@@ -1,0 +1,17 @@
+[package]
+name = "hk-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hk kernel - main kernel crate"
+
+[[bin]]
+name = "kernel"
+path = "main.rs"
+
+[dependencies]
+spin.workspace = true
+bitflags.workspace = true
+
+[features]
+default = []

@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+]
+exclude = [
+    "user",   # Separate target (Linux userspace, not bare metal)
+    "tools",  # Host-side tools, built separately
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Shared dependencies across workspace
+spin = "0.9"
+bitflags = "2"

@@ -1,0 +1,10 @@
+[package]
+name = "hk-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Development tools for hk kernel"
+
+[[bin]]
+name = "boot-test"
+path = "boot_test.rs"

@@ -1,0 +1,19 @@
+[package]
+name = "hk-user-boot-tester"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "boot_tester"
+path = "boot_tester.rs"
+
+[[bin]]
+name = "boot_tester2"
+path = "boot_tester2.rs"
+
+[profile.release]
+opt-level = "s"        # Optimize for size
+lto = true             # Link-time optimization
+panic = "abort"        # No unwinding
+strip = true           # Strip symbols

@@ -1,0 +1,20 @@
+# Build configuration for hk kernel
+#
+# To build for bare metal:
+#   cargo build --target x86_64-unknown-none
+#
+# To run tests (uses host target automatically):
+#   cargo test
+
+[target.x86_64-unknown-none]
+linker = "rust-lld"
+rustflags = [
+    "-C", "code-model=kernel",
+    "-C", "relocation-model=static",
+]
+
+[target.aarch64-unknown-none]
+linker = "rust-lld"
+rustflags = [
+    "-C", "link-arg=-Tkernel/arch/aarch64/kernel.ld",
+]

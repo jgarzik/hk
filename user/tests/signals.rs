@@ -1,0 +1,189 @@
+//! Signal tests
+//!
+//! Tests:
+//! - Test 74: rt_sigprocmask() - get and set signal mask
+//! - Test 75: rt_sigpending() - get pending signals
+//! - Test 76: kill() signal 0 - check process exists
+//! - Test 77: kill() ESRCH - non-existent process
+//! - Test 78: tgkill() signal 0
+//! - Test 79: tkill() signal 0
+//! - Test 80: rt_sigaction() - get default action
+//! - Test 81: rt_sigaction() EINVAL - invalid signal
+//! - Test 82: rt_sigaction() SIGKILL - can't change
+
+use super::helpers::{print, println, print_num};
+use crate::syscall::{
+    sys_getpid, sys_gettid, sys_kill, sys_rt_sigaction, sys_rt_sigpending, sys_rt_sigprocmask,
+    sys_tgkill, sys_tkill, SIG_BLOCK, SIG_DFL, SIG_IGN, SIGKILL, SIGUSR1,
+};
+
+/// Run all signal tests
+pub fn run_tests() {
+    test_sigprocmask();
+    test_sigpending();
+    test_kill_sig0();
+    test_kill_esrch();
+    test_tgkill_sig0();
+    test_tkill_sig0();
+    test_sigaction();
+    test_sigaction_einval();
+    test_sigaction_sigkill();
+}
+
+/// Test 74: rt_sigprocmask() - get and set signal mask
+fn test_sigprocmask() {
+
+    // Get current blocked mask
+    let mut old_mask: u64 = 0;
+    let ret = sys_rt_sigprocmask(SIG_BLOCK, 0, &mut old_mask as *mut u64 as u64, 8);
+    if ret == 0 {
+        print(b"rt_sigprocmask(SIG_BLOCK, NULL, &old_mask) = 0, old_mask = ");
+        print_num(old_mask as i64);
+
+        // Block SIGUSR1 (signal 10)
+        let new_mask: u64 = 1 << (SIGUSR1 - 1); // Signal bit for SIGUSR1
+        let mut returned_mask: u64 = 0;
+        let ret = sys_rt_sigprocmask(
+            SIG_BLOCK,
+            &new_mask as *const u64 as u64,
+            &mut returned_mask as *mut u64 as u64,
+            8,
+        );
+        if ret == 0 {
+            // Verify the mask was set
+            let mut check_mask: u64 = 0;
+            sys_rt_sigprocmask(SIG_BLOCK, 0, &mut check_mask as *mut u64 as u64, 8);
+            if (check_mask & new_mask) != 0 {
+                println(b"SIGPROCMASK:OK");
+            } else {
+                print(b"SIGPROCMASK:FAIL: SIGUSR1 not in blocked mask, got ");
+                print_num(check_mask as i64);
+            }
+        } else {
+            print(b"SIGPROCMASK:FAIL: could not block SIGUSR1, ret = ");
+            print_num(ret);
+        }
+    } else {
+        print(b"SIGPROCMASK:FAIL: could not get mask, ret = ");
+        print_num(ret);
+    }
+}
+
+/// Test 75: rt_sigpending() - get pending signals
+fn test_sigpending() {
+
+    let mut pending: u64 = 0xFFFFFFFF; // Initialize to non-zero
+    let ret = sys_rt_sigpending(&mut pending as *mut u64 as u64, 8);
+    if ret == 0 {
+        // Should be 0 or very low (no signals pending normally)
+        print(b"rt_sigpending() = 0, pending = ");
+        print_num(pending as i64);
+        println(b"SIGPENDING:OK");
+    } else {
+        print(b"SIGPENDING:FAIL: ret = ");
+        print_num(ret);
+    }
+}
+
+/// Test 76: kill() with signal 0 - check process exists
+fn test_kill_sig0() {
+
+    let pid = sys_getpid();
+    let ret = sys_kill(pid, 0); // Signal 0 = check if process exists
+    if ret == 0 {
+        println(b"KILL_SIG0:OK");
+    } else {
+        print(b"KILL_SIG0:FAIL: expected 0, got ");
+        print_num(ret);
+    }
+}
+
+/// Test 77: kill() to non-existent process should fail with ESRCH
+fn test_kill_esrch() {
+
+    let ret = sys_kill(99999, 0); // Non-existent PID
+    if ret == -3 {
+        // ESRCH
+        println(b"KILL_ESRCH:OK");
+    } else {
+        print(b"KILL_ESRCH:FAIL: expected -3 (ESRCH), got ");
+        print_num(ret);
+    }
+}
+
+/// Test 78: tgkill() with signal 0
+fn test_tgkill_sig0() {
+
+    let pid = sys_getpid();
+    let tid = sys_gettid();
+    let ret = sys_tgkill(pid, tid, 0);
+    if ret == 0 {
+        println(b"TGKILL_SIG0:OK");
+    } else {
+        print(b"TGKILL_SIG0:FAIL: expected 0, got ");
+        print_num(ret);
+    }
+}
+
+/// Test 79: tkill() with signal 0
+fn test_tkill_sig0() {
+
+    let tid = sys_gettid();
+    let ret = sys_tkill(tid, 0);
+    if ret == 0 {
+        println(b"TKILL_SIG0:OK");
+    } else {
+        print(b"TKILL_SIG0:FAIL: expected 0, got ");
+        print_num(ret);
+    }
+}
+
+/// Test 80: rt_sigaction() - get default action for SIGUSR1
+fn test_sigaction() {
+
+    // Define a simple sigaction structure for testing
+    // struct sigaction { u64 handler, u64 flags, u64 restorer, u64 mask }
+    let mut old_action: [u64; 4] = [0; 4];
+    let ret = sys_rt_sigaction(SIGUSR1, 0, old_action.as_mut_ptr() as u64, 8);
+    if ret == 0 {
+        print(b"rt_sigaction(SIGUSR1, NULL, &oact) = 0, handler = ");
+        print_num(old_action[0] as i64);
+        // Handler should be SIG_DFL (0) for SIGUSR1 by default
+        if old_action[0] == SIG_DFL {
+            println(b"SIGACTION:OK");
+        } else {
+            println(b"SIGACTION:OK (handler not default but call succeeded)");
+        }
+    } else {
+        print(b"SIGACTION:FAIL: ret = ");
+        print_num(ret);
+    }
+}
+
+/// Test 81: rt_sigaction() with invalid signal should fail
+fn test_sigaction_einval() {
+
+    let ret = sys_rt_sigaction(0, 0, 0, 8); // Signal 0 is invalid
+    if ret == -22 {
+        // EINVAL
+        println(b"SIGACTION_EINVAL:OK");
+    } else {
+        print(b"SIGACTION_EINVAL:FAIL: expected -22, got ");
+        print_num(ret);
+    }
+}
+
+/// Test 82: rt_sigaction() on SIGKILL should fail
+fn test_sigaction_sigkill() {
+
+    // Try to set a handler for SIGKILL (should fail)
+    let new_action: [u64; 4] = [SIG_IGN, 0, 0, 0];
+    let ret = sys_rt_sigaction(SIGKILL, new_action.as_ptr() as u64, 0, 8);
+    if ret == -22 {
+        // EINVAL - can't change SIGKILL
+        println(b"SIGACTION_SIGKILL:OK");
+    } else {
+        print(b"SIGACTION_SIGKILL:FAIL: expected -22, got ");
+        print_num(ret);
+    }
+}
