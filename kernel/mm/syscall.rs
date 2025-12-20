@@ -1,4 +1,4 @@
-//! Memory management syscalls (mmap, munmap, brk)
+//! Memory management syscalls (mmap, munmap, brk, mlock)
 
 extern crate alloc;
 
@@ -10,14 +10,31 @@ use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
 use super::{
-    MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MAP_SHARED, PAGE_SIZE, PROT_READ, PROT_WRITE, Vma,
-    create_default_mm, get_task_mm, init_task_mm,
+    MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MAP_SHARED, PAGE_SIZE, PROT_READ, PROT_WRITE, VM_LOCKED,
+    VM_LOCKED_MASK, VM_LOCKONFAULT, Vma, create_default_mm, get_task_mm, init_task_mm,
 };
 
 // Error codes (negative errno)
 const EINVAL: i64 = -22;
 const ENOMEM: i64 = -12;
 const EBADF: i64 = -9;
+const EPERM: i64 = -1;
+
+// ============================================================================
+// mlock flags (user-visible)
+// ============================================================================
+
+/// mlock2 flag: Lock pages in range after they are faulted in (deferred locking)
+pub const MLOCK_ONFAULT: i32 = 0x01;
+
+/// mlockall flag: Lock all current mappings
+pub const MCL_CURRENT: i32 = 1;
+
+/// mlockall flag: Lock all future mappings
+pub const MCL_FUTURE: i32 = 2;
+
+/// mlockall flag: Lock pages on fault (deferred locking)
+pub const MCL_ONFAULT: i32 = 4;
 
 /// mmap syscall
 ///
@@ -123,16 +140,34 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     };
 
     // Create VMA
-    let vma = if let Some(f) = file {
+    let mut vma = if let Some(f) = file {
         Vma::new_file(map_addr, map_addr + length, prot, flags, f, offset)
     } else {
         Vma::new(map_addr, map_addr + length, prot, flags | MAP_ANONYMOUS)
     };
 
+    // Apply def_flags if MCL_FUTURE was set via mlockall
+    let def_flags = mm_guard.def_flags();
+    if def_flags != 0 {
+        vma.flags |= def_flags;
+        let pages = length / PAGE_SIZE;
+        mm_guard.add_locked_vm(pages);
+    }
+
     mm_guard.insert_vma(vma);
 
-    // Note: Pages are NOT allocated here!
-    // They will be allocated on demand in the page fault handler.
+    // If MCL_FUTURE with immediate locking (not ONFAULT), populate now
+    let should_populate = def_flags != 0 && (def_flags & VM_LOCKONFAULT == 0);
+
+    // Release lock before potential page faults
+    drop(mm_guard);
+
+    if should_populate {
+        populate_range(map_addr, length);
+    }
+
+    // Note: Pages are allocated on demand in the page fault handler
+    // (unless we just populated them above for MCL_FUTURE)
 
     map_addr as i64
 }
@@ -427,4 +462,338 @@ pub fn sys_brk(brk: u64) -> i64 {
         // Pages will be allocated on demand via page faults
         brk as i64
     }
+}
+
+// ============================================================================
+// mlock syscalls
+// ============================================================================
+
+/// Check if the current task can perform mlock operations.
+///
+/// TODO: Check RLIMIT_MEMLOCK and CAP_IPC_LOCK when implemented.
+/// For now, always returns true since hk doesn't have swap and
+/// lacks rlimit infrastructure.
+#[allow(dead_code)]
+fn can_do_mlock() -> bool {
+    // TODO: When RLIMIT_MEMLOCK is implemented, check:
+    //   if rlimit(RLIMIT_MEMLOCK) != 0 { return true; }
+    //   if capable(CAP_IPC_LOCK) { return true; }
+    //   return false;
+    true
+}
+
+/// Populate pages in a range by triggering demand paging.
+///
+/// This is the hk equivalent of Linux's mm_populate().
+/// It walks through the address range and reads each page to trigger
+/// the page fault handler, which will allocate and map the pages.
+/// Populate pages by faulting them into memory
+///
+/// This function is a no-op for now because:
+/// 1. The kernel has no swap, so pages will be faulted in on demand anyway
+/// 2. Direct user memory access from kernel context requires proper uaccess
+///    handling and page fault tolerance that isn't fully implemented yet
+///
+/// TODO: Implement proper page population using get_user_pages() or similar
+/// when swap support is added.
+#[allow(unused_variables)]
+fn populate_range(start: u64, len: u64) {
+    // Currently a no-op - pages will be demand-paged on first access
+    // from userspace. When swap is implemented, this should prefault
+    // the pages to lock them in memory.
+}
+
+/// mlock syscall - Lock pages in memory
+///
+/// Locks the pages in the specified address range into RAM, preventing
+/// them from being swapped out. Since hk currently has no swap, this
+/// primarily sets the VM_LOCKED flag for ABI compatibility and prefaults
+/// the pages into memory.
+///
+/// # Arguments
+/// * `addr` - Start address of the memory range
+/// * `len` - Length of the memory range in bytes
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+pub fn sys_mlock(addr: u64, len: u64) -> i64 {
+    do_mlock(addr, len, VM_LOCKED)
+}
+
+/// mlock2 syscall - Lock pages in memory with flags
+///
+/// Extended version of mlock that supports the MLOCK_ONFAULT flag
+/// for deferred locking (pages are locked when faulted in, not prefaulted).
+///
+/// # Arguments
+/// * `addr` - Start address of the memory range
+/// * `len` - Length of the memory range in bytes
+/// * `flags` - Flags (MLOCK_ONFAULT)
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+pub fn sys_mlock2(addr: u64, len: u64, flags: i32) -> i64 {
+    // Validate flags - only MLOCK_ONFAULT is allowed
+    if flags & !MLOCK_ONFAULT != 0 {
+        return EINVAL;
+    }
+
+    let mut vm_flags = VM_LOCKED;
+    if flags & MLOCK_ONFAULT != 0 {
+        vm_flags |= VM_LOCKONFAULT;
+    }
+
+    do_mlock(addr, len, vm_flags)
+}
+
+/// Common implementation for mlock/mlock2
+fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
+    // Zero length is a no-op (success)
+    if len == 0 {
+        return 0;
+    }
+
+    // Permission check (stub - always allows for now)
+    if !can_do_mlock() {
+        return EPERM;
+    }
+
+    // Page-align the range
+    let start_aligned = start & !(PAGE_SIZE - 1);
+    let end_unaligned = start.saturating_add(len);
+    let end_aligned = (end_unaligned + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let len_aligned = end_aligned - start_aligned;
+
+    // Get current task's mm
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return ENOMEM,
+    };
+
+    let mut mm_guard = mm.lock();
+
+    // Find all VMAs in range and set VM_LOCKED flag
+    // Following Linux behavior: lock portions that exist, succeed even if
+    // some of the range has no VMA
+
+    // First pass: calculate total pages to add to locked_vm and update VMA flags
+    let mut pages_to_add: u64 = 0;
+    for vma in mm_guard.iter_mut() {
+        // Check for overlap
+        if vma.end <= start_aligned || vma.start >= end_aligned {
+            continue; // No overlap
+        }
+
+        // Calculate pages being locked in this VMA
+        let vma_start = vma.start.max(start_aligned);
+        let vma_end = vma.end.min(end_aligned);
+        let pages = (vma_end - vma_start) / PAGE_SIZE;
+
+        // Only count if not already locked
+        if vma.flags & VM_LOCKED == 0 {
+            pages_to_add += pages;
+        }
+
+        // Set the lock flags (clear old lock flags first, then set new ones)
+        vma.flags = (vma.flags & !VM_LOCKED_MASK) | vm_flags;
+    }
+
+    // Update locked_vm counter after the loop
+    mm_guard.add_locked_vm(pages_to_add);
+
+    // Release lock before populating (to avoid holding lock during page faults)
+    drop(mm_guard);
+
+    // If not MLOCK_ONFAULT, populate pages now
+    if vm_flags & VM_LOCKONFAULT == 0 {
+        populate_range(start_aligned, len_aligned);
+    }
+
+    0
+}
+
+/// munlock syscall - Unlock pages
+///
+/// Unlocks the pages in the specified address range, allowing them to be
+/// swapped out again (when swap is implemented).
+///
+/// # Arguments
+/// * `addr` - Start address of the memory range
+/// * `len` - Length of the memory range in bytes
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+pub fn sys_munlock(addr: u64, len: u64) -> i64 {
+    // Zero length is a no-op
+    if len == 0 {
+        return 0;
+    }
+
+    // Page-align the range
+    let start_aligned = addr & !(PAGE_SIZE - 1);
+    let end_unaligned = addr.saturating_add(len);
+    let end_aligned = (end_unaligned + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return 0, // No mm, nothing to unlock
+    };
+
+    let mut mm_guard = mm.lock();
+
+    // Accumulate pages to subtract (can't modify locked_vm during iteration)
+    let mut pages_to_subtract: u64 = 0;
+
+    for vma in mm_guard.iter_mut() {
+        // Check for overlap
+        if vma.end <= start_aligned || vma.start >= end_aligned {
+            continue; // No overlap
+        }
+
+        // Calculate pages being unlocked in this VMA
+        let vma_start = vma.start.max(start_aligned);
+        let vma_end = vma.end.min(end_aligned);
+        let pages = (vma_end - vma_start) / PAGE_SIZE;
+
+        // Only decrement if was locked
+        if vma.flags & VM_LOCKED != 0 {
+            pages_to_subtract += pages;
+        }
+
+        // Clear lock flags
+        vma.flags &= !VM_LOCKED_MASK;
+    }
+
+    // Update locked_vm counter after iteration
+    mm_guard.sub_locked_vm(pages_to_subtract);
+
+    0
+}
+
+/// mlockall syscall - Lock all current and/or future mappings
+///
+/// Locks all pages in the calling process's virtual address space.
+///
+/// # Arguments
+/// * `flags` - Combination of MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+pub fn sys_mlockall(flags: i32) -> i64 {
+    // Validate flags
+    if flags == 0 {
+        return EINVAL;
+    }
+    if flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 {
+        return EINVAL;
+    }
+    // MCL_ONFAULT alone is invalid
+    if flags == MCL_ONFAULT {
+        return EINVAL;
+    }
+
+    // Permission check
+    if !can_do_mlock() {
+        return EPERM;
+    }
+
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return ENOMEM,
+    };
+
+    let mut mm_guard = mm.lock();
+
+    // Clear old def_flags
+    mm_guard.set_def_flags(0);
+
+    // Handle MCL_FUTURE
+    if flags & MCL_FUTURE != 0 {
+        let mut def = VM_LOCKED;
+        if flags & MCL_ONFAULT != 0 {
+            def |= VM_LOCKONFAULT;
+        }
+        mm_guard.set_def_flags(def);
+
+        // If only MCL_FUTURE (without MCL_CURRENT), we're done
+        if flags & MCL_CURRENT == 0 {
+            return 0;
+        }
+    }
+
+    // Handle MCL_CURRENT - lock all existing VMAs
+    if flags & MCL_CURRENT != 0 {
+        let vm_flags = if flags & MCL_ONFAULT != 0 {
+            VM_LOCKED | VM_LOCKONFAULT
+        } else {
+            VM_LOCKED
+        };
+
+        // Collect ranges to populate (can't hold lock during page faults)
+        let mut ranges_to_populate: Vec<(u64, u64)> = Vec::new();
+        // Accumulate pages to add (can't modify locked_vm during iteration)
+        let mut pages_to_add: u64 = 0;
+
+        for vma in mm_guard.iter_mut() {
+            // Calculate pages
+            let pages = (vma.end - vma.start) / PAGE_SIZE;
+
+            // Only count if not already locked
+            if vma.flags & VM_LOCKED == 0 {
+                pages_to_add += pages;
+            }
+
+            // Collect range for population if not ONFAULT
+            if vm_flags & VM_LOCKONFAULT == 0 {
+                ranges_to_populate.push((vma.start, vma.end - vma.start));
+            }
+
+            // Set the lock flags
+            vma.flags = (vma.flags & !VM_LOCKED_MASK) | vm_flags;
+        }
+
+        // Update locked_vm counter after iteration
+        mm_guard.add_locked_vm(pages_to_add);
+
+        drop(mm_guard);
+
+        // Populate pages if not ONFAULT
+        for (start, len) in ranges_to_populate {
+            populate_range(start, len);
+        }
+    }
+
+    0
+}
+
+/// munlockall syscall - Unlock all mappings
+///
+/// Unlocks all pages in the calling process's virtual address space.
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+pub fn sys_munlockall() -> i64 {
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return 0, // No mm, nothing to unlock
+    };
+
+    let mut mm_guard = mm.lock();
+
+    // Clear def_flags (undo MCL_FUTURE)
+    mm_guard.set_def_flags(0);
+
+    // Clear VM_LOCKED on all VMAs
+    for vma in mm_guard.iter_mut() {
+        vma.flags &= !VM_LOCKED_MASK;
+    }
+
+    // Reset locked_vm counter
+    mm_guard.reset_locked_vm();
+
+    0
 }

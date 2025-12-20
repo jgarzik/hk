@@ -115,6 +115,16 @@ pub const SYS_CLONE: u64 = 220;
 pub const SYS_EXECVE: u64 = 221;
 pub const SYS_MMAP: u64 = 222;
 pub const SYS_MPROTECT: u64 = 226;
+/// mlock(addr, len)
+pub const SYS_MLOCK: u64 = 228;
+/// munlock(addr, len)
+pub const SYS_MUNLOCK: u64 = 229;
+/// mlockall(flags)
+pub const SYS_MLOCKALL: u64 = 230;
+/// munlockall()
+pub const SYS_MUNLOCKALL: u64 = 231;
+/// mlock2(addr, len, flags)
+pub const SYS_MLOCK2: u64 = 284;
 pub const SYS_WAIT4: u64 = 260;
 
 // Signal syscalls (aarch64 numbers)
@@ -438,6 +448,11 @@ pub fn aarch64_syscall_dispatch(
         }
         SYS_MUNMAP => crate::mm::syscall::sys_munmap(arg0, arg1) as u64,
         SYS_BRK => crate::mm::syscall::sys_brk(arg0) as u64,
+        SYS_MLOCK => crate::mm::syscall::sys_mlock(arg0, arg1) as u64,
+        SYS_MUNLOCK => crate::mm::syscall::sys_munlock(arg0, arg1) as u64,
+        SYS_MLOCKALL => crate::mm::syscall::sys_mlockall(arg0 as i32) as u64,
+        SYS_MUNLOCKALL => crate::mm::syscall::sys_munlockall() as u64,
+        SYS_MLOCK2 => crate::mm::syscall::sys_mlock2(arg0, arg1, arg2 as i32) as u64,
 
         // System information
         SYS_SYSINFO => {

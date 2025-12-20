@@ -117,6 +117,11 @@ pub const SYS_PSELECT6: u64 = 72;
 pub const SYS_BRK: u64 = 214;
 pub const SYS_MUNMAP: u64 = 215;
 pub const SYS_MMAP: u64 = 222;
+pub const SYS_MLOCK: u64 = 228;
+pub const SYS_MUNLOCK: u64 = 229;
+pub const SYS_MLOCKALL: u64 = 230;
+pub const SYS_MUNLOCKALL: u64 = 231;
+pub const SYS_MLOCK2: u64 = 284;
 
 // System information syscalls
 pub const SYS_GETRUSAGE: u64 = 165;
@@ -1492,6 +1497,99 @@ pub fn sys_brk(addr: u64) -> i64 {
             "svc #0",
             in("x8") SYS_BRK,
             in("x0") addr,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// mlock(addr, len) - lock pages in memory
+///
+/// Returns 0 on success, negative errno on error.
+#[inline(always)]
+pub fn sys_mlock(addr: u64, len: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_MLOCK,
+            in("x0") addr,
+            in("x1") len,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// mlock2(addr, len, flags) - lock pages in memory with flags
+///
+/// Returns 0 on success, negative errno on error.
+#[inline(always)]
+pub fn sys_mlock2(addr: u64, len: u64, flags: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_MLOCK2,
+            in("x0") addr,
+            in("x1") len,
+            in("x2") flags,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// munlock(addr, len) - unlock pages
+///
+/// Returns 0 on success, negative errno on error.
+#[inline(always)]
+pub fn sys_munlock(addr: u64, len: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_MUNLOCK,
+            in("x0") addr,
+            in("x1") len,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// mlockall(flags) - lock all current and/or future mappings
+///
+/// Returns 0 on success, negative errno on error.
+#[inline(always)]
+pub fn sys_mlockall(flags: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_MLOCKALL,
+            in("x0") flags,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// munlockall() - unlock all mappings
+///
+/// Returns 0 on success, negative errno on error.
+#[inline(always)]
+pub fn sys_munlockall() -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_MUNLOCKALL,
             lateout("x0") ret,
             options(nostack),
         );

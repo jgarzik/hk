@@ -287,13 +287,13 @@ Extended attributes (Linux-specific):
 
 - [ ] msync
 
-- [ ] mlock
+- [x] mlock
 
-- [ ] munlock
+- [x] munlock
 
-- [ ] mlockall
+- [x] mlockall
 
-- [ ] munlockall
+- [x] munlockall
 
 - [ ] mincore
 
@@ -591,7 +591,7 @@ linasm.sourceforge.net
 
 - [ ] prctl (lots of knobs: dumpable, NO_NEW_PRIVS, etc.)
 
-- [ ] mlock / mlockall (already listed under memory)
+- [x] mlock / mlockall (already listed under memory)
 
 - [ ] settimeofday / adjtimex (privileged)
 

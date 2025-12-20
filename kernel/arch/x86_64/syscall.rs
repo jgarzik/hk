@@ -58,6 +58,16 @@ pub const SYS_MMAP: u64 = 9;
 pub const SYS_MUNMAP: u64 = 11;
 /// brk(addr)
 pub const SYS_BRK: u64 = 12;
+/// mlock(addr, len)
+pub const SYS_MLOCK: u64 = 149;
+/// munlock(addr, len)
+pub const SYS_MUNLOCK: u64 = 150;
+/// mlockall(flags)
+pub const SYS_MLOCKALL: u64 = 151;
+/// munlockall()
+pub const SYS_MUNLOCKALL: u64 = 152;
+/// mlock2(addr, len, flags)
+pub const SYS_MLOCK2: u64 = 325;
 /// ftruncate(fd, length)
 pub const SYS_FTRUNCATE: u64 = 77;
 /// truncate(path, length)
@@ -881,6 +891,11 @@ pub fn x86_64_syscall_dispatch(
         }
         SYS_MUNMAP => crate::mm::syscall::sys_munmap(arg0, arg1) as u64,
         SYS_BRK => crate::mm::syscall::sys_brk(arg0) as u64,
+        SYS_MLOCK => crate::mm::syscall::sys_mlock(arg0, arg1) as u64,
+        SYS_MUNLOCK => crate::mm::syscall::sys_munlock(arg0, arg1) as u64,
+        SYS_MLOCKALL => crate::mm::syscall::sys_mlockall(arg0 as i32) as u64,
+        SYS_MUNLOCKALL => crate::mm::syscall::sys_munlockall() as u64,
+        SYS_MLOCK2 => crate::mm::syscall::sys_mlock2(arg0, arg1, arg2 as i32) as u64,
         SYS_FTRUNCATE => sys_ftruncate(arg0 as i32, arg1 as i64) as u64,
         SYS_TRUNCATE => sys_truncate(arg0, arg1 as i64) as u64,
         SYS_STAT => sys_stat(arg0, arg1) as u64,

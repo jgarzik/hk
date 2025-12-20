@@ -235,6 +235,14 @@ pub const MAP_PRIVATE: u32 = 0x02;
 pub const MAP_FIXED: u32 = 0x10;
 pub const MAP_ANONYMOUS: u32 = 0x20;
 
+// mlock2 flags
+pub const MLOCK_ONFAULT: i32 = 0x01;
+
+// mlockall flags
+pub const MCL_CURRENT: i32 = 1;
+pub const MCL_FUTURE: i32 = 2;
+pub const MCL_ONFAULT: i32 = 4;
+
 // Signal numbers
 pub const SIGHUP: u32 = 1;
 pub const SIGINT: u32 = 2;

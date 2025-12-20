@@ -60,7 +60,7 @@ int munmap(void *addr, size_t length);
 | MAP_FIXED | 0x10 | Use exact address | Implemented |
 | MAP_ANONYMOUS | 0x20 | No file backing | Implemented |
 | MAP_GROWSDOWN | 0x100 | Stack-like growth | Not implemented |
-| MAP_LOCKED | 0x2000 | Lock pages in memory | Not implemented |
+| MAP_LOCKED | 0x2000 | Lock pages in memory | Via mlock syscalls |
 | MAP_NORESERVE | 0x4000 | Don't reserve swap | Not implemented |
 | MAP_POPULATE | 0x8000 | Prefault pages | Not implemented |
 | MAP_HUGETLB | 0x40000 | Use huge pages | Not implemented |
@@ -87,6 +87,8 @@ pub struct MmStruct {
     vmas: Vec<Vma>,      // Sorted by start address
     mmap_base: u64,      // Base for free area search
     mmap_end: u64,       // End of mmap region
+    locked_vm: u64,      // Count of locked pages
+    def_flags: u32,      // Default VMA flags (for mlockall MCL_FUTURE)
 }
 ```
 
@@ -172,6 +174,51 @@ void *ptr = mmap((void*)0x10000000, size,
 ```
 Map at exact address (removes any existing mappings).
 
+## Memory Locking (mlock)
+
+The mlock family of syscalls lock virtual memory pages into physical RAM, preventing them from being paged out. Since hk currently has no swap, these primarily provide ABI compatibility and set the VM_LOCKED flag on VMAs for future-proofing.
+
+### mlock/mlock2
+
+```c
+int mlock(const void *addr, size_t len);
+int mlock2(const void *addr, size_t len, unsigned int flags);
+```
+
+| Flag | Value | Description |
+|------|-------|-------------|
+| MLOCK_ONFAULT | 0x01 | Lock pages on first fault (don't populate immediately) |
+
+**Returns**: 0 on success, -errno on failure
+
+### munlock
+
+```c
+int munlock(const void *addr, size_t len);
+```
+
+Unlocks pages in the specified range, allowing them to be paged out (when swap is implemented).
+
+### mlockall/munlockall
+
+```c
+int mlockall(int flags);
+int munlockall(void);
+```
+
+| Flag | Value | Description |
+|------|-------|-------------|
+| MCL_CURRENT | 1 | Lock all current mappings |
+| MCL_FUTURE | 2 | Lock all future mappings |
+| MCL_ONFAULT | 4 | Lock on fault (combine with MCL_CURRENT or MCL_FUTURE) |
+
+### VMA Lock Flags
+
+| Flag | Value | Description |
+|------|-------|-------------|
+| VM_LOCKED | 0x2000 | Pages are locked in memory |
+| VM_LOCKONFAULT | 0x10000 | Lock pages on first fault |
+
 ## Error Codes
 
 | Error | Value | Condition |
@@ -208,9 +255,9 @@ Map at exact address (removes any existing mappings).
 
 | File | Purpose |
 |------|---------|
-| kernel/mm/vma.rs | VMA struct, PROT_*, MAP_* constants |
+| kernel/mm/vma.rs | VMA struct, PROT_*, MAP_*, VM_LOCKED* constants |
 | kernel/mm/mod.rs | MmStruct, TASK_MM table, lifecycle functions |
-| kernel/mm/syscall.rs | sys_mmap, sys_munmap implementations |
+| kernel/mm/syscall.rs | sys_mmap, sys_munmap, mlock syscalls |
 | kernel/arch/x86_64/interrupts.rs | x86-64 demand paging handler |
 | kernel/arch/aarch64/exceptions.rs | aarch64 demand paging handler |
 | user/syscall/{x86_64,aarch64}.rs | Userspace syscall wrappers |

@@ -21,6 +21,22 @@ pub const MAP_ANONYMOUS: u32 = 0x20;
 /// Return value for failed mmap
 pub const MAP_FAILED: i64 = -1;
 
+// ============================================================================
+// VMA flags (internal kernel flags, stored in Vma.flags alongside MAP_*)
+// These use higher bits to avoid conflict with MAP_* flags
+// ============================================================================
+
+/// Pages in this VMA are memory-locked (cannot be swapped out)
+/// Matches Linux VM_LOCKED bit position
+pub const VM_LOCKED: u32 = 0x2000;
+
+/// Pages will be locked on fault (deferred locking for mlock2/MCL_ONFAULT)
+/// Matches Linux VM_LOCKONFAULT bit position
+pub const VM_LOCKONFAULT: u32 = 0x0001_0000;
+
+/// Combined mask for all lock-related VMA flags
+pub const VM_LOCKED_MASK: u32 = VM_LOCKED | VM_LOCKONFAULT;
+
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
 
@@ -119,5 +135,17 @@ impl Vma {
     #[inline]
     pub fn is_executable(&self) -> bool {
         self.prot & PROT_EXEC != 0
+    }
+
+    /// Check if this VMA is memory-locked
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        self.flags & VM_LOCKED != 0
+    }
+
+    /// Check if this VMA has lock-on-fault enabled
+    #[inline]
+    pub fn is_lockonfault(&self) -> bool {
+        self.flags & VM_LOCKONFAULT != 0
     }
 }

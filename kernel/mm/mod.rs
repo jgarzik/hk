@@ -52,6 +52,12 @@ pub struct MmStruct {
     start_brk: u64,
     /// Current program break
     brk: u64,
+    /// Count of locked pages (in pages, not bytes)
+    /// Used for resource limit checking (RLIMIT_MEMLOCK)
+    locked_vm: u64,
+    /// Default flags for new VMAs (set by mlockall with MCL_FUTURE)
+    /// Contains VM_LOCKED and/or VM_LOCKONFAULT when MCL_FUTURE is active
+    def_flags: u32,
 }
 
 impl MmStruct {
@@ -63,6 +69,8 @@ impl MmStruct {
             mmap_end,
             start_brk: 0,
             brk: 0,
+            locked_vm: 0,
+            def_flags: 0,
         }
     }
 
@@ -169,6 +177,45 @@ impl MmStruct {
     pub fn clone_vmas(&self) -> Vec<Vma> {
         self.vmas.clone()
     }
+
+    // ========================================================================
+    // Memory locking (mlock/mlockall) support
+    // ========================================================================
+
+    /// Get the count of locked pages
+    pub fn locked_vm(&self) -> u64 {
+        self.locked_vm
+    }
+
+    /// Add to the locked page count
+    pub fn add_locked_vm(&mut self, pages: u64) {
+        self.locked_vm = self.locked_vm.saturating_add(pages);
+    }
+
+    /// Subtract from the locked page count
+    pub fn sub_locked_vm(&mut self, pages: u64) {
+        self.locked_vm = self.locked_vm.saturating_sub(pages);
+    }
+
+    /// Reset the locked page count to zero
+    pub fn reset_locked_vm(&mut self) {
+        self.locked_vm = 0;
+    }
+
+    /// Get the default VMA flags (set by mlockall MCL_FUTURE)
+    pub fn def_flags(&self) -> u32 {
+        self.def_flags
+    }
+
+    /// Set the default VMA flags
+    pub fn set_def_flags(&mut self, flags: u32) {
+        self.def_flags = flags;
+    }
+
+    /// Get mutable iterator over all VMAs
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Vma> {
+        self.vmas.iter_mut()
+    }
 }
 
 /// Global mapping from task ID to memory descriptor
@@ -213,6 +260,9 @@ pub fn clone_task_mm(parent_tid: Tid, child_tid: Tid, share_vm: bool) {
             mmap_end: parent_guard.mmap_end,
             start_brk: parent_guard.start_brk,
             brk: parent_guard.brk,
+            // Copy mlock state for fork
+            locked_vm: parent_guard.locked_vm,
+            def_flags: parent_guard.def_flags,
         };
         drop(parent_guard);
         init_task_mm(child_tid, Arc::new(Mutex::new(new_mm)));

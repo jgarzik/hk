@@ -10,11 +10,14 @@ This guide covers building, testing, and running the hk kernel on Linux (Ubuntu)
 # Rust toolchain (if not installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# QEMU for x86-64 emulation
-sudo apt install qemu-system-x86
+# QEMU for x86-64 and aarch64 emulation
+sudo apt install qemu-system-x86 qemu-system-arm
 
 # Build tools for userspace and ISO creation
 sudo apt install build-essential cpio grub-pc-bin grub-common mtools xorriso
+
+# Cross-compiler for aarch64 userspace
+sudo apt install gcc-aarch64-linux-gnu
 ```
 
 ### Rust Components
@@ -23,17 +26,23 @@ The project uses nightly Rust. Components are specified in `rust-toolchain.toml`
 
 ```bash
 rustup target add x86_64-unknown-none
+rustup target add aarch64-unknown-none
+rustup target add x86_64-unknown-linux-gnu
+rustup target add aarch64-unknown-linux-gnu
 ```
 
 ## Quick Start
 
 ```bash
-# Build everything and run in QEMU
-make run
+# Build and test x86-64 (primary workflow)
+make check          # Build + boot test in QEMU
 
-# Or step by step:
-make all    # Build kernel + userspace
-make run    # Run in QEMU
+# Build and test aarch64
+make check-arm      # Build + boot test in QEMU
+
+# Run interactively
+make run            # x86-64 in QEMU
+make run-arm        # aarch64 in QEMU
 ```
 
 ## Build Commands
@@ -41,41 +50,41 @@ make run    # Run in QEMU
 ### Kernel
 
 ```bash
-make build      # Release build (optimized)
-make debug      # Debug build (unoptimized, with debug symbols)
-```
+# x86-64
+make build          # Release build (optimized)
+make debug          # Debug build
 
-Or directly with cargo:
+# aarch64
+make build-arm      # Release build
 
-```bash
-cargo build --target x86_64-unknown-none --release
-cargo build --target x86_64-unknown-none
+# Or directly with cargo:
+cargo build -p hk-kernel --target x86_64-unknown-none --release
+cargo build -p hk-kernel --target aarch64-unknown-none --release
 ```
 
 The kernel binary is output to:
-- Release: `target/x86_64-unknown-none/release/kernel`
-- Debug: `target/x86_64-unknown-none/debug/kernel`
+- x86-64: `target/x86_64-unknown-none/release/kernel`
+- aarch64: `target/aarch64-unknown-none/release/kernel`
 
 ### Userspace
 
+Userspace builds automatically as part of `make check`/`make check-arm`:
+
 ```bash
-make user       # Build boot_tester binary and create initramfs-x86_64.cpio
+cd user && make             # x86-64 userspace
+cd user && make arm         # aarch64 userspace
 ```
 
-Or manually:
+The userspace build creates:
+- `user/initramfs-x86_64.cpio` - x86-64 initramfs
+- `user/initramfs-aarch64.cpio` - aarch64 initramfs
+
+### Full Build + Test (Recommended)
 
 ```bash
-cd user
-make all        # Builds boot_tester + creates initramfs-x86_64.cpio
-```
-
-The userspace build creates `user/initramfs-x86_64.cpio` which is embedded into the kernel at compile time.
-
-### Full Build
-
-```bash
-make all        # Build kernel (release) + userspace
-make            # Same as above (default target)
+make check          # Build x86-64 + boot test (SUCCESS criteria)
+make check-arm      # Build aarch64 + boot test (SUCCESS criteria)
+cargo clippy --target x86_64-unknown-none -p hk-kernel  # Linting
 ```
 
 ## Running in QEMU
@@ -83,65 +92,65 @@ make            # Same as above (default target)
 ### Basic Run
 
 ```bash
-make run        # Builds if needed, then runs
+make run            # x86-64
+make run-arm        # aarch64
 ```
 
-### Debug Mode
+### Direct QEMU Scripts
 
 ```bash
-make run-debug  # Runs with -no-reboot (stops on crash)
-```
+# x86-64
+./run-qemu.sh           # Basic run
+./run-qemu.sh -d        # Debug mode (no reboot on crash)
+./run-qemu.sh -g        # Enable GDB server on port 1234
 
-### Direct QEMU Script
-
-```bash
-./run-qemu.sh       # Basic run
-./run-qemu.sh -d    # Debug mode (no reboot on crash)
-./run-qemu.sh -g    # Enable GDB server on port 1234
+# aarch64
+./run-qemu-arm.sh       # Basic run
+./run-qemu-arm.sh -d    # Debug mode
 ```
 
 ### QEMU Configuration
 
 The default QEMU setup:
 - Memory: 512MB
-- Serial output: logged to `/tmp/qemu_serial.log`
+- Serial output: logged to `/tmp/qemu_serial.log` (x86-64) or `/tmp/qemu_serial_arm.log` (aarch64)
 - Display: `-nographic` (console mode)
-
-### Manual Boot Test
-
-To manually boot test with serial output capture:
-
-```bash
-make iso
-timeout 20 qemu-system-x86_64 -cdrom target/hk-x86_64.iso -nographic -m 512M -serial file:/tmp/qemu_serial.log
-cat /tmp/qemu_serial.log
-```
-
-A successful boot shows `BOOT_COMPLETE` in the serial log.
-
-## Testing
-
-### Unit Tests
-
-Tests run on the host (with std), not bare metal:
-
-```bash
-make test           # Run all tests
-cargo test          # Same thing
-cargo test -p hk-kernel     # Test specific crate
-cargo test --release        # Release mode tests
-```
+- x86-64: Boots from ISO with GRUB
+- aarch64: Direct kernel boot with device tree
 
 ### Boot Test
 
-The `boot-test` target builds the kernel, boots it in QEMU, and verifies it reaches the `BOOT_COMPLETE` marker:
+A successful boot shows `BOOT_COMPLETE` in the serial log. The `make check` and `make check-arm` targets automatically verify this.
+
+## Testing
+
+### Boot Tests (Primary Testing Method)
+
+The kernel includes a comprehensive boot_tester that runs syscall and subsystem tests during boot:
 
 ```bash
-make boot-test              # Build and verify kernel boots successfully
-cargo run -p hk-tools --bin boot-test -- --timeout 30  # With custom timeout
+make check          # Build x86-64 + run boot tests
+make check-arm      # Build aarch64 + run boot tests
 ```
 
-This is useful for automated testing and CI - it exits with code 0 on success, 1 on timeout, or 2 on build failure.
+Tests are defined in `user/tests/*.rs` and cover:
+- Process management (fork, exec, clone, signals)
+- Memory management (mmap, mlock, munmap)
+- File system operations
+- Timers and scheduling
+- And more...
+
+A successful boot shows all tests passing and ends with `BOOT_COMPLETE`.
+
+### Kernel Unit Tests
+
+Some kernel modules have unit tests that run on the host:
+
+```bash
+cargo test -p hk-kernel --target x86_64-unknown-linux-gnu
+```
+
+Note: Most testing is done via boot tests since bare-metal kernel code requires QEMU.
 
 ## Code Quality
 
@@ -155,25 +164,29 @@ cargo fmt --check   # Check formatting without modifying
 
 ```
 hk/
-├── kernel/         # Final kernel binary
-│   ├── main.rs     # Rust entry point (_start)
-│   ├── boot.S      # 32-to-64-bit boot stub (_start32)
-│   ├── kernel.ld   # Linker script
-│   ├── build.rs    # Build script (assembles boot.S)
-│   ├── core/       # Architecture-independent kernel logic
-│   ├── dt/         # Device tree parsing
-│   ├── arch/       # Architecture-specific code (x86_64)
-│   ├── platform/   # Platform device drivers
-│   ├── fs/         # VFS + CPIO initramfs support
-│   └── task/       # Task/scheduler implementation
-├── boot/           # Boot configuration
-│   └── grub.cfg    # GRUB menu configuration
-├── tools/          # Development tools
-│   └── boot_test.rs # Automated boot test harness
-└── user/           # Userspace binaries
-    ├── hello.rs    # Test program
-    ├── user.ld     # Linker script
-    └── Makefile    # Userspace build
+├── kernel/              # Main kernel crate (no_std, no_main)
+│   ├── main.rs          # Entry point and kernel init
+│   ├── arch/            # Architecture-specific code
+│   │   ├── x86_64/      # x86-64: boot, interrupts, paging, syscalls
+│   │   └── aarch64/     # aarch64: boot, exceptions, paging, syscalls
+│   ├── mm/              # Memory management (mmap, vma, page tables)
+│   ├── task/            # Process/thread management, scheduler
+│   ├── fs/              # VFS + filesystem implementations
+│   ├── signal/          # Signal handling
+│   ├── bus/             # Bus drivers (PCI, etc.)
+│   ├── storage/         # Block device drivers
+│   ├── usb/             # USB stack (xHCI, hub, devices)
+│   ├── tty/             # TTY subsystem
+│   ├── ns/              # Namespaces
+│   ├── dt/              # Device tree parsing
+│   └── *.rs             # Core kernel modules (console, heap, frame_alloc, etc.)
+├── user/                # Userspace test binaries
+│   ├── boot_tester.rs   # Main test harness
+│   ├── syscall/         # Syscall wrappers (x86_64.rs, aarch64.rs)
+│   └── tests/           # Test modules (mmap.rs, process.rs, etc.)
+├── boot/                # GRUB configuration (x86-64)
+├── doc/                 # Documentation
+└── target/              # Build output
 ```
 
 **Note**: Source files are placed directly in crate roots (no `src/` directories).
@@ -197,11 +210,18 @@ hk/
 After a full build:
 
 ```
-target/x86_64-unknown-none/release/kernel   # Kernel binary (ELF)
-target/hk-x86_64.iso                        # Bootable ISO image (x86-64)
-kernel/initramfs-x86_64.cpio                # Initramfs (copied from user/)
-user/initramfs-x86_64.cpio                  # Userspace CPIO archive (x86-64)
-user/target/x86_64-unknown-none/release/hello  # Hello binary
+# x86-64
+target/x86_64-unknown-none/release/kernel    # Kernel binary (ELF)
+target/hk-x86_64.iso                         # Bootable ISO image
+user/initramfs-x86_64.cpio                   # Userspace CPIO archive
+
+# aarch64
+target/aarch64-unknown-none/release/kernel   # Kernel binary (ELF)
+user/initramfs-aarch64.cpio                  # Userspace CPIO archive
+
+# Userspace binaries
+user/target/x86_64-unknown-linux-gnu/release/boot_tester
+user/target/aarch64-unknown-linux-gnu/release/boot_tester
 ```
 
 ## Cleaning
@@ -228,25 +248,34 @@ rustup component add llvm-tools-preview
 
 ### QEMU permission issues
 
-Ensure QEMU is installed and accessible:
+Ensure QEMU is installed:
 ```bash
 which qemu-system-x86_64
-qemu-system-x86_64 --version
+which qemu-system-aarch64
 ```
 
 ### Build fails with target errors
 
-Ensure the nightly toolchain and target are installed:
+Ensure the nightly toolchain and targets are installed:
 ```bash
 rustup override set nightly
-rustup target add x86_64-unknown-none
+rustup target add x86_64-unknown-none aarch64-unknown-none
+rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+```
+
+### aarch64 cross-compilation fails
+
+Install the cross-compiler:
+```bash
+sudo apt install gcc-aarch64-linux-gnu
 ```
 
 ### Kernel crashes immediately
 
 Run with debug mode to see the error:
 ```bash
-make run-debug
+./run-qemu.sh -d        # x86-64
+./run-qemu-arm.sh -d    # aarch64
 ```
 
 Or enable GDB for step-by-step debugging:
