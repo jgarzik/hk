@@ -23,3 +23,9 @@ Uses the Linux syscall ABI for each respective architecture.
 
 New device driver model, eBPF, ...
 
+### Building etc
+
+Run `make check` or `make check-arm`.  Run `make help` for more info.
+
+Requires qemu, dosfstools, and iso tools.
+
