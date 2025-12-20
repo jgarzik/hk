@@ -244,6 +244,61 @@ pub const MCL_CURRENT: i32 = 1;
 pub const MCL_FUTURE: i32 = 2;
 pub const MCL_ONFAULT: i32 = 4;
 
+// Resource limits (rlimit constants)
+/// CPU time limit (seconds)
+pub const RLIMIT_CPU: u32 = 0;
+/// Maximum file size (bytes)
+pub const RLIMIT_FSIZE: u32 = 1;
+/// Maximum data segment size (bytes)
+pub const RLIMIT_DATA: u32 = 2;
+/// Maximum stack size (bytes)
+pub const RLIMIT_STACK: u32 = 3;
+/// Maximum core file size (bytes)
+pub const RLIMIT_CORE: u32 = 4;
+/// Maximum resident set size (unused)
+pub const RLIMIT_RSS: u32 = 5;
+/// Maximum processes per user
+pub const RLIMIT_NPROC: u32 = 6;
+/// Maximum open files
+pub const RLIMIT_NOFILE: u32 = 7;
+/// Maximum locked memory (bytes)
+pub const RLIMIT_MEMLOCK: u32 = 8;
+/// Maximum address space (bytes)
+pub const RLIMIT_AS: u32 = 9;
+/// Maximum file locks
+pub const RLIMIT_LOCKS: u32 = 10;
+/// Maximum pending signals
+pub const RLIMIT_SIGPENDING: u32 = 11;
+/// Maximum POSIX message queue bytes
+pub const RLIMIT_MSGQUEUE: u32 = 12;
+/// Maximum nice priority
+pub const RLIMIT_NICE: u32 = 13;
+/// Maximum realtime priority
+pub const RLIMIT_RTPRIO: u32 = 14;
+/// Maximum realtime CPU time (microseconds)
+pub const RLIMIT_RTTIME: u32 = 15;
+/// Number of resource limits
+pub const RLIM_NLIMITS: u32 = 16;
+/// Unlimited resource value
+pub const RLIM_INFINITY: u64 = !0u64;
+
+/// Resource limit structure (matches Linux struct rlimit64)
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RLimit {
+    /// Soft limit (current enforced limit)
+    pub rlim_cur: u64,
+    /// Hard limit (maximum allowed)
+    pub rlim_max: u64,
+}
+
+impl RLimit {
+    /// Create a new RLimit
+    pub const fn new(cur: u64, max: u64) -> Self {
+        Self { rlim_cur: cur, rlim_max: max }
+    }
+}
+
 // Signal numbers
 pub const SIGHUP: u32 = 1;
 pub const SIGINT: u32 = 2;

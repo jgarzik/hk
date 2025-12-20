@@ -669,6 +669,45 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         return Err(22); // EINVAL
     }
 
+    // RLIMIT_NPROC enforcement for new processes (not threads)
+    // Following Linux pattern: increment first (atomically), then check if over limit
+    // This avoids the TOCTOU race where multiple concurrent clones could all pass
+    // a check-then-increment pattern before any of them increment.
+    let is_new_process = config.flags & CLONE_THREAD == 0;
+    let (nproc_uid, nproc_incremented) = if is_new_process {
+        let cred = current_cred();
+        let new_count = crate::task::increment_user_process_count(cred.uid);
+
+        // Check if over limit (CAP_SYS_RESOURCE bypasses)
+        if !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
+            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NPROC);
+            if limit != crate::rlimit::RLIM_INFINITY && new_count > limit {
+                // Over limit - decrement and return error
+                crate::task::decrement_user_process_count(cred.uid);
+                return Err(11); // EAGAIN - resource temporarily unavailable
+            }
+        }
+        (cred.uid, true)
+    } else {
+        (0, false) // Threads don't count toward RLIMIT_NPROC
+    };
+
+    // Helper macro to handle early returns with NPROC cleanup
+    // If we incremented the process count and then fail, we must decrement it
+    macro_rules! try_with_cleanup {
+        ($expr:expr) => {
+            match $expr {
+                Ok(val) => val,
+                Err(e) => {
+                    if nproc_incremented {
+                        crate::task::decrement_user_process_count(nproc_uid);
+                    }
+                    return Err(e);
+                }
+            }
+        };
+    }
+
     // Get current CPU ID
     let cpu_id = CurrentArch::try_current_cpu_id().unwrap_or(0);
 
@@ -687,7 +726,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_pt_phys,
     ) = {
         let table = TASK_TABLE.lock();
-        let parent = table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)?; // ESRCH - no such process
+        let parent = try_with_cleanup!(table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)); // ESRCH - no such process
         (
             parent.pid,
             parent.ppid,
@@ -731,7 +770,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     let mut stack_base: Option<u64> = None;
 
     for i in 0..stack_pages {
-        let frame = frame_alloc.alloc_frame().ok_or(12)?; // ENOMEM
+        let frame = try_with_cleanup!(frame_alloc.alloc_frame().ok_or(12)); // ENOMEM
 
         if i == 0 {
             stack_base = Some(frame);
@@ -753,7 +792,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     } else {
         // Fork: duplicate the entire user address space
         let parent_pt = ArchPageTable::new(parent_pt_phys);
-        parent_pt.duplicate_user_space(frame_alloc)?
+        try_with_cleanup!(parent_pt.duplicate_user_space(frame_alloc))
     };
 
     // Determine child's user stack pointer
@@ -841,7 +880,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Handle namespace context (CLONE_NEW* flags)
     // This must come after filesystem context since mount namespace affects VFS
-    crate::ns::copy_namespaces(current_tid, child_tid, config.flags)?;
+    try_with_cleanup!(crate::ns::copy_namespaces(
+        current_tid,
+        child_tid,
+        config.flags
+    ));
 
     // Handle signal handlers (CLONE_SIGHAND)
     // If CLONE_SIGHAND is set, child shares parent's signal handler table
@@ -931,6 +974,19 @@ pub fn exit_current() -> ! {
     if let Some(tid) = current_tid {
         rq.contexts.retain(|(t, _)| *t != tid);
         rq.nr_running = rq.nr_running.saturating_sub(1);
+
+        // Decrement user process count for process exits (thread group leader)
+        // A process exits when tid == pid (thread group leader)
+        {
+            let table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter().find(|t| t.tid == tid) {
+                // Thread group leader: tid == pid
+                if task.tid == task.pid {
+                    let cred = current_cred();
+                    crate::task::decrement_user_process_count(cred.uid);
+                }
+            }
+        }
 
         // Clean up filesystem context for exiting task
         crate::fs::exit_task_fs(tid);

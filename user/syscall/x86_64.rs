@@ -8,7 +8,7 @@
 //! - Return value in RAX
 //! - RCX and R11 are clobbered by the syscall instruction
 
-use super::{FdSet, IoVec, PollFd, SigInfo, Stat, Timespec, Timeval, UtsName};
+use super::{FdSet, IoVec, PollFd, RLimit, SigInfo, Stat, Timespec, Timeval, UtsName};
 
 // ============================================================================
 // x86_64 Linux syscall numbers
@@ -135,6 +135,11 @@ pub const SYS_SCHED_GETSCHEDULER: u64 = 145;
 pub const SYS_SCHED_RR_GET_INTERVAL: u64 = 148;
 pub const SYS_SCHED_SETAFFINITY: u64 = 203;
 pub const SYS_SCHED_GETAFFINITY: u64 = 204;
+
+// Resource limits syscalls
+pub const SYS_GETRLIMIT: u64 = 97;
+pub const SYS_SETRLIMIT: u64 = 160;
+pub const SYS_PRLIMIT64: u64 = 302;
 
 // ============================================================================
 // Syscall wrapper functions
@@ -2258,6 +2263,82 @@ pub fn sys_sched_rr_get_interval(pid: i64, tp: *mut Timespec) -> i64 {
             in("rax") SYS_SCHED_RR_GET_INTERVAL,
             in("rdi") pid as u64,
             in("rsi") tp as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+// ============================================================================
+// Resource limits syscalls
+// ============================================================================
+
+/// getrlimit(resource, rlim) - get resource limits
+///
+/// Gets the soft and hard limits for the specified resource.
+/// Returns 0 on success, or negative errno.
+#[inline(always)]
+pub fn sys_getrlimit(resource: u32, rlim: *mut RLimit) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_GETRLIMIT,
+            in("rdi") resource as u64,
+            in("rsi") rlim as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// setrlimit(resource, rlim) - set resource limits
+///
+/// Sets the soft and hard limits for the specified resource.
+/// Returns 0 on success, or negative errno.
+#[inline(always)]
+pub fn sys_setrlimit(resource: u32, rlim: *const RLimit) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_SETRLIMIT,
+            in("rdi") resource as u64,
+            in("rsi") rlim as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// prlimit64(pid, resource, new_rlim, old_rlim) - get/set resource limits
+///
+/// Gets and/or sets resource limits for a process.
+/// `pid`: Process ID (0 = calling process)
+/// `resource`: Resource type (RLIMIT_*)
+/// `new_rlim`: New limits (NULL to only get)
+/// `old_rlim`: Buffer for old limits (NULL to only set)
+/// Returns 0 on success, or negative errno.
+#[inline(always)]
+pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim: *const RLimit, old_rlim: *mut RLimit) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_PRLIMIT64,
+            in("rdi") pid as u64,
+            in("rsi") resource as u64,
+            in("rdx") new_rlim as u64,
+            in("r10") old_rlim as u64,
             lateout("rax") ret,
             out("rcx") _,
             out("r11") _,

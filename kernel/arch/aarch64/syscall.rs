@@ -169,6 +169,14 @@ pub const SYS_SCHED_YIELD: u64 = 124;
 /// sched_rr_get_interval(pid, tp)
 pub const SYS_SCHED_RR_GET_INTERVAL: u64 = 127;
 
+// Resource limits
+/// getrlimit(resource, rlim)
+pub const SYS_GETRLIMIT: u64 = 163;
+/// setrlimit(resource, rlim)
+pub const SYS_SETRLIMIT: u64 = 164;
+/// prlimit64(pid, resource, new_rlim, old_rlim)
+pub const SYS_PRLIMIT64: u64 = 261;
+
 // ============================================================================
 // Syscall dispatcher
 // ============================================================================
@@ -470,6 +478,11 @@ pub fn aarch64_syscall_dispatch(
             use crate::task::syscall::sys_getrandom;
             sys_getrandom::<Uaccess>(arg0, arg1 as usize, arg2 as u32) as u64
         }
+
+        // Resource limits
+        SYS_GETRLIMIT => crate::rlimit::sys_getrlimit(arg0 as u32, arg1) as u64,
+        SYS_SETRLIMIT => crate::rlimit::sys_setrlimit(arg0 as u32, arg1) as u64,
+        SYS_PRLIMIT64 => crate::rlimit::sys_prlimit64(arg0 as i32, arg1 as u32, arg2, arg3) as u64,
 
         // Unimplemented syscalls
         _ => {

@@ -316,6 +316,14 @@ pub const SYS_SCHED_GETAFFINITY: u64 = 204;
 /// nice(inc)
 pub const SYS_NICE: u64 = 34;
 
+// Resource limits
+/// getrlimit(resource, rlim)
+pub const SYS_GETRLIMIT: u64 = 97;
+/// setrlimit(resource, rlim)
+pub const SYS_SETRLIMIT: u64 = 160;
+/// prlimit64(pid, resource, new_rlim, old_rlim)
+pub const SYS_PRLIMIT64: u64 = 302;
+
 /// Model Specific Registers for syscall
 const MSR_EFER: u32 = 0xC000_0080; // Extended Feature Enable Register
 const MSR_STAR: u32 = 0xC000_0081; // Segment selectors for syscall/sysret
@@ -1196,6 +1204,11 @@ pub fn x86_64_syscall_dispatch(
             use crate::task::syscall::sys_getrandom;
             sys_getrandom::<Uaccess>(arg0, arg1 as usize, arg2 as u32) as u64
         }
+
+        // Resource limits
+        SYS_GETRLIMIT => crate::rlimit::sys_getrlimit(arg0 as u32, arg1) as u64,
+        SYS_SETRLIMIT => crate::rlimit::sys_setrlimit(arg0 as u32, arg1) as u64,
+        SYS_PRLIMIT64 => crate::rlimit::sys_prlimit64(arg0 as i32, arg1 as u32, arg2, arg3) as u64,
 
         _ => (-38i64) as u64, // ENOSYS
     }

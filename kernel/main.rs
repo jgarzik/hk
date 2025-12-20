@@ -43,6 +43,7 @@ mod multiboot2;
 pub mod ns;
 mod power;
 mod random;
+mod rlimit;
 pub mod signal;
 pub mod task;
 mod time_syscall;

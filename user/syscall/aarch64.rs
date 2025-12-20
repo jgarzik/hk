@@ -19,7 +19,7 @@
 //!   - No `chmod`, `chown`, `lchown` - use *at variants
 //!   - No `truncate` - use ftruncate with openat
 
-use super::{FdSet, IoVec, PollFd, SigInfo, Stat, Timespec, Timeval, UtsName, AT_FDCWD};
+use super::{FdSet, IoVec, PollFd, RLimit, SigInfo, Stat, Timespec, Timeval, UtsName, AT_FDCWD};
 
 // ============================================================================
 // aarch64 Linux syscall numbers (different from x86_64!)
@@ -139,6 +139,11 @@ pub const SYS_SCHED_GETPARAM: u64 = 121;
 pub const SYS_SCHED_SETAFFINITY: u64 = 122;
 pub const SYS_SCHED_GETAFFINITY: u64 = 123;
 pub const SYS_SCHED_RR_GET_INTERVAL: u64 = 127;
+
+// Resource limits syscalls
+pub const SYS_GETRLIMIT: u64 = 163;
+pub const SYS_SETRLIMIT: u64 = 164;
+pub const SYS_PRLIMIT64: u64 = 261;
 
 // ============================================================================
 // Syscall wrapper functions
@@ -2114,6 +2119,76 @@ pub fn sys_sched_rr_get_interval(pid: i64, tp: *mut Timespec) -> i64 {
             in("x8") SYS_SCHED_RR_GET_INTERVAL,
             in("x0") pid as u64,
             in("x1") tp as u64,
+            lateout("x0") ret,
+            clobber_abi("C"),
+        );
+    }
+    ret
+}
+
+// ============================================================================
+// Resource limits syscalls
+// ============================================================================
+
+/// getrlimit(resource, rlim) - get resource limits
+///
+/// Gets the soft and hard limits for the specified resource.
+/// Returns 0 on success, or negative errno.
+#[inline(always)]
+pub fn sys_getrlimit(resource: u32, rlim: *mut RLimit) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_GETRLIMIT,
+            in("x0") resource as u64,
+            in("x1") rlim as u64,
+            lateout("x0") ret,
+            clobber_abi("C"),
+        );
+    }
+    ret
+}
+
+/// setrlimit(resource, rlim) - set resource limits
+///
+/// Sets the soft and hard limits for the specified resource.
+/// Returns 0 on success, or negative errno.
+#[inline(always)]
+pub fn sys_setrlimit(resource: u32, rlim: *const RLimit) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_SETRLIMIT,
+            in("x0") resource as u64,
+            in("x1") rlim as u64,
+            lateout("x0") ret,
+            clobber_abi("C"),
+        );
+    }
+    ret
+}
+
+/// prlimit64(pid, resource, new_rlim, old_rlim) - get/set resource limits
+///
+/// Gets and/or sets resource limits for a process.
+/// `pid`: Process ID (0 = calling process)
+/// `resource`: Resource type (RLIMIT_*)
+/// `new_rlim`: New limits (NULL to only get)
+/// `old_rlim`: Buffer for old limits (NULL to only set)
+/// Returns 0 on success, or negative errno.
+#[inline(always)]
+pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim: *const RLimit, old_rlim: *mut RLimit) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_PRLIMIT64,
+            in("x0") pid as u64,
+            in("x1") resource as u64,
+            in("x2") new_rlim as u64,
+            in("x3") old_rlim as u64,
             lateout("x0") ret,
             clobber_abi("C"),
         );

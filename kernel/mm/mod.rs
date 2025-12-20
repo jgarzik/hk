@@ -55,6 +55,9 @@ pub struct MmStruct {
     /// Count of locked pages (in pages, not bytes)
     /// Used for resource limit checking (RLIMIT_MEMLOCK)
     locked_vm: u64,
+    /// Total virtual memory (in pages)
+    /// Used for resource limit checking (RLIMIT_AS)
+    total_vm: u64,
     /// Default flags for new VMAs (set by mlockall with MCL_FUTURE)
     /// Contains VM_LOCKED and/or VM_LOCKONFAULT when MCL_FUTURE is active
     def_flags: u32,
@@ -70,6 +73,7 @@ impl MmStruct {
             start_brk: 0,
             brk: 0,
             locked_vm: 0,
+            total_vm: 0,
             def_flags: 0,
         }
     }
@@ -202,6 +206,25 @@ impl MmStruct {
         self.locked_vm = 0;
     }
 
+    // ========================================================================
+    // Total VM tracking (for RLIMIT_AS)
+    // ========================================================================
+
+    /// Get the total virtual memory in pages
+    pub fn total_vm(&self) -> u64 {
+        self.total_vm
+    }
+
+    /// Add to the total virtual memory count
+    pub fn add_total_vm(&mut self, pages: u64) {
+        self.total_vm = self.total_vm.saturating_add(pages);
+    }
+
+    /// Subtract from the total virtual memory count
+    pub fn sub_total_vm(&mut self, pages: u64) {
+        self.total_vm = self.total_vm.saturating_sub(pages);
+    }
+
     /// Get the default VMA flags (set by mlockall MCL_FUTURE)
     pub fn def_flags(&self) -> u32 {
         self.def_flags
@@ -262,6 +285,8 @@ pub fn clone_task_mm(parent_tid: Tid, child_tid: Tid, share_vm: bool) {
             brk: parent_guard.brk,
             // Copy mlock state for fork
             locked_vm: parent_guard.locked_vm,
+            // Copy total VM for fork
+            total_vm: parent_guard.total_vm,
             def_flags: parent_guard.def_flags,
         };
         drop(parent_guard);

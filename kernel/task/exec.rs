@@ -25,8 +25,12 @@ const PAGE_SIZE: u64 = 4096;
 /// User stack virtual address (near top of user space, below canonical hole)
 const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
 
-/// Number of pages for user stack (16KB)
+/// Default number of pages for user stack (16KB)
+/// This is used if RLIMIT_STACK is larger or infinite.
 const USER_STACK_PAGES: usize = 4;
+
+/// Maximum number of pages for user stack (8MB, matching default RLIMIT_STACK)
+const MAX_STACK_PAGES: usize = 2048;
 
 /// Base address for loading PIE (position-independent) executables
 /// On aarch64, kernel identity maps 0-2GB, so PIE base must be above 2GB.
@@ -135,10 +139,21 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     envp: &[Vec<u8>],
     entry_point: u64,
 ) -> Result<u64, i32> {
-    // Allocate stack pages
-    let stack_bottom = USER_STACK_TOP - (USER_STACK_PAGES as u64 * PAGE_SIZE);
+    // Calculate stack pages based on RLIMIT_STACK
+    let stack_limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_STACK);
+    let stack_pages = if stack_limit == crate::rlimit::RLIM_INFINITY {
+        // Unlimited - use default
+        USER_STACK_PAGES
+    } else {
+        // Limit stack to RLIMIT_STACK bytes, clamped between defaults
+        let pages = (stack_limit / PAGE_SIZE) as usize;
+        pages.clamp(USER_STACK_PAGES, MAX_STACK_PAGES)
+    };
 
-    for i in 0..USER_STACK_PAGES {
+    // Allocate stack pages
+    let stack_bottom = USER_STACK_TOP - (stack_pages as u64 * PAGE_SIZE);
+
+    for i in 0..stack_pages {
         let va = stack_bottom + (i as u64 * PAGE_SIZE);
         let frame = frame_alloc.alloc_frame().ok_or(ENOMEM)?;
 
@@ -186,8 +201,8 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     // Total size (align to 16 bytes)
     let total_size = (strings_size + auxv_size + pointers_size).div_ceil(16) * 16;
 
-    // Check if it fits in stack
-    if total_size > USER_STACK_PAGES * PAGE_SIZE as usize {
+    // Check if it fits in stack (using actual allocated pages)
+    if total_size > stack_pages * PAGE_SIZE as usize {
         return Err(E2BIG);
     }
 

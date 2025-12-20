@@ -526,12 +526,17 @@ static TASK_TIF_SIGPENDING: Mutex<BTreeMap<Tid, AtomicBool>> = Mutex::new(BTreeM
 /// Initialize signal state for a new task
 ///
 /// Called when creating a new process (init, fork without CLONE_SIGHAND).
+/// Also initializes the SignalStruct (which contains rlimits).
 pub fn init_task_signal(tid: Tid, sighand: Arc<SigHand>) {
     TASK_SIGHAND.lock().insert(tid, sighand);
     TASK_SIGNAL_STATE.lock().insert(tid, TaskSignalState::new());
     TASK_TIF_SIGPENDING
         .lock()
         .insert(tid, AtomicBool::new(false));
+    // Initialize SignalStruct for new processes (contains rlimits)
+    TASK_SIGNAL
+        .lock()
+        .insert(tid, Arc::new(SignalStruct::new()));
 }
 
 /// Get a task's signal handlers
@@ -600,6 +605,10 @@ pub fn clone_task_signal(
     TASK_TIF_SIGPENDING
         .lock()
         .insert(child_tid, AtomicBool::new(false));
+
+    // Clone or share SignalStruct (contains rlimits)
+    // CLONE_THREAD (share_pending) implies threads share SignalStruct
+    clone_task_signal_struct(parent_tid, child_tid, share_pending);
 }
 
 /// Clean up signal state on task exit
@@ -607,6 +616,8 @@ pub fn exit_task_signal(tid: Tid) {
     TASK_SIGHAND.lock().remove(&tid);
     TASK_SIGNAL_STATE.lock().remove(&tid);
     TASK_TIF_SIGPENDING.lock().remove(&tid);
+    // Clean up SignalStruct (contains rlimits)
+    exit_task_signal_struct(tid);
 }
 
 // =============================================================================
@@ -813,3 +824,135 @@ pub fn default_action(sig: u32) -> DefaultAction {
 
 // Alias for SIGIO
 const SIGPOLL: u32 = SIGIO;
+
+// =============================================================================
+// SignalStruct - Per-Process Structure (mirrors Linux signal_struct)
+// =============================================================================
+
+use crate::rlimit::{RLIM_NLIMITS, RLimit, default_rlimits};
+
+/// Per-process signal structure (mirrors Linux signal_struct)
+///
+/// This structure is shared by all threads in a thread group (CLONE_THREAD).
+/// It contains:
+/// - Resource limits (rlimits)
+/// - Future: Process-wide signal state, group exit state, etc.
+///
+/// Protected by IrqSpinlock for access from interrupt context.
+///
+/// # Linux Compatibility
+///
+/// Linux stores rlimits in `signal_struct->rlim[RLIM_NLIMITS]`. We mirror
+/// this exactly so that:
+/// - Threads share rlimits (because they share SignalStruct via Arc)
+/// - Fork creates independent rlimits copies (deep clone)
+/// - prlimit64 can modify limits for the whole thread group
+pub struct SignalStruct {
+    /// Resource limits for this process
+    rlim: IrqSpinlock<[RLimit; RLIM_NLIMITS]>,
+}
+
+impl SignalStruct {
+    /// Create new SignalStruct with default rlimits
+    pub fn new() -> Self {
+        Self {
+            rlim: IrqSpinlock::new(default_rlimits()),
+        }
+    }
+
+    /// Get a resource limit
+    pub fn get_rlimit(&self, resource: u32) -> Option<RLimit> {
+        if resource as usize >= RLIM_NLIMITS {
+            return None;
+        }
+        let rlim = self.rlim.lock();
+        Some(rlim[resource as usize])
+    }
+
+    /// Set a resource limit (with permission checks)
+    ///
+    /// Validates:
+    /// - rlim_cur <= rlim_max
+    /// - Only CAP_SYS_RESOURCE can raise hard limit
+    pub fn set_rlimit(
+        &self,
+        resource: u32,
+        new: RLimit,
+        old: &RLimit,
+        has_cap_sys_resource: bool,
+    ) -> Result<(), i32> {
+        if resource as usize >= RLIM_NLIMITS {
+            return Err(-22); // EINVAL
+        }
+
+        // cur must be <= max
+        if new.rlim_cur > new.rlim_max {
+            return Err(-22); // EINVAL
+        }
+
+        // Check if raising hard limit (requires CAP_SYS_RESOURCE)
+        if new.rlim_max > old.rlim_max && !has_cap_sys_resource {
+            return Err(-1); // EPERM
+        }
+
+        let mut rlim = self.rlim.lock();
+        rlim[resource as usize] = new;
+        Ok(())
+    }
+
+    /// Deep clone for fork (without CLONE_THREAD)
+    pub fn deep_clone(self: &Arc<Self>) -> Arc<Self> {
+        let rlim = self.rlim.lock();
+        let mut new_rlim = [RLimit::default(); RLIM_NLIMITS];
+        new_rlim.copy_from_slice(&*rlim);
+        Arc::new(Self {
+            rlim: IrqSpinlock::new(new_rlim),
+        })
+    }
+}
+
+impl Default for SignalStruct {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
+// TASK_SIGNAL Global Table
+// =============================================================================
+
+/// Global table mapping TID -> Arc<SignalStruct>
+///
+/// All threads in a thread group share the same SignalStruct.
+static TASK_SIGNAL: Mutex<BTreeMap<Tid, Arc<SignalStruct>>> = Mutex::new(BTreeMap::new());
+
+/// Get a task's signal struct
+pub fn get_task_signal_struct(tid: Tid) -> Option<Arc<SignalStruct>> {
+    TASK_SIGNAL.lock().get(&tid).cloned()
+}
+
+/// Clone signal struct for fork/clone
+///
+/// If `share_signal` is true (CLONE_THREAD), share the Arc<SignalStruct>.
+/// Otherwise, deep clone the signal struct.
+fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool) {
+    let parent_signal = TASK_SIGNAL.lock().get(&parent_tid).cloned();
+
+    let child_signal = if share_signal {
+        // CLONE_THREAD: share the same SignalStruct
+        parent_signal.unwrap_or_else(|| Arc::new(SignalStruct::new()))
+    } else {
+        // Fork: deep clone
+        parent_signal
+            .as_ref()
+            .map(|s| s.deep_clone())
+            .unwrap_or_else(|| Arc::new(SignalStruct::new()))
+    };
+
+    TASK_SIGNAL.lock().insert(child_tid, child_signal);
+}
+
+/// Clean up signal struct on task exit
+fn exit_task_signal_struct(tid: Tid) {
+    TASK_SIGNAL.lock().remove(&tid);
+}

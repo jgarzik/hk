@@ -14,6 +14,7 @@ pub mod sysinfo;
 pub mod signals;
 pub mod ipc;
 pub mod mmap;
+pub mod rlimit;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -27,4 +28,5 @@ pub fn run_all_tests() {
     signals::run_tests();
     ipc::run_tests();
     mmap::run_tests();
+    rlimit::run_tests();
 }

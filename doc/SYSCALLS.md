@@ -63,11 +63,11 @@
 
 1.4 Process resource limits & usage
 
-- [ ] getrlimit
+- [x] getrlimit
 
-- [ ] setrlimit
+- [x] setrlimit
 
-- [ ] prlimit64
+- [x] prlimit64
 
 - [x] getrusage
 

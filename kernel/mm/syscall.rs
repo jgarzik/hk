@@ -16,6 +16,7 @@ use super::{
 };
 
 // Error codes (negative errno)
+const EAGAIN: i64 = -11;
 const EINVAL: i64 = -22;
 const ENOMEM: i64 = -12;
 const EBADF: i64 = -9;
@@ -140,6 +141,15 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         }
     };
 
+    // Check RLIMIT_AS (address space limit) before creating VMA
+    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_AS);
+    if limit != crate::rlimit::RLIM_INFINITY {
+        let current_bytes = mm_guard.total_vm() * PAGE_SIZE;
+        if current_bytes.saturating_add(length) > limit {
+            return ENOMEM;
+        }
+    }
+
     // Create VMA
     let mut vma = if let Some(f) = file {
         Vma::new_file(map_addr, map_addr + length, prot, flags, f, offset)
@@ -151,16 +161,27 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     // Linux: do_mmap() checks can_do_mlock() and mlock_future_ok()
     let is_map_locked = flags & MAP_LOCKED != 0;
     if is_map_locked {
-        // Permission check (stub - always allows for now)
-        // TODO: Check RLIMIT_MEMLOCK when rlimits are implemented
+        // Permission check
         if !can_do_mlock() {
             return EPERM;
+        }
+
+        // Check RLIMIT_MEMLOCK (CAP_IPC_LOCK bypasses limit)
+        let pages = length / PAGE_SIZE;
+        if !crate::task::capable(crate::task::CAP_IPC_LOCK) {
+            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK);
+            if limit != crate::rlimit::RLIM_INFINITY {
+                let current_bytes = mm_guard.locked_vm() * PAGE_SIZE;
+                let requested_bytes = pages * PAGE_SIZE;
+                if current_bytes.saturating_add(requested_bytes) > limit {
+                    return EAGAIN;
+                }
+            }
         }
 
         // Set VM_LOCKED on the VMA (MAP_LOCKED and VM_LOCKED have same value 0x2000,
         // but we set explicitly for clarity like Linux's calc_vm_flag_bits)
         vma.flags |= VM_LOCKED;
-        let pages = length / PAGE_SIZE;
         mm_guard.add_locked_vm(pages);
     }
 
@@ -169,13 +190,27 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     // but that's fine - the flag is already set, we just update locked_vm count)
     let def_flags = mm_guard.def_flags();
     if def_flags != 0 && !is_map_locked {
+        // Check RLIMIT_MEMLOCK for MCL_FUTURE locking (CAP_IPC_LOCK bypasses limit)
+        let pages = length / PAGE_SIZE;
+        if !crate::task::capable(crate::task::CAP_IPC_LOCK) {
+            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK);
+            if limit != crate::rlimit::RLIM_INFINITY {
+                let current_bytes = mm_guard.locked_vm() * PAGE_SIZE;
+                let requested_bytes = pages * PAGE_SIZE;
+                if current_bytes.saturating_add(requested_bytes) > limit {
+                    return EAGAIN;
+                }
+            }
+        }
         // Only apply def_flags if not already locked via MAP_LOCKED
         vma.flags |= def_flags;
-        let pages = length / PAGE_SIZE;
         mm_guard.add_locked_vm(pages);
     }
 
     mm_guard.insert_vma(vma);
+
+    // Update total_vm for RLIMIT_AS tracking
+    mm_guard.add_total_vm(length / PAGE_SIZE);
 
     // Populate pages if locked (MAP_LOCKED or MCL_FUTURE without ONFAULT)
     // Linux: do_mmap() sets *populate = len if VM_LOCKED is set
@@ -228,6 +263,12 @@ pub fn sys_munmap(addr: u64, length: u64) -> i64 {
 
     // Remove VMAs in range
     let removed = mm_guard.remove_range(addr, end);
+
+    // Update total_vm for RLIMIT_AS tracking
+    for vma in &removed {
+        let pages = (vma.end - vma.start) / PAGE_SIZE;
+        mm_guard.sub_total_vm(pages);
+    }
 
     // Release lock before doing page table operations
     drop(mm_guard);
@@ -421,6 +462,10 @@ pub fn sys_brk(brk: u64) -> i64 {
         // For simplicity, we remove overlapping VMAs and recreate if needed
         let removed = mm_guard.remove_range(new_brk_aligned, old_brk_aligned);
 
+        // Update total_vm for RLIMIT_AS tracking
+        let shrink_pages = (old_brk_aligned - new_brk_aligned) / PAGE_SIZE;
+        mm_guard.sub_total_vm(shrink_pages);
+
         // Update brk
         mm_guard.update_brk(brk);
 
@@ -441,6 +486,26 @@ pub fn sys_brk(brk: u64) -> i64 {
         if mm_guard.overlaps(old_brk_aligned, new_brk_aligned) {
             // Collision - cannot expand
             return current_brk as i64;
+        }
+
+        // Check RLIMIT_DATA (data segment size limit)
+        // Per Linux behavior, just return current brk on limit exceeded (no error)
+        let data_limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_DATA);
+        if data_limit != crate::rlimit::RLIM_INFINITY {
+            let new_data_size = new_brk_aligned.saturating_sub(start_brk);
+            if new_data_size > data_limit {
+                return current_brk as i64;
+            }
+        }
+
+        // Check RLIMIT_AS (address space limit)
+        let as_limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_AS);
+        if as_limit != crate::rlimit::RLIM_INFINITY {
+            let expansion_bytes = new_brk_aligned - old_brk_aligned;
+            let current_bytes = mm_guard.total_vm() * PAGE_SIZE;
+            if current_bytes.saturating_add(expansion_bytes) > as_limit {
+                return current_brk as i64;
+            }
         }
 
         // Check if there's an existing heap VMA to extend
@@ -478,6 +543,10 @@ pub fn sys_brk(brk: u64) -> i64 {
             mm_guard.insert_vma(heap_vma);
         }
 
+        // Update total_vm for RLIMIT_AS tracking
+        let expansion_pages = (new_brk_aligned - old_brk_aligned) / PAGE_SIZE;
+        mm_guard.add_total_vm(expansion_pages);
+
         // Update brk
         mm_guard.update_brk(brk);
 
@@ -492,16 +561,20 @@ pub fn sys_brk(brk: u64) -> i64 {
 
 /// Check if the current task can perform mlock operations.
 ///
-/// TODO: Check RLIMIT_MEMLOCK and CAP_IPC_LOCK when implemented.
-/// For now, always returns true since hk doesn't have swap and
-/// lacks rlimit infrastructure.
-#[allow(dead_code)]
+/// Check if the current task is permitted to lock memory.
+///
+/// A task can lock memory if:
+/// - It has CAP_IPC_LOCK capability (euid == 0)
+/// - Its RLIMIT_MEMLOCK is non-zero
+///
+/// This follows Linux's can_do_mlock() in mm/mlock.c
 fn can_do_mlock() -> bool {
-    // TODO: When RLIMIT_MEMLOCK is implemented, check:
-    //   if rlimit(RLIMIT_MEMLOCK) != 0 { return true; }
-    //   if capable(CAP_IPC_LOCK) { return true; }
-    //   return false;
-    true
+    // CAP_IPC_LOCK bypasses all mlock restrictions
+    if crate::task::capable(crate::task::CAP_IPC_LOCK) {
+        return true;
+    }
+    // Non-privileged users can mlock if RLIMIT_MEMLOCK > 0
+    crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK) > 0
 }
 
 /// Populate pages in a range by triggering demand paging.
@@ -575,7 +648,7 @@ fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
         return 0;
     }
 
-    // Permission check (stub - always allows for now)
+    // Permission check
     if !can_do_mlock() {
         return EPERM;
     }
@@ -599,9 +672,9 @@ fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
     // Following Linux behavior: lock portions that exist, succeed even if
     // some of the range has no VMA
 
-    // First pass: calculate total pages to add to locked_vm and update VMA flags
+    // First pass: calculate total pages to add to locked_vm
     let mut pages_to_add: u64 = 0;
-    for vma in mm_guard.iter_mut() {
+    for vma in mm_guard.iter() {
         // Check for overlap
         if vma.end <= start_aligned || vma.start >= end_aligned {
             continue; // No overlap
@@ -615,6 +688,26 @@ fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
         // Only count if not already locked
         if vma.flags & VM_LOCKED == 0 {
             pages_to_add += pages;
+        }
+    }
+
+    // Check RLIMIT_MEMLOCK before committing (CAP_IPC_LOCK bypasses limit)
+    if !crate::task::capable(crate::task::CAP_IPC_LOCK) {
+        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK);
+        if limit != crate::rlimit::RLIM_INFINITY {
+            let current_bytes = mm_guard.locked_vm() * PAGE_SIZE;
+            let requested_bytes = pages_to_add * PAGE_SIZE;
+            if current_bytes.saturating_add(requested_bytes) > limit {
+                return EAGAIN;
+            }
+        }
+    }
+
+    // Second pass: update VMA flags now that we've passed the limit check
+    for vma in mm_guard.iter_mut() {
+        // Check for overlap
+        if vma.end <= start_aligned || vma.start >= end_aligned {
+            continue; // No overlap
         }
 
         // Set the lock flags (clear old lock flags first, then set new ones)
@@ -754,12 +847,9 @@ pub fn sys_mlockall(flags: i32) -> i64 {
             VM_LOCKED
         };
 
-        // Collect ranges to populate (can't hold lock during page faults)
-        let mut ranges_to_populate: Vec<(u64, u64)> = Vec::new();
-        // Accumulate pages to add (can't modify locked_vm during iteration)
+        // First pass: calculate total pages to add
         let mut pages_to_add: u64 = 0;
-
-        for vma in mm_guard.iter_mut() {
+        for vma in mm_guard.iter() {
             // Calculate pages
             let pages = (vma.end - vma.start) / PAGE_SIZE;
 
@@ -767,7 +857,23 @@ pub fn sys_mlockall(flags: i32) -> i64 {
             if vma.flags & VM_LOCKED == 0 {
                 pages_to_add += pages;
             }
+        }
 
+        // Check RLIMIT_MEMLOCK before committing (CAP_IPC_LOCK bypasses limit)
+        if !crate::task::capable(crate::task::CAP_IPC_LOCK) {
+            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK);
+            if limit != crate::rlimit::RLIM_INFINITY {
+                let current_bytes = mm_guard.locked_vm() * PAGE_SIZE;
+                let requested_bytes = pages_to_add * PAGE_SIZE;
+                if current_bytes.saturating_add(requested_bytes) > limit {
+                    return EAGAIN;
+                }
+            }
+        }
+
+        // Second pass: update VMA flags and collect ranges to populate
+        let mut ranges_to_populate: Vec<(u64, u64)> = Vec::new();
+        for vma in mm_guard.iter_mut() {
             // Collect range for population if not ONFAULT
             if vm_flags & VM_LOCKONFAULT == 0 {
                 ranges_to_populate.push((vma.start, vma.end - vma.start));
