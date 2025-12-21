@@ -75,12 +75,10 @@ impl BlockDriver for RamDiskDriver {
         "ramdisk"
     }
 
-    fn readpage(&self, _disk: &Disk, frame: u64, _page_offset: u64) {
+    fn readpage(&self, _disk: &Disk, buf: &mut [u8], _page_offset: u64) {
         // For RAM disk, a read of an unallocated page returns zeros.
         // The page cache will call this when populating a new page.
-        unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, 4096);
-        }
+        buf.fill(0);
     }
 }
 

@@ -179,7 +179,7 @@ impl AddressSpaceOps for BlkdevAddressSpaceOps {
         bdev.disk
             .queue
             .driver()
-            .readpage(&bdev.disk, buf.as_ptr() as u64, page_offset);
+            .readpage(&bdev.disk, buf, page_offset);
 
         Ok(buf.len())
     }
@@ -200,7 +200,7 @@ impl AddressSpaceOps for BlkdevAddressSpaceOps {
         bdev.disk
             .queue
             .driver()
-            .writepage(&bdev.disk, buf.as_ptr() as u64, page_offset);
+            .writepage(&bdev.disk, buf, page_offset);
 
         Ok(buf.len())
     }

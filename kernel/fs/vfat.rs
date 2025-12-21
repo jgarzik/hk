@@ -272,10 +272,11 @@ fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), FsE
 
         // Read from block device AFTER releasing the lock
         if needs_read {
+            let page_buf = unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE) };
             bdev.disk
                 .queue
                 .driver()
-                .readpage(&bdev.disk, frame, page_offset);
+                .readpage(&bdev.disk, page_buf, page_offset);
         }
 
         // Copy data from page to buffer
@@ -329,10 +330,12 @@ fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), FsErro
 
         // If this is a partial page write and the page is new, read existing data first
         if needs_read && (offset_in_page != 0 || chunk_size != PAGE_SIZE) {
+            let page_buf =
+                unsafe { core::slice::from_raw_parts_mut(page.frame as *mut u8, PAGE_SIZE) };
             bdev.disk
                 .queue
                 .driver()
-                .readpage(&bdev.disk, page.frame, page_offset);
+                .readpage(&bdev.disk, page_buf, page_offset);
         }
 
         // Write data to page
@@ -348,10 +351,11 @@ fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), FsErro
         page.mark_dirty();
 
         // Write page to disk (write-through for now, will add proper writeback later)
+        let page_buf = unsafe { core::slice::from_raw_parts(page.frame as *const u8, PAGE_SIZE) };
         bdev.disk
             .queue
             .driver()
-            .writepage(&bdev.disk, page.frame, page_offset);
+            .writepage(&bdev.disk, page_buf, page_offset);
 
         pos += chunk_size as u64;
         buf_offset += chunk_size;
