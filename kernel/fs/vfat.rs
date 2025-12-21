@@ -1804,6 +1804,11 @@ impl InodeOps for VfatInodeOps {
             return Err(FsError::IsADirectory);
         }
 
+        // FAT32 file size limit is 4 GiB - 1 (u32::MAX)
+        if length > u32::MAX as u64 {
+            return Err(FsError::FileTooLarge);
+        }
+
         let old_size = inode_data.file_size as u64;
         let new_size = length as u32;
         let cluster_size = sb_data.cluster_size as u64;
@@ -1839,6 +1844,9 @@ impl InodeOps for VfatInodeOps {
                     // Free remaining clusters
                     free_cluster_chain(&sb_data, chain[new_clusters])?;
                 }
+                // If chain.len() <= new_clusters, the on-disk chain is already
+                // at or below the target size (possibly due to FS inconsistency).
+                // Nothing to free; the chain's last cluster should already be EOC.
             }
         } else if new_clusters > old_clusters {
             // Extending: allocate more clusters
