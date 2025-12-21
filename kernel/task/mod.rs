@@ -466,7 +466,13 @@ impl<F> FdTable<F> {
     /// returns Err(EMFILE). Pass `u64::MAX` to disable limit.
     ///
     /// Returns Err(EBADF) if the fd is already in use.
-    pub fn alloc_at_with_flags(&mut self, fd: Fd, file: Arc<F>, flags: u32, nofile: u64) -> Result<(), i32> {
+    pub fn alloc_at_with_flags(
+        &mut self,
+        fd: Fd,
+        file: Arc<F>,
+        flags: u32,
+        nofile: u64,
+    ) -> Result<(), i32> {
         // RLIMIT_NOFILE enforcement
         if (fd as u64) >= nofile {
             return Err(24); // EMFILE - too many open files
@@ -488,7 +494,13 @@ impl<F> FdTable<F> {
     /// would be >= nofile, returns Err(EMFILE).
     ///
     /// Following Linux pattern: RLIMIT_NOFILE is enforced inside allocation.
-    pub fn alloc_at_or_above(&mut self, file: Arc<F>, min_fd: Fd, flags: u32, nofile: u64) -> Result<Fd, i32> {
+    pub fn alloc_at_or_above(
+        &mut self,
+        file: Arc<F>,
+        min_fd: Fd,
+        flags: u32,
+        nofile: u64,
+    ) -> Result<Fd, i32> {
         let mut fd = min_fd;
         while self.files.contains_key(&fd) {
             fd += 1;

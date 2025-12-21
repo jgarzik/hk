@@ -19,7 +19,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::frame_alloc::FrameAllocRef;
-use crate::mm::page_cache::{FileId, NULL_AOPS, PAGE_SIZE};
+use crate::mm::page_cache::{BLKDEV_AOPS, FileId, PAGE_SIZE};
 use crate::storage::BlockDevice;
 use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
@@ -255,16 +255,16 @@ fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), FsE
         let (frame, needs_read) = {
             let mut cache = PAGE_CACHE.lock();
             let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-            // Use NULL_AOPS for read path (writeback handled separately)
+            // Use BLKDEV_AOPS for disk-backed page cache with writeback support
             let (page, is_new) = cache
                 .find_or_create_page(
                     file_id,
                     page_offset,
                     capacity,
                     &mut frame_alloc,
-                    true,  // can_writeback for vfat
+                    true,  // can_writeback: uses BLKDEV_AOPS for disk I/O
                     false, // not unevictable (disk-backed)
-                    &NULL_AOPS,
+                    &BLKDEV_AOPS,
                 )
                 .map_err(|_| FsError::IoError)?;
             (page.frame, is_new)
@@ -319,9 +319,9 @@ fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), FsErro
                     page_offset,
                     capacity,
                     &mut frame_alloc,
-                    true,  // can_writeback for vfat
+                    true,  // can_writeback: uses BLKDEV_AOPS for disk I/O
                     false, // not unevictable (disk-backed)
-                    &NULL_AOPS,
+                    &BLKDEV_AOPS,
                 )
                 .map_err(|_| FsError::IoError)?;
             (page, is_new)

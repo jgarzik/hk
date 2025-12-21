@@ -154,6 +154,61 @@ impl AddressSpaceOps for NullAddressSpaceOps {
 /// Global null address space ops instance
 pub static NULL_AOPS: NullAddressSpaceOps = NullAddressSpaceOps;
 
+/// Block device address space operations for disk-backed filesystems.
+///
+/// Used by filesystems like VFAT that store data on block devices.
+/// This implementation looks up the block device from the global registry
+/// using the major/minor encoded in the FileId.
+pub struct BlkdevAddressSpaceOps;
+
+impl AddressSpaceOps for BlkdevAddressSpaceOps {
+    fn readpage(&self, file_id: FileId, page_offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        use crate::storage::{BLKDEV_REGISTRY, DevId};
+
+        // Extract major/minor from FileId
+        // Format: 0x8000_0000_0000_0000 | (major << 20) | minor
+        let encoded = file_id.0 & 0x7FFF_FFFF_FFFF_FFFF;
+        let major = ((encoded >> 20) & 0xFFFF) as u16;
+        let minor = (encoded & 0xFFFFF) as u16;
+
+        // Look up the block device
+        let dev_id = DevId { major, minor };
+        let bdev = BLKDEV_REGISTRY.read().get(dev_id).ok_or(-5i32)?; // EIO if device not found
+
+        // Read the page from the block device
+        bdev.disk
+            .queue
+            .driver()
+            .readpage(&bdev.disk, buf.as_ptr() as u64, page_offset);
+
+        Ok(buf.len())
+    }
+
+    fn writepage(&self, file_id: FileId, page_offset: u64, buf: &[u8]) -> Result<usize, i32> {
+        use crate::storage::{BLKDEV_REGISTRY, DevId};
+
+        // Extract major/minor from FileId
+        let encoded = file_id.0 & 0x7FFF_FFFF_FFFF_FFFF;
+        let major = ((encoded >> 20) & 0xFFFF) as u16;
+        let minor = (encoded & 0xFFFFF) as u16;
+
+        // Look up the block device
+        let dev_id = DevId { major, minor };
+        let bdev = BLKDEV_REGISTRY.read().get(dev_id).ok_or(-5i32)?; // EIO if device not found
+
+        // Write the page to the block device
+        bdev.disk
+            .queue
+            .driver()
+            .writepage(&bdev.disk, buf.as_ptr() as u64, page_offset);
+
+        Ok(buf.len())
+    }
+}
+
+/// Global block device address space ops instance
+pub static BLKDEV_AOPS: BlkdevAddressSpaceOps = BlkdevAddressSpaceOps;
+
 /// A single cached page
 ///
 /// Each page has its own lock (similar to Linux's PG_locked) for synchronizing

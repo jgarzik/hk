@@ -246,6 +246,7 @@ fn test_select_data_ready() {
 
     // Set up fd_set for read_fd
     let mut readfds = FdSet::new();
+    readfds.zero(); // Ensure proper zeroing (volatile writes)
     readfds.set(read_fd);
 
     // Timeout 0 (immediate)
@@ -284,6 +285,7 @@ fn test_select_no_data() {
 
     // Don't write data
     let mut readfds = FdSet::new();
+    readfds.zero(); // Ensure proper zeroing (volatile writes)
     readfds.set(read_fd);
 
     // Timeout 0 (immediate)

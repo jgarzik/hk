@@ -72,14 +72,17 @@ impl FdSet {
     }
 
     pub fn zero(&mut self) {
-        self.bits = [0; 16];
+        // Use volatile writes to ensure compiler doesn't optimize away the zeroing
+        for i in 0..16 {
+            unsafe { core::ptr::write_volatile(&mut self.bits[i], 0) };
+        }
     }
 
     pub fn set(&mut self, fd: i32) {
         if fd >= 0 && fd < 1024 {
             let idx = fd as usize / 64;
             let bit = fd as usize % 64;
-            self.bits[idx] |= 1 << bit;
+            self.bits[idx] |= 1u64 << bit;
         }
     }
 
