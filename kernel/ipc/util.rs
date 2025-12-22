@@ -138,6 +138,21 @@ impl KernIpcPerm {
 }
 
 // ============================================================================
+// IPC Object Type Tag
+// ============================================================================
+
+/// IPC object type discriminant for safe downcasting
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcType {
+    /// Shared memory segment
+    Shm,
+    /// Semaphore array
+    Sem,
+    /// Message queue
+    Msg,
+}
+
+// ============================================================================
 // IPC Object Trait
 // ============================================================================
 
@@ -145,6 +160,9 @@ impl KernIpcPerm {
 pub trait IpcObject: Send + Sync {
     /// Get the permission structure
     fn perm(&self) -> &KernIpcPerm;
+
+    /// Get the IPC object type for safe downcasting
+    fn ipc_type(&self) -> IpcType;
 
     /// Called when object should be freed
     fn destroy(&self);

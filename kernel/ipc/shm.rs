@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, Ordering};
 
 use crate::arch::Uaccess;
 use crate::ipc::util::{
-    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, KernIpcPerm, ipc_checkperm, ipcget,
+    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcType, KernIpcPerm, ipc_checkperm, ipcget,
 };
 use crate::ipc::{IPC_64, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Shmid64Ds, current_ipc_ns};
 use crate::mm::vma::{
@@ -143,6 +143,10 @@ impl IpcObject for ShmidKernel {
         &self.perm
     }
 
+    fn ipc_type(&self) -> IpcType {
+        IpcType::Shm
+    }
+
     fn destroy(&self) {
         // Free all frames
         let frames = self.frames.lock();
@@ -153,6 +157,24 @@ impl IpcObject for ShmidKernel {
         // Update namespace totals
         let pages = frames.len() as u64;
         self.ns.shm_tot.fetch_sub(pages, Ordering::Relaxed);
+    }
+}
+
+// ============================================================================
+// Safe Downcasting
+// ============================================================================
+
+/// Safely downcast an IpcObject to ShmidKernel
+///
+/// Returns None if the object is not a shared memory segment.
+/// This is safe because we verify the type tag before casting.
+fn downcast_shm(obj: &dyn IpcObject) -> Option<&ShmidKernel> {
+    if obj.ipc_type() == IpcType::Shm {
+        // SAFETY: We verified the type tag matches, so this cast is valid.
+        // The IpcType::Shm tag is only returned by ShmidKernel::ipc_type().
+        Some(unsafe { &*(obj as *const dyn IpcObject as *const ShmidKernel) })
+    } else {
+        None
     }
 }
 
@@ -241,9 +263,14 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
         return Err(e);
     }
 
-    // Get the ShmidKernel
-    let shm_kernel: &ShmidKernel =
-        unsafe { &*(shm_obj.as_ref() as *const dyn IpcObject as *const ShmidKernel) };
+    // Get the ShmidKernel (safe downcast with type verification)
+    let shm_kernel: &ShmidKernel = match downcast_shm(shm_obj.as_ref()) {
+        Some(shm) => shm,
+        None => {
+            perm.put_ref();
+            return Err(EINVAL);
+        }
+    };
 
     let size = shm_kernel.segsz;
 
@@ -466,8 +493,10 @@ fn do_shmdt(shmaddr: u64) -> Result<i32, i32> {
 
     // Update segment statistics
     if let Some(shm_obj) = ns.shm_ids().find_by_id(shmid) {
-        let shm_kernel: &ShmidKernel =
-            unsafe { &*(shm_obj.as_ref() as *const dyn IpcObject as *const ShmidKernel) };
+        let shm_kernel: &ShmidKernel = match downcast_shm(shm_obj.as_ref()) {
+            Some(shm) => shm,
+            None => return Err(EINVAL),
+        };
 
         let old_nattch = shm_kernel.nattch.fetch_sub(1, Ordering::Relaxed);
         shm_kernel
@@ -512,9 +541,11 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             // Fill and copy structure
             let mut ds = Shmid64Ds::default();
 
-            // Downcast safely
-            let shm_kernel: &ShmidKernel =
-                unsafe { &*(shm.as_ref() as *const dyn IpcObject as *const ShmidKernel) };
+            // Downcast safely with type verification
+            let shm_kernel: &ShmidKernel = match downcast_shm(shm.as_ref()) {
+                Some(shm) => shm,
+                None => return Err(EINVAL),
+            };
             shm_kernel.fill_shmid64_ds(&mut ds);
 
             if buf != 0 {
@@ -550,9 +581,14 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                 (*perm_mut).mode = ds.shm_perm.mode & 0o777;
             }
 
-            // Update ctime
-            let shm_kernel: &ShmidKernel =
-                unsafe { &*(shm.as_ref() as *const dyn IpcObject as *const ShmidKernel) };
+            // Update ctime (safe downcast with type verification)
+            let shm_kernel: &ShmidKernel = match downcast_shm(shm.as_ref()) {
+                Some(shm) => shm,
+                None => {
+                    perm.put_ref();
+                    return Err(EINVAL);
+                }
+            };
             shm_kernel
                 .ctim
                 .store(current_time_secs(), Ordering::Relaxed);
@@ -576,13 +612,13 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
 
             // Remove from ID table
             if let Some(removed) = ns.shm_ids().remove(shmid) {
-                // If no attachments, destroy immediately
-                let shm_kernel: &ShmidKernel =
-                    unsafe { &*(removed.as_ref() as *const dyn IpcObject as *const ShmidKernel) };
-                if shm_kernel.nattch.load(Ordering::Relaxed) == 0 {
+                // If no attachments, destroy immediately (safe downcast with type verification)
+                // Otherwise, segment will be destroyed when last process detaches
+                if let Some(shm_kernel) = downcast_shm(removed.as_ref())
+                    && shm_kernel.nattch.load(Ordering::Relaxed) == 0
+                {
                     removed.destroy();
                 }
-                // Otherwise, segment will be destroyed when last process detaches
             }
 
             Ok(0)

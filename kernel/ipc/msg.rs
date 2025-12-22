@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64,
 
 use crate::arch::Uaccess;
 use crate::ipc::util::{
-    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, KernIpcPerm, ipc_checkperm, ipcget,
+    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcType, KernIpcPerm, ipc_checkperm, ipcget,
 };
 use crate::ipc::{
     IPC_64, IPC_NOWAIT, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Msqid64Ds, current_ipc_ns,
@@ -258,6 +258,10 @@ impl MsgQueue {
 impl IpcObject for MsgQueue {
     fn perm(&self) -> &KernIpcPerm {
         &self.perm
+    }
+
+    fn ipc_type(&self) -> IpcType {
+        IpcType::Msg
     }
 
     fn destroy(&self) {

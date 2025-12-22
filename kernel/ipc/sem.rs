@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 
 use crate::arch::Uaccess;
 use crate::ipc::util::{
-    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, KernIpcPerm, ipc_checkperm, ipcget,
+    IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcType, KernIpcPerm, ipc_checkperm, ipcget,
 };
 use crate::ipc::{
     IPC_64, IPC_NOWAIT, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Sembuf, Semid64Ds,
@@ -237,6 +237,10 @@ impl SemArray {
 impl IpcObject for SemArray {
     fn perm(&self) -> &KernIpcPerm {
         &self.perm
+    }
+
+    fn ipc_type(&self) -> IpcType {
+        IpcType::Sem
     }
 
     fn destroy(&self) {
