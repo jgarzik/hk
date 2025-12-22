@@ -87,7 +87,9 @@ pub enum NamespaceType {
     Pid,
     /// User namespace (UID/GID mapping)
     User,
-    // Future: Ipc, Net, Cgroup, Time
+    /// IPC namespace (SysV IPC)
+    Ipc,
+    // Future: Net, Cgroup, Time
 }
 
 impl NamespaceType {
@@ -98,6 +100,7 @@ impl NamespaceType {
             Self::Mnt => "mnt",
             Self::Pid => "pid",
             Self::User => "user",
+            Self::Ipc => "ipc",
         }
     }
 
@@ -108,6 +111,7 @@ impl NamespaceType {
             "mnt" => Some(Self::Mnt),
             "pid" => Some(Self::Pid),
             "user" => Some(Self::User),
+            "ipc" => Some(Self::Ipc),
             _ => None,
         }
     }
@@ -119,12 +123,13 @@ impl NamespaceType {
             Self::Mnt => crate::ns::CLONE_NEWNS,
             Self::Pid => crate::ns::CLONE_NEWPID,
             Self::User => crate::ns::CLONE_NEWUSER,
+            Self::Ipc => crate::ns::CLONE_NEWIPC,
         }
     }
 
     /// List of all supported namespace types
     pub fn all() -> &'static [NamespaceType] {
-        &[Self::Uts, Self::Mnt, Self::Pid, Self::User]
+        &[Self::Uts, Self::Mnt, Self::Pid, Self::User, Self::Ipc]
     }
 }
 
@@ -411,6 +416,7 @@ fn lookup_pid_ns_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, 
         NamespaceType::Mnt => 3,
         NamespaceType::Pid => 4,
         NamespaceType::User => 5,
+        NamespaceType::Ipc => 6,
     };
 
     let inode = Arc::new(Inode::new(

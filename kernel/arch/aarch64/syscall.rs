@@ -211,6 +211,40 @@ pub const SYS_SHUTDOWN: u64 = 210;
 /// accept4(fd, addr, addrlen, flags)
 pub const SYS_ACCEPT4: u64 = 242;
 
+// Futex syscalls (aarch64 numbers)
+/// futex(uaddr, futex_op, val, timeout, uaddr2, val3)
+pub const SYS_FUTEX: u64 = 98;
+/// set_robust_list(head, len)
+pub const SYS_SET_ROBUST_LIST: u64 = 99;
+/// get_robust_list(pid, head_ptr, len_ptr)
+pub const SYS_GET_ROBUST_LIST: u64 = 100;
+
+// SysV IPC syscalls (aarch64 numbers)
+/// msgget(key, msgflg)
+pub const SYS_MSGGET: u64 = 186;
+/// msgctl(msqid, cmd, buf)
+pub const SYS_MSGCTL: u64 = 187;
+/// msgrcv(msqid, msgp, msgsz, msgtyp, msgflg)
+pub const SYS_MSGRCV: u64 = 188;
+/// msgsnd(msqid, msgp, msgsz, msgflg)
+pub const SYS_MSGSND: u64 = 189;
+/// semget(key, nsems, semflg)
+pub const SYS_SEMGET: u64 = 190;
+/// semctl(semid, semnum, cmd, ...)
+pub const SYS_SEMCTL: u64 = 191;
+/// semtimedop(semid, sops, nsops, timeout)
+pub const SYS_SEMTIMEDOP: u64 = 192;
+/// semop(semid, sops, nsops)
+pub const SYS_SEMOP: u64 = 193;
+/// shmget(key, size, shmflg)
+pub const SYS_SHMGET: u64 = 194;
+/// shmctl(shmid, cmd, buf)
+pub const SYS_SHMCTL: u64 = 195;
+/// shmat(shmid, shmaddr, shmflg)
+pub const SYS_SHMAT: u64 = 196;
+/// shmdt(shmaddr)
+pub const SYS_SHMDT: u64 = 197;
+
 // ============================================================================
 // Syscall dispatcher
 // ============================================================================
@@ -575,6 +609,30 @@ pub fn aarch64_syscall_dispatch(
             use crate::net::syscall::sys_recvfrom;
             sys_recvfrom(arg0 as i32, arg1, arg2, arg3 as i32, arg4, _arg5) as u64
         }
+
+        // Futex syscalls
+        SYS_FUTEX => {
+            crate::futex::sys_futex(arg0, arg1 as u32, arg2 as u32, arg3, arg4, _arg5 as u32) as u64
+        }
+        SYS_SET_ROBUST_LIST => crate::futex::sys_set_robust_list(arg0, arg1) as u64,
+        SYS_GET_ROBUST_LIST => crate::futex::sys_get_robust_list(arg0 as i32, arg1, arg2) as u64,
+
+        // SysV IPC syscalls
+        SYS_SHMGET => crate::ipc::sys_shmget(arg0 as i32, arg1 as usize, arg2 as i32) as u64,
+        SYS_SHMAT => crate::ipc::sys_shmat(arg0 as i32, arg1, arg2 as i32) as u64,
+        SYS_SHMDT => crate::ipc::sys_shmdt(arg0) as u64,
+        SYS_SHMCTL => crate::ipc::sys_shmctl(arg0 as i32, arg1 as i32, arg2) as u64,
+        SYS_SEMGET => crate::ipc::sys_semget(arg0 as i32, arg1 as i32, arg2 as i32) as u64,
+        SYS_SEMOP => crate::ipc::sys_semop(arg0 as i32, arg1, arg2 as usize) as u64,
+        SYS_SEMTIMEDOP => crate::ipc::sys_semtimedop(arg0 as i32, arg1, arg2 as usize, arg3) as u64,
+        SYS_SEMCTL => crate::ipc::sys_semctl(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64,
+        SYS_MSGGET => crate::ipc::sys_msgget(arg0 as i32, arg1 as i32) as u64,
+        SYS_MSGSND => crate::ipc::sys_msgsnd(arg0 as i32, arg1, arg2 as usize, arg3 as i32) as u64,
+        SYS_MSGRCV => {
+            crate::ipc::sys_msgrcv(arg0 as i32, arg1, arg2 as usize, arg3 as i64, arg4 as i32)
+                as u64
+        }
+        SYS_MSGCTL => crate::ipc::sys_msgctl(arg0 as i32, arg1 as i32, arg2) as u64,
 
         // Unimplemented syscalls
         _ => {

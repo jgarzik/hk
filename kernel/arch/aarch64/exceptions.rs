@@ -298,20 +298,27 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
 
     // Map the page
     let page_addr = fault_addr & !0xFFF;
-    if map_user_page_aarch64(pt_root, page_addr, frame, attrs).is_err() {
+    if map_user_page(pt_root, page_addr, frame, attrs).is_err() {
         // Mapping failed, free the frame
         crate::FRAME_ALLOCATOR.free(frame);
         return Some(false);
     }
-
-    // Flush TLB for this address
-    crate::arch::aarch64::paging::flush_tlb(page_addr);
+    // TLB is flushed by map_user_page
 
     Some(true)
 }
 
-/// Map a user page, allocating intermediate page tables as needed (aarch64)
-fn map_user_page_aarch64(l0_phys: u64, vaddr: u64, paddr: u64, attrs: u64) -> Result<(), ()> {
+/// Map a user page, allocating intermediate page tables as needed
+///
+/// This function is used by demand paging and shmat to map physical frames
+/// into a user process's address space.
+///
+/// # Arguments
+/// * `ttbr0` - Physical address of the L0 table (page table root)
+/// * `vaddr` - Virtual address to map (page-aligned)
+/// * `paddr` - Physical address to map to
+/// * `attrs` - Page table entry attributes
+pub fn map_user_page(ttbr0: u64, vaddr: u64, paddr: u64, attrs: u64) -> Result<(), ()> {
     let l0_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let l1_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let l2_idx = ((vaddr >> 21) & 0x1FF) as usize;
@@ -321,7 +328,7 @@ fn map_user_page_aarch64(l0_phys: u64, vaddr: u64, paddr: u64, attrs: u64) -> Re
     const TABLE_DESC: u64 = 0b11;
 
     unsafe {
-        let l0 = l0_phys as *mut u64;
+        let l0 = ttbr0 as *mut u64;
 
         // Get or create L1 table
         let l0_entry = *l0.add(l0_idx);
@@ -359,6 +366,72 @@ fn map_user_page_aarch64(l0_phys: u64, vaddr: u64, paddr: u64, attrs: u64) -> Re
         // Set the L3 entry (page descriptor)
         *l3.add(l3_idx) = paddr | attrs;
 
+        // Flush TLB for this address
+        crate::arch::aarch64::paging::flush_tlb(vaddr);
+
         Ok(())
+    }
+}
+
+/// Unmap a user page
+///
+/// Clears the page table entry for the given virtual address and flushes the TLB.
+/// Returns the physical address that was mapped, or None if not mapped.
+///
+/// # Arguments
+/// * `ttbr0` - Physical address of the L0 table (page table root)
+/// * `vaddr` - Virtual address to unmap (page-aligned)
+pub fn unmap_user_page(ttbr0: u64, vaddr: u64) -> Option<u64> {
+    let l0_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let l1_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let l2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let l3_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+    // Table descriptor: bits [1:0] = 0b11
+    const TABLE_DESC: u64 = 0b11;
+    // Page descriptor: bits [1:0] = 0b11 for valid page
+    const PAGE_VALID: u64 = 0b11;
+
+    unsafe {
+        // L0
+        let l0 = ttbr0 as *const u64;
+        let l0_entry = *l0.add(l0_idx);
+        if (l0_entry & 0b11) != TABLE_DESC {
+            return None;
+        }
+
+        // L1
+        let l1 = (l0_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l1_entry = *l1.add(l1_idx);
+        if (l1_entry & 0b11) != TABLE_DESC {
+            return None;
+        }
+
+        // L2
+        let l2 = (l1_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l2_entry = *l2.add(l2_idx);
+        if (l2_entry & 0b11) != TABLE_DESC {
+            return None;
+        }
+
+        // L3
+        let l3 = (l2_entry & 0x0000_FFFF_FFFF_F000) as *mut u64;
+        let l3_ptr = l3.add(l3_idx);
+        let l3_entry = *l3_ptr;
+
+        if (l3_entry & PAGE_VALID) != PAGE_VALID {
+            return None;
+        }
+
+        // Get physical address before clearing
+        let phys = l3_entry & 0x0000_FFFF_FFFF_F000;
+
+        // Clear the entry
+        *l3_ptr = 0;
+
+        // Flush TLB for this address
+        crate::arch::aarch64::paging::flush_tlb(vaddr);
+
+        Some(phys)
     }
 }

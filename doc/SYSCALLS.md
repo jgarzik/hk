@@ -5,7 +5,9 @@
 
 - [x] vfork
 
-- [x] clone / clone3 (Linux thread/process creation)
+- [x] clone (Linux thread/process creation)
+
+- [ ] clone3
 
 - [x] execve
 
@@ -196,7 +198,7 @@ man7.org
 
 - [x] fstat
 
-- [ ] newfstatat / fstatat64
+- [x] newfstatat / fstatat64 (aarch64)
 
 - [ ] statfs
 
@@ -294,6 +296,8 @@ Extended attributes (Linux-specific):
 - [x] mlockall
 
 - [x] munlockall
+
+- [x] mlock2
 
 - [ ] mincore
 
@@ -399,7 +403,11 @@ linasm.sourceforge.net
 
 7.2 Futex (core for modern libs/threads)
 
-- [ ] futex
+- [x] futex (WAIT, WAKE, WAIT_BITSET, WAKE_BITSET, REQUEUE, CMP_REQUEUE)
+
+- [x] set_robust_list
+
+- [x] get_robust_list
 
 - [ ] futex_waitv (newer multi-wait variant on some kernels)
 
@@ -445,34 +453,34 @@ linasm.sourceforge.net
 
 8. Networking & sockets
 
-Linux groups the socket syscalls as their own “network” category.
+Linux groups the socket syscalls as their own "network" category.
 linasm.sourceforge.net
 
-- [ ] socket
+- [x] socket
 
 - [ ] socketpair
 
-- [ ] bind
+- [x] bind
 
-- [ ] listen
+- [x] listen
 
-- [ ] accept
+- [x] accept
 
-- [ ] accept4
+- [x] accept4
 
-- [ ] connect
+- [x] connect
 
-- [ ] getsockname
+- [x] getsockname
 
-- [ ] getpeername
+- [x] getpeername
 
-- [ ] getsockopt
+- [x] getsockopt
 
-- [ ] setsockopt
+- [x] setsockopt
 
-- [ ] sendto
+- [x] sendto
 
-- [ ] recvfrom
+- [x] recvfrom
 
 - [ ] sendmsg
 
@@ -482,17 +490,7 @@ linasm.sourceforge.net
 
 - [ ] recvmmsg
 
-- [ ] shutdown
-
-Ancillary:
-
-- [ ] recvmmsg
-
-- [ ] sendmmsg
-
-- [ ] getsockopt
-
-- [ ] setsockopt
+- [x] shutdown
 
 9. Polling & event notification
 9.1 Select/poll/epoll
@@ -612,7 +610,7 @@ linasm.sourceforge.net
 
 - [x] unshare
 - [x] setns
-- [x] clone / clone3 with namespace flags
+- [x] clone with namespace flags
 
 11.3 Host identity
 

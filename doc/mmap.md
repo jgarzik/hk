@@ -87,7 +87,10 @@ pub struct MmStruct {
     vmas: Vec<Vma>,      // Sorted by start address
     mmap_base: u64,      // Base for free area search
     mmap_end: u64,       // End of mmap region
+    start_brk: u64,      // Initial program break (heap start)
+    brk: u64,            // Current program break
     locked_vm: u64,      // Count of locked pages
+    total_vm: u64,       // Total virtual memory (for RLIMIT_AS)
     def_flags: u32,      // Default VMA flags (for mlockall MCL_FUTURE)
 }
 ```
@@ -258,9 +261,10 @@ int munlockall(void);
 | kernel/mm/vma.rs | VMA struct, PROT_*, MAP_*, VM_LOCKED* constants |
 | kernel/mm/mod.rs | MmStruct, TASK_MM table, lifecycle functions |
 | kernel/mm/syscall.rs | sys_mmap, sys_munmap, mlock syscalls |
+| kernel/mm/page_cache.rs | Page cache infrastructure for file-backed mappings |
+| kernel/mm/writeback.rs | Dirty page writeback for file-backed mappings |
 | kernel/arch/x86_64/interrupts.rs | x86-64 demand paging handler |
 | kernel/arch/aarch64/exceptions.rs | aarch64 demand paging handler |
-| user/syscall/{x86_64,aarch64}.rs | Userspace syscall wrappers |
 | user/tests/mmap.rs | Boot tester mmap tests |
 
 ## References

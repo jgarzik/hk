@@ -692,7 +692,16 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
 }
 
 /// Map a user page, allocating intermediate page tables as needed
-fn map_user_page(cr3: u64, vaddr: u64, paddr: u64, flags: u64) -> Result<(), ()> {
+///
+/// This function is used by demand paging and shmat to map physical frames
+/// into a user process's address space.
+///
+/// # Arguments
+/// * `cr3` - Physical address of the PML4 (page table root)
+/// * `vaddr` - Virtual address to map (page-aligned)
+/// * `paddr` - Physical address to map to
+/// * `flags` - Page table entry flags (PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, etc.)
+pub fn map_user_page(cr3: u64, vaddr: u64, paddr: u64, flags: u64) -> Result<(), ()> {
     use crate::arch::x86_64::paging::{PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
 
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
@@ -739,7 +748,84 @@ fn map_user_page(cr3: u64, vaddr: u64, paddr: u64, flags: u64) -> Result<(), ()>
         // Set the PTE
         *pt.add(pt_idx) = paddr | flags;
 
+        // Flush TLB for this address
+        ::core::arch::asm!(
+            "invlpg [{}]",
+            in(reg) vaddr,
+            options(nostack, preserves_flags)
+        );
+
         Ok(())
+    }
+}
+
+/// Unmap a user page
+///
+/// Clears the page table entry for the given virtual address and flushes the TLB.
+/// Returns the physical address that was mapped, or None if not mapped.
+///
+/// # Arguments
+/// * `cr3` - Physical address of the PML4 (page table root)
+/// * `vaddr` - Virtual address to unmap (page-aligned)
+pub fn unmap_user_page(cr3: u64, vaddr: u64) -> Option<u64> {
+    use crate::arch::x86_64::paging::{PAGE_HUGE, PAGE_PRESENT};
+
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        // PML4
+        let pml4 = cr3 as *const u64;
+        let pml4_entry = *pml4.add(pml4_idx);
+        if pml4_entry & PAGE_PRESENT == 0 {
+            return None;
+        }
+
+        // PDPT
+        let pdpt = (pml4_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pdpt_entry = *pdpt.add(pdpt_idx);
+        if pdpt_entry & PAGE_PRESENT == 0 {
+            return None;
+        }
+        if pdpt_entry & PAGE_HUGE != 0 {
+            return None; // 1GB huge page, not handling
+        }
+
+        // PD
+        let pd = (pdpt_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pd_entry = *pd.add(pd_idx);
+        if pd_entry & PAGE_PRESENT == 0 {
+            return None;
+        }
+        if pd_entry & PAGE_HUGE != 0 {
+            return None; // 2MB huge page, not handling
+        }
+
+        // PT
+        let pt = (pd_entry & 0x000F_FFFF_FFFF_F000) as *mut u64;
+        let pte_ptr = pt.add(pt_idx);
+        let pte_value = *pte_ptr;
+
+        if pte_value & PAGE_PRESENT == 0 {
+            return None;
+        }
+
+        // Get physical address before clearing
+        let phys = pte_value & 0x000F_FFFF_FFFF_F000;
+
+        // Clear the entry
+        *pte_ptr = 0;
+
+        // Flush TLB for this address
+        ::core::arch::asm!(
+            "invlpg [{}]",
+            in(reg) vaddr,
+            options(nostack, preserves_flags)
+        );
+
+        Some(phys)
     }
 }
 

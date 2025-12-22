@@ -40,6 +40,10 @@ pub const VM_LOCKONFAULT: u32 = 0x0001_0000;
 /// Combined mask for all lock-related VMA flags
 pub const VM_LOCKED_MASK: u32 = VM_LOCKED | VM_LOCKONFAULT;
 
+/// VMA is backed by System V shared memory segment
+/// Uses a high bit to avoid conflicts with standard flags
+pub const VM_SHM: u32 = 0x0002_0000;
+
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
 

@@ -154,6 +154,20 @@ pub const SYS_GETPEERNAME: u64 = 52;
 pub const SYS_SETSOCKOPT: u64 = 54;
 pub const SYS_GETSOCKOPT: u64 = 55;
 
+// SysV IPC syscalls (shared memory, semaphores, message queues)
+pub const SYS_SHMGET: u64 = 29;
+pub const SYS_SHMAT: u64 = 30;
+pub const SYS_SHMCTL: u64 = 31;
+pub const SYS_SHMDT: u64 = 67;
+pub const SYS_SEMGET: u64 = 64;
+pub const SYS_SEMOP: u64 = 65;
+pub const SYS_SEMCTL: u64 = 66;
+pub const SYS_SEMTIMEDOP: u64 = 220;
+pub const SYS_MSGGET: u64 = 68;
+pub const SYS_MSGSND: u64 = 69;
+pub const SYS_MSGRCV: u64 = 70;
+pub const SYS_MSGCTL: u64 = 71;
+
 // ============================================================================
 // Syscall wrapper functions
 // ============================================================================
@@ -2669,6 +2683,334 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
             in("rdx") optname as u64,
             in("r10") optval as u64,
             in("r8") optlen as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+// ============================================================================
+// Futex syscalls
+// ============================================================================
+
+pub const SYS_FUTEX: u64 = 202;
+pub const SYS_SET_ROBUST_LIST: u64 = 273;
+pub const SYS_GET_ROBUST_LIST: u64 = 274;
+
+/// futex(uaddr, op, val, timeout, uaddr2, val3) - fast userspace mutex
+///
+/// Performs a futex operation on a userspace futex.
+/// Returns depend on operation:
+/// - FUTEX_WAIT: 0 on wake, negative errno on error
+/// - FUTEX_WAKE: number of waiters woken
+/// - FUTEX_REQUEUE: number woken + requeued
+#[inline(always)]
+pub fn sys_futex(uaddr: *mut u32, op: u32, val: u32, timeout: *const Timespec, uaddr2: *mut u32, val3: u32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_FUTEX,
+            in("rdi") uaddr as u64,
+            in("rsi") op as u64,
+            in("rdx") val as u64,
+            in("r10") timeout as u64,
+            in("r8") uaddr2 as u64,
+            in("r9") val3 as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// set_robust_list(head, len) - register robust futex list
+///
+/// Registers the robust futex list for the current task.
+/// Returns 0 on success, -EINVAL if len != sizeof(robust_list_head).
+#[inline(always)]
+pub fn sys_set_robust_list(head: *const super::RobustListHead, len: usize) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_SET_ROBUST_LIST,
+            in("rdi") head as u64,
+            in("rsi") len as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// get_robust_list(pid, head_ptr, len_ptr) - get robust futex list
+///
+/// Gets the robust futex list for a task.
+/// Returns 0 on success, -ESRCH if task not found.
+#[inline(always)]
+pub fn sys_get_robust_list(pid: i32, head_ptr: *mut *const super::RobustListHead, len_ptr: *mut usize) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_GET_ROBUST_LIST,
+            in("rdi") pid as u64,
+            in("rsi") head_ptr as u64,
+            in("rdx") len_ptr as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+// ============================================================================
+// SysV IPC syscall wrappers
+// ============================================================================
+
+/// shmget(key, size, shmflg) - allocate a shared memory segment
+#[inline(always)]
+pub fn sys_shmget(key: i32, size: usize, shmflg: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_SHMGET,
+            in("rdi") key as u64,
+            in("rsi") size as u64,
+            in("rdx") shmflg as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// shmat(shmid, shmaddr, shmflg) - attach a shared memory segment
+#[inline(always)]
+pub fn sys_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_SHMAT,
+            in("rdi") shmid as u64,
+            in("rsi") shmaddr,
+            in("rdx") shmflg as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// shmdt(shmaddr) - detach a shared memory segment
+#[inline(always)]
+pub fn sys_shmdt(shmaddr: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_SHMDT,
+            in("rdi") shmaddr,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// shmctl(shmid, cmd, buf) - shared memory control
+#[inline(always)]
+pub fn sys_shmctl(shmid: i32, cmd: i32, buf: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_SHMCTL,
+            in("rdi") shmid as u64,
+            in("rsi") cmd as u64,
+            in("rdx") buf,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// semget(key, nsems, semflg) - get a semaphore set
+#[inline(always)]
+pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_SEMGET,
+            in("rdi") key as u64,
+            in("rsi") nsems as u64,
+            in("rdx") semflg as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// semop(semid, sops, nsops) - semaphore operations
+#[inline(always)]
+pub fn sys_semop(semid: i32, sops: *const super::Sembuf, nsops: usize) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_SEMOP,
+            in("rdi") semid as u64,
+            in("rsi") sops as u64,
+            in("rdx") nsops as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// semtimedop(semid, sops, nsops, timeout) - semaphore operations with timeout
+#[inline(always)]
+pub fn sys_semtimedop(semid: i32, sops: *const super::Sembuf, nsops: usize, timeout: *const Timespec) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_SEMTIMEDOP,
+            in("rdi") semid as u64,
+            in("rsi") sops as u64,
+            in("rdx") nsops as u64,
+            in("r10") timeout as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// semctl(semid, semnum, cmd, arg) - semaphore control
+#[inline(always)]
+pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_SEMCTL,
+            in("rdi") semid as u64,
+            in("rsi") semnum as u64,
+            in("rdx") cmd as u64,
+            in("r10") arg,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// msgget(key, msgflg) - get a message queue
+#[inline(always)]
+pub fn sys_msgget(key: i32, msgflg: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_MSGGET,
+            in("rdi") key as u64,
+            in("rsi") msgflg as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// msgsnd(msqid, msgp, msgsz, msgflg) - send a message to a queue
+#[inline(always)]
+pub fn sys_msgsnd(msqid: i32, msgp: *const u8, msgsz: usize, msgflg: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_MSGSND,
+            in("rdi") msqid as u64,
+            in("rsi") msgp as u64,
+            in("rdx") msgsz as u64,
+            in("r10") msgflg as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// msgrcv(msqid, msgp, msgsz, msgtyp, msgflg) - receive a message from a queue
+#[inline(always)]
+pub fn sys_msgrcv(msqid: i32, msgp: *mut u8, msgsz: usize, msgtyp: i64, msgflg: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_MSGRCV,
+            in("rdi") msqid as u64,
+            in("rsi") msgp as u64,
+            in("rdx") msgsz as u64,
+            in("r10") msgtyp as u64,
+            in("r8") msgflg as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// msgctl(msqid, cmd, buf) - message queue control
+#[inline(always)]
+pub fn sys_msgctl(msqid: i32, cmd: i32, buf: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_MSGCTL,
+            in("rdi") msqid as u64,
+            in("rsi") cmd as u64,
+            in("rdx") buf,
             lateout("rax") ret,
             out("rcx") _,
             out("r11") _,
