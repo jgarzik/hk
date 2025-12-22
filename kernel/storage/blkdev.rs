@@ -26,7 +26,7 @@ use spin::{Mutex, RwLock};
 
 // Re-use DevId from chardev
 pub use crate::chardev::{DevId, DevMajor, DevMinor};
-use crate::mm::writeback::{bdi_register, bdi_unregister, BdiWriteback};
+use crate::mm::writeback::{BdiWriteback, bdi_register, bdi_unregister};
 
 /// Well-known block device major numbers (Linux compatible)
 pub mod major {
@@ -278,18 +278,16 @@ pub trait BlockDriver: Send + Sync {
     ///
     /// Called when page cache needs to populate a page.
     /// Default implementation zeros the page (sparse allocation).
-    fn readpage(&self, _disk: &Disk, frame: u64, _page_offset: u64) {
+    fn readpage(&self, _disk: &Disk, buf: &mut [u8], _page_offset: u64) {
         // Default: zero the page (sparse read returns zeros)
-        unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, 4096);
-        }
+        buf.fill(0);
     }
 
     /// Write a page to the device (for dirty page writeback)
     ///
     /// Called when page cache needs to flush a dirty page.
     /// Default implementation is a no-op (RAM disk doesn't need writeback).
-    fn writepage(&self, _disk: &Disk, _frame: u64, _page_offset: u64) {
+    fn writepage(&self, _disk: &Disk, _buf: &[u8], _page_offset: u64) {
         // Default: no-op (RAM disk keeps data in page cache)
     }
 }

@@ -1572,6 +1572,30 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
     }
 }
 
+/// Helper to perform truncate on an inode with RLIMIT and error handling
+fn do_truncate(inode: &alloc::sync::Arc<super::Inode>, length: u64) -> i64 {
+    // Check RLIMIT_FSIZE when extending the file
+    let current_size = inode.get_size();
+    if length > current_size {
+        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_FSIZE);
+        if limit != crate::rlimit::RLIM_INFINITY && length > limit {
+            let tid = current_tid();
+            crate::signal::send_signal(tid, crate::signal::SIGXFSZ);
+            return EFBIG;
+        }
+    }
+
+    // Perform truncate
+    match inode.i_op.truncate(inode, length) {
+        Ok(()) => 0,
+        Err(FsError::IsADirectory) => EISDIR,
+        Err(FsError::NotSupported) => EINVAL,
+        Err(FsError::PermissionDenied) => EACCES,
+        Err(FsError::FileTooLarge) => EFBIG,
+        Err(_) => EINVAL,
+    }
+}
+
 /// sys_ftruncate - truncate a file to a specified length
 ///
 /// Truncates the file referred to by fd to the specified length.
@@ -1606,25 +1630,7 @@ pub fn sys_ftruncate(fd: i32, length: i64) -> i64 {
         None => return EBADF,
     };
 
-    // Check RLIMIT_FSIZE when extending the file
-    let current_size = inode.get_size();
-    if (length as u64) > current_size {
-        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_FSIZE);
-        if limit != crate::rlimit::RLIM_INFINITY && (length as u64) > limit {
-            let tid = current_tid();
-            crate::signal::send_signal(tid, crate::signal::SIGXFSZ);
-            return EFBIG;
-        }
-    }
-
-    // Perform truncate
-    match inode.i_op.truncate(&inode, length as u64) {
-        Ok(()) => 0,
-        Err(FsError::IsADirectory) => EISDIR,
-        Err(FsError::NotSupported) => EINVAL,
-        Err(FsError::PermissionDenied) => EACCES,
-        Err(_) => EINVAL,
-    }
+    do_truncate(&inode, length as u64)
 }
 
 /// sys_truncate - truncate a file to a specified length by path
@@ -1664,25 +1670,7 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
         None => return ENOENT,
     };
 
-    // Check RLIMIT_FSIZE when extending the file
-    let current_size = inode.get_size();
-    if (length as u64) > current_size {
-        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_FSIZE);
-        if limit != crate::rlimit::RLIM_INFINITY && (length as u64) > limit {
-            let tid = current_tid();
-            crate::signal::send_signal(tid, crate::signal::SIGXFSZ);
-            return EFBIG;
-        }
-    }
-
-    // Perform truncate
-    match inode.i_op.truncate(&inode, length as u64) {
-        Ok(()) => 0,
-        Err(FsError::IsADirectory) => EISDIR,
-        Err(FsError::NotSupported) => EINVAL,
-        Err(FsError::PermissionDenied) => EACCES,
-        Err(_) => EINVAL,
-    }
+    do_truncate(&inode, length as u64)
 }
 
 /// sys_dup - duplicate a file descriptor
@@ -2791,6 +2779,19 @@ pub fn sys_renameat2(
         return ENOENT;
     }
 
+    // Extract final components for validation
+    let old_basename = oldpath.rsplit('/').next().unwrap_or(&oldpath);
+    let new_basename = newpath.rsplit('/').next().unwrap_or(&newpath);
+
+    // Cannot rename "." or ".." - these are special directory entries
+    if old_basename == "." || old_basename == ".." {
+        return EINVAL;
+    }
+    // Cannot rename TO "." or ".." either
+    if new_basename == "." || new_basename == ".." {
+        return EINVAL;
+    }
+
     // Look up parent of oldpath and get the filename
     let (old_parent_dentry, old_name) = match lookup_parent_at(olddirfd, &oldpath) {
         Ok(p) => p,
@@ -2827,8 +2828,26 @@ pub fn sys_renameat2(
     // - Otherwise: lock by address order
     let _trap = lock_rename(&old_parent_dentry, &new_parent_dentry);
 
-    // Look up the source dentry for cycle detection
+    // Look up the source dentry for cycle detection and same-file check
     let old_dentry = old_parent_dentry.lookup_child(&old_name);
+
+    // Look up target dentry for same-file check
+    let new_dentry = new_parent_dentry.lookup_child(&new_name);
+
+    // Same-inode check: if source and target are the same file, return success
+    // (Linux vfs_rename: "if (source == target) return 0;")
+    if let Some(ref src_dentry) = old_dentry {
+        if let Some(ref dst_dentry) = new_dentry {
+            if let (Some(src_inode), Some(dst_inode)) =
+                (src_dentry.get_inode(), dst_dentry.get_inode())
+            {
+                if src_inode.ino == dst_inode.ino {
+                    unlock_rename(&old_parent_dentry, &new_parent_dentry);
+                    return 0;
+                }
+            }
+        }
+    }
 
     // Cycle detection: prevent moving a directory into its own subtree
     // This would create an unreachable directory loop

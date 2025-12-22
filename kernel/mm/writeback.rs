@@ -22,10 +22,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::{Mutex, RwLock};
 
-use crate::mm::page_cache::{AddressSpace, FileId, DIRTY_ADDRESS_SPACES, PAGE_SIZE};
+use crate::PAGE_CACHE;
+use crate::mm::page_cache::{AddressSpace, DIRTY_ADDRESS_SPACES, FileId, PAGE_SIZE};
 use crate::storage::blkdev::DevId;
 use crate::workqueue::{DelayedWork, Workqueue, wq_flags};
-use crate::PAGE_CACHE;
 
 // ============================================================================
 // Writeback Constants
@@ -200,7 +200,9 @@ pub fn do_writepages(addr_space: &AddressSpace, wbc: &mut WritebackControl) -> R
         }
 
         // Call filesystem's writepage
-        let result = addr_space.a_ops.writepage(addr_space.file_id, page_offset, &buf);
+        let result = addr_space
+            .a_ops
+            .writepage(addr_space.file_id, page_offset, &buf);
 
         match result {
             Ok(_) => {
@@ -335,10 +337,8 @@ pub fn sync_all() -> Result<usize, i32> {
 ///
 /// This is a dedicated workqueue for writeback, separate from the system
 /// workqueue, allowing writeback to proceed even during memory pressure.
-pub static BDI_WORKQUEUE: Workqueue = Workqueue::new(
-    "bdi",
-    wq_flags::WQ_MEM_RECLAIM | wq_flags::WQ_UNBOUND,
-);
+pub static BDI_WORKQUEUE: Workqueue =
+    Workqueue::new("bdi", wq_flags::WQ_MEM_RECLAIM | wq_flags::WQ_UNBOUND);
 
 /// Registry of per-device writeback states
 static BDI_REGISTRY: RwLock<BTreeMap<DevId, Arc<BdiWriteback>>> = RwLock::new(BTreeMap::new());

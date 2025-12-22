@@ -37,8 +37,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 
 use crate::arch::IrqSpinlock;
-use crate::task::percpu::{SCHEDULING_ENABLED, get_ticks};
 use crate::task::Tid;
+use crate::task::percpu::{SCHEDULING_ENABLED, get_ticks};
 use crate::waitqueue::WaitQueue;
 
 // ============================================================================
@@ -107,22 +107,27 @@ impl Work {
 
     /// Try to mark as pending (returns true if successful, false if already pending)
     fn try_set_pending(&self) -> bool {
-        let prev = self.state.fetch_or(work_flags::WORK_PENDING, Ordering::AcqRel);
+        let prev = self
+            .state
+            .fetch_or(work_flags::WORK_PENDING, Ordering::AcqRel);
         prev & work_flags::WORK_PENDING == 0
     }
 
     /// Clear pending flag
     fn clear_pending(&self) {
-        self.state.fetch_and(!work_flags::WORK_PENDING, Ordering::Release);
+        self.state
+            .fetch_and(!work_flags::WORK_PENDING, Ordering::Release);
     }
 
     /// Execute the work callback
     fn execute(&mut self) {
-        self.state.fetch_or(work_flags::WORK_RUNNING, Ordering::AcqRel);
+        self.state
+            .fetch_or(work_flags::WORK_RUNNING, Ordering::AcqRel);
         if let Some(ref mut func) = self.func {
             func();
         }
-        self.state.fetch_and(!work_flags::WORK_RUNNING, Ordering::Release);
+        self.state
+            .fetch_and(!work_flags::WORK_RUNNING, Ordering::Release);
         self.clear_pending();
     }
 }

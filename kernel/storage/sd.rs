@@ -293,16 +293,15 @@ impl BlockDriver for ScsiDiskDriver {
         "sd"
     }
 
-    fn readpage(&self, _blk_disk: &Disk, frame: u64, page_offset: u64) {
+    fn readpage(&self, _blk_disk: &Disk, buf: &mut [u8], page_offset: u64) {
         // Read a single page (4096 bytes = 8 sectors)
         let lba = page_offset * 8; // page_offset is in pages, convert to 512-byte sectors
         crate::printkln!(
-            "sd: readpage frame=0x{:x} page_offset={} lba={}",
-            frame,
+            "sd: readpage buf={:p} page_offset={} lba={}",
+            buf.as_ptr(),
             page_offset,
             lba
         );
-        let buf = unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, 4096) };
 
         if let Err(e) = self.disk.read_sectors(lba, 8, buf) {
             crate::printkln!("sd: readpage error: {:?}", e);
@@ -313,10 +312,9 @@ impl BlockDriver for ScsiDiskDriver {
         }
     }
 
-    fn writepage(&self, _blk_disk: &Disk, frame: u64, page_offset: u64) {
+    fn writepage(&self, _blk_disk: &Disk, buf: &[u8], page_offset: u64) {
         // Write a single page (4096 bytes = 8 sectors)
         let lba = page_offset * 8; // page_offset is in pages, convert to 512-byte sectors
-        let buf = unsafe { core::slice::from_raw_parts(frame as *const u8, 4096) };
 
         if let Err(e) = self.disk.write_sectors(lba, 8, buf) {
             crate::printkln!("sd: writepage error: {:?}", e);

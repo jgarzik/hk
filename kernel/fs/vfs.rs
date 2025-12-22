@@ -46,6 +46,8 @@ pub enum FsError {
     BrokenPipe,
     /// No space left on device (ENOSPC)
     NoSpace,
+    /// File too large (EFBIG)
+    FileTooLarge,
 }
 
 /// File metadata
