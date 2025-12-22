@@ -2677,3 +2677,85 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
     }
     ret
 }
+
+// ============================================================================
+// Futex syscalls
+// ============================================================================
+
+pub const SYS_FUTEX: u64 = 202;
+pub const SYS_SET_ROBUST_LIST: u64 = 273;
+pub const SYS_GET_ROBUST_LIST: u64 = 274;
+
+/// futex(uaddr, op, val, timeout, uaddr2, val3) - fast userspace mutex
+///
+/// Performs a futex operation on a userspace futex.
+/// Returns depend on operation:
+/// - FUTEX_WAIT: 0 on wake, negative errno on error
+/// - FUTEX_WAKE: number of waiters woken
+/// - FUTEX_REQUEUE: number woken + requeued
+#[inline(always)]
+pub fn sys_futex(uaddr: *mut u32, op: u32, val: u32, timeout: *const Timespec, uaddr2: *mut u32, val3: u32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_FUTEX,
+            in("rdi") uaddr as u64,
+            in("rsi") op as u64,
+            in("rdx") val as u64,
+            in("r10") timeout as u64,
+            in("r8") uaddr2 as u64,
+            in("r9") val3 as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// set_robust_list(head, len) - register robust futex list
+///
+/// Registers the robust futex list for the current task.
+/// Returns 0 on success, -EINVAL if len != sizeof(robust_list_head).
+#[inline(always)]
+pub fn sys_set_robust_list(head: *const super::RobustListHead, len: usize) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_SET_ROBUST_LIST,
+            in("rdi") head as u64,
+            in("rsi") len as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// get_robust_list(pid, head_ptr, len_ptr) - get robust futex list
+///
+/// Gets the robust futex list for a task.
+/// Returns 0 on success, -ESRCH if task not found.
+#[inline(always)]
+pub fn sys_get_robust_list(pid: i32, head_ptr: *mut *const super::RobustListHead, len_ptr: *mut usize) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_GET_ROBUST_LIST,
+            in("rdi") pid as u64,
+            in("rsi") head_ptr as u64,
+            in("rdx") len_ptr as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}

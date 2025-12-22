@@ -399,7 +399,11 @@ linasm.sourceforge.net
 
 7.2 Futex (core for modern libs/threads)
 
-- [ ] futex
+- [x] futex (WAIT, WAKE, WAIT_BITSET, WAKE_BITSET, REQUEUE, CMP_REQUEUE)
+
+- [x] set_robust_list
+
+- [x] get_robust_list
 
 - [ ] futex_waitv (newer multi-wait variant on some kernels)
 

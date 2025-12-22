@@ -17,7 +17,8 @@ locking strategies used in the hk kernel.
    - [Timekeeping](#35-timekeeping)
    - [Kernel Logging (printk)](#36-kernel-logging-printk)
    - [Signal Infrastructure](#37-signal-infrastructure)
-   - [TTY and Console Subsystem](#38-tty-and-console-subsystem)
+   - [Futex Subsystem](#38-futex-subsystem)
+   - [TTY and Console Subsystem](#39-tty-and-console-subsystem)
 4. [Deadlock Prevention](#4-deadlock-prevention)
 5. [Lock-Free Patterns](#5-lock-free-patterns)
 6. [Preemption Control](#6-preemption-control)
@@ -175,6 +176,11 @@ Signal locks:
     TASK_SIGNAL_STATE (Mutex)  ← Per-task blocked/pending
         ↓
     SigHand.action (IrqSpinlock)  ← Signal handler table
+    ↓
+Futex locks:
+    TASK_ROBUST_LIST (Mutex)  ← Per-task robust list heads
+        ↓
+    FutexHashBucket.waiters (IrqSpinlock)  ← Per-bucket waiter list
     ↓
 Filesystem context locks (TASK_FS)
     ↓
@@ -1048,7 +1054,85 @@ set_tif_sigpending(tid);                // TASK_TIF_SIGPENDING update
 - Clone without CLONE_SIGHAND: new `Arc<SigHand>` with deep-cloned handlers
 - Exit: removes entry from `TASK_SIGHAND`, Arc refcount drops
 
-### 3.8 TTY and Console Subsystem
+### 3.8 Futex Subsystem
+
+**Location:** `kernel/futex.rs`
+
+The futex (fast userspace mutex) subsystem provides efficient userspace synchronization
+primitives. It uses a hash bucket design similar to Linux's `futex_queues`.
+
+#### Futex Locks
+
+| Variable | Type | Purpose |
+|----------|------|---------|
+| `FUTEX_HASH_TABLE` | `[FutexHashBucket; 256]` | Hash buckets for waiters |
+| `FutexHashBucket.waiters` | `IrqSpinlock<Vec<FutexQ>>` | Per-bucket waiter list |
+| `FutexHashBucket.waiter_count` | `AtomicU32` | Fast-path check for waiters |
+| `TASK_ROBUST_LIST` | `Mutex<BTreeMap<Tid, u64>>` | Per-task robust list heads |
+
+#### Why IrqSpinlock for Bucket Waiters
+
+Futex operations may be called from signal context (e.g., during signal delivery
+or cleanup). Using `IrqSpinlock` ensures:
+1. Interrupts are disabled during bucket access
+2. No deadlock if signal handler tries to access same bucket
+3. Memory barrier semantics for race prevention with userspace
+
+#### Memory Barrier Pattern (Linux-style)
+
+The futex implementation follows Linux's memory barrier pattern from
+`kernel/futex/waitwake.c` lines 63-108 to prevent lost wakeups:
+
+```
+Waiter (CPU 0)              Waker (CPU 1)
+--------------              --------------
+waiter_count++              *futex = new_value
+smp_mb()                    smp_mb()
+lock(bucket)                if (waiter_count > 0)
+val = *futex                  lock(bucket)
+if val == expected            find & wake waiters
+  enqueue                     unlock(bucket)
+unlock(bucket)
+sleep
+```
+
+The `fence(Ordering::SeqCst)` calls ensure that either:
+- Waiter sees new futex value → doesn't sleep
+- Waker sees waiter_count > 0 → wakes waiter
+
+Neither thread can miss the other's update.
+
+#### Lock Ordering
+
+```
+1. FutexHashBucket.waiters (IrqSpinlock)
+   ↓
+2. TASK_TABLE (Mutex, for task state updates during wake)
+   ↓
+3. Per-CPU scheduler lock (IrqSpinlock, for run queue updates)
+```
+
+For `futex_requeue()` with two different buckets:
+- Lock buckets in address order (lower pointer address first)
+- This prevents deadlock when two threads requeue in opposite directions
+
+#### Robust Futex Cleanup
+
+Robust futexes are cleaned up during task exit via `exit_robust_list()`:
+1. Called from task exit path in `kernel/task/percpu.rs`
+2. Walks the userspace robust list with a 2048 entry limit
+3. For each entry, sets `FUTEX_OWNER_DIED` bit and wakes one waiter
+4. Uses shared bucket lock only briefly per entry
+
+#### Key Rules
+
+1. **Bucket lock is IRQ-safe** - Safe from signal handlers
+2. **Memory barriers before userspace access** - Prevents lost wakeups
+3. **Lock order: bucket → TASK_TABLE → scheduler** - Consistent ordering
+4. **Multi-bucket operations use address ordering** - Prevents deadlock
+5. **Robust cleanup has entry limit** - Prevents infinite loop from corrupted list
+
+### 3.9 TTY and Console Subsystem
 
 **Location:** `kernel/tty/`, `kernel/gfx/console.rs`, `kernel/console.rs`, `kernel/printk.rs`
 

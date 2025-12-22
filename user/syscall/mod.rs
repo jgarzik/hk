@@ -226,6 +226,54 @@ pub const LINUX_REBOOT_CMD_POWER_OFF: u64 = 0x4321fedc;
 // AT_FDCWD for *at() syscalls
 pub const AT_FDCWD: i32 = -100;
 
+// ============================================================================
+// Futex constants
+// ============================================================================
+
+/// Wait if *uaddr == val
+pub const FUTEX_WAIT: u32 = 0;
+/// Wake up to val waiters
+pub const FUTEX_WAKE: u32 = 1;
+/// Requeue waiters from uaddr to uaddr2
+pub const FUTEX_REQUEUE: u32 = 3;
+/// Requeue if *uaddr == val3
+pub const FUTEX_CMP_REQUEUE: u32 = 4;
+/// Wait with bitset matching
+pub const FUTEX_WAIT_BITSET: u32 = 9;
+/// Wake with bitset matching
+pub const FUTEX_WAKE_BITSET: u32 = 10;
+
+/// Private futex (no shared memory)
+pub const FUTEX_PRIVATE_FLAG: u32 = 128;
+/// Use CLOCK_REALTIME for timeout
+pub const FUTEX_CLOCK_REALTIME: u32 = 256;
+
+/// Match any bit in bitset operations
+pub const FUTEX_BITSET_MATCH_ANY: u32 = 0xffffffff;
+
+/// There are waiters on this futex
+pub const FUTEX_WAITERS: u32 = 0x80000000;
+/// Owner died without unlocking
+pub const FUTEX_OWNER_DIED: u32 = 0x40000000;
+/// Mask for TID in futex value
+pub const FUTEX_TID_MASK: u32 = 0x3fffffff;
+
+/// Robust list head structure (matches Linux ABI)
+#[repr(C)]
+pub struct RobustListHead {
+    /// The head of the list. Points back to itself if empty.
+    pub list: u64,
+    /// Relative offset from list entry to the futex field
+    pub futex_offset: i64,
+    /// Address of lock being acquired (for race with exit)
+    pub list_op_pending: u64,
+}
+
+impl RobustListHead {
+    /// Size of the robust list head structure
+    pub const SIZE: usize = core::mem::size_of::<Self>();
+}
+
 // mmap protection flags
 pub const PROT_NONE: u32 = 0;
 pub const PROT_READ: u32 = 1;

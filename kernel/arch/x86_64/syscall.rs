@@ -358,6 +358,14 @@ pub const SYS_GETSOCKOPT: u64 = 55;
 /// accept4(fd, addr, addrlen, flags)
 pub const SYS_ACCEPT4: u64 = 288;
 
+// Futex syscalls (Section 7.2)
+/// futex(uaddr, futex_op, val, timeout, uaddr2, val3)
+pub const SYS_FUTEX: u64 = 202;
+/// set_robust_list(head, len)
+pub const SYS_SET_ROBUST_LIST: u64 = 273;
+/// get_robust_list(pid, head_ptr, len_ptr)
+pub const SYS_GET_ROBUST_LIST: u64 = 274;
+
 /// Model Specific Registers for syscall
 const MSR_EFER: u32 = 0xC000_0080; // Extended Feature Enable Register
 const MSR_STAR: u32 = 0xC000_0081; // Segment selectors for syscall/sysret
@@ -1276,6 +1284,13 @@ pub fn x86_64_syscall_dispatch(
         SYS_ACCEPT4 => {
             crate::net::syscall::sys_accept4(arg0 as i32, arg1, arg2, arg3 as i32) as u64
         }
+
+        // Futex syscalls
+        SYS_FUTEX => {
+            crate::futex::sys_futex(arg0, arg1 as u32, arg2 as u32, arg3, arg4, _arg5 as u32) as u64
+        }
+        SYS_SET_ROBUST_LIST => crate::futex::sys_set_robust_list(arg0, arg1) as u64,
+        SYS_GET_ROBUST_LIST => crate::futex::sys_get_robust_list(arg0 as i32, arg1, arg2) as u64,
 
         _ => (-38i64) as u64, // ENOSYS
     }
