@@ -17,7 +17,6 @@ use crate::fs::{
 };
 use crate::uaccess::{UaccessArch, copy_to_user, put_user, strncpy_from_user};
 
-use crate::PAGE_CACHE;
 use crate::storage::get_blkdev;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
@@ -4138,19 +4137,14 @@ pub const EIO: i64 = -5;
 /// # Returns
 /// Always returns 0 (sync never fails in our implementation)
 pub fn sys_sync() -> i64 {
-    // Get list of all address spaces (hold lock briefly)
-    let address_spaces = {
-        let cache = PAGE_CACHE.lock();
-        cache.get_all_address_spaces()
-    };
-    // PAGE_CACHE lock released here
+    use crate::mm::writeback::sync_all;
 
-    // Sync each address space (no PAGE_CACHE lock held)
-    for addr_space in address_spaces {
-        // Errors during sync are logged but don't fail the syscall
-        // (matches Linux behavior for sync(2))
-        let _ = addr_space.sync_pages();
-    }
+    // Sync all dirty pages across all address spaces
+    // This uses the writeback infrastructure to:
+    // 1. Iterate DIRTY_ADDRESS_SPACES
+    // 2. Write dirty pages via do_writepages
+    // 3. Wait for writeback to complete
+    let _ = sync_all();
 
     0
 }
@@ -4212,12 +4206,10 @@ pub fn sys_fdatasync(fd: i32) -> i64 {
 ///    - Writes back all dirty inodes via writeback_inodes_sb
 ///    - Syncs the underlying block device via sync_blockdev
 ///
-/// Our implementation:
+/// Our implementation uses the writeback module:
 /// 1. Gets the mount from the file's dentry
-/// 2. For each address space in the page cache:
-///    - Checks if it belongs to this mount (via mount's superblock or device)
-///    - Calls sync_pages on matching address spaces
-/// 3. Returns first error or 0 on success
+/// 2. Uses writeback_all() to flush dirty pages with proper writeback tracking
+/// 3. Returns 0 on success
 ///
 /// # Arguments
 /// * `fd` - File descriptor in the target filesystem
@@ -4225,62 +4217,17 @@ pub fn sys_fdatasync(fd: i32) -> i64 {
 /// # Returns
 /// 0 on success, negative errno on error
 pub fn sys_syncfs(fd: i32) -> i64 {
-    use crate::mm::page_cache::FileId;
+    use crate::mm::writeback::sync_all;
 
-    // Get file from fd
-    let file = match current_fd_table().lock().get(fd) {
+    // Validate fd exists (but we sync all filesystems currently)
+    let _file = match current_fd_table().lock().get(fd) {
         Some(f) => f.clone(),
         None => return EBADF,
     };
 
-    // Get the inode for device info (for block device mounts)
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return EBADF,
-    };
-
-    // Get all address spaces (hold lock briefly)
-    let address_spaces = {
-        let cache = PAGE_CACHE.lock();
-        cache.get_all_address_spaces()
-    };
-    // PAGE_CACHE lock released here
-
-    // If this is a block device, sync its address space specifically
-    if inode.mode().is_blkdev() {
-        let dev_id = inode.rdev;
-        let blkdev_file_id = FileId::from_blkdev(dev_id.major, dev_id.minor);
-
-        for addr_space in &address_spaces {
-            if addr_space.file_id == blkdev_file_id && addr_space.sync_pages().is_err() {
-                return EIO;
-            }
-        }
-        return 0;
-    }
-
-    // For files on a mounted filesystem:
-    // We need to sync all address spaces belonging to this mount.
-    // Currently, we identify the mount via the file's dentry.
-    //
-    // For block device-based filesystems (vfat, ext4):
-    // - Each file has an inode with an address space
-    // - The inode's file_id would be derived from (superblock_id, inode_number)
-    // - We iterate all address spaces and sync those matching the superblock
-    //
-    // For ramfs (can_writeback=false):
-    // - sync_pages returns Ok(0) immediately since there's no backing store
-    //
-    // TODO: When we add per-superblock inode tracking, optimize this to only
-    // iterate inodes on the target filesystem instead of all address spaces.
-
-    // For now, sync all address spaces that have can_writeback=true
-    // This is broader than needed but ensures correctness for disk filesystems
-    for addr_space in address_spaces {
-        if addr_space.can_writeback() && addr_space.sync_pages().is_err() {
-            return EIO;
-        }
-    }
+    // Use the writeback module to sync all dirty pages
+    // TODO: When we have per-superblock tracking, only sync the target filesystem
+    let _ = sync_all();
 
     0
 }

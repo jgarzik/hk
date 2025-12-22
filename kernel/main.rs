@@ -21,6 +21,7 @@ pub mod storage;
 mod time;
 pub mod uaccess;
 pub mod waitqueue;
+pub mod workqueue;
 
 // Device subsystems
 pub mod dt;

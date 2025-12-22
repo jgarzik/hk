@@ -13,17 +13,27 @@
 //! This prevents data loss for in-memory filesystems like ramfs where
 //! the page cache IS the only copy of the data.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
 
 use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use spin::RwLock;
+use spin::{Mutex, RwLock};
 
 use crate::arch::FrameAlloc;
 
 /// Page size constant (4KB)
 pub const PAGE_SIZE: usize = 4096;
+
+/// Global set of file IDs with dirty pages awaiting writeback.
+///
+/// This allows the writeback daemon to efficiently find address spaces
+/// that need flushing without scanning all cached files.
+///
+/// Operations:
+/// - Insert when a page is first marked dirty in an address space
+/// - Remove when all dirty pages in an address space have been written back
+pub static DIRTY_ADDRESS_SPACES: Mutex<BTreeSet<FileId>> = Mutex::new(BTreeSet::new());
 
 /// Unique identifier for a file in the VFS
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -56,6 +66,19 @@ impl FileId {
     /// Check if this FileId represents a block device
     pub fn is_blkdev(&self) -> bool {
         (self.0 & 0x8000_0000_0000_0000) != 0
+    }
+
+    /// Decode a block device FileId back to (major, minor)
+    ///
+    /// Returns None if this FileId is not a block device.
+    pub fn to_blkdev(&self) -> Option<(u16, u16)> {
+        if !self.is_blkdev() {
+            return None;
+        }
+        let dev_encoded = self.0 & !0x8000_0000_0000_0000;
+        let major = ((dev_encoded >> 20) & 0xFFFF) as u16;
+        let minor = (dev_encoded & 0xFFFFF) as u16;
+        Some((major, minor))
     }
 }
 
@@ -175,6 +198,11 @@ pub struct CachedPage {
     /// Dirty pages without writeback capability cannot be evicted.
     dirty: AtomicBool,
 
+    /// Whether this page has I/O in flight (being written back).
+    /// Similar to Linux's PG_writeback bit.
+    /// Used to track pages transitioning from dirty -> clean.
+    writeback: AtomicBool,
+
     /// Per-page lock for synchronizing access to page contents.
     /// Similar to Linux's PG_locked bit / folio_lock().
     /// Must be held when reading from or writing to the page frame.
@@ -190,6 +218,7 @@ impl CachedPage {
             file_id,
             page_offset,
             dirty: AtomicBool::new(false),
+            writeback: AtomicBool::new(false),
             locked: AtomicBool::new(false),
         }
     }
@@ -202,6 +231,7 @@ impl CachedPage {
             file_id,
             page_offset,
             dirty: AtomicBool::new(true),
+            writeback: AtomicBool::new(false),
             locked: AtomicBool::new(false),
         }
     }
@@ -360,6 +390,63 @@ impl CachedPage {
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Acquire)
     }
+
+    /// Check if this page has writeback I/O in flight
+    pub fn is_writeback(&self) -> bool {
+        self.writeback.load(Ordering::Acquire)
+    }
+
+    /// Set the writeback flag (called before starting writeback I/O)
+    ///
+    /// This marks the page as having I/O in flight. The page should be locked
+    /// when calling this to prevent concurrent modifications.
+    pub fn set_writeback(&self) {
+        self.writeback.store(true, Ordering::Release);
+    }
+
+    /// Clear the writeback flag (called from I/O completion)
+    ///
+    /// This signals that writeback I/O has completed. Wakes any waiters
+    /// blocked in `wait_writeback()`.
+    pub fn end_writeback(&self) {
+        use crate::task::percpu::SCHEDULING_ENABLED;
+        use crate::waitqueue::page_wait_queue;
+
+        self.writeback.store(false, Ordering::Release);
+
+        // Wake any waiters on this page's wait queue
+        if SCHEDULING_ENABLED.load(Ordering::Acquire) {
+            let wq = page_wait_queue(self.frame);
+            wq.wake_all();
+        }
+    }
+
+    /// Wait for writeback to complete on this page
+    ///
+    /// Blocks until the writeback flag is cleared by `end_writeback()`.
+    /// Used by fsync to wait for in-flight I/O to complete.
+    pub fn wait_writeback(&self) {
+        use crate::task::percpu::SCHEDULING_ENABLED;
+        use crate::waitqueue::page_wait_queue;
+
+        // Fast path: not in writeback
+        if !self.is_writeback() {
+            return;
+        }
+
+        // Slow path: wait on page wait queue
+        if SCHEDULING_ENABLED.load(Ordering::Acquire) {
+            let wq = page_wait_queue(self.frame);
+            while self.is_writeback() {
+                wq.wait();
+            }
+        } else {
+            // Scheduling not enabled - spin
+            while self.is_writeback() {
+                core::hint::spin_loop();
+            }
+        }
+    }
 }
 
 /// Internal mutable state of an AddressSpace, protected by the inner RwLock.
@@ -490,6 +577,57 @@ impl AddressSpace {
     /// Set file size (for truncate operations)
     pub fn set_file_size(&self, new_size: u64) {
         self.inner.write().file_size = new_size;
+    }
+
+    /// Mark this address space as having dirty pages.
+    ///
+    /// Adds the file_id to the global DIRTY_ADDRESS_SPACES set so the
+    /// writeback daemon can find it.
+    pub fn mark_dirty_for_writeback(&self) {
+        if self.inner.read().can_writeback {
+            DIRTY_ADDRESS_SPACES.lock().insert(self.file_id);
+        }
+    }
+
+    /// Mark this address space as having no dirty pages.
+    ///
+    /// Removes the file_id from the global DIRTY_ADDRESS_SPACES set.
+    /// Called after all dirty pages have been written back.
+    pub fn mark_clean_for_writeback(&self) {
+        DIRTY_ADDRESS_SPACES.lock().remove(&self.file_id);
+    }
+
+    /// Check if this address space has any dirty pages
+    pub fn has_dirty_pages(&self) -> bool {
+        self.inner.read().pages.values().any(|p| p.is_dirty())
+    }
+
+    /// Collect dirty pages for writeback (returns vec of (page_offset, page))
+    ///
+    /// Filters to pages that are dirty and not already in writeback.
+    /// The returned pages have their refcounts incremented.
+    pub fn collect_dirty_pages(&self, limit: usize) -> alloc::vec::Vec<(u64, Arc<CachedPage>)> {
+        let inner = self.inner.read();
+
+        if !inner.can_writeback {
+            return alloc::vec::Vec::new();
+        }
+
+        inner
+            .pages
+            .iter()
+            .filter(|(_, p)| p.is_dirty() && !p.is_writeback())
+            .take(limit)
+            .map(|(off, p)| (*off, p.clone()))
+            .collect()
+    }
+
+    /// Get all pages in this address space
+    ///
+    /// Returns cloned Arc references to all cached pages.
+    /// Used for waiting on writeback completion.
+    pub fn get_all_pages(&self) -> alloc::vec::Vec<Arc<CachedPage>> {
+        self.inner.read().pages.values().cloned().collect()
     }
 
     /// Sync all dirty pages to backing store.

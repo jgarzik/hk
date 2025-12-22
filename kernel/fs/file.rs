@@ -926,13 +926,15 @@ pub fn generic_file_pwrite(
 
 /// Generic fsync implementation using page cache.
 ///
-/// Syncs all dirty pages for a file to backing store.
+/// Syncs all dirty pages for a file to backing store using the writeback module.
+/// This is the proper async writeback path - it writes pages via do_writepages
+/// and waits for all I/O to complete.
 ///
 /// ## Locking Context
 ///
 /// - Acquires PAGE_CACHE lock briefly to get AddressSpace
-/// - Releases PAGE_CACHE lock before calling sync_pages
-/// - sync_pages acquires per-page locks during writeback
+/// - Uses writeback module for actual I/O (proper writeback flag tracking)
+/// - Waits for all in-flight writeback to complete
 ///
 /// ## Arguments
 ///
@@ -942,14 +944,14 @@ pub fn generic_file_pwrite(
 ///
 /// Ok(()) on success, or error
 pub fn generic_file_fsync(file_id: FileId) -> Result<(), FsError> {
-    let addr_space = {
-        let cache = PAGE_CACHE.lock();
-        cache.get_address_space(file_id)
-    };
+    use crate::mm::writeback::{WritebackControl, do_writepages_for_file, wait_on_writeback};
 
-    if let Some(addr_space) = addr_space {
-        addr_space.sync_pages().map_err(|_| FsError::IoError)?;
-    }
+    // Write all dirty pages for this file
+    let mut wbc = WritebackControl::for_fsync();
+    do_writepages_for_file(file_id, &mut wbc).map_err(|_| FsError::IoError)?;
+
+    // Wait for all writeback to complete
+    wait_on_writeback(file_id);
 
     Ok(())
 }

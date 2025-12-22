@@ -372,21 +372,18 @@ impl FileOps for BlockFileOps {
     }
 
     fn fsync(&self, file: &File) -> Result<(), FsError> {
+        use crate::mm::writeback::{WritebackControl, do_writepages_for_file, wait_on_writeback};
+
         let bdev = Self::get_bdev(file)?;
         let file_id = Self::file_id_for_bdev(&bdev);
 
-        // Get the address space for this block device
-        let cache = PAGE_CACHE.lock();
-        if let Some(addr_space) = cache.get_address_space(file_id) {
-            // Release PAGE_CACHE lock before calling sync_pages
-            // (sync_pages may acquire per-page locks but not PAGE_CACHE)
-            drop(cache);
+        // Write all dirty pages using the writeback module
+        // (proper writeback flag tracking and async I/O support)
+        let mut wbc = WritebackControl::for_fsync();
+        do_writepages_for_file(file_id, &mut wbc).map_err(|_| FsError::IoError)?;
 
-            // Sync all dirty pages to backing store.
-            // For RAM disk (can_writeback = false), this returns Ok(0) immediately.
-            // For real block devices, this writes dirty pages via a_ops.writepage().
-            addr_space.sync_pages().map_err(|_| FsError::IoError)?;
-        }
+        // Wait for all writeback to complete
+        wait_on_writeback(file_id);
 
         Ok(())
     }

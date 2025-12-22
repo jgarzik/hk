@@ -26,6 +26,7 @@ use spin::{Mutex, RwLock};
 
 // Re-use DevId from chardev
 pub use crate::chardev::{DevId, DevMajor, DevMinor};
+use crate::mm::writeback::{bdi_register, bdi_unregister, BdiWriteback};
 
 /// Well-known block device major numbers (Linux compatible)
 pub mod major {
@@ -419,6 +420,8 @@ pub struct Disk {
     pub logical_block_size: u32,
     /// Request queue
     pub queue: Arc<RequestQueue>,
+    /// Per-device writeback state
+    pub bdi: Arc<BdiWriteback>,
 }
 
 impl Disk {
@@ -430,12 +433,16 @@ impl Disk {
         logical_block_size: u32,
         queue: Arc<RequestQueue>,
     ) -> Arc<Self> {
+        // Register writeback state for this device
+        let bdi = bdi_register(id);
+
         let disk = Arc::new(Self {
             id,
             name,
             capacity_sectors: AtomicU64::new(capacity_sectors),
             logical_block_size,
             queue: queue.clone(),
+            bdi,
         });
         queue.set_disk(disk.clone());
         disk
@@ -620,6 +627,9 @@ pub fn register_blkdev(id: DevId, device: Arc<BlockDevice>) -> Result<(), BlockE
 /// The device may still exist if there are open references, but
 /// all I/O operations will fail.
 pub fn unregister_blkdev(id: DevId) -> Option<Arc<BlockDevice>> {
+    // Unregister writeback state for this device
+    bdi_unregister(id);
+
     let mut registry = BLKDEV_REGISTRY.write();
     if let Some(device) = registry.devices.get(&id) {
         // Mark device as dead before removing from registry

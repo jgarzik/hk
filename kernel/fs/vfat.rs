@@ -19,8 +19,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::frame_alloc::FrameAllocRef;
-use crate::mm::page_cache::{FileId, NULL_AOPS, PAGE_SIZE};
-use crate::storage::BlockDevice;
+use crate::mm::page_cache::{AddressSpaceOps, FileId, NULL_AOPS, PAGE_SIZE};
+use crate::storage::{get_blkdev, BlockDevice, DevId};
 use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
 use super::dentry::Dentry;
@@ -28,6 +28,45 @@ use super::file::{DirEntry as VfsDirEntry, File, FileOps};
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::superblock::{FileSystemType, SuperBlock, SuperBlockData, SuperOps, fs_flags};
 use super::vfs::FsError;
+
+// ============================================================================
+// VFAT AddressSpaceOps - Page I/O for writeback
+// ============================================================================
+
+/// VFAT address space operations for page cache writeback
+///
+/// Provides readpage/writepage implementations that translate FileId
+/// to block device and perform I/O via the block driver.
+pub struct VfatAddressSpaceOps;
+
+impl AddressSpaceOps for VfatAddressSpaceOps {
+    fn readpage(&self, file_id: FileId, page_offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
+        // Decode FileId to get block device
+        let (major, minor) = file_id.to_blkdev().ok_or(-5)?; // EIO if not blkdev
+        let bdev = get_blkdev(DevId::new(major, minor)).ok_or(-5)?;
+
+        // Read from block device
+        let frame_addr = buf.as_ptr() as u64;
+        bdev.disk.queue.driver().readpage(&bdev.disk, frame_addr, page_offset);
+
+        Ok(PAGE_SIZE)
+    }
+
+    fn writepage(&self, file_id: FileId, page_offset: u64, buf: &[u8]) -> Result<usize, i32> {
+        // Decode FileId to get block device
+        let (major, minor) = file_id.to_blkdev().ok_or(-5)?; // EIO if not blkdev
+        let bdev = get_blkdev(DevId::new(major, minor)).ok_or(-5)?;
+
+        // Write to block device
+        let frame_addr = buf.as_ptr() as u64;
+        bdev.disk.queue.driver().writepage(&bdev.disk, frame_addr, page_offset);
+
+        Ok(PAGE_SIZE)
+    }
+}
+
+/// Global VFAT address space ops instance
+pub static VFAT_AOPS: VfatAddressSpaceOps = VfatAddressSpaceOps;
 
 // ============================================================================
 // VFAT On-Disk Structures
@@ -295,8 +334,16 @@ fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), FsE
     Ok(())
 }
 
-/// Write bytes to block device via page cache
+/// Write bytes to block device via page cache (LAZY WRITEBACK)
+///
+/// Data is written to the page cache and marked dirty. The actual disk write
+/// happens later via:
+/// - Periodic writeback daemon (every ~5 seconds)
+/// - Explicit fsync() or sync() calls
+/// - Page cache eviction pressure
 fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+    use crate::mm::page_cache::DIRTY_ADDRESS_SPACES;
+
     let file_id = FileId::from_blkdev(bdev.dev_id().major, bdev.dev_id().minor);
     let capacity = bdev.capacity();
 
@@ -321,7 +368,7 @@ fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), FsErro
                     &mut frame_alloc,
                     true,  // can_writeback for vfat
                     false, // not unevictable (disk-backed)
-                    &NULL_AOPS,
+                    &VFAT_AOPS, // Use VFAT ops for writeback
                 )
                 .map_err(|_| FsError::IoError)?;
             (page, is_new)
@@ -344,14 +391,16 @@ fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), FsErro
             );
         }
 
-        // Mark page as dirty
+        // Mark page as dirty - writeback daemon will flush later
         page.mark_dirty();
 
-        // Write page to disk (write-through for now, will add proper writeback later)
-        bdev.disk
-            .queue
-            .driver()
-            .writepage(&bdev.disk, page.frame, page_offset);
+        // Track this address space as having dirty pages
+        DIRTY_ADDRESS_SPACES.lock().insert(file_id);
+
+        // Notify the device's BDI for per-device writeback scheduling
+        bdev.disk.bdi.mark_dirty(file_id);
+
+        // NO writepage() call here - lazy writeback!
 
         pos += chunk_size as u64;
         buf_offset += chunk_size;

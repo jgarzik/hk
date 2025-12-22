@@ -4,14 +4,27 @@
 //! - `WritebackControl` - Parameters controlling writeback operations
 //! - `do_writepages` - Write dirty pages for a single file
 //! - `writeback_all` - Write dirty pages for all files
-//! - `writeback_timer_tick` - Periodic writeback hook called from timer interrupt
+//! - `BdiWriteback` - Per-device writeback state with workqueue scheduling
+//!
+//! ## Architecture
+//!
+//! Unlike the old timer-interrupt approach, writeback now uses the workqueue
+//! subsystem. Each block device has a `BdiWriteback` structure that schedules
+//! delayed work items to flush dirty pages periodically.
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
+use alloc::collections::BTreeSet;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use spin::{Mutex, RwLock};
 
 use crate::mm::page_cache::{AddressSpace, FileId, DIRTY_ADDRESS_SPACES, PAGE_SIZE};
+use crate::storage::blkdev::DevId;
+use crate::workqueue::{DelayedWork, Workqueue, wq_flags};
 use crate::PAGE_CACHE;
 
 // ============================================================================
@@ -19,16 +32,10 @@ use crate::PAGE_CACHE;
 // ============================================================================
 
 /// Writeback interval in timer ticks (500 ticks = ~5 seconds at 100Hz)
-const WRITEBACK_INTERVAL_TICKS: u64 = 500;
+pub const WRITEBACK_INTERVAL_TICKS: u64 = 500;
 
 /// Pages to write per periodic writeback run
-const WRITEBACK_BATCH_SIZE: i64 = 128;
-
-/// Tick counter for periodic writeback scheduling
-static WRITEBACK_TICK_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Flag indicating writeback is pending (set from timer, processed later)
-static WRITEBACK_PENDING: AtomicBool = AtomicBool::new(false);
+pub const WRITEBACK_BATCH_SIZE: i64 = 128;
 
 // ============================================================================
 // WritebackControl
@@ -285,33 +292,14 @@ pub fn wait_on_writeback(file_id: FileId) {
 }
 
 // ============================================================================
-// Writeback Daemon (Timer-based)
+// Global Writeback (Legacy/Fallback)
 // ============================================================================
 
-/// Called from timer interrupt - checks if periodic writeback is due
+/// Perform periodic writeback for all dirty files
 ///
-/// This function is called from the timer interrupt handler on every tick.
-/// It checks if enough time has passed since the last writeback and triggers
-/// a batch writeback of dirty pages.
-///
-/// # Note
-/// This runs in interrupt context, so we use try_lock and keep work minimal.
-/// For expensive operations, we set a flag and let the scheduler do the work.
-pub fn writeback_timer_tick() {
-    let count = WRITEBACK_TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-
-    // Check if it's time for periodic writeback
-    if count.is_multiple_of(WRITEBACK_INTERVAL_TICKS) && count > 0 {
-        // For now, do writeback directly (simple approach)
-        // A more sophisticated approach would set WRITEBACK_PENDING and
-        // have the scheduler call check_writeback_pending()
-        do_periodic_writeback();
-    }
-}
-
-/// Perform periodic writeback
-///
-/// Called from writeback_timer_tick when it's time to flush dirty pages.
+/// This is a fallback for files not tracked by a per-device BDI.
+/// Called from do_device_writeback or sync_all.
+#[allow(dead_code)]
 fn do_periodic_writeback() {
     // Quick check - any dirty files?
     let has_dirty = !DIRTY_ADDRESS_SPACES.lock().is_empty();
@@ -322,16 +310,6 @@ fn do_periodic_writeback() {
     // Perform background writeback
     let mut wbc = WritebackControl::for_kupdate(WRITEBACK_BATCH_SIZE);
     writeback_all(&mut wbc);
-}
-
-/// Check if writeback is pending (for deferred writeback model)
-///
-/// If timer set WRITEBACK_PENDING, process it now in scheduler context.
-/// This is safer than doing writeback in interrupt context.
-pub fn check_writeback_pending() {
-    if WRITEBACK_PENDING.swap(false, Ordering::AcqRel) {
-        do_periodic_writeback();
-    }
 }
 
 /// Force immediate writeback of all dirty pages (for sync syscall)
@@ -347,4 +325,181 @@ pub fn sync_all() -> Result<usize, i32> {
     }
 
     Ok(wbc.pages_written)
+}
+
+// ============================================================================
+// Per-Device Writeback (BDI)
+// ============================================================================
+
+/// BDI workqueue for writeback operations
+///
+/// This is a dedicated workqueue for writeback, separate from the system
+/// workqueue, allowing writeback to proceed even during memory pressure.
+pub static BDI_WORKQUEUE: Workqueue = Workqueue::new(
+    "bdi",
+    wq_flags::WQ_MEM_RECLAIM | wq_flags::WQ_UNBOUND,
+);
+
+/// Registry of per-device writeback states
+static BDI_REGISTRY: RwLock<BTreeMap<DevId, Arc<BdiWriteback>>> = RwLock::new(BTreeMap::new());
+
+/// Per-device writeback state (simplified backing_dev_info)
+///
+/// Each block device has a BdiWriteback that tracks:
+/// - Which files on this device have dirty pages
+/// - A delayed work item for periodic flushing
+pub struct BdiWriteback {
+    /// Device ID this writeback state belongs to
+    pub dev_id: DevId,
+    /// Dirty file IDs on this device
+    dirty_inodes: Mutex<BTreeSet<FileId>>,
+    /// Delayed work for periodic flushing
+    dwork: Arc<Mutex<DelayedWork>>,
+    /// Number of pages written since last sample (for bandwidth estimation)
+    written_pages: AtomicU64,
+}
+
+impl BdiWriteback {
+    /// Create new writeback state for a device
+    fn new(dev_id: DevId) -> Self {
+        // Create delayed work that performs writeback for this device
+        let dev = dev_id;
+        let dwork = Arc::new(Mutex::new(DelayedWork::new(move || {
+            do_device_writeback(dev);
+        })));
+
+        Self {
+            dev_id,
+            dirty_inodes: Mutex::new(BTreeSet::new()),
+            dwork,
+            written_pages: AtomicU64::new(0),
+        }
+    }
+
+    /// Mark a file as dirty on this device
+    ///
+    /// If this is the first dirty file, schedules delayed writeback.
+    pub fn mark_dirty(&self, file_id: FileId) {
+        let was_empty = {
+            let mut set = self.dirty_inodes.lock();
+            let was_empty = set.is_empty();
+            set.insert(file_id);
+            was_empty
+        };
+
+        // If first dirty file, schedule delayed writeback
+        if was_empty {
+            self.wakeup_delayed();
+        }
+    }
+
+    /// Remove a file from the dirty list
+    pub fn mark_clean(&self, file_id: FileId) {
+        self.dirty_inodes.lock().remove(&file_id);
+    }
+
+    /// Schedule periodic writeback (delayed)
+    ///
+    /// Schedules writeback to occur after WRITEBACK_INTERVAL_TICKS.
+    pub fn wakeup_delayed(&self) {
+        BDI_WORKQUEUE.queue_delayed_work(self.dwork.clone(), WRITEBACK_INTERVAL_TICKS);
+    }
+
+    /// Wake immediately for sync/fsync
+    ///
+    /// Cancels any pending delayed work and queues for immediate execution.
+    pub fn wakeup(&self) {
+        // Cancel delayed timer and queue immediately
+        {
+            let dw = self.dwork.lock();
+            dw.cancel_timer();
+        }
+        // Queue for immediate execution
+        BDI_WORKQUEUE.queue_delayed_work(self.dwork.clone(), 0);
+    }
+
+    /// Get the dirty file IDs for this device
+    pub fn get_dirty_files(&self) -> Vec<FileId> {
+        self.dirty_inodes.lock().iter().copied().collect()
+    }
+
+    /// Check if there are dirty files
+    pub fn has_dirty(&self) -> bool {
+        !self.dirty_inodes.lock().is_empty()
+    }
+
+    /// Add to the written pages counter
+    pub fn add_written(&self, count: u64) {
+        self.written_pages.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+/// Perform writeback for a specific device
+///
+/// This is called from the workqueue worker thread.
+fn do_device_writeback(dev_id: DevId) {
+    // Get the BDI for this device
+    let bdi = match get_bdi(dev_id) {
+        Some(b) => b,
+        None => return,
+    };
+
+    // Get dirty files for this device
+    let dirty_files = bdi.get_dirty_files();
+
+    if dirty_files.is_empty() {
+        return;
+    }
+
+    // Perform writeback
+    let mut wbc = WritebackControl::for_kupdate(WRITEBACK_BATCH_SIZE);
+
+    for file_id in dirty_files {
+        if wbc.nr_to_write <= 0 {
+            break;
+        }
+
+        if let Ok(written) = do_writepages_for_file(file_id, &mut wbc) {
+            bdi.add_written(written as u64);
+        }
+    }
+
+    // If there are still dirty files, re-schedule
+    if bdi.has_dirty() {
+        bdi.wakeup_delayed();
+    }
+}
+
+/// Register a device for writeback tracking
+///
+/// Called when a block device is created. Returns the BdiWriteback for the device.
+pub fn bdi_register(dev_id: DevId) -> Arc<BdiWriteback> {
+    let bdi = Arc::new(BdiWriteback::new(dev_id));
+    BDI_REGISTRY.write().insert(dev_id, bdi.clone());
+    bdi
+}
+
+/// Unregister a device from writeback tracking
+///
+/// Called when a block device is removed.
+pub fn bdi_unregister(dev_id: DevId) {
+    if let Some(bdi) = BDI_REGISTRY.write().remove(&dev_id) {
+        // Cancel any pending work
+        bdi.dwork.lock().cancel_timer();
+    }
+}
+
+/// Get the BdiWriteback for a device
+pub fn get_bdi(dev_id: DevId) -> Option<Arc<BdiWriteback>> {
+    BDI_REGISTRY.read().get(&dev_id).cloned()
+}
+
+/// Wake all BDIs for sync
+///
+/// Called by sync() to flush all devices immediately.
+pub fn wakeup_all_bdis() {
+    let bdis: Vec<Arc<BdiWriteback>> = BDI_REGISTRY.read().values().cloned().collect();
+    for bdi in bdis {
+        bdi.wakeup();
+    }
 }

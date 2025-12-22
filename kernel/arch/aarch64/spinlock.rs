@@ -81,6 +81,36 @@ impl<T> IrqSpinlock<T> {
         }
     }
 
+    /// Try to acquire the lock without blocking
+    ///
+    /// Returns Some(guard) if the lock was acquired, None if it was already held.
+    /// This is useful in interrupt context where blocking is not allowed.
+    #[inline]
+    pub fn try_lock(&self) -> Option<IrqSpinlockGuard<'_, T>> {
+        // Save interrupt state and disable interrupts FIRST
+        let irq_state = save_and_disable_irq();
+
+        // Disable preemption (increment preempt_count)
+        percpu::preempt_disable();
+
+        // Try to acquire the lock (single attempt, no spinning)
+        if self
+            .lock
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(IrqSpinlockGuard {
+                lock: self,
+                irq_state,
+            })
+        } else {
+            // Failed to acquire - restore state
+            percpu::preempt_enable();
+            restore_irq(irq_state);
+            None
+        }
+    }
+
     /// Force unlock the spinlock without restoring state
     ///
     /// # Safety

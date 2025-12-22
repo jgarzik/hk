@@ -16,6 +16,7 @@ use crate::task::Tid;
 pub mod page_cache;
 pub mod syscall;
 pub mod vma;
+pub mod writeback;
 
 pub use vma::*;
 
