@@ -635,9 +635,10 @@ impl ContextOps for Aarch64Arch {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         new_page_table_root: u64,
+        next_tid: Tid,
     ) {
         unsafe {
-            context::context_switch(old_ctx, new_ctx, new_kstack, new_page_table_root);
+            context::context_switch(old_ctx, new_ctx, new_kstack, new_page_table_root, next_tid);
         }
     }
 
@@ -645,9 +646,10 @@ impl ContextOps for Aarch64Arch {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         new_page_table_root: u64,
+        next_tid: Tid,
     ) -> ! {
         unsafe {
-            context::context_switch_first(new_ctx, new_kstack, new_page_table_root);
+            context::context_switch_first(new_ctx, new_kstack, new_page_table_root, next_tid);
         }
     }
 }

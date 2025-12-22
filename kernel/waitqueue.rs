@@ -221,7 +221,7 @@ impl WaitQueue {
 
             // Context switch
             unsafe {
-                CurrentArch::context_switch(curr, next, next_kstack, next_cr3);
+                CurrentArch::context_switch(curr, next, next_kstack, next_cr3, next_tid);
             }
         }
 

@@ -648,6 +648,8 @@ pub struct CloneConfig {
     pub parent_tidptr: u64,
     /// User address to store child TID (CLONE_CHILD_SETTID/CLEARTID)
     pub child_tidptr: u64,
+    /// TLS pointer for child (CLONE_SETTLS)
+    pub tls: u64,
 }
 
 /// Create a new thread/process via clone()
@@ -935,6 +937,13 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         crate::ipc::sem::clone_task_semundo(current_tid, child_tid, true);
     }
 
+    // Handle CLONE_SETTLS: set child's TLS pointer
+    // This stores the TLS value so clone_child_entry can load it into the
+    // architecture-specific TLS register (FS base on x86_64, TPIDR_EL0 on aarch64)
+    if config.flags & CLONE_SETTLS != 0 {
+        crate::task::set_task_tls(child_tid, config.tls);
+    }
+
     // Handle CLONE_PARENT_SETTID: write child TID to parent's address space
     if config.flags & CLONE_PARENT_SETTID != 0 && config.parent_tidptr != 0 {
         use crate::arch::Uaccess;
@@ -1040,6 +1049,12 @@ pub fn exit_current() -> ! {
         // Clean up I/O context for exiting task
         crate::task::remove_task_io_context(tid);
 
+        // Clean up TLS pointer for exiting task
+        crate::task::remove_task_tls(tid);
+
+        // Clean up clear_child_tid pointer for exiting task
+        crate::task::remove_clear_child_tid(tid);
+
         // Clean up namespace context for exiting task
         crate::ns::exit_task_ns(tid);
 
@@ -1129,7 +1144,7 @@ pub fn exit_current() -> ! {
 
     // Switch to next task - never returns
     unsafe {
-        CurrentArch::context_switch_first(next_ctx, next_kstack, next_cr3);
+        CurrentArch::context_switch_first(next_ctx, next_kstack, next_cr3, next_tid);
     }
 }
 
@@ -1179,6 +1194,21 @@ pub extern "C" fn get_current_task_cr3() -> u64 {
         }
     }
     0
+}
+
+/// Get the current task's TLS value
+///
+/// This is called from clone_child_entry to load the child's TLS register
+/// before returning to user mode.
+///
+/// Returns 0 if no TLS is set for this task.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_current_task_tls() -> u64 {
+    let tid = current_tid();
+    if tid == 0 {
+        return 0;
+    }
+    crate::task::get_task_tls(tid).unwrap_or(0)
 }
 
 /// Put current task to sleep until the specified tick
@@ -1319,7 +1349,7 @@ pub fn sleep_current_until(wake_tick: u64) {
         // The lock is released by finish_context_switch() in the new task
         // when it starts or resumes.
         unsafe {
-            CurrentArch::context_switch(curr, next, next_kstack, next_cr3);
+            CurrentArch::context_switch(curr, next, next_kstack, next_cr3, next_tid);
         }
 
         // We return here when woken up
@@ -1457,7 +1487,7 @@ pub fn yield_now() {
         // The lock is released after we return from context_switch
         // (when another thread switches back to us)
         unsafe {
-            CurrentArch::context_switch(curr, next, next_kstack, next_cr3);
+            CurrentArch::context_switch(curr, next, next_kstack, next_cr3, next_tid);
         }
     }
 
@@ -2165,7 +2195,7 @@ pub fn try_schedule() {
             CurrentArch::set_current_task(&task_info);
 
             unsafe {
-                CurrentArch::context_switch(curr, next, next_kstack, next_cr3);
+                CurrentArch::context_switch(curr, next, next_kstack, next_cr3, next_tid);
             }
         }
     } else {
@@ -2215,7 +2245,7 @@ pub fn try_schedule() {
         drop(rq); // Release lock before switch
 
         unsafe {
-            CurrentArch::context_switch_first(next_ctx, next_kstack, next_cr3);
+            CurrentArch::context_switch_first(next_ctx, next_kstack, next_cr3, next_tid);
         }
     }
 }

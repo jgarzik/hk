@@ -242,6 +242,58 @@ pub fn read_gs_base() -> u64 {
 }
 
 // ============================================================================
+// User Thread-Local Storage (FS base register)
+// ============================================================================
+
+/// MSR address for FS base register (user TLS on x86_64)
+pub const MSR_FS_BASE: u32 = 0xC0000100;
+
+/// Set the FS base register (user TLS pointer)
+///
+/// This is used for user-space thread-local storage. The FS segment
+/// register's base address is set via this MSR on x86_64.
+pub fn write_fs_base(addr: u64) {
+    unsafe {
+        ::core::arch::asm!(
+            "wrmsr",
+            in("ecx") MSR_FS_BASE,
+            in("eax") addr as u32,
+            in("edx") (addr >> 32) as u32,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Read the FS base register
+pub fn read_fs_base() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        ::core::arch::asm!(
+            "rdmsr",
+            in("ecx") MSR_FS_BASE,
+            out("eax") low,
+            out("edx") high,
+            options(nostack, preserves_flags)
+        );
+    }
+    ((high as u64) << 32) | (low as u64)
+}
+
+// ============================================================================
+// arch_prctl operation codes
+// ============================================================================
+
+/// arch_prctl: Set GS base address
+pub const ARCH_SET_GS: i32 = 0x1001;
+/// arch_prctl: Set FS base address (user TLS)
+pub const ARCH_SET_FS: i32 = 0x1002;
+/// arch_prctl: Get FS base address
+pub const ARCH_GET_FS: i32 = 0x1003;
+/// arch_prctl: Get GS base address
+pub const ARCH_GET_GS: i32 = 0x1004;
+
+// ============================================================================
 // Preemption Control
 // ============================================================================
 

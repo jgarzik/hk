@@ -6,6 +6,9 @@
  *
  * Callee-saved registers: x19-x28, x29 (FP), x30 (LR)
  * The stack pointer (SP) is also saved/restored.
+ *
+ * TLS (TPIDR_EL0) handling is done in Rust before calling these functions,
+ * following the Linux kernel pattern (tls_thread_switch before cpu_switch_to).
  */
 
 .section .text

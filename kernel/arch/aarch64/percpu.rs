@@ -155,6 +155,32 @@ pub fn read_tpidr_el1() -> u64 {
     val
 }
 
+/// Set the TPIDR_EL0 register (user TLS pointer)
+#[inline]
+pub fn write_tpidr_el0(value: u64) {
+    unsafe {
+        asm!(
+            "msr tpidr_el0, {}",
+            in(reg) value,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Read the TPIDR_EL0 register (user TLS pointer)
+#[inline]
+pub fn read_tpidr_el0() -> u64 {
+    let val: u64;
+    unsafe {
+        asm!(
+            "mrs {}, tpidr_el0",
+            out(reg) val,
+            options(nostack, preserves_flags, nomem)
+        );
+    }
+    val
+}
+
 /// Get a reference to a CPU's per-CPU data by CPU ID
 pub fn get_percpu(cpu_id: u32) -> &'static mut PerCpu {
     assert!((cpu_id as usize) < MAX_CPUS, "CPU ID out of range");

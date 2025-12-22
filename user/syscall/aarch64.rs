@@ -180,6 +180,9 @@ pub const SYS_MSGSND: u64 = 189;
 pub const SYS_MSGRCV: u64 = 188;
 pub const SYS_MSGCTL: u64 = 187;
 
+// TLS syscalls
+pub const SYS_SET_TID_ADDRESS: u64 = 96;
+
 // ============================================================================
 // Syscall wrapper functions
 // ============================================================================
@@ -2588,6 +2591,32 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: *mut *const super::RobustListHead
             in("x0") pid as u64,
             in("x1") head_ptr as u64,
             in("x2") len_ptr as u64,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+// ============================================================================
+// TLS syscall wrappers
+// ============================================================================
+
+/// set_tid_address(tidptr) - set pointer to thread ID
+///
+/// Sets the clear_child_tid address for the calling thread.
+/// When the thread exits, the kernel will write 0 to this address
+/// and wake any futex waiters on it (used for pthread_join).
+///
+/// Returns the caller's thread ID.
+#[inline(always)]
+pub fn sys_set_tid_address(tidptr: *mut i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_SET_TID_ADDRESS,
+            in("x0") tidptr as u64,
             lateout("x0") ret,
             options(nostack),
         );

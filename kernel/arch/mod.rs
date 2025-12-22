@@ -291,6 +291,9 @@ pub trait ContextOps: Sized {
 
     /// Switch from current task to a new task, saving current context
     ///
+    /// Handles TLS save/restore in Rust before calling assembly, following
+    /// the Linux kernel pattern (tls_thread_switch before cpu_switch_to).
+    ///
     /// # Safety
     /// - `old_ctx` must point to valid, writable memory
     /// - `new_ctx` must point to a valid, previously saved context
@@ -300,11 +303,13 @@ pub trait ContextOps: Sized {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         new_page_table_root: u64,
+        next_tid: Tid,
     );
 
     /// Switch to a task without saving current context
     ///
-    /// Used for the initial switch to the first task.
+    /// Used for the initial switch to the first task or when exiting.
+    /// Handles TLS load for the new task before calling assembly.
     ///
     /// # Safety
     /// Same requirements as `context_switch`, except no saving occurs.
@@ -312,6 +317,7 @@ pub trait ContextOps: Sized {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         new_page_table_root: u64,
+        next_tid: Tid,
     ) -> !;
 }
 

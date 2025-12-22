@@ -172,6 +172,16 @@ pub const SYS_MSGSND: u64 = 69;
 pub const SYS_MSGRCV: u64 = 70;
 pub const SYS_MSGCTL: u64 = 71;
 
+// TLS syscalls
+pub const SYS_ARCH_PRCTL: u64 = 158;
+pub const SYS_SET_TID_ADDRESS: u64 = 218;
+
+// arch_prctl operation codes
+pub const ARCH_SET_GS: i32 = 0x1001;
+pub const ARCH_SET_FS: i32 = 0x1002;
+pub const ARCH_GET_FS: i32 = 0x1003;
+pub const ARCH_GET_GS: i32 = 0x1004;
+
 // ============================================================================
 // Syscall wrapper functions
 // ============================================================================
@@ -2769,6 +2779,61 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: *mut *const super::RobustListHead
             in("rdi") pid as u64,
             in("rsi") head_ptr as u64,
             in("rdx") len_ptr as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+// ============================================================================
+// TLS syscall wrappers
+// ============================================================================
+
+/// arch_prctl(code, addr) - set architecture-specific thread state
+///
+/// On x86_64, this is used to set/get FS and GS base registers.
+/// - ARCH_SET_FS (0x1002): Set FS base to addr
+/// - ARCH_GET_FS (0x1003): Store FS base at addr
+/// - ARCH_SET_GS (0x1001): Set GS base to addr (not supported in user mode)
+/// - ARCH_GET_GS (0x1004): Store GS base at addr (not supported in user mode)
+///
+/// Returns 0 on success, -EINVAL for invalid code.
+#[inline(always)]
+pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_ARCH_PRCTL,
+            in("rdi") code as u64,
+            in("rsi") addr,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// set_tid_address(tidptr) - set pointer to thread ID
+///
+/// Sets the clear_child_tid address for the calling thread.
+/// When the thread exits, the kernel will write 0 to this address
+/// and wake any futex waiters on it (used for pthread_join).
+///
+/// Returns the caller's thread ID.
+#[inline(always)]
+pub fn sys_set_tid_address(tidptr: *mut i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_SET_TID_ADDRESS,
+            in("rdi") tidptr as u64,
             lateout("rax") ret,
             out("rcx") _,
             out("r11") _,

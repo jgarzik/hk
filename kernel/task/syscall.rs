@@ -306,7 +306,7 @@ pub fn sys_clone(
     child_stack: u64,
     parent_tidptr: u64,
     child_tidptr: u64,
-    _tls: u64,
+    tls: u64,
 ) -> i64 {
     use super::percpu::CloneConfig;
     use crate::FRAME_ALLOCATOR;
@@ -328,6 +328,7 @@ pub fn sys_clone(
         parent_rsp,
         parent_tidptr,
         child_tidptr,
+        tls,
     };
 
     // Get frame allocator
@@ -346,7 +347,7 @@ pub fn sys_clone(
     child_stack: u64,
     parent_tidptr: u64,
     child_tidptr: u64,
-    _tls: u64,
+    tls: u64,
 ) -> i64 {
     use super::percpu::CloneConfig;
     use crate::FRAME_ALLOCATOR;
@@ -367,6 +368,7 @@ pub fn sys_clone(
         parent_rsp,
         parent_tidptr,
         child_tidptr,
+        tls,
     };
 
     // Get frame allocator
@@ -410,6 +412,7 @@ pub fn sys_fork() -> i64 {
         parent_rsp,
         parent_tidptr: 0,
         child_tidptr: 0,
+        tls: 0,
     };
 
     // Get frame allocator
@@ -444,6 +447,7 @@ pub fn sys_fork() -> i64 {
         parent_rsp,
         parent_tidptr: 0,
         child_tidptr: 0,
+        tls: 0,
     };
 
     // Get frame allocator
@@ -498,6 +502,7 @@ pub fn sys_vfork() -> i64 {
         parent_rsp,
         parent_tidptr: 0,
         child_tidptr: 0,
+        tls: 0,
     };
 
     // Get frame allocator
@@ -534,6 +539,7 @@ pub fn sys_vfork() -> i64 {
         parent_rsp,
         parent_tidptr: 0,
         child_tidptr: 0,
+        tls: 0,
     };
 
     // Get frame allocator
@@ -2289,4 +2295,90 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
         }
         _ => EINVAL,
     }
+}
+
+// =============================================================================
+// Thread-Local Storage syscalls
+// =============================================================================
+
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::percpu::{
+    ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_FS, ARCH_SET_GS, read_fs_base, write_fs_base,
+};
+
+/// sys_arch_prctl - Architecture-specific thread state (x86_64 only)
+///
+/// Controls architecture-specific thread state. On x86_64, this is used
+/// primarily for setting the FS and GS base registers for thread-local storage.
+///
+/// Supported operations:
+/// - ARCH_SET_FS (0x1002): Set FS base address (user TLS pointer)
+/// - ARCH_GET_FS (0x1003): Get FS base address
+/// - ARCH_SET_GS (0x1001): Not supported (GS is kernel per-CPU)
+/// - ARCH_GET_GS (0x1004): Not supported
+///
+/// Returns 0 on success, negative errno on error.
+#[cfg(target_arch = "x86_64")]
+pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
+    use crate::CurrentArch;
+    use crate::arch::PerCpuOps;
+    use crate::arch::Uaccess;
+    use crate::task::{get_task_tls, set_task_tls};
+    use crate::uaccess::put_user;
+
+    let tid = CurrentArch::current_tid();
+
+    match code {
+        ARCH_SET_FS => {
+            // Set FS base - user TLS pointer
+            set_task_tls(tid, addr);
+            write_fs_base(addr);
+            0
+        }
+        ARCH_GET_FS => {
+            // Get FS base - return via user pointer
+            // First try our stored value, fall back to reading the register
+            let tls = get_task_tls(tid).unwrap_or_else(read_fs_base);
+
+            // Write to user address
+            if put_user::<Uaccess, u64>(addr, tls).is_err() {
+                return EFAULT;
+            }
+            0
+        }
+        ARCH_SET_GS | ARCH_GET_GS => {
+            // GS base is used by kernel for per-CPU data, not available to user
+            EINVAL
+        }
+        _ => EINVAL,
+    }
+}
+
+/// sys_arch_prctl stub for non-x86_64 architectures
+#[cfg(not(target_arch = "x86_64"))]
+pub fn sys_arch_prctl(_code: i32, _addr: u64) -> i64 {
+    // arch_prctl is x86_64-specific
+    const ENOSYS: i64 = -38;
+    ENOSYS
+}
+
+/// sys_set_tid_address - Set pointer for thread ID clearing on exit
+///
+/// Sets the `clear_child_tid` address for the calling thread. When the thread
+/// exits:
+/// 1. The kernel writes 0 to this address
+/// 2. The kernel performs futex(FUTEX_WAKE, 1) on this address
+///
+/// This mechanism is used by pthread libraries to implement thread joining.
+/// The thread library stores a futex here and the parent waits on it.
+///
+/// Returns the caller's thread ID.
+pub fn sys_set_tid_address(tidptr: u64) -> i64 {
+    use crate::CurrentArch;
+    use crate::arch::PerCpuOps;
+    use crate::task::set_clear_child_tid;
+
+    let tid = CurrentArch::current_tid();
+    set_clear_child_tid(tid, tidptr);
+    tid as i64
 }

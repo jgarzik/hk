@@ -5,6 +5,13 @@
 //! callee-saved registers per AAPCS64 (ARM ABI).
 //!
 //! The actual context switch is implemented in switch_to.S (pure assembly).
+//!
+//! TLS (Thread Local Storage) handling follows the Linux kernel pattern:
+//! save/restore TPIDR_EL0 in Rust before calling the pure-asm switch.
+
+use super::percpu::{read_tpidr_el0, write_tpidr_el0};
+use crate::task::percpu::current_tid;
+use crate::task::{Tid, get_task_tls, set_task_tls};
 
 // External assembly functions from switch_to.S
 unsafe extern "C" {
@@ -141,6 +148,13 @@ pub extern "C" fn clone_child_entry() -> ! {
         "dsb ish",
         "isb",
 
+        // Get and load the child's TLS (TPIDR_EL0)
+        // This handles CLONE_SETTLS - if no TLS was set, get_tls returns 0
+        "bl {get_tls}",
+        // X0 now contains the TLS value (or 0 if not set)
+        // TPIDR_EL0 is the user TLS pointer register
+        "msr tpidr_el0, x0",
+
         // SP points to the TrapFrame we prepared on the child's kernel stack
         // TrapFrame layout (272 bytes):
         //   sp+0x000: x0-x30 (31 * 8 = 248 bytes)
@@ -191,10 +205,13 @@ pub extern "C" fn clone_child_entry() -> ! {
 
         finish_switch = sym finish_context_switch,
         get_ttbr0 = sym crate::task::percpu::get_current_task_cr3,
+        get_tls = sym crate::task::percpu::get_current_task_tls,
     );
 }
 
 /// Switch from the current task context to a new task context
+///
+/// Follows Linux kernel pattern: handle TLS in Rust wrapper, then call pure-asm switch.
 ///
 /// # Safety
 /// - `old_ctx` must point to valid, writable memory for storing the current context
@@ -202,21 +219,39 @@ pub extern "C" fn clone_child_entry() -> ! {
 /// - `new_kstack` should be the new kernel stack top (informational on aarch64)
 /// - `new_ttbr0` must be a valid page table physical address for TTBR0_EL1
 /// - Interrupts should be disabled during the switch
+/// - `next_tid` must be the TID of the task we're switching to
 pub unsafe fn context_switch(
     old_ctx: *mut Aarch64TaskContext,
     new_ctx: *const Aarch64TaskContext,
     new_kstack: u64,
     new_ttbr0: u64,
+    next_tid: Tid,
 ) {
+    // Save current task's TLS (TPIDR_EL0) before switching
+    let prev_tid = current_tid();
+    if prev_tid != 0 {
+        let tpidr = read_tpidr_el0();
+        if tpidr != 0 {
+            set_task_tls(prev_tid, tpidr);
+        }
+    }
+
+    // Load next task's TLS (TPIDR_EL0) before switching
+    if next_tid != 0 {
+        let tls = get_task_tls(next_tid).unwrap_or(0);
+        write_tpidr_el0(tls);
+    }
+
     unsafe {
         __switch_to_asm(old_ctx, new_ctx, new_kstack, new_ttbr0);
     }
+    // When we return here, we're a different task that was switched back to us
 }
 
 /// Switch to a new task without saving the old context
 ///
-/// Used for the initial switch to the first task, when there's no
-/// previous context to save.
+/// Used for the initial switch to the first task or when exiting.
+/// Follows Linux kernel pattern: load TLS for new task, then call pure-asm switch.
 ///
 /// # Safety
 /// Same requirements as context_switch, except old_ctx is not used.
@@ -224,7 +259,14 @@ pub unsafe fn context_switch_first(
     new_ctx: *const Aarch64TaskContext,
     new_kstack: u64,
     new_ttbr0: u64,
+    next_tid: Tid,
 ) -> ! {
+    // Load next task's TLS (TPIDR_EL0) - no prev task to save
+    if next_tid != 0 {
+        let tls = get_task_tls(next_tid).unwrap_or(0);
+        write_tpidr_el0(tls);
+    }
+
     unsafe {
         __switch_to_asm_first(new_ctx, new_kstack, new_ttbr0);
         // The above never returns

@@ -26,6 +26,8 @@ pub mod clone_flags {
     pub const CLONE_THREAD: u64 = 0x00010000;
     /// Share System V semaphore undo list
     pub const CLONE_SYSVSEM: u64 = 0x00040000;
+    /// Set thread-local storage pointer for child
+    pub const CLONE_SETTLS: u64 = 0x00080000;
     /// Set parent TID at parent_tidptr location
     pub const CLONE_PARENT_SETTID: u64 = 0x00100000;
     /// Set child TID at child_tidptr location (in child's address space)
@@ -860,3 +862,60 @@ pub const IOPRIO_WHO_PROCESS: i32 = 1;
 pub const IOPRIO_WHO_PGRP: i32 = 2;
 /// ioprio_get/set for all processes of a user
 pub const IOPRIO_WHO_USER: i32 = 3;
+
+// =============================================================================
+// Per-task Thread-Local Storage (TLS) pointer
+// =============================================================================
+
+/// Per-task TLS pointer mapping
+///
+/// Maps TID to the task's TLS pointer value:
+/// - x86_64: FS base address (set via MSR_FS_BASE)
+/// - aarch64: TPIDR_EL0 value
+///
+/// This is set when CLONE_SETTLS is used, or via arch_prctl(ARCH_SET_FS) on x86_64.
+static TASK_TLS: Mutex<BTreeMap<Tid, u64>> = Mutex::new(BTreeMap::new());
+
+/// Get the TLS pointer for a task
+pub fn get_task_tls(tid: Tid) -> Option<u64> {
+    TASK_TLS.lock().get(&tid).copied()
+}
+
+/// Set the TLS pointer for a task
+pub fn set_task_tls(tid: Tid, tls: u64) {
+    TASK_TLS.lock().insert(tid, tls);
+}
+
+/// Remove the TLS pointer for a task (on exit)
+pub fn remove_task_tls(tid: Tid) {
+    TASK_TLS.lock().remove(&tid);
+}
+
+// =============================================================================
+// Per-task clear_child_tid pointer (for set_tid_address syscall)
+// =============================================================================
+
+/// Per-task clear_child_tid pointer mapping
+///
+/// Maps TID to the address that should be cleared and futex-woken on thread exit.
+/// This is set by set_tid_address() syscall and used by pthread library for thread cleanup.
+static TASK_CLEAR_CHILD_TID: Mutex<BTreeMap<Tid, u64>> = Mutex::new(BTreeMap::new());
+
+/// Get the clear_child_tid pointer for a task
+pub fn get_clear_child_tid(tid: Tid) -> Option<u64> {
+    TASK_CLEAR_CHILD_TID.lock().get(&tid).copied()
+}
+
+/// Set the clear_child_tid pointer for a task
+pub fn set_clear_child_tid(tid: Tid, addr: u64) {
+    if addr == 0 {
+        TASK_CLEAR_CHILD_TID.lock().remove(&tid);
+    } else {
+        TASK_CLEAR_CHILD_TID.lock().insert(tid, addr);
+    }
+}
+
+/// Remove the clear_child_tid pointer for a task (on exit, after processing)
+pub fn remove_clear_child_tid(tid: Tid) {
+    TASK_CLEAR_CHILD_TID.lock().remove(&tid);
+}

@@ -180,6 +180,7 @@ pub const SEEK_END: i32 = 2;
 pub const CLONE_VM: u64 = 0x00000100;
 pub const CLONE_PARENT: u64 = 0x00008000;
 pub const CLONE_SYSVSEM: u64 = 0x00040000;
+pub const CLONE_SETTLS: u64 = 0x00080000;
 pub const CLONE_IO: u64 = 0x80000000;
 
 // I/O priority constants
