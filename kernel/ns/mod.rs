@@ -37,6 +37,8 @@ pub use pid::{
 pub use user::{INIT_USER_NS, UidGidExtent, UidGidMap, UserNamespace};
 pub use uts::{__NEW_UTS_LEN, INIT_UTS_NS, NewUtsname, UTS_FIELD_SIZE, UtsNamespace};
 
+use crate::ipc::{INIT_IPC_NS, IpcNamespace};
+
 // ============================================================================
 // Namespace Clone Flags (Linux compatible)
 // ============================================================================
@@ -128,8 +130,10 @@ pub struct NsProxy {
 
     /// User namespace (UID/GID mapping)
     pub user_ns: Arc<UserNamespace>,
+
+    /// IPC namespace (SysV IPC isolation)
+    pub ipc_ns: Arc<IpcNamespace>,
     // Future namespaces:
-    // pub ipc_ns: Arc<IpcNamespace>,
     // pub net_ns: Arc<NetNamespace>,
     // pub cgroup_ns: Arc<CgroupNamespace>,
     // pub time_ns: Arc<TimeNamespace>,
@@ -143,6 +147,7 @@ impl NsProxy {
             mnt_ns: INIT_MNT_NS.clone(),
             pid_ns: INIT_PID_NS.clone(),
             user_ns: INIT_USER_NS.clone(),
+            ipc_ns: INIT_IPC_NS.clone(),
         }
     }
 
@@ -182,11 +187,18 @@ impl NsProxy {
             self.user_ns.clone()
         };
 
+        let ipc_ns = if flags & CLONE_NEWIPC != 0 {
+            self.ipc_ns.clone_ns()?
+        } else {
+            self.ipc_ns.clone()
+        };
+
         Ok(Arc::new(Self {
             uts_ns,
             mnt_ns,
             pid_ns,
             user_ns,
+            ipc_ns,
         }))
     }
 }
@@ -316,8 +328,9 @@ const EINVAL: i64 = 22;
 
 /// Currently supported namespace flags for unshare
 ///
-/// We support UTS, mount, PID, and user namespaces.
-const SUPPORTED_NS_FLAGS: u64 = CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUSER;
+/// We support UTS, mount, PID, user, and IPC namespaces.
+const SUPPORTED_NS_FLAGS: u64 =
+    CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUSER | CLONE_NEWIPC;
 
 /// sys_unshare - disassociate parts of the process execution context
 ///
@@ -483,24 +496,35 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             mnt_ns: current_ns.mnt_ns.clone(),
             pid_ns: current_ns.pid_ns.clone(),
             user_ns: current_ns.user_ns.clone(),
+            ipc_ns: current_ns.ipc_ns.clone(),
         }),
         NamespaceType::Mnt => Arc::new(NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
             mnt_ns: target_ns.mnt_ns.clone(),
             pid_ns: current_ns.pid_ns.clone(),
             user_ns: current_ns.user_ns.clone(),
+            ipc_ns: current_ns.ipc_ns.clone(),
         }),
         NamespaceType::Pid => Arc::new(NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
             mnt_ns: current_ns.mnt_ns.clone(),
             pid_ns: target_ns.pid_ns.clone(),
             user_ns: current_ns.user_ns.clone(),
+            ipc_ns: current_ns.ipc_ns.clone(),
         }),
         NamespaceType::User => Arc::new(NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
             mnt_ns: current_ns.mnt_ns.clone(),
             pid_ns: current_ns.pid_ns.clone(),
             user_ns: target_ns.user_ns.clone(),
+            ipc_ns: current_ns.ipc_ns.clone(),
+        }),
+        NamespaceType::Ipc => Arc::new(NsProxy {
+            uts_ns: current_ns.uts_ns.clone(),
+            mnt_ns: current_ns.mnt_ns.clone(),
+            pid_ns: current_ns.pid_ns.clone(),
+            user_ns: current_ns.user_ns.clone(),
+            ipc_ns: target_ns.ipc_ns.clone(),
         }),
     };
 
