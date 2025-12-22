@@ -258,6 +258,24 @@ impl IpcObject for SemArray {
 }
 
 // ============================================================================
+// Safe Downcasting
+// ============================================================================
+
+/// Safely downcast an IpcObject to SemArray
+///
+/// Returns None if the object is not a semaphore array.
+/// This is safe because we verify the type tag before casting.
+fn downcast_sem(obj: &dyn IpcObject) -> Option<&SemArray> {
+    if obj.ipc_type() == IpcType::Sem {
+        // SAFETY: We verified the type tag matches, so this cast is valid.
+        // The IpcType::Sem tag is only returned by SemArray::ipc_type().
+        Some(unsafe { &*(obj as *const dyn IpcObject as *const SemArray) })
+    } else {
+        None
+    }
+}
+
+// ============================================================================
 // Syscalls
 // ============================================================================
 
@@ -448,23 +466,30 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let cred = crate::task::percpu::current_cred();
             let uid = cred.euid;
             let perm = sem.perm();
-            if uid != perm.uid && uid != perm.cuid && uid != 0 {
+            let _lock = perm.lock.lock();
+            // SAFETY: We hold the lock
+            let perm_mutable = unsafe { perm.mutable() };
+            if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
+                drop(_lock);
                 perm.put_ref();
                 return Err(EPERM);
             }
 
             let ds: Semid64Ds = get_user::<Uaccess, Semid64Ds>(arg).map_err(|_| EFAULT)?;
 
-            let _lock = perm.lock.lock();
-            let perm_mut = perm as *const KernIpcPerm as *mut KernIpcPerm;
-            unsafe {
-                (*perm_mut).uid = ds.sem_perm.uid;
-                (*perm_mut).gid = ds.sem_perm.gid;
-                (*perm_mut).mode = ds.sem_perm.mode & 0o777;
-            }
+            // Update fields
+            perm_mutable.uid = ds.sem_perm.uid;
+            perm_mutable.gid = ds.sem_perm.gid;
+            perm_mutable.mode = ds.sem_perm.mode & 0o777;
 
-            let sem_array: &SemArray =
-                unsafe { &*(sem.as_ref() as *const dyn IpcObject as *const SemArray) };
+            // Safe downcast with type verification
+            let sem_array: &SemArray = match downcast_sem(sem.as_ref()) {
+                Some(s) => s,
+                None => {
+                    perm.put_ref();
+                    return Err(EINVAL);
+                }
+            };
             sem_array
                 .ctime
                 .store(current_time_secs(), Ordering::Relaxed);
@@ -479,9 +504,15 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let cred = crate::task::percpu::current_cred();
             let uid = cred.euid;
             let perm = sem.perm();
-            if uid != perm.uid && uid != perm.cuid && uid != 0 {
-                perm.put_ref();
-                return Err(EPERM);
+            {
+                let _lock = perm.lock.lock();
+                // SAFETY: We hold the lock
+                let perm_mutable = unsafe { perm.mutable_ref() };
+                if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
+                    drop(_lock);
+                    perm.put_ref();
+                    return Err(EPERM);
+                }
             }
             perm.put_ref();
 

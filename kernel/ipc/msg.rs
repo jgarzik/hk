@@ -297,6 +297,24 @@ impl IpcObject for MsgQueue {
 }
 
 // ============================================================================
+// Safe Downcasting
+// ============================================================================
+
+/// Safely downcast an IpcObject to MsgQueue
+///
+/// Returns None if the object is not a message queue.
+/// This is safe because we verify the type tag before casting.
+fn downcast_msg(obj: &dyn IpcObject) -> Option<&MsgQueue> {
+    if obj.ipc_type() == IpcType::Msg {
+        // SAFETY: We verified the type tag matches, so this cast is valid.
+        // The IpcType::Msg tag is only returned by MsgQueue::ipc_type().
+        Some(unsafe { &*(obj as *const dyn IpcObject as *const MsgQueue) })
+    } else {
+        None
+    }
+}
+
+// ============================================================================
 // Syscalls
 // ============================================================================
 
@@ -542,23 +560,30 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             let cred = crate::task::percpu::current_cred();
             let uid = cred.euid;
             let perm = queue.perm();
-            if uid != perm.uid && uid != perm.cuid && uid != 0 {
+            let _lock = perm.lock.lock();
+            // SAFETY: We hold the lock
+            let perm_mutable = unsafe { perm.mutable() };
+            if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
+                drop(_lock);
                 perm.put_ref();
                 return Err(EPERM);
             }
 
             let ds: Msqid64Ds = get_user::<Uaccess, Msqid64Ds>(buf).map_err(|_| EFAULT)?;
 
-            let _lock = perm.lock.lock();
-            let perm_mut = perm as *const KernIpcPerm as *mut KernIpcPerm;
-            unsafe {
-                (*perm_mut).uid = ds.msg_perm.uid;
-                (*perm_mut).gid = ds.msg_perm.gid;
-                (*perm_mut).mode = ds.msg_perm.mode & 0o777;
-            }
+            // Update fields
+            perm_mutable.uid = ds.msg_perm.uid;
+            perm_mutable.gid = ds.msg_perm.gid;
+            perm_mutable.mode = ds.msg_perm.mode & 0o777;
 
-            let queue_inner: &MsgQueue =
-                unsafe { &*(queue.as_ref() as *const dyn IpcObject as *const MsgQueue) };
+            // Safe downcast with type verification
+            let queue_inner: &MsgQueue = match downcast_msg(queue.as_ref()) {
+                Some(q) => q,
+                None => {
+                    perm.put_ref();
+                    return Err(EINVAL);
+                }
+            };
 
             // Update qbytes if root
             if uid == 0 {
@@ -583,9 +608,15 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             let cred = crate::task::percpu::current_cred();
             let uid = cred.euid;
             let perm = queue.perm();
-            if uid != perm.uid && uid != perm.cuid && uid != 0 {
-                perm.put_ref();
-                return Err(EPERM);
+            {
+                let _lock = perm.lock.lock();
+                // SAFETY: We hold the lock
+                let perm_mutable = unsafe { perm.mutable_ref() };
+                if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
+                    drop(_lock);
+                    perm.put_ref();
+                    return Err(EPERM);
+                }
             }
             perm.put_ref();
 

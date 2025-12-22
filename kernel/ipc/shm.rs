@@ -563,7 +563,11 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             let cred = crate::task::percpu::current_cred();
             let uid = cred.euid;
             let perm = shm.perm();
-            if uid != perm.uid && uid != perm.cuid && uid != 0 {
+            let _lock = perm.lock.lock();
+            // SAFETY: We hold the lock
+            let perm_mutable = unsafe { perm.mutable() };
+            if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
+                drop(_lock);
                 perm.put_ref();
                 return Err(EPERM);
             }
@@ -572,14 +576,9 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             let ds: Shmid64Ds = get_user::<Uaccess, Shmid64Ds>(buf).map_err(|_| EFAULT)?;
 
             // Update fields (only uid, gid, mode can be changed)
-            let _lock = perm.lock.lock();
-            // Safety: we hold the lock
-            let perm_mut = perm as *const KernIpcPerm as *mut KernIpcPerm;
-            unsafe {
-                (*perm_mut).uid = ds.shm_perm.uid;
-                (*perm_mut).gid = ds.shm_perm.gid;
-                (*perm_mut).mode = ds.shm_perm.mode & 0o777;
-            }
+            perm_mutable.uid = ds.shm_perm.uid;
+            perm_mutable.gid = ds.shm_perm.gid;
+            perm_mutable.mode = ds.shm_perm.mode & 0o777;
 
             // Update ctime (safe downcast with type verification)
             let shm_kernel: &ShmidKernel = match downcast_shm(shm.as_ref()) {
@@ -604,9 +603,15 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             let cred = crate::task::percpu::current_cred();
             let uid = cred.euid;
             let perm = shm.perm();
-            if uid != perm.uid && uid != perm.cuid && uid != 0 {
-                perm.put_ref();
-                return Err(EPERM);
+            {
+                let _lock = perm.lock.lock();
+                // SAFETY: We hold the lock
+                let perm_mutable = unsafe { perm.mutable_ref() };
+                if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
+                    drop(_lock);
+                    perm.put_ref();
+                    return Err(EPERM);
+                }
             }
             perm.put_ref();
 

@@ -7,6 +7,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::{Mutex, RwLock};
 
@@ -34,34 +35,55 @@ const IPCMNI_SEQ_MAX: u32 = 0x8000;
 // IPC Permission Structure (kernel-internal)
 // ============================================================================
 
+/// Mutable fields of KernIpcPerm, protected by the lock
+///
+/// These fields are wrapped in UnsafeCell and protected by `KernIpcPerm::lock`.
+/// Following Linux's pattern where ipcperms() must be called with lock held.
+#[repr(C)]
+pub struct KernIpcPermMutable {
+    /// IPC identifier (composite: seq << 16 | idx) - set once during allocation
+    pub id: i32,
+    /// Current owner UID - can be changed via IPC_SET
+    pub uid: u32,
+    /// Current owner GID - can be changed via IPC_SET
+    pub gid: u32,
+    /// Permission mode bits (rwxrwxrwx) - can be changed via IPC_SET
+    pub mode: u16,
+    /// Sequence number for ID validation - set once during allocation
+    pub seq: u32,
+}
+
 /// Kernel IPC permission structure
 ///
 /// This is the kernel-internal version, NOT the user-space ABI structure.
 /// Each IPC object embeds this for common permission/ID tracking.
+///
+/// # Locking
+/// Mutable fields in `mutable` are protected by `lock`. Callers must hold
+/// the lock when reading or writing these fields. This follows Linux's
+/// locking scheme where ipcperms() is called with the object lock held.
 pub struct KernIpcPerm {
-    /// Per-object lock for state modifications
+    /// Lock protecting mutable fields
     pub lock: Mutex<()>,
-    /// Deletion marker (checked under RCU-like patterns)
+    /// Mutable fields (protected by lock)
+    mutable: UnsafeCell<KernIpcPermMutable>,
+    /// Deletion marker (lock-free, checked under RCU-like patterns)
     pub deleted: AtomicBool,
-    /// IPC identifier (composite: seq << 16 | idx)
-    pub id: i32,
-    /// User-supplied key
+    /// User-supplied key (immutable after creation)
     pub key: i32,
-    /// Current owner UID
-    pub uid: u32,
-    /// Current owner GID
-    pub gid: u32,
-    /// Creator UID
+    /// Creator UID (immutable after creation)
     pub cuid: u32,
-    /// Creator GID
+    /// Creator GID (immutable after creation)
     pub cgid: u32,
-    /// Permission mode bits (rwxrwxrwx)
-    pub mode: u16,
-    /// Sequence number for ID validation
-    pub seq: u32,
-    /// Reference count
+    /// Reference count (lock-free)
     pub refcount: AtomicU32,
 }
+
+// SAFETY: KernIpcPerm is safe to share between threads because:
+// - Mutable fields are protected by the lock
+// - deleted and refcount use atomics
+// - key, cuid, cgid are immutable after creation
+unsafe impl Sync for KernIpcPerm {}
 
 impl KernIpcPerm {
     /// Create new permission structure
@@ -71,17 +93,42 @@ impl KernIpcPerm {
         let gid = cred.egid;
         Self {
             lock: Mutex::new(()),
+            mutable: UnsafeCell::new(KernIpcPermMutable {
+                id: -1,
+                uid,
+                gid,
+                mode: mode & 0o777,
+                seq: 0,
+            }),
             deleted: AtomicBool::new(false),
-            id: -1,
             key,
-            uid,
-            gid,
             cuid: uid,
             cgid: gid,
-            mode: mode & 0o777,
-            seq: 0,
             refcount: AtomicU32::new(1),
         }
+    }
+
+    /// Get mutable reference to inner fields
+    ///
+    /// # Safety
+    /// Caller must hold `self.lock`.
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn mutable(&self) -> &mut KernIpcPermMutable {
+        // SAFETY: Caller guarantees they hold the lock.
+        // This is the standard UnsafeCell pattern for interior mutability
+        // protected by a lock.
+        unsafe { &mut *self.mutable.get() }
+    }
+
+    /// Get immutable reference to inner fields
+    ///
+    /// # Safety
+    /// Caller must hold `self.lock`.
+    #[inline]
+    pub unsafe fn mutable_ref(&self) -> &KernIpcPermMutable {
+        // SAFETY: Caller guarantees they hold the lock
+        unsafe { &*self.mutable.get() }
     }
 
     /// Increment reference count
@@ -122,18 +169,23 @@ impl KernIpcPerm {
     }
 
     /// Fill user-space ipc64_perm structure
-    pub fn fill_ipc64_perm(&self, perm: &mut crate::ipc::Ipc64Perm) {
-        perm.key = self.key;
-        perm.uid = self.uid;
-        perm.gid = self.gid;
-        perm.cuid = self.cuid;
-        perm.cgid = self.cgid;
-        perm.mode = self.mode;
-        perm.seq = self.seq as u16;
-        perm.__pad1 = [0; 2];
-        perm.__pad2 = 0;
-        perm.__unused1 = 0;
-        perm.__unused2 = 0;
+    ///
+    /// Acquires the lock internally.
+    pub fn fill_ipc64_perm(&self, out: &mut crate::ipc::Ipc64Perm) {
+        let _lock = self.lock.lock();
+        // SAFETY: We hold the lock
+        let inner = unsafe { self.mutable_ref() };
+        out.key = self.key;
+        out.uid = inner.uid;
+        out.gid = inner.gid;
+        out.cuid = self.cuid;
+        out.cgid = self.cgid;
+        out.mode = inner.mode;
+        out.seq = inner.seq as u16;
+        out.__pad1 = [0; 2];
+        out.__pad2 = 0;
+        out.__unused1 = 0;
+        out.__unused2 = 0;
     }
 }
 
@@ -248,15 +300,14 @@ impl IpcIds {
         // Calculate composite ID
         let id = ((inner.seq << IPCMNI_SEQ_SHIFT) | idx) as i32;
 
-        // Update object's perm
+        // Update object's perm (lock protected)
         {
             let perm = obj.perm();
-            // Safety: we have exclusive access via write lock
-            let perm_ptr = perm as *const KernIpcPerm as *mut KernIpcPerm;
-            unsafe {
-                (*perm_ptr).id = id;
-                (*perm_ptr).seq = inner.seq;
-            }
+            let _lock = perm.lock.lock();
+            // SAFETY: We hold the lock
+            let perm_mutable = unsafe { perm.mutable() };
+            perm_mutable.id = id;
+            perm_mutable.seq = inner.seq;
         }
 
         // Insert into maps
@@ -276,12 +327,14 @@ impl IpcIds {
         let idx = (id as u32) & (IPCMNI - 1);
         let seq = ((id as u32) >> IPCMNI_SEQ_SHIFT) & (IPCMNI_SEQ_MAX - 1);
 
-        if let Some(obj) = inner.entries.get(&idx)
-            && obj.perm().seq == seq
-            && !obj.perm().is_deleted()
-            && obj.perm().get_ref()
-        {
-            return Some(obj.clone());
+        if let Some(obj) = inner.entries.get(&idx) {
+            let perm = obj.perm();
+            let _lock = perm.lock.lock();
+            // SAFETY: We hold the lock
+            let perm_mutable = unsafe { perm.mutable_ref() };
+            if perm_mutable.seq == seq && !perm.is_deleted() && perm.get_ref() {
+                return Some(obj.clone());
+            }
         }
         None
     }
@@ -341,6 +394,7 @@ pub const IPC_PERM_WRITE: u16 = 0o222;
 
 /// Check IPC permissions
 ///
+/// Acquires the lock internally, following Linux's pattern.
 /// Returns 0 on success, -EACCES on failure
 pub fn ipc_checkperm(perm: &KernIpcPerm, flag: u16) -> Result<(), i32> {
     let cred = crate::task::percpu::current_cred();
@@ -350,18 +404,22 @@ pub fn ipc_checkperm(perm: &KernIpcPerm, flag: u16) -> Result<(), i32> {
     // Extract requested permission bits
     let requested = flag & 0o7;
 
+    let _lock = perm.lock.lock();
+    // SAFETY: We hold the lock
+    let inner = unsafe { perm.mutable_ref() };
+
     // Check owner permissions
-    if (euid == perm.cuid || euid == perm.uid) && (perm.mode >> 6) & 0o7 >= requested {
+    if (euid == perm.cuid || euid == inner.uid) && (inner.mode >> 6) & 0o7 >= requested {
         return Ok(());
     }
 
     // Check group permissions
-    if (gid == perm.cgid || gid == perm.gid) && (perm.mode >> 3) & 0o7 >= requested {
+    if (gid == perm.cgid || gid == inner.gid) && (inner.mode >> 3) & 0o7 >= requested {
         return Ok(());
     }
 
     // Check other permissions
-    if perm.mode & 0o7 >= requested {
+    if inner.mode & 0o7 >= requested {
         return Ok(());
     }
 
@@ -405,15 +463,20 @@ pub fn ipcget<T: IpcObject + 'static>(
             0
         };
 
+        let perm = existing.perm();
+
         if access_flag != 0
-            && let Err(e) = ipc_checkperm(existing.perm(), access_flag)
+            && let Err(e) = ipc_checkperm(perm, access_flag)
         {
-            existing.perm().put_ref();
+            perm.put_ref();
             return Err(e);
         }
 
-        let id = existing.perm().id;
-        existing.perm().put_ref();
+        let _lock = perm.lock.lock();
+        // SAFETY: We hold the lock
+        let id = unsafe { perm.mutable_ref() }.id;
+        drop(_lock);
+        perm.put_ref();
         return Ok(id);
     }
 
