@@ -18,7 +18,7 @@ The `clone()` syscall creates a new process or thread. It is the fundamental bui
 | CLONE_VM | 0x00000100 | Share virtual memory (address space) | Implemented |
 | CLONE_FS | 0x00000200 | Share filesystem context (cwd, root, umask) | Implemented |
 | CLONE_FILES | 0x00000400 | Share file descriptor table | Implemented |
-| CLONE_SIGHAND | 0x00000800 | Share signal handlers | Deferred (requires signal infrastructure) |
+| CLONE_SIGHAND | 0x00000800 | Share signal handlers | Implemented |
 | CLONE_THREAD | 0x00010000 | Same thread group (share PID) | Implemented |
 | CLONE_VFORK | 0x00004000 | Parent blocks until child exec/exit | Implemented |
 | CLONE_PARENT | 0x00008000 | Child has same parent as caller | Not implemented |
@@ -30,7 +30,7 @@ The `clone()` syscall creates a new process or thread. It is the fundamental bui
 | Flag | Value | Purpose | Status |
 |------|-------|---------|--------|
 | CLONE_PARENT_SETTID | 0x00100000 | Write child TID to parent's address | Implemented |
-| CLONE_CHILD_SETTID | 0x01000000 | Write child TID to child's address | Implemented |
+| CLONE_CHILD_SETTID | 0x01000000 | Write child TID to child's address | Implemented (threads only) |
 | CLONE_CHILD_CLEARTID | 0x00200000 | Clear TID + futex wake on exit | Implemented |
 | CLONE_SETTLS | 0x00080000 | Set thread-local storage | Deferred (arch-specific) |
 
@@ -42,7 +42,7 @@ The `clone()` syscall creates a new process or thread. It is the fundamental bui
 | CLONE_NEWUTS | 0x04000000 | New UTS namespace | Implemented |
 | CLONE_NEWIPC | 0x08000000 | New IPC namespace | Deferred (no SysV IPC) |
 | CLONE_NEWPID | 0x20000000 | New PID namespace | Implemented |
-| CLONE_NEWNET | 0x40000000 | New network namespace | Deferred (no network stack) |
+| CLONE_NEWNET | 0x40000000 | New network namespace | Deferred (no namespace isolation) |
 | CLONE_NEWUSER | 0x10000000 | New user namespace | Implemented |
 | CLONE_NEWCGROUP | 0x02000000 | New cgroup namespace | Deferred (no cgroups) |
 
@@ -121,6 +121,14 @@ When CLONE_VFORK is set:
 3. Child signals completion on exec() or exit()
 4. Parent resumes
 
+### Signal Handler Sharing (CLONE_SIGHAND)
+
+Each task has a `SigHand` structure holding signal handlers:
+
+- **CLONE_SIGHAND set**: Child shares parent's `Arc<IrqSpinlock<SigHand>>`
+- **CLONE_SIGHAND not set**: Child gets deep copy via `SigHand::deep_clone()`
+- **CLONE_THREAD**: Also enables shared thread-group pending signals
+
 ### Namespace Support
 
 Fully implemented:
@@ -133,7 +141,7 @@ Partially implemented:
 
 Deferred (require subsystem support):
 - **CLONE_NEWIPC**: Requires SysV IPC implementation
-- **CLONE_NEWNET**: Requires network stack implementation
+- **CLONE_NEWNET**: Requires per-namespace network isolation
 - **CLONE_NEWCGROUP**: Requires cgroup implementation
 
 Related syscalls:
@@ -142,23 +150,18 @@ Related syscalls:
 
 ## Future Work
 
-### Tier 1: Signal Infrastructure (Required for CLONE_SIGHAND)
-- Signal handler tables
-- Signal queuing and delivery
-- sigaction, sigprocmask syscalls
-
-### Tier 2: TLS Support (CLONE_SETTLS)
+### Tier 1: TLS Support (CLONE_SETTLS)
 - Architecture-specific thread-local storage
 - FS/GS base registers (x86_64)
 - TPIDR register (aarch64)
 
-### Tier 3: Remaining Namespaces
-- **CLONE_NEWNS**: Full mount isolation (requires per-namespace mount tree)
-- **CLONE_NEWNET**: Network namespace (requires network stack)
+### Tier 2: Remaining Namespaces
+- **CLONE_NEWNS**: Full mount isolation (per-namespace mount tree)
+- **CLONE_NEWNET**: Network namespace isolation
 - **CLONE_NEWIPC**: IPC namespace (requires SysV IPC)
 - **CLONE_NEWCGROUP**: Cgroup namespace (requires cgroup support)
 
-### Tier 4: Modern Features
+### Tier 3: Modern Features
 - CLONE_PIDFD for pidfd-based process tracking
 - clone3() syscall with extensible struct
 
@@ -183,4 +186,5 @@ Related syscalls:
 - kernel/ns/uts.rs - UTS namespace implementation
 - kernel/ns/pid.rs - PID namespace implementation
 - kernel/ns/user.rs - User namespace implementation
+- kernel/signal/mod.rs - Signal handler sharing (CLONE_SIGHAND)
 - kernel/fs/procfs.rs - /proc/<pid>/ns/* namespace files
