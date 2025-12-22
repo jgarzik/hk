@@ -11,12 +11,13 @@ use crate::syscall::{
     sys_brk, sys_clock_getres, sys_clock_nanosleep, sys_clone, sys_execve, sys_exit, sys_fork,
     sys_getcpu, sys_getegid, sys_geteuid, sys_getgid, sys_getpgid, sys_getpid, sys_getppid,
     sys_getpriority, sys_getresgid, sys_getresuid, sys_getrusage, sys_getsid, sys_gettid,
-    sys_getuid, sys_nanosleep, sys_sched_getaffinity, sys_sched_getparam, sys_sched_getscheduler,
-    sys_sched_rr_get_interval, sys_sched_setaffinity, sys_sched_setparam, sys_sched_setscheduler,
-    sys_setfsgid, sys_setfsuid, sys_setgid, sys_setpriority, sys_setregid, sys_setresgid,
-    sys_setresuid, sys_setreuid, sys_setsid, sys_setuid, sys_sysinfo, sys_vfork, sys_wait4,
-    sys_waitid, SchedParam, SigInfo, Timespec, CLOCK_MONOTONIC, CLOCK_REALTIME, CLONE_VM, P_ALL,
-    P_PID, PRIO_PROCESS, SCHED_NORMAL, SCHED_RR, WEXITED,
+    sys_getuid, sys_ioprio_get, sys_ioprio_set, sys_nanosleep, sys_sched_getaffinity,
+    sys_sched_getparam, sys_sched_getscheduler, sys_sched_rr_get_interval, sys_sched_setaffinity,
+    sys_sched_setparam, sys_sched_setscheduler, sys_setfsgid, sys_setfsuid, sys_setgid,
+    sys_setpriority, sys_setregid, sys_setresgid, sys_setresuid, sys_setreuid, sys_setsid,
+    sys_setuid, sys_sysinfo, sys_vfork, sys_wait4, sys_waitid, ioprio_prio_value, SchedParam,
+    SigInfo, Timespec, CLOCK_MONOTONIC, CLOCK_REALTIME, CLONE_VM, IOPRIO_CLASS_BE,
+    IOPRIO_WHO_PROCESS, P_ALL, P_PID, PRIO_PROCESS, SCHED_NORMAL, SCHED_RR, WEXITED,
 };
 #[cfg(target_arch = "x86_64")]
 use crate::syscall::sys_time;
@@ -78,6 +79,8 @@ pub fn run_tests() {
     test_brk_query();
     test_brk_expand();
     test_brk_shrink();
+    // I/O priority syscalls
+    test_ioprio_get_set();
 }
 
 /// Test 4: getpid syscall
@@ -1488,5 +1491,43 @@ fn test_brk_shrink() {
         println(b"BRK_SHRINK:OK");
     } else {
         println(b"BRK_SHRINK:FAIL");
+    }
+}
+
+// =============================================================================
+// I/O priority syscall tests
+// =============================================================================
+
+/// Test 55: ioprio_get/ioprio_set syscalls
+#[inline(never)]
+fn test_ioprio_get_set() {
+    // Set I/O priority to IOPRIO_CLASS_BE with level 4
+    let prio = ioprio_prio_value(IOPRIO_CLASS_BE, 4);
+    let ret = sys_ioprio_set(IOPRIO_WHO_PROCESS, 0, prio as i32);
+    if ret < 0 {
+        print(b"IOPRIO:FAIL set ret=");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+
+    // Get I/O priority back
+    let got = sys_ioprio_get(IOPRIO_WHO_PROCESS, 0);
+    if got < 0 {
+        print(b"IOPRIO:FAIL get ret=");
+        print_num(got);
+        println(b"");
+        return;
+    }
+
+    // Verify it matches
+    if got == prio as i64 {
+        println(b"IOPRIO:OK");
+    } else {
+        print(b"IOPRIO:FAIL expected ");
+        print_num(prio as i64);
+        print(b" got ");
+        print_num(got);
+        println(b"");
     }
 }

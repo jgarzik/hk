@@ -178,6 +178,24 @@ pub const SEEK_END: i32 = 2;
 
 // Clone flags
 pub const CLONE_VM: u64 = 0x00000100;
+pub const CLONE_PARENT: u64 = 0x00008000;
+pub const CLONE_SYSVSEM: u64 = 0x00040000;
+pub const CLONE_IO: u64 = 0x80000000;
+
+// I/O priority constants
+pub const IOPRIO_CLASS_NONE: u16 = 0;
+pub const IOPRIO_CLASS_RT: u16 = 1;
+pub const IOPRIO_CLASS_BE: u16 = 2;
+pub const IOPRIO_CLASS_IDLE: u16 = 3;
+
+pub const IOPRIO_WHO_PROCESS: i32 = 1;
+pub const IOPRIO_WHO_PGRP: i32 = 2;
+pub const IOPRIO_WHO_USER: i32 = 3;
+
+/// Construct ioprio value from class and level
+pub const fn ioprio_prio_value(class: u16, level: u16) -> i32 {
+    (((class & 0x7) << 13) | (level & 0x1fff)) as i32
+}
 
 // waitid idtype values
 pub const P_ALL: i32 = 0;

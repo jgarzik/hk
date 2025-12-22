@@ -44,10 +44,10 @@ use crate::task::{Priority, TaskState, Tid};
 use crate::uaccess::{get_user, put_user};
 
 // Architecture-specific uaccess implementation
-#[cfg(target_arch = "x86_64")]
-use crate::arch::x86_64::uaccess::X86_64Uaccess as Uaccess;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::uaccess::Aarch64Uaccess as Uaccess;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::uaccess::X86_64Uaccess as Uaccess;
 
 // Error constants (as i32 for syscall returns)
 const EAGAIN: i32 = 11;
@@ -752,16 +752,12 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
     let head = robust_list.get(&target_tid).copied().unwrap_or(0);
 
     // Write head pointer to user memory
-    if head_ptr != 0
-        && put_user::<Uaccess, u64>(head_ptr, head).is_err()
-    {
+    if head_ptr != 0 && put_user::<Uaccess, u64>(head_ptr, head).is_err() {
         return -EFAULT;
     }
 
     // Write length to user memory
-    if len_ptr != 0
-        && put_user::<Uaccess, u64>(len_ptr, RobustListHead::SIZE as u64).is_err()
-    {
+    if len_ptr != 0 && put_user::<Uaccess, u64>(len_ptr, RobustListHead::SIZE as u64).is_err() {
         return -EFAULT;
     }
 

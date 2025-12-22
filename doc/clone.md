@@ -21,9 +21,9 @@ The `clone()` syscall creates a new process or thread. It is the fundamental bui
 | CLONE_SIGHAND | 0x00000800 | Share signal handlers | Implemented |
 | CLONE_THREAD | 0x00010000 | Same thread group (share PID) | Implemented |
 | CLONE_VFORK | 0x00004000 | Parent blocks until child exec/exit | Implemented |
-| CLONE_PARENT | 0x00008000 | Child has same parent as caller | Not implemented |
-| CLONE_SYSVSEM | 0x00040000 | Share System V semaphore undo | Deferred (no SysV IPC) |
-| CLONE_IO | 0x80000000 | Share I/O context | Not implemented |
+| CLONE_PARENT | 0x00008000 | Child has same parent as caller | Implemented |
+| CLONE_SYSVSEM | 0x00040000 | Share System V semaphore undo | Implemented |
+| CLONE_IO | 0x80000000 | Share I/O context | Implemented |
 
 ### TID Pointer Flags
 
@@ -40,7 +40,7 @@ The `clone()` syscall creates a new process or thread. It is the fundamental bui
 |------|-------|---------|--------|
 | CLONE_NEWNS | 0x00020000 | New mount namespace | Implemented (stub isolation) |
 | CLONE_NEWUTS | 0x04000000 | New UTS namespace | Implemented |
-| CLONE_NEWIPC | 0x08000000 | New IPC namespace | Deferred (no SysV IPC) |
+| CLONE_NEWIPC | 0x08000000 | New IPC namespace | Implemented |
 | CLONE_NEWPID | 0x20000000 | New PID namespace | Implemented |
 | CLONE_NEWNET | 0x40000000 | New network namespace | Deferred (no namespace isolation) |
 | CLONE_NEWUSER | 0x10000000 | New user namespace | Implemented |
@@ -135,14 +135,35 @@ Fully implemented:
 - **CLONE_NEWUTS**: Creates new UTS namespace with copied hostname/domainname
 - **CLONE_NEWPID**: Creates new PID namespace with hierarchical PID translation
 - **CLONE_NEWUSER**: Creates new user namespace with UID/GID mapping support
+- **CLONE_NEWIPC**: Creates new IPC namespace with isolated SysV IPC resources
 
 Partially implemented:
 - **CLONE_NEWNS**: Creates new mount namespace wrapper (mount tree still global)
 
 Deferred (require subsystem support):
-- **CLONE_NEWIPC**: Requires SysV IPC implementation
 - **CLONE_NEWNET**: Requires per-namespace network isolation
 - **CLONE_NEWCGROUP**: Requires cgroup implementation
+
+### CLONE_PARENT Support
+
+When CLONE_PARENT or CLONE_THREAD is set, the child's parent PID (ppid) is set
+to the caller's parent rather than the caller itself. This makes the child a
+sibling of the caller rather than its child.
+
+### CLONE_SYSVSEM Support
+
+Shares the SysV semaphore undo list between parent and child:
+- **SEM_UNDO tracking**: semop() with SEM_UNDO flag records adjustments
+- **exit_sem()**: On task exit, pending undo adjustments are applied
+- **clone_task_semundo()**: Shares or copies undo list based on flag
+- **unshare(CLONE_SYSVSEM)**: Detaches from shared undo list
+
+### CLONE_IO Support
+
+Shares I/O context (ioprio) between parent and child:
+- **IoContext**: Contains atomic ioprio value (class + level)
+- **ioprio_get/ioprio_set syscalls**: Get/set I/O scheduling priority
+- **clone_task_io()**: Shares or copies IoContext based on flag
 
 Related syscalls:
 - **unshare(2)**: Disassociate from current namespaces (implemented)
@@ -158,12 +179,15 @@ Related syscalls:
 ### Tier 2: Remaining Namespaces
 - **CLONE_NEWNS**: Full mount isolation (per-namespace mount tree)
 - **CLONE_NEWNET**: Network namespace isolation
-- **CLONE_NEWIPC**: IPC namespace (requires SysV IPC)
 - **CLONE_NEWCGROUP**: Cgroup namespace (requires cgroup support)
 
 ### Tier 3: Modern Features
 - CLONE_PIDFD for pidfd-based process tracking
 - clone3() syscall with extensible struct
+
+### Tier 4: Debugging/Tracing
+- CLONE_PTRACE for ptrace continuation in child
+- CLONE_UNTRACED to prevent forced tracing
 
 ## Error Codes
 
@@ -180,11 +204,14 @@ Related syscalls:
 - Linux clone(2) man page
 - Linux clone3(2) man page
 - Linux namespaces(7) man page
-- kernel/task/mod.rs - Clone flag definitions
+- kernel/task/mod.rs - Clone flag definitions, IoContext
 - kernel/task/percpu.rs - do_clone() implementation
+- kernel/task/syscall.rs - ioprio_get/ioprio_set syscalls
 - kernel/ns/mod.rs - Namespace proxy and syscalls (unshare, setns)
 - kernel/ns/uts.rs - UTS namespace implementation
 - kernel/ns/pid.rs - PID namespace implementation
 - kernel/ns/user.rs - User namespace implementation
+- kernel/ipc/mod.rs - IPC namespace implementation
+- kernel/ipc/sem.rs - SysV semaphores with SEM_UNDO support
 - kernel/signal/mod.rs - Signal handler sharing (CLONE_SIGHAND)
 - kernel/fs/procfs.rs - /proc/<pid>/ns/* namespace files

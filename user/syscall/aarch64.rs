@@ -135,6 +135,10 @@ pub const SYS_GETRANDOM: u64 = 278;
 // File control
 pub const SYS_FCNTL: u64 = 25;
 
+// I/O priority syscalls
+pub const SYS_IOPRIO_SET: u64 = 30;
+pub const SYS_IOPRIO_GET: u64 = 31;
+
 // Scheduling syscalls (aarch64 numbers)
 pub const SYS_SCHED_SETPARAM: u64 = 118;
 pub const SYS_SCHED_SETSCHEDULER: u64 = 119;
@@ -2806,6 +2810,41 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: u64) -> i64 {
             in("x0") msqid as u64,
             in("x1") cmd as u64,
             in("x2") buf,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// ioprio_set(which, who, ioprio) - set I/O priority
+#[inline(always)]
+pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_IOPRIO_SET,
+            in("x0") which as u64,
+            in("x1") who as u64,
+            in("x2") ioprio as u64,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// ioprio_get(which, who) - get I/O priority
+#[inline(always)]
+pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_IOPRIO_GET,
+            in("x0") which as u64,
+            in("x1") who as u64,
             lateout("x0") ret,
             options(nostack),
         );

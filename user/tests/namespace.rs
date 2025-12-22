@@ -7,7 +7,7 @@
 use super::helpers::{print, println, print_num};
 use crate::syscall::{
     sys_close, sys_exit, sys_fork, sys_open, sys_sethostname, sys_uname, sys_unshare,
-    sys_setns, sys_wait4, UtsName, O_RDONLY, CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWPID,
+    sys_setns, sys_wait4, UtsName, O_RDONLY, CLONE_NEWUTS, CLONE_NEWNET, CLONE_NEWPID,
     CLONE_NEWUSER,
 };
 
@@ -93,10 +93,10 @@ fn test_unshare_newuts() {
     }
 }
 
-/// Test: unshare(CLONE_NEWIPC) should return EINVAL (not implemented)
+/// Test: unshare(CLONE_NEWNET) should return EINVAL (not implemented)
 fn test_unshare_einval() {
-    // Request unsupported namespace (IPC not implemented)
-    let ret = sys_unshare(CLONE_NEWIPC);
+    // Request unsupported namespace (network namespace not implemented)
+    let ret = sys_unshare(CLONE_NEWNET);
     if ret == -22 {
         // -EINVAL
         println(b"UNSHARE_EINVAL:OK");

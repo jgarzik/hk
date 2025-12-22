@@ -348,11 +348,23 @@ const SUPPORTED_NS_FLAGS: u64 =
 /// # Notes
 /// Unlike clone(), unshare() always affects the calling thread.
 /// The new namespace takes effect immediately.
+/// CLONE_SYSVSEM flag - used by unshare to detach from shared semundo
+const CLONE_SYSVSEM: u64 = 0x00040000;
+
 pub fn sys_unshare(unshare_flags: u64) -> i64 {
     let tid = crate::task::percpu::current_tid();
     let ns_flags = unshare_flags & CLONE_NS_FLAGS;
+    let sysvsem_flag = unshare_flags & CLONE_SYSVSEM;
 
-    // No namespace flags - nothing to do
+    // Handle CLONE_SYSVSEM - detach from shared semaphore undo list
+    // Similar to what Linux does: exit_sem(current) effectively
+    if sysvsem_flag != 0 {
+        // Detach from any shared undo list by exiting and re-creating
+        // This applies any pending undos if we're the last holder
+        crate::ipc::sem::exit_sem(tid);
+    }
+
+    // No namespace flags - nothing more to do
     if ns_flags == 0 {
         return 0;
     }

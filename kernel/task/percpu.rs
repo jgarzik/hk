@@ -720,7 +720,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     let current_tid = current_tid();
     let (
         parent_pid,
-        _parent_ppid,
+        parent_ppid,
         parent_pgid,
         parent_sid,
         parent_priority,
@@ -745,6 +745,15 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.page_table.root_table_phys(),
         )
     };
+
+    // Validate CLONE_PARENT: cannot be used by init process (pid 1)
+    // Linux checks for SIGNAL_UNKILLABLE flag, but we simplify to pid == 1
+    if config.flags & CLONE_PARENT != 0 && parent_pid == 1 {
+        if nproc_incremented {
+            crate::task::decrement_user_process_count(nproc_uid);
+        }
+        return Err(22); // EINVAL
+    }
 
     // Handle SCHED_RESET_ON_FORK: child gets SCHED_NORMAL with nice 0
     let (child_policy, child_rt_priority, child_priority) = if parent_reset_on_fork {
@@ -832,11 +841,20 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         stack_base,
     };
 
+    // Determine child's parent PID
+    // CLONE_PARENT or CLONE_THREAD: child becomes sibling (same parent as caller)
+    // Otherwise: caller becomes the parent
+    let child_ppid = if config.flags & (CLONE_PARENT | CLONE_THREAD) != 0 {
+        parent_ppid // Child's parent is our parent (grandparent of normal fork)
+    } else {
+        parent_pid // Normal case: we are the parent
+    };
+
     // Create child task
     let child_task = Task {
         pid: child_pid,
         tid: child_tid,
-        ppid: parent_pid, // Parent is the cloning process
+        ppid: child_ppid,
         pgid: parent_pgid,
         sid: parent_sid,
         kind: TaskKind::UserProcess,
@@ -901,6 +919,21 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         config.flags & CLONE_SIGHAND != 0,
         config.flags & CLONE_THREAD != 0,
     );
+
+    // Handle I/O context (CLONE_IO)
+    // If CLONE_IO is set, child shares parent's I/O context (ioprio changes affect both)
+    // Otherwise, child gets an independent copy with inherited ioprio value
+    // NOTE: Only run when explicitly requested or basic fork
+    if config.flags & CLONE_IO != 0 {
+        crate::task::clone_task_io(current_tid, child_tid, true);
+    }
+
+    // Handle SysV semaphore undo list (CLONE_SYSVSEM)
+    // If CLONE_SYSVSEM is set, child shares parent's semaphore undo list
+    // Otherwise, child starts with no undo list (allocated on first SEM_UNDO operation)
+    if config.flags & CLONE_SYSVSEM != 0 {
+        crate::ipc::sem::clone_task_semundo(current_tid, child_tid, true);
+    }
 
     // Handle CLONE_PARENT_SETTID: write child TID to parent's address space
     if config.flags & CLONE_PARENT_SETTID != 0 && config.parent_tidptr != 0 {
@@ -998,6 +1031,14 @@ pub fn exit_current() -> ! {
 
         // Clean up FD table for exiting task
         crate::task::fdtable::exit_task_fd(tid);
+
+        // Clean up SysV semaphore undo list for exiting task
+        // This may apply undo operations if this is the last holder
+        // MUST be done BEFORE exit_task_ns() since exit_sem needs IPC namespace
+        crate::ipc::sem::exit_sem(tid);
+
+        // Clean up I/O context for exiting task
+        crate::task::remove_task_io_context(tid);
 
         // Clean up namespace context for exiting task
         crate::ns::exit_task_ns(tid);
@@ -1456,6 +1497,23 @@ pub fn current_pgid() -> Pid {
 /// Get the current task's session ID
 pub fn current_sid() -> Pid {
     CurrentArch::get_current_task().sid
+}
+
+/// Check if a task exists by TID
+pub fn task_exists(tid: Tid) -> bool {
+    let table = TASK_TABLE.lock();
+    table.tasks.iter().any(|t| t.tid == tid)
+}
+
+/// Get all TIDs in a process group
+pub fn get_tids_by_pgid(pgid: Pid) -> alloc::vec::Vec<Tid> {
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .filter(|t| t.pgid == pgid)
+        .map(|t| t.tid)
+        .collect()
 }
 
 /// Get the current task's FsStruct (filesystem context)

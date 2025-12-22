@@ -127,6 +127,10 @@ pub const SYS_FCNTL: u64 = 72;
 pub const SYS_GETPRIORITY: u64 = 140;
 pub const SYS_SETPRIORITY: u64 = 141;
 
+// I/O priority syscalls
+pub const SYS_IOPRIO_SET: u64 = 251;
+pub const SYS_IOPRIO_GET: u64 = 252;
+
 // Scheduling syscalls
 pub const SYS_SCHED_SETPARAM: u64 = 142;
 pub const SYS_SCHED_GETPARAM: u64 = 143;
@@ -3011,6 +3015,45 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: u64) -> i64 {
             in("rdi") msqid as u64,
             in("rsi") cmd as u64,
             in("rdx") buf,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// ioprio_set(which, who, ioprio) - set I/O priority
+#[inline(always)]
+pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_IOPRIO_SET,
+            in("rdi") which as u64,
+            in("rsi") who as u64,
+            in("rdx") ioprio as u64,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// ioprio_get(which, who) - get I/O priority
+#[inline(always)]
+pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_IOPRIO_GET,
+            in("rdi") which as u64,
+            in("rsi") who as u64,
             lateout("rax") ret,
             out("rcx") _,
             out("r11") _,

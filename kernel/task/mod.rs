@@ -20,14 +20,20 @@ pub mod clone_flags {
     pub const CLONE_SIGHAND: u64 = 0x00000800;
     /// Parent blocks until child exec()s or _exit()s (vfork semantics)
     pub const CLONE_VFORK: u64 = 0x00004000;
+    /// Child has same parent as caller (creates sibling, not child)
+    pub const CLONE_PARENT: u64 = 0x00008000;
     /// Share thread group (same PID)
     pub const CLONE_THREAD: u64 = 0x00010000;
+    /// Share System V semaphore undo list
+    pub const CLONE_SYSVSEM: u64 = 0x00040000;
     /// Set parent TID at parent_tidptr location
     pub const CLONE_PARENT_SETTID: u64 = 0x00100000;
     /// Set child TID at child_tidptr location (in child's address space)
     pub const CLONE_CHILD_SETTID: u64 = 0x01000000;
     /// Clear child TID at child_tidptr on exit
     pub const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+    /// Share I/O context (ioprio)
+    pub const CLONE_IO: u64 = 0x80000000;
 
     // Namespace clone flags (re-exported from ns module for convenience)
     pub use crate::ns::{
@@ -697,3 +703,160 @@ pub fn get_user_process_count(uid: Uid) -> u64 {
     let counts = UID_PROCESS_COUNT.lock();
     counts.get(&uid).copied().unwrap_or(0)
 }
+
+// =============================================================================
+// I/O Priority (ioprio) support for CLONE_IO
+// =============================================================================
+
+use core::sync::atomic::{AtomicU16, Ordering};
+
+/// I/O priority type (matches Linux: 3-bit class + 13-bit data)
+pub type IoPrio = u16;
+
+/// No I/O priority class (use default)
+pub const IOPRIO_CLASS_NONE: u16 = 0;
+/// Real-time I/O class (highest priority)
+pub const IOPRIO_CLASS_RT: u16 = 1;
+/// Best-effort I/O class (default for normal processes)
+pub const IOPRIO_CLASS_BE: u16 = 2;
+/// Idle I/O class (only when system is otherwise idle)
+pub const IOPRIO_CLASS_IDLE: u16 = 3;
+
+/// Number of bits for I/O priority class
+pub const IOPRIO_CLASS_SHIFT: u16 = 13;
+/// Mask for I/O priority data
+pub const IOPRIO_PRIO_MASK: u16 = (1 << IOPRIO_CLASS_SHIFT) - 1;
+
+/// Default I/O priority (best-effort class, level 4)
+pub const IOPRIO_DEFAULT: IoPrio = ioprio_prio_value(IOPRIO_CLASS_BE, 4);
+
+/// Extract priority class from ioprio value
+#[inline]
+pub const fn ioprio_prio_class(ioprio: IoPrio) -> u16 {
+    ioprio >> IOPRIO_CLASS_SHIFT
+}
+
+/// Extract priority data/level from ioprio value
+#[inline]
+pub const fn ioprio_prio_data(ioprio: IoPrio) -> u16 {
+    ioprio & IOPRIO_PRIO_MASK
+}
+
+/// Construct ioprio value from class and data
+#[inline]
+pub const fn ioprio_prio_value(class: u16, data: u16) -> IoPrio {
+    ((class & 0x7) << IOPRIO_CLASS_SHIFT) | (data & IOPRIO_PRIO_MASK)
+}
+
+/// Check if an ioprio value is valid
+#[inline]
+pub fn ioprio_valid(ioprio: IoPrio) -> bool {
+    let class = ioprio_prio_class(ioprio);
+    class <= IOPRIO_CLASS_IDLE
+}
+
+/// I/O context for a task (shareable via CLONE_IO)
+///
+/// Contains I/O scheduling priority and related state.
+/// When CLONE_IO is used, multiple tasks share the same IoContext,
+/// so changes to ioprio affect all sharing tasks.
+pub struct IoContext {
+    /// I/O priority (3-bit class + 13-bit data)
+    pub ioprio: AtomicU16,
+}
+
+impl IoContext {
+    /// Create a new I/O context with default priority
+    pub fn new() -> Self {
+        Self {
+            ioprio: AtomicU16::new(IOPRIO_DEFAULT),
+        }
+    }
+
+    /// Create a new I/O context with specific priority
+    pub fn with_ioprio(ioprio: IoPrio) -> Self {
+        Self {
+            ioprio: AtomicU16::new(ioprio),
+        }
+    }
+
+    /// Get current I/O priority
+    #[inline]
+    pub fn get_ioprio(&self) -> IoPrio {
+        self.ioprio.load(Ordering::Relaxed)
+    }
+
+    /// Set I/O priority
+    #[inline]
+    pub fn set_ioprio(&self, ioprio: IoPrio) {
+        self.ioprio.store(ioprio, Ordering::Relaxed);
+    }
+}
+
+impl Default for IoContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for IoContext {
+    fn clone(&self) -> Self {
+        Self {
+            ioprio: AtomicU16::new(self.ioprio.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// Per-task I/O context mapping
+///
+/// Maps TID to Arc<IoContext>. When CLONE_IO is set, child shares
+/// parent's Arc. Otherwise, child gets a new IoContext (inheriting ioprio).
+pub static TASK_IO_CONTEXT: Mutex<BTreeMap<Tid, Arc<IoContext>>> = Mutex::new(BTreeMap::new());
+
+/// Get the I/O context for a task
+pub fn get_task_io_context(tid: Tid) -> Option<Arc<IoContext>> {
+    TASK_IO_CONTEXT.lock().get(&tid).cloned()
+}
+
+/// Set the I/O context for a task
+pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
+    TASK_IO_CONTEXT.lock().insert(tid, ctx);
+}
+
+/// Remove the I/O context for a task (on exit)
+pub fn remove_task_io_context(tid: Tid) {
+    TASK_IO_CONTEXT.lock().remove(&tid);
+}
+
+/// Clone I/O context for a new task
+///
+/// If `share` is true (CLONE_IO set), child shares parent's Arc<IoContext>.
+/// Otherwise, child gets a new IoContext inheriting parent's ioprio value.
+pub fn clone_task_io(parent_tid: Tid, child_tid: Tid, share: bool) {
+    let mut contexts = TASK_IO_CONTEXT.lock();
+
+    if let Some(parent_ctx) = contexts.get(&parent_tid).cloned() {
+        if share {
+            // CLONE_IO: share the same context
+            contexts.insert(child_tid, parent_ctx);
+        } else {
+            // No CLONE_IO: create new context with inherited ioprio
+            let new_ctx = Arc::new(IoContext::with_ioprio(parent_ctx.get_ioprio()));
+            contexts.insert(child_tid, new_ctx);
+        }
+    } else {
+        // Parent has no context, create default for child
+        contexts.insert(child_tid, Arc::new(IoContext::new()));
+    }
+}
+
+// =============================================================================
+// ioprio syscall "which" constants
+// =============================================================================
+
+/// ioprio_get/set for a specific process
+pub const IOPRIO_WHO_PROCESS: i32 = 1;
+/// ioprio_get/set for a process group
+pub const IOPRIO_WHO_PGRP: i32 = 2;
+/// ioprio_get/set for all processes of a user
+pub const IOPRIO_WHO_USER: i32 = 3;

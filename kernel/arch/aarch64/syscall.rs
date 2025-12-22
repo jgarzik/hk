@@ -149,6 +149,12 @@ pub const SYS_SETPRIORITY: u64 = 140;
 /// getpriority(which, who)
 pub const SYS_GETPRIORITY: u64 = 141;
 
+// I/O priority
+/// ioprio_set(which, who, ioprio)
+pub const SYS_IOPRIO_SET: u64 = 30;
+/// ioprio_get(which, who)
+pub const SYS_IOPRIO_GET: u64 = 31;
+
 // System information
 /// getrusage(who, usage)
 pub const SYS_GETRUSAGE: u64 = 165;
@@ -461,6 +467,16 @@ pub fn aarch64_syscall_dispatch(
                 percpu::current_pid(),
                 percpu::current_cred().euid,
             ) as u64
+        }
+
+        // I/O priority
+        SYS_IOPRIO_SET => {
+            use crate::task::syscall::sys_ioprio_set;
+            sys_ioprio_set(arg0 as i32, arg1 as i32, arg2 as i32) as u64
+        }
+        SYS_IOPRIO_GET => {
+            use crate::task::syscall::sys_ioprio_get;
+            sys_ioprio_get(arg0 as i32, arg1 as i32) as u64
         }
 
         // Scheduling syscalls (Section 1.3)
