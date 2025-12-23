@@ -2,11 +2,11 @@
 //!
 //! This module implements a simple IPv4 routing table for
 //! next-hop determination.
+//!
+//! Routes are stored per-namespace in NetNamespace.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-
-use spin::RwLock;
 
 use crate::net::NetError;
 use crate::net::device::NetDevice;
@@ -55,50 +55,28 @@ impl Route {
     }
 
     /// Get the number of bits in the prefix (for longest-prefix matching)
-    fn prefix_len(&self) -> u32 {
+    pub fn prefix_len(&self) -> u32 {
         self.netmask.to_u32().count_ones()
     }
 }
 
-/// Global routing table
-static ROUTING_TABLE: RwLock<Vec<Route>> = RwLock::new(Vec::new());
-
 /// Initialize routing
 pub fn init() {
     // Nothing to do - routes are added when interfaces come up
+    // Routes are per-namespace and stored in NetNamespace
 }
 
-/// Add a route for a directly connected interface
+/// Add a route for a directly connected interface in current namespace
 pub fn add_interface_route(dest: Ipv4Addr, netmask: Ipv4Addr, dev: Arc<NetDevice>) {
-    let route = Route {
-        dest,
-        netmask,
-        gateway: Ipv4Addr::new(0, 0, 0, 0),
-        dev,
-        flags: flags::RTF_UP,
-        metric: 0,
-    };
-
-    let mut table = ROUTING_TABLE.write();
-    table.push(route);
+    crate::net::current_net_ns().add_interface_route(dest, netmask, dev);
 }
 
-/// Add a default route (gateway)
+/// Add a default route (gateway) in current namespace
 pub fn add_default_route(gateway: Ipv4Addr, dev: Arc<NetDevice>) {
-    let route = Route {
-        dest: Ipv4Addr::new(0, 0, 0, 0),
-        netmask: Ipv4Addr::new(0, 0, 0, 0),
-        gateway,
-        dev,
-        flags: flags::RTF_UP | flags::RTF_GATEWAY | flags::RTF_DEFAULT,
-        metric: 100,
-    };
-
-    let mut table = ROUTING_TABLE.write();
-    table.push(route);
+    crate::net::current_net_ns().add_default_route(gateway, dev);
 }
 
-/// Add a host route
+/// Add a host route in current namespace
 pub fn add_host_route(dest: Ipv4Addr, gateway: Ipv4Addr, dev: Arc<NetDevice>) {
     let route = Route {
         dest,
@@ -115,52 +93,23 @@ pub fn add_host_route(dest: Ipv4Addr, gateway: Ipv4Addr, dev: Arc<NetDevice>) {
         metric: 0,
     };
 
-    let mut table = ROUTING_TABLE.write();
-    table.push(route);
+    crate::net::current_net_ns().add_route(route);
 }
 
-/// Look up a route for a destination address
+/// Look up a route for a destination address in current namespace
 ///
 /// Returns the output device and next-hop address.
 /// Uses longest-prefix matching for route selection.
 pub fn route_lookup(dest: Ipv4Addr) -> Result<(Arc<NetDevice>, Ipv4Addr), NetError> {
-    let table = ROUTING_TABLE.read();
-
-    // Find best matching route (longest prefix)
-    let mut best_route: Option<&Route> = None;
-    let mut best_prefix_len = 0u32;
-
-    for route in table.iter() {
-        if route.matches(dest) {
-            let prefix_len = route.prefix_len();
-            if best_route.is_none() || prefix_len > best_prefix_len {
-                best_route = Some(route);
-                best_prefix_len = prefix_len;
-            }
-        }
-    }
-
-    match best_route {
-        Some(route) => {
-            // Next hop is gateway if present, otherwise destination
-            let next_hop = if route.is_gateway() {
-                route.gateway
-            } else {
-                dest
-            };
-
-            Ok((Arc::clone(&route.dev), next_hop))
-        }
-        None => Err(NetError::NoRoute),
-    }
+    crate::net::current_net_ns().route_lookup(dest)
 }
 
-/// Get all routes (for debugging)
+/// Get all routes in current namespace (for debugging)
 pub fn get_routes() -> Vec<Route> {
-    ROUTING_TABLE.read().clone()
+    crate::net::current_net_ns().routes.read().clone()
 }
 
-/// Clear all routes
+/// Clear all routes in current namespace
 pub fn clear_routes() {
-    ROUTING_TABLE.write().clear();
+    crate::net::current_net_ns().routes.write().clear();
 }

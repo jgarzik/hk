@@ -164,7 +164,7 @@ fn create_file_at(start: Option<Path>, path: &str, mode: u32) -> Result<Arc<Dent
         // Use start or root
         start
             .map(|p| p.dentry.clone())
-            .or_else(|| crate::fs::mount::MOUNT_NS.get_root_dentry())
+            .or_else(|| crate::fs::mount::current_mnt_ns().get_root_dentry())
             .ok_or(FsError::NotFound)?
     } else {
         lookup_path_at(start, parent_path, LookupFlags::opendir())?
@@ -3012,7 +3012,7 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
     };
 
     // Find the mount at this path
-    let mount = match super::mount::MOUNT_NS.find_mount_at(&target_dentry) {
+    let mount = match super::mount::current_mnt_ns().find_mount_at(&target_dentry) {
         Some(m) => m,
         None => return EINVAL, // Not a mount point
     };

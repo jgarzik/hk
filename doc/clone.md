@@ -38,11 +38,11 @@ The `clone()` syscall creates a new process or thread. It is the fundamental bui
 
 | Flag | Value | Purpose | Status |
 |------|-------|---------|--------|
-| CLONE_NEWNS | 0x00020000 | New mount namespace | Implemented (stub isolation) |
+| CLONE_NEWNS | 0x00020000 | New mount namespace | Implemented |
 | CLONE_NEWUTS | 0x04000000 | New UTS namespace | Implemented |
 | CLONE_NEWIPC | 0x08000000 | New IPC namespace | Implemented |
 | CLONE_NEWPID | 0x20000000 | New PID namespace | Implemented |
-| CLONE_NEWNET | 0x40000000 | New network namespace | Deferred (no namespace isolation) |
+| CLONE_NEWNET | 0x40000000 | New network namespace | Implemented |
 | CLONE_NEWUSER | 0x10000000 | New user namespace | Implemented |
 | CLONE_NEWCGROUP | 0x02000000 | New cgroup namespace | Deferred (no cgroups) |
 

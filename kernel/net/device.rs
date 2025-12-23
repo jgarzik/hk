@@ -149,7 +149,7 @@ pub struct NetDevice {
     mtu: u32,
 
     /// Interface flags
-    flags: AtomicU32,
+    pub flags: AtomicU32,
 
     /// Device operations (provided by driver)
     ops: &'static dyn NetDeviceOps,

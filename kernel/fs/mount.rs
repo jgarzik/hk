@@ -148,6 +148,59 @@ impl Mount {
     pub fn has_children(&self) -> bool {
         !self.children.read().is_empty()
     }
+
+    /// Deep clone a mount tree for a new namespace
+    ///
+    /// Creates a copy of the entire mount tree rooted at this mount.
+    /// Each mount in the new tree references the same superblock/dentry
+    /// as the original (the filesystem data is shared), but the mount
+    /// structures themselves are independent.
+    ///
+    /// This is used by CLONE_NEWNS to give a new mount namespace its
+    /// own view of the mount hierarchy.
+    pub fn clone_tree(root: &Arc<Mount>) -> Result<Arc<Mount>, i32> {
+        // Clone the root mount
+        let new_root = Arc::new(Mount {
+            sb: root.sb.clone(),
+            root: root.root.clone(),
+            mountpoint: RwLock::new(None), // Root has no mountpoint
+            parent: RwLock::new(None),     // Root has no parent
+            children: RwLock::new(Vec::new()),
+            flags: root.flags,
+            mnt_count: AtomicU64::new(0),
+        });
+
+        // Recursively clone children
+        for child in root.children.read().iter() {
+            Self::clone_subtree(&new_root, child)?;
+        }
+
+        Ok(new_root)
+    }
+
+    /// Clone a subtree and attach it to a parent
+    fn clone_subtree(new_parent: &Arc<Mount>, old_mount: &Arc<Mount>) -> Result<(), i32> {
+        // Clone this mount
+        let new_mount = Arc::new(Mount {
+            sb: old_mount.sb.clone(),
+            root: old_mount.root.clone(),
+            mountpoint: RwLock::new(old_mount.mountpoint.read().clone()),
+            parent: RwLock::new(Some(Arc::downgrade(new_parent))),
+            children: RwLock::new(Vec::new()),
+            flags: old_mount.flags,
+            mnt_count: AtomicU64::new(0),
+        });
+
+        // Add to parent's children
+        new_parent.children.write().push(new_mount.clone());
+
+        // Recursively clone this mount's children
+        for child in old_mount.children.read().iter() {
+            Self::clone_subtree(&new_mount, child)?;
+        }
+
+        Ok(())
+    }
 }
 
 // Mount is Send + Sync
@@ -271,12 +324,26 @@ impl Default for MountNamespace {
     }
 }
 
-/// Global mount namespace
-pub static MOUNT_NS: MountNamespace = MountNamespace::new();
+/// Get the current task's mount namespace
+///
+/// Uses the namespace from the current task's nsproxy.
+/// Falls back to init mount namespace if no task context.
+pub fn current_mnt_ns() -> Arc<crate::ns::MntNamespace> {
+    crate::ns::current_mnt_ns()
+}
+
+/// Get the init mount namespace
+///
+/// Use for early boot before task context is set up.
+pub fn init_mnt_ns() -> Arc<crate::ns::MntNamespace> {
+    crate::ns::init_mnt_ns()
+}
 
 /// Mount a filesystem at a path
 ///
 /// If path is None or "/", this becomes the root mount.
+///
+/// Uses the current task's mount namespace, or init namespace if no task context.
 pub fn do_mount(
     fs_type: &'static FileSystemType,
     mountpoint: Option<Arc<Dentry>>,
@@ -290,20 +357,23 @@ pub fn do_mount(
     // Create the mount
     let mount = Mount::new(sb, root, 0);
 
+    // Get the current mount namespace (falls back to init for early boot)
+    let mnt_ns = current_mnt_ns();
+
     // If there's a mount point, set up the relationship
     if let Some(mp) = mountpoint {
         mount.set_mountpoint(mp.clone());
 
         // Find parent mount and add as child
-        if let Some(root_mount) = MOUNT_NS.get_root() {
+        if let Some(root_mount) = mnt_ns.get_root() {
             // For simplicity, add to root mount's children
             // A real implementation would walk the mount tree
             mount.set_parent(&root_mount);
             root_mount.add_child(mount.clone());
         }
     } else {
-        // This is the root mount
-        MOUNT_NS.set_root(mount.clone());
+        // This is the root mount - set in namespace
+        mnt_ns.set_root(mount.clone());
     }
 
     Ok(mount)
@@ -324,6 +394,8 @@ pub fn mount_at_path(fs_type: &'static FileSystemType, path: &str) -> Result<Arc
 /// Mount a device-backed filesystem
 ///
 /// Used for filesystems that require a backing block device (ext4, vfat, etc.).
+///
+/// Uses the current task's mount namespace.
 ///
 /// # Arguments
 /// * `fs_type` - Filesystem type (must have mount_dev function)
@@ -361,18 +433,21 @@ pub fn do_mount_dev(
     // Create the mount
     let mount = Mount::new(sb, root, 0);
 
+    // Get the current mount namespace
+    let mnt_ns = current_mnt_ns();
+
     // If there's a mount point, set up the relationship
     if let Some(mp) = mountpoint {
         mount.set_mountpoint(mp.clone());
 
         // Find parent mount and add as child
-        if let Some(root_mount) = MOUNT_NS.get_root() {
+        if let Some(root_mount) = mnt_ns.get_root() {
             mount.set_parent(&root_mount);
             root_mount.add_child(mount.clone());
         }
     } else {
-        // This is the root mount
-        MOUNT_NS.set_root(mount.clone());
+        // This is the root mount - set in namespace
+        mnt_ns.set_root(mount.clone());
     }
 
     Ok(mount)
@@ -460,8 +535,9 @@ pub fn follow_mount(dentry: &Arc<Dentry>) -> Arc<Dentry> {
         return dentry.clone();
     }
 
-    // Find the mount at this dentry
-    if let Some(root_mount) = MOUNT_NS.get_root() {
+    // Find the mount at this dentry using current namespace
+    let mnt_ns = current_mnt_ns();
+    if let Some(root_mount) = mnt_ns.get_root() {
         // Check children for a mount at this dentry
         let children = root_mount.children.read();
         for child in children.iter() {

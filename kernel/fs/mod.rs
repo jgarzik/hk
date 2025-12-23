@@ -32,8 +32,8 @@ pub use file::{CHAR_FILE_OPS, DirEntry, File, FileOps, flags, seek};
 pub use fsstruct::{FsStruct, clone_task_fs, exit_task_fs, get_task_fs, init_task_fs};
 pub use inode::{DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, Uid};
 pub use mount::{
-    MOUNT_NS, Mount, MountNamespace, do_mount, do_mount_dev, do_umount, follow_mount,
-    mount_at_path, umount_flags,
+    Mount, MountNamespace, current_mnt_ns, do_mount, do_mount_dev, do_umount, follow_mount,
+    init_mnt_ns, mount_at_path, umount_flags,
 };
 pub use path::{
     LookupFlags, MAY_EXEC, MAY_READ, MAY_WRITE, create_dir, create_file, inode_permission,

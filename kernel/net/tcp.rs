@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-use spin::{Mutex, RwLock};
+use spin::Mutex;
 
 use crate::net::NetError;
 use crate::net::ipv4::{self, IPPROTO_TCP, Ipv4Addr};
@@ -258,34 +258,24 @@ impl Default for TcpSock {
     }
 }
 
-/// Global TCP connection table
-static TCP_CONNECTIONS: RwLock<BTreeMap<TcpFourTuple, Arc<Socket>>> = RwLock::new(BTreeMap::new());
-
-/// Next ephemeral port
-static NEXT_PORT: AtomicU32 = AtomicU32::new(32768);
-
-/// Register a connection in the table
+/// Register a connection in the current namespace's table
 pub fn tcp_register_connection(tuple: TcpFourTuple, socket: Arc<Socket>) {
-    TCP_CONNECTIONS.write().insert(tuple, socket);
+    crate::net::current_net_ns().tcp_register(tuple, socket);
 }
 
-/// Remove a connection from the table
+/// Remove a connection from the current namespace's table
 pub fn tcp_unregister_connection(tuple: &TcpFourTuple) {
-    TCP_CONNECTIONS.write().remove(tuple);
+    crate::net::current_net_ns().tcp_unregister(tuple);
 }
 
-/// Look up a connection
+/// Look up a connection in the current namespace
 pub fn tcp_lookup_connection(tuple: &TcpFourTuple) -> Option<Arc<Socket>> {
-    TCP_CONNECTIONS.read().get(tuple).cloned()
+    crate::net::current_net_ns().tcp_lookup(tuple)
 }
 
-/// Allocate an ephemeral port
+/// Allocate an ephemeral port in the current namespace
 pub fn tcp_alloc_port() -> u16 {
-    let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
-    if port > 60999 {
-        NEXT_PORT.store(32768, Ordering::Relaxed);
-    }
-    port as u16
+    crate::net::current_net_ns().alloc_port()
 }
 
 /// Initiate a TCP connection (active open)
