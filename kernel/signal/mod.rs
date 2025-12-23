@@ -438,6 +438,31 @@ impl SigHand {
             action: IrqSpinlock::new(new_actions),
         })
     }
+
+    /// Reset all signal handlers to default (for CLONE_CLEAR_SIGHAND)
+    ///
+    /// This resets signal handlers following Linux semantics:
+    /// - Handlers set to SIG_IGN remain SIG_IGN (intentional - some signals must stay ignored)
+    /// - All other handlers (custom handlers and SIG_DFL) become SIG_DFL
+    /// - sa_flags are cleared to 0
+    /// - sa_mask is emptied (all signals unmasked in handler context)
+    /// - restorer is cleared
+    ///
+    /// This is called when CLONE_CLEAR_SIGHAND is used during clone.
+    pub fn flush_handlers(&self) {
+        let mut actions = self.action.lock();
+        // Signals 1-64 (index 0 is unused)
+        for sig in 1..=64 {
+            let action = &mut actions[sig];
+            // Preserve SIG_IGN, reset everything else to default
+            if action.handler != SigHandler::Ignore {
+                action.handler = SigHandler::Default;
+            }
+            action.flags = 0;
+            action.restorer = 0;
+            action.mask = SigSet::EMPTY;
+        }
+    }
 }
 
 impl Default for SigHand {
@@ -559,11 +584,15 @@ where
 /// Otherwise, deep clone the signal handlers.
 ///
 /// If `share_pending` is true (CLONE_THREAD), share the thread-group pending.
+///
+/// If `clear_sighand` is true (CLONE_CLEAR_SIGHAND), reset all handlers to default
+/// after cloning (except SIG_IGN handlers which are preserved).
 pub fn clone_task_signal(
     parent_tid: Tid,
     child_tid: Tid,
     share_sighand: bool,
     share_pending: bool,
+    clear_sighand: bool,
 ) {
     // Clone or share signal handlers
     let parent_sighand = TASK_SIGHAND.lock().get(&parent_tid).cloned();
@@ -573,10 +602,17 @@ pub fn clone_task_signal(
         parent_sighand.unwrap_or_else(|| Arc::new(SigHand::new()))
     } else {
         // Fork: deep clone handlers
-        parent_sighand
+        let sighand = parent_sighand
             .as_ref()
             .map(|sh| sh.deep_clone())
-            .unwrap_or_else(|| Arc::new(SigHand::new()))
+            .unwrap_or_else(|| Arc::new(SigHand::new()));
+
+        // CLONE_CLEAR_SIGHAND: reset handlers to default (except SIG_IGN)
+        if clear_sighand {
+            sighand.flush_handlers();
+        }
+
+        sighand
     };
 
     TASK_SIGHAND.lock().insert(child_tid, child_sighand);

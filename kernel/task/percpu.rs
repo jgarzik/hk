@@ -676,6 +676,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         return Err(22); // EINVAL
     }
 
+    // Validate: CLONE_SIGHAND and CLONE_CLEAR_SIGHAND are mutually exclusive
+    // (can't share handlers AND reset them at the same time)
+    if config.flags & CLONE_SIGHAND != 0 && config.flags & CLONE_CLEAR_SIGHAND != 0 {
+        return Err(22); // EINVAL
+    }
+
     // RLIMIT_NPROC enforcement for new processes (not threads)
     // Following Linux pattern: increment first (atomically), then check if over limit
     // This avoids the TOCTOU race where multiple concurrent clones could all pass
@@ -911,15 +917,17 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         config.flags
     ));
 
-    // Handle signal handlers (CLONE_SIGHAND)
+    // Handle signal handlers (CLONE_SIGHAND, CLONE_CLEAR_SIGHAND)
     // If CLONE_SIGHAND is set, child shares parent's signal handler table
     // Otherwise, child gets a deep copy of handlers
+    // If CLONE_CLEAR_SIGHAND is set, handlers are reset to default (except SIG_IGN)
     // CLONE_THREAD also implies sharing shared_pending
     crate::signal::clone_task_signal(
         current_tid,
         child_tid,
         config.flags & CLONE_SIGHAND != 0,
         config.flags & CLONE_THREAD != 0,
+        config.flags & CLONE_CLEAR_SIGHAND != 0,
     );
 
     // Handle I/O context (CLONE_IO)

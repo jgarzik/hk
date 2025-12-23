@@ -58,7 +58,7 @@ The `clone()` syscall creates a new process or thread. It is the fundamental bui
 | Flag | Value | Purpose | Status |
 |------|-------|---------|--------|
 | CLONE_PIDFD | 0x00001000 | Return pidfd for child | Not implemented |
-| CLONE_CLEAR_SIGHAND | 0x100000000 | Reset signal handlers | Deferred |
+| CLONE_CLEAR_SIGHAND | 0x100000000 | Reset signal handlers | Implemented |
 | CLONE_INTO_CGROUP | 0x200000000 | Place in specific cgroup | Deferred |
 
 ## Flag Dependencies
@@ -69,6 +69,7 @@ Linux enforces these dependency rules (EINVAL if violated):
 2. **CLONE_THREAD requires CLONE_SIGHAND** - Threads must share signal handlers
 3. **CLONE_NEWNS and CLONE_FS are mutually exclusive** - Cannot share FS context while in new mount namespace
 4. **CLONE_NEWPID incompatible with CLONE_THREAD** - Threads cannot be in different PID namespaces
+5. **CLONE_SIGHAND and CLONE_CLEAR_SIGHAND are mutually exclusive** - Cannot share and reset handlers simultaneously
 
 ## Common Flag Combinations
 
@@ -131,6 +132,17 @@ Each task has a `SigHand` structure holding signal handlers:
 - **CLONE_SIGHAND not set**: Child gets deep copy via `SigHand::deep_clone()`
 - **CLONE_THREAD**: Also enables shared thread-group pending signals
 
+### Signal Handler Reset (CLONE_CLEAR_SIGHAND)
+
+Linux 5.5+ feature used by container runtimes and glibc's `posix_spawn()`:
+
+- **Purpose**: Atomically reset all signal handlers to SIG_DFL in child
+- **Mutual exclusivity**: Cannot be used with CLONE_SIGHAND (returns EINVAL)
+- **SIG_IGN preserved**: Handlers set to SIG_IGN remain SIG_IGN (intentional Linux semantic)
+- **Clears metadata**: sa_flags, sa_mask, and restorer are all reset to 0
+
+Implementation uses `SigHand::flush_handlers()` after deep-cloning the handler table.
+
 ### Namespace Support
 
 Fully implemented:
@@ -138,13 +150,38 @@ Fully implemented:
 - **CLONE_NEWPID**: Creates new PID namespace with hierarchical PID translation
 - **CLONE_NEWUSER**: Creates new user namespace with UID/GID mapping support
 - **CLONE_NEWIPC**: Creates new IPC namespace with isolated SysV IPC resources
-
-Partially implemented:
-- **CLONE_NEWNS**: Creates new mount namespace wrapper (mount tree still global)
+- **CLONE_NEWNS**: Creates new mount namespace with cloned mount tree
+- **CLONE_NEWNET**: Creates new network namespace with isolated network stack
 
 Deferred (require subsystem support):
-- **CLONE_NEWNET**: Requires per-namespace network isolation
 - **CLONE_NEWCGROUP**: Requires cgroup implementation
+
+### CLONE_NEWNS (Mount Namespace)
+
+Creates a new mount namespace with a deep-cloned mount tree:
+- **Mount::clone_tree()**: Recursively clones entire mount hierarchy
+- **Per-namespace root**: Each namespace has its own root mount
+- **current_mnt_ns()**: Returns current task's mount namespace
+- **init_mnt_ns()**: Returns init mount namespace for early boot
+
+Mount operations use namespace-local storage:
+- `do_mount()` / `do_mount_dev()` add mounts to current namespace
+- `do_umount()` removes from current namespace
+- Path lookup uses current namespace's root
+
+### CLONE_NEWNET (Network Namespace)
+
+Creates a new network namespace with isolated network stack:
+- **Per-namespace devices**: Each namespace has its own device list
+- **Loopback device**: Every new namespace gets a loopback (127.0.0.1)
+- **Per-namespace routing**: Isolated routing table per namespace
+- **Per-namespace TCP**: Connection table is namespace-local
+- **Per-namespace ARP**: ARP cache is namespace-local
+
+Implementation:
+- `NetNamespace` in `kernel/ns/net.rs` holds all network state
+- `current_net_ns()` returns current task's network namespace
+- Init namespace receives physical network devices
 
 ### CLONE_PARENT Support
 
@@ -191,8 +228,6 @@ Related syscalls:
 ## Future Work
 
 ### Tier 1: Remaining Namespaces
-- **CLONE_NEWNS**: Full mount isolation (per-namespace mount tree)
-- **CLONE_NEWNET**: Network namespace isolation
 - **CLONE_NEWCGROUP**: Cgroup namespace (requires cgroup support)
 
 ### Tier 2: Modern Features
@@ -225,10 +260,12 @@ Related syscalls:
 - kernel/arch/x86_64/switch_to.S - Pure-asm register save/restore
 - kernel/arch/aarch64/context.rs - Context switch with TLS handling (TPIDR_EL0)
 - kernel/arch/aarch64/switch_to.S - Pure-asm register save/restore
-- kernel/ns/mod.rs - Namespace proxy and syscalls (unshare, setns)
+- kernel/ns/mod.rs - Namespace proxy, MntNamespace, and syscalls (unshare, setns)
 - kernel/ns/uts.rs - UTS namespace implementation
 - kernel/ns/pid.rs - PID namespace implementation
 - kernel/ns/user.rs - User namespace implementation
+- kernel/ns/net.rs - Network namespace implementation
+- kernel/fs/mount.rs - Mount namespace support, clone_tree()
 - kernel/ipc/mod.rs - IPC namespace implementation
 - kernel/ipc/sem.rs - SysV semaphores with SEM_UNDO support
 - kernel/signal/mod.rs - Signal handler sharing (CLONE_SIGHAND)

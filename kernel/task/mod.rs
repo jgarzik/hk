@@ -37,6 +37,10 @@ pub mod clone_flags {
     /// Share I/O context (ioprio)
     pub const CLONE_IO: u64 = 0x80000000;
 
+    /// Clear signal handlers (reset to SIG_DFL) - Linux 5.5+
+    /// Note: SIG_IGN handlers are preserved (intentional Linux behavior)
+    pub const CLONE_CLEAR_SIGHAND: u64 = 0x100000000;
+
     // Namespace clone flags (re-exported from ns module for convenience)
     pub use crate::ns::{
         CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER,

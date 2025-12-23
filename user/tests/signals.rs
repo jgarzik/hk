@@ -10,11 +10,13 @@
 //! - Test 80: rt_sigaction() - get default action
 //! - Test 81: rt_sigaction() EINVAL - invalid signal
 //! - Test 82: rt_sigaction() SIGKILL - can't change
+//! - Test: CLONE_CLEAR_SIGHAND - reset handlers after clone
 
 use super::helpers::{print, println, print_num};
 use crate::syscall::{
-    sys_getpid, sys_gettid, sys_kill, sys_rt_sigaction, sys_rt_sigpending, sys_rt_sigprocmask,
-    sys_tgkill, sys_tkill, SIG_BLOCK, SIG_DFL, SIG_IGN, SIGKILL, SIGUSR1,
+    sys_clone, sys_exit, sys_getpid, sys_gettid, sys_kill, sys_rt_sigaction, sys_rt_sigpending,
+    sys_rt_sigprocmask, sys_tgkill, sys_tkill, sys_wait4, CLONE_CLEAR_SIGHAND, SIG_BLOCK, SIG_DFL,
+    SIG_IGN, SIGCHLD, SIGKILL, SIGUSR1,
 };
 
 /// Run all signal tests
@@ -28,6 +30,7 @@ pub fn run_tests() {
     test_sigaction();
     test_sigaction_einval();
     test_sigaction_sigkill();
+    test_clone_clear_sighand();
 }
 
 /// Test 74: rt_sigprocmask() - get and set signal mask
@@ -185,5 +188,76 @@ fn test_sigaction_sigkill() {
     } else {
         print(b"SIGACTION_SIGKILL:FAIL: expected -22, got ");
         print_num(ret);
+    }
+}
+
+/// Test: CLONE_CLEAR_SIGHAND - reset signal handlers after clone
+fn test_clone_clear_sighand() {
+    // First, set a custom handler for SIGUSR1 (use SIG_IGN as a non-default handler)
+    // Note: We use SIG_IGN because it's preserved by CLONE_CLEAR_SIGHAND
+    // To properly test, we set a "handler" address (non-zero, non-SIG_IGN)
+    let custom_handler: u64 = 0x12345678; // Fake handler address
+    let new_action: [u64; 4] = [custom_handler, 0, 0, 0];
+    let mut old_action: [u64; 4] = [0; 4];
+
+    // Set custom handler for SIGUSR1
+    let ret = sys_rt_sigaction(SIGUSR1, new_action.as_ptr() as u64, old_action.as_mut_ptr() as u64, 8);
+    if ret != 0 {
+        print(b"CLONE_CLEAR_SIGHAND:FAIL: could not set handler, ret = ");
+        print_num(ret);
+        return;
+    }
+
+    // Allocate stack for child
+    const STACK_SIZE: usize = 4096;
+    #[repr(C, align(16))]
+    struct ChildStack([u8; STACK_SIZE]);
+    static mut CHILD_STACK: ChildStack = ChildStack([0; STACK_SIZE]);
+
+    // Clone with CLONE_CLEAR_SIGHAND
+    let stack_base = core::ptr::addr_of_mut!(CHILD_STACK) as *mut u8;
+    let stack_top = unsafe { stack_base.add(STACK_SIZE) as u64 };
+    let flags = SIGCHLD as u64 | CLONE_CLEAR_SIGHAND;
+
+    let ret = sys_clone(flags, stack_top, 0, 0, 0);
+
+    if ret < 0 {
+        print(b"CLONE_CLEAR_SIGHAND:FAIL: clone failed, ret = ");
+        print_num(ret);
+        // Restore default handler
+        let default_action: [u64; 4] = [SIG_DFL, 0, 0, 0];
+        sys_rt_sigaction(SIGUSR1, default_action.as_ptr() as u64, 0, 8);
+        return;
+    }
+
+    if ret == 0 {
+        // Child process: check if SIGUSR1 handler was reset to SIG_DFL
+        let mut child_action: [u64; 4] = [0xFFFFFFFF; 4];
+        let ret = sys_rt_sigaction(SIGUSR1, 0, child_action.as_mut_ptr() as u64, 8);
+        if ret == 0 && child_action[0] == SIG_DFL {
+            // Handler was reset to default - success!
+            sys_exit(0);
+        } else {
+            // Handler was NOT reset
+            sys_exit(1);
+        }
+    } else {
+        // Parent process: wait for child and check exit status
+        let child_pid = ret;
+        let mut wstatus: i32 = 0;
+        sys_wait4(child_pid, &mut wstatus, 0, 0);
+
+        // Restore default handler in parent
+        let default_action: [u64; 4] = [SIG_DFL, 0, 0, 0];
+        sys_rt_sigaction(SIGUSR1, default_action.as_ptr() as u64, 0, 8);
+
+        // Check exit status (WEXITSTATUS)
+        let exit_code = (wstatus >> 8) & 0xFF;
+        if exit_code == 0 {
+            println(b"CLONE_CLEAR_SIGHAND:OK");
+        } else {
+            print(b"CLONE_CLEAR_SIGHAND:FAIL: child exit code = ");
+            print_num(exit_code as i64);
+        }
     }
 }
