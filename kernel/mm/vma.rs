@@ -20,6 +20,9 @@ pub const MAP_ANONYMOUS: u32 = 0x20;
 /// MAP_DENYWRITE - ignored for Linux ABI compatibility (deprecated)
 /// Linux kernel explicitly ignores this flag (see include/linux/mman.h)
 pub const MAP_DENYWRITE: u32 = 0x0800;
+/// MAP_EXECUTABLE - ignored for Linux ABI compatibility (deprecated)
+/// Linux kernel explicitly ignores this flag (see include/linux/mman.h)
+pub const MAP_EXECUTABLE: u32 = 0x1000;
 /// MAP_LOCKED - lock pages in memory (Linux mman.h value)
 /// Note: Same value as VM_LOCKED (0x2000) - Linux uses calc_vm_flag_bits() for identity mapping
 pub const MAP_LOCKED: u32 = 0x2000;

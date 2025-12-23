@@ -11,7 +11,7 @@ use super::helpers::{print, println, print_num};
 use crate::syscall::{
     sys_mmap, sys_mprotect, sys_munmap, sys_mlock, sys_mlock2, sys_munlock,
     sys_mlockall, sys_munlockall,
-    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_LOCKED, MAP_PRIVATE, MAP_SHARED,
+    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_LOCKED, MAP_PRIVATE, MAP_SHARED,
     PROT_READ, PROT_WRITE, PROT_EXEC,
     MLOCK_ONFAULT, MCL_CURRENT, MCL_ONFAULT,
 };
@@ -31,6 +31,8 @@ pub fn run_tests() {
     test_mmap_shared_anon();
     // MAP_DENYWRITE tests (deprecated flag, should be accepted but ignored)
     test_mmap_denywrite();
+    // MAP_EXECUTABLE tests (deprecated flag, should be accepted but ignored)
+    test_mmap_executable();
     // mlock tests
     test_mlock_basic();
     test_mlock2_onfault();
@@ -660,4 +662,46 @@ fn test_mmap_denywrite() {
 
     sys_munmap(ptr as u64, 4096);
     println(b"MMAP_DENYWRITE:OK");
+}
+
+// ============================================================================
+// MAP_EXECUTABLE tests (deprecated flag - accepted but ignored per Linux)
+// ============================================================================
+
+/// Test: MAP_EXECUTABLE is accepted (but ignored per Linux behavior)
+fn test_mmap_executable() {
+    // MAP_EXECUTABLE should be accepted without returning an error
+    // Linux explicitly ignores this flag for ABI compatibility
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_EXECUTABLE,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MMAP_EXECUTABLE:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Verify the mapping works normally (flag is ignored)
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0xE0ECC0DE);
+    }
+
+    let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
+    if val != 0xE0ECC0DE {
+        print(b"MMAP_EXECUTABLE:FAIL read mismatch got ");
+        print_num(val as i64);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MMAP_EXECUTABLE:OK");
 }

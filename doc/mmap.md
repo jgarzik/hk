@@ -64,7 +64,7 @@ int munmap(void *addr, size_t length);
 | MAP_ANONYMOUS | 0x20 | No file backing | Implemented |
 | MAP_GROWSDOWN | 0x100 | Stack-like segment growth | Not implemented |
 | MAP_DENYWRITE | 0x0800 | ETXTBSY (deprecated) | Implemented (ignored per Linux) |
-| MAP_EXECUTABLE | 0x1000 | Mark executable (deprecated) | Not implemented (ignored by Linux) |
+| MAP_EXECUTABLE | 0x1000 | Mark executable (deprecated) | Implemented (ignored per Linux) |
 | MAP_LOCKED | 0x2000 | Lock pages in memory | Implemented (no prefault) |
 | MAP_NORESERVE | 0x4000 | Don't reserve swap | Not implemented |
 | MAP_POPULATE | 0x8000 | Prefault pages | Not implemented |
