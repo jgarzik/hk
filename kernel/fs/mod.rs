@@ -12,6 +12,7 @@ pub mod inode;
 pub mod mount;
 pub mod path;
 pub mod path_ref;
+pub mod splice;
 pub mod superblock;
 pub mod syscall;
 

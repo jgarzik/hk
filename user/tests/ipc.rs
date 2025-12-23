@@ -1,20 +1,23 @@
-//! IPC Tests - pipe, poll, select, and SysV IPC
+//! IPC Tests - pipe, poll, select, splice, and SysV IPC
 //!
 //! Tests for inter-process communication primitives including:
 //! - Pipes and poll/select
+//! - Splice, tee, vmsplice (zero-copy data transfer)
 //! - SysV shared memory (shmget, shmat, shmdt, shmctl)
 //! - SysV semaphores (semget, semop, semctl)
 //! - SysV message queues (msgget, msgsnd, msgrcv, msgctl)
 
 use crate::syscall::{
-    sys_close, sys_pipe, sys_poll, sys_read, sys_select, sys_write,
+    sys_close, sys_open, sys_pipe, sys_poll, sys_read, sys_select, sys_write,
+    sys_sendfile, sys_splice, sys_tee, sys_vmsplice,
     sys_shmget, sys_shmat, sys_shmdt, sys_shmctl,
     sys_semget, sys_semop, sys_semctl,
     sys_msgget, sys_msgsnd, sys_msgrcv, sys_msgctl,
-    FdSet, PollFd, Timeval, Sembuf,
+    FdSet, IoVec, PollFd, Timeval, Sembuf,
     POLLIN, POLLNVAL, POLLOUT,
     IPC_CREAT, IPC_PRIVATE, IPC_RMID,
     GETVAL, SETVAL,
+    O_RDONLY,
 };
 use super::helpers::{print, println, print_num};
 
@@ -31,6 +34,16 @@ pub fn run_tests() {
     test_poll_write_ready();
     test_select_data_ready();
     test_select_no_data();
+
+    // Splice tests
+    println(b"--- Splice / Tee / Vmsplice / Sendfile ---");
+    test_splice_pipe_to_pipe();
+    test_splice_invalid_no_pipe();
+    test_tee_pipe_to_pipe();
+    test_tee_invalid_same_pipe();
+    test_vmsplice_to_pipe();
+    test_sendfile_to_pipe();
+    test_sendfile_invalid_pipe_input();
 
     // SysV IPC tests
     println(b"--- SysV Shared Memory ---");
@@ -646,4 +659,301 @@ fn test_msgctl_rmid() {
     } else {
         println(b" MSGCTL_RMID:FAIL");
     }
+}
+
+// =============================================================================
+// Splice / Tee / Vmsplice Tests
+// =============================================================================
+
+/// Test splice between two pipes
+fn test_splice_pipe_to_pipe() {
+    // Create source pipe
+    let mut src_pipe: [i32; 2] = [0, 0];
+    if sys_pipe(src_pipe.as_mut_ptr()) != 0 {
+        println(b"SPLICE_P2P:FAIL (src pipe)");
+        return;
+    }
+
+    // Create destination pipe
+    let mut dst_pipe: [i32; 2] = [0, 0];
+    if sys_pipe(dst_pipe.as_mut_ptr()) != 0 {
+        sys_close(src_pipe[0] as u64);
+        sys_close(src_pipe[1] as u64);
+        println(b"SPLICE_P2P:FAIL (dst pipe)");
+        return;
+    }
+
+    // Write data to source pipe
+    let msg = b"splice!";
+    let written = sys_write(src_pipe[1] as u64, msg.as_ptr(), msg.len() as u64);
+    if written != msg.len() as i64 {
+        sys_close(src_pipe[0] as u64);
+        sys_close(src_pipe[1] as u64);
+        sys_close(dst_pipe[0] as u64);
+        sys_close(dst_pipe[1] as u64);
+        println(b"SPLICE_P2P:FAIL (write)");
+        return;
+    }
+
+    // Splice from source to destination
+    let spliced = sys_splice(
+        src_pipe[0], core::ptr::null_mut(),
+        dst_pipe[1], core::ptr::null_mut(),
+        msg.len(), 0,
+    );
+
+    print(b"splice(p2p) returned ");
+    print_num(spliced);
+
+    if spliced == msg.len() as i64 {
+        // Read from destination and verify
+        let mut buf = [0u8; 16];
+        let read = sys_read(dst_pipe[0] as u64, buf.as_mut_ptr(), 16);
+        if read == msg.len() as i64 && &buf[..msg.len()] == msg {
+            println(b" SPLICE_P2P:OK");
+        } else {
+            println(b" SPLICE_P2P:FAIL (verify)");
+        }
+    } else {
+        println(b" SPLICE_P2P:FAIL");
+    }
+
+    // Cleanup
+    sys_close(src_pipe[0] as u64);
+    sys_close(src_pipe[1] as u64);
+    sys_close(dst_pipe[0] as u64);
+    sys_close(dst_pipe[1] as u64);
+}
+
+/// Test that splice returns EINVAL when neither fd is a pipe
+fn test_splice_invalid_no_pipe() {
+    // splice with invalid fd should fail
+    let ret = sys_splice(
+        9999, core::ptr::null_mut(),
+        9998, core::ptr::null_mut(),
+        100, 0,
+    );
+
+    print(b"splice(no pipe) returned ");
+    print_num(ret);
+
+    // Should return EBADF (-9) or EINVAL (-22)
+    if ret < 0 {
+        println(b" SPLICE_NO_PIPE:OK");
+    } else {
+        println(b" SPLICE_NO_PIPE:FAIL");
+    }
+}
+
+/// Test tee between two pipes
+fn test_tee_pipe_to_pipe() {
+    // Create source pipe
+    let mut src_pipe: [i32; 2] = [0, 0];
+    if sys_pipe(src_pipe.as_mut_ptr()) != 0 {
+        println(b"TEE_P2P:FAIL (src pipe)");
+        return;
+    }
+
+    // Create destination pipe
+    let mut dst_pipe: [i32; 2] = [0, 0];
+    if sys_pipe(dst_pipe.as_mut_ptr()) != 0 {
+        sys_close(src_pipe[0] as u64);
+        sys_close(src_pipe[1] as u64);
+        println(b"TEE_P2P:FAIL (dst pipe)");
+        return;
+    }
+
+    // Write data to source pipe
+    let msg = b"tee!";
+    let written = sys_write(src_pipe[1] as u64, msg.as_ptr(), msg.len() as u64);
+    if written != msg.len() as i64 {
+        sys_close(src_pipe[0] as u64);
+        sys_close(src_pipe[1] as u64);
+        sys_close(dst_pipe[0] as u64);
+        sys_close(dst_pipe[1] as u64);
+        println(b"TEE_P2P:FAIL (write)");
+        return;
+    }
+
+    // Tee from source to destination (does not consume source)
+    let teed = sys_tee(src_pipe[0], dst_pipe[1], msg.len(), 0);
+
+    print(b"tee(p2p) returned ");
+    print_num(teed);
+
+    if teed == msg.len() as i64 {
+        // Read from destination
+        let mut buf = [0u8; 16];
+        let read = sys_read(dst_pipe[0] as u64, buf.as_mut_ptr(), 16);
+
+        // Also verify source still has data (tee doesn't consume)
+        let mut src_buf = [0u8; 16];
+        let src_read = sys_read(src_pipe[0] as u64, src_buf.as_mut_ptr(), 16);
+
+        if read == msg.len() as i64 && src_read == msg.len() as i64 {
+            println(b" TEE_P2P:OK");
+        } else {
+            println(b" TEE_P2P:FAIL (verify)");
+        }
+    } else {
+        println(b" TEE_P2P:FAIL");
+    }
+
+    // Cleanup
+    sys_close(src_pipe[0] as u64);
+    sys_close(src_pipe[1] as u64);
+    sys_close(dst_pipe[0] as u64);
+    sys_close(dst_pipe[1] as u64);
+}
+
+/// Test that tee to the same pipe returns EINVAL
+fn test_tee_invalid_same_pipe() {
+    let mut pipefd: [i32; 2] = [0, 0];
+    if sys_pipe(pipefd.as_mut_ptr()) != 0 {
+        println(b"TEE_SAME:FAIL (pipe)");
+        return;
+    }
+
+    // Write some data
+    let msg = b"x";
+    sys_write(pipefd[1] as u64, msg.as_ptr(), 1);
+
+    // Tee to same pipe should fail
+    let ret = sys_tee(pipefd[0], pipefd[1], 1, 0);
+
+    print(b"tee(same pipe) returned ");
+    print_num(ret);
+
+    // Should return EINVAL (-22)
+    if ret == -22 {
+        println(b" TEE_SAME:OK");
+    } else {
+        println(b" TEE_SAME:FAIL");
+    }
+
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+}
+
+/// Test vmsplice to write user memory into pipe
+fn test_vmsplice_to_pipe() {
+    let mut pipefd: [i32; 2] = [0, 0];
+    if sys_pipe(pipefd.as_mut_ptr()) != 0 {
+        println(b"VMSPLICE:FAIL (pipe)");
+        return;
+    }
+
+    // Prepare user buffer
+    let msg = b"vmsplice!";
+    let iov = IoVec {
+        iov_base: msg.as_ptr(),
+        iov_len: msg.len(),
+    };
+
+    // vmsplice user memory into pipe
+    let spliced = sys_vmsplice(pipefd[1], &iov as *const IoVec, 1, 0);
+
+    print(b"vmsplice() returned ");
+    print_num(spliced);
+
+    if spliced == msg.len() as i64 {
+        // Read from pipe and verify
+        let mut buf = [0u8; 16];
+        let read = sys_read(pipefd[0] as u64, buf.as_mut_ptr(), 16);
+        if read == msg.len() as i64 && &buf[..msg.len()] == msg {
+            println(b" VMSPLICE:OK");
+        } else {
+            println(b" VMSPLICE:FAIL (verify)");
+        }
+    } else {
+        println(b" VMSPLICE:FAIL");
+    }
+
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+}
+
+/// Test sendfile from file to pipe
+fn test_sendfile_to_pipe() {
+    // Open a test file (ramfs test.txt exists with "Hello from ramfs!")
+    let fd = sys_open(b"/test.txt\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        print(b"sendfile: open returned ");
+        print_num(fd);
+        println(b" SENDFILE_PIPE:SKIP (no test file)");
+        return;
+    }
+
+    // Create destination pipe
+    let mut pipefd: [i32; 2] = [0, 0];
+    if sys_pipe(pipefd.as_mut_ptr()) != 0 {
+        sys_close(fd as u64);
+        println(b"SENDFILE_PIPE:FAIL (pipe)");
+        return;
+    }
+
+    // Sendfile from file to pipe
+    let sent = sys_sendfile(pipefd[1], fd as i32, core::ptr::null_mut(), 17);
+
+    print(b"sendfile(file->pipe) returned ");
+    print_num(sent);
+
+    if sent > 0 {
+        // Read from pipe and verify
+        let mut buf = [0u8; 32];
+        let read = sys_read(pipefd[0] as u64, buf.as_mut_ptr(), 32);
+        if read == sent {
+            println(b" SENDFILE_PIPE:OK");
+        } else {
+            print(b" read=");
+            print_num(read);
+            println(b" SENDFILE_PIPE:FAIL (verify)");
+        }
+    } else {
+        println(b" SENDFILE_PIPE:FAIL");
+    }
+
+    sys_close(fd as u64);
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+}
+
+/// Test that sendfile with pipe as input returns EINVAL
+fn test_sendfile_invalid_pipe_input() {
+    // Create a pipe
+    let mut pipefd: [i32; 2] = [0, 0];
+    if sys_pipe(pipefd.as_mut_ptr()) != 0 {
+        println(b"SENDFILE_INV:FAIL (pipe)");
+        return;
+    }
+
+    // Create another pipe as destination
+    let mut dst_pipe: [i32; 2] = [0, 0];
+    if sys_pipe(dst_pipe.as_mut_ptr()) != 0 {
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        println(b"SENDFILE_INV:FAIL (dst pipe)");
+        return;
+    }
+
+    // Write some data to source pipe
+    sys_write(pipefd[1] as u64, b"x".as_ptr(), 1);
+
+    // sendfile with pipe as input should return EINVAL
+    let ret = sys_sendfile(dst_pipe[1], pipefd[0], core::ptr::null_mut(), 1);
+
+    print(b"sendfile(pipe input) returned ");
+    print_num(ret);
+
+    // Should return EINVAL (-22)
+    if ret == -22 {
+        println(b" SENDFILE_INV:OK");
+    } else {
+        println(b" SENDFILE_INV:FAIL");
+    }
+
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+    sys_close(dst_pipe[0] as u64);
+    sys_close(dst_pipe[1] as u64);
 }

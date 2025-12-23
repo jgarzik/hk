@@ -16,7 +16,7 @@
 //!     +-----> Arc<Pipe> <----------+
 //!              |
 //!              v
-//!         Ring Buffer
+//!     Page-based Ring Buffer
 //!         Wait Queue
 //! ```
 //!
@@ -26,11 +26,13 @@
 //! - poll() support with wait queue integration
 //! - POLLHUP when other end closes
 //! - O_NONBLOCK support
+//! - Zero-copy splice/tee/vmsplice support via page-based buffers
 //!
 //! ## Reference
 //!
 //! - `./select-poll.md` - Implementation guide
 //! - Linux pipe(7) man page
+//! - Linux fs/pipe.c
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -39,93 +41,377 @@ use spin::Mutex;
 
 use crate::fs::FsError;
 use crate::fs::file::{File, FileOps, flags};
+use crate::mm::page_cache::{CachedPage, PAGE_SIZE};
 use crate::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::waitqueue::WaitQueue;
 
 /// Pipe buffer size (matches Linux PIPE_BUF for atomic writes)
 pub const PIPE_BUF: usize = 4096;
 
+/// Number of buffer slots in a pipe (like Linux's PIPE_DEF_BUFFERS)
+pub const PIPE_BUFFERS: usize = 16;
+
+/// Pipe buffer flags
+pub mod pipe_buf_flags {
+    /// Page is in LRU (can be reclaimed)
+    pub const LRU: u32 = 0x01;
+    /// Page was atomically mapped
+    pub const ATOMIC: u32 = 0x02;
+    /// User donated this page (for vmsplice with SPLICE_F_GIFT)
+    pub const GIFT: u32 = 0x04;
+    /// Pages are a packet (for packet mode)
+    pub const PACKET: u32 = 0x08;
+    /// Can merge with previous buffer
+    pub const CAN_MERGE: u32 = 0x10;
+    /// This buffer was created by the kernel (owned)
+    pub const OWNED: u32 = 0x20;
+}
+
+/// A single buffer slot in a pipe
+///
+/// Similar to Linux's struct pipe_buffer, this holds a reference to a page
+/// along with offset and length information for the valid data region.
+pub struct PipeBuffer {
+    /// Page holding the buffer data
+    /// None if this slot is empty, Some if it contains data
+    pub page: Option<Arc<CachedPage>>,
+    /// Offset within the page where data starts
+    pub offset: u32,
+    /// Length of valid data in this buffer
+    pub len: u32,
+    /// Buffer flags (see pipe_buf_flags)
+    pub flags: u32,
+}
+
+impl PipeBuffer {
+    /// Create an empty pipe buffer slot
+    pub const fn empty() -> Self {
+        Self {
+            page: None,
+            offset: 0,
+            len: 0,
+            flags: 0,
+        }
+    }
+
+    /// Create a new pipe buffer with a page
+    pub fn new(page: Arc<CachedPage>, offset: u32, len: u32, flags: u32) -> Self {
+        Self {
+            page: Some(page),
+            offset,
+            len,
+            flags,
+        }
+    }
+
+    /// Check if this buffer slot is empty
+    pub fn is_empty(&self) -> bool {
+        self.page.is_none() || self.len == 0
+    }
+
+    /// Check if this buffer can be merged with new data
+    pub fn can_merge(&self) -> bool {
+        if self.page.is_none() {
+            return false;
+        }
+        // Can merge if CAN_MERGE flag is set and there's space at the end
+        (self.flags & pipe_buf_flags::CAN_MERGE != 0)
+            && ((self.offset + self.len) as usize) < PAGE_SIZE
+    }
+
+    /// Get remaining space in this buffer for merging
+    pub fn space_available(&self) -> usize {
+        if self.page.is_none() {
+            return 0;
+        }
+        PAGE_SIZE - (self.offset + self.len) as usize
+    }
+
+    /// Release the page reference
+    pub fn release(&mut self) {
+        if let Some(ref page) = self.page {
+            // Only call put() if we own the page (OWNED flag)
+            // For splice'd pages, the caller manages the refcount
+            if self.flags & pipe_buf_flags::OWNED != 0 {
+                page.put();
+            }
+        }
+        self.page = None;
+        self.offset = 0;
+        self.len = 0;
+        self.flags = 0;
+    }
+}
+
 /// Internal pipe state shared between read and write ends
+///
+/// Uses page-based ring buffer to support zero-copy splice operations.
+/// Public for splice module access.
 pub struct PipeInner {
-    /// Ring buffer for pipe data
-    buffer: [u8; PIPE_BUF],
-    /// Read position in buffer
-    read_pos: usize,
-    /// Write position in buffer
-    write_pos: usize,
-    /// Number of bytes in buffer
-    count: usize,
+    /// Ring of buffer slots (like Linux's struct pipe_inode_info.bufs)
+    pub bufs: [PipeBuffer; PIPE_BUFFERS],
+    /// Head index - producer writes here (mod PIPE_BUFFERS)
+    pub head: usize,
+    /// Tail index - consumer reads from here (mod PIPE_BUFFERS)
+    pub tail: usize,
+    /// Total bytes in all buffers
+    pub total_len: usize,
 }
 
 impl PipeInner {
-    const fn new() -> Self {
+    /// Create a new empty pipe inner
+    fn new() -> Self {
+        // Initialize all buffer slots as empty
+        const EMPTY_BUF: PipeBuffer = PipeBuffer::empty();
         Self {
-            buffer: [0; PIPE_BUF],
-            read_pos: 0,
-            write_pos: 0,
-            count: 0,
+            bufs: [EMPTY_BUF; PIPE_BUFFERS],
+            head: 0,
+            tail: 0,
+            total_len: 0,
         }
     }
 
-    /// Check if buffer is empty
-    fn is_empty(&self) -> bool {
-        self.count == 0
+    /// Check if pipe is empty
+    pub fn is_empty(&self) -> bool {
+        self.head == self.tail
     }
 
-    /// Check if buffer is full
-    fn is_full(&self) -> bool {
-        self.count == PIPE_BUF
+    /// Check if pipe is full (all buffer slots used)
+    pub fn is_full(&self) -> bool {
+        self.buffer_count() >= PIPE_BUFFERS
     }
 
-    /// Available space for writing
-    fn space_available(&self) -> usize {
-        PIPE_BUF - self.count
+    /// Number of used buffer slots
+    pub fn buffer_count(&self) -> usize {
+        if self.head >= self.tail {
+            self.head - self.tail
+        } else {
+            PIPE_BUFFERS - self.tail + self.head
+        }
+    }
+
+    /// Number of free buffer slots
+    #[allow(dead_code)]
+    fn free_slots(&self) -> usize {
+        PIPE_BUFFERS - self.buffer_count()
     }
 
     /// Bytes available for reading
-    fn bytes_available(&self) -> usize {
-        self.count
+    #[allow(dead_code)]
+    pub fn bytes_available(&self) -> usize {
+        self.total_len
     }
 
-    /// Write data to the pipe buffer
+    /// Get the tail buffer (for reading)
+    #[allow(dead_code)]
+    pub fn tail_buf(&self) -> Option<&PipeBuffer> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(&self.bufs[self.tail])
+        }
+    }
+
+    /// Get mutable tail buffer
+    #[allow(dead_code)]
+    pub fn tail_buf_mut(&mut self) -> Option<&mut PipeBuffer> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(&mut self.bufs[self.tail])
+        }
+    }
+
+    /// Get the head buffer for writing (last used slot, for merging)
+    #[allow(dead_code)]
+    pub fn head_buf_for_merge(&self) -> Option<&PipeBuffer> {
+        if self.is_empty() {
+            None
+        } else {
+            // Head points to next free slot, so previous slot is (head - 1)
+            let prev = if self.head == 0 {
+                PIPE_BUFFERS - 1
+            } else {
+                self.head - 1
+            };
+            Some(&self.bufs[prev])
+        }
+    }
+
+    /// Get mutable head buffer for merging
+    fn head_buf_for_merge_mut(&mut self) -> Option<&mut PipeBuffer> {
+        if self.is_empty() {
+            None
+        } else {
+            let prev = if self.head == 0 {
+                PIPE_BUFFERS - 1
+            } else {
+                self.head - 1
+            };
+            Some(&mut self.bufs[prev])
+        }
+    }
+
+    /// Advance tail after consuming a buffer
+    #[allow(dead_code)]
+    pub fn advance_tail(&mut self, bytes: usize) {
+        self.total_len = self.total_len.saturating_sub(bytes);
+        self.tail = (self.tail + 1) % PIPE_BUFFERS;
+    }
+
+    /// Add a buffer at head position
+    pub fn push_buffer(&mut self, buf: PipeBuffer) -> Result<(), PipeBuffer> {
+        if self.is_full() {
+            return Err(buf);
+        }
+        let bytes = buf.len as usize;
+        self.bufs[self.head] = buf;
+        self.head = (self.head + 1) % PIPE_BUFFERS;
+        self.total_len += bytes;
+        Ok(())
+    }
+
+    /// Write data to the pipe using page-based buffers
     ///
-    /// Returns number of bytes written
+    /// Allocates pages as needed. Returns number of bytes written.
     fn write(&mut self, data: &[u8]) -> usize {
-        let to_write = data.len().min(self.space_available());
-        if to_write == 0 {
+        if data.is_empty() {
             return 0;
         }
 
-        for &byte in &data[..to_write] {
-            self.buffer[self.write_pos] = byte;
-            self.write_pos = (self.write_pos + 1) % PIPE_BUF;
+        let mut written = 0;
+
+        // First, try to merge with existing head buffer
+        if let Some(buf) = self.head_buf_for_merge_mut() {
+            if buf.can_merge() {
+                let space = buf.space_available();
+                let to_write = data.len().min(space);
+                if to_write > 0 {
+                    // Get page frame and write data
+                    if let Some(ref page) = buf.page {
+                        let offset = (buf.offset + buf.len) as usize;
+                        let dst_addr = page.frame as usize + offset;
+                        unsafe {
+                            let dst = dst_addr as *mut u8;
+                            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, to_write);
+                        }
+                        buf.len += to_write as u32;
+                        self.total_len += to_write;
+                        written += to_write;
+                    }
+                }
+            }
         }
-        self.count += to_write;
-        to_write
+
+        // Write remaining data to new buffers
+        while written < data.len() && !self.is_full() {
+            // Allocate a new page for this buffer
+            let page = match allocate_pipe_page() {
+                Some(p) => p,
+                None => break, // Out of memory
+            };
+
+            let remaining = data.len() - written;
+            let to_write = remaining.min(PAGE_SIZE);
+
+            // Copy data to the new page
+            unsafe {
+                let dst = page.frame as *mut u8;
+                core::ptr::copy_nonoverlapping(data[written..].as_ptr(), dst, to_write);
+            }
+
+            // Create buffer with OWNED and CAN_MERGE flags
+            let buf = PipeBuffer::new(
+                page,
+                0,
+                to_write as u32,
+                pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE,
+            );
+
+            if self.push_buffer(buf).is_err() {
+                break;
+            }
+
+            written += to_write;
+        }
+
+        written
     }
 
-    /// Read data from the pipe buffer
+    /// Read data from the pipe
     ///
-    /// Returns number of bytes read
+    /// Returns number of bytes read.
     fn read(&mut self, buf: &mut [u8]) -> usize {
-        let to_read = buf.len().min(self.bytes_available());
-        if to_read == 0 {
+        if buf.is_empty() {
             return 0;
         }
 
-        for byte in buf[..to_read].iter_mut() {
-            *byte = self.buffer[self.read_pos];
-            self.read_pos = (self.read_pos + 1) % PIPE_BUF;
+        let mut read = 0;
+
+        while read < buf.len() && !self.is_empty() {
+            // Get the current tail index
+            let tail_idx = self.tail;
+            let pipe_buf = &mut self.bufs[tail_idx];
+
+            if pipe_buf.is_empty() {
+                // Empty buffer slot, advance and try next
+                self.tail = (self.tail + 1) % PIPE_BUFFERS;
+                continue;
+            }
+
+            let available = pipe_buf.len as usize;
+            let to_read = (buf.len() - read).min(available);
+
+            // Copy data from page to user buffer
+            if let Some(ref page) = pipe_buf.page {
+                let src_addr = page.frame as usize + pipe_buf.offset as usize;
+                unsafe {
+                    let src = src_addr as *const u8;
+                    core::ptr::copy_nonoverlapping(src, buf[read..].as_mut_ptr(), to_read);
+                }
+
+                pipe_buf.offset += to_read as u32;
+                pipe_buf.len -= to_read as u32;
+                read += to_read;
+
+                // If buffer is now empty, release it and advance tail
+                if pipe_buf.len == 0 {
+                    pipe_buf.release();
+                    self.tail = (self.tail + 1) % PIPE_BUFFERS;
+                }
+            } else {
+                // Shouldn't happen, but handle gracefully
+                self.tail = (self.tail + 1) % PIPE_BUFFERS;
+            }
         }
-        self.count -= to_read;
-        to_read
+
+        // Update total length after all reads
+        self.total_len = self.total_len.saturating_sub(read);
+        read
     }
+}
+
+/// Allocate a page for pipe buffer data
+///
+/// Creates an anonymous CachedPage for holding pipe data.
+fn allocate_pipe_page() -> Option<Arc<CachedPage>> {
+    use crate::FRAME_ALLOCATOR;
+    use crate::mm::page_cache::FileId;
+
+    // Allocate a physical frame
+    let frame = FRAME_ALLOCATOR.alloc()?;
+
+    // Create an anonymous CachedPage (file_id 0, offset 0)
+    let page = Arc::new(CachedPage::new(frame, FileId::anonymous(), 0));
+
+    Some(page)
 }
 
 /// Shared pipe structure
 pub struct Pipe {
     /// Pipe buffer (protected by mutex)
-    inner: Mutex<PipeInner>,
+    /// Public for splice module access
+    pub inner: Mutex<PipeInner>,
     /// Wait queue for readers/writers
     pub wait_queue: WaitQueue,
     /// Number of read end references
@@ -228,7 +514,8 @@ impl Drop for PipeReadEnd {
 
 /// File operations for pipe read end
 pub struct PipeReadFileOps {
-    pipe: Arc<Pipe>,
+    /// The underlying pipe (public for splice module access)
+    pub pipe: Arc<Pipe>,
 }
 
 impl PipeReadFileOps {
@@ -346,7 +633,8 @@ impl Drop for PipeWriteEnd {
 
 /// File operations for pipe write end
 pub struct PipeWriteFileOps {
-    pipe: Arc<Pipe>,
+    /// The underlying pipe (public for splice module access)
+    pub pipe: Arc<Pipe>,
 }
 
 impl PipeWriteFileOps {

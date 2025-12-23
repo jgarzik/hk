@@ -165,6 +165,7 @@ pub const SYS_MUNMAP: u64 = 11;
 pub const SYS_BRK: u64 = 12;
 pub const SYS_RT_SIGACTION: u64 = 13;
 pub const SYS_RT_SIGPROCMASK: u64 = 14;
+pub const SYS_IOCTL: u64 = 16;
 pub const SYS_PREAD64: u64 = 17;
 pub const SYS_PWRITE64: u64 = 18;
 pub const SYS_READV: u64 = 19;
@@ -295,6 +296,10 @@ pub const SYS_SETNS: u64 = 308;
 pub const SYS_GETCPU: u64 = 309;
 pub const SYS_GETRANDOM: u64 = 318;
 pub const SYS_MLOCK2: u64 = 325;
+pub const SYS_SENDFILE: u64 = 40;
+pub const SYS_SPLICE: u64 = 275;
+pub const SYS_TEE: u64 = 276;
+pub const SYS_VMSPLICE: u64 = 278;
 
 // arch_prctl operation codes
 pub const ARCH_SET_GS: i32 = 0x1001;
@@ -371,6 +376,11 @@ pub fn sys_getdents64(fd: u64, dirp: *mut u8, count: u64) -> i64 {
 #[inline(always)]
 pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
     unsafe { syscall3!(SYS_FCNTL, fd, cmd, arg) }
+}
+
+#[inline(always)]
+pub fn sys_ioctl(fd: i32, request: u64, arg: u64) -> i64 {
+    unsafe { syscall3!(SYS_IOCTL, fd, request, arg) }
 }
 
 #[inline(always)]
@@ -1070,4 +1080,26 @@ pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
 #[inline(always)]
 pub fn sys_set_tid_address(tidptr: *mut i32) -> i64 {
     unsafe { syscall1!(SYS_SET_TID_ADDRESS, tidptr) }
+}
+
+// --- Splice / Sendfile ---
+
+#[inline(always)]
+pub fn sys_sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> i64 {
+    unsafe { syscall4!(SYS_SENDFILE, out_fd, in_fd, offset, count) }
+}
+
+#[inline(always)]
+pub fn sys_splice(fd_in: i32, off_in: *mut i64, fd_out: i32, off_out: *mut i64, len: usize, flags: u32) -> i64 {
+    unsafe { syscall6!(SYS_SPLICE, fd_in, off_in, fd_out, off_out, len, flags) }
+}
+
+#[inline(always)]
+pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
+    unsafe { syscall4!(SYS_TEE, fd_in, fd_out, len, flags) }
+}
+
+#[inline(always)]
+pub fn sys_vmsplice(fd: i32, iov: *const super::IoVec, nr_segs: usize, flags: u32) -> i64 {
+    unsafe { syscall4!(SYS_VMSPLICE, fd, iov, nr_segs, flags) }
 }

@@ -261,6 +261,7 @@ pub const SYS_GETRANDOM: u64 = 278;
 
 // File control
 pub const SYS_FCNTL: u64 = 25;
+pub const SYS_IOCTL: u64 = 29;
 
 // I/O priority syscalls
 pub const SYS_IOPRIO_SET: u64 = 30;
@@ -314,6 +315,10 @@ pub const SYS_SET_TID_ADDRESS: u64 = 96;
 pub const SYS_FUTEX: u64 = 98;
 pub const SYS_SET_ROBUST_LIST: u64 = 99;
 pub const SYS_GET_ROBUST_LIST: u64 = 100;
+pub const SYS_SENDFILE: u64 = 71;
+pub const SYS_VMSPLICE: u64 = 75;
+pub const SYS_SPLICE: u64 = 76;
+pub const SYS_TEE: u64 = 77;
 
 // ============================================================================
 // Syscall wrapper functions
@@ -1056,6 +1061,12 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
     unsafe { syscall3!(SYS_FCNTL, fd, cmd, arg) }
 }
 
+/// ioctl(fd, request, arg) - device control operations
+#[inline(always)]
+pub fn sys_ioctl(fd: i32, request: u64, arg: u64) -> i64 {
+    unsafe { syscall3!(SYS_IOCTL, fd, request, arg) }
+}
+
 /// getrandom(buf, buflen, flags) - get random bytes
 #[inline(always)]
 pub fn sys_getrandom(buf: *mut u8, buflen: usize, flags: u32) -> i64 {
@@ -1334,4 +1345,30 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
 #[inline(always)]
 pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
     unsafe { syscall2!(SYS_IOPRIO_GET, which, who) }
+}
+
+// --- Splice / Sendfile ---
+
+/// sendfile(out_fd, in_fd, offset, count) - transfer data between file descriptors
+#[inline(always)]
+pub fn sys_sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> i64 {
+    unsafe { syscall4!(SYS_SENDFILE, out_fd, in_fd, offset, count) }
+}
+
+/// splice(fd_in, off_in, fd_out, off_out, len, flags) - splice data between fds
+#[inline(always)]
+pub fn sys_splice(fd_in: i32, off_in: *mut i64, fd_out: i32, off_out: *mut i64, len: usize, flags: u32) -> i64 {
+    unsafe { syscall6!(SYS_SPLICE, fd_in, off_in, fd_out, off_out, len, flags) }
+}
+
+/// tee(fd_in, fd_out, len, flags) - duplicate pipe content
+#[inline(always)]
+pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
+    unsafe { syscall4!(SYS_TEE, fd_in, fd_out, len, flags) }
+}
+
+/// vmsplice(fd, iov, nr_segs, flags) - splice user pages into a pipe
+#[inline(always)]
+pub fn sys_vmsplice(fd: i32, iov: *const super::IoVec, nr_segs: usize, flags: u32) -> i64 {
+    unsafe { syscall4!(SYS_VMSPLICE, fd, iov, nr_segs, flags) }
 }

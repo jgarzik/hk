@@ -126,15 +126,15 @@ linasm.sourceforge.net
 
 2.3 Special I/O helpers
 
-- [ ] sendfile
+- [x] sendfile
 
-- [ ] splice
+- [x] splice
 
-- [ ] tee
+- [x] tee
 
-- [ ] vmsplice
+- [x] vmsplice
 
-- [ ] ioctl
+- [x] ioctl
 
 - [x] sync
 

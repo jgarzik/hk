@@ -61,6 +61,19 @@ pub const SYS_FSYNC: u64 = 82;
 pub const SYS_FDATASYNC: u64 = 83;
 pub const SYS_SYNCFS: u64 = 267;
 
+/// ioctl(fd, request, arg)
+pub const SYS_IOCTL: u64 = 29;
+
+// Splice/sendfile syscalls
+/// sendfile(out_fd, in_fd, offset, count)
+pub const SYS_SENDFILE: u64 = 71;
+/// vmsplice(fd, iov, nr_segs, flags)
+pub const SYS_VMSPLICE: u64 = 75;
+/// splice(fd_in, off_in, fd_out, off_out, len, flags)
+pub const SYS_SPLICE: u64 = 76;
+/// tee(fd_in, fd_out, len, flags)
+pub const SYS_TEE: u64 = 77;
+
 // UTS namespace syscalls
 pub const SYS_UNAME: u64 = 160;
 pub const SYS_SETHOSTNAME: u64 = 161;
@@ -273,15 +286,15 @@ pub fn aarch64_syscall_dispatch(
     arg2: u64,
     arg3: u64,
     arg4: u64,
-    _arg5: u64,
+    arg5: u64,
 ) -> u64 {
     use crate::fs::syscall::{
         sys_close, sys_dup3, sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fcntl,
-        sys_fdatasync, sys_fstatat, sys_fsync, sys_ftruncate, sys_getdents64, sys_linkat,
-        sys_lseek, sys_mkdirat, sys_mknodat, sys_mount, sys_openat, sys_pipe2, sys_ppoll,
-        sys_pread64, sys_preadv, sys_pselect6, sys_pwrite64, sys_pwritev, sys_read, sys_readlinkat,
-        sys_readv, sys_renameat, sys_symlinkat, sys_sync, sys_syncfs, sys_umask, sys_umount2,
-        sys_unlinkat, sys_utimensat, sys_write, sys_writev,
+        sys_fdatasync, sys_fstatat, sys_fsync, sys_ftruncate, sys_getdents64, sys_ioctl,
+        sys_linkat, sys_lseek, sys_mkdirat, sys_mknodat, sys_mount, sys_openat, sys_pipe2,
+        sys_ppoll, sys_pread64, sys_preadv, sys_pselect6, sys_pwrite64, sys_pwritev, sys_read,
+        sys_readlinkat, sys_readv, sys_renameat, sys_symlinkat, sys_sync, sys_syncfs, sys_umask,
+        sys_umount2, sys_unlinkat, sys_utimensat, sys_write, sys_writev,
     };
     use crate::task::exec::sys_execve;
     use crate::task::percpu;
@@ -312,7 +325,7 @@ pub fn aarch64_syscall_dispatch(
         SYS_FCNTL => sys_fcntl(arg0 as i32, arg1 as i32, arg2) as u64,
         SYS_PIPE2 => sys_pipe2(arg0, arg1 as u32) as u64,
         SYS_PPOLL => sys_ppoll(arg0, arg1 as u32, arg2, arg3, arg4) as u64,
-        SYS_PSELECT6 => sys_pselect6(arg0 as i32, arg1, arg2, arg3, arg4, _arg5) as u64,
+        SYS_PSELECT6 => sys_pselect6(arg0 as i32, arg1, arg2, arg3, arg4, arg5) as u64,
         SYS_GETDENTS64 => sys_getdents64(arg0 as i32, arg1, arg2) as u64,
 
         // Directory operations
@@ -350,6 +363,28 @@ pub fn aarch64_syscall_dispatch(
         SYS_FSYNC => sys_fsync(arg0 as i32) as u64,
         SYS_FDATASYNC => sys_fdatasync(arg0 as i32) as u64,
         SYS_SYNCFS => sys_syncfs(arg0 as i32) as u64,
+
+        // ioctl
+        SYS_IOCTL => sys_ioctl(arg0 as i32, arg1 as u32, arg2) as u64,
+
+        // splice/sendfile
+        SYS_SENDFILE => {
+            crate::fs::splice::sys_sendfile64(arg0 as i32, arg1 as i32, arg2, arg3 as usize) as u64
+        }
+        SYS_SPLICE => crate::fs::splice::sys_splice(
+            arg0 as i32,
+            arg1,
+            arg2 as i32,
+            arg3,
+            arg4 as usize,
+            arg5 as u32,
+        ) as u64,
+        SYS_TEE => {
+            crate::fs::splice::sys_tee(arg0 as i32, arg1 as i32, arg2 as usize, arg3 as u32) as u64
+        }
+        SYS_VMSPLICE => {
+            crate::fs::splice::sys_vmsplice(arg0 as i32, arg1, arg2 as usize, arg3 as u32) as u64
+        }
 
         // Process info syscalls
         SYS_GETPID => sys_getpid(percpu::current_pid()) as u64,
@@ -555,7 +590,7 @@ pub fn aarch64_syscall_dispatch(
 
         // Memory management syscalls
         SYS_MMAP => {
-            crate::mm::syscall::sys_mmap(arg0, arg1, arg2 as u32, arg3 as u32, arg4 as i32, _arg5)
+            crate::mm::syscall::sys_mmap(arg0, arg1, arg2 as u32, arg3 as u32, arg4 as i32, arg5)
                 as u64
         }
         SYS_MPROTECT => crate::mm::syscall::sys_mprotect(arg0, arg1, arg2 as u32) as u64,
@@ -639,16 +674,16 @@ pub fn aarch64_syscall_dispatch(
         }
         SYS_SENDTO => {
             use crate::net::syscall::sys_sendto;
-            sys_sendto(arg0 as i32, arg1, arg2, arg3 as i32, arg4, _arg5) as u64
+            sys_sendto(arg0 as i32, arg1, arg2, arg3 as i32, arg4, arg5) as u64
         }
         SYS_RECVFROM => {
             use crate::net::syscall::sys_recvfrom;
-            sys_recvfrom(arg0 as i32, arg1, arg2, arg3 as i32, arg4, _arg5) as u64
+            sys_recvfrom(arg0 as i32, arg1, arg2, arg3 as i32, arg4, arg5) as u64
         }
 
         // Futex syscalls
         SYS_FUTEX => {
-            crate::futex::sys_futex(arg0, arg1 as u32, arg2 as u32, arg3, arg4, _arg5 as u32) as u64
+            crate::futex::sys_futex(arg0, arg1 as u32, arg2 as u32, arg3, arg4, arg5 as u32) as u64
         }
         SYS_SET_ROBUST_LIST => crate::futex::sys_set_robust_list(arg0, arg1) as u64,
         SYS_GET_ROBUST_LIST => crate::futex::sys_get_robust_list(arg0 as i32, arg1, arg2) as u64,
