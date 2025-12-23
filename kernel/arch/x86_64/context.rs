@@ -187,6 +187,10 @@ pub extern "C" fn clone_child_entry() -> ! {
         // This is safe because we're still in kernel mode with kernel stack
         "mov cr3, rax",
 
+        // Write child TID if CLONE_CHILD_SETTID was used (for fork)
+        // Must be after CR3 switch since we're writing to child's address space
+        "call {write_child_tid}",
+
         // Get and load the child's TLS (FS base)
         // This handles CLONE_SETTLS - if no TLS was set, get_tls returns 0
         "call {get_tls}",
@@ -231,6 +235,7 @@ pub extern "C" fn clone_child_entry() -> ! {
 
         finish_switch = sym finish_context_switch,
         get_cr3 = sym crate::task::percpu::get_current_task_cr3,
+        write_child_tid = sym crate::task::percpu::write_child_tid_if_needed,
         get_tls = sym crate::task::percpu::get_current_task_tls,
     );
 }

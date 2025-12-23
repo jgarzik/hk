@@ -148,6 +148,10 @@ pub extern "C" fn clone_child_entry() -> ! {
         "dsb ish",
         "isb",
 
+        // Write child TID if CLONE_CHILD_SETTID was used (for fork)
+        // Must be after TTBR0 switch since we're writing to child's address space
+        "bl {write_child_tid}",
+
         // Get and load the child's TLS (TPIDR_EL0)
         // This handles CLONE_SETTLS - if no TLS was set, get_tls returns 0
         "bl {get_tls}",
@@ -205,6 +209,7 @@ pub extern "C" fn clone_child_entry() -> ! {
 
         finish_switch = sym finish_context_switch,
         get_ttbr0 = sym crate::task::percpu::get_current_task_cr3,
+        write_child_tid = sym crate::task::percpu::write_child_tid_if_needed,
         get_tls = sym crate::task::percpu::get_current_task_tls,
     );
 }

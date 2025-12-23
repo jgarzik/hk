@@ -956,17 +956,19 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Handle CLONE_CHILD_SETTID: write child TID to child's address space
     // For threads (CLONE_VM set), parent and child share address space, so we can write now.
-    // For fork (CLONE_VM not set), we'd need to write using child's page table - skip for now.
+    // For fork (CLONE_VM not set), store for clone_child_entry to write in child's context.
     if config.flags & CLONE_CHILD_SETTID != 0 && config.child_tidptr != 0 {
-        use crate::arch::Uaccess;
-        use crate::uaccess::put_user;
         if config.flags & CLONE_VM != 0 {
             // Shared address space - write directly
+            use crate::arch::Uaccess;
+            use crate::uaccess::put_user;
             if put_user::<Uaccess, i32>(config.child_tidptr, child_tid as i32).is_err() {
                 printkln!("CLONE: CLONE_CHILD_SETTID write failed");
             }
+        } else {
+            // Separate address space (fork) - store for clone_child_entry to write
+            crate::task::set_set_child_tid(child_tid, config.child_tidptr);
         }
-        // Note: For fork without CLONE_VM, would need cross-address-space write
     }
 
     // Handle CLONE_CHILD_CLEARTID: store address to clear and wake on exit
@@ -1209,6 +1211,26 @@ pub extern "C" fn get_current_task_tls() -> u64 {
         return 0;
     }
     crate::task::get_task_tls(tid).unwrap_or(0)
+}
+
+/// Write the child TID for CLONE_CHILD_SETTID (called from clone_child_entry)
+///
+/// This is called in the child's context after its page table is loaded,
+/// specifically for fork (non-CLONE_VM) where we couldn't write at clone time.
+/// For threads (CLONE_VM), the TID was already written in do_clone().
+#[unsafe(no_mangle)]
+pub extern "C" fn write_child_tid_if_needed() {
+    let tid = current_tid();
+    if tid == 0 {
+        return;
+    }
+    if let Some(addr) = crate::task::get_set_child_tid(tid) {
+        use crate::arch::Uaccess;
+        use crate::uaccess::put_user;
+        if put_user::<Uaccess, i32>(addr, tid as i32).is_err() {
+            printkln!("CLONE: CLONE_CHILD_SETTID write failed in child");
+        }
+    }
 }
 
 /// Put current task to sleep until the specified tick

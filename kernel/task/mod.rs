@@ -919,3 +919,26 @@ pub fn set_clear_child_tid(tid: Tid, addr: u64) {
 pub fn remove_clear_child_tid(tid: Tid) {
     TASK_CLEAR_CHILD_TID.lock().remove(&tid);
 }
+
+// =============================================================================
+// Per-task set_child_tid pointer (for CLONE_CHILD_SETTID on fork)
+// =============================================================================
+
+/// Per-task set_child_tid pointer mapping
+///
+/// Maps TID to the address where we should write the child TID on first schedule.
+/// This is used by CLONE_CHILD_SETTID when CLONE_VM is not set (fork case).
+/// The address is consumed (removed) when read, as it's a one-time operation.
+static TASK_SET_CHILD_TID: Mutex<BTreeMap<Tid, u64>> = Mutex::new(BTreeMap::new());
+
+/// Get and remove the set_child_tid pointer for a task (one-time use)
+pub fn get_set_child_tid(tid: Tid) -> Option<u64> {
+    TASK_SET_CHILD_TID.lock().remove(&tid)
+}
+
+/// Set the set_child_tid pointer for a task
+pub fn set_set_child_tid(tid: Tid, addr: u64) {
+    if addr != 0 {
+        TASK_SET_CHILD_TID.lock().insert(tid, addr);
+    }
+}

@@ -30,9 +30,9 @@ The `clone()` syscall creates a new process or thread. It is the fundamental bui
 | Flag | Value | Purpose | Status |
 |------|-------|---------|--------|
 | CLONE_PARENT_SETTID | 0x00100000 | Write child TID to parent's address | Implemented |
-| CLONE_CHILD_SETTID | 0x01000000 | Write child TID to child's address | Implemented (threads only) |
+| CLONE_CHILD_SETTID | 0x01000000 | Write child TID to child's address | Implemented |
 | CLONE_CHILD_CLEARTID | 0x00200000 | Clear TID + futex wake on exit | Implemented |
-| CLONE_SETTLS | 0x00080000 | Set thread-local storage | Deferred (arch-specific) |
+| CLONE_SETTLS | 0x00080000 | Set thread-local storage | Implemented |
 
 ### Namespace Flags
 
@@ -110,7 +110,9 @@ Each task has its own FD table, managed via `TASK_FD` global mapping.
 ### TID Pointer Operations
 
 - **CLONE_PARENT_SETTID**: At clone time, writes child TID to `parent_tidptr` in parent's address space
-- **CLONE_CHILD_SETTID**: At clone time, writes child TID to `child_tidptr` in child's address space
+- **CLONE_CHILD_SETTID**: Writes child TID to `child_tidptr` in child's address space
+  - For threads (CLONE_VM): Written at clone time (shared address space)
+  - For fork (no CLONE_VM): Written in `clone_child_entry` after child's page table is loaded
 - **CLONE_CHILD_CLEARTID**: On exit, writes 0 to stored address and calls futex_wake to notify pthread_join waiters
 
 ### VFORK Blocking
@@ -165,27 +167,39 @@ Shares I/O context (ioprio) between parent and child:
 - **ioprio_get/ioprio_set syscalls**: Get/set I/O scheduling priority
 - **clone_task_io()**: Shares or copies IoContext based on flag
 
+### CLONE_SETTLS Support
+
+Sets thread-local storage (TLS) pointer for the new task:
+- **x86_64**: TLS value stored in FS base register (MSR 0xC0000100)
+- **aarch64**: TLS value stored in TPIDR_EL0 register
+
+Implementation follows Linux kernel's arm64 pattern:
+- TLS save/restore handled in Rust context switch wrappers (not assembly)
+- On context switch: save prev task's TLS to storage, load next task's TLS from storage
+- Assembly `switch_to.S` is pure register save/restore with no function calls
+- `clone_child_entry` loads child's TLS before returning to usermode
+
+TLS storage:
+- Per-task TLS values stored in `TASK_TLS` global table
+- `set_task_tls(tid, value)` / `get_task_tls(tid)` API
+- Context switch uses `current_tid()` to identify prev task
+
 Related syscalls:
 - **unshare(2)**: Disassociate from current namespaces (implemented)
 - **setns(2)**: Join existing namespace via fd (implemented)
 
 ## Future Work
 
-### Tier 1: TLS Support (CLONE_SETTLS)
-- Architecture-specific thread-local storage
-- FS/GS base registers (x86_64)
-- TPIDR register (aarch64)
-
-### Tier 2: Remaining Namespaces
+### Tier 1: Remaining Namespaces
 - **CLONE_NEWNS**: Full mount isolation (per-namespace mount tree)
 - **CLONE_NEWNET**: Network namespace isolation
 - **CLONE_NEWCGROUP**: Cgroup namespace (requires cgroup support)
 
-### Tier 3: Modern Features
+### Tier 2: Modern Features
 - CLONE_PIDFD for pidfd-based process tracking
 - clone3() syscall with extensible struct
 
-### Tier 4: Debugging/Tracing
+### Tier 3: Debugging/Tracing
 - CLONE_PTRACE for ptrace continuation in child
 - CLONE_UNTRACED to prevent forced tracing
 
@@ -204,9 +218,13 @@ Related syscalls:
 - Linux clone(2) man page
 - Linux clone3(2) man page
 - Linux namespaces(7) man page
-- kernel/task/mod.rs - Clone flag definitions, IoContext
-- kernel/task/percpu.rs - do_clone() implementation
+- kernel/task/mod.rs - Clone flag definitions, IoContext, TASK_TLS storage
+- kernel/task/percpu.rs - do_clone() implementation, get_current_task_tls()
 - kernel/task/syscall.rs - ioprio_get/ioprio_set syscalls
+- kernel/arch/x86_64/context.rs - Context switch with TLS handling (FS base)
+- kernel/arch/x86_64/switch_to.S - Pure-asm register save/restore
+- kernel/arch/aarch64/context.rs - Context switch with TLS handling (TPIDR_EL0)
+- kernel/arch/aarch64/switch_to.S - Pure-asm register save/restore
 - kernel/ns/mod.rs - Namespace proxy and syscalls (unshare, setns)
 - kernel/ns/uts.rs - UTS namespace implementation
 - kernel/ns/pid.rs - PID namespace implementation
