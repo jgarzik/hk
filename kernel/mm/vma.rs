@@ -33,6 +33,14 @@ pub const MAP_EXECUTABLE: u32 = 0x1000;
 /// MAP_LOCKED - lock pages in memory (Linux mman.h value)
 /// Note: Same value as VM_LOCKED (0x2000) - Linux uses calc_vm_flag_bits() for identity mapping
 pub const MAP_LOCKED: u32 = 0x2000;
+/// MAP_POPULATE - prefault page tables (populate pages immediately after mmap)
+pub const MAP_POPULATE: u32 = 0x8000;
+/// MAP_NONBLOCK - don't block on I/O when used with MAP_POPULATE
+/// When combined with MAP_POPULATE, the populate step is skipped
+pub const MAP_NONBLOCK: u32 = 0x10000;
+/// MAP_STACK - hint for stack allocation (no-op in hk, no THP support)
+/// Linux uses this to set VM_NOHUGEPAGE when transparent huge pages are enabled
+pub const MAP_STACK: u32 = 0x20000;
 
 /// Return value for failed mmap
 pub const MAP_FAILED: i64 = -1;

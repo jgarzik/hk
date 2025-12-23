@@ -315,6 +315,12 @@ pub const MAP_GROWSDOWN: u32 = 0x0100;
 pub const MAP_DENYWRITE: u32 = 0x0800;
 pub const MAP_EXECUTABLE: u32 = 0x1000;
 pub const MAP_LOCKED: u32 = 0x2000;
+/// Prefault page tables (populate pages immediately after mmap)
+pub const MAP_POPULATE: u32 = 0x8000;
+/// Don't block on I/O when used with MAP_POPULATE (skips populate)
+pub const MAP_NONBLOCK: u32 = 0x10000;
+/// Stack allocation hint (no-op on systems without THP)
+pub const MAP_STACK: u32 = 0x20000;
 
 // mlock2 flags
 pub const MLOCK_ONFAULT: i32 = 0x01;

@@ -10,9 +10,10 @@ use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
 use super::{
-    MAP_ANONYMOUS, MAP_FIXED, MAP_GROWSDOWN, MAP_LOCKED, MAP_PRIVATE, MAP_SHARED, PAGE_SIZE,
-    PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, VM_GROWSDOWN, VM_LOCKED, VM_LOCKED_MASK,
-    VM_LOCKONFAULT, VM_SHARED, Vma, create_default_mm, get_task_mm, init_task_mm,
+    MAP_ANONYMOUS, MAP_FIXED, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE,
+    MAP_SHARED, PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, VM_GROWSDOWN,
+    VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_SHARED, Vma, create_default_mm, get_task_mm,
+    init_task_mm,
 };
 
 // Error codes (negative errno)
@@ -218,9 +219,15 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     // Update total_vm for RLIMIT_AS tracking
     mm_guard.add_total_vm(length / PAGE_SIZE);
 
-    // Populate pages if locked (MAP_LOCKED or MCL_FUTURE without ONFAULT)
-    // Linux: do_mmap() sets *populate = len if VM_LOCKED is set
-    let should_populate = is_map_locked || (def_flags != 0 && (def_flags & VM_LOCKONFAULT == 0));
+    // Populate pages if:
+    // 1. MAP_LOCKED is set, or
+    // 2. MCL_FUTURE was set via mlockall (def_flags without ONFAULT), or
+    // 3. MAP_POPULATE is set without MAP_NONBLOCK
+    // Linux: do_mmap() sets *populate = len if VM_LOCKED or (MAP_POPULATE && !MAP_NONBLOCK)
+    let should_populate_for_map_populate = (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE;
+    let should_populate = is_map_locked
+        || (def_flags != 0 && (def_flags & VM_LOCKONFAULT == 0))
+        || should_populate_for_map_populate;
 
     // Release lock before potential page faults
     drop(mm_guard);
@@ -583,25 +590,206 @@ fn can_do_mlock() -> bool {
     crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK) > 0
 }
 
-/// Populate pages in a range by triggering demand paging.
+/// Populate pages in a range by prefaulting them into memory
 ///
-/// This is the hk equivalent of Linux's mm_populate().
-/// It walks through the address range and reads each page to trigger
-/// the page fault handler, which will allocate and map the pages.
-/// Populate pages by faulting them into memory
+/// This is the hk equivalent of Linux's mm_populate(). It walks through
+/// the address range page by page, allocating physical frames and mapping
+/// them into the process's address space.
 ///
-/// This function is a no-op for now because:
-/// 1. The kernel has no swap, so pages will be faulted in on demand anyway
-/// 2. Direct user memory access from kernel context requires proper uaccess
-///    handling and page fault tolerance that isn't fully implemented yet
-///
-/// TODO: Implement proper page population using get_user_pages() or similar
-/// when swap support is added.
-#[allow(unused_variables)]
+/// Used by:
+/// - MAP_POPULATE to prefault pages after mmap
+/// - MAP_LOCKED to lock pages in memory
+/// - mlock/mlockall to lock existing mappings
 fn populate_range(start: u64, len: u64) {
-    // Currently a no-op - pages will be demand-paged on first access
-    // from userspace. When swap is implemented, this should prefault
-    // the pages to lock them in memory.
+    if len == 0 {
+        return;
+    }
+
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return,
+    };
+
+    let end = start.saturating_add(len);
+    let mut addr = start & !(PAGE_SIZE - 1); // Page align down
+
+    while addr < end {
+        // Lock mm for VMA lookup
+        let mm_guard = mm.lock();
+
+        let vma = match mm_guard.find_vma(addr) {
+            Some(v) => v,
+            None => {
+                // No VMA at this address, skip to next page
+                drop(mm_guard);
+                addr += PAGE_SIZE;
+                continue;
+            }
+        };
+
+        // Skip if not accessible (PROT_NONE)
+        if vma.prot == super::PROT_NONE {
+            drop(mm_guard);
+            addr += PAGE_SIZE;
+            continue;
+        }
+
+        // Clone VMA info we need before dropping lock
+        let vma_prot = vma.prot;
+        let vma_is_anonymous = vma.is_anonymous();
+        let vma_file = vma.file.clone();
+        let vma_start = vma.start;
+        let vma_offset = vma.offset;
+        let vma_end = vma.end;
+        drop(mm_guard);
+
+        // Populate this page
+        populate_page(
+            addr,
+            vma_prot,
+            vma_is_anonymous,
+            vma_file,
+            vma_start,
+            vma_offset,
+        );
+
+        addr += PAGE_SIZE;
+
+        // Stop at VMA end - next iteration will find next VMA if any
+        if addr >= vma_end {
+            continue;
+        }
+    }
+}
+
+/// Populate a single page by allocating a frame and mapping it
+fn populate_page(
+    addr: u64,
+    prot: u32,
+    is_anonymous: bool,
+    file: Option<Arc<File>>,
+    vma_start: u64,
+    vma_offset: u64,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::FRAME_ALLOCATOR;
+        use crate::arch::x86_64::paging::{
+            PAGE_NO_EXECUTE, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE, X86_64PageTable,
+        };
+
+        let cr3: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+        }
+
+        // Check if already mapped
+        if X86_64PageTable::translate_with_root(cr3, addr).is_some() {
+            return; // Already mapped
+        }
+
+        // Allocate frame
+        let frame = match FRAME_ALLOCATOR.alloc() {
+            Some(f) => f,
+            None => return, // OOM, silently fail (Linux behavior for populate)
+        };
+
+        // Initialize page contents
+        if is_anonymous {
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            }
+        } else if let Some(f) = file {
+            // File-backed: read from file
+            let file_offset = vma_offset + (addr - vma_start);
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            }
+            let buf =
+                unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE as usize) };
+            let _ = f.pread(buf, file_offset);
+        } else {
+            // No file, zero-fill
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            }
+        }
+
+        // Build page flags
+        let mut flags = PAGE_PRESENT | PAGE_USER;
+        if prot & PROT_WRITE != 0 {
+            flags |= PAGE_WRITABLE;
+        }
+        if prot & super::PROT_EXEC == 0 {
+            flags |= PAGE_NO_EXECUTE;
+        }
+
+        // Map the page using map_user_page from interrupts module
+        if crate::arch::x86_64::interrupts::map_user_page(cr3, addr, frame, flags).is_err() {
+            FRAME_ALLOCATOR.free(frame);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::FRAME_ALLOCATOR;
+        use crate::arch::aarch64::paging::{
+            AF, AP_EL0_RO, AP_EL0_RW, ATTR_IDX_NORMAL, Aarch64PageTable, PXN, SH_INNER, UXN,
+        };
+
+        let ttbr0: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack));
+        }
+        let pt_phys = ttbr0 & !0xFFF;
+
+        // Check if already mapped
+        if Aarch64PageTable::translate_with_root(pt_phys, addr).is_some() {
+            return; // Already mapped
+        }
+
+        // Allocate frame
+        let frame = match FRAME_ALLOCATOR.alloc() {
+            Some(f) => f,
+            None => return, // OOM, silently fail
+        };
+
+        // Initialize page contents
+        if is_anonymous {
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            }
+        } else if let Some(f) = file {
+            let file_offset = vma_offset + (addr - vma_start);
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            }
+            let buf =
+                unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE as usize) };
+            let _ = f.pread(buf, file_offset);
+        } else {
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            }
+        }
+
+        // Build page attributes
+        let mut attrs = AF | SH_INNER | ATTR_IDX_NORMAL;
+        if prot & PROT_WRITE != 0 {
+            attrs |= AP_EL0_RW;
+        } else {
+            attrs |= AP_EL0_RO;
+        }
+        if prot & super::PROT_EXEC == 0 {
+            attrs |= PXN | UXN;
+        }
+
+        // Map the page
+        if crate::arch::aarch64::exceptions::map_user_page(pt_phys, addr, frame, attrs).is_err() {
+            FRAME_ALLOCATOR.free(frame);
+        }
+    }
 }
 
 /// mlock syscall - Lock pages in memory

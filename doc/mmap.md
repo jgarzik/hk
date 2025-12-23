@@ -65,11 +65,11 @@ int munmap(void *addr, size_t length);
 | MAP_GROWSDOWN | 0x100 | Stack-like segment growth | Implemented |
 | MAP_DENYWRITE | 0x0800 | ETXTBSY (deprecated) | Implemented (ignored per Linux) |
 | MAP_EXECUTABLE | 0x1000 | Mark executable (deprecated) | Implemented (ignored per Linux) |
-| MAP_LOCKED | 0x2000 | Lock pages in memory | Implemented (no prefault) |
+| MAP_LOCKED | 0x2000 | Lock pages in memory | Implemented |
 | MAP_NORESERVE | 0x4000 | Don't reserve swap | Not implemented |
-| MAP_POPULATE | 0x8000 | Prefault pages | Not implemented |
-| MAP_NONBLOCK | 0x10000 | Non-blocking with MAP_POPULATE | Not implemented |
-| MAP_STACK | 0x20000 | Stack allocation hint | Not implemented |
+| MAP_POPULATE | 0x8000 | Prefault pages | Implemented |
+| MAP_NONBLOCK | 0x10000 | Non-blocking with MAP_POPULATE | Implemented |
+| MAP_STACK | 0x20000 | Stack allocation hint | Implemented (no-op, no THP) |
 | MAP_HUGETLB | 0x40000 | Use huge pages | Not implemented |
 | MAP_SYNC | 0x80000 | Synchronous page faults (DAX) | Not implemented |
 | MAP_FIXED_NOREPLACE | 0x100000 | MAP_FIXED without unmapping | Not implemented |
@@ -273,13 +273,9 @@ Changes the protection flags for pages in the specified range. The range must be
 
 Current limitations in the implementation:
 
-1. **populate_range() is a no-op** - MAP_LOCKED sets VM_LOCKED flag but doesn't prefault pages; they are still demand-paged on first access.
+1. **No VMA merging** - Adjacent VMAs with compatible flags are not merged. Linux has sophisticated merge logic (`vma_merge()`) for efficiency.
 
-2. **No VMA merging** - Adjacent VMAs with compatible flags are not merged. Linux has sophisticated merge logic (`vma_merge()`) for efficiency.
-
-3. **No VMA splitting** - mprotect on a partial VMA region updates the entire VMA's protection; a full implementation would split the VMA.
-
-4. **No page population** - MAP_POPULATE flag not supported; pages always demand-faulted.
+2. **No VMA splitting** - mprotect on a partial VMA region updates the entire VMA's protection; a full implementation would split the VMA.
 
 ## Future Work
 
@@ -289,6 +285,9 @@ Current limitations in the implementation:
 - ~~**File-backed mapping I/O** - Read file contents on demand fault~~ ✓
 - ~~**MAP_GROWSDOWN** - Stack-like growth for guard pages~~ ✓
 - ~~**PROT_GROWSDOWN/PROT_GROWSUP** - mprotect growth extensions~~ ✓
+- ~~**MAP_POPULATE** - Prefault pages to avoid later faults~~ ✓
+- ~~**MAP_NONBLOCK** - Skip populate when combined with MAP_POPULATE~~ ✓
+- ~~**MAP_STACK** - Stack allocation hint (no-op, no THP)~~ ✓
 
 ### Tier 2: Common Features
 - **madvise()** - Memory hints (MADV_DONTNEED for memory release)
@@ -297,13 +296,10 @@ Current limitations in the implementation:
 - **MAP_FIXED_NOREPLACE** - Safer MAP_FIXED that fails on overlap
 
 ### Tier 3: Optimization
-- **MAP_POPULATE** - Prefault pages to avoid later faults
 - **VMA merging** - Merge adjacent compatible VMAs
-- **populate_range()** - Actually prefault pages for MAP_LOCKED
 
 ### Tier 4: Advanced Features
 - **MAP_HUGETLB** - Huge page support (requires arch TLB support)
-- **MAP_STACK** - Stack allocation hints
 - **mincore()** - Query which pages are resident
 
 ## File Locations

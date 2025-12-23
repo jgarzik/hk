@@ -12,7 +12,7 @@ use crate::syscall::{
     sys_mmap, sys_mprotect, sys_munmap, sys_mlock, sys_mlock2, sys_munlock,
     sys_mlockall, sys_munlockall,
     MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_GROWSDOWN, MAP_LOCKED,
-    MAP_PRIVATE, MAP_SHARED,
+    MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK,
     PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, PROT_EXEC,
     MLOCK_ONFAULT, MCL_CURRENT, MCL_ONFAULT,
 };
@@ -48,6 +48,11 @@ pub fn run_tests() {
     test_mlockall_current();
     test_mlockall_invalid_flags();
     test_munlockall();
+    // MAP_POPULATE, MAP_NONBLOCK, MAP_STACK tests
+    test_mmap_populate();
+    test_mmap_populate_nonblock();
+    test_mmap_nonblock_alone();
+    test_mmap_stack();
 }
 
 /// Test: Basic anonymous mmap
@@ -903,4 +908,155 @@ fn test_mprotect_grows_both_fails() {
 
     sys_munmap(ptr as u64, 4096);
     println(b"MPROTECT_GROWS_BOTH:OK");
+}
+
+// ============================================================================
+// MAP_POPULATE, MAP_NONBLOCK, MAP_STACK tests
+// ============================================================================
+
+/// Test: MAP_POPULATE prefaults pages immediately
+fn test_mmap_populate() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MMAP_POPULATE:FAIL errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Page should already be mapped - write should not need to fault
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0xDEADBEEF);
+    }
+
+    let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
+    if val != 0xDEADBEEF {
+        print(b"MMAP_POPULATE:FAIL value mismatch got ");
+        print_num(val as i64);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MMAP_POPULATE:OK");
+}
+
+/// Test: MAP_POPULATE | MAP_NONBLOCK - populate is skipped (non-blocking)
+fn test_mmap_populate_nonblock() {
+    // When both flags are set, populate is skipped (Linux behavior)
+    // Mapping should still succeed, pages demand-faulted instead
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE | MAP_NONBLOCK,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MMAP_POPULATE_NONBLOCK:FAIL errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Should still work via demand paging
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0xCAFEBABE);
+    }
+
+    let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
+    if val != 0xCAFEBABE {
+        print(b"MMAP_POPULATE_NONBLOCK:FAIL value mismatch got ");
+        print_num(val as i64);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MMAP_POPULATE_NONBLOCK:OK");
+}
+
+/// Test: MAP_NONBLOCK alone is accepted (no-op without MAP_POPULATE)
+fn test_mmap_nonblock_alone() {
+    // MAP_NONBLOCK alone should be silently accepted
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NONBLOCK,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MMAP_NONBLOCK_ALONE:FAIL errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Verify mapping works
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0x12345678);
+    }
+
+    let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
+    if val != 0x12345678 {
+        print(b"MMAP_NONBLOCK_ALONE:FAIL value mismatch got ");
+        print_num(val as i64);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MMAP_NONBLOCK_ALONE:OK");
+}
+
+/// Test: MAP_STACK hint flag is accepted (no-op on systems without THP)
+fn test_mmap_stack() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MMAP_STACK:FAIL errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Verify mapping works normally (flag is just a hint)
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0x57ACE000);
+    }
+
+    let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
+    if val != 0x57ACE000 {
+        print(b"MMAP_STACK:FAIL value mismatch got ");
+        print_num(val as i64);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MMAP_STACK:OK");
 }
