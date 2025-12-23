@@ -50,20 +50,30 @@ int munmap(void *addr, size_t length);
 | PROT_READ | 0x1 | Read permission | Implemented |
 | PROT_WRITE | 0x2 | Write permission | Implemented |
 | PROT_EXEC | 0x4 | Execute permission | Implemented |
+| PROT_SEM | 0x8 | Atomic ops support | Not implemented |
+| PROT_GROWSDOWN | 0x01000000 | mprotect: extend to growsdown VMA | Not implemented |
+| PROT_GROWSUP | 0x02000000 | mprotect: extend to growsup VMA | Not implemented |
 
 ## Mapping Flags (MAP_*)
 
 | Flag | Value | Description | Status |
 |------|-------|-------------|--------|
-| MAP_SHARED | 0x01 | Share with other processes | Not implemented |
+| MAP_SHARED | 0x01 | Share with other processes | Not implemented (returns EINVAL) |
 | MAP_PRIVATE | 0x02 | Private copy-on-write | Implemented |
 | MAP_FIXED | 0x10 | Use exact address | Implemented |
 | MAP_ANONYMOUS | 0x20 | No file backing | Implemented |
-| MAP_GROWSDOWN | 0x100 | Stack-like growth | Not implemented |
-| MAP_LOCKED | 0x2000 | Lock pages in memory | Implemented |
+| MAP_GROWSDOWN | 0x100 | Stack-like segment growth | Not implemented |
+| MAP_DENYWRITE | 0x0800 | ETXTBSY (deprecated) | Not implemented (ignored by Linux) |
+| MAP_EXECUTABLE | 0x1000 | Mark executable (deprecated) | Not implemented (ignored by Linux) |
+| MAP_LOCKED | 0x2000 | Lock pages in memory | Implemented (no prefault) |
 | MAP_NORESERVE | 0x4000 | Don't reserve swap | Not implemented |
 | MAP_POPULATE | 0x8000 | Prefault pages | Not implemented |
+| MAP_NONBLOCK | 0x10000 | Non-blocking with MAP_POPULATE | Not implemented |
+| MAP_STACK | 0x20000 | Stack allocation hint | Not implemented |
 | MAP_HUGETLB | 0x40000 | Use huge pages | Not implemented |
+| MAP_SYNC | 0x80000 | Synchronous page faults (DAX) | Not implemented |
+| MAP_FIXED_NOREPLACE | 0x100000 | MAP_FIXED without unmapping | Not implemented |
+| MAP_UNINITIALIZED | 0x4000000 | Skip zero-fill (embedded only) | Not implemented |
 
 ## Implementation Architecture
 
@@ -232,27 +242,51 @@ int munlockall(void);
 | EBADF | -9 | Bad file descriptor |
 | ENODEV | -19 | File doesn't support mmap |
 
+## Missing Syscalls
+
+| Syscall | Priority | Description |
+|---------|----------|-------------|
+| mprotect | High | Change VMA protection on existing mappings |
+| madvise | Medium | Memory usage hints (MADV_DONTNEED widely used) |
+| mremap | Medium | Resize/move existing mappings |
+| msync | Medium | Sync file-backed mappings to disk |
+| mincore | Low | Query page residency status |
+
+## Implementation Notes
+
+Current limitations in the implementation:
+
+1. **populate_range() is a no-op** - MAP_LOCKED sets VM_LOCKED flag but doesn't prefault pages; they are still demand-paged on first access.
+
+2. **No VMA merging** - Adjacent VMAs with compatible flags are not merged. Linux has sophisticated merge logic (`vma_merge()`) for efficiency.
+
+3. **File-backed mappings incomplete** - VMA stores file reference but page fault handler zero-fills instead of reading from file.
+
+4. **No page population** - MAP_POPULATE flag not supported; pages always demand-faulted.
+
 ## Future Work
 
-### Tier 1: File-Backed Mappings
-- Read file contents on demand fault
-- Handle truncated files (SIGBUS)
-- mmap() with actual file descriptors
+### Tier 1: Core Functionality
+- **mprotect()** - Change protection on existing mappings (widely used)
+- **MAP_SHARED** - Shared memory between processes (needed for IPC)
+- **File-backed mapping I/O** - Read file contents on demand fault
 
-### Tier 2: Shared Mappings (MAP_SHARED)
-- Multiple processes share same physical pages
-- Write visibility between processes
-- msync() for file writeback
+### Tier 2: Common Features
+- **madvise()** - Memory hints (MADV_DONTNEED for memory release)
+- **mremap()** - Resize/move mappings (used by realloc)
+- **msync()** - Sync file-backed mappings to disk
+- **MAP_FIXED_NOREPLACE** - Safer MAP_FIXED that fails on overlap
 
-### Tier 3: Memory Protection
-- mprotect() syscall
-- Change protection on existing mappings
+### Tier 3: Optimization
+- **MAP_POPULATE** - Prefault pages to avoid later faults
+- **VMA merging** - Merge adjacent compatible VMAs
+- **populate_range()** - Actually prefault pages for MAP_LOCKED
 
 ### Tier 4: Advanced Features
-- mremap() - Resize/move mappings
-- madvise() - Memory usage hints
-- MAP_POPULATE - Prefault pages
-- MAP_HUGETLB - Huge page support
+- **MAP_HUGETLB** - Huge page support (requires arch TLB support)
+- **MAP_GROWSDOWN** - Stack-like growth for guard pages
+- **MAP_STACK** - Stack allocation hints
+- **mincore()** - Query which pages are resident
 
 ## File Locations
 
