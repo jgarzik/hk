@@ -51,8 +51,8 @@ int munmap(void *addr, size_t length);
 | PROT_WRITE | 0x2 | Write permission | Implemented |
 | PROT_EXEC | 0x4 | Execute permission | Implemented |
 | PROT_SEM | 0x8 | Atomic ops support | Not implemented |
-| PROT_GROWSDOWN | 0x01000000 | mprotect: extend to growsdown VMA | Not implemented |
-| PROT_GROWSUP | 0x02000000 | mprotect: extend to growsup VMA | Not implemented |
+| PROT_GROWSDOWN | 0x01000000 | mprotect: extend to growsdown VMA start | Implemented |
+| PROT_GROWSUP | 0x02000000 | mprotect: extend to growsup VMA end | Implemented (always EINVAL on x86-64/aarch64) |
 
 ## Mapping Flags (MAP_*)
 
@@ -62,7 +62,7 @@ int munmap(void *addr, size_t length);
 | MAP_PRIVATE | 0x02 | Private copy-on-write | Implemented |
 | MAP_FIXED | 0x10 | Use exact address | Implemented |
 | MAP_ANONYMOUS | 0x20 | No file backing | Implemented |
-| MAP_GROWSDOWN | 0x100 | Stack-like segment growth | Not implemented |
+| MAP_GROWSDOWN | 0x100 | Stack-like segment growth | Implemented |
 | MAP_DENYWRITE | 0x0800 | ETXTBSY (deprecated) | Implemented (ignored per Linux) |
 | MAP_EXECUTABLE | 0x1000 | Mark executable (deprecated) | Implemented (ignored per Linux) |
 | MAP_LOCKED | 0x2000 | Lock pages in memory | Implemented (no prefault) |
@@ -287,6 +287,8 @@ Current limitations in the implementation:
 - ~~**mprotect()** - Change protection on existing mappings~~ ✓
 - ~~**MAP_SHARED** - Shared memory between processes~~ ✓
 - ~~**File-backed mapping I/O** - Read file contents on demand fault~~ ✓
+- ~~**MAP_GROWSDOWN** - Stack-like growth for guard pages~~ ✓
+- ~~**PROT_GROWSDOWN/PROT_GROWSUP** - mprotect growth extensions~~ ✓
 
 ### Tier 2: Common Features
 - **madvise()** - Memory hints (MADV_DONTNEED for memory release)
@@ -301,7 +303,6 @@ Current limitations in the implementation:
 
 ### Tier 4: Advanced Features
 - **MAP_HUGETLB** - Huge page support (requires arch TLB support)
-- **MAP_GROWSDOWN** - Stack-like growth for guard pages
 - **MAP_STACK** - Stack allocation hints
 - **mincore()** - Query which pages are resident
 

@@ -11,12 +11,19 @@ pub const PROT_NONE: u32 = 0;
 pub const PROT_READ: u32 = 1;
 pub const PROT_WRITE: u32 = 2;
 pub const PROT_EXEC: u32 = 4;
+/// PROT_GROWSDOWN - mprotect: extend change to start of growsdown VMA
+pub const PROT_GROWSDOWN: u32 = 0x0100_0000;
+/// PROT_GROWSUP - mprotect: extend change to end of growsup VMA
+/// Note: Always fails with EINVAL on x86-64/aarch64 (no VM_GROWSUP VMAs)
+pub const PROT_GROWSUP: u32 = 0x0200_0000;
 
 /// Map flags - Linux MAP_* values
 pub const MAP_SHARED: u32 = 0x01;
 pub const MAP_PRIVATE: u32 = 0x02;
 pub const MAP_FIXED: u32 = 0x10;
 pub const MAP_ANONYMOUS: u32 = 0x20;
+/// MAP_GROWSDOWN - stack-like segment that grows downward on page faults
+pub const MAP_GROWSDOWN: u32 = 0x0100;
 /// MAP_DENYWRITE - ignored for Linux ABI compatibility (deprecated)
 /// Linux kernel explicitly ignores this flag (see include/linux/mman.h)
 pub const MAP_DENYWRITE: u32 = 0x0800;
@@ -54,6 +61,10 @@ pub const VM_SHM: u32 = 0x0002_0000;
 /// This affects how page faults are handled - shared mappings
 /// share the same physical pages and writes are visible to all
 pub const VM_SHARED: u32 = 0x0004_0000;
+
+/// VMA can expand downward on page faults (stack-like growth)
+/// Set when MAP_GROWSDOWN is used during mmap
+pub const VM_GROWSDOWN: u32 = 0x0008_0000;
 
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
@@ -165,5 +176,11 @@ impl Vma {
     #[inline]
     pub fn is_lockonfault(&self) -> bool {
         self.flags & VM_LOCKONFAULT != 0
+    }
+
+    /// Check if this VMA can grow downward (stack-like)
+    #[inline]
+    pub fn is_growsdown(&self) -> bool {
+        self.flags & VM_GROWSDOWN != 0
     }
 }

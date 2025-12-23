@@ -11,8 +11,9 @@ use super::helpers::{print, println, print_num};
 use crate::syscall::{
     sys_mmap, sys_mprotect, sys_munmap, sys_mlock, sys_mlock2, sys_munlock,
     sys_mlockall, sys_munlockall,
-    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_LOCKED, MAP_PRIVATE, MAP_SHARED,
-    PROT_READ, PROT_WRITE, PROT_EXEC,
+    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_GROWSDOWN, MAP_LOCKED,
+    MAP_PRIVATE, MAP_SHARED,
+    PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, PROT_EXEC,
     MLOCK_ONFAULT, MCL_CURRENT, MCL_ONFAULT,
 };
 
@@ -33,6 +34,13 @@ pub fn run_tests() {
     test_mmap_denywrite();
     // MAP_EXECUTABLE tests (deprecated flag, should be accepted but ignored)
     test_mmap_executable();
+    // MAP_GROWSDOWN tests
+    test_mmap_growsdown_basic();
+    test_mmap_growsdown_expand();
+    // PROT_GROWSDOWN/PROT_GROWSUP tests
+    test_mprotect_growsdown();
+    test_mprotect_growsup_fails();
+    test_mprotect_grows_both_fails();
     // mlock tests
     test_mlock_basic();
     test_mlock2_onfault();
@@ -704,4 +712,195 @@ fn test_mmap_executable() {
 
     sys_munmap(ptr as u64, 4096);
     println(b"MMAP_EXECUTABLE:OK");
+}
+
+// ============================================================================
+// MAP_GROWSDOWN tests (stack-like downward expansion)
+// ============================================================================
+
+/// Test: MAP_GROWSDOWN basic - mmap with flag succeeds
+fn test_mmap_growsdown_basic() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MMAP_GROWSDOWN_BASIC:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Write to allocated page
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0xDEADBEEF);
+    }
+
+    let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
+    if val != 0xDEADBEEF {
+        print(b"MMAP_GROWSDOWN_BASIC:FAIL value=");
+        print_num(val as i64);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MMAP_GROWSDOWN_BASIC:OK");
+}
+
+/// Test: MAP_GROWSDOWN expansion - access below VMA expands it
+fn test_mmap_growsdown_expand() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MMAP_GROWSDOWN_EXPAND:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Write to original page
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0xAAAAAAAA);
+    }
+
+    // Access one page BELOW - should trigger stack expansion
+    let below = (ptr as u64).wrapping_sub(4096) as *mut u32;
+    unsafe {
+        core::ptr::write_volatile(below, 0xBBBBBBBB);
+    }
+
+    // Verify both pages work
+    let val1 = unsafe { core::ptr::read_volatile(ptr as *const u32) };
+    let val2 = unsafe { core::ptr::read_volatile(below as *const u32) };
+
+    if val1 != 0xAAAAAAAA || val2 != 0xBBBBBBBB {
+        print(b"MMAP_GROWSDOWN_EXPAND:FAIL val1=");
+        print_num(val1 as i64);
+        print(b" val2=");
+        print_num(val2 as i64);
+        println(b"");
+        sys_munmap((ptr as u64).wrapping_sub(4096), 8192);
+        return;
+    }
+
+    // Unmap expanded region (start at the lower address)
+    sys_munmap((ptr as u64).wrapping_sub(4096), 8192);
+    println(b"MMAP_GROWSDOWN_EXPAND:OK");
+}
+
+// ============================================================================
+// PROT_GROWSDOWN/PROT_GROWSUP tests
+// ============================================================================
+
+/// Test: PROT_GROWSDOWN extends mprotect to VMA start
+fn test_mprotect_growsdown() {
+    // Create a 2-page growsdown mapping
+    let ptr = sys_mmap(
+        0,
+        8192, // 2 pages
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MPROTECT_GROWSDOWN:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // mprotect upper page with PROT_GROWSDOWN - should extend to whole VMA
+    let result = sys_mprotect(ptr as u64 + 4096, 4096, PROT_READ | PROT_GROWSDOWN);
+    if result < 0 {
+        print(b"MPROTECT_GROWSDOWN:FAIL errno=");
+        print_num(-result);
+        println(b"");
+        sys_munmap(ptr as u64, 8192);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 8192);
+    println(b"MPROTECT_GROWSDOWN:OK");
+}
+
+/// Test: PROT_GROWSUP fails on non-growsup VMA (always on x86-64/aarch64)
+fn test_mprotect_growsup_fails() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MPROTECT_GROWSUP:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // PROT_GROWSUP should fail with EINVAL (no VM_GROWSUP on x86-64/aarch64)
+    let result = sys_mprotect(ptr as u64, 4096, PROT_READ | PROT_GROWSUP);
+    if result != -22 {
+        // EINVAL = 22
+        print(b"MPROTECT_GROWSUP:FAIL expected -22 got ");
+        print_num(result);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MPROTECT_GROWSUP:OK");
+}
+
+/// Test: PROT_GROWSDOWN | PROT_GROWSUP together fails
+fn test_mprotect_grows_both_fails() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MPROTECT_GROWS_BOTH:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Both flags together should fail with EINVAL
+    let result = sys_mprotect(ptr as u64, 4096, PROT_READ | PROT_GROWSDOWN | PROT_GROWSUP);
+    if result != -22 {
+        // EINVAL
+        print(b"MPROTECT_GROWS_BOTH:FAIL expected -22 got ");
+        print_num(result);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MPROTECT_GROWS_BOTH:OK");
 }

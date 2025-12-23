@@ -39,6 +39,10 @@ pub const MMAP_BASE: u64 = 0x0000_7F00_0000_0000;
 #[cfg(target_arch = "aarch64")]
 pub const MMAP_END: u64 = 0x0000_8000_0000_0000;
 
+/// Stack guard gap (256KB like Linux default)
+/// Prevents growsdown VMAs from expanding too close to adjacent VMAs
+pub const STACK_GUARD_GAP: u64 = 256 * 1024;
+
 /// Per-task memory descriptor
 ///
 /// Manages the virtual memory areas (VMAs) for a task's address space.
@@ -239,6 +243,65 @@ impl MmStruct {
     /// Get mutable iterator over all VMAs
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Vma> {
         self.vmas.iter_mut()
+    }
+
+    // ========================================================================
+    // Stack expansion (MAP_GROWSDOWN) support
+    // ========================================================================
+
+    /// Find index of a growsdown VMA that could expand to cover the given address
+    ///
+    /// Returns Some(index) if a VM_GROWSDOWN VMA exists just above `addr` and
+    /// the expansion wouldn't violate the stack guard gap.
+    pub fn find_expandable_vma(&self, addr: u64) -> Option<usize> {
+        for (i, vma) in self.vmas.iter().enumerate() {
+            // VMA must be growsdown and addr must be below it
+            if vma.is_growsdown() && addr < vma.start {
+                // Check stack guard gap against previous VMA
+                if i > 0 {
+                    let prev = &self.vmas[i - 1];
+                    if addr < prev.end.saturating_add(STACK_GUARD_GAP) {
+                        return None; // Would violate guard gap
+                    }
+                }
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Expand a growsdown VMA downward to include the given address
+    ///
+    /// Called during page fault handling when an access occurs below a
+    /// VM_GROWSDOWN VMA. The VMA's start address is extended downward.
+    pub fn expand_downwards(&mut self, vma_idx: usize, address: u64) -> Result<(), i32> {
+        const EFAULT: i32 = 14; // Bad address
+
+        let address = address & !0xFFF; // Page align down
+
+        if vma_idx >= self.vmas.len() {
+            return Err(EFAULT);
+        }
+
+        let vma = &mut self.vmas[vma_idx];
+        if address >= vma.start {
+            return Ok(()); // Already covered
+        }
+
+        if !vma.is_growsdown() {
+            return Err(EFAULT);
+        }
+
+        let grow_pages = (vma.start - address) >> 12;
+
+        // Update VMA
+        vma.start = address;
+        self.total_vm = self.total_vm.saturating_add(grow_pages);
+        if vma.is_locked() {
+            self.locked_vm = self.locked_vm.saturating_add(grow_pages);
+        }
+
+        Ok(())
     }
 }
 

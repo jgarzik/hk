@@ -300,12 +300,18 @@ pub const PROT_NONE: u32 = 0;
 pub const PROT_READ: u32 = 1;
 pub const PROT_WRITE: u32 = 2;
 pub const PROT_EXEC: u32 = 4;
+/// mprotect: extend change to start of growsdown VMA
+pub const PROT_GROWSDOWN: u32 = 0x0100_0000;
+/// mprotect: extend change to end of growsup VMA (always EINVAL on x86-64/aarch64)
+pub const PROT_GROWSUP: u32 = 0x0200_0000;
 
 // mmap flags
 pub const MAP_SHARED: u32 = 0x01;
 pub const MAP_PRIVATE: u32 = 0x02;
 pub const MAP_FIXED: u32 = 0x10;
 pub const MAP_ANONYMOUS: u32 = 0x20;
+/// Stack-like segment that grows downward on page faults
+pub const MAP_GROWSDOWN: u32 = 0x0100;
 pub const MAP_DENYWRITE: u32 = 0x0800;
 pub const MAP_EXECUTABLE: u32 = 0x1000;
 pub const MAP_LOCKED: u32 = 0x2000;

@@ -10,9 +10,9 @@ use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
 use super::{
-    MAP_ANONYMOUS, MAP_FIXED, MAP_LOCKED, MAP_PRIVATE, MAP_SHARED, PAGE_SIZE, PROT_READ,
-    PROT_WRITE, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_SHARED, Vma, create_default_mm,
-    get_task_mm, init_task_mm,
+    MAP_ANONYMOUS, MAP_FIXED, MAP_GROWSDOWN, MAP_LOCKED, MAP_PRIVATE, MAP_SHARED, PAGE_SIZE,
+    PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, VM_GROWSDOWN, VM_LOCKED, VM_LOCKED_MASK,
+    VM_LOCKONFAULT, VM_SHARED, Vma, create_default_mm, get_task_mm, init_task_mm,
 };
 
 // Error codes (negative errno)
@@ -155,6 +155,12 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     // Set VM_SHARED for shared mappings
     if is_shared {
         vma.flags |= VM_SHARED;
+    }
+
+    // Set VM_GROWSDOWN for stack-like mappings that grow downward
+    // Linux: calc_vm_flag_bits() translates MAP_GROWSDOWN to VM_GROWSDOWN
+    if flags & MAP_GROWSDOWN != 0 {
+        vma.flags |= VM_GROWSDOWN;
     }
 
     // Handle MAP_LOCKED flag - lock pages in memory
@@ -937,11 +943,21 @@ pub fn sys_munlockall() -> i64 {
 /// # Arguments
 /// * `addr` - Start address (must be page-aligned)
 /// * `len` - Length of region in bytes
-/// * `prot` - New protection flags (PROT_READ, PROT_WRITE, PROT_EXEC)
+/// * `prot` - New protection flags (PROT_READ, PROT_WRITE, PROT_EXEC).
+///   May include PROT_GROWSDOWN/PROT_GROWSUP to extend range.
 ///
 /// # Returns
 /// 0 on success, negative errno on failure
 pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
+    // Extract and strip grow flags (Linux behavior: mm/mprotect.c)
+    let grows = prot & (PROT_GROWSDOWN | PROT_GROWSUP);
+    let prot = prot & !(PROT_GROWSDOWN | PROT_GROWSUP);
+
+    // Can't specify both PROT_GROWSDOWN and PROT_GROWSUP
+    if grows == (PROT_GROWSDOWN | PROT_GROWSUP) {
+        return EINVAL;
+    }
+
     // Zero length is a no-op (success per Linux behavior)
     if len == 0 {
         return 0;
@@ -954,7 +970,7 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
 
     // Round up length to page boundary
     let len_aligned = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let end = match addr.checked_add(len_aligned) {
+    let mut end = match addr.checked_add(len_aligned) {
         Some(e) => e,
         None => return EINVAL, // Overflow
     };
@@ -972,13 +988,57 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
 
     let mut mm_guard = mm.lock();
 
+    // Handle PROT_GROWSDOWN - extend protection change to VMA start
+    // Linux: mm/mprotect.c do_mprotect_pkey() lines 807-865
+    let mut start = addr;
+
+    if grows & PROT_GROWSDOWN != 0 {
+        // Find VMA containing start address
+        if let Some(vma) = mm_guard.find_vma(start) {
+            // VMA must contain the address (not just be after it)
+            if vma.start > start || start >= vma.end {
+                return ENOMEM;
+            }
+            // VMA must have VM_GROWSDOWN flag
+            if !vma.is_growsdown() {
+                return EINVAL;
+            }
+            // Extend start to VMA start
+            start = vma.start;
+        } else {
+            return ENOMEM;
+        }
+    }
+
+    // Handle PROT_GROWSUP - always fails on x86-64/aarch64
+    // Linux: mm/mprotect.c - checks for VM_GROWSUP which never exists on these architectures
+    if grows & PROT_GROWSUP != 0 {
+        // Find VMA containing the end of range
+        let check_addr = end.saturating_sub(1);
+        if let Some(vma) = mm_guard.find_vma(check_addr) {
+            if vma.start > check_addr || check_addr >= vma.end {
+                return ENOMEM;
+            }
+            // VM_GROWSUP is never set on x86-64/aarch64 (only parisc has upward-growing stacks)
+            // So this always fails with EINVAL, matching Linux behavior
+            return EINVAL;
+        } else {
+            return ENOMEM;
+        }
+    }
+
+    // Recalculate end based on potentially adjusted start
+    if start != addr {
+        end = start.saturating_add(end.saturating_sub(addr));
+    }
+
     // Collect VMAs that need updating and validate the range is fully mapped
     let mut vmas_to_update: Vec<(u64, u64, u32)> = Vec::new();
-    let mut covered_start = addr;
+    let mut covered_start = start;
 
     for vma in mm_guard.iter() {
         // Skip VMAs that don't overlap with our range
-        if vma.end <= addr || vma.start >= end {
+        if vma.end <= start || vma.start >= end {
             continue;
         }
 
@@ -989,7 +1049,7 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
         }
 
         // Calculate the portion of this VMA that falls within our range
-        let update_start = vma.start.max(addr);
+        let update_start = vma.start.max(start);
         let update_end = vma.end.min(end);
 
         // Check if we're trying to write-protect a read-only file mapping
@@ -1010,7 +1070,7 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
 
     // Now update the VMA protection flags
     for vma in mm_guard.iter_mut() {
-        if vma.end <= addr || vma.start >= end {
+        if vma.end <= start || vma.start >= end {
             continue;
         }
 
