@@ -303,6 +303,88 @@ impl MmStruct {
 
         Ok(())
     }
+
+    // ========================================================================
+    // mremap support
+    // ========================================================================
+
+    /// Find the index of the VMA containing the given address
+    ///
+    /// Returns Some(index) if a VMA contains addr, None otherwise.
+    pub fn find_vma_index(&self, addr: u64) -> Option<usize> {
+        self.vmas.iter().position(|vma| vma.contains(addr))
+    }
+
+    /// Find the index of the VMA starting at exactly the given address
+    ///
+    /// Returns Some(index) if a VMA starts at addr, None otherwise.
+    pub fn find_vma_exact(&self, addr: u64) -> Option<usize> {
+        self.vmas.iter().position(|vma| vma.start == addr)
+    }
+
+    /// Try to expand a VMA's end address in-place
+    ///
+    /// Returns true if expansion succeeded (no collision with next VMA),
+    /// false if the expansion would collide.
+    pub fn try_expand_vma(&mut self, vma_idx: usize, new_end: u64) -> bool {
+        if vma_idx >= self.vmas.len() {
+            return false;
+        }
+
+        // Check if expansion collides with the next VMA
+        if vma_idx + 1 < self.vmas.len() {
+            let next_start = self.vmas[vma_idx + 1].start;
+            if new_end > next_start {
+                return false; // Would collide
+            }
+        }
+
+        // Check against mmap_end
+        if new_end > self.mmap_end {
+            return false;
+        }
+
+        // Perform expansion
+        let old_end = self.vmas[vma_idx].end;
+        self.vmas[vma_idx].end = new_end;
+
+        // Update total_vm accounting
+        let grow_pages = (new_end - old_end) >> 12;
+        self.total_vm = self.total_vm.saturating_add(grow_pages);
+        if self.vmas[vma_idx].is_locked() {
+            self.locked_vm = self.locked_vm.saturating_add(grow_pages);
+        }
+
+        true
+    }
+
+    /// Remove a VMA by index and return it
+    ///
+    /// Updates total_vm and locked_vm accounting.
+    pub fn remove_vma(&mut self, vma_idx: usize) -> Option<Vma> {
+        if vma_idx >= self.vmas.len() {
+            return None;
+        }
+
+        let vma = self.vmas.remove(vma_idx);
+        let pages = vma.size() >> 12;
+        self.total_vm = self.total_vm.saturating_sub(pages);
+        if vma.is_locked() {
+            self.locked_vm = self.locked_vm.saturating_sub(pages);
+        }
+
+        Some(vma)
+    }
+
+    /// Get a reference to a VMA by index
+    pub fn get_vma(&self, vma_idx: usize) -> Option<&Vma> {
+        self.vmas.get(vma_idx)
+    }
+
+    /// Get a mutable reference to a VMA by index
+    pub fn get_vma_mut(&mut self, vma_idx: usize) -> Option<&mut Vma> {
+        self.vmas.get_mut(vma_idx)
+    }
 }
 
 /// Global mapping from task ID to memory descriptor

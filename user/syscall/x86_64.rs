@@ -116,6 +116,7 @@ pub const SYS_MUNLOCKALL: u64 = 152;
 pub const SYS_MLOCK2: u64 = 325;
 pub const SYS_MSYNC: u64 = 26;
 pub const SYS_MADVISE: u64 = 28;
+pub const SYS_MREMAP: u64 = 25;
 
 // System information syscalls
 pub const SYS_GETCPU: u64 = 309;
@@ -1859,6 +1860,32 @@ pub fn sys_madvise(addr: u64, length: u64, advice: i32) -> i64 {
             in("rdi") addr,
             in("rsi") length,
             in("rdx") advice,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// mremap(old_addr, old_len, new_len, flags, new_addr) - remap a virtual memory region
+///
+/// Resizes and/or moves an existing memory mapping.
+///
+/// Returns the new address on success, negative errno on error.
+#[inline(always)]
+pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_addr: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_MREMAP,
+            in("rdi") old_addr,
+            in("rsi") old_len,
+            in("rdx") new_len,
+            in("r10") flags,
+            in("r8") new_addr,
             lateout("rax") ret,
             out("rcx") _,
             out("r11") _,

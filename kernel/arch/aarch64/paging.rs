@@ -1030,6 +1030,57 @@ impl Aarch64PageTable {
             Some(l3_entry.addr() | offset)
         }
     }
+
+    /// Read the page table entry for a virtual address
+    ///
+    /// Returns the physical address and attributes of the mapped page, or None if not mapped.
+    /// Only supports 4KB pages (not block descriptors).
+    ///
+    /// This is used by mremap to copy page mappings to a new location.
+    pub fn read_pte(l0_phys: u64, va: u64) -> Option<(u64, u64)> {
+        let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
+
+        unsafe {
+            let l0 = l0_phys as *const RawPageTable;
+
+            let l0_entry = (*l0).entry(l0_idx);
+            if !l0_entry.is_valid() || !l0_entry.is_table() {
+                return None;
+            }
+            let l1 = l0_entry.addr() as *const RawPageTable;
+
+            let l1_entry = (*l1).entry(l1_idx);
+            if !l1_entry.is_valid() {
+                return None;
+            }
+            // Block pages not supported
+            if l1_entry.is_block() {
+                return None;
+            }
+            let l2 = l1_entry.addr() as *const RawPageTable;
+
+            let l2_entry = (*l2).entry(l2_idx);
+            if !l2_entry.is_valid() {
+                return None;
+            }
+            // Block pages not supported
+            if l2_entry.is_block() {
+                return None;
+            }
+            let l3 = l2_entry.addr() as *const RawPageTable;
+
+            let l3_entry = (*l3).entry(l3_idx);
+            if !l3_entry.is_valid() {
+                return None;
+            }
+
+            // Get physical address and attributes (strip the descriptor type bits)
+            let phys = l3_entry.addr();
+            let attrs = l3_entry.0 & !ADDR_MASK & !0b11;
+
+            Some((phys, attrs))
+        }
+    }
 }
 
 // ============================================================================

@@ -136,6 +136,19 @@ pub const MADV_DONTDUMP: i32 = 16;
 /// MADV_DODUMP - Include in core dumps (undo MADV_DONTDUMP)
 pub const MADV_DODUMP: i32 = 17;
 
+// ============================================================================
+// mremap flags (MREMAP_*)
+// ============================================================================
+
+/// MREMAP_MAYMOVE - Allow kernel to move mapping if can't resize in-place
+pub const MREMAP_MAYMOVE: u32 = 1;
+
+/// MREMAP_FIXED - Move to exact new_addr (implies MREMAP_MAYMOVE)
+pub const MREMAP_FIXED: u32 = 2;
+
+/// MREMAP_DONTUNMAP - Keep original mapping after move (requires old_len == new_len)
+pub const MREMAP_DONTUNMAP: u32 = 4;
+
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
 

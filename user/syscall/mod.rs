@@ -362,6 +362,14 @@ pub const MCL_CURRENT: i32 = 1;
 pub const MCL_FUTURE: i32 = 2;
 pub const MCL_ONFAULT: i32 = 4;
 
+// mremap flags
+/// Allow kernel to move mapping if can't resize in-place
+pub const MREMAP_MAYMOVE: u32 = 1;
+/// Move to exact new_addr (implies MREMAP_MAYMOVE)
+pub const MREMAP_FIXED: u32 = 2;
+/// Keep original mapping after move
+pub const MREMAP_DONTUNMAP: u32 = 4;
+
 // Resource limits (rlimit constants)
 /// CPU time limit (seconds)
 pub const RLIMIT_CPU: u32 = 0;

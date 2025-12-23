@@ -1012,4 +1012,51 @@ impl X86_64PageTable {
             Some(pt_entry.addr() | offset)
         }
     }
+
+    /// Read the page table entry for a virtual address
+    ///
+    /// Returns the physical address and flags of the mapped page, or None if not mapped.
+    /// Only supports 4KB pages (not huge pages).
+    ///
+    /// This is used by mremap to copy page mappings to a new location.
+    pub fn read_pte(pml4_phys: u64, va: u64) -> Option<(u64, u64)> {
+        let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
+
+        unsafe {
+            let pml4 = pml4_phys as *const RawPageTable;
+
+            let pml4_entry = (*pml4).entry(pml4_idx);
+            if !pml4_entry.is_present() {
+                return None;
+            }
+            let pdpt = pml4_entry.addr() as *const RawPageTable;
+
+            let pdpt_entry = (*pdpt).entry(pdpt_idx);
+            if !pdpt_entry.is_present() {
+                return None;
+            }
+            // Huge pages not supported
+            if pdpt_entry.is_huge() {
+                return None;
+            }
+            let pd = pdpt_entry.addr() as *const RawPageTable;
+
+            let pd_entry = (*pd).entry(pd_idx);
+            if !pd_entry.is_present() {
+                return None;
+            }
+            // Huge pages not supported
+            if pd_entry.is_huge() {
+                return None;
+            }
+            let pt = pd_entry.addr() as *const RawPageTable;
+
+            let pt_entry = (*pt).entry(pt_idx);
+            if !pt_entry.is_present() {
+                return None;
+            }
+
+            Some((pt_entry.addr(), pt_entry.flags()))
+        }
+    }
 }

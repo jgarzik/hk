@@ -86,6 +86,8 @@ pub const SYS_DUP2: u64 = 33;
 pub const SYS_FCNTL: u64 = 72;
 /// sched_yield()
 pub const SYS_SCHED_YIELD: u64 = 24;
+/// mremap(old_addr, old_len, new_len, flags, new_addr)
+pub const SYS_MREMAP: u64 = 25;
 /// getpid()
 pub const SYS_GETPID: u64 = 39;
 /// exit(status)
@@ -993,6 +995,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_MLOCK2 => crate::mm::syscall::sys_mlock2(arg0, arg1, arg2 as i32) as u64,
         SYS_MSYNC => crate::mm::syscall::sys_msync(arg0, arg1, arg2 as i32) as u64,
         SYS_MADVISE => crate::mm::syscall::sys_madvise(arg0, arg1, arg2 as i32) as u64,
+        SYS_MREMAP => crate::mm::syscall::sys_mremap(arg0, arg1, arg2, arg3 as u32, arg4) as u64,
         SYS_FTRUNCATE => sys_ftruncate(arg0 as i32, arg1 as i64) as u64,
         SYS_TRUNCATE => sys_truncate(arg0, arg1 as i64) as u64,
         SYS_STAT => sys_stat(arg0, arg1) as u64,

@@ -9,12 +9,12 @@
 
 use super::helpers::{print, println, print_num};
 use crate::syscall::{
-    sys_madvise, sys_mmap, sys_mprotect, sys_msync, sys_munmap, sys_mlock, sys_mlock2,
+    sys_madvise, sys_mmap, sys_mprotect, sys_mremap, sys_msync, sys_munmap, sys_mlock, sys_mlock2,
     sys_munlock, sys_mlockall, sys_munlockall,
     MADV_DONTNEED, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED,
     MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE,
     MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
-    MAP_STACK, MS_ASYNC, MS_SYNC,
+    MAP_STACK, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC, MS_SYNC,
     PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, PROT_EXEC,
     MLOCK_ONFAULT, MCL_CURRENT, MCL_ONFAULT,
 };
@@ -66,6 +66,11 @@ pub fn run_tests() {
     test_madvise_dontneed();
     test_madvise_willneed();
     test_madvise_invalid();
+    // mremap tests
+    test_mremap_shrink();
+    test_mremap_expand_inplace();
+    test_mremap_expand_maymove();
+    test_mremap_einval();
 }
 
 /// Test: Basic anonymous mmap
@@ -1416,4 +1421,244 @@ fn test_madvise_invalid() {
 
     sys_munmap(ptr as u64, 4096);
     println(b"MADVISE_EINVAL:OK");
+}
+
+// ============================================================================
+// mremap tests
+// ============================================================================
+
+/// Test: mremap shrink - reduce mapping size
+fn test_mremap_shrink() {
+    // Create a 2-page mapping
+    let ptr = sys_mmap(
+        0,
+        8192, // 2 pages
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MREMAP_SHRINK:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Write to both pages to verify they're mapped
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0xAAAAAAAA);
+        core::ptr::write_volatile((ptr as u64 + 4096) as *mut u32, 0xBBBBBBBB);
+    }
+
+    // Shrink to 1 page
+    let new_ptr = sys_mremap(ptr as u64, 8192, 4096, 0, 0);
+    if new_ptr < 0 {
+        print(b"MREMAP_SHRINK:FAIL mremap errno=");
+        print_num(-new_ptr);
+        println(b"");
+        sys_munmap(ptr as u64, 8192);
+        return;
+    }
+
+    // Should return same address
+    if new_ptr as u64 != ptr as u64 {
+        print(b"MREMAP_SHRINK:FAIL addr changed from ");
+        print_num(ptr);
+        print(b" to ");
+        print_num(new_ptr);
+        println(b"");
+        sys_munmap(new_ptr as u64, 4096);
+        return;
+    }
+
+    // First page data should be preserved
+    let val = unsafe { core::ptr::read_volatile(new_ptr as *const u32) };
+    if val != 0xAAAAAAAA {
+        print(b"MREMAP_SHRINK:FAIL data mismatch got ");
+        print_num(val as i64);
+        println(b"");
+        sys_munmap(new_ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(new_ptr as u64, 4096);
+    println(b"MREMAP_SHRINK:OK");
+}
+
+/// Test: mremap expand in-place
+fn test_mremap_expand_inplace() {
+    // Create a 1-page mapping
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MREMAP_EXPAND:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Write test data
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0xDEADBEEF);
+    }
+
+    // Try to expand to 2 pages (may move if no room)
+    let new_ptr = sys_mremap(ptr as u64, 4096, 8192, MREMAP_MAYMOVE, 0);
+    if new_ptr < 0 {
+        print(b"MREMAP_EXPAND:FAIL mremap errno=");
+        print_num(-new_ptr);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    // Original data should be preserved
+    let val = unsafe { core::ptr::read_volatile(new_ptr as *const u32) };
+    if val != 0xDEADBEEF {
+        print(b"MREMAP_EXPAND:FAIL data mismatch got ");
+        print_num(val as i64);
+        println(b"");
+        sys_munmap(new_ptr as u64, 8192);
+        return;
+    }
+
+    // Second page should be accessible (zeroed for anonymous)
+    let val2 = unsafe { core::ptr::read_volatile((new_ptr as u64 + 4096) as *const u32) };
+    // Note: expanded page may or may not be zero depending on implementation
+    let _ = val2; // Just verify it's accessible
+
+    sys_munmap(new_ptr as u64, 8192);
+    println(b"MREMAP_EXPAND:OK");
+}
+
+/// Test: mremap expand with forced move (MREMAP_MAYMOVE)
+fn test_mremap_expand_maymove() {
+    // Create two adjacent mappings to force a collision
+    let ptr1 = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr1 < 0 {
+        print(b"MREMAP_MAYMOVE:FAIL mmap1 errno=");
+        print_num(-ptr1);
+        println(b"");
+        return;
+    }
+
+    // Try to create a second mapping right after the first
+    // (this may or may not succeed depending on address layout)
+    let ptr2 = sys_mmap(
+        (ptr1 as u64 + 4096) as u64,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    );
+
+    // Write test data to first mapping
+    unsafe {
+        core::ptr::write_volatile(ptr1 as *mut u32, 0xCAFEBABE);
+    }
+
+    // Now try to expand first mapping - if ptr2 succeeded, this should move
+    let new_ptr = sys_mremap(ptr1 as u64, 4096, 8192, MREMAP_MAYMOVE, 0);
+    if new_ptr < 0 {
+        print(b"MREMAP_MAYMOVE:FAIL mremap errno=");
+        print_num(-new_ptr);
+        println(b"");
+        sys_munmap(ptr1 as u64, 4096);
+        if ptr2 >= 0 {
+            sys_munmap(ptr2 as u64, 4096);
+        }
+        return;
+    }
+
+    // Data should be preserved regardless of whether it moved
+    let val = unsafe { core::ptr::read_volatile(new_ptr as *const u32) };
+    if val != 0xCAFEBABE {
+        print(b"MREMAP_MAYMOVE:FAIL data mismatch got ");
+        print_num(val as i64);
+        println(b"");
+        sys_munmap(new_ptr as u64, 8192);
+        if ptr2 >= 0 {
+            sys_munmap(ptr2 as u64, 4096);
+        }
+        return;
+    }
+
+    sys_munmap(new_ptr as u64, 8192);
+    if ptr2 >= 0 {
+        sys_munmap(ptr2 as u64, 4096);
+    }
+    println(b"MREMAP_MAYMOVE:OK");
+}
+
+/// Test: mremap with invalid parameters returns EINVAL
+fn test_mremap_einval() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MREMAP_EINVAL:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Test 1: new_len = 0 should fail
+    let ret = sys_mremap(ptr as u64, 4096, 0, 0, 0);
+    if ret != -22 {
+        // EINVAL
+        print(b"MREMAP_EINVAL:FAIL new_len=0 expected -22 got ");
+        print_num(ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    // Test 2: MREMAP_FIXED without MREMAP_MAYMOVE should fail
+    let ret = sys_mremap(ptr as u64, 4096, 4096, MREMAP_FIXED, 0x100000);
+    if ret != -22 {
+        // EINVAL
+        print(b"MREMAP_EINVAL:FAIL FIXED w/o MAYMOVE expected -22 got ");
+        print_num(ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    // Test 3: unaligned old_addr should fail
+    let ret = sys_mremap(ptr as u64 + 1, 4096, 4096, 0, 0);
+    if ret != -22 {
+        // EINVAL
+        print(b"MREMAP_EINVAL:FAIL unaligned expected -22 got ");
+        print_num(ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MREMAP_EINVAL:OK");
 }

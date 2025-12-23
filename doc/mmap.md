@@ -311,11 +311,33 @@ int madvise(void *addr, size_t length, int advice);
 
 Advises the kernel about how to handle paging I/O in the specified address range. MADV_DONTNEED is particularly important as it's widely used by allocators to release memory.
 
+### mremap
+
+```c
+void *mremap(void *old_addr, size_t old_len, size_t new_len,
+             int flags, ... /* void *new_addr */);
+```
+
+| Argument | Description |
+|----------|-------------|
+| old_addr | Start address of existing mapping (page-aligned) |
+| old_len | Old length of mapping in bytes |
+| new_len | New length of mapping in bytes |
+| flags | MREMAP_* flags |
+| new_addr | New address (only used with MREMAP_FIXED) |
+
+**Returns**: New address on success, -errno on failure
+
+| Flag | Value | Description | Status |
+|------|-------|-------------|--------|
+| MREMAP_MAYMOVE | 0x01 | Allow kernel to move mapping if can't resize in-place | Implemented |
+| MREMAP_FIXED | 0x02 | Move to exact new_addr (implies MAYMOVE) | Implemented |
+| MREMAP_DONTUNMAP | 0x04 | Keep original mapping after move | Implemented |
+
 ## Missing Syscalls
 
 | Syscall | Priority | Description |
 |---------|----------|-------------|
-| mremap | Medium | Resize/move existing mappings |
 | mincore | Low | Query page residency status |
 
 ## Implementation Notes
@@ -338,9 +360,9 @@ Current limitations in the implementation:
 - ~~**MAP_NONBLOCK** - Skip populate when combined with MAP_POPULATE~~ ✓
 - ~~**MAP_STACK** - Stack allocation hint (no-op, no THP)~~ ✓
 
-### Tier 2: Common Features (Partial)
+### Tier 2: Common Features (DONE)
 - ~~**madvise()** - Memory hints (MADV_DONTNEED for memory release)~~ ✓
-- **mremap()** - Resize/move mappings (used by realloc) - Deferred
+- ~~**mremap()** - Resize/move mappings (used by realloc)~~ ✓
 - ~~**msync()** - Sync file-backed mappings to disk~~ ✓
 - ~~**MAP_FIXED_NOREPLACE** - Safer MAP_FIXED that fails on overlap~~ ✓
 
