@@ -180,8 +180,14 @@ pub const SEEK_END: i32 = 2;
 pub const CLONE_VM: u64 = 0x00000100;
 pub const CLONE_SIGHAND: u64 = 0x00000800;
 pub const CLONE_PARENT: u64 = 0x00008000;
+pub const CLONE_NEWNS: u64 = 0x0002_0000;
 pub const CLONE_SYSVSEM: u64 = 0x00040000;
 pub const CLONE_SETTLS: u64 = 0x00080000;
+pub const CLONE_NEWUTS: u64 = 0x0400_0000;
+pub const CLONE_NEWIPC: u64 = 0x0800_0000;
+pub const CLONE_NEWUSER: u64 = 0x1000_0000;
+pub const CLONE_NEWPID: u64 = 0x2000_0000;
+pub const CLONE_NEWNET: u64 = 0x4000_0000;
 pub const CLONE_IO: u64 = 0x80000000;
 pub const CLONE_CLEAR_SIGHAND: u64 = 0x100000000;
 
