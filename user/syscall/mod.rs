@@ -321,6 +321,38 @@ pub const MAP_POPULATE: u32 = 0x8000;
 pub const MAP_NONBLOCK: u32 = 0x10000;
 /// Stack allocation hint (no-op on systems without THP)
 pub const MAP_STACK: u32 = 0x20000;
+/// Like MAP_FIXED but fails with EEXIST instead of unmapping existing mappings
+pub const MAP_FIXED_NOREPLACE: u32 = 0x100000;
+
+// msync flags
+/// Schedule write but don't wait (no-op in modern kernels)
+pub const MS_ASYNC: i32 = 1;
+/// Invalidate cached pages
+pub const MS_INVALIDATE: i32 = 2;
+/// Synchronously write dirty pages to disk
+pub const MS_SYNC: i32 = 4;
+
+// madvise flags
+/// No special treatment (default)
+pub const MADV_NORMAL: i32 = 0;
+/// Expect random page references
+pub const MADV_RANDOM: i32 = 1;
+/// Expect sequential page references
+pub const MADV_SEQUENTIAL: i32 = 2;
+/// Will need these pages soon (prefault)
+pub const MADV_WILLNEED: i32 = 3;
+/// Don't need these pages (zap and free)
+pub const MADV_DONTNEED: i32 = 4;
+/// Mark pages as lazily freeable
+pub const MADV_FREE: i32 = 8;
+/// Don't copy this VMA on fork
+pub const MADV_DONTFORK: i32 = 10;
+/// Do copy this VMA on fork (undo MADV_DONTFORK)
+pub const MADV_DOFORK: i32 = 11;
+/// Don't include in core dumps
+pub const MADV_DONTDUMP: i32 = 16;
+/// Include in core dumps (undo MADV_DONTDUMP)
+pub const MADV_DODUMP: i32 = 17;
 
 // mlock2 flags
 pub const MLOCK_ONFAULT: i32 = 0x01;

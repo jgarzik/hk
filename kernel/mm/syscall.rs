@@ -10,10 +10,12 @@ use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
 use super::{
-    MAP_ANONYMOUS, MAP_FIXED, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE,
-    MAP_SHARED, PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, VM_GROWSDOWN,
-    VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_SHARED, Vma, create_default_mm, get_task_mm,
-    init_task_mm,
+    MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE, MADV_NORMAL,
+    MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE,
+    MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MS_ASYNC,
+    MS_INVALIDATE, MS_SYNC, PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE,
+    VM_DONTCOPY, VM_DONTDUMP, VM_GROWSDOWN, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT,
+    VM_RAND_READ, VM_SEQ_READ, VM_SHARED, Vma, create_default_mm, get_task_mm, init_task_mm,
 };
 
 // Error codes (negative errno)
@@ -22,6 +24,9 @@ const EINVAL: i64 = -22;
 const ENOMEM: i64 = -12;
 const EBADF: i64 = -9;
 const EPERM: i64 = -1;
+const EEXIST: i64 = -17;
+const EBUSY: i64 = -16;
+const EIO: i64 = -5;
 
 // ============================================================================
 // mlock flags (user-visible)
@@ -69,6 +74,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
 
     let is_anonymous = flags & MAP_ANONYMOUS != 0;
     let is_fixed = flags & MAP_FIXED != 0;
+    let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
     let is_private = flags & MAP_PRIVATE != 0;
     let is_shared = flags & MAP_SHARED != 0;
 
@@ -110,13 +116,19 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     let mut mm_guard = mm.lock();
 
     // Determine mapping address
-    let map_addr = if is_fixed {
-        // MAP_FIXED: use exact address
+    let map_addr = if is_fixed || is_fixed_noreplace {
+        // MAP_FIXED or MAP_FIXED_NOREPLACE: use exact address
         if addr & (PAGE_SIZE - 1) != 0 {
             return EINVAL; // Must be page-aligned
         }
-        // Remove any existing mappings in range
-        mm_guard.remove_range(addr, addr + length);
+        // MAP_FIXED_NOREPLACE: fail if address range overlaps existing mapping
+        if is_fixed_noreplace && mm_guard.overlaps(addr, addr + length) {
+            return EEXIST;
+        }
+        // MAP_FIXED: remove any existing mappings in range
+        if is_fixed {
+            mm_guard.remove_range(addr, addr + length);
+        }
         addr
     } else if addr != 0 {
         // Hint address - try to use it, fall back to search
@@ -1314,6 +1326,226 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
             page += PAGE_SIZE;
         }
     }
+
+    0
+}
+
+// ============================================================================
+// msync syscall
+// ============================================================================
+
+/// msync syscall - Synchronize a file with a memory map
+///
+/// Flushes changes made to the in-core copy of a file-backed mapping back
+/// to the filesystem.
+///
+/// # Arguments
+/// * `addr` - Start address (must be page-aligned)
+/// * `length` - Length of region in bytes
+/// * `flags` - Combination of MS_ASYNC, MS_SYNC, MS_INVALIDATE
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+pub fn sys_msync(addr: u64, length: u64, flags: i32) -> i64 {
+    // Validate flags - must have valid combination
+    let valid_flags = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
+    if flags & !valid_flags != 0 {
+        return EINVAL;
+    }
+
+    // MS_ASYNC and MS_SYNC are mutually exclusive
+    if (flags & MS_ASYNC != 0) && (flags & MS_SYNC != 0) {
+        return EINVAL;
+    }
+
+    // Validate alignment
+    if addr & (PAGE_SIZE - 1) != 0 {
+        return EINVAL;
+    }
+
+    // Zero length: success (no-op)
+    if length == 0 {
+        return 0;
+    }
+
+    // Round up length to page boundary
+    let length = (length + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return ENOMEM,
+    };
+
+    let mm_guard = mm.lock();
+    let end = addr.saturating_add(length);
+
+    // Walk VMAs in range
+    for vma in mm_guard.iter() {
+        // Skip VMAs outside our range
+        if vma.end <= addr || vma.start >= end {
+            continue;
+        }
+
+        // MS_INVALIDATE on locked pages returns EBUSY (Linux behavior)
+        if flags & MS_INVALIDATE != 0 && vma.is_locked() {
+            return EBUSY;
+        }
+
+        // MS_SYNC on shared file-backed mapping: sync to disk
+        if flags & MS_SYNC != 0 && vma.is_shared() && vma.file.is_some() {
+            if let Some(ref file) = vma.file {
+                // Sync the file - this uses fsync for now
+                // A more sophisticated implementation would only sync the affected range
+                if file.f_op.fsync(file).is_err() {
+                    return EIO;
+                }
+            }
+        }
+        // MS_ASYNC: schedule async write but don't wait
+        // In modern Linux this is essentially a no-op as dirty pages are
+        // already scheduled for writeback. We do nothing here.
+    }
+
+    0
+}
+
+// ============================================================================
+// madvise syscall
+// ============================================================================
+
+/// madvise syscall - Give advice about use of memory
+///
+/// Advises the kernel about how to handle paging I/O in the specified
+/// address range.
+///
+/// # Arguments
+/// * `addr` - Start address (must be page-aligned)
+/// * `length` - Length of region in bytes
+/// * `advice` - Type of advice (MADV_*)
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+pub fn sys_madvise(addr: u64, length: u64, advice: i32) -> i64 {
+    // Validate alignment
+    if addr & (PAGE_SIZE - 1) != 0 {
+        return EINVAL;
+    }
+
+    // Round up length to page boundary
+    let length = (length + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    // Zero length: no-op success
+    if length == 0 {
+        return 0;
+    }
+
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return ENOMEM,
+    };
+
+    let end = addr.saturating_add(length);
+
+    match advice {
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_DONTFORK | MADV_DOFORK
+        | MADV_DONTDUMP | MADV_DODUMP => {
+            // These advices just update VMA flags
+            madvise_update_vma_flags(&mm, addr, end, advice)
+        }
+        MADV_WILLNEED => {
+            // Prefault pages (reuse populate_range)
+            populate_range(addr, length);
+            0
+        }
+        MADV_DONTNEED => {
+            // Zap pages - unmap and free
+            madvise_dontneed(&mm, addr, end)
+        }
+        MADV_FREE => {
+            // Mark pages as lazily freeable
+            // Simplified: treat as DONTNEED (kernel frees pages immediately)
+            madvise_dontneed(&mm, addr, end)
+        }
+        _ => EINVAL,
+    }
+}
+
+/// Update VMA flags based on madvise advice
+fn madvise_update_vma_flags(
+    mm: &alloc::sync::Arc<spin::Mutex<super::MmStruct>>,
+    start: u64,
+    end: u64,
+    advice: i32,
+) -> i64 {
+    let mut mm_guard = mm.lock();
+
+    // Walk VMAs and update flags
+    for vma in mm_guard.iter_mut() {
+        // Skip VMAs outside our range
+        if vma.end <= start || vma.start >= end {
+            continue;
+        }
+
+        match advice {
+            MADV_NORMAL => {
+                // Clear read hints
+                vma.flags &= !(VM_RAND_READ | VM_SEQ_READ);
+            }
+            MADV_RANDOM => {
+                // Set random access hint
+                vma.flags = (vma.flags & !VM_SEQ_READ) | VM_RAND_READ;
+            }
+            MADV_SEQUENTIAL => {
+                // Set sequential access hint
+                vma.flags = (vma.flags & !VM_RAND_READ) | VM_SEQ_READ;
+            }
+            MADV_DONTFORK => {
+                // Set don't copy on fork
+                vma.flags |= VM_DONTCOPY;
+            }
+            MADV_DOFORK => {
+                // Clear don't copy on fork
+                vma.flags &= !VM_DONTCOPY;
+            }
+            MADV_DONTDUMP => {
+                // Set don't include in core dumps
+                vma.flags |= VM_DONTDUMP;
+            }
+            MADV_DODUMP => {
+                // Clear don't include in core dumps
+                vma.flags &= !VM_DONTDUMP;
+            }
+            _ => {}
+        }
+    }
+
+    0
+}
+
+/// Handle MADV_DONTNEED - zap pages in range
+fn madvise_dontneed(
+    mm: &alloc::sync::Arc<spin::Mutex<super::MmStruct>>,
+    start: u64,
+    end: u64,
+) -> i64 {
+    {
+        let mm_guard = mm.lock();
+
+        // Check for locked VMAs - can't DONTNEED locked pages
+        for vma in mm_guard.iter() {
+            if vma.end <= start || vma.start >= end {
+                continue;
+            }
+            if vma.is_locked() {
+                return EINVAL;
+            }
+        }
+    }
+
+    // Unmap pages in range (reuse existing infrastructure)
+    unmap_pages_range(start, end);
 
     0
 }

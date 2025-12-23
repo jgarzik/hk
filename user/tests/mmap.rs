@@ -9,10 +9,12 @@
 
 use super::helpers::{print, println, print_num};
 use crate::syscall::{
-    sys_mmap, sys_mprotect, sys_munmap, sys_mlock, sys_mlock2, sys_munlock,
-    sys_mlockall, sys_munlockall,
-    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_GROWSDOWN, MAP_LOCKED,
-    MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_STACK,
+    sys_madvise, sys_mmap, sys_mprotect, sys_msync, sys_munmap, sys_mlock, sys_mlock2,
+    sys_munlock, sys_mlockall, sys_munlockall,
+    MADV_DONTNEED, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED,
+    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE,
+    MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
+    MAP_STACK, MS_ASYNC, MS_SYNC,
     PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, PROT_EXEC,
     MLOCK_ONFAULT, MCL_CURRENT, MCL_ONFAULT,
 };
@@ -53,6 +55,17 @@ pub fn run_tests() {
     test_mmap_populate_nonblock();
     test_mmap_nonblock_alone();
     test_mmap_stack();
+    // MAP_FIXED_NOREPLACE tests
+    test_mmap_fixed_noreplace_success();
+    test_mmap_fixed_noreplace_collision();
+    // msync tests
+    test_msync_basic();
+    test_msync_invalid_flags();
+    // madvise tests
+    test_madvise_normal();
+    test_madvise_dontneed();
+    test_madvise_willneed();
+    test_madvise_invalid();
 }
 
 /// Test: Basic anonymous mmap
@@ -1059,4 +1072,348 @@ fn test_mmap_stack() {
 
     sys_munmap(ptr as u64, 4096);
     println(b"MMAP_STACK:OK");
+}
+
+// ============================================================================
+// MAP_FIXED_NOREPLACE tests
+// ============================================================================
+
+/// Test: MAP_FIXED_NOREPLACE succeeds when no collision
+fn test_mmap_fixed_noreplace_success() {
+    // First mmap to get a valid address
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MMAP_FIXED_NOREPLACE_OK:FAIL initial mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Unmap it
+    sys_munmap(ptr as u64, 4096);
+
+    // Now use MAP_FIXED_NOREPLACE at the same address - should succeed
+    let ptr2 = sys_mmap(
+        ptr as u64,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    );
+
+    if ptr2 < 0 {
+        print(b"MMAP_FIXED_NOREPLACE_OK:FAIL errno=");
+        print_num(-ptr2);
+        println(b"");
+        return;
+    }
+
+    if ptr2 as u64 != ptr as u64 {
+        print(b"MMAP_FIXED_NOREPLACE_OK:FAIL addr mismatch expected ");
+        print_num(ptr);
+        print(b" got ");
+        print_num(ptr2);
+        println(b"");
+        sys_munmap(ptr2 as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr2 as u64, 4096);
+    println(b"MMAP_FIXED_NOREPLACE_OK:OK");
+}
+
+/// Test: MAP_FIXED_NOREPLACE returns EEXIST on collision
+fn test_mmap_fixed_noreplace_collision() {
+    // Create a mapping
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MMAP_FIXED_NOREPLACE_EEXIST:FAIL initial mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Try MAP_FIXED_NOREPLACE at same address - should fail with EEXIST (-17)
+    let ptr2 = sys_mmap(
+        ptr as u64,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    );
+
+    if ptr2 != -17 {
+        // EEXIST
+        print(b"MMAP_FIXED_NOREPLACE_EEXIST:FAIL expected -17 got ");
+        print_num(ptr2);
+        println(b"");
+        if ptr2 >= 0 {
+            sys_munmap(ptr2 as u64, 4096);
+        }
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MMAP_FIXED_NOREPLACE_EEXIST:OK");
+}
+
+// ============================================================================
+// msync tests
+// ============================================================================
+
+/// Test: msync with MS_ASYNC on anonymous mapping
+fn test_msync_basic() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MSYNC_BASIC:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Write something
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0xDEADBEEF);
+    }
+
+    // msync with MS_ASYNC (essentially a no-op but should succeed)
+    let ret = sys_msync(ptr as u64, 4096, MS_ASYNC);
+    if ret != 0 {
+        print(b"MSYNC_BASIC:FAIL msync errno=");
+        print_num(-ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MSYNC_BASIC:OK");
+}
+
+/// Test: msync with invalid flags returns EINVAL
+fn test_msync_invalid_flags() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MSYNC_EINVAL:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // MS_ASYNC | MS_SYNC together is invalid
+    let ret = sys_msync(ptr as u64, 4096, MS_ASYNC | MS_SYNC);
+    if ret != -22 {
+        // EINVAL
+        print(b"MSYNC_EINVAL:FAIL expected -22 got ");
+        print_num(ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MSYNC_EINVAL:OK");
+}
+
+// ============================================================================
+// madvise tests
+// ============================================================================
+
+/// Test: madvise with MADV_NORMAL
+fn test_madvise_normal() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MADVISE_NORMAL:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // First set to RANDOM, then back to NORMAL
+    let ret = sys_madvise(ptr as u64, 4096, MADV_RANDOM);
+    if ret != 0 {
+        print(b"MADVISE_NORMAL:FAIL madvise RANDOM errno=");
+        print_num(-ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    let ret = sys_madvise(ptr as u64, 4096, MADV_NORMAL);
+    if ret != 0 {
+        print(b"MADVISE_NORMAL:FAIL madvise NORMAL errno=");
+        print_num(-ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MADVISE_NORMAL:OK");
+}
+
+/// Test: madvise with MADV_DONTNEED zaps pages
+fn test_madvise_dontneed() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MADVISE_DONTNEED:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Write something
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0xDEADBEEF);
+    }
+
+    // MADV_DONTNEED - should zap the pages
+    let ret = sys_madvise(ptr as u64, 4096, MADV_DONTNEED);
+    if ret != 0 {
+        print(b"MADVISE_DONTNEED:FAIL madvise errno=");
+        print_num(-ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    // Re-read - page should be zeroed (new anonymous page)
+    let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
+    if val != 0 {
+        print(b"MADVISE_DONTNEED:FAIL expected 0 got ");
+        print_num(val as i64);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MADVISE_DONTNEED:OK");
+}
+
+/// Test: madvise with MADV_WILLNEED prefaults pages
+fn test_madvise_willneed() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MADVISE_WILLNEED:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // MADV_WILLNEED - should prefault pages
+    let ret = sys_madvise(ptr as u64, 4096, MADV_WILLNEED);
+    if ret != 0 {
+        print(b"MADVISE_WILLNEED:FAIL madvise errno=");
+        print_num(-ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    // Should be able to read (page prefaulted)
+    let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
+    // Anonymous pages are zeroed
+    if val != 0 {
+        print(b"MADVISE_WILLNEED:FAIL expected 0 got ");
+        print_num(val as i64);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MADVISE_WILLNEED:OK");
+}
+
+/// Test: madvise with invalid advice returns EINVAL
+fn test_madvise_invalid() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MADVISE_EINVAL:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Invalid advice (999 is not a valid MADV_* value)
+    let ret = sys_madvise(ptr as u64, 4096, 999);
+    if ret != -22 {
+        // EINVAL
+        print(b"MADVISE_EINVAL:FAIL expected -22 got ");
+        print_num(ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MADVISE_EINVAL:OK");
 }

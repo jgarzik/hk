@@ -127,6 +127,8 @@ pub const SYS_MUNLOCK: u64 = 229;
 pub const SYS_MLOCKALL: u64 = 230;
 pub const SYS_MUNLOCKALL: u64 = 231;
 pub const SYS_MLOCK2: u64 = 284;
+pub const SYS_MSYNC: u64 = 227;
+pub const SYS_MADVISE: u64 = 233;
 
 // System information syscalls
 pub const SYS_GETRUSAGE: u64 = 165;
@@ -1652,6 +1654,52 @@ pub fn sys_munlockall() -> i64 {
         core::arch::asm!(
             "svc #0",
             in("x8") SYS_MUNLOCKALL,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// msync(addr, length, flags) - synchronize a file with a memory map
+///
+/// Flushes changes made to the in-core copy of a file-backed mapping back
+/// to the filesystem.
+///
+/// Returns 0 on success, negative errno on error.
+#[inline(always)]
+pub fn sys_msync(addr: u64, length: u64, flags: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_MSYNC,
+            in("x0") addr,
+            in("x1") length,
+            in("x2") flags,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// madvise(addr, length, advice) - give advice about use of memory
+///
+/// Advises the kernel about how to handle paging I/O in the specified
+/// address range.
+///
+/// Returns 0 on success, negative errno on error.
+#[inline(always)]
+pub fn sys_madvise(addr: u64, length: u64, advice: i32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_MADVISE,
+            in("x0") addr,
+            in("x1") length,
+            in("x2") advice,
             lateout("x0") ret,
             options(nostack),
         );

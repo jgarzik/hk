@@ -41,6 +41,9 @@ pub const MAP_NONBLOCK: u32 = 0x10000;
 /// MAP_STACK - hint for stack allocation (no-op in hk, no THP support)
 /// Linux uses this to set VM_NOHUGEPAGE when transparent huge pages are enabled
 pub const MAP_STACK: u32 = 0x20000;
+/// MAP_FIXED_NOREPLACE - like MAP_FIXED but fails with EEXIST instead of unmapping
+/// Safer alternative to MAP_FIXED that doesn't silently replace existing mappings
+pub const MAP_FIXED_NOREPLACE: u32 = 0x100000;
 
 /// Return value for failed mmap
 pub const MAP_FAILED: i64 = -1;
@@ -73,6 +76,65 @@ pub const VM_SHARED: u32 = 0x0004_0000;
 /// VMA can expand downward on page faults (stack-like growth)
 /// Set when MAP_GROWSDOWN is used during mmap
 pub const VM_GROWSDOWN: u32 = 0x0008_0000;
+
+/// VMA has random access pattern (madvise MADV_RANDOM)
+pub const VM_RAND_READ: u32 = 0x0010_0000;
+
+/// VMA has sequential access pattern (madvise MADV_SEQUENTIAL)
+pub const VM_SEQ_READ: u32 = 0x0020_0000;
+
+/// VMA should not be copied on fork (madvise MADV_DONTFORK)
+pub const VM_DONTCOPY: u32 = 0x0040_0000;
+
+/// VMA should not be included in core dumps (madvise MADV_DONTDUMP)
+pub const VM_DONTDUMP: u32 = 0x0080_0000;
+
+// ============================================================================
+// msync flags (MS_*)
+// ============================================================================
+
+/// MS_ASYNC - Schedule write but don't wait (no-op in modern Linux)
+pub const MS_ASYNC: i32 = 1;
+
+/// MS_INVALIDATE - Invalidate cached pages
+pub const MS_INVALIDATE: i32 = 2;
+
+/// MS_SYNC - Synchronously write dirty pages to disk
+pub const MS_SYNC: i32 = 4;
+
+// ============================================================================
+// madvise flags (MADV_*)
+// ============================================================================
+
+/// MADV_NORMAL - No special treatment (default)
+pub const MADV_NORMAL: i32 = 0;
+
+/// MADV_RANDOM - Expect random page references
+pub const MADV_RANDOM: i32 = 1;
+
+/// MADV_SEQUENTIAL - Expect sequential page references
+pub const MADV_SEQUENTIAL: i32 = 2;
+
+/// MADV_WILLNEED - Will need these pages soon (prefault)
+pub const MADV_WILLNEED: i32 = 3;
+
+/// MADV_DONTNEED - Don't need these pages (zap and free)
+pub const MADV_DONTNEED: i32 = 4;
+
+/// MADV_FREE - Mark pages as lazily freeable (kernel may free them if needed)
+pub const MADV_FREE: i32 = 8;
+
+/// MADV_DONTFORK - Don't copy this VMA on fork
+pub const MADV_DONTFORK: i32 = 10;
+
+/// MADV_DOFORK - Do copy this VMA on fork (undo MADV_DONTFORK)
+pub const MADV_DOFORK: i32 = 11;
+
+/// MADV_DONTDUMP - Don't include in core dumps
+pub const MADV_DONTDUMP: i32 = 16;
+
+/// MADV_DODUMP - Include in core dumps (undo MADV_DONTDUMP)
+pub const MADV_DODUMP: i32 = 17;
 
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;

@@ -72,7 +72,7 @@ int munmap(void *addr, size_t length);
 | MAP_STACK | 0x20000 | Stack allocation hint | Implemented (no-op, no THP) |
 | MAP_HUGETLB | 0x40000 | Use huge pages | Not implemented |
 | MAP_SYNC | 0x80000 | Synchronous page faults (DAX) | Not implemented |
-| MAP_FIXED_NOREPLACE | 0x100000 | MAP_FIXED without unmapping | Not implemented |
+| MAP_FIXED_NOREPLACE | 0x100000 | MAP_FIXED without unmapping | Implemented |
 | MAP_UNINITIALIZED | 0x4000000 | Skip zero-fill (embedded only) | Not implemented |
 
 ## Implementation Architecture
@@ -260,13 +260,62 @@ int mprotect(void *addr, size_t len, int prot);
 
 Changes the protection flags for pages in the specified range. The range must be fully covered by existing VMAs (returns ENOMEM for unmapped regions).
 
+### msync
+
+```c
+int msync(void *addr, size_t length, int flags);
+```
+
+| Argument | Description |
+|----------|-------------|
+| addr | Start address (page-aligned) |
+| length | Length in bytes |
+| flags | Combination of MS_ASYNC, MS_SYNC, MS_INVALIDATE |
+
+| Flag | Value | Description |
+|------|-------|-------------|
+| MS_ASYNC | 1 | Schedule write but don't wait (no-op in modern kernels) |
+| MS_INVALIDATE | 2 | Invalidate cached pages |
+| MS_SYNC | 4 | Synchronously write dirty pages to disk |
+
+**Returns**: 0 on success, -errno on failure
+
+Flushes changes made to file-backed mappings back to the filesystem. MS_ASYNC and MS_SYNC are mutually exclusive.
+
+### madvise
+
+```c
+int madvise(void *addr, size_t length, int advice);
+```
+
+| Argument | Description |
+|----------|-------------|
+| addr | Start address (page-aligned) |
+| length | Length in bytes |
+| advice | Type of advice (MADV_*) |
+
+| Flag | Value | Description | Status |
+|------|-------|-------------|--------|
+| MADV_NORMAL | 0 | No special treatment (default) | Implemented |
+| MADV_RANDOM | 1 | Expect random page references | Implemented |
+| MADV_SEQUENTIAL | 2 | Expect sequential page references | Implemented |
+| MADV_WILLNEED | 3 | Will need these pages soon (prefault) | Implemented |
+| MADV_DONTNEED | 4 | Don't need these pages (zap and free) | Implemented |
+| MADV_FREE | 8 | Mark pages as lazily freeable | Implemented (treated as DONTNEED) |
+| MADV_DONTFORK | 10 | Don't copy this VMA on fork | Implemented |
+| MADV_DOFORK | 11 | Do copy this VMA on fork | Implemented |
+| MADV_DONTDUMP | 16 | Don't include in core dumps | Implemented |
+| MADV_DODUMP | 17 | Include in core dumps | Implemented |
+
+**Returns**: 0 on success, -errno on failure
+
+Advises the kernel about how to handle paging I/O in the specified address range. MADV_DONTNEED is particularly important as it's widely used by allocators to release memory.
+
 ## Missing Syscalls
 
 | Syscall | Priority | Description |
 |---------|----------|-------------|
-| madvise | Medium | Memory usage hints (MADV_DONTNEED widely used) |
 | mremap | Medium | Resize/move existing mappings |
-| msync | Medium | Sync file-backed mappings to disk |
 | mincore | Low | Query page residency status |
 
 ## Implementation Notes
@@ -289,11 +338,11 @@ Current limitations in the implementation:
 - ~~**MAP_NONBLOCK** - Skip populate when combined with MAP_POPULATE~~ ✓
 - ~~**MAP_STACK** - Stack allocation hint (no-op, no THP)~~ ✓
 
-### Tier 2: Common Features
-- **madvise()** - Memory hints (MADV_DONTNEED for memory release)
-- **mremap()** - Resize/move mappings (used by realloc)
-- **msync()** - Sync file-backed mappings to disk
-- **MAP_FIXED_NOREPLACE** - Safer MAP_FIXED that fails on overlap
+### Tier 2: Common Features (Partial)
+- ~~**madvise()** - Memory hints (MADV_DONTNEED for memory release)~~ ✓
+- **mremap()** - Resize/move mappings (used by realloc) - Deferred
+- ~~**msync()** - Sync file-backed mappings to disk~~ ✓
+- ~~**MAP_FIXED_NOREPLACE** - Safer MAP_FIXED that fails on overlap~~ ✓
 
 ### Tier 3: Optimization
 - **VMA merging** - Merge adjacent compatible VMAs

@@ -131,6 +131,10 @@ pub const SYS_MLOCKALL: u64 = 230;
 pub const SYS_MUNLOCKALL: u64 = 231;
 /// mlock2(addr, len, flags)
 pub const SYS_MLOCK2: u64 = 284;
+/// msync(addr, length, flags)
+pub const SYS_MSYNC: u64 = 227;
+/// madvise(addr, length, advice)
+pub const SYS_MADVISE: u64 = 233;
 pub const SYS_WAIT4: u64 = 260;
 
 // Signal syscalls (aarch64 numbers)
@@ -560,6 +564,8 @@ pub fn aarch64_syscall_dispatch(
         SYS_MLOCKALL => crate::mm::syscall::sys_mlockall(arg0 as i32) as u64,
         SYS_MUNLOCKALL => crate::mm::syscall::sys_munlockall() as u64,
         SYS_MLOCK2 => crate::mm::syscall::sys_mlock2(arg0, arg1, arg2 as i32) as u64,
+        SYS_MSYNC => crate::mm::syscall::sys_msync(arg0, arg1, arg2 as i32) as u64,
+        SYS_MADVISE => crate::mm::syscall::sys_madvise(arg0, arg1, arg2 as i32) as u64,
 
         // System information
         SYS_SYSINFO => {
