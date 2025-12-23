@@ -71,6 +71,11 @@ pub fn run_tests() {
     test_mremap_expand_inplace();
     test_mremap_expand_maymove();
     test_mremap_einval();
+    // VMA merging tests (Tier 3 optimization)
+    test_vma_merge_adjacent_anonymous();
+    test_vma_no_merge_different_prot();
+    test_vma_merge_after_mprotect();
+    test_vma_merge_multiple();
 }
 
 /// Test: Basic anonymous mmap
@@ -1606,6 +1611,284 @@ fn test_mremap_expand_maymove() {
         sys_munmap(ptr2 as u64, 4096);
     }
     println(b"MREMAP_MAYMOVE:OK");
+}
+
+// ============================================================================
+// VMA merging tests (Tier 3 optimization)
+// Note: VMA merging is internal; we test that behavior is correct after merge
+// ============================================================================
+
+/// Test: Adjacent anonymous mappings with same flags (triggers VMA merge)
+fn test_vma_merge_adjacent_anonymous() {
+    // First, allocate a page to get a base address
+    let ptr1 = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr1 < 0 {
+        print(b"VMA_MERGE_ADJACENT:FAIL mmap1 errno=");
+        print_num(-ptr1);
+        println(b"");
+        return;
+    }
+
+    // Try to allocate adjacent page using MAP_FIXED_NOREPLACE
+    // If it collides, use the hint address mechanism instead
+    let adjacent_addr = ptr1 as u64 + 4096;
+    let ptr2 = sys_mmap(
+        adjacent_addr,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    );
+
+    if ptr2 < 0 {
+        // Adjacent address not available, skip test
+        sys_munmap(ptr1 as u64, 4096);
+        println(b"VMA_MERGE_ADJACENT:SKIP (no adjacent space)");
+        return;
+    }
+
+    // Write to both pages
+    unsafe {
+        core::ptr::write_volatile(ptr1 as *mut u32, 0x11111111);
+        core::ptr::write_volatile(ptr2 as *mut u32, 0x22222222);
+    }
+
+    // Read back - if VMA merge worked, pages should still be accessible
+    let val1 = unsafe { core::ptr::read_volatile(ptr1 as *const u32) };
+    let val2 = unsafe { core::ptr::read_volatile(ptr2 as *const u32) };
+
+    if val1 != 0x11111111 || val2 != 0x22222222 {
+        print(b"VMA_MERGE_ADJACENT:FAIL val1=");
+        print_num(val1 as i64);
+        print(b" val2=");
+        print_num(val2 as i64);
+        println(b"");
+        sys_munmap(ptr1 as u64, 8192);
+        return;
+    }
+
+    // Unmap both (may be merged into single VMA internally)
+    sys_munmap(ptr1 as u64, 8192);
+    println(b"VMA_MERGE_ADJACENT:OK");
+}
+
+/// Test: VMAs with different protection don't merge (verify isolation)
+fn test_vma_no_merge_different_prot() {
+    // Allocate RW page
+    let ptr1 = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr1 < 0 {
+        print(b"VMA_NO_MERGE_PROT:FAIL mmap1 errno=");
+        print_num(-ptr1);
+        println(b"");
+        return;
+    }
+
+    // Try to allocate adjacent RO page
+    let adjacent_addr = ptr1 as u64 + 4096;
+    let ptr2 = sys_mmap(
+        adjacent_addr,
+        4096,
+        PROT_READ, // Different protection - read-only
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    );
+
+    if ptr2 < 0 {
+        sys_munmap(ptr1 as u64, 4096);
+        println(b"VMA_NO_MERGE_PROT:SKIP (no adjacent space)");
+        return;
+    }
+
+    // Write to RW page
+    unsafe {
+        core::ptr::write_volatile(ptr1 as *mut u32, 0xAAAAAAAA);
+    }
+
+    // Read from both (RO page should be readable)
+    let val1 = unsafe { core::ptr::read_volatile(ptr1 as *const u32) };
+    let val2 = unsafe { core::ptr::read_volatile(ptr2 as *const u32) };
+
+    if val1 != 0xAAAAAAAA {
+        print(b"VMA_NO_MERGE_PROT:FAIL val1=");
+        print_num(val1 as i64);
+        println(b"");
+        sys_munmap(ptr1 as u64, 4096);
+        sys_munmap(ptr2 as u64, 4096);
+        return;
+    }
+
+    // val2 should be 0 (anonymous zeroed page)
+    let _ = val2;
+
+    sys_munmap(ptr1 as u64, 4096);
+    sys_munmap(ptr2 as u64, 4096);
+    println(b"VMA_NO_MERGE_PROT:OK");
+}
+
+/// Test: mprotect followed by merge opportunity
+fn test_vma_merge_after_mprotect() {
+    // Create two adjacent RW pages
+    let ptr1 = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr1 < 0 {
+        print(b"VMA_MERGE_MPROTECT:FAIL mmap1 errno=");
+        print_num(-ptr1);
+        println(b"");
+        return;
+    }
+
+    let adjacent_addr = ptr1 as u64 + 4096;
+    let ptr2 = sys_mmap(
+        adjacent_addr,
+        4096,
+        PROT_READ, // Start with different prot
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    );
+
+    if ptr2 < 0 {
+        sys_munmap(ptr1 as u64, 4096);
+        println(b"VMA_MERGE_MPROTECT:SKIP (no adjacent space)");
+        return;
+    }
+
+    // Write to first page
+    unsafe {
+        core::ptr::write_volatile(ptr1 as *mut u32, 0xDEADC0DE);
+    }
+
+    // Now mprotect second page to RW (same as first) - may trigger merge
+    let ret = sys_mprotect(ptr2 as u64, 4096, PROT_READ | PROT_WRITE);
+    if ret != 0 {
+        print(b"VMA_MERGE_MPROTECT:FAIL mprotect errno=");
+        print_num(-ret);
+        println(b"");
+        sys_munmap(ptr1 as u64, 4096);
+        sys_munmap(ptr2 as u64, 4096);
+        return;
+    }
+
+    // Both pages should now be writable
+    unsafe {
+        core::ptr::write_volatile(ptr2 as *mut u32, 0xBEEFCAFE);
+    }
+
+    let val1 = unsafe { core::ptr::read_volatile(ptr1 as *const u32) };
+    let val2 = unsafe { core::ptr::read_volatile(ptr2 as *const u32) };
+
+    if val1 != 0xDEADC0DE || val2 != 0xBEEFCAFE {
+        print(b"VMA_MERGE_MPROTECT:FAIL val1=");
+        print_num(val1 as i64);
+        print(b" val2=");
+        print_num(val2 as i64);
+        println(b"");
+        sys_munmap(ptr1 as u64, 8192);
+        return;
+    }
+
+    sys_munmap(ptr1 as u64, 8192);
+    println(b"VMA_MERGE_MPROTECT:OK");
+}
+
+/// Test: Multiple consecutive mappings (stress test for merge cascade)
+fn test_vma_merge_multiple() {
+    const NUM_PAGES: u64 = 4;
+    let size = NUM_PAGES * 4096;
+
+    // Allocate first page to get base
+    let base = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if base < 0 {
+        print(b"VMA_MERGE_MULTI:FAIL mmap base errno=");
+        print_num(-base);
+        println(b"");
+        return;
+    }
+
+    // Try to allocate consecutive pages
+    let mut success = true;
+    for i in 1..NUM_PAGES {
+        let addr = base as u64 + i * 4096;
+        let ptr = sys_mmap(
+            addr,
+            4096,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        );
+        if ptr < 0 {
+            // Couldn't allocate consecutive page
+            sys_munmap(base as u64, i * 4096);
+            println(b"VMA_MERGE_MULTI:SKIP (no consecutive space)");
+            return;
+        }
+    }
+
+    // Write pattern to all pages
+    for i in 0..NUM_PAGES {
+        let addr = base as u64 + i * 4096;
+        unsafe {
+            core::ptr::write_volatile(addr as *mut u32, 0x11111111 * (i + 1) as u32);
+        }
+    }
+
+    // Verify all pages
+    for i in 0..NUM_PAGES {
+        let addr = base as u64 + i * 4096;
+        let expected = 0x11111111 * (i + 1) as u32;
+        let val = unsafe { core::ptr::read_volatile(addr as *const u32) };
+        if val != expected {
+            print(b"VMA_MERGE_MULTI:FAIL page ");
+            print_num(i as i64);
+            print(b" expected ");
+            print_num(expected as i64);
+            print(b" got ");
+            print_num(val as i64);
+            println(b"");
+            success = false;
+            break;
+        }
+    }
+
+    sys_munmap(base as u64, size);
+
+    if success {
+        println(b"VMA_MERGE_MULTI:OK");
+    }
 }
 
 /// Test: mremap with invalid parameters returns EINVAL

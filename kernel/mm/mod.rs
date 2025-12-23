@@ -115,13 +115,16 @@ impl MmStruct {
     }
 
     /// Insert a VMA, maintaining sorted order by start address
-    pub fn insert_vma(&mut self, vma: Vma) {
+    ///
+    /// Returns the index where the VMA was inserted, for use with `merge_adjacent()`.
+    pub fn insert_vma(&mut self, vma: Vma) -> usize {
         let pos = self
             .vmas
             .iter()
             .position(|v| v.start > vma.start)
             .unwrap_or(self.vmas.len());
         self.vmas.insert(pos, vma);
+        pos
     }
 
     /// Remove VMAs overlapping the given range
@@ -384,6 +387,62 @@ impl MmStruct {
     /// Get a mutable reference to a VMA by index
     pub fn get_vma_mut(&mut self, vma_idx: usize) -> Option<&mut Vma> {
         self.vmas.get_mut(vma_idx)
+    }
+
+    // ========================================================================
+    // VMA merging optimization
+    // ========================================================================
+
+    /// Try to merge VMA at index with the next VMA
+    ///
+    /// Returns true if merge occurred, false otherwise.
+    /// After merge, the VMA at `idx` is extended and the next VMA is removed.
+    pub fn try_merge_with_next(&mut self, idx: usize) -> bool {
+        if idx + 1 >= self.vmas.len() {
+            return false;
+        }
+        if self.vmas[idx].can_merge_with(&self.vmas[idx + 1]) {
+            // Extend first VMA to cover second
+            self.vmas[idx].end = self.vmas[idx + 1].end;
+            // Remove second VMA (no accounting change - same total memory)
+            self.vmas.remove(idx + 1);
+            return true;
+        }
+        false
+    }
+
+    /// Try to merge VMA at index with the previous VMA
+    ///
+    /// Returns true if merge occurred, false otherwise.
+    /// After merge, the VMA at `idx-1` is extended and the VMA at `idx` is removed.
+    pub fn try_merge_with_prev(&mut self, idx: usize) -> bool {
+        if idx == 0 {
+            return false;
+        }
+        if self.vmas[idx - 1].can_merge_with(&self.vmas[idx]) {
+            // Extend previous VMA to cover this one
+            self.vmas[idx - 1].end = self.vmas[idx].end;
+            // Remove this VMA (no accounting change - same total memory)
+            self.vmas.remove(idx);
+            return true;
+        }
+        false
+    }
+
+    /// Merge adjacent VMAs starting from the given index
+    ///
+    /// Cascades forward (merging with next VMAs) until no more merges,
+    /// then attempts to merge with the previous VMA.
+    pub fn merge_adjacent(&mut self, idx: usize) {
+        if idx >= self.vmas.len() {
+            return;
+        }
+        // Cascade merge with next VMAs
+        while self.try_merge_with_next(idx) {}
+        // Try merge with previous
+        if idx > 0 {
+            self.try_merge_with_prev(idx);
+        }
     }
 }
 

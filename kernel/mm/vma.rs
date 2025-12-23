@@ -266,4 +266,34 @@ impl Vma {
     pub fn is_growsdown(&self) -> bool {
         self.flags & VM_GROWSDOWN != 0
     }
+
+    /// Check if this VMA can merge with another adjacent VMA
+    ///
+    /// Two VMAs can merge if they are adjacent and have identical:
+    /// - Protection flags (prot)
+    /// - VMA flags (flags)
+    /// - File backing (both anonymous or same file with contiguous offsets)
+    pub fn can_merge_with(&self, other: &Vma) -> bool {
+        // Must be adjacent (this VMA ends where other begins)
+        if self.end != other.start {
+            return false;
+        }
+        // Must have same protection
+        if self.prot != other.prot {
+            return false;
+        }
+        // Must have same flags
+        if self.flags != other.flags {
+            return false;
+        }
+        // Must have same file backing with contiguous offsets
+        match (&self.file, &other.file) {
+            (None, None) => true, // Both anonymous
+            (Some(f1), Some(f2)) => {
+                // Same file and contiguous offset
+                Arc::ptr_eq(f1, f2) && self.offset + self.size() == other.offset
+            }
+            _ => false, // One has file, other doesn't
+        }
+    }
 }

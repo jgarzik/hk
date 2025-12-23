@@ -342,11 +342,26 @@ void *mremap(void *old_addr, size_t old_len, size_t new_len,
 
 ## Implementation Notes
 
+### VMA Merging (Tier 3 Optimization)
+
+Adjacent VMAs are automatically merged when they have compatible attributes. Two VMAs can merge if they have identical:
+- **Protection flags** (prot) - PROT_READ, PROT_WRITE, PROT_EXEC
+- **VMA flags** (flags) - MAP_SHARED/PRIVATE, VM_LOCKED, etc.
+- **File backing** - Both anonymous or same file with contiguous offsets
+
+Merging occurs after:
+- `mmap()` - New mappings may merge with adjacent VMAs
+- `mprotect()` - Protection changes may enable merging
+- `brk()` - Heap expansion may merge with adjacent VMAs
+- `mlock()/mlock2()` - Flag changes may enable merging
+- `madvise()` - Hint changes may enable merging
+- `mremap()` - Moved/resized mappings may merge
+
+This optimization reduces memory overhead (fewer VMA entries) and improves lookup performance.
+
 Current limitations in the implementation:
 
-1. **No VMA merging** - Adjacent VMAs with compatible flags are not merged. Linux has sophisticated merge logic (`vma_merge()`) for efficiency.
-
-2. **No VMA splitting** - mprotect on a partial VMA region updates the entire VMA's protection; a full implementation would split the VMA.
+1. **No VMA splitting** - mprotect on a partial VMA region updates the entire VMA's protection; a full implementation would split the VMA.
 
 ## Future Work
 
@@ -366,8 +381,8 @@ Current limitations in the implementation:
 - ~~**msync()** - Sync file-backed mappings to disk~~ ✓
 - ~~**MAP_FIXED_NOREPLACE** - Safer MAP_FIXED that fails on overlap~~ ✓
 
-### Tier 3: Optimization
-- **VMA merging** - Merge adjacent compatible VMAs
+### Tier 3: Optimization (DONE)
+- ~~**VMA merging** - Merge adjacent compatible VMAs~~ ✓
 
 ### Tier 4: Advanced Features
 - **MAP_HUGETLB** - Huge page support (requires arch TLB support)

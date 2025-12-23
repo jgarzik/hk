@@ -228,10 +228,13 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         mm_guard.add_locked_vm(pages);
     }
 
-    mm_guard.insert_vma(vma);
+    let idx = mm_guard.insert_vma(vma);
 
     // Update total_vm for RLIMIT_AS tracking
     mm_guard.add_total_vm(length / PAGE_SIZE);
+
+    // Try to merge with adjacent VMAs (VMA merging optimization)
+    mm_guard.merge_adjacent(idx);
 
     // Populate pages if:
     // 1. MAP_LOCKED is set, or
@@ -567,7 +570,14 @@ pub fn sys_brk(brk: u64) -> i64 {
                 PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS,
             );
-            mm_guard.insert_vma(heap_vma);
+            let idx = mm_guard.insert_vma(heap_vma);
+            // Try to merge with adjacent VMAs (VMA merging optimization)
+            mm_guard.merge_adjacent(idx);
+        } else {
+            // Heap VMA was extended - try merging with next VMA
+            if let Some(idx) = mm_guard.find_vma_index(start_brk_aligned) {
+                mm_guard.merge_adjacent(idx);
+            }
         }
 
         // Update total_vm for RLIMIT_AS tracking
@@ -912,7 +922,9 @@ fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
     }
 
     // Second pass: update VMA flags now that we've passed the limit check
-    for vma in mm_guard.iter_mut() {
+    // Collect indices of modified VMAs for merging
+    let mut modified_indices: Vec<usize> = Vec::new();
+    for (idx, vma) in mm_guard.iter_mut().enumerate() {
         // Check for overlap
         if vma.end <= start_aligned || vma.start >= end_aligned {
             continue; // No overlap
@@ -920,10 +932,17 @@ fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
 
         // Set the lock flags (clear old lock flags first, then set new ones)
         vma.flags = (vma.flags & !VM_LOCKED_MASK) | vm_flags;
+        modified_indices.push(idx);
     }
 
     // Update locked_vm counter after the loop
     mm_guard.add_locked_vm(pages_to_add);
+
+    // Try to merge modified VMAs with adjacent VMAs (VMA merging optimization)
+    // Process in reverse order to maintain valid indices after removals
+    for &idx in modified_indices.iter().rev() {
+        mm_guard.merge_adjacent(idx);
+    }
 
     // Release lock before populating (to avoid holding lock during page faults)
     drop(mm_guard);
@@ -1271,7 +1290,9 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     }
 
     // Now update the VMA protection flags
-    for vma in mm_guard.iter_mut() {
+    // Collect indices of modified VMAs for merging
+    let mut modified_indices: Vec<usize> = Vec::new();
+    for (idx, vma) in mm_guard.iter_mut().enumerate() {
         if vma.end <= start || vma.start >= end {
             continue;
         }
@@ -1280,6 +1301,13 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
         // Note: This is simplified - a full implementation would handle
         // VMA splitting if the mprotect range doesn't align with VMA boundaries
         vma.prot = prot;
+        modified_indices.push(idx);
+    }
+
+    // Try to merge modified VMAs with adjacent VMAs (VMA merging optimization)
+    // Process in reverse order to maintain valid indices after removals
+    for &idx in modified_indices.iter().rev() {
+        mm_guard.merge_adjacent(idx);
     }
 
     // Get page table root for page table updates
@@ -1483,8 +1511,9 @@ fn madvise_update_vma_flags(
 ) -> i64 {
     let mut mm_guard = mm.lock();
 
-    // Walk VMAs and update flags
-    for vma in mm_guard.iter_mut() {
+    // Walk VMAs and update flags, collect indices for merging
+    let mut modified_indices: Vec<usize> = Vec::new();
+    for (idx, vma) in mm_guard.iter_mut().enumerate() {
         // Skip VMAs outside our range
         if vma.end <= start || vma.start >= end {
             continue;
@@ -1521,6 +1550,13 @@ fn madvise_update_vma_flags(
             }
             _ => {}
         }
+        modified_indices.push(idx);
+    }
+
+    // Try to merge modified VMAs with adjacent VMAs (VMA merging optimization)
+    // Process in reverse order to maintain valid indices after removals
+    for &idx in modified_indices.iter().rev() {
+        mm_guard.merge_adjacent(idx);
     }
 
     0
@@ -1759,8 +1795,10 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         new_vma.end = target_addr + new_len_aligned;
 
         // Insert new VMA
-        mm_guard.insert_vma(new_vma);
+        let new_idx = mm_guard.insert_vma(new_vma);
         mm_guard.add_total_vm(new_len_aligned / PAGE_SIZE);
+        // Try to merge with adjacent VMAs (VMA merging optimization)
+        mm_guard.merge_adjacent(new_idx);
 
         // Handle old VMA based on DONTUNMAP flag
         if dontunmap {
@@ -1799,8 +1837,10 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         let mut new_vma = vma_clone.clone();
         new_vma.start = new_addr;
         new_vma.end = new_addr + new_len_aligned;
-        mm_guard.insert_vma(new_vma);
+        let new_idx = mm_guard.insert_vma(new_vma);
         mm_guard.add_total_vm(new_len_aligned / PAGE_SIZE);
+        // Try to merge with adjacent VMAs (VMA merging optimization)
+        mm_guard.merge_adjacent(new_idx);
 
         // Handle old VMA
         if dontunmap {
