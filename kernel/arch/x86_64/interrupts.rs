@@ -634,6 +634,9 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
     // Clone VMA info we need (release lock before allocating)
     let vma_prot = vma.prot;
     let vma_is_anonymous = vma.is_anonymous();
+    let vma_file = vma.file.clone();
+    let vma_start = vma.start;
+    let vma_offset = vma.offset;
     drop(mm_guard);
 
     // Allocate a physical frame
@@ -642,15 +645,32 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
         None => return Some(false), // OOM
     };
 
-    // Zero the frame for anonymous mappings
+    // Initialize the page contents
     if vma_is_anonymous {
-        // Use architecture-specific fast zeroing if available
+        // Anonymous mapping - zero the page
         unsafe {
             core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
         }
+    } else if let Some(file) = vma_file {
+        // File-backed mapping - read file contents into the page
+        // Calculate file offset for this page
+        let page_addr = fault_addr & !0xFFF;
+        let file_offset = vma_offset + (page_addr - vma_start);
+
+        // First zero the frame in case the read is partial (e.g., at EOF)
+        unsafe {
+            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+        }
+
+        // Read from file into the frame
+        // Note: We read directly into the physical frame since it's identity-mapped
+        // in the kernel's address space for low physical addresses
+        let buf = unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE as usize) };
+        let _read_result = file.pread(buf, file_offset);
+        // If read fails or returns less than PAGE_SIZE, the remaining bytes are already zeroed
+        // This matches Linux behavior for holes/errors
     } else {
-        // File-backed mapping - for MVP, just zero it
-        // TODO: Read from file when file-backed mappings are fully implemented
+        // File-backed but no file reference (shouldn't happen) - zero it
         unsafe {
             core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
         }

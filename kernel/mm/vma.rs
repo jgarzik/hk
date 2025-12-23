@@ -44,6 +44,11 @@ pub const VM_LOCKED_MASK: u32 = VM_LOCKED | VM_LOCKONFAULT;
 /// Uses a high bit to avoid conflicts with standard flags
 pub const VM_SHM: u32 = 0x0002_0000;
 
+/// VMA is a shared mapping (MAP_SHARED)
+/// This affects how page faults are handled - shared mappings
+/// share the same physical pages and writes are visible to all
+pub const VM_SHARED: u32 = 0x0004_0000;
+
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
 

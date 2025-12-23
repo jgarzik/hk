@@ -54,6 +54,8 @@ pub const SYS_LSTAT: u64 = 6;
 pub const SYS_LSEEK: u64 = 8;
 /// mmap(addr, length, prot, flags, fd, offset)
 pub const SYS_MMAP: u64 = 9;
+/// mprotect(addr, len, prot)
+pub const SYS_MPROTECT: u64 = 10;
 /// munmap(addr, length)
 pub const SYS_MUNMAP: u64 = 11;
 /// brk(addr)
@@ -977,6 +979,7 @@ pub fn x86_64_syscall_dispatch(
             crate::mm::syscall::sys_mmap(arg0, arg1, arg2 as u32, arg3 as u32, arg4 as i32, _arg5)
                 as u64
         }
+        SYS_MPROTECT => crate::mm::syscall::sys_mprotect(arg0, arg1, arg2 as u32) as u64,
         SYS_MUNMAP => crate::mm::syscall::sys_munmap(arg0, arg1) as u64,
         SYS_BRK => crate::mm::syscall::sys_brk(arg0) as u64,
         SYS_MLOCK => crate::mm::syscall::sys_mlock(arg0, arg1) as u64,

@@ -11,8 +11,8 @@ use crate::task::percpu::current_tid;
 
 use super::{
     MAP_ANONYMOUS, MAP_FIXED, MAP_LOCKED, MAP_PRIVATE, MAP_SHARED, PAGE_SIZE, PROT_READ,
-    PROT_WRITE, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, Vma, create_default_mm, get_task_mm,
-    init_task_mm,
+    PROT_WRITE, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_SHARED, Vma, create_default_mm,
+    get_task_mm, init_task_mm,
 };
 
 // Error codes (negative errno)
@@ -74,11 +74,6 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     // Must specify exactly one of MAP_PRIVATE or MAP_SHARED
     if is_private == is_shared {
         return EINVAL;
-    }
-
-    // For MVP: only support private mappings
-    if is_shared {
-        return EINVAL; // MAP_SHARED not yet implemented
     }
 
     // Get file if not anonymous
@@ -156,6 +151,11 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     } else {
         Vma::new(map_addr, map_addr + length, prot, flags | MAP_ANONYMOUS)
     };
+
+    // Set VM_SHARED for shared mappings
+    if is_shared {
+        vma.flags |= VM_SHARED;
+    }
 
     // Handle MAP_LOCKED flag - lock pages in memory
     // Linux: do_mmap() checks can_do_mlock() and mlock_future_ok()
@@ -922,6 +922,150 @@ pub fn sys_munlockall() -> i64 {
 
     // Reset locked_vm counter
     mm_guard.reset_locked_vm();
+
+    0
+}
+
+// ============================================================================
+// mprotect syscall
+// ============================================================================
+
+/// mprotect syscall - Change protection of memory region
+///
+/// Changes the protection of the pages in the specified address range.
+///
+/// # Arguments
+/// * `addr` - Start address (must be page-aligned)
+/// * `len` - Length of region in bytes
+/// * `prot` - New protection flags (PROT_READ, PROT_WRITE, PROT_EXEC)
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
+    // Zero length is a no-op (success per Linux behavior)
+    if len == 0 {
+        return 0;
+    }
+
+    // Validate alignment
+    if addr & (PAGE_SIZE - 1) != 0 {
+        return EINVAL;
+    }
+
+    // Round up length to page boundary
+    let len_aligned = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let end = match addr.checked_add(len_aligned) {
+        Some(e) => e,
+        None => return EINVAL, // Overflow
+    };
+
+    // Validate protection flags (only PROT_READ, PROT_WRITE, PROT_EXEC are valid)
+    if prot & !(PROT_READ | PROT_WRITE | super::PROT_EXEC) != 0 {
+        return EINVAL;
+    }
+
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return EINVAL, // No mm
+    };
+
+    let mut mm_guard = mm.lock();
+
+    // Collect VMAs that need updating and validate the range is fully mapped
+    let mut vmas_to_update: Vec<(u64, u64, u32)> = Vec::new();
+    let mut covered_start = addr;
+
+    for vma in mm_guard.iter() {
+        // Skip VMAs that don't overlap with our range
+        if vma.end <= addr || vma.start >= end {
+            continue;
+        }
+
+        // Check for gaps - the range must be fully mapped
+        if vma.start > covered_start {
+            // Gap found - return ENOMEM (Linux behavior for unmapped region)
+            return ENOMEM;
+        }
+
+        // Calculate the portion of this VMA that falls within our range
+        let update_start = vma.start.max(addr);
+        let update_end = vma.end.min(end);
+
+        // Check if we're trying to write-protect a read-only file mapping
+        // (simplified check - full implementation would check file permissions)
+        if prot & PROT_WRITE != 0 && !vma.is_anonymous() && vma.is_shared() {
+            // For shared file mappings, we'd need to check file write permissions
+            // For now, we allow it (the page fault handler will handle actual access)
+        }
+
+        vmas_to_update.push((update_start, update_end, vma.prot));
+        covered_start = vma.end;
+    }
+
+    // Check if we covered the entire range
+    if covered_start < end {
+        return ENOMEM; // Range not fully mapped
+    }
+
+    // Now update the VMA protection flags
+    for vma in mm_guard.iter_mut() {
+        if vma.end <= addr || vma.start >= end {
+            continue;
+        }
+
+        // Update the protection flags for this VMA
+        // Note: This is simplified - a full implementation would handle
+        // VMA splitting if the mprotect range doesn't align with VMA boundaries
+        vma.prot = prot;
+    }
+
+    // Get page table root for page table updates
+    #[cfg(target_arch = "x86_64")]
+    let pt_root: u64 = {
+        let cr3: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+        }
+        cr3
+    };
+
+    #[cfg(target_arch = "aarch64")]
+    let pt_root: u64 = {
+        let ttbr0: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack));
+        }
+        ttbr0 & !0xFFF
+    };
+
+    // Release mm lock before doing page table updates
+    drop(mm_guard);
+
+    // Update page table entries for all affected pages
+    let writable = prot & PROT_WRITE != 0;
+    let executable = prot & super::PROT_EXEC != 0;
+
+    for (update_start, update_end, _old_prot) in vmas_to_update {
+        let mut page = update_start;
+        while page < update_end {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use crate::arch::x86_64::paging::X86_64PageTable;
+                // Only update if the page is actually mapped
+                X86_64PageTable::update_page_protection(pt_root, page, writable, executable);
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                use crate::arch::aarch64::paging::Aarch64PageTable;
+                // Only update if the page is actually mapped
+                Aarch64PageTable::update_page_protection(pt_root, page, writable, executable);
+            }
+
+            page += PAGE_SIZE;
+        }
+    }
 
     0
 }

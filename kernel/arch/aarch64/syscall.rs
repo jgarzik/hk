@@ -552,6 +552,7 @@ pub fn aarch64_syscall_dispatch(
             crate::mm::syscall::sys_mmap(arg0, arg1, arg2 as u32, arg3 as u32, arg4 as i32, _arg5)
                 as u64
         }
+        SYS_MPROTECT => crate::mm::syscall::sys_mprotect(arg0, arg1, arg2 as u32) as u64,
         SYS_MUNMAP => crate::mm::syscall::sys_munmap(arg0, arg1) as u64,
         SYS_BRK => crate::mm::syscall::sys_brk(arg0) as u64,
         SYS_MLOCK => crate::mm::syscall::sys_mlock(arg0, arg1) as u64,

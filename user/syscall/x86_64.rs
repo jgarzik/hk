@@ -106,6 +106,7 @@ pub const SYS_SELECT: u64 = 23;
 
 // Memory management syscalls
 pub const SYS_MMAP: u64 = 9;
+pub const SYS_MPROTECT: u64 = 10;
 pub const SYS_MUNMAP: u64 = 11;
 pub const SYS_BRK: u64 = 12;
 pub const SYS_MLOCK: u64 = 149;
@@ -1642,6 +1643,26 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
             in("r10") flags as u64,
             in("r8") fd as u64,
             in("r9") offset,
+            lateout("rax") ret,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// mprotect(addr, len, prot) - change memory protection
+#[inline(always)]
+pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") SYS_MPROTECT,
+            in("rdi") addr,
+            in("rsi") len,
+            in("rdx") prot as u64,
             lateout("rax") ret,
             out("rcx") _,
             out("r11") _,

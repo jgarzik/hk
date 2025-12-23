@@ -283,7 +283,7 @@ Extended attributes (Linux-specific):
 
 - [x] munmap
 
-- [ ] mprotect
+- [x] mprotect
 
 - [ ] mremap
 

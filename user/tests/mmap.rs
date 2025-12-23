@@ -9,10 +9,10 @@
 
 use super::helpers::{print, println, print_num};
 use crate::syscall::{
-    sys_mmap, sys_munmap, sys_mlock, sys_mlock2, sys_munlock,
+    sys_mmap, sys_mprotect, sys_munmap, sys_mlock, sys_mlock2, sys_munlock,
     sys_mlockall, sys_munlockall,
-    MAP_ANONYMOUS, MAP_LOCKED, MAP_PRIVATE,
-    PROT_READ, PROT_WRITE,
+    MAP_ANONYMOUS, MAP_LOCKED, MAP_PRIVATE, MAP_SHARED,
+    PROT_READ, PROT_WRITE, PROT_EXEC,
     MLOCK_ONFAULT, MCL_CURRENT, MCL_ONFAULT,
 };
 
@@ -23,6 +23,12 @@ pub fn run_tests() {
     test_munmap();
     test_large_anonymous_mmap();
     test_mmap_locked();
+    // mprotect tests
+    test_mprotect_add_write();
+    test_mprotect_zero_len();
+    test_mprotect_invalid_addr();
+    // MAP_SHARED tests
+    test_mmap_shared_anon();
     // mlock tests
     test_mlock_basic();
     test_mlock2_onfault();
@@ -451,4 +457,163 @@ fn test_munlockall() {
         print_num(-ret);
         println(b"");
     }
+}
+
+// ============================================================================
+// mprotect tests
+// ============================================================================
+
+/// Test: mprotect to add write permission (R -> RW)
+fn test_mprotect_add_write() {
+    // Map a read-only page
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ, // Initially read-only
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MPROTECT_ADD_WRITE:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Change to read-write
+    let ret = sys_mprotect(ptr as u64, 4096, PROT_READ | PROT_WRITE);
+    if ret != 0 {
+        print(b"MPROTECT_ADD_WRITE:FAIL mprotect errno=");
+        print_num(-ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    // Should now be able to write
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u8, 42);
+    }
+
+    // Read it back
+    let val = unsafe { core::ptr::read_volatile(ptr as *const u8) };
+    if val != 42 {
+        print(b"MPROTECT_ADD_WRITE:FAIL read mismatch got ");
+        print_num(val as i64);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MPROTECT_ADD_WRITE:OK");
+}
+
+/// Test: mprotect with zero length is a no-op (success)
+fn test_mprotect_zero_len() {
+    // Map a page
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MPROTECT_ZERO_LEN:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // mprotect with zero length should succeed (no-op per Linux)
+    let ret = sys_mprotect(ptr as u64, 0, PROT_READ);
+    if ret == 0 {
+        sys_munmap(ptr as u64, 4096);
+        println(b"MPROTECT_ZERO_LEN:OK");
+    } else {
+        print(b"MPROTECT_ZERO_LEN:FAIL expected 0, got ");
+        print_num(ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+    }
+}
+
+/// Test: mprotect with unaligned address returns EINVAL
+fn test_mprotect_invalid_addr() {
+    // Map a page first
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MPROTECT_EINVAL:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Try mprotect with unaligned address (add 1 to make it unaligned)
+    let ret = sys_mprotect(ptr as u64 + 1, 4096, PROT_READ);
+    if ret == -22 {
+        // EINVAL
+        sys_munmap(ptr as u64, 4096);
+        println(b"MPROTECT_EINVAL:OK");
+    } else {
+        print(b"MPROTECT_EINVAL:FAIL expected -22, got ");
+        print_num(ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+    }
+}
+
+// ============================================================================
+// MAP_SHARED tests
+// ============================================================================
+
+/// Test: MAP_SHARED | MAP_ANONYMOUS mapping
+fn test_mmap_shared_anon() {
+    // Map a shared anonymous page
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MMAP_SHARED_ANON:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Write to verify it's accessible
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0xCAFEBABE);
+    }
+
+    // Read it back
+    let val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
+    if val != 0xCAFEBABE {
+        print(b"MMAP_SHARED_ANON:FAIL read mismatch got ");
+        print_num(val as i64);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MMAP_SHARED_ANON:OK");
 }

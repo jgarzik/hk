@@ -121,6 +121,7 @@ pub const SYS_PSELECT6: u64 = 72;
 pub const SYS_BRK: u64 = 214;
 pub const SYS_MUNMAP: u64 = 215;
 pub const SYS_MMAP: u64 = 222;
+pub const SYS_MPROTECT: u64 = 226;
 pub const SYS_MLOCK: u64 = 228;
 pub const SYS_MUNLOCK: u64 = 229;
 pub const SYS_MLOCKALL: u64 = 230;
@@ -1503,6 +1504,24 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
             in("x3") flags as u64,
             in("x4") fd as u64,
             in("x5") offset,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// mprotect(addr, len, prot) - change memory protection
+#[inline(always)]
+pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_MPROTECT,
+            in("x0") addr,
+            in("x1") len,
+            in("x2") prot as u64,
             lateout("x0") ret,
             options(nostack),
         );

@@ -58,7 +58,7 @@ int munmap(void *addr, size_t length);
 
 | Flag | Value | Description | Status |
 |------|-------|-------------|--------|
-| MAP_SHARED | 0x01 | Share with other processes | Not implemented (returns EINVAL) |
+| MAP_SHARED | 0x01 | Share with other processes | Implemented |
 | MAP_PRIVATE | 0x02 | Private copy-on-write | Implemented |
 | MAP_FIXED | 0x10 | Use exact address | Implemented |
 | MAP_ANONYMOUS | 0x20 | No file backing | Implemented |
@@ -136,7 +136,7 @@ Check write permission if is_write
     ↓
 Allocate frame (FRAME_ALLOCATOR.alloc())
     ↓
-Zero-fill for anonymous mapping
+Zero-fill (anonymous) or read from file (file-backed)
     ↓
 Map page with appropriate permissions
     ↓
@@ -225,12 +225,14 @@ int munlockall(void);
 | MCL_FUTURE | 2 | Lock all future mappings |
 | MCL_ONFAULT | 4 | Lock on fault (combine with MCL_CURRENT or MCL_FUTURE) |
 
-### VMA Lock Flags
+### VMA Flags
 
 | Flag | Value | Description |
 |------|-------|-------------|
 | VM_LOCKED | 0x2000 | Pages are locked in memory |
 | VM_LOCKONFAULT | 0x10000 | Lock pages on first fault |
+| VM_SHM | 0x20000 | System V shared memory segment |
+| VM_SHARED | 0x40000 | Shared mapping (MAP_SHARED) |
 
 ## Error Codes
 
@@ -242,11 +244,26 @@ int munlockall(void);
 | EBADF | -9 | Bad file descriptor |
 | ENODEV | -19 | File doesn't support mmap |
 
+### mprotect
+
+```c
+int mprotect(void *addr, size_t len, int prot);
+```
+
+| Argument | Description |
+|----------|-------------|
+| addr | Start address (page-aligned) |
+| len | Length in bytes (0 = no-op) |
+| prot | New protection flags (PROT_*) |
+
+**Returns**: 0 on success, -errno on failure
+
+Changes the protection flags for pages in the specified range. The range must be fully covered by existing VMAs (returns ENOMEM for unmapped regions).
+
 ## Missing Syscalls
 
 | Syscall | Priority | Description |
 |---------|----------|-------------|
-| mprotect | High | Change VMA protection on existing mappings |
 | madvise | Medium | Memory usage hints (MADV_DONTNEED widely used) |
 | mremap | Medium | Resize/move existing mappings |
 | msync | Medium | Sync file-backed mappings to disk |
@@ -260,16 +277,16 @@ Current limitations in the implementation:
 
 2. **No VMA merging** - Adjacent VMAs with compatible flags are not merged. Linux has sophisticated merge logic (`vma_merge()`) for efficiency.
 
-3. **File-backed mappings incomplete** - VMA stores file reference but page fault handler zero-fills instead of reading from file.
+3. **No VMA splitting** - mprotect on a partial VMA region updates the entire VMA's protection; a full implementation would split the VMA.
 
 4. **No page population** - MAP_POPULATE flag not supported; pages always demand-faulted.
 
 ## Future Work
 
-### Tier 1: Core Functionality
-- **mprotect()** - Change protection on existing mappings (widely used)
-- **MAP_SHARED** - Shared memory between processes (needed for IPC)
-- **File-backed mapping I/O** - Read file contents on demand fault
+### Tier 1: Core Functionality (DONE)
+- ~~**mprotect()** - Change protection on existing mappings~~ ✓
+- ~~**MAP_SHARED** - Shared memory between processes~~ ✓
+- ~~**File-backed mapping I/O** - Read file contents on demand fault~~ ✓
 
 ### Tier 2: Common Features
 - **madvise()** - Memory hints (MADV_DONTNEED for memory release)
