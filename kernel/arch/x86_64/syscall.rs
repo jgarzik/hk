@@ -192,6 +192,8 @@ pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
 /// fchdir(fd)
 pub const SYS_FCHDIR: u64 = 81;
+/// chroot(pathname)
+pub const SYS_CHROOT: u64 = 161;
 /// openat(dirfd, pathname, flags, mode)
 pub const SYS_OPENAT: u64 = 257;
 /// faccessat(dirfd, pathname, mode, flags)
@@ -258,6 +260,8 @@ pub const SYS_UTIMES: u64 = 235;
 pub const SYS_FCHOWNAT: u64 = 260;
 /// fchmodat(dirfd, pathname, mode, flags)
 pub const SYS_FCHMODAT: u64 = 268;
+/// fchmodat2(dirfd, pathname, mode, flags) - extended fchmodat with flags
+pub const SYS_FCHMODAT2: u64 = 452;
 /// utimensat(dirfd, pathname, times, flags)
 pub const SYS_UTIMENSAT: u64 = 280;
 /// rename(oldpath, newpath)
@@ -909,6 +913,7 @@ pub fn x86_64_syscall_dispatch(
         sys_chdir,
         sys_chmod,
         sys_chown,
+        sys_chroot,
         sys_close,
         sys_dup,
         sys_dup2,
@@ -918,6 +923,7 @@ pub fn x86_64_syscall_dispatch(
         sys_fchdir,
         sys_fchmod,
         sys_fchmodat,
+        sys_fchmodat2,
         sys_fchown,
         sys_fchownat,
         // fcntl
@@ -925,6 +931,7 @@ pub fn x86_64_syscall_dispatch(
         // Sync syscalls
         sys_fdatasync,
         sys_fstat,
+        sys_fstatfs,
         sys_fsync,
         sys_ftruncate,
         sys_getcwd,
@@ -969,7 +976,6 @@ pub fn x86_64_syscall_dispatch(
         sys_select,
         sys_stat,
         sys_statfs,
-        sys_fstatfs,
         sys_statx,
         sys_symlink,
         sys_symlinkat,
@@ -1143,6 +1149,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_GETCWD => sys_getcwd(arg0, arg1) as u64,
         SYS_CHDIR => sys_chdir(arg0) as u64,
         SYS_FCHDIR => sys_fchdir(arg0 as i32) as u64,
+        SYS_CHROOT => sys_chroot(arg0) as u64,
         SYS_OPENAT => sys_openat(arg0 as i32, arg1, arg2 as u32, arg3 as u32) as u64,
         SYS_FACCESSAT => sys_faccessat(arg0 as i32, arg1, arg2 as i32, arg3 as i32) as u64,
         SYS_DUP3 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as u32) as u64,
@@ -1212,6 +1219,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_CHMOD => sys_chmod(arg0, arg1 as u32) as u64,
         SYS_FCHMOD => sys_fchmod(arg0 as i32, arg1 as u32) as u64,
         SYS_FCHMODAT => sys_fchmodat(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64,
+        SYS_FCHMODAT2 => sys_fchmodat2(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64,
 
         // Ownership
         SYS_CHOWN => sys_chown(arg0, arg1 as u32, arg2 as u32) as u64,

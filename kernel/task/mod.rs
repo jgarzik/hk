@@ -788,6 +788,8 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
 
 /// CAP_IPC_LOCK - Lock memory (mlock, mlockall, etc.)
 pub const CAP_IPC_LOCK: u32 = 14;
+/// CAP_SYS_CHROOT - Use chroot()
+pub const CAP_SYS_CHROOT: u32 = 18;
 /// CAP_SYS_ADMIN - System administration capabilities
 pub const CAP_SYS_ADMIN: u32 = 21;
 /// CAP_SYS_NICE - Raise process nice value, set real-time priorities

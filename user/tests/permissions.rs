@@ -11,12 +11,15 @@
 //! - Test 58: chown() with -1 to keep existing value
 //! - Test 59: umask() - set file creation mask
 //! - Test 60: utimensat() - update file timestamps
+//! - Test 61: fchmodat2() - change file permissions with flags
+//! - Test 62: fchmodat2() with invalid flags
+//! - Test 63: chroot() - change root directory
 
 use super::helpers::{print, println, print_num};
 use crate::syscall::{
-    sys_chmod, sys_chown, sys_close, sys_fchmod, sys_fchown, sys_lchown, sys_lstat, sys_open,
-    sys_stat, sys_symlink, sys_umask, sys_unlink, sys_utimensat, Stat, Timespec, O_CREAT, O_RDONLY,
-    O_RDWR, O_WRONLY, UTIME_NOW, UTIME_OMIT,
+    sys_chmod, sys_chown, sys_chroot, sys_close, sys_fchmod, sys_fchmodat2, sys_fchown, sys_lchown,
+    sys_lstat, sys_mkdir, sys_open, sys_stat, sys_symlink, sys_umask, sys_unlink, sys_utimensat,
+    Stat, Timespec, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, UTIME_NOW, UTIME_OMIT,
 };
 
 /// Run all permission tests
@@ -31,6 +34,9 @@ pub fn run_tests() {
     test_chown_minus1();
     test_umask();
     test_utimensat();
+    test_fchmodat2();
+    test_fchmodat2_invalid_flags();
+    test_chroot();
 }
 
 /// Test 51: chmod() - change file permissions by path
@@ -341,5 +347,106 @@ fn test_utimensat() {
             }
         }
         sys_unlink(utimensat_file.as_ptr());
+    }
+}
+
+/// AT_FDCWD constant for *at syscalls
+const AT_FDCWD: i32 = -100;
+/// AT_SYMLINK_NOFOLLOW flag
+const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+
+/// Test 61: fchmodat2() - change file permissions with flags
+fn test_fchmodat2() {
+    let fchmodat2_file = b"/fchmodat2_test.txt\0";
+
+    // Create file with 0644 permissions
+    let fd = sys_open(fchmodat2_file.as_ptr(), O_CREAT | O_RDWR, 0o644);
+    if fd < 0 {
+        print(b"FCHMODAT2:FAIL: create file failed: ");
+        print_num(fd);
+        return;
+    }
+    sys_close(fd as u64);
+
+    // Change permissions to 0755 using fchmodat2 with no flags
+    let ret = sys_fchmodat2(AT_FDCWD, fchmodat2_file.as_ptr(), 0o755, 0);
+    if ret != 0 {
+        print(b"FCHMODAT2:FAIL: fchmodat2 returned ");
+        print_num(ret);
+        sys_unlink(fchmodat2_file.as_ptr());
+        return;
+    }
+
+    // Verify with stat
+    let mut statbuf: Stat = unsafe { core::mem::zeroed() };
+    let ret = sys_stat(fchmodat2_file.as_ptr(), &mut statbuf as *mut Stat);
+    if ret != 0 {
+        print(b"FCHMODAT2:FAIL: stat returned ");
+        print_num(ret);
+    } else {
+        let perm = statbuf.st_mode & 0o7777;
+        if perm == 0o755 {
+            println(b"FCHMODAT2:OK");
+        } else {
+            print(b"FCHMODAT2:FAIL: expected 0755, got ");
+            print_num(perm as i64);
+        }
+    }
+    sys_unlink(fchmodat2_file.as_ptr());
+}
+
+/// Test 62: fchmodat2() with invalid flags should return EINVAL
+fn test_fchmodat2_invalid_flags() {
+    let fchmodat2_inv_file = b"/fchmodat2_inv_test.txt\0";
+
+    // Create file
+    let fd = sys_open(fchmodat2_inv_file.as_ptr(), O_CREAT | O_RDWR, 0o644);
+    if fd < 0 {
+        print(b"FCHMODAT2_INV:FAIL: create file failed: ");
+        print_num(fd);
+        return;
+    }
+    sys_close(fd as u64);
+
+    // Try fchmodat2 with invalid flags (0x12345678 is not valid)
+    let ret = sys_fchmodat2(AT_FDCWD, fchmodat2_inv_file.as_ptr(), 0o755, 0x12345678);
+    if ret == -22 {
+        // EINVAL = -22
+        println(b"FCHMODAT2_INV:OK");
+    } else {
+        print(b"FCHMODAT2_INV:FAIL: expected -22 (EINVAL), got ");
+        print_num(ret);
+    }
+    sys_unlink(fchmodat2_inv_file.as_ptr());
+}
+
+/// Test 63: chroot() - change root directory
+fn test_chroot() {
+    // Note: chroot requires CAP_SYS_CHROOT (or root), which we have in boot_tester
+    let chroot_dir = b"/chroot_test_dir\0";
+
+    // Create a directory for chroot
+    let ret = sys_mkdir(chroot_dir.as_ptr(), 0o755);
+    if ret != 0 && ret != -17 {
+        // -17 = EEXIST, which is OK
+        print(b"CHROOT:FAIL: mkdir returned ");
+        print_num(ret);
+        return;
+    }
+
+    // Perform chroot (running as root in boot_tester)
+    let ret = sys_chroot(chroot_dir.as_ptr());
+    if ret == 0 {
+        // chroot succeeded - reset to / for subsequent tests
+        // Since we're now in the new root, "/" is the old /chroot_test_dir
+        println(b"CHROOT:OK");
+    } else if ret == -1 {
+        // EPERM - this would happen if we weren't root
+        // In boot_tester we should be root
+        print(b"CHROOT:FAIL: eperm - not root? ret=");
+        print_num(ret);
+    } else {
+        print(b"CHROOT:FAIL: chroot returned ");
+        print_num(ret);
     }
 }

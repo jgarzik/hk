@@ -22,7 +22,9 @@ use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
 /// Error numbers (negated for return)
+pub const EPERM: i64 = -1;
 pub const ENOENT: i64 = -2;
+pub const EACCES: i64 = -13;
 pub const ENXIO: i64 = -6;
 pub const EBADF: i64 = -9;
 pub const EAGAIN: i64 = -11;
@@ -432,6 +434,68 @@ pub fn sys_fchdir(fd: i32) -> i64 {
         && let Some(new_pwd) = Path::from_dentry(file.dentry.clone())
     {
         fs.set_pwd(new_pwd);
+    }
+
+    0
+}
+
+/// sys_chroot - change root directory
+///
+/// Changes the root directory of the calling process to the directory
+/// specified in path. This call does not change the current working directory.
+///
+/// # Arguments
+/// * `path_ptr` - User pointer to null-terminated path string
+///
+/// # Returns
+/// 0 on success, negative errno on error.
+///
+/// # Errors
+/// * EFAULT - Invalid user pointer
+/// * ENOENT - Path not found
+/// * ENOTDIR - Path is not a directory
+/// * EACCES - No execute permission on path
+/// * EPERM - Caller lacks CAP_SYS_CHROOT capability
+pub fn sys_chroot(path_ptr: u64) -> i64 {
+    // Check capability (must be root or have CAP_SYS_CHROOT)
+    if !crate::task::capable(crate::task::CAP_SYS_CHROOT) {
+        return EPERM;
+    }
+
+    // Copy path from user space
+    let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Start from current working directory for relative paths
+    let start = crate::task::percpu::current_cwd();
+
+    // Look up the path - must be a directory and we must follow symlinks
+    let dentry = match lookup_path_at(start, &path_str, LookupFlags::opendir()) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(FsError::PermissionDenied) => return EACCES,
+        Err(_) => return EINVAL,
+    };
+
+    // Verify it's a directory (should be guaranteed by opendir() flags, but check anyway)
+    if let Some(inode) = dentry.get_inode() {
+        if !inode.mode().is_dir() {
+            return ENOTDIR;
+        }
+    } else {
+        return ENOENT;
+    }
+
+    // Update the root directory
+    if let Some(fs) = crate::task::percpu::current_fs()
+        && let Some(new_root) = Path::from_dentry(dentry)
+    {
+        fs.set_root(new_root);
+    } else {
+        return EINVAL;
     }
 
     0
@@ -1619,7 +1683,11 @@ pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) 
 
     // For offset == -1, use current file position
     let use_position = offset == -1;
-    let mut current_offset = if use_position { file.get_pos() } else { offset as u64 };
+    let mut current_offset = if use_position {
+        file.get_pos()
+    } else {
+        offset as u64
+    };
 
     let mut total_read: usize = 0;
 
@@ -1648,23 +1716,43 @@ pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) 
             let bytes_read = match result {
                 Ok(n) => n,
                 Err(FsError::WouldBlock) => {
-                    return if total_read > 0 { total_read as i64 } else { EAGAIN };
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EAGAIN
+                    };
                 }
                 Err(FsError::NotSupported) => {
-                    return if total_read > 0 { total_read as i64 } else { EOPNOTSUPP };
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EOPNOTSUPP
+                    };
                 }
                 Err(FsError::PermissionDenied) => {
-                    return if total_read > 0 { total_read as i64 } else { EBADF };
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EBADF
+                    };
                 }
                 Err(_) => {
-                    return if total_read > 0 { total_read as i64 } else { EINVAL };
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EINVAL
+                    };
                 }
             };
 
             if bytes_read > 0
                 && copy_to_user::<Uaccess>(iov.iov_base, &read_buf[..bytes_read]).is_err()
             {
-                return if total_read > 0 { total_read as i64 } else { EFAULT };
+                return if total_read > 0 {
+                    total_read as i64
+                } else {
+                    EFAULT
+                };
             }
 
             total_read += bytes_read;
@@ -1685,23 +1773,43 @@ pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) 
             let bytes_read = match result {
                 Ok(n) => n,
                 Err(FsError::WouldBlock) => {
-                    return if total_read > 0 { total_read as i64 } else { EAGAIN };
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EAGAIN
+                    };
                 }
                 Err(FsError::NotSupported) => {
-                    return if total_read > 0 { total_read as i64 } else { EOPNOTSUPP };
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EOPNOTSUPP
+                    };
                 }
                 Err(FsError::PermissionDenied) => {
-                    return if total_read > 0 { total_read as i64 } else { EBADF };
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EBADF
+                    };
                 }
                 Err(_) => {
-                    return if total_read > 0 { total_read as i64 } else { EINVAL };
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EINVAL
+                    };
                 }
             };
 
             if bytes_read > 0
                 && copy_to_user::<Uaccess>(iov.iov_base, &kernel_buf[..bytes_read]).is_err()
             {
-                return if total_read > 0 { total_read as i64 } else { EFAULT };
+                return if total_read > 0 {
+                    total_read as i64
+                } else {
+                    EFAULT
+                };
             }
 
             total_read += bytes_read;
@@ -1847,19 +1955,39 @@ pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32)
             let bytes_written = match result {
                 Ok(n) => n,
                 Err(FsError::WouldBlock) => {
-                    return if total_written > 0 { total_written as i64 } else { EAGAIN };
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EAGAIN
+                    };
                 }
                 Err(FsError::NotSupported) => {
-                    return if total_written > 0 { total_written as i64 } else { EOPNOTSUPP };
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EOPNOTSUPP
+                    };
                 }
                 Err(FsError::PermissionDenied) => {
-                    return if total_written > 0 { total_written as i64 } else { EBADF };
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EBADF
+                    };
                 }
                 Err(FsError::BrokenPipe) => {
-                    return if total_written > 0 { total_written as i64 } else { EPIPE };
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EPIPE
+                    };
                 }
                 Err(_) => {
-                    return if total_written > 0 { total_written as i64 } else { EINVAL };
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EINVAL
+                    };
                 }
             };
 
@@ -1892,19 +2020,39 @@ pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32)
             let bytes_written = match result {
                 Ok(n) => n,
                 Err(FsError::WouldBlock) => {
-                    return if total_written > 0 { total_written as i64 } else { EAGAIN };
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EAGAIN
+                    };
                 }
                 Err(FsError::NotSupported) => {
-                    return if total_written > 0 { total_written as i64 } else { EOPNOTSUPP };
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EOPNOTSUPP
+                    };
                 }
                 Err(FsError::PermissionDenied) => {
-                    return if total_written > 0 { total_written as i64 } else { EBADF };
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EBADF
+                    };
                 }
                 Err(FsError::BrokenPipe) => {
-                    return if total_written > 0 { total_written as i64 } else { EPIPE };
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EPIPE
+                    };
                 }
                 Err(_) => {
-                    return if total_written > 0 { total_written as i64 } else { EINVAL };
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EINVAL
+                    };
                 }
             };
 
@@ -2542,9 +2690,6 @@ pub fn sys_fstatat(dirfd: i32, path_ptr: u64, statbuf: u64, flags: i32) -> i64 {
 // access, faccessat, faccessat2 syscalls
 // ============================================================================
 
-/// Permission denied error
-const EACCES: i64 = -13;
-
 // access() mode flags - what permissions to check
 /// Check if file exists
 const F_OK: i32 = 0;
@@ -2731,8 +2876,6 @@ pub fn sys_faccessat2(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
 const ELOOP: i64 = -40;
 /// File exists
 const EEXIST: i64 = -17;
-/// Operation not permitted
-const EPERM: i64 = -1;
 /// Cross-device link
 const EXDEV: i64 = -18;
 
@@ -3925,42 +4068,71 @@ fn sys_unlinkat_rmdir(dirfd: i32, path: &str) -> i64 {
 // Permission modification syscalls
 // =============================================================================
 
-/// sys_fchmodat - change file permissions relative to directory fd
+/// Internal helper for fchmodat/fchmodat2
 ///
-/// This is the core implementation used by chmod and fchmodat.
-pub fn sys_fchmodat(dirfd: i32, pathname: u64, mode: u32, _flags: i32) -> i64 {
+/// # Arguments
+/// * `dirfd` - Directory fd for relative paths, or AT_FDCWD
+/// * `pathname` - User pointer to path string
+/// * `mode` - New permission mode
+/// * `flags` - AT_SYMLINK_NOFOLLOW and/or AT_EMPTY_PATH
+fn do_fchmodat(dirfd: i32, pathname: u64, mode: u32, flags: i32) -> i64 {
+    // Validate flags - only AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH allowed
+    const FCHMODAT_VALID_FLAGS: i32 = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+    if (flags & !FCHMODAT_VALID_FLAGS) != 0 {
+        return EINVAL;
+    }
+
     // Copy path from user space
     let path_str = match strncpy_from_user::<Uaccess>(pathname, PATH_MAX) {
         Ok(p) => p,
         Err(_) => return EFAULT,
     };
 
-    // Determine starting path for relative paths
-    let start: Option<Path> = if path_str.starts_with('/') {
-        // Absolute path - lookup_path_at will use root
-        None
-    } else if dirfd == AT_FDCWD {
-        // Use current working directory
-        crate::task::percpu::current_cwd()
-    } else {
-        // Use directory from file descriptor
-        let file = match current_fd_table().lock().get(dirfd) {
-            Some(f) => f,
-            None => return EBADF,
-        };
-        if !file.is_dir() {
-            return ENOTDIR;
+    // Handle AT_EMPTY_PATH - operate on dirfd itself
+    let dentry = if path_str.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+        if dirfd < 0 {
+            return EBADF;
         }
-        Path::from_dentry(file.dentry.clone())
-    };
+        match current_fd_table().lock().get(dirfd) {
+            Some(f) => f.dentry.clone(),
+            None => return EBADF,
+        }
+    } else {
+        // Determine starting path for relative paths
+        let start: Option<Path> = if path_str.starts_with('/') {
+            // Absolute path - lookup_path_at will use root
+            None
+        } else if dirfd == AT_FDCWD {
+            // Use current working directory
+            crate::task::percpu::current_cwd()
+        } else {
+            // Use directory from file descriptor
+            let file = match current_fd_table().lock().get(dirfd) {
+                Some(f) => f,
+                None => return EBADF,
+            };
+            if !file.is_dir() {
+                return ENOTDIR;
+            }
+            Path::from_dentry(file.dentry.clone())
+        };
 
-    // Note: fchmodat follows symlinks by default (use AT_SYMLINK_NOFOLLOW to not follow)
-    // Using open() flags which follow symlinks
-    let dentry = match lookup_path_at(start, &path_str, LookupFlags::open()) {
-        Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        // Determine lookup flags based on AT_SYMLINK_NOFOLLOW
+        let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+            LookupFlags {
+                follow: false,
+                ..LookupFlags::open()
+            }
+        } else {
+            LookupFlags::open()
+        };
+
+        match lookup_path_at(start, &path_str, lookup_flags) {
+            Ok(d) => d,
+            Err(FsError::NotFound) => return ENOENT,
+            Err(FsError::NotADirectory) => return ENOTDIR,
+            Err(_) => return EINVAL,
+        }
     };
 
     // Get the inode
@@ -3973,6 +4145,31 @@ pub fn sys_fchmodat(dirfd: i32, pathname: u64, mode: u32, _flags: i32) -> i64 {
     inode.set_mode_perm((mode & 0o7777) as u16);
 
     0
+}
+
+/// sys_fchmodat - change file permissions relative to directory fd
+///
+/// This is the core implementation used by chmod and fchmodat.
+/// Note: fchmodat ignores flags parameter (always follows symlinks).
+pub fn sys_fchmodat(dirfd: i32, pathname: u64, mode: u32, _flags: i32) -> i64 {
+    // fchmodat ignores flags parameter (always follows symlinks)
+    do_fchmodat(dirfd, pathname, mode, 0)
+}
+
+/// sys_fchmodat2 - change file permissions with flags support
+///
+/// Extended version of fchmodat that properly handles flags.
+///
+/// # Arguments
+/// * `dirfd` - Directory fd for relative paths, or AT_FDCWD
+/// * `pathname` - User pointer to path string
+/// * `mode` - New permission mode
+/// * `flags` - AT_SYMLINK_NOFOLLOW and/or AT_EMPTY_PATH
+///
+/// # Returns
+/// 0 on success, negative errno on error.
+pub fn sys_fchmodat2(dirfd: i32, pathname: u64, mode: u32, flags: i32) -> i64 {
+    do_fchmodat(dirfd, pathname, mode, flags)
 }
 
 /// sys_chmod - change file permissions

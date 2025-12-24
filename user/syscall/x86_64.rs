@@ -305,6 +305,8 @@ pub const SYS_VMSPLICE: u64 = 278;
 pub const SYS_STATFS: u64 = 137;
 pub const SYS_FSTATFS: u64 = 138;
 pub const SYS_STATX: u64 = 332;
+pub const SYS_CHROOT: u64 = 161;
+pub const SYS_FCHMODAT2: u64 = 452;
 
 // arch_prctl operation codes
 pub const ARCH_SET_GS: i32 = 0x1001;
@@ -485,6 +487,16 @@ pub fn sys_lchown(pathname: *const u8, owner: u32, group: u32) -> i64 {
 #[inline(always)]
 pub fn sys_umask(mask: u32) -> i64 {
     unsafe { syscall1!(SYS_UMASK, mask) }
+}
+
+#[inline(always)]
+pub fn sys_chroot(pathname: *const u8) -> i64 {
+    unsafe { syscall1!(SYS_CHROOT, pathname) }
+}
+
+#[inline(always)]
+pub fn sys_fchmodat2(dirfd: i32, pathname: *const u8, mode: u32, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_FCHMODAT2, dirfd, pathname, mode, flags) }
 }
 
 // --- File Stats ---

@@ -31,9 +31,12 @@ pub const SYS_RENAMEAT: u64 = 38;
 pub const SYS_UMOUNT2: u64 = 39;
 pub const SYS_MOUNT: u64 = 40;
 pub const SYS_FTRUNCATE: u64 = 46;
+pub const SYS_CHROOT: u64 = 51;
 pub const SYS_FCHMOD: u64 = 52;
 pub const SYS_FCHMODAT: u64 = 53;
 pub const SYS_FCHOWNAT: u64 = 54;
+/// fchmodat2(dirfd, pathname, mode, flags) - extended fchmodat with flags
+pub const SYS_FCHMODAT2: u64 = 452;
 pub const SYS_FCHOWN: u64 = 55;
 pub const SYS_OPENAT: u64 = 56;
 pub const SYS_CLOSE: u64 = 57;
@@ -299,13 +302,13 @@ pub fn aarch64_syscall_dispatch(
     arg5: u64,
 ) -> u64 {
     use crate::fs::syscall::{
-        sys_close, sys_dup3, sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fcntl,
-        sys_fdatasync, sys_fstatat, sys_fstatfs, sys_fsync, sys_ftruncate, sys_getdents64,
-        sys_ioctl, sys_linkat, sys_lseek, sys_mkdirat, sys_mknodat, sys_mount, sys_openat,
-        sys_pipe2, sys_ppoll, sys_pread64, sys_preadv, sys_preadv2, sys_pselect6, sys_pwrite64,
-        sys_pwritev, sys_pwritev2, sys_read, sys_readlinkat, sys_readv, sys_renameat, sys_statfs,
-        sys_statx, sys_symlinkat, sys_sync, sys_syncfs, sys_umask, sys_umount2, sys_unlinkat,
-        sys_utimensat, sys_write, sys_writev,
+        sys_chroot, sys_close, sys_dup3, sys_fchmod, sys_fchmodat, sys_fchmodat2, sys_fchown,
+        sys_fchownat, sys_fcntl, sys_fdatasync, sys_fstatat, sys_fstatfs, sys_fsync, sys_ftruncate,
+        sys_getdents64, sys_ioctl, sys_linkat, sys_lseek, sys_mkdirat, sys_mknodat, sys_mount,
+        sys_openat, sys_pipe2, sys_ppoll, sys_pread64, sys_preadv, sys_preadv2, sys_pselect6,
+        sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read, sys_readlinkat, sys_readv, sys_renameat,
+        sys_statfs, sys_statx, sys_symlinkat, sys_sync, sys_syncfs, sys_umask, sys_umount2,
+        sys_unlinkat, sys_utimensat, sys_write, sys_writev,
     };
     use crate::task::exec::sys_execve;
     use crate::task::percpu;
@@ -353,8 +356,10 @@ pub fn aarch64_syscall_dispatch(
         SYS_RENAMEAT => sys_renameat(arg0 as i32, arg1, arg2 as i32, arg3) as u64,
         SYS_MOUNT => sys_mount(arg0, arg1, arg2, arg3, arg4) as u64,
         SYS_UMOUNT2 => sys_umount2(arg0, arg1 as i32) as u64,
+        SYS_CHROOT => sys_chroot(arg0) as u64,
         SYS_FCHMOD => sys_fchmod(arg0 as i32, arg1 as u32) as u64,
         SYS_FCHMODAT => sys_fchmodat(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64,
+        SYS_FCHMODAT2 => sys_fchmodat2(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64,
         SYS_FCHOWNAT => {
             sys_fchownat(arg0 as i32, arg1, arg2 as u32, arg3 as u32, arg4 as i32) as u64
         }

@@ -31,7 +31,9 @@ use super::FsError;
 use super::dentry::Dentry;
 use super::file::{DirEntry, File, FileOps, RwFlags};
 use super::inode::{AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
-use super::superblock::{FileSystemType, RAMFS_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps};
+use super::superblock::{
+    FileSystemType, RAMFS_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps,
+};
 
 // ============================================================================
 // Ramfs Address Space Operations
@@ -1077,12 +1079,7 @@ impl FileOps for RamfsFileOps {
         self.pread(file, buf, offset)
     }
 
-    fn write_with_flags(
-        &self,
-        file: &File,
-        buf: &[u8],
-        _flags: RwFlags,
-    ) -> Result<usize, FsError> {
+    fn write_with_flags(&self, file: &File, buf: &[u8], _flags: RwFlags) -> Result<usize, FsError> {
         // In-memory filesystem never blocks
         self.write(file, buf)
     }
@@ -1110,10 +1107,10 @@ impl SuperOps for RamfsSuperOps {
         StatFs {
             f_type: RAMFS_MAGIC,
             f_bsize: 4096,
-            f_blocks: 0,  // Unlimited (in-memory filesystem)
+            f_blocks: 0, // Unlimited (in-memory filesystem)
             f_bfree: 0,
             f_bavail: 0,
-            f_files: 0,   // Unlimited inodes
+            f_files: 0, // Unlimited inodes
             f_ffree: 0,
             f_namelen: 255,
         }

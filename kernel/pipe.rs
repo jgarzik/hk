@@ -736,12 +736,7 @@ impl FileOps for PipeWriteFileOps {
         Ok(())
     }
 
-    fn write_with_flags(
-        &self,
-        file: &File,
-        buf: &[u8],
-        flags: RwFlags,
-    ) -> Result<usize, FsError> {
+    fn write_with_flags(&self, file: &File, buf: &[u8], flags: RwFlags) -> Result<usize, FsError> {
         if flags.nowait {
             // Check for no readers (EPIPE)
             if !self.pipe.has_readers() {

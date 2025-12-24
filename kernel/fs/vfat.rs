@@ -29,7 +29,9 @@ use super::file::{
     generic_file_read, generic_file_write,
 };
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
-use super::superblock::{FileSystemType, MSDOS_SUPER_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps, fs_flags};
+use super::superblock::{
+    FileSystemType, MSDOS_SUPER_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps, fs_flags,
+};
 use super::vfs::FsError;
 
 // ============================================================================
@@ -2663,7 +2665,7 @@ impl SuperOps for VfatSuperOps {
             f_blocks: 0,
             f_bfree: 0,
             f_bavail: 0,
-            f_files: 0,  // FAT doesn't track inode count
+            f_files: 0, // FAT doesn't track inode count
             f_ffree: 0,
             f_namelen: 255, // LFN max length
         }

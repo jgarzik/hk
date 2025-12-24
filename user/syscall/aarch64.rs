@@ -324,6 +324,8 @@ pub const SYS_TEE: u64 = 77;
 pub const SYS_STATFS: u64 = 43;
 pub const SYS_FSTATFS: u64 = 44;
 pub const SYS_STATX: u64 = 291;
+pub const SYS_CHROOT: u64 = 51;
+pub const SYS_FCHMODAT2: u64 = 452;
 
 // ============================================================================
 // Syscall wrapper functions
@@ -697,6 +699,16 @@ pub fn sys_lstat(pathname: *const u8, statbuf: *mut Stat) -> i64 {
 /// umask(mask)
 pub fn sys_umask(mask: u32) -> i64 {
     unsafe { syscall1!(SYS_UMASK, mask) }
+}
+
+/// chroot(pathname)
+pub fn sys_chroot(pathname: *const u8) -> i64 {
+    unsafe { syscall1!(SYS_CHROOT, pathname) }
+}
+
+/// fchmodat2(dirfd, pathname, mode, flags)
+pub fn sys_fchmodat2(dirfd: i32, pathname: *const u8, mode: u32, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_FCHMODAT2, dirfd, pathname, mode, flags) }
 }
 
 /// utimensat(dirfd, pathname, times, flags)

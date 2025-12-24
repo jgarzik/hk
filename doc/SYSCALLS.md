@@ -185,7 +185,7 @@ linasm.sourceforge.net
 
 - [x] getcwd
 
-- [ ] chroot
+- [x] chroot
 
 3.2 Stat & attributes
 
@@ -220,7 +220,7 @@ Permissions and ownership:
 
 - [x] fchmodat
 
-- [ ] fchmodat2
+- [x] fchmodat2
 
 - [x] chown
 
