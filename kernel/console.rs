@@ -33,6 +33,14 @@
 //! Uses IrqSpinlock for all registry operations to prevent deadlock when
 //! console functions are called from interrupt context (e.g., printk from
 //! a timer interrupt). Linux uses console_sem for similar protection.
+//!
+//! ## Boot Console Lifecycle
+//!
+//! Boot consoles (marked with BOOT flag) are temporary early-boot consoles
+//! that are automatically unregistered when a "real" console (non-BOOT with
+//! CONSDEV flag) is registered. This follows the Linux pattern where early
+//! serial output transitions to a proper console (graphics, USB serial, etc.)
+//! without duplicate output.
 
 use crate::arch::IrqSpinlock;
 
@@ -190,7 +198,21 @@ impl ConsoleRegistry {
     }
 
     /// Unregister a console driver by name
+    ///
+    /// Flushes the console before removing it to ensure no output is lost.
+    /// This follows the Linux pattern where console output is flushed before
+    /// unregistration.
     pub fn unregister(&mut self, name: &str) -> bool {
+        // First, find and flush the console before removal
+        for i in 0..self.count {
+            if let Some(console) = self.consoles[i].console
+                && console.name() == name
+            {
+                console.flush();
+                break;
+            }
+        }
+
         let mut found = false;
         let mut write_idx = 0;
 
@@ -274,6 +296,49 @@ impl ConsoleRegistry {
         self.needs_flush = false;
         needs
     }
+
+    /// Check if any boot consoles are registered
+    pub fn has_boot_consoles(&self) -> bool {
+        for i in 0..self.count {
+            if self.consoles[i].flags.contains(ConsoleFlags::BOOT) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Collect names of boot consoles for later unregistration
+    ///
+    /// Returns a fixed-size array with boot console names (up to MAX_CONSOLES).
+    /// Unused slots are None.
+    fn boot_console_names(&self) -> [Option<&'static str>; MAX_CONSOLES] {
+        let mut names = [None; MAX_CONSOLES];
+        let mut idx = 0;
+        for i in 0..self.count {
+            if self.consoles[i].flags.contains(ConsoleFlags::BOOT)
+                && let Some(console) = self.consoles[i].console
+            {
+                names[idx] = Some(console.name());
+                idx += 1;
+            }
+        }
+        names
+    }
+
+    /// Get a snapshot of enabled consoles for writing outside the lock
+    ///
+    /// Returns a fixed-size array of console references. Unused slots are None.
+    /// The caller can iterate this outside the registry lock since console
+    /// pointers are `&'static`.
+    pub fn enabled_consoles_snapshot(&self) -> [Option<&'static dyn ConsoleDriver>; MAX_CONSOLES] {
+        let mut snapshot = [None; MAX_CONSOLES];
+        for (i, entry) in self.consoles.iter().take(self.count).enumerate() {
+            if entry.flags.contains(ConsoleFlags::ENABLED) {
+                snapshot[i] = entry.console;
+            }
+        }
+        snapshot
+    }
 }
 
 impl Default for ConsoleRegistry {
@@ -300,6 +365,11 @@ static CONSOLE_REGISTRY: IrqSpinlock<ConsoleRegistry> = IrqSpinlock::new(Console
 ///
 /// ENABLED is automatically set on registration.
 ///
+/// When a "real" console (non-BOOT with CONSDEV flag) is registered,
+/// all boot consoles are automatically unregistered. This follows the
+/// Linux pattern for transitioning from early boot output to the final
+/// console.
+///
 /// Returns true if this console became the primary console.
 pub fn register_console(
     console: &'static dyn ConsoleDriver,
@@ -315,9 +385,32 @@ pub fn register_console(
         priority
     };
 
-    CONSOLE_REGISTRY
-        .lock()
-        .register(console, effective_priority, flags)
+    // Check if we need to unregister boot consoles after registration
+    let is_real_console = !flags.contains(ConsoleFlags::BOOT) && flags.contains(ConsoleFlags::CONSDEV);
+
+    // Register the new console and collect boot console names if needed
+    let (became_primary, boot_names) = {
+        let mut registry = CONSOLE_REGISTRY.lock();
+        let has_boot = registry.has_boot_consoles();
+        let primary = registry.register(console, effective_priority, flags);
+
+        // Collect boot console names if this is a real console and boot consoles exist
+        let names = if is_real_console && has_boot {
+            registry.boot_console_names()
+        } else {
+            [None; MAX_CONSOLES]
+        };
+
+        (primary, names)
+    };
+
+    // Unregister boot consoles outside the main registration lock
+    // This allows boot consoles to flush their output
+    for name in boot_names.into_iter().flatten() {
+        unregister_console(name);
+    }
+
+    became_primary
 }
 
 /// Unregister a console driver by name
@@ -326,22 +419,39 @@ pub fn unregister_console(name: &str) -> bool {
 }
 
 /// Write to all registered consoles
+///
+/// Takes a snapshot of enabled consoles under the registry lock, then
+/// writes to each console outside the lock. This reduces lock hold time
+/// since console I/O can be slow (serial polling).
+///
+/// Safe because:
+/// - Console pointers are `&'static`, valid after lock release
+/// - OUTPUT_LOCK in printk serializes writes from multiple CPUs
+/// - Only structural changes (register/unregister) need the registry lock
 pub fn console_write(data: &[u8]) {
-    let registry = CONSOLE_REGISTRY.lock();
-    if registry.has_console() {
-        registry.write_all(data);
-    } else {
-        // Fallback: write directly to serial when no console available
-        #[cfg(target_arch = "aarch64")]
-        {
-            if let Ok(s) = core::str::from_utf8(data) {
-                crate::arch::aarch64::serial::write_str(s);
-            } else {
-                for &b in data {
-                    crate::arch::aarch64::serial::write_byte(b);
+    // Take snapshot under lock, then write outside lock
+    let snapshot = {
+        let registry = CONSOLE_REGISTRY.lock();
+        if !registry.has_console() {
+            // No consoles - use fallback
+            #[cfg(target_arch = "aarch64")]
+            {
+                if let Ok(s) = core::str::from_utf8(data) {
+                    crate::arch::aarch64::serial::write_str(s);
+                } else {
+                    for &b in data {
+                        crate::arch::aarch64::serial::write_byte(b);
+                    }
                 }
             }
+            return;
         }
+        registry.enabled_consoles_snapshot()
+    };
+
+    // Write outside the registry lock
+    for console in snapshot.into_iter().flatten() {
+        console.write(data);
     }
 }
 
