@@ -253,6 +253,7 @@ pub const SYS_MLOCKALL: u64 = 230;
 pub const SYS_MUNLOCKALL: u64 = 231;
 pub const SYS_MLOCK2: u64 = 284;
 pub const SYS_MSYNC: u64 = 227;
+pub const SYS_MINCORE: u64 = 232;
 pub const SYS_MADVISE: u64 = 233;
 pub const SYS_MREMAP: u64 = 216;
 
@@ -976,6 +977,12 @@ pub fn sys_munlockall() -> i64 {
 #[inline(always)]
 pub fn sys_msync(addr: u64, length: u64, flags: i32) -> i64 {
     unsafe { syscall3!(SYS_MSYNC, addr, length, flags) }
+}
+
+/// mincore(addr, length, vec) - determine whether pages are resident in memory
+#[inline(always)]
+pub fn sys_mincore(addr: u64, length: u64, vec: *mut u8) -> i64 {
+    unsafe { syscall3!(SYS_MINCORE, addr, length, vec) }
 }
 
 /// madvise(addr, length, advice) - give advice about use of memory

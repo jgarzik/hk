@@ -9,8 +9,8 @@
 
 use super::helpers::{print, println, print_num};
 use crate::syscall::{
-    sys_madvise, sys_mmap, sys_mprotect, sys_mremap, sys_msync, sys_munmap, sys_mlock, sys_mlock2,
-    sys_munlock, sys_mlockall, sys_munlockall,
+    sys_madvise, sys_mincore, sys_mmap, sys_mprotect, sys_mremap, sys_msync, sys_munmap,
+    sys_mlock, sys_mlock2, sys_munlock, sys_mlockall, sys_munlockall,
     MADV_DONTNEED, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED,
     MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE,
     MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
@@ -66,6 +66,9 @@ pub fn run_tests() {
     test_madvise_dontneed();
     test_madvise_willneed();
     test_madvise_invalid();
+    // mincore tests
+    test_mincore_basic();
+    test_mincore_invalid_addr();
     // mremap tests
     test_mremap_shrink();
     test_mremap_expand_inplace();
@@ -1944,4 +1947,93 @@ fn test_mremap_einval() {
 
     sys_munmap(ptr as u64, 4096);
     println(b"MREMAP_EINVAL:OK");
+}
+
+// ============================================================================
+// mincore tests
+// ============================================================================
+
+/// Test: mincore reports resident pages correctly
+fn test_mincore_basic() {
+    // Map one page of anonymous memory
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MINCORE_BASIC:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Touch the page to make it resident
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0xDEADBEEF);
+    }
+
+    // Call mincore to check residency
+    let mut vec: [u8; 1] = [0];
+    let ret = sys_mincore(ptr as u64, 4096, vec.as_mut_ptr());
+
+    if ret != 0 {
+        print(b"MINCORE_BASIC:FAIL mincore errno=");
+        print_num(-ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    // Check that the page is reported as resident (bit 0 set)
+    if vec[0] & 1 == 0 {
+        print(b"MINCORE_BASIC:FAIL page not reported as resident, vec=");
+        print_num(vec[0] as i64);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MINCORE_BASIC:OK");
+}
+
+/// Test: mincore returns EINVAL for unaligned address
+fn test_mincore_invalid_addr() {
+    // Map one page
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MINCORE_INVALID:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Try mincore with unaligned address - should return EINVAL (-22)
+    let mut vec: [u8; 1] = [0];
+    let ret = sys_mincore((ptr as u64) + 1, 4096, vec.as_mut_ptr());
+
+    if ret != -22 {
+        // EINVAL
+        print(b"MINCORE_INVALID:FAIL expected -22 got ");
+        print_num(ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MINCORE_INVALID:OK");
 }

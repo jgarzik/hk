@@ -84,6 +84,8 @@ pub const SYS_MUNLOCKALL: u64 = 152;
 pub const SYS_MLOCK2: u64 = 325;
 /// msync(addr, length, flags)
 pub const SYS_MSYNC: u64 = 26;
+/// mincore(addr, length, vec)
+pub const SYS_MINCORE: u64 = 27;
 /// madvise(addr, length, advice)
 pub const SYS_MADVISE: u64 = 28;
 /// ftruncate(fd, length)
@@ -1033,6 +1035,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_MUNLOCKALL => crate::mm::syscall::sys_munlockall() as u64,
         SYS_MLOCK2 => crate::mm::syscall::sys_mlock2(arg0, arg1, arg2 as i32) as u64,
         SYS_MSYNC => crate::mm::syscall::sys_msync(arg0, arg1, arg2 as i32) as u64,
+        SYS_MINCORE => crate::mm::syscall::sys_mincore(arg0, arg1, arg2) as u64,
         SYS_MADVISE => crate::mm::syscall::sys_madvise(arg0, arg1, arg2 as i32) as u64,
         SYS_MREMAP => crate::mm::syscall::sys_mremap(arg0, arg1, arg2, arg3 as u32, arg4) as u64,
         SYS_FTRUNCATE => sys_ftruncate(arg0 as i32, arg1 as i64) as u64,

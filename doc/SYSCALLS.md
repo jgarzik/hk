@@ -268,7 +268,7 @@ Extended attributes (Linux-specific):
 
 3.3 Directory enumeration
 
-- [ ] getdents
+- [n/a] getdents (legacy 32-bit syscall; aarch64 lacks it, use getdents64)
 
 - [x] getdents64
 
@@ -285,9 +285,9 @@ Extended attributes (Linux-specific):
 
 - [x] mprotect
 
-- [ ] mremap
+- [x] mremap
 
-- [ ] msync
+- [x] msync
 
 - [x] mlock
 
@@ -299,9 +299,9 @@ Extended attributes (Linux-specific):
 
 - [x] mlock2
 
-- [ ] mincore
+- [x] mincore
 
-- [ ] madvise
+- [x] madvise
 
 - [ ] remap_file_pages (legacy)
 

@@ -1943,3 +1943,120 @@ fn move_page_tables(old_start: u64, new_start: u64, len: u64, keep_old: bool) {
         }
     }
 }
+
+// ============================================================================
+// mincore syscall
+// ============================================================================
+
+/// mincore syscall - Determine whether pages are resident in memory
+///
+/// Reports whether pages in the specified address range are resident in
+/// physical memory (i.e., will not cause a page fault when accessed).
+///
+/// # Arguments
+/// * `addr` - Start address (must be page-aligned)
+/// * `length` - Length of region in bytes
+/// * `vec` - User-space pointer to result vector (1 byte per page)
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+///
+/// # Output Vector
+/// Each byte in vec corresponds to one page. The least significant bit is set
+/// if the page is currently resident in memory.
+pub fn sys_mincore(addr: u64, length: u64, vec: u64) -> i64 {
+    // Validate address alignment
+    if addr & (PAGE_SIZE - 1) != 0 {
+        return EINVAL;
+    }
+
+    // Zero length: success (no pages to check)
+    if length == 0 {
+        return 0;
+    }
+
+    // Calculate number of pages
+    let num_pages = length.div_ceil(PAGE_SIZE);
+
+    // Check for overflow
+    if addr.checked_add(num_pages * PAGE_SIZE).is_none() {
+        return ENOMEM;
+    }
+
+    // Get current task's MM
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return ENOMEM,
+    };
+
+    let mm_guard = mm.lock();
+
+    // Build result vector
+    let mut result: Vec<u8> = Vec::with_capacity(num_pages as usize);
+
+    // Get page table root and check each page
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::arch::x86_64::paging::X86_64PageTable;
+
+        let cr3: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+        }
+
+        for i in 0..num_pages {
+            let page_addr = addr + i * PAGE_SIZE;
+
+            // Check if address is in a valid VMA
+            let in_vma = mm_guard.find_vma(page_addr).is_some();
+            if !in_vma {
+                return ENOMEM;
+            }
+
+            // Check if page is resident
+            let resident = X86_64PageTable::translate_with_root(cr3, page_addr).is_some();
+            result.push(if resident { 1 } else { 0 });
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::arch::aarch64::paging::Aarch64PageTable;
+
+        let ttbr0: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack));
+        }
+        let pt_phys = ttbr0 & !0xFFF;
+
+        for i in 0..num_pages {
+            let page_addr = addr + i * PAGE_SIZE;
+
+            // Check if address is in a valid VMA
+            let in_vma = mm_guard.find_vma(page_addr).is_some();
+            if !in_vma {
+                return ENOMEM;
+            }
+
+            // Check if page is resident
+            let resident = Aarch64PageTable::translate_with_root(pt_phys, page_addr).is_some();
+            result.push(if resident { 1 } else { 0 });
+        }
+    }
+
+    // Drop the mm lock before copying to user space
+    drop(mm_guard);
+
+    // Copy result to user space
+    let vec_ptr = vec as *mut u8;
+    for (i, &byte) in result.iter().enumerate() {
+        unsafe {
+            // Safety: We're writing to user-space memory
+            // A more robust implementation would use proper Uaccess methods
+            core::ptr::write_volatile(vec_ptr.add(i), byte);
+        }
+    }
+
+    0
+}
