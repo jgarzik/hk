@@ -265,6 +265,54 @@ impl TimeKeeper {
     pub fn current_time(&self) -> Timespec {
         self.read(ClockId::Realtime, self.get_read_cycles())
     }
+
+    /// Set the realtime clock to a new value
+    ///
+    /// This updates the realtime offset so that CLOCK_REALTIME returns the
+    /// specified time. CLOCK_MONOTONIC is unaffected.
+    ///
+    /// # Arguments
+    /// * `new_time` - The new wall-clock time to set
+    ///
+    /// # Returns
+    /// `true` if successful, `false` if timekeeper is not initialized
+    pub fn set_realtime(&self, new_time: Timespec) -> bool {
+        if !self.is_initialized() {
+            return false;
+        }
+
+        let read_tsc = self.get_read_cycles();
+
+        // Begin write (make seq odd)
+        self.seq.fetch_add(1, Ordering::Relaxed);
+        ::core::sync::atomic::fence(Ordering::Release);
+
+        // Read current monotonic time
+        let now_cycles = read_tsc();
+        let cycle_base = self.cycle_base.load(Ordering::Relaxed);
+        let mono_base = self.mono_base_ns.load(Ordering::Relaxed);
+        let mult = self.mult.load(Ordering::Relaxed);
+        let shift = self.shift.load(Ordering::Relaxed);
+
+        let delta_cycles = now_cycles.wrapping_sub(cycle_base);
+        let delta_ns = ((delta_cycles as u128 * mult as u128) >> shift) as u64;
+        let mono_ns = mono_base.wrapping_add(delta_ns);
+
+        // Calculate new offset: realtime = monotonic + offset
+        // So offset = realtime - monotonic
+        let new_time_ns = new_time.to_nanos();
+        let new_offset = new_time_ns - mono_ns as i128;
+
+        // Store new offset
+        self.realtime_offset_ns
+            .store(new_offset as i64, Ordering::Relaxed);
+
+        // End write (make seq even)
+        ::core::sync::atomic::fence(Ordering::Release);
+        self.seq.fetch_add(1, Ordering::Relaxed);
+
+        true
+    }
 }
 
 /// Global timekeeper instance

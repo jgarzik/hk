@@ -354,13 +354,13 @@ linasm.sourceforge.net
 
 - [x] gettimeofday
 
-- [ ] settimeofday
+- [x] settimeofday (x86_64 only)
 
-- [ ] adjtimex
+- [ ] adjtimex (NTP)
 
 - [x] clock_gettime
 
-- [ ] clock_settime
+- [x] clock_settime
 
 - [x] clock_getres
 
@@ -591,7 +591,7 @@ linasm.sourceforge.net
 
 - [x] mlock / mlockall (already listed under memory)
 
-- [ ] settimeofday / adjtimex (privileged)
+- [x] settimeofday (x86_64 only) / [n/a] adjtimex (privileged)
 
 11. Namespaces, containers, mounts, cgroups
 11.1 Mounts & root

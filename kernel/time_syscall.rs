@@ -33,7 +33,7 @@ pub struct LinuxTimespec {
 /// Linux timeval structure for gettimeofday (x86_64 only - aarch64 uses clock_gettime)
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Timeval {
     pub tv_sec: i64,
     pub tv_usec: i64,
@@ -305,4 +305,104 @@ fn do_nanosleep(wake_tick: u64) {
     // Add to sleep queue and yield
     // The scheduler will wake us when wake_tick is reached
     crate::task::percpu::sleep_current_until(wake_tick);
+}
+
+/// sys_clock_settime - set time for specified clock
+///
+/// # Arguments
+/// * `clockid` - Clock identifier (only CLOCK_REALTIME can be set)
+/// * `tp` - Pointer to user space timespec structure with new time
+///
+/// Returns 0 on success, negative errno on error.
+///
+/// # Errors
+/// - EINVAL: Invalid clock ID (CLOCK_MONOTONIC cannot be set)
+/// - EINVAL: Invalid timespec (tv_nsec out of range)
+/// - EFAULT: Invalid tp pointer
+pub fn sys_clock_settime(clockid: i32, tp: u64) -> i64 {
+    // Validate user buffer address
+    if tp == 0 || !Uaccess::access_ok(tp, core::mem::size_of::<LinuxTimespec>()) {
+        return EFAULT;
+    }
+
+    // Only CLOCK_REALTIME can be set
+    if clockid != CLOCK_REALTIME {
+        return EINVAL;
+    }
+
+    // Read timespec from user space
+    let ts: LinuxTimespec = match get_user::<Uaccess, LinuxTimespec>(tp) {
+        Ok(ts) => ts,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate timespec values
+    if ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return EINVAL;
+    }
+
+    // Convert to Timespec and set
+    let new_time = crate::time::Timespec {
+        sec: ts.tv_sec,
+        nsec: ts.tv_nsec as u32,
+    };
+
+    if TIMEKEEPER.set_realtime(new_time) {
+        0
+    } else {
+        // Timekeeper not initialized
+        EINVAL
+    }
+}
+
+/// sys_settimeofday - set wall-clock time (x86_64 only)
+///
+/// # Arguments
+/// * `tv` - Pointer to user space timeval structure (may be NULL)
+/// * `tz` - Pointer to user space timezone structure (may be NULL, deprecated)
+///
+/// Returns 0 on success, negative errno on error.
+///
+/// # Errors
+/// - EINVAL: tv_usec out of range [0, 999999]
+/// - EFAULT: Invalid pointer
+///
+/// Note: This is a legacy syscall. aarch64 uses clock_settime instead.
+#[cfg(target_arch = "x86_64")]
+pub fn sys_settimeofday(tv: u64, tz: u64) -> i64 {
+    // If tv is provided, set the time
+    if tv != 0 {
+        // Validate user buffer address
+        if !Uaccess::access_ok(tv, core::mem::size_of::<Timeval>()) {
+            return EFAULT;
+        }
+
+        let timeval: Timeval = match get_user::<Uaccess, Timeval>(tv) {
+            Ok(tv) => tv,
+            Err(_) => return EFAULT,
+        };
+
+        // Validate timeval values
+        if timeval.tv_usec < 0 || timeval.tv_usec >= 1_000_000 {
+            return EINVAL;
+        }
+
+        // Convert timeval to Timespec (us -> ns)
+        let new_time = crate::time::Timespec {
+            sec: timeval.tv_sec,
+            nsec: (timeval.tv_usec * 1000) as u32,
+        };
+
+        if !TIMEKEEPER.set_realtime(new_time) {
+            return EINVAL; // Timekeeper not initialized
+        }
+    }
+
+    // Timezone is deprecated; we accept but ignore it
+    // Just validate the pointer if provided
+    if tz != 0 && !Uaccess::access_ok(tz, core::mem::size_of::<Timezone>()) {
+        return EFAULT;
+    }
+
+    0
 }

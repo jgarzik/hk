@@ -5,9 +5,20 @@
 //! - Test 71: sethostname() - set hostname
 //! - Test 72: setdomainname() - set domain name
 //! - Test 73: sethostname() EINVAL - too long name
+//! - Test 74: clock_settime() - set realtime clock
+//! - Test 75: clock_settime() EINVAL - cannot set CLOCK_MONOTONIC
+//! - Test 76: clock_settime() EINVAL - invalid nsec value
+//! - Test 77: settimeofday() - set time (x86_64 only)
+//! - Test 78: settimeofday() EINVAL - invalid usec (x86_64 only)
 
 use super::helpers::{print, println, print_num, print_cstr, starts_with};
-use crate::syscall::{sys_sethostname, sys_setdomainname, sys_uname, UtsName};
+use crate::syscall::{sys_sethostname, sys_setdomainname, sys_uname, sys_clock_settime, sys_clock_gettime, UtsName, Timespec};
+#[cfg(target_arch = "x86_64")]
+use crate::syscall::{sys_settimeofday, sys_gettimeofday, Timeval};
+
+// Clock IDs
+const CLOCK_REALTIME: i32 = 0;
+const CLOCK_MONOTONIC: i32 = 1;
 
 /// Run all sysinfo tests
 pub fn run_tests() {
@@ -15,6 +26,14 @@ pub fn run_tests() {
     test_sethostname();
     test_setdomainname();
     test_sethostname_einval();
+    test_clock_settime_basic();
+    test_clock_settime_monotonic_fails();
+    test_clock_settime_invalid_nsec();
+    #[cfg(target_arch = "x86_64")]
+    {
+        test_settimeofday_basic();
+        test_settimeofday_invalid_usec();
+    }
 }
 
 /// Test 70: uname() - get system identification
@@ -110,6 +129,131 @@ fn test_sethostname_einval() {
         println(b"SETHOSTNAME_EINVAL:OK");
     } else {
         print(b"SETHOSTNAME_EINVAL:FAIL: expected -22 (EINVAL), got ");
+        print_num(ret);
+    }
+}
+
+/// Test 74: clock_settime() - set realtime clock
+fn test_clock_settime_basic() {
+    // Get current time
+    let mut ts_before = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let ret = sys_clock_gettime(CLOCK_REALTIME, &mut ts_before);
+    if ret != 0 {
+        print(b"CLOCK_SETTIME:FAIL: clock_gettime() returned ");
+        print_num(ret);
+        return;
+    }
+
+    // Set time to a specific value (current time + 100 seconds)
+    let new_time = Timespec {
+        tv_sec: ts_before.tv_sec + 100,
+        tv_nsec: 0,
+    };
+    let ret = sys_clock_settime(CLOCK_REALTIME, &new_time);
+    if ret != 0 {
+        print(b"CLOCK_SETTIME:FAIL: clock_settime() returned ");
+        print_num(ret);
+        return;
+    }
+
+    // Read back and verify
+    let mut ts_after = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let ret = sys_clock_gettime(CLOCK_REALTIME, &mut ts_after);
+    if ret != 0 {
+        print(b"CLOCK_SETTIME:FAIL: clock_gettime() after set returned ");
+        print_num(ret);
+        return;
+    }
+
+    // The new time should be close to what we set (within a few seconds)
+    let diff = ts_after.tv_sec - new_time.tv_sec;
+    if diff >= 0 && diff < 5 {
+        println(b"CLOCK_SETTIME:OK");
+    } else {
+        print(b"CLOCK_SETTIME:FAIL: time difference too large: ");
+        print_num(diff);
+    }
+}
+
+/// Test 75: clock_settime() EINVAL - cannot set CLOCK_MONOTONIC
+fn test_clock_settime_monotonic_fails() {
+    let ts = Timespec { tv_sec: 1000, tv_nsec: 0 };
+    let ret = sys_clock_settime(CLOCK_MONOTONIC, &ts);
+    if ret == -22 {
+        // EINVAL
+        println(b"CLOCK_SETTIME_MONOTONIC:OK");
+    } else {
+        print(b"CLOCK_SETTIME_MONOTONIC:FAIL: expected -22 (EINVAL), got ");
+        print_num(ret);
+    }
+}
+
+/// Test 76: clock_settime() EINVAL - invalid nsec value
+fn test_clock_settime_invalid_nsec() {
+    let ts = Timespec { tv_sec: 1000, tv_nsec: 1_000_000_000 }; // nsec out of range
+    let ret = sys_clock_settime(CLOCK_REALTIME, &ts);
+    if ret == -22 {
+        // EINVAL
+        println(b"CLOCK_SETTIME_INVALID_NSEC:OK");
+    } else {
+        print(b"CLOCK_SETTIME_INVALID_NSEC:FAIL: expected -22 (EINVAL), got ");
+        print_num(ret);
+    }
+}
+
+/// Test 77: settimeofday() - set time (x86_64 only)
+#[cfg(target_arch = "x86_64")]
+fn test_settimeofday_basic() {
+    // Get current time
+    let mut tv_before = Timeval { tv_sec: 0, tv_usec: 0 };
+    let ret = sys_gettimeofday(&mut tv_before, core::ptr::null_mut());
+    if ret != 0 {
+        print(b"SETTIMEOFDAY:FAIL: gettimeofday() returned ");
+        print_num(ret);
+        return;
+    }
+
+    // Set time to current + 200 seconds
+    let new_time = Timeval {
+        tv_sec: tv_before.tv_sec + 200,
+        tv_usec: 0,
+    };
+    let ret = sys_settimeofday(&new_time, core::ptr::null());
+    if ret != 0 {
+        print(b"SETTIMEOFDAY:FAIL: settimeofday() returned ");
+        print_num(ret);
+        return;
+    }
+
+    // Read back and verify
+    let mut tv_after = Timeval { tv_sec: 0, tv_usec: 0 };
+    let ret = sys_gettimeofday(&mut tv_after, core::ptr::null_mut());
+    if ret != 0 {
+        print(b"SETTIMEOFDAY:FAIL: gettimeofday() after set returned ");
+        print_num(ret);
+        return;
+    }
+
+    // The new time should be close to what we set
+    let diff = tv_after.tv_sec - new_time.tv_sec;
+    if diff >= 0 && diff < 5 {
+        println(b"SETTIMEOFDAY:OK");
+    } else {
+        print(b"SETTIMEOFDAY:FAIL: time difference too large: ");
+        print_num(diff);
+    }
+}
+
+/// Test 78: settimeofday() EINVAL - invalid usec (x86_64 only)
+#[cfg(target_arch = "x86_64")]
+fn test_settimeofday_invalid_usec() {
+    let tv = Timeval { tv_sec: 1000, tv_usec: 1_000_000 }; // usec out of range
+    let ret = sys_settimeofday(&tv, core::ptr::null());
+    if ret == -22 {
+        // EINVAL
+        println(b"SETTIMEOFDAY_INVALID_USEC:OK");
+    } else {
+        print(b"SETTIMEOFDAY_INVALID_USEC:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
     }
 }

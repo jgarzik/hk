@@ -101,6 +101,8 @@ pub const SYS_EXIT: u64 = 93;
 pub const SYS_EXIT_GROUP: u64 = 94;
 pub const SYS_WAITID: u64 = 95;
 pub const SYS_NANOSLEEP: u64 = 101;
+/// clock_settime(clockid, tp)
+pub const SYS_CLOCK_SETTIME: u64 = 112;
 pub const SYS_CLOCK_GETTIME: u64 = 113;
 pub const SYS_CLOCK_GETRES: u64 = 114;
 pub const SYS_CLOCK_NANOSLEEP: u64 = 115;
@@ -320,7 +322,7 @@ pub fn aarch64_syscall_dispatch(
         sys_waitid,
     };
     use crate::time_syscall::{
-        sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_nanosleep,
+        sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime, sys_nanosleep,
     };
 
     match num {
@@ -487,6 +489,7 @@ pub fn aarch64_syscall_dispatch(
         // Time syscalls
         SYS_CLOCK_GETTIME => sys_clock_gettime(arg0 as i32, arg1) as u64,
         SYS_CLOCK_GETRES => sys_clock_getres(arg0 as i32, arg1) as u64,
+        SYS_CLOCK_SETTIME => sys_clock_settime(arg0 as i32, arg1) as u64,
         SYS_NANOSLEEP => sys_nanosleep(arg0, arg1) as u64,
         SYS_CLOCK_NANOSLEEP => sys_clock_nanosleep(arg0 as i32, arg1 as i32, arg2, arg3) as u64,
 

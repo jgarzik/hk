@@ -278,8 +278,12 @@ pub const SYS_SCHED_SETAFFINITY: u64 = 203;
 pub const SYS_SCHED_GETAFFINITY: u64 = 204;
 pub const SYS_SET_TID_ADDRESS: u64 = 218;
 pub const SYS_SEMTIMEDOP: u64 = 220;
+pub const SYS_CLOCK_SETTIME: u64 = 227;
+pub const SYS_CLOCK_GETTIME: u64 = 228;
 pub const SYS_CLOCK_GETRES: u64 = 229;
 pub const SYS_CLOCK_NANOSLEEP: u64 = 230;
+pub const SYS_GETTIMEOFDAY: u64 = 96;
+pub const SYS_SETTIMEOFDAY: u64 = 164;
 pub const SYS_TGKILL: u64 = 234;
 pub const SYS_WAITID: u64 = 247;
 pub const SYS_IOPRIO_SET: u64 = 251;
@@ -714,6 +718,26 @@ pub fn sys_clock_getres(clockid: i32, res: *mut Timespec) -> i64 {
 #[inline(always)]
 pub fn sys_time(tloc: *mut i64) -> i64 {
     unsafe { syscall1!(SYS_TIME, tloc) }
+}
+
+#[inline(always)]
+pub fn sys_clock_gettime(clockid: i32, tp: *mut Timespec) -> i64 {
+    unsafe { syscall2!(SYS_CLOCK_GETTIME, clockid, tp) }
+}
+
+#[inline(always)]
+pub fn sys_clock_settime(clockid: i32, tp: *const Timespec) -> i64 {
+    unsafe { syscall2!(SYS_CLOCK_SETTIME, clockid, tp) }
+}
+
+#[inline(always)]
+pub fn sys_gettimeofday(tv: *mut Timeval, tz: *mut u8) -> i64 {
+    unsafe { syscall2!(SYS_GETTIMEOFDAY, tv, tz) }
+}
+
+#[inline(always)]
+pub fn sys_settimeofday(tv: *const Timeval, tz: *const u8) -> i64 {
+    unsafe { syscall2!(SYS_SETTIMEOFDAY, tv, tz) }
 }
 
 // --- Signals ---

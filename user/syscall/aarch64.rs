@@ -178,6 +178,8 @@ pub const SYS_FCHOWN: u64 = 55;
 pub const SYS_EXIT: u64 = 93;
 pub const SYS_EXIT_GROUP: u64 = 94;
 pub const SYS_NANOSLEEP: u64 = 101;
+pub const SYS_CLOCK_SETTIME: u64 = 112;
+pub const SYS_CLOCK_GETTIME: u64 = 113;
 pub const SYS_CLOCK_GETRES: u64 = 114;
 pub const SYS_CLOCK_NANOSLEEP: u64 = 115;
 pub const SYS_REBOOT: u64 = 142;
@@ -480,6 +482,18 @@ pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: *const Timespec, rem: 
 #[inline(always)]
 pub fn sys_clock_getres(clockid: i32, res: *mut Timespec) -> i64 {
     unsafe { syscall2!(SYS_CLOCK_GETRES, clockid, res) }
+}
+
+/// clock_gettime(clockid, tp)
+#[inline(always)]
+pub fn sys_clock_gettime(clockid: i32, tp: *mut Timespec) -> i64 {
+    unsafe { syscall2!(SYS_CLOCK_GETTIME, clockid, tp) }
+}
+
+/// clock_settime(clockid, tp)
+#[inline(always)]
+pub fn sys_clock_settime(clockid: i32, tp: *const Timespec) -> i64 {
+    unsafe { syscall2!(SYS_CLOCK_SETTIME, clockid, tp) }
 }
 
 /// waitid(idtype, id, infop, options)

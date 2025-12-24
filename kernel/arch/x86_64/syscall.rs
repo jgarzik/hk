@@ -120,6 +120,10 @@ pub const SYS_NANOSLEEP: u64 = 35;
 pub const SYS_CLOCK_NANOSLEEP: u64 = 230;
 /// clock_getres(clockid, res)
 pub const SYS_CLOCK_GETRES: u64 = 229;
+/// clock_settime(clockid, tp)
+pub const SYS_CLOCK_SETTIME: u64 = 227;
+/// settimeofday(tv, tz)
+pub const SYS_SETTIMEOFDAY: u64 = 164;
 /// time(tloc)
 pub const SYS_TIME: u64 = 201;
 
@@ -1002,8 +1006,8 @@ pub fn x86_64_syscall_dispatch(
         sys_setsid, sys_vfork, sys_wait4, sys_waitid,
     };
     use crate::time_syscall::{
-        sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_gettimeofday, sys_nanosleep,
-        sys_time,
+        sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime,
+        sys_gettimeofday, sys_nanosleep, sys_settimeofday, sys_time,
     };
 
     match num {
@@ -1055,6 +1059,8 @@ pub fn x86_64_syscall_dispatch(
         SYS_CLOCK_GETTIME => sys_clock_gettime(arg0 as i32, arg1) as u64,
         SYS_CLOCK_GETRES => sys_clock_getres(arg0 as i32, arg1) as u64,
         SYS_TIME => sys_time(arg0) as u64,
+        SYS_CLOCK_SETTIME => sys_clock_settime(arg0 as i32, arg1) as u64,
+        SYS_SETTIMEOFDAY => sys_settimeofday(arg0, arg1) as u64,
         SYS_NANOSLEEP => sys_nanosleep(arg0, arg1) as u64,
         SYS_CLOCK_NANOSLEEP => sys_clock_nanosleep(arg0 as i32, arg1 as i32, arg2, arg3) as u64,
         SYS_SCHED_YIELD => {
