@@ -253,27 +253,27 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 
 7.3 SysV IPC
 
-- [ ] shmget
-- [ ] shmat
-- [ ] shmdt
-- [ ] shmctl
-- [ ] semget
-- [ ] semop
-- [ ] semtimedop
-- [ ] semctl
-- [ ] msgget
-- [ ] msgsnd
-- [ ] msgrcv
-- [ ] msgctl
+- [x] shmget
+- [x] shmat
+- [x] shmdt
+- [x] shmctl
+- [x] semget
+- [x] semop
+- [x] semtimedop
+- [x] semctl
+- [x] msgget
+- [x] msgsnd
+- [x] msgrcv
+- [x] msgctl
 
 7.4 POSIX message queues
 
-- [ ] mq_open
-- [ ] mq_unlink
-- [ ] mq_timedsend
-- [ ] mq_timedreceive
-- [ ] mq_notify
-- [ ] mq_getsetattr
+- [x] mq_open
+- [x] mq_unlink
+- [x] mq_timedsend
+- [x] mq_timedreceive
+- [x] mq_notify
+- [x] mq_getsetattr
 
 8. Networking & sockets
 

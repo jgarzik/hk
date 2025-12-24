@@ -932,3 +932,71 @@ impl SigEvent {
         }
     }
 }
+
+// ============================================================================
+// POSIX message queue types and constants (Section 7.4)
+// ============================================================================
+
+/// Message queue attributes structure (matches Linux struct mq_attr)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MqAttr {
+    /// Message queue flags (O_NONBLOCK)
+    pub mq_flags: i64,
+    /// Maximum number of messages in queue
+    pub mq_maxmsg: i64,
+    /// Maximum message size (bytes)
+    pub mq_msgsize: i64,
+    /// Current number of messages in queue (read-only)
+    pub mq_curmsgs: i64,
+    /// Reserved for future use
+    pub __reserved: [i64; 4],
+}
+
+impl MqAttr {
+    /// Create new mq_attr with specified limits
+    pub const fn new(maxmsg: i64, msgsize: i64) -> Self {
+        Self {
+            mq_flags: 0,
+            mq_maxmsg: maxmsg,
+            mq_msgsize: msgsize,
+            mq_curmsgs: 0,
+            __reserved: [0; 4],
+        }
+    }
+
+    /// Create with non-blocking flag
+    pub const fn nonblocking(maxmsg: i64, msgsize: i64) -> Self {
+        Self {
+            mq_flags: O_NONBLOCK as i64,
+            mq_maxmsg: maxmsg,
+            mq_msgsize: msgsize,
+            mq_curmsgs: 0,
+            __reserved: [0; 4],
+        }
+    }
+}
+
+impl Default for MqAttr {
+    fn default() -> Self {
+        Self {
+            mq_flags: 0,
+            mq_maxmsg: 10,    // DFLT_MSGMAX
+            mq_msgsize: 8192, // DFLT_MSGSIZEMAX
+            mq_curmsgs: 0,
+            __reserved: [0; 4],
+        }
+    }
+}
+
+/// Maximum message priority + 1
+pub const MQ_PRIO_MAX: u32 = 32768;
+
+/// Open flag for non-blocking queue operations
+pub const O_NONBLOCK: u32 = 0o4000;
+
+/// O_CLOEXEC flag for file descriptors
+pub const O_CLOEXEC: u32 = 0o2000000;
+
+/// O_EXCL flag for exclusive creation
+pub const O_EXCL: u32 = 0o200;

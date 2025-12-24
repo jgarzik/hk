@@ -145,6 +145,20 @@ pub const SYS_TIMER_GETOVERRUN: u64 = 225;
 /// timer_delete(timerid)
 pub const SYS_TIMER_DELETE: u64 = 226;
 
+// POSIX message queue syscalls (Section 7.4)
+/// mq_open(name, oflag, mode, attr)
+pub const SYS_MQ_OPEN: u64 = 240;
+/// mq_unlink(name)
+pub const SYS_MQ_UNLINK: u64 = 241;
+/// mq_timedsend(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)
+pub const SYS_MQ_TIMEDSEND: u64 = 242;
+/// mq_timedreceive(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)
+pub const SYS_MQ_TIMEDRECEIVE: u64 = 243;
+/// mq_notify(mqdes, sevp)
+pub const SYS_MQ_NOTIFY: u64 = 244;
+/// mq_getsetattr(mqdes, newattr, oldattr)
+pub const SYS_MQ_GETSETATTR: u64 = 245;
+
 // Process IDs & basic info (Section 1.2)
 /// setpgid(pid, pgid)
 pub const SYS_SETPGID: u64 = 109;
@@ -1133,6 +1147,18 @@ pub fn x86_64_syscall_dispatch(
         SYS_TIMER_GETTIME => crate::posix_timer::sys_timer_gettime(arg0 as i32, arg1) as u64,
         SYS_TIMER_GETOVERRUN => crate::posix_timer::sys_timer_getoverrun(arg0 as i32) as u64,
         SYS_TIMER_DELETE => crate::posix_timer::sys_timer_delete(arg0 as i32) as u64,
+
+        // POSIX message queue syscalls (Section 7.4)
+        SYS_MQ_OPEN => crate::ipc::sys_mq_open(arg0, arg1 as i32, arg2 as u32, arg3) as u64,
+        SYS_MQ_UNLINK => crate::ipc::sys_mq_unlink(arg0) as u64,
+        SYS_MQ_TIMEDSEND => {
+            crate::ipc::sys_mq_timedsend(arg0 as i32, arg1, arg2 as usize, arg3 as u32, arg4) as u64
+        }
+        SYS_MQ_TIMEDRECEIVE => {
+            crate::ipc::sys_mq_timedreceive(arg0 as i32, arg1, arg2 as usize, arg3, arg4) as u64
+        }
+        SYS_MQ_NOTIFY => crate::ipc::sys_mq_notify(arg0 as i32, arg1) as u64,
+        SYS_MQ_GETSETATTR => crate::ipc::sys_mq_getsetattr(arg0 as i32, arg1, arg2) as u64,
 
         SYS_SCHED_YIELD => {
             sys_sched_yield();

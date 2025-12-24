@@ -8,7 +8,7 @@
 //! - Return value in RAX
 //! - RCX and R11 are clobbered by the syscall instruction
 
-use crate::types::{FdSet, IoVec, PollFd, RLimit, SigInfo, Stat, Timespec, Timeval, UtsName};
+use crate::types::{FdSet, IoVec, MqAttr, PollFd, RLimit, SigInfo, SigEvent, Stat, Timespec, Timeval, UtsName};
 
 // ============================================================================
 // Syscall helper macros
@@ -292,6 +292,15 @@ pub const SYS_TIMER_SETTIME: u64 = 223;
 pub const SYS_TIMER_GETTIME: u64 = 224;
 pub const SYS_TIMER_GETOVERRUN: u64 = 225;
 pub const SYS_TIMER_DELETE: u64 = 226;
+
+// POSIX message queue syscalls (Section 7.4)
+pub const SYS_MQ_OPEN: u64 = 240;
+pub const SYS_MQ_UNLINK: u64 = 241;
+pub const SYS_MQ_TIMEDSEND: u64 = 242;
+pub const SYS_MQ_TIMEDRECEIVE: u64 = 243;
+pub const SYS_MQ_NOTIFY: u64 = 244;
+pub const SYS_MQ_GETSETATTR: u64 = 245;
+
 pub const SYS_GETTIMEOFDAY: u64 = 96;
 pub const SYS_SETTIMEOFDAY: u64 = 164;
 pub const SYS_TGKILL: u64 = 234;
@@ -789,8 +798,6 @@ pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
 
 // --- POSIX Timers ---
 
-use crate::types::SigEvent;
-
 /// timer_create(clockid, sigevent, timerid)
 #[inline(always)]
 pub fn sys_timer_create(clockid: i32, sevp: *const SigEvent, timerid: *mut i32) -> i64 {
@@ -819,6 +826,44 @@ pub fn sys_timer_getoverrun(timerid: i32) -> i64 {
 #[inline(always)]
 pub fn sys_timer_delete(timerid: i32) -> i64 {
     unsafe { syscall1!(SYS_TIMER_DELETE, timerid) }
+}
+
+// --- POSIX Message Queues ---
+
+/// mq_open(name, oflag, mode, attr)
+#[inline(always)]
+pub fn sys_mq_open(name: *const u8, oflag: i32, mode: u32, attr: *const MqAttr) -> i64 {
+    unsafe { syscall4!(SYS_MQ_OPEN, name, oflag, mode, attr) }
+}
+
+/// mq_unlink(name)
+#[inline(always)]
+pub fn sys_mq_unlink(name: *const u8) -> i64 {
+    unsafe { syscall1!(SYS_MQ_UNLINK, name) }
+}
+
+/// mq_timedsend(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)
+#[inline(always)]
+pub fn sys_mq_timedsend(mqdes: i32, msg: *const u8, len: usize, prio: u32, timeout: *const Timespec) -> i64 {
+    unsafe { syscall5!(SYS_MQ_TIMEDSEND, mqdes, msg, len, prio, timeout) }
+}
+
+/// mq_timedreceive(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)
+#[inline(always)]
+pub fn sys_mq_timedreceive(mqdes: i32, msg: *mut u8, len: usize, prio: *mut u32, timeout: *const Timespec) -> i64 {
+    unsafe { syscall5!(SYS_MQ_TIMEDRECEIVE, mqdes, msg, len, prio, timeout) }
+}
+
+/// mq_notify(mqdes, sevp)
+#[inline(always)]
+pub fn sys_mq_notify(mqdes: i32, sevp: *const SigEvent) -> i64 {
+    unsafe { syscall2!(SYS_MQ_NOTIFY, mqdes, sevp) }
+}
+
+/// mq_getsetattr(mqdes, newattr, oldattr)
+#[inline(always)]
+pub fn sys_mq_getsetattr(mqdes: i32, newattr: *const MqAttr, oldattr: *mut MqAttr) -> i64 {
+    unsafe { syscall3!(SYS_MQ_GETSETATTR, mqdes, newattr, oldattr) }
 }
 
 // --- Signals ---
