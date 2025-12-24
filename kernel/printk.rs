@@ -32,13 +32,18 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use super::console;
+use crate::arch::IrqSpinlock;
 
 /// Output lock - serializes all console/serial writes
 ///
 /// This is separate from PRINTK to:
 /// 1. Allow buffering while another CPU writes to console
 /// 2. Prevent deadlock if console code needs to log
-static OUTPUT_LOCK: Mutex<()> = Mutex::new(());
+///
+/// Uses IrqSpinlock (not spin::Mutex) to be IRQ-safe - this prevents
+/// deadlock when printk is called from interrupt context while another
+/// CPU holds the lock. Linux uses raw_spin_lock_irqsave().
+static OUTPUT_LOCK: IrqSpinlock<()> = IrqSpinlock::new(());
 
 /// Panic/oops in progress - use non-blocking output
 ///
@@ -256,7 +261,11 @@ fn direct_serial_write(bytes: &[u8]) {
 /// serial fallback to avoid deadlock.
 pub struct PrintkWriter {
     /// Lock guard (None if in panic mode and lock unavailable)
-    _guard: Option<spin::MutexGuard<'static, ()>>,
+    /// Uses IrqSpinlockGuard for IRQ safety
+    #[cfg(target_arch = "x86_64")]
+    _guard: Option<crate::arch::x86_64::spinlock::IrqSpinlockGuard<'static, ()>>,
+    #[cfg(target_arch = "aarch64")]
+    _guard: Option<crate::arch::aarch64::spinlock::IrqSpinlockGuard<'static, ()>>,
 }
 
 impl PrintkWriter {
