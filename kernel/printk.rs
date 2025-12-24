@@ -29,7 +29,6 @@
 
 use ::core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
 
 use super::console;
 use crate::arch::IrqSpinlock;
@@ -152,7 +151,11 @@ impl PrintkState {
 }
 
 /// Global printk state
-static PRINTK: Mutex<PrintkState> = Mutex::new(PrintkState::new());
+///
+/// Uses IrqSpinlock to be IRQ-safe - printk can be called from
+/// interrupt context, and we must disable interrupts while holding
+/// this lock to prevent deadlock. Linux uses raw_spin_lock_irqsave().
+static PRINTK: IrqSpinlock<PrintkState> = IrqSpinlock::new(PrintkState::new());
 
 /// Flush buffered messages to console
 ///

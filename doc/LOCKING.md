@@ -188,14 +188,14 @@ Per-CPU scheduler locks (IrqSpinlock)  ← IRQ-safe, can hold while acquiring be
     ↓
 Global subsystem locks (TASK_TABLE, PAGE_CACHE, FD_TABLE)  ← NOT IRQ-safe
     ↓
-Printk locks:
-    OUTPUT_LOCK (held for entire message)
-        ↓
-    PRINTK (ring buffer)
-        ↓
-    CONSOLE_REGISTRY (console dispatch)
-    ↓
 Memory allocator locks (FRAME_ALLOCATOR, heap)  ← NOT IRQ-safe
+
+Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
+    OUTPUT_LOCK (IrqSpinlock, held for entire message)
+        ↓
+    PRINTK (IrqSpinlock, ring buffer)
+        ↓
+    CONSOLE_REGISTRY (IrqSpinlock, console dispatch)
 ```
 
 ### Key Rules
@@ -1009,33 +1009,49 @@ loop {
 
 ### 3.6 Kernel Logging (printk)
 
-**Location:** `core/printk.rs`, `core/console.rs`
+**Location:** `kernel/printk.rs`, `kernel/console.rs`
 
-The printk subsystem uses two separate locks to ensure SMP-safe message output
-while avoiding deadlocks:
+The printk subsystem uses IRQ-safe locks to ensure SMP-safe message output
+while avoiding deadlocks in interrupt context:
 
 ```rust
-/// Serializes console/serial writes across CPUs
-static OUTPUT_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes console/serial writes across CPUs (IRQ-safe)
+static OUTPUT_LOCK: IrqSpinlock<()> = IrqSpinlock::new(());
 
-/// Protects the ring buffer state
-static PRINTK: Mutex<PrintkState> = Mutex::new(PrintkState::new());
+/// Protects the ring buffer state (IRQ-safe)
+static PRINTK: IrqSpinlock<PrintkState> = IrqSpinlock::new(PrintkState::new());
+
+/// Console driver registry (IRQ-safe)
+static CONSOLE_REGISTRY: IrqSpinlock<ConsoleRegistry> = IrqSpinlock::new(...);
 ```
 
 **Locking Hierarchy:**
 ```
-1. OUTPUT_LOCK (held for entire message, including newline)
+1. OUTPUT_LOCK (held for entire message, including newline) - IrqSpinlock
    ↓
-2. PRINTK (held briefly for ring buffer write)
+2. PRINTK (held briefly for ring buffer write) - IrqSpinlock
    ↓
-3. CONSOLE_REGISTRY (held during console_write)
+3. CONSOLE_REGISTRY (held during console_write) - IrqSpinlock
 ```
+
+**Why IRQ-Safe:**
+
+All three locks use `IrqSpinlock` because printk can be called from:
+- Normal process context
+- Timer interrupt handlers (e.g., debug output)
+- Exception handlers (e.g., page fault diagnostics)
+
+Using `IrqSpinlock` (like Linux's `raw_spin_lock_irqsave()`) ensures:
+1. Interrupts disabled while holding the lock
+2. No deadlock if printk is called from interrupt context
+3. No deadlock if a timer interrupt fires while another CPU holds the lock
 
 **Lock Separation:**
 
-The two-lock design serves different purposes:
+The three-lock design serves different purposes:
 - `OUTPUT_LOCK`: Ensures entire formatted messages are written atomically
 - `PRINTK`: Protects the ring buffer data structure
+- `CONSOLE_REGISTRY`: Protects the list of registered consoles
 
 This separation allows:
 1. Buffering to proceed while another CPU writes to console
@@ -1047,12 +1063,16 @@ The `PrintkWriter` struct holds `OUTPUT_LOCK` for the duration of formatting:
 
 ```rust
 pub struct PrintkWriter {
-    _guard: spin::MutexGuard<'static, ()>,
+    _guard: Option<IrqSpinlockGuard<'static, ()>>,
 }
 
 impl PrintkWriter {
     pub fn new() -> Self {
-        Self { _guard: OUTPUT_LOCK.lock() }
+        if OOPS_IN_PROGRESS.load(Ordering::Acquire) {
+            Self { _guard: OUTPUT_LOCK.try_lock() }
+        } else {
+            Self { _guard: Some(OUTPUT_LOCK.lock()) }
+        }
     }
 }
 ```
@@ -1088,12 +1108,23 @@ Timer: started with 10ms interval
 Timer: started with 10ms interval
 ```
 
-**Interrupt Context:**
+**Panic-Safe Output:**
 
-- **NOT IRQ-safe** - `Mutex` does not disable interrupts
-- Printk from interrupt context will spin if another CPU holds OUTPUT_LOCK
-- For panic context, interrupts are disabled first, so deadlock is avoided
-- Consider `try_lock()` pattern for truly interrupt-safe logging if needed
+During panic, the normal locking path can deadlock if the panicking CPU already
+holds `OUTPUT_LOCK`. The printk subsystem handles this with:
+
+1. **`OOPS_IN_PROGRESS` flag** - Atomic bool set at panic entry via `set_oops_in_progress()`
+2. **`try_lock()` fallback** - Non-blocking lock attempt in panic mode
+3. **Direct serial output** - If lock unavailable, bypass console subsystem
+
+```rust
+// In PrintkWriter::write_str() during panic:
+if self._guard.is_some() {
+    printk_write_locked(s.as_bytes());  // Normal path
+} else {
+    direct_serial_write(s.as_bytes());  // Panic fallback
+}
+```
 
 **Console Integration:**
 
@@ -1101,7 +1132,7 @@ Timer: started with 10ms interval
 
 ```rust
 pub fn console_write(data: &[u8]) {
-    let registry = CONSOLE_REGISTRY.lock();
+    let registry = CONSOLE_REGISTRY.lock();  // IrqSpinlock
     if registry.has_console() {
         registry.write_all(data);
     }
@@ -1109,6 +1140,25 @@ pub fn console_write(data: &[u8]) {
 ```
 
 The lock order (OUTPUT_LOCK → PRINTK → CONSOLE_REGISTRY) is maintained throughout.
+
+**Console Flags (Linux CON_* Pattern):**
+
+Console drivers are registered with flags that control behavior:
+
+```rust
+bitflags! {
+    pub struct ConsoleFlags: u16 {
+        const ENABLED = 1 << 0;       // Console can receive output
+        const BOOT = 1 << 1;          // Early boot console
+        const PRINTBUFFER = 1 << 2;   // Replay log buffer on registration
+        const CONSDEV = 1 << 3;       // Primary console (/dev/console target)
+    }
+}
+```
+
+- `BOOT` consoles (e.g., serial) are the first output during early boot
+- `CONSDEV` consoles (e.g., graphics) are the primary interactive console
+- `ENABLED` is automatically set on registration; only enabled consoles receive output
 
 ### 3.7 Signal Infrastructure
 
@@ -1308,15 +1358,18 @@ Robust futexes are cleaned up during task exit via `exit_robust_list()`:
 **Location:** `kernel/tty/`, `kernel/gfx/console.rs`, `kernel/console.rs`, `kernel/printk.rs`
 
 The TTY and console subsystem handles terminal I/O and kernel message output.
-All locks are non-IRQ-safe (Mutex) and must only be accessed from process context.
+Console framework locks are IRQ-safe (IrqSpinlock) to support printk from interrupt
+context. Per-TTY locks use Mutex and are accessed from process context only.
 
 #### Console Framework Locks
 
 | Variable | Location | Type | Purpose |
 |----------|----------|------|---------|
-| `OUTPUT_LOCK` | `printk.rs` | `Mutex<()>` | Serializes all console writes across CPUs |
-| `PRINTK` | `printk.rs` | `Mutex<PrintkState>` | Protects ring buffer state |
-| `CONSOLE_REGISTRY` | `console.rs` | `Mutex<ConsoleRegistry>` | Protects console driver list |
+| `OUTPUT_LOCK` | `printk.rs` | `IrqSpinlock<()>` | Serializes all console writes across CPUs |
+| `PRINTK` | `printk.rs` | `IrqSpinlock<PrintkState>` | Protects ring buffer state |
+| `CONSOLE_REGISTRY` | `console.rs` | `IrqSpinlock<ConsoleRegistry>` | Protects console driver list |
+
+All three use `IrqSpinlock` for IRQ safety - see Section 3.6 for details.
 
 #### Per-TTY Locks
 
@@ -1340,15 +1393,15 @@ framebuffer surface. This ensures atomic character rendering and cursor updates.
 #### Lock Ordering
 
 ```
-OUTPUT_LOCK (held for entire formatted message)
+OUTPUT_LOCK (IrqSpinlock, held for entire formatted message)
     ↓
-PRINTK (ring buffer, brief hold during write)
+PRINTK (IrqSpinlock, ring buffer, brief hold during write)
     ↓
-CONSOLE_REGISTRY (console dispatch to drivers)
+CONSOLE_REGISTRY (IrqSpinlock, console dispatch to drivers)
     ↓
-Per-TTY locks (termios, input, state) - independent between TTYs
+Per-TTY locks (Mutex: termios, input, state) - independent between TTYs
     ↓
-GfxConsole.state (if graphics console receives output)
+GfxConsole.state (Mutex, if graphics console receives output)
 ```
 
 #### Panic-Safe Console Output
@@ -1356,26 +1409,27 @@ GfxConsole.state (if graphics console receives output)
 During panic, the normal locking path can deadlock if the panicking CPU already
 holds `OUTPUT_LOCK`. The printk subsystem handles this with:
 
-1. **`OOPS_IN_PROGRESS` flag** - Atomic bool set at panic entry
+1. **`OOPS_IN_PROGRESS` flag** - Atomic bool set at panic entry via `set_oops_in_progress()`
 2. **`try_lock()` fallback** - Non-blocking lock attempt in panic mode
 3. **Direct serial output** - If lock unavailable, bypass console subsystem
 
 ```rust
-// In PrintkWriter::new() during panic:
-if OOPS_IN_PROGRESS.load(Ordering::Acquire) {
-    match OUTPUT_LOCK.try_lock() {
-        Some(guard) => /* use normal path */,
-        None => /* direct serial write */,
-    }
+// In PrintkWriter::write_str() during panic:
+if self._guard.is_some() {
+    printk_write_locked(s.as_bytes());  // Normal path with lock
+} else {
+    direct_serial_write(s.as_bytes());  // Panic fallback, no lock
 }
 ```
 
 #### Key Rules
 
-1. **OUTPUT_LOCK ensures atomic messages** - Multi-CPU printk won't interleave
-2. **Per-TTY locks are independent** - No ordering constraints between TTYs
-3. **GfxConsole uses single lock** - Cursor and surface always atomic
-4. **Panic bypasses locks** - Direct serial for guaranteed panic output
+1. **All console framework locks are IRQ-safe** - printk works from interrupt context
+2. **OUTPUT_LOCK ensures atomic messages** - Multi-CPU printk won't interleave
+3. **Per-TTY locks are independent** - No ordering constraints between TTYs
+4. **GfxConsole uses single lock** - Cursor and surface always atomic
+5. **Panic bypasses locks** - Direct serial for guaranteed panic output
+6. **ConsoleFlags control console behavior** - ENABLED, BOOT, CONSDEV flags
 
 ---
 
@@ -1626,8 +1680,9 @@ interrupt-safety invariant:
 | Heap allocator | kernel/heap.rs | `Mutex` | Kernel heap allocation |
 | `PAGE_CACHE` | core/page_cache.rs | `Mutex` | Page cache lookup |
 | All VFS locks | kernel/fs/*.rs | `RwLock` | Inodes, dentries, mounts |
-| `OUTPUT_LOCK` | core/printk.rs | `Mutex` | Console output serialization |
-| `PRINTK` | core/printk.rs | `Mutex` | Ring buffer access |
+
+Note: `OUTPUT_LOCK`, `PRINTK`, and `CONSOLE_REGISTRY` are now `IrqSpinlock` and
+CAN be safely acquired from interrupt context. See Section 3.6.
 
 **Invariant**: Code running with interrupts enabled that acquires any of these
 locks will never be interrupted by an ISR that also tries to acquire the same lock.

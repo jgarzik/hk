@@ -257,12 +257,23 @@ pub static SERIAL_TTY_S1: Tty = Tty::new("ttyS1", &SERIAL_DRIVER_S1, &RAW_LDISC)
 /// This initializes COM1 hardware and registers the TTY as a console
 /// with Fallback priority. USB serial (if present) will have Normal
 /// priority and take precedence.
+///
+/// Marked as BOOT console - this is the early serial output during boot.
+/// When a real console (graphics, USB serial) registers with CONSDEV,
+/// boot consoles are typically demoted or unregistered.
 pub fn init_serial_console() {
+    use crate::console::ConsoleFlags;
+
     // Initialize hardware
     SERIAL_DRIVER_S0.init_hardware(115200);
 
     // Register the TTY (not raw driver) as console with Fallback priority
-    register_console(&SERIAL_TTY_S0, ConsolePriority::Fallback);
+    // BOOT flag indicates this is an early boot console
+    register_console(
+        &SERIAL_TTY_S0,
+        ConsolePriority::Fallback,
+        ConsoleFlags::BOOT,
+    );
 }
 
 /// Write a byte directly to COM1 for panic output

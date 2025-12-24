@@ -27,8 +27,14 @@
 //!
 //! The console registry uses fixed-size arrays to avoid heap allocation,
 //! allowing it to work before the heap is initialized.
+//!
+//! ## SMP Locking
+//!
+//! Uses IrqSpinlock for all registry operations to prevent deadlock when
+//! console functions are called from interrupt context (e.g., printk from
+//! a timer interrupt). Linux uses console_sem for similar protection.
 
-use spin::Mutex;
+use crate::arch::IrqSpinlock;
 
 /// Maximum number of console drivers that can be registered
 const MAX_CONSOLES: usize = 8;
@@ -69,10 +75,29 @@ pub enum ConsolePriority {
     Preferred = 2,
 }
 
+bitflags::bitflags! {
+    /// Console flags (matches Linux CON_* flags)
+    ///
+    /// These flags control console behavior during registration and output.
+    /// Linux defines these in include/linux/console.h.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct ConsoleFlags: u16 {
+        /// Console is enabled and can print (CON_ENABLED)
+        const ENABLED = 1 << 0;
+        /// Boot console - auto-unregister when real console arrives (CON_BOOT)
+        const BOOT = 1 << 1;
+        /// Replay kernel log buffer to this console on registration (CON_PRINTBUFFER)
+        const PRINTBUFFER = 1 << 2;
+        /// This is the primary console (/dev/console target) (CON_CONSDEV)
+        const CONSDEV = 1 << 3;
+    }
+}
+
 /// Console registration entry
 struct ConsoleEntry {
     console: Option<&'static dyn ConsoleDriver>,
     priority: ConsolePriority,
+    flags: ConsoleFlags,
 }
 
 impl ConsoleEntry {
@@ -80,6 +105,7 @@ impl ConsoleEntry {
         Self {
             console: None,
             priority: ConsolePriority::Fallback,
+            flags: ConsoleFlags::empty(),
         }
     }
 }
@@ -123,6 +149,7 @@ impl ConsoleRegistry {
         &mut self,
         console: &'static dyn ConsoleDriver,
         priority: ConsolePriority,
+        flags: ConsoleFlags,
     ) -> bool {
         // Check if already registered
         for i in 0..self.count {
@@ -140,10 +167,11 @@ impl ConsoleRegistry {
 
         let was_primary_name = self.primary().map(|c| c.name());
 
-        // Add new entry
+        // Add new entry with ENABLED flag set
         self.consoles[self.count] = ConsoleEntry {
             console: Some(console),
             priority,
+            flags: flags | ConsoleFlags::ENABLED,
         };
         self.count += 1;
         self.needs_flush = true;
@@ -177,6 +205,7 @@ impl ConsoleRegistry {
                 self.consoles[write_idx] = ConsoleEntry {
                     console: self.consoles[read_idx].console,
                     priority: self.consoles[read_idx].priority,
+                    flags: self.consoles[read_idx].flags,
                 };
             }
             write_idx += 1;
@@ -203,9 +232,13 @@ impl ConsoleRegistry {
     }
 
     /// Write to all registered consoles
+    ///
+    /// Only writes to consoles with ENABLED flag set.
     pub fn write_all(&self, data: &[u8]) {
         for i in 0..self.count {
-            if let Some(console) = self.consoles[i].console {
+            if let Some(console) = self.consoles[i].console
+                && self.consoles[i].flags.contains(ConsoleFlags::ENABLED)
+            {
                 console.write(data);
             }
         }
@@ -250,15 +283,29 @@ impl Default for ConsoleRegistry {
 }
 
 /// Global console registry
-static CONSOLE_REGISTRY: Mutex<ConsoleRegistry> = Mutex::new(ConsoleRegistry::new());
+///
+/// Uses IrqSpinlock to be IRQ-safe - console functions can be called from
+/// interrupt context via printk. Linux uses console_sem for serialization.
+static CONSOLE_REGISTRY: IrqSpinlock<ConsoleRegistry> = IrqSpinlock::new(ConsoleRegistry::new());
 
 /// Register a console driver globally
 ///
 /// The priority is automatically elevated to Preferred if the console device
 /// was specified on the kernel command line (console=).
 ///
+/// Flags control console behavior:
+/// - BOOT: Boot console, auto-unregistered when real console arrives
+/// - PRINTBUFFER: Replay kernel log buffer to this console
+/// - CONSDEV: This is the primary console (/dev/console target)
+///
+/// ENABLED is automatically set on registration.
+///
 /// Returns true if this console became the primary console.
-pub fn register_console(console: &'static dyn ConsoleDriver, priority: ConsolePriority) -> bool {
+pub fn register_console(
+    console: &'static dyn ConsoleDriver,
+    priority: ConsolePriority,
+    flags: ConsoleFlags,
+) -> bool {
     use crate::cmdline::is_cmdline_console;
 
     // Elevate priority if specified on command line
@@ -270,7 +317,7 @@ pub fn register_console(console: &'static dyn ConsoleDriver, priority: ConsolePr
 
     CONSOLE_REGISTRY
         .lock()
-        .register(console, effective_priority)
+        .register(console, effective_priority, flags)
 }
 
 /// Unregister a console driver by name
