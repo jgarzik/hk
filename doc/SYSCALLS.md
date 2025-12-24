@@ -249,7 +249,7 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] futex (WAIT, WAKE, WAIT_BITSET, WAKE_BITSET, REQUEUE, CMP_REQUEUE)
 - [x] set_robust_list
 - [x] get_robust_list
-- [ ] futex_waitv (newer multi-wait variant on some kernels)
+- [x] futex_waitv (newer multi-wait variant on some kernels)
 
 7.3 SysV IPC
 

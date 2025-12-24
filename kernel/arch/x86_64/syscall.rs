@@ -475,6 +475,8 @@ pub const SYS_FUTEX: u64 = 202;
 pub const SYS_SET_ROBUST_LIST: u64 = 273;
 /// get_robust_list(pid, head_ptr, len_ptr)
 pub const SYS_GET_ROBUST_LIST: u64 = 274;
+/// futex_waitv(waiters, nr_futexes, flags, timeout, clockid)
+pub const SYS_FUTEX_WAITV: u64 = 449;
 
 // SysV IPC syscalls (Section 7.1)
 /// shmget(key, size, shmflg)
@@ -1546,6 +1548,9 @@ pub fn x86_64_syscall_dispatch(
         }
         SYS_SET_ROBUST_LIST => crate::futex::sys_set_robust_list(arg0, arg1) as u64,
         SYS_GET_ROBUST_LIST => crate::futex::sys_get_robust_list(arg0 as i32, arg1, arg2) as u64,
+        SYS_FUTEX_WAITV => {
+            crate::futex::sys_futex_waitv(arg0, arg1 as u32, arg2 as u32, arg3, arg4 as i32) as u64
+        }
 
         // SysV IPC syscalls
         SYS_SHMGET => crate::ipc::sys_shmget(arg0 as i32, arg1 as usize, arg2 as i32) as u64,

@@ -953,3 +953,340 @@ pub fn sys_futex(
         _ => -ENOSYS,
     }
 }
+
+// =============================================================================
+// Futex Waitv (Linux 5.16+)
+// =============================================================================
+
+/// Maximum number of futexes in a single futex_waitv call
+const FUTEX_WAITV_MAX: usize = 128;
+
+/// FUTEX2 size flags
+mod futex2 {
+    #![allow(dead_code)]
+    pub const SIZE_U8: u32 = 0x00;
+    pub const SIZE_U16: u32 = 0x01;
+    pub const SIZE_U32: u32 = 0x02;
+    pub const SIZE_U64: u32 = 0x03;
+    pub const SIZE_MASK: u32 = 0x03;
+    pub const NUMA: u32 = 0x04;
+    pub const PRIVATE: u32 = 128;
+    /// Valid mask for futex2 flags (size + private only for now)
+    pub const VALID_MASK: u32 = SIZE_MASK | PRIVATE;
+}
+
+/// struct futex_waitv from userspace
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserFutexWaitv {
+    val: u64,
+    uaddr: u64,
+    flags: u32,
+    __reserved: u32,
+}
+
+/// Kernel-side futex_waitv entry with additional tracking state
+struct FutexWaitvEntry {
+    /// Expected value
+    val: u32,
+    /// User address
+    uaddr: u64,
+    /// Is this a private futex?
+    is_private: bool,
+    /// Futex key (computed during setup)
+    key: FutexKey,
+    /// Was this entry woken?
+    woken: bool,
+}
+
+/// Linux futex_waitv syscall entry point
+///
+/// Wait on multiple futexes simultaneously. Returns when any futex is woken,
+/// the timeout expires, or a signal is received.
+///
+/// # Arguments
+/// * `waiters_ptr` - Pointer to array of struct futex_waitv
+/// * `nr_futexes` - Number of futexes in array (1-128)
+/// * `flags` - Syscall flags (must be 0)
+/// * `timeout_ptr` - Optional pointer to struct timespec (absolute timeout)
+/// * `clockid` - Clock for timeout (CLOCK_MONOTONIC or CLOCK_REALTIME)
+///
+/// # Returns
+/// * >= 0: Index of woken futex (hint - others may also be woken)
+/// * -EINVAL: Invalid arguments
+/// * -EFAULT: Bad memory access
+/// * -ETIMEDOUT: Timeout expired
+/// * -EAGAIN/-EWOULDBLOCK: Value mismatch at setup
+pub fn sys_futex_waitv(
+    waiters_ptr: u64,
+    nr_futexes: u32,
+    flags: u32,
+    timeout_ptr: u64,
+    clockid: i32,
+) -> i32 {
+    // Syscall flags must be 0
+    if flags != 0 {
+        return -EINVAL;
+    }
+
+    // Validate nr_futexes is in range [1, 128]
+    if nr_futexes == 0 || nr_futexes as usize > FUTEX_WAITV_MAX {
+        return -EINVAL;
+    }
+
+    // Validate waiters pointer
+    if waiters_ptr == 0 {
+        return -EINVAL;
+    }
+
+    // Validate clockid
+    const CLOCK_REALTIME: i32 = 0;
+    const CLOCK_MONOTONIC: i32 = 1;
+    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
+        return -EINVAL;
+    }
+    let use_realtime = clockid == CLOCK_REALTIME;
+
+    // Parse timeout (absolute time)
+    let timeout_ns = if timeout_ptr != 0 {
+        match read_user_timeout(timeout_ptr) {
+            Ok(Some(ns)) => Some(ns),
+            Ok(None) => None,
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+
+    // Copy and validate waiters from userspace
+    let mut entries: Vec<FutexWaitvEntry> = Vec::with_capacity(nr_futexes as usize);
+    let entry_size = core::mem::size_of::<UserFutexWaitv>() as u64;
+
+    for i in 0..nr_futexes {
+        let entry_ptr = waiters_ptr + (i as u64) * entry_size;
+
+        // Read the futex_waitv struct from userspace
+        let val = match read_user_u64(entry_ptr) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let uaddr = match read_user_u64(entry_ptr + 8) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let flags_field = match read_user_u32(entry_ptr + 16) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let reserved = match read_user_u32(entry_ptr + 20) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+
+        // Reserved field must be 0
+        if reserved != 0 {
+            return -EINVAL;
+        }
+
+        // Validate flags - only support SIZE_U32 and PRIVATE for now
+        if (flags_field & !futex2::VALID_MASK) != 0 {
+            return -EINVAL;
+        }
+
+        // Check size - only support 32-bit futexes
+        let size = flags_field & futex2::SIZE_MASK;
+        if size != futex2::SIZE_U32 {
+            return -EINVAL;
+        }
+
+        // Check alignment (must be 4-byte aligned for u32)
+        if uaddr % 4 != 0 {
+            return -EINVAL;
+        }
+
+        let is_private = (flags_field & futex2::PRIVATE) != 0;
+
+        entries.push(FutexWaitvEntry {
+            val: val as u32,
+            uaddr,
+            is_private,
+            key: FutexKey { ptr: 0, pid: 0 },
+            woken: false,
+        });
+    }
+
+    // Call the main wait logic
+    futex_wait_multiple(&mut entries, timeout_ns, use_realtime)
+}
+
+/// Wait on multiple futexes - returns index of woken futex or error
+///
+/// This implements the full Linux futex_waitv semantics with proper
+/// spurious wakeup handling via retry loop.
+fn futex_wait_multiple(
+    entries: &mut [FutexWaitvEntry],
+    timeout_ns: Option<u64>,
+    _use_realtime: bool,
+) -> i32 {
+    use crate::task::percpu::{SCHEDULING_ENABLED, TASK_TABLE, current_percpu_sched};
+    use crate::task::TaskState;
+
+    // Check scheduling is enabled
+    if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
+        return -EAGAIN;
+    }
+
+    let (tid, pid, priority) = get_current_task_info();
+
+    // Retry loop for spurious wakeups (following Linux pattern)
+    loop {
+        // Phase 1: Compute futex keys for all entries
+        for entry in entries.iter_mut() {
+            entry.key = if entry.is_private {
+                FutexKey::private(entry.uaddr, pid)
+            } else {
+                FutexKey::shared(entry.uaddr)
+            };
+            entry.woken = false;
+        }
+
+        // Phase 2: Atomically check values and enqueue on all futexes
+        // First, increment waiter counts for all buckets
+        for entry in entries.iter() {
+            let bucket = futex_bucket(&entry.key);
+            bucket.inc_waiters();
+        }
+
+        // Memory barrier: ensures waiter counts visible before value reads
+        core::sync::atomic::fence(Ordering::SeqCst);
+
+        // Check values and enqueue
+        let mut value_mismatch = false;
+        let mut enqueued_count = 0usize;
+
+        for entry in entries.iter() {
+            let bucket = futex_bucket(&entry.key);
+            let mut waiters = bucket.waiters.lock();
+
+            // Read futex value
+            let current_val = match read_user_u32(entry.uaddr) {
+                Ok(v) => v,
+                Err(_) => {
+                    // Cleanup: unqueue all enqueued entries and decrement waiter counts
+                    drop(waiters);
+                    for (j, e) in entries.iter().enumerate() {
+                        let b = futex_bucket(&e.key);
+                        if j < enqueued_count {
+                            let mut w = b.waiters.lock();
+                            if let Some(pos) = w.iter().position(|q| q.tid == tid && q.key == e.key) {
+                                w.remove(pos);
+                            }
+                        }
+                        b.dec_waiters();
+                    }
+                    return -EFAULT;
+                }
+            };
+
+            // If value doesn't match, we'll return EAGAIN after cleanup
+            if current_val != entry.val {
+                value_mismatch = true;
+                drop(waiters);
+                break;
+            }
+
+            // Value matches - enqueue ourselves
+            waiters.push(FutexQ::new(
+                entry.key,
+                tid,
+                priority,
+                futex_op::FUTEX_BITSET_MATCH_ANY,
+            ));
+            enqueued_count += 1;
+        }
+
+        if value_mismatch {
+            // Cleanup: unqueue all enqueued entries and decrement waiter counts
+            for (j, e) in entries.iter().enumerate() {
+                let b = futex_bucket(&e.key);
+                if j < enqueued_count {
+                    let mut w = b.waiters.lock();
+                    if let Some(pos) = w.iter().position(|q| q.tid == tid && q.key == e.key) {
+                        w.remove(pos);
+                    }
+                }
+                b.dec_waiters();
+            }
+            return -EAGAIN; // Same as -EWOULDBLOCK
+        }
+
+        // All values match and we're enqueued on all futexes
+        // Mark task as sleeping
+        {
+            let mut table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+                task.state = TaskState::Sleeping;
+            }
+        }
+
+        // Add to sleep queue if timeout specified
+        if let Some(deadline_ns) = timeout_ns
+            && let Some(sched) = current_percpu_sched()
+            && sched.initialized.load(Ordering::Acquire)
+        {
+            use crate::task::sched::SleepEntry;
+            let mut rq = sched.lock.lock();
+            rq.sleep_queue.push(SleepEntry {
+                tid,
+                wake_tick: deadline_ns,
+                priority,
+            });
+            rq.sleep_queue.sort_by_key(|e| e.wake_tick);
+        }
+
+        // Phase 3: Sleep - yield to scheduler
+        crate::task::syscall::sys_sched_yield();
+
+        // Phase 4: We've been woken - check which futex was woken
+        let mut woken_index: i32 = -1;
+
+        for (i, entry) in entries.iter_mut().enumerate() {
+            let bucket = futex_bucket(&entry.key);
+            let mut waiters = bucket.waiters.lock();
+
+            // Check if we're still in this bucket's queue
+            if let Some(pos) = waiters.iter().position(|q| q.tid == tid && q.key == entry.key) {
+                // Still in queue - we weren't woken from this futex
+                waiters.remove(pos);
+                bucket.dec_waiters();
+            } else {
+                // Not in queue - we were woken from this futex
+                entry.woken = true;
+                if woken_index < 0 {
+                    woken_index = i as i32;
+                }
+                bucket.dec_waiters();
+            }
+        }
+
+        // If we found a woken futex, return its index
+        if woken_index >= 0 {
+            return woken_index;
+        }
+
+        // No futex was woken - check for timeout
+        if let Some(deadline_ns) = timeout_ns {
+            // Check if timeout has expired
+            let ts = crate::time::TIMEKEEPER.current_time();
+            let now_ns = (ts.sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(ts.nsec as u64);
+            if now_ns >= deadline_ns {
+                return -ETIMEDOUT;
+            }
+        }
+
+        // Spurious wakeup - retry the entire operation
+        // (This follows Linux's futex_wait_multiple pattern)
+    }
+}

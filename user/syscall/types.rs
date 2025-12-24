@@ -1000,3 +1000,61 @@ pub const O_CLOEXEC: u32 = 0o2000000;
 
 /// O_EXCL flag for exclusive creation
 pub const O_EXCL: u32 = 0o200;
+
+// ============================================================================
+// Futex waitv types and constants (Linux 5.16+)
+// ============================================================================
+
+/// Maximum number of futexes in a single futex_waitv call
+pub const FUTEX_WAITV_MAX: u32 = 128;
+
+/// FUTEX2 size flags - specifies the size of the futex word
+pub const FUTEX2_SIZE_U8: u32 = 0x00;
+pub const FUTEX2_SIZE_U16: u32 = 0x01;
+pub const FUTEX2_SIZE_U32: u32 = 0x02;
+pub const FUTEX2_SIZE_U64: u32 = 0x03;
+pub const FUTEX2_SIZE_MASK: u32 = 0x03;
+
+/// FUTEX2 NUMA flag (not currently supported)
+pub const FUTEX2_NUMA: u32 = 0x04;
+
+/// FUTEX2 private flag - futex is process-private (same as FUTEX_PRIVATE_FLAG)
+pub const FUTEX2_PRIVATE: u32 = 128;
+
+/// struct futex_waitv - A waiter for vectorized wait
+///
+/// Matches Linux ABI exactly (24 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FutexWaitv {
+    /// Expected value at uaddr
+    pub val: u64,
+    /// User address to wait on
+    pub uaddr: u64,
+    /// Flags for this waiter (FUTEX2_SIZE_*, FUTEX2_PRIVATE)
+    pub flags: u32,
+    /// Reserved member - must be 0
+    pub __reserved: u32,
+}
+
+impl FutexWaitv {
+    /// Create a new futex_waitv entry
+    pub const fn new(uaddr: u64, val: u64, flags: u32) -> Self {
+        Self {
+            val,
+            uaddr,
+            flags,
+            __reserved: 0,
+        }
+    }
+
+    /// Create a private 32-bit futex waiter
+    pub const fn private32(uaddr: u64, val: u32) -> Self {
+        Self {
+            val: val as u64,
+            uaddr,
+            flags: FUTEX2_SIZE_U32 | FUTEX2_PRIVATE,
+            __reserved: 0,
+        }
+    }
+}

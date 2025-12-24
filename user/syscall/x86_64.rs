@@ -310,6 +310,7 @@ pub const SYS_IOPRIO_GET: u64 = 252;
 pub const SYS_UNSHARE: u64 = 272;
 pub const SYS_SET_ROBUST_LIST: u64 = 273;
 pub const SYS_GET_ROBUST_LIST: u64 = 274;
+pub const SYS_FUTEX_WAITV: u64 = 449;
 pub const SYS_UTIMENSAT: u64 = 280;
 pub const SYS_PIPE2: u64 = 293;
 pub const SYS_PREADV: u64 = 295;
@@ -1251,6 +1252,31 @@ pub fn sys_set_robust_list(head: *const super::RobustListHead, len: usize) -> i6
 #[inline(always)]
 pub fn sys_get_robust_list(pid: i32, head_ptr: *mut *const super::RobustListHead, len_ptr: *mut usize) -> i64 {
     unsafe { syscall3!(SYS_GET_ROBUST_LIST, pid, head_ptr, len_ptr) }
+}
+
+/// futex_waitv - wait on multiple futexes
+///
+/// # Arguments
+/// * `waiters` - Pointer to array of FutexWaitv structures
+/// * `nr_futexes` - Number of futexes in the array (1-128)
+/// * `flags` - Syscall flags (must be 0)
+/// * `timeout` - Optional pointer to absolute timeout (struct timespec)
+/// * `clockid` - Clock for timeout (CLOCK_MONOTONIC=1 or CLOCK_REALTIME=0)
+///
+/// # Returns
+/// * >= 0: Index of woken futex
+/// * -EINVAL: Invalid arguments
+/// * -EAGAIN: Value mismatch
+/// * -ETIMEDOUT: Timeout expired
+#[inline(always)]
+pub fn sys_futex_waitv(
+    waiters: *const super::FutexWaitv,
+    nr_futexes: u32,
+    flags: u32,
+    timeout: *const Timespec,
+    clockid: i32,
+) -> i64 {
+    unsafe { syscall5!(SYS_FUTEX_WAITV, waiters, nr_futexes, flags, timeout, clockid) }
 }
 
 // --- TLS ---
