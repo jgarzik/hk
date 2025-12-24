@@ -43,14 +43,6 @@ pub fn phys_to_virt(phys: u64) -> *mut u8 {
     (phys + PAGE_OFFSET) as *mut u8
 }
 
-/// Convert virtual address to physical address (direct map only)
-///
-/// Only valid for addresses in the direct map region.
-#[inline]
-pub fn virt_to_phys_direct(virt: *const u8) -> u64 {
-    (virt as u64) - PAGE_OFFSET
-}
-
 /// Convert physical address to page table pointer
 #[inline]
 pub fn phys_to_virt_table(phys: u64) -> *mut RawPageTable {
