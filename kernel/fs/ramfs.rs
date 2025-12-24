@@ -29,7 +29,7 @@ use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
 
 use super::FsError;
 use super::dentry::Dentry;
-use super::file::{DirEntry, File, FileOps};
+use super::file::{DirEntry, File, FileOps, RwFlags};
 use super::inode::{AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::superblock::{FileSystemType, SuperBlock, SuperBlockData, SuperOps};
 
@@ -1052,6 +1052,50 @@ impl FileOps for RamfsFileOps {
         }
 
         Ok(())
+    }
+
+    // RWF_NOWAIT support: ramfs is in-memory and never blocks
+
+    fn read_with_flags(
+        &self,
+        file: &File,
+        buf: &mut [u8],
+        _flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        // In-memory filesystem never blocks
+        self.read(file, buf)
+    }
+
+    fn pread_with_flags(
+        &self,
+        file: &File,
+        buf: &mut [u8],
+        offset: u64,
+        _flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        // In-memory filesystem never blocks
+        self.pread(file, buf, offset)
+    }
+
+    fn write_with_flags(
+        &self,
+        file: &File,
+        buf: &[u8],
+        _flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        // In-memory filesystem never blocks
+        self.write(file, buf)
+    }
+
+    fn pwrite_with_flags(
+        &self,
+        file: &File,
+        buf: &[u8],
+        offset: u64,
+        _flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        // In-memory filesystem never blocks
+        self.pwrite(file, buf, offset)
     }
 }
 

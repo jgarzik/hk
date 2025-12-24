@@ -76,6 +76,7 @@ pub fn run_tests() {
     test_pwritev2_rwf_append();
     test_preadv2_invalid_flags();
     test_preadv2_rwf_nowait();
+    test_preadv2_rwf_nowait_pipe_eagain();
 }
 
 /// Test 22: writev() - gather write to stdout
@@ -1110,8 +1111,9 @@ fn test_preadv2_invalid_flags() {
     }
 }
 
-/// Test 44: preadv2() with RWF_NOWAIT returns -EOPNOTSUPP (Phase 1)
+/// Test 44: preadv2() with RWF_NOWAIT on ramfs file succeeds
 fn test_preadv2_rwf_nowait() {
+    // Test RWF_NOWAIT on ramfs file - should succeed since ramfs never blocks
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
@@ -1124,16 +1126,57 @@ fn test_preadv2_rwf_nowait() {
     let mut buf = [0u8; 4];
     let iov: [IoVec; 1] = [IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() }];
 
-    // RWF_NOWAIT should return EOPNOTSUPP in Phase 1
+    // RWF_NOWAIT on ramfs should work (ramfs is in-memory and never blocks)
     let ret = sys_preadv2(fd as i32, iov.as_ptr(), 1, 0, RWF_NOWAIT);
 
     sys_close(fd as u64);
 
-    if ret == -95 {
-        // EOPNOTSUPP = 95
+    // Should return bytes read (4), not error
+    if ret == 4 {
         println(b"PREADV2_RWF_NOWAIT:OK");
+    } else if ret == -95 {
+        print(b"PREADV2_RWF_NOWAIT:FAIL: got EOPNOTSUPP, but ramfs should support NOWAIT");
+        println(b"");
     } else {
-        print(b"PREADV2_RWF_NOWAIT:FAIL: expected -95 (EOPNOTSUPP), got ");
+        print(b"PREADV2_RWF_NOWAIT:FAIL: expected 4, got ");
+        print_num(ret);
+        println(b"");
+    }
+}
+
+/// Test 45: preadv2() with RWF_NOWAIT on empty pipe returns EAGAIN
+fn test_preadv2_rwf_nowait_pipe_eagain() {
+    // Create a pipe
+    let mut pipefds = [0i32; 2];
+    let ret = sys_pipe2(pipefds.as_mut_ptr(), 0);
+    if ret < 0 {
+        print(b"PREADV2_NOWAIT_PIPE:FAIL: pipe2 failed: ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+
+    let read_fd = pipefds[0];
+    let write_fd = pipefds[1];
+
+    // Try to read from empty pipe with RWF_NOWAIT
+    let mut buf = [0u8; 4];
+    let iov: [IoVec; 1] = [IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() }];
+
+    // Use offset=-1 for pipe (pipes don't support positioned I/O)
+    let ret = sys_preadv2(read_fd, iov.as_ptr(), 1, -1, RWF_NOWAIT);
+
+    sys_close(read_fd as u64);
+    sys_close(write_fd as u64);
+
+    // Should return EAGAIN (-11) since pipe is empty
+    if ret == -11 {
+        println(b"PREADV2_NOWAIT_PIPE:OK");
+    } else if ret == -95 {
+        print(b"PREADV2_NOWAIT_PIPE:FAIL: got EOPNOTSUPP, but pipe should support NOWAIT");
+        println(b"");
+    } else {
+        print(b"PREADV2_NOWAIT_PIPE:FAIL: expected -11 (EAGAIN), got ");
         print_num(ret);
         println(b"");
     }

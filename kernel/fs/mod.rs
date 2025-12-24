@@ -29,7 +29,7 @@ pub mod vfs;
 pub use blkdev_ops::BLOCK_FILE_OPS;
 pub use cpio::unpack_cpio;
 pub use dentry::{DCACHE, Dentry, DentryCache, is_subdir};
-pub use file::{CHAR_FILE_OPS, DirEntry, File, FileOps, flags, seek};
+pub use file::{CHAR_FILE_OPS, DirEntry, File, FileOps, RwFlags, flags, seek};
 pub use fsstruct::{FsStruct, clone_task_fs, exit_task_fs, get_task_fs, init_task_fs};
 pub use inode::{DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, Uid};
 pub use mount::{

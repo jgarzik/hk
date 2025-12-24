@@ -40,7 +40,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Mutex;
 
 use crate::fs::FsError;
-use crate::fs::file::{File, FileOps, flags};
+use crate::fs::file::{File, FileOps, RwFlags, flags};
 use crate::mm::page_cache::{CachedPage, PAGE_SIZE};
 use crate::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::waitqueue::WaitQueue;
@@ -598,6 +598,27 @@ impl FileOps for PipeReadFileOps {
         // Reader reference is dropped via PipeReadEnd's Drop impl
         Ok(())
     }
+
+    fn read_with_flags(
+        &self,
+        file: &File,
+        buf: &mut [u8],
+        flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        if flags.nowait {
+            // Check if data is available without blocking
+            let inner = self.pipe.inner.lock();
+            if inner.is_empty() {
+                // No data available
+                if !self.pipe.has_writers() {
+                    return Ok(0); // EOF - write end closed
+                }
+                return Err(FsError::WouldBlock);
+            }
+            drop(inner); // Release lock before doing the actual read
+        }
+        self.read(file, buf)
+    }
 }
 
 // =============================================================================
@@ -713,6 +734,27 @@ impl FileOps for PipeWriteFileOps {
     fn release(&self, _file: &File) -> Result<(), FsError> {
         // Writer reference is dropped via PipeWriteEnd's Drop impl
         Ok(())
+    }
+
+    fn write_with_flags(
+        &self,
+        file: &File,
+        buf: &[u8],
+        flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        if flags.nowait {
+            // Check for no readers (EPIPE)
+            if !self.pipe.has_readers() {
+                return Err(FsError::BrokenPipe);
+            }
+            // Check if buffer has space without blocking
+            let inner = self.pipe.inner.lock();
+            if inner.is_full() {
+                return Err(FsError::WouldBlock);
+            }
+            drop(inner); // Release lock before doing the actual write
+        }
+        self.write(file, buf)
     }
 }
 

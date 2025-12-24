@@ -12,8 +12,8 @@ use alloc::vec;
 use crate::arch::Uaccess;
 use crate::console::console_write;
 use crate::fs::{
-    Dentry, File, FsError, InodeMode, LookupFlags, Path, RAMFS_FILE_OPS, is_subdir, lock_rename,
-    lookup_path_at, lookup_path_flags, unlock_rename,
+    Dentry, File, FsError, InodeMode, LookupFlags, Path, RAMFS_FILE_OPS, RwFlags, is_subdir,
+    lock_rename, lookup_path_at, lookup_path_flags, unlock_rename,
 };
 use crate::uaccess::{UaccessArch, copy_to_user, put_user, strncpy_from_user};
 
@@ -1581,19 +1581,144 @@ pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) 
         return EOPNOTSUPP;
     }
 
-    // Flags not supported in Phase 1 - return EOPNOTSUPP
-    if flags & (RWF_NOWAIT | RWF_ATOMIC | RWF_DONTCACHE) != 0 {
+    // Unsupported flags - return EOPNOTSUPP
+    if flags & (RWF_ATOMIC | RWF_DONTCACHE) != 0 {
         return EOPNOTSUPP;
     }
 
-    // offset == -1: use current file position (like readv)
-    if offset == -1 {
-        return sys_readv(fd, iov_ptr, iovcnt);
+    // If RWF_NOWAIT not set, delegate to existing syscalls
+    if flags & RWF_NOWAIT == 0 {
+        if offset == -1 {
+            return sys_readv(fd, iov_ptr, iovcnt);
+        }
+        return sys_preadv(fd, iov_ptr, iovcnt, offset);
     }
 
-    // Otherwise: positioned read (like preadv)
-    // Note: RWF_HIPRI, RWF_DSYNC, RWF_SYNC, RWF_NOAPPEND, RWF_NOSIGNAL are no-ops for reads
-    sys_preadv(fd, iov_ptr, iovcnt, offset)
+    // RWF_NOWAIT handling - use *_with_flags methods
+    let rw_flags = RwFlags::with_nowait();
+
+    // Validate and copy iovec array
+    let iovecs = match validate_iovec_array(iov_ptr, iovcnt) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if iovecs.is_empty() {
+        return 0;
+    }
+
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    if file.is_dir() {
+        return EISDIR;
+    }
+
+    // For offset == -1, use current file position
+    let use_position = offset == -1;
+    let mut current_offset = if use_position { file.get_pos() } else { offset as u64 };
+
+    let mut total_read: usize = 0;
+
+    for iov in &iovecs {
+        if iov.iov_len == 0 {
+            continue;
+        }
+
+        let remaining_allowed = MAX_RW_COUNT.saturating_sub(total_read);
+        if remaining_allowed == 0 {
+            break;
+        }
+
+        let count = core::cmp::min(iov.iov_len as usize, remaining_allowed);
+
+        if count <= SMALL_BUF_SIZE {
+            let mut stack_buf = [0u8; SMALL_BUF_SIZE];
+            let read_buf = &mut stack_buf[..count];
+
+            let result = if use_position {
+                file.read_with_flags(read_buf, rw_flags)
+            } else {
+                file.pread_with_flags(read_buf, current_offset, rw_flags)
+            };
+
+            let bytes_read = match result {
+                Ok(n) => n,
+                Err(FsError::WouldBlock) => {
+                    return if total_read > 0 { total_read as i64 } else { EAGAIN };
+                }
+                Err(FsError::NotSupported) => {
+                    return if total_read > 0 { total_read as i64 } else { EOPNOTSUPP };
+                }
+                Err(FsError::PermissionDenied) => {
+                    return if total_read > 0 { total_read as i64 } else { EBADF };
+                }
+                Err(_) => {
+                    return if total_read > 0 { total_read as i64 } else { EINVAL };
+                }
+            };
+
+            if bytes_read > 0
+                && copy_to_user::<Uaccess>(iov.iov_base, &read_buf[..bytes_read]).is_err()
+            {
+                return if total_read > 0 { total_read as i64 } else { EFAULT };
+            }
+
+            total_read += bytes_read;
+            current_offset += bytes_read as u64;
+
+            if bytes_read < count {
+                break;
+            }
+        } else {
+            let mut kernel_buf = vec![0u8; count];
+
+            let result = if use_position {
+                file.read_with_flags(&mut kernel_buf, rw_flags)
+            } else {
+                file.pread_with_flags(&mut kernel_buf, current_offset, rw_flags)
+            };
+
+            let bytes_read = match result {
+                Ok(n) => n,
+                Err(FsError::WouldBlock) => {
+                    return if total_read > 0 { total_read as i64 } else { EAGAIN };
+                }
+                Err(FsError::NotSupported) => {
+                    return if total_read > 0 { total_read as i64 } else { EOPNOTSUPP };
+                }
+                Err(FsError::PermissionDenied) => {
+                    return if total_read > 0 { total_read as i64 } else { EBADF };
+                }
+                Err(_) => {
+                    return if total_read > 0 { total_read as i64 } else { EINVAL };
+                }
+            };
+
+            if bytes_read > 0
+                && copy_to_user::<Uaccess>(iov.iov_base, &kernel_buf[..bytes_read]).is_err()
+            {
+                return if total_read > 0 { total_read as i64 } else { EFAULT };
+            }
+
+            total_read += bytes_read;
+            current_offset += bytes_read as u64;
+
+            if bytes_read < count {
+                break;
+            }
+        }
+    }
+
+    // Update file position if using current position
+    if use_position && total_read > 0 {
+        file.advance_pos(total_read as u64);
+    }
+
+    total_read as i64
 }
 
 /// sys_pwritev2 - positioned gather write with flags
@@ -1616,40 +1741,193 @@ pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32)
         return EOPNOTSUPP;
     }
 
-    // Flags not supported in Phase 1 - return EOPNOTSUPP
-    if flags & (RWF_NOWAIT | RWF_ATOMIC | RWF_DONTCACHE) != 0 {
+    // Unsupported flags - return EOPNOTSUPP
+    if flags & (RWF_ATOMIC | RWF_DONTCACHE) != 0 {
         return EOPNOTSUPP;
     }
 
-    // offset == -1: use current file position (like writev)
-    if offset == -1 {
-        let result = sys_writev(fd, iov_ptr, iovcnt);
-        // RWF_SYNC/RWF_DSYNC: sync after successful write
+    // If RWF_NOWAIT not set, delegate to existing syscalls
+    if flags & RWF_NOWAIT == 0 {
+        if offset == -1 {
+            let result = sys_writev(fd, iov_ptr, iovcnt);
+            if result > 0 && (flags & (RWF_SYNC | RWF_DSYNC)) != 0 {
+                let _ = sys_fsync(fd);
+            }
+            return result;
+        }
+
+        // RWF_APPEND: get file size as offset
+        let actual_offset = if flags & RWF_APPEND != 0 {
+            let file = match current_fd_table().lock().get(fd) {
+                Some(f) => f,
+                None => return EBADF,
+            };
+            file.get_inode().map(|i| i.get_size() as i64).unwrap_or(0)
+        } else {
+            offset
+        };
+
+        let result = sys_pwritev(fd, iov_ptr, iovcnt, actual_offset);
         if result > 0 && (flags & (RWF_SYNC | RWF_DSYNC)) != 0 {
             let _ = sys_fsync(fd);
         }
         return result;
     }
 
-    // RWF_APPEND: get file size as offset (append to end of file)
-    let actual_offset = if flags & RWF_APPEND != 0 {
-        let file = match current_fd_table().lock().get(fd) {
-            Some(f) => f,
-            None => return EBADF,
-        };
-        file.get_inode().map(|i| i.get_size() as i64).unwrap_or(0)
-    } else {
-        offset
+    // RWF_NOWAIT handling - use *_with_flags methods
+    let rw_flags = RwFlags::with_nowait();
+
+    // Validate and copy iovec array
+    let iovecs = match validate_iovec_array(iov_ptr, iovcnt) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
-    let result = sys_pwritev(fd, iov_ptr, iovcnt, actual_offset);
+    if iovecs.is_empty() {
+        return 0;
+    }
+
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    if file.is_dir() {
+        return EISDIR;
+    }
+
+    // For offset == -1, use current file position
+    let use_position = offset == -1;
+
+    // RWF_APPEND: get file size as offset
+    let mut current_offset = if use_position {
+        file.get_pos()
+    } else if flags & RWF_APPEND != 0 {
+        file.get_inode().map(|i| i.get_size()).unwrap_or(0)
+    } else {
+        offset as u64
+    };
+
+    let mut total_written: usize = 0;
+
+    for iov in &iovecs {
+        if iov.iov_len == 0 {
+            continue;
+        }
+
+        let remaining_allowed = MAX_RW_COUNT.saturating_sub(total_written);
+        if remaining_allowed == 0 {
+            break;
+        }
+
+        let count = core::cmp::min(iov.iov_len as usize, remaining_allowed);
+
+        if count <= SMALL_BUF_SIZE {
+            let mut stack_buf = [0u8; SMALL_BUF_SIZE];
+            let write_buf = &mut stack_buf[..count];
+
+            // Copy from user space
+            unsafe {
+                Uaccess::user_access_begin();
+                core::ptr::copy_nonoverlapping(
+                    iov.iov_base as *const u8,
+                    write_buf.as_mut_ptr(),
+                    count,
+                );
+                Uaccess::user_access_end();
+            }
+
+            let result = if use_position {
+                file.write_with_flags(write_buf, rw_flags)
+            } else {
+                file.pwrite_with_flags(write_buf, current_offset, rw_flags)
+            };
+
+            let bytes_written = match result {
+                Ok(n) => n,
+                Err(FsError::WouldBlock) => {
+                    return if total_written > 0 { total_written as i64 } else { EAGAIN };
+                }
+                Err(FsError::NotSupported) => {
+                    return if total_written > 0 { total_written as i64 } else { EOPNOTSUPP };
+                }
+                Err(FsError::PermissionDenied) => {
+                    return if total_written > 0 { total_written as i64 } else { EBADF };
+                }
+                Err(FsError::BrokenPipe) => {
+                    return if total_written > 0 { total_written as i64 } else { EPIPE };
+                }
+                Err(_) => {
+                    return if total_written > 0 { total_written as i64 } else { EINVAL };
+                }
+            };
+
+            total_written += bytes_written;
+            current_offset += bytes_written as u64;
+
+            if bytes_written < count {
+                break;
+            }
+        } else {
+            let mut kernel_buf = vec![0u8; count];
+
+            // Copy from user space
+            unsafe {
+                Uaccess::user_access_begin();
+                core::ptr::copy_nonoverlapping(
+                    iov.iov_base as *const u8,
+                    kernel_buf.as_mut_ptr(),
+                    count,
+                );
+                Uaccess::user_access_end();
+            }
+
+            let result = if use_position {
+                file.write_with_flags(&kernel_buf, rw_flags)
+            } else {
+                file.pwrite_with_flags(&kernel_buf, current_offset, rw_flags)
+            };
+
+            let bytes_written = match result {
+                Ok(n) => n,
+                Err(FsError::WouldBlock) => {
+                    return if total_written > 0 { total_written as i64 } else { EAGAIN };
+                }
+                Err(FsError::NotSupported) => {
+                    return if total_written > 0 { total_written as i64 } else { EOPNOTSUPP };
+                }
+                Err(FsError::PermissionDenied) => {
+                    return if total_written > 0 { total_written as i64 } else { EBADF };
+                }
+                Err(FsError::BrokenPipe) => {
+                    return if total_written > 0 { total_written as i64 } else { EPIPE };
+                }
+                Err(_) => {
+                    return if total_written > 0 { total_written as i64 } else { EINVAL };
+                }
+            };
+
+            total_written += bytes_written;
+            current_offset += bytes_written as u64;
+
+            if bytes_written < count {
+                break;
+            }
+        }
+    }
+
+    // Update file position if using current position
+    if use_position && total_written > 0 {
+        file.advance_pos(total_written as u64);
+    }
 
     // RWF_SYNC/RWF_DSYNC: sync after successful write
-    if result > 0 && (flags & (RWF_SYNC | RWF_DSYNC)) != 0 {
+    if total_written > 0 && (flags & (RWF_SYNC | RWF_DSYNC)) != 0 {
         let _ = sys_fsync(fd);
     }
 
-    result
+    total_written as i64
 }
 
 /// sys_close - close a file descriptor
