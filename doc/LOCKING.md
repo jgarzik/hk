@@ -1461,6 +1461,73 @@ pub fn advance_pos(&self, n: u64) -> u64 {
 
 As described in Section 3.4, time reads are lock-free using the seqlock pattern.
 
+### 5.4 Atomic Types vs Struct-Level Locks
+
+When designing data structures, choose between atomics and locks carefully:
+
+#### When to Use Atomics
+
+1. **Reference counting** - Single counter, increment/decrement operations
+2. **Independent flags** - Bool/state that doesn't need to update with other fields
+3. **Statistics counters** - Counters where slight inconsistency is acceptable
+4. **Seqlock sequences** - Sequence number for seqlock readers
+5. **Lock-free algorithms** - Data structures designed for lock-free access
+
+#### When to Use Struct-Level Locks
+
+1. **Related fields that must update together** - Use Mutex/RwLock
+2. **Invariants across multiple fields** - Lock ensures invariant holds
+3. **Complex state transitions** - Lock serializes state machine
+
+#### Common Mistake to Avoid
+
+Using multiple atomics in a struct and updating them separately does NOT provide
+multi-field atomicity. If fields A and B must be consistent:
+
+**Wrong:**
+```rust
+struct Foo {
+    a: AtomicU32,
+    b: AtomicU32,
+}
+// Two separate stores - can be seen inconsistently
+foo.a.store(1, Ordering::Release);
+foo.b.store(2, Ordering::Release);
+```
+
+**Right:**
+```rust
+struct Foo {
+    inner: Mutex<FooInner>,
+}
+struct FooInner {
+    a: u32,
+    b: u32,
+}
+// Single lock - guaranteed consistent
+let mut guard = foo.inner.lock();
+guard.a = 1;
+guard.b = 2;
+```
+
+#### hk Pattern Examples
+
+The following patterns are CORRECT uses of atomics in hk:
+
+| Subsystem | Atomic Fields | Why Correct |
+|-----------|---------------|-------------|
+| `TimeKeeper` | seq, cycle_base, mono_base_ns, etc. | Seqlock pattern - all read together with seq validation |
+| `Inode` | mode, uid, gid, size, nlink | Each field updated independently by different operations |
+| `File` | pos | File position modified independently (concurrent reads OK) |
+| `Socket` | flags, error, eof | Independent flags with Mutex-protected data buffers |
+| `CachedPage` | refcount, dirty, writeback, locked | Linux page cache pattern - flags + refcount |
+| `MsgQueue` | stime, rtime, cbytes, qnum, etc. | Different syscalls update different subsets |
+
+All hk structs that update multiple related fields atomically use locks:
+- `MsgQueue.messages: Mutex<VecDeque<MsgMsg>>` - protects message list
+- `SemArray.pending: Mutex<VecDeque<...>>` - serializes pending ops
+- `PageCache inner locks` - protect page maps
+
 ---
 
 ## 6. Preemption Control
