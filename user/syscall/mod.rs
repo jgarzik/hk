@@ -33,6 +33,7 @@ pub use aarch64::*;
 
 /// Timespec structure for nanosleep and related syscalls
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Timespec {
     pub tv_sec: i64,
     pub tv_nsec: i64,
@@ -778,3 +779,56 @@ pub const STATX_BTIME: u32 = 0x0800;
 // AT_* flags for statx
 pub const AT_EMPTY_PATH: i32 = 0x1000;
 pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+
+// ============================================================================
+// Timerfd types and constants
+// ============================================================================
+
+/// itimerspec structure for timerfd
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ITimerSpec {
+    /// Interval for periodic timer (0 = one-shot)
+    pub it_interval: Timespec,
+    /// Initial expiration time
+    pub it_value: Timespec,
+}
+
+impl ITimerSpec {
+    /// Create a new itimerspec
+    pub const fn new(value_sec: i64, value_nsec: i64, interval_sec: i64, interval_nsec: i64) -> Self {
+        Self {
+            it_value: Timespec { tv_sec: value_sec, tv_nsec: value_nsec },
+            it_interval: Timespec { tv_sec: interval_sec, tv_nsec: interval_nsec },
+        }
+    }
+
+    /// Create a one-shot timer with the given expiration
+    pub const fn oneshot(sec: i64, nsec: i64) -> Self {
+        Self::new(sec, nsec, 0, 0)
+    }
+
+    /// Create a periodic timer
+    pub const fn periodic(sec: i64, nsec: i64) -> Self {
+        Self::new(sec, nsec, sec, nsec)
+    }
+
+    /// Create a disarmed timer
+    pub const fn disarmed() -> Self {
+        Self::new(0, 0, 0, 0)
+    }
+}
+
+impl Default for ITimerSpec {
+    fn default() -> Self {
+        Self::disarmed()
+    }
+}
+
+/// timerfd_create flags
+pub const TFD_CLOEXEC: i32 = 0o2000000;
+pub const TFD_NONBLOCK: i32 = 0o4000;
+
+/// timerfd_settime flags
+pub const TFD_TIMER_ABSTIME: i32 = 1;
+pub const TFD_TIMER_CANCEL_ON_SET: i32 = 2;

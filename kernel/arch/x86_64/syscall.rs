@@ -126,6 +126,12 @@ pub const SYS_CLOCK_SETTIME: u64 = 227;
 pub const SYS_SETTIMEOFDAY: u64 = 164;
 /// time(tloc)
 pub const SYS_TIME: u64 = 201;
+/// timerfd_create(clockid, flags)
+pub const SYS_TIMERFD_CREATE: u64 = 283;
+/// timerfd_settime(fd, flags, new_value, old_value)
+pub const SYS_TIMERFD_SETTIME: u64 = 286;
+/// timerfd_gettime(fd, curr_value)
+pub const SYS_TIMERFD_GETTIME: u64 = 287;
 
 // Process IDs & basic info (Section 1.2)
 /// setpgid(pid, pgid)
@@ -1007,7 +1013,8 @@ pub fn x86_64_syscall_dispatch(
     };
     use crate::time_syscall::{
         sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime,
-        sys_gettimeofday, sys_nanosleep, sys_settimeofday, sys_time,
+        sys_gettimeofday, sys_nanosleep, sys_settimeofday, sys_time, sys_timerfd_create,
+        sys_timerfd_gettime, sys_timerfd_settime,
     };
 
     match num {
@@ -1063,6 +1070,9 @@ pub fn x86_64_syscall_dispatch(
         SYS_SETTIMEOFDAY => sys_settimeofday(arg0, arg1) as u64,
         SYS_NANOSLEEP => sys_nanosleep(arg0, arg1) as u64,
         SYS_CLOCK_NANOSLEEP => sys_clock_nanosleep(arg0 as i32, arg1 as i32, arg2, arg3) as u64,
+        SYS_TIMERFD_CREATE => sys_timerfd_create(arg0 as i32, arg1 as i32) as u64,
+        SYS_TIMERFD_SETTIME => sys_timerfd_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64,
+        SYS_TIMERFD_GETTIME => sys_timerfd_gettime(arg0 as i32, arg1) as u64,
         SYS_SCHED_YIELD => {
             sys_sched_yield();
             0

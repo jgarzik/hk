@@ -18,6 +18,7 @@ pub mod rlimit;
 pub mod namespace;
 pub mod sockets;
 pub mod futex;
+pub mod timerfd;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -35,4 +36,5 @@ pub fn run_all_tests() {
     namespace::run_tests();
     sockets::run_tests();
     futex::run_tests();
+    timerfd::run_tests();
 }

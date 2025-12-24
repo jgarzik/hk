@@ -406,3 +406,177 @@ pub fn sys_settimeofday(tv: u64, tz: u64) -> i64 {
 
     0
 }
+
+// =============================================================================
+// Timerfd syscalls
+// =============================================================================
+
+use crate::pipe::FD_CLOEXEC;
+use crate::task::fdtable::get_task_fd;
+use crate::task::percpu::current_tid;
+use crate::timerfd::{ITimerSpec, create_timerfd, get_timerfd, tfd_flags, tfd_timer_flags};
+
+/// Error numbers
+const EBADF: i64 = -9;
+const EMFILE: i64 = -24;
+
+/// Get the RLIMIT_NOFILE limit for the current task
+fn get_nofile_limit() -> u64 {
+    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
+    if limit == crate::rlimit::RLIM_INFINITY {
+        u64::MAX
+    } else {
+        limit
+    }
+}
+
+/// sys_timerfd_create - create a timerfd file descriptor
+///
+/// # Arguments
+/// * `clockid` - Clock to use (CLOCK_REALTIME or CLOCK_MONOTONIC)
+/// * `flags` - TFD_CLOEXEC | TFD_NONBLOCK
+///
+/// Returns fd on success, negative errno on error.
+pub fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
+    // Validate clockid
+    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
+        return EINVAL;
+    }
+
+    // Validate flags (only TFD_CLOEXEC and TFD_NONBLOCK are allowed)
+    let valid_flags = tfd_flags::TFD_CLOEXEC | tfd_flags::TFD_NONBLOCK;
+    if flags & !valid_flags != 0 {
+        return EINVAL;
+    }
+
+    // Create the timerfd file
+    let file = match create_timerfd(clockid, flags) {
+        Ok(f) => f,
+        Err(_) => return EMFILE,
+    };
+
+    // Get the FD table and allocate a file descriptor
+    let fd_table = match get_task_fd(current_tid()) {
+        Some(t) => t,
+        None => return EMFILE,
+    };
+    let mut table = fd_table.lock();
+    let fd_flags = if flags & tfd_flags::TFD_CLOEXEC != 0 {
+        FD_CLOEXEC
+    } else {
+        0
+    };
+
+    match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
+        Ok(fd) => fd as i64,
+        Err(e) => -(e as i64),
+    }
+}
+
+/// sys_timerfd_settime - arm/disarm a timerfd
+///
+/// # Arguments
+/// * `fd` - Timerfd file descriptor
+/// * `flags` - TFD_TIMER_ABSTIME for absolute time
+/// * `new_value` - Pointer to new itimerspec
+/// * `old_value` - Pointer to store old itimerspec (may be NULL)
+///
+/// Returns 0 on success, negative errno on error.
+pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: u64, old_value: u64) -> i64 {
+    // Validate flags
+    let valid_flags = tfd_timer_flags::TFD_TIMER_ABSTIME | tfd_timer_flags::TFD_TIMER_CANCEL_ON_SET;
+    if flags & !valid_flags != 0 {
+        return EINVAL;
+    }
+
+    // Validate new_value pointer
+    if new_value == 0 || !Uaccess::access_ok(new_value, core::mem::size_of::<ITimerSpec>()) {
+        return EFAULT;
+    }
+
+    // Read new_value from user space
+    let new_spec: ITimerSpec = match get_user::<Uaccess, ITimerSpec>(new_value) {
+        Ok(spec) => spec,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate timespec values
+    if new_spec.it_value.tv_nsec < 0
+        || new_spec.it_value.tv_nsec >= 1_000_000_000
+        || new_spec.it_interval.tv_nsec < 0
+        || new_spec.it_interval.tv_nsec >= 1_000_000_000
+    {
+        return EINVAL;
+    }
+
+    // Get the file from fd
+    let fd_table = match get_task_fd(current_tid()) {
+        Some(t) => t,
+        None => return EBADF,
+    };
+    let file = match fd_table.lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Get the timerfd from the file
+    let timerfd = match get_timerfd(&file) {
+        Some(t) => t,
+        None => return EBADF, // Not a timerfd
+    };
+
+    // Set the timer and get the old value
+    let old_spec = timerfd.settime(&new_spec, flags);
+
+    // Write old_value if provided
+    if old_value != 0 {
+        if !Uaccess::access_ok(old_value, core::mem::size_of::<ITimerSpec>()) {
+            return EFAULT;
+        }
+        if put_user::<Uaccess, ITimerSpec>(old_value, old_spec).is_err() {
+            return EFAULT;
+        }
+    }
+
+    0
+}
+
+/// sys_timerfd_gettime - get current timer value
+///
+/// # Arguments
+/// * `fd` - Timerfd file descriptor
+/// * `curr_value` - Pointer to store current itimerspec
+///
+/// Returns 0 on success, negative errno on error.
+pub fn sys_timerfd_gettime(fd: i32, curr_value: u64) -> i64 {
+    // Validate curr_value pointer
+    if curr_value == 0 || !Uaccess::access_ok(curr_value, core::mem::size_of::<ITimerSpec>()) {
+        return EFAULT;
+    }
+
+    // Get the file from fd
+    let fd_table = match get_task_fd(current_tid()) {
+        Some(t) => t,
+        None => return EBADF,
+    };
+    let file = match fd_table.lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Get the timerfd from the file
+    let timerfd = match get_timerfd(&file) {
+        Some(t) => t,
+        None => return EBADF, // Not a timerfd
+    };
+
+    // Get current timer value
+    let curr_spec = timerfd.gettime();
+
+    // Write to user space
+    if put_user::<Uaccess, ITimerSpec>(curr_value, curr_spec).is_err() {
+        return EFAULT;
+    }
+
+    0
+}

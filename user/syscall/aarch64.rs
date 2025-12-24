@@ -182,6 +182,9 @@ pub const SYS_CLOCK_SETTIME: u64 = 112;
 pub const SYS_CLOCK_GETTIME: u64 = 113;
 pub const SYS_CLOCK_GETRES: u64 = 114;
 pub const SYS_CLOCK_NANOSLEEP: u64 = 115;
+pub const SYS_TIMERFD_CREATE: u64 = 85;
+pub const SYS_TIMERFD_SETTIME: u64 = 86;
+pub const SYS_TIMERFD_GETTIME: u64 = 87;
 pub const SYS_REBOOT: u64 = 142;
 pub const SYS_SETPGID: u64 = 154;
 pub const SYS_GETPGID: u64 = 155;
@@ -494,6 +497,28 @@ pub fn sys_clock_gettime(clockid: i32, tp: *mut Timespec) -> i64 {
 #[inline(always)]
 pub fn sys_clock_settime(clockid: i32, tp: *const Timespec) -> i64 {
     unsafe { syscall2!(SYS_CLOCK_SETTIME, clockid, tp) }
+}
+
+// --- Timerfd ---
+
+use super::ITimerSpec;
+
+/// timerfd_create(clockid, flags)
+#[inline(always)]
+pub fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
+    unsafe { syscall2!(SYS_TIMERFD_CREATE, clockid, flags) }
+}
+
+/// timerfd_settime(fd, flags, new_value, old_value)
+#[inline(always)]
+pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: *const ITimerSpec, old_value: *mut ITimerSpec) -> i64 {
+    unsafe { syscall4!(SYS_TIMERFD_SETTIME, fd, flags, new_value, old_value) }
+}
+
+/// timerfd_gettime(fd, curr_value)
+#[inline(always)]
+pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
+    unsafe { syscall2!(SYS_TIMERFD_GETTIME, fd, curr_value) }
 }
 
 /// waitid(idtype, id, infop, options)

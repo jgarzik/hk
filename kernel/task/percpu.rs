@@ -1210,6 +1210,8 @@ pub fn exit_current() -> ! {
 /// Called on timer tick
 pub fn timer_tick() {
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Check and fire any expired software timers
+    crate::timer::check_timers();
 }
 
 /// Get current tick count

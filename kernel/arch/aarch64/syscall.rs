@@ -106,6 +106,12 @@ pub const SYS_CLOCK_SETTIME: u64 = 112;
 pub const SYS_CLOCK_GETTIME: u64 = 113;
 pub const SYS_CLOCK_GETRES: u64 = 114;
 pub const SYS_CLOCK_NANOSLEEP: u64 = 115;
+/// timerfd_create(clockid, flags)
+pub const SYS_TIMERFD_CREATE: u64 = 85;
+/// timerfd_settime(fd, flags, new_value, old_value)
+pub const SYS_TIMERFD_SETTIME: u64 = 86;
+/// timerfd_gettime(fd, curr_value)
+pub const SYS_TIMERFD_GETTIME: u64 = 87;
 pub const SYS_REBOOT: u64 = 142;
 pub const SYS_SETPGID: u64 = 154;
 pub const SYS_GETPGID: u64 = 155;
@@ -323,6 +329,7 @@ pub fn aarch64_syscall_dispatch(
     };
     use crate::time_syscall::{
         sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime, sys_nanosleep,
+        sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
     };
 
     match num {
@@ -492,6 +499,9 @@ pub fn aarch64_syscall_dispatch(
         SYS_CLOCK_SETTIME => sys_clock_settime(arg0 as i32, arg1) as u64,
         SYS_NANOSLEEP => sys_nanosleep(arg0, arg1) as u64,
         SYS_CLOCK_NANOSLEEP => sys_clock_nanosleep(arg0 as i32, arg1 as i32, arg2, arg3) as u64,
+        SYS_TIMERFD_CREATE => sys_timerfd_create(arg0 as i32, arg1 as i32) as u64,
+        SYS_TIMERFD_SETTIME => sys_timerfd_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64,
+        SYS_TIMERFD_GETTIME => sys_timerfd_gettime(arg0 as i32, arg1) as u64,
 
         // Process lifecycle
         SYS_EXIT | SYS_EXIT_GROUP => sys_exit(arg0 as i32),

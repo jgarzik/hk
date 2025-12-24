@@ -282,6 +282,9 @@ pub const SYS_CLOCK_SETTIME: u64 = 227;
 pub const SYS_CLOCK_GETTIME: u64 = 228;
 pub const SYS_CLOCK_GETRES: u64 = 229;
 pub const SYS_CLOCK_NANOSLEEP: u64 = 230;
+pub const SYS_TIMERFD_CREATE: u64 = 283;
+pub const SYS_TIMERFD_SETTIME: u64 = 286;
+pub const SYS_TIMERFD_GETTIME: u64 = 287;
 pub const SYS_GETTIMEOFDAY: u64 = 96;
 pub const SYS_SETTIMEOFDAY: u64 = 164;
 pub const SYS_TGKILL: u64 = 234;
@@ -738,6 +741,25 @@ pub fn sys_gettimeofday(tv: *mut Timeval, tz: *mut u8) -> i64 {
 #[inline(always)]
 pub fn sys_settimeofday(tv: *const Timeval, tz: *const u8) -> i64 {
     unsafe { syscall2!(SYS_SETTIMEOFDAY, tv, tz) }
+}
+
+// --- Timerfd ---
+
+use super::ITimerSpec;
+
+#[inline(always)]
+pub fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
+    unsafe { syscall2!(SYS_TIMERFD_CREATE, clockid, flags) }
+}
+
+#[inline(always)]
+pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: *const ITimerSpec, old_value: *mut ITimerSpec) -> i64 {
+    unsafe { syscall4!(SYS_TIMERFD_SETTIME, fd, flags, new_value, old_value) }
+}
+
+#[inline(always)]
+pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
+    unsafe { syscall2!(SYS_TIMERFD_GETTIME, fd, curr_value) }
 }
 
 // --- Signals ---

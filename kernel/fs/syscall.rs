@@ -595,6 +595,7 @@ pub fn sys_read(fd: i32, buf_ptr: u64, count: u64) -> i64 {
             Ok(n) => n,
             Err(FsError::IsADirectory) => return EISDIR,
             Err(FsError::PermissionDenied) => return EBADF,
+            Err(FsError::WouldBlock) => return EAGAIN,
             Err(_) => return EINVAL,
         };
 
@@ -613,6 +614,7 @@ pub fn sys_read(fd: i32, buf_ptr: u64, count: u64) -> i64 {
             Ok(n) => n,
             Err(FsError::IsADirectory) => return EISDIR,
             Err(FsError::PermissionDenied) => return EBADF,
+            Err(FsError::WouldBlock) => return EAGAIN,
             Err(_) => return EINVAL,
         };
 
