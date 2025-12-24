@@ -298,6 +298,69 @@ unsafe { context_switch(curr, next, next_kstack); }
 // Lock automatically released when guard drops after context switch returns
 ```
 
+### 3.1.1 Task Struct and Credentials
+
+**Location:** `kernel/task/mod.rs`, `kernel/task/percpu.rs`
+
+The kernel uses a single global `TASK_TABLE: Mutex<GlobalTaskTable>` protecting
+all task structs. This is simpler than Linux's per-task locks (`alloc_lock`,
+`pi_lock`, `sighand->siglock`) but sufficient for hk's current design.
+
+#### Data Structures
+
+| Variable | Type | Purpose |
+|----------|------|---------|
+| `TASK_TABLE` | `Mutex<GlobalTaskTable>` | All tasks in system |
+| Per-CPU `CurrentTask` | Copy struct in PerCpu | Cached task info (no lock) |
+| `Task.cred` | `Arc<Cred>` | Reference-counted credentials |
+
+#### Locking Rules
+
+1. **TASK_TABLE is NOT IRQ-safe** - Never acquire from interrupt handlers
+2. **IrqSpinlock → TASK_TABLE is safe** - IRQs disabled prevents ISR from running
+3. **wake_sleepers() caches priority** - `SleepEntry.priority` avoids TASK_TABLE in ISR
+
+#### Credential Handling (Linux Pattern)
+
+Following Linux's `kernel/cred.c` pattern (see `include/linux/cred.h`):
+
+1. **Reference-counted** - `Task.cred: Arc<Cred>` provides reference counting
+2. **Copy-on-write** - Credential modifications use prepare/commit pattern
+3. **Dual storage** - `Task.cred` in TASK_TABLE for persistence,
+   `CurrentTask.cred` copied into per-CPU struct for fast syscall access
+
+**Credential APIs (like Linux):**
+- `prepare_creds()` - Clone current credentials, return mutable copy
+- `commit_creds(new)` - Update Task.cred in TASK_TABLE AND CurrentTask.cred
+- `copy_creds(flags, parent)` - For fork/clone: share Arc (CLONE_THREAD) or deep copy
+
+**Credential Flow:**
+1. Syscall calls `prepare_creds()` to get mutable copy of current credentials
+2. Syscall modifies the credentials (e.g., `new.euid = target_uid`)
+3. Syscall calls `commit_creds(Arc::new(modified))` to persist changes
+4. `commit_creds()` updates both per-CPU cache (immediate visibility) and
+   TASK_TABLE (persistence across context switch)
+5. On context switch, scheduler loads `Task.cred` from TASK_TABLE into
+   the new task's per-CPU `CurrentTask.cred`
+
+**Why dual storage?**
+- Per-CPU `CurrentTask.cred` provides fast syscall access (no lock needed)
+- `Task.cred` in TASK_TABLE ensures credentials persist across context switches
+- Without TASK_TABLE persistence, credentials would be lost when switching away
+
+#### Deferred State Updates
+
+`wake_sleepers()` does not update `Task.state: Sleeping → Ready` because:
+- Run queue membership is the source of truth for runnability
+- Updating would require TASK_TABLE lock (unsafe in ISR)
+- `TaskState` is only checked for zombie detection in `waitpid()`
+
+#### Future Consideration
+
+When ptrace is implemented, hk may need per-task locks like Linux's `alloc_lock`
+to serialize remote credential/mm access. The current global `TASK_TABLE` lock
+is sufficient while all task modifications are by the current task itself.
+
 ### 3.2 Memory Management
 
 #### Frame Allocator

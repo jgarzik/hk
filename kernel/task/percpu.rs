@@ -389,6 +389,7 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         ppid: 0,
         pgid: pid,
         sid: pid,
+        cred: alloc::sync::Arc::new(Cred::ROOT), // Kernel threads run as root
         kind: TaskKind::KernelThread,
         state: TaskState::Ready,
         priority: PRIORITY_IDLE,
@@ -483,6 +484,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         ppid: config.ppid,
         pgid: config.pgid,
         sid: config.sid,
+        cred: alloc::sync::Arc::new(Cred::ROOT), // Initial user process starts as root
         kind: TaskKind::UserProcess,
         state: TaskState::Running, // Will be running immediately
         priority: config.priority,
@@ -763,6 +765,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_reset_on_fork,
         parent_cpus_allowed,
         parent_pt_phys,
+        parent_cred,
     ) = {
         let table = TASK_TABLE.lock();
         let parent = try_with_cleanup!(table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)); // ESRCH - no such process
@@ -777,6 +780,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.reset_on_fork,
             parent.cpus_allowed,
             parent.page_table.root_table_phys(),
+            parent.cred.clone(),
         )
     };
 
@@ -891,6 +895,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         ppid: child_ppid,
         pgid: parent_pgid,
         sid: parent_sid,
+        cred: crate::task::copy_creds(config.flags, &parent_cred),
         kind: TaskKind::UserProcess,
         state: TaskState::Ready,
         priority: child_priority,
@@ -1146,8 +1151,8 @@ pub fn exit_current() -> ! {
         .dequeue_highest()
         .expect("Idle task should always be runnable");
 
-    // Get next task's kernel stack, pid, ppid, pgid, sid from global table
-    let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3) = {
+    // Get next task's kernel stack, pid, ppid, pgid, sid, cred from global table
+    let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3, next_cred) = {
         let table = TASK_TABLE.lock();
         table
             .tasks
@@ -1161,9 +1166,10 @@ pub fn exit_current() -> ! {
                     t.pgid,
                     t.sid,
                     t.page_table.root_table_phys(),
+                    t.cred.clone(),
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, 0))
+            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT)))
     };
 
     // Get next task's context
@@ -1189,7 +1195,7 @@ pub fn exit_current() -> ! {
         ppid: next_ppid,
         pgid: next_pgid,
         sid: next_sid,
-        cred: Cred::ROOT,
+        cred: *next_cred,
     });
 
     // Release lock before switch (context_switch_first doesn't return)
@@ -1379,8 +1385,8 @@ pub fn sleep_current_until(wake_tick: u64) {
         return;
     }
 
-    // Get next task's kernel stack, pid, ppid, pgid, sid from global table
-    let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3) = {
+    // Get next task's kernel stack, pid, ppid, pgid, sid, cred from global table
+    let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3, next_cred) = {
         let table = TASK_TABLE.lock();
         table
             .tasks
@@ -1394,9 +1400,10 @@ pub fn sleep_current_until(wake_tick: u64) {
                     t.pgid,
                     t.sid,
                     t.page_table.root_table_phys(),
+                    t.cred.clone(),
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, 0))
+            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT)))
     };
 
     // Get context pointers
@@ -1415,7 +1422,7 @@ pub fn sleep_current_until(wake_tick: u64) {
             ppid: next_ppid,
             pgid: next_pgid,
             sid: next_sid,
-            cred: Cred::ROOT,
+            cred: *next_cred,
         });
 
         // Context switch with lock held!
@@ -1517,8 +1524,8 @@ pub fn yield_now() {
         return;
     }
 
-    // Get next task's kernel stack, pid, ppid, pgid, sid from global table
-    let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3) = {
+    // Get next task's kernel stack, pid, ppid, pgid, sid, cred from global table
+    let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3, next_cred) = {
         let table = TASK_TABLE.lock();
         table
             .tasks
@@ -1532,9 +1539,10 @@ pub fn yield_now() {
                     t.pgid,
                     t.sid,
                     t.page_table.root_table_phys(),
+                    t.cred.clone(),
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, 0))
+            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT)))
     };
 
     // Get context pointers
@@ -1553,7 +1561,7 @@ pub fn yield_now() {
             ppid: next_ppid,
             pgid: next_pgid,
             sid: next_sid,
-            cred: Cred::ROOT,
+            cred: *next_cred,
         });
 
         // Context switch with lock held!
@@ -1924,29 +1932,57 @@ pub fn update_current_pgid_sid(pgid: Pid, sid: Pid) {
     CurrentArch::set_current_task(&task);
 }
 
+/// Implementation of commit_creds - updates both per-CPU cache and TASK_TABLE
+///
+/// Like Linux's commit_creds() - atomically updates both storage locations
+/// so context switch will restore the correct credentials.
+pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
+    let tid = CurrentArch::current_tid();
+    if tid == 0 {
+        return; // No current task
+    }
+
+    // Update per-CPU cache first (so current task sees new creds immediately)
+    let mut current = CurrentArch::get_current_task();
+    current.cred = *new;
+    CurrentArch::set_current_task(&current);
+
+    // Update TASK_TABLE (persistent storage for context switch)
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.cred = new;
+    }
+}
+
 /// Update current task's UID (all fields: uid, suid, euid, fsuid)
 ///
 /// Called by sys_setuid when privileged (euid==0) changes UID.
 /// Sets real, saved, effective, and filesystem UID - permanently drops root.
 /// This matches Linux setuid() semantics for privileged callers.
+///
+/// Uses Linux prepare_creds/commit_creds pattern to ensure credentials
+/// are persisted to TASK_TABLE for context switch.
 pub fn set_current_uid_all(uid: crate::task::Uid) {
-    let mut task = CurrentArch::get_current_task();
-    task.cred.uid = uid;
-    task.cred.suid = uid;
-    task.cred.euid = uid;
-    task.cred.fsuid = uid;
-    CurrentArch::set_current_task(&task);
+    let mut new_cred = crate::task::prepare_creds();
+    new_cred.uid = uid;
+    new_cred.suid = uid;
+    new_cred.euid = uid;
+    new_cred.fsuid = uid;
+    crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
 }
 
 /// Update current task's effective UID only (euid and fsuid)
 ///
 /// Called by sys_setuid for non-root privilege drop.
 /// Sets effective and filesystem UID, leaving real UID unchanged.
+///
+/// Uses Linux prepare_creds/commit_creds pattern to ensure credentials
+/// are persisted to TASK_TABLE for context switch.
 pub fn set_current_euid(euid: crate::task::Uid) {
-    let mut task = CurrentArch::get_current_task();
-    task.cred.euid = euid;
-    task.cred.fsuid = euid; // fsuid follows euid
-    CurrentArch::set_current_task(&task);
+    let mut new_cred = crate::task::prepare_creds();
+    new_cred.euid = euid;
+    new_cred.fsuid = euid; // fsuid follows euid
+    crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
 }
 
 /// Update current task's GID (all fields: gid, sgid, egid, fsgid)
@@ -1954,24 +1990,30 @@ pub fn set_current_euid(euid: crate::task::Uid) {
 /// Called by sys_setgid when privileged (euid==0) changes GID.
 /// Sets real, saved, effective, and filesystem GID.
 /// This matches Linux setgid() semantics for privileged callers.
+///
+/// Uses Linux prepare_creds/commit_creds pattern to ensure credentials
+/// are persisted to TASK_TABLE for context switch.
 pub fn set_current_gid_all(gid: crate::task::Gid) {
-    let mut task = CurrentArch::get_current_task();
-    task.cred.gid = gid;
-    task.cred.sgid = gid;
-    task.cred.egid = gid;
-    task.cred.fsgid = gid;
-    CurrentArch::set_current_task(&task);
+    let mut new_cred = crate::task::prepare_creds();
+    new_cred.gid = gid;
+    new_cred.sgid = gid;
+    new_cred.egid = gid;
+    new_cred.fsgid = gid;
+    crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
 }
 
 /// Update current task's effective GID only (egid and fsgid)
 ///
 /// Called by sys_setgid for non-root privilege drop.
 /// Sets effective and filesystem GID, leaving real GID unchanged.
+///
+/// Uses Linux prepare_creds/commit_creds pattern to ensure credentials
+/// are persisted to TASK_TABLE for context switch.
 pub fn set_current_egid(egid: crate::task::Gid) {
-    let mut task = CurrentArch::get_current_task();
-    task.cred.egid = egid;
-    task.cred.fsgid = egid; // fsgid follows egid
-    CurrentArch::set_current_task(&task);
+    let mut new_cred = crate::task::prepare_creds();
+    new_cred.egid = egid;
+    new_cred.fsgid = egid; // fsgid follows egid
+    crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
 }
 
 /// Get current task's saved UID (suid)
@@ -1988,46 +2030,52 @@ pub fn get_current_sgid() -> crate::task::Gid {
 ///
 /// Called by sys_setresuid. Each field is only updated if Some.
 /// When euid changes, fsuid follows (Linux semantics).
+///
+/// Uses Linux prepare_creds/commit_creds pattern to ensure credentials
+/// are persisted to TASK_TABLE for context switch.
 pub fn set_current_resuid(
     ruid: Option<crate::task::Uid>,
     euid: Option<crate::task::Uid>,
     suid: Option<crate::task::Uid>,
 ) {
-    let mut task = CurrentArch::get_current_task();
+    let mut new_cred = crate::task::prepare_creds();
     if let Some(uid) = ruid {
-        task.cred.uid = uid;
+        new_cred.uid = uid;
     }
     if let Some(uid) = euid {
-        task.cred.euid = uid;
-        task.cred.fsuid = uid; // fsuid follows euid
+        new_cred.euid = uid;
+        new_cred.fsuid = uid; // fsuid follows euid
     }
     if let Some(uid) = suid {
-        task.cred.suid = uid;
+        new_cred.suid = uid;
     }
-    CurrentArch::set_current_task(&task);
+    crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
 }
 
 /// Update current task's real, effective, and saved GIDs selectively
 ///
 /// Called by sys_setresgid. Each field is only updated if Some.
 /// When egid changes, fsgid follows (Linux semantics).
+///
+/// Uses Linux prepare_creds/commit_creds pattern to ensure credentials
+/// are persisted to TASK_TABLE for context switch.
 pub fn set_current_resgid(
     rgid: Option<crate::task::Gid>,
     egid: Option<crate::task::Gid>,
     sgid: Option<crate::task::Gid>,
 ) {
-    let mut task = CurrentArch::get_current_task();
+    let mut new_cred = crate::task::prepare_creds();
     if let Some(gid) = rgid {
-        task.cred.gid = gid;
+        new_cred.gid = gid;
     }
     if let Some(gid) = egid {
-        task.cred.egid = gid;
-        task.cred.fsgid = gid; // fsgid follows egid
+        new_cred.egid = gid;
+        new_cred.fsgid = gid; // fsgid follows egid
     }
     if let Some(gid) = sgid {
-        task.cred.sgid = gid;
+        new_cred.sgid = gid;
     }
-    CurrentArch::set_current_task(&task);
+    crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
 }
 
 /// Get current task's filesystem UID (fsuid)
@@ -2045,23 +2093,26 @@ pub fn get_current_fsgid() -> crate::task::Gid {
 /// Called by sys_setreuid. Each field is only updated if Some.
 /// Also updates suid if new_suid is Some.
 /// fsuid always follows euid (set to new euid value).
+///
+/// Uses Linux prepare_creds/commit_creds pattern to ensure credentials
+/// are persisted to TASK_TABLE for context switch.
 pub fn set_current_reuid(
     ruid: Option<crate::task::Uid>,
     euid: Option<crate::task::Uid>,
     new_suid: Option<crate::task::Uid>,
 ) {
-    let mut task = CurrentArch::get_current_task();
+    let mut new_cred = crate::task::prepare_creds();
     if let Some(uid) = ruid {
-        task.cred.uid = uid;
+        new_cred.uid = uid;
     }
     if let Some(uid) = euid {
-        task.cred.euid = uid;
-        task.cred.fsuid = uid; // fsuid always follows euid
+        new_cred.euid = uid;
+        new_cred.fsuid = uid; // fsuid always follows euid
     }
     if let Some(uid) = new_suid {
-        task.cred.suid = uid;
+        new_cred.suid = uid;
     }
-    CurrentArch::set_current_task(&task);
+    crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
 }
 
 /// Update current task's real and effective GIDs (setregid semantics)
@@ -2069,41 +2120,50 @@ pub fn set_current_reuid(
 /// Called by sys_setregid. Each field is only updated if Some.
 /// Also updates sgid if new_sgid is Some.
 /// fsgid always follows egid (set to new egid value).
+///
+/// Uses Linux prepare_creds/commit_creds pattern to ensure credentials
+/// are persisted to TASK_TABLE for context switch.
 pub fn set_current_regid(
     rgid: Option<crate::task::Gid>,
     egid: Option<crate::task::Gid>,
     new_sgid: Option<crate::task::Gid>,
 ) {
-    let mut task = CurrentArch::get_current_task();
+    let mut new_cred = crate::task::prepare_creds();
     if let Some(gid) = rgid {
-        task.cred.gid = gid;
+        new_cred.gid = gid;
     }
     if let Some(gid) = egid {
-        task.cred.egid = gid;
-        task.cred.fsgid = gid; // fsgid always follows egid
+        new_cred.egid = gid;
+        new_cred.fsgid = gid; // fsgid always follows egid
     }
     if let Some(gid) = new_sgid {
-        task.cred.sgid = gid;
+        new_cred.sgid = gid;
     }
-    CurrentArch::set_current_task(&task);
+    crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
 }
 
 /// Set current task's filesystem UID directly
 ///
 /// Called by sys_setfsuid. Does NOT auto-update when euid changes elsewhere.
+///
+/// Uses Linux prepare_creds/commit_creds pattern to ensure credentials
+/// are persisted to TASK_TABLE for context switch.
 pub fn set_current_fsuid(fsuid: crate::task::Uid) {
-    let mut task = CurrentArch::get_current_task();
-    task.cred.fsuid = fsuid;
-    CurrentArch::set_current_task(&task);
+    let mut new_cred = crate::task::prepare_creds();
+    new_cred.fsuid = fsuid;
+    crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
 }
 
 /// Set current task's filesystem GID directly
 ///
 /// Called by sys_setfsgid. Does NOT auto-update when egid changes elsewhere.
+///
+/// Uses Linux prepare_creds/commit_creds pattern to ensure credentials
+/// are persisted to TASK_TABLE for context switch.
 pub fn set_current_fsgid(fsgid: crate::task::Gid) {
-    let mut task = CurrentArch::get_current_task();
-    task.cred.fsgid = fsgid;
-    CurrentArch::set_current_task(&task);
+    let mut new_cred = crate::task::prepare_creds();
+    new_cred.fsgid = fsgid;
+    crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
 }
 
 /// Replace current task's address space and jump to new entry point
@@ -2229,8 +2289,8 @@ pub fn try_schedule() {
             return; // Same task
         }
 
-        // Get next task's stack, pid, ppid, pgid, sid, cr3
-        let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3) = {
+        // Get next task's stack, pid, ppid, pgid, sid, cr3, cred
+        let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3, next_cred) = {
             let table = TASK_TABLE.lock();
             table
                 .tasks
@@ -2244,9 +2304,10 @@ pub fn try_schedule() {
                         t.pgid,
                         t.sid,
                         t.page_table.root_table_phys(),
+                        t.cred.clone(),
                     )
                 })
-                .unwrap_or((0, 0, 0, 0, 0, 0))
+                .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT)))
         };
 
         // Get contexts
@@ -2258,12 +2319,7 @@ pub fn try_schedule() {
 
             CurrentArch::set_current_tid(next_tid);
             let task_info = CurrentTask::from_parts(
-                next_tid,
-                next_pid,
-                next_ppid,
-                next_pgid,
-                next_sid,
-                Cred::ROOT,
+                next_tid, next_pid, next_ppid, next_pgid, next_sid, *next_cred,
             );
             CurrentArch::set_current_task(&task_info);
 
@@ -2278,7 +2334,7 @@ pub fn try_schedule() {
             .dequeue_highest()
             .expect("Idle task should always be runnable");
 
-        let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3) = {
+        let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3, next_cred) = {
             let table = TASK_TABLE.lock();
             table
                 .tasks
@@ -2292,9 +2348,10 @@ pub fn try_schedule() {
                         t.pgid,
                         t.sid,
                         t.page_table.root_table_phys(),
+                        t.cred.clone(),
                     )
                 })
-                .unwrap_or((0, 0, 0, 0, 0, 0))
+                .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT)))
         };
 
         let next_ctx = match rq.get_context(next_tid) {
@@ -2306,12 +2363,7 @@ pub fn try_schedule() {
 
         CurrentArch::set_current_tid(next_tid);
         let task_info = CurrentTask::from_parts(
-            next_tid,
-            next_pid,
-            next_ppid,
-            next_pgid,
-            next_sid,
-            Cred::ROOT,
+            next_tid, next_pid, next_ppid, next_pgid, next_sid, *next_cred,
         );
         CurrentArch::set_current_task(&task_info);
 

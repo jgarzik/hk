@@ -169,6 +169,79 @@ impl Default for Cred {
     }
 }
 
+// =============================================================================
+// Credential APIs (Linux kernel/cred.c pattern)
+// =============================================================================
+
+/// Get the current task's credentials from per-CPU cache
+///
+/// Like Linux's `current_cred()` - fast path for syscalls.
+/// Returns a copy since CurrentTask.cred is a Copy type.
+pub fn current_cred() -> Cred {
+    percpu::current_cred()
+}
+
+/// Get the current task's credentials from TASK_TABLE (authoritative source)
+///
+/// This fetches the Arc<Cred> from the actual Task struct.
+/// Used when the per-CPU cache might be stale or for reference counting.
+pub fn current_cred_arc() -> Arc<Cred> {
+    let tid = percpu::current_tid();
+    let table = percpu::TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .map(|t| t.cred.clone())
+        .unwrap_or_else(|| Arc::new(Cred::ROOT))
+}
+
+/// Prepare a new credential set by cloning current credentials
+///
+/// Like Linux's `prepare_creds()` - creates a mutable copy that can be
+/// modified before committing. Returns owned Cred (not Arc) for modification.
+///
+/// Usage pattern (like Linux):
+/// ```ignore
+/// let mut new_cred = prepare_creds();
+/// new_cred.uid = new_uid;
+/// new_cred.euid = new_uid;
+/// commit_creds(Arc::new(new_cred));
+/// ```
+pub fn prepare_creds() -> Cred {
+    current_cred()
+}
+
+/// Commit new credentials to current task
+///
+/// Like Linux's `commit_creds()` - atomically updates both:
+/// 1. Task.cred in TASK_TABLE (persistent storage)
+/// 2. CurrentTask.cred in per-CPU cache (fast access)
+///
+/// The new credentials take effect immediately.
+pub fn commit_creds(new: Arc<Cred>) {
+    percpu::commit_creds_impl(new);
+}
+
+/// Copy credentials for fork/clone
+///
+/// Like Linux's `copy_creds()` - handles credential inheritance during clone:
+/// - CLONE_THREAD: Share credentials (clone Arc reference)
+/// - Otherwise (fork): Deep copy credentials (new Arc with copied data)
+///
+/// This follows Linux's pattern from kernel/cred.c:copy_creds().
+pub fn copy_creds(clone_flags: u64, parent_cred: &Arc<Cred>) -> Arc<Cred> {
+    use clone_flags::CLONE_THREAD;
+
+    if clone_flags & CLONE_THREAD != 0 {
+        // Threads share credentials - just clone the Arc (bump refcount)
+        parent_cred.clone()
+    } else {
+        // Fork: deep copy credentials (child gets independent copy)
+        Arc::new(**parent_cred)
+    }
+}
+
 /// Per-CPU current task state (arch-neutral)
 ///
 /// This struct holds per-task state that needs to be quickly accessible
@@ -603,6 +676,14 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub pgid: Pid,
     /// Session ID
     pub sid: Pid,
+
+    // =========================================================================
+    // Credentials (like Linux task_struct->cred)
+    // =========================================================================
+    /// Task credentials - reference-counted, immutable after commit
+    /// Following Linux pattern: prepare_creds() -> modify -> commit_creds()
+    pub cred: Arc<Cred>,
+
     /// Kind of task
     pub kind: TaskKind,
     /// Current state
