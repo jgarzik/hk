@@ -8,6 +8,7 @@ use ::core::sync::atomic::Ordering;
 use super::X86_64TrapFrame;
 use super::cpu::KERNEL_CODE_SELECTOR;
 use super::lapic;
+use super::paging::phys_to_virt;
 use super::pic;
 
 /// LAPIC timer interrupt vector
@@ -571,8 +572,8 @@ fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
         // Copy page contents (4KB)
         unsafe {
             core::ptr::copy_nonoverlapping(
-                old_phys as *const u8,
-                new_phys as *mut u8,
+                phys_to_virt(old_phys) as *const u8,
+                phys_to_virt(new_phys),
                 PAGE_SIZE as usize,
             );
         }

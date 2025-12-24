@@ -13,8 +13,8 @@ use core::arch::asm;
 use spin::Mutex;
 
 use super::paging::{
-    AF, AP_EL1_RW, ATTR_IDX_DEVICE, PAGE_SIZE, PXN, PageTableEntry, RawPageTable, SH_INNER, UXN,
-    flush_tlb,
+    AF, AP_EL1_RW, ATTR_IDX_DEVICE, PAGE_SIZE, PXN, PageTableEntry, SH_INNER, UXN, flush_tlb,
+    phys_to_virt, phys_to_virt_table, phys_to_virt_table_const,
 };
 
 /// ioremap region base (3GB - outside identity-mapped 0-2GB)
@@ -286,7 +286,7 @@ fn map_device_page(l0_phys: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
     let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
 
     unsafe {
-        let l0 = l0_phys as *mut RawPageTable;
+        let l0 = phys_to_virt_table(l0_phys);
 
         // Get or create L1 table
         let l0_entry = (*l0).entry_mut(l0_idx);
@@ -294,7 +294,7 @@ fn map_device_page(l0_phys: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
             let l1_phys = alloc_page_table()?;
             l0_entry.set_table(l1_phys);
         }
-        let l1 = (l0_entry.addr()) as *mut RawPageTable;
+        let l1 = phys_to_virt_table(l0_entry.addr());
 
         // Get or create L2 table
         let l1_entry = (*l1).entry_mut(l1_idx);
@@ -305,7 +305,7 @@ fn map_device_page(l0_phys: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
             // 1GB block - would need to split, for now return error
             return Err(IoremapError::FrameAllocationFailed);
         }
-        let l2 = (l1_entry.addr()) as *mut RawPageTable;
+        let l2 = phys_to_virt_table(l1_entry.addr());
 
         // Get or create L3 table
         let l2_entry = (*l2).entry_mut(l2_idx);
@@ -316,7 +316,7 @@ fn map_device_page(l0_phys: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
             // 2MB block - would need to split
             return Err(IoremapError::FrameAllocationFailed);
         }
-        let l3 = (l2_entry.addr()) as *mut RawPageTable;
+        let l3 = phys_to_virt_table(l2_entry.addr());
 
         // Set L3 page entry with device attributes
         let l3_entry = (*l3).entry_mut(l3_idx);
@@ -340,25 +340,25 @@ fn unmap_page(l0_phys: u64, va: u64) {
     let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
 
     unsafe {
-        let l0 = l0_phys as *const RawPageTable;
+        let l0 = phys_to_virt_table_const(l0_phys);
 
         let l0_entry = (*l0).entry(l0_idx);
         if !l0_entry.is_valid() || !l0_entry.is_table() {
             return;
         }
-        let l1 = l0_entry.addr() as *const RawPageTable;
+        let l1 = phys_to_virt_table_const(l0_entry.addr());
 
         let l1_entry = (*l1).entry(l1_idx);
         if !l1_entry.is_valid() || !l1_entry.is_table() {
             return;
         }
-        let l2 = l1_entry.addr() as *const RawPageTable;
+        let l2 = phys_to_virt_table_const(l1_entry.addr());
 
         let l2_entry = (*l2).entry(l2_idx);
         if !l2_entry.is_valid() || !l2_entry.is_table() {
             return;
         }
-        let l3 = l2_entry.addr() as *mut RawPageTable;
+        let l3 = phys_to_virt_table(l2_entry.addr());
 
         // Clear the L3 entry
         let l3_entry = (*l3).entry_mut(l3_idx);
@@ -384,7 +384,7 @@ fn alloc_page_table() -> Result<u64, IoremapError> {
 
     // Zero the frame
     unsafe {
-        core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+        core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize);
     }
 
     Ok(frame)

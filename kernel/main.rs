@@ -65,6 +65,7 @@ use crate::arch::ArchBusOps;
 use crate::arch::{
     AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps,
     MemoryLayoutOps, PerCpuOps, PowerOps, SmpOps, TimekeeperOps, TimerCallbackOps, VfsInitOps,
+    phys_to_virt,
 };
 use crate::arch::{SchedArch, SyscallOps, UserModeOps};
 
@@ -434,9 +435,9 @@ where
 
         // Look up the physical address for this virtual address
         if let Some(phys) = page_table.translate(target_vaddr) {
-            // Write the relocated value to physical memory (identity mapped in kernel)
+            // Write the relocated value to physical memory
             unsafe {
-                let ptr = phys as *mut u64;
+                let ptr = phys_to_virt(phys) as *mut u64;
                 ::core::ptr::write_volatile(ptr, value);
             }
         }

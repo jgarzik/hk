@@ -23,6 +23,46 @@ const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// Number of entries per page table (512)
 const ENTRIES_PER_TABLE: usize = 512;
 
+// ============================================================================
+// Physical-to-Virtual Address Conversion
+// ============================================================================
+//
+// Phase 1: PAGE_OFFSET = 0 (identity mapping, no-op conversion)
+// Phase 2: PAGE_OFFSET = 0xFFFF_8880_0000_0000 (Linux-style direct map)
+
+/// Page offset for direct map
+///
+/// Physical address 0 maps to virtual address PAGE_OFFSET.
+/// Currently 0 for identity mapping; will be changed to
+/// 0xFFFF_8880_0000_0000 for high-address kernel.
+pub const PAGE_OFFSET: u64 = 0;
+
+/// Convert physical address to virtual address (direct map)
+#[inline]
+pub fn phys_to_virt(phys: u64) -> *mut u8 {
+    (phys + PAGE_OFFSET) as *mut u8
+}
+
+/// Convert virtual address to physical address (direct map only)
+///
+/// Only valid for addresses in the direct map region.
+#[inline]
+pub fn virt_to_phys_direct(virt: *const u8) -> u64 {
+    (virt as u64) - PAGE_OFFSET
+}
+
+/// Convert physical address to page table pointer
+#[inline]
+pub fn phys_to_virt_table(phys: u64) -> *mut RawPageTable {
+    phys_to_virt(phys) as *mut RawPageTable
+}
+
+/// Convert physical address to const page table pointer
+#[inline]
+pub fn phys_to_virt_table_const(phys: u64) -> *const RawPageTable {
+    phys_to_virt(phys) as *const RawPageTable
+}
+
 /// Page table entry
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -132,7 +172,7 @@ impl X86_64PageTable {
         let pml4_phys = frame_alloc.alloc_frame()?;
         // Zero the PML4
         unsafe {
-            core::ptr::write_bytes(pml4_phys as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(phys_to_virt(pml4_phys), 0, PAGE_SIZE as usize);
         }
         Some(Self::new(pml4_phys))
     }
@@ -167,7 +207,7 @@ impl X86_64PageTable {
         let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
 
         unsafe {
-            let pml4 = self.pml4_phys as *mut RawPageTable;
+            let pml4 = phys_to_virt_table(self.pml4_phys);
 
             // Get or create PDPT
             let pml4_entry = (*pml4).entry_mut(pml4_idx);
@@ -175,7 +215,7 @@ impl X86_64PageTable {
                 let pdpt_phys = frame_alloc
                     .alloc_frame()
                     .ok_or(MapError::FrameAllocationFailed)?;
-                core::ptr::write_bytes(pdpt_phys as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(phys_to_virt(pdpt_phys), 0, PAGE_SIZE as usize);
                 pml4_entry.set(pdpt_phys, intermediate_flags);
             } else {
                 // Entry exists - ensure USER flag is set for user-accessible mappings
@@ -187,7 +227,7 @@ impl X86_64PageTable {
                     }
                 }
             }
-            let pdpt = pml4_entry.addr() as *mut RawPageTable;
+            let pdpt = phys_to_virt_table(pml4_entry.addr());
 
             // Get or create PD
             let pdpt_entry = (*pdpt).entry_mut(pdpt_idx);
@@ -195,7 +235,7 @@ impl X86_64PageTable {
                 let pd_phys = frame_alloc
                     .alloc_frame()
                     .ok_or(MapError::FrameAllocationFailed)?;
-                core::ptr::write_bytes(pd_phys as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(phys_to_virt(pd_phys), 0, PAGE_SIZE as usize);
                 pdpt_entry.set(pd_phys, intermediate_flags);
             } else {
                 // Entry exists - ensure USER flag is set for user-accessible mappings
@@ -207,7 +247,7 @@ impl X86_64PageTable {
                     }
                 }
             }
-            let pd = pdpt_entry.addr() as *mut RawPageTable;
+            let pd = phys_to_virt_table(pdpt_entry.addr());
 
             // Get or create PT
             let pd_entry = (*pd).entry_mut(pd_idx);
@@ -215,7 +255,7 @@ impl X86_64PageTable {
                 let pt_phys = frame_alloc
                     .alloc_frame()
                     .ok_or(MapError::FrameAllocationFailed)?;
-                core::ptr::write_bytes(pt_phys as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(phys_to_virt(pt_phys), 0, PAGE_SIZE as usize);
                 pd_entry.set(pt_phys, intermediate_flags);
             } else if pd_entry.flags() & PAGE_HUGE == 0 {
                 // Entry exists and is not a huge page - ensure USER flag is set
@@ -230,7 +270,7 @@ impl X86_64PageTable {
                 // For now, return error - this case would need more complex handling
                 return Err(MapError::FrameAllocationFailed);
             }
-            let pt = pd_entry.addr() as *mut RawPageTable;
+            let pt = phys_to_virt_table(pd_entry.addr());
 
             // Set the final page table entry
             let pt_entry = (*pt).entry_mut(pt_idx);
@@ -249,8 +289,8 @@ impl X86_64PageTable {
     /// when the user page table is loaded.
     pub fn copy_kernel_mappings(&mut self) {
         unsafe {
-            let kernel_pml4 = Self::current_cr3() as *const RawPageTable;
-            let user_pml4 = self.pml4_phys as *mut RawPageTable;
+            let kernel_pml4 = phys_to_virt_table_const(Self::current_cr3());
+            let user_pml4 = phys_to_virt_table(self.pml4_phys);
 
             // Copy PML4[0] - this covers the identity-mapped kernel region (0-512GB)
             // The boot assembly maps the first 512MB using 2MB huge pages
@@ -302,13 +342,13 @@ impl X86_64PageTable {
         let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(vaddr);
 
         unsafe {
-            let pml4 = self.pml4_phys as *const RawPageTable;
+            let pml4 = phys_to_virt_table_const(self.pml4_phys);
             let pml4_entry = (*pml4).entry(pml4_idx);
             if !pml4_entry.is_present() {
                 return None;
             }
 
-            let pdpt = pml4_entry.addr() as *const RawPageTable;
+            let pdpt = phys_to_virt_table_const(pml4_entry.addr());
             let pdpt_entry = (*pdpt).entry(pdpt_idx);
             if !pdpt_entry.is_present() {
                 return None;
@@ -320,7 +360,7 @@ impl X86_64PageTable {
                 return Some(pdpt_entry.addr() + page_offset);
             }
 
-            let pd = pdpt_entry.addr() as *const RawPageTable;
+            let pd = phys_to_virt_table_const(pdpt_entry.addr());
             let pd_entry = (*pd).entry(pd_idx);
             if !pd_entry.is_present() {
                 return None;
@@ -332,7 +372,7 @@ impl X86_64PageTable {
                 return Some(pd_entry.addr() + page_offset);
             }
 
-            let pt = pd_entry.addr() as *const RawPageTable;
+            let pt = phys_to_virt_table_const(pd_entry.addr());
             let pt_entry = (*pt).entry(pt_idx);
             if !pt_entry.is_present() {
                 return None;
@@ -377,7 +417,7 @@ impl PageTable for X86_64PageTable {
         // In a real implementation, we'd allocate missing tables
 
         unsafe {
-            let pml4 = self.pml4_phys as *mut RawPageTable;
+            let pml4 = phys_to_virt_table(self.pml4_phys);
 
             // Get or create PDPT
             let pml4_entry = (*pml4).entry_mut(pml4_idx);
@@ -386,21 +426,21 @@ impl PageTable for X86_64PageTable {
                 // For now, panic
                 return;
             }
-            let pdpt = pml4_entry.addr() as *mut RawPageTable;
+            let pdpt = phys_to_virt_table(pml4_entry.addr());
 
             // Get or create PD
             let pdpt_entry = (*pdpt).entry_mut(pdpt_idx);
             if !pdpt_entry.is_present() {
                 return;
             }
-            let pd = pdpt_entry.addr() as *mut RawPageTable;
+            let pd = phys_to_virt_table(pdpt_entry.addr());
 
             // Get or create PT
             let pd_entry = (*pd).entry_mut(pd_idx);
             if !pd_entry.is_present() {
                 return;
             }
-            let pt = pd_entry.addr() as *mut RawPageTable;
+            let pt = phys_to_virt_table(pd_entry.addr());
 
             // Set the final page table entry
             let pt_entry = (*pt).entry_mut(pt_idx);
@@ -415,25 +455,25 @@ impl PageTable for X86_64PageTable {
         let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
 
         unsafe {
-            let pml4 = self.pml4_phys as *mut RawPageTable;
+            let pml4 = phys_to_virt_table(self.pml4_phys);
 
             let pml4_entry = (*pml4).entry(pml4_idx);
             if !pml4_entry.is_present() {
                 return;
             }
-            let pdpt = pml4_entry.addr() as *mut RawPageTable;
+            let pdpt = phys_to_virt_table(pml4_entry.addr());
 
             let pdpt_entry = (*pdpt).entry(pdpt_idx);
             if !pdpt_entry.is_present() {
                 return;
             }
-            let pd = pdpt_entry.addr() as *mut RawPageTable;
+            let pd = phys_to_virt_table(pdpt_entry.addr());
 
             let pd_entry = (*pd).entry(pd_idx);
             if !pd_entry.is_present() {
                 return;
             }
-            let pt = pd_entry.addr() as *mut RawPageTable;
+            let pt = phys_to_virt_table(pd_entry.addr());
 
             let pt_entry = (*pt).entry_mut(pt_idx);
             pt_entry.clear();
@@ -447,13 +487,13 @@ impl PageTable for X86_64PageTable {
         let offset = va & 0xFFF;
 
         unsafe {
-            let pml4 = self.pml4_phys as *const RawPageTable;
+            let pml4 = phys_to_virt_table_const(self.pml4_phys);
 
             let pml4_entry = (*pml4).entry(pml4_idx);
             if !pml4_entry.is_present() {
                 return None;
             }
-            let pdpt = pml4_entry.addr() as *const RawPageTable;
+            let pdpt = phys_to_virt_table_const(pml4_entry.addr());
 
             let pdpt_entry = (*pdpt).entry(pdpt_idx);
             if !pdpt_entry.is_present() {
@@ -464,7 +504,7 @@ impl PageTable for X86_64PageTable {
                 let base = pdpt_entry.addr();
                 return Some(base | (va & 0x3FFF_FFFF));
             }
-            let pd = pdpt_entry.addr() as *const RawPageTable;
+            let pd = phys_to_virt_table_const(pdpt_entry.addr());
 
             let pd_entry = (*pd).entry(pd_idx);
             if !pd_entry.is_present() {
@@ -475,7 +515,7 @@ impl PageTable for X86_64PageTable {
                 let base = pd_entry.addr();
                 return Some(base | (va & 0x1F_FFFF));
             }
-            let pt = pd_entry.addr() as *const RawPageTable;
+            let pt = phys_to_virt_table_const(pd_entry.addr());
 
             let pt_entry = (*pt).entry(pt_idx);
             if !pt_entry.is_present() {
@@ -524,7 +564,7 @@ impl PageTable for X86_64PageTable {
         frames.push(self.pml4_phys);
 
         unsafe {
-            let pml4 = self.pml4_phys as *const RawPageTable;
+            let pml4 = phys_to_virt_table_const(self.pml4_phys);
 
             // Walk PML4 entries (only user-space portion, indices 0-255)
             for pml4_idx in 0..256 {
@@ -535,7 +575,7 @@ impl PageTable for X86_64PageTable {
 
                 let pdpt_phys = pml4_entry.addr();
                 frames.push(pdpt_phys);
-                let pdpt = pdpt_phys as *const RawPageTable;
+                let pdpt = phys_to_virt_table_const(pdpt_phys);
 
                 // Walk PDPT entries
                 for pdpt_idx in 0..512 {
@@ -546,7 +586,7 @@ impl PageTable for X86_64PageTable {
 
                     let pd_phys = pdpt_entry.addr();
                     frames.push(pd_phys);
-                    let pd = pd_phys as *const RawPageTable;
+                    let pd = phys_to_virt_table_const(pd_phys);
 
                     // Walk PD entries
                     for pd_idx in 0..512 {
@@ -606,7 +646,7 @@ impl X86_64PageTable {
         // - For user addresses (>= USER_START): copy page contents to new frame
 
         unsafe {
-            let parent_pml4 = self.pml4_phys as *const RawPageTable;
+            let parent_pml4 = phys_to_virt_table_const(self.pml4_phys);
 
             // Walk all PML4 entries (0-511)
             for pml4_idx in 0..ENTRIES_PER_TABLE {
@@ -615,7 +655,7 @@ impl X86_64PageTable {
                     continue;
                 }
 
-                let pdpt = pml4_entry.addr() as *const RawPageTable;
+                let pdpt = phys_to_virt_table_const(pml4_entry.addr());
 
                 // Walk PDPT entries
                 for pdpt_idx in 0..ENTRIES_PER_TABLE {
@@ -637,7 +677,7 @@ impl X86_64PageTable {
                         continue;
                     }
 
-                    let pd = pdpt_entry.addr() as *const RawPageTable;
+                    let pd = phys_to_virt_table_const(pdpt_entry.addr());
 
                     // Walk PD entries
                     for pd_idx in 0..ENTRIES_PER_TABLE {
@@ -667,7 +707,7 @@ impl X86_64PageTable {
                             continue;
                         }
 
-                        let pt = pd_entry.addr() as *const RawPageTable;
+                        let pt = phys_to_virt_table_const(pd_entry.addr());
 
                         // Walk PT entries (4KB pages)
                         for pt_idx in 0..ENTRIES_PER_TABLE {
@@ -712,7 +752,7 @@ impl X86_64PageTable {
 
                                 // Update parent's PTE to be read-only with COW flag
                                 if old_flags & PAGE_WRITABLE != 0 {
-                                    let parent_pt = (*pd).entry(pd_idx).addr() as *mut RawPageTable;
+                                    let parent_pt = phys_to_virt_table((*pd).entry(pd_idx).addr());
                                     (*parent_pt).entry_mut(pt_idx).set(old_phys, cow_flags);
                                     // Flush TLB for the parent's mapping
                                     Self::flush_tlb(vaddr);
@@ -750,27 +790,27 @@ impl X86_64PageTable {
         frame_alloc: &mut FA,
     ) -> Result<(), i32> {
         unsafe {
-            let pml4 = self.pml4_phys as *mut RawPageTable;
+            let pml4 = phys_to_virt_table(self.pml4_phys);
 
             // Ensure PML4 entry exists
             if !(*pml4).entry(pml4_idx).is_present() {
                 let pdpt_frame = frame_alloc.alloc_frame().ok_or(-12i32)?;
-                core::ptr::write_bytes(pdpt_frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(phys_to_virt(pdpt_frame), 0, PAGE_SIZE as usize);
                 *(*pml4).entry_mut(pml4_idx) =
                     PageTableEntry(pdpt_frame | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
             }
 
-            let pdpt = (*pml4).entry(pml4_idx).addr() as *mut RawPageTable;
+            let pdpt = phys_to_virt_table((*pml4).entry(pml4_idx).addr());
 
             // Ensure PDPT entry exists
             if !(*pdpt).entry(pdpt_idx).is_present() {
                 let pd_frame = frame_alloc.alloc_frame().ok_or(-12i32)?;
-                core::ptr::write_bytes(pd_frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(phys_to_virt(pd_frame), 0, PAGE_SIZE as usize);
                 *(*pdpt).entry_mut(pdpt_idx) =
                     PageTableEntry(pd_frame | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
             }
 
-            let pd = (*pdpt).entry(pdpt_idx).addr() as *mut RawPageTable;
+            let pd = phys_to_virt_table((*pdpt).entry(pdpt_idx).addr());
 
             // Copy the 2MB huge page entry
             *(*pd).entry_mut(pd_idx) = entry;
@@ -790,37 +830,37 @@ impl X86_64PageTable {
         frame_alloc: &mut FA,
     ) -> Result<(), i32> {
         unsafe {
-            let pml4 = self.pml4_phys as *mut RawPageTable;
+            let pml4 = phys_to_virt_table(self.pml4_phys);
 
             // Ensure PML4 entry exists
             if !(*pml4).entry(pml4_idx).is_present() {
                 let pdpt_frame = frame_alloc.alloc_frame().ok_or(-12i32)?;
-                core::ptr::write_bytes(pdpt_frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(phys_to_virt(pdpt_frame), 0, PAGE_SIZE as usize);
                 *(*pml4).entry_mut(pml4_idx) =
                     PageTableEntry(pdpt_frame | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
             }
 
-            let pdpt = (*pml4).entry(pml4_idx).addr() as *mut RawPageTable;
+            let pdpt = phys_to_virt_table((*pml4).entry(pml4_idx).addr());
 
             // Ensure PDPT entry exists
             if !(*pdpt).entry(pdpt_idx).is_present() {
                 let pd_frame = frame_alloc.alloc_frame().ok_or(-12i32)?;
-                core::ptr::write_bytes(pd_frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(phys_to_virt(pd_frame), 0, PAGE_SIZE as usize);
                 *(*pdpt).entry_mut(pdpt_idx) =
                     PageTableEntry(pd_frame | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
             }
 
-            let pd = (*pdpt).entry(pdpt_idx).addr() as *mut RawPageTable;
+            let pd = phys_to_virt_table((*pdpt).entry(pdpt_idx).addr());
 
             // Ensure PD entry exists (non-huge)
             if !(*pd).entry(pd_idx).is_present() {
                 let pt_frame = frame_alloc.alloc_frame().ok_or(-12i32)?;
-                core::ptr::write_bytes(pt_frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(phys_to_virt(pt_frame), 0, PAGE_SIZE as usize);
                 *(*pd).entry_mut(pd_idx) =
                     PageTableEntry(pt_frame | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
             }
 
-            let pt = (*pd).entry(pd_idx).addr() as *mut RawPageTable;
+            let pt = phys_to_virt_table((*pd).entry(pd_idx).addr());
 
             // Copy the 4KB page entry
             *(*pt).entry_mut(pt_idx) = entry;
@@ -839,13 +879,13 @@ impl X86_64PageTable {
         let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
 
         unsafe {
-            let pml4 = pml4_phys as *mut RawPageTable;
+            let pml4 = phys_to_virt_table(pml4_phys);
 
             let pml4_entry = (*pml4).entry(pml4_idx);
             if !pml4_entry.is_present() {
                 return None;
             }
-            let pdpt = pml4_entry.addr() as *mut RawPageTable;
+            let pdpt = phys_to_virt_table(pml4_entry.addr());
 
             let pdpt_entry = (*pdpt).entry(pdpt_idx);
             if !pdpt_entry.is_present() {
@@ -855,7 +895,7 @@ impl X86_64PageTable {
             if pdpt_entry.is_huge() {
                 return None;
             }
-            let pd = pdpt_entry.addr() as *mut RawPageTable;
+            let pd = phys_to_virt_table(pdpt_entry.addr());
 
             let pd_entry = (*pd).entry(pd_idx);
             if !pd_entry.is_present() {
@@ -865,7 +905,7 @@ impl X86_64PageTable {
             if pd_entry.is_huge() {
                 return None;
             }
-            let pt = pd_entry.addr() as *mut RawPageTable;
+            let pt = phys_to_virt_table(pd_entry.addr());
 
             let pt_entry = (*pt).entry_mut(pt_idx);
             if !pt_entry.is_present() {
@@ -907,13 +947,13 @@ impl X86_64PageTable {
         let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
 
         unsafe {
-            let pml4 = pml4_phys as *mut RawPageTable;
+            let pml4 = phys_to_virt_table(pml4_phys);
 
             let pml4_entry = (*pml4).entry(pml4_idx);
             if !pml4_entry.is_present() {
                 return false;
             }
-            let pdpt = pml4_entry.addr() as *mut RawPageTable;
+            let pdpt = phys_to_virt_table(pml4_entry.addr());
 
             let pdpt_entry = (*pdpt).entry(pdpt_idx);
             if !pdpt_entry.is_present() {
@@ -923,7 +963,7 @@ impl X86_64PageTable {
             if pdpt_entry.is_huge() {
                 return false;
             }
-            let pd = pdpt_entry.addr() as *mut RawPageTable;
+            let pd = phys_to_virt_table(pdpt_entry.addr());
 
             let pd_entry = (*pd).entry(pd_idx);
             if !pd_entry.is_present() {
@@ -933,7 +973,7 @@ impl X86_64PageTable {
             if pd_entry.is_huge() {
                 return false;
             }
-            let pt = pd_entry.addr() as *mut RawPageTable;
+            let pt = phys_to_virt_table(pd_entry.addr());
 
             let pt_entry = (*pt).entry_mut(pt_idx);
             if !pt_entry.is_present() {
@@ -976,13 +1016,13 @@ impl X86_64PageTable {
         let offset = va & 0xFFF;
 
         unsafe {
-            let pml4 = pml4_phys as *const RawPageTable;
+            let pml4 = phys_to_virt_table_const(pml4_phys);
 
             let pml4_entry = (*pml4).entry(pml4_idx);
             if !pml4_entry.is_present() {
                 return None;
             }
-            let pdpt = pml4_entry.addr() as *const RawPageTable;
+            let pdpt = phys_to_virt_table_const(pml4_entry.addr());
 
             let pdpt_entry = (*pdpt).entry(pdpt_idx);
             if !pdpt_entry.is_present() {
@@ -992,7 +1032,7 @@ impl X86_64PageTable {
                 let base = pdpt_entry.addr();
                 return Some(base | (va & 0x3FFF_FFFF));
             }
-            let pd = pdpt_entry.addr() as *const RawPageTable;
+            let pd = phys_to_virt_table_const(pdpt_entry.addr());
 
             let pd_entry = (*pd).entry(pd_idx);
             if !pd_entry.is_present() {
@@ -1002,7 +1042,7 @@ impl X86_64PageTable {
                 let base = pd_entry.addr();
                 return Some(base | (va & 0x1F_FFFF));
             }
-            let pt = pd_entry.addr() as *const RawPageTable;
+            let pt = phys_to_virt_table_const(pd_entry.addr());
 
             let pt_entry = (*pt).entry(pt_idx);
             if !pt_entry.is_present() {
@@ -1023,13 +1063,13 @@ impl X86_64PageTable {
         let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
 
         unsafe {
-            let pml4 = pml4_phys as *const RawPageTable;
+            let pml4 = phys_to_virt_table_const(pml4_phys);
 
             let pml4_entry = (*pml4).entry(pml4_idx);
             if !pml4_entry.is_present() {
                 return None;
             }
-            let pdpt = pml4_entry.addr() as *const RawPageTable;
+            let pdpt = phys_to_virt_table_const(pml4_entry.addr());
 
             let pdpt_entry = (*pdpt).entry(pdpt_idx);
             if !pdpt_entry.is_present() {
@@ -1039,7 +1079,7 @@ impl X86_64PageTable {
             if pdpt_entry.is_huge() {
                 return None;
             }
-            let pd = pdpt_entry.addr() as *const RawPageTable;
+            let pd = phys_to_virt_table_const(pdpt_entry.addr());
 
             let pd_entry = (*pd).entry(pd_idx);
             if !pd_entry.is_present() {
@@ -1049,7 +1089,7 @@ impl X86_64PageTable {
             if pd_entry.is_huge() {
                 return None;
             }
-            let pt = pd_entry.addr() as *const RawPageTable;
+            let pt = phys_to_virt_table_const(pd_entry.addr());
 
             let pt_entry = (*pt).entry(pt_idx);
             if !pt_entry.is_present() {

@@ -29,6 +29,46 @@ const ENTRIES_PER_TABLE: usize = 512;
 const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 // ============================================================================
+// Physical-to-Virtual Address Conversion
+// ============================================================================
+//
+// Phase 1: PAGE_OFFSET = 0 (identity mapping, no-op conversion)
+// Phase 2: PAGE_OFFSET = 0xFFFF_8000_0000_0000 (high-address kernel)
+
+/// Page offset for direct map
+///
+/// Physical address 0 maps to virtual address PAGE_OFFSET.
+/// Currently 0 for identity mapping; will be changed to
+/// 0xFFFF_8000_0000_0000 for high-address kernel.
+pub const PAGE_OFFSET: u64 = 0;
+
+/// Convert physical address to virtual address (direct map)
+#[inline]
+pub fn phys_to_virt(phys: u64) -> *mut u8 {
+    (phys + PAGE_OFFSET) as *mut u8
+}
+
+/// Convert virtual address to physical address (direct map only)
+///
+/// Only valid for addresses in the direct map region.
+#[inline]
+pub fn virt_to_phys_direct(virt: *const u8) -> u64 {
+    (virt as u64) - PAGE_OFFSET
+}
+
+/// Convert physical address to page table pointer
+#[inline]
+pub fn phys_to_virt_table(phys: u64) -> *mut RawPageTable {
+    phys_to_virt(phys) as *mut RawPageTable
+}
+
+/// Convert physical address to const page table pointer
+#[inline]
+pub fn phys_to_virt_table_const(phys: u64) -> *const RawPageTable {
+    phys_to_virt(phys) as *const RawPageTable
+}
+
+// ============================================================================
 // Page Table Entry Descriptor Types
 // ============================================================================
 
@@ -494,7 +534,7 @@ impl Aarch64PageTable {
         let l0_phys = frame_alloc.alloc_frame()?;
         // Zero the L0 table
         unsafe {
-            core::ptr::write_bytes(l0_phys as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(phys_to_virt(l0_phys), 0, PAGE_SIZE as usize);
         }
         Some(Self::new(l0_phys))
     }
@@ -511,8 +551,8 @@ impl Aarch64PageTable {
         // We just make L0[0] point directly to kernel's L1 table for simplicity.
         // User mappings will create new L2/L3 tables as needed.
         unsafe {
-            let kernel_l0 = boot_page_table_phys() as *const u64;
-            let user_l0 = self.root_phys as *mut u64;
+            let kernel_l0 = phys_to_virt(boot_page_table_phys()) as *const u64;
+            let user_l0 = phys_to_virt(self.root_phys) as *mut u64;
 
             // Copy L0[0] - this makes us share kernel's L1 table
             // This is OK because user space uses different L1 entries than kernel
@@ -529,19 +569,19 @@ impl Aarch64PageTable {
         frame_alloc: &mut FA,
     ) -> Result<(), i32> {
         unsafe {
-            let kernel_l0 = boot_page_table_phys() as *const RawPageTable;
+            let kernel_l0 = phys_to_virt_table_const(boot_page_table_phys());
             let kernel_l0_entry = (*kernel_l0).entry(0);
 
             if !kernel_l0_entry.is_valid() || !kernel_l0_entry.is_table() {
                 return Err(-22); // EINVAL - kernel L0[0] must be valid table
             }
 
-            let kernel_l1 = kernel_l0_entry.addr() as *const RawPageTable;
+            let kernel_l1 = phys_to_virt_table_const(kernel_l0_entry.addr());
 
             // Allocate new L1 table for this page table
             let new_l1_phys = frame_alloc.alloc_frame().ok_or(-12i32)?;
-            core::ptr::write_bytes(new_l1_phys as *mut u8, 0, PAGE_SIZE as usize);
-            let new_l1 = new_l1_phys as *mut RawPageTable;
+            core::ptr::write_bytes(phys_to_virt(new_l1_phys), 0, PAGE_SIZE as usize);
+            let new_l1 = phys_to_virt_table(new_l1_phys);
 
             // Copy kernel's L1 entries (0 and 1 cover identity-mapped region)
             // L1[0] covers 0-1GB, L1[1] covers 1-2GB
@@ -552,7 +592,7 @@ impl Aarch64PageTable {
             }
 
             // Set our L0[0] to point to the new L1 table
-            let user_l0 = self.root_phys as *mut RawPageTable;
+            let user_l0 = phys_to_virt_table(self.root_phys);
             (*user_l0).entry_mut(0).set_table(new_l1_phys);
 
             Ok(())
@@ -589,7 +629,7 @@ impl Aarch64PageTable {
         let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
 
         unsafe {
-            let l0 = self.root_phys as *mut RawPageTable;
+            let l0 = phys_to_virt_table(self.root_phys);
 
             // Get or create L1 table
             let l0_entry = (*l0).entry_mut(l0_idx);
@@ -597,13 +637,13 @@ impl Aarch64PageTable {
                 let l1_phys = frame_alloc
                     .alloc_frame()
                     .ok_or(MapError::FrameAllocationFailed)?;
-                core::ptr::write_bytes(l1_phys as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(phys_to_virt(l1_phys), 0, PAGE_SIZE as usize);
                 l0_entry.set_table(l1_phys);
             } else if !l0_entry.is_table() {
                 // L0 entries must always be table descriptors
                 return Err(MapError::InvalidArgument);
             }
-            let l1 = l0_entry.addr() as *mut RawPageTable;
+            let l1 = phys_to_virt_table(l0_entry.addr());
 
             // Get or create L2 table
             let l1_entry = (*l1).entry_mut(l1_idx);
@@ -611,13 +651,13 @@ impl Aarch64PageTable {
                 let l2_phys = frame_alloc
                     .alloc_frame()
                     .ok_or(MapError::FrameAllocationFailed)?;
-                core::ptr::write_bytes(l2_phys as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(phys_to_virt(l2_phys), 0, PAGE_SIZE as usize);
                 l1_entry.set_table(l2_phys);
             } else if l1_entry.is_block() {
                 // Can't map 4KB page within a 1GB block
                 return Err(MapError::AlreadyMapped);
             }
-            let l2 = l1_entry.addr() as *mut RawPageTable;
+            let l2 = phys_to_virt_table(l1_entry.addr());
 
             // Get or create L3 table
             let l2_entry = (*l2).entry_mut(l2_idx);
@@ -625,13 +665,13 @@ impl Aarch64PageTable {
                 let l3_phys = frame_alloc
                     .alloc_frame()
                     .ok_or(MapError::FrameAllocationFailed)?;
-                core::ptr::write_bytes(l3_phys as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(phys_to_virt(l3_phys), 0, PAGE_SIZE as usize);
                 l2_entry.set_table(l3_phys);
             } else if l2_entry.is_block() {
                 // Can't map 4KB page within a 2MB block
                 return Err(MapError::AlreadyMapped);
             }
-            let l3 = l2_entry.addr() as *mut RawPageTable;
+            let l3 = phys_to_virt_table(l2_entry.addr());
 
             // Set the L3 page entry
             let l3_entry = (*l3).entry_mut(l3_idx);
@@ -660,13 +700,13 @@ impl Aarch64PageTable {
         let offset = va & 0xFFF;
 
         unsafe {
-            let l0 = self.root_phys as *const RawPageTable;
+            let l0 = phys_to_virt_table_const(self.root_phys);
 
             let l0_entry = (*l0).entry(l0_idx);
             if !l0_entry.is_valid() || !l0_entry.is_table() {
                 return None;
             }
-            let l1 = l0_entry.addr() as *const RawPageTable;
+            let l1 = phys_to_virt_table_const(l0_entry.addr());
 
             let l1_entry = (*l1).entry(l1_idx);
             if !l1_entry.is_valid() {
@@ -677,7 +717,7 @@ impl Aarch64PageTable {
                 let base = l1_entry.addr();
                 return Some(base | (va & 0x3FFF_FFFF));
             }
-            let l2 = l1_entry.addr() as *const RawPageTable;
+            let l2 = phys_to_virt_table_const(l1_entry.addr());
 
             let l2_entry = (*l2).entry(l2_idx);
             if !l2_entry.is_valid() {
@@ -688,7 +728,7 @@ impl Aarch64PageTable {
                 let base = l2_entry.addr();
                 return Some(base | (va & 0x1F_FFFF));
             }
-            let l3 = l2_entry.addr() as *const RawPageTable;
+            let l3 = phys_to_virt_table_const(l2_entry.addr());
 
             let l3_entry = (*l3).entry(l3_idx);
             if !l3_entry.is_valid() {
@@ -720,7 +760,7 @@ impl Aarch64PageTable {
         new_pt.copy_kernel_mappings_with_alloc(frame_alloc)?;
 
         unsafe {
-            let parent_l0 = self.root_phys as *const RawPageTable;
+            let parent_l0 = phys_to_virt_table_const(self.root_phys);
 
             // Walk all L0 entries (0-511)
             for l0_idx in 0..ENTRIES_PER_TABLE {
@@ -734,7 +774,7 @@ impl Aarch64PageTable {
                     continue;
                 }
 
-                let l1 = l0_entry.addr() as *const RawPageTable;
+                let l1 = phys_to_virt_table_const(l0_entry.addr());
 
                 // Walk L1 entries
                 for l1_idx in 0..ENTRIES_PER_TABLE {
@@ -754,7 +794,7 @@ impl Aarch64PageTable {
                         continue;
                     }
 
-                    let l2 = l1_entry.addr() as *const RawPageTable;
+                    let l2 = phys_to_virt_table_const(l1_entry.addr());
 
                     // Walk L2 entries
                     for l2_idx in 0..ENTRIES_PER_TABLE {
@@ -771,7 +811,7 @@ impl Aarch64PageTable {
                             continue;
                         }
 
-                        let l3 = l2_entry.addr() as *const RawPageTable;
+                        let l3 = phys_to_virt_table_const(l2_entry.addr());
 
                         // Walk L3 entries (4KB pages)
                         for l3_idx in 0..ENTRIES_PER_TABLE {
@@ -800,8 +840,8 @@ impl Aarch64PageTable {
 
                             // Copy page contents
                             core::ptr::copy_nonoverlapping(
-                                src_phys as *const u8,
-                                new_frame as *mut u8,
+                                phys_to_virt(src_phys) as *const u8,
+                                phys_to_virt(new_frame),
                                 PAGE_SIZE as usize,
                             );
 
@@ -842,13 +882,13 @@ impl Aarch64PageTable {
         let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
 
         unsafe {
-            let l0 = l0_phys as *mut RawPageTable;
+            let l0 = phys_to_virt_table(l0_phys);
 
             let l0_entry = (*l0).entry(l0_idx);
             if !l0_entry.is_valid() || !l0_entry.is_table() {
                 return None;
             }
-            let l1 = l0_entry.addr() as *mut RawPageTable;
+            let l1 = phys_to_virt_table(l0_entry.addr());
 
             let l1_entry = (*l1).entry(l1_idx);
             if !l1_entry.is_valid() {
@@ -858,7 +898,7 @@ impl Aarch64PageTable {
             if l1_entry.is_block() {
                 return None;
             }
-            let l2 = l1_entry.addr() as *mut RawPageTable;
+            let l2 = phys_to_virt_table(l1_entry.addr());
 
             let l2_entry = (*l2).entry(l2_idx);
             if !l2_entry.is_valid() {
@@ -868,7 +908,7 @@ impl Aarch64PageTable {
             if l2_entry.is_block() {
                 return None;
             }
-            let l3 = l2_entry.addr() as *mut RawPageTable;
+            let l3 = phys_to_virt_table(l2_entry.addr());
 
             let l3_entry = (*l3).entry_mut(l3_idx);
             if !l3_entry.is_valid() {
@@ -905,13 +945,13 @@ impl Aarch64PageTable {
         let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
 
         unsafe {
-            let l0 = l0_phys as *mut RawPageTable;
+            let l0 = phys_to_virt_table(l0_phys);
 
             let l0_entry = (*l0).entry(l0_idx);
             if !l0_entry.is_valid() || !l0_entry.is_table() {
                 return false;
             }
-            let l1 = l0_entry.addr() as *mut RawPageTable;
+            let l1 = phys_to_virt_table(l0_entry.addr());
 
             let l1_entry = (*l1).entry(l1_idx);
             if !l1_entry.is_valid() {
@@ -921,7 +961,7 @@ impl Aarch64PageTable {
             if l1_entry.is_block() {
                 return false;
             }
-            let l2 = l1_entry.addr() as *mut RawPageTable;
+            let l2 = phys_to_virt_table(l1_entry.addr());
 
             let l2_entry = (*l2).entry(l2_idx);
             if !l2_entry.is_valid() {
@@ -931,7 +971,7 @@ impl Aarch64PageTable {
             if l2_entry.is_block() {
                 return false;
             }
-            let l3 = l2_entry.addr() as *mut RawPageTable;
+            let l3 = phys_to_virt_table(l2_entry.addr());
 
             let l3_entry = (*l3).entry_mut(l3_idx);
             if !l3_entry.is_valid() {
@@ -994,13 +1034,13 @@ impl Aarch64PageTable {
         let offset = va & 0xFFF;
 
         unsafe {
-            let l0 = l0_phys as *const RawPageTable;
+            let l0 = phys_to_virt_table_const(l0_phys);
 
             let l0_entry = (*l0).entry(l0_idx);
             if !l0_entry.is_valid() || !l0_entry.is_table() {
                 return None;
             }
-            let l1 = l0_entry.addr() as *const RawPageTable;
+            let l1 = phys_to_virt_table_const(l0_entry.addr());
 
             let l1_entry = (*l1).entry(l1_idx);
             if !l1_entry.is_valid() {
@@ -1010,7 +1050,7 @@ impl Aarch64PageTable {
                 let base = l1_entry.addr();
                 return Some(base | (va & 0x3FFF_FFFF)); // 1GB mask
             }
-            let l2 = l1_entry.addr() as *const RawPageTable;
+            let l2 = phys_to_virt_table_const(l1_entry.addr());
 
             let l2_entry = (*l2).entry(l2_idx);
             if !l2_entry.is_valid() {
@@ -1020,7 +1060,7 @@ impl Aarch64PageTable {
                 let base = l2_entry.addr();
                 return Some(base | (va & 0x1F_FFFF)); // 2MB mask
             }
-            let l3 = l2_entry.addr() as *const RawPageTable;
+            let l3 = phys_to_virt_table_const(l2_entry.addr());
 
             let l3_entry = (*l3).entry(l3_idx);
             if !l3_entry.is_valid() {
@@ -1041,13 +1081,13 @@ impl Aarch64PageTable {
         let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
 
         unsafe {
-            let l0 = l0_phys as *const RawPageTable;
+            let l0 = phys_to_virt_table_const(l0_phys);
 
             let l0_entry = (*l0).entry(l0_idx);
             if !l0_entry.is_valid() || !l0_entry.is_table() {
                 return None;
             }
-            let l1 = l0_entry.addr() as *const RawPageTable;
+            let l1 = phys_to_virt_table_const(l0_entry.addr());
 
             let l1_entry = (*l1).entry(l1_idx);
             if !l1_entry.is_valid() {
@@ -1057,7 +1097,7 @@ impl Aarch64PageTable {
             if l1_entry.is_block() {
                 return None;
             }
-            let l2 = l1_entry.addr() as *const RawPageTable;
+            let l2 = phys_to_virt_table_const(l1_entry.addr());
 
             let l2_entry = (*l2).entry(l2_idx);
             if !l2_entry.is_valid() {
@@ -1067,7 +1107,7 @@ impl Aarch64PageTable {
             if l2_entry.is_block() {
                 return None;
             }
-            let l3 = l2_entry.addr() as *const RawPageTable;
+            let l3 = phys_to_virt_table_const(l2_entry.addr());
 
             let l3_entry = (*l3).entry(l3_idx);
             if !l3_entry.is_valid() {
@@ -1114,26 +1154,26 @@ impl PageTable for Aarch64PageTable {
         let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
 
         unsafe {
-            let l0 = self.root_phys as *mut RawPageTable;
+            let l0 = phys_to_virt_table(self.root_phys);
 
             // Walk page tables (assumes they exist)
             let l0_entry = (*l0).entry(l0_idx);
             if !l0_entry.is_valid() || !l0_entry.is_table() {
                 return;
             }
-            let l1 = l0_entry.addr() as *mut RawPageTable;
+            let l1 = phys_to_virt_table(l0_entry.addr());
 
             let l1_entry = (*l1).entry(l1_idx);
             if !l1_entry.is_valid() || l1_entry.is_block() {
                 return;
             }
-            let l2 = l1_entry.addr() as *mut RawPageTable;
+            let l2 = phys_to_virt_table(l1_entry.addr());
 
             let l2_entry = (*l2).entry(l2_idx);
             if !l2_entry.is_valid() || l2_entry.is_block() {
                 return;
             }
-            let l3 = l2_entry.addr() as *mut RawPageTable;
+            let l3 = phys_to_virt_table(l2_entry.addr());
 
             // Set the page entry
             let l3_entry = (*l3).entry_mut(l3_idx);
@@ -1147,25 +1187,25 @@ impl PageTable for Aarch64PageTable {
         let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
 
         unsafe {
-            let l0 = self.root_phys as *mut RawPageTable;
+            let l0 = phys_to_virt_table(self.root_phys);
 
             let l0_entry = (*l0).entry(l0_idx);
             if !l0_entry.is_valid() || !l0_entry.is_table() {
                 return;
             }
-            let l1 = l0_entry.addr() as *mut RawPageTable;
+            let l1 = phys_to_virt_table(l0_entry.addr());
 
             let l1_entry = (*l1).entry(l1_idx);
             if !l1_entry.is_valid() || l1_entry.is_block() {
                 return;
             }
-            let l2 = l1_entry.addr() as *mut RawPageTable;
+            let l2 = phys_to_virt_table(l1_entry.addr());
 
             let l2_entry = (*l2).entry(l2_idx);
             if !l2_entry.is_valid() || l2_entry.is_block() {
                 return;
             }
-            let l3 = l2_entry.addr() as *mut RawPageTable;
+            let l3 = phys_to_virt_table(l2_entry.addr());
 
             let l3_entry = (*l3).entry_mut(l3_idx);
             l3_entry.clear();
@@ -1212,7 +1252,7 @@ impl PageTable for Aarch64PageTable {
         frames.push(self.root_phys);
 
         unsafe {
-            let l0 = self.root_phys as *const RawPageTable;
+            let l0 = phys_to_virt_table_const(self.root_phys);
 
             // Walk L0 entries (user space is in lower addresses)
             for l0_idx in 0..512 {
@@ -1223,7 +1263,7 @@ impl PageTable for Aarch64PageTable {
 
                 let l1_phys = l0_entry.addr();
                 frames.push(l1_phys);
-                let l1 = l1_phys as *const RawPageTable;
+                let l1 = phys_to_virt_table_const(l1_phys);
 
                 // Walk L1 entries
                 for l1_idx in 0..512 {
@@ -1234,7 +1274,7 @@ impl PageTable for Aarch64PageTable {
 
                     let l2_phys = l1_entry.addr();
                     frames.push(l2_phys);
-                    let l2 = l2_phys as *const RawPageTable;
+                    let l2 = phys_to_virt_table_const(l2_phys);
 
                     // Walk L2 entries
                     for l2_idx in 0..512 {

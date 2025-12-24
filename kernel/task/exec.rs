@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 #[cfg(target_arch = "x86_64")]
 use crate::arch::PageTable;
-use crate::arch::{FrameAlloc, PageFlags, SchedArch};
+use crate::arch::{FrameAlloc, PageFlags, SchedArch, phys_to_virt};
 
 // Architecture-specific type alias for page tables
 #[cfg(target_arch = "x86_64")]
@@ -222,7 +222,7 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     let write_u64 = |pt: &ArchPageTable, va: u64, val: u64| -> Result<(), i32> {
         if let Some(phys) = pt.translate(va) {
             unsafe {
-                let ptr = phys as *mut u64;
+                let ptr = phys_to_virt(phys) as *mut u64;
                 core::ptr::write(ptr, val);
             }
             Ok(())
@@ -236,7 +236,7 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
             let addr = va + i as u64;
             if let Some(phys) = pt.translate(addr) {
                 unsafe {
-                    let ptr = phys as *mut u8;
+                    let ptr = phys_to_virt(phys);
                     core::ptr::write(ptr, byte);
                 }
             } else {
@@ -417,7 +417,7 @@ fn apply_relocations(elf: &ElfExecutable<u64>, base_addr: u64, page_table: &Arch
 
         if let Some(phys) = page_table.translate(target_vaddr) {
             unsafe {
-                let ptr = phys as *mut u64;
+                let ptr = phys_to_virt(phys) as *mut u64;
                 core::ptr::write_volatile(ptr, value);
             }
         }

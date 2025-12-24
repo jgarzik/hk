@@ -8,7 +8,7 @@ use spin::Mutex;
 
 use super::paging::{
     PAGE_CACHE_DISABLE, PAGE_HUGE, PAGE_NO_EXECUTE, PAGE_PRESENT, PAGE_SIZE, PAGE_WRITABLE,
-    PAGE_WRITE_THROUGH, RawPageTable, X86_64PageTable,
+    PAGE_WRITE_THROUGH, X86_64PageTable, phys_to_virt, phys_to_virt_table,
 };
 
 /// ioremap region base (224MB)
@@ -285,7 +285,7 @@ fn map_mmio_page(cr3: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
     let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
 
     unsafe {
-        let pml4 = cr3 as *mut RawPageTable;
+        let pml4 = phys_to_virt_table(cr3);
 
         // Get or create PDPT
         let pml4_entry = (*pml4).entry_mut(pml4_idx);
@@ -293,7 +293,7 @@ fn map_mmio_page(cr3: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
             let pdpt_phys = alloc_zeroed_frame()?;
             pml4_entry.set(pdpt_phys, INTERMEDIATE_FLAGS);
         }
-        let pdpt = pml4_entry.addr() as *mut RawPageTable;
+        let pdpt = phys_to_virt_table(pml4_entry.addr());
 
         // Get or create PD
         let pdpt_entry = (*pdpt).entry_mut(pdpt_idx);
@@ -301,7 +301,7 @@ fn map_mmio_page(cr3: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
             let pd_phys = alloc_zeroed_frame()?;
             pdpt_entry.set(pd_phys, INTERMEDIATE_FLAGS);
         }
-        let pd = pdpt_entry.addr() as *mut RawPageTable;
+        let pd = phys_to_virt_table(pdpt_entry.addr());
 
         // Get or create PT - handle 2MB huge pages
         let pd_entry = (*pd).entry_mut(pd_idx);
@@ -309,7 +309,7 @@ fn map_mmio_page(cr3: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
             // No entry - allocate a new page table
             let pt_phys = alloc_zeroed_frame()?;
             pd_entry.set(pt_phys, INTERMEDIATE_FLAGS);
-            pt_phys as *mut RawPageTable
+            phys_to_virt_table(pt_phys)
         } else if pd_entry.is_huge() {
             // 2MB huge page - need to split into 4KB pages
             let huge_base = pd_entry.addr();
@@ -317,7 +317,7 @@ fn map_mmio_page(cr3: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
 
             // Allocate a new page table
             let pt_phys = alloc_zeroed_frame()?;
-            let pt = pt_phys as *mut RawPageTable;
+            let pt = phys_to_virt_table(pt_phys);
 
             // Fill PT with 512 entries covering the same 2MB region
             for i in 0..512 {
@@ -331,7 +331,7 @@ fn map_mmio_page(cr3: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
             pt
         } else {
             // Regular PT entry - just use its address
-            pd_entry.addr() as *mut RawPageTable
+            phys_to_virt_table(pd_entry.addr())
         };
 
         // Map the page with MMIO flags
@@ -347,25 +347,25 @@ fn unmap_page(cr3: u64, va: u64) {
     let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
 
     unsafe {
-        let pml4 = cr3 as *mut RawPageTable;
+        let pml4 = phys_to_virt_table(cr3);
 
         let pml4_entry = (*pml4).entry(pml4_idx);
         if !pml4_entry.is_present() {
             return;
         }
-        let pdpt = pml4_entry.addr() as *mut RawPageTable;
+        let pdpt = phys_to_virt_table(pml4_entry.addr());
 
         let pdpt_entry = (*pdpt).entry(pdpt_idx);
         if !pdpt_entry.is_present() {
             return;
         }
-        let pd = pdpt_entry.addr() as *mut RawPageTable;
+        let pd = phys_to_virt_table(pdpt_entry.addr());
 
         let pd_entry = (*pd).entry(pd_idx);
         if !pd_entry.is_present() {
             return;
         }
-        let pt = pd_entry.addr() as *mut RawPageTable;
+        let pt = phys_to_virt_table(pd_entry.addr());
 
         // Clear the page table entry
         let pt_entry = (*pt).entry_mut(pt_idx);
@@ -381,7 +381,7 @@ fn alloc_zeroed_frame() -> Result<u64, IoremapError> {
 
     // Zero the frame
     unsafe {
-        core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+        core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize);
     }
 
     Ok(frame)
