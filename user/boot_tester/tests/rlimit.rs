@@ -3,7 +3,7 @@
 //! Tests for getrlimit, setrlimit, and prlimit64 syscalls.
 
 use super::helpers::{print, println, print_num};
-use crate::syscall::{
+use hk_syscall::{
     sys_getrlimit, sys_setrlimit, sys_prlimit64,
     RLimit, RLIMIT_NOFILE, RLIMIT_MEMLOCK, RLIMIT_STACK,
     RLIM_NLIMITS, RLIM_INFINITY,

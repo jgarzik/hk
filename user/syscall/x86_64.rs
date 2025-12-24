@@ -8,7 +8,7 @@
 //! - Return value in RAX
 //! - RCX and R11 are clobbered by the syscall instruction
 
-use super::{FdSet, IoVec, PollFd, RLimit, SigInfo, Stat, Timespec, Timeval, UtsName};
+use crate::types::{FdSet, IoVec, PollFd, RLimit, SigInfo, Stat, Timespec, Timeval, UtsName};
 
 // ============================================================================
 // Syscall helper macros
@@ -752,7 +752,7 @@ pub fn sys_settimeofday(tv: *const Timeval, tz: *const u8) -> i64 {
 
 // --- Timerfd ---
 
-use super::ITimerSpec;
+use crate::types::ITimerSpec;
 
 #[inline(always)]
 pub fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
@@ -771,7 +771,7 @@ pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
 
 // --- POSIX Timers ---
 
-use super::SigEvent;
+use crate::types::SigEvent;
 
 /// timer_create(clockid, sigevent, timerid)
 #[inline(always)]

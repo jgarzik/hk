@@ -7,22 +7,22 @@
 //! - waitid, execve
 
 use super::helpers::{print, println, print_num};
-use crate::syscall::{
+use hk_syscall::{
     sys_brk, sys_clock_getres, sys_clock_nanosleep, sys_clone, sys_execve, sys_exit, sys_fork,
     sys_getcpu, sys_getegid, sys_geteuid, sys_getgid, sys_getpgid, sys_getpid, sys_getppid,
     sys_getpriority, sys_getresgid, sys_getresuid, sys_getrusage, sys_getsid, sys_gettid,
     sys_getuid, sys_ioprio_get, sys_ioprio_set, sys_nanosleep, sys_sched_getaffinity,
     sys_sched_getparam, sys_sched_getscheduler, sys_sched_rr_get_interval, sys_sched_setaffinity,
-    sys_sched_setparam, sys_sched_setscheduler, sys_set_tid_address, sys_setfsgid, sys_setfsuid,
+    sys_set_tid_address, sys_setfsgid, sys_setfsuid,
     sys_setgid, sys_setpriority, sys_setregid, sys_setresgid, sys_setresuid, sys_setreuid,
     sys_setsid, sys_setuid, sys_sysinfo, sys_vfork, sys_wait4, sys_waitid, ioprio_prio_value,
     SchedParam, SigInfo, Timespec, CLOCK_MONOTONIC, CLOCK_REALTIME, CLONE_VM, IOPRIO_CLASS_BE,
-    IOPRIO_WHO_PROCESS, P_ALL, P_PID, PRIO_PROCESS, SCHED_NORMAL, SCHED_RR, WEXITED,
+    IOPRIO_WHO_PROCESS, P_ALL, P_PID, PRIO_PROCESS, SCHED_NORMAL, WEXITED,
 };
 #[cfg(target_arch = "x86_64")]
-use crate::syscall::sys_time;
+use hk_syscall::sys_time;
 #[cfg(target_arch = "x86_64")]
-use crate::syscall::{sys_arch_prctl, ARCH_SET_FS, ARCH_GET_FS};
+use hk_syscall::{sys_arch_prctl, ARCH_SET_FS, ARCH_GET_FS};
 
 /// Run all process tests
 pub fn run_tests() {

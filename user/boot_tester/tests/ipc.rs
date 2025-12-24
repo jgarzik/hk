@@ -7,7 +7,7 @@
 //! - SysV semaphores (semget, semop, semctl)
 //! - SysV message queues (msgget, msgsnd, msgrcv, msgctl)
 
-use crate::syscall::{
+use hk_syscall::{
     sys_close, sys_open, sys_pipe, sys_poll, sys_read, sys_select, sys_write,
     sys_sendfile, sys_splice, sys_tee, sys_vmsplice,
     sys_shmget, sys_shmat, sys_shmdt, sys_shmctl,

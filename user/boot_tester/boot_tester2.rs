@@ -9,10 +9,7 @@
 
 use core::panic::PanicInfo;
 
-// Architecture-specific syscall wrappers
-#[path = "syscall/mod.rs"]
-mod syscall;
-use syscall::{sys_exit, sys_getpid, sys_getppid, sys_write};
+use hk_syscall::{sys_exit, sys_getpid, sys_getppid, sys_write};
 
 /// Print a string to stdout
 fn print(s: &[u8]) {

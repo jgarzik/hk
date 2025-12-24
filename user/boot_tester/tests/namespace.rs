@@ -5,7 +5,7 @@
 //! - setns(2) - join existing namespace via file descriptor
 
 use super::helpers::{print, println, print_num};
-use crate::syscall::{
+use hk_syscall::{
     sys_close, sys_exit, sys_fork, sys_open, sys_sethostname, sys_uname, sys_unshare,
     sys_setns, sys_wait4, UtsName, O_RDONLY, CLONE_NEWUTS, CLONE_NEWNET, CLONE_NEWPID,
     CLONE_NEWUSER, CLONE_NEWNS,
@@ -278,7 +278,7 @@ fn test_setns_ebadf() {
 fn test_setns_uts() {
     // Simpler test: open our own /proc/self/ns/uts and setns to it
     // This should be a no-op but verifies the mechanism works
-    use crate::syscall::sys_getpid;
+    use hk_syscall::sys_getpid;
 
     let my_pid = sys_getpid();
 

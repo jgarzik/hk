@@ -1,34 +1,7 @@
-//! Architecture-specific syscall wrappers
-//!
-//! This module provides a common interface for Linux syscalls across different
-//! architectures (x86_64 and aarch64). Each architecture has different syscall
-//! numbers and calling conventions.
-//!
-//! # Architecture Differences
-//!
-//! | Aspect | x86_64 | aarch64 |
-//! |--------|--------|---------|
-//! | Instruction | `syscall` | `svc #0` |
-//! | Syscall Number | RAX | X8 |
-//! | Arguments | RDI, RSI, RDX, R10, R8, R9 | X0-X5 |
-//! | Return Value | RAX | X0 |
-//!
-//! Additionally, aarch64 uses different syscall numbers and has removed some
-//! legacy syscalls (open, fork, dup2) in favor of newer alternatives (openat,
-//! clone, dup3).
-
-#[cfg(target_arch = "x86_64")]
-mod x86_64;
-#[cfg(target_arch = "x86_64")]
-pub use x86_64::*;
-
-#[cfg(target_arch = "aarch64")]
-mod aarch64;
-#[cfg(target_arch = "aarch64")]
-pub use aarch64::*;
+//! Common types used by syscalls (architecture-independent)
 
 // ============================================================================
-// Common types used by syscalls (architecture-independent)
+// Time structures
 // ============================================================================
 
 /// Timespec structure for nanosleep and related syscalls
@@ -45,6 +18,10 @@ pub struct Timeval {
     pub tv_sec: i64,
     pub tv_usec: i64,
 }
+
+// ============================================================================
+// Poll/Select structures
+// ============================================================================
 
 /// pollfd structure for poll syscall
 #[repr(C)]
@@ -106,12 +83,20 @@ pub const POLLERR: i16 = 0x0008;
 pub const POLLHUP: i16 = 0x0010;
 pub const POLLNVAL: i16 = 0x0020;
 
+// ============================================================================
+// I/O structures
+// ============================================================================
+
 /// iovec structure for readv/writev
 #[repr(C)]
 pub struct IoVec {
     pub iov_base: *const u8,
     pub iov_len: usize,
 }
+
+// ============================================================================
+// Signal structures
+// ============================================================================
 
 /// siginfo_t structure for waitid (simplified)
 #[repr(C)]
@@ -125,6 +110,10 @@ pub struct SigInfo {
     pub si_status: i32,
     pub _pad: [u8; 128 - 28], // Padding to match Linux size
 }
+
+// ============================================================================
+// Stat structures
+// ============================================================================
 
 /// Linux stat structure (common layout)
 #[repr(C)]
@@ -151,7 +140,6 @@ pub struct Stat {
 
 /// Linux dirent64 structure
 #[repr(C, packed)]
-#[allow(dead_code)]
 pub struct LinuxDirent64 {
     pub d_ino: u64,
     pub d_off: i64,
@@ -161,10 +149,9 @@ pub struct LinuxDirent64 {
 }
 
 // ============================================================================
-// Common constants (architecture-independent)
+// Open/file flags
 // ============================================================================
 
-// Open flags
 pub const O_RDONLY: u32 = 0;
 pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
@@ -177,7 +164,10 @@ pub const SEEK_SET: i32 = 0;
 pub const SEEK_CUR: i32 = 1;
 pub const SEEK_END: i32 = 2;
 
+// ============================================================================
 // Clone flags
+// ============================================================================
+
 pub const CLONE_VM: u64 = 0x00000100;
 pub const CLONE_SIGHAND: u64 = 0x00000800;
 pub const CLONE_PARENT: u64 = 0x00008000;
@@ -192,7 +182,10 @@ pub const CLONE_NEWNET: u64 = 0x4000_0000;
 pub const CLONE_IO: u64 = 0x80000000;
 pub const CLONE_CLEAR_SIGHAND: u64 = 0x100000000;
 
-// I/O priority constants
+// ============================================================================
+// I/O priority
+// ============================================================================
+
 pub const IOPRIO_CLASS_NONE: u16 = 0;
 pub const IOPRIO_CLASS_RT: u16 = 1;
 pub const IOPRIO_CLASS_BE: u16 = 2;
@@ -207,10 +200,13 @@ pub const fn ioprio_prio_value(class: u16, level: u16) -> i32 {
     (((class & 0x7) << 13) | (level & 0x1fff)) as i32
 }
 
+// ============================================================================
+// Wait/process constants
+// ============================================================================
+
 // waitid idtype values
 pub const P_ALL: i32 = 0;
 pub const P_PID: i32 = 1;
-#[allow(dead_code)]
 pub const P_PGID: i32 = 2;
 
 // waitid options
@@ -218,18 +214,17 @@ pub const WEXITED: i32 = 4;
 
 // Priority "which" values for getpriority/setpriority
 pub const PRIO_PROCESS: i32 = 0;
-#[allow(dead_code)]
 pub const PRIO_PGRP: i32 = 1;
-#[allow(dead_code)]
 pub const PRIO_USER: i32 = 2;
 
-// Scheduling policies
+// ============================================================================
+// Scheduling
+// ============================================================================
+
 pub const SCHED_NORMAL: i32 = 0;
 pub const SCHED_FIFO: i32 = 1;
 pub const SCHED_RR: i32 = 2;
-#[allow(dead_code)]
 pub const SCHED_BATCH: i32 = 3;
-#[allow(dead_code)]
 pub const SCHED_IDLE: i32 = 5;
 
 /// sched_param structure for sched_setscheduler/sched_getparam
@@ -238,7 +233,10 @@ pub struct SchedParam {
     pub sched_priority: i32,
 }
 
-// Clock IDs
+// ============================================================================
+// Clock constants
+// ============================================================================
+
 pub const CLOCK_REALTIME: i32 = 0;
 pub const CLOCK_MONOTONIC: i32 = 1;
 
@@ -246,7 +244,10 @@ pub const CLOCK_MONOTONIC: i32 = 1;
 pub const UTIME_NOW: i64 = 0x3fffffff;
 pub const UTIME_OMIT: i64 = 0x3ffffffe;
 
-// Linux reboot magic numbers and commands
+// ============================================================================
+// Reboot constants
+// ============================================================================
+
 pub const LINUX_REBOOT_MAGIC1: u64 = 0xfee1dead;
 pub const LINUX_REBOOT_MAGIC2: u64 = 0x28121969;
 pub const LINUX_REBOOT_CMD_POWER_OFF: u64 = 0x4321fedc;
@@ -301,6 +302,10 @@ impl RobustListHead {
     /// Size of the robust list head structure
     pub const SIZE: usize = core::mem::size_of::<Self>();
 }
+
+// ============================================================================
+// mmap/mprotect constants
+// ============================================================================
 
 // mmap protection flags
 pub const PROT_NONE: u32 = 0;
@@ -377,7 +382,10 @@ pub const MREMAP_FIXED: u32 = 2;
 /// Keep original mapping after move
 pub const MREMAP_DONTUNMAP: u32 = 4;
 
-// Resource limits (rlimit constants)
+// ============================================================================
+// Resource limits
+// ============================================================================
+
 /// CPU time limit (seconds)
 pub const RLIMIT_CPU: u32 = 0;
 /// Maximum file size (bytes)
@@ -432,7 +440,10 @@ impl RLimit {
     }
 }
 
-// Signal numbers
+// ============================================================================
+// Signals
+// ============================================================================
+
 pub const SIGHUP: u32 = 1;
 pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
@@ -458,6 +469,10 @@ pub const SIG_SETMASK: i32 = 2;
 // Special signal handler values
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
+
+// ============================================================================
+// UTS name structure
+// ============================================================================
 
 /// UTS name structure for uname syscall (Linux ABI compatible)
 ///

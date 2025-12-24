@@ -19,7 +19,7 @@ endif
 
 CARGO = cargo
 
-# Output files
+# Output files (now built from workspace)
 BOOT_TESTER = target/$(TARGET)/release/boot_tester
 BOOT_TESTER2 = target/$(TARGET)/release/boot_tester2
 INITRD_ROOT = initrd-root
@@ -30,10 +30,7 @@ all: $(INITRAMFS)
 
 boot_tester: $(BOOT_TESTER) $(BOOT_TESTER2)
 
-$(BOOT_TESTER): boot_tester.rs syscall/mod.rs syscall/$(ARCH).rs Cargo.toml
-	$(CARGO) build --release --target $(TARGET)
-
-$(BOOT_TESTER2): boot_tester2.rs syscall/mod.rs syscall/$(ARCH).rs Cargo.toml
+$(BOOT_TESTER) $(BOOT_TESTER2): boot_tester/main.rs boot_tester/boot_tester2.rs boot_tester/tests/*.rs syscall/lib.rs syscall/types.rs syscall/$(ARCH).rs Cargo.toml
 	$(CARGO) build --release --target $(TARGET)
 
 $(INITRAMFS): $(BOOT_TESTER) $(BOOT_TESTER2)

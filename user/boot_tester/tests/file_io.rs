@@ -26,7 +26,7 @@
 //! - Test 44: preadv2() with RWF_NOWAIT returns -EOPNOTSUPP (Phase 1)
 
 use super::helpers::{print, println, print_num};
-use crate::syscall::{
+use hk_syscall::{
     sys_close, sys_fcntl, sys_fstatfs, sys_getrandom, sys_ioctl, sys_lseek, sys_open, sys_pipe2,
     sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read,
     sys_readv, sys_statfs, sys_statx, sys_write, sys_writev, IoVec, LinuxStatFs, Statx,
@@ -35,10 +35,6 @@ use crate::syscall::{
 };
 
 // RWF flags for preadv2/pwritev2
-const RWF_HIPRI: i32 = 0x01;
-const RWF_DSYNC: i32 = 0x02;
-#[allow(dead_code)]
-const RWF_SYNC: i32 = 0x04;
 const RWF_NOWAIT: i32 = 0x08;
 const RWF_APPEND: i32 = 0x10;
 

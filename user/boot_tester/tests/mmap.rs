@@ -8,14 +8,14 @@
 //! - mlock/mlock2/munlock/mlockall/munlockall
 
 use super::helpers::{print, println, print_num};
-use crate::syscall::{
+use hk_syscall::{
     sys_madvise, sys_mincore, sys_mmap, sys_mprotect, sys_mremap, sys_msync, sys_munmap,
     sys_mlock, sys_mlock2, sys_munlock, sys_mlockall, sys_munlockall,
-    MADV_DONTNEED, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED,
-    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_FIXED_NOREPLACE,
+    MADV_DONTNEED, MADV_NORMAL, MADV_RANDOM, MADV_WILLNEED,
+    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED_NOREPLACE,
     MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
     MAP_STACK, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC, MS_SYNC,
-    PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, PROT_EXEC,
+    PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE,
     MLOCK_ONFAULT, MCL_CURRENT, MCL_ONFAULT,
 };
 

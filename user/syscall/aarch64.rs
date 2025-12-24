@@ -19,7 +19,7 @@
 //!   - No `chmod`, `chown`, `lchown` - use *at variants
 //!   - No `truncate` - use ftruncate with openat
 
-use super::{FdSet, IoVec, PollFd, RLimit, SigInfo, Stat, Timespec, Timeval, UtsName, AT_FDCWD};
+use crate::types::{FdSet, IoVec, PollFd, RLimit, SigInfo, Stat, Timespec, Timeval, UtsName, AT_FDCWD};
 
 // ============================================================================
 // Syscall macros for aarch64
@@ -508,7 +508,7 @@ pub fn sys_clock_settime(clockid: i32, tp: *const Timespec) -> i64 {
 
 // --- Timerfd ---
 
-use super::ITimerSpec;
+use crate::types::ITimerSpec;
 
 /// timerfd_create(clockid, flags)
 #[inline(always)]
@@ -530,7 +530,7 @@ pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
 
 // --- POSIX Timers ---
 
-use super::SigEvent;
+use crate::types::SigEvent;
 
 /// timer_create(clockid, sigevent, timerid)
 #[inline(always)]

@@ -6,7 +6,7 @@
 //! 3. Listing /proc directory with getdents64
 
 use super::helpers::{print, println, print_num};
-use crate::syscall::{sys_close, sys_getdents64, sys_open, sys_read, sys_write, O_DIRECTORY, O_RDONLY};
+use hk_syscall::{sys_close, sys_getdents64, sys_open, sys_read, sys_write, O_DIRECTORY, O_RDONLY};
 
 /// Run all VFS tests
 pub fn run_tests() {

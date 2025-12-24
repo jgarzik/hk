@@ -1,6 +1,6 @@
 //! Shared test utilities for boot_tester modules
 
-use crate::syscall::{sys_write, sys_exit};
+use hk_syscall::sys_write;
 
 pub const STDOUT: u64 = 1;
 
@@ -50,7 +50,3 @@ pub fn starts_with(slice: &[u8], prefix: &[u8]) -> bool {
     true
 }
 
-/// Exit the process with given exit code
-pub fn exit(code: u64) -> ! {
-    sys_exit(code);
-}

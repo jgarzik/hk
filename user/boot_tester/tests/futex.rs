@@ -10,8 +10,8 @@
 //! - get_robust_list returns 0
 
 use super::helpers::{print, print_num, println};
-use crate::syscall::{
-    sys_futex, sys_get_robust_list, sys_set_robust_list, RobustListHead, Timespec,
+use hk_syscall::{
+    sys_futex, sys_get_robust_list, sys_set_robust_list, RobustListHead,
     FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE,
 };
 use core::ptr;

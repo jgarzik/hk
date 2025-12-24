@@ -7,15 +7,10 @@
 
 use core::panic::PanicInfo;
 
-// Architecture-specific syscall wrappers
-#[path = "syscall/mod.rs"]
-mod syscall;
-
 // Test modules
-#[path = "tests/mod.rs"]
 mod tests;
 
-use syscall::{sys_exit, sys_reboot, LINUX_REBOOT_CMD_POWER_OFF, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2};
+use hk_syscall::{sys_exit, sys_reboot, LINUX_REBOOT_CMD_POWER_OFF, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2};
 use tests::helpers::{println, print};
 
 #[unsafe(no_mangle)]
@@ -32,9 +27,7 @@ pub extern "C" fn _start() -> ! {
 
     // Shutdown the system via ACPI S5
     println(b"Powering off...");
-    sys_reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_POWER_OFF);
-
-    loop {}
+    sys_reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_POWER_OFF)
 }
 
 #[panic_handler]

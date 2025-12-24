@@ -13,7 +13,7 @@
 //! - Test: CLONE_CLEAR_SIGHAND - reset handlers after clone
 
 use super::helpers::{print, println, print_num};
-use crate::syscall::{
+use hk_syscall::{
     sys_clone, sys_exit, sys_getpid, sys_gettid, sys_kill, sys_rt_sigaction, sys_rt_sigpending,
     sys_rt_sigprocmask, sys_tgkill, sys_tkill, sys_wait4, CLONE_CLEAR_SIGHAND, SIG_BLOCK, SIG_DFL,
     SIG_IGN, SIGCHLD, SIGKILL, SIGUSR1,

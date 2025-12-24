@@ -16,10 +16,10 @@
 //! - Test 63: chroot() - change root directory
 
 use super::helpers::{print, println, print_num};
-use crate::syscall::{
+use hk_syscall::{
     sys_chmod, sys_chown, sys_chroot, sys_close, sys_fchmod, sys_fchmodat2, sys_fchown, sys_lchown,
     sys_lstat, sys_mkdir, sys_open, sys_stat, sys_symlink, sys_umask, sys_unlink, sys_utimensat,
-    Stat, Timespec, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, UTIME_NOW, UTIME_OMIT,
+    Stat, Timespec, O_CREAT, O_RDWR, O_WRONLY, UTIME_NOW, UTIME_OMIT,
 };
 
 /// Run all permission tests
@@ -352,8 +352,6 @@ fn test_utimensat() {
 
 /// AT_FDCWD constant for *at syscalls
 const AT_FDCWD: i32 = -100;
-/// AT_SYMLINK_NOFOLLOW flag
-const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 
 /// Test 61: fchmodat2() - change file permissions with flags
 fn test_fchmodat2() {

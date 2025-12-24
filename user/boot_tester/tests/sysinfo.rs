@@ -12,9 +12,9 @@
 //! - Test 78: settimeofday() EINVAL - invalid usec (x86_64 only)
 
 use super::helpers::{print, println, print_num, print_cstr, starts_with};
-use crate::syscall::{sys_sethostname, sys_setdomainname, sys_uname, sys_clock_settime, sys_clock_gettime, UtsName, Timespec};
+use hk_syscall::{sys_sethostname, sys_setdomainname, sys_uname, sys_clock_settime, sys_clock_gettime, UtsName, Timespec};
 #[cfg(target_arch = "x86_64")]
-use crate::syscall::{sys_settimeofday, sys_gettimeofday, Timeval};
+use hk_syscall::{sys_settimeofday, sys_gettimeofday, Timeval};
 
 // Clock IDs
 const CLOCK_REALTIME: i32 = 0;

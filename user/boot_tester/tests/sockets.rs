@@ -2,7 +2,7 @@
 //!
 //! Tests for the network socket syscalls.
 
-use crate::syscall::{
+use hk_syscall::{
     sys_close, sys_socket, sys_bind, sys_listen, sys_shutdown,
     sys_getsockname, SockAddrIn, AF_INET, SOCK_STREAM, SOCK_NONBLOCK,
     SHUT_RD, SHUT_WR, SHUT_RDWR, htons,

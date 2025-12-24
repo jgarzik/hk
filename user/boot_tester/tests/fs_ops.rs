@@ -9,7 +9,7 @@
 
 use super::fs_common;
 use super::helpers::{print, print_num, println};
-use crate::syscall::{
+use hk_syscall::{
     sys_close, sys_link, sys_lseek, sys_mkdir, sys_mknod, sys_mount, sys_open, sys_read,
     sys_readlink, sys_rename, sys_rmdir, sys_symlink, sys_truncate, sys_umount2, sys_unlink,
     sys_write, O_CREAT, O_RDONLY, O_WRONLY, SEEK_SET,

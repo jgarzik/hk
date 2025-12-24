@@ -10,7 +10,7 @@
 //! - Test 69: syncfs() on invalid fd
 
 use super::helpers::{print, println, print_num};
-use crate::syscall::{
+use hk_syscall::{
     sys_close, sys_fdatasync, sys_fsync, sys_open, sys_sync, sys_syncfs, sys_unlink, sys_write,
     O_CREAT, O_WRONLY,
 };

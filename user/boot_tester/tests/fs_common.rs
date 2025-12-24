@@ -4,7 +4,7 @@
 //! to run identically on ramfs, vfat, or any other filesystem.
 
 use super::helpers::{print, print_cstr, print_num, println};
-use crate::syscall::{
+use hk_syscall::{
     sys_close, sys_ftruncate, sys_mkdir, sys_mknod, sys_open, sys_read, sys_rename, sys_rmdir,
     sys_lseek, sys_unlink, sys_write, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, O_WRONLY,
     SEEK_CUR, SEEK_END, SEEK_SET,
