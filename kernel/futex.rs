@@ -1128,8 +1128,8 @@ fn futex_wait_multiple(
     timeout_ns: Option<u64>,
     _use_realtime: bool,
 ) -> i32 {
-    use crate::task::percpu::{SCHEDULING_ENABLED, TASK_TABLE, current_percpu_sched};
     use crate::task::TaskState;
+    use crate::task::percpu::{SCHEDULING_ENABLED, TASK_TABLE, current_percpu_sched};
 
     // Check scheduling is enabled
     if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
@@ -1178,7 +1178,8 @@ fn futex_wait_multiple(
                         let b = futex_bucket(&e.key);
                         if j < enqueued_count {
                             let mut w = b.waiters.lock();
-                            if let Some(pos) = w.iter().position(|q| q.tid == tid && q.key == e.key) {
+                            if let Some(pos) = w.iter().position(|q| q.tid == tid && q.key == e.key)
+                            {
                                 w.remove(pos);
                             }
                         }
@@ -1255,7 +1256,10 @@ fn futex_wait_multiple(
             let mut waiters = bucket.waiters.lock();
 
             // Check if we're still in this bucket's queue
-            if let Some(pos) = waiters.iter().position(|q| q.tid == tid && q.key == entry.key) {
+            if let Some(pos) = waiters
+                .iter()
+                .position(|q| q.tid == tid && q.key == entry.key)
+            {
                 // Still in queue - we weren't woken from this futex
                 waiters.remove(pos);
                 bucket.dec_waiters();

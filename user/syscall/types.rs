@@ -1058,3 +1058,118 @@ impl FutexWaitv {
         }
     }
 }
+
+// ============================================================================
+// Capabilities types and constants (Section 10.2)
+// ============================================================================
+
+/// User-space capability header (for capget/capset syscalls)
+///
+/// Matches Linux's `struct __user_cap_header_struct`
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CapUserHeader {
+    pub version: u32,
+    pub pid: i32,
+}
+
+/// User-space capability data (for capget/capset syscalls)
+///
+/// Matches Linux's `struct __user_cap_data_struct`
+/// Note: For version 3, an array of 2 of these is used (low/high 32 bits)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CapUserData {
+    pub effective: u32,
+    pub permitted: u32,
+    pub inheritable: u32,
+}
+
+/// Linux capability version 3 (current, supports 64 capabilities)
+pub const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+
+// Capability constants (CAP_* values for capability bitmask operations)
+/// Override chown restrictions
+pub const CAP_CHOWN: u32 = 0;
+/// Override DAC access restrictions
+pub const CAP_DAC_OVERRIDE: u32 = 1;
+/// Override DAC read/search restrictions
+pub const CAP_DAC_READ_SEARCH: u32 = 2;
+/// Override file ownership checks
+pub const CAP_FOWNER: u32 = 3;
+/// Override setuid/setgid bits
+pub const CAP_FSETID: u32 = 4;
+/// Override signal sending restrictions
+pub const CAP_KILL: u32 = 5;
+/// Allow setgid manipulation
+pub const CAP_SETGID: u32 = 6;
+/// Allow setuid manipulation
+pub const CAP_SETUID: u32 = 7;
+/// Transfer/remove capabilities
+pub const CAP_SETPCAP: u32 = 8;
+/// Modify S_IMMUTABLE and S_APPEND attributes
+pub const CAP_LINUX_IMMUTABLE: u32 = 9;
+/// Bind to ports below 1024
+pub const CAP_NET_BIND_SERVICE: u32 = 10;
+/// Allow broadcasting/multicasting
+pub const CAP_NET_BROADCAST: u32 = 11;
+/// Allow network administration
+pub const CAP_NET_ADMIN: u32 = 12;
+/// Allow raw sockets
+pub const CAP_NET_RAW: u32 = 13;
+/// Lock memory (mlock, mlockall, etc.)
+pub const CAP_IPC_LOCK: u32 = 14;
+/// Override IPC ownership checks
+pub const CAP_IPC_OWNER: u32 = 15;
+/// Insert/remove kernel modules
+pub const CAP_SYS_MODULE: u32 = 16;
+/// Allow raw I/O access
+pub const CAP_SYS_RAWIO: u32 = 17;
+/// Use chroot()
+pub const CAP_SYS_CHROOT: u32 = 18;
+/// Allow ptrace of any process
+pub const CAP_SYS_PTRACE: u32 = 19;
+/// Configure process accounting
+pub const CAP_SYS_PACCT: u32 = 20;
+/// System administration capabilities
+pub const CAP_SYS_ADMIN: u32 = 21;
+/// Use reboot()
+pub const CAP_SYS_BOOT: u32 = 22;
+/// Raise process nice value, set real-time priorities
+pub const CAP_SYS_NICE: u32 = 23;
+/// Override resource limits
+pub const CAP_SYS_RESOURCE: u32 = 24;
+/// Manipulate system clock
+pub const CAP_SYS_TIME: u32 = 25;
+/// Configure TTY devices
+pub const CAP_SYS_TTY_CONFIG: u32 = 26;
+/// Privileged mknod operations
+pub const CAP_MKNOD: u32 = 27;
+/// Take file leases
+pub const CAP_LEASE: u32 = 28;
+/// Write to audit log
+pub const CAP_AUDIT_WRITE: u32 = 29;
+/// Configure audit
+pub const CAP_AUDIT_CONTROL: u32 = 30;
+/// Set file capabilities
+pub const CAP_SETFCAP: u32 = 31;
+/// Override MAC access
+pub const CAP_MAC_OVERRIDE: u32 = 32;
+/// Configure MAC
+pub const CAP_MAC_ADMIN: u32 = 33;
+/// Configure syslog
+pub const CAP_SYSLOG: u32 = 34;
+/// Trigger wake alarms
+pub const CAP_WAKE_ALARM: u32 = 35;
+/// Prevent system suspend
+pub const CAP_BLOCK_SUSPEND: u32 = 36;
+/// Read audit log
+pub const CAP_AUDIT_READ: u32 = 37;
+/// Performance monitoring
+pub const CAP_PERFMON: u32 = 38;
+/// BPF operations
+pub const CAP_BPF: u32 = 39;
+/// Checkpoint/restore operations
+pub const CAP_CHECKPOINT_RESTORE: u32 = 40;
+/// Last valid capability number
+pub const CAP_LAST_CAP: u32 = 40;

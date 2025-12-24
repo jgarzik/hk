@@ -193,6 +193,10 @@ pub const SYS_GETRESGID: u64 = 150;
 pub const SYS_SETFSUID: u64 = 151;
 /// setfsgid(gid)
 pub const SYS_SETFSGID: u64 = 152;
+/// capget(hdrp, datap)
+pub const SYS_CAPGET: u64 = 90;
+/// capset(hdrp, datap)
+pub const SYS_CAPSET: u64 = 91;
 pub const SYS_GETUID: u64 = 174;
 pub const SYS_GETEUID: u64 = 175;
 pub const SYS_GETGID: u64 = 176;
@@ -612,6 +616,16 @@ pub fn aarch64_syscall_dispatch(
         SYS_SETFSGID => {
             use crate::task::syscall::sys_setfsgid;
             sys_setfsgid(arg0 as u32, percpu::current_cred()) as u64
+        }
+        SYS_CAPGET => {
+            use crate::arch::Uaccess;
+            use crate::task::syscall::sys_capget;
+            sys_capget::<Uaccess>(arg0, arg1) as u64
+        }
+        SYS_CAPSET => {
+            use crate::arch::Uaccess;
+            use crate::task::syscall::sys_capset;
+            sys_capset::<Uaccess>(arg0, arg1) as u64
         }
 
         // Time syscalls

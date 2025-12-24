@@ -22,6 +22,7 @@ pub mod timerfd;
 pub mod posix_timer;
 pub mod xattr;
 pub mod mqueue;
+pub mod capabilities;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -43,4 +44,5 @@ pub fn run_all_tests() {
     posix_timer::run_tests();
     xattr::run_tests();
     mqueue::run_tests();
+    capabilities::run_tests();
 }

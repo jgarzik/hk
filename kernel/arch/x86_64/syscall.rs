@@ -200,6 +200,10 @@ pub const SYS_GETRESGID: u64 = 120;
 pub const SYS_SETFSUID: u64 = 122;
 /// setfsgid(gid)
 pub const SYS_SETFSGID: u64 = 123;
+/// capget(hdrp, datap)
+pub const SYS_CAPGET: u64 = 125;
+/// capset(hdrp, datap)
+pub const SYS_CAPSET: u64 = 126;
 
 // Process creation (Section 1.1)
 /// clone(flags, child_stack, parent_tidptr, child_tidptr, tls)
@@ -1237,6 +1241,16 @@ pub fn x86_64_syscall_dispatch(
         SYS_SETFSGID => {
             use crate::task::syscall::sys_setfsgid;
             sys_setfsgid(arg0 as u32, percpu::current_cred()) as u64
+        }
+        SYS_CAPGET => {
+            use crate::arch::Uaccess;
+            use crate::task::syscall::sys_capget;
+            sys_capget::<Uaccess>(arg0, arg1) as u64
+        }
+        SYS_CAPSET => {
+            use crate::arch::Uaccess;
+            use crate::task::syscall::sys_capset;
+            sys_capset::<Uaccess>(arg0, arg1) as u64
         }
 
         // Process creation (Section 1.1)

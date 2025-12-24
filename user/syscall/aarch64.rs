@@ -185,6 +185,8 @@ pub const SYS_CLOCK_NANOSLEEP: u64 = 115;
 pub const SYS_TIMERFD_CREATE: u64 = 85;
 pub const SYS_TIMERFD_SETTIME: u64 = 86;
 pub const SYS_TIMERFD_GETTIME: u64 = 87;
+pub const SYS_CAPGET: u64 = 90;
+pub const SYS_CAPSET: u64 = 91;
 
 // POSIX timer syscalls (Section 6.2)
 pub const SYS_TIMER_CREATE: u64 = 107;
@@ -1672,4 +1674,32 @@ pub fn sys_lremovexattr(path: *const u8, name: *const u8) -> i64 {
 #[inline(always)]
 pub fn sys_fremovexattr(fd: i32, name: *const u8) -> i64 {
     unsafe { syscall2!(SYS_FREMOVEXATTR, fd, name) }
+}
+
+// ============================================================================
+// Capabilities (capget, capset)
+// ============================================================================
+
+use crate::types::{CapUserData, CapUserHeader};
+
+/// capget - get capabilities of a process
+///
+/// Gets the capabilities of the target process specified in the header.
+/// Use pid=0 for the calling process.
+///
+/// For version 3, datap must point to an array of 2 CapUserData structs.
+#[inline(always)]
+pub fn sys_capget(hdrp: *mut CapUserHeader, datap: *mut CapUserData) -> i64 {
+    unsafe { syscall2!(SYS_CAPGET, hdrp, datap) }
+}
+
+/// capset - set capabilities of current process
+///
+/// Sets the capabilities of the current process.
+/// The pid in the header must be 0 or the calling process's pid.
+///
+/// For version 3, datap must point to an array of 2 CapUserData structs.
+#[inline(always)]
+pub fn sys_capset(hdrp: *const CapUserHeader, datap: *const CapUserData) -> i64 {
+    unsafe { syscall2!(SYS_CAPSET, hdrp, datap) }
 }

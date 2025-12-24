@@ -347,8 +347,8 @@ Linux groups the socket syscalls as their own "network" category.
 
 10.2 Capabilities
 
-- [ ] capget
-- [ ] capset
+- [x] capget
+- [x] capset
 
 10.3 Keyrings (Linux key management)
 

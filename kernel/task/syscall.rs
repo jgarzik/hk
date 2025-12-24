@@ -2382,3 +2382,198 @@ pub fn sys_set_tid_address(tidptr: u64) -> i64 {
     set_clear_child_tid(tid, tidptr);
     tid as i64
 }
+
+// =============================================================================
+// Capability syscalls (capget, capset)
+// =============================================================================
+
+use super::{
+    _LINUX_CAPABILITY_U32S_3, _LINUX_CAPABILITY_VERSION_1, _LINUX_CAPABILITY_VERSION_2,
+    _LINUX_CAPABILITY_VERSION_3, CapUserData, CapUserHeader, KernelCap,
+};
+
+/// Validate capability header version and return number of u32s to copy
+///
+/// If the version is invalid, writes the current version back to the header
+/// and returns -EINVAL.
+fn cap_validate_magic<A: crate::uaccess::UaccessArch>(
+    header_addr: u64,
+) -> Result<(usize, i32), i64> {
+    use crate::uaccess::{get_user, put_user};
+
+    if header_addr == 0 {
+        return Err(EFAULT);
+    }
+
+    // Read header from user space
+    let hdr: CapUserHeader = match get_user::<A, CapUserHeader>(header_addr) {
+        Ok(h) => h,
+        Err(_) => return Err(EFAULT),
+    };
+
+    let version = hdr.version;
+    let pid = hdr.pid;
+
+    match version {
+        _LINUX_CAPABILITY_VERSION_1 => {
+            // Legacy 32-bit version - only 1 u32 per set
+            Ok((1, pid))
+        }
+        _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => {
+            // 64-bit versions - 2 u32s per set
+            Ok((_LINUX_CAPABILITY_U32S_3, pid))
+        }
+        _ => {
+            // Invalid version - write current version back and return EINVAL
+            let current_version = CapUserHeader {
+                version: _LINUX_CAPABILITY_VERSION_3,
+                pid: 0,
+            };
+            let _ = put_user::<A, CapUserHeader>(header_addr, current_version);
+            Err(EINVAL)
+        }
+    }
+}
+
+/// sys_capget - get capabilities of a process
+///
+/// Gets the capabilities of the target process. The target can be:
+/// - 0: current process
+/// - current pid: current process
+/// - other pid: that process (requires appropriate permissions)
+///
+/// If dataptr is NULL and the version is valid, returns 0 (version query).
+/// Otherwise, copies capability data to userspace.
+pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u64) -> i64 {
+    use crate::uaccess::put_user;
+
+    // Validate version and get number of u32s to copy
+    let (tocopy, pid) = match cap_validate_magic::<A>(header_addr) {
+        Ok((n, p)) => (n, p),
+        Err(e) => {
+            // If dataptr is NULL and we got EINVAL, this is a version query
+            if data_addr == 0 && e == EINVAL {
+                return 0;
+            }
+            return e;
+        }
+    };
+
+    // If dataptr is NULL, this is just a version query (already validated)
+    if data_addr == 0 {
+        return 0;
+    }
+
+    // Get current pid
+    let current_pid = super::percpu::current_pid() as i32;
+
+    // Determine which credentials to read
+    let cred = if pid == 0 || pid == current_pid {
+        // Query our own capabilities
+        super::current_cred()
+    } else if pid < 0 {
+        return EINVAL;
+    } else {
+        // Query another process's capabilities
+        // For now, only support querying current process
+        // Full implementation would use find_task_by_vpid and RCU
+        return ESRCH;
+    };
+
+    // Build capability data arrays
+    // Linux uses 2 CapUserData structs for 64-bit capability representation
+    let mut kdata = [CapUserData::default(); 2];
+    kdata[0].effective = cred.cap_effective.low();
+    kdata[1].effective = cred.cap_effective.high();
+    kdata[0].permitted = cred.cap_permitted.low();
+    kdata[1].permitted = cred.cap_permitted.high();
+    kdata[0].inheritable = cred.cap_inheritable.low();
+    kdata[1].inheritable = cred.cap_inheritable.high();
+
+    // Copy to user space
+    for (i, item) in kdata.iter().enumerate().take(tocopy) {
+        let dst = data_addr + (i * core::mem::size_of::<CapUserData>()) as u64;
+        if put_user::<A, CapUserData>(dst, *item).is_err() {
+            return EFAULT;
+        }
+    }
+
+    0
+}
+
+/// sys_capset - set capabilities of current process
+///
+/// Sets the capabilities of the current process. The pid in the header
+/// must be 0 or the current process's pid.
+///
+/// Restrictions:
+/// - I (inheritable): raised bits must be subset of old permitted
+/// - P (permitted): raised bits must be subset of old permitted
+/// - E (effective): must be subset of new permitted
+pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u64) -> i64 {
+    use crate::uaccess::get_user;
+
+    // Validate version and get number of u32s to copy
+    let (tocopy, pid) = match cap_validate_magic::<A>(header_addr) {
+        Ok((n, p)) => (n, p),
+        Err(e) => return e,
+    };
+
+    // Get current pid
+    let current_pid = super::percpu::current_pid() as i32;
+
+    // May only affect current process (Linux restriction since kernel 2.6.27)
+    if pid != 0 && pid != current_pid {
+        return EPERM;
+    }
+
+    // Read capability data from user space
+    let mut kdata = [CapUserData::default(); 2];
+    for (i, item) in kdata.iter_mut().enumerate().take(tocopy) {
+        let src = data_addr + (i * core::mem::size_of::<CapUserData>()) as u64;
+        match get_user::<A, CapUserData>(src) {
+            Ok(d) => *item = d,
+            Err(_) => return EFAULT,
+        }
+    }
+
+    // Combine 32-bit values into 64-bit capabilities
+    let effective = KernelCap::from_u32s(kdata[0].effective, kdata[1].effective);
+    let permitted = KernelCap::from_u32s(kdata[0].permitted, kdata[1].permitted);
+    let inheritable = KernelCap::from_u32s(kdata[0].inheritable, kdata[1].inheritable);
+
+    // Get current credentials
+    let old_cred = super::current_cred();
+
+    // Validate capability changes (Linux security rules from kernel/capability.c):
+    //
+    // 1. New inheritable must not add any capabilities not in old permitted
+    //    (can only inherit what we're permitted to use)
+    if !inheritable.is_subset(&old_cred.cap_permitted) {
+        return EPERM;
+    }
+
+    // 2. New permitted must not add any capabilities not in old permitted
+    //    (can't gain capabilities we don't already have)
+    if !permitted.is_subset(&old_cred.cap_permitted) {
+        return EPERM;
+    }
+
+    // 3. New effective must be subset of new permitted
+    //    (can't use capabilities we're not permitted to use)
+    if !effective.is_subset(&permitted) {
+        return EPERM;
+    }
+
+    // Create new credentials with updated capabilities
+    let mut new_cred = old_cred;
+    new_cred.cap_effective = effective;
+    new_cred.cap_permitted = permitted;
+    new_cred.cap_inheritable = inheritable;
+    // Note: bset and ambient are not modified by capset
+
+    // Commit the new credentials
+    super::commit_creds(alloc::sync::Arc::new(new_cred));
+
+    0
+}

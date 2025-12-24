@@ -249,6 +249,8 @@ pub const SYS_GETPGID: u64 = 121;
 pub const SYS_SETFSUID: u64 = 122;
 pub const SYS_SETFSGID: u64 = 123;
 pub const SYS_GETSID: u64 = 124;
+pub const SYS_CAPGET: u64 = 125;
+pub const SYS_CAPSET: u64 = 126;
 pub const SYS_RT_SIGPENDING: u64 = 127;
 pub const SYS_MKNOD: u64 = 133;
 pub const SYS_GETPRIORITY: u64 = 140;
@@ -1390,4 +1392,32 @@ pub fn sys_lremovexattr(path: *const u8, name: *const u8) -> i64 {
 #[inline(always)]
 pub fn sys_fremovexattr(fd: i32, name: *const u8) -> i64 {
     unsafe { syscall2!(SYS_FREMOVEXATTR, fd, name) }
+}
+
+// ============================================================================
+// Capabilities (capget, capset)
+// ============================================================================
+
+use crate::types::{CapUserData, CapUserHeader};
+
+/// capget - get capabilities of a process
+///
+/// Gets the capabilities of the target process specified in the header.
+/// Use pid=0 for the calling process.
+///
+/// For version 3, datap must point to an array of 2 CapUserData structs.
+#[inline(always)]
+pub fn sys_capget(hdrp: *mut CapUserHeader, datap: *mut CapUserData) -> i64 {
+    unsafe { syscall2!(SYS_CAPGET, hdrp, datap) }
+}
+
+/// capset - set capabilities of current process
+///
+/// Sets the capabilities of the current process.
+/// The pid in the header must be 0 or the calling process's pid.
+///
+/// For version 3, datap must point to an array of 2 CapUserData structs.
+#[inline(always)]
+pub fn sys_capset(hdrp: *const CapUserHeader, datap: *const CapUserData) -> i64 {
+    unsafe { syscall2!(SYS_CAPSET, hdrp, datap) }
 }
