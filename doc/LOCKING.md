@@ -230,6 +230,25 @@ The scheduler acquires `IrqSpinlock` then `TASK_TABLE` because:
 **This is the Linux-style pattern:** protect the innermost critical section with
 an IRQ-safe lock, then acquire non-IRQ-safe locks while protected.
 
+**Detailed Safety Analysis:**
+
+```rust
+// On IrqSpinlock::lock():
+cli              // Step 1: Disable interrupts (no ISR can preempt)
+preempt_count++  // Step 2: Disable preemption (no context switch)
+acquire lock     // Step 3: Spin until acquired
+```
+
+With interrupts disabled after Step 1:
+- Timer ISR cannot fire on this CPU
+- No nested interrupt can try to acquire TASK_TABLE
+- Deadlock is impossible from the local CPU
+
+Other CPUs cannot cause deadlock because:
+- They follow the same ordering (IrqSpinlock → TASK_TABLE)
+- No CPU ever acquires TASK_TABLE then IrqSpinlock
+- TASK_TABLE is NEVER acquired from interrupt context (see Section 7.4)
+
 ---
 
 ## 3. Per-Subsystem Locking
@@ -360,6 +379,71 @@ Following Linux's `kernel/cred.c` pattern (see `include/linux/cred.h`):
 When ptrace is implemented, hk may need per-task locks like Linux's `alloc_lock`
 to serialize remote credential/mm access. The current global `TASK_TABLE` lock
 is sufficient while all task modifications are by the current task itself.
+
+#### Per-CPU Current Task Access (Lock-Free)
+
+Each CPU maintains its own `PerCpu` structure accessed via the GS segment register
+(x86-64) or SP_EL0 (aarch64). This provides lock-free access to the current task:
+
+**x86-64 Pattern:**
+```rust
+// kernel/arch/x86_64/percpu.rs
+pub fn current_tid() -> Tid {
+    // Read GS:offset directly - no lock needed
+    try_current_cpu()
+        .map(|percpu| percpu.current_tid.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+```
+
+**Why no lock is needed:**
+1. Each CPU only accesses its own PerCpu structure
+2. GS base is set once during CPU init and never changes
+3. `current_tid` is only modified during context switch (with IrqSpinlock held)
+4. Reads are always consistent (atomic load)
+
+**CurrentTask is a COPY, not a reference:**
+
+The `PerCpu.current_task` field contains a COPY of task metadata (tid, pid, cred),
+not a pointer to the Task in TASK_TABLE. This provides:
+- Fast syscall access without locking TASK_TABLE
+- Consistent snapshot during syscall execution
+- Updates happen at controlled points (context switch, commit_creds)
+
+**Update Points:**
+1. Context switch: Scheduler copies from Task in TASK_TABLE to PerCpu
+2. `commit_creds()`: Updates both PerCpu cache AND Task in TASK_TABLE
+3. `setpgid()`/`setsid()`: Updates both locations
+
+**Linux Comparison:**
+Linux uses a `current_task` per-CPU variable pointing directly to `task_struct`.
+hk uses a copied snapshot for simpler lifetime management in Rust (no raw pointers
+to task_struct across CPU boundaries).
+
+### 3.1.2 Comparison with Linux task_struct Locking
+
+Linux uses multiple per-task locks; hk uses a simpler global lock model:
+
+| Linux Lock | Purpose | hk Equivalent |
+|------------|---------|---------------|
+| `alloc_lock` | Protect mm, files, fs, comm | `TASK_TABLE` (global) |
+| `pi_lock` | Priority inheritance, state | `TASK_TABLE` (global) |
+| `sighand->siglock` | Signal handlers | `SigHand.action` (IrqSpinlock) |
+| `tasklist_lock` | Task list, parent/child | `TASK_TABLE` (global) |
+
+**Why hk's approach works:**
+1. Single lock simplifies lock ordering (no per-task lock hierarchy)
+2. All task modifications go through TASK_TABLE
+3. Current task reads use per-CPU cache (no lock needed)
+4. Acceptable for MVP; can add per-task locks for ptrace later
+
+**When hk would need per-task locks:**
+- ptrace (remote task state modification)
+- /proc filesystem (concurrent access to task state)
+- RT priority inheritance (`pi_lock` equivalent)
+
+For now, all task field modifications are by the task itself (through syscalls),
+so the global TASK_TABLE lock is sufficient.
 
 ### 3.2 Memory Management
 
@@ -1431,6 +1515,42 @@ If interrupt context needs to trigger something that requires non-IRQ-safe locks
 
 Example: `needs_reschedule` flag is set in timer ISR, actual reschedule happens
 at interrupt exit when `preempt_count == 0`.
+
+### 7.4 Complete List of Locks Never Acquired from Interrupt Context
+
+The following locks are NEVER acquired from interrupt handlers (timer ISR,
+exceptions, etc.). This table serves as the authoritative reference for the
+interrupt-safety invariant:
+
+| Lock | Location | Type | Reason |
+|------|----------|------|--------|
+| `TASK_TABLE` | kernel/task/percpu.rs | `Mutex` | Global task registry |
+| `TASK_SIGHAND` | kernel/signal/mod.rs | `Mutex` | Signal handler mapping |
+| `TASK_SIGNAL_STATE` | kernel/signal/mod.rs | `Mutex` | Per-task signal state |
+| `TASK_FS` | kernel/fs/context.rs | `Mutex` | Filesystem context |
+| `TASK_NS` | kernel/ns/mod.rs | `Mutex` | Namespace context |
+| `TASK_TLS` | kernel/task/tls.rs | `Mutex` | TLS base addresses |
+| `UID_PROCESS_COUNT` | kernel/task/mod.rs | `Mutex` | RLIMIT_NPROC tracking |
+| `FRAME_ALLOCATOR` | kernel/frame_alloc.rs | `Mutex` | Physical frame allocation |
+| Heap allocator | kernel/heap.rs | `Mutex` | Kernel heap allocation |
+| `PAGE_CACHE` | core/page_cache.rs | `Mutex` | Page cache lookup |
+| All VFS locks | kernel/fs/*.rs | `RwLock` | Inodes, dentries, mounts |
+| `OUTPUT_LOCK` | core/printk.rs | `Mutex` | Console output serialization |
+| `PRINTK` | core/printk.rs | `Mutex` | Ring buffer access |
+
+**Invariant**: Code running with interrupts enabled that acquires any of these
+locks will never be interrupted by an ISR that also tries to acquire the same lock.
+
+**Why this is safe**: ISRs in hk only perform these operations:
+- Read/write atomics (tick counts, flags, `needs_reschedule`)
+- Acquire `IrqSpinlock` (per-CPU scheduler run queue)
+- Call `wake_sleepers()` which only touches per-CPU run queue
+
+ISRs NEVER perform:
+- Memory allocation (`alloc`, `Box`, `Vec` growth) - would acquire heap Mutex
+- Task table operations - would acquire TASK_TABLE Mutex
+- VFS operations - would acquire RwLock
+- printk - would acquire OUTPUT_LOCK Mutex (potential deadlock)
 
 ---
 

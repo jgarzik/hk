@@ -13,7 +13,7 @@ VFAT_IMAGE = target/vfat.img
 VFAT_SIZE_KB = 1024
 
 .PHONY: all build debug user iso iso-debug run run-debug test check clean info help vfat-image
-.PHONY: build-arm run-arm check-arm user-arm
+.PHONY: build-arm run-arm check-arm user-arm clippy clippy-arm fmt
 
 # Default: build everything (kernel, user binaries, ISO)
 all: iso
@@ -37,6 +37,10 @@ help:
 	@echo "  make build-arm - Build ARM64 kernel"
 	@echo "  make run-arm   - Run ARM64 kernel in QEMU"
 	@echo "  make check-arm - Boot ARM64 kernel, verify tests pass"
+	@echo ""
+	@echo "  make clippy   - Run clippy linter (x86-64)"
+	@echo "  make clippy-arm - Run clippy linter (aarch64)"
+	@echo "  make fmt      - Format code"
 	@echo ""
 	@echo "  make clean    - Remove all build artifacts"
 	@echo "  make info     - Show kernel binary info"
@@ -150,3 +154,23 @@ info-arm: build-arm
 	@echo "ARM Kernel: $(KERNEL_ARM)"
 	@ls -la $(KERNEL_ARM)
 	@file $(KERNEL_ARM)
+
+# ============================================================================
+# Code quality targets
+# ============================================================================
+
+# Run clippy for x86-64 kernel (must specify target for no_std)
+clippy:
+	cargo clippy --target $(TARGET) -p hk-kernel
+
+# Run clippy for aarch64 kernel
+clippy-arm:
+	cargo clippy --target $(TARGET_ARM) -p hk-kernel
+
+# Format all code
+fmt:
+	cargo fmt
+
+# Check formatting without modifying
+fmt-check:
+	cargo fmt --check

@@ -23,11 +23,15 @@ make run            # Run x86-64 kernel
 make run-arm        # Run aarch64 kernel
 
 # Code quality (SUCCESS criteria)
-cargo clippy        # Must pass with no warnings
-cargo fmt           # Format code
+make clippy         # Clippy for x86-64 (must pass with no warnings)
+make clippy-arm     # Clippy for aarch64
+make fmt            # Format code
 ```
 
-**Success criteria for all changes**: `make check`, `make check-arm`, build clean, clippy clean.
+**IMPORTANT**: Do NOT run bare `cargo clippy` or `cargo build` - they will fail on this no_std kernel.
+Always use the Makefile targets which specify the correct `--target` flags.
+
+**Success criteria for all changes**: `make check`, `make check-arm`, `make clippy` clean.
 
 ## Workspace Structure
 
