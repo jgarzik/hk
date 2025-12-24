@@ -50,20 +50,30 @@ int munmap(void *addr, size_t length);
 | PROT_READ | 0x1 | Read permission | Implemented |
 | PROT_WRITE | 0x2 | Write permission | Implemented |
 | PROT_EXEC | 0x4 | Execute permission | Implemented |
+| PROT_SEM | 0x8 | Atomic ops support | Not implemented |
+| PROT_GROWSDOWN | 0x01000000 | mprotect: extend to growsdown VMA start | Implemented |
+| PROT_GROWSUP | 0x02000000 | mprotect: extend to growsup VMA end | Implemented (always EINVAL on x86-64/aarch64) |
 
 ## Mapping Flags (MAP_*)
 
 | Flag | Value | Description | Status |
 |------|-------|-------------|--------|
-| MAP_SHARED | 0x01 | Share with other processes | Not implemented |
+| MAP_SHARED | 0x01 | Share with other processes | Implemented |
 | MAP_PRIVATE | 0x02 | Private copy-on-write | Implemented |
 | MAP_FIXED | 0x10 | Use exact address | Implemented |
 | MAP_ANONYMOUS | 0x20 | No file backing | Implemented |
-| MAP_GROWSDOWN | 0x100 | Stack-like growth | Not implemented |
+| MAP_GROWSDOWN | 0x100 | Stack-like segment growth | Implemented |
+| MAP_DENYWRITE | 0x0800 | ETXTBSY (deprecated) | Implemented (ignored per Linux) |
+| MAP_EXECUTABLE | 0x1000 | Mark executable (deprecated) | Implemented (ignored per Linux) |
 | MAP_LOCKED | 0x2000 | Lock pages in memory | Implemented |
 | MAP_NORESERVE | 0x4000 | Don't reserve swap | Not implemented |
-| MAP_POPULATE | 0x8000 | Prefault pages | Not implemented |
+| MAP_POPULATE | 0x8000 | Prefault pages | Implemented |
+| MAP_NONBLOCK | 0x10000 | Non-blocking with MAP_POPULATE | Implemented |
+| MAP_STACK | 0x20000 | Stack allocation hint | Implemented (no-op, no THP) |
 | MAP_HUGETLB | 0x40000 | Use huge pages | Not implemented |
+| MAP_SYNC | 0x80000 | Synchronous page faults (DAX) | Not implemented |
+| MAP_FIXED_NOREPLACE | 0x100000 | MAP_FIXED without unmapping | Implemented |
+| MAP_UNINITIALIZED | 0x4000000 | Skip zero-fill (embedded only) | Not implemented |
 
 ## Implementation Architecture
 
@@ -126,7 +136,7 @@ Check write permission if is_write
     ↓
 Allocate frame (FRAME_ALLOCATOR.alloc())
     ↓
-Zero-fill for anonymous mapping
+Zero-fill (anonymous) or read from file (file-backed)
     ↓
 Map page with appropriate permissions
     ↓
@@ -215,12 +225,14 @@ int munlockall(void);
 | MCL_FUTURE | 2 | Lock all future mappings |
 | MCL_ONFAULT | 4 | Lock on fault (combine with MCL_CURRENT or MCL_FUTURE) |
 
-### VMA Lock Flags
+### VMA Flags
 
 | Flag | Value | Description |
 |------|-------|-------------|
 | VM_LOCKED | 0x2000 | Pages are locked in memory |
 | VM_LOCKONFAULT | 0x10000 | Lock pages on first fault |
+| VM_SHM | 0x20000 | System V shared memory segment |
+| VM_SHARED | 0x40000 | Shared mapping (MAP_SHARED) |
 
 ## Error Codes
 
@@ -232,27 +244,149 @@ int munlockall(void);
 | EBADF | -9 | Bad file descriptor |
 | ENODEV | -19 | File doesn't support mmap |
 
+### mprotect
+
+```c
+int mprotect(void *addr, size_t len, int prot);
+```
+
+| Argument | Description |
+|----------|-------------|
+| addr | Start address (page-aligned) |
+| len | Length in bytes (0 = no-op) |
+| prot | New protection flags (PROT_*) |
+
+**Returns**: 0 on success, -errno on failure
+
+Changes the protection flags for pages in the specified range. The range must be fully covered by existing VMAs (returns ENOMEM for unmapped regions).
+
+### msync
+
+```c
+int msync(void *addr, size_t length, int flags);
+```
+
+| Argument | Description |
+|----------|-------------|
+| addr | Start address (page-aligned) |
+| length | Length in bytes |
+| flags | Combination of MS_ASYNC, MS_SYNC, MS_INVALIDATE |
+
+| Flag | Value | Description |
+|------|-------|-------------|
+| MS_ASYNC | 1 | Schedule write but don't wait (no-op in modern kernels) |
+| MS_INVALIDATE | 2 | Invalidate cached pages |
+| MS_SYNC | 4 | Synchronously write dirty pages to disk |
+
+**Returns**: 0 on success, -errno on failure
+
+Flushes changes made to file-backed mappings back to the filesystem. MS_ASYNC and MS_SYNC are mutually exclusive.
+
+### madvise
+
+```c
+int madvise(void *addr, size_t length, int advice);
+```
+
+| Argument | Description |
+|----------|-------------|
+| addr | Start address (page-aligned) |
+| length | Length in bytes |
+| advice | Type of advice (MADV_*) |
+
+| Flag | Value | Description | Status |
+|------|-------|-------------|--------|
+| MADV_NORMAL | 0 | No special treatment (default) | Implemented |
+| MADV_RANDOM | 1 | Expect random page references | Implemented |
+| MADV_SEQUENTIAL | 2 | Expect sequential page references | Implemented |
+| MADV_WILLNEED | 3 | Will need these pages soon (prefault) | Implemented |
+| MADV_DONTNEED | 4 | Don't need these pages (zap and free) | Implemented |
+| MADV_FREE | 8 | Mark pages as lazily freeable | Implemented (treated as DONTNEED) |
+| MADV_DONTFORK | 10 | Don't copy this VMA on fork | Implemented |
+| MADV_DOFORK | 11 | Do copy this VMA on fork | Implemented |
+| MADV_DONTDUMP | 16 | Don't include in core dumps | Implemented |
+| MADV_DODUMP | 17 | Include in core dumps | Implemented |
+
+**Returns**: 0 on success, -errno on failure
+
+Advises the kernel about how to handle paging I/O in the specified address range. MADV_DONTNEED is particularly important as it's widely used by allocators to release memory.
+
+### mremap
+
+```c
+void *mremap(void *old_addr, size_t old_len, size_t new_len,
+             int flags, ... /* void *new_addr */);
+```
+
+| Argument | Description |
+|----------|-------------|
+| old_addr | Start address of existing mapping (page-aligned) |
+| old_len | Old length of mapping in bytes |
+| new_len | New length of mapping in bytes |
+| flags | MREMAP_* flags |
+| new_addr | New address (only used with MREMAP_FIXED) |
+
+**Returns**: New address on success, -errno on failure
+
+| Flag | Value | Description | Status |
+|------|-------|-------------|--------|
+| MREMAP_MAYMOVE | 0x01 | Allow kernel to move mapping if can't resize in-place | Implemented |
+| MREMAP_FIXED | 0x02 | Move to exact new_addr (implies MAYMOVE) | Implemented |
+| MREMAP_DONTUNMAP | 0x04 | Keep original mapping after move | Implemented |
+
+## Missing Syscalls
+
+| Syscall | Priority | Description |
+|---------|----------|-------------|
+| mincore | Low | Query page residency status |
+
+## Implementation Notes
+
+### VMA Merging (Tier 3 Optimization)
+
+Adjacent VMAs are automatically merged when they have compatible attributes. Two VMAs can merge if they have identical:
+- **Protection flags** (prot) - PROT_READ, PROT_WRITE, PROT_EXEC
+- **VMA flags** (flags) - MAP_SHARED/PRIVATE, VM_LOCKED, etc.
+- **File backing** - Both anonymous or same file with contiguous offsets
+
+Merging occurs after:
+- `mmap()` - New mappings may merge with adjacent VMAs
+- `mprotect()` - Protection changes may enable merging
+- `brk()` - Heap expansion may merge with adjacent VMAs
+- `mlock()/mlock2()` - Flag changes may enable merging
+- `madvise()` - Hint changes may enable merging
+- `mremap()` - Moved/resized mappings may merge
+
+This optimization reduces memory overhead (fewer VMA entries) and improves lookup performance.
+
+Current limitations in the implementation:
+
+1. **No VMA splitting** - mprotect on a partial VMA region updates the entire VMA's protection; a full implementation would split the VMA.
+
 ## Future Work
 
-### Tier 1: File-Backed Mappings
-- Read file contents on demand fault
-- Handle truncated files (SIGBUS)
-- mmap() with actual file descriptors
+### Tier 1: Core Functionality (DONE)
+- ~~**mprotect()** - Change protection on existing mappings~~ ✓
+- ~~**MAP_SHARED** - Shared memory between processes~~ ✓
+- ~~**File-backed mapping I/O** - Read file contents on demand fault~~ ✓
+- ~~**MAP_GROWSDOWN** - Stack-like growth for guard pages~~ ✓
+- ~~**PROT_GROWSDOWN/PROT_GROWSUP** - mprotect growth extensions~~ ✓
+- ~~**MAP_POPULATE** - Prefault pages to avoid later faults~~ ✓
+- ~~**MAP_NONBLOCK** - Skip populate when combined with MAP_POPULATE~~ ✓
+- ~~**MAP_STACK** - Stack allocation hint (no-op, no THP)~~ ✓
 
-### Tier 2: Shared Mappings (MAP_SHARED)
-- Multiple processes share same physical pages
-- Write visibility between processes
-- msync() for file writeback
+### Tier 2: Common Features (DONE)
+- ~~**madvise()** - Memory hints (MADV_DONTNEED for memory release)~~ ✓
+- ~~**mremap()** - Resize/move mappings (used by realloc)~~ ✓
+- ~~**msync()** - Sync file-backed mappings to disk~~ ✓
+- ~~**MAP_FIXED_NOREPLACE** - Safer MAP_FIXED that fails on overlap~~ ✓
 
-### Tier 3: Memory Protection
-- mprotect() syscall
-- Change protection on existing mappings
+### Tier 3: Optimization (DONE)
+- ~~**VMA merging** - Merge adjacent compatible VMAs~~ ✓
 
 ### Tier 4: Advanced Features
-- mremap() - Resize/move mappings
-- madvise() - Memory usage hints
-- MAP_POPULATE - Prefault pages
-- MAP_HUGETLB - Huge page support
+- **MAP_HUGETLB** - Huge page support (requires arch TLB support)
+- **mincore()** - Query which pages are resident
 
 ## File Locations
 

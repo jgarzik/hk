@@ -148,6 +148,9 @@ pub extern "C" fn _start(multiboot_info: u64) -> ! {
     // Messages before console attach are buffered
     printkln!("hk kernel starting...");
 
+    // Initialize VGA text console for early output
+    arch::x86_64::vgacon::init_vgacon();
+
     // Initialize serial console (through TTY layer)
     tty::serial::init_serial_console();
 
@@ -698,7 +701,7 @@ fn kmain() -> ! {
     // Phase 6: Initramfs Unpacking
     // ========================================================================
     let initramfs_data = CurrentArch::get_initramfs();
-    let root_dentry = fs::MOUNT_NS
+    let root_dentry = fs::init_mnt_ns()
         .get_root_dentry()
         .expect("VFS root not initialized");
     match fs::unpack_cpio(initramfs_data, &root_dentry) {
@@ -887,7 +890,7 @@ fn kmain() -> ! {
         stack_base.unwrap() + INIT_KERNEL_STACK_SIZE as u64
     };
 
-    printkln!("BOOT_COMPLETE");
+    printkln!("KERNEL_READY");
 
     // Run locking infrastructure self-tests
     crate::waitqueue::run_locking_tests();

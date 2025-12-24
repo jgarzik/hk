@@ -10,9 +10,13 @@ use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
 use super::{
-    MAP_ANONYMOUS, MAP_FIXED, MAP_LOCKED, MAP_PRIVATE, MAP_SHARED, PAGE_SIZE, PROT_READ,
-    PROT_WRITE, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, Vma, create_default_mm, get_task_mm,
-    init_task_mm,
+    MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE, MADV_NORMAL,
+    MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE,
+    MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
+    MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC, MS_INVALIDATE, MS_SYNC, PAGE_SIZE,
+    PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, VM_DONTCOPY, VM_DONTDUMP, VM_GROWSDOWN,
+    VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_RAND_READ, VM_SEQ_READ, VM_SHARED, Vma,
+    create_default_mm, get_task_mm, init_task_mm,
 };
 
 // Error codes (negative errno)
@@ -21,6 +25,10 @@ const EINVAL: i64 = -22;
 const ENOMEM: i64 = -12;
 const EBADF: i64 = -9;
 const EPERM: i64 = -1;
+const EEXIST: i64 = -17;
+const EBUSY: i64 = -16;
+const EIO: i64 = -5;
+const EFAULT: i64 = -14;
 
 // ============================================================================
 // mlock flags (user-visible)
@@ -68,17 +76,13 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
 
     let is_anonymous = flags & MAP_ANONYMOUS != 0;
     let is_fixed = flags & MAP_FIXED != 0;
+    let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
     let is_private = flags & MAP_PRIVATE != 0;
     let is_shared = flags & MAP_SHARED != 0;
 
     // Must specify exactly one of MAP_PRIVATE or MAP_SHARED
     if is_private == is_shared {
         return EINVAL;
-    }
-
-    // For MVP: only support private mappings
-    if is_shared {
-        return EINVAL; // MAP_SHARED not yet implemented
     }
 
     // Get file if not anonymous
@@ -114,13 +118,19 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     let mut mm_guard = mm.lock();
 
     // Determine mapping address
-    let map_addr = if is_fixed {
-        // MAP_FIXED: use exact address
+    let map_addr = if is_fixed || is_fixed_noreplace {
+        // MAP_FIXED or MAP_FIXED_NOREPLACE: use exact address
         if addr & (PAGE_SIZE - 1) != 0 {
             return EINVAL; // Must be page-aligned
         }
-        // Remove any existing mappings in range
-        mm_guard.remove_range(addr, addr + length);
+        // MAP_FIXED_NOREPLACE: fail if address range overlaps existing mapping
+        if is_fixed_noreplace && mm_guard.overlaps(addr, addr + length) {
+            return EEXIST;
+        }
+        // MAP_FIXED: remove any existing mappings in range
+        if is_fixed {
+            mm_guard.remove_range(addr, addr + length);
+        }
         addr
     } else if addr != 0 {
         // Hint address - try to use it, fall back to search
@@ -156,6 +166,17 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     } else {
         Vma::new(map_addr, map_addr + length, prot, flags | MAP_ANONYMOUS)
     };
+
+    // Set VM_SHARED for shared mappings
+    if is_shared {
+        vma.flags |= VM_SHARED;
+    }
+
+    // Set VM_GROWSDOWN for stack-like mappings that grow downward
+    // Linux: calc_vm_flag_bits() translates MAP_GROWSDOWN to VM_GROWSDOWN
+    if flags & MAP_GROWSDOWN != 0 {
+        vma.flags |= VM_GROWSDOWN;
+    }
 
     // Handle MAP_LOCKED flag - lock pages in memory
     // Linux: do_mmap() checks can_do_mlock() and mlock_future_ok()
@@ -207,14 +228,23 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         mm_guard.add_locked_vm(pages);
     }
 
-    mm_guard.insert_vma(vma);
+    let idx = mm_guard.insert_vma(vma);
 
     // Update total_vm for RLIMIT_AS tracking
     mm_guard.add_total_vm(length / PAGE_SIZE);
 
-    // Populate pages if locked (MAP_LOCKED or MCL_FUTURE without ONFAULT)
-    // Linux: do_mmap() sets *populate = len if VM_LOCKED is set
-    let should_populate = is_map_locked || (def_flags != 0 && (def_flags & VM_LOCKONFAULT == 0));
+    // Try to merge with adjacent VMAs (VMA merging optimization)
+    mm_guard.merge_adjacent(idx);
+
+    // Populate pages if:
+    // 1. MAP_LOCKED is set, or
+    // 2. MCL_FUTURE was set via mlockall (def_flags without ONFAULT), or
+    // 3. MAP_POPULATE is set without MAP_NONBLOCK
+    // Linux: do_mmap() sets *populate = len if VM_LOCKED or (MAP_POPULATE && !MAP_NONBLOCK)
+    let should_populate_for_map_populate = (flags & (MAP_POPULATE | MAP_NONBLOCK)) == MAP_POPULATE;
+    let should_populate = is_map_locked
+        || (def_flags != 0 && (def_flags & VM_LOCKONFAULT == 0))
+        || should_populate_for_map_populate;
 
     // Release lock before potential page faults
     drop(mm_guard);
@@ -540,7 +570,14 @@ pub fn sys_brk(brk: u64) -> i64 {
                 PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS,
             );
-            mm_guard.insert_vma(heap_vma);
+            let idx = mm_guard.insert_vma(heap_vma);
+            // Try to merge with adjacent VMAs (VMA merging optimization)
+            mm_guard.merge_adjacent(idx);
+        } else {
+            // Heap VMA was extended - try merging with next VMA
+            if let Some(idx) = mm_guard.find_vma_index(start_brk_aligned) {
+                mm_guard.merge_adjacent(idx);
+            }
         }
 
         // Update total_vm for RLIMIT_AS tracking
@@ -577,25 +614,206 @@ fn can_do_mlock() -> bool {
     crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK) > 0
 }
 
-/// Populate pages in a range by triggering demand paging.
+/// Populate pages in a range by prefaulting them into memory
 ///
-/// This is the hk equivalent of Linux's mm_populate().
-/// It walks through the address range and reads each page to trigger
-/// the page fault handler, which will allocate and map the pages.
-/// Populate pages by faulting them into memory
+/// This is the hk equivalent of Linux's mm_populate(). It walks through
+/// the address range page by page, allocating physical frames and mapping
+/// them into the process's address space.
 ///
-/// This function is a no-op for now because:
-/// 1. The kernel has no swap, so pages will be faulted in on demand anyway
-/// 2. Direct user memory access from kernel context requires proper uaccess
-///    handling and page fault tolerance that isn't fully implemented yet
-///
-/// TODO: Implement proper page population using get_user_pages() or similar
-/// when swap support is added.
-#[allow(unused_variables)]
+/// Used by:
+/// - MAP_POPULATE to prefault pages after mmap
+/// - MAP_LOCKED to lock pages in memory
+/// - mlock/mlockall to lock existing mappings
 fn populate_range(start: u64, len: u64) {
-    // Currently a no-op - pages will be demand-paged on first access
-    // from userspace. When swap is implemented, this should prefault
-    // the pages to lock them in memory.
+    if len == 0 {
+        return;
+    }
+
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return,
+    };
+
+    let end = start.saturating_add(len);
+    let mut addr = start & !(PAGE_SIZE - 1); // Page align down
+
+    while addr < end {
+        // Lock mm for VMA lookup
+        let mm_guard = mm.lock();
+
+        let vma = match mm_guard.find_vma(addr) {
+            Some(v) => v,
+            None => {
+                // No VMA at this address, skip to next page
+                drop(mm_guard);
+                addr += PAGE_SIZE;
+                continue;
+            }
+        };
+
+        // Skip if not accessible (PROT_NONE)
+        if vma.prot == super::PROT_NONE {
+            drop(mm_guard);
+            addr += PAGE_SIZE;
+            continue;
+        }
+
+        // Clone VMA info we need before dropping lock
+        let vma_prot = vma.prot;
+        let vma_is_anonymous = vma.is_anonymous();
+        let vma_file = vma.file.clone();
+        let vma_start = vma.start;
+        let vma_offset = vma.offset;
+        let vma_end = vma.end;
+        drop(mm_guard);
+
+        // Populate this page
+        populate_page(
+            addr,
+            vma_prot,
+            vma_is_anonymous,
+            vma_file,
+            vma_start,
+            vma_offset,
+        );
+
+        addr += PAGE_SIZE;
+
+        // Stop at VMA end - next iteration will find next VMA if any
+        if addr >= vma_end {
+            continue;
+        }
+    }
+}
+
+/// Populate a single page by allocating a frame and mapping it
+fn populate_page(
+    addr: u64,
+    prot: u32,
+    is_anonymous: bool,
+    file: Option<Arc<File>>,
+    vma_start: u64,
+    vma_offset: u64,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::FRAME_ALLOCATOR;
+        use crate::arch::x86_64::paging::{
+            PAGE_NO_EXECUTE, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE, X86_64PageTable,
+        };
+
+        let cr3: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+        }
+
+        // Check if already mapped
+        if X86_64PageTable::translate_with_root(cr3, addr).is_some() {
+            return; // Already mapped
+        }
+
+        // Allocate frame
+        let frame = match FRAME_ALLOCATOR.alloc() {
+            Some(f) => f,
+            None => return, // OOM, silently fail (Linux behavior for populate)
+        };
+
+        // Initialize page contents
+        if is_anonymous {
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            }
+        } else if let Some(f) = file {
+            // File-backed: read from file
+            let file_offset = vma_offset + (addr - vma_start);
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            }
+            let buf =
+                unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE as usize) };
+            let _ = f.pread(buf, file_offset);
+        } else {
+            // No file, zero-fill
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            }
+        }
+
+        // Build page flags
+        let mut flags = PAGE_PRESENT | PAGE_USER;
+        if prot & PROT_WRITE != 0 {
+            flags |= PAGE_WRITABLE;
+        }
+        if prot & super::PROT_EXEC == 0 {
+            flags |= PAGE_NO_EXECUTE;
+        }
+
+        // Map the page using map_user_page from interrupts module
+        if crate::arch::x86_64::interrupts::map_user_page(cr3, addr, frame, flags).is_err() {
+            FRAME_ALLOCATOR.free(frame);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::FRAME_ALLOCATOR;
+        use crate::arch::aarch64::paging::{
+            AF, AP_EL0_RO, AP_EL0_RW, ATTR_IDX_NORMAL, Aarch64PageTable, PXN, SH_INNER, UXN,
+        };
+
+        let ttbr0: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack));
+        }
+        let pt_phys = ttbr0 & !0xFFF;
+
+        // Check if already mapped
+        if Aarch64PageTable::translate_with_root(pt_phys, addr).is_some() {
+            return; // Already mapped
+        }
+
+        // Allocate frame
+        let frame = match FRAME_ALLOCATOR.alloc() {
+            Some(f) => f,
+            None => return, // OOM, silently fail
+        };
+
+        // Initialize page contents
+        if is_anonymous {
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            }
+        } else if let Some(f) = file {
+            let file_offset = vma_offset + (addr - vma_start);
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            }
+            let buf =
+                unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE as usize) };
+            let _ = f.pread(buf, file_offset);
+        } else {
+            unsafe {
+                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            }
+        }
+
+        // Build page attributes
+        let mut attrs = AF | SH_INNER | ATTR_IDX_NORMAL;
+        if prot & PROT_WRITE != 0 {
+            attrs |= AP_EL0_RW;
+        } else {
+            attrs |= AP_EL0_RO;
+        }
+        if prot & super::PROT_EXEC == 0 {
+            attrs |= PXN | UXN;
+        }
+
+        // Map the page
+        if crate::arch::aarch64::exceptions::map_user_page(pt_phys, addr, frame, attrs).is_err() {
+            FRAME_ALLOCATOR.free(frame);
+        }
+    }
 }
 
 /// mlock syscall - Lock pages in memory
@@ -704,7 +922,9 @@ fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
     }
 
     // Second pass: update VMA flags now that we've passed the limit check
-    for vma in mm_guard.iter_mut() {
+    // Collect indices of modified VMAs for merging
+    let mut modified_indices: Vec<usize> = Vec::new();
+    for (idx, vma) in mm_guard.iter_mut().enumerate() {
         // Check for overlap
         if vma.end <= start_aligned || vma.start >= end_aligned {
             continue; // No overlap
@@ -712,10 +932,17 @@ fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
 
         // Set the lock flags (clear old lock flags first, then set new ones)
         vma.flags = (vma.flags & !VM_LOCKED_MASK) | vm_flags;
+        modified_indices.push(idx);
     }
 
     // Update locked_vm counter after the loop
     mm_guard.add_locked_vm(pages_to_add);
+
+    // Try to merge modified VMAs with adjacent VMAs (VMA merging optimization)
+    // Process in reverse order to maintain valid indices after removals
+    for &idx in modified_indices.iter().rev() {
+        mm_guard.merge_adjacent(idx);
+    }
 
     // Release lock before populating (to avoid holding lock during page faults)
     drop(mm_guard);
@@ -924,4 +1151,795 @@ pub fn sys_munlockall() -> i64 {
     mm_guard.reset_locked_vm();
 
     0
+}
+
+// ============================================================================
+// mprotect syscall
+// ============================================================================
+
+/// mprotect syscall - Change protection of memory region
+///
+/// Changes the protection of the pages in the specified address range.
+///
+/// # Arguments
+/// * `addr` - Start address (must be page-aligned)
+/// * `len` - Length of region in bytes
+/// * `prot` - New protection flags (PROT_READ, PROT_WRITE, PROT_EXEC).
+///   May include PROT_GROWSDOWN/PROT_GROWSUP to extend range.
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
+    // Extract and strip grow flags (Linux behavior: mm/mprotect.c)
+    let grows = prot & (PROT_GROWSDOWN | PROT_GROWSUP);
+    let prot = prot & !(PROT_GROWSDOWN | PROT_GROWSUP);
+
+    // Can't specify both PROT_GROWSDOWN and PROT_GROWSUP
+    if grows == (PROT_GROWSDOWN | PROT_GROWSUP) {
+        return EINVAL;
+    }
+
+    // Zero length is a no-op (success per Linux behavior)
+    if len == 0 {
+        return 0;
+    }
+
+    // Validate alignment
+    if addr & (PAGE_SIZE - 1) != 0 {
+        return EINVAL;
+    }
+
+    // Round up length to page boundary
+    let len_aligned = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let mut end = match addr.checked_add(len_aligned) {
+        Some(e) => e,
+        None => return EINVAL, // Overflow
+    };
+
+    // Validate protection flags (only PROT_READ, PROT_WRITE, PROT_EXEC are valid)
+    if prot & !(PROT_READ | PROT_WRITE | super::PROT_EXEC) != 0 {
+        return EINVAL;
+    }
+
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return EINVAL, // No mm
+    };
+
+    let mut mm_guard = mm.lock();
+
+    // Handle PROT_GROWSDOWN - extend protection change to VMA start
+    // Linux: mm/mprotect.c do_mprotect_pkey() lines 807-865
+    let mut start = addr;
+
+    if grows & PROT_GROWSDOWN != 0 {
+        // Find VMA containing start address
+        if let Some(vma) = mm_guard.find_vma(start) {
+            // VMA must contain the address (not just be after it)
+            if vma.start > start || start >= vma.end {
+                return ENOMEM;
+            }
+            // VMA must have VM_GROWSDOWN flag
+            if !vma.is_growsdown() {
+                return EINVAL;
+            }
+            // Extend start to VMA start
+            start = vma.start;
+        } else {
+            return ENOMEM;
+        }
+    }
+
+    // Handle PROT_GROWSUP - always fails on x86-64/aarch64
+    // Linux: mm/mprotect.c - checks for VM_GROWSUP which never exists on these architectures
+    if grows & PROT_GROWSUP != 0 {
+        // Find VMA containing the end of range
+        let check_addr = end.saturating_sub(1);
+        if let Some(vma) = mm_guard.find_vma(check_addr) {
+            if vma.start > check_addr || check_addr >= vma.end {
+                return ENOMEM;
+            }
+            // VM_GROWSUP is never set on x86-64/aarch64 (only parisc has upward-growing stacks)
+            // So this always fails with EINVAL, matching Linux behavior
+            return EINVAL;
+        } else {
+            return ENOMEM;
+        }
+    }
+
+    // Recalculate end based on potentially adjusted start
+    if start != addr {
+        end = start.saturating_add(end.saturating_sub(addr));
+    }
+
+    // Collect VMAs that need updating and validate the range is fully mapped
+    let mut vmas_to_update: Vec<(u64, u64, u32)> = Vec::new();
+    let mut covered_start = start;
+
+    for vma in mm_guard.iter() {
+        // Skip VMAs that don't overlap with our range
+        if vma.end <= start || vma.start >= end {
+            continue;
+        }
+
+        // Check for gaps - the range must be fully mapped
+        if vma.start > covered_start {
+            // Gap found - return ENOMEM (Linux behavior for unmapped region)
+            return ENOMEM;
+        }
+
+        // Calculate the portion of this VMA that falls within our range
+        let update_start = vma.start.max(start);
+        let update_end = vma.end.min(end);
+
+        // Check if we're trying to write-protect a read-only file mapping
+        // (simplified check - full implementation would check file permissions)
+        if prot & PROT_WRITE != 0 && !vma.is_anonymous() && vma.is_shared() {
+            // For shared file mappings, we'd need to check file write permissions
+            // For now, we allow it (the page fault handler will handle actual access)
+        }
+
+        vmas_to_update.push((update_start, update_end, vma.prot));
+        covered_start = vma.end;
+    }
+
+    // Check if we covered the entire range
+    if covered_start < end {
+        return ENOMEM; // Range not fully mapped
+    }
+
+    // Now update the VMA protection flags
+    // Collect indices of modified VMAs for merging
+    let mut modified_indices: Vec<usize> = Vec::new();
+    for (idx, vma) in mm_guard.iter_mut().enumerate() {
+        if vma.end <= start || vma.start >= end {
+            continue;
+        }
+
+        // Update the protection flags for this VMA
+        // Note: This is simplified - a full implementation would handle
+        // VMA splitting if the mprotect range doesn't align with VMA boundaries
+        vma.prot = prot;
+        modified_indices.push(idx);
+    }
+
+    // Try to merge modified VMAs with adjacent VMAs (VMA merging optimization)
+    // Process in reverse order to maintain valid indices after removals
+    for &idx in modified_indices.iter().rev() {
+        mm_guard.merge_adjacent(idx);
+    }
+
+    // Get page table root for page table updates
+    #[cfg(target_arch = "x86_64")]
+    let pt_root: u64 = {
+        let cr3: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+        }
+        cr3
+    };
+
+    #[cfg(target_arch = "aarch64")]
+    let pt_root: u64 = {
+        let ttbr0: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack));
+        }
+        ttbr0 & !0xFFF
+    };
+
+    // Release mm lock before doing page table updates
+    drop(mm_guard);
+
+    // Update page table entries for all affected pages
+    let writable = prot & PROT_WRITE != 0;
+    let executable = prot & super::PROT_EXEC != 0;
+
+    for (update_start, update_end, _old_prot) in vmas_to_update {
+        let mut page = update_start;
+        while page < update_end {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use crate::arch::x86_64::paging::X86_64PageTable;
+                // Only update if the page is actually mapped
+                X86_64PageTable::update_page_protection(pt_root, page, writable, executable);
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                use crate::arch::aarch64::paging::Aarch64PageTable;
+                // Only update if the page is actually mapped
+                Aarch64PageTable::update_page_protection(pt_root, page, writable, executable);
+            }
+
+            page += PAGE_SIZE;
+        }
+    }
+
+    0
+}
+
+// ============================================================================
+// msync syscall
+// ============================================================================
+
+/// msync syscall - Synchronize a file with a memory map
+///
+/// Flushes changes made to the in-core copy of a file-backed mapping back
+/// to the filesystem.
+///
+/// # Arguments
+/// * `addr` - Start address (must be page-aligned)
+/// * `length` - Length of region in bytes
+/// * `flags` - Combination of MS_ASYNC, MS_SYNC, MS_INVALIDATE
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+pub fn sys_msync(addr: u64, length: u64, flags: i32) -> i64 {
+    // Validate flags - must have valid combination
+    let valid_flags = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
+    if flags & !valid_flags != 0 {
+        return EINVAL;
+    }
+
+    // MS_ASYNC and MS_SYNC are mutually exclusive
+    if (flags & MS_ASYNC != 0) && (flags & MS_SYNC != 0) {
+        return EINVAL;
+    }
+
+    // Validate alignment
+    if addr & (PAGE_SIZE - 1) != 0 {
+        return EINVAL;
+    }
+
+    // Zero length: success (no-op)
+    if length == 0 {
+        return 0;
+    }
+
+    // Round up length to page boundary
+    let length = (length + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return ENOMEM,
+    };
+
+    let mm_guard = mm.lock();
+    let end = addr.saturating_add(length);
+
+    // Walk VMAs in range
+    for vma in mm_guard.iter() {
+        // Skip VMAs outside our range
+        if vma.end <= addr || vma.start >= end {
+            continue;
+        }
+
+        // MS_INVALIDATE on locked pages returns EBUSY (Linux behavior)
+        if flags & MS_INVALIDATE != 0 && vma.is_locked() {
+            return EBUSY;
+        }
+
+        // MS_SYNC on shared file-backed mapping: sync to disk
+        if flags & MS_SYNC != 0
+            && vma.is_shared()
+            && let Some(ref file) = vma.file
+        {
+            // Sync the file - this uses fsync for now
+            // A more sophisticated implementation would only sync the affected range
+            if file.f_op.fsync(file).is_err() {
+                return EIO;
+            }
+        }
+        // MS_ASYNC: schedule async write but don't wait
+        // In modern Linux this is essentially a no-op as dirty pages are
+        // already scheduled for writeback. We do nothing here.
+    }
+
+    0
+}
+
+// ============================================================================
+// madvise syscall
+// ============================================================================
+
+/// madvise syscall - Give advice about use of memory
+///
+/// Advises the kernel about how to handle paging I/O in the specified
+/// address range.
+///
+/// # Arguments
+/// * `addr` - Start address (must be page-aligned)
+/// * `length` - Length of region in bytes
+/// * `advice` - Type of advice (MADV_*)
+///
+/// # Returns
+/// 0 on success, negative errno on failure
+pub fn sys_madvise(addr: u64, length: u64, advice: i32) -> i64 {
+    // Validate alignment
+    if addr & (PAGE_SIZE - 1) != 0 {
+        return EINVAL;
+    }
+
+    // Round up length to page boundary
+    let length = (length + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    // Zero length: no-op success
+    if length == 0 {
+        return 0;
+    }
+
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return ENOMEM,
+    };
+
+    let end = addr.saturating_add(length);
+
+    match advice {
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_DONTFORK | MADV_DOFORK
+        | MADV_DONTDUMP | MADV_DODUMP => {
+            // These advices just update VMA flags
+            madvise_update_vma_flags(&mm, addr, end, advice)
+        }
+        MADV_WILLNEED => {
+            // Prefault pages (reuse populate_range)
+            populate_range(addr, length);
+            0
+        }
+        MADV_DONTNEED => {
+            // Zap pages - unmap and free
+            madvise_dontneed(&mm, addr, end)
+        }
+        MADV_FREE => {
+            // Mark pages as lazily freeable
+            // Simplified: treat as DONTNEED (kernel frees pages immediately)
+            madvise_dontneed(&mm, addr, end)
+        }
+        _ => EINVAL,
+    }
+}
+
+/// Update VMA flags based on madvise advice
+fn madvise_update_vma_flags(
+    mm: &alloc::sync::Arc<spin::Mutex<super::MmStruct>>,
+    start: u64,
+    end: u64,
+    advice: i32,
+) -> i64 {
+    let mut mm_guard = mm.lock();
+
+    // Walk VMAs and update flags, collect indices for merging
+    let mut modified_indices: Vec<usize> = Vec::new();
+    for (idx, vma) in mm_guard.iter_mut().enumerate() {
+        // Skip VMAs outside our range
+        if vma.end <= start || vma.start >= end {
+            continue;
+        }
+
+        match advice {
+            MADV_NORMAL => {
+                // Clear read hints
+                vma.flags &= !(VM_RAND_READ | VM_SEQ_READ);
+            }
+            MADV_RANDOM => {
+                // Set random access hint
+                vma.flags = (vma.flags & !VM_SEQ_READ) | VM_RAND_READ;
+            }
+            MADV_SEQUENTIAL => {
+                // Set sequential access hint
+                vma.flags = (vma.flags & !VM_RAND_READ) | VM_SEQ_READ;
+            }
+            MADV_DONTFORK => {
+                // Set don't copy on fork
+                vma.flags |= VM_DONTCOPY;
+            }
+            MADV_DOFORK => {
+                // Clear don't copy on fork
+                vma.flags &= !VM_DONTCOPY;
+            }
+            MADV_DONTDUMP => {
+                // Set don't include in core dumps
+                vma.flags |= VM_DONTDUMP;
+            }
+            MADV_DODUMP => {
+                // Clear don't include in core dumps
+                vma.flags &= !VM_DONTDUMP;
+            }
+            _ => {}
+        }
+        modified_indices.push(idx);
+    }
+
+    // Try to merge modified VMAs with adjacent VMAs (VMA merging optimization)
+    // Process in reverse order to maintain valid indices after removals
+    for &idx in modified_indices.iter().rev() {
+        mm_guard.merge_adjacent(idx);
+    }
+
+    0
+}
+
+/// Handle MADV_DONTNEED - zap pages in range
+fn madvise_dontneed(
+    mm: &alloc::sync::Arc<spin::Mutex<super::MmStruct>>,
+    start: u64,
+    end: u64,
+) -> i64 {
+    {
+        let mm_guard = mm.lock();
+
+        // Check for locked VMAs - can't DONTNEED locked pages
+        for vma in mm_guard.iter() {
+            if vma.end <= start || vma.start >= end {
+                continue;
+            }
+            if vma.is_locked() {
+                return EINVAL;
+            }
+        }
+    }
+
+    // Unmap pages in range (reuse existing infrastructure)
+    unmap_pages_range(start, end);
+
+    0
+}
+
+// ============================================================================
+// mremap syscall
+// ============================================================================
+
+/// mremap syscall - Remap a virtual memory region
+///
+/// Resizes and/or moves an existing memory mapping. This is used by realloc()
+/// for large allocations.
+///
+/// # Arguments
+/// * `old_addr` - Start address of existing mapping (must be page-aligned)
+/// * `old_len` - Old length of mapping in bytes
+/// * `new_len` - New length of mapping in bytes
+/// * `flags` - MREMAP_* flags
+/// * `new_addr` - New address (only used with MREMAP_FIXED)
+///
+/// # Returns
+/// New address on success, negative errno on failure
+pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_addr: u64) -> i64 {
+    // Validate flags
+    let may_move = flags & MREMAP_MAYMOVE != 0;
+    let fixed = flags & MREMAP_FIXED != 0;
+    let dontunmap = flags & MREMAP_DONTUNMAP != 0;
+
+    // Check for invalid flag combinations
+    let valid_flags = MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP;
+    if flags & !valid_flags != 0 {
+        return EINVAL;
+    }
+
+    // MREMAP_FIXED implies MREMAP_MAYMOVE (Linux behavior)
+    if fixed && !may_move {
+        return EINVAL;
+    }
+
+    // MREMAP_DONTUNMAP requires MREMAP_MAYMOVE
+    if dontunmap && !may_move {
+        return EINVAL;
+    }
+
+    // Validate address alignment
+    if old_addr & (PAGE_SIZE - 1) != 0 {
+        return EINVAL;
+    }
+
+    // new_len must be > 0
+    if new_len == 0 {
+        return EINVAL;
+    }
+
+    // Round lengths to page boundaries
+    let old_len = (old_len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let new_len_aligned = (new_len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    // old_len == 0 is special: creates new mapping at old_addr (deprecated, return EINVAL)
+    if old_len == 0 {
+        return EINVAL;
+    }
+
+    // Check for overflow
+    if old_addr.checked_add(old_len).is_none() {
+        return EINVAL;
+    }
+
+    // MREMAP_FIXED: validate new_addr
+    if fixed {
+        if new_addr & (PAGE_SIZE - 1) != 0 {
+            return EINVAL;
+        }
+        // new_addr must not overlap with old range (unless DONTUNMAP)
+        if !dontunmap {
+            let new_end = match new_addr.checked_add(new_len_aligned) {
+                Some(e) => e,
+                None => return EINVAL,
+            };
+            let old_end = old_addr + old_len;
+            // Check for overlap
+            if !(new_end <= old_addr || new_addr >= old_end) {
+                return EINVAL;
+            }
+        }
+    }
+
+    // MREMAP_DONTUNMAP requires old_len == new_len
+    if dontunmap && old_len != new_len_aligned {
+        return EINVAL;
+    }
+
+    let tid = current_tid();
+    let mm = match get_task_mm(tid) {
+        Some(mm) => mm,
+        None => return EFAULT,
+    };
+
+    let mut mm_guard = mm.lock();
+
+    // Find VMA containing old_addr
+    let vma_idx = match mm_guard.find_vma_exact(old_addr) {
+        Some(idx) => idx,
+        None => {
+            // Try find_vma_index in case old_addr is not exactly at VMA start
+            // Linux allows mremap on any VMA that contains old_addr
+            match mm_guard.find_vma_index(old_addr) {
+                Some(idx) => {
+                    // Check if old_addr is at VMA start
+                    if let Some(vma) = mm_guard.get_vma(idx)
+                        && vma.start != old_addr
+                    {
+                        // For simplicity, require old_addr to be at VMA start
+                        return EFAULT;
+                    }
+                    idx
+                }
+                None => return EFAULT,
+            }
+        }
+    };
+
+    // Validate the VMA covers the requested range
+    {
+        let vma = match mm_guard.get_vma(vma_idx) {
+            Some(v) => v,
+            None => return EFAULT,
+        };
+
+        // Check that the VMA covers [old_addr, old_addr + old_len)
+        if vma.end < old_addr + old_len {
+            return EFAULT;
+        }
+    }
+
+    // Handle shrink: new_len < old_len
+    if new_len_aligned < old_len {
+        // Unmap the tail portion
+        let unmap_start = old_addr + new_len_aligned;
+        let unmap_end = old_addr + old_len;
+
+        // Update VMA end
+        if let Some(vma) = mm_guard.get_vma_mut(vma_idx) {
+            vma.end = old_addr + new_len_aligned;
+        }
+
+        // Update total_vm
+        let shrink_pages = (old_len - new_len_aligned) / PAGE_SIZE;
+        mm_guard.sub_total_vm(shrink_pages);
+
+        // Release lock before page table operations
+        drop(mm_guard);
+
+        // Unmap the pages
+        unmap_pages_range(unmap_start, unmap_end);
+
+        return old_addr as i64;
+    }
+
+    // Handle expand: new_len > old_len
+    if new_len_aligned > old_len {
+        // Check RLIMIT_AS before expansion
+        let expansion = new_len_aligned - old_len;
+        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_AS);
+        if limit != crate::rlimit::RLIM_INFINITY {
+            let current_bytes = mm_guard.total_vm() * PAGE_SIZE;
+            if current_bytes.saturating_add(expansion) > limit {
+                return ENOMEM;
+            }
+        }
+
+        // Try in-place expansion first
+        let new_end = old_addr + new_len_aligned;
+        if mm_guard.try_expand_vma(vma_idx, new_end) {
+            // Success - VMA expanded in place
+            return old_addr as i64;
+        }
+
+        // In-place expansion failed (collision with next VMA)
+        // Need to move if MREMAP_MAYMOVE is set
+        if !may_move && !fixed {
+            return ENOMEM;
+        }
+
+        // Clone VMA info before modifications
+        let vma_clone = match mm_guard.get_vma(vma_idx) {
+            Some(v) => v.clone(),
+            None => return EFAULT,
+        };
+
+        // Determine target address
+        let target_addr = if fixed {
+            // MREMAP_FIXED: use specified address
+            // First, unmap any existing mappings at target
+            let target_end = new_addr + new_len_aligned;
+            let _ = mm_guard.remove_range(new_addr, target_end);
+            new_addr
+        } else {
+            // Find a new free area
+            match mm_guard.find_free_area(new_len_aligned) {
+                Some(addr) => addr,
+                None => return ENOMEM,
+            }
+        };
+
+        // Create new VMA at target location
+        let mut new_vma = vma_clone.clone();
+        new_vma.start = target_addr;
+        new_vma.end = target_addr + new_len_aligned;
+
+        // Insert new VMA
+        let new_idx = mm_guard.insert_vma(new_vma);
+        mm_guard.add_total_vm(new_len_aligned / PAGE_SIZE);
+        // Try to merge with adjacent VMAs (VMA merging optimization)
+        mm_guard.merge_adjacent(new_idx);
+
+        // Handle old VMA based on DONTUNMAP flag
+        if dontunmap {
+            // Keep the old VMA but mark it as anonymous (no file backing)
+            if let Some(vma) = mm_guard.get_vma_mut(vma_idx) {
+                vma.file = None;
+                vma.flags |= MAP_ANONYMOUS;
+            }
+        } else {
+            // Remove old VMA
+            let _ = mm_guard.remove_vma(vma_idx);
+        }
+
+        // Release lock before page table operations
+        drop(mm_guard);
+
+        // Move page table entries
+        move_page_tables(old_addr, target_addr, old_len, dontunmap);
+
+        return target_addr as i64;
+    }
+
+    // Same size - handle MREMAP_FIXED (move to new location)
+    if fixed {
+        // Clone VMA info
+        let vma_clone = match mm_guard.get_vma(vma_idx) {
+            Some(v) => v.clone(),
+            None => return EFAULT,
+        };
+
+        // Unmap any existing mappings at target
+        let target_end = new_addr + new_len_aligned;
+        let _ = mm_guard.remove_range(new_addr, target_end);
+
+        // Create new VMA at target
+        let mut new_vma = vma_clone.clone();
+        new_vma.start = new_addr;
+        new_vma.end = new_addr + new_len_aligned;
+        let new_idx = mm_guard.insert_vma(new_vma);
+        mm_guard.add_total_vm(new_len_aligned / PAGE_SIZE);
+        // Try to merge with adjacent VMAs (VMA merging optimization)
+        mm_guard.merge_adjacent(new_idx);
+
+        // Handle old VMA
+        if dontunmap {
+            if let Some(vma) = mm_guard.get_vma_mut(vma_idx) {
+                vma.file = None;
+                vma.flags |= MAP_ANONYMOUS;
+            }
+        } else {
+            let _ = mm_guard.remove_vma(vma_idx);
+        }
+
+        drop(mm_guard);
+
+        move_page_tables(old_addr, new_addr, old_len, dontunmap);
+
+        return new_addr as i64;
+    }
+
+    // Same size, no flags - just return old address
+    old_addr as i64
+}
+
+/// Move page table entries from old location to new location
+fn move_page_tables(old_start: u64, new_start: u64, len: u64, keep_old: bool) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::FRAME_ALLOCATOR;
+        use crate::arch::x86_64::paging::X86_64PageTable;
+
+        let cr3: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+        }
+
+        let mut offset: u64 = 0;
+        while offset < len {
+            let old_addr = old_start + offset;
+            let new_addr = new_start + offset;
+
+            // Check if old page is mapped
+            if let Some((phys, flags)) = X86_64PageTable::read_pte(cr3, old_addr) {
+                // Map at new location
+                let _ = crate::arch::x86_64::interrupts::map_user_page(cr3, new_addr, phys, flags);
+                // Increment frame refcount since we have a new mapping
+                FRAME_ALLOCATOR.incref(phys);
+
+                if !keep_old {
+                    // Unmap old location
+                    if let Some(old_phys) = X86_64PageTable::unmap_page(cr3, old_addr) {
+                        FRAME_ALLOCATOR.decref(old_phys);
+                    }
+                }
+            }
+
+            offset += PAGE_SIZE;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::FRAME_ALLOCATOR;
+        use crate::arch::aarch64::paging::Aarch64PageTable;
+
+        // Page descriptor bits for L3 entries (must be 0b11 for valid page)
+        const DESC_PAGE: u64 = 0b11;
+
+        let ttbr0: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack));
+        }
+        let pt_phys = ttbr0 & !0xFFF;
+
+        let mut offset: u64 = 0;
+        while offset < len {
+            let old_addr = old_start + offset;
+            let new_addr = new_start + offset;
+
+            // Check if old page is mapped
+            if let Some((phys, attrs)) = Aarch64PageTable::read_pte(pt_phys, old_addr) {
+                // Map at new location - add page descriptor bits that read_pte strips
+                let _ = crate::arch::aarch64::exceptions::map_user_page(
+                    pt_phys,
+                    new_addr,
+                    phys,
+                    attrs | DESC_PAGE,
+                );
+                // Increment frame refcount
+                FRAME_ALLOCATOR.incref(phys);
+
+                if !keep_old {
+                    // Unmap old location
+                    if let Some(old_phys) = Aarch64PageTable::unmap_page(pt_phys, old_addr) {
+                        FRAME_ALLOCATOR.decref(old_phys);
+                    }
+                }
+            }
+
+            offset += PAGE_SIZE;
+        }
+    }
 }

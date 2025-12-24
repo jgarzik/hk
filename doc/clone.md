@@ -21,28 +21,28 @@ The `clone()` syscall creates a new process or thread. It is the fundamental bui
 | CLONE_SIGHAND | 0x00000800 | Share signal handlers | Implemented |
 | CLONE_THREAD | 0x00010000 | Same thread group (share PID) | Implemented |
 | CLONE_VFORK | 0x00004000 | Parent blocks until child exec/exit | Implemented |
-| CLONE_PARENT | 0x00008000 | Child has same parent as caller | Not implemented |
-| CLONE_SYSVSEM | 0x00040000 | Share System V semaphore undo | Deferred (no SysV IPC) |
-| CLONE_IO | 0x80000000 | Share I/O context | Not implemented |
+| CLONE_PARENT | 0x00008000 | Child has same parent as caller | Implemented |
+| CLONE_SYSVSEM | 0x00040000 | Share System V semaphore undo | Implemented |
+| CLONE_IO | 0x80000000 | Share I/O context | Implemented |
 
 ### TID Pointer Flags
 
 | Flag | Value | Purpose | Status |
 |------|-------|---------|--------|
 | CLONE_PARENT_SETTID | 0x00100000 | Write child TID to parent's address | Implemented |
-| CLONE_CHILD_SETTID | 0x01000000 | Write child TID to child's address | Implemented (threads only) |
+| CLONE_CHILD_SETTID | 0x01000000 | Write child TID to child's address | Implemented |
 | CLONE_CHILD_CLEARTID | 0x00200000 | Clear TID + futex wake on exit | Implemented |
-| CLONE_SETTLS | 0x00080000 | Set thread-local storage | Deferred (arch-specific) |
+| CLONE_SETTLS | 0x00080000 | Set thread-local storage | Implemented |
 
 ### Namespace Flags
 
 | Flag | Value | Purpose | Status |
 |------|-------|---------|--------|
-| CLONE_NEWNS | 0x00020000 | New mount namespace | Implemented (stub isolation) |
+| CLONE_NEWNS | 0x00020000 | New mount namespace | Implemented |
 | CLONE_NEWUTS | 0x04000000 | New UTS namespace | Implemented |
-| CLONE_NEWIPC | 0x08000000 | New IPC namespace | Deferred (no SysV IPC) |
+| CLONE_NEWIPC | 0x08000000 | New IPC namespace | Implemented |
 | CLONE_NEWPID | 0x20000000 | New PID namespace | Implemented |
-| CLONE_NEWNET | 0x40000000 | New network namespace | Deferred (no namespace isolation) |
+| CLONE_NEWNET | 0x40000000 | New network namespace | Implemented |
 | CLONE_NEWUSER | 0x10000000 | New user namespace | Implemented |
 | CLONE_NEWCGROUP | 0x02000000 | New cgroup namespace | Deferred (no cgroups) |
 
@@ -58,7 +58,7 @@ The `clone()` syscall creates a new process or thread. It is the fundamental bui
 | Flag | Value | Purpose | Status |
 |------|-------|---------|--------|
 | CLONE_PIDFD | 0x00001000 | Return pidfd for child | Not implemented |
-| CLONE_CLEAR_SIGHAND | 0x100000000 | Reset signal handlers | Deferred |
+| CLONE_CLEAR_SIGHAND | 0x100000000 | Reset signal handlers | Implemented |
 | CLONE_INTO_CGROUP | 0x200000000 | Place in specific cgroup | Deferred |
 
 ## Flag Dependencies
@@ -69,6 +69,7 @@ Linux enforces these dependency rules (EINVAL if violated):
 2. **CLONE_THREAD requires CLONE_SIGHAND** - Threads must share signal handlers
 3. **CLONE_NEWNS and CLONE_FS are mutually exclusive** - Cannot share FS context while in new mount namespace
 4. **CLONE_NEWPID incompatible with CLONE_THREAD** - Threads cannot be in different PID namespaces
+5. **CLONE_SIGHAND and CLONE_CLEAR_SIGHAND are mutually exclusive** - Cannot share and reset handlers simultaneously
 
 ## Common Flag Combinations
 
@@ -110,7 +111,9 @@ Each task has its own FD table, managed via `TASK_FD` global mapping.
 ### TID Pointer Operations
 
 - **CLONE_PARENT_SETTID**: At clone time, writes child TID to `parent_tidptr` in parent's address space
-- **CLONE_CHILD_SETTID**: At clone time, writes child TID to `child_tidptr` in child's address space
+- **CLONE_CHILD_SETTID**: Writes child TID to `child_tidptr` in child's address space
+  - For threads (CLONE_VM): Written at clone time (shared address space)
+  - For fork (no CLONE_VM): Written in `clone_child_entry` after child's page table is loaded
 - **CLONE_CHILD_CLEARTID**: On exit, writes 0 to stored address and calls futex_wake to notify pthread_join waiters
 
 ### VFORK Blocking
@@ -129,20 +132,94 @@ Each task has a `SigHand` structure holding signal handlers:
 - **CLONE_SIGHAND not set**: Child gets deep copy via `SigHand::deep_clone()`
 - **CLONE_THREAD**: Also enables shared thread-group pending signals
 
+### Signal Handler Reset (CLONE_CLEAR_SIGHAND)
+
+Linux 5.5+ feature used by container runtimes and glibc's `posix_spawn()`:
+
+- **Purpose**: Atomically reset all signal handlers to SIG_DFL in child
+- **Mutual exclusivity**: Cannot be used with CLONE_SIGHAND (returns EINVAL)
+- **SIG_IGN preserved**: Handlers set to SIG_IGN remain SIG_IGN (intentional Linux semantic)
+- **Clears metadata**: sa_flags, sa_mask, and restorer are all reset to 0
+
+Implementation uses `SigHand::flush_handlers()` after deep-cloning the handler table.
+
 ### Namespace Support
 
 Fully implemented:
 - **CLONE_NEWUTS**: Creates new UTS namespace with copied hostname/domainname
 - **CLONE_NEWPID**: Creates new PID namespace with hierarchical PID translation
 - **CLONE_NEWUSER**: Creates new user namespace with UID/GID mapping support
-
-Partially implemented:
-- **CLONE_NEWNS**: Creates new mount namespace wrapper (mount tree still global)
+- **CLONE_NEWIPC**: Creates new IPC namespace with isolated SysV IPC resources
+- **CLONE_NEWNS**: Creates new mount namespace with cloned mount tree
+- **CLONE_NEWNET**: Creates new network namespace with isolated network stack
 
 Deferred (require subsystem support):
-- **CLONE_NEWIPC**: Requires SysV IPC implementation
-- **CLONE_NEWNET**: Requires per-namespace network isolation
 - **CLONE_NEWCGROUP**: Requires cgroup implementation
+
+### CLONE_NEWNS (Mount Namespace)
+
+Creates a new mount namespace with a deep-cloned mount tree:
+- **Mount::clone_tree()**: Recursively clones entire mount hierarchy
+- **Per-namespace root**: Each namespace has its own root mount
+- **current_mnt_ns()**: Returns current task's mount namespace
+- **init_mnt_ns()**: Returns init mount namespace for early boot
+
+Mount operations use namespace-local storage:
+- `do_mount()` / `do_mount_dev()` add mounts to current namespace
+- `do_umount()` removes from current namespace
+- Path lookup uses current namespace's root
+
+### CLONE_NEWNET (Network Namespace)
+
+Creates a new network namespace with isolated network stack:
+- **Per-namespace devices**: Each namespace has its own device list
+- **Loopback device**: Every new namespace gets a loopback (127.0.0.1)
+- **Per-namespace routing**: Isolated routing table per namespace
+- **Per-namespace TCP**: Connection table is namespace-local
+- **Per-namespace ARP**: ARP cache is namespace-local
+
+Implementation:
+- `NetNamespace` in `kernel/ns/net.rs` holds all network state
+- `current_net_ns()` returns current task's network namespace
+- Init namespace receives physical network devices
+
+### CLONE_PARENT Support
+
+When CLONE_PARENT or CLONE_THREAD is set, the child's parent PID (ppid) is set
+to the caller's parent rather than the caller itself. This makes the child a
+sibling of the caller rather than its child.
+
+### CLONE_SYSVSEM Support
+
+Shares the SysV semaphore undo list between parent and child:
+- **SEM_UNDO tracking**: semop() with SEM_UNDO flag records adjustments
+- **exit_sem()**: On task exit, pending undo adjustments are applied
+- **clone_task_semundo()**: Shares or copies undo list based on flag
+- **unshare(CLONE_SYSVSEM)**: Detaches from shared undo list
+
+### CLONE_IO Support
+
+Shares I/O context (ioprio) between parent and child:
+- **IoContext**: Contains atomic ioprio value (class + level)
+- **ioprio_get/ioprio_set syscalls**: Get/set I/O scheduling priority
+- **clone_task_io()**: Shares or copies IoContext based on flag
+
+### CLONE_SETTLS Support
+
+Sets thread-local storage (TLS) pointer for the new task:
+- **x86_64**: TLS value stored in FS base register (MSR 0xC0000100)
+- **aarch64**: TLS value stored in TPIDR_EL0 register
+
+Implementation follows Linux kernel's arm64 pattern:
+- TLS save/restore handled in Rust context switch wrappers (not assembly)
+- On context switch: save prev task's TLS to storage, load next task's TLS from storage
+- Assembly `switch_to.S` is pure register save/restore with no function calls
+- `clone_child_entry` loads child's TLS before returning to usermode
+
+TLS storage:
+- Per-task TLS values stored in `TASK_TLS` global table
+- `set_task_tls(tid, value)` / `get_task_tls(tid)` API
+- Context switch uses `current_tid()` to identify prev task
 
 Related syscalls:
 - **unshare(2)**: Disassociate from current namespaces (implemented)
@@ -150,20 +227,16 @@ Related syscalls:
 
 ## Future Work
 
-### Tier 1: TLS Support (CLONE_SETTLS)
-- Architecture-specific thread-local storage
-- FS/GS base registers (x86_64)
-- TPIDR register (aarch64)
-
-### Tier 2: Remaining Namespaces
-- **CLONE_NEWNS**: Full mount isolation (per-namespace mount tree)
-- **CLONE_NEWNET**: Network namespace isolation
-- **CLONE_NEWIPC**: IPC namespace (requires SysV IPC)
+### Tier 1: Remaining Namespaces
 - **CLONE_NEWCGROUP**: Cgroup namespace (requires cgroup support)
 
-### Tier 3: Modern Features
+### Tier 2: Modern Features
 - CLONE_PIDFD for pidfd-based process tracking
 - clone3() syscall with extensible struct
+
+### Tier 3: Debugging/Tracing
+- CLONE_PTRACE for ptrace continuation in child
+- CLONE_UNTRACED to prevent forced tracing
 
 ## Error Codes
 
@@ -180,11 +253,20 @@ Related syscalls:
 - Linux clone(2) man page
 - Linux clone3(2) man page
 - Linux namespaces(7) man page
-- kernel/task/mod.rs - Clone flag definitions
-- kernel/task/percpu.rs - do_clone() implementation
-- kernel/ns/mod.rs - Namespace proxy and syscalls (unshare, setns)
+- kernel/task/mod.rs - Clone flag definitions, IoContext, TASK_TLS storage
+- kernel/task/percpu.rs - do_clone() implementation, get_current_task_tls()
+- kernel/task/syscall.rs - ioprio_get/ioprio_set syscalls
+- kernel/arch/x86_64/context.rs - Context switch with TLS handling (FS base)
+- kernel/arch/x86_64/switch_to.S - Pure-asm register save/restore
+- kernel/arch/aarch64/context.rs - Context switch with TLS handling (TPIDR_EL0)
+- kernel/arch/aarch64/switch_to.S - Pure-asm register save/restore
+- kernel/ns/mod.rs - Namespace proxy, MntNamespace, and syscalls (unshare, setns)
 - kernel/ns/uts.rs - UTS namespace implementation
 - kernel/ns/pid.rs - PID namespace implementation
 - kernel/ns/user.rs - User namespace implementation
+- kernel/ns/net.rs - Network namespace implementation
+- kernel/fs/mount.rs - Mount namespace support, clone_tree()
+- kernel/ipc/mod.rs - IPC namespace implementation
+- kernel/ipc/sem.rs - SysV semaphores with SEM_UNDO support
 - kernel/signal/mod.rs - Signal handler sharing (CLONE_SIGHAND)
 - kernel/fs/procfs.rs - /proc/<pid>/ns/* namespace files

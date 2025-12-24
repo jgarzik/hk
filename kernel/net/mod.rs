@@ -38,8 +38,9 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
-use spin::RwLock;
+
+// Re-export namespace access
+pub use crate::ns::{INIT_NET_NS, NetNamespace, current_net_ns, init_net_ns};
 
 // Submodules
 pub mod arp;
@@ -133,9 +134,6 @@ impl NetError {
     }
 }
 
-/// Global list of registered network devices
-static NET_DEVICES: RwLock<Vec<Arc<NetDevice>>> = RwLock::new(Vec::new());
-
 /// Initialize the network subsystem
 pub fn init() {
     crate::printkln!("net: initializing network subsystem");
@@ -147,11 +145,8 @@ pub fn init() {
         ipv4_gateway: Ipv4Addr::new(10, 0, 2, 2),
     };
 
-    // Store global config for later use
-    *NET_CONFIG.write() = Some(config);
-
-    // Initialize routing table with default route
-    route::init();
+    // Store config in init network namespace
+    INIT_NET_NS.set_config(config);
 
     crate::printkln!("net: configured 10.0.2.15/24, gw 10.0.2.2");
 }
@@ -164,15 +159,14 @@ pub struct NetConfig {
     pub ipv4_gateway: Ipv4Addr,
 }
 
-/// Global network configuration
-static NET_CONFIG: RwLock<Option<NetConfig>> = RwLock::new(None);
-
-/// Get the current network configuration
+/// Get the current network configuration from current namespace
 pub fn get_config() -> Option<NetConfig> {
-    *NET_CONFIG.read()
+    current_net_ns().get_config()
 }
 
 /// Register a network device
+///
+/// Physical devices are registered in the init network namespace.
 pub fn register_netdev(dev: Arc<NetDevice>) {
     crate::printkln!(
         "net: registered {} (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
@@ -185,36 +179,37 @@ pub fn register_netdev(dev: Arc<NetDevice>) {
         dev.mac()[5]
     );
 
-    // Configure device with static IP if this is the first device
-    if NET_DEVICES.read().is_empty()
-        && let Some(config) = get_config()
+    // Register device in init network namespace
+    let init_ns = init_net_ns();
+
+    // Configure device with static IP if this is the first physical device
+    // (init namespace starts with only loopback)
+    if init_ns.devices.read().len() == 1
+        && let Some(config) = init_ns.get_config()
     {
         dev.set_ipv4(config.ipv4_addr, config.ipv4_netmask);
 
-        // Add routes for this device
-        route::add_interface_route(
+        // Add routes for this device in init namespace
+        init_ns.add_interface_route(
             config.ipv4_addr & config.ipv4_netmask,
             config.ipv4_netmask,
             Arc::clone(&dev),
         );
-        route::add_default_route(config.ipv4_gateway, Arc::clone(&dev));
+        init_ns.add_default_route(config.ipv4_gateway, Arc::clone(&dev));
     }
 
-    NET_DEVICES.write().push(dev);
+    // Add to init namespace
+    init_ns.register_device(dev);
 }
 
-/// Get a network device by name
+/// Get a network device by name in current namespace
 pub fn get_netdev(name: &str) -> Option<Arc<NetDevice>> {
-    NET_DEVICES
-        .read()
-        .iter()
-        .find(|d| d.name() == name)
-        .cloned()
+    current_net_ns().get_device(name)
 }
 
-/// Get the first network device (for simple single-NIC setups)
+/// Get the first network device in current namespace (for simple single-NIC setups)
 pub fn get_default_netdev() -> Option<Arc<NetDevice>> {
-    NET_DEVICES.read().first().cloned()
+    current_net_ns().get_default_device()
 }
 
 /// Receive path entry point - called by device drivers

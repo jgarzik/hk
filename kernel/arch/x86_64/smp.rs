@@ -47,11 +47,12 @@ static AP_READY: AtomicU32 = AtomicU32::new(0);
 pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F) -> usize {
     // Use existing LAPIC instance (already mapped via ioremap in main.rs)
     let lapic = LocalApic::get();
-    let bsp_apic_id = lapic.id();
+    let bsp_apic_id = lapic.id() as u32;
 
     // Initialize BSP per-CPU data
+    // Note: percpu uses u8 APIC ID for xAPIC compatibility
     let bsp_stack = cpu::get_kernel_stack();
-    percpu::init_bsp(bsp_apic_id, bsp_stack);
+    percpu::init_bsp(bsp_apic_id as u8, bsp_stack);
     printkln!("SMP_CPU_ONLINE: cpu=0 apic={}", bsp_apic_id);
 
     // Enable LAPIC on BSP
@@ -113,7 +114,7 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
             core::ptr::write_volatile(entry_ptr, ap_entry as *const () as u64);
             core::ptr::write_volatile(stack_ptr, stack_top);
             core::ptr::write_volatile(cpu_id_ptr, cpu_id);
-            core::ptr::write_volatile(apic_id_ptr, cpu_info.apic_id as u32);
+            core::ptr::write_volatile(apic_id_ptr, cpu_info.apic_id);
         }
 
         // Clear ready flag and start AP
@@ -155,15 +156,29 @@ fn allocate_ap_stack<F: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut F) -> u64 
 }
 
 /// Start an AP using INIT-SIPI-SIPI sequence
-fn start_ap(lapic: &LocalApic, apic_id: u8) -> bool {
+///
+/// Note: The LAPIC IPI functions currently only support xAPIC mode (8-bit APIC IDs).
+/// For X2APIC systems with APIC IDs > 255, this will fail. Full X2APIC support
+/// would require using MSRs instead of MMIO for IPI delivery.
+fn start_ap(lapic: &LocalApic, apic_id: u32) -> bool {
+    // xAPIC mode only supports 8-bit APIC IDs
+    if apic_id > 255 {
+        crate::printkln!(
+            "SMP: Cannot start AP with APIC ID {} > 255 (X2APIC mode not supported)",
+            apic_id
+        );
+        return false;
+    }
+    let apic_id_u8 = apic_id as u8;
+
     // Send INIT IPI
-    lapic.send_init(apic_id);
+    lapic.send_init(apic_id_u8);
 
     // Wait 10ms
     delay_ms(10);
 
     // Send first SIPI
-    lapic.send_sipi(apic_id, SIPI_VECTOR);
+    lapic.send_sipi(apic_id_u8, SIPI_VECTOR);
 
     // Wait up to 200ms for AP to respond
     if wait_for_ap(200) {
@@ -171,7 +186,7 @@ fn start_ap(lapic: &LocalApic, apic_id: u8) -> bool {
     }
 
     // Send second SIPI (required by some older CPUs)
-    lapic.send_sipi(apic_id, SIPI_VECTOR);
+    lapic.send_sipi(apic_id_u8, SIPI_VECTOR);
 
     // Wait up to 1 second for AP
     wait_for_ap(1000)

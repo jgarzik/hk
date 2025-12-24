@@ -44,7 +44,7 @@ impl Path {
     ///
     /// Falls back to root mount since we don't track per-dentry mounts yet.
     pub fn from_dentry(dentry: Arc<Dentry>) -> Option<Self> {
-        let mnt = super::mount::MOUNT_NS.get_root()?;
+        let mnt = super::mount::current_mnt_ns().get_root()?;
         Some(Self { mnt, dentry })
     }
 

@@ -20,14 +20,26 @@ pub mod clone_flags {
     pub const CLONE_SIGHAND: u64 = 0x00000800;
     /// Parent blocks until child exec()s or _exit()s (vfork semantics)
     pub const CLONE_VFORK: u64 = 0x00004000;
+    /// Child has same parent as caller (creates sibling, not child)
+    pub const CLONE_PARENT: u64 = 0x00008000;
     /// Share thread group (same PID)
     pub const CLONE_THREAD: u64 = 0x00010000;
+    /// Share System V semaphore undo list
+    pub const CLONE_SYSVSEM: u64 = 0x00040000;
+    /// Set thread-local storage pointer for child
+    pub const CLONE_SETTLS: u64 = 0x00080000;
     /// Set parent TID at parent_tidptr location
     pub const CLONE_PARENT_SETTID: u64 = 0x00100000;
     /// Set child TID at child_tidptr location (in child's address space)
     pub const CLONE_CHILD_SETTID: u64 = 0x01000000;
     /// Clear child TID at child_tidptr on exit
     pub const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+    /// Share I/O context (ioprio)
+    pub const CLONE_IO: u64 = 0x80000000;
+
+    /// Clear signal handlers (reset to SIG_DFL) - Linux 5.5+
+    /// Note: SIG_IGN handlers are preserved (intentional Linux behavior)
+    pub const CLONE_CLEAR_SIGHAND: u64 = 0x100000000;
 
     // Namespace clone flags (re-exported from ns module for convenience)
     pub use crate::ns::{
@@ -63,9 +75,17 @@ pub mod wait_options {
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicBool;
 
 use crate::arch::{Arch, PageTable};
+use crate::fs::{File, FsStruct};
+use crate::ipc::sem::SemUndoList;
+use crate::mm::MmStruct;
 use crate::mm::page_cache::CachedPage;
+use crate::ns::NsProxy;
+use crate::signal::{SigHand, SignalStruct, TaskSignalState};
+
+use spin::Mutex;
 
 /// Process ID type
 pub type Pid = u64;
@@ -146,6 +166,79 @@ impl Cred {
 impl Default for Cred {
     fn default() -> Self {
         Self::ROOT
+    }
+}
+
+// =============================================================================
+// Credential APIs (Linux kernel/cred.c pattern)
+// =============================================================================
+
+/// Get the current task's credentials from per-CPU cache
+///
+/// Like Linux's `current_cred()` - fast path for syscalls.
+/// Returns a copy since CurrentTask.cred is a Copy type.
+pub fn current_cred() -> Cred {
+    percpu::current_cred()
+}
+
+/// Get the current task's credentials from TASK_TABLE (authoritative source)
+///
+/// This fetches the Arc<Cred> from the actual Task struct.
+/// Used when the per-CPU cache might be stale or for reference counting.
+pub fn current_cred_arc() -> Arc<Cred> {
+    let tid = percpu::current_tid();
+    let table = percpu::TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .map(|t| t.cred.clone())
+        .unwrap_or_else(|| Arc::new(Cred::ROOT))
+}
+
+/// Prepare a new credential set by cloning current credentials
+///
+/// Like Linux's `prepare_creds()` - creates a mutable copy that can be
+/// modified before committing. Returns owned Cred (not Arc) for modification.
+///
+/// Usage pattern (like Linux):
+/// ```ignore
+/// let mut new_cred = prepare_creds();
+/// new_cred.uid = new_uid;
+/// new_cred.euid = new_uid;
+/// commit_creds(Arc::new(new_cred));
+/// ```
+pub fn prepare_creds() -> Cred {
+    current_cred()
+}
+
+/// Commit new credentials to current task
+///
+/// Like Linux's `commit_creds()` - atomically updates both:
+/// 1. Task.cred in TASK_TABLE (persistent storage)
+/// 2. CurrentTask.cred in per-CPU cache (fast access)
+///
+/// The new credentials take effect immediately.
+pub fn commit_creds(new: Arc<Cred>) {
+    percpu::commit_creds_impl(new);
+}
+
+/// Copy credentials for fork/clone
+///
+/// Like Linux's `copy_creds()` - handles credential inheritance during clone:
+/// - CLONE_THREAD: Share credentials (clone Arc reference)
+/// - Otherwise (fork): Deep copy credentials (new Arc with copied data)
+///
+/// This follows Linux's pattern from kernel/cred.c:copy_creds().
+pub fn copy_creds(clone_flags: u64, parent_cred: &Arc<Cred>) -> Arc<Cred> {
+    use clone_flags::CLONE_THREAD;
+
+    if clone_flags & CLONE_THREAD != 0 {
+        // Threads share credentials - just clone the Arc (bump refcount)
+        parent_cred.clone()
+    } else {
+        // Fork: deep copy credentials (child gets independent copy)
+        Arc::new(**parent_cred)
     }
 }
 
@@ -583,6 +676,14 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub pgid: Pid,
     /// Session ID
     pub sid: Pid,
+
+    // =========================================================================
+    // Credentials (like Linux task_struct->cred)
+    // =========================================================================
+    /// Task credentials - reference-counted, immutable after commit
+    /// Following Linux pattern: prepare_creds() -> modify -> commit_creds()
+    pub cred: Arc<Cred>,
+
     /// Kind of task
     pub kind: TaskKind,
     /// Current state
@@ -607,6 +708,61 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub user_stack_top: Option<A::VirtAddr>,
     /// Cached pages this task is using (for refcount management on exit)
     pub cached_pages: Vec<Arc<CachedPage>>,
+
+    // =========================================================================
+    // TLS and thread-exit fields (Linux: embedded in task_struct/thread_struct)
+    // =========================================================================
+    /// Thread-local storage base address
+    /// - x86_64: FS base (set via MSR_FS_BASE or arch_prctl ARCH_SET_FS)
+    /// - aarch64: TPIDR_EL0 value
+    pub tls_base: u64,
+
+    /// Address to clear and futex-wake on thread exit (set_tid_address syscall)
+    /// Used by pthread library for thread cleanup notification.
+    pub clear_child_tid: u64,
+
+    /// Address to write child TID on first schedule (CLONE_CHILD_SETTID for fork)
+    /// Consumed after first use (one-time operation).
+    pub set_child_tid: u64,
+
+    // =========================================================================
+    // Shared resources (Arc for clone-sharing, like Linux pointers)
+    // =========================================================================
+    /// Memory descriptor (shared when CLONE_VM)
+    pub mm: Option<Arc<Mutex<MmStruct>>>,
+
+    /// File descriptor table (shared when CLONE_FILES)
+    pub files: Option<Arc<Mutex<FdTable<File>>>>,
+
+    /// Filesystem context (shared when CLONE_FS)
+    pub fs: Option<Arc<FsStruct>>,
+
+    /// Namespace proxy (shared based on CLONE_NEW* flags)
+    pub nsproxy: Option<Arc<NsProxy>>,
+
+    /// Signal handlers (shared when CLONE_SIGHAND)
+    pub sighand: Option<Arc<SigHand>>,
+
+    /// Thread-group signal state (shared when CLONE_THREAD)
+    pub signal: Option<Arc<SignalStruct>>,
+
+    /// I/O context (shared when CLONE_IO)
+    pub io_context: Option<Arc<IoContext>>,
+
+    /// SysV semaphore undo list (shared when CLONE_SYSVSEM)
+    pub sysvsem: Option<Arc<SemUndoList>>,
+
+    // =========================================================================
+    // Per-task signal state (not shared)
+    // =========================================================================
+    /// Per-task signal state (blocked signals, pending signals)
+    pub signal_state: TaskSignalState,
+
+    /// TIF_SIGPENDING flag (fast check at syscall return)
+    pub tif_sigpending: AtomicBool,
+
+    /// Robust futex list head address
+    pub robust_list: u64,
 }
 
 impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {
@@ -658,8 +814,6 @@ pub fn capable(_cap: u32) -> bool {
 // Per-UID process counting (for RLIMIT_NPROC)
 // =============================================================================
 
-use spin::Mutex;
-
 /// Global table tracking process count per UID
 ///
 /// Used for RLIMIT_NPROC enforcement. Each process (not thread) increments
@@ -696,4 +850,273 @@ pub fn decrement_user_process_count(uid: Uid) {
 pub fn get_user_process_count(uid: Uid) -> u64 {
     let counts = UID_PROCESS_COUNT.lock();
     counts.get(&uid).copied().unwrap_or(0)
+}
+
+// =============================================================================
+// I/O Priority (ioprio) support for CLONE_IO
+// =============================================================================
+
+use core::sync::atomic::{AtomicU16, Ordering};
+
+/// I/O priority type (matches Linux: 3-bit class + 13-bit data)
+pub type IoPrio = u16;
+
+/// No I/O priority class (use default)
+pub const IOPRIO_CLASS_NONE: u16 = 0;
+/// Real-time I/O class (highest priority)
+pub const IOPRIO_CLASS_RT: u16 = 1;
+/// Best-effort I/O class (default for normal processes)
+pub const IOPRIO_CLASS_BE: u16 = 2;
+/// Idle I/O class (only when system is otherwise idle)
+pub const IOPRIO_CLASS_IDLE: u16 = 3;
+
+/// Number of bits for I/O priority class
+pub const IOPRIO_CLASS_SHIFT: u16 = 13;
+/// Mask for I/O priority data
+pub const IOPRIO_PRIO_MASK: u16 = (1 << IOPRIO_CLASS_SHIFT) - 1;
+
+/// Default I/O priority (best-effort class, level 4)
+pub const IOPRIO_DEFAULT: IoPrio = ioprio_prio_value(IOPRIO_CLASS_BE, 4);
+
+/// Extract priority class from ioprio value
+#[inline]
+pub const fn ioprio_prio_class(ioprio: IoPrio) -> u16 {
+    ioprio >> IOPRIO_CLASS_SHIFT
+}
+
+/// Extract priority data/level from ioprio value
+#[inline]
+pub const fn ioprio_prio_data(ioprio: IoPrio) -> u16 {
+    ioprio & IOPRIO_PRIO_MASK
+}
+
+/// Construct ioprio value from class and data
+#[inline]
+pub const fn ioprio_prio_value(class: u16, data: u16) -> IoPrio {
+    ((class & 0x7) << IOPRIO_CLASS_SHIFT) | (data & IOPRIO_PRIO_MASK)
+}
+
+/// Check if an ioprio value is valid
+#[inline]
+pub fn ioprio_valid(ioprio: IoPrio) -> bool {
+    let class = ioprio_prio_class(ioprio);
+    class <= IOPRIO_CLASS_IDLE
+}
+
+/// I/O context for a task (shareable via CLONE_IO)
+///
+/// Contains I/O scheduling priority and related state.
+/// When CLONE_IO is used, multiple tasks share the same IoContext,
+/// so changes to ioprio affect all sharing tasks.
+pub struct IoContext {
+    /// I/O priority (3-bit class + 13-bit data)
+    pub ioprio: AtomicU16,
+}
+
+impl IoContext {
+    /// Create a new I/O context with default priority
+    pub fn new() -> Self {
+        Self {
+            ioprio: AtomicU16::new(IOPRIO_DEFAULT),
+        }
+    }
+
+    /// Create a new I/O context with specific priority
+    pub fn with_ioprio(ioprio: IoPrio) -> Self {
+        Self {
+            ioprio: AtomicU16::new(ioprio),
+        }
+    }
+
+    /// Get current I/O priority
+    #[inline]
+    pub fn get_ioprio(&self) -> IoPrio {
+        self.ioprio.load(Ordering::Relaxed)
+    }
+
+    /// Set I/O priority
+    #[inline]
+    pub fn set_ioprio(&self, ioprio: IoPrio) {
+        self.ioprio.store(ioprio, Ordering::Relaxed);
+    }
+}
+
+impl Default for IoContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for IoContext {
+    fn clone(&self) -> Self {
+        Self {
+            ioprio: AtomicU16::new(self.ioprio.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+// =============================================================================
+// Task I/O context accessors - uses Task.io_context field via TASK_TABLE
+// =============================================================================
+
+/// Get the I/O context for a task
+pub fn get_task_io_context(tid: Tid) -> Option<Arc<IoContext>> {
+    let table = percpu::TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .and_then(|t| t.io_context.clone())
+}
+
+/// Set the I/O context for a task
+pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
+    let mut table = percpu::TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.io_context = Some(ctx);
+    }
+}
+
+/// Remove the I/O context for a task (on exit)
+pub fn remove_task_io_context(tid: Tid) {
+    let mut table = percpu::TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.io_context = None;
+    }
+}
+
+/// Clone I/O context for a new task
+///
+/// If `share` is true (CLONE_IO set), child shares parent's Arc<IoContext>.
+/// Otherwise, child gets a new IoContext inheriting parent's ioprio value.
+pub fn clone_task_io(parent_tid: Tid, child_tid: Tid, share: bool) {
+    let parent_ctx = get_task_io_context(parent_tid);
+
+    let child_ctx = if let Some(parent_ctx) = parent_ctx {
+        if share {
+            // CLONE_IO: share the same context
+            parent_ctx
+        } else {
+            // No CLONE_IO: create new context with inherited ioprio
+            Arc::new(IoContext::with_ioprio(parent_ctx.get_ioprio()))
+        }
+    } else {
+        // Parent has no context, create default for child
+        Arc::new(IoContext::new())
+    };
+
+    set_task_io_context(child_tid, child_ctx);
+}
+
+// =============================================================================
+// ioprio syscall "which" constants
+// =============================================================================
+
+/// ioprio_get/set for a specific process
+pub const IOPRIO_WHO_PROCESS: i32 = 1;
+/// ioprio_get/set for a process group
+pub const IOPRIO_WHO_PGRP: i32 = 2;
+/// ioprio_get/set for all processes of a user
+pub const IOPRIO_WHO_USER: i32 = 3;
+
+// =============================================================================
+// Per-task Thread-Local Storage (TLS) pointer
+// =============================================================================
+//
+// TLS is stored directly in the Task struct (tls_base field), following the
+// Linux pattern where it's stored in task_struct->thread.fsbase.
+//
+// Access pattern (Linux-compatible):
+// - TASK_TABLE.lock() for short critical section
+// - Direct field access (O(1) once task is found)
+
+/// Get the TLS pointer for a task
+pub fn get_task_tls(tid: Tid) -> Option<u64> {
+    let table = percpu::TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .map(|t| t.tls_base)
+        .filter(|&v| v != 0)
+}
+
+/// Set the TLS pointer for a task
+pub fn set_task_tls(tid: Tid, tls: u64) {
+    let mut table = percpu::TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.tls_base = tls;
+    }
+}
+
+/// Remove the TLS pointer for a task (on exit)
+pub fn remove_task_tls(tid: Tid) {
+    let mut table = percpu::TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.tls_base = 0;
+    }
+}
+
+// =============================================================================
+// Per-task clear_child_tid pointer (for set_tid_address syscall)
+// =============================================================================
+//
+// Stored directly in Task struct (clear_child_tid field), following Linux's
+// task_struct->clear_child_tid pattern.
+
+/// Get the clear_child_tid pointer for a task
+pub fn get_clear_child_tid(tid: Tid) -> Option<u64> {
+    let table = percpu::TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .map(|t| t.clear_child_tid)
+        .filter(|&v| v != 0)
+}
+
+/// Set the clear_child_tid pointer for a task
+pub fn set_clear_child_tid(tid: Tid, addr: u64) {
+    let mut table = percpu::TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.clear_child_tid = addr;
+    }
+}
+
+/// Remove the clear_child_tid pointer for a task (on exit, after processing)
+pub fn remove_clear_child_tid(tid: Tid) {
+    let mut table = percpu::TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.clear_child_tid = 0;
+    }
+}
+
+// =============================================================================
+// Per-task set_child_tid pointer (for CLONE_CHILD_SETTID on fork)
+// =============================================================================
+//
+// Stored directly in Task struct (set_child_tid field), following Linux's
+// task_struct->set_child_tid pattern.
+
+/// Get and remove the set_child_tid pointer for a task (one-time use)
+pub fn get_set_child_tid(tid: Tid) -> Option<u64> {
+    let mut table = percpu::TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        let addr = task.set_child_tid;
+        if addr != 0 {
+            task.set_child_tid = 0; // Consume (one-time use)
+            return Some(addr);
+        }
+    }
+    None
+}
+
+/// Set the set_child_tid pointer for a task
+pub fn set_set_child_tid(tid: Tid, addr: u64) {
+    if addr != 0 {
+        let mut table = percpu::TASK_TABLE.lock();
+        if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+            task.set_child_tid = addr;
+        }
+    }
 }

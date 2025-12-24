@@ -5,6 +5,9 @@
  *
  * This file implements the core task switching mechanism,
  * saving/restoring only callee-saved registers per System V AMD64 ABI.
+ *
+ * TLS (FS base) handling is done in Rust before calling these functions,
+ * following the Linux kernel pattern (tls_thread_switch before cpu_switch_to).
  */
 
 .section .text

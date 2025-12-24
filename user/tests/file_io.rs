@@ -15,10 +15,12 @@
 //! - Test 33: fcntl() with invalid fd returns -EBADF
 //! - Test 34: getrandom() - get random bytes
 //! - Test 35: getrandom() with invalid flags returns -EINVAL
+//! - Test 36: ioctl() with invalid fd returns -EBADF
+//! - Test 37: ioctl() on regular file returns -ENOTTY
 
 use super::helpers::{print, println, print_num};
 use crate::syscall::{
-    sys_close, sys_fcntl, sys_getrandom, sys_lseek, sys_open, sys_pread64, sys_preadv,
+    sys_close, sys_fcntl, sys_getrandom, sys_ioctl, sys_lseek, sys_open, sys_pread64, sys_preadv,
     sys_pwrite64, sys_pwritev, sys_read, sys_readv, sys_write, sys_writev, IoVec, O_CREAT,
     O_RDONLY, O_RDWR, O_TRUNC,
 };
@@ -49,6 +51,8 @@ pub fn run_tests() {
     test_fcntl_ebadf();
     test_getrandom();
     test_getrandom_einval();
+    test_ioctl_ebadf();
+    test_ioctl_enotty();
 }
 
 /// Test 22: writev() - gather write to stdout
@@ -774,6 +778,46 @@ fn test_getrandom_einval() {
         println(b"GETRANDOM_EINVAL:OK");
     } else {
         print(b"GETRANDOM_EINVAL:FAIL: expected -22 (EINVAL), got ");
+        print_num(ret);
+        println(b"");
+    }
+}
+
+/// Test 36: ioctl() with invalid fd returns -EBADF
+fn test_ioctl_ebadf() {
+    // Use a clearly invalid fd
+    let ret = sys_ioctl(9999, 0, 0);
+    if ret == -9 {
+        // EBADF = 9
+        println(b"IOCTL_EBADF:OK");
+    } else {
+        print(b"IOCTL_EBADF:FAIL: expected -9 (EBADF), got ");
+        print_num(ret);
+        println(b"");
+    }
+}
+
+/// Test 37: ioctl() on regular file returns -ENOTTY
+fn test_ioctl_enotty() {
+    // Open a regular file
+    let path = b"/test.txt\0";
+    let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        print(b"IOCTL_ENOTTY:FAIL: open failed: ");
+        print_num(fd);
+        println(b"");
+        return;
+    }
+
+    // ioctl on regular file should return ENOTTY
+    let ret = sys_ioctl(fd as i32, 0, 0);
+    sys_close(fd as u64);
+
+    if ret == -25 {
+        // ENOTTY = 25
+        println(b"IOCTL_ENOTTY:OK");
+    } else {
+        print(b"IOCTL_ENOTTY:FAIL: expected -25 (ENOTTY), got ");
         print_num(ret);
         println(b"");
     }

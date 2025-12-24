@@ -178,6 +178,33 @@ pub const SEEK_END: i32 = 2;
 
 // Clone flags
 pub const CLONE_VM: u64 = 0x00000100;
+pub const CLONE_SIGHAND: u64 = 0x00000800;
+pub const CLONE_PARENT: u64 = 0x00008000;
+pub const CLONE_NEWNS: u64 = 0x0002_0000;
+pub const CLONE_SYSVSEM: u64 = 0x00040000;
+pub const CLONE_SETTLS: u64 = 0x00080000;
+pub const CLONE_NEWUTS: u64 = 0x0400_0000;
+pub const CLONE_NEWIPC: u64 = 0x0800_0000;
+pub const CLONE_NEWUSER: u64 = 0x1000_0000;
+pub const CLONE_NEWPID: u64 = 0x2000_0000;
+pub const CLONE_NEWNET: u64 = 0x4000_0000;
+pub const CLONE_IO: u64 = 0x80000000;
+pub const CLONE_CLEAR_SIGHAND: u64 = 0x100000000;
+
+// I/O priority constants
+pub const IOPRIO_CLASS_NONE: u16 = 0;
+pub const IOPRIO_CLASS_RT: u16 = 1;
+pub const IOPRIO_CLASS_BE: u16 = 2;
+pub const IOPRIO_CLASS_IDLE: u16 = 3;
+
+pub const IOPRIO_WHO_PROCESS: i32 = 1;
+pub const IOPRIO_WHO_PGRP: i32 = 2;
+pub const IOPRIO_WHO_USER: i32 = 3;
+
+/// Construct ioprio value from class and level
+pub const fn ioprio_prio_value(class: u16, level: u16) -> i32 {
+    (((class & 0x7) << 13) | (level & 0x1fff)) as i32
+}
 
 // waitid idtype values
 pub const P_ALL: i32 = 0;
@@ -279,13 +306,59 @@ pub const PROT_NONE: u32 = 0;
 pub const PROT_READ: u32 = 1;
 pub const PROT_WRITE: u32 = 2;
 pub const PROT_EXEC: u32 = 4;
+/// mprotect: extend change to start of growsdown VMA
+pub const PROT_GROWSDOWN: u32 = 0x0100_0000;
+/// mprotect: extend change to end of growsup VMA (always EINVAL on x86-64/aarch64)
+pub const PROT_GROWSUP: u32 = 0x0200_0000;
 
 // mmap flags
 pub const MAP_SHARED: u32 = 0x01;
 pub const MAP_PRIVATE: u32 = 0x02;
 pub const MAP_FIXED: u32 = 0x10;
 pub const MAP_ANONYMOUS: u32 = 0x20;
+/// Stack-like segment that grows downward on page faults
+pub const MAP_GROWSDOWN: u32 = 0x0100;
+pub const MAP_DENYWRITE: u32 = 0x0800;
+pub const MAP_EXECUTABLE: u32 = 0x1000;
 pub const MAP_LOCKED: u32 = 0x2000;
+/// Prefault page tables (populate pages immediately after mmap)
+pub const MAP_POPULATE: u32 = 0x8000;
+/// Don't block on I/O when used with MAP_POPULATE (skips populate)
+pub const MAP_NONBLOCK: u32 = 0x10000;
+/// Stack allocation hint (no-op on systems without THP)
+pub const MAP_STACK: u32 = 0x20000;
+/// Like MAP_FIXED but fails with EEXIST instead of unmapping existing mappings
+pub const MAP_FIXED_NOREPLACE: u32 = 0x100000;
+
+// msync flags
+/// Schedule write but don't wait (no-op in modern kernels)
+pub const MS_ASYNC: i32 = 1;
+/// Invalidate cached pages
+pub const MS_INVALIDATE: i32 = 2;
+/// Synchronously write dirty pages to disk
+pub const MS_SYNC: i32 = 4;
+
+// madvise flags
+/// No special treatment (default)
+pub const MADV_NORMAL: i32 = 0;
+/// Expect random page references
+pub const MADV_RANDOM: i32 = 1;
+/// Expect sequential page references
+pub const MADV_SEQUENTIAL: i32 = 2;
+/// Will need these pages soon (prefault)
+pub const MADV_WILLNEED: i32 = 3;
+/// Don't need these pages (zap and free)
+pub const MADV_DONTNEED: i32 = 4;
+/// Mark pages as lazily freeable
+pub const MADV_FREE: i32 = 8;
+/// Don't copy this VMA on fork
+pub const MADV_DONTFORK: i32 = 10;
+/// Do copy this VMA on fork (undo MADV_DONTFORK)
+pub const MADV_DOFORK: i32 = 11;
+/// Don't include in core dumps
+pub const MADV_DONTDUMP: i32 = 16;
+/// Include in core dumps (undo MADV_DONTDUMP)
+pub const MADV_DODUMP: i32 = 17;
 
 // mlock2 flags
 pub const MLOCK_ONFAULT: i32 = 0x01;
@@ -294,6 +367,14 @@ pub const MLOCK_ONFAULT: i32 = 0x01;
 pub const MCL_CURRENT: i32 = 1;
 pub const MCL_FUTURE: i32 = 2;
 pub const MCL_ONFAULT: i32 = 4;
+
+// mremap flags
+/// Allow kernel to move mapping if can't resize in-place
+pub const MREMAP_MAYMOVE: u32 = 1;
+/// Move to exact new_addr (implies MREMAP_MAYMOVE)
+pub const MREMAP_FIXED: u32 = 2;
+/// Keep original mapping after move
+pub const MREMAP_DONTUNMAP: u32 = 4;
 
 // Resource limits (rlimit constants)
 /// CPU time limit (seconds)

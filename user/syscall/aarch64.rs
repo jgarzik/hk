@@ -22,6 +22,129 @@
 use super::{FdSet, IoVec, PollFd, RLimit, SigInfo, Stat, Timespec, Timeval, UtsName, AT_FDCWD};
 
 // ============================================================================
+// Syscall macros for aarch64
+// ============================================================================
+
+/// Raw syscall with 0 arguments
+macro_rules! syscall0 {
+    ($nr:expr) => {{
+        let ret: i64;
+        core::arch::asm!(
+            "svc #0",
+            in("x8") $nr,
+            lateout("x0") ret,
+            options(nostack),
+        );
+        ret
+    }};
+}
+
+/// Raw syscall with 1 argument
+macro_rules! syscall1 {
+    ($nr:expr, $a0:expr) => {{
+        let ret: i64;
+        core::arch::asm!(
+            "svc #0",
+            in("x8") $nr,
+            in("x0") $a0 as u64,
+            lateout("x0") ret,
+            options(nostack),
+        );
+        ret
+    }};
+}
+
+/// Raw syscall with 2 arguments
+macro_rules! syscall2 {
+    ($nr:expr, $a0:expr, $a1:expr) => {{
+        let ret: i64;
+        core::arch::asm!(
+            "svc #0",
+            in("x8") $nr,
+            in("x0") $a0 as u64,
+            in("x1") $a1 as u64,
+            lateout("x0") ret,
+            options(nostack),
+        );
+        ret
+    }};
+}
+
+/// Raw syscall with 3 arguments
+macro_rules! syscall3 {
+    ($nr:expr, $a0:expr, $a1:expr, $a2:expr) => {{
+        let ret: i64;
+        core::arch::asm!(
+            "svc #0",
+            in("x8") $nr,
+            in("x0") $a0 as u64,
+            in("x1") $a1 as u64,
+            in("x2") $a2 as u64,
+            lateout("x0") ret,
+            options(nostack),
+        );
+        ret
+    }};
+}
+
+/// Raw syscall with 4 arguments
+macro_rules! syscall4 {
+    ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
+        let ret: i64;
+        core::arch::asm!(
+            "svc #0",
+            in("x8") $nr,
+            in("x0") $a0 as u64,
+            in("x1") $a1 as u64,
+            in("x2") $a2 as u64,
+            in("x3") $a3 as u64,
+            lateout("x0") ret,
+            options(nostack),
+        );
+        ret
+    }};
+}
+
+/// Raw syscall with 5 arguments
+macro_rules! syscall5 {
+    ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr) => {{
+        let ret: i64;
+        core::arch::asm!(
+            "svc #0",
+            in("x8") $nr,
+            in("x0") $a0 as u64,
+            in("x1") $a1 as u64,
+            in("x2") $a2 as u64,
+            in("x3") $a3 as u64,
+            in("x4") $a4 as u64,
+            lateout("x0") ret,
+            options(nostack),
+        );
+        ret
+    }};
+}
+
+/// Raw syscall with 6 arguments
+macro_rules! syscall6 {
+    ($nr:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr, $a5:expr) => {{
+        let ret: i64;
+        core::arch::asm!(
+            "svc #0",
+            in("x8") $nr,
+            in("x0") $a0 as u64,
+            in("x1") $a1 as u64,
+            in("x2") $a2 as u64,
+            in("x3") $a3 as u64,
+            in("x4") $a4 as u64,
+            in("x5") $a5 as u64,
+            lateout("x0") ret,
+            options(nostack),
+        );
+        ret
+    }};
+}
+
+// ============================================================================
 // aarch64 Linux syscall numbers (different from x86_64!)
 // ============================================================================
 
@@ -121,11 +244,15 @@ pub const SYS_PSELECT6: u64 = 72;
 pub const SYS_BRK: u64 = 214;
 pub const SYS_MUNMAP: u64 = 215;
 pub const SYS_MMAP: u64 = 222;
+pub const SYS_MPROTECT: u64 = 226;
 pub const SYS_MLOCK: u64 = 228;
 pub const SYS_MUNLOCK: u64 = 229;
 pub const SYS_MLOCKALL: u64 = 230;
 pub const SYS_MUNLOCKALL: u64 = 231;
 pub const SYS_MLOCK2: u64 = 284;
+pub const SYS_MSYNC: u64 = 227;
+pub const SYS_MADVISE: u64 = 233;
+pub const SYS_MREMAP: u64 = 216;
 
 // System information syscalls
 pub const SYS_GETRUSAGE: u64 = 165;
@@ -134,6 +261,11 @@ pub const SYS_GETRANDOM: u64 = 278;
 
 // File control
 pub const SYS_FCNTL: u64 = 25;
+pub const SYS_IOCTL: u64 = 29;
+
+// I/O priority syscalls
+pub const SYS_IOPRIO_SET: u64 = 30;
+pub const SYS_IOPRIO_GET: u64 = 31;
 
 // Scheduling syscalls (aarch64 numbers)
 pub const SYS_SCHED_SETPARAM: u64 = 118;
@@ -176,6 +308,18 @@ pub const SYS_MSGSND: u64 = 189;
 pub const SYS_MSGRCV: u64 = 188;
 pub const SYS_MSGCTL: u64 = 187;
 
+// TLS syscalls
+pub const SYS_SET_TID_ADDRESS: u64 = 96;
+
+// Futex syscalls
+pub const SYS_FUTEX: u64 = 98;
+pub const SYS_SET_ROBUST_LIST: u64 = 99;
+pub const SYS_GET_ROBUST_LIST: u64 = 100;
+pub const SYS_SENDFILE: u64 = 71;
+pub const SYS_VMSPLICE: u64 = 75;
+pub const SYS_SPLICE: u64 = 76;
+pub const SYS_TEE: u64 = 77;
+
 // ============================================================================
 // Syscall wrapper functions
 // ============================================================================
@@ -183,56 +327,19 @@ pub const SYS_MSGCTL: u64 = 187;
 /// write(fd, buf, len)
 #[inline(always)]
 pub fn sys_write(fd: u64, buf: *const u8, len: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_WRITE,
-            in("x0") fd,
-            in("x1") buf,
-            in("x2") len,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_WRITE, fd, buf, len) }
 }
 
 /// read(fd, buf, len)
 #[inline(always)]
 pub fn sys_read(fd: u64, buf: *mut u8, len: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_READ,
-            in("x0") fd,
-            in("x1") buf,
-            in("x2") len,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_READ, fd, buf, len) }
 }
 
 /// openat(dirfd, path, flags, mode)
 #[inline(always)]
 pub fn sys_openat(dirfd: i32, path: *const u8, flags: u32, mode: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_OPENAT,
-            in("x0") dirfd as i64,
-            in("x1") path,
-            in("x2") flags as u64,
-            in("x3") mode as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_OPENAT, dirfd, path, flags, mode) }
 }
 
 /// open(path, flags, mode) - compatibility wrapper using openat with AT_FDCWD
@@ -244,208 +351,81 @@ pub fn sys_open(path: *const u8, flags: u32, mode: u32) -> i64 {
 /// close(fd)
 #[inline(always)]
 pub fn sys_close(fd: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_CLOSE,
-            in("x0") fd,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_CLOSE, fd) }
 }
 
 /// getpid()
 #[inline(always)]
 pub fn sys_getpid() -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETPID,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall0!(SYS_GETPID) }
 }
 
 /// getppid()
 #[inline(always)]
 pub fn sys_getppid() -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETPPID,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall0!(SYS_GETPPID) }
 }
 
 /// getuid()
 #[inline(always)]
 pub fn sys_getuid() -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETUID,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall0!(SYS_GETUID) }
 }
 
 /// geteuid()
 #[inline(always)]
 pub fn sys_geteuid() -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETEUID,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall0!(SYS_GETEUID) }
 }
 
 /// getgid()
 #[inline(always)]
 pub fn sys_getgid() -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETGID,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall0!(SYS_GETGID) }
 }
 
 /// getegid()
 #[inline(always)]
 pub fn sys_getegid() -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETEGID,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall0!(SYS_GETEGID) }
 }
 
 /// getpgid(pid)
 #[inline(always)]
 pub fn sys_getpgid(pid: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETPGID,
-            in("x0") pid,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_GETPGID, pid) }
 }
 
 /// getsid(pid)
 #[inline(always)]
 pub fn sys_getsid(pid: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETSID,
-            in("x0") pid,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_GETSID, pid) }
 }
 
 /// setpgid(pid, pgid)
 #[inline(always)]
 #[allow(dead_code)]
 pub fn sys_setpgid(pid: u64, pgid: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETPGID,
-            in("x0") pid,
-            in("x1") pgid,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_SETPGID, pid, pgid) }
 }
 
 /// setsid()
 #[inline(always)]
 #[allow(dead_code)]
 pub fn sys_setsid() -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETSID,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall0!(SYS_SETSID) }
 }
 
 /// gettid()
 #[inline(always)]
 pub fn sys_gettid() -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETTID,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall0!(SYS_GETTID) }
 }
 
 /// clone(flags, child_stack, parent_tidptr, child_tidptr, tls)
 #[inline(always)]
 pub fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: u64, child_tidptr: u64, tls: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_CLONE,
-            in("x0") flags,
-            in("x1") child_stack,
-            in("x2") parent_tidptr,
-            in("x3") child_tidptr,
-            in("x4") tls,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall5!(SYS_CLONE, flags, child_stack, parent_tidptr, child_tidptr, tls) }
 }
 
 /// fork() - compatibility wrapper using clone
@@ -467,258 +447,85 @@ pub fn sys_vfork() -> i64 {
 /// wait4(pid, wstatus, options, rusage)
 #[inline(always)]
 pub fn sys_wait4(pid: i64, wstatus: *mut i32, options: i32, rusage: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_WAIT4,
-            in("x0") pid,
-            in("x1") wstatus as u64,
-            in("x2") options as u64,
-            in("x3") rusage,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_WAIT4, pid, wstatus, options, rusage) }
 }
 
 /// getdents64(fd, dirp, count)
 #[inline(always)]
 pub fn sys_getdents64(fd: u64, dirp: *mut u8, count: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETDENTS64,
-            in("x0") fd,
-            in("x1") dirp,
-            in("x2") count,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_GETDENTS64, fd, dirp, count) }
 }
 
 /// nanosleep(req, rem)
 #[inline(always)]
 pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_NANOSLEEP,
-            in("x0") req,
-            in("x1") rem,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_NANOSLEEP, req, rem) }
 }
 
 /// clock_nanosleep(clockid, flags, req, rem)
 #[inline(always)]
 pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: *const Timespec, rem: *mut Timespec) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_CLOCK_NANOSLEEP,
-            in("x0") clockid as u64,
-            in("x1") flags as u64,
-            in("x2") req,
-            in("x3") rem,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_CLOCK_NANOSLEEP, clockid, flags, req, rem) }
 }
 
 /// clock_getres(clockid, res)
 #[inline(always)]
 pub fn sys_clock_getres(clockid: i32, res: *mut Timespec) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_CLOCK_GETRES,
-            in("x0") clockid as u64,
-            in("x1") res,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_CLOCK_GETRES, clockid, res) }
 }
 
 /// waitid(idtype, id, infop, options)
 #[inline(always)]
 pub fn sys_waitid(idtype: i32, id: u64, infop: *mut SigInfo, options: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_WAITID,
-            in("x0") idtype as u64,
-            in("x1") id,
-            in("x2") infop as u64,
-            in("x3") options as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_WAITID, idtype, id, infop, options) }
 }
 
 /// execve(pathname, argv, envp)
 #[inline(always)]
 pub fn sys_execve(pathname: *const u8, argv: *const *const u8, envp: *const *const u8) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_EXECVE,
-            in("x0") pathname as u64,
-            in("x1") argv as u64,
-            in("x2") envp as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_EXECVE, pathname, argv, envp) }
 }
 
 /// readv(fd, iov, iovcnt)
 #[inline(always)]
 pub fn sys_readv(fd: u64, iov: *const IoVec, iovcnt: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_READV,
-            in("x0") fd,
-            in("x1") iov,
-            in("x2") iovcnt,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_READV, fd, iov, iovcnt) }
 }
 
 /// writev(fd, iov, iovcnt)
 #[inline(always)]
 pub fn sys_writev(fd: u64, iov: *const IoVec, iovcnt: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_WRITEV,
-            in("x0") fd,
-            in("x1") iov,
-            in("x2") iovcnt,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_WRITEV, fd, iov, iovcnt) }
 }
 
-/// pread64(fd, buf, count, offset) - read from file at given offset without changing file position
+/// pread64(fd, buf, count, offset)
 #[inline(always)]
 pub fn sys_pread64(fd: i32, buf: *mut u8, count: u64, offset: i64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_PREAD64,
-            in("x0") fd as i64,
-            in("x1") buf,
-            in("x2") count,
-            in("x3") offset,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_PREAD64, fd, buf, count, offset) }
 }
 
-/// pwrite64(fd, buf, count, offset) - write to file at given offset without changing file position
+/// pwrite64(fd, buf, count, offset)
 #[inline(always)]
 pub fn sys_pwrite64(fd: i32, buf: *const u8, count: u64, offset: i64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_PWRITE64,
-            in("x0") fd as i64,
-            in("x1") buf,
-            in("x2") count,
-            in("x3") offset,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_PWRITE64, fd, buf, count, offset) }
 }
 
-/// preadv(fd, iov, iovcnt, offset) - scatter read at given offset without changing file position
+/// preadv(fd, iov, iovcnt, offset)
 #[inline(always)]
 pub fn sys_preadv(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_PREADV,
-            in("x0") fd as i64,
-            in("x1") iov,
-            in("x2") iovcnt as u64,
-            in("x3") offset,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_PREADV, fd, iov, iovcnt, offset) }
 }
 
-/// pwritev(fd, iov, iovcnt, offset) - gather write at given offset without changing file position
+/// pwritev(fd, iov, iovcnt, offset)
 #[inline(always)]
 pub fn sys_pwritev(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_PWRITEV,
-            in("x0") fd as i64,
-            in("x1") iov,
-            in("x2") iovcnt as u64,
-            in("x3") offset,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_PWRITEV, fd, iov, iovcnt, offset) }
 }
 
 /// mkdirat(dirfd, pathname, mode)
 #[inline(always)]
 pub fn sys_mkdirat(dirfd: i32, pathname: *const u8, mode: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MKDIRAT,
-            in("x0") dirfd as i64,
-            in("x1") pathname,
-            in("x2") mode as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_MKDIRAT, dirfd, pathname, mode) }
 }
 
 /// mkdir(pathname, mode) - compatibility wrapper
@@ -730,19 +537,7 @@ pub fn sys_mkdir(pathname: *const u8, mode: u32) -> i64 {
 /// unlinkat(dirfd, pathname, flags)
 #[inline(always)]
 pub fn sys_unlinkat(dirfd: i32, pathname: *const u8, flags: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_UNLINKAT,
-            in("x0") dirfd as i64,
-            in("x1") pathname,
-            in("x2") flags as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_UNLINKAT, dirfd, pathname, flags) }
 }
 
 /// rmdir(pathname) - compatibility wrapper using unlinkat with AT_REMOVEDIR
@@ -761,20 +556,7 @@ pub fn sys_unlink(pathname: *const u8) -> i64 {
 /// mknodat(dirfd, pathname, mode, dev)
 #[inline(always)]
 pub fn sys_mknodat(dirfd: i32, pathname: *const u8, mode: u32, dev: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MKNODAT,
-            in("x0") dirfd as i64,
-            in("x1") pathname,
-            in("x2") mode as u64,
-            in("x3") dev,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_MKNODAT, dirfd, pathname, mode, dev) }
 }
 
 /// mknod(pathname, mode, dev) - compatibility wrapper
@@ -786,19 +568,7 @@ pub fn sys_mknod(pathname: *const u8, mode: u32, dev: u64) -> i64 {
 /// symlinkat(target, newdirfd, linkpath)
 #[inline(always)]
 pub fn sys_symlinkat(target: *const u8, newdirfd: i32, linkpath: *const u8) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SYMLINKAT,
-            in("x0") target,
-            in("x1") newdirfd as i64,
-            in("x2") linkpath,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_SYMLINKAT, target, newdirfd, linkpath) }
 }
 
 /// symlink(target, linkpath) - compatibility wrapper
@@ -810,20 +580,7 @@ pub fn sys_symlink(target: *const u8, linkpath: *const u8) -> i64 {
 /// readlinkat(dirfd, pathname, buf, bufsiz)
 #[inline(always)]
 pub fn sys_readlinkat(dirfd: i32, pathname: *const u8, buf: *mut u8, bufsiz: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_READLINKAT,
-            in("x0") dirfd as i64,
-            in("x1") pathname,
-            in("x2") buf,
-            in("x3") bufsiz,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_READLINKAT, dirfd, pathname, buf, bufsiz) }
 }
 
 /// readlink(pathname, buf, bufsiz) - compatibility wrapper
@@ -835,21 +592,7 @@ pub fn sys_readlink(pathname: *const u8, buf: *mut u8, bufsiz: u64) -> i64 {
 /// linkat(olddirfd, oldpath, newdirfd, newpath, flags)
 #[inline(always)]
 pub fn sys_linkat(olddirfd: i32, oldpath: *const u8, newdirfd: i32, newpath: *const u8, flags: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_LINKAT,
-            in("x0") olddirfd as i64,
-            in("x1") oldpath,
-            in("x2") newdirfd as i64,
-            in("x3") newpath,
-            in("x4") flags as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall5!(SYS_LINKAT, olddirfd, oldpath, newdirfd, newpath, flags) }
 }
 
 /// link(oldpath, newpath) - compatibility wrapper
@@ -860,39 +603,15 @@ pub fn sys_link(oldpath: *const u8, newpath: *const u8) -> i64 {
 
 /// lseek(fd, offset, whence)
 pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_LSEEK,
-            in("x0") fd as i64,
-            in("x1") offset,
-            in("x2") whence as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_LSEEK, fd, offset, whence) }
 }
 
 /// ftruncate(fd, length)
 pub fn sys_ftruncate(fd: i32, length: i64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_FTRUNCATE,
-            in("x0") fd as i64,
-            in("x1") length,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_FTRUNCATE, fd, length) }
 }
 
 /// truncate(pathname, length) - compatibility wrapper
-/// Opens file, truncates, closes
 pub fn sys_truncate(pathname: *const u8, length: i64) -> i64 {
     let fd = sys_openat(AT_FDCWD, pathname, 1, 0); // O_WRONLY = 1
     if fd < 0 {
@@ -906,20 +625,7 @@ pub fn sys_truncate(pathname: *const u8, length: i64) -> i64 {
 /// fchmodat(dirfd, pathname, mode, flags)
 #[inline(always)]
 pub fn sys_fchmodat(dirfd: i32, pathname: *const u8, mode: u32, flags: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_FCHMODAT,
-            in("x0") dirfd as i64,
-            in("x1") pathname,
-            in("x2") mode as u64,
-            in("x3") flags as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_FCHMODAT, dirfd, pathname, mode, flags) }
 }
 
 /// chmod(pathname, mode) - compatibility wrapper
@@ -929,38 +635,13 @@ pub fn sys_chmod(pathname: *const u8, mode: u32) -> i64 {
 
 /// fchmod(fd, mode)
 pub fn sys_fchmod(fd: i32, mode: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_FCHMOD,
-            in("x0") fd as i64,
-            in("x1") mode as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_FCHMOD, fd, mode) }
 }
 
 /// fchownat(dirfd, pathname, owner, group, flags)
 #[inline(always)]
 pub fn sys_fchownat(dirfd: i32, pathname: *const u8, owner: u32, group: u32, flags: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_FCHOWNAT,
-            in("x0") dirfd as i64,
-            in("x1") pathname,
-            in("x2") owner as u64,
-            in("x3") group as u64,
-            in("x4") flags as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall5!(SYS_FCHOWNAT, dirfd, pathname, owner, group, flags) }
 }
 
 /// chown(pathname, owner, group) - compatibility wrapper
@@ -976,38 +657,13 @@ pub fn sys_lchown(pathname: *const u8, owner: u32, group: u32) -> i64 {
 
 /// fchown(fd, owner, group)
 pub fn sys_fchown(fd: i32, owner: u32, group: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_FCHOWN,
-            in("x0") fd as i64,
-            in("x1") owner as u64,
-            in("x2") group as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_FCHOWN, fd, owner, group) }
 }
 
 /// fstatat(dirfd, pathname, statbuf, flags)
 #[inline(always)]
 pub fn sys_fstatat(dirfd: i32, pathname: *const u8, statbuf: *mut Stat, flags: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_FSTATAT,
-            in("x0") dirfd as i64,
-            in("x1") pathname,
-            in("x2") statbuf,
-            in("x3") flags as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_FSTATAT, dirfd, pathname, statbuf, flags) }
 }
 
 /// stat(pathname, statbuf) - compatibility wrapper
@@ -1023,54 +679,18 @@ pub fn sys_lstat(pathname: *const u8, statbuf: *mut Stat) -> i64 {
 
 /// umask(mask)
 pub fn sys_umask(mask: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_UMASK,
-            in("x0") mask as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_UMASK, mask) }
 }
 
 /// utimensat(dirfd, pathname, times, flags)
 pub fn sys_utimensat(dirfd: i32, pathname: *const u8, times: *const Timespec, flags: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_UTIMENSAT,
-            in("x0") dirfd as i64,
-            in("x1") pathname as u64,
-            in("x2") times as u64,
-            in("x3") flags as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_UTIMENSAT, dirfd, pathname, times, flags) }
 }
 
 /// renameat(olddirfd, oldpath, newdirfd, newpath)
 #[inline(always)]
 pub fn sys_renameat(olddirfd: i32, oldpath: *const u8, newdirfd: i32, newpath: *const u8) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_RENAMEAT,
-            in("x0") olddirfd as i64,
-            in("x1") oldpath,
-            in("x2") newdirfd as i64,
-            in("x3") newpath,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_RENAMEAT, olddirfd, oldpath, newdirfd, newpath) }
 }
 
 /// rename(oldpath, newpath) - compatibility wrapper
@@ -1080,100 +700,36 @@ pub fn sys_rename(oldpath: *const u8, newpath: *const u8) -> i64 {
 
 /// mount(source, target, fstype, flags, data)
 pub fn sys_mount(source: *const u8, target: *const u8, fstype: *const u8, flags: u64, data: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MOUNT,
-            in("x0") source,
-            in("x1") target,
-            in("x2") fstype,
-            in("x3") flags,
-            in("x4") data,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall5!(SYS_MOUNT, source, target, fstype, flags, data) }
 }
 
 /// umount2(target, flags)
 pub fn sys_umount2(target: *const u8, flags: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_UMOUNT2,
-            in("x0") target,
-            in("x1") flags,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_UMOUNT2, target, flags) }
 }
 
 /// sync() - synchronize cached writes to persistent storage
 #[inline(always)]
 pub fn sys_sync() -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SYNC,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall0!(SYS_SYNC) }
 }
 
 /// fsync(fd) - synchronize a file's in-core state with storage device
 #[inline(always)]
 pub fn sys_fsync(fd: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_FSYNC,
-            in("x0") fd as i64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_FSYNC, fd) }
 }
 
 /// fdatasync(fd) - synchronize a file's in-core data with storage device
 #[inline(always)]
 pub fn sys_fdatasync(fd: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_FDATASYNC,
-            in("x0") fd as i64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_FDATASYNC, fd) }
 }
 
 /// syncfs(fd) - synchronize filesystem containing file referred to by fd
 #[inline(always)]
 pub fn sys_syncfs(fd: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SYNCFS,
-            in("x0") fd as i64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_SYNCFS, fd) }
 }
 
 /// reboot(magic1, magic2, cmd) - does not return
@@ -1212,51 +768,19 @@ pub fn sys_exit(status: u64) -> ! {
 /// uname(buf) - get system identification
 #[inline(always)]
 pub fn sys_uname(buf: *mut UtsName) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_UNAME,
-            in("x0") buf as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_UNAME, buf) }
 }
 
 /// sethostname(name, len) - set hostname
 #[inline(always)]
 pub fn sys_sethostname(name: *const u8, len: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETHOSTNAME,
-            in("x0") name as u64,
-            in("x1") len,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_SETHOSTNAME, name, len) }
 }
 
 /// setdomainname(name, len) - set NIS domain name
 #[inline(always)]
 pub fn sys_setdomainname(name: *const u8, len: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETDOMAINNAME,
-            in("x0") name as u64,
-            in("x1") len,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_SETDOMAINNAME, name, len) }
 }
 
 // ============================================================================
@@ -1266,108 +790,37 @@ pub fn sys_setdomainname(name: *const u8, len: u64) -> i64 {
 /// rt_sigaction(sig, act, oact, sigsetsize) - examine and change signal action
 #[inline(always)]
 pub fn sys_rt_sigaction(sig: u32, act: u64, oact: u64, sigsetsize: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_RT_SIGACTION,
-            in("x0") sig as u64,
-            in("x1") act,
-            in("x2") oact,
-            in("x3") sigsetsize,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_RT_SIGACTION, sig, act, oact, sigsetsize) }
 }
 
 /// rt_sigprocmask(how, set, oset, sigsetsize) - examine and change blocked signals
 #[inline(always)]
 pub fn sys_rt_sigprocmask(how: i32, set: u64, oset: u64, sigsetsize: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_RT_SIGPROCMASK,
-            in("x0") how as u64,
-            in("x1") set,
-            in("x2") oset,
-            in("x3") sigsetsize,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_RT_SIGPROCMASK, how, set, oset, sigsetsize) }
 }
 
 /// rt_sigpending(set, sigsetsize) - examine pending signals
 #[inline(always)]
 pub fn sys_rt_sigpending(set: u64, sigsetsize: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_RT_SIGPENDING,
-            in("x0") set,
-            in("x1") sigsetsize,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_RT_SIGPENDING, set, sigsetsize) }
 }
 
 /// kill(pid, sig) - send signal to process
 #[inline(always)]
 pub fn sys_kill(pid: i64, sig: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_KILL,
-            in("x0") pid as u64,
-            in("x1") sig as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_KILL, pid, sig) }
 }
 
 /// tgkill(tgid, tid, sig) - send signal to specific thread
 #[inline(always)]
 pub fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_TGKILL,
-            in("x0") tgid as u64,
-            in("x1") tid as u64,
-            in("x2") sig as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_TGKILL, tgid, tid, sig) }
 }
 
 /// tkill(tid, sig) - send signal to thread (deprecated)
 #[inline(always)]
 pub fn sys_tkill(tid: i64, sig: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_TKILL,
-            in("x0") tid as u64,
-            in("x1") sig as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_TKILL, tid, sig) }
 }
 
 // ============================================================================
@@ -1375,53 +828,24 @@ pub fn sys_tkill(tid: i64, sig: u32) -> i64 {
 // ============================================================================
 
 /// pipe2(pipefd, flags) - create a pipe with flags
-/// Note: aarch64 doesn't have pipe(), only pipe2()
 #[inline(always)]
 pub fn sys_pipe2(pipefd: *mut i32, flags: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_PIPE2,
-            in("x0") pipefd as u64,
-            in("x1") flags as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_PIPE2, pipefd, flags) }
 }
 
 /// sys_pipe - wrapper that calls pipe2 with flags=0
-/// Provides x86_64-compatible interface
 #[inline(always)]
 pub fn sys_pipe(pipefd: *mut i32) -> i64 {
     sys_pipe2(pipefd, 0)
 }
 
 /// ppoll(fds, nfds, tmo_p, sigmask, sigsetsize) - wait for events on file descriptors
-/// Note: aarch64 doesn't have poll(), only ppoll()
 #[inline(always)]
 pub fn sys_ppoll(fds: *mut PollFd, nfds: u32, tmo_p: *const Timespec, sigmask: u64, sigsetsize: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_PPOLL,
-            in("x0") fds as u64,
-            in("x1") nfds as u64,
-            in("x2") tmo_p as u64,
-            in("x3") sigmask,
-            in("x4") sigsetsize,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall5!(SYS_PPOLL, fds, nfds, tmo_p, sigmask, sigsetsize) }
 }
 
 /// sys_poll - wrapper that calls ppoll with NULL sigmask
-/// Provides x86_64-compatible interface
 #[inline(always)]
 pub fn sys_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i64 {
     if timeout < 0 {
@@ -1437,31 +861,14 @@ pub fn sys_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i64 {
     }
 }
 
-/// pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask) - synchronous I/O multiplexing
-/// Note: aarch64 doesn't have select(), only pselect6()
+/// pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
 #[inline(always)]
 #[allow(dead_code)]
 pub fn sys_pselect6(nfds: i32, readfds: *mut FdSet, writefds: *mut FdSet, exceptfds: *mut FdSet, timeout: *const Timespec, sigmask: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_PSELECT6,
-            in("x0") nfds as u64,
-            in("x1") readfds as u64,
-            in("x2") writefds as u64,
-            in("x3") exceptfds as u64,
-            in("x4") timeout as u64,
-            in("x5") sigmask,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall6!(SYS_PSELECT6, nfds, readfds, writefds, exceptfds, timeout, sigmask) }
 }
 
 /// sys_select - wrapper that calls pselect6 with NULL sigmask
-/// Provides x86_64-compatible interface
 #[inline(always)]
 pub fn sys_select(nfds: i32, readfds: *mut FdSet, writefds: *mut FdSet, exceptfds: *mut FdSet, timeout: *mut Timeval) -> i64 {
     if timeout.is_null() {
@@ -1485,424 +892,151 @@ pub fn sys_select(nfds: i32, readfds: *mut FdSet, writefds: *mut FdSet, exceptfd
 /// mmap(addr, length, prot, flags, fd, offset) - map memory
 #[inline(always)]
 pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MMAP,
-            in("x0") addr,
-            in("x1") length,
-            in("x2") prot as u64,
-            in("x3") flags as u64,
-            in("x4") fd as u64,
-            in("x5") offset,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall6!(SYS_MMAP, addr, length, prot, flags, fd, offset) }
+}
+
+/// mprotect(addr, len, prot) - change memory protection
+#[inline(always)]
+pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
+    unsafe { syscall3!(SYS_MPROTECT, addr, len, prot) }
 }
 
 /// munmap(addr, length) - unmap memory
 #[inline(always)]
 pub fn sys_munmap(addr: u64, length: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MUNMAP,
-            in("x0") addr,
-            in("x1") length,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_MUNMAP, addr, length) }
 }
 
 /// brk(addr) - change program break
-///
-/// If addr is 0, returns current program break.
-/// Otherwise, attempts to set program break to addr.
-/// Returns new program break on success, current break on failure.
 #[inline(always)]
 pub fn sys_brk(addr: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_BRK,
-            in("x0") addr,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_BRK, addr) }
 }
 
 /// mlock(addr, len) - lock pages in memory
-///
-/// Returns 0 on success, negative errno on error.
 #[inline(always)]
 pub fn sys_mlock(addr: u64, len: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MLOCK,
-            in("x0") addr,
-            in("x1") len,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_MLOCK, addr, len) }
 }
 
 /// mlock2(addr, len, flags) - lock pages in memory with flags
-///
-/// Returns 0 on success, negative errno on error.
 #[inline(always)]
 pub fn sys_mlock2(addr: u64, len: u64, flags: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MLOCK2,
-            in("x0") addr,
-            in("x1") len,
-            in("x2") flags,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_MLOCK2, addr, len, flags) }
 }
 
 /// munlock(addr, len) - unlock pages
-///
-/// Returns 0 on success, negative errno on error.
 #[inline(always)]
 pub fn sys_munlock(addr: u64, len: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MUNLOCK,
-            in("x0") addr,
-            in("x1") len,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_MUNLOCK, addr, len) }
 }
 
 /// mlockall(flags) - lock all current and/or future mappings
-///
-/// Returns 0 on success, negative errno on error.
 #[inline(always)]
 pub fn sys_mlockall(flags: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MLOCKALL,
-            in("x0") flags,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_MLOCKALL, flags) }
 }
 
 /// munlockall() - unlock all mappings
-///
-/// Returns 0 on success, negative errno on error.
 #[inline(always)]
 pub fn sys_munlockall() -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MUNLOCKALL,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall0!(SYS_MUNLOCKALL) }
+}
+
+/// msync(addr, length, flags) - synchronize a file with a memory map
+#[inline(always)]
+pub fn sys_msync(addr: u64, length: u64, flags: i32) -> i64 {
+    unsafe { syscall3!(SYS_MSYNC, addr, length, flags) }
+}
+
+/// madvise(addr, length, advice) - give advice about use of memory
+#[inline(always)]
+pub fn sys_madvise(addr: u64, length: u64, advice: i32) -> i64 {
+    unsafe { syscall3!(SYS_MADVISE, addr, length, advice) }
+}
+
+/// mremap(old_addr, old_len, new_len, flags, new_addr) - remap a virtual memory region
+#[inline(always)]
+pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_addr: u64) -> i64 {
+    unsafe { syscall5!(SYS_MREMAP, old_addr, old_len, new_len, flags, new_addr) }
 }
 
 /// getcpu(cpup, nodep) - get CPU and NUMA node for calling thread
-///
-/// Returns 0 on success, negative errno on error.
-/// Both pointers can be NULL if that information is not needed.
 #[inline(always)]
 pub fn sys_getcpu(cpup: *mut u32, nodep: *mut u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETCPU,
-            in("x0") cpup,
-            in("x1") nodep,
-            in("x2") 0u64, // unused third parameter (legacy tcache)
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_GETCPU, cpup, nodep, 0u64) }
 }
 
 /// getpriority(which, who) - get program scheduling priority
-///
-/// Returns the priority of a process, process group, or user.
-/// The `which` argument selects the type: PRIO_PROCESS, PRIO_PGRP, or PRIO_USER.
-/// The `who` argument selects the specific process/group/user (0 = calling process).
-///
-/// Returns 20 - nice value (range 1-40) on success, negative errno on error.
-/// Note: To get the actual nice value, compute: 20 - return_value
 #[inline(always)]
 pub fn sys_getpriority(which: i32, who: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETPRIORITY,
-            in("x0") which as u64,
-            in("x1") who,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_GETPRIORITY, which, who) }
 }
 
 /// setpriority(which, who, niceval) - set program scheduling priority
-///
-/// Sets the priority of a process, process group, or user.
-/// The `which` argument selects the type: PRIO_PROCESS, PRIO_PGRP, or PRIO_USER.
-/// The `who` argument selects the specific process/group/user (0 = calling process).
-/// The `niceval` argument is the new nice value (-20 to 19).
-///
-/// Returns 0 on success, negative errno on error.
 #[inline(always)]
 pub fn sys_setpriority(which: i32, who: u64, niceval: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETPRIORITY,
-            in("x0") which as u64,
-            in("x1") who,
-            in("x2") niceval as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_SETPRIORITY, which, who, niceval) }
 }
 
 /// setuid(uid) - set user identity
-///
-/// Sets the effective user ID of the calling process.
-/// If the calling process has root privilege, also sets the real and saved UID.
-///
-/// Returns 0 on success, -EPERM if not permitted.
 #[inline(always)]
 pub fn sys_setuid(uid: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETUID,
-            in("x0") uid as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_SETUID, uid) }
 }
 
 /// setgid(gid) - set group identity
-///
-/// Sets the effective group ID of the calling process.
-/// If the calling process has root privilege, also sets the real and saved GID.
-///
-/// Returns 0 on success, -EPERM if not permitted.
 #[inline(always)]
 pub fn sys_setgid(gid: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETGID,
-            in("x0") gid as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_SETGID, gid) }
 }
 
 /// getresuid(ruid, euid, suid) - get real, effective, and saved user IDs
-///
-/// Returns 0 on success, -EFAULT if pointers are invalid.
 #[inline(always)]
 pub fn sys_getresuid(ruid: *mut u32, euid: *mut u32, suid: *mut u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETRESUID,
-            in("x0") ruid as u64,
-            in("x1") euid as u64,
-            in("x2") suid as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_GETRESUID, ruid, euid, suid) }
 }
 
 /// getresgid(rgid, egid, sgid) - get real, effective, and saved group IDs
-///
-/// Returns 0 on success, -EFAULT if pointers are invalid.
 #[inline(always)]
 pub fn sys_getresgid(rgid: *mut u32, egid: *mut u32, sgid: *mut u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETRESGID,
-            in("x0") rgid as u64,
-            in("x1") egid as u64,
-            in("x2") sgid as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_GETRESGID, rgid, egid, sgid) }
 }
 
 /// setresuid(ruid, euid, suid) - set real, effective, and saved user IDs
-///
-/// A value of -1 (0xFFFFFFFF) means "don't change this field".
-/// Returns 0 on success, -EPERM if not permitted.
 #[inline(always)]
 pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETRESUID,
-            in("x0") ruid as u64,
-            in("x1") euid as u64,
-            in("x2") suid as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_SETRESUID, ruid, euid, suid) }
 }
 
 /// setresgid(rgid, egid, sgid) - set real, effective, and saved group IDs
-///
-/// A value of -1 (0xFFFFFFFF) means "don't change this field".
-/// Returns 0 on success, -EPERM if not permitted.
 #[inline(always)]
 pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETRESGID,
-            in("x0") rgid as u64,
-            in("x1") egid as u64,
-            in("x2") sgid as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_SETRESGID, rgid, egid, sgid) }
 }
 
 /// setreuid(ruid, euid) - set real and effective user IDs
-///
-/// A value of -1 (0xFFFFFFFF) means "don't change this field".
-/// Returns 0 on success, -EPERM if not permitted.
 #[inline(always)]
 pub fn sys_setreuid(ruid: u32, euid: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETREUID,
-            in("x0") ruid as u64,
-            in("x1") euid as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_SETREUID, ruid, euid) }
 }
 
 /// setregid(rgid, egid) - set real and effective group IDs
-///
-/// A value of -1 (0xFFFFFFFF) means "don't change this field".
-/// Returns 0 on success, -EPERM if not permitted.
 #[inline(always)]
 pub fn sys_setregid(rgid: u32, egid: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETREGID,
-            in("x0") rgid as u64,
-            in("x1") egid as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_SETREGID, rgid, egid) }
 }
 
 /// setfsuid(uid) - set filesystem UID
-///
-/// Returns the OLD fsuid value (not an error code).
-/// If permission denied or invalid, returns old fsuid without changing.
 #[inline(always)]
 pub fn sys_setfsuid(uid: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETFSUID,
-            in("x0") uid as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_SETFSUID, uid) }
 }
 
 /// setfsgid(gid) - set filesystem GID
-///
-/// Returns the OLD fsgid value (not an error code).
-/// If permission denied or invalid, returns old fsgid without changing.
 #[inline(always)]
 pub fn sys_setfsgid(gid: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETFSGID,
-            in("x0") gid as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_SETFSGID, gid) }
 }
 
 // ============================================================================
@@ -1910,89 +1044,33 @@ pub fn sys_setfsgid(gid: u32) -> i64 {
 // ============================================================================
 
 /// sysinfo(info) - return system information
-///
-/// Returns system-wide statistics including uptime, memory, and process count.
-/// Returns 0 on success, -EFAULT if pointer is invalid.
 #[inline(always)]
 pub fn sys_sysinfo(info: *mut u8) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SYSINFO,
-            in("x0") info as u64,
-            lateout("x0") ret,
-            // Syscalls may clobber x1-x7, x16, x17 (temporary registers)
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_SYSINFO, info) }
 }
 
 /// getrusage(who, usage) - get resource usage
-///
-/// Returns resource usage for the specified target.
-/// `who`: RUSAGE_SELF (0), RUSAGE_CHILDREN (-1), or RUSAGE_THREAD (1)
-/// Returns 0 on success, -EINVAL for invalid who, -EFAULT if copy fails.
 #[inline(always)]
 pub fn sys_getrusage(who: i32, usage: *mut u8) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETRUSAGE,
-            in("x0") who as u64,
-            in("x1") usage as u64,
-            lateout("x0") ret,
-            // Syscalls may clobber x1-x7, x16, x17 (temporary registers)
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_GETRUSAGE, who, usage) }
 }
 
 /// fcntl(fd, cmd, arg) - file control operations
-///
-/// Performs various operations on file descriptors.
-/// `cmd`: F_DUPFD(0), F_GETFD(1), F_SETFD(2), F_GETFL(3), F_SETFL(4), F_DUPFD_CLOEXEC(1030)
-/// Returns new fd for F_DUPFD*, flags for F_GET*, 0 for F_SET*, or negative errno.
 #[inline(always)]
 pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_FCNTL,
-            in("x0") fd as u64,
-            in("x1") cmd as u64,
-            in("x2") arg,
-            lateout("x0") ret,
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_FCNTL, fd, cmd, arg) }
+}
+
+/// ioctl(fd, request, arg) - device control operations
+#[inline(always)]
+pub fn sys_ioctl(fd: i32, request: u64, arg: u64) -> i64 {
+    unsafe { syscall3!(SYS_IOCTL, fd, request, arg) }
 }
 
 /// getrandom(buf, buflen, flags) - get random bytes
-///
-/// Fills buffer with random bytes from kernel CRNG.
-/// `flags`: GRND_NONBLOCK(0x01), GRND_RANDOM(0x02), GRND_INSECURE(0x04)
-/// Returns number of bytes written, or negative errno.
 #[inline(always)]
 pub fn sys_getrandom(buf: *mut u8, buflen: usize, flags: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETRANDOM,
-            in("x0") buf as u64,
-            in("x1") buflen as u64,
-            in("x2") flags as u64,
-            lateout("x0") ret,
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_GETRANDOM, buf, buflen, flags) }
 }
 
 // ============================================================================
@@ -2000,161 +1078,45 @@ pub fn sys_getrandom(buf: *mut u8, buflen: usize, flags: u32) -> i64 {
 // ============================================================================
 
 /// sched_getscheduler(pid) - get scheduling policy
-///
-/// Returns the scheduling policy of the specified process.
-/// `pid`: Process ID (0 = calling process)
-/// Returns policy (SCHED_NORMAL=0, SCHED_FIFO=1, SCHED_RR=2, etc.) or negative errno.
 #[inline(always)]
 pub fn sys_sched_getscheduler(pid: i64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SCHED_GETSCHEDULER,
-            in("x0") pid as u64,
-            lateout("x0") ret,
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_SCHED_GETSCHEDULER, pid) }
 }
 
 /// sched_setscheduler(pid, policy, param) - set scheduling policy and parameters
-///
-/// Sets the scheduling policy and parameters for the specified process.
-/// `pid`: Process ID (0 = calling process)
-/// `policy`: SCHED_NORMAL(0), SCHED_FIFO(1), SCHED_RR(2), etc.
-/// `param`: Pointer to sched_param struct (contains sched_priority)
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_sched_setscheduler(pid: i64, policy: i32, param: *const super::SchedParam) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SCHED_SETSCHEDULER,
-            in("x0") pid as u64,
-            in("x1") policy as u64,
-            in("x2") param as u64,
-            lateout("x0") ret,
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_SCHED_SETSCHEDULER, pid, policy, param) }
 }
 
 /// sched_getparam(pid, param) - get scheduling parameters
-///
-/// Gets the scheduling parameters for the specified process.
-/// `pid`: Process ID (0 = calling process)
-/// `param`: Pointer to sched_param struct to fill
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_sched_getparam(pid: i64, param: *mut super::SchedParam) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SCHED_GETPARAM,
-            in("x0") pid as u64,
-            in("x1") param as u64,
-            lateout("x0") ret,
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_SCHED_GETPARAM, pid, param) }
 }
 
 /// sched_setparam(pid, param) - set scheduling parameters
-///
-/// Sets the scheduling parameters for the specified process.
-/// `pid`: Process ID (0 = calling process)
-/// `param`: Pointer to sched_param struct
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_sched_setparam(pid: i64, param: *const super::SchedParam) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SCHED_SETPARAM,
-            in("x0") pid as u64,
-            in("x1") param as u64,
-            lateout("x0") ret,
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_SCHED_SETPARAM, pid, param) }
 }
 
 /// sched_getaffinity(pid, cpusetsize, mask) - get CPU affinity mask
-///
-/// Gets the CPU affinity mask for the specified process.
-/// `pid`: Process ID (0 = calling process)
-/// `cpusetsize`: Size of the mask buffer in bytes
-/// `mask`: Pointer to buffer for CPU mask
-/// Returns number of bytes written on success, or negative errno.
 #[inline(always)]
 pub fn sys_sched_getaffinity(pid: i64, cpusetsize: usize, mask: *mut u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SCHED_GETAFFINITY,
-            in("x0") pid as u64,
-            in("x1") cpusetsize as u64,
-            in("x2") mask as u64,
-            lateout("x0") ret,
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_SCHED_GETAFFINITY, pid, cpusetsize, mask) }
 }
 
 /// sched_setaffinity(pid, cpusetsize, mask) - set CPU affinity mask
-///
-/// Sets the CPU affinity mask for the specified process.
-/// `pid`: Process ID (0 = calling process)
-/// `cpusetsize`: Size of the mask buffer in bytes
-/// `mask`: Pointer to CPU mask
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_sched_setaffinity(pid: i64, cpusetsize: usize, mask: *const u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SCHED_SETAFFINITY,
-            in("x0") pid as u64,
-            in("x1") cpusetsize as u64,
-            in("x2") mask as u64,
-            lateout("x0") ret,
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_SCHED_SETAFFINITY, pid, cpusetsize, mask) }
 }
 
 /// sched_rr_get_interval(pid, tp) - get round-robin time quantum
-///
-/// Gets the round-robin time quantum for the specified process.
-/// `pid`: Process ID (0 = calling process)
-/// `tp`: Pointer to timespec struct to fill
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_sched_rr_get_interval(pid: i64, tp: *mut Timespec) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SCHED_RR_GET_INTERVAL,
-            in("x0") pid as u64,
-            in("x1") tp as u64,
-            lateout("x0") ret,
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_SCHED_RR_GET_INTERVAL, pid, tp) }
 }
 
 // ============================================================================
@@ -2162,114 +1124,37 @@ pub fn sys_sched_rr_get_interval(pid: i64, tp: *mut Timespec) -> i64 {
 // ============================================================================
 
 /// getrlimit(resource, rlim) - get resource limits
-///
-/// Gets the soft and hard limits for the specified resource.
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_getrlimit(resource: u32, rlim: *mut RLimit) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETRLIMIT,
-            in("x0") resource as u64,
-            in("x1") rlim as u64,
-            lateout("x0") ret,
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_GETRLIMIT, resource, rlim) }
 }
 
 /// setrlimit(resource, rlim) - set resource limits
-///
-/// Sets the soft and hard limits for the specified resource.
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_setrlimit(resource: u32, rlim: *const RLimit) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETRLIMIT,
-            in("x0") resource as u64,
-            in("x1") rlim as u64,
-            lateout("x0") ret,
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_SETRLIMIT, resource, rlim) }
 }
 
 /// prlimit64(pid, resource, new_rlim, old_rlim) - get/set resource limits
-///
-/// Gets and/or sets resource limits for a process.
-/// `pid`: Process ID (0 = calling process)
-/// `resource`: Resource type (RLIMIT_*)
-/// `new_rlim`: New limits (NULL to only get)
-/// `old_rlim`: Buffer for old limits (NULL to only set)
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim: *const RLimit, old_rlim: *mut RLimit) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_PRLIMIT64,
-            in("x0") pid as u64,
-            in("x1") resource as u64,
-            in("x2") new_rlim as u64,
-            in("x3") old_rlim as u64,
-            lateout("x0") ret,
-            clobber_abi("C"),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_PRLIMIT64, pid, resource, new_rlim, old_rlim) }
 }
 
 // ============================================================================
 // Namespace syscalls
 // ============================================================================
 
-/// Namespace clone flags
-pub const CLONE_NEWNS: u64 = 0x0002_0000;
-pub const CLONE_NEWUTS: u64 = 0x0400_0000;
-pub const CLONE_NEWIPC: u64 = 0x0800_0000;
-pub const CLONE_NEWUSER: u64 = 0x1000_0000;
-pub const CLONE_NEWPID: u64 = 0x2000_0000;
-pub const CLONE_NEWNET: u64 = 0x4000_0000;
-
 /// unshare(flags) - disassociate parts of process execution context
 #[inline(always)]
 pub fn sys_unshare(flags: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_UNSHARE,
-            in("x0") flags,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_UNSHARE, flags) }
 }
 
 /// setns(fd, nstype) - reassociate thread with a namespace
 #[inline(always)]
 pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETNS,
-            in("x0") fd as u64,
-            in("x1") nstype as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_SETNS, fd, nstype) }
 }
 
 // ============================================================================
@@ -2277,318 +1162,101 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
 // ============================================================================
 
 /// socket(domain, type, protocol) - create a socket
-///
-/// Creates a socket for network communication.
-/// Returns file descriptor on success, or negative errno.
 #[inline(always)]
 pub fn sys_socket(domain: i32, sock_type: i32, protocol: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SOCKET,
-            in("x0") domain as u64,
-            in("x1") sock_type as u64,
-            in("x2") protocol as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_SOCKET, domain, sock_type, protocol) }
 }
 
 /// connect(fd, addr, addrlen) - initiate a connection on a socket
-///
-/// Connects the socket to the address specified.
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_connect(fd: i32, addr: *const u8, addrlen: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_CONNECT,
-            in("x0") fd as u64,
-            in("x1") addr as u64,
-            in("x2") addrlen as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_CONNECT, fd, addr, addrlen) }
 }
 
 /// bind(fd, addr, addrlen) - bind a name to a socket
-///
-/// Assigns the address to the socket.
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_bind(fd: i32, addr: *const u8, addrlen: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_BIND,
-            in("x0") fd as u64,
-            in("x1") addr as u64,
-            in("x2") addrlen as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_BIND, fd, addr, addrlen) }
 }
 
 /// listen(fd, backlog) - listen for connections on a socket
-///
-/// Marks the socket as a passive socket for accepting connections.
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_LISTEN,
-            in("x0") fd as u64,
-            in("x1") backlog as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_LISTEN, fd, backlog) }
 }
 
 /// shutdown(fd, how) - shut down part of a full-duplex connection
-///
-/// Shuts down the connection. `how`: SHUT_RD(0), SHUT_WR(1), SHUT_RDWR(2)
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_shutdown(fd: i32, how: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SHUTDOWN,
-            in("x0") fd as u64,
-            in("x1") how as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_SHUTDOWN, fd, how) }
 }
 
 /// getsockname(fd, addr, addrlen) - get socket name
-///
-/// Returns the current address bound to the socket.
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_getsockname(fd: i32, addr: *mut u8, addrlen: *mut u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETSOCKNAME,
-            in("x0") fd as u64,
-            in("x1") addr as u64,
-            in("x2") addrlen as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_GETSOCKNAME, fd, addr, addrlen) }
 }
 
 /// getpeername(fd, addr, addrlen) - get name of connected peer socket
-///
-/// Returns the address of the peer connected to the socket.
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_getpeername(fd: i32, addr: *mut u8, addrlen: *mut u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETPEERNAME,
-            in("x0") fd as u64,
-            in("x1") addr as u64,
-            in("x2") addrlen as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_GETPEERNAME, fd, addr, addrlen) }
 }
 
 /// sendto(fd, buf, len, flags, dest_addr, addrlen) - send a message on a socket
-///
-/// Sends data to a socket. For connected sockets, dest_addr can be NULL.
-/// Returns number of bytes sent, or negative errno.
 #[inline(always)]
 pub fn sys_sendto(fd: i32, buf: *const u8, len: usize, flags: i32, dest_addr: *const u8, addrlen: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SENDTO,
-            in("x0") fd as u64,
-            in("x1") buf as u64,
-            in("x2") len as u64,
-            in("x3") flags as u64,
-            in("x4") dest_addr as u64,
-            in("x5") addrlen as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall6!(SYS_SENDTO, fd, buf, len, flags, dest_addr, addrlen) }
 }
 
 /// recvfrom(fd, buf, len, flags, src_addr, addrlen) - receive a message from a socket
-///
-/// Receives data from a socket.
-/// Returns number of bytes received, or negative errno.
 #[inline(always)]
 pub fn sys_recvfrom(fd: i32, buf: *mut u8, len: usize, flags: i32, src_addr: *mut u8, addrlen: *mut u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_RECVFROM,
-            in("x0") fd as u64,
-            in("x1") buf as u64,
-            in("x2") len as u64,
-            in("x3") flags as u64,
-            in("x4") src_addr as u64,
-            in("x5") addrlen as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall6!(SYS_RECVFROM, fd, buf, len, flags, src_addr, addrlen) }
 }
 
 /// setsockopt(fd, level, optname, optval, optlen) - set socket options
-///
-/// Sets options on a socket.
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optlen: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SETSOCKOPT,
-            in("x0") fd as u64,
-            in("x1") level as u64,
-            in("x2") optname as u64,
-            in("x3") optval as u64,
-            in("x4") optlen as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall5!(SYS_SETSOCKOPT, fd, level, optname, optval, optlen) }
 }
 
 /// getsockopt(fd, level, optname, optval, optlen) - get socket options
-///
-/// Gets options on a socket.
-/// Returns 0 on success, or negative errno.
 #[inline(always)]
 pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen: *mut u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GETSOCKOPT,
-            in("x0") fd as u64,
-            in("x1") level as u64,
-            in("x2") optname as u64,
-            in("x3") optval as u64,
-            in("x4") optlen as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall5!(SYS_GETSOCKOPT, fd, level, optname, optval, optlen) }
 }
 
 // ============================================================================
 // Futex syscalls
 // ============================================================================
 
-pub const SYS_FUTEX: u64 = 98;
-pub const SYS_SET_ROBUST_LIST: u64 = 99;
-pub const SYS_GET_ROBUST_LIST: u64 = 100;
-
 /// futex(uaddr, op, val, timeout, uaddr2, val3) - fast userspace mutex
-///
-/// Performs a futex operation on a userspace futex.
-/// Returns depend on operation:
-/// - FUTEX_WAIT: 0 on wake, negative errno on error
-/// - FUTEX_WAKE: number of waiters woken
-/// - FUTEX_REQUEUE: number woken + requeued
 #[inline(always)]
 pub fn sys_futex(uaddr: *mut u32, op: u32, val: u32, timeout: *const Timespec, uaddr2: *mut u32, val3: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_FUTEX,
-            in("x0") uaddr as u64,
-            in("x1") op as u64,
-            in("x2") val as u64,
-            in("x3") timeout as u64,
-            in("x4") uaddr2 as u64,
-            in("x5") val3 as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall6!(SYS_FUTEX, uaddr, op, val, timeout, uaddr2, val3) }
 }
 
 /// set_robust_list(head, len) - register robust futex list
-///
-/// Registers the robust futex list for the current task.
-/// Returns 0 on success, -EINVAL if len != sizeof(robust_list_head).
 #[inline(always)]
 pub fn sys_set_robust_list(head: *const super::RobustListHead, len: usize) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SET_ROBUST_LIST,
-            in("x0") head as u64,
-            in("x1") len as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_SET_ROBUST_LIST, head, len) }
 }
 
 /// get_robust_list(pid, head_ptr, len_ptr) - get robust futex list
-///
-/// Gets the robust futex list for a task.
-/// Returns 0 on success, -ESRCH if task not found.
 #[inline(always)]
 pub fn sys_get_robust_list(pid: i32, head_ptr: *mut *const super::RobustListHead, len_ptr: *mut usize) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_GET_ROBUST_LIST,
-            in("x0") pid as u64,
-            in("x1") head_ptr as u64,
-            in("x2") len_ptr as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_GET_ROBUST_LIST, pid, head_ptr, len_ptr) }
+}
+
+// ============================================================================
+// TLS syscall wrappers
+// ============================================================================
+
+/// set_tid_address(tidptr) - set pointer to thread ID
+#[inline(always)]
+pub fn sys_set_tid_address(tidptr: *mut i32) -> i64 {
+    unsafe { syscall1!(SYS_SET_TID_ADDRESS, tidptr) }
 }
 
 // ============================================================================
@@ -2598,217 +1266,109 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: *mut *const super::RobustListHead
 /// shmget(key, size, shmflg) - allocate a shared memory segment
 #[inline(always)]
 pub fn sys_shmget(key: i32, size: usize, shmflg: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SHMGET,
-            in("x0") key as u64,
-            in("x1") size as u64,
-            in("x2") shmflg as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_SHMGET, key, size, shmflg) }
 }
 
 /// shmat(shmid, shmaddr, shmflg) - attach a shared memory segment
 #[inline(always)]
 pub fn sys_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SHMAT,
-            in("x0") shmid as u64,
-            in("x1") shmaddr,
-            in("x2") shmflg as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_SHMAT, shmid, shmaddr, shmflg) }
 }
 
 /// shmdt(shmaddr) - detach a shared memory segment
 #[inline(always)]
 pub fn sys_shmdt(shmaddr: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SHMDT,
-            in("x0") shmaddr,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall1!(SYS_SHMDT, shmaddr) }
 }
 
 /// shmctl(shmid, cmd, buf) - shared memory control
 #[inline(always)]
 pub fn sys_shmctl(shmid: i32, cmd: i32, buf: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SHMCTL,
-            in("x0") shmid as u64,
-            in("x1") cmd as u64,
-            in("x2") buf,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_SHMCTL, shmid, cmd, buf) }
 }
 
 /// semget(key, nsems, semflg) - get a semaphore set
 #[inline(always)]
 pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SEMGET,
-            in("x0") key as u64,
-            in("x1") nsems as u64,
-            in("x2") semflg as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_SEMGET, key, nsems, semflg) }
 }
 
 /// semop(semid, sops, nsops) - semaphore operations
 #[inline(always)]
 pub fn sys_semop(semid: i32, sops: *const super::Sembuf, nsops: usize) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SEMOP,
-            in("x0") semid as u64,
-            in("x1") sops as u64,
-            in("x2") nsops as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_SEMOP, semid, sops, nsops) }
 }
 
 /// semtimedop(semid, sops, nsops, timeout) - semaphore operations with timeout
 #[inline(always)]
 pub fn sys_semtimedop(semid: i32, sops: *const super::Sembuf, nsops: usize, timeout: *const Timespec) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SEMTIMEDOP,
-            in("x0") semid as u64,
-            in("x1") sops as u64,
-            in("x2") nsops as u64,
-            in("x3") timeout as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_SEMTIMEDOP, semid, sops, nsops, timeout) }
 }
 
 /// semctl(semid, semnum, cmd, arg) - semaphore control
 #[inline(always)]
 pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_SEMCTL,
-            in("x0") semid as u64,
-            in("x1") semnum as u64,
-            in("x2") cmd as u64,
-            in("x3") arg,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_SEMCTL, semid, semnum, cmd, arg) }
 }
 
 /// msgget(key, msgflg) - get a message queue
 #[inline(always)]
 pub fn sys_msgget(key: i32, msgflg: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MSGGET,
-            in("x0") key as u64,
-            in("x1") msgflg as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall2!(SYS_MSGGET, key, msgflg) }
 }
 
 /// msgsnd(msqid, msgp, msgsz, msgflg) - send a message to a queue
 #[inline(always)]
 pub fn sys_msgsnd(msqid: i32, msgp: *const u8, msgsz: usize, msgflg: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MSGSND,
-            in("x0") msqid as u64,
-            in("x1") msgp as u64,
-            in("x2") msgsz as u64,
-            in("x3") msgflg as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall4!(SYS_MSGSND, msqid, msgp, msgsz, msgflg) }
 }
 
 /// msgrcv(msqid, msgp, msgsz, msgtyp, msgflg) - receive a message from a queue
 #[inline(always)]
 pub fn sys_msgrcv(msqid: i32, msgp: *mut u8, msgsz: usize, msgtyp: i64, msgflg: i32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MSGRCV,
-            in("x0") msqid as u64,
-            in("x1") msgp as u64,
-            in("x2") msgsz as u64,
-            in("x3") msgtyp as u64,
-            in("x4") msgflg as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall5!(SYS_MSGRCV, msqid, msgp, msgsz, msgtyp, msgflg) }
 }
 
 /// msgctl(msqid, cmd, buf) - message queue control
 #[inline(always)]
 pub fn sys_msgctl(msqid: i32, cmd: i32, buf: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #0",
-            in("x8") SYS_MSGCTL,
-            in("x0") msqid as u64,
-            in("x1") cmd as u64,
-            in("x2") buf,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    unsafe { syscall3!(SYS_MSGCTL, msqid, cmd, buf) }
+}
+
+/// ioprio_set(which, who, ioprio) - set I/O priority
+#[inline(always)]
+pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
+    unsafe { syscall3!(SYS_IOPRIO_SET, which, who, ioprio) }
+}
+
+/// ioprio_get(which, who) - get I/O priority
+#[inline(always)]
+pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
+    unsafe { syscall2!(SYS_IOPRIO_GET, which, who) }
+}
+
+// --- Splice / Sendfile ---
+
+/// sendfile(out_fd, in_fd, offset, count) - transfer data between file descriptors
+#[inline(always)]
+pub fn sys_sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> i64 {
+    unsafe { syscall4!(SYS_SENDFILE, out_fd, in_fd, offset, count) }
+}
+
+/// splice(fd_in, off_in, fd_out, off_out, len, flags) - splice data between fds
+#[inline(always)]
+pub fn sys_splice(fd_in: i32, off_in: *mut i64, fd_out: i32, off_out: *mut i64, len: usize, flags: u32) -> i64 {
+    unsafe { syscall6!(SYS_SPLICE, fd_in, off_in, fd_out, off_out, len, flags) }
+}
+
+/// tee(fd_in, fd_out, len, flags) - duplicate pipe content
+#[inline(always)]
+pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
+    unsafe { syscall4!(SYS_TEE, fd_in, fd_out, len, flags) }
+}
+
+/// vmsplice(fd, iov, nr_segs, flags) - splice user pages into a pipe
+#[inline(always)]
+pub fn sys_vmsplice(fd: i32, iov: *const super::IoVec, nr_segs: usize, flags: u32) -> i64 {
+    unsafe { syscall4!(SYS_VMSPLICE, fd, iov, nr_segs, flags) }
 }

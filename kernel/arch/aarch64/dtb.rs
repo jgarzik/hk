@@ -110,8 +110,8 @@ fn extract_cpus(dt: &DeviceTree) -> Vec<CpuInfo> {
         }
 
         // Get CPU ID from reg property
-        let cpu_id = if let Some(reg_prop) = cpu_child.property("reg") {
-            reg_prop.as_u32().unwrap_or(0) as u8
+        let cpu_id: u32 = if let Some(reg_prop) = cpu_child.property("reg") {
+            reg_prop.as_u32().unwrap_or(0)
         } else {
             continue; // Skip CPUs without reg property
         };

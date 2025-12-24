@@ -306,7 +306,7 @@ pub fn sys_clone(
     child_stack: u64,
     parent_tidptr: u64,
     child_tidptr: u64,
-    _tls: u64,
+    tls: u64,
 ) -> i64 {
     use super::percpu::CloneConfig;
     use crate::FRAME_ALLOCATOR;
@@ -328,6 +328,7 @@ pub fn sys_clone(
         parent_rsp,
         parent_tidptr,
         child_tidptr,
+        tls,
     };
 
     // Get frame allocator
@@ -346,7 +347,7 @@ pub fn sys_clone(
     child_stack: u64,
     parent_tidptr: u64,
     child_tidptr: u64,
-    _tls: u64,
+    tls: u64,
 ) -> i64 {
     use super::percpu::CloneConfig;
     use crate::FRAME_ALLOCATOR;
@@ -367,6 +368,7 @@ pub fn sys_clone(
         parent_rsp,
         parent_tidptr,
         child_tidptr,
+        tls,
     };
 
     // Get frame allocator
@@ -410,6 +412,7 @@ pub fn sys_fork() -> i64 {
         parent_rsp,
         parent_tidptr: 0,
         child_tidptr: 0,
+        tls: 0,
     };
 
     // Get frame allocator
@@ -444,6 +447,7 @@ pub fn sys_fork() -> i64 {
         parent_rsp,
         parent_tidptr: 0,
         child_tidptr: 0,
+        tls: 0,
     };
 
     // Get frame allocator
@@ -498,6 +502,7 @@ pub fn sys_vfork() -> i64 {
         parent_rsp,
         parent_tidptr: 0,
         child_tidptr: 0,
+        tls: 0,
     };
 
     // Get frame allocator
@@ -534,6 +539,7 @@ pub fn sys_vfork() -> i64 {
         parent_rsp,
         parent_tidptr: 0,
         child_tidptr: 0,
+        tls: 0,
     };
 
     // Get frame allocator
@@ -2125,4 +2131,254 @@ pub fn sys_nice(inc: i32, caller_pid: Pid, caller_euid: super::Uid) -> i64 {
         Ok(()) => new_nice as i64,
         Err(errno) => -(errno as i64),
     }
+}
+
+// =============================================================================
+// I/O Priority Syscalls
+// =============================================================================
+
+/// sys_ioprio_set - set I/O scheduling class and priority
+///
+/// # Arguments
+/// * `which` - IOPRIO_WHO_PROCESS, IOPRIO_WHO_PGRP, or IOPRIO_WHO_USER
+/// * `who` - ID (pid, pgid, or uid) or 0 for current
+/// * `ioprio` - I/O priority value (class << 13 | level)
+///
+/// # Returns
+/// * 0 on success
+/// * -EINVAL for invalid arguments
+/// * -ESRCH if target not found
+/// * -EPERM if not permitted
+pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
+    use super::{
+        IOPRIO_CLASS_IDLE, IOPRIO_CLASS_RT, IOPRIO_WHO_PGRP, IOPRIO_WHO_PROCESS, IOPRIO_WHO_USER,
+        get_task_io_context, ioprio_prio_class, ioprio_valid,
+    };
+
+    let ioprio = ioprio as u16;
+
+    // Validate ioprio
+    if !ioprio_valid(ioprio) {
+        return EINVAL;
+    }
+
+    let class = ioprio_prio_class(ioprio);
+    let caller_euid = super::percpu::current_cred().euid;
+
+    // Permission check: RT and IDLE classes require CAP_SYS_NICE (or root)
+    if (class == IOPRIO_CLASS_RT || class == IOPRIO_CLASS_IDLE) && caller_euid != 0 {
+        return EPERM;
+    }
+
+    match which {
+        IOPRIO_WHO_PROCESS => {
+            let tid = if who == 0 {
+                super::percpu::current_tid()
+            } else {
+                who as u64
+            };
+
+            // Get or create IoContext for the target
+            let ctx = match get_task_io_context(tid) {
+                Some(ctx) => ctx,
+                None => {
+                    // Create a new context if target exists
+                    if !super::percpu::task_exists(tid) {
+                        return ESRCH;
+                    }
+                    let ctx = alloc::sync::Arc::new(super::IoContext::new());
+                    super::set_task_io_context(tid, ctx.clone());
+                    ctx
+                }
+            };
+
+            ctx.set_ioprio(ioprio);
+            0
+        }
+        IOPRIO_WHO_PGRP => {
+            // Set ioprio for all processes in a process group
+            let pgid = if who == 0 {
+                super::percpu::current_pgid()
+            } else {
+                who as u64
+            };
+
+            let tids = super::percpu::get_tids_by_pgid(pgid);
+            if tids.is_empty() {
+                return ESRCH;
+            }
+
+            for tid in tids {
+                let ctx = match get_task_io_context(tid) {
+                    Some(ctx) => ctx,
+                    None => {
+                        let ctx = alloc::sync::Arc::new(super::IoContext::new());
+                        super::set_task_io_context(tid, ctx.clone());
+                        ctx
+                    }
+                };
+                ctx.set_ioprio(ioprio);
+            }
+            0
+        }
+        IOPRIO_WHO_USER => {
+            // Set ioprio for all processes of a user - not fully implemented
+            // Just return success for simplicity
+            0
+        }
+        _ => EINVAL,
+    }
+}
+
+/// sys_ioprio_get - get I/O scheduling class and priority
+///
+/// # Arguments
+/// * `which` - IOPRIO_WHO_PROCESS, IOPRIO_WHO_PGRP, or IOPRIO_WHO_USER
+/// * `who` - ID (pid, pgid, or uid) or 0 for current
+///
+/// # Returns
+/// * I/O priority value on success (class << 13 | level)
+/// * -EINVAL for invalid arguments
+/// * -ESRCH if target not found
+pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
+    use super::{
+        IOPRIO_DEFAULT, IOPRIO_WHO_PGRP, IOPRIO_WHO_PROCESS, IOPRIO_WHO_USER, get_task_io_context,
+    };
+
+    match which {
+        IOPRIO_WHO_PROCESS => {
+            let tid = if who == 0 {
+                super::percpu::current_tid()
+            } else {
+                who as u64
+            };
+
+            // Check if task exists
+            if !super::percpu::task_exists(tid) {
+                return ESRCH;
+            }
+
+            match get_task_io_context(tid) {
+                Some(ctx) => ctx.get_ioprio() as i64,
+                None => IOPRIO_DEFAULT as i64,
+            }
+        }
+        IOPRIO_WHO_PGRP => {
+            let pgid = if who == 0 {
+                super::percpu::current_pgid()
+            } else {
+                who as u64
+            };
+
+            let tids = super::percpu::get_tids_by_pgid(pgid);
+            if tids.is_empty() {
+                return ESRCH;
+            }
+
+            // Return the highest priority (lowest class value, then highest level)
+            let mut best_ioprio = IOPRIO_DEFAULT;
+            for tid in tids {
+                if let Some(ctx) = get_task_io_context(tid) {
+                    let ioprio = ctx.get_ioprio();
+                    // Compare: lower class is higher priority
+                    if ioprio < best_ioprio {
+                        best_ioprio = ioprio;
+                    }
+                }
+            }
+            best_ioprio as i64
+        }
+        IOPRIO_WHO_USER => {
+            // Get highest ioprio for all processes of a user - not fully implemented
+            // Return default for simplicity
+            IOPRIO_DEFAULT as i64
+        }
+        _ => EINVAL,
+    }
+}
+
+// =============================================================================
+// Thread-Local Storage syscalls
+// =============================================================================
+
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::percpu::{
+    ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_FS, ARCH_SET_GS, read_fs_base, write_fs_base,
+};
+
+/// sys_arch_prctl - Architecture-specific thread state (x86_64 only)
+///
+/// Controls architecture-specific thread state. On x86_64, this is used
+/// primarily for setting the FS and GS base registers for thread-local storage.
+///
+/// Supported operations:
+/// - ARCH_SET_FS (0x1002): Set FS base address (user TLS pointer)
+/// - ARCH_GET_FS (0x1003): Get FS base address
+/// - ARCH_SET_GS (0x1001): Not supported (GS is kernel per-CPU)
+/// - ARCH_GET_GS (0x1004): Not supported
+///
+/// Returns 0 on success, negative errno on error.
+#[cfg(target_arch = "x86_64")]
+pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
+    use crate::CurrentArch;
+    use crate::arch::PerCpuOps;
+    use crate::arch::Uaccess;
+    use crate::task::{get_task_tls, set_task_tls};
+    use crate::uaccess::put_user;
+
+    let tid = CurrentArch::current_tid();
+
+    match code {
+        ARCH_SET_FS => {
+            // Set FS base - user TLS pointer
+            set_task_tls(tid, addr);
+            write_fs_base(addr);
+            0
+        }
+        ARCH_GET_FS => {
+            // Get FS base - return via user pointer
+            // First try our stored value, fall back to reading the register
+            let tls = get_task_tls(tid).unwrap_or_else(read_fs_base);
+
+            // Write to user address
+            if put_user::<Uaccess, u64>(addr, tls).is_err() {
+                return EFAULT;
+            }
+            0
+        }
+        ARCH_SET_GS | ARCH_GET_GS => {
+            // GS base is used by kernel for per-CPU data, not available to user
+            EINVAL
+        }
+        _ => EINVAL,
+    }
+}
+
+/// sys_arch_prctl stub for non-x86_64 architectures
+#[cfg(not(target_arch = "x86_64"))]
+pub fn sys_arch_prctl(_code: i32, _addr: u64) -> i64 {
+    // arch_prctl is x86_64-specific
+    const ENOSYS: i64 = -38;
+    ENOSYS
+}
+
+/// sys_set_tid_address - Set pointer for thread ID clearing on exit
+///
+/// Sets the `clear_child_tid` address for the calling thread. When the thread
+/// exits:
+/// 1. The kernel writes 0 to this address
+/// 2. The kernel performs futex(FUTEX_WAKE, 1) on this address
+///
+/// This mechanism is used by pthread libraries to implement thread joining.
+/// The thread library stores a futex here and the parent waits on it.
+///
+/// Returns the caller's thread ID.
+pub fn sys_set_tid_address(tidptr: u64) -> i64 {
+    use crate::CurrentArch;
+    use crate::arch::PerCpuOps;
+    use crate::task::set_clear_child_tid;
+
+    let tid = CurrentArch::current_tid();
+    set_clear_child_tid(tid, tidptr);
+    tid as i64
 }

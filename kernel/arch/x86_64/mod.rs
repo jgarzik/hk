@@ -33,6 +33,7 @@ pub mod spinlock;
 pub mod syscall;
 pub mod tsc;
 pub mod uaccess;
+pub mod vgacon;
 
 use crate::arch::{Arch, CpuOps, SchedArch, UserModeOps};
 
@@ -284,6 +285,7 @@ impl SmpOps for X86_64Arch {
                     is_bsp: cpu.is_bsp,
                 })
                 .collect(),
+            ioapics: alloc::vec::Vec::new(), // I/O APICs not needed for SMP init
             bsp_apic_id: acpi.bsp_cpu_id,
             power_info: acpi.power_info.map(|p| acpi::PowerInfo {
                 pm1a_cnt_blk: p.pm1a_cnt_blk,
@@ -299,7 +301,7 @@ impl SmpOps for X86_64Arch {
         smp::enable_ap_scheduling();
     }
 
-    fn set_bsp_cpu_id(acpi: &mut AcpiInfo, hw_id: u8) {
+    fn set_bsp_cpu_id(acpi: &mut AcpiInfo, hw_id: u32) {
         acpi.bsp_cpu_id = hw_id;
         // Also mark the appropriate CPU as BSP
         for cpu in acpi.cpus.iter_mut() {
@@ -317,8 +319,8 @@ impl LocalTimerOps for X86_64Arch {
         }
     }
 
-    fn current_hw_cpu_id() -> u8 {
-        lapic::current_apic_id()
+    fn current_hw_cpu_id() -> u32 {
+        lapic::current_apic_id() as u32
     }
 
     fn calibrate_and_start_timer(vector: u8, interval_ms: u32) -> u32 {

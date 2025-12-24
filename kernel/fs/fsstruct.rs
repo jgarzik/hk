@@ -19,7 +19,6 @@
 //! In our Rust implementation, Arc provides the reference counting,
 //! and Mutex provides the locking.
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
 use spin::Mutex;
@@ -59,8 +58,9 @@ impl FsStruct {
 
     /// Create a new FsStruct initialized to the filesystem root
     pub fn new_root() -> Option<Arc<Self>> {
-        let root_dentry = super::mount::MOUNT_NS.get_root_dentry()?;
-        let root_mnt = super::mount::MOUNT_NS.get_root()?;
+        let mnt_ns = super::mount::current_mnt_ns();
+        let root_dentry = mnt_ns.get_root_dentry()?;
+        let root_mnt = mnt_ns.get_root()?;
         let root_path = Path::new(root_mnt.clone(), root_dentry.clone());
         let pwd_path = Path::new(root_mnt, root_dentry);
         Some(Self::new(root_path, pwd_path))
@@ -132,20 +132,28 @@ impl FsStruct {
 // Global task -> FsStruct mapping
 // =============================================================================
 
-/// Global table mapping TID -> FsStruct
-///
-/// This is used to track the filesystem context for each task.
-/// Multiple tasks can share the same Arc<FsStruct> when CLONE_FS is used.
-static TASK_FS: Mutex<BTreeMap<Tid, Arc<FsStruct>>> = Mutex::new(BTreeMap::new());
+// =============================================================================
+// Task FS accessors - uses Task.fs field directly via TASK_TABLE
+// =============================================================================
+
+use crate::task::percpu::TASK_TABLE;
 
 /// Initialize filesystem context for a new task
 pub fn init_task_fs(tid: Tid, fs: Arc<FsStruct>) {
-    TASK_FS.lock().insert(tid, fs);
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.fs = Some(fs);
+    }
 }
 
 /// Get the FsStruct for a task (returns cloned Arc)
 pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
-    TASK_FS.lock().get(&tid).cloned()
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .and_then(|t| t.fs.clone())
 }
 
 /// Remove filesystem context when task exits
@@ -154,7 +162,10 @@ pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
 /// (no other tasks sharing this FsStruct), the FsStruct is dropped,
 /// which in turn drops the Path references to pwd and root.
 pub fn exit_task_fs(tid: Tid) {
-    TASK_FS.lock().remove(&tid);
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.fs = None;
+    }
 }
 
 /// Clone filesystem context for fork/clone

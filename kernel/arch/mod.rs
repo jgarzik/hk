@@ -291,6 +291,9 @@ pub trait ContextOps: Sized {
 
     /// Switch from current task to a new task, saving current context
     ///
+    /// Handles TLS save/restore in Rust before calling assembly, following
+    /// the Linux kernel pattern (tls_thread_switch before cpu_switch_to).
+    ///
     /// # Safety
     /// - `old_ctx` must point to valid, writable memory
     /// - `new_ctx` must point to a valid, previously saved context
@@ -300,11 +303,13 @@ pub trait ContextOps: Sized {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         new_page_table_root: u64,
+        next_tid: Tid,
     );
 
     /// Switch to a task without saving current context
     ///
-    /// Used for the initial switch to the first task.
+    /// Used for the initial switch to the first task or when exiting.
+    /// Handles TLS load for the new task before calling assembly.
     ///
     /// # Safety
     /// Same requirements as `context_switch`, except no saving occurs.
@@ -312,6 +317,7 @@ pub trait ContextOps: Sized {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         new_page_table_root: u64,
+        next_tid: Tid,
     ) -> !;
 }
 
@@ -440,7 +446,8 @@ pub trait IoremapOps {
 #[derive(Debug, Clone, Copy)]
 pub struct CpuInfo {
     /// Hardware CPU ID (APIC ID on x86, MPIDR on ARM)
-    pub hw_cpu_id: u8,
+    /// 32-bit for X2APIC support on x86-64
+    pub hw_cpu_id: u32,
     /// Whether this CPU is enabled
     pub enabled: bool,
     /// Whether this is the bootstrap processor
@@ -471,8 +478,8 @@ pub struct AcpiInfo {
     pub interrupt_controller_base: u64,
     /// List of CPUs discovered
     pub cpus: Vec<CpuInfo>,
-    /// Bootstrap processor CPU ID
-    pub bsp_cpu_id: u8,
+    /// Bootstrap processor CPU ID (32-bit for X2APIC support)
+    pub bsp_cpu_id: u32,
     /// Power management info (if available, x86-specific)
     #[allow(dead_code)]
     pub power_info: Option<PowerInfo>,
@@ -517,7 +524,7 @@ pub trait SmpOps {
     /// # Arguments
     /// * `acpi` - Platform hardware info to update
     /// * `hw_id` - Hardware CPU ID of the bootstrap processor
-    fn set_bsp_cpu_id(acpi: &mut AcpiInfo, hw_id: u8);
+    fn set_bsp_cpu_id(acpi: &mut AcpiInfo, hw_id: u32);
 }
 
 /// Local interrupt controller and timer operations
@@ -541,8 +548,8 @@ pub trait LocalTimerOps {
 
     /// Get the current CPU's hardware ID
     ///
-    /// Returns APIC ID on x86, MPIDR-derived ID on ARM.
-    fn current_hw_cpu_id() -> u8;
+    /// Returns APIC ID on x86 (32-bit for X2APIC), MPIDR-derived ID on ARM.
+    fn current_hw_cpu_id() -> u32;
 
     /// Calibrate and start the local timer
     ///

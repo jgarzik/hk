@@ -888,6 +888,104 @@ impl Aarch64PageTable {
         }
     }
 
+    /// Update the protection flags on an already-mapped page
+    ///
+    /// This modifies the page table entry for the given virtual address
+    /// to have new protection flags, without changing the physical mapping.
+    ///
+    /// # Arguments
+    /// * `l0_phys` - Physical address of the L0 table
+    /// * `va` - Virtual address of the page to modify
+    /// * `writable` - Whether the page should be writable
+    /// * `executable` - Whether the page should be executable
+    ///
+    /// # Returns
+    /// `true` if the page was found and updated, `false` if not mapped
+    pub fn update_page_protection(l0_phys: u64, va: u64, writable: bool, executable: bool) -> bool {
+        let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
+
+        unsafe {
+            let l0 = l0_phys as *mut RawPageTable;
+
+            let l0_entry = (*l0).entry(l0_idx);
+            if !l0_entry.is_valid() || !l0_entry.is_table() {
+                return false;
+            }
+            let l1 = l0_entry.addr() as *mut RawPageTable;
+
+            let l1_entry = (*l1).entry(l1_idx);
+            if !l1_entry.is_valid() {
+                return false;
+            }
+            // 1GB block pages not supported for protection update
+            if l1_entry.is_block() {
+                return false;
+            }
+            let l2 = l1_entry.addr() as *mut RawPageTable;
+
+            let l2_entry = (*l2).entry(l2_idx);
+            if !l2_entry.is_valid() {
+                return false;
+            }
+            // 2MB block pages not supported for protection update
+            if l2_entry.is_block() {
+                return false;
+            }
+            let l3 = l2_entry.addr() as *mut RawPageTable;
+
+            let l3_entry = (*l3).entry_mut(l3_idx);
+            if !l3_entry.is_valid() {
+                return false;
+            }
+
+            // Get current entry, preserve address
+            let phys = l3_entry.addr();
+
+            // Build new attributes, preserving AF, SH, ATTR_IDX
+            let mut attrs = l3_entry.0 & (AF | SH_INNER | 0b11100); // Preserve AF, SH, ATTR_IDX
+
+            // Set access permissions
+            // For user pages: AP_EL0_RW (writable) or AP_EL0_RO (read-only)
+            // We detect if this is a user page by checking if AP[1] was set (EL0 access)
+            let was_user = (l3_entry.0 & AP_EL0_RW) != 0 || (l3_entry.0 & AP_EL0_RO) != 0;
+
+            if was_user {
+                if writable {
+                    attrs |= AP_EL0_RW;
+                } else {
+                    attrs |= AP_EL0_RO;
+                }
+            } else {
+                // Kernel page
+                if writable {
+                    attrs |= AP_EL1_RW;
+                } else {
+                    attrs |= AP_EL1_RO;
+                }
+            }
+
+            // Set execute permissions
+            if !executable {
+                attrs |= PXN | UXN;
+            }
+
+            // Write back the updated entry
+            l3_entry.set_page(phys, attrs);
+
+            // Clean data cache and flush TLB
+            let entry_addr = l3_entry as *mut PageTableEntry as u64;
+            asm!(
+                "dc cvau, {}",
+                "dsb ish",
+                in(reg) entry_addr,
+                options(nostack)
+            );
+            flush_tlb(va);
+
+            true
+        }
+    }
+
     /// Translate a virtual address to physical using the given page table root
     ///
     /// Static method that takes l0_phys directly.
@@ -930,6 +1028,57 @@ impl Aarch64PageTable {
             }
 
             Some(l3_entry.addr() | offset)
+        }
+    }
+
+    /// Read the page table entry for a virtual address
+    ///
+    /// Returns the physical address and attributes of the mapped page, or None if not mapped.
+    /// Only supports 4KB pages (not block descriptors).
+    ///
+    /// This is used by mremap to copy page mappings to a new location.
+    pub fn read_pte(l0_phys: u64, va: u64) -> Option<(u64, u64)> {
+        let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
+
+        unsafe {
+            let l0 = l0_phys as *const RawPageTable;
+
+            let l0_entry = (*l0).entry(l0_idx);
+            if !l0_entry.is_valid() || !l0_entry.is_table() {
+                return None;
+            }
+            let l1 = l0_entry.addr() as *const RawPageTable;
+
+            let l1_entry = (*l1).entry(l1_idx);
+            if !l1_entry.is_valid() {
+                return None;
+            }
+            // Block pages not supported
+            if l1_entry.is_block() {
+                return None;
+            }
+            let l2 = l1_entry.addr() as *const RawPageTable;
+
+            let l2_entry = (*l2).entry(l2_idx);
+            if !l2_entry.is_valid() {
+                return None;
+            }
+            // Block pages not supported
+            if l2_entry.is_block() {
+                return None;
+            }
+            let l3 = l2_entry.addr() as *const RawPageTable;
+
+            let l3_entry = (*l3).entry(l3_idx);
+            if !l3_entry.is_valid() {
+                return None;
+            }
+
+            // Get physical address and attributes (strip the descriptor type bits)
+            let phys = l3_entry.addr();
+            let attrs = l3_entry.0 & !ADDR_MASK & !0b11;
+
+            Some((phys, attrs))
         }
     }
 }

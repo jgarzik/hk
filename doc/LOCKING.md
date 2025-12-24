@@ -188,14 +188,14 @@ Per-CPU scheduler locks (IrqSpinlock)  ← IRQ-safe, can hold while acquiring be
     ↓
 Global subsystem locks (TASK_TABLE, PAGE_CACHE, FD_TABLE)  ← NOT IRQ-safe
     ↓
-Printk locks:
-    OUTPUT_LOCK (held for entire message)
-        ↓
-    PRINTK (ring buffer)
-        ↓
-    CONSOLE_REGISTRY (console dispatch)
-    ↓
 Memory allocator locks (FRAME_ALLOCATOR, heap)  ← NOT IRQ-safe
+
+Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
+    OUTPUT_LOCK (IrqSpinlock, held for entire message)
+        ↓
+    PRINTK (IrqSpinlock, ring buffer)
+        ↓
+    CONSOLE_REGISTRY (IrqSpinlock, console dispatch)
 ```
 
 ### Key Rules
@@ -229,6 +229,25 @@ The scheduler acquires `IrqSpinlock` then `TASK_TABLE` because:
 
 **This is the Linux-style pattern:** protect the innermost critical section with
 an IRQ-safe lock, then acquire non-IRQ-safe locks while protected.
+
+**Detailed Safety Analysis:**
+
+```rust
+// On IrqSpinlock::lock():
+cli              // Step 1: Disable interrupts (no ISR can preempt)
+preempt_count++  // Step 2: Disable preemption (no context switch)
+acquire lock     // Step 3: Spin until acquired
+```
+
+With interrupts disabled after Step 1:
+- Timer ISR cannot fire on this CPU
+- No nested interrupt can try to acquire TASK_TABLE
+- Deadlock is impossible from the local CPU
+
+Other CPUs cannot cause deadlock because:
+- They follow the same ordering (IrqSpinlock → TASK_TABLE)
+- No CPU ever acquires TASK_TABLE then IrqSpinlock
+- TASK_TABLE is NEVER acquired from interrupt context (see Section 7.4)
 
 ---
 
@@ -297,6 +316,158 @@ let table = TASK_TABLE.lock();
 unsafe { context_switch(curr, next, next_kstack); }
 // Lock automatically released when guard drops after context switch returns
 ```
+
+### 3.1.1 Task Struct and Credentials
+
+**Location:** `kernel/task/mod.rs`, `kernel/task/percpu.rs`
+
+The kernel uses a single global `TASK_TABLE: Mutex<GlobalTaskTable>` protecting
+all task structs. This is simpler than Linux's per-task locks (`alloc_lock`,
+`pi_lock`, `sighand->siglock`) but sufficient for hk's current design.
+
+#### Data Structures
+
+| Variable | Type | Purpose |
+|----------|------|---------|
+| `TASK_TABLE` | `Mutex<GlobalTaskTable>` | All tasks in system |
+| Per-CPU `CurrentTask` | Copy struct in PerCpu | Cached task info (no lock) |
+| `Task.cred` | `Arc<Cred>` | Reference-counted credentials |
+
+#### Locking Rules
+
+1. **TASK_TABLE is NOT IRQ-safe** - Never acquire from interrupt handlers
+2. **IrqSpinlock → TASK_TABLE is safe** - IRQs disabled prevents ISR from running
+3. **wake_sleepers() caches priority** - `SleepEntry.priority` avoids TASK_TABLE in ISR
+
+#### Credential Handling (Linux Pattern)
+
+Following Linux's `kernel/cred.c` pattern (see `include/linux/cred.h`):
+
+1. **Reference-counted** - `Task.cred: Arc<Cred>` provides reference counting
+2. **Copy-on-write** - Credential modifications use prepare/commit pattern
+3. **Dual storage** - `Task.cred` in TASK_TABLE for persistence,
+   `CurrentTask.cred` copied into per-CPU struct for fast syscall access
+
+**Credential APIs (like Linux):**
+- `prepare_creds()` - Clone current credentials, return mutable copy
+- `commit_creds(new)` - Update Task.cred in TASK_TABLE AND CurrentTask.cred
+- `copy_creds(flags, parent)` - For fork/clone: share Arc (CLONE_THREAD) or deep copy
+
+**Credential Flow:**
+1. Syscall calls `prepare_creds()` to get mutable copy of current credentials
+2. Syscall modifies the credentials (e.g., `new.euid = target_uid`)
+3. Syscall calls `commit_creds(Arc::new(modified))` to persist changes
+4. `commit_creds()` updates both per-CPU cache (immediate visibility) and
+   TASK_TABLE (persistence across context switch)
+5. On context switch, scheduler loads `Task.cred` from TASK_TABLE into
+   the new task's per-CPU `CurrentTask.cred`
+
+**Why dual storage?**
+- Per-CPU `CurrentTask.cred` provides fast syscall access (no lock needed)
+- `Task.cred` in TASK_TABLE ensures credentials persist across context switches
+- Without TASK_TABLE persistence, credentials would be lost when switching away
+
+#### Deferred State Updates
+
+`wake_sleepers()` does not update `Task.state: Sleeping → Ready` because:
+- Run queue membership is the source of truth for runnability
+- Updating would require TASK_TABLE lock (unsafe in ISR)
+- `TaskState` is only checked for zombie detection in `waitpid()`
+
+#### Future Consideration
+
+When ptrace is implemented, hk may need per-task locks like Linux's `alloc_lock`
+to serialize remote credential/mm access. The current global `TASK_TABLE` lock
+is sufficient while all task modifications are by the current task itself.
+
+#### Per-CPU Current Task Access (Lock-Free)
+
+Each CPU maintains its own `PerCpu` structure accessed via the GS segment register
+(x86-64) or SP_EL0 (aarch64). This provides lock-free access to the current task:
+
+**x86-64 Pattern:**
+```rust
+// kernel/arch/x86_64/percpu.rs
+pub fn current_tid() -> Tid {
+    // Read GS:offset directly - no lock needed
+    try_current_cpu()
+        .map(|percpu| percpu.current_tid.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+```
+
+**Why no lock is needed:**
+1. Each CPU only accesses its own PerCpu structure
+2. GS base is set once during CPU init and never changes
+3. `current_tid` is only modified during context switch (with IrqSpinlock held)
+4. Reads are always consistent (atomic load)
+
+**CurrentTask is a COPY, not a reference:**
+
+The `PerCpu.current_task` field contains a COPY of task metadata (tid, pid, cred),
+not a pointer to the Task in TASK_TABLE. This provides:
+- Fast syscall access without locking TASK_TABLE
+- Consistent snapshot during syscall execution
+- Updates happen at controlled points (context switch, commit_creds)
+
+**Update Points:**
+1. Context switch: Scheduler copies from Task in TASK_TABLE to PerCpu
+2. `commit_creds()`: Updates both PerCpu cache AND Task in TASK_TABLE
+3. `setpgid()`/`setsid()`: Updates both locations
+
+**Linux Comparison:**
+Linux uses a `current_task` per-CPU variable pointing directly to `task_struct`.
+hk uses a copied snapshot for simpler lifetime management in Rust (no raw pointers
+to task_struct across CPU boundaries).
+
+### 3.1.2 Comparison with Linux task_struct Locking
+
+Linux uses multiple per-task locks; hk uses a simpler global lock model:
+
+| Linux Lock | Purpose | hk Equivalent |
+|------------|---------|---------------|
+| `alloc_lock` | Protect mm, files, fs, comm | `TASK_TABLE` (global) |
+| `pi_lock` | Priority inheritance, state | `TASK_TABLE` (global) |
+| `sighand->siglock` | Signal handlers | `SigHand.action` (IrqSpinlock) |
+| `tasklist_lock` | Task list, parent/child | `TASK_TABLE` (global) |
+
+**Why hk's approach works:**
+1. Single lock simplifies lock ordering (no per-task lock hierarchy)
+2. All task modifications go through TASK_TABLE
+3. Current task reads use per-CPU cache (no lock needed)
+4. Acceptable for MVP; can add per-task locks for ptrace later
+
+**When hk would need per-task locks:**
+- ptrace (remote task state modification)
+- /proc filesystem (concurrent access to task state)
+- RT priority inheritance (`pi_lock` equivalent)
+
+For now, all task field modifications are by the task itself (through syscalls),
+so the global TASK_TABLE lock is sufficient.
+
+### 3.1.3 Task State Invariants
+
+The `TaskState` enum is primarily informational, not the source of scheduling truth:
+
+**Source of Truth for Scheduling:**
+1. **Runnable**: Task is in a run queue (`CpuRunQueue.queue`)
+2. **Sleeping**: Task is in a wait queue or sleep queue
+3. **Current**: Task is `CpuRunQueue.current`
+4. **Zombie**: `TaskState::Zombie(status)` is set AND task is NOT in any queue
+
+**Why TaskState is Not the Scheduling Source of Truth:**
+
+In timer ISR, we cannot acquire TASK_TABLE (non-IRQ-safe Mutex). Therefore:
+- `wake_sleepers()` adds tasks to run queue WITHOUT updating TaskState
+- The task becomes runnable (in run queue) while TaskState may still say Sleeping
+- This is safe because:
+  - Scheduler checks run queue membership, not TaskState
+  - waitpid() checks TaskState::Zombie which IS reliably set (in process context)
+
+**Consistency Points:**
+- TaskState is set correctly in process context operations (fork, exit, explicit wait)
+- TaskState may be transiently stale after timer-based wakeup
+- Code must NOT rely on TaskState for scheduling decisions
 
 ### 3.2 Memory Management
 
@@ -838,33 +1009,49 @@ loop {
 
 ### 3.6 Kernel Logging (printk)
 
-**Location:** `core/printk.rs`, `core/console.rs`
+**Location:** `kernel/printk.rs`, `kernel/console.rs`
 
-The printk subsystem uses two separate locks to ensure SMP-safe message output
-while avoiding deadlocks:
+The printk subsystem uses IRQ-safe locks to ensure SMP-safe message output
+while avoiding deadlocks in interrupt context:
 
 ```rust
-/// Serializes console/serial writes across CPUs
-static OUTPUT_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes console/serial writes across CPUs (IRQ-safe)
+static OUTPUT_LOCK: IrqSpinlock<()> = IrqSpinlock::new(());
 
-/// Protects the ring buffer state
-static PRINTK: Mutex<PrintkState> = Mutex::new(PrintkState::new());
+/// Protects the ring buffer state (IRQ-safe)
+static PRINTK: IrqSpinlock<PrintkState> = IrqSpinlock::new(PrintkState::new());
+
+/// Console driver registry (IRQ-safe)
+static CONSOLE_REGISTRY: IrqSpinlock<ConsoleRegistry> = IrqSpinlock::new(...);
 ```
 
 **Locking Hierarchy:**
 ```
-1. OUTPUT_LOCK (held for entire message, including newline)
+1. OUTPUT_LOCK (held for entire message, including newline) - IrqSpinlock
    ↓
-2. PRINTK (held briefly for ring buffer write)
+2. PRINTK (held briefly for ring buffer write) - IrqSpinlock
    ↓
-3. CONSOLE_REGISTRY (held during console_write)
+3. CONSOLE_REGISTRY (held during console_write) - IrqSpinlock
 ```
+
+**Why IRQ-Safe:**
+
+All three locks use `IrqSpinlock` because printk can be called from:
+- Normal process context
+- Timer interrupt handlers (e.g., debug output)
+- Exception handlers (e.g., page fault diagnostics)
+
+Using `IrqSpinlock` (like Linux's `raw_spin_lock_irqsave()`) ensures:
+1. Interrupts disabled while holding the lock
+2. No deadlock if printk is called from interrupt context
+3. No deadlock if a timer interrupt fires while another CPU holds the lock
 
 **Lock Separation:**
 
-The two-lock design serves different purposes:
+The three-lock design serves different purposes:
 - `OUTPUT_LOCK`: Ensures entire formatted messages are written atomically
 - `PRINTK`: Protects the ring buffer data structure
+- `CONSOLE_REGISTRY`: Protects the list of registered consoles
 
 This separation allows:
 1. Buffering to proceed while another CPU writes to console
@@ -876,12 +1063,16 @@ The `PrintkWriter` struct holds `OUTPUT_LOCK` for the duration of formatting:
 
 ```rust
 pub struct PrintkWriter {
-    _guard: spin::MutexGuard<'static, ()>,
+    _guard: Option<IrqSpinlockGuard<'static, ()>>,
 }
 
 impl PrintkWriter {
     pub fn new() -> Self {
-        Self { _guard: OUTPUT_LOCK.lock() }
+        if OOPS_IN_PROGRESS.load(Ordering::Acquire) {
+            Self { _guard: OUTPUT_LOCK.try_lock() }
+        } else {
+            Self { _guard: Some(OUTPUT_LOCK.lock()) }
+        }
     }
 }
 ```
@@ -917,12 +1108,23 @@ Timer: started with 10ms interval
 Timer: started with 10ms interval
 ```
 
-**Interrupt Context:**
+**Panic-Safe Output:**
 
-- **NOT IRQ-safe** - `Mutex` does not disable interrupts
-- Printk from interrupt context will spin if another CPU holds OUTPUT_LOCK
-- For panic context, interrupts are disabled first, so deadlock is avoided
-- Consider `try_lock()` pattern for truly interrupt-safe logging if needed
+During panic, the normal locking path can deadlock if the panicking CPU already
+holds `OUTPUT_LOCK`. The printk subsystem handles this with:
+
+1. **`OOPS_IN_PROGRESS` flag** - Atomic bool set at panic entry via `set_oops_in_progress()`
+2. **`try_lock()` fallback** - Non-blocking lock attempt in panic mode
+3. **Direct serial output** - If lock unavailable, bypass console subsystem
+
+```rust
+// In PrintkWriter::write_str() during panic:
+if self._guard.is_some() {
+    printk_write_locked(s.as_bytes());  // Normal path
+} else {
+    direct_serial_write(s.as_bytes());  // Panic fallback
+}
+```
 
 **Console Integration:**
 
@@ -930,7 +1132,7 @@ Timer: started with 10ms interval
 
 ```rust
 pub fn console_write(data: &[u8]) {
-    let registry = CONSOLE_REGISTRY.lock();
+    let registry = CONSOLE_REGISTRY.lock();  // IrqSpinlock
     if registry.has_console() {
         registry.write_all(data);
     }
@@ -938,6 +1140,25 @@ pub fn console_write(data: &[u8]) {
 ```
 
 The lock order (OUTPUT_LOCK → PRINTK → CONSOLE_REGISTRY) is maintained throughout.
+
+**Console Flags (Linux CON_* Pattern):**
+
+Console drivers are registered with flags that control behavior:
+
+```rust
+bitflags! {
+    pub struct ConsoleFlags: u16 {
+        const ENABLED = 1 << 0;       // Console can receive output
+        const BOOT = 1 << 1;          // Early boot console
+        const PRINTBUFFER = 1 << 2;   // Replay log buffer on registration
+        const CONSDEV = 1 << 3;       // Primary console (/dev/console target)
+    }
+}
+```
+
+- `BOOT` consoles (e.g., serial) are the first output during early boot
+- `CONSDEV` consoles (e.g., graphics) are the primary interactive console
+- `ENABLED` is automatically set on registration; only enabled consoles receive output
 
 ### 3.7 Signal Infrastructure
 
@@ -1137,15 +1358,18 @@ Robust futexes are cleaned up during task exit via `exit_robust_list()`:
 **Location:** `kernel/tty/`, `kernel/gfx/console.rs`, `kernel/console.rs`, `kernel/printk.rs`
 
 The TTY and console subsystem handles terminal I/O and kernel message output.
-All locks are non-IRQ-safe (Mutex) and must only be accessed from process context.
+Console framework locks are IRQ-safe (IrqSpinlock) to support printk from interrupt
+context. Per-TTY locks use Mutex and are accessed from process context only.
 
 #### Console Framework Locks
 
 | Variable | Location | Type | Purpose |
 |----------|----------|------|---------|
-| `OUTPUT_LOCK` | `printk.rs` | `Mutex<()>` | Serializes all console writes across CPUs |
-| `PRINTK` | `printk.rs` | `Mutex<PrintkState>` | Protects ring buffer state |
-| `CONSOLE_REGISTRY` | `console.rs` | `Mutex<ConsoleRegistry>` | Protects console driver list |
+| `OUTPUT_LOCK` | `printk.rs` | `IrqSpinlock<()>` | Serializes all console writes across CPUs |
+| `PRINTK` | `printk.rs` | `IrqSpinlock<PrintkState>` | Protects ring buffer state |
+| `CONSOLE_REGISTRY` | `console.rs` | `IrqSpinlock<ConsoleRegistry>` | Protects console driver list |
+
+All three use `IrqSpinlock` for IRQ safety - see Section 3.6 for details.
 
 #### Per-TTY Locks
 
@@ -1169,15 +1393,15 @@ framebuffer surface. This ensures atomic character rendering and cursor updates.
 #### Lock Ordering
 
 ```
-OUTPUT_LOCK (held for entire formatted message)
+OUTPUT_LOCK (IrqSpinlock, held for entire formatted message)
     ↓
-PRINTK (ring buffer, brief hold during write)
+PRINTK (IrqSpinlock, ring buffer, brief hold during write)
     ↓
-CONSOLE_REGISTRY (console dispatch to drivers)
+CONSOLE_REGISTRY (IrqSpinlock, console dispatch to drivers)
     ↓
-Per-TTY locks (termios, input, state) - independent between TTYs
+Per-TTY locks (Mutex: termios, input, state) - independent between TTYs
     ↓
-GfxConsole.state (if graphics console receives output)
+GfxConsole.state (Mutex, if graphics console receives output)
 ```
 
 #### Panic-Safe Console Output
@@ -1185,26 +1409,27 @@ GfxConsole.state (if graphics console receives output)
 During panic, the normal locking path can deadlock if the panicking CPU already
 holds `OUTPUT_LOCK`. The printk subsystem handles this with:
 
-1. **`OOPS_IN_PROGRESS` flag** - Atomic bool set at panic entry
+1. **`OOPS_IN_PROGRESS` flag** - Atomic bool set at panic entry via `set_oops_in_progress()`
 2. **`try_lock()` fallback** - Non-blocking lock attempt in panic mode
 3. **Direct serial output** - If lock unavailable, bypass console subsystem
 
 ```rust
-// In PrintkWriter::new() during panic:
-if OOPS_IN_PROGRESS.load(Ordering::Acquire) {
-    match OUTPUT_LOCK.try_lock() {
-        Some(guard) => /* use normal path */,
-        None => /* direct serial write */,
-    }
+// In PrintkWriter::write_str() during panic:
+if self._guard.is_some() {
+    printk_write_locked(s.as_bytes());  // Normal path with lock
+} else {
+    direct_serial_write(s.as_bytes());  // Panic fallback, no lock
 }
 ```
 
 #### Key Rules
 
-1. **OUTPUT_LOCK ensures atomic messages** - Multi-CPU printk won't interleave
-2. **Per-TTY locks are independent** - No ordering constraints between TTYs
-3. **GfxConsole uses single lock** - Cursor and surface always atomic
-4. **Panic bypasses locks** - Direct serial for guaranteed panic output
+1. **All console framework locks are IRQ-safe** - printk works from interrupt context
+2. **OUTPUT_LOCK ensures atomic messages** - Multi-CPU printk won't interleave
+3. **Per-TTY locks are independent** - No ordering constraints between TTYs
+4. **GfxConsole uses single lock** - Cursor and surface always atomic
+5. **Panic bypasses locks** - Direct serial for guaranteed panic output
+6. **ConsoleFlags control console behavior** - ENABLED, BOOT, CONSDEV flags
 
 ---
 
@@ -1290,6 +1515,73 @@ pub fn advance_pos(&self, n: u64) -> u64 {
 
 As described in Section 3.4, time reads are lock-free using the seqlock pattern.
 
+### 5.4 Atomic Types vs Struct-Level Locks
+
+When designing data structures, choose between atomics and locks carefully:
+
+#### When to Use Atomics
+
+1. **Reference counting** - Single counter, increment/decrement operations
+2. **Independent flags** - Bool/state that doesn't need to update with other fields
+3. **Statistics counters** - Counters where slight inconsistency is acceptable
+4. **Seqlock sequences** - Sequence number for seqlock readers
+5. **Lock-free algorithms** - Data structures designed for lock-free access
+
+#### When to Use Struct-Level Locks
+
+1. **Related fields that must update together** - Use Mutex/RwLock
+2. **Invariants across multiple fields** - Lock ensures invariant holds
+3. **Complex state transitions** - Lock serializes state machine
+
+#### Common Mistake to Avoid
+
+Using multiple atomics in a struct and updating them separately does NOT provide
+multi-field atomicity. If fields A and B must be consistent:
+
+**Wrong:**
+```rust
+struct Foo {
+    a: AtomicU32,
+    b: AtomicU32,
+}
+// Two separate stores - can be seen inconsistently
+foo.a.store(1, Ordering::Release);
+foo.b.store(2, Ordering::Release);
+```
+
+**Right:**
+```rust
+struct Foo {
+    inner: Mutex<FooInner>,
+}
+struct FooInner {
+    a: u32,
+    b: u32,
+}
+// Single lock - guaranteed consistent
+let mut guard = foo.inner.lock();
+guard.a = 1;
+guard.b = 2;
+```
+
+#### hk Pattern Examples
+
+The following patterns are CORRECT uses of atomics in hk:
+
+| Subsystem | Atomic Fields | Why Correct |
+|-----------|---------------|-------------|
+| `TimeKeeper` | seq, cycle_base, mono_base_ns, etc. | Seqlock pattern - all read together with seq validation |
+| `Inode` | mode, uid, gid, size, nlink | Each field updated independently by different operations |
+| `File` | pos | File position modified independently (concurrent reads OK) |
+| `Socket` | flags, error, eof | Independent flags with Mutex-protected data buffers |
+| `CachedPage` | refcount, dirty, writeback, locked | Linux page cache pattern - flags + refcount |
+| `MsgQueue` | stime, rtime, cbytes, qnum, etc. | Different syscalls update different subsets |
+
+All hk structs that update multiple related fields atomically use locks:
+- `MsgQueue.messages: Mutex<VecDeque<MsgMsg>>` - protects message list
+- `SemArray.pending: Mutex<VecDeque<...>>` - serializes pending ops
+- `PageCache inner locks` - protect page maps
+
 ---
 
 ## 6. Preemption Control
@@ -1368,6 +1660,43 @@ If interrupt context needs to trigger something that requires non-IRQ-safe locks
 
 Example: `needs_reschedule` flag is set in timer ISR, actual reschedule happens
 at interrupt exit when `preempt_count == 0`.
+
+### 7.4 Complete List of Locks Never Acquired from Interrupt Context
+
+The following locks are NEVER acquired from interrupt handlers (timer ISR,
+exceptions, etc.). This table serves as the authoritative reference for the
+interrupt-safety invariant:
+
+| Lock | Location | Type | Reason |
+|------|----------|------|--------|
+| `TASK_TABLE` | kernel/task/percpu.rs | `Mutex` | Global task registry |
+| `TASK_SIGHAND` | kernel/signal/mod.rs | `Mutex` | Signal handler mapping |
+| `TASK_SIGNAL_STATE` | kernel/signal/mod.rs | `Mutex` | Per-task signal state |
+| `TASK_FS` | kernel/fs/context.rs | `Mutex` | Filesystem context |
+| `TASK_NS` | kernel/ns/mod.rs | `Mutex` | Namespace context |
+| `TASK_TLS` | kernel/task/tls.rs | `Mutex` | TLS base addresses |
+| `UID_PROCESS_COUNT` | kernel/task/mod.rs | `Mutex` | RLIMIT_NPROC tracking |
+| `FRAME_ALLOCATOR` | kernel/frame_alloc.rs | `Mutex` | Physical frame allocation |
+| Heap allocator | kernel/heap.rs | `Mutex` | Kernel heap allocation |
+| `PAGE_CACHE` | core/page_cache.rs | `Mutex` | Page cache lookup |
+| All VFS locks | kernel/fs/*.rs | `RwLock` | Inodes, dentries, mounts |
+
+Note: `OUTPUT_LOCK`, `PRINTK`, and `CONSOLE_REGISTRY` are now `IrqSpinlock` and
+CAN be safely acquired from interrupt context. See Section 3.6.
+
+**Invariant**: Code running with interrupts enabled that acquires any of these
+locks will never be interrupted by an ISR that also tries to acquire the same lock.
+
+**Why this is safe**: ISRs in hk only perform these operations:
+- Read/write atomics (tick counts, flags, `needs_reschedule`)
+- Acquire `IrqSpinlock` (per-CPU scheduler run queue)
+- Call `wake_sleepers()` which only touches per-CPU run queue
+
+ISRs NEVER perform:
+- Memory allocation (`alloc`, `Box`, `Vec` growth) - would acquire heap Mutex
+- Task table operations - would acquire TASK_TABLE Mutex
+- VFS operations - would acquire RwLock
+- printk - would acquire OUTPUT_LOCK Mutex (potential deadlock)
 
 ---
 

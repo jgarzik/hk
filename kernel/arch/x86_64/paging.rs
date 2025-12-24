@@ -885,6 +885,89 @@ impl X86_64PageTable {
         }
     }
 
+    /// Update the protection flags on an already-mapped page
+    ///
+    /// This modifies the page table entry for the given virtual address
+    /// to have new protection flags, without changing the physical mapping.
+    ///
+    /// # Arguments
+    /// * `pml4_phys` - Physical address of the PML4 table
+    /// * `va` - Virtual address of the page to modify
+    /// * `writable` - Whether the page should be writable
+    /// * `executable` - Whether the page should be executable
+    ///
+    /// # Returns
+    /// `true` if the page was found and updated, `false` if not mapped
+    pub fn update_page_protection(
+        pml4_phys: u64,
+        va: u64,
+        writable: bool,
+        executable: bool,
+    ) -> bool {
+        let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
+
+        unsafe {
+            let pml4 = pml4_phys as *mut RawPageTable;
+
+            let pml4_entry = (*pml4).entry(pml4_idx);
+            if !pml4_entry.is_present() {
+                return false;
+            }
+            let pdpt = pml4_entry.addr() as *mut RawPageTable;
+
+            let pdpt_entry = (*pdpt).entry(pdpt_idx);
+            if !pdpt_entry.is_present() {
+                return false;
+            }
+            // 1GB huge pages not supported for protection update
+            if pdpt_entry.is_huge() {
+                return false;
+            }
+            let pd = pdpt_entry.addr() as *mut RawPageTable;
+
+            let pd_entry = (*pd).entry(pd_idx);
+            if !pd_entry.is_present() {
+                return false;
+            }
+            // 2MB huge pages not supported for protection update
+            if pd_entry.is_huge() {
+                return false;
+            }
+            let pt = pd_entry.addr() as *mut RawPageTable;
+
+            let pt_entry = (*pt).entry_mut(pt_idx);
+            if !pt_entry.is_present() {
+                return false;
+            }
+
+            // Get current entry, preserve address and base flags
+            let phys = pt_entry.addr();
+            let mut flags = pt_entry.flags();
+
+            // Update writable flag
+            if writable {
+                flags |= PAGE_WRITABLE;
+            } else {
+                flags &= !PAGE_WRITABLE;
+            }
+
+            // Update executable flag (NX bit - inverted logic)
+            if executable {
+                flags &= !PAGE_NO_EXECUTE;
+            } else {
+                flags |= PAGE_NO_EXECUTE;
+            }
+
+            // Write back the updated entry
+            pt_entry.set(phys, flags);
+
+            // Flush TLB for this address
+            Self::flush_tlb(va);
+
+            true
+        }
+    }
+
     /// Translate a virtual address to physical using the given page table root
     ///
     /// Static method that takes pml4_phys directly.
@@ -927,6 +1010,53 @@ impl X86_64PageTable {
             }
 
             Some(pt_entry.addr() | offset)
+        }
+    }
+
+    /// Read the page table entry for a virtual address
+    ///
+    /// Returns the physical address and flags of the mapped page, or None if not mapped.
+    /// Only supports 4KB pages (not huge pages).
+    ///
+    /// This is used by mremap to copy page mappings to a new location.
+    pub fn read_pte(pml4_phys: u64, va: u64) -> Option<(u64, u64)> {
+        let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
+
+        unsafe {
+            let pml4 = pml4_phys as *const RawPageTable;
+
+            let pml4_entry = (*pml4).entry(pml4_idx);
+            if !pml4_entry.is_present() {
+                return None;
+            }
+            let pdpt = pml4_entry.addr() as *const RawPageTable;
+
+            let pdpt_entry = (*pdpt).entry(pdpt_idx);
+            if !pdpt_entry.is_present() {
+                return None;
+            }
+            // Huge pages not supported
+            if pdpt_entry.is_huge() {
+                return None;
+            }
+            let pd = pdpt_entry.addr() as *const RawPageTable;
+
+            let pd_entry = (*pd).entry(pd_idx);
+            if !pd_entry.is_present() {
+                return None;
+            }
+            // Huge pages not supported
+            if pd_entry.is_huge() {
+                return None;
+            }
+            let pt = pd_entry.addr() as *const RawPageTable;
+
+            let pt_entry = (*pt).entry(pt_idx);
+            if !pt_entry.is_present() {
+                return None;
+            }
+
+            Some((pt_entry.addr(), pt_entry.flags()))
         }
     }
 }

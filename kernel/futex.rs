@@ -33,21 +33,18 @@
 //! sleep
 //! ```
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
-
-use spin::Mutex;
 
 use crate::arch::IrqSpinlock;
 use crate::task::{Priority, TaskState, Tid};
 use crate::uaccess::{get_user, put_user};
 
 // Architecture-specific uaccess implementation
-#[cfg(target_arch = "x86_64")]
-use crate::arch::x86_64::uaccess::X86_64Uaccess as Uaccess;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::uaccess::Aarch64Uaccess as Uaccess;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::uaccess::X86_64Uaccess as Uaccess;
 
 // Error constants (as i32 for syscall returns)
 const EAGAIN: i32 = 11;
@@ -231,11 +228,10 @@ fn futex_bucket(key: &FutexKey) -> &'static FutexHashBucket {
 }
 
 // =============================================================================
-// Robust Futex Support
+// Robust Futex Support - uses Task.robust_list field via TASK_TABLE
 // =============================================================================
 
-/// Global table mapping TID -> robust_list_head user address
-static TASK_ROBUST_LIST: Mutex<BTreeMap<Tid, u64>> = Mutex::new(BTreeMap::new());
+use crate::task::percpu::TASK_TABLE;
 
 /// Robust list head structure (matches Linux ABI)
 #[repr(C)]
@@ -714,11 +710,9 @@ pub fn sys_set_robust_list(head: u64, len: u64) -> i32 {
 
     let tid = crate::task::percpu::current_tid();
 
-    let mut robust_list = TASK_ROBUST_LIST.lock();
-    if head == 0 {
-        robust_list.remove(&tid);
-    } else {
-        robust_list.insert(tid, head);
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.robust_list = head;
     }
 
     0
@@ -748,20 +742,21 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
         pid as Tid
     };
 
-    let robust_list = TASK_ROBUST_LIST.lock();
-    let head = robust_list.get(&target_tid).copied().unwrap_or(0);
+    let table = TASK_TABLE.lock();
+    let head = table
+        .tasks
+        .iter()
+        .find(|t| t.tid == target_tid)
+        .map(|t| t.robust_list)
+        .unwrap_or(0);
 
     // Write head pointer to user memory
-    if head_ptr != 0
-        && put_user::<Uaccess, u64>(head_ptr, head).is_err()
-    {
+    if head_ptr != 0 && put_user::<Uaccess, u64>(head_ptr, head).is_err() {
         return -EFAULT;
     }
 
     // Write length to user memory
-    if len_ptr != 0
-        && put_user::<Uaccess, u64>(len_ptr, RobustListHead::SIZE as u64).is_err()
-    {
+    if len_ptr != 0 && put_user::<Uaccess, u64>(len_ptr, RobustListHead::SIZE as u64).is_err() {
         return -EFAULT;
     }
 
@@ -780,8 +775,14 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
 pub fn exit_robust_list(tid: Tid, pid: u64) {
     // Get and remove robust list for this task
     let head_addr = {
-        let mut robust_list = TASK_ROBUST_LIST.lock();
-        robust_list.remove(&tid)
+        let mut table = TASK_TABLE.lock();
+        if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+            let addr = task.robust_list;
+            task.robust_list = 0;
+            if addr != 0 { Some(addr) } else { None }
+        } else {
+            None
+        }
     };
 
     let head_addr = match head_addr {

@@ -84,7 +84,8 @@ The userspace build creates:
 ```bash
 make check          # Build x86-64 + boot test (SUCCESS criteria)
 make check-arm      # Build aarch64 + boot test (SUCCESS criteria)
-cargo clippy --target x86_64-unknown-none -p hk-kernel  # Linting
+make clippy         # Linting for x86-64
+make clippy-arm     # Linting for aarch64
 ```
 
 ## Running in QEMU
@@ -155,10 +156,17 @@ Note: Most testing is done via boot tests since bare-metal kernel code requires 
 ## Code Quality
 
 ```bash
-cargo clippy        # Run linter
-cargo fmt           # Format code
-cargo fmt --check   # Check formatting without modifying
+# Linting (must specify target for no_std kernel)
+make clippy         # Run clippy for x86-64
+make clippy-arm     # Run clippy for aarch64
+
+# Formatting
+make fmt            # Format code
+make fmt-check      # Check formatting without modifying
 ```
+
+**IMPORTANT**: Do NOT run bare `cargo clippy` - it will fail on this no_std kernel.
+Always use the Makefile targets which specify the correct `--target` flags.
 
 ## Project Structure
 

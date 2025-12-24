@@ -181,7 +181,7 @@ impl WaitQueue {
         }
 
         // Get next task's info from TASK_TABLE
-        let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3) = {
+        let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3, next_cred) = {
             let table = TASK_TABLE.lock();
             table
                 .tasks
@@ -195,9 +195,10 @@ impl WaitQueue {
                         t.pgid,
                         t.sid,
                         t.page_table.root_table_phys(),
+                        t.cred.clone(),
                     )
                 })
-                .unwrap_or((0, 0, 0, 0, 0, 0))
+                .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT)))
         };
 
         // Get context pointers
@@ -216,12 +217,12 @@ impl WaitQueue {
                 ppid: next_ppid,
                 pgid: next_pgid,
                 sid: next_sid,
-                cred: Cred::ROOT,
+                cred: *next_cred,
             });
 
             // Context switch
             unsafe {
-                CurrentArch::context_switch(curr, next, next_kstack, next_cr3);
+                CurrentArch::context_switch(curr, next, next_kstack, next_cr3, next_tid);
             }
         }
 

@@ -18,31 +18,37 @@
 //!
 //! Always acquire TASK_FD first, then the table mutex.
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use spin::Mutex;
 
+use super::percpu::TASK_TABLE;
 use super::{FdTable, Tid};
 use crate::fs::File;
 
-/// Global table mapping TID -> FdTable
-///
-/// Each task has its own FD table. Multiple tasks can share the same
-/// Arc<Mutex<FdTable>> when CLONE_FILES is used during clone().
-static TASK_FD: Mutex<BTreeMap<Tid, Arc<Mutex<FdTable<File>>>>> = Mutex::new(BTreeMap::new());
+// =============================================================================
+// Task FD accessors - uses Task.files field directly via TASK_TABLE
+// =============================================================================
 
 /// Initialize FD table for a new task
 ///
 /// Called when creating the initial task or when a task needs a new FD table.
 pub fn init_task_fd(tid: Tid, fd_table: Arc<Mutex<FdTable<File>>>) {
-    TASK_FD.lock().insert(tid, fd_table);
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.files = Some(fd_table);
+    }
 }
 
 /// Get the FD table for a task (returns cloned Arc)
 ///
 /// Returns None if the task doesn't have an FD table registered.
 pub fn get_task_fd(tid: Tid) -> Option<Arc<Mutex<FdTable<File>>>> {
-    TASK_FD.lock().get(&tid).cloned()
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .and_then(|t| t.files.clone())
 }
 
 /// Remove FD table mapping when task exits
@@ -51,7 +57,10 @@ pub fn get_task_fd(tid: Tid) -> Option<Arc<Mutex<FdTable<File>>>> {
 /// (no other tasks sharing this FD table), the table is dropped
 /// and all file descriptors are closed.
 pub fn exit_task_fd(tid: Tid) {
-    TASK_FD.lock().remove(&tid);
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.files = None;
+    }
 }
 
 /// Clone FD table for fork/clone

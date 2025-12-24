@@ -329,6 +329,8 @@ impl ConsoleDriver for UsbSerialConsole {
 /// The device is registered with Normal priority, allowing it to take precedence
 /// over legacy serial (Fallback priority).
 pub fn register_usb_serial_console(serial: &UsbSerial) {
+    use crate::console::ConsoleFlags;
+
     // SAFETY: This is only called during driver probe, which happens once
     // per device during boot on a single CPU
     unsafe {
@@ -336,7 +338,8 @@ pub fn register_usb_serial_console(serial: &UsbSerial) {
 
         if let Some(ref console) = USB_SERIAL_CONSOLE {
             // Register with Normal priority (higher than legacy serial's Fallback)
-            register_console(console, ConsolePriority::Normal);
+            // No special flags - this is a normal runtime console
+            register_console(console, ConsolePriority::Normal, ConsoleFlags::empty());
         }
     }
 }

@@ -11,15 +11,39 @@ pub const PROT_NONE: u32 = 0;
 pub const PROT_READ: u32 = 1;
 pub const PROT_WRITE: u32 = 2;
 pub const PROT_EXEC: u32 = 4;
+/// PROT_GROWSDOWN - mprotect: extend change to start of growsdown VMA
+pub const PROT_GROWSDOWN: u32 = 0x0100_0000;
+/// PROT_GROWSUP - mprotect: extend change to end of growsup VMA
+/// Note: Always fails with EINVAL on x86-64/aarch64 (no VM_GROWSUP VMAs)
+pub const PROT_GROWSUP: u32 = 0x0200_0000;
 
 /// Map flags - Linux MAP_* values
 pub const MAP_SHARED: u32 = 0x01;
 pub const MAP_PRIVATE: u32 = 0x02;
 pub const MAP_FIXED: u32 = 0x10;
 pub const MAP_ANONYMOUS: u32 = 0x20;
+/// MAP_GROWSDOWN - stack-like segment that grows downward on page faults
+pub const MAP_GROWSDOWN: u32 = 0x0100;
+/// MAP_DENYWRITE - ignored for Linux ABI compatibility (deprecated)
+/// Linux kernel explicitly ignores this flag (see include/linux/mman.h)
+pub const MAP_DENYWRITE: u32 = 0x0800;
+/// MAP_EXECUTABLE - ignored for Linux ABI compatibility (deprecated)
+/// Linux kernel explicitly ignores this flag (see include/linux/mman.h)
+pub const MAP_EXECUTABLE: u32 = 0x1000;
 /// MAP_LOCKED - lock pages in memory (Linux mman.h value)
 /// Note: Same value as VM_LOCKED (0x2000) - Linux uses calc_vm_flag_bits() for identity mapping
 pub const MAP_LOCKED: u32 = 0x2000;
+/// MAP_POPULATE - prefault page tables (populate pages immediately after mmap)
+pub const MAP_POPULATE: u32 = 0x8000;
+/// MAP_NONBLOCK - don't block on I/O when used with MAP_POPULATE
+/// When combined with MAP_POPULATE, the populate step is skipped
+pub const MAP_NONBLOCK: u32 = 0x10000;
+/// MAP_STACK - hint for stack allocation (no-op in hk, no THP support)
+/// Linux uses this to set VM_NOHUGEPAGE when transparent huge pages are enabled
+pub const MAP_STACK: u32 = 0x20000;
+/// MAP_FIXED_NOREPLACE - like MAP_FIXED but fails with EEXIST instead of unmapping
+/// Safer alternative to MAP_FIXED that doesn't silently replace existing mappings
+pub const MAP_FIXED_NOREPLACE: u32 = 0x100000;
 
 /// Return value for failed mmap
 pub const MAP_FAILED: i64 = -1;
@@ -43,6 +67,87 @@ pub const VM_LOCKED_MASK: u32 = VM_LOCKED | VM_LOCKONFAULT;
 /// VMA is backed by System V shared memory segment
 /// Uses a high bit to avoid conflicts with standard flags
 pub const VM_SHM: u32 = 0x0002_0000;
+
+/// VMA is a shared mapping (MAP_SHARED)
+/// This affects how page faults are handled - shared mappings
+/// share the same physical pages and writes are visible to all
+pub const VM_SHARED: u32 = 0x0004_0000;
+
+/// VMA can expand downward on page faults (stack-like growth)
+/// Set when MAP_GROWSDOWN is used during mmap
+pub const VM_GROWSDOWN: u32 = 0x0008_0000;
+
+/// VMA has random access pattern (madvise MADV_RANDOM)
+pub const VM_RAND_READ: u32 = 0x0010_0000;
+
+/// VMA has sequential access pattern (madvise MADV_SEQUENTIAL)
+pub const VM_SEQ_READ: u32 = 0x0020_0000;
+
+/// VMA should not be copied on fork (madvise MADV_DONTFORK)
+pub const VM_DONTCOPY: u32 = 0x0040_0000;
+
+/// VMA should not be included in core dumps (madvise MADV_DONTDUMP)
+pub const VM_DONTDUMP: u32 = 0x0080_0000;
+
+// ============================================================================
+// msync flags (MS_*)
+// ============================================================================
+
+/// MS_ASYNC - Schedule write but don't wait (no-op in modern Linux)
+pub const MS_ASYNC: i32 = 1;
+
+/// MS_INVALIDATE - Invalidate cached pages
+pub const MS_INVALIDATE: i32 = 2;
+
+/// MS_SYNC - Synchronously write dirty pages to disk
+pub const MS_SYNC: i32 = 4;
+
+// ============================================================================
+// madvise flags (MADV_*)
+// ============================================================================
+
+/// MADV_NORMAL - No special treatment (default)
+pub const MADV_NORMAL: i32 = 0;
+
+/// MADV_RANDOM - Expect random page references
+pub const MADV_RANDOM: i32 = 1;
+
+/// MADV_SEQUENTIAL - Expect sequential page references
+pub const MADV_SEQUENTIAL: i32 = 2;
+
+/// MADV_WILLNEED - Will need these pages soon (prefault)
+pub const MADV_WILLNEED: i32 = 3;
+
+/// MADV_DONTNEED - Don't need these pages (zap and free)
+pub const MADV_DONTNEED: i32 = 4;
+
+/// MADV_FREE - Mark pages as lazily freeable (kernel may free them if needed)
+pub const MADV_FREE: i32 = 8;
+
+/// MADV_DONTFORK - Don't copy this VMA on fork
+pub const MADV_DONTFORK: i32 = 10;
+
+/// MADV_DOFORK - Do copy this VMA on fork (undo MADV_DONTFORK)
+pub const MADV_DOFORK: i32 = 11;
+
+/// MADV_DONTDUMP - Don't include in core dumps
+pub const MADV_DONTDUMP: i32 = 16;
+
+/// MADV_DODUMP - Include in core dumps (undo MADV_DONTDUMP)
+pub const MADV_DODUMP: i32 = 17;
+
+// ============================================================================
+// mremap flags (MREMAP_*)
+// ============================================================================
+
+/// MREMAP_MAYMOVE - Allow kernel to move mapping if can't resize in-place
+pub const MREMAP_MAYMOVE: u32 = 1;
+
+/// MREMAP_FIXED - Move to exact new_addr (implies MREMAP_MAYMOVE)
+pub const MREMAP_FIXED: u32 = 2;
+
+/// MREMAP_DONTUNMAP - Keep original mapping after move (requires old_len == new_len)
+pub const MREMAP_DONTUNMAP: u32 = 4;
 
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
@@ -154,5 +259,41 @@ impl Vma {
     #[inline]
     pub fn is_lockonfault(&self) -> bool {
         self.flags & VM_LOCKONFAULT != 0
+    }
+
+    /// Check if this VMA can grow downward (stack-like)
+    #[inline]
+    pub fn is_growsdown(&self) -> bool {
+        self.flags & VM_GROWSDOWN != 0
+    }
+
+    /// Check if this VMA can merge with another adjacent VMA
+    ///
+    /// Two VMAs can merge if they are adjacent and have identical:
+    /// - Protection flags (prot)
+    /// - VMA flags (flags)
+    /// - File backing (both anonymous or same file with contiguous offsets)
+    pub fn can_merge_with(&self, other: &Vma) -> bool {
+        // Must be adjacent (this VMA ends where other begins)
+        if self.end != other.start {
+            return false;
+        }
+        // Must have same protection
+        if self.prot != other.prot {
+            return false;
+        }
+        // Must have same flags
+        if self.flags != other.flags {
+            return false;
+        }
+        // Must have same file backing with contiguous offsets
+        match (&self.file, &other.file) {
+            (None, None) => true, // Both anonymous
+            (Some(f1), Some(f2)) => {
+                // Same file and contiguous offset
+                Arc::ptr_eq(f1, f2) && self.offset + self.size() == other.offset
+            }
+            _ => false, // One has file, other doesn't
+        }
     }
 }

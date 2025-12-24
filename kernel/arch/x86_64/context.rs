@@ -7,6 +7,13 @@
 //! The actual context switch is implemented in switch_to.S (pure assembly)
 //! to avoid Rust inline assembly ABI issues, following the Linux kernel's
 //! __switch_to_asm pattern.
+//!
+//! TLS (Thread Local Storage) handling follows the Linux kernel pattern:
+//! save/restore FS base in Rust before calling the pure-asm switch.
+
+use super::percpu::{read_fs_base, write_fs_base};
+use crate::task::percpu::current_tid;
+use crate::task::{Tid, get_task_tls, set_task_tls};
 
 // External assembly functions from switch_to.S
 unsafe extern "C" {
@@ -163,6 +170,7 @@ extern "C" fn kernel_thread_exit(_status: i64) {
 /// - RSP points to a location where we placed a TrapFrame
 /// - We need to release the scheduler lock
 /// - Load the child's page table (CR3)
+/// - Load the child's TLS (FS base) if CLONE_SETTLS was used
 /// - Restore all registers from TrapFrame
 /// - IRETQ to user mode with RAX=0 (child return value)
 #[unsafe(naked)]
@@ -178,6 +186,24 @@ pub extern "C" fn clone_child_entry() -> ! {
         // Load it into CR3 NOW, before restoring registers
         // This is safe because we're still in kernel mode with kernel stack
         "mov cr3, rax",
+
+        // Write child TID if CLONE_CHILD_SETTID was used (for fork)
+        // Must be after CR3 switch since we're writing to child's address space
+        "call {write_child_tid}",
+
+        // Get and load the child's TLS (FS base)
+        // This handles CLONE_SETTLS - if no TLS was set, get_tls returns 0
+        "call {get_tls}",
+        // RAX now contains the TLS value (or 0 if not set)
+        "test rax, rax",
+        "jz 1f",                  // Skip wrmsr if TLS is 0
+        // Write to MSR_FS_BASE (0xC0000100)
+        // wrmsr expects: ECX = MSR number, EDX:EAX = value
+        "mov rdx, rax",
+        "shr rdx, 32",            // High 32 bits in EDX
+        "mov ecx, 0xC0000100",    // MSR_FS_BASE
+        "wrmsr",
+        "1:",
 
         // RSP points to the TrapFrame we prepared on the child's kernel stack
         // TrapFrame layout:
@@ -209,6 +235,8 @@ pub extern "C" fn clone_child_entry() -> ! {
 
         finish_switch = sym finish_context_switch,
         get_cr3 = sym crate::task::percpu::get_current_task_cr3,
+        write_child_tid = sym crate::task::percpu::write_child_tid_if_needed,
+        get_tls = sym crate::task::percpu::get_current_task_tls,
     );
 }
 
@@ -265,6 +293,8 @@ impl TaskContext {
 
 /// Switch from the current task context to a new task context
 ///
+/// Follows Linux kernel pattern: handle TLS in Rust wrapper, then call pure-asm switch.
+///
 /// # Safety
 /// - `old_ctx` must point to valid, writable memory for storing the current context
 /// - `new_ctx` must point to a valid, previously saved context
@@ -277,12 +307,29 @@ impl TaskContext {
 /// * `new_ctx` - The context to restore
 /// * `new_kstack` - New kernel stack top (for TSS.RSP0)
 /// * `new_cr3` - New task's page table physical address
+/// * `next_tid` - TID of the task we're switching to (for TLS lookup)
 pub unsafe fn context_switch(
     old_ctx: *mut TaskContext,
     new_ctx: *const TaskContext,
     new_kstack: u64,
     new_cr3: u64,
+    next_tid: Tid,
 ) {
+    // Save current task's TLS (FS base) before switching
+    let prev_tid = current_tid();
+    if prev_tid != 0 {
+        let fs_base = read_fs_base();
+        if fs_base != 0 {
+            set_task_tls(prev_tid, fs_base);
+        }
+    }
+
+    // Load next task's TLS (FS base) before switching
+    if next_tid != 0 {
+        let tls = get_task_tls(next_tid).unwrap_or(0);
+        write_fs_base(tls);
+    }
+
     // The external assembly function uses a stack-based context.
     // It saves/restores callee-saved registers via push/pop on the stack,
     // with RSP stored in TaskContext.rsp.
@@ -297,16 +344,28 @@ pub unsafe fn context_switch(
         let next_sp = (*new_ctx).rsp;
         __switch_to_asm(prev_sp_ptr, next_sp, new_kstack, new_cr3);
     }
+    // When we return here, we're a different task that was switched back to us
 }
 
 /// Switch to a new task without saving the old context
 ///
-/// Used for the initial switch to the first task, when there's no
-/// previous context to save.
+/// Used for the initial switch to the first task or when exiting.
+/// Follows Linux kernel pattern: load TLS for new task, then call pure-asm switch.
 ///
 /// # Safety
 /// Same requirements as context_switch, except old_ctx is not used.
-pub unsafe fn context_switch_first(new_ctx: *const TaskContext, new_kstack: u64, new_cr3: u64) {
+pub unsafe fn context_switch_first(
+    new_ctx: *const TaskContext,
+    new_kstack: u64,
+    new_cr3: u64,
+    next_tid: Tid,
+) {
+    // Load next task's TLS (FS base) - no prev task to save
+    if next_tid != 0 {
+        let tls = get_task_tls(next_tid).unwrap_or(0);
+        write_fs_base(tls);
+    }
+
     // The external assembly function handles:
     // - Loading next task's RSP
     // - Updating TSS.RSP0
@@ -346,9 +405,10 @@ impl ContextOps for X86_64Arch {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         new_page_table_root: u64,
+        next_tid: Tid,
     ) {
         unsafe {
-            context_switch(old_ctx, new_ctx, new_kstack, new_page_table_root);
+            context_switch(old_ctx, new_ctx, new_kstack, new_page_table_root, next_tid);
         }
     }
 
@@ -356,9 +416,10 @@ impl ContextOps for X86_64Arch {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         new_page_table_root: u64,
+        next_tid: Tid,
     ) -> ! {
         unsafe {
-            context_switch_first(new_ctx, new_kstack, new_page_table_root);
+            context_switch_first(new_ctx, new_kstack, new_page_table_root, next_tid);
             // The above never returns, but we need to satisfy the type system
             core::hint::unreachable_unchecked()
         }

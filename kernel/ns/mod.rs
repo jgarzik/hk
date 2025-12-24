@@ -7,27 +7,27 @@
 //! ## Design Overview
 //!
 //! Following Linux's `struct nsproxy` pattern:
-//! - Each task has an `Arc<NsProxy>` (via `TASK_NS` global table)
+//! - Each task has an `Arc<NsProxy>` (via `Task.nsproxy` field)
 //! - Multiple tasks can share the same NsProxy (threads)
 //! - Clone with CLONE_NEW* flags creates new namespace(s)
 //! - Reference counting via Arc handles cleanup
 //!
 //! ## Locking
 //!
-//! - `TASK_NS`: `spin::Mutex` (thread context only)
+//! - `TASK_TABLE`: Protects task struct access (including nsproxy field)
 //! - Per-namespace data: `spin::RwLock` (read-heavy)
 //!
 //! ## Lock Ordering
 //!
 //! VFS locks → Namespace locks → Filesystem context → Per-CPU scheduler → TASK_TABLE
 
+pub mod net;
 pub mod pid;
 pub mod user;
 pub mod uts;
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use spin::{Lazy, Mutex};
+use spin::{Lazy, RwLock};
 
 use crate::task::Tid;
 pub use pid::{
@@ -38,6 +38,7 @@ pub use user::{INIT_USER_NS, UidGidExtent, UidGidMap, UserNamespace};
 pub use uts::{__NEW_UTS_LEN, INIT_UTS_NS, NewUtsname, UTS_FIELD_SIZE, UtsNamespace};
 
 use crate::ipc::{INIT_IPC_NS, IpcNamespace};
+pub use net::{INIT_NET_NS, NetNamespace, init_net_ns};
 
 // ============================================================================
 // Namespace Clone Flags (Linux compatible)
@@ -74,35 +75,179 @@ pub const CLONE_NS_FLAGS: u64 = CLONE_NEWNS
     | CLONE_NEWCGROUP;
 
 // ============================================================================
-// Mount Namespace Wrapper
+// Mount Namespace
 // ============================================================================
 
-/// Mount namespace wrapper
+use crate::fs::mount::Mount;
+
+/// Mount namespace - per-namespace mount tree
 ///
-/// Currently wraps the global MOUNT_NS for namespace compatibility.
-/// Future: per-namespace mount trees with proper isolation.
+/// Each mount namespace has its own view of the filesystem hierarchy.
+/// When CLONE_NEWNS is used, the entire mount tree is cloned.
 pub struct MntNamespace {
-    // For now, just a marker - actual mount tree is in fs::MOUNT_NS
-    // Future: own mount tree root
+    /// Root mount of this namespace
+    pub root: RwLock<Option<Arc<Mount>>>,
 }
 
 impl MntNamespace {
+    /// Create a new empty mount namespace
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            root: RwLock::new(None),
+        })
+    }
+
     /// Create initial mount namespace
     fn new_init() -> Arc<Self> {
-        Arc::new(Self {})
+        Self::new()
     }
 
     /// Clone this namespace (for CLONE_NEWNS)
     ///
-    /// Currently returns a new wrapper (mounts still shared globally).
-    /// Future: copy mount tree for proper isolation.
+    /// Deep-copies the entire mount tree so the new namespace has
+    /// an independent view of the filesystem hierarchy.
     pub fn clone_ns(&self) -> Result<Arc<Self>, i32> {
-        Ok(Arc::new(Self {}))
+        let new_ns = Self::new();
+
+        // Clone the mount tree if we have a root
+        if let Some(old_root) = self.root.read().as_ref() {
+            let new_root = Mount::clone_tree(old_root)?;
+            *new_ns.root.write() = Some(new_root);
+        }
+
+        Ok(new_ns)
+    }
+
+    /// Set the root mount
+    pub fn set_root(&self, mount: Arc<Mount>) {
+        *self.root.write() = Some(mount);
+    }
+
+    /// Get the root mount
+    pub fn get_root(&self) -> Option<Arc<Mount>> {
+        self.root.read().clone()
+    }
+
+    /// Get the root dentry
+    pub fn get_root_dentry(&self) -> Option<Arc<crate::fs::dentry::Dentry>> {
+        self.get_root().map(|m| m.root.clone())
+    }
+
+    /// Find which mount a dentry belongs to by device ID
+    pub fn find_mount_for_dev(&self, dev_id: u64) -> Option<Arc<Mount>> {
+        let root = self.get_root()?;
+
+        // Check if dentry belongs to root mount's filesystem
+        if root.sb.dev_id == dev_id {
+            return Some(root.clone());
+        }
+
+        // Check children recursively
+        self.find_mount_for_dev_recursive(&root, dev_id)
+    }
+
+    fn find_mount_for_dev_recursive(&self, mount: &Arc<Mount>, dev_id: u64) -> Option<Arc<Mount>> {
+        for child in mount.children.read().iter() {
+            if child.sb.dev_id == dev_id {
+                return Some(child.clone());
+            }
+            if let Some(found) = self.find_mount_for_dev_recursive(child, dev_id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Find mount whose root dentry matches the given dentry
+    pub fn find_mount_at(&self, dentry: &Arc<crate::fs::dentry::Dentry>) -> Option<Arc<Mount>> {
+        let root = self.get_root()?;
+
+        // Check if this is the root mount
+        if Arc::ptr_eq(&root.root, dentry) {
+            return Some(root);
+        }
+
+        // Check if dentry matches root mount's root by inode
+        if let (Some(root_ino), Some(d_ino)) = (root.root.get_inode(), dentry.get_inode())
+            && root_ino.ino == d_ino.ino
+            && root.root.superblock().map(|s| s.dev_id) == dentry.superblock().map(|s| s.dev_id)
+        {
+            return Some(root);
+        }
+
+        // Search children recursively
+        self.find_mount_recursive(&root, dentry)
+    }
+
+    fn find_mount_recursive(
+        &self,
+        mount: &Arc<Mount>,
+        dentry: &Arc<crate::fs::dentry::Dentry>,
+    ) -> Option<Arc<Mount>> {
+        for child in mount.children.read().iter() {
+            // Check if child's root dentry matches the target
+            if Arc::ptr_eq(&child.root, dentry) {
+                return Some(child.clone());
+            }
+
+            // Also check by inode number + device ID
+            if let (Some(child_ino), Some(d_ino)) = (child.root.get_inode(), dentry.get_inode())
+                && child_ino.ino == d_ino.ino
+                && child.root.superblock().map(|s| s.dev_id)
+                    == dentry.superblock().map(|s| s.dev_id)
+            {
+                return Some(child.clone());
+            }
+
+            // Recurse into child's children
+            if let Some(found) = self.find_mount_recursive(child, dentry) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Find which mount a dentry belongs to
+    ///
+    /// Given a dentry, returns the mount whose filesystem contains it.
+    /// This walks up the mount tree to find the appropriate mount.
+    pub fn find_mount_for_dentry(
+        &self,
+        dentry: &Arc<crate::fs::dentry::Dentry>,
+    ) -> Option<Arc<Mount>> {
+        let root = self.get_root()?;
+
+        // Check if dentry belongs to root mount's filesystem
+        if let Some(dentry_sb) = dentry.superblock() {
+            // First check root mount
+            if dentry_sb.dev_id == root.sb.dev_id {
+                return Some(root.clone());
+            }
+
+            // Check children recursively by device ID
+            self.find_mount_for_dev_recursive(&root, dentry_sb.dev_id)
+        } else {
+            // Fall back to root mount
+            Some(root)
+        }
+    }
+}
+
+impl Default for MntNamespace {
+    fn default() -> Self {
+        Self {
+            root: RwLock::new(None),
+        }
     }
 }
 
 /// Initial mount namespace
-static INIT_MNT_NS: Lazy<Arc<MntNamespace>> = Lazy::new(MntNamespace::new_init);
+pub static INIT_MNT_NS: Lazy<Arc<MntNamespace>> = Lazy::new(MntNamespace::new_init);
+
+/// Get the init mount namespace
+pub fn init_mnt_ns() -> Arc<MntNamespace> {
+    INIT_MNT_NS.clone()
+}
 
 // ============================================================================
 // NsProxy - Namespace Proxy
@@ -133,8 +278,10 @@ pub struct NsProxy {
 
     /// IPC namespace (SysV IPC isolation)
     pub ipc_ns: Arc<IpcNamespace>,
+
+    /// Network namespace (network stack isolation)
+    pub net_ns: Arc<NetNamespace>,
     // Future namespaces:
-    // pub net_ns: Arc<NetNamespace>,
     // pub cgroup_ns: Arc<CgroupNamespace>,
     // pub time_ns: Arc<TimeNamespace>,
 }
@@ -148,6 +295,7 @@ impl NsProxy {
             pid_ns: INIT_PID_NS.clone(),
             user_ns: INIT_USER_NS.clone(),
             ipc_ns: INIT_IPC_NS.clone(),
+            net_ns: INIT_NET_NS.clone(),
         }
     }
 
@@ -193,12 +341,19 @@ impl NsProxy {
             self.ipc_ns.clone()
         };
 
+        let net_ns = if flags & CLONE_NEWNET != 0 {
+            self.net_ns.clone_ns()?
+        } else {
+            self.net_ns.clone()
+        };
+
         Ok(Arc::new(Self {
             uts_ns,
             mnt_ns,
             pid_ns,
             user_ns,
             ipc_ns,
+            net_ns,
         }))
     }
 }
@@ -212,24 +367,32 @@ pub static INIT_NSPROXY: Lazy<Arc<NsProxy>> = Lazy::new(|| Arc::new(NsProxy::new
 // Task-NsProxy Mapping (following FsStruct pattern)
 // ============================================================================
 
-/// Global table mapping TID -> NsProxy
-///
-/// Multiple tasks can share the same Arc<NsProxy> when created
-/// without CLONE_NEW* flags (threads sharing namespaces).
-static TASK_NS: Mutex<BTreeMap<Tid, Arc<NsProxy>>> = Mutex::new(BTreeMap::new());
+// =============================================================================
+// Task NS accessors - uses Task.nsproxy field directly via TASK_TABLE
+// =============================================================================
+
+use crate::task::percpu::TASK_TABLE;
 
 /// Initialize nsproxy for a new task
 ///
 /// Called when creating a new task to set up its namespace context.
 pub fn init_task_ns(tid: Tid, nsproxy: Arc<NsProxy>) {
-    TASK_NS.lock().insert(tid, nsproxy);
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.nsproxy = Some(nsproxy);
+    }
 }
 
 /// Get the NsProxy for a task
 ///
 /// Returns a cloned Arc (increments refcount).
 pub fn get_task_ns(tid: Tid) -> Option<Arc<NsProxy>> {
-    TASK_NS.lock().get(&tid).cloned()
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .and_then(|t| t.nsproxy.clone())
 }
 
 /// Remove nsproxy when task exits
@@ -238,7 +401,10 @@ pub fn get_task_ns(tid: Tid) -> Option<Arc<NsProxy>> {
 /// (no other tasks sharing this NsProxy), the NsProxy is dropped,
 /// which in turn drops the namespace references.
 pub fn exit_task_ns(tid: Tid) {
-    TASK_NS.lock().remove(&tid);
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.nsproxy = None;
+    }
 }
 
 /// Clone nsproxy for fork/clone
@@ -318,6 +484,17 @@ pub fn current_user_ns() -> Arc<UserNamespace> {
         .unwrap_or_else(|| INIT_USER_NS.clone())
 }
 
+/// Get current task's network namespace
+///
+/// Returns the network namespace for the calling task, or the init
+/// namespace if no namespace context is set.
+pub fn current_net_ns() -> Arc<NetNamespace> {
+    let tid = crate::task::percpu::current_tid();
+    get_task_ns(tid)
+        .map(|ns| ns.net_ns.clone())
+        .unwrap_or_else(|| INIT_NET_NS.clone())
+}
+
 // ============================================================================
 // Unshare Syscall
 // ============================================================================
@@ -328,9 +505,9 @@ const EINVAL: i64 = 22;
 
 /// Currently supported namespace flags for unshare
 ///
-/// We support UTS, mount, PID, user, and IPC namespaces.
+/// We support UTS, mount, PID, user, IPC, and network namespaces.
 const SUPPORTED_NS_FLAGS: u64 =
-    CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUSER | CLONE_NEWIPC;
+    CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUSER | CLONE_NEWIPC | CLONE_NEWNET;
 
 /// sys_unshare - disassociate parts of the process execution context
 ///
@@ -348,18 +525,28 @@ const SUPPORTED_NS_FLAGS: u64 =
 /// # Notes
 /// Unlike clone(), unshare() always affects the calling thread.
 /// The new namespace takes effect immediately.
+/// CLONE_SYSVSEM flag - used by unshare to detach from shared semundo
+const CLONE_SYSVSEM: u64 = 0x00040000;
+
 pub fn sys_unshare(unshare_flags: u64) -> i64 {
     let tid = crate::task::percpu::current_tid();
     let ns_flags = unshare_flags & CLONE_NS_FLAGS;
+    let sysvsem_flag = unshare_flags & CLONE_SYSVSEM;
 
-    // No namespace flags - nothing to do
+    // Handle CLONE_SYSVSEM - detach from shared semaphore undo list
+    // Similar to what Linux does: exit_sem(current) effectively
+    if sysvsem_flag != 0 {
+        // Detach from any shared undo list by exiting and re-creating
+        // This applies any pending undos if we're the last holder
+        crate::ipc::sem::exit_sem(tid);
+    }
+
+    // No namespace flags - nothing more to do
     if ns_flags == 0 {
         return 0;
     }
 
     // Check for unsupported namespace flags
-    // Currently we support: UTS, mount
-    // PID and user will be added in Phase 2-3
     let unsupported = ns_flags & !SUPPORTED_NS_FLAGS;
     if unsupported != 0 {
         return -EINVAL;
@@ -392,7 +579,7 @@ pub fn sys_unshare(unshare_flags: u64) -> i64 {
 /// This atomically replaces the task's nsproxy. Used by both
 /// unshare() and setns().
 pub fn switch_task_namespaces(tid: Tid, new_ns: Arc<NsProxy>) {
-    TASK_NS.lock().insert(tid, new_ns);
+    init_task_ns(tid, new_ns);
 }
 
 // ============================================================================
@@ -497,6 +684,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             pid_ns: current_ns.pid_ns.clone(),
             user_ns: current_ns.user_ns.clone(),
             ipc_ns: current_ns.ipc_ns.clone(),
+            net_ns: current_ns.net_ns.clone(),
         }),
         NamespaceType::Mnt => Arc::new(NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
@@ -504,6 +692,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             pid_ns: current_ns.pid_ns.clone(),
             user_ns: current_ns.user_ns.clone(),
             ipc_ns: current_ns.ipc_ns.clone(),
+            net_ns: current_ns.net_ns.clone(),
         }),
         NamespaceType::Pid => Arc::new(NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
@@ -511,6 +700,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             pid_ns: target_ns.pid_ns.clone(),
             user_ns: current_ns.user_ns.clone(),
             ipc_ns: current_ns.ipc_ns.clone(),
+            net_ns: current_ns.net_ns.clone(),
         }),
         NamespaceType::User => Arc::new(NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
@@ -518,6 +708,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             pid_ns: current_ns.pid_ns.clone(),
             user_ns: target_ns.user_ns.clone(),
             ipc_ns: current_ns.ipc_ns.clone(),
+            net_ns: current_ns.net_ns.clone(),
         }),
         NamespaceType::Ipc => Arc::new(NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
@@ -525,6 +716,15 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             pid_ns: current_ns.pid_ns.clone(),
             user_ns: current_ns.user_ns.clone(),
             ipc_ns: target_ns.ipc_ns.clone(),
+            net_ns: current_ns.net_ns.clone(),
+        }),
+        NamespaceType::Net => Arc::new(NsProxy {
+            uts_ns: current_ns.uts_ns.clone(),
+            mnt_ns: current_ns.mnt_ns.clone(),
+            pid_ns: current_ns.pid_ns.clone(),
+            user_ns: current_ns.user_ns.clone(),
+            ipc_ns: current_ns.ipc_ns.clone(),
+            net_ns: target_ns.net_ns.clone(),
         }),
     };
 

@@ -89,7 +89,9 @@ pub enum NamespaceType {
     User,
     /// IPC namespace (SysV IPC)
     Ipc,
-    // Future: Net, Cgroup, Time
+    /// Network namespace (network stack isolation)
+    Net,
+    // Future: Cgroup, Time
 }
 
 impl NamespaceType {
@@ -101,6 +103,7 @@ impl NamespaceType {
             Self::Pid => "pid",
             Self::User => "user",
             Self::Ipc => "ipc",
+            Self::Net => "net",
         }
     }
 
@@ -112,6 +115,7 @@ impl NamespaceType {
             "pid" => Some(Self::Pid),
             "user" => Some(Self::User),
             "ipc" => Some(Self::Ipc),
+            "net" => Some(Self::Net),
             _ => None,
         }
     }
@@ -124,12 +128,20 @@ impl NamespaceType {
             Self::Pid => crate::ns::CLONE_NEWPID,
             Self::User => crate::ns::CLONE_NEWUSER,
             Self::Ipc => crate::ns::CLONE_NEWIPC,
+            Self::Net => crate::ns::CLONE_NEWNET,
         }
     }
 
     /// List of all supported namespace types
     pub fn all() -> &'static [NamespaceType] {
-        &[Self::Uts, Self::Mnt, Self::Pid, Self::User, Self::Ipc]
+        &[
+            Self::Uts,
+            Self::Mnt,
+            Self::Pid,
+            Self::User,
+            Self::Ipc,
+            Self::Net,
+        ]
     }
 }
 
@@ -417,6 +429,7 @@ fn lookup_pid_ns_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, 
         NamespaceType::Pid => 4,
         NamespaceType::User => 5,
         NamespaceType::Ipc => 6,
+        NamespaceType::Net => 7,
     };
 
     let inode = Arc::new(Inode::new(
@@ -745,13 +758,13 @@ fn gen_version() -> Vec<u8> {
 /// Format: device mountpoint fstype options dump pass
 /// Example: none / ramfs rw 0 0
 fn gen_mounts() -> Vec<u8> {
-    use super::mount::MOUNT_NS;
+    use super::mount::current_mnt_ns;
     use alloc::fmt::Write;
 
     let mut output = String::new();
 
-    // Get root mount
-    if let Some(root_mount) = MOUNT_NS.get_root() {
+    // Get root mount from current task's mount namespace
+    if let Some(root_mount) = current_mnt_ns().get_root() {
         // Output root mount
         let fs_name = root_mount.sb.fs_type.name;
         let _ = writeln!(output, "none / {} rw 0 0", fs_name);

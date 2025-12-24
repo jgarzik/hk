@@ -45,6 +45,13 @@ impl FileId {
         Self(id)
     }
 
+    /// Create an anonymous FileId for pipe buffers and other non-file pages
+    ///
+    /// Uses 0 as the ID which won't conflict with path-based or block device IDs.
+    pub fn anonymous() -> Self {
+        Self(0)
+    }
+
     /// Create a FileId from a file path using a simple hash
     pub fn from_path(path: &str) -> Self {
         let mut hash: u64 = 0;

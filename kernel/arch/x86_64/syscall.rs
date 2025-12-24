@@ -26,6 +26,8 @@ pub const SYS_PREAD64: u64 = 17;
 pub const SYS_PWRITE64: u64 = 18;
 /// readv(fd, iov, iovcnt)
 pub const SYS_READV: u64 = 19;
+/// ioctl(fd, request, arg)
+pub const SYS_IOCTL: u64 = 16;
 /// writev(fd, iov, iovcnt)
 pub const SYS_WRITEV: u64 = 20;
 /// preadv(fd, iov, iovcnt, offset)
@@ -54,6 +56,8 @@ pub const SYS_LSTAT: u64 = 6;
 pub const SYS_LSEEK: u64 = 8;
 /// mmap(addr, length, prot, flags, fd, offset)
 pub const SYS_MMAP: u64 = 9;
+/// mprotect(addr, len, prot)
+pub const SYS_MPROTECT: u64 = 10;
 /// munmap(addr, length)
 pub const SYS_MUNMAP: u64 = 11;
 /// brk(addr)
@@ -68,6 +72,10 @@ pub const SYS_MLOCKALL: u64 = 151;
 pub const SYS_MUNLOCKALL: u64 = 152;
 /// mlock2(addr, len, flags)
 pub const SYS_MLOCK2: u64 = 325;
+/// msync(addr, length, flags)
+pub const SYS_MSYNC: u64 = 26;
+/// madvise(addr, length, advice)
+pub const SYS_MADVISE: u64 = 28;
 /// ftruncate(fd, length)
 pub const SYS_FTRUNCATE: u64 = 77;
 /// truncate(path, length)
@@ -80,6 +88,8 @@ pub const SYS_DUP2: u64 = 33;
 pub const SYS_FCNTL: u64 = 72;
 /// sched_yield()
 pub const SYS_SCHED_YIELD: u64 = 24;
+/// mremap(old_addr, old_len, new_len, flags, new_addr)
+pub const SYS_MREMAP: u64 = 25;
 /// getpid()
 pub const SYS_GETPID: u64 = 39;
 /// exit(status)
@@ -257,6 +267,16 @@ pub const SYS_SYNC: u64 = 162;
 /// syncfs(fd)
 pub const SYS_SYNCFS: u64 = 306;
 
+// Splice/sendfile syscalls
+/// sendfile64(out_fd, in_fd, offset, count)
+pub const SYS_SENDFILE: u64 = 40;
+/// splice(fd_in, off_in, fd_out, off_out, len, flags)
+pub const SYS_SPLICE: u64 = 275;
+/// tee(fd_in, fd_out, len, flags)
+pub const SYS_TEE: u64 = 276;
+/// vmsplice(fd, iov, nr_segs, flags)
+pub const SYS_VMSPLICE: u64 = 278;
+
 // UTS namespace syscalls
 /// uname(buf)
 pub const SYS_UNAME: u64 = 63;
@@ -287,6 +307,18 @@ pub const SYS_TGKILL: u64 = 234;
 pub const SYS_GETPRIORITY: u64 = 140;
 /// setpriority(which, who, niceval)
 pub const SYS_SETPRIORITY: u64 = 141;
+
+// I/O priority
+/// ioprio_set(which, who, ioprio)
+pub const SYS_IOPRIO_SET: u64 = 251;
+/// ioprio_get(which, who)
+pub const SYS_IOPRIO_GET: u64 = 252;
+
+// Thread-local storage
+/// arch_prctl(code, addr) - Architecture-specific thread state
+pub const SYS_ARCH_PRCTL: u64 = 158;
+/// set_tid_address(tidptr) - Set pointer for child thread ID on exit
+pub const SYS_SET_TID_ADDRESS: u64 = 218;
 
 // System information
 /// getcpu(cpup, nodep, unused)
@@ -860,7 +892,7 @@ pub fn x86_64_syscall_dispatch(
     arg2: u64,
     arg3: u64,
     arg4: u64,
-    _arg5: u64,
+    arg5: u64,
 ) -> u64 {
     use crate::fs::syscall::{
         sys_access,
@@ -887,6 +919,8 @@ pub fn x86_64_syscall_dispatch(
         sys_ftruncate,
         sys_getcwd,
         sys_getdents64,
+        // ioctl
+        sys_ioctl,
         sys_lchown,
         sys_link,
         sys_linkat,
@@ -962,9 +996,10 @@ pub fn x86_64_syscall_dispatch(
         SYS_CLOSE => sys_close(arg0 as i32) as u64,
         SYS_LSEEK => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32) as u64,
         SYS_MMAP => {
-            crate::mm::syscall::sys_mmap(arg0, arg1, arg2 as u32, arg3 as u32, arg4 as i32, _arg5)
+            crate::mm::syscall::sys_mmap(arg0, arg1, arg2 as u32, arg3 as u32, arg4 as i32, arg5)
                 as u64
         }
+        SYS_MPROTECT => crate::mm::syscall::sys_mprotect(arg0, arg1, arg2 as u32) as u64,
         SYS_MUNMAP => crate::mm::syscall::sys_munmap(arg0, arg1) as u64,
         SYS_BRK => crate::mm::syscall::sys_brk(arg0) as u64,
         SYS_MLOCK => crate::mm::syscall::sys_mlock(arg0, arg1) as u64,
@@ -972,6 +1007,9 @@ pub fn x86_64_syscall_dispatch(
         SYS_MLOCKALL => crate::mm::syscall::sys_mlockall(arg0 as i32) as u64,
         SYS_MUNLOCKALL => crate::mm::syscall::sys_munlockall() as u64,
         SYS_MLOCK2 => crate::mm::syscall::sys_mlock2(arg0, arg1, arg2 as i32) as u64,
+        SYS_MSYNC => crate::mm::syscall::sys_msync(arg0, arg1, arg2 as i32) as u64,
+        SYS_MADVISE => crate::mm::syscall::sys_madvise(arg0, arg1, arg2 as i32) as u64,
+        SYS_MREMAP => crate::mm::syscall::sys_mremap(arg0, arg1, arg2, arg3 as u32, arg4) as u64,
         SYS_FTRUNCATE => sys_ftruncate(arg0 as i32, arg1 as i64) as u64,
         SYS_TRUNCATE => sys_truncate(arg0, arg1 as i64) as u64,
         SYS_STAT => sys_stat(arg0, arg1) as u64,
@@ -1091,7 +1129,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_POLL => sys_poll(arg0, arg1 as u32, arg2 as i32) as u64,
         SYS_PPOLL => sys_ppoll(arg0, arg1 as u32, arg2, arg3, arg4) as u64,
         SYS_SELECT => sys_select(arg0 as i32, arg1, arg2, arg3, arg4) as u64,
-        SYS_PSELECT6 => sys_pselect6(arg0 as i32, arg1, arg2, arg3, arg4, _arg5) as u64,
+        SYS_PSELECT6 => sys_pselect6(arg0 as i32, arg1, arg2, arg3, arg4, arg5) as u64,
         SYS_FACCESSAT2 => sys_faccessat2(arg0 as i32, arg1, arg2 as i32, arg3 as i32) as u64,
 
         // Symlinks and hard links
@@ -1125,6 +1163,28 @@ pub fn x86_64_syscall_dispatch(
         SYS_FSYNC => sys_fsync(arg0 as i32) as u64,
         SYS_FDATASYNC => sys_fdatasync(arg0 as i32) as u64,
         SYS_SYNCFS => sys_syncfs(arg0 as i32) as u64,
+
+        // ioctl
+        SYS_IOCTL => sys_ioctl(arg0 as i32, arg1 as u32, arg2) as u64,
+
+        // splice/sendfile
+        SYS_SENDFILE => {
+            crate::fs::splice::sys_sendfile64(arg0 as i32, arg1 as i32, arg2, arg3 as usize) as u64
+        }
+        SYS_SPLICE => crate::fs::splice::sys_splice(
+            arg0 as i32,
+            arg1,
+            arg2 as i32,
+            arg3,
+            arg4 as usize,
+            arg5 as u32,
+        ) as u64,
+        SYS_TEE => {
+            crate::fs::splice::sys_tee(arg0 as i32, arg1 as i32, arg2 as usize, arg3 as u32) as u64
+        }
+        SYS_VMSPLICE => {
+            crate::fs::splice::sys_vmsplice(arg0 as i32, arg1, arg2 as usize, arg3 as u32) as u64
+        }
 
         // Permissions
         SYS_CHMOD => sys_chmod(arg0, arg1 as u32) as u64,
@@ -1189,6 +1249,26 @@ pub fn x86_64_syscall_dispatch(
                 percpu::current_pid(),
                 percpu::current_cred().euid,
             ) as u64
+        }
+
+        // I/O priority
+        SYS_IOPRIO_SET => {
+            use crate::task::syscall::sys_ioprio_set;
+            sys_ioprio_set(arg0 as i32, arg1 as i32, arg2 as i32) as u64
+        }
+        SYS_IOPRIO_GET => {
+            use crate::task::syscall::sys_ioprio_get;
+            sys_ioprio_get(arg0 as i32, arg1 as i32) as u64
+        }
+
+        // Thread-local storage
+        SYS_ARCH_PRCTL => {
+            use crate::task::syscall::sys_arch_prctl;
+            sys_arch_prctl(arg0 as i32, arg1) as u64
+        }
+        SYS_SET_TID_ADDRESS => {
+            use crate::task::syscall::sys_set_tid_address;
+            sys_set_tid_address(arg0) as u64
         }
 
         // Scheduling syscalls (Section 1.3)
@@ -1287,11 +1367,10 @@ pub fn x86_64_syscall_dispatch(
         SYS_CONNECT => crate::net::syscall::sys_connect(arg0 as i32, arg1, arg2) as u64,
         SYS_ACCEPT => crate::net::syscall::sys_accept(arg0 as i32, arg1, arg2) as u64,
         SYS_SENDTO => {
-            crate::net::syscall::sys_sendto(arg0 as i32, arg1, arg2, arg3 as i32, arg4, _arg5)
-                as u64
+            crate::net::syscall::sys_sendto(arg0 as i32, arg1, arg2, arg3 as i32, arg4, arg5) as u64
         }
         SYS_RECVFROM => {
-            crate::net::syscall::sys_recvfrom(arg0 as i32, arg1, arg2, arg3 as i32, arg4, _arg5)
+            crate::net::syscall::sys_recvfrom(arg0 as i32, arg1, arg2, arg3 as i32, arg4, arg5)
                 as u64
         }
         SYS_SHUTDOWN => crate::net::syscall::sys_shutdown(arg0 as i32, arg1 as i32) as u64,
@@ -1313,7 +1392,7 @@ pub fn x86_64_syscall_dispatch(
 
         // Futex syscalls
         SYS_FUTEX => {
-            crate::futex::sys_futex(arg0, arg1 as u32, arg2 as u32, arg3, arg4, _arg5 as u32) as u64
+            crate::futex::sys_futex(arg0, arg1 as u32, arg2 as u32, arg3, arg4, arg5 as u32) as u64
         }
         SYS_SET_ROBUST_LIST => crate::futex::sys_set_robust_list(arg0, arg1) as u64,
         SYS_GET_ROBUST_LIST => crate::futex::sys_get_robust_list(arg0 as i32, arg1, arg2) as u64,

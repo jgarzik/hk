@@ -19,7 +19,7 @@ use spin::Mutex;
 use super::FsError;
 use super::dentry::Dentry;
 use super::inode::{FileType, Inode, InodeId};
-use super::mount::{MOUNT_NS, Mount};
+use super::mount::{Mount, current_mnt_ns};
 use crate::poll::{
     DEFAULT_POLLMASK, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable,
 };
@@ -212,7 +212,7 @@ impl File {
     /// this file is open.
     pub fn new(dentry: Arc<Dentry>, flags: u32, f_op: &'static dyn FileOps) -> Self {
         // Find the mount for this dentry and call mntget
-        let mnt = MOUNT_NS.find_mount_for(&dentry);
+        let mnt = current_mnt_ns().find_mount_for_dentry(&dentry);
         if let Some(ref m) = mnt {
             m.mntget();
         }

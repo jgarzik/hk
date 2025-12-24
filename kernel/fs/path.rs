@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use super::FsError;
 use super::dentry::Dentry;
 use super::inode::{Gid, Inode, Uid};
-use super::mount::{MOUNT_NS, follow_mount};
+use super::mount::{current_mnt_ns, follow_mount};
 
 /// Permission mask: may execute
 pub const MAY_EXEC: u32 = 1;
@@ -107,15 +107,16 @@ fn lookup_path_at_full(
     }
 
     // Get the starting point
+    let mnt_ns = current_mnt_ns();
     let (mut current, components) = if path.starts_with('/') {
         // Absolute path - always start from root, ignore start
-        let root = MOUNT_NS.get_root_dentry().ok_or(FsError::NotFound)?;
+        let root = mnt_ns.get_root_dentry().ok_or(FsError::NotFound)?;
         (root, split_path(path))
     } else {
         // Relative path - use provided start dentry or fall back to root
         let start_dentry = start
             .map(|p| p.dentry.clone())
-            .or_else(|| MOUNT_NS.get_root_dentry())
+            .or_else(|| mnt_ns.get_root_dentry())
             .ok_or(FsError::NotFound)?;
         (start_dentry, split_path(path))
     };
@@ -250,14 +251,15 @@ fn lookup_path_full(
     }
 
     // Get the starting point
+    let mnt_ns = current_mnt_ns();
     let (mut current, components) = if path.starts_with('/') {
         // Absolute path - start from root
-        let root = MOUNT_NS.get_root_dentry().ok_or(FsError::NotFound)?;
+        let root = mnt_ns.get_root_dentry().ok_or(FsError::NotFound)?;
         (root, split_path(path))
     } else {
         // Relative path - for now, treat as absolute from root
         // A real implementation would use the task's cwd
-        let root = MOUNT_NS.get_root_dentry().ok_or(FsError::NotFound)?;
+        let root = mnt_ns.get_root_dentry().ok_or(FsError::NotFound)?;
         (root, split_path(path))
     };
 

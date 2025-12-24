@@ -249,7 +249,7 @@ impl SmpOps for Aarch64Arch {
         smp::enable_ap_scheduling();
     }
 
-    fn set_bsp_cpu_id(acpi: &mut AcpiInfo, hw_id: u8) {
+    fn set_bsp_cpu_id(acpi: &mut AcpiInfo, hw_id: u32) {
         acpi.bsp_cpu_id = hw_id;
         for cpu in acpi.cpus.iter_mut() {
             cpu.is_bsp = cpu.hw_cpu_id == hw_id;
@@ -269,8 +269,8 @@ impl LocalTimerOps for Aarch64Arch {
         // This function is a no-op on aarch64 since we don't use a LAPIC-style model
     }
 
-    fn current_hw_cpu_id() -> u8 {
-        cpu::cpu_id() as u8
+    fn current_hw_cpu_id() -> u32 {
+        cpu::cpu_id()
     }
 
     fn calibrate_and_start_timer(_vector: u8, interval_ms: u32) -> u32 {
@@ -635,9 +635,10 @@ impl ContextOps for Aarch64Arch {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         new_page_table_root: u64,
+        next_tid: Tid,
     ) {
         unsafe {
-            context::context_switch(old_ctx, new_ctx, new_kstack, new_page_table_root);
+            context::context_switch(old_ctx, new_ctx, new_kstack, new_page_table_root, next_tid);
         }
     }
 
@@ -645,9 +646,10 @@ impl ContextOps for Aarch64Arch {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         new_page_table_root: u64,
+        next_tid: Tid,
     ) -> ! {
         unsafe {
-            context::context_switch_first(new_ctx, new_kstack, new_page_table_root);
+            context::context_switch_first(new_ctx, new_kstack, new_page_table_root, next_tid);
         }
     }
 }

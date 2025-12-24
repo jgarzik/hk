@@ -18,7 +18,6 @@
 
 pub mod syscall;
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
@@ -438,6 +437,31 @@ impl SigHand {
             action: IrqSpinlock::new(new_actions),
         })
     }
+
+    /// Reset all signal handlers to default (for CLONE_CLEAR_SIGHAND)
+    ///
+    /// This resets signal handlers following Linux semantics:
+    /// - Handlers set to SIG_IGN remain SIG_IGN (intentional - some signals must stay ignored)
+    /// - All other handlers (custom handlers and SIG_DFL) become SIG_DFL
+    /// - sa_flags are cleared to 0
+    /// - sa_mask is emptied (all signals unmasked in handler context)
+    /// - restorer is cleared
+    ///
+    /// This is called when CLONE_CLEAR_SIGHAND is used during clone.
+    pub fn flush_handlers(&self) {
+        let mut actions = self.action.lock();
+        // Signals 1-64 (index 0 is unused)
+        for sig in 1..=64 {
+            let action = &mut actions[sig];
+            // Preserve SIG_IGN, reset everything else to default
+            if action.handler != SigHandler::Ignore {
+                action.handler = SigHandler::Default;
+            }
+            action.flags = 0;
+            action.restorer = 0;
+            action.mask = SigSet::EMPTY;
+        }
+    }
 }
 
 impl Default for SigHand {
@@ -501,23 +525,10 @@ impl Default for TaskSignalState {
 }
 
 // =============================================================================
-// Global Tables
+// Task signal accessors - uses Task struct fields directly via TASK_TABLE
 // =============================================================================
 
-/// Global table mapping TID -> Arc<SigHand>
-///
-/// Protected by Mutex (only accessed from process context).
-static TASK_SIGHAND: Mutex<BTreeMap<Tid, Arc<SigHand>>> = Mutex::new(BTreeMap::new());
-
-/// Global table for per-task signal state
-///
-/// Protected by Mutex (only accessed from process context).
-static TASK_SIGNAL_STATE: Mutex<BTreeMap<Tid, TaskSignalState>> = Mutex::new(BTreeMap::new());
-
-/// Per-task TIF_SIGPENDING flag
-///
-/// Separate from TaskSignalState for fast lockless checking at syscall return.
-static TASK_TIF_SIGPENDING: Mutex<BTreeMap<Tid, AtomicBool>> = Mutex::new(BTreeMap::new());
+use crate::task::percpu::TASK_TABLE;
 
 // =============================================================================
 // Task Signal APIs
@@ -528,20 +539,23 @@ static TASK_TIF_SIGPENDING: Mutex<BTreeMap<Tid, AtomicBool>> = Mutex::new(BTreeM
 /// Called when creating a new process (init, fork without CLONE_SIGHAND).
 /// Also initializes the SignalStruct (which contains rlimits).
 pub fn init_task_signal(tid: Tid, sighand: Arc<SigHand>) {
-    TASK_SIGHAND.lock().insert(tid, sighand);
-    TASK_SIGNAL_STATE.lock().insert(tid, TaskSignalState::new());
-    TASK_TIF_SIGPENDING
-        .lock()
-        .insert(tid, AtomicBool::new(false));
-    // Initialize SignalStruct for new processes (contains rlimits)
-    TASK_SIGNAL
-        .lock()
-        .insert(tid, Arc::new(SignalStruct::new()));
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.sighand = Some(sighand);
+        task.signal_state = TaskSignalState::new();
+        task.tif_sigpending = AtomicBool::new(false);
+        task.signal = Some(Arc::new(SignalStruct::new()));
+    }
 }
 
 /// Get a task's signal handlers
 pub fn get_task_sighand(tid: Tid) -> Option<Arc<SigHand>> {
-    TASK_SIGHAND.lock().get(&tid).cloned()
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .and_then(|t| t.sighand.clone())
 }
 
 /// Access a task's signal state for modification
@@ -549,8 +563,12 @@ pub fn with_task_signal_state<F, R>(tid: Tid, f: F) -> Option<R>
 where
     F: FnOnce(&mut TaskSignalState) -> R,
 {
-    let mut table = TASK_SIGNAL_STATE.lock();
-    table.get_mut(&tid).map(f)
+    let mut table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter_mut()
+        .find(|t| t.tid == tid)
+        .map(|t| f(&mut t.signal_state))
 }
 
 /// Clone signal state for fork/clone
@@ -559,52 +577,70 @@ where
 /// Otherwise, deep clone the signal handlers.
 ///
 /// If `share_pending` is true (CLONE_THREAD), share the thread-group pending.
+///
+/// If `clear_sighand` is true (CLONE_CLEAR_SIGHAND), reset all handlers to default
+/// after cloning (except SIG_IGN handlers which are preserved).
 pub fn clone_task_signal(
     parent_tid: Tid,
     child_tid: Tid,
     share_sighand: bool,
     share_pending: bool,
+    clear_sighand: bool,
 ) {
-    // Clone or share signal handlers
-    let parent_sighand = TASK_SIGHAND.lock().get(&parent_tid).cloned();
+    // Get parent's sighand and signal_state
+    let (parent_sighand, parent_state) = {
+        let table = TASK_TABLE.lock();
+        let parent = table.tasks.iter().find(|t| t.tid == parent_tid);
+        (
+            parent.and_then(|p| p.sighand.clone()),
+            parent.map(|p| p.signal_state.clone()),
+        )
+    };
 
     let child_sighand = if share_sighand {
         // CLONE_SIGHAND: share the same SigHand
         parent_sighand.unwrap_or_else(|| Arc::new(SigHand::new()))
     } else {
         // Fork: deep clone handlers
-        parent_sighand
+        let sighand = parent_sighand
             .as_ref()
             .map(|sh| sh.deep_clone())
-            .unwrap_or_else(|| Arc::new(SigHand::new()))
-    };
+            .unwrap_or_else(|| Arc::new(SigHand::new()));
 
-    TASK_SIGHAND.lock().insert(child_tid, child_sighand);
+        // CLONE_CLEAR_SIGHAND: reset handlers to default (except SIG_IGN)
+        if clear_sighand {
+            sighand.flush_handlers();
+        }
+
+        sighand
+    };
 
     // Clone per-task signal state
-    let child_state = {
-        let table = TASK_SIGNAL_STATE.lock();
-        if let Some(parent_state) = table.get(&parent_tid) {
-            TaskSignalState {
-                blocked: parent_state.blocked, // Inherit blocked mask
-                pending: SigPending::new(),    // Fresh private pending
-                shared_pending: if share_pending {
-                    // CLONE_THREAD: share thread-group pending
-                    parent_state.shared_pending.clone()
-                } else {
-                    Arc::new(Mutex::new(SigPending::new()))
-                },
-                sigpending: false,
-            }
-        } else {
-            TaskSignalState::new()
+    let child_state = if let Some(parent_state) = parent_state {
+        TaskSignalState {
+            blocked: parent_state.blocked, // Inherit blocked mask
+            pending: SigPending::new(),    // Fresh private pending
+            shared_pending: if share_pending {
+                // CLONE_THREAD: share thread-group pending
+                parent_state.shared_pending.clone()
+            } else {
+                Arc::new(Mutex::new(SigPending::new()))
+            },
+            sigpending: false,
         }
+    } else {
+        TaskSignalState::new()
     };
 
-    TASK_SIGNAL_STATE.lock().insert(child_tid, child_state);
-    TASK_TIF_SIGPENDING
-        .lock()
-        .insert(child_tid, AtomicBool::new(false));
+    // Update child task
+    {
+        let mut table = TASK_TABLE.lock();
+        if let Some(child) = table.tasks.iter_mut().find(|t| t.tid == child_tid) {
+            child.sighand = Some(child_sighand);
+            child.signal_state = child_state;
+            child.tif_sigpending = AtomicBool::new(false);
+        }
+    }
 
     // Clone or share SignalStruct (contains rlimits)
     // CLONE_THREAD (share_pending) implies threads share SignalStruct
@@ -613,11 +649,13 @@ pub fn clone_task_signal(
 
 /// Clean up signal state on task exit
 pub fn exit_task_signal(tid: Tid) {
-    TASK_SIGHAND.lock().remove(&tid);
-    TASK_SIGNAL_STATE.lock().remove(&tid);
-    TASK_TIF_SIGPENDING.lock().remove(&tid);
-    // Clean up SignalStruct (contains rlimits)
-    exit_task_signal_struct(tid);
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.sighand = None;
+        task.signal_state = TaskSignalState::new();
+        task.tif_sigpending = AtomicBool::new(false);
+        task.signal = None;
+    }
 }
 
 // =============================================================================
@@ -626,27 +664,29 @@ pub fn exit_task_signal(tid: Tid) {
 
 /// Set TIF_SIGPENDING flag for a task
 fn set_tif_sigpending(tid: Tid) {
-    let table = TASK_TIF_SIGPENDING.lock();
-    if let Some(flag) = table.get(&tid) {
-        flag.store(true, Ordering::Release);
+    let table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter().find(|t| t.tid == tid) {
+        task.tif_sigpending.store(true, Ordering::Release);
     }
 }
 
 /// Clear TIF_SIGPENDING flag for a task
 #[allow(dead_code)]
 fn clear_tif_sigpending(tid: Tid) {
-    let table = TASK_TIF_SIGPENDING.lock();
-    if let Some(flag) = table.get(&tid) {
-        flag.store(false, Ordering::Release);
+    let table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter().find(|t| t.tid == tid) {
+        task.tif_sigpending.store(false, Ordering::Release);
     }
 }
 
 /// Check if a task has pending signals (fast path)
 pub fn has_pending_signals(tid: Tid) -> bool {
-    let table = TASK_TIF_SIGPENDING.lock();
+    let table = TASK_TABLE.lock();
     table
-        .get(&tid)
-        .map(|f| f.load(Ordering::Acquire))
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .map(|t| t.tif_sigpending.load(Ordering::Acquire))
         .unwrap_or(false)
 }
 
@@ -656,7 +696,8 @@ pub fn has_pending_signals(tid: Tid) -> bool {
 pub fn send_signal(tid: Tid, sig: u32) -> i32 {
     if sig == 0 {
         // Signal 0 is null signal - just check if task exists
-        return if TASK_SIGNAL_STATE.lock().contains_key(&tid) {
+        let table = TASK_TABLE.lock();
+        return if table.tasks.iter().any(|t| t.tid == tid) {
             0
         } else {
             -3 // ESRCH
@@ -921,14 +962,16 @@ impl Default for SignalStruct {
 // TASK_SIGNAL Global Table
 // =============================================================================
 
-/// Global table mapping TID -> Arc<SignalStruct>
-///
-/// All threads in a thread group share the same SignalStruct.
-static TASK_SIGNAL: Mutex<BTreeMap<Tid, Arc<SignalStruct>>> = Mutex::new(BTreeMap::new());
+// Task.signal field accessors (SignalStruct - shared by thread group)
 
 /// Get a task's signal struct
 pub fn get_task_signal_struct(tid: Tid) -> Option<Arc<SignalStruct>> {
-    TASK_SIGNAL.lock().get(&tid).cloned()
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .and_then(|t| t.signal.clone())
 }
 
 /// Clone signal struct for fork/clone
@@ -936,7 +979,7 @@ pub fn get_task_signal_struct(tid: Tid) -> Option<Arc<SignalStruct>> {
 /// If `share_signal` is true (CLONE_THREAD), share the Arc<SignalStruct>.
 /// Otherwise, deep clone the signal struct.
 fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool) {
-    let parent_signal = TASK_SIGNAL.lock().get(&parent_tid).cloned();
+    let parent_signal = get_task_signal_struct(parent_tid);
 
     let child_signal = if share_signal {
         // CLONE_THREAD: share the same SignalStruct
@@ -949,10 +992,8 @@ fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool)
             .unwrap_or_else(|| Arc::new(SignalStruct::new()))
     };
 
-    TASK_SIGNAL.lock().insert(child_tid, child_signal);
-}
-
-/// Clean up signal struct on task exit
-fn exit_task_signal_struct(tid: Tid) {
-    TASK_SIGNAL.lock().remove(&tid);
+    let mut table = TASK_TABLE.lock();
+    if let Some(child) = table.tasks.iter_mut().find(|t| t.tid == child_tid) {
+        child.signal = Some(child_signal);
+    }
 }

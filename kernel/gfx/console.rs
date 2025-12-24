@@ -426,10 +426,19 @@ pub unsafe fn init_graphics_console() -> bool {
 /// Register the graphics console with the console subsystem
 ///
 /// Should be called after init_graphics_console().
+/// Registered with CONSDEV flag indicating this is the primary interactive console.
 pub fn register_graphics_console() {
+    use crate::console::ConsoleFlags;
+
     if let Some(console) = GRAPHICS_CONSOLE.get() {
-        // Register with Normal priority (serial stays Preferred for debug)
-        crate::console::register_console(console, ConsolePriority::Normal);
+        // Register with Normal priority and CONSDEV flag
+        // CONSDEV indicates this is the primary console (/dev/console target)
+        // PRINTBUFFER requests replay of buffered messages (already done by printk)
+        crate::console::register_console(
+            console,
+            ConsolePriority::Normal,
+            ConsoleFlags::CONSDEV | ConsoleFlags::PRINTBUFFER,
+        );
         crate::printkln!("graphics: console registered as {}", console.name());
     }
 }
