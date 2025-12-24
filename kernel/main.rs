@@ -16,6 +16,7 @@ pub mod elf;
 pub mod futex;
 pub mod pipe;
 pub mod poll;
+pub mod posix_timer;
 pub mod printk;
 pub mod storage;
 mod time;

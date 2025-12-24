@@ -19,6 +19,7 @@ pub mod namespace;
 pub mod sockets;
 pub mod futex;
 pub mod timerfd;
+pub mod posix_timer;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -37,4 +38,5 @@ pub fn run_all_tests() {
     sockets::run_tests();
     futex::run_tests();
     timerfd::run_tests();
+    posix_timer::run_tests();
 }

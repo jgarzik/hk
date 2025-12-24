@@ -185,6 +185,13 @@ pub const SYS_CLOCK_NANOSLEEP: u64 = 115;
 pub const SYS_TIMERFD_CREATE: u64 = 85;
 pub const SYS_TIMERFD_SETTIME: u64 = 86;
 pub const SYS_TIMERFD_GETTIME: u64 = 87;
+
+// POSIX timer syscalls (Section 6.2)
+pub const SYS_TIMER_CREATE: u64 = 107;
+pub const SYS_TIMER_GETTIME: u64 = 108;
+pub const SYS_TIMER_GETOVERRUN: u64 = 109;
+pub const SYS_TIMER_SETTIME: u64 = 110;
+pub const SYS_TIMER_DELETE: u64 = 111;
 pub const SYS_REBOOT: u64 = 142;
 pub const SYS_SETPGID: u64 = 154;
 pub const SYS_GETPGID: u64 = 155;
@@ -519,6 +526,40 @@ pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: *const ITimerSpec, ol
 #[inline(always)]
 pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
     unsafe { syscall2!(SYS_TIMERFD_GETTIME, fd, curr_value) }
+}
+
+// --- POSIX Timers ---
+
+use super::SigEvent;
+
+/// timer_create(clockid, sigevent, timerid)
+#[inline(always)]
+pub fn sys_timer_create(clockid: i32, sevp: *const SigEvent, timerid: *mut i32) -> i64 {
+    unsafe { syscall3!(SYS_TIMER_CREATE, clockid, sevp, timerid) }
+}
+
+/// timer_settime(timerid, flags, new_value, old_value)
+#[inline(always)]
+pub fn sys_timer_settime(timerid: i32, flags: i32, new_value: *const ITimerSpec, old_value: *mut ITimerSpec) -> i64 {
+    unsafe { syscall4!(SYS_TIMER_SETTIME, timerid, flags, new_value, old_value) }
+}
+
+/// timer_gettime(timerid, curr_value)
+#[inline(always)]
+pub fn sys_timer_gettime(timerid: i32, curr_value: *mut ITimerSpec) -> i64 {
+    unsafe { syscall2!(SYS_TIMER_GETTIME, timerid, curr_value) }
+}
+
+/// timer_getoverrun(timerid)
+#[inline(always)]
+pub fn sys_timer_getoverrun(timerid: i32) -> i64 {
+    unsafe { syscall1!(SYS_TIMER_GETOVERRUN, timerid) }
+}
+
+/// timer_delete(timerid)
+#[inline(always)]
+pub fn sys_timer_delete(timerid: i32) -> i64 {
+    unsafe { syscall1!(SYS_TIMER_DELETE, timerid) }
 }
 
 /// waitid(idtype, id, infop, options)

@@ -832,3 +832,88 @@ pub const TFD_NONBLOCK: i32 = 0o4000;
 /// timerfd_settime flags
 pub const TFD_TIMER_ABSTIME: i32 = 1;
 pub const TFD_TIMER_CANCEL_ON_SET: i32 = 2;
+
+// ============================================================================
+// POSIX timer types and constants (Section 6.2)
+// ============================================================================
+
+/// POSIX timer_settime flags
+pub const TIMER_ABSTIME: i32 = 1;
+
+/// POSIX timer notification types
+pub mod sigev_notify {
+    /// Notify via signal
+    pub const SIGEV_SIGNAL: i32 = 0;
+    /// No notification
+    pub const SIGEV_NONE: i32 = 1;
+    /// Notify via thread (not supported)
+    pub const SIGEV_THREAD: i32 = 2;
+    /// Signal specific thread
+    pub const SIGEV_THREAD_ID: i32 = 4;
+}
+
+/// union sigval - data passed with signal notification
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union SigVal {
+    pub sival_int: i32,
+    pub sival_ptr: u64,
+}
+
+impl Default for SigVal {
+    fn default() -> Self {
+        Self { sival_int: 0 }
+    }
+}
+
+/// struct sigevent - Linux ABI compatible
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SigEvent {
+    /// Data passed with notification
+    pub sigev_value: SigVal,
+    /// Signal number
+    pub sigev_signo: i32,
+    /// Notification method (SIGEV_SIGNAL, SIGEV_NONE, etc.)
+    pub sigev_notify: i32,
+    /// Thread ID for SIGEV_THREAD_ID
+    pub sigev_notify_thread_id: i32,
+    /// Padding to match Linux layout (56 bytes total)
+    pub _pad: [i32; 11],
+}
+
+impl Default for SigEvent {
+    fn default() -> Self {
+        Self {
+            sigev_value: SigVal::default(),
+            sigev_signo: SIGALRM as i32,
+            sigev_notify: sigev_notify::SIGEV_SIGNAL,
+            sigev_notify_thread_id: 0,
+            _pad: [0; 11],
+        }
+    }
+}
+
+impl SigEvent {
+    /// Create a new sigevent for signal notification
+    pub const fn signal(signo: i32) -> Self {
+        Self {
+            sigev_value: SigVal { sival_int: 0 },
+            sigev_signo: signo,
+            sigev_notify: sigev_notify::SIGEV_SIGNAL,
+            sigev_notify_thread_id: 0,
+            _pad: [0; 11],
+        }
+    }
+
+    /// Create a sigevent that disables notification
+    pub const fn none() -> Self {
+        Self {
+            sigev_value: SigVal { sival_int: 0 },
+            sigev_signo: 0,
+            sigev_notify: sigev_notify::SIGEV_NONE,
+            sigev_notify_thread_id: 0,
+            _pad: [0; 11],
+        }
+    }
+}

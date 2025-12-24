@@ -112,6 +112,19 @@ pub const SYS_TIMERFD_CREATE: u64 = 85;
 pub const SYS_TIMERFD_SETTIME: u64 = 86;
 /// timerfd_gettime(fd, curr_value)
 pub const SYS_TIMERFD_GETTIME: u64 = 87;
+
+// POSIX timer syscalls (Section 6.2)
+/// timer_create(clockid, sigevent, timerid)
+pub const SYS_TIMER_CREATE: u64 = 107;
+/// timer_gettime(timerid, curr_value)
+pub const SYS_TIMER_GETTIME: u64 = 108;
+/// timer_getoverrun(timerid)
+pub const SYS_TIMER_GETOVERRUN: u64 = 109;
+/// timer_settime(timerid, flags, new_value, old_value)
+pub const SYS_TIMER_SETTIME: u64 = 110;
+/// timer_delete(timerid)
+pub const SYS_TIMER_DELETE: u64 = 111;
+
 pub const SYS_REBOOT: u64 = 142;
 pub const SYS_SETPGID: u64 = 154;
 pub const SYS_GETPGID: u64 = 155;
@@ -502,6 +515,15 @@ pub fn aarch64_syscall_dispatch(
         SYS_TIMERFD_CREATE => sys_timerfd_create(arg0 as i32, arg1 as i32) as u64,
         SYS_TIMERFD_SETTIME => sys_timerfd_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64,
         SYS_TIMERFD_GETTIME => sys_timerfd_gettime(arg0 as i32, arg1) as u64,
+
+        // POSIX timer syscalls (Section 6.2)
+        SYS_TIMER_CREATE => crate::posix_timer::sys_timer_create(arg0 as i32, arg1, arg2) as u64,
+        SYS_TIMER_SETTIME => {
+            crate::posix_timer::sys_timer_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64
+        }
+        SYS_TIMER_GETTIME => crate::posix_timer::sys_timer_gettime(arg0 as i32, arg1) as u64,
+        SYS_TIMER_GETOVERRUN => crate::posix_timer::sys_timer_getoverrun(arg0 as i32) as u64,
+        SYS_TIMER_DELETE => crate::posix_timer::sys_timer_delete(arg0 as i32) as u64,
 
         // Process lifecycle
         SYS_EXIT | SYS_EXIT_GROUP => sys_exit(arg0 as i32),

@@ -223,11 +223,11 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 
 6.2 POSIX timers
 
-- [ ] timer_create
-- [ ] timer_settime
-- [ ] timer_gettime
-- [ ] timer_getoverrun
-- [ ] timer_delete
+- [x] timer_create
+- [x] timer_settime
+- [x] timer_gettime
+- [x] timer_getoverrun
+- [x] timer_delete
 
 6.3 Timer FDs
 
