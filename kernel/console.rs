@@ -386,7 +386,8 @@ pub fn register_console(
     };
 
     // Check if we need to unregister boot consoles after registration
-    let is_real_console = !flags.contains(ConsoleFlags::BOOT) && flags.contains(ConsoleFlags::CONSDEV);
+    let is_real_console =
+        !flags.contains(ConsoleFlags::BOOT) && flags.contains(ConsoleFlags::CONSDEV);
 
     // Register the new console and collect boot console names if needed
     let (became_primary, boot_names) = {
