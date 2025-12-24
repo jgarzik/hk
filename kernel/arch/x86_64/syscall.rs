@@ -295,6 +295,32 @@ pub const SYS_RENAMEAT: u64 = 264;
 /// renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
 pub const SYS_RENAMEAT2: u64 = 316;
 
+// Extended attributes (xattr) syscalls
+/// setxattr(path, name, value, size, flags)
+pub const SYS_SETXATTR: u64 = 188;
+/// lsetxattr(path, name, value, size, flags)
+pub const SYS_LSETXATTR: u64 = 189;
+/// fsetxattr(fd, name, value, size, flags)
+pub const SYS_FSETXATTR: u64 = 190;
+/// getxattr(path, name, value, size)
+pub const SYS_GETXATTR: u64 = 191;
+/// lgetxattr(path, name, value, size)
+pub const SYS_LGETXATTR: u64 = 192;
+/// fgetxattr(fd, name, value, size)
+pub const SYS_FGETXATTR: u64 = 193;
+/// listxattr(path, list, size)
+pub const SYS_LISTXATTR: u64 = 194;
+/// llistxattr(path, list, size)
+pub const SYS_LLISTXATTR: u64 = 195;
+/// flistxattr(fd, list, size)
+pub const SYS_FLISTXATTR: u64 = 196;
+/// removexattr(path, name)
+pub const SYS_REMOVEXATTR: u64 = 197;
+/// lremovexattr(path, name)
+pub const SYS_LREMOVEXATTR: u64 = 198;
+/// fremovexattr(fd, name)
+pub const SYS_FREMOVEXATTR: u64 = 199;
+
 // Sync syscalls
 /// fsync(fd)
 pub const SYS_FSYNC: u64 = 74;
@@ -954,18 +980,28 @@ pub fn x86_64_syscall_dispatch(
         sys_fcntl,
         // Sync syscalls
         sys_fdatasync,
+        sys_fgetxattr,
+        sys_flistxattr,
+        sys_fremovexattr,
+        sys_fsetxattr,
         sys_fstat,
         sys_fstatfs,
         sys_fsync,
         sys_ftruncate,
         sys_getcwd,
         sys_getdents64,
+        sys_getxattr,
         // ioctl
         sys_ioctl,
         sys_lchown,
+        sys_lgetxattr,
         sys_link,
         sys_linkat,
+        sys_listxattr,
+        sys_llistxattr,
+        sys_lremovexattr,
         sys_lseek,
+        sys_lsetxattr,
         sys_lstat,
         sys_mkdir,
         sys_mkdirat,
@@ -993,11 +1029,14 @@ pub fn x86_64_syscall_dispatch(
         sys_readlink,
         sys_readlinkat,
         sys_readv,
+        sys_removexattr,
         sys_rename,
         sys_renameat,
         sys_renameat2,
         sys_rmdir,
         sys_select,
+        // Extended attributes
+        sys_setxattr,
         sys_stat,
         sys_statfs,
         sys_statx,
@@ -1282,6 +1321,20 @@ pub fn x86_64_syscall_dispatch(
         SYS_RENAME => sys_rename(arg0, arg1) as u64,
         SYS_RENAMEAT => sys_renameat(arg0 as i32, arg1, arg2 as i32, arg3) as u64,
         SYS_RENAMEAT2 => sys_renameat2(arg0 as i32, arg1, arg2 as i32, arg3, arg4 as u32) as u64,
+
+        // Extended attributes
+        SYS_SETXATTR => sys_setxattr(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
+        SYS_LSETXATTR => sys_lsetxattr(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
+        SYS_FSETXATTR => sys_fsetxattr(arg0 as i32, arg1, arg2, arg3, arg4 as i32) as u64,
+        SYS_GETXATTR => sys_getxattr(arg0, arg1, arg2, arg3) as u64,
+        SYS_LGETXATTR => sys_lgetxattr(arg0, arg1, arg2, arg3) as u64,
+        SYS_FGETXATTR => sys_fgetxattr(arg0 as i32, arg1, arg2, arg3) as u64,
+        SYS_LISTXATTR => sys_listxattr(arg0, arg1, arg2) as u64,
+        SYS_LLISTXATTR => sys_llistxattr(arg0, arg1, arg2) as u64,
+        SYS_FLISTXATTR => sys_flistxattr(arg0 as i32, arg1, arg2) as u64,
+        SYS_REMOVEXATTR => sys_removexattr(arg0, arg1) as u64,
+        SYS_LREMOVEXATTR => sys_lremovexattr(arg0, arg1) as u64,
+        SYS_FREMOVEXATTR => sys_fremovexattr(arg0 as i32, arg1) as u64,
 
         // UTS namespace (hostname, domainname, system info)
         SYS_UNAME => crate::ns::uts::sys_uname(arg0) as u64,

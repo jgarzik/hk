@@ -146,18 +146,18 @@ Timestamps:
 
 Extended attributes (Linux-specific):
 
-- [ ] getxattr
-- [ ] lgetxattr
-- [ ] fgetxattr
-- [ ] setxattr
-- [ ] lsetxattr
-- [ ] fsetxattr
-- [ ] listxattr
-- [ ] llistxattr
-- [ ] flistxattr
-- [ ] removexattr
-- [ ] lremovexattr
-- [ ] fremovexattr
+- [x] getxattr
+- [x] lgetxattr
+- [x] fgetxattr
+- [x] setxattr
+- [x] lsetxattr
+- [x] fsetxattr
+- [x] listxattr
+- [x] llistxattr
+- [x] flistxattr
+- [x] removexattr
+- [x] lremovexattr
+- [x] fremovexattr
 
 3.3 Directory enumeration
 

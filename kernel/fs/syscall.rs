@@ -39,6 +39,9 @@ pub const EFBIG: i64 = -27;
 pub const ESPIPE: i64 = -29;
 pub const EPIPE: i64 = -32;
 pub const ENOTEMPTY: i64 = -39;
+pub const ERANGE: i64 = -34;
+pub const ENODATA: i64 = -61;
+pub const EEXIST: i64 = -17;
 pub const EOPNOTSUPP: i64 = -95;
 
 // =============================================================================
@@ -500,9 +503,6 @@ pub fn sys_chroot(path_ptr: u64) -> i64 {
 
     0
 }
-
-/// ERANGE - buffer too small
-const ERANGE: i64 = -34;
 
 /// sys_getcwd - get current working directory
 ///
@@ -2876,8 +2876,6 @@ pub fn sys_faccessat2(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
 
 /// Too many symbolic links encountered
 const ELOOP: i64 = -40;
-/// File exists
-const EEXIST: i64 = -17;
 /// Cross-device link
 const EXDEV: i64 = -18;
 
@@ -6117,4 +6115,561 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> 
     }
 
     0
+}
+
+// =============================================================================
+// Extended attributes (xattr) syscalls
+// =============================================================================
+
+/// XATTR_CREATE - set value, fail if attr already exists
+pub const XATTR_CREATE: u32 = 0x1;
+/// XATTR_REPLACE - set value, fail if attr doesn't exist
+pub const XATTR_REPLACE: u32 = 0x2;
+/// Maximum attribute name length
+pub const XATTR_NAME_MAX: usize = 255;
+/// Maximum attribute value size (64KB)
+pub const XATTR_SIZE_MAX: usize = 65536;
+
+/// Helper to convert FsError to errno for xattr operations
+fn xattr_error_to_errno(e: FsError) -> i64 {
+    match e {
+        FsError::NotFound => ENOENT,
+        FsError::NoData => ENODATA,
+        FsError::AlreadyExists => EEXIST,
+        FsError::Range => ERANGE,
+        FsError::NotSupported => EOPNOTSUPP,
+        FsError::PermissionDenied => EPERM,
+        FsError::IoError => -5, // EIO
+        _ => EINVAL,
+    }
+}
+
+/// Copy xattr value from user space
+fn copy_xattr_value_from_user(value_ptr: u64, size: u64) -> Result<alloc::vec::Vec<u8>, i64> {
+    use crate::uaccess::copy_from_user;
+
+    if size > XATTR_SIZE_MAX as u64 {
+        return Err(ERANGE);
+    }
+
+    if size == 0 {
+        return Ok(alloc::vec::Vec::new());
+    }
+
+    // Validate user buffer
+    if !Uaccess::access_ok(value_ptr, size as usize) {
+        return Err(EFAULT);
+    }
+
+    // Allocate and copy value from user space
+    let mut value = vec![0u8; size as usize];
+    if copy_from_user::<Uaccess>(&mut value, value_ptr, size as usize).is_err() {
+        return Err(EFAULT);
+    }
+    Ok(value)
+}
+
+/// sys_setxattr - set an extended attribute value
+///
+/// # Arguments
+/// * `path_ptr` - User pointer to path string
+/// * `name_ptr` - User pointer to attribute name string
+/// * `value_ptr` - User pointer to attribute value
+/// * `size` - Size of the value
+/// * `flags` - XATTR_CREATE or XATTR_REPLACE
+///
+/// # Returns
+/// 0 on success, negative errno on error
+pub fn sys_setxattr(path_ptr: u64, name_ptr: u64, value_ptr: u64, size: u64, flags: i32) -> i64 {
+    do_setxattr(path_ptr, name_ptr, value_ptr, size, flags, true)
+}
+
+/// sys_lsetxattr - set an extended attribute value (don't follow symlinks)
+pub fn sys_lsetxattr(path_ptr: u64, name_ptr: u64, value_ptr: u64, size: u64, flags: i32) -> i64 {
+    do_setxattr(path_ptr, name_ptr, value_ptr, size, flags, false)
+}
+
+/// Internal helper for setxattr/lsetxattr
+fn do_setxattr(
+    path_ptr: u64,
+    name_ptr: u64,
+    value_ptr: u64,
+    size: u64,
+    flags: i32,
+    follow_symlinks: bool,
+) -> i64 {
+    // Validate flags
+    if flags as u32 & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
+        return EINVAL;
+    }
+
+    // Copy path from user
+    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Copy attribute name from user
+    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+        Ok(n) => n,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate name length
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE;
+    }
+
+    // Copy value from user
+    let value = match copy_xattr_value_from_user(value_ptr, size) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // Lookup path
+    let lookup_flags = if follow_symlinks {
+        LookupFlags::open()
+    } else {
+        LookupFlags {
+            follow: false,
+            ..LookupFlags::open()
+        }
+    };
+
+    let dentry = match lookup_path_flags(&path, lookup_flags) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    let inode = match dentry.get_inode() {
+        Some(i) => i,
+        None => return ENOENT,
+    };
+
+    // Call inode operation
+    match inode.i_op.setxattr(&inode, &name, &value, flags as u32) {
+        Ok(()) => 0,
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_fsetxattr - set an extended attribute value on a file descriptor
+pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i32) -> i64 {
+    // Validate flags
+    if flags as u32 & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
+        return EINVAL;
+    }
+
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Copy attribute name from user
+    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+        Ok(n) => n,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate name length
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE;
+    }
+
+    // Copy value from user
+    let value = match copy_xattr_value_from_user(value_ptr, size) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let inode = match file.get_inode() {
+        Some(i) => i,
+        None => return EBADF,
+    };
+
+    // Call inode operation
+    match inode.i_op.setxattr(&inode, &name, &value, flags as u32) {
+        Ok(()) => 0,
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_getxattr - get an extended attribute value
+///
+/// # Arguments
+/// * `path_ptr` - User pointer to path string
+/// * `name_ptr` - User pointer to attribute name string
+/// * `value_ptr` - User pointer to buffer for attribute value
+/// * `size` - Size of the buffer (0 to query size needed)
+///
+/// # Returns
+/// Size of attribute value on success, negative errno on error
+pub fn sys_getxattr(path_ptr: u64, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
+    do_getxattr(path_ptr, name_ptr, value_ptr, size, true)
+}
+
+/// sys_lgetxattr - get an extended attribute value (don't follow symlinks)
+pub fn sys_lgetxattr(path_ptr: u64, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
+    do_getxattr(path_ptr, name_ptr, value_ptr, size, false)
+}
+
+/// Internal helper for getxattr/lgetxattr
+fn do_getxattr(
+    path_ptr: u64,
+    name_ptr: u64,
+    value_ptr: u64,
+    size: u64,
+    follow_symlinks: bool,
+) -> i64 {
+    // Copy path from user
+    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Copy attribute name from user
+    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+        Ok(n) => n,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate name length
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE;
+    }
+
+    // Lookup path
+    let lookup_flags = if follow_symlinks {
+        LookupFlags::open()
+    } else {
+        LookupFlags {
+            follow: false,
+            ..LookupFlags::open()
+        }
+    };
+
+    let dentry = match lookup_path_flags(&path, lookup_flags) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    let inode = match dentry.get_inode() {
+        Some(i) => i,
+        None => return ENOENT,
+    };
+
+    // If size is 0, query the size needed
+    if size == 0 {
+        let mut empty_buf: [u8; 0] = [];
+        match inode.i_op.getxattr(&inode, &name, &mut empty_buf) {
+            Ok(attr_size) => return attr_size as i64,
+            Err(e) => return xattr_error_to_errno(e),
+        }
+    }
+
+    // Validate size
+    if size > XATTR_SIZE_MAX as u64 {
+        return ERANGE;
+    }
+
+    // Validate user buffer
+    if !Uaccess::access_ok(value_ptr, size as usize) {
+        return EFAULT;
+    }
+
+    // Allocate kernel buffer
+    let mut value = vec![0u8; size as usize];
+
+    // Get the attribute
+    match inode.i_op.getxattr(&inode, &name, &mut value) {
+        Ok(attr_size) => {
+            // Copy to user
+            unsafe {
+                core::ptr::copy_nonoverlapping(value.as_ptr(), value_ptr as *mut u8, attr_size);
+            }
+            attr_size as i64
+        }
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_fgetxattr - get an extended attribute value from a file descriptor
+pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Copy attribute name from user
+    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+        Ok(n) => n,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate name length
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE;
+    }
+
+    let inode = match file.get_inode() {
+        Some(i) => i,
+        None => return EBADF,
+    };
+
+    // If size is 0, query the size needed
+    if size == 0 {
+        let mut empty_buf: [u8; 0] = [];
+        match inode.i_op.getxattr(&inode, &name, &mut empty_buf) {
+            Ok(attr_size) => return attr_size as i64,
+            Err(e) => return xattr_error_to_errno(e),
+        }
+    }
+
+    // Validate size
+    if size > XATTR_SIZE_MAX as u64 {
+        return ERANGE;
+    }
+
+    // Validate user buffer
+    if !Uaccess::access_ok(value_ptr, size as usize) {
+        return EFAULT;
+    }
+
+    // Allocate kernel buffer
+    let mut value = vec![0u8; size as usize];
+
+    // Get the attribute
+    match inode.i_op.getxattr(&inode, &name, &mut value) {
+        Ok(attr_size) => {
+            // Copy to user
+            unsafe {
+                core::ptr::copy_nonoverlapping(value.as_ptr(), value_ptr as *mut u8, attr_size);
+            }
+            attr_size as i64
+        }
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_listxattr - list extended attribute names
+///
+/// # Arguments
+/// * `path_ptr` - User pointer to path string
+/// * `list_ptr` - User pointer to buffer for null-separated attribute names
+/// * `size` - Size of the buffer (0 to query size needed)
+///
+/// # Returns
+/// Total size of attribute names on success, negative errno on error
+pub fn sys_listxattr(path_ptr: u64, list_ptr: u64, size: u64) -> i64 {
+    do_listxattr(path_ptr, list_ptr, size, true)
+}
+
+/// sys_llistxattr - list extended attribute names (don't follow symlinks)
+pub fn sys_llistxattr(path_ptr: u64, list_ptr: u64, size: u64) -> i64 {
+    do_listxattr(path_ptr, list_ptr, size, false)
+}
+
+/// Internal helper for listxattr/llistxattr
+fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) -> i64 {
+    // Copy path from user
+    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Lookup path
+    let lookup_flags = if follow_symlinks {
+        LookupFlags::open()
+    } else {
+        LookupFlags {
+            follow: false,
+            ..LookupFlags::open()
+        }
+    };
+
+    let dentry = match lookup_path_flags(&path, lookup_flags) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    let inode = match dentry.get_inode() {
+        Some(i) => i,
+        None => return ENOENT,
+    };
+
+    // If size is 0, query the size needed
+    if size == 0 {
+        let mut empty_buf: [u8; 0] = [];
+        match inode.i_op.listxattr(&inode, &mut empty_buf) {
+            Ok(list_size) => return list_size as i64,
+            Err(e) => return xattr_error_to_errno(e),
+        }
+    }
+
+    // Validate user buffer
+    if !Uaccess::access_ok(list_ptr, size as usize) {
+        return EFAULT;
+    }
+
+    // Allocate kernel buffer
+    let mut list = vec![0u8; size as usize];
+
+    // Get the list
+    match inode.i_op.listxattr(&inode, &mut list) {
+        Ok(list_size) => {
+            // Copy to user
+            unsafe {
+                core::ptr::copy_nonoverlapping(list.as_ptr(), list_ptr as *mut u8, list_size);
+            }
+            list_size as i64
+        }
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_flistxattr - list extended attribute names from a file descriptor
+pub fn sys_flistxattr(fd: i32, list_ptr: u64, size: u64) -> i64 {
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    let inode = match file.get_inode() {
+        Some(i) => i,
+        None => return EBADF,
+    };
+
+    // If size is 0, query the size needed
+    if size == 0 {
+        let mut empty_buf: [u8; 0] = [];
+        match inode.i_op.listxattr(&inode, &mut empty_buf) {
+            Ok(list_size) => return list_size as i64,
+            Err(e) => return xattr_error_to_errno(e),
+        }
+    }
+
+    // Validate user buffer
+    if !Uaccess::access_ok(list_ptr, size as usize) {
+        return EFAULT;
+    }
+
+    // Allocate kernel buffer
+    let mut list = vec![0u8; size as usize];
+
+    // Get the list
+    match inode.i_op.listxattr(&inode, &mut list) {
+        Ok(list_size) => {
+            // Copy to user
+            unsafe {
+                core::ptr::copy_nonoverlapping(list.as_ptr(), list_ptr as *mut u8, list_size);
+            }
+            list_size as i64
+        }
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_removexattr - remove an extended attribute
+///
+/// # Arguments
+/// * `path_ptr` - User pointer to path string
+/// * `name_ptr` - User pointer to attribute name string
+///
+/// # Returns
+/// 0 on success, negative errno on error
+pub fn sys_removexattr(path_ptr: u64, name_ptr: u64) -> i64 {
+    do_removexattr(path_ptr, name_ptr, true)
+}
+
+/// sys_lremovexattr - remove an extended attribute (don't follow symlinks)
+pub fn sys_lremovexattr(path_ptr: u64, name_ptr: u64) -> i64 {
+    do_removexattr(path_ptr, name_ptr, false)
+}
+
+/// Internal helper for removexattr/lremovexattr
+fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
+    // Copy path from user
+    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Copy attribute name from user
+    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+        Ok(n) => n,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate name length
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE;
+    }
+
+    // Lookup path
+    let lookup_flags = if follow_symlinks {
+        LookupFlags::open()
+    } else {
+        LookupFlags {
+            follow: false,
+            ..LookupFlags::open()
+        }
+    };
+
+    let dentry = match lookup_path_flags(&path, lookup_flags) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    let inode = match dentry.get_inode() {
+        Some(i) => i,
+        None => return ENOENT,
+    };
+
+    // Call inode operation
+    match inode.i_op.removexattr(&inode, &name) {
+        Ok(()) => 0,
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_fremovexattr - remove an extended attribute from a file descriptor
+pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Copy attribute name from user
+    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+        Ok(n) => n,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate name length
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE;
+    }
+
+    let inode = match file.get_inode() {
+        Some(i) => i,
+        None => return EBADF,
+    };
+
+    // Call inode operation
+    match inode.i_op.removexattr(&inode, &name) {
+        Ok(()) => 0,
+        Err(e) => xattr_error_to_errno(e),
+    }
 }

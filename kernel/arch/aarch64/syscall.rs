@@ -72,6 +72,32 @@ pub const SYS_FSYNC: u64 = 82;
 pub const SYS_FDATASYNC: u64 = 83;
 pub const SYS_SYNCFS: u64 = 267;
 
+// Extended attributes (xattr) syscalls - aarch64 numbers
+/// setxattr(path, name, value, size, flags)
+pub const SYS_SETXATTR: u64 = 5;
+/// lsetxattr(path, name, value, size, flags)
+pub const SYS_LSETXATTR: u64 = 6;
+/// fsetxattr(fd, name, value, size, flags)
+pub const SYS_FSETXATTR: u64 = 7;
+/// getxattr(path, name, value, size)
+pub const SYS_GETXATTR: u64 = 8;
+/// lgetxattr(path, name, value, size)
+pub const SYS_LGETXATTR: u64 = 9;
+/// fgetxattr(fd, name, value, size)
+pub const SYS_FGETXATTR: u64 = 10;
+/// listxattr(path, list, size)
+pub const SYS_LISTXATTR: u64 = 11;
+/// llistxattr(path, list, size)
+pub const SYS_LLISTXATTR: u64 = 12;
+/// flistxattr(fd, list, size)
+pub const SYS_FLISTXATTR: u64 = 13;
+/// removexattr(path, name)
+pub const SYS_REMOVEXATTR: u64 = 14;
+/// lremovexattr(path, name)
+pub const SYS_LREMOVEXATTR: u64 = 15;
+/// fremovexattr(fd, name)
+pub const SYS_FREMOVEXATTR: u64 = 16;
+
 /// ioctl(fd, request, arg)
 pub const SYS_IOCTL: u64 = 29;
 
@@ -325,13 +351,65 @@ pub fn aarch64_syscall_dispatch(
     arg5: u64,
 ) -> u64 {
     use crate::fs::syscall::{
-        sys_chroot, sys_close, sys_dup3, sys_fchmod, sys_fchmodat, sys_fchmodat2, sys_fchown,
-        sys_fchownat, sys_fcntl, sys_fdatasync, sys_fstatat, sys_fstatfs, sys_fsync, sys_ftruncate,
-        sys_getdents64, sys_ioctl, sys_linkat, sys_lseek, sys_mkdirat, sys_mknodat, sys_mount,
-        sys_openat, sys_pipe2, sys_ppoll, sys_pread64, sys_preadv, sys_preadv2, sys_pselect6,
-        sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read, sys_readlinkat, sys_readv, sys_renameat,
-        sys_statfs, sys_statx, sys_symlinkat, sys_sync, sys_syncfs, sys_umask, sys_umount2,
-        sys_unlinkat, sys_utimensat, sys_write, sys_writev,
+        sys_chroot,
+        sys_close,
+        sys_dup3,
+        sys_fchmod,
+        sys_fchmodat,
+        sys_fchmodat2,
+        sys_fchown,
+        sys_fchownat,
+        sys_fcntl,
+        sys_fdatasync,
+        sys_fgetxattr,
+        sys_flistxattr,
+        sys_fremovexattr,
+        sys_fsetxattr,
+        sys_fstatat,
+        sys_fstatfs,
+        sys_fsync,
+        sys_ftruncate,
+        sys_getdents64,
+        sys_getxattr,
+        sys_ioctl,
+        sys_lgetxattr,
+        sys_linkat,
+        sys_listxattr,
+        sys_llistxattr,
+        sys_lremovexattr,
+        sys_lseek,
+        sys_lsetxattr,
+        sys_mkdirat,
+        sys_mknodat,
+        sys_mount,
+        sys_openat,
+        sys_pipe2,
+        sys_ppoll,
+        sys_pread64,
+        sys_preadv,
+        sys_preadv2,
+        sys_pselect6,
+        sys_pwrite64,
+        sys_pwritev,
+        sys_pwritev2,
+        sys_read,
+        sys_readlinkat,
+        sys_readv,
+        sys_removexattr,
+        sys_renameat,
+        // Extended attributes
+        sys_setxattr,
+        sys_statfs,
+        sys_statx,
+        sys_symlinkat,
+        sys_sync,
+        sys_syncfs,
+        sys_umask,
+        sys_umount2,
+        sys_unlinkat,
+        sys_utimensat,
+        sys_write,
+        sys_writev,
     };
     use crate::task::exec::sys_execve;
     use crate::task::percpu;
@@ -394,6 +472,20 @@ pub fn aarch64_syscall_dispatch(
         SYS_STATFS => sys_statfs(arg0, arg1) as u64,
         SYS_FSTATFS => sys_fstatfs(arg0 as i32, arg1) as u64,
         SYS_STATX => sys_statx(arg0 as i32, arg1, arg2 as i32, arg3 as u32, arg4) as u64,
+
+        // Extended attributes
+        SYS_SETXATTR => sys_setxattr(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
+        SYS_LSETXATTR => sys_lsetxattr(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
+        SYS_FSETXATTR => sys_fsetxattr(arg0 as i32, arg1, arg2, arg3, arg4 as i32) as u64,
+        SYS_GETXATTR => sys_getxattr(arg0, arg1, arg2, arg3) as u64,
+        SYS_LGETXATTR => sys_lgetxattr(arg0, arg1, arg2, arg3) as u64,
+        SYS_FGETXATTR => sys_fgetxattr(arg0 as i32, arg1, arg2, arg3) as u64,
+        SYS_LISTXATTR => sys_listxattr(arg0, arg1, arg2) as u64,
+        SYS_LLISTXATTR => sys_llistxattr(arg0, arg1, arg2) as u64,
+        SYS_FLISTXATTR => sys_flistxattr(arg0 as i32, arg1, arg2) as u64,
+        SYS_REMOVEXATTR => sys_removexattr(arg0, arg1) as u64,
+        SYS_LREMOVEXATTR => sys_lremovexattr(arg0, arg1) as u64,
+        SYS_FREMOVEXATTR => sys_fremovexattr(arg0 as i32, arg1) as u64,
 
         // System information
         SYS_GETCPU => {

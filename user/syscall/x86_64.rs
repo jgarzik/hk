@@ -323,6 +323,24 @@ pub const SYS_STATX: u64 = 332;
 pub const SYS_CHROOT: u64 = 161;
 pub const SYS_FCHMODAT2: u64 = 452;
 
+// Extended attributes syscalls
+pub const SYS_SETXATTR: u64 = 188;
+pub const SYS_LSETXATTR: u64 = 189;
+pub const SYS_FSETXATTR: u64 = 190;
+pub const SYS_GETXATTR: u64 = 191;
+pub const SYS_LGETXATTR: u64 = 192;
+pub const SYS_FGETXATTR: u64 = 193;
+pub const SYS_LISTXATTR: u64 = 194;
+pub const SYS_LLISTXATTR: u64 = 195;
+pub const SYS_FLISTXATTR: u64 = 196;
+pub const SYS_REMOVEXATTR: u64 = 197;
+pub const SYS_LREMOVEXATTR: u64 = 198;
+pub const SYS_FREMOVEXATTR: u64 = 199;
+
+// xattr flags
+pub const XATTR_CREATE: i32 = 0x1;
+pub const XATTR_REPLACE: i32 = 0x2;
+
 // arch_prctl operation codes
 pub const ARCH_SET_GS: i32 = 0x1001;
 pub const ARCH_SET_FS: i32 = 0x1002;
@@ -1239,4 +1257,66 @@ pub fn sys_fstatfs(fd: i32, buf: *mut super::LinuxStatFs) -> i64 {
 #[inline(always)]
 pub fn sys_statx(dirfd: i32, pathname: *const u8, flags: i32, mask: u32, buf: *mut super::Statx) -> i64 {
     unsafe { syscall5!(SYS_STATX, dirfd, pathname, flags, mask, buf) }
+}
+
+// --- Extended Attributes ---
+
+#[inline(always)]
+pub fn sys_setxattr(path: *const u8, name: *const u8, value: *const u8, size: usize, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_SETXATTR, path, name, value, size, flags) }
+}
+
+#[inline(always)]
+pub fn sys_lsetxattr(path: *const u8, name: *const u8, value: *const u8, size: usize, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_LSETXATTR, path, name, value, size, flags) }
+}
+
+#[inline(always)]
+pub fn sys_fsetxattr(fd: i32, name: *const u8, value: *const u8, size: usize, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_FSETXATTR, fd, name, value, size, flags) }
+}
+
+#[inline(always)]
+pub fn sys_getxattr(path: *const u8, name: *const u8, value: *mut u8, size: usize) -> i64 {
+    unsafe { syscall4!(SYS_GETXATTR, path, name, value, size) }
+}
+
+#[inline(always)]
+pub fn sys_lgetxattr(path: *const u8, name: *const u8, value: *mut u8, size: usize) -> i64 {
+    unsafe { syscall4!(SYS_LGETXATTR, path, name, value, size) }
+}
+
+#[inline(always)]
+pub fn sys_fgetxattr(fd: i32, name: *const u8, value: *mut u8, size: usize) -> i64 {
+    unsafe { syscall4!(SYS_FGETXATTR, fd, name, value, size) }
+}
+
+#[inline(always)]
+pub fn sys_listxattr(path: *const u8, list: *mut u8, size: usize) -> i64 {
+    unsafe { syscall3!(SYS_LISTXATTR, path, list, size) }
+}
+
+#[inline(always)]
+pub fn sys_llistxattr(path: *const u8, list: *mut u8, size: usize) -> i64 {
+    unsafe { syscall3!(SYS_LLISTXATTR, path, list, size) }
+}
+
+#[inline(always)]
+pub fn sys_flistxattr(fd: i32, list: *mut u8, size: usize) -> i64 {
+    unsafe { syscall3!(SYS_FLISTXATTR, fd, list, size) }
+}
+
+#[inline(always)]
+pub fn sys_removexattr(path: *const u8, name: *const u8) -> i64 {
+    unsafe { syscall2!(SYS_REMOVEXATTR, path, name) }
+}
+
+#[inline(always)]
+pub fn sys_lremovexattr(path: *const u8, name: *const u8) -> i64 {
+    unsafe { syscall2!(SYS_LREMOVEXATTR, path, name) }
+}
+
+#[inline(always)]
+pub fn sys_fremovexattr(fd: i32, name: *const u8) -> i64 {
+    unsafe { syscall2!(SYS_FREMOVEXATTR, fd, name) }
 }
