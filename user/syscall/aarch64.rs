@@ -169,6 +169,8 @@ pub const SYS_PREAD64: u64 = 67;
 pub const SYS_PWRITE64: u64 = 68;
 pub const SYS_PREADV: u64 = 69;
 pub const SYS_PWRITEV: u64 = 70;
+pub const SYS_PREADV2: u64 = 286;
+pub const SYS_PWRITEV2: u64 = 287;
 pub const SYS_READLINKAT: u64 = 78;
 pub const SYS_FSTATAT: u64 = 79;
 pub const SYS_FCHMOD: u64 = 52;
@@ -520,6 +522,18 @@ pub fn sys_preadv(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> i64 {
 #[inline(always)]
 pub fn sys_pwritev(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> i64 {
     unsafe { syscall4!(SYS_PWRITEV, fd, iov, iovcnt, offset) }
+}
+
+/// preadv2(fd, iov, iovcnt, offset, flags)
+#[inline(always)]
+pub fn sys_preadv2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_PREADV2, fd, iov, iovcnt, offset, flags) }
+}
+
+/// pwritev2(fd, iov, iovcnt, offset, flags)
+#[inline(always)]
+pub fn sys_pwritev2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_PWRITEV2, fd, iov, iovcnt, offset, flags) }
 }
 
 /// mkdirat(dirfd, pathname, mode)

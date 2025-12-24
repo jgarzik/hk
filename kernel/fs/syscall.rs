@@ -37,6 +37,40 @@ pub const EFBIG: i64 = -27;
 pub const ESPIPE: i64 = -29;
 pub const EPIPE: i64 = -32;
 pub const ENOTEMPTY: i64 = -39;
+pub const EOPNOTSUPP: i64 = -95;
+
+// =============================================================================
+// RWF flags for preadv2/pwritev2
+// =============================================================================
+
+/// High priority request (hint, accepted but no-op)
+pub const RWF_HIPRI: i32 = 0x00000001;
+/// Per-IO O_DSYNC - sync data after write
+pub const RWF_DSYNC: i32 = 0x00000002;
+/// Per-IO O_SYNC - full sync after write
+pub const RWF_SYNC: i32 = 0x00000004;
+/// Return EAGAIN if operation would block
+pub const RWF_NOWAIT: i32 = 0x00000008;
+/// Per-IO O_APPEND - append to file
+pub const RWF_APPEND: i32 = 0x00000010;
+/// Negate O_APPEND (no-op in our implementation)
+pub const RWF_NOAPPEND: i32 = 0x00000020;
+/// Atomic write (not supported)
+pub const RWF_ATOMIC: i32 = 0x00000040;
+/// Drop cache after I/O (not supported)
+pub const RWF_DONTCACHE: i32 = 0x00000080;
+/// Prevent SIGPIPE (no-op, we don't generate SIGPIPE on pipes yet)
+pub const RWF_NOSIGNAL: i32 = 0x00000100;
+/// Mask of all supported RWF flags
+pub const RWF_SUPPORTED: i32 = RWF_HIPRI
+    | RWF_DSYNC
+    | RWF_SYNC
+    | RWF_NOWAIT
+    | RWF_APPEND
+    | RWF_NOAPPEND
+    | RWF_ATOMIC
+    | RWF_DONTCACHE
+    | RWF_NOSIGNAL;
 
 /// AT_FDCWD - special value meaning current working directory
 ///
@@ -1525,6 +1559,97 @@ pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
     }
 
     total_written as i64
+}
+
+/// sys_preadv2 - positioned scatter read with flags
+///
+/// Enhanced version of preadv that supports per-I/O flags (RWF_*).
+///
+/// # Arguments
+/// * `fd` - File descriptor to read from
+/// * `iov_ptr` - User pointer to array of iovec structures
+/// * `iovcnt` - Number of iovec structures
+/// * `offset` - File offset to read from, or -1 to use current file position
+/// * `flags` - RWF_* flags for this I/O operation
+///
+/// # Returns
+/// Total bytes read on success, negative errno on error.
+/// Returns -EOPNOTSUPP for unsupported flags.
+pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) -> i64 {
+    // Validate flags - unknown flags return EOPNOTSUPP
+    if flags & !RWF_SUPPORTED != 0 {
+        return EOPNOTSUPP;
+    }
+
+    // Flags not supported in Phase 1 - return EOPNOTSUPP
+    if flags & (RWF_NOWAIT | RWF_ATOMIC | RWF_DONTCACHE) != 0 {
+        return EOPNOTSUPP;
+    }
+
+    // offset == -1: use current file position (like readv)
+    if offset == -1 {
+        return sys_readv(fd, iov_ptr, iovcnt);
+    }
+
+    // Otherwise: positioned read (like preadv)
+    // Note: RWF_HIPRI, RWF_DSYNC, RWF_SYNC, RWF_NOAPPEND, RWF_NOSIGNAL are no-ops for reads
+    sys_preadv(fd, iov_ptr, iovcnt, offset)
+}
+
+/// sys_pwritev2 - positioned gather write with flags
+///
+/// Enhanced version of pwritev that supports per-I/O flags (RWF_*).
+///
+/// # Arguments
+/// * `fd` - File descriptor to write to
+/// * `iov_ptr` - User pointer to array of iovec structures
+/// * `iovcnt` - Number of iovec structures
+/// * `offset` - File offset to write to, or -1 to use current file position
+/// * `flags` - RWF_* flags for this I/O operation
+///
+/// # Returns
+/// Total bytes written on success, negative errno on error.
+/// Returns -EOPNOTSUPP for unsupported flags.
+pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) -> i64 {
+    // Validate flags - unknown flags return EOPNOTSUPP
+    if flags & !RWF_SUPPORTED != 0 {
+        return EOPNOTSUPP;
+    }
+
+    // Flags not supported in Phase 1 - return EOPNOTSUPP
+    if flags & (RWF_NOWAIT | RWF_ATOMIC | RWF_DONTCACHE) != 0 {
+        return EOPNOTSUPP;
+    }
+
+    // offset == -1: use current file position (like writev)
+    if offset == -1 {
+        let result = sys_writev(fd, iov_ptr, iovcnt);
+        // RWF_SYNC/RWF_DSYNC: sync after successful write
+        if result > 0 && (flags & (RWF_SYNC | RWF_DSYNC)) != 0 {
+            let _ = sys_fsync(fd);
+        }
+        return result;
+    }
+
+    // RWF_APPEND: get file size as offset (append to end of file)
+    let actual_offset = if flags & RWF_APPEND != 0 {
+        let file = match current_fd_table().lock().get(fd) {
+            Some(f) => f,
+            None => return EBADF,
+        };
+        file.get_inode().map(|i| i.get_size() as i64).unwrap_or(0)
+    } else {
+        offset
+    };
+
+    let result = sys_pwritev(fd, iov_ptr, iovcnt, actual_offset);
+
+    // RWF_SYNC/RWF_DSYNC: sync after successful write
+    if result > 0 && (flags & (RWF_SYNC | RWF_DSYNC)) != 0 {
+        let _ = sys_fsync(fd);
+    }
+
+    result
 }
 
 /// sys_close - close a file descriptor

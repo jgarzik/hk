@@ -112,11 +112,11 @@ linasm.sourceforge.net
 
 - [x] preadv
 
-- [ ] preadv2
+- [x] preadv2
 
 - [x] pwritev
 
-- [ ] pwritev2
+- [x] pwritev2
 
 - [x] lseek
 

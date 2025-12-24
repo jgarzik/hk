@@ -290,6 +290,8 @@ pub const SYS_UTIMENSAT: u64 = 280;
 pub const SYS_PIPE2: u64 = 293;
 pub const SYS_PREADV: u64 = 295;
 pub const SYS_PWRITEV: u64 = 296;
+pub const SYS_PREADV2: u64 = 327;
+pub const SYS_PWRITEV2: u64 = 328;
 pub const SYS_PRLIMIT64: u64 = 302;
 pub const SYS_SYNCFS: u64 = 306;
 pub const SYS_SETNS: u64 = 308;
@@ -366,6 +368,16 @@ pub fn sys_preadv(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> i64 {
 #[inline(always)]
 pub fn sys_pwritev(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> i64 {
     unsafe { syscall4!(SYS_PWRITEV, fd, iov, iovcnt, offset) }
+}
+
+#[inline(always)]
+pub fn sys_preadv2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_PREADV2, fd, iov, iovcnt, offset, flags) }
+}
+
+#[inline(always)]
+pub fn sys_pwritev2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_PWRITEV2, fd, iov, iovcnt, offset, flags) }
 }
 
 #[inline(always)]

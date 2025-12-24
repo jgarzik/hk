@@ -34,6 +34,10 @@ pub const SYS_WRITEV: u64 = 20;
 pub const SYS_PREADV: u64 = 295;
 /// pwritev(fd, iov, iovcnt, offset)
 pub const SYS_PWRITEV: u64 = 296;
+/// preadv2(fd, iov, iovcnt, offset, flags)
+pub const SYS_PREADV2: u64 = 327;
+/// pwritev2(fd, iov, iovcnt, offset, flags)
+pub const SYS_PWRITEV2: u64 = 328;
 /// pipe(pipefd)
 pub const SYS_PIPE: u64 = 22;
 /// poll(fds, nfds, timeout)
@@ -942,10 +946,12 @@ pub fn x86_64_syscall_dispatch(
         // Positioned read/write syscalls
         sys_pread64,
         sys_preadv,
+        sys_preadv2,
         // Select syscalls
         sys_pselect6,
         sys_pwrite64,
         sys_pwritev,
+        sys_pwritev2,
         sys_read,
         sys_readlink,
         sys_readlinkat,
@@ -992,6 +998,10 @@ pub fn x86_64_syscall_dispatch(
         SYS_PWRITE64 => sys_pwrite64(arg0 as i32, arg1, arg2, arg3 as i64) as u64,
         SYS_PREADV => sys_preadv(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
         SYS_PWRITEV => sys_pwritev(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
+        SYS_PREADV2 => sys_preadv2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg4 as i32) as u64,
+        SYS_PWRITEV2 => {
+            sys_pwritev2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg4 as i32) as u64
+        }
         SYS_OPEN => sys_open(arg0, arg1 as u32, arg2 as u32) as u64,
         SYS_CLOSE => sys_close(arg0 as i32) as u64,
         SYS_LSEEK => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32) as u64,

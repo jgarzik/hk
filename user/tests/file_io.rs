@@ -17,13 +17,28 @@
 //! - Test 35: getrandom() with invalid flags returns -EINVAL
 //! - Test 36: ioctl() with invalid fd returns -EBADF
 //! - Test 37: ioctl() on regular file returns -ENOTTY
+//! - Test 38: preadv2() - basic positioned scatter read with flags=0
+//! - Test 39: pwritev2() - basic positioned gather write with flags=0
+//! - Test 40: preadv2() with offset=-1 uses current file position
+//! - Test 41: pwritev2() with offset=-1 uses current file position
+//! - Test 42: pwritev2() with RWF_APPEND appends to file
+//! - Test 43: preadv2() with invalid flags returns -EOPNOTSUPP
+//! - Test 44: preadv2() with RWF_NOWAIT returns -EOPNOTSUPP (Phase 1)
 
 use super::helpers::{print, println, print_num};
 use crate::syscall::{
     sys_close, sys_fcntl, sys_getrandom, sys_ioctl, sys_lseek, sys_open, sys_pread64, sys_preadv,
-    sys_pwrite64, sys_pwritev, sys_read, sys_readv, sys_write, sys_writev, IoVec, O_CREAT,
-    O_RDONLY, O_RDWR, O_TRUNC,
+    sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read, sys_readv, sys_write,
+    sys_writev, IoVec, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC,
 };
+
+// RWF flags for preadv2/pwritev2
+const RWF_HIPRI: i32 = 0x01;
+const RWF_DSYNC: i32 = 0x02;
+#[allow(dead_code)]
+const RWF_SYNC: i32 = 0x04;
+const RWF_NOWAIT: i32 = 0x08;
+const RWF_APPEND: i32 = 0x10;
 
 // fcntl commands
 const F_DUPFD: i32 = 0;
@@ -53,6 +68,14 @@ pub fn run_tests() {
     test_getrandom_einval();
     test_ioctl_ebadf();
     test_ioctl_enotty();
+    // preadv2/pwritev2 tests
+    test_preadv2_basic();
+    test_pwritev2_basic();
+    test_preadv2_offset_minus_one();
+    test_pwritev2_offset_minus_one();
+    test_pwritev2_rwf_append();
+    test_preadv2_invalid_flags();
+    test_preadv2_rwf_nowait();
 }
 
 /// Test 22: writev() - gather write to stdout
@@ -818,6 +841,299 @@ fn test_ioctl_enotty() {
         println(b"IOCTL_ENOTTY:OK");
     } else {
         print(b"IOCTL_ENOTTY:FAIL: expected -25 (ENOTTY), got ");
+        print_num(ret);
+        println(b"");
+    }
+}
+
+// =============================================================================
+// preadv2/pwritev2 tests
+// =============================================================================
+
+/// Test 38: preadv2() - basic positioned scatter read with flags=0
+fn test_preadv2_basic() {
+    // Open /test.txt which should contain "Hello from ramfs!"
+    let path = b"/test.txt\0";
+    let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        print(b"PREADV2_BASIC:FAIL: open failed: ");
+        print_num(fd);
+        println(b"");
+        return;
+    }
+
+    // Read "from" starting at offset 6 with flags=0
+    let mut buf = [0u8; 4];
+    let iov: [IoVec; 1] = [IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() }];
+
+    let ret = sys_preadv2(fd as i32, iov.as_ptr(), 1, 6, 0);
+    if ret != 4 {
+        print(b"PREADV2_BASIC:FAIL: expected 4 bytes, got ");
+        print_num(ret);
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+
+    // Verify we read "from"
+    if buf[0] != b'f' || buf[1] != b'r' || buf[2] != b'o' || buf[3] != b'm' {
+        print(b"PREADV2_BASIC:FAIL: expected 'from', got ");
+        sys_write(1, buf.as_ptr(), 4);
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+
+    sys_close(fd as u64);
+    println(b"PREADV2_BASIC:OK");
+}
+
+/// Test 39: pwritev2() - basic positioned gather write with flags=0
+fn test_pwritev2_basic() {
+    // Create a test file
+    let path = b"/pwritev2_test.txt\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    if fd < 0 {
+        print(b"PWRITEV2_BASIC:FAIL: open failed: ");
+        print_num(fd);
+        println(b"");
+        return;
+    }
+
+    // Write "test" at offset 0 with flags=0
+    let data = b"test";
+    let iov: [IoVec; 1] = [IoVec { iov_base: data.as_ptr(), iov_len: data.len() }];
+
+    let ret = sys_pwritev2(fd as i32, iov.as_ptr(), 1, 0, 0);
+    if ret != 4 {
+        print(b"PWRITEV2_BASIC:FAIL: expected 4 bytes written, got ");
+        print_num(ret);
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+
+    // Verify by reading back
+    let mut buf = [0u8; 4];
+    let read_ret = sys_pread64(fd as i32, buf.as_mut_ptr(), 4, 0);
+    if read_ret != 4 || buf[0] != b't' || buf[3] != b't' {
+        print(b"PWRITEV2_BASIC:FAIL: readback failed");
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+
+    sys_close(fd as u64);
+    println(b"PWRITEV2_BASIC:OK");
+}
+
+/// Test 40: preadv2() with offset=-1 uses current file position
+fn test_preadv2_offset_minus_one() {
+    let path = b"/test.txt\0";
+    let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        print(b"PREADV2_OFFSET_NEG1:FAIL: open failed: ");
+        print_num(fd);
+        println(b"");
+        return;
+    }
+
+    // Seek to offset 6
+    let pos = sys_lseek(fd as i32, 6, 0); // SEEK_SET=0
+    if pos != 6 {
+        print(b"PREADV2_OFFSET_NEG1:FAIL: lseek failed: ");
+        print_num(pos);
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+
+    // Read with offset=-1 (should use current position)
+    let mut buf = [0u8; 4];
+    let iov: [IoVec; 1] = [IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() }];
+
+    let ret = sys_preadv2(fd as i32, iov.as_ptr(), 1, -1, 0);
+    if ret != 4 {
+        print(b"PREADV2_OFFSET_NEG1:FAIL: expected 4 bytes, got ");
+        print_num(ret);
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+
+    // Should have read "from" (at offset 6)
+    if buf[0] != b'f' || buf[1] != b'r' || buf[2] != b'o' || buf[3] != b'm' {
+        print(b"PREADV2_OFFSET_NEG1:FAIL: expected 'from', got ");
+        sys_write(1, buf.as_ptr(), 4);
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+
+    sys_close(fd as u64);
+    println(b"PREADV2_OFFSET_NEG1:OK");
+}
+
+/// Test 41: pwritev2() with offset=-1 uses current file position
+fn test_pwritev2_offset_minus_one() {
+    let path = b"/pwritev2_neg1.txt\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    if fd < 0 {
+        print(b"PWRITEV2_OFFSET_NEG1:FAIL: open failed: ");
+        print_num(fd);
+        println(b"");
+        return;
+    }
+
+    // Write "AAAA" to establish file
+    let data1 = b"AAAA";
+    sys_write(fd as u64, data1.as_ptr(), 4);
+
+    // Seek to position 2
+    let pos = sys_lseek(fd as i32, 2, 0); // SEEK_SET=0
+    if pos != 2 {
+        print(b"PWRITEV2_OFFSET_NEG1:FAIL: lseek failed: ");
+        print_num(pos);
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+
+    // Write "BB" with offset=-1 (should use current position = 2)
+    let data2 = b"BB";
+    let iov: [IoVec; 1] = [IoVec { iov_base: data2.as_ptr(), iov_len: data2.len() }];
+
+    let ret = sys_pwritev2(fd as i32, iov.as_ptr(), 1, -1, 0);
+    if ret != 2 {
+        print(b"PWRITEV2_OFFSET_NEG1:FAIL: expected 2 bytes written, got ");
+        print_num(ret);
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+
+    // Verify: file should be "AABB"
+    let mut buf = [0u8; 4];
+    let read_ret = sys_pread64(fd as i32, buf.as_mut_ptr(), 4, 0);
+    if read_ret != 4 || buf[0] != b'A' || buf[1] != b'A' || buf[2] != b'B' || buf[3] != b'B' {
+        print(b"PWRITEV2_OFFSET_NEG1:FAIL: expected 'AABB', got ");
+        sys_write(1, buf.as_ptr(), 4);
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+
+    sys_close(fd as u64);
+    println(b"PWRITEV2_OFFSET_NEG1:OK");
+}
+
+/// Test 42: pwritev2() with RWF_APPEND appends to file
+fn test_pwritev2_rwf_append() {
+    let path = b"/pwritev2_append.txt\0";
+    let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o644);
+    if fd < 0 {
+        print(b"PWRITEV2_RWF_APPEND:FAIL: open failed: ");
+        print_num(fd);
+        println(b"");
+        return;
+    }
+
+    // Write "Hello" first
+    let data1 = b"Hello";
+    sys_write(fd as u64, data1.as_ptr(), 5);
+
+    // Use pwritev2 with RWF_APPEND to append "World"
+    // Even though offset=0, RWF_APPEND should append at end
+    let data2 = b"World";
+    let iov: [IoVec; 1] = [IoVec { iov_base: data2.as_ptr(), iov_len: data2.len() }];
+
+    let ret = sys_pwritev2(fd as i32, iov.as_ptr(), 1, 0, RWF_APPEND);
+    if ret != 5 {
+        print(b"PWRITEV2_RWF_APPEND:FAIL: expected 5 bytes written, got ");
+        print_num(ret);
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+
+    // Verify: file should be "HelloWorld" (10 bytes)
+    let mut buf = [0u8; 10];
+    let read_ret = sys_pread64(fd as i32, buf.as_mut_ptr(), 10, 0);
+    if read_ret != 10 {
+        print(b"PWRITEV2_RWF_APPEND:FAIL: expected 10 bytes, got ");
+        print_num(read_ret);
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+
+    // Check content
+    if buf[0] != b'H' || buf[4] != b'o' || buf[5] != b'W' || buf[9] != b'd' {
+        print(b"PWRITEV2_RWF_APPEND:FAIL: expected 'HelloWorld', got ");
+        sys_write(1, buf.as_ptr(), 10);
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+
+    sys_close(fd as u64);
+    println(b"PWRITEV2_RWF_APPEND:OK");
+}
+
+/// Test 43: preadv2() with invalid flags returns -EOPNOTSUPP
+fn test_preadv2_invalid_flags() {
+    let path = b"/test.txt\0";
+    let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        print(b"PREADV2_INVALID_FLAGS:FAIL: open failed: ");
+        print_num(fd);
+        println(b"");
+        return;
+    }
+
+    let mut buf = [0u8; 4];
+    let iov: [IoVec; 1] = [IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() }];
+
+    // Use invalid flag (bit not in RWF_SUPPORTED)
+    let invalid_flags = 0x1000; // Not a valid RWF flag
+    let ret = sys_preadv2(fd as i32, iov.as_ptr(), 1, 0, invalid_flags);
+
+    sys_close(fd as u64);
+
+    if ret == -95 {
+        // EOPNOTSUPP = 95
+        println(b"PREADV2_INVALID_FLAGS:OK");
+    } else {
+        print(b"PREADV2_INVALID_FLAGS:FAIL: expected -95 (EOPNOTSUPP), got ");
+        print_num(ret);
+        println(b"");
+    }
+}
+
+/// Test 44: preadv2() with RWF_NOWAIT returns -EOPNOTSUPP (Phase 1)
+fn test_preadv2_rwf_nowait() {
+    let path = b"/test.txt\0";
+    let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        print(b"PREADV2_RWF_NOWAIT:FAIL: open failed: ");
+        print_num(fd);
+        println(b"");
+        return;
+    }
+
+    let mut buf = [0u8; 4];
+    let iov: [IoVec; 1] = [IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() }];
+
+    // RWF_NOWAIT should return EOPNOTSUPP in Phase 1
+    let ret = sys_preadv2(fd as i32, iov.as_ptr(), 1, 0, RWF_NOWAIT);
+
+    sys_close(fd as u64);
+
+    if ret == -95 {
+        // EOPNOTSUPP = 95
+        println(b"PREADV2_RWF_NOWAIT:OK");
+    } else {
+        print(b"PREADV2_RWF_NOWAIT:FAIL: expected -95 (EOPNOTSUPP), got ");
         print_num(ret);
         println(b"");
     }

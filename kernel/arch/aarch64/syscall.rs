@@ -51,6 +51,10 @@ pub const SYS_PWRITE64: u64 = 68;
 pub const SYS_PREADV: u64 = 69;
 /// pwritev(fd, iov, iovcnt, offset)
 pub const SYS_PWRITEV: u64 = 70;
+/// preadv2(fd, iov, iovcnt, offset, flags)
+pub const SYS_PREADV2: u64 = 286;
+/// pwritev2(fd, iov, iovcnt, offset, flags)
+pub const SYS_PWRITEV2: u64 = 287;
 pub const SYS_READLINKAT: u64 = 78;
 pub const SYS_FSTATAT: u64 = 79;
 pub const SYS_UTIMENSAT: u64 = 88;
@@ -292,9 +296,9 @@ pub fn aarch64_syscall_dispatch(
         sys_close, sys_dup3, sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fcntl,
         sys_fdatasync, sys_fstatat, sys_fsync, sys_ftruncate, sys_getdents64, sys_ioctl,
         sys_linkat, sys_lseek, sys_mkdirat, sys_mknodat, sys_mount, sys_openat, sys_pipe2,
-        sys_ppoll, sys_pread64, sys_preadv, sys_pselect6, sys_pwrite64, sys_pwritev, sys_read,
-        sys_readlinkat, sys_readv, sys_renameat, sys_symlinkat, sys_sync, sys_syncfs, sys_umask,
-        sys_umount2, sys_unlinkat, sys_utimensat, sys_write, sys_writev,
+        sys_ppoll, sys_pread64, sys_preadv, sys_preadv2, sys_pselect6, sys_pwrite64, sys_pwritev,
+        sys_pwritev2, sys_read, sys_readlinkat, sys_readv, sys_renameat, sys_symlinkat, sys_sync,
+        sys_syncfs, sys_umask, sys_umount2, sys_unlinkat, sys_utimensat, sys_write, sys_writev,
     };
     use crate::task::exec::sys_execve;
     use crate::task::percpu;
@@ -317,6 +321,10 @@ pub fn aarch64_syscall_dispatch(
         SYS_PWRITE64 => sys_pwrite64(arg0 as i32, arg1, arg2, arg3 as i64) as u64,
         SYS_PREADV => sys_preadv(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
         SYS_PWRITEV => sys_pwritev(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
+        SYS_PREADV2 => sys_preadv2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg4 as i32) as u64,
+        SYS_PWRITEV2 => {
+            sys_pwritev2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg4 as i32) as u64
+        }
         SYS_OPENAT => sys_openat(arg0 as i32, arg1, arg2 as u32, arg3 as u32) as u64,
         SYS_CLOSE => sys_close(arg0 as i32) as u64,
         SYS_LSEEK => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32) as u64,
