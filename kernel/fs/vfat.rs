@@ -29,7 +29,7 @@ use super::file::{
     generic_file_read, generic_file_write,
 };
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
-use super::superblock::{FileSystemType, SuperBlock, SuperBlockData, SuperOps, fs_flags};
+use super::superblock::{FileSystemType, MSDOS_SUPER_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps, fs_flags};
 use super::vfs::FsError;
 
 // ============================================================================
@@ -2654,6 +2654,21 @@ pub static VFAT_FILE_OPS: VfatFileOps = VfatFileOps;
 pub struct VfatSuperOps;
 
 impl SuperOps for VfatSuperOps {
+    fn statfs(&self) -> StatFs {
+        // TODO: Could provide actual block counts from VfatSbData if available
+        // For now, return minimal valid values
+        StatFs {
+            f_type: MSDOS_SUPER_MAGIC,
+            f_bsize: 4096, // Cluster size varies; use common value
+            f_blocks: 0,
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0,  // FAT doesn't track inode count
+            f_ffree: 0,
+            f_namelen: 255, // LFN max length
+        }
+    }
+
     fn alloc_inode(
         &self,
         sb: &Arc<SuperBlock>,

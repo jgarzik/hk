@@ -27,9 +27,11 @@
 
 use super::helpers::{print, println, print_num};
 use crate::syscall::{
-    sys_close, sys_fcntl, sys_getrandom, sys_ioctl, sys_lseek, sys_open, sys_pread64, sys_preadv,
-    sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read, sys_readv, sys_write,
-    sys_writev, IoVec, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC,
+    sys_close, sys_fcntl, sys_fstatfs, sys_getrandom, sys_ioctl, sys_lseek, sys_open, sys_pipe2,
+    sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read,
+    sys_readv, sys_statfs, sys_statx, sys_write, sys_writev, IoVec, LinuxStatFs, Statx,
+    AT_EMPTY_PATH, AT_FDCWD, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, PROC_SUPER_MAGIC, RAMFS_MAGIC,
+    STATX_BASIC_STATS,
 };
 
 // RWF flags for preadv2/pwritev2
@@ -77,6 +79,13 @@ pub fn run_tests() {
     test_preadv2_invalid_flags();
     test_preadv2_rwf_nowait();
     test_preadv2_rwf_nowait_pipe_eagain();
+    // statfs/fstatfs/statx tests
+    test_statfs_root();
+    test_statfs_proc();
+    test_statfs_enoent();
+    test_fstatfs();
+    test_statx_basic();
+    test_statx_at_empty_path();
 }
 
 /// Test 22: writev() - gather write to stdout
@@ -1180,4 +1189,214 @@ fn test_preadv2_rwf_nowait_pipe_eagain() {
         print_num(ret);
         println(b"");
     }
+}
+
+// =============================================================================
+// statfs/fstatfs/statx tests
+// =============================================================================
+
+/// Test 46: statfs() on root filesystem
+fn test_statfs_root() {
+    let mut buf: LinuxStatFs = unsafe { core::mem::zeroed() };
+    let path = b"/\0";
+
+    let ret = sys_statfs(path.as_ptr(), &mut buf);
+    if ret != 0 {
+        print(b"STATFS_ROOT:FAIL: statfs returned ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+
+    // Verify we got valid data (ramfs magic)
+    if buf.f_type != RAMFS_MAGIC {
+        print(b"STATFS_ROOT:FAIL: expected ramfs magic ");
+        print_num(RAMFS_MAGIC);
+        print(b", got ");
+        print_num(buf.f_type);
+        println(b"");
+        return;
+    }
+
+    // Block size should be positive
+    if buf.f_bsize <= 0 {
+        print(b"STATFS_ROOT:FAIL: invalid block size ");
+        print_num(buf.f_bsize);
+        println(b"");
+        return;
+    }
+
+    // Max filename length should be positive
+    if buf.f_namelen <= 0 {
+        print(b"STATFS_ROOT:FAIL: invalid namelen ");
+        print_num(buf.f_namelen);
+        println(b"");
+        return;
+    }
+
+    println(b"STATFS_ROOT:OK");
+}
+
+/// Test 47: statfs() on /proc filesystem
+fn test_statfs_proc() {
+    let mut buf: LinuxStatFs = unsafe { core::mem::zeroed() };
+    let path = b"/proc\0";
+
+    let ret = sys_statfs(path.as_ptr(), &mut buf);
+    if ret != 0 {
+        print(b"STATFS_PROC:FAIL: statfs returned ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+
+    // Verify we got procfs magic
+    if buf.f_type != PROC_SUPER_MAGIC {
+        print(b"STATFS_PROC:FAIL: expected procfs magic ");
+        print_num(PROC_SUPER_MAGIC);
+        print(b", got ");
+        print_num(buf.f_type);
+        println(b"");
+        return;
+    }
+
+    println(b"STATFS_PROC:OK");
+}
+
+/// Test 48: statfs() on nonexistent path returns -ENOENT
+fn test_statfs_enoent() {
+    let mut buf: LinuxStatFs = unsafe { core::mem::zeroed() };
+    let path = b"/nonexistent_path_12345\0";
+
+    let ret = sys_statfs(path.as_ptr(), &mut buf);
+    if ret == -2 {
+        // ENOENT = 2
+        println(b"STATFS_ENOENT:OK");
+    } else {
+        print(b"STATFS_ENOENT:FAIL: expected -2 (ENOENT), got ");
+        print_num(ret);
+        println(b"");
+    }
+}
+
+/// Test 49: fstatfs() on open file descriptor
+fn test_fstatfs() {
+    // Open a file
+    let path = b"/test.txt\0";
+    let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        print(b"FSTATFS:FAIL: open failed: ");
+        print_num(fd);
+        println(b"");
+        return;
+    }
+
+    let mut buf: LinuxStatFs = unsafe { core::mem::zeroed() };
+    let ret = sys_fstatfs(fd as i32, &mut buf);
+    sys_close(fd as u64);
+
+    if ret != 0 {
+        print(b"FSTATFS:FAIL: fstatfs returned ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+
+    // Verify we got ramfs magic (root fs)
+    if buf.f_type != RAMFS_MAGIC {
+        print(b"FSTATFS:FAIL: expected ramfs magic, got ");
+        print_num(buf.f_type);
+        println(b"");
+        return;
+    }
+
+    println(b"FSTATFS:OK");
+}
+
+/// Test 50: statx() basic usage
+fn test_statx_basic() {
+    let mut buf: Statx = unsafe { core::mem::zeroed() };
+    let path = b"/test.txt\0";
+
+    let ret = sys_statx(AT_FDCWD, path.as_ptr(), 0, STATX_BASIC_STATS, &mut buf);
+    if ret != 0 {
+        print(b"STATX_BASIC:FAIL: statx returned ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+
+    // Verify basic stats returned
+    if buf.stx_mask & STATX_BASIC_STATS == 0 {
+        print(b"STATX_BASIC:FAIL: stx_mask missing BASIC_STATS: ");
+        print_num(buf.stx_mask as i64);
+        println(b"");
+        return;
+    }
+
+    // Size should be positive (test.txt has content)
+    if buf.stx_size == 0 {
+        println(b"STATX_BASIC:FAIL: stx_size is 0");
+        return;
+    }
+
+    // Inode should be non-zero
+    if buf.stx_ino == 0 {
+        println(b"STATX_BASIC:FAIL: stx_ino is 0");
+        return;
+    }
+
+    // Mode should indicate regular file (S_IFREG = 0o100000)
+    let s_ifreg: u16 = 0o100000;
+    if buf.stx_mode & s_ifreg != s_ifreg {
+        print(b"STATX_BASIC:FAIL: not a regular file, mode=");
+        print_num(buf.stx_mode as i64);
+        println(b"");
+        return;
+    }
+
+    println(b"STATX_BASIC:OK");
+}
+
+/// Test 51: statx() with AT_EMPTY_PATH on fd
+fn test_statx_at_empty_path() {
+    // Open a file
+    let path = b"/test.txt\0";
+    let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        print(b"STATX_EMPTY_PATH:FAIL: open failed: ");
+        print_num(fd);
+        println(b"");
+        return;
+    }
+
+    let mut buf: Statx = unsafe { core::mem::zeroed() };
+    let empty = b"\0";
+
+    // statx on the fd itself using AT_EMPTY_PATH
+    let ret = sys_statx(fd as i32, empty.as_ptr(), AT_EMPTY_PATH, STATX_BASIC_STATS, &mut buf);
+    sys_close(fd as u64);
+
+    if ret != 0 {
+        print(b"STATX_EMPTY_PATH:FAIL: statx returned ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+
+    // Verify we got stats
+    if buf.stx_mask & STATX_BASIC_STATS == 0 {
+        print(b"STATX_EMPTY_PATH:FAIL: stx_mask missing BASIC_STATS: ");
+        print_num(buf.stx_mask as i64);
+        println(b"");
+        return;
+    }
+
+    // Size should be positive
+    if buf.stx_size == 0 {
+        println(b"STATX_EMPTY_PATH:FAIL: stx_size is 0");
+        return;
+    }
+
+    println(b"STATX_EMPTY_PATH:OK");
 }

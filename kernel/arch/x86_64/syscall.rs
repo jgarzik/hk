@@ -38,6 +38,12 @@ pub const SYS_PWRITEV: u64 = 296;
 pub const SYS_PREADV2: u64 = 327;
 /// pwritev2(fd, iov, iovcnt, offset, flags)
 pub const SYS_PWRITEV2: u64 = 328;
+/// statfs(pathname, buf)
+pub const SYS_STATFS: u64 = 137;
+/// fstatfs(fd, buf)
+pub const SYS_FSTATFS: u64 = 138;
+/// statx(dirfd, pathname, flags, mask, statxbuf)
+pub const SYS_STATX: u64 = 332;
 /// pipe(pipefd)
 pub const SYS_PIPE: u64 = 22;
 /// poll(fds, nfds, timeout)
@@ -962,6 +968,9 @@ pub fn x86_64_syscall_dispatch(
         sys_rmdir,
         sys_select,
         sys_stat,
+        sys_statfs,
+        sys_fstatfs,
+        sys_statx,
         sys_symlink,
         sys_symlinkat,
         sys_sync,
@@ -1024,6 +1033,9 @@ pub fn x86_64_syscall_dispatch(
         SYS_TRUNCATE => sys_truncate(arg0, arg1 as i64) as u64,
         SYS_STAT => sys_stat(arg0, arg1) as u64,
         SYS_FSTAT => sys_fstat(arg0 as i32, arg1) as u64,
+        SYS_STATFS => sys_statfs(arg0, arg1) as u64,
+        SYS_FSTATFS => sys_fstatfs(arg0 as i32, arg1) as u64,
+        SYS_STATX => sys_statx(arg0 as i32, arg1, arg2 as i32, arg3 as u32, arg4) as u64,
         SYS_DUP => sys_dup(arg0 as i32) as u64,
         SYS_DUP2 => sys_dup2(arg0 as i32, arg1 as i32) as u64,
         SYS_FCNTL => sys_fcntl(arg0 as i32, arg1 as i32, arg2) as u64,

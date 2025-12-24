@@ -26,7 +26,7 @@ use super::FsError;
 use super::dentry::Dentry;
 use super::file::{DirEntry, File, FileOps};
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
-use super::superblock::{FileSystemType, SuperBlock, SuperOps};
+use super::superblock::{FileSystemType, PROC_SUPER_MAGIC, StatFs, SuperBlock, SuperOps};
 use crate::task::Pid;
 
 /// Get current timestamp for new inodes
@@ -714,6 +714,19 @@ pub static PROCFS_FILE_OPS: ProcfsFileOps = ProcfsFileOps;
 pub struct ProcfsSuperOps;
 
 impl SuperOps for ProcfsSuperOps {
+    fn statfs(&self) -> StatFs {
+        StatFs {
+            f_type: PROC_SUPER_MAGIC,
+            f_bsize: 4096,
+            f_blocks: 0,
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0,
+            f_ffree: 0,
+            f_namelen: 255,
+        }
+    }
+
     fn alloc_inode(
         &self,
         sb: &Arc<SuperBlock>,

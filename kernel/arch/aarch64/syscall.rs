@@ -55,6 +55,10 @@ pub const SYS_PWRITEV: u64 = 70;
 pub const SYS_PREADV2: u64 = 286;
 /// pwritev2(fd, iov, iovcnt, offset, flags)
 pub const SYS_PWRITEV2: u64 = 287;
+/// statfs(path, buf)
+pub const SYS_STATFS: u64 = 43;
+/// fstatfs(fd, buf)
+pub const SYS_FSTATFS: u64 = 44;
 pub const SYS_READLINKAT: u64 = 78;
 pub const SYS_FSTATAT: u64 = 79;
 pub const SYS_UTIMENSAT: u64 = 88;
@@ -189,6 +193,8 @@ pub const SYS_GETRUSAGE: u64 = 165;
 pub const SYS_SYSINFO: u64 = 179;
 /// getrandom(buf, buflen, flags)
 pub const SYS_GETRANDOM: u64 = 278;
+/// statx(dirfd, pathname, flags, mask, statxbuf)
+pub const SYS_STATX: u64 = 291;
 
 // Scheduling syscalls (aarch64 numbers)
 /// sched_setparam(pid, param)
@@ -294,11 +300,12 @@ pub fn aarch64_syscall_dispatch(
 ) -> u64 {
     use crate::fs::syscall::{
         sys_close, sys_dup3, sys_fchmod, sys_fchmodat, sys_fchown, sys_fchownat, sys_fcntl,
-        sys_fdatasync, sys_fstatat, sys_fsync, sys_ftruncate, sys_getdents64, sys_ioctl,
-        sys_linkat, sys_lseek, sys_mkdirat, sys_mknodat, sys_mount, sys_openat, sys_pipe2,
-        sys_ppoll, sys_pread64, sys_preadv, sys_preadv2, sys_pselect6, sys_pwrite64, sys_pwritev,
-        sys_pwritev2, sys_read, sys_readlinkat, sys_readv, sys_renameat, sys_symlinkat, sys_sync,
-        sys_syncfs, sys_umask, sys_umount2, sys_unlinkat, sys_utimensat, sys_write, sys_writev,
+        sys_fdatasync, sys_fstatat, sys_fstatfs, sys_fsync, sys_ftruncate, sys_getdents64,
+        sys_ioctl, sys_linkat, sys_lseek, sys_mkdirat, sys_mknodat, sys_mount, sys_openat,
+        sys_pipe2, sys_ppoll, sys_pread64, sys_preadv, sys_preadv2, sys_pselect6, sys_pwrite64,
+        sys_pwritev, sys_pwritev2, sys_read, sys_readlinkat, sys_readv, sys_renameat, sys_statfs,
+        sys_statx, sys_symlinkat, sys_sync, sys_syncfs, sys_umask, sys_umount2, sys_unlinkat,
+        sys_utimensat, sys_write, sys_writev,
     };
     use crate::task::exec::sys_execve;
     use crate::task::percpu;
@@ -355,6 +362,9 @@ pub fn aarch64_syscall_dispatch(
         SYS_FSTATAT => sys_fstatat(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
         SYS_UTIMENSAT => sys_utimensat(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
         SYS_UMASK => sys_umask(arg0 as u32) as u64,
+        SYS_STATFS => sys_statfs(arg0, arg1) as u64,
+        SYS_FSTATFS => sys_fstatfs(arg0 as i32, arg1) as u64,
+        SYS_STATX => sys_statx(arg0 as i32, arg1, arg2 as i32, arg3 as u32, arg4) as u64,
 
         // System information
         SYS_GETCPU => {

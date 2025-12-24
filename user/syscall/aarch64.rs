@@ -321,6 +321,9 @@ pub const SYS_SENDFILE: u64 = 71;
 pub const SYS_VMSPLICE: u64 = 75;
 pub const SYS_SPLICE: u64 = 76;
 pub const SYS_TEE: u64 = 77;
+pub const SYS_STATFS: u64 = 43;
+pub const SYS_FSTATFS: u64 = 44;
+pub const SYS_STATX: u64 = 291;
 
 // ============================================================================
 // Syscall wrapper functions
@@ -1385,4 +1388,24 @@ pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
 #[inline(always)]
 pub fn sys_vmsplice(fd: i32, iov: *const super::IoVec, nr_segs: usize, flags: u32) -> i64 {
     unsafe { syscall4!(SYS_VMSPLICE, fd, iov, nr_segs, flags) }
+}
+
+// --- Filesystem Statistics ---
+
+/// statfs(pathname, buf) - get filesystem statistics
+#[inline(always)]
+pub fn sys_statfs(pathname: *const u8, buf: *mut super::LinuxStatFs) -> i64 {
+    unsafe { syscall2!(SYS_STATFS, pathname, buf) }
+}
+
+/// fstatfs(fd, buf) - get filesystem statistics by file descriptor
+#[inline(always)]
+pub fn sys_fstatfs(fd: i32, buf: *mut super::LinuxStatFs) -> i64 {
+    unsafe { syscall2!(SYS_FSTATFS, fd, buf) }
+}
+
+/// statx(dirfd, pathname, flags, mask, buf) - get extended file status
+#[inline(always)]
+pub fn sys_statx(dirfd: i32, pathname: *const u8, flags: i32, mask: u32, buf: *mut super::Statx) -> i64 {
+    unsafe { syscall5!(SYS_STATX, dirfd, pathname, flags, mask, buf) }
 }

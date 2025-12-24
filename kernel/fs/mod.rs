@@ -50,7 +50,8 @@ pub use ramfs::{
     ramfs_create_dir_with_timestamp, ramfs_create_file_with_timestamp, ramfs_mkpath_with_timestamp,
 };
 pub use superblock::{
-    FileSystemType, SuperBlock, SuperOps, find_filesystem, init_fs_registry, register_filesystem,
+    FileSystemType, LinuxStatFs, MSDOS_SUPER_MAGIC, PROC_SUPER_MAGIC, RAMFS_MAGIC, StatFs,
+    SuperBlock, SuperOps, find_filesystem, init_fs_registry, register_filesystem,
 };
 pub use vfat::{VFAT_FILE_OPS, VFAT_TYPE};
 pub use vfs::{FileMetadata, FileSystem, FsError, Vfs};

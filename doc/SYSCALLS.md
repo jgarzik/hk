@@ -200,11 +200,11 @@ man7.org
 
 - [x] newfstatat / fstatat64 (aarch64)
 
-- [ ] statfs
+- [x] statfs
 
-- [ ] fstatfs
+- [x] fstatfs
 
-- [ ] statx (modern richer interface)
+- [x] statx (modern richer interface)
 
 Permissions and ownership:
 

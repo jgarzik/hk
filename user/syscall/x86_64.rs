@@ -302,6 +302,9 @@ pub const SYS_SENDFILE: u64 = 40;
 pub const SYS_SPLICE: u64 = 275;
 pub const SYS_TEE: u64 = 276;
 pub const SYS_VMSPLICE: u64 = 278;
+pub const SYS_STATFS: u64 = 137;
+pub const SYS_FSTATFS: u64 = 138;
+pub const SYS_STATX: u64 = 332;
 
 // arch_prctl operation codes
 pub const ARCH_SET_GS: i32 = 0x1001;
@@ -1114,4 +1117,21 @@ pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
 #[inline(always)]
 pub fn sys_vmsplice(fd: i32, iov: *const super::IoVec, nr_segs: usize, flags: u32) -> i64 {
     unsafe { syscall4!(SYS_VMSPLICE, fd, iov, nr_segs, flags) }
+}
+
+// --- Filesystem Statistics ---
+
+#[inline(always)]
+pub fn sys_statfs(pathname: *const u8, buf: *mut super::LinuxStatFs) -> i64 {
+    unsafe { syscall2!(SYS_STATFS, pathname, buf) }
+}
+
+#[inline(always)]
+pub fn sys_fstatfs(fd: i32, buf: *mut super::LinuxStatFs) -> i64 {
+    unsafe { syscall2!(SYS_FSTATFS, fd, buf) }
+}
+
+#[inline(always)]
+pub fn sys_statx(dirfd: i32, pathname: *const u8, flags: i32, mask: u32, buf: *mut super::Statx) -> i64 {
+    unsafe { syscall5!(SYS_STATX, dirfd, pathname, flags, mask, buf) }
 }

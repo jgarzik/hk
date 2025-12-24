@@ -12,8 +12,8 @@ use alloc::vec;
 use crate::arch::Uaccess;
 use crate::console::console_write;
 use crate::fs::{
-    Dentry, File, FsError, InodeMode, LookupFlags, Path, RAMFS_FILE_OPS, RwFlags, is_subdir,
-    lock_rename, lookup_path_at, lookup_path_flags, unlock_rename,
+    Dentry, File, FsError, InodeMode, LinuxStatFs, LookupFlags, Path, RAMFS_FILE_OPS, RwFlags,
+    is_subdir, lock_rename, lookup_path_at, lookup_path_flags, unlock_rename,
 };
 use crate::uaccess::{UaccessArch, copy_to_user, put_user, strncpy_from_user};
 
@@ -5554,4 +5554,368 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
 
         _ => EINVAL,
     }
+}
+
+// =============================================================================
+// statx structures and constants
+// =============================================================================
+
+/// Timestamp for statx (16 bytes)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct StatxTimestamp {
+    /// Seconds since Unix epoch
+    pub tv_sec: i64,
+    /// Nanoseconds within the second
+    pub tv_nsec: u32,
+    /// Reserved for future use
+    pub __reserved: i32,
+}
+
+/// Extended file status structure (256 bytes)
+///
+/// This matches the Linux kernel's `struct statx` for x86-64.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Statx {
+    /// Bitmask of results returned
+    pub stx_mask: u32,
+    /// Preferred I/O block size
+    pub stx_blksize: u32,
+    /// File attributes (STATX_ATTR_*)
+    pub stx_attributes: u64,
+    /// Number of hard links
+    pub stx_nlink: u32,
+    /// User ID of owner
+    pub stx_uid: u32,
+    /// Group ID of owner
+    pub stx_gid: u32,
+    /// File type and mode
+    pub stx_mode: u16,
+    /// Padding
+    pub __spare0: [u16; 1],
+    /// Inode number
+    pub stx_ino: u64,
+    /// File size in bytes
+    pub stx_size: u64,
+    /// Number of 512-byte blocks allocated
+    pub stx_blocks: u64,
+    /// Supported attributes mask
+    pub stx_attributes_mask: u64,
+    /// Last access time
+    pub stx_atime: StatxTimestamp,
+    /// Birth/creation time
+    pub stx_btime: StatxTimestamp,
+    /// Last attribute change time
+    pub stx_ctime: StatxTimestamp,
+    /// Last data modification time
+    pub stx_mtime: StatxTimestamp,
+    /// Device major for special files
+    pub stx_rdev_major: u32,
+    /// Device minor for special files
+    pub stx_rdev_minor: u32,
+    /// Device major containing file
+    pub stx_dev_major: u32,
+    /// Device minor containing file
+    pub stx_dev_minor: u32,
+    /// Mount ID
+    pub stx_mnt_id: u64,
+    /// Direct I/O memory alignment
+    pub stx_dio_mem_align: u32,
+    /// Direct I/O offset alignment
+    pub stx_dio_offset_align: u32,
+    /// Subvolume ID
+    pub stx_subvol: u64,
+    /// Min atomic write unit in bytes
+    pub stx_atomic_write_unit_min: u32,
+    /// Max atomic write unit in bytes
+    pub stx_atomic_write_unit_max: u32,
+    /// Max atomic write segment count
+    pub stx_atomic_write_segments_max: u32,
+    /// Direct I/O read offset alignment
+    pub stx_dio_read_offset_align: u32,
+    /// Optimized max atomic write unit
+    pub stx_atomic_write_unit_max_opt: u32,
+    /// Padding
+    pub __spare2: [u32; 1],
+    /// Reserved for future use
+    pub __spare3: [u64; 8],
+}
+
+// STATX mask bits - what fields caller wants / kernel provided
+/// Want/got stx_mode & S_IFMT
+pub const STATX_TYPE: u32 = 0x0001;
+/// Want/got stx_mode & ~S_IFMT
+pub const STATX_MODE: u32 = 0x0002;
+/// Want/got stx_nlink
+pub const STATX_NLINK: u32 = 0x0004;
+/// Want/got stx_uid
+pub const STATX_UID: u32 = 0x0008;
+/// Want/got stx_gid
+pub const STATX_GID: u32 = 0x0010;
+/// Want/got stx_atime
+pub const STATX_ATIME: u32 = 0x0020;
+/// Want/got stx_mtime
+pub const STATX_MTIME: u32 = 0x0040;
+/// Want/got stx_ctime
+pub const STATX_CTIME: u32 = 0x0080;
+/// Want/got stx_ino
+pub const STATX_INO: u32 = 0x0100;
+/// Want/got stx_size
+pub const STATX_SIZE: u32 = 0x0200;
+/// Want/got stx_blocks
+pub const STATX_BLOCKS: u32 = 0x0400;
+/// Basic stats - everything in normal stat struct
+pub const STATX_BASIC_STATS: u32 = 0x07ff;
+/// Want/got stx_btime
+pub const STATX_BTIME: u32 = 0x0800;
+/// Got stx_mnt_id
+pub const STATX_MNT_ID: u32 = 0x1000;
+
+// AT_* flags used by statx (note: some already defined above)
+/// Sync as stat (default)
+pub const AT_STATX_SYNC_AS_STAT: i32 = 0x0000;
+/// Force sync
+pub const AT_STATX_FORCE_SYNC: i32 = 0x2000;
+/// Don't sync
+pub const AT_STATX_DONT_SYNC: i32 = 0x4000;
+
+// =============================================================================
+// statfs/fstatfs syscalls
+// =============================================================================
+
+/// sys_statfs - get filesystem statistics by path
+///
+/// # Arguments
+/// * `path_ptr` - User pointer to null-terminated path string
+/// * `buf` - User pointer to statfs structure to fill
+///
+/// # Returns
+/// 0 on success, negative errno on error.
+pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
+    // Read path from user space
+    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate buffer
+    if !Uaccess::access_ok(buf, core::mem::size_of::<LinuxStatFs>()) {
+        return EFAULT;
+    }
+
+    // Look up path to get dentry/superblock
+    let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    // Get superblock
+    let sb = match dentry.superblock() {
+        Some(sb) => sb,
+        None => return ENOENT,
+    };
+
+    // Get stats from filesystem
+    let statfs = sb.s_op.statfs();
+    let linux_statfs = statfs.to_linux(sb.dev_id, sb.flags);
+
+    // Copy to user
+    if put_user::<Uaccess, LinuxStatFs>(buf, linux_statfs).is_err() {
+        return EFAULT;
+    }
+
+    0
+}
+
+/// sys_fstatfs - get filesystem statistics by file descriptor
+///
+/// # Arguments
+/// * `fd` - File descriptor
+/// * `buf` - User pointer to statfs structure to fill
+///
+/// # Returns
+/// 0 on success, negative errno on error.
+pub fn sys_fstatfs(fd: i32, buf: u64) -> i64 {
+    // Validate buffer
+    if !Uaccess::access_ok(buf, core::mem::size_of::<LinuxStatFs>()) {
+        return EFAULT;
+    }
+
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Get superblock from file's dentry
+    let sb = match file.dentry.superblock() {
+        Some(sb) => sb,
+        None => return EBADF,
+    };
+
+    // Get stats
+    let statfs = sb.s_op.statfs();
+    let linux_statfs = statfs.to_linux(sb.dev_id, sb.flags);
+
+    // Copy to user
+    if put_user::<Uaccess, LinuxStatFs>(buf, linux_statfs).is_err() {
+        return EFAULT;
+    }
+
+    0
+}
+
+// =============================================================================
+// statx syscall
+// =============================================================================
+
+use super::Inode;
+
+/// Fill a Statx structure from an inode
+fn fill_statx(inode: &Inode, _mask: u32) -> Statx {
+    let attr = inode.i_op.getattr(inode);
+    let st_dev = inode.superblock().map(|sb| sb.dev_id).unwrap_or(0);
+
+    let st_rdev = if attr.mode.is_device() {
+        attr.rdev.encode() as u64
+    } else {
+        0
+    };
+
+    Statx {
+        stx_mask: STATX_BASIC_STATS, // Always provide basic stats
+        stx_blksize: 4096,
+        stx_attributes: 0,
+        stx_nlink: attr.nlink,
+        stx_uid: attr.uid,
+        stx_gid: attr.gid,
+        stx_mode: attr.mode.raw(),
+        __spare0: [0],
+        stx_ino: attr.ino,
+        stx_size: attr.size,
+        stx_blocks: attr.size.div_ceil(512),
+        stx_attributes_mask: 0,
+        stx_atime: StatxTimestamp {
+            tv_sec: attr.atime.sec,
+            tv_nsec: attr.atime.nsec,
+            __reserved: 0,
+        },
+        stx_btime: StatxTimestamp {
+            tv_sec: 0,
+            tv_nsec: 0,
+            __reserved: 0,
+        }, // Birth time not tracked
+        stx_ctime: StatxTimestamp {
+            tv_sec: attr.ctime.sec,
+            tv_nsec: attr.ctime.nsec,
+            __reserved: 0,
+        },
+        stx_mtime: StatxTimestamp {
+            tv_sec: attr.mtime.sec,
+            tv_nsec: attr.mtime.nsec,
+            __reserved: 0,
+        },
+        stx_rdev_major: ((st_rdev >> 8) & 0xfff) as u32,
+        stx_rdev_minor: (st_rdev & 0xff) as u32 | ((st_rdev >> 12) & 0xfff00) as u32,
+        stx_dev_major: ((st_dev >> 8) & 0xfff) as u32,
+        stx_dev_minor: (st_dev & 0xff) as u32,
+        stx_mnt_id: 0, // Not implemented yet
+        stx_dio_mem_align: 0,
+        stx_dio_offset_align: 0,
+        stx_subvol: 0,
+        stx_atomic_write_unit_min: 0,
+        stx_atomic_write_unit_max: 0,
+        stx_atomic_write_segments_max: 0,
+        stx_dio_read_offset_align: 0,
+        stx_atomic_write_unit_max_opt: 0,
+        __spare2: [0],
+        __spare3: [0; 8],
+    }
+}
+
+/// sys_statx - get extended file status
+///
+/// # Arguments
+/// * `dirfd` - Directory fd for relative paths, or AT_FDCWD
+/// * `path_ptr` - User pointer to path string
+/// * `flags` - AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH, etc.
+/// * `mask` - STATX_* mask of what to return
+/// * `buf` - User pointer to statx structure to fill
+///
+/// # Returns
+/// 0 on success, negative errno on error.
+pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> i64 {
+    // Validate buffer
+    if !Uaccess::access_ok(buf, core::mem::size_of::<Statx>()) {
+        return EFAULT;
+    }
+
+    // Read path from user space
+    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Handle AT_EMPTY_PATH (statx on fd itself)
+    let dentry = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+        if dirfd < 0 {
+            return EBADF;
+        }
+        match current_fd_table().lock().get(dirfd) {
+            Some(f) => f.dentry.clone(),
+            None => return EBADF,
+        }
+    } else {
+        // Determine starting path for relative paths
+        let start: Option<Path> = if path.starts_with('/') {
+            None
+        } else if dirfd == AT_FDCWD {
+            crate::task::percpu::current_cwd()
+        } else {
+            let file = match current_fd_table().lock().get(dirfd) {
+                Some(f) => f,
+                None => return EBADF,
+            };
+            if !file.is_dir() {
+                return ENOTDIR;
+            }
+            Path::from_dentry(file.dentry.clone())
+        };
+
+        // Determine lookup flags
+        let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+            LookupFlags {
+                follow: false,
+                ..LookupFlags::open()
+            }
+        } else {
+            LookupFlags::open()
+        };
+
+        match lookup_path_at(start, &path, lookup_flags) {
+            Ok(d) => d,
+            Err(FsError::NotFound) => return ENOENT,
+            Err(FsError::NotADirectory) => return ENOTDIR,
+            Err(_) => return EINVAL,
+        }
+    };
+
+    // Get inode
+    let inode = match dentry.get_inode() {
+        Some(i) => i,
+        None => return ENOENT,
+    };
+
+    // Fill statx structure
+    let statx = fill_statx(&inode, mask);
+
+    // Copy to user
+    if put_user::<Uaccess, Statx>(buf, statx).is_err() {
+        return EFAULT;
+    }
+
+    0
 }

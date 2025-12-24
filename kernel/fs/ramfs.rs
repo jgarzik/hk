@@ -31,7 +31,7 @@ use super::FsError;
 use super::dentry::Dentry;
 use super::file::{DirEntry, File, FileOps, RwFlags};
 use super::inode::{AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
-use super::superblock::{FileSystemType, SuperBlock, SuperBlockData, SuperOps};
+use super::superblock::{FileSystemType, RAMFS_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps};
 
 // ============================================================================
 // Ramfs Address Space Operations
@@ -1106,6 +1106,19 @@ pub static RAMFS_FILE_OPS: RamfsFileOps = RamfsFileOps;
 pub struct RamfsSuperOps;
 
 impl SuperOps for RamfsSuperOps {
+    fn statfs(&self) -> StatFs {
+        StatFs {
+            f_type: RAMFS_MAGIC,
+            f_bsize: 4096,
+            f_blocks: 0,  // Unlimited (in-memory filesystem)
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0,   // Unlimited inodes
+            f_ffree: 0,
+            f_namelen: 255,
+        }
+    }
+
     fn alloc_inode(
         &self,
         sb: &Arc<SuperBlock>,

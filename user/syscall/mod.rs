@@ -642,3 +642,139 @@ pub const GETZCNT: i32 = 15;
 pub const MSG_NOERROR: i32 = 0o10000;
 pub const MSG_EXCEPT: i32 = 0o20000;
 pub const MSG_COPY: i32 = 0o40000;
+
+// ============================================================================
+// Filesystem statistics types
+// ============================================================================
+
+/// Linux statfs structure (64-bit)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LinuxStatFs {
+    /// Filesystem type magic
+    pub f_type: i64,
+    /// Optimal transfer block size
+    pub f_bsize: i64,
+    /// Total data blocks
+    pub f_blocks: i64,
+    /// Free blocks
+    pub f_bfree: i64,
+    /// Free blocks for unprivileged user
+    pub f_bavail: i64,
+    /// Total inodes
+    pub f_files: i64,
+    /// Free inodes
+    pub f_ffree: i64,
+    /// Filesystem ID
+    pub f_fsid: [i32; 2],
+    /// Maximum filename length
+    pub f_namelen: i64,
+    /// Fragment size
+    pub f_frsize: i64,
+    /// Mount flags
+    pub f_flags: i64,
+    /// Padding
+    pub f_spare: [i64; 4],
+}
+
+// Filesystem magic numbers
+pub const RAMFS_MAGIC: i64 = 0x858458f6;
+pub const PROC_SUPER_MAGIC: i64 = 0x9fa0;
+pub const MSDOS_SUPER_MAGIC: i64 = 0x4d44;
+
+// ============================================================================
+// statx types and constants
+// ============================================================================
+
+/// statx timestamp structure
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct StatxTimestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    pub __reserved: i32,
+}
+
+/// Linux statx structure (256 bytes)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Statx {
+    /// What results were written
+    pub stx_mask: u32,
+    /// Preferred I/O size
+    pub stx_blksize: u32,
+    /// File attributes
+    pub stx_attributes: u64,
+    /// Hard links
+    pub stx_nlink: u32,
+    /// User ID
+    pub stx_uid: u32,
+    /// Group ID
+    pub stx_gid: u32,
+    /// File type and mode
+    pub stx_mode: u16,
+    pub __spare0: [u16; 1],
+    /// Inode number
+    pub stx_ino: u64,
+    /// File size
+    pub stx_size: u64,
+    /// 512-byte blocks allocated
+    pub stx_blocks: u64,
+    /// Supported attributes
+    pub stx_attributes_mask: u64,
+    /// Access time
+    pub stx_atime: StatxTimestamp,
+    /// Birth/creation time
+    pub stx_btime: StatxTimestamp,
+    /// Status change time
+    pub stx_ctime: StatxTimestamp,
+    /// Modification time
+    pub stx_mtime: StatxTimestamp,
+    /// Device major for device files
+    pub stx_rdev_major: u32,
+    /// Device minor for device files
+    pub stx_rdev_minor: u32,
+    /// Filesystem device major
+    pub stx_dev_major: u32,
+    /// Filesystem device minor
+    pub stx_dev_minor: u32,
+    /// Mount ID
+    pub stx_mnt_id: u64,
+    /// DIO memory alignment
+    pub stx_dio_mem_align: u32,
+    /// DIO offset alignment
+    pub stx_dio_offset_align: u32,
+    /// Subvolume ID
+    pub stx_subvol: u64,
+    /// Atomic write min
+    pub stx_atomic_write_unit_min: u32,
+    /// Atomic write max
+    pub stx_atomic_write_unit_max: u32,
+    /// Atomic write segments max
+    pub stx_atomic_write_segments_max: u32,
+    /// DIO read offset alignment
+    pub stx_dio_read_offset_align: u32,
+    /// Atomic write max opt
+    pub stx_atomic_write_unit_max_opt: u32,
+    pub __spare2: [u32; 1],
+    pub __spare3: [u64; 8],
+}
+
+// STATX mask bits
+pub const STATX_TYPE: u32 = 0x0001;
+pub const STATX_MODE: u32 = 0x0002;
+pub const STATX_NLINK: u32 = 0x0004;
+pub const STATX_UID: u32 = 0x0008;
+pub const STATX_GID: u32 = 0x0010;
+pub const STATX_ATIME: u32 = 0x0020;
+pub const STATX_MTIME: u32 = 0x0040;
+pub const STATX_CTIME: u32 = 0x0080;
+pub const STATX_INO: u32 = 0x0100;
+pub const STATX_SIZE: u32 = 0x0200;
+pub const STATX_BLOCKS: u32 = 0x0400;
+pub const STATX_BASIC_STATS: u32 = 0x07ff;
+pub const STATX_BTIME: u32 = 0x0800;
+
+// AT_* flags for statx
+pub const AT_EMPTY_PATH: i32 = 0x1000;
+pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
