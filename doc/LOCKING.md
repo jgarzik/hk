@@ -445,6 +445,30 @@ Linux uses multiple per-task locks; hk uses a simpler global lock model:
 For now, all task field modifications are by the task itself (through syscalls),
 so the global TASK_TABLE lock is sufficient.
 
+### 3.1.3 Task State Invariants
+
+The `TaskState` enum is primarily informational, not the source of scheduling truth:
+
+**Source of Truth for Scheduling:**
+1. **Runnable**: Task is in a run queue (`CpuRunQueue.queue`)
+2. **Sleeping**: Task is in a wait queue or sleep queue
+3. **Current**: Task is `CpuRunQueue.current`
+4. **Zombie**: `TaskState::Zombie(status)` is set AND task is NOT in any queue
+
+**Why TaskState is Not the Scheduling Source of Truth:**
+
+In timer ISR, we cannot acquire TASK_TABLE (non-IRQ-safe Mutex). Therefore:
+- `wake_sleepers()` adds tasks to run queue WITHOUT updating TaskState
+- The task becomes runnable (in run queue) while TaskState may still say Sleeping
+- This is safe because:
+  - Scheduler checks run queue membership, not TaskState
+  - waitpid() checks TaskState::Zombie which IS reliably set (in process context)
+
+**Consistency Points:**
+- TaskState is set correctly in process context operations (fork, exit, explicit wait)
+- TaskState may be transiently stale after timer-based wakeup
+- Code must NOT rely on TaskState for scheduling decisions
+
 ### 3.2 Memory Management
 
 #### Frame Allocator
