@@ -1423,13 +1423,14 @@ pub fn sys_msync(addr: u64, length: u64, flags: i32) -> i64 {
         }
 
         // MS_SYNC on shared file-backed mapping: sync to disk
-        if flags & MS_SYNC != 0 && vma.is_shared() && vma.file.is_some() {
-            if let Some(ref file) = vma.file {
-                // Sync the file - this uses fsync for now
-                // A more sophisticated implementation would only sync the affected range
-                if file.f_op.fsync(file).is_err() {
-                    return EIO;
-                }
+        if flags & MS_SYNC != 0
+            && vma.is_shared()
+            && let Some(ref file) = vma.file
+        {
+            // Sync the file - this uses fsync for now
+            // A more sophisticated implementation would only sync the affected range
+            if file.f_op.fsync(file).is_err() {
+                return EIO;
             }
         }
         // MS_ASYNC: schedule async write but don't wait
@@ -1693,11 +1694,11 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
             match mm_guard.find_vma_index(old_addr) {
                 Some(idx) => {
                     // Check if old_addr is at VMA start
-                    if let Some(vma) = mm_guard.get_vma(idx) {
-                        if vma.start != old_addr {
-                            // For simplicity, require old_addr to be at VMA start
-                            return EFAULT;
-                        }
+                    if let Some(vma) = mm_guard.get_vma(idx)
+                        && vma.start != old_addr
+                    {
+                        // For simplicity, require old_addr to be at VMA start
+                        return EFAULT;
                     }
                     idx
                 }

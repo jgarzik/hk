@@ -5,7 +5,6 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -446,24 +445,40 @@ impl MmStruct {
     }
 }
 
-/// Global mapping from task ID to memory descriptor
-static TASK_MM: Mutex<BTreeMap<Tid, Arc<Mutex<MmStruct>>>> = Mutex::new(BTreeMap::new());
+// =============================================================================
+// Task MM accessors - uses Task.mm field directly via TASK_TABLE
+// =============================================================================
+
+use crate::task::percpu::TASK_TABLE;
 
 /// Get the memory descriptor for a task
 pub fn get_task_mm(tid: Tid) -> Option<Arc<Mutex<MmStruct>>> {
-    TASK_MM.lock().get(&tid).cloned()
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .and_then(|t| t.mm.clone())
 }
 
 /// Initialize memory descriptor for a task
 pub fn init_task_mm(tid: Tid, mm: Arc<Mutex<MmStruct>>) {
-    TASK_MM.lock().insert(tid, mm);
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.mm = Some(mm);
+    }
 }
 
 /// Remove memory descriptor for a task (called on exit)
 ///
 /// Returns the removed MmStruct for cleanup.
 pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mutex<MmStruct>>> {
-    TASK_MM.lock().remove(&tid)
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.mm.take()
+    } else {
+        None
+    }
 }
 
 /// Clone memory descriptor from parent to child

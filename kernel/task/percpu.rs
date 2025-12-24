@@ -21,13 +21,6 @@ use crate::task::{
 };
 use spin::Mutex;
 
-/// Global table mapping TID -> clear_child_tid address
-///
-/// When CLONE_CHILD_CLEARTID is set during clone(), this stores the address
-/// where we need to write 0 and call futex_wake when the task exits.
-/// This enables pthread_join to work correctly.
-static TASK_CLEAR_TID: Mutex<BTreeMap<Tid, u64>> = Mutex::new(BTreeMap::new());
-
 /// Vfork completion state
 ///
 /// When CLONE_VFORK is used, the parent must wait until the child calls
@@ -35,28 +28,27 @@ static TASK_CLEAR_TID: Mutex<BTreeMap<Tid, u64>> = Mutex::new(BTreeMap::new());
 /// When the child completes, the flag is set to true and the parent wakes.
 static VFORK_COMPLETION: Mutex<BTreeMap<Tid, bool>> = Mutex::new(BTreeMap::new());
 
-/// Set the clear_child_tid address for a task
-///
-/// Called from do_clone when CLONE_CHILD_CLEARTID is set.
-pub fn set_clear_child_tid(tid: Tid, addr: u64) {
-    TASK_CLEAR_TID.lock().insert(tid, addr);
-}
-
 /// Clear the child TID and wake futex waiters
 ///
 /// Called when a task exits if CLONE_CHILD_CLEARTID was set during clone.
 /// This:
-/// 1. Writes 0 to the stored address
-/// 2. Calls futex_wake on that address to wake pthread_join waiters
+/// 1. Gets and clears the clear_child_tid address from the Task struct
+/// 2. Writes 0 to that address
+/// 3. Calls futex_wake on that address to wake pthread_join waiters
 fn do_clear_child_tid(tid: Tid) {
+    // Get and clear the address from the Task struct directly
     let addr = {
-        let mut table = TASK_CLEAR_TID.lock();
-        table.remove(&tid)
+        let mut table = TASK_TABLE.lock();
+        if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+            let addr = task.clear_child_tid;
+            task.clear_child_tid = 0;
+            if addr != 0 { Some(addr) } else { None }
+        } else {
+            None
+        }
     };
 
-    if let Some(addr) = addr
-        && addr != 0
-    {
+    if let Some(addr) = addr {
         use crate::arch::Uaccess;
         use crate::uaccess::put_user;
 
@@ -409,6 +401,23 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         kstack_top: stack_top,
         user_stack_top: None,
         cached_pages: Vec::new(),
+        // TLS fields (not used for idle task)
+        tls_base: 0,
+        clear_child_tid: 0,
+        set_child_tid: 0,
+        // Shared resources (kernel threads don't have user-space resources)
+        mm: None,
+        files: None,
+        fs: None,
+        nsproxy: None,
+        sighand: None,
+        signal: None,
+        io_context: None,
+        sysvsem: None,
+        // Per-task signal state
+        signal_state: crate::signal::TaskSignalState::new(),
+        tif_sigpending: core::sync::atomic::AtomicBool::new(false),
+        robust_list: 0,
     };
 
     // Add task to global table
@@ -486,6 +495,23 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         kstack_top: config.kstack_top,
         user_stack_top: Some(config.user_stack_top),
         cached_pages: Vec::new(),
+        // TLS fields (initialized to 0, set by syscalls)
+        tls_base: 0,
+        clear_child_tid: 0,
+        set_child_tid: 0,
+        // Shared resources (will be initialized by caller via init_* functions)
+        mm: None,
+        files: None,
+        fs: None,
+        nsproxy: None,
+        sighand: None,
+        signal: None,
+        io_context: None,
+        sysvsem: None,
+        // Per-task signal state
+        signal_state: crate::signal::TaskSignalState::new(),
+        tif_sigpending: core::sync::atomic::AtomicBool::new(false),
+        robust_list: 0,
     };
 
     // Add to global table
@@ -877,6 +903,23 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         kstack_top,
         user_stack_top: Some(child_user_rsp),
         cached_pages: Vec::new(),
+        // TLS fields - will be set based on clone flags below
+        tls_base: 0,
+        clear_child_tid: 0,
+        set_child_tid: 0,
+        // Shared resources (will be cloned/shared based on clone flags below)
+        mm: None,
+        files: None,
+        fs: None,
+        nsproxy: None,
+        sighand: None,
+        signal: None,
+        io_context: None,
+        sysvsem: None,
+        // Per-task signal state (always per-task, not shared)
+        signal_state: crate::signal::TaskSignalState::new(),
+        tif_sigpending: core::sync::atomic::AtomicBool::new(false),
+        robust_list: 0,
     };
 
     // Add to global task table
@@ -982,7 +1025,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Handle CLONE_CHILD_CLEARTID: store address to clear and wake on exit
     // This enables pthread_join to work by waking when thread exits
     if config.flags & CLONE_CHILD_CLEARTID != 0 && config.child_tidptr != 0 {
-        set_clear_child_tid(child_tid, config.child_tidptr);
+        crate::task::set_clear_child_tid(child_tid, config.child_tidptr);
     }
 
     printkln!(

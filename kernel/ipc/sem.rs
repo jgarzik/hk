@@ -784,24 +784,34 @@ impl Default for SemUndoList {
     }
 }
 
-/// Global per-task semaphore undo list mapping
-///
-/// Maps TID to Arc<SemUndoList>. When CLONE_SYSVSEM is set, child shares
-/// parent's Arc. Otherwise, child starts with None (allocated lazily on
-/// first SEM_UNDO operation).
-pub static TASK_SEM_UNDO: Mutex<BTreeMap<Tid, Arc<SemUndoList>>> = Mutex::new(BTreeMap::new());
+// =============================================================================
+// Task SemUndo accessors - uses Task.sysvsem field directly via TASK_TABLE
+// =============================================================================
+
+use crate::task::percpu::TASK_TABLE;
 
 /// Get the undo list for a task, creating if necessary
 pub fn get_or_create_undo_list(tid: Tid) -> Arc<SemUndoList> {
-    let mut map = TASK_SEM_UNDO.lock();
-    map.entry(tid)
-        .or_insert_with(|| Arc::new(SemUndoList::new()))
-        .clone()
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        if task.sysvsem.is_none() {
+            task.sysvsem = Some(Arc::new(SemUndoList::new()));
+        }
+        task.sysvsem.clone().unwrap()
+    } else {
+        // Task not found - shouldn't happen but return a new list
+        Arc::new(SemUndoList::new())
+    }
 }
 
 /// Get the undo list for a task (if it exists)
 pub fn get_undo_list(tid: Tid) -> Option<Arc<SemUndoList>> {
-    TASK_SEM_UNDO.lock().get(&tid).cloned()
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .and_then(|t| t.sysvsem.clone())
 }
 
 /// Clone semaphore undo list for a new task
@@ -809,12 +819,14 @@ pub fn get_undo_list(tid: Tid) -> Option<Arc<SemUndoList>> {
 /// If `share` is true (CLONE_SYSVSEM set), child shares parent's Arc<SemUndoList>.
 /// Otherwise, child starts with None (lazy allocation on first SEM_UNDO operation).
 pub fn clone_task_semundo(parent_tid: Tid, child_tid: Tid, share: bool) {
-    let mut map = TASK_SEM_UNDO.lock();
-
     if share {
         // CLONE_SYSVSEM: share the same undo list
-        if let Some(parent_undo) = map.get(&parent_tid).cloned() {
-            map.insert(child_tid, parent_undo);
+        let parent_undo = get_undo_list(parent_tid);
+        if let Some(undo) = parent_undo {
+            let mut table = TASK_TABLE.lock();
+            if let Some(child) = table.tasks.iter_mut().find(|t| t.tid == child_tid) {
+                child.sysvsem = Some(undo);
+            }
         }
         // If parent has no undo list, child also starts with none (will be created on demand)
     }
@@ -830,8 +842,12 @@ pub fn clone_task_semundo(parent_tid: Tid, child_tid: Tid, share: bool) {
 pub fn exit_sem(tid: Tid) {
     // Remove this task's undo list reference
     let undo_list = {
-        let mut map = TASK_SEM_UNDO.lock();
-        map.remove(&tid)
+        let mut table = TASK_TABLE.lock();
+        if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+            task.sysvsem.take()
+        } else {
+            None
+        }
     };
 
     let Some(undo_list) = undo_list else {

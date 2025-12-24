@@ -282,23 +282,23 @@ impl PipeInner {
         let mut written = 0;
 
         // First, try to merge with existing head buffer
-        if let Some(buf) = self.head_buf_for_merge_mut() {
-            if buf.can_merge() {
-                let space = buf.space_available();
-                let to_write = data.len().min(space);
-                if to_write > 0 {
-                    // Get page frame and write data
-                    if let Some(ref page) = buf.page {
-                        let offset = (buf.offset + buf.len) as usize;
-                        let dst_addr = page.frame as usize + offset;
-                        unsafe {
-                            let dst = dst_addr as *mut u8;
-                            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, to_write);
-                        }
-                        buf.len += to_write as u32;
-                        self.total_len += to_write;
-                        written += to_write;
+        if let Some(buf) = self.head_buf_for_merge_mut()
+            && buf.can_merge()
+        {
+            let space = buf.space_available();
+            let to_write = data.len().min(space);
+            if to_write > 0 {
+                // Get page frame and write data
+                if let Some(ref page) = buf.page {
+                    let offset = (buf.offset + buf.len) as usize;
+                    let dst_addr = page.frame as usize + offset;
+                    unsafe {
+                        let dst = dst_addr as *mut u8;
+                        core::ptr::copy_nonoverlapping(data.as_ptr(), dst, to_write);
                     }
+                    buf.len += to_write as u32;
+                    self.total_len += to_write;
+                    written += to_write;
                 }
             }
         }

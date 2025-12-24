@@ -7,14 +7,14 @@
 //! ## Design Overview
 //!
 //! Following Linux's `struct nsproxy` pattern:
-//! - Each task has an `Arc<NsProxy>` (via `TASK_NS` global table)
+//! - Each task has an `Arc<NsProxy>` (via `Task.nsproxy` field)
 //! - Multiple tasks can share the same NsProxy (threads)
 //! - Clone with CLONE_NEW* flags creates new namespace(s)
 //! - Reference counting via Arc handles cleanup
 //!
 //! ## Locking
 //!
-//! - `TASK_NS`: `spin::Mutex` (thread context only)
+//! - `TASK_TABLE`: Protects task struct access (including nsproxy field)
 //! - Per-namespace data: `spin::RwLock` (read-heavy)
 //!
 //! ## Lock Ordering
@@ -26,9 +26,8 @@ pub mod pid;
 pub mod user;
 pub mod uts;
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use spin::{Lazy, Mutex, RwLock};
+use spin::{Lazy, RwLock};
 
 use crate::task::Tid;
 pub use pid::{
@@ -368,24 +367,32 @@ pub static INIT_NSPROXY: Lazy<Arc<NsProxy>> = Lazy::new(|| Arc::new(NsProxy::new
 // Task-NsProxy Mapping (following FsStruct pattern)
 // ============================================================================
 
-/// Global table mapping TID -> NsProxy
-///
-/// Multiple tasks can share the same Arc<NsProxy> when created
-/// without CLONE_NEW* flags (threads sharing namespaces).
-static TASK_NS: Mutex<BTreeMap<Tid, Arc<NsProxy>>> = Mutex::new(BTreeMap::new());
+// =============================================================================
+// Task NS accessors - uses Task.nsproxy field directly via TASK_TABLE
+// =============================================================================
+
+use crate::task::percpu::TASK_TABLE;
 
 /// Initialize nsproxy for a new task
 ///
 /// Called when creating a new task to set up its namespace context.
 pub fn init_task_ns(tid: Tid, nsproxy: Arc<NsProxy>) {
-    TASK_NS.lock().insert(tid, nsproxy);
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.nsproxy = Some(nsproxy);
+    }
 }
 
 /// Get the NsProxy for a task
 ///
 /// Returns a cloned Arc (increments refcount).
 pub fn get_task_ns(tid: Tid) -> Option<Arc<NsProxy>> {
-    TASK_NS.lock().get(&tid).cloned()
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .and_then(|t| t.nsproxy.clone())
 }
 
 /// Remove nsproxy when task exits
@@ -394,7 +401,10 @@ pub fn get_task_ns(tid: Tid) -> Option<Arc<NsProxy>> {
 /// (no other tasks sharing this NsProxy), the NsProxy is dropped,
 /// which in turn drops the namespace references.
 pub fn exit_task_ns(tid: Tid) {
-    TASK_NS.lock().remove(&tid);
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.nsproxy = None;
+    }
 }
 
 /// Clone nsproxy for fork/clone
@@ -569,7 +579,7 @@ pub fn sys_unshare(unshare_flags: u64) -> i64 {
 /// This atomically replaces the task's nsproxy. Used by both
 /// unshare() and setns().
 pub fn switch_task_namespaces(tid: Tid, new_ns: Arc<NsProxy>) {
-    TASK_NS.lock().insert(tid, new_ns);
+    init_task_ns(tid, new_ns);
 }
 
 // ============================================================================
