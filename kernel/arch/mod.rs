@@ -446,7 +446,8 @@ pub trait IoremapOps {
 #[derive(Debug, Clone, Copy)]
 pub struct CpuInfo {
     /// Hardware CPU ID (APIC ID on x86, MPIDR on ARM)
-    pub hw_cpu_id: u8,
+    /// 32-bit for X2APIC support on x86-64
+    pub hw_cpu_id: u32,
     /// Whether this CPU is enabled
     pub enabled: bool,
     /// Whether this is the bootstrap processor
@@ -477,8 +478,8 @@ pub struct AcpiInfo {
     pub interrupt_controller_base: u64,
     /// List of CPUs discovered
     pub cpus: Vec<CpuInfo>,
-    /// Bootstrap processor CPU ID
-    pub bsp_cpu_id: u8,
+    /// Bootstrap processor CPU ID (32-bit for X2APIC support)
+    pub bsp_cpu_id: u32,
     /// Power management info (if available, x86-specific)
     #[allow(dead_code)]
     pub power_info: Option<PowerInfo>,
@@ -523,7 +524,7 @@ pub trait SmpOps {
     /// # Arguments
     /// * `acpi` - Platform hardware info to update
     /// * `hw_id` - Hardware CPU ID of the bootstrap processor
-    fn set_bsp_cpu_id(acpi: &mut AcpiInfo, hw_id: u8);
+    fn set_bsp_cpu_id(acpi: &mut AcpiInfo, hw_id: u32);
 }
 
 /// Local interrupt controller and timer operations
@@ -547,8 +548,8 @@ pub trait LocalTimerOps {
 
     /// Get the current CPU's hardware ID
     ///
-    /// Returns APIC ID on x86, MPIDR-derived ID on ARM.
-    fn current_hw_cpu_id() -> u8;
+    /// Returns APIC ID on x86 (32-bit for X2APIC), MPIDR-derived ID on ARM.
+    fn current_hw_cpu_id() -> u32;
 
     /// Calibrate and start the local timer
     ///

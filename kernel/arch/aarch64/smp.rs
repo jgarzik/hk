@@ -64,7 +64,7 @@ unsafe extern "C" {
 /// Initialize SMP - bring up all APs
 pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut FA) -> usize {
     let bsp_mpidr = cpu::read_mpidr();
-    let bsp_cpu_id = (bsp_mpidr & 0xFF) as u8;
+    let bsp_cpu_id = (bsp_mpidr & 0xFF) as u32;
 
     // Get BSP kernel stack (from current SP, rounded to stack top)
     let bsp_stack: u64;

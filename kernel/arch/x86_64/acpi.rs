@@ -11,8 +11,8 @@
 //! above the identity-mapped region. We use ioremap to map tables before
 //! accessing them.
 
-use alloc::vec::Vec;
 use super::ioremap::{ioremap, iounmap};
+use alloc::vec::Vec;
 
 /// RSDP signature "RSD PTR "
 const RSDP_SIGNATURE: &[u8; 8] = b"RSD PTR ";
@@ -29,16 +29,29 @@ const MADT_ENTRY_IOAPIC: u8 = 1;
 const MADT_ENTRY_ISO: u8 = 2; // Interrupt Source Override
 const MADT_ENTRY_LAPIC_NMI: u8 = 4;
 const MADT_ENTRY_LAPIC_64: u8 = 5; // Local APIC Address Override
+const MADT_ENTRY_X2APIC: u8 = 9; // Processor Local x2APIC
 
 /// Information about a CPU found in MADT
 #[derive(Debug, Clone, Copy)]
 pub struct CpuInfo {
-    /// Local APIC ID
-    pub apic_id: u8,
+    /// Local APIC ID (32-bit for X2APIC support)
+    pub apic_id: u32,
     /// Whether this CPU is enabled
     pub enabled: bool,
     /// Whether this is the bootstrap processor
     pub is_bsp: bool,
+}
+
+/// Information about an I/O APIC found in MADT
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Fields used for future I/O APIC configuration
+pub struct IoApicInfo {
+    /// I/O APIC ID
+    pub id: u8,
+    /// Physical base address
+    pub address: u32,
+    /// Global System Interrupt base
+    pub gsi_base: u32,
 }
 
 /// Power management information from FADT
@@ -59,8 +72,10 @@ pub struct AcpiInfo {
     pub lapic_base: u64,
     /// List of CPUs found
     pub cpus: Vec<CpuInfo>,
-    /// Bootstrap processor's APIC ID
-    pub bsp_apic_id: u8,
+    /// List of I/O APICs found
+    pub ioapics: Vec<IoApicInfo>,
+    /// Bootstrap processor's APIC ID (32-bit for X2APIC support)
+    pub bsp_apic_id: u32,
     /// Power management information (for shutdown/reboot)
     pub power_info: Option<PowerInfo>,
 }
@@ -215,8 +230,16 @@ fn search_rsdp(start: usize, length: usize) -> Option<*const Rsdp> {
 
         if signature == *RSDP_SIGNATURE {
             let ptr = addr as *const Rsdp;
-            // Verify checksum
+            // Verify basic checksum (first 20 bytes)
             if checksum_valid(ptr as *const u8, core::mem::size_of::<Rsdp>()) {
+                // For ACPI 2.0+, also verify extended checksum (full 36 bytes)
+                let revision = unsafe { core::ptr::read_volatile((addr + 15) as *const u8) };
+                if revision >= 2 && !checksum_valid(ptr as *const u8, core::mem::size_of::<Rsdp2>())
+                {
+                    // Extended checksum failed, keep searching
+                    addr += 16;
+                    continue;
+                }
                 return Some(ptr);
             }
         }
@@ -232,6 +255,23 @@ fn checksum_valid(ptr: *const u8, len: usize) -> bool {
         sum = sum.wrapping_add(unsafe { core::ptr::read_volatile(ptr.add(i)) });
     }
     sum == 0
+}
+
+/// Validate checksum of ACPI table, logging warning if invalid (Linux behavior)
+///
+/// Linux logs a warning but continues processing tables with bad checksums,
+/// as many real-world BIOS implementations have buggy ACPI tables.
+/// Returns true if checksum is valid, false if invalid (but processing should continue).
+fn validate_table_checksum(ptr: *const u8, len: usize, table_name: &str) -> bool {
+    if checksum_valid(ptr, len) {
+        true
+    } else {
+        crate::printkln!(
+            "ACPI Warning: Incorrect checksum in table [{}] - continuing anyway",
+            table_name
+        );
+        false
+    }
 }
 
 /// Find MADT physical address in RSDT or XSDT (uses ioremap)
@@ -253,6 +293,11 @@ fn find_table_phys(sdt_phys: u64, is_xsdt: bool, signature: &[u8; 4]) -> Result<
         // Read length using offset (packed struct)
         let length_ptr = (sdt_ptr as *const u8).add(4) as *const u32;
         let total_length = core::ptr::read_unaligned(length_ptr) as usize;
+
+        // Validate RSDT/XSDT checksum (warn but continue per Linux behavior)
+        let table_name = if is_xsdt { "XSDT" } else { "RSDT" };
+        validate_table_checksum(sdt_ptr as *const u8, total_length, table_name);
+
         let header_size = core::mem::size_of::<SdtHeader>();
         let entry_size = if is_xsdt { 8 } else { 4 };
         let num_entries = (total_length - header_size) / entry_size;
@@ -297,6 +342,13 @@ fn parse_madt_mapped(madt_phys: u64) -> Result<AcpiInfo, &'static str> {
         // Map the MADT
         let madt_ptr = map_acpi_table(madt_phys)?;
 
+        // Read length from SDT header (offset 4) first for checksum validation
+        let length_ptr = madt_ptr.add(4) as *const u32;
+        let madt_length = core::ptr::read_unaligned(length_ptr) as usize;
+
+        // Validate MADT checksum (warn but continue per Linux behavior)
+        validate_table_checksum(madt_ptr as *const u8, madt_length, "MADT");
+
         // Read fields using offsets (packed struct)
         // MadtHeader layout: SdtHeader (36 bytes) + lapic_address (4) + flags (4)
         let lapic_addr_ptr = madt_ptr.add(36) as *const u32;
@@ -305,15 +357,16 @@ fn parse_madt_mapped(madt_phys: u64) -> Result<AcpiInfo, &'static str> {
         let mut info = AcpiInfo {
             lapic_base,
             cpus: Vec::new(),
+            ioapics: Vec::new(),
             bsp_apic_id: 0,   // Will be set after LAPIC is mapped
             power_info: None, // Will be set after FADT parsing
         };
 
-        // Read length from SDT header (offset 4)
-        let length_ptr = madt_ptr.add(4) as *const u32;
-        let madt_length = core::ptr::read_unaligned(length_ptr) as usize;
         let entries_start = madt_ptr.add(core::mem::size_of::<MadtHeader>());
         let entries_end = madt_ptr.add(madt_length);
+
+        // Track if we found LAPIC entries (for X2APIC duplicate filtering)
+        let mut has_lapic_cpus = false;
 
         let mut ptr = entries_start;
         while ptr < entries_end {
@@ -334,7 +387,8 @@ fn parse_madt_mapped(madt_phys: u64) -> Result<AcpiInfo, &'static str> {
                     let enabled = (flags & 0x1) != 0 || (flags & 0x2) != 0;
 
                     if enabled {
-                        let apic_id = core::ptr::read_unaligned(ptr.add(3));
+                        has_lapic_cpus = true;
+                        let apic_id = core::ptr::read_unaligned(ptr.add(3)) as u32;
                         info.cpus.push(CpuInfo {
                             apic_id,
                             enabled,
@@ -343,14 +397,50 @@ fn parse_madt_mapped(madt_phys: u64) -> Result<AcpiInfo, &'static str> {
                     }
                 }
 
+                MADT_ENTRY_X2APIC => {
+                    // X2APIC: header (2) + reserved (2) + x2apic_id (4) + flags (4) + uid (4)
+                    let x2apic_id = core::ptr::read_unaligned(ptr.add(4) as *const u32);
+                    let flags = core::ptr::read_unaligned(ptr.add(8) as *const u32);
+                    let enabled = (flags & 0x1) != 0 || (flags & 0x2) != 0;
+
+                    // Ignore invalid ID (0xffffffff)
+                    if x2apic_id == 0xffffffff {
+                        // skip
+                    }
+                    // Per ACPI spec: if LAPIC entries exist, X2APIC entries with ID < 0xff
+                    // are duplicates and should be ignored
+                    else if has_lapic_cpus && x2apic_id < 0xff {
+                        // skip duplicate
+                    } else if enabled {
+                        info.cpus.push(CpuInfo {
+                            apic_id: x2apic_id,
+                            enabled,
+                            is_bsp: false,
+                        });
+                    }
+                }
+
+                MADT_ENTRY_IOAPIC => {
+                    // IOAPIC: header (2) + id (1) + reserved (1) + address (4) + gsi_base (4)
+                    let id = core::ptr::read_unaligned(ptr.add(2));
+                    let address = core::ptr::read_unaligned(ptr.add(4) as *const u32);
+                    let gsi_base = core::ptr::read_unaligned(ptr.add(8) as *const u32);
+
+                    info.ioapics.push(IoApicInfo {
+                        id,
+                        address,
+                        gsi_base,
+                    });
+                }
+
                 MADT_ENTRY_LAPIC_64 => {
                     // MadtLapicAddrOverride: header (2) + reserved (2) + address (8)
                     let addr_ptr = ptr.add(4) as *const u64;
                     info.lapic_base = core::ptr::read_unaligned(addr_ptr);
                 }
 
-                MADT_ENTRY_IOAPIC | MADT_ENTRY_ISO | MADT_ENTRY_LAPIC_NMI => {
-                    // I/O APIC, Interrupt source override and LAPIC NMI entries
+                MADT_ENTRY_ISO | MADT_ENTRY_LAPIC_NMI => {
+                    // Interrupt source override and LAPIC NMI entries
                     // Not needed for basic SMP boot
                 }
 
@@ -381,7 +471,10 @@ fn parse_fadt_mapped(fadt_phys: u64) -> Result<PowerInfo, &'static str> {
 
         // Read length from SDT header (offset 4)
         let length_ptr = fadt_ptr.add(4) as *const u32;
-        let fadt_length = core::ptr::read_unaligned(length_ptr) as u64;
+        let fadt_length = core::ptr::read_unaligned(length_ptr) as usize;
+
+        // Validate FADT checksum (warn but continue per Linux behavior)
+        validate_table_checksum(fadt_ptr as *const u8, fadt_length, "FADT");
 
         // FADT layout: SdtHeader (36) + various fields
         // pm1a_cnt_blk is at offset 64, pm1b_cnt_blk at offset 68
@@ -398,7 +491,7 @@ fn parse_fadt_mapped(fadt_phys: u64) -> Result<PowerInfo, &'static str> {
         };
 
         // Unmap the FADT
-        iounmap(fadt_ptr, fadt_length);
+        iounmap(fadt_ptr, fadt_length as u64);
 
         Ok(info)
     }
