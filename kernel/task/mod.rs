@@ -475,6 +475,67 @@ pub enum TaskState {
     Zombie(i32),
 }
 
+// =============================================================================
+// prctl state (PR_SET_NAME, PR_SET_DUMPABLE, etc.)
+// =============================================================================
+
+/// prctl operation codes
+pub mod prctl_ops {
+    /// Get dumpable flag
+    pub const PR_GET_DUMPABLE: i32 = 3;
+    /// Set dumpable flag
+    pub const PR_SET_DUMPABLE: i32 = 4;
+    /// Set process name (comm)
+    pub const PR_SET_NAME: i32 = 15;
+    /// Get process name (comm)
+    pub const PR_GET_NAME: i32 = 16;
+    /// Set timer slack value (nanoseconds)
+    pub const PR_SET_TIMERSLACK: i32 = 29;
+    /// Get timer slack value (nanoseconds)
+    pub const PR_GET_TIMERSLACK: i32 = 30;
+    /// Disable privilege escalation via setuid/setgid (irreversible)
+    pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
+    /// Get no_new_privs flag
+    pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
+}
+
+/// Dumpable flag values for PR_SET_DUMPABLE
+pub mod dumpable {
+    /// Not dumpable
+    pub const SUID_DUMP_DISABLE: u8 = 0;
+    /// Dumpable by user (default)
+    pub const SUID_DUMP_USER: u8 = 1;
+    /// Dumpable by root only
+    pub const SUID_DUMP_ROOT: u8 = 2;
+}
+
+/// Per-task prctl state
+///
+/// Stores settings controlled by the prctl() syscall.
+/// These are per-thread (not shared across clone).
+#[derive(Clone)]
+pub struct PrctlState {
+    /// Thread/process name (PR_SET_NAME) - 16 bytes max, null-terminated
+    pub name: [u8; 16],
+    /// Dumpable flag (PR_SET_DUMPABLE) - controls core dump generation
+    pub dumpable: u8,
+    /// No-new-privileges flag (PR_SET_NO_NEW_PRIVS) - irreversible once set
+    pub no_new_privs: bool,
+    /// Timer slack in nanoseconds (PR_SET_TIMERSLACK)
+    pub timer_slack_ns: u64,
+}
+
+impl Default for PrctlState {
+    fn default() -> Self {
+        Self {
+            name: [0u8; 16],
+            dumpable: dumpable::SUID_DUMP_USER,
+            no_new_privs: false,
+            timer_slack_ns: 50_000, // 50 microseconds default
+        }
+    }
+}
+
 /// File descriptor number type
 pub type Fd = i32;
 
@@ -794,6 +855,12 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
 
     /// Robust futex list head address
     pub robust_list: u64,
+
+    // =========================================================================
+    // prctl state (not shared)
+    // =========================================================================
+    /// Per-task prctl state (name, dumpable, no_new_privs, timer_slack)
+    pub prctl: PrctlState,
 }
 
 impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {

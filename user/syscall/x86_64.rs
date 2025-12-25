@@ -833,6 +833,17 @@ pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
     unsafe { syscall2!(SYS_EVENTFD2, initval, flags) }
 }
 
+// --- prctl ---
+
+/// prctl syscall number
+pub const SYS_PRCTL: u64 = 157;
+
+/// prctl(option, arg2, arg3, arg4, arg5) - process/thread control
+#[inline(always)]
+pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    unsafe { syscall5!(SYS_PRCTL, option, arg2, arg3, arg4, arg5) }
+}
+
 // --- signalfd ---
 
 /// signalfd(fd, mask, flags) - legacy signalfd (x86_64 only)

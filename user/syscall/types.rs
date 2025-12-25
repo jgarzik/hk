@@ -987,6 +987,25 @@ pub struct SignalfdSiginfo {
 }
 
 // ============================================================================
+// prctl constants (Section 10.4)
+// ============================================================================
+
+/// prctl operation codes
+pub const PR_GET_DUMPABLE: i32 = 3;
+pub const PR_SET_DUMPABLE: i32 = 4;
+pub const PR_SET_NAME: i32 = 15;
+pub const PR_GET_NAME: i32 = 16;
+pub const PR_SET_TIMERSLACK: i32 = 29;
+pub const PR_GET_TIMERSLACK: i32 = 30;
+pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
+pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
+
+/// Dumpable flag values
+pub const SUID_DUMP_DISABLE: i32 = 0;
+pub const SUID_DUMP_USER: i32 = 1;
+pub const SUID_DUMP_ROOT: i32 = 2;
+
+// ============================================================================
 // POSIX timer types and constants (Section 6.2)
 // ============================================================================
 

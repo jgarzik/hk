@@ -2298,6 +2298,171 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
 }
 
 // =============================================================================
+// prctl syscall
+// =============================================================================
+
+use crate::task::prctl_ops::{
+    PR_GET_DUMPABLE, PR_GET_NAME, PR_GET_NO_NEW_PRIVS, PR_GET_TIMERSLACK, PR_SET_DUMPABLE,
+    PR_SET_NAME, PR_SET_NO_NEW_PRIVS, PR_SET_TIMERSLACK,
+};
+
+/// sys_prctl - Process/thread control operations
+///
+/// Provides various process/thread control operations. Unlike arch_prctl,
+/// this syscall is portable across architectures.
+///
+/// Supported operations:
+/// - PR_SET_NAME (15): Set thread name (16-byte max, arg2 = char*)
+/// - PR_GET_NAME (16): Get thread name (arg2 = char* buffer)
+/// - PR_SET_DUMPABLE (4): Set core dump flag (arg2 = 0, 1, or 2)
+/// - PR_GET_DUMPABLE (3): Get core dump flag (returns value)
+/// - PR_SET_NO_NEW_PRIVS (38): Disable privilege escalation (arg2 = 1, irreversible)
+/// - PR_GET_NO_NEW_PRIVS (39): Get no_new_privs flag (returns 0 or 1)
+/// - PR_SET_TIMERSLACK (29): Set timer slack (arg2 = nanoseconds)
+/// - PR_GET_TIMERSLACK (30): Get timer slack (returns nanoseconds)
+///
+/// Returns 0 on success (or value for GET operations), negative errno on error.
+pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 {
+    use crate::arch::Uaccess;
+    use crate::task::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_ROOT, SUID_DUMP_USER};
+    use crate::task::percpu::{TASK_TABLE, current_tid};
+    use crate::uaccess::{get_user, put_user};
+
+    let tid = current_tid();
+
+    match option {
+        PR_SET_NAME => {
+            // Set thread name from user-space string (max 16 bytes including null)
+            let mut name = [0u8; 16];
+
+            // Read up to 16 bytes from user space
+            for (i, slot) in name.iter_mut().enumerate() {
+                match get_user::<Uaccess, u8>(arg2 + i as u64) {
+                    Ok(byte) => {
+                        *slot = byte;
+                        if byte == 0 {
+                            break; // Null terminator found
+                        }
+                    }
+                    Err(_) => return -14, // EFAULT
+                }
+            }
+            // Ensure null termination
+            name[15] = 0;
+
+            // Update task's prctl state
+            let mut table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+                task.prctl.name = name;
+                0
+            } else {
+                -3 // ESRCH
+            }
+        }
+
+        PR_GET_NAME => {
+            // Get thread name and write to user buffer
+            let name = {
+                let table = TASK_TABLE.lock();
+                match table.tasks.iter().find(|t| t.tid == tid) {
+                    Some(task) => task.prctl.name,
+                    None => return -3, // ESRCH
+                }
+            };
+
+            // Write name to user space (16 bytes)
+            for (i, &byte) in name.iter().enumerate() {
+                if put_user::<Uaccess, u8>(arg2 + i as u64, byte).is_err() {
+                    return -14; // EFAULT
+                }
+            }
+            0
+        }
+
+        PR_SET_DUMPABLE => {
+            // Set dumpable flag (0, 1, or 2)
+            let value = arg2 as u8;
+            if value != SUID_DUMP_DISABLE && value != SUID_DUMP_USER && value != SUID_DUMP_ROOT {
+                return -22; // EINVAL
+            }
+
+            let mut table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+                task.prctl.dumpable = value;
+                0
+            } else {
+                -3 // ESRCH
+            }
+        }
+
+        PR_GET_DUMPABLE => {
+            // Return dumpable flag value
+            let table = TASK_TABLE.lock();
+            match table.tasks.iter().find(|t| t.tid == tid) {
+                Some(task) => task.prctl.dumpable as i64,
+                None => -3, // ESRCH
+            }
+        }
+
+        PR_SET_NO_NEW_PRIVS => {
+            // Set no_new_privs flag (irreversible once set)
+            // arg2 must be 1 to enable, any other value is EINVAL
+            if arg2 != 1 {
+                return -22; // EINVAL
+            }
+
+            let mut table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+                task.prctl.no_new_privs = true;
+                0
+            } else {
+                -3 // ESRCH
+            }
+        }
+
+        PR_GET_NO_NEW_PRIVS => {
+            // Return no_new_privs flag (0 or 1)
+            let table = TASK_TABLE.lock();
+            match table.tasks.iter().find(|t| t.tid == tid) {
+                Some(task) => {
+                    if task.prctl.no_new_privs {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                None => -3, // ESRCH
+            }
+        }
+
+        PR_SET_TIMERSLACK => {
+            // Set timer slack in nanoseconds
+            // arg2 of 0 resets to default (50,000 ns)
+            let slack = if arg2 == 0 { 50_000 } else { arg2 };
+
+            let mut table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+                task.prctl.timer_slack_ns = slack;
+                0
+            } else {
+                -3 // ESRCH
+            }
+        }
+
+        PR_GET_TIMERSLACK => {
+            // Return timer slack in nanoseconds
+            let table = TASK_TABLE.lock();
+            match table.tasks.iter().find(|t| t.tid == tid) {
+                Some(task) => task.prctl.timer_slack_ns as i64,
+                None => -3, // ESRCH
+            }
+        }
+
+        _ => -22, // EINVAL - unsupported operation
+    }
+}
+
+// =============================================================================
 // Thread-Local Storage syscalls
 // =============================================================================
 

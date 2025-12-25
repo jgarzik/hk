@@ -419,6 +419,8 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         signal_state: crate::signal::TaskSignalState::new(),
         tif_sigpending: core::sync::atomic::AtomicBool::new(false),
         robust_list: 0,
+        // prctl state
+        prctl: crate::task::PrctlState::default(),
     };
 
     // Add task to global table
@@ -514,6 +516,8 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         signal_state: crate::signal::TaskSignalState::new(),
         tif_sigpending: core::sync::atomic::AtomicBool::new(false),
         robust_list: 0,
+        // prctl state
+        prctl: crate::task::PrctlState::default(),
     };
 
     // Add to global table
@@ -766,6 +770,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_cpus_allowed,
         parent_pt_phys,
         parent_cred,
+        parent_prctl,
     ) = {
         let table = TASK_TABLE.lock();
         let parent = try_with_cleanup!(table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)); // ESRCH - no such process
@@ -781,6 +786,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.cpus_allowed,
             parent.page_table.root_table_phys(),
             parent.cred.clone(),
+            parent.prctl.clone(),
         )
     };
 
@@ -925,6 +931,13 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         signal_state: crate::signal::TaskSignalState::new(),
         tif_sigpending: core::sync::atomic::AtomicBool::new(false),
         robust_list: 0,
+        // prctl state: inherit no_new_privs from parent, reset others
+        prctl: crate::task::PrctlState {
+            name: [0u8; 16],                                 // Child gets empty name
+            dumpable: crate::task::dumpable::SUID_DUMP_USER, // Reset to default
+            no_new_privs: parent_prctl.no_new_privs,         // Inherited (irreversible)
+            timer_slack_ns: parent_prctl.timer_slack_ns,     // Inherited
+        },
     };
 
     // Add to global task table

@@ -420,7 +420,9 @@ pub const SYS_IOPRIO_SET: u64 = 251;
 /// ioprio_get(which, who)
 pub const SYS_IOPRIO_GET: u64 = 252;
 
-// Thread-local storage
+// Thread-local storage and process control
+/// prctl(option, arg2, arg3, arg4, arg5) - Process/thread control
+pub const SYS_PRCTL: u64 = 157;
 /// arch_prctl(code, addr) - Architecture-specific thread state
 pub const SYS_ARCH_PRCTL: u64 = 158;
 /// set_tid_address(tidptr) - Set pointer for child thread ID on exit
@@ -1483,7 +1485,11 @@ pub fn x86_64_syscall_dispatch(
             sys_ioprio_get(arg0 as i32, arg1 as i32) as u64
         }
 
-        // Thread-local storage
+        // Thread-local storage and process control
+        SYS_PRCTL => {
+            use crate::task::syscall::sys_prctl;
+            sys_prctl(arg0 as i32, arg1, arg2, arg3, arg4) as u64
+        }
         SYS_ARCH_PRCTL => {
             use crate::task::syscall::sys_arch_prctl;
             sys_arch_prctl(arg0 as i32, arg1) as u64
