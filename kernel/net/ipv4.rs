@@ -13,6 +13,7 @@ use crate::net::ethernet::{self, ETH_ALEN, ETH_HLEN, EtherType};
 use crate::net::route;
 use crate::net::skb::SkBuff;
 use crate::net::tcp;
+use crate::net::udp;
 
 /// IP protocol numbers
 pub const IPPROTO_ICMP: u8 = 1;
@@ -328,12 +329,8 @@ pub fn ip_rcv(mut skb: SkBuff) {
 
     match hdr.protocol {
         IPPROTO_TCP => tcp::tcp_rcv(skb),
-        IPPROTO_UDP => {
-            // UDP not implemented yet
-        }
-        IPPROTO_ICMP => {
-            // ICMP not implemented yet
-        }
+        IPPROTO_UDP => udp::udp_rcv(skb),
+        IPPROTO_ICMP => crate::net::icmp::icmp_rcv(skb),
         _ => {
             // Unknown protocol, drop
         }

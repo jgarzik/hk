@@ -309,6 +309,7 @@ pub const SYS_PRLIMIT64: u64 = 261;
 
 // Socket syscalls
 pub const SYS_SOCKET: u64 = 198;
+pub const SYS_SOCKETPAIR: u64 = 199;
 pub const SYS_BIND: u64 = 200;
 pub const SYS_LISTEN: u64 = 201;
 pub const SYS_CONNECT: u64 = 203;
@@ -319,6 +320,10 @@ pub const SYS_RECVFROM: u64 = 207;
 pub const SYS_SETSOCKOPT: u64 = 208;
 pub const SYS_GETSOCKOPT: u64 = 209;
 pub const SYS_SHUTDOWN: u64 = 210;
+pub const SYS_SENDMSG: u64 = 211;
+pub const SYS_RECVMSG: u64 = 212;
+pub const SYS_RECVMMSG: u64 = 243;
+pub const SYS_SENDMMSG: u64 = 269;
 
 // SysV IPC syscalls (shared memory, semaphores, message queues)
 pub const SYS_SHMGET: u64 = 194;
@@ -1407,6 +1412,36 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
 #[inline(always)]
 pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen: *mut u32) -> i64 {
     unsafe { syscall5!(SYS_GETSOCKOPT, fd, level, optname, optval, optlen) }
+}
+
+/// socketpair(domain, type, protocol, sv) - create a pair of connected sockets
+#[inline(always)]
+pub fn sys_socketpair(domain: i32, sock_type: i32, protocol: i32, sv: *mut [i32; 2]) -> i64 {
+    unsafe { syscall4!(SYS_SOCKETPAIR, domain, sock_type, protocol, sv) }
+}
+
+/// sendmsg(fd, msg, flags) - send a message on a socket
+#[inline(always)]
+pub fn sys_sendmsg(fd: i32, msg: *const super::MsgHdr, flags: i32) -> i64 {
+    unsafe { syscall3!(SYS_SENDMSG, fd, msg, flags) }
+}
+
+/// recvmsg(fd, msg, flags) - receive a message from a socket
+#[inline(always)]
+pub fn sys_recvmsg(fd: i32, msg: *mut super::MsgHdr, flags: i32) -> i64 {
+    unsafe { syscall3!(SYS_RECVMSG, fd, msg, flags) }
+}
+
+/// sendmmsg(fd, msgvec, vlen, flags) - send multiple messages
+#[inline(always)]
+pub fn sys_sendmmsg(fd: i32, msgvec: *mut super::MMsgHdr, vlen: u32, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_SENDMMSG, fd, msgvec, vlen, flags) }
+}
+
+/// recvmmsg(fd, msgvec, vlen, flags, timeout) - receive multiple messages
+#[inline(always)]
+pub fn sys_recvmmsg(fd: i32, msgvec: *mut super::MMsgHdr, vlen: u32, flags: i32, timeout: *const Timespec) -> i64 {
+    unsafe { syscall5!(SYS_RECVMMSG, fd, msgvec, vlen, flags, timeout) }
 }
 
 // ============================================================================

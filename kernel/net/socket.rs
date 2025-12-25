@@ -4,6 +4,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use spin::Mutex;
@@ -134,6 +135,10 @@ pub struct Socket {
     /// TCP control block (for SOCK_STREAM)
     pub tcp: Option<TcpSock>,
 
+    /// Datagram receive queue (for SOCK_DGRAM)
+    /// Each entry: (source_addr, source_port, data)
+    pub(super) dgram_rx_queue: Mutex<VecDeque<(Ipv4Addr, u16, Vec<u8>)>>,
+
     /// Wait queue for readers
     pub(super) rx_wait: WaitQueue,
 
@@ -169,6 +174,7 @@ impl Socket {
             rx_buffer: Mutex::new(VecDeque::with_capacity(DEFAULT_RCVBUF)),
             rx_buffer_limit: DEFAULT_RCVBUF,
             tcp,
+            dgram_rx_queue: Mutex::new(VecDeque::new()),
             rx_wait: WaitQueue::new(),
             tx_wait: WaitQueue::new(),
             connect_wait: WaitQueue::new(),
@@ -294,6 +300,58 @@ impl Socket {
                 rx.push_back(byte);
             }
         }
+    }
+
+    /// Deliver a datagram to the receive queue (called by UDP)
+    pub fn deliver_datagram(&self, src_addr: Ipv4Addr, src_port: u16, data: &[u8]) {
+        let mut queue = self.dgram_rx_queue.lock();
+        // Limit queue depth (max 64 datagrams)
+        if queue.len() < 64 {
+            queue.push_back((src_addr, src_port, data.to_vec()));
+        }
+    }
+
+    /// Read a datagram from the receive queue (for UDP)
+    ///
+    /// Returns (bytes_read, source_addr, source_port)
+    pub fn read_datagram(&self, buf: &mut [u8]) -> Result<(usize, Ipv4Addr, u16), i32> {
+        loop {
+            // Check for error
+            let err = self.error.load(Ordering::Acquire);
+            if err != 0 {
+                return Err(err);
+            }
+
+            // Try to read a datagram
+            {
+                let mut queue = self.dgram_rx_queue.lock();
+                if let Some((src_addr, src_port, data)) = queue.pop_front() {
+                    let n = buf.len().min(data.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    return Ok((n, src_addr, src_port));
+                }
+            }
+
+            // Check for EOF
+            if self.is_eof() {
+                return Ok((0, Ipv4Addr::new(0, 0, 0, 0), 0));
+            }
+
+            // Non-blocking?
+            if self.is_nonblocking() {
+                return Err(-crate::net::libc::EAGAIN);
+            }
+
+            // Block
+            self.rx_wait.wait();
+        }
+    }
+
+    /// Check if datagram is available for reading
+    pub fn poll_read_dgram(&self) -> bool {
+        !self.dgram_rx_queue.lock().is_empty()
+            || self.is_eof()
+            || self.error.load(Ordering::Acquire) != 0
     }
 
     /// Wake readers

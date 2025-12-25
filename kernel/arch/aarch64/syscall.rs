@@ -295,6 +295,8 @@ pub const SYS_PRLIMIT64: u64 = 261;
 // Socket syscalls (aarch64 numbers)
 /// socket(domain, type, protocol)
 pub const SYS_SOCKET: u64 = 198;
+/// socketpair(domain, type, protocol, sv)
+pub const SYS_SOCKETPAIR: u64 = 199;
 /// bind(fd, addr, addrlen)
 pub const SYS_BIND: u64 = 200;
 /// listen(fd, backlog)
@@ -317,8 +319,16 @@ pub const SYS_SETSOCKOPT: u64 = 208;
 pub const SYS_GETSOCKOPT: u64 = 209;
 /// shutdown(fd, how)
 pub const SYS_SHUTDOWN: u64 = 210;
+/// sendmsg(fd, msg, flags)
+pub const SYS_SENDMSG: u64 = 211;
+/// recvmsg(fd, msg, flags)
+pub const SYS_RECVMSG: u64 = 212;
 /// accept4(fd, addr, addrlen, flags)
 pub const SYS_ACCEPT4: u64 = 242;
+/// recvmmsg(fd, msgvec, vlen, flags, timeout)
+pub const SYS_RECVMMSG: u64 = 243;
+/// sendmmsg(fd, msgvec, vlen, flags)
+pub const SYS_SENDMMSG: u64 = 269;
 
 // Futex syscalls (aarch64 numbers)
 /// futex(uaddr, futex_op, val, timeout, uaddr2, val3)
@@ -874,6 +884,26 @@ pub fn aarch64_syscall_dispatch(
         SYS_RECVFROM => {
             use crate::net::syscall::sys_recvfrom;
             sys_recvfrom(arg0 as i32, arg1, arg2, arg3 as i32, arg4, arg5) as u64
+        }
+        SYS_SOCKETPAIR => {
+            use crate::net::syscall::sys_socketpair;
+            sys_socketpair(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64
+        }
+        SYS_SENDMSG => {
+            use crate::net::syscall::sys_sendmsg;
+            sys_sendmsg(arg0 as i32, arg1, arg2 as i32) as u64
+        }
+        SYS_RECVMSG => {
+            use crate::net::syscall::sys_recvmsg;
+            sys_recvmsg(arg0 as i32, arg1, arg2 as i32) as u64
+        }
+        SYS_SENDMMSG => {
+            use crate::net::syscall::sys_sendmmsg;
+            sys_sendmmsg(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64
+        }
+        SYS_RECVMMSG => {
+            use crate::net::syscall::sys_recvmmsg;
+            sys_recvmmsg(arg0 as i32, arg1, arg2 as u32, arg3 as i32, arg4) as u64
         }
 
         // Futex syscalls

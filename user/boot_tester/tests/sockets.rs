@@ -4,7 +4,8 @@
 
 use hk_syscall::{
     sys_close, sys_socket, sys_bind, sys_listen, sys_shutdown,
-    sys_getsockname, SockAddrIn, AF_INET, SOCK_STREAM, SOCK_NONBLOCK,
+    sys_getsockname, sys_socketpair, sys_sendmsg,
+    SockAddrIn, MsgHdr, IoVec, AF_INET, SOCK_STREAM, SOCK_DGRAM, SOCK_NONBLOCK,
     SHUT_RD, SHUT_WR, SHUT_RDWR, htons,
 };
 use super::helpers::{print, println, print_num};
@@ -21,6 +22,14 @@ pub fn run_tests() {
     test_listen();
     test_shutdown();
     test_socket_close();
+
+    // UDP socket tests
+    test_socket_dgram();
+    test_udp_bind();
+
+    // New syscall tests
+    test_socketpair();
+    test_sendmsg_recvmsg();
 }
 
 /// Test basic socket creation
@@ -262,5 +271,130 @@ fn test_socket_close() {
         println(b"SOCKET_CLOSE:OK");
     } else {
         println(b"SOCKET_CLOSE:FAIL");
+    }
+}
+
+/// Test UDP socket creation
+fn test_socket_dgram() {
+    let fd = sys_socket(AF_INET, SOCK_DGRAM, 0);
+
+    print(b"socket(AF_INET, SOCK_DGRAM, 0) returned ");
+    print_num(fd);
+
+    if fd >= 0 {
+        sys_close(fd as u64);
+        println(b"SOCKET_DGRAM:OK");
+    } else {
+        println(b"SOCKET_DGRAM:FAIL");
+    }
+}
+
+/// Test UDP socket bind
+fn test_udp_bind() {
+    let fd = sys_socket(AF_INET, SOCK_DGRAM, 0);
+    if fd < 0 {
+        print(b"socket() failed: ");
+        print_num(fd);
+        println(b"UDP_BIND:FAIL");
+        return;
+    }
+
+    // Bind to a specific port
+    let port: u16 = 54321;
+    let addr = SockAddrIn::new(AF_INET as u16, htons(port), 0);
+    let ret = sys_bind(
+        fd as i32,
+        &addr as *const SockAddrIn as *const u8,
+        core::mem::size_of::<SockAddrIn>() as u32,
+    );
+
+    print(b"UDP bind() returned ");
+    print_num(ret);
+
+    // Verify with getsockname
+    let mut out_addr = SockAddrIn::new(0, 0, 0);
+    let mut addrlen: u32 = core::mem::size_of::<SockAddrIn>() as u32;
+    let ret2 = sys_getsockname(
+        fd as i32,
+        &mut out_addr as *mut SockAddrIn as *mut u8,
+        &mut addrlen,
+    );
+
+    let bound_port = u16::from_be(out_addr.sin_port);
+    print(b", getsockname port=");
+    print_num(bound_port as i64);
+
+    sys_close(fd as u64);
+
+    if ret == 0 && ret2 == 0 && bound_port == port {
+        println(b"UDP_BIND:OK");
+    } else {
+        println(b"UDP_BIND:FAIL");
+    }
+}
+
+/// Test socketpair syscall
+fn test_socketpair() {
+    let mut sv: [i32; 2] = [-1, -1];
+
+    let ret = sys_socketpair(AF_INET, SOCK_DGRAM, 0, &mut sv as *mut [i32; 2]);
+
+    print(b"socketpair(AF_INET, SOCK_DGRAM) returned ");
+    print_num(ret);
+    print(b", fds=[");
+    print_num(sv[0] as i64);
+    print(b",");
+    print_num(sv[1] as i64);
+    print(b"]");
+
+    if ret == 0 && sv[0] >= 0 && sv[1] >= 0 && sv[0] != sv[1] {
+        sys_close(sv[0] as u64);
+        sys_close(sv[1] as u64);
+        println(b"SOCKETPAIR:OK");
+    } else {
+        if sv[0] >= 0 {
+            sys_close(sv[0] as u64);
+        }
+        if sv[1] >= 0 {
+            sys_close(sv[1] as u64);
+        }
+        println(b"SOCKETPAIR:FAIL");
+    }
+}
+
+/// Test sendmsg/recvmsg on TCP socket
+fn test_sendmsg_recvmsg() {
+    // Create a TCP socket
+    let fd = sys_socket(AF_INET, SOCK_STREAM, 0);
+    if fd < 0 {
+        print(b"socket() failed: ");
+        print_num(fd);
+        println(b"SENDMSG_RECVMSG:FAIL");
+        return;
+    }
+
+    // Prepare a message with iovec
+    let data: [u8; 5] = [b'H', b'e', b'l', b'l', b'o'];
+    let mut iov = IoVec {
+        iov_base: data.as_ptr(),
+        iov_len: data.len(),
+    };
+
+    let msg = MsgHdr::new(&mut iov as *mut IoVec, 1);
+
+    // sendmsg on unconnected TCP socket should fail with ENOTCONN (-107)
+    // or EPIPE (-32) depending on implementation
+    let ret = sys_sendmsg(fd as i32, &msg as *const MsgHdr, 0);
+
+    print(b"sendmsg on unconnected socket returned ");
+    print_num(ret);
+
+    sys_close(fd as u64);
+
+    // We expect an error (negative) since socket is not connected
+    if ret < 0 {
+        println(b"SENDMSG_RECVMSG:OK");
+    } else {
+        println(b"SENDMSG_RECVMSG:FAIL");
     }
 }

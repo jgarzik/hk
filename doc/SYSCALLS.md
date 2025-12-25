@@ -280,7 +280,7 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 Linux groups the socket syscalls as their own "network" category.
 
 - [x] socket
-- [ ] socketpair
+- [x] socketpair
 - [x] bind
 - [x] listen
 - [x] accept
@@ -292,10 +292,10 @@ Linux groups the socket syscalls as their own "network" category.
 - [x] setsockopt
 - [x] sendto
 - [x] recvfrom
-- [ ] sendmsg
-- [ ] recvmsg
-- [ ] sendmmsg
-- [ ] recvmmsg
+- [x] sendmsg
+- [x] recvmsg
+- [x] sendmmsg
+- [x] recvmmsg
 - [x] shutdown
 
 9. Polling & event notification

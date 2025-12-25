@@ -185,11 +185,14 @@ pub const SYS_SOCKET: u64 = 41;
 pub const SYS_CONNECT: u64 = 42;
 pub const SYS_SENDTO: u64 = 44;
 pub const SYS_RECVFROM: u64 = 45;
+pub const SYS_SENDMSG: u64 = 46;
+pub const SYS_RECVMSG: u64 = 47;
 pub const SYS_SHUTDOWN: u64 = 48;
 pub const SYS_BIND: u64 = 49;
 pub const SYS_LISTEN: u64 = 50;
 pub const SYS_GETSOCKNAME: u64 = 51;
 pub const SYS_GETPEERNAME: u64 = 52;
+pub const SYS_SOCKETPAIR: u64 = 53;
 pub const SYS_SETSOCKOPT: u64 = 54;
 pub const SYS_GETSOCKOPT: u64 = 55;
 pub const SYS_CLONE: u64 = 56;
@@ -319,8 +322,10 @@ pub const SYS_PREADV: u64 = 295;
 pub const SYS_PWRITEV: u64 = 296;
 pub const SYS_PREADV2: u64 = 327;
 pub const SYS_PWRITEV2: u64 = 328;
+pub const SYS_RECVMMSG: u64 = 299;
 pub const SYS_PRLIMIT64: u64 = 302;
 pub const SYS_SYNCFS: u64 = 306;
+pub const SYS_SENDMMSG: u64 = 307;
 pub const SYS_SETNS: u64 = 308;
 pub const SYS_GETCPU: u64 = 309;
 pub const SYS_GETRANDOM: u64 = 318;
@@ -1171,6 +1176,31 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optl
 #[inline(always)]
 pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen: *mut u32) -> i64 {
     unsafe { syscall5!(SYS_GETSOCKOPT, fd, level, optname, optval, optlen) }
+}
+
+#[inline(always)]
+pub fn sys_socketpair(domain: i32, sock_type: i32, protocol: i32, sv: *mut [i32; 2]) -> i64 {
+    unsafe { syscall4!(SYS_SOCKETPAIR, domain, sock_type, protocol, sv) }
+}
+
+#[inline(always)]
+pub fn sys_sendmsg(fd: i32, msg: *const super::MsgHdr, flags: i32) -> i64 {
+    unsafe { syscall3!(SYS_SENDMSG, fd, msg, flags) }
+}
+
+#[inline(always)]
+pub fn sys_recvmsg(fd: i32, msg: *mut super::MsgHdr, flags: i32) -> i64 {
+    unsafe { syscall3!(SYS_RECVMSG, fd, msg, flags) }
+}
+
+#[inline(always)]
+pub fn sys_sendmmsg(fd: i32, msgvec: *mut super::MMsgHdr, vlen: u32, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_SENDMMSG, fd, msgvec, vlen, flags) }
+}
+
+#[inline(always)]
+pub fn sys_recvmmsg(fd: i32, msgvec: *mut super::MMsgHdr, vlen: u32, flags: i32, timeout: *const Timespec) -> i64 {
+    unsafe { syscall5!(SYS_RECVMMSG, fd, msgvec, vlen, flags, timeout) }
 }
 
 // --- SysV IPC: Shared Memory ---

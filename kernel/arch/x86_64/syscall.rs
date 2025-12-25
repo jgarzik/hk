@@ -455,6 +455,10 @@ pub const SYS_ACCEPT: u64 = 43;
 pub const SYS_SENDTO: u64 = 44;
 /// recvfrom(fd, buf, len, flags, src_addr, addrlen)
 pub const SYS_RECVFROM: u64 = 45;
+/// sendmsg(fd, msg, flags)
+pub const SYS_SENDMSG: u64 = 46;
+/// recvmsg(fd, msg, flags)
+pub const SYS_RECVMSG: u64 = 47;
 /// shutdown(fd, how)
 pub const SYS_SHUTDOWN: u64 = 48;
 /// bind(fd, addr, addrlen)
@@ -465,12 +469,18 @@ pub const SYS_LISTEN: u64 = 50;
 pub const SYS_GETSOCKNAME: u64 = 51;
 /// getpeername(fd, addr, addrlen)
 pub const SYS_GETPEERNAME: u64 = 52;
+/// socketpair(domain, type, protocol, sv)
+pub const SYS_SOCKETPAIR: u64 = 53;
 /// setsockopt(fd, level, optname, optval, optlen)
 pub const SYS_SETSOCKOPT: u64 = 54;
 /// getsockopt(fd, level, optname, optval, optlen)
 pub const SYS_GETSOCKOPT: u64 = 55;
 /// accept4(fd, addr, addrlen, flags)
 pub const SYS_ACCEPT4: u64 = 288;
+/// recvmmsg(fd, msgvec, vlen, flags, timeout)
+pub const SYS_RECVMMSG: u64 = 299;
+/// sendmmsg(fd, msgvec, vlen, flags)
+pub const SYS_SENDMMSG: u64 = 307;
 
 // Futex syscalls (Section 7.2)
 /// futex(uaddr, futex_op, val, timeout, uaddr2, val3)
@@ -1554,6 +1564,18 @@ pub fn x86_64_syscall_dispatch(
         }
         SYS_ACCEPT4 => {
             crate::net::syscall::sys_accept4(arg0 as i32, arg1, arg2, arg3 as i32) as u64
+        }
+        SYS_SOCKETPAIR => {
+            crate::net::syscall::sys_socketpair(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64
+        }
+        SYS_SENDMSG => crate::net::syscall::sys_sendmsg(arg0 as i32, arg1, arg2 as i32) as u64,
+        SYS_RECVMSG => crate::net::syscall::sys_recvmsg(arg0 as i32, arg1, arg2 as i32) as u64,
+        SYS_SENDMMSG => {
+            crate::net::syscall::sys_sendmmsg(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64
+        }
+        SYS_RECVMMSG => {
+            crate::net::syscall::sys_recvmmsg(arg0 as i32, arg1, arg2 as u32, arg3 as i32, arg4)
+                as u64
         }
 
         // Futex syscalls

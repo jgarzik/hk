@@ -29,6 +29,7 @@ use crate::net::ipv4::Ipv4Addr;
 use crate::net::route::Route;
 use crate::net::socket::Socket;
 use crate::net::tcp::TcpFourTuple;
+use crate::net::udp::UdpTwoTuple;
 
 // ARP types from arp.rs that we need
 use crate::net::arp::ArpEntry;
@@ -54,6 +55,9 @@ pub struct NetNamespace {
     /// TCP connection table (four-tuple -> socket)
     pub tcp_connections: RwLock<BTreeMap<TcpFourTuple, Arc<Socket>>>,
 
+    /// UDP socket table (two-tuple -> socket)
+    pub udp_sockets: RwLock<BTreeMap<UdpTwoTuple, Arc<Socket>>>,
+
     /// ARP cache entries indexed by IP address
     pub arp_entries: Mutex<BTreeMap<u32, ArpEntry>>,
 
@@ -75,6 +79,7 @@ impl NetNamespace {
             config: RwLock::new(None),
             routes: RwLock::new(Vec::new()),
             tcp_connections: RwLock::new(BTreeMap::new()),
+            udp_sockets: RwLock::new(BTreeMap::new()),
             arp_entries: Mutex::new(BTreeMap::new()),
             arp_pending: Mutex::new(BTreeMap::new()),
             next_port: AtomicU32::new(32768),
@@ -133,6 +138,37 @@ impl NetNamespace {
             self.next_port.store(32768, Ordering::Relaxed);
         }
         port as u16
+    }
+
+    // ========================================================================
+    // UDP socket management
+    // ========================================================================
+
+    /// Register a UDP socket in this namespace
+    pub fn udp_register(&self, tuple: UdpTwoTuple, socket: Arc<Socket>) {
+        self.udp_sockets.write().insert(tuple, socket);
+    }
+
+    /// Unregister a UDP socket from this namespace
+    pub fn udp_unregister(&self, tuple: &UdpTwoTuple) {
+        self.udp_sockets.write().remove(tuple);
+    }
+
+    /// Look up a UDP socket by port in this namespace
+    ///
+    /// For UDP, we only need to match by local port (and optionally local address).
+    /// This is simpler than TCP's four-tuple matching.
+    pub fn udp_lookup_by_port(&self, local_port: u16) -> Option<Arc<Socket>> {
+        let sockets = self.udp_sockets.read();
+
+        // First try to find exact match with any local address
+        for (tuple, socket) in sockets.iter() {
+            if tuple.local_port == local_port {
+                return Some(Arc::clone(socket));
+            }
+        }
+
+        None
     }
 
     // ========================================================================
@@ -274,6 +310,7 @@ impl Default for NetNamespace {
             config: RwLock::new(None),
             routes: RwLock::new(Vec::new()),
             tcp_connections: RwLock::new(BTreeMap::new()),
+            udp_sockets: RwLock::new(BTreeMap::new()),
             arp_entries: Mutex::new(BTreeMap::new()),
             arp_pending: Mutex::new(BTreeMap::new()),
             next_port: AtomicU32::new(32768),

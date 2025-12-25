@@ -571,6 +571,87 @@ pub const ECONNREFUSED: i64 = 111;
 pub const EINPROGRESS: i64 = 115;
 pub const ENOTCONN: i64 = 107;
 
+// ============================================================================
+// Message header structures for sendmsg/recvmsg
+// ============================================================================
+
+/// Message header for sendmsg/recvmsg (struct msghdr)
+#[repr(C)]
+pub struct MsgHdr {
+    /// Optional address
+    pub msg_name: *mut SockAddrIn,
+    /// Size of address
+    pub msg_namelen: u32,
+    /// Padding
+    _pad1: u32,
+    /// Scatter/gather array
+    pub msg_iov: *mut IoVec,
+    /// Number of elements in iov
+    pub msg_iovlen: usize,
+    /// Ancillary data
+    pub msg_control: *mut u8,
+    /// Ancillary data length
+    pub msg_controllen: usize,
+    /// Flags on received message
+    pub msg_flags: i32,
+    /// Padding
+    _pad2: i32,
+}
+
+impl MsgHdr {
+    /// Create a new MsgHdr with iovec
+    pub fn new(iov: *mut IoVec, iovlen: usize) -> Self {
+        Self {
+            msg_name: core::ptr::null_mut(),
+            msg_namelen: 0,
+            _pad1: 0,
+            msg_iov: iov,
+            msg_iovlen: iovlen,
+            msg_control: core::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+            _pad2: 0,
+        }
+    }
+
+    /// Create a MsgHdr with destination address (for UDP sendmsg)
+    pub fn with_addr(addr: *mut SockAddrIn, iov: *mut IoVec, iovlen: usize) -> Self {
+        Self {
+            msg_name: addr,
+            msg_namelen: core::mem::size_of::<SockAddrIn>() as u32,
+            _pad1: 0,
+            msg_iov: iov,
+            msg_iovlen: iovlen,
+            msg_control: core::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+            _pad2: 0,
+        }
+    }
+}
+
+/// Multi-message header for sendmmsg/recvmmsg (struct mmsghdr)
+#[repr(C)]
+pub struct MMsgHdr {
+    /// Message header
+    pub msg_hdr: MsgHdr,
+    /// Number of bytes transmitted/received
+    pub msg_len: u32,
+    /// Padding
+    _pad: u32,
+}
+
+impl MMsgHdr {
+    /// Create a new MMsgHdr
+    pub fn new(hdr: MsgHdr) -> Self {
+        Self {
+            msg_hdr: hdr,
+            msg_len: 0,
+            _pad: 0,
+        }
+    }
+}
+
 /// Convert host byte order to network byte order (big-endian) for u16
 #[inline]
 pub const fn htons(val: u16) -> u16 {
