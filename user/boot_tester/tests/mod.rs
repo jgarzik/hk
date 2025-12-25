@@ -27,6 +27,7 @@ pub mod eventfd;
 pub mod epoll;
 pub mod signalfd;
 pub mod prctl;
+pub mod inotify;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -53,4 +54,5 @@ pub fn run_all_tests() {
     epoll::run_tests();
     signalfd::run_tests();
     prctl::run_tests();
+    inotify::run_tests();
 }

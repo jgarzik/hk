@@ -1826,3 +1826,33 @@ pub fn sys_capget(hdrp: *mut CapUserHeader, datap: *mut CapUserData) -> i64 {
 pub fn sys_capset(hdrp: *const CapUserHeader, datap: *const CapUserData) -> i64 {
     unsafe { syscall2!(SYS_CAPSET, hdrp, datap) }
 }
+
+// ============================================================================
+// Inotify
+// NOTE: aarch64 only has inotify_init1, not legacy inotify_init
+// ============================================================================
+
+/// inotify_init1(flags) - syscall number
+pub const SYS_INOTIFY_INIT1: u64 = 26;
+/// inotify_add_watch(fd, pathname, mask) - syscall number
+pub const SYS_INOTIFY_ADD_WATCH: u64 = 27;
+/// inotify_rm_watch(fd, wd) - syscall number
+pub const SYS_INOTIFY_RM_WATCH: u64 = 28;
+
+/// inotify_init1(flags) - create inotify instance with flags
+#[inline(always)]
+pub fn sys_inotify_init1(flags: i32) -> i64 {
+    unsafe { syscall1!(SYS_INOTIFY_INIT1, flags) }
+}
+
+/// inotify_add_watch(fd, pathname, mask) - add watch to inotify instance
+#[inline(always)]
+pub fn sys_inotify_add_watch(fd: i32, pathname: *const u8, mask: u32) -> i64 {
+    unsafe { syscall3!(SYS_INOTIFY_ADD_WATCH, fd, pathname, mask) }
+}
+
+/// inotify_rm_watch(fd, wd) - remove watch from inotify instance
+#[inline(always)]
+pub fn sys_inotify_rm_watch(fd: i32, wd: i32) -> i64 {
+    unsafe { syscall2!(SYS_INOTIFY_RM_WATCH, fd, wd) }
+}

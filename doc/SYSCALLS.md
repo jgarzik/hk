@@ -313,10 +313,10 @@ Linux groups the socket syscalls as their own "network" category.
 
 9.2 Inotify & fanotify (fs events)
 
-- [ ] inotify_init
-- [ ] inotify_init1
-- [ ] inotify_add_watch
-- [ ] inotify_rm_watch
+- [x] inotify_init
+- [x] inotify_init1
+- [x] inotify_add_watch
+- [x] inotify_rm_watch
 - [ ] fanotify_init
 - [ ] fanotify_mark
 

@@ -147,6 +147,14 @@ pub const SYS_EVENTFD2: u64 = 19;
 /// signalfd4(fd, mask, sizemask, flags)
 pub const SYS_SIGNALFD4: u64 = 74;
 
+// inotify syscalls (Section 9.2) - NOTE: aarch64 only has inotify_init1, not legacy inotify_init
+/// inotify_init1(flags)
+pub const SYS_INOTIFY_INIT1: u64 = 26;
+/// inotify_add_watch(fd, pathname, mask)
+pub const SYS_INOTIFY_ADD_WATCH: u64 = 27;
+/// inotify_rm_watch(fd, wd)
+pub const SYS_INOTIFY_RM_WATCH: u64 = 28;
+
 // epoll syscalls (Section 9.1) - NOTE: aarch64 only has epoll_create1, not legacy epoll_create
 /// epoll_create1(flags)
 pub const SYS_EPOLL_CREATE1: u64 = 20;
@@ -671,6 +679,13 @@ pub fn aarch64_syscall_dispatch(
         SYS_SIGNALFD4 => {
             crate::signal::syscall::sys_signalfd4(arg0 as i32, arg1, arg2, arg3 as i32) as u64
         }
+
+        // inotify syscalls (Section 9.2)
+        SYS_INOTIFY_INIT1 => crate::inotify::sys_inotify_init1(arg0 as i32) as u64,
+        SYS_INOTIFY_ADD_WATCH => {
+            crate::inotify::sys_inotify_add_watch(arg0 as i32, arg1, arg2 as u32) as u64
+        }
+        SYS_INOTIFY_RM_WATCH => crate::inotify::sys_inotify_rm_watch(arg0 as i32, arg1 as i32) as u64,
 
         // epoll syscalls (Section 9.1)
         SYS_EPOLL_CREATE1 => crate::epoll::sys_epoll_create1(arg0 as i32) as u64,

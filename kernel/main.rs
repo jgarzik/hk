@@ -16,6 +16,7 @@ pub mod elf;
 pub mod epoll;
 pub mod eventfd;
 pub mod futex;
+pub mod inotify;
 pub mod pipe;
 pub mod poll;
 pub mod posix_timer;

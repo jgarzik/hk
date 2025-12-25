@@ -1413,3 +1413,91 @@ pub const EPOLLEXCLUSIVE: u32 = 1 << 28;
 // epoll_create1 flags
 /// Set close-on-exec flag on the new file descriptor
 pub const EPOLL_CLOEXEC: i32 = 0o2000000;
+
+// ============================================================================
+// Inotify constants
+// ============================================================================
+
+// inotify_init1 flags
+/// Set close-on-exec flag on the new file descriptor
+pub const IN_CLOEXEC: i32 = 0o2000000;
+/// Set non-blocking flag on the new file descriptor
+pub const IN_NONBLOCK: i32 = 0o4000;
+
+// inotify event mask bits (watch events)
+/// File was accessed
+pub const IN_ACCESS: u32 = 0x00000001;
+/// File was modified
+pub const IN_MODIFY: u32 = 0x00000002;
+/// Metadata changed
+pub const IN_ATTRIB: u32 = 0x00000004;
+/// Writable file was closed
+pub const IN_CLOSE_WRITE: u32 = 0x00000008;
+/// Unwritable file closed
+pub const IN_CLOSE_NOWRITE: u32 = 0x00000010;
+/// File was opened
+pub const IN_OPEN: u32 = 0x00000020;
+/// File was moved from X
+pub const IN_MOVED_FROM: u32 = 0x00000040;
+/// File was moved to Y
+pub const IN_MOVED_TO: u32 = 0x00000080;
+/// Subfile was created
+pub const IN_CREATE: u32 = 0x00000100;
+/// Subfile was deleted
+pub const IN_DELETE: u32 = 0x00000200;
+/// Self was deleted
+pub const IN_DELETE_SELF: u32 = 0x00000400;
+/// Self was moved
+pub const IN_MOVE_SELF: u32 = 0x00000800;
+
+// Helper masks
+/// Close (both write and nowrite)
+pub const IN_CLOSE: u32 = IN_CLOSE_WRITE | IN_CLOSE_NOWRITE;
+/// Move (both from and to)
+pub const IN_MOVE: u32 = IN_MOVED_FROM | IN_MOVED_TO;
+/// All events user can watch for
+pub const IN_ALL_EVENTS: u32 = IN_ACCESS | IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE
+    | IN_CLOSE_NOWRITE | IN_OPEN | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE
+    | IN_CREATE | IN_DELETE_SELF | IN_MOVE_SELF;
+
+// Events sent by the kernel
+/// Backing fs was unmounted
+pub const IN_UNMOUNT: u32 = 0x00002000;
+/// Event queue overflowed
+pub const IN_Q_OVERFLOW: u32 = 0x00004000;
+/// File was ignored (watch removed)
+pub const IN_IGNORED: u32 = 0x00008000;
+
+// inotify_add_watch flags
+/// Only watch if path is directory
+pub const IN_ONLYDIR: u32 = 0x01000000;
+/// Don't follow symlink
+pub const IN_DONT_FOLLOW: u32 = 0x02000000;
+/// Exclude events on unlinked objects
+pub const IN_EXCL_UNLINK: u32 = 0x04000000;
+/// Only create watches (error if exists)
+pub const IN_MASK_CREATE: u32 = 0x10000000;
+/// Add to mask of existing watch
+pub const IN_MASK_ADD: u32 = 0x20000000;
+/// Event occurred against directory
+pub const IN_ISDIR: u32 = 0x40000000;
+/// Only send event once
+pub const IN_ONESHOT: u32 = 0x80000000;
+
+/// Inotify event header structure (Linux ABI)
+///
+/// The event header is followed by `len` bytes of null-terminated filename
+/// (if len > 0). The filename is padded to a multiple of the struct size.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InotifyEvent {
+    /// Watch descriptor
+    pub wd: i32,
+    /// Watch mask / event type
+    pub mask: u32,
+    /// Cookie for rename synchronization
+    pub cookie: u32,
+    /// Length of name (including nulls)
+    pub len: u32,
+    // Followed by name bytes
+}
