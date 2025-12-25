@@ -18,6 +18,7 @@ const CACHE_LINE_SIZE: usize = 64;
 /// visible to devices that read from RAM directly.
 ///
 /// Uses DC CVAC (Clean by Virtual Address to Point of Coherency).
+#[allow(dead_code)]
 #[inline(always)]
 fn dc_cvac(addr: u64) {
     unsafe {
@@ -72,6 +73,10 @@ pub fn cache_clean_range(addr: *const u8, len: usize) {
 
     let mut current = start;
     while current < end {
+        // Use CVAC (clean only) - writes dirty cache lines back to memory.
+        // Do NOT use CIVAC (clean+invalidate) here because invalidation affects
+        // ALL virtual addresses mapping the same physical page, which can corrupt
+        // other processes' cached data (e.g., parent's rodata after child execve).
         dc_cvac(current as u64);
         current += CACHE_LINE_SIZE;
     }

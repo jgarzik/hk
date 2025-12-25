@@ -945,6 +945,20 @@ fn kmain() -> ! {
     // (because 'call' would push an 8-byte return address). Since we're entering via IRET
     // not CALL, we need to subtract 8 from the stack top to maintain ABI alignment.
     let user_sp = user_stack_top - 8;
+
+    // ARM64: Final cache flush barrier before jumping to user mode.
+    // The ELF segments were cache-flushed earlier, but between then and now
+    // we've done a lot of kernel operations. This ensures all cache operations
+    // are truly visible before the ERET to user mode.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "dsb sy", // Full system data synchronization barrier
+            "isb",    // Instruction synchronization barrier
+            options(nostack, preserves_flags)
+        );
+    }
+
     unsafe {
         CurrentArch::jump_to_user(entry_point, user_sp, page_table_root, kernel_stack);
     }

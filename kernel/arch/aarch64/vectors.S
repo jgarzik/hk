@@ -251,6 +251,14 @@ el1_irq_handler:
 el0_sync_handler:
     SAVE_CONTEXT 1      // use_sp_el0=1: save user stack pointer
 
+    // Memory barrier to ensure all user memory accesses are visible
+    // This is critical for correct user memory access during syscalls
+    // DSB ISH: ensure all prior memory accesses complete
+    // ISB: ensure pipeline is flushed and subsequent instructions see
+    //      the effects of any page table updates
+    dsb     ish
+    isb
+
     // x0 = pointer to trap frame
     mov     x0, sp
     // x1 = ESR_EL1 (exception syndrome)
@@ -258,6 +266,18 @@ el0_sync_handler:
 
     // Call Rust handler: handle_el0_sync(frame: *mut TrapFrame, esr: u64)
     bl      handle_el0_sync
+
+    // Memory barrier before returning to user mode to ensure all
+    // kernel memory updates are visible.
+    // This is critical for ARM memory ordering correctness.
+    dsb     ish
+
+    // TLB invalidate for address 0 to act as a stronger barrier.
+    // Linux does this for ARM64_WORKAROUND_SPECULATIVE_UNPRIV_LOAD.
+    // This ensures any speculative loads from user space see correct data.
+    tlbi    vale1, xzr
+    dsb     nsh
+    isb
 
     RESTORE_CONTEXT 1   // use_sp_el0=1: restore user stack pointer
     eret

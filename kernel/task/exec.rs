@@ -312,6 +312,20 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
         string_ptr += (env.len() + 1) as u64;
     }
 
+    // ARM64: Flush data cache for all stack pages we just wrote.
+    // The kernel writes via phys_to_virt (kernel VA) but user reads via
+    // user VA - ARM requires cache flush for coherency across different VAs.
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::arch::aarch64::cache;
+        for i in 0..stack_pages {
+            let va = stack_bottom + (i as u64 * PAGE_SIZE);
+            if let Some(phys) = page_table.translate(va) {
+                cache::cache_clean_range(phys_to_virt(phys) as *const u8, PAGE_SIZE as usize);
+            }
+        }
+    }
+
     Ok(sp)
 }
 
@@ -397,6 +411,17 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
                 }
             }
 
+            // ARM64: Flush data cache for the frame we just wrote.
+            // ARM's D-cache is not coherent across different virtual addresses
+            // to the same physical memory. The kernel writes via identity-mapped
+            // kernel VA, but user reads via user VA - these may have separate
+            // cache entries. We must clean the D-cache to ensure user sees the data.
+            #[cfg(target_arch = "aarch64")]
+            {
+                use crate::arch::aarch64::cache;
+                cache::cache_clean_range(frame as *const u8, PAGE_SIZE as usize);
+            }
+
             // Map the page
             page_table
                 .map_with_alloc(va, frame, flags, frame_alloc)
@@ -419,6 +444,13 @@ fn apply_relocations(elf: &ElfExecutable<u64>, base_addr: u64, page_table: &Arch
             unsafe {
                 let ptr = phys_to_virt(phys) as *mut u64;
                 core::ptr::write_volatile(ptr, value);
+
+                // ARM64: Clean the cache line for this relocation write
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use crate::arch::aarch64::cache;
+                    cache::cache_clean_range(ptr as *const u8, 8);
+                }
             }
         }
     }
@@ -508,7 +540,26 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     };
 
     // Copy kernel mappings to the new page table
-    new_page_table.copy_kernel_mappings();
+    #[cfg(target_arch = "aarch64")]
+    {
+        // ARM64: Use dedicated L1 table like fork does, to avoid sharing L1
+        // table with parent which can cause TLB coherency issues.
+        // When we do tlbi vmalle1is (global TLB invalidate), if we share the L1
+        // table with the parent process, the TLB flush affects mappings that the
+        // parent is still using, causing the parent's cached data to become stale.
+        if new_page_table
+            .copy_kernel_mappings_with_alloc(frame_alloc)
+            .is_err()
+        {
+            return -ENOMEM;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // x86-64: Sharing PML4[0] is safe because x86 has hardware-coherent caches
+        // and doesn't have ARM's cache maintenance requirements.
+        new_page_table.copy_kernel_mappings();
+    }
 
     // Load ELF segments and get the end address for brk initialization
     let segments_end =

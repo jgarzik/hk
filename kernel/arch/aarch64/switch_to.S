@@ -46,7 +46,8 @@ __switch_to_asm:
     /* Switch to new user page table */
     msr     ttbr0_el1, x3
     tlbi    vmalle1is               // Invalidate TLB for EL1
-    dsb     ish                     // Ensure TLB invalidation completes
+    ic      iallu                   // Invalidate instruction cache
+    dsb     sy                      // Full system barrier (stronger than ish)
     isb                             // Synchronize context
 
     /* Restore callee-saved registers from next context */
@@ -77,7 +78,8 @@ __switch_to_asm_first:
     /* Switch to new user page table */
     msr     ttbr0_el1, x2
     tlbi    vmalle1is               // Invalidate TLB
-    dsb     ish
+    ic      iallu                   // Invalidate instruction cache
+    dsb     sy                      // Full system barrier
     isb
 
     /* Restore callee-saved registers from next context */

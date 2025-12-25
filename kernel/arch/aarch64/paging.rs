@@ -830,9 +830,16 @@ impl Aarch64PageTable {
                             let src_phys = l3_entry.addr();
                             let new_frame = frame_alloc.alloc_frame().ok_or(-12i32)?; // ENOMEM
 
-                            // Copy page contents
-                            core::ptr::copy_nonoverlapping(
-                                phys_to_virt(src_phys) as *const u8,
+                            // Copy page contents using volatile to avoid any optimization issues
+                            let src_ptr = phys_to_virt(src_phys) as *const u64;
+                            let dst_ptr = phys_to_virt(new_frame) as *mut u64;
+                            for i in 0..(PAGE_SIZE as usize / 8) {
+                                let val = core::ptr::read_volatile(src_ptr.add(i));
+                                core::ptr::write_volatile(dst_ptr.add(i), val);
+                            }
+
+                            // Clean the new frame's cache to ensure child sees correct data
+                            crate::arch::aarch64::cache::cache_clean_range(
                                 phys_to_virt(new_frame),
                                 PAGE_SIZE as usize,
                             );
