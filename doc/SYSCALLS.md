@@ -202,8 +202,8 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [ ] rt_sigqueueinfo
 - [ ] rt_sigsuspend
 - [ ] sigaltstack
-- [ ] signalfd
-- [ ] signalfd4
+- [x] signalfd
+- [x] signalfd4
 - [x] tgkill (targeted kill by tid)
 - [x] kill
 - [x] tkill (legacy)

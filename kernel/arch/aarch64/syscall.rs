@@ -143,6 +143,10 @@ pub const SYS_TIMERFD_GETTIME: u64 = 87;
 /// eventfd2(initval, flags) - NOTE: aarch64 only has eventfd2, not legacy eventfd
 pub const SYS_EVENTFD2: u64 = 19;
 
+// signalfd syscalls (Section 5) - NOTE: aarch64 only has signalfd4, not legacy signalfd
+/// signalfd4(fd, mask, sizemask, flags)
+pub const SYS_SIGNALFD4: u64 = 74;
+
 // epoll syscalls (Section 9.1) - NOTE: aarch64 only has epoll_create1, not legacy epoll_create
 /// epoll_create1(flags)
 pub const SYS_EPOLL_CREATE1: u64 = 20;
@@ -661,10 +665,20 @@ pub fn aarch64_syscall_dispatch(
         SYS_TIMERFD_GETTIME => sys_timerfd_gettime(arg0 as i32, arg1) as u64,
         SYS_EVENTFD2 => sys_eventfd2(arg0 as u32, arg1 as i32) as u64,
 
+        // signalfd syscalls (Section 5)
+        SYS_SIGNALFD4 => {
+            crate::signal::syscall::sys_signalfd4(arg0 as i32, arg1, arg2, arg3 as i32) as u64
+        }
+
         // epoll syscalls (Section 9.1)
         SYS_EPOLL_CREATE1 => crate::epoll::sys_epoll_create1(arg0 as i32) as u64,
-        SYS_EPOLL_CTL => crate::epoll::sys_epoll_ctl(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64,
-        SYS_EPOLL_PWAIT => crate::epoll::sys_epoll_pwait(arg0 as i32, arg1, arg2 as i32, arg3 as i32, arg4, arg5) as u64,
+        SYS_EPOLL_CTL => {
+            crate::epoll::sys_epoll_ctl(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64
+        }
+        SYS_EPOLL_PWAIT => {
+            crate::epoll::sys_epoll_pwait(arg0 as i32, arg1, arg2 as i32, arg3 as i32, arg4, arg5)
+                as u64
+        }
 
         // POSIX timer syscalls (Section 6.2)
         SYS_TIMER_CREATE => crate::posix_timer::sys_timer_create(arg0 as i32, arg1, arg2) as u64,

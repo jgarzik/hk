@@ -721,6 +721,9 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
     // Set TIF_SIGPENDING flag
     set_tif_sigpending(tid);
 
+    // Wake any signalfds monitoring this signal
+    crate::signalfd::wake_signalfds_for_signal(tid, sig);
+
     0
 }
 

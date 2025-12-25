@@ -192,6 +192,10 @@ pub const SYS_CAPSET: u64 = 91;
 // NOTE: aarch64 only has eventfd2, not the legacy eventfd
 pub const SYS_EVENTFD2: u64 = 19;
 
+// signalfd syscalls (Section 5)
+// NOTE: aarch64 only has signalfd4, not the legacy signalfd
+pub const SYS_SIGNALFD4: u64 = 74;
+
 // epoll syscalls (Section 9.1) - NOTE: aarch64 only has epoll_create1, not legacy epoll_create
 pub const SYS_EPOLL_CREATE1: u64 = 20;
 pub const SYS_EPOLL_CTL: u64 = 21;
@@ -579,6 +583,15 @@ pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
 #[inline(always)]
 pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
     unsafe { syscall2!(SYS_EVENTFD2, initval, flags) }
+}
+
+// --- signalfd ---
+
+/// signalfd4(fd, mask, sizemask, flags) - create/update signalfd
+/// NOTE: aarch64 only has signalfd4, not the legacy signalfd
+#[inline(always)]
+pub fn sys_signalfd4(fd: i32, mask: *const u64, sizemask: usize, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_SIGNALFD4, fd, mask, sizemask, flags) }
 }
 
 // --- epoll ---

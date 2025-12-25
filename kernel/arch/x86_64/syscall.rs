@@ -139,6 +139,12 @@ pub const SYS_EVENTFD: u64 = 284;
 /// eventfd2(initval, flags)
 pub const SYS_EVENTFD2: u64 = 290;
 
+// signalfd syscalls (Section 5)
+/// signalfd(fd, mask, flags) - legacy
+pub const SYS_SIGNALFD: u64 = 282;
+/// signalfd4(fd, mask, sizemask, flags)
+pub const SYS_SIGNALFD4: u64 = 289;
+
 // epoll syscalls (Section 9.1)
 /// epoll_create(size)
 pub const SYS_EPOLL_CREATE: u64 = 213;
@@ -1175,12 +1181,25 @@ pub fn x86_64_syscall_dispatch(
         SYS_EVENTFD => sys_eventfd(arg0 as u32) as u64,
         SYS_EVENTFD2 => sys_eventfd2(arg0 as u32, arg1 as i32) as u64,
 
+        // signalfd syscalls (Section 5)
+        SYS_SIGNALFD => crate::signal::syscall::sys_signalfd(arg0 as i32, arg1, arg2 as i32) as u64,
+        SYS_SIGNALFD4 => {
+            crate::signal::syscall::sys_signalfd4(arg0 as i32, arg1, arg2, arg3 as i32) as u64
+        }
+
         // epoll syscalls (Section 9.1)
         SYS_EPOLL_CREATE => crate::epoll::sys_epoll_create(arg0 as i32) as u64,
         SYS_EPOLL_CREATE1 => crate::epoll::sys_epoll_create1(arg0 as i32) as u64,
-        SYS_EPOLL_CTL => crate::epoll::sys_epoll_ctl(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64,
-        SYS_EPOLL_WAIT => crate::epoll::sys_epoll_wait(arg0 as i32, arg1, arg2 as i32, arg3 as i32) as u64,
-        SYS_EPOLL_PWAIT => crate::epoll::sys_epoll_pwait(arg0 as i32, arg1, arg2 as i32, arg3 as i32, arg4, arg5) as u64,
+        SYS_EPOLL_CTL => {
+            crate::epoll::sys_epoll_ctl(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64
+        }
+        SYS_EPOLL_WAIT => {
+            crate::epoll::sys_epoll_wait(arg0 as i32, arg1, arg2 as i32, arg3 as i32) as u64
+        }
+        SYS_EPOLL_PWAIT => {
+            crate::epoll::sys_epoll_pwait(arg0 as i32, arg1, arg2 as i32, arg3 as i32, arg4, arg5)
+                as u64
+        }
 
         // POSIX timer syscalls (Section 6.2)
         SYS_TIMER_CREATE => crate::posix_timer::sys_timer_create(arg0 as i32, arg1, arg2) as u64,

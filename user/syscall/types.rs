@@ -934,6 +934,58 @@ pub const EFD_SEMAPHORE: i32 = 1;
 pub const EFD_CLOEXEC: i32 = 0o2000000;
 pub const EFD_NONBLOCK: i32 = 0o4000;
 
+/// signalfd flags
+pub const SFD_CLOEXEC: i32 = 0o2000000;
+pub const SFD_NONBLOCK: i32 = 0o4000;
+
+/// signalfd_siginfo structure - Linux ABI (128 bytes)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SignalfdSiginfo {
+    /// Signal number
+    pub ssi_signo: u32,
+    /// Error number
+    pub ssi_errno: i32,
+    /// Signal code
+    pub ssi_code: i32,
+    /// Sender's PID
+    pub ssi_pid: u32,
+    /// Sender's UID
+    pub ssi_uid: u32,
+    /// File descriptor (SIGIO)
+    pub ssi_fd: i32,
+    /// Sender's TID
+    pub ssi_tid: u32,
+    /// Band event (SIGIO)
+    pub ssi_band: u32,
+    /// POSIX timer overrun count
+    pub ssi_overrun: u32,
+    /// Trap number
+    pub ssi_trapno: u32,
+    /// Exit status/signal (SIGCHLD)
+    pub ssi_status: i32,
+    /// sigqueue() integer
+    pub ssi_int: i32,
+    /// sigqueue() pointer
+    pub ssi_ptr: u64,
+    /// User CPU time (SIGCHLD)
+    pub ssi_utime: u64,
+    /// System CPU time (SIGCHLD)
+    pub ssi_stime: u64,
+    /// Fault address
+    pub ssi_addr: u64,
+    /// LSB of address
+    pub ssi_addr_lsb: u16,
+    __pad2: u16,
+    /// System call number
+    pub ssi_syscall: i32,
+    /// Address of system call instruction
+    pub ssi_call_addr: u64,
+    /// Architecture
+    pub ssi_arch: u32,
+    __pad: [u8; 28],
+}
+
 // ============================================================================
 // POSIX timer types and constants (Section 6.2)
 // ============================================================================

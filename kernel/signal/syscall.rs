@@ -364,10 +364,99 @@ pub fn sys_sigaltstack(_ss_ptr: u64, _oss_ptr: u64) -> i64 {
     -38 // ENOSYS
 }
 
-/// signalfd/signalfd4 - create file descriptor for signals
+/// signalfd4(fd, mask, sizemask, flags) - create/update signalfd
 ///
-/// Not yet implemented - returns ENOSYS.
-#[allow(dead_code)]
-pub fn sys_signalfd(_fd: i32, _mask_ptr: u64, _flags: i32) -> i64 {
-    -38 // ENOSYS
+/// # Arguments
+/// * `fd` - -1 for new fd, or existing signalfd to update mask
+/// * `mask_ptr` - Pointer to signal mask (sigset_t)
+/// * `sizemask` - Size of signal mask (must be 8)
+/// * `flags` - SFD_CLOEXEC | SFD_NONBLOCK
+///
+/// # Returns
+/// fd on success, negative errno on error
+pub fn sys_signalfd4(fd: i32, mask_ptr: u64, sizemask: u64, flags: i32) -> i64 {
+    use crate::pipe::FD_CLOEXEC;
+    use crate::signalfd::{create_signalfd, get_signalfd, sfd_flags};
+    use crate::task::fdtable::get_task_fd;
+
+    // Validate sizemask
+    if sizemask != 8 {
+        return -22; // EINVAL
+    }
+
+    // Validate flags
+    let valid_flags = sfd_flags::SFD_CLOEXEC | sfd_flags::SFD_NONBLOCK;
+    if flags & !valid_flags != 0 {
+        return -22; // EINVAL
+    }
+
+    // Read mask from user space
+    let mask_bits = match get_user::<Uaccess, u64>(mask_ptr) {
+        Ok(v) => v,
+        Err(_) => return -14, // EFAULT
+    };
+    let mask = SigSet::from_bits(mask_bits);
+
+    if fd == -1 {
+        // Create new signalfd
+        let file = match create_signalfd(mask, flags) {
+            Ok(f) => f,
+            Err(_) => return -12, // ENOMEM
+        };
+
+        // Allocate fd and install file
+        let fd_table = match get_task_fd(current_tid()) {
+            Some(t) => t,
+            None => return -24, // EMFILE
+        };
+        let mut table = fd_table.lock();
+        let fd_flags = if flags & sfd_flags::SFD_CLOEXEC != 0 {
+            FD_CLOEXEC
+        } else {
+            0
+        };
+
+        // Get RLIMIT_NOFILE
+        let nofile_limit = {
+            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
+            if limit == crate::rlimit::RLIM_INFINITY {
+                u64::MAX
+            } else {
+                limit
+            }
+        };
+
+        match table.alloc_with_flags(file, fd_flags, nofile_limit) {
+            Ok(new_fd) => new_fd as i64,
+            Err(e) => -(e as i64),
+        }
+    } else {
+        // Update existing signalfd mask
+        let fd_table = match get_task_fd(current_tid()) {
+            Some(t) => t,
+            None => return -9, // EBADF
+        };
+
+        let file = match fd_table.lock().get(fd) {
+            Some(f) => f,
+            None => return -9, // EBADF
+        };
+
+        // Verify it's a signalfd
+        match get_signalfd(&file) {
+            Some(signalfd) => {
+                signalfd.update_mask(mask);
+                fd as i64
+            }
+            None => -22, // EINVAL - not a signalfd
+        }
+    }
+}
+
+/// signalfd(fd, mask, flags) - legacy signalfd (x86_64 only)
+///
+/// This is the legacy version without sizemask parameter.
+/// The mask size is assumed to be 8 bytes.
+pub fn sys_signalfd(fd: i32, mask_ptr: u64, flags: i32) -> i64 {
+    sys_signalfd4(fd, mask_ptr, 8, flags)
 }

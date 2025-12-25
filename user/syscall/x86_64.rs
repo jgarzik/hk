@@ -295,6 +295,10 @@ pub const SYS_TIMERFD_GETTIME: u64 = 287;
 pub const SYS_EVENTFD: u64 = 284;
 pub const SYS_EVENTFD2: u64 = 290;
 
+// signalfd syscalls (Section 5)
+pub const SYS_SIGNALFD: u64 = 282;
+pub const SYS_SIGNALFD4: u64 = 289;
+
 // epoll syscalls (Section 9.1)
 pub const SYS_EPOLL_CREATE: u64 = 213;
 pub const SYS_EPOLL_WAIT: u64 = 232;
@@ -827,6 +831,20 @@ pub fn sys_eventfd(initval: u32) -> i64 {
 #[inline(always)]
 pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
     unsafe { syscall2!(SYS_EVENTFD2, initval, flags) }
+}
+
+// --- signalfd ---
+
+/// signalfd(fd, mask, flags) - legacy signalfd (x86_64 only)
+#[inline(always)]
+pub fn sys_signalfd(fd: i32, mask: *const u64, flags: i32) -> i64 {
+    unsafe { syscall3!(SYS_SIGNALFD, fd, mask, flags) }
+}
+
+/// signalfd4(fd, mask, sizemask, flags) - create/update signalfd
+#[inline(always)]
+pub fn sys_signalfd4(fd: i32, mask: *const u64, sizemask: usize, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_SIGNALFD4, fd, mask, sizemask, flags) }
 }
 
 // --- epoll ---

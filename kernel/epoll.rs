@@ -34,15 +34,15 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{IrqSpinlock, Uaccess};
-use crate::fs::dentry::Dentry;
-use crate::fs::file::{flags, File, FileOps};
-use crate::fs::inode::{Inode, InodeMode, Timespec as InodeTimespec, NULL_INODE_OPS};
 use crate::fs::FsError;
+use crate::fs::dentry::Dentry;
+use crate::fs::file::{File, FileOps, flags};
+use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
 use crate::pipe::FD_CLOEXEC;
-use crate::poll::{PollTable, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDNORM, POLLWRNORM};
+use crate::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDNORM, POLLWRNORM, PollTable};
+use crate::task::Fd;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
-use crate::task::Fd;
 use crate::uaccess::{get_user, put_user};
 use crate::waitqueue::WaitQueue;
 
@@ -276,7 +276,8 @@ impl Eventpoll {
                     }
 
                     // Mask with requested events (but always report ERR/HUP)
-                    let masked = (ep_events & item.event.events) | (ep_events & (EPOLLERR | EPOLLHUP));
+                    let masked =
+                        (ep_events & item.event.events) | (ep_events & (EPOLLERR | EPOLLHUP));
 
                     if masked != 0 {
                         // Edge-triggered mode: only report if events changed

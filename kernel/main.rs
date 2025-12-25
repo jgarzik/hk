@@ -20,6 +20,7 @@ pub mod pipe;
 pub mod poll;
 pub mod posix_timer;
 pub mod printk;
+pub mod signalfd;
 pub mod storage;
 mod time;
 pub mod timer;
