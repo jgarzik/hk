@@ -4903,7 +4903,13 @@ pub fn sys_poll(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
 
     // Do the poll loop
     let mut ready_count;
-    let _timeout_remaining = timeout_ms; // For future timeout implementation
+
+    // Calculate timeout end time (in milliseconds)
+    let timeout_end = if timeout_ms < 0 {
+        u64::MAX // Infinite timeout
+    } else {
+        crate::time::current_ticks().saturating_add(timeout_ms as u64)
+    };
 
     loop {
         // Reset poll table for this iteration
@@ -4958,17 +4964,19 @@ pub fn sys_poll(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
             break;
         }
 
-        // TODO: Implement proper waiting with timeout
-        // For now, yield and retry a few times, then timeout
-        static mut POLL_ITERATIONS: u32 = 0;
-        unsafe {
-            POLL_ITERATIONS += 1;
-            if POLL_ITERATIONS > 100 || timeout_ms > 0 {
-                POLL_ITERATIONS = 0;
-                break;
-            }
-        }
+        // Wait for events with timeout
+        // Use a simple polling loop with yields until we have proper timed waits
+
+        // Yield to let other tasks run (e.g., child process can exit)
         crate::task::percpu::yield_now();
+
+        // Check if timeout has elapsed
+        let now = crate::time::current_ticks();
+        if now >= timeout_end {
+            break;
+        }
+
+        // Continue polling loop
     }
 
     // Copy results back to user space

@@ -431,6 +431,11 @@ fn test_sigqueueinfo() {
     // Queue the signal
     let ret = sys_rt_sigqueueinfo(pid, SIGUSR1, &info as *const SigInfo as u64);
 
+    // Consume the pending signal using sigtimedwait (with short timeout)
+    // This prevents the signal from remaining pending and interfering with later tests
+    let ts = [0i64, 0i64]; // Zero timeout
+    sys_rt_sigtimedwait(&mask as *const u64 as u64, 0, ts.as_ptr() as u64, 8);
+
     // Unblock SIGUSR1
     sys_rt_sigprocmask(SIG_UNBLOCK, &mask as *const u64 as u64, 0, 8);
 
@@ -473,6 +478,11 @@ fn test_tgsigqueueinfo() {
     sys_rt_sigprocmask(SIG_BLOCK, &mask as *const u64 as u64, 0, 8);
 
     let ret = sys_rt_tgsigqueueinfo(pid, tid, SIGUSR1, &info as *const SigInfo as u64);
+
+    // Consume the pending signal using sigtimedwait (with short timeout)
+    // This prevents the signal from remaining pending and interfering with later tests
+    let ts = [0i64, 0i64]; // Zero timeout
+    sys_rt_sigtimedwait(&mask as *const u64 as u64, 0, ts.as_ptr() as u64, 8);
 
     // Unblock
     sys_rt_sigprocmask(SIG_UNBLOCK, &mask as *const u64 as u64, 0, 8);
