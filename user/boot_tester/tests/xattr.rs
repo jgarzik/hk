@@ -28,6 +28,9 @@ const EBADF: i64 = -9;
 
 /// Run all xattr tests
 pub fn run_tests() {
+    // Create /tmp directory for test files (ignore error if exists)
+    let _ = sys_mkdir(b"/tmp\0".as_ptr(), 0o755);
+
     test_setxattr_getxattr();
     test_getxattr_enodata();
     test_setxattr_create_flag();
