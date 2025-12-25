@@ -16,7 +16,7 @@ use super::{
     MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC, MS_INVALIDATE, MS_SYNC, PAGE_SIZE,
     PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, VM_DONTCOPY, VM_DONTDUMP, VM_GROWSDOWN,
     VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_RAND_READ, VM_SEQ_READ, VM_SHARED, Vma,
-    create_default_mm, get_task_mm, init_task_mm,
+    anon_vma::AnonVma, create_default_mm, get_task_mm, init_task_mm,
 };
 
 // Error codes (negative errno)
@@ -164,7 +164,15 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     let mut vma = if let Some(f) = file {
         Vma::new_file(map_addr, map_addr + length, prot, flags, f, offset)
     } else {
-        Vma::new(map_addr, map_addr + length, prot, flags | MAP_ANONYMOUS)
+        // Anonymous mapping
+        let mut v = Vma::new(map_addr, map_addr + length, prot, flags | MAP_ANONYMOUS);
+        // Set up anon_vma for private anonymous mappings (for swap-out reverse mapping)
+        if is_private {
+            let anon_vma = AnonVma::new();
+            anon_vma.add_vma(tid, map_addr, map_addr + length);
+            v.set_anon_vma(anon_vma);
+        }
+        v
     };
 
     // Set VM_SHARED for shared mappings
@@ -294,10 +302,15 @@ pub fn sys_munmap(addr: u64, length: u64) -> i64 {
     // Remove VMAs in range
     let removed = mm_guard.remove_range(addr, end);
 
-    // Update total_vm for RLIMIT_AS tracking
+    // Update total_vm for RLIMIT_AS tracking and clean up anon_vma
     for vma in &removed {
         let pages = (vma.end - vma.start) / PAGE_SIZE;
         mm_guard.sub_total_vm(pages);
+
+        // Remove this VMA from its anon_vma (for reverse mapping cleanup)
+        if let Some(ref anon_vma) = vma.anon_vma {
+            anon_vma.remove_vma(tid, vma.start);
+        }
     }
 
     // Release lock before doing page table operations
@@ -314,7 +327,11 @@ pub fn sys_munmap(addr: u64, length: u64) -> i64 {
 /// Unmap pages for removed VMAs
 ///
 /// This handles the actual page table manipulation and frame freeing.
+/// Also updates page descriptors and LRU lists for swap support.
 fn unmap_vma_pages(vmas: &[Vma], unmap_start: u64, unmap_end: u64) {
+    use crate::mm::lru::lru_remove;
+    use crate::mm::rmap::page_remove_rmap;
+
     #[cfg(target_arch = "x86_64")]
     {
         use crate::FRAME_ALLOCATOR;
@@ -335,6 +352,11 @@ fn unmap_vma_pages(vmas: &[Vma], unmap_start: u64, unmap_end: u64) {
             while page < end {
                 // Try to unmap this page
                 if let Some(phys) = X86_64PageTable::unmap_page(cr3, page) {
+                    // Update page descriptor and LRU for anonymous pages
+                    if vma.is_anon_private() {
+                        page_remove_rmap(phys);
+                        lru_remove(phys);
+                    }
                     // Free the physical frame
                     FRAME_ALLOCATOR.decref(phys);
                 }
@@ -362,6 +384,11 @@ fn unmap_vma_pages(vmas: &[Vma], unmap_start: u64, unmap_end: u64) {
             let mut page = start;
             while page < end {
                 if let Some(phys) = Aarch64PageTable::unmap_page(pt_phys, page) {
+                    // Update page descriptor and LRU for anonymous pages
+                    if vma.is_anon_private() {
+                        page_remove_rmap(phys);
+                        lru_remove(phys);
+                    }
                     FRAME_ALLOCATOR.decref(phys);
                 }
                 page += PAGE_SIZE;

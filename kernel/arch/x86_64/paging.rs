@@ -608,6 +608,35 @@ const USER_END: u64 = 0x0000_8000_0000_0000; // 128TB
 /// Bit 9 is one of the "available" bits (9-11) that can be used by the OS
 pub const PAGE_COW: u64 = 1 << 9;
 
+// ============================================================================
+// Swap PTE helpers
+// ============================================================================
+
+use crate::mm::SwapEntry;
+
+/// Check if a PTE contains a swap entry (page swapped out)
+///
+/// A swap PTE has Present=0 but encodes swap device and offset information.
+#[inline]
+pub fn is_swap_pte(pte: u64) -> bool {
+    SwapEntry::is_swap_pte(pte)
+}
+
+/// Decode a swap entry from a PTE
+///
+/// # Safety
+/// Caller must ensure `is_swap_pte(pte)` returns true
+#[inline]
+pub fn pte_to_swap_entry(pte: u64) -> SwapEntry {
+    SwapEntry::from_pte(pte)
+}
+
+/// Encode a swap entry into a PTE value
+#[inline]
+pub fn swap_entry_to_pte(entry: SwapEntry) -> u64 {
+    entry.to_pte()
+}
+
 impl X86_64PageTable {
     /// Duplicate the entire user address space using Copy-on-Write (COW)
     ///

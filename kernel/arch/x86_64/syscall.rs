@@ -315,6 +315,12 @@ pub const SYS_MOUNT: u64 = 165;
 /// umount2(target, flags)
 pub const SYS_UMOUNT2: u64 = 166;
 
+// Swap management
+/// swapon(path, swapflags)
+pub const SYS_SWAPON: u64 = 167;
+/// swapoff(path)
+pub const SYS_SWAPOFF: u64 = 168;
+
 // Permissions and ownership (Section 3.2)
 /// chmod(pathname, mode)
 pub const SYS_CHMOD: u64 = 90;
@@ -1455,6 +1461,10 @@ pub fn x86_64_syscall_dispatch(
         // Filesystem mounting
         SYS_MOUNT => sys_mount(arg0, arg1, arg2, arg3, arg4) as u64,
         SYS_UMOUNT2 => sys_umount2(arg0, arg1 as i32) as u64,
+
+        // Swap management
+        SYS_SWAPON => crate::mm::sys_swapon(arg0, arg1 as i32) as u64,
+        SYS_SWAPOFF => crate::mm::sys_swapoff(arg0) as u64,
 
         // Sync operations
         SYS_SYNC => sys_sync() as u64,

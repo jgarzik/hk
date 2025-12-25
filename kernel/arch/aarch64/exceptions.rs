@@ -177,6 +177,11 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             let is_translation_fault = (0x04..=0x07).contains(&dfsc);
 
             if is_translation_fault {
+                // Try to handle as swap fault first (swapped-out page with swap entry in PTE)
+                if let Some(true) = handle_swap_fault(far) {
+                    return; // Swap-in successful, resume execution
+                }
+
                 // Try to handle as mmap demand fault
                 if let Some(true) = handle_mmap_fault(far, is_write) {
                     return; // Fault handled, resume execution
@@ -272,9 +277,11 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
     // Clone VMA info we need (release lock before allocating)
     let vma_prot = vma.prot;
     let vma_is_anonymous = vma.is_anonymous();
+    let vma_is_anon_private = vma.is_anon_private();
     let vma_file = vma.file.clone();
     let vma_start = vma.start;
     let vma_offset = vma.offset;
+    let vma_anon_vma = vma.anon_vma.clone();
     drop(mm_guard);
 
     // Allocate a physical frame
@@ -341,6 +348,17 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
         return Some(false);
     }
     // TLB is flushed by map_user_page
+
+    // Register anonymous page with LRU and page descriptors for swap support
+    if vma_is_anon_private {
+        use crate::mm::lru::lru_add_new;
+        use crate::mm::rmap::page_add_anon_rmap;
+
+        if let Some(ref anon_vma) = vma_anon_vma {
+            page_add_anon_rmap(frame, anon_vma, page_addr);
+        }
+        lru_add_new(frame);
+    }
 
     Some(true)
 }
@@ -471,4 +489,135 @@ pub fn unmap_user_page(ttbr0: u64, vaddr: u64) -> Option<u64> {
 
         Some(phys)
     }
+}
+
+/// Walk page tables and return pointer to L3 PTE, even for non-present entries
+///
+/// Returns (pte_pointer, pte_value) or None if page table walk fails at higher levels
+unsafe fn get_pte_for_swap(ttbr0: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
+    let l0_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let l1_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let l2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let l3_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+    // Table descriptor: bits [1:0] = 0b11
+    const TABLE_DESC: u64 = 0b11;
+
+    unsafe {
+        let l0 = ttbr0 as *const u64;
+
+        // L0 must be present
+        let l0_entry = *l0.add(l0_idx);
+        if (l0_entry & 0b11) != TABLE_DESC {
+            return None;
+        }
+
+        // L1 must be present
+        let l1 = (l0_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l1_entry = *l1.add(l1_idx);
+        if (l1_entry & 0b11) != TABLE_DESC {
+            return None;
+        }
+
+        // L2 must be present
+        let l2 = (l1_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l2_entry = *l2.add(l2_idx);
+        if (l2_entry & 0b11) != TABLE_DESC {
+            return None;
+        }
+
+        // L3 - return PTE regardless of present bit (for swap detection)
+        let l3 = (l2_entry & 0x0000_FFFF_FFFF_F000) as *mut u64;
+        let pte_ptr = l3.add(l3_idx);
+        let pte_value = *pte_ptr;
+
+        Some((pte_ptr, pte_value))
+    }
+}
+
+/// Handle a page fault for a swapped-out page
+///
+/// Detects swap entries in PTEs and performs swap-in:
+/// 1. Check if PTE contains a swap entry (non-present with swap marker)
+/// 2. Allocate a new physical frame
+/// 3. Read page data from swap device
+/// 4. Update PTE to point to the new frame
+/// 5. Free the swap slot
+///
+/// Returns:
+/// - Some(true) if the swap fault was handled successfully
+/// - Some(false) if swap-in failed (e.g., OOM, I/O error)
+/// - None if the PTE is not a swap entry
+fn handle_swap_fault(fault_addr: u64) -> Option<bool> {
+    use crate::arch::aarch64::paging::{AF, AP_EL0_RW, ATTR_IDX_NORMAL, SH_INNER};
+    use crate::mm::{SwapEntry, free_swap_entry, swap_cache_lookup, swap_read_page};
+
+    // Get current page table (TTBR0_EL1 for user space)
+    let ttbr0: u64;
+    unsafe {
+        asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nostack, nomem));
+    }
+    let pt_root = ttbr0 & !0xFFF;
+
+    // Get the PTE (including non-present entries)
+    let (pte_ptr, pte_value) = unsafe { get_pte_for_swap(pt_root, fault_addr)? };
+
+    // Check if this is a swap entry
+    if !SwapEntry::is_swap_pte(pte_value) {
+        return None; // Not a swap entry, let other handlers deal with it
+    }
+
+    let entry = SwapEntry::from_pte(pte_value);
+
+    // Step 1: Check swap cache first
+    if let Some(cached) = swap_cache_lookup(entry) {
+        let frame = cached.frame;
+
+        // L3 page descriptor attributes: [1:0] = 0b11
+        let attrs: u64 = 0b11 | AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL0_RW;
+        let new_pte = frame | attrs;
+
+        unsafe {
+            core::ptr::write_volatile(pte_ptr, new_pte);
+        }
+
+        // Flush TLB
+        crate::arch::aarch64::paging::flush_tlb(fault_addr);
+
+        return Some(true);
+    }
+
+    // Step 2: Allocate new frame
+    let frame = match crate::FRAME_ALLOCATOR.alloc() {
+        Some(f) => f,
+        None => {
+            printkln!("swap_fault: Out of memory!");
+            return Some(false);
+        }
+    };
+
+    // Step 3: Read from swap
+    if swap_read_page(entry, frame).is_err() {
+        // I/O error - free frame and fail
+        crate::FRAME_ALLOCATOR.free(frame);
+        printkln!("swap_fault: Swap I/O error!");
+        return Some(false);
+    }
+
+    // Step 4: Update PTE - clear swap entry, set present
+    // L3 page descriptor attributes: [1:0] = 0b11
+    let attrs: u64 = 0b11 | AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL0_RW;
+    let new_pte = frame | attrs;
+
+    unsafe {
+        core::ptr::write_volatile(pte_ptr, new_pte);
+    }
+
+    // Step 5: Flush TLB for this address
+    crate::arch::aarch64::paging::flush_tlb(fault_addr);
+
+    // Step 6: Free swap slot (page is now in RAM)
+    free_swap_entry(entry);
+
+    Some(true) // Swap-in successful
 }

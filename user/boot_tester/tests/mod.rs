@@ -30,6 +30,7 @@ pub mod prctl;
 pub mod inotify;
 pub mod clone3_syslog;
 pub mod pidfd;
+pub mod swap;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -59,4 +60,5 @@ pub fn run_all_tests() {
     inotify::run_tests();
     clone3_syslog::run_tests();
     pidfd::run_tests();
+    swap::run_tests();
 }

@@ -277,6 +277,8 @@ pub const SYS_SETRLIMIT: u64 = 160;
 pub const SYS_SYNC: u64 = 162;
 pub const SYS_MOUNT: u64 = 165;
 pub const SYS_UMOUNT2: u64 = 166;
+pub const SYS_SWAPON: u64 = 167;
+pub const SYS_SWAPOFF: u64 = 168;
 pub const SYS_REBOOT: u64 = 169;
 pub const SYS_SETHOSTNAME: u64 = 170;
 pub const SYS_SETDOMAINNAME: u64 = 171;
@@ -603,6 +605,18 @@ pub fn sys_mount(source: *const u8, target: *const u8, fstype: *const u8, flags:
 #[inline(always)]
 pub fn sys_umount2(target: *const u8, flags: u64) -> i64 {
     unsafe { syscall2!(SYS_UMOUNT2, target, flags) }
+}
+
+/// swapon(path, swapflags) - enable a swap device/file
+#[inline(always)]
+pub fn sys_swapon(path: *const u8, swapflags: i32) -> i64 {
+    unsafe { syscall2!(SYS_SWAPON, path, swapflags as u64) }
+}
+
+/// swapoff(path) - disable a swap device/file
+#[inline(always)]
+pub fn sys_swapoff(path: *const u8) -> i64 {
+    unsafe { syscall1!(SYS_SWAPOFF, path) }
 }
 
 #[inline(always)]
