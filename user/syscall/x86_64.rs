@@ -8,7 +8,7 @@
 //! - Return value in RAX
 //! - RCX and R11 are clobbered by the syscall instruction
 
-use crate::types::{FdSet, IoVec, MqAttr, PollFd, RLimit, SigInfo, SigEvent, Stat, Timespec, Timeval, UtsName};
+use crate::types::{EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigInfo, SigEvent, Stat, Timespec, Timeval, UtsName};
 
 // ============================================================================
 // Syscall helper macros
@@ -294,6 +294,13 @@ pub const SYS_TIMERFD_GETTIME: u64 = 287;
 // eventfd syscalls (Section 7.1)
 pub const SYS_EVENTFD: u64 = 284;
 pub const SYS_EVENTFD2: u64 = 290;
+
+// epoll syscalls (Section 9.1)
+pub const SYS_EPOLL_CREATE: u64 = 213;
+pub const SYS_EPOLL_WAIT: u64 = 232;
+pub const SYS_EPOLL_CTL: u64 = 233;
+pub const SYS_EPOLL_PWAIT: u64 = 281;
+pub const SYS_EPOLL_CREATE1: u64 = 291;
 
 // POSIX timer syscalls (Section 6.2)
 pub const SYS_TIMER_CREATE: u64 = 222;
@@ -820,6 +827,45 @@ pub fn sys_eventfd(initval: u32) -> i64 {
 #[inline(always)]
 pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
     unsafe { syscall2!(SYS_EVENTFD2, initval, flags) }
+}
+
+// --- epoll ---
+
+/// epoll_create(size) - create an epoll instance (size is ignored but must be > 0)
+#[inline(always)]
+pub fn sys_epoll_create(size: i32) -> i64 {
+    unsafe { syscall1!(SYS_EPOLL_CREATE, size) }
+}
+
+/// epoll_create1(flags) - create an epoll instance with flags (EPOLL_CLOEXEC)
+#[inline(always)]
+pub fn sys_epoll_create1(flags: i32) -> i64 {
+    unsafe { syscall1!(SYS_EPOLL_CREATE1, flags) }
+}
+
+/// epoll_ctl(epfd, op, fd, event) - control an epoll instance
+#[inline(always)]
+pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEvent) -> i64 {
+    unsafe { syscall4!(SYS_EPOLL_CTL, epfd, op, fd, event) }
+}
+
+/// epoll_wait(epfd, events, maxevents, timeout) - wait for events
+#[inline(always)]
+pub fn sys_epoll_wait(epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32) -> i64 {
+    unsafe { syscall4!(SYS_EPOLL_WAIT, epfd, events, maxevents, timeout) }
+}
+
+/// epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize) - wait with signal mask
+#[inline(always)]
+pub fn sys_epoll_pwait(
+    epfd: i32,
+    events: *mut EpollEvent,
+    maxevents: i32,
+    timeout: i32,
+    sigmask: *const u64,
+    sigsetsize: usize,
+) -> i64 {
+    unsafe { syscall6!(SYS_EPOLL_PWAIT, epfd, events, maxevents, timeout, sigmask, sigsetsize) }
 }
 
 // --- POSIX Timers ---

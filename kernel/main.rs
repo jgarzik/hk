@@ -13,6 +13,7 @@ pub mod chardev;
 pub mod console;
 pub mod dma;
 pub mod elf;
+pub mod epoll;
 pub mod eventfd;
 pub mod futex;
 pub mod pipe;

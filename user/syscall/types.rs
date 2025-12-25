@@ -1259,3 +1259,86 @@ pub const CAP_BPF: u32 = 39;
 pub const CAP_CHECKPOINT_RESTORE: u32 = 40;
 /// Last valid capability number
 pub const CAP_LAST_CAP: u32 = 40;
+
+// ============================================================================
+// epoll types and constants
+// ============================================================================
+
+/// epoll_event structure (Linux ABI)
+///
+/// Note: This is packed to match Linux's x86-64 ABI where the structure
+/// is 12 bytes (not 16). The data field is a union in Linux but we use u64.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct EpollEvent {
+    /// Event mask (EPOLLIN, EPOLLOUT, etc.)
+    pub events: u32,
+    /// User data (passed back unchanged)
+    pub data: u64,
+}
+
+impl EpollEvent {
+    /// Create a new epoll_event
+    pub const fn new(events: u32, data: u64) -> Self {
+        Self { events, data }
+    }
+
+    /// Create an empty epoll_event
+    pub const fn empty() -> Self {
+        Self { events: 0, data: 0 }
+    }
+}
+
+impl Default for EpollEvent {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+// epoll_ctl operations
+/// Add a file descriptor to the epoll interest list
+pub const EPOLL_CTL_ADD: i32 = 1;
+/// Remove a file descriptor from the epoll interest list
+pub const EPOLL_CTL_DEL: i32 = 2;
+/// Modify the event mask for an existing file descriptor
+pub const EPOLL_CTL_MOD: i32 = 3;
+
+// epoll event masks (input - what to monitor)
+/// Data available for reading
+pub const EPOLLIN: u32 = 0x001;
+/// Urgent/priority data available
+pub const EPOLLPRI: u32 = 0x002;
+/// Ready for writing
+pub const EPOLLOUT: u32 = 0x004;
+/// Normal data readable (same as POLLIN for most cases)
+pub const EPOLLRDNORM: u32 = 0x040;
+/// Priority band data readable
+pub const EPOLLRDBAND: u32 = 0x080;
+/// Normal data writable
+pub const EPOLLWRNORM: u32 = 0x100;
+/// Priority band data writable
+pub const EPOLLWRBAND: u32 = 0x200;
+/// Message available
+pub const EPOLLMSG: u32 = 0x400;
+/// Remote peer closed connection or shut down writing half
+pub const EPOLLRDHUP: u32 = 0x2000;
+
+// epoll event masks (output only - always reported)
+/// Error condition
+pub const EPOLLERR: u32 = 0x008;
+/// Hang up / EOF
+pub const EPOLLHUP: u32 = 0x010;
+
+// epoll behavior modifiers
+/// Edge-triggered mode (only notify once per state change)
+pub const EPOLLET: u32 = 1 << 31;
+/// One-shot mode (disable after first event, require EPOLL_CTL_MOD to re-arm)
+pub const EPOLLONESHOT: u32 = 1 << 30;
+/// Wake up system even during suspend
+pub const EPOLLWAKEUP: u32 = 1 << 29;
+/// Exclusive wakeup (for load balancing with multiple epoll waiters)
+pub const EPOLLEXCLUSIVE: u32 = 1 << 28;
+
+// epoll_create1 flags
+/// Set close-on-exec flag on the new file descriptor
+pub const EPOLL_CLOEXEC: i32 = 0o2000000;

@@ -304,11 +304,11 @@ Linux groups the socket syscalls as their own "network" category.
 - [x] pselect6
 - [x] poll
 - [x] ppoll
-- [ ] epoll_create
-- [ ] epoll_create1
-- [ ] epoll_ctl
-- [ ] epoll_wait
-- [ ] epoll_pwait
+- [x] epoll_create
+- [x] epoll_create1
+- [x] epoll_ctl
+- [x] epoll_wait
+- [x] epoll_pwait
 - [ ] epoll_pwait2 (newer)
 
 9.2 Inotify & fanotify (fs events)

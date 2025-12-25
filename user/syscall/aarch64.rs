@@ -19,7 +19,7 @@
 //!   - No `chmod`, `chown`, `lchown` - use *at variants
 //!   - No `truncate` - use ftruncate with openat
 
-use crate::types::{FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Stat, Timespec, Timeval, UtsName, AT_FDCWD};
+use crate::types::{EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Stat, Timespec, Timeval, UtsName, AT_FDCWD};
 
 // ============================================================================
 // Syscall macros for aarch64
@@ -191,6 +191,11 @@ pub const SYS_CAPSET: u64 = 91;
 // eventfd syscalls (Section 7.1)
 // NOTE: aarch64 only has eventfd2, not the legacy eventfd
 pub const SYS_EVENTFD2: u64 = 19;
+
+// epoll syscalls (Section 9.1) - NOTE: aarch64 only has epoll_create1, not legacy epoll_create
+pub const SYS_EPOLL_CREATE1: u64 = 20;
+pub const SYS_EPOLL_CTL: u64 = 21;
+pub const SYS_EPOLL_PWAIT: u64 = 22;
 
 // POSIX timer syscalls (Section 6.2)
 pub const SYS_TIMER_CREATE: u64 = 107;
@@ -574,6 +579,52 @@ pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
 #[inline(always)]
 pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
     unsafe { syscall2!(SYS_EVENTFD2, initval, flags) }
+}
+
+// --- epoll ---
+// NOTE: aarch64 only has epoll_create1, epoll_ctl, and epoll_pwait
+// We provide compatibility wrappers for epoll_create and epoll_wait
+
+/// epoll_create(size) - create an epoll instance
+/// On aarch64, this is implemented via epoll_create1(0)
+#[inline(always)]
+pub fn sys_epoll_create(size: i32) -> i64 {
+    if size <= 0 {
+        return -22; // EINVAL
+    }
+    sys_epoll_create1(0)
+}
+
+/// epoll_create1(flags) - create an epoll instance with flags (EPOLL_CLOEXEC)
+#[inline(always)]
+pub fn sys_epoll_create1(flags: i32) -> i64 {
+    unsafe { syscall1!(SYS_EPOLL_CREATE1, flags) }
+}
+
+/// epoll_ctl(epfd, op, fd, event) - control an epoll instance
+#[inline(always)]
+pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEvent) -> i64 {
+    unsafe { syscall4!(SYS_EPOLL_CTL, epfd, op, fd, event) }
+}
+
+/// epoll_wait(epfd, events, maxevents, timeout) - wait for events
+/// On aarch64, this is implemented via epoll_pwait with null sigmask
+#[inline(always)]
+pub fn sys_epoll_wait(epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32) -> i64 {
+    sys_epoll_pwait(epfd, events, maxevents, timeout, core::ptr::null(), 0)
+}
+
+/// epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize) - wait with signal mask
+#[inline(always)]
+pub fn sys_epoll_pwait(
+    epfd: i32,
+    events: *mut EpollEvent,
+    maxevents: i32,
+    timeout: i32,
+    sigmask: *const u64,
+    sigsetsize: usize,
+) -> i64 {
+    unsafe { syscall6!(SYS_EPOLL_PWAIT, epfd, events, maxevents, timeout, sigmask, sigsetsize) }
 }
 
 // --- POSIX Timers ---

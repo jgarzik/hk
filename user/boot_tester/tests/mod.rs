@@ -24,6 +24,7 @@ pub mod xattr;
 pub mod mqueue;
 pub mod capabilities;
 pub mod eventfd;
+pub mod epoll;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -47,4 +48,5 @@ pub fn run_all_tests() {
     mqueue::run_tests();
     capabilities::run_tests();
     eventfd::run_tests();
+    epoll::run_tests();
 }
