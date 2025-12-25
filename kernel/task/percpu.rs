@@ -581,11 +581,22 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
 
 /// Mark a task as zombie with exit status
 pub fn mark_zombie(tid: Tid, status: i32) {
-    let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.state = TaskState::Zombie(status);
-        // Release cached pages
-        task.release_cached_pages();
+    let pid: Option<Pid>;
+    {
+        let mut table = TASK_TABLE.lock();
+        if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+            task.state = TaskState::Zombie(status);
+            // Release cached pages
+            task.release_cached_pages();
+            pid = Some(task.pid);
+        } else {
+            pid = None;
+        }
+    }
+
+    // Notify any pidfds watching this process (after releasing TASK_TABLE lock)
+    if let Some(p) = pid {
+        crate::pidfd::notify_process_exit(p, status);
     }
 }
 
@@ -686,6 +697,8 @@ pub struct CloneConfig {
     pub child_tidptr: u64,
     /// TLS pointer for child (CLONE_SETTLS)
     pub tls: u64,
+    /// User address to store pidfd (CLONE_PIDFD)
+    pub pidfd_ptr: u64,
 }
 
 /// Create a new thread/process via clone()
@@ -1075,6 +1088,50 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         register_vfork_child(child_tid);
         // Wait for child to signal completion (via exec or exit)
         wait_for_vfork(child_tid);
+    }
+
+    // Handle CLONE_PIDFD: create a pidfd for the child and write it to parent's address space
+    if config.flags & CLONE_PIDFD != 0 && config.pidfd_ptr != 0 {
+        use crate::arch::Uaccess;
+        use crate::uaccess::put_user;
+
+        // Create pidfd for the child
+        let pidfd_file = match crate::pidfd::create_pidfd(child_pid, 0) {
+            Ok(file) => file,
+            Err(_) => {
+                // Pidfd creation failed - this is not critical, just don't set it
+                // Return success anyway as the child is already created
+                return Ok(return_value);
+            }
+        };
+
+        // Allocate FD in parent's FD table
+        let fd_table = match crate::task::fdtable::get_task_fd(current_tid) {
+            Some(table) => table,
+            None => return Ok(return_value), // No FD table - shouldn't happen
+        };
+
+        // Get NOFILE limit
+        let nofile = {
+            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
+            if limit == crate::rlimit::RLIM_INFINITY {
+                u64::MAX
+            } else {
+                limit
+            }
+        };
+
+        let pidfd_num = {
+            let mut table = fd_table.lock();
+            // Allocate with O_CLOEXEC by default for pidfds
+            match table.alloc_with_flags(pidfd_file, crate::task::FD_CLOEXEC, nofile) {
+                Ok(fd) => fd,
+                Err(_) => return Ok(return_value), // FD allocation failed
+            }
+        };
+
+        // Write the pidfd number to parent's address space
+        let _ = put_user::<Uaccess, i32>(config.pidfd_ptr, pidfd_num as i32);
     }
 
     // Return value depends on CLONE_THREAD flag:

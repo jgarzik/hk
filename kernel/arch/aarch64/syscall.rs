@@ -390,6 +390,14 @@ pub const SYS_PERSONALITY: u64 = 92;
 /// syslog(type, buf, len) - Read/control kernel message ring buffer
 pub const SYS_SYSLOG: u64 = 116;
 
+// pidfd syscalls
+/// pidfd_send_signal(pidfd, sig, info, flags) - Send signal to process via pidfd
+pub const SYS_PIDFD_SEND_SIGNAL: u64 = 424;
+/// pidfd_open(pid, flags) - Obtain file descriptor for process
+pub const SYS_PIDFD_OPEN: u64 = 434;
+/// pidfd_getfd(pidfd, targetfd, flags) - Get file descriptor from another process
+pub const SYS_PIDFD_GETFD: u64 = 438;
+
 // SysV IPC syscalls (aarch64 numbers)
 /// msgget(key, msgflg)
 pub const SYS_MSGGET: u64 = 186;
@@ -766,6 +774,20 @@ pub fn aarch64_syscall_dispatch(
             use crate::arch::Uaccess;
             use crate::task::syscall::sys_syslog;
             sys_syslog::<Uaccess>(arg0 as i32, arg1, arg2 as i32) as u64
+        }
+
+        // pidfd syscalls
+        SYS_PIDFD_OPEN => {
+            use crate::task::syscall::sys_pidfd_open;
+            sys_pidfd_open(arg0 as i64, arg1 as u32) as u64
+        }
+        SYS_PIDFD_SEND_SIGNAL => {
+            use crate::task::syscall::sys_pidfd_send_signal;
+            sys_pidfd_send_signal(arg0 as i32, arg1 as i32, arg2, arg3 as u32) as u64
+        }
+        SYS_PIDFD_GETFD => {
+            use crate::task::syscall::sys_pidfd_getfd;
+            sys_pidfd_getfd(arg0 as i32, arg1 as i32, arg2 as u32) as u64
         }
 
         // Power management

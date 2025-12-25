@@ -236,13 +236,16 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] timerfd_settime
 - [x] timerfd_gettime
 
-7. IPC: pipes, futex, SysV IPC, POSIX MQ
+7. IPC: pipes, futex, SysV IPC, POSIX MQ, pidfd
 7.1 Pipes & simple IPC
 
 - [x] pipe
 - [x] pipe2
 - [x] eventfd
 - [x] eventfd2
+- [x] pidfd_open
+- [x] pidfd_send_signal
+- [ ] pidfd_getfd (stub - requires PTRACE capabilities)
 
 7.2 Futex (core for modern libs/threads)
 

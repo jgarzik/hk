@@ -165,6 +165,22 @@ pub enum ProcfsInodeData {
     ///
     /// Can be opened and passed to setns(2) to join a namespace.
     NamespaceFile { pid: Pid, ns_type: NamespaceType },
+    /// Per-PID fd directory (/proc/<pid>/fd)
+    ///
+    /// Contains symlinks to open file descriptors.
+    PidFdDirectory { pid: Pid },
+    /// Per-PID fdinfo directory (/proc/<pid>/fdinfo)
+    ///
+    /// Contains files with information about open file descriptors.
+    PidFdinfoDirectory { pid: Pid },
+    /// Fd symlink (/proc/<pid>/fd/<n>)
+    ///
+    /// Symlink to the open file descriptor.
+    FdSymlink { pid: Pid, fd: i32 },
+    /// Fdinfo file (/proc/<pid>/fdinfo/<n>)
+    ///
+    /// File containing information about an open file descriptor.
+    FdinfoFile { pid: Pid, fd: i32 },
 }
 
 impl ProcfsInodeData {
@@ -193,6 +209,26 @@ impl ProcfsInodeData {
     /// Create namespace file data
     pub fn new_ns_file(pid: Pid, ns_type: NamespaceType) -> Self {
         Self::NamespaceFile { pid, ns_type }
+    }
+
+    /// Create per-PID fd directory data
+    pub fn new_pid_fd_dir(pid: Pid) -> Self {
+        Self::PidFdDirectory { pid }
+    }
+
+    /// Create per-PID fdinfo directory data
+    pub fn new_pid_fdinfo_dir(pid: Pid) -> Self {
+        Self::PidFdinfoDirectory { pid }
+    }
+
+    /// Create fd symlink data
+    pub fn new_fd_symlink(pid: Pid, fd: i32) -> Self {
+        Self::FdSymlink { pid, fd }
+    }
+
+    /// Create fdinfo file data
+    pub fn new_fdinfo_file(pid: Pid, fd: i32) -> Self {
+        Self::FdinfoFile { pid, fd }
     }
 
     /// Get children map (for static directories)
@@ -224,7 +260,11 @@ impl ProcfsInodeData {
         match self {
             Self::PidDirectory { pid }
             | Self::PidNsDirectory { pid }
-            | Self::NamespaceFile { pid, .. } => Some(*pid),
+            | Self::NamespaceFile { pid, .. }
+            | Self::PidFdDirectory { pid }
+            | Self::PidFdinfoDirectory { pid }
+            | Self::FdSymlink { pid, .. }
+            | Self::FdinfoFile { pid, .. } => Some(*pid),
             _ => None,
         }
     }
@@ -241,7 +281,11 @@ impl ProcfsInodeData {
     pub fn is_directory(&self) -> bool {
         matches!(
             self,
-            Self::Directory { .. } | Self::PidDirectory { .. } | Self::PidNsDirectory { .. }
+            Self::Directory { .. }
+                | Self::PidDirectory { .. }
+                | Self::PidNsDirectory { .. }
+                | Self::PidFdDirectory { .. }
+                | Self::PidFdinfoDirectory { .. }
         )
     }
 }
@@ -307,9 +351,18 @@ impl InodeOps for ProcfsInodeOps {
                 // Handle /proc/<pid>/ns/* lookups
                 lookup_pid_ns_entry(dir, *pid, name)
             }
-            ProcfsInodeData::File { .. } | ProcfsInodeData::NamespaceFile { .. } => {
-                Err(FsError::NotADirectory)
+            ProcfsInodeData::PidFdDirectory { pid } => {
+                // Handle /proc/<pid>/fd/* lookups
+                lookup_pid_fd_entry(dir, *pid, name)
             }
+            ProcfsInodeData::PidFdinfoDirectory { pid } => {
+                // Handle /proc/<pid>/fdinfo/* lookups
+                lookup_pid_fdinfo_entry(dir, *pid, name)
+            }
+            ProcfsInodeData::File { .. }
+            | ProcfsInodeData::NamespaceFile { .. }
+            | ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::FdinfoFile { .. } => Err(FsError::NotADirectory),
         }
     }
 
@@ -332,9 +385,16 @@ impl InodeOps for ProcfsInodeOps {
                 // Format matches Linux: "ns:[<inode>]" but we use a simpler format
                 gen_namespace_content(*pid, *ns_type)
             }
+            ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
+            ProcfsInodeData::FdSymlink { .. } => {
+                // Symlinks don't have content, readlink() handles them
+                return Err(FsError::IoError);
+            }
             ProcfsInodeData::Directory { .. }
             | ProcfsInodeData::PidDirectory { .. }
-            | ProcfsInodeData::PidNsDirectory { .. } => return Err(FsError::IsADirectory),
+            | ProcfsInodeData::PidNsDirectory { .. }
+            | ProcfsInodeData::PidFdDirectory { .. }
+            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(FsError::IsADirectory),
         };
 
         let page_size = buf.len();
@@ -406,6 +466,42 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, FsE
             ))));
             Ok(inode)
         }
+        "fd" => {
+            // Create /proc/<pid>/fd directory
+            let sb = dir.superblock().ok_or(FsError::IoError)?;
+            let inode = Arc::new(Inode::new(
+                pid_ino(pid, 100),           // offset 100 for fd dir
+                InodeMode::directory(0o500), // dr-x------ (only owner can read)
+                0,
+                0,
+                0,
+                current_time(),
+                Arc::downgrade(&sb),
+                &PROCFS_INODE_OPS,
+            ));
+            inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+                ProcfsInodeData::new_pid_fd_dir(pid),
+            ))));
+            Ok(inode)
+        }
+        "fdinfo" => {
+            // Create /proc/<pid>/fdinfo directory
+            let sb = dir.superblock().ok_or(FsError::IoError)?;
+            let inode = Arc::new(Inode::new(
+                pid_ino(pid, 101),           // offset 101 for fdinfo dir
+                InodeMode::directory(0o500), // dr-x------ (only owner can read)
+                0,
+                0,
+                0,
+                current_time(),
+                Arc::downgrade(&sb),
+                &PROCFS_INODE_OPS,
+            ));
+            inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+                ProcfsInodeData::new_pid_fdinfo_dir(pid),
+            ))));
+            Ok(inode)
+        }
         // Future: add "status", "cmdline", "maps", etc.
         _ => Err(FsError::NotFound),
     }
@@ -448,6 +544,139 @@ fn lookup_pid_ns_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, 
     Ok(inode)
 }
 
+/// Look up entries in /proc/<pid>/fd/
+fn lookup_pid_fd_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, FsError> {
+    // Verify the task still exists
+    if !task_exists(pid) {
+        return Err(FsError::NotFound);
+    }
+
+    // Parse fd number from name
+    let fd: i32 = name.parse().map_err(|_| FsError::NotFound)?;
+    if fd < 0 {
+        return Err(FsError::NotFound);
+    }
+
+    // Verify the FD exists for this task
+    let tid = get_tid_for_pid(pid).ok_or(FsError::NotFound)?;
+    let fd_exists = {
+        if let Some(table_arc) = crate::task::fdtable::get_task_fd(tid) {
+            let table = table_arc.lock();
+            table.get(fd).is_some()
+        } else {
+            false
+        }
+    };
+    if !fd_exists {
+        return Err(FsError::NotFound);
+    }
+
+    // Create symlink inode for /proc/<pid>/fd/<n>
+    let sb = dir.superblock().ok_or(FsError::IoError)?;
+    let inode = Arc::new(Inode::new(
+        pid_ino(pid, 200 + fd as u64), // offset 200+ for fd symlinks
+        InodeMode::symlink(),          // lrwxrwxrwx
+        0,
+        0,
+        0,
+        current_time(),
+        Arc::downgrade(&sb),
+        &PROCFS_INODE_OPS,
+    ));
+    inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+        ProcfsInodeData::new_fd_symlink(pid, fd),
+    ))));
+    Ok(inode)
+}
+
+/// Look up entries in /proc/<pid>/fdinfo/
+fn lookup_pid_fdinfo_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, FsError> {
+    // Verify the task still exists
+    if !task_exists(pid) {
+        return Err(FsError::NotFound);
+    }
+
+    // Parse fd number from name
+    let fd: i32 = name.parse().map_err(|_| FsError::NotFound)?;
+    if fd < 0 {
+        return Err(FsError::NotFound);
+    }
+
+    // Verify the FD exists for this task
+    let tid = get_tid_for_pid(pid).ok_or(FsError::NotFound)?;
+    let fd_exists = {
+        if let Some(table_arc) = crate::task::fdtable::get_task_fd(tid) {
+            let table = table_arc.lock();
+            table.get(fd).is_some()
+        } else {
+            false
+        }
+    };
+    if !fd_exists {
+        return Err(FsError::NotFound);
+    }
+
+    // Create regular file inode for /proc/<pid>/fdinfo/<n>
+    let sb = dir.superblock().ok_or(FsError::IoError)?;
+    let inode = Arc::new(Inode::new(
+        pid_ino(pid, 500 + fd as u64), // offset 500+ for fdinfo files
+        InodeMode::regular(0o444),     // r--r--r--
+        0,
+        0,
+        0,
+        current_time(),
+        Arc::downgrade(&sb),
+        &PROCFS_INODE_OPS,
+    ));
+    inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+        ProcfsInodeData::new_fdinfo_file(pid, fd),
+    ))));
+    Ok(inode)
+}
+
+/// Generate content for /proc/<pid>/fdinfo/<n> files
+fn gen_fdinfo_content(pid: Pid, fd: i32) -> Vec<u8> {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+
+    // Get the task's TID
+    let tid = match get_tid_for_pid(pid) {
+        Some(t) => t,
+        None => {
+            return Vec::new();
+        }
+    };
+
+    // Get file info from the FD table
+    let (flags, is_pidfd, pidfd_target_pid) = {
+        if let Some(table_arc) = crate::task::fdtable::get_task_fd(tid) {
+            let table = table_arc.lock();
+            if let Some(file) = table.get(fd) {
+                let flags = file.get_flags();
+                // Check if this is a pidfd
+                let target_pid = crate::pidfd::get_pidfd_pid(&file);
+                (flags, target_pid.is_some(), target_pid)
+            } else {
+                return Vec::new();
+            }
+        } else {
+            return Vec::new();
+        }
+    };
+
+    // Output in Linux fdinfo format
+    let _ = writeln!(output, "pos:\t0");
+    let _ = writeln!(output, "flags:\t{:o}", flags);
+    let _ = writeln!(output, "mnt_id:\t0");
+
+    // If this is a pidfd, add the Pid line (Linux-compatible)
+    if is_pidfd && let Some(target) = pidfd_target_pid {
+        let _ = writeln!(output, "Pid:\t{}", target);
+    }
+
+    Vec::from(output.as_bytes())
+}
+
 /// Generate content for namespace files
 ///
 /// Returns a string identifying the namespace, similar to Linux's
@@ -488,9 +717,13 @@ impl FileOps for ProcfsFileOps {
             ProcfsInodeData::NamespaceFile { pid, ns_type } => {
                 gen_namespace_content(*pid, *ns_type)
             }
+            ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
+            ProcfsInodeData::FdSymlink { .. } => return Err(FsError::IoError),
             ProcfsInodeData::Directory { .. }
             | ProcfsInodeData::PidDirectory { .. }
-            | ProcfsInodeData::PidNsDirectory { .. } => return Err(FsError::IsADirectory),
+            | ProcfsInodeData::PidNsDirectory { .. }
+            | ProcfsInodeData::PidFdDirectory { .. }
+            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(FsError::IsADirectory),
         };
 
         let pos = file.get_pos() as usize;
@@ -523,9 +756,13 @@ impl FileOps for ProcfsFileOps {
             ProcfsInodeData::NamespaceFile { pid, ns_type } => {
                 gen_namespace_content(*pid, *ns_type)
             }
+            ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
+            ProcfsInodeData::FdSymlink { .. } => return Err(FsError::IoError),
             ProcfsInodeData::Directory { .. }
             | ProcfsInodeData::PidDirectory { .. }
-            | ProcfsInodeData::PidNsDirectory { .. } => return Err(FsError::IsADirectory),
+            | ProcfsInodeData::PidNsDirectory { .. }
+            | ProcfsInodeData::PidFdDirectory { .. }
+            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(FsError::IsADirectory),
         };
 
         let pos = offset as usize;
@@ -621,7 +858,18 @@ impl FileOps for ProcfsFileOps {
                 // Emit /proc/<pid>/ns/* entries
                 readdir_emit_ns_entries(*pid, callback)?;
             }
-            ProcfsInodeData::File { .. } | ProcfsInodeData::NamespaceFile { .. } => {
+            ProcfsInodeData::PidFdDirectory { pid } => {
+                // Emit /proc/<pid>/fd/* entries
+                readdir_emit_fd_entries(*pid, callback)?;
+            }
+            ProcfsInodeData::PidFdinfoDirectory { pid } => {
+                // Emit /proc/<pid>/fdinfo/* entries
+                readdir_emit_fdinfo_entries(*pid, callback)?;
+            }
+            ProcfsInodeData::File { .. }
+            | ProcfsInodeData::NamespaceFile { .. }
+            | ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::FdinfoFile { .. } => {
                 return Err(FsError::NotADirectory);
             }
         }
@@ -670,11 +918,33 @@ fn readdir_emit_pid_entries(
     pid: Pid,
     callback: &mut dyn FnMut(DirEntry) -> bool,
 ) -> Result<(), FsError> {
-    // Currently we only have "ns" subdirectory
+    // Emit "ns" subdirectory
     let should_continue = callback(DirEntry {
         ino: pid_ino(pid, 1),
         file_type: FileType::Directory,
         name: Vec::from(b"ns"),
+    });
+
+    if !should_continue {
+        return Ok(());
+    }
+
+    // Emit "fd" subdirectory
+    let should_continue = callback(DirEntry {
+        ino: pid_ino(pid, 100),
+        file_type: FileType::Directory,
+        name: Vec::from(b"fd"),
+    });
+
+    if !should_continue {
+        return Ok(());
+    }
+
+    // Emit "fdinfo" subdirectory
+    let should_continue = callback(DirEntry {
+        ino: pid_ino(pid, 101),
+        file_type: FileType::Directory,
+        name: Vec::from(b"fdinfo"),
     });
 
     if !should_continue {
@@ -697,6 +967,82 @@ fn readdir_emit_ns_entries(
             ino: pid_ino(pid, 2 + idx as u64),
             file_type: FileType::Regular, // Namespace files appear as regular files
             name: Vec::from(ns_type.as_str().as_bytes()),
+        });
+
+        if !should_continue {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Emit entries for /proc/<pid>/fd/ directory
+fn readdir_emit_fd_entries(
+    pid: Pid,
+    callback: &mut dyn FnMut(DirEntry) -> bool,
+) -> Result<(), FsError> {
+    // Get the task's TID
+    let tid = match get_tid_for_pid(pid) {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    // Get FDs from the task's FD table
+    let fds: Vec<i32> = {
+        if let Some(table_arc) = crate::task::fdtable::get_task_fd(tid) {
+            let table = table_arc.lock();
+            table.fds().copied().collect()
+        } else {
+            return Ok(());
+        }
+    };
+
+    // Emit all FD symlinks
+    for fd in fds {
+        let name = alloc::format!("{}", fd);
+        let should_continue = callback(DirEntry {
+            ino: pid_ino(pid, 200 + fd as u64),
+            file_type: FileType::Symlink,
+            name: Vec::from(name.as_bytes()),
+        });
+
+        if !should_continue {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Emit entries for /proc/<pid>/fdinfo/ directory
+fn readdir_emit_fdinfo_entries(
+    pid: Pid,
+    callback: &mut dyn FnMut(DirEntry) -> bool,
+) -> Result<(), FsError> {
+    // Get the task's TID
+    let tid = match get_tid_for_pid(pid) {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    // Get FDs from the task's FD table
+    let fds: Vec<i32> = {
+        if let Some(table_arc) = crate::task::fdtable::get_task_fd(tid) {
+            let table = table_arc.lock();
+            table.fds().copied().collect()
+        } else {
+            return Ok(());
+        }
+    };
+
+    // Emit all fdinfo files
+    for fd in fds {
+        let name = alloc::format!("{}", fd);
+        let should_continue = callback(DirEntry {
+            ino: pid_ino(pid, 500 + fd as u64),
+            file_type: FileType::Regular,
+            name: Vec::from(name.as_bytes()),
         });
 
         if !should_continue {

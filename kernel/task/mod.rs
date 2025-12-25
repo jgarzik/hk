@@ -10,6 +10,8 @@ pub mod syscall;
 ///
 /// These flags control what resources are shared between parent and child.
 pub mod clone_flags {
+    /// Return a pidfd for the child process
+    pub const CLONE_PIDFD: u64 = 0x00001000;
     /// Share virtual memory (address space) - creates a thread
     pub const CLONE_VM: u64 = 0x00000100;
     /// Share filesystem info (root, cwd, umask)
@@ -70,6 +72,8 @@ pub mod wait_options {
     pub const P_PID: i32 = 1;
     /// Wait for child in specific process group
     pub const P_PGID: i32 = 2;
+    /// Wait for child identified by pidfd
+    pub const P_PIDFD: i32 = 3;
 }
 
 use alloc::collections::BTreeMap;

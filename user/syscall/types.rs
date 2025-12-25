@@ -208,6 +208,7 @@ pub const fn ioprio_prio_value(class: u16, level: u16) -> i32 {
 pub const P_ALL: i32 = 0;
 pub const P_PID: i32 = 1;
 pub const P_PGID: i32 = 2;
+pub const P_PIDFD: i32 = 3;
 
 // waitid options
 pub const WEXITED: i32 = 4;

@@ -329,6 +329,7 @@ pub fn sys_clone(
         parent_tidptr,
         child_tidptr,
         tls,
+        pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
     };
 
     // Get frame allocator
@@ -369,6 +370,7 @@ pub fn sys_clone(
         parent_tidptr,
         child_tidptr,
         tls,
+        pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
     };
 
     // Get frame allocator
@@ -413,6 +415,7 @@ pub fn sys_fork() -> i64 {
         parent_tidptr: 0,
         child_tidptr: 0,
         tls: 0,
+        pidfd_ptr: 0,
     };
 
     // Get frame allocator
@@ -448,6 +451,7 @@ pub fn sys_fork() -> i64 {
         parent_tidptr: 0,
         child_tidptr: 0,
         tls: 0,
+        pidfd_ptr: 0,
     };
 
     // Get frame allocator
@@ -503,6 +507,7 @@ pub fn sys_vfork() -> i64 {
         parent_tidptr: 0,
         child_tidptr: 0,
         tls: 0,
+        pidfd_ptr: 0,
     };
 
     // Get frame allocator
@@ -540,6 +545,7 @@ pub fn sys_vfork() -> i64 {
         parent_tidptr: 0,
         child_tidptr: 0,
         tls: 0,
+        pidfd_ptr: 0,
     };
 
     // Get frame allocator
@@ -662,11 +668,12 @@ const SIGCHLD: i32 = 17;
 /// * -ECHILD: No matching children
 /// * -EINVAL: Invalid arguments
 pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32) -> i64 {
-    use super::wait_options::{P_ALL, P_PGID, P_PID, WEXITED, WNOHANG};
+    use super::wait_options::{P_ALL, P_PGID, P_PID, P_PIDFD, WEXITED, WNOHANG};
     use crate::arch::Uaccess;
     use crate::uaccess::{UaccessArch, put_user};
 
     let current_pid = super::percpu::current_pid();
+    let current_tid = super::percpu::current_tid();
 
     // Validate infop pointer if non-null
     if infop != 0 && !Uaccess::access_ok(infop, core::mem::size_of::<SigInfo>()) {
@@ -674,7 +681,7 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32) -> i64 {
     }
 
     // Validate idtype
-    if idtype != P_ALL && idtype != P_PID && idtype != P_PGID {
+    if idtype != P_ALL && idtype != P_PID && idtype != P_PGID && idtype != P_PIDFD {
         return EINVAL;
     }
 
@@ -698,6 +705,24 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32) -> i64 {
                 0 // Same process group as caller
             } else {
                 -(id as i64) // Specific process group
+            }
+        }
+        P_PIDFD => {
+            // id is a file descriptor - get the PID from the pidfd
+            let fd_table = match super::fdtable::get_task_fd(current_tid) {
+                Some(table) => table,
+                None => return ESRCH,
+            };
+            let file = {
+                let table = fd_table.lock();
+                match table.get(id as i32) {
+                    Some(file) => file,
+                    None => return -9, // EBADF
+                }
+            };
+            match crate::pidfd::get_pidfd_pid(&file) {
+                Some(pid) => pid as i64,
+                None => return -9, // EBADF - not a pidfd
             }
         }
         _ => return EINVAL,
@@ -2829,10 +2854,7 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
     let mut args = CloneArgs::default();
     let copy_size = core::cmp::min(size as usize, core::mem::size_of::<CloneArgs>());
     let args_bytes = unsafe {
-        core::slice::from_raw_parts_mut(
-            &mut args as *mut CloneArgs as *mut u8,
-            copy_size,
-        )
+        core::slice::from_raw_parts_mut(&mut args as *mut CloneArgs as *mut u8, copy_size)
     };
     if copy_from_user::<Uaccess>(args_bytes, uargs, copy_size).is_err() {
         return EFAULT;
@@ -2897,6 +2919,7 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         parent_tidptr: args.parent_tid,
         child_tidptr: args.child_tid,
         tls: args.tls,
+        pidfd_ptr: args.pidfd,
     };
 
     // Get frame allocator
@@ -2933,10 +2956,7 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
     let mut args = CloneArgs::default();
     let copy_size = core::cmp::min(size as usize, core::mem::size_of::<CloneArgs>());
     let args_bytes = unsafe {
-        core::slice::from_raw_parts_mut(
-            &mut args as *mut CloneArgs as *mut u8,
-            copy_size,
-        )
+        core::slice::from_raw_parts_mut(&mut args as *mut CloneArgs as *mut u8, copy_size)
     };
     if copy_from_user::<Uaccess>(args_bytes, uargs, copy_size).is_err() {
         return EFAULT;
@@ -3001,6 +3021,7 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         parent_tidptr: args.parent_tid,
         child_tidptr: args.child_tid,
         tls: args.tls,
+        pidfd_ptr: args.pidfd,
     };
 
     // Get frame allocator
@@ -3112,10 +3133,7 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
             | SYSLOG_ACTION_CONSOLE_LEVEL
     );
 
-    if needs_cap
-        && !super::capable(super::CAP_SYSLOG)
-        && !super::capable(super::CAP_SYS_ADMIN)
-    {
+    if needs_cap && !super::capable(super::CAP_SYSLOG) && !super::capable(super::CAP_SYS_ADMIN) {
         return EPERM;
     }
 
@@ -3125,9 +3143,7 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
             0
         }
 
-        SYSLOG_ACTION_READ
-        | SYSLOG_ACTION_READ_ALL
-        | SYSLOG_ACTION_READ_CLEAR => {
+        SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
             // Read from kernel log buffer
             if buf == 0 || len == 0 {
                 return EINVAL;
@@ -3182,3 +3198,155 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
     }
 }
 
+// ============================================================================
+// pidfd syscalls
+// ============================================================================
+
+/// sys_pidfd_open - obtain a file descriptor for a process
+///
+/// # Arguments
+/// * `pid` - Process ID to obtain pidfd for
+/// * `flags` - Flags (PIDFD_NONBLOCK only)
+///
+/// # Returns
+/// * >= 0: File descriptor on success
+/// * -EINVAL: Invalid flags or pid
+/// * -ESRCH: No such process
+pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
+    // Validate flags - only O_NONBLOCK (0o4000) is allowed
+    const PIDFD_NONBLOCK: u32 = 0o4000;
+    if flags & !PIDFD_NONBLOCK != 0 {
+        return EINVAL;
+    }
+
+    // Validate pid
+    if pid <= 0 {
+        return EINVAL;
+    }
+
+    let target_pid = pid as Pid;
+
+    // Check if process exists
+    {
+        let table = super::percpu::TASK_TABLE.lock();
+        if !table.tasks.iter().any(|t| t.pid == target_pid) {
+            return ESRCH;
+        }
+    }
+
+    // Create pidfd
+    let pidfd_file = match crate::pidfd::create_pidfd(target_pid, flags) {
+        Ok(file) => file,
+        Err(_) => return -12, // ENOMEM
+    };
+
+    // Allocate FD in current task's FD table
+    let current_tid = super::percpu::current_tid();
+    let fd_table = match super::fdtable::get_task_fd(current_tid) {
+        Some(table) => table,
+        None => return ESRCH,
+    };
+
+    let mut table = fd_table.lock();
+
+    // Get NOFILE limit
+    let nofile = {
+        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
+        if limit == crate::rlimit::RLIM_INFINITY {
+            u64::MAX
+        } else {
+            limit
+        }
+    };
+
+    // Check if we need FD_CLOEXEC (O_CLOEXEC is 0o2000000)
+    let fd_flags = if flags & 0o2000000 != 0 {
+        super::FD_CLOEXEC
+    } else {
+        0
+    };
+
+    match table.alloc_with_flags(pidfd_file, fd_flags, nofile) {
+        Ok(fd) => fd as i64,
+        Err(e) => e as i64,
+    }
+}
+
+/// sys_pidfd_send_signal - send a signal to a process via a pidfd
+///
+/// # Arguments
+/// * `pidfd` - File descriptor referring to the target process
+/// * `sig` - Signal number to send
+/// * `info` - Optional siginfo_t pointer (not used currently)
+/// * `flags` - Flags (must be 0)
+///
+/// # Returns
+/// * 0 on success
+/// * -EBADF: Invalid file descriptor
+/// * -EINVAL: Invalid signal number or flags
+/// * -ESRCH: Process no longer exists
+pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i64 {
+    // Flags must be 0
+    if flags != 0 {
+        return EINVAL;
+    }
+
+    // Validate signal number (0 is allowed as a null signal for checking permissions)
+    if !(0..=64).contains(&sig) {
+        return EINVAL;
+    }
+
+    // Get the file from FD table
+    let current_tid = super::percpu::current_tid();
+    let fd_table = match super::fdtable::get_task_fd(current_tid) {
+        Some(table) => table,
+        None => return ESRCH,
+    };
+
+    let file = {
+        let table = fd_table.lock();
+        match table.get(pidfd) {
+            Some(file) => file,
+            None => return -9, // EBADF
+        }
+    };
+
+    // Validate it's a pidfd and get target PID
+    let target_pid = match crate::pidfd::get_pidfd_pid(&file) {
+        Some(pid) => pid,
+        None => return -9, // EBADF - not a pidfd
+    };
+
+    // Check if process still exists
+    {
+        let table = super::percpu::TASK_TABLE.lock();
+        if !table.tasks.iter().any(|t| t.pid == target_pid) {
+            return ESRCH;
+        }
+    }
+
+    // Signal 0 is a null signal - just check if process exists
+    if sig == 0 {
+        return 0;
+    }
+
+    // Send the signal
+    crate::signal::send_signal_to_process(target_pid, sig as u32) as i64
+}
+
+/// sys_pidfd_getfd - obtain a duplicate of another process's file descriptor
+///
+/// # Arguments
+/// * `pidfd` - File descriptor referring to the target process
+/// * `targetfd` - File descriptor in the target process to duplicate
+/// * `flags` - Flags (must be 0)
+///
+/// # Returns
+/// * >= 0: New file descriptor on success
+/// * -ENOSYS: Not implemented (requires PTRACE)
+///
+/// Note: This syscall requires PTRACE_MODE_ATTACH permissions which we don't
+/// implement yet. Return ENOSYS for now.
+pub fn sys_pidfd_getfd(_pidfd: i32, _targetfd: i32, _flags: u32) -> i64 {
+    -38 // ENOSYS
+}

@@ -57,7 +57,7 @@ The `clone()` syscall creates a new process or thread. It is the fundamental bui
 
 | Flag | Value | Purpose | Status |
 |------|-------|---------|--------|
-| CLONE_PIDFD | 0x00001000 | Return pidfd for child | Not implemented |
+| CLONE_PIDFD | 0x00001000 | Return pidfd for child | Implemented |
 | CLONE_CLEAR_SIGHAND | 0x100000000 | Reset signal handlers | Implemented |
 | CLONE_INTO_CGROUP | 0x200000000 | Place in specific cgroup | Deferred |
 
@@ -197,6 +197,25 @@ Shares the SysV semaphore undo list between parent and child:
 - **clone_task_semundo()**: Shares or copies undo list based on flag
 - **unshare(CLONE_SYSVSEM)**: Detaches from shared undo list
 
+### CLONE_PIDFD Support
+
+Returns a pidfd file descriptor for the child process:
+- **pidfd creation**: Creates a pidfd via `pidfd::create_pidfd()` after child task is created
+- **FD allocation**: Allocates FD in parent's FD table
+- **User pointer write**: Writes FD number to `CloneArgs.pidfd` address in parent's address space
+- **Exit notification**: pidfd becomes readable (POLLIN) when child exits via registry notification
+
+The pidfd subsystem provides race-free process tracking:
+- `pidfd_open(pid, flags)`: Create pidfd for existing process
+- `pidfd_send_signal(pidfd, sig, info, flags)`: Send signal via pidfd
+- `waitid(P_PIDFD, pidfd, ...)`: Wait for process via pidfd
+- `/proc/<pid>/fdinfo/<pidfd>`: Shows "Pid:" line for pidfd introspection
+
+Implementation in `kernel/pidfd.rs` follows eventfd.rs pattern with:
+- Global registry for exit notification
+- WaitQueue for poll support
+- FileOps trait for VFS integration
+
 ### CLONE_IO Support
 
 Shares I/O context (ioprio) between parent and child:
@@ -231,8 +250,10 @@ Related syscalls:
 - **CLONE_NEWCGROUP**: Cgroup namespace (requires cgroup support)
 
 ### Tier 2: Modern Features
-- CLONE_PIDFD for pidfd-based process tracking
-- clone3() syscall with extensible struct
+- CLONE_PIDFD for pidfd-based process tracking - **Implemented**
+- clone3() syscall - **Implemented** (versioned CloneArgs structure, size validation)
+- pidfd_open, pidfd_send_signal - **Implemented** (Linux-compatible pidfd subsystem)
+- waitid P_PIDFD - **Implemented** (wait via pidfd)
 
 ### Tier 3: Debugging/Tracing
 - CLONE_PTRACE for ptrace continuation in child
@@ -269,4 +290,5 @@ Related syscalls:
 - kernel/ipc/mod.rs - IPC namespace implementation
 - kernel/ipc/sem.rs - SysV semaphores with SEM_UNDO support
 - kernel/signal/mod.rs - Signal handler sharing (CLONE_SIGHAND)
-- kernel/fs/procfs.rs - /proc/<pid>/ns/* namespace files
+- kernel/fs/procfs.rs - /proc/<pid>/ns/* namespace files, /proc/<pid>/fd/, /proc/<pid>/fdinfo/
+- kernel/pidfd.rs - pidfd subsystem (pidfd_open, pidfd_send_signal, exit notification)

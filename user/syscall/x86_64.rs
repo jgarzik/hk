@@ -1706,3 +1706,50 @@ pub const SYSLOG_ACTION_CONSOLE_ON: i32 = 7;
 pub const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
 pub const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
 pub const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
+
+// ============================================================================
+// pidfd - process file descriptors
+// ============================================================================
+
+/// pidfd_open syscall number (x86_64)
+pub const SYS_PIDFD_OPEN: u64 = 434;
+/// pidfd_send_signal syscall number (x86_64)
+pub const SYS_PIDFD_SEND_SIGNAL: u64 = 424;
+/// pidfd_getfd syscall number (x86_64)
+pub const SYS_PIDFD_GETFD: u64 = 438;
+
+/// pidfd_open(pid, flags) - create pidfd for a process
+///
+/// Creates a file descriptor that refers to the process specified by pid.
+/// The flags argument is a bit mask of flags that modify the behavior:
+/// - 0: Default behavior
+/// - O_NONBLOCK (0o4000): Open in non-blocking mode
+///
+/// Returns the file descriptor on success, or a negative error code on failure.
+#[inline(always)]
+pub fn sys_pidfd_open(pid: i32, flags: u32) -> i64 {
+    unsafe { syscall2!(SYS_PIDFD_OPEN, pid, flags) }
+}
+
+/// pidfd_send_signal(pidfd, sig, info, flags) - send signal via pidfd
+///
+/// Sends the signal sig to the process referred to by the pidfd.
+/// The info argument is an optional pointer to siginfo_t for queued signals.
+/// The flags argument is reserved and must be 0.
+///
+/// Returns 0 on success, or a negative error code on failure.
+#[inline(always)]
+pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: *const u8, flags: u32) -> i64 {
+    unsafe { syscall4!(SYS_PIDFD_SEND_SIGNAL, pidfd, sig, info, flags) }
+}
+
+/// pidfd_getfd(pidfd, targetfd, flags) - obtain duplicate of another process's FD
+///
+/// This syscall duplicates a file descriptor from the process referred to by pidfd.
+/// Currently returns -ENOSYS as it requires PTRACE capabilities.
+///
+/// Returns the new file descriptor on success, or a negative error code on failure.
+#[inline(always)]
+pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
+    unsafe { syscall3!(SYS_PIDFD_GETFD, pidfd, targetfd, flags) }
+}
