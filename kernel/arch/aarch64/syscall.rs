@@ -265,6 +265,12 @@ pub const SYS_RT_SIGPENDING: u64 = 136;
 pub const SYS_RT_SIGTIMEDWAIT: u64 = 137;
 #[allow(dead_code)] // Infrastructure for future signal delivery
 pub const SYS_RT_SIGRETURN: u64 = 139;
+/// rt_sigqueueinfo(pid, sig, uinfo)
+pub const SYS_RT_SIGQUEUEINFO: u64 = 128;
+/// rt_sigsuspend(mask, sigsetsize)
+pub const SYS_RT_SIGSUSPEND: u64 = 133;
+/// rt_tgsigqueueinfo(tgid, tid, sig, uinfo)
+pub const SYS_RT_TGSIGQUEUEINFO: u64 = 240;
 
 // Memory barrier syscall
 pub const SYS_MEMBARRIER: u64 = 283;
@@ -764,6 +770,16 @@ pub fn aarch64_syscall_dispatch(
             crate::signal::syscall::sys_tgkill(arg0 as i64, arg1 as i64, arg2 as u32) as u64
         }
         SYS_TKILL => crate::signal::syscall::sys_tkill(arg0 as i64, arg1 as u32) as u64,
+        SYS_RT_SIGQUEUEINFO => {
+            crate::signal::syscall::sys_rt_sigqueueinfo(arg0 as i64, arg1 as u32, arg2) as u64
+        }
+        SYS_RT_SIGSUSPEND => crate::signal::syscall::sys_rt_sigsuspend(arg0, arg1) as u64,
+        SYS_RT_TGSIGQUEUEINFO => crate::signal::syscall::sys_rt_tgsigqueueinfo(
+            arg0 as i64,
+            arg1 as i64,
+            arg2 as u32,
+            arg3,
+        ) as u64,
 
         // membarrier syscall
         SYS_MEMBARRIER => {

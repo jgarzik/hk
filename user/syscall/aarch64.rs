@@ -274,6 +274,9 @@ pub const SYS_RT_SIGACTION: u64 = 134;
 pub const SYS_RT_SIGPROCMASK: u64 = 135;
 pub const SYS_RT_SIGPENDING: u64 = 136;
 pub const SYS_RT_SIGTIMEDWAIT: u64 = 137;
+pub const SYS_RT_SIGQUEUEINFO: u64 = 128;
+pub const SYS_RT_SIGSUSPEND: u64 = 133;
+pub const SYS_RT_TGSIGQUEUEINFO: u64 = 240;
 
 // Memory barrier syscall
 pub const SYS_MEMBARRIER: u64 = 283;
@@ -1110,6 +1113,24 @@ pub fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> i64 {
 #[inline(always)]
 pub fn sys_tkill(tid: i64, sig: u32) -> i64 {
     unsafe { syscall2!(SYS_TKILL, tid, sig) }
+}
+
+/// rt_sigqueueinfo(pid, sig, uinfo) - send signal with info to process
+#[inline(always)]
+pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
+    unsafe { syscall3!(SYS_RT_SIGQUEUEINFO, pid, sig, uinfo) }
+}
+
+/// rt_sigsuspend(mask, sigsetsize) - wait for signal with temporary mask
+#[inline(always)]
+pub fn sys_rt_sigsuspend(mask: u64, sigsetsize: u64) -> i64 {
+    unsafe { syscall2!(SYS_RT_SIGSUSPEND, mask, sigsetsize) }
+}
+
+/// rt_tgsigqueueinfo(tgid, tid, sig, uinfo) - send signal with info to thread
+#[inline(always)]
+pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
+    unsafe { syscall4!(SYS_RT_TGSIGQUEUEINFO, tgid, tid, sig, uinfo) }
 }
 
 // ============================================================================

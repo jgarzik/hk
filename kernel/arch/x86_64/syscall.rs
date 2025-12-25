@@ -421,6 +421,12 @@ pub const SYS_TGKILL: u64 = 234;
 pub const SYS_RT_SIGTIMEDWAIT: u64 = 128;
 /// sigaltstack(ss, oss)
 pub const SYS_SIGALTSTACK: u64 = 131;
+/// rt_sigqueueinfo(pid, sig, uinfo)
+pub const SYS_RT_SIGQUEUEINFO: u64 = 129;
+/// rt_sigsuspend(mask, sigsetsize)
+pub const SYS_RT_SIGSUSPEND: u64 = 130;
+/// rt_tgsigqueueinfo(tgid, tid, sig, uinfo)
+pub const SYS_RT_TGSIGQUEUEINFO: u64 = 297;
 
 // Memory barrier (Section 13)
 /// membarrier(cmd, flags, cpu_id)
@@ -1494,6 +1500,16 @@ pub fn x86_64_syscall_dispatch(
             crate::signal::syscall::sys_tgkill(arg0 as i64, arg1 as i64, arg2 as u32) as u64
         }
         SYS_TKILL => crate::signal::syscall::sys_tkill(arg0 as i64, arg1 as u32) as u64,
+        SYS_RT_SIGQUEUEINFO => {
+            crate::signal::syscall::sys_rt_sigqueueinfo(arg0 as i64, arg1 as u32, arg2) as u64
+        }
+        SYS_RT_SIGSUSPEND => crate::signal::syscall::sys_rt_sigsuspend(arg0, arg1) as u64,
+        SYS_RT_TGSIGQUEUEINFO => crate::signal::syscall::sys_rt_tgsigqueueinfo(
+            arg0 as i64,
+            arg1 as i64,
+            arg2 as u32,
+            arg3,
+        ) as u64,
 
         // membarrier syscall
         SYS_MEMBARRIER => {

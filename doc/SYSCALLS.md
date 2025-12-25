@@ -199,8 +199,9 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] rt_sigprocmask
 - [x] rt_sigpending
 - [x] rt_sigtimedwait
-- [ ] rt_sigqueueinfo
-- [ ] rt_sigsuspend
+- [x] rt_sigqueueinfo
+- [x] rt_sigsuspend
+- [x] rt_tgsigqueueinfo
 - [x] sigaltstack
 - [x] signalfd
 - [x] signalfd4

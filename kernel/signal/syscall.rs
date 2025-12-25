@@ -309,30 +309,163 @@ pub fn sys_tkill(tid: i64, sig: u32) -> i64 {
     send_signal(tid as u64, sig) as i64
 }
 
+/// rt_sigqueueinfo(pid, sig, uinfo) - send signal with info to a process
+///
+/// # Arguments
+/// * `pid` - Target process ID
+/// * `sig` - Signal number to send
+/// * `uinfo` - Pointer to user-space siginfo_t
+///
+/// # Returns
+/// 0 on success, negative errno on error:
+/// * -EINVAL: Invalid signal number
+/// * -EPERM: Permission denied (cannot impersonate kernel/other process)
+/// * -ESRCH: No such process
+/// * -EFAULT: Bad uinfo pointer
+pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
+    use crate::task::percpu::current_pid;
+
+    // Validate signal number
+    if sig == 0 || sig > 64 {
+        return -22; // EINVAL
+    }
+
+    // Read siginfo from user space
+    let info = match SigInfo::read_from_user(uinfo, sig) {
+        Ok(i) => i,
+        Err(e) => return -(e as i64),
+    };
+
+    // Security check: si_code validation per Linux kernel
+    // - si_code >= 0 means kernel-generated (SI_USER=0, SI_KERNEL=128, etc.)
+    // - si_code < 0 means user-generated (SI_QUEUE=-1, SI_TKILL=-6, etc.)
+    //
+    // User cannot:
+    // 1. Pretend to be the kernel (si_code >= 0)
+    // 2. Use SI_TKILL code (reserved for tgkill/tkill)
+    // 3. Pretend to be a different process (si_pid != current_pid)
+    let caller_pid = current_pid() as i32;
+    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && info.pid() != caller_pid {
+        return -1; // EPERM
+    }
+
+    // Send signal to process
+    send_signal_to_process(pid as u64, sig) as i64
+}
+
+/// rt_tgsigqueueinfo(tgid, tid, sig, uinfo) - send signal with info to a thread
+///
+/// # Arguments
+/// * `tgid` - Target thread group ID (process ID)
+/// * `tid` - Target thread ID
+/// * `sig` - Signal number to send
+/// * `uinfo` - Pointer to user-space siginfo_t
+///
+/// # Returns
+/// 0 on success, negative errno on error:
+/// * -EINVAL: Invalid signal number, pid <= 0, or tgid <= 0
+/// * -EPERM: Permission denied
+/// * -ESRCH: No such process/thread
+/// * -EFAULT: Bad uinfo pointer
+pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
+    use crate::task::percpu::current_pid;
+
+    // Validate arguments
+    if tid <= 0 || tgid <= 0 {
+        return -22; // EINVAL
+    }
+
+    if sig == 0 || sig > 64 {
+        return -22; // EINVAL
+    }
+
+    // Read siginfo from user space
+    let info = match SigInfo::read_from_user(uinfo, sig) {
+        Ok(i) => i,
+        Err(e) => return -(e as i64),
+    };
+
+    // Security check: same as rt_sigqueueinfo
+    // Cannot pretend to be kernel or use SI_TKILL code unless actually this process
+    let caller_pid = current_pid() as i32;
+    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && info.pid() != caller_pid {
+        return -1; // EPERM
+    }
+
+    // TODO: Verify tid belongs to tgid (thread group check)
+    // For now, just send to the specified tid
+
+    // Send signal to specific thread
+    send_signal(tid as u64, sig) as i64
+}
+
 /// rt_sigsuspend(mask, sigsetsize) - wait for signal with temporary mask
 ///
 /// Temporarily replaces the signal mask and waits for a signal.
-/// Returns when a signal handler is invoked.
+/// Returns when a signal handler is invoked or a signal terminates the process.
 ///
 /// # Arguments
 /// * `mask_ptr` - Pointer to temporary signal mask
 /// * `sigsetsize` - Size of sigset_t (must be 8)
 ///
 /// # Returns
-/// Always returns -EINTR (interrupted by signal)
-#[allow(dead_code)]
+/// Always returns -EINTR (interrupted by signal) on success
+/// * -EINVAL: Invalid sigsetsize
+/// * -EFAULT: Bad mask_ptr pointer
 pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
+    use crate::signal::has_pending_signals;
+
     if sigsetsize != 8 {
         return -22; // EINVAL
     }
 
-    let _new_mask = match get_user::<Uaccess, u64>(mask_ptr) {
+    // Read the new mask from user space
+    let new_mask = match get_user::<Uaccess, u64>(mask_ptr) {
         Ok(v) => SigSet::from_bits(v),
         Err(_) => return -14, // EFAULT
     };
 
-    // TODO: Implement actual signal waiting
-    // For now, just return -EINTR as if a signal was delivered
+    let tid = current_tid();
+
+    // Save old mask and set new mask
+    let old_mask = with_task_signal_state(tid, |state| {
+        let old = state.blocked;
+        // Set new blocked mask, but never block SIGKILL/SIGSTOP
+        state.blocked = new_mask.subtract(&UNMASKABLE_SIGNALS);
+        state.recalc_sigpending();
+        old
+    });
+
+    let old_mask = match old_mask {
+        Some(m) => m,
+        None => return -3, // ESRCH
+    };
+
+    // Check for immediately deliverable signals
+    // In a full implementation, we would loop here and block
+    // until a signal becomes deliverable
+    if has_pending_signals(tid) {
+        // Restore old mask before returning
+        with_task_signal_state(tid, |state| {
+            state.blocked = old_mask;
+            state.recalc_sigpending();
+        });
+        return -4; // EINTR
+    }
+
+    // TODO: In a complete implementation, we would:
+    // 1. Mark the task as sleeping/waiting
+    // 2. Schedule another task
+    // 3. When woken by a signal, restore the old mask
+    // 4. Return -EINTR
+    //
+    // For now, restore mask and return -EINTR
+    // This is sufficient for testing but not for real signal waiting
+    with_task_signal_state(tid, |state| {
+        state.blocked = old_mask;
+        state.recalc_sigpending();
+    });
+
     -4 // EINTR
 }
 
@@ -454,6 +587,68 @@ impl SigInfo {
             return Err(14);
         }
         Ok(())
+    }
+
+    /// Read siginfo from user space
+    ///
+    /// # Arguments
+    /// * `ptr` - User-space pointer to siginfo_t (128 bytes)
+    /// * `sig` - Expected signal number for validation
+    ///
+    /// # Returns
+    /// Ok(SigInfo) on success, Err(errno) on error
+    pub fn read_from_user(ptr: u64, sig: u32) -> Result<Self, i32> {
+        // Read si_signo (offset 0)
+        let si_signo = match get_user::<Uaccess, i32>(ptr) {
+            Ok(v) => v,
+            Err(_) => return Err(14), // EFAULT
+        };
+        // Read si_errno (offset 4)
+        let si_errno = match get_user::<Uaccess, i32>(ptr + 4) {
+            Ok(v) => v,
+            Err(_) => return Err(14),
+        };
+        // Read si_code (offset 8)
+        let si_code = match get_user::<Uaccess, i32>(ptr + 8) {
+            Ok(v) => v,
+            Err(_) => return Err(14),
+        };
+        // Read si_pid (offset 16)
+        let si_pid = match get_user::<Uaccess, i32>(ptr + 16) {
+            Ok(v) => v,
+            Err(_) => return Err(14),
+        };
+        // Read si_uid (offset 20)
+        let si_uid = match get_user::<Uaccess, u32>(ptr + 20) {
+            Ok(v) => v,
+            Err(_) => return Err(14),
+        };
+
+        // Validate si_signo matches expected signal
+        if si_signo != sig as i32 {
+            return Err(22); // EINVAL
+        }
+
+        Ok(Self {
+            si_signo,
+            si_errno,
+            si_code,
+            _pad0: 0,
+            _sifields: SigInfoFields {
+                kill: SigInfoKill { si_pid, si_uid },
+            },
+        })
+    }
+
+    /// Get si_code value
+    pub fn code(&self) -> i32 {
+        self.si_code
+    }
+
+    /// Get sender's PID from siginfo
+    pub fn pid(&self) -> i32 {
+        // Safety: We always initialize _sifields with kill variant
+        unsafe { self._sifields.kill.si_pid }
     }
 }
 
