@@ -861,6 +861,13 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     // =========================================================================
     /// Per-task prctl state (name, dumpable, no_new_privs, timer_slack)
     pub prctl: PrctlState,
+
+    // =========================================================================
+    // Personality (execution domain)
+    // =========================================================================
+    /// Process personality (execution domain, affects syscall behavior)
+    /// See personality(2). Default is 0 (PER_LINUX).
+    pub personality: u32,
 }
 
 impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {

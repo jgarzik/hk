@@ -19,7 +19,7 @@
 //!   - No `chmod`, `chown`, `lchown` - use *at variants
 //!   - No `truncate` - use ftruncate with openat
 
-use crate::types::{EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Stat, Timespec, Timeval, UtsName, AT_FDCWD};
+use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Stat, Timespec, Timeval, UtsName, AT_FDCWD};
 
 // ============================================================================
 // Syscall macros for aarch64
@@ -365,6 +365,11 @@ pub const SYS_MSGCTL: u64 = 187;
 
 // TLS syscalls
 pub const SYS_SET_TID_ADDRESS: u64 = 96;
+
+// New syscall numbers
+pub const SYS_CLONE3: u64 = 435;
+pub const SYS_PERSONALITY: u64 = 92;
+pub const SYS_SYSLOG: u64 = 116;
 
 // Futex syscalls
 pub const SYS_FUTEX: u64 = 98;
@@ -1923,3 +1928,49 @@ pub fn sys_membarrier(cmd: i32, flags: u32, cpu_id: i32) -> i64 {
 pub fn sys_readahead(fd: i32, offset: i64, count: usize) -> i64 {
     unsafe { syscall3!(SYS_READAHEAD, fd, offset, count) }
 }
+
+// ============================================================================
+// clone3 (modern extensible clone)
+// ============================================================================
+
+/// clone3(uargs, size) - create a new process with extended arguments
+#[inline(always)]
+pub fn sys_clone3(args: *const CloneArgs, size: usize) -> i64 {
+    unsafe { syscall2!(SYS_CLONE3, args, size) }
+}
+
+// ============================================================================
+// personality (execution domain)
+// ============================================================================
+
+/// personality(persona) - set process execution domain
+///
+/// If persona is 0xFFFFFFFF, returns current personality without changing it.
+/// Otherwise, sets new personality and returns old value.
+#[inline(always)]
+pub fn sys_personality(persona: u32) -> i64 {
+    unsafe { syscall1!(SYS_PERSONALITY, persona) }
+}
+
+// ============================================================================
+// syslog (kernel logging)
+// ============================================================================
+
+/// syslog(type, buf, len) - read and/or clear kernel message ring buffer
+#[inline(always)]
+pub fn sys_syslog(type_: i32, buf: *mut u8, len: i32) -> i64 {
+    unsafe { syscall3!(SYS_SYSLOG, type_, buf, len) }
+}
+
+/// syslog action codes
+pub const SYSLOG_ACTION_CLOSE: i32 = 0;
+pub const SYSLOG_ACTION_OPEN: i32 = 1;
+pub const SYSLOG_ACTION_READ: i32 = 2;
+pub const SYSLOG_ACTION_READ_ALL: i32 = 3;
+pub const SYSLOG_ACTION_READ_CLEAR: i32 = 4;
+pub const SYSLOG_ACTION_CLEAR: i32 = 5;
+pub const SYSLOG_ACTION_CONSOLE_OFF: i32 = 6;
+pub const SYSLOG_ACTION_CONSOLE_ON: i32 = 7;
+pub const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
+pub const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
+pub const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;

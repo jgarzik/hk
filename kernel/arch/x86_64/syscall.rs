@@ -572,6 +572,18 @@ pub const SYS_MSGCTL: u64 = 71;
 /// semtimedop(semid, sops, nsops, timeout)
 pub const SYS_SEMTIMEDOP: u64 = 220;
 
+// New process/thread creation
+/// clone3(uargs, size) - Modern extensible clone
+pub const SYS_CLONE3: u64 = 435;
+
+// System logging
+/// syslog(type, buf, len) - Read/control kernel message ring buffer
+pub const SYS_SYSLOG: u64 = 103;
+
+// Process personality/execution domain
+/// personality(persona) - Set process execution domain
+pub const SYS_PERSONALITY: u64 = 135;
+
 /// Model Specific Registers for syscall
 const MSR_EFER: u32 = 0xC000_0080; // Extended Feature Enable Register
 const MSR_STAR: u32 = 0xC000_0081; // Segment selectors for syscall/sysret
@@ -1351,6 +1363,10 @@ pub fn x86_64_syscall_dispatch(
 
         // Process creation (Section 1.1)
         SYS_CLONE => sys_clone(arg0, arg1, arg2, arg3, arg4) as u64,
+        SYS_CLONE3 => {
+            use crate::task::syscall::sys_clone3;
+            sys_clone3(arg0, arg1) as u64
+        }
         SYS_FORK => sys_fork() as u64,
         SYS_VFORK => sys_vfork() as u64,
         SYS_EXECVE => sys_execve(arg0, arg1, arg2) as u64,
@@ -1358,6 +1374,19 @@ pub fn x86_64_syscall_dispatch(
         SYS_WAIT4 => sys_wait4(arg0 as i64, arg1, arg2 as i32, arg3) as u64,
         SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
         SYS_EXIT_GROUP => sys_exit(arg0 as i32), // For single-threaded, same as _exit
+
+        // Personality (execution domain)
+        SYS_PERSONALITY => {
+            use crate::task::syscall::sys_personality;
+            sys_personality(arg0 as u32) as u64
+        }
+
+        // System logging
+        SYS_SYSLOG => {
+            use crate::arch::Uaccess;
+            use crate::task::syscall::sys_syslog;
+            sys_syslog::<Uaccess>(arg0 as i32, arg1, arg2 as i32) as u64
+        }
 
         // Power management
         SYS_REBOOT => crate::power::sys_reboot(arg0 as u32, arg1 as u32, arg2 as u32, arg3) as u64,

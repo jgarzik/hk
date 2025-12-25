@@ -4,7 +4,7 @@
 - [x] fork
 - [x] vfork
 - [x] clone (Linux thread/process creation)
-- [ ] clone3
+- [x] clone3
 - [x] execve
 - [x] execveat
 - [x] _exit
@@ -394,7 +394,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 - [x] getrandom
 - [x] reboot
 - [ ] kexec_load
-- [ ] syslog
+- [x] syslog
 - [ ] acct
 - [ ] swapon
 - [ ] swapoff
@@ -414,14 +414,14 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 
 14. Thread-local, arch-specific, misc
 
-- [ ] arch_prctl (TLS, FS/GS base on x86-64)
+- [x] arch_prctl (TLS, FS/GS base on x86-64)
 - [ ] set_thread_area / get_thread_area (32-bit oriented)
 - [ ] get_thread_area (arch-specific)
 
 Misc utilities that don't fit elsewhere:
 
 - [ ] getpgid / setpgid (already listed)
-- [ ] personality
+- [x] personality
 - [x] umount / umount2 (already listed)
 - [ ] vhangup
 - [x] readahead

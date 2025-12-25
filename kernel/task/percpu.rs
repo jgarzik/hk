@@ -421,6 +421,8 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         robust_list: 0,
         // prctl state
         prctl: crate::task::PrctlState::default(),
+        // Process personality (execution domain)
+        personality: 0,
     };
 
     // Add task to global table
@@ -518,6 +520,8 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         robust_list: 0,
         // prctl state
         prctl: crate::task::PrctlState::default(),
+        // Process personality (execution domain)
+        personality: 0,
     };
 
     // Add to global table
@@ -771,6 +775,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_pt_phys,
         parent_cred,
         parent_prctl,
+        parent_personality,
     ) = {
         let table = TASK_TABLE.lock();
         let parent = try_with_cleanup!(table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)); // ESRCH - no such process
@@ -787,6 +792,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.page_table.root_table_phys(),
             parent.cred.clone(),
             parent.prctl.clone(),
+            parent.personality,
         )
     };
 
@@ -938,6 +944,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             no_new_privs: parent_prctl.no_new_privs,         // Inherited (irreversible)
             timer_slack_ns: parent_prctl.timer_slack_ns,     // Inherited
         },
+        // Process personality (inherited from parent)
+        personality: parent_personality,
     };
 
     // Add to global task table
@@ -2387,5 +2395,32 @@ pub fn try_schedule() {
         unsafe {
             CurrentArch::context_switch_first(next_ctx, next_kstack, next_cr3, next_tid);
         }
+    }
+}
+
+// =============================================================================
+// Personality accessors
+// =============================================================================
+
+/// Get the current task's personality value
+///
+/// Default is 0 (PER_LINUX).
+pub fn get_current_personality() -> u32 {
+    let tid = current_tid();
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .map(|t| t.personality)
+        .unwrap_or(0)
+}
+
+/// Set the current task's personality value
+pub fn set_current_personality(personality: u32) {
+    let tid = current_tid();
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.personality = personality;
     }
 }

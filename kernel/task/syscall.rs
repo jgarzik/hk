@@ -2742,3 +2742,443 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
 
     0
 }
+
+// =============================================================================
+// clone3 syscall - Modern extensible process/thread creation
+// =============================================================================
+
+/// clone_args structure for clone3 syscall (matches Linux struct clone_args)
+///
+/// The structure is versioned by size, allowing future extensions.
+/// Fields are 64-bit aligned as required by Linux ABI.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CloneArgs {
+    /// Clone flags (CLONE_* constants, except CSIGNAL bits)
+    pub flags: u64,
+    /// File descriptor for pidfd (CLONE_PIDFD)
+    pub pidfd: u64,
+    /// Address to store child TID in child's memory (CLONE_CHILD_SETTID)
+    pub child_tid: u64,
+    /// Address to store child TID in parent's memory (CLONE_PARENT_SETTID)
+    pub parent_tid: u64,
+    /// Exit signal for child (replaces low bits of clone() flags)
+    pub exit_signal: u64,
+    /// Lowest address of the stack (stack grows down on x86/arm)
+    pub stack: u64,
+    /// Size of the stack in bytes
+    pub stack_size: u64,
+    /// TLS pointer for child (CLONE_SETTLS)
+    pub tls: u64,
+    /// Array of PIDs for set_tid feature (CLONE_SET_TID, not implemented)
+    pub set_tid: u64,
+    /// Size of set_tid array
+    pub set_tid_size: u64,
+    /// Cgroup file descriptor (CLONE_INTO_CGROUP, not implemented)
+    pub cgroup: u64,
+}
+
+/// Size of clone_args version 0 (flags through tls)
+pub const CLONE_ARGS_SIZE_VER0: usize = 64;
+/// Size of clone_args version 1 (adds set_tid, set_tid_size)
+pub const CLONE_ARGS_SIZE_VER1: usize = 80;
+/// Size of clone_args version 2 (adds cgroup)
+pub const CLONE_ARGS_SIZE_VER2: usize = 88;
+
+/// CLONE_INTO_CGROUP flag (clone3 only)
+const CLONE_INTO_CGROUP: u64 = 0x200000000;
+
+/// Signal mask for exit signal
+const CSIGNAL: u64 = 0x000000ff;
+
+/// sys_clone3 - create a new process with extended arguments
+///
+/// This is the modern, extensible syscall for process/thread creation.
+/// It takes a struct clone_args that is versioned by size.
+///
+/// # Arguments
+/// * `uargs` - User pointer to struct clone_args
+/// * `size` - Size of the clone_args structure
+///
+/// # Returns
+/// * > 0: Child PID/TID (to parent)
+/// * 0: Child returns 0
+/// * < 0: Error code
+#[cfg(target_arch = "x86_64")]
+pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
+    use super::percpu::CloneConfig;
+    use crate::FRAME_ALLOCATOR;
+    use crate::arch::Uaccess;
+    use crate::arch::x86_64::percpu::{
+        get_syscall_user_rflags, get_syscall_user_rip, get_syscall_user_rsp,
+    };
+    use crate::frame_alloc::FrameAllocRef;
+    use crate::uaccess::{UaccessArch, copy_from_user};
+
+    // Validate size - must be at least VER0 and not too large
+    if size < CLONE_ARGS_SIZE_VER0 as u64 || size > 4096 {
+        return EINVAL;
+    }
+
+    // Validate user pointer
+    if !Uaccess::access_ok(uargs, size as usize) {
+        return EFAULT;
+    }
+
+    // Copy clone_args from userspace (zero-fill any missing fields)
+    let mut args = CloneArgs::default();
+    let copy_size = core::cmp::min(size as usize, core::mem::size_of::<CloneArgs>());
+    let args_bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            &mut args as *mut CloneArgs as *mut u8,
+            copy_size,
+        )
+    };
+    if copy_from_user::<Uaccess>(args_bytes, uargs, copy_size).is_err() {
+        return EFAULT;
+    }
+
+    // Validate clone3-specific constraints
+
+    // exit_signal must be valid (only low 8 bits used, must be valid signal or 0)
+    if (args.exit_signal & !CSIGNAL) != 0 || args.exit_signal > 64 {
+        return EINVAL;
+    }
+
+    // CLONE_INTO_CGROUP requires cgroup fd and VER2 size
+    if (args.flags & CLONE_INTO_CGROUP) != 0 {
+        if size < CLONE_ARGS_SIZE_VER2 as u64 {
+            return EINVAL;
+        }
+        // We don't support CLONE_INTO_CGROUP yet
+        return EINVAL;
+    }
+
+    // set_tid feature not supported
+    if args.set_tid != 0 || args.set_tid_size != 0 {
+        return EINVAL;
+    }
+
+    // Validate stack - if stack is provided, stack_size must also be provided
+    if args.stack != 0 && args.stack_size == 0 {
+        return EINVAL;
+    }
+    if args.stack == 0 && args.stack_size != 0 {
+        return EINVAL;
+    }
+
+    // CLONE_THREAD or CLONE_PARENT cannot have exit_signal
+    let clone_thread = super::clone_flags::CLONE_THREAD;
+    let clone_parent = super::clone_flags::CLONE_PARENT;
+    if (args.flags & (clone_thread | clone_parent)) != 0 && args.exit_signal != 0 {
+        return EINVAL;
+    }
+
+    // Get parent's return address, flags, and stack from per-CPU data
+    let parent_rip = get_syscall_user_rip();
+    let parent_rflags = get_syscall_user_rflags();
+    let parent_rsp = get_syscall_user_rsp();
+
+    // Calculate actual child stack pointer
+    // clone3 provides stack base and size; we need to compute the stack top
+    let child_stack = if args.stack != 0 {
+        // Stack grows down, so stack top = stack + stack_size
+        args.stack.wrapping_add(args.stack_size)
+    } else {
+        0 // Inherit parent stack (for fork-like behavior)
+    };
+
+    let config = CloneConfig {
+        flags: args.flags,
+        child_stack,
+        parent_rip,
+        parent_rflags,
+        parent_rsp,
+        parent_tidptr: args.parent_tid,
+        child_tidptr: args.child_tid,
+        tls: args.tls,
+    };
+
+    // Get frame allocator
+    let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
+
+    match super::percpu::do_clone(config, &mut frame_alloc) {
+        Ok(child_tid) => child_tid as i64,
+        Err(errno) => -(errno as i64),
+    }
+}
+
+/// sys_clone3 for aarch64 - create a new process with extended arguments
+#[cfg(target_arch = "aarch64")]
+pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
+    use super::percpu::CloneConfig;
+    use crate::FRAME_ALLOCATOR;
+    use crate::arch::PerCpuOps;
+    use crate::arch::Uaccess;
+    use crate::arch::aarch64::Aarch64Arch;
+    use crate::frame_alloc::FrameAllocRef;
+    use crate::uaccess::{UaccessArch, copy_from_user};
+
+    // Validate size - must be at least VER0 and not too large
+    if size < CLONE_ARGS_SIZE_VER0 as u64 || size > 4096 {
+        return EINVAL;
+    }
+
+    // Validate user pointer
+    if !Uaccess::access_ok(uargs, size as usize) {
+        return EFAULT;
+    }
+
+    // Copy clone_args from userspace (zero-fill any missing fields)
+    let mut args = CloneArgs::default();
+    let copy_size = core::cmp::min(size as usize, core::mem::size_of::<CloneArgs>());
+    let args_bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            &mut args as *mut CloneArgs as *mut u8,
+            copy_size,
+        )
+    };
+    if copy_from_user::<Uaccess>(args_bytes, uargs, copy_size).is_err() {
+        return EFAULT;
+    }
+
+    // Validate clone3-specific constraints
+
+    // exit_signal must be valid (only low 8 bits used, must be valid signal or 0)
+    if (args.exit_signal & !CSIGNAL) != 0 || args.exit_signal > 64 {
+        return EINVAL;
+    }
+
+    // CLONE_INTO_CGROUP requires cgroup fd and VER2 size
+    if (args.flags & CLONE_INTO_CGROUP) != 0 {
+        if size < CLONE_ARGS_SIZE_VER2 as u64 {
+            return EINVAL;
+        }
+        // We don't support CLONE_INTO_CGROUP yet
+        return EINVAL;
+    }
+
+    // set_tid feature not supported
+    if args.set_tid != 0 || args.set_tid_size != 0 {
+        return EINVAL;
+    }
+
+    // Validate stack - if stack is provided, stack_size must also be provided
+    if args.stack != 0 && args.stack_size == 0 {
+        return EINVAL;
+    }
+    if args.stack == 0 && args.stack_size != 0 {
+        return EINVAL;
+    }
+
+    // CLONE_THREAD or CLONE_PARENT cannot have exit_signal
+    let clone_thread = super::clone_flags::CLONE_THREAD;
+    let clone_parent = super::clone_flags::CLONE_PARENT;
+    if (args.flags & (clone_thread | clone_parent)) != 0 && args.exit_signal != 0 {
+        return EINVAL;
+    }
+
+    // Get parent's return address, flags, and stack from per-CPU data
+    let parent_rip = Aarch64Arch::get_syscall_user_rip();
+    let parent_rflags = Aarch64Arch::get_syscall_user_rflags();
+    let parent_rsp = Aarch64Arch::get_syscall_user_rsp();
+
+    // Calculate actual child stack pointer
+    // clone3 provides stack base and size; we need to compute the stack top
+    let child_stack = if args.stack != 0 {
+        // Stack grows down, so stack top = stack + stack_size
+        args.stack.wrapping_add(args.stack_size)
+    } else {
+        0 // Inherit parent stack (for fork-like behavior)
+    };
+
+    let config = CloneConfig {
+        flags: args.flags,
+        child_stack,
+        parent_rip,
+        parent_rflags,
+        parent_rsp,
+        parent_tidptr: args.parent_tid,
+        child_tidptr: args.child_tid,
+        tls: args.tls,
+    };
+
+    // Get frame allocator
+    let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
+
+    match super::percpu::do_clone(config, &mut frame_alloc) {
+        Ok(child_tid) => child_tid as i64,
+        Err(errno) => -(errno as i64),
+    }
+}
+
+// =============================================================================
+// personality syscall - Process execution domain
+// =============================================================================
+
+/// sys_personality - set process execution domain
+///
+/// The personality syscall controls various execution behaviors like
+/// how the kernel reports certain system information. Used primarily
+/// for running programs compiled for different ABIs.
+///
+/// # Arguments
+/// * `personality` - New personality value, or 0xFFFFFFFF to query current
+///
+/// # Returns
+/// * Previous personality value on success
+///
+/// # Linux ABI
+/// If personality is 0xFFFFFFFF, returns current personality without changing it.
+/// Otherwise, sets new personality and returns old value.
+pub fn sys_personality(personality: u32) -> i64 {
+    // Get current personality
+    let old = super::percpu::get_current_personality();
+
+    // If querying only, return current value
+    if personality == 0xFFFFFFFF {
+        return old as i64;
+    }
+
+    // Set new personality
+    super::percpu::set_current_personality(personality);
+
+    old as i64
+}
+
+// =============================================================================
+// syslog syscall - Kernel logging operations
+// =============================================================================
+
+/// Syslog action codes (from Linux include/linux/syslog.h)
+pub mod syslog_action {
+    /// Close the log (nop for us)
+    pub const SYSLOG_ACTION_CLOSE: i32 = 0;
+    /// Open the log (nop for us)
+    pub const SYSLOG_ACTION_OPEN: i32 = 1;
+    /// Read from the log
+    pub const SYSLOG_ACTION_READ: i32 = 2;
+    /// Read all messages (and mark as read)
+    pub const SYSLOG_ACTION_READ_ALL: i32 = 3;
+    /// Read all messages and clear ring buffer
+    pub const SYSLOG_ACTION_READ_CLEAR: i32 = 4;
+    /// Clear ring buffer
+    pub const SYSLOG_ACTION_CLEAR: i32 = 5;
+    /// Disable printk to console
+    pub const SYSLOG_ACTION_CONSOLE_OFF: i32 = 6;
+    /// Enable printk to console
+    pub const SYSLOG_ACTION_CONSOLE_ON: i32 = 7;
+    /// Set console log level
+    pub const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
+    /// Return number of unread characters
+    pub const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
+    /// Return size of the log buffer
+    pub const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
+}
+
+/// sys_syslog - read and/or clear kernel message ring buffer
+///
+/// Provides access to the kernel's message buffer (dmesg).
+///
+/// # Arguments
+/// * `type_` - Operation to perform (SYSLOG_ACTION_*)
+/// * `buf` - User buffer for read operations
+/// * `len` - Length of buffer
+///
+/// # Returns
+/// * >= 0 on success (depends on operation)
+/// * < 0 on error
+///
+/// # Permissions
+/// Most operations require CAP_SYSLOG or CAP_SYS_ADMIN.
+pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32) -> i64 {
+    use syslog_action::*;
+
+    // Basic validation
+    if len < 0 {
+        return EINVAL;
+    }
+
+    // Check permissions for privileged operations
+    // SYSLOG_ACTION_READ_ALL, READ_CLEAR, CLEAR, CONSOLE_* require CAP_SYSLOG
+    let needs_cap = matches!(
+        type_,
+        SYSLOG_ACTION_READ
+            | SYSLOG_ACTION_READ_ALL
+            | SYSLOG_ACTION_READ_CLEAR
+            | SYSLOG_ACTION_CLEAR
+            | SYSLOG_ACTION_CONSOLE_OFF
+            | SYSLOG_ACTION_CONSOLE_ON
+            | SYSLOG_ACTION_CONSOLE_LEVEL
+    );
+
+    if needs_cap
+        && !super::capable(super::CAP_SYSLOG)
+        && !super::capable(super::CAP_SYS_ADMIN)
+    {
+        return EPERM;
+    }
+
+    match type_ {
+        SYSLOG_ACTION_CLOSE | SYSLOG_ACTION_OPEN => {
+            // No-op, just return success
+            0
+        }
+
+        SYSLOG_ACTION_READ
+        | SYSLOG_ACTION_READ_ALL
+        | SYSLOG_ACTION_READ_CLEAR => {
+            // Read from kernel log buffer
+            if buf == 0 || len == 0 {
+                return EINVAL;
+            }
+            if !A::access_ok(buf, len as usize) {
+                return EFAULT;
+            }
+
+            // For now, we don't have a kernel log buffer implementation
+            // Just return 0 bytes read (empty buffer)
+            0
+        }
+
+        SYSLOG_ACTION_CLEAR => {
+            // Clear the ring buffer - no-op for now
+            0
+        }
+
+        SYSLOG_ACTION_CONSOLE_OFF => {
+            // Disable console logging - no-op for now
+            0
+        }
+
+        SYSLOG_ACTION_CONSOLE_ON => {
+            // Enable console logging - no-op for now
+            0
+        }
+
+        SYSLOG_ACTION_CONSOLE_LEVEL => {
+            // Set console log level
+            // len parameter is the log level (1-8 typically)
+            if !(1..=8).contains(&len) {
+                return EINVAL;
+            }
+            // No-op for now
+            0
+        }
+
+        SYSLOG_ACTION_SIZE_UNREAD => {
+            // Return number of unread bytes
+            // We don't track this, so return 0
+            0
+        }
+
+        SYSLOG_ACTION_SIZE_BUFFER => {
+            // Return size of log buffer
+            // We don't have one, so return a reasonable default
+            0
+        }
+
+        _ => EINVAL,
+    }
+}
+

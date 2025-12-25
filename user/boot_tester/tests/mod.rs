@@ -28,6 +28,7 @@ pub mod epoll;
 pub mod signalfd;
 pub mod prctl;
 pub mod inotify;
+pub mod clone3_syslog;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -55,4 +56,5 @@ pub fn run_all_tests() {
     signalfd::run_tests();
     prctl::run_tests();
     inotify::run_tests();
+    clone3_syslog::run_tests();
 }

@@ -231,6 +231,8 @@ pub const SYS_GETTID: u64 = 178;
 pub const SYS_BRK: u64 = 214;
 pub const SYS_MUNMAP: u64 = 215;
 pub const SYS_CLONE: u64 = 220;
+/// clone3(uargs, size) - Modern extensible clone
+pub const SYS_CLONE3: u64 = 435;
 pub const SYS_EXECVE: u64 = 221;
 pub const SYS_MMAP: u64 = 222;
 pub const SYS_MPROTECT: u64 = 226;
@@ -379,6 +381,14 @@ pub const SYS_SET_ROBUST_LIST: u64 = 99;
 pub const SYS_GET_ROBUST_LIST: u64 = 100;
 /// futex_waitv(waiters, nr_futexes, flags, timeout, clockid)
 pub const SYS_FUTEX_WAITV: u64 = 449;
+
+// Personality (execution domain)
+/// personality(persona) - Set process execution domain
+pub const SYS_PERSONALITY: u64 = 92;
+
+// System logging
+/// syslog(type, buf, len) - Read/control kernel message ring buffer
+pub const SYS_SYSLOG: u64 = 116;
 
 // SysV IPC syscalls (aarch64 numbers)
 /// msgget(key, msgflg)
@@ -738,8 +748,25 @@ pub fn aarch64_syscall_dispatch(
         SYS_EXIT | SYS_EXIT_GROUP => sys_exit(arg0 as i32),
         SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
         SYS_CLONE => sys_clone(arg0, arg1, arg2, arg3, arg4) as u64,
+        SYS_CLONE3 => {
+            use crate::task::syscall::sys_clone3;
+            sys_clone3(arg0, arg1) as u64
+        }
         SYS_EXECVE => sys_execve(arg0, arg1, arg2) as u64,
         SYS_WAIT4 => sys_wait4(arg0 as i64, arg1, arg2 as i32, arg3) as u64,
+
+        // Personality (execution domain)
+        SYS_PERSONALITY => {
+            use crate::task::syscall::sys_personality;
+            sys_personality(arg0 as u32) as u64
+        }
+
+        // System logging
+        SYS_SYSLOG => {
+            use crate::arch::Uaccess;
+            use crate::task::syscall::sys_syslog;
+            sys_syslog::<Uaccess>(arg0 as i32, arg1, arg2 as i32) as u64
+        }
 
         // Power management
         SYS_REBOOT => crate::power::sys_reboot(arg0 as u32, arg1 as u32, arg2 as u32, arg3) as u64,

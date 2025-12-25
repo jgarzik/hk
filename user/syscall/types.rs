@@ -1501,3 +1501,46 @@ pub struct InotifyEvent {
     pub len: u32,
     // Followed by name bytes
 }
+
+// ============================================================================
+// clone3 syscall types
+// ============================================================================
+
+/// clone_args structure for clone3 syscall (matches Linux struct clone_args)
+///
+/// The structure is versioned by size, allowing future extensions.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CloneArgs {
+    /// Clone flags (CLONE_* constants)
+    pub flags: u64,
+    /// File descriptor for pidfd (CLONE_PIDFD)
+    pub pidfd: u64,
+    /// Address to store child TID in child's memory (CLONE_CHILD_SETTID)
+    pub child_tid: u64,
+    /// Address to store child TID in parent's memory (CLONE_PARENT_SETTID)
+    pub parent_tid: u64,
+    /// Exit signal for child
+    pub exit_signal: u64,
+    /// Lowest address of the stack
+    pub stack: u64,
+    /// Size of the stack in bytes
+    pub stack_size: u64,
+    /// TLS pointer for child (CLONE_SETTLS)
+    pub tls: u64,
+    /// Array of PIDs for set_tid feature (not implemented)
+    pub set_tid: u64,
+    /// Size of set_tid array
+    pub set_tid_size: u64,
+    /// Cgroup file descriptor (not implemented)
+    pub cgroup: u64,
+}
+
+/// Size of clone_args version 0 (flags through tls)
+pub const CLONE_ARGS_SIZE_VER0: usize = 64;
+
+// Common personality values
+/// Default Linux personality
+pub const PER_LINUX: u32 = 0;
+/// Query personality without changing it
+pub const PERSONALITY_QUERY: u32 = 0xFFFFFFFF;
