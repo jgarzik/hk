@@ -291,6 +291,10 @@ pub const SYS_TIMERFD_CREATE: u64 = 283;
 pub const SYS_TIMERFD_SETTIME: u64 = 286;
 pub const SYS_TIMERFD_GETTIME: u64 = 287;
 
+// eventfd syscalls (Section 7.1)
+pub const SYS_EVENTFD: u64 = 284;
+pub const SYS_EVENTFD2: u64 = 290;
+
 // POSIX timer syscalls (Section 6.2)
 pub const SYS_TIMER_CREATE: u64 = 222;
 pub const SYS_TIMER_SETTIME: u64 = 223;
@@ -802,6 +806,20 @@ pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: *const ITimerSpec, ol
 #[inline(always)]
 pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
     unsafe { syscall2!(SYS_TIMERFD_GETTIME, fd, curr_value) }
+}
+
+// --- eventfd ---
+
+/// eventfd(initval) - create eventfd (legacy, x86_64 only)
+#[inline(always)]
+pub fn sys_eventfd(initval: u32) -> i64 {
+    unsafe { syscall1!(SYS_EVENTFD, initval) }
+}
+
+/// eventfd2(initval, flags) - create eventfd with flags
+#[inline(always)]
+pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
+    unsafe { syscall2!(SYS_EVENTFD2, initval, flags) }
 }
 
 // --- POSIX Timers ---

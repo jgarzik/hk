@@ -188,6 +188,10 @@ pub const SYS_TIMERFD_GETTIME: u64 = 87;
 pub const SYS_CAPGET: u64 = 90;
 pub const SYS_CAPSET: u64 = 91;
 
+// eventfd syscalls (Section 7.1)
+// NOTE: aarch64 only has eventfd2, not the legacy eventfd
+pub const SYS_EVENTFD2: u64 = 19;
+
 // POSIX timer syscalls (Section 6.2)
 pub const SYS_TIMER_CREATE: u64 = 107;
 pub const SYS_TIMER_GETTIME: u64 = 108;
@@ -561,6 +565,15 @@ pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: *const ITimerSpec, ol
 #[inline(always)]
 pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
     unsafe { syscall2!(SYS_TIMERFD_GETTIME, fd, curr_value) }
+}
+
+// --- eventfd ---
+
+/// eventfd2(initval, flags) - create eventfd with flags
+/// NOTE: aarch64 only has eventfd2, not the legacy eventfd
+#[inline(always)]
+pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
+    unsafe { syscall2!(SYS_EVENTFD2, initval, flags) }
 }
 
 // --- POSIX Timers ---

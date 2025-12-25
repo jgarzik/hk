@@ -240,9 +240,8 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 
 - [x] pipe
 - [x] pipe2
-- [ ] eventfd
-- [ ] eventfd2
-- [ ] eventfd2 (flags)
+- [x] eventfd
+- [x] eventfd2
 
 7.2 Futex (core for modern libs/threads)
 

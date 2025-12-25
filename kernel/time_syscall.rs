@@ -411,6 +411,7 @@ pub fn sys_settimeofday(tv: u64, tz: u64) -> i64 {
 // Timerfd syscalls
 // =============================================================================
 
+use crate::eventfd::{create_eventfd, efd_flags};
 use crate::pipe::FD_CLOEXEC;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
@@ -579,4 +580,57 @@ pub fn sys_timerfd_gettime(fd: i32, curr_value: u64) -> i64 {
     }
 
     0
+}
+
+// ============================================================================
+// eventfd syscalls
+// ============================================================================
+
+/// sys_eventfd2 - create an eventfd file descriptor
+///
+/// # Arguments
+/// * `initval` - Initial value for the counter
+/// * `flags` - EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE
+///
+/// Returns fd on success, negative errno on error.
+pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
+    // Validate flags (only EFD_CLOEXEC, EFD_NONBLOCK, and EFD_SEMAPHORE are allowed)
+    let valid_flags = efd_flags::EFD_CLOEXEC | efd_flags::EFD_NONBLOCK | efd_flags::EFD_SEMAPHORE;
+    if flags & !valid_flags != 0 {
+        return EINVAL;
+    }
+
+    // Create the eventfd file
+    let file = match create_eventfd(initval as u64, flags) {
+        Ok(f) => f,
+        Err(_) => return EMFILE,
+    };
+
+    // Get the FD table and allocate a file descriptor
+    let fd_table = match get_task_fd(current_tid()) {
+        Some(t) => t,
+        None => return EMFILE,
+    };
+    let mut table = fd_table.lock();
+    let fd_flags = if flags & efd_flags::EFD_CLOEXEC != 0 {
+        FD_CLOEXEC
+    } else {
+        0
+    };
+
+    match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
+        Ok(fd) => fd as i64,
+        Err(e) => -(e as i64),
+    }
+}
+
+/// sys_eventfd - create an eventfd file descriptor (legacy, x86_64 only)
+///
+/// # Arguments
+/// * `initval` - Initial value for the counter
+///
+/// Returns fd on success, negative errno on error.
+#[cfg(target_arch = "x86_64")]
+pub fn sys_eventfd(initval: u32) -> i64 {
+    sys_eventfd2(initval, 0)
 }

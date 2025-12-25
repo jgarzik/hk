@@ -929,6 +929,11 @@ pub const TFD_NONBLOCK: i32 = 0o4000;
 pub const TFD_TIMER_ABSTIME: i32 = 1;
 pub const TFD_TIMER_CANCEL_ON_SET: i32 = 2;
 
+/// eventfd flags
+pub const EFD_SEMAPHORE: i32 = 1;
+pub const EFD_CLOEXEC: i32 = 0o2000000;
+pub const EFD_NONBLOCK: i32 = 0o4000;
+
 // ============================================================================
 // POSIX timer types and constants (Section 6.2)
 // ============================================================================

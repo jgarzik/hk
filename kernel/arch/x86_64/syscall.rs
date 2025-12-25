@@ -133,6 +133,12 @@ pub const SYS_TIMERFD_SETTIME: u64 = 286;
 /// timerfd_gettime(fd, curr_value)
 pub const SYS_TIMERFD_GETTIME: u64 = 287;
 
+// eventfd syscalls (Section 7.1)
+/// eventfd(initval)
+pub const SYS_EVENTFD: u64 = 284;
+/// eventfd2(initval, flags)
+pub const SYS_EVENTFD2: u64 = 290;
+
 // POSIX timer syscalls (Section 6.2)
 /// timer_create(clockid, sigevent, timerid)
 pub const SYS_TIMER_CREATE: u64 = 222;
@@ -1093,9 +1099,9 @@ pub fn x86_64_syscall_dispatch(
         sys_setsid, sys_vfork, sys_wait4, sys_waitid,
     };
     use crate::time_syscall::{
-        sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime,
-        sys_gettimeofday, sys_nanosleep, sys_settimeofday, sys_time, sys_timerfd_create,
-        sys_timerfd_gettime, sys_timerfd_settime,
+        sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime, sys_eventfd,
+        sys_eventfd2, sys_gettimeofday, sys_nanosleep, sys_settimeofday, sys_time,
+        sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
     };
 
     match num {
@@ -1154,6 +1160,8 @@ pub fn x86_64_syscall_dispatch(
         SYS_TIMERFD_CREATE => sys_timerfd_create(arg0 as i32, arg1 as i32) as u64,
         SYS_TIMERFD_SETTIME => sys_timerfd_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64,
         SYS_TIMERFD_GETTIME => sys_timerfd_gettime(arg0 as i32, arg1) as u64,
+        SYS_EVENTFD => sys_eventfd(arg0 as u32) as u64,
+        SYS_EVENTFD2 => sys_eventfd2(arg0 as u32, arg1 as i32) as u64,
 
         // POSIX timer syscalls (Section 6.2)
         SYS_TIMER_CREATE => crate::posix_timer::sys_timer_create(arg0 as i32, arg1, arg2) as u64,
