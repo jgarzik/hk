@@ -47,6 +47,7 @@ mod frame_alloc;
 pub mod fs;
 mod heap;
 pub mod ipc;
+pub mod membarrier;
 pub mod mm;
 #[cfg(target_arch = "x86_64")]
 mod multiboot2;

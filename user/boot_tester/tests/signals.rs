@@ -11,12 +11,14 @@
 //! - Test 81: rt_sigaction() EINVAL - invalid signal
 //! - Test 82: rt_sigaction() SIGKILL - can't change
 //! - Test: CLONE_CLEAR_SIGHAND - reset handlers after clone
+//! - Test: rt_sigtimedwait() - wait for signal with timeout
+//! - Test: sigaltstack() - alternate signal stack
 
 use super::helpers::{print, println, print_num};
 use hk_syscall::{
     sys_clone, sys_exit, sys_getpid, sys_gettid, sys_kill, sys_rt_sigaction, sys_rt_sigpending,
-    sys_rt_sigprocmask, sys_tgkill, sys_tkill, sys_wait4, CLONE_CLEAR_SIGHAND, SIG_BLOCK, SIG_DFL,
-    SIG_IGN, SIGCHLD, SIGKILL, SIGUSR1,
+    sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_sigaltstack, sys_tgkill, sys_tkill, sys_wait4,
+    CLONE_CLEAR_SIGHAND, SIG_BLOCK, SIG_DFL, SIG_IGN, SIGCHLD, SIGKILL, SIGUSR1,
 };
 
 /// Run all signal tests
@@ -31,6 +33,8 @@ pub fn run_tests() {
     test_sigaction_einval();
     test_sigaction_sigkill();
     test_clone_clear_sighand();
+    test_sigtimedwait();
+    test_sigaltstack();
 }
 
 /// Test 74: rt_sigprocmask() - get and set signal mask
@@ -260,4 +264,117 @@ fn test_clone_clear_sighand() {
             print_num(exit_code as i64);
         }
     }
+}
+
+/// Test: rt_sigtimedwait() - wait for signal with zero timeout
+fn test_sigtimedwait() {
+    // Wait for SIGUSR1 with zero timeout (should return -EAGAIN)
+    let wait_set: u64 = 1 << (SIGUSR1 - 1);
+    let ts = [0i64, 0i64]; // Zero timeout
+
+    let ret = sys_rt_sigtimedwait(
+        &wait_set as *const u64 as u64,
+        0, // No info requested
+        ts.as_ptr() as u64,
+        8,
+    );
+
+    // With zero timeout and no pending signal, should return -EAGAIN (-11)
+    if ret == -11 {
+        println(b"SIGTIMEDWAIT:OK");
+    } else {
+        print(b"SIGTIMEDWAIT:FAIL: expected -11 (EAGAIN), got ");
+        print_num(ret);
+    }
+}
+
+/// Sigaltstack structure (matching Linux stack_t)
+#[repr(C)]
+struct StackT {
+    ss_sp: u64,
+    ss_flags: i32,
+    _pad: i32,
+    ss_size: u64,
+}
+
+/// SS_DISABLE flag
+const SS_DISABLE: i32 = 2;
+
+/// Test: sigaltstack() - set and get alternate signal stack
+fn test_sigaltstack() {
+    // First, query current altstack (should be disabled initially)
+    let mut old_stack = StackT {
+        ss_sp: 0,
+        ss_flags: 0,
+        _pad: 0,
+        ss_size: 0,
+    };
+
+    let ret = sys_sigaltstack(0, &mut old_stack as *mut StackT as u64);
+    if ret != 0 {
+        print(b"SIGALTSTACK:FAIL: query failed, ret = ");
+        print_num(ret);
+        return;
+    }
+
+    // Old stack should be disabled (SS_DISABLE flag set)
+    if old_stack.ss_flags & SS_DISABLE == 0 {
+        print(b"SIGALTSTACK:FAIL: expected SS_DISABLE in old_stack, got flags = ");
+        print_num(old_stack.ss_flags as i64);
+        return;
+    }
+
+    // Set up a new alternate stack
+    static mut ALT_STACK: [u8; 8192] = [0; 8192];
+    let new_stack = StackT {
+        ss_sp: core::ptr::addr_of!(ALT_STACK) as u64,
+        ss_flags: 0, // Enable
+        _pad: 0,
+        ss_size: 8192,
+    };
+
+    let ret = sys_sigaltstack(&new_stack as *const StackT as u64, 0);
+    if ret != 0 {
+        print(b"SIGALTSTACK:FAIL: set failed, ret = ");
+        print_num(ret);
+        return;
+    }
+
+    // Query again to verify it was set
+    let mut check_stack = StackT {
+        ss_sp: 0,
+        ss_flags: 0,
+        _pad: 0,
+        ss_size: 0,
+    };
+
+    let ret = sys_sigaltstack(0, &mut check_stack as *mut StackT as u64);
+    if ret != 0 {
+        print(b"SIGALTSTACK:FAIL: verify query failed, ret = ");
+        print_num(ret);
+        return;
+    }
+
+    // Verify the stack was configured
+    if check_stack.ss_flags & SS_DISABLE != 0 {
+        println(b"SIGALTSTACK:FAIL: stack still disabled after set");
+        return;
+    }
+
+    if check_stack.ss_size != 8192 {
+        print(b"SIGALTSTACK:FAIL: wrong size, expected 8192, got ");
+        print_num(check_stack.ss_size as i64);
+        return;
+    }
+
+    // Restore disabled state
+    let disable_stack = StackT {
+        ss_sp: 0,
+        ss_flags: SS_DISABLE,
+        _pad: 0,
+        ss_size: 0,
+    };
+    sys_sigaltstack(&disable_stack as *const StackT as u64, 0);
+
+    println(b"SIGALTSTACK:OK");
 }

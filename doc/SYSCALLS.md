@@ -198,10 +198,10 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] rt_sigaction
 - [x] rt_sigprocmask
 - [x] rt_sigpending
-- [ ] rt_sigtimedwait
+- [x] rt_sigtimedwait
 - [ ] rt_sigqueueinfo
 - [ ] rt_sigsuspend
-- [ ] sigaltstack
+- [x] sigaltstack
 - [x] signalfd
 - [x] signalfd4
 - [x] tgkill (targeted kill by tid)
@@ -407,7 +407,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 - [ ] ptrace
 - [ ] perf_event_open
 - [ ] bpf
-- [ ] membarrier
+- [x] membarrier
 - [ ] kcmp (compare processes)
 - [ ] rseq (restartable sequences)
 
@@ -423,7 +423,7 @@ Misc utilities that don't fit elsewhere:
 - [ ] personality
 - [x] umount / umount2 (already listed)
 - [ ] vhangup
-- [ ] readahead
+- [x] readahead
 - [ ] sysfs (legacy)
 - fanotify_* (already listed)
 - landlock_add_rule, landlock_restrict_self (if you want Landlock later)

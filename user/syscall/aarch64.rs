@@ -269,9 +269,17 @@ pub const SYS_SETNS: u64 = 268;
 pub const SYS_KILL: u64 = 129;
 pub const SYS_TKILL: u64 = 130;
 pub const SYS_TGKILL: u64 = 131;
+pub const SYS_SIGALTSTACK: u64 = 132;
 pub const SYS_RT_SIGACTION: u64 = 134;
 pub const SYS_RT_SIGPROCMASK: u64 = 135;
 pub const SYS_RT_SIGPENDING: u64 = 136;
+pub const SYS_RT_SIGTIMEDWAIT: u64 = 137;
+
+// Memory barrier syscall
+pub const SYS_MEMBARRIER: u64 = 283;
+
+// File readahead syscall
+pub const SYS_READAHEAD: u64 = 213;
 
 // Pipe/poll/select syscalls (aarch64 numbers)
 pub const SYS_PIPE2: u64 = 59;
@@ -1074,6 +1082,18 @@ pub fn sys_rt_sigpending(set: u64, sigsetsize: u64) -> i64 {
     unsafe { syscall2!(SYS_RT_SIGPENDING, set, sigsetsize) }
 }
 
+/// rt_sigtimedwait(set, info, ts, sigsetsize) - wait for signal
+#[inline(always)]
+pub fn sys_rt_sigtimedwait(set: u64, info: u64, ts: u64, sigsetsize: u64) -> i64 {
+    unsafe { syscall4!(SYS_RT_SIGTIMEDWAIT, set, info, ts, sigsetsize) }
+}
+
+/// sigaltstack(ss, oss) - set/get alternate signal stack
+#[inline(always)]
+pub fn sys_sigaltstack(ss: u64, oss: u64) -> i64 {
+    unsafe { syscall2!(SYS_SIGALTSTACK, ss, oss) }
+}
+
 /// kill(pid, sig) - send signal to process
 #[inline(always)]
 pub fn sys_kill(pid: i64, sig: u32) -> i64 {
@@ -1855,4 +1875,30 @@ pub fn sys_inotify_add_watch(fd: i32, pathname: *const u8, mask: u32) -> i64 {
 #[inline(always)]
 pub fn sys_inotify_rm_watch(fd: i32, wd: i32) -> i64 {
     unsafe { syscall2!(SYS_INOTIFY_RM_WATCH, fd, wd) }
+}
+
+// ============================================================================
+// Membarrier
+// ============================================================================
+
+/// membarrier command constants
+pub const MEMBARRIER_CMD_QUERY: i32 = 0;
+pub const MEMBARRIER_CMD_GLOBAL: i32 = 1 << 0;
+pub const MEMBARRIER_CMD_PRIVATE_EXPEDITED: i32 = 1 << 3;
+pub const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
+
+/// membarrier(cmd, flags, cpu_id) - memory barrier across threads
+#[inline(always)]
+pub fn sys_membarrier(cmd: i32, flags: u32, cpu_id: i32) -> i64 {
+    unsafe { syscall3!(SYS_MEMBARRIER, cmd, flags, cpu_id) }
+}
+
+// ============================================================================
+// Readahead
+// ============================================================================
+
+/// readahead(fd, offset, count) - initiate file readahead
+#[inline(always)]
+pub fn sys_readahead(fd: i32, offset: i64, count: usize) -> i64 {
+    unsafe { syscall3!(SYS_READAHEAD, fd, offset, count) }
 }

@@ -258,11 +258,19 @@ pub const SYS_WAIT4: u64 = 260;
 pub const SYS_KILL: u64 = 129;
 pub const SYS_TKILL: u64 = 130;
 pub const SYS_TGKILL: u64 = 131;
+pub const SYS_SIGALTSTACK: u64 = 132;
 pub const SYS_RT_SIGACTION: u64 = 134;
 pub const SYS_RT_SIGPROCMASK: u64 = 135;
 pub const SYS_RT_SIGPENDING: u64 = 136;
+pub const SYS_RT_SIGTIMEDWAIT: u64 = 137;
 #[allow(dead_code)] // Infrastructure for future signal delivery
 pub const SYS_RT_SIGRETURN: u64 = 139;
+
+// Memory barrier syscall
+pub const SYS_MEMBARRIER: u64 = 283;
+
+// File readahead syscall
+pub const SYS_READAHEAD: u64 = 213;
 
 // Scheduling priority (aarch64 numbers - note: swapped from x86_64)
 /// setpriority(which, who, niceval)
@@ -685,7 +693,9 @@ pub fn aarch64_syscall_dispatch(
         SYS_INOTIFY_ADD_WATCH => {
             crate::inotify::sys_inotify_add_watch(arg0 as i32, arg1, arg2 as u32) as u64
         }
-        SYS_INOTIFY_RM_WATCH => crate::inotify::sys_inotify_rm_watch(arg0 as i32, arg1 as i32) as u64,
+        SYS_INOTIFY_RM_WATCH => {
+            crate::inotify::sys_inotify_rm_watch(arg0 as i32, arg1 as i32) as u64
+        }
 
         // epoll syscalls (Section 9.1)
         SYS_EPOLL_CREATE1 => crate::epoll::sys_epoll_create1(arg0 as i32) as u64,
@@ -745,11 +755,25 @@ pub fn aarch64_syscall_dispatch(
             crate::signal::syscall::sys_rt_sigprocmask(arg0 as i32, arg1, arg2, arg3) as u64
         }
         SYS_RT_SIGPENDING => crate::signal::syscall::sys_rt_sigpending(arg0, arg1) as u64,
+        SYS_RT_SIGTIMEDWAIT => {
+            crate::signal::syscall::sys_rt_sigtimedwait(arg0, arg1, arg2, arg3) as u64
+        }
+        SYS_SIGALTSTACK => crate::signal::syscall::sys_sigaltstack(arg0, arg1) as u64,
         SYS_KILL => crate::signal::syscall::sys_kill(arg0 as i64, arg1 as u32) as u64,
         SYS_TGKILL => {
             crate::signal::syscall::sys_tgkill(arg0 as i64, arg1 as i64, arg2 as u32) as u64
         }
         SYS_TKILL => crate::signal::syscall::sys_tkill(arg0 as i64, arg1 as u32) as u64,
+
+        // membarrier syscall
+        SYS_MEMBARRIER => {
+            crate::membarrier::sys_membarrier(arg0 as i32, arg1 as u32, arg2 as i32) as u64
+        }
+
+        // readahead syscall
+        SYS_READAHEAD => {
+            crate::fs::syscall::sys_readahead(arg0 as i32, arg1 as i64, arg2 as usize) as u64
+        }
 
         // Scheduling priority
         SYS_GETPRIORITY => {

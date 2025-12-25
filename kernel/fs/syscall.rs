@@ -6673,3 +6673,64 @@ pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
         Err(e) => xattr_error_to_errno(e),
     }
 }
+
+// =============================================================================
+// readahead syscall
+// =============================================================================
+
+/// sys_readahead - initiate file readahead into the page cache
+///
+/// This syscall initiates readahead on a file, populating the page cache
+/// with pages from the file in preparation for future reads. This can
+/// improve read performance by starting I/O before the data is needed.
+///
+/// # Arguments
+/// * `fd` - File descriptor to read ahead
+/// * `offset` - Starting offset in the file
+/// * `count` - Number of bytes to read ahead
+///
+/// # Returns
+/// 0 on success, negative errno on error:
+/// * -EBADF: Invalid file descriptor or not open for reading
+/// * -EINVAL: File type doesn't support readahead (e.g., pipes, sockets)
+///
+/// # Notes
+/// This is a hint to the kernel - it may read more or less than requested,
+/// and can be a no-op if the kernel doesn't have page cache support.
+pub fn sys_readahead(fd: i32, offset: i64, count: usize) -> i64 {
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Verify file is opened for reading
+    if !file.is_readable() {
+        return EBADF;
+    }
+
+    // Check file type - only regular files and block devices support readahead
+    if let Some(inode) = file.get_inode() {
+        let mode = inode.mode();
+        if !mode.is_file() && !mode.is_blkdev() {
+            return EINVAL;
+        }
+    } else {
+        // No inode means special file (pipe, socket, etc.)
+        return EINVAL;
+    }
+
+    // Validate offset
+    if offset < 0 {
+        return EINVAL;
+    }
+
+    // Currently a no-op since we don't have a full page cache.
+    // In a full implementation, we would:
+    // 1. Calculate page-aligned start and end
+    // 2. Call the file's address_space->readahead() method
+    // 3. Or use vfs_fadvise(POSIX_FADV_WILLNEED)
+    let _ = count; // Suppress unused warning
+
+    0 // Success (hint accepted, even if no action taken)
+}

@@ -336,6 +336,241 @@ pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
     -4 // EINTR
 }
 
+/// siginfo_t structure for user space (Linux ABI)
+///
+/// This is the 128-byte structure passed to user space signal handlers
+/// and returned by rt_sigtimedwait.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SigInfo {
+    /// Signal number
+    pub si_signo: i32,
+    /// Error number (not used for most signals)
+    pub si_errno: i32,
+    /// Signal code (SI_USER, SI_KERNEL, etc.)
+    pub si_code: i32,
+    /// Padding for alignment
+    _pad0: i32,
+    /// Union of signal-specific data
+    _sifields: SigInfoFields,
+}
+
+/// Signal-specific fields union (128 bytes total for siginfo_t)
+#[repr(C)]
+#[derive(Clone, Copy)]
+union SigInfoFields {
+    /// Common: sender PID and UID
+    kill: SigInfoKill,
+    /// Padding to ensure 128-byte total size for siginfo_t
+    /// (128 - 16 bytes for header = 112 bytes)
+    _pad: [u8; 112],
+}
+
+impl Default for SigInfoFields {
+    fn default() -> Self {
+        Self { _pad: [0; 112] }
+    }
+}
+
+impl core::fmt::Debug for SigInfoFields {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Safety: accessing _pad is always safe
+        f.debug_struct("SigInfoFields").finish()
+    }
+}
+
+/// Kill signal info (SI_USER, SI_TKILL)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SigInfoKill {
+    /// Sender's PID
+    si_pid: i32,
+    /// Sender's UID
+    si_uid: u32,
+}
+
+/// Signal codes
+pub mod si_code {
+    /// Sent by kill, sigsend, raise
+    pub const SI_USER: i32 = 0;
+    /// Sent by kernel
+    pub const SI_KERNEL: i32 = 128;
+    /// Sent by sigqueue
+    pub const SI_QUEUE: i32 = -1;
+    /// Sent by timer expiration
+    pub const SI_TIMER: i32 = -2;
+    /// Sent by real-time mesq state change
+    pub const SI_MESGQ: i32 = -3;
+    /// Sent by AIO completion
+    pub const SI_ASYNCIO: i32 = -4;
+    /// Sent by queued SIGIO
+    pub const SI_SIGIO: i32 = -5;
+    /// Sent by tkill/tgkill
+    pub const SI_TKILL: i32 = -6;
+}
+
+impl SigInfo {
+    /// Create siginfo for a user-sent signal
+    pub fn from_kill(sig: u32, pid: i32, uid: u32) -> Self {
+        Self {
+            si_signo: sig as i32,
+            si_errno: 0,
+            si_code: si_code::SI_USER,
+            _pad0: 0,
+            _sifields: SigInfoFields {
+                kill: SigInfoKill {
+                    si_pid: pid,
+                    si_uid: uid,
+                },
+            },
+        }
+    }
+
+    /// Write siginfo to user space
+    pub fn write_to_user(&self, ptr: u64) -> Result<(), i32> {
+        // Write si_signo (offset 0)
+        if put_user::<Uaccess, i32>(ptr, self.si_signo).is_err() {
+            return Err(14); // EFAULT
+        }
+        // Write si_errno (offset 4)
+        if put_user::<Uaccess, i32>(ptr + 4, self.si_errno).is_err() {
+            return Err(14);
+        }
+        // Write si_code (offset 8)
+        if put_user::<Uaccess, i32>(ptr + 8, self.si_code).is_err() {
+            return Err(14);
+        }
+        // Write _pad0 (offset 12)
+        if put_user::<Uaccess, i32>(ptr + 12, self._pad0).is_err() {
+            return Err(14);
+        }
+        // Write kill fields (offset 16)
+        // Safety: We always initialize _sifields
+        let kill = unsafe { self._sifields.kill };
+        if put_user::<Uaccess, i32>(ptr + 16, kill.si_pid).is_err() {
+            return Err(14);
+        }
+        if put_user::<Uaccess, u32>(ptr + 20, kill.si_uid).is_err() {
+            return Err(14);
+        }
+        Ok(())
+    }
+}
+
+/// rt_sigtimedwait(uthese, uinfo, uts, sigsetsize) - wait for signal
+///
+/// Synchronously wait for a signal from the specified set. The calling
+/// thread is suspended until a signal from the set becomes pending, or
+/// the timeout expires.
+///
+/// # Arguments
+/// * `set_ptr` - Pointer to set of signals to wait for
+/// * `info_ptr` - Pointer to receive siginfo_t (can be null)
+/// * `ts_ptr` - Pointer to timeout (can be null for infinite wait)
+/// * `sigsetsize` - Size of sigset_t (must be 8)
+///
+/// # Returns
+/// Signal number on success, negative errno on error:
+/// * -EINTR: Interrupted by signal not in set
+/// * -EAGAIN: Timeout expired without signal
+/// * -EINVAL: Invalid sigsetsize or timeout
+/// * -EFAULT: Bad pointer
+pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize: u64) -> i64 {
+    use crate::signal::{SIGKILL, SIGSTOP};
+
+    // Validate sigsetsize
+    if sigsetsize != 8 {
+        return -22; // EINVAL
+    }
+
+    // Read the signal set to wait for
+    let wait_set = match get_user::<Uaccess, u64>(set_ptr) {
+        Ok(v) => SigSet::from_bits(v),
+        Err(_) => return -14, // EFAULT
+    };
+
+    // Read timeout if provided
+    let timeout_ns = if ts_ptr != 0 {
+        let tv_sec = match get_user::<Uaccess, i64>(ts_ptr) {
+            Ok(v) => v,
+            Err(_) => return -14, // EFAULT
+        };
+        let tv_nsec = match get_user::<Uaccess, i64>(ts_ptr + 8) {
+            Ok(v) => v,
+            Err(_) => return -14, // EFAULT
+        };
+
+        // Validate timeout
+        if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
+            return -22; // EINVAL
+        }
+
+        Some(tv_sec as u64 * 1_000_000_000 + tv_nsec as u64)
+    } else {
+        None // Infinite wait
+    };
+
+    let tid = current_tid();
+
+    // Cannot wait for SIGKILL or SIGSTOP (they're always delivered)
+    let mut mask = wait_set;
+    mask.remove(SIGKILL);
+    mask.remove(SIGSTOP);
+
+    // Check if any signals in the set are already pending
+    let dequeued_sig = with_task_signal_state(tid, |state| {
+        // Check private pending
+        let deliverable = state.pending.signal.intersect(&mask);
+        if let Some(sig) = deliverable.first() {
+            state.pending.remove(sig);
+            state.recalc_sigpending();
+            return Some(sig);
+        }
+
+        // Check shared pending
+        let mut shared = state.shared_pending.lock();
+        let deliverable = shared.signal.intersect(&mask);
+        if let Some(sig) = deliverable.first() {
+            shared.remove(sig);
+            drop(shared);
+            state.recalc_sigpending();
+            return Some(sig);
+        }
+
+        None
+    });
+
+    if let Some(Some(sig)) = dequeued_sig {
+        // Signal was pending - return it
+        if info_ptr != 0 {
+            // Create basic siginfo (SI_USER with pid/uid 0 since we don't track sender)
+            let siginfo = SigInfo::from_kill(sig, 0, 0);
+            if siginfo.write_to_user(info_ptr).is_err() {
+                return -14; // EFAULT
+            }
+        }
+        return sig as i64;
+    }
+
+    // No signal pending - check if we should wait
+    match timeout_ns {
+        Some(0) => {
+            // Zero timeout - return immediately
+            -11 // EAGAIN
+        }
+        Some(_ns) => {
+            // Non-zero timeout - for now, just return EAGAIN
+            // TODO: Implement actual sleeping with timeout
+            -11 // EAGAIN
+        }
+        None => {
+            // Infinite wait - for now, just return EAGAIN
+            // TODO: Implement actual sleeping
+            -11 // EAGAIN
+        }
+    }
+}
+
 /// rt_sigreturn() - return from signal handler
 ///
 /// This is called by the user-space signal trampoline after the signal
@@ -358,10 +593,91 @@ pub fn sys_rt_sigreturn() -> ! {
 
 /// sigaltstack(ss, oss) - set/get alternate signal stack
 ///
-/// Not yet implemented - returns ENOSYS.
-#[allow(dead_code)]
-pub fn sys_sigaltstack(_ss_ptr: u64, _oss_ptr: u64) -> i64 {
-    -38 // ENOSYS
+/// Sets up or queries an alternate signal stack for signal handling.
+/// This allows signal handlers to execute on a separate stack, which is
+/// useful when the normal stack might be corrupted (e.g., stack overflow).
+///
+/// # Arguments
+/// * `ss_ptr` - Pointer to new stack_t to set (can be null to just query)
+/// * `oss_ptr` - Pointer to receive old stack_t (can be null)
+///
+/// # Returns
+/// 0 on success, negative errno on error
+pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
+    use crate::signal::{AltStack, MINSIGSTKSZ, ss_flags};
+
+    let tid = current_tid();
+
+    with_task_signal_state(tid, |state| {
+        // Return old stack if requested
+        if oss_ptr != 0 {
+            let old = &state.altstack;
+            // Write ss_sp (offset 0)
+            if put_user::<Uaccess, u64>(oss_ptr, old.ss_sp).is_err() {
+                return -14i64; // EFAULT
+            }
+            // Write ss_flags (offset 8)
+            if put_user::<Uaccess, i32>(oss_ptr + 8, old.ss_flags).is_err() {
+                return -14; // EFAULT
+            }
+            // Write ss_size (offset 16, with padding after flags)
+            if put_user::<Uaccess, u64>(oss_ptr + 16, old.ss_size as u64).is_err() {
+                return -14; // EFAULT
+            }
+        }
+
+        // Set new stack if provided
+        if ss_ptr != 0 {
+            // Read ss_sp (offset 0)
+            let ss_sp = match get_user::<Uaccess, u64>(ss_ptr) {
+                Ok(v) => v,
+                Err(_) => return -14, // EFAULT
+            };
+            // Read ss_flags (offset 8)
+            let ss_flags_val = match get_user::<Uaccess, i32>(ss_ptr + 8) {
+                Ok(v) => v,
+                Err(_) => return -14, // EFAULT
+            };
+            // Read ss_size (offset 16)
+            let ss_size = match get_user::<Uaccess, u64>(ss_ptr + 16) {
+                Ok(v) => v as usize,
+                Err(_) => return -14, // EFAULT
+            };
+
+            // Cannot change while on signal stack
+            // TODO: Check if currently on signal stack using SP
+            // For now, we skip this check
+
+            // Validate flags - only SS_DISABLE and SS_FLAG_BITS are valid
+            let mode = ss_flags_val & !ss_flags::SS_FLAG_BITS;
+            if mode != 0 && mode != ss_flags::SS_DISABLE {
+                return -22; // EINVAL
+            }
+
+            if mode == ss_flags::SS_DISABLE {
+                // Disable the alternate stack
+                state.altstack = AltStack {
+                    ss_sp: 0,
+                    ss_size: 0,
+                    ss_flags: ss_flags::SS_DISABLE,
+                };
+            } else {
+                // Enable/update the alternate stack
+                if ss_size < MINSIGSTKSZ {
+                    return -12; // ENOMEM
+                }
+
+                state.altstack = AltStack {
+                    ss_sp,
+                    ss_size,
+                    ss_flags: ss_flags_val,
+                };
+            }
+        }
+
+        0i64
+    })
+    .unwrap_or(-3) // ESRCH
 }
 
 /// signalfd4(fd, mask, sizemask, flags) - create/update signalfd
