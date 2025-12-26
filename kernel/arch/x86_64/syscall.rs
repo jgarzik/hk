@@ -326,6 +326,8 @@ pub const SYS_UNLINKAT: u64 = 263;
 pub const SYS_MOUNT: u64 = 165;
 /// umount2(target, flags)
 pub const SYS_UMOUNT2: u64 = 166;
+/// pivot_root(new_root, put_old)
+pub const SYS_PIVOT_ROOT: u64 = 155;
 
 // Swap management
 /// swapon(path, swapflags)
@@ -1135,6 +1137,7 @@ pub fn x86_64_syscall_dispatch(
         // Pipe syscalls
         sys_pipe,
         sys_pipe2,
+        sys_pivot_root,
         // Poll syscalls
         sys_poll,
         sys_ppoll,
@@ -1492,6 +1495,7 @@ pub fn x86_64_syscall_dispatch(
         // Filesystem mounting
         SYS_MOUNT => sys_mount(arg0, arg1, arg2, arg3, arg4) as u64,
         SYS_UMOUNT2 => sys_umount2(arg0, arg1 as i32) as u64,
+        SYS_PIVOT_ROOT => sys_pivot_root(arg0, arg1) as u64,
 
         // Swap management
         SYS_SWAPON => crate::mm::sys_swapon(arg0, arg1 as i32) as u64,

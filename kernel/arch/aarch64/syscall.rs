@@ -30,6 +30,8 @@ pub const SYS_LINKAT: u64 = 37;
 pub const SYS_RENAMEAT: u64 = 38;
 pub const SYS_UMOUNT2: u64 = 39;
 pub const SYS_MOUNT: u64 = 40;
+/// pivot_root(new_root, put_old)
+pub const SYS_PIVOT_ROOT: u64 = 41;
 pub const SYS_SWAPON: u64 = 224;
 pub const SYS_SWAPOFF: u64 = 225;
 pub const SYS_FTRUNCATE: u64 = 46;
@@ -486,6 +488,7 @@ pub fn aarch64_syscall_dispatch(
         sys_mount,
         sys_openat,
         sys_pipe2,
+        sys_pivot_root,
         sys_ppoll,
         sys_pread64,
         sys_preadv,
@@ -560,6 +563,7 @@ pub fn aarch64_syscall_dispatch(
         SYS_RENAMEAT => sys_renameat(arg0 as i32, arg1, arg2 as i32, arg3) as u64,
         SYS_MOUNT => sys_mount(arg0, arg1, arg2, arg3, arg4) as u64,
         SYS_UMOUNT2 => sys_umount2(arg0, arg1 as i32) as u64,
+        SYS_PIVOT_ROOT => sys_pivot_root(arg0, arg1) as u64,
         SYS_SWAPON => crate::mm::sys_swapon(arg0, arg1 as i32) as u64,
         SYS_SWAPOFF => crate::mm::sys_swapoff(arg0) as u64,
         SYS_CHROOT => sys_chroot(arg0) as u64,

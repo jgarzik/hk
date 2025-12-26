@@ -7,8 +7,8 @@
 use super::helpers::{print, println, print_num};
 use hk_syscall::{
     sys_close, sys_exit, sys_fork, sys_open, sys_sethostname, sys_uname, sys_unshare,
-    sys_setns, sys_wait4, UtsName, O_RDONLY, CLONE_NEWUTS, CLONE_NEWNET, CLONE_NEWPID,
-    CLONE_NEWUSER, CLONE_NEWNS,
+    sys_setns, sys_wait4, sys_pivot_root, UtsName, O_RDONLY, CLONE_NEWUTS, CLONE_NEWNET,
+    CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWNS,
 };
 
 /// Run all namespace tests
@@ -22,6 +22,9 @@ pub fn run_tests() {
     test_unshare_newns();
     test_setns_ebadf();
     test_setns_uts();
+    test_pivot_root_enoent();
+    test_pivot_root_enotdir();
+    test_pivot_root_einval();
 }
 
 /// Test: unshare(0) should succeed (no-op)
@@ -432,5 +435,49 @@ fn test_unshare_newns() {
                 println(b"");
             }
         }
+    }
+}
+
+/// Test: pivot_root with non-existent paths returns ENOENT
+fn test_pivot_root_enoent() {
+    let ret = sys_pivot_root(
+        b"/nonexistent_path_for_pivot\0".as_ptr(),
+        b"/also_nonexistent\0".as_ptr(),
+    );
+    if ret == -2 {
+        // ENOENT
+        println(b"PIVOT_ROOT_ENOENT:OK");
+    } else {
+        print(b"PIVOT_ROOT_ENOENT:FAIL ret=");
+        print_num(ret);
+        println(b"");
+    }
+}
+
+/// Test: pivot_root with non-directory returns ENOTDIR
+fn test_pivot_root_enotdir() {
+    // /dev/null is a character device, not a directory
+    let ret = sys_pivot_root(b"/dev/null\0".as_ptr(), b"/tmp\0".as_ptr());
+    if ret == -20 {
+        // ENOTDIR
+        println(b"PIVOT_ROOT_ENOTDIR:OK");
+    } else {
+        print(b"PIVOT_ROOT_ENOTDIR:FAIL ret=");
+        print_num(ret);
+        println(b"");
+    }
+}
+
+/// Test: pivot_root with valid directories that aren't mountpoints returns EINVAL
+fn test_pivot_root_einval() {
+    // /bin exists but isn't a mount point - should get EINVAL
+    let ret = sys_pivot_root(b"/bin\0".as_ptr(), b"/bin\0".as_ptr());
+    if ret == -22 {
+        // EINVAL (not a mountpoint)
+        println(b"PIVOT_ROOT_EINVAL:OK");
+    } else {
+        print(b"PIVOT_ROOT_EINVAL:FAIL ret=");
+        print_num(ret);
+        println(b"");
     }
 }

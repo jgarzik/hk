@@ -3572,6 +3572,95 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
     }
 }
 
+/// pivot_root - change the root filesystem
+///
+/// Moves the root filesystem of the calling process's mount namespace
+/// to the directory `put_old` and makes `new_root` the new root filesystem.
+///
+/// # Arguments
+/// * `new_root_ptr` - User pointer to path that will become the new root
+/// * `put_old_ptr` - User pointer to path where old root will be moved
+///
+/// # Returns
+/// 0 on success, negative errno on error
+///
+/// # Errors
+/// * EPERM - Caller lacks CAP_SYS_ADMIN
+/// * EINVAL - Various invalid configuration (not mountpoints, put_old not under new_root)
+/// * ENOTDIR - new_root or put_old is not a directory
+/// * ENOENT - Path not found
+pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
+    // 1. Permission check: requires CAP_SYS_ADMIN
+    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+        return EPERM;
+    }
+
+    // 2. Copy paths from user space
+    let new_root_str = match strncpy_from_user::<Uaccess>(new_root_ptr, PATH_MAX) {
+        Ok(s) => s,
+        Err(_) => return EFAULT,
+    };
+    let put_old_str = match strncpy_from_user::<Uaccess>(put_old_ptr, PATH_MAX) {
+        Ok(s) => s,
+        Err(_) => return EFAULT,
+    };
+
+    // 3. Look up new_root path (must be directory)
+    let new_root_dentry = match lookup_path_flags(&new_root_str, LookupFlags::opendir()) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    // 4. Verify new_root is a mount point
+    let mnt_ns = super::mount::current_mnt_ns();
+    let new_mnt = match mnt_ns.find_mount_at(&new_root_dentry) {
+        Some(m) => m,
+        None => return EINVAL, // Not a mount point
+    };
+
+    // 5. Look up put_old path (must be directory)
+    let put_old_dentry = match lookup_path_flags(&put_old_str, LookupFlags::opendir()) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    // 6. Verify put_old is at or under new_root
+    if !is_subdir(&put_old_dentry, &new_root_dentry) {
+        return EINVAL;
+    }
+
+    // 7. Get old root mount - must exist
+    let _old_root_mnt = match mnt_ns.get_root() {
+        Some(m) => m,
+        None => return EINVAL,
+    };
+
+    // 8. Verify new_root is not the same as current root
+    // (pivoting to the same root is a no-op but Linux returns EBUSY)
+    if let Some(root_dentry) = mnt_ns.get_root_dentry()
+        && Arc::ptr_eq(&root_dentry, &new_root_dentry)
+    {
+        return EBUSY;
+    }
+
+    // 9. Set new root as namespace root
+    mnt_ns.set_root(new_mnt.clone());
+
+    // 10. Update task's fs root
+    // The new root dentry becomes the task's root
+    if let Some(fs) = crate::task::percpu::current_fs()
+        && let Some(new_path) = Path::from_dentry(new_root_dentry)
+    {
+        fs.set_root(new_path);
+    }
+
+    0
+}
+
 /// Helper to look up parent directory for creating new entries
 ///
 /// Returns the parent dentry and the final component name.

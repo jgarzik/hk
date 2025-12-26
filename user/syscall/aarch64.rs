@@ -253,6 +253,7 @@ pub const SYS_UTIMENSAT: u64 = 88;
 pub const SYS_MKNODAT: u64 = 33;
 pub const SYS_MOUNT: u64 = 40;
 pub const SYS_UMOUNT2: u64 = 39;
+pub const SYS_PIVOT_ROOT: u64 = 41;
 pub const SYS_SWAPON: u64 = 224;
 pub const SYS_SWAPOFF: u64 = 225;
 pub const SYS_SYNC: u64 = 81;
@@ -1014,6 +1015,12 @@ pub fn sys_mount(source: *const u8, target: *const u8, fstype: *const u8, flags:
 /// umount2(target, flags)
 pub fn sys_umount2(target: *const u8, flags: u64) -> i64 {
     unsafe { syscall2!(SYS_UMOUNT2, target, flags) }
+}
+
+/// pivot_root(new_root, put_old) - change the root filesystem
+#[inline(always)]
+pub fn sys_pivot_root(new_root: *const u8, put_old: *const u8) -> i64 {
+    unsafe { syscall2!(SYS_PIVOT_ROOT, new_root, put_old) }
 }
 
 /// swapon(path, swapflags) - enable a swap device/file
