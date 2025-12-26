@@ -1067,14 +1067,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         crate::task::set_clear_child_tid(child_tid, config.child_tidptr);
     }
 
-    printkln!(
-        "CLONE: parent_tid={} child_tid={} child_pid={} flags=0x{:x}",
-        current_tid,
-        child_tid,
-        child_pid,
-        config.flags
-    );
-
     // Determine return value before potential blocking
     let return_value = if config.flags & CLONE_THREAD != 0 {
         child_tid

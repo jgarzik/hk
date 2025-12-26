@@ -99,55 +99,38 @@ fn test_unshare_newuts() {
 
 /// Test: unshare(CLONE_NEWNET) creates new network namespace
 fn test_unshare_newnet() {
-    // On aarch64, there's a kernel data abort when forking after namespace tests
-    // For now, just verify the syscall returns success without a child process
-    #[cfg(target_arch = "aarch64")]
-    {
-        // Simplified test for aarch64: just call unshare without fork
-        let ret = sys_unshare(CLONE_NEWNET);
-        if ret == 0 {
-            println(b"UNSHARE_NEWNET:OK");
-        } else {
-            print(b"UNSHARE_NEWNET:FAIL ret=");
-            print_num(ret);
-            println(b"");
-        }
+    // Must fork first so unshare happens in child, not main boot_tester process
+    // (otherwise subsequent tests lose network config)
+    let pid = sys_fork();
+    if pid < 0 {
+        print(b"UNSHARE_NEWNET:FAIL fork failed ");
+        print_num(pid);
+        println(b"");
         return;
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let pid = sys_fork();
-        if pid < 0 {
-            print(b"UNSHARE_NEWNET:FAIL fork failed ");
-            print_num(pid);
-            println(b"");
-            return;
+    if pid == 0 {
+        // Child: unshare network namespace
+        let ret = sys_unshare(CLONE_NEWNET);
+        if ret != 0 {
+            sys_exit(1);
         }
 
-        if pid == 0 {
-            // Child: unshare network namespace
-            let ret = sys_unshare(CLONE_NEWNET);
-            if ret != 0 {
-                sys_exit(1);
-            }
+        // Success - we created a new network namespace
+        // The new namespace has only loopback device
+        sys_exit(0);
+    } else {
+        // Parent: wait for child
+        let mut wstatus: i32 = 0;
+        sys_wait4(pid, &mut wstatus, 0, 0);
 
-            // Success - we created a new network namespace
-            // The new namespace has only loopback device
-            sys_exit(0);
+        let exit_status = (wstatus >> 8) & 0xff;
+        if exit_status == 0 {
+            println(b"UNSHARE_NEWNET:OK");
         } else {
-            // Parent: wait for child
-            let mut wstatus: i32 = 0;
-            sys_wait4(pid, &mut wstatus, 0, 0);
-
-            let exit_status = (wstatus >> 8) & 0xff;
-            if exit_status == 0 {
-                println(b"UNSHARE_NEWNET:OK");
-            } else {
-                print(b"UNSHARE_NEWNET:FAIL exit_status=");
-                print_num(exit_status as i64);
-                println(b"");
-            }
+            print(b"UNSHARE_NEWNET:FAIL exit_status=");
+            print_num(exit_status as i64);
+            println(b"");
         }
     }
 }

@@ -17,6 +17,13 @@ use crate::net::tcp::{self, TcpState};
 use crate::net::udp;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
+use crate::uaccess::get_user;
+
+// Architecture-specific uaccess implementation
+#[cfg(target_arch = "aarch64")]
+use crate::arch::aarch64::uaccess::Aarch64Uaccess as Uaccess;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::uaccess::X86_64Uaccess as Uaccess;
 
 /// Get RLIMIT_NOFILE limit for fd allocation
 #[inline]
@@ -46,6 +53,7 @@ mod errno {
     pub const EAGAIN: i64 = -11;
     pub const EINPROGRESS: i64 = -115;
     pub const EALREADY: i64 = -114;
+    pub const EMFILE: i64 = -24;
 }
 
 /// Create a dummy dentry for sockets
@@ -261,31 +269,147 @@ pub fn sys_bind(fd: i32, addr: u64, addrlen: u64) -> i64 {
 }
 
 /// listen(fd, backlog) - start listening for connections
-pub fn sys_listen(fd: i32, _backlog: i32) -> i64 {
+///
+/// Following Linux's inet_listen() -> inet_csk_listen_start():
+/// 1. Check socket is bound
+/// 2. Initialize accept queue with backlog
+/// 3. Set TCP state to Listen
+/// 4. Register in listener hash table
+pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
     let socket = match get_socket(fd) {
         Ok(s) => s,
         Err(e) => return e,
     };
 
-    // Set TCP state to Listen
-    if let Some(ref tcp) = socket.tcp {
-        tcp.set_state(TcpState::Listen);
-        0
-    } else {
-        errno::EOPNOTSUPP
+    // Must be TCP socket
+    let tcp = match socket.tcp.as_ref() {
+        Some(t) => t,
+        None => return errno::EOPNOTSUPP,
+    };
+
+    // Must be bound (have local address)
+    if socket.local_addr().is_none() {
+        return errno::EINVAL;
     }
+
+    // Can only listen from Closed state
+    if tcp.state() != TcpState::Closed {
+        return errno::EINVAL;
+    }
+
+    // Initialize accept queue with backlog (like inet_csk_listen_start)
+    // Linux clamps backlog to somaxconn, we use a simpler approach
+    let backlog = (backlog as u32).clamp(1, 128);
+    socket.init_accept_queue(backlog);
+
+    // Set TCP state to Listen
+    tcp.set_state(TcpState::Listen);
+
+    // Register in listener hash table (like inet_csk_listen_start)
+    let (_, local_port) = socket.local_addr().unwrap();
+    crate::net::current_net_ns().tcp_listen_register(local_port, Arc::clone(&socket));
+
+    0
 }
 
 /// accept(fd, addr, addrlen) - accept incoming connection
-pub fn sys_accept(fd: i32, _addr: u64, _addrlen: u64) -> i64 {
-    let _socket = match get_socket(fd) {
+///
+/// Following Linux's inet_accept() -> inet_csk_accept():
+/// 1. Check socket is listening
+/// 2. Wait for connection in accept queue (or return EAGAIN if non-blocking)
+/// 3. Dequeue child socket
+/// 4. Create new fd for child socket
+/// 5. Copy peer address to user if requested
+pub fn sys_accept(fd: i32, addr: u64, addrlen: u64) -> i64 {
+    let socket = match get_socket(fd) {
         Ok(s) => s,
         Err(e) => return e,
     };
 
-    // TODO: Implement accept queue for listening sockets
-    // For now, return not supported
-    errno::EOPNOTSUPP
+    // Must be TCP socket
+    let tcp = match socket.tcp.as_ref() {
+        Some(t) => t,
+        None => return errno::EOPNOTSUPP,
+    };
+
+    // Must be in Listen state
+    if tcp.state() != TcpState::Listen {
+        return errno::EINVAL;
+    }
+
+    // Get accept queue
+    loop {
+        // Try to get a connection from accept queue
+        {
+            let accept_queue_guard = socket.accept_queue.lock();
+            let accept_queue = match accept_queue_guard.as_ref() {
+                Some(q) => q,
+                None => return errno::EINVAL,
+            };
+
+            if let Some(child) = accept_queue.accept_queue_remove() {
+                // Got a connection - create fd for it
+                drop(accept_queue_guard);
+
+                // Create file descriptor for child socket
+                let child_fd = match create_socket_fd(child.clone()) {
+                    Ok(fd) => fd,
+                    Err(e) => return e,
+                };
+
+                // Write peer address if requested
+                if addr != 0 && addrlen != 0 {
+                    if let Some((remote_addr, remote_port)) = child.remote_addr() {
+                        // Read addrlen from user
+                        let user_addrlen =
+                            unsafe { core::ptr::read_volatile(addrlen as *const u32) };
+
+                        if user_addrlen >= 16 {
+                            // Write sockaddr_in
+                            let sockaddr = SockAddrIn::new(remote_addr, remote_port);
+                            unsafe {
+                                core::ptr::write_volatile(addr as *mut SockAddrIn, sockaddr);
+                                core::ptr::write_volatile(addrlen as *mut u32, 16);
+                            }
+                        }
+                    }
+                }
+
+                return child_fd;
+            }
+        }
+
+        // Queue is empty
+        if socket.is_nonblocking() {
+            return errno::EAGAIN;
+        }
+
+        // Block waiting for connection
+        // Use socket's accept_wait_block() which doesn't hold the accept_queue lock
+        socket.accept_wait_block();
+    }
+}
+
+/// Create a file descriptor for a socket
+fn create_socket_fd(socket: Arc<Socket>) -> Result<i64, i64> {
+    // Create socket file operations (leaked for 'static lifetime like in sys_socket)
+    let ops: &'static dyn crate::fs::file::FileOps =
+        Box::leak(Box::new(SocketFileOps::new(socket)));
+
+    // Create dummy dentry for socket
+    let dentry = create_socket_dentry()?;
+
+    // Create file
+    let file = Arc::new(File::new(dentry, file_flags::O_RDWR, ops));
+
+    // Allocate fd
+    let fd_table = get_task_fd(current_tid()).ok_or(errno::EBADF)?;
+    let fd = fd_table
+        .lock()
+        .alloc(file, get_nofile_limit())
+        .map_err(|_| errno::EMFILE)?;
+
+    Ok(fd as i64)
 }
 
 /// accept4(fd, addr, addrlen, flags) - accept with flags
@@ -918,9 +1042,19 @@ fn read_sockaddr_in(addr: u64) -> Result<SockAddrIn, i64> {
         return Err(errno::EFAULT);
     }
 
-    let ptr = addr as *const SockAddrIn;
-    let sockaddr = unsafe { *ptr };
-    Ok(sockaddr)
+    // Use get_user to properly access user memory with SMAP protection
+    // SockAddrIn layout: sin_family (u16), sin_port (u16), sin_addr (u32), sin_zero ([u8; 8])
+    let sin_family: u16 = get_user::<Uaccess, u16>(addr).map_err(|_| errno::EFAULT)?;
+    let sin_port: u16 = get_user::<Uaccess, u16>(addr + 2).map_err(|_| errno::EFAULT)?;
+    let sin_addr: u32 = get_user::<Uaccess, u32>(addr + 4).map_err(|_| errno::EFAULT)?;
+
+    // sin_zero is padding, we don't need to read it
+    Ok(SockAddrIn {
+        sin_family,
+        sin_port,
+        sin_addr,
+        sin_zero: [0; 8],
+    })
 }
 
 /// Write sockaddr_in to user space

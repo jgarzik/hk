@@ -188,11 +188,7 @@ pub fn arp_rcv(mut skb: SkBuff) {
 /// queues the packet for later transmission.
 ///
 /// Uses current namespace's ARP cache.
-pub fn arp_resolve(
-    dev: &Arc<NetDevice>,
-    ip: Ipv4Addr,
-    skb: Box<SkBuff>,
-) -> Result<[u8; ETH_ALEN], NetError> {
+pub fn arp_resolve(dev: &Arc<NetDevice>, ip: Ipv4Addr, skb: Box<SkBuff>) -> Result<(), NetError> {
     let ns = crate::net::current_net_ns();
     let now = crate::time::current_ticks();
 
@@ -200,18 +196,19 @@ pub fn arp_resolve(
     if let Some(entry) = ns.arp_lookup(ip)
         && entry.state == ArpState::Reachable
     {
-        return Ok(entry.mac);
+        // MAC cached - transmit packet now
+        return crate::net::ipv4::ip_finish_output(skb, entry.mac);
     }
 
-    // Queue packet and send ARP request
     // Check again in case of race
     if let Some(entry) = ns.arp_lookup(ip)
         && entry.state == ArpState::Reachable
     {
-        return Ok(entry.mac);
+        // MAC cached - transmit packet now
+        return crate::net::ipv4::ip_finish_output(skb, entry.mac);
     }
 
-    // Queue the packet
+    // Queue the packet for later transmission when ARP completes
     ns.arp_queue_packet(ip, PendingPacket { skb });
 
     // Add incomplete entry if not present
@@ -228,7 +225,8 @@ pub fn arp_resolve(
     // Send ARP request
     send_arp_request(dev, ip);
 
-    Err(NetError::WouldBlock)
+    // Packet is queued, return success (it will be sent when ARP completes)
+    Ok(())
 }
 
 /// Send an ARP request

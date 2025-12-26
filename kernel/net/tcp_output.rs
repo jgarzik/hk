@@ -7,6 +7,7 @@ use core::sync::atomic::Ordering;
 
 use crate::net::NetError;
 use crate::net::ipv4::{self, IPPROTO_TCP, Ipv4Addr};
+use crate::net::request_sock::RequestSock;
 use crate::net::skb::SkBuff;
 use crate::net::socket::Socket;
 use crate::net::tcp::{TCP_HLEN_MIN, TcpSegment, TcpState, flags, tcp_checksum};
@@ -187,6 +188,40 @@ pub fn tcp_send_fin(socket: &Arc<Socket>) -> Result<(), NetError> {
 
     skb.saddr = Some(local_addr);
     skb.daddr = Some(remote_addr);
+
+    ipv4::ip_queue_xmit(skb, IPPROTO_TCP)
+}
+
+/// Send a SYN-ACK segment in response to a SYN on a listening socket
+///
+/// Following Linux's tcp_v4_send_synack() -> tcp_make_synack():
+/// This is sent from a listening socket to a client that sent a SYN.
+/// The RequestSock contains the connection parameters from the SYN.
+pub fn tcp_send_synack(listener: &Arc<Socket>, req: &RequestSock) -> Result<(), NetError> {
+    let mut skb = SkBuff::alloc_tx(0).ok_or(NetError::OutOfMemory)?;
+
+    // SYN-ACK: seq = our ISS, ack = client's ISN + 1
+    let seq = req.iss;
+    let ack = req.irs.wrapping_add(1);
+    let window = req.rcv_wnd;
+
+    build_tcp_header(
+        &mut skb,
+        req.local_port,
+        req.remote_port,
+        seq,
+        ack,
+        flags::SYN | flags::ACK,
+        window,
+        req.local_addr,
+        req.remote_addr,
+    )?;
+
+    skb.saddr = Some(req.local_addr);
+    skb.daddr = Some(req.remote_addr);
+
+    // Suppress unused warning for listener - we may use it later for options
+    let _ = listener;
 
     ipv4::ip_queue_xmit(skb, IPPROTO_TCP)
 }

@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use spin::Mutex;
 
 use crate::net::ipv4::Ipv4Addr;
+use crate::net::request_sock::RequestSockQueue;
 use crate::net::tcp::TcpSock;
 use crate::waitqueue::WaitQueue;
 
@@ -153,6 +154,14 @@ pub struct Socket {
 
     /// EOF received
     pub(super) eof: AtomicBool,
+
+    /// Accept queue for listening sockets (initialized by listen())
+    /// None for non-listening sockets
+    pub accept_queue: Mutex<Option<RequestSockQueue>>,
+
+    /// Wait queue for accept() blocking - separate from accept_queue to avoid
+    /// holding the Mutex while waiting (which would deadlock with tcp_rcv)
+    pub accept_wait: WaitQueue,
 }
 
 impl Socket {
@@ -180,6 +189,8 @@ impl Socket {
             connect_wait: WaitQueue::new(),
             error: AtomicI32::new(0),
             eof: AtomicBool::new(false),
+            accept_queue: Mutex::new(None),
+            accept_wait: WaitQueue::new(),
         })
     }
 
@@ -389,5 +400,33 @@ impl Socket {
     /// Get connect wait queue
     pub fn connect_wait(&self) -> &WaitQueue {
         &self.connect_wait
+    }
+
+    /// Initialize accept queue for a listening socket
+    ///
+    /// Called by listen() to set up the accept queue with the given backlog.
+    pub fn init_accept_queue(&self, backlog: u32) {
+        let mut queue = self.accept_queue.lock();
+        if queue.is_none() {
+            *queue = Some(RequestSockQueue::new(backlog));
+        }
+    }
+
+    /// Check if this socket has an accept queue (is listening)
+    pub fn has_accept_queue(&self) -> bool {
+        self.accept_queue.lock().is_some()
+    }
+
+    /// Wait for a connection to be available in accept queue
+    ///
+    /// Uses the direct accept_wait WaitQueue field to avoid holding
+    /// the accept_queue Mutex while blocking (which would deadlock with tcp_rcv).
+    pub fn accept_wait_block(&self) {
+        self.accept_wait.wait();
+    }
+
+    /// Wake up processes waiting on accept()
+    pub fn accept_wake(&self) {
+        self.accept_wait.wake_one();
     }
 }

@@ -55,6 +55,10 @@ pub struct NetNamespace {
     /// TCP connection table (four-tuple -> socket)
     pub tcp_connections: RwLock<BTreeMap<TcpFourTuple, Arc<Socket>>>,
 
+    /// TCP listening sockets (local_port -> socket)
+    /// Following Linux's inet_hashtables listening hash
+    pub tcp_listeners: RwLock<BTreeMap<u16, Arc<Socket>>>,
+
     /// UDP socket table (two-tuple -> socket)
     pub udp_sockets: RwLock<BTreeMap<UdpTwoTuple, Arc<Socket>>>,
 
@@ -79,6 +83,7 @@ impl NetNamespace {
             config: RwLock::new(None),
             routes: RwLock::new(Vec::new()),
             tcp_connections: RwLock::new(BTreeMap::new()),
+            tcp_listeners: RwLock::new(BTreeMap::new()),
             udp_sockets: RwLock::new(BTreeMap::new()),
             arp_entries: Mutex::new(BTreeMap::new()),
             arp_pending: Mutex::new(BTreeMap::new()),
@@ -129,6 +134,26 @@ impl NetNamespace {
     /// Look up a TCP connection in this namespace
     pub fn tcp_lookup(&self, tuple: &TcpFourTuple) -> Option<Arc<Socket>> {
         self.tcp_connections.read().get(tuple).cloned()
+    }
+
+    /// Register a listening socket in this namespace
+    ///
+    /// Following Linux's inet_csk_listen_start() which adds to listening hash.
+    pub fn tcp_listen_register(&self, port: u16, socket: Arc<Socket>) {
+        self.tcp_listeners.write().insert(port, socket);
+    }
+
+    /// Unregister a listening socket from this namespace
+    pub fn tcp_listen_unregister(&self, port: u16) {
+        self.tcp_listeners.write().remove(&port);
+    }
+
+    /// Look up a listening socket by port
+    ///
+    /// Following Linux's __inet_lookup_listener().
+    /// For now we just match by port; Linux also considers local address.
+    pub fn tcp_lookup_listener(&self, local_port: u16) -> Option<Arc<Socket>> {
+        self.tcp_listeners.read().get(&local_port).cloned()
     }
 
     /// Allocate an ephemeral port in this namespace
@@ -310,6 +335,7 @@ impl Default for NetNamespace {
             config: RwLock::new(None),
             routes: RwLock::new(Vec::new()),
             tcp_connections: RwLock::new(BTreeMap::new()),
+            tcp_listeners: RwLock::new(BTreeMap::new()),
             udp_sockets: RwLock::new(BTreeMap::new()),
             arp_entries: Mutex::new(BTreeMap::new()),
             arp_pending: Mutex::new(BTreeMap::new()),

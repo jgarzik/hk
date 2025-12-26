@@ -641,6 +641,9 @@ fn kmain() -> ! {
     let mut driver_registry = crate::bus::DriverRegistry::new();
     crate::bus::register_drivers(&mut driver_registry);
 
+    // Initialize network subsystem (sets up loopback, static IP config)
+    crate::net::init();
+
     // ========================================================================
     // Bus/Driver Model: Layered device discovery
     // ========================================================================

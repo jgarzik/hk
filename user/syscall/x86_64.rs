@@ -183,6 +183,7 @@ pub const SYS_NANOSLEEP: u64 = 35;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_SOCKET: u64 = 41;
 pub const SYS_CONNECT: u64 = 42;
+pub const SYS_ACCEPT: u64 = 43;
 pub const SYS_SENDTO: u64 = 44;
 pub const SYS_RECVFROM: u64 = 45;
 pub const SYS_SENDMSG: u64 = 46;
@@ -1316,6 +1317,11 @@ pub fn sys_bind(fd: i32, addr: *const u8, addrlen: u32) -> i64 {
 #[inline(always)]
 pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
     unsafe { syscall2!(SYS_LISTEN, fd, backlog) }
+}
+
+#[inline(always)]
+pub fn sys_accept(fd: i32, addr: *mut u8, addrlen: *mut u32) -> i64 {
+    unsafe { syscall3!(SYS_ACCEPT, fd, addr, addrlen) }
 }
 
 #[inline(always)]
