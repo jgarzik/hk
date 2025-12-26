@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
 use spin::RwLock;
 
+use crate::arch::phys_to_virt;
 use crate::frame_alloc::{BitmapFrameAllocator, FRAME_SIZE};
 
 /// DMA address type - what devices see
@@ -355,11 +356,11 @@ impl DmaOps for DirectDmaOps {
 
         // Zero the memory
         unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, size);
+            core::ptr::write_bytes(phys_to_virt(phys), 0, size);
         }
 
         Some(DmaCoherent {
-            cpu_addr: phys as *mut u8,
+            cpu_addr: phys_to_virt(phys),
             dma_addr: DmaAddr(phys),
             size,
         })

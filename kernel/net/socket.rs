@@ -4,11 +4,13 @@
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use spin::Mutex;
 
 use crate::net::ipv4::Ipv4Addr;
+use crate::net::request_sock::RequestSockQueue;
 use crate::net::tcp::TcpSock;
 use crate::waitqueue::WaitQueue;
 
@@ -134,6 +136,10 @@ pub struct Socket {
     /// TCP control block (for SOCK_STREAM)
     pub tcp: Option<TcpSock>,
 
+    /// Datagram receive queue (for SOCK_DGRAM)
+    /// Each entry: (source_addr, source_port, data)
+    pub(super) dgram_rx_queue: Mutex<VecDeque<(Ipv4Addr, u16, Vec<u8>)>>,
+
     /// Wait queue for readers
     pub(super) rx_wait: WaitQueue,
 
@@ -148,6 +154,14 @@ pub struct Socket {
 
     /// EOF received
     pub(super) eof: AtomicBool,
+
+    /// Accept queue for listening sockets (initialized by listen())
+    /// None for non-listening sockets
+    pub accept_queue: Mutex<Option<RequestSockQueue>>,
+
+    /// Wait queue for accept() blocking - separate from accept_queue to avoid
+    /// holding the Mutex while waiting (which would deadlock with tcp_rcv)
+    pub accept_wait: WaitQueue,
 }
 
 impl Socket {
@@ -169,11 +183,14 @@ impl Socket {
             rx_buffer: Mutex::new(VecDeque::with_capacity(DEFAULT_RCVBUF)),
             rx_buffer_limit: DEFAULT_RCVBUF,
             tcp,
+            dgram_rx_queue: Mutex::new(VecDeque::new()),
             rx_wait: WaitQueue::new(),
             tx_wait: WaitQueue::new(),
             connect_wait: WaitQueue::new(),
             error: AtomicI32::new(0),
             eof: AtomicBool::new(false),
+            accept_queue: Mutex::new(None),
+            accept_wait: WaitQueue::new(),
         })
     }
 
@@ -296,6 +313,58 @@ impl Socket {
         }
     }
 
+    /// Deliver a datagram to the receive queue (called by UDP)
+    pub fn deliver_datagram(&self, src_addr: Ipv4Addr, src_port: u16, data: &[u8]) {
+        let mut queue = self.dgram_rx_queue.lock();
+        // Limit queue depth (max 64 datagrams)
+        if queue.len() < 64 {
+            queue.push_back((src_addr, src_port, data.to_vec()));
+        }
+    }
+
+    /// Read a datagram from the receive queue (for UDP)
+    ///
+    /// Returns (bytes_read, source_addr, source_port)
+    pub fn read_datagram(&self, buf: &mut [u8]) -> Result<(usize, Ipv4Addr, u16), i32> {
+        loop {
+            // Check for error
+            let err = self.error.load(Ordering::Acquire);
+            if err != 0 {
+                return Err(err);
+            }
+
+            // Try to read a datagram
+            {
+                let mut queue = self.dgram_rx_queue.lock();
+                if let Some((src_addr, src_port, data)) = queue.pop_front() {
+                    let n = buf.len().min(data.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    return Ok((n, src_addr, src_port));
+                }
+            }
+
+            // Check for EOF
+            if self.is_eof() {
+                return Ok((0, Ipv4Addr::new(0, 0, 0, 0), 0));
+            }
+
+            // Non-blocking?
+            if self.is_nonblocking() {
+                return Err(-crate::net::libc::EAGAIN);
+            }
+
+            // Block
+            self.rx_wait.wait();
+        }
+    }
+
+    /// Check if datagram is available for reading
+    pub fn poll_read_dgram(&self) -> bool {
+        !self.dgram_rx_queue.lock().is_empty()
+            || self.is_eof()
+            || self.error.load(Ordering::Acquire) != 0
+    }
+
     /// Wake readers
     pub fn wake_rx(&self) {
         self.rx_wait.wake_all();
@@ -331,5 +400,33 @@ impl Socket {
     /// Get connect wait queue
     pub fn connect_wait(&self) -> &WaitQueue {
         &self.connect_wait
+    }
+
+    /// Initialize accept queue for a listening socket
+    ///
+    /// Called by listen() to set up the accept queue with the given backlog.
+    pub fn init_accept_queue(&self, backlog: u32) {
+        let mut queue = self.accept_queue.lock();
+        if queue.is_none() {
+            *queue = Some(RequestSockQueue::new(backlog));
+        }
+    }
+
+    /// Check if this socket has an accept queue (is listening)
+    pub fn has_accept_queue(&self) -> bool {
+        self.accept_queue.lock().is_some()
+    }
+
+    /// Wait for a connection to be available in accept queue
+    ///
+    /// Uses the direct accept_wait WaitQueue field to avoid holding
+    /// the accept_queue Mutex while blocking (which would deadlock with tcp_rcv).
+    pub fn accept_wait_block(&self) {
+        self.accept_wait.wait();
+    }
+
+    /// Wake up processes waiting on accept()
+    pub fn accept_wake(&self) {
+        self.accept_wait.wake_one();
     }
 }

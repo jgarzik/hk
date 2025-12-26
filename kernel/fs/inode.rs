@@ -295,6 +295,61 @@ pub trait InodeOps: Send + Sync {
             ctime: inode.ctime(),
         }
     }
+
+    // =========================================================================
+    // Extended attribute operations
+    // =========================================================================
+
+    /// Get an extended attribute value
+    ///
+    /// # Arguments
+    /// * `inode` - The inode to get the attribute from
+    /// * `name` - The attribute name (e.g., "user.foo")
+    /// * `value` - Buffer to store the attribute value (empty to query size)
+    ///
+    /// # Returns
+    /// The size of the attribute value on success.
+    /// If `value` is empty, returns the size that would be needed.
+    fn getxattr(&self, inode: &Inode, name: &str, value: &mut [u8]) -> Result<usize, FsError> {
+        let _ = (inode, name, value);
+        Err(FsError::NotSupported)
+    }
+
+    /// Set an extended attribute value
+    ///
+    /// # Arguments
+    /// * `inode` - The inode to set the attribute on
+    /// * `name` - The attribute name (e.g., "user.foo")
+    /// * `value` - The attribute value
+    /// * `flags` - XATTR_CREATE (fail if exists) or XATTR_REPLACE (fail if not exists)
+    fn setxattr(&self, inode: &Inode, name: &str, value: &[u8], flags: u32) -> Result<(), FsError> {
+        let _ = (inode, name, value, flags);
+        Err(FsError::NotSupported)
+    }
+
+    /// List extended attribute names
+    ///
+    /// # Arguments
+    /// * `inode` - The inode to list attributes from
+    /// * `list` - Buffer to store null-separated attribute names (empty to query size)
+    ///
+    /// # Returns
+    /// The total size of all attribute names (including null terminators).
+    /// If `list` is empty, returns the size that would be needed.
+    fn listxattr(&self, inode: &Inode, list: &mut [u8]) -> Result<usize, FsError> {
+        let _ = (inode, list);
+        Err(FsError::NotSupported)
+    }
+
+    /// Remove an extended attribute
+    ///
+    /// # Arguments
+    /// * `inode` - The inode to remove the attribute from
+    /// * `name` - The attribute name to remove
+    fn removexattr(&self, inode: &Inode, name: &str) -> Result<(), FsError> {
+        let _ = (inode, name);
+        Err(FsError::NotSupported)
+    }
 }
 
 /// Inode attributes returned by getattr

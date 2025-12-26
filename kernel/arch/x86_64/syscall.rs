@@ -34,6 +34,16 @@ pub const SYS_WRITEV: u64 = 20;
 pub const SYS_PREADV: u64 = 295;
 /// pwritev(fd, iov, iovcnt, offset)
 pub const SYS_PWRITEV: u64 = 296;
+/// preadv2(fd, iov, iovcnt, offset, flags)
+pub const SYS_PREADV2: u64 = 327;
+/// pwritev2(fd, iov, iovcnt, offset, flags)
+pub const SYS_PWRITEV2: u64 = 328;
+/// statfs(pathname, buf)
+pub const SYS_STATFS: u64 = 137;
+/// fstatfs(fd, buf)
+pub const SYS_FSTATFS: u64 = 138;
+/// statx(dirfd, pathname, flags, mask, statxbuf)
+pub const SYS_STATX: u64 = 332;
 /// pipe(pipefd)
 pub const SYS_PIPE: u64 = 22;
 /// poll(fds, nfds, timeout)
@@ -74,6 +84,8 @@ pub const SYS_MUNLOCKALL: u64 = 152;
 pub const SYS_MLOCK2: u64 = 325;
 /// msync(addr, length, flags)
 pub const SYS_MSYNC: u64 = 26;
+/// mincore(addr, length, vec)
+pub const SYS_MINCORE: u64 = 27;
 /// madvise(addr, length, advice)
 pub const SYS_MADVISE: u64 = 28;
 /// ftruncate(fd, length)
@@ -108,8 +120,90 @@ pub const SYS_NANOSLEEP: u64 = 35;
 pub const SYS_CLOCK_NANOSLEEP: u64 = 230;
 /// clock_getres(clockid, res)
 pub const SYS_CLOCK_GETRES: u64 = 229;
+/// clock_settime(clockid, tp)
+pub const SYS_CLOCK_SETTIME: u64 = 227;
+/// settimeofday(tv, tz)
+pub const SYS_SETTIMEOFDAY: u64 = 164;
 /// time(tloc)
 pub const SYS_TIME: u64 = 201;
+/// timerfd_create(clockid, flags)
+pub const SYS_TIMERFD_CREATE: u64 = 283;
+/// timerfd_settime(fd, flags, new_value, old_value)
+pub const SYS_TIMERFD_SETTIME: u64 = 286;
+/// timerfd_gettime(fd, curr_value)
+pub const SYS_TIMERFD_GETTIME: u64 = 287;
+/// adjtimex(txc) - read/set kernel clock parameters
+pub const SYS_ADJTIMEX: u64 = 159;
+
+// eventfd syscalls (Section 7.1)
+/// eventfd(initval)
+pub const SYS_EVENTFD: u64 = 284;
+/// eventfd2(initval, flags)
+pub const SYS_EVENTFD2: u64 = 290;
+
+// signalfd syscalls (Section 5)
+/// signalfd(fd, mask, flags) - legacy
+pub const SYS_SIGNALFD: u64 = 282;
+/// signalfd4(fd, mask, sizemask, flags)
+pub const SYS_SIGNALFD4: u64 = 289;
+
+// inotify syscalls (Section 9.2)
+/// inotify_init()
+pub const SYS_INOTIFY_INIT: u64 = 253;
+/// inotify_add_watch(fd, pathname, mask)
+pub const SYS_INOTIFY_ADD_WATCH: u64 = 254;
+/// inotify_rm_watch(fd, wd)
+pub const SYS_INOTIFY_RM_WATCH: u64 = 255;
+/// inotify_init1(flags)
+pub const SYS_INOTIFY_INIT1: u64 = 294;
+
+// epoll syscalls (Section 9.1)
+/// epoll_create(size)
+pub const SYS_EPOLL_CREATE: u64 = 213;
+/// epoll_wait(epfd, events, maxevents, timeout)
+pub const SYS_EPOLL_WAIT: u64 = 232;
+/// epoll_ctl(epfd, op, fd, event)
+pub const SYS_EPOLL_CTL: u64 = 233;
+/// epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
+pub const SYS_EPOLL_PWAIT: u64 = 281;
+/// epoll_create1(flags)
+pub const SYS_EPOLL_CREATE1: u64 = 291;
+/// epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)
+pub const SYS_EPOLL_PWAIT2: u64 = 441;
+
+// io_uring syscalls (Section 9.3)
+/// io_uring_setup(entries, params)
+pub const SYS_IO_URING_SETUP: u64 = 425;
+/// io_uring_enter(fd, to_submit, min_complete, flags, argp, argsz)
+pub const SYS_IO_URING_ENTER: u64 = 426;
+/// io_uring_register(fd, opcode, arg, nr_args)
+pub const SYS_IO_URING_REGISTER: u64 = 427;
+
+// POSIX timer syscalls (Section 6.2)
+/// timer_create(clockid, sigevent, timerid)
+pub const SYS_TIMER_CREATE: u64 = 222;
+/// timer_settime(timerid, flags, new_value, old_value)
+pub const SYS_TIMER_SETTIME: u64 = 223;
+/// timer_gettime(timerid, curr_value)
+pub const SYS_TIMER_GETTIME: u64 = 224;
+/// timer_getoverrun(timerid)
+pub const SYS_TIMER_GETOVERRUN: u64 = 225;
+/// timer_delete(timerid)
+pub const SYS_TIMER_DELETE: u64 = 226;
+
+// POSIX message queue syscalls (Section 7.4)
+/// mq_open(name, oflag, mode, attr)
+pub const SYS_MQ_OPEN: u64 = 240;
+/// mq_unlink(name)
+pub const SYS_MQ_UNLINK: u64 = 241;
+/// mq_timedsend(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)
+pub const SYS_MQ_TIMEDSEND: u64 = 242;
+/// mq_timedreceive(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)
+pub const SYS_MQ_TIMEDRECEIVE: u64 = 243;
+/// mq_notify(mqdes, sevp)
+pub const SYS_MQ_NOTIFY: u64 = 244;
+/// mq_getsetattr(mqdes, newattr, oldattr)
+pub const SYS_MQ_GETSETATTR: u64 = 245;
 
 // Process IDs & basic info (Section 1.2)
 /// setpgid(pid, pgid)
@@ -152,6 +246,10 @@ pub const SYS_GETRESGID: u64 = 120;
 pub const SYS_SETFSUID: u64 = 122;
 /// setfsgid(gid)
 pub const SYS_SETFSGID: u64 = 123;
+/// capget(hdrp, datap)
+pub const SYS_CAPGET: u64 = 125;
+/// capset(hdrp, datap)
+pub const SYS_CAPSET: u64 = 126;
 
 // Process creation (Section 1.1)
 /// clone(flags, child_stack, parent_tidptr, child_tidptr, tls)
@@ -182,6 +280,8 @@ pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
 /// fchdir(fd)
 pub const SYS_FCHDIR: u64 = 81;
+/// chroot(pathname)
+pub const SYS_CHROOT: u64 = 161;
 /// openat(dirfd, pathname, flags, mode)
 pub const SYS_OPENAT: u64 = 257;
 /// faccessat(dirfd, pathname, mode, flags)
@@ -226,6 +326,14 @@ pub const SYS_UNLINKAT: u64 = 263;
 pub const SYS_MOUNT: u64 = 165;
 /// umount2(target, flags)
 pub const SYS_UMOUNT2: u64 = 166;
+/// pivot_root(new_root, put_old)
+pub const SYS_PIVOT_ROOT: u64 = 155;
+
+// Swap management
+/// swapon(path, swapflags)
+pub const SYS_SWAPON: u64 = 167;
+/// swapoff(path)
+pub const SYS_SWAPOFF: u64 = 168;
 
 // Permissions and ownership (Section 3.2)
 /// chmod(pathname, mode)
@@ -248,6 +356,8 @@ pub const SYS_UTIMES: u64 = 235;
 pub const SYS_FCHOWNAT: u64 = 260;
 /// fchmodat(dirfd, pathname, mode, flags)
 pub const SYS_FCHMODAT: u64 = 268;
+/// fchmodat2(dirfd, pathname, mode, flags) - extended fchmodat with flags
+pub const SYS_FCHMODAT2: u64 = 452;
 /// utimensat(dirfd, pathname, times, flags)
 pub const SYS_UTIMENSAT: u64 = 280;
 /// rename(oldpath, newpath)
@@ -256,6 +366,32 @@ pub const SYS_RENAME: u64 = 82;
 pub const SYS_RENAMEAT: u64 = 264;
 /// renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
 pub const SYS_RENAMEAT2: u64 = 316;
+
+// Extended attributes (xattr) syscalls
+/// setxattr(path, name, value, size, flags)
+pub const SYS_SETXATTR: u64 = 188;
+/// lsetxattr(path, name, value, size, flags)
+pub const SYS_LSETXATTR: u64 = 189;
+/// fsetxattr(fd, name, value, size, flags)
+pub const SYS_FSETXATTR: u64 = 190;
+/// getxattr(path, name, value, size)
+pub const SYS_GETXATTR: u64 = 191;
+/// lgetxattr(path, name, value, size)
+pub const SYS_LGETXATTR: u64 = 192;
+/// fgetxattr(fd, name, value, size)
+pub const SYS_FGETXATTR: u64 = 193;
+/// listxattr(path, list, size)
+pub const SYS_LISTXATTR: u64 = 194;
+/// llistxattr(path, list, size)
+pub const SYS_LLISTXATTR: u64 = 195;
+/// flistxattr(fd, list, size)
+pub const SYS_FLISTXATTR: u64 = 196;
+/// removexattr(path, name)
+pub const SYS_REMOVEXATTR: u64 = 197;
+/// lremovexattr(path, name)
+pub const SYS_LREMOVEXATTR: u64 = 198;
+/// fremovexattr(fd, name)
+pub const SYS_FREMOVEXATTR: u64 = 199;
 
 // Sync syscalls
 /// fsync(fd)
@@ -301,6 +437,24 @@ pub const SYS_RT_SIGPENDING: u64 = 127;
 pub const SYS_TKILL: u64 = 200;
 /// tgkill(tgid, tid, sig)
 pub const SYS_TGKILL: u64 = 234;
+/// rt_sigtimedwait(set, info, ts, sigsetsize)
+pub const SYS_RT_SIGTIMEDWAIT: u64 = 128;
+/// sigaltstack(ss, oss)
+pub const SYS_SIGALTSTACK: u64 = 131;
+/// rt_sigqueueinfo(pid, sig, uinfo)
+pub const SYS_RT_SIGQUEUEINFO: u64 = 129;
+/// rt_sigsuspend(mask, sigsetsize)
+pub const SYS_RT_SIGSUSPEND: u64 = 130;
+/// rt_tgsigqueueinfo(tgid, tid, sig, uinfo)
+pub const SYS_RT_TGSIGQUEUEINFO: u64 = 297;
+
+// Memory barrier (Section 13)
+/// membarrier(cmd, flags, cpu_id)
+pub const SYS_MEMBARRIER: u64 = 324;
+
+// File readahead (Section 2.3)
+/// readahead(fd, offset, count)
+pub const SYS_READAHEAD: u64 = 187;
 
 // Scheduling priority
 /// getpriority(which, who)
@@ -314,7 +468,9 @@ pub const SYS_IOPRIO_SET: u64 = 251;
 /// ioprio_get(which, who)
 pub const SYS_IOPRIO_GET: u64 = 252;
 
-// Thread-local storage
+// Thread-local storage and process control
+/// prctl(option, arg2, arg3, arg4, arg5) - Process/thread control
+pub const SYS_PRCTL: u64 = 157;
 /// arch_prctl(code, addr) - Architecture-specific thread state
 pub const SYS_ARCH_PRCTL: u64 = 158;
 /// set_tid_address(tidptr) - Set pointer for child thread ID on exit
@@ -373,6 +529,10 @@ pub const SYS_ACCEPT: u64 = 43;
 pub const SYS_SENDTO: u64 = 44;
 /// recvfrom(fd, buf, len, flags, src_addr, addrlen)
 pub const SYS_RECVFROM: u64 = 45;
+/// sendmsg(fd, msg, flags)
+pub const SYS_SENDMSG: u64 = 46;
+/// recvmsg(fd, msg, flags)
+pub const SYS_RECVMSG: u64 = 47;
 /// shutdown(fd, how)
 pub const SYS_SHUTDOWN: u64 = 48;
 /// bind(fd, addr, addrlen)
@@ -383,12 +543,18 @@ pub const SYS_LISTEN: u64 = 50;
 pub const SYS_GETSOCKNAME: u64 = 51;
 /// getpeername(fd, addr, addrlen)
 pub const SYS_GETPEERNAME: u64 = 52;
+/// socketpair(domain, type, protocol, sv)
+pub const SYS_SOCKETPAIR: u64 = 53;
 /// setsockopt(fd, level, optname, optval, optlen)
 pub const SYS_SETSOCKOPT: u64 = 54;
 /// getsockopt(fd, level, optname, optval, optlen)
 pub const SYS_GETSOCKOPT: u64 = 55;
 /// accept4(fd, addr, addrlen, flags)
 pub const SYS_ACCEPT4: u64 = 288;
+/// recvmmsg(fd, msgvec, vlen, flags, timeout)
+pub const SYS_RECVMMSG: u64 = 299;
+/// sendmmsg(fd, msgvec, vlen, flags)
+pub const SYS_SENDMMSG: u64 = 307;
 
 // Futex syscalls (Section 7.2)
 /// futex(uaddr, futex_op, val, timeout, uaddr2, val3)
@@ -397,6 +563,8 @@ pub const SYS_FUTEX: u64 = 202;
 pub const SYS_SET_ROBUST_LIST: u64 = 273;
 /// get_robust_list(pid, head_ptr, len_ptr)
 pub const SYS_GET_ROBUST_LIST: u64 = 274;
+/// futex_waitv(waiters, nr_futexes, flags, timeout, clockid)
+pub const SYS_FUTEX_WAITV: u64 = 449;
 
 // SysV IPC syscalls (Section 7.1)
 /// shmget(key, size, shmflg)
@@ -423,6 +591,36 @@ pub const SYS_MSGRCV: u64 = 70;
 pub const SYS_MSGCTL: u64 = 71;
 /// semtimedop(semid, sops, nsops, timeout)
 pub const SYS_SEMTIMEDOP: u64 = 220;
+
+// New process/thread creation
+/// clone3(uargs, size) - Modern extensible clone
+pub const SYS_CLONE3: u64 = 435;
+
+// System logging
+/// syslog(type, buf, len) - Read/control kernel message ring buffer
+pub const SYS_SYSLOG: u64 = 103;
+
+// Process personality/execution domain
+/// personality(persona) - Set process execution domain
+pub const SYS_PERSONALITY: u64 = 135;
+
+// pidfd syscalls
+/// pidfd_send_signal(pidfd, sig, info, flags) - Send signal to process via pidfd
+pub const SYS_PIDFD_SEND_SIGNAL: u64 = 424;
+/// pidfd_open(pid, flags) - Obtain file descriptor for process
+pub const SYS_PIDFD_OPEN: u64 = 434;
+/// pidfd_getfd(pidfd, targetfd, flags) - Get file descriptor from another process
+pub const SYS_PIDFD_GETFD: u64 = 438;
+
+// Keyring syscalls (Section 10.3)
+/// add_key(type, description, payload, plen, keyring)
+pub const SYS_ADD_KEY: u64 = 248;
+/// request_key(type, description, callout_info, dest_keyring)
+pub const SYS_REQUEST_KEY: u64 = 249;
+/// keyctl(cmd, arg2, arg3, arg4, arg5)
+pub const SYS_KEYCTL: u64 = 250;
+/// kcmp(pid1, pid2, type, idx1, idx2)
+pub const SYS_KCMP: u64 = 312;
 
 /// Model Specific Registers for syscall
 const MSR_EFER: u32 = 0xC000_0080; // Extended Feature Enable Register
@@ -589,7 +787,8 @@ unsafe extern "C" fn syscall_entry() {
         "push r8",
         "push r9",
 
-        // Save RCX (user RIP), R11 (user RFLAGS), and user RSP to per-CPU data for clone()/fork()
+        // Save RCX (user RIP), R11 (user RFLAGS), user RSP, and callee-saved regs
+        // for clone()/fork(). The child needs to inherit ALL parent registers.
         // Stack layout at this point (from top):
         //   RSP+0:   r9
         //   RSP+8:   r8
@@ -607,10 +806,36 @@ unsafe extern "C" fn syscall_entry() {
         //   RSP+104: r11 (user RFLAGS)
         //   RSP+112: rcx (user RIP)
         //   RSP+120: user_rsp
-        "mov rdi, [rsp + 112]",  // rcx (user RIP) -> rdi
-        "mov rsi, [rsp + 104]",  // r11 (user RFLAGS) -> rsi
-        "mov rdx, [rsp + 120]",  // user_rsp -> rdx
+        //
+        // save_syscall_state(rip, rflags, rsp, rbx, rbp, r12, r13, r14, r15)
+        // ABI: rdi, rsi, rdx, rcx, r8, r9, [stack+0], [stack+8], [stack+16]
+        //
+        // First 6 args in registers, last 3 on stack
+        // Push stack args in reverse order (r15, r14, r13)
+        "push [rsp + 56]",       // r15 -> stack arg 3 (at rsp+0 after 3 pushes)
+        "push [rsp + 72]",       // r14 -> stack arg 2 (offset +8 due to push)
+        "push [rsp + 88]",       // r13 -> stack arg 1 (offset +16 due to 2 pushes)
+        // Now set up register args
+        "mov rdi, [rsp + 136]",  // rcx (user RIP) -> rdi (offset: 112 + 24)
+        "mov rsi, [rsp + 128]",  // r11 (user RFLAGS) -> rsi (offset: 104 + 24)
+        "mov rdx, [rsp + 144]",  // user_rsp -> rdx (offset: 120 + 24)
+        "mov rcx, [rsp + 120]",  // rbx -> rcx (offset: 96 + 24)
+        "mov r8, [rsp + 112]",   // rbp -> r8 (offset: 88 + 24)
+        "mov r9, [rsp + 104]",   // r12 -> r9 (offset: 80 + 24)
         "call {save_syscall_state}",
+        // Remove stack args
+        "add rsp, 24",
+
+        // Save caller-saved registers for fork() (Linux ABI preserves these across syscalls)
+        // save_syscall_caller_saved(rdi, rsi, rdx, r8, r9, r10)
+        // Stack layout: [r9, r8, r10, rdx, rsi, rdi, rax, ...]
+        "mov rdi, [rsp + 40]",   // saved RDI
+        "mov rsi, [rsp + 32]",   // saved RSI
+        "mov rdx, [rsp + 24]",   // saved RDX
+        "mov rcx, [rsp + 8]",    // saved R8
+        "mov r8, [rsp + 0]",     // saved R9
+        "mov r9, [rsp + 16]",    // saved R10
+        "call {save_syscall_caller_saved}",
 
         // Now set up arguments for C handler
         // syscall_handler(num, arg0, arg1, arg2, arg3, arg4, arg5)
@@ -711,6 +936,7 @@ unsafe extern "C" fn syscall_entry() {
         handler = sym syscall_handler,
         kstack = sym SYSCALL_KERNEL_STACK,
         save_syscall_state = sym super::percpu::save_syscall_state,
+        save_syscall_caller_saved = sym super::percpu::save_syscall_caller_saved,
     );
 }
 
@@ -899,6 +1125,7 @@ pub fn x86_64_syscall_dispatch(
         sys_chdir,
         sys_chmod,
         sys_chown,
+        sys_chroot,
         sys_close,
         sys_dup,
         sys_dup2,
@@ -908,23 +1135,35 @@ pub fn x86_64_syscall_dispatch(
         sys_fchdir,
         sys_fchmod,
         sys_fchmodat,
+        sys_fchmodat2,
         sys_fchown,
         sys_fchownat,
         // fcntl
         sys_fcntl,
         // Sync syscalls
         sys_fdatasync,
+        sys_fgetxattr,
+        sys_flistxattr,
+        sys_fremovexattr,
+        sys_fsetxattr,
         sys_fstat,
+        sys_fstatfs,
         sys_fsync,
         sys_ftruncate,
         sys_getcwd,
         sys_getdents64,
+        sys_getxattr,
         // ioctl
         sys_ioctl,
         sys_lchown,
+        sys_lgetxattr,
         sys_link,
         sys_linkat,
+        sys_listxattr,
+        sys_llistxattr,
+        sys_lremovexattr,
         sys_lseek,
+        sys_lsetxattr,
         sys_lstat,
         sys_mkdir,
         sys_mkdirat,
@@ -936,26 +1175,34 @@ pub fn x86_64_syscall_dispatch(
         // Pipe syscalls
         sys_pipe,
         sys_pipe2,
+        sys_pivot_root,
         // Poll syscalls
         sys_poll,
         sys_ppoll,
         // Positioned read/write syscalls
         sys_pread64,
         sys_preadv,
+        sys_preadv2,
         // Select syscalls
         sys_pselect6,
         sys_pwrite64,
         sys_pwritev,
+        sys_pwritev2,
         sys_read,
         sys_readlink,
         sys_readlinkat,
         sys_readv,
+        sys_removexattr,
         sys_rename,
         sys_renameat,
         sys_renameat2,
         sys_rmdir,
         sys_select,
+        // Extended attributes
+        sys_setxattr,
         sys_stat,
+        sys_statfs,
+        sys_statx,
         sys_symlink,
         sys_symlinkat,
         sys_sync,
@@ -979,8 +1226,9 @@ pub fn x86_64_syscall_dispatch(
         sys_setsid, sys_vfork, sys_wait4, sys_waitid,
     };
     use crate::time_syscall::{
-        sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_gettimeofday, sys_nanosleep,
-        sys_time,
+        sys_adjtimex, sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime,
+        sys_eventfd, sys_eventfd2, sys_gettimeofday, sys_nanosleep, sys_settimeofday, sys_time,
+        sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
     };
 
     match num {
@@ -992,6 +1240,10 @@ pub fn x86_64_syscall_dispatch(
         SYS_PWRITE64 => sys_pwrite64(arg0 as i32, arg1, arg2, arg3 as i64) as u64,
         SYS_PREADV => sys_preadv(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
         SYS_PWRITEV => sys_pwritev(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
+        SYS_PREADV2 => sys_preadv2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg4 as i32) as u64,
+        SYS_PWRITEV2 => {
+            sys_pwritev2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg4 as i32) as u64
+        }
         SYS_OPEN => sys_open(arg0, arg1 as u32, arg2 as u32) as u64,
         SYS_CLOSE => sys_close(arg0 as i32) as u64,
         SYS_LSEEK => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32) as u64,
@@ -1008,12 +1260,16 @@ pub fn x86_64_syscall_dispatch(
         SYS_MUNLOCKALL => crate::mm::syscall::sys_munlockall() as u64,
         SYS_MLOCK2 => crate::mm::syscall::sys_mlock2(arg0, arg1, arg2 as i32) as u64,
         SYS_MSYNC => crate::mm::syscall::sys_msync(arg0, arg1, arg2 as i32) as u64,
+        SYS_MINCORE => crate::mm::syscall::sys_mincore(arg0, arg1, arg2) as u64,
         SYS_MADVISE => crate::mm::syscall::sys_madvise(arg0, arg1, arg2 as i32) as u64,
         SYS_MREMAP => crate::mm::syscall::sys_mremap(arg0, arg1, arg2, arg3 as u32, arg4) as u64,
         SYS_FTRUNCATE => sys_ftruncate(arg0 as i32, arg1 as i64) as u64,
         SYS_TRUNCATE => sys_truncate(arg0, arg1 as i64) as u64,
         SYS_STAT => sys_stat(arg0, arg1) as u64,
         SYS_FSTAT => sys_fstat(arg0 as i32, arg1) as u64,
+        SYS_STATFS => sys_statfs(arg0, arg1) as u64,
+        SYS_FSTATFS => sys_fstatfs(arg0 as i32, arg1) as u64,
+        SYS_STATX => sys_statx(arg0 as i32, arg1, arg2 as i32, arg3 as u32, arg4) as u64,
         SYS_DUP => sys_dup(arg0 as i32) as u64,
         SYS_DUP2 => sys_dup2(arg0 as i32, arg1 as i32) as u64,
         SYS_FCNTL => sys_fcntl(arg0 as i32, arg1 as i32, arg2) as u64,
@@ -1024,8 +1280,86 @@ pub fn x86_64_syscall_dispatch(
         SYS_CLOCK_GETTIME => sys_clock_gettime(arg0 as i32, arg1) as u64,
         SYS_CLOCK_GETRES => sys_clock_getres(arg0 as i32, arg1) as u64,
         SYS_TIME => sys_time(arg0) as u64,
+        SYS_CLOCK_SETTIME => sys_clock_settime(arg0 as i32, arg1) as u64,
+        SYS_SETTIMEOFDAY => sys_settimeofday(arg0, arg1) as u64,
         SYS_NANOSLEEP => sys_nanosleep(arg0, arg1) as u64,
         SYS_CLOCK_NANOSLEEP => sys_clock_nanosleep(arg0 as i32, arg1 as i32, arg2, arg3) as u64,
+        SYS_TIMERFD_CREATE => sys_timerfd_create(arg0 as i32, arg1 as i32) as u64,
+        SYS_TIMERFD_SETTIME => sys_timerfd_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64,
+        SYS_TIMERFD_GETTIME => sys_timerfd_gettime(arg0 as i32, arg1) as u64,
+        SYS_ADJTIMEX => sys_adjtimex(arg0) as u64,
+        SYS_EVENTFD => sys_eventfd(arg0 as u32) as u64,
+        SYS_EVENTFD2 => sys_eventfd2(arg0 as u32, arg1 as i32) as u64,
+
+        // signalfd syscalls (Section 5)
+        SYS_SIGNALFD => crate::signal::syscall::sys_signalfd(arg0 as i32, arg1, arg2 as i32) as u64,
+        SYS_SIGNALFD4 => {
+            crate::signal::syscall::sys_signalfd4(arg0 as i32, arg1, arg2, arg3 as i32) as u64
+        }
+
+        // inotify syscalls (Section 9.2)
+        SYS_INOTIFY_INIT => crate::inotify::sys_inotify_init() as u64,
+        SYS_INOTIFY_INIT1 => crate::inotify::sys_inotify_init1(arg0 as i32) as u64,
+        SYS_INOTIFY_ADD_WATCH => {
+            crate::inotify::sys_inotify_add_watch(arg0 as i32, arg1, arg2 as u32) as u64
+        }
+        SYS_INOTIFY_RM_WATCH => {
+            crate::inotify::sys_inotify_rm_watch(arg0 as i32, arg1 as i32) as u64
+        }
+
+        // epoll syscalls (Section 9.1)
+        SYS_EPOLL_CREATE => crate::epoll::sys_epoll_create(arg0 as i32) as u64,
+        SYS_EPOLL_CREATE1 => crate::epoll::sys_epoll_create1(arg0 as i32) as u64,
+        SYS_EPOLL_CTL => {
+            crate::epoll::sys_epoll_ctl(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64
+        }
+        SYS_EPOLL_WAIT => {
+            crate::epoll::sys_epoll_wait(arg0 as i32, arg1, arg2 as i32, arg3 as i32) as u64
+        }
+        SYS_EPOLL_PWAIT => {
+            crate::epoll::sys_epoll_pwait(arg0 as i32, arg1, arg2 as i32, arg3 as i32, arg4, arg5)
+                as u64
+        }
+        SYS_EPOLL_PWAIT2 => {
+            crate::epoll::sys_epoll_pwait2(arg0 as i32, arg1, arg2 as i32, arg3, arg4, arg5) as u64
+        }
+
+        // io_uring syscalls (Section 9.3)
+        SYS_IO_URING_SETUP => crate::io_uring::sys_io_uring_setup(arg0 as u32, arg1) as u64,
+        SYS_IO_URING_ENTER => crate::io_uring::sys_io_uring_enter(
+            arg0 as u32,
+            arg1 as u32,
+            arg2 as u32,
+            arg3 as u32,
+            arg4,
+            arg5 as usize,
+        ) as u64,
+        SYS_IO_URING_REGISTER => {
+            crate::io_uring::sys_io_uring_register(arg0 as u32, arg1 as u32, arg2, arg3 as u32)
+                as u64
+        }
+
+        // POSIX timer syscalls (Section 6.2)
+        SYS_TIMER_CREATE => crate::posix_timer::sys_timer_create(arg0 as i32, arg1, arg2) as u64,
+        SYS_TIMER_SETTIME => {
+            crate::posix_timer::sys_timer_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64
+        }
+        SYS_TIMER_GETTIME => crate::posix_timer::sys_timer_gettime(arg0 as i32, arg1) as u64,
+        SYS_TIMER_GETOVERRUN => crate::posix_timer::sys_timer_getoverrun(arg0 as i32) as u64,
+        SYS_TIMER_DELETE => crate::posix_timer::sys_timer_delete(arg0 as i32) as u64,
+
+        // POSIX message queue syscalls (Section 7.4)
+        SYS_MQ_OPEN => crate::ipc::sys_mq_open(arg0, arg1 as i32, arg2 as u32, arg3) as u64,
+        SYS_MQ_UNLINK => crate::ipc::sys_mq_unlink(arg0) as u64,
+        SYS_MQ_TIMEDSEND => {
+            crate::ipc::sys_mq_timedsend(arg0 as i32, arg1, arg2 as usize, arg3 as u32, arg4) as u64
+        }
+        SYS_MQ_TIMEDRECEIVE => {
+            crate::ipc::sys_mq_timedreceive(arg0 as i32, arg1, arg2 as usize, arg3, arg4) as u64
+        }
+        SYS_MQ_NOTIFY => crate::ipc::sys_mq_notify(arg0 as i32, arg1) as u64,
+        SYS_MQ_GETSETATTR => crate::ipc::sys_mq_getsetattr(arg0 as i32, arg1, arg2) as u64,
+
         SYS_SCHED_YIELD => {
             sys_sched_yield();
             0
@@ -1102,9 +1436,23 @@ pub fn x86_64_syscall_dispatch(
             use crate::task::syscall::sys_setfsgid;
             sys_setfsgid(arg0 as u32, percpu::current_cred()) as u64
         }
+        SYS_CAPGET => {
+            use crate::arch::Uaccess;
+            use crate::task::syscall::sys_capget;
+            sys_capget::<Uaccess>(arg0, arg1) as u64
+        }
+        SYS_CAPSET => {
+            use crate::arch::Uaccess;
+            use crate::task::syscall::sys_capset;
+            sys_capset::<Uaccess>(arg0, arg1) as u64
+        }
 
         // Process creation (Section 1.1)
         SYS_CLONE => sys_clone(arg0, arg1, arg2, arg3, arg4) as u64,
+        SYS_CLONE3 => {
+            use crate::task::syscall::sys_clone3;
+            sys_clone3(arg0, arg1) as u64
+        }
         SYS_FORK => sys_fork() as u64,
         SYS_VFORK => sys_vfork() as u64,
         SYS_EXECVE => sys_execve(arg0, arg1, arg2) as u64,
@@ -1112,6 +1460,33 @@ pub fn x86_64_syscall_dispatch(
         SYS_WAIT4 => sys_wait4(arg0 as i64, arg1, arg2 as i32, arg3) as u64,
         SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
         SYS_EXIT_GROUP => sys_exit(arg0 as i32), // For single-threaded, same as _exit
+
+        // Personality (execution domain)
+        SYS_PERSONALITY => {
+            use crate::task::syscall::sys_personality;
+            sys_personality(arg0 as u32) as u64
+        }
+
+        // System logging
+        SYS_SYSLOG => {
+            use crate::arch::Uaccess;
+            use crate::task::syscall::sys_syslog;
+            sys_syslog::<Uaccess>(arg0 as i32, arg1, arg2 as i32) as u64
+        }
+
+        // pidfd syscalls
+        SYS_PIDFD_OPEN => {
+            use crate::task::syscall::sys_pidfd_open;
+            sys_pidfd_open(arg0 as i64, arg1 as u32) as u64
+        }
+        SYS_PIDFD_SEND_SIGNAL => {
+            use crate::task::syscall::sys_pidfd_send_signal;
+            sys_pidfd_send_signal(arg0 as i32, arg1 as i32, arg2, arg3 as u32) as u64
+        }
+        SYS_PIDFD_GETFD => {
+            use crate::task::syscall::sys_pidfd_getfd;
+            sys_pidfd_getfd(arg0 as i32, arg1 as i32, arg2 as u32) as u64
+        }
 
         // Power management
         SYS_REBOOT => crate::power::sys_reboot(arg0 as u32, arg1 as u32, arg2 as u32, arg3) as u64,
@@ -1121,6 +1496,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_GETCWD => sys_getcwd(arg0, arg1) as u64,
         SYS_CHDIR => sys_chdir(arg0) as u64,
         SYS_FCHDIR => sys_fchdir(arg0 as i32) as u64,
+        SYS_CHROOT => sys_chroot(arg0) as u64,
         SYS_OPENAT => sys_openat(arg0 as i32, arg1, arg2 as u32, arg3 as u32) as u64,
         SYS_FACCESSAT => sys_faccessat(arg0 as i32, arg1, arg2 as i32, arg3 as i32) as u64,
         SYS_DUP3 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as u32) as u64,
@@ -1157,6 +1533,11 @@ pub fn x86_64_syscall_dispatch(
         // Filesystem mounting
         SYS_MOUNT => sys_mount(arg0, arg1, arg2, arg3, arg4) as u64,
         SYS_UMOUNT2 => sys_umount2(arg0, arg1 as i32) as u64,
+        SYS_PIVOT_ROOT => sys_pivot_root(arg0, arg1) as u64,
+
+        // Swap management
+        SYS_SWAPON => crate::mm::sys_swapon(arg0, arg1 as i32) as u64,
+        SYS_SWAPOFF => crate::mm::sys_swapoff(arg0) as u64,
 
         // Sync operations
         SYS_SYNC => sys_sync() as u64,
@@ -1190,6 +1571,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_CHMOD => sys_chmod(arg0, arg1 as u32) as u64,
         SYS_FCHMOD => sys_fchmod(arg0 as i32, arg1 as u32) as u64,
         SYS_FCHMODAT => sys_fchmodat(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64,
+        SYS_FCHMODAT2 => sys_fchmodat2(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64,
 
         // Ownership
         SYS_CHOWN => sys_chown(arg0, arg1 as u32, arg2 as u32) as u64,
@@ -1212,6 +1594,20 @@ pub fn x86_64_syscall_dispatch(
         SYS_RENAMEAT => sys_renameat(arg0 as i32, arg1, arg2 as i32, arg3) as u64,
         SYS_RENAMEAT2 => sys_renameat2(arg0 as i32, arg1, arg2 as i32, arg3, arg4 as u32) as u64,
 
+        // Extended attributes
+        SYS_SETXATTR => sys_setxattr(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
+        SYS_LSETXATTR => sys_lsetxattr(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
+        SYS_FSETXATTR => sys_fsetxattr(arg0 as i32, arg1, arg2, arg3, arg4 as i32) as u64,
+        SYS_GETXATTR => sys_getxattr(arg0, arg1, arg2, arg3) as u64,
+        SYS_LGETXATTR => sys_lgetxattr(arg0, arg1, arg2, arg3) as u64,
+        SYS_FGETXATTR => sys_fgetxattr(arg0 as i32, arg1, arg2, arg3) as u64,
+        SYS_LISTXATTR => sys_listxattr(arg0, arg1, arg2) as u64,
+        SYS_LLISTXATTR => sys_llistxattr(arg0, arg1, arg2) as u64,
+        SYS_FLISTXATTR => sys_flistxattr(arg0 as i32, arg1, arg2) as u64,
+        SYS_REMOVEXATTR => sys_removexattr(arg0, arg1) as u64,
+        SYS_LREMOVEXATTR => sys_lremovexattr(arg0, arg1) as u64,
+        SYS_FREMOVEXATTR => sys_fremovexattr(arg0 as i32, arg1) as u64,
+
         // UTS namespace (hostname, domainname, system info)
         SYS_UNAME => crate::ns::uts::sys_uname(arg0) as u64,
         SYS_SETHOSTNAME => crate::ns::uts::sys_sethostname(arg0, arg1) as u64,
@@ -1229,11 +1625,35 @@ pub fn x86_64_syscall_dispatch(
             crate::signal::syscall::sys_rt_sigprocmask(arg0 as i32, arg1, arg2, arg3) as u64
         }
         SYS_RT_SIGPENDING => crate::signal::syscall::sys_rt_sigpending(arg0, arg1) as u64,
+        SYS_RT_SIGTIMEDWAIT => {
+            crate::signal::syscall::sys_rt_sigtimedwait(arg0, arg1, arg2, arg3) as u64
+        }
+        SYS_SIGALTSTACK => crate::signal::syscall::sys_sigaltstack(arg0, arg1) as u64,
         SYS_KILL => crate::signal::syscall::sys_kill(arg0 as i64, arg1 as u32) as u64,
         SYS_TGKILL => {
             crate::signal::syscall::sys_tgkill(arg0 as i64, arg1 as i64, arg2 as u32) as u64
         }
         SYS_TKILL => crate::signal::syscall::sys_tkill(arg0 as i64, arg1 as u32) as u64,
+        SYS_RT_SIGQUEUEINFO => {
+            crate::signal::syscall::sys_rt_sigqueueinfo(arg0 as i64, arg1 as u32, arg2) as u64
+        }
+        SYS_RT_SIGSUSPEND => crate::signal::syscall::sys_rt_sigsuspend(arg0, arg1) as u64,
+        SYS_RT_TGSIGQUEUEINFO => crate::signal::syscall::sys_rt_tgsigqueueinfo(
+            arg0 as i64,
+            arg1 as i64,
+            arg2 as u32,
+            arg3,
+        ) as u64,
+
+        // membarrier syscall
+        SYS_MEMBARRIER => {
+            crate::membarrier::sys_membarrier(arg0 as i32, arg1 as u32, arg2 as i32) as u64
+        }
+
+        // readahead syscall
+        SYS_READAHEAD => {
+            crate::fs::syscall::sys_readahead(arg0 as i32, arg1 as i64, arg2 as usize) as u64
+        }
 
         // Scheduling priority
         SYS_GETPRIORITY => {
@@ -1261,7 +1681,11 @@ pub fn x86_64_syscall_dispatch(
             sys_ioprio_get(arg0 as i32, arg1 as i32) as u64
         }
 
-        // Thread-local storage
+        // Thread-local storage and process control
+        SYS_PRCTL => {
+            use crate::task::syscall::sys_prctl;
+            sys_prctl(arg0 as i32, arg1, arg2, arg3, arg4) as u64
+        }
         SYS_ARCH_PRCTL => {
             use crate::task::syscall::sys_arch_prctl;
             sys_arch_prctl(arg0 as i32, arg1) as u64
@@ -1389,6 +1813,18 @@ pub fn x86_64_syscall_dispatch(
         SYS_ACCEPT4 => {
             crate::net::syscall::sys_accept4(arg0 as i32, arg1, arg2, arg3 as i32) as u64
         }
+        SYS_SOCKETPAIR => {
+            crate::net::syscall::sys_socketpair(arg0 as i32, arg1 as i32, arg2 as i32, arg3) as u64
+        }
+        SYS_SENDMSG => crate::net::syscall::sys_sendmsg(arg0 as i32, arg1, arg2 as i32) as u64,
+        SYS_RECVMSG => crate::net::syscall::sys_recvmsg(arg0 as i32, arg1, arg2 as i32) as u64,
+        SYS_SENDMMSG => {
+            crate::net::syscall::sys_sendmmsg(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64
+        }
+        SYS_RECVMMSG => {
+            crate::net::syscall::sys_recvmmsg(arg0 as i32, arg1, arg2 as u32, arg3 as i32, arg4)
+                as u64
+        }
 
         // Futex syscalls
         SYS_FUTEX => {
@@ -1396,6 +1832,9 @@ pub fn x86_64_syscall_dispatch(
         }
         SYS_SET_ROBUST_LIST => crate::futex::sys_set_robust_list(arg0, arg1) as u64,
         SYS_GET_ROBUST_LIST => crate::futex::sys_get_robust_list(arg0 as i32, arg1, arg2) as u64,
+        SYS_FUTEX_WAITV => {
+            crate::futex::sys_futex_waitv(arg0, arg1 as u32, arg2 as u32, arg3, arg4 as i32) as u64
+        }
 
         // SysV IPC syscalls
         SYS_SHMGET => crate::ipc::sys_shmget(arg0 as i32, arg1 as usize, arg2 as i32) as u64,
@@ -1413,6 +1852,14 @@ pub fn x86_64_syscall_dispatch(
                 as u64
         }
         SYS_MSGCTL => crate::ipc::sys_msgctl(arg0 as i32, arg1 as i32, arg2) as u64,
+
+        // Keyring syscalls (Section 10.3)
+        SYS_ADD_KEY => crate::keys::sys_add_key(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
+        SYS_REQUEST_KEY => crate::keys::sys_request_key(arg0, arg1, arg2, arg3 as i32) as u64,
+        SYS_KEYCTL => crate::keys::sys_keyctl(arg0 as i32, arg1, arg2, arg3, arg4) as u64,
+
+        // Process inspection (Section 13)
+        SYS_KCMP => crate::kcmp::sys_kcmp(arg0, arg1, arg2 as i32, arg3, arg4) as u64,
 
         _ => (-38i64) as u64, // ENOSYS
     }

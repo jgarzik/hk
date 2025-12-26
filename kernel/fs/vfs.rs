@@ -48,6 +48,10 @@ pub enum FsError {
     NoSpace,
     /// File too large (EFBIG)
     FileTooLarge,
+    /// No data available (ENODATA) - for xattr not found
+    NoData,
+    /// Result too large for buffer (ERANGE)
+    Range,
 }
 
 /// File metadata

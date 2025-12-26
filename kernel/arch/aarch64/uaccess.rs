@@ -33,7 +33,19 @@ impl UaccessArch for Aarch64Uaccess {
     /// Begin user access (disable PAN if available)
     ///
     /// This temporarily allows kernel access to user memory.
+    /// Also ensures any prior TLB/cache maintenance is complete.
+    #[inline(always)]
     unsafe fn user_access_begin() {
+        // Ensure any prior TLB invalidations or page table updates are complete
+        // before we access user memory. This is particularly important on ARM
+        // where memory ordering is weaker than x86.
+        //
+        // SAFETY: dsb ish is a data synchronization barrier that ensures all
+        // prior memory accesses are complete before proceeding.
+        unsafe {
+            core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        }
+
         // PAN (Privileged Access Never) is an ARMv8.1+ feature.
         // For ARMv8.0 CPUs like cortex-a57, this is a no-op.
         // A full implementation would check ID_AA64MMFR1_EL1.PAN and use
@@ -43,7 +55,17 @@ impl UaccessArch for Aarch64Uaccess {
     /// End user access (re-enable PAN if available)
     ///
     /// This restores protection against accidental user memory access.
+    /// Also ensures all user memory accesses are complete before proceeding.
+    #[inline(always)]
     unsafe fn user_access_end() {
+        // Ensure all user memory accesses complete before continuing
+        //
+        // SAFETY: dsb ish is a data synchronization barrier that ensures all
+        // prior memory accesses are complete before proceeding.
+        unsafe {
+            core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        }
+
         // PAN (Privileged Access Never) is an ARMv8.1+ feature.
         // For ARMv8.0 CPUs like cortex-a57, this is a no-op.
     }

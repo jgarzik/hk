@@ -25,6 +25,7 @@
 //!
 //! - Linux kernel ipc/util.c, ipc/shm.c, ipc/sem.c, ipc/msg.c
 
+pub mod mqueue;
 pub mod msg;
 pub mod sem;
 pub mod shm;
@@ -34,6 +35,10 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicU64};
 use spin::Lazy;
 
+pub use mqueue::{
+    sys_mq_getsetattr, sys_mq_notify, sys_mq_open, sys_mq_timedreceive, sys_mq_timedsend,
+    sys_mq_unlink,
+};
 pub use msg::{sys_msgctl, sys_msgget, sys_msgrcv, sys_msgsnd};
 pub use sem::{sys_semctl, sys_semget, sys_semop, sys_semtimedop};
 pub use shm::{sys_shmat, sys_shmctl, sys_shmdt, sys_shmget};

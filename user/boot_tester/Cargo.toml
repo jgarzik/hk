@@ -1,0 +1,16 @@
+[package]
+name = "hk-boot-tester"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "boot_tester"
+path = "main.rs"
+
+[[bin]]
+name = "boot_tester2"
+path = "boot_tester2.rs"
+
+[dependencies]
+hk-syscall = { path = "../syscall" }

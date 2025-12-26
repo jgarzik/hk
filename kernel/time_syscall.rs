@@ -6,8 +6,9 @@
 //! crate::uaccess to ensure proper validation and SMAP protection.
 
 use crate::arch::Uaccess;
-use crate::time::{ClockId, TIMEKEEPER};
+use crate::time::{ClockId, NTP_STATE, STA_NANO, STA_UNSYNC, TIMEKEEPER};
 use crate::uaccess::{UaccessArch, get_user, put_user};
+use core::sync::atomic::Ordering;
 
 /// Linux clock IDs
 pub const CLOCK_REALTIME: i32 = 0;
@@ -33,7 +34,7 @@ pub struct LinuxTimespec {
 /// Linux timeval structure for gettimeofday (x86_64 only - aarch64 uses clock_gettime)
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Timeval {
     pub tv_sec: i64,
     pub tv_usec: i64,
@@ -305,4 +306,573 @@ fn do_nanosleep(wake_tick: u64) {
     // Add to sleep queue and yield
     // The scheduler will wake us when wake_tick is reached
     crate::task::percpu::sleep_current_until(wake_tick);
+}
+
+/// sys_clock_settime - set time for specified clock
+///
+/// # Arguments
+/// * `clockid` - Clock identifier (only CLOCK_REALTIME can be set)
+/// * `tp` - Pointer to user space timespec structure with new time
+///
+/// Returns 0 on success, negative errno on error.
+///
+/// # Errors
+/// - EINVAL: Invalid clock ID (CLOCK_MONOTONIC cannot be set)
+/// - EINVAL: Invalid timespec (tv_nsec out of range)
+/// - EFAULT: Invalid tp pointer
+pub fn sys_clock_settime(clockid: i32, tp: u64) -> i64 {
+    // Validate user buffer address
+    if tp == 0 || !Uaccess::access_ok(tp, core::mem::size_of::<LinuxTimespec>()) {
+        return EFAULT;
+    }
+
+    // Only CLOCK_REALTIME can be set
+    if clockid != CLOCK_REALTIME {
+        return EINVAL;
+    }
+
+    // Read timespec from user space
+    let ts: LinuxTimespec = match get_user::<Uaccess, LinuxTimespec>(tp) {
+        Ok(ts) => ts,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate timespec values
+    if ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return EINVAL;
+    }
+
+    // Convert to Timespec and set
+    let new_time = crate::time::Timespec {
+        sec: ts.tv_sec,
+        nsec: ts.tv_nsec as u32,
+    };
+
+    if TIMEKEEPER.set_realtime(new_time) {
+        0
+    } else {
+        // Timekeeper not initialized
+        EINVAL
+    }
+}
+
+/// sys_settimeofday - set wall-clock time (x86_64 only)
+///
+/// # Arguments
+/// * `tv` - Pointer to user space timeval structure (may be NULL)
+/// * `tz` - Pointer to user space timezone structure (may be NULL, deprecated)
+///
+/// Returns 0 on success, negative errno on error.
+///
+/// # Errors
+/// - EINVAL: tv_usec out of range [0, 999999]
+/// - EFAULT: Invalid pointer
+///
+/// Note: This is a legacy syscall. aarch64 uses clock_settime instead.
+#[cfg(target_arch = "x86_64")]
+pub fn sys_settimeofday(tv: u64, tz: u64) -> i64 {
+    // If tv is provided, set the time
+    if tv != 0 {
+        // Validate user buffer address
+        if !Uaccess::access_ok(tv, core::mem::size_of::<Timeval>()) {
+            return EFAULT;
+        }
+
+        let timeval: Timeval = match get_user::<Uaccess, Timeval>(tv) {
+            Ok(tv) => tv,
+            Err(_) => return EFAULT,
+        };
+
+        // Validate timeval values
+        if timeval.tv_usec < 0 || timeval.tv_usec >= 1_000_000 {
+            return EINVAL;
+        }
+
+        // Convert timeval to Timespec (us -> ns)
+        let new_time = crate::time::Timespec {
+            sec: timeval.tv_sec,
+            nsec: (timeval.tv_usec * 1000) as u32,
+        };
+
+        if !TIMEKEEPER.set_realtime(new_time) {
+            return EINVAL; // Timekeeper not initialized
+        }
+    }
+
+    // Timezone is deprecated; we accept but ignore it
+    // Just validate the pointer if provided
+    if tz != 0 && !Uaccess::access_ok(tz, core::mem::size_of::<Timezone>()) {
+        return EFAULT;
+    }
+
+    0
+}
+
+// =============================================================================
+// Timerfd syscalls
+// =============================================================================
+
+use crate::eventfd::{create_eventfd, efd_flags};
+use crate::pipe::FD_CLOEXEC;
+use crate::task::fdtable::get_task_fd;
+use crate::task::percpu::current_tid;
+use crate::timerfd::{ITimerSpec, create_timerfd, get_timerfd, tfd_flags, tfd_timer_flags};
+
+/// Error numbers
+const EBADF: i64 = -9;
+const EMFILE: i64 = -24;
+
+/// Get the RLIMIT_NOFILE limit for the current task
+fn get_nofile_limit() -> u64 {
+    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
+    if limit == crate::rlimit::RLIM_INFINITY {
+        u64::MAX
+    } else {
+        limit
+    }
+}
+
+/// sys_timerfd_create - create a timerfd file descriptor
+///
+/// # Arguments
+/// * `clockid` - Clock to use (CLOCK_REALTIME or CLOCK_MONOTONIC)
+/// * `flags` - TFD_CLOEXEC | TFD_NONBLOCK
+///
+/// Returns fd on success, negative errno on error.
+pub fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
+    // Validate clockid
+    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
+        return EINVAL;
+    }
+
+    // Validate flags (only TFD_CLOEXEC and TFD_NONBLOCK are allowed)
+    let valid_flags = tfd_flags::TFD_CLOEXEC | tfd_flags::TFD_NONBLOCK;
+    if flags & !valid_flags != 0 {
+        return EINVAL;
+    }
+
+    // Create the timerfd file
+    let file = match create_timerfd(clockid, flags) {
+        Ok(f) => f,
+        Err(_) => return EMFILE,
+    };
+
+    // Get the FD table and allocate a file descriptor
+    let fd_table = match get_task_fd(current_tid()) {
+        Some(t) => t,
+        None => return EMFILE,
+    };
+    let mut table = fd_table.lock();
+    let fd_flags = if flags & tfd_flags::TFD_CLOEXEC != 0 {
+        FD_CLOEXEC
+    } else {
+        0
+    };
+
+    match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
+        Ok(fd) => fd as i64,
+        Err(e) => -(e as i64),
+    }
+}
+
+/// sys_timerfd_settime - arm/disarm a timerfd
+///
+/// # Arguments
+/// * `fd` - Timerfd file descriptor
+/// * `flags` - TFD_TIMER_ABSTIME for absolute time
+/// * `new_value` - Pointer to new itimerspec
+/// * `old_value` - Pointer to store old itimerspec (may be NULL)
+///
+/// Returns 0 on success, negative errno on error.
+pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: u64, old_value: u64) -> i64 {
+    // Validate flags
+    let valid_flags = tfd_timer_flags::TFD_TIMER_ABSTIME | tfd_timer_flags::TFD_TIMER_CANCEL_ON_SET;
+    if flags & !valid_flags != 0 {
+        return EINVAL;
+    }
+
+    // Validate new_value pointer
+    if new_value == 0 || !Uaccess::access_ok(new_value, core::mem::size_of::<ITimerSpec>()) {
+        return EFAULT;
+    }
+
+    // Read new_value from user space
+    let new_spec: ITimerSpec = match get_user::<Uaccess, ITimerSpec>(new_value) {
+        Ok(spec) => spec,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate timespec values
+    if new_spec.it_value.tv_nsec < 0
+        || new_spec.it_value.tv_nsec >= 1_000_000_000
+        || new_spec.it_interval.tv_nsec < 0
+        || new_spec.it_interval.tv_nsec >= 1_000_000_000
+    {
+        return EINVAL;
+    }
+
+    // Get the file from fd
+    let fd_table = match get_task_fd(current_tid()) {
+        Some(t) => t,
+        None => return EBADF,
+    };
+    let file = match fd_table.lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Get the timerfd from the file
+    let timerfd = match get_timerfd(&file) {
+        Some(t) => t,
+        None => return EBADF, // Not a timerfd
+    };
+
+    // Set the timer and get the old value
+    let old_spec = timerfd.settime(&new_spec, flags);
+
+    // Write old_value if provided
+    if old_value != 0 {
+        if !Uaccess::access_ok(old_value, core::mem::size_of::<ITimerSpec>()) {
+            return EFAULT;
+        }
+        if put_user::<Uaccess, ITimerSpec>(old_value, old_spec).is_err() {
+            return EFAULT;
+        }
+    }
+
+    0
+}
+
+/// sys_timerfd_gettime - get current timer value
+///
+/// # Arguments
+/// * `fd` - Timerfd file descriptor
+/// * `curr_value` - Pointer to store current itimerspec
+///
+/// Returns 0 on success, negative errno on error.
+pub fn sys_timerfd_gettime(fd: i32, curr_value: u64) -> i64 {
+    // Validate curr_value pointer
+    if curr_value == 0 || !Uaccess::access_ok(curr_value, core::mem::size_of::<ITimerSpec>()) {
+        return EFAULT;
+    }
+
+    // Get the file from fd
+    let fd_table = match get_task_fd(current_tid()) {
+        Some(t) => t,
+        None => return EBADF,
+    };
+    let file = match fd_table.lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Get the timerfd from the file
+    let timerfd = match get_timerfd(&file) {
+        Some(t) => t,
+        None => return EBADF, // Not a timerfd
+    };
+
+    // Get current timer value
+    let curr_spec = timerfd.gettime();
+
+    // Write to user space
+    if put_user::<Uaccess, ITimerSpec>(curr_value, curr_spec).is_err() {
+        return EFAULT;
+    }
+
+    0
+}
+
+// ============================================================================
+// eventfd syscalls
+// ============================================================================
+
+/// sys_eventfd2 - create an eventfd file descriptor
+///
+/// # Arguments
+/// * `initval` - Initial value for the counter
+/// * `flags` - EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE
+///
+/// Returns fd on success, negative errno on error.
+pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
+    // Validate flags (only EFD_CLOEXEC, EFD_NONBLOCK, and EFD_SEMAPHORE are allowed)
+    let valid_flags = efd_flags::EFD_CLOEXEC | efd_flags::EFD_NONBLOCK | efd_flags::EFD_SEMAPHORE;
+    if flags & !valid_flags != 0 {
+        return EINVAL;
+    }
+
+    // Create the eventfd file
+    let file = match create_eventfd(initval as u64, flags) {
+        Ok(f) => f,
+        Err(_) => return EMFILE,
+    };
+
+    // Get the FD table and allocate a file descriptor
+    let fd_table = match get_task_fd(current_tid()) {
+        Some(t) => t,
+        None => return EMFILE,
+    };
+    let mut table = fd_table.lock();
+    let fd_flags = if flags & efd_flags::EFD_CLOEXEC != 0 {
+        FD_CLOEXEC
+    } else {
+        0
+    };
+
+    match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
+        Ok(fd) => fd as i64,
+        Err(e) => -(e as i64),
+    }
+}
+
+/// sys_eventfd - create an eventfd file descriptor (legacy, x86_64 only)
+///
+/// # Arguments
+/// * `initval` - Initial value for the counter
+///
+/// Returns fd on success, negative errno on error.
+#[cfg(target_arch = "x86_64")]
+pub fn sys_eventfd(initval: u32) -> i64 {
+    sys_eventfd2(initval, 0)
+}
+
+// ============================================================================
+// adjtimex syscall
+// ============================================================================
+
+/// Linux __kernel_timex_timeval (used inside timex)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TimexTimeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+/// Linux __kernel_timex structure for adjtimex syscall
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Timex {
+    /// Mode selector (ADJ_* flags)
+    pub modes: u32,
+    _pad1: i32,
+    /// Time offset (usec or nsec depending on ADJ_NANO)
+    pub offset: i64,
+    /// Frequency offset (scaled PPM)
+    pub freq: i64,
+    /// Maximum error (usec)
+    pub maxerror: i64,
+    /// Estimated error (usec)
+    pub esterror: i64,
+    /// Clock status (STA_* flags)
+    pub status: i32,
+    _pad2: i32,
+    /// PLL time constant
+    pub constant: i64,
+    /// Clock precision (usec, read-only)
+    pub precision: i64,
+    /// Clock frequency tolerance (ppm, read-only)
+    pub tolerance: i64,
+    /// Current time (read-only except for ADJ_SETOFFSET)
+    pub time: TimexTimeval,
+    /// Usec between clock ticks
+    pub tick: i64,
+    /// PPS frequency (scaled ppm, read-only)
+    pub ppsfreq: i64,
+    /// PPS jitter (usec, read-only)
+    pub jitter: i64,
+    /// Interval duration shift (read-only)
+    pub shift: i32,
+    _pad3: i32,
+    /// PPS stability (scaled ppm, read-only)
+    pub stabil: i64,
+    /// Jitter limit exceeded (read-only)
+    pub jitcnt: i64,
+    /// Calibration intervals (read-only)
+    pub calcnt: i64,
+    /// Calibration errors (read-only)
+    pub errcnt: i64,
+    /// Stability limit exceeded (read-only)
+    pub stbcnt: i64,
+    /// TAI offset (read-only)
+    pub tai: i32,
+    /// Padding for 11 more i32 fields
+    _reserved: [i32; 11],
+}
+
+impl Default for Timex {
+    fn default() -> Self {
+        // Zero-initialize all fields
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+/// ADJ_* mode flags for adjtimex
+#[allow(dead_code)]
+pub const ADJ_OFFSET: u32 = 0x0001;
+#[allow(dead_code)]
+pub const ADJ_FREQUENCY: u32 = 0x0002;
+pub const ADJ_MAXERROR: u32 = 0x0004;
+pub const ADJ_ESTERROR: u32 = 0x0008;
+pub const ADJ_STATUS: u32 = 0x0010;
+pub const ADJ_TIMECONST: u32 = 0x0020;
+pub const ADJ_TAI: u32 = 0x0080;
+pub const ADJ_SETOFFSET: u32 = 0x0100;
+#[allow(dead_code)]
+pub const ADJ_MICRO: u32 = 0x1000;
+pub const ADJ_NANO: u32 = 0x2000;
+pub const ADJ_TICK: u32 = 0x4000;
+
+/// Clock time states (return values)
+pub const TIME_OK: i32 = 0;
+#[allow(dead_code)]
+pub const TIME_INS: i32 = 1;
+#[allow(dead_code)]
+pub const TIME_DEL: i32 = 2;
+#[allow(dead_code)]
+pub const TIME_OOP: i32 = 3;
+#[allow(dead_code)]
+pub const TIME_WAIT: i32 = 4;
+pub const TIME_ERROR: i32 = 5;
+
+/// Writable STA_* status flags (read-write mask)
+const STA_RW_MASK: i32 = crate::time::STA_PLL
+    | crate::time::STA_PPSFREQ
+    | crate::time::STA_PPSTIME
+    | crate::time::STA_FLL
+    | crate::time::STA_INS
+    | crate::time::STA_DEL
+    | crate::time::STA_UNSYNC
+    | crate::time::STA_FREQHOLD;
+
+/// sys_adjtimex - read or set kernel time variables
+///
+/// # Arguments
+/// * `txc_p` - Pointer to user space timex structure
+///
+/// Returns TIME_OK (0) on success if clock is synchronized,
+/// or TIME_ERROR (5) if unsynchronized,
+/// or negative errno on error.
+///
+/// # Privilege
+/// Reading (modes=0) is always allowed.
+/// Setting values requires CAP_SYS_TIME capability.
+pub fn sys_adjtimex(txc_p: u64) -> i64 {
+    // Validate user buffer
+    if txc_p == 0 || !Uaccess::access_ok(txc_p, core::mem::size_of::<Timex>()) {
+        return EFAULT;
+    }
+
+    // Read timex from user space
+    let mut txc: Timex = match get_user::<Uaccess, Timex>(txc_p) {
+        Ok(t) => t,
+        Err(_) => return EFAULT,
+    };
+
+    // Check if any modifications are requested
+    let is_read_only = txc.modes == 0;
+
+    // For any modification, require CAP_SYS_TIME
+    // For now, we allow modifications from any process (simplified model)
+    // A full implementation would check cred.has_capability(CAP_SYS_TIME)
+    if !is_read_only {
+        // Validate tick range if being set
+        if txc.modes & ADJ_TICK != 0 {
+            // Tick must be within 10% of nominal (10000 usec = 10ms for 100Hz)
+            if txc.tick < 9000 || txc.tick > 11000 {
+                return EINVAL;
+            }
+        }
+
+        // Validate offset if ADJ_SETOFFSET is used
+        if txc.modes & ADJ_SETOFFSET != 0 {
+            if txc.time.tv_usec < 0 {
+                return EINVAL;
+            }
+            if txc.modes & ADJ_NANO != 0 {
+                if txc.time.tv_usec >= 1_000_000_000 {
+                    return EINVAL;
+                }
+            } else if txc.time.tv_usec >= 1_000_000 {
+                return EINVAL;
+            }
+        }
+    }
+
+    // Apply modifications to kernel state
+    if txc.modes & ADJ_MAXERROR != 0 {
+        NTP_STATE.maxerror.store(txc.maxerror, Ordering::Relaxed);
+    }
+    if txc.modes & ADJ_ESTERROR != 0 {
+        NTP_STATE.esterror.store(txc.esterror, Ordering::Relaxed);
+    }
+    if txc.modes & ADJ_STATUS != 0 {
+        // Only allow setting writable status bits
+        let new_status = txc.status & STA_RW_MASK;
+        NTP_STATE.status.store(new_status, Ordering::Relaxed);
+    }
+    if txc.modes & ADJ_TAI != 0 {
+        NTP_STATE.tai_offset.store(txc.tai, Ordering::Relaxed);
+    }
+    if txc.modes & ADJ_TIMECONST != 0 {
+        NTP_STATE.constant.store(txc.constant, Ordering::Relaxed);
+    }
+    if txc.modes & ADJ_TICK != 0 {
+        NTP_STATE.tick.store(txc.tick, Ordering::Relaxed);
+    }
+
+    // Handle ADJ_SETOFFSET - inject time offset
+    if txc.modes & ADJ_SETOFFSET != 0 {
+        let offset_ns = if txc.modes & ADJ_NANO != 0 {
+            txc.time.tv_sec * 1_000_000_000 + txc.time.tv_usec
+        } else {
+            txc.time.tv_sec * 1_000_000_000 + txc.time.tv_usec * 1000
+        };
+
+        // Get current realtime and add offset
+        let current = TIMEKEEPER.read(ClockId::Realtime, TIMEKEEPER.get_read_cycles());
+        let new_ns = current.to_nanos() + offset_ns as i128;
+        let new_time = crate::time::Timespec::from_nanos(new_ns);
+        TIMEKEEPER.set_realtime(new_time);
+    }
+
+    // Read current state back into txc
+    let ts = TIMEKEEPER.read(ClockId::Realtime, TIMEKEEPER.get_read_cycles());
+    let status = NTP_STATE.status.load(Ordering::Relaxed);
+
+    txc.offset = 0; // No ongoing adjustment
+    txc.freq = 0; // No frequency offset
+    txc.maxerror = NTP_STATE.maxerror.load(Ordering::Relaxed);
+    txc.esterror = NTP_STATE.esterror.load(Ordering::Relaxed);
+    txc.status = status;
+    txc.constant = NTP_STATE.constant.load(Ordering::Relaxed);
+    txc.precision = 1; // 1 microsecond precision
+    txc.tolerance = 500; // 500 ppm tolerance
+    txc.time.tv_sec = ts.sec;
+    txc.time.tv_usec = if status & STA_NANO != 0 {
+        ts.nsec as i64
+    } else {
+        ts.nsec as i64 / 1000
+    };
+    txc.tick = NTP_STATE.tick.load(Ordering::Relaxed);
+    txc.ppsfreq = 0;
+    txc.jitter = 0;
+    txc.shift = 0;
+    txc.stabil = 0;
+    txc.jitcnt = 0;
+    txc.calcnt = 0;
+    txc.errcnt = 0;
+    txc.stbcnt = 0;
+    txc.tai = NTP_STATE.tai_offset.load(Ordering::Relaxed);
+
+    // Copy result back to user space
+    if put_user::<Uaccess, Timex>(txc_p, txc).is_err() {
+        return EFAULT;
+    }
+
+    // Return clock state
+    if status & STA_UNSYNC != 0 {
+        TIME_ERROR as i64
+    } else {
+        TIME_OK as i64
+    }
 }

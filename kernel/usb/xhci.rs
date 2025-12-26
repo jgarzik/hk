@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 
 use spin::Mutex;
 
-use crate::arch::{CurrentArch, FrameAlloc, IoremapOps};
+use crate::arch::{CurrentArch, FrameAlloc, IoremapOps, phys_to_virt};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, Driver, DriverError};
 use crate::bus::pci::{self, PciDevice};
@@ -519,11 +519,11 @@ impl CommandRing {
     fn init_from_phys(phys: u64) -> Option<Self> {
         // Zero the memory
         unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(phys_to_virt(phys), 0, 4096);
         }
 
         // Set up link TRB at end of ring (points back to start)
-        let trbs = phys as *mut Trb;
+        let trbs = phys_to_virt(phys) as *mut Trb;
         unsafe {
             let link = trbs.add(Self::SIZE - 1);
             (*link).parameter = phys;
@@ -619,22 +619,22 @@ impl EventRing {
     fn init_from_phys(phys: u64, erst_phys: u64) -> Option<Self> {
         // Zero event ring memory
         unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(phys_to_virt(phys), 0, 4096);
         }
 
         // Zero and initialize ERST (Event Ring Segment Table)
         unsafe {
-            core::ptr::write_bytes(erst_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(phys_to_virt(erst_phys), 0, 4096);
 
             // Set up single ERST entry
-            let erst = erst_phys as *mut ErstEntry;
+            let erst = phys_to_virt(erst_phys) as *mut ErstEntry;
             (*erst).ring_segment_base = phys;
             (*erst).ring_segment_size = Self::SIZE as u16;
         }
 
         Some(Self {
             phys,
-            trbs: TrbPtr(phys as *mut Trb),
+            trbs: TrbPtr(phys_to_virt(phys) as *mut Trb),
             size: Self::SIZE,
             dequeue: 0,
             cycle: true,
@@ -848,7 +848,7 @@ impl XhciController {
         // Allocate Device Context Base Address Array
         let dcbaa_phys = frame_alloc.alloc_frame().ok_or(UsbError::NoResources)?;
         unsafe {
-            core::ptr::write_bytes(dcbaa_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(phys_to_virt(dcbaa_phys), 0, 4096);
         }
         self.dcbaa_phys = dcbaa_phys;
 
@@ -929,7 +929,7 @@ impl XhciController {
         // Allocate Device Context Base Address Array
         let dcbaa_phys = frame_alloc.alloc_frame().ok_or(UsbError::NoResources)?;
         unsafe {
-            core::ptr::write_bytes(dcbaa_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(phys_to_virt(dcbaa_phys), 0, 4096);
         }
         self.dcbaa_phys = dcbaa_phys;
 
@@ -1256,7 +1256,7 @@ impl XhciController {
 
         // Set DCBAA entry for this slot
         unsafe {
-            let dcbaa = self.dcbaa_phys as *mut u64;
+            let dcbaa = phys_to_virt(self.dcbaa_phys) as *mut u64;
             write_volatile(dcbaa.add(slot_id as usize), output_ctx.dma_addr());
         }
         fence(Ordering::SeqCst);
@@ -1733,7 +1733,7 @@ impl XhciController {
 
         // Clear DCBAA entry for this slot
         unsafe {
-            let dcbaa = self.dcbaa_phys as *mut u64;
+            let dcbaa = phys_to_virt(self.dcbaa_phys) as *mut u64;
             write_volatile(dcbaa.add(slot_id as usize), 0);
         }
         fence(Ordering::SeqCst);

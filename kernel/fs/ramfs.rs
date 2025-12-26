@@ -29,9 +29,11 @@ use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
 
 use super::FsError;
 use super::dentry::Dentry;
-use super::file::{DirEntry, File, FileOps};
+use super::file::{DirEntry, File, FileOps, RwFlags};
 use super::inode::{AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
-use super::superblock::{FileSystemType, SuperBlock, SuperBlockData, SuperOps};
+use super::superblock::{
+    FileSystemType, RAMFS_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps,
+};
 
 // ============================================================================
 // Ramfs Address Space Operations
@@ -79,6 +81,9 @@ pub struct RamfsInodeData {
     /// Symlink target (symlinks only - stored inline, not in page cache)
     /// Symlinks are typically small, so inline storage is more efficient.
     pub symlink_target: Option<String>,
+
+    /// Extended attributes (name -> value)
+    pub xattrs: RwLock<BTreeMap<String, Vec<u8>>>,
 }
 
 /// Generate a FileId for a ramfs inode
@@ -99,6 +104,7 @@ impl RamfsInodeData {
             file_id: Some(file_id),
             children: RwLock::new(BTreeMap::new()),
             symlink_target: None,
+            xattrs: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -108,6 +114,7 @@ impl RamfsInodeData {
             file_id: None,
             children: RwLock::new(BTreeMap::new()),
             symlink_target: None,
+            xattrs: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -117,6 +124,7 @@ impl RamfsInodeData {
             file_id: None,
             children: RwLock::new(BTreeMap::new()),
             symlink_target: Some(target),
+            xattrs: RwLock::new(BTreeMap::new()),
         }
     }
 }
@@ -697,6 +705,153 @@ impl InodeOps for RamfsInodeOps {
 
         Ok(())
     }
+
+    // =========================================================================
+    // Extended attribute operations
+    // =========================================================================
+
+    fn getxattr(&self, inode: &Inode, name: &str, value: &mut [u8]) -> Result<usize, FsError> {
+        // Validate namespace - only user.* is supported for regular files/dirs
+        if !name.starts_with("user.") {
+            return Err(FsError::NotSupported);
+        }
+
+        // user.* namespace only allowed on regular files and directories
+        let mode = inode.mode();
+        if !mode.is_file() && !mode.is_dir() {
+            return Err(FsError::NotSupported);
+        }
+
+        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let ramfs_data = private
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RamfsInodeData>()
+            .ok_or(FsError::IoError)?;
+
+        let xattrs = ramfs_data.xattrs.read();
+        let attr_value = xattrs.get(name).ok_or(FsError::NoData)?;
+
+        // If value buffer is empty, return the size needed
+        if value.is_empty() {
+            return Ok(attr_value.len());
+        }
+
+        // Check if buffer is large enough
+        if value.len() < attr_value.len() {
+            return Err(FsError::Range);
+        }
+
+        // Copy value to buffer
+        value[..attr_value.len()].copy_from_slice(attr_value);
+        Ok(attr_value.len())
+    }
+
+    fn setxattr(&self, inode: &Inode, name: &str, value: &[u8], flags: u32) -> Result<(), FsError> {
+        // Constants for xattr flags
+        const XATTR_CREATE: u32 = 0x1;
+        const XATTR_REPLACE: u32 = 0x2;
+
+        // Validate namespace - only user.* is supported for regular files/dirs
+        if !name.starts_with("user.") {
+            return Err(FsError::NotSupported);
+        }
+
+        // user.* namespace only allowed on regular files and directories
+        let mode = inode.mode();
+        if !mode.is_file() && !mode.is_dir() {
+            return Err(FsError::NotSupported);
+        }
+
+        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let ramfs_data = private
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RamfsInodeData>()
+            .ok_or(FsError::IoError)?;
+
+        let mut xattrs = ramfs_data.xattrs.write();
+
+        let exists = xattrs.contains_key(name);
+
+        // Check XATTR_CREATE flag - fail if exists
+        if (flags & XATTR_CREATE) != 0 && exists {
+            return Err(FsError::AlreadyExists);
+        }
+
+        // Check XATTR_REPLACE flag - fail if doesn't exist
+        if (flags & XATTR_REPLACE) != 0 && !exists {
+            return Err(FsError::NoData);
+        }
+
+        // Set the attribute
+        xattrs.insert(String::from(name), value.to_vec());
+        Ok(())
+    }
+
+    fn listxattr(&self, inode: &Inode, list: &mut [u8]) -> Result<usize, FsError> {
+        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let ramfs_data = private
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RamfsInodeData>()
+            .ok_or(FsError::IoError)?;
+
+        let xattrs = ramfs_data.xattrs.read();
+
+        // Calculate total size needed (each name + null terminator)
+        let total_size: usize = xattrs.keys().map(|k| k.len() + 1).sum();
+
+        // If list buffer is empty, return the size needed
+        if list.is_empty() {
+            return Ok(total_size);
+        }
+
+        // Check if buffer is large enough
+        if list.len() < total_size {
+            return Err(FsError::Range);
+        }
+
+        // Build the null-separated list of attribute names
+        let mut offset = 0;
+        for name in xattrs.keys() {
+            let name_bytes = name.as_bytes();
+            list[offset..offset + name_bytes.len()].copy_from_slice(name_bytes);
+            offset += name_bytes.len();
+            list[offset] = 0; // null terminator
+            offset += 1;
+        }
+
+        Ok(total_size)
+    }
+
+    fn removexattr(&self, inode: &Inode, name: &str) -> Result<(), FsError> {
+        // Validate namespace - only user.* is supported for regular files/dirs
+        if !name.starts_with("user.") {
+            return Err(FsError::NotSupported);
+        }
+
+        // user.* namespace only allowed on regular files and directories
+        let mode = inode.mode();
+        if !mode.is_file() && !mode.is_dir() {
+            return Err(FsError::NotSupported);
+        }
+
+        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let ramfs_data = private
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RamfsInodeData>()
+            .ok_or(FsError::IoError)?;
+
+        let mut xattrs = ramfs_data.xattrs.write();
+
+        if xattrs.remove(name).is_none() {
+            return Err(FsError::NoData);
+        }
+
+        Ok(())
+    }
 }
 
 /// Static ramfs inode ops
@@ -1053,6 +1208,45 @@ impl FileOps for RamfsFileOps {
 
         Ok(())
     }
+
+    // RWF_NOWAIT support: ramfs is in-memory and never blocks
+
+    fn read_with_flags(
+        &self,
+        file: &File,
+        buf: &mut [u8],
+        _flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        // In-memory filesystem never blocks
+        self.read(file, buf)
+    }
+
+    fn pread_with_flags(
+        &self,
+        file: &File,
+        buf: &mut [u8],
+        offset: u64,
+        _flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        // In-memory filesystem never blocks
+        self.pread(file, buf, offset)
+    }
+
+    fn write_with_flags(&self, file: &File, buf: &[u8], _flags: RwFlags) -> Result<usize, FsError> {
+        // In-memory filesystem never blocks
+        self.write(file, buf)
+    }
+
+    fn pwrite_with_flags(
+        &self,
+        file: &File,
+        buf: &[u8],
+        offset: u64,
+        _flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        // In-memory filesystem never blocks
+        self.pwrite(file, buf, offset)
+    }
 }
 
 /// Static ramfs file ops
@@ -1062,6 +1256,19 @@ pub static RAMFS_FILE_OPS: RamfsFileOps = RamfsFileOps;
 pub struct RamfsSuperOps;
 
 impl SuperOps for RamfsSuperOps {
+    fn statfs(&self) -> StatFs {
+        StatFs {
+            f_type: RAMFS_MAGIC,
+            f_bsize: 4096,
+            f_blocks: 0, // Unlimited (in-memory filesystem)
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0, // Unlimited inodes
+            f_ffree: 0,
+            f_namelen: 255,
+        }
+    }
+
     fn alloc_inode(
         &self,
         sb: &Arc<SuperBlock>,

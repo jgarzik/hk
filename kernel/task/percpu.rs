@@ -419,6 +419,10 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         signal_state: crate::signal::TaskSignalState::new(),
         tif_sigpending: core::sync::atomic::AtomicBool::new(false),
         robust_list: 0,
+        // prctl state
+        prctl: crate::task::PrctlState::default(),
+        // Process personality (execution domain)
+        personality: 0,
     };
 
     // Add task to global table
@@ -514,6 +518,10 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         signal_state: crate::signal::TaskSignalState::new(),
         tif_sigpending: core::sync::atomic::AtomicBool::new(false),
         robust_list: 0,
+        // prctl state
+        prctl: crate::task::PrctlState::default(),
+        // Process personality (execution domain)
+        personality: 0,
     };
 
     // Add to global table
@@ -573,11 +581,22 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
 
 /// Mark a task as zombie with exit status
 pub fn mark_zombie(tid: Tid, status: i32) {
-    let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.state = TaskState::Zombie(status);
-        // Release cached pages
-        task.release_cached_pages();
+    let pid: Option<Pid>;
+    {
+        let mut table = TASK_TABLE.lock();
+        if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+            task.state = TaskState::Zombie(status);
+            // Release cached pages
+            task.release_cached_pages();
+            pid = Some(task.pid);
+        } else {
+            pid = None;
+        }
+    }
+
+    // Notify any pidfds watching this process (after releasing TASK_TABLE lock)
+    if let Some(p) = pid {
+        crate::pidfd::notify_process_exit(p, status);
     }
 }
 
@@ -678,6 +697,8 @@ pub struct CloneConfig {
     pub child_tidptr: u64,
     /// TLS pointer for child (CLONE_SETTLS)
     pub tls: u64,
+    /// User address to store pidfd (CLONE_PIDFD)
+    pub pidfd_ptr: u64,
 }
 
 /// Create a new thread/process via clone()
@@ -766,6 +787,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_cpus_allowed,
         parent_pt_phys,
         parent_cred,
+        parent_prctl,
+        parent_personality,
     ) = {
         let table = TASK_TABLE.lock();
         let parent = try_with_cleanup!(table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)); // ESRCH - no such process
@@ -781,6 +804,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.cpus_allowed,
             parent.page_table.root_table_phys(),
             parent.cred.clone(),
+            parent.prctl.clone(),
+            parent.personality,
         )
     };
 
@@ -925,6 +950,15 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         signal_state: crate::signal::TaskSignalState::new(),
         tif_sigpending: core::sync::atomic::AtomicBool::new(false),
         robust_list: 0,
+        // prctl state: inherit no_new_privs from parent, reset others
+        prctl: crate::task::PrctlState {
+            name: [0u8; 16],                                 // Child gets empty name
+            dumpable: crate::task::dumpable::SUID_DUMP_USER, // Reset to default
+            no_new_privs: parent_prctl.no_new_privs,         // Inherited (irreversible)
+            timer_slack_ns: parent_prctl.timer_slack_ns,     // Inherited
+        },
+        // Process personality (inherited from parent)
+        personality: parent_personality,
     };
 
     // Add to global task table
@@ -1033,14 +1067,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         crate::task::set_clear_child_tid(child_tid, config.child_tidptr);
     }
 
-    printkln!(
-        "CLONE: parent_tid={} child_tid={} child_pid={} flags=0x{:x}",
-        current_tid,
-        child_tid,
-        child_pid,
-        config.flags
-    );
-
     // Determine return value before potential blocking
     let return_value = if config.flags & CLONE_THREAD != 0 {
         child_tid
@@ -1054,6 +1080,50 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         register_vfork_child(child_tid);
         // Wait for child to signal completion (via exec or exit)
         wait_for_vfork(child_tid);
+    }
+
+    // Handle CLONE_PIDFD: create a pidfd for the child and write it to parent's address space
+    if config.flags & CLONE_PIDFD != 0 && config.pidfd_ptr != 0 {
+        use crate::arch::Uaccess;
+        use crate::uaccess::put_user;
+
+        // Create pidfd for the child
+        let pidfd_file = match crate::pidfd::create_pidfd(child_pid, 0) {
+            Ok(file) => file,
+            Err(_) => {
+                // Pidfd creation failed - this is not critical, just don't set it
+                // Return success anyway as the child is already created
+                return Ok(return_value);
+            }
+        };
+
+        // Allocate FD in parent's FD table
+        let fd_table = match crate::task::fdtable::get_task_fd(current_tid) {
+            Some(table) => table,
+            None => return Ok(return_value), // No FD table - shouldn't happen
+        };
+
+        // Get NOFILE limit
+        let nofile = {
+            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
+            if limit == crate::rlimit::RLIM_INFINITY {
+                u64::MAX
+            } else {
+                limit
+            }
+        };
+
+        let pidfd_num = {
+            let mut table = fd_table.lock();
+            // Allocate with O_CLOEXEC by default for pidfds
+            match table.alloc_with_flags(pidfd_file, crate::task::FD_CLOEXEC, nofile) {
+                Ok(fd) => fd,
+                Err(_) => return Ok(return_value), // FD allocation failed
+            }
+        };
+
+        // Write the pidfd number to parent's address space
+        let _ = put_user::<Uaccess, i32>(config.pidfd_ptr, pidfd_num as i32);
     }
 
     // Return value depends on CLONE_THREAD flag:
@@ -1210,6 +1280,8 @@ pub fn exit_current() -> ! {
 /// Called on timer tick
 pub fn timer_tick() {
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Check and fire any expired software timers
+    crate::timer::check_timers();
 }
 
 /// Get current tick count
@@ -2372,5 +2444,32 @@ pub fn try_schedule() {
         unsafe {
             CurrentArch::context_switch_first(next_ctx, next_kstack, next_cr3, next_tid);
         }
+    }
+}
+
+// =============================================================================
+// Personality accessors
+// =============================================================================
+
+/// Get the current task's personality value
+///
+/// Default is 0 (PER_LINUX).
+pub fn get_current_personality() -> u32 {
+    let tid = current_tid();
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .map(|t| t.personality)
+        .unwrap_or(0)
+}
+
+/// Set the current task's personality value
+pub fn set_current_personality(personality: u32) {
+    let tid = current_tid();
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.personality = personality;
     }
 }

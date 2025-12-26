@@ -12,8 +12,8 @@ use alloc::vec;
 use crate::arch::Uaccess;
 use crate::console::console_write;
 use crate::fs::{
-    Dentry, File, FsError, InodeMode, LookupFlags, Path, RAMFS_FILE_OPS, is_subdir, lock_rename,
-    lookup_path_at, lookup_path_flags, unlock_rename,
+    Dentry, File, FsError, InodeMode, LinuxStatFs, LookupFlags, Path, RAMFS_FILE_OPS, RwFlags,
+    is_subdir, lock_rename, lookup_path_at, lookup_path_flags, unlock_rename,
 };
 use crate::uaccess::{UaccessArch, copy_to_user, put_user, strncpy_from_user};
 
@@ -22,7 +22,9 @@ use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
 /// Error numbers (negated for return)
+pub const EPERM: i64 = -1;
 pub const ENOENT: i64 = -2;
+pub const EACCES: i64 = -13;
 pub const ENXIO: i64 = -6;
 pub const EBADF: i64 = -9;
 pub const EAGAIN: i64 = -11;
@@ -37,6 +39,43 @@ pub const EFBIG: i64 = -27;
 pub const ESPIPE: i64 = -29;
 pub const EPIPE: i64 = -32;
 pub const ENOTEMPTY: i64 = -39;
+pub const ERANGE: i64 = -34;
+pub const ENODATA: i64 = -61;
+pub const EEXIST: i64 = -17;
+pub const EOPNOTSUPP: i64 = -95;
+
+// =============================================================================
+// RWF flags for preadv2/pwritev2
+// =============================================================================
+
+/// High priority request (hint, accepted but no-op)
+pub const RWF_HIPRI: i32 = 0x00000001;
+/// Per-IO O_DSYNC - sync data after write
+pub const RWF_DSYNC: i32 = 0x00000002;
+/// Per-IO O_SYNC - full sync after write
+pub const RWF_SYNC: i32 = 0x00000004;
+/// Return EAGAIN if operation would block
+pub const RWF_NOWAIT: i32 = 0x00000008;
+/// Per-IO O_APPEND - append to file
+pub const RWF_APPEND: i32 = 0x00000010;
+/// Negate O_APPEND (no-op in our implementation)
+pub const RWF_NOAPPEND: i32 = 0x00000020;
+/// Atomic write (not supported)
+pub const RWF_ATOMIC: i32 = 0x00000040;
+/// Drop cache after I/O (not supported)
+pub const RWF_DONTCACHE: i32 = 0x00000080;
+/// Prevent SIGPIPE (no-op, we don't generate SIGPIPE on pipes yet)
+pub const RWF_NOSIGNAL: i32 = 0x00000100;
+/// Mask of all supported RWF flags
+pub const RWF_SUPPORTED: i32 = RWF_HIPRI
+    | RWF_DSYNC
+    | RWF_SYNC
+    | RWF_NOWAIT
+    | RWF_APPEND
+    | RWF_NOAPPEND
+    | RWF_ATOMIC
+    | RWF_DONTCACHE
+    | RWF_NOSIGNAL;
 
 /// AT_FDCWD - special value meaning current working directory
 ///
@@ -403,8 +442,67 @@ pub fn sys_fchdir(fd: i32) -> i64 {
     0
 }
 
-/// ERANGE - buffer too small
-const ERANGE: i64 = -34;
+/// sys_chroot - change root directory
+///
+/// Changes the root directory of the calling process to the directory
+/// specified in path. This call does not change the current working directory.
+///
+/// # Arguments
+/// * `path_ptr` - User pointer to null-terminated path string
+///
+/// # Returns
+/// 0 on success, negative errno on error.
+///
+/// # Errors
+/// * EFAULT - Invalid user pointer
+/// * ENOENT - Path not found
+/// * ENOTDIR - Path is not a directory
+/// * EACCES - No execute permission on path
+/// * EPERM - Caller lacks CAP_SYS_CHROOT capability
+pub fn sys_chroot(path_ptr: u64) -> i64 {
+    // Check capability (must be root or have CAP_SYS_CHROOT)
+    if !crate::task::capable(crate::task::CAP_SYS_CHROOT) {
+        return EPERM;
+    }
+
+    // Copy path from user space
+    let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Start from current working directory for relative paths
+    let start = crate::task::percpu::current_cwd();
+
+    // Look up the path - must be a directory and we must follow symlinks
+    let dentry = match lookup_path_at(start, &path_str, LookupFlags::opendir()) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(FsError::PermissionDenied) => return EACCES,
+        Err(_) => return EINVAL,
+    };
+
+    // Verify it's a directory (should be guaranteed by opendir() flags, but check anyway)
+    if let Some(inode) = dentry.get_inode() {
+        if !inode.mode().is_dir() {
+            return ENOTDIR;
+        }
+    } else {
+        return ENOENT;
+    }
+
+    // Update the root directory
+    if let Some(fs) = crate::task::percpu::current_fs()
+        && let Some(new_root) = Path::from_dentry(dentry)
+    {
+        fs.set_root(new_root);
+    } else {
+        return EINVAL;
+    }
+
+    0
+}
 
 /// sys_getcwd - get current working directory
 ///
@@ -497,6 +595,7 @@ pub fn sys_read(fd: i32, buf_ptr: u64, count: u64) -> i64 {
             Ok(n) => n,
             Err(FsError::IsADirectory) => return EISDIR,
             Err(FsError::PermissionDenied) => return EBADF,
+            Err(FsError::WouldBlock) => return EAGAIN,
             Err(_) => return EINVAL,
         };
 
@@ -515,6 +614,7 @@ pub fn sys_read(fd: i32, buf_ptr: u64, count: u64) -> i64 {
             Ok(n) => n,
             Err(FsError::IsADirectory) => return EISDIR,
             Err(FsError::PermissionDenied) => return EBADF,
+            Err(FsError::WouldBlock) => return EAGAIN,
             Err(_) => return EINVAL,
         };
 
@@ -1527,6 +1627,459 @@ pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
     total_written as i64
 }
 
+/// sys_preadv2 - positioned scatter read with flags
+///
+/// Enhanced version of preadv that supports per-I/O flags (RWF_*).
+///
+/// # Arguments
+/// * `fd` - File descriptor to read from
+/// * `iov_ptr` - User pointer to array of iovec structures
+/// * `iovcnt` - Number of iovec structures
+/// * `offset` - File offset to read from, or -1 to use current file position
+/// * `flags` - RWF_* flags for this I/O operation
+///
+/// # Returns
+/// Total bytes read on success, negative errno on error.
+/// Returns -EOPNOTSUPP for unsupported flags.
+pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) -> i64 {
+    // Validate flags - unknown flags return EOPNOTSUPP
+    if flags & !RWF_SUPPORTED != 0 {
+        return EOPNOTSUPP;
+    }
+
+    // Unsupported flags - return EOPNOTSUPP
+    if flags & (RWF_ATOMIC | RWF_DONTCACHE) != 0 {
+        return EOPNOTSUPP;
+    }
+
+    // If RWF_NOWAIT not set, delegate to existing syscalls
+    if flags & RWF_NOWAIT == 0 {
+        if offset == -1 {
+            return sys_readv(fd, iov_ptr, iovcnt);
+        }
+        return sys_preadv(fd, iov_ptr, iovcnt, offset);
+    }
+
+    // RWF_NOWAIT handling - use *_with_flags methods
+    let rw_flags = RwFlags::with_nowait();
+
+    // Validate and copy iovec array
+    let iovecs = match validate_iovec_array(iov_ptr, iovcnt) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if iovecs.is_empty() {
+        return 0;
+    }
+
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    if file.is_dir() {
+        return EISDIR;
+    }
+
+    // For offset == -1, use current file position
+    let use_position = offset == -1;
+    let mut current_offset = if use_position {
+        file.get_pos()
+    } else {
+        offset as u64
+    };
+
+    let mut total_read: usize = 0;
+
+    for iov in &iovecs {
+        if iov.iov_len == 0 {
+            continue;
+        }
+
+        let remaining_allowed = MAX_RW_COUNT.saturating_sub(total_read);
+        if remaining_allowed == 0 {
+            break;
+        }
+
+        let count = core::cmp::min(iov.iov_len as usize, remaining_allowed);
+
+        if count <= SMALL_BUF_SIZE {
+            let mut stack_buf = [0u8; SMALL_BUF_SIZE];
+            let read_buf = &mut stack_buf[..count];
+
+            let result = if use_position {
+                file.read_with_flags(read_buf, rw_flags)
+            } else {
+                file.pread_with_flags(read_buf, current_offset, rw_flags)
+            };
+
+            let bytes_read = match result {
+                Ok(n) => n,
+                Err(FsError::WouldBlock) => {
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EAGAIN
+                    };
+                }
+                Err(FsError::NotSupported) => {
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EOPNOTSUPP
+                    };
+                }
+                Err(FsError::PermissionDenied) => {
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EBADF
+                    };
+                }
+                Err(_) => {
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EINVAL
+                    };
+                }
+            };
+
+            if bytes_read > 0
+                && copy_to_user::<Uaccess>(iov.iov_base, &read_buf[..bytes_read]).is_err()
+            {
+                return if total_read > 0 {
+                    total_read as i64
+                } else {
+                    EFAULT
+                };
+            }
+
+            total_read += bytes_read;
+            current_offset += bytes_read as u64;
+
+            if bytes_read < count {
+                break;
+            }
+        } else {
+            let mut kernel_buf = vec![0u8; count];
+
+            let result = if use_position {
+                file.read_with_flags(&mut kernel_buf, rw_flags)
+            } else {
+                file.pread_with_flags(&mut kernel_buf, current_offset, rw_flags)
+            };
+
+            let bytes_read = match result {
+                Ok(n) => n,
+                Err(FsError::WouldBlock) => {
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EAGAIN
+                    };
+                }
+                Err(FsError::NotSupported) => {
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EOPNOTSUPP
+                    };
+                }
+                Err(FsError::PermissionDenied) => {
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EBADF
+                    };
+                }
+                Err(_) => {
+                    return if total_read > 0 {
+                        total_read as i64
+                    } else {
+                        EINVAL
+                    };
+                }
+            };
+
+            if bytes_read > 0
+                && copy_to_user::<Uaccess>(iov.iov_base, &kernel_buf[..bytes_read]).is_err()
+            {
+                return if total_read > 0 {
+                    total_read as i64
+                } else {
+                    EFAULT
+                };
+            }
+
+            total_read += bytes_read;
+            current_offset += bytes_read as u64;
+
+            if bytes_read < count {
+                break;
+            }
+        }
+    }
+
+    // Update file position if using current position
+    if use_position && total_read > 0 {
+        file.advance_pos(total_read as u64);
+    }
+
+    total_read as i64
+}
+
+/// sys_pwritev2 - positioned gather write with flags
+///
+/// Enhanced version of pwritev that supports per-I/O flags (RWF_*).
+///
+/// # Arguments
+/// * `fd` - File descriptor to write to
+/// * `iov_ptr` - User pointer to array of iovec structures
+/// * `iovcnt` - Number of iovec structures
+/// * `offset` - File offset to write to, or -1 to use current file position
+/// * `flags` - RWF_* flags for this I/O operation
+///
+/// # Returns
+/// Total bytes written on success, negative errno on error.
+/// Returns -EOPNOTSUPP for unsupported flags.
+pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) -> i64 {
+    // Validate flags - unknown flags return EOPNOTSUPP
+    if flags & !RWF_SUPPORTED != 0 {
+        return EOPNOTSUPP;
+    }
+
+    // Unsupported flags - return EOPNOTSUPP
+    if flags & (RWF_ATOMIC | RWF_DONTCACHE) != 0 {
+        return EOPNOTSUPP;
+    }
+
+    // If RWF_NOWAIT not set, delegate to existing syscalls
+    if flags & RWF_NOWAIT == 0 {
+        if offset == -1 {
+            let result = sys_writev(fd, iov_ptr, iovcnt);
+            if result > 0 && (flags & (RWF_SYNC | RWF_DSYNC)) != 0 {
+                let _ = sys_fsync(fd);
+            }
+            return result;
+        }
+
+        // RWF_APPEND: get file size as offset
+        let actual_offset = if flags & RWF_APPEND != 0 {
+            let file = match current_fd_table().lock().get(fd) {
+                Some(f) => f,
+                None => return EBADF,
+            };
+            file.get_inode().map(|i| i.get_size() as i64).unwrap_or(0)
+        } else {
+            offset
+        };
+
+        let result = sys_pwritev(fd, iov_ptr, iovcnt, actual_offset);
+        if result > 0 && (flags & (RWF_SYNC | RWF_DSYNC)) != 0 {
+            let _ = sys_fsync(fd);
+        }
+        return result;
+    }
+
+    // RWF_NOWAIT handling - use *_with_flags methods
+    let rw_flags = RwFlags::with_nowait();
+
+    // Validate and copy iovec array
+    let iovecs = match validate_iovec_array(iov_ptr, iovcnt) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if iovecs.is_empty() {
+        return 0;
+    }
+
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    if file.is_dir() {
+        return EISDIR;
+    }
+
+    // For offset == -1, use current file position
+    let use_position = offset == -1;
+
+    // RWF_APPEND: get file size as offset
+    let mut current_offset = if use_position {
+        file.get_pos()
+    } else if flags & RWF_APPEND != 0 {
+        file.get_inode().map(|i| i.get_size()).unwrap_or(0)
+    } else {
+        offset as u64
+    };
+
+    let mut total_written: usize = 0;
+
+    for iov in &iovecs {
+        if iov.iov_len == 0 {
+            continue;
+        }
+
+        let remaining_allowed = MAX_RW_COUNT.saturating_sub(total_written);
+        if remaining_allowed == 0 {
+            break;
+        }
+
+        let count = core::cmp::min(iov.iov_len as usize, remaining_allowed);
+
+        if count <= SMALL_BUF_SIZE {
+            let mut stack_buf = [0u8; SMALL_BUF_SIZE];
+            let write_buf = &mut stack_buf[..count];
+
+            // Copy from user space
+            unsafe {
+                Uaccess::user_access_begin();
+                core::ptr::copy_nonoverlapping(
+                    iov.iov_base as *const u8,
+                    write_buf.as_mut_ptr(),
+                    count,
+                );
+                Uaccess::user_access_end();
+            }
+
+            let result = if use_position {
+                file.write_with_flags(write_buf, rw_flags)
+            } else {
+                file.pwrite_with_flags(write_buf, current_offset, rw_flags)
+            };
+
+            let bytes_written = match result {
+                Ok(n) => n,
+                Err(FsError::WouldBlock) => {
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EAGAIN
+                    };
+                }
+                Err(FsError::NotSupported) => {
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EOPNOTSUPP
+                    };
+                }
+                Err(FsError::PermissionDenied) => {
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EBADF
+                    };
+                }
+                Err(FsError::BrokenPipe) => {
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EPIPE
+                    };
+                }
+                Err(_) => {
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EINVAL
+                    };
+                }
+            };
+
+            total_written += bytes_written;
+            current_offset += bytes_written as u64;
+
+            if bytes_written < count {
+                break;
+            }
+        } else {
+            let mut kernel_buf = vec![0u8; count];
+
+            // Copy from user space
+            unsafe {
+                Uaccess::user_access_begin();
+                core::ptr::copy_nonoverlapping(
+                    iov.iov_base as *const u8,
+                    kernel_buf.as_mut_ptr(),
+                    count,
+                );
+                Uaccess::user_access_end();
+            }
+
+            let result = if use_position {
+                file.write_with_flags(&kernel_buf, rw_flags)
+            } else {
+                file.pwrite_with_flags(&kernel_buf, current_offset, rw_flags)
+            };
+
+            let bytes_written = match result {
+                Ok(n) => n,
+                Err(FsError::WouldBlock) => {
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EAGAIN
+                    };
+                }
+                Err(FsError::NotSupported) => {
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EOPNOTSUPP
+                    };
+                }
+                Err(FsError::PermissionDenied) => {
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EBADF
+                    };
+                }
+                Err(FsError::BrokenPipe) => {
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EPIPE
+                    };
+                }
+                Err(_) => {
+                    return if total_written > 0 {
+                        total_written as i64
+                    } else {
+                        EINVAL
+                    };
+                }
+            };
+
+            total_written += bytes_written;
+            current_offset += bytes_written as u64;
+
+            if bytes_written < count {
+                break;
+            }
+        }
+    }
+
+    // Update file position if using current position
+    if use_position && total_written > 0 {
+        file.advance_pos(total_written as u64);
+    }
+
+    // RWF_SYNC/RWF_DSYNC: sync after successful write
+    if total_written > 0 && (flags & (RWF_SYNC | RWF_DSYNC)) != 0 {
+        let _ = sys_fsync(fd);
+    }
+
+    total_written as i64
+}
+
 /// sys_close - close a file descriptor
 ///
 /// Returns 0 on success, negative errno on error.
@@ -2139,9 +2692,6 @@ pub fn sys_fstatat(dirfd: i32, path_ptr: u64, statbuf: u64, flags: i32) -> i64 {
 // access, faccessat, faccessat2 syscalls
 // ============================================================================
 
-/// Permission denied error
-const EACCES: i64 = -13;
-
 // access() mode flags - what permissions to check
 /// Check if file exists
 const F_OK: i32 = 0;
@@ -2326,10 +2876,6 @@ pub fn sys_faccessat2(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
 
 /// Too many symbolic links encountered
 const ELOOP: i64 = -40;
-/// File exists
-const EEXIST: i64 = -17;
-/// Operation not permitted
-const EPERM: i64 = -1;
 /// Cross-device link
 const EXDEV: i64 = -18;
 
@@ -3026,6 +3572,95 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
     }
 }
 
+/// pivot_root - change the root filesystem
+///
+/// Moves the root filesystem of the calling process's mount namespace
+/// to the directory `put_old` and makes `new_root` the new root filesystem.
+///
+/// # Arguments
+/// * `new_root_ptr` - User pointer to path that will become the new root
+/// * `put_old_ptr` - User pointer to path where old root will be moved
+///
+/// # Returns
+/// 0 on success, negative errno on error
+///
+/// # Errors
+/// * EPERM - Caller lacks CAP_SYS_ADMIN
+/// * EINVAL - Various invalid configuration (not mountpoints, put_old not under new_root)
+/// * ENOTDIR - new_root or put_old is not a directory
+/// * ENOENT - Path not found
+pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
+    // 1. Permission check: requires CAP_SYS_ADMIN
+    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+        return EPERM;
+    }
+
+    // 2. Copy paths from user space
+    let new_root_str = match strncpy_from_user::<Uaccess>(new_root_ptr, PATH_MAX) {
+        Ok(s) => s,
+        Err(_) => return EFAULT,
+    };
+    let put_old_str = match strncpy_from_user::<Uaccess>(put_old_ptr, PATH_MAX) {
+        Ok(s) => s,
+        Err(_) => return EFAULT,
+    };
+
+    // 3. Look up new_root path (must be directory)
+    let new_root_dentry = match lookup_path_flags(&new_root_str, LookupFlags::opendir()) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    // 4. Verify new_root is a mount point
+    let mnt_ns = super::mount::current_mnt_ns();
+    let new_mnt = match mnt_ns.find_mount_at(&new_root_dentry) {
+        Some(m) => m,
+        None => return EINVAL, // Not a mount point
+    };
+
+    // 5. Look up put_old path (must be directory)
+    let put_old_dentry = match lookup_path_flags(&put_old_str, LookupFlags::opendir()) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    // 6. Verify put_old is at or under new_root
+    if !is_subdir(&put_old_dentry, &new_root_dentry) {
+        return EINVAL;
+    }
+
+    // 7. Get old root mount - must exist
+    let _old_root_mnt = match mnt_ns.get_root() {
+        Some(m) => m,
+        None => return EINVAL,
+    };
+
+    // 8. Verify new_root is not the same as current root
+    // (pivoting to the same root is a no-op but Linux returns EBUSY)
+    if let Some(root_dentry) = mnt_ns.get_root_dentry()
+        && Arc::ptr_eq(&root_dentry, &new_root_dentry)
+    {
+        return EBUSY;
+    }
+
+    // 9. Set new root as namespace root
+    mnt_ns.set_root(new_mnt.clone());
+
+    // 10. Update task's fs root
+    // The new root dentry becomes the task's root
+    if let Some(fs) = crate::task::percpu::current_fs()
+        && let Some(new_path) = Path::from_dentry(new_root_dentry)
+    {
+        fs.set_root(new_path);
+    }
+
+    0
+}
+
 /// Helper to look up parent directory for creating new entries
 ///
 /// Returns the parent dentry and the final component name.
@@ -3522,42 +4157,71 @@ fn sys_unlinkat_rmdir(dirfd: i32, path: &str) -> i64 {
 // Permission modification syscalls
 // =============================================================================
 
-/// sys_fchmodat - change file permissions relative to directory fd
+/// Internal helper for fchmodat/fchmodat2
 ///
-/// This is the core implementation used by chmod and fchmodat.
-pub fn sys_fchmodat(dirfd: i32, pathname: u64, mode: u32, _flags: i32) -> i64 {
+/// # Arguments
+/// * `dirfd` - Directory fd for relative paths, or AT_FDCWD
+/// * `pathname` - User pointer to path string
+/// * `mode` - New permission mode
+/// * `flags` - AT_SYMLINK_NOFOLLOW and/or AT_EMPTY_PATH
+fn do_fchmodat(dirfd: i32, pathname: u64, mode: u32, flags: i32) -> i64 {
+    // Validate flags - only AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH allowed
+    const FCHMODAT_VALID_FLAGS: i32 = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+    if (flags & !FCHMODAT_VALID_FLAGS) != 0 {
+        return EINVAL;
+    }
+
     // Copy path from user space
     let path_str = match strncpy_from_user::<Uaccess>(pathname, PATH_MAX) {
         Ok(p) => p,
         Err(_) => return EFAULT,
     };
 
-    // Determine starting path for relative paths
-    let start: Option<Path> = if path_str.starts_with('/') {
-        // Absolute path - lookup_path_at will use root
-        None
-    } else if dirfd == AT_FDCWD {
-        // Use current working directory
-        crate::task::percpu::current_cwd()
-    } else {
-        // Use directory from file descriptor
-        let file = match current_fd_table().lock().get(dirfd) {
-            Some(f) => f,
-            None => return EBADF,
-        };
-        if !file.is_dir() {
-            return ENOTDIR;
+    // Handle AT_EMPTY_PATH - operate on dirfd itself
+    let dentry = if path_str.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+        if dirfd < 0 {
+            return EBADF;
         }
-        Path::from_dentry(file.dentry.clone())
-    };
+        match current_fd_table().lock().get(dirfd) {
+            Some(f) => f.dentry.clone(),
+            None => return EBADF,
+        }
+    } else {
+        // Determine starting path for relative paths
+        let start: Option<Path> = if path_str.starts_with('/') {
+            // Absolute path - lookup_path_at will use root
+            None
+        } else if dirfd == AT_FDCWD {
+            // Use current working directory
+            crate::task::percpu::current_cwd()
+        } else {
+            // Use directory from file descriptor
+            let file = match current_fd_table().lock().get(dirfd) {
+                Some(f) => f,
+                None => return EBADF,
+            };
+            if !file.is_dir() {
+                return ENOTDIR;
+            }
+            Path::from_dentry(file.dentry.clone())
+        };
 
-    // Note: fchmodat follows symlinks by default (use AT_SYMLINK_NOFOLLOW to not follow)
-    // Using open() flags which follow symlinks
-    let dentry = match lookup_path_at(start, &path_str, LookupFlags::open()) {
-        Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        // Determine lookup flags based on AT_SYMLINK_NOFOLLOW
+        let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+            LookupFlags {
+                follow: false,
+                ..LookupFlags::open()
+            }
+        } else {
+            LookupFlags::open()
+        };
+
+        match lookup_path_at(start, &path_str, lookup_flags) {
+            Ok(d) => d,
+            Err(FsError::NotFound) => return ENOENT,
+            Err(FsError::NotADirectory) => return ENOTDIR,
+            Err(_) => return EINVAL,
+        }
     };
 
     // Get the inode
@@ -3570,6 +4234,31 @@ pub fn sys_fchmodat(dirfd: i32, pathname: u64, mode: u32, _flags: i32) -> i64 {
     inode.set_mode_perm((mode & 0o7777) as u16);
 
     0
+}
+
+/// sys_fchmodat - change file permissions relative to directory fd
+///
+/// This is the core implementation used by chmod and fchmodat.
+/// Note: fchmodat ignores flags parameter (always follows symlinks).
+pub fn sys_fchmodat(dirfd: i32, pathname: u64, mode: u32, _flags: i32) -> i64 {
+    // fchmodat ignores flags parameter (always follows symlinks)
+    do_fchmodat(dirfd, pathname, mode, 0)
+}
+
+/// sys_fchmodat2 - change file permissions with flags support
+///
+/// Extended version of fchmodat that properly handles flags.
+///
+/// # Arguments
+/// * `dirfd` - Directory fd for relative paths, or AT_FDCWD
+/// * `pathname` - User pointer to path string
+/// * `mode` - New permission mode
+/// * `flags` - AT_SYMLINK_NOFOLLOW and/or AT_EMPTY_PATH
+///
+/// # Returns
+/// 0 on success, negative errno on error.
+pub fn sys_fchmodat2(dirfd: i32, pathname: u64, mode: u32, flags: i32) -> i64 {
+    do_fchmodat(dirfd, pathname, mode, flags)
 }
 
 /// sys_chmod - change file permissions
@@ -4303,7 +4992,13 @@ pub fn sys_poll(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
 
     // Do the poll loop
     let mut ready_count;
-    let _timeout_remaining = timeout_ms; // For future timeout implementation
+
+    // Calculate timeout end time (in milliseconds)
+    let timeout_end = if timeout_ms < 0 {
+        u64::MAX // Infinite timeout
+    } else {
+        crate::time::current_ticks().saturating_add(timeout_ms as u64)
+    };
 
     loop {
         // Reset poll table for this iteration
@@ -4358,17 +5053,19 @@ pub fn sys_poll(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
             break;
         }
 
-        // TODO: Implement proper waiting with timeout
-        // For now, yield and retry a few times, then timeout
-        static mut POLL_ITERATIONS: u32 = 0;
-        unsafe {
-            POLL_ITERATIONS += 1;
-            if POLL_ITERATIONS > 100 || timeout_ms > 0 {
-                POLL_ITERATIONS = 0;
-                break;
-            }
-        }
+        // Wait for events with timeout
+        // Use a simple polling loop with yields until we have proper timed waits
+
+        // Yield to let other tasks run (e.g., child process can exit)
         crate::task::percpu::yield_now();
+
+        // Check if timeout has elapsed
+        let now = crate::time::current_ticks();
+        if now >= timeout_end {
+            break;
+        }
+
+        // Continue polling loop
     }
 
     // Copy results back to user space
@@ -5151,4 +5848,986 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
 
         _ => EINVAL,
     }
+}
+
+// =============================================================================
+// statx structures and constants
+// =============================================================================
+
+/// Timestamp for statx (16 bytes)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct StatxTimestamp {
+    /// Seconds since Unix epoch
+    pub tv_sec: i64,
+    /// Nanoseconds within the second
+    pub tv_nsec: u32,
+    /// Reserved for future use
+    pub __reserved: i32,
+}
+
+/// Extended file status structure (256 bytes)
+///
+/// This matches the Linux kernel's `struct statx` for x86-64.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Statx {
+    /// Bitmask of results returned
+    pub stx_mask: u32,
+    /// Preferred I/O block size
+    pub stx_blksize: u32,
+    /// File attributes (STATX_ATTR_*)
+    pub stx_attributes: u64,
+    /// Number of hard links
+    pub stx_nlink: u32,
+    /// User ID of owner
+    pub stx_uid: u32,
+    /// Group ID of owner
+    pub stx_gid: u32,
+    /// File type and mode
+    pub stx_mode: u16,
+    /// Padding
+    pub __spare0: [u16; 1],
+    /// Inode number
+    pub stx_ino: u64,
+    /// File size in bytes
+    pub stx_size: u64,
+    /// Number of 512-byte blocks allocated
+    pub stx_blocks: u64,
+    /// Supported attributes mask
+    pub stx_attributes_mask: u64,
+    /// Last access time
+    pub stx_atime: StatxTimestamp,
+    /// Birth/creation time
+    pub stx_btime: StatxTimestamp,
+    /// Last attribute change time
+    pub stx_ctime: StatxTimestamp,
+    /// Last data modification time
+    pub stx_mtime: StatxTimestamp,
+    /// Device major for special files
+    pub stx_rdev_major: u32,
+    /// Device minor for special files
+    pub stx_rdev_minor: u32,
+    /// Device major containing file
+    pub stx_dev_major: u32,
+    /// Device minor containing file
+    pub stx_dev_minor: u32,
+    /// Mount ID
+    pub stx_mnt_id: u64,
+    /// Direct I/O memory alignment
+    pub stx_dio_mem_align: u32,
+    /// Direct I/O offset alignment
+    pub stx_dio_offset_align: u32,
+    /// Subvolume ID
+    pub stx_subvol: u64,
+    /// Min atomic write unit in bytes
+    pub stx_atomic_write_unit_min: u32,
+    /// Max atomic write unit in bytes
+    pub stx_atomic_write_unit_max: u32,
+    /// Max atomic write segment count
+    pub stx_atomic_write_segments_max: u32,
+    /// Direct I/O read offset alignment
+    pub stx_dio_read_offset_align: u32,
+    /// Optimized max atomic write unit
+    pub stx_atomic_write_unit_max_opt: u32,
+    /// Padding
+    pub __spare2: [u32; 1],
+    /// Reserved for future use
+    pub __spare3: [u64; 8],
+}
+
+// STATX mask bits - what fields caller wants / kernel provided
+/// Want/got stx_mode & S_IFMT
+pub const STATX_TYPE: u32 = 0x0001;
+/// Want/got stx_mode & ~S_IFMT
+pub const STATX_MODE: u32 = 0x0002;
+/// Want/got stx_nlink
+pub const STATX_NLINK: u32 = 0x0004;
+/// Want/got stx_uid
+pub const STATX_UID: u32 = 0x0008;
+/// Want/got stx_gid
+pub const STATX_GID: u32 = 0x0010;
+/// Want/got stx_atime
+pub const STATX_ATIME: u32 = 0x0020;
+/// Want/got stx_mtime
+pub const STATX_MTIME: u32 = 0x0040;
+/// Want/got stx_ctime
+pub const STATX_CTIME: u32 = 0x0080;
+/// Want/got stx_ino
+pub const STATX_INO: u32 = 0x0100;
+/// Want/got stx_size
+pub const STATX_SIZE: u32 = 0x0200;
+/// Want/got stx_blocks
+pub const STATX_BLOCKS: u32 = 0x0400;
+/// Basic stats - everything in normal stat struct
+pub const STATX_BASIC_STATS: u32 = 0x07ff;
+/// Want/got stx_btime
+pub const STATX_BTIME: u32 = 0x0800;
+/// Got stx_mnt_id
+pub const STATX_MNT_ID: u32 = 0x1000;
+
+// AT_* flags used by statx (note: some already defined above)
+/// Sync as stat (default)
+pub const AT_STATX_SYNC_AS_STAT: i32 = 0x0000;
+/// Force sync
+pub const AT_STATX_FORCE_SYNC: i32 = 0x2000;
+/// Don't sync
+pub const AT_STATX_DONT_SYNC: i32 = 0x4000;
+
+// =============================================================================
+// statfs/fstatfs syscalls
+// =============================================================================
+
+/// sys_statfs - get filesystem statistics by path
+///
+/// # Arguments
+/// * `path_ptr` - User pointer to null-terminated path string
+/// * `buf` - User pointer to statfs structure to fill
+///
+/// # Returns
+/// 0 on success, negative errno on error.
+pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
+    // Read path from user space
+    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate buffer
+    if !Uaccess::access_ok(buf, core::mem::size_of::<LinuxStatFs>()) {
+        return EFAULT;
+    }
+
+    // Look up path to get dentry/superblock
+    let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    // Get superblock
+    let sb = match dentry.superblock() {
+        Some(sb) => sb,
+        None => return ENOENT,
+    };
+
+    // Get stats from filesystem
+    let statfs = sb.s_op.statfs();
+    let linux_statfs = statfs.to_linux(sb.dev_id, sb.flags);
+
+    // Copy to user
+    if put_user::<Uaccess, LinuxStatFs>(buf, linux_statfs).is_err() {
+        return EFAULT;
+    }
+
+    0
+}
+
+/// sys_fstatfs - get filesystem statistics by file descriptor
+///
+/// # Arguments
+/// * `fd` - File descriptor
+/// * `buf` - User pointer to statfs structure to fill
+///
+/// # Returns
+/// 0 on success, negative errno on error.
+pub fn sys_fstatfs(fd: i32, buf: u64) -> i64 {
+    // Validate buffer
+    if !Uaccess::access_ok(buf, core::mem::size_of::<LinuxStatFs>()) {
+        return EFAULT;
+    }
+
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Get superblock from file's dentry
+    let sb = match file.dentry.superblock() {
+        Some(sb) => sb,
+        None => return EBADF,
+    };
+
+    // Get stats
+    let statfs = sb.s_op.statfs();
+    let linux_statfs = statfs.to_linux(sb.dev_id, sb.flags);
+
+    // Copy to user
+    if put_user::<Uaccess, LinuxStatFs>(buf, linux_statfs).is_err() {
+        return EFAULT;
+    }
+
+    0
+}
+
+// =============================================================================
+// statx syscall
+// =============================================================================
+
+use super::Inode;
+
+/// Fill a Statx structure from an inode
+fn fill_statx(inode: &Inode, _mask: u32) -> Statx {
+    let attr = inode.i_op.getattr(inode);
+    let st_dev = inode.superblock().map(|sb| sb.dev_id).unwrap_or(0);
+
+    let st_rdev = if attr.mode.is_device() {
+        attr.rdev.encode() as u64
+    } else {
+        0
+    };
+
+    Statx {
+        stx_mask: STATX_BASIC_STATS, // Always provide basic stats
+        stx_blksize: 4096,
+        stx_attributes: 0,
+        stx_nlink: attr.nlink,
+        stx_uid: attr.uid,
+        stx_gid: attr.gid,
+        stx_mode: attr.mode.raw(),
+        __spare0: [0],
+        stx_ino: attr.ino,
+        stx_size: attr.size,
+        stx_blocks: attr.size.div_ceil(512),
+        stx_attributes_mask: 0,
+        stx_atime: StatxTimestamp {
+            tv_sec: attr.atime.sec,
+            tv_nsec: attr.atime.nsec,
+            __reserved: 0,
+        },
+        stx_btime: StatxTimestamp {
+            tv_sec: 0,
+            tv_nsec: 0,
+            __reserved: 0,
+        }, // Birth time not tracked
+        stx_ctime: StatxTimestamp {
+            tv_sec: attr.ctime.sec,
+            tv_nsec: attr.ctime.nsec,
+            __reserved: 0,
+        },
+        stx_mtime: StatxTimestamp {
+            tv_sec: attr.mtime.sec,
+            tv_nsec: attr.mtime.nsec,
+            __reserved: 0,
+        },
+        stx_rdev_major: ((st_rdev >> 8) & 0xfff) as u32,
+        stx_rdev_minor: (st_rdev & 0xff) as u32 | ((st_rdev >> 12) & 0xfff00) as u32,
+        stx_dev_major: ((st_dev >> 8) & 0xfff) as u32,
+        stx_dev_minor: (st_dev & 0xff) as u32,
+        stx_mnt_id: 0, // Not implemented yet
+        stx_dio_mem_align: 0,
+        stx_dio_offset_align: 0,
+        stx_subvol: 0,
+        stx_atomic_write_unit_min: 0,
+        stx_atomic_write_unit_max: 0,
+        stx_atomic_write_segments_max: 0,
+        stx_dio_read_offset_align: 0,
+        stx_atomic_write_unit_max_opt: 0,
+        __spare2: [0],
+        __spare3: [0; 8],
+    }
+}
+
+/// sys_statx - get extended file status
+///
+/// # Arguments
+/// * `dirfd` - Directory fd for relative paths, or AT_FDCWD
+/// * `path_ptr` - User pointer to path string
+/// * `flags` - AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH, etc.
+/// * `mask` - STATX_* mask of what to return
+/// * `buf` - User pointer to statx structure to fill
+///
+/// # Returns
+/// 0 on success, negative errno on error.
+pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> i64 {
+    // Validate buffer
+    if !Uaccess::access_ok(buf, core::mem::size_of::<Statx>()) {
+        return EFAULT;
+    }
+
+    // Read path from user space
+    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Handle AT_EMPTY_PATH (statx on fd itself)
+    let dentry = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+        if dirfd < 0 {
+            return EBADF;
+        }
+        match current_fd_table().lock().get(dirfd) {
+            Some(f) => f.dentry.clone(),
+            None => return EBADF,
+        }
+    } else {
+        // Determine starting path for relative paths
+        let start: Option<Path> = if path.starts_with('/') {
+            None
+        } else if dirfd == AT_FDCWD {
+            crate::task::percpu::current_cwd()
+        } else {
+            let file = match current_fd_table().lock().get(dirfd) {
+                Some(f) => f,
+                None => return EBADF,
+            };
+            if !file.is_dir() {
+                return ENOTDIR;
+            }
+            Path::from_dentry(file.dentry.clone())
+        };
+
+        // Determine lookup flags
+        let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+            LookupFlags {
+                follow: false,
+                ..LookupFlags::open()
+            }
+        } else {
+            LookupFlags::open()
+        };
+
+        match lookup_path_at(start, &path, lookup_flags) {
+            Ok(d) => d,
+            Err(FsError::NotFound) => return ENOENT,
+            Err(FsError::NotADirectory) => return ENOTDIR,
+            Err(_) => return EINVAL,
+        }
+    };
+
+    // Get inode
+    let inode = match dentry.get_inode() {
+        Some(i) => i,
+        None => return ENOENT,
+    };
+
+    // Fill statx structure
+    let statx = fill_statx(&inode, mask);
+
+    // Copy to user
+    if put_user::<Uaccess, Statx>(buf, statx).is_err() {
+        return EFAULT;
+    }
+
+    0
+}
+
+// =============================================================================
+// Extended attributes (xattr) syscalls
+// =============================================================================
+
+/// XATTR_CREATE - set value, fail if attr already exists
+pub const XATTR_CREATE: u32 = 0x1;
+/// XATTR_REPLACE - set value, fail if attr doesn't exist
+pub const XATTR_REPLACE: u32 = 0x2;
+/// Maximum attribute name length
+pub const XATTR_NAME_MAX: usize = 255;
+/// Maximum attribute value size (64KB)
+pub const XATTR_SIZE_MAX: usize = 65536;
+
+/// Helper to convert FsError to errno for xattr operations
+fn xattr_error_to_errno(e: FsError) -> i64 {
+    match e {
+        FsError::NotFound => ENOENT,
+        FsError::NoData => ENODATA,
+        FsError::AlreadyExists => EEXIST,
+        FsError::Range => ERANGE,
+        FsError::NotSupported => EOPNOTSUPP,
+        FsError::PermissionDenied => EPERM,
+        FsError::IoError => -5, // EIO
+        _ => EINVAL,
+    }
+}
+
+/// Copy xattr value from user space
+fn copy_xattr_value_from_user(value_ptr: u64, size: u64) -> Result<alloc::vec::Vec<u8>, i64> {
+    use crate::uaccess::copy_from_user;
+
+    if size > XATTR_SIZE_MAX as u64 {
+        return Err(ERANGE);
+    }
+
+    if size == 0 {
+        return Ok(alloc::vec::Vec::new());
+    }
+
+    // Validate user buffer
+    if !Uaccess::access_ok(value_ptr, size as usize) {
+        return Err(EFAULT);
+    }
+
+    // Allocate and copy value from user space
+    let mut value = vec![0u8; size as usize];
+    if copy_from_user::<Uaccess>(&mut value, value_ptr, size as usize).is_err() {
+        return Err(EFAULT);
+    }
+    Ok(value)
+}
+
+/// sys_setxattr - set an extended attribute value
+///
+/// # Arguments
+/// * `path_ptr` - User pointer to path string
+/// * `name_ptr` - User pointer to attribute name string
+/// * `value_ptr` - User pointer to attribute value
+/// * `size` - Size of the value
+/// * `flags` - XATTR_CREATE or XATTR_REPLACE
+///
+/// # Returns
+/// 0 on success, negative errno on error
+pub fn sys_setxattr(path_ptr: u64, name_ptr: u64, value_ptr: u64, size: u64, flags: i32) -> i64 {
+    do_setxattr(path_ptr, name_ptr, value_ptr, size, flags, true)
+}
+
+/// sys_lsetxattr - set an extended attribute value (don't follow symlinks)
+pub fn sys_lsetxattr(path_ptr: u64, name_ptr: u64, value_ptr: u64, size: u64, flags: i32) -> i64 {
+    do_setxattr(path_ptr, name_ptr, value_ptr, size, flags, false)
+}
+
+/// Internal helper for setxattr/lsetxattr
+fn do_setxattr(
+    path_ptr: u64,
+    name_ptr: u64,
+    value_ptr: u64,
+    size: u64,
+    flags: i32,
+    follow_symlinks: bool,
+) -> i64 {
+    // Validate flags
+    if flags as u32 & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
+        return EINVAL;
+    }
+
+    // Copy path from user
+    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Copy attribute name from user
+    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+        Ok(n) => n,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate name length
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE;
+    }
+
+    // Copy value from user
+    let value = match copy_xattr_value_from_user(value_ptr, size) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // Lookup path
+    let lookup_flags = if follow_symlinks {
+        LookupFlags::open()
+    } else {
+        LookupFlags {
+            follow: false,
+            ..LookupFlags::open()
+        }
+    };
+
+    let dentry = match lookup_path_flags(&path, lookup_flags) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    let inode = match dentry.get_inode() {
+        Some(i) => i,
+        None => return ENOENT,
+    };
+
+    // Call inode operation
+    match inode.i_op.setxattr(&inode, &name, &value, flags as u32) {
+        Ok(()) => 0,
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_fsetxattr - set an extended attribute value on a file descriptor
+pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i32) -> i64 {
+    // Validate flags
+    if flags as u32 & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
+        return EINVAL;
+    }
+
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Copy attribute name from user
+    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+        Ok(n) => n,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate name length
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE;
+    }
+
+    // Copy value from user
+    let value = match copy_xattr_value_from_user(value_ptr, size) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let inode = match file.get_inode() {
+        Some(i) => i,
+        None => return EBADF,
+    };
+
+    // Call inode operation
+    match inode.i_op.setxattr(&inode, &name, &value, flags as u32) {
+        Ok(()) => 0,
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_getxattr - get an extended attribute value
+///
+/// # Arguments
+/// * `path_ptr` - User pointer to path string
+/// * `name_ptr` - User pointer to attribute name string
+/// * `value_ptr` - User pointer to buffer for attribute value
+/// * `size` - Size of the buffer (0 to query size needed)
+///
+/// # Returns
+/// Size of attribute value on success, negative errno on error
+pub fn sys_getxattr(path_ptr: u64, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
+    do_getxattr(path_ptr, name_ptr, value_ptr, size, true)
+}
+
+/// sys_lgetxattr - get an extended attribute value (don't follow symlinks)
+pub fn sys_lgetxattr(path_ptr: u64, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
+    do_getxattr(path_ptr, name_ptr, value_ptr, size, false)
+}
+
+/// Internal helper for getxattr/lgetxattr
+fn do_getxattr(
+    path_ptr: u64,
+    name_ptr: u64,
+    value_ptr: u64,
+    size: u64,
+    follow_symlinks: bool,
+) -> i64 {
+    // Copy path from user
+    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Copy attribute name from user
+    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+        Ok(n) => n,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate name length
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE;
+    }
+
+    // Lookup path
+    let lookup_flags = if follow_symlinks {
+        LookupFlags::open()
+    } else {
+        LookupFlags {
+            follow: false,
+            ..LookupFlags::open()
+        }
+    };
+
+    let dentry = match lookup_path_flags(&path, lookup_flags) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    let inode = match dentry.get_inode() {
+        Some(i) => i,
+        None => return ENOENT,
+    };
+
+    // If size is 0, query the size needed
+    if size == 0 {
+        let mut empty_buf: [u8; 0] = [];
+        match inode.i_op.getxattr(&inode, &name, &mut empty_buf) {
+            Ok(attr_size) => return attr_size as i64,
+            Err(e) => return xattr_error_to_errno(e),
+        }
+    }
+
+    // Validate size
+    if size > XATTR_SIZE_MAX as u64 {
+        return ERANGE;
+    }
+
+    // Validate user buffer
+    if !Uaccess::access_ok(value_ptr, size as usize) {
+        return EFAULT;
+    }
+
+    // Allocate kernel buffer
+    let mut value = vec![0u8; size as usize];
+
+    // Get the attribute
+    match inode.i_op.getxattr(&inode, &name, &mut value) {
+        Ok(attr_size) => {
+            // Copy to user
+            unsafe {
+                core::ptr::copy_nonoverlapping(value.as_ptr(), value_ptr as *mut u8, attr_size);
+            }
+            attr_size as i64
+        }
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_fgetxattr - get an extended attribute value from a file descriptor
+pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Copy attribute name from user
+    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+        Ok(n) => n,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate name length
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE;
+    }
+
+    let inode = match file.get_inode() {
+        Some(i) => i,
+        None => return EBADF,
+    };
+
+    // If size is 0, query the size needed
+    if size == 0 {
+        let mut empty_buf: [u8; 0] = [];
+        match inode.i_op.getxattr(&inode, &name, &mut empty_buf) {
+            Ok(attr_size) => return attr_size as i64,
+            Err(e) => return xattr_error_to_errno(e),
+        }
+    }
+
+    // Validate size
+    if size > XATTR_SIZE_MAX as u64 {
+        return ERANGE;
+    }
+
+    // Validate user buffer
+    if !Uaccess::access_ok(value_ptr, size as usize) {
+        return EFAULT;
+    }
+
+    // Allocate kernel buffer
+    let mut value = vec![0u8; size as usize];
+
+    // Get the attribute
+    match inode.i_op.getxattr(&inode, &name, &mut value) {
+        Ok(attr_size) => {
+            // Copy to user
+            unsafe {
+                core::ptr::copy_nonoverlapping(value.as_ptr(), value_ptr as *mut u8, attr_size);
+            }
+            attr_size as i64
+        }
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_listxattr - list extended attribute names
+///
+/// # Arguments
+/// * `path_ptr` - User pointer to path string
+/// * `list_ptr` - User pointer to buffer for null-separated attribute names
+/// * `size` - Size of the buffer (0 to query size needed)
+///
+/// # Returns
+/// Total size of attribute names on success, negative errno on error
+pub fn sys_listxattr(path_ptr: u64, list_ptr: u64, size: u64) -> i64 {
+    do_listxattr(path_ptr, list_ptr, size, true)
+}
+
+/// sys_llistxattr - list extended attribute names (don't follow symlinks)
+pub fn sys_llistxattr(path_ptr: u64, list_ptr: u64, size: u64) -> i64 {
+    do_listxattr(path_ptr, list_ptr, size, false)
+}
+
+/// Internal helper for listxattr/llistxattr
+fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) -> i64 {
+    // Copy path from user
+    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Lookup path
+    let lookup_flags = if follow_symlinks {
+        LookupFlags::open()
+    } else {
+        LookupFlags {
+            follow: false,
+            ..LookupFlags::open()
+        }
+    };
+
+    let dentry = match lookup_path_flags(&path, lookup_flags) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    let inode = match dentry.get_inode() {
+        Some(i) => i,
+        None => return ENOENT,
+    };
+
+    // If size is 0, query the size needed
+    if size == 0 {
+        let mut empty_buf: [u8; 0] = [];
+        match inode.i_op.listxattr(&inode, &mut empty_buf) {
+            Ok(list_size) => return list_size as i64,
+            Err(e) => return xattr_error_to_errno(e),
+        }
+    }
+
+    // Validate user buffer
+    if !Uaccess::access_ok(list_ptr, size as usize) {
+        return EFAULT;
+    }
+
+    // Allocate kernel buffer
+    let mut list = vec![0u8; size as usize];
+
+    // Get the list
+    match inode.i_op.listxattr(&inode, &mut list) {
+        Ok(list_size) => {
+            // Copy to user
+            unsafe {
+                core::ptr::copy_nonoverlapping(list.as_ptr(), list_ptr as *mut u8, list_size);
+            }
+            list_size as i64
+        }
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_flistxattr - list extended attribute names from a file descriptor
+pub fn sys_flistxattr(fd: i32, list_ptr: u64, size: u64) -> i64 {
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    let inode = match file.get_inode() {
+        Some(i) => i,
+        None => return EBADF,
+    };
+
+    // If size is 0, query the size needed
+    if size == 0 {
+        let mut empty_buf: [u8; 0] = [];
+        match inode.i_op.listxattr(&inode, &mut empty_buf) {
+            Ok(list_size) => return list_size as i64,
+            Err(e) => return xattr_error_to_errno(e),
+        }
+    }
+
+    // Validate user buffer
+    if !Uaccess::access_ok(list_ptr, size as usize) {
+        return EFAULT;
+    }
+
+    // Allocate kernel buffer
+    let mut list = vec![0u8; size as usize];
+
+    // Get the list
+    match inode.i_op.listxattr(&inode, &mut list) {
+        Ok(list_size) => {
+            // Copy to user
+            unsafe {
+                core::ptr::copy_nonoverlapping(list.as_ptr(), list_ptr as *mut u8, list_size);
+            }
+            list_size as i64
+        }
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_removexattr - remove an extended attribute
+///
+/// # Arguments
+/// * `path_ptr` - User pointer to path string
+/// * `name_ptr` - User pointer to attribute name string
+///
+/// # Returns
+/// 0 on success, negative errno on error
+pub fn sys_removexattr(path_ptr: u64, name_ptr: u64) -> i64 {
+    do_removexattr(path_ptr, name_ptr, true)
+}
+
+/// sys_lremovexattr - remove an extended attribute (don't follow symlinks)
+pub fn sys_lremovexattr(path_ptr: u64, name_ptr: u64) -> i64 {
+    do_removexattr(path_ptr, name_ptr, false)
+}
+
+/// Internal helper for removexattr/lremovexattr
+fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
+    // Copy path from user
+    let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
+        Ok(p) => p,
+        Err(_) => return EFAULT,
+    };
+
+    // Copy attribute name from user
+    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+        Ok(n) => n,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate name length
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE;
+    }
+
+    // Lookup path
+    let lookup_flags = if follow_symlinks {
+        LookupFlags::open()
+    } else {
+        LookupFlags {
+            follow: false,
+            ..LookupFlags::open()
+        }
+    };
+
+    let dentry = match lookup_path_flags(&path, lookup_flags) {
+        Ok(d) => d,
+        Err(FsError::NotFound) => return ENOENT,
+        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(_) => return EINVAL,
+    };
+
+    let inode = match dentry.get_inode() {
+        Some(i) => i,
+        None => return ENOENT,
+    };
+
+    // Call inode operation
+    match inode.i_op.removexattr(&inode, &name) {
+        Ok(()) => 0,
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+/// sys_fremovexattr - remove an extended attribute from a file descriptor
+pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Copy attribute name from user
+    let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
+        Ok(n) => n,
+        Err(_) => return EFAULT,
+    };
+
+    // Validate name length
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return ERANGE;
+    }
+
+    let inode = match file.get_inode() {
+        Some(i) => i,
+        None => return EBADF,
+    };
+
+    // Call inode operation
+    match inode.i_op.removexattr(&inode, &name) {
+        Ok(()) => 0,
+        Err(e) => xattr_error_to_errno(e),
+    }
+}
+
+// =============================================================================
+// readahead syscall
+// =============================================================================
+
+/// sys_readahead - initiate file readahead into the page cache
+///
+/// This syscall initiates readahead on a file, populating the page cache
+/// with pages from the file in preparation for future reads. This can
+/// improve read performance by starting I/O before the data is needed.
+///
+/// # Arguments
+/// * `fd` - File descriptor to read ahead
+/// * `offset` - Starting offset in the file
+/// * `count` - Number of bytes to read ahead
+///
+/// # Returns
+/// 0 on success, negative errno on error:
+/// * -EBADF: Invalid file descriptor or not open for reading
+/// * -EINVAL: File type doesn't support readahead (e.g., pipes, sockets)
+///
+/// # Notes
+/// This is a hint to the kernel - it may read more or less than requested,
+/// and can be a no-op if the kernel doesn't have page cache support.
+pub fn sys_readahead(fd: i32, offset: i64, count: usize) -> i64 {
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f,
+        None => return EBADF,
+    };
+
+    // Verify file is opened for reading
+    if !file.is_readable() {
+        return EBADF;
+    }
+
+    // Check file type - only regular files and block devices support readahead
+    if let Some(inode) = file.get_inode() {
+        let mode = inode.mode();
+        if !mode.is_file() && !mode.is_blkdev() {
+            return EINVAL;
+        }
+    } else {
+        // No inode means special file (pipe, socket, etc.)
+        return EINVAL;
+    }
+
+    // Validate offset
+    if offset < 0 {
+        return EINVAL;
+    }
+
+    // Currently a no-op since we don't have a full page cache.
+    // In a full implementation, we would:
+    // 1. Calculate page-aligned start and end
+    // 2. Call the file's address_space->readahead() method
+    // 3. Or use vfs_fadvise(POSIX_FADV_WILLNEED)
+    let _ = count; // Suppress unused warning
+
+    0 // Success (hint accepted, even if no action taken)
 }

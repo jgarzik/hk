@@ -67,6 +67,25 @@ pub mod seek {
     pub const SEEK_END: i32 = 2;
 }
 
+/// Flags for read/write operations (preadv2/pwritev2 RWF_* flags)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RwFlags {
+    /// RWF_NOWAIT - return EAGAIN if operation would block
+    pub nowait: bool,
+}
+
+impl RwFlags {
+    /// Create empty flags (no special behavior)
+    pub const fn empty() -> Self {
+        Self { nowait: false }
+    }
+
+    /// Create flags with NOWAIT set
+    pub const fn with_nowait() -> Self {
+        Self { nowait: true }
+    }
+}
+
 /// Directory entry for getdents
 #[derive(Debug, Clone)]
 pub struct DirEntry {
@@ -177,6 +196,67 @@ pub trait FileOps: Send + Sync {
     fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
         // Default for regular files - always ready
         DEFAULT_POLLMASK
+    }
+
+    /// Read with RWF flags (for preadv2/pwritev2)
+    ///
+    /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
+    /// Default implementation rejects NOWAIT (returns NotSupported).
+    fn read_with_flags(
+        &self,
+        file: &File,
+        buf: &mut [u8],
+        flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        if flags.nowait {
+            return Err(FsError::NotSupported);
+        }
+        self.read(file, buf)
+    }
+
+    /// Positioned read with RWF flags
+    ///
+    /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
+    /// Default implementation rejects NOWAIT (returns NotSupported).
+    fn pread_with_flags(
+        &self,
+        file: &File,
+        buf: &mut [u8],
+        offset: u64,
+        flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        if flags.nowait {
+            return Err(FsError::NotSupported);
+        }
+        self.pread(file, buf, offset)
+    }
+
+    /// Write with RWF flags (for preadv2/pwritev2)
+    ///
+    /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
+    /// Default implementation rejects NOWAIT (returns NotSupported).
+    fn write_with_flags(&self, file: &File, buf: &[u8], flags: RwFlags) -> Result<usize, FsError> {
+        if flags.nowait {
+            return Err(FsError::NotSupported);
+        }
+        self.write(file, buf)
+    }
+
+    /// Positioned write with RWF flags
+    ///
+    /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
+    /// Default implementation rejects NOWAIT (returns NotSupported).
+    fn pwrite_with_flags(
+        &self,
+        file: &File,
+        buf: &[u8],
+        offset: u64,
+        flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        if flags.nowait {
+            return Err(FsError::NotSupported);
+        }
+        self.pwrite(file, buf, offset)
     }
 }
 
@@ -312,6 +392,48 @@ impl File {
             return Err(FsError::PermissionDenied);
         }
         self.f_op.pwrite(self, buf, offset)
+    }
+
+    /// Read with RWF flags (for preadv2/pwritev2 with RWF_NOWAIT support)
+    pub fn read_with_flags(&self, buf: &mut [u8], flags: RwFlags) -> Result<usize, FsError> {
+        if !self.is_readable() {
+            return Err(FsError::PermissionDenied);
+        }
+        self.f_op.read_with_flags(self, buf, flags)
+    }
+
+    /// Write with RWF flags
+    pub fn write_with_flags(&self, buf: &[u8], flags: RwFlags) -> Result<usize, FsError> {
+        if !self.is_writable() {
+            return Err(FsError::PermissionDenied);
+        }
+        self.f_op.write_with_flags(self, buf, flags)
+    }
+
+    /// Positioned read with RWF flags
+    pub fn pread_with_flags(
+        &self,
+        buf: &mut [u8],
+        offset: u64,
+        flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        if !self.is_readable() {
+            return Err(FsError::PermissionDenied);
+        }
+        self.f_op.pread_with_flags(self, buf, offset, flags)
+    }
+
+    /// Positioned write with RWF flags
+    pub fn pwrite_with_flags(
+        &self,
+        buf: &[u8],
+        offset: u64,
+        flags: RwFlags,
+    ) -> Result<usize, FsError> {
+        if !self.is_writable() {
+            return Err(FsError::PermissionDenied);
+        }
+        self.f_op.pwrite_with_flags(self, buf, offset, flags)
     }
 
     /// Seek

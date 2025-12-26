@@ -17,7 +17,7 @@
 //!
 //! The seqlock ensures readers get consistent snapshots without blocking.
 
-use ::core::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 /// Filesystem timestamp (seconds + nanoseconds since Unix epoch)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -63,6 +63,54 @@ pub enum ClockId {
 fn null_read_tsc() -> u64 {
     0
 }
+
+// ============================================================================
+// NTP state for adjtimex syscall
+// ============================================================================
+
+/// NTP-related status flags (from Linux)
+pub const STA_PLL: i32 = 0x0001;
+pub const STA_PPSFREQ: i32 = 0x0002;
+pub const STA_PPSTIME: i32 = 0x0004;
+pub const STA_FLL: i32 = 0x0008;
+pub const STA_INS: i32 = 0x0010;
+pub const STA_DEL: i32 = 0x0020;
+pub const STA_UNSYNC: i32 = 0x0040;
+pub const STA_FREQHOLD: i32 = 0x0080;
+pub const STA_NANO: i32 = 0x2000;
+
+/// Extended timekeeper state for NTP/adjtimex support
+pub struct NtpState {
+    /// Maximum error (microseconds)
+    pub maxerror: AtomicI64,
+    /// Estimated error (microseconds)
+    pub esterror: AtomicI64,
+    /// Clock status flags (STA_*)
+    pub status: AtomicI32,
+    /// TAI offset (seconds)
+    pub tai_offset: AtomicI32,
+    /// PLL time constant
+    pub constant: AtomicI64,
+    /// Tick value (usec per tick, nominally 10000 for 100Hz)
+    pub tick: AtomicI64,
+}
+
+impl NtpState {
+    /// Create a new NtpState with default values
+    pub const fn new() -> Self {
+        Self {
+            maxerror: AtomicI64::new(500_000),  // 0.5 sec default
+            esterror: AtomicI64::new(500_000),  // 0.5 sec default
+            status: AtomicI32::new(STA_UNSYNC), // Initially unsynchronized
+            tai_offset: AtomicI32::new(0),
+            constant: AtomicI64::new(2),
+            tick: AtomicI64::new(10000), // 10ms in usec (100Hz)
+        }
+    }
+}
+
+/// Global NTP state
+pub static NTP_STATE: NtpState = NtpState::new();
 
 /// Global timekeeper with seqlock protection
 ///
@@ -264,6 +312,54 @@ impl TimeKeeper {
     /// architecture-specific modules (like the filesystem layer).
     pub fn current_time(&self) -> Timespec {
         self.read(ClockId::Realtime, self.get_read_cycles())
+    }
+
+    /// Set the realtime clock to a new value
+    ///
+    /// This updates the realtime offset so that CLOCK_REALTIME returns the
+    /// specified time. CLOCK_MONOTONIC is unaffected.
+    ///
+    /// # Arguments
+    /// * `new_time` - The new wall-clock time to set
+    ///
+    /// # Returns
+    /// `true` if successful, `false` if timekeeper is not initialized
+    pub fn set_realtime(&self, new_time: Timespec) -> bool {
+        if !self.is_initialized() {
+            return false;
+        }
+
+        let read_tsc = self.get_read_cycles();
+
+        // Begin write (make seq odd)
+        self.seq.fetch_add(1, Ordering::Relaxed);
+        ::core::sync::atomic::fence(Ordering::Release);
+
+        // Read current monotonic time
+        let now_cycles = read_tsc();
+        let cycle_base = self.cycle_base.load(Ordering::Relaxed);
+        let mono_base = self.mono_base_ns.load(Ordering::Relaxed);
+        let mult = self.mult.load(Ordering::Relaxed);
+        let shift = self.shift.load(Ordering::Relaxed);
+
+        let delta_cycles = now_cycles.wrapping_sub(cycle_base);
+        let delta_ns = ((delta_cycles as u128 * mult as u128) >> shift) as u64;
+        let mono_ns = mono_base.wrapping_add(delta_ns);
+
+        // Calculate new offset: realtime = monotonic + offset
+        // So offset = realtime - monotonic
+        let new_time_ns = new_time.to_nanos();
+        let new_offset = new_time_ns - mono_ns as i128;
+
+        // Store new offset
+        self.realtime_offset_ns
+            .store(new_offset as i64, Ordering::Relaxed);
+
+        // End write (make seq even)
+        ::core::sync::atomic::fence(Ordering::Release);
+        self.seq.fetch_add(1, Ordering::Relaxed);
+
+        true
     }
 }
 

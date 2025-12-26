@@ -29,7 +29,7 @@ pub mod vfs;
 pub use blkdev_ops::BLOCK_FILE_OPS;
 pub use cpio::unpack_cpio;
 pub use dentry::{DCACHE, Dentry, DentryCache, is_subdir};
-pub use file::{CHAR_FILE_OPS, DirEntry, File, FileOps, flags, seek};
+pub use file::{CHAR_FILE_OPS, DirEntry, File, FileOps, RwFlags, flags, seek};
 pub use fsstruct::{FsStruct, clone_task_fs, exit_task_fs, get_task_fs, init_task_fs};
 pub use inode::{DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, Uid};
 pub use mount::{
@@ -50,7 +50,8 @@ pub use ramfs::{
     ramfs_create_dir_with_timestamp, ramfs_create_file_with_timestamp, ramfs_mkpath_with_timestamp,
 };
 pub use superblock::{
-    FileSystemType, SuperBlock, SuperOps, find_filesystem, init_fs_registry, register_filesystem,
+    FileSystemType, LinuxStatFs, MSDOS_SUPER_MAGIC, PROC_SUPER_MAGIC, RAMFS_MAGIC, StatFs,
+    SuperBlock, SuperOps, find_filesystem, init_fs_registry, register_filesystem,
 };
 pub use vfat::{VFAT_FILE_OPS, VFAT_TYPE};
 pub use vfs::{FileMetadata, FileSystem, FsError, Vfs};

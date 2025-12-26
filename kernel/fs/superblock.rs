@@ -57,6 +57,83 @@ pub struct StatFs {
     pub f_namelen: u64,
 }
 
+// ============================================================================
+// Filesystem Magic Numbers (from Linux include/uapi/linux/magic.h)
+// ============================================================================
+
+/// Ramfs filesystem magic number
+pub const RAMFS_MAGIC: u64 = 0x858458f6;
+/// Tmpfs filesystem magic number
+pub const TMPFS_MAGIC: u64 = 0x01021994;
+/// Procfs filesystem magic number
+pub const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+/// FAT/VFAT filesystem magic number
+pub const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
+
+// ============================================================================
+// Linux ABI statfs Structure
+// ============================================================================
+
+/// Linux statfs structure (64-bit ABI)
+///
+/// This matches the Linux kernel's `struct statfs` for 64-bit architectures.
+/// Total size: 120 bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LinuxStatFs {
+    /// Filesystem type magic number
+    pub f_type: i64,
+    /// Optimal transfer block size
+    pub f_bsize: i64,
+    /// Total data blocks in filesystem
+    pub f_blocks: i64,
+    /// Free blocks in filesystem
+    pub f_bfree: i64,
+    /// Free blocks available to unprivileged user
+    pub f_bavail: i64,
+    /// Total file nodes (inodes) in filesystem
+    pub f_files: i64,
+    /// Free file nodes in filesystem
+    pub f_ffree: i64,
+    /// Filesystem ID
+    pub f_fsid: [i32; 2],
+    /// Maximum length of filenames
+    pub f_namelen: i64,
+    /// Fragment size (same as f_bsize for most filesystems)
+    pub f_frsize: i64,
+    /// Mount flags (ST_RDONLY, ST_NOSUID, etc.)
+    pub f_flags: i64,
+    /// Padding for future use
+    pub f_spare: [i64; 4],
+}
+
+impl StatFs {
+    /// Convert internal StatFs to Linux ABI format
+    pub fn to_linux(&self, dev_id: u64, mount_flags: u32) -> LinuxStatFs {
+        LinuxStatFs {
+            f_type: self.f_type as i64,
+            f_bsize: self.f_bsize as i64,
+            f_blocks: self.f_blocks as i64,
+            f_bfree: self.f_bfree as i64,
+            f_bavail: self.f_bavail as i64,
+            f_files: self.f_files as i64,
+            f_ffree: self.f_ffree as i64,
+            f_fsid: [(dev_id & 0xFFFFFFFF) as i32, (dev_id >> 32) as i32],
+            f_namelen: self.f_namelen as i64,
+            f_frsize: self.f_bsize as i64, // Same as bsize for simplicity
+            f_flags: Self::mount_flags_to_st_flags(mount_flags) as i64,
+            f_spare: [0; 4],
+        }
+    }
+
+    /// Convert internal mount flags to ST_* flags for userspace
+    fn mount_flags_to_st_flags(_mnt_flags: u32) -> u64 {
+        // ST_RDONLY = 1, ST_NOSUID = 2, ST_NODEV = 4, etc.
+        // For now return 0; can expand when mount flags are implemented
+        0
+    }
+}
+
 use super::file::FileOps;
 
 use crate::storage::BlockDevice;

@@ -13,6 +13,7 @@ use crate::net::ethernet::{self, ETH_ALEN, ETH_HLEN, EtherType};
 use crate::net::route;
 use crate::net::skb::SkBuff;
 use crate::net::tcp;
+use crate::net::udp;
 
 /// IP protocol numbers
 pub const IPPROTO_ICMP: u8 = 1;
@@ -328,12 +329,8 @@ pub fn ip_rcv(mut skb: SkBuff) {
 
     match hdr.protocol {
         IPPROTO_TCP => tcp::tcp_rcv(skb),
-        IPPROTO_UDP => {
-            // UDP not implemented yet
-        }
-        IPPROTO_ICMP => {
-            // ICMP not implemented yet
-        }
+        IPPROTO_UDP => udp::udp_rcv(skb),
+        IPPROTO_ICMP => crate::net::icmp::icmp_rcv(skb),
         _ => {
             // Unknown protocol, drop
         }
@@ -351,7 +348,58 @@ pub fn ip_rcv(mut skb: SkBuff) {
 pub fn ip_queue_xmit(mut skb: Box<SkBuff>, protocol: u8) -> Result<(), NetError> {
     let daddr = skb.daddr.ok_or(NetError::InvalidArgument)?;
     let config = crate::net::get_config().ok_or(NetError::InvalidArgument)?;
-    let saddr = skb.saddr.unwrap_or(config.ipv4_addr);
+
+    // For loopback destinations, use loopback as source address
+    let saddr = if daddr.is_loopback() {
+        skb.saddr.unwrap_or(daddr) // Use loopback address
+    } else {
+        skb.saddr.unwrap_or(config.ipv4_addr)
+    };
+
+    // Loopback shortcut: deliver locally without going through network device
+    let is_local = daddr.is_loopback() || daddr == config.ipv4_addr || daddr == saddr;
+    if is_local {
+        // Build IP header for loopback
+        let payload_len = skb.len();
+        let tot_len = (IP_HLEN_MIN + payload_len) as u16;
+
+        let ip_hdr = skb.push(IP_HLEN_MIN).ok_or(NetError::NoBufferSpace)?;
+        ip_hdr[0] = 0x45; // Version (4) + IHL (5)
+        ip_hdr[1] = 0; // TOS
+        ip_hdr[2..4].copy_from_slice(&tot_len.to_be_bytes());
+        ip_hdr[4..6].copy_from_slice(&next_ip_id().to_be_bytes());
+        ip_hdr[6] = 0x40; // Don't Fragment
+        ip_hdr[7] = 0;
+        ip_hdr[8] = IP_DEFAULT_TTL;
+        ip_hdr[9] = protocol;
+        ip_hdr[10] = 0; // Checksum (computed below)
+        ip_hdr[11] = 0;
+        ip_hdr[12..16].copy_from_slice(&saddr.to_be_bytes());
+        ip_hdr[16..20].copy_from_slice(&daddr.to_be_bytes());
+
+        let checksum = ip_checksum(&ip_hdr[..IP_HLEN_MIN]);
+        ip_hdr[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+        // Unbox and prepare for receive path
+        let mut loopback_skb = *skb;
+        loopback_skb.saddr = Some(saddr);
+        loopback_skb.daddr = Some(daddr);
+        loopback_skb.ip_protocol = protocol;
+
+        // Set transport header offset and skip IP header
+        loopback_skb.set_transport_header(IP_HLEN_MIN);
+        if loopback_skb.pull(IP_HLEN_MIN).is_none() {
+            return Err(NetError::InvalidArgument);
+        }
+
+        // Dispatch to transport layer
+        match protocol {
+            IPPROTO_TCP => tcp::tcp_rcv(loopback_skb),
+            IPPROTO_UDP => udp::udp_rcv(loopback_skb),
+            _ => {}
+        }
+        return Ok(());
+    }
 
     // Route lookup
     let (dev, next_hop) = route::route_lookup(daddr)?;
@@ -392,15 +440,9 @@ pub fn ip_queue_xmit(mut skb: Box<SkBuff>, protocol: u8) -> Result<(), NetError>
     // Set device on skb
     skb.dev = Some(Arc::clone(&dev));
 
-    // Resolve next-hop MAC address
-    let _dest_mac = arp::arp_resolve(&dev, next_hop, skb)?;
-
-    // If we get here, we have the MAC and can transmit
-    // (ARP may have queued the packet for later if resolution pending)
-
-    // This should not happen - arp_resolve either returns MAC or queues skb
-    // But we handle it for completeness
-    Err(NetError::WouldBlock)
+    // Resolve next-hop MAC address and transmit
+    // arp_resolve either transmits immediately (MAC cached) or queues for later (ARP pending)
+    arp::arp_resolve(&dev, next_hop, skb)
 }
 
 /// Build IP header and transmit (called by ARP when resolution completes)

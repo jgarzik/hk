@@ -12,10 +12,27 @@ use spin::Mutex;
 
 use crate::task::Tid;
 
+pub mod anon_vma;
+pub mod lru;
+pub mod page;
 pub mod page_cache;
+pub mod rmap;
+pub mod swap;
+pub mod swap_entry;
+pub mod swap_state;
 pub mod syscall;
 pub mod vma;
 pub mod writeback;
+
+pub use swap::{
+    SWAP_FLAG_DISCARD, SWAP_FLAG_PREFER, alloc_swap_entry, free_swap_entry, get_swap_info,
+    memory_pressure, should_swap_out, swap_available, swap_read_page, swap_write_page, sys_swapoff,
+    sys_swapon,
+};
+pub use swap_entry::SwapEntry;
+pub use swap_state::{
+    is_swap_file_id, swap_cache_add, swap_cache_del, swap_cache_lookup, swap_file_id,
+};
 
 pub use vma::*;
 
@@ -485,6 +502,9 @@ pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mutex<MmStruct>>> {
 ///
 /// If `share_vm` is true (CLONE_VM), both tasks share the same MmStruct.
 /// Otherwise, the child gets a copy of the parent's VMAs.
+///
+/// For fork (share_vm=false), the child's VMAs share the parent's anon_vma
+/// structures to enable proper reverse mapping for COW pages.
 pub fn clone_task_mm(parent_tid: Tid, child_tid: Tid, share_vm: bool) {
     let parent_mm = match get_task_mm(parent_tid) {
         Some(mm) => mm,
@@ -497,8 +517,18 @@ pub fn clone_task_mm(parent_tid: Tid, child_tid: Tid, share_vm: bool) {
     } else {
         // Fork: create independent copy of VMAs
         let parent_guard = parent_mm.lock();
+        let mut child_vmas = parent_guard.clone_vmas();
+
+        // Register child's VMAs with their anon_vma structures
+        // This enables reverse mapping to find both parent and child's PTEs
+        for vma in &mut child_vmas {
+            if let Some(ref anon_vma) = vma.anon_vma {
+                anon_vma.add_vma(child_tid, vma.start, vma.end);
+            }
+        }
+
         let new_mm = MmStruct {
-            vmas: parent_guard.clone_vmas(),
+            vmas: child_vmas,
             mmap_base: parent_guard.mmap_base,
             mmap_end: parent_guard.mmap_end,
             start_brk: parent_guard.start_brk,

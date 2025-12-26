@@ -474,6 +474,61 @@ impl Default for SigHand {
 // Per-Task Signal State
 // =============================================================================
 
+// =============================================================================
+// Signal Alternate Stack (sigaltstack)
+// =============================================================================
+
+/// Signal stack flags
+pub mod ss_flags {
+    /// Currently executing on signal stack
+    pub const SS_ONSTACK: i32 = 1;
+    /// Disable signal stack
+    pub const SS_DISABLE: i32 = 2;
+    /// Auto-disarm after signal handler
+    pub const SS_AUTODISARM: i32 = 1 << 31;
+    /// Valid flags mask (includes internal SS_FLAG_BITS)
+    pub const SS_FLAG_BITS: i32 = SS_AUTODISARM;
+}
+
+/// Minimum signal stack size (MINSIGSTKSZ on Linux)
+pub const MINSIGSTKSZ: usize = 2048;
+
+/// Default signal stack size (SIGSTKSZ on Linux)
+pub const SIGSTKSZ: usize = 8192;
+
+/// Alternate signal stack state
+#[derive(Clone, Debug)]
+pub struct AltStack {
+    /// Stack pointer (base address)
+    pub ss_sp: u64,
+    /// Stack size
+    pub ss_size: usize,
+    /// Flags (SS_DISABLE, SS_AUTODISARM, etc.)
+    pub ss_flags: i32,
+}
+
+impl AltStack {
+    /// Create new disabled alternate stack
+    pub const fn new() -> Self {
+        Self {
+            ss_sp: 0,
+            ss_size: 0,
+            ss_flags: ss_flags::SS_DISABLE,
+        }
+    }
+
+    /// Check if alternate stack is enabled
+    pub fn is_enabled(&self) -> bool {
+        self.ss_flags & ss_flags::SS_DISABLE == 0
+    }
+}
+
+impl Default for AltStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-task signal state (NOT shared via CLONE_SIGHAND)
 ///
 /// Each task has its own blocked mask and private pending signals.
@@ -488,6 +543,8 @@ pub struct TaskSignalState {
     pub shared_pending: Arc<Mutex<SigPending>>,
     /// Flag indicating signals need processing
     pub sigpending: bool,
+    /// Alternate signal stack
+    pub altstack: AltStack,
 }
 
 impl TaskSignalState {
@@ -498,6 +555,7 @@ impl TaskSignalState {
             pending: SigPending::new(),
             shared_pending: Arc::new(Mutex::new(SigPending::new())),
             sigpending: false,
+            altstack: AltStack::new(),
         }
     }
 
@@ -627,6 +685,7 @@ pub fn clone_task_signal(
                 Arc::new(Mutex::new(SigPending::new()))
             },
             sigpending: false,
+            altstack: AltStack::new(), // Child starts with no altstack
         }
     } else {
         TaskSignalState::new()
@@ -720,6 +779,9 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
 
     // Set TIF_SIGPENDING flag
     set_tif_sigpending(tid);
+
+    // Wake any signalfds monitoring this signal
+    crate::signalfd::wake_signalfds_for_signal(tid, sig);
 
     0
 }

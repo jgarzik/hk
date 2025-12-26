@@ -47,7 +47,9 @@ pub mod arp;
 pub mod device;
 pub mod driver;
 pub mod ethernet;
+pub mod icmp;
 pub mod ipv4;
+pub mod request_sock;
 pub mod route;
 pub mod skb;
 pub mod socket;
@@ -56,6 +58,7 @@ pub mod syscall;
 pub mod tcp;
 pub mod tcp_input;
 pub mod tcp_output;
+pub mod udp;
 
 // Re-export commonly used types
 pub use device::{NetDevice, NetDeviceOps, NetDeviceStats};

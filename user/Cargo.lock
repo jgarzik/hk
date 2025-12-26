@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
-name = "hk-user-boot-tester"
+name = "hk-boot-tester"
+version = "0.1.0"
+dependencies = [
+ "hk-syscall",
+]
+
+[[package]]
+name = "hk-syscall"
 version = "0.1.0"

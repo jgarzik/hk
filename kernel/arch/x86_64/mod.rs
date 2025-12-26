@@ -167,22 +167,30 @@ impl SchedArch for X86_64Arch {
         parent_rflags: u64,
         child_rsp: u64,
     ) -> Self::TrapFrame {
+        // Get parent's callee-saved registers from per-CPU storage
+        // These were saved during syscall entry
+        let (rbx, rbp, r12, r13, r14, r15) = percpu::get_syscall_user_callee_saved();
+
+        // Get parent's caller-saved/argument registers
+        // Linux ABI preserves these across syscalls, so child must inherit them
+        let (rdi, rsi, rdx, r8, r9, r10) = percpu::get_syscall_user_caller_saved();
+
         X86_64TrapFrame {
-            // General purpose registers - mostly zeros, child starts fresh
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            r11: parent_rflags, // Restore user RFLAGS
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rbp: 0,
-            rdi: 0,
-            rsi: 0,
-            rdx: 0,
-            rcx: parent_rip, // User return address
-            rbx: 0,
+            // Callee-saved registers - inherit from parent
+            r15,
+            r14,
+            r13,
+            r12,
+            r11: parent_rflags, // Restore user RFLAGS (SYSRET convention)
+            r10,                // Inherit from parent (Linux ABI preserves)
+            r9,                 // Inherit from parent (Linux ABI preserves)
+            r8,                 // Inherit from parent (Linux ABI preserves)
+            rbp,
+            rdi,             // Inherit from parent (Linux ABI preserves)
+            rsi,             // Inherit from parent (Linux ABI preserves)
+            rdx,             // Inherit from parent (Linux ABI preserves)
+            rcx: parent_rip, // User return address (SYSRET convention)
+            rbx,
             rax: 0, // Child returns 0 from fork/clone
 
             // IRET frame

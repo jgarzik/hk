@@ -29,6 +29,7 @@ use crate::net::ipv4::Ipv4Addr;
 use crate::net::route::Route;
 use crate::net::socket::Socket;
 use crate::net::tcp::TcpFourTuple;
+use crate::net::udp::UdpTwoTuple;
 
 // ARP types from arp.rs that we need
 use crate::net::arp::ArpEntry;
@@ -54,6 +55,13 @@ pub struct NetNamespace {
     /// TCP connection table (four-tuple -> socket)
     pub tcp_connections: RwLock<BTreeMap<TcpFourTuple, Arc<Socket>>>,
 
+    /// TCP listening sockets (local_port -> socket)
+    /// Following Linux's inet_hashtables listening hash
+    pub tcp_listeners: RwLock<BTreeMap<u16, Arc<Socket>>>,
+
+    /// UDP socket table (two-tuple -> socket)
+    pub udp_sockets: RwLock<BTreeMap<UdpTwoTuple, Arc<Socket>>>,
+
     /// ARP cache entries indexed by IP address
     pub arp_entries: Mutex<BTreeMap<u32, ArpEntry>>,
 
@@ -75,6 +83,8 @@ impl NetNamespace {
             config: RwLock::new(None),
             routes: RwLock::new(Vec::new()),
             tcp_connections: RwLock::new(BTreeMap::new()),
+            tcp_listeners: RwLock::new(BTreeMap::new()),
+            udp_sockets: RwLock::new(BTreeMap::new()),
             arp_entries: Mutex::new(BTreeMap::new()),
             arp_pending: Mutex::new(BTreeMap::new()),
             next_port: AtomicU32::new(32768),
@@ -126,6 +136,26 @@ impl NetNamespace {
         self.tcp_connections.read().get(tuple).cloned()
     }
 
+    /// Register a listening socket in this namespace
+    ///
+    /// Following Linux's inet_csk_listen_start() which adds to listening hash.
+    pub fn tcp_listen_register(&self, port: u16, socket: Arc<Socket>) {
+        self.tcp_listeners.write().insert(port, socket);
+    }
+
+    /// Unregister a listening socket from this namespace
+    pub fn tcp_listen_unregister(&self, port: u16) {
+        self.tcp_listeners.write().remove(&port);
+    }
+
+    /// Look up a listening socket by port
+    ///
+    /// Following Linux's __inet_lookup_listener().
+    /// For now we just match by port; Linux also considers local address.
+    pub fn tcp_lookup_listener(&self, local_port: u16) -> Option<Arc<Socket>> {
+        self.tcp_listeners.read().get(&local_port).cloned()
+    }
+
     /// Allocate an ephemeral port in this namespace
     pub fn alloc_port(&self) -> u16 {
         let port = self.next_port.fetch_add(1, Ordering::Relaxed);
@@ -133,6 +163,37 @@ impl NetNamespace {
             self.next_port.store(32768, Ordering::Relaxed);
         }
         port as u16
+    }
+
+    // ========================================================================
+    // UDP socket management
+    // ========================================================================
+
+    /// Register a UDP socket in this namespace
+    pub fn udp_register(&self, tuple: UdpTwoTuple, socket: Arc<Socket>) {
+        self.udp_sockets.write().insert(tuple, socket);
+    }
+
+    /// Unregister a UDP socket from this namespace
+    pub fn udp_unregister(&self, tuple: &UdpTwoTuple) {
+        self.udp_sockets.write().remove(tuple);
+    }
+
+    /// Look up a UDP socket by port in this namespace
+    ///
+    /// For UDP, we only need to match by local port (and optionally local address).
+    /// This is simpler than TCP's four-tuple matching.
+    pub fn udp_lookup_by_port(&self, local_port: u16) -> Option<Arc<Socket>> {
+        let sockets = self.udp_sockets.read();
+
+        // First try to find exact match with any local address
+        for (tuple, socket) in sockets.iter() {
+            if tuple.local_port == local_port {
+                return Some(Arc::clone(socket));
+            }
+        }
+
+        None
     }
 
     // ========================================================================
@@ -274,6 +335,8 @@ impl Default for NetNamespace {
             config: RwLock::new(None),
             routes: RwLock::new(Vec::new()),
             tcp_connections: RwLock::new(BTreeMap::new()),
+            tcp_listeners: RwLock::new(BTreeMap::new()),
+            udp_sockets: RwLock::new(BTreeMap::new()),
             arp_entries: Mutex::new(BTreeMap::new()),
             arp_pending: Mutex::new(BTreeMap::new()),
             next_port: AtomicU32::new(32768),

@@ -3,14 +3,9 @@
 //! This module contains exception handlers for synchronous exceptions and IRQs.
 
 use crate::printkln;
-use crate::task::syscall::sys_exit;
 use core::arch::asm;
 
 use super::Aarch64TrapFrame;
-
-// Linux signal numbers - exit status for signal death is 128 + signal
-const EXIT_SIGILL: i32 = 128 + 4; // SIGILL = 4
-const EXIT_SIGSEGV: i32 = 128 + 11; // SIGSEGV = 11
 
 // Exception classes (ESR_EL1[31:26])
 const EC_UNKNOWN: u64 = 0x00;
@@ -176,21 +171,52 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             // DFSC 0x04-0x07 are translation faults at different levels
             let is_translation_fault = (0x04..=0x07).contains(&dfsc);
 
+            // Permission fault = page present but access denied (COW candidate)
+            // DFSC 0x0C-0x0F are permission faults at different levels
+            let is_permission_fault = (0x0C..=0x0F).contains(&dfsc);
+
             if is_translation_fault {
+                // Try to handle as swap fault first (swapped-out page with swap entry in PTE)
+                if let Some(true) = handle_swap_fault(far) {
+                    return; // Swap-in successful, resume execution
+                }
+
                 // Try to handle as mmap demand fault
                 if let Some(true) = handle_mmap_fault(far, is_write) {
                     return; // Fault handled, resume execution
                 }
             }
 
-            // Unhandled fault - terminate process
+            // COW handling: permission fault on write to a COW-marked page
+            if is_permission_fault && is_write {
+                if let Some(true) = handle_cow_fault(far) {
+                    return; // COW resolved, resume execution
+                }
+                // If handle_cow_fault returns None, it's not a COW page
+                // If it returns Some(false), COW resolution failed (OOM)
+                // In both cases, fall through to SIGSEGV
+            }
+
+            // Unhandled fault - send signal to process
             printkln!(
                 "User data abort at ELR={:#x}, FAR={:#x}, ISS={:#x}",
                 frame.elr,
                 far,
                 iss
             );
-            sys_exit(EXIT_SIGSEGV);
+
+            // Send SIGSEGV or SIGBUS depending on fault type
+            // Access flag fault (DFSC 0x08-0x0B) suggests hardware error -> SIGBUS
+            let is_bus_error = (0x08..=0x0B).contains(&dfsc);
+            let sig = if is_bus_error {
+                crate::signal::SIGBUS
+            } else {
+                crate::signal::SIGSEGV
+            };
+
+            let tid = crate::task::percpu::current_tid();
+            crate::signal::send_signal(tid, sig);
+            // Return to user - signal will be delivered on next syscall exit
         }
         EC_IABORT_LOWER => {
             let far: u64;
@@ -203,20 +229,26 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
                 far,
                 iss
             );
-            // Terminate the process (sys_exit never returns)
-            sys_exit(EXIT_SIGSEGV);
+
+            // Send SIGSEGV for instruction abort
+            let tid = crate::task::percpu::current_tid();
+            crate::signal::send_signal(tid, crate::signal::SIGSEGV);
+            // Return to user - signal will be delivered on next syscall exit
         }
         _ => {
-            // Unknown/unhandled exception from userland - terminate the process
-            // rather than panicking the kernel. This could be an illegal instruction,
-            // alignment fault, or other unrecognized exception class.
+            // Unknown/unhandled exception from userland - send signal instead of terminating.
+            // This could be an illegal instruction, alignment fault, or other exception.
             printkln!(
-                "Unhandled EL0 sync exception: EC={:#x}, ISS={:#x}, ELR={:#x} - terminating process",
+                "Unhandled EL0 sync exception: EC={:#x}, ISS={:#x}, ELR={:#x}",
                 ec,
                 iss,
                 frame.elr
             );
-            sys_exit(EXIT_SIGILL);
+
+            // Send SIGILL for unknown exceptions (likely illegal instruction)
+            let tid = crate::task::percpu::current_tid();
+            crate::signal::send_signal(tid, crate::signal::SIGILL);
+            // Return to user - signal will be delivered on next syscall exit
         }
     }
 }
@@ -272,9 +304,11 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
     // Clone VMA info we need (release lock before allocating)
     let vma_prot = vma.prot;
     let vma_is_anonymous = vma.is_anonymous();
+    let vma_is_anon_private = vma.is_anon_private();
     let vma_file = vma.file.clone();
     let vma_start = vma.start;
     let vma_offset = vma.offset;
+    let vma_anon_vma = vma.anon_vma.clone();
     drop(mm_guard);
 
     // Allocate a physical frame
@@ -341,6 +375,17 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
         return Some(false);
     }
     // TLB is flushed by map_user_page
+
+    // Register anonymous page with LRU and page descriptors for swap support
+    if vma_is_anon_private {
+        use crate::mm::lru::lru_add_new;
+        use crate::mm::rmap::page_add_anon_rmap;
+
+        if let Some(ref anon_vma) = vma_anon_vma {
+            page_add_anon_rmap(frame, anon_vma, page_addr);
+        }
+        lru_add_new(frame);
+    }
 
     Some(true)
 }
@@ -471,4 +516,314 @@ pub fn unmap_user_page(ttbr0: u64, vaddr: u64) -> Option<u64> {
 
         Some(phys)
     }
+}
+
+/// Walk page tables and return pointer to L3 PTE, even for non-present entries
+///
+/// Returns (pte_pointer, pte_value) or None if page table walk fails at higher levels
+unsafe fn get_pte_for_swap(ttbr0: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
+    let l0_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let l1_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let l2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let l3_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+    // Table descriptor: bits [1:0] = 0b11
+    const TABLE_DESC: u64 = 0b11;
+
+    unsafe {
+        let l0 = ttbr0 as *const u64;
+
+        // L0 must be present
+        let l0_entry = *l0.add(l0_idx);
+        if (l0_entry & 0b11) != TABLE_DESC {
+            return None;
+        }
+
+        // L1 must be present
+        let l1 = (l0_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l1_entry = *l1.add(l1_idx);
+        if (l1_entry & 0b11) != TABLE_DESC {
+            return None;
+        }
+
+        // L2 must be present
+        let l2 = (l1_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l2_entry = *l2.add(l2_idx);
+        if (l2_entry & 0b11) != TABLE_DESC {
+            return None;
+        }
+
+        // L3 - return PTE regardless of present bit (for swap detection)
+        let l3 = (l2_entry & 0x0000_FFFF_FFFF_F000) as *mut u64;
+        let pte_ptr = l3.add(l3_idx);
+        let pte_value = *pte_ptr;
+
+        Some((pte_ptr, pte_value))
+    }
+}
+
+/// Handle a page fault for a swapped-out page
+///
+/// Detects swap entries in PTEs and performs swap-in:
+/// 1. Check if PTE contains a swap entry (non-present with swap marker)
+/// 2. Allocate a new physical frame
+/// 3. Read page data from swap device
+/// 4. Update PTE to point to the new frame
+/// 5. Free the swap slot
+///
+/// Returns:
+/// - Some(true) if the swap fault was handled successfully
+/// - Some(false) if swap-in failed (e.g., OOM, I/O error)
+/// - None if the PTE is not a swap entry
+fn handle_swap_fault(fault_addr: u64) -> Option<bool> {
+    use crate::arch::aarch64::paging::{AF, AP_EL0_RW, ATTR_IDX_NORMAL, SH_INNER};
+    use crate::mm::{SwapEntry, free_swap_entry, swap_cache_lookup, swap_read_page};
+
+    // Get current page table (TTBR0_EL1 for user space)
+    let ttbr0: u64;
+    unsafe {
+        asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nostack, nomem));
+    }
+    let pt_root = ttbr0 & !0xFFF;
+
+    // Get the PTE (including non-present entries)
+    let (pte_ptr, pte_value) = unsafe { get_pte_for_swap(pt_root, fault_addr)? };
+
+    // Check if this is a swap entry
+    if !SwapEntry::is_swap_pte(pte_value) {
+        return None; // Not a swap entry, let other handlers deal with it
+    }
+
+    let entry = SwapEntry::from_pte(pte_value);
+
+    // Step 1: Check swap cache first
+    if let Some(cached) = swap_cache_lookup(entry) {
+        let frame = cached.frame;
+
+        // L3 page descriptor attributes: [1:0] = 0b11
+        let attrs: u64 = 0b11 | AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL0_RW;
+        let new_pte = frame | attrs;
+
+        unsafe {
+            core::ptr::write_volatile(pte_ptr, new_pte);
+        }
+
+        // Flush TLB
+        crate::arch::aarch64::paging::flush_tlb(fault_addr);
+
+        return Some(true);
+    }
+
+    // Step 2: Allocate new frame
+    let frame = match crate::FRAME_ALLOCATOR.alloc() {
+        Some(f) => f,
+        None => {
+            printkln!("swap_fault: Out of memory!");
+            return Some(false);
+        }
+    };
+
+    // Step 3: Read from swap
+    if swap_read_page(entry, frame).is_err() {
+        // I/O error - free frame and fail
+        crate::FRAME_ALLOCATOR.free(frame);
+        printkln!("swap_fault: Swap I/O error!");
+        return Some(false);
+    }
+
+    // Step 4: Update PTE - clear swap entry, set present
+    // L3 page descriptor attributes: [1:0] = 0b11
+    let attrs: u64 = 0b11 | AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL0_RW;
+    let new_pte = frame | attrs;
+
+    unsafe {
+        core::ptr::write_volatile(pte_ptr, new_pte);
+    }
+
+    // Step 5: Flush TLB for this address
+    crate::arch::aarch64::paging::flush_tlb(fault_addr);
+
+    // Step 6: Free swap slot (page is now in RAM)
+    free_swap_entry(entry);
+
+    Some(true) // Swap-in successful
+}
+
+/// Walk page tables and return pointer to L3 PTE for COW handling
+///
+/// Returns (pte_pointer, pte_value) or None if page table walk fails.
+/// This is similar to get_pte_for_swap but expects a valid present page.
+unsafe fn get_pte_for_cow(ttbr0: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
+    let l0_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let l1_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let l2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let l3_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+    // Table descriptor: bits [1:0] = 0b11
+    const TABLE_DESC: u64 = 0b11;
+
+    unsafe {
+        let l0 = ttbr0 as *const u64;
+
+        // L0 must be present
+        let l0_entry = *l0.add(l0_idx);
+        if (l0_entry & 0b11) != TABLE_DESC {
+            return None;
+        }
+
+        // L1 must be present
+        let l1 = (l0_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l1_entry = *l1.add(l1_idx);
+        if (l1_entry & 0b11) != TABLE_DESC {
+            return None;
+        }
+
+        // L2 must be present
+        let l2 = (l1_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l2_entry = *l2.add(l2_idx);
+        if (l2_entry & 0b11) != TABLE_DESC {
+            return None;
+        }
+
+        // L3 - return PTE pointer and value
+        let l3 = (l2_entry & 0x0000_FFFF_FFFF_F000) as *mut u64;
+        let pte_ptr = l3.add(l3_idx);
+        let pte_value = *pte_ptr;
+
+        Some((pte_ptr, pte_value))
+    }
+}
+
+/// Handle a COW (Copy-on-Write) page fault
+///
+/// Called when a write permission fault occurs on a page marked with PAGE_COW.
+/// This performs the copy-on-write resolution:
+/// 1. Check if the page has the COW flag set
+/// 2. If refcount > 1: allocate new frame, copy contents, update PTE
+/// 3. If refcount == 1: just clear COW flag and make writable
+/// 4. Use atomic CAS for race-safe PTE update
+///
+/// Returns:
+/// - Some(true) if COW was resolved successfully
+/// - Some(false) if COW resolution failed (e.g., OOM)
+/// - None if not a COW page (should be handled as SIGSEGV)
+fn handle_cow_fault(fault_addr: u64) -> Option<bool> {
+    use crate::arch::aarch64::paging::{
+        AF, AP_EL0_RO, AP_EL0_RW, ATTR_IDX_NORMAL, PAGE_COW, PAGE_SIZE, SH_INNER,
+    };
+    use crate::mm::anon_vma::AnonVma;
+    use crate::mm::get_task_mm;
+    use crate::mm::lru::lru_add_new;
+    use crate::mm::rmap::{page_add_anon_rmap, page_remove_rmap};
+    use crate::task::percpu::current_tid;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    // Physical address mask (bits [47:12])
+    const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+    // Get current page table (TTBR0_EL1 for user space)
+    let ttbr0: u64;
+    unsafe {
+        asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nostack, nomem));
+    }
+    let pt_root = ttbr0 & !0xFFF;
+
+    // Page-align the fault address
+    let page_addr = fault_addr & !0xFFF;
+
+    // Get PTE for the faulting address
+    let (pte_ptr, pte_value) = unsafe { get_pte_for_cow(pt_root, page_addr)? };
+
+    // Check if this is a COW page
+    if (pte_value & PAGE_COW) == 0 {
+        return None; // Not a COW page - let SIGSEGV handler deal with it
+    }
+
+    // Save original PTE for atomic CAS
+    let orig_pte = pte_value;
+
+    // Get the physical address of the shared page
+    let old_phys = pte_value & ADDR_MASK;
+
+    // Get anon_vma from VMA for rmap updates (if available)
+    let tid = current_tid();
+    let anon_vma: Option<Arc<AnonVma>> = get_task_mm(tid).and_then(|mm| {
+        let mm_guard = mm.lock();
+        mm_guard
+            .find_vma(fault_addr)
+            .and_then(|vma| vma.anon_vma.clone())
+    });
+
+    // Check reference count to determine if we need to copy
+    let refcount = crate::FRAME_ALLOCATOR.refcount(old_phys);
+
+    if refcount > 1 {
+        // Shared page - need to allocate new frame and copy
+        let new_phys = match crate::FRAME_ALLOCATOR.alloc() {
+            Some(f) => f,
+            None => {
+                printkln!("cow_fault: Out of memory!");
+                return Some(false);
+            }
+        };
+
+        // Copy page contents
+        unsafe {
+            let src = old_phys as *const u8;
+            let dst = new_phys as *mut u8;
+            core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE as usize);
+        }
+
+        // Clean cache for new page
+        crate::arch::aarch64::cache::cache_clean_range(new_phys as *mut u8, PAGE_SIZE as usize);
+
+        // Build new PTE: new physical address, writable, no COW, preserve other attrs
+        // Keep AF, SH, ATTR_IDX, PXN/UXN but change permissions
+        let preserved_attrs = pte_value & (AF | SH_INNER | ATTR_IDX_NORMAL | (0b11 << 53));
+        let new_pte = new_phys | preserved_attrs | AP_EL0_RW | 0b11; // 0b11 = valid page
+
+        // Use atomic CAS to update PTE (prevent race with another CPU)
+        let pte_atomic = unsafe { &*(pte_ptr as *const AtomicU64) };
+        match pte_atomic.compare_exchange(orig_pte, new_pte, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                // CAS succeeded - we updated the PTE
+                // Update rmap: register new page, remove old page
+                if let Some(ref av) = anon_vma {
+                    page_add_anon_rmap(new_phys, av, page_addr);
+                }
+                lru_add_new(new_phys);
+                page_remove_rmap(old_phys);
+
+                // Decrement reference count on old frame
+                crate::FRAME_ALLOCATOR.decref(old_phys);
+            }
+            Err(_) => {
+                // CAS failed - another CPU already resolved this fault
+                // Free the frame we allocated
+                crate::FRAME_ALLOCATOR.free(new_phys);
+                // Still return success - the fault is resolved
+                return Some(true);
+            }
+        }
+    } else {
+        // Exclusive page (refcount == 1) - just make writable
+        // Clear COW flag and set writable permission
+        let new_pte = (pte_value & !PAGE_COW & !AP_EL0_RO) | AP_EL0_RW;
+
+        // Use atomic CAS for consistency
+        let pte_atomic = unsafe { &*(pte_ptr as *const AtomicU64) };
+        if pte_atomic
+            .compare_exchange(orig_pte, new_pte, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Race - fault already resolved
+            return Some(true);
+        }
+    }
+
+    // Flush TLB for this address
+    crate::arch::aarch64::paging::flush_tlb(page_addr);
+
+    Some(true)
 }

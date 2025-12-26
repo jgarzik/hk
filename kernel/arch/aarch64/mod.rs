@@ -433,8 +433,18 @@ impl UserModeOps for Aarch64Arch {
                 "msr ttbr0_el1, {page_table}",
                 // Invalidate TLB entries for this ASID
                 "tlbi vmalle1is",
-                // Data synchronization barrier to ensure TLB flush completes
-                "dsb ish",
+                // Invalidate instruction cache - critical for newly loaded ELF code
+                // ARM64 I-cache is not coherent with D-cache, so after kernel writes
+                // to frames (which go to D-cache), the I-cache may have stale data.
+                // This matches Linux's behavior in arch/arm64/mm/context.c
+                "ic iallu",
+                // Full system data synchronization barrier to ensure:
+                // 1. TLB flush completes
+                // 2. I-cache invalidation completes
+                // 3. All prior memory writes (cache cleans) are visible
+                // Using DSB SY (full system) rather than DSB ISH (inner shareable)
+                // to ensure maximum visibility of ELF data to user mode.
+                "dsb sy",
                 // Instruction synchronization barrier
                 "isb",
 

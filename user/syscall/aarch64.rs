@@ -19,7 +19,7 @@
 //!   - No `chmod`, `chown`, `lchown` - use *at variants
 //!   - No `truncate` - use ftruncate with openat
 
-use super::{FdSet, IoVec, PollFd, RLimit, SigInfo, Stat, Timespec, Timeval, UtsName, AT_FDCWD};
+use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Stat, Timespec, Timeval, Timex, UtsName, AT_FDCWD};
 
 // ============================================================================
 // Syscall macros for aarch64
@@ -169,6 +169,8 @@ pub const SYS_PREAD64: u64 = 67;
 pub const SYS_PWRITE64: u64 = 68;
 pub const SYS_PREADV: u64 = 69;
 pub const SYS_PWRITEV: u64 = 70;
+pub const SYS_PREADV2: u64 = 286;
+pub const SYS_PWRITEV2: u64 = 287;
 pub const SYS_READLINKAT: u64 = 78;
 pub const SYS_FSTATAT: u64 = 79;
 pub const SYS_FCHMOD: u64 = 52;
@@ -176,8 +178,46 @@ pub const SYS_FCHOWN: u64 = 55;
 pub const SYS_EXIT: u64 = 93;
 pub const SYS_EXIT_GROUP: u64 = 94;
 pub const SYS_NANOSLEEP: u64 = 101;
+pub const SYS_CLOCK_SETTIME: u64 = 112;
+pub const SYS_CLOCK_GETTIME: u64 = 113;
 pub const SYS_CLOCK_GETRES: u64 = 114;
 pub const SYS_CLOCK_NANOSLEEP: u64 = 115;
+pub const SYS_TIMERFD_CREATE: u64 = 85;
+pub const SYS_TIMERFD_SETTIME: u64 = 86;
+pub const SYS_TIMERFD_GETTIME: u64 = 87;
+pub const SYS_ADJTIMEX: u64 = 171;
+pub const SYS_CAPGET: u64 = 90;
+pub const SYS_CAPSET: u64 = 91;
+
+// eventfd syscalls (Section 7.1)
+// NOTE: aarch64 only has eventfd2, not the legacy eventfd
+pub const SYS_EVENTFD2: u64 = 19;
+
+// signalfd syscalls (Section 5)
+// NOTE: aarch64 only has signalfd4, not the legacy signalfd
+pub const SYS_SIGNALFD4: u64 = 74;
+
+// epoll syscalls (Section 9.1) - NOTE: aarch64 only has epoll_create1, not legacy epoll_create
+pub const SYS_EPOLL_CREATE1: u64 = 20;
+pub const SYS_EPOLL_CTL: u64 = 21;
+pub const SYS_EPOLL_PWAIT: u64 = 22;
+pub const SYS_EPOLL_PWAIT2: u64 = 441;
+
+// POSIX timer syscalls (Section 6.2)
+pub const SYS_TIMER_CREATE: u64 = 107;
+pub const SYS_TIMER_GETTIME: u64 = 108;
+pub const SYS_TIMER_GETOVERRUN: u64 = 109;
+pub const SYS_TIMER_SETTIME: u64 = 110;
+pub const SYS_TIMER_DELETE: u64 = 111;
+
+// POSIX message queue syscalls (Section 7.4)
+pub const SYS_MQ_OPEN: u64 = 180;
+pub const SYS_MQ_UNLINK: u64 = 181;
+pub const SYS_MQ_TIMEDSEND: u64 = 182;
+pub const SYS_MQ_TIMEDRECEIVE: u64 = 183;
+pub const SYS_MQ_NOTIFY: u64 = 184;
+pub const SYS_MQ_GETSETATTR: u64 = 185;
+
 pub const SYS_REBOOT: u64 = 142;
 pub const SYS_SETPGID: u64 = 154;
 pub const SYS_GETPGID: u64 = 155;
@@ -213,6 +253,9 @@ pub const SYS_UTIMENSAT: u64 = 88;
 pub const SYS_MKNODAT: u64 = 33;
 pub const SYS_MOUNT: u64 = 40;
 pub const SYS_UMOUNT2: u64 = 39;
+pub const SYS_PIVOT_ROOT: u64 = 41;
+pub const SYS_SWAPON: u64 = 224;
+pub const SYS_SWAPOFF: u64 = 225;
 pub const SYS_SYNC: u64 = 81;
 pub const SYS_FSYNC: u64 = 82;
 pub const SYS_FDATASYNC: u64 = 83;
@@ -231,9 +274,20 @@ pub const SYS_SETNS: u64 = 268;
 pub const SYS_KILL: u64 = 129;
 pub const SYS_TKILL: u64 = 130;
 pub const SYS_TGKILL: u64 = 131;
+pub const SYS_SIGALTSTACK: u64 = 132;
 pub const SYS_RT_SIGACTION: u64 = 134;
 pub const SYS_RT_SIGPROCMASK: u64 = 135;
 pub const SYS_RT_SIGPENDING: u64 = 136;
+pub const SYS_RT_SIGTIMEDWAIT: u64 = 137;
+pub const SYS_RT_SIGQUEUEINFO: u64 = 128;
+pub const SYS_RT_SIGSUSPEND: u64 = 133;
+pub const SYS_RT_TGSIGQUEUEINFO: u64 = 240;
+
+// Memory barrier syscall
+pub const SYS_MEMBARRIER: u64 = 283;
+
+// File readahead syscall
+pub const SYS_READAHEAD: u64 = 213;
 
 // Pipe/poll/select syscalls (aarch64 numbers)
 pub const SYS_PIPE2: u64 = 59;
@@ -251,6 +305,7 @@ pub const SYS_MLOCKALL: u64 = 230;
 pub const SYS_MUNLOCKALL: u64 = 231;
 pub const SYS_MLOCK2: u64 = 284;
 pub const SYS_MSYNC: u64 = 227;
+pub const SYS_MINCORE: u64 = 232;
 pub const SYS_MADVISE: u64 = 233;
 pub const SYS_MREMAP: u64 = 216;
 
@@ -283,8 +338,10 @@ pub const SYS_PRLIMIT64: u64 = 261;
 
 // Socket syscalls
 pub const SYS_SOCKET: u64 = 198;
+pub const SYS_SOCKETPAIR: u64 = 199;
 pub const SYS_BIND: u64 = 200;
 pub const SYS_LISTEN: u64 = 201;
+pub const SYS_ACCEPT: u64 = 202;
 pub const SYS_CONNECT: u64 = 203;
 pub const SYS_GETSOCKNAME: u64 = 204;
 pub const SYS_GETPEERNAME: u64 = 205;
@@ -293,6 +350,10 @@ pub const SYS_RECVFROM: u64 = 207;
 pub const SYS_SETSOCKOPT: u64 = 208;
 pub const SYS_GETSOCKOPT: u64 = 209;
 pub const SYS_SHUTDOWN: u64 = 210;
+pub const SYS_SENDMSG: u64 = 211;
+pub const SYS_RECVMSG: u64 = 212;
+pub const SYS_RECVMMSG: u64 = 243;
+pub const SYS_SENDMMSG: u64 = 269;
 
 // SysV IPC syscalls (shared memory, semaphores, message queues)
 pub const SYS_SHMGET: u64 = 194;
@@ -311,14 +372,43 @@ pub const SYS_MSGCTL: u64 = 187;
 // TLS syscalls
 pub const SYS_SET_TID_ADDRESS: u64 = 96;
 
+// New syscall numbers
+pub const SYS_CLONE3: u64 = 435;
+pub const SYS_PERSONALITY: u64 = 92;
+pub const SYS_SYSLOG: u64 = 116;
+
 // Futex syscalls
 pub const SYS_FUTEX: u64 = 98;
 pub const SYS_SET_ROBUST_LIST: u64 = 99;
 pub const SYS_GET_ROBUST_LIST: u64 = 100;
+pub const SYS_FUTEX_WAITV: u64 = 449;
 pub const SYS_SENDFILE: u64 = 71;
 pub const SYS_VMSPLICE: u64 = 75;
 pub const SYS_SPLICE: u64 = 76;
 pub const SYS_TEE: u64 = 77;
+pub const SYS_STATFS: u64 = 43;
+pub const SYS_FSTATFS: u64 = 44;
+pub const SYS_STATX: u64 = 291;
+
+// Extended attribute syscalls (aarch64 uses low syscall numbers 5-16)
+pub const SYS_SETXATTR: u64 = 5;
+pub const SYS_LSETXATTR: u64 = 6;
+pub const SYS_FSETXATTR: u64 = 7;
+pub const SYS_GETXATTR: u64 = 8;
+pub const SYS_LGETXATTR: u64 = 9;
+pub const SYS_FGETXATTR: u64 = 10;
+pub const SYS_LISTXATTR: u64 = 11;
+pub const SYS_LLISTXATTR: u64 = 12;
+pub const SYS_FLISTXATTR: u64 = 13;
+pub const SYS_REMOVEXATTR: u64 = 14;
+pub const SYS_LREMOVEXATTR: u64 = 15;
+pub const SYS_FREMOVEXATTR: u64 = 16;
+
+// Extended attribute flags
+pub const XATTR_CREATE: i32 = 0x1;
+pub const XATTR_REPLACE: i32 = 0x2;
+pub const SYS_CHROOT: u64 = 51;
+pub const SYS_FCHMODAT2: u64 = 452;
 
 // ============================================================================
 // Syscall wrapper functions
@@ -474,6 +564,204 @@ pub fn sys_clock_getres(clockid: i32, res: *mut Timespec) -> i64 {
     unsafe { syscall2!(SYS_CLOCK_GETRES, clockid, res) }
 }
 
+/// clock_gettime(clockid, tp)
+#[inline(always)]
+pub fn sys_clock_gettime(clockid: i32, tp: *mut Timespec) -> i64 {
+    unsafe { syscall2!(SYS_CLOCK_GETTIME, clockid, tp) }
+}
+
+/// clock_settime(clockid, tp)
+#[inline(always)]
+pub fn sys_clock_settime(clockid: i32, tp: *const Timespec) -> i64 {
+    unsafe { syscall2!(SYS_CLOCK_SETTIME, clockid, tp) }
+}
+
+// --- Timerfd ---
+
+use crate::types::ITimerSpec;
+
+/// timerfd_create(clockid, flags)
+#[inline(always)]
+pub fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
+    unsafe { syscall2!(SYS_TIMERFD_CREATE, clockid, flags) }
+}
+
+/// timerfd_settime(fd, flags, new_value, old_value)
+#[inline(always)]
+pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: *const ITimerSpec, old_value: *mut ITimerSpec) -> i64 {
+    unsafe { syscall4!(SYS_TIMERFD_SETTIME, fd, flags, new_value, old_value) }
+}
+
+/// timerfd_gettime(fd, curr_value)
+#[inline(always)]
+pub fn sys_timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
+    unsafe { syscall2!(SYS_TIMERFD_GETTIME, fd, curr_value) }
+}
+
+// --- eventfd ---
+
+/// eventfd2(initval, flags) - create eventfd with flags
+/// NOTE: aarch64 only has eventfd2, not the legacy eventfd
+#[inline(always)]
+pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
+    unsafe { syscall2!(SYS_EVENTFD2, initval, flags) }
+}
+
+// --- prctl ---
+
+/// prctl syscall number
+pub const SYS_PRCTL: u64 = 167;
+
+/// prctl(option, arg2, arg3, arg4, arg5) - process/thread control
+#[inline(always)]
+pub fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    unsafe { syscall5!(SYS_PRCTL, option, arg2, arg3, arg4, arg5) }
+}
+
+// --- signalfd ---
+
+/// signalfd4(fd, mask, sizemask, flags) - create/update signalfd
+/// NOTE: aarch64 only has signalfd4, not the legacy signalfd
+#[inline(always)]
+pub fn sys_signalfd4(fd: i32, mask: *const u64, sizemask: usize, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_SIGNALFD4, fd, mask, sizemask, flags) }
+}
+
+// --- epoll ---
+// NOTE: aarch64 only has epoll_create1, epoll_ctl, and epoll_pwait
+// We provide compatibility wrappers for epoll_create and epoll_wait
+
+/// epoll_create(size) - create an epoll instance
+/// On aarch64, this is implemented via epoll_create1(0)
+#[inline(always)]
+pub fn sys_epoll_create(size: i32) -> i64 {
+    if size <= 0 {
+        return -22; // EINVAL
+    }
+    sys_epoll_create1(0)
+}
+
+/// epoll_create1(flags) - create an epoll instance with flags (EPOLL_CLOEXEC)
+#[inline(always)]
+pub fn sys_epoll_create1(flags: i32) -> i64 {
+    unsafe { syscall1!(SYS_EPOLL_CREATE1, flags) }
+}
+
+/// epoll_ctl(epfd, op, fd, event) - control an epoll instance
+#[inline(always)]
+pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event: *const EpollEvent) -> i64 {
+    unsafe { syscall4!(SYS_EPOLL_CTL, epfd, op, fd, event) }
+}
+
+/// epoll_wait(epfd, events, maxevents, timeout) - wait for events
+/// On aarch64, this is implemented via epoll_pwait with null sigmask
+#[inline(always)]
+pub fn sys_epoll_wait(epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32) -> i64 {
+    sys_epoll_pwait(epfd, events, maxevents, timeout, core::ptr::null(), 0)
+}
+
+/// epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize) - wait with signal mask
+#[inline(always)]
+pub fn sys_epoll_pwait(
+    epfd: i32,
+    events: *mut EpollEvent,
+    maxevents: i32,
+    timeout: i32,
+    sigmask: *const u64,
+    sigsetsize: usize,
+) -> i64 {
+    unsafe { syscall6!(SYS_EPOLL_PWAIT, epfd, events, maxevents, timeout, sigmask, sigsetsize) }
+}
+
+/// epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize) - wait with timespec timeout
+#[inline(always)]
+pub fn sys_epoll_pwait2(
+    epfd: i32,
+    events: *mut EpollEvent,
+    maxevents: i32,
+    timeout: *const Timespec,
+    sigmask: *const u64,
+    sigsetsize: usize,
+) -> i64 {
+    unsafe { syscall6!(SYS_EPOLL_PWAIT2, epfd, events, maxevents, timeout, sigmask, sigsetsize) }
+}
+
+// --- POSIX Timers ---
+
+/// timer_create(clockid, sigevent, timerid)
+#[inline(always)]
+pub fn sys_timer_create(clockid: i32, sevp: *const SigEvent, timerid: *mut i32) -> i64 {
+    unsafe { syscall3!(SYS_TIMER_CREATE, clockid, sevp, timerid) }
+}
+
+/// timer_settime(timerid, flags, new_value, old_value)
+#[inline(always)]
+pub fn sys_timer_settime(timerid: i32, flags: i32, new_value: *const ITimerSpec, old_value: *mut ITimerSpec) -> i64 {
+    unsafe { syscall4!(SYS_TIMER_SETTIME, timerid, flags, new_value, old_value) }
+}
+
+/// timer_gettime(timerid, curr_value)
+#[inline(always)]
+pub fn sys_timer_gettime(timerid: i32, curr_value: *mut ITimerSpec) -> i64 {
+    unsafe { syscall2!(SYS_TIMER_GETTIME, timerid, curr_value) }
+}
+
+/// timer_getoverrun(timerid)
+#[inline(always)]
+pub fn sys_timer_getoverrun(timerid: i32) -> i64 {
+    unsafe { syscall1!(SYS_TIMER_GETOVERRUN, timerid) }
+}
+
+/// timer_delete(timerid)
+#[inline(always)]
+pub fn sys_timer_delete(timerid: i32) -> i64 {
+    unsafe { syscall1!(SYS_TIMER_DELETE, timerid) }
+}
+
+/// adjtimex(txc) - read/set kernel clock parameters
+#[inline(always)]
+pub fn sys_adjtimex(txc: *mut Timex) -> i64 {
+    unsafe { syscall1!(SYS_ADJTIMEX, txc) }
+}
+
+// --- POSIX Message Queues ---
+
+/// mq_open(name, oflag, mode, attr)
+#[inline(always)]
+pub fn sys_mq_open(name: *const u8, oflag: i32, mode: u32, attr: *const MqAttr) -> i64 {
+    unsafe { syscall4!(SYS_MQ_OPEN, name, oflag, mode, attr) }
+}
+
+/// mq_unlink(name)
+#[inline(always)]
+pub fn sys_mq_unlink(name: *const u8) -> i64 {
+    unsafe { syscall1!(SYS_MQ_UNLINK, name) }
+}
+
+/// mq_timedsend(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)
+#[inline(always)]
+pub fn sys_mq_timedsend(mqdes: i32, msg: *const u8, len: usize, prio: u32, timeout: *const Timespec) -> i64 {
+    unsafe { syscall5!(SYS_MQ_TIMEDSEND, mqdes, msg, len, prio, timeout) }
+}
+
+/// mq_timedreceive(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)
+#[inline(always)]
+pub fn sys_mq_timedreceive(mqdes: i32, msg: *mut u8, len: usize, prio: *mut u32, timeout: *const Timespec) -> i64 {
+    unsafe { syscall5!(SYS_MQ_TIMEDRECEIVE, mqdes, msg, len, prio, timeout) }
+}
+
+/// mq_notify(mqdes, sevp)
+#[inline(always)]
+pub fn sys_mq_notify(mqdes: i32, sevp: *const SigEvent) -> i64 {
+    unsafe { syscall2!(SYS_MQ_NOTIFY, mqdes, sevp) }
+}
+
+/// mq_getsetattr(mqdes, newattr, oldattr)
+#[inline(always)]
+pub fn sys_mq_getsetattr(mqdes: i32, newattr: *const MqAttr, oldattr: *mut MqAttr) -> i64 {
+    unsafe { syscall3!(SYS_MQ_GETSETATTR, mqdes, newattr, oldattr) }
+}
+
 /// waitid(idtype, id, infop, options)
 #[inline(always)]
 pub fn sys_waitid(idtype: i32, id: u64, infop: *mut SigInfo, options: i32) -> i64 {
@@ -520,6 +808,18 @@ pub fn sys_preadv(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> i64 {
 #[inline(always)]
 pub fn sys_pwritev(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> i64 {
     unsafe { syscall4!(SYS_PWRITEV, fd, iov, iovcnt, offset) }
+}
+
+/// preadv2(fd, iov, iovcnt, offset, flags)
+#[inline(always)]
+pub fn sys_preadv2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_PREADV2, fd, iov, iovcnt, offset, flags) }
+}
+
+/// pwritev2(fd, iov, iovcnt, offset, flags)
+#[inline(always)]
+pub fn sys_pwritev2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_PWRITEV2, fd, iov, iovcnt, offset, flags) }
 }
 
 /// mkdirat(dirfd, pathname, mode)
@@ -682,6 +982,16 @@ pub fn sys_umask(mask: u32) -> i64 {
     unsafe { syscall1!(SYS_UMASK, mask) }
 }
 
+/// chroot(pathname)
+pub fn sys_chroot(pathname: *const u8) -> i64 {
+    unsafe { syscall1!(SYS_CHROOT, pathname) }
+}
+
+/// fchmodat2(dirfd, pathname, mode, flags)
+pub fn sys_fchmodat2(dirfd: i32, pathname: *const u8, mode: u32, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_FCHMODAT2, dirfd, pathname, mode, flags) }
+}
+
 /// utimensat(dirfd, pathname, times, flags)
 pub fn sys_utimensat(dirfd: i32, pathname: *const u8, times: *const Timespec, flags: i32) -> i64 {
     unsafe { syscall4!(SYS_UTIMENSAT, dirfd, pathname, times, flags) }
@@ -706,6 +1016,24 @@ pub fn sys_mount(source: *const u8, target: *const u8, fstype: *const u8, flags:
 /// umount2(target, flags)
 pub fn sys_umount2(target: *const u8, flags: u64) -> i64 {
     unsafe { syscall2!(SYS_UMOUNT2, target, flags) }
+}
+
+/// pivot_root(new_root, put_old) - change the root filesystem
+#[inline(always)]
+pub fn sys_pivot_root(new_root: *const u8, put_old: *const u8) -> i64 {
+    unsafe { syscall2!(SYS_PIVOT_ROOT, new_root, put_old) }
+}
+
+/// swapon(path, swapflags) - enable a swap device/file
+#[inline(always)]
+pub fn sys_swapon(path: *const u8, swapflags: i32) -> i64 {
+    unsafe { syscall2!(SYS_SWAPON, path, swapflags as u64) }
+}
+
+/// swapoff(path) - disable a swap device/file
+#[inline(always)]
+pub fn sys_swapoff(path: *const u8) -> i64 {
+    unsafe { syscall1!(SYS_SWAPOFF, path) }
 }
 
 /// sync() - synchronize cached writes to persistent storage
@@ -805,6 +1133,18 @@ pub fn sys_rt_sigpending(set: u64, sigsetsize: u64) -> i64 {
     unsafe { syscall2!(SYS_RT_SIGPENDING, set, sigsetsize) }
 }
 
+/// rt_sigtimedwait(set, info, ts, sigsetsize) - wait for signal
+#[inline(always)]
+pub fn sys_rt_sigtimedwait(set: u64, info: u64, ts: u64, sigsetsize: u64) -> i64 {
+    unsafe { syscall4!(SYS_RT_SIGTIMEDWAIT, set, info, ts, sigsetsize) }
+}
+
+/// sigaltstack(ss, oss) - set/get alternate signal stack
+#[inline(always)]
+pub fn sys_sigaltstack(ss: u64, oss: u64) -> i64 {
+    unsafe { syscall2!(SYS_SIGALTSTACK, ss, oss) }
+}
+
 /// kill(pid, sig) - send signal to process
 #[inline(always)]
 pub fn sys_kill(pid: i64, sig: u32) -> i64 {
@@ -821,6 +1161,24 @@ pub fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> i64 {
 #[inline(always)]
 pub fn sys_tkill(tid: i64, sig: u32) -> i64 {
     unsafe { syscall2!(SYS_TKILL, tid, sig) }
+}
+
+/// rt_sigqueueinfo(pid, sig, uinfo) - send signal with info to process
+#[inline(always)]
+pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
+    unsafe { syscall3!(SYS_RT_SIGQUEUEINFO, pid, sig, uinfo) }
+}
+
+/// rt_sigsuspend(mask, sigsetsize) - wait for signal with temporary mask
+#[inline(always)]
+pub fn sys_rt_sigsuspend(mask: u64, sigsetsize: u64) -> i64 {
+    unsafe { syscall2!(SYS_RT_SIGSUSPEND, mask, sigsetsize) }
+}
+
+/// rt_tgsigqueueinfo(tgid, tid, sig, uinfo) - send signal with info to thread
+#[inline(always)]
+pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
+    unsafe { syscall4!(SYS_RT_TGSIGQUEUEINFO, tgid, tid, sig, uinfo) }
 }
 
 // ============================================================================
@@ -947,6 +1305,12 @@ pub fn sys_munlockall() -> i64 {
 #[inline(always)]
 pub fn sys_msync(addr: u64, length: u64, flags: i32) -> i64 {
     unsafe { syscall3!(SYS_MSYNC, addr, length, flags) }
+}
+
+/// mincore(addr, length, vec) - determine whether pages are resident in memory
+#[inline(always)]
+pub fn sys_mincore(addr: u64, length: u64, vec: *mut u8) -> i64 {
+    unsafe { syscall3!(SYS_MINCORE, addr, length, vec) }
 }
 
 /// madvise(addr, length, advice) - give advice about use of memory
@@ -1185,6 +1549,12 @@ pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
     unsafe { syscall2!(SYS_LISTEN, fd, backlog) }
 }
 
+/// accept(fd, addr, addrlen) - accept a connection on a socket
+#[inline(always)]
+pub fn sys_accept(fd: i32, addr: *mut u8, addrlen: *mut u32) -> i64 {
+    unsafe { syscall3!(SYS_ACCEPT, fd, addr, addrlen) }
+}
+
 /// shutdown(fd, how) - shut down part of a full-duplex connection
 #[inline(always)]
 pub fn sys_shutdown(fd: i32, how: i32) -> i64 {
@@ -1227,6 +1597,36 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *mut u8, optlen
     unsafe { syscall5!(SYS_GETSOCKOPT, fd, level, optname, optval, optlen) }
 }
 
+/// socketpair(domain, type, protocol, sv) - create a pair of connected sockets
+#[inline(always)]
+pub fn sys_socketpair(domain: i32, sock_type: i32, protocol: i32, sv: *mut [i32; 2]) -> i64 {
+    unsafe { syscall4!(SYS_SOCKETPAIR, domain, sock_type, protocol, sv) }
+}
+
+/// sendmsg(fd, msg, flags) - send a message on a socket
+#[inline(always)]
+pub fn sys_sendmsg(fd: i32, msg: *const super::MsgHdr, flags: i32) -> i64 {
+    unsafe { syscall3!(SYS_SENDMSG, fd, msg, flags) }
+}
+
+/// recvmsg(fd, msg, flags) - receive a message from a socket
+#[inline(always)]
+pub fn sys_recvmsg(fd: i32, msg: *mut super::MsgHdr, flags: i32) -> i64 {
+    unsafe { syscall3!(SYS_RECVMSG, fd, msg, flags) }
+}
+
+/// sendmmsg(fd, msgvec, vlen, flags) - send multiple messages
+#[inline(always)]
+pub fn sys_sendmmsg(fd: i32, msgvec: *mut super::MMsgHdr, vlen: u32, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_SENDMMSG, fd, msgvec, vlen, flags) }
+}
+
+/// recvmmsg(fd, msgvec, vlen, flags, timeout) - receive multiple messages
+#[inline(always)]
+pub fn sys_recvmmsg(fd: i32, msgvec: *mut super::MMsgHdr, vlen: u32, flags: i32, timeout: *const Timespec) -> i64 {
+    unsafe { syscall5!(SYS_RECVMMSG, fd, msgvec, vlen, flags, timeout) }
+}
+
 // ============================================================================
 // Futex syscalls
 // ============================================================================
@@ -1247,6 +1647,31 @@ pub fn sys_set_robust_list(head: *const super::RobustListHead, len: usize) -> i6
 #[inline(always)]
 pub fn sys_get_robust_list(pid: i32, head_ptr: *mut *const super::RobustListHead, len_ptr: *mut usize) -> i64 {
     unsafe { syscall3!(SYS_GET_ROBUST_LIST, pid, head_ptr, len_ptr) }
+}
+
+/// futex_waitv - wait on multiple futexes
+///
+/// # Arguments
+/// * `waiters` - Pointer to array of FutexWaitv structures
+/// * `nr_futexes` - Number of futexes in the array (1-128)
+/// * `flags` - Syscall flags (must be 0)
+/// * `timeout` - Optional pointer to absolute timeout (struct timespec)
+/// * `clockid` - Clock for timeout (CLOCK_MONOTONIC=1 or CLOCK_REALTIME=0)
+///
+/// # Returns
+/// * >= 0: Index of woken futex
+/// * -EINVAL: Invalid arguments
+/// * -EAGAIN: Value mismatch
+/// * -ETIMEDOUT: Timeout expired
+#[inline(always)]
+pub fn sys_futex_waitv(
+    waiters: *const super::FutexWaitv,
+    nr_futexes: u32,
+    flags: u32,
+    timeout: *const Timespec,
+    clockid: i32,
+) -> i64 {
+    unsafe { syscall5!(SYS_FUTEX_WAITV, waiters, nr_futexes, flags, timeout, clockid) }
 }
 
 // ============================================================================
@@ -1371,4 +1796,425 @@ pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
 #[inline(always)]
 pub fn sys_vmsplice(fd: i32, iov: *const super::IoVec, nr_segs: usize, flags: u32) -> i64 {
     unsafe { syscall4!(SYS_VMSPLICE, fd, iov, nr_segs, flags) }
+}
+
+// --- Filesystem Statistics ---
+
+/// statfs(pathname, buf) - get filesystem statistics
+#[inline(always)]
+pub fn sys_statfs(pathname: *const u8, buf: *mut super::LinuxStatFs) -> i64 {
+    unsafe { syscall2!(SYS_STATFS, pathname, buf) }
+}
+
+/// fstatfs(fd, buf) - get filesystem statistics by file descriptor
+#[inline(always)]
+pub fn sys_fstatfs(fd: i32, buf: *mut super::LinuxStatFs) -> i64 {
+    unsafe { syscall2!(SYS_FSTATFS, fd, buf) }
+}
+
+/// statx(dirfd, pathname, flags, mask, buf) - get extended file status
+#[inline(always)]
+pub fn sys_statx(dirfd: i32, pathname: *const u8, flags: i32, mask: u32, buf: *mut super::Statx) -> i64 {
+    unsafe { syscall5!(SYS_STATX, dirfd, pathname, flags, mask, buf) }
+}
+
+// ============================================================================
+// Extended attributes syscalls
+// ============================================================================
+
+/// setxattr(path, name, value, size, flags) - set extended attribute
+#[inline(always)]
+pub fn sys_setxattr(path: *const u8, name: *const u8, value: *const u8, size: usize, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_SETXATTR, path, name, value, size, flags) }
+}
+
+/// lsetxattr(path, name, value, size, flags) - set extended attribute (no symlink follow)
+#[inline(always)]
+pub fn sys_lsetxattr(path: *const u8, name: *const u8, value: *const u8, size: usize, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_LSETXATTR, path, name, value, size, flags) }
+}
+
+/// fsetxattr(fd, name, value, size, flags) - set extended attribute by fd
+#[inline(always)]
+pub fn sys_fsetxattr(fd: i32, name: *const u8, value: *const u8, size: usize, flags: i32) -> i64 {
+    unsafe { syscall5!(SYS_FSETXATTR, fd, name, value, size, flags) }
+}
+
+/// getxattr(path, name, value, size) - get extended attribute
+#[inline(always)]
+pub fn sys_getxattr(path: *const u8, name: *const u8, value: *mut u8, size: usize) -> i64 {
+    unsafe { syscall4!(SYS_GETXATTR, path, name, value, size) }
+}
+
+/// lgetxattr(path, name, value, size) - get extended attribute (no symlink follow)
+#[inline(always)]
+pub fn sys_lgetxattr(path: *const u8, name: *const u8, value: *mut u8, size: usize) -> i64 {
+    unsafe { syscall4!(SYS_LGETXATTR, path, name, value, size) }
+}
+
+/// fgetxattr(fd, name, value, size) - get extended attribute by fd
+#[inline(always)]
+pub fn sys_fgetxattr(fd: i32, name: *const u8, value: *mut u8, size: usize) -> i64 {
+    unsafe { syscall4!(SYS_FGETXATTR, fd, name, value, size) }
+}
+
+/// listxattr(path, list, size) - list extended attributes
+#[inline(always)]
+pub fn sys_listxattr(path: *const u8, list: *mut u8, size: usize) -> i64 {
+    unsafe { syscall3!(SYS_LISTXATTR, path, list, size) }
+}
+
+/// llistxattr(path, list, size) - list extended attributes (no symlink follow)
+#[inline(always)]
+pub fn sys_llistxattr(path: *const u8, list: *mut u8, size: usize) -> i64 {
+    unsafe { syscall3!(SYS_LLISTXATTR, path, list, size) }
+}
+
+/// flistxattr(fd, list, size) - list extended attributes by fd
+#[inline(always)]
+pub fn sys_flistxattr(fd: i32, list: *mut u8, size: usize) -> i64 {
+    unsafe { syscall3!(SYS_FLISTXATTR, fd, list, size) }
+}
+
+/// removexattr(path, name) - remove extended attribute
+#[inline(always)]
+pub fn sys_removexattr(path: *const u8, name: *const u8) -> i64 {
+    unsafe { syscall2!(SYS_REMOVEXATTR, path, name) }
+}
+
+/// lremovexattr(path, name) - remove extended attribute (no symlink follow)
+#[inline(always)]
+pub fn sys_lremovexattr(path: *const u8, name: *const u8) -> i64 {
+    unsafe { syscall2!(SYS_LREMOVEXATTR, path, name) }
+}
+
+/// fremovexattr(fd, name) - remove extended attribute by fd
+#[inline(always)]
+pub fn sys_fremovexattr(fd: i32, name: *const u8) -> i64 {
+    unsafe { syscall2!(SYS_FREMOVEXATTR, fd, name) }
+}
+
+// ============================================================================
+// Capabilities (capget, capset)
+// ============================================================================
+
+use crate::types::{CapUserData, CapUserHeader};
+
+/// capget - get capabilities of a process
+///
+/// Gets the capabilities of the target process specified in the header.
+/// Use pid=0 for the calling process.
+///
+/// For version 3, datap must point to an array of 2 CapUserData structs.
+#[inline(always)]
+pub fn sys_capget(hdrp: *mut CapUserHeader, datap: *mut CapUserData) -> i64 {
+    unsafe { syscall2!(SYS_CAPGET, hdrp, datap) }
+}
+
+/// capset - set capabilities of current process
+///
+/// Sets the capabilities of the current process.
+/// The pid in the header must be 0 or the calling process's pid.
+///
+/// For version 3, datap must point to an array of 2 CapUserData structs.
+#[inline(always)]
+pub fn sys_capset(hdrp: *const CapUserHeader, datap: *const CapUserData) -> i64 {
+    unsafe { syscall2!(SYS_CAPSET, hdrp, datap) }
+}
+
+// ============================================================================
+// Inotify
+// NOTE: aarch64 only has inotify_init1, not legacy inotify_init
+// ============================================================================
+
+/// inotify_init1(flags) - syscall number
+pub const SYS_INOTIFY_INIT1: u64 = 26;
+/// inotify_add_watch(fd, pathname, mask) - syscall number
+pub const SYS_INOTIFY_ADD_WATCH: u64 = 27;
+/// inotify_rm_watch(fd, wd) - syscall number
+pub const SYS_INOTIFY_RM_WATCH: u64 = 28;
+
+/// inotify_init1(flags) - create inotify instance with flags
+#[inline(always)]
+pub fn sys_inotify_init1(flags: i32) -> i64 {
+    unsafe { syscall1!(SYS_INOTIFY_INIT1, flags) }
+}
+
+/// inotify_add_watch(fd, pathname, mask) - add watch to inotify instance
+#[inline(always)]
+pub fn sys_inotify_add_watch(fd: i32, pathname: *const u8, mask: u32) -> i64 {
+    unsafe { syscall3!(SYS_INOTIFY_ADD_WATCH, fd, pathname, mask) }
+}
+
+/// inotify_rm_watch(fd, wd) - remove watch from inotify instance
+#[inline(always)]
+pub fn sys_inotify_rm_watch(fd: i32, wd: i32) -> i64 {
+    unsafe { syscall2!(SYS_INOTIFY_RM_WATCH, fd, wd) }
+}
+
+// ============================================================================
+// Membarrier
+// ============================================================================
+
+/// membarrier command constants
+pub const MEMBARRIER_CMD_QUERY: i32 = 0;
+pub const MEMBARRIER_CMD_GLOBAL: i32 = 1 << 0;
+pub const MEMBARRIER_CMD_PRIVATE_EXPEDITED: i32 = 1 << 3;
+pub const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
+
+/// membarrier(cmd, flags, cpu_id) - memory barrier across threads
+#[inline(always)]
+pub fn sys_membarrier(cmd: i32, flags: u32, cpu_id: i32) -> i64 {
+    unsafe { syscall3!(SYS_MEMBARRIER, cmd, flags, cpu_id) }
+}
+
+// ============================================================================
+// Readahead
+// ============================================================================
+
+/// readahead(fd, offset, count) - initiate file readahead
+#[inline(always)]
+pub fn sys_readahead(fd: i32, offset: i64, count: usize) -> i64 {
+    unsafe { syscall3!(SYS_READAHEAD, fd, offset, count) }
+}
+
+// ============================================================================
+// clone3 (modern extensible clone)
+// ============================================================================
+
+/// clone3(uargs, size) - create a new process with extended arguments
+#[inline(always)]
+pub fn sys_clone3(args: *const CloneArgs, size: usize) -> i64 {
+    unsafe { syscall2!(SYS_CLONE3, args, size) }
+}
+
+// ============================================================================
+// personality (execution domain)
+// ============================================================================
+
+/// personality(persona) - set process execution domain
+///
+/// If persona is 0xFFFFFFFF, returns current personality without changing it.
+/// Otherwise, sets new personality and returns old value.
+#[inline(always)]
+pub fn sys_personality(persona: u32) -> i64 {
+    unsafe { syscall1!(SYS_PERSONALITY, persona) }
+}
+
+// ============================================================================
+// syslog (kernel logging)
+// ============================================================================
+
+/// syslog(type, buf, len) - read and/or clear kernel message ring buffer
+#[inline(always)]
+pub fn sys_syslog(type_: i32, buf: *mut u8, len: i32) -> i64 {
+    unsafe { syscall3!(SYS_SYSLOG, type_, buf, len) }
+}
+
+/// syslog action codes
+pub const SYSLOG_ACTION_CLOSE: i32 = 0;
+pub const SYSLOG_ACTION_OPEN: i32 = 1;
+pub const SYSLOG_ACTION_READ: i32 = 2;
+pub const SYSLOG_ACTION_READ_ALL: i32 = 3;
+pub const SYSLOG_ACTION_READ_CLEAR: i32 = 4;
+pub const SYSLOG_ACTION_CLEAR: i32 = 5;
+pub const SYSLOG_ACTION_CONSOLE_OFF: i32 = 6;
+pub const SYSLOG_ACTION_CONSOLE_ON: i32 = 7;
+pub const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
+pub const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
+pub const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
+
+// ============================================================================
+// pidfd - process file descriptors
+// ============================================================================
+
+/// pidfd_open syscall number (aarch64)
+pub const SYS_PIDFD_OPEN: u64 = 434;
+/// pidfd_send_signal syscall number (aarch64)
+pub const SYS_PIDFD_SEND_SIGNAL: u64 = 424;
+/// pidfd_getfd syscall number (aarch64)
+pub const SYS_PIDFD_GETFD: u64 = 438;
+
+/// pidfd_open(pid, flags) - create pidfd for a process
+///
+/// Creates a file descriptor that refers to the process specified by pid.
+/// The flags argument is a bit mask of flags that modify the behavior:
+/// - 0: Default behavior
+/// - O_NONBLOCK (0o4000): Open in non-blocking mode
+///
+/// Returns the file descriptor on success, or a negative error code on failure.
+#[inline(always)]
+pub fn sys_pidfd_open(pid: i32, flags: u32) -> i64 {
+    unsafe { syscall2!(SYS_PIDFD_OPEN, pid, flags) }
+}
+
+/// pidfd_send_signal(pidfd, sig, info, flags) - send signal via pidfd
+///
+/// Sends the signal sig to the process referred to by the pidfd.
+/// The info argument is an optional pointer to siginfo_t for queued signals.
+/// The flags argument is reserved and must be 0.
+///
+/// Returns 0 on success, or a negative error code on failure.
+#[inline(always)]
+pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: *const u8, flags: u32) -> i64 {
+    unsafe { syscall4!(SYS_PIDFD_SEND_SIGNAL, pidfd, sig, info, flags) }
+}
+
+/// pidfd_getfd(pidfd, targetfd, flags) - obtain duplicate of another process's FD
+///
+/// This syscall duplicates a file descriptor from the process referred to by pidfd.
+/// Currently returns -ENOSYS as it requires PTRACE capabilities.
+///
+/// Returns the new file descriptor on success, or a negative error code on failure.
+#[inline(always)]
+pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
+    unsafe { syscall3!(SYS_PIDFD_GETFD, pidfd, targetfd, flags) }
+}
+
+// --- io_uring ---
+
+/// io_uring_setup syscall number (aarch64)
+pub const SYS_IO_URING_SETUP: u64 = 425;
+/// io_uring_enter syscall number (aarch64)
+pub const SYS_IO_URING_ENTER: u64 = 426;
+/// io_uring_register syscall number (aarch64)
+pub const SYS_IO_URING_REGISTER: u64 = 427;
+
+/// io_uring_setup(entries, params) - set up an io_uring instance
+///
+/// Creates a new io_uring instance with the specified number of submission queue entries.
+/// The params structure is used to pass in additional setup parameters and receive
+/// ring offsets on output.
+///
+/// Returns a file descriptor on success, or a negative error code on failure.
+#[inline(always)]
+pub fn sys_io_uring_setup(entries: u32, params: *mut crate::types::IoUringParams) -> i64 {
+    unsafe { syscall2!(SYS_IO_URING_SETUP, entries, params) }
+}
+
+/// io_uring_enter(fd, to_submit, min_complete, flags, argp, argsz) - submit and wait for io_uring completions
+///
+/// Submits I/O requests to the io_uring instance referenced by fd and optionally
+/// waits for completions.
+///
+/// - fd: io_uring file descriptor
+/// - to_submit: number of submissions to process from the SQ ring
+/// - min_complete: minimum number of completions to wait for (if IORING_ENTER_GETEVENTS)
+/// - flags: operation flags (IORING_ENTER_GETEVENTS, IORING_ENTER_SQ_WAKEUP, etc.)
+/// - argp: optional pointer to additional arguments
+/// - argsz: size of the argp structure
+///
+/// Returns the number of submissions processed, or a negative error code.
+#[inline(always)]
+pub fn sys_io_uring_enter(
+    fd: u32,
+    to_submit: u32,
+    min_complete: u32,
+    flags: u32,
+    argp: u64,
+    argsz: usize,
+) -> i64 {
+    unsafe { syscall6!(SYS_IO_URING_ENTER, fd, to_submit, min_complete, flags, argp, argsz) }
+}
+
+/// io_uring_register(fd, opcode, arg, nr_args) - register resources with io_uring
+///
+/// Registers or unregisters resources (files, buffers, eventfds) with the io_uring
+/// instance for more efficient access during I/O operations.
+///
+/// - fd: io_uring file descriptor
+/// - opcode: registration operation (IORING_REGISTER_*, IORING_UNREGISTER_*)
+/// - arg: pointer to arguments (depends on opcode)
+/// - nr_args: number of arguments
+///
+/// Returns 0 on success, or a negative error code on failure.
+#[inline(always)]
+pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i64 {
+    unsafe { syscall4!(SYS_IO_URING_REGISTER, fd, opcode, arg, nr_args) }
+}
+
+// Keyring syscalls
+pub const SYS_ADD_KEY: u64 = 217;
+pub const SYS_REQUEST_KEY: u64 = 218;
+pub const SYS_KEYCTL: u64 = 219;
+/// kcmp syscall number (aarch64)
+pub const SYS_KCMP: u64 = 272;
+
+/// add_key(type, description, payload, plen, keyring) - add a key to the kernel's key management facility
+///
+/// Creates a new key of the specified type with the given description and payload,
+/// and links it to the specified keyring.
+///
+/// - type_ptr: pointer to NUL-terminated key type name (e.g., "user", "keyring")
+/// - desc_ptr: pointer to NUL-terminated key description
+/// - payload_ptr: pointer to the key payload data
+/// - plen: length of the payload in bytes
+/// - keyring: destination keyring (KEY_SPEC_* or positive serial number)
+///
+/// Returns the key serial number on success, or a negative error code.
+#[inline(always)]
+pub fn sys_add_key(
+    type_ptr: *const u8,
+    desc_ptr: *const u8,
+    payload_ptr: *const u8,
+    plen: usize,
+    keyring: i32,
+) -> i64 {
+    unsafe { syscall5!(SYS_ADD_KEY, type_ptr, desc_ptr, payload_ptr, plen, keyring) }
+}
+
+/// request_key(type, description, callout_info, dest_keyring) - request a key from the kernel
+///
+/// Searches for a key of the specified type and description in the process keyrings.
+/// If found, the key is linked to the destination keyring (if specified).
+///
+/// - type_ptr: pointer to NUL-terminated key type name
+/// - desc_ptr: pointer to NUL-terminated key description
+/// - callout_info_ptr: pointer to callout info (can be NULL)
+/// - dest_keyring: destination keyring to link found key (0 for none)
+///
+/// Returns the key serial number on success, or a negative error code.
+#[inline(always)]
+pub fn sys_request_key(
+    type_ptr: *const u8,
+    desc_ptr: *const u8,
+    callout_info_ptr: *const u8,
+    dest_keyring: i32,
+) -> i64 {
+    unsafe { syscall4!(SYS_REQUEST_KEY, type_ptr, desc_ptr, callout_info_ptr, dest_keyring) }
+}
+
+/// keyctl(cmd, arg2, arg3, arg4, arg5) - manipulate the kernel's key management facility
+///
+/// Performs various operations on keys and keyrings based on the command.
+///
+/// - cmd: KEYCTL_* command
+/// - arg2-arg5: command-specific arguments
+///
+/// Returns command-specific value on success, or a negative error code.
+#[inline(always)]
+pub fn sys_keyctl(cmd: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    unsafe { syscall5!(SYS_KEYCTL, cmd, arg2, arg3, arg4, arg5) }
+}
+
+/// kcmp(pid1, pid2, type, idx1, idx2) - compare kernel resources between processes
+///
+/// Compares kernel resources (file descriptors, memory maps, etc.) between two processes.
+/// Used by container runtimes and process inspection tools.
+///
+/// # Arguments
+/// * `pid1` - First process ID
+/// * `pid2` - Second process ID
+/// * `type_` - Comparison type (KCMP_FILE, KCMP_VM, KCMP_FILES, KCMP_FS, etc.)
+/// * `idx1` - First index (fd number for KCMP_FILE, ignored otherwise)
+/// * `idx2` - Second index (fd number for KCMP_FILE, ignored otherwise)
+///
+/// # Returns
+/// * 0 if resources are equal (same kernel object)
+/// * 1 if first < second (obfuscated pointer comparison)
+/// * 2 if first > second
+/// * Negative error code on failure (ESRCH, EBADF, EINVAL, EOPNOTSUPP)
+#[inline(always)]
+pub fn sys_kcmp(pid1: u64, pid2: u64, type_: i32, idx1: u64, idx2: u64) -> i64 {
+    unsafe { syscall5!(SYS_KCMP, pid1, pid2, type_, idx1, idx2) }
 }

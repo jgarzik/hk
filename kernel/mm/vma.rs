@@ -5,6 +5,7 @@
 use alloc::sync::Arc;
 
 use crate::fs::File;
+use crate::mm::anon_vma::AnonVma;
 
 /// Protection flags - Linux PROT_* values
 pub const PROT_NONE: u32 = 0;
@@ -167,6 +168,11 @@ pub struct Vma {
     pub file: Option<Arc<File>>,
     /// Offset within file (in bytes, page-aligned)
     pub offset: u64,
+    /// Anonymous VMA tracking for reverse mapping
+    ///
+    /// Set for private anonymous mappings (MAP_ANONYMOUS | MAP_PRIVATE).
+    /// Shared between parent and child on fork for COW pages.
+    pub anon_vma: Option<Arc<AnonVma>>,
 }
 
 impl Vma {
@@ -179,6 +185,7 @@ impl Vma {
             flags,
             file: None,
             offset: 0,
+            anon_vma: None,
         }
     }
 
@@ -198,6 +205,23 @@ impl Vma {
             flags,
             file: Some(file),
             offset,
+            anon_vma: None,
+        }
+    }
+
+    /// Create a new anonymous VMA with anon_vma tracking
+    ///
+    /// Used for MAP_ANONYMOUS | MAP_PRIVATE mappings that need
+    /// reverse mapping support for swap-out.
+    pub fn new_anon(start: u64, end: u64, prot: u32, flags: u32, anon_vma: Arc<AnonVma>) -> Self {
+        Self {
+            start,
+            end,
+            prot,
+            flags,
+            file: None,
+            offset: 0,
+            anon_vma: Some(anon_vma),
         }
     }
 
@@ -273,6 +297,7 @@ impl Vma {
     /// - Protection flags (prot)
     /// - VMA flags (flags)
     /// - File backing (both anonymous or same file with contiguous offsets)
+    /// - anon_vma (must be same Arc for anonymous mappings)
     pub fn can_merge_with(&self, other: &Vma) -> bool {
         // Must be adjacent (this VMA ends where other begins)
         if self.end != other.start {
@@ -286,6 +311,16 @@ impl Vma {
         if self.flags != other.flags {
             return false;
         }
+        // Must have same anon_vma (or both None)
+        match (&self.anon_vma, &other.anon_vma) {
+            (None, None) => {}
+            (Some(av1), Some(av2)) => {
+                if !Arc::ptr_eq(av1, av2) {
+                    return false;
+                }
+            }
+            _ => return false, // One has anon_vma, other doesn't
+        }
         // Must have same file backing with contiguous offsets
         match (&self.file, &other.file) {
             (None, None) => true, // Both anonymous
@@ -295,5 +330,25 @@ impl Vma {
             }
             _ => false, // One has file, other doesn't
         }
+    }
+
+    /// Check if this VMA is a private anonymous mapping
+    ///
+    /// These are the mappings that can be swapped out and need
+    /// reverse mapping support.
+    #[inline]
+    pub fn is_anon_private(&self) -> bool {
+        self.is_anonymous() && self.is_private()
+    }
+
+    /// Get the anon_vma for this VMA, if any
+    #[inline]
+    pub fn get_anon_vma(&self) -> Option<&Arc<AnonVma>> {
+        self.anon_vma.as_ref()
+    }
+
+    /// Set the anon_vma for this VMA
+    pub fn set_anon_vma(&mut self, anon_vma: Arc<AnonVma>) {
+        self.anon_vma = Some(anon_vma);
     }
 }

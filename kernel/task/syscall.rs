@@ -329,6 +329,7 @@ pub fn sys_clone(
         parent_tidptr,
         child_tidptr,
         tls,
+        pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
     };
 
     // Get frame allocator
@@ -369,6 +370,7 @@ pub fn sys_clone(
         parent_tidptr,
         child_tidptr,
         tls,
+        pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
     };
 
     // Get frame allocator
@@ -413,6 +415,7 @@ pub fn sys_fork() -> i64 {
         parent_tidptr: 0,
         child_tidptr: 0,
         tls: 0,
+        pidfd_ptr: 0,
     };
 
     // Get frame allocator
@@ -448,6 +451,7 @@ pub fn sys_fork() -> i64 {
         parent_tidptr: 0,
         child_tidptr: 0,
         tls: 0,
+        pidfd_ptr: 0,
     };
 
     // Get frame allocator
@@ -503,6 +507,7 @@ pub fn sys_vfork() -> i64 {
         parent_tidptr: 0,
         child_tidptr: 0,
         tls: 0,
+        pidfd_ptr: 0,
     };
 
     // Get frame allocator
@@ -540,6 +545,7 @@ pub fn sys_vfork() -> i64 {
         parent_tidptr: 0,
         child_tidptr: 0,
         tls: 0,
+        pidfd_ptr: 0,
     };
 
     // Get frame allocator
@@ -662,11 +668,12 @@ const SIGCHLD: i32 = 17;
 /// * -ECHILD: No matching children
 /// * -EINVAL: Invalid arguments
 pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32) -> i64 {
-    use super::wait_options::{P_ALL, P_PGID, P_PID, WEXITED, WNOHANG};
+    use super::wait_options::{P_ALL, P_PGID, P_PID, P_PIDFD, WEXITED, WNOHANG};
     use crate::arch::Uaccess;
     use crate::uaccess::{UaccessArch, put_user};
 
     let current_pid = super::percpu::current_pid();
+    let current_tid = super::percpu::current_tid();
 
     // Validate infop pointer if non-null
     if infop != 0 && !Uaccess::access_ok(infop, core::mem::size_of::<SigInfo>()) {
@@ -674,7 +681,7 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32) -> i64 {
     }
 
     // Validate idtype
-    if idtype != P_ALL && idtype != P_PID && idtype != P_PGID {
+    if idtype != P_ALL && idtype != P_PID && idtype != P_PGID && idtype != P_PIDFD {
         return EINVAL;
     }
 
@@ -698,6 +705,24 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32) -> i64 {
                 0 // Same process group as caller
             } else {
                 -(id as i64) // Specific process group
+            }
+        }
+        P_PIDFD => {
+            // id is a file descriptor - get the PID from the pidfd
+            let fd_table = match super::fdtable::get_task_fd(current_tid) {
+                Some(table) => table,
+                None => return ESRCH,
+            };
+            let file = {
+                let table = fd_table.lock();
+                match table.get(id as i32) {
+                    Some(file) => file,
+                    None => return -9, // EBADF
+                }
+            };
+            match crate::pidfd::get_pidfd_pid(&file) {
+                Some(pid) => pid as i64,
+                None => return -9, // EBADF - not a pidfd
             }
         }
         _ => return EINVAL,
@@ -2298,6 +2323,171 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
 }
 
 // =============================================================================
+// prctl syscall
+// =============================================================================
+
+use crate::task::prctl_ops::{
+    PR_GET_DUMPABLE, PR_GET_NAME, PR_GET_NO_NEW_PRIVS, PR_GET_TIMERSLACK, PR_SET_DUMPABLE,
+    PR_SET_NAME, PR_SET_NO_NEW_PRIVS, PR_SET_TIMERSLACK,
+};
+
+/// sys_prctl - Process/thread control operations
+///
+/// Provides various process/thread control operations. Unlike arch_prctl,
+/// this syscall is portable across architectures.
+///
+/// Supported operations:
+/// - PR_SET_NAME (15): Set thread name (16-byte max, arg2 = char*)
+/// - PR_GET_NAME (16): Get thread name (arg2 = char* buffer)
+/// - PR_SET_DUMPABLE (4): Set core dump flag (arg2 = 0, 1, or 2)
+/// - PR_GET_DUMPABLE (3): Get core dump flag (returns value)
+/// - PR_SET_NO_NEW_PRIVS (38): Disable privilege escalation (arg2 = 1, irreversible)
+/// - PR_GET_NO_NEW_PRIVS (39): Get no_new_privs flag (returns 0 or 1)
+/// - PR_SET_TIMERSLACK (29): Set timer slack (arg2 = nanoseconds)
+/// - PR_GET_TIMERSLACK (30): Get timer slack (returns nanoseconds)
+///
+/// Returns 0 on success (or value for GET operations), negative errno on error.
+pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 {
+    use crate::arch::Uaccess;
+    use crate::task::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_ROOT, SUID_DUMP_USER};
+    use crate::task::percpu::{TASK_TABLE, current_tid};
+    use crate::uaccess::{get_user, put_user};
+
+    let tid = current_tid();
+
+    match option {
+        PR_SET_NAME => {
+            // Set thread name from user-space string (max 16 bytes including null)
+            let mut name = [0u8; 16];
+
+            // Read up to 16 bytes from user space
+            for (i, slot) in name.iter_mut().enumerate() {
+                match get_user::<Uaccess, u8>(arg2 + i as u64) {
+                    Ok(byte) => {
+                        *slot = byte;
+                        if byte == 0 {
+                            break; // Null terminator found
+                        }
+                    }
+                    Err(_) => return -14, // EFAULT
+                }
+            }
+            // Ensure null termination
+            name[15] = 0;
+
+            // Update task's prctl state
+            let mut table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+                task.prctl.name = name;
+                0
+            } else {
+                -3 // ESRCH
+            }
+        }
+
+        PR_GET_NAME => {
+            // Get thread name and write to user buffer
+            let name = {
+                let table = TASK_TABLE.lock();
+                match table.tasks.iter().find(|t| t.tid == tid) {
+                    Some(task) => task.prctl.name,
+                    None => return -3, // ESRCH
+                }
+            };
+
+            // Write name to user space (16 bytes)
+            for (i, &byte) in name.iter().enumerate() {
+                if put_user::<Uaccess, u8>(arg2 + i as u64, byte).is_err() {
+                    return -14; // EFAULT
+                }
+            }
+            0
+        }
+
+        PR_SET_DUMPABLE => {
+            // Set dumpable flag (0, 1, or 2)
+            let value = arg2 as u8;
+            if value != SUID_DUMP_DISABLE && value != SUID_DUMP_USER && value != SUID_DUMP_ROOT {
+                return -22; // EINVAL
+            }
+
+            let mut table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+                task.prctl.dumpable = value;
+                0
+            } else {
+                -3 // ESRCH
+            }
+        }
+
+        PR_GET_DUMPABLE => {
+            // Return dumpable flag value
+            let table = TASK_TABLE.lock();
+            match table.tasks.iter().find(|t| t.tid == tid) {
+                Some(task) => task.prctl.dumpable as i64,
+                None => -3, // ESRCH
+            }
+        }
+
+        PR_SET_NO_NEW_PRIVS => {
+            // Set no_new_privs flag (irreversible once set)
+            // arg2 must be 1 to enable, any other value is EINVAL
+            if arg2 != 1 {
+                return -22; // EINVAL
+            }
+
+            let mut table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+                task.prctl.no_new_privs = true;
+                0
+            } else {
+                -3 // ESRCH
+            }
+        }
+
+        PR_GET_NO_NEW_PRIVS => {
+            // Return no_new_privs flag (0 or 1)
+            let table = TASK_TABLE.lock();
+            match table.tasks.iter().find(|t| t.tid == tid) {
+                Some(task) => {
+                    if task.prctl.no_new_privs {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                None => -3, // ESRCH
+            }
+        }
+
+        PR_SET_TIMERSLACK => {
+            // Set timer slack in nanoseconds
+            // arg2 of 0 resets to default (50,000 ns)
+            let slack = if arg2 == 0 { 50_000 } else { arg2 };
+
+            let mut table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+                task.prctl.timer_slack_ns = slack;
+                0
+            } else {
+                -3 // ESRCH
+            }
+        }
+
+        PR_GET_TIMERSLACK => {
+            // Return timer slack in nanoseconds
+            let table = TASK_TABLE.lock();
+            match table.tasks.iter().find(|t| t.tid == tid) {
+                Some(task) => task.prctl.timer_slack_ns as i64,
+                None => -3, // ESRCH
+            }
+        }
+
+        _ => -22, // EINVAL - unsupported operation
+    }
+}
+
+// =============================================================================
 // Thread-Local Storage syscalls
 // =============================================================================
 
@@ -2381,4 +2571,782 @@ pub fn sys_set_tid_address(tidptr: u64) -> i64 {
     let tid = CurrentArch::current_tid();
     set_clear_child_tid(tid, tidptr);
     tid as i64
+}
+
+// =============================================================================
+// Capability syscalls (capget, capset)
+// =============================================================================
+
+use super::{
+    _LINUX_CAPABILITY_U32S_3, _LINUX_CAPABILITY_VERSION_1, _LINUX_CAPABILITY_VERSION_2,
+    _LINUX_CAPABILITY_VERSION_3, CapUserData, CapUserHeader, KernelCap,
+};
+
+/// Validate capability header version and return number of u32s to copy
+///
+/// If the version is invalid, writes the current version back to the header
+/// and returns -EINVAL.
+fn cap_validate_magic<A: crate::uaccess::UaccessArch>(
+    header_addr: u64,
+) -> Result<(usize, i32), i64> {
+    use crate::uaccess::{get_user, put_user};
+
+    if header_addr == 0 {
+        return Err(EFAULT);
+    }
+
+    // Read header from user space
+    let hdr: CapUserHeader = match get_user::<A, CapUserHeader>(header_addr) {
+        Ok(h) => h,
+        Err(_) => return Err(EFAULT),
+    };
+
+    let version = hdr.version;
+    let pid = hdr.pid;
+
+    match version {
+        _LINUX_CAPABILITY_VERSION_1 => {
+            // Legacy 32-bit version - only 1 u32 per set
+            Ok((1, pid))
+        }
+        _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3 => {
+            // 64-bit versions - 2 u32s per set
+            Ok((_LINUX_CAPABILITY_U32S_3, pid))
+        }
+        _ => {
+            // Invalid version - write current version back and return EINVAL
+            let current_version = CapUserHeader {
+                version: _LINUX_CAPABILITY_VERSION_3,
+                pid: 0,
+            };
+            let _ = put_user::<A, CapUserHeader>(header_addr, current_version);
+            Err(EINVAL)
+        }
+    }
+}
+
+/// sys_capget - get capabilities of a process
+///
+/// Gets the capabilities of the target process. The target can be:
+/// - 0: current process
+/// - current pid: current process
+/// - other pid: that process (requires appropriate permissions)
+///
+/// If dataptr is NULL and the version is valid, returns 0 (version query).
+/// Otherwise, copies capability data to userspace.
+pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u64) -> i64 {
+    use crate::uaccess::put_user;
+
+    // Validate version and get number of u32s to copy
+    let (tocopy, pid) = match cap_validate_magic::<A>(header_addr) {
+        Ok((n, p)) => (n, p),
+        Err(e) => {
+            // If dataptr is NULL and we got EINVAL, this is a version query
+            if data_addr == 0 && e == EINVAL {
+                return 0;
+            }
+            return e;
+        }
+    };
+
+    // If dataptr is NULL, this is just a version query (already validated)
+    if data_addr == 0 {
+        return 0;
+    }
+
+    // Get current pid
+    let current_pid = super::percpu::current_pid() as i32;
+
+    // Determine which credentials to read
+    let cred = if pid == 0 || pid == current_pid {
+        // Query our own capabilities
+        super::current_cred()
+    } else if pid < 0 {
+        return EINVAL;
+    } else {
+        // Query another process's capabilities
+        // For now, only support querying current process
+        // Full implementation would use find_task_by_vpid and RCU
+        return ESRCH;
+    };
+
+    // Build capability data arrays
+    // Linux uses 2 CapUserData structs for 64-bit capability representation
+    let mut kdata = [CapUserData::default(); 2];
+    kdata[0].effective = cred.cap_effective.low();
+    kdata[1].effective = cred.cap_effective.high();
+    kdata[0].permitted = cred.cap_permitted.low();
+    kdata[1].permitted = cred.cap_permitted.high();
+    kdata[0].inheritable = cred.cap_inheritable.low();
+    kdata[1].inheritable = cred.cap_inheritable.high();
+
+    // Copy to user space
+    for (i, item) in kdata.iter().enumerate().take(tocopy) {
+        let dst = data_addr + (i * core::mem::size_of::<CapUserData>()) as u64;
+        if put_user::<A, CapUserData>(dst, *item).is_err() {
+            return EFAULT;
+        }
+    }
+
+    0
+}
+
+/// sys_capset - set capabilities of current process
+///
+/// Sets the capabilities of the current process. The pid in the header
+/// must be 0 or the current process's pid.
+///
+/// Restrictions:
+/// - I (inheritable): raised bits must be subset of old permitted
+/// - P (permitted): raised bits must be subset of old permitted
+/// - E (effective): must be subset of new permitted
+pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u64) -> i64 {
+    use crate::uaccess::get_user;
+
+    // Validate version and get number of u32s to copy
+    let (tocopy, pid) = match cap_validate_magic::<A>(header_addr) {
+        Ok((n, p)) => (n, p),
+        Err(e) => return e,
+    };
+
+    // Get current pid
+    let current_pid = super::percpu::current_pid() as i32;
+
+    // May only affect current process (Linux restriction since kernel 2.6.27)
+    if pid != 0 && pid != current_pid {
+        return EPERM;
+    }
+
+    // Read capability data from user space
+    let mut kdata = [CapUserData::default(); 2];
+    for (i, item) in kdata.iter_mut().enumerate().take(tocopy) {
+        let src = data_addr + (i * core::mem::size_of::<CapUserData>()) as u64;
+        match get_user::<A, CapUserData>(src) {
+            Ok(d) => *item = d,
+            Err(_) => return EFAULT,
+        }
+    }
+
+    // Combine 32-bit values into 64-bit capabilities
+    let effective = KernelCap::from_u32s(kdata[0].effective, kdata[1].effective);
+    let permitted = KernelCap::from_u32s(kdata[0].permitted, kdata[1].permitted);
+    let inheritable = KernelCap::from_u32s(kdata[0].inheritable, kdata[1].inheritable);
+
+    // Get current credentials
+    let old_cred = super::current_cred();
+
+    // Validate capability changes (Linux security rules from kernel/capability.c):
+    //
+    // 1. New inheritable must not add any capabilities not in old permitted
+    //    (can only inherit what we're permitted to use)
+    if !inheritable.is_subset(&old_cred.cap_permitted) {
+        return EPERM;
+    }
+
+    // 2. New permitted must not add any capabilities not in old permitted
+    //    (can't gain capabilities we don't already have)
+    if !permitted.is_subset(&old_cred.cap_permitted) {
+        return EPERM;
+    }
+
+    // 3. New effective must be subset of new permitted
+    //    (can't use capabilities we're not permitted to use)
+    if !effective.is_subset(&permitted) {
+        return EPERM;
+    }
+
+    // Create new credentials with updated capabilities
+    let mut new_cred = old_cred;
+    new_cred.cap_effective = effective;
+    new_cred.cap_permitted = permitted;
+    new_cred.cap_inheritable = inheritable;
+    // Note: bset and ambient are not modified by capset
+
+    // Commit the new credentials
+    super::commit_creds(alloc::sync::Arc::new(new_cred));
+
+    0
+}
+
+// =============================================================================
+// clone3 syscall - Modern extensible process/thread creation
+// =============================================================================
+
+/// clone_args structure for clone3 syscall (matches Linux struct clone_args)
+///
+/// The structure is versioned by size, allowing future extensions.
+/// Fields are 64-bit aligned as required by Linux ABI.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CloneArgs {
+    /// Clone flags (CLONE_* constants, except CSIGNAL bits)
+    pub flags: u64,
+    /// File descriptor for pidfd (CLONE_PIDFD)
+    pub pidfd: u64,
+    /// Address to store child TID in child's memory (CLONE_CHILD_SETTID)
+    pub child_tid: u64,
+    /// Address to store child TID in parent's memory (CLONE_PARENT_SETTID)
+    pub parent_tid: u64,
+    /// Exit signal for child (replaces low bits of clone() flags)
+    pub exit_signal: u64,
+    /// Lowest address of the stack (stack grows down on x86/arm)
+    pub stack: u64,
+    /// Size of the stack in bytes
+    pub stack_size: u64,
+    /// TLS pointer for child (CLONE_SETTLS)
+    pub tls: u64,
+    /// Array of PIDs for set_tid feature (CLONE_SET_TID, not implemented)
+    pub set_tid: u64,
+    /// Size of set_tid array
+    pub set_tid_size: u64,
+    /// Cgroup file descriptor (CLONE_INTO_CGROUP, not implemented)
+    pub cgroup: u64,
+}
+
+/// Size of clone_args version 0 (flags through tls)
+pub const CLONE_ARGS_SIZE_VER0: usize = 64;
+/// Size of clone_args version 1 (adds set_tid, set_tid_size)
+pub const CLONE_ARGS_SIZE_VER1: usize = 80;
+/// Size of clone_args version 2 (adds cgroup)
+pub const CLONE_ARGS_SIZE_VER2: usize = 88;
+
+/// CLONE_INTO_CGROUP flag (clone3 only)
+const CLONE_INTO_CGROUP: u64 = 0x200000000;
+
+/// Signal mask for exit signal
+const CSIGNAL: u64 = 0x000000ff;
+
+/// sys_clone3 - create a new process with extended arguments
+///
+/// This is the modern, extensible syscall for process/thread creation.
+/// It takes a struct clone_args that is versioned by size.
+///
+/// # Arguments
+/// * `uargs` - User pointer to struct clone_args
+/// * `size` - Size of the clone_args structure
+///
+/// # Returns
+/// * > 0: Child PID/TID (to parent)
+/// * 0: Child returns 0
+/// * < 0: Error code
+#[cfg(target_arch = "x86_64")]
+pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
+    use super::percpu::CloneConfig;
+    use crate::FRAME_ALLOCATOR;
+    use crate::arch::Uaccess;
+    use crate::arch::x86_64::percpu::{
+        get_syscall_user_rflags, get_syscall_user_rip, get_syscall_user_rsp,
+    };
+    use crate::frame_alloc::FrameAllocRef;
+    use crate::uaccess::{UaccessArch, copy_from_user};
+
+    // Validate size - must be at least VER0 and not too large
+    if size < CLONE_ARGS_SIZE_VER0 as u64 || size > 4096 {
+        return EINVAL;
+    }
+
+    // Validate user pointer
+    if !Uaccess::access_ok(uargs, size as usize) {
+        return EFAULT;
+    }
+
+    // Copy clone_args from userspace (zero-fill any missing fields)
+    let mut args = CloneArgs::default();
+    let copy_size = core::cmp::min(size as usize, core::mem::size_of::<CloneArgs>());
+    let args_bytes = unsafe {
+        core::slice::from_raw_parts_mut(&mut args as *mut CloneArgs as *mut u8, copy_size)
+    };
+    if copy_from_user::<Uaccess>(args_bytes, uargs, copy_size).is_err() {
+        return EFAULT;
+    }
+
+    // Validate clone3-specific constraints
+
+    // exit_signal must be valid (only low 8 bits used, must be valid signal or 0)
+    if (args.exit_signal & !CSIGNAL) != 0 || args.exit_signal > 64 {
+        return EINVAL;
+    }
+
+    // CLONE_INTO_CGROUP requires cgroup fd and VER2 size
+    if (args.flags & CLONE_INTO_CGROUP) != 0 {
+        if size < CLONE_ARGS_SIZE_VER2 as u64 {
+            return EINVAL;
+        }
+        // We don't support CLONE_INTO_CGROUP yet
+        return EINVAL;
+    }
+
+    // set_tid feature not supported
+    if args.set_tid != 0 || args.set_tid_size != 0 {
+        return EINVAL;
+    }
+
+    // Validate stack - if stack is provided, stack_size must also be provided
+    if args.stack != 0 && args.stack_size == 0 {
+        return EINVAL;
+    }
+    if args.stack == 0 && args.stack_size != 0 {
+        return EINVAL;
+    }
+
+    // CLONE_THREAD or CLONE_PARENT cannot have exit_signal
+    let clone_thread = super::clone_flags::CLONE_THREAD;
+    let clone_parent = super::clone_flags::CLONE_PARENT;
+    if (args.flags & (clone_thread | clone_parent)) != 0 && args.exit_signal != 0 {
+        return EINVAL;
+    }
+
+    // Get parent's return address, flags, and stack from per-CPU data
+    let parent_rip = get_syscall_user_rip();
+    let parent_rflags = get_syscall_user_rflags();
+    let parent_rsp = get_syscall_user_rsp();
+
+    // Calculate actual child stack pointer
+    // clone3 provides stack base and size; we need to compute the stack top
+    let child_stack = if args.stack != 0 {
+        // Stack grows down, so stack top = stack + stack_size
+        args.stack.wrapping_add(args.stack_size)
+    } else {
+        0 // Inherit parent stack (for fork-like behavior)
+    };
+
+    let config = CloneConfig {
+        flags: args.flags,
+        child_stack,
+        parent_rip,
+        parent_rflags,
+        parent_rsp,
+        parent_tidptr: args.parent_tid,
+        child_tidptr: args.child_tid,
+        tls: args.tls,
+        pidfd_ptr: args.pidfd,
+    };
+
+    // Get frame allocator
+    let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
+
+    match super::percpu::do_clone(config, &mut frame_alloc) {
+        Ok(child_tid) => child_tid as i64,
+        Err(errno) => -(errno as i64),
+    }
+}
+
+/// sys_clone3 for aarch64 - create a new process with extended arguments
+#[cfg(target_arch = "aarch64")]
+pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
+    use super::percpu::CloneConfig;
+    use crate::FRAME_ALLOCATOR;
+    use crate::arch::PerCpuOps;
+    use crate::arch::Uaccess;
+    use crate::arch::aarch64::Aarch64Arch;
+    use crate::frame_alloc::FrameAllocRef;
+    use crate::uaccess::{UaccessArch, copy_from_user};
+
+    // Validate size - must be at least VER0 and not too large
+    if size < CLONE_ARGS_SIZE_VER0 as u64 || size > 4096 {
+        return EINVAL;
+    }
+
+    // Validate user pointer
+    if !Uaccess::access_ok(uargs, size as usize) {
+        return EFAULT;
+    }
+
+    // Copy clone_args from userspace (zero-fill any missing fields)
+    let mut args = CloneArgs::default();
+    let copy_size = core::cmp::min(size as usize, core::mem::size_of::<CloneArgs>());
+    let args_bytes = unsafe {
+        core::slice::from_raw_parts_mut(&mut args as *mut CloneArgs as *mut u8, copy_size)
+    };
+    if copy_from_user::<Uaccess>(args_bytes, uargs, copy_size).is_err() {
+        return EFAULT;
+    }
+
+    // Validate clone3-specific constraints
+
+    // exit_signal must be valid (only low 8 bits used, must be valid signal or 0)
+    if (args.exit_signal & !CSIGNAL) != 0 || args.exit_signal > 64 {
+        return EINVAL;
+    }
+
+    // CLONE_INTO_CGROUP requires cgroup fd and VER2 size
+    if (args.flags & CLONE_INTO_CGROUP) != 0 {
+        if size < CLONE_ARGS_SIZE_VER2 as u64 {
+            return EINVAL;
+        }
+        // We don't support CLONE_INTO_CGROUP yet
+        return EINVAL;
+    }
+
+    // set_tid feature not supported
+    if args.set_tid != 0 || args.set_tid_size != 0 {
+        return EINVAL;
+    }
+
+    // Validate stack - if stack is provided, stack_size must also be provided
+    if args.stack != 0 && args.stack_size == 0 {
+        return EINVAL;
+    }
+    if args.stack == 0 && args.stack_size != 0 {
+        return EINVAL;
+    }
+
+    // CLONE_THREAD or CLONE_PARENT cannot have exit_signal
+    let clone_thread = super::clone_flags::CLONE_THREAD;
+    let clone_parent = super::clone_flags::CLONE_PARENT;
+    if (args.flags & (clone_thread | clone_parent)) != 0 && args.exit_signal != 0 {
+        return EINVAL;
+    }
+
+    // Get parent's return address, flags, and stack from per-CPU data
+    let parent_rip = Aarch64Arch::get_syscall_user_rip();
+    let parent_rflags = Aarch64Arch::get_syscall_user_rflags();
+    let parent_rsp = Aarch64Arch::get_syscall_user_rsp();
+
+    // Calculate actual child stack pointer
+    // clone3 provides stack base and size; we need to compute the stack top
+    let child_stack = if args.stack != 0 {
+        // Stack grows down, so stack top = stack + stack_size
+        args.stack.wrapping_add(args.stack_size)
+    } else {
+        0 // Inherit parent stack (for fork-like behavior)
+    };
+
+    let config = CloneConfig {
+        flags: args.flags,
+        child_stack,
+        parent_rip,
+        parent_rflags,
+        parent_rsp,
+        parent_tidptr: args.parent_tid,
+        child_tidptr: args.child_tid,
+        tls: args.tls,
+        pidfd_ptr: args.pidfd,
+    };
+
+    // Get frame allocator
+    let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
+
+    match super::percpu::do_clone(config, &mut frame_alloc) {
+        Ok(child_tid) => child_tid as i64,
+        Err(errno) => -(errno as i64),
+    }
+}
+
+// =============================================================================
+// personality syscall - Process execution domain
+// =============================================================================
+
+/// sys_personality - set process execution domain
+///
+/// The personality syscall controls various execution behaviors like
+/// how the kernel reports certain system information. Used primarily
+/// for running programs compiled for different ABIs.
+///
+/// # Arguments
+/// * `personality` - New personality value, or 0xFFFFFFFF to query current
+///
+/// # Returns
+/// * Previous personality value on success
+///
+/// # Linux ABI
+/// If personality is 0xFFFFFFFF, returns current personality without changing it.
+/// Otherwise, sets new personality and returns old value.
+pub fn sys_personality(personality: u32) -> i64 {
+    // Get current personality
+    let old = super::percpu::get_current_personality();
+
+    // If querying only, return current value
+    if personality == 0xFFFFFFFF {
+        return old as i64;
+    }
+
+    // Set new personality
+    super::percpu::set_current_personality(personality);
+
+    old as i64
+}
+
+// =============================================================================
+// syslog syscall - Kernel logging operations
+// =============================================================================
+
+/// Syslog action codes (from Linux include/linux/syslog.h)
+pub mod syslog_action {
+    /// Close the log (nop for us)
+    pub const SYSLOG_ACTION_CLOSE: i32 = 0;
+    /// Open the log (nop for us)
+    pub const SYSLOG_ACTION_OPEN: i32 = 1;
+    /// Read from the log
+    pub const SYSLOG_ACTION_READ: i32 = 2;
+    /// Read all messages (and mark as read)
+    pub const SYSLOG_ACTION_READ_ALL: i32 = 3;
+    /// Read all messages and clear ring buffer
+    pub const SYSLOG_ACTION_READ_CLEAR: i32 = 4;
+    /// Clear ring buffer
+    pub const SYSLOG_ACTION_CLEAR: i32 = 5;
+    /// Disable printk to console
+    pub const SYSLOG_ACTION_CONSOLE_OFF: i32 = 6;
+    /// Enable printk to console
+    pub const SYSLOG_ACTION_CONSOLE_ON: i32 = 7;
+    /// Set console log level
+    pub const SYSLOG_ACTION_CONSOLE_LEVEL: i32 = 8;
+    /// Return number of unread characters
+    pub const SYSLOG_ACTION_SIZE_UNREAD: i32 = 9;
+    /// Return size of the log buffer
+    pub const SYSLOG_ACTION_SIZE_BUFFER: i32 = 10;
+}
+
+/// sys_syslog - read and/or clear kernel message ring buffer
+///
+/// Provides access to the kernel's message buffer (dmesg).
+///
+/// # Arguments
+/// * `type_` - Operation to perform (SYSLOG_ACTION_*)
+/// * `buf` - User buffer for read operations
+/// * `len` - Length of buffer
+///
+/// # Returns
+/// * >= 0 on success (depends on operation)
+/// * < 0 on error
+///
+/// # Permissions
+/// Most operations require CAP_SYSLOG or CAP_SYS_ADMIN.
+pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32) -> i64 {
+    use syslog_action::*;
+
+    // Basic validation
+    if len < 0 {
+        return EINVAL;
+    }
+
+    // Check permissions for privileged operations
+    // SYSLOG_ACTION_READ_ALL, READ_CLEAR, CLEAR, CONSOLE_* require CAP_SYSLOG
+    let needs_cap = matches!(
+        type_,
+        SYSLOG_ACTION_READ
+            | SYSLOG_ACTION_READ_ALL
+            | SYSLOG_ACTION_READ_CLEAR
+            | SYSLOG_ACTION_CLEAR
+            | SYSLOG_ACTION_CONSOLE_OFF
+            | SYSLOG_ACTION_CONSOLE_ON
+            | SYSLOG_ACTION_CONSOLE_LEVEL
+    );
+
+    if needs_cap && !super::capable(super::CAP_SYSLOG) && !super::capable(super::CAP_SYS_ADMIN) {
+        return EPERM;
+    }
+
+    match type_ {
+        SYSLOG_ACTION_CLOSE | SYSLOG_ACTION_OPEN => {
+            // No-op, just return success
+            0
+        }
+
+        SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
+            // Read from kernel log buffer
+            if buf == 0 || len == 0 {
+                return EINVAL;
+            }
+            if !A::access_ok(buf, len as usize) {
+                return EFAULT;
+            }
+
+            // For now, we don't have a kernel log buffer implementation
+            // Just return 0 bytes read (empty buffer)
+            0
+        }
+
+        SYSLOG_ACTION_CLEAR => {
+            // Clear the ring buffer - no-op for now
+            0
+        }
+
+        SYSLOG_ACTION_CONSOLE_OFF => {
+            // Disable console logging - no-op for now
+            0
+        }
+
+        SYSLOG_ACTION_CONSOLE_ON => {
+            // Enable console logging - no-op for now
+            0
+        }
+
+        SYSLOG_ACTION_CONSOLE_LEVEL => {
+            // Set console log level
+            // len parameter is the log level (1-8 typically)
+            if !(1..=8).contains(&len) {
+                return EINVAL;
+            }
+            // No-op for now
+            0
+        }
+
+        SYSLOG_ACTION_SIZE_UNREAD => {
+            // Return number of unread bytes
+            // We don't track this, so return 0
+            0
+        }
+
+        SYSLOG_ACTION_SIZE_BUFFER => {
+            // Return size of log buffer
+            // We don't have one, so return a reasonable default
+            0
+        }
+
+        _ => EINVAL,
+    }
+}
+
+// ============================================================================
+// pidfd syscalls
+// ============================================================================
+
+/// sys_pidfd_open - obtain a file descriptor for a process
+///
+/// # Arguments
+/// * `pid` - Process ID to obtain pidfd for
+/// * `flags` - Flags (PIDFD_NONBLOCK only)
+///
+/// # Returns
+/// * >= 0: File descriptor on success
+/// * -EINVAL: Invalid flags or pid
+/// * -ESRCH: No such process
+pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
+    // Validate flags - only O_NONBLOCK (0o4000) is allowed
+    const PIDFD_NONBLOCK: u32 = 0o4000;
+    if flags & !PIDFD_NONBLOCK != 0 {
+        return EINVAL;
+    }
+
+    // Validate pid
+    if pid <= 0 {
+        return EINVAL;
+    }
+
+    let target_pid = pid as Pid;
+
+    // Check if process exists
+    {
+        let table = super::percpu::TASK_TABLE.lock();
+        if !table.tasks.iter().any(|t| t.pid == target_pid) {
+            return ESRCH;
+        }
+    }
+
+    // Create pidfd
+    let pidfd_file = match crate::pidfd::create_pidfd(target_pid, flags) {
+        Ok(file) => file,
+        Err(_) => return -12, // ENOMEM
+    };
+
+    // Allocate FD in current task's FD table
+    let current_tid = super::percpu::current_tid();
+    let fd_table = match super::fdtable::get_task_fd(current_tid) {
+        Some(table) => table,
+        None => return ESRCH,
+    };
+
+    let mut table = fd_table.lock();
+
+    // Get NOFILE limit
+    let nofile = {
+        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
+        if limit == crate::rlimit::RLIM_INFINITY {
+            u64::MAX
+        } else {
+            limit
+        }
+    };
+
+    // Check if we need FD_CLOEXEC (O_CLOEXEC is 0o2000000)
+    let fd_flags = if flags & 0o2000000 != 0 {
+        super::FD_CLOEXEC
+    } else {
+        0
+    };
+
+    match table.alloc_with_flags(pidfd_file, fd_flags, nofile) {
+        Ok(fd) => fd as i64,
+        Err(e) => e as i64,
+    }
+}
+
+/// sys_pidfd_send_signal - send a signal to a process via a pidfd
+///
+/// # Arguments
+/// * `pidfd` - File descriptor referring to the target process
+/// * `sig` - Signal number to send
+/// * `info` - Optional siginfo_t pointer (not used currently)
+/// * `flags` - Flags (must be 0)
+///
+/// # Returns
+/// * 0 on success
+/// * -EBADF: Invalid file descriptor
+/// * -EINVAL: Invalid signal number or flags
+/// * -ESRCH: Process no longer exists
+pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i64 {
+    // Flags must be 0
+    if flags != 0 {
+        return EINVAL;
+    }
+
+    // Validate signal number (0 is allowed as a null signal for checking permissions)
+    if !(0..=64).contains(&sig) {
+        return EINVAL;
+    }
+
+    // Get the file from FD table
+    let current_tid = super::percpu::current_tid();
+    let fd_table = match super::fdtable::get_task_fd(current_tid) {
+        Some(table) => table,
+        None => return ESRCH,
+    };
+
+    let file = {
+        let table = fd_table.lock();
+        match table.get(pidfd) {
+            Some(file) => file,
+            None => return -9, // EBADF
+        }
+    };
+
+    // Validate it's a pidfd and get target PID
+    let target_pid = match crate::pidfd::get_pidfd_pid(&file) {
+        Some(pid) => pid,
+        None => return -9, // EBADF - not a pidfd
+    };
+
+    // Check if process still exists
+    {
+        let table = super::percpu::TASK_TABLE.lock();
+        if !table.tasks.iter().any(|t| t.pid == target_pid) {
+            return ESRCH;
+        }
+    }
+
+    // Signal 0 is a null signal - just check if process exists
+    if sig == 0 {
+        return 0;
+    }
+
+    // Send the signal
+    crate::signal::send_signal_to_process(target_pid, sig as u32) as i64
+}
+
+/// sys_pidfd_getfd - obtain a duplicate of another process's file descriptor
+///
+/// # Arguments
+/// * `pidfd` - File descriptor referring to the target process
+/// * `targetfd` - File descriptor in the target process to duplicate
+/// * `flags` - Flags (must be 0)
+///
+/// # Returns
+/// * >= 0: New file descriptor on success
+/// * -ENOSYS: Not implemented (requires PTRACE)
+///
+/// Note: This syscall requires PTRACE_MODE_ATTACH permissions which we don't
+/// implement yet. Return ENOSYS for now.
+pub fn sys_pidfd_getfd(_pidfd: i32, _targetfd: i32, _flags: u32) -> i64 {
+    -38 // ENOSYS
 }

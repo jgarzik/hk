@@ -278,6 +278,11 @@ pub fn tcp_alloc_port() -> u16 {
     crate::net::current_net_ns().alloc_port()
 }
 
+/// Look up a listening socket by port in the current namespace
+pub fn tcp_lookup_listener(local_port: u16) -> Option<Arc<Socket>> {
+    crate::net::current_net_ns().tcp_lookup_listener(local_port)
+}
+
 /// Initiate a TCP connection (active open)
 pub fn tcp_connect(
     socket: &Arc<Socket>,
@@ -289,7 +294,13 @@ pub fn tcp_connect(
 
     // Allocate local port
     let local_port = tcp_alloc_port();
-    let local_addr = config.ipv4_addr;
+
+    // For loopback destinations, use loopback as local address
+    let local_addr = if remote_addr.is_loopback() {
+        remote_addr // Use same loopback address
+    } else {
+        config.ipv4_addr
+    };
 
     // Set socket addresses
     socket.set_local(local_addr, local_port);

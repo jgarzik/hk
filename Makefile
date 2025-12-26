@@ -105,12 +105,16 @@ check: iso
 	@if [ ! -f /tmp/qemu_serial.log ]; then \
 		echo "Boot test FAILED - QEMU did not create serial log"; \
 		exit 1; \
-	elif grep -q "Powering off" /tmp/qemu_serial.log; then \
-		echo "Boot test PASSED"; \
-	else \
+	elif ! grep -q "Powering off" /tmp/qemu_serial.log; then \
 		echo "Boot test FAILED - 'Powering off' not found in serial log:"; \
 		cat /tmp/qemu_serial.log; \
 		exit 1; \
+	elif grep -q "FAIL" /tmp/qemu_serial.log; then \
+		echo "Boot test FAILED - test failures detected:"; \
+		grep "FAIL" /tmp/qemu_serial.log; \
+		exit 1; \
+	else \
+		echo "Boot test PASSED"; \
 	fi
 
 clean:
@@ -142,12 +146,16 @@ check-arm: build-arm
 	@if [ ! -f /tmp/qemu_serial_arm.log ]; then \
 		echo "ARM Boot test FAILED - QEMU did not create serial log"; \
 		exit 1; \
-	elif grep -q "Powering off" /tmp/qemu_serial_arm.log; then \
-		echo "ARM Boot test PASSED"; \
-	else \
-		echo "ARM Boot test FAILED - 'Powering off' not found in serial log:"; \
+	elif ! grep -qE "(Powering off|System shutdown via PSCI)" /tmp/qemu_serial_arm.log; then \
+		echo "ARM Boot test FAILED - shutdown message not found in serial log:"; \
 		cat /tmp/qemu_serial_arm.log; \
 		exit 1; \
+	elif grep -q "FAIL" /tmp/qemu_serial_arm.log; then \
+		echo "ARM Boot test FAILED - test failures detected:"; \
+		grep "FAIL" /tmp/qemu_serial_arm.log; \
+		exit 1; \
+	else \
+		echo "ARM Boot test PASSED"; \
 	fi
 
 info-arm: build-arm

@@ -10,6 +10,8 @@ pub mod syscall;
 ///
 /// These flags control what resources are shared between parent and child.
 pub mod clone_flags {
+    /// Return a pidfd for the child process
+    pub const CLONE_PIDFD: u64 = 0x00001000;
     /// Share virtual memory (address space) - creates a thread
     pub const CLONE_VM: u64 = 0x00000100;
     /// Share filesystem info (root, cwd, umask)
@@ -70,6 +72,8 @@ pub mod wait_options {
     pub const P_PID: i32 = 1;
     /// Wait for child in specific process group
     pub const P_PGID: i32 = 2;
+    /// Wait for child identified by pidfd
+    pub const P_PIDFD: i32 = 3;
 }
 
 use alloc::collections::BTreeMap;
@@ -103,7 +107,9 @@ pub type Gid = u32;
 ///
 /// Linux has multiple credential sets: real, effective, saved, filesystem.
 /// For permission checking, fsuid/fsgid are used. This tracks all eight IDs
-/// as Linux does.
+/// as Linux does, plus the five capability sets.
+///
+/// Mirrors Linux's `struct cred` from include/linux/cred.h
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cred {
     /// Real user ID
@@ -122,10 +128,22 @@ pub struct Cred {
     pub fsuid: Uid,
     /// Filesystem group ID (used for permission checks)
     pub fsgid: Gid,
+
+    // Capability sets (mirrors Linux's struct cred)
+    /// Capabilities children can inherit
+    pub cap_inheritable: KernelCap,
+    /// Capabilities we're permitted to use
+    pub cap_permitted: KernelCap,
+    /// Capabilities we can actually use (checked by capable())
+    pub cap_effective: KernelCap,
+    /// Capability bounding set (limits caps that can be gained)
+    pub cap_bset: KernelCap,
+    /// Ambient capability set (automatically inherited by children)
+    pub cap_ambient: KernelCap,
 }
 
 impl Cred {
-    /// Root credentials (uid=0, gid=0 for all fields)
+    /// Root credentials (uid=0, gid=0, full capabilities)
     pub const ROOT: Self = Self {
         uid: 0,
         gid: 0,
@@ -135,14 +153,26 @@ impl Cred {
         egid: 0,
         fsuid: 0,
         fsgid: 0,
+        cap_inheritable: CAP_FULL_SET,
+        cap_permitted: CAP_FULL_SET,
+        cap_effective: CAP_FULL_SET,
+        cap_bset: CAP_FULL_SET,
+        cap_ambient: CAP_EMPTY_SET, // Ambient starts empty even for root
     };
 
     /// Create credentials for a specific user/group
     ///
     /// Sets all credential fields (uid, suid, euid, fsuid) to the same value.
-    /// This is appropriate for new processes. For setuid binaries, suid/sgid
-    /// would be set differently during exec.
+    /// For root (uid=0), grants full capabilities.
+    /// For non-root, grants empty capabilities.
     pub const fn new(uid: Uid, gid: Gid) -> Self {
+        // Root gets full caps, non-root gets empty caps
+        let (caps, bset) = if uid == 0 {
+            (CAP_FULL_SET, CAP_FULL_SET)
+        } else {
+            (CAP_EMPTY_SET, CAP_FULL_SET) // Bounding set is full even for non-root
+        };
+
         Self {
             uid,
             gid,
@@ -152,6 +182,11 @@ impl Cred {
             egid: gid,
             fsuid: uid,
             fsgid: gid,
+            cap_inheritable: CAP_EMPTY_SET,
+            cap_permitted: caps,
+            cap_effective: caps,
+            cap_bset: bset,
+            cap_ambient: CAP_EMPTY_SET,
         }
     }
 
@@ -442,6 +477,67 @@ pub enum TaskState {
     Sleeping,
     /// Exited with status
     Zombie(i32),
+}
+
+// =============================================================================
+// prctl state (PR_SET_NAME, PR_SET_DUMPABLE, etc.)
+// =============================================================================
+
+/// prctl operation codes
+pub mod prctl_ops {
+    /// Get dumpable flag
+    pub const PR_GET_DUMPABLE: i32 = 3;
+    /// Set dumpable flag
+    pub const PR_SET_DUMPABLE: i32 = 4;
+    /// Set process name (comm)
+    pub const PR_SET_NAME: i32 = 15;
+    /// Get process name (comm)
+    pub const PR_GET_NAME: i32 = 16;
+    /// Set timer slack value (nanoseconds)
+    pub const PR_SET_TIMERSLACK: i32 = 29;
+    /// Get timer slack value (nanoseconds)
+    pub const PR_GET_TIMERSLACK: i32 = 30;
+    /// Disable privilege escalation via setuid/setgid (irreversible)
+    pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
+    /// Get no_new_privs flag
+    pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
+}
+
+/// Dumpable flag values for PR_SET_DUMPABLE
+pub mod dumpable {
+    /// Not dumpable
+    pub const SUID_DUMP_DISABLE: u8 = 0;
+    /// Dumpable by user (default)
+    pub const SUID_DUMP_USER: u8 = 1;
+    /// Dumpable by root only
+    pub const SUID_DUMP_ROOT: u8 = 2;
+}
+
+/// Per-task prctl state
+///
+/// Stores settings controlled by the prctl() syscall.
+/// These are per-thread (not shared across clone).
+#[derive(Clone)]
+pub struct PrctlState {
+    /// Thread/process name (PR_SET_NAME) - 16 bytes max, null-terminated
+    pub name: [u8; 16],
+    /// Dumpable flag (PR_SET_DUMPABLE) - controls core dump generation
+    pub dumpable: u8,
+    /// No-new-privileges flag (PR_SET_NO_NEW_PRIVS) - irreversible once set
+    pub no_new_privs: bool,
+    /// Timer slack in nanoseconds (PR_SET_TIMERSLACK)
+    pub timer_slack_ns: u64,
+}
+
+impl Default for PrctlState {
+    fn default() -> Self {
+        Self {
+            name: [0u8; 16],
+            dumpable: dumpable::SUID_DUMP_USER,
+            no_new_privs: false,
+            timer_slack_ns: 50_000, // 50 microseconds default
+        }
+    }
 }
 
 /// File descriptor number type
@@ -763,6 +859,19 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
 
     /// Robust futex list head address
     pub robust_list: u64,
+
+    // =========================================================================
+    // prctl state (not shared)
+    // =========================================================================
+    /// Per-task prctl state (name, dumpable, no_new_privs, timer_slack)
+    pub prctl: PrctlState,
+
+    // =========================================================================
+    // Personality (execution domain)
+    // =========================================================================
+    /// Process personality (execution domain, affects syscall behavior)
+    /// See personality(2). Default is 0 (PER_LINUX).
+    pub personality: u32,
 }
 
 impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {
@@ -783,31 +892,241 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
 }
 
 // =============================================================================
-// Linux capability constants (subset)
+// Linux capability system (full implementation)
 // =============================================================================
 
-/// CAP_IPC_LOCK - Lock memory (mlock, mlockall, etc.)
+/// Kernel capability set (64-bit bitmask)
+///
+/// Mirrors Linux's `kernel_cap_t` - a single 64-bit value that can hold
+/// all 41 Linux capabilities (CAP_CHOWN=0 through CAP_CHECKPOINT_RESTORE=40).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct KernelCap(pub u64);
+
+// POSIX-draft capabilities (0-7)
+/// Override chown restrictions
+pub const CAP_CHOWN: u32 = 0;
+/// Override DAC access restrictions
+pub const CAP_DAC_OVERRIDE: u32 = 1;
+/// Override DAC read/search restrictions
+pub const CAP_DAC_READ_SEARCH: u32 = 2;
+/// Override file ownership checks
+pub const CAP_FOWNER: u32 = 3;
+/// Override setuid/setgid bits
+pub const CAP_FSETID: u32 = 4;
+/// Override signal sending restrictions
+pub const CAP_KILL: u32 = 5;
+/// Allow setgid manipulation
+pub const CAP_SETGID: u32 = 6;
+/// Allow setuid manipulation
+pub const CAP_SETUID: u32 = 7;
+
+// Linux-specific capabilities (8-40)
+/// Transfer/remove capabilities
+pub const CAP_SETPCAP: u32 = 8;
+/// Modify S_IMMUTABLE and S_APPEND attributes
+pub const CAP_LINUX_IMMUTABLE: u32 = 9;
+/// Bind to ports below 1024
+pub const CAP_NET_BIND_SERVICE: u32 = 10;
+/// Allow broadcasting/multicasting
+pub const CAP_NET_BROADCAST: u32 = 11;
+/// Allow network administration
+pub const CAP_NET_ADMIN: u32 = 12;
+/// Allow raw sockets
+pub const CAP_NET_RAW: u32 = 13;
+/// Lock memory (mlock, mlockall, etc.)
 pub const CAP_IPC_LOCK: u32 = 14;
-/// CAP_SYS_ADMIN - System administration capabilities
+/// Override IPC ownership checks
+pub const CAP_IPC_OWNER: u32 = 15;
+/// Insert/remove kernel modules
+pub const CAP_SYS_MODULE: u32 = 16;
+/// Allow raw I/O access
+pub const CAP_SYS_RAWIO: u32 = 17;
+/// Use chroot()
+pub const CAP_SYS_CHROOT: u32 = 18;
+/// Allow ptrace of any process
+pub const CAP_SYS_PTRACE: u32 = 19;
+/// Configure process accounting
+pub const CAP_SYS_PACCT: u32 = 20;
+/// System administration capabilities
 pub const CAP_SYS_ADMIN: u32 = 21;
-/// CAP_SYS_NICE - Raise process nice value, set real-time priorities
+/// Use reboot()
+pub const CAP_SYS_BOOT: u32 = 22;
+/// Raise process nice value, set real-time priorities
 pub const CAP_SYS_NICE: u32 = 23;
-/// CAP_SYS_RESOURCE - Override resource limits
+/// Override resource limits
 pub const CAP_SYS_RESOURCE: u32 = 24;
+/// Manipulate system clock
+pub const CAP_SYS_TIME: u32 = 25;
+/// Configure TTY devices
+pub const CAP_SYS_TTY_CONFIG: u32 = 26;
+/// Privileged mknod operations
+pub const CAP_MKNOD: u32 = 27;
+/// Take file leases
+pub const CAP_LEASE: u32 = 28;
+/// Write to audit log
+pub const CAP_AUDIT_WRITE: u32 = 29;
+/// Configure audit
+pub const CAP_AUDIT_CONTROL: u32 = 30;
+/// Set file capabilities
+pub const CAP_SETFCAP: u32 = 31;
+/// Override MAC access
+pub const CAP_MAC_OVERRIDE: u32 = 32;
+/// Configure MAC
+pub const CAP_MAC_ADMIN: u32 = 33;
+/// Configure syslog
+pub const CAP_SYSLOG: u32 = 34;
+/// Trigger wake alarms
+pub const CAP_WAKE_ALARM: u32 = 35;
+/// Prevent system suspend
+pub const CAP_BLOCK_SUSPEND: u32 = 36;
+/// Read audit log
+pub const CAP_AUDIT_READ: u32 = 37;
+/// Performance monitoring
+pub const CAP_PERFMON: u32 = 38;
+/// BPF operations
+pub const CAP_BPF: u32 = 39;
+/// Checkpoint/restore operations
+pub const CAP_CHECKPOINT_RESTORE: u32 = 40;
+
+/// Last valid capability number
+pub const CAP_LAST_CAP: u32 = CAP_CHECKPOINT_RESTORE;
+
+/// Bitmask of all valid capabilities
+pub const CAP_VALID_MASK: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
+
+/// Full capability set (all capabilities enabled)
+pub const CAP_FULL_SET: KernelCap = KernelCap(CAP_VALID_MASK);
+
+/// Empty capability set (no capabilities enabled)
+pub const CAP_EMPTY_SET: KernelCap = KernelCap(0);
+
+impl KernelCap {
+    /// Create a new empty capability set
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Create a new full capability set
+    pub const fn full() -> Self {
+        Self(CAP_VALID_MASK)
+    }
+
+    /// Check if a capability is set
+    #[inline]
+    pub const fn has(&self, cap: u32) -> bool {
+        if cap > CAP_LAST_CAP {
+            return false;
+        }
+        (self.0 & (1u64 << cap)) != 0
+    }
+
+    /// Raise (enable) a capability
+    #[inline]
+    pub fn raise(&mut self, cap: u32) {
+        if cap <= CAP_LAST_CAP {
+            self.0 |= 1u64 << cap;
+        }
+    }
+
+    /// Drop (disable) a capability
+    #[inline]
+    pub fn drop(&mut self, cap: u32) {
+        if cap <= CAP_LAST_CAP {
+            self.0 &= !(1u64 << cap);
+        }
+    }
+
+    /// Check if this set is a subset of another
+    #[inline]
+    pub const fn is_subset(&self, superset: &KernelCap) -> bool {
+        (self.0 & !superset.0) == 0
+    }
+
+    /// Intersect two capability sets
+    #[inline]
+    pub const fn intersect(&self, other: &KernelCap) -> KernelCap {
+        KernelCap(self.0 & other.0)
+    }
+
+    /// Union two capability sets
+    #[inline]
+    pub const fn union(&self, other: &KernelCap) -> KernelCap {
+        KernelCap(self.0 | other.0)
+    }
+
+    /// Get lower 32 bits (for syscall ABI)
+    #[inline]
+    pub const fn low(&self) -> u32 {
+        self.0 as u32
+    }
+
+    /// Get upper 32 bits (for syscall ABI)
+    #[inline]
+    pub const fn high(&self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    /// Create from low and high 32-bit values (for syscall ABI)
+    #[inline]
+    pub const fn from_u32s(low: u32, high: u32) -> Self {
+        Self((low as u64) | ((high as u64) << 32))
+    }
+}
+
+// Linux capability version constants (for syscall ABI)
+/// Legacy 32-bit capability version
+pub const _LINUX_CAPABILITY_VERSION_1: u32 = 0x19980330;
+/// Deprecated 64-bit capability version
+pub const _LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026;
+/// Current 64-bit capability version
+pub const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+/// Number of u32s per capability set in version 3
+pub const _LINUX_CAPABILITY_U32S_3: usize = 2;
+
+/// User-space capability header (for syscall ABI)
+///
+/// Matches Linux's `struct __user_cap_header_struct`
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CapUserHeader {
+    pub version: u32,
+    pub pid: i32,
+}
+
+/// User-space capability data (for syscall ABI)
+///
+/// Matches Linux's `struct __user_cap_data_struct`
+/// Note: For version 3, userspace provides an array of 2 of these
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CapUserData {
+    pub effective: u32,
+    pub permitted: u32,
+    pub inheritable: u32,
+}
+
+/// Check if a capability number is valid
+#[inline]
+pub const fn cap_valid(cap: u32) -> bool {
+    cap <= CAP_LAST_CAP
+}
 
 /// Check if the current task has a specific capability
 ///
-/// Currently simplified: all capabilities are granted when euid == 0 (root).
-/// A full capability system would track per-task capability bitmasks.
+/// Checks the effective capability set of the current task.
+/// This is the Linux-compatible capability check function.
 ///
 /// # Arguments
-/// * `_cap` - The capability constant (CAP_IPC_LOCK, CAP_SYS_RESOURCE, etc.)
+/// * `cap` - The capability constant (CAP_IPC_LOCK, CAP_SYS_RESOURCE, etc.)
 ///
 /// # Returns
-/// true if the current task has the capability
-#[allow(unused_variables)]
-pub fn capable(_cap: u32) -> bool {
-    percpu::current_cred().euid == 0
+/// true if the current task has the capability in its effective set
+pub fn capable(cap: u32) -> bool {
+    if cap > CAP_LAST_CAP {
+        return false;
+    }
+    percpu::current_cred().cap_effective.has(cap)
 }
 
 // =============================================================================
