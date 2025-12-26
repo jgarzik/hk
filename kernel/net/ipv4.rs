@@ -357,7 +357,8 @@ pub fn ip_queue_xmit(mut skb: Box<SkBuff>, protocol: u8) -> Result<(), NetError>
     };
 
     // Loopback shortcut: deliver locally without going through network device
-    if daddr.is_loopback() || daddr == saddr {
+    let is_local = daddr.is_loopback() || daddr == config.ipv4_addr || daddr == saddr;
+    if is_local {
         // Build IP header for loopback
         let payload_len = skb.len();
         let tot_len = (IP_HLEN_MIN + payload_len) as u16;

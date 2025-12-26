@@ -78,6 +78,15 @@ pub struct PerCpu {
     pub syscall_user_r13: u64,
     pub syscall_user_r14: u64,
     pub syscall_user_r15: u64,
+
+    /// Saved caller-saved/argument registers from syscall entry
+    /// Linux ABI preserves these across syscalls, so fork() child must inherit them
+    pub syscall_user_rdi: u64,
+    pub syscall_user_rsi: u64,
+    pub syscall_user_rdx: u64,
+    pub syscall_user_r8: u64,
+    pub syscall_user_r9: u64,
+    pub syscall_user_r10: u64,
 }
 
 impl PerCpu {
@@ -105,6 +114,12 @@ impl PerCpu {
             syscall_user_r13: 0,
             syscall_user_r14: 0,
             syscall_user_r15: 0,
+            syscall_user_rdi: 0,
+            syscall_user_rsi: 0,
+            syscall_user_rdx: 0,
+            syscall_user_r8: 0,
+            syscall_user_r9: 0,
+            syscall_user_r10: 0,
         }
     }
 
@@ -442,6 +457,51 @@ pub fn get_syscall_user_callee_saved() -> (u64, u64, u64, u64, u64, u64) {
                 percpu.syscall_user_r13,
                 percpu.syscall_user_r14,
                 percpu.syscall_user_r15,
+            )
+        })
+        .unwrap_or((0, 0, 0, 0, 0, 0))
+}
+
+/// Save caller-saved/argument registers for fork()
+///
+/// Linux syscall ABI preserves these across syscalls, so the child
+/// must inherit the parent's values. Called from syscall entry.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn save_syscall_caller_saved(
+    user_rdi: u64,
+    user_rsi: u64,
+    user_rdx: u64,
+    user_r8: u64,
+    user_r9: u64,
+    user_r10: u64,
+) {
+    if let Some(_percpu) = try_current_cpu() {
+        unsafe {
+            let percpu_mut = current_cpu_mut();
+            percpu_mut.syscall_user_rdi = user_rdi;
+            percpu_mut.syscall_user_rsi = user_rsi;
+            percpu_mut.syscall_user_rdx = user_rdx;
+            percpu_mut.syscall_user_r8 = user_r8;
+            percpu_mut.syscall_user_r9 = user_r9;
+            percpu_mut.syscall_user_r10 = user_r10;
+        }
+    }
+}
+
+/// Get saved syscall user caller-saved registers
+/// Returns (rdi, rsi, rdx, r8, r9, r10)
+#[inline]
+pub fn get_syscall_user_caller_saved() -> (u64, u64, u64, u64, u64, u64) {
+    try_current_cpu()
+        .map(|percpu| {
+            (
+                percpu.syscall_user_rdi,
+                percpu.syscall_user_rsi,
+                percpu.syscall_user_rdx,
+                percpu.syscall_user_r8,
+                percpu.syscall_user_r9,
+                percpu.syscall_user_r10,
             )
         })
         .unwrap_or((0, 0, 0, 0, 0, 0))

@@ -141,9 +141,15 @@ pub fn udp_sendmsg(
     let (src_addr, src_port) = match socket.local_addr() {
         Some((addr, port)) => {
             if port == 0 {
-                // Need to allocate ephemeral port
+                // Need to allocate ephemeral port and register for receiving
                 let port = crate::net::current_net_ns().alloc_port();
                 socket.set_local(addr, port);
+                // Register socket so we can receive replies
+                let tuple = UdpTwoTuple {
+                    local_addr: addr,
+                    local_port: port,
+                };
+                udp_register_socket(tuple, Arc::clone(socket));
                 (addr, port)
             } else {
                 (addr, port)
@@ -154,6 +160,12 @@ pub fn udp_sendmsg(
             let config = crate::net::get_config().ok_or(NetError::InvalidArgument)?;
             let port = crate::net::current_net_ns().alloc_port();
             socket.set_local(config.ipv4_addr, port);
+            // Register socket so we can receive replies
+            let tuple = UdpTwoTuple {
+                local_addr: config.ipv4_addr,
+                local_port: port,
+            };
+            udp_register_socket(tuple, Arc::clone(socket));
             (config.ipv4_addr, port)
         }
     };

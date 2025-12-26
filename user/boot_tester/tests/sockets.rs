@@ -4,9 +4,10 @@
 
 use hk_syscall::{
     sys_close, sys_socket, sys_bind, sys_listen, sys_shutdown,
-    sys_getsockname, sys_socketpair, sys_sendmsg,
-    SockAddrIn, MsgHdr, IoVec, AF_INET, SOCK_STREAM, SOCK_DGRAM, SOCK_NONBLOCK,
-    SHUT_RD, SHUT_WR, SHUT_RDWR, htons,
+    sys_getsockname, sys_socketpair, sys_sendmsg, sys_sendto, sys_recvfrom,
+    sys_fork, sys_wait4, sys_exit, sys_nanosleep,
+    SockAddrIn, MsgHdr, IoVec, Timespec, AF_INET, SOCK_STREAM, SOCK_DGRAM, SOCK_NONBLOCK,
+    SHUT_RD, SHUT_WR, SHUT_RDWR, htons, htonl, make_ipv4,
 };
 use super::helpers::{print, println, print_num};
 
@@ -30,6 +31,9 @@ pub fn run_tests() {
     // New syscall tests
     test_socketpair();
     test_sendmsg_recvmsg();
+
+    // UDP data transfer tests
+    test_udp_loopback();
 }
 
 /// Test basic socket creation
@@ -396,5 +400,145 @@ fn test_sendmsg_recvmsg() {
         println(b"SENDMSG_RECVMSG:OK");
     } else {
         println(b"SENDMSG_RECVMSG:FAIL");
+    }
+}
+
+/// Fork-based UDP loopback test - client/server exchange
+fn test_udp_loopback() {
+    const PORT: u16 = 8899;
+
+    // Create server socket first (before fork)
+    let server_fd = sys_socket(AF_INET, SOCK_DGRAM, 0);
+    if server_fd < 0 {
+        println(b"UDP_LOOPBACK:FAIL");
+        return;
+    }
+
+    // Bind server socket to loopback address
+    let server_addr = SockAddrIn::new(
+        AF_INET as u16,
+        htons(PORT),
+        htonl(make_ipv4(127, 0, 0, 1)),
+    );
+    let ret = sys_bind(
+        server_fd as i32,
+        &server_addr as *const SockAddrIn as *const u8,
+        core::mem::size_of::<SockAddrIn>() as u32,
+    );
+    if ret < 0 {
+        sys_close(server_fd as u64);
+        println(b"UDP_LOOPBACK:FAIL");
+        return;
+    }
+
+    let pid = sys_fork();
+    if pid < 0 {
+        sys_close(server_fd as u64);
+        println(b"UDP_LOOPBACK:FAIL (fork failed)");
+        return;
+    }
+
+    if pid == 0 {
+        // Child process - client
+        sys_close(server_fd as u64);
+
+        // Create client socket
+        let client_fd = sys_socket(AF_INET, SOCK_DGRAM, 0);
+        if client_fd < 0 {
+            sys_exit(1);
+        }
+
+        // Destination address
+        let dest_addr = SockAddrIn::new(
+            AF_INET as u16,
+            htons(PORT),
+            htonl(make_ipv4(127, 0, 0, 1)),
+        );
+
+        // Send data to server
+        let msg = b"Hello UDP";
+        let sent = sys_sendto(
+            client_fd as i32,
+            msg.as_ptr(),
+            msg.len(),
+            0,
+            &dest_addr as *const SockAddrIn as *const u8,
+            core::mem::size_of::<SockAddrIn>() as u32,
+        );
+
+        if sent as usize != msg.len() {
+            sys_close(client_fd as u64);
+            sys_exit(1);
+        }
+
+        // Receive response from server
+        let mut buf = [0u8; 64];
+        let n = sys_recvfrom(
+            client_fd as i32,
+            buf.as_mut_ptr(),
+            buf.len(),
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+
+        sys_close(client_fd as u64);
+
+        // Check response
+        let expected = b"UDP reply";
+        if n as usize == expected.len() && &buf[..n as usize] == expected {
+            sys_exit(0);
+        } else {
+            sys_exit(1);
+        }
+    } else {
+        // Parent process - server
+
+        // Brief delay to let child start
+        let delay = Timespec { tv_sec: 0, tv_nsec: 10_000_000 }; // 10ms
+        sys_nanosleep(&delay, core::ptr::null_mut());
+
+        // Receive data from client
+        let mut buf = [0u8; 64];
+        let mut client_addr = SockAddrIn::new(0, 0, 0);
+        let mut addrlen: u32 = core::mem::size_of::<SockAddrIn>() as u32;
+
+        let n = sys_recvfrom(
+            server_fd as i32,
+            buf.as_mut_ptr(),
+            buf.len(),
+            0,
+            &mut client_addr as *mut SockAddrIn as *mut u8,
+            &mut addrlen,
+        );
+
+        if n > 0 {
+            // Verify received message
+            let expected = b"Hello UDP";
+            if n as usize == expected.len() && &buf[..n as usize] == expected {
+                // Send response back to client
+                let response = b"UDP reply";
+                sys_sendto(
+                    server_fd as i32,
+                    response.as_ptr(),
+                    response.len(),
+                    0,
+                    &client_addr as *const SockAddrIn as *const u8,
+                    core::mem::size_of::<SockAddrIn>() as u32,
+                );
+            }
+        }
+
+        sys_close(server_fd as u64);
+
+        // Wait for child and check status
+        let mut status: i32 = 0;
+        sys_wait4(-1, &mut status, 0, 0);
+
+        if (status >> 8) == 0 {
+            println(b"UDP_LOOPBACK:OK");
+        } else {
+            println(b"UDP_LOOPBACK:FAIL");
+        }
     }
 }

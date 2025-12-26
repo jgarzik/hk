@@ -605,8 +605,9 @@ fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
     } else {
         // Exclusive page (refcount == 1): just restore writable, clear COW flag
         let new_flags = (old_flags & !PAGE_COW) | PAGE_WRITABLE;
+        let new_pte = old_phys | new_flags;
         unsafe {
-            core::ptr::write_volatile(pte_ptr, old_phys | new_flags);
+            core::ptr::write_volatile(pte_ptr, new_pte);
         }
     }
 

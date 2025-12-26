@@ -816,6 +816,17 @@ unsafe extern "C" fn syscall_entry() {
         // Remove stack args
         "add rsp, 24",
 
+        // Save caller-saved registers for fork() (Linux ABI preserves these across syscalls)
+        // save_syscall_caller_saved(rdi, rsi, rdx, r8, r9, r10)
+        // Stack layout: [r9, r8, r10, rdx, rsi, rdi, rax, ...]
+        "mov rdi, [rsp + 40]",   // saved RDI
+        "mov rsi, [rsp + 32]",   // saved RSI
+        "mov rdx, [rsp + 24]",   // saved RDX
+        "mov rcx, [rsp + 8]",    // saved R8
+        "mov r8, [rsp + 0]",     // saved R9
+        "mov r9, [rsp + 16]",    // saved R10
+        "call {save_syscall_caller_saved}",
+
         // Now set up arguments for C handler
         // syscall_handler(num, arg0, arg1, arg2, arg3, arg4, arg5)
         // C ABI: rdi, rsi, rdx, rcx, r8, r9, [stack]
@@ -915,6 +926,7 @@ unsafe extern "C" fn syscall_entry() {
         handler = sym syscall_handler,
         kstack = sym SYSCALL_KERNEL_STACK,
         save_syscall_state = sym super::percpu::save_syscall_state,
+        save_syscall_caller_saved = sym super::percpu::save_syscall_caller_saved,
     );
 }
 
