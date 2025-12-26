@@ -1863,3 +1863,64 @@ pub fn sys_io_uring_enter(
 pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i64 {
     unsafe { syscall4!(SYS_IO_URING_REGISTER, fd, opcode, arg, nr_args) }
 }
+
+// ============================================================================
+// Keyring syscalls (Section 10.3)
+// ============================================================================
+
+/// add_key syscall number (x86_64)
+pub const SYS_ADD_KEY: u64 = 248;
+/// request_key syscall number (x86_64)
+pub const SYS_REQUEST_KEY: u64 = 249;
+/// keyctl syscall number (x86_64)
+pub const SYS_KEYCTL: u64 = 250;
+
+/// add_key(type, description, payload, plen, keyring) - create a key
+///
+/// Creates a new key of the specified type with the given description and
+/// payload, and links it to the specified keyring.
+///
+/// Returns the key serial number on success, or a negative error code.
+#[inline(always)]
+pub fn sys_add_key(
+    key_type: *const u8,
+    description: *const u8,
+    payload: *const u8,
+    plen: usize,
+    keyring: i32,
+) -> i64 {
+    unsafe { syscall5!(SYS_ADD_KEY, key_type, description, payload, plen, keyring) }
+}
+
+/// request_key(type, description, callout_info, dest_keyring) - search for a key
+///
+/// Searches the process keyrings for a key of the specified type and description.
+/// If found, returns the key serial number. If not found and callout_info is
+/// provided, a userspace helper may be invoked (not supported in hk).
+///
+/// Returns the key serial number on success, or a negative error code.
+#[inline(always)]
+pub fn sys_request_key(
+    key_type: *const u8,
+    description: *const u8,
+    callout_info: *const u8,
+    dest_keyring: i32,
+) -> i64 {
+    unsafe { syscall4!(SYS_REQUEST_KEY, key_type, description, callout_info, dest_keyring) }
+}
+
+/// keyctl(cmd, arg2, arg3, arg4, arg5) - key management operations
+///
+/// Performs various key management operations based on the cmd parameter.
+/// Common commands include:
+/// - KEYCTL_GET_KEYRING_ID (0): Get keyring ID
+/// - KEYCTL_READ (11): Read key payload
+/// - KEYCTL_DESCRIBE (6): Describe a key
+/// - KEYCTL_LINK (8): Link key to keyring
+/// - KEYCTL_UNLINK (9): Unlink key from keyring
+///
+/// Returns operation-specific value on success, or a negative error code.
+#[inline(always)]
+pub fn sys_keyctl(cmd: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    unsafe { syscall5!(SYS_KEYCTL, cmd, arg2, arg3, arg4, arg5) }
+}

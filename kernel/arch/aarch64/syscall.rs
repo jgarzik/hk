@@ -440,6 +440,14 @@ pub const SYS_SHMAT: u64 = 196;
 /// shmdt(shmaddr)
 pub const SYS_SHMDT: u64 = 197;
 
+// Keyring syscalls (Section 10.3)
+/// add_key(type, description, payload, plen, keyring)
+pub const SYS_ADD_KEY: u64 = 217;
+/// request_key(type, description, callout_info, dest_keyring)
+pub const SYS_REQUEST_KEY: u64 = 218;
+/// keyctl(cmd, arg2, arg3, arg4, arg5)
+pub const SYS_KEYCTL: u64 = 219;
+
 // ============================================================================
 // Syscall dispatcher
 // ============================================================================
@@ -1113,6 +1121,11 @@ pub fn aarch64_syscall_dispatch(
                 as u64
         }
         SYS_MSGCTL => crate::ipc::sys_msgctl(arg0 as i32, arg1 as i32, arg2) as u64,
+
+        // Keyring syscalls (Section 10.3)
+        SYS_ADD_KEY => crate::keys::sys_add_key(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
+        SYS_REQUEST_KEY => crate::keys::sys_request_key(arg0, arg1, arg2, arg3 as i32) as u64,
+        SYS_KEYCTL => crate::keys::sys_keyctl(arg0 as i32, arg1, arg2, arg3, arg4) as u64,
 
         // Unimplemented syscalls
         _ => {

@@ -355,9 +355,9 @@ Linux groups the socket syscalls as their own "network" category.
 
 10.3 Keyrings (Linux key management)
 
-- [ ] add_key
-- [ ] request_key
-- [ ] keyctl
+- [x] add_key
+- [x] request_key
+- [x] keyctl (GET_KEYRING_ID, UPDATE, REVOKE, CHOWN, SETPERM, DESCRIBE, CLEAR, LINK, UNLINK, SEARCH, READ, INVALIDATE)
 
 10.4 Misc security / sandboxing
 

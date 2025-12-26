@@ -612,6 +612,14 @@ pub const SYS_PIDFD_OPEN: u64 = 434;
 /// pidfd_getfd(pidfd, targetfd, flags) - Get file descriptor from another process
 pub const SYS_PIDFD_GETFD: u64 = 438;
 
+// Keyring syscalls (Section 10.3)
+/// add_key(type, description, payload, plen, keyring)
+pub const SYS_ADD_KEY: u64 = 248;
+/// request_key(type, description, callout_info, dest_keyring)
+pub const SYS_REQUEST_KEY: u64 = 249;
+/// keyctl(cmd, arg2, arg3, arg4, arg5)
+pub const SYS_KEYCTL: u64 = 250;
+
 /// Model Specific Registers for syscall
 const MSR_EFER: u32 = 0xC000_0080; // Extended Feature Enable Register
 const MSR_STAR: u32 = 0xC000_0081; // Segment selectors for syscall/sysret
@@ -1842,6 +1850,11 @@ pub fn x86_64_syscall_dispatch(
                 as u64
         }
         SYS_MSGCTL => crate::ipc::sys_msgctl(arg0 as i32, arg1 as i32, arg2) as u64,
+
+        // Keyring syscalls (Section 10.3)
+        SYS_ADD_KEY => crate::keys::sys_add_key(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
+        SYS_REQUEST_KEY => crate::keys::sys_request_key(arg0, arg1, arg2, arg3 as i32) as u64,
+        SYS_KEYCTL => crate::keys::sys_keyctl(arg0 as i32, arg1, arg2, arg3, arg4) as u64,
 
         _ => (-38i64) as u64, // ENOSYS
     }

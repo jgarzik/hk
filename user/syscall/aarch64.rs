@@ -2132,3 +2132,65 @@ pub fn sys_io_uring_enter(
 pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i64 {
     unsafe { syscall4!(SYS_IO_URING_REGISTER, fd, opcode, arg, nr_args) }
 }
+
+// Keyring syscalls
+pub const SYS_ADD_KEY: u64 = 217;
+pub const SYS_REQUEST_KEY: u64 = 218;
+pub const SYS_KEYCTL: u64 = 219;
+
+/// add_key(type, description, payload, plen, keyring) - add a key to the kernel's key management facility
+///
+/// Creates a new key of the specified type with the given description and payload,
+/// and links it to the specified keyring.
+///
+/// - type_ptr: pointer to NUL-terminated key type name (e.g., "user", "keyring")
+/// - desc_ptr: pointer to NUL-terminated key description
+/// - payload_ptr: pointer to the key payload data
+/// - plen: length of the payload in bytes
+/// - keyring: destination keyring (KEY_SPEC_* or positive serial number)
+///
+/// Returns the key serial number on success, or a negative error code.
+#[inline(always)]
+pub fn sys_add_key(
+    type_ptr: *const u8,
+    desc_ptr: *const u8,
+    payload_ptr: *const u8,
+    plen: usize,
+    keyring: i32,
+) -> i64 {
+    unsafe { syscall5!(SYS_ADD_KEY, type_ptr, desc_ptr, payload_ptr, plen, keyring) }
+}
+
+/// request_key(type, description, callout_info, dest_keyring) - request a key from the kernel
+///
+/// Searches for a key of the specified type and description in the process keyrings.
+/// If found, the key is linked to the destination keyring (if specified).
+///
+/// - type_ptr: pointer to NUL-terminated key type name
+/// - desc_ptr: pointer to NUL-terminated key description
+/// - callout_info_ptr: pointer to callout info (can be NULL)
+/// - dest_keyring: destination keyring to link found key (0 for none)
+///
+/// Returns the key serial number on success, or a negative error code.
+#[inline(always)]
+pub fn sys_request_key(
+    type_ptr: *const u8,
+    desc_ptr: *const u8,
+    callout_info_ptr: *const u8,
+    dest_keyring: i32,
+) -> i64 {
+    unsafe { syscall4!(SYS_REQUEST_KEY, type_ptr, desc_ptr, callout_info_ptr, dest_keyring) }
+}
+
+/// keyctl(cmd, arg2, arg3, arg4, arg5) - manipulate the kernel's key management facility
+///
+/// Performs various operations on keys and keyrings based on the command.
+///
+/// - cmd: KEYCTL_* command
+/// - arg2-arg5: command-specific arguments
+///
+/// Returns command-specific value on success, or a negative error code.
+#[inline(always)]
+pub fn sys_keyctl(cmd: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    unsafe { syscall5!(SYS_KEYCTL, cmd, arg2, arg3, arg4, arg5) }
+}

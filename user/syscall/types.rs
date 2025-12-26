@@ -1813,3 +1813,130 @@ pub struct IoUringCqe {
     pub res: i32,
     pub flags: u32,
 }
+
+// ============================================================================
+// Keyring types and constants
+// ============================================================================
+
+// Special keyring IDs (KEY_SPEC_*)
+/// Thread-specific keyring
+pub const KEY_SPEC_THREAD_KEYRING: i32 = -1;
+/// Process-specific keyring
+pub const KEY_SPEC_PROCESS_KEYRING: i32 = -2;
+/// Session keyring
+pub const KEY_SPEC_SESSION_KEYRING: i32 = -3;
+/// User-specific keyring
+pub const KEY_SPEC_USER_KEYRING: i32 = -4;
+/// User default session keyring
+pub const KEY_SPEC_USER_SESSION_KEYRING: i32 = -5;
+/// Group-specific keyring
+pub const KEY_SPEC_GROUP_KEYRING: i32 = -6;
+/// Requestor's thread keyring
+pub const KEY_SPEC_REQKEY_AUTH_KEY: i32 = -7;
+
+// Keyctl commands (KEYCTL_*)
+/// Get keyring ID
+pub const KEYCTL_GET_KEYRING_ID: i32 = 0;
+/// Join session keyring
+pub const KEYCTL_JOIN_SESSION_KEYRING: i32 = 1;
+/// Update key payload
+pub const KEYCTL_UPDATE: i32 = 2;
+/// Revoke key
+pub const KEYCTL_REVOKE: i32 = 3;
+/// Change key ownership
+pub const KEYCTL_CHOWN: i32 = 4;
+/// Set key permissions
+pub const KEYCTL_SETPERM: i32 = 5;
+/// Describe key
+pub const KEYCTL_DESCRIBE: i32 = 6;
+/// Clear keyring contents
+pub const KEYCTL_CLEAR: i32 = 7;
+/// Link key to keyring
+pub const KEYCTL_LINK: i32 = 8;
+/// Unlink key from keyring
+pub const KEYCTL_UNLINK: i32 = 9;
+/// Search keyring tree
+pub const KEYCTL_SEARCH: i32 = 10;
+/// Read key payload
+pub const KEYCTL_READ: i32 = 11;
+/// Instantiate key
+pub const KEYCTL_INSTANTIATE: i32 = 12;
+/// Negate key
+pub const KEYCTL_NEGATE: i32 = 13;
+/// Set key timeout
+pub const KEYCTL_SET_TIMEOUT: i32 = 14;
+/// Assume request_key authority
+pub const KEYCTL_ASSUME_AUTHORITY: i32 = 15;
+/// Get key security label
+pub const KEYCTL_GET_SECURITY: i32 = 17;
+/// Start session management
+pub const KEYCTL_SESSION_TO_PARENT: i32 = 18;
+/// Reject key
+pub const KEYCTL_REJECT: i32 = 19;
+/// Instantiate key with iovec
+pub const KEYCTL_INSTANTIATE_IOV: i32 = 20;
+/// Invalidate key
+pub const KEYCTL_INVALIDATE: i32 = 21;
+/// Get persistent keyring
+pub const KEYCTL_GET_PERSISTENT: i32 = 22;
+
+// Key permission bits
+/// Possessor can view key attributes
+pub const KEY_POS_VIEW: u32 = 0x01000000;
+/// Possessor can read key payload
+pub const KEY_POS_READ: u32 = 0x02000000;
+/// Possessor can update key
+pub const KEY_POS_WRITE: u32 = 0x04000000;
+/// Possessor can search keyring
+pub const KEY_POS_SEARCH: u32 = 0x08000000;
+/// Possessor can link key
+pub const KEY_POS_LINK: u32 = 0x10000000;
+/// Possessor can set key attributes
+pub const KEY_POS_SETATTR: u32 = 0x20000000;
+/// All possessor permissions
+pub const KEY_POS_ALL: u32 = 0x3f000000;
+
+/// User can view key attributes
+pub const KEY_USR_VIEW: u32 = 0x00010000;
+/// User can read key payload
+pub const KEY_USR_READ: u32 = 0x00020000;
+/// User can update key
+pub const KEY_USR_WRITE: u32 = 0x00040000;
+/// User can search keyring
+pub const KEY_USR_SEARCH: u32 = 0x00080000;
+/// User can link key
+pub const KEY_USR_LINK: u32 = 0x00100000;
+/// User can set key attributes
+pub const KEY_USR_SETATTR: u32 = 0x00200000;
+/// All user permissions
+pub const KEY_USR_ALL: u32 = 0x003f0000;
+
+/// Group can view key attributes
+pub const KEY_GRP_VIEW: u32 = 0x00000100;
+/// Group can read key payload
+pub const KEY_GRP_READ: u32 = 0x00000200;
+/// Group can update key
+pub const KEY_GRP_WRITE: u32 = 0x00000400;
+/// Group can search keyring
+pub const KEY_GRP_SEARCH: u32 = 0x00000800;
+/// Group can link key
+pub const KEY_GRP_LINK: u32 = 0x00001000;
+/// Group can set key attributes
+pub const KEY_GRP_SETATTR: u32 = 0x00002000;
+/// All group permissions
+pub const KEY_GRP_ALL: u32 = 0x00003f00;
+
+/// Others can view key attributes
+pub const KEY_OTH_VIEW: u32 = 0x00000001;
+/// Others can read key payload
+pub const KEY_OTH_READ: u32 = 0x00000002;
+/// Others can update key
+pub const KEY_OTH_WRITE: u32 = 0x00000004;
+/// Others can search keyring
+pub const KEY_OTH_SEARCH: u32 = 0x00000008;
+/// Others can link key
+pub const KEY_OTH_LINK: u32 = 0x00000010;
+/// Others can set key attributes
+pub const KEY_OTH_SETATTR: u32 = 0x00000020;
+/// All other permissions
+pub const KEY_OTH_ALL: u32 = 0x0000003f;
