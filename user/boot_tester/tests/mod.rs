@@ -32,6 +32,7 @@ pub mod clone3_syslog;
 pub mod pidfd;
 pub mod swap;
 pub mod adjtimex;
+pub mod io_uring;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -63,4 +64,5 @@ pub fn run_all_tests() {
     pidfd::run_tests();
     swap::run_tests();
     adjtimex::run_tests();
+    io_uring::run_tests();
 }

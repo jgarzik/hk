@@ -324,11 +324,11 @@ Linux groups the socket syscalls as their own "network" category.
 - [ ] fanotify_init
 - [ ] fanotify_mark
 
-9.3 io_uring (optional but modern)
+9.3 io_uring (modern async I/O)
 
-- [ ] io_uring_setup
-- [ ] io_uring_enter
-- [ ] io_uring_register
+- [x] io_uring_setup
+- [x] io_uring_enter
+- [x] io_uring_register
 
 10. Credentials, security, keyrings
 10.1 UIDs / GIDs

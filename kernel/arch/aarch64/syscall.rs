@@ -169,6 +169,14 @@ pub const SYS_EPOLL_PWAIT: u64 = 22;
 /// epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)
 pub const SYS_EPOLL_PWAIT2: u64 = 441;
 
+// io_uring syscalls (Section 9.3)
+/// io_uring_setup(entries, params)
+pub const SYS_IO_URING_SETUP: u64 = 425;
+/// io_uring_enter(fd, to_submit, min_complete, flags, argp, argsz)
+pub const SYS_IO_URING_ENTER: u64 = 426;
+/// io_uring_register(fd, opcode, arg, nr_args)
+pub const SYS_IO_URING_REGISTER: u64 = 427;
+
 // POSIX timer syscalls (Section 6.2)
 /// timer_create(clockid, sigevent, timerid)
 pub const SYS_TIMER_CREATE: u64 = 107;
@@ -741,6 +749,21 @@ pub fn aarch64_syscall_dispatch(
         }
         SYS_EPOLL_PWAIT2 => {
             crate::epoll::sys_epoll_pwait2(arg0 as i32, arg1, arg2 as i32, arg3, arg4, arg5) as u64
+        }
+
+        // io_uring syscalls (Section 9.3)
+        SYS_IO_URING_SETUP => crate::io_uring::sys_io_uring_setup(arg0 as u32, arg1) as u64,
+        SYS_IO_URING_ENTER => crate::io_uring::sys_io_uring_enter(
+            arg0 as u32,
+            arg1 as u32,
+            arg2 as u32,
+            arg3 as u32,
+            arg4,
+            arg5 as usize,
+        ) as u64,
+        SYS_IO_URING_REGISTER => {
+            crate::io_uring::sys_io_uring_register(arg0 as u32, arg1 as u32, arg2, arg3 as u32)
+                as u64
         }
 
         // POSIX timer syscalls (Section 6.2)

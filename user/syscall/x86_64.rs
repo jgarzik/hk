@@ -1788,3 +1788,65 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: *const u8, flags: u32) 
 pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
     unsafe { syscall3!(SYS_PIDFD_GETFD, pidfd, targetfd, flags) }
 }
+
+// --- io_uring ---
+
+/// io_uring_setup syscall number (x86_64)
+pub const SYS_IO_URING_SETUP: u64 = 425;
+/// io_uring_enter syscall number (x86_64)
+pub const SYS_IO_URING_ENTER: u64 = 426;
+/// io_uring_register syscall number (x86_64)
+pub const SYS_IO_URING_REGISTER: u64 = 427;
+
+/// io_uring_setup(entries, params) - set up an io_uring instance
+///
+/// Creates a new io_uring instance with the specified number of submission queue entries.
+/// The params structure is used to pass in additional setup parameters and receive
+/// ring offsets on output.
+///
+/// Returns a file descriptor on success, or a negative error code on failure.
+#[inline(always)]
+pub fn sys_io_uring_setup(entries: u32, params: *mut crate::types::IoUringParams) -> i64 {
+    unsafe { syscall2!(SYS_IO_URING_SETUP, entries, params) }
+}
+
+/// io_uring_enter(fd, to_submit, min_complete, flags, argp, argsz) - submit and wait for io_uring completions
+///
+/// Submits I/O requests to the io_uring instance referenced by fd and optionally
+/// waits for completions.
+///
+/// - fd: io_uring file descriptor
+/// - to_submit: number of submissions to process from the SQ ring
+/// - min_complete: minimum number of completions to wait for (if IORING_ENTER_GETEVENTS)
+/// - flags: operation flags (IORING_ENTER_GETEVENTS, IORING_ENTER_SQ_WAKEUP, etc.)
+/// - argp: optional pointer to additional arguments
+/// - argsz: size of the argp structure
+///
+/// Returns the number of submissions processed, or a negative error code.
+#[inline(always)]
+pub fn sys_io_uring_enter(
+    fd: u32,
+    to_submit: u32,
+    min_complete: u32,
+    flags: u32,
+    argp: u64,
+    argsz: usize,
+) -> i64 {
+    unsafe { syscall6!(SYS_IO_URING_ENTER, fd, to_submit, min_complete, flags, argp, argsz) }
+}
+
+/// io_uring_register(fd, opcode, arg, nr_args) - register resources with io_uring
+///
+/// Registers or unregisters resources (files, buffers, eventfds) with the io_uring
+/// instance for more efficient access during I/O operations.
+///
+/// - fd: io_uring file descriptor
+/// - opcode: registration operation (IORING_REGISTER_*, IORING_UNREGISTER_*)
+/// - arg: pointer to arguments (depends on opcode)
+/// - nr_args: number of arguments
+///
+/// Returns 0 on success, or a negative error code on failure.
+#[inline(always)]
+pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i64 {
+    unsafe { syscall4!(SYS_IO_URING_REGISTER, fd, opcode, arg, nr_args) }
+}
