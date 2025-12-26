@@ -596,8 +596,8 @@ fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
     let old_flags = pte_value & !0x000F_FFFF_FFFF_F000;
 
     // Get anon_vma from VMA for rmap updates (Linux: wp_page_copy sets up rmap)
-    use crate::mm::get_task_mm;
     use crate::mm::anon_vma::AnonVma;
+    use crate::mm::get_task_mm;
     use crate::task::percpu::current_tid;
     use alloc::sync::Arc;
 
@@ -605,7 +605,9 @@ fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
         let tid = current_tid();
         get_task_mm(tid).and_then(|mm| {
             let mm_guard = mm.lock();
-            mm_guard.find_vma(fault_addr).and_then(|vma| vma.anon_vma.clone())
+            mm_guard
+                .find_vma(fault_addr)
+                .and_then(|vma| vma.anon_vma.clone())
         })
     };
 

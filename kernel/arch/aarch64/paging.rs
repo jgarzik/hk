@@ -108,6 +108,12 @@ pub const PXN: u64 = 1 << 53;
 /// User Execute Never (bit 54)
 pub const UXN: u64 = 1 << 54;
 
+/// COW (Copy-on-Write) flag - software-defined bit
+/// We use bit 55 which is available for OS use on ARM64
+/// When set along with AP_EL0_RO, indicates a writable page that is
+/// temporarily read-only for COW sharing between parent and child.
+pub const PAGE_COW: u64 = 1 << 55;
+
 // ============================================================================
 // MAIR_EL1 Memory Attribute Configuration
 // ============================================================================
@@ -492,6 +498,47 @@ pub fn flush_tlb(vaddr: u64) {
     }
 }
 
+/// Flush TLB for a range of virtual addresses
+///
+/// Uses full TLB flush for large ranges (more efficient than many individual flushes)
+/// and individual TLBI instructions for small ranges.
+#[inline]
+pub fn flush_tlb_range(start: u64, end: u64) {
+    const INVLPG_THRESHOLD: u64 = 32 * PAGE_SIZE;
+
+    if end <= start {
+        return;
+    }
+
+    let range = end - start;
+
+    if range > INVLPG_THRESHOLD {
+        // Full TLB flush is cheaper for large ranges
+        flush_tlb_all();
+    } else {
+        // Individual flushes for small ranges
+        let mut addr = start & !(PAGE_SIZE - 1);
+        while addr < end {
+            flush_tlb(addr);
+            addr += PAGE_SIZE;
+        }
+    }
+}
+
+/// Flush entire TLB (all entries for EL1)
+#[inline]
+pub fn flush_tlb_all() {
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack)
+        );
+    }
+}
+
 // ============================================================================
 // Extract Page Table Indices from Virtual Address
 // ============================================================================
@@ -762,7 +809,12 @@ impl Aarch64PageTable {
 
     /// Duplicate the user space portion of this page table for fork()
     ///
-    /// Creates a new page table with copies of all user space mappings.
+    /// Uses Copy-on-Write (COW) for writable pages:
+    /// - Writable pages are marked read-only with PAGE_COW flag in both parent and child
+    /// - Physical frames are shared with incremented reference count
+    /// - On first write, a page fault triggers COW resolution (copy then)
+    ///
+    /// This is much more efficient than eager copying, especially for fork+exec patterns.
     pub fn duplicate_user_space<FA: FrameAlloc<PhysAddr = u64>>(
         &self,
         frame_alloc: &mut FA,
@@ -780,8 +832,12 @@ impl Aarch64PageTable {
         // This allows user mappings to be independent of other processes
         new_pt.copy_kernel_mappings_with_alloc(frame_alloc)?;
 
+        // Track range for batch TLB flush
+        let mut flush_start: Option<u64> = None;
+        let mut flush_end: u64 = 0;
+
         unsafe {
-            let parent_l0 = phys_to_virt_table_const(self.root_phys);
+            let parent_l0 = phys_to_virt_table(self.root_phys);
 
             // Walk all L0 entries (0-511)
             for l0_idx in 0..ENTRIES_PER_TABLE {
@@ -795,7 +851,7 @@ impl Aarch64PageTable {
                     continue;
                 }
 
-                let l1 = phys_to_virt_table_const(l0_entry.addr());
+                let l1 = phys_to_virt_table(l0_entry.addr());
 
                 // Walk L1 entries
                 for l1_idx in 0..ENTRIES_PER_TABLE {
@@ -815,7 +871,7 @@ impl Aarch64PageTable {
                         continue;
                     }
 
-                    let l2 = phys_to_virt_table_const(l1_entry.addr());
+                    let l2 = phys_to_virt_table(l1_entry.addr());
 
                     // Walk L2 entries
                     for l2_idx in 0..ENTRIES_PER_TABLE {
@@ -832,11 +888,11 @@ impl Aarch64PageTable {
                             continue;
                         }
 
-                        let l3 = phys_to_virt_table_const(l2_entry.addr());
+                        let l3_parent = phys_to_virt_table(l2_entry.addr());
 
                         // Walk L3 entries (4KB pages)
                         for l3_idx in 0..ENTRIES_PER_TABLE {
-                            let l3_entry = (*l3).entry(l3_idx);
+                            let l3_entry = (*l3_parent).entry_mut(l3_idx);
                             if !l3_entry.is_valid() {
                                 continue;
                             }
@@ -850,54 +906,125 @@ impl Aarch64PageTable {
 
                             // Skip kernel-only pages (ioremap, etc.)
                             // User pages have AP_EL0_RW or AP_EL0_RO set
-                            let attrs = l3_entry.0 & !ADDR_MASK & !0b11;
+                            let pte_value = l3_entry.0;
+                            let attrs = pte_value & !ADDR_MASK & !0b11;
                             if attrs & (AP_EL0_RW | AP_EL0_RO) == 0 {
                                 continue;
                             }
 
-                            // User page - allocate new frame and copy contents
                             let src_phys = l3_entry.addr();
-                            let new_frame = frame_alloc.alloc_frame().ok_or(-12i32)?; // ENOMEM
+                            let is_writable = (attrs & AP_EL0_RW) == AP_EL0_RW;
 
-                            // Copy page contents using volatile to avoid any optimization issues
-                            let src_ptr = phys_to_virt(src_phys) as *const u64;
-                            let dst_ptr = phys_to_virt(new_frame) as *mut u64;
-                            for i in 0..(PAGE_SIZE as usize / 8) {
-                                let val = core::ptr::read_volatile(src_ptr.add(i));
-                                core::ptr::write_volatile(dst_ptr.add(i), val);
-                            }
+                            // COW handling for writable pages
+                            let child_pte = if is_writable {
+                                // Mark parent as read-only with COW flag
+                                // Clear AP_EL0_RW, set AP_EL0_RO and PAGE_COW
+                                let parent_new_pte =
+                                    (pte_value & !AP_EL0_RW) | AP_EL0_RO | PAGE_COW;
+                                l3_entry.0 = parent_new_pte;
 
-                            // Clean the new frame's cache to ensure child sees correct data
-                            crate::arch::aarch64::cache::cache_clean_range(
-                                phys_to_virt(new_frame),
-                                PAGE_SIZE as usize,
-                            );
+                                // Track for TLB flush
+                                if flush_start.is_none() {
+                                    flush_start = Some(vaddr);
+                                }
+                                flush_end = vaddr + PAGE_SIZE;
 
-                            // Map in child with same permissions (attrs already extracted above)
-                            let flags = if attrs & AP_EL0_RW == AP_EL0_RW {
-                                PageFlags::USER | PageFlags::WRITE
-                            } else if attrs & AP_EL0_RO == AP_EL0_RO {
-                                PageFlags::USER
+                                // Child gets same COW mapping
+                                parent_new_pte
                             } else {
-                                PageFlags::WRITE
+                                // Read-only page - just share it as-is
+                                pte_value
                             };
 
-                            let flags = if attrs & (PXN | UXN) == 0 {
-                                flags | PageFlags::EXECUTE
-                            } else {
-                                flags
-                            };
+                            // Increment reference count on shared frame
+                            crate::FRAME_ALLOCATOR.incref(src_phys);
 
-                            new_pt
-                                .map_with_alloc(vaddr, new_frame, flags, frame_alloc)
-                                .map_err(|_| -12i32)?; // ENOMEM
+                            // Map in child - we need to map with the raw PTE value
+                            // to preserve PAGE_COW flag
+                            Self::map_raw_pte(new_pt.root_phys, vaddr, child_pte, frame_alloc)
+                                .map_err(|_| -12i32)?;
                         }
                     }
                 }
             }
+
+            // Batch TLB flush for parent's modified PTEs
+            if let Some(start) = flush_start {
+                flush_tlb_range(start, flush_end);
+            }
         }
 
         Ok(new_pt)
+    }
+
+    /// Map a page with a raw PTE value (used by COW to preserve PAGE_COW flag)
+    ///
+    /// This allocates intermediate page tables as needed and sets the L3 entry
+    /// to the exact PTE value provided.
+    fn map_raw_pte<FA: FrameAlloc<PhysAddr = u64>>(
+        l0_phys: u64,
+        va: u64,
+        pte_value: u64,
+        frame_alloc: &mut FA,
+    ) -> Result<(), MapError> {
+        let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
+
+        unsafe {
+            let l0 = phys_to_virt_table(l0_phys);
+
+            // Get or create L1 table
+            let l0_entry = (*l0).entry_mut(l0_idx);
+            if !l0_entry.is_valid() {
+                let l1_phys = frame_alloc
+                    .alloc_frame()
+                    .ok_or(MapError::FrameAllocationFailed)?;
+                core::ptr::write_bytes(phys_to_virt(l1_phys), 0, PAGE_SIZE as usize);
+                l0_entry.set_table(l1_phys);
+            } else if !l0_entry.is_table() {
+                return Err(MapError::InvalidArgument);
+            }
+            let l1 = phys_to_virt_table(l0_entry.addr());
+
+            // Get or create L2 table
+            let l1_entry = (*l1).entry_mut(l1_idx);
+            if !l1_entry.is_valid() {
+                let l2_phys = frame_alloc
+                    .alloc_frame()
+                    .ok_or(MapError::FrameAllocationFailed)?;
+                core::ptr::write_bytes(phys_to_virt(l2_phys), 0, PAGE_SIZE as usize);
+                l1_entry.set_table(l2_phys);
+            } else if l1_entry.is_block() {
+                return Err(MapError::AlreadyMapped);
+            }
+            let l2 = phys_to_virt_table(l1_entry.addr());
+
+            // Get or create L3 table
+            let l2_entry = (*l2).entry_mut(l2_idx);
+            if !l2_entry.is_valid() {
+                let l3_phys = frame_alloc
+                    .alloc_frame()
+                    .ok_or(MapError::FrameAllocationFailed)?;
+                core::ptr::write_bytes(phys_to_virt(l3_phys), 0, PAGE_SIZE as usize);
+                l2_entry.set_table(l3_phys);
+            } else if l2_entry.is_block() {
+                return Err(MapError::AlreadyMapped);
+            }
+            let l3 = phys_to_virt_table(l2_entry.addr());
+
+            // Set the L3 page entry with the raw PTE value
+            (*l3).entry_mut(l3_idx).0 = pte_value;
+
+            // Clean the data cache for this page table entry
+            let entry_addr = (*l3).entry_mut(l3_idx) as *mut PageTableEntry as u64;
+            asm!(
+                "dc cvau, {}",
+                "dsb ish",
+                in(reg) entry_addr,
+                options(nostack)
+            );
+        }
+
+        Ok(())
     }
 
     /// Unmap a single page and return its physical address

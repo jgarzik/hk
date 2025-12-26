@@ -902,7 +902,8 @@ impl X86_64PageTable {
 
                                     // Update parent's PTE to be read-only with COW flag
                                     if old_flags & PAGE_WRITABLE != 0 {
-                                        let parent_pt = phys_to_virt_table((*pd).entry(pd_idx).addr());
+                                        let parent_pt =
+                                            phys_to_virt_table((*pd).entry(pd_idx).addr());
                                         (*parent_pt).entry_mut(pt_idx).set(old_phys, cow_flags);
                                         // Track range for batch TLB flush (instead of per-page flush)
                                         if flush_start.is_none() {
