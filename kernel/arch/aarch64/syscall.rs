@@ -447,6 +447,8 @@ pub const SYS_ADD_KEY: u64 = 217;
 pub const SYS_REQUEST_KEY: u64 = 218;
 /// keyctl(cmd, arg2, arg3, arg4, arg5)
 pub const SYS_KEYCTL: u64 = 219;
+/// kcmp(pid1, pid2, type, idx1, idx2)
+pub const SYS_KCMP: u64 = 272;
 
 // ============================================================================
 // Syscall dispatcher
@@ -1126,6 +1128,9 @@ pub fn aarch64_syscall_dispatch(
         SYS_ADD_KEY => crate::keys::sys_add_key(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
         SYS_REQUEST_KEY => crate::keys::sys_request_key(arg0, arg1, arg2, arg3 as i32) as u64,
         SYS_KEYCTL => crate::keys::sys_keyctl(arg0 as i32, arg1, arg2, arg3, arg4) as u64,
+
+        // Process inspection (Section 13)
+        SYS_KCMP => crate::kcmp::sys_kcmp(arg0, arg1, arg2 as i32, arg3, arg4) as u64,
 
         // Unimplemented syscalls
         _ => {

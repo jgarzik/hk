@@ -2137,6 +2137,8 @@ pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i6
 pub const SYS_ADD_KEY: u64 = 217;
 pub const SYS_REQUEST_KEY: u64 = 218;
 pub const SYS_KEYCTL: u64 = 219;
+/// kcmp syscall number (aarch64)
+pub const SYS_KCMP: u64 = 272;
 
 /// add_key(type, description, payload, plen, keyring) - add a key to the kernel's key management facility
 ///
@@ -2193,4 +2195,26 @@ pub fn sys_request_key(
 #[inline(always)]
 pub fn sys_keyctl(cmd: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
     unsafe { syscall5!(SYS_KEYCTL, cmd, arg2, arg3, arg4, arg5) }
+}
+
+/// kcmp(pid1, pid2, type, idx1, idx2) - compare kernel resources between processes
+///
+/// Compares kernel resources (file descriptors, memory maps, etc.) between two processes.
+/// Used by container runtimes and process inspection tools.
+///
+/// # Arguments
+/// * `pid1` - First process ID
+/// * `pid2` - Second process ID
+/// * `type_` - Comparison type (KCMP_FILE, KCMP_VM, KCMP_FILES, KCMP_FS, etc.)
+/// * `idx1` - First index (fd number for KCMP_FILE, ignored otherwise)
+/// * `idx2` - Second index (fd number for KCMP_FILE, ignored otherwise)
+///
+/// # Returns
+/// * 0 if resources are equal (same kernel object)
+/// * 1 if first < second (obfuscated pointer comparison)
+/// * 2 if first > second
+/// * Negative error code on failure (ESRCH, EBADF, EINVAL, EOPNOTSUPP)
+#[inline(always)]
+pub fn sys_kcmp(pid1: u64, pid2: u64, type_: i32, idx1: u64, idx2: u64) -> i64 {
+    unsafe { syscall5!(SYS_KCMP, pid1, pid2, type_, idx1, idx2) }
 }

@@ -1940,3 +1940,26 @@ pub const KEY_OTH_LINK: u32 = 0x00000010;
 pub const KEY_OTH_SETATTR: u32 = 0x00000020;
 /// All other permissions
 pub const KEY_OTH_ALL: u32 = 0x0000003f;
+
+// ============================================================================
+// kcmp comparison types
+// ============================================================================
+
+/// Compare file descriptors
+pub const KCMP_FILE: i32 = 0;
+/// Compare memory address spaces (mm_struct)
+pub const KCMP_VM: i32 = 1;
+/// Compare file descriptor tables
+pub const KCMP_FILES: i32 = 2;
+/// Compare filesystem context (cwd, root)
+pub const KCMP_FS: i32 = 3;
+/// Compare signal handlers
+pub const KCMP_SIGHAND: i32 = 4;
+/// Compare I/O context
+pub const KCMP_IO: i32 = 5;
+/// Compare SysV semaphore undo lists
+pub const KCMP_SYSVSEM: i32 = 6;
+/// Compare epoll target fds (not supported)
+pub const KCMP_EPOLL_TFD: i32 = 7;
+/// Number of comparison types
+pub const KCMP_TYPES: i32 = 8;

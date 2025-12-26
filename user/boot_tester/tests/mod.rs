@@ -35,6 +35,7 @@ pub mod adjtimex;
 pub mod io_uring;
 pub mod tcp;
 pub mod keys;
+pub mod kcmp;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -69,4 +70,5 @@ pub fn run_all_tests() {
     io_uring::run_tests();
     tcp::run_tests();
     keys::run_tests();
+    kcmp::run_tests();
 }

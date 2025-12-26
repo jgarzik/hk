@@ -619,6 +619,8 @@ pub const SYS_ADD_KEY: u64 = 248;
 pub const SYS_REQUEST_KEY: u64 = 249;
 /// keyctl(cmd, arg2, arg3, arg4, arg5)
 pub const SYS_KEYCTL: u64 = 250;
+/// kcmp(pid1, pid2, type, idx1, idx2)
+pub const SYS_KCMP: u64 = 312;
 
 /// Model Specific Registers for syscall
 const MSR_EFER: u32 = 0xC000_0080; // Extended Feature Enable Register
@@ -1855,6 +1857,9 @@ pub fn x86_64_syscall_dispatch(
         SYS_ADD_KEY => crate::keys::sys_add_key(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
         SYS_REQUEST_KEY => crate::keys::sys_request_key(arg0, arg1, arg2, arg3 as i32) as u64,
         SYS_KEYCTL => crate::keys::sys_keyctl(arg0 as i32, arg1, arg2, arg3, arg4) as u64,
+
+        // Process inspection (Section 13)
+        SYS_KCMP => crate::kcmp::sys_kcmp(arg0, arg1, arg2 as i32, arg3, arg4) as u64,
 
         _ => (-38i64) as u64, // ENOSYS
     }

@@ -18,6 +18,7 @@ pub mod eventfd;
 pub mod futex;
 pub mod inotify;
 pub mod io_uring;
+pub mod kcmp;
 pub mod pidfd;
 pub mod pipe;
 pub mod poll;
