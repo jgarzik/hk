@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use spin::Mutex;
 
-use crate::net::NetError;
+use crate::net::KernelError;
 use crate::net::ipv4::Ipv4Addr;
 use crate::net::skb::SkBuff;
 use crate::waitqueue::WaitQueue;
@@ -45,7 +45,7 @@ pub trait NetDeviceOps: Send + Sync {
     ///
     /// Takes ownership of the skb. Returns Ok(()) on success or
     /// error if transmission failed.
-    fn xmit(&self, skb: Box<SkBuff>) -> Result<(), NetError>;
+    fn xmit(&self, skb: Box<SkBuff>) -> Result<(), KernelError>;
 
     /// Get the hardware MAC address
     fn mac_address(&self) -> [u8; 6];
@@ -56,12 +56,12 @@ pub trait NetDeviceOps: Send + Sync {
     }
 
     /// Open/start the interface
-    fn open(&self) -> Result<(), NetError> {
+    fn open(&self) -> Result<(), KernelError> {
         Ok(())
     }
 
     /// Stop the interface
-    fn stop(&self) -> Result<(), NetError> {
+    fn stop(&self) -> Result<(), KernelError> {
         Ok(())
     }
 
@@ -224,7 +224,7 @@ impl NetDevice {
     }
 
     /// Bring interface up
-    pub fn up(&self) -> Result<(), NetError> {
+    pub fn up(&self) -> Result<(), KernelError> {
         self.ops.open()?;
         self.flags
             .fetch_or(flags::IFF_UP | flags::IFF_RUNNING, Ordering::Release);
@@ -232,7 +232,7 @@ impl NetDevice {
     }
 
     /// Bring interface down
-    pub fn down(&self) -> Result<(), NetError> {
+    pub fn down(&self) -> Result<(), KernelError> {
         self.flags
             .fetch_and(!(flags::IFF_UP | flags::IFF_RUNNING), Ordering::Release);
         self.ops.stop()?;
@@ -266,9 +266,9 @@ impl NetDevice {
     }
 
     /// Transmit a packet
-    pub fn xmit(&self, skb: Box<SkBuff>) -> Result<(), NetError> {
+    pub fn xmit(&self, skb: Box<SkBuff>) -> Result<(), KernelError> {
         if !self.is_up() {
-            return Err(NetError::DeviceDown);
+            return Err(KernelError::NetworkDown);
         }
 
         let len = skb.len() as u64;

@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use ::core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
-use super::FsError;
+use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{Inode, InodeId, InodeMode, InodeOps};
 
@@ -20,13 +20,13 @@ pub trait SuperOps: Send + Sync {
         sb: &Arc<SuperBlock>,
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, FsError>;
+    ) -> Result<Arc<Inode>, KernelError>;
 
     /// Called when inode is no longer referenced
     fn drop_inode(&self, _inode: &Inode) {}
 
     /// Sync filesystem to backing store (no-op for in-memory fs)
-    fn sync_fs(&self) -> Result<(), FsError> {
+    fn sync_fs(&self) -> Result<(), KernelError> {
         Ok(())
     }
 
@@ -139,13 +139,13 @@ use super::file::FileOps;
 use crate::storage::BlockDevice;
 
 /// Mount function type for pseudo-filesystems (no backing device)
-pub type MountFn = fn(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, FsError>;
+pub type MountFn = fn(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError>;
 
 /// Mount function type for device-backed filesystems (ext4, vfat, etc.)
 pub type MountDevFn = fn(
     fs_type: &'static FileSystemType,
     bdev: Arc<BlockDevice>,
-) -> Result<Arc<SuperBlock>, FsError>;
+) -> Result<Arc<SuperBlock>, KernelError>;
 
 /// Filesystem type descriptor
 pub struct FileSystemType {
@@ -273,8 +273,8 @@ impl SuperOps for NullSuperOps {
         _sb: &Arc<SuperBlock>,
         _mode: InodeMode,
         _i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, FsError> {
-        Err(FsError::NotSupported)
+    ) -> Result<Arc<Inode>, KernelError> {
+        Err(KernelError::OperationNotSupported)
     }
 }
 

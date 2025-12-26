@@ -35,7 +35,7 @@ use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use spin::{Lazy, Mutex, RwLock};
 
 use crate::arch::Uaccess;
-use crate::fs::FsError;
+use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
@@ -383,26 +383,26 @@ impl FileOps for MqFileOps {
         self
     }
 
-    fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         if self.access_mode == O_WRONLY {
-            return Err(FsError::PermissionDenied);
+            return Err(KernelError::PermissionDenied);
         }
 
         match self.queue.receive(buf, false) {
             Ok((len, _prio)) => Ok(len),
-            Err(_) => Err(FsError::IoError),
+            Err(_) => Err(KernelError::Io),
         }
     }
 
-    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, FsError> {
+    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         if self.access_mode == O_RDONLY {
-            return Err(FsError::PermissionDenied);
+            return Err(KernelError::PermissionDenied);
         }
 
         // Write with priority 0 (default)
         match self.queue.send(buf, 0, false) {
             Ok(()) => Ok(buf.len()),
-            Err(_) => Err(FsError::IoError),
+            Err(_) => Err(KernelError::Io),
         }
     }
 
@@ -420,7 +420,7 @@ impl FileOps for MqFileOps {
         events
     }
 
-    fn release(&self, _file: &File) -> Result<(), FsError> {
+    fn release(&self, _file: &File) -> Result<(), KernelError> {
         // Clear notification if we own it
         let current_pid = crate::task::percpu::current_pid();
         let mut notify = self.queue.notify.lock();

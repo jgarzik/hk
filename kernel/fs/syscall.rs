@@ -12,7 +12,7 @@ use alloc::vec;
 use crate::arch::Uaccess;
 use crate::console::console_write;
 use crate::fs::{
-    Dentry, File, FsError, InodeMode, LinuxStatFs, LookupFlags, Path, RAMFS_FILE_OPS, RwFlags,
+    Dentry, File, KernelError, InodeMode, LinuxStatFs, LookupFlags, Path, RAMFS_FILE_OPS, RwFlags,
     is_subdir, lock_rename, lookup_path_at, lookup_path_flags, unlock_rename,
 };
 use crate::uaccess::{UaccessArch, copy_to_user, put_user, strncpy_from_user};
@@ -175,11 +175,11 @@ pub struct IoVec {
 ///
 /// # Returns
 /// The dentry of the created file on success
-fn create_file_at(start: Option<Path>, path: &str, mode: u32) -> Result<Arc<Dentry>, FsError> {
+fn create_file_at(start: Option<Path>, path: &str, mode: u32) -> Result<Arc<Dentry>, KernelError> {
     // Find the last path component
     let path = path.trim_end_matches('/');
     if path.is_empty() {
-        return Err(FsError::InvalidArgument);
+        return Err(KernelError::InvalidArgument);
     }
 
     let (parent_path, name) = match path.rfind('/') {
@@ -195,7 +195,7 @@ fn create_file_at(start: Option<Path>, path: &str, mode: u32) -> Result<Arc<Dent
     };
 
     if name.is_empty() {
-        return Err(FsError::InvalidArgument);
+        return Err(KernelError::InvalidArgument);
     }
 
     // Look up the parent directory
@@ -204,14 +204,14 @@ fn create_file_at(start: Option<Path>, path: &str, mode: u32) -> Result<Arc<Dent
         start
             .map(|p| p.dentry.clone())
             .or_else(|| crate::fs::mount::current_mnt_ns().get_root_dentry())
-            .ok_or(FsError::NotFound)?
+            .ok_or(KernelError::NotFound)?
     } else {
         lookup_path_at(start, parent_path, LookupFlags::opendir())?
     };
 
-    let parent_inode = parent_dentry.get_inode().ok_or(FsError::NotFound)?;
+    let parent_inode = parent_dentry.get_inode().ok_or(KernelError::NotFound)?;
     if !parent_inode.mode().is_dir() {
-        return Err(FsError::NotADirectory);
+        return Err(KernelError::NotDirectory);
     }
 
     // Lock parent directory (Linux i_rwsem pattern)
@@ -220,7 +220,7 @@ fn create_file_at(start: Option<Path>, path: &str, mode: u32) -> Result<Arc<Dent
     // Check if file already exists (with lock held)
     if parent_dentry.lookup_child(name).is_some() {
         unsafe { parent_inode.inode_unlock() };
-        return Err(FsError::AlreadyExists);
+        return Err(KernelError::AlreadyExists);
     }
 
     // Create the file with requested permission bits
@@ -311,7 +311,7 @@ pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> i64 {
             }
             d
         }
-        Err(FsError::NotFound) => {
+        Err(KernelError::NotFound) => {
             // File doesn't exist - try to create if O_CREAT is set
             if flags & super::flags::O_CREAT == 0 {
                 return ENOENT;
@@ -319,14 +319,14 @@ pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> i64 {
             // Create the file
             match create_file_at(start, &path_str, mode) {
                 Ok(d) => d,
-                Err(FsError::NotFound) => return ENOENT,
-                Err(FsError::NotADirectory) => return ENOTDIR,
-                Err(FsError::AlreadyExists) => return EEXIST,
-                Err(FsError::PermissionDenied) => return EACCES,
+                Err(KernelError::NotFound) => return ENOENT,
+                Err(KernelError::NotDirectory) => return ENOTDIR,
+                Err(KernelError::AlreadyExists) => return EEXIST,
+                Err(KernelError::PermissionDenied) => return EACCES,
                 Err(_) => return EINVAL,
             }
         }
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -389,8 +389,8 @@ pub fn sys_chdir(path_ptr: u64) -> i64 {
     // Look up the path (must be a directory)
     let dentry = match lookup_path_at(start, &path_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -477,9 +477,9 @@ pub fn sys_chroot(path_ptr: u64) -> i64 {
     // Look up the path - must be a directory and we must follow symlinks
     let dentry = match lookup_path_at(start, &path_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
-        Err(FsError::PermissionDenied) => return EACCES,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
+        Err(KernelError::PermissionDenied) => return EACCES,
         Err(_) => return EINVAL,
     };
 
@@ -593,9 +593,9 @@ pub fn sys_read(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         // Perform read into stack buffer
         let bytes_read = match file.read(read_buf) {
             Ok(n) => n,
-            Err(FsError::IsADirectory) => return EISDIR,
-            Err(FsError::PermissionDenied) => return EBADF,
-            Err(FsError::WouldBlock) => return EAGAIN,
+            Err(KernelError::IsDirectory) => return EISDIR,
+            Err(KernelError::PermissionDenied) => return EBADF,
+            Err(KernelError::WouldBlock) => return EAGAIN,
             Err(_) => return EINVAL,
         };
 
@@ -612,9 +612,9 @@ pub fn sys_read(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         // Perform read into kernel buffer
         let bytes_read = match file.read(&mut kernel_buf) {
             Ok(n) => n,
-            Err(FsError::IsADirectory) => return EISDIR,
-            Err(FsError::PermissionDenied) => return EBADF,
-            Err(FsError::WouldBlock) => return EAGAIN,
+            Err(KernelError::IsDirectory) => return EISDIR,
+            Err(KernelError::PermissionDenied) => return EBADF,
+            Err(KernelError::WouldBlock) => return EAGAIN,
             Err(_) => return EINVAL,
         };
 
@@ -696,7 +696,7 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         // Perform write
         match file.write(write_buf) {
             Ok(n) => n as i64,
-            Err(FsError::PermissionDenied) => EBADF,
+            Err(KernelError::PermissionDenied) => EBADF,
             Err(_) => EINVAL,
         }
     } else {
@@ -713,7 +713,7 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         // Perform write
         match file.write(&kernel_buf) {
             Ok(n) => n as i64,
-            Err(FsError::PermissionDenied) => EBADF,
+            Err(KernelError::PermissionDenied) => EBADF,
             Err(_) => EINVAL,
         }
     }
@@ -775,9 +775,9 @@ pub fn sys_pread64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
         // Perform positioned read into stack buffer
         let bytes_read = match file.pread(read_buf, offset) {
             Ok(n) => n,
-            Err(FsError::IsADirectory) => return EISDIR,
-            Err(FsError::PermissionDenied) => return EBADF,
-            Err(FsError::NotSupported) => return ESPIPE, // Not seekable
+            Err(KernelError::IsDirectory) => return EISDIR,
+            Err(KernelError::PermissionDenied) => return EBADF,
+            Err(KernelError::OperationNotSupported) => return ESPIPE, // Not seekable
             Err(_) => return EINVAL,
         };
 
@@ -794,9 +794,9 @@ pub fn sys_pread64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
         // Perform positioned read into kernel buffer
         let bytes_read = match file.pread(&mut kernel_buf, offset) {
             Ok(n) => n,
-            Err(FsError::IsADirectory) => return EISDIR,
-            Err(FsError::PermissionDenied) => return EBADF,
-            Err(FsError::NotSupported) => return ESPIPE, // Not seekable
+            Err(KernelError::IsDirectory) => return EISDIR,
+            Err(KernelError::PermissionDenied) => return EBADF,
+            Err(KernelError::OperationNotSupported) => return ESPIPE, // Not seekable
             Err(_) => return EINVAL,
         };
 
@@ -870,8 +870,8 @@ pub fn sys_pwrite64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
         // Perform positioned write
         match file.pwrite(write_buf, offset) {
             Ok(n) => n as i64,
-            Err(FsError::PermissionDenied) => EBADF,
-            Err(FsError::NotSupported) => ESPIPE, // Not seekable
+            Err(KernelError::PermissionDenied) => EBADF,
+            Err(KernelError::OperationNotSupported) => ESPIPE, // Not seekable
             Err(_) => EINVAL,
         }
     } else {
@@ -888,8 +888,8 @@ pub fn sys_pwrite64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
         // Perform positioned write
         match file.pwrite(&kernel_buf, offset) {
             Ok(n) => n as i64,
-            Err(FsError::PermissionDenied) => EBADF,
-            Err(FsError::NotSupported) => ESPIPE, // Not seekable
+            Err(KernelError::PermissionDenied) => EBADF,
+            Err(KernelError::OperationNotSupported) => ESPIPE, // Not seekable
             Err(_) => EINVAL,
         }
     }
@@ -1020,14 +1020,14 @@ pub fn sys_readv(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
 
             let bytes_read = match file.read(read_buf) {
                 Ok(n) => n,
-                Err(FsError::IsADirectory) => {
+                Err(KernelError::IsDirectory) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
                         EISDIR
                     };
                 }
-                Err(FsError::PermissionDenied) => {
+                Err(KernelError::PermissionDenied) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
@@ -1064,14 +1064,14 @@ pub fn sys_readv(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
 
             let bytes_read = match file.read(&mut kernel_buf) {
                 Ok(n) => n,
-                Err(FsError::IsADirectory) => {
+                Err(KernelError::IsDirectory) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
                         EISDIR
                     };
                 }
-                Err(FsError::PermissionDenied) => {
+                Err(KernelError::PermissionDenied) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
@@ -1234,7 +1234,7 @@ pub fn sys_writev(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
 
             let bytes_written = match file.write(write_buf) {
                 Ok(n) => n,
-                Err(FsError::PermissionDenied) => {
+                Err(KernelError::PermissionDenied) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
@@ -1271,7 +1271,7 @@ pub fn sys_writev(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
 
             let bytes_written = match file.write(&kernel_buf) {
                 Ok(n) => n,
-                Err(FsError::PermissionDenied) => {
+                Err(KernelError::PermissionDenied) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
@@ -1370,14 +1370,14 @@ pub fn sys_preadv(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
             // Use positioned read (doesn't modify file position)
             let bytes_read = match file.pread(read_buf, current_offset) {
                 Ok(n) => n,
-                Err(FsError::NotSupported) => {
+                Err(KernelError::OperationNotSupported) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
                         ESPIPE // non-seekable file
                     };
                 }
-                Err(FsError::PermissionDenied) => {
+                Err(KernelError::PermissionDenied) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
@@ -1417,14 +1417,14 @@ pub fn sys_preadv(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
             // Use positioned read (doesn't modify file position)
             let bytes_read = match file.pread(&mut kernel_buf, current_offset) {
                 Ok(n) => n,
-                Err(FsError::NotSupported) => {
+                Err(KernelError::OperationNotSupported) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
                         ESPIPE
                     };
                 }
-                Err(FsError::PermissionDenied) => {
+                Err(KernelError::PermissionDenied) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
@@ -1546,14 +1546,14 @@ pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
             // Use positioned write (doesn't modify file position)
             let bytes_written = match file.pwrite(write_buf, current_offset) {
                 Ok(n) => n,
-                Err(FsError::NotSupported) => {
+                Err(KernelError::OperationNotSupported) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
                         ESPIPE // non-seekable file
                     };
                 }
-                Err(FsError::PermissionDenied) => {
+                Err(KernelError::PermissionDenied) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
@@ -1592,14 +1592,14 @@ pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
             // Use positioned write (doesn't modify file position)
             let bytes_written = match file.pwrite(&kernel_buf, current_offset) {
                 Ok(n) => n,
-                Err(FsError::NotSupported) => {
+                Err(KernelError::OperationNotSupported) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
                         ESPIPE
                     };
                 }
-                Err(FsError::PermissionDenied) => {
+                Err(KernelError::PermissionDenied) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
@@ -1717,21 +1717,21 @@ pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) 
 
             let bytes_read = match result {
                 Ok(n) => n,
-                Err(FsError::WouldBlock) => {
+                Err(KernelError::WouldBlock) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
                         EAGAIN
                     };
                 }
-                Err(FsError::NotSupported) => {
+                Err(KernelError::OperationNotSupported) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
                         EOPNOTSUPP
                     };
                 }
-                Err(FsError::PermissionDenied) => {
+                Err(KernelError::PermissionDenied) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
@@ -1774,21 +1774,21 @@ pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) 
 
             let bytes_read = match result {
                 Ok(n) => n,
-                Err(FsError::WouldBlock) => {
+                Err(KernelError::WouldBlock) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
                         EAGAIN
                     };
                 }
-                Err(FsError::NotSupported) => {
+                Err(KernelError::OperationNotSupported) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
                         EOPNOTSUPP
                     };
                 }
-                Err(FsError::PermissionDenied) => {
+                Err(KernelError::PermissionDenied) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
@@ -1956,28 +1956,28 @@ pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32)
 
             let bytes_written = match result {
                 Ok(n) => n,
-                Err(FsError::WouldBlock) => {
+                Err(KernelError::WouldBlock) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
                         EAGAIN
                     };
                 }
-                Err(FsError::NotSupported) => {
+                Err(KernelError::OperationNotSupported) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
                         EOPNOTSUPP
                     };
                 }
-                Err(FsError::PermissionDenied) => {
+                Err(KernelError::PermissionDenied) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
                         EBADF
                     };
                 }
-                Err(FsError::BrokenPipe) => {
+                Err(KernelError::BrokenPipe) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
@@ -2021,28 +2021,28 @@ pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32)
 
             let bytes_written = match result {
                 Ok(n) => n,
-                Err(FsError::WouldBlock) => {
+                Err(KernelError::WouldBlock) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
                         EAGAIN
                     };
                 }
-                Err(FsError::NotSupported) => {
+                Err(KernelError::OperationNotSupported) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
                         EOPNOTSUPP
                     };
                 }
-                Err(FsError::PermissionDenied) => {
+                Err(KernelError::PermissionDenied) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
                         EBADF
                     };
                 }
-                Err(FsError::BrokenPipe) => {
+                Err(KernelError::BrokenPipe) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
@@ -2119,8 +2119,8 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
     // Perform the seek
     match file.lseek(offset, whence) {
         Ok(new_pos) => new_pos as i64,
-        Err(FsError::InvalidArgument) => EINVAL,
-        Err(FsError::NotSupported) => -29, // ESPIPE - illegal seek (e.g., on pipe)
+        Err(KernelError::InvalidArgument) => EINVAL,
+        Err(KernelError::OperationNotSupported) => -29, // ESPIPE - illegal seek (e.g., on pipe)
         Err(_) => EINVAL,
     }
 }
@@ -2141,10 +2141,10 @@ fn do_truncate(inode: &alloc::sync::Arc<super::Inode>, length: u64) -> i64 {
     // Perform truncate
     match inode.i_op.truncate(inode, length) {
         Ok(()) => 0,
-        Err(FsError::IsADirectory) => EISDIR,
-        Err(FsError::NotSupported) => EINVAL,
-        Err(FsError::PermissionDenied) => EACCES,
-        Err(FsError::FileTooLarge) => EFBIG,
+        Err(KernelError::IsDirectory) => EISDIR,
+        Err(KernelError::OperationNotSupported) => EINVAL,
+        Err(KernelError::PermissionDenied) => EACCES,
+        Err(KernelError::FileTooLarge) => EFBIG,
         Err(_) => EINVAL,
     }
 }
@@ -2212,8 +2212,8 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
     // Look up the file (follow symlinks for truncate)
     let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -2451,7 +2451,7 @@ pub fn sys_getdents64(fd: i32, dirp: u64, count: u64) -> i64 {
             }
             offset as i64
         }
-        Err(FsError::NotADirectory) => ENOTDIR,
+        Err(KernelError::NotDirectory) => ENOTDIR,
         Err(_) => EINVAL,
     }
 }
@@ -2536,8 +2536,8 @@ pub fn sys_stat(path_ptr: u64, statbuf: u64) -> i64 {
     // Look up the path (follow symlinks)
     let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -2665,9 +2665,9 @@ pub fn sys_fstatat(dirfd: i32, path_ptr: u64, statbuf: u64, flags: i32) -> i64 {
     // Look up the path
     let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
-        Err(FsError::TooManySymlinks) => return ELOOP,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
+        Err(KernelError::TooManySymlinks) => return ELOOP,
         Err(_) => return EINVAL,
     };
 
@@ -2778,9 +2778,9 @@ fn do_faccessat(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
     // Look up the path
     let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
-        Err(FsError::PermissionDenied) => return EACCES,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
+        Err(KernelError::PermissionDenied) => return EACCES,
         Err(_) => return EINVAL,
     };
 
@@ -2907,9 +2907,9 @@ pub fn sys_lstat(path_ptr: u64, statbuf: u64) -> i64 {
 
     let dentry = match lookup_path_flags(&path, flags) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
-        Err(FsError::TooManySymlinks) => return ELOOP,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
+        Err(KernelError::TooManySymlinks) => return ELOOP,
         Err(_) => return EINVAL,
     };
 
@@ -2997,9 +2997,9 @@ pub fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> i64 {
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             return match e {
-                FsError::AlreadyExists => EEXIST,
-                FsError::PermissionDenied => EACCES,
-                FsError::NotSupported => EPERM,
+                KernelError::AlreadyExists => EEXIST,
+                KernelError::PermissionDenied => EACCES,
+                KernelError::OperationNotSupported => EPERM,
                 _ => EINVAL,
             };
         }
@@ -3084,9 +3084,9 @@ pub fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i
 
     let dentry = match lookup_path_at(start, &path, flags) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
-        Err(FsError::TooManySymlinks) => return ELOOP,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
+        Err(KernelError::TooManySymlinks) => return ELOOP,
         Err(_) => return EINVAL,
     };
 
@@ -3104,7 +3104,7 @@ pub fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i
     // Read the symlink target
     let target = match inode.i_op.readlink(&inode) {
         Ok(t) => t,
-        Err(FsError::NotSupported) => return EINVAL,
+        Err(KernelError::OperationNotSupported) => return EINVAL,
         Err(_) => return EINVAL,
     };
 
@@ -3189,9 +3189,9 @@ pub fn sys_linkat(
 
     let old_dentry = match lookup_path_at(old_start, &oldpath, lookup_flags) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
-        Err(FsError::TooManySymlinks) => return ELOOP,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
+        Err(KernelError::TooManySymlinks) => return ELOOP,
         Err(_) => return EINVAL,
     };
 
@@ -3252,9 +3252,9 @@ pub fn sys_linkat(
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             match e {
-                FsError::AlreadyExists => EEXIST,
-                FsError::PermissionDenied => EACCES,
-                FsError::NotSupported => EPERM,
+                KernelError::AlreadyExists => EEXIST,
+                KernelError::PermissionDenied => EACCES,
+                KernelError::OperationNotSupported => EPERM,
                 _ => EINVAL,
             }
         }
@@ -3419,11 +3419,11 @@ pub fn sys_renameat2(
     // Handle result
     match result {
         Ok(()) => {}
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::AlreadyExists) => return EEXIST,
-        Err(FsError::DirectoryNotEmpty) => return ENOTEMPTY,
-        Err(FsError::NotSupported) => return EINVAL,
-        Err(FsError::InvalidArgument) => return EINVAL,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::AlreadyExists) => return EEXIST,
+        Err(KernelError::DirectoryNotEmpty) => return ENOTEMPTY,
+        Err(KernelError::OperationNotSupported) => return EINVAL,
+        Err(KernelError::InvalidArgument) => return EINVAL,
         Err(_) => return EINVAL,
     }
 
@@ -3493,8 +3493,8 @@ pub fn sys_mount(
     // Look up the mount point (must be a directory)
     let mountpoint_dentry = match lookup_path_flags(&target, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -3512,17 +3512,17 @@ pub fn sys_mount(
         // Device-backed filesystem (vfat, ext4, etc.)
         match super::mount::do_mount_dev(fs_type, &source, Some(mountpoint_dentry)) {
             Ok(_mount) => 0,
-            Err(FsError::NotABlockDevice) => ENOTBLK,
-            Err(FsError::NoDevice) => ENODEV,
-            Err(FsError::Busy) => EBUSY,
+            Err(KernelError::NotBlockDevice) => ENOTBLK,
+            Err(KernelError::NoDevice) => ENODEV,
+            Err(KernelError::Busy) => EBUSY,
             Err(_) => EINVAL,
         }
     } else {
         // Pseudo-filesystem (ramfs, procfs, etc.)
         match super::mount::do_mount(fs_type, Some(mountpoint_dentry)) {
             Ok(_mount) => 0,
-            Err(FsError::Busy) => EBUSY,
-            Err(FsError::NoDevice) => ENODEV,
+            Err(KernelError::Busy) => EBUSY,
+            Err(KernelError::NoDevice) => ENODEV,
             Err(_) => EINVAL,
         }
     }
@@ -3552,8 +3552,8 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
     // Look up the target path
     let target_dentry = match lookup_path_flags(&target, lookup_flags) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -3566,8 +3566,8 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
     // Perform the unmount
     match super::mount::do_umount(mount, flags) {
         Ok(()) => 0,
-        Err(FsError::Busy) => EBUSY,
-        Err(FsError::InvalidArgument) => EINVAL, // Can't unmount root
+        Err(KernelError::Busy) => EBUSY,
+        Err(KernelError::InvalidArgument) => EINVAL, // Can't unmount root
         Err(_) => EINVAL,
     }
 }
@@ -3608,8 +3608,8 @@ pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     // 3. Look up new_root path (must be directory)
     let new_root_dentry = match lookup_path_flags(&new_root_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -3623,8 +3623,8 @@ pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     // 5. Look up put_old path (must be directory)
     let put_old_dentry = match lookup_path_flags(&put_old_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -3709,9 +3709,9 @@ fn lookup_parent_at(
     // Look up parent directory
     let parent_dentry = match lookup_path_at(start, parent_path, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return Err(ENOENT),
-        Err(FsError::NotADirectory) => return Err(ENOTDIR),
-        Err(FsError::TooManySymlinks) => return Err(ELOOP),
+        Err(KernelError::NotFound) => return Err(ENOENT),
+        Err(KernelError::NotDirectory) => return Err(ENOTDIR),
+        Err(KernelError::TooManySymlinks) => return Err(ELOOP),
         Err(_) => return Err(EINVAL),
     };
 
@@ -3784,9 +3784,9 @@ pub fn sys_mkdirat(dirfd: i32, pathname_ptr: u64, mode: u32) -> i64 {
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             return match e {
-                FsError::AlreadyExists => EEXIST,
-                FsError::PermissionDenied => EACCES,
-                FsError::NotSupported => EPERM,
+                KernelError::AlreadyExists => EEXIST,
+                KernelError::PermissionDenied => EACCES,
+                KernelError::OperationNotSupported => EPERM,
                 _ => EINVAL,
             };
         }
@@ -3872,11 +3872,11 @@ pub fn sys_rmdir(pathname_ptr: u64) -> i64 {
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             match e {
-                FsError::NotFound => ENOENT,
-                FsError::NotADirectory => ENOTDIR,
-                FsError::DirectoryNotEmpty => ENOTEMPTY,
-                FsError::PermissionDenied => EACCES,
-                FsError::Busy => -16, // EBUSY
+                KernelError::NotFound => ENOENT,
+                KernelError::NotDirectory => ENOTDIR,
+                KernelError::DirectoryNotEmpty => ENOTEMPTY,
+                KernelError::PermissionDenied => EACCES,
+                KernelError::Busy => -16, // EBUSY
                 _ => EINVAL,
             }
         }
@@ -3973,9 +3973,9 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, _dev: u64) -> i64 {
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             return match e {
-                FsError::AlreadyExists => EEXIST,
-                FsError::PermissionDenied => EACCES,
-                FsError::NotSupported => EPERM,
+                KernelError::AlreadyExists => EEXIST,
+                KernelError::PermissionDenied => EACCES,
+                KernelError::OperationNotSupported => EPERM,
                 _ => EINVAL,
             };
         }
@@ -4086,9 +4086,9 @@ pub fn sys_unlinkat(dirfd: i32, pathname_ptr: u64, flags: i32) -> i64 {
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             match e {
-                FsError::NotFound => ENOENT,
-                FsError::PermissionDenied => EACCES,
-                FsError::IsADirectory => EISDIR,
+                KernelError::NotFound => ENOENT,
+                KernelError::PermissionDenied => EACCES,
+                KernelError::IsDirectory => EISDIR,
                 _ => EINVAL,
             }
         }
@@ -4142,11 +4142,11 @@ fn sys_unlinkat_rmdir(dirfd: i32, path: &str) -> i64 {
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             match e {
-                FsError::NotFound => ENOENT,
-                FsError::NotADirectory => ENOTDIR,
-                FsError::DirectoryNotEmpty => ENOTEMPTY,
-                FsError::PermissionDenied => EACCES,
-                FsError::Busy => -16, // EBUSY
+                KernelError::NotFound => ENOENT,
+                KernelError::NotDirectory => ENOTDIR,
+                KernelError::DirectoryNotEmpty => ENOTEMPTY,
+                KernelError::PermissionDenied => EACCES,
+                KernelError::Busy => -16, // EBUSY
                 _ => EINVAL,
             }
         }
@@ -4218,8 +4218,8 @@ fn do_fchmodat(dirfd: i32, pathname: u64, mode: u32, flags: i32) -> i64 {
 
         match lookup_path_at(start, &path_str, lookup_flags) {
             Ok(d) => d,
-            Err(FsError::NotFound) => return ENOENT,
-            Err(FsError::NotADirectory) => return ENOTDIR,
+            Err(KernelError::NotFound) => return ENOENT,
+            Err(KernelError::NotDirectory) => return ENOTDIR,
             Err(_) => return EINVAL,
         }
     };
@@ -4334,8 +4334,8 @@ pub fn sys_fchownat(dirfd: i32, pathname: u64, owner: u32, group: u32, flags: i3
 
     let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -4510,8 +4510,8 @@ pub fn sys_utimensat(dirfd: i32, pathname: u64, times: u64, flags: i32) -> i64 {
 
         let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
             Ok(d) => d,
-            Err(FsError::NotFound) => return ENOENT,
-            Err(FsError::NotADirectory) => return ENOTDIR,
+            Err(KernelError::NotFound) => return ENOENT,
+            Err(KernelError::NotDirectory) => return ENOTDIR,
             Err(_) => return EINVAL,
         };
 
@@ -4636,8 +4636,8 @@ pub fn sys_utimes(pathname: u64, times: u64) -> i64 {
     let start = crate::task::percpu::current_cwd();
     let dentry = match lookup_path_at(start, &path_str, LookupFlags::open()) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -4701,8 +4701,8 @@ pub fn sys_utime(pathname: u64, times: u64) -> i64 {
     let start = crate::task::percpu::current_cwd();
     let dentry = match lookup_path_at(start, &path_str, LookupFlags::open()) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -4873,7 +4873,7 @@ pub fn sys_fsync(fd: i32) -> i64 {
     // Call the file's fsync operation
     match file.f_op.fsync(&file) {
         Ok(()) => 0,
-        Err(FsError::IoError) => EIO,
+        Err(KernelError::Io) => EIO,
         Err(_) => EINVAL,
     }
 }
@@ -6001,8 +6001,8 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
     // Look up path to get dentry/superblock
     let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -6191,8 +6191,8 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> 
 
         match lookup_path_at(start, &path, lookup_flags) {
             Ok(d) => d,
-            Err(FsError::NotFound) => return ENOENT,
-            Err(FsError::NotADirectory) => return ENOTDIR,
+            Err(KernelError::NotFound) => return ENOENT,
+            Err(KernelError::NotDirectory) => return ENOTDIR,
             Err(_) => return EINVAL,
         }
     };
@@ -6227,16 +6227,16 @@ pub const XATTR_NAME_MAX: usize = 255;
 /// Maximum attribute value size (64KB)
 pub const XATTR_SIZE_MAX: usize = 65536;
 
-/// Helper to convert FsError to errno for xattr operations
-fn xattr_error_to_errno(e: FsError) -> i64 {
+/// Helper to convert KernelError to errno for xattr operations
+fn xattr_error_to_errno(e: KernelError) -> i64 {
     match e {
-        FsError::NotFound => ENOENT,
-        FsError::NoData => ENODATA,
-        FsError::AlreadyExists => EEXIST,
-        FsError::Range => ERANGE,
-        FsError::NotSupported => EOPNOTSUPP,
-        FsError::PermissionDenied => EPERM,
-        FsError::IoError => -5, // EIO
+        KernelError::NotFound => ENOENT,
+        KernelError::NoData => ENODATA,
+        KernelError::AlreadyExists => EEXIST,
+        KernelError::Range => ERANGE,
+        KernelError::OperationNotSupported => EOPNOTSUPP,
+        KernelError::PermissionDenied => EPERM,
+        KernelError::Io => -5, // EIO
         _ => EINVAL,
     }
 }
@@ -6335,8 +6335,8 @@ fn do_setxattr(
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -6450,8 +6450,8 @@ fn do_getxattr(
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -6592,8 +6592,8 @@ fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) 
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 
@@ -6723,8 +6723,8 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(FsError::NotFound) => return ENOENT,
-        Err(FsError::NotADirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return ENOENT,
+        Err(KernelError::NotDirectory) => return ENOTDIR,
         Err(_) => return EINVAL,
     };
 

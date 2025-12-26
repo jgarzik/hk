@@ -6,7 +6,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::FsError;
+use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{Gid, Inode, Uid};
 use super::mount::{current_mnt_ns, follow_mount};
@@ -64,12 +64,12 @@ fn split_path(path: &str) -> Vec<&str> {
 }
 
 /// Look up a path and return the dentry
-pub fn lookup_path(path: &str) -> Result<Arc<Dentry>, FsError> {
+pub fn lookup_path(path: &str) -> Result<Arc<Dentry>, KernelError> {
     lookup_path_flags(path, LookupFlags::open())
 }
 
 /// Look up a path with specific flags
-pub fn lookup_path_flags(path: &str, flags: LookupFlags) -> Result<Arc<Dentry>, FsError> {
+pub fn lookup_path_flags(path: &str, flags: LookupFlags) -> Result<Arc<Dentry>, KernelError> {
     lookup_path_full(path, flags, 0)
 }
 
@@ -91,7 +91,7 @@ pub fn lookup_path_at(
     start: Option<super::path_ref::Path>,
     path: &str,
     flags: LookupFlags,
-) -> Result<Arc<Dentry>, FsError> {
+) -> Result<Arc<Dentry>, KernelError> {
     lookup_path_at_full(start, path, flags, 0)
 }
 
@@ -101,23 +101,23 @@ fn lookup_path_at_full(
     path: &str,
     flags: LookupFlags,
     symlink_depth: usize,
-) -> Result<Arc<Dentry>, FsError> {
+) -> Result<Arc<Dentry>, KernelError> {
     if symlink_depth > MAX_SYMLINK_DEPTH {
-        return Err(FsError::TooManySymlinks);
+        return Err(KernelError::TooManySymlinks);
     }
 
     // Get the starting point
     let mnt_ns = current_mnt_ns();
     let (mut current, components) = if path.starts_with('/') {
         // Absolute path - always start from root, ignore start
-        let root = mnt_ns.get_root_dentry().ok_or(FsError::NotFound)?;
+        let root = mnt_ns.get_root_dentry().ok_or(KernelError::NotFound)?;
         (root, split_path(path))
     } else {
         // Relative path - use provided start dentry or fall back to root
         let start_dentry = start
             .map(|p| p.dentry.clone())
             .or_else(|| mnt_ns.get_root_dentry())
-            .ok_or(FsError::NotFound)?;
+            .ok_or(KernelError::NotFound)?;
         (start_dentry, split_path(path))
     };
 
@@ -136,11 +136,11 @@ fn lookup_path_at_full(
         }
 
         // Get the current directory's inode
-        let inode = current.get_inode().ok_or(FsError::NotFound)?;
+        let inode = current.get_inode().ok_or(KernelError::NotFound)?;
 
         // Must be a directory to traverse into
         if !inode.mode().is_dir() {
-            return Err(FsError::NotADirectory);
+            return Err(KernelError::NotDirectory);
         }
 
         // Look up in dcache first
@@ -234,7 +234,7 @@ fn lookup_path_at_full(
         && let Some(inode) = current.get_inode()
         && !inode.mode().is_dir()
     {
-        return Err(FsError::NotADirectory);
+        return Err(KernelError::NotDirectory);
     }
 
     Ok(current)
@@ -245,21 +245,21 @@ fn lookup_path_full(
     path: &str,
     flags: LookupFlags,
     symlink_depth: usize,
-) -> Result<Arc<Dentry>, FsError> {
+) -> Result<Arc<Dentry>, KernelError> {
     if symlink_depth > MAX_SYMLINK_DEPTH {
-        return Err(FsError::TooManySymlinks);
+        return Err(KernelError::TooManySymlinks);
     }
 
     // Get the starting point
     let mnt_ns = current_mnt_ns();
     let (mut current, components) = if path.starts_with('/') {
         // Absolute path - start from root
-        let root = mnt_ns.get_root_dentry().ok_or(FsError::NotFound)?;
+        let root = mnt_ns.get_root_dentry().ok_or(KernelError::NotFound)?;
         (root, split_path(path))
     } else {
         // Relative path - for now, treat as absolute from root
         // A real implementation would use the task's cwd
-        let root = mnt_ns.get_root_dentry().ok_or(FsError::NotFound)?;
+        let root = mnt_ns.get_root_dentry().ok_or(KernelError::NotFound)?;
         (root, split_path(path))
     };
 
@@ -278,11 +278,11 @@ fn lookup_path_full(
         }
 
         // Get the current directory's inode
-        let inode = current.get_inode().ok_or(FsError::NotFound)?;
+        let inode = current.get_inode().ok_or(KernelError::NotFound)?;
 
         // Must be a directory to traverse into
         if !inode.mode().is_dir() {
-            return Err(FsError::NotADirectory);
+            return Err(KernelError::NotDirectory);
         }
 
         // Look up in dcache first
@@ -376,19 +376,19 @@ fn lookup_path_full(
         && let Some(inode) = current.get_inode()
         && !inode.mode().is_dir()
     {
-        return Err(FsError::NotADirectory);
+        return Err(KernelError::NotDirectory);
     }
 
     Ok(current)
 }
 
 /// Look up parent directory and return (parent_dentry, final_component_name)
-pub fn lookup_parent(path: &str) -> Result<(Arc<Dentry>, &str), FsError> {
+pub fn lookup_parent(path: &str) -> Result<(Arc<Dentry>, &str), KernelError> {
     // Find the last path component
     let path = path.trim_end_matches('/');
 
     if path.is_empty() || path == "/" {
-        return Err(FsError::InvalidArgument);
+        return Err(KernelError::InvalidArgument);
     }
 
     let (parent_path, name) = match path.rfind('/') {
@@ -404,7 +404,7 @@ pub fn lookup_parent(path: &str) -> Result<(Arc<Dentry>, &str), FsError> {
     };
 
     if name.is_empty() {
-        return Err(FsError::InvalidArgument);
+        return Err(KernelError::InvalidArgument);
     }
 
     let parent_dentry = lookup_path(parent_path)?;
@@ -412,17 +412,17 @@ pub fn lookup_parent(path: &str) -> Result<(Arc<Dentry>, &str), FsError> {
 }
 
 /// Create a file at the given path
-pub fn create_file(path: &str, mode: super::inode::InodeMode) -> Result<Arc<Dentry>, FsError> {
+pub fn create_file(path: &str, mode: super::inode::InodeMode) -> Result<Arc<Dentry>, KernelError> {
     let (parent, name) = lookup_parent(path)?;
 
-    let parent_inode = parent.get_inode().ok_or(FsError::NotFound)?;
+    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
     if !parent_inode.mode().is_dir() {
-        return Err(FsError::NotADirectory);
+        return Err(KernelError::NotDirectory);
     }
 
     // Check if already exists
     if parent.lookup_child(name).is_some() {
-        return Err(FsError::AlreadyExists);
+        return Err(KernelError::AlreadyExists);
     }
 
     // Create the inode
@@ -441,17 +441,17 @@ pub fn create_file(path: &str, mode: super::inode::InodeMode) -> Result<Arc<Dent
 }
 
 /// Create a directory at the given path
-pub fn create_dir(path: &str, mode: super::inode::InodeMode) -> Result<Arc<Dentry>, FsError> {
+pub fn create_dir(path: &str, mode: super::inode::InodeMode) -> Result<Arc<Dentry>, KernelError> {
     let (parent, name) = lookup_parent(path)?;
 
-    let parent_inode = parent.get_inode().ok_or(FsError::NotFound)?;
+    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
     if !parent_inode.mode().is_dir() {
-        return Err(FsError::NotADirectory);
+        return Err(KernelError::NotDirectory);
     }
 
     // Check if already exists
     if parent.lookup_child(name).is_some() {
-        return Err(FsError::AlreadyExists);
+        return Err(KernelError::AlreadyExists);
     }
 
     // Create the directory inode
@@ -478,8 +478,8 @@ pub fn create_dir(path: &str, mode: super::inode::InodeMode) -> Result<Arc<Dentr
 /// * `mask` - Permission mask (MAY_READ, MAY_WRITE, MAY_EXEC, or combination)
 ///
 /// # Returns
-/// `Ok(())` if access is allowed, `Err(FsError::PermissionDenied)` otherwise
-pub fn inode_permission(inode: &Inode, uid: Uid, gid: Gid, mask: u32) -> Result<(), FsError> {
+/// `Ok(())` if access is allowed, `Err(KernelError::PermissionDenied)` otherwise
+pub fn inode_permission(inode: &Inode, uid: Uid, gid: Gid, mask: u32) -> Result<(), KernelError> {
     // Root (uid 0) bypasses all permission checks
     if uid == 0 {
         return Ok(());
@@ -492,6 +492,6 @@ pub fn inode_permission(inode: &Inode, uid: Uid, gid: Gid, mask: u32) -> Result<
     {
         Ok(())
     } else {
-        Err(FsError::PermissionDenied)
+        Err(KernelError::PermissionDenied)
     }
 }

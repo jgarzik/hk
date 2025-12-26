@@ -21,6 +21,7 @@ use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use spin::{Mutex, RwLock};
 
 use crate::arch::FrameAlloc;
+use crate::error::KernelError;
 
 /// Page size constant (4KB)
 pub const PAGE_SIZE: usize = 4096;
@@ -772,16 +773,6 @@ impl AddressSpace {
     }
 }
 
-/// Page cache error types
-#[derive(Debug)]
-pub enum PageCacheError {
-    /// Out of physical memory
-    OutOfMemory,
-    /// All cached pages are in use (cannot evict)
-    AllPagesInUse,
-    /// Page offset out of bounds
-    OutOfBounds,
-}
 
 /// Cache key for looking up pages
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -902,7 +893,7 @@ impl PageCache {
         can_writeback: bool,
         unevictable: bool,
         a_ops: &'static dyn AddressSpaceOps,
-    ) -> Result<(Arc<CachedPage>, bool), PageCacheError> {
+    ) -> Result<(Arc<CachedPage>, bool), KernelError> {
         // Check if page already exists (with lock held the entire time)
         if let Some(page) = self.find_get_page(file_id, page_offset) {
             return Ok((page, false)); // false = not newly created
@@ -950,7 +941,7 @@ impl PageCache {
         can_writeback: bool,
         unevictable: bool,
         a_ops: &'static dyn AddressSpaceOps,
-    ) -> Result<Arc<CachedPage>, PageCacheError> {
+    ) -> Result<Arc<CachedPage>, KernelError> {
         // Check if we need to evict
         if self.current_pages.load(Ordering::Relaxed) >= self.max_pages {
             self.evict_one(frame_alloc)?;
@@ -959,7 +950,7 @@ impl PageCache {
         // Allocate frame
         let frame = frame_alloc
             .alloc_frame()
-            .ok_or(PageCacheError::OutOfMemory)?;
+            .ok_or(KernelError::OutOfMemory)?;
 
         // Copy data to frame
         unsafe {
@@ -1031,7 +1022,7 @@ impl PageCache {
     fn evict_one<FA: FrameAlloc<PhysAddr = u64>>(
         &mut self,
         frame_alloc: &mut FA,
-    ) -> Result<(), PageCacheError> {
+    ) -> Result<(), KernelError> {
         let max_attempts = self.fifo_queue.len();
         let mut attempts = 0;
 
@@ -1126,7 +1117,7 @@ impl PageCache {
             attempts += 1;
         }
 
-        Err(PageCacheError::AllPagesInUse)
+        Err(KernelError::OutOfMemory)
     }
 
     /// Get cache statistics
@@ -1158,7 +1149,7 @@ impl PageCache {
         can_writeback: bool,
         unevictable: bool,
         a_ops: &'static dyn AddressSpaceOps,
-    ) -> Result<Arc<CachedPage>, PageCacheError> {
+    ) -> Result<Arc<CachedPage>, KernelError> {
         // Check if we need to evict
         if self.current_pages.load(Ordering::Relaxed) >= self.max_pages {
             self.evict_one(frame_alloc)?;
@@ -1167,7 +1158,7 @@ impl PageCache {
         // Allocate frame
         let frame = frame_alloc
             .alloc_frame()
-            .ok_or(PageCacheError::OutOfMemory)?;
+            .ok_or(KernelError::OutOfMemory)?;
 
         // Zero the frame
         unsafe {

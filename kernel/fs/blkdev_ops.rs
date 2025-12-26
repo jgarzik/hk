@@ -16,8 +16,8 @@ use alloc::sync::Arc;
 use core::cmp::min;
 
 use crate::frame_alloc::FrameAllocRef;
-use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE, PageCacheError};
-use crate::storage::{BlockDevice, BlockError, get_blkdev};
+use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
+use crate::storage::{BlockDevice, get_blkdev};
 use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
 // ============================================================================
@@ -67,33 +67,8 @@ impl AddressSpaceOps for BlkdevAddressSpaceOps {
 pub static BLKDEV_AOPS: BlkdevAddressSpaceOps = BlkdevAddressSpaceOps;
 
 use super::file::{File, FileOps, seek};
-use super::vfs::FsError;
+use crate::error::KernelError;
 
-/// Convert BlockError to FsError
-impl From<BlockError> for FsError {
-    fn from(e: BlockError) -> Self {
-        match e {
-            BlockError::IoError => FsError::IoError,
-            BlockError::OutOfRange => FsError::InvalidArgument,
-            BlockError::NotReady => FsError::IoError,
-            BlockError::InvalidArg => FsError::InvalidArgument,
-            BlockError::NotFound => FsError::NotFound,
-            BlockError::NotSupported => FsError::NotSupported,
-            BlockError::AlreadyExists => FsError::AlreadyExists,
-        }
-    }
-}
-
-/// Convert PageCacheError to FsError
-impl From<PageCacheError> for FsError {
-    fn from(e: PageCacheError) -> Self {
-        match e {
-            PageCacheError::OutOfMemory => FsError::IoError,
-            PageCacheError::AllPagesInUse => FsError::IoError,
-            PageCacheError::OutOfBounds => FsError::InvalidArgument,
-        }
-    }
-}
 
 /// Block device file operations
 ///
@@ -103,9 +78,9 @@ pub struct BlockFileOps;
 
 impl BlockFileOps {
     /// Get the BlockDevice from a file's inode rdev
-    fn get_bdev(file: &File) -> Result<Arc<BlockDevice>, FsError> {
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
-        get_blkdev(inode.rdev).ok_or(FsError::NotFound)
+    fn get_bdev(file: &File) -> Result<Arc<BlockDevice>, KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        get_blkdev(inode.rdev).ok_or(KernelError::NotFound)
     }
 
     /// Get FileId for a block device's page cache
@@ -121,7 +96,7 @@ impl BlockFileOps {
     ///
     /// Uses `find_or_create_page()` to atomically find or create the page,
     /// preventing the TOCTOU race that could occur with separate lookup and add.
-    fn get_page(bdev: &BlockDevice, page_offset: u64) -> Result<u64, FsError> {
+    fn get_page(bdev: &BlockDevice, page_offset: u64) -> Result<u64, KernelError> {
         let file_id = Self::file_id_for_bdev(bdev);
         let capacity = bdev.capacity();
 
@@ -165,7 +140,7 @@ impl FileOps for BlockFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         let bdev = Self::get_bdev(file)?;
         let pos = file.get_pos();
         let capacity = bdev.capacity();
@@ -208,14 +183,14 @@ impl FileOps for BlockFileOps {
         Ok(bytes_read)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, FsError> {
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         let bdev = Self::get_bdev(file)?;
         let pos = file.get_pos();
         let capacity = bdev.capacity();
 
         // Cannot write past end of block device
         if pos >= capacity {
-            return Err(FsError::InvalidArgument);
+            return Err(KernelError::InvalidArgument);
         }
 
         let available = (capacity - pos) as usize;
@@ -254,7 +229,7 @@ impl FileOps for BlockFileOps {
         Ok(bytes_written)
     }
 
-    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, FsError> {
+    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
         let bdev = Self::get_bdev(file)?;
         let pos = offset;
         let capacity = bdev.capacity();
@@ -295,14 +270,14 @@ impl FileOps for BlockFileOps {
         Ok(bytes_read)
     }
 
-    fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, FsError> {
+    fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
         let bdev = Self::get_bdev(file)?;
         let pos = offset;
         let capacity = bdev.capacity();
 
         // Cannot write past end of block device
         if pos >= capacity {
-            return Err(FsError::InvalidArgument);
+            return Err(KernelError::InvalidArgument);
         }
 
         let available = (capacity - pos) as usize;
@@ -339,14 +314,14 @@ impl FileOps for BlockFileOps {
         Ok(bytes_written)
     }
 
-    fn llseek(&self, file: &File, offset: i64, whence: i32) -> Result<u64, FsError> {
+    fn llseek(&self, file: &File, offset: i64, whence: i32) -> Result<u64, KernelError> {
         let bdev = Self::get_bdev(file)?;
         let capacity = bdev.capacity();
 
         let new_pos = match whence {
             seek::SEEK_SET => {
                 if offset < 0 {
-                    return Err(FsError::InvalidArgument);
+                    return Err(KernelError::InvalidArgument);
                 }
                 offset as u64
             }
@@ -354,7 +329,7 @@ impl FileOps for BlockFileOps {
                 let cur = file.get_pos();
                 if offset < 0 {
                     cur.checked_sub((-offset) as u64)
-                        .ok_or(FsError::InvalidArgument)?
+                        .ok_or(KernelError::InvalidArgument)?
                 } else {
                     cur.saturating_add(offset as u64)
                 }
@@ -365,17 +340,17 @@ impl FileOps for BlockFileOps {
                 } else {
                     capacity
                         .checked_sub((-offset) as u64)
-                        .ok_or(FsError::InvalidArgument)?
+                        .ok_or(KernelError::InvalidArgument)?
                 }
             }
-            _ => return Err(FsError::InvalidArgument),
+            _ => return Err(KernelError::InvalidArgument),
         };
 
         file.set_pos(new_pos);
         Ok(new_pos)
     }
 
-    fn fsync(&self, file: &File) -> Result<(), FsError> {
+    fn fsync(&self, file: &File) -> Result<(), KernelError> {
         use crate::mm::writeback::{WritebackControl, do_writepages_for_file, wait_on_writeback};
 
         let bdev = Self::get_bdev(file)?;
@@ -384,7 +359,7 @@ impl FileOps for BlockFileOps {
         // Write all dirty pages using the writeback module
         // (proper writeback flag tracking and async I/O support)
         let mut wbc = WritebackControl::for_fsync();
-        do_writepages_for_file(file_id, &mut wbc).map_err(|_| FsError::IoError)?;
+        do_writepages_for_file(file_id, &mut wbc).map_err(|_| KernelError::Io)?;
 
         // Wait for all writeback to complete
         wait_on_writeback(file_id);

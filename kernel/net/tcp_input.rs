@@ -292,7 +292,7 @@ fn process_syn_sent(socket: &Arc<Socket>, hdr: &TcpHdr, _payload: &[u8]) {
         if hdr.has_flag(flags::RST) {
             // Connection refused
             tcp.set_state(TcpState::Closed);
-            socket.set_error(-crate::net::libc::ECONNREFUSED);
+            socket.set_error(crate::error::KernelError::ConnectionRefused.to_errno_neg());
             socket.wake_connect();
             return;
         }
@@ -325,7 +325,7 @@ fn process_established(socket: &Arc<Socket>, hdr: &TcpHdr, payload: &[u8], _sadd
     // Check RST
     if hdr.has_flag(flags::RST) {
         tcp.set_state(TcpState::Closed);
-        socket.set_error(-crate::net::libc::ECONNRESET);
+        socket.set_error(crate::error::KernelError::ConnectionReset.to_errno_neg());
         socket.wake_all();
         return;
     }

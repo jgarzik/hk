@@ -46,6 +46,7 @@ pub mod usb;
 
 mod arch;
 mod cmdline;
+pub mod error;
 mod frame_alloc;
 pub mod fs;
 mod heap;

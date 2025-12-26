@@ -20,9 +20,11 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use super::{
-    Bio, BioOp, BlockDevice, BlockDriver, BlockError, DevId, Disk, QueueLimits, RequestQueue,
+    Bio, BioOp, BlockDevice, BlockDriver, DevId, Disk, QueueLimits, RequestQueue,
     major, register_blkdev, unregister_blkdev,
 };
+
+use crate::error::KernelError;
 
 use super::scsi::{
     Cdb, ScsiCommand, ScsiError, ScsiHost, ScsiResult, inquiry, read_capacity, test_unit_ready,
@@ -324,7 +326,7 @@ impl BlockDriver for ScsiDiskDriver {
 
 impl ScsiDiskDriver {
     /// Handle a read bio
-    fn handle_read(&self, bio: &Bio) -> Result<(), BlockError> {
+    fn handle_read(&self, bio: &Bio) -> Result<(), KernelError> {
         // For each segment in the bio, read the data
         for seg in &bio.segs {
             let buf = unsafe { core::slice::from_raw_parts_mut(seg.frame as *mut u8, seg.len) };
@@ -333,27 +335,27 @@ impl ScsiDiskDriver {
             let sectors_per_seg = seg.len / 512;
             self.disk
                 .read_sectors(bio.lba, sectors_per_seg as u32, buf)
-                .map_err(|_| BlockError::IoError)?;
+                .map_err(|_| KernelError::Io)?;
         }
         Ok(())
     }
 
     /// Handle a write bio
-    fn handle_write(&self, bio: &Bio) -> Result<(), BlockError> {
+    fn handle_write(&self, bio: &Bio) -> Result<(), KernelError> {
         for seg in &bio.segs {
             let buf = unsafe { core::slice::from_raw_parts(seg.frame as *const u8, seg.len) };
 
             let sectors_per_seg = seg.len / 512;
             self.disk
                 .write_sectors(bio.lba, sectors_per_seg as u32, buf)
-                .map_err(|_| BlockError::IoError)?;
+                .map_err(|_| KernelError::Io)?;
         }
         Ok(())
     }
 
     /// Handle a flush bio
-    fn handle_flush(&self) -> Result<(), BlockError> {
-        self.disk.sync_cache().map_err(|_| BlockError::IoError)
+    fn handle_flush(&self) -> Result<(), KernelError> {
+        self.disk.sync_cache().map_err(|_| KernelError::Io)
     }
 }
 
@@ -372,9 +374,9 @@ pub fn create_scsi_disk(
     target: u8,
     lun: u8,
     minor: u16,
-) -> Result<Arc<BlockDevice>, BlockError> {
+) -> Result<Arc<BlockDevice>, KernelError> {
     // Probe the device
-    let scsi_disk = Arc::new(ScsiDisk::probe(host, target, lun).map_err(|_| BlockError::NotFound)?);
+    let scsi_disk = Arc::new(ScsiDisk::probe(host, target, lun).map_err(|_| KernelError::NotFound)?);
 
     // Create driver
     let driver = ScsiDiskDriver::new(scsi_disk.clone());
@@ -436,8 +438,8 @@ pub fn create_scsi_disk(
 ///
 /// # Returns
 /// * `Ok(())` - Device was successfully unregistered
-/// * `Err(BlockError::NotFound)` - No device with this minor number
-pub fn unregister_scsi_disk(minor: u16) -> Result<(), BlockError> {
+/// * `Err(KernelError::NotFound)` - No device with this minor number
+pub fn unregister_scsi_disk(minor: u16) -> Result<(), KernelError> {
     let dev_id = DevId::new(major::SCSI_DISK, minor);
 
     crate::printkln!(
@@ -449,7 +451,7 @@ pub fn unregister_scsi_disk(minor: u16) -> Result<(), BlockError> {
 
     // Unregister from block device registry
     // This calls mark_dead() which stops the request queue
-    let _bdev = unregister_blkdev(dev_id).ok_or(BlockError::NotFound)?;
+    let _bdev = unregister_blkdev(dev_id).ok_or(KernelError::NotFound)?;
 
     // Invalidate page cache entries for this block device
     // This frees all cached pages belonging to this device

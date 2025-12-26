@@ -54,20 +54,21 @@ pub use superblock::{
     SuperBlock, SuperOps, find_filesystem, init_fs_registry, register_filesystem,
 };
 pub use vfat::{VFAT_FILE_OPS, VFAT_TYPE};
-pub use vfs::{FileMetadata, FileSystem, FsError, Vfs};
+pub use crate::error::KernelError;
+pub use vfs::{FileMetadata, FileSystem, Vfs};
 
-/// Filesystem error types (extending the original FsError)
-impl FsError {
+/// Filesystem error types (extending the original KernelError)
+impl KernelError {
     /// Operation not supported
     pub const fn not_supported() -> Self {
-        FsError::NotSupported
+        KernelError::OperationNotSupported
     }
 }
 
 // Add additional error variants
-impl From<&str> for FsError {
+impl From<&str> for KernelError {
     fn from(_: &str) -> Self {
-        FsError::IoError
+        KernelError::Io
     }
 }
 
@@ -90,9 +91,9 @@ pub fn kernel_open_exec(path: &str) -> Result<Arc<File>, i32> {
 
     // Look up the path
     let dentry = lookup_path_flags(path, LookupFlags::open()).map_err(|e| match e {
-        FsError::NotFound => ENOENT,
-        FsError::NotADirectory => ENOENT,
-        FsError::PermissionDenied => EACCES,
+        KernelError::NotFound => ENOENT,
+        KernelError::NotDirectory => ENOENT,
+        KernelError::PermissionDenied => EACCES,
         _ => ENOENT,
     })?;
 

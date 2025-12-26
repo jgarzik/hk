@@ -192,7 +192,7 @@ pub fn sys_connect(fd: i32, addr: u64, addrlen: u64) -> i64 {
 
     // Initiate connection
     if let Err(e) = tcp::tcp_connect(&socket, remote_addr, remote_port) {
-        return e.to_errno() as i64;
+        return e.to_errno_neg() as i64;
     }
 
     // Non-blocking: return EINPROGRESS
@@ -692,14 +692,14 @@ pub fn sys_sendmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
             // For TCP, ignore dest - use connected address
             match tcp::tcp_sendmsg(&socket, &data) {
                 Ok(n) => n as i64,
-                Err(e) => e.to_errno() as i64,
+                Err(e) => e.to_errno_neg() as i64,
             }
         }
         SocketType::Dgram => {
             // For UDP, use dest if provided, otherwise use connected address
             match udp::udp_sendmsg(&socket, &data, dest) {
                 Ok(n) => n as i64,
-                Err(e) => e.to_errno() as i64,
+                Err(e) => e.to_errno_neg() as i64,
             }
         }
         _ => errno::EOPNOTSUPP,
@@ -858,7 +858,7 @@ pub fn sys_shutdown(fd: i32, how: i32) -> i64 {
         1 | 2 => {
             // SHUT_WR or SHUT_RDWR - close the connection
             if let Err(e) = tcp::tcp_close(&socket) {
-                return e.to_errno() as i64;
+                return e.to_errno_neg() as i64;
             }
             if how == 2 {
                 socket.set_eof();
@@ -957,7 +957,7 @@ pub fn sys_sendto(fd: i32, buf: u64, len: u64, _flags: i32, dest_addr: u64, addr
             // TCP: use tcp_sendmsg (ignores dest_addr)
             match tcp::tcp_sendmsg(&socket, data) {
                 Ok(n) => n as i64,
-                Err(e) => e.to_errno() as i64,
+                Err(e) => e.to_errno_neg() as i64,
             }
         }
         SocketType::Dgram => {
@@ -973,7 +973,7 @@ pub fn sys_sendto(fd: i32, buf: u64, len: u64, _flags: i32, dest_addr: u64, addr
 
             match udp::udp_sendmsg(&socket, data, dest) {
                 Ok(n) => n as i64,
-                Err(e) => e.to_errno() as i64,
+                Err(e) => e.to_errno_neg() as i64,
             }
         }
         _ => errno::EOPNOTSUPP,

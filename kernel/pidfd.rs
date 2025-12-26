@@ -32,7 +32,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
-use crate::fs::FsError;
+use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
@@ -161,21 +161,21 @@ impl FileOps for PidfdFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
         // pidfds don't support read
-        Err(FsError::InvalidArgument)
+        Err(KernelError::InvalidArgument)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, FsError> {
+    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
         // pidfds don't support write
-        Err(FsError::InvalidArgument)
+        Err(KernelError::InvalidArgument)
     }
 
     fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
         self.pidfd.poll(pt)
     }
 
-    fn release(&self, _file: &File) -> Result<(), FsError> {
+    fn release(&self, _file: &File) -> Result<(), KernelError> {
         self.pidfd.release();
         Ok(())
     }
@@ -189,7 +189,7 @@ impl FileOps for PidfdFileOps {
 ///
 /// # Returns
 /// Arc<File> for the new pidfd
-pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, FsError> {
+pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError> {
     let pidfd = Pidfd::new(pid);
 
     // Create file operations
@@ -209,7 +209,7 @@ pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, FsError> {
 }
 
 /// Create a dummy dentry for pidfd
-fn create_pidfd_dentry() -> Result<Arc<Dentry>, FsError> {
+fn create_pidfd_dentry() -> Result<Arc<Dentry>, KernelError> {
     let mode = InodeMode::regular(0o600);
     let inode = Arc::new(Inode::new(
         0, // ino=0 for anonymous

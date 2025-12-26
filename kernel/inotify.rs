@@ -37,7 +37,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
-use crate::fs::FsError;
+use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
@@ -358,10 +358,10 @@ impl Inotify {
     }
 
     /// Read events from the inotify instance
-    pub fn read(&self, buf: &mut [u8], nonblock: bool) -> Result<usize, FsError> {
+    pub fn read(&self, buf: &mut [u8], nonblock: bool) -> Result<usize, KernelError> {
         // Buffer must be at least big enough for one event header
         if buf.len() < INOTIFY_EVENT_HEADER_SIZE {
-            return Err(FsError::InvalidArgument);
+            return Err(KernelError::InvalidArgument);
         }
 
         loop {
@@ -378,7 +378,7 @@ impl Inotify {
                     if bytes_written + event_size > buf.len() {
                         if bytes_written == 0 {
                             // First event doesn't fit
-                            return Err(FsError::InvalidArgument);
+                            return Err(KernelError::InvalidArgument);
                         }
                         break;
                     }
@@ -436,7 +436,7 @@ impl Inotify {
             drop(inner);
 
             if nonblock {
-                return Err(FsError::WouldBlock);
+                return Err(KernelError::WouldBlock);
             }
 
             // Wait for events
@@ -507,20 +507,20 @@ impl FileOps for InotifyFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
         self.inotify.read(buf, nonblock)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, FsError> {
-        Err(FsError::InvalidArgument)
+    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
+        Err(KernelError::InvalidArgument)
     }
 
     fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
         self.inotify.poll(pt)
     }
 
-    fn release(&self, _file: &File) -> Result<(), FsError> {
+    fn release(&self, _file: &File) -> Result<(), KernelError> {
         self.inotify.release();
         Ok(())
     }
@@ -537,7 +537,7 @@ impl FileOps for InotifyFileOps {
 ///
 /// # Returns
 /// Arc<File> for the new inotify fd
-pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, FsError> {
+pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, KernelError> {
     let inotify = Inotify::new();
 
     // Create file operations
@@ -557,7 +557,7 @@ pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, FsError> {
 }
 
 /// Create a dummy dentry for inotify
-fn create_inotify_dentry() -> Result<Arc<Dentry>, FsError> {
+fn create_inotify_dentry() -> Result<Arc<Dentry>, KernelError> {
     let mode = InodeMode::regular(0o600);
     let inode = Arc::new(Inode::new(
         0,
@@ -763,10 +763,10 @@ fn resolve_path_to_ino(pathname: &str, mask: u32) -> Result<(u64, bool), i64> {
         Ok(d) => d,
         Err(e) => {
             return Err(match e {
-                FsError::NotFound => -2,          // ENOENT
-                FsError::NotADirectory => -20,    // ENOTDIR
-                FsError::PermissionDenied => -13, // EACCES
-                FsError::TooManySymlinks => -40,  // ELOOP
+                KernelError::NotFound => -2,          // ENOENT
+                KernelError::NotDirectory => -20,    // ENOTDIR
+                KernelError::PermissionDenied => -13, // EACCES
+                KernelError::TooManySymlinks => -40,  // ELOOP
                 _ => -22,                         // EINVAL
             });
         }

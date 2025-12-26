@@ -188,14 +188,12 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             }
 
             // COW handling: permission fault on write to a COW-marked page
-            if is_permission_fault && is_write {
-                if let Some(true) = handle_cow_fault(far) {
-                    return; // COW resolved, resume execution
-                }
-                // If handle_cow_fault returns None, it's not a COW page
-                // If it returns Some(false), COW resolution failed (OOM)
-                // In both cases, fall through to SIGSEGV
+            if is_permission_fault && is_write && let Some(true) = handle_cow_fault(far) {
+                return; // COW resolved, resume execution
             }
+            // If handle_cow_fault returns None, it's not a COW page
+            // If it returns Some(false), COW resolution failed (OOM)
+            // In both cases, fall through to SIGSEGV
 
             // Unhandled fault - send signal to process
             printkln!(

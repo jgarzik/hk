@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use ::core::cmp::min;
 use spin::RwLock;
 
-use super::FsError;
+use super::KernelError;
 use super::dentry::Dentry;
 use super::file::{DirEntry, File, FileOps};
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
@@ -313,13 +313,13 @@ impl InodeData for ProcfsInodeWrapper {}
 pub struct ProcfsInodeOps;
 
 impl InodeOps for ProcfsInodeOps {
-    fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, FsError> {
-        let private = dir.get_private().ok_or(FsError::IoError)?;
+    fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError> {
+        let private = dir.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
             .as_ref()
             .as_any()
             .downcast_ref::<ProcfsInodeWrapper>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         let data = wrapper.0.read();
         match &*data {
@@ -341,7 +341,7 @@ impl InodeOps for ProcfsInodeOps {
                     }
                 }
 
-                Err(FsError::NotFound)
+                Err(KernelError::NotFound)
             }
             ProcfsInodeData::PidDirectory { pid } => {
                 // Handle /proc/<pid>/* lookups
@@ -362,20 +362,20 @@ impl InodeOps for ProcfsInodeOps {
             ProcfsInodeData::File { .. }
             | ProcfsInodeData::NamespaceFile { .. }
             | ProcfsInodeData::FdSymlink { .. }
-            | ProcfsInodeData::FdinfoFile { .. } => Err(FsError::NotADirectory),
+            | ProcfsInodeData::FdinfoFile { .. } => Err(KernelError::NotDirectory),
         }
     }
 
-    fn readpage(&self, inode: &Inode, page_offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn readpage(&self, inode: &Inode, page_offset: u64, buf: &mut [u8]) -> Result<usize, KernelError> {
         // For procfs, we generate content on demand
         // This is called for page cache integration but procfs typically
         // doesn't use the page cache (content is ephemeral)
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
             .as_ref()
             .as_any()
             .downcast_ref::<ProcfsInodeWrapper>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         let data = wrapper.0.read();
         let content = match &*data {
@@ -388,13 +388,13 @@ impl InodeOps for ProcfsInodeOps {
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
             ProcfsInodeData::FdSymlink { .. } => {
                 // Symlinks don't have content, readlink() handles them
-                return Err(FsError::IoError);
+                return Err(KernelError::Io);
             }
             ProcfsInodeData::Directory { .. }
             | ProcfsInodeData::PidDirectory { .. }
             | ProcfsInodeData::PidNsDirectory { .. }
             | ProcfsInodeData::PidFdDirectory { .. }
-            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(FsError::IsADirectory),
+            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
         };
 
         let page_size = buf.len();
@@ -441,16 +441,16 @@ fn create_pid_dir_inode(parent: &Inode, pid: Pid) -> Arc<Inode> {
 }
 
 /// Look up entries in /proc/<pid>/
-fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, FsError> {
+fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, KernelError> {
     // Verify the task still exists
     if !task_exists(pid) {
-        return Err(FsError::NotFound);
+        return Err(KernelError::NotFound);
     }
 
     match name {
         "ns" => {
             // Create /proc/<pid>/ns directory
-            let sb = dir.superblock().ok_or(FsError::IoError)?;
+            let sb = dir.superblock().ok_or(KernelError::Io)?;
             let inode = Arc::new(Inode::new(
                 pid_ino(pid, 1),
                 InodeMode::directory(0o555), // r-xr-xr-x
@@ -468,7 +468,7 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, FsE
         }
         "fd" => {
             // Create /proc/<pid>/fd directory
-            let sb = dir.superblock().ok_or(FsError::IoError)?;
+            let sb = dir.superblock().ok_or(KernelError::Io)?;
             let inode = Arc::new(Inode::new(
                 pid_ino(pid, 100),           // offset 100 for fd dir
                 InodeMode::directory(0o500), // dr-x------ (only owner can read)
@@ -486,7 +486,7 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, FsE
         }
         "fdinfo" => {
             // Create /proc/<pid>/fdinfo directory
-            let sb = dir.superblock().ok_or(FsError::IoError)?;
+            let sb = dir.superblock().ok_or(KernelError::Io)?;
             let inode = Arc::new(Inode::new(
                 pid_ino(pid, 101),           // offset 101 for fdinfo dir
                 InodeMode::directory(0o500), // dr-x------ (only owner can read)
@@ -503,22 +503,22 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, FsE
             Ok(inode)
         }
         // Future: add "status", "cmdline", "maps", etc.
-        _ => Err(FsError::NotFound),
+        _ => Err(KernelError::NotFound),
     }
 }
 
 /// Look up entries in /proc/<pid>/ns/
-fn lookup_pid_ns_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, FsError> {
+fn lookup_pid_ns_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, KernelError> {
     // Verify the task still exists
     if !task_exists(pid) {
-        return Err(FsError::NotFound);
+        return Err(KernelError::NotFound);
     }
 
     // Parse namespace type from name
-    let ns_type = NamespaceType::parse(name).ok_or(FsError::NotFound)?;
+    let ns_type = NamespaceType::parse(name).ok_or(KernelError::NotFound)?;
 
     // Create namespace file inode
-    let sb = dir.superblock().ok_or(FsError::IoError)?;
+    let sb = dir.superblock().ok_or(KernelError::Io)?;
     let offset = match ns_type {
         NamespaceType::Uts => 2,
         NamespaceType::Mnt => 3,
@@ -545,20 +545,20 @@ fn lookup_pid_ns_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, 
 }
 
 /// Look up entries in /proc/<pid>/fd/
-fn lookup_pid_fd_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, FsError> {
+fn lookup_pid_fd_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, KernelError> {
     // Verify the task still exists
     if !task_exists(pid) {
-        return Err(FsError::NotFound);
+        return Err(KernelError::NotFound);
     }
 
     // Parse fd number from name
-    let fd: i32 = name.parse().map_err(|_| FsError::NotFound)?;
+    let fd: i32 = name.parse().map_err(|_| KernelError::NotFound)?;
     if fd < 0 {
-        return Err(FsError::NotFound);
+        return Err(KernelError::NotFound);
     }
 
     // Verify the FD exists for this task
-    let tid = get_tid_for_pid(pid).ok_or(FsError::NotFound)?;
+    let tid = get_tid_for_pid(pid).ok_or(KernelError::NotFound)?;
     let fd_exists = {
         if let Some(table_arc) = crate::task::fdtable::get_task_fd(tid) {
             let table = table_arc.lock();
@@ -568,11 +568,11 @@ fn lookup_pid_fd_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, 
         }
     };
     if !fd_exists {
-        return Err(FsError::NotFound);
+        return Err(KernelError::NotFound);
     }
 
     // Create symlink inode for /proc/<pid>/fd/<n>
-    let sb = dir.superblock().ok_or(FsError::IoError)?;
+    let sb = dir.superblock().ok_or(KernelError::Io)?;
     let inode = Arc::new(Inode::new(
         pid_ino(pid, 200 + fd as u64), // offset 200+ for fd symlinks
         InodeMode::symlink(),          // lrwxrwxrwx
@@ -590,20 +590,20 @@ fn lookup_pid_fd_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, 
 }
 
 /// Look up entries in /proc/<pid>/fdinfo/
-fn lookup_pid_fdinfo_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, FsError> {
+fn lookup_pid_fdinfo_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, KernelError> {
     // Verify the task still exists
     if !task_exists(pid) {
-        return Err(FsError::NotFound);
+        return Err(KernelError::NotFound);
     }
 
     // Parse fd number from name
-    let fd: i32 = name.parse().map_err(|_| FsError::NotFound)?;
+    let fd: i32 = name.parse().map_err(|_| KernelError::NotFound)?;
     if fd < 0 {
-        return Err(FsError::NotFound);
+        return Err(KernelError::NotFound);
     }
 
     // Verify the FD exists for this task
-    let tid = get_tid_for_pid(pid).ok_or(FsError::NotFound)?;
+    let tid = get_tid_for_pid(pid).ok_or(KernelError::NotFound)?;
     let fd_exists = {
         if let Some(table_arc) = crate::task::fdtable::get_task_fd(tid) {
             let table = table_arc.lock();
@@ -613,11 +613,11 @@ fn lookup_pid_fdinfo_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inod
         }
     };
     if !fd_exists {
-        return Err(FsError::NotFound);
+        return Err(KernelError::NotFound);
     }
 
     // Create regular file inode for /proc/<pid>/fdinfo/<n>
-    let sb = dir.superblock().ok_or(FsError::IoError)?;
+    let sb = dir.superblock().ok_or(KernelError::Io)?;
     let inode = Arc::new(Inode::new(
         pid_ino(pid, 500 + fd as u64), // offset 500+ for fdinfo files
         InodeMode::regular(0o444),     // r--r--r--
@@ -702,14 +702,14 @@ impl FileOps for ProcfsFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, FsError> {
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
             .as_ref()
             .as_any()
             .downcast_ref::<ProcfsInodeWrapper>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         let data = wrapper.0.read();
         let content = match &*data {
@@ -718,12 +718,12 @@ impl FileOps for ProcfsFileOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::FdSymlink { .. } => return Err(FsError::IoError),
+            ProcfsInodeData::FdSymlink { .. } => return Err(KernelError::Io),
             ProcfsInodeData::Directory { .. }
             | ProcfsInodeData::PidDirectory { .. }
             | ProcfsInodeData::PidNsDirectory { .. }
             | ProcfsInodeData::PidFdDirectory { .. }
-            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(FsError::IsADirectory),
+            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
         };
 
         let pos = file.get_pos() as usize;
@@ -741,14 +741,14 @@ impl FileOps for ProcfsFileOps {
         Ok(to_read)
     }
 
-    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, FsError> {
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
             .as_ref()
             .as_any()
             .downcast_ref::<ProcfsInodeWrapper>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         let data = wrapper.0.read();
         let content = match &*data {
@@ -757,12 +757,12 @@ impl FileOps for ProcfsFileOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::FdSymlink { .. } => return Err(FsError::IoError),
+            ProcfsInodeData::FdSymlink { .. } => return Err(KernelError::Io),
             ProcfsInodeData::Directory { .. }
             | ProcfsInodeData::PidDirectory { .. }
             | ProcfsInodeData::PidNsDirectory { .. }
             | ProcfsInodeData::PidFdDirectory { .. }
-            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(FsError::IsADirectory),
+            | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
         };
 
         let pos = offset as usize;
@@ -784,19 +784,19 @@ impl FileOps for ProcfsFileOps {
         &self,
         file: &File,
         callback: &mut dyn FnMut(DirEntry) -> bool,
-    ) -> Result<(), FsError> {
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
+    ) -> Result<(), KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
 
         if !inode.mode().is_dir() {
-            return Err(FsError::NotADirectory);
+            return Err(KernelError::NotDirectory);
         }
 
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
             .as_ref()
             .as_any()
             .downcast_ref::<ProcfsInodeWrapper>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         let data = wrapper.0.read();
 
@@ -870,7 +870,7 @@ impl FileOps for ProcfsFileOps {
             | ProcfsInodeData::NamespaceFile { .. }
             | ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::FdinfoFile { .. } => {
-                return Err(FsError::NotADirectory);
+                return Err(KernelError::NotDirectory);
             }
         }
 
@@ -882,7 +882,7 @@ impl FileOps for ProcfsFileOps {
 fn readdir_emit_pids(
     proc_ino: u64,
     callback: &mut dyn FnMut(DirEntry) -> bool,
-) -> Result<(), FsError> {
+) -> Result<(), KernelError> {
     use crate::task::percpu::TASK_TABLE;
 
     // Collect PIDs first to release lock quickly
@@ -917,7 +917,7 @@ fn readdir_emit_pids(
 fn readdir_emit_pid_entries(
     pid: Pid,
     callback: &mut dyn FnMut(DirEntry) -> bool,
-) -> Result<(), FsError> {
+) -> Result<(), KernelError> {
     // Emit "ns" subdirectory
     let should_continue = callback(DirEntry {
         ino: pid_ino(pid, 1),
@@ -960,7 +960,7 @@ fn readdir_emit_pid_entries(
 fn readdir_emit_ns_entries(
     pid: Pid,
     callback: &mut dyn FnMut(DirEntry) -> bool,
-) -> Result<(), FsError> {
+) -> Result<(), KernelError> {
     // Emit all namespace files
     for (idx, ns_type) in NamespaceType::all().iter().enumerate() {
         let should_continue = callback(DirEntry {
@@ -981,7 +981,7 @@ fn readdir_emit_ns_entries(
 fn readdir_emit_fd_entries(
     pid: Pid,
     callback: &mut dyn FnMut(DirEntry) -> bool,
-) -> Result<(), FsError> {
+) -> Result<(), KernelError> {
     // Get the task's TID
     let tid = match get_tid_for_pid(pid) {
         Some(t) => t,
@@ -1019,7 +1019,7 @@ fn readdir_emit_fd_entries(
 fn readdir_emit_fdinfo_entries(
     pid: Pid,
     callback: &mut dyn FnMut(DirEntry) -> bool,
-) -> Result<(), FsError> {
+) -> Result<(), KernelError> {
     // Get the task's TID
     let tid = match get_tid_for_pid(pid) {
         Some(t) => t,
@@ -1078,7 +1078,7 @@ impl SuperOps for ProcfsSuperOps {
         sb: &Arc<SuperBlock>,
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, FsError> {
+    ) -> Result<Arc<Inode>, KernelError> {
         let inode = Arc::new(Inode::new(
             sb.alloc_ino(),
             mode,
@@ -1157,7 +1157,7 @@ fn gen_mounts_recursive(mount: &super::mount::Mount, output: &mut String) {
 }
 
 /// Mount function for procfs
-fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, FsError> {
+fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError> {
     // Create superblock
     let sb = SuperBlock::new(fs_type, &PROCFS_SUPER_OPS, 0);
 

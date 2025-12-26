@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use ::core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
-use super::FsError;
+use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{FileType, Inode};
 use super::superblock::{FileSystemType, SuperBlock};
@@ -347,12 +347,12 @@ pub fn init_mnt_ns() -> Arc<crate::ns::MntNamespace> {
 pub fn do_mount(
     fs_type: &'static FileSystemType,
     mountpoint: Option<Arc<Dentry>>,
-) -> Result<Arc<Mount>, FsError> {
+) -> Result<Arc<Mount>, KernelError> {
     // Create the superblock by calling the filesystem's mount function
     let sb = (fs_type.mount)(fs_type)?;
 
     // Get the root dentry from the superblock
-    let root = sb.get_root().ok_or(FsError::InvalidArgument)?;
+    let root = sb.get_root().ok_or(KernelError::InvalidArgument)?;
 
     // Create the mount
     let mount = Mount::new(sb, root, 0);
@@ -380,7 +380,7 @@ pub fn do_mount(
 }
 
 /// Mount a filesystem at a path string
-pub fn mount_at_path(fs_type: &'static FileSystemType, path: &str) -> Result<Arc<Mount>, FsError> {
+pub fn mount_at_path(fs_type: &'static FileSystemType, path: &str) -> Result<Arc<Mount>, KernelError> {
     if path == "/" || path.is_empty() {
         // Root mount
         do_mount(fs_type, None)
@@ -408,27 +408,27 @@ pub fn do_mount_dev(
     fs_type: &'static FileSystemType,
     source: &str,
     mountpoint: Option<Arc<Dentry>>,
-) -> Result<Arc<Mount>, FsError> {
+) -> Result<Arc<Mount>, KernelError> {
     // The filesystem must support device mounting
-    let mount_dev_fn = fs_type.mount_dev.ok_or(FsError::NotSupported)?;
+    let mount_dev_fn = fs_type.mount_dev.ok_or(KernelError::OperationNotSupported)?;
 
     // Look up the source device path
     let source_dentry = super::path::lookup_path(source)?;
-    let source_inode = source_dentry.get_inode().ok_or(FsError::NotFound)?;
+    let source_inode = source_dentry.get_inode().ok_or(KernelError::NotFound)?;
 
     // Verify it's a block device
     if source_inode.mode().file_type() != Some(FileType::BlockDev) {
-        return Err(FsError::NotABlockDevice);
+        return Err(KernelError::NotBlockDevice);
     }
 
     // Get the BlockDevice from the registry using the inode's rdev
-    let bdev = get_blkdev(source_inode.rdev).ok_or(FsError::NoDevice)?;
+    let bdev = get_blkdev(source_inode.rdev).ok_or(KernelError::NoDevice)?;
 
     // Call the filesystem's mount_dev function
     let sb = mount_dev_fn(fs_type, bdev)?;
 
     // Get the root dentry from the superblock
-    let root = sb.get_root().ok_or(FsError::InvalidArgument)?;
+    let root = sb.get_root().ok_or(KernelError::InvalidArgument)?;
 
     // Create the mount
     let mount = Mount::new(sb, root, 0);
@@ -494,12 +494,12 @@ fn is_mount_busy(mount: &Arc<Mount>) -> bool {
 /// * `flags` - Umount flags (MNT_FORCE, MNT_DETACH, etc.)
 ///
 /// # Errors
-/// * `FsError::Busy` - Mount is busy and MNT_FORCE/MNT_DETACH not specified
-/// * `FsError::InvalidArgument` - Trying to unmount root filesystem
-pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), FsError> {
+/// * `KernelError::Busy` - Mount is busy and MNT_FORCE/MNT_DETACH not specified
+/// * `KernelError::InvalidArgument` - Trying to unmount root filesystem
+pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
     // Cannot unmount the root filesystem
     if mount.get_mountpoint().is_none() {
-        return Err(FsError::InvalidArgument);
+        return Err(KernelError::InvalidArgument);
     }
 
     // Check if busy (unless force or detach)
@@ -507,7 +507,7 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), FsError> {
     let detach = (flags & umount_flags::MNT_DETACH) != 0;
 
     if !force && !detach && is_mount_busy(&mount) {
-        return Err(FsError::Busy);
+        return Err(KernelError::Busy);
     }
 
     // Clear the mountpoint flag on the dentry

@@ -29,7 +29,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
-use crate::fs::FsError;
+use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
@@ -197,11 +197,11 @@ impl Signalfd {
     ///
     /// Blocks until at least one matching signal is pending (unless nonblock).
     /// Returns signalfd_siginfo structures (128 bytes each).
-    pub fn read(&self, buf: &mut [u8], nonblock: bool) -> Result<usize, FsError> {
+    pub fn read(&self, buf: &mut [u8], nonblock: bool) -> Result<usize, KernelError> {
         const SIGINFO_SIZE: usize = 128;
 
         if buf.len() < SIGINFO_SIZE {
-            return Err(FsError::InvalidArgument);
+            return Err(KernelError::InvalidArgument);
         }
 
         let max_signals = buf.len() / SIGINFO_SIZE;
@@ -232,7 +232,7 @@ impl Signalfd {
             }
 
             if nonblock {
-                return Err(FsError::WouldBlock);
+                return Err(KernelError::WouldBlock);
             }
 
             // Wait for signals
@@ -292,21 +292,21 @@ impl FileOps for SignalfdFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
         self.signalfd.read(buf, nonblock)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, FsError> {
+    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
         // signalfd doesn't support write
-        Err(FsError::InvalidArgument)
+        Err(KernelError::InvalidArgument)
     }
 
     fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
         self.signalfd.poll(pt)
     }
 
-    fn release(&self, _file: &File) -> Result<(), FsError> {
+    fn release(&self, _file: &File) -> Result<(), KernelError> {
         self.signalfd.release();
         Ok(())
     }
@@ -320,7 +320,7 @@ impl FileOps for SignalfdFileOps {
 ///
 /// # Returns
 /// Arc<File> for the new signalfd
-pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<Arc<File>, FsError> {
+pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<Arc<File>, KernelError> {
     let tid = crate::task::percpu::current_tid();
     let signalfd = Signalfd::new(mask, tid);
 
@@ -341,7 +341,7 @@ pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<Arc<File>, FsErro
 }
 
 /// Create a dummy dentry for signalfd
-fn create_signalfd_dentry() -> Result<Arc<Dentry>, FsError> {
+fn create_signalfd_dentry() -> Result<Arc<Dentry>, KernelError> {
     let mode = InodeMode::regular(0o600);
     let inode = Arc::new(Inode::new(
         0, // ino=0 for anonymous

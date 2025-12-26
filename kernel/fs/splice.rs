@@ -26,7 +26,7 @@
 
 use alloc::sync::Arc;
 
-use crate::fs::FsError;
+use crate::fs::KernelError;
 use crate::fs::file::File;
 use crate::mm::page_cache::{CachedPage, PAGE_SIZE};
 use crate::net::socket_file::SocketFileOps;
@@ -104,11 +104,11 @@ pub fn splice_to_pipe(
     page: Arc<CachedPage>,
     offset: u32,
     len: u32,
-) -> Result<usize, FsError> {
+) -> Result<usize, KernelError> {
     let mut inner = pipe.inner.lock();
 
     if inner.is_full() {
-        return Err(FsError::WouldBlock);
+        return Err(KernelError::WouldBlock);
     }
 
     // Create a pipe buffer for the page
@@ -122,7 +122,7 @@ pub fn splice_to_pipe(
             pipe.wait_queue.wake_all();
             Ok(len as usize)
         }
-        Err(_) => Err(FsError::WouldBlock),
+        Err(_) => Err(KernelError::WouldBlock),
     }
 }
 
@@ -181,14 +181,14 @@ pub fn splice_from_pipe(pipe: &Pipe) -> Option<(Arc<CachedPage>, u32, u32)> {
 ///
 /// # Returns
 /// Number of bytes tee'd
-pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usize, FsError> {
+pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usize, KernelError> {
     // Lock both pipes in consistent order to prevent deadlock
     // Use pointer addresses to determine order
     let src_addr = src as *const Pipe as usize;
     let dst_addr = dst as *const Pipe as usize;
 
     if src_addr == dst_addr {
-        return Err(FsError::InvalidArgument);
+        return Err(KernelError::InvalidArgument);
     }
 
     // Lock in address order
@@ -207,7 +207,7 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
     }
 
     if dst_guard.is_full() {
-        return Err(FsError::WouldBlock);
+        return Err(KernelError::WouldBlock);
     }
 
     let mut copied = 0;
@@ -532,14 +532,14 @@ fn do_splice_file_to_pipe(
         // Use pread at specified offset
         match file.pread(&mut buf[..to_read], off_in) {
             Ok(n) => n,
-            Err(FsError::WouldBlock) => return if nonblock { EAGAIN } else { 0 },
+            Err(KernelError::WouldBlock) => return if nonblock { EAGAIN } else { 0 },
             Err(_) => return -5, // EIO
         }
     } else {
         // Use regular read (advances file position)
         match file.read(&mut buf[..to_read]) {
             Ok(n) => n,
-            Err(FsError::WouldBlock) => return if nonblock { EAGAIN } else { 0 },
+            Err(KernelError::WouldBlock) => return if nonblock { EAGAIN } else { 0 },
             Err(_) => return -5, // EIO
         }
     };
@@ -695,7 +695,7 @@ fn do_splice_pipe_to_socket(
                     break; // Partial send
                 }
             }
-            Err(crate::net::NetError::WouldBlock) => {
+            Err(KernelError::WouldBlock) => {
                 if nonblock {
                     break;
                 }
@@ -759,7 +759,7 @@ pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
 
     match link_pipe(&in_pipe, &out_pipe, len, flags) {
         Ok(n) => n as i64,
-        Err(FsError::WouldBlock) => {
+        Err(KernelError::WouldBlock) => {
             if flags & SPLICE_F_NONBLOCK != 0 {
                 EAGAIN
             } else {
@@ -953,7 +953,7 @@ fn do_sendfile_to_socket(
                     break; // Partial send
                 }
             }
-            Err(crate::net::NetError::WouldBlock) => break,
+            Err(KernelError::WouldBlock) => break,
             Err(_) => break,
         }
     }

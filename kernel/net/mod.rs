@@ -67,75 +67,8 @@ pub use ipv4::Ipv4Addr;
 pub use skb::SkBuff;
 pub use socket::Socket;
 
-/// Network error type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetError {
-    /// No route to destination
-    NoRoute,
-    /// Network is unreachable
-    NetworkUnreachable,
-    /// Host is unreachable
-    HostUnreachable,
-    /// Connection refused
-    ConnectionRefused,
-    /// Connection reset
-    ConnectionReset,
-    /// Connection timed out
-    TimedOut,
-    /// Address already in use
-    AddressInUse,
-    /// Address not available
-    AddressNotAvailable,
-    /// No buffer space available
-    NoBufferSpace,
-    /// Operation would block
-    WouldBlock,
-    /// Invalid argument
-    InvalidArgument,
-    /// Device not found
-    DeviceNotFound,
-    /// Protocol not supported
-    ProtocolNotSupported,
-    /// Socket type not supported
-    SocketTypeNotSupported,
-    /// Operation not supported
-    NotSupported,
-    /// Device is down
-    DeviceDown,
-    /// Packet too large
-    PacketTooLarge,
-    /// Checksum error
-    ChecksumError,
-    /// Out of memory
-    OutOfMemory,
-}
-
-impl NetError {
-    /// Convert to errno value for syscalls
-    pub fn to_errno(self) -> i32 {
-        match self {
-            NetError::NoRoute => -libc::ENETUNREACH,
-            NetError::NetworkUnreachable => -libc::ENETUNREACH,
-            NetError::HostUnreachable => -libc::EHOSTUNREACH,
-            NetError::ConnectionRefused => -libc::ECONNREFUSED,
-            NetError::ConnectionReset => -libc::ECONNRESET,
-            NetError::TimedOut => -libc::ETIMEDOUT,
-            NetError::AddressInUse => -libc::EADDRINUSE,
-            NetError::AddressNotAvailable => -libc::EADDRNOTAVAIL,
-            NetError::NoBufferSpace => -libc::ENOBUFS,
-            NetError::WouldBlock => -libc::EAGAIN,
-            NetError::InvalidArgument => -libc::EINVAL,
-            NetError::DeviceNotFound => -libc::ENODEV,
-            NetError::ProtocolNotSupported => -libc::EPROTONOSUPPORT,
-            NetError::SocketTypeNotSupported => -libc::ESOCKTNOSUPPORT,
-            NetError::NotSupported => -libc::EOPNOTSUPP,
-            NetError::DeviceDown => -libc::ENETDOWN,
-            NetError::PacketTooLarge => -libc::EMSGSIZE,
-            NetError::ChecksumError => -libc::EBADMSG,
-            NetError::OutOfMemory => -libc::ENOMEM,
-        }
-    }
-}
+// Import unified error type
+use crate::error::KernelError;
 
 /// Initialize the network subsystem
 pub fn init() {
@@ -239,36 +172,15 @@ pub fn net_rx(skb: SkBuff) {
 /// Transmit a packet through the appropriate interface
 ///
 /// Called by the IP layer after routing decision is made.
-pub fn dev_queue_xmit(skb: Box<SkBuff>) -> Result<(), NetError> {
+pub fn dev_queue_xmit(skb: Box<SkBuff>) -> Result<(), KernelError> {
     // Clone the device reference before moving skb
-    let dev = skb.dev.clone().ok_or(NetError::DeviceNotFound)?;
+    let dev = skb.dev.clone().ok_or(KernelError::NoDevice)?;
 
     if !dev.is_up() {
-        return Err(NetError::DeviceDown);
+        return Err(KernelError::NetworkDown);
     }
 
     // Let the device transmit the packet
     dev.xmit(skb)
 }
 
-/// libc constants for errno conversion
-mod libc {
-    pub const ENETUNREACH: i32 = 101;
-    pub const EHOSTUNREACH: i32 = 113;
-    pub const ECONNREFUSED: i32 = 111;
-    pub const ECONNRESET: i32 = 104;
-    pub const ETIMEDOUT: i32 = 110;
-    pub const EADDRINUSE: i32 = 98;
-    pub const EADDRNOTAVAIL: i32 = 99;
-    pub const ENOBUFS: i32 = 105;
-    pub const EAGAIN: i32 = 11;
-    pub const EINVAL: i32 = 22;
-    pub const ENODEV: i32 = 19;
-    pub const EPROTONOSUPPORT: i32 = 93;
-    pub const ESOCKTNOSUPPORT: i32 = 94;
-    pub const EOPNOTSUPP: i32 = 95;
-    pub const ENETDOWN: i32 = 100;
-    pub const EMSGSIZE: i32 = 90;
-    pub const EBADMSG: i32 = 74;
-    pub const ENOMEM: i32 = 12;
-}

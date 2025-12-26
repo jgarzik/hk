@@ -29,7 +29,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
-use crate::fs::FsError;
+use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
@@ -111,7 +111,7 @@ impl Eventfd {
     /// Returns the counter value as an 8-byte u64.
     /// In normal mode, resets counter to 0.
     /// In semaphore mode, decrements counter by 1.
-    pub fn read(&self, nonblock: bool) -> Result<u64, FsError> {
+    pub fn read(&self, nonblock: bool) -> Result<u64, KernelError> {
         loop {
             {
                 let mut inner = self.inner.lock();
@@ -135,7 +135,7 @@ impl Eventfd {
             }
 
             if nonblock {
-                return Err(FsError::WouldBlock);
+                return Err(KernelError::WouldBlock);
             }
 
             // Wait for someone to write
@@ -148,10 +148,10 @@ impl Eventfd {
     /// Adds the value to the counter.
     /// Blocks if counter would overflow (unless O_NONBLOCK is set).
     /// The value must not be ULLONG_MAX.
-    pub fn write(&self, value: u64, nonblock: bool) -> Result<usize, FsError> {
+    pub fn write(&self, value: u64, nonblock: bool) -> Result<usize, KernelError> {
         // Value of ULLONG_MAX is not allowed
         if value == ULLONG_MAX {
-            return Err(FsError::InvalidArgument);
+            return Err(KernelError::InvalidArgument);
         }
 
         loop {
@@ -169,7 +169,7 @@ impl Eventfd {
             }
 
             if nonblock {
-                return Err(FsError::WouldBlock);
+                return Err(KernelError::WouldBlock);
             }
 
             // Wait for someone to read
@@ -229,10 +229,10 @@ impl FileOps for EventfdFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         // eventfd read always returns 8 bytes (u64)
         if buf.len() < 8 {
-            return Err(FsError::InvalidArgument);
+            return Err(KernelError::InvalidArgument);
         }
 
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
@@ -243,10 +243,10 @@ impl FileOps for EventfdFileOps {
         Ok(8)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, FsError> {
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         // eventfd write requires exactly 8 bytes (u64)
         if buf.len() < 8 {
-            return Err(FsError::InvalidArgument);
+            return Err(KernelError::InvalidArgument);
         }
 
         // Read u64 from buffer (little-endian)
@@ -262,7 +262,7 @@ impl FileOps for EventfdFileOps {
         self.eventfd.poll(pt)
     }
 
-    fn release(&self, _file: &File) -> Result<(), FsError> {
+    fn release(&self, _file: &File) -> Result<(), KernelError> {
         self.eventfd.release();
         Ok(())
     }
@@ -276,7 +276,7 @@ impl FileOps for EventfdFileOps {
 ///
 /// # Returns
 /// Arc<File> for the new eventfd
-pub fn create_eventfd(initval: u64, efd_flags: i32) -> Result<Arc<File>, FsError> {
+pub fn create_eventfd(initval: u64, efd_flags: i32) -> Result<Arc<File>, KernelError> {
     let eventfd = Eventfd::new(initval, efd_flags);
 
     // Create file operations
@@ -296,7 +296,7 @@ pub fn create_eventfd(initval: u64, efd_flags: i32) -> Result<Arc<File>, FsError
 }
 
 /// Create a dummy dentry for eventfd
-fn create_eventfd_dentry() -> Result<Arc<Dentry>, FsError> {
+fn create_eventfd_dentry() -> Result<Arc<Dentry>, KernelError> {
     let mode = InodeMode::regular(0o600);
     let inode = Arc::new(Inode::new(
         0, // ino=0 for anonymous

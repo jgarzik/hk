@@ -46,7 +46,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::{IrqSpinlock, Uaccess};
-use crate::fs::FsError;
+use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
@@ -173,30 +173,15 @@ pub const IORING_UNREGISTER_EVENTFD: u32 = 5;
 pub const IORING_REGISTER_FILES_UPDATE: u32 = 6;
 
 /// Error codes (negative errno values)
+/// NOTE: Many of these will be removed as we migrate to KernelError::to_syscall_error()
 const ENOENT: i64 = -2;
-const EIO: i64 = -5;
 const EBADF: i64 = -9;
-const EAGAIN: i64 = -11;
 const ENOMEM: i64 = -12;
-const EACCES: i64 = -13;
 const EFAULT: i64 = -14;
-const ENOTBLK: i64 = -15;
 const EBUSY: i64 = -16;
-const EEXIST: i64 = -17;
-const ENODEV: i64 = -19;
-const ENOTDIR: i64 = -20;
-const EISDIR: i64 = -21;
 const EINVAL: i64 = -22;
-const ENOTTY: i64 = -25;
-const EFBIG: i64 = -27;
-const ENOSPC: i64 = -28;
-const EPIPE: i64 = -32;
-const ERANGE: i64 = -34;
 #[allow(dead_code)] // Kept for potential future opcodes
 const ENOSYS: i64 = -38;
-const ENOTEMPTY: i64 = -39;
-const ELOOP: i64 = -40;
-const ENODATA: i64 = -61;
 const EOPNOTSUPP: i64 = -95;
 const ECANCELED: i64 = -125;
 const ETIME: i64 = -62;
@@ -1381,14 +1366,14 @@ impl FileOps for IoUringFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
         // io_uring fds are not directly readable
-        Err(FsError::InvalidArgument)
+        Err(KernelError::InvalidArgument)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, FsError> {
+    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
         // io_uring fds are not directly writable
-        Err(FsError::InvalidArgument)
+        Err(KernelError::InvalidArgument)
     }
 
     fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
@@ -1405,7 +1390,7 @@ impl FileOps for IoUringFileOps {
         }
     }
 
-    fn release(&self, _file: &File) -> Result<(), FsError> {
+    fn release(&self, _file: &File) -> Result<(), KernelError> {
         self.ring.release();
         Ok(())
     }
@@ -1420,7 +1405,7 @@ pub fn get_io_uring(file: &File) -> Option<Arc<IoUring>> {
 }
 
 /// Create an io_uring file
-fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, FsError> {
+fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, KernelError> {
     let ops: &'static dyn FileOps = Box::leak(Box::new(IoUringFileOps::new(ring)));
 
     // Create dummy dentry
@@ -1460,33 +1445,9 @@ fn get_file_from_fd(fd: i32) -> Option<Arc<File>> {
     fd_table.lock().get(fd)
 }
 
-/// Convert FsError to negative errno value
-fn fs_error_to_errno(e: FsError) -> i64 {
-    match e {
-        FsError::NotFound => ENOENT,
-        FsError::NotAFile => EINVAL,
-        FsError::NotADirectory => ENOTDIR,
-        FsError::PermissionDenied => EACCES,
-        FsError::IoError => EIO,
-        FsError::NotSupported => EOPNOTSUPP,
-        FsError::AlreadyExists => EEXIST,
-        FsError::InvalidArgument => EINVAL,
-        FsError::TooManySymlinks => ELOOP,
-        FsError::IsADirectory => EISDIR,
-        FsError::InvalidFile => EBADF,
-        FsError::BadFd => EBADF,
-        FsError::Busy => EBUSY,
-        FsError::NoDevice => ENODEV,
-        FsError::DirectoryNotEmpty => ENOTEMPTY,
-        FsError::NotABlockDevice => ENOTBLK,
-        FsError::WouldBlock => EAGAIN,
-        FsError::NotTty => ENOTTY,
-        FsError::BrokenPipe => EPIPE,
-        FsError::NoSpace => ENOSPC,
-        FsError::FileTooLarge => EFBIG,
-        FsError::NoData => ENODATA,
-        FsError::Range => ERANGE,
-    }
+/// Convert KernelError to negative errno value
+fn fs_error_to_errno(e: KernelError) -> i64 {
+    e.to_syscall_error()
 }
 
 // ============================================================================

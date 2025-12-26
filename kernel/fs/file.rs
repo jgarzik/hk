@@ -16,7 +16,7 @@ use ::core::cmp::min;
 use ::core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
-use super::FsError;
+use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{FileType, Inode, InodeId};
 use super::mount::{Mount, current_mnt_ns};
@@ -103,41 +103,41 @@ pub trait FileOps: Send + Sync {
     fn as_any(&self) -> &dyn core::any::Any;
 
     /// Read from file at current position
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, FsError>;
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError>;
 
     /// Write to file at current position
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, FsError> {
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         let _ = (file, buf);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Positioned read - read from file at given offset without modifying file position
     ///
     /// Unlike read(), this does NOT advance the file position.
     /// Returns NotSupported for files that don't support positioned I/O (pipes, sockets).
-    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, FsError> {
+    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
         let _ = (file, buf, offset);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Positioned write - write to file at given offset without modifying file position
     ///
     /// Unlike write(), this does NOT advance the file position.
     /// Returns NotSupported for files that don't support positioned I/O (pipes, sockets).
-    fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, FsError> {
+    fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
         let _ = (file, buf, offset);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Seek to a position
-    fn llseek(&self, file: &File, offset: i64, whence: i32) -> Result<u64, FsError> {
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
+    fn llseek(&self, file: &File, offset: i64, whence: i32) -> Result<u64, KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let size = inode.get_size();
 
         let new_pos = match whence {
             seek::SEEK_SET => {
                 if offset < 0 {
-                    return Err(FsError::InvalidArgument);
+                    return Err(KernelError::InvalidArgument);
                 }
                 offset as u64
             }
@@ -145,7 +145,7 @@ pub trait FileOps: Send + Sync {
                 let cur = file.get_pos();
                 if offset < 0 {
                     cur.checked_sub((-offset) as u64)
-                        .ok_or(FsError::InvalidArgument)?
+                        .ok_or(KernelError::InvalidArgument)?
                 } else {
                     cur.saturating_add(offset as u64)
                 }
@@ -153,12 +153,12 @@ pub trait FileOps: Send + Sync {
             seek::SEEK_END => {
                 if offset < 0 {
                     size.checked_sub((-offset) as u64)
-                        .ok_or(FsError::InvalidArgument)?
+                        .ok_or(KernelError::InvalidArgument)?
                 } else {
                     size.saturating_add(offset as u64)
                 }
             }
-            _ => return Err(FsError::InvalidArgument),
+            _ => return Err(KernelError::InvalidArgument),
         };
 
         file.set_pos(new_pos);
@@ -170,18 +170,18 @@ pub trait FileOps: Send + Sync {
         &self,
         file: &File,
         callback: &mut dyn FnMut(DirEntry) -> bool,
-    ) -> Result<(), FsError> {
+    ) -> Result<(), KernelError> {
         let _ = (file, callback);
-        Err(FsError::NotADirectory)
+        Err(KernelError::NotDirectory)
     }
 
     /// Sync file data to backing store
-    fn fsync(&self, _file: &File) -> Result<(), FsError> {
+    fn fsync(&self, _file: &File) -> Result<(), KernelError> {
         Ok(())
     }
 
     /// Release file (called when last reference is dropped)
-    fn release(&self, _file: &File) -> Result<(), FsError> {
+    fn release(&self, _file: &File) -> Result<(), KernelError> {
         Ok(())
     }
 
@@ -207,9 +207,9 @@ pub trait FileOps: Send + Sync {
         file: &File,
         buf: &mut [u8],
         flags: RwFlags,
-    ) -> Result<usize, FsError> {
+    ) -> Result<usize, KernelError> {
         if flags.nowait {
-            return Err(FsError::NotSupported);
+            return Err(KernelError::OperationNotSupported);
         }
         self.read(file, buf)
     }
@@ -224,9 +224,9 @@ pub trait FileOps: Send + Sync {
         buf: &mut [u8],
         offset: u64,
         flags: RwFlags,
-    ) -> Result<usize, FsError> {
+    ) -> Result<usize, KernelError> {
         if flags.nowait {
-            return Err(FsError::NotSupported);
+            return Err(KernelError::OperationNotSupported);
         }
         self.pread(file, buf, offset)
     }
@@ -235,9 +235,9 @@ pub trait FileOps: Send + Sync {
     ///
     /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
     /// Default implementation rejects NOWAIT (returns NotSupported).
-    fn write_with_flags(&self, file: &File, buf: &[u8], flags: RwFlags) -> Result<usize, FsError> {
+    fn write_with_flags(&self, file: &File, buf: &[u8], flags: RwFlags) -> Result<usize, KernelError> {
         if flags.nowait {
-            return Err(FsError::NotSupported);
+            return Err(KernelError::OperationNotSupported);
         }
         self.write(file, buf)
     }
@@ -252,9 +252,9 @@ pub trait FileOps: Send + Sync {
         buf: &[u8],
         offset: u64,
         flags: RwFlags,
-    ) -> Result<usize, FsError> {
+    ) -> Result<usize, KernelError> {
         if flags.nowait {
-            return Err(FsError::NotSupported);
+            return Err(KernelError::OperationNotSupported);
         }
         self.pwrite(file, buf, offset)
     }
@@ -363,49 +363,49 @@ impl File {
     }
 
     /// Read from file
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, FsError> {
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, KernelError> {
         if !self.is_readable() {
-            return Err(FsError::PermissionDenied);
+            return Err(KernelError::PermissionDenied);
         }
         self.f_op.read(self, buf)
     }
 
     /// Write to file
-    pub fn write(&self, buf: &[u8]) -> Result<usize, FsError> {
+    pub fn write(&self, buf: &[u8]) -> Result<usize, KernelError> {
         if !self.is_writable() {
-            return Err(FsError::PermissionDenied);
+            return Err(KernelError::PermissionDenied);
         }
         self.f_op.write(self, buf)
     }
 
     /// Positioned read - read at given offset without modifying file position
-    pub fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize, FsError> {
+    pub fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
         if !self.is_readable() {
-            return Err(FsError::PermissionDenied);
+            return Err(KernelError::PermissionDenied);
         }
         self.f_op.pread(self, buf, offset)
     }
 
     /// Positioned write - write at given offset without modifying file position
-    pub fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize, FsError> {
+    pub fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
         if !self.is_writable() {
-            return Err(FsError::PermissionDenied);
+            return Err(KernelError::PermissionDenied);
         }
         self.f_op.pwrite(self, buf, offset)
     }
 
     /// Read with RWF flags (for preadv2/pwritev2 with RWF_NOWAIT support)
-    pub fn read_with_flags(&self, buf: &mut [u8], flags: RwFlags) -> Result<usize, FsError> {
+    pub fn read_with_flags(&self, buf: &mut [u8], flags: RwFlags) -> Result<usize, KernelError> {
         if !self.is_readable() {
-            return Err(FsError::PermissionDenied);
+            return Err(KernelError::PermissionDenied);
         }
         self.f_op.read_with_flags(self, buf, flags)
     }
 
     /// Write with RWF flags
-    pub fn write_with_flags(&self, buf: &[u8], flags: RwFlags) -> Result<usize, FsError> {
+    pub fn write_with_flags(&self, buf: &[u8], flags: RwFlags) -> Result<usize, KernelError> {
         if !self.is_writable() {
-            return Err(FsError::PermissionDenied);
+            return Err(KernelError::PermissionDenied);
         }
         self.f_op.write_with_flags(self, buf, flags)
     }
@@ -416,9 +416,9 @@ impl File {
         buf: &mut [u8],
         offset: u64,
         flags: RwFlags,
-    ) -> Result<usize, FsError> {
+    ) -> Result<usize, KernelError> {
         if !self.is_readable() {
-            return Err(FsError::PermissionDenied);
+            return Err(KernelError::PermissionDenied);
         }
         self.f_op.pread_with_flags(self, buf, offset, flags)
     }
@@ -429,22 +429,22 @@ impl File {
         buf: &[u8],
         offset: u64,
         flags: RwFlags,
-    ) -> Result<usize, FsError> {
+    ) -> Result<usize, KernelError> {
         if !self.is_writable() {
-            return Err(FsError::PermissionDenied);
+            return Err(KernelError::PermissionDenied);
         }
         self.f_op.pwrite_with_flags(self, buf, offset, flags)
     }
 
     /// Seek
-    pub fn lseek(&self, offset: i64, whence: i32) -> Result<u64, FsError> {
+    pub fn lseek(&self, offset: i64, whence: i32) -> Result<u64, KernelError> {
         self.f_op.llseek(self, offset, whence)
     }
 
     /// Read directory entries
-    pub fn readdir(&self, callback: &mut dyn FnMut(DirEntry) -> bool) -> Result<(), FsError> {
+    pub fn readdir(&self, callback: &mut dyn FnMut(DirEntry) -> bool) -> Result<(), KernelError> {
         if !self.is_dir() {
-            return Err(FsError::NotADirectory);
+            return Err(KernelError::NotDirectory);
         }
         self.f_op.readdir(self, callback)
     }
@@ -479,8 +479,8 @@ impl FileOps for NullFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, FsError> {
-        Err(FsError::NotSupported)
+    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
+        Err(KernelError::OperationNotSupported)
     }
 
     fn poll(&self, _file: &File, _pt: Option<&mut PollTable>) -> u16 {
@@ -504,16 +504,16 @@ use crate::chardev::{DeviceError, get_chardev};
 pub struct CharDevFileOps;
 
 impl CharDevFileOps {
-    /// Convert DeviceError to FsError
-    fn to_fs_error(e: DeviceError) -> FsError {
+    /// Convert DeviceError to KernelError
+    fn to_fs_error(e: DeviceError) -> KernelError {
         match e {
-            DeviceError::NotReady => FsError::IoError,
-            DeviceError::WouldBlock => FsError::WouldBlock,
-            DeviceError::NotSupported => FsError::NotSupported,
-            DeviceError::IoError => FsError::IoError,
-            DeviceError::InvalidArg => FsError::InvalidArgument,
-            DeviceError::NotFound => FsError::NotFound,
-            DeviceError::NotTty => FsError::NotTty,
+            DeviceError::NotReady => KernelError::Io,
+            DeviceError::WouldBlock => KernelError::WouldBlock,
+            DeviceError::NotSupported => KernelError::OperationNotSupported,
+            DeviceError::IoError => KernelError::Io,
+            DeviceError::InvalidArg => KernelError::InvalidArgument,
+            DeviceError::NotFound => KernelError::NotFound,
+            DeviceError::NotTty => KernelError::NotTty,
         }
     }
 }
@@ -523,25 +523,25 @@ impl FileOps for CharDevFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, FsError> {
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let rdev = inode.rdev;
 
-        let device = get_chardev(rdev).ok_or(FsError::NotFound)?;
+        let device = get_chardev(rdev).ok_or(KernelError::NotFound)?;
         device.read(buf).map_err(Self::to_fs_error)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, FsError> {
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let rdev = inode.rdev;
 
-        let device = get_chardev(rdev).ok_or(FsError::NotFound)?;
+        let device = get_chardev(rdev).ok_or(KernelError::NotFound)?;
         device.write(buf).map_err(Self::to_fs_error)
     }
 
-    fn llseek(&self, _file: &File, _offset: i64, _whence: i32) -> Result<u64, FsError> {
+    fn llseek(&self, _file: &File, _offset: i64, _whence: i32) -> Result<u64, KernelError> {
         // Most character devices don't support seeking
-        Err(FsError::InvalidArgument)
+        Err(KernelError::InvalidArgument)
     }
 
     fn poll(&self, file: &File, _pt: Option<&mut PollTable>) -> u16 {
@@ -611,7 +611,7 @@ pub fn generic_file_read(
     can_writeback: bool,
     unevictable: bool,
     a_ops: &'static dyn AddressSpaceOps,
-) -> Result<usize, FsError> {
+) -> Result<usize, KernelError> {
     let pos = file.get_pos();
 
     // EOF check
@@ -649,7 +649,7 @@ pub fn generic_file_read(
                     unevictable,
                     a_ops,
                 )
-                .map_err(|_| FsError::IoError)?
+                .map_err(|_| KernelError::Io)?
         };
         // PAGE_CACHE lock released here
 
@@ -675,7 +675,7 @@ pub fn generic_file_read(
                 }
                 Err(_) => {
                     page.unlock();
-                    return Err(FsError::IoError);
+                    return Err(KernelError::Io);
                 }
             }
 
@@ -734,7 +734,7 @@ pub fn generic_file_write(
     can_writeback: bool,
     unevictable: bool,
     a_ops: &'static dyn AddressSpaceOps,
-) -> Result<usize, FsError> {
+) -> Result<usize, KernelError> {
     let pos = file.get_pos();
 
     if buf.is_empty() {
@@ -751,7 +751,7 @@ pub fn generic_file_write(
 
     let to_write = min(buf.len(), available);
     if to_write == 0 {
-        return Err(FsError::InvalidArgument);
+        return Err(KernelError::InvalidArgument);
     }
 
     let mut bytes_written = 0;
@@ -777,7 +777,7 @@ pub fn generic_file_write(
                     unevictable,
                     a_ops,
                 )
-                .map_err(|_| FsError::IoError)?
+                .map_err(|_| KernelError::Io)?
         };
 
         // If this is a partial page write and it's new, we need to read existing data first
@@ -855,7 +855,7 @@ pub fn generic_file_pread(
     can_writeback: bool,
     unevictable: bool,
     a_ops: &'static dyn AddressSpaceOps,
-) -> Result<usize, FsError> {
+) -> Result<usize, KernelError> {
     let pos = offset;
 
     // EOF check
@@ -893,7 +893,7 @@ pub fn generic_file_pread(
                     unevictable,
                     a_ops,
                 )
-                .map_err(|_| FsError::IoError)?
+                .map_err(|_| KernelError::Io)?
         };
         // PAGE_CACHE lock released here
 
@@ -919,7 +919,7 @@ pub fn generic_file_pread(
                 }
                 Err(_) => {
                     page.unlock();
-                    return Err(FsError::IoError);
+                    return Err(KernelError::Io);
                 }
             }
 
@@ -976,7 +976,7 @@ pub fn generic_file_pwrite(
     can_writeback: bool,
     unevictable: bool,
     a_ops: &'static dyn AddressSpaceOps,
-) -> Result<usize, FsError> {
+) -> Result<usize, KernelError> {
     let pos = offset;
 
     if buf.is_empty() {
@@ -993,7 +993,7 @@ pub fn generic_file_pwrite(
 
     let to_write = min(buf.len(), available);
     if to_write == 0 {
-        return Err(FsError::InvalidArgument);
+        return Err(KernelError::InvalidArgument);
     }
 
     let mut bytes_written = 0;
@@ -1019,7 +1019,7 @@ pub fn generic_file_pwrite(
                     unevictable,
                     a_ops,
                 )
-                .map_err(|_| FsError::IoError)?
+                .map_err(|_| KernelError::Io)?
         };
 
         // If this is a partial page write and it's new, we need to read existing data first
@@ -1081,12 +1081,12 @@ pub fn generic_file_pwrite(
 /// ## Returns
 ///
 /// Ok(()) on success, or error
-pub fn generic_file_fsync(file_id: FileId) -> Result<(), FsError> {
+pub fn generic_file_fsync(file_id: FileId) -> Result<(), KernelError> {
     use crate::mm::writeback::{WritebackControl, do_writepages_for_file, wait_on_writeback};
 
     // Write all dirty pages for this file
     let mut wbc = WritebackControl::for_fsync();
-    do_writepages_for_file(file_id, &mut wbc).map_err(|_| FsError::IoError)?;
+    do_writepages_for_file(file_id, &mut wbc).map_err(|_| KernelError::Io)?;
 
     // Wait for all writeback to complete
     wait_on_writeback(file_id);

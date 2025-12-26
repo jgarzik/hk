@@ -26,6 +26,7 @@ use spin::{Mutex, RwLock};
 
 // Re-use DevId from chardev
 pub use crate::chardev::{DevId, DevMajor, DevMinor};
+use crate::error::KernelError;
 use crate::mm::writeback::{BdiWriteback, bdi_register, bdi_unregister};
 
 /// Well-known block device major numbers (Linux compatible)
@@ -72,27 +73,8 @@ pub struct BioSeg {
     pub len: usize,
 }
 
-/// Block device error types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockError {
-    /// I/O error during read/write
-    IoError,
-    /// Request out of range
-    OutOfRange,
-    /// Device not ready
-    NotReady,
-    /// Invalid argument
-    InvalidArg,
-    /// Device not found
-    NotFound,
-    /// Operation not supported
-    NotSupported,
-    /// Device already registered
-    AlreadyExists,
-}
-
 /// Bio completion callback type
-pub type BioComplete = Box<dyn FnOnce(Result<(), BlockError>) + Send + 'static>;
+pub type BioComplete = Box<dyn FnOnce(Result<(), crate::error::KernelError>) + Send + 'static>;
 
 /// Block I/O request
 ///
@@ -169,7 +151,7 @@ impl Bio {
     }
 
     /// Call the completion callback with the result
-    pub fn complete(self, result: Result<(), BlockError>) {
+    pub fn complete(self, result: Result<(), KernelError>) {
         if let Some(complete) = self.complete {
             complete(result);
         }
@@ -334,17 +316,17 @@ impl RequestQueue {
     }
 
     /// Submit a bio to the queue
-    pub fn submit_bio(&self, bio: Bio) -> Result<(), BlockError> {
+    pub fn submit_bio(&self, bio: Bio) -> Result<(), KernelError> {
         if self.stopped.load(Ordering::Acquire) {
-            return Err(BlockError::NotReady);
+            return Err(KernelError::Busy);
         }
 
         // Validate against limits
         if bio.len_sectors > self.limits.max_sectors {
-            return Err(BlockError::InvalidArg);
+            return Err(KernelError::InvalidArgument);
         }
         if bio.segs.len() > self.limits.max_segments as usize {
-            return Err(BlockError::InvalidArg);
+            return Err(KernelError::InvalidArgument);
         }
 
         // For MVP: synchronous processing
@@ -374,7 +356,7 @@ impl RequestQueue {
                         self.driver.submit(&d, b);
                     } else {
                         // No disk attached, complete with error
-                        b.complete(Err(BlockError::NotReady));
+                        b.complete(Err(KernelError::Busy));
                     }
                     self.in_flight.fetch_sub(1, Ordering::Relaxed);
                 }
@@ -505,7 +487,7 @@ impl BlockDevice {
     }
 
     /// Open the block device (increment open count)
-    pub fn open(&self) -> Result<(), BlockError> {
+    pub fn open(&self) -> Result<(), KernelError> {
         self.open_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -536,14 +518,14 @@ impl BlockDevice {
     }
 
     /// Submit a bio to this block device
-    pub fn submit_bio(&self, bio: Bio) -> Result<(), BlockError> {
+    pub fn submit_bio(&self, bio: Bio) -> Result<(), KernelError> {
         // Check if device is dead (hotplug removed)
         if self.is_dead() {
-            return Err(BlockError::NotReady);
+            return Err(KernelError::Busy);
         }
         // Validate range for non-flush operations
         if bio.op != BioOp::Flush && !self.disk.validate_range(bio.lba, bio.len_sectors) {
-            return Err(BlockError::OutOfRange);
+            return Err(KernelError::InvalidArgument);
         }
         self.disk.queue.submit_bio(bio)
     }
@@ -566,9 +548,9 @@ impl BlockDeviceRegistry {
     }
 
     /// Register a block device
-    pub fn register(&mut self, id: DevId, device: Arc<BlockDevice>) -> Result<(), BlockError> {
+    pub fn register(&mut self, id: DevId, device: Arc<BlockDevice>) -> Result<(), KernelError> {
         if self.devices.contains_key(&id) {
-            return Err(BlockError::AlreadyExists);
+            return Err(KernelError::AlreadyExists);
         }
         self.devices.insert(id, device);
         Ok(())
@@ -615,7 +597,7 @@ impl Default for BlockDeviceRegistry {
 pub static BLKDEV_REGISTRY: RwLock<BlockDeviceRegistry> = RwLock::new(BlockDeviceRegistry::new());
 
 /// Register a block device globally
-pub fn register_blkdev(id: DevId, device: Arc<BlockDevice>) -> Result<(), BlockError> {
+pub fn register_blkdev(id: DevId, device: Arc<BlockDevice>) -> Result<(), KernelError> {
     BLKDEV_REGISTRY.write().register(id, device)
 }
 

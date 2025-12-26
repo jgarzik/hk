@@ -34,7 +34,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{IrqSpinlock, Uaccess};
-use crate::fs::FsError;
+use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
@@ -384,21 +384,21 @@ impl FileOps for EpollFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
         // epoll fds are not directly readable
-        Err(FsError::InvalidArgument)
+        Err(KernelError::InvalidArgument)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, FsError> {
+    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
         // epoll fds are not writable
-        Err(FsError::InvalidArgument)
+        Err(KernelError::InvalidArgument)
     }
 
     fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
         self.ep.poll(pt)
     }
 
-    fn release(&self, _file: &File) -> Result<(), FsError> {
+    fn release(&self, _file: &File) -> Result<(), KernelError> {
         self.ep.release();
         Ok(())
     }
@@ -411,7 +411,7 @@ impl FileOps for EpollFileOps {
 ///
 /// # Returns
 /// Arc<File> for the new epoll fd
-pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, FsError> {
+pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
     let ep = Eventpoll::new();
 
     // Create file operations
@@ -431,7 +431,7 @@ pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, FsError> {
 }
 
 /// Create a dummy dentry for epoll
-fn create_epoll_dentry() -> Result<Arc<Dentry>, FsError> {
+fn create_epoll_dentry() -> Result<Arc<Dentry>, KernelError> {
     let mode = InodeMode::regular(0o600);
     let inode = Arc::new(Inode::new(
         0, // ino=0 for anonymous

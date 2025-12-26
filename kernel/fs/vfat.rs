@@ -32,7 +32,7 @@ use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Times
 use super::superblock::{
     FileSystemType, MSDOS_SUPER_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps, fs_flags,
 };
-use super::vfs::FsError;
+use crate::error::KernelError;
 
 // ============================================================================
 // VFAT AddressSpaceOps - Page I/O for writeback
@@ -474,7 +474,7 @@ fn decode_vfat_file_id(file_id: FileId) -> Option<(u8, u8, u32)> {
 // ============================================================================
 
 /// Read bytes from block device via page cache
-fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), KernelError> {
     let file_id = FileId::from_blkdev(bdev.dev_id().major, bdev.dev_id().minor);
     let capacity = bdev.capacity();
 
@@ -503,7 +503,7 @@ fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), FsE
                     false, // not unevictable (disk-backed)
                     &VFAT_AOPS,
                 )
-                .map_err(|_| FsError::IoError)?;
+                .map_err(|_| KernelError::Io)?;
             (page.frame, is_new)
         };
 
@@ -540,7 +540,7 @@ fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), FsE
 /// - Periodic writeback daemon (every ~5 seconds)
 /// - Explicit fsync() or sync() calls
 /// - Page cache eviction pressure
-fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), KernelError> {
     use crate::mm::page_cache::DIRTY_ADDRESS_SPACES;
 
     let file_id = FileId::from_blkdev(bdev.dev_id().major, bdev.dev_id().minor);
@@ -569,7 +569,7 @@ fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), FsErro
                     false,      // not unevictable (disk-backed)
                     &VFAT_AOPS, // Use VFAT ops for writeback
                 )
-                .map_err(|_| FsError::IoError)?;
+                .map_err(|_| KernelError::Io)?;
             (page, is_new)
         };
 
@@ -616,22 +616,22 @@ fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), FsErro
 // ============================================================================
 
 /// Get VFAT superblock data from superblock (cloned to avoid lifetime issues)
-fn get_sb_data(sb: &Arc<SuperBlock>) -> Result<VfatSbData, FsError> {
+fn get_sb_data(sb: &Arc<SuperBlock>) -> Result<VfatSbData, KernelError> {
     let guard = sb.private.read();
     guard
         .as_ref()
         .and_then(|p| p.as_any().downcast_ref::<VfatSbData>())
         .cloned()
-        .ok_or(FsError::IoError)
+        .ok_or(KernelError::Io)
 }
 
 /// Get VFAT inode data from inode (cloned to avoid lifetime issues)
-fn get_inode_data(inode: &Inode) -> Result<VfatInodeData, FsError> {
-    let private = inode.get_private().ok_or(FsError::IoError)?;
+fn get_inode_data(inode: &Inode) -> Result<VfatInodeData, KernelError> {
+    let private = inode.get_private().ok_or(KernelError::Io)?;
     let data = private
         .as_any()
         .downcast_ref::<VfatInodeData>()
-        .ok_or(FsError::IoError)?;
+        .ok_or(KernelError::Io)?;
     Ok(VfatInodeData {
         start_cluster: data.start_cluster,
         file_size: data.file_size,
@@ -643,7 +643,7 @@ fn get_inode_data(inode: &Inode) -> Result<VfatInodeData, FsError> {
 }
 
 /// Read a FAT entry for a cluster
-fn get_fat_entry(sb_data: &VfatSbData, cluster: u32) -> Result<u32, FsError> {
+fn get_fat_entry(sb_data: &VfatSbData, cluster: u32) -> Result<u32, KernelError> {
     let fat_offset = (cluster as u64) * 4;
     let fat_sector = sb_data.fat_start_sector + fat_offset / sb_data.bytes_per_sector as u64;
     let offset_in_sector = (fat_offset % sb_data.bytes_per_sector as u64) as usize;
@@ -672,7 +672,7 @@ fn cluster_to_offset(sb_data: &VfatSbData, cluster: u32) -> u64 {
 }
 
 /// Read a cluster chain starting from a cluster
-fn read_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<Vec<u32>, FsError> {
+fn read_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<Vec<u32>, KernelError> {
     let mut chain = Vec::new();
     let mut cluster = start_cluster;
 
@@ -684,7 +684,7 @@ fn read_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<Vec<u3
         }
         // Safety check against infinite loops
         if chain.len() > 1_000_000 {
-            return Err(FsError::IoError);
+            return Err(KernelError::Io);
         }
     }
 
@@ -702,7 +702,7 @@ const FAT_EOC: u32 = 0x0FFF_FFF8;
 const FAT_FREE: u32 = 0x0000_0000;
 
 /// Write a FAT entry for a cluster (updates all FAT copies)
-fn set_fat_entry(sb_data: &VfatSbData, cluster: u32, value: u32) -> Result<(), FsError> {
+fn set_fat_entry(sb_data: &VfatSbData, cluster: u32, value: u32) -> Result<(), KernelError> {
     let fat_offset = (cluster as u64) * 4;
     let offset_in_fat = fat_offset % (sb_data.fat_sectors * sb_data.bytes_per_sector as u64);
 
@@ -726,7 +726,7 @@ fn set_fat_entry(sb_data: &VfatSbData, cluster: u32, value: u32) -> Result<(), F
 ///
 /// Searches the FAT for a free cluster (value 0), marks it as end-of-chain,
 /// and returns the cluster number.
-fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, FsError> {
+fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, KernelError> {
     // Calculate total data clusters
     // Total sectors = fat_start + fat_sectors * num_fats + data_sectors
     // data_clusters = data_sectors / sectors_per_cluster
@@ -750,11 +750,11 @@ fn allocate_cluster(sb_data: &VfatSbData) -> Result<u32, FsError> {
         }
     }
 
-    Err(FsError::NoSpace)
+    Err(KernelError::NoSpace)
 }
 
 /// Free a cluster chain starting from start_cluster
-fn free_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<(), FsError> {
+fn free_cluster_chain(sb_data: &VfatSbData, start_cluster: u32) -> Result<(), KernelError> {
     let mut cluster = start_cluster;
 
     while is_valid_cluster(cluster) {
@@ -778,7 +778,7 @@ fn extend_cluster_chain(
     sb_data: &VfatSbData,
     last_cluster: u32,
     count: usize,
-) -> Result<Vec<u32>, FsError> {
+) -> Result<Vec<u32>, KernelError> {
     let mut new_clusters = Vec::with_capacity(count);
 
     for i in 0..count {
@@ -800,7 +800,7 @@ fn extend_cluster_chain(
 
 /// Get the last cluster in a chain
 #[allow(dead_code)]
-fn get_last_cluster(sb_data: &VfatSbData, start_cluster: u32) -> Result<u32, FsError> {
+fn get_last_cluster(sb_data: &VfatSbData, start_cluster: u32) -> Result<u32, KernelError> {
     let mut cluster = start_cluster;
     let mut count = 0;
 
@@ -812,7 +812,7 @@ fn get_last_cluster(sb_data: &VfatSbData, start_cluster: u32) -> Result<u32, FsE
         cluster = next;
         count += 1;
         if count > 1_000_000 {
-            return Err(FsError::IoError);
+            return Err(KernelError::Io);
         }
     }
 
@@ -927,7 +927,7 @@ fn lfn_entry_chars(entry: &VfatLfnEntry) -> Vec<char> {
 fn read_directory_entries(
     sb_data: &VfatSbData,
     start_cluster: u32,
-) -> Result<Vec<ParsedDirEntry>, FsError> {
+) -> Result<Vec<ParsedDirEntry>, KernelError> {
     let chain = read_cluster_chain(sb_data, start_cluster)?;
     let mut entries = Vec::new();
     let mut lfn_parts: Vec<(u8, Vec<char>)> = Vec::new();
@@ -1221,7 +1221,7 @@ fn find_free_dir_slots(
     sb_data: &VfatSbData,
     dir_cluster: u32,
     num_slots: usize,
-) -> Result<(u32, usize), FsError> {
+) -> Result<(u32, usize), KernelError> {
     let chain = read_cluster_chain(sb_data, dir_cluster)?;
     let entries_per_cluster = sb_data.cluster_size as usize / 32;
 
@@ -1271,7 +1271,7 @@ fn find_free_dir_slots(
         return Ok((new_cluster, new_index));
     }
 
-    Err(FsError::NoSpace)
+    Err(KernelError::NoSpace)
 }
 
 /// Write a directory entry (raw 32-byte entry) at a specific position
@@ -1280,7 +1280,7 @@ fn write_raw_dir_entry(
     dir_cluster: u32,
     entry_index: usize,
     entry_bytes: &[u8; 32],
-) -> Result<(), FsError> {
+) -> Result<(), KernelError> {
     let chain = read_cluster_chain(sb_data, dir_cluster)?;
     let entries_per_cluster = sb_data.cluster_size as usize / 32;
 
@@ -1288,7 +1288,7 @@ fn write_raw_dir_entry(
     let index_in_cluster = entry_index % entries_per_cluster;
 
     if cluster_idx >= chain.len() {
-        return Err(FsError::InvalidArgument);
+        return Err(KernelError::InvalidArgument);
     }
 
     let cluster = chain[cluster_idx];
@@ -1309,7 +1309,7 @@ fn create_dir_entry_with_lfn(
     attributes: u8,
     start_cluster: u32,
     file_size: u32,
-) -> Result<[u8; 11], FsError> {
+) -> Result<[u8; 11], KernelError> {
     // Get existing short names to avoid collisions
     let existing_entries = read_directory_entries(sb_data, parent_cluster)?;
     let existing_short_names: Vec<[u8; 11]> =
@@ -1425,7 +1425,7 @@ fn update_dir_entry_size(
     parent_cluster: u32,
     name: &str,
     new_size: u32,
-) -> Result<(), FsError> {
+) -> Result<(), KernelError> {
     let chain = read_cluster_chain(sb_data, parent_cluster)?;
     let entries_per_cluster = sb_data.cluster_size as usize / 32;
 
@@ -1462,7 +1462,7 @@ fn update_dir_entry_size(
         }
     }
 
-    Err(FsError::NotFound)
+    Err(KernelError::NotFound)
 }
 
 /// Update directory entry metadata (start_cluster and file_size) by short name
@@ -1472,7 +1472,7 @@ fn update_dir_entry_by_short_name(
     short_name: &[u8; 11],
     new_start_cluster: u32,
     new_size: u32,
-) -> Result<(), FsError> {
+) -> Result<(), KernelError> {
     let chain = read_cluster_chain(sb_data, parent_cluster)?;
     let entries_per_cluster = sb_data.cluster_size as usize / 32;
 
@@ -1509,11 +1509,11 @@ fn update_dir_entry_by_short_name(
         }
     }
 
-    Err(FsError::NotFound)
+    Err(KernelError::NotFound)
 }
 
 /// Delete a directory entry by marking it as deleted (0xE5)
-fn delete_dir_entry(sb_data: &VfatSbData, parent_cluster: u32, name: &str) -> Result<u32, FsError> {
+fn delete_dir_entry(sb_data: &VfatSbData, parent_cluster: u32, name: &str) -> Result<u32, KernelError> {
     let chain = read_cluster_chain(sb_data, parent_cluster)?;
     let entries_per_cluster = sb_data.cluster_size as usize / 32;
 
@@ -1532,7 +1532,7 @@ fn delete_dir_entry(sb_data: &VfatSbData, parent_cluster: u32, name: &str) -> Re
 
             // End of directory
             if buf[0] == END_MARKER {
-                return Err(FsError::NotFound);
+                return Err(KernelError::NotFound);
             }
 
             // Skip already deleted
@@ -1638,7 +1638,7 @@ fn delete_dir_entry(sb_data: &VfatSbData, parent_cluster: u32, name: &str) -> Re
         }
     }
 
-    Err(FsError::NotFound)
+    Err(KernelError::NotFound)
 }
 
 // ============================================================================
@@ -1649,13 +1649,13 @@ fn delete_dir_entry(sb_data: &VfatSbData, parent_cluster: u32, name: &str) -> Re
 pub struct VfatInodeOps;
 
 impl InodeOps for VfatInodeOps {
-    fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, FsError> {
-        let sb = dir.superblock().ok_or(FsError::IoError)?;
+    fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError> {
+        let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let inode_data = get_inode_data(dir)?;
 
         if !inode_data.is_dir {
-            return Err(FsError::NotADirectory);
+            return Err(KernelError::NotDirectory);
         }
 
         // Read directory entries
@@ -1668,11 +1668,11 @@ impl InodeOps for VfatInodeOps {
             }
         }
 
-        Err(FsError::NotFound)
+        Err(KernelError::NotFound)
     }
 
-    fn readpage(&self, inode: &Inode, page_offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let sb = inode.superblock().ok_or(FsError::IoError)?;
+    fn readpage(&self, inode: &Inode, page_offset: u64, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let inode_data = get_inode_data(inode)?;
 
@@ -1734,8 +1734,8 @@ impl InodeOps for VfatInodeOps {
         Ok(bytes_read)
     }
 
-    fn writepage(&self, inode: &Inode, page_offset: u64, buf: &[u8]) -> Result<usize, FsError> {
-        let sb = inode.superblock().ok_or(FsError::IoError)?;
+    fn writepage(&self, inode: &Inode, page_offset: u64, buf: &[u8]) -> Result<usize, KernelError> {
+        let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let inode_data = get_inode_data(inode)?;
 
@@ -1835,21 +1835,21 @@ impl InodeOps for VfatInodeOps {
         Ok(bytes_written)
     }
 
-    fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, FsError> {
+    fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = mode; // FAT doesn't support Unix permissions
-        let sb = dir.superblock().ok_or(FsError::IoError)?;
+        let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let dir_inode_data = get_inode_data(dir)?;
 
         if !dir_inode_data.is_dir {
-            return Err(FsError::NotADirectory);
+            return Err(KernelError::NotDirectory);
         }
 
         // Check if file already exists
         let entries = read_directory_entries(&sb_data, dir_inode_data.start_cluster)?;
         for entry in &entries {
             if entry.name.eq_ignore_ascii_case(name) {
-                return Err(FsError::AlreadyExists);
+                return Err(KernelError::AlreadyExists);
             }
         }
 
@@ -1893,21 +1893,21 @@ impl InodeOps for VfatInodeOps {
         Ok(inode)
     }
 
-    fn mkdir(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, FsError> {
+    fn mkdir(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = mode; // FAT doesn't support Unix permissions
-        let sb = dir.superblock().ok_or(FsError::IoError)?;
+        let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let dir_inode_data = get_inode_data(dir)?;
 
         if !dir_inode_data.is_dir {
-            return Err(FsError::NotADirectory);
+            return Err(KernelError::NotDirectory);
         }
 
         // Check if directory already exists
         let entries = read_directory_entries(&sb_data, dir_inode_data.start_cluster)?;
         for entry in &entries {
             if entry.name.eq_ignore_ascii_case(name) {
-                return Err(FsError::AlreadyExists);
+                return Err(KernelError::AlreadyExists);
             }
         }
 
@@ -1976,13 +1976,13 @@ impl InodeOps for VfatInodeOps {
         Ok(inode)
     }
 
-    fn unlink(&self, dir: &Inode, name: &str) -> Result<(), FsError> {
-        let sb = dir.superblock().ok_or(FsError::IoError)?;
+    fn unlink(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
+        let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let dir_inode_data = get_inode_data(dir)?;
 
         if !dir_inode_data.is_dir {
-            return Err(FsError::NotADirectory);
+            return Err(KernelError::NotDirectory);
         }
 
         // Find the entry to ensure it exists and is a file
@@ -1990,10 +1990,10 @@ impl InodeOps for VfatInodeOps {
         let entry = entries
             .iter()
             .find(|e| e.name.eq_ignore_ascii_case(name))
-            .ok_or(FsError::NotFound)?;
+            .ok_or(KernelError::NotFound)?;
 
         if entry.is_dir() {
-            return Err(FsError::IsADirectory);
+            return Err(KernelError::IsDirectory);
         }
 
         // Delete the directory entry
@@ -2007,13 +2007,13 @@ impl InodeOps for VfatInodeOps {
         Ok(())
     }
 
-    fn rmdir(&self, dir: &Inode, name: &str) -> Result<(), FsError> {
-        let sb = dir.superblock().ok_or(FsError::IoError)?;
+    fn rmdir(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
+        let sb = dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let dir_inode_data = get_inode_data(dir)?;
 
         if !dir_inode_data.is_dir {
-            return Err(FsError::NotADirectory);
+            return Err(KernelError::NotDirectory);
         }
 
         // Find the entry to ensure it exists and is a directory
@@ -2021,17 +2021,17 @@ impl InodeOps for VfatInodeOps {
         let entry = entries
             .iter()
             .find(|e| e.name.eq_ignore_ascii_case(name))
-            .ok_or(FsError::NotFound)?;
+            .ok_or(KernelError::NotFound)?;
 
         if !entry.is_dir() {
-            return Err(FsError::NotADirectory);
+            return Err(KernelError::NotDirectory);
         }
 
         // Check if directory is empty (only . and .. allowed)
         let child_entries = read_directory_entries(&sb_data, entry.start_cluster)?;
         for child in &child_entries {
             if child.name != "." && child.name != ".." {
-                return Err(FsError::DirectoryNotEmpty);
+                return Err(KernelError::DirectoryNotEmpty);
             }
         }
 
@@ -2046,19 +2046,19 @@ impl InodeOps for VfatInodeOps {
         Ok(())
     }
 
-    fn truncate(&self, inode: &Inode, length: u64) -> Result<(), FsError> {
-        let sb = inode.superblock().ok_or(FsError::IoError)?;
+    fn truncate(&self, inode: &Inode, length: u64) -> Result<(), KernelError> {
+        let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let inode_data = get_inode_data(inode)?;
 
         // Directories cannot be truncated
         if inode_data.is_dir {
-            return Err(FsError::IsADirectory);
+            return Err(KernelError::IsDirectory);
         }
 
         // FAT32 file size limit is 4 GiB - 1 (u32::MAX)
         if length > u32::MAX as u64 {
-            return Err(FsError::FileTooLarge);
+            return Err(KernelError::FileTooLarge);
         }
 
         let old_size = inode_data.file_size as u64;
@@ -2213,13 +2213,13 @@ impl InodeOps for VfatInodeOps {
         new_dir: &Arc<Inode>,
         new_name: &str,
         flags: u32,
-    ) -> Result<(), FsError> {
+    ) -> Result<(), KernelError> {
         // RENAME_EXCHANGE not supported for FAT
         if flags != 0 {
-            return Err(FsError::InvalidArgument);
+            return Err(KernelError::InvalidArgument);
         }
 
-        let sb = old_dir.superblock().ok_or(FsError::IoError)?;
+        let sb = old_dir.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let old_dir_data = get_inode_data(old_dir)?;
         let new_dir_data = get_inode_data(new_dir)?;
@@ -2229,7 +2229,7 @@ impl InodeOps for VfatInodeOps {
         let old_entry = old_entries
             .iter()
             .find(|e| e.name.eq_ignore_ascii_case(old_name))
-            .ok_or(FsError::NotFound)?
+            .ok_or(KernelError::NotFound)?
             .clone();
 
         // Check if target already exists
@@ -2241,14 +2241,14 @@ impl InodeOps for VfatInodeOps {
             // Target exists - delete it (FAT replaces existing)
             if existing.is_dir() != old_entry.is_dir() {
                 // Can't replace file with dir or vice versa
-                return Err(FsError::InvalidArgument);
+                return Err(KernelError::InvalidArgument);
             }
             if existing.is_dir() {
                 // Check if target dir is empty
                 let child_entries = read_directory_entries(&sb_data, existing.start_cluster)?;
                 for child in &child_entries {
                     if child.name != "." && child.name != ".." {
-                        return Err(FsError::DirectoryNotEmpty);
+                        return Err(KernelError::DirectoryNotEmpty);
                     }
                 }
             }
@@ -2289,7 +2289,7 @@ fn create_inode_for_entry(
     sb: &Arc<SuperBlock>,
     entry: &ParsedDirEntry,
     parent_cluster: u32,
-) -> Result<Arc<Inode>, FsError> {
+) -> Result<Arc<Inode>, KernelError> {
     let sb_data = get_sb_data(sb)?;
     let mode = if entry.is_dir() {
         InodeMode::directory(0o755)
@@ -2333,8 +2333,8 @@ impl FileOps for VfatFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, FsError> {
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let inode_data = get_inode_data(&inode)?;
 
         // Use generic_file_read with VFAT file address space ops
@@ -2350,14 +2350,14 @@ impl FileOps for VfatFileOps {
         )
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, FsError> {
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         if buf.is_empty() {
             return Ok(0);
         }
 
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let mut inode_data = get_inode_data(&inode)?;
-        let sb = inode.superblock().ok_or(FsError::IoError)?;
+        let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let pos = file.get_pos();
         let old_size = inode.get_size();
@@ -2460,8 +2460,8 @@ impl FileOps for VfatFileOps {
         Ok(bytes_written)
     }
 
-    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, FsError> {
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
+    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let inode_data = get_inode_data(&inode)?;
 
         // Use generic_file_pread with VFAT file address space ops
@@ -2477,14 +2477,14 @@ impl FileOps for VfatFileOps {
         )
     }
 
-    fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, FsError> {
+    fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
         if buf.is_empty() {
             return Ok(0);
         }
 
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let mut inode_data = get_inode_data(&inode)?;
-        let sb = inode.superblock().ok_or(FsError::IoError)?;
+        let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let old_size = inode.get_size();
 
@@ -2590,14 +2590,14 @@ impl FileOps for VfatFileOps {
         &self,
         file: &File,
         callback: &mut dyn FnMut(VfsDirEntry) -> bool,
-    ) -> Result<(), FsError> {
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
-        let sb = inode.superblock().ok_or(FsError::IoError)?;
+    ) -> Result<(), KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let inode_data = get_inode_data(&inode)?;
 
         if !inode_data.is_dir {
-            return Err(FsError::NotADirectory);
+            return Err(KernelError::NotDirectory);
         }
 
         // Emit . and ..
@@ -2676,7 +2676,7 @@ impl SuperOps for VfatSuperOps {
         sb: &Arc<SuperBlock>,
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, FsError> {
+    ) -> Result<Arc<Inode>, KernelError> {
         Ok(Arc::new(Inode::new(
             sb.alloc_ino(),
             mode,
@@ -2697,15 +2697,15 @@ pub static VFAT_SUPER_OPS: VfatSuperOps = VfatSuperOps;
 // ============================================================================
 
 /// Placeholder mount function for pseudo-fs style (shouldn't be called)
-fn vfat_mount_pseudo(_fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, FsError> {
-    Err(FsError::NotSupported) // FAT32 requires a device
+fn vfat_mount_pseudo(_fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError> {
+    Err(KernelError::OperationNotSupported) // FAT32 requires a device
 }
 
 /// Mount VFAT filesystem on a block device
 fn vfat_mount_dev(
     fs_type: &'static FileSystemType,
     bdev: Arc<BlockDevice>,
-) -> Result<Arc<SuperBlock>, FsError> {
+) -> Result<Arc<SuperBlock>, KernelError> {
     // Read boot sector
     let mut boot_sector_buf = [0u8; 512];
     read_bytes(&bdev, 0, &mut boot_sector_buf)?;
@@ -2717,17 +2717,17 @@ fn vfat_mount_dev(
     // Check for valid bytes per sector (must be power of 2, 512-4096)
     let bytes_per_sector = boot_sector.bytes_per_sector;
     if !(512..=4096).contains(&bytes_per_sector) || !bytes_per_sector.is_power_of_two() {
-        return Err(FsError::InvalidArgument);
+        return Err(KernelError::InvalidArgument);
     }
 
     // Check for FAT32 (fat_size_16 == 0 and fat_size_32 != 0)
     if boot_sector.fat_size_16 != 0 || boot_sector.fat_size_32 == 0 {
-        return Err(FsError::InvalidArgument);
+        return Err(KernelError::InvalidArgument);
     }
 
     // Check root_entry_count is 0 (required for FAT32)
     if boot_sector.root_entry_count != 0 {
-        return Err(FsError::InvalidArgument);
+        return Err(KernelError::InvalidArgument);
     }
 
     // Calculate filesystem layout
