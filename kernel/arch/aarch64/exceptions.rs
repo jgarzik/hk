@@ -3,14 +3,9 @@
 //! This module contains exception handlers for synchronous exceptions and IRQs.
 
 use crate::printkln;
-use crate::task::syscall::sys_exit;
 use core::arch::asm;
 
 use super::Aarch64TrapFrame;
-
-// Linux signal numbers - exit status for signal death is 128 + signal
-const EXIT_SIGILL: i32 = 128 + 4; // SIGILL = 4
-const EXIT_SIGSEGV: i32 = 128 + 11; // SIGSEGV = 11
 
 // Exception classes (ESR_EL1[31:26])
 const EC_UNKNOWN: u64 = 0x00;
@@ -188,14 +183,26 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
                 }
             }
 
-            // Unhandled fault - terminate process
+            // Unhandled fault - send signal to process
             printkln!(
                 "User data abort at ELR={:#x}, FAR={:#x}, ISS={:#x}",
                 frame.elr,
                 far,
                 iss
             );
-            sys_exit(EXIT_SIGSEGV);
+
+            // Send SIGSEGV or SIGBUS depending on fault type
+            // Access flag fault (DFSC 0x08-0x0B) suggests hardware error -> SIGBUS
+            let is_bus_error = (0x08..=0x0B).contains(&dfsc);
+            let sig = if is_bus_error {
+                crate::signal::SIGBUS
+            } else {
+                crate::signal::SIGSEGV
+            };
+
+            let tid = crate::task::percpu::current_tid();
+            crate::signal::send_signal(tid, sig);
+            // Return to user - signal will be delivered on next syscall exit
         }
         EC_IABORT_LOWER => {
             let far: u64;
@@ -208,20 +215,26 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
                 far,
                 iss
             );
-            // Terminate the process (sys_exit never returns)
-            sys_exit(EXIT_SIGSEGV);
+
+            // Send SIGSEGV for instruction abort
+            let tid = crate::task::percpu::current_tid();
+            crate::signal::send_signal(tid, crate::signal::SIGSEGV);
+            // Return to user - signal will be delivered on next syscall exit
         }
         _ => {
-            // Unknown/unhandled exception from userland - terminate the process
-            // rather than panicking the kernel. This could be an illegal instruction,
-            // alignment fault, or other unrecognized exception class.
+            // Unknown/unhandled exception from userland - send signal instead of terminating.
+            // This could be an illegal instruction, alignment fault, or other exception.
             printkln!(
-                "Unhandled EL0 sync exception: EC={:#x}, ISS={:#x}, ELR={:#x} - terminating process",
+                "Unhandled EL0 sync exception: EC={:#x}, ISS={:#x}, ELR={:#x}",
                 ec,
                 iss,
                 frame.elr
             );
-            sys_exit(EXIT_SIGILL);
+
+            // Send SIGILL for unknown exceptions (likely illegal instruction)
+            let tid = crate::task::percpu::current_tid();
+            crate::signal::send_signal(tid, crate::signal::SIGILL);
+            // Return to user - signal will be delivered on next syscall exit
         }
     }
 }

@@ -14,6 +14,8 @@ pub const PAGE_WRITABLE: u64 = 1 << 1;
 pub const PAGE_USER: u64 = 1 << 2;
 pub const PAGE_WRITE_THROUGH: u64 = 1 << 3;
 pub const PAGE_CACHE_DISABLE: u64 = 1 << 4;
+pub const PAGE_ACCESSED: u64 = 1 << 5; // Hardware-set: page was accessed
+pub const PAGE_DIRTY: u64 = 1 << 6; // Hardware-set: page was written
 pub const PAGE_HUGE: u64 = 1 << 7;
 pub const PAGE_NO_EXECUTE: u64 = 1 << 63;
 
@@ -327,6 +329,31 @@ impl X86_64PageTable {
         }
     }
 
+    /// Flush TLB for a range of addresses
+    ///
+    /// For large ranges (>32 pages), a full TLB flush is more efficient
+    /// than individual invlpg instructions.
+    pub fn flush_tlb_range(start: u64, end: u64) {
+        const INVLPG_THRESHOLD: u64 = 32 * PAGE_SIZE; // 32 pages
+
+        if end <= start {
+            return;
+        }
+
+        let range = end - start;
+        if range > INVLPG_THRESHOLD {
+            // Full TLB flush is cheaper for large ranges
+            Self::flush_tlb_all();
+        } else {
+            // Individual invalidations for small ranges
+            let mut addr = start & !(PAGE_SIZE - 1);
+            while addr < end {
+                Self::flush_tlb(addr);
+                addr += PAGE_SIZE;
+            }
+        }
+    }
+
     /// Translate a virtual address to physical address
     /// Returns None if the address is not mapped
     #[allow(dead_code)]
@@ -609,6 +636,52 @@ const USER_END: u64 = 0x0000_8000_0000_0000; // 128TB
 pub const PAGE_COW: u64 = 1 << 9;
 
 // ============================================================================
+// PTE flag manipulation helpers (Linux-style)
+// ============================================================================
+
+/// Make a PTE young (set Accessed bit)
+#[inline]
+pub const fn pte_mkyoung(pte: u64) -> u64 {
+    pte | PAGE_ACCESSED
+}
+
+/// Make a PTE dirty (set Dirty bit)
+#[inline]
+pub const fn pte_mkdirty(pte: u64) -> u64 {
+    pte | PAGE_DIRTY
+}
+
+/// Check if PTE is young (Accessed bit set)
+#[inline]
+pub const fn pte_young(pte: u64) -> bool {
+    pte & PAGE_ACCESSED != 0
+}
+
+/// Check if PTE is dirty (Dirty bit set)
+#[inline]
+pub const fn pte_dirty(pte: u64) -> bool {
+    pte & PAGE_DIRTY != 0
+}
+
+/// Make a PTE writable
+#[inline]
+pub const fn pte_mkwrite(pte: u64) -> u64 {
+    pte | PAGE_WRITABLE
+}
+
+/// Remove write permission from a PTE
+#[inline]
+pub const fn pte_wrprotect(pte: u64) -> u64 {
+    pte & !PAGE_WRITABLE
+}
+
+/// Check if PTE is writable
+#[inline]
+pub const fn pte_write(pte: u64) -> bool {
+    pte & PAGE_WRITABLE != 0
+}
+
+// ============================================================================
 // Swap PTE helpers
 // ============================================================================
 
@@ -637,6 +710,10 @@ pub fn swap_entry_to_pte(entry: SwapEntry) -> u64 {
     entry.to_pte()
 }
 
+/// Callback to check if a page should be force-copied instead of COW'd
+/// Used for mlock'd pages which should be copied immediately
+pub type ForceCopyFn = fn(vaddr: u64) -> bool;
+
 impl X86_64PageTable {
     /// Duplicate the entire user address space using Copy-on-Write (COW)
     ///
@@ -650,9 +727,31 @@ impl X86_64PageTable {
     /// 2. Copy the page contents
     /// 3. Update the PTE to point to the new frame with write permission
     /// 4. Decrement the old frame's reference count
+    ///
+    /// If `force_copy_fn` is provided, pages where the callback returns true
+    /// will be copied immediately instead of using COW. This is used for
+    /// mlock'd pages that must remain resident.
     pub fn duplicate_user_space<FA: FrameAlloc<PhysAddr = u64>>(
         &self,
         frame_alloc: &mut FA,
+    ) -> Result<Self, i32> {
+        self.duplicate_user_space_inner(frame_alloc, None)
+    }
+
+    /// Duplicate user space with optional force-copy callback for mlock'd pages
+    pub fn duplicate_user_space_with_callback<FA: FrameAlloc<PhysAddr = u64>>(
+        &self,
+        frame_alloc: &mut FA,
+        force_copy_fn: ForceCopyFn,
+    ) -> Result<Self, i32> {
+        self.duplicate_user_space_inner(frame_alloc, Some(force_copy_fn))
+    }
+
+    /// Internal implementation of user space duplication
+    fn duplicate_user_space_inner<FA: FrameAlloc<PhysAddr = u64>>(
+        &self,
+        frame_alloc: &mut FA,
+        force_copy_fn: Option<ForceCopyFn>,
     ) -> Result<Self, i32> {
         // Create new user page table
         let mut new_pt = Self::new_user(frame_alloc).ok_or(-12i32)?; // ENOMEM
@@ -665,6 +764,10 @@ impl X86_64PageTable {
         // Instead, we walk the parent's page tables and:
         // - For kernel addresses (< USER_START): share by copying PTE directly
         // - For user addresses (>= USER_START): copy page contents to new frame
+
+        // Track range of modified parent PTEs for batch TLB flush
+        let mut flush_start: Option<u64> = None;
+        let mut flush_end: u64 = 0;
 
         unsafe {
             let parent_pml4 = phys_to_virt_table_const(self.pml4_phys);
@@ -757,45 +860,81 @@ impl X86_64PageTable {
                                     frame_alloc,
                                 )?;
                             } else {
-                                // User address - use COW (Copy-on-Write)
+                                // User address - use COW (Copy-on-Write) or force copy
                                 let old_phys = pt_entry.addr();
                                 let old_flags = pt_entry.flags();
 
-                                // If the page was writable, mark it read-only and set COW flag
-                                // in both parent and child PTEs
-                                let cow_flags = if old_flags & PAGE_WRITABLE != 0 {
-                                    // Remove WRITABLE, add COW marker
-                                    (old_flags & !PAGE_WRITABLE) | PAGE_COW
+                                // Check if this page should be force-copied (e.g., mlock'd)
+                                let force_copy = force_copy_fn.map_or(false, |f| f(vaddr));
+
+                                if force_copy {
+                                    // Force copy: allocate new frame and copy contents immediately
+                                    // Used for mlock'd pages that must remain resident
+                                    let new_phys = frame_alloc.alloc_frame().ok_or(-12i32)?;
+
+                                    // Copy page contents
+                                    core::ptr::copy_nonoverlapping(
+                                        phys_to_virt(old_phys) as *const u8,
+                                        phys_to_virt(new_phys),
+                                        PAGE_SIZE as usize,
+                                    );
+
+                                    // Map new frame in child with original flags
+                                    new_pt.ensure_pt_entry(
+                                        pml4_idx,
+                                        pdpt_idx,
+                                        pd_idx,
+                                        pt_idx,
+                                        PageTableEntry(new_phys | old_flags),
+                                        frame_alloc,
+                                    )?;
                                 } else {
-                                    // Already read-only, keep as-is (no COW needed)
-                                    old_flags
-                                };
+                                    // Standard COW: mark read-only in both parent and child
+                                    // If the page was writable, mark it read-only and set COW flag
+                                    // in both parent and child PTEs
+                                    let cow_flags = if old_flags & PAGE_WRITABLE != 0 {
+                                        // Remove WRITABLE, add COW marker
+                                        (old_flags & !PAGE_WRITABLE) | PAGE_COW
+                                    } else {
+                                        // Already read-only, keep as-is (no COW needed)
+                                        old_flags
+                                    };
 
-                                // Update parent's PTE to be read-only with COW flag
-                                if old_flags & PAGE_WRITABLE != 0 {
-                                    let parent_pt = phys_to_virt_table((*pd).entry(pd_idx).addr());
-                                    (*parent_pt).entry_mut(pt_idx).set(old_phys, cow_flags);
-                                    // Flush TLB for the parent's mapping
-                                    Self::flush_tlb(vaddr);
+                                    // Update parent's PTE to be read-only with COW flag
+                                    if old_flags & PAGE_WRITABLE != 0 {
+                                        let parent_pt = phys_to_virt_table((*pd).entry(pd_idx).addr());
+                                        (*parent_pt).entry_mut(pt_idx).set(old_phys, cow_flags);
+                                        // Track range for batch TLB flush (instead of per-page flush)
+                                        if flush_start.is_none() {
+                                            flush_start = Some(vaddr);
+                                        }
+                                        flush_end = vaddr + PAGE_SIZE;
+                                    }
+
+                                    // Increment reference count for the shared frame
+                                    crate::FRAME_ALLOCATOR.incref(old_phys);
+
+                                    // Map same physical frame in child with COW flags
+                                    new_pt.ensure_pt_entry(
+                                        pml4_idx,
+                                        pdpt_idx,
+                                        pd_idx,
+                                        pt_idx,
+                                        PageTableEntry(old_phys | cow_flags),
+                                        frame_alloc,
+                                    )?;
                                 }
-
-                                // Increment reference count for the shared frame
-                                crate::FRAME_ALLOCATOR.incref(old_phys);
-
-                                // Map same physical frame in child with COW flags
-                                new_pt.ensure_pt_entry(
-                                    pml4_idx,
-                                    pdpt_idx,
-                                    pd_idx,
-                                    pt_idx,
-                                    PageTableEntry(old_phys | cow_flags),
-                                    frame_alloc,
-                                )?;
                             }
                         }
                     }
                 }
             }
+        }
+
+        // Batch TLB flush for all modified parent PTEs
+        // This is more efficient than per-page flush for large address spaces
+        if let Some(start) = flush_start {
+            Self::flush_tlb_range(start, flush_end);
         }
 
         Ok(new_pt)

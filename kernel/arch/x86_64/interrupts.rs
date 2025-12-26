@@ -338,12 +338,35 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
         ::core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
     }
 
-    // Handle page faults specially - check for COW
-    if vector == 14
-        && let Some(handled) = handle_page_fault(frame, cr2)
-        && handled
-    {
-        return 1; // Fault handled, resume execution
+    // Handle page faults specially - check for COW, demand paging, etc.
+    if vector == 14 {
+        match handle_page_fault(frame, cr2) {
+            Some(true) => {
+                return 1; // Fault handled, resume execution
+            }
+            Some(false) | None => {
+                // Fault not handled - check if user mode
+                // Error code bit 2: User mode access (1) or supervisor (0)
+                let user = (frame.error_code & 4) != 0;
+                if user {
+                    // User mode page fault - send signal instead of halting
+                    // Error code bit 3: Reserved bit violation (SIGBUS)
+                    let is_bus_error = (frame.error_code & 8) != 0;
+                    let sig = if is_bus_error {
+                        crate::signal::SIGBUS
+                    } else {
+                        crate::signal::SIGSEGV
+                    };
+
+                    let tid = crate::task::percpu::current_tid();
+                    crate::signal::send_signal(tid, sig);
+
+                    // Return to user mode, signal will be delivered on syscall exit path
+                    return 1;
+                }
+                // Kernel mode fault - fall through to fatal handler
+            }
+        }
     }
 
     // Cast to u8 for the rest of the handler
@@ -572,8 +595,25 @@ fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
     let old_phys = pte_value & 0x000F_FFFF_FFFF_F000; // ADDR_MASK
     let old_flags = pte_value & !0x000F_FFFF_FFFF_F000;
 
+    // Get anon_vma from VMA for rmap updates (Linux: wp_page_copy sets up rmap)
+    use crate::mm::get_task_mm;
+    use crate::mm::anon_vma::AnonVma;
+    use crate::task::percpu::current_tid;
+    use alloc::sync::Arc;
+
+    let anon_vma: Option<Arc<AnonVma>> = {
+        let tid = current_tid();
+        get_task_mm(tid).and_then(|mm| {
+            let mm_guard = mm.lock();
+            mm_guard.find_vma(fault_addr).and_then(|vma| vma.anon_vma.clone())
+        })
+    };
+
     // Check reference count
     let refcount = crate::FRAME_ALLOCATOR.refcount(old_phys);
+
+    // Save original PTE value for race detection
+    let orig_pte = pte_value;
 
     if refcount > 1 {
         // Shared page: allocate new frame and copy
@@ -594,20 +634,59 @@ fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
             );
         }
 
-        // Update PTE: new frame, restore writable, clear COW flag
-        let new_flags = (old_flags & !PAGE_COW) | PAGE_WRITABLE;
-        unsafe {
-            core::ptr::write_volatile(pte_ptr, new_phys | new_flags);
-        }
+        // Update PTE: new frame, restore writable, clear COW flag, set young+dirty
+        // Linux: pte_mkdirty(pte_mkyoung(entry)) in wp_page_copy
+        use crate::arch::x86_64::paging::{PAGE_ACCESSED, PAGE_DIRTY};
+        let new_flags = (old_flags & !PAGE_COW) | PAGE_WRITABLE | PAGE_ACCESSED | PAGE_DIRTY;
+        let new_pte = new_phys | new_flags;
 
-        // Decrement old frame's reference count
-        crate::FRAME_ALLOCATOR.decref(old_phys);
+        // Use atomic CAS to update PTE - prevents race with another CPU resolving same fault
+        // Linux: pte_offset_map_lock + pte_same check in wp_page_copy
+        use core::sync::atomic::{AtomicU64, Ordering};
+        let pte_atomic = unsafe { &*(pte_ptr as *const AtomicU64) };
+        match pte_atomic.compare_exchange(orig_pte, new_pte, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                // Success - we updated the PTE
+                // Update rmap: register new page, remove old page
+                // Linux: folio_add_new_anon_rmap + folio_remove_rmap_pte in wp_page_copy
+                use crate::mm::lru::lru_add_new;
+                use crate::mm::rmap::{page_add_anon_rmap, page_remove_rmap};
+
+                if let Some(ref av) = anon_vma {
+                    page_add_anon_rmap(new_phys, av, fault_addr);
+                }
+                lru_add_new(new_phys);
+
+                // Remove old page from rmap (decrements mapcount)
+                page_remove_rmap(old_phys);
+
+                // Decrement old frame's reference count
+                crate::FRAME_ALLOCATOR.decref(old_phys);
+            }
+            Err(_) => {
+                // Race detected - another CPU already resolved this fault
+                // Free the frame we allocated and return success
+                crate::FRAME_ALLOCATOR.free(new_phys);
+                // Fault is already resolved, no TLB flush needed from us
+                return Some(true);
+            }
+        }
     } else {
         // Exclusive page (refcount == 1): just restore writable, clear COW flag
-        let new_flags = (old_flags & !PAGE_COW) | PAGE_WRITABLE;
+        // Also set young+dirty bits since we're writing
+        use crate::arch::x86_64::paging::{PAGE_ACCESSED, PAGE_DIRTY};
+        let new_flags = (old_flags & !PAGE_COW) | PAGE_WRITABLE | PAGE_ACCESSED | PAGE_DIRTY;
         let new_pte = old_phys | new_flags;
-        unsafe {
-            core::ptr::write_volatile(pte_ptr, new_pte);
+
+        // Use atomic CAS for exclusive case too - prevents race with munmap
+        use core::sync::atomic::{AtomicU64, Ordering};
+        let pte_atomic = unsafe { &*(pte_ptr as *const AtomicU64) };
+        if pte_atomic
+            .compare_exchange(orig_pte, new_pte, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Race detected - PTE changed, fault resolved elsewhere
+            return Some(true);
         }
     }
 
@@ -712,7 +791,9 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
     }
 
     // Build page table entry flags
-    let mut flags = PAGE_PRESENT | PAGE_USER;
+    // Set ACCESSED bit since we're mapping due to access (Linux: pte_mkyoung)
+    use crate::arch::x86_64::paging::PAGE_ACCESSED;
+    let mut flags = PAGE_PRESENT | PAGE_USER | PAGE_ACCESSED;
     if vma_prot & PROT_WRITE != 0 {
         flags |= PAGE_WRITABLE;
     }
