@@ -140,6 +140,8 @@ pub const SYS_TIMERFD_CREATE: u64 = 85;
 pub const SYS_TIMERFD_SETTIME: u64 = 86;
 /// timerfd_gettime(fd, curr_value)
 pub const SYS_TIMERFD_GETTIME: u64 = 87;
+/// adjtimex(txc) - read/set kernel clock parameters
+pub const SYS_ADJTIMEX: u64 = 171;
 
 // eventfd syscalls (Section 7.1)
 /// eventfd2(initval, flags) - NOTE: aarch64 only has eventfd2, not legacy eventfd
@@ -164,6 +166,8 @@ pub const SYS_EPOLL_CREATE1: u64 = 20;
 pub const SYS_EPOLL_CTL: u64 = 21;
 /// epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
 pub const SYS_EPOLL_PWAIT: u64 = 22;
+/// epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)
+pub const SYS_EPOLL_PWAIT2: u64 = 441;
 
 // POSIX timer syscalls (Section 6.2)
 /// timer_create(clockid, sigevent, timerid)
@@ -509,8 +513,8 @@ pub fn aarch64_syscall_dispatch(
         sys_waitid,
     };
     use crate::time_syscall::{
-        sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime, sys_eventfd2,
-        sys_nanosleep, sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
+        sys_adjtimex, sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime,
+        sys_eventfd2, sys_nanosleep, sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
     };
 
     match num {
@@ -709,6 +713,7 @@ pub fn aarch64_syscall_dispatch(
         SYS_TIMERFD_CREATE => sys_timerfd_create(arg0 as i32, arg1 as i32) as u64,
         SYS_TIMERFD_SETTIME => sys_timerfd_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64,
         SYS_TIMERFD_GETTIME => sys_timerfd_gettime(arg0 as i32, arg1) as u64,
+        SYS_ADJTIMEX => sys_adjtimex(arg0) as u64,
         SYS_EVENTFD2 => sys_eventfd2(arg0 as u32, arg1 as i32) as u64,
 
         // signalfd syscalls (Section 5)
@@ -733,6 +738,9 @@ pub fn aarch64_syscall_dispatch(
         SYS_EPOLL_PWAIT => {
             crate::epoll::sys_epoll_pwait(arg0 as i32, arg1, arg2 as i32, arg3 as i32, arg4, arg5)
                 as u64
+        }
+        SYS_EPOLL_PWAIT2 => {
+            crate::epoll::sys_epoll_pwait2(arg0 as i32, arg1, arg2 as i32, arg3, arg4, arg5) as u64
         }
 
         // POSIX timer syscalls (Section 6.2)

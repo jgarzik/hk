@@ -17,7 +17,7 @@
 //!
 //! The seqlock ensures readers get consistent snapshots without blocking.
 
-use ::core::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 /// Filesystem timestamp (seconds + nanoseconds since Unix epoch)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -63,6 +63,54 @@ pub enum ClockId {
 fn null_read_tsc() -> u64 {
     0
 }
+
+// ============================================================================
+// NTP state for adjtimex syscall
+// ============================================================================
+
+/// NTP-related status flags (from Linux)
+pub const STA_PLL: i32 = 0x0001;
+pub const STA_PPSFREQ: i32 = 0x0002;
+pub const STA_PPSTIME: i32 = 0x0004;
+pub const STA_FLL: i32 = 0x0008;
+pub const STA_INS: i32 = 0x0010;
+pub const STA_DEL: i32 = 0x0020;
+pub const STA_UNSYNC: i32 = 0x0040;
+pub const STA_FREQHOLD: i32 = 0x0080;
+pub const STA_NANO: i32 = 0x2000;
+
+/// Extended timekeeper state for NTP/adjtimex support
+pub struct NtpState {
+    /// Maximum error (microseconds)
+    pub maxerror: AtomicI64,
+    /// Estimated error (microseconds)
+    pub esterror: AtomicI64,
+    /// Clock status flags (STA_*)
+    pub status: AtomicI32,
+    /// TAI offset (seconds)
+    pub tai_offset: AtomicI32,
+    /// PLL time constant
+    pub constant: AtomicI64,
+    /// Tick value (usec per tick, nominally 10000 for 100Hz)
+    pub tick: AtomicI64,
+}
+
+impl NtpState {
+    /// Create a new NtpState with default values
+    pub const fn new() -> Self {
+        Self {
+            maxerror: AtomicI64::new(500_000),  // 0.5 sec default
+            esterror: AtomicI64::new(500_000),  // 0.5 sec default
+            status: AtomicI32::new(STA_UNSYNC), // Initially unsynchronized
+            tai_offset: AtomicI32::new(0),
+            constant: AtomicI64::new(2),
+            tick: AtomicI64::new(10000), // 10ms in usec (100Hz)
+        }
+    }
+}
+
+/// Global NTP state
+pub static NTP_STATE: NtpState = NtpState::new();
 
 /// Global timekeeper with seqlock protection
 ///

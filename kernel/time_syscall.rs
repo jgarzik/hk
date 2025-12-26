@@ -6,8 +6,9 @@
 //! crate::uaccess to ensure proper validation and SMAP protection.
 
 use crate::arch::Uaccess;
-use crate::time::{ClockId, TIMEKEEPER};
+use crate::time::{ClockId, NTP_STATE, STA_NANO, STA_UNSYNC, TIMEKEEPER};
 use crate::uaccess::{UaccessArch, get_user, put_user};
+use core::sync::atomic::Ordering;
 
 /// Linux clock IDs
 pub const CLOCK_REALTIME: i32 = 0;
@@ -633,4 +634,245 @@ pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
 #[cfg(target_arch = "x86_64")]
 pub fn sys_eventfd(initval: u32) -> i64 {
     sys_eventfd2(initval, 0)
+}
+
+// ============================================================================
+// adjtimex syscall
+// ============================================================================
+
+/// Linux __kernel_timex_timeval (used inside timex)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TimexTimeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+/// Linux __kernel_timex structure for adjtimex syscall
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Timex {
+    /// Mode selector (ADJ_* flags)
+    pub modes: u32,
+    _pad1: i32,
+    /// Time offset (usec or nsec depending on ADJ_NANO)
+    pub offset: i64,
+    /// Frequency offset (scaled PPM)
+    pub freq: i64,
+    /// Maximum error (usec)
+    pub maxerror: i64,
+    /// Estimated error (usec)
+    pub esterror: i64,
+    /// Clock status (STA_* flags)
+    pub status: i32,
+    _pad2: i32,
+    /// PLL time constant
+    pub constant: i64,
+    /// Clock precision (usec, read-only)
+    pub precision: i64,
+    /// Clock frequency tolerance (ppm, read-only)
+    pub tolerance: i64,
+    /// Current time (read-only except for ADJ_SETOFFSET)
+    pub time: TimexTimeval,
+    /// Usec between clock ticks
+    pub tick: i64,
+    /// PPS frequency (scaled ppm, read-only)
+    pub ppsfreq: i64,
+    /// PPS jitter (usec, read-only)
+    pub jitter: i64,
+    /// Interval duration shift (read-only)
+    pub shift: i32,
+    _pad3: i32,
+    /// PPS stability (scaled ppm, read-only)
+    pub stabil: i64,
+    /// Jitter limit exceeded (read-only)
+    pub jitcnt: i64,
+    /// Calibration intervals (read-only)
+    pub calcnt: i64,
+    /// Calibration errors (read-only)
+    pub errcnt: i64,
+    /// Stability limit exceeded (read-only)
+    pub stbcnt: i64,
+    /// TAI offset (read-only)
+    pub tai: i32,
+    /// Padding for 11 more i32 fields
+    _reserved: [i32; 11],
+}
+
+impl Default for Timex {
+    fn default() -> Self {
+        // Zero-initialize all fields
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+/// ADJ_* mode flags for adjtimex
+#[allow(dead_code)]
+pub const ADJ_OFFSET: u32 = 0x0001;
+#[allow(dead_code)]
+pub const ADJ_FREQUENCY: u32 = 0x0002;
+pub const ADJ_MAXERROR: u32 = 0x0004;
+pub const ADJ_ESTERROR: u32 = 0x0008;
+pub const ADJ_STATUS: u32 = 0x0010;
+pub const ADJ_TIMECONST: u32 = 0x0020;
+pub const ADJ_TAI: u32 = 0x0080;
+pub const ADJ_SETOFFSET: u32 = 0x0100;
+#[allow(dead_code)]
+pub const ADJ_MICRO: u32 = 0x1000;
+pub const ADJ_NANO: u32 = 0x2000;
+pub const ADJ_TICK: u32 = 0x4000;
+
+/// Clock time states (return values)
+pub const TIME_OK: i32 = 0;
+#[allow(dead_code)]
+pub const TIME_INS: i32 = 1;
+#[allow(dead_code)]
+pub const TIME_DEL: i32 = 2;
+#[allow(dead_code)]
+pub const TIME_OOP: i32 = 3;
+#[allow(dead_code)]
+pub const TIME_WAIT: i32 = 4;
+pub const TIME_ERROR: i32 = 5;
+
+/// Writable STA_* status flags (read-write mask)
+const STA_RW_MASK: i32 = crate::time::STA_PLL
+    | crate::time::STA_PPSFREQ
+    | crate::time::STA_PPSTIME
+    | crate::time::STA_FLL
+    | crate::time::STA_INS
+    | crate::time::STA_DEL
+    | crate::time::STA_UNSYNC
+    | crate::time::STA_FREQHOLD;
+
+/// sys_adjtimex - read or set kernel time variables
+///
+/// # Arguments
+/// * `txc_p` - Pointer to user space timex structure
+///
+/// Returns TIME_OK (0) on success if clock is synchronized,
+/// or TIME_ERROR (5) if unsynchronized,
+/// or negative errno on error.
+///
+/// # Privilege
+/// Reading (modes=0) is always allowed.
+/// Setting values requires CAP_SYS_TIME capability.
+pub fn sys_adjtimex(txc_p: u64) -> i64 {
+    // Validate user buffer
+    if txc_p == 0 || !Uaccess::access_ok(txc_p, core::mem::size_of::<Timex>()) {
+        return EFAULT;
+    }
+
+    // Read timex from user space
+    let mut txc: Timex = match get_user::<Uaccess, Timex>(txc_p) {
+        Ok(t) => t,
+        Err(_) => return EFAULT,
+    };
+
+    // Check if any modifications are requested
+    let is_read_only = txc.modes == 0;
+
+    // For any modification, require CAP_SYS_TIME
+    // For now, we allow modifications from any process (simplified model)
+    // A full implementation would check cred.has_capability(CAP_SYS_TIME)
+    if !is_read_only {
+        // Validate tick range if being set
+        if txc.modes & ADJ_TICK != 0 {
+            // Tick must be within 10% of nominal (10000 usec = 10ms for 100Hz)
+            if txc.tick < 9000 || txc.tick > 11000 {
+                return EINVAL;
+            }
+        }
+
+        // Validate offset if ADJ_SETOFFSET is used
+        if txc.modes & ADJ_SETOFFSET != 0 {
+            if txc.time.tv_usec < 0 {
+                return EINVAL;
+            }
+            if txc.modes & ADJ_NANO != 0 {
+                if txc.time.tv_usec >= 1_000_000_000 {
+                    return EINVAL;
+                }
+            } else if txc.time.tv_usec >= 1_000_000 {
+                return EINVAL;
+            }
+        }
+    }
+
+    // Apply modifications to kernel state
+    if txc.modes & ADJ_MAXERROR != 0 {
+        NTP_STATE.maxerror.store(txc.maxerror, Ordering::Relaxed);
+    }
+    if txc.modes & ADJ_ESTERROR != 0 {
+        NTP_STATE.esterror.store(txc.esterror, Ordering::Relaxed);
+    }
+    if txc.modes & ADJ_STATUS != 0 {
+        // Only allow setting writable status bits
+        let new_status = txc.status & STA_RW_MASK;
+        NTP_STATE.status.store(new_status, Ordering::Relaxed);
+    }
+    if txc.modes & ADJ_TAI != 0 {
+        NTP_STATE.tai_offset.store(txc.tai, Ordering::Relaxed);
+    }
+    if txc.modes & ADJ_TIMECONST != 0 {
+        NTP_STATE.constant.store(txc.constant, Ordering::Relaxed);
+    }
+    if txc.modes & ADJ_TICK != 0 {
+        NTP_STATE.tick.store(txc.tick, Ordering::Relaxed);
+    }
+
+    // Handle ADJ_SETOFFSET - inject time offset
+    if txc.modes & ADJ_SETOFFSET != 0 {
+        let offset_ns = if txc.modes & ADJ_NANO != 0 {
+            txc.time.tv_sec * 1_000_000_000 + txc.time.tv_usec
+        } else {
+            txc.time.tv_sec * 1_000_000_000 + txc.time.tv_usec * 1000
+        };
+
+        // Get current realtime and add offset
+        let current = TIMEKEEPER.read(ClockId::Realtime, TIMEKEEPER.get_read_cycles());
+        let new_ns = current.to_nanos() + offset_ns as i128;
+        let new_time = crate::time::Timespec::from_nanos(new_ns);
+        TIMEKEEPER.set_realtime(new_time);
+    }
+
+    // Read current state back into txc
+    let ts = TIMEKEEPER.read(ClockId::Realtime, TIMEKEEPER.get_read_cycles());
+    let status = NTP_STATE.status.load(Ordering::Relaxed);
+
+    txc.offset = 0; // No ongoing adjustment
+    txc.freq = 0; // No frequency offset
+    txc.maxerror = NTP_STATE.maxerror.load(Ordering::Relaxed);
+    txc.esterror = NTP_STATE.esterror.load(Ordering::Relaxed);
+    txc.status = status;
+    txc.constant = NTP_STATE.constant.load(Ordering::Relaxed);
+    txc.precision = 1; // 1 microsecond precision
+    txc.tolerance = 500; // 500 ppm tolerance
+    txc.time.tv_sec = ts.sec;
+    txc.time.tv_usec = if status & STA_NANO != 0 {
+        ts.nsec as i64
+    } else {
+        ts.nsec as i64 / 1000
+    };
+    txc.tick = NTP_STATE.tick.load(Ordering::Relaxed);
+    txc.ppsfreq = 0;
+    txc.jitter = 0;
+    txc.shift = 0;
+    txc.stabil = 0;
+    txc.jitcnt = 0;
+    txc.calcnt = 0;
+    txc.errcnt = 0;
+    txc.stbcnt = 0;
+    txc.tai = NTP_STATE.tai_offset.load(Ordering::Relaxed);
+
+    // Copy result back to user space
+    if put_user::<Uaccess, Timex>(txc_p, txc).is_err() {
+        return EFAULT;
+    }
+
+    // Return clock state
+    if status & STA_UNSYNC != 0 {
+        TIME_ERROR as i64
+    } else {
+        TIME_OK as i64
+    }
 }

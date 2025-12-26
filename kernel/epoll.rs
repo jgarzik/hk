@@ -650,3 +650,78 @@ pub fn sys_epoll_pwait(
 
     count as i64
 }
+
+/// sys_epoll_pwait2 - Wait for events with high-precision timeout
+///
+/// Like sys_epoll_pwait but uses a struct timespec pointer for nanosecond-precision
+/// timeout instead of an integer milliseconds value.
+///
+/// # Arguments
+/// * `epfd` - epoll file descriptor
+/// * `events_ptr` - User space buffer for returned events
+/// * `maxevents` - Maximum number of events to return
+/// * `timeout_ptr` - Pointer to struct timespec timeout (NULL = wait indefinitely)
+/// * `sigmask` - Signal mask (not yet implemented)
+/// * `sigsetsize` - Size of signal mask
+///
+/// Returns number of ready descriptors, 0 on timeout, or negative errno on error.
+pub fn sys_epoll_pwait2(
+    epfd: i32,
+    events_ptr: u64,
+    maxevents: i32,
+    timeout_ptr: u64,
+    _sigmask: u64,
+    _sigsetsize: u64,
+) -> i64 {
+    use crate::time_syscall::LinuxTimespec;
+
+    // Convert timespec to milliseconds for the existing wait logic
+    let timeout_ms: i32 = if timeout_ptr == 0 {
+        // NULL timeout = wait indefinitely
+        -1
+    } else {
+        // Read timespec from user space
+        let ts: LinuxTimespec = match get_user::<Uaccess, LinuxTimespec>(timeout_ptr) {
+            Ok(ts) => ts,
+            Err(_) => return EFAULT,
+        };
+
+        // Validate timespec
+        if ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+            return EINVAL;
+        }
+
+        // Handle negative seconds (invalid)
+        if ts.tv_sec < 0 {
+            return EINVAL;
+        }
+
+        // Check for zero timeout (non-blocking)
+        if ts.tv_sec == 0 && ts.tv_nsec == 0 {
+            0
+        } else {
+            // Convert seconds and nanoseconds to milliseconds
+            // tv_sec * 1000 + tv_nsec / 1_000_000, with rounding up for ns remainder
+            let ms_from_sec = (ts.tv_sec as i64).saturating_mul(1000);
+            let ms_from_ns = (ts.tv_nsec + 999_999) / 1_000_000; // Round up
+            let total_ms = ms_from_sec.saturating_add(ms_from_ns);
+
+            // Clamp to i32::MAX if overflow
+            if total_ms > i32::MAX as i64 {
+                i32::MAX
+            } else {
+                total_ms as i32
+            }
+        }
+    };
+
+    // Delegate to existing epoll_pwait implementation
+    sys_epoll_pwait(
+        epfd,
+        events_ptr,
+        maxevents,
+        timeout_ms,
+        _sigmask,
+        _sigsetsize,
+    )
+}

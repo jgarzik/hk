@@ -11,9 +11,10 @@
 use super::helpers::{print, println, print_num};
 use hk_syscall::{
     sys_close, sys_write, sys_pipe2, sys_eventfd2,
-    sys_epoll_create, sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait,
+    sys_epoll_create, sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait, sys_epoll_pwait2,
     EpollEvent, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD,
     EPOLLIN, EPOLLOUT, EPOLLONESHOT, EPOLL_CLOEXEC,
+    Timespec,
 };
 
 /// Run all epoll tests
@@ -26,6 +27,9 @@ pub fn run_tests() {
     test_epoll_timeout();
     test_epoll_modify();
     test_epoll_oneshot();
+    test_epoll_pwait2_null_timeout();
+    test_epoll_pwait2_zero_timeout();
+    test_epoll_pwait2_with_data();
 }
 
 /// Test epoll_create (legacy API)
@@ -351,4 +355,158 @@ fn test_epoll_oneshot() {
     sys_close(epfd as u64);
     sys_close(efd as u64);
     println(b"EPOLL_ONESHOT:OK");
+}
+
+/// Test epoll_pwait2 with NULL timeout (indefinite wait, but with ready fd)
+fn test_epoll_pwait2_null_timeout() {
+    let epfd = sys_epoll_create1(0);
+    if epfd < 0 {
+        print(b"EPOLL_PWAIT2_NULL:FAIL: epoll_create1 returned ");
+        print_num(epfd);
+        println(b"");
+        return;
+    }
+
+    // Create eventfd with initial value 1 (immediately readable)
+    let efd = sys_eventfd2(1, 0);
+    if efd < 0 {
+        print(b"EPOLL_PWAIT2_NULL:FAIL: eventfd2 returned ");
+        print_num(efd);
+        println(b"");
+        sys_close(epfd as u64);
+        return;
+    }
+
+    let event = EpollEvent::new(EPOLLIN, 100);
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, efd as i32, &event);
+
+    // NULL timeout with ready fd should return immediately
+    let mut events = [EpollEvent::empty(); 4];
+    let ret = sys_epoll_pwait2(
+        epfd as i32,
+        events.as_mut_ptr(),
+        4,
+        core::ptr::null(),
+        core::ptr::null(),
+        0,
+    );
+    if ret != 1 {
+        print(b"EPOLL_PWAIT2_NULL:FAIL: expected 1, got ");
+        print_num(ret);
+        println(b"");
+        sys_close(epfd as u64);
+        sys_close(efd as u64);
+        return;
+    }
+
+    if events[0].data != 100 {
+        print(b"EPOLL_PWAIT2_NULL:FAIL: wrong data ");
+        print_num(events[0].data as i64);
+        println(b"");
+        sys_close(epfd as u64);
+        sys_close(efd as u64);
+        return;
+    }
+
+    sys_close(epfd as u64);
+    sys_close(efd as u64);
+    println(b"EPOLL_PWAIT2_NULL:OK");
+}
+
+/// Test epoll_pwait2 with zero timeout (non-blocking)
+fn test_epoll_pwait2_zero_timeout() {
+    let epfd = sys_epoll_create1(0);
+    if epfd < 0 {
+        print(b"EPOLL_PWAIT2_ZERO:FAIL: epoll_create1 returned ");
+        print_num(epfd);
+        println(b"");
+        return;
+    }
+
+    // Empty epoll, zero timeout should return 0 immediately
+    let mut events = [EpollEvent::empty(); 4];
+    let timeout = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let ret = sys_epoll_pwait2(
+        epfd as i32,
+        events.as_mut_ptr(),
+        4,
+        &timeout,
+        core::ptr::null(),
+        0,
+    );
+    if ret != 0 {
+        print(b"EPOLL_PWAIT2_ZERO:FAIL: expected 0, got ");
+        print_num(ret);
+        println(b"");
+        sys_close(epfd as u64);
+        return;
+    }
+
+    sys_close(epfd as u64);
+    println(b"EPOLL_PWAIT2_ZERO:OK");
+}
+
+/// Test epoll_pwait2 with data ready and small timeout
+fn test_epoll_pwait2_with_data() {
+    let epfd = sys_epoll_create1(0);
+    if epfd < 0 {
+        print(b"EPOLL_PWAIT2_DATA:FAIL: epoll_create1 returned ");
+        print_num(epfd);
+        println(b"");
+        return;
+    }
+
+    let mut pipefd = [0i32; 2];
+    let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
+    if ret < 0 {
+        print(b"EPOLL_PWAIT2_DATA:FAIL: pipe2 returned ");
+        print_num(ret);
+        println(b"");
+        sys_close(epfd as u64);
+        return;
+    }
+
+    // Add read end
+    let event = EpollEvent::new(EPOLLIN, 200);
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, pipefd[0], &event);
+
+    // Write to pipe
+    let data = b"Y";
+    sys_write(pipefd[1] as u64, data.as_ptr(), 1);
+
+    // Use 100ms timeout (in nanoseconds)
+    let timeout = Timespec { tv_sec: 0, tv_nsec: 100_000_000 };
+    let mut events = [EpollEvent::empty(); 4];
+    let ret = sys_epoll_pwait2(
+        epfd as i32,
+        events.as_mut_ptr(),
+        4,
+        &timeout,
+        core::ptr::null(),
+        0,
+    );
+    if ret != 1 {
+        print(b"EPOLL_PWAIT2_DATA:FAIL: expected 1, got ");
+        print_num(ret);
+        println(b"");
+        sys_close(epfd as u64);
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        return;
+    }
+
+    if events[0].data != 200 {
+        print(b"EPOLL_PWAIT2_DATA:FAIL: wrong data ");
+        print_num(events[0].data as i64);
+        println(b"");
+        sys_close(epfd as u64);
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        return;
+    }
+
+    sys_close(epfd as u64);
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+    println(b"EPOLL_PWAIT2_DATA:OK");
 }

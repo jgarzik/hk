@@ -8,7 +8,7 @@
 //! - Return value in RAX
 //! - RCX and R11 are clobbered by the syscall instruction
 
-use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigInfo, SigEvent, Stat, Timespec, Timeval, UtsName};
+use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigInfo, SigEvent, Stat, Timespec, Timeval, Timex, UtsName};
 
 // ============================================================================
 // Syscall helper macros
@@ -298,6 +298,7 @@ pub const SYS_CLOCK_NANOSLEEP: u64 = 230;
 pub const SYS_TIMERFD_CREATE: u64 = 283;
 pub const SYS_TIMERFD_SETTIME: u64 = 286;
 pub const SYS_TIMERFD_GETTIME: u64 = 287;
+pub const SYS_ADJTIMEX: u64 = 159;
 
 // eventfd syscalls (Section 7.1)
 pub const SYS_EVENTFD: u64 = 284;
@@ -313,6 +314,7 @@ pub const SYS_EPOLL_WAIT: u64 = 232;
 pub const SYS_EPOLL_CTL: u64 = 233;
 pub const SYS_EPOLL_PWAIT: u64 = 281;
 pub const SYS_EPOLL_CREATE1: u64 = 291;
+pub const SYS_EPOLL_PWAIT2: u64 = 441;
 
 // POSIX timer syscalls (Section 6.2)
 pub const SYS_TIMER_CREATE: u64 = 222;
@@ -923,6 +925,19 @@ pub fn sys_epoll_pwait(
     unsafe { syscall6!(SYS_EPOLL_PWAIT, epfd, events, maxevents, timeout, sigmask, sigsetsize) }
 }
 
+/// epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize) - wait with timespec timeout
+#[inline(always)]
+pub fn sys_epoll_pwait2(
+    epfd: i32,
+    events: *mut EpollEvent,
+    maxevents: i32,
+    timeout: *const Timespec,
+    sigmask: *const u64,
+    sigsetsize: usize,
+) -> i64 {
+    unsafe { syscall6!(SYS_EPOLL_PWAIT2, epfd, events, maxevents, timeout, sigmask, sigsetsize) }
+}
+
 // --- POSIX Timers ---
 
 /// timer_create(clockid, sigevent, timerid)
@@ -953,6 +968,12 @@ pub fn sys_timer_getoverrun(timerid: i32) -> i64 {
 #[inline(always)]
 pub fn sys_timer_delete(timerid: i32) -> i64 {
     unsafe { syscall1!(SYS_TIMER_DELETE, timerid) }
+}
+
+/// adjtimex(txc) - read/set kernel clock parameters
+#[inline(always)]
+pub fn sys_adjtimex(txc: *mut Timex) -> i64 {
+    unsafe { syscall1!(SYS_ADJTIMEX, txc) }
 }
 
 // --- POSIX Message Queues ---

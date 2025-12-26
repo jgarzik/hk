@@ -215,7 +215,7 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] time
 - [x] gettimeofday
 - [x] settimeofday (x86_64 only)
-- [ ] adjtimex (NTP)
+- [x] adjtimex (NTP)
 - [x] clock_gettime
 - [x] clock_settime
 - [x] clock_getres
@@ -313,7 +313,7 @@ Linux groups the socket syscalls as their own "network" category.
 - [x] epoll_ctl
 - [x] epoll_wait
 - [x] epoll_pwait
-- [ ] epoll_pwait2 (newer)
+- [x] epoll_pwait2 (newer)
 
 9.2 Inotify & fanotify (fs events)
 

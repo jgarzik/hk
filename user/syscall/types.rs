@@ -1545,3 +1545,104 @@ pub const CLONE_ARGS_SIZE_VER0: usize = 64;
 pub const PER_LINUX: u32 = 0;
 /// Query personality without changing it
 pub const PERSONALITY_QUERY: u32 = 0xFFFFFFFF;
+
+// ============================================================================
+// adjtimex types and constants
+// ============================================================================
+
+/// Timeval for timex structure
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TimexTimeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+/// Linux __kernel_timex structure for adjtimex syscall
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Timex {
+    /// Mode selector (ADJ_* flags)
+    pub modes: u32,
+    _pad1: i32,
+    /// Time offset (usec or nsec depending on ADJ_NANO)
+    pub offset: i64,
+    /// Frequency offset (scaled PPM)
+    pub freq: i64,
+    /// Maximum error (usec)
+    pub maxerror: i64,
+    /// Estimated error (usec)
+    pub esterror: i64,
+    /// Clock status (STA_* flags)
+    pub status: i32,
+    _pad2: i32,
+    /// PLL time constant
+    pub constant: i64,
+    /// Clock precision (usec, read-only)
+    pub precision: i64,
+    /// Clock frequency tolerance (ppm, read-only)
+    pub tolerance: i64,
+    /// Current time (read-only except for ADJ_SETOFFSET)
+    pub time: TimexTimeval,
+    /// Usec between clock ticks
+    pub tick: i64,
+    /// PPS frequency (scaled ppm, read-only)
+    pub ppsfreq: i64,
+    /// PPS jitter (usec, read-only)
+    pub jitter: i64,
+    /// Interval duration shift (read-only)
+    pub shift: i32,
+    _pad3: i32,
+    /// PPS stability (scaled ppm, read-only)
+    pub stabil: i64,
+    /// Jitter limit exceeded (read-only)
+    pub jitcnt: i64,
+    /// Calibration intervals (read-only)
+    pub calcnt: i64,
+    /// Calibration errors (read-only)
+    pub errcnt: i64,
+    /// Stability limit exceeded (read-only)
+    pub stbcnt: i64,
+    /// TAI offset (read-only)
+    pub tai: i32,
+    /// Padding for 11 more i32 fields
+    _reserved: [i32; 11],
+}
+
+impl Default for Timex {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+/// ADJ_* mode flags for adjtimex
+pub const ADJ_OFFSET: u32 = 0x0001;
+pub const ADJ_FREQUENCY: u32 = 0x0002;
+pub const ADJ_MAXERROR: u32 = 0x0004;
+pub const ADJ_ESTERROR: u32 = 0x0008;
+pub const ADJ_STATUS: u32 = 0x0010;
+pub const ADJ_TIMECONST: u32 = 0x0020;
+pub const ADJ_TAI: u32 = 0x0080;
+pub const ADJ_SETOFFSET: u32 = 0x0100;
+pub const ADJ_MICRO: u32 = 0x1000;
+pub const ADJ_NANO: u32 = 0x2000;
+pub const ADJ_TICK: u32 = 0x4000;
+
+/// STA_* status flags
+pub const STA_PLL: i32 = 0x0001;
+pub const STA_PPSFREQ: i32 = 0x0002;
+pub const STA_PPSTIME: i32 = 0x0004;
+pub const STA_FLL: i32 = 0x0008;
+pub const STA_INS: i32 = 0x0010;
+pub const STA_DEL: i32 = 0x0020;
+pub const STA_UNSYNC: i32 = 0x0040;
+pub const STA_FREQHOLD: i32 = 0x0080;
+pub const STA_NANO: i32 = 0x2000;
+
+/// Time state return values
+pub const TIME_OK: i32 = 0;
+pub const TIME_INS: i32 = 1;
+pub const TIME_DEL: i32 = 2;
+pub const TIME_OOP: i32 = 3;
+pub const TIME_WAIT: i32 = 4;
+pub const TIME_ERROR: i32 = 5;

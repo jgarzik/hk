@@ -19,7 +19,7 @@
 //!   - No `chmod`, `chown`, `lchown` - use *at variants
 //!   - No `truncate` - use ftruncate with openat
 
-use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Stat, Timespec, Timeval, UtsName, AT_FDCWD};
+use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Stat, Timespec, Timeval, Timex, UtsName, AT_FDCWD};
 
 // ============================================================================
 // Syscall macros for aarch64
@@ -185,6 +185,7 @@ pub const SYS_CLOCK_NANOSLEEP: u64 = 115;
 pub const SYS_TIMERFD_CREATE: u64 = 85;
 pub const SYS_TIMERFD_SETTIME: u64 = 86;
 pub const SYS_TIMERFD_GETTIME: u64 = 87;
+pub const SYS_ADJTIMEX: u64 = 171;
 pub const SYS_CAPGET: u64 = 90;
 pub const SYS_CAPSET: u64 = 91;
 
@@ -200,6 +201,7 @@ pub const SYS_SIGNALFD4: u64 = 74;
 pub const SYS_EPOLL_CREATE1: u64 = 20;
 pub const SYS_EPOLL_CTL: u64 = 21;
 pub const SYS_EPOLL_PWAIT: u64 = 22;
+pub const SYS_EPOLL_PWAIT2: u64 = 441;
 
 // POSIX timer syscalls (Section 6.2)
 pub const SYS_TIMER_CREATE: u64 = 107;
@@ -669,6 +671,19 @@ pub fn sys_epoll_pwait(
     unsafe { syscall6!(SYS_EPOLL_PWAIT, epfd, events, maxevents, timeout, sigmask, sigsetsize) }
 }
 
+/// epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize) - wait with timespec timeout
+#[inline(always)]
+pub fn sys_epoll_pwait2(
+    epfd: i32,
+    events: *mut EpollEvent,
+    maxevents: i32,
+    timeout: *const Timespec,
+    sigmask: *const u64,
+    sigsetsize: usize,
+) -> i64 {
+    unsafe { syscall6!(SYS_EPOLL_PWAIT2, epfd, events, maxevents, timeout, sigmask, sigsetsize) }
+}
+
 // --- POSIX Timers ---
 
 /// timer_create(clockid, sigevent, timerid)
@@ -699,6 +714,12 @@ pub fn sys_timer_getoverrun(timerid: i32) -> i64 {
 #[inline(always)]
 pub fn sys_timer_delete(timerid: i32) -> i64 {
     unsafe { syscall1!(SYS_TIMER_DELETE, timerid) }
+}
+
+/// adjtimex(txc) - read/set kernel clock parameters
+#[inline(always)]
+pub fn sys_adjtimex(txc: *mut Timex) -> i64 {
+    unsafe { syscall1!(SYS_ADJTIMEX, txc) }
 }
 
 // --- POSIX Message Queues ---
