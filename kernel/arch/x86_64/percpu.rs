@@ -69,6 +69,15 @@ pub struct PerCpu {
     /// Saved user RSP from syscall entry
     /// Used by fork() to inherit parent's stack pointer
     pub syscall_user_rsp: u64,
+
+    /// Saved callee-saved registers from syscall entry
+    /// Used by fork() so child inherits parent's register state
+    pub syscall_user_rbx: u64,
+    pub syscall_user_rbp: u64,
+    pub syscall_user_r12: u64,
+    pub syscall_user_r13: u64,
+    pub syscall_user_r14: u64,
+    pub syscall_user_r15: u64,
 }
 
 impl PerCpu {
@@ -90,6 +99,12 @@ impl PerCpu {
             syscall_user_rip: 0,
             syscall_user_rflags: 0,
             syscall_user_rsp: 0,
+            syscall_user_rbx: 0,
+            syscall_user_rbp: 0,
+            syscall_user_r12: 0,
+            syscall_user_r13: 0,
+            syscall_user_r14: 0,
+            syscall_user_r15: 0,
         }
     }
 
@@ -109,6 +124,12 @@ impl PerCpu {
         self.syscall_user_rip = 0;
         self.syscall_user_rflags = 0;
         self.syscall_user_rsp = 0;
+        self.syscall_user_rbx = 0;
+        self.syscall_user_rbp = 0;
+        self.syscall_user_r12 = 0;
+        self.syscall_user_r13 = 0;
+        self.syscall_user_r14 = 0;
+        self.syscall_user_r15 = 0;
         // Don't set is_online yet - that happens after full init
     }
 
@@ -349,19 +370,37 @@ pub fn preempt_count() -> u32 {
         .unwrap_or(0)
 }
 
-/// Save syscall entry state (user RIP, RFLAGS, and RSP) for clone()/fork()
+/// Save syscall entry state (user RIP, RFLAGS, RSP, and callee-saved regs) for clone()/fork()
 ///
 /// Called from syscall entry before dispatching. Stores the user's
-/// return address (RCX), flags (R11), and stack pointer in per-CPU data
-/// so clone()/fork() can use them to set up the child's TrapFrame.
+/// return address (RCX), flags (R11), stack pointer, and all callee-saved
+/// registers in per-CPU data so clone()/fork() can use them to set up
+/// the child's TrapFrame.
 #[inline]
-pub fn save_syscall_state(user_rip: u64, user_rflags: u64, user_rsp: u64) {
+#[allow(clippy::too_many_arguments)]
+pub fn save_syscall_state(
+    user_rip: u64,
+    user_rflags: u64,
+    user_rsp: u64,
+    user_rbx: u64,
+    user_rbp: u64,
+    user_r12: u64,
+    user_r13: u64,
+    user_r14: u64,
+    user_r15: u64,
+) {
     if let Some(_percpu) = try_current_cpu() {
         unsafe {
             let percpu_mut = current_cpu_mut();
             percpu_mut.syscall_user_rip = user_rip;
             percpu_mut.syscall_user_rflags = user_rflags;
             percpu_mut.syscall_user_rsp = user_rsp;
+            percpu_mut.syscall_user_rbx = user_rbx;
+            percpu_mut.syscall_user_rbp = user_rbp;
+            percpu_mut.syscall_user_r12 = user_r12;
+            percpu_mut.syscall_user_r13 = user_r13;
+            percpu_mut.syscall_user_r14 = user_r14;
+            percpu_mut.syscall_user_r15 = user_r15;
         }
     }
 }
@@ -388,6 +427,24 @@ pub fn get_syscall_user_rsp() -> u64 {
     try_current_cpu()
         .map(|percpu| percpu.syscall_user_rsp)
         .unwrap_or(0)
+}
+
+/// Get saved syscall user callee-saved registers
+/// Returns (rbx, rbp, r12, r13, r14, r15)
+#[inline]
+pub fn get_syscall_user_callee_saved() -> (u64, u64, u64, u64, u64, u64) {
+    try_current_cpu()
+        .map(|percpu| {
+            (
+                percpu.syscall_user_rbx,
+                percpu.syscall_user_rbp,
+                percpu.syscall_user_r12,
+                percpu.syscall_user_r13,
+                percpu.syscall_user_r14,
+                percpu.syscall_user_r15,
+            )
+        })
+        .unwrap_or((0, 0, 0, 0, 0, 0))
 }
 
 // ============================================================================

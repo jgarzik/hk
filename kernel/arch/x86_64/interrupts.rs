@@ -612,7 +612,7 @@ fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
 
     // Flush TLB for this address
     unsafe {
-        ::core::arch::asm!(
+        core::arch::asm!(
             "invlpg [{}]",
             in(reg) fault_addr,
             options(nostack, preserves_flags)

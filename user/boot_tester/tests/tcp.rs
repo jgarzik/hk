@@ -185,13 +185,6 @@ fn run_tcp_client(port: u16) {
         htonl(make_ipv4(127, 0, 0, 1)),
     );
 
-    // Debug: print address family
-    print(b"CLIENT: sin_family=");
-    print_num(server_addr.sin_family as i64);
-    print(b" port=");
-    print_num(port as i64);
-    print(b"\n");
-
     let ret = sys_connect(
         client_fd as i32,
         &server_addr as *const SockAddrIn as *const u8,

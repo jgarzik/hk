@@ -777,7 +777,8 @@ unsafe extern "C" fn syscall_entry() {
         "push r8",
         "push r9",
 
-        // Save RCX (user RIP), R11 (user RFLAGS), and user RSP to per-CPU data for clone()/fork()
+        // Save RCX (user RIP), R11 (user RFLAGS), user RSP, and callee-saved regs
+        // for clone()/fork(). The child needs to inherit ALL parent registers.
         // Stack layout at this point (from top):
         //   RSP+0:   r9
         //   RSP+8:   r8
@@ -795,10 +796,25 @@ unsafe extern "C" fn syscall_entry() {
         //   RSP+104: r11 (user RFLAGS)
         //   RSP+112: rcx (user RIP)
         //   RSP+120: user_rsp
-        "mov rdi, [rsp + 112]",  // rcx (user RIP) -> rdi
-        "mov rsi, [rsp + 104]",  // r11 (user RFLAGS) -> rsi
-        "mov rdx, [rsp + 120]",  // user_rsp -> rdx
+        //
+        // save_syscall_state(rip, rflags, rsp, rbx, rbp, r12, r13, r14, r15)
+        // ABI: rdi, rsi, rdx, rcx, r8, r9, [stack+0], [stack+8], [stack+16]
+        //
+        // First 6 args in registers, last 3 on stack
+        // Push stack args in reverse order (r15, r14, r13)
+        "push [rsp + 56]",       // r15 -> stack arg 3 (at rsp+0 after 3 pushes)
+        "push [rsp + 72]",       // r14 -> stack arg 2 (offset +8 due to push)
+        "push [rsp + 88]",       // r13 -> stack arg 1 (offset +16 due to 2 pushes)
+        // Now set up register args
+        "mov rdi, [rsp + 136]",  // rcx (user RIP) -> rdi (offset: 112 + 24)
+        "mov rsi, [rsp + 128]",  // r11 (user RFLAGS) -> rsi (offset: 104 + 24)
+        "mov rdx, [rsp + 144]",  // user_rsp -> rdx (offset: 120 + 24)
+        "mov rcx, [rsp + 120]",  // rbx -> rcx (offset: 96 + 24)
+        "mov r8, [rsp + 112]",   // rbp -> r8 (offset: 88 + 24)
+        "mov r9, [rsp + 104]",   // r12 -> r9 (offset: 80 + 24)
         "call {save_syscall_state}",
+        // Remove stack args
+        "add rsp, 24",
 
         // Now set up arguments for C handler
         // syscall_handler(num, arg0, arg1, arg2, arg3, arg4, arg5)
