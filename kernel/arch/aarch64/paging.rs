@@ -235,35 +235,6 @@ impl PageTableEntry {
 }
 
 // ============================================================================
-// Swap PTE helpers
-// ============================================================================
-
-use crate::mm::SwapEntry;
-
-/// Check if a PTE contains a swap entry (page swapped out)
-///
-/// A swap PTE has Valid=0 (bits [1:0] = 0b00) but encodes swap information.
-#[inline]
-pub fn is_swap_pte(pte: u64) -> bool {
-    SwapEntry::is_swap_pte(pte)
-}
-
-/// Decode a swap entry from a PTE
-///
-/// # Safety
-/// Caller must ensure `is_swap_pte(pte)` returns true
-#[inline]
-pub fn pte_to_swap_entry(pte: u64) -> SwapEntry {
-    SwapEntry::from_pte(pte)
-}
-
-/// Encode a swap entry into a PTE value
-#[inline]
-pub fn swap_entry_to_pte(entry: SwapEntry) -> u64 {
-    entry.to_pte()
-}
-
-// ============================================================================
 // Raw Page Table Structure
 // ============================================================================
 

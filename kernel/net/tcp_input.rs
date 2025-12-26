@@ -227,7 +227,7 @@ fn process_listen(
 /// - Set up TCP state for established connection
 /// - Register in connection table
 fn create_child_socket(
-    listener: &Arc<Socket>,
+    _listener: &Arc<Socket>,
     req: &RequestSock,
     hdr: &TcpHdr,
 ) -> Option<Arc<Socket>> {

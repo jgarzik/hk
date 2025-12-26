@@ -167,10 +167,10 @@ pub fn sys_request_key(
         }
 
         // Link to destination keyring if specified
-        if dest_keyring != 0 {
-            if let Ok(dest) = resolve_special_keyring(dest_keyring, false, tid, uid, gid) {
-                let _ = keyring_link(&dest, &key);
-            }
+        if dest_keyring != 0
+            && let Ok(dest) = resolve_special_keyring(dest_keyring, false, tid, uid, gid)
+        {
+            let _ = keyring_link(&dest, &key);
         }
 
         return key.serial as i64;

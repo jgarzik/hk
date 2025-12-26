@@ -197,7 +197,7 @@ pub fn tcp_send_fin(socket: &Arc<Socket>) -> Result<(), NetError> {
 /// Following Linux's tcp_v4_send_synack() -> tcp_make_synack():
 /// This is sent from a listening socket to a client that sent a SYN.
 /// The RequestSock contains the connection parameters from the SYN.
-pub fn tcp_send_synack(listener: &Arc<Socket>, req: &RequestSock) -> Result<(), NetError> {
+pub fn tcp_send_synack(_listener: &Arc<Socket>, req: &RequestSock) -> Result<(), NetError> {
     let mut skb = SkBuff::alloc_tx(0).ok_or(NetError::OutOfMemory)?;
 
     // SYN-ACK: seq = our ISS, ack = client's ISN + 1
@@ -219,9 +219,6 @@ pub fn tcp_send_synack(listener: &Arc<Socket>, req: &RequestSock) -> Result<(), 
 
     skb.saddr = Some(req.local_addr);
     skb.daddr = Some(req.remote_addr);
-
-    // Suppress unused warning for listener - we may use it later for options
-    let _ = listener;
 
     ipv4::ip_queue_xmit(skb, IPPROTO_TCP)
 }

@@ -358,19 +358,19 @@ pub fn sys_accept(fd: i32, addr: u64, addrlen: u64) -> i64 {
                 };
 
                 // Write peer address if requested
-                if addr != 0 && addrlen != 0 {
-                    if let Some((remote_addr, remote_port)) = child.remote_addr() {
-                        // Read addrlen from user
-                        let user_addrlen =
-                            unsafe { core::ptr::read_volatile(addrlen as *const u32) };
+                if addr != 0
+                    && addrlen != 0
+                    && let Some((remote_addr, remote_port)) = child.remote_addr()
+                {
+                    // Read addrlen from user
+                    let user_addrlen = unsafe { core::ptr::read_volatile(addrlen as *const u32) };
 
-                        if user_addrlen >= 16 {
-                            // Write sockaddr_in
-                            let sockaddr = SockAddrIn::new(remote_addr, remote_port);
-                            unsafe {
-                                core::ptr::write_volatile(addr as *mut SockAddrIn, sockaddr);
-                                core::ptr::write_volatile(addrlen as *mut u32, 16);
-                            }
+                    if user_addrlen >= 16 {
+                        // Write sockaddr_in
+                        let sockaddr = SockAddrIn::new(remote_addr, remote_port);
+                        unsafe {
+                            core::ptr::write_volatile(addr as *mut SockAddrIn, sockaddr);
+                            core::ptr::write_volatile(addrlen as *mut u32, 16);
                         }
                     }
                 }

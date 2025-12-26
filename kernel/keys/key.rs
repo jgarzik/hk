@@ -326,12 +326,13 @@ impl Key {
 
         let keys = self.keyring_keys.read();
         for &serial in keys.iter() {
-            if let Some(key) = super::lookup_key(serial) {
-                if key.type_name == type_name && key.description == description {
-                    if key.is_instantiated() && !key.is_revoked() {
-                        return Some(serial);
-                    }
-                }
+            if let Some(key) = super::lookup_key(serial)
+                && key.type_name == type_name
+                && key.description == description
+                && key.is_instantiated()
+                && !key.is_revoked()
+            {
+                return Some(serial);
             }
         }
         None
@@ -347,22 +348,24 @@ impl Key {
             return None;
         }
 
+        // Clone the keys while holding the lock, then release before recursion
         let keys = self.keyring_keys.read().clone();
-        drop(self.keyring_keys.read()); // Release lock before recursion
 
         for serial in keys {
             if let Some(key) = super::lookup_key(serial) {
                 // Check if this key matches
-                if key.type_name == type_name && key.description == description {
-                    if key.is_instantiated() && !key.is_revoked() {
-                        return Some(serial);
-                    }
+                if key.type_name == type_name
+                    && key.description == description
+                    && key.is_instantiated()
+                    && !key.is_revoked()
+                {
+                    return Some(serial);
                 }
                 // Recursively search nested keyrings
-                if key.is_keyring() {
-                    if let Some(found) = key.keyring_search_recursive(type_name, description) {
-                        return Some(found);
-                    }
+                if key.is_keyring()
+                    && let Some(found) = key.keyring_search_recursive(type_name, description)
+                {
+                    return Some(found);
                 }
             }
         }

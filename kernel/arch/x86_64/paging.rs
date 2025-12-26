@@ -639,77 +639,6 @@ pub const PAGE_COW: u64 = 1 << 9;
 // PTE flag manipulation helpers (Linux-style)
 // ============================================================================
 
-/// Make a PTE young (set Accessed bit)
-#[inline]
-pub const fn pte_mkyoung(pte: u64) -> u64 {
-    pte | PAGE_ACCESSED
-}
-
-/// Make a PTE dirty (set Dirty bit)
-#[inline]
-pub const fn pte_mkdirty(pte: u64) -> u64 {
-    pte | PAGE_DIRTY
-}
-
-/// Check if PTE is young (Accessed bit set)
-#[inline]
-pub const fn pte_young(pte: u64) -> bool {
-    pte & PAGE_ACCESSED != 0
-}
-
-/// Check if PTE is dirty (Dirty bit set)
-#[inline]
-pub const fn pte_dirty(pte: u64) -> bool {
-    pte & PAGE_DIRTY != 0
-}
-
-/// Make a PTE writable
-#[inline]
-pub const fn pte_mkwrite(pte: u64) -> u64 {
-    pte | PAGE_WRITABLE
-}
-
-/// Remove write permission from a PTE
-#[inline]
-pub const fn pte_wrprotect(pte: u64) -> u64 {
-    pte & !PAGE_WRITABLE
-}
-
-/// Check if PTE is writable
-#[inline]
-pub const fn pte_write(pte: u64) -> bool {
-    pte & PAGE_WRITABLE != 0
-}
-
-// ============================================================================
-// Swap PTE helpers
-// ============================================================================
-
-use crate::mm::SwapEntry;
-
-/// Check if a PTE contains a swap entry (page swapped out)
-///
-/// A swap PTE has Present=0 but encodes swap device and offset information.
-#[inline]
-pub fn is_swap_pte(pte: u64) -> bool {
-    SwapEntry::is_swap_pte(pte)
-}
-
-/// Decode a swap entry from a PTE
-///
-/// # Safety
-/// Caller must ensure `is_swap_pte(pte)` returns true
-#[inline]
-pub fn pte_to_swap_entry(pte: u64) -> SwapEntry {
-    SwapEntry::from_pte(pte)
-}
-
-/// Encode a swap entry into a PTE value
-#[inline]
-pub fn swap_entry_to_pte(entry: SwapEntry) -> u64 {
-    entry.to_pte()
-}
-
 /// Callback to check if a page should be force-copied instead of COW'd
 /// Used for mlock'd pages which should be copied immediately
 pub type ForceCopyFn = fn(vaddr: u64) -> bool;
@@ -865,7 +794,7 @@ impl X86_64PageTable {
                                 let old_flags = pt_entry.flags();
 
                                 // Check if this page should be force-copied (e.g., mlock'd)
-                                let force_copy = force_copy_fn.map_or(false, |f| f(vaddr));
+                                let force_copy = force_copy_fn.is_some_and(|f| f(vaddr));
 
                                 if force_copy {
                                     // Force copy: allocate new frame and copy contents immediately

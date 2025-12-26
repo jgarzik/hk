@@ -92,14 +92,12 @@ pub fn resolve_special_keyring(
     match special_id {
         KEY_SPEC_THREAD_KEYRING => {
             let mut all_keyrings = TASK_KEYRINGS.write();
-            let keyrings = all_keyrings
-                .entry(tid)
-                .or_insert_with(TaskKeyrings::default);
+            let keyrings = all_keyrings.entry(tid).or_default();
 
-            if let Some(serial) = keyrings.thread_keyring {
-                if let Some(key) = lookup_key(serial) {
-                    return Ok(key);
-                }
+            if let Some(serial) = keyrings.thread_keyring
+                && let Some(key) = lookup_key(serial)
+            {
+                return Ok(key);
             }
 
             if create {
@@ -113,14 +111,12 @@ pub fn resolve_special_keyring(
 
         KEY_SPEC_PROCESS_KEYRING => {
             let mut all_keyrings = TASK_KEYRINGS.write();
-            let keyrings = all_keyrings
-                .entry(tid)
-                .or_insert_with(TaskKeyrings::default);
+            let keyrings = all_keyrings.entry(tid).or_default();
 
-            if let Some(serial) = keyrings.process_keyring {
-                if let Some(key) = lookup_key(serial) {
-                    return Ok(key);
-                }
+            if let Some(serial) = keyrings.process_keyring
+                && let Some(key) = lookup_key(serial)
+            {
+                return Ok(key);
             }
 
             if create {
@@ -134,14 +130,12 @@ pub fn resolve_special_keyring(
 
         KEY_SPEC_SESSION_KEYRING => {
             let mut all_keyrings = TASK_KEYRINGS.write();
-            let keyrings = all_keyrings
-                .entry(tid)
-                .or_insert_with(TaskKeyrings::default);
+            let keyrings = all_keyrings.entry(tid).or_default();
 
-            if let Some(serial) = keyrings.session_keyring {
-                if let Some(key) = lookup_key(serial) {
-                    return Ok(key);
-                }
+            if let Some(serial) = keyrings.session_keyring
+                && let Some(key) = lookup_key(serial)
+            {
+                return Ok(key);
             }
 
             if create {
@@ -155,14 +149,12 @@ pub fn resolve_special_keyring(
 
         KEY_SPEC_USER_KEYRING => {
             let mut user_keyrings = USER_KEYRINGS.write();
-            let keyrings = user_keyrings
-                .entry(uid)
-                .or_insert_with(UserKeyrings::default);
+            let keyrings = user_keyrings.entry(uid).or_default();
 
-            if let Some(serial) = keyrings.user_keyring {
-                if let Some(key) = lookup_key(serial) {
-                    return Ok(key);
-                }
+            if let Some(serial) = keyrings.user_keyring
+                && let Some(key) = lookup_key(serial)
+            {
+                return Ok(key);
             }
 
             if create {
@@ -176,14 +168,12 @@ pub fn resolve_special_keyring(
 
         KEY_SPEC_USER_SESSION_KEYRING => {
             let mut user_keyrings = USER_KEYRINGS.write();
-            let keyrings = user_keyrings
-                .entry(uid)
-                .or_insert_with(UserKeyrings::default);
+            let keyrings = user_keyrings.entry(uid).or_default();
 
-            if let Some(serial) = keyrings.user_session_keyring {
-                if let Some(key) = lookup_key(serial) {
-                    return Ok(key);
-                }
+            if let Some(serial) = keyrings.user_session_keyring
+                && let Some(key) = lookup_key(serial)
+            {
+                return Ok(key);
             }
 
             if create {
@@ -218,30 +208,27 @@ pub fn search_process_keyrings(type_name: &str, description: &str, tid: u64) -> 
     let keyrings = get_task_keyrings(tid);
 
     // Search thread keyring
-    if let Some(serial) = keyrings.thread_keyring {
-        if let Some(keyring) = lookup_key(serial) {
-            if let Some(found) = keyring.keyring_search_recursive(type_name, description) {
-                return lookup_key(found);
-            }
-        }
+    if let Some(serial) = keyrings.thread_keyring
+        && let Some(keyring) = lookup_key(serial)
+        && let Some(found) = keyring.keyring_search_recursive(type_name, description)
+    {
+        return lookup_key(found);
     }
 
     // Search process keyring
-    if let Some(serial) = keyrings.process_keyring {
-        if let Some(keyring) = lookup_key(serial) {
-            if let Some(found) = keyring.keyring_search_recursive(type_name, description) {
-                return lookup_key(found);
-            }
-        }
+    if let Some(serial) = keyrings.process_keyring
+        && let Some(keyring) = lookup_key(serial)
+        && let Some(found) = keyring.keyring_search_recursive(type_name, description)
+    {
+        return lookup_key(found);
     }
 
     // Search session keyring
-    if let Some(serial) = keyrings.session_keyring {
-        if let Some(keyring) = lookup_key(serial) {
-            if let Some(found) = keyring.keyring_search_recursive(type_name, description) {
-                return lookup_key(found);
-            }
-        }
+    if let Some(serial) = keyrings.session_keyring
+        && let Some(keyring) = lookup_key(serial)
+        && let Some(found) = keyring.keyring_search_recursive(type_name, description)
+    {
+        return lookup_key(found);
     }
 
     None

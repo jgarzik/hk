@@ -31,11 +31,8 @@ use crate::uaccess::strncpy_from_user;
 const EPERM: i64 = -1;
 const ENOENT: i64 = -2;
 const EIO: i64 = -5;
-const ENOMEM: i64 = -12;
 const EBUSY: i64 = -16;
-const EEXIST: i64 = -17;
 const EINVAL: i64 = -22;
-const ENOSPC: i64 = -28;
 
 // ============================================================================
 // Swap flags (for swapon syscall)

@@ -215,17 +215,13 @@ pub fn keyctl_describe(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
 
     // Copy description to buffer
     let copy_len = core::cmp::min(desc_bytes.len(), buflen.saturating_sub(1));
-    if copy_len > 0 {
-        if copy_to_user::<Uaccess>(buffer_ptr, &desc_bytes[..copy_len]).is_err() {
-            return EFAULT;
-        }
+    if copy_len > 0 && copy_to_user::<Uaccess>(buffer_ptr, &desc_bytes[..copy_len]).is_err() {
+        return EFAULT;
     }
 
     // Write NUL terminator if there's space
-    if copy_len < buflen {
-        if copy_to_user::<Uaccess>(buffer_ptr + copy_len as u64, &[0u8]).is_err() {
-            return EFAULT;
-        }
+    if copy_len < buflen && copy_to_user::<Uaccess>(buffer_ptr + copy_len as u64, &[0u8]).is_err() {
+        return EFAULT;
     }
 
     total_len as i64
@@ -388,22 +384,22 @@ pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_key
     }
 
     // Search the keyring recursively
-    if let Some(serial) = keyring.keyring_search_recursive(&type_name, &description) {
-        if let Some(key) = lookup_key(serial) {
-            // Check if key is valid
-            if key.is_revoked() {
-                return EKEYREVOKED;
-            }
-
-            // Link to destination keyring if specified
-            if dest_keyring != 0 {
-                if let Ok(dest) = resolve_special_keyring(dest_keyring, false, tid, uid, gid) {
-                    let _ = keyring_link(&dest, &key);
-                }
-            }
-
-            return serial as i64;
+    if let Some(serial) = keyring.keyring_search_recursive(&type_name, &description)
+        && let Some(key) = lookup_key(serial)
+    {
+        // Check if key is valid
+        if key.is_revoked() {
+            return EKEYREVOKED;
         }
+
+        // Link to destination keyring if specified
+        if dest_keyring != 0
+            && let Ok(dest) = resolve_special_keyring(dest_keyring, false, tid, uid, gid)
+        {
+            let _ = keyring_link(&dest, &key);
+        }
+
+        return serial as i64;
     }
 
     ENOKEY
@@ -453,10 +449,8 @@ pub fn keyctl_read(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
     match key.key_type().read(&key, &mut buffer) {
         Ok(actual_len) => {
             let copy_len = core::cmp::min(actual_len, buflen);
-            if copy_len > 0 {
-                if copy_to_user::<Uaccess>(buffer_ptr, &buffer[..copy_len]).is_err() {
-                    return EFAULT;
-                }
+            if copy_len > 0 && copy_to_user::<Uaccess>(buffer_ptr, &buffer[..copy_len]).is_err() {
+                return EFAULT;
             }
             actual_len as i64
         }
