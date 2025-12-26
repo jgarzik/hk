@@ -373,7 +373,7 @@ Linux groups the socket syscalls as their own "network" category.
 - [x] umount (via umount2)
 - [x] umount2
 - [x] pivot_root
-- [ ] chroot (legacy but used)
+- [x] chroot
 
 11.2 Namespaces
 
