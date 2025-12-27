@@ -181,6 +181,11 @@ pub enum ProcfsInodeData {
     ///
     /// File containing information about an open file descriptor.
     FdinfoFile { pid: Pid, fd: i32 },
+    /// Cgroup file (/proc/<pid>/cgroup)
+    ///
+    /// Shows the cgroup(s) the process belongs to.
+    /// For cgroup v2: "0::<path>\n"
+    PidCgroupFile { pid: Pid },
 }
 
 impl ProcfsInodeData {
@@ -231,6 +236,11 @@ impl ProcfsInodeData {
         Self::FdinfoFile { pid, fd }
     }
 
+    /// Create cgroup file data
+    pub fn new_pid_cgroup_file(pid: Pid) -> Self {
+        Self::PidCgroupFile { pid }
+    }
+
     /// Get children map (for static directories)
     pub fn children(&self) -> Option<&BTreeMap<String, Arc<Inode>>> {
         match self {
@@ -264,7 +274,8 @@ impl ProcfsInodeData {
             | Self::PidFdDirectory { pid }
             | Self::PidFdinfoDirectory { pid }
             | Self::FdSymlink { pid, .. }
-            | Self::FdinfoFile { pid, .. } => Some(*pid),
+            | Self::FdinfoFile { pid, .. }
+            | Self::PidCgroupFile { pid } => Some(*pid),
             _ => None,
         }
     }
@@ -362,7 +373,8 @@ impl InodeOps for ProcfsInodeOps {
             ProcfsInodeData::File { .. }
             | ProcfsInodeData::NamespaceFile { .. }
             | ProcfsInodeData::FdSymlink { .. }
-            | ProcfsInodeData::FdinfoFile { .. } => Err(KernelError::NotDirectory),
+            | ProcfsInodeData::FdinfoFile { .. }
+            | ProcfsInodeData::PidCgroupFile { .. } => Err(KernelError::NotDirectory),
         }
     }
 
@@ -391,6 +403,7 @@ impl InodeOps for ProcfsInodeOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
+            ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
             ProcfsInodeData::FdSymlink { .. } => {
                 // Symlinks don't have content, readlink() handles them
                 return Err(KernelError::Io);
@@ -504,6 +517,24 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
             ));
             inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
                 ProcfsInodeData::new_pid_fdinfo_dir(pid),
+            ))));
+            Ok(inode)
+        }
+        "cgroup" => {
+            // Create /proc/<pid>/cgroup file
+            let sb = dir.superblock().ok_or(KernelError::Io)?;
+            let inode = Arc::new(Inode::new(
+                pid_ino(pid, 102),         // offset 102 for cgroup file
+                InodeMode::regular(0o444), // r--r--r--
+                0,
+                0,
+                0,
+                current_time(),
+                Arc::downgrade(&sb),
+                &PROCFS_INODE_OPS,
+            ));
+            inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+                ProcfsInodeData::new_pid_cgroup_file(pid),
             ))));
             Ok(inode)
         }
@@ -696,6 +727,75 @@ fn gen_namespace_content(pid: Pid, ns_type: NamespaceType) -> Vec<u8> {
     Vec::from(output.as_bytes())
 }
 
+/// Generate content for /proc/<pid>/cgroup
+///
+/// Returns the cgroup membership for the process.
+/// For cgroup v2, this is a single line: "0::<path>\n"
+/// The path is relative to the task's cgroup namespace root.
+fn gen_cgroup_content(pid: Pid) -> Vec<u8> {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+
+    // Get the task's cgroup path (namespace-virtualized)
+    let cgroup_path = get_task_cgroup_path(pid);
+
+    // cgroup v2 format: "0::<path>"
+    // The "0" indicates the unified hierarchy (cgroup v2)
+    // The empty string between colons indicates no named controllers
+    let _ = writeln!(output, "0::{}", cgroup_path);
+
+    Vec::from(output.as_bytes())
+}
+
+/// Get the cgroup path for a task (virtualized to its namespace)
+fn get_task_cgroup_path(pid: Pid) -> String {
+    use crate::cgroup::TASK_CGROUP;
+    use crate::ns::INIT_CGROUP_NS;
+    use crate::task::percpu::TASK_TABLE;
+
+    // Get the task's TID to look up its cgroup namespace
+    let tid = match get_tid_for_pid(pid) {
+        Some(t) => t,
+        None => return String::from("/"),
+    };
+
+    // Get the task's cgroup
+    let task_cgroup = {
+        let table = TASK_TABLE.lock();
+        if let Some(task) = table.tasks.iter().find(|t| t.tid == tid) {
+            // Try to get from TASK_CGROUP mapping
+            TASK_CGROUP.read().get(&task.tid).cloned()
+        } else {
+            None
+        }
+    };
+
+    let cgroup = match task_cgroup {
+        Some(cg) => cg,
+        None => {
+            // Task not in any cgroup - return root
+            return String::from("/");
+        }
+    };
+
+    // Get the task's cgroup namespace
+    let cgroup_ns = {
+        let table = TASK_TABLE.lock();
+        if let Some(task) = table.tasks.iter().find(|t| t.tid == tid) {
+            if let Some(ref nsproxy) = task.nsproxy {
+                nsproxy.cgroup_ns.clone()
+            } else {
+                INIT_CGROUP_NS.clone()
+            }
+        } else {
+            INIT_CGROUP_NS.clone()
+        }
+    };
+
+    // Translate the cgroup path relative to the namespace root
+    cgroup_ns.translate_path(&cgroup)
+}
+
 /// Static procfs inode ops
 pub static PROCFS_INODE_OPS: ProcfsInodeOps = ProcfsInodeOps;
 
@@ -723,6 +823,7 @@ impl FileOps for ProcfsFileOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
+            ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
             ProcfsInodeData::FdSymlink { .. } => return Err(KernelError::Io),
             ProcfsInodeData::Directory { .. }
             | ProcfsInodeData::PidDirectory { .. }
@@ -762,6 +863,7 @@ impl FileOps for ProcfsFileOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
+            ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
             ProcfsInodeData::FdSymlink { .. } => return Err(KernelError::Io),
             ProcfsInodeData::Directory { .. }
             | ProcfsInodeData::PidDirectory { .. }
@@ -874,7 +976,8 @@ impl FileOps for ProcfsFileOps {
             ProcfsInodeData::File { .. }
             | ProcfsInodeData::NamespaceFile { .. }
             | ProcfsInodeData::FdSymlink { .. }
-            | ProcfsInodeData::FdinfoFile { .. } => {
+            | ProcfsInodeData::FdinfoFile { .. }
+            | ProcfsInodeData::PidCgroupFile { .. } => {
                 return Err(KernelError::NotDirectory);
             }
         }
@@ -950,6 +1053,17 @@ fn readdir_emit_pid_entries(
         ino: pid_ino(pid, 101),
         file_type: FileType::Directory,
         name: Vec::from(b"fdinfo"),
+    });
+
+    if !should_continue {
+        return Ok(());
+    }
+
+    // Emit "cgroup" file
+    let should_continue = callback(DirEntry {
+        ino: pid_ino(pid, 102),
+        file_type: FileType::Regular,
+        name: Vec::from(b"cgroup"),
     });
 
     if !should_continue {

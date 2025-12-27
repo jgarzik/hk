@@ -37,6 +37,7 @@ pub mod tcp;
 pub mod keys;
 pub mod kcmp;
 pub mod tty;
+pub mod cgroup;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -73,4 +74,5 @@ pub fn run_all_tests() {
     keys::run_tests();
     kcmp::run_tests();
     tty::run_tests();
+    cgroup::run_tests();
 }

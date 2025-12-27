@@ -594,6 +594,10 @@ pub fn mark_zombie(tid: Tid, status: i32) {
         }
     }
 
+    // Detach from cgroup and decrement task counters
+    // This must be done after releasing TASK_TABLE lock to avoid lock ordering issues
+    crate::cgroup::detach_task(tid);
+
     // Notify any pidfds watching this process (after releasing TASK_TABLE lock)
     if let Some(p) = pid {
         crate::pidfd::notify_process_exit(p, status);
@@ -753,6 +757,21 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     } else {
         (0, false) // Threads don't count toward RLIMIT_NPROC
     };
+
+    // Check cgroup pids controller limit (if task is in a cgroup with pids.max)
+    // This is checked before allocating resources so we fail early if over limit
+    let parent_cgroup = {
+        let tid = current_tid();
+        crate::cgroup::TASK_CGROUP.read().get(&tid).cloned()
+    };
+    if let Some(ref cgroup) = parent_cgroup
+        && !crate::cgroup::pids_can_fork(cgroup)
+    {
+        if nproc_incremented {
+            crate::task::decrement_user_process_count(nproc_uid);
+        }
+        return Err(11); // EAGAIN - resource temporarily unavailable
+    }
 
     // Helper macro to handle early returns with NPROC cleanup
     // If we incremented the process count and then fail, we must decrement it
@@ -998,6 +1017,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         child_tid,
         config.flags
     ));
+
+    // Inherit cgroup membership from parent
+    // Child joins same cgroup as parent and inherits resource constraints
+    if let Some(ref cgroup) = parent_cgroup {
+        crate::cgroup::attach_task(child_tid, cgroup);
+    }
 
     // Handle signal handlers (CLONE_SIGHAND, CLONE_CLEAR_SIGHAND)
     // If CLONE_SIGHAND is set, child shares parent's signal handler table

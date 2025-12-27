@@ -45,6 +45,7 @@ pub mod usb;
 // Multiboot2 header is in boot.S
 
 mod arch;
+pub mod cgroup;
 mod cmdline;
 pub mod error;
 mod frame_alloc;

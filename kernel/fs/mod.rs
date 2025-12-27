@@ -17,6 +17,7 @@ pub mod superblock;
 pub mod syscall;
 
 // Filesystem implementations
+pub mod cgroupfs;
 pub mod cpio;
 pub mod procfs;
 pub mod ramfs;
@@ -42,6 +43,7 @@ pub use path::{
     lookup_path, lookup_path_at, lookup_path_flags,
 };
 pub use path_ref::Path;
+pub use cgroupfs::{CGROUPFS_FILE_OPS, CGROUPFS_TYPE};
 pub use procfs::{
     NamespaceType, PROCFS_FILE_OPS, PROCFS_TYPE, ProcfsInodeData, ProcfsInodeWrapper,
 };
