@@ -2235,3 +2235,26 @@ pub fn sys_keyctl(cmd: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
 pub fn sys_kcmp(pid1: u64, pid2: u64, type_: i32, idx1: u64, idx2: u64) -> i64 {
     unsafe { syscall5!(SYS_KCMP, pid1, pid2, type_, idx1, idx2) }
 }
+
+// ============================================================================
+// Seccomp (secure computing mode)
+// ============================================================================
+
+/// seccomp syscall number
+pub const SYS_SECCOMP: u64 = 277;
+
+/// seccomp(operation, flags, args) - operate on secure computing state
+///
+/// Controls the seccomp sandboxing mechanism for the calling process.
+///
+/// # Arguments
+/// * `op` - Operation (SECCOMP_SET_MODE_STRICT, SECCOMP_SET_MODE_FILTER, etc.)
+/// * `flags` - Flags for the operation
+/// * `args` - Arguments (depends on operation, typically filter program pointer)
+///
+/// # Returns
+/// 0 on success, or a negative error code
+#[inline(always)]
+pub fn sys_seccomp(op: u32, flags: u32, args: u64) -> i64 {
+    unsafe { syscall3!(SYS_SECCOMP, op, flags, args) }
+}

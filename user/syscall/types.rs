@@ -1963,3 +1963,190 @@ pub const KCMP_SYSVSEM: i32 = 6;
 pub const KCMP_EPOLL_TFD: i32 = 7;
 /// Number of comparison types
 pub const KCMP_TYPES: i32 = 8;
+
+// ============================================================================
+// Seccomp constants and types
+// ============================================================================
+
+// Seccomp modes
+/// Seccomp disabled
+pub const SECCOMP_MODE_DISABLED: u32 = 0;
+/// Strict mode - only read, write, exit, sigreturn allowed
+pub const SECCOMP_MODE_STRICT: u32 = 1;
+/// Filter mode - BPF program decides
+pub const SECCOMP_MODE_FILTER: u32 = 2;
+
+// Seccomp operations (for seccomp syscall)
+/// Set strict mode
+pub const SECCOMP_SET_MODE_STRICT: u32 = 0;
+/// Set filter mode with BPF program
+pub const SECCOMP_SET_MODE_FILTER: u32 = 1;
+/// Check if action is available
+pub const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
+/// Get notification struct sizes
+pub const SECCOMP_GET_NOTIF_SIZES: u32 = 3;
+
+// Seccomp filter flags
+/// Log all non-ALLOW actions
+pub const SECCOMP_FILTER_FLAG_LOG: u32 = 1;
+/// Synchronize filter across all threads
+pub const SECCOMP_FILTER_FLAG_TSYNC: u32 = 2;
+/// Create new user notification fd
+pub const SECCOMP_FILTER_FLAG_NEW_LISTENER: u32 = 8;
+/// Attach to TSYNC error thread
+pub const SECCOMP_FILTER_FLAG_TSYNC_ESRCH: u32 = 16;
+/// Wait for filter install in all threads
+pub const SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: u32 = 32;
+
+// Seccomp return values (action in high 16 bits, data in low 16 bits)
+/// Kill the process
+pub const SECCOMP_RET_KILL_PROCESS: u32 = 0x80000000;
+/// Kill the thread
+pub const SECCOMP_RET_KILL_THREAD: u32 = 0x00000000;
+/// Deliver SIGSYS
+pub const SECCOMP_RET_TRAP: u32 = 0x00030000;
+/// Return errno
+pub const SECCOMP_RET_ERRNO: u32 = 0x00050000;
+/// Notify userspace
+pub const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc00000;
+/// Notify ptrace tracer
+pub const SECCOMP_RET_TRACE: u32 = 0x7ff00000;
+/// Log and allow
+pub const SECCOMP_RET_LOG: u32 = 0x7ffc0000;
+/// Allow the syscall
+pub const SECCOMP_RET_ALLOW: u32 = 0x7fff0000;
+
+/// Mask for action bits
+pub const SECCOMP_RET_ACTION: u32 = 0x7fff0000;
+/// Mask for data bits (errno value for RET_ERRNO)
+pub const SECCOMP_RET_DATA: u32 = 0x0000ffff;
+
+// Classic BPF structures for seccomp filter programs
+
+/// Classic BPF instruction (sock_filter)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SockFilter {
+    /// Instruction opcode
+    pub code: u16,
+    /// Jump if true offset
+    pub jt: u8,
+    /// Jump if false offset
+    pub jf: u8,
+    /// Immediate value
+    pub k: u32,
+}
+
+/// Classic BPF program (sock_fprog)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockFprog {
+    /// Number of filter instructions
+    pub len: u16,
+    /// Padding
+    _pad: [u8; 6],
+    /// Pointer to filter array
+    pub filter: *const SockFilter,
+}
+
+// Classic BPF instruction classes
+/// Load into accumulator
+pub const BPF_LD: u16 = 0x00;
+/// Load into index register
+pub const BPF_LDX: u16 = 0x01;
+/// Store from accumulator
+pub const BPF_ST: u16 = 0x02;
+/// Store from index register
+pub const BPF_STX: u16 = 0x03;
+/// ALU operation
+pub const BPF_ALU: u16 = 0x04;
+/// Jump
+pub const BPF_JMP: u16 = 0x05;
+/// Return
+pub const BPF_RET: u16 = 0x06;
+/// Misc
+pub const BPF_MISC: u16 = 0x07;
+
+// BPF sizes
+/// Word (32-bit)
+pub const BPF_W: u16 = 0x00;
+/// Half-word (16-bit)
+pub const BPF_H: u16 = 0x08;
+/// Byte
+pub const BPF_B: u16 = 0x10;
+
+// BPF modes
+/// Immediate
+pub const BPF_IMM: u16 = 0x00;
+/// Absolute
+pub const BPF_ABS: u16 = 0x20;
+/// Indirect
+pub const BPF_IND: u16 = 0x40;
+/// Memory
+pub const BPF_MEM: u16 = 0x60;
+/// Length
+pub const BPF_LEN: u16 = 0x80;
+/// MSH (multiply shift)
+pub const BPF_MSH: u16 = 0xa0;
+
+// BPF source
+/// Constant
+pub const BPF_K: u16 = 0x00;
+/// Index register
+pub const BPF_X: u16 = 0x08;
+
+// BPF ALU operations
+/// Add
+pub const BPF_ADD: u16 = 0x00;
+/// Subtract
+pub const BPF_SUB: u16 = 0x10;
+/// Multiply
+pub const BPF_MUL: u16 = 0x20;
+/// Divide
+pub const BPF_DIV: u16 = 0x30;
+/// Or
+pub const BPF_OR: u16 = 0x40;
+/// And
+pub const BPF_AND: u16 = 0x50;
+/// Left shift
+pub const BPF_LSH: u16 = 0x60;
+/// Right shift
+pub const BPF_RSH: u16 = 0x70;
+/// Negate
+pub const BPF_NEG: u16 = 0x80;
+
+// BPF jump operations
+/// Jump always
+pub const BPF_JA: u16 = 0x00;
+/// Jump if equal
+pub const BPF_JEQ: u16 = 0x10;
+/// Jump if greater than
+pub const BPF_JGT: u16 = 0x20;
+/// Jump if greater or equal
+pub const BPF_JGE: u16 = 0x30;
+/// Jump if bits set
+pub const BPF_JSET: u16 = 0x40;
+
+// Seccomp data offsets for BPF_LD with BPF_ABS
+/// Offset to syscall number (nr field in seccomp_data)
+pub const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+/// Offset to architecture (arch field)
+pub const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+/// Offset to instruction pointer (low 32 bits)
+pub const SECCOMP_DATA_IP_LO_OFFSET: u32 = 8;
+/// Offset to instruction pointer (high 32 bits)
+pub const SECCOMP_DATA_IP_HI_OFFSET: u32 = 12;
+/// Offset to syscall arguments array
+pub const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
+
+/// Helper: Create a BPF instruction
+#[inline(always)]
+pub const fn bpf_stmt(code: u16, k: u32) -> SockFilter {
+    SockFilter { code, jt: 0, jf: 0, k }
+}
+
+/// Helper: Create a BPF jump instruction
+#[inline(always)]
+pub const fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
+    SockFilter { code, jt, jf, k }
+}

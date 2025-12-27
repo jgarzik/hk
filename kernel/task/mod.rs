@@ -92,6 +92,7 @@ use crate::ipc::sem::SemUndoList;
 use crate::mm::MmStruct;
 use crate::mm::page_cache::CachedPage;
 use crate::ns::NsProxy;
+use crate::seccomp::SeccompFilter;
 use crate::signal::{SigHand, SignalStruct, TaskSignalState};
 
 use spin::Mutex;
@@ -301,6 +302,9 @@ pub struct CurrentTask {
     pub sid: Pid,
     /// Credentials of the currently running task
     pub cred: Cred,
+    /// Seccomp mode (cached for fast syscall-entry check)
+    /// 0=DISABLED, 1=STRICT, 2=FILTER
+    pub seccomp_mode: u8,
 }
 
 impl CurrentTask {
@@ -313,6 +317,7 @@ impl CurrentTask {
             pgid: 0,
             sid: 0,
             cred: Cred::ROOT,
+            seccomp_mode: 0, // SECCOMP_MODE_DISABLED
         }
     }
 
@@ -342,6 +347,7 @@ impl CurrentTask {
             pgid,
             sid,
             cred,
+            seccomp_mode: 0, // SECCOMP_MODE_DISABLED
         }
     }
 }
@@ -502,6 +508,10 @@ pub mod prctl_ops {
     pub const PR_SET_TIMERSLACK: i32 = 29;
     /// Get timer slack value (nanoseconds)
     pub const PR_GET_TIMERSLACK: i32 = 30;
+    /// Get seccomp mode
+    pub const PR_GET_SECCOMP: i32 = 21;
+    /// Set seccomp mode
+    pub const PR_SET_SECCOMP: i32 = 22;
     /// Disable privilege escalation via setuid/setgid (irreversible)
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     /// Get no_new_privs flag
@@ -877,6 +887,18 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Process personality (execution domain, affects syscall behavior)
     /// See personality(2). Default is 0 (PER_LINUX).
     pub personality: u32,
+
+    // =========================================================================
+    // Seccomp state (sandboxing)
+    // =========================================================================
+    /// Seccomp mode: 0=DISABLED, 1=STRICT, 2=FILTER
+    pub seccomp_mode: u8,
+
+    /// Seccomp filter chain (head, reference counted)
+    /// Filters are chained: when a new filter is installed, it points to the previous.
+    /// On syscall entry, filters are run in order (newest first), and the most
+    /// restrictive result wins.
+    pub seccomp_filter: Option<Arc<SeccompFilter>>,
 }
 
 impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {

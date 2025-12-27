@@ -314,8 +314,8 @@ pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(buf: u64, buflen: usize, fl
 // =============================================================================
 
 use crate::task::prctl_ops::{
-    PR_GET_DUMPABLE, PR_GET_NAME, PR_GET_NO_NEW_PRIVS, PR_GET_TIMERSLACK, PR_SET_DUMPABLE,
-    PR_SET_NAME, PR_SET_NO_NEW_PRIVS, PR_SET_TIMERSLACK,
+    PR_GET_DUMPABLE, PR_GET_NAME, PR_GET_NO_NEW_PRIVS, PR_GET_SECCOMP, PR_GET_TIMERSLACK,
+    PR_SET_DUMPABLE, PR_SET_NAME, PR_SET_NO_NEW_PRIVS, PR_SET_SECCOMP, PR_SET_TIMERSLACK,
 };
 
 /// sys_prctl - Process/thread control operations
@@ -468,6 +468,17 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                 Some(task) => task.prctl.timer_slack_ns as i64,
                 None => KernelError::NoProcess.sysret(),
             }
+        }
+
+        PR_GET_SECCOMP => {
+            // Delegate to seccomp module
+            crate::seccomp::prctl_get_seccomp()
+        }
+
+        PR_SET_SECCOMP => {
+            // Delegate to seccomp module
+            // arg2 = mode, _arg3 = filter (for FILTER mode)
+            crate::seccomp::prctl_set_seccomp(arg2, _arg3)
         }
 
         _ => KernelError::InvalidArgument.sysret(), // unsupported operation

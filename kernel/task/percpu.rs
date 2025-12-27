@@ -423,6 +423,9 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         prctl: crate::task::PrctlState::default(),
         // Process personality (execution domain)
         personality: 0,
+        // Seccomp state (kernel threads don't use seccomp)
+        seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
+        seccomp_filter: None,
     };
 
     // Add task to global table
@@ -522,6 +525,9 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         prctl: crate::task::PrctlState::default(),
         // Process personality (execution domain)
         personality: 0,
+        // Seccomp state (disabled initially)
+        seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
+        seccomp_filter: None,
     };
 
     // Add to global table
@@ -808,6 +814,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_cred,
         parent_prctl,
         parent_personality,
+        parent_seccomp_mode,
+        parent_seccomp_filter,
     ) = {
         let table = TASK_TABLE.lock();
         let parent = try_with_cleanup!(table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)); // ESRCH - no such process
@@ -825,6 +833,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.cred.clone(),
             parent.prctl.clone(),
             parent.personality,
+            parent.seccomp_mode,
+            parent.seccomp_filter.clone(),
         )
     };
 
@@ -978,6 +988,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         },
         // Process personality (inherited from parent)
         personality: parent_personality,
+        // Seccomp state (inherited from parent)
+        // Seccomp filters are reference-counted, so this is cheap
+        seccomp_mode: parent_seccomp_mode,
+        seccomp_filter: parent_seccomp_filter,
     };
 
     // Add to global task table
@@ -1211,6 +1225,9 @@ pub fn exit_current() -> ! {
         // Clean up namespace context for exiting task
         crate::ns::exit_task_ns(tid);
 
+        // Clean up seccomp state for exiting task
+        crate::seccomp::exit_seccomp(tid);
+
         // Clean up signal state for exiting task
         crate::signal::exit_task_signal(tid);
 
@@ -1246,8 +1263,17 @@ pub fn exit_current() -> ! {
         .dequeue_highest()
         .expect("Idle task should always be runnable");
 
-    // Get next task's kernel stack, pid, ppid, pgid, sid, cred from global table
-    let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3, next_cred) = {
+    // Get next task's kernel stack, pid, ppid, pgid, sid, cred, seccomp_mode from global table
+    let (
+        next_kstack,
+        next_pid,
+        next_ppid,
+        next_pgid,
+        next_sid,
+        next_cr3,
+        next_cred,
+        next_seccomp_mode,
+    ) = {
         let table = TASK_TABLE.lock();
         table
             .tasks
@@ -1262,9 +1288,10 @@ pub fn exit_current() -> ! {
                     t.sid,
                     t.page_table.root_table_phys(),
                     t.cred.clone(),
+                    t.seccomp_mode,
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT)))
+            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT), 0))
     };
 
     // Get next task's context
@@ -1291,6 +1318,7 @@ pub fn exit_current() -> ! {
         pgid: next_pgid,
         sid: next_sid,
         cred: *next_cred,
+        seccomp_mode: next_seccomp_mode,
     });
 
     // Release lock before switch (context_switch_first doesn't return)
@@ -1482,8 +1510,17 @@ pub fn sleep_current_until(wake_tick: u64) {
         return;
     }
 
-    // Get next task's kernel stack, pid, ppid, pgid, sid, cred from global table
-    let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3, next_cred) = {
+    // Get next task's kernel stack, pid, ppid, pgid, sid, cred, seccomp_mode from global table
+    let (
+        next_kstack,
+        next_pid,
+        next_ppid,
+        next_pgid,
+        next_sid,
+        next_cr3,
+        next_cred,
+        next_seccomp_mode,
+    ) = {
         let table = TASK_TABLE.lock();
         table
             .tasks
@@ -1498,9 +1535,10 @@ pub fn sleep_current_until(wake_tick: u64) {
                     t.sid,
                     t.page_table.root_table_phys(),
                     t.cred.clone(),
+                    t.seccomp_mode,
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT)))
+            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT), 0))
     };
 
     // Get context pointers
@@ -1520,6 +1558,7 @@ pub fn sleep_current_until(wake_tick: u64) {
             pgid: next_pgid,
             sid: next_sid,
             cred: *next_cred,
+            seccomp_mode: next_seccomp_mode,
         });
 
         // Context switch with lock held!
@@ -1621,8 +1660,17 @@ pub fn yield_now() {
         return;
     }
 
-    // Get next task's kernel stack, pid, ppid, pgid, sid, cred from global table
-    let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3, next_cred) = {
+    // Get next task's kernel stack, pid, ppid, pgid, sid, cred, seccomp_mode from global table
+    let (
+        next_kstack,
+        next_pid,
+        next_ppid,
+        next_pgid,
+        next_sid,
+        next_cr3,
+        next_cred,
+        next_seccomp_mode,
+    ) = {
         let table = TASK_TABLE.lock();
         table
             .tasks
@@ -1637,9 +1685,10 @@ pub fn yield_now() {
                     t.sid,
                     t.page_table.root_table_phys(),
                     t.cred.clone(),
+                    t.seccomp_mode,
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT)))
+            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT), 0))
     };
 
     // Get context pointers
@@ -1659,6 +1708,7 @@ pub fn yield_now() {
             pgid: next_pgid,
             sid: next_sid,
             cred: *next_cred,
+            seccomp_mode: next_seccomp_mode,
         });
 
         // Context switch with lock held!
@@ -2026,6 +2076,17 @@ pub fn update_current_pgid_sid(pgid: Pid, sid: Pid) {
     let mut task = CurrentArch::get_current_task();
     task.pgid = pgid;
     task.sid = sid;
+    CurrentArch::set_current_task(&task);
+}
+
+/// Update the current task's seccomp mode in per-CPU cache
+///
+/// Called after seccomp mode changes to update the fast-path cache.
+/// This allows syscall entry to quickly check if seccomp is enabled
+/// without locking TASK_TABLE.
+pub fn update_current_seccomp_mode(mode: u8) {
+    let mut task = CurrentArch::get_current_task();
+    task.seccomp_mode = mode;
     CurrentArch::set_current_task(&task);
 }
 

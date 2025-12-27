@@ -313,6 +313,8 @@ pub const SYS_IOPRIO_GET: u64 = 31;
 pub const SYS_PRCTL: u64 = 167;
 /// set_tid_address(tidptr) - Set pointer for child thread ID on exit
 pub const SYS_SET_TID_ADDRESS: u64 = 96;
+/// seccomp(operation, flags, args) - Operate on Secure Computing state
+pub const SYS_SECCOMP: u64 = 277;
 
 // System information
 /// getrusage(who, usage)
@@ -541,6 +543,14 @@ pub fn aarch64_syscall_dispatch(
         sys_adjtimex, sys_clock_getres, sys_clock_gettime, sys_clock_nanosleep, sys_clock_settime,
         sys_eventfd2, sys_nanosleep, sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
     };
+
+    // Check seccomp policy before executing syscall
+    // Note: ip is not available here, pass 0 for now
+    if let Some(result) =
+        crate::seccomp::check::check_syscall_aarch64(num, 0, arg0, arg1, arg2, arg3, arg4, arg5)
+    {
+        return result;
+    }
 
     match num {
         // I/O syscalls
@@ -931,6 +941,7 @@ pub fn aarch64_syscall_dispatch(
             use crate::task::syscall::sys_set_tid_address;
             sys_set_tid_address(arg0) as u64
         }
+        SYS_SECCOMP => crate::seccomp::sys_seccomp(arg0, arg1, arg2) as u64,
 
         // Scheduling syscalls (Section 1.3)
         SYS_SCHED_YIELD => {

@@ -45,6 +45,7 @@ pub mod usb;
 // Multiboot2 header is in boot.S
 
 mod arch;
+pub mod bpf;
 pub mod cgroup;
 mod cmdline;
 pub mod error;
@@ -61,6 +62,7 @@ pub mod ns;
 mod power;
 mod random;
 mod rlimit;
+pub mod seccomp;
 pub mod signal;
 pub mod task;
 mod time_syscall;
