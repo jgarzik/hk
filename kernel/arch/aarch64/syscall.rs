@@ -461,6 +461,10 @@ pub const SYS_ADD_KEY: u64 = 217;
 pub const SYS_REQUEST_KEY: u64 = 218;
 /// keyctl(cmd, arg2, arg3, arg4, arg5)
 pub const SYS_KEYCTL: u64 = 219;
+/// process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
+pub const SYS_PROCESS_VM_READV: u64 = 270;
+/// process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
+pub const SYS_PROCESS_VM_WRITEV: u64 = 271;
 /// kcmp(pid1, pid2, type, idx1, idx2)
 pub const SYS_KCMP: u64 = 272;
 
@@ -1162,6 +1166,20 @@ pub fn aarch64_syscall_dispatch(
         SYS_ADD_KEY => crate::keys::sys_add_key(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
         SYS_REQUEST_KEY => crate::keys::sys_request_key(arg0, arg1, arg2, arg3 as i32) as u64,
         SYS_KEYCTL => crate::keys::sys_keyctl(arg0 as i32, arg1, arg2, arg3, arg4) as u64,
+
+        // Cross-process memory access
+        SYS_PROCESS_VM_READV => {
+            crate::task::process_vm::sys_process_vm_readv(arg0 as i32, arg1, arg2, arg3, arg4, arg5)
+                as u64
+        }
+        SYS_PROCESS_VM_WRITEV => crate::task::process_vm::sys_process_vm_writev(
+            arg0 as i32,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+            arg5,
+        ) as u64,
 
         // Process inspection (Section 13)
         SYS_KCMP => crate::kcmp::sys_kcmp(arg0, arg1, arg2 as i32, arg3, arg4) as u64,

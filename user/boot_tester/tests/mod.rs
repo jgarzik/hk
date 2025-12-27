@@ -38,6 +38,7 @@ pub mod io_uring;
 pub mod tcp;
 pub mod keys;
 pub mod kcmp;
+pub mod process_vm;
 pub mod tty;
 pub mod cgroup;
 
@@ -77,6 +78,7 @@ pub fn run_all_tests() {
     tcp::run_tests();
     keys::run_tests();
     kcmp::run_tests();
+    process_vm::run_tests();
     tty::run_tests();
     cgroup::run_tests();
 }

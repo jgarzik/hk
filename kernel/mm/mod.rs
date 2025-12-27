@@ -17,6 +17,7 @@ pub mod huge_page;
 pub mod lru;
 pub mod page;
 pub mod page_cache;
+pub mod remote;
 pub mod rmap;
 pub mod swap;
 pub mod swap_entry;

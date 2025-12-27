@@ -413,6 +413,8 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 - [ ] bpf
 - [x] membarrier
 - [x] kcmp (compare processes)
+- [x] process_vm_readv
+- [x] process_vm_writev
 - [ ] rseq (restartable sequences)
 
 14. Thread-local, arch-specific, misc

@@ -7,6 +7,7 @@ pub mod misc;
 pub mod percpu;
 pub mod pgrp;
 pub mod proc;
+pub mod process_vm;
 pub mod sched;
 pub mod schedsys;
 pub mod syscall;

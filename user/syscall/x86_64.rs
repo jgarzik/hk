@@ -2033,6 +2033,64 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, type_: i32, idx1: u64, idx2: u64) -> i64 {
 }
 
 // ============================================================================
+// Cross-process memory access
+// ============================================================================
+
+/// process_vm_readv syscall number
+pub const SYS_PROCESS_VM_READV: u64 = 310;
+
+/// process_vm_writev syscall number
+pub const SYS_PROCESS_VM_WRITEV: u64 = 311;
+
+/// process_vm_readv - Read from another process's memory
+///
+/// # Arguments
+/// * `pid` - Target process ID
+/// * `local_iov` - Pointer to local iovec array (destination buffers)
+/// * `liovcnt` - Number of local iovecs
+/// * `remote_iov` - Pointer to remote iovec array (source addresses in target)
+/// * `riovcnt` - Number of remote iovecs
+/// * `flags` - Reserved (must be 0)
+///
+/// # Returns
+/// Total bytes read on success, negative error code on failure
+#[inline(always)]
+pub fn sys_process_vm_readv(
+    pid: i32,
+    local_iov: *const super::IoVec,
+    liovcnt: u64,
+    remote_iov: *const super::IoVec,
+    riovcnt: u64,
+    flags: u64,
+) -> i64 {
+    unsafe { syscall6!(SYS_PROCESS_VM_READV, pid, local_iov, liovcnt, remote_iov, riovcnt, flags) }
+}
+
+/// process_vm_writev - Write to another process's memory
+///
+/// # Arguments
+/// * `pid` - Target process ID
+/// * `local_iov` - Pointer to local iovec array (source buffers)
+/// * `liovcnt` - Number of local iovecs
+/// * `remote_iov` - Pointer to remote iovec array (destination addresses in target)
+/// * `riovcnt` - Number of remote iovecs
+/// * `flags` - Reserved (must be 0)
+///
+/// # Returns
+/// Total bytes written on success, negative error code on failure
+#[inline(always)]
+pub fn sys_process_vm_writev(
+    pid: i32,
+    local_iov: *const super::IoVec,
+    liovcnt: u64,
+    remote_iov: *const super::IoVec,
+    riovcnt: u64,
+    flags: u64,
+) -> i64 {
+    unsafe { syscall6!(SYS_PROCESS_VM_WRITEV, pid, local_iov, liovcnt, remote_iov, riovcnt, flags) }
+}
+
+// ============================================================================
 // Seccomp (secure computing mode)
 // ============================================================================
 
