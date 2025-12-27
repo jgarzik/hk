@@ -179,8 +179,8 @@ Extended attributes (Linux-specific):
 - [x] mlockall
 - [x] munlockall
 - [x] mlock2
-- [x] mincore
 - [x] madvise
+- [x] mincore
 - [ ] remap_file_pages (legacy)
 
 4.2 NUMA / memory policy (optional but Linuxy)
@@ -399,8 +399,8 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 - [ ] kexec_load
 - [x] syslog
 - [x] acct
-- [ ] swapon
-- [ ] swapoff
+- [x] swapon
+- [x] swapoff
 - [ ] sysfs (legacy)
 - [x] getcpu
 - [ ] getpid / getppid (already listed)
