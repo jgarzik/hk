@@ -189,11 +189,11 @@ pub enum KernelError {
 }
 
 impl KernelError {
-    /// Convert to negative errno for syscall return (i64)
+    /// Return negative errno for syscall return (i64)
     ///
-    /// Syscalls return negative errno values on error.
+    /// Example: `KernelError::BadFd.sysret()` returns -9
     #[inline]
-    pub const fn to_syscall_error(self) -> i64 {
+    pub const fn sysret(self) -> i64 {
         -(self as i32 as i64)
     }
 

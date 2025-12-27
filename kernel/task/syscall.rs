@@ -3,13 +3,9 @@
 //! Generic handlers for scheduler and task syscalls.
 //! These are called by arch-specific syscall dispatchers.
 
-use super::{Pid, Tid};
+use crate::error::KernelError;
 
-// Linux error codes
-const EPERM: i64 = -1; // Operation not permitted
-const ESRCH: i64 = -3; // No such process
-const ECHILD: i64 = -10; // No child processes
-const EINVAL: i64 = -22; // Invalid argument
+use super::{Pid, Tid};
 
 /// sys_getpid - get current process ID
 pub fn sys_getpid(pid: Pid) -> i64 {
@@ -98,7 +94,7 @@ pub fn sys_setuid(uid: u32, current_cred: super::Cred) -> i64 {
     }
 
     // Not permitted
-    EPERM
+    KernelError::NotPermitted.sysret()
 }
 
 /// sys_setgid - set group identity (Linux-compatible)
@@ -140,7 +136,7 @@ pub fn sys_setgid(gid: u32, current_cred: super::Cred) -> i64 {
     }
 
     // Not permitted
-    EPERM
+    KernelError::NotPermitted.sysret()
 }
 
 /// sys_getpgid - get process group ID
@@ -158,7 +154,7 @@ pub fn sys_getpgid(pid: Pid, caller_pid: Pid, caller_pgid: Pid) -> i64 {
     } else {
         match super::percpu::lookup_task_pgid(pid) {
             Some(pgid) => pgid as i64,
-            None => ESRCH,
+            None => KernelError::NoProcess.sysret(),
         }
     }
 }
@@ -180,7 +176,7 @@ pub fn sys_getsid(pid: Pid, caller_pid: Pid, caller_sid: Pid) -> i64 {
     } else {
         match super::percpu::lookup_task_sid(pid) {
             Some(sid) => sid as i64,
-            None => ESRCH,
+            None => KernelError::NoProcess.sysret(),
         }
     }
 }
@@ -215,13 +211,13 @@ pub fn sys_setpgid(
 
     // Validate pgid (cannot be negative in Linux, we use u64 so this is fine)
     if new_pgid == 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // For now, we only support setting own PGID (no child process support yet)
     if target_pid != caller_pid {
         // TODO: When we have fork(), allow setting child's PGID
-        return ESRCH;
+        return KernelError::NoProcess.sysret();
     }
 
     // Call the scheduler function to update the task
@@ -595,7 +591,7 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, _rusage: u64) -> i64 {
 
         // No zombie child found - check if we have any children at all
         if !super::percpu::has_children(current_pid, pid) {
-            return ECHILD;
+            return KernelError::NoChild.sysret();
         }
 
         // If WNOHANG, return 0 (no child ready)
@@ -646,9 +642,6 @@ const CLD_STOPPED: i32 = 5; // Child has stopped
 #[allow(dead_code)]
 const CLD_CONTINUED: i32 = 6; // Stopped child has continued
 
-// Error code
-const EFAULT: i64 = -14;
-
 // Signal number for SIGCHLD
 const SIGCHLD: i32 = 17;
 
@@ -677,19 +670,19 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32) -> i64 {
 
     // Validate infop pointer if non-null
     if infop != 0 && !Uaccess::access_ok(infop, core::mem::size_of::<SigInfo>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Validate idtype
     if idtype != P_ALL && idtype != P_PID && idtype != P_PGID && idtype != P_PIDFD {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Must specify at least one wait condition
     // For now we only support WEXITED (terminated children)
     if options & WEXITED == 0 {
         // We don't support WSTOPPED or WCONTINUED yet
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Convert idtype/id to the pid format used by wait4/reap_zombie_child:
@@ -711,21 +704,21 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32) -> i64 {
             // id is a file descriptor - get the PID from the pidfd
             let fd_table = match super::fdtable::get_task_fd(current_tid) {
                 Some(table) => table,
-                None => return ESRCH,
+                None => return KernelError::NoProcess.sysret(),
             };
             let file = {
                 let table = fd_table.lock();
                 match table.get(id as i32) {
                     Some(file) => file,
-                    None => return -9, // EBADF
+                    None => return KernelError::BadFd.sysret(),
                 }
             };
             match crate::pidfd::get_pidfd_pid(&file) {
                 Some(pid) => pid as i64,
-                None => return -9, // EBADF - not a pidfd
+                None => return KernelError::BadFd.sysret(), // not a pidfd
             }
         }
-        _ => return EINVAL,
+        _ => return KernelError::InvalidArgument.sysret(),
     };
 
     // Loop until we find a zombie child or determine there are no children
@@ -747,7 +740,7 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32) -> i64 {
                     si_status: exit_status,
                 };
                 if put_user::<Uaccess, SigInfo>(infop, info).is_err() {
-                    return EFAULT;
+                    return KernelError::BadAddress.sysret();
                 }
             }
             return 0; // Success
@@ -755,7 +748,7 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32) -> i64 {
 
         // No zombie child found - check if we have any children at all
         if !super::percpu::has_children(current_pid, wait_pid) {
-            return ECHILD;
+            return KernelError::NoChild.sysret();
         }
 
         // If WNOHANG, return 0 but leave infop->si_pid as 0 to indicate no child
@@ -772,7 +765,7 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32) -> i64 {
                     si_status: 0,
                 };
                 if put_user::<Uaccess, SigInfo>(infop, info).is_err() {
-                    return EFAULT;
+                    return KernelError::BadAddress.sysret();
                 }
             }
             return 0;
@@ -803,28 +796,25 @@ pub fn sys_getcpu<A: crate::uaccess::UaccessArch>(cpu: u32, cpup: u64, nodep: u6
     // Write CPU number if pointer provided
     if cpup != 0 {
         if !A::access_ok(cpup, core::mem::size_of::<u32>()) {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
         if put_user::<A, u32>(cpup, cpu).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
     // Write NUMA node if pointer provided (always 0 - no NUMA support)
     if nodep != 0 {
         if !A::access_ok(nodep, core::mem::size_of::<u32>()) {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
         if put_user::<A, u32>(nodep, 0).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
     0
 }
-
-// Error code for permission denied (priority raise without permission)
-const EACCES: i64 = -13;
 
 /// sys_getpriority - get program scheduling priority
 ///
@@ -851,14 +841,14 @@ pub fn sys_getpriority(which: i32, who: u64, caller_pid: Pid) -> i64 {
                     // Return 20 - nice (range 1-40) to avoid negative return values
                     (20 - nice) as i64
                 }
-                None => ESRCH,
+                None => KernelError::NoProcess.sysret(),
             }
         }
         PRIO_PGRP | PRIO_USER => {
             // Not implemented yet - would require task iteration
-            ESRCH // Return ESRCH for now (no matching processes)
+            KernelError::NoProcess.sysret() // Return ESRCH for now (no matching processes)
         }
-        _ => EINVAL,
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -902,12 +892,12 @@ pub fn sys_setpriority(
             // Get current priority to check permissions
             let current_nice = match super::percpu::lookup_task_priority(target_pid) {
                 Some(priority) => priority_to_nice(priority),
-                None => return ESRCH,
+                None => return KernelError::NoProcess.sysret(),
             };
 
             // Permission check: non-root cannot raise priority (lower nice value)
             if caller_euid != 0 && niceval < current_nice {
-                return EACCES;
+                return KernelError::PermissionDenied.sysret();
             }
 
             // Set the new priority
@@ -919,9 +909,9 @@ pub fn sys_setpriority(
         }
         PRIO_PGRP | PRIO_USER => {
             // Not implemented yet
-            ESRCH
+            KernelError::NoProcess.sysret()
         }
-        _ => EINVAL,
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -953,24 +943,24 @@ pub fn sys_getresuid<A: crate::uaccess::UaccessArch>(
 
     // Validate all pointers
     if !A::access_ok(ruid_ptr, core::mem::size_of::<u32>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
     if !A::access_ok(euid_ptr, core::mem::size_of::<u32>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
     if !A::access_ok(suid_ptr, core::mem::size_of::<u32>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Write the three UIDs to user space
     if put_user::<A, u32>(ruid_ptr, current_cred.uid).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
     if put_user::<A, u32>(euid_ptr, current_cred.euid).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
     if put_user::<A, u32>(suid_ptr, current_cred.suid).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -1003,24 +993,24 @@ pub fn sys_getresgid<A: crate::uaccess::UaccessArch>(
 
     // Validate all pointers
     if !A::access_ok(rgid_ptr, core::mem::size_of::<u32>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
     if !A::access_ok(egid_ptr, core::mem::size_of::<u32>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
     if !A::access_ok(sgid_ptr, core::mem::size_of::<u32>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Write the three GIDs to user space
     if put_user::<A, u32>(rgid_ptr, current_cred.gid).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
     if put_user::<A, u32>(egid_ptr, current_cred.egid).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
     if put_user::<A, u32>(sgid_ptr, current_cred.sgid).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -1064,13 +1054,13 @@ pub fn sys_setresuid(ruid: u32, euid: u32, suid: u32, current_cred: super::Cred)
 
     // Check each field
     if ruid != NO_CHANGE && !is_privileged && !is_permitted(ruid) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
     if euid != NO_CHANGE && !is_privileged && !is_permitted(euid) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
     if suid != NO_CHANGE && !is_privileged && !is_permitted(suid) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Convert -1 to None (don't change)
@@ -1120,13 +1110,13 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32, current_cred: super::Cred)
 
     // Check each field
     if rgid != NO_CHANGE && !is_privileged && !is_permitted(rgid) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
     if egid != NO_CHANGE && !is_privileged && !is_permitted(egid) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
     if sgid != NO_CHANGE && !is_privileged && !is_permitted(sgid) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Convert -1 to None (don't change)
@@ -1170,7 +1160,7 @@ pub fn sys_setreuid(ruid: u32, euid: u32, current_cred: super::Cred) -> i64 {
     // Permission check for ruid: must be in {uid, euid} or privileged
     if ruid != NO_CHANGE && !is_privileged && ruid != current_cred.uid && ruid != current_cred.euid
     {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Permission check for euid: must be in {uid, euid, suid} or privileged
@@ -1180,7 +1170,7 @@ pub fn sys_setreuid(ruid: u32, euid: u32, current_cred: super::Cred) -> i64 {
         && euid != current_cred.euid
         && euid != current_cred.suid
     {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Determine what to set
@@ -1237,7 +1227,7 @@ pub fn sys_setregid(rgid: u32, egid: u32, current_cred: super::Cred) -> i64 {
     // Permission check for rgid: must be in {gid, egid} or privileged
     if rgid != NO_CHANGE && !is_privileged && rgid != current_cred.gid && rgid != current_cred.egid
     {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Permission check for egid: must be in {gid, egid, sgid} or privileged
@@ -1247,7 +1237,7 @@ pub fn sys_setregid(rgid: u32, egid: u32, current_cred: super::Cred) -> i64 {
         && egid != current_cred.egid
         && egid != current_cred.sgid
     {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Determine what to set
@@ -1514,7 +1504,7 @@ pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
 
     // Validate user pointer
     if !A::access_ok(info_ptr, core::mem::size_of::<SysInfo>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Get uptime (monotonic time since boot, in seconds)
@@ -1546,7 +1536,7 @@ pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
 
     // Copy to user space
     if put_user::<A, SysInfo>(info_ptr, info).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -1578,12 +1568,12 @@ pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(who: i32, usage_ptr: u64) -
 
     // Validate who parameter
     if who != RUSAGE_SELF && who != RUSAGE_CHILDREN && who != RUSAGE_THREAD {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate user pointer
     if !A::access_ok(usage_ptr, core::mem::size_of::<Rusage>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Build rusage structure
@@ -1601,12 +1591,12 @@ pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(who: i32, usage_ptr: u64) -
             // We don't track child resource usage yet, so return zeros
             Rusage::default()
         }
-        _ => return EINVAL,
+        _ => return KernelError::InvalidArgument.sysret(),
     };
 
     // Copy to user space
     if put_user::<A, Rusage>(usage_ptr, usage).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -1641,7 +1631,7 @@ pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(buf: u64, buflen: usize, fl
     // Validate flags first
     const VALID_FLAGS: u32 = random::GRND_NONBLOCK | random::GRND_RANDOM | random::GRND_INSECURE;
     if flags & !VALID_FLAGS != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Limit single read to stack buffer size
@@ -1649,7 +1639,7 @@ pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(buf: u64, buflen: usize, fl
 
     // Validate user buffer
     if !A::access_ok(buf, len) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Generate random bytes
@@ -1658,7 +1648,7 @@ pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(buf: u64, buflen: usize, fl
         Ok(n) => {
             // Copy to user space
             if copy_to_user::<A>(buf, &tmp[..n]).is_err() {
-                return EFAULT;
+                return KernelError::BadAddress.sysret();
             }
             n as i64
         }
@@ -1688,14 +1678,14 @@ pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(buf: u64, buflen: usize, fl
 pub fn sys_sched_getscheduler(pid: i64, caller_pid: Pid) -> i64 {
     // pid < 0 is invalid
     if pid < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
 
     match super::percpu::lookup_task_policy(target_pid) {
         Some(policy) => policy as i64,
-        None => ESRCH,
+        None => KernelError::NoProcess.sysret(),
     }
 }
 
@@ -1733,32 +1723,32 @@ pub fn sys_sched_setscheduler<A: crate::uaccess::UaccessArch>(
 
     // pid < 0 is invalid
     if pid < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate param_ptr
     if param_ptr == 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     if !A::access_ok(param_ptr, core::mem::size_of::<SchedParam>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Read sched_param from user space
     let param: SchedParam = match get_user::<A, SchedParam>(param_ptr) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate policy
     if !super::is_valid_policy(policy) {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Permission check: non-root cannot set RT policies
     let base_policy = policy & !super::SCHED_RESET_ON_FORK;
     if super::is_rt_policy(base_policy) && caller_euid != 0 {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
@@ -1796,15 +1786,15 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
 
     // pid < 0 is invalid
     if pid < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate param_ptr
     if param_ptr == 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     if !A::access_ok(param_ptr, core::mem::size_of::<SchedParam>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
@@ -1812,7 +1802,7 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
     // Get the RT priority (0 for non-RT tasks)
     let rt_prio = match super::percpu::lookup_task_rt_priority(target_pid) {
         Some(p) => p,
-        None => return ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     let param = SchedParam {
@@ -1821,7 +1811,7 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
 
     // Copy to user space
     if put_user::<A, SchedParam>(param_ptr, param).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -1860,21 +1850,21 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
 
     // pid < 0 is invalid
     if pid < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate param_ptr
     if param_ptr == 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     if !A::access_ok(param_ptr, core::mem::size_of::<SchedParam>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Read sched_param from user space
     let param: SchedParam = match get_user::<A, SchedParam>(param_ptr) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
@@ -1882,13 +1872,13 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
     // Get current policy to preserve it
     let current_policy = match super::percpu::lookup_task_policy(target_pid) {
         Some(p) => p,
-        None => return ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Permission check: non-root cannot set RT parameters
     let base_policy = current_policy & !super::SCHED_RESET_ON_FORK;
     if super::is_rt_policy(base_policy) && caller_euid != 0 {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Set the scheduler with current policy
@@ -1925,17 +1915,17 @@ pub fn sys_sched_getaffinity<A: crate::uaccess::UaccessArch>(
 
     // pid < 0 is invalid
     if pid < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // cpusetsize must be at least 8 bytes (sizeof u64)
     if cpusetsize < 8 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate mask_ptr
     if mask_ptr == 0 {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
@@ -1943,7 +1933,7 @@ pub fn sys_sched_getaffinity<A: crate::uaccess::UaccessArch>(
     // Get the CPU affinity mask
     let mask = match super::percpu::lookup_task_cpus_allowed(target_pid) {
         Some(m) => m,
-        None => return ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // We only support 64 CPUs (single u64), but Linux allows larger buffers
@@ -1951,13 +1941,13 @@ pub fn sys_sched_getaffinity<A: crate::uaccess::UaccessArch>(
     let write_size = cpusetsize.min(8) as usize;
 
     if !A::access_ok(mask_ptr, write_size) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Convert mask to bytes and copy
     let mask_bytes = mask.to_ne_bytes();
     if copy_to_user::<A>(mask_ptr, &mask_bytes[..write_size]).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Return the size of the kernel cpu_set_t (8 bytes for u64)
@@ -1997,39 +1987,39 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
 
     // pid < 0 is invalid
     if pid < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // cpusetsize must be at least 8 bytes (sizeof u64)
     if cpusetsize < 8 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate mask_ptr
     if mask_ptr == 0 {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
     if !A::access_ok(mask_ptr, 8) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Read the mask from user space
     let mut mask_bytes = [0u8; 8];
     if copy_from_user::<A>(&mut mask_bytes, mask_ptr, 8).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
     let mask = u64::from_ne_bytes(mask_bytes);
 
     // Empty mask is invalid
     if mask == 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
 
     // Permission check: non-root can only set own affinity
     if target_pid != caller_pid && caller_euid != 0 {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Set the CPU affinity mask
@@ -2074,15 +2064,15 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(
 
     // pid < 0 is invalid
     if pid < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate tp_ptr
     if tp_ptr == 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     if !A::access_ok(tp_ptr, core::mem::size_of::<Timespec>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
@@ -2090,7 +2080,7 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(
     // Get the scheduling policy
     let policy = match super::percpu::lookup_task_policy(target_pid) {
         Some(p) => p,
-        None => return ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Only SCHED_RR has a meaningful time quantum
@@ -2109,7 +2099,7 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(
 
     // Copy to user space
     if put_user::<A, Timespec>(tp_ptr, ts).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -2139,7 +2129,7 @@ pub fn sys_nice(inc: i32, caller_pid: Pid, caller_euid: super::Uid) -> i64 {
     // Get current nice value
     let current_nice = match super::percpu::lookup_task_priority(caller_pid) {
         Some(priority) => super::priority_to_nice(priority),
-        None => return ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Calculate new nice value (clamped to valid range)
@@ -2147,7 +2137,7 @@ pub fn sys_nice(inc: i32, caller_pid: Pid, caller_euid: super::Uid) -> i64 {
 
     // Permission check: non-root cannot increase priority (decrease nice)
     if new_nice < current_nice && caller_euid != 0 {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Set the new priority
@@ -2184,7 +2174,7 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
 
     // Validate ioprio
     if !ioprio_valid(ioprio) {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let class = ioprio_prio_class(ioprio);
@@ -2192,7 +2182,7 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
 
     // Permission check: RT and IDLE classes require CAP_SYS_NICE (or root)
     if (class == IOPRIO_CLASS_RT || class == IOPRIO_CLASS_IDLE) && caller_euid != 0 {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     match which {
@@ -2209,7 +2199,7 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
                 None => {
                     // Create a new context if target exists
                     if !super::percpu::task_exists(tid) {
-                        return ESRCH;
+                        return KernelError::NoProcess.sysret();
                     }
                     let ctx = alloc::sync::Arc::new(super::IoContext::new());
                     super::set_task_io_context(tid, ctx.clone());
@@ -2230,7 +2220,7 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
 
             let tids = super::percpu::get_tids_by_pgid(pgid);
             if tids.is_empty() {
-                return ESRCH;
+                return KernelError::NoProcess.sysret();
             }
 
             for tid in tids {
@@ -2251,7 +2241,7 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
             // Just return success for simplicity
             0
         }
-        _ => EINVAL,
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -2280,7 +2270,7 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
 
             // Check if task exists
             if !super::percpu::task_exists(tid) {
-                return ESRCH;
+                return KernelError::NoProcess.sysret();
             }
 
             match get_task_io_context(tid) {
@@ -2297,7 +2287,7 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
 
             let tids = super::percpu::get_tids_by_pgid(pgid);
             if tids.is_empty() {
-                return ESRCH;
+                return KernelError::NoProcess.sysret();
             }
 
             // Return the highest priority (lowest class value, then highest level)
@@ -2318,7 +2308,7 @@ pub fn sys_ioprio_get(which: i32, who: i32) -> i64 {
             // Return default for simplicity
             IOPRIO_DEFAULT as i64
         }
-        _ => EINVAL,
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -2369,7 +2359,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                             break; // Null terminator found
                         }
                     }
-                    Err(_) => return -14, // EFAULT
+                    Err(_) => return KernelError::BadAddress.sysret(),
                 }
             }
             // Ensure null termination
@@ -2381,7 +2371,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                 task.prctl.name = name;
                 0
             } else {
-                -3 // ESRCH
+                KernelError::NoProcess.sysret()
             }
         }
 
@@ -2391,14 +2381,14 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                 let table = TASK_TABLE.lock();
                 match table.tasks.iter().find(|t| t.tid == tid) {
                     Some(task) => task.prctl.name,
-                    None => return -3, // ESRCH
+                    None => return KernelError::NoProcess.sysret(),
                 }
             };
 
             // Write name to user space (16 bytes)
             for (i, &byte) in name.iter().enumerate() {
                 if put_user::<Uaccess, u8>(arg2 + i as u64, byte).is_err() {
-                    return -14; // EFAULT
+                    return KernelError::BadAddress.sysret();
                 }
             }
             0
@@ -2408,7 +2398,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             // Set dumpable flag (0, 1, or 2)
             let value = arg2 as u8;
             if value != SUID_DUMP_DISABLE && value != SUID_DUMP_USER && value != SUID_DUMP_ROOT {
-                return -22; // EINVAL
+                return KernelError::InvalidArgument.sysret();
             }
 
             let mut table = TASK_TABLE.lock();
@@ -2416,7 +2406,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                 task.prctl.dumpable = value;
                 0
             } else {
-                -3 // ESRCH
+                KernelError::NoProcess.sysret()
             }
         }
 
@@ -2425,7 +2415,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             let table = TASK_TABLE.lock();
             match table.tasks.iter().find(|t| t.tid == tid) {
                 Some(task) => task.prctl.dumpable as i64,
-                None => -3, // ESRCH
+                None => KernelError::NoProcess.sysret(),
             }
         }
 
@@ -2433,7 +2423,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             // Set no_new_privs flag (irreversible once set)
             // arg2 must be 1 to enable, any other value is EINVAL
             if arg2 != 1 {
-                return -22; // EINVAL
+                return KernelError::InvalidArgument.sysret();
             }
 
             let mut table = TASK_TABLE.lock();
@@ -2441,7 +2431,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                 task.prctl.no_new_privs = true;
                 0
             } else {
-                -3 // ESRCH
+                KernelError::NoProcess.sysret()
             }
         }
 
@@ -2456,7 +2446,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                         0
                     }
                 }
-                None => -3, // ESRCH
+                None => KernelError::NoProcess.sysret(),
             }
         }
 
@@ -2470,7 +2460,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                 task.prctl.timer_slack_ns = slack;
                 0
             } else {
-                -3 // ESRCH
+                KernelError::NoProcess.sysret()
             }
         }
 
@@ -2479,11 +2469,11 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             let table = TASK_TABLE.lock();
             match table.tasks.iter().find(|t| t.tid == tid) {
                 Some(task) => task.prctl.timer_slack_ns as i64,
-                None => -3, // ESRCH
+                None => KernelError::NoProcess.sysret(),
             }
         }
 
-        _ => -22, // EINVAL - unsupported operation
+        _ => KernelError::InvalidArgument.sysret(), // unsupported operation
     }
 }
 
@@ -2532,15 +2522,15 @@ pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
 
             // Write to user address
             if put_user::<Uaccess, u64>(addr, tls).is_err() {
-                return EFAULT;
+                return KernelError::BadAddress.sysret();
             }
             0
         }
         ARCH_SET_GS | ARCH_GET_GS => {
             // GS base is used by kernel for per-CPU data, not available to user
-            EINVAL
+            KernelError::InvalidArgument.sysret()
         }
-        _ => EINVAL,
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -2548,8 +2538,7 @@ pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn sys_arch_prctl(_code: i32, _addr: u64) -> i64 {
     // arch_prctl is x86_64-specific
-    const ENOSYS: i64 = -38;
-    ENOSYS
+    KernelError::NotImplemented.sysret()
 }
 
 /// sys_set_tid_address - Set pointer for thread ID clearing on exit
@@ -2592,13 +2581,13 @@ fn cap_validate_magic<A: crate::uaccess::UaccessArch>(
     use crate::uaccess::{get_user, put_user};
 
     if header_addr == 0 {
-        return Err(EFAULT);
+        return Err(KernelError::BadAddress.sysret());
     }
 
     // Read header from user space
     let hdr: CapUserHeader = match get_user::<A, CapUserHeader>(header_addr) {
         Ok(h) => h,
-        Err(_) => return Err(EFAULT),
+        Err(_) => return Err(KernelError::BadAddress.sysret()),
     };
 
     let version = hdr.version;
@@ -2620,7 +2609,7 @@ fn cap_validate_magic<A: crate::uaccess::UaccessArch>(
                 pid: 0,
             };
             let _ = put_user::<A, CapUserHeader>(header_addr, current_version);
-            Err(EINVAL)
+            Err(KernelError::InvalidArgument.sysret())
         }
     }
 }
@@ -2642,7 +2631,7 @@ pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
         Ok((n, p)) => (n, p),
         Err(e) => {
             // If dataptr is NULL and we got EINVAL, this is a version query
-            if data_addr == 0 && e == EINVAL {
+            if data_addr == 0 && e == KernelError::InvalidArgument.sysret() {
                 return 0;
             }
             return e;
@@ -2662,12 +2651,12 @@ pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
         // Query our own capabilities
         super::current_cred()
     } else if pid < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     } else {
         // Query another process's capabilities
         // For now, only support querying current process
         // Full implementation would use find_task_by_vpid and RCU
-        return ESRCH;
+        return KernelError::NoProcess.sysret();
     };
 
     // Build capability data arrays
@@ -2684,7 +2673,7 @@ pub fn sys_capget<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
     for (i, item) in kdata.iter().enumerate().take(tocopy) {
         let dst = data_addr + (i * core::mem::size_of::<CapUserData>()) as u64;
         if put_user::<A, CapUserData>(dst, *item).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -2714,7 +2703,7 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
 
     // May only affect current process (Linux restriction since kernel 2.6.27)
     if pid != 0 && pid != current_pid {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Read capability data from user space
@@ -2723,7 +2712,7 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
         let src = data_addr + (i * core::mem::size_of::<CapUserData>()) as u64;
         match get_user::<A, CapUserData>(src) {
             Ok(d) => *item = d,
-            Err(_) => return EFAULT,
+            Err(_) => return KernelError::BadAddress.sysret(),
         }
     }
 
@@ -2740,19 +2729,19 @@ pub fn sys_capset<A: crate::uaccess::UaccessArch>(header_addr: u64, data_addr: u
     // 1. New inheritable must not add any capabilities not in old permitted
     //    (can only inherit what we're permitted to use)
     if !inheritable.is_subset(&old_cred.cap_permitted) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // 2. New permitted must not add any capabilities not in old permitted
     //    (can't gain capabilities we don't already have)
     if !permitted.is_subset(&old_cred.cap_permitted) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // 3. New effective must be subset of new permitted
     //    (can't use capabilities we're not permitted to use)
     if !effective.is_subset(&permitted) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Create new credentials with updated capabilities
@@ -2842,12 +2831,12 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
 
     // Validate size - must be at least VER0 and not too large
     if size < CLONE_ARGS_SIZE_VER0 as u64 || size > 4096 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate user pointer
     if !Uaccess::access_ok(uargs, size as usize) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Copy clone_args from userspace (zero-fill any missing fields)
@@ -2857,43 +2846,43 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         core::slice::from_raw_parts_mut(&mut args as *mut CloneArgs as *mut u8, copy_size)
     };
     if copy_from_user::<Uaccess>(args_bytes, uargs, copy_size).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Validate clone3-specific constraints
 
     // exit_signal must be valid (only low 8 bits used, must be valid signal or 0)
     if (args.exit_signal & !CSIGNAL) != 0 || args.exit_signal > 64 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // CLONE_INTO_CGROUP requires cgroup fd and VER2 size
     if (args.flags & CLONE_INTO_CGROUP) != 0 {
         if size < CLONE_ARGS_SIZE_VER2 as u64 {
-            return EINVAL;
+            return KernelError::InvalidArgument.sysret();
         }
         // We don't support CLONE_INTO_CGROUP yet
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // set_tid feature not supported
     if args.set_tid != 0 || args.set_tid_size != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate stack - if stack is provided, stack_size must also be provided
     if args.stack != 0 && args.stack_size == 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     if args.stack == 0 && args.stack_size != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // CLONE_THREAD or CLONE_PARENT cannot have exit_signal
     let clone_thread = super::clone_flags::CLONE_THREAD;
     let clone_parent = super::clone_flags::CLONE_PARENT;
     if (args.flags & (clone_thread | clone_parent)) != 0 && args.exit_signal != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get parent's return address, flags, and stack from per-CPU data
@@ -2944,12 +2933,12 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
 
     // Validate size - must be at least VER0 and not too large
     if size < CLONE_ARGS_SIZE_VER0 as u64 || size > 4096 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate user pointer
     if !Uaccess::access_ok(uargs, size as usize) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Copy clone_args from userspace (zero-fill any missing fields)
@@ -2959,43 +2948,43 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         core::slice::from_raw_parts_mut(&mut args as *mut CloneArgs as *mut u8, copy_size)
     };
     if copy_from_user::<Uaccess>(args_bytes, uargs, copy_size).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Validate clone3-specific constraints
 
     // exit_signal must be valid (only low 8 bits used, must be valid signal or 0)
     if (args.exit_signal & !CSIGNAL) != 0 || args.exit_signal > 64 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // CLONE_INTO_CGROUP requires cgroup fd and VER2 size
     if (args.flags & CLONE_INTO_CGROUP) != 0 {
         if size < CLONE_ARGS_SIZE_VER2 as u64 {
-            return EINVAL;
+            return KernelError::InvalidArgument.sysret();
         }
         // We don't support CLONE_INTO_CGROUP yet
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // set_tid feature not supported
     if args.set_tid != 0 || args.set_tid_size != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate stack - if stack is provided, stack_size must also be provided
     if args.stack != 0 && args.stack_size == 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     if args.stack == 0 && args.stack_size != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // CLONE_THREAD or CLONE_PARENT cannot have exit_signal
     let clone_thread = super::clone_flags::CLONE_THREAD;
     let clone_parent = super::clone_flags::CLONE_PARENT;
     if (args.flags & (clone_thread | clone_parent)) != 0 && args.exit_signal != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get parent's return address, flags, and stack from per-CPU data
@@ -3117,7 +3106,7 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
 
     // Basic validation
     if len < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Check permissions for privileged operations
@@ -3134,7 +3123,7 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
     );
 
     if needs_cap && !super::capable(super::CAP_SYSLOG) && !super::capable(super::CAP_SYS_ADMIN) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     match type_ {
@@ -3146,10 +3135,10 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
         SYSLOG_ACTION_READ | SYSLOG_ACTION_READ_ALL | SYSLOG_ACTION_READ_CLEAR => {
             // Read from kernel log buffer
             if buf == 0 || len == 0 {
-                return EINVAL;
+                return KernelError::InvalidArgument.sysret();
             }
             if !A::access_ok(buf, len as usize) {
-                return EFAULT;
+                return KernelError::BadAddress.sysret();
             }
 
             // For now, we don't have a kernel log buffer implementation
@@ -3176,7 +3165,7 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
             // Set console log level
             // len parameter is the log level (1-8 typically)
             if !(1..=8).contains(&len) {
-                return EINVAL;
+                return KernelError::InvalidArgument.sysret();
             }
             // No-op for now
             0
@@ -3194,7 +3183,7 @@ pub fn sys_syslog<A: crate::uaccess::UaccessArch>(type_: i32, buf: u64, len: i32
             0
         }
 
-        _ => EINVAL,
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -3216,12 +3205,12 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
     // Validate flags - only O_NONBLOCK (0o4000) is allowed
     const PIDFD_NONBLOCK: u32 = 0o4000;
     if flags & !PIDFD_NONBLOCK != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate pid
     if pid <= 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let target_pid = pid as Pid;
@@ -3230,21 +3219,21 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
     {
         let table = super::percpu::TASK_TABLE.lock();
         if !table.tasks.iter().any(|t| t.pid == target_pid) {
-            return ESRCH;
+            return KernelError::NoProcess.sysret();
         }
     }
 
     // Create pidfd
     let pidfd_file = match crate::pidfd::create_pidfd(target_pid, flags) {
         Ok(file) => file,
-        Err(_) => return -12, // ENOMEM
+        Err(_) => return KernelError::OutOfMemory.sysret(),
     };
 
     // Allocate FD in current task's FD table
     let current_tid = super::percpu::current_tid();
     let fd_table = match super::fdtable::get_task_fd(current_tid) {
         Some(table) => table,
-        None => return ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     let mut table = fd_table.lock();
@@ -3288,40 +3277,40 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
 pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i64 {
     // Flags must be 0
     if flags != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate signal number (0 is allowed as a null signal for checking permissions)
     if !(0..=64).contains(&sig) {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get the file from FD table
     let current_tid = super::percpu::current_tid();
     let fd_table = match super::fdtable::get_task_fd(current_tid) {
         Some(table) => table,
-        None => return ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     let file = {
         let table = fd_table.lock();
         match table.get(pidfd) {
             Some(file) => file,
-            None => return -9, // EBADF
+            None => return KernelError::BadFd.sysret(),
         }
     };
 
     // Validate it's a pidfd and get target PID
     let target_pid = match crate::pidfd::get_pidfd_pid(&file) {
         Some(pid) => pid,
-        None => return -9, // EBADF - not a pidfd
+        None => return KernelError::BadFd.sysret(), // not a pidfd
     };
 
     // Check if process still exists
     {
         let table = super::percpu::TASK_TABLE.lock();
         if !table.tasks.iter().any(|t| t.pid == target_pid) {
-            return ESRCH;
+            return KernelError::NoProcess.sysret();
         }
     }
 
@@ -3357,45 +3346,45 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i6
 pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
     // Validate flags (must be 0)
     if flags != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get caller's fd table and the pidfd file
     let caller_tid = super::percpu::current_tid();
     let caller_fd_table = match super::fdtable::get_task_fd(caller_tid) {
         Some(t) => t,
-        None => return ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     let pidfd_file = {
         let table = caller_fd_table.lock();
         match table.get(pidfd) {
             Some(f) => f,
-            None => return -9, // EBADF
+            None => return KernelError::BadFd.sysret(),
         }
     };
 
     // Verify it's actually a pidfd and get the target PID
     let target_pid = match crate::pidfd::get_pidfd_pid(&pidfd_file) {
         Some(pid) => pid,
-        None => return -9, // EBADF - not a pidfd
+        None => return KernelError::BadFd.sysret(), // not a pidfd
     };
 
     // Find the target task by PID and check permissions
     let target_tid = match find_task_by_pid(target_pid) {
         Some(tid) => tid,
-        None => return ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     // Permission check: CAP_SYS_PTRACE or same euid
     if !check_pidfd_getfd_permission(target_tid) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Get target's fd table
     let target_fd_table = match super::fdtable::get_task_fd(target_tid) {
         Some(t) => t,
-        None => return ESRCH, // Process exiting
+        None => return KernelError::NoProcess.sysret(), // Process exiting
     };
 
     // Get the file from target's fd table
@@ -3403,7 +3392,7 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
         let table = target_fd_table.lock();
         match table.get(targetfd) {
             Some(f) => f,
-            None => return -9, // EBADF
+            None => return KernelError::BadFd.sysret(),
         }
     };
 

@@ -14,6 +14,7 @@ use alloc::sync::Arc;
 use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+use crate::error::KernelError;
 use crate::task::percpu::TASK_TABLE;
 
 // KCMP comparison types
@@ -35,12 +36,6 @@ pub const KCMP_SYSVSEM: i32 = 6;
 pub const KCMP_EPOLL_TFD: i32 = 7;
 /// Number of comparison types
 pub const KCMP_TYPES: i32 = 8;
-
-// Error codes
-const ESRCH: i64 = -3; // No such process
-const EINVAL: i64 = -22; // Invalid argument
-const EBADF: i64 = -9; // Bad file descriptor
-const EOPNOTSUPP: i64 = -95; // Operation not supported
 
 // Obfuscation cookies for pointer comparison (like Linux)
 // Two cookies per type: XOR value and multiplier
@@ -145,12 +140,12 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
 
     // Validate type
     if !(0..KCMP_TYPES).contains(&kcmp_type) {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // KCMP_EPOLL_TFD is not supported (requires complex epoll internals)
     if kcmp_type == KCMP_EPOLL_TFD {
-        return EOPNOTSUPP;
+        return KernelError::OperationNotSupported.sysret();
     }
 
     // Look up both tasks and extract the resources we need
@@ -158,12 +153,12 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
 
     let task1 = match table.tasks.iter().find(|t| t.pid == pid1) {
         Some(t) => t,
-        None => return ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     let task2 = match table.tasks.iter().find(|t| t.pid == pid2) {
         Some(t) => t,
-        None => return ESRCH,
+        None => return KernelError::NoProcess.sysret(),
     };
 
     match kcmp_type {
@@ -174,10 +169,10 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
                     let fd_table = files.lock();
                     match fd_table.get(idx1 as i32) {
                         Some(f) => Arc::as_ptr(&f) as u64,
-                        None => return EBADF,
+                        None => return KernelError::BadFd.sysret(),
                     }
                 }
-                None => return EBADF,
+                None => return KernelError::BadFd.sysret(),
             };
 
             let ptr2 = match &task2.files {
@@ -185,10 +180,10 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
                     let fd_table = files.lock();
                     match fd_table.get(idx2 as i32) {
                         Some(f) => Arc::as_ptr(&f) as u64,
-                        None => return EBADF,
+                        None => return KernelError::BadFd.sysret(),
                     }
                 }
-                None => return EBADF,
+                None => return KernelError::BadFd.sysret(),
             };
 
             kcmp_ptr(ptr1, ptr2, KCMP_FILE)
@@ -224,6 +219,6 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
             compare_arc_option(&task1.sysvsem, &task2.sysvsem, KCMP_SYSVSEM)
         }
 
-        _ => EINVAL,
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }

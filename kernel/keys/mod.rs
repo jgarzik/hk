@@ -35,31 +35,6 @@ use core::sync::atomic::{AtomicI32, Ordering};
 use spin::RwLock;
 
 // =============================================================================
-// Error codes for keyring operations (Linux ABI compatible)
-// =============================================================================
-
-/// Required key not available
-pub const ENOKEY: i64 = -126;
-/// Key has expired
-pub const EKEYEXPIRED: i64 = -127;
-/// Key has been revoked
-pub const EKEYREVOKED: i64 = -128;
-/// Key was rejected by service
-pub const EKEYREJECTED: i64 = -129;
-
-// Common error codes
-pub const EINVAL: i64 = -22;
-pub const ENOENT: i64 = -2;
-pub const ENOMEM: i64 = -12;
-pub const EFAULT: i64 = -14;
-pub const EACCES: i64 = -13;
-pub const EPERM: i64 = -1;
-pub const EDQUOT: i64 = -122;
-pub const ENOTDIR: i64 = -20;
-pub const EEXIST: i64 = -17;
-pub const EOPNOTSUPP: i64 = -95;
-
-// =============================================================================
 // Special keyring IDs (negative values, Linux ABI compatible)
 // =============================================================================
 

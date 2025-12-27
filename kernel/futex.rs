@@ -37,6 +37,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch::IrqSpinlock;
+use crate::error::KernelError;
 use crate::task::{Priority, TaskState, Tid};
 use crate::uaccess::{get_user, put_user};
 
@@ -45,14 +46,6 @@ use crate::uaccess::{get_user, put_user};
 use crate::arch::aarch64::uaccess::Aarch64Uaccess as Uaccess;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::uaccess::X86_64Uaccess as Uaccess;
-
-// Error constants (as i32 for syscall returns)
-const EAGAIN: i32 = 11;
-const EFAULT: i32 = 14;
-const EINVAL: i32 = 22;
-const ENOSYS: i32 = 38;
-const ESRCH: i32 = 3;
-const ETIMEDOUT: i32 = 110;
 
 // =============================================================================
 // Futex Operation Constants (Linux ABI compatible)
@@ -260,7 +253,7 @@ impl RobustListHead {
 /// - Handles SMAP protection on x86_64
 /// - Checks alignment
 fn read_user_u32(addr: u64) -> Result<u32, i32> {
-    get_user::<Uaccess, u32>(addr).map_err(|_| -EFAULT)
+    get_user::<Uaccess, u32>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
 }
 
 /// Write a u32 to user memory
@@ -270,7 +263,7 @@ fn read_user_u32(addr: u64) -> Result<u32, i32> {
 /// - Handles SMAP protection on x86_64
 /// - Checks alignment
 fn write_user_u32(addr: u64, val: u32) -> Result<(), i32> {
-    put_user::<Uaccess, u32>(addr, val).map_err(|_| -EFAULT)
+    put_user::<Uaccess, u32>(addr, val).map_err(|_| KernelError::BadAddress.to_errno_neg())
 }
 
 /// Read a u64 from user memory
@@ -280,7 +273,7 @@ fn write_user_u32(addr: u64, val: u32) -> Result<(), i32> {
 /// - Handles SMAP protection on x86_64
 /// - Checks alignment
 fn read_user_u64(addr: u64) -> Result<u64, i32> {
-    get_user::<Uaccess, u64>(addr).map_err(|_| -EFAULT)
+    get_user::<Uaccess, u64>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
 }
 
 /// Read a timespec from user memory and convert to nanoseconds
@@ -295,7 +288,7 @@ fn read_user_timeout(timeout_ptr: u64) -> Result<Option<u64>, i32> {
 
     // Validate
     if tv_nsec >= 1_000_000_000 {
-        return Err(-EINVAL);
+        return Err(KernelError::InvalidArgument.to_errno_neg());
     }
 
     let ns = tv_sec.saturating_mul(1_000_000_000).saturating_add(tv_nsec);
@@ -345,7 +338,7 @@ fn get_current_task_info() -> (Tid, u64, Priority) {
 /// # Returns
 /// * 0 on successful wake
 /// * -EAGAIN if value at uaddr != expected
-/// * -ETIMEDOUT if timeout expired
+/// * KernelError::TimedOut.to_errno_neg() if timeout expired
 /// * -EINVAL if bitset is 0 or address is invalid
 pub fn futex_wait(
     uaddr: u64,
@@ -358,12 +351,12 @@ pub fn futex_wait(
 
     // Validate bitset (0 is invalid per Linux ABI)
     if bitset == 0 {
-        return -EINVAL;
+        return KernelError::InvalidArgument.to_errno_neg();
     }
 
     // Check scheduling is enabled
     if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
-        return -EAGAIN;
+        return KernelError::WouldBlock.to_errno_neg();
     }
 
     // Get current task info
@@ -403,7 +396,7 @@ pub fn futex_wait(
         // If value changed, don't wait
         if current_val != expected {
             bucket.dec_waiters();
-            return -EAGAIN;
+            return KernelError::WouldBlock.to_errno_neg();
         }
 
         // Value matches - enqueue ourselves
@@ -412,7 +405,7 @@ pub fn futex_wait(
     };
 
     if !should_wait {
-        return -EAGAIN;
+        return KernelError::WouldBlock.to_errno_neg();
     }
 
     // Mark task as sleeping
@@ -466,7 +459,7 @@ pub fn futex_wait(
     };
 
     if was_timeout && timeout_ns.is_some() {
-        -ETIMEDOUT
+        KernelError::TimedOut.to_errno_neg()
     } else {
         0
     }
@@ -493,7 +486,7 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i
     }
 
     if bitset == 0 {
-        return -EINVAL;
+        return KernelError::InvalidArgument.to_errno_neg();
     }
 
     // Get current PID for private futex key
@@ -585,7 +578,7 @@ pub fn futex_requeue(
     use crate::task::percpu::{TASK_TABLE, current_percpu_sched};
 
     if nr_wake < 0 || nr_requeue < 0 {
-        return -EINVAL;
+        return KernelError::InvalidArgument.to_errno_neg();
     }
 
     let pid = crate::task::percpu::current_pid();
@@ -622,7 +615,7 @@ pub fn futex_requeue(
                 Err(e) => return e,
             };
             if current != expected {
-                return -EAGAIN;
+                return KernelError::WouldBlock.to_errno_neg();
             }
         }
 
@@ -705,7 +698,7 @@ pub fn futex_requeue(
 /// 0 on success, -EINVAL if len doesn't match
 pub fn sys_set_robust_list(head: u64, len: u64) -> i32 {
     if len as usize != RobustListHead::SIZE {
-        return -EINVAL;
+        return KernelError::InvalidArgument.to_errno_neg();
     }
 
     let tid = crate::task::percpu::current_tid();
@@ -737,7 +730,7 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
         // For non-zero pid, we'd need to look up the task
         // For now, only support current task
         if pid as Tid != current_tid {
-            return -ESRCH;
+            return KernelError::NoProcess.to_errno_neg();
         }
         pid as Tid
     };
@@ -752,12 +745,12 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
 
     // Write head pointer to user memory
     if head_ptr != 0 && put_user::<Uaccess, u64>(head_ptr, head).is_err() {
-        return -EFAULT;
+        return KernelError::BadAddress.to_errno_neg();
     }
 
     // Write length to user memory
     if len_ptr != 0 && put_user::<Uaccess, u64>(len_ptr, RobustListHead::SIZE as u64).is_err() {
-        return -EFAULT;
+        return KernelError::BadAddress.to_errno_neg();
     }
 
     0
@@ -917,7 +910,7 @@ pub fn sys_futex(
 
         FUTEX_WAIT_BITSET => {
             if val3 == 0 {
-                return -EINVAL;
+                return KernelError::InvalidArgument.to_errno_neg();
             }
             let timeout = match read_user_timeout(timeout_or_val2) {
                 Ok(t) => t,
@@ -928,7 +921,7 @@ pub fn sys_futex(
 
         FUTEX_WAKE_BITSET => {
             if val3 == 0 {
-                return -EINVAL;
+                return KernelError::InvalidArgument.to_errno_neg();
             }
             futex_wake(uaddr, val as i32, val3, is_private)
         }
@@ -950,7 +943,7 @@ pub fn sys_futex(
             )
         }
 
-        _ => -ENOSYS,
+        _ => KernelError::NotImplemented.to_errno_neg(),
     }
 }
 
@@ -1015,7 +1008,7 @@ struct FutexWaitvEntry {
 /// * >= 0: Index of woken futex (hint - others may also be woken)
 /// * -EINVAL: Invalid arguments
 /// * -EFAULT: Bad memory access
-/// * -ETIMEDOUT: Timeout expired
+/// * KernelError::TimedOut.to_errno_neg(): Timeout expired
 /// * -EAGAIN/-EWOULDBLOCK: Value mismatch at setup
 pub fn sys_futex_waitv(
     waiters_ptr: u64,
@@ -1026,24 +1019,24 @@ pub fn sys_futex_waitv(
 ) -> i32 {
     // Syscall flags must be 0
     if flags != 0 {
-        return -EINVAL;
+        return KernelError::InvalidArgument.to_errno_neg();
     }
 
     // Validate nr_futexes is in range [1, 128]
     if nr_futexes == 0 || nr_futexes as usize > FUTEX_WAITV_MAX {
-        return -EINVAL;
+        return KernelError::InvalidArgument.to_errno_neg();
     }
 
     // Validate waiters pointer
     if waiters_ptr == 0 {
-        return -EINVAL;
+        return KernelError::InvalidArgument.to_errno_neg();
     }
 
     // Validate clockid
     const CLOCK_REALTIME: i32 = 0;
     const CLOCK_MONOTONIC: i32 = 1;
     if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
-        return -EINVAL;
+        return KernelError::InvalidArgument.to_errno_neg();
     }
     let use_realtime = clockid == CLOCK_REALTIME;
 
@@ -1085,23 +1078,23 @@ pub fn sys_futex_waitv(
 
         // Reserved field must be 0
         if reserved != 0 {
-            return -EINVAL;
+            return KernelError::InvalidArgument.to_errno_neg();
         }
 
         // Validate flags - only support SIZE_U32 and PRIVATE for now
         if (flags_field & !futex2::VALID_MASK) != 0 {
-            return -EINVAL;
+            return KernelError::InvalidArgument.to_errno_neg();
         }
 
         // Check size - only support 32-bit futexes
         let size = flags_field & futex2::SIZE_MASK;
         if size != futex2::SIZE_U32 {
-            return -EINVAL;
+            return KernelError::InvalidArgument.to_errno_neg();
         }
 
         // Check alignment (must be 4-byte aligned for u32)
         if uaddr % 4 != 0 {
-            return -EINVAL;
+            return KernelError::InvalidArgument.to_errno_neg();
         }
 
         let is_private = (flags_field & futex2::PRIVATE) != 0;
@@ -1133,7 +1126,7 @@ fn futex_wait_multiple(
 
     // Check scheduling is enabled
     if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
-        return -EAGAIN;
+        return KernelError::WouldBlock.to_errno_neg();
     }
 
     let (tid, pid, priority) = get_current_task_info();
@@ -1185,7 +1178,7 @@ fn futex_wait_multiple(
                         }
                         b.dec_waiters();
                     }
-                    return -EFAULT;
+                    return KernelError::BadAddress.to_errno_neg();
                 }
             };
 
@@ -1218,7 +1211,7 @@ fn futex_wait_multiple(
                 }
                 b.dec_waiters();
             }
-            return -EAGAIN; // Same as -EWOULDBLOCK
+            return KernelError::WouldBlock.to_errno_neg(); // Same as -EWOULDBLOCK
         }
 
         // All values match and we're enqueued on all futexes
@@ -1286,7 +1279,7 @@ fn futex_wait_multiple(
                 .saturating_mul(1_000_000_000)
                 .saturating_add(ts.nsec as u64);
             if now_ns >= deadline_ns {
-                return -ETIMEDOUT;
+                return KernelError::TimedOut.to_errno_neg();
             }
         }
 

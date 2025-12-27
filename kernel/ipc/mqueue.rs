@@ -35,7 +35,7 @@ use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use spin::{Lazy, Mutex, RwLock};
 
 use crate::arch::Uaccess;
-use crate::fs::KernelError;
+use crate::error::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
@@ -84,27 +84,6 @@ const SIGEV_SIGNAL: i32 = 0;
 const SIGEV_NONE: i32 = 1;
 const SIGEV_THREAD: i32 = 2;
 const SIGEV_THREAD_ID: i32 = 4;
-
-// Error codes
-const ENOENT: i64 = -2;
-#[allow(dead_code)] // Will be used when WaitQueue supports interruptible wait
-const EINTR: i64 = -4;
-const EBADF: i64 = -9;
-const EAGAIN: i64 = -11;
-#[allow(dead_code)] // Will be used for Vec allocation failure handling
-const ENOMEM: i64 = -12;
-const EACCES: i64 = -13;
-const EFAULT: i64 = -14;
-const EBUSY: i64 = -16;
-const EEXIST: i64 = -17;
-const EINVAL: i64 = -22;
-const EMFILE: i64 = -24;
-#[allow(dead_code)] // System-wide fd limit (EMFILE is per-process)
-const ENFILE: i64 = -23;
-const ENAMETOOLONG: i64 = -36;
-const EMSGSIZE: i64 = -90;
-#[allow(dead_code)] // Will be used when WaitQueue supports timed wait
-const ETIMEDOUT: i64 = -110;
 
 // ============================================================================
 // Data Structures
@@ -304,7 +283,7 @@ impl MqQueue {
             }
 
             if nonblock || self.is_nonblocking() {
-                return Err(EAGAIN);
+                return Err(KernelError::WouldBlock.sysret());
             }
 
             // Wait for space
@@ -331,7 +310,7 @@ impl MqQueue {
             }
 
             if nonblock || self.is_nonblocking() {
-                return Err(EAGAIN);
+                return Err(KernelError::WouldBlock.sysret());
             }
 
             // Wait for messages
@@ -501,21 +480,21 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
     // Read name from user space
     let name = match strncpy_from_user::<Uaccess>(name_ptr, NAME_MAX + 1) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate name (must start with '/', no embedded '/')
     if !name.starts_with('/') {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     if name.len() < 2 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     if name[1..].contains('/') {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     if name.len() > NAME_MAX {
-        return ENAMETOOLONG;
+        return KernelError::NameTooLong.sysret();
     }
 
     // Extract name without leading '/'
@@ -532,31 +511,31 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
 
         if let Some(q) = registry.get(&queue_name) {
             if creating && exclusive {
-                return EEXIST;
+                return KernelError::AlreadyExists.sysret();
             }
             // Check access permissions
             if !q.check_access(access_mode) {
-                return EACCES;
+                return KernelError::PermissionDenied.sysret();
             }
             q.clone()
         } else {
             if !creating {
-                return ENOENT;
+                return KernelError::NotFound.sysret();
             }
 
             // Read attributes if provided
             let (maxmsg, msgsize) = if attr_ptr != 0 {
                 let attr: MqAttr = match get_user::<Uaccess, MqAttr>(attr_ptr) {
                     Ok(a) => a,
-                    Err(_) => return EFAULT,
+                    Err(_) => return KernelError::BadAddress.sysret(),
                 };
 
                 // Validate attributes
                 if attr.mq_maxmsg <= 0 || attr.mq_maxmsg > HARD_MSGMAX {
-                    return EINVAL;
+                    return KernelError::InvalidArgument.sysret();
                 }
                 if attr.mq_msgsize <= 0 || attr.mq_msgsize > HARD_MSGSIZEMAX {
-                    return EINVAL;
+                    return KernelError::InvalidArgument.sysret();
                 }
                 (attr.mq_maxmsg, attr.mq_msgsize)
             } else {
@@ -583,7 +562,7 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
 
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return EMFILE,
+        None => return KernelError::ProcessFileLimit.sysret(),
     };
 
     let fd_flags = if oflag & O_CLOEXEC != 0 {
@@ -606,15 +585,15 @@ pub fn sys_mq_unlink(name_ptr: u64) -> i64 {
     // Read name from user space
     let name = match strncpy_from_user::<Uaccess>(name_ptr, NAME_MAX + 1) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate name
     if !name.starts_with('/') {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     if name.len() < 2 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let queue_name = name[1..].to_string();
@@ -623,12 +602,12 @@ pub fn sys_mq_unlink(name_ptr: u64) -> i64 {
     if let Some(q) = registry.get(&queue_name) {
         // Check write permission (needed for unlink)
         if !q.check_access(O_WRONLY) {
-            return EACCES;
+            return KernelError::PermissionDenied.sysret();
         }
         registry.remove(&queue_name);
         0
     } else {
-        ENOENT
+        KernelError::NotFound.sysret()
     }
 }
 
@@ -642,41 +621,41 @@ pub fn sys_mq_timedsend(
 ) -> i64 {
     // Validate priority
     if msg_prio >= MQ_PRIO_MAX {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get file from fd
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let file = match fd_table.lock().get(mqdes) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get MqFileOps from file
     let mq_ops = match file.f_op.as_any().downcast_ref::<MqFileOps>() {
         Some(ops) => ops,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Check write permission
     if mq_ops.access_mode == O_RDONLY {
-        return EBADF;
+        return KernelError::BadFd.sysret();
     }
 
     // Check message size
     if msg_len as i64 > mq_ops.queue.msgsize {
-        return EMSGSIZE;
+        return KernelError::MessageTooLong.sysret();
     }
 
     // Read message from user space
     let mut msg_buf = vec![0u8; msg_len];
     if msg_len > 0 {
         if !Uaccess::access_ok(msg_ptr, msg_len) {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
         unsafe {
             Uaccess::user_access_begin();
@@ -705,28 +684,28 @@ pub fn sys_mq_timedreceive(
     // Get file from fd
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let file = match fd_table.lock().get(mqdes) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get MqFileOps from file
     let mq_ops = match file.f_op.as_any().downcast_ref::<MqFileOps>() {
         Some(ops) => ops,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Check read permission
     if mq_ops.access_mode == O_WRONLY {
-        return EBADF;
+        return KernelError::BadFd.sysret();
     }
 
     // Check buffer size
     if (msg_len as i64) < mq_ops.queue.msgsize {
-        return EMSGSIZE;
+        return KernelError::MessageTooLong.sysret();
     }
 
     // Receive message
@@ -742,7 +721,7 @@ pub fn sys_mq_timedreceive(
     // Write message to user space
     if len > 0 {
         if !Uaccess::access_ok(msg_ptr, len) {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
         unsafe {
             Uaccess::user_access_begin();
@@ -753,7 +732,7 @@ pub fn sys_mq_timedreceive(
 
     // Write priority if requested
     if prio_ptr != 0 && put_user::<Uaccess, u32>(prio_ptr, prio).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     len as i64
@@ -764,18 +743,18 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
     // Get file from fd
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let file = match fd_table.lock().get(mqdes) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get MqFileOps from file
     let mq_ops = match file.f_op.as_any().downcast_ref::<MqFileOps>() {
         Some(ops) => ops,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let current_pid = crate::task::percpu::current_pid();
@@ -796,14 +775,14 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
     // Read sigevent from user
     let sev: SigEvent = match get_user::<Uaccess, SigEvent>(sevp_ptr) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate notification type
     match sev.sigev_notify {
         SIGEV_NONE | SIGEV_SIGNAL | SIGEV_THREAD_ID => {}
-        SIGEV_THREAD => return EINVAL, // Not supported (requires user-space pthread)
-        _ => return EINVAL,
+        SIGEV_THREAD => return KernelError::InvalidArgument.sysret(), // Not supported (requires user-space pthread)
+        _ => return KernelError::InvalidArgument.sysret(),
     }
 
     // Check if already registered by another process
@@ -811,7 +790,7 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
     if let Some(ref n) = *notify
         && n.owner_pid != current_pid
     {
-        return EBUSY;
+        return KernelError::Busy.sysret();
     }
 
     // Register notification
@@ -835,25 +814,25 @@ pub fn sys_mq_getsetattr(mqdes: i32, newattr_ptr: u64, oldattr_ptr: u64) -> i64 
     // Get file from fd
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let file = match fd_table.lock().get(mqdes) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get MqFileOps from file
     let mq_ops = match file.f_op.as_any().downcast_ref::<MqFileOps>() {
         Some(ops) => ops,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get old attributes if requested
     if oldattr_ptr != 0 {
         let old_attr = mq_ops.queue.get_attr();
         if put_user::<Uaccess, MqAttr>(oldattr_ptr, old_attr).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -861,7 +840,7 @@ pub fn sys_mq_getsetattr(mqdes: i32, newattr_ptr: u64, oldattr_ptr: u64) -> i64 
     if newattr_ptr != 0 {
         let new_attr: MqAttr = match get_user::<Uaccess, MqAttr>(newattr_ptr) {
             Ok(a) => a,
-            Err(_) => return EFAULT,
+            Err(_) => return KernelError::BadAddress.sysret(),
         };
         // Only mq_flags (O_NONBLOCK) can be changed
         mq_ops.queue.set_flags(new_attr.mq_flags);

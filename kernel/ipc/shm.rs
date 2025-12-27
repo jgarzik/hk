@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, Ordering};
 
 use crate::arch::Uaccess;
+use crate::error::KernelError;
 use crate::ipc::util::{
     IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcType, KernIpcPerm, ipc_checkperm, ipcget,
 };
@@ -22,12 +23,6 @@ use crate::uaccess::{get_user, put_user};
 use spin::Mutex;
 
 const PAGE_SIZE: usize = 4096;
-
-// Error codes
-const EINVAL: i32 = 22;
-const ENOMEM: i32 = 12;
-const EPERM: i32 = 1;
-const EFAULT: i32 = 14;
 
 /// Get current time in seconds
 fn current_time_secs() -> i64 {
@@ -95,7 +90,9 @@ impl ShmidKernel {
         // Allocate physical frames
         let mut frames = Vec::with_capacity(num_pages);
         for _ in 0..num_pages {
-            let frame = crate::FRAME_ALLOCATOR.alloc().ok_or(ENOMEM)?;
+            let frame = crate::FRAME_ALLOCATOR
+                .alloc()
+                .ok_or(KernelError::OutOfMemory.errno())?;
 
             // Zero the frame
             unsafe {
@@ -213,7 +210,7 @@ fn do_shmget(key: i32, size: usize, shmflg: i32) -> Result<i32, i32> {
 
     // Validate size
     if size < SHMMIN || size > ns.shm_ctlmax {
-        return Err(EINVAL);
+        return Err(KernelError::InvalidArgument.errno());
     }
 
     let ns_clone = ns.clone();
@@ -222,7 +219,7 @@ fn do_shmget(key: i32, size: usize, shmflg: i32) -> Result<i32, i32> {
         let pages = size.div_ceil(PAGE_SIZE) as u64;
         let current_tot = ns_clone.shm_tot.load(Ordering::Relaxed);
         if current_tot + pages > ns_clone.shm_ctlall as u64 {
-            return Err(ENOMEM);
+            return Err(KernelError::OutOfMemory.errno());
         }
 
         let shm = ShmidKernel::new(k, size, mode, ns_clone.clone())?;
@@ -249,7 +246,10 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
     let tid = current_tid();
 
     // Find segment
-    let shm_obj = ns.shm_ids().find_by_id(shmid).ok_or(EINVAL)?;
+    let shm_obj = ns
+        .shm_ids()
+        .find_by_id(shmid)
+        .ok_or(KernelError::InvalidArgument.errno())?;
     let perm = shm_obj.perm();
 
     // Check permissions
@@ -268,7 +268,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
         Some(shm) => shm,
         None => {
             perm.put_ref();
-            return Err(EINVAL);
+            return Err(KernelError::InvalidArgument.errno());
         }
     };
 
@@ -279,7 +279,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
         Some(m) => m,
         None => {
             perm.put_ref();
-            return Err(ENOMEM);
+            return Err(KernelError::OutOfMemory.errno());
         }
     };
 
@@ -294,7 +294,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
                 Some(a) => a,
                 None => {
                     perm.put_ref();
-                    return Err(ENOMEM);
+                    return Err(KernelError::OutOfMemory.errno());
                 }
             }
         } else {
@@ -304,7 +304,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
             } else {
                 if shmaddr & (PAGE_SIZE as u64 - 1) != 0 {
                     perm.put_ref();
-                    return Err(EINVAL);
+                    return Err(KernelError::InvalidArgument.errno());
                 }
                 shmaddr
             };
@@ -313,7 +313,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
             if mm_guard.overlaps(aligned_addr, aligned_addr + size as u64) {
                 if shmflg & SHM_REMAP == 0 {
                     perm.put_ref();
-                    return Err(EINVAL);
+                    return Err(KernelError::InvalidArgument.errno());
                 }
                 // SHM_REMAP: remove overlapping VMAs
                 mm_guard.remove_range(aligned_addr, aligned_addr + size as u64);
@@ -341,7 +341,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
     let cr3 = get_current_task_cr3();
     if cr3 == 0 {
         perm.put_ref();
-        return Err(ENOMEM);
+        return Err(KernelError::OutOfMemory.errno());
     }
 
     // Calculate page table flags
@@ -390,7 +390,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
                 }
                 drop(frames);
                 perm.put_ref();
-                return Err(ENOMEM);
+                return Err(KernelError::OutOfMemory.errno());
             }
         }
 
@@ -405,7 +405,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
                 }
                 drop(frames);
                 perm.put_ref();
-                return Err(ENOMEM);
+                return Err(KernelError::OutOfMemory.errno());
             }
         }
     }
@@ -437,23 +437,25 @@ fn do_shmdt(shmaddr: u64) -> Result<i32, i32> {
     let ns = current_ipc_ns();
 
     // Get task's mm
-    let mm = get_task_mm(tid).ok_or(EINVAL)?;
+    let mm = get_task_mm(tid).ok_or(KernelError::InvalidArgument.errno())?;
 
     // Find and validate the VMA
     let (shmid, size) = {
         let mm_guard = mm.lock();
 
         // Find VMA for this address
-        let vma = mm_guard.find_vma(shmaddr).ok_or(EINVAL)?;
+        let vma = mm_guard
+            .find_vma(shmaddr)
+            .ok_or(KernelError::InvalidArgument.errno())?;
 
         // Must detach at start address
         if vma.start != shmaddr {
-            return Err(EINVAL);
+            return Err(KernelError::InvalidArgument.errno());
         }
 
         // Must be a SHM VMA
         if vma.flags & VM_SHM == 0 {
-            return Err(EINVAL);
+            return Err(KernelError::InvalidArgument.errno());
         }
 
         // Get shmid from VMA offset field
@@ -466,7 +468,7 @@ fn do_shmdt(shmaddr: u64) -> Result<i32, i32> {
     // Get page table root
     let cr3 = get_current_task_cr3();
     if cr3 == 0 {
-        return Err(EINVAL);
+        return Err(KernelError::InvalidArgument.errno());
     }
 
     // Unmap pages from page tables
@@ -495,7 +497,7 @@ fn do_shmdt(shmaddr: u64) -> Result<i32, i32> {
     if let Some(shm_obj) = ns.shm_ids().find_by_id(shmid) {
         let shm_kernel: &ShmidKernel = match downcast_shm(shm_obj.as_ref()) {
             Some(shm) => shm,
-            None => return Err(EINVAL),
+            None => return Err(KernelError::InvalidArgument.errno()),
         };
 
         let old_nattch = shm_kernel.nattch.fetch_sub(1, Ordering::Relaxed);
@@ -533,7 +535,10 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
 
     match cmd_only {
         IPC_STAT | SHM_STAT => {
-            let shm = ns.shm_ids().find_by_id(shmid).ok_or(EINVAL)?;
+            let shm = ns
+                .shm_ids()
+                .find_by_id(shmid)
+                .ok_or(KernelError::InvalidArgument.errno())?;
 
             // Check read permission
             ipc_checkperm(shm.perm(), IPC_PERM_READ)?;
@@ -544,12 +549,13 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             // Downcast safely with type verification
             let shm_kernel: &ShmidKernel = match downcast_shm(shm.as_ref()) {
                 Some(shm) => shm,
-                None => return Err(EINVAL),
+                None => return Err(KernelError::InvalidArgument.errno()),
             };
             shm_kernel.fill_shmid64_ds(&mut ds);
 
             if buf != 0 {
-                put_user::<Uaccess, Shmid64Ds>(buf, ds).map_err(|_| EFAULT)?;
+                put_user::<Uaccess, Shmid64Ds>(buf, ds)
+                    .map_err(|_| KernelError::BadAddress.errno())?;
             }
 
             shm.perm().put_ref();
@@ -557,7 +563,10 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
         }
 
         IPC_SET => {
-            let shm = ns.shm_ids().find_by_id(shmid).ok_or(EINVAL)?;
+            let shm = ns
+                .shm_ids()
+                .find_by_id(shmid)
+                .ok_or(KernelError::InvalidArgument.errno())?;
 
             // Must be owner or have CAP_SYS_ADMIN
             let cred = crate::task::percpu::current_cred();
@@ -569,11 +578,12 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
                 drop(_lock);
                 perm.put_ref();
-                return Err(EPERM);
+                return Err(KernelError::NotPermitted.errno());
             }
 
             // Read user data
-            let ds: Shmid64Ds = get_user::<Uaccess, Shmid64Ds>(buf).map_err(|_| EFAULT)?;
+            let ds: Shmid64Ds =
+                get_user::<Uaccess, Shmid64Ds>(buf).map_err(|_| KernelError::BadAddress.errno())?;
 
             // Update fields (only uid, gid, mode can be changed)
             perm_mutable.uid = ds.shm_perm.uid;
@@ -585,7 +595,7 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                 Some(shm) => shm,
                 None => {
                     perm.put_ref();
-                    return Err(EINVAL);
+                    return Err(KernelError::InvalidArgument.errno());
                 }
             };
             shm_kernel
@@ -598,7 +608,10 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
 
         IPC_RMID => {
             // Must be owner or have CAP_SYS_ADMIN
-            let shm = ns.shm_ids().find_by_id(shmid).ok_or(EINVAL)?;
+            let shm = ns
+                .shm_ids()
+                .find_by_id(shmid)
+                .ok_or(KernelError::InvalidArgument.errno())?;
 
             let cred = crate::task::percpu::current_cred();
             let uid = cred.euid;
@@ -610,7 +623,7 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                 if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
                     drop(_lock);
                     perm.put_ref();
-                    return Err(EPERM);
+                    return Err(KernelError::NotPermitted.errno());
                 }
             }
             perm.put_ref();
@@ -632,11 +645,14 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
         SHM_LOCK | SHM_UNLOCK => {
             // Lock/unlock requires CAP_IPC_LOCK
             // For now, just validate and return success (no swap anyway)
-            let shm = ns.shm_ids().find_by_id(shmid).ok_or(EINVAL)?;
+            let shm = ns
+                .shm_ids()
+                .find_by_id(shmid)
+                .ok_or(KernelError::InvalidArgument.errno())?;
             shm.perm().put_ref();
             Ok(0)
         }
 
-        _ => Err(EINVAL),
+        _ => Err(KernelError::InvalidArgument.errno()),
     }
 }

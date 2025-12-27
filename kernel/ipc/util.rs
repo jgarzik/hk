@@ -11,12 +11,8 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::{Mutex, RwLock};
 
+use crate::error::KernelError;
 use crate::ipc::{IPC_CREAT, IPC_EXCL, IPC_PRIVATE};
-
-// Error codes
-const EACCES: i32 = 13;
-const EEXIST: i32 = 17;
-const ENOENT: i32 = 2;
 
 // ============================================================================
 // ID Allocation Constants
@@ -270,7 +266,7 @@ impl IpcIds {
         let mut inner = self.inner.write();
 
         if inner.in_use >= max_ids || inner.in_use >= IPCMNI {
-            return Err(ENOSPC);
+            return Err(KernelError::NoSpace.errno());
         }
 
         // Find free index (cyclic allocation)
@@ -283,7 +279,7 @@ impl IpcIds {
                 break;
             }
             if idx == start_idx {
-                return Err(ENOSPC);
+                return Err(KernelError::NoSpace.errno());
             }
         }
 
@@ -381,9 +377,6 @@ impl Default for IpcIds {
     }
 }
 
-// ENOSPC is not in our errno module, define locally
-const ENOSPC: i32 = 28;
-
 // ============================================================================
 // Permission Checking
 // ============================================================================
@@ -434,7 +427,7 @@ pub fn ipc_checkperm(perm: &KernIpcPerm, flag: u16) -> Result<(), i32> {
 
     // TODO: CAP_IPC_OWNER capability check
 
-    Err(EACCES)
+    Err(KernelError::PermissionDenied.errno())
 }
 
 /// Generic IPC get operation
@@ -460,7 +453,7 @@ pub fn ipcget<T: IpcObject + 'static>(
         // Found existing - check flags
         if flags & IPC_CREAT != 0 && flags & IPC_EXCL != 0 {
             existing.perm().put_ref();
-            return Err(EEXIST);
+            return Err(KernelError::AlreadyExists.errno());
         }
 
         // Check permissions for access
@@ -495,5 +488,5 @@ pub fn ipcget<T: IpcObject + 'static>(
         return ids.alloc_id(obj, max_ids);
     }
 
-    Err(ENOENT)
+    Err(KernelError::NotFound.errno())
 }

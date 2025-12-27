@@ -4,6 +4,8 @@
 //! implementation. Architecture-specific power operations are implemented in
 //! arch/<arch>/power.rs modules.
 
+use crate::error::KernelError;
+
 /// Linux reboot syscall command constants
 pub mod cmd {
     /// Magic number 1 for reboot syscall
@@ -22,9 +24,6 @@ pub mod cmd {
     pub const HALT: u32 = 0xcdef0123;
 }
 
-/// Error codes
-const EINVAL: i64 = -22;
-
 /// sys_reboot implementation
 ///
 /// Implements the Linux reboot(2) syscall. The caller must provide valid
@@ -42,7 +41,7 @@ const EINVAL: i64 = -22;
 pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
     // Validate magic number 1
     if magic1 != cmd::LINUX_REBOOT_MAGIC1 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate magic number 2 (any of the valid variants)
@@ -51,7 +50,7 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
         && magic2 != cmd::LINUX_REBOOT_MAGIC2B
         && magic2 != cmd::LINUX_REBOOT_MAGIC2C
     {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Dispatch to architecture-specific implementation
@@ -59,6 +58,6 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
         cmd::POWER_OFF => crate::arch::power::shutdown(),
         cmd::RESTART => crate::arch::power::reboot(),
         cmd::HALT => crate::arch::power::halt(),
-        _ => EINVAL,
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }

@@ -6,6 +6,7 @@
 //! crate::uaccess to ensure proper validation and SMAP protection.
 
 use crate::arch::Uaccess;
+use crate::error::KernelError;
 use crate::time::{ClockId, NTP_STATE, STA_NANO, STA_UNSYNC, TIMEKEEPER};
 use crate::uaccess::{UaccessArch, get_user, put_user};
 use core::sync::atomic::Ordering;
@@ -13,12 +14,6 @@ use core::sync::atomic::Ordering;
 /// Linux clock IDs
 pub const CLOCK_REALTIME: i32 = 0;
 pub const CLOCK_MONOTONIC: i32 = 1;
-
-/// Error numbers (negated for return)
-const EFAULT: i64 = -14;
-const EINVAL: i64 = -22;
-#[allow(dead_code)]
-const EINTR: i64 = -4;
 
 /// TIMER_ABSTIME flag for clock_nanosleep
 pub const TIMER_ABSTIME: i32 = 1;
@@ -59,13 +54,13 @@ pub struct Timezone {
 pub fn sys_clock_gettime(clockid: i32, tp: u64) -> i64 {
     // Validate user buffer address
     if tp == 0 || !Uaccess::access_ok(tp, core::mem::size_of::<LinuxTimespec>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     let clock_id = match clockid {
         CLOCK_REALTIME => ClockId::Realtime,
         CLOCK_MONOTONIC => ClockId::Monotonic,
-        _ => return EINVAL,
+        _ => return KernelError::InvalidArgument.sysret(),
     };
 
     let ts = TIMEKEEPER.read(clock_id, TIMEKEEPER.get_read_cycles());
@@ -77,7 +72,7 @@ pub fn sys_clock_gettime(clockid: i32, tp: u64) -> i64 {
 
     // Copy to user space using put_user
     if put_user::<Uaccess, LinuxTimespec>(tp, result).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -96,7 +91,7 @@ pub fn sys_gettimeofday(tv: u64, tz: u64) -> i64 {
     if tv != 0 {
         // Validate user buffer address
         if !Uaccess::access_ok(tv, core::mem::size_of::<Timeval>()) {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
 
         let ts = TIMEKEEPER.read(ClockId::Realtime, TIMEKEEPER.get_read_cycles());
@@ -108,7 +103,7 @@ pub fn sys_gettimeofday(tv: u64, tz: u64) -> i64 {
 
         // Copy to user space
         if put_user::<Uaccess, Timeval>(tv, result).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -116,7 +111,7 @@ pub fn sys_gettimeofday(tv: u64, tz: u64) -> i64 {
     if tz != 0 {
         // Validate user buffer address
         if !Uaccess::access_ok(tz, core::mem::size_of::<Timezone>()) {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
 
         let timezone = Timezone {
@@ -125,7 +120,7 @@ pub fn sys_gettimeofday(tv: u64, tz: u64) -> i64 {
         };
 
         if put_user::<Uaccess, Timezone>(tz, timezone).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -143,17 +138,17 @@ pub fn sys_gettimeofday(tv: u64, tz: u64) -> i64 {
 pub fn sys_nanosleep(req: u64, rem: u64) -> i64 {
     // Validate and read request timespec
     if req == 0 || !Uaccess::access_ok(req, core::mem::size_of::<LinuxTimespec>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     let request: LinuxTimespec = match get_user::<Uaccess, LinuxTimespec>(req) {
         Ok(ts) => ts,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate timespec values
     if request.tv_sec < 0 || request.tv_nsec < 0 || request.tv_nsec >= 1_000_000_000 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Convert to ticks (10ms per tick = 100 ticks/second)
@@ -189,22 +184,22 @@ pub fn sys_nanosleep(req: u64, rem: u64) -> i64 {
 pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 {
     // Validate clock ID
     if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate and read request timespec
     if req == 0 || !Uaccess::access_ok(req, core::mem::size_of::<LinuxTimespec>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     let request: LinuxTimespec = match get_user::<Uaccess, LinuxTimespec>(req) {
         Ok(ts) => ts,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate timespec values
     if request.tv_sec < 0 || request.tv_nsec < 0 || request.tv_nsec >= 1_000_000_000 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     const NS_PER_TICK: i64 = 10_000_000;
@@ -241,7 +236,7 @@ pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 
 pub fn sys_clock_getres(clockid: i32, res: u64) -> i64 {
     // Validate clock ID first (even if res is NULL per POSIX)
     if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // If res is NULL, just return success (validates clock ID only)
@@ -251,7 +246,7 @@ pub fn sys_clock_getres(clockid: i32, res: u64) -> i64 {
 
     // Validate user buffer address
     if !Uaccess::access_ok(res, core::mem::size_of::<LinuxTimespec>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Return 1 nanosecond resolution (high-resolution mode)
@@ -261,7 +256,7 @@ pub fn sys_clock_getres(clockid: i32, res: u64) -> i64 {
     };
 
     if put_user::<Uaccess, LinuxTimespec>(res, result).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -284,10 +279,10 @@ pub fn sys_time(tloc: u64) -> i64 {
     // If tloc is provided, write time to user space
     if tloc != 0 {
         if !Uaccess::access_ok(tloc, core::mem::size_of::<i64>()) {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
         if put_user::<Uaccess, i64>(tloc, seconds).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -323,23 +318,23 @@ fn do_nanosleep(wake_tick: u64) {
 pub fn sys_clock_settime(clockid: i32, tp: u64) -> i64 {
     // Validate user buffer address
     if tp == 0 || !Uaccess::access_ok(tp, core::mem::size_of::<LinuxTimespec>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Only CLOCK_REALTIME can be set
     if clockid != CLOCK_REALTIME {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Read timespec from user space
     let ts: LinuxTimespec = match get_user::<Uaccess, LinuxTimespec>(tp) {
         Ok(ts) => ts,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate timespec values
     if ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Convert to Timespec and set
@@ -352,7 +347,7 @@ pub fn sys_clock_settime(clockid: i32, tp: u64) -> i64 {
         0
     } else {
         // Timekeeper not initialized
-        EINVAL
+        KernelError::InvalidArgument.sysret()
     }
 }
 
@@ -375,17 +370,17 @@ pub fn sys_settimeofday(tv: u64, tz: u64) -> i64 {
     if tv != 0 {
         // Validate user buffer address
         if !Uaccess::access_ok(tv, core::mem::size_of::<Timeval>()) {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
 
         let timeval: Timeval = match get_user::<Uaccess, Timeval>(tv) {
             Ok(tv) => tv,
-            Err(_) => return EFAULT,
+            Err(_) => return KernelError::BadAddress.sysret(),
         };
 
         // Validate timeval values
         if timeval.tv_usec < 0 || timeval.tv_usec >= 1_000_000 {
-            return EINVAL;
+            return KernelError::InvalidArgument.sysret();
         }
 
         // Convert timeval to Timespec (us -> ns)
@@ -395,14 +390,14 @@ pub fn sys_settimeofday(tv: u64, tz: u64) -> i64 {
         };
 
         if !TIMEKEEPER.set_realtime(new_time) {
-            return EINVAL; // Timekeeper not initialized
+            return KernelError::InvalidArgument.sysret(); // Timekeeper not initialized
         }
     }
 
     // Timezone is deprecated; we accept but ignore it
     // Just validate the pointer if provided
     if tz != 0 && !Uaccess::access_ok(tz, core::mem::size_of::<Timezone>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -417,10 +412,6 @@ use crate::pipe::FD_CLOEXEC;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 use crate::timerfd::{ITimerSpec, create_timerfd, get_timerfd, tfd_flags, tfd_timer_flags};
-
-/// Error numbers
-const EBADF: i64 = -9;
-const EMFILE: i64 = -24;
 
 /// Get the RLIMIT_NOFILE limit for the current task
 fn get_nofile_limit() -> u64 {
@@ -442,25 +433,25 @@ fn get_nofile_limit() -> u64 {
 pub fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
     // Validate clockid
     if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate flags (only TFD_CLOEXEC and TFD_NONBLOCK are allowed)
     let valid_flags = tfd_flags::TFD_CLOEXEC | tfd_flags::TFD_NONBLOCK;
     if flags & !valid_flags != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Create the timerfd file
     let file = match create_timerfd(clockid, flags) {
         Ok(f) => f,
-        Err(_) => return EMFILE,
+        Err(_) => return KernelError::ProcessFileLimit.sysret(),
     };
 
     // Get the FD table and allocate a file descriptor
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return EMFILE,
+        None => return KernelError::ProcessFileLimit.sysret(),
     };
     let mut table = fd_table.lock();
     let fd_flags = if flags & tfd_flags::TFD_CLOEXEC != 0 {
@@ -488,18 +479,18 @@ pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: u64, old_value: u64) 
     // Validate flags
     let valid_flags = tfd_timer_flags::TFD_TIMER_ABSTIME | tfd_timer_flags::TFD_TIMER_CANCEL_ON_SET;
     if flags & !valid_flags != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate new_value pointer
     if new_value == 0 || !Uaccess::access_ok(new_value, core::mem::size_of::<ITimerSpec>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Read new_value from user space
     let new_spec: ITimerSpec = match get_user::<Uaccess, ITimerSpec>(new_value) {
         Ok(spec) => spec,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate timespec values
@@ -508,23 +499,23 @@ pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: u64, old_value: u64) 
         || new_spec.it_interval.tv_nsec < 0
         || new_spec.it_interval.tv_nsec >= 1_000_000_000
     {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get the file from fd
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
     let file = match fd_table.lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get the timerfd from the file
     let timerfd = match get_timerfd(&file) {
         Some(t) => t,
-        None => return EBADF, // Not a timerfd
+        None => return KernelError::BadFd.sysret(), // Not a timerfd
     };
 
     // Set the timer and get the old value
@@ -533,10 +524,10 @@ pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: u64, old_value: u64) 
     // Write old_value if provided
     if old_value != 0 {
         if !Uaccess::access_ok(old_value, core::mem::size_of::<ITimerSpec>()) {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
         if put_user::<Uaccess, ITimerSpec>(old_value, old_spec).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -553,23 +544,23 @@ pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: u64, old_value: u64) 
 pub fn sys_timerfd_gettime(fd: i32, curr_value: u64) -> i64 {
     // Validate curr_value pointer
     if curr_value == 0 || !Uaccess::access_ok(curr_value, core::mem::size_of::<ITimerSpec>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Get the file from fd
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
     let file = match fd_table.lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get the timerfd from the file
     let timerfd = match get_timerfd(&file) {
         Some(t) => t,
-        None => return EBADF, // Not a timerfd
+        None => return KernelError::BadFd.sysret(), // Not a timerfd
     };
 
     // Get current timer value
@@ -577,7 +568,7 @@ pub fn sys_timerfd_gettime(fd: i32, curr_value: u64) -> i64 {
 
     // Write to user space
     if put_user::<Uaccess, ITimerSpec>(curr_value, curr_spec).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -598,19 +589,19 @@ pub fn sys_eventfd2(initval: u32, flags: i32) -> i64 {
     // Validate flags (only EFD_CLOEXEC, EFD_NONBLOCK, and EFD_SEMAPHORE are allowed)
     let valid_flags = efd_flags::EFD_CLOEXEC | efd_flags::EFD_NONBLOCK | efd_flags::EFD_SEMAPHORE;
     if flags & !valid_flags != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Create the eventfd file
     let file = match create_eventfd(initval as u64, flags) {
         Ok(f) => f,
-        Err(_) => return EMFILE,
+        Err(_) => return KernelError::ProcessFileLimit.sysret(),
     };
 
     // Get the FD table and allocate a file descriptor
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return EMFILE,
+        None => return KernelError::ProcessFileLimit.sysret(),
     };
     let mut table = fd_table.lock();
     let fd_flags = if flags & efd_flags::EFD_CLOEXEC != 0 {
@@ -759,13 +750,13 @@ const STA_RW_MASK: i32 = crate::time::STA_PLL
 pub fn sys_adjtimex(txc_p: u64) -> i64 {
     // Validate user buffer
     if txc_p == 0 || !Uaccess::access_ok(txc_p, core::mem::size_of::<Timex>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Read timex from user space
     let mut txc: Timex = match get_user::<Uaccess, Timex>(txc_p) {
         Ok(t) => t,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Check if any modifications are requested
@@ -779,21 +770,21 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
         if txc.modes & ADJ_TICK != 0 {
             // Tick must be within 10% of nominal (10000 usec = 10ms for 100Hz)
             if txc.tick < 9000 || txc.tick > 11000 {
-                return EINVAL;
+                return KernelError::InvalidArgument.sysret();
             }
         }
 
         // Validate offset if ADJ_SETOFFSET is used
         if txc.modes & ADJ_SETOFFSET != 0 {
             if txc.time.tv_usec < 0 {
-                return EINVAL;
+                return KernelError::InvalidArgument.sysret();
             }
             if txc.modes & ADJ_NANO != 0 {
                 if txc.time.tv_usec >= 1_000_000_000 {
-                    return EINVAL;
+                    return KernelError::InvalidArgument.sysret();
                 }
             } else if txc.time.tv_usec >= 1_000_000 {
-                return EINVAL;
+                return KernelError::InvalidArgument.sysret();
             }
         }
     }
@@ -866,7 +857,7 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
 
     // Copy result back to user space
     if put_user::<Uaccess, Timex>(txc_p, txc).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Return clock state

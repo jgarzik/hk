@@ -21,29 +21,6 @@ use crate::storage::get_blkdev;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
-/// Error numbers (negated for return)
-pub const EPERM: i64 = -1;
-pub const ENOENT: i64 = -2;
-pub const EACCES: i64 = -13;
-pub const ENXIO: i64 = -6;
-pub const EBADF: i64 = -9;
-pub const EAGAIN: i64 = -11;
-pub const ENOMEM: i64 = -12;
-pub const EFAULT: i64 = -14;
-pub const ENOTDIR: i64 = -20;
-pub const EISDIR: i64 = -21;
-pub const EINVAL: i64 = -22;
-pub const EMFILE: i64 = -24;
-pub const ENOTTY: i64 = -25;
-pub const EFBIG: i64 = -27;
-pub const ESPIPE: i64 = -29;
-pub const EPIPE: i64 = -32;
-pub const ENOTEMPTY: i64 = -39;
-pub const ERANGE: i64 = -34;
-pub const ENODATA: i64 = -61;
-pub const EEXIST: i64 = -17;
-pub const EOPNOTSUPP: i64 = -95;
-
 // =============================================================================
 // RWF flags for preadv2/pwritev2
 // =============================================================================
@@ -138,7 +115,7 @@ fn check_fsize_limit(offset: u64, count: usize) -> Result<(), i64> {
         // Send SIGXFSZ before returning error (per POSIX/Linux requirement)
         let tid = current_tid();
         crate::signal::send_signal(tid, crate::signal::SIGXFSZ);
-        return Err(EFBIG);
+        return Err(KernelError::FileTooLarge.sysret());
     }
     Ok(())
 }
@@ -270,7 +247,7 @@ pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> i64 {
     // Read path from user space with proper validation
     let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Determine starting path for relative paths
@@ -284,10 +261,10 @@ pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> i64 {
         // Use directory from file descriptor
         let file = match current_fd_table().lock().get(dirfd) {
             Some(f) => f,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         };
         if !file.is_dir() {
-            return ENOTDIR;
+            return KernelError::NotDirectory.sysret();
         }
         // Create Path from the file's dentry
         Path::from_dentry(file.dentry.clone())
@@ -307,33 +284,35 @@ pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> i64 {
         Ok(d) => {
             // File exists - check for O_EXCL
             if flags & super::flags::O_CREAT != 0 && flags & super::flags::O_EXCL != 0 {
-                return EEXIST;
+                return KernelError::AlreadyExists.sysret();
             }
             d
         }
         Err(KernelError::NotFound) => {
             // File doesn't exist - try to create if O_CREAT is set
             if flags & super::flags::O_CREAT == 0 {
-                return ENOENT;
+                return KernelError::NotFound.sysret();
             }
             // Create the file
             match create_file_at(start, &path_str, mode) {
                 Ok(d) => d,
-                Err(KernelError::NotFound) => return ENOENT,
-                Err(KernelError::NotDirectory) => return ENOTDIR,
-                Err(KernelError::AlreadyExists) => return EEXIST,
-                Err(KernelError::PermissionDenied) => return EACCES,
-                Err(_) => return EINVAL,
+                Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+                Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+                Err(KernelError::AlreadyExists) => return KernelError::AlreadyExists.sysret(),
+                Err(KernelError::PermissionDenied) => {
+                    return KernelError::PermissionDenied.sysret();
+                }
+                Err(_) => return KernelError::InvalidArgument.sysret(),
             }
         }
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Check if trying to open directory without O_DIRECTORY when reading
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Handle O_TRUNC - truncate file to zero length
@@ -380,7 +359,7 @@ pub fn sys_chdir(path_ptr: u64) -> i64 {
     // Read path from user space
     let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Get current task's cwd as starting point for relative paths
@@ -389,18 +368,18 @@ pub fn sys_chdir(path_ptr: u64) -> i64 {
     // Look up the path (must be a directory)
     let dentry = match lookup_path_at(start, &path_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Verify it's a directory
     if let Some(inode) = dentry.get_inode() {
         if !inode.mode().is_dir() {
-            return ENOTDIR;
+            return KernelError::NotDirectory.sysret();
         }
     } else {
-        return ENOENT;
+        return KernelError::NotFound.sysret();
     }
 
     // Create new Path and update FsStruct
@@ -424,12 +403,12 @@ pub fn sys_fchdir(fd: i32) -> i64 {
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Must be a directory
     if !file.is_dir() {
-        return ENOTDIR;
+        return KernelError::NotDirectory.sysret();
     }
 
     // Create new Path and update FsStruct
@@ -462,13 +441,13 @@ pub fn sys_fchdir(fd: i32) -> i64 {
 pub fn sys_chroot(path_ptr: u64) -> i64 {
     // Check capability (must be root or have CAP_SYS_CHROOT)
     if !crate::task::capable(crate::task::CAP_SYS_CHROOT) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Copy path from user space
     let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Start from current working directory for relative paths
@@ -477,19 +456,19 @@ pub fn sys_chroot(path_ptr: u64) -> i64 {
     // Look up the path - must be a directory and we must follow symlinks
     let dentry = match lookup_path_at(start, &path_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(KernelError::PermissionDenied) => return EACCES,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(KernelError::PermissionDenied) => return KernelError::PermissionDenied.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Verify it's a directory (should be guaranteed by opendir() flags, but check anyway)
     if let Some(inode) = dentry.get_inode() {
         if !inode.mode().is_dir() {
-            return ENOTDIR;
+            return KernelError::NotDirectory.sysret();
         }
     } else {
-        return ENOENT;
+        return KernelError::NotFound.sysret();
     }
 
     // Update the root directory
@@ -498,7 +477,7 @@ pub fn sys_chroot(path_ptr: u64) -> i64 {
     {
         fs.set_root(new_root);
     } else {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     0
@@ -522,7 +501,7 @@ pub fn sys_getcwd(buf: u64, size: u64) -> i64 {
     // Get current task's filesystem context
     let fs = match crate::task::percpu::current_fs() {
         Some(fs) => fs,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Get pwd and build path string
@@ -534,12 +513,12 @@ pub fn sys_getcwd(buf: u64, size: u64) -> i64 {
 
     // Check buffer size
     if size < path_len as u64 {
-        return ERANGE;
+        return KernelError::Range.sysret();
     }
 
     // Validate user buffer address
     if !Uaccess::access_ok(buf, path_len) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Copy path to user buffer (with null terminator)
@@ -547,7 +526,7 @@ pub fn sys_getcwd(buf: u64, size: u64) -> i64 {
     path_bytes.push(0); // null terminator
 
     if copy_to_user::<Uaccess>(buf, &path_bytes).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     path_len as i64
@@ -565,7 +544,7 @@ pub fn sys_read(fd: i32, buf_ptr: u64, count: u64) -> i64 {
 
     // Validate user buffer address
     if !Uaccess::access_ok(buf_ptr, count) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Handle special fds (stdin)
@@ -577,12 +556,12 @@ pub fn sys_read(fd: i32, buf_ptr: u64, count: u64) -> i64 {
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Check if trying to read a directory
     if file.is_dir() {
-        return EISDIR;
+        return KernelError::IsDirectory.sysret();
     }
 
     // Use stack buffer for small reads to avoid heap allocation
@@ -593,15 +572,15 @@ pub fn sys_read(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         // Perform read into stack buffer
         let bytes_read = match file.read(read_buf) {
             Ok(n) => n,
-            Err(KernelError::IsDirectory) => return EISDIR,
-            Err(KernelError::PermissionDenied) => return EBADF,
-            Err(KernelError::WouldBlock) => return EAGAIN,
-            Err(_) => return EINVAL,
+            Err(KernelError::IsDirectory) => return KernelError::IsDirectory.sysret(),
+            Err(KernelError::PermissionDenied) => return KernelError::BadFd.sysret(),
+            Err(KernelError::WouldBlock) => return KernelError::WouldBlock.sysret(),
+            Err(_) => return KernelError::InvalidArgument.sysret(),
         };
 
         // Copy from kernel buffer to user space
         if bytes_read > 0 && copy_to_user::<Uaccess>(buf_ptr, &read_buf[..bytes_read]).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
 
         bytes_read as i64
@@ -612,15 +591,15 @@ pub fn sys_read(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         // Perform read into kernel buffer
         let bytes_read = match file.read(&mut kernel_buf) {
             Ok(n) => n,
-            Err(KernelError::IsDirectory) => return EISDIR,
-            Err(KernelError::PermissionDenied) => return EBADF,
-            Err(KernelError::WouldBlock) => return EAGAIN,
-            Err(_) => return EINVAL,
+            Err(KernelError::IsDirectory) => return KernelError::IsDirectory.sysret(),
+            Err(KernelError::PermissionDenied) => return KernelError::BadFd.sysret(),
+            Err(KernelError::WouldBlock) => return KernelError::WouldBlock.sysret(),
+            Err(_) => return KernelError::InvalidArgument.sysret(),
         };
 
         // Copy from kernel buffer to user space
         if bytes_read > 0 && copy_to_user::<Uaccess>(buf_ptr, &kernel_buf[..bytes_read]).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
 
         bytes_read as i64
@@ -636,7 +615,7 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
 
     // Validate user buffer address
     if !Uaccess::access_ok(buf_ptr, count) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Handle special fds (stdout, stderr) - no RLIMIT_FSIZE check needed
@@ -670,7 +649,7 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Check RLIMIT_FSIZE for regular files (files with inodes)
@@ -696,8 +675,8 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         // Perform write
         match file.write(write_buf) {
             Ok(n) => n as i64,
-            Err(KernelError::PermissionDenied) => EBADF,
-            Err(_) => EINVAL,
+            Err(KernelError::PermissionDenied) => KernelError::BadFd.sysret(),
+            Err(_) => KernelError::InvalidArgument.sysret(),
         }
     } else {
         // Allocate a kernel buffer for large writes
@@ -713,8 +692,8 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         // Perform write
         match file.write(&kernel_buf) {
             Ok(n) => n as i64,
-            Err(KernelError::PermissionDenied) => EBADF,
-            Err(_) => EINVAL,
+            Err(KernelError::PermissionDenied) => KernelError::BadFd.sysret(),
+            Err(_) => KernelError::InvalidArgument.sysret(),
         }
     }
 }
@@ -739,7 +718,7 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
 pub fn sys_pread64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
     // Check offset validity (Linux returns -EINVAL for negative offsets)
     if offset < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     let offset = offset as u64;
 
@@ -748,23 +727,23 @@ pub fn sys_pread64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
 
     // Validate user buffer address
     if !Uaccess::access_ok(buf_ptr, count) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Handle special fds (stdin) - not supported for pread
     if fd == 0 {
-        return ESPIPE; // stdin is not seekable
+        return KernelError::IllegalSeek.sysret(); // stdin is not seekable
     }
 
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Check if trying to read a directory
     if file.is_dir() {
-        return EISDIR;
+        return KernelError::IsDirectory.sysret();
     }
 
     // Use stack buffer for small reads to avoid heap allocation
@@ -775,15 +754,15 @@ pub fn sys_pread64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
         // Perform positioned read into stack buffer
         let bytes_read = match file.pread(read_buf, offset) {
             Ok(n) => n,
-            Err(KernelError::IsDirectory) => return EISDIR,
-            Err(KernelError::PermissionDenied) => return EBADF,
-            Err(KernelError::OperationNotSupported) => return ESPIPE, // Not seekable
-            Err(_) => return EINVAL,
+            Err(KernelError::IsDirectory) => return KernelError::IsDirectory.sysret(),
+            Err(KernelError::PermissionDenied) => return KernelError::BadFd.sysret(),
+            Err(KernelError::OperationNotSupported) => return KernelError::IllegalSeek.sysret(), // Not seekable
+            Err(_) => return KernelError::InvalidArgument.sysret(),
         };
 
         // Copy from kernel buffer to user space
         if bytes_read > 0 && copy_to_user::<Uaccess>(buf_ptr, &read_buf[..bytes_read]).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
 
         bytes_read as i64
@@ -794,15 +773,15 @@ pub fn sys_pread64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
         // Perform positioned read into kernel buffer
         let bytes_read = match file.pread(&mut kernel_buf, offset) {
             Ok(n) => n,
-            Err(KernelError::IsDirectory) => return EISDIR,
-            Err(KernelError::PermissionDenied) => return EBADF,
-            Err(KernelError::OperationNotSupported) => return ESPIPE, // Not seekable
-            Err(_) => return EINVAL,
+            Err(KernelError::IsDirectory) => return KernelError::IsDirectory.sysret(),
+            Err(KernelError::PermissionDenied) => return KernelError::BadFd.sysret(),
+            Err(KernelError::OperationNotSupported) => return KernelError::IllegalSeek.sysret(), // Not seekable
+            Err(_) => return KernelError::InvalidArgument.sysret(),
         };
 
         // Copy from kernel buffer to user space
         if bytes_read > 0 && copy_to_user::<Uaccess>(buf_ptr, &kernel_buf[..bytes_read]).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
 
         bytes_read as i64
@@ -825,7 +804,7 @@ pub fn sys_pread64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
 pub fn sys_pwrite64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
     // Check offset validity (Linux returns -EINVAL for negative offsets)
     if offset < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     let offset = offset as u64;
 
@@ -834,18 +813,18 @@ pub fn sys_pwrite64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
 
     // Validate user buffer address
     if !Uaccess::access_ok(buf_ptr, count) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Handle special fds (stdout, stderr) - not supported for pwrite
     if fd == 1 || fd == 2 {
-        return ESPIPE; // stdout/stderr are not seekable
+        return KernelError::IllegalSeek.sysret(); // stdout/stderr are not seekable
     }
 
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Check RLIMIT_FSIZE for regular files (pwrite uses explicit offset)
@@ -870,9 +849,9 @@ pub fn sys_pwrite64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
         // Perform positioned write
         match file.pwrite(write_buf, offset) {
             Ok(n) => n as i64,
-            Err(KernelError::PermissionDenied) => EBADF,
-            Err(KernelError::OperationNotSupported) => ESPIPE, // Not seekable
-            Err(_) => EINVAL,
+            Err(KernelError::PermissionDenied) => KernelError::BadFd.sysret(),
+            Err(KernelError::OperationNotSupported) => KernelError::IllegalSeek.sysret(), // Not seekable
+            Err(_) => KernelError::InvalidArgument.sysret(),
         }
     } else {
         // Allocate a kernel buffer for large writes
@@ -888,9 +867,9 @@ pub fn sys_pwrite64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
         // Perform positioned write
         match file.pwrite(&kernel_buf, offset) {
             Ok(n) => n as i64,
-            Err(KernelError::PermissionDenied) => EBADF,
-            Err(KernelError::OperationNotSupported) => ESPIPE, // Not seekable
-            Err(_) => EINVAL,
+            Err(KernelError::PermissionDenied) => KernelError::BadFd.sysret(),
+            Err(KernelError::OperationNotSupported) => KernelError::IllegalSeek.sysret(), // Not seekable
+            Err(_) => KernelError::InvalidArgument.sysret(),
         }
     }
 }
@@ -914,13 +893,13 @@ pub fn sys_pwrite64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
 fn validate_iovec_array(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoVec>, i64> {
     // Check iovcnt bounds
     if iovcnt < 0 {
-        return Err(EINVAL);
+        return Err(KernelError::InvalidArgument.sysret());
     }
     if iovcnt == 0 {
         return Ok(alloc::vec::Vec::new());
     }
     if iovcnt as usize > IOV_MAX {
-        return Err(EINVAL);
+        return Err(KernelError::InvalidArgument.sysret());
     }
 
     let iovcnt = iovcnt as usize;
@@ -929,7 +908,7 @@ fn validate_iovec_array(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoV
 
     // Validate iovec array pointer
     if !Uaccess::access_ok(iov_ptr, total_size) {
-        return Err(EFAULT);
+        return Err(KernelError::BadAddress.sysret());
     }
 
     // Copy iovec array from user space
@@ -951,7 +930,7 @@ fn validate_iovec_array(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoV
         }
         // Validate buffer address
         if !Uaccess::access_ok(iov.iov_base, iov.iov_len as usize) {
-            return Err(EFAULT);
+            return Err(KernelError::BadAddress.sysret());
         }
     }
 
@@ -989,12 +968,12 @@ pub fn sys_readv(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Check if trying to read a directory
     if file.is_dir() {
-        return EISDIR;
+        return KernelError::IsDirectory.sysret();
     }
 
     let mut total_read: usize = 0;
@@ -1024,21 +1003,21 @@ pub fn sys_readv(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EISDIR
+                        KernelError::IsDirectory.sysret()
                     };
                 }
                 Err(KernelError::PermissionDenied) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EBADF
+                        KernelError::BadFd.sysret()
                     };
                 }
                 Err(_) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EINVAL
+                        KernelError::InvalidArgument.sysret()
                     };
                 }
             };
@@ -1049,7 +1028,7 @@ pub fn sys_readv(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
                 return if total_read > 0 {
                     total_read as i64
                 } else {
-                    EFAULT
+                    KernelError::BadAddress.sysret()
                 };
             }
 
@@ -1068,21 +1047,21 @@ pub fn sys_readv(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EISDIR
+                        KernelError::IsDirectory.sysret()
                     };
                 }
                 Err(KernelError::PermissionDenied) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EBADF
+                        KernelError::BadFd.sysret()
                     };
                 }
                 Err(_) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EINVAL
+                        KernelError::InvalidArgument.sysret()
                     };
                 }
             };
@@ -1093,7 +1072,7 @@ pub fn sys_readv(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
                 return if total_read > 0 {
                     total_read as i64
                 } else {
-                    EFAULT
+                    KernelError::BadAddress.sysret()
                 };
             }
 
@@ -1129,7 +1108,7 @@ fn writev_console(iovecs: &[IoVec]) -> i64 {
             return if total_written > 0 {
                 total_written as i64
             } else {
-                EFAULT
+                KernelError::BadAddress.sysret()
             };
         }
 
@@ -1197,7 +1176,7 @@ pub fn sys_writev(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let mut total_written: usize = 0;
@@ -1238,14 +1217,14 @@ pub fn sys_writev(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EBADF
+                        KernelError::BadFd.sysret()
                     };
                 }
                 Err(_) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EINVAL
+                        KernelError::InvalidArgument.sysret()
                     };
                 }
             };
@@ -1275,14 +1254,14 @@ pub fn sys_writev(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EBADF
+                        KernelError::BadFd.sysret()
                     };
                 }
                 Err(_) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EINVAL
+                        KernelError::InvalidArgument.sysret()
                     };
                 }
             };
@@ -1315,7 +1294,7 @@ pub fn sys_writev(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
 pub fn sys_preadv(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
     // Validate offset
     if offset < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     let mut current_offset = offset as u64;
 
@@ -1332,18 +1311,18 @@ pub fn sys_preadv(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
 
     // Handle stdin - pipes don't support positioned I/O
     if fd == 0 {
-        return ESPIPE;
+        return KernelError::IllegalSeek.sysret();
     }
 
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Cannot preadv from directory
     if file.is_dir() {
-        return EISDIR;
+        return KernelError::IsDirectory.sysret();
     }
 
     let mut total_read: usize = 0;
@@ -1374,21 +1353,21 @@ pub fn sys_preadv(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        ESPIPE // non-seekable file
+                        KernelError::IllegalSeek.sysret() // non-seekable file
                     };
                 }
                 Err(KernelError::PermissionDenied) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EBADF
+                        KernelError::BadFd.sysret()
                     };
                 }
                 Err(_) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EINVAL
+                        KernelError::InvalidArgument.sysret()
                     };
                 }
             };
@@ -1421,21 +1400,21 @@ pub fn sys_preadv(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        ESPIPE
+                        KernelError::IllegalSeek.sysret()
                     };
                 }
                 Err(KernelError::PermissionDenied) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EBADF
+                        KernelError::BadFd.sysret()
                     };
                 }
                 Err(_) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EINVAL
+                        KernelError::InvalidArgument.sysret()
                     };
                 }
             };
@@ -1480,7 +1459,7 @@ pub fn sys_preadv(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
 pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
     // Validate offset
     if offset < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     let mut current_offset = offset as u64;
 
@@ -1497,18 +1476,18 @@ pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
 
     // Handle stdout/stderr - these don't support positioned I/O
     if fd == 1 || fd == 2 {
-        return ESPIPE;
+        return KernelError::IllegalSeek.sysret();
     }
 
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Cannot pwritev to directory
     if file.is_dir() {
-        return EISDIR;
+        return KernelError::IsDirectory.sysret();
     }
 
     let mut total_written: usize = 0;
@@ -1550,21 +1529,21 @@ pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        ESPIPE // non-seekable file
+                        KernelError::IllegalSeek.sysret() // non-seekable file
                     };
                 }
                 Err(KernelError::PermissionDenied) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EBADF
+                        KernelError::BadFd.sysret()
                     };
                 }
                 Err(_) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EINVAL
+                        KernelError::InvalidArgument.sysret()
                     };
                 }
             };
@@ -1596,21 +1575,21 @@ pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        ESPIPE
+                        KernelError::IllegalSeek.sysret()
                     };
                 }
                 Err(KernelError::PermissionDenied) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EBADF
+                        KernelError::BadFd.sysret()
                     };
                 }
                 Err(_) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EINVAL
+                        KernelError::InvalidArgument.sysret()
                     };
                 }
             };
@@ -1644,12 +1623,12 @@ pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
 pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) -> i64 {
     // Validate flags - unknown flags return EOPNOTSUPP
     if flags & !RWF_SUPPORTED != 0 {
-        return EOPNOTSUPP;
+        return KernelError::OperationNotSupported.sysret();
     }
 
     // Unsupported flags - return EOPNOTSUPP
     if flags & (RWF_ATOMIC | RWF_DONTCACHE) != 0 {
-        return EOPNOTSUPP;
+        return KernelError::OperationNotSupported.sysret();
     }
 
     // If RWF_NOWAIT not set, delegate to existing syscalls
@@ -1676,11 +1655,11 @@ pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) 
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     if file.is_dir() {
-        return EISDIR;
+        return KernelError::IsDirectory.sysret();
     }
 
     // For offset == -1, use current file position
@@ -1721,28 +1700,28 @@ pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) 
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EAGAIN
+                        KernelError::WouldBlock.sysret()
                     };
                 }
                 Err(KernelError::OperationNotSupported) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EOPNOTSUPP
+                        KernelError::OperationNotSupported.sysret()
                     };
                 }
                 Err(KernelError::PermissionDenied) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EBADF
+                        KernelError::BadFd.sysret()
                     };
                 }
                 Err(_) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EINVAL
+                        KernelError::InvalidArgument.sysret()
                     };
                 }
             };
@@ -1753,7 +1732,7 @@ pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) 
                 return if total_read > 0 {
                     total_read as i64
                 } else {
-                    EFAULT
+                    KernelError::BadAddress.sysret()
                 };
             }
 
@@ -1778,28 +1757,28 @@ pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) 
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EAGAIN
+                        KernelError::WouldBlock.sysret()
                     };
                 }
                 Err(KernelError::OperationNotSupported) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EOPNOTSUPP
+                        KernelError::OperationNotSupported.sysret()
                     };
                 }
                 Err(KernelError::PermissionDenied) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EBADF
+                        KernelError::BadFd.sysret()
                     };
                 }
                 Err(_) => {
                     return if total_read > 0 {
                         total_read as i64
                     } else {
-                        EINVAL
+                        KernelError::InvalidArgument.sysret()
                     };
                 }
             };
@@ -1810,7 +1789,7 @@ pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) 
                 return if total_read > 0 {
                     total_read as i64
                 } else {
-                    EFAULT
+                    KernelError::BadAddress.sysret()
                 };
             }
 
@@ -1848,12 +1827,12 @@ pub fn sys_preadv2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) 
 pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32) -> i64 {
     // Validate flags - unknown flags return EOPNOTSUPP
     if flags & !RWF_SUPPORTED != 0 {
-        return EOPNOTSUPP;
+        return KernelError::OperationNotSupported.sysret();
     }
 
     // Unsupported flags - return EOPNOTSUPP
     if flags & (RWF_ATOMIC | RWF_DONTCACHE) != 0 {
-        return EOPNOTSUPP;
+        return KernelError::OperationNotSupported.sysret();
     }
 
     // If RWF_NOWAIT not set, delegate to existing syscalls
@@ -1870,7 +1849,7 @@ pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32)
         let actual_offset = if flags & RWF_APPEND != 0 {
             let file = match current_fd_table().lock().get(fd) {
                 Some(f) => f,
-                None => return EBADF,
+                None => return KernelError::BadFd.sysret(),
             };
             file.get_inode().map(|i| i.get_size() as i64).unwrap_or(0)
         } else {
@@ -1900,11 +1879,11 @@ pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32)
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     if file.is_dir() {
-        return EISDIR;
+        return KernelError::IsDirectory.sysret();
     }
 
     // For offset == -1, use current file position
@@ -1960,35 +1939,35 @@ pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32)
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EAGAIN
+                        KernelError::WouldBlock.sysret()
                     };
                 }
                 Err(KernelError::OperationNotSupported) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EOPNOTSUPP
+                        KernelError::OperationNotSupported.sysret()
                     };
                 }
                 Err(KernelError::PermissionDenied) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EBADF
+                        KernelError::BadFd.sysret()
                     };
                 }
                 Err(KernelError::BrokenPipe) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EPIPE
+                        KernelError::BrokenPipe.sysret()
                     };
                 }
                 Err(_) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EINVAL
+                        KernelError::InvalidArgument.sysret()
                     };
                 }
             };
@@ -2025,35 +2004,35 @@ pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32)
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EAGAIN
+                        KernelError::WouldBlock.sysret()
                     };
                 }
                 Err(KernelError::OperationNotSupported) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EOPNOTSUPP
+                        KernelError::OperationNotSupported.sysret()
                     };
                 }
                 Err(KernelError::PermissionDenied) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EBADF
+                        KernelError::BadFd.sysret()
                     };
                 }
                 Err(KernelError::BrokenPipe) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EPIPE
+                        KernelError::BrokenPipe.sysret()
                     };
                 }
                 Err(_) => {
                     return if total_written > 0 {
                         total_written as i64
                     } else {
-                        EINVAL
+                        KernelError::InvalidArgument.sysret()
                     };
                 }
             };
@@ -2091,7 +2070,7 @@ pub fn sys_close(fd: i32) -> i64 {
 
     match current_fd_table().lock().close(fd) {
         Some(_) => 0,
-        None => EBADF,
+        None => KernelError::BadFd.sysret(),
     }
 }
 
@@ -2113,15 +2092,15 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Perform the seek
     match file.lseek(offset, whence) {
         Ok(new_pos) => new_pos as i64,
-        Err(KernelError::InvalidArgument) => EINVAL,
+        Err(KernelError::InvalidArgument) => KernelError::InvalidArgument.sysret(),
         Err(KernelError::OperationNotSupported) => -29, // ESPIPE - illegal seek (e.g., on pipe)
-        Err(_) => EINVAL,
+        Err(_) => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -2134,18 +2113,18 @@ fn do_truncate(inode: &alloc::sync::Arc<super::Inode>, length: u64) -> i64 {
         if limit != crate::rlimit::RLIM_INFINITY && length > limit {
             let tid = current_tid();
             crate::signal::send_signal(tid, crate::signal::SIGXFSZ);
-            return EFBIG;
+            return KernelError::FileTooLarge.sysret();
         }
     }
 
     // Perform truncate
     match inode.i_op.truncate(inode, length) {
         Ok(()) => 0,
-        Err(KernelError::IsDirectory) => EISDIR,
-        Err(KernelError::OperationNotSupported) => EINVAL,
-        Err(KernelError::PermissionDenied) => EACCES,
-        Err(KernelError::FileTooLarge) => EFBIG,
-        Err(_) => EINVAL,
+        Err(KernelError::IsDirectory) => KernelError::IsDirectory.sysret(),
+        Err(KernelError::OperationNotSupported) => KernelError::InvalidArgument.sysret(),
+        Err(KernelError::PermissionDenied) => KernelError::PermissionDenied.sysret(),
+        Err(KernelError::FileTooLarge) => KernelError::FileTooLarge.sysret(),
+        Err(_) => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -2163,24 +2142,24 @@ fn do_truncate(inode: &alloc::sync::Arc<super::Inode>, length: u64) -> i64 {
 /// 0 on success, negative errno on error
 pub fn sys_ftruncate(fd: i32, length: i64) -> i64 {
     if length < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Check file is writable
     if !file.is_writable() {
-        return EINVAL; // EBADF or EINVAL depending on interpretation
+        return KernelError::InvalidArgument.sysret(); // EBADF or EINVAL depending on interpretation
     }
 
     // Get the inode
     let inode = match file.get_inode() {
         Some(i) => i,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     do_truncate(&inode, length as u64)
@@ -2196,31 +2175,31 @@ pub fn sys_ftruncate(fd: i32, length: i64) -> i64 {
 /// 0 on success, negative errno on error
 pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
     if length < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Read path from user space
     let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     if path.is_empty() {
-        return ENOENT;
+        return KernelError::NotFound.sysret();
     }
 
     // Look up the file (follow symlinks for truncate)
     let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Get the inode
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     do_truncate(&inode, length as u64)
@@ -2241,7 +2220,7 @@ pub fn sys_dup(oldfd: i32) -> i64 {
     let mut table = fd_table.lock();
     let file = match table.get(oldfd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Allocate fd (RLIMIT_NOFILE enforced inside alloc)
@@ -2264,7 +2243,7 @@ pub fn sys_dup(oldfd: i32) -> i64 {
 /// newfd on success, negative errno on error.
 pub fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
     if newfd < 0 {
-        return EBADF;
+        return KernelError::BadFd.sysret();
     }
 
     // If oldfd == newfd, just verify oldfd is valid
@@ -2274,7 +2253,7 @@ pub fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
         return if table.is_valid(oldfd) {
             newfd as i64
         } else {
-            EBADF
+            KernelError::BadFd.sysret()
         };
     }
 
@@ -2282,7 +2261,7 @@ pub fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
     let mut table = fd_table.lock();
     let file = match table.get(oldfd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Close newfd if open (silently ignore errors)
@@ -2310,22 +2289,22 @@ pub fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
 pub fn sys_dup3(oldfd: i32, newfd: i32, flags: u32) -> i64 {
     // dup3 requires oldfd != newfd (unlike dup2)
     if oldfd == newfd {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     if newfd < 0 {
-        return EBADF;
+        return KernelError::BadFd.sysret();
     }
 
     // Only O_CLOEXEC is valid for dup3
     if flags & !super::file::flags::O_CLOEXEC != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let fd_table = current_fd_table();
     let mut table = fd_table.lock();
     let file = match table.get(oldfd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Close newfd if open
@@ -2373,17 +2352,17 @@ pub fn sys_getdents64(fd: i32, dirp: u64, count: u64) -> i64 {
 
     // Validate user buffer address
     if !Uaccess::access_ok(dirp, count) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     if !file.is_dir() {
-        return ENOTDIR;
+        return KernelError::NotDirectory.sysret();
     }
 
     // Use stack buffer for small directory listings
@@ -2447,12 +2426,12 @@ pub fn sys_getdents64(fd: i32, dirp: u64, count: u64) -> i64 {
         Ok(()) => {
             // Copy from kernel buffer to user space
             if offset > 0 && copy_to_user::<Uaccess>(dirp, &kernel_buf[..offset]).is_err() {
-                return EFAULT;
+                return KernelError::BadAddress.sysret();
             }
             offset as i64
         }
-        Err(KernelError::NotDirectory) => ENOTDIR,
-        Err(_) => EINVAL,
+        Err(KernelError::NotDirectory) => KernelError::NotDirectory.sysret(),
+        Err(_) => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -2525,26 +2504,26 @@ pub fn sys_stat(path_ptr: u64, statbuf: u64) -> i64 {
     // Read path from user space with proper validation
     let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate stat buffer address
     if !Uaccess::access_ok(statbuf, core::mem::size_of::<Stat>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Look up the path (follow symlinks)
     let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Get the inode
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Fill the stat structure
@@ -2552,7 +2531,7 @@ pub fn sys_stat(path_ptr: u64, statbuf: u64) -> i64 {
 
     // Copy to user space using put_user for the entire structure
     if put_user::<Uaccess, Stat>(statbuf, stat).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -2564,19 +2543,19 @@ pub fn sys_stat(path_ptr: u64, statbuf: u64) -> i64 {
 pub fn sys_fstat(fd: i32, statbuf: u64) -> i64 {
     // Validate stat buffer address
     if !Uaccess::access_ok(statbuf, core::mem::size_of::<Stat>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get the inode
     let inode = match file.get_inode() {
         Some(i) => i,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Fill the stat structure
@@ -2584,7 +2563,7 @@ pub fn sys_fstat(fd: i32, statbuf: u64) -> i64 {
 
     // Copy to user space using put_user for the entire structure
     if put_user::<Uaccess, Stat>(statbuf, stat).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -2609,24 +2588,24 @@ pub fn sys_fstatat(dirfd: i32, path_ptr: u64, statbuf: u64, flags: i32) -> i64 {
     const AT_EMPTY_PATH_FLAG: i32 = 0x1000;
     let valid_flags = AT_SYMLINK_NOFOLLOW_FLAG | AT_EMPTY_PATH_FLAG;
     if flags & !valid_flags != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate stat buffer address
     if !Uaccess::access_ok(statbuf, core::mem::size_of::<Stat>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Read path from user space
     let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Handle AT_EMPTY_PATH - stat the dirfd itself
     if (flags & AT_EMPTY_PATH_FLAG) != 0 && path_str.is_empty() {
         if dirfd == AT_FDCWD {
-            return EINVAL;
+            return KernelError::InvalidArgument.sysret();
         }
         // Stat the directory fd itself
         return sys_fstat(dirfd, statbuf);
@@ -2643,10 +2622,10 @@ pub fn sys_fstatat(dirfd: i32, path_ptr: u64, statbuf: u64, flags: i32) -> i64 {
         // Use directory from file descriptor
         let file = match current_fd_table().lock().get(dirfd) {
             Some(f) => f,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         };
         if !file.is_dir() {
-            return ENOTDIR;
+            return KernelError::NotDirectory.sysret();
         }
         // Create Path from the file's dentry
         Path::from_dentry(file.dentry.clone())
@@ -2665,16 +2644,16 @@ pub fn sys_fstatat(dirfd: i32, path_ptr: u64, statbuf: u64, flags: i32) -> i64 {
     // Look up the path
     let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
         Err(KernelError::TooManySymlinks) => return ELOOP,
-        Err(_) => return EINVAL,
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Get the inode
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Fill the stat structure
@@ -2682,7 +2661,7 @@ pub fn sys_fstatat(dirfd: i32, path_ptr: u64, statbuf: u64, flags: i32) -> i64 {
 
     // Copy to user space
     if put_user::<Uaccess, Stat>(statbuf, stat).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -2725,28 +2704,28 @@ const AT_EMPTY_PATH: i32 = 0x1000;
 fn do_faccessat(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
     // Validate mode - only F_OK, R_OK, W_OK, X_OK are allowed
     if mode & !(F_OK | R_OK | W_OK | X_OK) != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate flags
     let valid_flags = AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
     if flags & !valid_flags != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Read path from user space
     let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Handle AT_EMPTY_PATH
     if path_str.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
-            return ENOENT;
+            return KernelError::NotFound.sysret();
         }
         // AT_EMPTY_PATH: stat the fd itself (needs fd table lookup and file stat)
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Determine starting path for relative paths
@@ -2760,10 +2739,10 @@ fn do_faccessat(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
         // Use directory from file descriptor
         let file = match current_fd_table().lock().get(dirfd) {
             Some(f) => f,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         };
         if !file.is_dir() {
-            return ENOTDIR;
+            return KernelError::NotDirectory.sysret();
         }
         // Create Path from the file's dentry
         Path::from_dentry(file.dentry.clone())
@@ -2778,10 +2757,10 @@ fn do_faccessat(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
     // Look up the path
     let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(KernelError::PermissionDenied) => return EACCES,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(KernelError::PermissionDenied) => return KernelError::PermissionDenied.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // F_OK just checks existence - path lookup succeeded
@@ -2792,7 +2771,7 @@ fn do_faccessat(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
     // Get inode for permission check
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Get credentials - use effective if AT_EACCESS, else real
@@ -2818,7 +2797,7 @@ fn do_faccessat(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
     // Check permissions
     match super::inode_permission(&inode, uid, gid, mask) {
         Ok(()) => 0,
-        Err(_) => EACCES,
+        Err(_) => KernelError::PermissionDenied.sysret(),
     }
 }
 
@@ -2893,12 +2872,12 @@ pub fn sys_lstat(path_ptr: u64, statbuf: u64) -> i64 {
     // Read path from user space with proper validation
     let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate stat buffer address
     if !Uaccess::access_ok(statbuf, core::mem::size_of::<Stat>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Look up the path without following symlinks
@@ -2907,16 +2886,16 @@ pub fn sys_lstat(path_ptr: u64, statbuf: u64) -> i64 {
 
     let dentry = match lookup_path_flags(&path, flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
         Err(KernelError::TooManySymlinks) => return ELOOP,
-        Err(_) => return EINVAL,
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Get the inode
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Fill the stat structure
@@ -2924,7 +2903,7 @@ pub fn sys_lstat(path_ptr: u64, statbuf: u64) -> i64 {
 
     // Copy to user space using put_user for the entire structure
     if put_user::<Uaccess, Stat>(statbuf, stat).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -2957,17 +2936,17 @@ pub fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> i64 {
     // Read target from user space
     let target = match strncpy_from_user::<Uaccess>(target_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Read linkpath from user space
     let linkpath = match strncpy_from_user::<Uaccess>(linkpath_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     if target.is_empty() || linkpath.is_empty() {
-        return ENOENT;
+        return KernelError::NotFound.sysret();
     }
 
     // Look up parent directory of the new symlink
@@ -2979,7 +2958,7 @@ pub fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> i64 {
     // Get parent inode
     let parent_inode = match parent_dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Lock parent directory (Linux i_rwsem pattern)
@@ -2988,7 +2967,7 @@ pub fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> i64 {
     // Check if name already exists (with lock held)
     if parent_dentry.lookup_child(&name).is_some() {
         unsafe { parent_inode.inode_unlock() };
-        return EEXIST;
+        return KernelError::AlreadyExists.sysret();
     }
 
     // Create the symlink
@@ -2997,10 +2976,10 @@ pub fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> i64 {
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             return match e {
-                KernelError::AlreadyExists => EEXIST,
-                KernelError::PermissionDenied => EACCES,
-                KernelError::OperationNotSupported => EPERM,
-                _ => EINVAL,
+                KernelError::AlreadyExists => KernelError::AlreadyExists.sysret(),
+                KernelError::PermissionDenied => KernelError::PermissionDenied.sysret(),
+                KernelError::OperationNotSupported => KernelError::NotPermitted.sysret(),
+                _ => KernelError::InvalidArgument.sysret(),
             };
         }
     };
@@ -3049,17 +3028,17 @@ pub fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i
     // Read path from user space
     let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     let bufsiz = bufsiz as usize;
     if bufsiz == 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate user buffer address
     if !Uaccess::access_ok(buf_ptr, bufsiz) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Determine starting path for relative paths
@@ -3070,10 +3049,10 @@ pub fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i
     } else {
         let file = match current_fd_table().lock().get(dirfd) {
             Some(f) => f,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         };
         if !file.is_dir() {
-            return ENOTDIR;
+            return KernelError::NotDirectory.sysret();
         }
         Path::from_dentry(file.dentry.clone())
     };
@@ -3084,34 +3063,34 @@ pub fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i
 
     let dentry = match lookup_path_at(start, &path, flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
         Err(KernelError::TooManySymlinks) => return ELOOP,
-        Err(_) => return EINVAL,
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Get inode
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Must be a symlink
     if !inode.mode().is_symlink() {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Read the symlink target
     let target = match inode.i_op.readlink(&inode) {
         Ok(t) => t,
-        Err(KernelError::OperationNotSupported) => return EINVAL,
-        Err(_) => return EINVAL,
+        Err(KernelError::OperationNotSupported) => return KernelError::InvalidArgument.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Copy to user buffer (without null terminator)
     let copy_len = core::cmp::min(target.len(), bufsiz);
     if copy_to_user::<Uaccess>(buf_ptr, &target.as_bytes()[..copy_len]).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     copy_len as i64
@@ -3152,17 +3131,17 @@ pub fn sys_linkat(
     // Read oldpath from user space
     let oldpath = match strncpy_from_user::<Uaccess>(oldpath_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Read newpath from user space
     let newpath = match strncpy_from_user::<Uaccess>(newpath_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     if oldpath.is_empty() || newpath.is_empty() {
-        return ENOENT;
+        return KernelError::NotFound.sysret();
     }
 
     // AT_SYMLINK_FOLLOW (0x400) means follow symlinks in oldpath
@@ -3176,10 +3155,10 @@ pub fn sys_linkat(
     } else {
         let file = match current_fd_table().lock().get(olddirfd) {
             Some(f) => f,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         };
         if !file.is_dir() {
-            return ENOTDIR;
+            return KernelError::NotDirectory.sysret();
         }
         Path::from_dentry(file.dentry.clone())
     };
@@ -3189,20 +3168,20 @@ pub fn sys_linkat(
 
     let old_dentry = match lookup_path_at(old_start, &oldpath, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
         Err(KernelError::TooManySymlinks) => return ELOOP,
-        Err(_) => return EINVAL,
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     let old_inode = match old_dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Cannot hard link directories
     if old_inode.mode().is_dir() {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Look up parent directory of the new link
@@ -3221,7 +3200,7 @@ pub fn sys_linkat(
     // Get parent inode
     let parent_inode = match parent_dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Lock parent directory (Linux i_rwsem pattern)
@@ -3230,7 +3209,7 @@ pub fn sys_linkat(
     // Check if name already exists (with lock held)
     if parent_dentry.lookup_child(&name).is_some() {
         unsafe { parent_inode.inode_unlock() };
-        return EEXIST;
+        return KernelError::AlreadyExists.sysret();
     }
 
     // Create the hard link
@@ -3252,10 +3231,10 @@ pub fn sys_linkat(
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             match e {
-                KernelError::AlreadyExists => EEXIST,
-                KernelError::PermissionDenied => EACCES,
-                KernelError::OperationNotSupported => EPERM,
-                _ => EINVAL,
+                KernelError::AlreadyExists => KernelError::AlreadyExists.sysret(),
+                KernelError::PermissionDenied => KernelError::PermissionDenied.sysret(),
+                KernelError::OperationNotSupported => KernelError::NotPermitted.sysret(),
+                _ => KernelError::InvalidArgument.sysret(),
             }
         }
     }
@@ -3312,17 +3291,17 @@ pub fn sys_renameat2(
     // Read oldpath from user space
     let oldpath = match strncpy_from_user::<Uaccess>(oldpath_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Read newpath from user space
     let newpath = match strncpy_from_user::<Uaccess>(newpath_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     if oldpath.is_empty() || newpath.is_empty() {
-        return ENOENT;
+        return KernelError::NotFound.sysret();
     }
 
     // Extract final components for validation
@@ -3331,11 +3310,11 @@ pub fn sys_renameat2(
 
     // Cannot rename "." or ".." - these are special directory entries
     if old_basename == "." || old_basename == ".." {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     // Cannot rename TO "." or ".." either
     if new_basename == "." || new_basename == ".." {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Look up parent of oldpath and get the filename
@@ -3360,12 +3339,12 @@ pub fn sys_renameat2(
     // Get parent inodes
     let old_parent_inode = match old_parent_dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     let new_parent_inode = match new_parent_dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Lock directories for rename (Linux lock_rename pattern)
@@ -3401,7 +3380,7 @@ pub fn sys_renameat2(
         && is_subdir(&new_parent_dentry, src_dentry)
     {
         unlock_rename(&old_parent_dentry, &new_parent_dentry);
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Perform the rename via inode ops
@@ -3419,12 +3398,12 @@ pub fn sys_renameat2(
     // Handle result
     match result {
         Ok(()) => {}
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::AlreadyExists) => return EEXIST,
-        Err(KernelError::DirectoryNotEmpty) => return ENOTEMPTY,
-        Err(KernelError::OperationNotSupported) => return EINVAL,
-        Err(KernelError::InvalidArgument) => return EINVAL,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::AlreadyExists) => return KernelError::AlreadyExists.sysret(),
+        Err(KernelError::DirectoryNotEmpty) => return KernelError::DirectoryNotEmpty.sysret(),
+        Err(KernelError::OperationNotSupported) => return KernelError::InvalidArgument.sysret(),
+        Err(KernelError::InvalidArgument) => return KernelError::InvalidArgument.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     }
 
     // Update dentry cache:
@@ -3475,13 +3454,13 @@ pub fn sys_mount(
     // Read filesystem type from user space
     let fstype = match strncpy_from_user::<Uaccess>(fstype_ptr, PATH_MAX) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Read target path from user space
     let target = match strncpy_from_user::<Uaccess>(target_ptr, PATH_MAX) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Look up the filesystem type
@@ -3493,18 +3472,18 @@ pub fn sys_mount(
     // Look up the mount point (must be a directory)
     let mountpoint_dentry = match lookup_path_flags(&target, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Verify it's a directory
     if let Some(inode) = mountpoint_dentry.get_inode() {
         if !inode.mode().is_dir() {
-            return ENOTDIR;
+            return KernelError::NotDirectory.sysret();
         }
     } else {
-        return ENOENT;
+        return KernelError::NotFound.sysret();
     }
 
     // Choose mount method based on filesystem type
@@ -3515,7 +3494,7 @@ pub fn sys_mount(
             Err(KernelError::NotBlockDevice) => ENOTBLK,
             Err(KernelError::NoDevice) => ENODEV,
             Err(KernelError::Busy) => EBUSY,
-            Err(_) => EINVAL,
+            Err(_) => KernelError::InvalidArgument.sysret(),
         }
     } else {
         // Pseudo-filesystem (ramfs, procfs, etc.)
@@ -3523,7 +3502,7 @@ pub fn sys_mount(
             Ok(_mount) => 0,
             Err(KernelError::Busy) => EBUSY,
             Err(KernelError::NoDevice) => ENODEV,
-            Err(_) => EINVAL,
+            Err(_) => KernelError::InvalidArgument.sysret(),
         }
     }
 }
@@ -3540,7 +3519,7 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
     // Read target path from user space
     let target = match strncpy_from_user::<Uaccess>(target_ptr, PATH_MAX) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Set up lookup flags - respect UMOUNT_NOFOLLOW
@@ -3552,23 +3531,23 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
     // Look up the target path
     let target_dentry = match lookup_path_flags(&target, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Find the mount at this path
     let mount = match super::mount::current_mnt_ns().find_mount_at(&target_dentry) {
         Some(m) => m,
-        None => return EINVAL, // Not a mount point
+        None => return KernelError::InvalidArgument.sysret(), // Not a mount point
     };
 
     // Perform the unmount
     match super::mount::do_umount(mount, flags) {
         Ok(()) => 0,
         Err(KernelError::Busy) => EBUSY,
-        Err(KernelError::InvalidArgument) => EINVAL, // Can't unmount root
-        Err(_) => EINVAL,
+        Err(KernelError::InvalidArgument) => KernelError::InvalidArgument.sysret(), // Can't unmount root
+        Err(_) => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -3592,51 +3571,51 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
 pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     // 1. Permission check: requires CAP_SYS_ADMIN
     if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // 2. Copy paths from user space
     let new_root_str = match strncpy_from_user::<Uaccess>(new_root_ptr, PATH_MAX) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
     let put_old_str = match strncpy_from_user::<Uaccess>(put_old_ptr, PATH_MAX) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // 3. Look up new_root path (must be directory)
     let new_root_dentry = match lookup_path_flags(&new_root_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // 4. Verify new_root is a mount point
     let mnt_ns = super::mount::current_mnt_ns();
     let new_mnt = match mnt_ns.find_mount_at(&new_root_dentry) {
         Some(m) => m,
-        None => return EINVAL, // Not a mount point
+        None => return KernelError::InvalidArgument.sysret(), // Not a mount point
     };
 
     // 5. Look up put_old path (must be directory)
     let put_old_dentry = match lookup_path_flags(&put_old_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // 6. Verify put_old is at or under new_root
     if !is_subdir(&put_old_dentry, &new_root_dentry) {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // 7. Get old root mount - must exist
     let _old_root_mnt = match mnt_ns.get_root() {
         Some(m) => m,
-        None => return EINVAL,
+        None => return KernelError::InvalidArgument.sysret(),
     };
 
     // 8. Verify new_root is not the same as current root
@@ -3671,7 +3650,7 @@ fn lookup_parent_at(
     // Find the last path component
     let path = path.trim_end_matches('/');
     if path.is_empty() {
-        return Err(EINVAL);
+        return Err(KernelError::InvalidArgument.sysret());
     }
 
     let (parent_path, name) = match path.rfind('/') {
@@ -3687,7 +3666,7 @@ fn lookup_parent_at(
     };
 
     if name.is_empty() {
-        return Err(EINVAL);
+        return Err(KernelError::InvalidArgument.sysret());
     }
 
     // Determine starting path
@@ -3698,10 +3677,10 @@ fn lookup_parent_at(
     } else {
         let file = match current_fd_table().lock().get(dirfd) {
             Some(f) => f,
-            None => return Err(EBADF),
+            None => return Err(KernelError::BadFd.sysret()),
         };
         if !file.is_dir() {
-            return Err(ENOTDIR);
+            return Err(KernelError::NotDirectory.sysret());
         }
         Path::from_dentry(file.dentry.clone())
     };
@@ -3709,10 +3688,10 @@ fn lookup_parent_at(
     // Look up parent directory
     let parent_dentry = match lookup_path_at(start, parent_path, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return Err(ENOENT),
-        Err(KernelError::NotDirectory) => return Err(ENOTDIR),
+        Err(KernelError::NotFound) => return Err(KernelError::NotFound.sysret()),
+        Err(KernelError::NotDirectory) => return Err(KernelError::NotDirectory.sysret()),
         Err(KernelError::TooManySymlinks) => return Err(ELOOP),
-        Err(_) => return Err(EINVAL),
+        Err(_) => return Err(KernelError::InvalidArgument.sysret()),
     };
 
     Ok((parent_dentry, alloc::string::String::from(name)))
@@ -3747,11 +3726,11 @@ pub fn sys_mkdirat(dirfd: i32, pathname_ptr: u64, mode: u32) -> i64 {
     // Read path from user space
     let path = match strncpy_from_user::<Uaccess>(pathname_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     if path.is_empty() {
-        return ENOENT;
+        return KernelError::NotFound.sysret();
     }
 
     // Look up parent directory
@@ -3763,7 +3742,7 @@ pub fn sys_mkdirat(dirfd: i32, pathname_ptr: u64, mode: u32) -> i64 {
     // Get parent inode
     let parent_inode = match parent_dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Lock parent directory (Linux i_rwsem pattern)
@@ -3772,7 +3751,7 @@ pub fn sys_mkdirat(dirfd: i32, pathname_ptr: u64, mode: u32) -> i64 {
     // Check if name already exists (with lock held)
     if parent_dentry.lookup_child(&name).is_some() {
         unsafe { parent_inode.inode_unlock() };
-        return EEXIST;
+        return KernelError::AlreadyExists.sysret();
     }
 
     // Create directory mode with requested permissions (masked by typical umask of 0o22)
@@ -3784,10 +3763,10 @@ pub fn sys_mkdirat(dirfd: i32, pathname_ptr: u64, mode: u32) -> i64 {
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             return match e {
-                KernelError::AlreadyExists => EEXIST,
-                KernelError::PermissionDenied => EACCES,
-                KernelError::OperationNotSupported => EPERM,
-                _ => EINVAL,
+                KernelError::AlreadyExists => KernelError::AlreadyExists.sysret(),
+                KernelError::PermissionDenied => KernelError::PermissionDenied.sysret(),
+                KernelError::OperationNotSupported => KernelError::NotPermitted.sysret(),
+                _ => KernelError::InvalidArgument.sysret(),
             };
         }
     };
@@ -3820,11 +3799,11 @@ pub fn sys_rmdir(pathname_ptr: u64) -> i64 {
     // Read path from user space
     let path = match strncpy_from_user::<Uaccess>(pathname_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     if path.is_empty() {
-        return ENOENT;
+        return KernelError::NotFound.sysret();
     }
 
     // Look up parent directory and name
@@ -3836,7 +3815,7 @@ pub fn sys_rmdir(pathname_ptr: u64) -> i64 {
     // Get parent inode
     let parent_inode = match parent_dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Lock parent directory (Linux i_rwsem pattern)
@@ -3847,7 +3826,7 @@ pub fn sys_rmdir(pathname_ptr: u64) -> i64 {
         Some(d) => d,
         None => {
             unsafe { parent_inode.inode_unlock() };
-            return ENOENT;
+            return KernelError::NotFound.sysret();
         }
     };
 
@@ -3856,7 +3835,7 @@ pub fn sys_rmdir(pathname_ptr: u64) -> i64 {
         && !target_inode.mode().is_dir()
     {
         unsafe { parent_inode.inode_unlock() };
-        return ENOTDIR;
+        return KernelError::NotDirectory.sysret();
     }
 
     // Call rmdir on the parent
@@ -3872,12 +3851,12 @@ pub fn sys_rmdir(pathname_ptr: u64) -> i64 {
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             match e {
-                KernelError::NotFound => ENOENT,
-                KernelError::NotDirectory => ENOTDIR,
-                KernelError::DirectoryNotEmpty => ENOTEMPTY,
-                KernelError::PermissionDenied => EACCES,
+                KernelError::NotFound => KernelError::NotFound.sysret(),
+                KernelError::NotDirectory => KernelError::NotDirectory.sysret(),
+                KernelError::DirectoryNotEmpty => KernelError::DirectoryNotEmpty.sysret(),
+                KernelError::PermissionDenied => KernelError::PermissionDenied.sysret(),
                 KernelError::Busy => -16, // EBUSY
-                _ => EINVAL,
+                _ => KernelError::InvalidArgument.sysret(),
             }
         }
     }
@@ -3922,11 +3901,11 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, _dev: u64) -> i64 {
     // Read path from user space
     let path = match strncpy_from_user::<Uaccess>(pathname_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     if path.is_empty() {
-        return ENOENT;
+        return KernelError::NotFound.sysret();
     }
 
     // Look up parent directory
@@ -3938,7 +3917,7 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, _dev: u64) -> i64 {
     // Get parent inode
     let parent_inode = match parent_dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Lock parent directory (Linux i_rwsem pattern)
@@ -3947,7 +3926,7 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, _dev: u64) -> i64 {
     // Check if name already exists (with lock held)
     if parent_dentry.lookup_child(&name).is_some() {
         unsafe { parent_inode.inode_unlock() };
-        return EEXIST;
+        return KernelError::AlreadyExists.sysret();
     }
 
     // Determine file type and create appropriate mode
@@ -3963,7 +3942,7 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, _dev: u64) -> i64 {
         }
         _ => {
             unsafe { parent_inode.inode_unlock() };
-            return EINVAL; // Invalid type
+            return KernelError::InvalidArgument.sysret(); // Invalid type
         }
     };
 
@@ -3973,10 +3952,10 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, _dev: u64) -> i64 {
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             return match e {
-                KernelError::AlreadyExists => EEXIST,
-                KernelError::PermissionDenied => EACCES,
-                KernelError::OperationNotSupported => EPERM,
-                _ => EINVAL,
+                KernelError::AlreadyExists => KernelError::AlreadyExists.sysret(),
+                KernelError::PermissionDenied => KernelError::PermissionDenied.sysret(),
+                KernelError::OperationNotSupported => KernelError::NotPermitted.sysret(),
+                _ => KernelError::InvalidArgument.sysret(),
             };
         }
     };
@@ -4028,11 +4007,11 @@ pub fn sys_unlinkat(dirfd: i32, pathname_ptr: u64, flags: i32) -> i64 {
     // Read path from user space
     let path = match strncpy_from_user::<Uaccess>(pathname_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     if path.is_empty() {
-        return ENOENT;
+        return KernelError::NotFound.sysret();
     }
 
     // If AT_REMOVEDIR is set, perform rmdir instead
@@ -4050,7 +4029,7 @@ pub fn sys_unlinkat(dirfd: i32, pathname_ptr: u64, flags: i32) -> i64 {
     // Get parent inode
     let parent_inode = match parent_dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Lock parent directory (Linux i_rwsem pattern)
@@ -4061,7 +4040,7 @@ pub fn sys_unlinkat(dirfd: i32, pathname_ptr: u64, flags: i32) -> i64 {
         Some(d) => d,
         None => {
             unsafe { parent_inode.inode_unlock() };
-            return ENOENT;
+            return KernelError::NotFound.sysret();
         }
     };
 
@@ -4070,7 +4049,7 @@ pub fn sys_unlinkat(dirfd: i32, pathname_ptr: u64, flags: i32) -> i64 {
         && target_inode.mode().is_dir()
     {
         unsafe { parent_inode.inode_unlock() };
-        return EISDIR;
+        return KernelError::IsDirectory.sysret();
     }
 
     // Call unlink on the parent
@@ -4086,10 +4065,10 @@ pub fn sys_unlinkat(dirfd: i32, pathname_ptr: u64, flags: i32) -> i64 {
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             match e {
-                KernelError::NotFound => ENOENT,
-                KernelError::PermissionDenied => EACCES,
-                KernelError::IsDirectory => EISDIR,
-                _ => EINVAL,
+                KernelError::NotFound => KernelError::NotFound.sysret(),
+                KernelError::PermissionDenied => KernelError::PermissionDenied.sysret(),
+                KernelError::IsDirectory => KernelError::IsDirectory.sysret(),
+                _ => KernelError::InvalidArgument.sysret(),
             }
         }
     }
@@ -4106,7 +4085,7 @@ fn sys_unlinkat_rmdir(dirfd: i32, path: &str) -> i64 {
     // Get parent inode
     let parent_inode = match parent_dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Lock parent directory (Linux i_rwsem pattern)
@@ -4117,7 +4096,7 @@ fn sys_unlinkat_rmdir(dirfd: i32, path: &str) -> i64 {
         Some(d) => d,
         None => {
             unsafe { parent_inode.inode_unlock() };
-            return ENOENT;
+            return KernelError::NotFound.sysret();
         }
     };
 
@@ -4126,7 +4105,7 @@ fn sys_unlinkat_rmdir(dirfd: i32, path: &str) -> i64 {
         && !target_inode.mode().is_dir()
     {
         unsafe { parent_inode.inode_unlock() };
-        return ENOTDIR;
+        return KernelError::NotDirectory.sysret();
     }
 
     // Call rmdir on the parent
@@ -4142,12 +4121,12 @@ fn sys_unlinkat_rmdir(dirfd: i32, path: &str) -> i64 {
         Err(e) => {
             unsafe { parent_inode.inode_unlock() };
             match e {
-                KernelError::NotFound => ENOENT,
-                KernelError::NotDirectory => ENOTDIR,
-                KernelError::DirectoryNotEmpty => ENOTEMPTY,
-                KernelError::PermissionDenied => EACCES,
+                KernelError::NotFound => KernelError::NotFound.sysret(),
+                KernelError::NotDirectory => KernelError::NotDirectory.sysret(),
+                KernelError::DirectoryNotEmpty => KernelError::DirectoryNotEmpty.sysret(),
+                KernelError::PermissionDenied => KernelError::PermissionDenied.sysret(),
                 KernelError::Busy => -16, // EBUSY
-                _ => EINVAL,
+                _ => KernelError::InvalidArgument.sysret(),
             }
         }
     }
@@ -4168,23 +4147,23 @@ fn do_fchmodat(dirfd: i32, pathname: u64, mode: u32, flags: i32) -> i64 {
     // Validate flags - only AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH allowed
     const FCHMODAT_VALID_FLAGS: i32 = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
     if (flags & !FCHMODAT_VALID_FLAGS) != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Copy path from user space
     let path_str = match strncpy_from_user::<Uaccess>(pathname, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Handle AT_EMPTY_PATH - operate on dirfd itself
     let dentry = if path_str.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
         if dirfd < 0 {
-            return EBADF;
+            return KernelError::BadFd.sysret();
         }
         match current_fd_table().lock().get(dirfd) {
             Some(f) => f.dentry.clone(),
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         }
     } else {
         // Determine starting path for relative paths
@@ -4198,10 +4177,10 @@ fn do_fchmodat(dirfd: i32, pathname: u64, mode: u32, flags: i32) -> i64 {
             // Use directory from file descriptor
             let file = match current_fd_table().lock().get(dirfd) {
                 Some(f) => f,
-                None => return EBADF,
+                None => return KernelError::BadFd.sysret(),
             };
             if !file.is_dir() {
-                return ENOTDIR;
+                return KernelError::NotDirectory.sysret();
             }
             Path::from_dentry(file.dentry.clone())
         };
@@ -4218,16 +4197,16 @@ fn do_fchmodat(dirfd: i32, pathname: u64, mode: u32, flags: i32) -> i64 {
 
         match lookup_path_at(start, &path_str, lookup_flags) {
             Ok(d) => d,
-            Err(KernelError::NotFound) => return ENOENT,
-            Err(KernelError::NotDirectory) => return ENOTDIR,
-            Err(_) => return EINVAL,
+            Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+            Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+            Err(_) => return KernelError::InvalidArgument.sysret(),
         }
     };
 
     // Get the inode
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Update the permission bits (only lower 12 bits: rwxrwxrwx + setuid/setgid/sticky)
@@ -4273,13 +4252,13 @@ pub fn sys_fchmod(fd: i32, mode: u32) -> i64 {
     // Get the file from fd
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get the inode
     let inode = match file.get_inode() {
         Some(i) => i,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Update the permission bits
@@ -4300,7 +4279,7 @@ pub fn sys_fchownat(dirfd: i32, pathname: u64, owner: u32, group: u32, flags: i3
     // Copy path from user space
     let path_str = match strncpy_from_user::<Uaccess>(pathname, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Determine starting path for relative paths
@@ -4314,10 +4293,10 @@ pub fn sys_fchownat(dirfd: i32, pathname: u64, owner: u32, group: u32, flags: i3
         // Use directory from file descriptor
         let file = match current_fd_table().lock().get(dirfd) {
             Some(f) => f,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         };
         if !file.is_dir() {
-            return ENOTDIR;
+            return KernelError::NotDirectory.sysret();
         }
         Path::from_dentry(file.dentry.clone())
     };
@@ -4334,15 +4313,15 @@ pub fn sys_fchownat(dirfd: i32, pathname: u64, owner: u32, group: u32, flags: i3
 
     let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Get the inode
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Update owner if specified (owner != -1)
@@ -4377,13 +4356,13 @@ pub fn sys_fchown(fd: i32, owner: u32, group: u32) -> i64 {
     // Get the file from fd
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get the inode
     let inode = match file.get_inode() {
         Some(i) => i,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Update owner if specified (owner != -1)
@@ -4465,21 +4444,21 @@ pub fn sys_utimensat(dirfd: i32, pathname: u64, times: u64, flags: i32) -> i64 {
     let inode = if pathname == 0 {
         // pathname is NULL - operate on the file referred to by dirfd
         if dirfd == AT_FDCWD {
-            return EINVAL; // Can't use NULL pathname with AT_FDCWD
+            return KernelError::InvalidArgument.sysret(); // Can't use NULL pathname with AT_FDCWD
         }
         let file = match current_fd_table().lock().get(dirfd) {
             Some(f) => f,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         };
         match file.get_inode() {
             Some(i) => i,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         }
     } else {
         // Copy path from user space
         let path_str = match strncpy_from_user::<Uaccess>(pathname, PATH_MAX) {
             Ok(p) => p,
-            Err(_) => return EFAULT,
+            Err(_) => return KernelError::BadAddress.sysret(),
         };
 
         // Determine starting path for relative paths
@@ -4490,10 +4469,10 @@ pub fn sys_utimensat(dirfd: i32, pathname: u64, times: u64, flags: i32) -> i64 {
         } else {
             let file = match current_fd_table().lock().get(dirfd) {
                 Some(f) => f,
-                None => return EBADF,
+                None => return KernelError::BadFd.sysret(),
             };
             if !file.is_dir() {
-                return ENOTDIR;
+                return KernelError::NotDirectory.sysret();
             }
             Path::from_dentry(file.dentry.clone())
         };
@@ -4510,14 +4489,14 @@ pub fn sys_utimensat(dirfd: i32, pathname: u64, times: u64, flags: i32) -> i64 {
 
         let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
             Ok(d) => d,
-            Err(KernelError::NotFound) => return ENOENT,
-            Err(KernelError::NotDirectory) => return ENOTDIR,
-            Err(_) => return EINVAL,
+            Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+            Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+            Err(_) => return KernelError::InvalidArgument.sysret(),
         };
 
         match dentry.get_inode() {
             Some(i) => i,
-            None => return ENOENT,
+            None => return KernelError::NotFound.sysret(),
         }
     };
 
@@ -4532,7 +4511,7 @@ pub fn sys_utimensat(dirfd: i32, pathname: u64, times: u64, flags: i32) -> i64 {
         // Read the two timespec values from user space
         let size = core::mem::size_of::<[UserTimespec; 2]>();
         if !Uaccess::access_ok(times, size) {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
         let ts: [UserTimespec; 2] = unsafe {
             Uaccess::user_access_begin();
@@ -4606,7 +4585,7 @@ pub fn sys_utimes(pathname: u64, times: u64) -> i64 {
     // Read the two timeval values
     let size = core::mem::size_of::<[Timeval; 2]>();
     if !Uaccess::access_ok(times, size) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
     let tv: [Timeval; 2] = unsafe {
         Uaccess::user_access_begin();
@@ -4630,20 +4609,20 @@ pub fn sys_utimes(pathname: u64, times: u64) -> i64 {
     // Get inode and apply directly (can't easily pass converted struct to utimensat)
     let path_str = match strncpy_from_user::<Uaccess>(pathname, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     let start = crate::task::percpu::current_cwd();
     let dentry = match lookup_path_at(start, &path_str, LookupFlags::open()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     let now = current_time();
@@ -4683,7 +4662,7 @@ pub fn sys_utime(pathname: u64, times: u64) -> i64 {
 
     let size = core::mem::size_of::<Utimbuf>();
     if !Uaccess::access_ok(times, size) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
     let buf: Utimbuf = unsafe {
         Uaccess::user_access_begin();
@@ -4695,20 +4674,20 @@ pub fn sys_utime(pathname: u64, times: u64) -> i64 {
     // Get inode and apply
     let path_str = match strncpy_from_user::<Uaccess>(pathname, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     let start = crate::task::percpu::current_cwd();
     let dentry = match lookup_path_at(start, &path_str, LookupFlags::open()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     let now = current_time();
@@ -4752,13 +4731,13 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
     // Get file from fd
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f.clone(),
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get the inode to check file type
     let inode = match file.get_inode() {
         Some(i) => i,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Block device ioctls
@@ -4766,7 +4745,7 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
         // Get the block device from rdev
         let bdev = match get_blkdev(inode.rdev) {
             Some(b) => b,
-            None => return ENXIO,
+            None => return KernelError::NoDeviceOrAddress.sysret(),
         };
 
         match cmd {
@@ -4776,10 +4755,10 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
                 if arg != 0 {
                     // Write size to userspace pointer
                     if !Uaccess::access_ok(arg, core::mem::size_of::<u64>()) {
-                        return EFAULT;
+                        return KernelError::BadAddress.sysret();
                     }
                     if put_user::<Uaccess, u64>(arg, size).is_err() {
-                        return EFAULT;
+                        return KernelError::BadAddress.sysret();
                     }
                 }
                 0
@@ -4789,10 +4768,10 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
                 let block_size: i32 = bdev.block_size() as i32;
                 if arg != 0 {
                     if !Uaccess::access_ok(arg, core::mem::size_of::<i32>()) {
-                        return EFAULT;
+                        return KernelError::BadAddress.sysret();
                     }
                     if put_user::<Uaccess, i32>(arg, block_size).is_err() {
-                        return EFAULT;
+                        return KernelError::BadAddress.sysret();
                     }
                 }
                 0
@@ -4802,7 +4781,7 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
                 // (page cache IS the storage)
                 0
             }
-            _ => ENOTTY,
+            _ => KernelError::NotTty.sysret(),
         }
     } else if inode.mode().is_chrdev() {
         // Character device ioctls - route to CharDevice::ioctl()
@@ -4810,28 +4789,25 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
 
         let device = match get_chardev(inode.rdev) {
             Some(d) => d,
-            None => return ENXIO,
+            None => return KernelError::NoDeviceOrAddress.sysret(),
         };
 
         match device.ioctl(cmd, arg) {
             Ok(result) => result,
-            Err(crate::chardev::DeviceError::NotTty) => ENOTTY,
-            Err(crate::chardev::DeviceError::InvalidArg) => EINVAL,
-            Err(crate::chardev::DeviceError::NotSupported) => ENOTTY,
-            Err(_) => EIO,
+            Err(crate::chardev::DeviceError::NotTty) => KernelError::NotTty.sysret(),
+            Err(crate::chardev::DeviceError::InvalidArg) => KernelError::InvalidArgument.sysret(),
+            Err(crate::chardev::DeviceError::NotSupported) => KernelError::NotTty.sysret(),
+            Err(_) => KernelError::Io.sysret(),
         }
     } else {
         // Not a device - ioctl not supported
-        ENOTTY
+        KernelError::NotTty.sysret()
     }
 }
 
 // ============================================================================
 // Sync Syscalls - Flush dirty pages to backing store
 // ============================================================================
-
-/// Error code for I/O error
-pub const EIO: i64 = -5;
 
 /// sys_sync - sync all filesystems
 ///
@@ -4867,14 +4843,14 @@ pub fn sys_fsync(fd: i32) -> i64 {
     // Get file from fd
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f.clone(),
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Call the file's fsync operation
     match file.f_op.fsync(&file) {
         Ok(()) => 0,
-        Err(KernelError::Io) => EIO,
-        Err(_) => EINVAL,
+        Err(KernelError::Io) => KernelError::Io.sysret(),
+        Err(_) => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -4926,7 +4902,7 @@ pub fn sys_syncfs(fd: i32) -> i64 {
     // Validate fd exists (but we sync all filesystems currently)
     let _file = match current_fd_table().lock().get(fd) {
         Some(f) => f.clone(),
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Use the writeback module to sync all dirty pages
@@ -4963,7 +4939,7 @@ pub fn sys_poll(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
     // Limit nfds to prevent DoS
     const MAX_NFDS: u32 = 1024;
     if nfds > MAX_NFDS {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Handle empty poll (just sleep for timeout)
@@ -4984,7 +4960,7 @@ pub fn sys_poll(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
         unsafe { core::slice::from_raw_parts_mut(pollfds.as_mut_ptr() as *mut u8, total_size) };
 
     if copy_from_user::<Uaccess>(bytes_slice, fds, total_size).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Create poll context
@@ -5073,7 +5049,7 @@ pub fn sys_poll(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
         unsafe { core::slice::from_raw_parts(pollfds.as_ptr() as *const u8, total_size) };
 
     if copy_to_user::<Uaccess>(fds, result_bytes).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     ready_count
@@ -5117,7 +5093,7 @@ pub fn sys_ppoll(fds: u64, nfds: u32, tmo_p: u64, _sigmask_ptr: u64, _sigsetsize
         };
 
         if copy_from_user::<Uaccess>(ts_bytes, tmo_p, core::mem::size_of::<Timespec>()).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
 
         // Convert to milliseconds (clamped to i32 range)
@@ -5169,7 +5145,7 @@ pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeou
     // Validate nfds
     const FD_SETSIZE: i32 = 1024;
     if !(0..=FD_SETSIZE).contains(&nfds) {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Handle empty select (just sleep for timeout)
@@ -5193,7 +5169,7 @@ pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeou
             core::slice::from_raw_parts_mut(read_set.bits.as_mut_ptr() as *mut u8, bytes_needed)
         };
         if copy_from_user::<Uaccess>(bytes, readfds, bytes_needed).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -5202,7 +5178,7 @@ pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeou
             core::slice::from_raw_parts_mut(write_set.bits.as_mut_ptr() as *mut u8, bytes_needed)
         };
         if copy_from_user::<Uaccess>(bytes, writefds, bytes_needed).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -5211,7 +5187,7 @@ pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeou
             core::slice::from_raw_parts_mut(except_set.bits.as_mut_ptr() as *mut u8, bytes_needed)
         };
         if copy_from_user::<Uaccess>(bytes, exceptfds, bytes_needed).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -5233,7 +5209,7 @@ pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeou
         };
 
         if copy_from_user::<Uaccess>(tv_bytes, timeout, core::mem::size_of::<Timeval>()).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
 
         // Convert to milliseconds
@@ -5283,7 +5259,7 @@ pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeou
             let file = match table.get(fd) {
                 Some(f) => f,
                 None => {
-                    return EBADF;
+                    return KernelError::BadFd.sysret();
                 }
             };
 
@@ -5353,7 +5329,7 @@ pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeou
             core::slice::from_raw_parts(out_read.bits.as_ptr() as *const u8, bytes_needed)
         };
         if copy_to_user::<Uaccess>(readfds, bytes).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -5362,7 +5338,7 @@ pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeou
             core::slice::from_raw_parts(out_write.bits.as_ptr() as *const u8, bytes_needed)
         };
         if copy_to_user::<Uaccess>(writefds, bytes).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -5371,7 +5347,7 @@ pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeou
             core::slice::from_raw_parts(out_except.bits.as_ptr() as *const u8, bytes_needed)
         };
         if copy_to_user::<Uaccess>(exceptfds, bytes).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -5422,7 +5398,7 @@ pub fn sys_pselect6(
         };
 
         if copy_from_user::<Uaccess>(ts_bytes, timeout, core::mem::size_of::<Timespec>()).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
 
         // Convert to milliseconds
@@ -5462,7 +5438,7 @@ fn sys_select_internal(
     // Validate nfds
     const FD_SETSIZE: i32 = 1024;
     if !(0..=FD_SETSIZE).contains(&nfds) {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Handle empty select
@@ -5483,7 +5459,7 @@ fn sys_select_internal(
             core::slice::from_raw_parts_mut(read_set.bits.as_mut_ptr() as *mut u8, bytes_needed)
         };
         if copy_from_user::<Uaccess>(bytes, readfds, bytes_needed).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -5492,7 +5468,7 @@ fn sys_select_internal(
             core::slice::from_raw_parts_mut(write_set.bits.as_mut_ptr() as *mut u8, bytes_needed)
         };
         if copy_from_user::<Uaccess>(bytes, writefds, bytes_needed).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -5501,7 +5477,7 @@ fn sys_select_internal(
             core::slice::from_raw_parts_mut(except_set.bits.as_mut_ptr() as *mut u8, bytes_needed)
         };
         if copy_from_user::<Uaccess>(bytes, exceptfds, bytes_needed).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -5538,7 +5514,7 @@ fn sys_select_internal(
             let file = match table.get(fd) {
                 Some(f) => f,
                 None => {
-                    return EBADF;
+                    return KernelError::BadFd.sysret();
                 }
             };
 
@@ -5607,7 +5583,7 @@ fn sys_select_internal(
             core::slice::from_raw_parts(out_read.bits.as_ptr() as *const u8, bytes_needed)
         };
         if copy_to_user::<Uaccess>(readfds, bytes).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -5616,7 +5592,7 @@ fn sys_select_internal(
             core::slice::from_raw_parts(out_write.bits.as_ptr() as *const u8, bytes_needed)
         };
         if copy_to_user::<Uaccess>(writefds, bytes).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -5625,7 +5601,7 @@ fn sys_select_internal(
             core::slice::from_raw_parts(out_except.bits.as_ptr() as *const u8, bytes_needed)
         };
         if copy_to_user::<Uaccess>(exceptfds, bytes).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -5674,18 +5650,18 @@ pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
     // Validate flags - only O_CLOEXEC and O_NONBLOCK are allowed
     const VALID_FLAGS: u32 = O_CLOEXEC | O_NONBLOCK;
     if flags & !VALID_FLAGS != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate user pointer
     if pipefd == 0 {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Create the pipe
     let (read_file, write_file) = match create_pipe(flags & O_NONBLOCK) {
         Ok((r, w)) => (r, w),
-        Err(_) => return ENOMEM,
+        Err(_) => return KernelError::OutOfMemory.sysret(),
     };
 
     // Allocate file descriptors (RLIMIT_NOFILE enforced inside alloc)
@@ -5730,7 +5706,7 @@ pub fn sys_pipe2(pipefd: u64, flags: u32) -> i64 {
             let mut table = fd_table.lock();
             table.close(read_fd);
             table.close(write_fd);
-            EFAULT
+            KernelError::BadAddress.sysret()
         }
     }
 }
@@ -5773,15 +5749,15 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             // Duplicate fd to lowest available >= arg
             let file = match table.get(fd) {
                 Some(f) => f,
-                None => return EBADF,
+                None => return KernelError::BadFd.sysret(),
             };
             let min_fd = arg as i32;
             if min_fd < 0 {
-                return EINVAL;
+                return KernelError::InvalidArgument.sysret();
             }
             // Linux: if (from >= nofile) return -EINVAL
             if (min_fd as u64) >= nofile {
-                return EINVAL;
+                return KernelError::InvalidArgument.sysret();
             }
             // RLIMIT_NOFILE enforced inside alloc_at_or_above
             match table.alloc_at_or_above(file, min_fd, 0, nofile) {
@@ -5794,15 +5770,15 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             // Duplicate fd with FD_CLOEXEC set
             let file = match table.get(fd) {
                 Some(f) => f,
-                None => return EBADF,
+                None => return KernelError::BadFd.sysret(),
             };
             let min_fd = arg as i32;
             if min_fd < 0 {
-                return EINVAL;
+                return KernelError::InvalidArgument.sysret();
             }
             // Linux: if (from >= nofile) return -EINVAL
             if (min_fd as u64) >= nofile {
-                return EINVAL;
+                return KernelError::InvalidArgument.sysret();
             }
             // RLIMIT_NOFILE enforced inside alloc_at_or_above
             match table.alloc_at_or_above(file, min_fd, crate::task::FD_CLOEXEC, nofile) {
@@ -5814,7 +5790,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
         F_GETFD => {
             // Get fd flags (FD_CLOEXEC)
             if !table.is_valid(fd) {
-                return EBADF;
+                return KernelError::BadFd.sysret();
             }
             table.get_fd_flags(fd) as i64
         }
@@ -5822,7 +5798,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
         F_SETFD => {
             // Set fd flags (only FD_CLOEXEC is valid)
             if !table.set_fd_flags(fd, arg as u32) {
-                return EBADF;
+                return KernelError::BadFd.sysret();
             }
             0
         }
@@ -5831,7 +5807,7 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             // Get file status flags
             let file = match table.get(fd) {
                 Some(f) => f,
-                None => return EBADF,
+                None => return KernelError::BadFd.sysret(),
             };
             file.get_flags() as i64
         }
@@ -5840,13 +5816,13 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             // Set file status flags (only O_APPEND, O_NONBLOCK can be changed)
             let file = match table.get(fd) {
                 Some(f) => f,
-                None => return EBADF,
+                None => return KernelError::BadFd.sysret(),
             };
             file.set_status_flags(arg as u32);
             0
         }
 
-        _ => EINVAL,
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -5990,26 +5966,26 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
     // Read path from user space
     let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate buffer
     if !Uaccess::access_ok(buf, core::mem::size_of::<LinuxStatFs>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Look up path to get dentry/superblock
     let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Get superblock
     let sb = match dentry.superblock() {
         Some(sb) => sb,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Get stats from filesystem
@@ -6018,7 +5994,7 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
 
     // Copy to user
     if put_user::<Uaccess, LinuxStatFs>(buf, linux_statfs).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -6035,19 +6011,19 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
 pub fn sys_fstatfs(fd: i32, buf: u64) -> i64 {
     // Validate buffer
     if !Uaccess::access_ok(buf, core::mem::size_of::<LinuxStatFs>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get superblock from file's dentry
     let sb = match file.dentry.superblock() {
         Some(sb) => sb,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get stats
@@ -6056,7 +6032,7 @@ pub fn sys_fstatfs(fd: i32, buf: u64) -> i64 {
 
     // Copy to user
     if put_user::<Uaccess, LinuxStatFs>(buf, linux_statfs).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -6144,23 +6120,23 @@ fn fill_statx(inode: &Inode, _mask: u32) -> Statx {
 pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> i64 {
     // Validate buffer
     if !Uaccess::access_ok(buf, core::mem::size_of::<Statx>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Read path from user space
     let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Handle AT_EMPTY_PATH (statx on fd itself)
     let dentry = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
         if dirfd < 0 {
-            return EBADF;
+            return KernelError::BadFd.sysret();
         }
         match current_fd_table().lock().get(dirfd) {
             Some(f) => f.dentry.clone(),
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         }
     } else {
         // Determine starting path for relative paths
@@ -6171,10 +6147,10 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> 
         } else {
             let file = match current_fd_table().lock().get(dirfd) {
                 Some(f) => f,
-                None => return EBADF,
+                None => return KernelError::BadFd.sysret(),
             };
             if !file.is_dir() {
-                return ENOTDIR;
+                return KernelError::NotDirectory.sysret();
             }
             Path::from_dentry(file.dentry.clone())
         };
@@ -6191,16 +6167,16 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> 
 
         match lookup_path_at(start, &path, lookup_flags) {
             Ok(d) => d,
-            Err(KernelError::NotFound) => return ENOENT,
-            Err(KernelError::NotDirectory) => return ENOTDIR,
-            Err(_) => return EINVAL,
+            Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+            Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+            Err(_) => return KernelError::InvalidArgument.sysret(),
         }
     };
 
     // Get inode
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Fill statx structure
@@ -6208,7 +6184,7 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> 
 
     // Copy to user
     if put_user::<Uaccess, Statx>(buf, statx).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -6230,14 +6206,14 @@ pub const XATTR_SIZE_MAX: usize = 65536;
 /// Helper to convert KernelError to errno for xattr operations
 fn xattr_error_to_errno(e: KernelError) -> i64 {
     match e {
-        KernelError::NotFound => ENOENT,
-        KernelError::NoData => ENODATA,
-        KernelError::AlreadyExists => EEXIST,
-        KernelError::Range => ERANGE,
-        KernelError::OperationNotSupported => EOPNOTSUPP,
-        KernelError::PermissionDenied => EPERM,
-        KernelError::Io => -5, // EIO
-        _ => EINVAL,
+        KernelError::NotFound => KernelError::NotFound.sysret(),
+        KernelError::NoData => KernelError::NoData.sysret(),
+        KernelError::AlreadyExists => KernelError::AlreadyExists.sysret(),
+        KernelError::Range => KernelError::Range.sysret(),
+        KernelError::OperationNotSupported => KernelError::OperationNotSupported.sysret(),
+        KernelError::PermissionDenied => KernelError::NotPermitted.sysret(),
+        KernelError::Io => KernelError::Io.sysret(),
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -6246,7 +6222,7 @@ fn copy_xattr_value_from_user(value_ptr: u64, size: u64) -> Result<alloc::vec::V
     use crate::uaccess::copy_from_user;
 
     if size > XATTR_SIZE_MAX as u64 {
-        return Err(ERANGE);
+        return Err(KernelError::Range.sysret());
     }
 
     if size == 0 {
@@ -6255,13 +6231,13 @@ fn copy_xattr_value_from_user(value_ptr: u64, size: u64) -> Result<alloc::vec::V
 
     // Validate user buffer
     if !Uaccess::access_ok(value_ptr, size as usize) {
-        return Err(EFAULT);
+        return Err(KernelError::BadAddress.sysret());
     }
 
     // Allocate and copy value from user space
     let mut value = vec![0u8; size as usize];
     if copy_from_user::<Uaccess>(&mut value, value_ptr, size as usize).is_err() {
-        return Err(EFAULT);
+        return Err(KernelError::BadAddress.sysret());
     }
     Ok(value)
 }
@@ -6297,24 +6273,24 @@ fn do_setxattr(
 ) -> i64 {
     // Validate flags
     if flags as u32 & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Copy path from user
     let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Copy attribute name from user
     let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate name length
     if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return ERANGE;
+        return KernelError::Range.sysret();
     }
 
     // Copy value from user
@@ -6335,14 +6311,14 @@ fn do_setxattr(
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Call inode operation
@@ -6356,24 +6332,24 @@ fn do_setxattr(
 pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i32) -> i64 {
     // Validate flags
     if flags as u32 & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Copy attribute name from user
     let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate name length
     if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return ERANGE;
+        return KernelError::Range.sysret();
     }
 
     // Copy value from user
@@ -6384,7 +6360,7 @@ pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i
 
     let inode = match file.get_inode() {
         Some(i) => i,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Call inode operation
@@ -6424,18 +6400,18 @@ fn do_getxattr(
     // Copy path from user
     let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Copy attribute name from user
     let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate name length
     if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return ERANGE;
+        return KernelError::Range.sysret();
     }
 
     // Lookup path
@@ -6450,14 +6426,14 @@ fn do_getxattr(
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // If size is 0, query the size needed
@@ -6471,12 +6447,12 @@ fn do_getxattr(
 
     // Validate size
     if size > XATTR_SIZE_MAX as u64 {
-        return ERANGE;
+        return KernelError::Range.sysret();
     }
 
     // Validate user buffer
     if !Uaccess::access_ok(value_ptr, size as usize) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Allocate kernel buffer
@@ -6500,23 +6476,23 @@ pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Copy attribute name from user
     let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate name length
     if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return ERANGE;
+        return KernelError::Range.sysret();
     }
 
     let inode = match file.get_inode() {
         Some(i) => i,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // If size is 0, query the size needed
@@ -6530,12 +6506,12 @@ pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
 
     // Validate size
     if size > XATTR_SIZE_MAX as u64 {
-        return ERANGE;
+        return KernelError::Range.sysret();
     }
 
     // Validate user buffer
     if !Uaccess::access_ok(value_ptr, size as usize) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Allocate kernel buffer
@@ -6577,7 +6553,7 @@ fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) 
     // Copy path from user
     let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Lookup path
@@ -6592,14 +6568,14 @@ fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) 
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // If size is 0, query the size needed
@@ -6613,7 +6589,7 @@ fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) 
 
     // Validate user buffer
     if !Uaccess::access_ok(list_ptr, size as usize) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Allocate kernel buffer
@@ -6637,12 +6613,12 @@ pub fn sys_flistxattr(fd: i32, list_ptr: u64, size: u64) -> i64 {
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let inode = match file.get_inode() {
         Some(i) => i,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // If size is 0, query the size needed
@@ -6656,7 +6632,7 @@ pub fn sys_flistxattr(fd: i32, list_ptr: u64, size: u64) -> i64 {
 
     // Validate user buffer
     if !Uaccess::access_ok(list_ptr, size as usize) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Allocate kernel buffer
@@ -6697,18 +6673,18 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
     // Copy path from user
     let path = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Copy attribute name from user
     let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate name length
     if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return ERANGE;
+        return KernelError::Range.sysret();
     }
 
     // Lookup path
@@ -6723,14 +6699,14 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return ENOENT,
-        Err(KernelError::NotDirectory) => return ENOTDIR,
-        Err(_) => return EINVAL,
+        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
+        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Call inode operation
@@ -6745,23 +6721,23 @@ pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Copy attribute name from user
     let name = match strncpy_from_user::<Uaccess>(name_ptr, XATTR_NAME_MAX + 1) {
         Ok(n) => n,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Validate name length
     if name.is_empty() || name.len() > XATTR_NAME_MAX {
-        return ERANGE;
+        return KernelError::Range.sysret();
     }
 
     let inode = match file.get_inode() {
         Some(i) => i,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Call inode operation
@@ -6798,28 +6774,28 @@ pub fn sys_readahead(fd: i32, offset: i64, count: usize) -> i64 {
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Verify file is opened for reading
     if !file.is_readable() {
-        return EBADF;
+        return KernelError::BadFd.sysret();
     }
 
     // Check file type - only regular files and block devices support readahead
     if let Some(inode) = file.get_inode() {
         let mode = inode.mode();
         if !mode.is_file() && !mode.is_blkdev() {
-            return EINVAL;
+            return KernelError::InvalidArgument.sysret();
         }
     } else {
         // No inode means special file (pipe, socket, etc.)
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate offset
     if offset < 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Currently a no-op since we don't have a full page cache.

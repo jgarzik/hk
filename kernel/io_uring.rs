@@ -172,22 +172,6 @@ pub const IORING_REGISTER_EVENTFD: u32 = 4;
 pub const IORING_UNREGISTER_EVENTFD: u32 = 5;
 pub const IORING_REGISTER_FILES_UPDATE: u32 = 6;
 
-/// Error codes (negative errno values)
-/// NOTE: Many of these will be removed as we migrate to KernelError::to_syscall_error()
-const ENOENT: i64 = -2;
-const EBADF: i64 = -9;
-const ENOMEM: i64 = -12;
-const EFAULT: i64 = -14;
-const EBUSY: i64 = -16;
-const EINVAL: i64 = -22;
-#[allow(dead_code)] // Kept for potential future opcodes
-const ENOSYS: i64 = -38;
-const EOPNOTSUPP: i64 = -95;
-const ECANCELED: i64 = -125;
-const ETIME: i64 = -62;
-#[allow(dead_code)] // Will be used for duplicate poll detection
-const EALREADY: i64 = -114;
-
 /// Maximum ring size
 const IORING_MAX_ENTRIES: u32 = 32768;
 
@@ -557,13 +541,13 @@ impl IoUring {
             // Process the SQE (unless link chain has failed)
             let result = if link_failed && in_link && !is_hard_linked {
                 // Link chain has failed, skip this SQE
-                ECANCELED as i32
+                KernelError::Canceled.to_errno_neg()
             } else {
                 // Handle LINK_TIMEOUT specially
                 if sqe.opcode == IORING_OP_LINK_TIMEOUT {
                     // LINK_TIMEOUT is only valid in a link chain
                     if !in_link {
-                        EINVAL as i32
+                        KernelError::InvalidArgument.to_errno_neg()
                     } else {
                         // For now, just return success (proper implementation
                         // would set up a timeout for the linked operation)
@@ -640,7 +624,7 @@ impl IoUring {
             IORING_OP_RECVMSG => self.do_recvmsg(sqe),
             IORING_OP_SHUTDOWN => self.do_shutdown(sqe),
 
-            _ => -(EINVAL as i32), // Unknown opcode
+            _ => KernelError::InvalidArgument.to_errno_neg(), // Unknown opcode
         }
     }
 
@@ -657,19 +641,19 @@ impl IoUring {
             // Use fixed file from registered file table
             match self.get_fixed_file(fd as u32) {
                 Some(f) => f,
-                None => return EBADF as i32,
+                None => return KernelError::BadFd.to_errno_neg(),
             }
         } else {
             // Use regular fd
             match get_file_from_fd(fd) {
                 Some(f) => f,
-                None => return EBADF as i32,
+                None => return KernelError::BadFd.to_errno_neg(),
             }
         };
 
         // Create buffer for read
         if buf_addr == 0 || len == 0 {
-            return -(EINVAL as i32);
+            return KernelError::InvalidArgument.to_errno_neg();
         }
 
         // Allocate kernel buffer
@@ -716,18 +700,18 @@ impl IoUring {
         let file = if sqe.flags & IOSQE_FIXED_FILE != 0 {
             match self.get_fixed_file(fd as u32) {
                 Some(f) => f,
-                None => return EBADF as i32,
+                None => return KernelError::BadFd.to_errno_neg(),
             }
         } else {
             match get_file_from_fd(fd) {
                 Some(f) => f,
-                None => return EBADF as i32,
+                None => return KernelError::BadFd.to_errno_neg(),
             }
         };
 
         // Validate buffer
         if buf_addr == 0 || len == 0 {
-            return -(EINVAL as i32);
+            return KernelError::InvalidArgument.to_errno_neg();
         }
 
         // Copy from userspace
@@ -767,17 +751,17 @@ impl IoUring {
         let file = if sqe.flags & IOSQE_FIXED_FILE != 0 {
             match self.get_fixed_file(fd as u32) {
                 Some(f) => f,
-                None => return EBADF as i32,
+                None => return KernelError::BadFd.to_errno_neg(),
             }
         } else {
             match get_file_from_fd(fd) {
                 Some(f) => f,
-                None => return EBADF as i32,
+                None => return KernelError::BadFd.to_errno_neg(),
             }
         };
 
         if iov_addr == 0 || iov_count == 0 {
-            return -(EINVAL as i32);
+            return KernelError::InvalidArgument.to_errno_neg();
         }
 
         // Read iovec array from userspace
@@ -837,17 +821,17 @@ impl IoUring {
         let file = if sqe.flags & IOSQE_FIXED_FILE != 0 {
             match self.get_fixed_file(fd as u32) {
                 Some(f) => f,
-                None => return EBADF as i32,
+                None => return KernelError::BadFd.to_errno_neg(),
             }
         } else {
             match get_file_from_fd(fd) {
                 Some(f) => f,
-                None => return EBADF as i32,
+                None => return KernelError::BadFd.to_errno_neg(),
             }
         };
 
         if iov_addr == 0 || iov_count == 0 {
-            return -(EINVAL as i32);
+            return KernelError::InvalidArgument.to_errno_neg();
         }
 
         // Read iovec array from userspace and write
@@ -999,13 +983,13 @@ impl IoUring {
 
         // Can't register if already registered
         if inner.registered_files.is_some() {
-            return EBUSY;
+            return KernelError::Busy.sysret();
         }
 
         // Resolve fds to File references
         let fd_table = match get_task_fd(current_tid()) {
             Some(t) => t,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         };
 
         let fd_table_locked = fd_table.lock();
@@ -1018,7 +1002,7 @@ impl IoUring {
             } else {
                 match fd_table_locked.get(fd) {
                     Some(f) => files.push(Some(f)),
-                    None => return EBADF,
+                    None => return KernelError::BadFd.sysret(),
                 }
             }
         }
@@ -1032,7 +1016,7 @@ impl IoUring {
         let mut inner = self.inner.lock();
 
         if inner.registered_files.is_none() {
-            return EINVAL;
+            return KernelError::InvalidArgument.sysret();
         }
 
         inner.registered_files = None;
@@ -1045,18 +1029,18 @@ impl IoUring {
 
         let registered = match inner.registered_files.as_mut() {
             Some(r) => r,
-            None => return EINVAL,
+            None => return KernelError::InvalidArgument.sysret(),
         };
 
         let offset = offset as usize;
         if offset + fds.len() > registered.len() {
-            return EINVAL;
+            return KernelError::InvalidArgument.sysret();
         }
 
         // Resolve fds to File references
         let fd_table = match get_task_fd(current_tid()) {
             Some(t) => t,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         };
 
         let fd_table_locked = fd_table.lock();
@@ -1067,7 +1051,7 @@ impl IoUring {
             } else {
                 match fd_table_locked.get(fd) {
                     Some(f) => registered[offset + i] = Some(f),
-                    None => return EBADF,
+                    None => return KernelError::BadFd.sysret(),
                 }
             }
         }
@@ -1099,12 +1083,12 @@ impl IoUring {
         let file = if sqe.flags & IOSQE_FIXED_FILE != 0 {
             match self.get_fixed_file(fd as u32) {
                 Some(f) => f,
-                None => return EBADF as i32,
+                None => return KernelError::BadFd.to_errno_neg(),
             }
         } else {
             match get_file_from_fd(fd) {
                 Some(f) => f,
-                None => return EBADF as i32,
+                None => return KernelError::BadFd.to_errno_neg(),
             }
         };
 
@@ -1137,11 +1121,11 @@ impl IoUring {
         // Find and cancel the pending poll
         if inner.cancel_pending(target_user_data) {
             // Post CQE for the cancelled operation
-            inner.post_cqe(target_user_data, ECANCELED as i32, 0);
+            inner.post_cqe(target_user_data, KernelError::Canceled.to_errno_neg(), 0);
             0 // Success
         } else {
             // Not found
-            ENOENT as i32
+            KernelError::NotFound.to_errno_neg()
         }
     }
 
@@ -1154,7 +1138,7 @@ impl IoUring {
         // op_flags contains IORING_TIMEOUT_ABS for absolute time
 
         if ts_ptr == 0 {
-            return EINVAL as i32;
+            return KernelError::InvalidArgument.to_errno_neg();
         }
 
         // Read timespec from userspace
@@ -1163,7 +1147,7 @@ impl IoUring {
         let tv_nsec: i64 = unsafe { core::ptr::read_volatile((ts_ptr + 8) as *const i64) };
 
         if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
-            return EINVAL as i32;
+            return KernelError::InvalidArgument.to_errno_neg();
         }
 
         // Calculate deadline in nanoseconds
@@ -1191,7 +1175,7 @@ impl IoUring {
         if count == 0 {
             // Pure timeout - check if already expired
             if now_ns >= deadline_ns {
-                return ETIME as i32;
+                return KernelError::TimerExpired.to_errno_neg();
             }
         }
 
@@ -1202,7 +1186,7 @@ impl IoUring {
         // In a full implementation, we'd use a timer and complete later
         if now_ns >= deadline_ns {
             // Already expired
-            ETIME as i32
+            KernelError::TimerExpired.to_errno_neg()
         } else {
             // Still pending - return 0, CQE will be posted when timeout fires
             // Since we can't do async timers, return success
@@ -1218,11 +1202,11 @@ impl IoUring {
         // Find and cancel the pending timeout
         if inner.cancel_pending(target_user_data) {
             // Post CQE for the cancelled timeout with ECANCELED
-            inner.post_cqe(target_user_data, ECANCELED as i32, 0);
+            inner.post_cqe(target_user_data, KernelError::Canceled.to_errno_neg(), 0);
             0 // Success
         } else {
             // Not found
-            ENOENT as i32
+            KernelError::NotFound.to_errno_neg()
         }
     }
 
@@ -1247,24 +1231,24 @@ impl IoUring {
             // Post CQEs for all cancelled operations
             let cancelled = inner.drain_cancelled();
             for user_data in cancelled {
-                inner.post_cqe(user_data, ECANCELED as i32, 0);
+                inner.post_cqe(user_data, KernelError::Canceled.to_errno_neg(), 0);
             }
 
             if cancelled_count > 0 {
                 cancelled_count
             } else {
-                ENOENT as i32
+                KernelError::NotFound.to_errno_neg()
             }
         } else {
             // Cancel first matching operation
             if inner.cancel_pending(target_user_data) {
                 let cancelled = inner.drain_cancelled();
                 for user_data in cancelled {
-                    inner.post_cqe(user_data, ECANCELED as i32, 0);
+                    inner.post_cqe(user_data, KernelError::Canceled.to_errno_neg(), 0);
                 }
                 0 // Success
             } else {
-                ENOENT as i32
+                KernelError::NotFound.to_errno_neg()
             }
         }
     }
@@ -1447,7 +1431,7 @@ fn get_file_from_fd(fd: i32) -> Option<Arc<File>> {
 
 /// Convert KernelError to negative errno value
 fn fs_error_to_errno(e: KernelError) -> i64 {
-    e.to_syscall_error()
+    e.sysret()
 }
 
 // ============================================================================
@@ -1494,30 +1478,30 @@ fn is_power_of_2(n: u32) -> bool {
 pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
     // Validate entries
     if entries == 0 || entries > IORING_MAX_ENTRIES {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     if params_ptr == 0 {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Read params from user space
     let mut params: IoUringParams = match get_user::<Uaccess, IoUringParams>(params_ptr) {
         Ok(p) => p,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Check reserved fields are zero
     for r in &params.resv {
         if *r != 0 {
-            return EINVAL;
+            return KernelError::InvalidArgument.sysret();
         }
     }
 
     // Validate flags - we only support a subset for now
     let supported_flags = IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP;
     if params.flags & !supported_flags != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Round entries to power of 2
@@ -1525,7 +1509,7 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
         core::cmp::min(round_up_pow2(entries), IORING_MAX_ENTRIES)
     } else {
         if !is_power_of_2(entries) {
-            return EINVAL;
+            return KernelError::InvalidArgument.sysret();
         }
         entries
     };
@@ -1534,13 +1518,13 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
     let cq_entries = if params.flags & IORING_SETUP_CQSIZE != 0 {
         let cq = params.cq_entries;
         if cq == 0 || cq > IORING_MAX_ENTRIES * 2 {
-            return EINVAL;
+            return KernelError::InvalidArgument.sysret();
         }
         if params.flags & IORING_SETUP_CLAMP != 0 {
             core::cmp::min(round_up_pow2(cq), IORING_MAX_ENTRIES * 2)
         } else {
             if !is_power_of_2(cq) {
-                return EINVAL;
+                return KernelError::InvalidArgument.sysret();
             }
             cq
         }
@@ -1588,13 +1572,13 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
     // Create file
     let file = match create_io_uring_file(ring) {
         Ok(f) => f,
-        Err(_) => return ENOMEM,
+        Err(_) => return KernelError::OutOfMemory.sysret(),
     };
 
     // Allocate fd
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return ENOMEM,
+        None => return KernelError::OutOfMemory.sysret(),
     };
 
     let fd = match fd_table
@@ -1609,7 +1593,7 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
     if put_user::<Uaccess, IoUringParams>(params_ptr, params).is_err() {
         // Close the fd we just allocated
         let _ = fd_table.lock().close(fd);
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     fd as i64
@@ -1638,23 +1622,23 @@ pub fn sys_io_uring_enter(
     // Validate flags
     let supported = IORING_ENTER_GETEVENTS | IORING_ENTER_SQ_WAKEUP | IORING_ENTER_SQ_WAIT;
     if flags & !supported != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get io_uring from fd
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let file = match fd_table.lock().get(fd as i32) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let ring = match get_io_uring(&file) {
         Some(r) => r,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let mut ret = 0i64;
@@ -1694,34 +1678,34 @@ pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i6
     // Get io_uring from fd
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let file = match fd_table.lock().get(fd as i32) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let ring = match get_io_uring(&file) {
         Some(r) => r,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Handle register operations
     match opcode {
         IORING_REGISTER_BUFFERS => {
             // Buffer registration not yet implemented (requires different data structure)
-            EOPNOTSUPP
+            KernelError::OperationNotSupported.sysret()
         }
 
         IORING_UNREGISTER_BUFFERS => {
             // Buffer unregistration not yet implemented
-            EOPNOTSUPP
+            KernelError::OperationNotSupported.sysret()
         }
 
         IORING_REGISTER_FILES => {
             if nr_args == 0 {
-                return EINVAL;
+                return KernelError::InvalidArgument.sysret();
             }
 
             // Read fd array from userspace
@@ -1744,7 +1728,7 @@ pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i6
             // For simplicity, we expect arg to point to the fds array directly
             // with offset = 0. Full implementation would parse the struct.
             if nr_args == 0 {
-                return EINVAL;
+                return KernelError::InvalidArgument.sysret();
             }
 
             // Read fd array from userspace
@@ -1762,9 +1746,9 @@ pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i6
 
         IORING_REGISTER_EVENTFD | IORING_UNREGISTER_EVENTFD => {
             // Eventfd registration not yet implemented
-            EOPNOTSUPP
+            KernelError::OperationNotSupported.sysret()
         }
 
-        _ => EINVAL,
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }
