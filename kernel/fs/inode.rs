@@ -264,7 +264,12 @@ pub trait InodeOps: Send + Sync {
 
     /// Read a page of data from a file
     /// Returns the number of bytes read (may be less than PAGE_SIZE at EOF)
-    fn readpage(&self, inode: &Inode, page_offset: u64, buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn readpage(
+        &self,
+        inode: &Inode,
+        page_offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, KernelError> {
         let _ = (inode, page_offset, buf);
         Err(KernelError::OperationNotSupported)
     }
@@ -322,7 +327,13 @@ pub trait InodeOps: Send + Sync {
     /// * `name` - The attribute name (e.g., "user.foo")
     /// * `value` - The attribute value
     /// * `flags` - XATTR_CREATE (fail if exists) or XATTR_REPLACE (fail if not exists)
-    fn setxattr(&self, inode: &Inode, name: &str, value: &[u8], flags: u32) -> Result<(), KernelError> {
+    fn setxattr(
+        &self,
+        inode: &Inode,
+        name: &str,
+        value: &[u8],
+        flags: u32,
+    ) -> Result<(), KernelError> {
         let _ = (inode, name, value, flags);
         Err(KernelError::OperationNotSupported)
     }

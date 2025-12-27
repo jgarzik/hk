@@ -235,7 +235,12 @@ pub trait FileOps: Send + Sync {
     ///
     /// Supports RWF_NOWAIT: if set and operation would block, return WouldBlock.
     /// Default implementation rejects NOWAIT (returns NotSupported).
-    fn write_with_flags(&self, file: &File, buf: &[u8], flags: RwFlags) -> Result<usize, KernelError> {
+    fn write_with_flags(
+        &self,
+        file: &File,
+        buf: &[u8],
+        flags: RwFlags,
+    ) -> Result<usize, KernelError> {
         if flags.nowait {
             return Err(KernelError::OperationNotSupported);
         }

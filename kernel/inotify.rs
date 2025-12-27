@@ -764,10 +764,10 @@ fn resolve_path_to_ino(pathname: &str, mask: u32) -> Result<(u64, bool), i64> {
         Err(e) => {
             return Err(match e {
                 KernelError::NotFound => -2,          // ENOENT
-                KernelError::NotDirectory => -20,    // ENOTDIR
+                KernelError::NotDirectory => -20,     // ENOTDIR
                 KernelError::PermissionDenied => -13, // EACCES
                 KernelError::TooManySymlinks => -40,  // ELOOP
-                _ => -22,                         // EINVAL
+                _ => -22,                             // EINVAL
             });
         }
     };

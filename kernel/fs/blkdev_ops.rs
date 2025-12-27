@@ -69,7 +69,6 @@ pub static BLKDEV_AOPS: BlkdevAddressSpaceOps = BlkdevAddressSpaceOps;
 use super::file::{File, FileOps, seek};
 use crate::error::KernelError;
 
-
 /// Block device file operations
 ///
 /// Implements FileOps for block special files, routing I/O through

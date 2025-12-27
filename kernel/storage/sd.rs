@@ -20,8 +20,8 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use super::{
-    Bio, BioOp, BlockDevice, BlockDriver, DevId, Disk, QueueLimits, RequestQueue,
-    major, register_blkdev, unregister_blkdev,
+    Bio, BioOp, BlockDevice, BlockDriver, DevId, Disk, QueueLimits, RequestQueue, major,
+    register_blkdev, unregister_blkdev,
 };
 
 use crate::error::KernelError;
@@ -376,7 +376,8 @@ pub fn create_scsi_disk(
     minor: u16,
 ) -> Result<Arc<BlockDevice>, KernelError> {
     // Probe the device
-    let scsi_disk = Arc::new(ScsiDisk::probe(host, target, lun).map_err(|_| KernelError::NotFound)?);
+    let scsi_disk =
+        Arc::new(ScsiDisk::probe(host, target, lun).map_err(|_| KernelError::NotFound)?);
 
     // Create driver
     let driver = ScsiDiskDriver::new(scsi_disk.clone());

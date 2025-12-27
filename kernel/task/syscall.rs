@@ -3336,17 +3336,123 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i6
 
 /// sys_pidfd_getfd - obtain a duplicate of another process's file descriptor
 ///
+/// This syscall duplicates a file descriptor from another process identified
+/// by a pidfd. The new fd is allocated in the caller's fd table with O_CLOEXEC set.
+///
 /// # Arguments
-/// * `pidfd` - File descriptor referring to the target process
-/// * `targetfd` - File descriptor in the target process to duplicate
-/// * `flags` - Flags (must be 0)
+/// * `pidfd` - File descriptor referring to the target process (from pidfd_open)
+/// * `targetfd` - File descriptor number in the target process to duplicate
+/// * `flags` - Flags (must be 0, reserved for future use)
 ///
 /// # Returns
 /// * >= 0: New file descriptor on success
-/// * -ENOSYS: Not implemented (requires PTRACE)
+/// * -EBADF: pidfd is not a valid fd or not a pidfd, or targetfd is invalid in target
+/// * -ESRCH: Target process doesn't exist or has exited
+/// * -EPERM: Permission denied (caller cannot access target's fds)
+/// * -EINVAL: flags is non-zero
+/// * -EMFILE: Too many open files in caller's process
 ///
-/// Note: This syscall requires PTRACE_MODE_ATTACH permissions which we don't
-/// implement yet. Return ENOSYS for now.
-pub fn sys_pidfd_getfd(_pidfd: i32, _targetfd: i32, _flags: u32) -> i64 {
-    -38 // ENOSYS
+/// # Permission Model
+/// Simplified PTRACE_MODE_ATTACH: allow if caller has CAP_SYS_PTRACE or same euid.
+pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
+    // Validate flags (must be 0)
+    if flags != 0 {
+        return EINVAL;
+    }
+
+    // Get caller's fd table and the pidfd file
+    let caller_tid = super::percpu::current_tid();
+    let caller_fd_table = match super::fdtable::get_task_fd(caller_tid) {
+        Some(t) => t,
+        None => return ESRCH,
+    };
+
+    let pidfd_file = {
+        let table = caller_fd_table.lock();
+        match table.get(pidfd) {
+            Some(f) => f,
+            None => return -9, // EBADF
+        }
+    };
+
+    // Verify it's actually a pidfd and get the target PID
+    let target_pid = match crate::pidfd::get_pidfd_pid(&pidfd_file) {
+        Some(pid) => pid,
+        None => return -9, // EBADF - not a pidfd
+    };
+
+    // Find the target task by PID and check permissions
+    let target_tid = match find_task_by_pid(target_pid) {
+        Some(tid) => tid,
+        None => return ESRCH,
+    };
+
+    // Permission check: CAP_SYS_PTRACE or same euid
+    if !check_pidfd_getfd_permission(target_tid) {
+        return EPERM;
+    }
+
+    // Get target's fd table
+    let target_fd_table = match super::fdtable::get_task_fd(target_tid) {
+        Some(t) => t,
+        None => return ESRCH, // Process exiting
+    };
+
+    // Get the file from target's fd table
+    let target_file = {
+        let table = target_fd_table.lock();
+        match table.get(targetfd) {
+            Some(f) => f,
+            None => return -9, // EBADF
+        }
+    };
+
+    // Allocate new fd in caller's fd table with FD_CLOEXEC
+    let nofile = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
+    let new_fd = {
+        let mut table = caller_fd_table.lock();
+        match table.alloc_with_flags(target_file, super::FD_CLOEXEC, nofile) {
+            Ok(fd) => fd,
+            Err(e) => return e as i64,
+        }
+    };
+
+    new_fd as i64
+}
+
+/// Find a task by PID (returns TID of the main thread)
+fn find_task_by_pid(pid: super::Pid) -> Option<super::Tid> {
+    let table = super::percpu::TASK_TABLE.lock();
+    table.tasks.iter().find(|t| t.pid == pid).map(|t| t.tid)
+}
+
+/// Check permission for pidfd_getfd
+///
+/// Simplified PTRACE_MODE_ATTACH check:
+/// - Allow if caller has CAP_SYS_PTRACE
+/// - Allow if same effective UID
+fn check_pidfd_getfd_permission(target_tid: super::Tid) -> bool {
+    // CAP_SYS_PTRACE bypasses all checks
+    if super::capable(super::CAP_SYS_PTRACE) {
+        return true;
+    }
+
+    // Get caller credentials
+    let caller_cred = super::percpu::current_cred();
+
+    // Get target credentials from task table
+    let target_euid = {
+        let table = super::percpu::TASK_TABLE.lock();
+        table
+            .tasks
+            .iter()
+            .find(|t| t.tid == target_tid)
+            .map(|t| t.cred.euid)
+    };
+
+    // Same effective UID check
+    match target_euid {
+        Some(euid) => caller_cred.euid == euid,
+        None => false, // Target doesn't exist
+    }
 }

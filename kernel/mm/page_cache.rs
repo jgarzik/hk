@@ -773,7 +773,6 @@ impl AddressSpace {
     }
 }
 
-
 /// Cache key for looking up pages
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct PageCacheKey {
@@ -948,9 +947,7 @@ impl PageCache {
         }
 
         // Allocate frame
-        let frame = frame_alloc
-            .alloc_frame()
-            .ok_or(KernelError::OutOfMemory)?;
+        let frame = frame_alloc.alloc_frame().ok_or(KernelError::OutOfMemory)?;
 
         // Copy data to frame
         unsafe {
@@ -1156,9 +1153,7 @@ impl PageCache {
         }
 
         // Allocate frame
-        let frame = frame_alloc
-            .alloc_frame()
-            .ok_or(KernelError::OutOfMemory)?;
+        let frame = frame_alloc.alloc_frame().ok_or(KernelError::OutOfMemory)?;
 
         // Zero the frame
         unsafe {

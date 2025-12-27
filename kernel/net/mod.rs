@@ -183,4 +183,3 @@ pub fn dev_queue_xmit(skb: Box<SkBuff>) -> Result<(), KernelError> {
     // Let the device transmit the packet
     dev.xmit(skb)
 }
-

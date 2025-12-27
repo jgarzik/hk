@@ -26,8 +26,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 
 use super::{
-    Bio, BioOp, BlockDevice, BlockDriver, DevId, Disk, QueueLimits, RequestQueue,
-    major, register_blkdev,
+    Bio, BioOp, BlockDevice, BlockDriver, DevId, Disk, QueueLimits, RequestQueue, major,
+    register_blkdev,
 };
 use crate::error::KernelError;
 use crate::frame_alloc::FrameAllocRef;

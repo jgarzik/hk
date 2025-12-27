@@ -600,6 +600,10 @@ pub const SYS_CLONE3: u64 = 435;
 /// syslog(type, buf, len) - Read/control kernel message ring buffer
 pub const SYS_SYSLOG: u64 = 103;
 
+// TTY control
+/// vhangup() - Simulate hangup on controlling terminal
+pub const SYS_VHANGUP: u64 = 153;
+
 // Process personality/execution domain
 /// personality(persona) - Set process execution domain
 pub const SYS_PERSONALITY: u64 = 135;
@@ -1473,6 +1477,9 @@ pub fn x86_64_syscall_dispatch(
             use crate::task::syscall::sys_syslog;
             sys_syslog::<Uaccess>(arg0 as i32, arg1, arg2 as i32) as u64
         }
+
+        // TTY control
+        SYS_VHANGUP => crate::tty::sys_vhangup() as u64,
 
         // pidfd syscalls
         SYS_PIDFD_OPEN => {

@@ -212,4 +212,3 @@ impl KernelError {
 
 /// Result type alias for kernel operations
 pub type KernelResult<T> = Result<T, KernelError>;
-

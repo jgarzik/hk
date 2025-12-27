@@ -380,7 +380,10 @@ pub fn do_mount(
 }
 
 /// Mount a filesystem at a path string
-pub fn mount_at_path(fs_type: &'static FileSystemType, path: &str) -> Result<Arc<Mount>, KernelError> {
+pub fn mount_at_path(
+    fs_type: &'static FileSystemType,
+    path: &str,
+) -> Result<Arc<Mount>, KernelError> {
     if path == "/" || path.is_empty() {
         // Root mount
         do_mount(fs_type, None)
@@ -410,7 +413,9 @@ pub fn do_mount_dev(
     mountpoint: Option<Arc<Dentry>>,
 ) -> Result<Arc<Mount>, KernelError> {
     // The filesystem must support device mounting
-    let mount_dev_fn = fs_type.mount_dev.ok_or(KernelError::OperationNotSupported)?;
+    let mount_dev_fn = fs_type
+        .mount_dev
+        .ok_or(KernelError::OperationNotSupported)?;
 
     // Look up the source device path
     let source_dentry = super::path::lookup_path(source)?;

@@ -26,6 +26,7 @@ pub mod vfat;
 pub mod vfs;
 
 // Re-exports for convenience
+pub use crate::error::KernelError;
 pub use blkdev_ops::BLOCK_FILE_OPS;
 pub use cpio::unpack_cpio;
 pub use dentry::{DCACHE, Dentry, DentryCache, is_subdir};
@@ -54,7 +55,6 @@ pub use superblock::{
     SuperBlock, SuperOps, find_filesystem, init_fs_registry, register_filesystem,
 };
 pub use vfat::{VFAT_FILE_OPS, VFAT_TYPE};
-pub use crate::error::KernelError;
 pub use vfs::{FileMetadata, FileSystem, Vfs};
 
 /// Filesystem error types (extending the original KernelError)

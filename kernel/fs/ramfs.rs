@@ -318,7 +318,12 @@ impl InodeOps for RamfsInodeOps {
         Ok(new_inode)
     }
 
-    fn readpage(&self, inode: &Inode, page_offset: u64, buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn readpage(
+        &self,
+        inode: &Inode,
+        page_offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, KernelError> {
         // Ramfs uses page cache via AddressSpaceOps (RAMFS_AOPS).
         // This InodeOps::readpage is deprecated for ramfs - use the page cache directly.
         use crate::frame_alloc::FrameAllocRef;
@@ -603,14 +608,20 @@ impl InodeOps for RamfsInodeOps {
             let mut children = old_dir_data.children.write();
 
             // Get the source inode
-            let source_inode = children.get(old_name).cloned().ok_or(KernelError::NotFound)?;
+            let source_inode = children
+                .get(old_name)
+                .cloned()
+                .ok_or(KernelError::NotFound)?;
 
             // Check target exists
             let target_exists = children.contains_key(new_name);
 
             if exchange {
                 // Exchange requires both to exist
-                let target_inode = children.get(new_name).cloned().ok_or(KernelError::NotFound)?;
+                let target_inode = children
+                    .get(new_name)
+                    .cloned()
+                    .ok_or(KernelError::NotFound)?;
 
                 // Swap the entries
                 children.insert(String::from(old_name), target_inode);
@@ -747,7 +758,13 @@ impl InodeOps for RamfsInodeOps {
         Ok(attr_value.len())
     }
 
-    fn setxattr(&self, inode: &Inode, name: &str, value: &[u8], flags: u32) -> Result<(), KernelError> {
+    fn setxattr(
+        &self,
+        inode: &Inode,
+        name: &str,
+        value: &[u8],
+        flags: u32,
+    ) -> Result<(), KernelError> {
         // Constants for xattr flags
         const XATTR_CREATE: u32 = 0x1;
         const XATTR_REPLACE: u32 = 0x2;
@@ -1232,7 +1249,12 @@ impl FileOps for RamfsFileOps {
         self.pread(file, buf, offset)
     }
 
-    fn write_with_flags(&self, file: &File, buf: &[u8], _flags: RwFlags) -> Result<usize, KernelError> {
+    fn write_with_flags(
+        &self,
+        file: &File,
+        buf: &[u8],
+        _flags: RwFlags,
+    ) -> Result<usize, KernelError> {
         // In-memory filesystem never blocks
         self.write(file, buf)
     }

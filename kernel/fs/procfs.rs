@@ -366,7 +366,12 @@ impl InodeOps for ProcfsInodeOps {
         }
     }
 
-    fn readpage(&self, inode: &Inode, page_offset: u64, buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn readpage(
+        &self,
+        inode: &Inode,
+        page_offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, KernelError> {
         // For procfs, we generate content on demand
         // This is called for page cache integration but procfs typically
         // doesn't use the page cache (content is ephemeral)

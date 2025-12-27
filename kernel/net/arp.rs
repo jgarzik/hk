@@ -188,7 +188,11 @@ pub fn arp_rcv(mut skb: SkBuff) {
 /// queues the packet for later transmission.
 ///
 /// Uses current namespace's ARP cache.
-pub fn arp_resolve(dev: &Arc<NetDevice>, ip: Ipv4Addr, skb: Box<SkBuff>) -> Result<(), KernelError> {
+pub fn arp_resolve(
+    dev: &Arc<NetDevice>,
+    ip: Ipv4Addr,
+    skb: Box<SkBuff>,
+) -> Result<(), KernelError> {
     let ns = crate::net::current_net_ns();
     let now = crate::time::current_ticks();
 

@@ -1513,7 +1513,11 @@ fn update_dir_entry_by_short_name(
 }
 
 /// Delete a directory entry by marking it as deleted (0xE5)
-fn delete_dir_entry(sb_data: &VfatSbData, parent_cluster: u32, name: &str) -> Result<u32, KernelError> {
+fn delete_dir_entry(
+    sb_data: &VfatSbData,
+    parent_cluster: u32,
+    name: &str,
+) -> Result<u32, KernelError> {
     let chain = read_cluster_chain(sb_data, parent_cluster)?;
     let entries_per_cluster = sb_data.cluster_size as usize / 32;
 
@@ -1671,7 +1675,12 @@ impl InodeOps for VfatInodeOps {
         Err(KernelError::NotFound)
     }
 
-    fn readpage(&self, inode: &Inode, page_offset: u64, buf: &mut [u8]) -> Result<usize, KernelError> {
+    fn readpage(
+        &self,
+        inode: &Inode,
+        page_offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, KernelError> {
         let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
         let inode_data = get_inode_data(inode)?;

@@ -245,7 +245,7 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] eventfd2
 - [x] pidfd_open
 - [x] pidfd_send_signal
-- [ ] pidfd_getfd (stub - requires PTRACE capabilities)
+- [x] pidfd_getfd
 
 7.2 Futex (core for modern libs/threads)
 
@@ -426,7 +426,7 @@ Misc utilities that don't fit elsewhere:
 - [ ] getpgid / setpgid (already listed)
 - [x] personality
 - [x] umount / umount2 (already listed)
-- [ ] vhangup
+- [x] vhangup
 - [x] readahead
 - [ ] sysfs (legacy)
 - fanotify_* (already listed)

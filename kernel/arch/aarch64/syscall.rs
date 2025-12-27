@@ -406,6 +406,10 @@ pub const SYS_PERSONALITY: u64 = 92;
 /// syslog(type, buf, len) - Read/control kernel message ring buffer
 pub const SYS_SYSLOG: u64 = 116;
 
+// TTY control
+/// vhangup() - Simulate hangup on controlling terminal
+pub const SYS_VHANGUP: u64 = 58;
+
 // pidfd syscalls
 /// pidfd_send_signal(pidfd, sig, info, flags) - Send signal to process via pidfd
 pub const SYS_PIDFD_SEND_SIGNAL: u64 = 424;
@@ -824,6 +828,9 @@ pub fn aarch64_syscall_dispatch(
             use crate::task::syscall::sys_syslog;
             sys_syslog::<Uaccess>(arg0 as i32, arg1, arg2 as i32) as u64
         }
+
+        // TTY control
+        SYS_VHANGUP => crate::tty::sys_vhangup() as u64,
 
         // pidfd syscalls
         SYS_PIDFD_OPEN => {

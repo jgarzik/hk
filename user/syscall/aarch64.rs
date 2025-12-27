@@ -2071,6 +2071,23 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
     unsafe { syscall3!(SYS_PIDFD_GETFD, pidfd, targetfd, flags) }
 }
 
+// --- vhangup ---
+
+/// vhangup syscall number (aarch64)
+pub const SYS_VHANGUP: u64 = 58;
+
+/// vhangup() - simulate hangup on controlling terminal
+///
+/// Simulates a hangup on the current process's controlling terminal.
+/// This is typically used by login(1) to ensure a clean terminal state.
+///
+/// Returns 0 on success, or a negative error code:
+/// - -EPERM: Caller lacks CAP_SYS_TTY_CONFIG capability
+#[inline(always)]
+pub fn sys_vhangup() -> i64 {
+    unsafe { syscall0!(SYS_VHANGUP) }
+}
+
 // --- io_uring ---
 
 /// io_uring_setup syscall number (aarch64)
