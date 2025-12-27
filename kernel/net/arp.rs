@@ -7,7 +7,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-use crate::net::NetError;
+use crate::net::KernelError;
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{self, ETH_ALEN, ETH_BROADCAST, ETH_HLEN, EtherType};
 use crate::net::ipv4::{self, Ipv4Addr};
@@ -188,7 +188,11 @@ pub fn arp_rcv(mut skb: SkBuff) {
 /// queues the packet for later transmission.
 ///
 /// Uses current namespace's ARP cache.
-pub fn arp_resolve(dev: &Arc<NetDevice>, ip: Ipv4Addr, skb: Box<SkBuff>) -> Result<(), NetError> {
+pub fn arp_resolve(
+    dev: &Arc<NetDevice>,
+    ip: Ipv4Addr,
+    skb: Box<SkBuff>,
+) -> Result<(), KernelError> {
     let ns = crate::net::current_net_ns();
     let now = crate::time::current_ticks();
 

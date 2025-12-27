@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use spin::Mutex;
 
-use crate::net::NetError;
+use crate::net::KernelError;
 use crate::net::ipv4::{self, IPPROTO_TCP, Ipv4Addr};
 use crate::net::socket::Socket;
 
@@ -288,9 +288,9 @@ pub fn tcp_connect(
     socket: &Arc<Socket>,
     remote_addr: Ipv4Addr,
     remote_port: u16,
-) -> Result<(), NetError> {
-    let tcp = socket.tcp.as_ref().ok_or(NetError::InvalidArgument)?;
-    let config = crate::net::get_config().ok_or(NetError::InvalidArgument)?;
+) -> Result<(), KernelError> {
+    let tcp = socket.tcp.as_ref().ok_or(KernelError::InvalidArgument)?;
+    let config = crate::net::get_config().ok_or(KernelError::InvalidArgument)?;
 
     // Allocate local port
     let local_port = tcp_alloc_port();
@@ -327,8 +327,8 @@ pub fn tcp_connect(
 }
 
 /// Close a TCP connection
-pub fn tcp_close(socket: &Arc<Socket>) -> Result<(), NetError> {
-    let tcp = socket.tcp.as_ref().ok_or(NetError::InvalidArgument)?;
+pub fn tcp_close(socket: &Arc<Socket>) -> Result<(), KernelError> {
+    let tcp = socket.tcp.as_ref().ok_or(KernelError::InvalidArgument)?;
 
     match tcp.state() {
         TcpState::Closed | TcpState::Listen => {

@@ -5,7 +5,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
-use crate::net::NetError;
+use crate::net::KernelError;
 use crate::net::ipv4::{self, IPPROTO_TCP, Ipv4Addr};
 use crate::net::request_sock::RequestSock;
 use crate::net::skb::SkBuff;
@@ -13,20 +13,20 @@ use crate::net::socket::Socket;
 use crate::net::tcp::{TCP_HLEN_MIN, TcpSegment, TcpState, flags, tcp_checksum};
 
 /// Send data over a TCP connection
-pub fn tcp_sendmsg(socket: &Arc<Socket>, data: &[u8]) -> Result<usize, NetError> {
-    let tcp = socket.tcp.as_ref().ok_or(NetError::InvalidArgument)?;
+pub fn tcp_sendmsg(socket: &Arc<Socket>, data: &[u8]) -> Result<usize, KernelError> {
+    let tcp = socket.tcp.as_ref().ok_or(KernelError::InvalidArgument)?;
 
     // Check state
     if !tcp.state().is_connected() {
-        return Err(NetError::NotSupported);
+        return Err(KernelError::OperationNotSupported);
     }
 
     if tcp.state() != TcpState::Established && tcp.state() != TcpState::CloseWait {
-        return Err(NetError::NotSupported);
+        return Err(KernelError::OperationNotSupported);
     }
 
-    let (local_addr, local_port) = socket.local_addr().ok_or(NetError::InvalidArgument)?;
-    let (remote_addr, remote_port) = socket.remote_addr().ok_or(NetError::InvalidArgument)?;
+    let (local_addr, local_port) = socket.local_addr().ok_or(KernelError::InvalidArgument)?;
+    let (remote_addr, remote_port) = socket.remote_addr().ok_or(KernelError::InvalidArgument)?;
 
     // Segment data into MSS-sized chunks
     let mss = tcp.mss as usize;
@@ -40,7 +40,7 @@ pub fn tcp_sendmsg(socket: &Arc<Socket>, data: &[u8]) -> Result<usize, NetError>
             if sent > 0 {
                 return Ok(sent);
             }
-            return Err(NetError::WouldBlock);
+            return Err(KernelError::WouldBlock);
         }
 
         let chunk_len = (data.len() - sent).min(mss).min(snd_wnd as usize);
@@ -51,10 +51,10 @@ pub fn tcp_sendmsg(socket: &Arc<Socket>, data: &[u8]) -> Result<usize, NetError>
         let ack = tcp.rcv_nxt();
         let window = tcp.rcv_wnd.load(Ordering::Acquire) as u16;
 
-        let mut skb = SkBuff::alloc_tx(chunk_len).ok_or(NetError::OutOfMemory)?;
+        let mut skb = SkBuff::alloc_tx(chunk_len).ok_or(KernelError::OutOfMemory)?;
 
         // Add payload
-        skb.put_slice(chunk).ok_or(NetError::NoBufferSpace)?;
+        skb.put_slice(chunk).ok_or(KernelError::NoBufferSpace)?;
 
         // Build TCP header
         build_tcp_header(
@@ -96,15 +96,15 @@ pub fn tcp_sendmsg(socket: &Arc<Socket>, data: &[u8]) -> Result<usize, NetError>
 }
 
 /// Send a SYN segment
-pub fn tcp_send_syn(socket: &Arc<Socket>) -> Result<(), NetError> {
-    let tcp = socket.tcp.as_ref().ok_or(NetError::InvalidArgument)?;
-    let (local_addr, local_port) = socket.local_addr().ok_or(NetError::InvalidArgument)?;
-    let (remote_addr, remote_port) = socket.remote_addr().ok_or(NetError::InvalidArgument)?;
+pub fn tcp_send_syn(socket: &Arc<Socket>) -> Result<(), KernelError> {
+    let tcp = socket.tcp.as_ref().ok_or(KernelError::InvalidArgument)?;
+    let (local_addr, local_port) = socket.local_addr().ok_or(KernelError::InvalidArgument)?;
+    let (remote_addr, remote_port) = socket.remote_addr().ok_or(KernelError::InvalidArgument)?;
 
     let seq = tcp.snd_nxt();
     let window = tcp.rcv_wnd.load(Ordering::Acquire) as u16;
 
-    let mut skb = SkBuff::alloc_tx(0).ok_or(NetError::OutOfMemory)?;
+    let mut skb = SkBuff::alloc_tx(0).ok_or(KernelError::OutOfMemory)?;
 
     // Build TCP header with SYN flag
     build_tcp_header(
@@ -130,16 +130,16 @@ pub fn tcp_send_syn(socket: &Arc<Socket>) -> Result<(), NetError> {
 }
 
 /// Send an ACK segment
-pub fn tcp_send_ack(socket: &Arc<Socket>) -> Result<(), NetError> {
-    let tcp = socket.tcp.as_ref().ok_or(NetError::InvalidArgument)?;
-    let (local_addr, local_port) = socket.local_addr().ok_or(NetError::InvalidArgument)?;
-    let (remote_addr, remote_port) = socket.remote_addr().ok_or(NetError::InvalidArgument)?;
+pub fn tcp_send_ack(socket: &Arc<Socket>) -> Result<(), KernelError> {
+    let tcp = socket.tcp.as_ref().ok_or(KernelError::InvalidArgument)?;
+    let (local_addr, local_port) = socket.local_addr().ok_or(KernelError::InvalidArgument)?;
+    let (remote_addr, remote_port) = socket.remote_addr().ok_or(KernelError::InvalidArgument)?;
 
     let seq = tcp.snd_nxt();
     let ack = tcp.rcv_nxt();
     let window = tcp.rcv_wnd.load(Ordering::Acquire) as u16;
 
-    let mut skb = SkBuff::alloc_tx(0).ok_or(NetError::OutOfMemory)?;
+    let mut skb = SkBuff::alloc_tx(0).ok_or(KernelError::OutOfMemory)?;
 
     build_tcp_header(
         &mut skb,
@@ -160,16 +160,16 @@ pub fn tcp_send_ack(socket: &Arc<Socket>) -> Result<(), NetError> {
 }
 
 /// Send a FIN segment
-pub fn tcp_send_fin(socket: &Arc<Socket>) -> Result<(), NetError> {
-    let tcp = socket.tcp.as_ref().ok_or(NetError::InvalidArgument)?;
-    let (local_addr, local_port) = socket.local_addr().ok_or(NetError::InvalidArgument)?;
-    let (remote_addr, remote_port) = socket.remote_addr().ok_or(NetError::InvalidArgument)?;
+pub fn tcp_send_fin(socket: &Arc<Socket>) -> Result<(), KernelError> {
+    let tcp = socket.tcp.as_ref().ok_or(KernelError::InvalidArgument)?;
+    let (local_addr, local_port) = socket.local_addr().ok_or(KernelError::InvalidArgument)?;
+    let (remote_addr, remote_port) = socket.remote_addr().ok_or(KernelError::InvalidArgument)?;
 
     let seq = tcp.snd_nxt();
     let ack = tcp.rcv_nxt();
     let window = tcp.rcv_wnd.load(Ordering::Acquire) as u16;
 
-    let mut skb = SkBuff::alloc_tx(0).ok_or(NetError::OutOfMemory)?;
+    let mut skb = SkBuff::alloc_tx(0).ok_or(KernelError::OutOfMemory)?;
 
     build_tcp_header(
         &mut skb,
@@ -197,8 +197,8 @@ pub fn tcp_send_fin(socket: &Arc<Socket>) -> Result<(), NetError> {
 /// Following Linux's tcp_v4_send_synack() -> tcp_make_synack():
 /// This is sent from a listening socket to a client that sent a SYN.
 /// The RequestSock contains the connection parameters from the SYN.
-pub fn tcp_send_synack(_listener: &Arc<Socket>, req: &RequestSock) -> Result<(), NetError> {
-    let mut skb = SkBuff::alloc_tx(0).ok_or(NetError::OutOfMemory)?;
+pub fn tcp_send_synack(_listener: &Arc<Socket>, req: &RequestSock) -> Result<(), KernelError> {
+    let mut skb = SkBuff::alloc_tx(0).ok_or(KernelError::OutOfMemory)?;
 
     // SYN-ACK: seq = our ISS, ack = client's ISN + 1
     let seq = req.iss;
@@ -230,8 +230,8 @@ pub fn tcp_send_rst(
     remote_addr: Ipv4Addr,
     remote_port: u16,
     seq: u32,
-) -> Result<(), NetError> {
-    let mut skb = SkBuff::alloc_tx(0).ok_or(NetError::OutOfMemory)?;
+) -> Result<(), KernelError> {
+    let mut skb = SkBuff::alloc_tx(0).ok_or(KernelError::OutOfMemory)?;
 
     build_tcp_header(
         &mut skb,
@@ -263,11 +263,11 @@ fn build_tcp_header(
     window: u16,
     saddr: Ipv4Addr,
     daddr: Ipv4Addr,
-) -> Result<(), NetError> {
+) -> Result<(), KernelError> {
     let _payload_len = skb.len();
 
     // Push TCP header
-    let hdr = skb.push(TCP_HLEN_MIN).ok_or(NetError::NoBufferSpace)?;
+    let hdr = skb.push(TCP_HLEN_MIN).ok_or(KernelError::NoBufferSpace)?;
 
     // Source port
     hdr[0..2].copy_from_slice(&source_port.to_be_bytes());

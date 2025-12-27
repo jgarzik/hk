@@ -7,8 +7,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 
+use crate::error::KernelError;
+
 use super::key::Key;
-use super::{EKEYREVOKED, EOPNOTSUPP};
 
 /// Trait for pluggable key types
 ///
@@ -59,7 +60,7 @@ impl KeyType for UserKeyType {
 
     fn read(&self, key: &Key, buffer: &mut [u8]) -> Result<usize, i64> {
         if key.is_revoked() {
-            return Err(EKEYREVOKED);
+            return Err(KernelError::KeyRevoked.sysret());
         }
 
         if let Some(payload) = key.read_payload() {
@@ -73,7 +74,7 @@ impl KeyType for UserKeyType {
 
     fn update(&self, key: &Key, data: &[u8]) -> Result<(), i64> {
         if key.is_revoked() {
-            return Err(EKEYREVOKED);
+            return Err(KernelError::KeyRevoked.sysret());
         }
         key.set_payload(data.to_vec());
         Ok(())
@@ -118,7 +119,7 @@ impl KeyType for KeyringKeyType {
 
     fn read(&self, key: &Key, buffer: &mut [u8]) -> Result<usize, i64> {
         if key.is_revoked() {
-            return Err(EKEYREVOKED);
+            return Err(KernelError::KeyRevoked.sysret());
         }
 
         // Return list of key serial numbers as i32 array
@@ -137,7 +138,7 @@ impl KeyType for KeyringKeyType {
 
     fn update(&self, _key: &Key, _data: &[u8]) -> Result<(), i64> {
         // Keyrings cannot be updated via KEYCTL_UPDATE
-        Err(EOPNOTSUPP)
+        Err(KernelError::OperationNotSupported.sysret())
     }
 
     fn describe(&self, key: &Key) -> String {

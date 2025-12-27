@@ -8,13 +8,13 @@
 use alloc::vec;
 
 use crate::arch::Uaccess;
+use crate::error::KernelError;
 use crate::task::percpu;
 use crate::uaccess::{copy_from_user, strncpy_from_user};
 
 use super::key::{KEY_DEFAULT_PERM, Key};
 use super::keyring::{keyring_link, resolve_special_keyring, search_process_keyrings};
 use super::types::get_key_type;
-use super::{EFAULT, EINVAL, ENOKEY};
 use super::{alloc_serial, register_key, remove_key};
 
 /// Maximum type name length
@@ -42,32 +42,32 @@ const MAX_PAYLOAD_SIZE: usize = 1024 * 1024 - 1;
 pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, keyring: i32) -> i64 {
     // Validate payload size
     if plen > MAX_PAYLOAD_SIZE as u64 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Copy type string from userspace
     let type_name = match strncpy_from_user::<Uaccess>(type_ptr, MAX_TYPE_LEN) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Copy description from userspace
     let description = match strncpy_from_user::<Uaccess>(desc_ptr, MAX_DESC_LEN) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Look up the key type
     let key_type = match get_key_type(&type_name) {
         Some(kt) => kt,
-        None => return EINVAL,
+        None => return KernelError::InvalidArgument.sysret(),
     };
 
     // Copy payload from userspace (if any)
     let payload = if plen > 0 && payload_ptr != 0 {
         let mut buf = vec![0u8; plen as usize];
         if copy_from_user::<Uaccess>(&mut buf, payload_ptr, plen as usize).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
         buf
     } else {
@@ -88,7 +88,7 @@ pub fn sys_add_key(type_ptr: u64, desc_ptr: u64, payload_ptr: u64, plen: u64, ke
 
     // Check if destination is actually a keyring
     if !dest_keyring.is_keyring() {
-        return super::ENOTDIR;
+        return KernelError::NotDirectory.sysret();
     }
 
     // Allocate new key
@@ -144,13 +144,13 @@ pub fn sys_request_key(
     // Copy type string from userspace
     let type_name = match strncpy_from_user::<Uaccess>(type_ptr, MAX_TYPE_LEN) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Copy description from userspace
     let description = match strncpy_from_user::<Uaccess>(desc_ptr, MAX_DESC_LEN) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Get current credentials
@@ -163,7 +163,7 @@ pub fn sys_request_key(
     if let Some(key) = search_process_keyrings(&type_name, &description, tid) {
         // Check if key is valid
         if key.is_revoked() {
-            return super::EKEYREVOKED;
+            return KernelError::KeyRevoked.sysret();
         }
 
         // Link to destination keyring if specified
@@ -177,7 +177,7 @@ pub fn sys_request_key(
     }
 
     // Key not found (we don't support userspace upcall)
-    ENOKEY
+    KernelError::NoKey.sysret()
 }
 
 /// keyctl syscall
@@ -208,6 +208,6 @@ pub fn sys_keyctl(cmd: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
         KEYCTL_SEARCH => keyctl_search(arg2 as i32, arg3, arg4, arg5 as i32),
         KEYCTL_READ => keyctl_read(arg2 as i32, arg3, arg4 as usize),
         KEYCTL_INVALIDATE => keyctl_invalidate(arg2 as i32),
-        _ => EOPNOTSUPP,
+        _ => KernelError::OperationNotSupported.sysret(),
     }
 }

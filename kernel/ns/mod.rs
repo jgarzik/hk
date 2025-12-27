@@ -21,6 +21,7 @@
 //!
 //! VFS locks → Namespace locks → Filesystem context → Per-CPU scheduler → TASK_TABLE
 
+pub mod cgroup;
 pub mod net;
 pub mod pid;
 pub mod user;
@@ -30,6 +31,7 @@ use alloc::sync::Arc;
 use spin::{Lazy, RwLock};
 
 use crate::task::Tid;
+pub use cgroup::{CgroupNamespace, INIT_CGROUP_NS};
 pub use pid::{
     INIT_PID_NS, PidNamespace, find_task_by_pid_ns, register_task_pids, task_pid_nr,
     task_pid_nr_ns, unregister_task_pids,
@@ -281,8 +283,10 @@ pub struct NsProxy {
 
     /// Network namespace (network stack isolation)
     pub net_ns: Arc<NetNamespace>,
+
+    /// Cgroup namespace (cgroup hierarchy virtualization)
+    pub cgroup_ns: Arc<CgroupNamespace>,
     // Future namespaces:
-    // pub cgroup_ns: Arc<CgroupNamespace>,
     // pub time_ns: Arc<TimeNamespace>,
 }
 
@@ -296,6 +300,7 @@ impl NsProxy {
             user_ns: INIT_USER_NS.clone(),
             ipc_ns: INIT_IPC_NS.clone(),
             net_ns: INIT_NET_NS.clone(),
+            cgroup_ns: INIT_CGROUP_NS.clone(),
         }
     }
 
@@ -347,6 +352,14 @@ impl NsProxy {
             self.net_ns.clone()
         };
 
+        let cgroup_ns = if flags & CLONE_NEWCGROUP != 0 {
+            // New cgroup namespace rooted at current task's cgroup
+            // For now, use the same root (proper implementation would get task's cgroup)
+            self.cgroup_ns.clone_ns(self.cgroup_ns.root())?
+        } else {
+            self.cgroup_ns.clone()
+        };
+
         Ok(Arc::new(Self {
             uts_ns,
             mnt_ns,
@@ -354,6 +367,7 @@ impl NsProxy {
             user_ns,
             ipc_ns,
             net_ns,
+            cgroup_ns,
         }))
     }
 }
@@ -685,6 +699,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             user_ns: current_ns.user_ns.clone(),
             ipc_ns: current_ns.ipc_ns.clone(),
             net_ns: current_ns.net_ns.clone(),
+            cgroup_ns: current_ns.cgroup_ns.clone(),
         }),
         NamespaceType::Mnt => Arc::new(NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
@@ -693,6 +708,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             user_ns: current_ns.user_ns.clone(),
             ipc_ns: current_ns.ipc_ns.clone(),
             net_ns: current_ns.net_ns.clone(),
+            cgroup_ns: current_ns.cgroup_ns.clone(),
         }),
         NamespaceType::Pid => Arc::new(NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
@@ -701,6 +717,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             user_ns: current_ns.user_ns.clone(),
             ipc_ns: current_ns.ipc_ns.clone(),
             net_ns: current_ns.net_ns.clone(),
+            cgroup_ns: current_ns.cgroup_ns.clone(),
         }),
         NamespaceType::User => Arc::new(NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
@@ -709,6 +726,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             user_ns: target_ns.user_ns.clone(),
             ipc_ns: current_ns.ipc_ns.clone(),
             net_ns: current_ns.net_ns.clone(),
+            cgroup_ns: current_ns.cgroup_ns.clone(),
         }),
         NamespaceType::Ipc => Arc::new(NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
@@ -717,6 +735,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             user_ns: current_ns.user_ns.clone(),
             ipc_ns: target_ns.ipc_ns.clone(),
             net_ns: current_ns.net_ns.clone(),
+            cgroup_ns: current_ns.cgroup_ns.clone(),
         }),
         NamespaceType::Net => Arc::new(NsProxy {
             uts_ns: current_ns.uts_ns.clone(),
@@ -725,6 +744,7 @@ pub fn sys_setns(fd: i32, nstype: i32) -> i64 {
             user_ns: current_ns.user_ns.clone(),
             ipc_ns: current_ns.ipc_ns.clone(),
             net_ns: target_ns.net_ns.clone(),
+            cgroup_ns: current_ns.cgroup_ns.clone(),
         }),
     };
 

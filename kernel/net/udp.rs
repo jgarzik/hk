@@ -5,7 +5,7 @@
 
 use alloc::sync::Arc;
 
-use crate::net::NetError;
+use crate::net::KernelError;
 use crate::net::ipv4::{self, IPPROTO_UDP, Ipv4Addr};
 use crate::net::skb::SkBuff;
 use crate::net::socket::{Socket, SocketType};
@@ -127,13 +127,13 @@ pub fn udp_sendmsg(
     socket: &Arc<Socket>,
     data: &[u8],
     dest: Option<(Ipv4Addr, u16)>,
-) -> Result<usize, NetError> {
+) -> Result<usize, KernelError> {
     // Get destination address
     let (dest_addr, dest_port) = match dest {
         Some((addr, port)) => (addr, port),
         None => {
             // Use connected address
-            socket.remote_addr().ok_or(NetError::InvalidArgument)?
+            socket.remote_addr().ok_or(KernelError::InvalidArgument)?
         }
     };
 
@@ -157,7 +157,7 @@ pub fn udp_sendmsg(
         }
         None => {
             // Get source IP from config and allocate port
-            let config = crate::net::get_config().ok_or(NetError::InvalidArgument)?;
+            let config = crate::net::get_config().ok_or(KernelError::InvalidArgument)?;
             let port = crate::net::current_net_ns().alloc_port();
             socket.set_local(config.ipv4_addr, port);
             // Register socket so we can receive replies
@@ -183,17 +183,17 @@ fn udp_build_and_send(
     daddr: Ipv4Addr,
     dport: u16,
     data: &[u8],
-) -> Result<(), NetError> {
+) -> Result<(), KernelError> {
     // Allocate skb for UDP packet (returns Box<SkBuff>)
-    let mut skb = SkBuff::alloc_tx(UDP_HLEN + data.len()).ok_or(NetError::NoBufferSpace)?;
+    let mut skb = SkBuff::alloc_tx(UDP_HLEN + data.len()).ok_or(KernelError::NoBufferSpace)?;
 
     // Copy payload data
-    skb.put(data.len()).ok_or(NetError::NoBufferSpace)?;
+    skb.put(data.len()).ok_or(KernelError::NoBufferSpace)?;
     skb.data_mut()[..data.len()].copy_from_slice(data);
 
     // Build UDP header (prepend)
     let udp_len = (UDP_HLEN + data.len()) as u16;
-    let hdr_bytes = skb.push(UDP_HLEN).ok_or(NetError::NoBufferSpace)?;
+    let hdr_bytes = skb.push(UDP_HLEN).ok_or(KernelError::NoBufferSpace)?;
 
     // Source port
     hdr_bytes[0..2].copy_from_slice(&sport.to_be_bytes());

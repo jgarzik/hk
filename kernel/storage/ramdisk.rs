@@ -26,9 +26,10 @@ use alloc::string::String;
 use alloc::sync::Arc;
 
 use super::{
-    Bio, BioOp, BlockDevice, BlockDriver, BlockError, DevId, Disk, QueueLimits, RequestQueue,
-    major, register_blkdev,
+    Bio, BioOp, BlockDevice, BlockDriver, DevId, Disk, QueueLimits, RequestQueue, major,
+    register_blkdev,
 };
+use crate::error::KernelError;
 use crate::frame_alloc::FrameAllocRef;
 use crate::mm::page_cache::{FileId, NULL_AOPS, PAGE_SIZE};
 use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
@@ -93,7 +94,7 @@ impl BlockDriver for RamDiskDriver {
 ///
 /// # Returns
 /// The created BlockDevice on success
-pub fn create_ramdisk(minor: u16, capacity_mb: u64) -> Result<Arc<BlockDevice>, BlockError> {
+pub fn create_ramdisk(minor: u16, capacity_mb: u64) -> Result<Arc<BlockDevice>, KernelError> {
     let capacity_bytes = capacity_mb * 1024 * 1024;
     let capacity_sectors = capacity_bytes / 512;
 
@@ -141,7 +142,7 @@ pub fn create_ramdisk(minor: u16, capacity_mb: u64) -> Result<Arc<BlockDevice>, 
 ///
 /// # Returns
 /// The created BlockDevice on success
-pub fn create_ramdisk_from_data(minor: u16, data: &[u8]) -> Result<Arc<BlockDevice>, BlockError> {
+pub fn create_ramdisk_from_data(minor: u16, data: &[u8]) -> Result<Arc<BlockDevice>, KernelError> {
     // Round up size to MB for capacity calculation
     let size_bytes = data.len() as u64;
     let size_mb = size_bytes.div_ceil(1024 * 1024);
@@ -171,7 +172,7 @@ pub fn create_ramdisk_from_data(minor: u16, data: &[u8]) -> Result<Arc<BlockDevi
                 false, // not unevictable (clean pages can be evicted)
                 &NULL_AOPS,
             )
-            .map_err(|_| BlockError::IoError)?;
+            .map_err(|_| KernelError::Io)?;
 
         // Copy data to the frame
         let src_offset = page_idx * PAGE_SIZE;

@@ -5,7 +5,7 @@
 
 use alloc::sync::Arc;
 
-use crate::fs::FsError;
+use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, flags};
 use crate::net::socket::Socket;
 use crate::net::tcp::{self, TcpState};
@@ -33,7 +33,7 @@ impl FileOps for SocketFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0 || self.socket.is_nonblocking();
 
         loop {
@@ -46,7 +46,7 @@ impl FileOps for SocketFileOps {
                 self.socket
                     .error
                     .store(0, core::sync::atomic::Ordering::Release);
-                return Err(FsError::from_errno(-err));
+                return Err(KernelError::from_errno(-err));
             }
 
             // Try to read from receive buffer
@@ -77,7 +77,7 @@ impl FileOps for SocketFileOps {
             }
 
             if nonblock {
-                return Err(FsError::WouldBlock);
+                return Err(KernelError::WouldBlock);
             }
 
             // Block waiting for data
@@ -85,7 +85,7 @@ impl FileOps for SocketFileOps {
         }
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, FsError> {
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0 || self.socket.is_nonblocking();
 
         // Check for error
@@ -97,27 +97,27 @@ impl FileOps for SocketFileOps {
             self.socket
                 .error
                 .store(0, core::sync::atomic::Ordering::Release);
-            return Err(FsError::from_errno(-err));
+            return Err(KernelError::from_errno(-err));
         }
 
         // For TCP sockets, use tcp_sendmsg
         if let Some(ref _tcp) = self.socket.tcp {
             match tcp::tcp_sendmsg(&self.socket, buf) {
                 Ok(n) => Ok(n),
-                Err(crate::net::NetError::WouldBlock) => {
+                Err(crate::net::KernelError::WouldBlock) => {
                     if nonblock {
-                        Err(FsError::WouldBlock)
+                        Err(KernelError::WouldBlock)
                     } else {
                         // Block and retry
                         self.socket.tx_wait.wait();
                         // Retry once after wakeup
-                        tcp::tcp_sendmsg(&self.socket, buf).map_err(|_| FsError::WouldBlock)
+                        tcp::tcp_sendmsg(&self.socket, buf).map_err(|_| KernelError::WouldBlock)
                     }
                 }
-                Err(e) => Err(FsError::from_errno(-e.to_errno())),
+                Err(e) => Err(KernelError::from_errno(-e.to_errno_neg())),
             }
         } else {
-            Err(FsError::NotSupported)
+            Err(KernelError::OperationNotSupported)
         }
     }
 
@@ -167,7 +167,7 @@ impl FileOps for SocketFileOps {
         mask
     }
 
-    fn release(&self, _file: &File) -> Result<(), FsError> {
+    fn release(&self, _file: &File) -> Result<(), KernelError> {
         // Close the TCP connection
         if self.socket.tcp.is_some() {
             let _ = tcp::tcp_close(&self.socket);
@@ -176,12 +176,12 @@ impl FileOps for SocketFileOps {
     }
 }
 
-impl FsError {
+impl KernelError {
     /// Convert from errno
     pub fn from_errno(errno: i32) -> Self {
         match errno {
-            11 => FsError::WouldBlock,
-            _ => FsError::IoError,
+            11 => KernelError::WouldBlock,
+            _ => KernelError::Io,
         }
     }
 }

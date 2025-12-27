@@ -188,14 +188,15 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             }
 
             // COW handling: permission fault on write to a COW-marked page
-            if is_permission_fault && is_write {
-                if let Some(true) = handle_cow_fault(far) {
-                    return; // COW resolved, resume execution
-                }
-                // If handle_cow_fault returns None, it's not a COW page
-                // If it returns Some(false), COW resolution failed (OOM)
-                // In both cases, fall through to SIGSEGV
+            if is_permission_fault
+                && is_write
+                && let Some(true) = handle_cow_fault(far)
+            {
+                return; // COW resolved, resume execution
             }
+            // If handle_cow_fault returns None, it's not a COW page
+            // If it returns Some(false), COW resolution failed (OOM)
+            // In both cases, fall through to SIGSEGV
 
             // Unhandled fault - send signal to process
             printkln!(
@@ -260,6 +261,96 @@ extern "C" fn handle_el0_irq(frame: &mut Aarch64TrapFrame) {
     handle_el1_irq(frame);
 }
 
+/// Try to allocate and map a 2MB huge page for a THP-eligible VMA
+///
+/// Returns:
+/// - Some(true) if a huge page was successfully allocated and mapped
+/// - Some(false) if allocation/mapping failed
+/// - None if THP is not applicable (fall through to 4KB allocation)
+fn try_huge_page_fault(
+    pt_root: u64,
+    fault_addr: u64,
+    vma_start: u64,
+    vma_end: u64,
+    vma_prot: u32,
+    anon_vma: Option<&alloc::sync::Arc<crate::mm::anon_vma::AnonVma>>,
+) -> Option<bool> {
+    use crate::arch::PageFlags;
+    use crate::arch::aarch64::paging::Aarch64PageTable;
+    use crate::mm::huge_page::{HUGE_PAGE_SIZE, huge_page_align_down};
+    use crate::mm::{PROT_EXEC, PROT_WRITE};
+
+    // Calculate the 2MB-aligned region containing this fault
+    let huge_base = huge_page_align_down(fault_addr);
+    let huge_end = huge_base + HUGE_PAGE_SIZE;
+
+    // VMA must fully contain the 2MB region
+    if vma_start > huge_base || vma_end < huge_end {
+        return None; // Fall back to 4KB
+    }
+
+    // Try to allocate a contiguous 2MB physical region
+    // Falls back to 4KB allocation if no contiguous memory available
+    let huge_frame = crate::FRAME_ALLOCATOR.alloc_huge()?;
+
+    // Zero the 2MB region
+    unsafe {
+        core::ptr::write_bytes(huge_frame as *mut u8, 0, HUGE_PAGE_SIZE as usize);
+    }
+
+    // Build page flags from VMA protection
+    let mut flags = PageFlags::READ | PageFlags::USER;
+    if vma_prot & PROT_WRITE != 0 {
+        flags |= PageFlags::WRITE;
+    }
+    if vma_prot & PROT_EXEC != 0 {
+        flags |= PageFlags::EXECUTE;
+    }
+
+    // Map the huge page
+    if Aarch64PageTable::map_huge_page(
+        pt_root,
+        huge_base,
+        huge_frame,
+        flags,
+        &mut &crate::FRAME_ALLOCATOR,
+    )
+    .is_err()
+    {
+        // Mapping failed - free the huge page and fall back
+        crate::FRAME_ALLOCATOR.free_huge(huge_frame);
+        return None;
+    }
+
+    // Register with LRU (track head frame only for huge pages)
+    {
+        use crate::mm::lru::lru_add_new;
+        use crate::mm::rmap::page_add_anon_rmap;
+
+        if let Some(anon_vma) = anon_vma {
+            page_add_anon_rmap(huge_frame, anon_vma, huge_base);
+        }
+        lru_add_new(huge_frame);
+    }
+
+    // Flush TLB for the huge page region
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vale1is, {0}",
+            "dsb ish",
+            "isb",
+            in(reg) huge_base >> 12,
+            options(nostack)
+        );
+    }
+
+    // Increment minor fault counter (THP is still minor - no I/O)
+    crate::task::percpu::increment_min_flt();
+
+    Some(true) // Huge page mapped successfully
+}
+
 /// Handle a page fault for an mmap'd region (demand paging)
 ///
 /// Returns:
@@ -305,11 +396,35 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
     let vma_prot = vma.prot;
     let vma_is_anonymous = vma.is_anonymous();
     let vma_is_anon_private = vma.is_anon_private();
+    let vma_is_thp_eligible = vma.is_thp_eligible();
     let vma_file = vma.file.clone();
     let vma_start = vma.start;
+    let vma_end = vma.end;
     let vma_offset = vma.offset;
     let vma_anon_vma = vma.anon_vma.clone();
     drop(mm_guard);
+
+    // Get current page table (TTBR0_EL1 for user space)
+    let ttbr0: u64;
+    unsafe {
+        asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nostack, nomem));
+    }
+    let pt_root = ttbr0 & !0xFFF;
+
+    // Try THP (Transparent Huge Page) allocation for eligible VMAs
+    if vma_is_thp_eligible
+        && let Some(result) = try_huge_page_fault(
+            pt_root,
+            fault_addr,
+            vma_start,
+            vma_end,
+            vma_prot,
+            vma_anon_vma.as_ref(),
+        )
+    {
+        return Some(result);
+    }
+    // Fall through to 4KB allocation if THP failed
 
     // Allocate a physical frame
     let frame = match crate::FRAME_ALLOCATOR.alloc() {
@@ -360,13 +475,6 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
         attrs |= PXN | UXN;
     }
 
-    // Get current page table (TTBR0_EL1 for user space)
-    let ttbr0: u64;
-    unsafe {
-        asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nostack, nomem));
-    }
-    let pt_root = ttbr0 & !0xFFF;
-
     // Map the page
     let page_addr = fault_addr & !0xFFF;
     if map_user_page(pt_root, page_addr, frame, attrs).is_err() {
@@ -386,6 +494,9 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
         }
         lru_add_new(frame);
     }
+
+    // Increment minor fault counter (demand paging is minor - no I/O from disk)
+    crate::task::percpu::increment_min_flt();
 
     Some(true)
 }
@@ -611,6 +722,9 @@ fn handle_swap_fault(fault_addr: u64) -> Option<bool> {
         // Flush TLB
         crate::arch::aarch64::paging::flush_tlb(fault_addr);
 
+        // Increment major fault counter (swap cache hit still counts as major)
+        crate::task::percpu::increment_maj_flt();
+
         return Some(true);
     }
 
@@ -645,6 +759,9 @@ fn handle_swap_fault(fault_addr: u64) -> Option<bool> {
 
     // Step 6: Free swap slot (page is now in RAM)
     free_swap_entry(entry);
+
+    // Increment major fault counter (swap-in requires I/O)
+    crate::task::percpu::increment_maj_flt();
 
     Some(true) // Swap-in successful
 }
@@ -728,6 +845,19 @@ fn handle_cow_fault(fault_addr: u64) -> Option<bool> {
         asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nostack, nomem));
     }
     let pt_root = ttbr0 & !0xFFF;
+
+    // Check if this address is in a huge page - if so, split it first
+    // This implements the "split-first" COW strategy for THP
+    {
+        use crate::arch::aarch64::paging::Aarch64PageTable;
+        if let Some((huge_base, _phys)) = Aarch64PageTable::is_huge_page_mapped(pt_root, fault_addr)
+        {
+            // Split the huge page into 512 4KB pages before handling COW
+            let _ =
+                Aarch64PageTable::split_huge_page(pt_root, huge_base, &mut &crate::FRAME_ALLOCATOR);
+            // After splitting, the page is now a regular 4KB page - continue with COW handling
+        }
+    }
 
     // Page-align the fault address
     let page_addr = fault_addr & !0xFFF;
@@ -824,6 +954,9 @@ fn handle_cow_fault(fault_addr: u64) -> Option<bool> {
 
     // Flush TLB for this address
     crate::arch::aarch64::paging::flush_tlb(page_addr);
+
+    // Increment minor fault counter (COW is minor - no I/O)
+    crate::task::percpu::increment_min_flt();
 
     Some(true)
 }

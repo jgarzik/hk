@@ -9,6 +9,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use spin::RwLock;
 
+use crate::error::KernelError;
+
 use super::types::KeyType;
 
 /// Key serial number type (positive i32, >= 3)
@@ -269,7 +271,7 @@ impl Key {
     /// Add a key to this keyring (if this is a keyring)
     pub fn keyring_add(&self, key_serial: KeySerial) -> Result<(), i64> {
         if !self.is_keyring() {
-            return Err(super::ENOTDIR);
+            return Err(KernelError::NotDirectory.sysret());
         }
 
         let mut keys = self.keyring_keys.write();
@@ -286,7 +288,7 @@ impl Key {
     /// Remove a key from this keyring
     pub fn keyring_remove(&self, key_serial: KeySerial) -> Result<(), i64> {
         if !self.is_keyring() {
-            return Err(super::ENOTDIR);
+            return Err(KernelError::NotDirectory.sysret());
         }
 
         let mut keys = self.keyring_keys.write();
@@ -294,14 +296,14 @@ impl Key {
             keys.remove(pos);
             Ok(())
         } else {
-            Err(super::ENOENT)
+            Err(KernelError::NotFound.sysret())
         }
     }
 
     /// Clear all keys from this keyring
     pub fn keyring_clear(&self) -> Result<(), i64> {
         if !self.is_keyring() {
-            return Err(super::ENOTDIR);
+            return Err(KernelError::NotDirectory.sysret());
         }
 
         self.keyring_keys.write().clear();

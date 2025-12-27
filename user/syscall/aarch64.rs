@@ -1953,6 +1953,72 @@ pub fn sys_inotify_rm_watch(fd: i32, wd: i32) -> i64 {
 }
 
 // ============================================================================
+// Fanotify
+// ============================================================================
+
+/// fanotify_init(flags, event_f_flags) - syscall number
+pub const SYS_FANOTIFY_INIT: u64 = 262;
+/// fanotify_mark(fd, flags, mask, dirfd, pathname) - syscall number
+pub const SYS_FANOTIFY_MARK: u64 = 263;
+
+// Fanotify init flags
+/// Close-on-exec for fanotify fd
+pub const FAN_CLOEXEC: u32 = 0x00000001;
+/// Non-blocking mode
+pub const FAN_NONBLOCK: u32 = 0x00000002;
+/// Notification class (default)
+pub const FAN_CLASS_NOTIF: u32 = 0x00000000;
+
+// Fanotify mark flags
+/// Add mask to mark
+pub const FAN_MARK_ADD: u32 = 0x00000001;
+/// Remove mask from mark
+pub const FAN_MARK_REMOVE: u32 = 0x00000002;
+/// Flush all marks
+pub const FAN_MARK_FLUSH: u32 = 0x00000080;
+/// Mark mount point
+pub const FAN_MARK_MOUNT: u32 = 0x00000010;
+/// Mark filesystem
+pub const FAN_MARK_FILESYSTEM: u32 = 0x00000100;
+
+// Fanotify event masks
+/// File was accessed
+pub const FAN_ACCESS: u64 = 0x00000001;
+/// File was modified
+pub const FAN_MODIFY: u64 = 0x00000002;
+/// Writable file closed
+pub const FAN_CLOSE_WRITE: u64 = 0x00000008;
+/// Unwritable file closed
+pub const FAN_CLOSE_NOWRITE: u64 = 0x00000010;
+/// File was opened
+pub const FAN_OPEN: u64 = 0x00000020;
+
+/// fanotify_init(flags, event_f_flags) - create fanotify instance
+#[inline(always)]
+pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> i64 {
+    unsafe { syscall2!(SYS_FANOTIFY_INIT, flags, event_f_flags) }
+}
+
+/// fanotify_mark(fd, flags, mask, dirfd, pathname) - add/remove/flush marks
+#[inline(always)]
+pub fn sys_fanotify_mark(fd: i32, flags: u32, mask: u64, dirfd: i32, pathname: *const u8) -> i64 {
+    unsafe { syscall5!(SYS_FANOTIFY_MARK, fd, flags, mask, dirfd, pathname) }
+}
+
+// ============================================================================
+// Process Accounting
+// ============================================================================
+
+/// acct(filename) - syscall number
+pub const SYS_ACCT: u64 = 89;
+
+/// acct(filename) - enable/disable process accounting
+#[inline(always)]
+pub fn sys_acct(filename: *const u8) -> i64 {
+    unsafe { syscall1!(SYS_ACCT, filename) }
+}
+
+// ============================================================================
 // Membarrier
 // ============================================================================
 
@@ -2069,6 +2135,23 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, info: *const u8, flags: u32) 
 #[inline(always)]
 pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
     unsafe { syscall3!(SYS_PIDFD_GETFD, pidfd, targetfd, flags) }
+}
+
+// --- vhangup ---
+
+/// vhangup syscall number (aarch64)
+pub const SYS_VHANGUP: u64 = 58;
+
+/// vhangup() - simulate hangup on controlling terminal
+///
+/// Simulates a hangup on the current process's controlling terminal.
+/// This is typically used by login(1) to ensure a clean terminal state.
+///
+/// Returns 0 on success, or a negative error code:
+/// - -EPERM: Caller lacks CAP_SYS_TTY_CONFIG capability
+#[inline(always)]
+pub fn sys_vhangup() -> i64 {
+    unsafe { syscall0!(SYS_VHANGUP) }
 }
 
 // --- io_uring ---
@@ -2217,4 +2300,27 @@ pub fn sys_keyctl(cmd: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
 #[inline(always)]
 pub fn sys_kcmp(pid1: u64, pid2: u64, type_: i32, idx1: u64, idx2: u64) -> i64 {
     unsafe { syscall5!(SYS_KCMP, pid1, pid2, type_, idx1, idx2) }
+}
+
+// ============================================================================
+// Seccomp (secure computing mode)
+// ============================================================================
+
+/// seccomp syscall number
+pub const SYS_SECCOMP: u64 = 277;
+
+/// seccomp(operation, flags, args) - operate on secure computing state
+///
+/// Controls the seccomp sandboxing mechanism for the calling process.
+///
+/// # Arguments
+/// * `op` - Operation (SECCOMP_SET_MODE_STRICT, SECCOMP_SET_MODE_FILTER, etc.)
+/// * `flags` - Flags for the operation
+/// * `args` - Arguments (depends on operation, typically filter program pointer)
+///
+/// # Returns
+/// 0 on success, or a negative error code
+#[inline(always)]
+pub fn sys_seccomp(op: u32, flags: u32, args: u64) -> i64 {
+    unsafe { syscall3!(SYS_SECCOMP, op, flags, args) }
 }

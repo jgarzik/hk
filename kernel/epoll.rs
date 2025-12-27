@@ -34,7 +34,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{IrqSpinlock, Uaccess};
-use crate::fs::FsError;
+use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
@@ -77,14 +77,6 @@ pub const EPOLL_CLOEXEC: i32 = 0o2000000;
 
 /// Maximum events that can be returned in a single epoll_wait call
 const EP_MAX_EVENTS: i32 = 4096;
-
-/// Linux error codes
-const EINVAL: i64 = -22;
-const EBADF: i64 = -9;
-const EEXIST: i64 = -17;
-const ENOENT: i64 = -2;
-const ENOMEM: i64 = -12;
-const EFAULT: i64 = -14;
 
 /// User-space epoll_event structure (Linux ABI)
 ///
@@ -179,7 +171,7 @@ impl Eventpoll {
 
         // Check if fd already exists
         if inner.items.contains_key(&fd) {
-            return Err(EEXIST);
+            return Err(KernelError::AlreadyExists.sysret());
         }
 
         // Create new item
@@ -194,7 +186,10 @@ impl Eventpoll {
         let mut inner = self.inner.lock();
 
         // Find existing item
-        let item = inner.items.get_mut(&fd).ok_or(ENOENT)?;
+        let item = inner
+            .items
+            .get_mut(&fd)
+            .ok_or(KernelError::NotFound.sysret())?;
 
         // Update event mask and data
         item.event = *event;
@@ -210,7 +205,7 @@ impl Eventpoll {
 
         // Remove the item
         if inner.items.remove(&fd).is_none() {
-            return Err(ENOENT);
+            return Err(KernelError::NotFound.sysret());
         }
 
         Ok(())
@@ -384,21 +379,21 @@ impl FileOps for EpollFileOps {
         self
     }
 
-    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read(&self, _file: &File, _buf: &mut [u8]) -> Result<usize, KernelError> {
         // epoll fds are not directly readable
-        Err(FsError::InvalidArgument)
+        Err(KernelError::InvalidArgument)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, FsError> {
+    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
         // epoll fds are not writable
-        Err(FsError::InvalidArgument)
+        Err(KernelError::InvalidArgument)
     }
 
     fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
         self.ep.poll(pt)
     }
 
-    fn release(&self, _file: &File) -> Result<(), FsError> {
+    fn release(&self, _file: &File) -> Result<(), KernelError> {
         self.ep.release();
         Ok(())
     }
@@ -411,7 +406,7 @@ impl FileOps for EpollFileOps {
 ///
 /// # Returns
 /// Arc<File> for the new epoll fd
-pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, FsError> {
+pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
     let ep = Eventpoll::new();
 
     // Create file operations
@@ -431,7 +426,7 @@ pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, FsError> {
 }
 
 /// Create a dummy dentry for epoll
-fn create_epoll_dentry() -> Result<Arc<Dentry>, FsError> {
+fn create_epoll_dentry() -> Result<Arc<Dentry>, KernelError> {
     let mode = InodeMode::regular(0o600);
     let inode = Arc::new(Inode::new(
         0, // ino=0 for anonymous
@@ -465,7 +460,7 @@ pub fn get_eventpoll(file: &File) -> Option<Arc<Eventpoll>> {
 /// The size argument is ignored but must be greater than zero for compatibility.
 pub fn sys_epoll_create(size: i32) -> i64 {
     if size <= 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
     sys_epoll_create1(0)
 }
@@ -486,19 +481,19 @@ fn get_nofile_limit() -> u64 {
 pub fn sys_epoll_create1(eflags: i32) -> i64 {
     // Validate flags
     if eflags & !EPOLL_CLOEXEC != 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Create epoll file
     let file = match create_epoll_file(eflags) {
         Ok(f) => f,
-        Err(_) => return ENOMEM,
+        Err(_) => return KernelError::OutOfMemory.sysret(),
     };
 
     // Get the FD table and allocate a file descriptor
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return ENOMEM,
+        None => return KernelError::OutOfMemory.sysret(),
     };
     let mut table = fd_table.lock();
     let fd_flags = if eflags & EPOLL_CLOEXEC != 0 {
@@ -518,27 +513,27 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> i64 {
     // Get FD table
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
     let table = fd_table.lock();
 
     // Get epoll file
     let ep_file = match table.get(epfd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Verify it's an epoll fd
     let ep = match get_eventpoll(&ep_file) {
         Some(e) => e,
-        None => return EINVAL,
+        None => return KernelError::InvalidArgument.sysret(),
     };
 
     // Get target file (for ADD and MOD)
     let target_file = if op != EPOLL_CTL_DEL {
         match table.get(fd) {
             Some(f) => Some(f),
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         }
     } else {
         None
@@ -548,7 +543,7 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> i64 {
     if let Some(ref tf) = target_file
         && Arc::ptr_eq(&ep_file, tf)
     {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Release lock before user memory access
@@ -557,11 +552,11 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> i64 {
     // Read event from user space (for ADD and MOD)
     let event = if op != EPOLL_CTL_DEL {
         if event_ptr == 0 {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
         match get_user::<Uaccess, EpollEvent>(event_ptr) {
             Ok(e) => e,
-            Err(_) => return EFAULT,
+            Err(_) => return KernelError::BadAddress.sysret(),
         }
     } else {
         EpollEvent::default()
@@ -584,7 +579,7 @@ pub fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> i64 {
             Ok(()) => 0,
             Err(e) => e,
         },
-        _ => EINVAL,
+        _ => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -604,28 +599,28 @@ pub fn sys_epoll_pwait(
 ) -> i64 {
     // Validate maxevents
     if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Validate events pointer
     if events_ptr == 0 {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Get epoll instance
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let ep_file = match fd_table.lock().get(epfd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     let ep = match get_eventpoll(&ep_file) {
         Some(e) => e,
-        None => return EINVAL,
+        None => return KernelError::InvalidArgument.sysret(),
     };
 
     // TODO: Handle signal mask if provided (for proper epoll_pwait semantics)
@@ -644,7 +639,7 @@ pub fn sys_epoll_pwait(
     for (i, event) in events.iter().enumerate().take(count) {
         let addr = events_ptr + (i * event_size) as u64;
         if put_user::<Uaccess, EpollEvent>(addr, *event).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -683,17 +678,17 @@ pub fn sys_epoll_pwait2(
         // Read timespec from user space
         let ts: LinuxTimespec = match get_user::<Uaccess, LinuxTimespec>(timeout_ptr) {
             Ok(ts) => ts,
-            Err(_) => return EFAULT,
+            Err(_) => return KernelError::BadAddress.sysret(),
         };
 
         // Validate timespec
         if ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-            return EINVAL;
+            return KernelError::InvalidArgument.sysret();
         }
 
         // Handle negative seconds (invalid)
         if ts.tv_sec < 0 {
-            return EINVAL;
+            return KernelError::InvalidArgument.sysret();
         }
 
         // Check for zero timeout (non-blocking)

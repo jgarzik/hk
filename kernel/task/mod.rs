@@ -2,8 +2,13 @@
 
 pub mod exec;
 pub mod fdtable;
+pub mod id;
+pub mod misc;
 pub mod percpu;
+pub mod pgrp;
+pub mod proc;
 pub mod sched;
+pub mod schedsys;
 pub mod syscall;
 
 /// Clone flags for clone() syscall (subset of Linux flags)
@@ -87,6 +92,7 @@ use crate::ipc::sem::SemUndoList;
 use crate::mm::MmStruct;
 use crate::mm::page_cache::CachedPage;
 use crate::ns::NsProxy;
+use crate::seccomp::SeccompFilter;
 use crate::signal::{SigHand, SignalStruct, TaskSignalState};
 
 use spin::Mutex;
@@ -102,6 +108,9 @@ pub type Uid = u32;
 
 /// Group ID type (Linux-compatible)
 pub type Gid = u32;
+
+/// Magic value to detect corrupted/freed Task structs ("TASKMAGI" in ASCII)
+pub const TASK_MAGIC: u64 = 0x5441534B_4D414749;
 
 /// Task credentials (Linux-compatible model)
 ///
@@ -296,6 +305,9 @@ pub struct CurrentTask {
     pub sid: Pid,
     /// Credentials of the currently running task
     pub cred: Cred,
+    /// Seccomp mode (cached for fast syscall-entry check)
+    /// 0=DISABLED, 1=STRICT, 2=FILTER
+    pub seccomp_mode: u8,
 }
 
 impl CurrentTask {
@@ -308,6 +320,7 @@ impl CurrentTask {
             pgid: 0,
             sid: 0,
             cred: Cred::ROOT,
+            seccomp_mode: 0, // SECCOMP_MODE_DISABLED
         }
     }
 
@@ -337,6 +350,7 @@ impl CurrentTask {
             pgid,
             sid,
             cred,
+            seccomp_mode: 0, // SECCOMP_MODE_DISABLED
         }
     }
 }
@@ -485,6 +499,10 @@ pub enum TaskState {
 
 /// prctl operation codes
 pub mod prctl_ops {
+    /// Set parent death signal
+    pub const PR_SET_PDEATHSIG: i32 = 1;
+    /// Get parent death signal
+    pub const PR_GET_PDEATHSIG: i32 = 2;
     /// Get dumpable flag
     pub const PR_GET_DUMPABLE: i32 = 3;
     /// Set dumpable flag
@@ -497,6 +515,10 @@ pub mod prctl_ops {
     pub const PR_SET_TIMERSLACK: i32 = 29;
     /// Get timer slack value (nanoseconds)
     pub const PR_GET_TIMERSLACK: i32 = 30;
+    /// Get seccomp mode
+    pub const PR_GET_SECCOMP: i32 = 21;
+    /// Set seccomp mode
+    pub const PR_SET_SECCOMP: i32 = 22;
     /// Disable privilege escalation via setuid/setgid (irreversible)
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     /// Get no_new_privs flag
@@ -762,16 +784,49 @@ impl<F> Default for FdTable<F> {
 
 /// A task (thread or process)
 pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
+    /// Magic number for validation (must be TASK_MAGIC)
+    pub magic: u64,
     /// Process ID
     pub pid: Pid,
     /// Thread ID
     pub tid: Tid,
+    /// Thread Group ID (equals pid for thread group leader)
+    /// For CLONE_THREAD: inherited from parent; otherwise: equals pid
+    pub tgid: Pid,
     /// Parent process ID (0 for init/orphans)
     pub ppid: Pid,
     /// Process group ID
     pub pgid: Pid,
     /// Session ID
     pub sid: Pid,
+
+    // =========================================================================
+    // Exit handling (like Linux task_struct exit fields)
+    // =========================================================================
+    /// Exit status code (set when task becomes zombie)
+    pub exit_code: i32,
+    /// Signal to send to parent on exit (default SIGCHLD, from clone3 exit_signal)
+    pub exit_signal: i32,
+    /// Signal to send when parent dies (set via prctl PR_SET_PDEATHSIG)
+    pub pdeath_signal: i32,
+
+    // =========================================================================
+    // Process accounting (like Linux task_struct timing/accounting fields)
+    // =========================================================================
+    /// User CPU time consumed (nanoseconds)
+    pub utime: u64,
+    /// System CPU time consumed (nanoseconds)
+    pub stime: u64,
+    /// Task start time (monotonic clock, nanoseconds since boot)
+    pub start_time: u64,
+    /// Voluntary context switches (task yielded or slept)
+    pub nvcsw: u64,
+    /// Involuntary context switches (preempted by scheduler)
+    pub nivcsw: u64,
+    /// Minor page faults (demand paging, COW - no I/O required)
+    pub min_flt: u64,
+    /// Major page faults (swap-in required - I/O needed)
+    pub maj_flt: u64,
 
     // =========================================================================
     // Credentials (like Linux task_struct->cred)
@@ -872,6 +927,18 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Process personality (execution domain, affects syscall behavior)
     /// See personality(2). Default is 0 (PER_LINUX).
     pub personality: u32,
+
+    // =========================================================================
+    // Seccomp state (sandboxing)
+    // =========================================================================
+    /// Seccomp mode: 0=DISABLED, 1=STRICT, 2=FILTER
+    pub seccomp_mode: u8,
+
+    /// Seccomp filter chain (head, reference counted)
+    /// Filters are chained: when a new filter is installed, it points to the previous.
+    /// On syscall entry, filters are run in order (newest first), and the most
+    /// restrictive result wins.
+    pub seccomp_filter: Option<Arc<SeccompFilter>>,
 }
 
 impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {

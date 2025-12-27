@@ -1098,6 +1098,77 @@ impl X86_64PageTable {
         }
     }
 
+    /// Update protection flags for a 2MB huge page
+    ///
+    /// # Arguments
+    /// * `pml4_phys` - Physical address of the PML4 table
+    /// * `va` - Virtual address (must be 2MB-aligned)
+    /// * `writable` - Whether the page should be writable
+    /// * `executable` - Whether the page should be executable
+    ///
+    /// # Returns
+    /// `true` if the huge page was found and updated, `false` if not mapped
+    pub fn update_huge_page_protection(
+        pml4_phys: u64,
+        va: u64,
+        writable: bool,
+        executable: bool,
+    ) -> bool {
+        let (pml4_idx, pdpt_idx, pd_idx, _pt_idx) = page_indices(va);
+
+        unsafe {
+            let pml4 = phys_to_virt_table(pml4_phys);
+
+            let pml4_entry = (*pml4).entry(pml4_idx);
+            if !pml4_entry.is_present() {
+                return false;
+            }
+            let pdpt = phys_to_virt_table(pml4_entry.addr());
+
+            let pdpt_entry = (*pdpt).entry(pdpt_idx);
+            if !pdpt_entry.is_present() {
+                return false;
+            }
+            if pdpt_entry.is_huge() {
+                // 1GB huge page - not handled here
+                return false;
+            }
+            let pd = phys_to_virt_table(pdpt_entry.addr());
+
+            let pd_entry = (*pd).entry_mut(pd_idx);
+            if !pd_entry.is_present() || !pd_entry.is_huge() {
+                // Must be a 2MB huge page
+                return false;
+            }
+
+            // Get current entry, preserve address and base flags
+            let phys = pd_entry.addr();
+            let mut flags = pd_entry.flags();
+
+            // Update writable flag
+            if writable {
+                flags |= PAGE_WRITABLE;
+            } else {
+                flags &= !PAGE_WRITABLE;
+            }
+
+            // Update executable flag (NX bit - inverted logic)
+            if executable {
+                flags &= !PAGE_NO_EXECUTE;
+            } else {
+                flags |= PAGE_NO_EXECUTE;
+            }
+
+            // Write back the updated entry
+            pd_entry.set(phys, flags);
+
+            // Flush TLB for this huge page
+            Self::flush_tlb(va);
+
+            true
+        }
+    }
+
     /// Translate a virtual address to physical using the given page table root
     ///
     /// Static method that takes pml4_phys directly.
@@ -1187,6 +1258,256 @@ impl X86_64PageTable {
             }
 
             Some((pt_entry.addr(), pt_entry.flags()))
+        }
+    }
+
+    // =========================================================================
+    // Transparent Huge Page (THP) Support - 2MB pages
+    // =========================================================================
+
+    /// Map a 2MB huge page at PD (Page Directory) level
+    ///
+    /// Creates a direct 2MB mapping in the PD entry, skipping the PT level.
+    /// The virtual address must be 2MB-aligned.
+    ///
+    /// # Arguments
+    /// * `pml4_phys` - Physical address of the PML4 table
+    /// * `va` - Virtual address (must be 2MB-aligned)
+    /// * `pa` - Physical address of the 2MB frame (must be 2MB-aligned)
+    /// * `flags` - Page table entry flags
+    /// * `frame_alloc` - Frame allocator for intermediate tables
+    ///
+    /// # Returns
+    /// Ok(()) on success, Err(MapError) on failure
+    pub fn map_huge_page<FA: FrameAlloc<PhysAddr = u64>>(
+        pml4_phys: u64,
+        va: u64,
+        pa: u64,
+        flags: PageFlags,
+        frame_alloc: &mut FA,
+    ) -> Result<(), MapError> {
+        const HUGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
+
+        // Verify alignment
+        if va & (HUGE_PAGE_SIZE - 1) != 0 {
+            return Err(MapError::InvalidAddress);
+        }
+        if pa & (HUGE_PAGE_SIZE - 1) != 0 {
+            return Err(MapError::InvalidAddress);
+        }
+
+        // Convert PageFlags to x86-64 PTE flags with PAGE_HUGE
+        let mut entry_flags = PAGE_PRESENT | PAGE_HUGE;
+        if flags.contains(PageFlags::WRITE) {
+            entry_flags |= PAGE_WRITABLE;
+        }
+        if flags.contains(PageFlags::USER) {
+            entry_flags |= PAGE_USER;
+        }
+        if !flags.contains(PageFlags::EXECUTE) {
+            entry_flags |= PAGE_NO_EXECUTE;
+        }
+
+        let intermediate_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+        let (pml4_idx, pdpt_idx, pd_idx, _pt_idx) = page_indices(va);
+
+        unsafe {
+            let pml4 = phys_to_virt_table(pml4_phys);
+
+            // Get or create PDPT
+            let pml4_entry = (*pml4).entry_mut(pml4_idx);
+            if !pml4_entry.is_present() {
+                let pdpt_phys = frame_alloc
+                    .alloc_frame()
+                    .ok_or(MapError::FrameAllocationFailed)?;
+                core::ptr::write_bytes(phys_to_virt(pdpt_phys), 0, PAGE_SIZE as usize);
+                pml4_entry.set(pdpt_phys, intermediate_flags);
+            }
+            let pdpt = phys_to_virt_table(pml4_entry.addr());
+
+            // Get or create PD
+            let pdpt_entry = (*pdpt).entry_mut(pdpt_idx);
+            if !pdpt_entry.is_present() {
+                let pd_phys = frame_alloc
+                    .alloc_frame()
+                    .ok_or(MapError::FrameAllocationFailed)?;
+                core::ptr::write_bytes(phys_to_virt(pd_phys), 0, PAGE_SIZE as usize);
+                pdpt_entry.set(pd_phys, intermediate_flags);
+            } else if pdpt_entry.is_huge() {
+                // 1GB huge page exists here - can't map 2MB within it
+                return Err(MapError::AlreadyMapped);
+            }
+            let pd = phys_to_virt_table(pdpt_entry.addr());
+
+            // Check PD entry - should not already be mapped
+            let pd_entry = (*pd).entry_mut(pd_idx);
+            if pd_entry.is_present() {
+                return Err(MapError::AlreadyMapped);
+            }
+
+            // Set the 2MB huge page entry (no PT, direct to physical frame)
+            pd_entry.set(pa, entry_flags);
+
+            // Flush TLB for this address
+            Self::flush_tlb(va);
+        }
+
+        Ok(())
+    }
+
+    /// Unmap a 2MB huge page
+    ///
+    /// Clears the PD entry for the given 2MB-aligned virtual address.
+    ///
+    /// # Arguments
+    /// * `pml4_phys` - Physical address of the PML4 table
+    /// * `va` - Virtual address (must be 2MB-aligned)
+    ///
+    /// # Returns
+    /// Some(phys_addr) if a huge page was unmapped, None otherwise
+    pub fn unmap_huge_page(pml4_phys: u64, va: u64) -> Option<u64> {
+        let (pml4_idx, pdpt_idx, pd_idx, _pt_idx) = page_indices(va);
+
+        unsafe {
+            let pml4 = phys_to_virt_table(pml4_phys);
+
+            let pml4_entry = (*pml4).entry(pml4_idx);
+            if !pml4_entry.is_present() {
+                return None;
+            }
+            let pdpt = phys_to_virt_table(pml4_entry.addr());
+
+            let pdpt_entry = (*pdpt).entry(pdpt_idx);
+            if !pdpt_entry.is_present() || pdpt_entry.is_huge() {
+                return None;
+            }
+            let pd = phys_to_virt_table(pdpt_entry.addr());
+
+            let pd_entry = (*pd).entry_mut(pd_idx);
+            if !pd_entry.is_present() || !pd_entry.is_huge() {
+                return None;
+            }
+
+            // Get physical address before clearing
+            let phys = pd_entry.addr();
+
+            // Clear the entry
+            pd_entry.clear();
+
+            // Flush TLB for this huge page region
+            Self::flush_tlb(va);
+
+            Some(phys)
+        }
+    }
+
+    /// Split a 2MB huge page into 512 4KB pages
+    ///
+    /// Allocates a new PT, creates 512 4KB PTEs pointing to the same
+    /// physical memory (consecutive 4KB pages), and updates the PD entry
+    /// to point to the new PT.
+    ///
+    /// # Arguments
+    /// * `pml4_phys` - Physical address of the PML4 table
+    /// * `va` - Virtual address of the huge page (must be 2MB-aligned)
+    /// * `frame_alloc` - Frame allocator for the new PT
+    ///
+    /// # Returns
+    /// Ok(phys_base) with the base physical address of the split huge page,
+    /// Err(MapError) on failure
+    pub fn split_huge_page<FA: FrameAlloc<PhysAddr = u64>>(
+        pml4_phys: u64,
+        va: u64,
+        frame_alloc: &mut FA,
+    ) -> Result<u64, MapError> {
+        let (pml4_idx, pdpt_idx, pd_idx, _pt_idx) = page_indices(va);
+
+        unsafe {
+            let pml4 = phys_to_virt_table(pml4_phys);
+
+            let pml4_entry = (*pml4).entry(pml4_idx);
+            if !pml4_entry.is_present() {
+                return Err(MapError::NotMapped);
+            }
+            let pdpt = phys_to_virt_table(pml4_entry.addr());
+
+            let pdpt_entry = (*pdpt).entry(pdpt_idx);
+            if !pdpt_entry.is_present() || pdpt_entry.is_huge() {
+                return Err(MapError::NotMapped);
+            }
+            let pd = phys_to_virt_table(pdpt_entry.addr());
+
+            let pd_entry = (*pd).entry_mut(pd_idx);
+            if !pd_entry.is_present() || !pd_entry.is_huge() {
+                return Err(MapError::NotMapped);
+            }
+
+            // Get the huge page physical address and flags
+            let huge_phys = pd_entry.addr();
+            let old_flags = pd_entry.flags();
+
+            // Convert huge page flags to 4KB page flags (remove PAGE_HUGE)
+            let new_flags = (old_flags & !PAGE_HUGE) | PAGE_PRESENT;
+
+            // Allocate a new PT
+            let pt_phys = frame_alloc
+                .alloc_frame()
+                .ok_or(MapError::FrameAllocationFailed)?;
+            let pt = phys_to_virt_table(pt_phys);
+
+            // Fill the PT with 512 entries pointing to consecutive 4KB pages
+            for i in 0..512 {
+                let page_phys = huge_phys + (i as u64 * PAGE_SIZE);
+                (*pt).entry_mut(i).set(page_phys, new_flags);
+            }
+
+            // Update PD entry to point to the new PT (remove PAGE_HUGE)
+            let pt_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+            pd_entry.set(pt_phys, pt_flags);
+
+            // Flush entire huge page region from TLB
+            // Note: On x86-64, we need to flush all 512 entries since invlpg
+            // on a single address only invalidates that TLB entry
+            Self::flush_tlb_all();
+
+            Ok(huge_phys)
+        }
+    }
+
+    /// Check if a virtual address is mapped as a 2MB huge page
+    ///
+    /// # Arguments
+    /// * `pml4_phys` - Physical address of the PML4 table
+    /// * `va` - Virtual address to check
+    ///
+    /// # Returns
+    /// Some((phys_addr, flags)) if mapped as huge page, None otherwise
+    /// The phys_addr is the 2MB-aligned base address of the huge page
+    pub fn is_huge_page_mapped(pml4_phys: u64, va: u64) -> Option<(u64, u64)> {
+        let (pml4_idx, pdpt_idx, pd_idx, _pt_idx) = page_indices(va);
+
+        unsafe {
+            let pml4 = phys_to_virt_table_const(pml4_phys);
+
+            let pml4_entry = (*pml4).entry(pml4_idx);
+            if !pml4_entry.is_present() {
+                return None;
+            }
+            let pdpt = phys_to_virt_table_const(pml4_entry.addr());
+
+            let pdpt_entry = (*pdpt).entry(pdpt_idx);
+            if !pdpt_entry.is_present() || pdpt_entry.is_huge() {
+                return None;
+            }
+            let pd = phys_to_virt_table_const(pdpt_entry.addr());
+
+            let pd_entry = (*pd).entry(pd_idx);
+            if !pd_entry.is_present() || !pd_entry.is_huge() {
+                return None;
+            }
+
+            Some((pd_entry.addr(), pd_entry.flags()))
         }
     }
 }

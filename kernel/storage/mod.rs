@@ -14,8 +14,8 @@ pub mod sd;
 // Re-export block device types
 pub use blkdev::{
     BLKDEV_REGISTRY, Bio, BioFlags, BioOp, BioSeg, BlockDevice, BlockDeviceRegistry, BlockDriver,
-    BlockError, Disk, FifoScheduler, IoScheduler, QueueLimits, RequestQueue, SECTOR_SIZE,
-    bytes_to_sectors, get_blkdev, major, register_blkdev, sectors_to_bytes, unregister_blkdev,
+    Disk, FifoScheduler, IoScheduler, QueueLimits, RequestQueue, SECTOR_SIZE, bytes_to_sectors,
+    get_blkdev, major, register_blkdev, sectors_to_bytes, unregister_blkdev,
 };
 pub use blkdev::{DevId, DevMajor, DevMinor};
 

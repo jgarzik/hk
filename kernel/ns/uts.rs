@@ -18,6 +18,7 @@ use alloc::sync::Arc;
 use spin::{Lazy, RwLock};
 
 use crate::arch::Uaccess;
+use crate::error::KernelError;
 use crate::uaccess::UaccessArch;
 
 /// Maximum string length for UTS fields (not including NUL terminator)
@@ -179,11 +180,6 @@ fn copy_str(dest: &mut [u8], src: &[u8]) {
 // Syscall Handlers (Phase 2)
 // ============================================================================
 
-// Error codes
-const EFAULT: i64 = -14;
-const EINVAL: i64 = -22;
-const EPERM: i64 = -1;
-
 /// sys_uname - get system identification
 ///
 /// Copies the UTS name structure to userspace.
@@ -197,7 +193,7 @@ const EPERM: i64 = -1;
 pub fn sys_uname(buf: u64) -> i64 {
     // Validate user buffer
     if !Uaccess::access_ok(buf, core::mem::size_of::<NewUtsname>()) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Get current task's UTS namespace
@@ -236,16 +232,16 @@ pub fn sys_sethostname(name: u64, len: u64) -> i64 {
     // Permission check (CAP_SYS_ADMIN in UTS ns's user ns)
     // For now: check euid == 0
     if percpu::current_cred().euid != 0 {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     let len = len as usize;
     if len > __NEW_UTS_LEN {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     if !Uaccess::access_ok(name, len) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Copy from user
@@ -286,16 +282,16 @@ pub fn sys_setdomainname(name: u64, len: u64) -> i64 {
 
     // Permission check
     if percpu::current_cred().euid != 0 {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     let len = len as usize;
     if len > __NEW_UTS_LEN {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     if !Uaccess::access_ok(name, len) {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Copy from user

@@ -157,6 +157,12 @@ pub const SYS_INOTIFY_RM_WATCH: u64 = 255;
 /// inotify_init1(flags)
 pub const SYS_INOTIFY_INIT1: u64 = 294;
 
+// fanotify syscalls (Section 9.2)
+/// fanotify_init(flags, event_f_flags)
+pub const SYS_FANOTIFY_INIT: u64 = 300;
+/// fanotify_mark(fanotify_fd, flags, mask, dirfd, pathname)
+pub const SYS_FANOTIFY_MARK: u64 = 301;
+
 // epoll syscalls (Section 9.1)
 /// epoll_create(size)
 pub const SYS_EPOLL_CREATE: u64 = 213;
@@ -475,6 +481,8 @@ pub const SYS_PRCTL: u64 = 157;
 pub const SYS_ARCH_PRCTL: u64 = 158;
 /// set_tid_address(tidptr) - Set pointer for child thread ID on exit
 pub const SYS_SET_TID_ADDRESS: u64 = 218;
+/// seccomp(operation, flags, args) - Operate on Secure Computing state
+pub const SYS_SECCOMP: u64 = 317;
 
 // System information
 /// getcpu(cpup, nodep, unused)
@@ -485,6 +493,8 @@ pub const SYS_GETRUSAGE: u64 = 98;
 pub const SYS_SYSINFO: u64 = 99;
 /// getrandom(buf, buflen, flags)
 pub const SYS_GETRANDOM: u64 = 318;
+/// acct(filename) - Enable/disable process accounting
+pub const SYS_ACCT: u64 = 163;
 
 // Scheduling syscalls
 /// sched_setparam(pid, param)
@@ -599,6 +609,10 @@ pub const SYS_CLONE3: u64 = 435;
 // System logging
 /// syslog(type, buf, len) - Read/control kernel message ring buffer
 pub const SYS_SYSLOG: u64 = 103;
+
+// TTY control
+/// vhangup() - Simulate hangup on controlling terminal
+pub const SYS_VHANGUP: u64 = 153;
 
 // Process personality/execution domain
 /// personality(persona) - Set process execution domain
@@ -1231,6 +1245,14 @@ pub fn x86_64_syscall_dispatch(
         sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
     };
 
+    // Check seccomp policy before executing syscall
+    // Note: ip is not available here, pass 0 for now
+    if let Some(result) =
+        crate::seccomp::check::check_syscall_x86_64(num, 0, arg0, arg1, arg2, arg3, arg4, arg5)
+    {
+        return result;
+    }
+
     match num {
         SYS_READ => sys_read(arg0 as i32, arg1, arg2) as u64,
         SYS_WRITE => sys_write(arg0 as i32, arg1, arg2) as u64,
@@ -1305,6 +1327,13 @@ pub fn x86_64_syscall_dispatch(
         }
         SYS_INOTIFY_RM_WATCH => {
             crate::inotify::sys_inotify_rm_watch(arg0 as i32, arg1 as i32) as u64
+        }
+
+        // fanotify syscalls (Section 9.2)
+        SYS_FANOTIFY_INIT => crate::fanotify::sys_fanotify_init(arg0 as u32, arg1 as u32) as u64,
+        SYS_FANOTIFY_MARK => {
+            crate::fanotify::sys_fanotify_mark(arg0 as i32, arg1 as u32, arg2, arg3 as i32, arg4)
+                as u64
         }
 
         // epoll syscalls (Section 9.1)
@@ -1473,6 +1502,9 @@ pub fn x86_64_syscall_dispatch(
             use crate::task::syscall::sys_syslog;
             sys_syslog::<Uaccess>(arg0 as i32, arg1, arg2 as i32) as u64
         }
+
+        // TTY control
+        SYS_VHANGUP => crate::tty::sys_vhangup() as u64,
 
         // pidfd syscalls
         SYS_PIDFD_OPEN => {
@@ -1694,6 +1726,7 @@ pub fn x86_64_syscall_dispatch(
             use crate::task::syscall::sys_set_tid_address;
             sys_set_tid_address(arg0) as u64
         }
+        SYS_SECCOMP => crate::seccomp::sys_seccomp(arg0, arg1, arg2) as u64,
 
         // Scheduling syscalls (Section 1.3)
         SYS_SCHED_GETSCHEDULER => {
@@ -1780,6 +1813,7 @@ pub fn x86_64_syscall_dispatch(
             use crate::task::syscall::sys_getrandom;
             sys_getrandom::<Uaccess>(arg0, arg1 as usize, arg2 as u32) as u64
         }
+        SYS_ACCT => crate::acct::sys_acct(arg0) as u64,
 
         // Resource limits
         SYS_GETRLIMIT => crate::rlimit::sys_getrlimit(arg0 as u32, arg1) as u64,

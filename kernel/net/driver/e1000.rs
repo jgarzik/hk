@@ -29,7 +29,7 @@ use crate::bus::pci::PciDevice;
 use crate::dma::{DmaCoherent, DmaConfig, DmaDevice};
 use crate::net::device::{NetDevice, NetDeviceOps};
 use crate::net::skb::SkBuff;
-use crate::net::{self, NetError};
+use crate::net::{self, KernelError};
 use crate::printkln;
 
 // ============================================================================
@@ -314,7 +314,7 @@ impl E1000Device {
     }
 
     /// Transmit a packet
-    fn transmit(&self, skb: Box<SkBuff>) -> Result<(), NetError> {
+    fn transmit(&self, skb: Box<SkBuff>) -> Result<(), KernelError> {
         let mut tx_idx = self.tx_index.lock();
         let mut tx_clean = self.tx_clean.lock();
 
@@ -336,7 +336,7 @@ impl E1000Device {
         // Check if ring is full
         let next_idx = (*tx_idx + 1) % TX_RING_SIZE;
         if next_idx == *tx_clean {
-            return Err(NetError::NoBufferSpace);
+            return Err(KernelError::NoBufferSpace);
         }
 
         // Get pointer to descriptor
@@ -381,7 +381,7 @@ struct E1000Ops {
 }
 
 impl NetDeviceOps for E1000Ops {
-    fn xmit(&self, skb: Box<SkBuff>) -> Result<(), NetError> {
+    fn xmit(&self, skb: Box<SkBuff>) -> Result<(), KernelError> {
         self.device.transmit(skb)
     }
 
@@ -393,7 +393,7 @@ impl NetDeviceOps for E1000Ops {
         1500
     }
 
-    fn open(&self) -> Result<(), NetError> {
+    fn open(&self) -> Result<(), KernelError> {
         // Enable interrupts
         let ims = int::LSC | int::RXT0 | int::TXDW;
         self.device.write_reg(reg::IMS, ims);
@@ -405,7 +405,7 @@ impl NetDeviceOps for E1000Ops {
         Ok(())
     }
 
-    fn stop(&self) -> Result<(), NetError> {
+    fn stop(&self) -> Result<(), KernelError> {
         // Disable interrupts
         self.device.write_reg(reg::IMC, 0xFFFFFFFF);
         Ok(())

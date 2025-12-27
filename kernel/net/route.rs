@@ -8,7 +8,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::net::NetError;
+use crate::net::KernelError;
 use crate::net::device::NetDevice;
 use crate::net::ipv4::Ipv4Addr;
 
@@ -100,7 +100,7 @@ pub fn add_host_route(dest: Ipv4Addr, gateway: Ipv4Addr, dev: Arc<NetDevice>) {
 ///
 /// Returns the output device and next-hop address.
 /// Uses longest-prefix matching for route selection.
-pub fn route_lookup(dest: Ipv4Addr) -> Result<(Arc<NetDevice>, Ipv4Addr), NetError> {
+pub fn route_lookup(dest: Ipv4Addr) -> Result<(Arc<NetDevice>, Ipv4Addr), KernelError> {
     crate::net::current_net_ns().route_lookup(dest)
 }
 

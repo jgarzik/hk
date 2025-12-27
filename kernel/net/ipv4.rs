@@ -7,7 +7,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::net::NetError;
+use crate::net::KernelError;
 use crate::net::arp;
 use crate::net::ethernet::{self, ETH_ALEN, ETH_HLEN, EtherType};
 use crate::net::route;
@@ -345,9 +345,9 @@ pub fn ip_rcv(mut skb: SkBuff) {
 /// 3. Resolves the next-hop MAC via ARP
 /// 4. Builds the Ethernet header
 /// 5. Transmits via the device
-pub fn ip_queue_xmit(mut skb: Box<SkBuff>, protocol: u8) -> Result<(), NetError> {
-    let daddr = skb.daddr.ok_or(NetError::InvalidArgument)?;
-    let config = crate::net::get_config().ok_or(NetError::InvalidArgument)?;
+pub fn ip_queue_xmit(mut skb: Box<SkBuff>, protocol: u8) -> Result<(), KernelError> {
+    let daddr = skb.daddr.ok_or(KernelError::InvalidArgument)?;
+    let config = crate::net::get_config().ok_or(KernelError::InvalidArgument)?;
 
     // For loopback destinations, use loopback as source address
     let saddr = if daddr.is_loopback() {
@@ -363,7 +363,7 @@ pub fn ip_queue_xmit(mut skb: Box<SkBuff>, protocol: u8) -> Result<(), NetError>
         let payload_len = skb.len();
         let tot_len = (IP_HLEN_MIN + payload_len) as u16;
 
-        let ip_hdr = skb.push(IP_HLEN_MIN).ok_or(NetError::NoBufferSpace)?;
+        let ip_hdr = skb.push(IP_HLEN_MIN).ok_or(KernelError::NoBufferSpace)?;
         ip_hdr[0] = 0x45; // Version (4) + IHL (5)
         ip_hdr[1] = 0; // TOS
         ip_hdr[2..4].copy_from_slice(&tot_len.to_be_bytes());
@@ -389,7 +389,7 @@ pub fn ip_queue_xmit(mut skb: Box<SkBuff>, protocol: u8) -> Result<(), NetError>
         // Set transport header offset and skip IP header
         loopback_skb.set_transport_header(IP_HLEN_MIN);
         if loopback_skb.pull(IP_HLEN_MIN).is_none() {
-            return Err(NetError::InvalidArgument);
+            return Err(KernelError::InvalidArgument);
         }
 
         // Dispatch to transport layer
@@ -408,7 +408,7 @@ pub fn ip_queue_xmit(mut skb: Box<SkBuff>, protocol: u8) -> Result<(), NetError>
     let payload_len = skb.len();
     let tot_len = (IP_HLEN_MIN + payload_len) as u16;
 
-    let ip_hdr = skb.push(IP_HLEN_MIN).ok_or(NetError::NoBufferSpace)?;
+    let ip_hdr = skb.push(IP_HLEN_MIN).ok_or(KernelError::NoBufferSpace)?;
 
     // Version (4) + IHL (5 = 20 bytes)
     ip_hdr[0] = 0x45;
@@ -446,13 +446,13 @@ pub fn ip_queue_xmit(mut skb: Box<SkBuff>, protocol: u8) -> Result<(), NetError>
 }
 
 /// Build IP header and transmit (called by ARP when resolution completes)
-pub fn ip_finish_output(mut skb: Box<SkBuff>, dest_mac: [u8; ETH_ALEN]) -> Result<(), NetError> {
-    let dev = skb.dev.as_ref().ok_or(NetError::DeviceNotFound)?;
+pub fn ip_finish_output(mut skb: Box<SkBuff>, dest_mac: [u8; ETH_ALEN]) -> Result<(), KernelError> {
+    let dev = skb.dev.as_ref().ok_or(KernelError::NoDevice)?;
     let source_mac = dev.mac();
 
     // Build Ethernet header
     ethernet::eth_header(&mut skb, &dest_mac, &source_mac, EtherType::Ipv4)
-        .ok_or(NetError::NoBufferSpace)?;
+        .ok_or(KernelError::NoBufferSpace)?;
 
     // Transmit
     crate::net::dev_queue_xmit(skb)

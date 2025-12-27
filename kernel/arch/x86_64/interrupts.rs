@@ -583,6 +583,17 @@ fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
         ::core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
     }
 
+    // Check if this address is in a huge page - if so, split it first
+    // This implements the "split-first" COW strategy for THP
+    {
+        use crate::arch::x86_64::paging::X86_64PageTable;
+        if let Some((huge_base, _phys)) = X86_64PageTable::is_huge_page_mapped(cr3, fault_addr) {
+            // Split the huge page into 512 4KB pages before handling COW
+            let _ = X86_64PageTable::split_huge_page(cr3, huge_base, &mut &crate::FRAME_ALLOCATOR);
+            // After splitting, the page is now a regular 4KB page - continue with COW handling
+        }
+    }
+
     // Look up the PTE for this address
     let (pte_ptr, pte_value) = unsafe { get_pte_for_addr(cr3, fault_addr)? };
 
@@ -701,7 +712,98 @@ fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
         );
     }
 
+    // Increment minor fault counter (COW is minor - no I/O)
+    crate::task::percpu::increment_min_flt();
+
     Some(true) // COW fault handled successfully
+}
+
+/// Try to allocate and map a 2MB huge page for a THP-eligible VMA
+///
+/// Returns:
+/// - Some(true) if a huge page was successfully allocated and mapped
+/// - Some(false) if allocation/mapping failed
+/// - None if THP is not applicable (fall through to 4KB allocation)
+fn try_huge_page_fault(
+    cr3: u64,
+    fault_addr: u64,
+    vma_start: u64,
+    vma_end: u64,
+    vma_prot: u32,
+    anon_vma: Option<&alloc::sync::Arc<crate::mm::anon_vma::AnonVma>>,
+) -> Option<bool> {
+    use crate::arch::PageFlags;
+    use crate::arch::x86_64::paging::X86_64PageTable;
+    use crate::mm::huge_page::{HUGE_PAGE_SIZE, huge_page_align_down};
+    use crate::mm::{PROT_EXEC, PROT_WRITE};
+
+    // Calculate the 2MB-aligned region containing this fault
+    let huge_base = huge_page_align_down(fault_addr);
+    let huge_end = huge_base + HUGE_PAGE_SIZE;
+
+    // VMA must fully contain the 2MB region
+    if vma_start > huge_base || vma_end < huge_end {
+        return None; // Fall back to 4KB
+    }
+
+    // Try to allocate a contiguous 2MB physical region
+    // Falls back to 4KB allocation if no contiguous memory available
+    let huge_frame = crate::FRAME_ALLOCATOR.alloc_huge()?;
+
+    // Zero the 2MB region
+    unsafe {
+        core::ptr::write_bytes(huge_frame as *mut u8, 0, HUGE_PAGE_SIZE as usize);
+    }
+
+    // Build page flags from VMA protection
+    let mut flags = PageFlags::READ | PageFlags::USER;
+    if vma_prot & PROT_WRITE != 0 {
+        flags |= PageFlags::WRITE;
+    }
+    if vma_prot & PROT_EXEC != 0 {
+        flags |= PageFlags::EXECUTE;
+    }
+
+    // Map the huge page
+    if X86_64PageTable::map_huge_page(
+        cr3,
+        huge_base,
+        huge_frame,
+        flags,
+        &mut &crate::FRAME_ALLOCATOR,
+    )
+    .is_err()
+    {
+        // Mapping failed - free the huge page and fall back
+        crate::FRAME_ALLOCATOR.free_huge(huge_frame);
+        return None;
+    }
+
+    // Register with LRU (track head frame only for huge pages)
+    {
+        use crate::mm::lru::lru_add_new;
+        use crate::mm::rmap::page_add_anon_rmap;
+
+        if let Some(anon_vma) = anon_vma {
+            page_add_anon_rmap(huge_frame, anon_vma, huge_base);
+        }
+        lru_add_new(huge_frame);
+    }
+
+    // Flush TLB for the huge page region (invlpg on any address in the 2MB
+    // range invalidates the entire huge page TLB entry)
+    unsafe {
+        ::core::arch::asm!(
+            "invlpg [{}]",
+            in(reg) huge_base,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    // Increment minor fault counter (THP is still minor - no I/O)
+    crate::task::percpu::increment_min_flt();
+
+    Some(true) // Huge page mapped successfully
 }
 
 /// Handle a page fault for an mmap'd region (demand paging)
@@ -749,11 +851,34 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
     let vma_prot = vma.prot;
     let vma_is_anonymous = vma.is_anonymous();
     let vma_is_anon_private = vma.is_anon_private();
+    let vma_is_thp_eligible = vma.is_thp_eligible();
     let vma_file = vma.file.clone();
     let vma_start = vma.start;
+    let vma_end = vma.end;
     let vma_offset = vma.offset;
     let vma_anon_vma = vma.anon_vma.clone();
     drop(mm_guard);
+
+    // Get current page table
+    let cr3: u64;
+    unsafe {
+        ::core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+    }
+
+    // Try THP (Transparent Huge Page) allocation for eligible VMAs
+    if vma_is_thp_eligible
+        && let Some(result) = try_huge_page_fault(
+            cr3,
+            fault_addr,
+            vma_start,
+            vma_end,
+            vma_prot,
+            vma_anon_vma.as_ref(),
+        )
+    {
+        return Some(result);
+    }
+    // Fall through to 4KB allocation if THP failed
 
     // Allocate a physical frame
     let frame = match crate::FRAME_ALLOCATOR.alloc() {
@@ -836,6 +961,9 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
             options(nostack, preserves_flags)
         );
     }
+
+    // Increment minor fault counter (demand paging is minor - no I/O from disk)
+    crate::task::percpu::increment_min_flt();
 
     Some(true)
 }
@@ -1127,6 +1255,9 @@ fn handle_swap_fault(cr3: u64, fault_addr: u64) -> Option<bool> {
             );
         }
 
+        // Increment major fault counter (swap cache hit still counts as major)
+        crate::task::percpu::increment_maj_flt();
+
         return Some(true);
     }
 
@@ -1165,6 +1296,9 @@ fn handle_swap_fault(cr3: u64, fault_addr: u64) -> Option<bool> {
 
     // Step 6: Free swap slot (page is now in RAM)
     free_swap_entry(entry);
+
+    // Increment major fault counter (swap-in requires I/O)
+    crate::task::percpu::increment_maj_flt();
 
     Some(true) // Swap-in successful
 }

@@ -22,8 +22,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use spin::{Lazy, Mutex, RwLock};
 
+use crate::error::KernelError;
 use crate::net::NetConfig;
-use crate::net::NetError;
 use crate::net::device::{NetDevice, NetDeviceOps, flags as dev_flags};
 use crate::net::ipv4::Ipv4Addr;
 use crate::net::route::Route;
@@ -201,7 +201,7 @@ impl NetNamespace {
     // ========================================================================
 
     /// Look up a route in this namespace
-    pub fn route_lookup(&self, dest: Ipv4Addr) -> Result<(Arc<NetDevice>, Ipv4Addr), NetError> {
+    pub fn route_lookup(&self, dest: Ipv4Addr) -> Result<(Arc<NetDevice>, Ipv4Addr), KernelError> {
         let table = self.routes.read();
 
         // Find best matching route (longest prefix)
@@ -227,7 +227,7 @@ impl NetNamespace {
                 };
                 Ok((Arc::clone(&route.dev), next_hop))
             }
-            None => Err(NetError::NoRoute),
+            None => Err(KernelError::NetworkUnreachable),
         }
     }
 
@@ -353,7 +353,7 @@ impl Default for NetNamespace {
 struct LoopbackOps;
 
 impl NetDeviceOps for LoopbackOps {
-    fn xmit(&self, skb: alloc::boxed::Box<crate::net::skb::SkBuff>) -> Result<(), NetError> {
+    fn xmit(&self, skb: alloc::boxed::Box<crate::net::skb::SkBuff>) -> Result<(), KernelError> {
         // Loopback: packet comes right back as received
         // For a proper implementation, we'd queue it for rx processing
         // For now, just drop it (loopback in userspace isn't critical for namespace tests)

@@ -14,10 +14,12 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use spin::RwLock;
 
+use crate::error::KernelError;
+
 use super::key::{KEYRING_DEFAULT_PERM, Key, KeySerial};
 use super::types::keyring_key_type;
 use super::{
-    ENOKEY, KEY_SPEC_PROCESS_KEYRING, KEY_SPEC_SESSION_KEYRING, KEY_SPEC_THREAD_KEYRING,
+    KEY_SPEC_PROCESS_KEYRING, KEY_SPEC_SESSION_KEYRING, KEY_SPEC_THREAD_KEYRING,
     KEY_SPEC_USER_KEYRING, KEY_SPEC_USER_SESSION_KEYRING,
 };
 use super::{alloc_serial, lookup_key, register_key};
@@ -105,7 +107,7 @@ pub fn resolve_special_keyring(
                 keyrings.thread_keyring = Some(keyring.serial);
                 Ok(keyring)
             } else {
-                Err(ENOKEY)
+                Err(KernelError::NoKey.sysret())
             }
         }
 
@@ -124,7 +126,7 @@ pub fn resolve_special_keyring(
                 keyrings.process_keyring = Some(keyring.serial);
                 Ok(keyring)
             } else {
-                Err(ENOKEY)
+                Err(KernelError::NoKey.sysret())
             }
         }
 
@@ -143,7 +145,7 @@ pub fn resolve_special_keyring(
                 keyrings.session_keyring = Some(keyring.serial);
                 Ok(keyring)
             } else {
-                Err(ENOKEY)
+                Err(KernelError::NoKey.sysret())
             }
         }
 
@@ -162,7 +164,7 @@ pub fn resolve_special_keyring(
                 keyrings.user_keyring = Some(keyring.serial);
                 Ok(keyring)
             } else {
-                Err(ENOKEY)
+                Err(KernelError::NoKey.sysret())
             }
         }
 
@@ -181,15 +183,15 @@ pub fn resolve_special_keyring(
                 keyrings.user_session_keyring = Some(keyring.serial);
                 Ok(keyring)
             } else {
-                Err(ENOKEY)
+                Err(KernelError::NoKey.sysret())
             }
         }
 
         // Positive serial: look up directly
-        serial if serial > 0 => lookup_key(serial).ok_or(ENOKEY),
+        serial if serial > 0 => lookup_key(serial).ok_or(KernelError::NoKey.sysret()),
 
         // Invalid special ID
-        _ => Err(ENOKEY),
+        _ => Err(KernelError::NoKey.sysret()),
     }
 }
 

@@ -27,7 +27,7 @@ use spin::RwLock;
 
 use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
 
-use super::FsError;
+use super::KernelError;
 use super::dentry::Dentry;
 use super::file::{DirEntry, File, FileOps, RwFlags};
 use super::inode::{AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
@@ -162,7 +162,7 @@ impl RamfsInodeOps {
         new_children: &mut BTreeMap<String, Arc<Inode>>,
         new_name: &str,
         flags: u32,
-    ) -> Result<(), FsError> {
+    ) -> Result<(), KernelError> {
         const RENAME_NOREPLACE: u32 = 1;
         const RENAME_EXCHANGE: u32 = 2;
 
@@ -173,14 +173,14 @@ impl RamfsInodeOps {
         let source_inode = old_children
             .get(old_name)
             .cloned()
-            .ok_or(FsError::NotFound)?;
+            .ok_or(KernelError::NotFound)?;
 
         if exchange {
             // Exchange requires both to exist
             let target_inode = new_children
                 .get(new_name)
                 .cloned()
-                .ok_or(FsError::NotFound)?;
+                .ok_or(KernelError::NotFound)?;
 
             // Move source to new location, target to old location
             old_children.remove(old_name);
@@ -192,7 +192,7 @@ impl RamfsInodeOps {
             let target_exists = new_children.contains_key(new_name);
 
             if noreplace && target_exists {
-                return Err(FsError::AlreadyExists);
+                return Err(KernelError::AlreadyExists);
             }
 
             // Remove source
@@ -202,17 +202,17 @@ impl RamfsInodeOps {
             if let Some(old_target) = new_children.remove(new_name) {
                 // If replacing a directory, it must be empty
                 if old_target.mode().is_dir() {
-                    let target_private = old_target.get_private().ok_or(FsError::IoError)?;
+                    let target_private = old_target.get_private().ok_or(KernelError::Io)?;
                     let target_data = target_private
                         .as_ref()
                         .as_any()
                         .downcast_ref::<RamfsInodeData>()
-                        .ok_or(FsError::IoError)?;
+                        .ok_or(KernelError::Io)?;
                     if !target_data.children.read().is_empty() {
                         // Restore source and target
                         old_children.insert(String::from(old_name), source_inode);
                         new_children.insert(String::from(new_name), old_target);
-                        return Err(FsError::DirectoryNotEmpty);
+                        return Err(KernelError::DirectoryNotEmpty);
                     }
                 }
                 old_target.dec_nlink();
@@ -227,34 +227,34 @@ impl RamfsInodeOps {
 }
 
 impl InodeOps for RamfsInodeOps {
-    fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, FsError> {
-        let private = dir.get_private().ok_or(FsError::IoError)?;
+    fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError> {
+        let private = dir.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         ramfs_data
             .children
             .read()
             .get(name)
             .cloned()
-            .ok_or(FsError::NotFound)
+            .ok_or(KernelError::NotFound)
     }
 
-    fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, FsError> {
-        let sb = dir.superblock().ok_or(FsError::IoError)?;
-        let private = dir.get_private().ok_or(FsError::IoError)?;
+    fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+        let sb = dir.superblock().ok_or(KernelError::Io)?;
+        let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         // Check if already exists
         if dir_data.children.read().contains_key(name) {
-            return Err(FsError::AlreadyExists);
+            return Err(KernelError::AlreadyExists);
         }
 
         // Create new inode (inherit uid/gid from parent directory for now)
@@ -282,18 +282,18 @@ impl InodeOps for RamfsInodeOps {
         Ok(new_inode)
     }
 
-    fn mkdir(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, FsError> {
-        let sb = dir.superblock().ok_or(FsError::IoError)?;
-        let private = dir.get_private().ok_or(FsError::IoError)?;
+    fn mkdir(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
+        let sb = dir.superblock().ok_or(KernelError::Io)?;
+        let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         // Check if already exists
         if dir_data.children.read().contains_key(name) {
-            return Err(FsError::AlreadyExists);
+            return Err(KernelError::AlreadyExists);
         }
 
         // Create new directory inode (inherit uid/gid from parent)
@@ -318,20 +318,25 @@ impl InodeOps for RamfsInodeOps {
         Ok(new_inode)
     }
 
-    fn readpage(&self, inode: &Inode, page_offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn readpage(
+        &self,
+        inode: &Inode,
+        page_offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, KernelError> {
         // Ramfs uses page cache via AddressSpaceOps (RAMFS_AOPS).
         // This InodeOps::readpage is deprecated for ramfs - use the page cache directly.
         use crate::frame_alloc::FrameAllocRef;
         use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
-        let file_id = ramfs_data.file_id.ok_or(FsError::IoError)?;
+        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
         let file_size = inode.get_size();
 
         // Get the page from cache
@@ -349,7 +354,7 @@ impl InodeOps for RamfsInodeOps {
                     true,  // unevictable
                     &RAMFS_AOPS,
                 )
-                .map_err(|_| FsError::IoError)?;
+                .map_err(|_| KernelError::Io)?;
             page
         };
 
@@ -362,20 +367,20 @@ impl InodeOps for RamfsInodeOps {
         Ok(page_size)
     }
 
-    fn writepage(&self, inode: &Inode, page_offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn writepage(&self, inode: &Inode, page_offset: u64, buf: &[u8]) -> Result<usize, KernelError> {
         // Ramfs uses page cache via AddressSpaceOps (RAMFS_AOPS).
         // This InodeOps::writepage is deprecated for ramfs - use the page cache directly.
         use crate::frame_alloc::FrameAllocRef;
         use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
-        let file_id = ramfs_data.file_id.ok_or(FsError::IoError)?;
+        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
         let file_size = inode.get_size();
         let page_size = buf.len();
 
@@ -394,7 +399,7 @@ impl InodeOps for RamfsInodeOps {
                     true,  // unevictable
                     &RAMFS_AOPS,
                 )
-                .map_err(|_| FsError::IoError)?;
+                .map_err(|_| KernelError::Io)?;
             page
         };
 
@@ -407,38 +412,38 @@ impl InodeOps for RamfsInodeOps {
         Ok(page_size)
     }
 
-    fn readlink(&self, inode: &Inode) -> Result<String, FsError> {
+    fn readlink(&self, inode: &Inode) -> Result<String, KernelError> {
         // Must be a symlink
         if !inode.mode().is_symlink() {
-            return Err(FsError::InvalidArgument);
+            return Err(KernelError::InvalidArgument);
         }
 
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         // Symlink target is stored inline
         ramfs_data
             .symlink_target
             .clone()
-            .ok_or(FsError::InvalidArgument)
+            .ok_or(KernelError::InvalidArgument)
     }
 
-    fn symlink(&self, dir: &Inode, name: &str, target: &str) -> Result<Arc<Inode>, FsError> {
-        let sb = dir.superblock().ok_or(FsError::IoError)?;
-        let private = dir.get_private().ok_or(FsError::IoError)?;
+    fn symlink(&self, dir: &Inode, name: &str, target: &str) -> Result<Arc<Inode>, KernelError> {
+        let sb = dir.superblock().ok_or(KernelError::Io)?;
+        let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         // Check if already exists
         if dir_data.children.read().contains_key(name) {
-            return Err(FsError::AlreadyExists);
+            return Err(KernelError::AlreadyExists);
         }
 
         // Create symlink inode (mode = S_IFLNK | 0777)
@@ -465,22 +470,22 @@ impl InodeOps for RamfsInodeOps {
         Ok(new_inode)
     }
 
-    fn link(&self, dir: &Inode, name: &str, target_inode: &Arc<Inode>) -> Result<(), FsError> {
+    fn link(&self, dir: &Inode, name: &str, target_inode: &Arc<Inode>) -> Result<(), KernelError> {
         // Cannot hard link directories
         if target_inode.mode().is_dir() {
-            return Err(FsError::PermissionDenied); // EPERM
+            return Err(KernelError::PermissionDenied); // EPERM
         }
 
-        let private = dir.get_private().ok_or(FsError::IoError)?;
+        let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         // Check if name already exists
         if dir_data.children.read().contains_key(name) {
-            return Err(FsError::AlreadyExists);
+            return Err(KernelError::AlreadyExists);
         }
 
         // Increment link count on target
@@ -495,23 +500,23 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    fn truncate(&self, inode: &Inode, length: u64) -> Result<(), FsError> {
+    fn truncate(&self, inode: &Inode, length: u64) -> Result<(), KernelError> {
         use crate::frame_alloc::FrameAllocRef;
         use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
         // Cannot truncate directories
         if inode.mode().is_dir() {
-            return Err(FsError::IsADirectory);
+            return Err(KernelError::IsDirectory);
         }
 
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
-        let file_id = ramfs_data.file_id.ok_or(FsError::IoError)?;
+        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
         let old_size = inode.get_size();
 
         // If shrinking, free pages beyond the new size
@@ -534,18 +539,18 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    fn unlink(&self, dir: &Inode, name: &str) -> Result<(), FsError> {
-        let private = dir.get_private().ok_or(FsError::IoError)?;
+    fn unlink(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
+        let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         // Remove from directory
         let removed_inode = {
             let mut children = dir_data.children.write();
-            children.remove(name).ok_or(FsError::NotFound)?
+            children.remove(name).ok_or(KernelError::NotFound)?
         };
 
         // Decrement link count
@@ -563,7 +568,7 @@ impl InodeOps for RamfsInodeOps {
         new_dir: &Arc<Inode>,
         new_name: &str,
         flags: u32,
-    ) -> Result<(), FsError> {
+    ) -> Result<(), KernelError> {
         // RENAME_NOREPLACE = 1, RENAME_EXCHANGE = 2
         const RENAME_NOREPLACE: u32 = 1;
         const RENAME_EXCHANGE: u32 = 2;
@@ -573,24 +578,24 @@ impl InodeOps for RamfsInodeOps {
 
         // NOREPLACE and EXCHANGE are mutually exclusive
         if noreplace && exchange {
-            return Err(FsError::InvalidArgument);
+            return Err(KernelError::InvalidArgument);
         }
 
         // Get old directory's data
-        let old_private = old_dir.get_private().ok_or(FsError::IoError)?;
+        let old_private = old_dir.get_private().ok_or(KernelError::Io)?;
         let old_dir_data = old_private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         // Get new directory's data
-        let new_private = new_dir.get_private().ok_or(FsError::IoError)?;
+        let new_private = new_dir.get_private().ok_or(KernelError::Io)?;
         let new_dir_data = new_private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         // Check if same directory (optimization for simple renames)
         let same_dir = core::ptr::eq(
@@ -603,20 +608,26 @@ impl InodeOps for RamfsInodeOps {
             let mut children = old_dir_data.children.write();
 
             // Get the source inode
-            let source_inode = children.get(old_name).cloned().ok_or(FsError::NotFound)?;
+            let source_inode = children
+                .get(old_name)
+                .cloned()
+                .ok_or(KernelError::NotFound)?;
 
             // Check target exists
             let target_exists = children.contains_key(new_name);
 
             if exchange {
                 // Exchange requires both to exist
-                let target_inode = children.get(new_name).cloned().ok_or(FsError::NotFound)?;
+                let target_inode = children
+                    .get(new_name)
+                    .cloned()
+                    .ok_or(KernelError::NotFound)?;
 
                 // Swap the entries
                 children.insert(String::from(old_name), target_inode);
                 children.insert(String::from(new_name), source_inode);
             } else if noreplace && target_exists {
-                return Err(FsError::AlreadyExists);
+                return Err(KernelError::AlreadyExists);
             } else {
                 // Remove old entry
                 children.remove(old_name);
@@ -625,16 +636,16 @@ impl InodeOps for RamfsInodeOps {
                 if let Some(old_target) = children.remove(new_name) {
                     // If replacing a directory, it must be empty
                     if old_target.mode().is_dir() {
-                        let target_private = old_target.get_private().ok_or(FsError::IoError)?;
+                        let target_private = old_target.get_private().ok_or(KernelError::Io)?;
                         let target_data = target_private
                             .as_ref()
                             .as_any()
                             .downcast_ref::<RamfsInodeData>()
-                            .ok_or(FsError::IoError)?;
+                            .ok_or(KernelError::Io)?;
                         if !target_data.children.read().is_empty() {
                             // Restore the source
                             children.insert(String::from(old_name), source_inode);
-                            return Err(FsError::DirectoryNotEmpty);
+                            return Err(KernelError::DirectoryNotEmpty);
                         }
                     }
                     old_target.dec_nlink();
@@ -663,41 +674,41 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    fn rmdir(&self, dir: &Inode, name: &str) -> Result<(), FsError> {
-        let private = dir.get_private().ok_or(FsError::IoError)?;
+    fn rmdir(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
+        let private = dir.get_private().ok_or(KernelError::Io)?;
         let dir_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         // First, look up the target to check it's a directory and empty
         let target_inode = {
             let children = dir_data.children.read();
-            children.get(name).cloned().ok_or(FsError::NotFound)?
+            children.get(name).cloned().ok_or(KernelError::NotFound)?
         };
 
         // Must be a directory
         if !target_inode.mode().is_dir() {
-            return Err(FsError::NotADirectory);
+            return Err(KernelError::NotDirectory);
         }
 
         // Check if directory is empty
-        let target_private = target_inode.get_private().ok_or(FsError::IoError)?;
+        let target_private = target_inode.get_private().ok_or(KernelError::Io)?;
         let target_data = target_private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         if !target_data.children.read().is_empty() {
-            return Err(FsError::DirectoryNotEmpty);
+            return Err(KernelError::DirectoryNotEmpty);
         }
 
         // Remove from parent directory
         let removed_inode = {
             let mut children = dir_data.children.write();
-            children.remove(name).ok_or(FsError::NotFound)?
+            children.remove(name).ok_or(KernelError::NotFound)?
         };
 
         // Decrement link count
@@ -710,27 +721,27 @@ impl InodeOps for RamfsInodeOps {
     // Extended attribute operations
     // =========================================================================
 
-    fn getxattr(&self, inode: &Inode, name: &str, value: &mut [u8]) -> Result<usize, FsError> {
+    fn getxattr(&self, inode: &Inode, name: &str, value: &mut [u8]) -> Result<usize, KernelError> {
         // Validate namespace - only user.* is supported for regular files/dirs
         if !name.starts_with("user.") {
-            return Err(FsError::NotSupported);
+            return Err(KernelError::OperationNotSupported);
         }
 
         // user.* namespace only allowed on regular files and directories
         let mode = inode.mode();
         if !mode.is_file() && !mode.is_dir() {
-            return Err(FsError::NotSupported);
+            return Err(KernelError::OperationNotSupported);
         }
 
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         let xattrs = ramfs_data.xattrs.read();
-        let attr_value = xattrs.get(name).ok_or(FsError::NoData)?;
+        let attr_value = xattrs.get(name).ok_or(KernelError::NoData)?;
 
         // If value buffer is empty, return the size needed
         if value.is_empty() {
@@ -739,7 +750,7 @@ impl InodeOps for RamfsInodeOps {
 
         // Check if buffer is large enough
         if value.len() < attr_value.len() {
-            return Err(FsError::Range);
+            return Err(KernelError::Range);
         }
 
         // Copy value to buffer
@@ -747,28 +758,34 @@ impl InodeOps for RamfsInodeOps {
         Ok(attr_value.len())
     }
 
-    fn setxattr(&self, inode: &Inode, name: &str, value: &[u8], flags: u32) -> Result<(), FsError> {
+    fn setxattr(
+        &self,
+        inode: &Inode,
+        name: &str,
+        value: &[u8],
+        flags: u32,
+    ) -> Result<(), KernelError> {
         // Constants for xattr flags
         const XATTR_CREATE: u32 = 0x1;
         const XATTR_REPLACE: u32 = 0x2;
 
         // Validate namespace - only user.* is supported for regular files/dirs
         if !name.starts_with("user.") {
-            return Err(FsError::NotSupported);
+            return Err(KernelError::OperationNotSupported);
         }
 
         // user.* namespace only allowed on regular files and directories
         let mode = inode.mode();
         if !mode.is_file() && !mode.is_dir() {
-            return Err(FsError::NotSupported);
+            return Err(KernelError::OperationNotSupported);
         }
 
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         let mut xattrs = ramfs_data.xattrs.write();
 
@@ -776,12 +793,12 @@ impl InodeOps for RamfsInodeOps {
 
         // Check XATTR_CREATE flag - fail if exists
         if (flags & XATTR_CREATE) != 0 && exists {
-            return Err(FsError::AlreadyExists);
+            return Err(KernelError::AlreadyExists);
         }
 
         // Check XATTR_REPLACE flag - fail if doesn't exist
         if (flags & XATTR_REPLACE) != 0 && !exists {
-            return Err(FsError::NoData);
+            return Err(KernelError::NoData);
         }
 
         // Set the attribute
@@ -789,13 +806,13 @@ impl InodeOps for RamfsInodeOps {
         Ok(())
     }
 
-    fn listxattr(&self, inode: &Inode, list: &mut [u8]) -> Result<usize, FsError> {
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+    fn listxattr(&self, inode: &Inode, list: &mut [u8]) -> Result<usize, KernelError> {
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         let xattrs = ramfs_data.xattrs.read();
 
@@ -809,7 +826,7 @@ impl InodeOps for RamfsInodeOps {
 
         // Check if buffer is large enough
         if list.len() < total_size {
-            return Err(FsError::Range);
+            return Err(KernelError::Range);
         }
 
         // Build the null-separated list of attribute names
@@ -825,29 +842,29 @@ impl InodeOps for RamfsInodeOps {
         Ok(total_size)
     }
 
-    fn removexattr(&self, inode: &Inode, name: &str) -> Result<(), FsError> {
+    fn removexattr(&self, inode: &Inode, name: &str) -> Result<(), KernelError> {
         // Validate namespace - only user.* is supported for regular files/dirs
         if !name.starts_with("user.") {
-            return Err(FsError::NotSupported);
+            return Err(KernelError::OperationNotSupported);
         }
 
         // user.* namespace only allowed on regular files and directories
         let mode = inode.mode();
         if !mode.is_file() && !mode.is_dir() {
-            return Err(FsError::NotSupported);
+            return Err(KernelError::OperationNotSupported);
         }
 
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         let mut xattrs = ramfs_data.xattrs.write();
 
         if xattrs.remove(name).is_none() {
-            return Err(FsError::NoData);
+            return Err(KernelError::NoData);
         }
 
         Ok(())
@@ -865,19 +882,19 @@ impl FileOps for RamfsFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         use crate::frame_alloc::FrameAllocRef;
         use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
-        let file_id = ramfs_data.file_id.ok_or(FsError::IoError)?;
+        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
         let file_size = inode.get_size();
         let pos = file.get_pos();
 
@@ -916,7 +933,7 @@ impl FileOps for RamfsFileOps {
                         true,  // unevictable: true for ramfs
                         &RAMFS_AOPS,
                     )
-                    .map_err(|_| FsError::IoError)?;
+                    .map_err(|_| KernelError::Io)?;
                 page
             };
 
@@ -933,19 +950,19 @@ impl FileOps for RamfsFileOps {
         Ok(bytes_read)
     }
 
-    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, FsError> {
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         use crate::frame_alloc::FrameAllocRef;
         use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
-        let file_id = ramfs_data.file_id.ok_or(FsError::IoError)?;
+        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
         let pos = file.get_pos();
 
         if buf.is_empty() {
@@ -979,7 +996,7 @@ impl FileOps for RamfsFileOps {
                         true,  // unevictable: true for ramfs
                         &RAMFS_AOPS,
                     )
-                    .map_err(|_| FsError::IoError)?;
+                    .map_err(|_| KernelError::Io)?;
                 page
             };
 
@@ -1004,19 +1021,19 @@ impl FileOps for RamfsFileOps {
         Ok(bytes_written)
     }
 
-    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, FsError> {
+    fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
         use crate::frame_alloc::FrameAllocRef;
         use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
-        let file_id = ramfs_data.file_id.ok_or(FsError::IoError)?;
+        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
         let file_size = inode.get_size();
         let pos = offset;
 
@@ -1055,7 +1072,7 @@ impl FileOps for RamfsFileOps {
                         true,  // unevictable: true for ramfs
                         &RAMFS_AOPS,
                     )
-                    .map_err(|_| FsError::IoError)?;
+                    .map_err(|_| KernelError::Io)?;
                 page
             };
 
@@ -1072,19 +1089,19 @@ impl FileOps for RamfsFileOps {
         Ok(bytes_read)
     }
 
-    fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, FsError> {
+    fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
         use crate::frame_alloc::FrameAllocRef;
         use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
-        let file_id = ramfs_data.file_id.ok_or(FsError::IoError)?;
+        let file_id = ramfs_data.file_id.ok_or(KernelError::Io)?;
         let pos = offset;
 
         if buf.is_empty() {
@@ -1118,7 +1135,7 @@ impl FileOps for RamfsFileOps {
                         true,  // unevictable: true for ramfs
                         &RAMFS_AOPS,
                     )
-                    .map_err(|_| FsError::IoError)?;
+                    .map_err(|_| KernelError::Io)?;
                 page
             };
 
@@ -1147,19 +1164,19 @@ impl FileOps for RamfsFileOps {
         &self,
         file: &File,
         callback: &mut dyn FnMut(DirEntry) -> bool,
-    ) -> Result<(), FsError> {
-        let inode = file.get_inode().ok_or(FsError::InvalidFile)?;
+    ) -> Result<(), KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
 
         if !inode.mode().is_dir() {
-            return Err(FsError::NotADirectory);
+            return Err(KernelError::NotDirectory);
         }
 
-        let private = inode.get_private().ok_or(FsError::IoError)?;
+        let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
-            .ok_or(FsError::IoError)?;
+            .ok_or(KernelError::Io)?;
 
         // First, emit "." and ".."
         let should_continue = callback(DirEntry {
@@ -1216,7 +1233,7 @@ impl FileOps for RamfsFileOps {
         file: &File,
         buf: &mut [u8],
         _flags: RwFlags,
-    ) -> Result<usize, FsError> {
+    ) -> Result<usize, KernelError> {
         // In-memory filesystem never blocks
         self.read(file, buf)
     }
@@ -1227,12 +1244,17 @@ impl FileOps for RamfsFileOps {
         buf: &mut [u8],
         offset: u64,
         _flags: RwFlags,
-    ) -> Result<usize, FsError> {
+    ) -> Result<usize, KernelError> {
         // In-memory filesystem never blocks
         self.pread(file, buf, offset)
     }
 
-    fn write_with_flags(&self, file: &File, buf: &[u8], _flags: RwFlags) -> Result<usize, FsError> {
+    fn write_with_flags(
+        &self,
+        file: &File,
+        buf: &[u8],
+        _flags: RwFlags,
+    ) -> Result<usize, KernelError> {
         // In-memory filesystem never blocks
         self.write(file, buf)
     }
@@ -1243,7 +1265,7 @@ impl FileOps for RamfsFileOps {
         buf: &[u8],
         offset: u64,
         _flags: RwFlags,
-    ) -> Result<usize, FsError> {
+    ) -> Result<usize, KernelError> {
         // In-memory filesystem never blocks
         self.pwrite(file, buf, offset)
     }
@@ -1274,7 +1296,7 @@ impl SuperOps for RamfsSuperOps {
         sb: &Arc<SuperBlock>,
         mode: InodeMode,
         i_op: &'static dyn InodeOps,
-    ) -> Result<Arc<Inode>, FsError> {
+    ) -> Result<Arc<Inode>, KernelError> {
         let ino = sb.alloc_ino();
 
         let inode = Arc::new(Inode::new(
@@ -1308,7 +1330,7 @@ impl SuperOps for RamfsSuperOps {
 pub static RAMFS_SUPER_OPS: RamfsSuperOps = RamfsSuperOps;
 
 /// Mount function for ramfs
-fn ramfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, FsError> {
+fn ramfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError> {
     // Create superblock
     let sb = SuperBlock::new(fs_type, &RAMFS_SUPER_OPS, 0);
 
@@ -1352,21 +1374,21 @@ pub fn ramfs_create_dir_with_owner(
     mode: InodeMode,
     uid: Uid,
     gid: Gid,
-) -> Result<Arc<Dentry>, FsError> {
-    let parent_inode = parent.get_inode().ok_or(FsError::NotFound)?;
-    let sb = parent_inode.superblock().ok_or(FsError::IoError)?;
+) -> Result<Arc<Dentry>, KernelError> {
+    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
+    let sb = parent_inode.superblock().ok_or(KernelError::Io)?;
 
     // Get parent's ramfs data
-    let private = parent_inode.get_private().ok_or(FsError::IoError)?;
+    let private = parent_inode.get_private().ok_or(KernelError::Io)?;
     let parent_data = private
         .as_ref()
         .as_any()
         .downcast_ref::<RamfsInodeData>()
-        .ok_or(FsError::IoError)?;
+        .ok_or(KernelError::Io)?;
 
     // Check if already exists
     if parent_data.children.read().contains_key(name) {
-        return Err(FsError::AlreadyExists);
+        return Err(KernelError::AlreadyExists);
     }
 
     // Create new directory inode
@@ -1401,7 +1423,7 @@ pub fn ramfs_create_dir_with_owner(
 }
 
 /// Create a directory in ramfs with default ownership (root:root, mode 0755)
-pub fn ramfs_create_dir(parent: &Arc<Dentry>, name: &str) -> Result<Arc<Dentry>, FsError> {
+pub fn ramfs_create_dir(parent: &Arc<Dentry>, name: &str) -> Result<Arc<Dentry>, KernelError> {
     ramfs_create_dir_with_owner(parent, name, InodeMode::directory(0o755), 0, 0)
 }
 
@@ -1414,24 +1436,24 @@ pub fn ramfs_create_file_with_timestamp(
     uid: Uid,
     gid: Gid,
     mtime: Timespec,
-) -> Result<Arc<Dentry>, FsError> {
+) -> Result<Arc<Dentry>, KernelError> {
     use crate::frame_alloc::FrameAllocRef;
     use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
-    let parent_inode = parent.get_inode().ok_or(FsError::NotFound)?;
-    let sb = parent_inode.superblock().ok_or(FsError::IoError)?;
+    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
+    let sb = parent_inode.superblock().ok_or(KernelError::Io)?;
 
     // Get parent's ramfs data
-    let private = parent_inode.get_private().ok_or(FsError::IoError)?;
+    let private = parent_inode.get_private().ok_or(KernelError::Io)?;
     let parent_data = private
         .as_ref()
         .as_any()
         .downcast_ref::<RamfsInodeData>()
-        .ok_or(FsError::IoError)?;
+        .ok_or(KernelError::Io)?;
 
     // Check if already exists
     if parent_data.children.read().contains_key(name) {
-        return Err(FsError::AlreadyExists);
+        return Err(KernelError::AlreadyExists);
     }
 
     // Create new file inode with content and explicit timestamp
@@ -1475,7 +1497,7 @@ pub fn ramfs_create_file_with_timestamp(
                         true,  // unevictable
                         &RAMFS_AOPS,
                     )
-                    .map_err(|_| FsError::IoError)?;
+                    .map_err(|_| KernelError::Io)?;
                 page
             };
 
@@ -1516,21 +1538,21 @@ pub fn ramfs_create_dir_with_timestamp(
     uid: Uid,
     gid: Gid,
     mtime: Timespec,
-) -> Result<Arc<Dentry>, FsError> {
-    let parent_inode = parent.get_inode().ok_or(FsError::NotFound)?;
-    let sb = parent_inode.superblock().ok_or(FsError::IoError)?;
+) -> Result<Arc<Dentry>, KernelError> {
+    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
+    let sb = parent_inode.superblock().ok_or(KernelError::Io)?;
 
     // Get parent's ramfs data
-    let private = parent_inode.get_private().ok_or(FsError::IoError)?;
+    let private = parent_inode.get_private().ok_or(KernelError::Io)?;
     let parent_data = private
         .as_ref()
         .as_any()
         .downcast_ref::<RamfsInodeData>()
-        .ok_or(FsError::IoError)?;
+        .ok_or(KernelError::Io)?;
 
     // Check if already exists
     if parent_data.children.read().contains_key(name) {
-        return Err(FsError::AlreadyExists);
+        return Err(KernelError::AlreadyExists);
     }
 
     // Create new directory inode with explicit timestamp
@@ -1571,7 +1593,7 @@ pub fn ramfs_mkpath_with_timestamp(
     uid: Uid,
     gid: Gid,
     mtime: Timespec,
-) -> Result<Arc<Dentry>, FsError> {
+) -> Result<Arc<Dentry>, KernelError> {
     let mut current = root.clone();
 
     for component in path.split('/').filter(|s| !s.is_empty()) {
@@ -1581,7 +1603,7 @@ pub fn ramfs_mkpath_with_timestamp(
             if let Some(inode) = child.get_inode()
                 && !inode.mode().is_dir()
             {
-                return Err(FsError::NotADirectory);
+                return Err(KernelError::NotDirectory);
             }
             current = child;
         } else {
@@ -1608,21 +1630,21 @@ pub fn ramfs_create_symlink_with_timestamp(
     uid: Uid,
     gid: Gid,
     mtime: Timespec,
-) -> Result<Arc<Dentry>, FsError> {
-    let parent_inode = parent.get_inode().ok_or(FsError::NotFound)?;
-    let sb = parent_inode.superblock().ok_or(FsError::IoError)?;
+) -> Result<Arc<Dentry>, KernelError> {
+    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
+    let sb = parent_inode.superblock().ok_or(KernelError::Io)?;
 
     // Get parent's ramfs data
-    let private = parent_inode.get_private().ok_or(FsError::IoError)?;
+    let private = parent_inode.get_private().ok_or(KernelError::Io)?;
     let parent_data = private
         .as_ref()
         .as_any()
         .downcast_ref::<RamfsInodeData>()
-        .ok_or(FsError::IoError)?;
+        .ok_or(KernelError::Io)?;
 
     // Check if already exists
     if parent_data.children.read().contains_key(name) {
-        return Err(FsError::AlreadyExists);
+        return Err(KernelError::AlreadyExists);
     }
 
     // Create symlink inode (mode = S_IFLNK | 0777)
@@ -1675,21 +1697,21 @@ pub fn ramfs_create_blkdev(
     name: &str,
     rdev: DevId,
     mode: u16,
-) -> Result<Arc<Dentry>, FsError> {
-    let parent_inode = parent.get_inode().ok_or(FsError::NotFound)?;
-    let sb = parent_inode.superblock().ok_or(FsError::IoError)?;
+) -> Result<Arc<Dentry>, KernelError> {
+    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
+    let sb = parent_inode.superblock().ok_or(KernelError::Io)?;
 
     // Get parent's ramfs data
-    let private = parent_inode.get_private().ok_or(FsError::IoError)?;
+    let private = parent_inode.get_private().ok_or(KernelError::Io)?;
     let parent_data = private
         .as_ref()
         .as_any()
         .downcast_ref::<RamfsInodeData>()
-        .ok_or(FsError::IoError)?;
+        .ok_or(KernelError::Io)?;
 
     // Check if already exists
     if parent_data.children.read().contains_key(name) {
-        return Err(FsError::AlreadyExists);
+        return Err(KernelError::AlreadyExists);
     }
 
     // Create new block device inode
@@ -1740,21 +1762,21 @@ pub fn ramfs_create_chrdev(
     name: &str,
     rdev: DevId,
     mode: u16,
-) -> Result<Arc<Dentry>, FsError> {
-    let parent_inode = parent.get_inode().ok_or(FsError::NotFound)?;
-    let sb = parent_inode.superblock().ok_or(FsError::IoError)?;
+) -> Result<Arc<Dentry>, KernelError> {
+    let parent_inode = parent.get_inode().ok_or(KernelError::NotFound)?;
+    let sb = parent_inode.superblock().ok_or(KernelError::Io)?;
 
     // Get parent's ramfs data
-    let private = parent_inode.get_private().ok_or(FsError::IoError)?;
+    let private = parent_inode.get_private().ok_or(KernelError::Io)?;
     let parent_data = private
         .as_ref()
         .as_any()
         .downcast_ref::<RamfsInodeData>()
-        .ok_or(FsError::IoError)?;
+        .ok_or(KernelError::Io)?;
 
     // Check if already exists
     if parent_data.children.read().contains_key(name) {
-        return Err(FsError::AlreadyExists);
+        return Err(KernelError::AlreadyExists);
     }
 
     // Create new character device inode

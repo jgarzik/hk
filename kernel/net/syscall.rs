@@ -7,6 +7,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::sync::Weak;
 
+use crate::error::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags as file_flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec};
@@ -34,26 +35,6 @@ fn get_nofile_limit() -> u64 {
     } else {
         limit
     }
-}
-
-/// Error numbers (negative)
-mod errno {
-    pub const EINVAL: i64 = -22;
-    pub const EBADF: i64 = -9;
-    pub const ENOTSOCK: i64 = -88;
-    pub const EAFNOSUPPORT: i64 = -97;
-    pub const ESOCKTNOSUPPORT: i64 = -94;
-    pub const EPROTONOSUPPORT: i64 = -93;
-    pub const ENOMEM: i64 = -12;
-    pub const EOPNOTSUPP: i64 = -95;
-    pub const ENOTCONN: i64 = -107;
-    pub const EISCONN: i64 = -106;
-    pub const EFAULT: i64 = -14;
-    #[allow(dead_code)]
-    pub const EAGAIN: i64 = -11;
-    pub const EINPROGRESS: i64 = -115;
-    pub const EALREADY: i64 = -114;
-    pub const EMFILE: i64 = -24;
 }
 
 /// Create a dummy dentry for sockets
@@ -85,7 +66,7 @@ pub fn sys_socket(domain: i32, sock_type: i32, protocol: i32) -> i64 {
     // Parse address family
     let family = match AddressFamily::from_i32(domain) {
         Some(AddressFamily::Inet) => AddressFamily::Inet,
-        Some(_) | None => return errno::EAFNOSUPPORT,
+        Some(_) | None => return KernelError::AddressFamilyNotSupported.sysret(),
     };
 
     // Extract type and flags
@@ -97,8 +78,8 @@ pub fn sys_socket(domain: i32, sock_type: i32, protocol: i32) -> i64 {
     let stype = match SocketType::from_i32(type_only) {
         Some(SocketType::Stream) => SocketType::Stream,
         Some(SocketType::Dgram) => SocketType::Dgram,
-        Some(SocketType::Raw) => return errno::ESOCKTNOSUPPORT,
-        None => return errno::ESOCKTNOSUPPORT,
+        Some(SocketType::Raw) => return KernelError::SocketTypeNotSupported.sysret(),
+        None => return KernelError::SocketTypeNotSupported.sysret(),
     };
 
     // Protocol: 0 means default for type
@@ -107,9 +88,9 @@ pub fn sys_socket(domain: i32, sock_type: i32, protocol: i32) -> i64 {
         match (stype, protocol) {
             (SocketType::Stream, 6) => {} // TCP
             (SocketType::Dgram, 17) => {} // UDP
-            (SocketType::Stream, _) => return errno::EPROTONOSUPPORT,
-            (SocketType::Dgram, _) => return errno::EPROTONOSUPPORT,
-            _ => return errno::EPROTONOSUPPORT,
+            (SocketType::Stream, _) => return KernelError::ProtocolNotSupported.sysret(),
+            (SocketType::Dgram, _) => return KernelError::ProtocolNotSupported.sysret(),
+            _ => return KernelError::ProtocolNotSupported.sysret(),
         }
     }
 
@@ -127,7 +108,7 @@ pub fn sys_socket(domain: i32, sock_type: i32, protocol: i32) -> i64 {
     // Create dummy dentry for socket
     let dentry = match create_socket_dentry() {
         Ok(d) => d,
-        Err(_) => return errno::ENOMEM,
+        Err(_) => return KernelError::OutOfMemory.sysret(),
     };
 
     // Determine file flags
@@ -143,18 +124,18 @@ pub fn sys_socket(domain: i32, sock_type: i32, protocol: i32) -> i64 {
     // Allocate fd
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return errno::ENOMEM,
+        None => return KernelError::OutOfMemory.sysret(),
     };
     match fd_table.lock().alloc(file, get_nofile_limit()) {
         Ok(fd) => fd as i64,
-        Err(_) => errno::ENOMEM,
+        Err(_) => KernelError::OutOfMemory.sysret(),
     }
 }
 
 /// connect(fd, addr, addrlen) - connect to remote address
 pub fn sys_connect(fd: i32, addr: u64, addrlen: u64) -> i64 {
     if addrlen < core::mem::size_of::<SockAddrIn>() as u64 {
-        return errno::EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get socket from fd
@@ -171,7 +152,7 @@ pub fn sys_connect(fd: i32, addr: u64, addrlen: u64) -> i64 {
 
     // Verify address family
     if sockaddr.sin_family != AddressFamily::Inet as u16 {
-        return errno::EAFNOSUPPORT;
+        return KernelError::AddressFamilyNotSupported.sysret();
     }
 
     let remote_addr = sockaddr.addr();
@@ -180,10 +161,10 @@ pub fn sys_connect(fd: i32, addr: u64, addrlen: u64) -> i64 {
     // Check TCP state
     if let Some(ref tcp) = socket.tcp {
         match tcp.state() {
-            TcpState::Established => return errno::EISCONN,
+            TcpState::Established => return KernelError::AlreadyConnected.sysret(),
             TcpState::SynSent | TcpState::SynReceived => {
                 if socket.is_nonblocking() {
-                    return errno::EALREADY;
+                    return KernelError::AlreadyInProgress.sysret();
                 }
             }
             _ => {}
@@ -192,12 +173,12 @@ pub fn sys_connect(fd: i32, addr: u64, addrlen: u64) -> i64 {
 
     // Initiate connection
     if let Err(e) = tcp::tcp_connect(&socket, remote_addr, remote_port) {
-        return e.to_errno() as i64;
+        return e.sysret();
     }
 
     // Non-blocking: return EINPROGRESS
     if socket.is_nonblocking() {
-        return errno::EINPROGRESS;
+        return KernelError::InProgress.sysret();
     }
 
     // Blocking: wait for connection
@@ -210,7 +191,7 @@ pub fn sys_connect(fd: i32, addr: u64, addrlen: u64) -> i64 {
                     if err != 0 {
                         return err as i64;
                     }
-                    return errno::ENOTCONN;
+                    return KernelError::NotConnected.sysret();
                 }
                 _ => {}
             }
@@ -222,7 +203,7 @@ pub fn sys_connect(fd: i32, addr: u64, addrlen: u64) -> i64 {
 /// bind(fd, addr, addrlen) - bind to local address
 pub fn sys_bind(fd: i32, addr: u64, addrlen: u64) -> i64 {
     if addrlen < core::mem::size_of::<SockAddrIn>() as u64 {
-        return errno::EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let socket = match get_socket(fd) {
@@ -236,7 +217,7 @@ pub fn sys_bind(fd: i32, addr: u64, addrlen: u64) -> i64 {
     };
 
     if sockaddr.sin_family != AddressFamily::Inet as u16 {
-        return errno::EAFNOSUPPORT;
+        return KernelError::AddressFamilyNotSupported.sysret();
     }
 
     let mut local_addr = sockaddr.addr();
@@ -284,17 +265,17 @@ pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
     // Must be TCP socket
     let tcp = match socket.tcp.as_ref() {
         Some(t) => t,
-        None => return errno::EOPNOTSUPP,
+        None => return KernelError::OperationNotSupported.sysret(),
     };
 
     // Must be bound (have local address)
     if socket.local_addr().is_none() {
-        return errno::EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Can only listen from Closed state
     if tcp.state() != TcpState::Closed {
-        return errno::EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Initialize accept queue with backlog (like inet_csk_listen_start)
@@ -329,12 +310,12 @@ pub fn sys_accept(fd: i32, addr: u64, addrlen: u64) -> i64 {
     // Must be TCP socket
     let tcp = match socket.tcp.as_ref() {
         Some(t) => t,
-        None => return errno::EOPNOTSUPP,
+        None => return KernelError::OperationNotSupported.sysret(),
     };
 
     // Must be in Listen state
     if tcp.state() != TcpState::Listen {
-        return errno::EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get accept queue
@@ -344,7 +325,7 @@ pub fn sys_accept(fd: i32, addr: u64, addrlen: u64) -> i64 {
             let accept_queue_guard = socket.accept_queue.lock();
             let accept_queue = match accept_queue_guard.as_ref() {
                 Some(q) => q,
-                None => return errno::EINVAL,
+                None => return KernelError::InvalidArgument.sysret(),
             };
 
             if let Some(child) = accept_queue.accept_queue_remove() {
@@ -381,7 +362,7 @@ pub fn sys_accept(fd: i32, addr: u64, addrlen: u64) -> i64 {
 
         // Queue is empty
         if socket.is_nonblocking() {
-            return errno::EAGAIN;
+            return KernelError::WouldBlock.sysret();
         }
 
         // Block waiting for connection
@@ -403,11 +384,11 @@ fn create_socket_fd(socket: Arc<Socket>) -> Result<i64, i64> {
     let file = Arc::new(File::new(dentry, file_flags::O_RDWR, ops));
 
     // Allocate fd
-    let fd_table = get_task_fd(current_tid()).ok_or(errno::EBADF)?;
+    let fd_table = get_task_fd(current_tid()).ok_or(KernelError::BadFd.sysret())?;
     let fd = fd_table
         .lock()
         .alloc(file, get_nofile_limit())
-        .map_err(|_| errno::EMFILE)?;
+        .map_err(|_| KernelError::ProcessFileLimit.sysret())?;
 
     Ok(fd as i64)
 }
@@ -422,14 +403,14 @@ pub fn sys_accept4(fd: i32, addr: u64, addrlen: u64, _flags: i32) -> i64 {
 /// For AF_INET, creates two UDP sockets connected to each other.
 pub fn sys_socketpair(domain: i32, sock_type: i32, protocol: i32, sv: u64) -> i64 {
     if sv == 0 {
-        return errno::EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Only support AF_INET for now
     let family = match AddressFamily::from_i32(domain) {
         Some(AddressFamily::Inet) => AddressFamily::Inet,
-        Some(AddressFamily::Unix) => return errno::EAFNOSUPPORT, // AF_UNIX not implemented
-        _ => return errno::EAFNOSUPPORT,
+        Some(AddressFamily::Unix) => return KernelError::AddressFamilyNotSupported.sysret(), // AF_UNIX not implemented
+        _ => return KernelError::AddressFamilyNotSupported.sysret(),
     };
 
     // Extract type and flags
@@ -440,14 +421,14 @@ pub fn sys_socketpair(domain: i32, sock_type: i32, protocol: i32, sv: u64) -> i6
     // Parse socket type - only SOCK_DGRAM makes sense for socketpair with AF_INET
     let stype = match SocketType::from_i32(type_only) {
         Some(SocketType::Dgram) => SocketType::Dgram,
-        Some(SocketType::Stream) => return errno::EOPNOTSUPP, // TCP socketpair needs more work
-        _ => return errno::ESOCKTNOSUPPORT,
+        Some(SocketType::Stream) => return KernelError::OperationNotSupported.sysret(), // TCP socketpair needs more work
+        _ => return KernelError::SocketTypeNotSupported.sysret(),
     };
 
     // Validate protocol
     if protocol != 0 && protocol != 17 {
         // 17 = IPPROTO_UDP
-        return errno::EPROTONOSUPPORT;
+        return KernelError::ProtocolNotSupported.sysret();
     }
 
     // Create two sockets
@@ -491,11 +472,11 @@ pub fn sys_socketpair(domain: i32, sock_type: i32, protocol: i32, sv: u64) -> i6
     // Create dentries
     let dentry1 = match create_socket_dentry() {
         Ok(d) => d,
-        Err(_) => return errno::ENOMEM,
+        Err(_) => return KernelError::OutOfMemory.sysret(),
     };
     let dentry2 = match create_socket_dentry() {
         Ok(d) => d,
-        Err(_) => return errno::ENOMEM,
+        Err(_) => return KernelError::OutOfMemory.sysret(),
     };
 
     // Determine file flags
@@ -513,20 +494,20 @@ pub fn sys_socketpair(domain: i32, sock_type: i32, protocol: i32, sv: u64) -> i6
     // Allocate file descriptors
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
-        None => return errno::ENOMEM,
+        None => return KernelError::OutOfMemory.sysret(),
     };
 
     let nofile = get_nofile_limit();
     let fd1 = match fd_table.lock().alloc(file1, nofile) {
         Ok(fd) => fd,
-        Err(_) => return errno::ENOMEM,
+        Err(_) => return KernelError::OutOfMemory.sysret(),
     };
     let fd2 = match fd_table.lock().alloc(file2, nofile) {
         Ok(fd) => fd,
         Err(_) => {
             // Clean up fd1
             let _ = fd_table.lock().close(fd1);
-            return errno::ENOMEM;
+            return KernelError::OutOfMemory.sysret();
         }
     };
 
@@ -591,7 +572,7 @@ pub struct MMsgHdr {
 /// Read msghdr from user space
 fn read_msghdr(addr: u64) -> Result<UserMsgHdr, i64> {
     if addr == 0 {
-        return Err(errno::EFAULT);
+        return Err(KernelError::BadAddress.sysret());
     }
     let ptr = addr as *const UserMsgHdr;
     Ok(unsafe { core::ptr::read(ptr) })
@@ -605,11 +586,11 @@ fn gather_iovec(iov_ptr: u64, iovlen: usize) -> Result<alloc::vec::Vec<u8>, i64>
         return Ok(Vec::new());
     }
     if iov_ptr == 0 {
-        return Err(errno::EFAULT);
+        return Err(KernelError::BadAddress.sysret());
     }
     if iovlen > 1024 {
         // UIO_MAXIOV
-        return Err(errno::EINVAL);
+        return Err(KernelError::InvalidArgument.sysret());
     }
 
     let iovecs = unsafe { core::slice::from_raw_parts(iov_ptr as *const IoVec, iovlen) };
@@ -692,17 +673,17 @@ pub fn sys_sendmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
             // For TCP, ignore dest - use connected address
             match tcp::tcp_sendmsg(&socket, &data) {
                 Ok(n) => n as i64,
-                Err(e) => e.to_errno() as i64,
+                Err(e) => e.sysret(),
             }
         }
         SocketType::Dgram => {
             // For UDP, use dest if provided, otherwise use connected address
             match udp::udp_sendmsg(&socket, &data, dest) {
                 Ok(n) => n as i64,
-                Err(e) => e.to_errno() as i64,
+                Err(e) => e.sysret(),
             }
         }
-        _ => errno::EOPNOTSUPP,
+        _ => KernelError::OperationNotSupported.sysret(),
     }
 }
 
@@ -776,7 +757,7 @@ pub fn sys_recvmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
                 Err(e) => e as i64,
             }
         }
-        _ => errno::EOPNOTSUPP,
+        _ => KernelError::OperationNotSupported.sysret(),
     }
 }
 
@@ -787,7 +768,7 @@ pub fn sys_sendmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32) -> i64 {
     }
     if vlen > 1024 {
         // UIO_MAXIOV limit
-        return errno::EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let msgs = unsafe { core::slice::from_raw_parts_mut(msgvec as *mut MMsgHdr, vlen as usize) };
@@ -816,7 +797,7 @@ pub fn sys_recvmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32, _timeout: u64) 
         return 0;
     }
     if vlen > 1024 {
-        return errno::EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let msgs = unsafe { core::slice::from_raw_parts_mut(msgvec as *mut MMsgHdr, vlen as usize) };
@@ -858,14 +839,14 @@ pub fn sys_shutdown(fd: i32, how: i32) -> i64 {
         1 | 2 => {
             // SHUT_WR or SHUT_RDWR - close the connection
             if let Err(e) = tcp::tcp_close(&socket) {
-                return e.to_errno() as i64;
+                return e.sysret();
             }
             if how == 2 {
                 socket.set_eof();
                 socket.wake_all();
             }
         }
-        _ => return errno::EINVAL,
+        _ => return KernelError::InvalidArgument.sysret(),
     }
 
     0
@@ -896,7 +877,7 @@ pub fn sys_getpeername(fd: i32, addr: u64, addrlen: u64) -> i64 {
 
     let (remote_addr, remote_port) = match socket.remote_addr() {
         Some(a) => a,
-        None => return errno::ENOTCONN,
+        None => return KernelError::NotConnected.sysret(),
     };
 
     let sockaddr = SockAddrIn::new(remote_addr, remote_port);
@@ -957,7 +938,7 @@ pub fn sys_sendto(fd: i32, buf: u64, len: u64, _flags: i32, dest_addr: u64, addr
             // TCP: use tcp_sendmsg (ignores dest_addr)
             match tcp::tcp_sendmsg(&socket, data) {
                 Ok(n) => n as i64,
-                Err(e) => e.to_errno() as i64,
+                Err(e) => e.sysret(),
             }
         }
         SocketType::Dgram => {
@@ -973,10 +954,10 @@ pub fn sys_sendto(fd: i32, buf: u64, len: u64, _flags: i32, dest_addr: u64, addr
 
             match udp::udp_sendmsg(&socket, data, dest) {
                 Ok(n) => n as i64,
-                Err(e) => e.to_errno() as i64,
+                Err(e) => e.sysret(),
             }
         }
-        _ => errno::EOPNOTSUPP,
+        _ => KernelError::OperationNotSupported.sysret(),
     }
 }
 
@@ -1011,7 +992,7 @@ pub fn sys_recvfrom(fd: i32, buf: u64, len: u64, _flags: i32, src_addr: u64, add
                 Err(e) => e as i64,
             }
         }
-        _ => errno::EOPNOTSUPP,
+        _ => KernelError::OperationNotSupported.sysret(),
     }
 }
 
@@ -1020,18 +1001,18 @@ pub fn sys_recvfrom(fd: i32, buf: u64, len: u64, _flags: i32, src_addr: u64, add
 /// Get socket from file descriptor
 fn get_socket(fd: i32) -> Result<Arc<Socket>, i64> {
     if fd < 0 {
-        return Err(errno::EBADF);
+        return Err(KernelError::BadFd.sysret());
     }
 
-    let fd_table = get_task_fd(current_tid()).ok_or(errno::EBADF)?;
-    let file = fd_table.lock().get(fd).ok_or(errno::EBADF)?;
+    let fd_table = get_task_fd(current_tid()).ok_or(KernelError::BadFd.sysret())?;
+    let file = fd_table.lock().get(fd).ok_or(KernelError::BadFd.sysret())?;
 
     // Try to downcast FileOps to SocketFileOps
     let ops = file.ops();
     let socket_ops = ops
         .as_any()
         .downcast_ref::<SocketFileOps>()
-        .ok_or(errno::ENOTSOCK)?;
+        .ok_or(KernelError::NotSocket.sysret())?;
 
     Ok(Arc::clone(socket_ops.socket()))
 }
@@ -1039,14 +1020,17 @@ fn get_socket(fd: i32) -> Result<Arc<Socket>, i64> {
 /// Read sockaddr_in from user space
 fn read_sockaddr_in(addr: u64) -> Result<SockAddrIn, i64> {
     if addr == 0 {
-        return Err(errno::EFAULT);
+        return Err(KernelError::BadAddress.sysret());
     }
 
     // Use get_user to properly access user memory with SMAP protection
     // SockAddrIn layout: sin_family (u16), sin_port (u16), sin_addr (u32), sin_zero ([u8; 8])
-    let sin_family: u16 = get_user::<Uaccess, u16>(addr).map_err(|_| errno::EFAULT)?;
-    let sin_port: u16 = get_user::<Uaccess, u16>(addr + 2).map_err(|_| errno::EFAULT)?;
-    let sin_addr: u32 = get_user::<Uaccess, u32>(addr + 4).map_err(|_| errno::EFAULT)?;
+    let sin_family: u16 =
+        get_user::<Uaccess, u16>(addr).map_err(|_| KernelError::BadAddress.sysret())?;
+    let sin_port: u16 =
+        get_user::<Uaccess, u16>(addr + 2).map_err(|_| KernelError::BadAddress.sysret())?;
+    let sin_addr: u32 =
+        get_user::<Uaccess, u32>(addr + 4).map_err(|_| KernelError::BadAddress.sysret())?;
 
     // sin_zero is padding, we don't need to read it
     Ok(SockAddrIn {
@@ -1060,7 +1044,7 @@ fn read_sockaddr_in(addr: u64) -> Result<SockAddrIn, i64> {
 /// Write sockaddr_in to user space
 fn write_sockaddr_in(addr: u64, addrlen: u64, sockaddr: &SockAddrIn) -> i64 {
     if addr == 0 || addrlen == 0 {
-        return errno::EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     unsafe {

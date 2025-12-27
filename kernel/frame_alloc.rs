@@ -13,6 +13,9 @@ use crate::arch::IrqSpinlock;
 /// Page/frame size (4KB)
 pub const FRAME_SIZE: usize = 4096;
 
+/// Number of 4KB frames per 2MB huge page
+pub const FRAMES_PER_HUGE_PAGE: usize = 512;
+
 /// Maximum number of frames we can track (256MB worth of 4KB frames)
 const MAX_FRAMES: usize = 65536;
 
@@ -227,9 +230,246 @@ impl BitmapFrameAllocator {
             }
         }
     }
+
+    // =========================================================================
+    // Huge Page Support (2MB = 512 frames)
+    // =========================================================================
+
+    /// Allocate a contiguous 2MB huge page (512 frames)
+    ///
+    /// Returns the physical address of the first frame, or None if
+    /// no contiguous 2MB-aligned region is available.
+    ///
+    /// The allocation is 2MB-aligned to meet hardware requirements for
+    /// huge page mappings.
+    pub fn alloc_huge(&self) -> Option<u64> {
+        let mut inner = self.inner.lock();
+
+        // We need 512 consecutive free frames starting at a 512-frame boundary.
+        // 512 frames = 8 consecutive bitmap words (64 bits each).
+        // Each word must be all 1s (0xFFFF_FFFF_FFFF_FFFF = all free).
+        const WORDS_PER_HUGE_PAGE: usize = FRAMES_PER_HUGE_PAGE / 64; // 8
+
+        // Calculate how many complete huge pages could fit in our managed region
+        let max_huge_pages = inner.total_frames / FRAMES_PER_HUGE_PAGE;
+        if max_huge_pages == 0 {
+            return None;
+        }
+
+        // Search for 8 consecutive all-ones words at an 8-word boundary
+        for huge_idx in 0..max_huge_pages {
+            let word_start = huge_idx * WORDS_PER_HUGE_PAGE;
+            let frame_start = huge_idx * FRAMES_PER_HUGE_PAGE;
+
+            // Check if this huge page region is entirely within bounds
+            if frame_start + FRAMES_PER_HUGE_PAGE > inner.total_frames {
+                break;
+            }
+
+            // Check if all 8 words are all 1s (all 512 frames free)
+            let mut all_free = true;
+            for w in 0..WORDS_PER_HUGE_PAGE {
+                if inner.bitmap[word_start + w] != !0u64 {
+                    all_free = false;
+                    break;
+                }
+            }
+
+            if all_free {
+                // Mark all 512 frames as used (set all 8 words to 0)
+                for w in 0..WORDS_PER_HUGE_PAGE {
+                    inner.bitmap[word_start + w] = 0;
+                }
+
+                // Set refcount for the head frame (we track huge pages by head frame only)
+                inner.refcounts[frame_start] = 1;
+
+                // Update hint past this huge page
+                inner.next_free = frame_start + FRAMES_PER_HUGE_PAGE;
+
+                let phys_addr = inner.base + (frame_start as u64 * FRAME_SIZE as u64);
+                return Some(phys_addr);
+            }
+        }
+
+        None
+    }
+
+    /// Free a contiguous 2MB huge page
+    ///
+    /// Frees all 512 frames starting at the given 2MB-aligned address.
+    /// The address must be 2MB-aligned.
+    pub fn free_huge(&self, frame: u64) {
+        let mut inner = self.inner.lock();
+
+        if frame < inner.base {
+            return;
+        }
+
+        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+
+        // Verify alignment (must be at 512-frame boundary)
+        if !frame_idx.is_multiple_of(FRAMES_PER_HUGE_PAGE) {
+            return;
+        }
+
+        // Check bounds
+        if frame_idx + FRAMES_PER_HUGE_PAGE > inner.total_frames {
+            return;
+        }
+
+        const WORDS_PER_HUGE_PAGE: usize = FRAMES_PER_HUGE_PAGE / 64;
+        let word_start = frame_idx / 64;
+
+        // Mark all 512 frames as free (set all 8 words to all 1s)
+        for w in 0..WORDS_PER_HUGE_PAGE {
+            inner.bitmap[word_start + w] = !0u64;
+        }
+
+        // Clear refcount for head frame
+        inner.refcounts[frame_idx] = 0;
+
+        // Update hint
+        if frame_idx < inner.next_free {
+            inner.next_free = frame_idx;
+        }
+    }
+
+    /// Increment reference count for a huge page
+    ///
+    /// Used when sharing a huge page between page tables (e.g., fork with COW).
+    /// Only the head frame's refcount is tracked.
+    pub fn incref_huge(&self, frame: u64) {
+        let mut inner = self.inner.lock();
+
+        if frame < inner.base {
+            return;
+        }
+
+        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+
+        // Verify alignment
+        if !frame_idx.is_multiple_of(FRAMES_PER_HUGE_PAGE) {
+            return;
+        }
+
+        if frame_idx < inner.total_frames {
+            inner.refcounts[frame_idx] = inner.refcounts[frame_idx].saturating_add(1);
+        }
+    }
+
+    /// Decrement reference count for a huge page and free if it reaches zero
+    ///
+    /// Returns true if the huge page was freed, false if still referenced.
+    pub fn decref_huge(&self, frame: u64) -> bool {
+        let mut inner = self.inner.lock();
+
+        if frame < inner.base {
+            return false;
+        }
+
+        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+
+        // Verify alignment
+        if !frame_idx.is_multiple_of(FRAMES_PER_HUGE_PAGE) {
+            return false;
+        }
+
+        if frame_idx + FRAMES_PER_HUGE_PAGE > inner.total_frames {
+            return false;
+        }
+
+        if inner.refcounts[frame_idx] > 0 {
+            inner.refcounts[frame_idx] -= 1;
+        }
+
+        if inner.refcounts[frame_idx] == 0 {
+            // Huge page is no longer referenced, free all 512 frames
+            const WORDS_PER_HUGE_PAGE: usize = FRAMES_PER_HUGE_PAGE / 64;
+            let word_start = frame_idx / 64;
+
+            for w in 0..WORDS_PER_HUGE_PAGE {
+                inner.bitmap[word_start + w] = !0u64;
+            }
+
+            // Update hint
+            if frame_idx < inner.next_free {
+                inner.next_free = frame_idx;
+            }
+            return true;
+        }
+
+        false
+    }
+
+    /// Get the reference count for a huge page
+    ///
+    /// Returns the refcount of the head frame.
+    pub fn refcount_huge(&self, frame: u64) -> u16 {
+        let inner = self.inner.lock();
+
+        if frame < inner.base {
+            return 0;
+        }
+
+        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+
+        // Verify alignment
+        if !frame_idx.is_multiple_of(FRAMES_PER_HUGE_PAGE) {
+            return 0;
+        }
+
+        if frame_idx < inner.total_frames {
+            inner.refcounts[frame_idx]
+        } else {
+            0
+        }
+    }
+
+    /// Check if a physical address is the start of a huge page allocation
+    ///
+    /// Returns true if this address is 2MB-aligned and has a non-zero refcount
+    /// (indicating it's the head of an allocated huge page).
+    pub fn is_huge_page(&self, frame: u64) -> bool {
+        let inner = self.inner.lock();
+
+        if frame < inner.base {
+            return false;
+        }
+
+        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+
+        // Must be at 512-frame boundary
+        if !frame_idx.is_multiple_of(FRAMES_PER_HUGE_PAGE) {
+            return false;
+        }
+
+        if frame_idx < inner.total_frames {
+            // Check if head frame has non-zero refcount (allocated as huge page)
+            inner.refcounts[frame_idx] > 0
+        } else {
+            false
+        }
+    }
 }
 
 impl FrameAlloc for BitmapFrameAllocator {
+    type PhysAddr = u64;
+
+    fn alloc_frame(&mut self) -> Option<Self::PhysAddr> {
+        // Delegate to shared implementation
+        (&*self).alloc_frame()
+    }
+
+    fn free_frame(&mut self, frame: Self::PhysAddr) {
+        // Delegate to shared implementation
+        (&*self).free_frame(frame);
+    }
+}
+
+/// Implementation for references - allows use with static allocator
+/// This works because BitmapFrameAllocator uses interior mutability (Mutex)
+impl FrameAlloc for &BitmapFrameAllocator {
     type PhysAddr = u64;
 
     fn alloc_frame(&mut self) -> Option<Self::PhysAddr> {

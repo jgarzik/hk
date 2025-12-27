@@ -8,6 +8,7 @@
 extern crate alloc;
 
 // Core modules (formerly in core/ subdir)
+pub mod acct;
 pub mod bus;
 pub mod chardev;
 pub mod console;
@@ -15,6 +16,7 @@ pub mod dma;
 pub mod elf;
 pub mod epoll;
 pub mod eventfd;
+pub mod fanotify;
 pub mod futex;
 pub mod inotify;
 pub mod io_uring;
@@ -45,7 +47,10 @@ pub mod usb;
 // Multiboot2 header is in boot.S
 
 mod arch;
+pub mod bpf;
+pub mod cgroup;
 mod cmdline;
+pub mod error;
 mod frame_alloc;
 pub mod fs;
 mod heap;
@@ -59,6 +64,7 @@ pub mod ns;
 mod power;
 mod random;
 mod rlimit;
+pub mod seccomp;
 pub mod signal;
 pub mod task;
 mod time_syscall;

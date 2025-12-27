@@ -117,6 +117,10 @@ pub enum MapError {
     AlreadyMapped,
     /// Invalid address or flags
     InvalidArgument,
+    /// Address is not properly aligned (e.g., for huge pages)
+    InvalidAddress,
+    /// Address is not mapped (for unmap/split operations)
+    NotMapped,
 }
 
 /// Page table abstraction trait

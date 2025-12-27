@@ -5,6 +5,7 @@
 use alloc::vec;
 
 use crate::arch::Uaccess;
+use crate::error::KernelError;
 use crate::task::percpu;
 use crate::uaccess::{copy_from_user, copy_to_user, strncpy_from_user};
 
@@ -12,7 +13,6 @@ use super::key::{
     KEY_NEED_READ, KEY_NEED_SETATTR, KEY_NEED_VIEW, KEY_NEED_WRITE, check_key_permission,
 };
 use super::keyring::{keyring_link, keyring_unlink, resolve_special_keyring};
-use super::{EACCES, EFAULT, EKEYREVOKED, ENOKEY, ENOTDIR, EPERM};
 use super::{lookup_key, remove_key};
 
 /// Maximum buffer sizes
@@ -65,25 +65,25 @@ pub fn keyctl_update(key_serial: i32, payload_ptr: u64, plen: usize) -> i64 {
         Ok(k) => k,
         Err(_) => match lookup_key(key_serial) {
             Some(k) => k,
-            None => return ENOKEY,
+            None => return KernelError::NoKey.sysret(),
         },
     };
 
     // Check permission
     if !check_key_permission(&key, KEY_NEED_WRITE, uid, gid, is_root) {
-        return EACCES;
+        return KernelError::PermissionDenied.sysret();
     }
 
     // Check if revoked
     if key.is_revoked() {
-        return EKEYREVOKED;
+        return KernelError::KeyRevoked.sysret();
     }
 
     // Copy payload from userspace
     let payload = if plen > 0 && payload_ptr != 0 {
         let mut buf = vec![0u8; plen];
         if copy_from_user::<Uaccess>(&mut buf, payload_ptr, plen).is_err() {
-            return EFAULT;
+            return KernelError::BadAddress.sysret();
         }
         buf
     } else {
@@ -110,12 +110,12 @@ pub fn keyctl_revoke(key_serial: i32) -> i64 {
 
     let key = match lookup_key(key_serial) {
         Some(k) => k,
-        None => return ENOKEY,
+        None => return KernelError::NoKey.sysret(),
     };
 
     // Check permission (need SETATTR to revoke)
     if !check_key_permission(&key, KEY_NEED_SETATTR, uid, gid, is_root) {
-        return EACCES;
+        return KernelError::PermissionDenied.sysret();
     }
 
     key.revoke();
@@ -137,12 +137,12 @@ pub fn keyctl_chown(key_serial: i32, _new_uid: i32, _new_gid: i32) -> i64 {
 
     let _key = match lookup_key(key_serial) {
         Some(k) => k,
-        None => return ENOKEY,
+        None => return KernelError::NoKey.sysret(),
     };
 
     // Only root can change ownership
     if !is_root {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Note: In a full implementation, we would modify the key's uid/gid here.
@@ -165,12 +165,12 @@ pub fn keyctl_setperm(key_serial: i32, perm: u32) -> i64 {
 
     let key = match lookup_key(key_serial) {
         Some(k) => k,
-        None => return ENOKEY,
+        None => return KernelError::NoKey.sysret(),
     };
 
     // Check permission
     if !check_key_permission(&key, KEY_NEED_SETATTR, uid, gid, is_root) {
-        return EACCES;
+        return KernelError::PermissionDenied.sysret();
     }
 
     key.set_perm(perm);
@@ -194,13 +194,13 @@ pub fn keyctl_describe(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
         Ok(k) => k,
         Err(_) => match lookup_key(key_serial) {
             Some(k) => k,
-            None => return ENOKEY,
+            None => return KernelError::NoKey.sysret(),
         },
     };
 
     // Check permission
     if !check_key_permission(&key, KEY_NEED_VIEW, uid, gid, is_root) {
-        return EACCES;
+        return KernelError::PermissionDenied.sysret();
     }
 
     // Get description string
@@ -216,12 +216,12 @@ pub fn keyctl_describe(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
     // Copy description to buffer
     let copy_len = core::cmp::min(desc_bytes.len(), buflen.saturating_sub(1));
     if copy_len > 0 && copy_to_user::<Uaccess>(buffer_ptr, &desc_bytes[..copy_len]).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     // Write NUL terminator if there's space
     if copy_len < buflen && copy_to_user::<Uaccess>(buffer_ptr + copy_len as u64, &[0u8]).is_err() {
-        return EFAULT;
+        return KernelError::BadAddress.sysret();
     }
 
     total_len as i64
@@ -242,17 +242,17 @@ pub fn keyctl_clear(keyring_serial: i32) -> i64 {
         Ok(k) => k,
         Err(_) => match lookup_key(keyring_serial) {
             Some(k) => k,
-            None => return ENOKEY,
+            None => return KernelError::NoKey.sysret(),
         },
     };
 
     if !keyring.is_keyring() {
-        return ENOTDIR;
+        return KernelError::NotDirectory.sysret();
     }
 
     // Check permission
     if !check_key_permission(&keyring, KEY_NEED_WRITE, uid, gid, is_root) {
-        return EACCES;
+        return KernelError::PermissionDenied.sysret();
     }
 
     match keyring.keyring_clear() {
@@ -276,7 +276,7 @@ pub fn keyctl_link(key_serial: i32, keyring_serial: i32) -> i64 {
     // Look up the key
     let key = match lookup_key(key_serial) {
         Some(k) => k,
-        None => return ENOKEY,
+        None => return KernelError::NoKey.sysret(),
     };
 
     // Look up the keyring
@@ -284,17 +284,17 @@ pub fn keyctl_link(key_serial: i32, keyring_serial: i32) -> i64 {
         Ok(k) => k,
         Err(_) => match lookup_key(keyring_serial) {
             Some(k) => k,
-            None => return ENOKEY,
+            None => return KernelError::NoKey.sysret(),
         },
     };
 
     if !keyring.is_keyring() {
-        return ENOTDIR;
+        return KernelError::NotDirectory.sysret();
     }
 
     // Check WRITE permission on keyring
     if !check_key_permission(&keyring, KEY_NEED_WRITE, uid, gid, is_root) {
-        return EACCES;
+        return KernelError::PermissionDenied.sysret();
     }
 
     match keyring_link(&keyring, &key) {
@@ -318,7 +318,7 @@ pub fn keyctl_unlink(key_serial: i32, keyring_serial: i32) -> i64 {
     // Look up the key
     let key = match lookup_key(key_serial) {
         Some(k) => k,
-        None => return ENOKEY,
+        None => return KernelError::NoKey.sysret(),
     };
 
     // Look up the keyring
@@ -326,17 +326,17 @@ pub fn keyctl_unlink(key_serial: i32, keyring_serial: i32) -> i64 {
         Ok(k) => k,
         Err(_) => match lookup_key(keyring_serial) {
             Some(k) => k,
-            None => return ENOKEY,
+            None => return KernelError::NoKey.sysret(),
         },
     };
 
     if !keyring.is_keyring() {
-        return ENOTDIR;
+        return KernelError::NotDirectory.sysret();
     }
 
     // Check WRITE permission on keyring
     if !check_key_permission(&keyring, KEY_NEED_WRITE, uid, gid, is_root) {
-        return EACCES;
+        return KernelError::PermissionDenied.sysret();
     }
 
     match keyring_unlink(&keyring, &key) {
@@ -362,12 +362,12 @@ pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_key
     // Copy type and description from userspace
     let type_name = match strncpy_from_user::<Uaccess>(type_ptr, MAX_TYPE_LEN) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     let description = match strncpy_from_user::<Uaccess>(desc_ptr, MAX_DESC_LEN) {
         Ok(s) => s,
-        Err(_) => return EFAULT,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Look up the keyring to search
@@ -375,12 +375,12 @@ pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_key
         Ok(k) => k,
         Err(_) => match lookup_key(keyring_serial) {
             Some(k) => k,
-            None => return ENOKEY,
+            None => return KernelError::NoKey.sysret(),
         },
     };
 
     if !keyring.is_keyring() {
-        return ENOTDIR;
+        return KernelError::NotDirectory.sysret();
     }
 
     // Search the keyring recursively
@@ -389,7 +389,7 @@ pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_key
     {
         // Check if key is valid
         if key.is_revoked() {
-            return EKEYREVOKED;
+            return KernelError::KeyRevoked.sysret();
         }
 
         // Link to destination keyring if specified
@@ -402,7 +402,7 @@ pub fn keyctl_search(keyring_serial: i32, type_ptr: u64, desc_ptr: u64, dest_key
         return serial as i64;
     }
 
-    ENOKEY
+    KernelError::NoKey.sysret()
 }
 
 /// KEYCTL_READ - Read a key's payload
@@ -422,18 +422,18 @@ pub fn keyctl_read(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
         Ok(k) => k,
         Err(_) => match lookup_key(key_serial) {
             Some(k) => k,
-            None => return ENOKEY,
+            None => return KernelError::NoKey.sysret(),
         },
     };
 
     // Check permission
     if !check_key_permission(&key, KEY_NEED_READ, uid, gid, is_root) {
-        return EACCES;
+        return KernelError::PermissionDenied.sysret();
     }
 
     // Check if revoked
     if key.is_revoked() {
-        return EKEYREVOKED;
+        return KernelError::KeyRevoked.sysret();
     }
 
     // Query mode: just return size needed
@@ -450,7 +450,7 @@ pub fn keyctl_read(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
         Ok(actual_len) => {
             let copy_len = core::cmp::min(actual_len, buflen);
             if copy_len > 0 && copy_to_user::<Uaccess>(buffer_ptr, &buffer[..copy_len]).is_err() {
-                return EFAULT;
+                return KernelError::BadAddress.sysret();
             }
             actual_len as i64
         }
@@ -471,13 +471,13 @@ pub fn keyctl_invalidate(key_serial: i32) -> i64 {
 
     let key = match lookup_key(key_serial) {
         Some(k) => k,
-        None => return ENOKEY,
+        None => return KernelError::NoKey.sysret(),
     };
 
     // Check permission (need SEARCH to invalidate)
     // Note: Linux uses different permission checks; we simplify here
     if !check_key_permission(&key, KEY_NEED_SETATTR, uid, gid, is_root) {
-        return EACCES;
+        return KernelError::PermissionDenied.sysret();
     }
 
     key.invalidate();

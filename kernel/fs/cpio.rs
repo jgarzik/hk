@@ -24,7 +24,7 @@ pub enum CpioError {
     /// Invalid header field
     InvalidHeader,
     /// Filesystem error during unpacking
-    FsError,
+    KernelError,
 }
 
 /// Unpack a CPIO archive into a ramfs directory.
@@ -103,7 +103,7 @@ pub fn unpack_cpio(data: &[u8], root: &Arc<Dentry>) -> Result<usize, CpioError> 
             if is_dir {
                 // Create directory path with ownership and timestamp from CPIO
                 ramfs_mkpath_with_timestamp(root, name, uid, gid, mtime)
-                    .map_err(|_| CpioError::FsError)?;
+                    .map_err(|_| CpioError::KernelError)?;
             } else if is_symlink && filesize > 0 {
                 // Symlink: data contains the target path
                 let target = core::str::from_utf8(&data[data_start..data_end])
@@ -120,12 +120,12 @@ pub fn unpack_cpio(data: &[u8], root: &Arc<Dentry>) -> Result<usize, CpioError> 
                     root.clone()
                 } else {
                     ramfs_mkpath_with_timestamp(root, parent_path, uid, gid, mtime)
-                        .map_err(|_| CpioError::FsError)?
+                        .map_err(|_| CpioError::KernelError)?
                 };
 
                 // Create symlink
                 ramfs_create_symlink_with_timestamp(&parent, filename, target, uid, gid, mtime)
-                    .map_err(|_| CpioError::FsError)?;
+                    .map_err(|_| CpioError::KernelError)?;
 
                 file_count += 1;
             } else if filesize > 0 {
@@ -143,7 +143,7 @@ pub fn unpack_cpio(data: &[u8], root: &Arc<Dentry>) -> Result<usize, CpioError> 
                     root.clone()
                 } else {
                     ramfs_mkpath_with_timestamp(root, parent_path, uid, gid, mtime)
-                        .map_err(|_| CpioError::FsError)?
+                        .map_err(|_| CpioError::KernelError)?
                 };
 
                 // Create the file with mode, ownership, and timestamp from CPIO
@@ -151,7 +151,7 @@ pub fn unpack_cpio(data: &[u8], root: &Arc<Dentry>) -> Result<usize, CpioError> 
                 ramfs_create_file_with_timestamp(
                     &parent, filename, file_data, inode_mode, uid, gid, mtime,
                 )
-                .map_err(|_| CpioError::FsError)?;
+                .map_err(|_| CpioError::KernelError)?;
 
                 file_count += 1;
             }

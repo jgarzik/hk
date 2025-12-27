@@ -9,7 +9,7 @@ use ::core::cell::Cell;
 use ::core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use spin::{Mutex, RwLock};
 
-use super::FsError;
+use super::KernelError;
 use super::superblock::SuperBlock;
 
 // Re-export device types from chardev module
@@ -186,48 +186,48 @@ impl InodeMode {
 /// Inode operations trait - filesystem-specific behavior
 pub trait InodeOps: Send + Sync {
     /// Look up a child entry in a directory inode
-    fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, FsError>;
+    fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError>;
 
     /// Create a new file in a directory
-    fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, FsError> {
+    fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, mode);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Create a new directory
-    fn mkdir(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, FsError> {
+    fn mkdir(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, mode);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Remove a file
-    fn unlink(&self, dir: &Inode, name: &str) -> Result<(), FsError> {
+    fn unlink(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
         let _ = (dir, name);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Remove a directory
-    fn rmdir(&self, dir: &Inode, name: &str) -> Result<(), FsError> {
+    fn rmdir(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
         let _ = (dir, name);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Read the target of a symbolic link
-    fn readlink(&self, inode: &Inode) -> Result<alloc::string::String, FsError> {
+    fn readlink(&self, inode: &Inode) -> Result<alloc::string::String, KernelError> {
         let _ = inode;
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Create a symbolic link
-    fn symlink(&self, dir: &Inode, name: &str, target: &str) -> Result<Arc<Inode>, FsError> {
+    fn symlink(&self, dir: &Inode, name: &str, target: &str) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, target);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Create a hard link (new directory entry pointing to existing inode)
-    fn link(&self, dir: &Inode, name: &str, inode: &Arc<Inode>) -> Result<(), FsError> {
+    fn link(&self, dir: &Inode, name: &str, inode: &Arc<Inode>) -> Result<(), KernelError> {
         let _ = (dir, name, inode);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Rename a file or directory
@@ -248,31 +248,36 @@ pub trait InodeOps: Send + Sync {
         new_dir: &Arc<Inode>,
         new_name: &str,
         flags: u32,
-    ) -> Result<(), FsError> {
+    ) -> Result<(), KernelError> {
         let _ = (old_dir, old_name, new_dir, new_name, flags);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Truncate or extend a file to a specified length
     ///
     /// If the file was larger than length, the extra data is discarded.
     /// If the file was shorter, it is extended with null bytes.
-    fn truncate(&self, inode: &Inode, length: u64) -> Result<(), FsError> {
+    fn truncate(&self, inode: &Inode, length: u64) -> Result<(), KernelError> {
         let _ = (inode, length);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Read a page of data from a file
     /// Returns the number of bytes read (may be less than PAGE_SIZE at EOF)
-    fn readpage(&self, inode: &Inode, page_offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn readpage(
+        &self,
+        inode: &Inode,
+        page_offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, KernelError> {
         let _ = (inode, page_offset, buf);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Write a page of data to a file
-    fn writepage(&self, inode: &Inode, page_offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+    fn writepage(&self, inode: &Inode, page_offset: u64, buf: &[u8]) -> Result<usize, KernelError> {
         let _ = (inode, page_offset, buf);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Get file size (may be dynamically computed for procfs)
@@ -310,9 +315,9 @@ pub trait InodeOps: Send + Sync {
     /// # Returns
     /// The size of the attribute value on success.
     /// If `value` is empty, returns the size that would be needed.
-    fn getxattr(&self, inode: &Inode, name: &str, value: &mut [u8]) -> Result<usize, FsError> {
+    fn getxattr(&self, inode: &Inode, name: &str, value: &mut [u8]) -> Result<usize, KernelError> {
         let _ = (inode, name, value);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Set an extended attribute value
@@ -322,9 +327,15 @@ pub trait InodeOps: Send + Sync {
     /// * `name` - The attribute name (e.g., "user.foo")
     /// * `value` - The attribute value
     /// * `flags` - XATTR_CREATE (fail if exists) or XATTR_REPLACE (fail if not exists)
-    fn setxattr(&self, inode: &Inode, name: &str, value: &[u8], flags: u32) -> Result<(), FsError> {
+    fn setxattr(
+        &self,
+        inode: &Inode,
+        name: &str,
+        value: &[u8],
+        flags: u32,
+    ) -> Result<(), KernelError> {
         let _ = (inode, name, value, flags);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// List extended attribute names
@@ -336,9 +347,9 @@ pub trait InodeOps: Send + Sync {
     /// # Returns
     /// The total size of all attribute names (including null terminators).
     /// If `list` is empty, returns the size that would be needed.
-    fn listxattr(&self, inode: &Inode, list: &mut [u8]) -> Result<usize, FsError> {
+    fn listxattr(&self, inode: &Inode, list: &mut [u8]) -> Result<usize, KernelError> {
         let _ = (inode, list);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 
     /// Remove an extended attribute
@@ -346,9 +357,9 @@ pub trait InodeOps: Send + Sync {
     /// # Arguments
     /// * `inode` - The inode to remove the attribute from
     /// * `name` - The attribute name to remove
-    fn removexattr(&self, inode: &Inode, name: &str) -> Result<(), FsError> {
+    fn removexattr(&self, inode: &Inode, name: &str) -> Result<(), KernelError> {
         let _ = (inode, name);
-        Err(FsError::NotSupported)
+        Err(KernelError::OperationNotSupported)
     }
 }
 
@@ -682,8 +693,8 @@ unsafe impl Sync for Inode {}
 pub struct NullInodeOps;
 
 impl InodeOps for NullInodeOps {
-    fn lookup(&self, _dir: &Inode, _name: &str) -> Result<Arc<Inode>, FsError> {
-        Err(FsError::NotSupported)
+    fn lookup(&self, _dir: &Inode, _name: &str) -> Result<Arc<Inode>, KernelError> {
+        Err(KernelError::OperationNotSupported)
     }
 }
 

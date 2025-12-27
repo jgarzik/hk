@@ -26,7 +26,7 @@
 
 use alloc::sync::Arc;
 
-use crate::fs::FsError;
+use crate::fs::KernelError;
 use crate::fs::file::File;
 use crate::mm::page_cache::{CachedPage, PAGE_SIZE};
 use crate::net::socket_file::SocketFileOps;
@@ -55,19 +55,6 @@ pub const SPLICE_F_MORE: u32 = 0x04;
 /// Pages passed in are a gift (for vmsplice)
 #[allow(dead_code)]
 pub const SPLICE_F_GIFT: u32 = 0x08;
-
-// =============================================================================
-// Error codes
-// =============================================================================
-
-/// EBADF - Bad file descriptor
-const EBADF: i64 = -9;
-/// EINVAL - Invalid argument
-const EINVAL: i64 = -22;
-/// ESPIPE - Illegal seek
-const ESPIPE: i64 = -29;
-/// EAGAIN - Resource temporarily unavailable
-const EAGAIN: i64 = -11;
 
 // =============================================================================
 // Splice helper types
@@ -104,11 +91,11 @@ pub fn splice_to_pipe(
     page: Arc<CachedPage>,
     offset: u32,
     len: u32,
-) -> Result<usize, FsError> {
+) -> Result<usize, KernelError> {
     let mut inner = pipe.inner.lock();
 
     if inner.is_full() {
-        return Err(FsError::WouldBlock);
+        return Err(KernelError::WouldBlock);
     }
 
     // Create a pipe buffer for the page
@@ -122,7 +109,7 @@ pub fn splice_to_pipe(
             pipe.wait_queue.wake_all();
             Ok(len as usize)
         }
-        Err(_) => Err(FsError::WouldBlock),
+        Err(_) => Err(KernelError::WouldBlock),
     }
 }
 
@@ -181,14 +168,14 @@ pub fn splice_from_pipe(pipe: &Pipe) -> Option<(Arc<CachedPage>, u32, u32)> {
 ///
 /// # Returns
 /// Number of bytes tee'd
-pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usize, FsError> {
+pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usize, KernelError> {
     // Lock both pipes in consistent order to prevent deadlock
     // Use pointer addresses to determine order
     let src_addr = src as *const Pipe as usize;
     let dst_addr = dst as *const Pipe as usize;
 
     if src_addr == dst_addr {
-        return Err(FsError::InvalidArgument);
+        return Err(KernelError::InvalidArgument);
     }
 
     // Lock in address order
@@ -207,7 +194,7 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
     }
 
     if dst_guard.is_full() {
-        return Err(FsError::WouldBlock);
+        return Err(KernelError::WouldBlock);
     }
 
     let mut copied = 0;
@@ -356,28 +343,28 @@ pub fn sys_splice(
 
     // At least one must be a pipe
     if !in_is_pipe && !out_is_pipe {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Get the files
     let in_file = match get_file_from_fd(fd_in) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
     let out_file = match get_file_from_fd(fd_out) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Pipe-to-pipe splice
     if in_is_pipe && out_is_pipe {
         let in_pipe = match get_pipe_from_fd(fd_in) {
             Some(p) => p,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         };
         let out_pipe = match get_pipe_from_fd(fd_out) {
             Some(p) => p,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         };
 
         // Move data from in_pipe to out_pipe
@@ -388,12 +375,12 @@ pub fn sys_splice(
     if out_is_pipe {
         let out_pipe = match get_pipe_from_fd(fd_out) {
             Some(p) => p,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         };
 
         // Pipes don't support offsets
         if off_out != 0 {
-            return ESPIPE;
+            return KernelError::IllegalSeek.sysret();
         }
 
         return do_splice_file_to_pipe(&in_file, off_in, &out_pipe, len, flags);
@@ -403,18 +390,18 @@ pub fn sys_splice(
     if in_is_pipe {
         let in_pipe = match get_pipe_from_fd(fd_in) {
             Some(p) => p,
-            None => return EBADF,
+            None => return KernelError::BadFd.sysret(),
         };
 
         // Pipes don't support offsets
         if off_in != 0 {
-            return ESPIPE;
+            return KernelError::IllegalSeek.sysret();
         }
 
         return do_splice_pipe_to_file(&in_pipe, &out_file, off_out, len, flags);
     }
 
-    EINVAL
+    KernelError::InvalidArgument.sysret()
 }
 
 /// Splice from pipe to pipe (move buffers)
@@ -423,7 +410,7 @@ fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64
     let dst_addr = dst as *const Pipe as usize;
 
     if src_addr == dst_addr {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
@@ -439,14 +426,14 @@ fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64
 
     if src_guard.is_empty() {
         if nonblock {
-            return EAGAIN;
+            return KernelError::WouldBlock.sysret();
         }
         return 0; // No data to move
     }
 
     if dst_guard.is_full() {
         if nonblock {
-            return EAGAIN;
+            return KernelError::WouldBlock.sysret();
         }
         return 0; // No space
     }
@@ -517,7 +504,11 @@ fn do_splice_file_to_pipe(
     {
         let inner = pipe.inner.lock();
         if inner.is_full() {
-            return if nonblock { EAGAIN } else { 0 };
+            return if nonblock {
+                KernelError::WouldBlock.sysret()
+            } else {
+                0
+            };
         }
     }
 
@@ -532,15 +523,27 @@ fn do_splice_file_to_pipe(
         // Use pread at specified offset
         match file.pread(&mut buf[..to_read], off_in) {
             Ok(n) => n,
-            Err(FsError::WouldBlock) => return if nonblock { EAGAIN } else { 0 },
-            Err(_) => return -5, // EIO
+            Err(KernelError::WouldBlock) => {
+                return if nonblock {
+                    KernelError::WouldBlock.sysret()
+                } else {
+                    0
+                };
+            }
+            Err(_) => return KernelError::Io.sysret(),
         }
     } else {
         // Use regular read (advances file position)
         match file.read(&mut buf[..to_read]) {
             Ok(n) => n,
-            Err(FsError::WouldBlock) => return if nonblock { EAGAIN } else { 0 },
-            Err(_) => return -5, // EIO
+            Err(KernelError::WouldBlock) => {
+                return if nonblock {
+                    KernelError::WouldBlock.sysret()
+                } else {
+                    0
+                };
+            }
+            Err(_) => return KernelError::Io.sysret(),
         }
     };
 
@@ -551,7 +554,7 @@ fn do_splice_file_to_pipe(
     // Allocate a pipe page and copy data
     let page = match allocate_pipe_page() {
         Some(p) => p,
-        None => return -12, // ENOMEM
+        None => return KernelError::OutOfMemory.sysret(),
     };
 
     // Copy data to page
@@ -569,7 +572,11 @@ fn do_splice_file_to_pipe(
 
     let mut inner = pipe.inner.lock();
     if inner.push_buffer(pipe_buf).is_err() {
-        return if nonblock { EAGAIN } else { 0 };
+        return if nonblock {
+            KernelError::WouldBlock.sysret()
+        } else {
+            0
+        };
     }
     drop(inner);
 
@@ -595,7 +602,11 @@ fn do_splice_pipe_to_file(
             if !pipe.has_writers() {
                 return 0; // EOF
             }
-            return if nonblock { EAGAIN } else { 0 };
+            return if nonblock {
+                KernelError::WouldBlock.sysret()
+            } else {
+                0
+            };
         }
     }
 
@@ -648,7 +659,7 @@ fn do_splice_pipe_to_file(
     }
 
     if written == 0 && nonblock {
-        return EAGAIN;
+        return KernelError::WouldBlock.sysret();
     }
 
     written as i64
@@ -666,7 +677,7 @@ fn do_splice_pipe_to_socket(
 
     // Check if socket is ready for writing
     if socket.tcp.is_none() {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let mut sent = 0;
@@ -695,7 +706,7 @@ fn do_splice_pipe_to_socket(
                     break; // Partial send
                 }
             }
-            Err(crate::net::NetError::WouldBlock) => {
+            Err(KernelError::WouldBlock) => {
                 if nonblock {
                     break;
                 }
@@ -707,7 +718,7 @@ fn do_splice_pipe_to_socket(
     }
 
     if sent == 0 && nonblock {
-        return EAGAIN;
+        return KernelError::WouldBlock.sysret();
     }
 
     sent as i64
@@ -743,30 +754,30 @@ pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
     // Both must be pipes
     let in_pipe = match get_pipe_from_fd(fd_in) {
         Some(p) => p,
-        None => return EINVAL,
+        None => return KernelError::InvalidArgument.sysret(),
     };
     let out_pipe = match get_pipe_from_fd(fd_out) {
         Some(p) => p,
-        None => return EINVAL,
+        None => return KernelError::InvalidArgument.sysret(),
     };
 
     // Cannot tee to same pipe
     let in_addr = Arc::as_ptr(&in_pipe) as usize;
     let out_addr = Arc::as_ptr(&out_pipe) as usize;
     if in_addr == out_addr {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     match link_pipe(&in_pipe, &out_pipe, len, flags) {
         Ok(n) => n as i64,
-        Err(FsError::WouldBlock) => {
+        Err(KernelError::WouldBlock) => {
             if flags & SPLICE_F_NONBLOCK != 0 {
-                EAGAIN
+                KernelError::WouldBlock.sysret()
             } else {
                 0
             }
         }
-        Err(_) => EINVAL,
+        Err(_) => KernelError::InvalidArgument.sysret(),
     }
 }
 
@@ -788,7 +799,7 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
     // fd must be a pipe
     let pipe = match get_pipe_from_fd(fd) {
         Some(p) => p,
-        None => return EINVAL,
+        None => return KernelError::InvalidArgument.sysret(),
     };
 
     let nonblock = flags & SPLICE_F_NONBLOCK != 0;
@@ -818,7 +829,7 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
         // Allocate a pipe page
         let page = match allocate_pipe_page() {
             Some(p) => p,
-            None => return -12, // ENOMEM
+            None => return KernelError::OutOfMemory.sysret(),
         };
 
         // Copy user data to page (limited to PAGE_SIZE)
@@ -843,7 +854,11 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
         if inner.is_full() {
             drop(inner);
             if nonblock {
-                return if total > 0 { total as i64 } else { EAGAIN };
+                return if total > 0 {
+                    total as i64
+                } else {
+                    KernelError::WouldBlock.sysret()
+                };
             }
             break;
         }
@@ -880,18 +895,18 @@ pub fn sys_sendfile64(out_fd: i32, in_fd: i32, offset: u64, count: usize) -> i64
     // Get input file
     let in_file = match get_file_from_fd(in_fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Get output file
     let out_file = match get_file_from_fd(out_fd) {
         Some(f) => f,
-        None => return EBADF,
+        None => return KernelError::BadFd.sysret(),
     };
 
     // Input cannot be a pipe (sendfile is for regular files)
     if is_pipe_fd(in_fd) {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Check if output is a socket for optimized path
@@ -918,7 +933,7 @@ fn do_sendfile_to_socket(
     let socket = socket_ops.socket();
 
     if socket.tcp.is_none() {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let mut buf = [0u8; PAGE_SIZE];
@@ -953,7 +968,7 @@ fn do_sendfile_to_socket(
                     break; // Partial send
                 }
             }
-            Err(crate::net::NetError::WouldBlock) => break,
+            Err(KernelError::WouldBlock) => break,
             Err(_) => break,
         }
     }

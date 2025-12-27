@@ -17,22 +17,13 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use spin::{Mutex, RwLock};
 
 use crate::arch::Uaccess;
+use crate::error::KernelError;
 use crate::fs::{Inode, lookup_path};
 use crate::mm::page_cache::PAGE_SIZE;
 use crate::mm::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::storage::BlockDevice;
 use crate::task::{CAP_SYS_ADMIN, capable};
 use crate::uaccess::strncpy_from_user;
-
-// ============================================================================
-// Error codes
-// ============================================================================
-
-const EPERM: i64 = -1;
-const ENOENT: i64 = -2;
-const EIO: i64 = -5;
-const EBUSY: i64 = -16;
-const EINVAL: i64 = -22;
 
 // ============================================================================
 // Swap flags (for swapon syscall)
@@ -431,7 +422,7 @@ pub fn free_swap_entry(entry: SwapEntry) {
 /// # Returns
 /// Ok(()) on success, Err(errno) on failure
 pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
-    let si = get_swap_info(entry.swap_type()).ok_or(EINVAL)?;
+    let si = get_swap_info(entry.swap_type()).ok_or(KernelError::InvalidArgument.sysret())?;
     let offset = entry.offset();
 
     // Calculate page offset in swap device (page number, not byte offset)
@@ -443,7 +434,7 @@ pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
         let bytes_read = inode
             .i_op
             .readpage(inode, page_offset, &mut buf)
-            .map_err(|_| EIO)?;
+            .map_err(|_| KernelError::Io.sysret())?;
         if bytes_read < PAGE_SIZE {
             // Zero-fill the rest if EOF encountered
             buf[bytes_read..].fill(0);
@@ -457,9 +448,9 @@ pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
     } else if let Some(ref _bdev) = si.bdev {
         // Swap partition: direct block device I/O
         // TODO: implement direct block device read
-        Err(EIO)
+        Err(KernelError::Io.sysret())
     } else {
-        Err(EINVAL)
+        Err(KernelError::InvalidArgument.sysret())
     }
 }
 
@@ -472,7 +463,7 @@ pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
 /// # Returns
 /// Ok(()) on success, Err(errno) on failure
 pub fn swap_write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
-    let si = get_swap_info(entry.swap_type()).ok_or(EINVAL)?;
+    let si = get_swap_info(entry.swap_type()).ok_or(KernelError::InvalidArgument.sysret())?;
     let offset = entry.offset();
 
     // Calculate page offset in swap device (page number, not byte offset)
@@ -489,17 +480,17 @@ pub fn swap_write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
         let bytes_written = inode
             .i_op
             .writepage(inode, page_offset, &buf)
-            .map_err(|_| EIO)?;
+            .map_err(|_| KernelError::Io.sysret())?;
         if bytes_written != PAGE_SIZE {
-            return Err(EIO);
+            return Err(KernelError::Io.sysret());
         }
         Ok(())
     } else if let Some(ref _bdev) = si.bdev {
         // Swap partition: direct block device I/O
         // TODO: implement direct block device write
-        Err(EIO)
+        Err(KernelError::Io.sysret())
     } else {
-        Err(EINVAL)
+        Err(KernelError::InvalidArgument.sysret())
     }
 }
 
@@ -518,43 +509,43 @@ pub fn swap_write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
 pub fn sys_swapon(path_ptr: u64, swap_flags: i32) -> i64 {
     // Check permissions - requires CAP_SYS_ADMIN
     if !capable(CAP_SYS_ADMIN) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Read path from user space
     let path_str = match strncpy_from_user::<Uaccess>(path_ptr, 4096) {
         Ok(p) => p,
-        Err(_) => return -14, // EFAULT
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
     let path = path_str.into_bytes();
 
     // Check if already activated
     if find_swap_by_path(&path).is_some() {
-        return EBUSY;
+        return KernelError::Busy.sysret();
     }
 
     // Find a free swap type slot
     let swap_type = match find_free_swap_type() {
         Some(t) => t,
-        None => return EBUSY, // Too many swap devices
+        None => return KernelError::Busy.sysret(), // Too many swap devices
     };
 
     // Convert path to str for lookup
     let path_str = match core::str::from_utf8(&path) {
         Ok(s) => s,
-        Err(_) => return EINVAL,
+        Err(_) => return KernelError::InvalidArgument.sysret(),
     };
 
     // Lookup the file/device
     let dentry = match lookup_path(path_str) {
         Ok(d) => d,
-        Err(_) => return ENOENT,
+        Err(_) => return KernelError::NotFound.sysret(),
     };
 
     // Get inode from dentry
     let inode = match dentry.get_inode() {
         Some(i) => i,
-        None => return ENOENT,
+        None => return KernelError::NotFound.sysret(),
     };
 
     // Read and validate swap header (page 0)
@@ -565,12 +556,12 @@ pub fn sys_swapon(path_ptr: u64, swap_flags: i32) -> i64 {
         .unwrap_or(0)
         < PAGE_SIZE
     {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Check magic
     if &header_page[SWAP_MAGIC_OFFSET..SWAP_MAGIC_OFFSET + 10] != SWAP_MAGIC {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Parse header info
@@ -578,12 +569,12 @@ pub fn sys_swapon(path_ptr: u64, swap_flags: i32) -> i64 {
     let header_info = unsafe { *info_ptr };
 
     if header_info.version != 1 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     let max_slots = header_info.last_page as u64;
     if max_slots == 0 {
-        return EINVAL;
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Calculate priority
@@ -621,26 +612,26 @@ pub fn sys_swapon(path_ptr: u64, swap_flags: i32) -> i64 {
 pub fn sys_swapoff(path_ptr: u64) -> i64 {
     // Check permissions - requires CAP_SYS_ADMIN
     if !capable(CAP_SYS_ADMIN) {
-        return EPERM;
+        return KernelError::NotPermitted.sysret();
     }
 
     // Read path from user space
     let path_str = match strncpy_from_user::<Uaccess>(path_ptr, 4096) {
         Ok(p) => p,
-        Err(_) => return -14, // EFAULT
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
     let path = path_str.into_bytes();
 
     // Find swap device by path
     let swap_type = match find_swap_by_path(&path) {
         Some(t) => t,
-        None => return EINVAL,
+        None => return KernelError::InvalidArgument.sysret(),
     };
 
     // Get swap info
     let si = match get_swap_info(swap_type) {
         Some(s) => s,
-        None => return EINVAL,
+        None => return KernelError::InvalidArgument.sysret(),
     };
 
     // Mark as deactivating
@@ -658,7 +649,7 @@ pub fn sys_swapoff(path_ptr: u64) -> i64 {
         let mut flags = si.flags.lock();
         *flags |= SWP_WRITEOK;
         *flags &= !SWP_DISCARDING;
-        return EBUSY;
+        return KernelError::Busy.sysret();
     }
 
     // Update global counters

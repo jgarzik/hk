@@ -8,11 +8,13 @@
 //! - Test pidfd poll for exit
 //! - Test procfs /proc/<pid>/fdinfo/<pidfd> shows Pid line
 //! - Test waitid with P_PIDFD
+//! - Test pidfd_getfd to get own fd via pidfd
+//! - Test pidfd_getfd with invalid flags returns EINVAL
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     sys_close, sys_fork, sys_getpid, sys_open, sys_poll, sys_read, sys_wait4, sys_waitid,
-    sys_pidfd_open, sys_pidfd_send_signal,
+    sys_pidfd_open, sys_pidfd_send_signal, sys_pidfd_getfd,
     PollFd, SigInfo, POLLIN, P_PIDFD, WEXITED,
 };
 
@@ -25,6 +27,8 @@ pub fn run_tests() {
     test_pidfd_poll_exit();
     test_pidfd_fdinfo();
     test_waitid_p_pidfd();
+    test_pidfd_getfd_self();
+    test_pidfd_getfd_invalid_flags();
 }
 
 /// Test pidfd_open for current process
@@ -353,4 +357,68 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         }
     }
     false
+}
+
+// =============================================================================
+// pidfd_getfd tests
+// =============================================================================
+
+/// Test pidfd_getfd to get own file descriptor via pidfd
+///
+/// Creates a pidfd for the current process, then uses pidfd_getfd
+/// to duplicate fd 0 (stdin) via the pidfd. This tests the basic
+/// functionality without requiring a separate process.
+fn test_pidfd_getfd_self() {
+    let pid = sys_getpid();
+    let pidfd = sys_pidfd_open(pid as i32, 0);
+
+    if pidfd < 0 {
+        print(b"PIDFD_GETFD_SELF:FAIL: pidfd_open returned ");
+        print_num(pidfd);
+        println(b"");
+        return;
+    }
+
+    // Get fd 0 (stdin) via pidfd_getfd
+    // Note: fd 0 should always exist as stdin
+    let new_fd = sys_pidfd_getfd(pidfd as i32, 0, 0);
+
+    let _ = sys_close(pidfd as u64);
+
+    if new_fd < 0 {
+        print(b"PIDFD_GETFD_SELF:FAIL: pidfd_getfd returned ");
+        print_num(new_fd);
+        println(b"");
+        return;
+    }
+
+    // Close the duplicated fd
+    let _ = sys_close(new_fd as u64);
+
+    println(b"PIDFD_GETFD_SELF:OK");
+}
+
+/// Test pidfd_getfd with invalid flags returns EINVAL
+fn test_pidfd_getfd_invalid_flags() {
+    let pid = sys_getpid();
+    let pidfd = sys_pidfd_open(pid as i32, 0);
+
+    if pidfd < 0 {
+        println(b"PIDFD_GETFD_FLAGS:SKIP (pidfd_open failed)");
+        return;
+    }
+
+    // Try with invalid flags (should return EINVAL = -22)
+    let ret = sys_pidfd_getfd(pidfd as i32, 0, 0xFFFF);
+
+    let _ = sys_close(pidfd as u64);
+
+    if ret == -22 {
+        // EINVAL
+        println(b"PIDFD_GETFD_FLAGS:OK");
+    } else {
+        print(b"PIDFD_GETFD_FLAGS:FAIL: expected -22, got ");
+        print_num(ret);
+        println(b"");
+    }
 }

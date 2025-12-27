@@ -28,6 +28,8 @@ pub mod epoll;
 pub mod signalfd;
 pub mod prctl;
 pub mod inotify;
+pub mod fanotify;
+pub mod acct;
 pub mod clone3_syslog;
 pub mod pidfd;
 pub mod swap;
@@ -36,6 +38,8 @@ pub mod io_uring;
 pub mod tcp;
 pub mod keys;
 pub mod kcmp;
+pub mod tty;
+pub mod cgroup;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -63,6 +67,8 @@ pub fn run_all_tests() {
     signalfd::run_tests();
     prctl::run_tests();
     inotify::run_tests();
+    fanotify::run_tests();
+    acct::run_tests();
     clone3_syslog::run_tests();
     pidfd::run_tests();
     swap::run_tests();
@@ -71,4 +77,6 @@ pub fn run_all_tests() {
     tcp::run_tests();
     keys::run_tests();
     kcmp::run_tests();
+    tty::run_tests();
+    cgroup::run_tests();
 }

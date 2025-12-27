@@ -245,7 +245,7 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] eventfd2
 - [x] pidfd_open
 - [x] pidfd_send_signal
-- [ ] pidfd_getfd (stub - requires PTRACE capabilities)
+- [x] pidfd_getfd
 
 7.2 Futex (core for modern libs/threads)
 
@@ -321,8 +321,8 @@ Linux groups the socket syscalls as their own "network" category.
 - [x] inotify_init1
 - [x] inotify_add_watch
 - [x] inotify_rm_watch
-- [ ] fanotify_init
-- [ ] fanotify_mark
+- [x] fanotify_init
+- [x] fanotify_mark
 
 9.3 io_uring (modern async I/O)
 
@@ -361,8 +361,8 @@ Linux groups the socket syscalls as their own "network" category.
 
 10.4 Misc security / sandboxing
 
-- [ ] seccomp
-- [x] prctl (PR_SET/GET_NAME, PR_SET/GET_DUMPABLE, PR_SET/GET_NO_NEW_PRIVS, PR_SET/GET_TIMERSLACK)
+- [x] seccomp (SECCOMP_SET_MODE_STRICT, SECCOMP_SET_MODE_FILTER with eBPF support)
+- [x] prctl (PR_SET/GET_NAME, PR_SET/GET_DUMPABLE, PR_SET/GET_NO_NEW_PRIVS, PR_SET/GET_TIMERSLACK, PR_SET/GET_SECCOMP)
 - [x] mlock / mlockall (already listed under memory)
 - [x] settimeofday (x86_64 only) / [n/a] adjtimex (privileged)
 
@@ -398,7 +398,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 - [x] reboot
 - [ ] kexec_load
 - [x] syslog
-- [ ] acct
+- [x] acct
 - [ ] swapon
 - [ ] swapoff
 - [ ] sysfs (legacy)
@@ -426,7 +426,7 @@ Misc utilities that don't fit elsewhere:
 - [ ] getpgid / setpgid (already listed)
 - [x] personality
 - [x] umount / umount2 (already listed)
-- [ ] vhangup
+- [x] vhangup
 - [x] readahead
 - [ ] sysfs (legacy)
 - fanotify_* (already listed)

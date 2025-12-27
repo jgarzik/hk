@@ -3,56 +3,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Filesystem error
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FsError {
-    /// File not found
-    NotFound,
-    /// Not a file
-    NotAFile,
-    /// Not a directory
-    NotADirectory,
-    /// Permission denied
-    PermissionDenied,
-    /// I/O error
-    IoError,
-    /// Operation not supported
-    NotSupported,
-    /// File already exists
-    AlreadyExists,
-    /// Invalid argument
-    InvalidArgument,
-    /// Too many symbolic links
-    TooManySymlinks,
-    /// Is a directory (operation not valid for directory)
-    IsADirectory,
-    /// Invalid file handle
-    InvalidFile,
-    /// Bad file descriptor
-    BadFd,
-    /// Resource busy
-    Busy,
-    /// No such device or filesystem type
-    NoDevice,
-    /// Directory not empty
-    DirectoryNotEmpty,
-    /// Not a block device
-    NotABlockDevice,
-    /// Operation would block (EAGAIN/EWOULDBLOCK)
-    WouldBlock,
-    /// Not a TTY (ENOTTY)
-    NotTty,
-    /// Broken pipe (EPIPE)
-    BrokenPipe,
-    /// No space left on device (ENOSPC)
-    NoSpace,
-    /// File too large (EFBIG)
-    FileTooLarge,
-    /// No data available (ENODATA) - for xattr not found
-    NoData,
-    /// Result too large for buffer (ERANGE)
-    Range,
-}
+use crate::error::KernelError;
 
 /// File metadata
 #[derive(Debug, Clone)]
@@ -78,16 +29,16 @@ pub trait FileSystem {
     type FileHandle;
 
     /// Open a file
-    fn open(&self, path: &str) -> Result<Self::FileHandle, FsError>;
+    fn open(&self, path: &str) -> Result<Self::FileHandle, KernelError>;
 
     /// Read from a file handle
-    fn read(&self, fh: &mut Self::FileHandle, buf: &mut [u8]) -> Result<usize, FsError>;
+    fn read(&self, fh: &mut Self::FileHandle, buf: &mut [u8]) -> Result<usize, KernelError>;
 
     /// Get file metadata
-    fn stat(&self, path: &str) -> Result<FileMetadata, FsError>;
+    fn stat(&self, path: &str) -> Result<FileMetadata, KernelError>;
 
     /// List directory contents
-    fn list(&self, path: &str) -> Result<Vec<DirEntry>, FsError>;
+    fn list(&self, path: &str) -> Result<Vec<DirEntry>, KernelError>;
 }
 
 /// Mount point in the VFS

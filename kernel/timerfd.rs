@@ -30,7 +30,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
-use crate::fs::FsError;
+use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
@@ -254,7 +254,7 @@ impl Timerfd {
     ///
     /// Blocks until timer expires (unless O_NONBLOCK is set).
     /// Returns the number of expirations as an 8-byte u64.
-    pub fn read(&self, nonblock: bool) -> Result<u64, FsError> {
+    pub fn read(&self, nonblock: bool) -> Result<u64, KernelError> {
         loop {
             {
                 let mut inner = self.inner.lock();
@@ -267,16 +267,16 @@ impl Timerfd {
                 // Timer not armed?
                 if inner.expires_ns == 0 {
                     if nonblock {
-                        return Err(FsError::WouldBlock);
+                        return Err(KernelError::WouldBlock);
                     }
                     // Could wait forever, but that's undefined behavior
                     // For now, return EAGAIN
-                    return Err(FsError::WouldBlock);
+                    return Err(KernelError::WouldBlock);
                 }
             }
 
             if nonblock {
-                return Err(FsError::WouldBlock);
+                return Err(KernelError::WouldBlock);
             }
 
             // Wait for timer to fire
@@ -375,10 +375,10 @@ impl FileOps for TimerfdFileOps {
         self
     }
 
-    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, FsError> {
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         // timerfd read always returns 8 bytes (u64)
         if buf.len() < 8 {
-            return Err(FsError::InvalidArgument);
+            return Err(KernelError::InvalidArgument);
         }
 
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
@@ -389,16 +389,16 @@ impl FileOps for TimerfdFileOps {
         Ok(8)
     }
 
-    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, FsError> {
+    fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
         // timerfd doesn't support write
-        Err(FsError::InvalidArgument)
+        Err(KernelError::InvalidArgument)
     }
 
     fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
         self.timerfd.poll(pt)
     }
 
-    fn release(&self, _file: &File) -> Result<(), FsError> {
+    fn release(&self, _file: &File) -> Result<(), KernelError> {
         self.timerfd.release();
         Ok(())
     }
@@ -412,7 +412,7 @@ impl FileOps for TimerfdFileOps {
 ///
 /// # Returns
 /// Arc<File> for the new timerfd
-pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<Arc<File>, FsError> {
+pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<Arc<File>, KernelError> {
     let timerfd = Timerfd::new(clockid);
 
     // Create file operations
@@ -432,7 +432,7 @@ pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<Arc<File>, FsError
 }
 
 /// Create a dummy dentry for timerfd
-fn create_timerfd_dentry() -> Result<Arc<Dentry>, FsError> {
+fn create_timerfd_dentry() -> Result<Arc<Dentry>, KernelError> {
     let mode = InodeMode::regular(0o600);
     let inode = Arc::new(Inode::new(
         0, // ino=0 for anonymous

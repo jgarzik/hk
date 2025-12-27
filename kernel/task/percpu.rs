@@ -384,11 +384,25 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
     // Create the task structure
     // Idle task: ppid=0 (no parent), pgid=pid (own group), sid=pid (own session)
     let task = Task {
+        magic: crate::task::TASK_MAGIC,
         pid,
         tid,
+        tgid: pid, // Thread group leader (tgid == pid)
         ppid: 0,
         pgid: pid,
         sid: pid,
+        // Exit handling (kernel threads don't exit normally)
+        exit_code: 0,
+        exit_signal: 0, // Kernel threads don't send exit signals
+        pdeath_signal: 0,
+        // Accounting (kernel threads don't track CPU time)
+        utime: 0,
+        stime: 0,
+        start_time: crate::time::monotonic_ns(),
+        nvcsw: 0,
+        nivcsw: 0,
+        min_flt: 0,
+        maj_flt: 0,
         cred: alloc::sync::Arc::new(Cred::ROOT), // Kernel threads run as root
         kind: TaskKind::KernelThread,
         state: TaskState::Ready,
@@ -423,6 +437,9 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         prctl: crate::task::PrctlState::default(),
         // Process personality (execution domain)
         personality: 0,
+        // Seccomp state (kernel threads don't use seccomp)
+        seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
+        seccomp_filter: None,
     };
 
     // Add task to global table
@@ -483,11 +500,25 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
 
     // Create Task entry
     let task = Task {
+        magic: crate::task::TASK_MAGIC,
         pid: config.pid,
         tid: config.tid,
+        tgid: config.pid, // Thread group leader (tgid == pid)
         ppid: config.ppid,
         pgid: config.pgid,
         sid: config.sid,
+        // Exit handling
+        exit_code: 0,
+        exit_signal: crate::signal::SIGCHLD as i32, // Default: notify parent with SIGCHLD
+        pdeath_signal: 0,
+        // Accounting
+        utime: 0,
+        stime: 0,
+        start_time: crate::time::monotonic_ns(),
+        nvcsw: 0,
+        nivcsw: 0,
+        min_flt: 0,
+        maj_flt: 0,
         cred: alloc::sync::Arc::new(Cred::ROOT), // Initial user process starts as root
         kind: TaskKind::UserProcess,
         state: TaskState::Running, // Will be running immediately
@@ -522,6 +553,9 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         prctl: crate::task::PrctlState::default(),
         // Process personality (execution domain)
         personality: 0,
+        // Seccomp state (disabled initially)
+        seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
+        seccomp_filter: None,
     };
 
     // Add to global table
@@ -585,6 +619,7 @@ pub fn mark_zombie(tid: Tid, status: i32) {
     {
         let mut table = TASK_TABLE.lock();
         if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+            task.exit_code = status;
             task.state = TaskState::Zombie(status);
             // Release cached pages
             task.release_cached_pages();
@@ -594,9 +629,16 @@ pub fn mark_zombie(tid: Tid, status: i32) {
         }
     }
 
+    // Detach from cgroup and decrement task counters
+    // This must be done after releasing TASK_TABLE lock to avoid lock ordering issues
+    crate::cgroup::detach_task(tid);
+
     // Notify any pidfds watching this process (after releasing TASK_TABLE lock)
     if let Some(p) = pid {
         crate::pidfd::notify_process_exit(p, status);
+
+        // Write accounting record if process accounting is enabled
+        crate::acct::write_acct_record(tid, p, status);
     }
 }
 
@@ -699,6 +741,8 @@ pub struct CloneConfig {
     pub tls: u64,
     /// User address to store pidfd (CLONE_PIDFD)
     pub pidfd_ptr: u64,
+    /// Exit signal for child (SIGCHLD for fork, 0 for threads)
+    pub exit_signal: i32,
 }
 
 /// Create a new thread/process via clone()
@@ -754,6 +798,21 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         (0, false) // Threads don't count toward RLIMIT_NPROC
     };
 
+    // Check cgroup pids controller limit (if task is in a cgroup with pids.max)
+    // This is checked before allocating resources so we fail early if over limit
+    let parent_cgroup = {
+        let tid = current_tid();
+        crate::cgroup::TASK_CGROUP.read().get(&tid).cloned()
+    };
+    if let Some(ref cgroup) = parent_cgroup
+        && !crate::cgroup::pids_can_fork(cgroup)
+    {
+        if nproc_incremented {
+            crate::task::decrement_user_process_count(nproc_uid);
+        }
+        return Err(11); // EAGAIN - resource temporarily unavailable
+    }
+
     // Helper macro to handle early returns with NPROC cleanup
     // If we incremented the process count and then fail, we must decrement it
     macro_rules! try_with_cleanup {
@@ -777,6 +836,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     let current_tid = current_tid();
     let (
         parent_pid,
+        parent_tgid,
         parent_ppid,
         parent_pgid,
         parent_sid,
@@ -789,11 +849,14 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_cred,
         parent_prctl,
         parent_personality,
+        parent_seccomp_mode,
+        parent_seccomp_filter,
     ) = {
         let table = TASK_TABLE.lock();
         let parent = try_with_cleanup!(table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)); // ESRCH - no such process
         (
             parent.pid,
+            parent.tgid,
             parent.ppid,
             parent.pgid,
             parent.sid,
@@ -806,6 +869,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.cred.clone(),
             parent.prctl.clone(),
             parent.personality,
+            parent.seccomp_mode,
+            parent.seccomp_filter.clone(),
         )
     };
 
@@ -915,11 +980,30 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Create child task
     let child_task = Task {
+        magic: crate::task::TASK_MAGIC,
         pid: child_pid,
         tid: child_tid,
+        // Thread group ID: same as parent for CLONE_THREAD, else child becomes leader
+        tgid: if config.flags & CLONE_THREAD != 0 {
+            parent_tgid
+        } else {
+            child_pid
+        },
         ppid: child_ppid,
         pgid: parent_pgid,
         sid: parent_sid,
+        // Exit handling
+        exit_code: 0,
+        exit_signal: config.exit_signal, // From clone3 args (SIGCHLD for fork, 0 for threads)
+        pdeath_signal: 0,                // Never inherited, must be set explicitly via prctl
+        // Accounting (child starts fresh)
+        utime: 0,
+        stime: 0,
+        start_time: crate::time::monotonic_ns(),
+        nvcsw: 0,
+        nivcsw: 0,
+        min_flt: 0,
+        maj_flt: 0,
         cred: crate::task::copy_creds(config.flags, &parent_cred),
         kind: TaskKind::UserProcess,
         state: TaskState::Ready,
@@ -959,6 +1043,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         },
         // Process personality (inherited from parent)
         personality: parent_personality,
+        // Seccomp state (inherited from parent)
+        // Seccomp filters are reference-counted, so this is cheap
+        seccomp_mode: parent_seccomp_mode,
+        seccomp_filter: parent_seccomp_filter,
     };
 
     // Add to global task table
@@ -998,6 +1086,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         child_tid,
         config.flags
     ));
+
+    // Inherit cgroup membership from parent
+    // Child joins same cgroup as parent and inherits resource constraints
+    if let Some(ref cgroup) = parent_cgroup {
+        crate::cgroup::attach_task(child_tid, cgroup);
+    }
 
     // Handle signal handlers (CLONE_SIGHAND, CLONE_CLEAR_SIGHAND)
     // If CLONE_SIGHAND is set, child shares parent's signal handler table
@@ -1186,6 +1280,9 @@ pub fn exit_current() -> ! {
         // Clean up namespace context for exiting task
         crate::ns::exit_task_ns(tid);
 
+        // Clean up seccomp state for exiting task
+        crate::seccomp::exit_seccomp(tid);
+
         // Clean up signal state for exiting task
         crate::signal::exit_task_signal(tid);
 
@@ -1221,8 +1318,17 @@ pub fn exit_current() -> ! {
         .dequeue_highest()
         .expect("Idle task should always be runnable");
 
-    // Get next task's kernel stack, pid, ppid, pgid, sid, cred from global table
-    let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3, next_cred) = {
+    // Get next task's kernel stack, pid, ppid, pgid, sid, cred, seccomp_mode from global table
+    let (
+        next_kstack,
+        next_pid,
+        next_ppid,
+        next_pgid,
+        next_sid,
+        next_cr3,
+        next_cred,
+        next_seccomp_mode,
+    ) = {
         let table = TASK_TABLE.lock();
         table
             .tasks
@@ -1237,9 +1343,10 @@ pub fn exit_current() -> ! {
                     t.sid,
                     t.page_table.root_table_phys(),
                     t.cred.clone(),
+                    t.seccomp_mode,
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT)))
+            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT), 0))
     };
 
     // Get next task's context
@@ -1266,6 +1373,7 @@ pub fn exit_current() -> ! {
         pgid: next_pgid,
         sid: next_sid,
         cred: *next_cred,
+        seccomp_mode: next_seccomp_mode,
     });
 
     // Release lock before switch (context_switch_first doesn't return)
@@ -1457,8 +1565,17 @@ pub fn sleep_current_until(wake_tick: u64) {
         return;
     }
 
-    // Get next task's kernel stack, pid, ppid, pgid, sid, cred from global table
-    let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3, next_cred) = {
+    // Get next task's kernel stack, pid, ppid, pgid, sid, cred, seccomp_mode from global table
+    let (
+        next_kstack,
+        next_pid,
+        next_ppid,
+        next_pgid,
+        next_sid,
+        next_cr3,
+        next_cred,
+        next_seccomp_mode,
+    ) = {
         let table = TASK_TABLE.lock();
         table
             .tasks
@@ -1473,9 +1590,10 @@ pub fn sleep_current_until(wake_tick: u64) {
                     t.sid,
                     t.page_table.root_table_phys(),
                     t.cred.clone(),
+                    t.seccomp_mode,
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT)))
+            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT), 0))
     };
 
     // Get context pointers
@@ -1495,6 +1613,7 @@ pub fn sleep_current_until(wake_tick: u64) {
             pgid: next_pgid,
             sid: next_sid,
             cred: *next_cred,
+            seccomp_mode: next_seccomp_mode,
         });
 
         // Context switch with lock held!
@@ -1596,8 +1715,17 @@ pub fn yield_now() {
         return;
     }
 
-    // Get next task's kernel stack, pid, ppid, pgid, sid, cred from global table
-    let (next_kstack, next_pid, next_ppid, next_pgid, next_sid, next_cr3, next_cred) = {
+    // Get next task's kernel stack, pid, ppid, pgid, sid, cred, seccomp_mode from global table
+    let (
+        next_kstack,
+        next_pid,
+        next_ppid,
+        next_pgid,
+        next_sid,
+        next_cr3,
+        next_cred,
+        next_seccomp_mode,
+    ) = {
         let table = TASK_TABLE.lock();
         table
             .tasks
@@ -1612,9 +1740,10 @@ pub fn yield_now() {
                     t.sid,
                     t.page_table.root_table_phys(),
                     t.cred.clone(),
+                    t.seccomp_mode,
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT)))
+            .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT), 0))
     };
 
     // Get context pointers
@@ -1634,6 +1763,7 @@ pub fn yield_now() {
             pgid: next_pgid,
             sid: next_sid,
             cred: *next_cred,
+            seccomp_mode: next_seccomp_mode,
         });
 
         // Context switch with lock held!
@@ -1686,6 +1816,30 @@ pub fn current_sid() -> Pid {
 pub fn task_exists(tid: Tid) -> bool {
     let table = TASK_TABLE.lock();
     table.tasks.iter().any(|t| t.tid == tid)
+}
+
+/// Increment minor page fault counter for current task
+///
+/// Called after successfully handling a demand-paging or COW fault
+/// (no I/O required - page was already in memory or newly allocated).
+pub fn increment_min_flt() {
+    let tid = current_tid();
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.min_flt = task.min_flt.saturating_add(1);
+    }
+}
+
+/// Increment major page fault counter for current task
+///
+/// Called after successfully handling a swap-in fault
+/// (I/O was required - page had to be read from disk).
+pub fn increment_maj_flt() {
+    let tid = current_tid();
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.maj_flt = task.maj_flt.saturating_add(1);
+    }
 }
 
 /// Get all TIDs in a process group
@@ -2001,6 +2155,17 @@ pub fn update_current_pgid_sid(pgid: Pid, sid: Pid) {
     let mut task = CurrentArch::get_current_task();
     task.pgid = pgid;
     task.sid = sid;
+    CurrentArch::set_current_task(&task);
+}
+
+/// Update the current task's seccomp mode in per-CPU cache
+///
+/// Called after seccomp mode changes to update the fast-path cache.
+/// This allows syscall entry to quickly check if seccomp is enabled
+/// without locking TASK_TABLE.
+pub fn update_current_seccomp_mode(mode: u8) {
+    let mut task = CurrentArch::get_current_task();
+    task.seccomp_mode = mode;
     CurrentArch::set_current_task(&task);
 }
 

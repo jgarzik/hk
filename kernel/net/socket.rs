@@ -278,7 +278,7 @@ impl Socket {
 
             // Non-blocking?
             if self.is_nonblocking() {
-                return Err(-crate::net::libc::EAGAIN);
+                return Err(crate::error::KernelError::WouldBlock.to_errno_neg());
             }
 
             // Block
@@ -350,7 +350,7 @@ impl Socket {
 
             // Non-blocking?
             if self.is_nonblocking() {
-                return Err(-crate::net::libc::EAGAIN);
+                return Err(crate::error::KernelError::WouldBlock.to_errno_neg());
             }
 
             // Block
