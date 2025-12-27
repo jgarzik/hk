@@ -16,6 +16,20 @@ pub mod splice;
 pub mod superblock;
 pub mod syscall;
 
+// Syscall implementation modules
+pub mod dir;
+pub mod fd;
+pub mod io;
+pub mod iov;
+pub mod link;
+pub mod misc;
+pub mod nav;
+pub mod open;
+pub mod perm;
+#[path = "poll.rs"]
+pub mod pollsys;
+pub mod stat;
+
 // Filesystem implementations
 pub mod cgroupfs;
 pub mod cpio;

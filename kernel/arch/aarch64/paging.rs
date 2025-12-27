@@ -1222,12 +1222,10 @@ impl Aarch64PageTable {
                 } else {
                     attrs |= AP_EL0_RO;
                 }
+            } else if writable {
+                attrs |= AP_EL1_RW;
             } else {
-                if writable {
-                    attrs |= AP_EL1_RW;
-                } else {
-                    attrs |= AP_EL1_RO;
-                }
+                attrs |= AP_EL1_RO;
             }
 
             // Set execute permissions

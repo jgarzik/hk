@@ -2,8 +2,13 @@
 
 pub mod exec;
 pub mod fdtable;
+pub mod id;
+pub mod misc;
 pub mod percpu;
+pub mod pgrp;
+pub mod proc;
 pub mod sched;
+pub mod schedsys;
 pub mod syscall;
 
 /// Clone flags for clone() syscall (subset of Linux flags)
