@@ -21,8 +21,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::error::KernelError;
 use crate::task::Pid;
 
-use super::subsys::{CgroupSubsysOps, ControlFile, ControllerType, CssPrivate};
 use super::CgroupSubsysState;
+use super::subsys::{CgroupSubsysOps, ControlFile, ControllerType, CssPrivate};
 
 /// Unlimited memory
 pub const MEMORY_MAX_UNLIMITED: u64 = u64::MAX;
@@ -318,9 +318,7 @@ fn parse_memory_size(s: &str) -> Result<u64, KernelError> {
         (s, 1)
     };
 
-    let value: u64 = num_str
-        .parse()
-        .map_err(|_| KernelError::InvalidArgument)?;
+    let value: u64 = num_str.parse().map_err(|_| KernelError::InvalidArgument)?;
 
     value
         .checked_mul(multiplier)

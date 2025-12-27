@@ -32,8 +32,8 @@ use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Times
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 
 use crate::cgroup::{
-    cgroup_attach_task, cgroup_init, cgroup_mkdir, cgroup_rmdir, Cgroup, ControllerType,
-    CGROUP_ROOT,
+    CGROUP_ROOT, Cgroup, ControllerType, cgroup_attach_task, cgroup_init, cgroup_mkdir,
+    cgroup_rmdir,
 };
 use crate::task::Pid;
 
@@ -83,11 +83,7 @@ impl CgroupControlFileType {
 
     /// Get file mode
     pub fn mode(&self) -> u16 {
-        if self.is_writable() {
-            0o644
-        } else {
-            0o444
-        }
+        if self.is_writable() { 0o644 } else { 0o444 }
     }
 
     /// Parse filename to control file type
@@ -517,10 +513,7 @@ fn handle_control_file_write(
         CgroupControlFileType::Procs => {
             // Migrate a task to this cgroup
             let s = core::str::from_utf8(data).map_err(|_| KernelError::InvalidArgument)?;
-            let pid: Pid = s
-                .trim()
-                .parse()
-                .map_err(|_| KernelError::InvalidArgument)?;
+            let pid: Pid = s.trim().parse().map_err(|_| KernelError::InvalidArgument)?;
             cgroup_attach_task(cgroup, pid)
         }
         CgroupControlFileType::SubtreeControl => {

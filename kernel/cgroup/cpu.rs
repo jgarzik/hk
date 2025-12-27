@@ -20,8 +20,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::error::KernelError;
 use crate::task::Pid;
 
-use super::subsys::{CgroupSubsysOps, ControlFile, ControllerType, CssPrivate};
 use super::CgroupSubsysState;
+use super::subsys::{CgroupSubsysOps, ControlFile, ControllerType, CssPrivate};
 
 /// Default CPU weight
 pub const CPU_WEIGHT_DEFAULT: u64 = 100;
@@ -172,8 +172,10 @@ impl CpuState {
 
             // Track time spent throttled
             if self.throttled.load(Ordering::Acquire) {
-                let throttled_time = now_usec - period_start - self.period_used.load(Ordering::Relaxed);
-                self.throttled_usec.fetch_add(throttled_time, Ordering::Relaxed);
+                let throttled_time =
+                    now_usec - period_start - self.period_used.load(Ordering::Relaxed);
+                self.throttled_usec
+                    .fetch_add(throttled_time, Ordering::Relaxed);
             }
 
             self.period_used.store(0, Ordering::Relaxed);
@@ -328,10 +330,7 @@ fn cpu_weight_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
 fn cpu_weight_write(css: &CgroupSubsysState, data: &[u8]) -> Result<(), KernelError> {
     if let Some(state) = css.private_as::<CpuState>() {
         let s = core::str::from_utf8(data).map_err(|_| KernelError::InvalidArgument)?;
-        let weight: u64 = s
-            .trim()
-            .parse()
-            .map_err(|_| KernelError::InvalidArgument)?;
+        let weight: u64 = s.trim().parse().map_err(|_| KernelError::InvalidArgument)?;
 
         if weight < CPU_WEIGHT_MIN || weight > CPU_WEIGHT_MAX {
             return Err(KernelError::InvalidArgument);

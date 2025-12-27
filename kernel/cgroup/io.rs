@@ -21,8 +21,8 @@ use spin::RwLock;
 use crate::error::KernelError;
 use crate::task::Pid;
 
-use super::subsys::{CgroupSubsysOps, ControlFile, ControllerType, CssPrivate};
 use super::CgroupSubsysState;
+use super::subsys::{CgroupSubsysOps, ControlFile, ControllerType, CssPrivate};
 
 /// Device ID (major:minor encoded as u64)
 pub type DevId = u64;

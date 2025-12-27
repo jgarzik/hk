@@ -42,7 +42,7 @@ pub mod io;
 pub mod memory;
 pub mod pids;
 
-pub use subsys::{CgroupSubsys, CgroupSubsysOps, CssPrivate, ControllerType};
+pub use subsys::{CgroupSubsys, CgroupSubsysOps, ControllerType, CssPrivate};
 
 /// Unique cgroup identifier
 pub type CgroupId = u64;
@@ -550,12 +550,19 @@ impl CgroupRoot {
     }
 
     /// Register a controller
-    pub fn register_controller(&self, controller: ControllerType, ops: &'static dyn CgroupSubsysOps) {
+    pub fn register_controller(
+        &self,
+        controller: ControllerType,
+        ops: &'static dyn CgroupSubsysOps,
+    ) {
         self.controllers.write().insert(controller, ops);
     }
 
     /// Get a controller's operations
-    pub fn get_controller(&self, controller: ControllerType) -> Option<&'static dyn CgroupSubsysOps> {
+    pub fn get_controller(
+        &self,
+        controller: ControllerType,
+    ) -> Option<&'static dyn CgroupSubsysOps> {
         self.controllers.read().get(&controller).copied()
     }
 
@@ -744,7 +751,8 @@ pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &str) -> Result<Arc<Cgroup>, Ker
                 let parent_css = parent.css(controller);
                 if let Ok(private) = ops.css_alloc(parent_css.as_ref()) {
                     let css_id = root.alloc_cg_id(); // Reuse cg_id allocator for css_id
-                    let css = CgroupSubsysState::new(&new_cg, controller, css_id, parent_css.as_ref());
+                    let css =
+                        CgroupSubsysState::new(&new_cg, controller, css_id, parent_css.as_ref());
                     css.set_private(private);
                     new_cg.set_css(controller, css);
                 }

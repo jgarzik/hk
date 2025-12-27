@@ -227,6 +227,18 @@ impl PageTableEntry {
         self.0 = (phys_addr & ADDR_MASK) | attrs | DESC_PAGE;
     }
 
+    /// Set entry to a block descriptor (L1 for 1GB, L2 for 2MB)
+    #[inline]
+    pub fn set_block(&mut self, phys_addr: u64, attrs: u64) {
+        self.0 = (phys_addr & ADDR_MASK) | attrs | DESC_BLOCK;
+    }
+
+    /// Get the attributes/flags from the entry
+    #[inline]
+    pub fn attrs(&self) -> u64 {
+        self.0 & !ADDR_MASK
+    }
+
     /// Clear the entry
     #[inline]
     pub fn clear(&mut self) {
@@ -1152,6 +1164,94 @@ impl Aarch64PageTable {
         }
     }
 
+    /// Update protection flags for a 2MB huge page (L2 block descriptor)
+    ///
+    /// # Arguments
+    /// * `l0_phys` - Physical address of the L0 table
+    /// * `va` - Virtual address (must be 2MB-aligned)
+    /// * `writable` - Whether the page should be writable
+    /// * `executable` - Whether the page should be executable
+    ///
+    /// # Returns
+    /// `true` if the huge page was found and updated, `false` if not mapped
+    pub fn update_huge_page_protection(
+        l0_phys: u64,
+        va: u64,
+        writable: bool,
+        executable: bool,
+    ) -> bool {
+        let (l0_idx, l1_idx, l2_idx, _l3_idx) = page_indices(va);
+
+        unsafe {
+            let l0 = phys_to_virt_table(l0_phys);
+
+            let l0_entry = (*l0).entry(l0_idx);
+            if !l0_entry.is_valid() || !l0_entry.is_table() {
+                return false;
+            }
+            let l1 = phys_to_virt_table(l0_entry.addr());
+
+            let l1_entry = (*l1).entry(l1_idx);
+            if !l1_entry.is_valid() {
+                return false;
+            }
+            if l1_entry.is_block() {
+                // 1GB block page - not handled here
+                return false;
+            }
+            let l2 = phys_to_virt_table(l1_entry.addr());
+
+            let l2_entry = (*l2).entry_mut(l2_idx);
+            if !l2_entry.is_valid() || !l2_entry.is_block() {
+                // Must be a 2MB block page
+                return false;
+            }
+
+            // Get current entry, preserve address
+            let phys = l2_entry.addr();
+
+            // Build new attributes, preserving AF, SH, ATTR_IDX
+            let mut attrs = l2_entry.0 & (AF | SH_INNER | 0b11100); // Preserve AF, SH, ATTR_IDX
+
+            // Detect if user page
+            let was_user = (l2_entry.0 & AP_EL0_RW) != 0 || (l2_entry.0 & AP_EL0_RO) != 0;
+
+            if was_user {
+                if writable {
+                    attrs |= AP_EL0_RW;
+                } else {
+                    attrs |= AP_EL0_RO;
+                }
+            } else {
+                if writable {
+                    attrs |= AP_EL1_RW;
+                } else {
+                    attrs |= AP_EL1_RO;
+                }
+            }
+
+            // Set execute permissions
+            if !executable {
+                attrs |= PXN | UXN;
+            }
+
+            // Write back the updated entry as a block descriptor
+            l2_entry.set_block(phys, attrs);
+
+            // Clean data cache and flush TLB
+            let entry_addr = l2_entry as *mut PageTableEntry as u64;
+            asm!(
+                "dc cvau, {}",
+                "dsb ish",
+                in(reg) entry_addr,
+                options(nostack)
+            );
+            flush_tlb(va);
+
+            true
+        }
+    }
+
     /// Translate a virtual address to physical using the given page table root
     ///
     /// Static method that takes l0_phys directly.
@@ -1418,5 +1518,300 @@ impl PageTable for Aarch64PageTable {
         }
 
         frames
+    }
+}
+
+// ============================================================================
+// Transparent Huge Page (THP) Support - 2MB blocks at L2 level
+// ============================================================================
+
+impl Aarch64PageTable {
+    /// Map a 2MB huge page at L2 level (block descriptor)
+    ///
+    /// Creates a 2MB block descriptor in the L2 table entry.
+    /// The virtual address must be 2MB-aligned.
+    ///
+    /// # Arguments
+    /// * `l0_phys` - Physical address of the L0 (root) table
+    /// * `va` - Virtual address (must be 2MB-aligned)
+    /// * `pa` - Physical address of the 2MB frame (must be 2MB-aligned)
+    /// * `flags` - Page flags
+    /// * `frame_alloc` - Frame allocator for intermediate tables
+    ///
+    /// # Returns
+    /// Ok(()) on success, Err(MapError) on failure
+    pub fn map_huge_page<FA: FrameAlloc<PhysAddr = u64>>(
+        l0_phys: u64,
+        va: u64,
+        pa: u64,
+        flags: PageFlags,
+        frame_alloc: &mut FA,
+    ) -> Result<(), MapError> {
+        const HUGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
+
+        // Verify alignment
+        if va & (HUGE_PAGE_SIZE - 1) != 0 {
+            return Err(MapError::InvalidAddress);
+        }
+        if pa & (HUGE_PAGE_SIZE - 1) != 0 {
+            return Err(MapError::InvalidAddress);
+        }
+
+        // Convert generic flags to AArch64 block attributes
+        let mut attrs = AF | SH_INNER | ATTR_IDX_NORMAL;
+
+        if flags.contains(PageFlags::USER) {
+            if flags.contains(PageFlags::WRITE) {
+                attrs |= AP_EL0_RW;
+            } else {
+                attrs |= AP_EL0_RO;
+            }
+        } else if flags.contains(PageFlags::WRITE) {
+            attrs |= AP_EL1_RW;
+        } else {
+            attrs |= AP_EL1_RO;
+        }
+
+        if !flags.contains(PageFlags::EXECUTE) {
+            attrs |= PXN | UXN;
+        }
+
+        let (l0_idx, l1_idx, l2_idx, _l3_idx) = page_indices(va);
+
+        unsafe {
+            let l0 = phys_to_virt_table(l0_phys);
+
+            // Get or create L1 table
+            let l0_entry = (*l0).entry_mut(l0_idx);
+            if !l0_entry.is_valid() {
+                let l1_phys = frame_alloc
+                    .alloc_frame()
+                    .ok_or(MapError::FrameAllocationFailed)?;
+                core::ptr::write_bytes(phys_to_virt(l1_phys), 0, PAGE_SIZE as usize);
+                l0_entry.set_table(l1_phys);
+            } else if !l0_entry.is_table() {
+                return Err(MapError::InvalidArgument);
+            }
+            let l1 = phys_to_virt_table(l0_entry.addr());
+
+            // Get or create L2 table
+            let l1_entry = (*l1).entry_mut(l1_idx);
+            if !l1_entry.is_valid() {
+                let l2_phys = frame_alloc
+                    .alloc_frame()
+                    .ok_or(MapError::FrameAllocationFailed)?;
+                core::ptr::write_bytes(phys_to_virt(l2_phys), 0, PAGE_SIZE as usize);
+                l1_entry.set_table(l2_phys);
+            } else if l1_entry.is_block() {
+                // 1GB block exists here - can't map 2MB within it
+                return Err(MapError::AlreadyMapped);
+            }
+            let l2 = phys_to_virt_table(l1_entry.addr());
+
+            // Check L2 entry - should not already be mapped
+            let l2_entry = (*l2).entry_mut(l2_idx);
+            if l2_entry.is_valid() {
+                return Err(MapError::AlreadyMapped);
+            }
+
+            // Set the 2MB block entry
+            l2_entry.set_block(pa, attrs);
+
+            // Clean the data cache for this page table entry
+            let entry_addr = l2_entry as *mut PageTableEntry as u64;
+            asm!(
+                "dc cvau, {}",
+                "dsb ish",
+                in(reg) entry_addr,
+                options(nostack)
+            );
+
+            // Flush TLB for this address
+            flush_tlb(va);
+        }
+
+        Ok(())
+    }
+
+    /// Unmap a 2MB huge page
+    ///
+    /// Clears the L2 block entry for the given 2MB-aligned virtual address.
+    ///
+    /// # Arguments
+    /// * `l0_phys` - Physical address of the L0 (root) table
+    /// * `va` - Virtual address (must be 2MB-aligned)
+    ///
+    /// # Returns
+    /// Some(phys_addr) if a huge page was unmapped, None otherwise
+    pub fn unmap_huge_page(l0_phys: u64, va: u64) -> Option<u64> {
+        let (l0_idx, l1_idx, l2_idx, _l3_idx) = page_indices(va);
+
+        unsafe {
+            let l0 = phys_to_virt_table(l0_phys);
+
+            let l0_entry = (*l0).entry(l0_idx);
+            if !l0_entry.is_valid() || !l0_entry.is_table() {
+                return None;
+            }
+            let l1 = phys_to_virt_table(l0_entry.addr());
+
+            let l1_entry = (*l1).entry(l1_idx);
+            if !l1_entry.is_valid() || l1_entry.is_block() {
+                return None;
+            }
+            let l2 = phys_to_virt_table(l1_entry.addr());
+
+            let l2_entry = (*l2).entry_mut(l2_idx);
+            if !l2_entry.is_valid() || !l2_entry.is_block() {
+                return None;
+            }
+
+            // Get physical address before clearing
+            let phys = l2_entry.addr();
+
+            // Clear the entry
+            l2_entry.clear();
+
+            // Clean the data cache for this page table entry
+            let entry_addr = l2_entry as *mut PageTableEntry as u64;
+            asm!(
+                "dc cvau, {}",
+                "dsb ish",
+                in(reg) entry_addr,
+                options(nostack)
+            );
+
+            // Flush TLB for this huge page region
+            flush_tlb(va);
+
+            Some(phys)
+        }
+    }
+
+    /// Split a 2MB huge page into 512 4KB pages
+    ///
+    /// Allocates a new L3 table, creates 512 page entries pointing to the same
+    /// physical memory (consecutive 4KB pages), and updates the L2 entry
+    /// to point to the new L3 table.
+    ///
+    /// # Arguments
+    /// * `l0_phys` - Physical address of the L0 (root) table
+    /// * `va` - Virtual address of the huge page (must be 2MB-aligned)
+    /// * `frame_alloc` - Frame allocator for the new L3 table
+    ///
+    /// # Returns
+    /// Ok(phys_base) with the base physical address of the split huge page,
+    /// Err(MapError) on failure
+    pub fn split_huge_page<FA: FrameAlloc<PhysAddr = u64>>(
+        l0_phys: u64,
+        va: u64,
+        frame_alloc: &mut FA,
+    ) -> Result<u64, MapError> {
+        let (l0_idx, l1_idx, l2_idx, _l3_idx) = page_indices(va);
+
+        unsafe {
+            let l0 = phys_to_virt_table(l0_phys);
+
+            let l0_entry = (*l0).entry(l0_idx);
+            if !l0_entry.is_valid() || !l0_entry.is_table() {
+                return Err(MapError::NotMapped);
+            }
+            let l1 = phys_to_virt_table(l0_entry.addr());
+
+            let l1_entry = (*l1).entry(l1_idx);
+            if !l1_entry.is_valid() || l1_entry.is_block() {
+                return Err(MapError::NotMapped);
+            }
+            let l2 = phys_to_virt_table(l1_entry.addr());
+
+            let l2_entry = (*l2).entry_mut(l2_idx);
+            if !l2_entry.is_valid() || !l2_entry.is_block() {
+                return Err(MapError::NotMapped);
+            }
+
+            // Get the huge page physical address and attributes
+            let huge_phys = l2_entry.addr();
+            let old_attrs = l2_entry.attrs();
+
+            // Convert block attributes to page attributes
+            // Block and page descriptors use the same attribute bits
+            let page_attrs = old_attrs & !0b11; // Clear descriptor type bits
+
+            // Allocate a new L3 table
+            let l3_phys = frame_alloc
+                .alloc_frame()
+                .ok_or(MapError::FrameAllocationFailed)?;
+            let l3 = phys_to_virt_table(l3_phys);
+
+            // Fill the L3 with 512 page entries pointing to consecutive 4KB pages
+            for i in 0..512 {
+                let page_phys = huge_phys + (i as u64 * PAGE_SIZE);
+                (*l3).entry_mut(i).set_page(page_phys, page_attrs);
+            }
+
+            // Update L2 entry to point to the new L3 table
+            l2_entry.set_table(l3_phys);
+
+            // Clean the data cache for the L2 entry and all L3 entries
+            let l2_entry_addr = l2_entry as *mut PageTableEntry as u64;
+            asm!(
+                "dc cvau, {}",
+                in(reg) l2_entry_addr,
+                options(nostack)
+            );
+
+            // Clean cache for all L3 entries
+            for i in 0..512 {
+                let l3_entry_addr = (*l3).entry(i) as *const PageTableEntry as u64;
+                asm!(
+                    "dc cvau, {}",
+                    in(reg) l3_entry_addr,
+                    options(nostack)
+                );
+            }
+
+            asm!("dsb ish", options(nostack));
+
+            // Flush entire TLB - splitting affects many addresses
+            flush_tlb_all();
+
+            Ok(huge_phys)
+        }
+    }
+
+    /// Check if a virtual address is mapped as a 2MB huge page
+    ///
+    /// # Arguments
+    /// * `l0_phys` - Physical address of the L0 (root) table
+    /// * `va` - Virtual address to check
+    ///
+    /// # Returns
+    /// Some((phys_addr, attrs)) if mapped as huge page, None otherwise
+    /// The phys_addr is the 2MB-aligned base address of the huge page
+    pub fn is_huge_page_mapped(l0_phys: u64, va: u64) -> Option<(u64, u64)> {
+        let (l0_idx, l1_idx, l2_idx, _l3_idx) = page_indices(va);
+
+        unsafe {
+            let l0 = phys_to_virt_table_const(l0_phys);
+
+            let l0_entry = (*l0).entry(l0_idx);
+            if !l0_entry.is_valid() || !l0_entry.is_table() {
+                return None;
+            }
+            let l1 = phys_to_virt_table_const(l0_entry.addr());
+
+            let l1_entry = (*l1).entry(l1_idx);
+            if !l1_entry.is_valid() || l1_entry.is_block() {
+                return None;
+            }
+            let l2 = phys_to_virt_table_const(l1_entry.addr());
+
+            let l2_entry = (*l2).entry(l2_idx);
+            if !l2_entry.is_valid() || !l2_entry.is_block() {
+                return None;
+            }
+
+            Some((l2_entry.addr(), l2_entry.attrs()))
+        }
     }
 }

@@ -19,8 +19,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::error::KernelError;
 use crate::task::Pid;
 
-use super::subsys::{CgroupSubsysOps, ControlFile, ControllerType, CssPrivate};
 use super::CgroupSubsysState;
+use super::subsys::{CgroupSubsysOps, ControlFile, ControllerType, CssPrivate};
 
 /// Sentinel value for unlimited pids
 pub const PIDS_MAX_UNLIMITED: u64 = u64::MAX;
@@ -235,9 +235,7 @@ fn pids_max_write(css: &CgroupSubsysState, data: &[u8]) -> Result<(), KernelErro
         let max = if trimmed == "max" {
             PIDS_MAX_UNLIMITED
         } else {
-            trimmed
-                .parse()
-                .map_err(|_| KernelError::InvalidArgument)?
+            trimmed.parse().map_err(|_| KernelError::InvalidArgument)?
         };
 
         state.set_max(max);

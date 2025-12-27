@@ -10,13 +10,14 @@ use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
 use super::{
-    MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE, MADV_NORMAL,
-    MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE,
-    MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
-    MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC, MS_INVALIDATE, MS_SYNC, PAGE_SIZE,
-    PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, VM_DONTCOPY, VM_DONTDUMP, VM_GROWSDOWN,
-    VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_RAND_READ, VM_SEQ_READ, VM_SHARED, Vma,
-    anon_vma::AnonVma, create_default_mm, get_task_mm, init_task_mm,
+    MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE,
+    MADV_HUGEPAGE, MADV_NOHUGEPAGE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED,
+    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK,
+    MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE,
+    MS_ASYNC, MS_INVALIDATE, MS_SYNC, PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ,
+    PROT_WRITE, VM_DONTCOPY, VM_DONTDUMP, VM_GROWSDOWN, VM_HUGEPAGE, VM_LOCKED, VM_LOCKED_MASK,
+    VM_LOCKONFAULT, VM_NOHUGEPAGE, VM_RAND_READ, VM_SEQ_READ, VM_SHARED, Vma, anon_vma::AnonVma,
+    create_default_mm, get_task_mm, init_task_mm,
 };
 use crate::error::KernelError;
 
@@ -319,6 +320,7 @@ pub fn sys_munmap(addr: u64, length: u64) -> i64 {
 /// This handles the actual page table manipulation and frame freeing.
 /// Also updates page descriptors and LRU lists for swap support.
 fn unmap_vma_pages(vmas: &[Vma], unmap_start: u64, unmap_end: u64) {
+    use crate::mm::huge_page::HUGE_PAGE_SIZE;
     use crate::mm::lru::lru_remove;
     use crate::mm::rmap::page_remove_rmap;
 
@@ -340,6 +342,34 @@ fn unmap_vma_pages(vmas: &[Vma], unmap_start: u64, unmap_end: u64) {
 
             let mut page = start;
             while page < end {
+                // Check if this page is part of a huge page
+                if let Some((huge_base, _phys)) = X86_64PageTable::is_huge_page_mapped(cr3, page) {
+                    // Check if we're unmapping the entire 2MB region
+                    let huge_end = huge_base + HUGE_PAGE_SIZE;
+                    if start <= huge_base && end >= huge_end {
+                        // Unmapping entire huge page - unmap directly
+                        if let Some(phys) = X86_64PageTable::unmap_huge_page(cr3, huge_base) {
+                            if vma.is_anon_private() {
+                                page_remove_rmap(phys);
+                                lru_remove(phys);
+                            }
+                            FRAME_ALLOCATOR.decref_huge(phys);
+                        }
+                        page = huge_end;
+                        continue;
+                    } else {
+                        // Partial unmap - split the huge page first
+                        if X86_64PageTable::split_huge_page(cr3, huge_base, &mut &FRAME_ALLOCATOR)
+                            .is_ok()
+                        {
+                            // After splitting, the huge page's physical memory is now tracked
+                            // as 512 individual 4KB pages. The split function already set up
+                            // the refcounts. Continue with normal 4KB unmapping.
+                        }
+                        // Continue to unmap individual 4KB pages
+                    }
+                }
+
                 // Try to unmap this page
                 if let Some(phys) = X86_64PageTable::unmap_page(cr3, page) {
                     // Update page descriptor and LRU for anonymous pages
@@ -373,6 +403,32 @@ fn unmap_vma_pages(vmas: &[Vma], unmap_start: u64, unmap_end: u64) {
 
             let mut page = start;
             while page < end {
+                // Check if this page is part of a huge page
+                if let Some((huge_base, _phys)) =
+                    Aarch64PageTable::is_huge_page_mapped(pt_phys, page)
+                {
+                    let huge_end = huge_base + HUGE_PAGE_SIZE;
+                    if start <= huge_base && end >= huge_end {
+                        // Unmapping entire huge page
+                        if let Some(phys) = Aarch64PageTable::unmap_huge_page(pt_phys, huge_base) {
+                            if vma.is_anon_private() {
+                                page_remove_rmap(phys);
+                                lru_remove(phys);
+                            }
+                            FRAME_ALLOCATOR.decref_huge(phys);
+                        }
+                        page = huge_end;
+                        continue;
+                    } else {
+                        // Partial unmap - split first
+                        let _ = Aarch64PageTable::split_huge_page(
+                            pt_phys,
+                            huge_base,
+                            &mut &FRAME_ALLOCATOR,
+                        );
+                    }
+                }
+
                 if let Some(phys) = Aarch64PageTable::unmap_page(pt_phys, page) {
                     // Update page descriptor and LRU for anonymous pages
                     if vma.is_anon_private() {
@@ -392,6 +448,8 @@ fn unmap_vma_pages(vmas: &[Vma], unmap_start: u64, unmap_end: u64) {
 /// Unlike unmap_vma_pages, this directly unmaps pages in a range
 /// without requiring VMA information.
 fn unmap_pages_range(start: u64, end: u64) {
+    use crate::mm::huge_page::HUGE_PAGE_SIZE;
+
     #[cfg(target_arch = "x86_64")]
     {
         use crate::FRAME_ALLOCATOR;
@@ -404,6 +462,22 @@ fn unmap_pages_range(start: u64, end: u64) {
 
         let mut page = start;
         while page < end {
+            // Check for huge page
+            if let Some((huge_base, _phys)) = X86_64PageTable::is_huge_page_mapped(cr3, page) {
+                let huge_end = huge_base + HUGE_PAGE_SIZE;
+                if start <= huge_base && end >= huge_end {
+                    // Unmapping entire huge page
+                    if let Some(phys) = X86_64PageTable::unmap_huge_page(cr3, huge_base) {
+                        FRAME_ALLOCATOR.decref_huge(phys);
+                    }
+                    page = huge_end;
+                    continue;
+                } else {
+                    // Partial unmap - split first
+                    let _ = X86_64PageTable::split_huge_page(cr3, huge_base, &mut &FRAME_ALLOCATOR);
+                }
+            }
+
             if let Some(phys) = X86_64PageTable::unmap_page(cr3, page) {
                 FRAME_ALLOCATOR.decref(phys);
             }
@@ -424,6 +498,26 @@ fn unmap_pages_range(start: u64, end: u64) {
 
         let mut page = start;
         while page < end {
+            // Check for huge page
+            if let Some((huge_base, _phys)) = Aarch64PageTable::is_huge_page_mapped(pt_phys, page) {
+                let huge_end = huge_base + HUGE_PAGE_SIZE;
+                if start <= huge_base && end >= huge_end {
+                    // Unmapping entire huge page
+                    if let Some(phys) = Aarch64PageTable::unmap_huge_page(pt_phys, huge_base) {
+                        FRAME_ALLOCATOR.decref_huge(phys);
+                    }
+                    page = huge_end;
+                    continue;
+                } else {
+                    // Partial unmap - split first
+                    let _ = Aarch64PageTable::split_huge_page(
+                        pt_phys,
+                        huge_base,
+                        &mut &FRAME_ALLOCATOR,
+                    );
+                }
+            }
+
             if let Some(phys) = Aarch64PageTable::unmap_page(pt_phys, page) {
                 FRAME_ALLOCATOR.decref(phys);
             }
@@ -1353,12 +1447,39 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     let writable = prot & PROT_WRITE != 0;
     let executable = prot & super::PROT_EXEC != 0;
 
+    use crate::FRAME_ALLOCATOR;
+    use crate::mm::huge_page::HUGE_PAGE_SIZE;
+
     for (update_start, update_end, _old_prot) in vmas_to_update {
         let mut page = update_start;
         while page < update_end {
             #[cfg(target_arch = "x86_64")]
             {
                 use crate::arch::x86_64::paging::X86_64PageTable;
+
+                // Check if this page is part of a huge page
+                if let Some((huge_base, _)) = X86_64PageTable::is_huge_page_mapped(pt_root, page) {
+                    let huge_end = huge_base + HUGE_PAGE_SIZE;
+
+                    // Check if we're updating the entire huge page
+                    if update_start <= huge_base && update_end >= huge_end {
+                        // Update the entire huge page protection
+                        X86_64PageTable::update_huge_page_protection(
+                            pt_root, huge_base, writable, executable,
+                        );
+                        page = huge_end;
+                        continue;
+                    } else {
+                        // Partial update - split the huge page first
+                        let _ = X86_64PageTable::split_huge_page(
+                            pt_root,
+                            huge_base,
+                            &mut &FRAME_ALLOCATOR,
+                        );
+                        // Continue with normal 4KB page updates
+                    }
+                }
+
                 // Only update if the page is actually mapped
                 X86_64PageTable::update_page_protection(pt_root, page, writable, executable);
             }
@@ -1366,6 +1487,30 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
             #[cfg(target_arch = "aarch64")]
             {
                 use crate::arch::aarch64::paging::Aarch64PageTable;
+
+                // Check if this page is part of a huge page
+                if let Some((huge_base, _)) = Aarch64PageTable::is_huge_page_mapped(pt_root, page) {
+                    let huge_end = huge_base + HUGE_PAGE_SIZE;
+
+                    // Check if we're updating the entire huge page
+                    if update_start <= huge_base && update_end >= huge_end {
+                        // Update the entire huge page protection
+                        Aarch64PageTable::update_huge_page_protection(
+                            pt_root, huge_base, writable, executable,
+                        );
+                        page = huge_end;
+                        continue;
+                    } else {
+                        // Partial update - split the huge page first
+                        let _ = Aarch64PageTable::split_huge_page(
+                            pt_root,
+                            huge_base,
+                            &mut &FRAME_ALLOCATOR,
+                        );
+                        // Continue with normal 4KB page updates
+                    }
+                }
+
                 // Only update if the page is actually mapped
                 Aarch64PageTable::update_page_protection(pt_root, page, writable, executable);
             }
@@ -1498,7 +1643,7 @@ pub fn sys_madvise(addr: u64, length: u64, advice: i32) -> i64 {
 
     match advice {
         MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_DONTFORK | MADV_DOFORK
-        | MADV_DONTDUMP | MADV_DODUMP => {
+        | MADV_DONTDUMP | MADV_DODUMP | MADV_HUGEPAGE | MADV_NOHUGEPAGE => {
             // These advices just update VMA flags
             madvise_update_vma_flags(&mm, addr, end, advice)
         }
@@ -1565,6 +1710,14 @@ fn madvise_update_vma_flags(
             MADV_DODUMP => {
                 // Clear don't include in core dumps
                 vma.flags &= !VM_DONTDUMP;
+            }
+            MADV_HUGEPAGE => {
+                // Enable transparent huge pages for this VMA
+                vma.flags = (vma.flags & !VM_NOHUGEPAGE) | VM_HUGEPAGE;
+            }
+            MADV_NOHUGEPAGE => {
+                // Disable transparent huge pages for this VMA
+                vma.flags = (vma.flags & !VM_HUGEPAGE) | VM_NOHUGEPAGE;
             }
             _ => {}
         }

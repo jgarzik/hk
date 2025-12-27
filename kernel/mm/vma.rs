@@ -90,6 +90,14 @@ pub const VM_DONTCOPY: u32 = 0x0040_0000;
 /// VMA should not be included in core dumps (madvise MADV_DONTDUMP)
 pub const VM_DONTDUMP: u32 = 0x0080_0000;
 
+/// VMA explicitly allows transparent huge pages (madvise MADV_HUGEPAGE)
+/// When set, the kernel will try to use 2MB pages for this VMA
+pub const VM_HUGEPAGE: u32 = 0x0100_0000;
+
+/// VMA explicitly prohibits transparent huge pages (madvise MADV_NOHUGEPAGE)
+/// When set, the kernel will never use huge pages for this VMA
+pub const VM_NOHUGEPAGE: u32 = 0x0200_0000;
+
 // ============================================================================
 // msync flags (MS_*)
 // ============================================================================
@@ -136,6 +144,14 @@ pub const MADV_DONTDUMP: i32 = 16;
 
 /// MADV_DODUMP - Include in core dumps (undo MADV_DONTDUMP)
 pub const MADV_DODUMP: i32 = 17;
+
+/// MADV_HUGEPAGE - Mark region as suitable for transparent huge pages
+/// Linux value from include/uapi/asm-generic/mman-common.h
+pub const MADV_HUGEPAGE: i32 = 14;
+
+/// MADV_NOHUGEPAGE - Mark region as unsuitable for transparent huge pages
+/// Linux value from include/uapi/asm-generic/mman-common.h
+pub const MADV_NOHUGEPAGE: i32 = 15;
 
 // ============================================================================
 // mremap flags (MREMAP_*)
@@ -350,5 +366,39 @@ impl Vma {
     /// Set the anon_vma for this VMA
     pub fn set_anon_vma(&mut self, anon_vma: Arc<AnonVma>) {
         self.anon_vma = Some(anon_vma);
+    }
+
+    // =========================================================================
+    // Transparent Huge Page (THP) support
+    // =========================================================================
+
+    /// Check if this VMA is eligible for transparent huge pages
+    ///
+    /// A VMA is THP-eligible if:
+    /// - It is anonymous and private (not file-backed, not shared)
+    /// - VM_NOHUGEPAGE is not set
+    /// - VM_HUGEPAGE is set (we currently require explicit opt-in)
+    ///
+    /// For now we require MADV_HUGEPAGE to enable THP (madvise mode).
+    /// This is safer than always-on THP and matches typical Linux deployments.
+    #[inline]
+    pub fn is_thp_eligible(&self) -> bool {
+        self.is_anon_private() && !self.prohibits_hugepage() && self.wants_hugepage()
+    }
+
+    /// Check if this VMA explicitly wants transparent huge pages
+    ///
+    /// Returns true if MADV_HUGEPAGE was called on this VMA.
+    #[inline]
+    pub fn wants_hugepage(&self) -> bool {
+        self.flags & VM_HUGEPAGE != 0
+    }
+
+    /// Check if this VMA explicitly prohibits transparent huge pages
+    ///
+    /// Returns true if MADV_NOHUGEPAGE was called on this VMA.
+    #[inline]
+    pub fn prohibits_hugepage(&self) -> bool {
+        self.flags & VM_NOHUGEPAGE != 0
     }
 }

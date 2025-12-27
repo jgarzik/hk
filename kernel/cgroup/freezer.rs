@@ -18,8 +18,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::error::KernelError;
 use crate::task::Pid;
 
-use super::subsys::{CgroupSubsysOps, ControlFile, ControllerType, CssPrivate};
 use super::CgroupSubsysState;
+use super::subsys::{CgroupSubsysOps, ControlFile, ControllerType, CssPrivate};
 
 /// Per-cgroup freezer state
 pub struct FreezerState {

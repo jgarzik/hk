@@ -29,6 +29,7 @@ pub mod vfs;
 // Re-exports for convenience
 pub use crate::error::KernelError;
 pub use blkdev_ops::BLOCK_FILE_OPS;
+pub use cgroupfs::{CGROUPFS_FILE_OPS, CGROUPFS_TYPE};
 pub use cpio::unpack_cpio;
 pub use dentry::{DCACHE, Dentry, DentryCache, is_subdir};
 pub use file::{CHAR_FILE_OPS, DirEntry, File, FileOps, RwFlags, flags, seek};
@@ -43,7 +44,6 @@ pub use path::{
     lookup_path, lookup_path_at, lookup_path_flags,
 };
 pub use path_ref::Path;
-pub use cgroupfs::{CGROUPFS_FILE_OPS, CGROUPFS_TYPE};
 pub use procfs::{
     NamespaceType, PROCFS_FILE_OPS, PROCFS_TYPE, ProcfsInodeData, ProcfsInodeWrapper,
 };

@@ -17,7 +17,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use spin::Lazy;
 
-use crate::cgroup::{Cgroup, CGROUP_ROOT};
+use crate::cgroup::{CGROUP_ROOT, Cgroup};
 
 /// Cgroup namespace
 ///
@@ -115,5 +115,4 @@ fn create_placeholder_root() -> Arc<Cgroup> {
 }
 
 /// Initial (root) cgroup namespace
-pub static INIT_CGROUP_NS: Lazy<Arc<CgroupNamespace>> =
-    Lazy::new(CgroupNamespace::new_init);
+pub static INIT_CGROUP_NS: Lazy<Arc<CgroupNamespace>> = Lazy::new(CgroupNamespace::new_init);
