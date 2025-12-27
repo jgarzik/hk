@@ -609,6 +609,9 @@ pub fn mark_zombie(tid: Tid, status: i32) {
     // Notify any pidfds watching this process (after releasing TASK_TABLE lock)
     if let Some(p) = pid {
         crate::pidfd::notify_process_exit(p, status);
+
+        // Write accounting record if process accounting is enabled
+        crate::acct::write_acct_record(tid, p, status);
     }
 }
 

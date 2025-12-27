@@ -161,6 +161,12 @@ pub const SYS_INOTIFY_ADD_WATCH: u64 = 27;
 /// inotify_rm_watch(fd, wd)
 pub const SYS_INOTIFY_RM_WATCH: u64 = 28;
 
+// fanotify syscalls (Section 9.2)
+/// fanotify_init(flags, event_f_flags)
+pub const SYS_FANOTIFY_INIT: u64 = 262;
+/// fanotify_mark(fanotify_fd, flags, mask, dirfd, pathname)
+pub const SYS_FANOTIFY_MARK: u64 = 263;
+
 // epoll syscalls (Section 9.1) - NOTE: aarch64 only has epoll_create1, not legacy epoll_create
 /// epoll_create1(flags)
 pub const SYS_EPOLL_CREATE1: u64 = 20;
@@ -323,6 +329,8 @@ pub const SYS_GETRUSAGE: u64 = 165;
 pub const SYS_SYSINFO: u64 = 179;
 /// getrandom(buf, buflen, flags)
 pub const SYS_GETRANDOM: u64 = 278;
+/// acct(filename) - Enable/disable process accounting
+pub const SYS_ACCT: u64 = 89;
 /// statx(dirfd, pathname, flags, mask, statxbuf)
 pub const SYS_STATX: u64 = 291;
 
@@ -766,6 +774,13 @@ pub fn aarch64_syscall_dispatch(
             crate::inotify::sys_inotify_rm_watch(arg0 as i32, arg1 as i32) as u64
         }
 
+        // fanotify syscalls (Section 9.2)
+        SYS_FANOTIFY_INIT => crate::fanotify::sys_fanotify_init(arg0 as u32, arg1 as u32) as u64,
+        SYS_FANOTIFY_MARK => {
+            crate::fanotify::sys_fanotify_mark(arg0 as i32, arg1 as u32, arg2, arg3 as i32, arg4)
+                as u64
+        }
+
         // epoll syscalls (Section 9.1)
         SYS_EPOLL_CREATE1 => crate::epoll::sys_epoll_create1(arg0 as i32) as u64,
         SYS_EPOLL_CTL => {
@@ -1035,6 +1050,7 @@ pub fn aarch64_syscall_dispatch(
             use crate::task::syscall::sys_getrandom;
             sys_getrandom::<Uaccess>(arg0, arg1 as usize, arg2 as u32) as u64
         }
+        SYS_ACCT => crate::acct::sys_acct(arg0) as u64,
 
         // Resource limits
         SYS_GETRLIMIT => crate::rlimit::sys_getrlimit(arg0 as u32, arg1) as u64,

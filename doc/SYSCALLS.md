@@ -321,8 +321,8 @@ Linux groups the socket syscalls as their own "network" category.
 - [x] inotify_init1
 - [x] inotify_add_watch
 - [x] inotify_rm_watch
-- [ ] fanotify_init
-- [ ] fanotify_mark
+- [x] fanotify_init
+- [x] fanotify_mark
 
 9.3 io_uring (modern async I/O)
 
@@ -398,7 +398,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 - [x] reboot
 - [ ] kexec_load
 - [x] syslog
-- [ ] acct
+- [x] acct
 - [ ] swapon
 - [ ] swapoff
 - [ ] sysfs (legacy)
