@@ -744,10 +744,8 @@ fn try_huge_page_fault(
     }
 
     // Try to allocate a contiguous 2MB physical region
-    let huge_frame = match crate::FRAME_ALLOCATOR.alloc_huge() {
-        Some(f) => f,
-        None => return None, // No contiguous memory - fall back to 4KB
-    };
+    // Falls back to 4KB allocation if no contiguous memory available
+    let huge_frame = crate::FRAME_ALLOCATOR.alloc_huge()?;
 
     // Zero the 2MB region
     unsafe {
@@ -862,19 +860,19 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
     }
 
     // Try THP (Transparent Huge Page) allocation for eligible VMAs
-    if vma_is_thp_eligible {
-        if let Some(result) = try_huge_page_fault(
+    if vma_is_thp_eligible
+        && let Some(result) = try_huge_page_fault(
             cr3,
             fault_addr,
             vma_start,
             vma_end,
             vma_prot,
             vma_anon_vma.as_ref(),
-        ) {
-            return Some(result);
-        }
-        // Fall through to 4KB allocation if THP failed
+        )
+    {
+        return Some(result);
     }
+    // Fall through to 4KB allocation if THP failed
 
     // Allocate a physical frame
     let frame = match crate::FRAME_ALLOCATOR.alloc() {

@@ -11,6 +11,7 @@
 //! - `pids.events`: Read-only event counter ("max N")
 
 use alloc::format;
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -216,7 +217,7 @@ fn pids_max_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
     if let Some(state) = css.private_as::<PidsState>() {
         let max = state.max();
         let content = if max == PIDS_MAX_UNLIMITED {
-            format!("max\n")
+            "max\n".to_string()
         } else {
             format!("{}\n", max)
         };

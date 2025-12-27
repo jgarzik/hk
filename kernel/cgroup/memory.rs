@@ -13,6 +13,7 @@
 //! - `memory.events`: OOM and limit events
 
 use alloc::format;
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -55,8 +56,6 @@ pub struct MemoryState {
     shmem: AtomicU64,
 
     /// Events
-    events_low: AtomicU64,
-    events_high: AtomicU64,
     events_max: AtomicU64,
     events_oom: AtomicU64,
     events_oom_kill: AtomicU64,
@@ -75,8 +74,6 @@ impl MemoryState {
             file: AtomicU64::new(0),
             kernel: AtomicU64::new(0),
             shmem: AtomicU64::new(0),
-            events_low: AtomicU64::new(0),
-            events_high: AtomicU64::new(0),
             events_max: AtomicU64::new(0),
             events_oom: AtomicU64::new(0),
             events_oom_kill: AtomicU64::new(0),
@@ -271,7 +268,7 @@ fn memory_max_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
     if let Some(state) = css.private_as::<MemoryState>() {
         let max = state.max();
         let content = if max == MEMORY_MAX_UNLIMITED {
-            format!("max\n")
+            "max\n".to_string()
         } else {
             format!("{}\n", max)
         };
@@ -373,23 +370,21 @@ fn memory_events_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
 
 /// Try to charge memory for a task's cgroup
 pub fn try_charge_memory(pid: Pid, bytes: u64, mem_type: MemType) -> Result<(), KernelError> {
-    if let Some(cgroup) = super::get_task_cgroup(pid) {
-        if let Some(css) = cgroup.css(ControllerType::Memory) {
-            if let Some(state) = css.private_as::<MemoryState>() {
-                return state.try_charge(bytes, mem_type);
-            }
-        }
+    if let Some(cgroup) = super::get_task_cgroup(pid)
+        && let Some(css) = cgroup.css(ControllerType::Memory)
+        && let Some(state) = css.private_as::<MemoryState>()
+    {
+        return state.try_charge(bytes, mem_type);
     }
     Ok(())
 }
 
 /// Uncharge memory for a task's cgroup
 pub fn uncharge_memory(pid: Pid, bytes: u64, mem_type: MemType) {
-    if let Some(cgroup) = super::get_task_cgroup(pid) {
-        if let Some(css) = cgroup.css(ControllerType::Memory) {
-            if let Some(state) = css.private_as::<MemoryState>() {
-                state.uncharge(bytes, mem_type);
-            }
-        }
+    if let Some(cgroup) = super::get_task_cgroup(pid)
+        && let Some(css) = cgroup.css(ControllerType::Memory)
+        && let Some(state) = css.private_as::<MemoryState>()
+    {
+        state.uncharge(bytes, mem_type);
     }
 }

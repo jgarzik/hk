@@ -410,23 +410,21 @@ fn io_stat_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
 
 /// Try to acquire IO bandwidth for a task
 pub fn try_acquire_io(pid: Pid, dev: DevId, bytes: u64, is_write: bool, now_usec: u64) -> bool {
-    if let Some(cgroup) = super::get_task_cgroup(pid) {
-        if let Some(css) = cgroup.css(ControllerType::Io) {
-            if let Some(state) = css.private_as::<IoState>() {
-                return state.try_acquire(dev, bytes, is_write, now_usec);
-            }
-        }
+    if let Some(cgroup) = super::get_task_cgroup(pid)
+        && let Some(css) = cgroup.css(ControllerType::Io)
+        && let Some(state) = css.private_as::<IoState>()
+    {
+        return state.try_acquire(dev, bytes, is_write, now_usec);
     }
     true // No limits if not in a cgroup
 }
 
 /// Record IO for a task
 pub fn record_io(pid: Pid, dev: DevId, bytes: u64, is_write: bool) {
-    if let Some(cgroup) = super::get_task_cgroup(pid) {
-        if let Some(css) = cgroup.css(ControllerType::Io) {
-            if let Some(state) = css.private_as::<IoState>() {
-                state.record_io(dev, bytes, is_write);
-            }
-        }
+    if let Some(cgroup) = super::get_task_cgroup(pid)
+        && let Some(css) = cgroup.css(ControllerType::Io)
+        && let Some(state) = css.private_as::<IoState>()
+    {
+        state.record_io(dev, bytes, is_write);
     }
 }

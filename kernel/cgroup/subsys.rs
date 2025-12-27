@@ -129,6 +129,12 @@ pub trait CgroupSubsysOps: Send + Sync {
     fn control_files(&self) -> &'static [ControlFile];
 }
 
+/// Type alias for control file read callback
+pub type ControlFileReadFn = fn(&CgroupSubsysState) -> Result<Vec<u8>, KernelError>;
+
+/// Type alias for control file write callback
+pub type ControlFileWriteFn = fn(&CgroupSubsysState, &[u8]) -> Result<(), KernelError>;
+
 /// Control file descriptor for cgroupfs
 ///
 /// Defines a readable/writable control file in the cgroup directory.
@@ -140,18 +146,15 @@ pub struct ControlFile {
     pub mode: u16,
 
     /// Read callback: generate file content
-    pub read: Option<fn(&CgroupSubsysState) -> Result<Vec<u8>, KernelError>>,
+    pub read: Option<ControlFileReadFn>,
 
     /// Write callback: handle file write
-    pub write: Option<fn(&CgroupSubsysState, &[u8]) -> Result<(), KernelError>>,
+    pub write: Option<ControlFileWriteFn>,
 }
 
 impl ControlFile {
     /// Create a read-only control file
-    pub const fn read_only(
-        name: &'static str,
-        read: fn(&CgroupSubsysState) -> Result<Vec<u8>, KernelError>,
-    ) -> Self {
+    pub const fn read_only(name: &'static str, read: ControlFileReadFn) -> Self {
         Self {
             name,
             mode: 0o444,
@@ -163,8 +166,8 @@ impl ControlFile {
     /// Create a read-write control file
     pub const fn read_write(
         name: &'static str,
-        read: fn(&CgroupSubsysState) -> Result<Vec<u8>, KernelError>,
-        write: fn(&CgroupSubsysState, &[u8]) -> Result<(), KernelError>,
+        read: ControlFileReadFn,
+        write: ControlFileWriteFn,
     ) -> Self {
         Self {
             name,
@@ -175,10 +178,7 @@ impl ControlFile {
     }
 
     /// Create a write-only control file
-    pub const fn write_only(
-        name: &'static str,
-        write: fn(&CgroupSubsysState, &[u8]) -> Result<(), KernelError>,
-    ) -> Self {
+    pub const fn write_only(name: &'static str, write: ControlFileWriteFn) -> Self {
         Self {
             name,
             mode: 0o200,

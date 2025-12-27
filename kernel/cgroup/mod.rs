@@ -157,10 +157,10 @@ impl Cgroup {
             return false;
         }
         let ancestors = self.ancestors.read();
-        if let Some(ancestor) = ancestors.get(other.level as usize) {
-            if let Some(a) = ancestor.upgrade() {
-                return Arc::ptr_eq(&a, other);
-            }
+        if let Some(ancestor) = ancestors.get(other.level as usize)
+            && let Some(a) = ancestor.upgrade()
+        {
+            return Arc::ptr_eq(&a, other);
         }
         false
     }
@@ -280,10 +280,10 @@ impl Cgroup {
 
         let ancestors = self.ancestors.read();
         for ancestor in ancestors.iter().rev() {
-            if let Some(cg) = ancestor.upgrade() {
-                if cg.level > 0 {
-                    parts.push(cg.name.clone());
-                }
+            if let Some(cg) = ancestor.upgrade()
+                && cg.level > 0
+            {
+                parts.push(cg.name.clone());
             }
         }
 
@@ -483,11 +483,11 @@ pub fn find_css_set(
     let mut cache = CSS_SET_CACHE.lock();
 
     // Try to find existing CssSet with same hash
-    if let Some(weak) = cache.get(&hash) {
-        if let Some(css_set) = weak.upgrade() {
-            css_set.get();
-            return css_set;
-        }
+    if let Some(weak) = cache.get(&hash)
+        && let Some(css_set) = weak.upgrade()
+    {
+        css_set.get();
+        return css_set;
     }
 
     // Create new CssSet
@@ -515,6 +515,12 @@ pub struct CgroupRoot {
 
     /// Mount count (for reference tracking)
     mount_count: AtomicU32,
+}
+
+impl Default for CgroupRoot {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CgroupRoot {
@@ -629,12 +635,12 @@ pub fn cgroup_init() {
 
     // Initialize CSS for root cgroup for each controller
     for controller in root.registered_controllers() {
-        if let Some(ops) = root.get_controller(controller) {
-            if let Ok(private) = ops.css_alloc(None) {
-                let css = CgroupSubsysState::new(&root_cg, controller, 1, None);
-                css.set_private(private);
-                root_cg.set_css(controller, css);
-            }
+        if let Some(ops) = root.get_controller(controller)
+            && let Ok(private) = ops.css_alloc(None)
+        {
+            let css = CgroupSubsysState::new(&root_cg, controller, 1, None);
+            css.set_private(private);
+            root_cg.set_css(controller, css);
         }
     }
 }
@@ -650,20 +656,20 @@ pub fn cgroup_attach_task(target_cg: &Arc<Cgroup>, pid: Pid) -> Result<(), Kerne
 
     // Call can_attach on all controllers
     for controller in target_cg.enabled_controllers() {
-        if let Some(css) = target_cg.css(controller) {
-            if let Some(ops) = root.get_controller(controller) {
-                ops.can_attach(&css, pid)?;
-            }
+        if let Some(css) = target_cg.css(controller)
+            && let Some(ops) = root.get_controller(controller)
+        {
+            ops.can_attach(&css, pid)?;
         }
     }
 
     // Detach from old cgroup
     if let Some(ref old) = old_cg {
         for controller in old.enabled_controllers() {
-            if let Some(css) = old.css(controller) {
-                if let Some(ops) = root.get_controller(controller) {
-                    ops.detach(&css, pid);
-                }
+            if let Some(css) = old.css(controller)
+                && let Some(ops) = root.get_controller(controller)
+            {
+                ops.detach(&css, pid);
             }
         }
         old.remove_task(pid);
@@ -671,10 +677,10 @@ pub fn cgroup_attach_task(target_cg: &Arc<Cgroup>, pid: Pid) -> Result<(), Kerne
 
     // Attach to new cgroup
     for controller in target_cg.enabled_controllers() {
-        if let Some(css) = target_cg.css(controller) {
-            if let Some(ops) = root.get_controller(controller) {
-                ops.attach(&css, pid)?;
-            }
+        if let Some(css) = target_cg.css(controller)
+            && let Some(ops) = root.get_controller(controller)
+        {
+            ops.attach(&css, pid)?;
         }
     }
 
@@ -690,10 +696,10 @@ pub fn cgroup_exit_task(pid: Pid) {
 
     if let Some(cg) = remove_task_cgroup(pid) {
         for controller in cg.enabled_controllers() {
-            if let Some(css) = cg.css(controller) {
-                if let Some(ops) = root.get_controller(controller) {
-                    ops.exit(&css, pid);
-                }
+            if let Some(css) = cg.css(controller)
+                && let Some(ops) = root.get_controller(controller)
+            {
+                ops.exit(&css, pid);
             }
         }
         cg.remove_task(pid);
@@ -702,12 +708,11 @@ pub fn cgroup_exit_task(pid: Pid) {
 
 /// Check if a task can fork (pids controller check)
 pub fn cgroup_can_fork(pid: Pid) -> Result<(), KernelError> {
-    if let Some(cg) = get_task_cgroup(pid) {
-        if let Some(css) = cg.css(ControllerType::Pids) {
-            if let Some(ops) = CGROUP_ROOT.get_controller(ControllerType::Pids) {
-                return ops.can_fork(&css);
-            }
-        }
+    if let Some(cg) = get_task_cgroup(pid)
+        && let Some(css) = cg.css(ControllerType::Pids)
+        && let Some(ops) = CGROUP_ROOT.get_controller(ControllerType::Pids)
+    {
+        return ops.can_fork(&css);
     }
     Ok(())
 }
@@ -718,10 +723,10 @@ pub fn cgroup_fork(parent_pid: Pid, child_pid: Pid) -> Result<(), KernelError> {
     if let Some(cg) = get_task_cgroup(parent_pid) {
         // Call fork on all controllers
         for controller in cg.enabled_controllers() {
-            if let Some(css) = cg.css(controller) {
-                if let Some(ops) = CGROUP_ROOT.get_controller(controller) {
-                    ops.fork(&css, child_pid)?;
-                }
+            if let Some(css) = cg.css(controller)
+                && let Some(ops) = CGROUP_ROOT.get_controller(controller)
+            {
+                ops.fork(&css, child_pid)?;
             }
         }
 
@@ -746,16 +751,15 @@ pub fn cgroup_mkdir(parent: &Arc<Cgroup>, name: &str) -> Result<Arc<Cgroup>, Ker
 
     // Initialize CSS for controllers enabled in parent's subtree_control
     for controller in root.registered_controllers() {
-        if parent.subtree_control_enabled(controller) {
-            if let Some(ops) = root.get_controller(controller) {
-                let parent_css = parent.css(controller);
-                if let Ok(private) = ops.css_alloc(parent_css.as_ref()) {
-                    let css_id = root.alloc_cg_id(); // Reuse cg_id allocator for css_id
-                    let css =
-                        CgroupSubsysState::new(&new_cg, controller, css_id, parent_css.as_ref());
-                    css.set_private(private);
-                    new_cg.set_css(controller, css);
-                }
+        if parent.subtree_control_enabled(controller)
+            && let Some(ops) = root.get_controller(controller)
+        {
+            let parent_css = parent.css(controller);
+            if let Ok(private) = ops.css_alloc(parent_css.as_ref()) {
+                let css_id = root.alloc_cg_id(); // Reuse cg_id allocator for css_id
+                let css = CgroupSubsysState::new(&new_cg, controller, css_id, parent_css.as_ref());
+                css.set_private(private);
+                new_cg.set_css(controller, css);
             }
         }
     }
@@ -778,10 +782,10 @@ pub fn cgroup_rmdir(parent: &Arc<Cgroup>, name: &str) -> Result<(), KernelError>
     // Cleanup CSS for all controllers
     let root = CGROUP_ROOT.clone();
     for controller in child.enabled_controllers() {
-        if let Some(css) = child.remove_css(controller) {
-            if let Some(ops) = root.get_controller(controller) {
-                ops.css_free(&css);
-            }
+        if let Some(css) = child.remove_css(controller)
+            && let Some(ops) = root.get_controller(controller)
+        {
+            ops.css_free(&css);
         }
     }
 
@@ -802,10 +806,10 @@ use crate::task::Tid;
 /// Returns true if fork is allowed, false if pids.max limit would be exceeded.
 pub fn pids_can_fork(cgroup: &Arc<Cgroup>) -> bool {
     // Check pids controller if enabled
-    if let Some(css) = cgroup.css(ControllerType::Pids) {
-        if let Some(ops) = CGROUP_ROOT.get_controller(ControllerType::Pids) {
-            return ops.can_fork(&css).is_ok();
-        }
+    if let Some(css) = cgroup.css(ControllerType::Pids)
+        && let Some(ops) = CGROUP_ROOT.get_controller(ControllerType::Pids)
+    {
+        return ops.can_fork(&css).is_ok();
     }
     // No pids controller enabled - allow fork
     true

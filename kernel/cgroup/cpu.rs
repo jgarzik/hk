@@ -332,7 +332,7 @@ fn cpu_weight_write(css: &CgroupSubsysState, data: &[u8]) -> Result<(), KernelEr
         let s = core::str::from_utf8(data).map_err(|_| KernelError::InvalidArgument)?;
         let weight: u64 = s.trim().parse().map_err(|_| KernelError::InvalidArgument)?;
 
-        if weight < CPU_WEIGHT_MIN || weight > CPU_WEIGHT_MAX {
+        if !(CPU_WEIGHT_MIN..=CPU_WEIGHT_MAX).contains(&weight) {
             return Err(KernelError::InvalidArgument);
         }
 
@@ -368,23 +368,21 @@ fn cpu_stat_read(css: &CgroupSubsysState) -> Result<Vec<u8>, KernelError> {
 
 /// Check if a task is CPU throttled
 pub fn task_cpu_throttled(pid: Pid) -> bool {
-    if let Some(cgroup) = super::get_task_cgroup(pid) {
-        if let Some(css) = cgroup.css(ControllerType::Cpu) {
-            if let Some(state) = css.private_as::<CpuState>() {
-                return state.is_throttled();
-            }
-        }
+    if let Some(cgroup) = super::get_task_cgroup(pid)
+        && let Some(css) = cgroup.css(ControllerType::Cpu)
+        && let Some(state) = css.private_as::<CpuState>()
+    {
+        return state.is_throttled();
     }
     false
 }
 
 /// Charge CPU time for a task
 pub fn charge_cpu_time(pid: Pid, usec: u64, is_user: bool) {
-    if let Some(cgroup) = super::get_task_cgroup(pid) {
-        if let Some(css) = cgroup.css(ControllerType::Cpu) {
-            if let Some(state) = css.private_as::<CpuState>() {
-                state.charge_usage(usec, is_user);
-            }
-        }
+    if let Some(cgroup) = super::get_task_cgroup(pid)
+        && let Some(css) = cgroup.css(ControllerType::Cpu)
+        && let Some(state) = css.private_as::<CpuState>()
+    {
+        state.charge_usage(usec, is_user);
     }
 }

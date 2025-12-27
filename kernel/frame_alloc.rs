@@ -13,9 +13,6 @@ use crate::arch::IrqSpinlock;
 /// Page/frame size (4KB)
 pub const FRAME_SIZE: usize = 4096;
 
-/// Huge page size (2MB = 512 * 4KB)
-pub const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
-
 /// Number of 4KB frames per 2MB huge page
 pub const FRAMES_PER_HUGE_PAGE: usize = 512;
 
