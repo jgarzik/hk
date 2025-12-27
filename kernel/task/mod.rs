@@ -109,6 +109,9 @@ pub type Uid = u32;
 /// Group ID type (Linux-compatible)
 pub type Gid = u32;
 
+/// Magic value to detect corrupted/freed Task structs ("TASKMAGI" in ASCII)
+pub const TASK_MAGIC: u64 = 0x5441534B_4D414749;
+
 /// Task credentials (Linux-compatible model)
 ///
 /// Linux has multiple credential sets: real, effective, saved, filesystem.
@@ -777,6 +780,8 @@ impl<F> Default for FdTable<F> {
 
 /// A task (thread or process)
 pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
+    /// Magic number for validation (must be TASK_MAGIC)
+    pub magic: u64,
     /// Process ID
     pub pid: Pid,
     /// Thread ID

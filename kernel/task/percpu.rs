@@ -384,6 +384,7 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
     // Create the task structure
     // Idle task: ppid=0 (no parent), pgid=pid (own group), sid=pid (own session)
     let task = Task {
+        magic: crate::task::TASK_MAGIC,
         pid,
         tid,
         ppid: 0,
@@ -486,6 +487,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
 
     // Create Task entry
     let task = Task {
+        magic: crate::task::TASK_MAGIC,
         pid: config.pid,
         tid: config.tid,
         ppid: config.ppid,
@@ -944,6 +946,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Create child task
     let child_task = Task {
+        magic: crate::task::TASK_MAGIC,
         pid: child_pid,
         tid: child_tid,
         ppid: child_ppid,
