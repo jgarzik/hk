@@ -70,8 +70,11 @@ pub fn sys_clone(
     let parent_rflags = get_syscall_user_rflags();
     let parent_rsp = get_syscall_user_rsp();
 
+    // Extract exit_signal from low 8 bits of flags (CSIGNAL mask = 0xff)
+    let exit_signal = (flags & 0xff) as i32;
+
     let config = CloneConfig {
-        flags,
+        flags: flags & !0xff, // Remove signal bits from flags
         child_stack,
         parent_rip,
         parent_rflags,
@@ -80,6 +83,7 @@ pub fn sys_clone(
         child_tidptr,
         tls,
         pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
+        exit_signal,
     };
 
     // Get frame allocator
@@ -111,8 +115,11 @@ pub fn sys_clone(
     let parent_rflags = Aarch64Arch::get_syscall_user_rflags();
     let parent_rsp = Aarch64Arch::get_syscall_user_rsp();
 
+    // Extract exit_signal from low 8 bits of flags (CSIGNAL mask = 0xff)
+    let exit_signal = (flags & 0xff) as i32;
+
     let config = CloneConfig {
-        flags,
+        flags: flags & !0xff, // Remove signal bits from flags
         child_stack,
         parent_rip,
         parent_rflags,
@@ -121,6 +128,7 @@ pub fn sys_clone(
         child_tidptr,
         tls,
         pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
+        exit_signal,
     };
 
     // Get frame allocator
@@ -166,6 +174,7 @@ pub fn sys_fork() -> i64 {
         child_tidptr: 0,
         tls: 0,
         pidfd_ptr: 0,
+        exit_signal: crate::signal::SIGCHLD as i32, // fork sends SIGCHLD on exit
     };
 
     // Get frame allocator
@@ -202,6 +211,7 @@ pub fn sys_fork() -> i64 {
         child_tidptr: 0,
         tls: 0,
         pidfd_ptr: 0,
+        exit_signal: crate::signal::SIGCHLD as i32, // fork sends SIGCHLD on exit
     };
 
     // Get frame allocator
@@ -258,6 +268,7 @@ pub fn sys_vfork() -> i64 {
         child_tidptr: 0,
         tls: 0,
         pidfd_ptr: 0,
+        exit_signal: crate::signal::SIGCHLD as i32, // vfork sends SIGCHLD on exit
     };
 
     // Get frame allocator
@@ -296,6 +307,7 @@ pub fn sys_vfork() -> i64 {
         child_tidptr: 0,
         tls: 0,
         pidfd_ptr: 0,
+        exit_signal: crate::signal::SIGCHLD as i32, // vfork sends SIGCHLD on exit
     };
 
     // Get frame allocator
@@ -703,6 +715,7 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         child_tidptr: args.child_tid,
         tls: args.tls,
         pidfd_ptr: args.pidfd,
+        exit_signal: args.exit_signal as i32,
     };
 
     // Get frame allocator
@@ -805,6 +818,7 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         child_tidptr: args.child_tid,
         tls: args.tls,
         pidfd_ptr: args.pidfd,
+        exit_signal: args.exit_signal as i32,
     };
 
     // Get frame allocator

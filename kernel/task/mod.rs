@@ -499,6 +499,10 @@ pub enum TaskState {
 
 /// prctl operation codes
 pub mod prctl_ops {
+    /// Set parent death signal
+    pub const PR_SET_PDEATHSIG: i32 = 1;
+    /// Get parent death signal
+    pub const PR_GET_PDEATHSIG: i32 = 2;
     /// Get dumpable flag
     pub const PR_GET_DUMPABLE: i32 = 3;
     /// Set dumpable flag
@@ -786,12 +790,43 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub pid: Pid,
     /// Thread ID
     pub tid: Tid,
+    /// Thread Group ID (equals pid for thread group leader)
+    /// For CLONE_THREAD: inherited from parent; otherwise: equals pid
+    pub tgid: Pid,
     /// Parent process ID (0 for init/orphans)
     pub ppid: Pid,
     /// Process group ID
     pub pgid: Pid,
     /// Session ID
     pub sid: Pid,
+
+    // =========================================================================
+    // Exit handling (like Linux task_struct exit fields)
+    // =========================================================================
+    /// Exit status code (set when task becomes zombie)
+    pub exit_code: i32,
+    /// Signal to send to parent on exit (default SIGCHLD, from clone3 exit_signal)
+    pub exit_signal: i32,
+    /// Signal to send when parent dies (set via prctl PR_SET_PDEATHSIG)
+    pub pdeath_signal: i32,
+
+    // =========================================================================
+    // Process accounting (like Linux task_struct timing/accounting fields)
+    // =========================================================================
+    /// User CPU time consumed (nanoseconds)
+    pub utime: u64,
+    /// System CPU time consumed (nanoseconds)
+    pub stime: u64,
+    /// Task start time (monotonic clock, nanoseconds since boot)
+    pub start_time: u64,
+    /// Voluntary context switches (task yielded or slept)
+    pub nvcsw: u64,
+    /// Involuntary context switches (preempted by scheduler)
+    pub nivcsw: u64,
+    /// Minor page faults (demand paging, COW - no I/O required)
+    pub min_flt: u64,
+    /// Major page faults (swap-in required - I/O needed)
+    pub maj_flt: u64,
 
     // =========================================================================
     // Credentials (like Linux task_struct->cred)

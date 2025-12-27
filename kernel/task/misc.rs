@@ -314,8 +314,9 @@ pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(buf: u64, buflen: usize, fl
 // =============================================================================
 
 use crate::task::prctl_ops::{
-    PR_GET_DUMPABLE, PR_GET_NAME, PR_GET_NO_NEW_PRIVS, PR_GET_SECCOMP, PR_GET_TIMERSLACK,
-    PR_SET_DUMPABLE, PR_SET_NAME, PR_SET_NO_NEW_PRIVS, PR_SET_SECCOMP, PR_SET_TIMERSLACK,
+    PR_GET_DUMPABLE, PR_GET_NAME, PR_GET_NO_NEW_PRIVS, PR_GET_PDEATHSIG, PR_GET_SECCOMP,
+    PR_GET_TIMERSLACK, PR_SET_DUMPABLE, PR_SET_NAME, PR_SET_NO_NEW_PRIVS, PR_SET_PDEATHSIG,
+    PR_SET_SECCOMP, PR_SET_TIMERSLACK,
 };
 
 /// sys_prctl - Process/thread control operations
@@ -324,14 +325,16 @@ use crate::task::prctl_ops::{
 /// this syscall is portable across architectures.
 ///
 /// Supported operations:
-/// - PR_SET_NAME (15): Set thread name (16-byte max, arg2 = char*)
-/// - PR_GET_NAME (16): Get thread name (arg2 = char* buffer)
+/// - PR_SET_PDEATHSIG (1): Set parent death signal (arg2 = signal, 0 to disable)
+/// - PR_GET_PDEATHSIG (2): Get parent death signal (arg2 = int* for result)
 /// - PR_SET_DUMPABLE (4): Set core dump flag (arg2 = 0, 1, or 2)
 /// - PR_GET_DUMPABLE (3): Get core dump flag (returns value)
-/// - PR_SET_NO_NEW_PRIVS (38): Disable privilege escalation (arg2 = 1, irreversible)
-/// - PR_GET_NO_NEW_PRIVS (39): Get no_new_privs flag (returns 0 or 1)
+/// - PR_SET_NAME (15): Set thread name (16-byte max, arg2 = char*)
+/// - PR_GET_NAME (16): Get thread name (arg2 = char* buffer)
 /// - PR_SET_TIMERSLACK (29): Set timer slack (arg2 = nanoseconds)
 /// - PR_GET_TIMERSLACK (30): Get timer slack (returns nanoseconds)
+/// - PR_SET_NO_NEW_PRIVS (38): Disable privilege escalation (arg2 = 1, irreversible)
+/// - PR_GET_NO_NEW_PRIVS (39): Get no_new_privs flag (returns 0 or 1)
 ///
 /// Returns 0 on success (or value for GET operations), negative errno on error.
 pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 {
@@ -343,6 +346,43 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
     let tid = current_tid();
 
     match option {
+        PR_SET_PDEATHSIG => {
+            // Set signal to send when parent dies
+            // arg2 is the signal number (0 = disable)
+            let sig = arg2 as i32;
+
+            // Validate signal number (0 is valid - means disable)
+            if !(0..=64).contains(&sig) {
+                return KernelError::InvalidArgument.sysret();
+            }
+
+            let mut table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+                task.pdeath_signal = sig;
+                0
+            } else {
+                KernelError::NoProcess.sysret()
+            }
+        }
+
+        PR_GET_PDEATHSIG => {
+            // Get current parent death signal
+            // arg2 is pointer to int where result is stored
+            let sig = {
+                let table = TASK_TABLE.lock();
+                match table.tasks.iter().find(|t| t.tid == tid) {
+                    Some(task) => task.pdeath_signal,
+                    None => return KernelError::NoProcess.sysret(),
+                }
+            };
+
+            // Write signal to user-space pointer
+            if put_user::<Uaccess, i32>(arg2, sig).is_err() {
+                return KernelError::BadAddress.sysret();
+            }
+            0
+        }
+
         PR_SET_NAME => {
             // Set thread name from user-space string (max 16 bytes including null)
             let mut name = [0u8; 16];

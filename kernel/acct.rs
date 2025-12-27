@@ -356,17 +356,24 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
     let cred = &*task.cred;
     let (uid, euid, gid) = (cred.uid, cred.euid, cred.gid);
 
-    // Calculate elapsed time - use monotonic clock
-    // Note: Task struct doesn't track start_time_ns, so we use current time as approximation
-    use crate::time::{ClockId, TIMEKEEPER};
-    let now_ts = TIMEKEEPER.read(ClockId::Monotonic, TIMEKEEPER.get_read_cycles());
-    let now_ns = now_ts.to_nanos() as u64;
-    // Since we don't track start time, elapsed is approximated as 0
-    let elapsed_ns = 0u64;
+    // Calculate elapsed time using task.start_time (monotonic ns since boot)
+    let now_ns = crate::time::monotonic_ns();
+    let elapsed_ns = now_ns.saturating_sub(task.start_time);
 
     // Get start time as Unix timestamp (seconds since epoch)
-    // Use current time as approximation since Task doesn't store start time
-    let start_time = (now_ns / 1_000_000_000) as u32;
+    // Convert from monotonic start_time to wall clock using TIMEKEEPER
+    use crate::time::{ClockId, TIMEKEEPER};
+    let realtime_ts = TIMEKEEPER.read(ClockId::Realtime, TIMEKEEPER.get_read_cycles());
+    let mono_ts = TIMEKEEPER.read(ClockId::Monotonic, TIMEKEEPER.get_read_cycles());
+    let realtime_ns = realtime_ts.to_nanos() as u64;
+    let mono_ns = mono_ts.to_nanos() as u64;
+    // Calculate the realtime offset and apply it to start_time
+    let realtime_start_ns = if realtime_ns >= mono_ns {
+        task.start_time.saturating_add(realtime_ns - mono_ns)
+    } else {
+        task.start_time.saturating_sub(mono_ns - realtime_ns)
+    };
+    let start_time = (realtime_start_ns / 1_000_000_000) as u32;
 
     Some(TaskInfo {
         uid,
@@ -376,10 +383,10 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
         tty: 0, // TODO: Get controlling terminal
         start_time,
         elapsed_ns,
-        utime_ns: 0, // TODO: Track user CPU time
-        stime_ns: 0, // TODO: Track system CPU time
-        minflt: 0,   // TODO: Track minor page faults
-        majflt: 0,   // TODO: Track major page faults
+        utime_ns: task.utime,
+        stime_ns: task.stime,
+        minflt: task.min_flt,
+        majflt: task.maj_flt,
         comm,
         did_fork: pid != tid as Pid, // Simple heuristic: different PID/TID means forked
         did_exec: task.prctl.name[0] != 0, // Has a name means exec'd

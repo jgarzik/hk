@@ -375,3 +375,12 @@ pub fn current_ticks() -> u64 {
     // Convert to milliseconds
     ts.sec as u64 * 1000 + ts.nsec as u64 / 1_000_000
 }
+
+/// Get current monotonic time in nanoseconds
+///
+/// Returns the current monotonic clock time since boot in nanoseconds.
+/// Suitable for process start times and precise timing measurements.
+pub fn monotonic_ns() -> u64 {
+    let ts = TIMEKEEPER.read(ClockId::Monotonic, TIMEKEEPER.get_read_cycles());
+    ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
+}

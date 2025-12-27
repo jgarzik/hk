@@ -345,6 +345,9 @@ fn try_huge_page_fault(
         );
     }
 
+    // Increment minor fault counter (THP is still minor - no I/O)
+    crate::task::percpu::increment_min_flt();
+
     Some(true) // Huge page mapped successfully
 }
 
@@ -491,6 +494,9 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
         }
         lru_add_new(frame);
     }
+
+    // Increment minor fault counter (demand paging is minor - no I/O from disk)
+    crate::task::percpu::increment_min_flt();
 
     Some(true)
 }
@@ -716,6 +722,9 @@ fn handle_swap_fault(fault_addr: u64) -> Option<bool> {
         // Flush TLB
         crate::arch::aarch64::paging::flush_tlb(fault_addr);
 
+        // Increment major fault counter (swap cache hit still counts as major)
+        crate::task::percpu::increment_maj_flt();
+
         return Some(true);
     }
 
@@ -750,6 +759,9 @@ fn handle_swap_fault(fault_addr: u64) -> Option<bool> {
 
     // Step 6: Free swap slot (page is now in RAM)
     free_swap_entry(entry);
+
+    // Increment major fault counter (swap-in requires I/O)
+    crate::task::percpu::increment_maj_flt();
 
     Some(true) // Swap-in successful
 }
@@ -942,6 +954,9 @@ fn handle_cow_fault(fault_addr: u64) -> Option<bool> {
 
     // Flush TLB for this address
     crate::arch::aarch64::paging::flush_tlb(page_addr);
+
+    // Increment minor fault counter (COW is minor - no I/O)
+    crate::task::percpu::increment_min_flt();
 
     Some(true)
 }

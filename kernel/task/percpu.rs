@@ -387,9 +387,22 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         magic: crate::task::TASK_MAGIC,
         pid,
         tid,
+        tgid: pid, // Thread group leader (tgid == pid)
         ppid: 0,
         pgid: pid,
         sid: pid,
+        // Exit handling (kernel threads don't exit normally)
+        exit_code: 0,
+        exit_signal: 0, // Kernel threads don't send exit signals
+        pdeath_signal: 0,
+        // Accounting (kernel threads don't track CPU time)
+        utime: 0,
+        stime: 0,
+        start_time: crate::time::monotonic_ns(),
+        nvcsw: 0,
+        nivcsw: 0,
+        min_flt: 0,
+        maj_flt: 0,
         cred: alloc::sync::Arc::new(Cred::ROOT), // Kernel threads run as root
         kind: TaskKind::KernelThread,
         state: TaskState::Ready,
@@ -490,9 +503,22 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         magic: crate::task::TASK_MAGIC,
         pid: config.pid,
         tid: config.tid,
+        tgid: config.pid, // Thread group leader (tgid == pid)
         ppid: config.ppid,
         pgid: config.pgid,
         sid: config.sid,
+        // Exit handling
+        exit_code: 0,
+        exit_signal: crate::signal::SIGCHLD as i32, // Default: notify parent with SIGCHLD
+        pdeath_signal: 0,
+        // Accounting
+        utime: 0,
+        stime: 0,
+        start_time: crate::time::monotonic_ns(),
+        nvcsw: 0,
+        nivcsw: 0,
+        min_flt: 0,
+        maj_flt: 0,
         cred: alloc::sync::Arc::new(Cred::ROOT), // Initial user process starts as root
         kind: TaskKind::UserProcess,
         state: TaskState::Running, // Will be running immediately
@@ -593,6 +619,7 @@ pub fn mark_zombie(tid: Tid, status: i32) {
     {
         let mut table = TASK_TABLE.lock();
         if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+            task.exit_code = status;
             task.state = TaskState::Zombie(status);
             // Release cached pages
             task.release_cached_pages();
@@ -714,6 +741,8 @@ pub struct CloneConfig {
     pub tls: u64,
     /// User address to store pidfd (CLONE_PIDFD)
     pub pidfd_ptr: u64,
+    /// Exit signal for child (SIGCHLD for fork, 0 for threads)
+    pub exit_signal: i32,
 }
 
 /// Create a new thread/process via clone()
@@ -807,6 +836,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     let current_tid = current_tid();
     let (
         parent_pid,
+        parent_tgid,
         parent_ppid,
         parent_pgid,
         parent_sid,
@@ -826,6 +856,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         let parent = try_with_cleanup!(table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)); // ESRCH - no such process
         (
             parent.pid,
+            parent.tgid,
             parent.ppid,
             parent.pgid,
             parent.sid,
@@ -952,9 +983,27 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         magic: crate::task::TASK_MAGIC,
         pid: child_pid,
         tid: child_tid,
+        // Thread group ID: same as parent for CLONE_THREAD, else child becomes leader
+        tgid: if config.flags & CLONE_THREAD != 0 {
+            parent_tgid
+        } else {
+            child_pid
+        },
         ppid: child_ppid,
         pgid: parent_pgid,
         sid: parent_sid,
+        // Exit handling
+        exit_code: 0,
+        exit_signal: config.exit_signal, // From clone3 args (SIGCHLD for fork, 0 for threads)
+        pdeath_signal: 0,                // Never inherited, must be set explicitly via prctl
+        // Accounting (child starts fresh)
+        utime: 0,
+        stime: 0,
+        start_time: crate::time::monotonic_ns(),
+        nvcsw: 0,
+        nivcsw: 0,
+        min_flt: 0,
+        maj_flt: 0,
         cred: crate::task::copy_creds(config.flags, &parent_cred),
         kind: TaskKind::UserProcess,
         state: TaskState::Ready,
@@ -1767,6 +1816,30 @@ pub fn current_sid() -> Pid {
 pub fn task_exists(tid: Tid) -> bool {
     let table = TASK_TABLE.lock();
     table.tasks.iter().any(|t| t.tid == tid)
+}
+
+/// Increment minor page fault counter for current task
+///
+/// Called after successfully handling a demand-paging or COW fault
+/// (no I/O required - page was already in memory or newly allocated).
+pub fn increment_min_flt() {
+    let tid = current_tid();
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.min_flt = task.min_flt.saturating_add(1);
+    }
+}
+
+/// Increment major page fault counter for current task
+///
+/// Called after successfully handling a swap-in fault
+/// (I/O was required - page had to be read from disk).
+pub fn increment_maj_flt() {
+    let tid = current_tid();
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.maj_flt = task.maj_flt.saturating_add(1);
+    }
 }
 
 /// Get all TIDs in a process group

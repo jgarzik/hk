@@ -537,6 +537,9 @@ impl Default for AltStack {
 pub struct TaskSignalState {
     /// Blocked signal mask
     pub blocked: SigSet,
+    /// Saved signal mask (for restoring after signal handler / SA_RESTART)
+    /// When Some, the blocked mask will be restored after the current syscall
+    pub saved_sigmask: Option<SigSet>,
     /// Pending signals for this task (private)
     pub pending: SigPending,
     /// Shared pending signals (for thread group)
@@ -552,6 +555,7 @@ impl TaskSignalState {
     pub fn new() -> Self {
         Self {
             blocked: SigSet::EMPTY,
+            saved_sigmask: None,
             pending: SigPending::new(),
             shared_pending: Arc::new(Mutex::new(SigPending::new())),
             sigpending: false,
@@ -677,6 +681,7 @@ pub fn clone_task_signal(
     let child_state = if let Some(parent_state) = parent_state {
         TaskSignalState {
             blocked: parent_state.blocked, // Inherit blocked mask
+            saved_sigmask: None,           // Child starts with no saved mask
             pending: SigPending::new(),    // Fresh private pending
             shared_pending: if share_pending {
                 // CLONE_THREAD: share thread-group pending
