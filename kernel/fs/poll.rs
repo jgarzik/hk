@@ -442,7 +442,13 @@ pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeou
 
     // Do the select loop
     let mut ready_count;
-    let _timeout_remaining = timeout_ms;
+
+    // Calculate timeout end time (in milliseconds)
+    let timeout_end = if timeout_ms < 0 {
+        u64::MAX // Infinite timeout
+    } else {
+        crate::time::current_ticks().saturating_add(timeout_ms as u64)
+    };
 
     loop {
         let mut poll_table = PollTable::new(&mut ctx);
@@ -517,17 +523,16 @@ pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeou
             break;
         }
 
-        // TODO: Implement proper waiting with timeout
-        // For now, yield and retry a few times, then timeout
-        static mut SELECT_ITERATIONS: u32 = 0;
-        unsafe {
-            SELECT_ITERATIONS += 1;
-            if SELECT_ITERATIONS > 100 || timeout_ms > 0 {
-                SELECT_ITERATIONS = 0;
-                break;
-            }
-        }
+        // Yield to let other tasks run (e.g., child process can exit)
         crate::task::percpu::yield_now();
+
+        // Check if timeout has elapsed
+        let now = crate::time::current_ticks();
+        if now >= timeout_end {
+            break;
+        }
+
+        // Continue polling loop
     }
 
     // Copy results back to user space
@@ -699,6 +704,13 @@ fn sys_select_internal(
     // Do the select loop
     let mut ready_count;
 
+    // Calculate timeout end time (in milliseconds)
+    let timeout_end = if timeout_ms < 0 {
+        u64::MAX // Infinite timeout
+    } else {
+        crate::time::current_ticks().saturating_add(timeout_ms as u64)
+    };
+
     loop {
         let mut poll_table = PollTable::new(&mut ctx);
         ready_count = 0i32;
@@ -772,16 +784,16 @@ fn sys_select_internal(
             break;
         }
 
-        // TODO: Implement proper waiting with timeout
-        static mut PSELECT_ITERATIONS: u32 = 0;
-        unsafe {
-            PSELECT_ITERATIONS += 1;
-            if PSELECT_ITERATIONS > 100 || timeout_ms > 0 {
-                PSELECT_ITERATIONS = 0;
-                break;
-            }
-        }
+        // Yield to let other tasks run (e.g., child process can exit)
         crate::task::percpu::yield_now();
+
+        // Check if timeout has elapsed
+        let now = crate::time::current_ticks();
+        if now >= timeout_end {
+            break;
+        }
+
+        // Continue polling loop
     }
 
     // Copy results back to user space
