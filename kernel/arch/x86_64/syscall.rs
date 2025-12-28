@@ -409,15 +409,21 @@ pub const SYS_SYNC: u64 = 162;
 /// syncfs(fd)
 pub const SYS_SYNCFS: u64 = 306;
 
-// Splice/sendfile syscalls
+// Splice/sendfile/copy syscalls
 /// sendfile64(out_fd, in_fd, offset, count)
 pub const SYS_SENDFILE: u64 = 40;
+/// flock(fd, operation)
+pub const SYS_FLOCK: u64 = 73;
 /// splice(fd_in, off_in, fd_out, off_out, len, flags)
 pub const SYS_SPLICE: u64 = 275;
 /// tee(fd_in, fd_out, len, flags)
 pub const SYS_TEE: u64 = 276;
 /// vmsplice(fd, iov, nr_segs, flags)
 pub const SYS_VMSPLICE: u64 = 278;
+/// fallocate(fd, mode, offset, len)
+pub const SYS_FALLOCATE: u64 = 285;
+/// copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)
+pub const SYS_COPY_FILE_RANGE: u64 = 326;
 
 // UTS namespace syscalls
 /// uname(buf)
@@ -462,6 +468,18 @@ pub const SYS_MEMBARRIER: u64 = 324;
 /// readahead(fd, offset, count)
 pub const SYS_READAHEAD: u64 = 187;
 
+// NUMA memory policy (Section 4.2)
+/// mbind(start, len, mode, nodemask, maxnode, flags)
+pub const SYS_MBIND: u64 = 237;
+/// set_mempolicy(mode, nodemask, maxnode)
+pub const SYS_SET_MEMPOLICY: u64 = 238;
+/// get_mempolicy(policy, nodemask, maxnode, addr, flags)
+pub const SYS_GET_MEMPOLICY: u64 = 239;
+/// migrate_pages(pid, maxnode, old_nodes, new_nodes)
+pub const SYS_MIGRATE_PAGES: u64 = 256;
+/// move_pages(pid, nr_pages, pages, nodes, status, flags)
+pub const SYS_MOVE_PAGES: u64 = 279;
+
 // Scheduling priority
 /// getpriority(which, who)
 pub const SYS_GETPRIORITY: u64 = 140;
@@ -483,6 +501,8 @@ pub const SYS_ARCH_PRCTL: u64 = 158;
 pub const SYS_SET_TID_ADDRESS: u64 = 218;
 /// seccomp(operation, flags, args) - Operate on Secure Computing state
 pub const SYS_SECCOMP: u64 = 317;
+/// bpf(cmd, attr, size) - BPF syscall for maps and programs
+pub const SYS_BPF: u64 = 321;
 
 // System information
 /// getcpu(cpup, nodep, unused)
@@ -618,6 +638,12 @@ pub const SYS_VHANGUP: u64 = 153;
 /// personality(persona) - Set process execution domain
 pub const SYS_PERSONALITY: u64 = 135;
 
+// I/O port permissions (x86-64 only)
+/// iopl(level) - Set I/O privilege level (0-3)
+pub const SYS_IOPL: u64 = 172;
+/// ioperm(from, num, turn_on) - Set port permissions for first 0x3ff ports
+pub const SYS_IOPERM: u64 = 173;
+
 // pidfd syscalls
 /// pidfd_send_signal(pidfd, sig, info, flags) - Send signal to process via pidfd
 pub const SYS_PIDFD_SEND_SIGNAL: u64 = 424;
@@ -633,6 +659,10 @@ pub const SYS_ADD_KEY: u64 = 248;
 pub const SYS_REQUEST_KEY: u64 = 249;
 /// keyctl(cmd, arg2, arg3, arg4, arg5)
 pub const SYS_KEYCTL: u64 = 250;
+/// process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
+pub const SYS_PROCESS_VM_READV: u64 = 310;
+/// process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
+pub const SYS_PROCESS_VM_WRITEV: u64 = 311;
 /// kcmp(pid1, pid2, type, idx1, idx2)
 pub const SYS_KCMP: u64 = 312;
 
@@ -1496,6 +1526,16 @@ pub fn x86_64_syscall_dispatch(
             sys_personality(arg0 as u32) as u64
         }
 
+        // I/O port permissions (x86-64 only)
+        SYS_IOPL => {
+            use crate::task::syscall::sys_iopl;
+            sys_iopl(arg0 as u32) as u64
+        }
+        SYS_IOPERM => {
+            use crate::task::syscall::sys_ioperm;
+            sys_ioperm(arg0, arg1, arg2 as i32) as u64
+        }
+
         // System logging
         SYS_SYSLOG => {
             use crate::arch::Uaccess;
@@ -1580,10 +1620,11 @@ pub fn x86_64_syscall_dispatch(
         // ioctl
         SYS_IOCTL => sys_ioctl(arg0 as i32, arg1 as u32, arg2) as u64,
 
-        // splice/sendfile
+        // splice/sendfile/copy/flock
         SYS_SENDFILE => {
             crate::fs::splice::sys_sendfile64(arg0 as i32, arg1 as i32, arg2, arg3 as usize) as u64
         }
+        SYS_FLOCK => crate::fs::flock::sys_flock(arg0 as i32, arg1 as i32) as u64,
         SYS_SPLICE => crate::fs::splice::sys_splice(
             arg0 as i32,
             arg1,
@@ -1598,6 +1639,18 @@ pub fn x86_64_syscall_dispatch(
         SYS_VMSPLICE => {
             crate::fs::splice::sys_vmsplice(arg0 as i32, arg1, arg2 as usize, arg3 as u32) as u64
         }
+        SYS_FALLOCATE => {
+            crate::fs::misc::sys_fallocate(arg0 as i32, arg1 as i32, arg2 as i64, arg3 as i64)
+                as u64
+        }
+        SYS_COPY_FILE_RANGE => crate::fs::splice::sys_copy_file_range(
+            arg0 as i32,
+            arg1,
+            arg2 as i32,
+            arg3,
+            arg4,
+            arg5 as u32,
+        ) as u64,
 
         // Permissions
         SYS_CHMOD => sys_chmod(arg0, arg1 as u32) as u64,
@@ -1687,6 +1740,24 @@ pub fn x86_64_syscall_dispatch(
             crate::fs::syscall::sys_readahead(arg0 as i32, arg1 as i64, arg2 as usize) as u64
         }
 
+        // NUMA memory policy
+        SYS_GET_MEMPOLICY => {
+            crate::mm::mempolicy::sys_get_mempolicy(arg0, arg1, arg2, arg3, arg4) as u64
+        }
+        SYS_SET_MEMPOLICY => {
+            crate::mm::mempolicy::sys_set_mempolicy(arg0 as i32, arg1, arg2) as u64
+        }
+        SYS_MBIND => {
+            crate::mm::mempolicy::sys_mbind(arg0, arg1, arg2, arg3, arg4, arg5 as u32) as u64
+        }
+        SYS_MIGRATE_PAGES => {
+            crate::mm::mempolicy::sys_migrate_pages(arg0 as i64, arg1, arg2, arg3) as u64
+        }
+        SYS_MOVE_PAGES => {
+            crate::mm::mempolicy::sys_move_pages(arg0 as i64, arg1, arg2, arg3, arg4, arg5 as i32)
+                as u64
+        }
+
         // Scheduling priority
         SYS_GETPRIORITY => {
             use crate::task::syscall::sys_getpriority;
@@ -1727,6 +1798,7 @@ pub fn x86_64_syscall_dispatch(
             sys_set_tid_address(arg0) as u64
         }
         SYS_SECCOMP => crate::seccomp::sys_seccomp(arg0, arg1, arg2) as u64,
+        SYS_BPF => crate::bpf::sys_bpf(arg0 as i32, arg1, arg2 as u32) as u64,
 
         // Scheduling syscalls (Section 1.3)
         SYS_SCHED_GETSCHEDULER => {
@@ -1891,6 +1963,20 @@ pub fn x86_64_syscall_dispatch(
         SYS_ADD_KEY => crate::keys::sys_add_key(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
         SYS_REQUEST_KEY => crate::keys::sys_request_key(arg0, arg1, arg2, arg3 as i32) as u64,
         SYS_KEYCTL => crate::keys::sys_keyctl(arg0 as i32, arg1, arg2, arg3, arg4) as u64,
+
+        // Cross-process memory access
+        SYS_PROCESS_VM_READV => {
+            crate::task::process_vm::sys_process_vm_readv(arg0 as i32, arg1, arg2, arg3, arg4, arg5)
+                as u64
+        }
+        SYS_PROCESS_VM_WRITEV => crate::task::process_vm::sys_process_vm_writev(
+            arg0 as i32,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+            arg5,
+        ) as u64,
 
         // Process inspection (Section 13)
         SYS_KCMP => crate::kcmp::sys_kcmp(arg0, arg1, arg2 as i32, arg3, arg4) as u64,

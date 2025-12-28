@@ -19,11 +19,13 @@ locking strategies used in the hk kernel.
    - [Signal Infrastructure](#37-signal-infrastructure)
    - [Futex Subsystem](#38-futex-subsystem)
    - [TTY and Console Subsystem](#39-tty-and-console-subsystem)
+   - [Device Drivers](#310-device-drivers)
 4. [Deadlock Prevention](#4-deadlock-prevention)
 5. [Lock-Free Patterns](#5-lock-free-patterns)
 6. [Preemption Control](#6-preemption-control)
 7. [Interrupt Context Rules](#7-interrupt-context-rules)
 8. [API Quick Reference](#8-api-quick-reference)
+9. [Gaps vs Linux Kernel](#9-gaps-vs-linux-kernel)
 
 ---
 
@@ -1431,6 +1433,68 @@ if self._guard.is_some() {
 5. **Panic bypasses locks** - Direct serial for guaranteed panic output
 6. **ConsoleFlags control console behavior** - ENABLED, BOOT, CONSDEV flags
 
+### 3.10 Device Drivers
+
+Device drivers use thread-context locks (Mutex, RwLock) rather than IrqSpinlock.
+ISRs set atomic flags but never acquire locks, deferring work to thread context.
+
+#### USB Subsystem
+
+**Location:** `kernel/usb/`
+
+| Lock | Type | Purpose |
+|------|------|---------|
+| `USB_CONTROLLER` | `Mutex<Option<XhciController>>` | Global xHCI controller access |
+| `XHCI_IRQ_STATE.*` | `AtomicU64`, `AtomicBool` | ISR state (lock-free) |
+| `USB_OUTPUT_ACTIVE` | `AtomicBool` | Console recursion guard |
+
+**ISR Pattern:** The xHCI ISR sets `interrupt_pending` atomic but does NOT acquire
+`USB_CONTROLLER` mutex. This avoids IRQ-context deadlock since the mutex is not
+IRQ-safe.
+
+#### Block Device Subsystem
+
+**Location:** `kernel/storage/`
+
+| Lock | Type | Purpose |
+|------|------|---------|
+| `BLKDEV_REGISTRY` | `RwLock<BlockDeviceRegistry>` | Device registration |
+| `RequestQueue.sched` | `Mutex<Box<dyn IoScheduler>>` | Per-queue scheduler |
+| `RequestQueue.disk` | `RwLock<Option<Arc<Disk>>>` | Back-reference |
+| `Disk.capacity_sectors` | `AtomicU64` | Lock-free capacity |
+| `BlockDevice.open_count` | `AtomicUsize` | Lock-free open count |
+
+**I/O Completion:** Bio completion callbacks are synchronous and must not acquire
+locks to avoid deadlock with the request queue.
+
+#### Network Subsystem
+
+**Location:** `kernel/net/`
+
+| Lock | Type | Purpose |
+|------|------|---------|
+| `Socket.local_addr` | `Mutex` | Per-socket local address |
+| `Socket.remote_addr` | `Mutex` | Per-socket remote address |
+| `Socket.rx_buffer` | `Mutex` | Receive buffer |
+| `Socket.dgram_rx_queue` | `Mutex` | Datagram queue |
+| `TcpConnection.retransmit_queue` | `Mutex` | TCP retransmit queue |
+| `E1000Driver.tx_*` | `Mutex` | TX ring management |
+
+**Socket Lock Ordering:** When acquiring multiple socket locks, acquire in this order:
+1. `local_addr`
+2. `remote_addr`
+3. `rx_buffer` / `dgram_rx_queue`
+
+**TCP State:** Uses atomics (`AtomicU8` for state, `AtomicU32` for sequence numbers)
+for lock-free access from packet receive path.
+
+#### Key Device Driver Rules
+
+1. **No IrqSpinlock in drivers** - All driver locks are thread-context only
+2. **ISRs set flags only** - Never acquire locks, defer to thread context
+3. **Atomics for hot paths** - Use atomics for frequently-accessed state
+4. **Completion callbacks are lock-free** - Don't acquire locks in bio/skb completion
+
 ---
 
 ## 4. Deadlock Prevention
@@ -1745,3 +1809,32 @@ unsafe { context_switch(curr, next, kstack); }
 // Lock released when guard drops
 ```
 
+---
+
+## 9. Gaps vs Linux Kernel
+
+Features present in Linux but not yet implemented in hk:
+
+| Feature | Linux | hk | Impact |
+|---------|-------|-----|--------|
+| `spin_lock_bh()` | Disables softirqs | N/A | No softirqs in hk |
+| Softirqs/Tasklets | Deferred interrupt work | Not implemented | ISRs must be minimal |
+| NAPI | Network interrupt mitigation | Not implemented | Higher network IRQ overhead |
+| Threaded IRQs | IRQ handlers in thread context | Not implemented | All IRQs run in interrupt context |
+| lockdep | Runtime deadlock detection | Not implemented | Manual ordering verification |
+| RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
+| Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
+
+### Implications
+
+1. **No softirqs**: Device drivers cannot defer work to bottom-half context. All
+   deferred work must use workqueues or be handled synchronously.
+
+2. **No NAPI**: Network drivers process each packet in ISR context. High packet
+   rates may cause increased interrupt load.
+
+3. **No lockdep**: Lock ordering must be verified manually via code review.
+   Consider adding compile-time lock ordering enforcement in the future.
+
+4. **No RCU**: Read-heavy data structures use RwLock, which has higher overhead
+   than RCU for read-mostly workloads.

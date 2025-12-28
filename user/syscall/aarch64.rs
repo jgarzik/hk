@@ -25,6 +25,10 @@ use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, 
 // Syscall macros for aarch64
 // ============================================================================
 
+// NOTE: On aarch64, syscalls may clobber registers x1-x7. We must declare these
+// as clobbers so the compiler doesn't assume their values are preserved across
+// the syscall. The `lateout` for unused argument registers handles this.
+
 /// Raw syscall with 0 arguments
 macro_rules! syscall0 {
     ($nr:expr) => {{
@@ -33,6 +37,14 @@ macro_rules! syscall0 {
             "svc #0",
             in("x8") $nr,
             lateout("x0") ret,
+            // Clobber argument registers that kernel may modify
+            lateout("x1") _,
+            lateout("x2") _,
+            lateout("x3") _,
+            lateout("x4") _,
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
@@ -46,8 +58,15 @@ macro_rules! syscall1 {
         core::arch::asm!(
             "svc #0",
             in("x8") $nr,
-            in("x0") $a0 as u64,
-            lateout("x0") ret,
+            inlateout("x0") $a0 as u64 => ret,
+            // Clobber argument registers that kernel may modify
+            lateout("x1") _,
+            lateout("x2") _,
+            lateout("x3") _,
+            lateout("x4") _,
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
@@ -61,9 +80,15 @@ macro_rules! syscall2 {
         core::arch::asm!(
             "svc #0",
             in("x8") $nr,
-            in("x0") $a0 as u64,
-            in("x1") $a1 as u64,
-            lateout("x0") ret,
+            inlateout("x0") $a0 as u64 => ret,
+            inlateout("x1") $a1 as u64 => _,
+            // Clobber argument registers that kernel may modify
+            lateout("x2") _,
+            lateout("x3") _,
+            lateout("x4") _,
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
@@ -77,10 +102,15 @@ macro_rules! syscall3 {
         core::arch::asm!(
             "svc #0",
             in("x8") $nr,
-            in("x0") $a0 as u64,
-            in("x1") $a1 as u64,
-            in("x2") $a2 as u64,
-            lateout("x0") ret,
+            inlateout("x0") $a0 as u64 => ret,
+            inlateout("x1") $a1 as u64 => _,
+            inlateout("x2") $a2 as u64 => _,
+            // Clobber argument registers that kernel may modify
+            lateout("x3") _,
+            lateout("x4") _,
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
@@ -94,11 +124,15 @@ macro_rules! syscall4 {
         core::arch::asm!(
             "svc #0",
             in("x8") $nr,
-            in("x0") $a0 as u64,
-            in("x1") $a1 as u64,
-            in("x2") $a2 as u64,
-            in("x3") $a3 as u64,
-            lateout("x0") ret,
+            inlateout("x0") $a0 as u64 => ret,
+            inlateout("x1") $a1 as u64 => _,
+            inlateout("x2") $a2 as u64 => _,
+            inlateout("x3") $a3 as u64 => _,
+            // Clobber argument registers that kernel may modify
+            lateout("x4") _,
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
@@ -112,12 +146,15 @@ macro_rules! syscall5 {
         core::arch::asm!(
             "svc #0",
             in("x8") $nr,
-            in("x0") $a0 as u64,
-            in("x1") $a1 as u64,
-            in("x2") $a2 as u64,
-            in("x3") $a3 as u64,
-            in("x4") $a4 as u64,
-            lateout("x0") ret,
+            inlateout("x0") $a0 as u64 => ret,
+            inlateout("x1") $a1 as u64 => _,
+            inlateout("x2") $a2 as u64 => _,
+            inlateout("x3") $a3 as u64 => _,
+            inlateout("x4") $a4 as u64 => _,
+            // Clobber argument registers that kernel may modify
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
@@ -131,13 +168,15 @@ macro_rules! syscall6 {
         core::arch::asm!(
             "svc #0",
             in("x8") $nr,
-            in("x0") $a0 as u64,
-            in("x1") $a1 as u64,
-            in("x2") $a2 as u64,
-            in("x3") $a3 as u64,
-            in("x4") $a4 as u64,
-            in("x5") $a5 as u64,
-            lateout("x0") ret,
+            inlateout("x0") $a0 as u64 => ret,
+            inlateout("x1") $a1 as u64 => _,
+            inlateout("x2") $a2 as u64 => _,
+            inlateout("x3") $a3 as u64 => _,
+            inlateout("x4") $a4 as u64 => _,
+            inlateout("x5") $a5 as u64 => _,
+            // Clobber argument registers that kernel may modify
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
@@ -382,10 +421,13 @@ pub const SYS_FUTEX: u64 = 98;
 pub const SYS_SET_ROBUST_LIST: u64 = 99;
 pub const SYS_GET_ROBUST_LIST: u64 = 100;
 pub const SYS_FUTEX_WAITV: u64 = 449;
+pub const SYS_FLOCK: u64 = 32;
+pub const SYS_FALLOCATE: u64 = 47;
 pub const SYS_SENDFILE: u64 = 71;
 pub const SYS_VMSPLICE: u64 = 75;
 pub const SYS_SPLICE: u64 = 76;
 pub const SYS_TEE: u64 = 77;
+pub const SYS_COPY_FILE_RANGE: u64 = 285;
 pub const SYS_STATFS: u64 = 43;
 pub const SYS_FSTATFS: u64 = 44;
 pub const SYS_STATX: u64 = 291;
@@ -1325,6 +1367,108 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     unsafe { syscall5!(SYS_MREMAP, old_addr, old_len, new_len, flags, new_addr) }
 }
 
+// --- NUMA Memory Policy ---
+
+/// get_mempolicy syscall number
+pub const SYS_GET_MEMPOLICY: u64 = 236;
+/// set_mempolicy syscall number
+pub const SYS_SET_MEMPOLICY: u64 = 237;
+/// mbind syscall number
+pub const SYS_MBIND: u64 = 235;
+/// migrate_pages syscall number
+pub const SYS_MIGRATE_PAGES: u64 = 238;
+/// move_pages syscall number
+pub const SYS_MOVE_PAGES: u64 = 239;
+
+/// get_mempolicy - Get NUMA memory policy
+///
+/// # Arguments
+/// * `policy` - Output pointer for policy mode (can be null)
+/// * `nodemask` - Output pointer for node mask (can be null)
+/// * `maxnode` - Size of nodemask in bits
+/// * `addr` - Address for MPOL_F_ADDR lookup
+/// * `flags` - MPOL_F_NODE, MPOL_F_ADDR, MPOL_F_MEMS_ALLOWED
+#[inline(always)]
+pub fn sys_get_mempolicy(
+    policy: *mut i32,
+    nodemask: *mut u64,
+    maxnode: u64,
+    addr: u64,
+    flags: u64,
+) -> i64 {
+    unsafe { syscall5!(SYS_GET_MEMPOLICY, policy, nodemask, maxnode, addr, flags) }
+}
+
+/// set_mempolicy - Set NUMA memory policy for process
+///
+/// # Arguments
+/// * `mode` - Policy mode (MPOL_DEFAULT, MPOL_BIND, etc.)
+/// * `nodemask` - Pointer to node mask
+/// * `maxnode` - Size of nodemask in bits
+#[inline(always)]
+pub fn sys_set_mempolicy(mode: i32, nodemask: *const u64, maxnode: u64) -> i64 {
+    unsafe { syscall3!(SYS_SET_MEMPOLICY, mode, nodemask, maxnode) }
+}
+
+/// mbind - Set NUMA memory policy for a memory range
+///
+/// # Arguments
+/// * `start` - Start address (page-aligned)
+/// * `len` - Length of range
+/// * `mode` - Policy mode
+/// * `nodemask` - Pointer to node mask
+/// * `maxnode` - Size of nodemask in bits
+/// * `flags` - MPOL_MF_STRICT, MPOL_MF_MOVE, MPOL_MF_MOVE_ALL
+#[inline(always)]
+pub fn sys_mbind(
+    start: u64,
+    len: u64,
+    mode: u64,
+    nodemask: *const u64,
+    maxnode: u64,
+    flags: u32,
+) -> i64 {
+    unsafe { syscall6!(SYS_MBIND, start, len, mode, nodemask, maxnode, flags) }
+}
+
+/// migrate_pages - Migrate pages between NUMA nodes
+///
+/// # Arguments
+/// * `pid` - Target process ID (0 = current)
+/// * `maxnode` - Maximum node number + 1
+/// * `old_nodes` - Pointer to old nodes bitmask
+/// * `new_nodes` - Pointer to new nodes bitmask
+#[inline(always)]
+pub fn sys_migrate_pages(
+    pid: i64,
+    maxnode: u64,
+    old_nodes: *const u64,
+    new_nodes: *const u64,
+) -> i64 {
+    unsafe { syscall4!(SYS_MIGRATE_PAGES, pid, maxnode, old_nodes, new_nodes) }
+}
+
+/// move_pages - Move pages to specific NUMA nodes
+///
+/// # Arguments
+/// * `pid` - Target process ID (0 = current)
+/// * `nr_pages` - Number of pages
+/// * `pages` - Array of page addresses
+/// * `nodes` - Array of target nodes (or NULL for query)
+/// * `status` - Array for status output
+/// * `flags` - MPOL_MF_MOVE or MPOL_MF_MOVE_ALL
+#[inline(always)]
+pub fn sys_move_pages(
+    pid: i64,
+    nr_pages: u64,
+    pages: *const u64,
+    nodes: *const i32,
+    status: *mut i32,
+    flags: i32,
+) -> i64 {
+    unsafe { syscall6!(SYS_MOVE_PAGES, pid, nr_pages, pages, nodes, status, flags) }
+}
+
 /// getcpu(cpup, nodep) - get CPU and NUMA node for calling thread
 #[inline(always)]
 pub fn sys_getcpu(cpup: *mut u32, nodep: *mut u32) -> i64 {
@@ -1796,6 +1940,24 @@ pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
 #[inline(always)]
 pub fn sys_vmsplice(fd: i32, iov: *const super::IoVec, nr_segs: usize, flags: u32) -> i64 {
     unsafe { syscall4!(SYS_VMSPLICE, fd, iov, nr_segs, flags) }
+}
+
+/// flock(fd, operation) - apply or remove an advisory lock on an open file
+#[inline(always)]
+pub fn sys_flock(fd: i32, operation: i32) -> i64 {
+    unsafe { syscall2!(SYS_FLOCK, fd, operation) }
+}
+
+/// fallocate(fd, mode, offset, len) - manipulate file space
+#[inline(always)]
+pub fn sys_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i64 {
+    unsafe { syscall4!(SYS_FALLOCATE, fd, mode, offset, len) }
+}
+
+/// copy_file_range(fd_in, off_in, fd_out, off_out, len, flags) - copy range of data between files
+#[inline(always)]
+pub fn sys_copy_file_range(fd_in: i32, off_in: *mut u64, fd_out: i32, off_out: *mut u64, len: usize, flags: u32) -> i64 {
+    unsafe { syscall6!(SYS_COPY_FILE_RANGE, fd_in, off_in, fd_out, off_out, len, flags) }
 }
 
 // --- Filesystem Statistics ---
@@ -2303,6 +2465,64 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, type_: i32, idx1: u64, idx2: u64) -> i64 {
 }
 
 // ============================================================================
+// Cross-process memory access
+// ============================================================================
+
+/// process_vm_readv syscall number
+pub const SYS_PROCESS_VM_READV: u64 = 270;
+
+/// process_vm_writev syscall number
+pub const SYS_PROCESS_VM_WRITEV: u64 = 271;
+
+/// process_vm_readv - Read from another process's memory
+///
+/// # Arguments
+/// * `pid` - Target process ID
+/// * `local_iov` - Pointer to local iovec array (destination buffers)
+/// * `liovcnt` - Number of local iovecs
+/// * `remote_iov` - Pointer to remote iovec array (source addresses in target)
+/// * `riovcnt` - Number of remote iovecs
+/// * `flags` - Reserved (must be 0)
+///
+/// # Returns
+/// Total bytes read on success, negative error code on failure
+#[inline(always)]
+pub fn sys_process_vm_readv(
+    pid: i32,
+    local_iov: *const super::IoVec,
+    liovcnt: u64,
+    remote_iov: *const super::IoVec,
+    riovcnt: u64,
+    flags: u64,
+) -> i64 {
+    unsafe { syscall6!(SYS_PROCESS_VM_READV, pid, local_iov, liovcnt, remote_iov, riovcnt, flags) }
+}
+
+/// process_vm_writev - Write to another process's memory
+///
+/// # Arguments
+/// * `pid` - Target process ID
+/// * `local_iov` - Pointer to local iovec array (source buffers)
+/// * `liovcnt` - Number of local iovecs
+/// * `remote_iov` - Pointer to remote iovec array (destination addresses in target)
+/// * `riovcnt` - Number of remote iovecs
+/// * `flags` - Reserved (must be 0)
+///
+/// # Returns
+/// Total bytes written on success, negative error code on failure
+#[inline(always)]
+pub fn sys_process_vm_writev(
+    pid: i32,
+    local_iov: *const super::IoVec,
+    liovcnt: u64,
+    remote_iov: *const super::IoVec,
+    riovcnt: u64,
+    flags: u64,
+) -> i64 {
+    unsafe { syscall6!(SYS_PROCESS_VM_WRITEV, pid, local_iov, liovcnt, remote_iov, riovcnt, flags) }
+}
+
+// ============================================================================
 // Seccomp (secure computing mode)
 // ============================================================================
 
@@ -2323,4 +2543,48 @@ pub const SYS_SECCOMP: u64 = 277;
 #[inline(always)]
 pub fn sys_seccomp(op: u32, flags: u32, args: u64) -> i64 {
     unsafe { syscall3!(SYS_SECCOMP, op, flags, args) }
+}
+
+// ============================================================================
+// BPF (Berkeley Packet Filter)
+// ============================================================================
+
+/// bpf syscall number
+pub const SYS_BPF: u64 = 280;
+
+/// BPF commands
+pub const BPF_MAP_CREATE: i32 = 0;
+pub const BPF_MAP_LOOKUP_ELEM: i32 = 1;
+pub const BPF_MAP_UPDATE_ELEM: i32 = 2;
+pub const BPF_MAP_DELETE_ELEM: i32 = 3;
+pub const BPF_MAP_GET_NEXT_KEY: i32 = 4;
+pub const BPF_PROG_LOAD: i32 = 5;
+pub const BPF_OBJ_GET_INFO_BY_FD: i32 = 29;
+
+/// BPF map types
+pub const BPF_MAP_TYPE_HASH: u32 = 1;
+pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
+
+/// BPF program types
+pub const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
+
+/// BPF update flags
+pub const BPF_ANY: u64 = 0;
+pub const BPF_NOEXIST: u64 = 1;
+pub const BPF_EXIST: u64 = 2;
+
+/// bpf(cmd, attr, size) - BPF syscall
+///
+/// Perform operations on BPF maps and programs.
+///
+/// # Arguments
+/// * `cmd` - BPF command (BPF_MAP_CREATE, BPF_PROG_LOAD, etc.)
+/// * `attr` - Pointer to bpf_attr union
+/// * `size` - Size of the attr structure
+///
+/// # Returns
+/// File descriptor or 0 on success, negative error on failure
+#[inline(always)]
+pub fn sys_bpf(cmd: i32, attr: u64, size: u32) -> i64 {
+    unsafe { syscall3!(SYS_BPF, cmd, attr, size) }
 }

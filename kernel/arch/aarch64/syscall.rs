@@ -105,7 +105,11 @@ pub const SYS_FREMOVEXATTR: u64 = 16;
 /// ioctl(fd, request, arg)
 pub const SYS_IOCTL: u64 = 29;
 
-// Splice/sendfile syscalls
+// Splice/sendfile/copy syscalls
+/// flock(fd, operation)
+pub const SYS_FLOCK: u64 = 32;
+/// fallocate(fd, mode, offset, len)
+pub const SYS_FALLOCATE: u64 = 47;
 /// sendfile(out_fd, in_fd, offset, count)
 pub const SYS_SENDFILE: u64 = 71;
 /// vmsplice(fd, iov, nr_segs, flags)
@@ -114,6 +118,8 @@ pub const SYS_VMSPLICE: u64 = 75;
 pub const SYS_SPLICE: u64 = 76;
 /// tee(fd_in, fd_out, len, flags)
 pub const SYS_TEE: u64 = 77;
+/// copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)
+pub const SYS_COPY_FILE_RANGE: u64 = 285;
 
 // UTS namespace syscalls
 pub const SYS_UNAME: u64 = 160;
@@ -302,6 +308,18 @@ pub const SYS_MEMBARRIER: u64 = 283;
 // File readahead syscall
 pub const SYS_READAHEAD: u64 = 213;
 
+// NUMA memory policy (Section 4.2)
+/// mbind(start, len, mode, nodemask, maxnode, flags)
+pub const SYS_MBIND: u64 = 235;
+/// get_mempolicy(policy, nodemask, maxnode, addr, flags)
+pub const SYS_GET_MEMPOLICY: u64 = 236;
+/// set_mempolicy(mode, nodemask, maxnode)
+pub const SYS_SET_MEMPOLICY: u64 = 237;
+/// migrate_pages(pid, maxnode, old_nodes, new_nodes)
+pub const SYS_MIGRATE_PAGES: u64 = 238;
+/// move_pages(pid, nr_pages, pages, nodes, status, flags)
+pub const SYS_MOVE_PAGES: u64 = 239;
+
 // Scheduling priority (aarch64 numbers - note: swapped from x86_64)
 /// setpriority(which, who, niceval)
 pub const SYS_SETPRIORITY: u64 = 140;
@@ -321,6 +339,8 @@ pub const SYS_PRCTL: u64 = 167;
 pub const SYS_SET_TID_ADDRESS: u64 = 96;
 /// seccomp(operation, flags, args) - Operate on Secure Computing state
 pub const SYS_SECCOMP: u64 = 277;
+/// bpf(cmd, attr, size) - BPF syscall for maps and programs
+pub const SYS_BPF: u64 = 280;
 
 // System information
 /// getrusage(who, usage)
@@ -461,6 +481,10 @@ pub const SYS_ADD_KEY: u64 = 217;
 pub const SYS_REQUEST_KEY: u64 = 218;
 /// keyctl(cmd, arg2, arg3, arg4, arg5)
 pub const SYS_KEYCTL: u64 = 219;
+/// process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
+pub const SYS_PROCESS_VM_READV: u64 = 270;
+/// process_vm_writev(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)
+pub const SYS_PROCESS_VM_WRITEV: u64 = 271;
 /// kcmp(pid1, pid2, type, idx1, idx2)
 pub const SYS_KCMP: u64 = 272;
 
@@ -646,7 +670,12 @@ pub fn aarch64_syscall_dispatch(
         // ioctl
         SYS_IOCTL => sys_ioctl(arg0 as i32, arg1 as u32, arg2) as u64,
 
-        // splice/sendfile
+        // splice/sendfile/copy/flock
+        SYS_FLOCK => crate::fs::flock::sys_flock(arg0 as i32, arg1 as i32) as u64,
+        SYS_FALLOCATE => {
+            crate::fs::misc::sys_fallocate(arg0 as i32, arg1 as i32, arg2 as i64, arg3 as i64)
+                as u64
+        }
         SYS_SENDFILE => {
             crate::fs::splice::sys_sendfile64(arg0 as i32, arg1 as i32, arg2, arg3 as usize) as u64
         }
@@ -664,6 +693,14 @@ pub fn aarch64_syscall_dispatch(
         SYS_VMSPLICE => {
             crate::fs::splice::sys_vmsplice(arg0 as i32, arg1, arg2 as usize, arg3 as u32) as u64
         }
+        SYS_COPY_FILE_RANGE => crate::fs::splice::sys_copy_file_range(
+            arg0 as i32,
+            arg1,
+            arg2 as i32,
+            arg3,
+            arg4,
+            arg5 as u32,
+        ) as u64,
 
         // Process info syscalls
         SYS_GETPID => sys_getpid(percpu::current_pid()) as u64,
@@ -921,6 +958,24 @@ pub fn aarch64_syscall_dispatch(
             crate::fs::syscall::sys_readahead(arg0 as i32, arg1 as i64, arg2 as usize) as u64
         }
 
+        // NUMA memory policy
+        SYS_GET_MEMPOLICY => {
+            crate::mm::mempolicy::sys_get_mempolicy(arg0, arg1, arg2, arg3, arg4) as u64
+        }
+        SYS_SET_MEMPOLICY => {
+            crate::mm::mempolicy::sys_set_mempolicy(arg0 as i32, arg1, arg2) as u64
+        }
+        SYS_MBIND => {
+            crate::mm::mempolicy::sys_mbind(arg0, arg1, arg2, arg3, arg4, arg5 as u32) as u64
+        }
+        SYS_MIGRATE_PAGES => {
+            crate::mm::mempolicy::sys_migrate_pages(arg0 as i64, arg1, arg2, arg3) as u64
+        }
+        SYS_MOVE_PAGES => {
+            crate::mm::mempolicy::sys_move_pages(arg0 as i64, arg1, arg2, arg3, arg4, arg5 as i32)
+                as u64
+        }
+
         // Scheduling priority
         SYS_GETPRIORITY => {
             use crate::task::syscall::sys_getpriority;
@@ -957,6 +1012,7 @@ pub fn aarch64_syscall_dispatch(
             sys_set_tid_address(arg0) as u64
         }
         SYS_SECCOMP => crate::seccomp::sys_seccomp(arg0, arg1, arg2) as u64,
+        SYS_BPF => crate::bpf::sys_bpf(arg0 as i32, arg1, arg2 as u32) as u64,
 
         // Scheduling syscalls (Section 1.3)
         SYS_SCHED_YIELD => {
@@ -1162,6 +1218,20 @@ pub fn aarch64_syscall_dispatch(
         SYS_ADD_KEY => crate::keys::sys_add_key(arg0, arg1, arg2, arg3, arg4 as i32) as u64,
         SYS_REQUEST_KEY => crate::keys::sys_request_key(arg0, arg1, arg2, arg3 as i32) as u64,
         SYS_KEYCTL => crate::keys::sys_keyctl(arg0 as i32, arg1, arg2, arg3, arg4) as u64,
+
+        // Cross-process memory access
+        SYS_PROCESS_VM_READV => {
+            crate::task::process_vm::sys_process_vm_readv(arg0 as i32, arg1, arg2, arg3, arg4, arg5)
+                as u64
+        }
+        SYS_PROCESS_VM_WRITEV => crate::task::process_vm::sys_process_vm_writev(
+            arg0 as i32,
+            arg1,
+            arg2,
+            arg3,
+            arg4,
+            arg5,
+        ) as u64,
 
         // Process inspection (Section 13)
         SYS_KCMP => crate::kcmp::sys_kcmp(arg0, arg1, arg2 as i32, arg3, arg4) as u64,

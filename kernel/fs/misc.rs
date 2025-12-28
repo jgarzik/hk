@@ -960,3 +960,154 @@ pub fn sys_readahead(fd: i32, offset: i64, count: usize) -> i64 {
 
     0 // Success (hint accepted, even if no action taken)
 }
+
+// =============================================================================
+// fallocate syscall
+// =============================================================================
+
+/// Mode flags for fallocate (from include/uapi/linux/falloc.h)
+pub mod falloc_mode {
+    /// Don't extend file size even if offset + len > size
+    pub const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+    /// Deallocate range (punch hole) - must be combined with KEEP_SIZE
+    pub const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
+    /// Reserved for future use
+    #[allow(dead_code)]
+    pub const FALLOC_FL_NO_HIDE_STALE: i32 = 0x04;
+    /// Collapse range, removing a hole
+    pub const FALLOC_FL_COLLAPSE_RANGE: i32 = 0x08;
+    /// Zero range without doing I/O
+    pub const FALLOC_FL_ZERO_RANGE: i32 = 0x10;
+    /// Insert range, creating a hole
+    pub const FALLOC_FL_INSERT_RANGE: i32 = 0x20;
+    /// Unshare shared blocks (for reflinked files)
+    #[allow(dead_code)]
+    pub const FALLOC_FL_UNSHARE_RANGE: i32 = 0x40;
+}
+
+/// sys_fallocate - manipulate file space
+///
+/// Preallocates or deallocates space in a file without doing I/O.
+///
+/// # Arguments
+/// * `fd` - File descriptor (must be open for writing)
+/// * `mode` - Operation mode (0 = allocate, or FALLOC_FL_* flags)
+/// * `offset` - Starting offset in file
+/// * `len` - Length of region to manipulate
+///
+/// # Returns
+/// 0 on success, negative errno on error:
+/// * -EBADF: fd is not a valid file descriptor or not open for writing
+/// * -EINVAL: Invalid mode, offset, or len
+/// * -ENODEV: fd does not refer to a regular file
+/// * -ESPIPE: fd refers to a pipe or socket
+/// * -ENOSPC: Not enough space on device
+/// * -EOPNOTSUPP: Filesystem does not support this operation
+pub fn sys_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i64 {
+    use falloc_mode::*;
+
+    // Validate offset and len
+    if offset < 0 || len <= 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+
+    // Check for overflow
+    if offset.checked_add(len).is_none() {
+        return KernelError::InvalidArgument.sysret();
+    }
+
+    // Validate mode - check for unknown flags
+    let known_flags = FALLOC_FL_KEEP_SIZE
+        | FALLOC_FL_PUNCH_HOLE
+        | FALLOC_FL_COLLAPSE_RANGE
+        | FALLOC_FL_ZERO_RANGE
+        | FALLOC_FL_INSERT_RANGE;
+
+    if mode & !known_flags != 0 {
+        return KernelError::OperationNotSupported.sysret();
+    }
+
+    // PUNCH_HOLE requires KEEP_SIZE
+    if mode & FALLOC_FL_PUNCH_HOLE != 0 && mode & FALLOC_FL_KEEP_SIZE == 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+
+    // COLLAPSE_RANGE and INSERT_RANGE are mutually exclusive with other flags
+    if mode & FALLOC_FL_COLLAPSE_RANGE != 0 && mode != FALLOC_FL_COLLAPSE_RANGE {
+        return KernelError::InvalidArgument.sysret();
+    }
+    if mode & FALLOC_FL_INSERT_RANGE != 0 && mode != FALLOC_FL_INSERT_RANGE {
+        return KernelError::InvalidArgument.sysret();
+    }
+
+    // Get file from fd table
+    let file = match current_fd_table().lock().get(fd) {
+        Some(f) => f.clone(),
+        None => return KernelError::BadFd.sysret(),
+    };
+
+    // Must be open for writing
+    if !file.is_writable() {
+        return KernelError::BadFd.sysret();
+    }
+
+    // Get inode
+    let inode = match file.get_inode() {
+        Some(i) => i,
+        None => return KernelError::BadFd.sysret(),
+    };
+
+    // Must be a regular file
+    if !inode.mode().is_file() {
+        if inode.mode().is_dir() {
+            return KernelError::IsDirectory.sysret();
+        }
+        // Pipe or socket
+        return KernelError::IllegalSeek.sysret();
+    }
+
+    let offset_u64 = offset as u64;
+    let len_u64 = len as u64;
+    let current_size = inode.get_size();
+
+    // Handle different modes
+    if mode == 0 {
+        // Default mode: allocate space, extend file if needed
+        let new_size = offset_u64 + len_u64;
+        if new_size > current_size {
+            inode.set_size(new_size);
+        }
+        // For ramfs, no actual allocation needed (memory is allocated on write)
+        0
+    } else if mode & FALLOC_FL_KEEP_SIZE != 0 && mode & FALLOC_FL_PUNCH_HOLE != 0 {
+        // Punch hole: deallocate space (zero the range for ramfs)
+        // For ramfs, this is effectively a no-op since we don't track holes
+        0
+    } else if mode == FALLOC_FL_KEEP_SIZE {
+        // Allocate but don't extend size
+        // For ramfs, this is a no-op
+        0
+    } else if mode & FALLOC_FL_ZERO_RANGE != 0 {
+        // Zero range: zero the specified range
+        // For ramfs, we would need to write zeros to the range
+        // For now, treat as no-op (data will be zero when read if not written)
+        let keep_size = mode & FALLOC_FL_KEEP_SIZE != 0;
+        if !keep_size {
+            let new_size = offset_u64 + len_u64;
+            if new_size > current_size {
+                inode.set_size(new_size);
+            }
+        }
+        0
+    } else if mode == FALLOC_FL_COLLAPSE_RANGE {
+        // Collapse range: remove a hole, shift data left
+        // Requires more complex implementation
+        KernelError::OperationNotSupported.sysret()
+    } else if mode == FALLOC_FL_INSERT_RANGE {
+        // Insert range: create hole, shift data right
+        // Requires more complex implementation
+        KernelError::OperationNotSupported.sysret()
+    } else {
+        KernelError::OperationNotSupported.sysret()
+    }
+}

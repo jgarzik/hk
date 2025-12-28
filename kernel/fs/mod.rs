@@ -19,6 +19,7 @@ pub mod syscall;
 // Syscall implementation modules
 pub mod dir;
 pub mod fd;
+pub mod flock;
 pub mod io;
 pub mod iov;
 pub mod link;

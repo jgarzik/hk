@@ -7,6 +7,7 @@ pub mod misc;
 pub mod percpu;
 pub mod pgrp;
 pub mod proc;
+pub mod process_vm;
 pub mod sched;
 pub mod schedsys;
 pub mod syscall;
@@ -929,6 +930,13 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub personality: u32,
 
     // =========================================================================
+    // NUMA memory policy
+    // =========================================================================
+    /// Per-task NUMA memory policy (set via set_mempolicy)
+    /// Inherited by child tasks on fork.
+    pub mempolicy: crate::mm::mempolicy::TaskMempolicy,
+
+    // =========================================================================
     // Seccomp state (sandboxing)
     // =========================================================================
     /// Seccomp mode: 0=DISABLED, 1=STRICT, 2=FILTER
@@ -939,6 +947,15 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// On syscall entry, filters are run in order (newest first), and the most
     /// restrictive result wins.
     pub seccomp_filter: Option<Arc<SeccompFilter>>,
+
+    // =========================================================================
+    // I/O port permissions (x86-64 only)
+    // =========================================================================
+    /// Emulated I/O privilege level (x86-64 only)
+    /// 0-2 = no direct I/O access, 3 = full I/O port access
+    /// This is an emulation of the CPU IOPL mechanism, stored per-task.
+    #[cfg(target_arch = "x86_64")]
+    pub iopl_emul: u8,
 }
 
 impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {

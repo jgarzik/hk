@@ -45,6 +45,9 @@ pub const MAP_STACK: u32 = 0x20000;
 /// MAP_FIXED_NOREPLACE - like MAP_FIXED but fails with EEXIST instead of unmapping
 /// Safer alternative to MAP_FIXED that doesn't silently replace existing mappings
 pub const MAP_FIXED_NOREPLACE: u32 = 0x100000;
+/// MAP_NORESERVE - don't reserve swap space for this mapping
+/// Allows large sparse mappings without requiring swap reservation upfront
+pub const MAP_NORESERVE: u32 = 0x4000;
 
 /// Return value for failed mmap
 pub const MAP_FAILED: i64 = -1;
@@ -97,6 +100,10 @@ pub const VM_HUGEPAGE: u32 = 0x0100_0000;
 /// VMA explicitly prohibits transparent huge pages (madvise MADV_NOHUGEPAGE)
 /// When set, the kernel will never use huge pages for this VMA
 pub const VM_NOHUGEPAGE: u32 = 0x0200_0000;
+
+/// VMA does not require swap reservation (MAP_NORESERVE)
+/// Allows overcommit for this mapping without swap backing guarantee
+pub const VM_NORESERVE: u32 = 0x0400_0000;
 
 // ============================================================================
 // msync flags (MS_*)
@@ -189,6 +196,10 @@ pub struct Vma {
     /// Set for private anonymous mappings (MAP_ANONYMOUS | MAP_PRIVATE).
     /// Shared between parent and child on fork for COW pages.
     pub anon_vma: Option<Arc<AnonVma>>,
+    /// Per-VMA NUMA memory policy (set by mbind)
+    ///
+    /// If None, the task's default mempolicy is used.
+    pub mempolicy: Option<crate::mm::mempolicy::TaskMempolicy>,
 }
 
 impl Vma {
@@ -202,6 +213,7 @@ impl Vma {
             file: None,
             offset: 0,
             anon_vma: None,
+            mempolicy: None,
         }
     }
 
@@ -222,6 +234,7 @@ impl Vma {
             file: Some(file),
             offset,
             anon_vma: None,
+            mempolicy: None,
         }
     }
 
@@ -238,6 +251,7 @@ impl Vma {
             file: None,
             offset: 0,
             anon_vma: Some(anon_vma),
+            mempolicy: None,
         }
     }
 
@@ -305,6 +319,12 @@ impl Vma {
     #[inline]
     pub fn is_growsdown(&self) -> bool {
         self.flags & VM_GROWSDOWN != 0
+    }
+
+    /// Check if this VMA has no-reserve set (doesn't require swap reservation)
+    #[inline]
+    pub fn is_noreserve(&self) -> bool {
+        self.flags & VM_NORESERVE != 0
     }
 
     /// Check if this VMA can merge with another adjacent VMA

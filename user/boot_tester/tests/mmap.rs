@@ -58,6 +58,8 @@ pub fn run_tests() {
     // MAP_FIXED_NOREPLACE tests
     test_mmap_fixed_noreplace_success();
     test_mmap_fixed_noreplace_collision();
+    // MAP_NORESERVE test
+    test_mmap_noreserve();
     // msync tests
     test_msync_basic();
     test_msync_invalid_flags();
@@ -1187,6 +1189,42 @@ fn test_mmap_fixed_noreplace_collision() {
 
     sys_munmap(ptr as u64, 4096);
     println(b"MMAP_FIXED_NOREPLACE_EEXIST:OK");
+}
+
+/// Test: MAP_NORESERVE flag is accepted
+fn test_mmap_noreserve() {
+    const MAP_NORESERVE: u32 = 0x4000;
+
+    // Create anonymous mapping with MAP_NORESERVE
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MMAP_NORESERVE:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Verify we can read/write to it
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u32, 0x12345678);
+        let val = core::ptr::read_volatile(ptr as *const u32);
+        if val != 0x12345678 {
+            println(b"MMAP_NORESERVE:FAIL data mismatch");
+            sys_munmap(ptr as u64, 4096);
+            return;
+        }
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MMAP_NORESERVE:OK");
 }
 
 // ============================================================================

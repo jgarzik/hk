@@ -1,8 +1,8 @@
 1. Process / thread / scheduling
 1.1 Process creation & termination
 
-- [x] fork
-- [x] vfork
+- [x] fork (x86-64 only, legacy; use clone)
+- [x] vfork (x86-64 only, legacy; use clone with CLONE_VFORK)
 - [x] clone (Linux thread/process creation)
 - [x] clone3
 - [x] execve
@@ -11,7 +11,6 @@
 - [x] exit_group
 - [x] wait4
 - [x] waitid
-- [ ] waitpid (on some architectures; often a libc wrapper around wait4/waitid)
 
 1.2 Process IDs & basic info
 
@@ -33,7 +32,6 @@
 - [x] sched_getparam
 - [x] sched_setparam
 - [x] sched_rr_get_interval
-- [x] nice (usually via setpriority)
 - [x] getpriority
 - [x] setpriority
 
@@ -50,12 +48,12 @@
 
 2.1 FD lifecycle
 
-- [x] open
+- [x] open (x86-64 only, legacy; use openat)
 - [x] openat
 - [x] close
-- [x] creat (via open with O_CREAT)
+- [x] creat (x86-64 only, legacy; use openat with O_CREAT)
 - [x] dup
-- [x] dup2
+- [x] dup2 (x86-64 only, legacy; use dup3)
 - [x] dup3
 - [x] fcntl
 
@@ -72,39 +70,43 @@
 - [x] pwritev
 - [x] pwritev2
 - [x] lseek
-- [x] truncate
-- [x] ftruncate
+- [x] truncate (x86-64 only, legacy)
+- [x] ftruncate (x86-64 only, legacy)
 
 2.3 Special I/O helpers
 
-- [x] sendfile
+- [x] sendfile (x86-64 only, legacy)
 - [x] splice
 - [x] tee
 - [x] vmsplice
+- [x] copy_file_range
 - [x] ioctl
 - [x] sync
 - [x] fsync
 - [x] fdatasync
 - [x] syncfs
+- [x] sync_file_range (x86-64) / sync_file_range2 (aarch64; different arg order)
+- [x] flock (advisory file locking)
+- [x] fallocate (file space manipulation)
 
 3. Filesystem / path / metadata
 3.1 Paths & directory ops
 
-- [x] mkdir
+- [x] mkdir (x86-64 only, legacy; use mkdirat)
 - [x] mkdirat
-- [x] rmdir
-- [x] link
+- [x] rmdir (x86-64 only, legacy; use unlinkat with AT_REMOVEDIR)
+- [x] link (x86-64 only, legacy; use linkat)
 - [x] linkat
-- [x] unlink
+- [x] unlink (x86-64 only, legacy; use unlinkat)
 - [x] unlinkat
-- [x] rename
-- [x] renameat
+- [x] rename (x86-64 only, legacy; use renameat2)
+- [x] renameat (x86-64 only, legacy; use renameat2)
 - [x] renameat2
-- [x] symlink
+- [x] symlink (x86-64 only, legacy; use symlinkat)
 - [x] symlinkat
-- [x] readlink
+- [x] readlink (x86-64 only, legacy; use readlinkat)
 - [x] readlinkat
-- [x] mknod
+- [x] mknod (x86-64 only, legacy; use mknodat)
 - [x] mknodat
 - [x] chdir
 - [x] fchdir
@@ -115,33 +117,33 @@
 
 New kernels mostly use statx; older ones use stat/lstat/fstat.
 
-- [x] stat
-- [x] lstat
-- [x] fstat
-- [x] newfstatat / fstatat64 (aarch64)
-- [x] statfs
-- [x] fstatfs
+- [x] stat (x86-64 only, legacy; use fstatat/statx)
+- [x] lstat (x86-64 only, legacy; use fstatat/statx)
+- [x] fstat (x86-64 only, legacy; use fstatat/statx)
+- [x] newfstatat (fstatat on aarch64)
+- [x] statfs (x86-64 only, legacy)
+- [x] fstatfs (x86-64 only, legacy)
 - [x] statx (modern richer interface)
 
 Permissions and ownership:
 
-- [x] access
+- [x] access (x86-64 only, legacy; use faccessat)
 - [x] faccessat
 - [x] faccessat2
-- [x] chmod
+- [x] chmod (x86-64 only, legacy; use fchmodat)
 - [x] fchmod
 - [x] fchmodat
 - [x] fchmodat2
-- [x] chown
+- [x] chown (x86-64 only, legacy; use fchownat)
 - [x] fchown
-- [x] lchown
+- [x] lchown (x86-64 only, legacy; use fchownat with AT_SYMLINK_NOFOLLOW)
 - [x] fchownat
 - [x] umask
 
 Timestamps:
 
-- [x] utime
-- [x] utimes
+- [x] utime (x86-64 only, legacy; use utimensat)
+- [x] utimes (x86-64 only, legacy; use utimensat)
 - [x] utimensat
 
 Extended attributes (Linux-specific):
@@ -161,7 +163,7 @@ Extended attributes (Linux-specific):
 
 3.3 Directory enumeration
 
-- [n/a] getdents (legacy 32-bit syscall; aarch64 lacks it, use getdents64)
+- [x] getdents (x86-64 only, legacy; use getdents64)
 - [x] getdents64
 
 4. Memory management
@@ -185,11 +187,11 @@ Extended attributes (Linux-specific):
 
 4.2 NUMA / memory policy (optional but Linuxy)
 
-- [ ] get_mempolicy
-- [ ] set_mempolicy
-- [ ] mbind
-- [ ] migrate_pages
-- [ ] move_pages
+- [x] get_mempolicy
+- [x] set_mempolicy
+- [x] mbind
+- [x] migrate_pages
+- [x] move_pages
 
 5. Signals
 
@@ -203,7 +205,7 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] rt_sigsuspend
 - [x] rt_tgsigqueueinfo
 - [x] sigaltstack
-- [x] signalfd
+- [x] signalfd (x86-64 only, legacy; use signalfd4)
 - [x] signalfd4
 - [x] tgkill (targeted kill by tid)
 - [x] kill
@@ -212,9 +214,9 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 6. Time & timers
 6.1 Basic time
 
-- [x] time
+- [x] time (x86-64 only, legacy; use clock_gettime)
 - [x] gettimeofday
-- [x] settimeofday (x86_64 only)
+- [x] settimeofday
 - [x] adjtimex (NTP)
 - [x] clock_gettime
 - [x] clock_settime
@@ -239,9 +241,9 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 7. IPC: pipes, futex, SysV IPC, POSIX MQ, pidfd
 7.1 Pipes & simple IPC
 
-- [x] pipe
+- [x] pipe (x86-64 only, legacy; use pipe2)
 - [x] pipe2
-- [x] eventfd
+- [x] eventfd (x86-64 only, legacy; use eventfd2)
 - [x] eventfd2
 - [x] pidfd_open
 - [x] pidfd_send_signal
@@ -304,20 +306,20 @@ Linux groups the socket syscalls as their own "network" category.
 9. Polling & event notification
 9.1 Select/poll/epoll
 
-- [x] select
+- [x] select (x86-64 only, legacy; use pselect6)
 - [x] pselect6
-- [x] poll
+- [x] poll (x86-64 only, legacy; use ppoll)
 - [x] ppoll
-- [x] epoll_create
+- [x] epoll_create (x86-64 only, legacy; use epoll_create1)
 - [x] epoll_create1
 - [x] epoll_ctl
-- [x] epoll_wait
+- [x] epoll_wait (x86-64 only, legacy; use epoll_pwait)
 - [x] epoll_pwait
-- [x] epoll_pwait2 (newer)
+- [x] epoll_pwait2
 
 9.2 Inotify & fanotify (fs events)
 
-- [x] inotify_init
+- [x] inotify_init (x86-64 only, legacy; use inotify_init1)
 - [x] inotify_init1
 - [x] inotify_add_watch
 - [x] inotify_rm_watch
@@ -364,7 +366,6 @@ Linux groups the socket syscalls as their own "network" category.
 - [x] seccomp (SECCOMP_SET_MODE_STRICT, SECCOMP_SET_MODE_FILTER with eBPF support)
 - [x] prctl (PR_SET/GET_NAME, PR_SET/GET_DUMPABLE, PR_SET/GET_NO_NEW_PRIVS, PR_SET/GET_TIMERSLACK, PR_SET/GET_SECCOMP)
 - [x] mlock / mlockall (already listed under memory)
-- [x] settimeofday (x86_64 only) / [n/a] adjtimex (privileged)
 
 11. Namespaces, containers, mounts, cgroups
 11.1 Mounts & root
@@ -401,36 +402,35 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 - [x] acct
 - [x] swapon
 - [x] swapoff
-- [ ] sysfs (legacy)
 - [x] getcpu
-- [ ] getpid / getppid (already listed)
-- [ ] gettimeofday (already listed)
 
 13. Debugging, perf, BPF
 
 - [ ] ptrace
 - [ ] perf_event_open
-- [ ] bpf
+- [x] bpf (BPF_MAP_CREATE, BPF_MAP_LOOKUP/UPDATE/DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, BPF_PROG_LOAD, BPF_OBJ_GET_INFO_BY_FD; map types: HASH, ARRAY; program type: SOCKET_FILTER)
 - [x] membarrier
 - [x] kcmp (compare processes)
+- [x] process_vm_readv
+- [x] process_vm_writev
 - [ ] rseq (restartable sequences)
 
 14. Thread-local, arch-specific, misc
 
-- [x] arch_prctl (TLS, FS/GS base on x86-64)
-- [ ] set_thread_area / get_thread_area (32-bit oriented)
-- [ ] get_thread_area (arch-specific)
+- [x] arch_prctl (x86-64 only; TLS, FS/GS base)
+- [x] iopl (x86-64 only; I/O port privilege level)
+- [x] ioperm (x86-64 only; returns ENOSYS - requires TSS I/O bitmap)
+- [ ] modify_ldt (x86-64 only; LDT manipulation)
 
 Misc utilities that don't fit elsewhere:
 
-- [ ] getpgid / setpgid (already listed)
 - [x] personality
-- [x] umount / umount2 (already listed)
 - [x] vhangup
 - [x] readahead
-- [ ] sysfs (legacy)
-- fanotify_* (already listed)
-- landlock_add_rule, landlock_restrict_self (if you want Landlock later)
+- [x] alarm (x86-64 only, legacy; use timer APIs)
+- [x] pause (x86-64 only, legacy; use sigsuspend/ppoll)
+- [x] getpgrp (x86-64 only, legacy; use getpgid(0))
+- [x] ustat (x86-64 only, legacy; deprecated filesystem syscall)
 
 15. "Probably later" / niche syscalls
 
