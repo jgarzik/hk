@@ -1207,3 +1207,84 @@ fn check_pidfd_getfd_permission(target_tid: super::Tid) -> bool {
         None => false, // Target doesn't exist
     }
 }
+
+// =============================================================================
+// I/O port permissions (x86-64 only)
+// =============================================================================
+
+/// iopl - Set I/O privilege level (x86-64 only)
+///
+/// Changes the I/O privilege level of the calling thread. The IOPL determines
+/// which I/O ports the thread can access.
+///
+/// # Arguments
+/// * `level` - The new IOPL level (0-3). Level 3 grants access to all I/O ports.
+///
+/// # Returns
+/// * 0 on success
+/// * -EINVAL if level > 3
+/// * -EPERM if trying to raise privilege without CAP_SYS_RAWIO
+///
+/// # Security
+/// Lowering the privilege level is always allowed. Raising it requires
+/// CAP_SYS_RAWIO capability.
+///
+/// # Note
+/// This is an emulated IOPL - it doesn't modify the CPU's actual IOPL register.
+/// The kernel stores the level per-task and uses it for permission checks.
+#[cfg(target_arch = "x86_64")]
+pub fn sys_iopl(level: u32) -> i64 {
+    use crate::task::{CAP_SYS_RAWIO, capable};
+
+    const EINVAL: i64 = 22;
+    const EPERM: i64 = 1;
+
+    // Validate level (must be 0-3)
+    if level > 3 {
+        return -EINVAL;
+    }
+
+    // Get current IOPL level
+    let old = super::percpu::current_iopl_emul();
+
+    // No change? Done.
+    if level == old as u32 {
+        return 0;
+    }
+
+    // Lowering privilege is always allowed
+    if level < old as u32 {
+        super::percpu::set_current_iopl_emul(level as u8);
+        return 0;
+    }
+
+    // Raising privilege requires CAP_SYS_RAWIO
+    if !capable(CAP_SYS_RAWIO) {
+        return -EPERM;
+    }
+
+    // Set new level
+    super::percpu::set_current_iopl_emul(level as u8);
+    0
+}
+
+/// ioperm - Set port input/output permissions (x86-64 only, stub)
+///
+/// This syscall allows fine-grained control over individual I/O ports (0-0x3ff).
+///
+/// # Arguments
+/// * `from` - Starting port number
+/// * `num` - Number of ports
+/// * `turn_on` - 1 to enable access, 0 to disable
+///
+/// # Returns
+/// * -ENOSYS - Not implemented (requires TSS I/O bitmap infrastructure)
+///
+/// # Note
+/// Full ioperm implementation requires per-task I/O permission bitmaps in the TSS.
+/// This is not yet implemented. Use iopl(3) for full I/O port access.
+#[cfg(target_arch = "x86_64")]
+pub fn sys_ioperm(_from: u64, _num: u64, _turn_on: i32) -> i64 {
+    const ENOSYS: i64 = 38;
+    -ENOSYS
+}

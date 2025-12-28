@@ -630,6 +630,12 @@ pub const SYS_VHANGUP: u64 = 153;
 /// personality(persona) - Set process execution domain
 pub const SYS_PERSONALITY: u64 = 135;
 
+// I/O port permissions (x86-64 only)
+/// iopl(level) - Set I/O privilege level (0-3)
+pub const SYS_IOPL: u64 = 172;
+/// ioperm(from, num, turn_on) - Set port permissions for first 0x3ff ports
+pub const SYS_IOPERM: u64 = 173;
+
 // pidfd syscalls
 /// pidfd_send_signal(pidfd, sig, info, flags) - Send signal to process via pidfd
 pub const SYS_PIDFD_SEND_SIGNAL: u64 = 424;
@@ -1510,6 +1516,16 @@ pub fn x86_64_syscall_dispatch(
         SYS_PERSONALITY => {
             use crate::task::syscall::sys_personality;
             sys_personality(arg0 as u32) as u64
+        }
+
+        // I/O port permissions (x86-64 only)
+        SYS_IOPL => {
+            use crate::task::syscall::sys_iopl;
+            sys_iopl(arg0 as u32) as u64
+        }
+        SYS_IOPERM => {
+            use crate::task::syscall::sys_ioperm;
+            sys_ioperm(arg0, arg1, arg2 as i32) as u64
         }
 
         // System logging

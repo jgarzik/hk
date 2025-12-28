@@ -42,6 +42,8 @@ pub mod process_vm;
 pub mod mempolicy;
 pub mod tty;
 pub mod cgroup;
+#[cfg(target_arch = "x86_64")]
+pub mod ioport;
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -83,4 +85,6 @@ pub fn run_all_tests() {
     tty::run_tests();
     cgroup::run_tests();
     mempolicy::run_tests();
+    #[cfg(target_arch = "x86_64")]
+    ioport::run_tests();
 }

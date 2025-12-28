@@ -415,8 +415,8 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 14. Thread-local, arch-specific, misc
 
 - [x] arch_prctl (x86-64 only; TLS, FS/GS base)
-- [ ] iopl (x86-64 only; I/O port privilege level)
-- [ ] ioperm (x86-64 only; I/O port permissions)
+- [x] iopl (x86-64 only; I/O port privilege level)
+- [x] ioperm (x86-64 only; returns ENOSYS - requires TSS I/O bitmap)
 - [ ] modify_ldt (x86-64 only; LDT manipulation)
 
 Misc utilities that don't fit elsewhere:

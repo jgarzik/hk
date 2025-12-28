@@ -1888,6 +1888,48 @@ pub fn sys_personality(persona: u32) -> i64 {
 }
 
 // ============================================================================
+// I/O port permissions (x86-64 only)
+// ============================================================================
+
+/// iopl(level) - set I/O privilege level
+///
+/// Changes the I/O privilege level of the calling thread. Level 3 grants
+/// access to all 65536 I/O ports.
+///
+/// # Arguments
+/// * `level` - The new IOPL level (0-3)
+///
+/// # Returns
+/// * 0 on success
+/// * -EINVAL if level > 3
+/// * -EPERM if raising privilege without CAP_SYS_RAWIO
+const SYS_IOPL: u64 = 172;
+
+#[inline(always)]
+pub fn sys_iopl(level: u32) -> i64 {
+    unsafe { syscall1!(SYS_IOPL, level) }
+}
+
+/// ioperm(from, num, turn_on) - set port input/output permissions
+///
+/// Sets permissions for the specified I/O port range (ports 0-0x3ff only).
+///
+/// # Arguments
+/// * `from` - Starting port number
+/// * `num` - Number of ports
+/// * `turn_on` - 1 to enable access, 0 to disable
+///
+/// # Returns
+/// * 0 on success
+/// * -ENOSYS (not implemented in this kernel)
+const SYS_IOPERM: u64 = 173;
+
+#[inline(always)]
+pub fn sys_ioperm(from: u64, num: u64, turn_on: i32) -> i64 {
+    unsafe { syscall3!(SYS_IOPERM, from, num, turn_on) }
+}
+
+// ============================================================================
 // syslog (kernel logging)
 // ============================================================================
 

@@ -947,6 +947,15 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// On syscall entry, filters are run in order (newest first), and the most
     /// restrictive result wins.
     pub seccomp_filter: Option<Arc<SeccompFilter>>,
+
+    // =========================================================================
+    // I/O port permissions (x86-64 only)
+    // =========================================================================
+    /// Emulated I/O privilege level (x86-64 only)
+    /// 0-2 = no direct I/O access, 3 = full I/O port access
+    /// This is an emulation of the CPU IOPL mechanism, stored per-task.
+    #[cfg(target_arch = "x86_64")]
+    pub iopl_emul: u8,
 }
 
 impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {

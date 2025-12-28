@@ -442,6 +442,9 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         // Seccomp state (kernel threads don't use seccomp)
         seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
         seccomp_filter: None,
+        // I/O port permissions (x86-64 only, kernel threads don't use I/O ports)
+        #[cfg(target_arch = "x86_64")]
+        iopl_emul: 0,
     };
 
     // Add task to global table
@@ -560,6 +563,9 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         // Seccomp state (disabled initially)
         seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
         seccomp_filter: None,
+        // I/O port permissions (x86-64 only, no I/O port access initially)
+        #[cfg(target_arch = "x86_64")]
+        iopl_emul: 0,
     };
 
     // Add to global table
@@ -880,6 +886,18 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         )
     };
 
+    // Get parent iopl_emul (x86-64 only) - must be done in separate block
+    #[cfg(target_arch = "x86_64")]
+    let parent_iopl_emul = {
+        let table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter()
+            .find(|t| t.tid == current_tid)
+            .map(|t| t.iopl_emul)
+            .unwrap_or(0)
+    };
+
     // Validate CLONE_PARENT: cannot be used by init process (pid 1)
     // Linux checks for SIGNAL_UNKILLABLE flag, but we simplify to pid == 1
     if config.flags & CLONE_PARENT != 0 && parent_pid == 1 {
@@ -1055,6 +1073,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         // Seccomp filters are reference-counted, so this is cheap
         seccomp_mode: parent_seccomp_mode,
         seccomp_filter: parent_seccomp_filter,
+        // I/O port permissions (x86-64 only, inherited from parent)
+        #[cfg(target_arch = "x86_64")]
+        iopl_emul: parent_iopl_emul,
     };
 
     // Add to global task table
@@ -2644,5 +2665,36 @@ pub fn set_current_personality(personality: u32) {
     let mut table = TASK_TABLE.lock();
     if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
         task.personality = personality;
+    }
+}
+
+// =============================================================================
+// I/O port permissions (x86-64 only)
+// =============================================================================
+
+/// Get the current task's emulated IOPL level (x86-64 only)
+///
+/// Returns 0-3, where 3 grants full I/O port access.
+#[cfg(target_arch = "x86_64")]
+pub fn current_iopl_emul() -> u8 {
+    let tid = current_tid();
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .map(|t| t.iopl_emul)
+        .unwrap_or(0)
+}
+
+/// Set the current task's emulated IOPL level (x86-64 only)
+///
+/// Level must be 0-3. Caller is responsible for privilege checks.
+#[cfg(target_arch = "x86_64")]
+pub fn set_current_iopl_emul(level: u8) {
+    let tid = current_tid();
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.iopl_emul = level;
     }
 }
