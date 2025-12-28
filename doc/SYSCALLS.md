@@ -188,8 +188,8 @@ Extended attributes (Linux-specific):
 - [x] get_mempolicy
 - [x] set_mempolicy
 - [x] mbind
-- [ ] migrate_pages
-- [ ] move_pages
+- [x] migrate_pages
+- [x] move_pages
 
 5. Signals
 

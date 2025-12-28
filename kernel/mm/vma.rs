@@ -196,6 +196,10 @@ pub struct Vma {
     /// Set for private anonymous mappings (MAP_ANONYMOUS | MAP_PRIVATE).
     /// Shared between parent and child on fork for COW pages.
     pub anon_vma: Option<Arc<AnonVma>>,
+    /// Per-VMA NUMA memory policy (set by mbind)
+    ///
+    /// If None, the task's default mempolicy is used.
+    pub mempolicy: Option<crate::mm::mempolicy::TaskMempolicy>,
 }
 
 impl Vma {
@@ -209,6 +213,7 @@ impl Vma {
             file: None,
             offset: 0,
             anon_vma: None,
+            mempolicy: None,
         }
     }
 
@@ -229,6 +234,7 @@ impl Vma {
             file: Some(file),
             offset,
             anon_vma: None,
+            mempolicy: None,
         }
     }
 
@@ -245,6 +251,7 @@ impl Vma {
             file: None,
             offset: 0,
             anon_vma: Some(anon_vma),
+            mempolicy: None,
         }
     }
 

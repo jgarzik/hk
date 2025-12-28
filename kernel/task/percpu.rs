@@ -437,6 +437,8 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         prctl: crate::task::PrctlState::default(),
         // Process personality (execution domain)
         personality: 0,
+        // NUMA memory policy (kernel threads use default)
+        mempolicy: crate::mm::mempolicy::TaskMempolicy::new(),
         // Seccomp state (kernel threads don't use seccomp)
         seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
         seccomp_filter: None,
@@ -553,6 +555,8 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         prctl: crate::task::PrctlState::default(),
         // Process personality (execution domain)
         personality: 0,
+        // NUMA memory policy (user processes start with default)
+        mempolicy: crate::mm::mempolicy::TaskMempolicy::new(),
         // Seccomp state (disabled initially)
         seccomp_mode: crate::seccomp::SECCOMP_MODE_DISABLED,
         seccomp_filter: None,
@@ -849,6 +853,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_cred,
         parent_prctl,
         parent_personality,
+        parent_mempolicy,
         parent_seccomp_mode,
         parent_seccomp_filter,
     ) = {
@@ -869,6 +874,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.cred.clone(),
             parent.prctl.clone(),
             parent.personality,
+            parent.mempolicy,
             parent.seccomp_mode,
             parent.seccomp_filter.clone(),
         )
@@ -1043,6 +1049,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         },
         // Process personality (inherited from parent)
         personality: parent_personality,
+        // NUMA memory policy (inherited from parent)
+        mempolicy: parent_mempolicy,
         // Seccomp state (inherited from parent)
         // Seccomp filters are reference-counted, so this is cheap
         seccomp_mode: parent_seccomp_mode,

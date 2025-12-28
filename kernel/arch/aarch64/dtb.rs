@@ -329,6 +329,206 @@ pub unsafe fn extract_simple_framebuffer(dtb_ptr: u64) -> Option<crate::gfx::Fra
     ))
 }
 
+/// Initialize NUMA topology from device tree numa-node-id properties
+///
+/// Looks for `numa-node-id` properties on `/memory` and `/cpus/cpu@N` nodes.
+/// Returns Ok(true) if NUMA topology was found, Ok(false) if no NUMA info
+/// (caller should use single-node fallback).
+///
+/// # Safety
+/// The dtb_ptr must point to a valid FDT blob in memory.
+pub fn init_numa_topology(dtb_ptr: u64) -> Result<bool, &'static str> {
+    use crate::numa::{LOCAL_DISTANCE, MAX_NUMA_NODES, NUMA_TOPOLOGY, NumaNode, REMOTE_DISTANCE};
+
+    if dtb_ptr == 0 {
+        return Ok(false);
+    }
+
+    // Parse DTB header for size
+    let dtb_data = unsafe {
+        let header = core::slice::from_raw_parts(dtb_ptr as *const u8, 8);
+
+        // Check magic number first (big-endian 0xd00dfeed)
+        if header[0] != 0xd0 || header[1] != 0x0d || header[2] != 0xfe || header[3] != 0xed {
+            return Ok(false);
+        }
+
+        let totalsize = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+
+        // Sanity check size (between 1KB and 16MB)
+        if !(1024..=16 * 1024 * 1024).contains(&totalsize) {
+            return Ok(false);
+        }
+
+        core::slice::from_raw_parts(dtb_ptr as *const u8, totalsize)
+    };
+
+    let dt = match DeviceTree::from_fdt(dtb_data) {
+        Ok(dt) => dt,
+        Err(_) => return Ok(false),
+    };
+
+    let mut found_numa = false;
+    let mut topology = NUMA_TOPOLOGY.lock();
+
+    // Extract memory nodes with numa-node-id
+    // Memory nodes can be /memory or /memory@ADDR
+    let root = match dt.find_node("/") {
+        Some(root) => root,
+        None => return Ok(false),
+    };
+
+    for child in root.children() {
+        let name = child.name();
+        if (name == "memory" || name.starts_with("memory@"))
+            && let Some(numa_prop) = child.property("numa-node-id")
+            && let Some(node_id) = numa_prop.as_u32()
+        {
+            let node_id = node_id as usize;
+            if node_id < MAX_NUMA_NODES {
+                found_numa = true;
+
+                // Get memory region from reg property
+                if let Some((Some(base), Some(size))) = child.reg() {
+                    let start_pfn = base / 4096;
+                    let end_pfn = (base + size) / 4096;
+                    let pages = size / 4096;
+
+                    // Get or create node
+                    if topology.nodes[node_id].is_none() {
+                        topology.nodes[node_id] = Some(NumaNode::new(node_id as u32));
+                        topology.node_online_mask |= 1u64 << node_id;
+                    }
+
+                    if let Some(ref mut node) = topology.nodes[node_id] {
+                        // Extend node's memory range
+                        if node.start_pfn == 0 || start_pfn < node.start_pfn {
+                            node.start_pfn = start_pfn;
+                        }
+                        if end_pfn > node.end_pfn {
+                            node.end_pfn = end_pfn;
+                        }
+                        node.present_pages += pages;
+                    }
+                }
+            }
+        }
+    }
+
+    // Extract CPU NUMA affinity from /cpus/cpu@N nodes
+    if let Some(cpus_node) = dt.find_node("/cpus") {
+        for cpu_child in cpus_node.children() {
+            let name = cpu_child.name();
+            if !name.starts_with("cpu@") && name != "cpu" {
+                continue;
+            }
+
+            // Check if this is actually a CPU node
+            let is_cpu = cpu_child
+                .property("device_type")
+                .and_then(|p| p.as_str())
+                .map(|s| s == "cpu")
+                .unwrap_or(name.starts_with("cpu@") || name == "cpu");
+
+            if !is_cpu {
+                continue;
+            }
+
+            // Get CPU ID from reg property
+            let cpu_id = match cpu_child.property("reg") {
+                Some(reg) => reg.as_u32().unwrap_or(0),
+                None => continue,
+            };
+
+            // Get numa-node-id if present
+            if let Some(numa_prop) = cpu_child.property("numa-node-id")
+                && let Some(node_id) = numa_prop.as_u32()
+            {
+                let node_id = node_id as usize;
+                if node_id < MAX_NUMA_NODES && (cpu_id as usize) < crate::numa::MAX_CPUS {
+                    found_numa = true;
+                    topology.cpu_to_node[cpu_id as usize] = node_id as u8;
+
+                    // Ensure node exists
+                    if topology.nodes[node_id].is_none() {
+                        topology.nodes[node_id] = Some(NumaNode::new(node_id as u32));
+                        topology.node_online_mask |= 1u64 << node_id;
+                    }
+
+                    // Add CPU to node's cpu_mask
+                    if cpu_id < 64
+                        && let Some(ref mut node) = topology.nodes[node_id]
+                    {
+                        node.add_cpu(cpu_id);
+                    }
+                }
+            }
+        }
+    }
+
+    if !found_numa {
+        return Ok(false);
+    }
+
+    // Update node count
+    topology.nr_nodes = topology.node_online_mask.count_ones() as usize;
+
+    // Check for numa-distance-map-v1 (optional)
+    // Look for /distance-map compatible = "numa-distance-map-v1"
+    let distance_nodes = dt.find_compatible("numa-distance-map-v1");
+    if let Some(dist_node) = distance_nodes.first() {
+        // distance-matrix property format: <from1 to1 dist1 from2 to2 dist2 ...>
+        if let Some(dist_prop) = dist_node.property("distance-matrix") {
+            let data = dist_prop.data();
+            // Each entry is 3 u32s (12 bytes): from, to, distance
+            let entries = data.len() / 12;
+            for i in 0..entries {
+                let offset = i * 12;
+                if offset + 12 <= data.len() {
+                    let from = u32::from_be_bytes([
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                    ]) as usize;
+                    let to = u32::from_be_bytes([
+                        data[offset + 4],
+                        data[offset + 5],
+                        data[offset + 6],
+                        data[offset + 7],
+                    ]) as usize;
+                    let dist = u32::from_be_bytes([
+                        data[offset + 8],
+                        data[offset + 9],
+                        data[offset + 10],
+                        data[offset + 11],
+                    ]) as u8;
+
+                    if from < MAX_NUMA_NODES && to < MAX_NUMA_NODES {
+                        topology.set_distance(from, to, dist);
+                    }
+                }
+            }
+        }
+    } else {
+        // No distance map, use defaults
+        for from in 0..MAX_NUMA_NODES {
+            for to in 0..MAX_NUMA_NODES {
+                if from == to {
+                    topology.set_distance(from, to, LOCAL_DISTANCE);
+                } else {
+                    topology.set_distance(from, to, REMOTE_DISTANCE);
+                }
+            }
+        }
+    }
+
+    // Mark as initialized
+    topology.set_initialized();
+
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     // Tests would go here, but require std for the test framework

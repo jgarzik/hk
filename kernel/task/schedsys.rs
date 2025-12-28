@@ -28,6 +28,7 @@ use super::Pid;
 /// None required - reads per-CPU data which is stable during syscall execution.
 /// This matches Linux's implementation which uses raw_smp_processor_id().
 pub fn sys_getcpu<A: crate::uaccess::UaccessArch>(cpu: u32, cpup: u64, nodep: u64) -> i64 {
+    use crate::numa::NUMA_TOPOLOGY;
     use crate::uaccess::put_user;
 
     // Write CPU number if pointer provided
@@ -40,12 +41,14 @@ pub fn sys_getcpu<A: crate::uaccess::UaccessArch>(cpu: u32, cpup: u64, nodep: u6
         }
     }
 
-    // Write NUMA node if pointer provided (always 0 - no NUMA support)
+    // Write NUMA node if pointer provided
     if nodep != 0 {
         if !A::access_ok(nodep, core::mem::size_of::<u32>()) {
             return KernelError::BadAddress.sysret();
         }
-        if put_user::<A, u32>(nodep, 0).is_err() {
+        // Look up NUMA node for this CPU from the topology
+        let node = NUMA_TOPOLOGY.lock().cpu_to_node(cpu);
+        if put_user::<A, u32>(nodep, node).is_err() {
             return KernelError::BadAddress.sysret();
         }
     }

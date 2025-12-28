@@ -930,6 +930,13 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub personality: u32,
 
     // =========================================================================
+    // NUMA memory policy
+    // =========================================================================
+    /// Per-task NUMA memory policy (set via set_mempolicy)
+    /// Inherited by child tasks on fork.
+    pub mempolicy: crate::mm::mempolicy::TaskMempolicy,
+
+    // =========================================================================
     // Seccomp state (sandboxing)
     // =========================================================================
     /// Seccomp mode: 0=DISABLED, 1=STRICT, 2=FILTER

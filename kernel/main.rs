@@ -61,6 +61,7 @@ pub mod mm;
 #[cfg(target_arch = "x86_64")]
 mod multiboot2;
 pub mod ns;
+pub mod numa;
 mod power;
 mod random;
 mod rlimit;
@@ -504,6 +505,54 @@ where
     Ok(USER_STACK_TOP)
 }
 
+/// Initialize NUMA topology from firmware
+///
+/// On x86-64, parses ACPI SRAT/SLIT tables.
+/// On aarch64, extracts numa-node-id properties from device tree.
+///
+/// Falls back to single-node topology if no NUMA info is available.
+fn init_numa_topology() {
+    let (_alloc_base, alloc_size) = CurrentArch::get_frame_alloc_region();
+    let total_pages = alloc_size / 4096;
+    let nr_cpus = 1; // Will be updated when SMP is initialized
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        match arch::x86_64::acpi::init_numa_topology() {
+            Ok(true) => {
+                numa::print_topology();
+                return;
+            }
+            Ok(false) => {
+                // No SRAT table, use single-node fallback
+            }
+            Err(e) => {
+                printkln!("NUMA: ACPI parse error: {}", e);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let dtb_ptr = unsafe { DTB_PTR };
+        match arch::aarch64::dtb::init_numa_topology(dtb_ptr) {
+            Ok(true) => {
+                numa::print_topology();
+                return;
+            }
+            Ok(false) => {
+                // No numa-node-id properties, use single-node fallback
+            }
+            Err(e) => {
+                printkln!("NUMA: DTB parse error: {}", e);
+            }
+        }
+    }
+
+    // Fallback to single-node topology
+    numa::init_single_node_fallback(total_pages, nr_cpus);
+}
+
 /// Discover boot framebuffer from firmware
 ///
 /// On x86-64, parses the multiboot2 framebuffer tag.
@@ -569,7 +618,14 @@ fn kmain() -> ! {
     CurrentArch::ioremap_init();
 
     // ========================================================================
-    // Phase 1b: Graphics Framebuffer Discovery
+    // Phase 1b: NUMA Topology Discovery
+    // ========================================================================
+    // Initialize NUMA topology from firmware (ACPI SRAT on x86, DTB numa-node-id on arm)
+    // This must happen after ioremap_init but before SMP init
+    init_numa_topology();
+
+    // ========================================================================
+    // Phase 1c: Graphics Framebuffer Discovery
     // ========================================================================
     // Discover boot framebuffer from firmware (multiboot2 on x86, DTB on arm)
     // This must happen after ioremap_init but before we heavily use the frame allocator

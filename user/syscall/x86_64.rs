@@ -1179,6 +1179,10 @@ pub const SYS_GET_MEMPOLICY: u64 = 239;
 pub const SYS_SET_MEMPOLICY: u64 = 238;
 /// mbind syscall number
 pub const SYS_MBIND: u64 = 237;
+/// migrate_pages syscall number
+pub const SYS_MIGRATE_PAGES: u64 = 256;
+/// move_pages syscall number
+pub const SYS_MOVE_PAGES: u64 = 279;
 
 /// get_mempolicy - Get NUMA memory policy
 ///
@@ -1229,6 +1233,44 @@ pub fn sys_mbind(
     flags: u32,
 ) -> i64 {
     unsafe { syscall6!(SYS_MBIND, start, len, mode, nodemask, maxnode, flags) }
+}
+
+/// migrate_pages - Migrate pages between NUMA nodes
+///
+/// # Arguments
+/// * `pid` - Target process ID (0 = current)
+/// * `maxnode` - Maximum node number + 1
+/// * `old_nodes` - Pointer to old nodes bitmask
+/// * `new_nodes` - Pointer to new nodes bitmask
+#[inline(always)]
+pub fn sys_migrate_pages(
+    pid: i64,
+    maxnode: u64,
+    old_nodes: *const u64,
+    new_nodes: *const u64,
+) -> i64 {
+    unsafe { syscall4!(SYS_MIGRATE_PAGES, pid, maxnode, old_nodes, new_nodes) }
+}
+
+/// move_pages - Move pages to specific NUMA nodes
+///
+/// # Arguments
+/// * `pid` - Target process ID (0 = current)
+/// * `nr_pages` - Number of pages
+/// * `pages` - Array of page addresses
+/// * `nodes` - Array of target nodes (or NULL for query)
+/// * `status` - Array for status output
+/// * `flags` - MPOL_MF_MOVE or MPOL_MF_MOVE_ALL
+#[inline(always)]
+pub fn sys_move_pages(
+    pid: i64,
+    nr_pages: u64,
+    pages: *const u64,
+    nodes: *const i32,
+    status: *mut i32,
+    flags: i32,
+) -> i64 {
+    unsafe { syscall6!(SYS_MOVE_PAGES, pid, nr_pages, pages, nodes, status, flags) }
 }
 
 // --- System Information ---

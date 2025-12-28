@@ -23,6 +23,12 @@ const MADT_SIGNATURE: &[u8; 4] = b"APIC";
 /// FADT signature "FACP" (Fixed ACPI Description Table)
 const FADT_SIGNATURE: &[u8; 4] = b"FACP";
 
+/// SRAT signature "SRAT" (System Resource Affinity Table)
+const SRAT_SIGNATURE: &[u8; 4] = b"SRAT";
+
+/// SLIT signature "SLIT" (System Locality Information Table)
+const SLIT_SIGNATURE: &[u8; 4] = b"SLIT";
+
 /// MADT entry types
 const MADT_ENTRY_LAPIC: u8 = 0;
 const MADT_ENTRY_IOAPIC: u8 = 1;
@@ -30,6 +36,11 @@ const MADT_ENTRY_ISO: u8 = 2; // Interrupt Source Override
 const MADT_ENTRY_LAPIC_NMI: u8 = 4;
 const MADT_ENTRY_LAPIC_64: u8 = 5; // Local APIC Address Override
 const MADT_ENTRY_X2APIC: u8 = 9; // Processor Local x2APIC
+
+/// SRAT entry types
+const SRAT_ENTRY_LAPIC_AFFINITY: u8 = 0; // Processor Local APIC/SAPIC Affinity
+const SRAT_ENTRY_MEMORY_AFFINITY: u8 = 1; // Memory Affinity
+const SRAT_ENTRY_X2APIC_AFFINITY: u8 = 2; // Processor Local x2APIC Affinity
 
 /// Information about a CPU found in MADT
 #[derive(Debug, Clone, Copy)]
@@ -494,5 +505,282 @@ fn parse_fadt_mapped(fadt_phys: u64) -> Result<PowerInfo, &'static str> {
         iounmap(fadt_ptr, fadt_length as u64);
 
         Ok(info)
+    }
+}
+
+/// Initialize NUMA topology from ACPI SRAT/SLIT tables
+///
+/// Called early in boot to discover NUMA topology. If SRAT is not found,
+/// returns Ok(false) and caller should use single-node fallback.
+pub fn init_numa_topology() -> Result<bool, &'static str> {
+    use crate::numa::{LOCAL_DISTANCE, MAX_NUMA_NODES, NUMA_TOPOLOGY, REMOTE_DISTANCE};
+
+    // Find RSDP
+    let rsdp = find_rsdp()?;
+
+    // Get RSDT or XSDT address
+    let (sdt_phys, is_xsdt) = unsafe {
+        if (*rsdp).revision >= 2 {
+            let rsdp2 = rsdp as *const Rsdp2;
+            if (*rsdp2).xsdt_address != 0 {
+                ((*rsdp2).xsdt_address, true)
+            } else {
+                ((*rsdp).rsdt_address as u64, false)
+            }
+        } else {
+            ((*rsdp).rsdt_address as u64, false)
+        }
+    };
+
+    // Try to find SRAT table
+    let srat_phys = match find_table_phys(sdt_phys, is_xsdt, SRAT_SIGNATURE) {
+        Ok(addr) => addr,
+        Err(_) => {
+            // No SRAT table - not an error, just use single-node fallback
+            return Ok(false);
+        }
+    };
+
+    // Parse SRAT to extract NUMA topology
+    parse_srat_mapped(srat_phys)?;
+
+    // Optionally parse SLIT for distance matrix
+    if let Ok(slit_phys) = find_table_phys(sdt_phys, is_xsdt, SLIT_SIGNATURE) {
+        if let Err(e) = parse_slit_mapped(slit_phys) {
+            crate::printkln!("NUMA: SLIT parse error (using default distances): {}", e);
+        }
+    } else {
+        // No SLIT, initialize default distances
+        let mut topology = NUMA_TOPOLOGY.lock();
+        for from in 0..MAX_NUMA_NODES {
+            for to in 0..MAX_NUMA_NODES {
+                if from == to {
+                    topology.set_distance(from, to, LOCAL_DISTANCE);
+                } else {
+                    topology.set_distance(from, to, REMOTE_DISTANCE);
+                }
+            }
+        }
+    }
+
+    // Mark topology as initialized
+    {
+        let mut topology = NUMA_TOPOLOGY.lock();
+        topology.set_initialized();
+    }
+
+    Ok(true)
+}
+
+/// Parse SRAT table and populate NUMA topology
+fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
+    use crate::numa::{MAX_CPUS, MAX_NUMA_NODES, NUMA_TOPOLOGY, NumaNode};
+
+    unsafe {
+        // Map the SRAT
+        let srat_ptr = map_acpi_table(srat_phys)?;
+
+        // Read length from SDT header (offset 4)
+        let length_ptr = srat_ptr.add(4) as *const u32;
+        let srat_length = core::ptr::read_unaligned(length_ptr) as usize;
+
+        // Validate SRAT checksum
+        validate_table_checksum(srat_ptr as *const u8, srat_length, "SRAT");
+
+        // SRAT header: SdtHeader (36) + Reserved (4) + Reserved (8) = 48 bytes
+        let entries_start = srat_ptr.add(48);
+        let entries_end = srat_ptr.add(srat_length);
+
+        let mut topology = NUMA_TOPOLOGY.lock();
+
+        // First pass: collect memory affinity entries to build nodes
+        let mut ptr = entries_start;
+        while ptr < entries_end {
+            let entry_type = core::ptr::read_unaligned(ptr);
+            let entry_len = core::ptr::read_unaligned(ptr.add(1)) as usize;
+
+            if entry_len == 0 {
+                break;
+            }
+
+            if entry_type == SRAT_ENTRY_MEMORY_AFFINITY {
+                // Memory Affinity Structure (length 40):
+                // 0: type (1), 1: length (1), 2: proximity_domain_lo (4)
+                // 6: reserved (2), 8: base_addr_lo (4), 12: base_addr_hi (4)
+                // 16: length_lo (4), 20: length_hi (4), 24: reserved (4)
+                // 28: flags (4), 32: reserved (8)
+                let prox_domain_lo = core::ptr::read_unaligned(ptr.add(2) as *const u32);
+                let base_lo = core::ptr::read_unaligned(ptr.add(8) as *const u32) as u64;
+                let base_hi = core::ptr::read_unaligned(ptr.add(12) as *const u32) as u64;
+                let len_lo = core::ptr::read_unaligned(ptr.add(16) as *const u32) as u64;
+                let len_hi = core::ptr::read_unaligned(ptr.add(20) as *const u32) as u64;
+                let flags = core::ptr::read_unaligned(ptr.add(28) as *const u32);
+
+                // Bit 0: Enabled
+                let enabled = (flags & 0x1) != 0;
+
+                if enabled {
+                    let base_addr = base_lo | (base_hi << 32);
+                    let length = len_lo | (len_hi << 32);
+                    let node_id = prox_domain_lo as usize;
+
+                    if node_id < MAX_NUMA_NODES && length > 0 {
+                        let start_pfn = base_addr / 4096;
+                        let end_pfn = (base_addr + length) / 4096;
+                        let pages = length / 4096;
+
+                        // Get or create node
+                        if topology.nodes[node_id].is_none() {
+                            topology.nodes[node_id] = Some(NumaNode::new(node_id as u32));
+                            topology.node_online_mask |= 1u64 << node_id;
+                        }
+
+                        if let Some(ref mut node) = topology.nodes[node_id] {
+                            // Extend node's memory range (SRAT can have multiple entries per node)
+                            if node.start_pfn == 0 || start_pfn < node.start_pfn {
+                                node.start_pfn = start_pfn;
+                            }
+                            if end_pfn > node.end_pfn {
+                                node.end_pfn = end_pfn;
+                            }
+                            node.present_pages += pages;
+                        }
+                    }
+                }
+            }
+
+            ptr = ptr.add(entry_len);
+        }
+
+        // Second pass: collect CPU affinity entries
+        ptr = entries_start;
+        while ptr < entries_end {
+            let entry_type = core::ptr::read_unaligned(ptr);
+            let entry_len = core::ptr::read_unaligned(ptr.add(1)) as usize;
+
+            if entry_len == 0 {
+                break;
+            }
+
+            match entry_type {
+                SRAT_ENTRY_LAPIC_AFFINITY => {
+                    // Processor Local APIC Affinity (length 16):
+                    // 0: type (1), 1: length (1), 2: proximity_domain_lo (1)
+                    // 3: apic_id (1), 4: flags (4), 8: sapic_eid (1)
+                    // 9: proximity_domain_hi (3), 12: clock_domain (4)
+                    let prox_domain_lo = core::ptr::read_unaligned(ptr.add(2)) as u32;
+                    let apic_id = core::ptr::read_unaligned(ptr.add(3)) as u32;
+                    let flags = core::ptr::read_unaligned(ptr.add(4) as *const u32);
+                    let prox_hi_bytes: [u8; 3] = [
+                        core::ptr::read_unaligned(ptr.add(9)),
+                        core::ptr::read_unaligned(ptr.add(10)),
+                        core::ptr::read_unaligned(ptr.add(11)),
+                    ];
+                    let prox_domain_hi = (prox_hi_bytes[0] as u32)
+                        | ((prox_hi_bytes[1] as u32) << 8)
+                        | ((prox_hi_bytes[2] as u32) << 16);
+
+                    let enabled = (flags & 0x1) != 0;
+
+                    if enabled {
+                        let node_id = (prox_domain_lo | (prox_domain_hi << 8)) as usize;
+                        if node_id < MAX_NUMA_NODES && (apic_id as usize) < MAX_CPUS {
+                            topology.cpu_to_node[apic_id as usize] = node_id as u8;
+
+                            // Also add CPU to node's cpu_mask
+                            if let Some(ref mut node) = topology.nodes[node_id] {
+                                node.add_cpu(apic_id);
+                            }
+                        }
+                    }
+                }
+
+                SRAT_ENTRY_X2APIC_AFFINITY => {
+                    // Processor Local x2APIC Affinity (length 24):
+                    // 0: type (1), 1: length (1), 2: reserved (2)
+                    // 4: proximity_domain (4), 8: x2apic_id (4)
+                    // 12: flags (4), 16: clock_domain (4), 20: reserved (4)
+                    let prox_domain = core::ptr::read_unaligned(ptr.add(4) as *const u32);
+                    let x2apic_id = core::ptr::read_unaligned(ptr.add(8) as *const u32);
+                    let flags = core::ptr::read_unaligned(ptr.add(12) as *const u32);
+
+                    let enabled = (flags & 0x1) != 0;
+
+                    if enabled {
+                        let node_id = prox_domain as usize;
+                        // x2APIC IDs can be > 255, but we only support up to MAX_CPUS
+                        if node_id < MAX_NUMA_NODES && (x2apic_id as usize) < MAX_CPUS {
+                            topology.cpu_to_node[x2apic_id as usize] = node_id as u8;
+
+                            // Also add CPU to node's cpu_mask (only if < 64)
+                            if x2apic_id < 64
+                                && let Some(ref mut node) = topology.nodes[node_id]
+                            {
+                                node.add_cpu(x2apic_id);
+                            }
+                        }
+                    }
+                }
+
+                _ => {}
+            }
+
+            ptr = ptr.add(entry_len);
+        }
+
+        // Update node count
+        topology.nr_nodes = topology.node_online_mask.count_ones() as usize;
+
+        // Unmap the SRAT
+        iounmap(srat_ptr, srat_length as u64);
+
+        if topology.nr_nodes == 0 {
+            return Err("SRAT contained no valid nodes");
+        }
+
+        Ok(())
+    }
+}
+
+/// Parse SLIT table for inter-node distance matrix
+fn parse_slit_mapped(slit_phys: u64) -> Result<(), &'static str> {
+    use crate::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY};
+
+    unsafe {
+        // Map the SLIT
+        let slit_ptr = map_acpi_table(slit_phys)?;
+
+        // Read length from SDT header (offset 4)
+        let length_ptr = slit_ptr.add(4) as *const u32;
+        let slit_length = core::ptr::read_unaligned(length_ptr) as usize;
+
+        // Validate SLIT checksum
+        validate_table_checksum(slit_ptr as *const u8, slit_length, "SLIT");
+
+        // SLIT header: SdtHeader (36) + Number of System Localities (8)
+        let num_localities = core::ptr::read_unaligned(slit_ptr.add(36) as *const u64) as usize;
+
+        if num_localities > MAX_NUMA_NODES {
+            iounmap(slit_ptr, slit_length as u64);
+            return Err("SLIT has too many localities");
+        }
+
+        // Distance matrix starts at offset 44, stored as 1D array [from][to]
+        let matrix_start = slit_ptr.add(44);
+
+        let mut topology = NUMA_TOPOLOGY.lock();
+
+        for from in 0..num_localities {
+            for to in 0..num_localities {
+                let offset = from * num_localities + to;
+                let distance = core::ptr::read_unaligned(matrix_start.add(offset));
+                topology.set_distance(from, to, distance);
+            }
+        }
+
+        // Unmap the SLIT
+        iounmap(slit_ptr, slit_length as u64);
+
+        Ok(())
     }
 }

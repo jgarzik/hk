@@ -469,6 +469,10 @@ pub const SYS_MBIND: u64 = 237;
 pub const SYS_SET_MEMPOLICY: u64 = 238;
 /// get_mempolicy(policy, nodemask, maxnode, addr, flags)
 pub const SYS_GET_MEMPOLICY: u64 = 239;
+/// migrate_pages(pid, maxnode, old_nodes, new_nodes)
+pub const SYS_MIGRATE_PAGES: u64 = 256;
+/// move_pages(pid, nr_pages, pages, nodes, status, flags)
+pub const SYS_MOVE_PAGES: u64 = 279;
 
 // Scheduling priority
 /// getpriority(which, who)
@@ -1708,6 +1712,13 @@ pub fn x86_64_syscall_dispatch(
         }
         SYS_MBIND => {
             crate::mm::mempolicy::sys_mbind(arg0, arg1, arg2, arg3, arg4, arg5 as u32) as u64
+        }
+        SYS_MIGRATE_PAGES => {
+            crate::mm::mempolicy::sys_migrate_pages(arg0 as i64, arg1, arg2, arg3) as u64
+        }
+        SYS_MOVE_PAGES => {
+            crate::mm::mempolicy::sys_move_pages(arg0 as i64, arg1, arg2, arg3, arg4, arg5 as i32)
+                as u64
         }
 
         // Scheduling priority
