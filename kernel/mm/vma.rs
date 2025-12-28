@@ -12,6 +12,9 @@ pub const PROT_NONE: u32 = 0;
 pub const PROT_READ: u32 = 1;
 pub const PROT_WRITE: u32 = 2;
 pub const PROT_EXEC: u32 = 4;
+/// PROT_SEM - page may be used for atomic operations (futex)
+/// Linux accepts this flag but it's a no-op on x86-64/aarch64
+pub const PROT_SEM: u32 = 0x8;
 /// PROT_GROWSDOWN - mprotect: extend change to start of growsdown VMA
 pub const PROT_GROWSDOWN: u32 = 0x0100_0000;
 /// PROT_GROWSUP - mprotect: extend change to end of growsup VMA
@@ -48,6 +51,14 @@ pub const MAP_FIXED_NOREPLACE: u32 = 0x100000;
 /// MAP_NORESERVE - don't reserve swap space for this mapping
 /// Allows large sparse mappings without requiring swap reservation upfront
 pub const MAP_NORESERVE: u32 = 0x4000;
+/// MAP_HUGETLB - use huge TLB pages (implemented via THP support)
+pub const MAP_HUGETLB: u32 = 0x40000;
+/// MAP_SYNC - perform synchronous page faults for DAX mappings
+/// Requires DAX filesystem support; returns EOPNOTSUPP without it
+pub const MAP_SYNC: u32 = 0x80000;
+/// MAP_SHARED_VALIDATE - like MAP_SHARED but validates unknown flags
+/// Required for MAP_SYNC to work; with plain MAP_SHARED, unknown flags are ignored
+pub const MAP_SHARED_VALIDATE: u32 = 0x03;
 
 /// Return value for failed mmap
 pub const MAP_FAILED: i64 = -1;

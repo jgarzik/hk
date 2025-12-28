@@ -14,11 +14,11 @@ use super::{
     MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM,
     MADV_REMOVE, MADV_SEQUENTIAL, MADV_WILLNEED, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_FIXED,
     MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE,
-    MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC,
-    MS_INVALIDATE, MS_SYNC, PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE,
-    VM_DONTCOPY, VM_DONTDUMP, VM_GROWSDOWN, VM_HUGEPAGE, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT,
-    VM_NOHUGEPAGE, VM_NORESERVE, VM_RAND_READ, VM_SEQ_READ, VM_SHARED, VM_WIPEONFORK, Vma,
-    anon_vma::AnonVma, create_default_mm, get_task_mm, init_task_mm,
+    MAP_PRIVATE, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC, MS_INVALIDATE, MS_SYNC,
+    PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, VM_DONTCOPY, VM_DONTDUMP,
+    VM_GROWSDOWN, VM_HUGEPAGE, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_NOHUGEPAGE,
+    VM_NORESERVE, VM_RAND_READ, VM_SEQ_READ, VM_SHARED, VM_WIPEONFORK, Vma, anon_vma::AnonVma,
+    create_default_mm, get_task_mm, init_task_mm,
 };
 use crate::error::KernelError;
 
@@ -69,13 +69,27 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     let is_anonymous = flags & MAP_ANONYMOUS != 0;
     let is_fixed = flags & MAP_FIXED != 0;
     let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
-    let is_private = flags & MAP_PRIVATE != 0;
-    let is_shared = flags & MAP_SHARED != 0;
 
-    // Must specify exactly one of MAP_PRIVATE or MAP_SHARED
-    if is_private == is_shared {
-        return KernelError::InvalidArgument.sysret();
-    }
+    // Check sharing mode: MAP_SHARED (0x01), MAP_PRIVATE (0x02), or MAP_SHARED_VALIDATE (0x03)
+    // MAP_SHARED_VALIDATE is special - it's MAP_SHARED | MAP_PRIVATE bits together,
+    // and means "shared mapping with strict flag validation"
+    let share_mode = flags & super::MAP_SHARED_VALIDATE; // Mask to just these 2 bits
+    let (is_shared, is_shared_validate) = match share_mode {
+        0x01 => (true, false),  // MAP_SHARED
+        0x02 => (false, false), // MAP_PRIVATE
+        0x03 => {
+            // MAP_SHARED_VALIDATE - shared with strict validation
+            // If MAP_SYNC is requested, we must reject since we don't support DAX
+            if flags & super::MAP_SYNC != 0 {
+                return -95_i64; // EOPNOTSUPP - no DAX filesystem support
+            }
+            (true, true)
+        }
+        _ => return KernelError::InvalidArgument.sysret(), // 0x00 = neither specified
+    };
+    let is_private = !is_shared;
+    // Suppress unused warning - is_shared_validate is for future validation
+    let _ = is_shared_validate;
 
     // Get file if not anonymous
     let file: Option<Arc<File>> = if !is_anonymous {
@@ -1314,8 +1328,9 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
         None => return KernelError::InvalidArgument.sysret(), // Overflow
     };
 
-    // Validate protection flags (only PROT_READ, PROT_WRITE, PROT_EXEC are valid)
-    if prot & !(PROT_READ | PROT_WRITE | super::PROT_EXEC) != 0 {
+    // Validate protection flags (PROT_READ, PROT_WRITE, PROT_EXEC, PROT_SEM are valid)
+    // Note: PROT_SEM is accepted but is a no-op on x86-64/aarch64 (Linux behavior)
+    if prot & !(PROT_READ | PROT_WRITE | super::PROT_EXEC | super::PROT_SEM) != 0 {
         return KernelError::InvalidArgument.sysret();
     }
 

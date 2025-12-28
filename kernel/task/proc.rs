@@ -82,7 +82,7 @@ pub fn sys_clone(
         parent_tidptr,
         child_tidptr,
         tls,
-        pidfd_ptr: 0,  // CLONE_PIDFD only supported via clone3
+        pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
         exit_signal,
         cgroup_fd: -1, // CLONE_INTO_CGROUP only supported via clone3
     };
@@ -128,7 +128,7 @@ pub fn sys_clone(
         parent_tidptr,
         child_tidptr,
         tls,
-        pidfd_ptr: 0,  // CLONE_PIDFD only supported via clone3
+        pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
         exit_signal,
         cgroup_fd: -1, // CLONE_INTO_CGROUP only supported via clone3
     };
