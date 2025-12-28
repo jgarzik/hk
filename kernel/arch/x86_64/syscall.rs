@@ -670,6 +670,14 @@ pub const SYS_PROCESS_VM_WRITEV: u64 = 311;
 /// kcmp(pid1, pid2, type, idx1, idx2)
 pub const SYS_KCMP: u64 = 312;
 
+// Syscalls that return stubs (not fully implemented)
+/// kexec_load(entry, nr_segments, segments, flags) - load new kernel
+pub const SYS_KEXEC_LOAD: u64 = 246;
+/// perf_event_open(attr, pid, cpu, group_fd, flags) - performance monitoring
+pub const SYS_PERF_EVENT_OPEN: u64 = 298;
+/// rseq(rseq, rseq_len, flags, sig) - restartable sequences
+pub const SYS_RSEQ: u64 = 334;
+
 /// Model Specific Registers for syscall
 const MSR_EFER: u32 = 0xC000_0080; // Extended Feature Enable Register
 const MSR_STAR: u32 = 0xC000_0081; // Segment selectors for syscall/sysret
@@ -2007,6 +2015,24 @@ pub fn x86_64_syscall_dispatch(
 
         // Process inspection (Section 13)
         SYS_KCMP => crate::kcmp::sys_kcmp(arg0, arg1, arg2 as i32, arg3, arg4) as u64,
+
+        // Syscall stubs (not fully implemented)
+        SYS_RSEQ => {
+            // Restartable sequences - not implemented, return ENOSYS
+            (-38i64) as u64 // ENOSYS
+        }
+        SYS_PERF_EVENT_OPEN => {
+            // Performance monitoring - not supported, return EOPNOTSUPP
+            (-95i64) as u64 // EOPNOTSUPP
+        }
+        SYS_KEXEC_LOAD => {
+            // Kernel execution load - check capability, return ENOSYS
+            if !crate::task::capable(crate::task::CAP_SYS_BOOT) {
+                (-1i64) as u64 // EPERM
+            } else {
+                (-38i64) as u64 // ENOSYS
+            }
+        }
 
         _ => (-38i64) as u64, // ENOSYS
     };

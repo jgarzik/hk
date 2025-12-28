@@ -110,6 +110,23 @@ const DEFAULT_RCVBUF: usize = 65536;
 /// Default send buffer size
 const DEFAULT_SNDBUF: usize = 65536;
 
+/// Default TCP keepalive idle time (seconds)
+const DEFAULT_TCP_KEEPIDLE: u32 = 7200;
+/// Default TCP keepalive interval (seconds)
+const DEFAULT_TCP_KEEPINTVL: u32 = 75;
+/// Default TCP keepalive count
+const DEFAULT_TCP_KEEPCNT: u32 = 9;
+
+/// SO_LINGER option structure
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Linger {
+    /// Linger active (non-zero = enabled)
+    pub l_onoff: i32,
+    /// How long to linger for (seconds)
+    pub l_linger: i32,
+}
+
 /// Socket options structure
 ///
 /// Stores configurable socket options set via setsockopt().
@@ -124,6 +141,18 @@ pub struct SocketOptions {
     pub send_buf_size: AtomicU32,
     /// TCP_NODELAY - disable Nagle's algorithm
     pub tcp_nodelay: AtomicBool,
+    /// SO_BROADCAST - allow sending to broadcast addresses
+    pub broadcast: AtomicBool,
+    /// SO_DONTROUTE - bypass routing tables
+    pub dontroute: AtomicBool,
+    /// SO_LINGER - linger on close (packed: high 16 bits = l_onoff, low 16 = l_linger)
+    pub linger: AtomicU32,
+    /// TCP_KEEPIDLE - start keepalives after this period (seconds)
+    pub tcp_keepidle: AtomicU32,
+    /// TCP_KEEPINTVL - interval between keepalives (seconds)
+    pub tcp_keepintvl: AtomicU32,
+    /// TCP_KEEPCNT - number of keepalives before giving up
+    pub tcp_keepcnt: AtomicU32,
 }
 
 impl SocketOptions {
@@ -135,6 +164,12 @@ impl SocketOptions {
             recv_buf_size: AtomicU32::new(DEFAULT_RCVBUF as u32),
             send_buf_size: AtomicU32::new(DEFAULT_SNDBUF as u32),
             tcp_nodelay: AtomicBool::new(false),
+            broadcast: AtomicBool::new(false),
+            dontroute: AtomicBool::new(false),
+            linger: AtomicU32::new(0), // Linger disabled by default
+            tcp_keepidle: AtomicU32::new(DEFAULT_TCP_KEEPIDLE),
+            tcp_keepintvl: AtomicU32::new(DEFAULT_TCP_KEEPINTVL),
+            tcp_keepcnt: AtomicU32::new(DEFAULT_TCP_KEEPCNT),
         }
     }
 }

@@ -890,13 +890,22 @@ const IPPROTO_TCP: i32 = 6;
 
 /// Socket option constants (SOL_SOCKET level)
 const SO_REUSEADDR: i32 = 2;
+const SO_TYPE: i32 = 3;
 const SO_ERROR: i32 = 4;
+const SO_DONTROUTE: i32 = 5;
+const SO_BROADCAST: i32 = 6;
 const SO_SNDBUF: i32 = 7;
 const SO_RCVBUF: i32 = 8;
 const SO_KEEPALIVE: i32 = 9;
+const SO_LINGER: i32 = 13;
+const SO_PROTOCOL: i32 = 38;
+const SO_DOMAIN: i32 = 39;
 
 /// TCP option constants (IPPROTO_TCP level)
 const TCP_NODELAY: i32 = 1;
+const TCP_KEEPIDLE: i32 = 4;
+const TCP_KEEPINTVL: i32 = 5;
+const TCP_KEEPCNT: i32 = 6;
 
 /// setsockopt(fd, level, optname, optval, optlen) - set socket option
 pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u64) -> i64 {
@@ -947,6 +956,35 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u6
                     .store(size, core::sync::atomic::Ordering::Release);
                 0
             }
+            SO_BROADCAST => {
+                socket
+                    .options
+                    .broadcast
+                    .store(bool_value, core::sync::atomic::Ordering::Release);
+                0
+            }
+            SO_DONTROUTE => {
+                socket
+                    .options
+                    .dontroute
+                    .store(bool_value, core::sync::atomic::Ordering::Release);
+                0
+            }
+            SO_LINGER => {
+                // Need at least 8 bytes for struct linger
+                if optlen < 8 {
+                    return KernelError::InvalidArgument.sysret();
+                }
+                let linger = unsafe { *(optval as *const super::socket::Linger) };
+                // Pack l_onoff and l_linger into u32: high 16 bits = onoff, low 16 = linger
+                let packed =
+                    (((linger.l_onoff != 0) as u32) << 16) | ((linger.l_linger as u32) & 0xFFFF);
+                socket
+                    .options
+                    .linger
+                    .store(packed, core::sync::atomic::Ordering::Release);
+                0
+            }
             _ => 0, // Accept unknown options silently
         },
         IPPROTO_TCP => match optname {
@@ -955,6 +993,30 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u6
                     .options
                     .tcp_nodelay
                     .store(bool_value, core::sync::atomic::Ordering::Release);
+                0
+            }
+            TCP_KEEPIDLE => {
+                let val = (value as u32).max(1); // minimum 1 second
+                socket
+                    .options
+                    .tcp_keepidle
+                    .store(val, core::sync::atomic::Ordering::Release);
+                0
+            }
+            TCP_KEEPINTVL => {
+                let val = (value as u32).max(1);
+                socket
+                    .options
+                    .tcp_keepintvl
+                    .store(val, core::sync::atomic::Ordering::Release);
+                0
+            }
+            TCP_KEEPCNT => {
+                let val = (value as u32).clamp(1, 127); // Linux max is 127
+                socket
+                    .options
+                    .tcp_keepcnt
+                    .store(val, core::sync::atomic::Ordering::Release);
                 0
             }
             _ => 0, // Accept unknown options silently
@@ -997,6 +1059,27 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u6
                 let err = socket.get_error();
                 write_i32(-err)
             }
+            SO_TYPE => {
+                // Return socket type (SOCK_STREAM=1, SOCK_DGRAM=2)
+                write_i32(socket.sock_type as i32)
+            }
+            SO_DOMAIN => {
+                // Return address family (AF_INET=2)
+                write_i32(socket.family as i32)
+            }
+            SO_PROTOCOL => {
+                // Return protocol (6=TCP, 17=UDP, or stored protocol)
+                let proto = if socket.protocol != 0 {
+                    socket.protocol
+                } else {
+                    match socket.sock_type {
+                        super::socket::SocketType::Stream => 6, // IPPROTO_TCP
+                        super::socket::SocketType::Dgram => 17, // IPPROTO_UDP
+                        _ => 0,
+                    }
+                };
+                write_i32(proto)
+            }
             SO_REUSEADDR => {
                 let val = socket
                     .options
@@ -1025,6 +1108,41 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u6
                     .load(core::sync::atomic::Ordering::Acquire);
                 write_i32(val as i32)
             }
+            SO_BROADCAST => {
+                let val = socket
+                    .options
+                    .broadcast
+                    .load(core::sync::atomic::Ordering::Acquire);
+                write_i32(if val { 1 } else { 0 })
+            }
+            SO_DONTROUTE => {
+                let val = socket
+                    .options
+                    .dontroute
+                    .load(core::sync::atomic::Ordering::Acquire);
+                write_i32(if val { 1 } else { 0 })
+            }
+            SO_LINGER => {
+                // Return struct linger (8 bytes)
+                let packed = socket
+                    .options
+                    .linger
+                    .load(core::sync::atomic::Ordering::Acquire);
+                let l_onoff = ((packed >> 16) & 1) as i32;
+                let l_linger = (packed & 0xFFFF) as i32;
+                unsafe {
+                    let ptr = optval as *mut super::socket::Linger;
+                    if !ptr.is_null() {
+                        (*ptr).l_onoff = l_onoff;
+                        (*ptr).l_linger = l_linger;
+                    }
+                    let len_ptr = optlen as *mut u32;
+                    if !len_ptr.is_null() {
+                        *len_ptr = 8; // sizeof(struct linger)
+                    }
+                }
+                0
+            }
             _ => {
                 // Unknown option - return 0 with value 0
                 write_i32(0)
@@ -1037,6 +1155,27 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u6
                     .tcp_nodelay
                     .load(core::sync::atomic::Ordering::Acquire);
                 write_i32(if val { 1 } else { 0 })
+            }
+            TCP_KEEPIDLE => {
+                let val = socket
+                    .options
+                    .tcp_keepidle
+                    .load(core::sync::atomic::Ordering::Acquire);
+                write_i32(val as i32)
+            }
+            TCP_KEEPINTVL => {
+                let val = socket
+                    .options
+                    .tcp_keepintvl
+                    .load(core::sync::atomic::Ordering::Acquire);
+                write_i32(val as i32)
+            }
+            TCP_KEEPCNT => {
+                let val = socket
+                    .options
+                    .tcp_keepcnt
+                    .load(core::sync::atomic::Ordering::Acquire);
+                write_i32(val as i32)
             }
             _ => write_i32(0),
         },

@@ -266,11 +266,84 @@ const BLKFLSBUF: u32 = 0x1261;
 /// # Returns
 /// 0 on success, negative errno on error.
 pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
+    use crate::uaccess::get_user;
+
+    // Generic ioctl constants (work on any fd)
+    const FIONBIO: u32 = 0x5421; // Set/clear non-blocking mode
+    const FIOASYNC: u32 = 0x5452; // Enable async I/O notification
+    const FIOCLEX: u32 = 0x5451; // Set close-on-exec flag
+    const FIONCLEX: u32 = 0x5450; // Clear close-on-exec flag
+    const FIONREAD: u32 = 0x541B; // Get bytes available for read
+
     // Get file from fd
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f.clone(),
         None => return KernelError::BadFd.sysret(),
     };
+
+    // Handle generic ioctls first (work on any fd type)
+    match cmd {
+        FIONBIO => {
+            // Set/clear non-blocking mode
+            if arg == 0 {
+                return KernelError::BadAddress.sysret();
+            }
+            let enable: i32 = match get_user::<Uaccess, i32>(arg) {
+                Ok(v) => v,
+                Err(_) => return KernelError::BadAddress.sysret(),
+            };
+            let current_flags = file.get_flags();
+            if enable != 0 {
+                file.set_status_flags(current_flags | crate::fs::flags::O_NONBLOCK);
+            } else {
+                file.set_status_flags(current_flags & !crate::fs::flags::O_NONBLOCK);
+            }
+            return 0;
+        }
+        FIOASYNC => {
+            // Set/clear O_ASYNC flag
+            if arg == 0 {
+                return KernelError::BadAddress.sysret();
+            }
+            let enable: i32 = match get_user::<Uaccess, i32>(arg) {
+                Ok(v) => v,
+                Err(_) => return KernelError::BadAddress.sysret(),
+            };
+            let current_flags = file.get_flags();
+            if enable != 0 {
+                file.set_status_flags(current_flags | crate::fs::flags::O_ASYNC);
+            } else {
+                file.set_status_flags(current_flags & !crate::fs::flags::O_ASYNC);
+            }
+            return 0;
+        }
+        FIOCLEX => {
+            // Set close-on-exec flag
+            current_fd_table()
+                .lock()
+                .set_fd_flags(fd, crate::task::FD_CLOEXEC);
+            return 0;
+        }
+        FIONCLEX => {
+            // Clear close-on-exec flag
+            current_fd_table().lock().set_fd_flags(fd, 0);
+            return 0;
+        }
+        FIONREAD => {
+            // Get bytes available for reading
+            if arg == 0 {
+                return KernelError::BadAddress.sysret();
+            }
+            // For most file types, return 0 (would need file-type specific handling)
+            // Pipes, sockets, etc. would have buffered data
+            let available: i32 = 0;
+            if put_user::<Uaccess, i32>(arg, available).is_err() {
+                return KernelError::BadAddress.sysret();
+            }
+            return 0;
+        }
+        _ => {} // Fall through to device-specific handling
+    }
 
     // Get the inode to check file type
     let inode = match file.get_inode() {

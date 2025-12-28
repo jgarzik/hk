@@ -1008,6 +1008,21 @@ pub struct SignalfdSiginfo {
 }
 
 // ============================================================================
+// Generic ioctl constants
+// ============================================================================
+
+/// Set non-blocking mode
+pub const FIONBIO: u32 = 0x5421;
+/// Enable async I/O
+pub const FIOASYNC: u32 = 0x5452;
+/// Set close-on-exec
+pub const FIOCLEX: u32 = 0x5451;
+/// Clear close-on-exec
+pub const FIONCLEX: u32 = 0x5450;
+/// Get bytes available to read
+pub const FIONREAD: u32 = 0x541B;
+
+// ============================================================================
 // prctl constants (Section 10.4)
 // ============================================================================
 
@@ -1024,6 +1039,24 @@ pub const PR_GET_CHILD_SUBREAPER: i32 = 36;
 pub const PR_SET_CHILD_SUBREAPER: i32 = 37;
 pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
 pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
+pub const PR_SET_THP_DISABLE: i32 = 41;
+pub const PR_GET_THP_DISABLE: i32 = 42;
+
+// x86-64 specific prctl operations
+#[cfg(target_arch = "x86_64")]
+pub const PR_GET_TSC: i32 = 25;
+#[cfg(target_arch = "x86_64")]
+pub const PR_SET_TSC: i32 = 26;
+#[cfg(target_arch = "x86_64")]
+pub const PR_GET_CPUID: i32 = 48;
+#[cfg(target_arch = "x86_64")]
+pub const PR_SET_CPUID: i32 = 49;
+
+// TSC mode values (x86-64 only)
+#[cfg(target_arch = "x86_64")]
+pub const PR_TSC_ENABLE: i32 = 1;
+#[cfg(target_arch = "x86_64")]
+pub const PR_TSC_SIGSEGV: i32 = 2;
 
 /// Dumpable flag values
 pub const SUID_DUMP_DISABLE: i32 = 0;

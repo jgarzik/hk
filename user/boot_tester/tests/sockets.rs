@@ -16,11 +16,31 @@ const SOL_SOCKET: i32 = 1;
 const IPPROTO_TCP: i32 = 6;
 /// Socket option constants
 const SO_REUSEADDR: i32 = 2;
-const SO_SNDBUF: i32 = 7;
+const SO_TYPE: i32 = 3;
+#[allow(dead_code)]
+const SO_DONTROUTE: i32 = 5; // Used in SO_DONTROUTE setsockopt, not tested yet
+const SO_BROADCAST: i32 = 6;
+#[allow(dead_code)]
+const SO_SNDBUF: i32 = 7; // Buffer size options, tested elsewhere
+#[allow(dead_code)]
 const SO_RCVBUF: i32 = 8;
-const SO_KEEPALIVE: i32 = 9;
+#[allow(dead_code)]
+const SO_KEEPALIVE: i32 = 9; // Keepalive enable, not tested yet
+const SO_LINGER: i32 = 13;
+const SO_PROTOCOL: i32 = 38;
+const SO_DOMAIN: i32 = 39;
 /// TCP option constants
 const TCP_NODELAY: i32 = 1;
+const TCP_KEEPIDLE: i32 = 4;
+const TCP_KEEPINTVL: i32 = 5;
+const TCP_KEEPCNT: i32 = 6;
+
+/// Linger structure for SO_LINGER option
+#[repr(C)]
+struct Linger {
+    l_onoff: i32,
+    l_linger: i32,
+}
 use super::helpers::{print, println, print_num};
 
 /// Run all socket tests
@@ -51,6 +71,14 @@ pub fn run_tests() {
     test_setsockopt_reuseaddr();
     test_setsockopt_tcp_nodelay();
     test_getsockopt_roundtrip();
+
+    // New socket option tests
+    test_getsockopt_so_type();
+    test_getsockopt_so_domain();
+    test_getsockopt_so_protocol();
+    test_sockopt_broadcast();
+    test_sockopt_linger();
+    test_tcp_keepalive_options();
 }
 
 /// Test basic socket creation
@@ -666,5 +694,296 @@ fn test_getsockopt_roundtrip() {
         println(b"SOCKOPT_ROUNDTRIP:OK");
     } else {
         println(b"SOCKOPT_ROUNDTRIP:FAIL");
+    }
+}
+
+/// Test getsockopt SO_TYPE returns socket type
+fn test_getsockopt_so_type() {
+    // Test TCP socket
+    let tcp_fd = sys_socket(AF_INET, SOCK_STREAM, 0);
+    if tcp_fd < 0 {
+        println(b"SOCKOPT_SO_TYPE:FAIL (socket)");
+        return;
+    }
+
+    let mut sock_type: i32 = 0;
+    let mut optlen: u32 = 4;
+    let ret = sys_getsockopt(
+        tcp_fd as i32,
+        SOL_SOCKET,
+        SO_TYPE,
+        &mut sock_type as *mut i32 as *mut u8,
+        &mut optlen,
+    );
+
+    print(b"getsockopt(SO_TYPE) for TCP returned ");
+    print_num(ret);
+    print(b", type=");
+    print_num(sock_type as i64);
+
+    sys_close(tcp_fd as u64);
+
+    // SOCK_STREAM = 1
+    if ret == 0 && sock_type == 1 {
+        println(b"SOCKOPT_SO_TYPE:OK");
+    } else {
+        println(b"SOCKOPT_SO_TYPE:FAIL");
+    }
+}
+
+/// Test getsockopt SO_DOMAIN returns socket domain
+fn test_getsockopt_so_domain() {
+    let fd = sys_socket(AF_INET, SOCK_STREAM, 0);
+    if fd < 0 {
+        println(b"SOCKOPT_SO_DOMAIN:FAIL (socket)");
+        return;
+    }
+
+    let mut domain: i32 = 0;
+    let mut optlen: u32 = 4;
+    let ret = sys_getsockopt(
+        fd as i32,
+        SOL_SOCKET,
+        SO_DOMAIN,
+        &mut domain as *mut i32 as *mut u8,
+        &mut optlen,
+    );
+
+    print(b"getsockopt(SO_DOMAIN) returned ");
+    print_num(ret);
+    print(b", domain=");
+    print_num(domain as i64);
+
+    sys_close(fd as u64);
+
+    // AF_INET = 2
+    if ret == 0 && domain == 2 {
+        println(b"SOCKOPT_SO_DOMAIN:OK");
+    } else {
+        println(b"SOCKOPT_SO_DOMAIN:FAIL");
+    }
+}
+
+/// Test getsockopt SO_PROTOCOL returns protocol
+fn test_getsockopt_so_protocol() {
+    let fd = sys_socket(AF_INET, SOCK_STREAM, 0);
+    if fd < 0 {
+        println(b"SOCKOPT_SO_PROTOCOL:FAIL (socket)");
+        return;
+    }
+
+    let mut protocol: i32 = 0;
+    let mut optlen: u32 = 4;
+    let ret = sys_getsockopt(
+        fd as i32,
+        SOL_SOCKET,
+        SO_PROTOCOL,
+        &mut protocol as *mut i32 as *mut u8,
+        &mut optlen,
+    );
+
+    print(b"getsockopt(SO_PROTOCOL) returned ");
+    print_num(ret);
+    print(b", protocol=");
+    print_num(protocol as i64);
+
+    sys_close(fd as u64);
+
+    // IPPROTO_TCP = 6
+    if ret == 0 && protocol == 6 {
+        println(b"SOCKOPT_SO_PROTOCOL:OK");
+    } else {
+        println(b"SOCKOPT_SO_PROTOCOL:FAIL");
+    }
+}
+
+/// Test setsockopt/getsockopt SO_BROADCAST
+fn test_sockopt_broadcast() {
+    // SO_BROADCAST only valid for DGRAM sockets
+    let fd = sys_socket(AF_INET, SOCK_DGRAM, 0);
+    if fd < 0 {
+        println(b"SOCKOPT_BROADCAST:FAIL (socket)");
+        return;
+    }
+
+    // Set SO_BROADCAST to 1
+    let set_val: i32 = 1;
+    let ret1 = sys_setsockopt(
+        fd as i32,
+        SOL_SOCKET,
+        SO_BROADCAST,
+        &set_val as *const i32 as *const u8,
+        4,
+    );
+
+    if ret1 != 0 {
+        print(b"setsockopt(SO_BROADCAST) failed: ");
+        print_num(ret1);
+        sys_close(fd as u64);
+        println(b"SOCKOPT_BROADCAST:FAIL");
+        return;
+    }
+
+    // Get SO_BROADCAST and verify it's 1
+    let mut get_val: i32 = 0;
+    let mut optlen: u32 = 4;
+    let ret2 = sys_getsockopt(
+        fd as i32,
+        SOL_SOCKET,
+        SO_BROADCAST,
+        &mut get_val as *mut i32 as *mut u8,
+        &mut optlen,
+    );
+
+    print(b"SO_BROADCAST roundtrip: set=");
+    print_num(ret1);
+    print(b", get=");
+    print_num(ret2);
+    print(b", value=");
+    print_num(get_val as i64);
+
+    sys_close(fd as u64);
+
+    if ret2 == 0 && get_val == 1 {
+        println(b"SOCKOPT_BROADCAST:OK");
+    } else {
+        println(b"SOCKOPT_BROADCAST:FAIL");
+    }
+}
+
+/// Test setsockopt/getsockopt SO_LINGER
+fn test_sockopt_linger() {
+    let fd = sys_socket(AF_INET, SOCK_STREAM, 0);
+    if fd < 0 {
+        println(b"SOCKOPT_LINGER:FAIL (socket)");
+        return;
+    }
+
+    // Set SO_LINGER with l_onoff=1, l_linger=5
+    let set_linger = Linger { l_onoff: 1, l_linger: 5 };
+    let ret1 = sys_setsockopt(
+        fd as i32,
+        SOL_SOCKET,
+        SO_LINGER,
+        &set_linger as *const Linger as *const u8,
+        core::mem::size_of::<Linger>() as u32,
+    );
+
+    if ret1 != 0 {
+        print(b"setsockopt(SO_LINGER) failed: ");
+        print_num(ret1);
+        sys_close(fd as u64);
+        println(b"SOCKOPT_LINGER:FAIL");
+        return;
+    }
+
+    // Get SO_LINGER and verify values
+    let mut get_linger = Linger { l_onoff: 0, l_linger: 0 };
+    let mut optlen: u32 = core::mem::size_of::<Linger>() as u32;
+    let ret2 = sys_getsockopt(
+        fd as i32,
+        SOL_SOCKET,
+        SO_LINGER,
+        &mut get_linger as *mut Linger as *mut u8,
+        &mut optlen,
+    );
+
+    print(b"SO_LINGER: onoff=");
+    print_num(get_linger.l_onoff as i64);
+    print(b", linger=");
+    print_num(get_linger.l_linger as i64);
+
+    sys_close(fd as u64);
+
+    if ret2 == 0 && get_linger.l_onoff == 1 && get_linger.l_linger == 5 {
+        println(b"SOCKOPT_LINGER:OK");
+    } else {
+        println(b"SOCKOPT_LINGER:FAIL");
+    }
+}
+
+/// Test TCP keepalive socket options
+fn test_tcp_keepalive_options() {
+    let fd = sys_socket(AF_INET, SOCK_STREAM, 0);
+    if fd < 0 {
+        println(b"TCP_KEEPALIVE:FAIL (socket)");
+        return;
+    }
+
+    // Set TCP_KEEPIDLE to 60 seconds
+    let idle_val: i32 = 60;
+    let ret1 = sys_setsockopt(
+        fd as i32,
+        IPPROTO_TCP,
+        TCP_KEEPIDLE,
+        &idle_val as *const i32 as *const u8,
+        4,
+    );
+
+    // Set TCP_KEEPINTVL to 10 seconds
+    let intvl_val: i32 = 10;
+    let ret2 = sys_setsockopt(
+        fd as i32,
+        IPPROTO_TCP,
+        TCP_KEEPINTVL,
+        &intvl_val as *const i32 as *const u8,
+        4,
+    );
+
+    // Set TCP_KEEPCNT to 5
+    let cnt_val: i32 = 5;
+    let ret3 = sys_setsockopt(
+        fd as i32,
+        IPPROTO_TCP,
+        TCP_KEEPCNT,
+        &cnt_val as *const i32 as *const u8,
+        4,
+    );
+
+    // Verify by getting the values back
+    let mut get_idle: i32 = 0;
+    let mut get_intvl: i32 = 0;
+    let mut get_cnt: i32 = 0;
+    let mut optlen: u32 = 4;
+
+    sys_getsockopt(
+        fd as i32,
+        IPPROTO_TCP,
+        TCP_KEEPIDLE,
+        &mut get_idle as *mut i32 as *mut u8,
+        &mut optlen,
+    );
+    optlen = 4;
+    sys_getsockopt(
+        fd as i32,
+        IPPROTO_TCP,
+        TCP_KEEPINTVL,
+        &mut get_intvl as *mut i32 as *mut u8,
+        &mut optlen,
+    );
+    optlen = 4;
+    sys_getsockopt(
+        fd as i32,
+        IPPROTO_TCP,
+        TCP_KEEPCNT,
+        &mut get_cnt as *mut i32 as *mut u8,
+        &mut optlen,
+    );
+
+    print(b"TCP keepalive: idle=");
+    print_num(get_idle as i64);
+    print(b", intvl=");
+    print_num(get_intvl as i64);
+    print(b", cnt=");
+    print_num(get_cnt as i64);
+
+    sys_close(fd as u64);
+
+    if ret1 == 0 && ret2 == 0 && ret3 == 0
+        && get_idle == 60 && get_intvl == 10 && get_cnt == 5
+    {
+        println(b"TCP_KEEPALIVE:OK");
+    } else {
+        println(b"TCP_KEEPALIVE:FAIL");
     }
 }

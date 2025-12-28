@@ -335,9 +335,13 @@ pub fn sys_getrandom<A: crate::uaccess::UaccessArch>(buf: u64, buflen: usize, fl
 
 use crate::task::prctl_ops::{
     PR_GET_CHILD_SUBREAPER, PR_GET_DUMPABLE, PR_GET_KEEPCAPS, PR_GET_NAME, PR_GET_NO_NEW_PRIVS,
-    PR_GET_PDEATHSIG, PR_GET_SECCOMP, PR_GET_TIMERSLACK, PR_SET_CHILD_SUBREAPER, PR_SET_DUMPABLE,
-    PR_SET_KEEPCAPS, PR_SET_NAME, PR_SET_NO_NEW_PRIVS, PR_SET_PDEATHSIG, PR_SET_SECCOMP,
-    PR_SET_TIMERSLACK,
+    PR_GET_PDEATHSIG, PR_GET_SECCOMP, PR_GET_THP_DISABLE, PR_GET_TIMERSLACK,
+    PR_SET_CHILD_SUBREAPER, PR_SET_DUMPABLE, PR_SET_KEEPCAPS, PR_SET_NAME, PR_SET_NO_NEW_PRIVS,
+    PR_SET_PDEATHSIG, PR_SET_SECCOMP, PR_SET_THP_DISABLE, PR_SET_TIMERSLACK,
+};
+#[cfg(target_arch = "x86_64")]
+use crate::task::prctl_ops::{
+    PR_GET_CPUID, PR_GET_TSC, PR_SET_CPUID, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSEGV,
 };
 
 /// sys_prctl - Process/thread control operations
@@ -606,6 +610,105 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                 return KernelError::BadAddress.sysret();
             }
             0
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        PR_GET_TSC => {
+            // Get TSC mode (x86-64 only)
+            // arg2 = pointer to int for result
+            let tsc_mode = {
+                let table = TASK_TABLE.lock();
+                match table.tasks.iter().find(|t| t.tid == tid) {
+                    Some(task) => task.prctl.tsc_mode,
+                    None => return KernelError::NoProcess.sysret(),
+                }
+            };
+
+            if put_user::<Uaccess, i32>(arg2, tsc_mode as i32).is_err() {
+                return KernelError::BadAddress.sysret();
+            }
+            0
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        PR_SET_TSC => {
+            // Set TSC mode (x86-64 only)
+            // arg2: PR_TSC_ENABLE (1) or PR_TSC_SIGSEGV (2)
+            let mode = arg2 as i32;
+            if mode != PR_TSC_ENABLE && mode != PR_TSC_SIGSEGV {
+                return KernelError::InvalidArgument.sysret();
+            }
+
+            let mut table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+                task.prctl.tsc_mode = mode as u8;
+                // Note: Actually enabling TSC faulting requires CR4.TSD manipulation
+                // For now, just store the preference
+                0
+            } else {
+                KernelError::NoProcess.sysret()
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        PR_GET_CPUID => {
+            // Get CPUID faulting mode (x86-64 only)
+            // Returns 0 if CPUID allowed, 1 if CPUID faulting enabled
+            let table = TASK_TABLE.lock();
+            match table.tasks.iter().find(|t| t.tid == tid) {
+                Some(task) => {
+                    if task.prctl.cpuid_fault {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                None => KernelError::NoProcess.sysret(),
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        PR_SET_CPUID => {
+            // Set CPUID faulting mode (x86-64 only)
+            // arg2: 0 = allow CPUID, 1 = fault on CPUID
+            if arg2 > 1 {
+                return KernelError::InvalidArgument.sysret();
+            }
+
+            let mut table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+                task.prctl.cpuid_fault = arg2 != 0;
+                // Note: Actually enabling CPUID faulting requires MSR manipulation
+                0
+            } else {
+                KernelError::NoProcess.sysret()
+            }
+        }
+
+        PR_SET_THP_DISABLE => {
+            // Disable transparent huge pages for this process
+            let mut table = TASK_TABLE.lock();
+            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+                task.prctl.thp_disable = arg2 != 0;
+                0
+            } else {
+                KernelError::NoProcess.sysret()
+            }
+        }
+
+        PR_GET_THP_DISABLE => {
+            // Get THP disable flag (returns 0 or 1)
+            let table = TASK_TABLE.lock();
+            match table.tasks.iter().find(|t| t.tid == tid) {
+                Some(task) => {
+                    if task.prctl.thp_disable {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                None => KernelError::NoProcess.sysret(),
+            }
         }
 
         _ => KernelError::InvalidArgument.sysret(), // unsupported operation

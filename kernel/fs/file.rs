@@ -49,6 +49,8 @@ pub mod flags {
     pub const O_APPEND: u32 = 0o2000;
     /// Non-blocking mode
     pub const O_NONBLOCK: u32 = 0o4000;
+    /// Asynchronous I/O (generate SIGIO)
+    pub const O_ASYNC: u32 = 0o20000;
     /// Must be a directory
     pub const O_DIRECTORY: u32 = 0o200000;
     /// Don't follow symlinks
