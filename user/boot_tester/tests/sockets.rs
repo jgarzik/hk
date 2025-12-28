@@ -5,10 +5,22 @@
 use hk_syscall::{
     sys_close, sys_socket, sys_bind, sys_listen, sys_shutdown,
     sys_getsockname, sys_socketpair, sys_sendmsg, sys_sendto, sys_recvfrom,
+    sys_setsockopt, sys_getsockopt,
     sys_fork, sys_wait4, sys_exit, sys_nanosleep,
     SockAddrIn, MsgHdr, IoVec, Timespec, AF_INET, SOCK_STREAM, SOCK_DGRAM, SOCK_NONBLOCK,
     SHUT_RD, SHUT_WR, SHUT_RDWR, htons, htonl, make_ipv4,
 };
+
+/// Socket level constants
+const SOL_SOCKET: i32 = 1;
+const IPPROTO_TCP: i32 = 6;
+/// Socket option constants
+const SO_REUSEADDR: i32 = 2;
+const SO_SNDBUF: i32 = 7;
+const SO_RCVBUF: i32 = 8;
+const SO_KEEPALIVE: i32 = 9;
+/// TCP option constants
+const TCP_NODELAY: i32 = 1;
 use super::helpers::{print, println, print_num};
 
 /// Run all socket tests
@@ -34,6 +46,11 @@ pub fn run_tests() {
 
     // UDP data transfer tests
     test_udp_loopback();
+
+    // Socket options tests
+    test_setsockopt_reuseaddr();
+    test_setsockopt_tcp_nodelay();
+    test_getsockopt_roundtrip();
 }
 
 /// Test basic socket creation
@@ -540,5 +557,114 @@ fn test_udp_loopback() {
         } else {
             println(b"UDP_LOOPBACK:FAIL");
         }
+    }
+}
+
+/// Test setsockopt with SO_REUSEADDR
+fn test_setsockopt_reuseaddr() {
+    let fd = sys_socket(AF_INET, SOCK_STREAM, 0);
+    if fd < 0 {
+        println(b"SOCKOPT_REUSEADDR:FAIL (socket)");
+        return;
+    }
+
+    // Enable SO_REUSEADDR
+    let optval: i32 = 1;
+    let ret = sys_setsockopt(
+        fd as i32,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &optval as *const i32 as *const u8,
+        4,
+    );
+
+    print(b"setsockopt(SO_REUSEADDR, 1) returned ");
+    print_num(ret);
+
+    sys_close(fd as u64);
+
+    if ret == 0 {
+        println(b"SOCKOPT_REUSEADDR:OK");
+    } else {
+        println(b"SOCKOPT_REUSEADDR:FAIL");
+    }
+}
+
+/// Test setsockopt with TCP_NODELAY
+fn test_setsockopt_tcp_nodelay() {
+    let fd = sys_socket(AF_INET, SOCK_STREAM, 0);
+    if fd < 0 {
+        println(b"SOCKOPT_NODELAY:FAIL (socket)");
+        return;
+    }
+
+    // Enable TCP_NODELAY
+    let optval: i32 = 1;
+    let ret = sys_setsockopt(
+        fd as i32,
+        IPPROTO_TCP,
+        TCP_NODELAY,
+        &optval as *const i32 as *const u8,
+        4,
+    );
+
+    print(b"setsockopt(TCP_NODELAY, 1) returned ");
+    print_num(ret);
+
+    sys_close(fd as u64);
+
+    if ret == 0 {
+        println(b"SOCKOPT_NODELAY:OK");
+    } else {
+        println(b"SOCKOPT_NODELAY:FAIL");
+    }
+}
+
+/// Test getsockopt returns set values
+fn test_getsockopt_roundtrip() {
+    let fd = sys_socket(AF_INET, SOCK_STREAM, 0);
+    if fd < 0 {
+        println(b"SOCKOPT_ROUNDTRIP:FAIL (socket)");
+        return;
+    }
+
+    // Set SO_REUSEADDR to 1
+    let set_val: i32 = 1;
+    let ret1 = sys_setsockopt(
+        fd as i32,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &set_val as *const i32 as *const u8,
+        4,
+    );
+
+    if ret1 != 0 {
+        sys_close(fd as u64);
+        println(b"SOCKOPT_ROUNDTRIP:FAIL (setsockopt)");
+        return;
+    }
+
+    // Get SO_REUSEADDR and verify it's 1
+    let mut get_val: i32 = 0;
+    let mut optlen: u32 = 4;
+    let ret2 = sys_getsockopt(
+        fd as i32,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &mut get_val as *mut i32 as *mut u8,
+        &mut optlen,
+    );
+
+    print(b"getsockopt(SO_REUSEADDR) returned ");
+    print_num(ret2);
+    print(b", value=");
+    print_num(get_val as i64);
+
+    sys_close(fd as u64);
+
+    if ret2 == 0 && get_val == 1 {
+        println(b"SOCKOPT_ROUNDTRIP:OK");
+    } else {
+        println(b"SOCKOPT_ROUNDTRIP:FAIL");
     }
 }

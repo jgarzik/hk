@@ -107,6 +107,44 @@ impl SockAddrIn {
 /// Default receive buffer size
 const DEFAULT_RCVBUF: usize = 65536;
 
+/// Default send buffer size
+const DEFAULT_SNDBUF: usize = 65536;
+
+/// Socket options structure
+///
+/// Stores configurable socket options set via setsockopt().
+pub struct SocketOptions {
+    /// SO_REUSEADDR - allow local address reuse
+    pub reuse_addr: AtomicBool,
+    /// SO_KEEPALIVE - enable TCP keepalive
+    pub keepalive: AtomicBool,
+    /// SO_RCVBUF - receive buffer size
+    pub recv_buf_size: AtomicU32,
+    /// SO_SNDBUF - send buffer size
+    pub send_buf_size: AtomicU32,
+    /// TCP_NODELAY - disable Nagle's algorithm
+    pub tcp_nodelay: AtomicBool,
+}
+
+impl SocketOptions {
+    /// Create default socket options
+    pub fn new() -> Self {
+        Self {
+            reuse_addr: AtomicBool::new(false),
+            keepalive: AtomicBool::new(false),
+            recv_buf_size: AtomicU32::new(DEFAULT_RCVBUF as u32),
+            send_buf_size: AtomicU32::new(DEFAULT_SNDBUF as u32),
+            tcp_nodelay: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Default for SocketOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Socket structure
 pub struct Socket {
     /// Address family
@@ -120,6 +158,9 @@ pub struct Socket {
 
     /// Socket flags (O_NONBLOCK, etc.)
     pub flags: AtomicU32,
+
+    /// Socket options (SO_REUSEADDR, etc.)
+    pub options: SocketOptions,
 
     /// Local address
     pub(super) local_addr: Mutex<Option<(Ipv4Addr, u16)>>,
@@ -178,6 +219,7 @@ impl Socket {
             sock_type,
             protocol,
             flags: AtomicU32::new(0),
+            options: SocketOptions::new(),
             local_addr: Mutex::new(None),
             remote_addr: Mutex::new(None),
             rx_buffer: Mutex::new(VecDeque::with_capacity(DEFAULT_RCVBUF)),

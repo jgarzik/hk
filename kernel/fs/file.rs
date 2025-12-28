@@ -506,6 +506,9 @@ unsafe impl Sync for File {}
 
 impl Drop for File {
     fn drop(&mut self) {
+        // Call release on file operations to allow cleanup (e.g., decrement pipe reader/writer counts)
+        let _ = self.f_op.release(self);
+
         // Release POSIX advisory locks (must be before releasing mount ref)
         // POSIX semantics: closing ANY fd releases ALL locks by this process
         super::posix_lock::release_posix_locks_on_close(self);

@@ -65,7 +65,7 @@ pub use device::{NetDevice, NetDeviceOps, NetDeviceStats};
 pub use ethernet::EtherType;
 pub use ipv4::Ipv4Addr;
 pub use skb::SkBuff;
-pub use socket::Socket;
+pub use socket::{Socket, SocketOptions};
 
 // Import unified error type
 use crate::error::KernelError;

@@ -595,7 +595,8 @@ impl FileOps for PipeReadFileOps {
     }
 
     fn release(&self, _file: &File) -> Result<(), KernelError> {
-        // Reader reference is dropped via PipeReadEnd's Drop impl
+        // Decrement reader count when file is closed
+        self.pipe.remove_reader();
         Ok(())
     }
 
@@ -685,7 +686,10 @@ impl FileOps for PipeWriteFileOps {
         loop {
             // Check for EPIPE (no readers)
             if !self.pipe.has_readers() {
-                // TODO: Send SIGPIPE to calling process
+                // Send SIGPIPE to calling thread
+                use crate::signal::{SIGPIPE, send_signal};
+                use crate::task::percpu::current_tid;
+                let _ = send_signal(current_tid(), SIGPIPE);
                 return Err(KernelError::BrokenPipe);
             }
 
@@ -732,7 +736,8 @@ impl FileOps for PipeWriteFileOps {
     }
 
     fn release(&self, _file: &File) -> Result<(), KernelError> {
-        // Writer reference is dropped via PipeWriteEnd's Drop impl
+        // Decrement writer count when file is closed
+        self.pipe.remove_writer();
         Ok(())
     }
 
@@ -745,6 +750,10 @@ impl FileOps for PipeWriteFileOps {
         if flags.nowait {
             // Check for no readers (EPIPE)
             if !self.pipe.has_readers() {
+                // Send SIGPIPE to calling thread
+                use crate::signal::{SIGPIPE, send_signal};
+                use crate::task::percpu::current_tid;
+                let _ = send_signal(current_tid(), SIGPIPE);
                 return Err(KernelError::BrokenPipe);
             }
             // Check if buffer has space without blocking

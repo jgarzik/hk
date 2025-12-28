@@ -884,12 +884,82 @@ pub fn sys_getpeername(fd: i32, addr: u64, addrlen: u64) -> i64 {
     write_sockaddr_in(addr, addrlen, &sockaddr)
 }
 
+/// Socket level constants
+const SOL_SOCKET: i32 = 1;
+const IPPROTO_TCP: i32 = 6;
+
+/// Socket option constants (SOL_SOCKET level)
+const SO_REUSEADDR: i32 = 2;
+const SO_ERROR: i32 = 4;
+const SO_SNDBUF: i32 = 7;
+const SO_RCVBUF: i32 = 8;
+const SO_KEEPALIVE: i32 = 9;
+
+/// TCP option constants (IPPROTO_TCP level)
+const TCP_NODELAY: i32 = 1;
+
 /// setsockopt(fd, level, optname, optval, optlen) - set socket option
-pub fn sys_setsockopt(fd: i32, _level: i32, _optname: i32, _optval: u64, _optlen: u64) -> i64 {
-    // Verify it's a socket
-    match get_socket(fd) {
-        Ok(_) => 0, // Silently accept but ignore options for now
-        Err(e) => e,
+pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u64) -> i64 {
+    let socket = match get_socket(fd) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    // Need at least 4 bytes for integer options
+    if optval == 0 || optlen < 4 {
+        return KernelError::InvalidArgument.sysret();
+    }
+
+    // Read the option value (assume i32 for most options)
+    let value = unsafe { *(optval as *const i32) };
+    let bool_value = value != 0;
+
+    match level {
+        SOL_SOCKET => match optname {
+            SO_REUSEADDR => {
+                socket
+                    .options
+                    .reuse_addr
+                    .store(bool_value, core::sync::atomic::Ordering::Release);
+                0
+            }
+            SO_KEEPALIVE => {
+                socket
+                    .options
+                    .keepalive
+                    .store(bool_value, core::sync::atomic::Ordering::Release);
+                0
+            }
+            SO_RCVBUF => {
+                // Clamp to reasonable range (1KB to 16MB)
+                let size = (value as u32).clamp(1024, 16 * 1024 * 1024);
+                socket
+                    .options
+                    .recv_buf_size
+                    .store(size, core::sync::atomic::Ordering::Release);
+                0
+            }
+            SO_SNDBUF => {
+                let size = (value as u32).clamp(1024, 16 * 1024 * 1024);
+                socket
+                    .options
+                    .send_buf_size
+                    .store(size, core::sync::atomic::Ordering::Release);
+                0
+            }
+            _ => 0, // Accept unknown options silently
+        },
+        IPPROTO_TCP => match optname {
+            TCP_NODELAY => {
+                socket
+                    .options
+                    .tcp_nodelay
+                    .store(bool_value, core::sync::atomic::Ordering::Release);
+                0
+            }
+            _ => 0, // Accept unknown options silently
+        },
+        _ => 0, // Accept unknown levels silently
     }
 }
 
@@ -900,28 +970,81 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u6
         Err(e) => return e,
     };
 
-    // SOL_SOCKET = 1, SO_ERROR = 4
-    if level == 1 && optname == 4 {
-        // SO_ERROR - get pending error
-        let err = socket.get_error();
-        if optval != 0 && optlen != 0 {
-            // Write error value
-            unsafe {
-                let ptr = optval as *mut i32;
-                if !ptr.is_null() {
-                    *ptr = -err;
-                }
-                let len_ptr = optlen as *mut u32;
-                if !len_ptr.is_null() {
-                    *len_ptr = 4;
-                }
-            }
-        }
-        return 0;
+    // Check we have valid pointers and space for an i32
+    if optval == 0 || optlen == 0 {
+        return KernelError::InvalidArgument.sysret();
     }
 
-    // Other options: return 0 with empty result
-    0
+    // Helper to write an i32 option value
+    let write_i32 = |value: i32| {
+        unsafe {
+            let ptr = optval as *mut i32;
+            if !ptr.is_null() {
+                *ptr = value;
+            }
+            let len_ptr = optlen as *mut u32;
+            if !len_ptr.is_null() {
+                *len_ptr = 4;
+            }
+        }
+        0i64
+    };
+
+    match level {
+        SOL_SOCKET => match optname {
+            SO_ERROR => {
+                // Get and clear pending error
+                let err = socket.get_error();
+                write_i32(-err)
+            }
+            SO_REUSEADDR => {
+                let val = socket
+                    .options
+                    .reuse_addr
+                    .load(core::sync::atomic::Ordering::Acquire);
+                write_i32(if val { 1 } else { 0 })
+            }
+            SO_KEEPALIVE => {
+                let val = socket
+                    .options
+                    .keepalive
+                    .load(core::sync::atomic::Ordering::Acquire);
+                write_i32(if val { 1 } else { 0 })
+            }
+            SO_RCVBUF => {
+                let val = socket
+                    .options
+                    .recv_buf_size
+                    .load(core::sync::atomic::Ordering::Acquire);
+                write_i32(val as i32)
+            }
+            SO_SNDBUF => {
+                let val = socket
+                    .options
+                    .send_buf_size
+                    .load(core::sync::atomic::Ordering::Acquire);
+                write_i32(val as i32)
+            }
+            _ => {
+                // Unknown option - return 0 with value 0
+                write_i32(0)
+            }
+        },
+        IPPROTO_TCP => match optname {
+            TCP_NODELAY => {
+                let val = socket
+                    .options
+                    .tcp_nodelay
+                    .load(core::sync::atomic::Ordering::Acquire);
+                write_i32(if val { 1 } else { 0 })
+            }
+            _ => write_i32(0),
+        },
+        _ => {
+            // Unknown level - return 0 with value 0
+            write_i32(0)
+        }
+    }
 }
 
 /// sendto(fd, buf, len, flags, dest_addr, addrlen) - send data

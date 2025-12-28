@@ -19,10 +19,12 @@
 
 use super::helpers::{print, println, print_num};
 use hk_syscall::{
-    sys_clone, sys_exit, sys_getpid, sys_gettid, sys_kill, sys_rt_sigaction, sys_rt_sigpending,
-    sys_rt_sigprocmask, sys_rt_sigqueueinfo, sys_rt_sigsuspend, sys_rt_sigtimedwait,
-    sys_rt_tgsigqueueinfo, sys_sigaltstack, sys_tgkill, sys_tkill, sys_wait4,
-    CLONE_CLEAR_SIGHAND, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_UNBLOCK, SIGCHLD, SIGKILL, SIGUSR1,
+    sys_clone, sys_close, sys_exit, sys_getpid, sys_gettid, sys_kill, sys_pipe,
+    sys_rt_sigaction, sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigqueueinfo,
+    sys_rt_sigsuspend, sys_rt_sigtimedwait, sys_rt_tgsigqueueinfo, sys_sigaltstack,
+    sys_tgkill, sys_tkill, sys_wait4, sys_write,
+    CLONE_CLEAR_SIGHAND, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_UNBLOCK, SIGCHLD, SIGKILL, SIGPIPE,
+    SIGUSR1,
 };
 
 /// SI_QUEUE signal code (for rt_sigqueueinfo)
@@ -75,6 +77,7 @@ pub fn run_tests() {
     test_sigsuspend_einval();
     test_kill_pgrp_zero();
     test_kill_pgrp_neg();
+    test_sigpipe_broken_pipe();
 }
 
 /// Test 74: rt_sigprocmask() - get and set signal mask
@@ -579,5 +582,61 @@ fn test_kill_pgrp_neg() {
     } else {
         print(b"KILL_PGRP_NEG:FAIL: expected 0, got ");
         print_num(ret);
+    }
+}
+
+/// Test: SIGPIPE is generated when writing to a pipe with closed read end
+///
+/// Per POSIX, writing to a pipe/socket with no readers should:
+/// 1. Send SIGPIPE to the writing process
+/// 2. Return EPIPE (-32) if SIGPIPE is ignored/blocked
+fn test_sigpipe_broken_pipe() {
+    // Create a pipe
+    let mut pipefd: [i32; 2] = [0, 0];
+    let ret = sys_pipe(pipefd.as_mut_ptr());
+    if ret != 0 {
+        print(b"SIGPIPE_PIPE:FAIL: pipe() failed, ret = ");
+        print_num(ret);
+        return;
+    }
+
+    let read_fd = pipefd[0];
+    let write_fd = pipefd[1];
+
+    // Block SIGPIPE so we can detect it as pending
+    let sigpipe_mask: u64 = 1 << (SIGPIPE - 1);
+    sys_rt_sigprocmask(SIG_BLOCK, &sigpipe_mask as *const u64 as u64, 0, 8);
+
+    // Close the read end - now writes should fail with EPIPE and generate SIGPIPE
+    sys_close(read_fd as u64);
+
+    // Write to the pipe - should fail and generate SIGPIPE
+    let buf = [0u8; 4];
+    let write_ret = sys_write(write_fd as u64, buf.as_ptr(), 4);
+
+    // Check if SIGPIPE is pending
+    let mut pending: u64 = 0;
+    sys_rt_sigpending(&mut pending as *mut u64 as u64, 8);
+
+    // Consume the pending SIGPIPE using sigtimedwait
+    let ts = [0i64, 0i64]; // Zero timeout
+    sys_rt_sigtimedwait(&sigpipe_mask as *const u64 as u64, 0, ts.as_ptr() as u64, 8);
+
+    // Unblock SIGPIPE
+    sys_rt_sigprocmask(SIG_UNBLOCK, &sigpipe_mask as *const u64 as u64, 0, 8);
+
+    // Clean up
+    sys_close(write_fd as u64);
+
+    // Verify: write should return -32 (EPIPE) and SIGPIPE should have been pending
+    let sigpipe_was_pending = (pending & sigpipe_mask) != 0;
+    if write_ret == -32 && sigpipe_was_pending {
+        println(b"SIGPIPE_PIPE:OK");
+    } else if write_ret == -32 {
+        print(b"SIGPIPE_PIPE:FAIL: write returned EPIPE but SIGPIPE not pending, pending=");
+        print_num(pending as i64);
+    } else {
+        print(b"SIGPIPE_PIPE:FAIL: expected -32 (EPIPE), got ");
+        print_num(write_ret);
     }
 }
