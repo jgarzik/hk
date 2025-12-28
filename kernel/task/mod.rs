@@ -508,18 +508,26 @@ pub mod prctl_ops {
     pub const PR_GET_DUMPABLE: i32 = 3;
     /// Set dumpable flag
     pub const PR_SET_DUMPABLE: i32 = 4;
+    /// Get keep capabilities flag
+    pub const PR_GET_KEEPCAPS: i32 = 7;
+    /// Set keep capabilities flag
+    pub const PR_SET_KEEPCAPS: i32 = 8;
     /// Set process name (comm)
     pub const PR_SET_NAME: i32 = 15;
     /// Get process name (comm)
     pub const PR_GET_NAME: i32 = 16;
-    /// Set timer slack value (nanoseconds)
-    pub const PR_SET_TIMERSLACK: i32 = 29;
-    /// Get timer slack value (nanoseconds)
-    pub const PR_GET_TIMERSLACK: i32 = 30;
     /// Get seccomp mode
     pub const PR_GET_SECCOMP: i32 = 21;
     /// Set seccomp mode
     pub const PR_SET_SECCOMP: i32 = 22;
+    /// Set timer slack value (nanoseconds)
+    pub const PR_SET_TIMERSLACK: i32 = 29;
+    /// Get timer slack value (nanoseconds)
+    pub const PR_GET_TIMERSLACK: i32 = 30;
+    /// Get child subreaper flag
+    pub const PR_GET_CHILD_SUBREAPER: i32 = 36;
+    /// Set child subreaper flag
+    pub const PR_SET_CHILD_SUBREAPER: i32 = 37;
     /// Disable privilege escalation via setuid/setgid (irreversible)
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     /// Get no_new_privs flag
@@ -550,6 +558,13 @@ pub struct PrctlState {
     pub no_new_privs: bool,
     /// Timer slack in nanoseconds (PR_SET_TIMERSLACK)
     pub timer_slack_ns: u64,
+    /// Keep capabilities across setuid (PR_SET_KEEPCAPS)
+    /// When set, capabilities are preserved when changing UIDs
+    pub keep_caps: bool,
+    /// Child subreaper flag (PR_SET_CHILD_SUBREAPER)
+    /// When set, this process becomes the parent of orphaned descendants
+    /// instead of init (PID 1)
+    pub child_subreaper: bool,
 }
 
 impl Default for PrctlState {
@@ -559,6 +574,8 @@ impl Default for PrctlState {
             dumpable: dumpable::SUID_DUMP_USER,
             no_new_privs: false,
             timer_slack_ns: 50_000, // 50 microseconds default
+            keep_caps: false,
+            child_subreaper: false,
         }
     }
 }

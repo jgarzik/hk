@@ -10,14 +10,15 @@ use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
 use super::{
-    MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE,
-    MADV_HUGEPAGE, MADV_NOHUGEPAGE, MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED,
-    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK,
-    MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_FIXED,
-    MREMAP_MAYMOVE, MS_ASYNC, MS_INVALIDATE, MS_SYNC, PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP,
-    PROT_READ, PROT_WRITE, VM_DONTCOPY, VM_DONTDUMP, VM_GROWSDOWN, VM_HUGEPAGE, VM_LOCKED,
-    VM_LOCKED_MASK, VM_LOCKONFAULT, VM_NOHUGEPAGE, VM_NORESERVE, VM_RAND_READ, VM_SEQ_READ,
-    VM_SHARED, Vma, anon_vma::AnonVma, create_default_mm, get_task_mm, init_task_mm,
+    MADV_COLD, MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE,
+    MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM,
+    MADV_REMOVE, MADV_SEQUENTIAL, MADV_WILLNEED, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_FIXED,
+    MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE,
+    MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC,
+    MS_INVALIDATE, MS_SYNC, PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE,
+    VM_DONTCOPY, VM_DONTDUMP, VM_GROWSDOWN, VM_HUGEPAGE, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT,
+    VM_NOHUGEPAGE, VM_NORESERVE, VM_RAND_READ, VM_SEQ_READ, VM_SHARED, VM_WIPEONFORK, Vma,
+    anon_vma::AnonVma, create_default_mm, get_task_mm, init_task_mm,
 };
 use crate::error::KernelError;
 
@@ -1406,19 +1407,69 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
         return KernelError::OutOfMemory.sysret(); // Range not fully mapped
     }
 
-    // Now update the VMA protection flags
-    // Collect indices of modified VMAs for merging
+    // Now update the VMA protection flags with proper VMA splitting
+    // We need to split VMAs when the mprotect range doesn't align with VMA boundaries
+    //
+    // Algorithm:
+    // 1. Find VMAs overlapping [start, end)
+    // 2. For each VMA, split at start if start > vma.start
+    // 3. For each VMA, split at end if end < vma.end
+    // 4. Update protection only on the middle portion
+    // 5. Try to merge with adjacent VMAs
+
+    // Collect indices of VMAs to modify (we'll process them in order)
+    let mut vma_idx = 0;
     let mut modified_indices: Vec<usize> = Vec::new();
-    for (idx, vma) in mm_guard.iter_mut().enumerate() {
+
+    while let Some(vma) = mm_guard.get_vma(vma_idx) {
+        // Skip VMAs that don't overlap with our range
         if vma.end <= start || vma.start >= end {
+            vma_idx += 1;
             continue;
         }
 
-        // Update the protection flags for this VMA
-        // Note: This is simplified - a full implementation would handle
-        // VMA splitting if the mprotect range doesn't align with VMA boundaries
-        vma.prot = prot;
-        modified_indices.push(idx);
+        // Get VMA boundaries for splitting decisions
+        let vma_start = vma.start;
+
+        // Case 1: Need to split at start (mprotect range starts after VMA start)
+        if start > vma_start {
+            // Split: [vma_start, start) keeps old prot, [start, vma_end) gets new prot
+            if mm_guard.split_vma(vma_idx, start).is_some() {
+                // After split: vma_idx is [vma_start, start), vma_idx+1 is [start, vma_end)
+                // Move to the second part (which overlaps with our range)
+                vma_idx += 1;
+            } else {
+                // Split failed, skip this VMA
+                vma_idx += 1;
+                continue;
+            }
+        }
+
+        // Re-read VMA after potential split
+        let vma_end = match mm_guard.get_vma(vma_idx) {
+            Some(v) => v.end,
+            None => {
+                vma_idx += 1;
+                continue;
+            }
+        };
+
+        // Case 2: Need to split at end (mprotect range ends before VMA end)
+        if end < vma_end {
+            // Split: [vma.start, end) gets new prot, [end, vma_end) keeps old prot
+            let _ = mm_guard.split_vma(vma_idx, end);
+            // After split: vma_idx is [vma.start, end), vma_idx+1 is [end, vma_end)
+            // We update vma_idx (the first part)
+        }
+
+        // Now the VMA at vma_idx exactly covers [max(start, original_start), min(end, original_end))
+        // Update its protection
+        if let Some(vma) = mm_guard.get_vma_mut(vma_idx) {
+            vma.prot = prot;
+            modified_indices.push(vma_idx);
+        }
+
+        vma_idx += 1;
     }
 
     // Try to merge modified VMAs with adjacent VMAs (VMA merging optimization)
@@ -1649,7 +1700,8 @@ pub fn sys_madvise(addr: u64, length: u64, advice: i32) -> i64 {
 
     match advice {
         MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_DONTFORK | MADV_DOFORK
-        | MADV_DONTDUMP | MADV_DODUMP | MADV_HUGEPAGE | MADV_NOHUGEPAGE => {
+        | MADV_DONTDUMP | MADV_DODUMP | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_WIPEONFORK
+        | MADV_KEEPONFORK => {
             // These advices just update VMA flags
             madvise_update_vma_flags(&mm, addr, end, advice)
         }
@@ -1666,6 +1718,25 @@ pub fn sys_madvise(addr: u64, length: u64, advice: i32) -> i64 {
             // Mark pages as lazily freeable
             // Simplified: treat as DONTNEED (kernel frees pages immediately)
             madvise_dontneed(&mm, addr, end)
+        }
+        MADV_REMOVE => {
+            // MADV_REMOVE punches holes in file mappings / frees swap entries
+            // For now, treat similarly to DONTNEED (simplified)
+            // Full implementation would use fallocate(FALLOC_FL_PUNCH_HOLE) for files
+            madvise_dontneed(&mm, addr, end)
+        }
+        MADV_COLD | MADV_PAGEOUT => {
+            // These are hints for memory reclaim (LRU demotion / swap out)
+            // Without a proper LRU and swap infrastructure, these are no-ops
+            // Just validate the range exists
+            let mm_guard = mm.lock();
+            for vma in mm_guard.iter() {
+                if vma.end > addr && vma.start < end {
+                    return 0; // Range is mapped, success
+                }
+            }
+            // No VMAs found in range
+            KernelError::OutOfMemory.sysret()
         }
         _ => KernelError::InvalidArgument.sysret(),
     }
@@ -1724,6 +1795,14 @@ fn madvise_update_vma_flags(
             MADV_NOHUGEPAGE => {
                 // Disable transparent huge pages for this VMA
                 vma.flags = (vma.flags & !VM_HUGEPAGE) | VM_NOHUGEPAGE;
+            }
+            MADV_WIPEONFORK => {
+                // Zero this VMA in child on fork
+                vma.flags |= VM_WIPEONFORK;
+            }
+            MADV_KEEPONFORK => {
+                // Undo MADV_WIPEONFORK (normal fork behavior)
+                vma.flags &= !VM_WIPEONFORK;
             }
             _ => {}
         }

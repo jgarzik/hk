@@ -366,6 +366,16 @@ pub const MADV_DOFORK: i32 = 11;
 pub const MADV_DONTDUMP: i32 = 16;
 /// Include in core dumps (undo MADV_DONTDUMP)
 pub const MADV_DODUMP: i32 = 17;
+/// Remove pages (punch hole in file)
+pub const MADV_REMOVE: i32 = 9;
+/// Zero VMA in child on fork
+pub const MADV_WIPEONFORK: i32 = 18;
+/// Undo MADV_WIPEONFORK
+pub const MADV_KEEPONFORK: i32 = 19;
+/// Deactivate pages (hint for LRU)
+pub const MADV_COLD: i32 = 20;
+/// Reclaim pages (swap out)
+pub const MADV_PAGEOUT: i32 = 21;
 
 // mlock2 flags
 pub const MLOCK_ONFAULT: i32 = 0x01;
@@ -994,10 +1004,14 @@ pub struct SignalfdSiginfo {
 /// prctl operation codes
 pub const PR_GET_DUMPABLE: i32 = 3;
 pub const PR_SET_DUMPABLE: i32 = 4;
+pub const PR_GET_KEEPCAPS: i32 = 7;
+pub const PR_SET_KEEPCAPS: i32 = 8;
 pub const PR_SET_NAME: i32 = 15;
 pub const PR_GET_NAME: i32 = 16;
 pub const PR_SET_TIMERSLACK: i32 = 29;
 pub const PR_GET_TIMERSLACK: i32 = 30;
+pub const PR_GET_CHILD_SUBREAPER: i32 = 36;
+pub const PR_SET_CHILD_SUBREAPER: i32 = 37;
 pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
 pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 

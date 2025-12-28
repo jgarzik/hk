@@ -409,6 +409,47 @@ impl MmStruct {
     }
 
     // ========================================================================
+    // VMA splitting for mprotect
+    // ========================================================================
+
+    /// Split a VMA at the given address, creating two VMAs
+    ///
+    /// The original VMA is truncated to [start, split_addr) and a new VMA
+    /// is created for [split_addr, end). The new VMA is inserted after the
+    /// original.
+    ///
+    /// Returns the index of the new (second) VMA on success, or None if:
+    /// - vma_idx is out of bounds
+    /// - split_addr is not within the VMA's range (exclusive of boundaries)
+    pub fn split_vma(&mut self, vma_idx: usize, split_addr: u64) -> Option<usize> {
+        // Validate index
+        let vma = self.vmas.get(vma_idx)?;
+
+        // Validate split point is strictly within the VMA
+        if split_addr <= vma.start || split_addr >= vma.end {
+            return None;
+        }
+
+        // Clone VMA for the second half
+        let mut new_vma = vma.clone();
+        new_vma.start = split_addr;
+
+        // Adjust file offset if file-backed
+        if new_vma.file.is_some() {
+            new_vma.offset += split_addr - vma.start;
+        }
+
+        // Truncate original VMA to end at split point
+        self.vmas[vma_idx].end = split_addr;
+
+        // Insert new VMA after the original
+        // (VMA list remains sorted since new_vma.start > vmas[vma_idx].start)
+        self.vmas.insert(vma_idx + 1, new_vma);
+
+        Some(vma_idx + 1)
+    }
+
+    // ========================================================================
     // VMA merging optimization
     // ========================================================================
 

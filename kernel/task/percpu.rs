@@ -1064,6 +1064,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             dumpable: crate::task::dumpable::SUID_DUMP_USER, // Reset to default
             no_new_privs: parent_prctl.no_new_privs,         // Inherited (irreversible)
             timer_slack_ns: parent_prctl.timer_slack_ns,     // Inherited
+            keep_caps: false,                                // Reset on fork
+            child_subreaper: false,                          // Not inherited
         },
         // Process personality (inherited from parent)
         personality: parent_personality,

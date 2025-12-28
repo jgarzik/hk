@@ -11,7 +11,8 @@ use super::helpers::{print, println, print_num};
 use hk_syscall::{
     sys_madvise, sys_mincore, sys_mmap, sys_mprotect, sys_mremap, sys_msync, sys_munmap,
     sys_mlock, sys_mlock2, sys_munlock, sys_mlockall, sys_munlockall,
-    MADV_DONTNEED, MADV_NORMAL, MADV_RANDOM, MADV_WILLNEED,
+    MADV_COLD, MADV_DONTNEED, MADV_KEEPONFORK, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM,
+    MADV_WILLNEED, MADV_WIPEONFORK,
     MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED_NOREPLACE,
     MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
     MAP_STACK, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC, MS_SYNC,
@@ -81,6 +82,12 @@ pub fn run_tests() {
     test_vma_no_merge_different_prot();
     test_vma_merge_after_mprotect();
     test_vma_merge_multiple();
+    // VMA splitting tests
+    test_mprotect_partial_vma();
+    // New madvise hints
+    test_madvise_cold();
+    test_madvise_pageout();
+    test_madvise_wipeonfork();
 }
 
 /// Test: Basic anonymous mmap
@@ -2074,4 +2081,186 @@ fn test_mincore_invalid_addr() {
 
     sys_munmap(ptr as u64, 4096);
     println(b"MINCORE_INVALID:OK");
+}
+
+// ============================================================================
+// VMA splitting tests
+// ============================================================================
+
+/// Test: mprotect on partial VMA range triggers VMA splitting
+fn test_mprotect_partial_vma() {
+    // Map 3 pages as a single VMA
+    let size: u64 = 3 * 4096;
+    let ptr = sys_mmap(
+        0,
+        size,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MPROTECT_PARTIAL:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Write to all 3 pages to make sure they're accessible
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u8, 1);
+        core::ptr::write_volatile((ptr as u64 + 4096) as *mut u8, 2);
+        core::ptr::write_volatile((ptr as u64 + 8192) as *mut u8, 3);
+    }
+
+    // mprotect only the middle page to read-only
+    // This should split the VMA into 3 parts:
+    // [ptr, ptr+4096) = RW
+    // [ptr+4096, ptr+8192) = R
+    // [ptr+8192, ptr+12288) = RW
+    let middle = ptr as u64 + 4096;
+    let ret = sys_mprotect(middle, 4096, PROT_READ);
+    if ret != 0 {
+        print(b"MPROTECT_PARTIAL:FAIL mprotect errno=");
+        print_num(-ret);
+        println(b"");
+        sys_munmap(ptr as u64, size);
+        return;
+    }
+
+    // Verify we can still write to first and third pages
+    unsafe {
+        core::ptr::write_volatile(ptr as *mut u8, 10);
+        core::ptr::write_volatile((ptr as u64 + 8192) as *mut u8, 30);
+    }
+
+    // Verify reads work on all pages
+    let v1 = unsafe { core::ptr::read_volatile(ptr as *const u8) };
+    let v2 = unsafe { core::ptr::read_volatile((ptr as u64 + 4096) as *const u8) };
+    let v3 = unsafe { core::ptr::read_volatile((ptr as u64 + 8192) as *const u8) };
+
+    if v1 != 10 || v2 != 2 || v3 != 30 {
+        print(b"MPROTECT_PARTIAL:FAIL read mismatch ");
+        print_num(v1 as i64);
+        print(b" ");
+        print_num(v2 as i64);
+        print(b" ");
+        print_num(v3 as i64);
+        println(b"");
+        sys_munmap(ptr as u64, size);
+        return;
+    }
+
+    // Note: We can't easily test that writing to middle page fails
+    // without handling SIGSEGV, so we just verify the API works
+
+    sys_munmap(ptr as u64, size);
+    println(b"MPROTECT_PARTIAL:OK");
+}
+
+// ============================================================================
+// Additional madvise hint tests
+// ============================================================================
+
+/// Test: MADV_COLD hint (no-op, just verify it returns 0)
+fn test_madvise_cold() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MADVISE_COLD:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    let ret = sys_madvise(ptr as u64, 4096, MADV_COLD);
+    if ret == 0 {
+        println(b"MADVISE_COLD:OK");
+    } else {
+        print(b"MADVISE_COLD:FAIL expected 0, got ");
+        print_num(ret);
+        println(b"");
+    }
+
+    sys_munmap(ptr as u64, 4096);
+}
+
+/// Test: MADV_PAGEOUT hint (no-op, just verify it returns 0)
+fn test_madvise_pageout() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MADVISE_PAGEOUT:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    let ret = sys_madvise(ptr as u64, 4096, MADV_PAGEOUT);
+    if ret == 0 {
+        println(b"MADVISE_PAGEOUT:OK");
+    } else {
+        print(b"MADVISE_PAGEOUT:FAIL expected 0, got ");
+        print_num(ret);
+        println(b"");
+    }
+
+    sys_munmap(ptr as u64, 4096);
+}
+
+/// Test: MADV_WIPEONFORK / MADV_KEEPONFORK
+fn test_madvise_wipeonfork() {
+    let ptr = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+
+    if ptr < 0 {
+        print(b"MADVISE_WIPEONFORK:FAIL mmap errno=");
+        print_num(-ptr);
+        println(b"");
+        return;
+    }
+
+    // Set WIPEONFORK
+    let ret = sys_madvise(ptr as u64, 4096, MADV_WIPEONFORK);
+    if ret != 0 {
+        print(b"MADVISE_WIPEONFORK:FAIL WIPEONFORK returned ");
+        print_num(ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    // Clear with KEEPONFORK
+    let ret = sys_madvise(ptr as u64, 4096, MADV_KEEPONFORK);
+    if ret != 0 {
+        print(b"MADVISE_WIPEONFORK:FAIL KEEPONFORK returned ");
+        print_num(ret);
+        println(b"");
+        sys_munmap(ptr as u64, 4096);
+        return;
+    }
+
+    sys_munmap(ptr as u64, 4096);
+    println(b"MADVISE_WIPEONFORK:OK");
 }

@@ -105,6 +105,10 @@ pub const VM_NOHUGEPAGE: u32 = 0x0200_0000;
 /// Allows overcommit for this mapping without swap backing guarantee
 pub const VM_NORESERVE: u32 = 0x0400_0000;
 
+/// VMA should be zeroed in child on fork (madvise MADV_WIPEONFORK)
+/// Useful for sensitive data that shouldn't be inherited
+pub const VM_WIPEONFORK: u32 = 0x0800_0000;
+
 // ============================================================================
 // msync flags (MS_*)
 // ============================================================================
@@ -159,6 +163,25 @@ pub const MADV_HUGEPAGE: i32 = 14;
 /// MADV_NOHUGEPAGE - Mark region as unsuitable for transparent huge pages
 /// Linux value from include/uapi/asm-generic/mman-common.h
 pub const MADV_NOHUGEPAGE: i32 = 15;
+
+/// MADV_REMOVE - Remove pages (punch hole in file, swap entries, or private anonymous)
+/// For file mappings: like fallocate(FALLOC_FL_PUNCH_HOLE) without file write permission
+pub const MADV_REMOVE: i32 = 9;
+
+/// MADV_WIPEONFORK - Zero this VMA in child on fork
+/// Useful for sensitive data that shouldn't be inherited
+pub const MADV_WIPEONFORK: i32 = 18;
+
+/// MADV_KEEPONFORK - Undo MADV_WIPEONFORK (normal fork behavior)
+pub const MADV_KEEPONFORK: i32 = 19;
+
+/// MADV_COLD - Deactivate pages (hint for LRU demotion)
+/// Pages will be moved to inactive list for faster reclaim
+pub const MADV_COLD: i32 = 20;
+
+/// MADV_PAGEOUT - Reclaim pages (swap out or writeback and free)
+/// Proactive memory reclaim hint
+pub const MADV_PAGEOUT: i32 = 21;
 
 // ============================================================================
 // mremap flags (MREMAP_*)
