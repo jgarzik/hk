@@ -275,8 +275,8 @@ fn test_clone_clear_sighand() {
     if ret == 0 {
         // Child process: check if SIGUSR1 handler was reset to SIG_DFL
         let mut child_action: [u64; 4] = [0xFFFFFFFF; 4];
-        let ret = sys_rt_sigaction(SIGUSR1, 0, child_action.as_mut_ptr() as u64, 8);
-        if ret == 0 && child_action[0] == SIG_DFL {
+        let sigact_ret = sys_rt_sigaction(SIGUSR1, 0, child_action.as_mut_ptr() as u64, 8);
+        if sigact_ret == 0 && child_action[0] == SIG_DFL {
             // Handler was reset to default - success!
             sys_exit(0);
         } else {

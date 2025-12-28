@@ -39,6 +39,7 @@ pub mod tcp;
 pub mod keys;
 pub mod kcmp;
 pub mod process_vm;
+pub mod mempolicy;
 pub mod tty;
 pub mod cgroup;
 
@@ -81,4 +82,5 @@ pub fn run_all_tests() {
     process_vm::run_tests();
     tty::run_tests();
     cgroup::run_tests();
+    mempolicy::run_tests();
 }

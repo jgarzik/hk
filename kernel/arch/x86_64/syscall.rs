@@ -462,6 +462,14 @@ pub const SYS_MEMBARRIER: u64 = 324;
 /// readahead(fd, offset, count)
 pub const SYS_READAHEAD: u64 = 187;
 
+// NUMA memory policy (Section 4.2)
+/// mbind(start, len, mode, nodemask, maxnode, flags)
+pub const SYS_MBIND: u64 = 237;
+/// set_mempolicy(mode, nodemask, maxnode)
+pub const SYS_SET_MEMPOLICY: u64 = 238;
+/// get_mempolicy(policy, nodemask, maxnode, addr, flags)
+pub const SYS_GET_MEMPOLICY: u64 = 239;
+
 // Scheduling priority
 /// getpriority(which, who)
 pub const SYS_GETPRIORITY: u64 = 140;
@@ -1689,6 +1697,17 @@ pub fn x86_64_syscall_dispatch(
         // readahead syscall
         SYS_READAHEAD => {
             crate::fs::syscall::sys_readahead(arg0 as i32, arg1 as i64, arg2 as usize) as u64
+        }
+
+        // NUMA memory policy
+        SYS_GET_MEMPOLICY => {
+            crate::mm::mempolicy::sys_get_mempolicy(arg0, arg1, arg2, arg3, arg4) as u64
+        }
+        SYS_SET_MEMPOLICY => {
+            crate::mm::mempolicy::sys_set_mempolicy(arg0 as i32, arg1, arg2) as u64
+        }
+        SYS_MBIND => {
+            crate::mm::mempolicy::sys_mbind(arg0, arg1, arg2, arg3, arg4, arg5 as u32) as u64
         }
 
         // Scheduling priority

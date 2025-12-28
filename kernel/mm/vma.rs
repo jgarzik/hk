@@ -45,6 +45,9 @@ pub const MAP_STACK: u32 = 0x20000;
 /// MAP_FIXED_NOREPLACE - like MAP_FIXED but fails with EEXIST instead of unmapping
 /// Safer alternative to MAP_FIXED that doesn't silently replace existing mappings
 pub const MAP_FIXED_NOREPLACE: u32 = 0x100000;
+/// MAP_NORESERVE - don't reserve swap space for this mapping
+/// Allows large sparse mappings without requiring swap reservation upfront
+pub const MAP_NORESERVE: u32 = 0x4000;
 
 /// Return value for failed mmap
 pub const MAP_FAILED: i64 = -1;
@@ -97,6 +100,10 @@ pub const VM_HUGEPAGE: u32 = 0x0100_0000;
 /// VMA explicitly prohibits transparent huge pages (madvise MADV_NOHUGEPAGE)
 /// When set, the kernel will never use huge pages for this VMA
 pub const VM_NOHUGEPAGE: u32 = 0x0200_0000;
+
+/// VMA does not require swap reservation (MAP_NORESERVE)
+/// Allows overcommit for this mapping without swap backing guarantee
+pub const VM_NORESERVE: u32 = 0x0400_0000;
 
 // ============================================================================
 // msync flags (MS_*)
@@ -305,6 +312,12 @@ impl Vma {
     #[inline]
     pub fn is_growsdown(&self) -> bool {
         self.flags & VM_GROWSDOWN != 0
+    }
+
+    /// Check if this VMA has no-reserve set (doesn't require swap reservation)
+    #[inline]
+    pub fn is_noreserve(&self) -> bool {
+        self.flags & VM_NORESERVE != 0
     }
 
     /// Check if this VMA can merge with another adjacent VMA

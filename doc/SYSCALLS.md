@@ -185,9 +185,9 @@ Extended attributes (Linux-specific):
 
 4.2 NUMA / memory policy (optional but Linuxy)
 
-- [ ] get_mempolicy
-- [ ] set_mempolicy
-- [ ] mbind
+- [x] get_mempolicy
+- [x] set_mempolicy
+- [x] mbind
 - [ ] migrate_pages
 - [ ] move_pages
 

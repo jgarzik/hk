@@ -1171,6 +1171,66 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     unsafe { syscall5!(SYS_MREMAP, old_addr, old_len, new_len, flags, new_addr) }
 }
 
+// --- NUMA Memory Policy ---
+
+/// get_mempolicy syscall number
+pub const SYS_GET_MEMPOLICY: u64 = 239;
+/// set_mempolicy syscall number
+pub const SYS_SET_MEMPOLICY: u64 = 238;
+/// mbind syscall number
+pub const SYS_MBIND: u64 = 237;
+
+/// get_mempolicy - Get NUMA memory policy
+///
+/// # Arguments
+/// * `policy` - Output pointer for policy mode (can be null)
+/// * `nodemask` - Output pointer for node mask (can be null)
+/// * `maxnode` - Size of nodemask in bits
+/// * `addr` - Address for MPOL_F_ADDR lookup
+/// * `flags` - MPOL_F_NODE, MPOL_F_ADDR, MPOL_F_MEMS_ALLOWED
+#[inline(always)]
+pub fn sys_get_mempolicy(
+    policy: *mut i32,
+    nodemask: *mut u64,
+    maxnode: u64,
+    addr: u64,
+    flags: u64,
+) -> i64 {
+    unsafe { syscall5!(SYS_GET_MEMPOLICY, policy, nodemask, maxnode, addr, flags) }
+}
+
+/// set_mempolicy - Set NUMA memory policy for process
+///
+/// # Arguments
+/// * `mode` - Policy mode (MPOL_DEFAULT, MPOL_BIND, etc.)
+/// * `nodemask` - Pointer to node mask
+/// * `maxnode` - Size of nodemask in bits
+#[inline(always)]
+pub fn sys_set_mempolicy(mode: i32, nodemask: *const u64, maxnode: u64) -> i64 {
+    unsafe { syscall3!(SYS_SET_MEMPOLICY, mode, nodemask, maxnode) }
+}
+
+/// mbind - Set NUMA memory policy for a memory range
+///
+/// # Arguments
+/// * `start` - Start address (page-aligned)
+/// * `len` - Length of range
+/// * `mode` - Policy mode
+/// * `nodemask` - Pointer to node mask
+/// * `maxnode` - Size of nodemask in bits
+/// * `flags` - MPOL_MF_STRICT, MPOL_MF_MOVE, MPOL_MF_MOVE_ALL
+#[inline(always)]
+pub fn sys_mbind(
+    start: u64,
+    len: u64,
+    mode: u64,
+    nodemask: *const u64,
+    maxnode: u64,
+    flags: u32,
+) -> i64 {
+    unsafe { syscall6!(SYS_MBIND, start, len, mode, nodemask, maxnode, flags) }
+}
+
 // --- System Information ---
 
 #[inline(always)]

@@ -12,10 +12,15 @@
 
 | Flag | Value | Description |
 |------|-------|-------------|
-| MAP_NORESERVE | 0x4000 | Don't reserve swap |
 | MAP_HUGETLB | 0x40000 | Use huge pages |
 | MAP_SYNC | 0x80000 | Synchronous page faults (DAX) |
 | MAP_UNINITIALIZED | 0x4000000 | Skip zero-fill (embedded only) |
+
+## Recently Implemented
+
+| Flag | Value | Description |
+|------|-------|-------------|
+| MAP_NORESERVE | 0x4000 | Don't reserve swap (accepted, no effect since we don't reserve swap) |
 
 ## Known Limitations
 
