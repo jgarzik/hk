@@ -46,9 +46,17 @@ pub mod clone_flags {
     /// Share I/O context (ioprio)
     pub const CLONE_IO: u64 = 0x80000000;
 
+    /// Continue tracing child (if parent is being traced)
+    pub const CLONE_PTRACE: u64 = 0x00002000;
+    /// Prevent forced CLONE_PTRACE by parent's tracer
+    pub const CLONE_UNTRACED: u64 = 0x00800000;
+
     /// Clear signal handlers (reset to SIG_DFL) - Linux 5.5+
     /// Note: SIG_IGN handlers are preserved (intentional Linux behavior)
     pub const CLONE_CLEAR_SIGHAND: u64 = 0x100000000;
+
+    /// Place child in specific cgroup (clone3 only, requires cgroup fd)
+    pub const CLONE_INTO_CGROUP: u64 = 0x200000000;
 
     // Namespace clone flags (re-exported from ns module for convenience)
     pub use crate::ns::{
@@ -1566,5 +1574,36 @@ pub fn set_set_child_tid(tid: Tid, addr: u64) {
         if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
             task.set_child_tid = addr;
         }
+    }
+}
+
+// =============================================================================
+// Cgroup file descriptor lookup (for CLONE_INTO_CGROUP)
+// =============================================================================
+
+/// Look up a cgroup from a file descriptor.
+///
+/// The fd must refer to an open directory on cgroupfs.
+/// Returns the cgroup Arc if valid, None otherwise.
+pub fn cgroup_from_fd(tid: Tid, fd: i32) -> Option<alloc::sync::Arc<crate::cgroup::Cgroup>> {
+    use crate::fs::cgroupfs::{CgroupfsInodeData, CgroupfsInodeWrapper};
+
+    // Get the file from fd
+    let fd_table = fdtable::get_task_fd(tid)?;
+    let file = fd_table.lock().get(fd)?;
+
+    // Get the inode from the file
+    let inode = file.get_inode()?;
+
+    // Check if it's a cgroupfs directory inode
+    let private = inode.get_private()?;
+    let wrapper = private.as_any().downcast_ref::<CgroupfsInodeWrapper>()?;
+    let data = wrapper.0.read();
+
+    // Must be a directory (cgroup) not a control file
+    if let CgroupfsInodeData::Directory { cgroup } = &*data {
+        cgroup.upgrade()
+    } else {
+        None
     }
 }

@@ -769,6 +769,8 @@ pub struct CloneConfig {
     pub pidfd_ptr: u64,
     /// Exit signal for child (SIGCHLD for fork, 0 for threads)
     pub exit_signal: i32,
+    /// Cgroup file descriptor (CLONE_INTO_CGROUP, clone3 only)
+    pub cgroup_fd: i32,
 }
 
 /// Create a new thread/process via clone()
@@ -878,6 +880,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_mempolicy,
         parent_seccomp_mode,
         parent_seccomp_filter,
+        parent_ptrace,
+        parent_ptracer_tid,
     ) = {
         let table = TASK_TABLE.lock();
         let parent = try_with_cleanup!(table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)); // ESRCH - no such process
@@ -899,6 +903,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.mempolicy,
             parent.seccomp_mode,
             parent.seccomp_filter.clone(),
+            parent.ptrace,
+            parent.ptracer_tid,
         )
     };
 
@@ -1096,10 +1102,26 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         // I/O port permissions (x86-64 only, inherited from parent)
         #[cfg(target_arch = "x86_64")]
         iopl_emul: parent_iopl_emul,
-        // Ptrace state (not traced initially, even if parent is traced)
-        // Ptrace is not inherited - tracer must explicitly attach to child
-        ptrace: 0,
-        ptracer_tid: None,
+        // Ptrace state: inherited if CLONE_PTRACE is set and parent is traced
+        // CLONE_UNTRACED prevents forced inheritance even when tracer requests it
+        ptrace: if config.flags & CLONE_UNTRACED != 0 {
+            // CLONE_UNTRACED: child is never traced, even if parent is
+            0
+        } else if config.flags & CLONE_PTRACE != 0 && parent_ptrace != 0 {
+            // CLONE_PTRACE: if parent is being traced, child inherits tracing
+            // with the same tracer
+            parent_ptrace
+        } else {
+            // Normal case: child is not traced initially
+            0
+        },
+        ptracer_tid: if config.flags & CLONE_UNTRACED != 0 {
+            None
+        } else if config.flags & CLONE_PTRACE != 0 && parent_ptracer_tid.is_some() {
+            parent_ptracer_tid
+        } else {
+            None
+        },
         real_parent_tid: child_ppid,
         ptrace_message: 0,
         ptrace_options: 0,
@@ -1143,9 +1165,25 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         config.flags
     ));
 
-    // Inherit cgroup membership from parent
-    // Child joins same cgroup as parent and inherits resource constraints
-    if let Some(ref cgroup) = parent_cgroup {
+    // Handle cgroup membership
+    // If CLONE_INTO_CGROUP is set, look up cgroup from fd and use that
+    // Otherwise, inherit from parent
+    if config.flags & CLONE_INTO_CGROUP != 0 && config.cgroup_fd >= 0 {
+        // Look up cgroup from file descriptor
+        match crate::task::cgroup_from_fd(current_tid, config.cgroup_fd) {
+            Some(cgroup) => {
+                crate::cgroup::attach_task(child_tid, &cgroup);
+            }
+            None => {
+                // Invalid cgroup fd - cleanup and return error
+                if nproc_incremented {
+                    crate::task::decrement_user_process_count(nproc_uid);
+                }
+                return Err(9); // EBADF
+            }
+        }
+    } else if let Some(ref cgroup) = parent_cgroup {
+        // Inherit cgroup membership from parent
         crate::cgroup::attach_task(child_tid, cgroup);
     }
 

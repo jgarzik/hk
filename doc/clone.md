@@ -1,15 +1,17 @@
 # Clone Syscall - Gaps and Future Work
 
-## Unimplemented Clone Flags
+## Implemented Flags
+
+All major clone flags are now implemented. The following were recently added:
 
 | Flag | Value | Purpose |
 |------|-------|---------|
-| CLONE_NEWCGROUP | 0x02000000 | New cgroup namespace (requires cgroup support) |
-| CLONE_PTRACE | 0x00002000 | Continue tracing in child (requires ptrace) |
-| CLONE_UNTRACED | 0x00800000 | Prevent forced tracing (requires ptrace) |
-| CLONE_INTO_CGROUP | 0x200000000 | Place in specific cgroup (requires cgroups) |
+| CLONE_PTRACE | 0x00002000 | Continue tracing in child (if parent is traced) |
+| CLONE_UNTRACED | 0x00800000 | Prevent forced CLONE_PTRACE by tracer |
+| CLONE_NEWCGROUP | 0x02000000 | New cgroup namespace |
+| CLONE_INTO_CGROUP | 0x200000000 | Place child in specific cgroup (clone3 only) |
 
-## Dependencies
+## Notes
 
-- **CLONE_NEWCGROUP** and **CLONE_INTO_CGROUP**: Blocked on cgroup v2 implementation
-- **CLONE_PTRACE** and **CLONE_UNTRACED**: Blocked on ptrace implementation
+- **CLONE_INTO_CGROUP** is only supported via clone3 syscall (not clone).
+  It requires a cgroup file descriptor pointing to an open cgroupfs directory.
