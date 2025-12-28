@@ -421,10 +421,13 @@ pub const SYS_FUTEX: u64 = 98;
 pub const SYS_SET_ROBUST_LIST: u64 = 99;
 pub const SYS_GET_ROBUST_LIST: u64 = 100;
 pub const SYS_FUTEX_WAITV: u64 = 449;
+pub const SYS_FLOCK: u64 = 32;
+pub const SYS_FALLOCATE: u64 = 47;
 pub const SYS_SENDFILE: u64 = 71;
 pub const SYS_VMSPLICE: u64 = 75;
 pub const SYS_SPLICE: u64 = 76;
 pub const SYS_TEE: u64 = 77;
+pub const SYS_COPY_FILE_RANGE: u64 = 285;
 pub const SYS_STATFS: u64 = 43;
 pub const SYS_FSTATFS: u64 = 44;
 pub const SYS_STATX: u64 = 291;
@@ -1937,6 +1940,24 @@ pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
 #[inline(always)]
 pub fn sys_vmsplice(fd: i32, iov: *const super::IoVec, nr_segs: usize, flags: u32) -> i64 {
     unsafe { syscall4!(SYS_VMSPLICE, fd, iov, nr_segs, flags) }
+}
+
+/// flock(fd, operation) - apply or remove an advisory lock on an open file
+#[inline(always)]
+pub fn sys_flock(fd: i32, operation: i32) -> i64 {
+    unsafe { syscall2!(SYS_FLOCK, fd, operation) }
+}
+
+/// fallocate(fd, mode, offset, len) - manipulate file space
+#[inline(always)]
+pub fn sys_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i64 {
+    unsafe { syscall4!(SYS_FALLOCATE, fd, mode, offset, len) }
+}
+
+/// copy_file_range(fd_in, off_in, fd_out, off_out, len, flags) - copy range of data between files
+#[inline(always)]
+pub fn sys_copy_file_range(fd_in: i32, off_in: *mut u64, fd_out: i32, off_out: *mut u64, len: usize, flags: u32) -> i64 {
+    unsafe { syscall6!(SYS_COPY_FILE_RANGE, fd_in, off_in, fd_out, off_out, len, flags) }
 }
 
 // --- Filesystem Statistics ---

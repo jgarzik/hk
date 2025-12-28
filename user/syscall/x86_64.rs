@@ -359,9 +359,12 @@ pub const SYS_GETRANDOM: u64 = 318;
 pub const SYS_MEMBARRIER: u64 = 324;
 pub const SYS_MLOCK2: u64 = 325;
 pub const SYS_SENDFILE: u64 = 40;
+pub const SYS_FLOCK: u64 = 73;
 pub const SYS_SPLICE: u64 = 275;
 pub const SYS_TEE: u64 = 276;
 pub const SYS_VMSPLICE: u64 = 278;
+pub const SYS_FALLOCATE: u64 = 285;
+pub const SYS_COPY_FILE_RANGE: u64 = 326;
 pub const SYS_STATFS: u64 = 137;
 pub const SYS_FSTATFS: u64 = 138;
 pub const SYS_STATX: u64 = 332;
@@ -1626,6 +1629,21 @@ pub fn sys_tee(fd_in: i32, fd_out: i32, len: usize, flags: u32) -> i64 {
 #[inline(always)]
 pub fn sys_vmsplice(fd: i32, iov: *const super::IoVec, nr_segs: usize, flags: u32) -> i64 {
     unsafe { syscall4!(SYS_VMSPLICE, fd, iov, nr_segs, flags) }
+}
+
+#[inline(always)]
+pub fn sys_flock(fd: i32, operation: i32) -> i64 {
+    unsafe { syscall2!(SYS_FLOCK, fd, operation) }
+}
+
+#[inline(always)]
+pub fn sys_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i64 {
+    unsafe { syscall4!(SYS_FALLOCATE, fd, mode, offset, len) }
+}
+
+#[inline(always)]
+pub fn sys_copy_file_range(fd_in: i32, off_in: *mut u64, fd_out: i32, off_out: *mut u64, len: usize, flags: u32) -> i64 {
+    unsafe { syscall6!(SYS_COPY_FILE_RANGE, fd_in, off_in, fd_out, off_out, len, flags) }
 }
 
 // --- Filesystem Statistics ---

@@ -79,12 +79,15 @@
 - [x] splice
 - [x] tee
 - [x] vmsplice
+- [x] copy_file_range
 - [x] ioctl
 - [x] sync
 - [x] fsync
 - [x] fdatasync
 - [x] syncfs
 - [x] sync_file_range (x86-64) / sync_file_range2 (aarch64; different arg order)
+- [x] flock (advisory file locking)
+- [x] fallocate (file space manipulation)
 
 3. Filesystem / path / metadata
 3.1 Paths & directory ops

@@ -105,7 +105,11 @@ pub const SYS_FREMOVEXATTR: u64 = 16;
 /// ioctl(fd, request, arg)
 pub const SYS_IOCTL: u64 = 29;
 
-// Splice/sendfile syscalls
+// Splice/sendfile/copy syscalls
+/// flock(fd, operation)
+pub const SYS_FLOCK: u64 = 32;
+/// fallocate(fd, mode, offset, len)
+pub const SYS_FALLOCATE: u64 = 47;
 /// sendfile(out_fd, in_fd, offset, count)
 pub const SYS_SENDFILE: u64 = 71;
 /// vmsplice(fd, iov, nr_segs, flags)
@@ -114,6 +118,8 @@ pub const SYS_VMSPLICE: u64 = 75;
 pub const SYS_SPLICE: u64 = 76;
 /// tee(fd_in, fd_out, len, flags)
 pub const SYS_TEE: u64 = 77;
+/// copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)
+pub const SYS_COPY_FILE_RANGE: u64 = 285;
 
 // UTS namespace syscalls
 pub const SYS_UNAME: u64 = 160;
@@ -664,7 +670,12 @@ pub fn aarch64_syscall_dispatch(
         // ioctl
         SYS_IOCTL => sys_ioctl(arg0 as i32, arg1 as u32, arg2) as u64,
 
-        // splice/sendfile
+        // splice/sendfile/copy/flock
+        SYS_FLOCK => crate::fs::flock::sys_flock(arg0 as i32, arg1 as i32) as u64,
+        SYS_FALLOCATE => {
+            crate::fs::misc::sys_fallocate(arg0 as i32, arg1 as i32, arg2 as i64, arg3 as i64)
+                as u64
+        }
         SYS_SENDFILE => {
             crate::fs::splice::sys_sendfile64(arg0 as i32, arg1 as i32, arg2, arg3 as usize) as u64
         }
@@ -682,6 +693,14 @@ pub fn aarch64_syscall_dispatch(
         SYS_VMSPLICE => {
             crate::fs::splice::sys_vmsplice(arg0 as i32, arg1, arg2 as usize, arg3 as u32) as u64
         }
+        SYS_COPY_FILE_RANGE => crate::fs::splice::sys_copy_file_range(
+            arg0 as i32,
+            arg1,
+            arg2 as i32,
+            arg3,
+            arg4,
+            arg5 as u32,
+        ) as u64,
 
         // Process info syscalls
         SYS_GETPID => sys_getpid(percpu::current_pid()) as u64,

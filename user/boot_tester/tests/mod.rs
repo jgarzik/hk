@@ -43,6 +43,7 @@ pub mod mempolicy;
 pub mod tty;
 pub mod cgroup;
 pub mod bpf;
+pub mod flock;
 #[cfg(target_arch = "x86_64")]
 pub mod ioport;
 
@@ -87,6 +88,7 @@ pub fn run_all_tests() {
     cgroup::run_tests();
     mempolicy::run_tests();
     bpf::run_tests();
+    flock::run_tests();
     #[cfg(target_arch = "x86_64")]
     ioport::run_tests();
 }

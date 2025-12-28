@@ -1030,3 +1030,176 @@ fn do_sendfile_to_file(
 
     transferred as i64
 }
+
+// =============================================================================
+// copy_file_range syscall
+// =============================================================================
+
+/// sys_copy_file_range - Copy a range of data between two files
+///
+/// Efficiently copies data between two file descriptors without the need
+/// to transfer data to and from user space. The copy is done in kernel space.
+///
+/// # Arguments
+/// * `fd_in` - Source file descriptor
+/// * `off_in_ptr` - Pointer to source offset (NULL=0 uses file position)
+/// * `fd_out` - Destination file descriptor
+/// * `off_out_ptr` - Pointer to destination offset (NULL=0 uses file position)
+/// * `len` - Number of bytes to copy
+/// * `flags` - Reserved, must be 0
+///
+/// # Returns
+/// Number of bytes copied on success, negative errno on error:
+/// * -EBADF: fd_in or fd_out is not a valid file descriptor
+/// * -EINVAL: flags is not 0, or offsets are invalid
+/// * -EISDIR: fd_in or fd_out is a directory
+/// * -EXDEV: Cross-device copy not supported (not enforced here)
+/// * -EOVERFLOW: Requested range exceeds maximum file size
+pub fn sys_copy_file_range(
+    fd_in: i32,
+    off_in_ptr: u64,
+    fd_out: i32,
+    off_out_ptr: u64,
+    len: u64,
+    flags: u32,
+) -> i64 {
+    use crate::arch::Uaccess;
+    use crate::uaccess::{UaccessArch, get_user, put_user};
+
+    // flags must be 0 (reserved for future use)
+    if flags != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+
+    if len == 0 {
+        return 0;
+    }
+
+    // Get input file
+    let in_file = match get_file_from_fd(fd_in) {
+        Some(f) => f,
+        None => return KernelError::BadFd.sysret(),
+    };
+
+    // Get output file
+    let out_file = match get_file_from_fd(fd_out) {
+        Some(f) => f,
+        None => return KernelError::BadFd.sysret(),
+    };
+
+    // Check permissions
+    if !in_file.is_readable() {
+        return KernelError::BadFd.sysret();
+    }
+    if !out_file.is_writable() {
+        return KernelError::BadFd.sysret();
+    }
+
+    // Check file types - must be regular files
+    if let Some(inode) = in_file.get_inode() {
+        if inode.mode().is_dir() {
+            return KernelError::IsDirectory.sysret();
+        }
+        if !inode.mode().is_file() {
+            return KernelError::InvalidArgument.sysret();
+        }
+    }
+    if let Some(inode) = out_file.get_inode() {
+        if inode.mode().is_dir() {
+            return KernelError::IsDirectory.sysret();
+        }
+        if !inode.mode().is_file() {
+            return KernelError::InvalidArgument.sysret();
+        }
+    }
+
+    // Get input offset
+    let off_in: u64 = if off_in_ptr != 0 {
+        if !Uaccess::access_ok(off_in_ptr, core::mem::size_of::<u64>()) {
+            return KernelError::BadAddress.sysret();
+        }
+        match get_user::<Uaccess, u64>(off_in_ptr) {
+            Ok(v) => v,
+            Err(_) => return KernelError::BadAddress.sysret(),
+        }
+    } else {
+        in_file.get_pos()
+    };
+
+    // Get output offset
+    let off_out: u64 = if off_out_ptr != 0 {
+        if !Uaccess::access_ok(off_out_ptr, core::mem::size_of::<u64>()) {
+            return KernelError::BadAddress.sysret();
+        }
+        match get_user::<Uaccess, u64>(off_out_ptr) {
+            Ok(v) => v,
+            Err(_) => return KernelError::BadAddress.sysret(),
+        }
+    } else {
+        out_file.get_pos()
+    };
+
+    // Check for overflow
+    if off_in.checked_add(len).is_none() || off_out.checked_add(len).is_none() {
+        return KernelError::Overflow.sysret();
+    }
+
+    // Perform the copy
+    let mut buf = [0u8; PAGE_SIZE];
+    let mut copied: u64 = 0;
+    let mut current_off_in = off_in;
+    let mut current_off_out = off_out;
+
+    while copied < len {
+        let to_copy = ((len - copied) as usize).min(PAGE_SIZE);
+
+        // Read from source at current offset
+        let bytes_read = match in_file.pread(&mut buf[..to_copy], current_off_in) {
+            Ok(0) => break, // EOF
+            Ok(n) => n,
+            Err(e) => {
+                if copied > 0 {
+                    break; // Return partial success
+                }
+                return e.sysret();
+            }
+        };
+
+        // Write to destination at current offset
+        let bytes_written = match out_file.pwrite(&buf[..bytes_read], current_off_out) {
+            Ok(n) => n,
+            Err(e) => {
+                if copied > 0 {
+                    break; // Return partial success
+                }
+                return e.sysret();
+            }
+        };
+
+        copied += bytes_written as u64;
+        current_off_in += bytes_written as u64;
+        current_off_out += bytes_written as u64;
+
+        if bytes_written < bytes_read {
+            break; // Partial write, stop
+        }
+    }
+
+    // Update offset pointers if provided
+    if off_in_ptr != 0 && copied > 0 {
+        let _ = put_user::<Uaccess, u64>(off_in_ptr, off_in + copied);
+    }
+    if off_out_ptr != 0 && copied > 0 {
+        let _ = put_user::<Uaccess, u64>(off_out_ptr, off_out + copied);
+    }
+
+    // Update file positions if offset pointers were NULL
+    if off_in_ptr == 0 && copied > 0 {
+        in_file.set_pos(off_in + copied);
+    }
+    if off_out_ptr == 0 && copied > 0 {
+        out_file.set_pos(off_out + copied);
+    }
+
+    copied as i64
+}
