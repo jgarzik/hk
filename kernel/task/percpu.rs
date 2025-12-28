@@ -399,6 +399,8 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         utime: 0,
         stime: 0,
         start_time: crate::time::monotonic_ns(),
+        last_run_ns: crate::time::monotonic_ns(),
+        in_kernel: true, // Kernel threads always in kernel mode
         nvcsw: 0,
         nivcsw: 0,
         min_flt: 0,
@@ -520,6 +522,8 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         utime: 0,
         stime: 0,
         start_time: crate::time::monotonic_ns(),
+        last_run_ns: crate::time::monotonic_ns(),
+        in_kernel: false, // User tasks start in user mode
         nvcsw: 0,
         nivcsw: 0,
         min_flt: 0,
@@ -1024,6 +1028,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         utime: 0,
         stime: 0,
         start_time: crate::time::monotonic_ns(),
+        last_run_ns: crate::time::monotonic_ns(),
+        in_kernel: false, // Child starts in user mode
         nvcsw: 0,
         nivcsw: 0,
         min_flt: 0,
@@ -1884,6 +1890,18 @@ pub fn get_tids_by_pgid(pgid: Pid) -> alloc::vec::Vec<Tid> {
         .collect()
 }
 
+/// Get all unique PIDs in the system
+///
+/// Returns a sorted, deduplicated list of all process IDs.
+/// Used by kill(-1, sig) to signal all processes.
+pub fn get_all_pids() -> alloc::vec::Vec<Pid> {
+    let table = TASK_TABLE.lock();
+    let mut pids: alloc::vec::Vec<Pid> = table.tasks.iter().map(|t| t.pid).collect();
+    pids.sort();
+    pids.dedup();
+    pids
+}
+
 /// Get the current task's FsStruct (filesystem context)
 ///
 /// Returns None if there is no current task or no filesystem context.
@@ -1963,6 +1981,106 @@ pub fn lookup_task_rt_priority(pid: Pid) -> Option<i32> {
         .iter()
         .find(|t| t.pid == pid)
         .map(|t| t.rt_priority)
+}
+
+/// Get a task's CPU time statistics by TID
+///
+/// Returns (utime_ns, stime_ns) for the specified task.
+/// Returns (0, 0) if the task is not found.
+pub fn get_task_times(tid: Tid) -> (u64, u64) {
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .map(|t| (t.utime, t.stime))
+        .unwrap_or((0, 0))
+}
+
+/// Get aggregate CPU times for a process (all threads)
+///
+/// Returns (utime_ns, stime_ns) summed across all threads in the process.
+/// Returns (0, 0) if no threads are found.
+pub fn get_process_times(pid: Pid) -> (u64, u64) {
+    let table = TASK_TABLE.lock();
+    let mut utime = 0u64;
+    let mut stime = 0u64;
+    for task in table.tasks.iter().filter(|t| t.pid == pid) {
+        utime = utime.saturating_add(task.utime);
+        stime = stime.saturating_add(task.stime);
+    }
+    (utime, stime)
+}
+
+/// Called when entering kernel mode (syscall entry)
+///
+/// Accumulates user time and marks task as in kernel mode.
+/// Call this at the start of syscall handling.
+pub fn account_syscall_enter() {
+    let tid = current_tid();
+    if tid == 0 {
+        return;
+    }
+
+    let now = crate::time::monotonic_ns();
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        // Accumulate user time (time since last_run_ns while in user mode)
+        if !task.in_kernel {
+            let delta = now.saturating_sub(task.last_run_ns);
+            task.utime = task.utime.saturating_add(delta);
+        }
+        task.last_run_ns = now;
+        task.in_kernel = true;
+    }
+}
+
+/// Called when exiting kernel mode (syscall return)
+///
+/// Accumulates system time and marks task as in user mode.
+/// Call this just before returning to user space.
+pub fn account_syscall_exit() {
+    let tid = current_tid();
+    if tid == 0 {
+        return;
+    }
+
+    let now = crate::time::monotonic_ns();
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        // Accumulate system time (time since last_run_ns while in kernel mode)
+        if task.in_kernel {
+            let delta = now.saturating_sub(task.last_run_ns);
+            task.stime = task.stime.saturating_add(delta);
+        }
+        task.last_run_ns = now;
+        task.in_kernel = false;
+    }
+}
+
+/// Called on context switch to accumulate time for outgoing task
+///
+/// This handles time accounting when switching away from a task.
+pub fn account_context_switch(tid: Tid, now: u64) {
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        let delta = now.saturating_sub(task.last_run_ns);
+        if task.in_kernel {
+            task.stime = task.stime.saturating_add(delta);
+        } else {
+            task.utime = task.utime.saturating_add(delta);
+        }
+    }
+}
+
+/// Called when a task starts running after context switch
+///
+/// Updates last_run_ns for the incoming task.
+pub fn account_task_resume(tid: Tid, now: u64) {
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.last_run_ns = now;
+    }
 }
 
 /// Look up a task's CPU affinity mask by PID

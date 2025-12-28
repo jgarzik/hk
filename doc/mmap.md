@@ -22,10 +22,6 @@
 |------|-------|-------------|
 | MAP_NORESERVE | 0x4000 | Don't reserve swap (accepted, no effect since we don't reserve swap) |
 
-## Known Limitations
-
-1. **No VMA splitting** - mprotect on a partial VMA region updates the entire VMA's protection; a full implementation would split the VMA.
-
 ## Dependencies
 
 - **MAP_HUGETLB**: Requires architecture-specific huge page TLB support

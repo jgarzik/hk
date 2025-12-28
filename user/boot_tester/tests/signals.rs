@@ -73,6 +73,8 @@ pub fn run_tests() {
     test_tgsigqueueinfo();
     test_sigsuspend();
     test_sigsuspend_einval();
+    test_kill_pgrp_zero();
+    test_kill_pgrp_neg();
 }
 
 /// Test 74: rt_sigprocmask() - get and set signal mask
@@ -544,6 +546,38 @@ fn test_sigsuspend_einval() {
         println(b"SIGSUSPEND_EINVAL:OK");
     } else {
         print(b"SIGSUSPEND_EINVAL:FAIL: expected -22, got ");
+        print_num(ret);
+    }
+}
+
+/// Test: kill(0, sig) - signal own process group
+///
+/// kill(0, sig) should signal all processes in the caller's process group.
+/// Since we're the only process in our process group, signal 0 should succeed.
+fn test_kill_pgrp_zero() {
+    // Signal 0 is a validity check - should succeed for our own pgrp
+    let ret = sys_kill(0, 0);
+    if ret == 0 {
+        println(b"KILL_PGRP_ZERO:OK");
+    } else {
+        print(b"KILL_PGRP_ZERO:FAIL: expected 0, got ");
+        print_num(ret);
+    }
+}
+
+/// Test: kill(-pgid, sig) - signal specific process group
+///
+/// kill(-pgid, sig) should signal all processes in process group pgid.
+/// We use our own pid (negated) since we're a process group leader.
+fn test_kill_pgrp_neg() {
+    let pid = sys_getpid();
+
+    // Signal our own process group using -pid (we are the pgrp leader)
+    let ret = sys_kill(-pid, 0); // Signal 0 = validity check
+    if ret == 0 {
+        println(b"KILL_PGRP_NEG:OK");
+    } else {
+        print(b"KILL_PGRP_NEG:FAIL: expected 0, got ");
         print_num(ret);
     }
 }

@@ -195,6 +195,14 @@ pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
     0
 }
 
+/// Convert nanoseconds to Timeval
+fn timeval_from_ns(ns: u64) -> Timeval {
+    Timeval {
+        tv_sec: (ns / 1_000_000_000) as i64,
+        tv_usec: ((ns % 1_000_000_000) / 1000) as i64,
+    }
+}
+
 /// sys_getrusage - get resource usage
 ///
 /// Returns resource usage statistics for the specified target.
@@ -209,14 +217,14 @@ pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
 /// * -EFAULT if copy to user fails
 ///
 /// # Locking
-/// None required for current minimal implementation.
-/// When per-task stats are added, will need to read task struct with lock.
+/// Acquires TASK_TABLE lock to read task CPU times.
 ///
 /// # Implementation Notes
-/// Currently returns minimal/zero values for most fields since we don't
-/// track detailed per-task resource usage yet. This is Linux-compatible
-/// behavior for a minimal implementation.
+/// Returns utime and stime for the current task/process. Other fields
+/// like maxrss, page faults, and context switches are also populated
+/// when available.
 pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(who: i32, usage_ptr: u64) -> i64 {
+    use crate::task::percpu;
     use crate::uaccess::put_user;
 
     // Validate who parameter
@@ -230,17 +238,29 @@ pub fn sys_getrusage<A: crate::uaccess::UaccessArch>(who: i32, usage_ptr: u64) -
     }
 
     // Build rusage structure
-    // For now, we return zeros for most fields since we don't track
-    // detailed per-task resource usage. This matches Linux behavior
-    // for fields that aren't implemented.
     let usage = match who {
-        RUSAGE_SELF | RUSAGE_THREAD => {
-            // For RUSAGE_SELF and RUSAGE_THREAD, return current task stats
-            // Currently we don't track these per-task, so return zeros
-            Rusage::default()
+        RUSAGE_THREAD => {
+            // RUSAGE_THREAD: return current thread's stats only
+            let tid = percpu::current_tid();
+            let (utime_ns, stime_ns) = percpu::get_task_times(tid);
+            Rusage {
+                ru_utime: timeval_from_ns(utime_ns),
+                ru_stime: timeval_from_ns(stime_ns),
+                ..Rusage::default()
+            }
+        }
+        RUSAGE_SELF => {
+            // RUSAGE_SELF: return aggregate stats for all threads in process
+            let pid = percpu::current_pid();
+            let (utime_ns, stime_ns) = percpu::get_process_times(pid);
+            Rusage {
+                ru_utime: timeval_from_ns(utime_ns),
+                ru_stime: timeval_from_ns(stime_ns),
+                ..Rusage::default()
+            }
         }
         RUSAGE_CHILDREN => {
-            // For RUSAGE_CHILDREN, return stats of terminated and waited-for children
+            // RUSAGE_CHILDREN: return stats of terminated and waited-for children
             // We don't track child resource usage yet, so return zeros
             Rusage::default()
         }

@@ -837,6 +837,10 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub stime: u64,
     /// Task start time (monotonic clock, nanoseconds since boot)
     pub start_time: u64,
+    /// Timestamp when task last started running (for CPU time tracking)
+    pub last_run_ns: u64,
+    /// Whether task is currently in kernel mode (for utime/stime split)
+    pub in_kernel: bool,
     /// Voluntary context switches (task yielded or slept)
     pub nvcsw: u64,
     /// Involuntary context switches (preempted by scheduler)

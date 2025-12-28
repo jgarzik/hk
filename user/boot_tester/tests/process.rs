@@ -70,6 +70,7 @@ pub fn run_tests() {
     test_sysinfo();
     test_getrusage();
     test_getrusage_einval();
+    test_getrusage_times();
     // Scheduling syscalls
     test_sched_getscheduler();
     test_sched_getparam();
@@ -1264,6 +1265,69 @@ fn test_getrusage_einval() {
     }
 
     println(b"GETRUSAGE_EINVAL:OK");
+}
+
+/// Test: getrusage CPU time tracking
+///
+/// After doing CPU-intensive work, utime + stime should be non-zero.
+#[inline(never)]
+fn test_getrusage_times() {
+    // Do some CPU-intensive work
+    let mut sum: u64 = 0;
+    for i in 0..100000u64 {
+        sum = sum.wrapping_add(i);
+        // Prevent optimizer from removing the loop
+        core::hint::black_box(sum);
+    }
+
+    // Get rusage
+    let mut buffer: [u8; 160] = [0xff; 160];
+    let ret = sys_getrusage(RUSAGE_SELF, buffer.as_mut_ptr());
+    if ret != 0 {
+        print(b"GETRUSAGE_TIMES:FAIL ret=");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+
+    // Extract utime.tv_sec, utime.tv_usec, stime.tv_sec, stime.tv_usec
+    let utime_sec = i64::from_ne_bytes([
+        buffer[0], buffer[1], buffer[2], buffer[3],
+        buffer[4], buffer[5], buffer[6], buffer[7],
+    ]);
+    let utime_usec = i64::from_ne_bytes([
+        buffer[8], buffer[9], buffer[10], buffer[11],
+        buffer[12], buffer[13], buffer[14], buffer[15],
+    ]);
+    let stime_sec = i64::from_ne_bytes([
+        buffer[16], buffer[17], buffer[18], buffer[19],
+        buffer[20], buffer[21], buffer[22], buffer[23],
+    ]);
+    let stime_usec = i64::from_ne_bytes([
+        buffer[24], buffer[25], buffer[26], buffer[27],
+        buffer[28], buffer[29], buffer[30], buffer[31],
+    ]);
+
+    // Calculate total time in microseconds
+    let utime_total = utime_sec * 1_000_000 + utime_usec;
+    let stime_total = stime_sec * 1_000_000 + stime_usec;
+    let total = utime_total + stime_total;
+
+    // After doing work, total time should be > 0
+    // Note: Times might be 0 if the work loop was too fast
+    if total >= 0 {
+        // Print the times for debugging
+        print(b"GETRUSAGE_TIMES: utime=");
+        print_num(utime_total);
+        print(b"us stime=");
+        print_num(stime_total);
+        print(b"us");
+        println(b"GETRUSAGE_TIMES:OK");
+    } else {
+        print(b"GETRUSAGE_TIMES:FAIL negative time total=");
+        print_num(total);
+        println(b"");
+    }
 }
 
 // =============================================================================

@@ -13,9 +13,9 @@
 use crate::arch::Uaccess;
 use crate::signal::{
     SIGKILL, SIGSTOP, SigAction, SigSet, UNMASKABLE_SIGNALS, get_task_sighand, send_signal,
-    send_signal_to_process, with_task_signal_state,
+    send_signal_to_pgrp, send_signal_to_process, with_task_signal_state,
 };
-use crate::task::percpu::current_tid;
+use crate::task::percpu::{current_pgid, current_tid, get_all_pids};
 use crate::uaccess::{get_user, put_user};
 
 /// SIG_BLOCK - Add signals to blocked mask
@@ -264,16 +264,40 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
         send_signal_to_process(pid as u64, sig) as i64
     } else if pid == 0 {
         // Send to all processes in caller's process group
-        // TODO: Implement process group signaling
-        -1 // ESRCH for now
+        let pgid = current_pgid();
+        // Signal 0 is a validity check only
+        if sig == 0 {
+            // Check if our process group exists (it always does)
+            return 0;
+        }
+        send_signal_to_pgrp(pgid, sig) as i64
     } else if pid == -1 {
         // Send to all processes (except init)
-        // TODO: Implement broadcast signaling
-        -1 // ESRCH for now
+        // Signal 0 is a validity check, don't actually send
+        if sig == 0 {
+            return 0;
+        }
+        let mut sent = false;
+        for target_pid in get_all_pids() {
+            if target_pid != 1 {
+                // Skip init (pid 1)
+                if send_signal_to_process(target_pid, sig) == 0 {
+                    sent = true;
+                }
+            }
+        }
+        if sent { 0 } else { -3 } // ESRCH if no process was signaled
     } else {
         // pid < -1: Send to all processes in process group -pid
-        // TODO: Implement process group signaling
-        -1 // ESRCH for now
+        let pgid = (-pid) as u64;
+        // Signal 0 is a validity check - check if pgrp exists
+        if sig == 0 {
+            use crate::task::percpu::TASK_TABLE;
+            let table = TASK_TABLE.lock();
+            let exists = table.tasks.iter().any(|t| t.pgid == pgid);
+            return if exists { 0 } else { -3 }; // ESRCH if pgrp doesn't exist
+        }
+        send_signal_to_pgrp(pgid, sig) as i64
     }
 }
 
