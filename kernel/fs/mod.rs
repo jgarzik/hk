@@ -29,6 +29,7 @@ pub mod open;
 pub mod perm;
 #[path = "poll.rs"]
 pub mod pollsys;
+pub mod posix_lock;
 pub mod stat;
 
 // Filesystem implementations

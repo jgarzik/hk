@@ -468,6 +468,10 @@ unsafe impl Sync for File {}
 
 impl Drop for File {
     fn drop(&mut self) {
+        // Release POSIX advisory locks (must be before releasing mount ref)
+        // POSIX semantics: closing ANY fd releases ALL locks by this process
+        super::posix_lock::release_posix_locks_on_close(self);
+
         // Decrement mount reference count via mntput
         // This mirrors Linux's fput() -> mntput()
         if let Some(ref mnt) = self.mnt {

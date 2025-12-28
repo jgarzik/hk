@@ -2150,3 +2150,42 @@ pub const fn bpf_stmt(code: u16, k: u32) -> SockFilter {
 pub const fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
     SockFilter { code, jt, jf, k }
 }
+
+// ============================================================================
+// POSIX Advisory Lock structures (fcntl F_GETLK/F_SETLK/F_SETLKW)
+// ============================================================================
+
+/// struct flock for POSIX advisory byte-range locks (Linux ABI)
+///
+/// Used with fcntl F_GETLK, F_SETLK, and F_SETLKW commands for
+/// fine-grained byte-range locking on files.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Flock {
+    /// Lock type: F_RDLCK, F_WRLCK, or F_UNLCK
+    pub l_type: i16,
+    /// How to interpret l_start: SEEK_SET, SEEK_CUR, or SEEK_END
+    pub l_whence: i16,
+    /// Starting offset of the lock
+    pub l_start: i64,
+    /// Length of the lock (0 = to EOF)
+    pub l_len: i64,
+    /// PID of lock owner (filled in by F_GETLK)
+    pub l_pid: i32,
+}
+
+// POSIX lock type constants
+/// Read (shared) lock - multiple processes can hold
+pub const F_RDLCK: i16 = 0;
+/// Write (exclusive) lock - only one process can hold
+pub const F_WRLCK: i16 = 1;
+/// Unlock - release the lock
+pub const F_UNLCK: i16 = 2;
+
+// fcntl command constants for POSIX advisory locks
+/// Get lock info - test if a lock would block
+pub const F_GETLK: i32 = 5;
+/// Set lock (non-blocking) - returns EAGAIN if would block
+pub const F_SETLK: i32 = 6;
+/// Set lock (blocking) - waits until lock available
+pub const F_SETLKW: i32 = 7;
