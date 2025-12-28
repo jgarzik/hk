@@ -35,22 +35,12 @@ const MAP_ANONYMOUS: u32 = 0x20;
 pub fn run_tests() {
     println(b"=== mempolicy Tests ===");
 
-    // Skip tests on aarch64 due to binary layout issue affecting CLONE_CLEAR_SIGHAND
-    #[cfg(target_arch = "aarch64")]
-    {
-        println(b"  (skipped on aarch64 - see mempolicy.rs)");
-        return;
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        test_get_mempolicy_default();
-        test_set_mempolicy_default();
-        test_set_mempolicy_local();
-        test_set_mempolicy_bind_node0();
-        test_mbind_anonymous();
-        test_get_mempolicy_nodemask();
-    }
+    test_get_mempolicy_default();
+    test_set_mempolicy_default();
+    test_set_mempolicy_local();
+    test_set_mempolicy_bind_node0();
+    test_mbind_anonymous();
+    test_get_mempolicy_nodemask();
 }
 
 /// Test: Get default memory policy

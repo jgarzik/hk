@@ -233,6 +233,32 @@ fn test_sigaction_sigkill() {
     }
 }
 
+/// Helper for CLONE_CLEAR_SIGHAND test - runs in child process
+///
+/// This MUST be a separate function to ensure stack variables are allocated
+/// on the child's new stack, not the parent's stack. The compiler allocates
+/// the entire function's stack frame at function entry, before clone()
+/// switches stacks.
+#[inline(never)]
+fn child_check_sighand() -> ! {
+    // Query SIGUSR1 handler - should be SIG_DFL after CLONE_CLEAR_SIGHAND
+    let mut child_action: [u64; 4] = [0xFFFFFFFF; 4];
+
+    let sigact_ret = sys_rt_sigaction(SIGUSR1, 0, child_action.as_mut_ptr() as u64, 8);
+
+    // Force a volatile read from memory
+    let handler_val = unsafe { core::ptr::read_volatile(&child_action[0]) };
+
+    if sigact_ret == 0 && handler_val == SIG_DFL {
+        // Handler was reset to default - success!
+        sys_exit(0);
+    } else {
+        // Handler was NOT reset - fail
+        let handler_low = (handler_val & 0xFF) as u8;
+        sys_exit(handler_low as u64);
+    }
+}
+
 /// Test: CLONE_CLEAR_SIGHAND - reset signal handlers after clone
 fn test_clone_clear_sighand() {
     // First, set a custom handler for SIGUSR1 (use SIG_IGN as a non-default handler)
@@ -251,7 +277,7 @@ fn test_clone_clear_sighand() {
     }
 
     // Allocate stack for child
-    const STACK_SIZE: usize = 4096;
+    const STACK_SIZE: usize = 16384;
     #[repr(C, align(16))]
     struct ChildStack([u8; STACK_SIZE]);
     static mut CHILD_STACK: ChildStack = ChildStack([0; STACK_SIZE]);
@@ -273,16 +299,11 @@ fn test_clone_clear_sighand() {
     }
 
     if ret == 0 {
-        // Child process: check if SIGUSR1 handler was reset to SIG_DFL
-        let mut child_action: [u64; 4] = [0xFFFFFFFF; 4];
-        let sigact_ret = sys_rt_sigaction(SIGUSR1, 0, child_action.as_mut_ptr() as u64, 8);
-        if sigact_ret == 0 && child_action[0] == SIG_DFL {
-            // Handler was reset to default - success!
-            sys_exit(0);
-        } else {
-            // Handler was NOT reset
-            sys_exit(1);
-        }
+        // Child process - call helper function to ensure stack variables
+        // are allocated on the NEW child stack, not the parent's stack.
+        // The compiler may allocate the entire function's stack frame at
+        // function entry, before clone() switches stacks.
+        child_check_sighand();
     } else {
         // Parent process: wait for child and check exit status
         let child_pid = ret;

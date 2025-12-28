@@ -197,8 +197,11 @@ pub fn acknowledge_interrupt() -> u32 {
     unsafe {
         asm!(
             "mrs {}, icc_iar1_el1",
+            // DSB SY ensures the interrupt state change is visible
+            // (per ARM GICv3 spec 4.1.1)
+            "dsb sy",
             out(reg) intid,
-            options(nostack, nomem)
+            options(nostack)
         );
     }
     intid as u32
@@ -209,8 +212,10 @@ pub fn end_interrupt(intid: u32) {
     unsafe {
         asm!(
             "msr icc_eoir1_el1, {}",
+            // ISB ensures EOI completes before further processing
+            "isb",
             in(reg) intid as u64,
-            options(nostack, nomem)
+            options(nostack)
         );
     }
 }

@@ -25,6 +25,10 @@ use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, 
 // Syscall macros for aarch64
 // ============================================================================
 
+// NOTE: On aarch64, syscalls may clobber registers x1-x7. We must declare these
+// as clobbers so the compiler doesn't assume their values are preserved across
+// the syscall. The `lateout` for unused argument registers handles this.
+
 /// Raw syscall with 0 arguments
 macro_rules! syscall0 {
     ($nr:expr) => {{
@@ -33,6 +37,14 @@ macro_rules! syscall0 {
             "svc #0",
             in("x8") $nr,
             lateout("x0") ret,
+            // Clobber argument registers that kernel may modify
+            lateout("x1") _,
+            lateout("x2") _,
+            lateout("x3") _,
+            lateout("x4") _,
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
@@ -46,8 +58,15 @@ macro_rules! syscall1 {
         core::arch::asm!(
             "svc #0",
             in("x8") $nr,
-            in("x0") $a0 as u64,
-            lateout("x0") ret,
+            inlateout("x0") $a0 as u64 => ret,
+            // Clobber argument registers that kernel may modify
+            lateout("x1") _,
+            lateout("x2") _,
+            lateout("x3") _,
+            lateout("x4") _,
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
@@ -61,9 +80,15 @@ macro_rules! syscall2 {
         core::arch::asm!(
             "svc #0",
             in("x8") $nr,
-            in("x0") $a0 as u64,
-            in("x1") $a1 as u64,
-            lateout("x0") ret,
+            inlateout("x0") $a0 as u64 => ret,
+            inlateout("x1") $a1 as u64 => _,
+            // Clobber argument registers that kernel may modify
+            lateout("x2") _,
+            lateout("x3") _,
+            lateout("x4") _,
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
@@ -77,10 +102,15 @@ macro_rules! syscall3 {
         core::arch::asm!(
             "svc #0",
             in("x8") $nr,
-            in("x0") $a0 as u64,
-            in("x1") $a1 as u64,
-            in("x2") $a2 as u64,
-            lateout("x0") ret,
+            inlateout("x0") $a0 as u64 => ret,
+            inlateout("x1") $a1 as u64 => _,
+            inlateout("x2") $a2 as u64 => _,
+            // Clobber argument registers that kernel may modify
+            lateout("x3") _,
+            lateout("x4") _,
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
@@ -94,11 +124,15 @@ macro_rules! syscall4 {
         core::arch::asm!(
             "svc #0",
             in("x8") $nr,
-            in("x0") $a0 as u64,
-            in("x1") $a1 as u64,
-            in("x2") $a2 as u64,
-            in("x3") $a3 as u64,
-            lateout("x0") ret,
+            inlateout("x0") $a0 as u64 => ret,
+            inlateout("x1") $a1 as u64 => _,
+            inlateout("x2") $a2 as u64 => _,
+            inlateout("x3") $a3 as u64 => _,
+            // Clobber argument registers that kernel may modify
+            lateout("x4") _,
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
@@ -112,12 +146,15 @@ macro_rules! syscall5 {
         core::arch::asm!(
             "svc #0",
             in("x8") $nr,
-            in("x0") $a0 as u64,
-            in("x1") $a1 as u64,
-            in("x2") $a2 as u64,
-            in("x3") $a3 as u64,
-            in("x4") $a4 as u64,
-            lateout("x0") ret,
+            inlateout("x0") $a0 as u64 => ret,
+            inlateout("x1") $a1 as u64 => _,
+            inlateout("x2") $a2 as u64 => _,
+            inlateout("x3") $a3 as u64 => _,
+            inlateout("x4") $a4 as u64 => _,
+            // Clobber argument registers that kernel may modify
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
@@ -131,13 +168,15 @@ macro_rules! syscall6 {
         core::arch::asm!(
             "svc #0",
             in("x8") $nr,
-            in("x0") $a0 as u64,
-            in("x1") $a1 as u64,
-            in("x2") $a2 as u64,
-            in("x3") $a3 as u64,
-            in("x4") $a4 as u64,
-            in("x5") $a5 as u64,
-            lateout("x0") ret,
+            inlateout("x0") $a0 as u64 => ret,
+            inlateout("x1") $a1 as u64 => _,
+            inlateout("x2") $a2 as u64 => _,
+            inlateout("x3") $a3 as u64 => _,
+            inlateout("x4") $a4 as u64 => _,
+            inlateout("x5") $a5 as u64 => _,
+            // Clobber argument registers that kernel may modify
+            lateout("x6") _,
+            lateout("x7") _,
             options(nostack),
         );
         ret
