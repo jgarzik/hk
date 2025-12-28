@@ -2523,3 +2523,47 @@ pub const SYS_SECCOMP: u64 = 277;
 pub fn sys_seccomp(op: u32, flags: u32, args: u64) -> i64 {
     unsafe { syscall3!(SYS_SECCOMP, op, flags, args) }
 }
+
+// ============================================================================
+// BPF (Berkeley Packet Filter)
+// ============================================================================
+
+/// bpf syscall number
+pub const SYS_BPF: u64 = 280;
+
+/// BPF commands
+pub const BPF_MAP_CREATE: i32 = 0;
+pub const BPF_MAP_LOOKUP_ELEM: i32 = 1;
+pub const BPF_MAP_UPDATE_ELEM: i32 = 2;
+pub const BPF_MAP_DELETE_ELEM: i32 = 3;
+pub const BPF_MAP_GET_NEXT_KEY: i32 = 4;
+pub const BPF_PROG_LOAD: i32 = 5;
+pub const BPF_OBJ_GET_INFO_BY_FD: i32 = 29;
+
+/// BPF map types
+pub const BPF_MAP_TYPE_HASH: u32 = 1;
+pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
+
+/// BPF program types
+pub const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
+
+/// BPF update flags
+pub const BPF_ANY: u64 = 0;
+pub const BPF_NOEXIST: u64 = 1;
+pub const BPF_EXIST: u64 = 2;
+
+/// bpf(cmd, attr, size) - BPF syscall
+///
+/// Perform operations on BPF maps and programs.
+///
+/// # Arguments
+/// * `cmd` - BPF command (BPF_MAP_CREATE, BPF_PROG_LOAD, etc.)
+/// * `attr` - Pointer to bpf_attr union
+/// * `size` - Size of the attr structure
+///
+/// # Returns
+/// File descriptor or 0 on success, negative error on failure
+#[inline(always)]
+pub fn sys_bpf(cmd: i32, attr: u64, size: u32) -> i64 {
+    unsafe { syscall3!(SYS_BPF, cmd, attr, size) }
+}

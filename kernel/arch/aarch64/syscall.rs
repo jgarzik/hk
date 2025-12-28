@@ -333,6 +333,8 @@ pub const SYS_PRCTL: u64 = 167;
 pub const SYS_SET_TID_ADDRESS: u64 = 96;
 /// seccomp(operation, flags, args) - Operate on Secure Computing state
 pub const SYS_SECCOMP: u64 = 277;
+/// bpf(cmd, attr, size) - BPF syscall for maps and programs
+pub const SYS_BPF: u64 = 280;
 
 // System information
 /// getrusage(who, usage)
@@ -991,6 +993,7 @@ pub fn aarch64_syscall_dispatch(
             sys_set_tid_address(arg0) as u64
         }
         SYS_SECCOMP => crate::seccomp::sys_seccomp(arg0, arg1, arg2) as u64,
+        SYS_BPF => crate::bpf::sys_bpf(arg0 as i32, arg1, arg2 as u32) as u64,
 
         // Scheduling syscalls (Section 1.3)
         SYS_SCHED_YIELD => {

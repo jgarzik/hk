@@ -405,7 +405,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 
 - [ ] ptrace
 - [ ] perf_event_open
-- [ ] bpf
+- [x] bpf (BPF_MAP_CREATE, BPF_MAP_LOOKUP/UPDATE/DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, BPF_PROG_LOAD, BPF_OBJ_GET_INFO_BY_FD; map types: HASH, ARRAY; program type: SOCKET_FILTER)
 - [x] membarrier
 - [x] kcmp (compare processes)
 - [x] process_vm_readv
