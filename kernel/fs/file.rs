@@ -13,7 +13,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use ::core::cmp::min;
-use ::core::sync::atomic::{AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use spin::Mutex;
 
 use super::KernelError;
@@ -49,6 +49,8 @@ pub mod flags {
     pub const O_APPEND: u32 = 0o2000;
     /// Non-blocking mode
     pub const O_NONBLOCK: u32 = 0o4000;
+    /// Asynchronous I/O (generate SIGIO)
+    pub const O_ASYNC: u32 = 0o20000;
     /// Must be a directory
     pub const O_DIRECTORY: u32 = 0o200000;
     /// Don't follow symlinks
@@ -287,6 +289,14 @@ pub struct File {
 
     /// File operations
     pub f_op: &'static dyn FileOps,
+
+    /// Owner PID for SIGIO signal delivery (F_SETOWN/F_GETOWN)
+    /// 0 = unset, positive = PID, negative = PGID
+    owner_pid: AtomicI32,
+
+    /// Signal to send for async I/O (F_SETSIG/F_GETSIG)
+    /// 0 = use default SIGIO
+    owner_sig: AtomicI32,
 }
 
 impl File {
@@ -308,6 +318,8 @@ impl File {
             pos: AtomicU64::new(0),
             f_lock: Mutex::new(flags),
             f_op,
+            owner_pid: AtomicI32::new(0),
+            owner_sig: AtomicI32::new(0),
         }
     }
 
@@ -365,6 +377,34 @@ impl File {
     /// Get the file operations
     pub fn ops(&self) -> &'static dyn FileOps {
         self.f_op
+    }
+
+    /// Set owner PID/PGID for async I/O signals (F_SETOWN)
+    ///
+    /// Positive value = process ID, negative = process group ID
+    pub fn set_owner(&self, pid: i32) {
+        self.owner_pid.store(pid, Ordering::Relaxed);
+    }
+
+    /// Get owner PID/PGID for async I/O signals (F_GETOWN)
+    ///
+    /// Returns: positive = PID, negative = PGID, 0 = unset
+    pub fn get_owner(&self) -> i32 {
+        self.owner_pid.load(Ordering::Relaxed)
+    }
+
+    /// Set signal number for async I/O (F_SETSIG)
+    ///
+    /// 0 = use default SIGIO
+    pub fn set_sig(&self, sig: i32) {
+        self.owner_sig.store(sig, Ordering::Relaxed);
+    }
+
+    /// Get signal number for async I/O (F_GETSIG)
+    ///
+    /// Returns: signal number, 0 = use default SIGIO
+    pub fn get_sig(&self) -> i32 {
+        self.owner_sig.load(Ordering::Relaxed)
     }
 
     /// Read from file
@@ -468,6 +508,13 @@ unsafe impl Sync for File {}
 
 impl Drop for File {
     fn drop(&mut self) {
+        // Call release on file operations to allow cleanup (e.g., decrement pipe reader/writer counts)
+        let _ = self.f_op.release(self);
+
+        // Release POSIX advisory locks (must be before releasing mount ref)
+        // POSIX semantics: closing ANY fd releases ALL locks by this process
+        super::posix_lock::release_posix_locks_on_close(self);
+
         // Decrement mount reference count via mntput
         // This mirrors Linux's fput() -> mntput()
         if let Some(ref mnt) = self.mnt {

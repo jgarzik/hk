@@ -435,6 +435,8 @@ pub const SYS_PERSONALITY: u64 = 92;
 // System logging
 /// syslog(type, buf, len) - Read/control kernel message ring buffer
 pub const SYS_SYSLOG: u64 = 116;
+/// ptrace(request, pid, addr, data) - Process tracing
+pub const SYS_PTRACE: u64 = 117;
 
 // TTY control
 /// vhangup() - Simulate hangup on controlling terminal
@@ -487,6 +489,14 @@ pub const SYS_PROCESS_VM_READV: u64 = 270;
 pub const SYS_PROCESS_VM_WRITEV: u64 = 271;
 /// kcmp(pid1, pid2, type, idx1, idx2)
 pub const SYS_KCMP: u64 = 272;
+
+// Syscalls that return stubs (not fully implemented)
+/// kexec_load(entry, nr_segments, segments, flags) - load new kernel
+pub const SYS_KEXEC_LOAD: u64 = 104;
+/// perf_event_open(attr, pid, cpu, group_fd, flags) - performance monitoring
+pub const SYS_PERF_EVENT_OPEN: u64 = 241;
+/// rseq(rseq, rseq_len, flags, sig) - restartable sequences
+pub const SYS_RSEQ: u64 = 293;
 
 // ============================================================================
 // Syscall dispatcher
@@ -576,15 +586,19 @@ pub fn aarch64_syscall_dispatch(
         sys_eventfd2, sys_nanosleep, sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
     };
 
+    // Account for entering kernel mode
+    percpu::account_syscall_enter();
+
     // Check seccomp policy before executing syscall
     // Note: ip is not available here, pass 0 for now
     if let Some(result) =
         crate::seccomp::check::check_syscall_aarch64(num, 0, arg0, arg1, arg2, arg3, arg4, arg5)
     {
+        percpu::account_syscall_exit();
         return result;
     }
 
-    match num {
+    let result = match num {
         // I/O syscalls
         SYS_READ => sys_read(arg0 as i32, arg1, arg2) as u64,
         SYS_WRITE => sys_write(arg0 as i32, arg1, arg2) as u64,
@@ -891,6 +905,9 @@ pub fn aarch64_syscall_dispatch(
             sys_syslog::<Uaccess>(arg0 as i32, arg1, arg2 as i32) as u64
         }
 
+        // Process tracing/debugging
+        SYS_PTRACE => crate::task::ptrace::sys_ptrace(arg0 as i64, arg1 as i64, arg2, arg3) as u64,
+
         // TTY control
         SYS_VHANGUP => crate::tty::sys_vhangup() as u64,
 
@@ -941,6 +958,7 @@ pub fn aarch64_syscall_dispatch(
             crate::signal::syscall::sys_rt_sigqueueinfo(arg0 as i64, arg1 as u32, arg2) as u64
         }
         SYS_RT_SIGSUSPEND => crate::signal::syscall::sys_rt_sigsuspend(arg0, arg1) as u64,
+        SYS_RT_SIGRETURN => super::signal::sys_rt_sigreturn() as u64,
         SYS_RT_TGSIGQUEUEINFO => crate::signal::syscall::sys_rt_tgsigqueueinfo(
             arg0 as i64,
             arg1 as i64,
@@ -1236,10 +1254,42 @@ pub fn aarch64_syscall_dispatch(
         // Process inspection (Section 13)
         SYS_KCMP => crate::kcmp::sys_kcmp(arg0, arg1, arg2 as i32, arg3, arg4) as u64,
 
+        // Syscall stubs (not fully implemented)
+        SYS_RSEQ => {
+            // Restartable sequences - not implemented, return ENOSYS
+            (-38i64) as u64 // ENOSYS
+        }
+        SYS_PERF_EVENT_OPEN => {
+            // Performance monitoring - not supported, return EOPNOTSUPP
+            (-95i64) as u64 // EOPNOTSUPP
+        }
+        SYS_KEXEC_LOAD => {
+            // Kernel execution load - check capability, return ENOSYS
+            if !crate::task::capable(crate::task::CAP_SYS_BOOT) {
+                (-1i64) as u64 // EPERM
+            } else {
+                (-38i64) as u64 // ENOSYS
+            }
+        }
+
         // Unimplemented syscalls
         _ => {
             printkln!("SYSCALL: unimplemented syscall {} on aarch64", num);
             (-38i64) as u64 // -ENOSYS
         }
+    };
+
+    // Update percpu.syscall_user_regs[0] with the syscall result BEFORE calling do_signal()
+    // This is important because if do_signal() sets up a signal frame, the saved context
+    // should have the correct return value (not the original x0 argument).
+    // When the signal handler returns via rt_sigreturn, x0 will be restored to this value.
+    unsafe {
+        super::percpu::current_cpu_mut().syscall_user_regs[0] = result;
     }
+
+    // Check for pending signals before returning to userspace
+    // This may modify the saved user context to invoke the signal handler
+    crate::signal::do_signal();
+
+    result
 }

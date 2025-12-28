@@ -340,13 +340,37 @@ pub fn sys_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64)
     result_to_i64(do_semtimedop(semid, sops_ptr, nsops, timeout_ptr))
 }
 
-fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, _timeout_ptr: u64) -> Result<i32, i32> {
+/// Timespec structure for semtimedop timeout (matches Linux ABI)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct SemTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> Result<i32, i32> {
     let ns = current_ipc_ns();
 
     // Validate
     if nsops == 0 || nsops > ns.sem_ctls[2] as usize {
         return Err(KernelError::ArgListTooLong.errno());
     }
+
+    // Parse timeout if provided
+    let deadline_ns: Option<i128> = if timeout_ptr != 0 {
+        let ts: SemTimespec = get_user::<Uaccess, SemTimespec>(timeout_ptr)
+            .map_err(|_| KernelError::BadAddress.errno())?;
+        // Validate timeout
+        if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+            return Err(KernelError::InvalidArgument.errno());
+        }
+        let now = TIMEKEEPER.current_time();
+        let now_ns = now.sec as i128 * 1_000_000_000 + now.nsec as i128;
+        let timeout_ns = ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128;
+        Some(now_ns + timeout_ns)
+    } else {
+        None
+    };
 
     // Read operations from user
     let mut sops = vec![Sembuf::default(); nsops];
@@ -396,7 +420,17 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, _timeout_ptr: u64) -> 
                     return Err(KernelError::WouldBlock.errno());
                 }
 
-                // Add to pending queue and sleep
+                // Check timeout before blocking
+                if let Some(deadline) = deadline_ns {
+                    let now = TIMEKEEPER.current_time();
+                    let now_ns = now.sec as i128 * 1_000_000_000 + now.nsec as i128;
+                    if now_ns >= deadline {
+                        sem_array.perm.put_ref();
+                        return Err(KernelError::WouldBlock.errno());
+                    }
+                }
+
+                // Add to pending queue
                 let queue = Arc::new(SemQueue {
                     tid: current_tid(),
                     sops: sops.clone(),
@@ -410,9 +444,15 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, _timeout_ptr: u64) -> 
                     pending.push_back(queue.clone());
                 }
 
-                // Sleep until woken
-                // TODO: proper timeout support
-                sem_array.waitq.wait();
+                // Sleep until woken or timeout
+                // If we have a deadline, use polling with yields instead of blocking
+                if deadline_ns.is_some() {
+                    // Just yield to let other tasks run
+                    crate::task::percpu::yield_now();
+                } else {
+                    // No timeout - block indefinitely
+                    sem_array.waitq.wait();
+                }
 
                 // Check result
                 if queue.woken.load(Ordering::Acquire) {
@@ -429,7 +469,22 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, _timeout_ptr: u64) -> 
                     return Ok(0);
                 }
 
-                // Spurious wakeup, retry
+                // Check timeout after spurious wakeup or yield
+                if let Some(deadline) = deadline_ns {
+                    let now = TIMEKEEPER.current_time();
+                    let now_ns = now.sec as i128 * 1_000_000_000 + now.nsec as i128;
+                    if now_ns >= deadline {
+                        // Remove from pending queue
+                        {
+                            let mut pending = sem_array.pending.lock();
+                            pending.retain(|q| !Arc::ptr_eq(q, &queue));
+                        }
+                        sem_array.perm.put_ref();
+                        return Err(KernelError::WouldBlock.errno());
+                    }
+                }
+
+                // Spurious wakeup or polling iteration, retry
             }
             Err(e) => {
                 sem_array.perm.put_ref();

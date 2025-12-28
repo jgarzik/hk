@@ -529,6 +529,9 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         Err(_) => return -ENOEXEC,
     };
 
+    // Release all POSIX advisory locks (POSIX semantics: locks released on exec)
+    crate::fs::posix_lock::release_all_posix_locks_for_pid(crate::task::percpu::current_pid());
+
     // Calculate base address
     let base_addr = if elf.is_pie { USER_PIE_BASE } else { 0 };
     let entry_point = elf.entry + base_addr;

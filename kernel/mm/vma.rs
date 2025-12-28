@@ -12,6 +12,9 @@ pub const PROT_NONE: u32 = 0;
 pub const PROT_READ: u32 = 1;
 pub const PROT_WRITE: u32 = 2;
 pub const PROT_EXEC: u32 = 4;
+/// PROT_SEM - page may be used for atomic operations (futex)
+/// Linux accepts this flag but it's a no-op on x86-64/aarch64
+pub const PROT_SEM: u32 = 0x8;
 /// PROT_GROWSDOWN - mprotect: extend change to start of growsdown VMA
 pub const PROT_GROWSDOWN: u32 = 0x0100_0000;
 /// PROT_GROWSUP - mprotect: extend change to end of growsup VMA
@@ -48,6 +51,14 @@ pub const MAP_FIXED_NOREPLACE: u32 = 0x100000;
 /// MAP_NORESERVE - don't reserve swap space for this mapping
 /// Allows large sparse mappings without requiring swap reservation upfront
 pub const MAP_NORESERVE: u32 = 0x4000;
+/// MAP_HUGETLB - use huge TLB pages (implemented via THP support)
+pub const MAP_HUGETLB: u32 = 0x40000;
+/// MAP_SYNC - perform synchronous page faults for DAX mappings
+/// Requires DAX filesystem support; returns EOPNOTSUPP without it
+pub const MAP_SYNC: u32 = 0x80000;
+/// MAP_SHARED_VALIDATE - like MAP_SHARED but validates unknown flags
+/// Required for MAP_SYNC to work; with plain MAP_SHARED, unknown flags are ignored
+pub const MAP_SHARED_VALIDATE: u32 = 0x03;
 
 /// Return value for failed mmap
 pub const MAP_FAILED: i64 = -1;
@@ -105,6 +116,10 @@ pub const VM_NOHUGEPAGE: u32 = 0x0200_0000;
 /// Allows overcommit for this mapping without swap backing guarantee
 pub const VM_NORESERVE: u32 = 0x0400_0000;
 
+/// VMA should be zeroed in child on fork (madvise MADV_WIPEONFORK)
+/// Useful for sensitive data that shouldn't be inherited
+pub const VM_WIPEONFORK: u32 = 0x0800_0000;
+
 // ============================================================================
 // msync flags (MS_*)
 // ============================================================================
@@ -159,6 +174,25 @@ pub const MADV_HUGEPAGE: i32 = 14;
 /// MADV_NOHUGEPAGE - Mark region as unsuitable for transparent huge pages
 /// Linux value from include/uapi/asm-generic/mman-common.h
 pub const MADV_NOHUGEPAGE: i32 = 15;
+
+/// MADV_REMOVE - Remove pages (punch hole in file, swap entries, or private anonymous)
+/// For file mappings: like fallocate(FALLOC_FL_PUNCH_HOLE) without file write permission
+pub const MADV_REMOVE: i32 = 9;
+
+/// MADV_WIPEONFORK - Zero this VMA in child on fork
+/// Useful for sensitive data that shouldn't be inherited
+pub const MADV_WIPEONFORK: i32 = 18;
+
+/// MADV_KEEPONFORK - Undo MADV_WIPEONFORK (normal fork behavior)
+pub const MADV_KEEPONFORK: i32 = 19;
+
+/// MADV_COLD - Deactivate pages (hint for LRU demotion)
+/// Pages will be moved to inactive list for faster reclaim
+pub const MADV_COLD: i32 = 20;
+
+/// MADV_PAGEOUT - Reclaim pages (swap out or writeback and free)
+/// Proactive memory reclaim hint
+pub const MADV_PAGEOUT: i32 = 21;
 
 // ============================================================================
 // mremap flags (MREMAP_*)

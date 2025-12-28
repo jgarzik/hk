@@ -11,8 +11,9 @@ use alloc::sync::Arc;
 use crate::arch::Uaccess;
 use crate::fs::{KernelError, LookupFlags, lookup_path_flags};
 use crate::task::percpu::current_tid;
-use crate::uaccess::strncpy_from_user;
+use crate::uaccess::{copy_from_user, copy_to_user, strncpy_from_user};
 
+use super::posix_lock::{Flock, posix_getlk, posix_setlk, posix_setlkw};
 use super::syscall::{PATH_MAX, current_fd_table, get_nofile_limit};
 
 // =============================================================================
@@ -357,6 +358,15 @@ mod fcntl_cmd {
     pub const F_SETFD: i32 = 2;
     pub const F_GETFL: i32 = 3;
     pub const F_SETFL: i32 = 4;
+    // POSIX advisory lock commands
+    pub const F_GETLK: i32 = 5;
+    pub const F_SETLK: i32 = 6;
+    pub const F_SETLKW: i32 = 7;
+    // Async I/O owner commands
+    pub const F_SETOWN: i32 = 8;
+    pub const F_GETOWN: i32 = 9;
+    pub const F_SETSIG: i32 = 10;
+    pub const F_GETSIG: i32 = 11;
     pub const F_DUPFD_CLOEXEC: i32 = 1030;
 }
 
@@ -459,6 +469,131 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
             };
             file.set_status_flags(arg as u32);
             0
+        }
+
+        F_GETLK => {
+            // Get lock info - test if a lock would block
+            let file = match table.get(fd) {
+                Some(f) => f,
+                None => return KernelError::BadFd.sysret(),
+            };
+            drop(table); // Release FD table lock before copying
+
+            // Copy flock from user
+            let mut flock = Flock::default();
+            let flock_size = core::mem::size_of::<Flock>();
+            let flock_bytes = unsafe {
+                core::slice::from_raw_parts_mut(&mut flock as *mut Flock as *mut u8, flock_size)
+            };
+            if copy_from_user::<Uaccess>(flock_bytes, arg, flock_size).is_err() {
+                return KernelError::BadAddress.sysret();
+            }
+
+            // Do the getlk
+            if let Err(e) = posix_getlk(&file, &mut flock) {
+                return e.sysret();
+            }
+
+            // Copy result back
+            let flock_bytes = unsafe {
+                core::slice::from_raw_parts(&flock as *const Flock as *const u8, flock_size)
+            };
+            if copy_to_user::<Uaccess>(arg, flock_bytes).is_err() {
+                return KernelError::BadAddress.sysret();
+            }
+
+            0
+        }
+
+        F_SETLK => {
+            // Set lock (non-blocking)
+            let file = match table.get(fd) {
+                Some(f) => f,
+                None => return KernelError::BadFd.sysret(),
+            };
+            drop(table);
+
+            // Copy flock from user
+            let mut flock = Flock::default();
+            let flock_size = core::mem::size_of::<Flock>();
+            let flock_bytes = unsafe {
+                core::slice::from_raw_parts_mut(&mut flock as *mut Flock as *mut u8, flock_size)
+            };
+            if copy_from_user::<Uaccess>(flock_bytes, arg, flock_size).is_err() {
+                return KernelError::BadAddress.sysret();
+            }
+
+            match posix_setlk(&file, &flock) {
+                Ok(()) => 0,
+                Err(e) => e.sysret(),
+            }
+        }
+
+        F_SETLKW => {
+            // Set lock (blocking - but we don't actually block, like flock)
+            let file = match table.get(fd) {
+                Some(f) => f,
+                None => return KernelError::BadFd.sysret(),
+            };
+            drop(table);
+
+            // Copy flock from user
+            let mut flock = Flock::default();
+            let flock_size = core::mem::size_of::<Flock>();
+            let flock_bytes = unsafe {
+                core::slice::from_raw_parts_mut(&mut flock as *mut Flock as *mut u8, flock_size)
+            };
+            if copy_from_user::<Uaccess>(flock_bytes, arg, flock_size).is_err() {
+                return KernelError::BadAddress.sysret();
+            }
+
+            match posix_setlkw(&file, &flock) {
+                Ok(()) => 0,
+                Err(e) => e.sysret(),
+            }
+        }
+
+        F_SETOWN => {
+            // Set owner PID/PGID for async I/O signals
+            let file = match table.get(fd) {
+                Some(f) => f,
+                None => return KernelError::BadFd.sysret(),
+            };
+            file.set_owner(arg as i32);
+            0
+        }
+
+        F_GETOWN => {
+            // Get owner PID/PGID for async I/O signals
+            let file = match table.get(fd) {
+                Some(f) => f,
+                None => return KernelError::BadFd.sysret(),
+            };
+            file.get_owner() as i64
+        }
+
+        F_SETSIG => {
+            // Set signal for async I/O
+            let file = match table.get(fd) {
+                Some(f) => f,
+                None => return KernelError::BadFd.sysret(),
+            };
+            let sig = arg as i32;
+            // Validate signal number (0 is valid - means use SIGIO)
+            if !(0..=64).contains(&sig) {
+                return KernelError::InvalidArgument.sysret();
+            }
+            file.set_sig(sig);
+            0
+        }
+
+        F_GETSIG => {
+            // Get signal for async I/O
+            let file = match table.get(fd) {
+                Some(f) => f,
+                None => return KernelError::BadFd.sysret(),
+            };
+            file.get_sig() as i64
         }
 
         _ => KernelError::InvalidArgument.sysret(),

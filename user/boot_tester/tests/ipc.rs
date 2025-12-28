@@ -11,9 +11,9 @@ use hk_syscall::{
     sys_close, sys_open, sys_pipe, sys_poll, sys_read, sys_select, sys_write,
     sys_sendfile, sys_splice, sys_tee, sys_vmsplice,
     sys_shmget, sys_shmat, sys_shmdt, sys_shmctl,
-    sys_semget, sys_semop, sys_semctl,
+    sys_semget, sys_semop, sys_semctl, sys_semtimedop,
     sys_msgget, sys_msgsnd, sys_msgrcv, sys_msgctl,
-    FdSet, IoVec, PollFd, Timeval, Sembuf,
+    FdSet, IoVec, PollFd, Timeval, Sembuf, Timespec,
     POLLIN, POLLNVAL, POLLOUT,
     IPC_CREAT, IPC_PRIVATE, IPC_RMID,
     GETVAL, SETVAL,
@@ -55,6 +55,7 @@ pub fn run_tests() {
     test_semget_create();
     test_semctl_setval_getval();
     test_semop_increment();
+    test_semtimedop_timeout();
 
     println(b"--- SysV Message Queues ---");
     test_msgget_create();
@@ -541,6 +542,39 @@ fn test_semop_increment() {
         println(b" SEMOP_INC:OK");
     } else {
         println(b" SEMOP_INC:FAIL");
+    }
+}
+
+/// Test semtimedop() with timeout - should return EAGAIN when operation can't complete in time
+fn test_semtimedop_timeout() {
+    // Create a semaphore set with 1 semaphore
+    let semid = sys_semget(IPC_PRIVATE, 1, IPC_CREAT | 0o666);
+    if semid < 0 {
+        println(b"semget failed SEMTIMEDOP_TIMEOUT:FAIL");
+        return;
+    }
+
+    // Set initial value to 0
+    sys_semctl(semid as i32, 0, SETVAL, 0);
+
+    // Try to decrement (which would block) with a very short timeout
+    // -1 means "decrement by 1" - this will block because value is 0
+    let sop = Sembuf::new(0, -1, 0);
+    let timeout = Timespec { tv_sec: 0, tv_nsec: 1_000_000 }; // 1ms timeout
+
+    let ret = sys_semtimedop(semid as i32, &sop, 1, &timeout);
+
+    print(b"semtimedop(-1, 1ms timeout) returned ");
+    print_num(ret);
+
+    // Clean up
+    sys_semctl(semid as i32, 0, IPC_RMID, 0);
+
+    // Should return EAGAIN (-11) because operation couldn't complete in time
+    if ret == -11 {
+        println(b" SEMTIMEDOP_TIMEOUT:OK");
+    } else {
+        println(b" SEMTIMEDOP_TIMEOUT:FAIL");
     }
 }
 

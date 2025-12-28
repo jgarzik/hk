@@ -320,6 +320,7 @@ pub const SYS_RT_SIGPENDING: u64 = 136;
 pub const SYS_RT_SIGTIMEDWAIT: u64 = 137;
 pub const SYS_RT_SIGQUEUEINFO: u64 = 128;
 pub const SYS_RT_SIGSUSPEND: u64 = 133;
+pub const SYS_RT_SIGRETURN: u64 = 139;
 pub const SYS_RT_TGSIGQUEUEINFO: u64 = 240;
 
 // Memory barrier syscall
@@ -1221,6 +1222,20 @@ pub fn sys_rt_sigsuspend(mask: u64, sigsetsize: u64) -> i64 {
 #[inline(always)]
 pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
     unsafe { syscall4!(SYS_RT_TGSIGQUEUEINFO, tgid, tid, sig, uinfo) }
+}
+
+/// rt_sigreturn() - return from signal handler
+///
+/// This syscall is called by the signal trampoline to restore the
+/// context saved before the signal handler was invoked.
+/// It never returns on success.
+#[inline(always)]
+pub fn sys_rt_sigreturn() -> ! {
+    unsafe {
+        syscall0!(SYS_RT_SIGRETURN);
+        // Should never reach here - kernel restores context
+        core::hint::unreachable_unchecked()
+    }
 }
 
 // ============================================================================

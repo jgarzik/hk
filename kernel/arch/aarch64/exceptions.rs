@@ -156,6 +156,20 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
                 frame.x[5], // arg5
             );
             frame.x[0] = result;
+
+            // Update frame from percpu if signal delivery modified the context
+            // This is needed because do_signal() modifies percpu, not the frame
+            // Only update if the flag is set to avoid corrupting registers on normal syscalls
+            if super::percpu::try_current_cpu().is_some() {
+                let percpu = unsafe { super::percpu::current_cpu_mut() };
+                if percpu.signal_context_modified {
+                    percpu.signal_context_modified = false;
+                    frame.elr = percpu.syscall_user_elr;
+                    frame.spsr = percpu.syscall_user_spsr;
+                    frame.sp = percpu.syscall_user_sp;
+                    frame.x = percpu.syscall_user_regs;
+                }
+            }
         }
         EC_DABORT_LOWER => {
             let far: u64;

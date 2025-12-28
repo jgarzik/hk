@@ -30,8 +30,8 @@ use hk_syscall::{
     sys_close, sys_fcntl, sys_fstatfs, sys_getrandom, sys_ioctl, sys_lseek, sys_open, sys_pipe2,
     sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read,
     sys_readv, sys_statfs, sys_statx, sys_write, sys_writev, IoVec, LinuxStatFs, Statx,
-    AT_EMPTY_PATH, AT_FDCWD, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, PROC_SUPER_MAGIC, RAMFS_MAGIC,
-    STATX_BASIC_STATS,
+    AT_EMPTY_PATH, AT_FDCWD, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_NONBLOCK, PROC_SUPER_MAGIC,
+    RAMFS_MAGIC, STATX_BASIC_STATS, FIONBIO, FIOCLEX, FIONCLEX,
 };
 
 // RWF flags for preadv2/pwritev2
@@ -82,6 +82,9 @@ pub fn run_tests() {
     test_fstatfs();
     test_statx_basic();
     test_statx_at_empty_path();
+    // Generic ioctl tests
+    test_ioctl_fionbio();
+    test_ioctl_fioclex();
 }
 
 /// Test 22: writev() - gather write to stdout
@@ -1395,4 +1398,126 @@ fn test_statx_at_empty_path() {
     }
 
     println(b"STATX_EMPTY_PATH:OK");
+}
+
+/// Test ioctl FIONBIO - set non-blocking mode
+fn test_ioctl_fionbio() {
+    // Create a pipe to test on (pipes support non-blocking mode)
+    let mut pipefd: [i32; 2] = [0; 2];
+    let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
+    if ret < 0 {
+        print(b"IOCTL_FIONBIO:FAIL: pipe2 returned ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+
+    // Get initial flags
+    let flags = sys_fcntl(pipefd[0], 3, 0); // F_GETFL = 3
+    if flags < 0 {
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        print(b"IOCTL_FIONBIO:FAIL: fcntl(F_GETFL) returned ");
+        print_num(flags);
+        println(b"");
+        return;
+    }
+
+    // Set non-blocking mode via FIONBIO
+    let enable: i32 = 1;
+    let ret = sys_ioctl(pipefd[0], FIONBIO as u64, &enable as *const i32 as u64);
+    if ret != 0 {
+        sys_close(pipefd[0] as u64);
+        sys_close(pipefd[1] as u64);
+        print(b"IOCTL_FIONBIO:FAIL: ioctl(FIONBIO, 1) returned ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+
+    // Verify via fcntl that O_NONBLOCK is set
+    let new_flags = sys_fcntl(pipefd[0], 3, 0); // F_GETFL = 3
+    let has_nonblock = (new_flags as u32 & O_NONBLOCK) != 0;
+
+    // Clear non-blocking mode
+    let disable: i32 = 0;
+    let ret = sys_ioctl(pipefd[0], FIONBIO as u64, &disable as *const i32 as u64);
+
+    // Verify O_NONBLOCK is cleared
+    let final_flags = sys_fcntl(pipefd[0], 3, 0); // F_GETFL = 3
+    let still_has_nonblock = (final_flags as u32 & O_NONBLOCK) != 0;
+
+    sys_close(pipefd[0] as u64);
+    sys_close(pipefd[1] as u64);
+
+    if has_nonblock && !still_has_nonblock && ret == 0 {
+        println(b"IOCTL_FIONBIO:OK");
+    } else {
+        print(b"IOCTL_FIONBIO:FAIL: has_nb=");
+        print_num(has_nonblock as i64);
+        print(b", still_has_nb=");
+        print_num(still_has_nonblock as i64);
+        println(b"");
+    }
+}
+
+/// Test ioctl FIOCLEX/FIONCLEX - set/clear close-on-exec
+fn test_ioctl_fioclex() {
+    // Create a pipe to test on (avoids file system dependencies)
+    let mut pipefd: [i32; 2] = [0; 2];
+    let ret = sys_pipe2(pipefd.as_mut_ptr(), 0);
+    if ret < 0 {
+        print(b"IOCTL_FIOCLEX:FAIL: pipe2 returned ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+    let fd = pipefd[0] as i64; // Use read end of pipe
+
+    // Get initial fd flags (should not have FD_CLOEXEC)
+    let flags1 = sys_fcntl(fd as i32, F_GETFD, 0);
+    let initially_cloexec = (flags1 as u64 & FD_CLOEXEC) != 0;
+
+    // Set close-on-exec via FIOCLEX
+    let ret = sys_ioctl(fd as i32, FIOCLEX as u64, 0);
+    if ret != 0 {
+        sys_close(fd as u64);
+        print(b"IOCTL_FIOCLEX:FAIL: ioctl(FIOCLEX) returned ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+
+    // Verify FD_CLOEXEC is set
+    let flags2 = sys_fcntl(fd as i32, F_GETFD, 0);
+    let has_cloexec = (flags2 as u64 & FD_CLOEXEC) != 0;
+
+    // Clear close-on-exec via FIONCLEX
+    let ret = sys_ioctl(fd as i32, FIONCLEX as u64, 0);
+    if ret != 0 {
+        sys_close(fd as u64);
+        print(b"IOCTL_FIOCLEX:FAIL: ioctl(FIONCLEX) returned ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+
+    // Verify FD_CLOEXEC is cleared
+    let flags3 = sys_fcntl(fd as i32, F_GETFD, 0);
+    let still_cloexec = (flags3 as u64 & FD_CLOEXEC) != 0;
+
+    sys_close(fd as u64);
+    sys_close(pipefd[1] as u64);
+
+    if !initially_cloexec && has_cloexec && !still_cloexec {
+        println(b"IOCTL_FIOCLEX:OK");
+    } else {
+        print(b"IOCTL_FIOCLEX:FAIL: init=");
+        print_num(initially_cloexec as i64);
+        print(b", has=");
+        print_num(has_cloexec as i64);
+        print(b", still=");
+        print_num(still_cloexec as i64);
+        println(b"");
+    }
 }

@@ -8,6 +8,7 @@ pub mod percpu;
 pub mod pgrp;
 pub mod proc;
 pub mod process_vm;
+pub mod ptrace;
 pub mod sched;
 pub mod schedsys;
 pub mod syscall;
@@ -45,9 +46,17 @@ pub mod clone_flags {
     /// Share I/O context (ioprio)
     pub const CLONE_IO: u64 = 0x80000000;
 
+    /// Continue tracing child (if parent is being traced)
+    pub const CLONE_PTRACE: u64 = 0x00002000;
+    /// Prevent forced CLONE_PTRACE by parent's tracer
+    pub const CLONE_UNTRACED: u64 = 0x00800000;
+
     /// Clear signal handlers (reset to SIG_DFL) - Linux 5.5+
     /// Note: SIG_IGN handlers are preserved (intentional Linux behavior)
     pub const CLONE_CLEAR_SIGHAND: u64 = 0x100000000;
+
+    /// Place child in specific cgroup (clone3 only, requires cgroup fd)
+    pub const CLONE_INTO_CGROUP: u64 = 0x200000000;
 
     // Namespace clone flags (re-exported from ns module for convenience)
     pub use crate::ns::{
@@ -490,6 +499,8 @@ pub enum TaskState {
     Running,
     /// Sleeping/waiting
     Sleeping,
+    /// Stopped for ptrace (signal number that caused stop)
+    Traced(i32),
     /// Exited with status
     Zombie(i32),
 }
@@ -508,22 +519,47 @@ pub mod prctl_ops {
     pub const PR_GET_DUMPABLE: i32 = 3;
     /// Set dumpable flag
     pub const PR_SET_DUMPABLE: i32 = 4;
+    /// Get keep capabilities flag
+    pub const PR_GET_KEEPCAPS: i32 = 7;
+    /// Set keep capabilities flag
+    pub const PR_SET_KEEPCAPS: i32 = 8;
     /// Set process name (comm)
     pub const PR_SET_NAME: i32 = 15;
     /// Get process name (comm)
     pub const PR_GET_NAME: i32 = 16;
-    /// Set timer slack value (nanoseconds)
-    pub const PR_SET_TIMERSLACK: i32 = 29;
-    /// Get timer slack value (nanoseconds)
-    pub const PR_GET_TIMERSLACK: i32 = 30;
     /// Get seccomp mode
     pub const PR_GET_SECCOMP: i32 = 21;
     /// Set seccomp mode
     pub const PR_SET_SECCOMP: i32 = 22;
+    /// Get TSC (timestamp counter) mode (x86-64 only)
+    pub const PR_GET_TSC: i32 = 25;
+    /// Set TSC mode (x86-64 only)
+    pub const PR_SET_TSC: i32 = 26;
+    /// Set timer slack value (nanoseconds)
+    pub const PR_SET_TIMERSLACK: i32 = 29;
+    /// Get timer slack value (nanoseconds)
+    pub const PR_GET_TIMERSLACK: i32 = 30;
+    /// Get child subreaper flag
+    pub const PR_GET_CHILD_SUBREAPER: i32 = 36;
+    /// Set child subreaper flag
+    pub const PR_SET_CHILD_SUBREAPER: i32 = 37;
     /// Disable privilege escalation via setuid/setgid (irreversible)
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     /// Get no_new_privs flag
     pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
+    /// Disable transparent huge pages for this process
+    pub const PR_SET_THP_DISABLE: i32 = 41;
+    /// Get THP disable flag
+    pub const PR_GET_THP_DISABLE: i32 = 42;
+    /// Get CPUID faulting mode (x86-64 only)
+    pub const PR_GET_CPUID: i32 = 48;
+    /// Set CPUID faulting mode (x86-64 only)
+    pub const PR_SET_CPUID: i32 = 49;
+
+    /// TSC mode: allow RDTSC instruction
+    pub const PR_TSC_ENABLE: i32 = 1;
+    /// TSC mode: SIGSEGV on RDTSC instruction
+    pub const PR_TSC_SIGSEGV: i32 = 2;
 }
 
 /// Dumpable flag values for PR_SET_DUMPABLE
@@ -550,6 +586,23 @@ pub struct PrctlState {
     pub no_new_privs: bool,
     /// Timer slack in nanoseconds (PR_SET_TIMERSLACK)
     pub timer_slack_ns: u64,
+    /// Keep capabilities across setuid (PR_SET_KEEPCAPS)
+    /// When set, capabilities are preserved when changing UIDs
+    pub keep_caps: bool,
+    /// Child subreaper flag (PR_SET_CHILD_SUBREAPER)
+    /// When set, this process becomes the parent of orphaned descendants
+    /// instead of init (PID 1)
+    pub child_subreaper: bool,
+    /// TSC mode (x86-64 only): PR_TSC_ENABLE or PR_TSC_SIGSEGV
+    /// Controls whether RDTSC instruction is allowed
+    #[cfg(target_arch = "x86_64")]
+    pub tsc_mode: u8,
+    /// CPUID faulting enabled (x86-64 only)
+    /// When set, CPUID instruction causes SIGSEGV
+    #[cfg(target_arch = "x86_64")]
+    pub cpuid_fault: bool,
+    /// Transparent Huge Pages disabled for this process
+    pub thp_disable: bool,
 }
 
 impl Default for PrctlState {
@@ -559,6 +612,13 @@ impl Default for PrctlState {
             dumpable: dumpable::SUID_DUMP_USER,
             no_new_privs: false,
             timer_slack_ns: 50_000, // 50 microseconds default
+            keep_caps: false,
+            child_subreaper: false,
+            #[cfg(target_arch = "x86_64")]
+            tsc_mode: prctl_ops::PR_TSC_ENABLE as u8, // RDTSC allowed by default
+            #[cfg(target_arch = "x86_64")]
+            cpuid_fault: false,
+            thp_disable: false,
         }
     }
 }
@@ -820,6 +880,10 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub stime: u64,
     /// Task start time (monotonic clock, nanoseconds since boot)
     pub start_time: u64,
+    /// Timestamp when task last started running (for CPU time tracking)
+    pub last_run_ns: u64,
+    /// Whether task is currently in kernel mode (for utime/stime split)
+    pub in_kernel: bool,
     /// Voluntary context switches (task yielded or slept)
     pub nvcsw: u64,
     /// Involuntary context switches (preempted by scheduler)
@@ -956,6 +1020,27 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// This is an emulation of the CPU IOPL mechanism, stored per-task.
     #[cfg(target_arch = "x86_64")]
     pub iopl_emul: u8,
+
+    // =========================================================================
+    // Ptrace state (like Linux task_struct ptrace fields)
+    // =========================================================================
+    /// Ptrace flags (PT_PTRACED, PT_SEIZED, PT_SYSCALL_TRACE, PT_SINGLESTEP)
+    /// 0 = not traced, non-zero = traced with flags
+    pub ptrace: u32,
+
+    /// Current ptrace parent (tracer) TID
+    /// Only valid when ptrace != 0
+    pub ptracer_tid: Option<Tid>,
+
+    /// Real parent TID (preserved for detach restoration)
+    /// When ptracing, parent may be changed to tracer; real_parent stays original
+    pub real_parent_tid: Tid,
+
+    /// Message for PTRACE_GETEVENTMSG (child PID, exec old TID, exit code, etc.)
+    pub ptrace_message: u64,
+
+    /// Ptrace options (PTRACE_O_TRACESYSGOOD, etc.)
+    pub ptrace_options: u32,
 }
 
 impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {
@@ -1521,5 +1606,36 @@ pub fn set_set_child_tid(tid: Tid, addr: u64) {
         if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
             task.set_child_tid = addr;
         }
+    }
+}
+
+// =============================================================================
+// Cgroup file descriptor lookup (for CLONE_INTO_CGROUP)
+// =============================================================================
+
+/// Look up a cgroup from a file descriptor.
+///
+/// The fd must refer to an open directory on cgroupfs.
+/// Returns the cgroup Arc if valid, None otherwise.
+pub fn cgroup_from_fd(tid: Tid, fd: i32) -> Option<alloc::sync::Arc<crate::cgroup::Cgroup>> {
+    use crate::fs::cgroupfs::{CgroupfsInodeData, CgroupfsInodeWrapper};
+
+    // Get the file from fd
+    let fd_table = fdtable::get_task_fd(tid)?;
+    let file = fd_table.lock().get(fd)?;
+
+    // Get the inode from the file
+    let inode = file.get_inode()?;
+
+    // Check if it's a cgroupfs directory inode
+    let private = inode.get_private()?;
+    let wrapper = private.as_any().downcast_ref::<CgroupfsInodeWrapper>()?;
+    let data = wrapper.0.read();
+
+    // Must be a directory (cgroup) not a control file
+    if let CgroupfsInodeData::Directory { cgroup } = &*data {
+        cgroup.upgrade()
+    } else {
+        None
     }
 }

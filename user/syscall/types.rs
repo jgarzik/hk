@@ -366,6 +366,16 @@ pub const MADV_DOFORK: i32 = 11;
 pub const MADV_DONTDUMP: i32 = 16;
 /// Include in core dumps (undo MADV_DONTDUMP)
 pub const MADV_DODUMP: i32 = 17;
+/// Remove pages (punch hole in file)
+pub const MADV_REMOVE: i32 = 9;
+/// Zero VMA in child on fork
+pub const MADV_WIPEONFORK: i32 = 18;
+/// Undo MADV_WIPEONFORK
+pub const MADV_KEEPONFORK: i32 = 19;
+/// Deactivate pages (hint for LRU)
+pub const MADV_COLD: i32 = 20;
+/// Reclaim pages (swap out)
+pub const MADV_PAGEOUT: i32 = 21;
 
 // mlock2 flags
 pub const MLOCK_ONFAULT: i32 = 0x01;
@@ -470,6 +480,16 @@ pub const SIG_SETMASK: i32 = 2;
 // Special signal handler values
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
+
+// Signal action flags
+pub const SA_NOCLDSTOP: u64 = 1;
+pub const SA_NOCLDWAIT: u64 = 2;
+pub const SA_SIGINFO: u64 = 4;
+pub const SA_ONSTACK: u64 = 0x08000000;
+pub const SA_RESTART: u64 = 0x10000000;
+pub const SA_NODEFER: u64 = 0x40000000;
+pub const SA_RESETHAND: u64 = 0x80000000;
+pub const SA_RESTORER: u64 = 0x04000000;
 
 // ============================================================================
 // UTS name structure
@@ -988,18 +1008,55 @@ pub struct SignalfdSiginfo {
 }
 
 // ============================================================================
+// Generic ioctl constants
+// ============================================================================
+
+/// Set non-blocking mode
+pub const FIONBIO: u32 = 0x5421;
+/// Enable async I/O
+pub const FIOASYNC: u32 = 0x5452;
+/// Set close-on-exec
+pub const FIOCLEX: u32 = 0x5451;
+/// Clear close-on-exec
+pub const FIONCLEX: u32 = 0x5450;
+/// Get bytes available to read
+pub const FIONREAD: u32 = 0x541B;
+
+// ============================================================================
 // prctl constants (Section 10.4)
 // ============================================================================
 
 /// prctl operation codes
 pub const PR_GET_DUMPABLE: i32 = 3;
 pub const PR_SET_DUMPABLE: i32 = 4;
+pub const PR_GET_KEEPCAPS: i32 = 7;
+pub const PR_SET_KEEPCAPS: i32 = 8;
 pub const PR_SET_NAME: i32 = 15;
 pub const PR_GET_NAME: i32 = 16;
 pub const PR_SET_TIMERSLACK: i32 = 29;
 pub const PR_GET_TIMERSLACK: i32 = 30;
+pub const PR_GET_CHILD_SUBREAPER: i32 = 36;
+pub const PR_SET_CHILD_SUBREAPER: i32 = 37;
 pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
 pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
+pub const PR_SET_THP_DISABLE: i32 = 41;
+pub const PR_GET_THP_DISABLE: i32 = 42;
+
+// x86-64 specific prctl operations
+#[cfg(target_arch = "x86_64")]
+pub const PR_GET_TSC: i32 = 25;
+#[cfg(target_arch = "x86_64")]
+pub const PR_SET_TSC: i32 = 26;
+#[cfg(target_arch = "x86_64")]
+pub const PR_GET_CPUID: i32 = 48;
+#[cfg(target_arch = "x86_64")]
+pub const PR_SET_CPUID: i32 = 49;
+
+// TSC mode values (x86-64 only)
+#[cfg(target_arch = "x86_64")]
+pub const PR_TSC_ENABLE: i32 = 1;
+#[cfg(target_arch = "x86_64")]
+pub const PR_TSC_SIGSEGV: i32 = 2;
 
 /// Dumpable flag values
 pub const SUID_DUMP_DISABLE: i32 = 0;
@@ -2150,3 +2207,52 @@ pub const fn bpf_stmt(code: u16, k: u32) -> SockFilter {
 pub const fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
     SockFilter { code, jt, jf, k }
 }
+
+// ============================================================================
+// POSIX Advisory Lock structures (fcntl F_GETLK/F_SETLK/F_SETLKW)
+// ============================================================================
+
+/// struct flock for POSIX advisory byte-range locks (Linux ABI)
+///
+/// Used with fcntl F_GETLK, F_SETLK, and F_SETLKW commands for
+/// fine-grained byte-range locking on files.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Flock {
+    /// Lock type: F_RDLCK, F_WRLCK, or F_UNLCK
+    pub l_type: i16,
+    /// How to interpret l_start: SEEK_SET, SEEK_CUR, or SEEK_END
+    pub l_whence: i16,
+    /// Starting offset of the lock
+    pub l_start: i64,
+    /// Length of the lock (0 = to EOF)
+    pub l_len: i64,
+    /// PID of lock owner (filled in by F_GETLK)
+    pub l_pid: i32,
+}
+
+// POSIX lock type constants
+/// Read (shared) lock - multiple processes can hold
+pub const F_RDLCK: i16 = 0;
+/// Write (exclusive) lock - only one process can hold
+pub const F_WRLCK: i16 = 1;
+/// Unlock - release the lock
+pub const F_UNLCK: i16 = 2;
+
+// fcntl command constants for POSIX advisory locks
+/// Get lock info - test if a lock would block
+pub const F_GETLK: i32 = 5;
+/// Set lock (non-blocking) - returns EAGAIN if would block
+pub const F_SETLK: i32 = 6;
+/// Set lock (blocking) - waits until lock available
+pub const F_SETLKW: i32 = 7;
+
+// fcntl command constants for async I/O owner (signal-driven I/O)
+/// Set owner PID/PGID for SIGIO signals
+pub const F_SETOWN: i32 = 8;
+/// Get owner PID/PGID for SIGIO signals
+pub const F_GETOWN: i32 = 9;
+/// Set signal number for async I/O (0 = use SIGIO)
+pub const F_SETSIG: i32 = 10;
+/// Get signal number for async I/O
+pub const F_GETSIG: i32 = 11;

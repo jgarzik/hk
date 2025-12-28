@@ -150,7 +150,7 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         match file.write(write_buf) {
             Ok(n) => n as i64,
             Err(KernelError::PermissionDenied) => KernelError::BadFd.sysret(),
-            Err(_) => KernelError::InvalidArgument.sysret(),
+            Err(e) => e.sysret(),
         }
     } else {
         // Allocate a kernel buffer for large writes
@@ -167,7 +167,7 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         match file.write(&kernel_buf) {
             Ok(n) => n as i64,
             Err(KernelError::PermissionDenied) => KernelError::BadFd.sysret(),
-            Err(_) => KernelError::InvalidArgument.sysret(),
+            Err(e) => e.sysret(),
         }
     }
 }

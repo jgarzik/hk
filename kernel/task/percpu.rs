@@ -399,6 +399,8 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         utime: 0,
         stime: 0,
         start_time: crate::time::monotonic_ns(),
+        last_run_ns: crate::time::monotonic_ns(),
+        in_kernel: true, // Kernel threads always in kernel mode
         nvcsw: 0,
         nivcsw: 0,
         min_flt: 0,
@@ -445,6 +447,12 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         // I/O port permissions (x86-64 only, kernel threads don't use I/O ports)
         #[cfg(target_arch = "x86_64")]
         iopl_emul: 0,
+        // Ptrace state (kernel threads are not traced)
+        ptrace: 0,
+        ptracer_tid: None,
+        real_parent_tid: 0,
+        ptrace_message: 0,
+        ptrace_options: 0,
     };
 
     // Add task to global table
@@ -520,6 +528,8 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         utime: 0,
         stime: 0,
         start_time: crate::time::monotonic_ns(),
+        last_run_ns: crate::time::monotonic_ns(),
+        in_kernel: false, // User tasks start in user mode
         nvcsw: 0,
         nivcsw: 0,
         min_flt: 0,
@@ -566,6 +576,12 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         // I/O port permissions (x86-64 only, no I/O port access initially)
         #[cfg(target_arch = "x86_64")]
         iopl_emul: 0,
+        // Ptrace state (not traced initially)
+        ptrace: 0,
+        ptracer_tid: None,
+        real_parent_tid: config.ppid,
+        ptrace_message: 0,
+        ptrace_options: 0,
     };
 
     // Add to global table
@@ -753,6 +769,8 @@ pub struct CloneConfig {
     pub pidfd_ptr: u64,
     /// Exit signal for child (SIGCHLD for fork, 0 for threads)
     pub exit_signal: i32,
+    /// Cgroup file descriptor (CLONE_INTO_CGROUP, clone3 only)
+    pub cgroup_fd: i32,
 }
 
 /// Create a new thread/process via clone()
@@ -862,6 +880,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_mempolicy,
         parent_seccomp_mode,
         parent_seccomp_filter,
+        parent_ptrace,
+        parent_ptracer_tid,
     ) = {
         let table = TASK_TABLE.lock();
         let parent = try_with_cleanup!(table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)); // ESRCH - no such process
@@ -883,6 +903,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.mempolicy,
             parent.seccomp_mode,
             parent.seccomp_filter.clone(),
+            parent.ptrace,
+            parent.ptracer_tid,
         )
     };
 
@@ -1024,6 +1046,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         utime: 0,
         stime: 0,
         start_time: crate::time::monotonic_ns(),
+        last_run_ns: crate::time::monotonic_ns(),
+        in_kernel: false, // Child starts in user mode
         nvcsw: 0,
         nivcsw: 0,
         min_flt: 0,
@@ -1064,6 +1088,13 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             dumpable: crate::task::dumpable::SUID_DUMP_USER, // Reset to default
             no_new_privs: parent_prctl.no_new_privs,         // Inherited (irreversible)
             timer_slack_ns: parent_prctl.timer_slack_ns,     // Inherited
+            keep_caps: false,                                // Reset on fork
+            child_subreaper: false,                          // Not inherited
+            #[cfg(target_arch = "x86_64")]
+            tsc_mode: parent_prctl.tsc_mode, // Inherited
+            #[cfg(target_arch = "x86_64")]
+            cpuid_fault: parent_prctl.cpuid_fault, // Inherited
+            thp_disable: parent_prctl.thp_disable,           // Inherited
         },
         // Process personality (inherited from parent)
         personality: parent_personality,
@@ -1076,6 +1107,29 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         // I/O port permissions (x86-64 only, inherited from parent)
         #[cfg(target_arch = "x86_64")]
         iopl_emul: parent_iopl_emul,
+        // Ptrace state: inherited if CLONE_PTRACE is set and parent is traced
+        // CLONE_UNTRACED prevents forced inheritance even when tracer requests it
+        ptrace: if config.flags & CLONE_UNTRACED != 0 {
+            // CLONE_UNTRACED: child is never traced, even if parent is
+            0
+        } else if config.flags & CLONE_PTRACE != 0 && parent_ptrace != 0 {
+            // CLONE_PTRACE: if parent is being traced, child inherits tracing
+            // with the same tracer
+            parent_ptrace
+        } else {
+            // Normal case: child is not traced initially
+            0
+        },
+        ptracer_tid: if config.flags & CLONE_UNTRACED != 0 {
+            None
+        } else if config.flags & CLONE_PTRACE != 0 && parent_ptracer_tid.is_some() {
+            parent_ptracer_tid
+        } else {
+            None
+        },
+        real_parent_tid: child_ppid,
+        ptrace_message: 0,
+        ptrace_options: 0,
     };
 
     // Add to global task table
@@ -1116,9 +1170,25 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         config.flags
     ));
 
-    // Inherit cgroup membership from parent
-    // Child joins same cgroup as parent and inherits resource constraints
-    if let Some(ref cgroup) = parent_cgroup {
+    // Handle cgroup membership
+    // If CLONE_INTO_CGROUP is set, look up cgroup from fd and use that
+    // Otherwise, inherit from parent
+    if config.flags & CLONE_INTO_CGROUP != 0 && config.cgroup_fd >= 0 {
+        // Look up cgroup from file descriptor
+        match crate::task::cgroup_from_fd(current_tid, config.cgroup_fd) {
+            Some(cgroup) => {
+                crate::cgroup::attach_task(child_tid, &cgroup);
+            }
+            None => {
+                // Invalid cgroup fd - cleanup and return error
+                if nproc_incremented {
+                    crate::task::decrement_user_process_count(nproc_uid);
+                }
+                return Err(9); // EBADF
+            }
+        }
+    } else if let Some(ref cgroup) = parent_cgroup {
+        // Inherit cgroup membership from parent
         crate::cgroup::attach_task(child_tid, cgroup);
     }
 
@@ -1882,6 +1952,18 @@ pub fn get_tids_by_pgid(pgid: Pid) -> alloc::vec::Vec<Tid> {
         .collect()
 }
 
+/// Get all unique PIDs in the system
+///
+/// Returns a sorted, deduplicated list of all process IDs.
+/// Used by kill(-1, sig) to signal all processes.
+pub fn get_all_pids() -> alloc::vec::Vec<Pid> {
+    let table = TASK_TABLE.lock();
+    let mut pids: alloc::vec::Vec<Pid> = table.tasks.iter().map(|t| t.pid).collect();
+    pids.sort();
+    pids.dedup();
+    pids
+}
+
 /// Get the current task's FsStruct (filesystem context)
 ///
 /// Returns None if there is no current task or no filesystem context.
@@ -1961,6 +2043,106 @@ pub fn lookup_task_rt_priority(pid: Pid) -> Option<i32> {
         .iter()
         .find(|t| t.pid == pid)
         .map(|t| t.rt_priority)
+}
+
+/// Get a task's CPU time statistics by TID
+///
+/// Returns (utime_ns, stime_ns) for the specified task.
+/// Returns (0, 0) if the task is not found.
+pub fn get_task_times(tid: Tid) -> (u64, u64) {
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .map(|t| (t.utime, t.stime))
+        .unwrap_or((0, 0))
+}
+
+/// Get aggregate CPU times for a process (all threads)
+///
+/// Returns (utime_ns, stime_ns) summed across all threads in the process.
+/// Returns (0, 0) if no threads are found.
+pub fn get_process_times(pid: Pid) -> (u64, u64) {
+    let table = TASK_TABLE.lock();
+    let mut utime = 0u64;
+    let mut stime = 0u64;
+    for task in table.tasks.iter().filter(|t| t.pid == pid) {
+        utime = utime.saturating_add(task.utime);
+        stime = stime.saturating_add(task.stime);
+    }
+    (utime, stime)
+}
+
+/// Called when entering kernel mode (syscall entry)
+///
+/// Accumulates user time and marks task as in kernel mode.
+/// Call this at the start of syscall handling.
+pub fn account_syscall_enter() {
+    let tid = current_tid();
+    if tid == 0 {
+        return;
+    }
+
+    let now = crate::time::monotonic_ns();
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        // Accumulate user time (time since last_run_ns while in user mode)
+        if !task.in_kernel {
+            let delta = now.saturating_sub(task.last_run_ns);
+            task.utime = task.utime.saturating_add(delta);
+        }
+        task.last_run_ns = now;
+        task.in_kernel = true;
+    }
+}
+
+/// Called when exiting kernel mode (syscall return)
+///
+/// Accumulates system time and marks task as in user mode.
+/// Call this just before returning to user space.
+pub fn account_syscall_exit() {
+    let tid = current_tid();
+    if tid == 0 {
+        return;
+    }
+
+    let now = crate::time::monotonic_ns();
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        // Accumulate system time (time since last_run_ns while in kernel mode)
+        if task.in_kernel {
+            let delta = now.saturating_sub(task.last_run_ns);
+            task.stime = task.stime.saturating_add(delta);
+        }
+        task.last_run_ns = now;
+        task.in_kernel = false;
+    }
+}
+
+/// Called on context switch to accumulate time for outgoing task
+///
+/// This handles time accounting when switching away from a task.
+pub fn account_context_switch(tid: Tid, now: u64) {
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        let delta = now.saturating_sub(task.last_run_ns);
+        if task.in_kernel {
+            task.stime = task.stime.saturating_add(delta);
+        } else {
+            task.utime = task.utime.saturating_add(delta);
+        }
+    }
+}
+
+/// Called when a task starts running after context switch
+///
+/// Updates last_run_ns for the incoming task.
+pub fn account_task_resume(tid: Tid, now: u64) {
+    let mut table = TASK_TABLE.lock();
+    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        task.last_run_ns = now;
+    }
 }
 
 /// Look up a task's CPU affinity mask by PID

@@ -43,7 +43,7 @@ pub const RWF_NOAPPEND: i32 = 0x00000020;
 pub const RWF_ATOMIC: i32 = 0x00000040;
 /// Drop cache after I/O (not supported)
 pub const RWF_DONTCACHE: i32 = 0x00000080;
-/// Prevent SIGPIPE (no-op, we don't generate SIGPIPE on pipes yet)
+/// Prevent SIGPIPE generation on pipe/socket write errors
 pub const RWF_NOSIGNAL: i32 = 0x00000100;
 /// Mask of all supported RWF flags
 pub const RWF_SUPPORTED: i32 = RWF_HIPRI

@@ -55,7 +55,7 @@
 - [x] dup
 - [x] dup2 (x86-64 only, legacy; use dup3)
 - [x] dup3
-- [x] fcntl
+- [x] fcntl (F_DUPFD, F_GETFD, F_SETFD, F_GETFL, F_SETFL, F_GETLK, F_SETLK, F_SETLKW)
 
 2.2 Read/write + position
 
@@ -80,7 +80,7 @@
 - [x] tee
 - [x] vmsplice
 - [x] copy_file_range
-- [x] ioctl
+- [x] ioctl (FIONBIO, FIOASYNC, FIOCLEX, FIONCLEX, FIONREAD, TIOCGWINSZ, terminal/tty, virtio-blk, xHCI USB)
 - [x] sync
 - [x] fsync
 - [x] fdatasync
@@ -293,8 +293,8 @@ Linux groups the socket syscalls as their own "network" category.
 - [x] connect
 - [x] getsockname
 - [x] getpeername
-- [x] getsockopt
-- [x] setsockopt
+- [x] getsockopt (SO_REUSEADDR, SO_ERROR, SO_TYPE, SO_DOMAIN, SO_PROTOCOL, SO_BROADCAST, SO_DONTROUTE, SO_LINGER, SO_SNDBUF, SO_RCVBUF, SO_KEEPALIVE, TCP_NODELAY, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT)
+- [x] setsockopt (SO_REUSEADDR, SO_BROADCAST, SO_DONTROUTE, SO_LINGER, SO_SNDBUF, SO_RCVBUF, SO_KEEPALIVE, TCP_NODELAY, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT)
 - [x] sendto
 - [x] recvfrom
 - [x] sendmsg
@@ -364,7 +364,7 @@ Linux groups the socket syscalls as their own "network" category.
 10.4 Misc security / sandboxing
 
 - [x] seccomp (SECCOMP_SET_MODE_STRICT, SECCOMP_SET_MODE_FILTER with eBPF support)
-- [x] prctl (PR_SET/GET_NAME, PR_SET/GET_DUMPABLE, PR_SET/GET_NO_NEW_PRIVS, PR_SET/GET_TIMERSLACK, PR_SET/GET_SECCOMP)
+- [x] prctl (PR_SET/GET_NAME, PR_SET/GET_DUMPABLE, PR_SET/GET_NO_NEW_PRIVS, PR_SET/GET_TIMERSLACK, PR_SET/GET_SECCOMP, PR_SET/GET_KEEPCAPS, PR_SET/GET_CHILD_SUBREAPER, PR_SET/GET_THP_DISABLE, PR_SET/GET_TSC [x86-64], PR_SET/GET_CPUID [x86-64])
 - [x] mlock / mlockall (already listed under memory)
 
 11. Namespaces, containers, mounts, cgroups
@@ -397,7 +397,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 - [x] sysinfo
 - [x] getrandom
 - [x] reboot
-- [ ] kexec_load
+- [x] kexec_load (stub, returns -ENOSYS; requires CAP_SYS_BOOT)
 - [x] syslog
 - [x] acct
 - [x] swapon
@@ -406,14 +406,14 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 
 13. Debugging, perf, BPF
 
-- [ ] ptrace
-- [ ] perf_event_open
+- [x] ptrace (TRACEME, ATTACH, SEIZE, DETACH, PEEKDATA, POKEDATA, GETREGS, SETREGS, CONT, SYSCALL, SINGLESTEP, KILL, SETOPTIONS, GETEVENTMSG)
+- [x] perf_event_open (stub, returns -EOPNOTSUPP)
 - [x] bpf (BPF_MAP_CREATE, BPF_MAP_LOOKUP/UPDATE/DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, BPF_PROG_LOAD, BPF_OBJ_GET_INFO_BY_FD; map types: HASH, ARRAY; program type: SOCKET_FILTER)
 - [x] membarrier
 - [x] kcmp (compare processes)
 - [x] process_vm_readv
 - [x] process_vm_writev
-- [ ] rseq (restartable sequences)
+- [x] rseq (stub, returns -ENOSYS)
 
 14. Thread-local, arch-specific, misc
 

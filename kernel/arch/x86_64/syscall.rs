@@ -497,6 +497,10 @@ pub const SYS_IOPRIO_GET: u64 = 252;
 pub const SYS_PRCTL: u64 = 157;
 /// arch_prctl(code, addr) - Architecture-specific thread state
 pub const SYS_ARCH_PRCTL: u64 = 158;
+
+// Ptrace (debugging/tracing)
+/// ptrace(request, pid, addr, data) - Process tracing
+pub const SYS_PTRACE: u64 = 101;
 /// set_tid_address(tidptr) - Set pointer for child thread ID on exit
 pub const SYS_SET_TID_ADDRESS: u64 = 218;
 /// seccomp(operation, flags, args) - Operate on Secure Computing state
@@ -665,6 +669,14 @@ pub const SYS_PROCESS_VM_READV: u64 = 310;
 pub const SYS_PROCESS_VM_WRITEV: u64 = 311;
 /// kcmp(pid1, pid2, type, idx1, idx2)
 pub const SYS_KCMP: u64 = 312;
+
+// Syscalls that return stubs (not fully implemented)
+/// kexec_load(entry, nr_segments, segments, flags) - load new kernel
+pub const SYS_KEXEC_LOAD: u64 = 246;
+/// perf_event_open(attr, pid, cpu, group_fd, flags) - performance monitoring
+pub const SYS_PERF_EVENT_OPEN: u64 = 298;
+/// rseq(rseq, rseq_len, flags, sig) - restartable sequences
+pub const SYS_RSEQ: u64 = 334;
 
 /// Model Specific Registers for syscall
 const MSR_EFER: u32 = 0xC000_0080; // Extended Feature Enable Register
@@ -923,7 +935,21 @@ unsafe extern "C" fn syscall_entry() {
         // [RSP + 32] = rsi
         // [RSP + 40] = rdi
         // [RSP + 48] = rax (return value slot)
+        // [RSP + 56] = r15
+        // [RSP + 64] = r14
+        // [RSP + 72] = r13
+        // [RSP + 80] = r12
+        // [RSP + 88] = rbp
+        // [RSP + 96] = rbx
+        // [RSP + 104] = r11 (user RFLAGS)
+        // [RSP + 112] = rcx (user RIP)
+        // [RSP + 120] = user_rsp
         "mov [rsp + 48], rax",
+
+        // Update stack frame from percpu if signal delivery modified the context
+        // Pass RSP as the frame base pointer
+        "mov rdi, rsp",
+        "call {update_frame}",
 
         // Restore caller-saved registers (in reverse order of pushes)
         // Push order was: rax, rdi, rsi, rdx, r10, r8, r9
@@ -981,6 +1007,7 @@ unsafe extern "C" fn syscall_entry() {
         kstack = sym SYSCALL_KERNEL_STACK,
         save_syscall_state = sym super::percpu::save_syscall_state,
         save_syscall_caller_saved = sym super::percpu::save_syscall_caller_saved,
+        update_frame = sym super::percpu::update_syscall_return_frame,
     );
 }
 
@@ -1275,15 +1302,19 @@ pub fn x86_64_syscall_dispatch(
         sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
     };
 
+    // Account for entering kernel mode
+    percpu::account_syscall_enter();
+
     // Check seccomp policy before executing syscall
     // Note: ip is not available here, pass 0 for now
     if let Some(result) =
         crate::seccomp::check::check_syscall_x86_64(num, 0, arg0, arg1, arg2, arg3, arg4, arg5)
     {
+        percpu::account_syscall_exit();
         return result;
     }
 
-    match num {
+    let result = match num {
         SYS_READ => sys_read(arg0 as i32, arg1, arg2) as u64,
         SYS_WRITE => sys_write(arg0 as i32, arg1, arg2) as u64,
         SYS_READV => sys_readv(arg0 as i32, arg1, arg2 as i32) as u64,
@@ -1723,6 +1754,7 @@ pub fn x86_64_syscall_dispatch(
             crate::signal::syscall::sys_rt_sigqueueinfo(arg0 as i64, arg1 as u32, arg2) as u64
         }
         SYS_RT_SIGSUSPEND => crate::signal::syscall::sys_rt_sigsuspend(arg0, arg1) as u64,
+        SYS_RT_SIGRETURN => super::signal::sys_rt_sigreturn() as u64,
         SYS_RT_TGSIGQUEUEINFO => crate::signal::syscall::sys_rt_tgsigqueueinfo(
             arg0 as i64,
             arg1 as i64,
@@ -1793,6 +1825,9 @@ pub fn x86_64_syscall_dispatch(
             use crate::task::syscall::sys_arch_prctl;
             sys_arch_prctl(arg0 as i32, arg1) as u64
         }
+
+        // Ptrace (debugging/tracing)
+        SYS_PTRACE => crate::task::ptrace::sys_ptrace(arg0 as i64, arg1 as i64, arg2, arg3) as u64,
         SYS_SET_TID_ADDRESS => {
             use crate::task::syscall::sys_set_tid_address;
             sys_set_tid_address(arg0) as u64
@@ -1981,6 +2016,33 @@ pub fn x86_64_syscall_dispatch(
         // Process inspection (Section 13)
         SYS_KCMP => crate::kcmp::sys_kcmp(arg0, arg1, arg2 as i32, arg3, arg4) as u64,
 
+        // Syscall stubs (not fully implemented)
+        SYS_RSEQ => {
+            // Restartable sequences - not implemented, return ENOSYS
+            (-38i64) as u64 // ENOSYS
+        }
+        SYS_PERF_EVENT_OPEN => {
+            // Performance monitoring - not supported, return EOPNOTSUPP
+            (-95i64) as u64 // EOPNOTSUPP
+        }
+        SYS_KEXEC_LOAD => {
+            // Kernel execution load - check capability, return ENOSYS
+            if !crate::task::capable(crate::task::CAP_SYS_BOOT) {
+                (-1i64) as u64 // EPERM
+            } else {
+                (-38i64) as u64 // ENOSYS
+            }
+        }
+
         _ => (-38i64) as u64, // ENOSYS
-    }
+    };
+
+    // Check for pending signals before returning to userspace
+    // This may modify the saved user context to invoke the signal handler
+    crate::signal::do_signal();
+
+    // Account for exiting kernel mode
+    percpu::account_syscall_exit();
+
+    result
 }

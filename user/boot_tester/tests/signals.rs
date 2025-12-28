@@ -6,6 +6,7 @@
 //! - Test 76: kill() signal 0 - check process exists
 //! - Test 77: kill() ESRCH - non-existent process
 //! - Test 78: tgkill() signal 0
+//! - Test: tgkill() wrong tgid - thread group validation (ESRCH)
 //! - Test 79: tkill() signal 0
 //! - Test 80: rt_sigaction() - get default action
 //! - Test 81: rt_sigaction() EINVAL - invalid signal
@@ -15,14 +16,17 @@
 //! - Test: sigaltstack() - alternate signal stack
 //! - Test: rt_sigqueueinfo() - queue signal with siginfo
 //! - Test: rt_tgsigqueueinfo() - queue signal to thread
+//! - Test: rt_tgsigqueueinfo() wrong tgid - thread group validation (ESRCH)
 //! - Test: rt_sigsuspend() - wait for signal with temp mask
 
 use super::helpers::{print, println, print_num};
 use hk_syscall::{
-    sys_clone, sys_exit, sys_getpid, sys_gettid, sys_kill, sys_rt_sigaction, sys_rt_sigpending,
-    sys_rt_sigprocmask, sys_rt_sigqueueinfo, sys_rt_sigsuspend, sys_rt_sigtimedwait,
-    sys_rt_tgsigqueueinfo, sys_sigaltstack, sys_tgkill, sys_tkill, sys_wait4,
-    CLONE_CLEAR_SIGHAND, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_UNBLOCK, SIGCHLD, SIGKILL, SIGUSR1,
+    sys_clone, sys_close, sys_exit, sys_getpid, sys_gettid, sys_kill, sys_pipe,
+    sys_rt_sigaction, sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigqueueinfo,
+    sys_rt_sigsuspend, sys_rt_sigtimedwait, sys_rt_tgsigqueueinfo, sys_sigaltstack,
+    sys_tgkill, sys_tkill, sys_wait4, sys_write,
+    CLONE_CLEAR_SIGHAND, SA_RESTORER, SA_SIGINFO, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_UNBLOCK,
+    SIGCHLD, SIGKILL, SIGPIPE, SIGUSR1,
 };
 
 /// SI_QUEUE signal code (for rt_sigqueueinfo)
@@ -61,6 +65,7 @@ pub fn run_tests() {
     test_kill_sig0();
     test_kill_esrch();
     test_tgkill_sig0();
+    test_tgkill_wrong_tgid();
     test_tkill_sig0();
     test_sigaction();
     test_sigaction_einval();
@@ -71,8 +76,13 @@ pub fn run_tests() {
     test_sigqueueinfo();
     test_sigqueueinfo_eperm();
     test_tgsigqueueinfo();
+    test_tgsigqueueinfo_wrong_tgid();
     test_sigsuspend();
     test_sigsuspend_einval();
+    test_kill_pgrp_zero();
+    test_kill_pgrp_neg();
+    test_sigpipe_broken_pipe();
+    test_signal_handler_invocation();
 }
 
 /// Test 74: rt_sigprocmask() - get and set signal mask
@@ -166,6 +176,27 @@ fn test_tgkill_sig0() {
         println(b"TGKILL_SIG0:OK");
     } else {
         print(b"TGKILL_SIG0:FAIL: expected 0, got ");
+        print_num(ret);
+    }
+}
+
+/// Test: tgkill() with wrong tgid should fail with ESRCH
+///
+/// The thread group validation checks that the tid actually belongs to
+/// the specified tgid. Using a wrong tgid (e.g., pid+1) should return ESRCH.
+fn test_tgkill_wrong_tgid() {
+    let pid = sys_getpid();
+    let tid = sys_gettid();
+
+    // Use pid+1 as a wrong tgid - our tid doesn't belong to that thread group
+    let wrong_tgid = pid + 1;
+    let ret = sys_tgkill(wrong_tgid, tid, 0);
+
+    if ret == -3 {
+        // ESRCH - thread not in specified thread group
+        println(b"TGKILL_WRONG_TGID:OK");
+    } else {
+        print(b"TGKILL_WRONG_TGID:FAIL: expected -3 (ESRCH), got ");
         print_num(ret);
     }
 }
@@ -516,6 +547,28 @@ fn test_tgsigqueueinfo() {
     }
 }
 
+/// Test: rt_tgsigqueueinfo() with wrong tgid should fail with ESRCH
+///
+/// Like tgkill, tgsigqueueinfo validates that the tid belongs to the tgid.
+fn test_tgsigqueueinfo_wrong_tgid() {
+    let pid = sys_getpid();
+    let tid = sys_gettid();
+
+    let info = SigInfo::new(SIGUSR1, SI_QUEUE, pid as i32, 0);
+
+    // Use pid+1 as a wrong tgid - our tid doesn't belong to that thread group
+    let wrong_tgid = pid + 1;
+    let ret = sys_rt_tgsigqueueinfo(wrong_tgid, tid, SIGUSR1, &info as *const SigInfo as u64);
+
+    if ret == -3 {
+        // ESRCH - thread not in specified thread group
+        println(b"TGSIGQUEUEINFO_WRONG_TGID:OK");
+    } else {
+        print(b"TGSIGQUEUEINFO_WRONG_TGID:FAIL: expected -3 (ESRCH), got ");
+        print_num(ret);
+    }
+}
+
 /// Test: rt_sigsuspend() - should return -EINTR
 fn test_sigsuspend() {
     // sigsuspend always returns -EINTR when a signal is pending/delivered
@@ -545,5 +598,232 @@ fn test_sigsuspend_einval() {
     } else {
         print(b"SIGSUSPEND_EINVAL:FAIL: expected -22, got ");
         print_num(ret);
+    }
+}
+
+/// Test: kill(0, sig) - signal own process group
+///
+/// kill(0, sig) should signal all processes in the caller's process group.
+/// Since we're the only process in our process group, signal 0 should succeed.
+fn test_kill_pgrp_zero() {
+    // Signal 0 is a validity check - should succeed for our own pgrp
+    let ret = sys_kill(0, 0);
+    if ret == 0 {
+        println(b"KILL_PGRP_ZERO:OK");
+    } else {
+        print(b"KILL_PGRP_ZERO:FAIL: expected 0, got ");
+        print_num(ret);
+    }
+}
+
+/// Test: kill(-pgid, sig) - signal specific process group
+///
+/// kill(-pgid, sig) should signal all processes in process group pgid.
+/// We use our own pid (negated) since we're a process group leader.
+fn test_kill_pgrp_neg() {
+    let pid = sys_getpid();
+
+    // Signal our own process group using -pid (we are the pgrp leader)
+    let ret = sys_kill(-pid, 0); // Signal 0 = validity check
+    if ret == 0 {
+        println(b"KILL_PGRP_NEG:OK");
+    } else {
+        print(b"KILL_PGRP_NEG:FAIL: expected 0, got ");
+        print_num(ret);
+    }
+}
+
+/// Test: SIGPIPE is generated when writing to a pipe with closed read end
+///
+/// Per POSIX, writing to a pipe/socket with no readers should:
+/// 1. Send SIGPIPE to the writing process
+/// 2. Return EPIPE (-32) if SIGPIPE is ignored/blocked
+fn test_sigpipe_broken_pipe() {
+    // Create a pipe
+    let mut pipefd: [i32; 2] = [0, 0];
+    let ret = sys_pipe(pipefd.as_mut_ptr());
+    if ret != 0 {
+        print(b"SIGPIPE_PIPE:FAIL: pipe() failed, ret = ");
+        print_num(ret);
+        return;
+    }
+
+    let read_fd = pipefd[0];
+    let write_fd = pipefd[1];
+
+    // Block SIGPIPE so we can detect it as pending
+    let sigpipe_mask: u64 = 1 << (SIGPIPE - 1);
+    sys_rt_sigprocmask(SIG_BLOCK, &sigpipe_mask as *const u64 as u64, 0, 8);
+
+    // Close the read end - now writes should fail with EPIPE and generate SIGPIPE
+    sys_close(read_fd as u64);
+
+    // Write to the pipe - should fail and generate SIGPIPE
+    let buf = [0u8; 4];
+    let write_ret = sys_write(write_fd as u64, buf.as_ptr(), 4);
+
+    // Check if SIGPIPE is pending
+    let mut pending: u64 = 0;
+    sys_rt_sigpending(&mut pending as *mut u64 as u64, 8);
+
+    // Consume the pending SIGPIPE using sigtimedwait
+    let ts = [0i64, 0i64]; // Zero timeout
+    sys_rt_sigtimedwait(&sigpipe_mask as *const u64 as u64, 0, ts.as_ptr() as u64, 8);
+
+    // Unblock SIGPIPE
+    sys_rt_sigprocmask(SIG_UNBLOCK, &sigpipe_mask as *const u64 as u64, 0, 8);
+
+    // Clean up
+    sys_close(write_fd as u64);
+
+    // Verify: write should return -32 (EPIPE) and SIGPIPE should have been pending
+    let sigpipe_was_pending = (pending & sigpipe_mask) != 0;
+    if write_ret == -32 && sigpipe_was_pending {
+        println(b"SIGPIPE_PIPE:OK");
+    } else if write_ret == -32 {
+        print(b"SIGPIPE_PIPE:FAIL: write returned EPIPE but SIGPIPE not pending, pending=");
+        print_num(pending as i64);
+    } else {
+        print(b"SIGPIPE_PIPE:FAIL: expected -32 (EPIPE), got ");
+        print_num(write_ret);
+    }
+}
+
+// ============================================================================
+// Signal Handler Invocation Tests
+// ============================================================================
+
+/// Global volatile flag to track if signal handler was invoked
+static mut HANDLER_INVOKED: bool = false;
+
+/// Global to store siginfo signal number for verification
+static mut RECEIVED_SIGNO: i32 = 0;
+
+/// sigaction structure for signal handler registration
+/// Layout: [handler, flags, restorer, mask]
+#[repr(C)]
+struct SigActionData {
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    mask: u64,
+}
+
+/// Signal restorer trampoline that calls rt_sigreturn
+///
+/// This function is set as SA_RESTORER and will be jumped to
+/// when the signal handler returns. It then calls rt_sigreturn
+/// to restore the original context.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn signal_restorer() -> ! {
+    core::arch::naked_asm!(
+        "mov rax, 15",  // SYS_rt_sigreturn
+        "syscall",
+        "ud2"           // Should never reach here
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn signal_restorer() -> ! {
+    core::arch::naked_asm!(
+        "mov x8, 139",  // SYS_rt_sigreturn
+        "svc 0",
+        "brk 0"         // Should never reach here
+    )
+}
+
+/// Simple signal handler that sets the global flag
+///
+/// For SA_SIGINFO handlers: fn(signo: i32, info: *const SigInfo, ucontext: *const u8)
+extern "C" fn test_signal_handler(signo: i32, _info: *const SigInfo, _ucontext: *const u8) {
+    unsafe {
+        core::ptr::write_volatile(&raw mut HANDLER_INVOKED, true);
+        core::ptr::write_volatile(&raw mut RECEIVED_SIGNO, signo);
+    }
+}
+
+/// Test: Signal handler invocation with SA_SIGINFO
+///
+/// This test:
+/// 1. Registers a signal handler with SA_SIGINFO and SA_RESTORER
+/// 2. Sends SIGUSR1 to self
+/// 3. Verifies the handler was invoked
+/// 4. Verifies the signo received matches
+fn test_signal_handler_invocation() {
+    // Reset global state
+    unsafe {
+        core::ptr::write_volatile(&raw mut HANDLER_INVOKED, false);
+        core::ptr::write_volatile(&raw mut RECEIVED_SIGNO, 0);
+    }
+
+    // Set up sigaction with our handler
+    let action = SigActionData {
+        handler: test_signal_handler as *const () as u64,
+        flags: SA_SIGINFO | SA_RESTORER,
+        restorer: signal_restorer as *const () as u64,
+        mask: 0,
+    };
+
+    let mut old_action = SigActionData {
+        handler: 0,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+
+    // Register the handler
+    let ret = sys_rt_sigaction(
+        SIGUSR1,
+        &action as *const SigActionData as u64,
+        &mut old_action as *mut SigActionData as u64,
+        8,
+    );
+
+    if ret != 0 {
+        print(b"SIGHANDLER_INVOKE:FAIL: sigaction failed, ret = ");
+        print_num(ret);
+        return;
+    }
+
+    // Send SIGUSR1 to ourselves
+    let pid = sys_getpid();
+    let kill_ret = sys_kill(pid, SIGUSR1);
+
+    if kill_ret != 0 {
+        print(b"SIGHANDLER_INVOKE:FAIL: kill failed, ret = ");
+        print_num(kill_ret);
+        // Restore default handler
+        let default_action = SigActionData {
+            handler: SIG_DFL,
+            flags: 0,
+            restorer: 0,
+            mask: 0,
+        };
+        sys_rt_sigaction(SIGUSR1, &default_action as *const SigActionData as u64, 0, 8);
+        return;
+    }
+
+    // Check if handler was invoked
+    let invoked = unsafe { core::ptr::read_volatile(&raw const HANDLER_INVOKED) };
+    let signo = unsafe { core::ptr::read_volatile(&raw const RECEIVED_SIGNO) };
+
+    // Restore default handler
+    let default_action = SigActionData {
+        handler: SIG_DFL,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+    sys_rt_sigaction(SIGUSR1, &default_action as *const SigActionData as u64, 0, 8);
+
+    if invoked && signo == SIGUSR1 as i32 {
+        println(b"SIGHANDLER_INVOKE:OK");
+    } else if invoked {
+        print(b"SIGHANDLER_INVOKE:FAIL: handler invoked but signo wrong, got ");
+        print_num(signo as i64);
+    } else {
+        println(b"SIGHANDLER_INVOKE:FAIL: handler not invoked");
     }
 }

@@ -84,6 +84,7 @@ pub fn sys_clone(
         tls,
         pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
         exit_signal,
+        cgroup_fd: -1, // CLONE_INTO_CGROUP only supported via clone3
     };
 
     // Get frame allocator
@@ -129,6 +130,7 @@ pub fn sys_clone(
         tls,
         pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
         exit_signal,
+        cgroup_fd: -1, // CLONE_INTO_CGROUP only supported via clone3
     };
 
     // Get frame allocator
@@ -175,6 +177,7 @@ pub fn sys_fork() -> i64 {
         tls: 0,
         pidfd_ptr: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // fork sends SIGCHLD on exit
+        cgroup_fd: -1,
     };
 
     // Get frame allocator
@@ -212,6 +215,7 @@ pub fn sys_fork() -> i64 {
         tls: 0,
         pidfd_ptr: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // fork sends SIGCHLD on exit
+        cgroup_fd: -1,
     };
 
     // Get frame allocator
@@ -269,6 +273,7 @@ pub fn sys_vfork() -> i64 {
         tls: 0,
         pidfd_ptr: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // vfork sends SIGCHLD on exit
+        cgroup_fd: -1,
     };
 
     // Get frame allocator
@@ -308,6 +313,7 @@ pub fn sys_vfork() -> i64 {
         tls: 0,
         pidfd_ptr: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // vfork sends SIGCHLD on exit
+        cgroup_fd: -1,
     };
 
     // Get frame allocator
@@ -663,13 +669,14 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
     }
 
     // CLONE_INTO_CGROUP requires cgroup fd and VER2 size
-    if (args.flags & CLONE_INTO_CGROUP) != 0 {
+    let cgroup_fd = if (args.flags & CLONE_INTO_CGROUP) != 0 {
         if size < CLONE_ARGS_SIZE_VER2 as u64 {
             return KernelError::InvalidArgument.sysret();
         }
-        // We don't support CLONE_INTO_CGROUP yet
-        return KernelError::InvalidArgument.sysret();
-    }
+        args.cgroup as i32
+    } else {
+        -1
+    };
 
     // set_tid feature not supported
     if args.set_tid != 0 || args.set_tid_size != 0 {
@@ -716,6 +723,7 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         tls: args.tls,
         pidfd_ptr: args.pidfd,
         exit_signal: args.exit_signal as i32,
+        cgroup_fd,
     };
 
     // Get frame allocator
@@ -766,13 +774,14 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
     }
 
     // CLONE_INTO_CGROUP requires cgroup fd and VER2 size
-    if (args.flags & CLONE_INTO_CGROUP) != 0 {
+    let cgroup_fd = if (args.flags & CLONE_INTO_CGROUP) != 0 {
         if size < CLONE_ARGS_SIZE_VER2 as u64 {
             return KernelError::InvalidArgument.sysret();
         }
-        // We don't support CLONE_INTO_CGROUP yet
-        return KernelError::InvalidArgument.sysret();
-    }
+        args.cgroup as i32
+    } else {
+        -1
+    };
 
     // set_tid feature not supported
     if args.set_tid != 0 || args.set_tid_size != 0 {
@@ -819,6 +828,7 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         tls: args.tls,
         pidfd_ptr: args.pidfd,
         exit_signal: args.exit_signal as i32,
+        cgroup_fd,
     };
 
     // Get frame allocator
