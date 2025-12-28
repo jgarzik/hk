@@ -435,6 +435,8 @@ pub const SYS_PERSONALITY: u64 = 92;
 // System logging
 /// syslog(type, buf, len) - Read/control kernel message ring buffer
 pub const SYS_SYSLOG: u64 = 116;
+/// ptrace(request, pid, addr, data) - Process tracing
+pub const SYS_PTRACE: u64 = 117;
 
 // TTY control
 /// vhangup() - Simulate hangup on controlling terminal
@@ -894,6 +896,9 @@ pub fn aarch64_syscall_dispatch(
             use crate::task::syscall::sys_syslog;
             sys_syslog::<Uaccess>(arg0 as i32, arg1, arg2 as i32) as u64
         }
+
+        // Process tracing/debugging
+        SYS_PTRACE => crate::task::ptrace::sys_ptrace(arg0 as i64, arg1 as i64, arg2, arg3) as u64,
 
         // TTY control
         SYS_VHANGUP => crate::tty::sys_vhangup() as u64,

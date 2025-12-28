@@ -447,6 +447,12 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         // I/O port permissions (x86-64 only, kernel threads don't use I/O ports)
         #[cfg(target_arch = "x86_64")]
         iopl_emul: 0,
+        // Ptrace state (kernel threads are not traced)
+        ptrace: 0,
+        ptracer_tid: None,
+        real_parent_tid: 0,
+        ptrace_message: 0,
+        ptrace_options: 0,
     };
 
     // Add task to global table
@@ -570,6 +576,12 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         // I/O port permissions (x86-64 only, no I/O port access initially)
         #[cfg(target_arch = "x86_64")]
         iopl_emul: 0,
+        // Ptrace state (not traced initially)
+        ptrace: 0,
+        ptracer_tid: None,
+        real_parent_tid: config.ppid,
+        ptrace_message: 0,
+        ptrace_options: 0,
     };
 
     // Add to global table
@@ -1084,6 +1096,13 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         // I/O port permissions (x86-64 only, inherited from parent)
         #[cfg(target_arch = "x86_64")]
         iopl_emul: parent_iopl_emul,
+        // Ptrace state (not traced initially, even if parent is traced)
+        // Ptrace is not inherited - tracer must explicitly attach to child
+        ptrace: 0,
+        ptracer_tid: None,
+        real_parent_tid: child_ppid,
+        ptrace_message: 0,
+        ptrace_options: 0,
     };
 
     // Add to global task table

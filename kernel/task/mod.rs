@@ -8,6 +8,7 @@ pub mod percpu;
 pub mod pgrp;
 pub mod proc;
 pub mod process_vm;
+pub mod ptrace;
 pub mod sched;
 pub mod schedsys;
 pub mod syscall;
@@ -490,6 +491,8 @@ pub enum TaskState {
     Running,
     /// Sleeping/waiting
     Sleeping,
+    /// Stopped for ptrace (signal number that caused stop)
+    Traced(i32),
     /// Exited with status
     Zombie(i32),
 }
@@ -977,6 +980,27 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// This is an emulation of the CPU IOPL mechanism, stored per-task.
     #[cfg(target_arch = "x86_64")]
     pub iopl_emul: u8,
+
+    // =========================================================================
+    // Ptrace state (like Linux task_struct ptrace fields)
+    // =========================================================================
+    /// Ptrace flags (PT_PTRACED, PT_SEIZED, PT_SYSCALL_TRACE, PT_SINGLESTEP)
+    /// 0 = not traced, non-zero = traced with flags
+    pub ptrace: u32,
+
+    /// Current ptrace parent (tracer) TID
+    /// Only valid when ptrace != 0
+    pub ptracer_tid: Option<Tid>,
+
+    /// Real parent TID (preserved for detach restoration)
+    /// When ptracing, parent may be changed to tracer; real_parent stays original
+    pub real_parent_tid: Tid,
+
+    /// Message for PTRACE_GETEVENTMSG (child PID, exec old TID, exit code, etc.)
+    pub ptrace_message: u64,
+
+    /// Ptrace options (PTRACE_O_TRACESYSGOOD, etc.)
+    pub ptrace_options: u32,
 }
 
 impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {

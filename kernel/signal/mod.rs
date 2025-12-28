@@ -1108,7 +1108,8 @@ pub fn do_signal() -> bool {
         }
         SigHandler::Handler(_) => {
             // Get current blocked mask
-            let blocked = with_task_signal_state(tid, |state| state.blocked).unwrap_or(SigSet::EMPTY);
+            let blocked =
+                with_task_signal_state(tid, |state| state.blocked).unwrap_or(SigSet::EMPTY);
 
             // Set up signal frame
             match signal::setup_rt_frame(sig, &action, blocked) {
@@ -1163,7 +1164,8 @@ pub fn do_signal() -> bool {
         }
         SigHandler::Handler(_) => {
             // Get current blocked mask
-            let blocked = with_task_signal_state(tid, |state| state.blocked).unwrap_or(SigSet::EMPTY);
+            let blocked =
+                with_task_signal_state(tid, |state| state.blocked).unwrap_or(SigSet::EMPTY);
 
             // Set up signal frame
             match signal::setup_rt_frame(sig, &action, blocked) {

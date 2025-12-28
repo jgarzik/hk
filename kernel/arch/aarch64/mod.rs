@@ -16,6 +16,7 @@ pub mod irq;
 pub mod paging;
 pub mod percpu;
 pub mod power;
+pub mod ptrace;
 pub mod rtc;
 pub mod serial;
 pub mod signal;

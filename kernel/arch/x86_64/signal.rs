@@ -15,8 +15,8 @@
 #![allow(dead_code)]
 
 use crate::arch::Uaccess;
-use crate::signal::{sa_flags, SigAction, SigHandler, SigSet};
-use crate::uaccess::{copy_from_user, copy_to_user, UaccessArch};
+use crate::signal::{SigAction, SigHandler, SigSet, sa_flags};
+use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 
 // =============================================================================
 // Signal Context (sigcontext)
@@ -251,7 +251,7 @@ pub fn setup_rt_frame(sig: u32, action: &SigAction, blocked: SigSet) -> Result<(
         rbp,
         rbx,
         rdx,
-        rax: 0, // Will be syscall return value, not important for signal context
+        rax: 0,        // Will be syscall return value, not important for signal context
         rcx: user_rip, // RCX was overwritten by syscall with RIP
         rsp: user_rsp,
         rip: user_rip,
@@ -302,8 +302,9 @@ pub fn setup_rt_frame(sig: u32, action: &SigAction, blocked: SigSet) -> Result<(
     };
 
     // Copy frame to user stack
-    let frame_bytes =
-        unsafe { core::slice::from_raw_parts(&frame as *const RtSigFrame as *const u8, frame_size) };
+    let frame_bytes = unsafe {
+        core::slice::from_raw_parts(&frame as *const RtSigFrame as *const u8, frame_size)
+    };
 
     if copy_to_user::<Uaccess>(frame_addr, frame_bytes).is_err() {
         return Err(-14); // EFAULT

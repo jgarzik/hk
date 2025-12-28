@@ -497,6 +497,10 @@ pub const SYS_IOPRIO_GET: u64 = 252;
 pub const SYS_PRCTL: u64 = 157;
 /// arch_prctl(code, addr) - Architecture-specific thread state
 pub const SYS_ARCH_PRCTL: u64 = 158;
+
+// Ptrace (debugging/tracing)
+/// ptrace(request, pid, addr, data) - Process tracing
+pub const SYS_PTRACE: u64 = 101;
 /// set_tid_address(tidptr) - Set pointer for child thread ID on exit
 pub const SYS_SET_TID_ADDRESS: u64 = 218;
 /// seccomp(operation, flags, args) - Operate on Secure Computing state
@@ -1813,6 +1817,9 @@ pub fn x86_64_syscall_dispatch(
             use crate::task::syscall::sys_arch_prctl;
             sys_arch_prctl(arg0 as i32, arg1) as u64
         }
+
+        // Ptrace (debugging/tracing)
+        SYS_PTRACE => crate::task::ptrace::sys_ptrace(arg0 as i64, arg1 as i64, arg2, arg3) as u64,
         SYS_SET_TID_ADDRESS => {
             use crate::task::syscall::sys_set_tid_address;
             sys_set_tid_address(arg0) as u64

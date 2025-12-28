@@ -12,8 +12,8 @@
 #![allow(dead_code)]
 
 use crate::arch::Uaccess;
-use crate::signal::{sa_flags, SigAction, SigHandler, SigSet};
-use crate::uaccess::{copy_from_user, copy_to_user, UaccessArch};
+use crate::signal::{SigAction, SigHandler, SigSet, sa_flags};
+use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 
 // =============================================================================
 // Signal Context (sigcontext)
@@ -155,7 +155,6 @@ const SI_USER: i32 = 0;
 /// SS_DISABLE flag for stack_t
 const SS_DISABLE: i32 = 2;
 
-
 /// Set up signal frame on user stack
 ///
 /// This function:
@@ -275,10 +274,10 @@ pub fn setup_rt_frame(sig: u32, action: &SigAction, blocked: SigSet) -> Result<(
         let percpu_mut = percpu::current_cpu_mut();
         percpu_mut.syscall_user_sp = frame_addr;
         percpu_mut.syscall_user_elr = handler;
-        percpu_mut.syscall_user_regs[0] = sig as u64;      // x0 = signal number
-        percpu_mut.syscall_user_regs[1] = info_addr;       // x1 = &siginfo
-        percpu_mut.syscall_user_regs[2] = uc_addr;         // x2 = &ucontext
-        percpu_mut.syscall_user_regs[30] = restorer;       // x30 (LR) = restorer
+        percpu_mut.syscall_user_regs[0] = sig as u64; // x0 = signal number
+        percpu_mut.syscall_user_regs[1] = info_addr; // x1 = &siginfo
+        percpu_mut.syscall_user_regs[2] = uc_addr; // x2 = &ucontext
+        percpu_mut.syscall_user_regs[30] = restorer; // x30 (LR) = restorer
         // Clear other argument registers for security
         percpu_mut.syscall_user_regs[3] = 0;
         percpu_mut.syscall_user_regs[4] = 0;
@@ -355,7 +354,8 @@ pub fn sys_rt_sigreturn() -> i64 {
     if copy_from_user::<Uaccess>(&mut sc_bytes, mcontext_addr, minimal_size).is_err() {
         return -14; // EFAULT
     }
-    let sc: SigContextMinimal = unsafe { core::ptr::read(sc_bytes.as_ptr() as *const SigContextMinimal) };
+    let sc: SigContextMinimal =
+        unsafe { core::ptr::read(sc_bytes.as_ptr() as *const SigContextMinimal) };
 
     // Restore blocked signal mask
     let tid = crate::task::percpu::current_tid();

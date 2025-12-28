@@ -552,25 +552,25 @@ pub fn update_syscall_return_frame(frame_base: *mut u64) {
             percpu_mut.signal_context_modified = false;
 
             // Update RIP (stored in RCX slot for sysretq)
-            *frame_base.add(14) = percpu_mut.syscall_user_rip;  // offset 112
+            *frame_base.add(14) = percpu_mut.syscall_user_rip; // offset 112
             // Update RFLAGS (stored in R11 slot for sysretq)
-            *frame_base.add(13) = percpu_mut.syscall_user_rflags;  // offset 104
+            *frame_base.add(13) = percpu_mut.syscall_user_rflags; // offset 104
             // Update RSP
-            *frame_base.add(15) = percpu_mut.syscall_user_rsp;  // offset 120
+            *frame_base.add(15) = percpu_mut.syscall_user_rsp; // offset 120
             // Update argument registers (for signal handler args)
-            *frame_base.add(5) = percpu_mut.syscall_user_rdi;   // offset 40
-            *frame_base.add(4) = percpu_mut.syscall_user_rsi;   // offset 32
-            *frame_base.add(3) = percpu_mut.syscall_user_rdx;   // offset 24
-            *frame_base.add(1) = percpu_mut.syscall_user_r8;    // offset 8
-            *frame_base.add(0) = percpu_mut.syscall_user_r9;    // offset 0
-            *frame_base.add(2) = percpu_mut.syscall_user_r10;   // offset 16
+            *frame_base.add(5) = percpu_mut.syscall_user_rdi; // offset 40
+            *frame_base.add(4) = percpu_mut.syscall_user_rsi; // offset 32
+            *frame_base.add(3) = percpu_mut.syscall_user_rdx; // offset 24
+            *frame_base.add(1) = percpu_mut.syscall_user_r8; // offset 8
+            *frame_base.add(0) = percpu_mut.syscall_user_r9; // offset 0
+            *frame_base.add(2) = percpu_mut.syscall_user_r10; // offset 16
             // Update callee-saved registers (needed for rt_sigreturn context restore)
-            *frame_base.add(12) = percpu_mut.syscall_user_rbx;  // offset 96
-            *frame_base.add(11) = percpu_mut.syscall_user_rbp;  // offset 88
-            *frame_base.add(10) = percpu_mut.syscall_user_r12;  // offset 80
-            *frame_base.add(9) = percpu_mut.syscall_user_r13;   // offset 72
-            *frame_base.add(8) = percpu_mut.syscall_user_r14;   // offset 64
-            *frame_base.add(7) = percpu_mut.syscall_user_r15;   // offset 56
+            *frame_base.add(12) = percpu_mut.syscall_user_rbx; // offset 96
+            *frame_base.add(11) = percpu_mut.syscall_user_rbp; // offset 88
+            *frame_base.add(10) = percpu_mut.syscall_user_r12; // offset 80
+            *frame_base.add(9) = percpu_mut.syscall_user_r13; // offset 72
+            *frame_base.add(8) = percpu_mut.syscall_user_r14; // offset 64
+            *frame_base.add(7) = percpu_mut.syscall_user_r15; // offset 56
         }
     }
 }
