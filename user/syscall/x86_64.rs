@@ -165,6 +165,7 @@ pub const SYS_MUNMAP: u64 = 11;
 pub const SYS_BRK: u64 = 12;
 pub const SYS_RT_SIGACTION: u64 = 13;
 pub const SYS_RT_SIGPROCMASK: u64 = 14;
+pub const SYS_RT_SIGRETURN: u64 = 15;
 pub const SYS_IOCTL: u64 = 16;
 pub const SYS_PREAD64: u64 = 17;
 pub const SYS_PWRITE64: u64 = 18;
@@ -1083,6 +1084,20 @@ pub fn sys_rt_sigsuspend(mask: u64, sigsetsize: u64) -> i64 {
 #[inline(always)]
 pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
     unsafe { syscall4!(SYS_RT_TGSIGQUEUEINFO, tgid, tid, sig, uinfo) }
+}
+
+/// rt_sigreturn() - return from signal handler
+///
+/// This syscall is called by the signal trampoline to restore the
+/// context saved before the signal handler was invoked.
+/// It never returns on success.
+#[inline(always)]
+pub fn sys_rt_sigreturn() -> ! {
+    unsafe {
+        syscall0!(SYS_RT_SIGRETURN);
+        // Should never reach here - kernel restores context
+        core::hint::unreachable_unchecked()
+    }
 }
 
 // --- Pipe/Poll/Select ---

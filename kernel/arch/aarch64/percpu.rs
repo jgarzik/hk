@@ -63,6 +63,10 @@ pub struct PerCpu {
 
     /// Saved user GPRs x0-x30 from syscall entry (for fork/clone)
     pub syscall_user_regs: [u64; 31],
+
+    /// Flag set when signal delivery modifies the return context
+    /// When true, the syscall return path should update the stack frame from percpu
+    pub signal_context_modified: bool,
 }
 
 // Safety: PerCpu is only accessed by its owning CPU
@@ -89,6 +93,7 @@ impl PerCpu {
             syscall_user_spsr: 0,
             syscall_user_sp: 0,
             syscall_user_regs: [0; 31],
+            signal_context_modified: false,
         }
     }
 
@@ -113,6 +118,7 @@ impl PerCpu {
         self.syscall_user_spsr = 0;
         self.syscall_user_sp = 0;
         self.syscall_user_regs = [0; 31];
+        self.signal_context_modified = false;
     }
 
     /// Mark this CPU as online
@@ -302,4 +308,40 @@ pub fn preempt_count() -> u32 {
     try_current_cpu()
         .map(|percpu| percpu.preempt_count.load(Ordering::Relaxed))
         .unwrap_or(0)
+}
+
+// ============================================================================
+// Syscall user state accessors (for signal handling)
+// ============================================================================
+
+/// Get saved syscall user ELR (return address/PC)
+#[inline]
+pub fn get_syscall_user_elr() -> u64 {
+    try_current_cpu()
+        .map(|percpu| percpu.syscall_user_elr)
+        .unwrap_or(0)
+}
+
+/// Get saved syscall user SPSR (processor state)
+#[inline]
+pub fn get_syscall_user_spsr() -> u64 {
+    try_current_cpu()
+        .map(|percpu| percpu.syscall_user_spsr)
+        .unwrap_or(0)
+}
+
+/// Get saved syscall user SP (stack pointer)
+#[inline]
+pub fn get_syscall_user_sp() -> u64 {
+    try_current_cpu()
+        .map(|percpu| percpu.syscall_user_sp)
+        .unwrap_or(0)
+}
+
+/// Get saved syscall user registers (x0-x30)
+#[inline]
+pub fn get_syscall_user_regs() -> [u64; 31] {
+    try_current_cpu()
+        .map(|percpu| percpu.syscall_user_regs)
+        .unwrap_or([0; 31])
 }

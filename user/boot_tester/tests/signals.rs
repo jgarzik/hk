@@ -23,8 +23,8 @@ use hk_syscall::{
     sys_rt_sigaction, sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigqueueinfo,
     sys_rt_sigsuspend, sys_rt_sigtimedwait, sys_rt_tgsigqueueinfo, sys_sigaltstack,
     sys_tgkill, sys_tkill, sys_wait4, sys_write,
-    CLONE_CLEAR_SIGHAND, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_UNBLOCK, SIGCHLD, SIGKILL, SIGPIPE,
-    SIGUSR1,
+    CLONE_CLEAR_SIGHAND, SA_RESTORER, SA_SIGINFO, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_UNBLOCK,
+    SIGCHLD, SIGKILL, SIGPIPE, SIGUSR1,
 };
 
 /// SI_QUEUE signal code (for rt_sigqueueinfo)
@@ -78,6 +78,7 @@ pub fn run_tests() {
     test_kill_pgrp_zero();
     test_kill_pgrp_neg();
     test_sigpipe_broken_pipe();
+    test_signal_handler_invocation();
 }
 
 /// Test 74: rt_sigprocmask() - get and set signal mask
@@ -638,5 +639,144 @@ fn test_sigpipe_broken_pipe() {
     } else {
         print(b"SIGPIPE_PIPE:FAIL: expected -32 (EPIPE), got ");
         print_num(write_ret);
+    }
+}
+
+// ============================================================================
+// Signal Handler Invocation Tests
+// ============================================================================
+
+/// Global volatile flag to track if signal handler was invoked
+static mut HANDLER_INVOKED: bool = false;
+
+/// Global to store siginfo signal number for verification
+static mut RECEIVED_SIGNO: i32 = 0;
+
+/// sigaction structure for signal handler registration
+/// Layout: [handler, flags, restorer, mask]
+#[repr(C)]
+struct SigActionData {
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    mask: u64,
+}
+
+/// Signal restorer trampoline that calls rt_sigreturn
+///
+/// This function is set as SA_RESTORER and will be jumped to
+/// when the signal handler returns. It then calls rt_sigreturn
+/// to restore the original context.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn signal_restorer() -> ! {
+    core::arch::naked_asm!(
+        "mov rax, 15",  // SYS_rt_sigreturn
+        "syscall",
+        "ud2"           // Should never reach here
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn signal_restorer() -> ! {
+    core::arch::naked_asm!(
+        "mov x8, 139",  // SYS_rt_sigreturn
+        "svc 0",
+        "brk 0"         // Should never reach here
+    )
+}
+
+/// Simple signal handler that sets the global flag
+///
+/// For SA_SIGINFO handlers: fn(signo: i32, info: *const SigInfo, ucontext: *const u8)
+extern "C" fn test_signal_handler(signo: i32, _info: *const SigInfo, _ucontext: *const u8) {
+    unsafe {
+        core::ptr::write_volatile(&raw mut HANDLER_INVOKED, true);
+        core::ptr::write_volatile(&raw mut RECEIVED_SIGNO, signo);
+    }
+}
+
+/// Test: Signal handler invocation with SA_SIGINFO
+///
+/// This test:
+/// 1. Registers a signal handler with SA_SIGINFO and SA_RESTORER
+/// 2. Sends SIGUSR1 to self
+/// 3. Verifies the handler was invoked
+/// 4. Verifies the signo received matches
+fn test_signal_handler_invocation() {
+    // Reset global state
+    unsafe {
+        core::ptr::write_volatile(&raw mut HANDLER_INVOKED, false);
+        core::ptr::write_volatile(&raw mut RECEIVED_SIGNO, 0);
+    }
+
+    // Set up sigaction with our handler
+    let action = SigActionData {
+        handler: test_signal_handler as *const () as u64,
+        flags: SA_SIGINFO | SA_RESTORER,
+        restorer: signal_restorer as *const () as u64,
+        mask: 0,
+    };
+
+    let mut old_action = SigActionData {
+        handler: 0,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+
+    // Register the handler
+    let ret = sys_rt_sigaction(
+        SIGUSR1,
+        &action as *const SigActionData as u64,
+        &mut old_action as *mut SigActionData as u64,
+        8,
+    );
+
+    if ret != 0 {
+        print(b"SIGHANDLER_INVOKE:FAIL: sigaction failed, ret = ");
+        print_num(ret);
+        return;
+    }
+
+    // Send SIGUSR1 to ourselves
+    let pid = sys_getpid();
+    let kill_ret = sys_kill(pid, SIGUSR1);
+
+    if kill_ret != 0 {
+        print(b"SIGHANDLER_INVOKE:FAIL: kill failed, ret = ");
+        print_num(kill_ret);
+        // Restore default handler
+        let default_action = SigActionData {
+            handler: SIG_DFL,
+            flags: 0,
+            restorer: 0,
+            mask: 0,
+        };
+        sys_rt_sigaction(SIGUSR1, &default_action as *const SigActionData as u64, 0, 8);
+        return;
+    }
+
+    // Check if handler was invoked
+    let invoked = unsafe { core::ptr::read_volatile(&raw const HANDLER_INVOKED) };
+    let signo = unsafe { core::ptr::read_volatile(&raw const RECEIVED_SIGNO) };
+
+    // Restore default handler
+    let default_action = SigActionData {
+        handler: SIG_DFL,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+    sys_rt_sigaction(SIGUSR1, &default_action as *const SigActionData as u64, 0, 8);
+
+    if invoked && signo == SIGUSR1 as i32 {
+        println(b"SIGHANDLER_INVOKE:OK");
+    } else if invoked {
+        print(b"SIGHANDLER_INVOKE:FAIL: handler invoked but signo wrong, got ");
+        print_num(signo as i64);
+    } else {
+        println(b"SIGHANDLER_INVOKE:FAIL: handler not invoked");
     }
 }

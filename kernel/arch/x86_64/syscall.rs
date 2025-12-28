@@ -923,7 +923,21 @@ unsafe extern "C" fn syscall_entry() {
         // [RSP + 32] = rsi
         // [RSP + 40] = rdi
         // [RSP + 48] = rax (return value slot)
+        // [RSP + 56] = r15
+        // [RSP + 64] = r14
+        // [RSP + 72] = r13
+        // [RSP + 80] = r12
+        // [RSP + 88] = rbp
+        // [RSP + 96] = rbx
+        // [RSP + 104] = r11 (user RFLAGS)
+        // [RSP + 112] = rcx (user RIP)
+        // [RSP + 120] = user_rsp
         "mov [rsp + 48], rax",
+
+        // Update stack frame from percpu if signal delivery modified the context
+        // Pass RSP as the frame base pointer
+        "mov rdi, rsp",
+        "call {update_frame}",
 
         // Restore caller-saved registers (in reverse order of pushes)
         // Push order was: rax, rdi, rsi, rdx, r10, r8, r9
@@ -981,6 +995,7 @@ unsafe extern "C" fn syscall_entry() {
         kstack = sym SYSCALL_KERNEL_STACK,
         save_syscall_state = sym super::percpu::save_syscall_state,
         save_syscall_caller_saved = sym super::percpu::save_syscall_caller_saved,
+        update_frame = sym super::percpu::update_syscall_return_frame,
     );
 }
 
@@ -1727,6 +1742,7 @@ pub fn x86_64_syscall_dispatch(
             crate::signal::syscall::sys_rt_sigqueueinfo(arg0 as i64, arg1 as u32, arg2) as u64
         }
         SYS_RT_SIGSUSPEND => crate::signal::syscall::sys_rt_sigsuspend(arg0, arg1) as u64,
+        SYS_RT_SIGRETURN => super::signal::sys_rt_sigreturn() as u64,
         SYS_RT_TGSIGQUEUEINFO => crate::signal::syscall::sys_rt_tgsigqueueinfo(
             arg0 as i64,
             arg1 as i64,
@@ -1987,6 +2003,10 @@ pub fn x86_64_syscall_dispatch(
 
         _ => (-38i64) as u64, // ENOSYS
     };
+
+    // Check for pending signals before returning to userspace
+    // This may modify the saved user context to invoke the signal handler
+    crate::signal::do_signal();
 
     // Account for exiting kernel mode
     percpu::account_syscall_exit();

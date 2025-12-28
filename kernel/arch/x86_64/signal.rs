@@ -12,11 +12,11 @@
 //! When the handler returns, it executes the trampoline which calls rt_sigreturn
 //! to restore the original context.
 
-// Signal frame structures are infrastructure for future signal delivery.
-// They will be used when we implement setup_rt_frame() and rt_sigreturn.
 #![allow(dead_code)]
 
-use crate::signal::SigSet;
+use crate::arch::Uaccess;
+use crate::signal::{sa_flags, SigAction, SigHandler, SigSet};
+use crate::uaccess::{copy_from_user, copy_to_user, UaccessArch};
 
 // =============================================================================
 // Signal Context (sigcontext)
@@ -177,7 +177,7 @@ pub struct RtSigFrame {
 }
 
 // =============================================================================
-// Signal Frame Setup (stub - full implementation requires uaccess)
+// Signal Frame Setup
 // =============================================================================
 
 /// Calculate signal frame size
@@ -185,28 +185,229 @@ pub const fn signal_frame_size() -> usize {
     core::mem::size_of::<RtSigFrame>()
 }
 
-/// Set up signal frame on user stack (stub)
+/// User code segment selector
+const USER_CS: u16 = 0x23; // RPL=3, index=4
+/// User data segment selector
+const USER_SS: u16 = 0x1b; // RPL=3, index=3
+
+/// Set up signal frame on user stack
 ///
-/// This function would:
-/// 1. Calculate frame location on user stack (aligned)
-/// 2. Build siginfo and ucontext from current registers
-/// 3. Write frame to user memory
-/// 4. Return (new_rsp, handler_rip)
+/// This function:
+/// 1. Calculates frame location on user stack (16-byte aligned)
+/// 2. Builds siginfo and ucontext from saved registers
+/// 3. Writes frame to user memory
+/// 4. Updates percpu saved state to redirect to handler
 ///
-/// For now this is a stub - actual implementation requires:
-/// - Access to current trap frame
-/// - uaccess to write to user stack
-/// - Proper error handling for invalid stack
-#[allow(dead_code)]
-pub fn setup_rt_frame(
-    _sig: u32,
-    _handler: u64,
-    _restorer: u64,
-    _user_rsp: u64,
-    _user_rip: u64,
-    _user_rflags: u64,
-    _blocked: SigSet,
-) -> Result<(u64, u64), i32> {
-    // TODO: Full implementation
-    Err(-38) // ENOSYS
+/// Returns Ok(()) on success, Err(errno) on failure.
+pub fn setup_rt_frame(sig: u32, action: &SigAction, blocked: SigSet) -> Result<(), i32> {
+    use super::percpu;
+
+    // Get saved user state from percpu
+    let user_rip = percpu::get_syscall_user_rip();
+    let user_rflags = percpu::get_syscall_user_rflags();
+    let user_rsp = percpu::get_syscall_user_rsp();
+    let (rbx, rbp, r12, r13, r14, r15) = percpu::get_syscall_user_callee_saved();
+    let (rdi, rsi, rdx, r8, r9, r10) = percpu::get_syscall_user_caller_saved();
+
+    // Get handler address
+    let handler = match action.handler {
+        SigHandler::Handler(addr) => addr,
+        _ => return Err(-22), // EINVAL - not a handler
+    };
+
+    // Get restorer (trampoline that calls rt_sigreturn)
+    // If SA_RESTORER is set, use the provided restorer address
+    // Otherwise we'd need to provide a default trampoline
+    let restorer = if action.flags & sa_flags::SA_RESTORER != 0 {
+        action.restorer
+    } else {
+        // No restorer provided - signal delivery will fail
+        // In a real kernel we'd provide a VDSO trampoline
+        return Err(-22); // EINVAL
+    };
+
+    // Calculate frame size and location on user stack
+    // Frame must be 16-byte aligned (x86-64 ABI requirement)
+    let frame_size = signal_frame_size();
+    let frame_addr = (user_rsp - frame_size as u64) & !0xF;
+
+    // Validate user stack address
+    if !Uaccess::access_ok(frame_addr, frame_size) {
+        return Err(-14); // EFAULT
+    }
+
+    // Build SigContext from saved registers
+    let sigctx = SigContext {
+        r8,
+        r9,
+        r10,
+        r11: user_rflags, // R11 was overwritten by syscall with RFLAGS
+        r12,
+        r13,
+        r14,
+        r15,
+        rdi,
+        rsi,
+        rbp,
+        rbx,
+        rdx,
+        rax: 0, // Will be syscall return value, not important for signal context
+        rcx: user_rip, // RCX was overwritten by syscall with RIP
+        rsp: user_rsp,
+        rip: user_rip,
+        eflags: user_rflags,
+        cs: USER_CS,
+        gs: 0,
+        fs: 0,
+        ss: USER_SS,
+        err: 0,
+        trapno: 0,
+        oldmask: blocked.bits(),
+        cr2: 0,
+        fpstate: 0, // No FPU state saved for now
+        reserved: [0; 8],
+    };
+
+    // Build SigInfo
+    let siginfo = SigInfo {
+        si_signo: sig as i32,
+        si_errno: 0,
+        si_code: SI_USER,
+        _pad: 0,
+        _fields: [0; 14],
+    };
+
+    // Build StackT for ucontext (current stack info)
+    let stack_t = StackT {
+        ss_sp: 0,
+        ss_flags: SS_DISABLE,
+        _pad: 0,
+        ss_size: 0,
+    };
+
+    // Build UContext
+    let ucontext = UContext {
+        uc_flags: 0,
+        uc_link: 0,
+        uc_stack: stack_t,
+        uc_mcontext: sigctx,
+        uc_sigmask: blocked,
+    };
+
+    // Build the complete frame
+    let frame = RtSigFrame {
+        pretcode: restorer,
+        info: siginfo,
+        uc: ucontext,
+    };
+
+    // Copy frame to user stack
+    let frame_bytes =
+        unsafe { core::slice::from_raw_parts(&frame as *const RtSigFrame as *const u8, frame_size) };
+
+    if copy_to_user::<Uaccess>(frame_addr, frame_bytes).is_err() {
+        return Err(-14); // EFAULT
+    }
+
+    // Calculate addresses of info and ucontext within the frame
+    let info_offset = core::mem::offset_of!(RtSigFrame, info);
+    let uc_offset = core::mem::offset_of!(RtSigFrame, uc);
+    let info_addr = frame_addr + info_offset as u64;
+    let uc_addr = frame_addr + uc_offset as u64;
+
+    // Update percpu saved state to redirect execution to handler
+    // When syscall returns, it will:
+    // - RSP = frame_addr (points to pretcode, which is return address)
+    // - RIP = handler address
+    // - RDI = signal number (first argument)
+    // - RSI = &siginfo (second argument, for SA_SIGINFO)
+    // - RDX = &ucontext (third argument, for SA_SIGINFO)
+    unsafe {
+        let percpu_mut = percpu::current_cpu_mut();
+        percpu_mut.syscall_user_rsp = frame_addr;
+        percpu_mut.syscall_user_rip = handler;
+        percpu_mut.syscall_user_rdi = sig as u64;
+        percpu_mut.syscall_user_rsi = info_addr;
+        percpu_mut.syscall_user_rdx = uc_addr;
+        // Clear other argument registers for security
+        percpu_mut.syscall_user_r8 = 0;
+        percpu_mut.syscall_user_r9 = 0;
+        percpu_mut.syscall_user_r10 = 0;
+        // Signal that the return context was modified
+        percpu_mut.signal_context_modified = true;
+    }
+
+    Ok(())
+}
+
+/// Restore context from signal frame (sys_rt_sigreturn)
+///
+/// This function:
+/// 1. Reads the UContext from user stack
+/// 2. Restores blocked signal mask
+/// 3. Restores all saved registers to percpu
+///
+/// Returns the value that should be in RAX (usually -EINTR for interrupted syscall),
+/// or error code if restore fails.
+pub fn sys_rt_sigreturn() -> i64 {
+    use super::percpu;
+
+    // When the signal handler returns (via `ret`), the restorer's return address
+    // (pretcode) has been popped from the stack, so RSP has moved up by 8 bytes.
+    // The signal frame is 8 bytes below the current RSP.
+    // This matches Linux: frame = (struct rt_sigframe __user *)(regs->sp - sizeof(long))
+    let frame_addr = percpu::get_syscall_user_rsp() - 8;
+
+    // Calculate offset to UContext within frame
+    let uc_offset = core::mem::offset_of!(RtSigFrame, uc);
+    let uc_addr = frame_addr + uc_offset as u64;
+    let uc_size = core::mem::size_of::<UContext>();
+
+    // Validate address
+    if !Uaccess::access_ok(uc_addr, uc_size) {
+        return -14; // EFAULT
+    }
+
+    // Read UContext from user stack
+    let mut uc_bytes = [0u8; core::mem::size_of::<UContext>()];
+    if copy_from_user::<Uaccess>(&mut uc_bytes, uc_addr, uc_size).is_err() {
+        return -14; // EFAULT
+    }
+
+    // Safety: UContext is repr(C) and we read the correct size
+    let uc: UContext = unsafe { core::ptr::read(uc_bytes.as_ptr() as *const UContext) };
+
+    // Restore blocked signal mask
+    let tid = crate::task::percpu::current_tid();
+    crate::signal::with_task_signal_state(tid, |state| {
+        state.blocked = uc.uc_sigmask;
+        state.recalc_sigpending();
+    });
+
+    // Restore all registers from sigcontext to percpu
+    let sc = &uc.uc_mcontext;
+    unsafe {
+        let percpu_mut = percpu::current_cpu_mut();
+        percpu_mut.syscall_user_rip = sc.rip;
+        percpu_mut.syscall_user_rflags = sc.eflags;
+        percpu_mut.syscall_user_rsp = sc.rsp;
+        percpu_mut.syscall_user_rbx = sc.rbx;
+        percpu_mut.syscall_user_rbp = sc.rbp;
+        percpu_mut.syscall_user_r12 = sc.r12;
+        percpu_mut.syscall_user_r13 = sc.r13;
+        percpu_mut.syscall_user_r14 = sc.r14;
+        percpu_mut.syscall_user_r15 = sc.r15;
+        percpu_mut.syscall_user_rdi = sc.rdi;
+        percpu_mut.syscall_user_rsi = sc.rsi;
+        percpu_mut.syscall_user_rdx = sc.rdx;
+        percpu_mut.syscall_user_r8 = sc.r8;
+        percpu_mut.syscall_user_r9 = sc.r9;
+        percpu_mut.syscall_user_r10 = sc.r10;
+        // Signal that the return context was modified
+        percpu_mut.signal_context_modified = true;
+    }
+
+    // Return RAX from saved context
+    // This allows signal handler to modify the return value
+    uc.uc_mcontext.rax as i64
 }

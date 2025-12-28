@@ -1064,3 +1064,162 @@ fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool)
         child.signal = Some(child_signal);
     }
 }
+
+// =============================================================================
+// Signal Delivery Entry Point
+// =============================================================================
+
+/// Check for and deliver pending signals
+///
+/// This function is called from the syscall return path. It:
+/// 1. Checks if there are any deliverable signals
+/// 2. Dequeues the next signal
+/// 3. For user handlers, sets up the signal frame
+/// 4. For default actions, performs the action (terminate, stop, etc.)
+///
+/// Returns true if a signal was handled (frame set up or action taken),
+/// false if no signals were deliverable.
+#[cfg(target_arch = "x86_64")]
+pub fn do_signal() -> bool {
+    use crate::arch::x86_64::signal;
+
+    let tid = crate::task::percpu::current_tid();
+
+    // Check if there are pending signals
+    if !has_pending_signals(tid) {
+        return false;
+    }
+
+    // Get next deliverable signal
+    let (sig, action) = match get_signal_to_deliver(tid) {
+        Some((s, a)) => (s, a),
+        None => return false,
+    };
+
+    // Handle based on action type
+    match action.handler {
+        SigHandler::Default => {
+            // Perform default action
+            handle_default_action(tid, sig)
+        }
+        SigHandler::Ignore => {
+            // Signal ignored, nothing to do
+            false
+        }
+        SigHandler::Handler(_) => {
+            // Get current blocked mask
+            let blocked = with_task_signal_state(tid, |state| state.blocked).unwrap_or(SigSet::EMPTY);
+
+            // Set up signal frame
+            match signal::setup_rt_frame(sig, &action, blocked) {
+                Ok(()) => {
+                    // Update blocked mask: add action.mask and the signal itself (unless SA_NODEFER)
+                    with_task_signal_state(tid, |state| {
+                        state.blocked = state.blocked.union(&action.mask);
+                        if action.flags & sa_flags::SA_NODEFER == 0 {
+                            state.blocked.add(sig);
+                        }
+                        state.recalc_sigpending();
+                    });
+                    true
+                }
+                Err(_) => {
+                    // Frame setup failed (invalid stack) - force SIGSEGV
+                    force_sigsegv(tid);
+                    true
+                }
+            }
+        }
+    }
+}
+
+/// Check for and deliver pending signals (aarch64 version)
+#[cfg(target_arch = "aarch64")]
+pub fn do_signal() -> bool {
+    use crate::arch::aarch64::signal;
+
+    let tid = crate::task::percpu::current_tid();
+
+    // Check if there are pending signals
+    if !has_pending_signals(tid) {
+        return false;
+    }
+
+    // Get next deliverable signal
+    let (sig, action) = match get_signal_to_deliver(tid) {
+        Some((s, a)) => (s, a),
+        None => return false,
+    };
+
+    // Handle based on action type
+    match action.handler {
+        SigHandler::Default => {
+            // Perform default action
+            handle_default_action(tid, sig)
+        }
+        SigHandler::Ignore => {
+            // Signal ignored, nothing to do
+            false
+        }
+        SigHandler::Handler(_) => {
+            // Get current blocked mask
+            let blocked = with_task_signal_state(tid, |state| state.blocked).unwrap_or(SigSet::EMPTY);
+
+            // Set up signal frame
+            match signal::setup_rt_frame(sig, &action, blocked) {
+                Ok(()) => {
+                    // Update blocked mask: add action.mask and the signal itself (unless SA_NODEFER)
+                    with_task_signal_state(tid, |state| {
+                        state.blocked = state.blocked.union(&action.mask);
+                        if action.flags & sa_flags::SA_NODEFER == 0 {
+                            state.blocked.add(sig);
+                        }
+                        state.recalc_sigpending();
+                    });
+                    true
+                }
+                Err(_) => {
+                    // Frame setup failed (invalid stack) - force SIGSEGV
+                    force_sigsegv(tid);
+                    true
+                }
+            }
+        }
+    }
+}
+
+/// Handle default signal action
+fn handle_default_action(_tid: Tid, sig: u32) -> bool {
+    match default_action(sig) {
+        DefaultAction::Terminate | DefaultAction::Core => {
+            // Terminate the process with signal exit status
+            // Signal exit status is (signal | 0x80) by convention
+            crate::task::proc::sys_exit((sig as i32) | 0x80);
+            true
+        }
+        DefaultAction::Stop => {
+            // TODO: Implement process stop
+            // For now, just ignore
+            false
+        }
+        DefaultAction::Continue => {
+            // TODO: Implement process continue
+            // For now, just ignore
+            false
+        }
+        DefaultAction::Ignore => {
+            // Signal ignored
+            false
+        }
+    }
+}
+
+/// Force delivery of SIGSEGV (for stack errors during signal setup)
+fn force_sigsegv(tid: Tid) {
+    // Reset SIGSEGV to default action
+    if let Some(sighand) = get_task_sighand(tid) {
+        let _ = sighand.set_action(SIGSEGV, SigAction::default());
+    }
+    // Send SIGSEGV to self
+    send_signal(tid, SIGSEGV);
+}

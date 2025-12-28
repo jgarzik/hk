@@ -87,6 +87,10 @@ pub struct PerCpu {
     pub syscall_user_r8: u64,
     pub syscall_user_r9: u64,
     pub syscall_user_r10: u64,
+
+    /// Flag set when signal delivery modifies the return context
+    /// When true, the syscall return path should update the stack frame from percpu
+    pub signal_context_modified: bool,
 }
 
 impl PerCpu {
@@ -120,6 +124,7 @@ impl PerCpu {
             syscall_user_r8: 0,
             syscall_user_r9: 0,
             syscall_user_r10: 0,
+            signal_context_modified: false,
         }
     }
 
@@ -145,6 +150,7 @@ impl PerCpu {
         self.syscall_user_r13 = 0;
         self.syscall_user_r14 = 0;
         self.syscall_user_r15 = 0;
+        self.signal_context_modified = false;
         // Don't set is_online yet - that happens after full init
     }
 
@@ -505,6 +511,68 @@ pub fn get_syscall_user_caller_saved() -> (u64, u64, u64, u64, u64, u64) {
             )
         })
         .unwrap_or((0, 0, 0, 0, 0, 0))
+}
+
+/// Update syscall return frame from percpu saved state
+///
+/// Called from syscall exit path to apply any modifications made by
+/// signal delivery (setup_rt_frame) to the stack frame that will be
+/// restored on return to userspace.
+///
+/// Only updates the frame if signal_context_modified is set, indicating
+/// that signal delivery has redirected execution to a handler.
+///
+/// Stack frame layout (passed as frame_base):
+///   frame_base+0:  r9
+///   frame_base+8:  r8
+///   frame_base+16: r10
+///   frame_base+24: rdx
+///   frame_base+32: rsi
+///   frame_base+40: rdi
+///   frame_base+48: rax (return value)
+///   frame_base+56: r15
+///   frame_base+64: r14
+///   frame_base+72: r13
+///   frame_base+80: r12
+///   frame_base+88: rbp
+///   frame_base+96: rbx
+///   frame_base+104: r11 (user RFLAGS)
+///   frame_base+112: rcx (user RIP)
+///   frame_base+120: user_rsp
+#[inline]
+pub fn update_syscall_return_frame(frame_base: *mut u64) {
+    if let Some(_percpu) = try_current_cpu() {
+        unsafe {
+            let percpu_mut = current_cpu_mut();
+            // Only update if signal delivery modified the context
+            if !percpu_mut.signal_context_modified {
+                return;
+            }
+            // Clear the flag
+            percpu_mut.signal_context_modified = false;
+
+            // Update RIP (stored in RCX slot for sysretq)
+            *frame_base.add(14) = percpu_mut.syscall_user_rip;  // offset 112
+            // Update RFLAGS (stored in R11 slot for sysretq)
+            *frame_base.add(13) = percpu_mut.syscall_user_rflags;  // offset 104
+            // Update RSP
+            *frame_base.add(15) = percpu_mut.syscall_user_rsp;  // offset 120
+            // Update argument registers (for signal handler args)
+            *frame_base.add(5) = percpu_mut.syscall_user_rdi;   // offset 40
+            *frame_base.add(4) = percpu_mut.syscall_user_rsi;   // offset 32
+            *frame_base.add(3) = percpu_mut.syscall_user_rdx;   // offset 24
+            *frame_base.add(1) = percpu_mut.syscall_user_r8;    // offset 8
+            *frame_base.add(0) = percpu_mut.syscall_user_r9;    // offset 0
+            *frame_base.add(2) = percpu_mut.syscall_user_r10;   // offset 16
+            // Update callee-saved registers (needed for rt_sigreturn context restore)
+            *frame_base.add(12) = percpu_mut.syscall_user_rbx;  // offset 96
+            *frame_base.add(11) = percpu_mut.syscall_user_rbp;  // offset 88
+            *frame_base.add(10) = percpu_mut.syscall_user_r12;  // offset 80
+            *frame_base.add(9) = percpu_mut.syscall_user_r13;   // offset 72
+            *frame_base.add(8) = percpu_mut.syscall_user_r14;   // offset 64
+            *frame_base.add(7) = percpu_mut.syscall_user_r15;   // offset 56
+        }
+    }
 }
 
 // ============================================================================

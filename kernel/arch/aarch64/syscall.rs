@@ -945,6 +945,7 @@ pub fn aarch64_syscall_dispatch(
             crate::signal::syscall::sys_rt_sigqueueinfo(arg0 as i64, arg1 as u32, arg2) as u64
         }
         SYS_RT_SIGSUSPEND => crate::signal::syscall::sys_rt_sigsuspend(arg0, arg1) as u64,
+        SYS_RT_SIGRETURN => super::signal::sys_rt_sigreturn() as u64,
         SYS_RT_TGSIGQUEUEINFO => crate::signal::syscall::sys_rt_tgsigqueueinfo(
             arg0 as i64,
             arg1 as i64,
@@ -1247,8 +1248,17 @@ pub fn aarch64_syscall_dispatch(
         }
     };
 
-    // Account for exiting kernel mode
-    percpu::account_syscall_exit();
+    // Update percpu.syscall_user_regs[0] with the syscall result BEFORE calling do_signal()
+    // This is important because if do_signal() sets up a signal frame, the saved context
+    // should have the correct return value (not the original x0 argument).
+    // When the signal handler returns via rt_sigreturn, x0 will be restored to this value.
+    unsafe {
+        super::percpu::current_cpu_mut().syscall_user_regs[0] = result;
+    }
+
+    // Check for pending signals before returning to userspace
+    // This may modify the saved user context to invoke the signal handler
+    crate::signal::do_signal();
 
     result
 }

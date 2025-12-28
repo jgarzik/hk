@@ -481,6 +481,16 @@ pub const SIG_SETMASK: i32 = 2;
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
 
+// Signal action flags
+pub const SA_NOCLDSTOP: u64 = 1;
+pub const SA_NOCLDWAIT: u64 = 2;
+pub const SA_SIGINFO: u64 = 4;
+pub const SA_ONSTACK: u64 = 0x08000000;
+pub const SA_RESTART: u64 = 0x10000000;
+pub const SA_NODEFER: u64 = 0x40000000;
+pub const SA_RESETHAND: u64 = 0x80000000;
+pub const SA_RESTORER: u64 = 0x04000000;
+
 // ============================================================================
 // UTS name structure
 // ============================================================================
