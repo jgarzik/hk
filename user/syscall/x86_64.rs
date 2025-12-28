@@ -158,6 +158,7 @@ pub const SYS_CLOSE: u64 = 3;
 pub const SYS_STAT: u64 = 4;
 pub const SYS_LSTAT: u64 = 6;
 pub const SYS_POLL: u64 = 7;
+pub const SYS_PPOLL: u64 = 271;
 pub const SYS_LSEEK: u64 = 8;
 pub const SYS_MMAP: u64 = 9;
 pub const SYS_MPROTECT: u64 = 10;
@@ -173,6 +174,7 @@ pub const SYS_READV: u64 = 19;
 pub const SYS_WRITEV: u64 = 20;
 pub const SYS_PIPE: u64 = 22;
 pub const SYS_SELECT: u64 = 23;
+pub const SYS_PSELECT6: u64 = 270;
 pub const SYS_MREMAP: u64 = 25;
 pub const SYS_MSYNC: u64 = 26;
 pub const SYS_MINCORE: u64 = 27;
@@ -1118,8 +1120,18 @@ pub fn sys_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i64 {
 }
 
 #[inline(always)]
+pub fn sys_ppoll(fds: *mut PollFd, nfds: u32, tmo_p: *const Timespec, sigmask: u64, sigsetsize: u64) -> i64 {
+    unsafe { syscall5!(SYS_PPOLL, fds, nfds, tmo_p, sigmask, sigsetsize) }
+}
+
+#[inline(always)]
 pub fn sys_select(nfds: i32, readfds: *mut FdSet, writefds: *mut FdSet, exceptfds: *mut FdSet, timeout: *mut Timeval) -> i64 {
     unsafe { syscall5!(SYS_SELECT, nfds, readfds, writefds, exceptfds, timeout) }
+}
+
+#[inline(always)]
+pub fn sys_pselect6(nfds: i32, readfds: *mut FdSet, writefds: *mut FdSet, exceptfds: *mut FdSet, timeout: *const Timespec, sigmask: u64) -> i64 {
+    unsafe { syscall6!(SYS_PSELECT6, nfds, readfds, writefds, exceptfds, timeout, sigmask) }
 }
 
 // --- Memory Management ---
