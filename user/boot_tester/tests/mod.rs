@@ -45,6 +45,7 @@ pub mod cgroup;
 pub mod bpf;
 pub mod flock;
 pub mod posix_lock;
+pub mod fcntl_owner;
 #[cfg(target_arch = "x86_64")]
 pub mod ioport;
 
@@ -91,6 +92,7 @@ pub fn run_all_tests() {
     bpf::run_tests();
     flock::run_tests();
     posix_lock::run_tests();
+    fcntl_owner::run_tests();
     #[cfg(target_arch = "x86_64")]
     ioport::run_tests();
 }

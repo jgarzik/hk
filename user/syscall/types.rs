@@ -2189,3 +2189,13 @@ pub const F_GETLK: i32 = 5;
 pub const F_SETLK: i32 = 6;
 /// Set lock (blocking) - waits until lock available
 pub const F_SETLKW: i32 = 7;
+
+// fcntl command constants for async I/O owner (signal-driven I/O)
+/// Set owner PID/PGID for SIGIO signals
+pub const F_SETOWN: i32 = 8;
+/// Get owner PID/PGID for SIGIO signals
+pub const F_GETOWN: i32 = 9;
+/// Set signal number for async I/O (0 = use SIGIO)
+pub const F_SETSIG: i32 = 10;
+/// Get signal number for async I/O
+pub const F_GETSIG: i32 = 11;

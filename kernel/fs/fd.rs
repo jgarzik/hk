@@ -362,6 +362,11 @@ mod fcntl_cmd {
     pub const F_GETLK: i32 = 5;
     pub const F_SETLK: i32 = 6;
     pub const F_SETLKW: i32 = 7;
+    // Async I/O owner commands
+    pub const F_SETOWN: i32 = 8;
+    pub const F_GETOWN: i32 = 9;
+    pub const F_SETSIG: i32 = 10;
+    pub const F_GETSIG: i32 = 11;
     pub const F_DUPFD_CLOEXEC: i32 = 1030;
 }
 
@@ -546,6 +551,49 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
                 Ok(()) => 0,
                 Err(e) => e.sysret(),
             }
+        }
+
+        F_SETOWN => {
+            // Set owner PID/PGID for async I/O signals
+            let file = match table.get(fd) {
+                Some(f) => f,
+                None => return KernelError::BadFd.sysret(),
+            };
+            file.set_owner(arg as i32);
+            0
+        }
+
+        F_GETOWN => {
+            // Get owner PID/PGID for async I/O signals
+            let file = match table.get(fd) {
+                Some(f) => f,
+                None => return KernelError::BadFd.sysret(),
+            };
+            file.get_owner() as i64
+        }
+
+        F_SETSIG => {
+            // Set signal for async I/O
+            let file = match table.get(fd) {
+                Some(f) => f,
+                None => return KernelError::BadFd.sysret(),
+            };
+            let sig = arg as i32;
+            // Validate signal number (0 is valid - means use SIGIO)
+            if !(0..=64).contains(&sig) {
+                return KernelError::InvalidArgument.sysret();
+            }
+            file.set_sig(sig);
+            0
+        }
+
+        F_GETSIG => {
+            // Get signal for async I/O
+            let file = match table.get(fd) {
+                Some(f) => f,
+                None => return KernelError::BadFd.sysret(),
+            };
+            file.get_sig() as i64
         }
 
         _ => KernelError::InvalidArgument.sysret(),
