@@ -6,6 +6,7 @@
 //! - Test 76: kill() signal 0 - check process exists
 //! - Test 77: kill() ESRCH - non-existent process
 //! - Test 78: tgkill() signal 0
+//! - Test: tgkill() wrong tgid - thread group validation (ESRCH)
 //! - Test 79: tkill() signal 0
 //! - Test 80: rt_sigaction() - get default action
 //! - Test 81: rt_sigaction() EINVAL - invalid signal
@@ -15,6 +16,7 @@
 //! - Test: sigaltstack() - alternate signal stack
 //! - Test: rt_sigqueueinfo() - queue signal with siginfo
 //! - Test: rt_tgsigqueueinfo() - queue signal to thread
+//! - Test: rt_tgsigqueueinfo() wrong tgid - thread group validation (ESRCH)
 //! - Test: rt_sigsuspend() - wait for signal with temp mask
 
 use super::helpers::{print, println, print_num};
@@ -63,6 +65,7 @@ pub fn run_tests() {
     test_kill_sig0();
     test_kill_esrch();
     test_tgkill_sig0();
+    test_tgkill_wrong_tgid();
     test_tkill_sig0();
     test_sigaction();
     test_sigaction_einval();
@@ -73,6 +76,7 @@ pub fn run_tests() {
     test_sigqueueinfo();
     test_sigqueueinfo_eperm();
     test_tgsigqueueinfo();
+    test_tgsigqueueinfo_wrong_tgid();
     test_sigsuspend();
     test_sigsuspend_einval();
     test_kill_pgrp_zero();
@@ -172,6 +176,27 @@ fn test_tgkill_sig0() {
         println(b"TGKILL_SIG0:OK");
     } else {
         print(b"TGKILL_SIG0:FAIL: expected 0, got ");
+        print_num(ret);
+    }
+}
+
+/// Test: tgkill() with wrong tgid should fail with ESRCH
+///
+/// The thread group validation checks that the tid actually belongs to
+/// the specified tgid. Using a wrong tgid (e.g., pid+1) should return ESRCH.
+fn test_tgkill_wrong_tgid() {
+    let pid = sys_getpid();
+    let tid = sys_gettid();
+
+    // Use pid+1 as a wrong tgid - our tid doesn't belong to that thread group
+    let wrong_tgid = pid + 1;
+    let ret = sys_tgkill(wrong_tgid, tid, 0);
+
+    if ret == -3 {
+        // ESRCH - thread not in specified thread group
+        println(b"TGKILL_WRONG_TGID:OK");
+    } else {
+        print(b"TGKILL_WRONG_TGID:FAIL: expected -3 (ESRCH), got ");
         print_num(ret);
     }
 }
@@ -518,6 +543,28 @@ fn test_tgsigqueueinfo() {
         println(b"TGSIGQUEUEINFO:OK");
     } else {
         print(b"TGSIGQUEUEINFO:FAIL: expected 0, got ");
+        print_num(ret);
+    }
+}
+
+/// Test: rt_tgsigqueueinfo() with wrong tgid should fail with ESRCH
+///
+/// Like tgkill, tgsigqueueinfo validates that the tid belongs to the tgid.
+fn test_tgsigqueueinfo_wrong_tgid() {
+    let pid = sys_getpid();
+    let tid = sys_gettid();
+
+    let info = SigInfo::new(SIGUSR1, SI_QUEUE, pid as i32, 0);
+
+    // Use pid+1 as a wrong tgid - our tid doesn't belong to that thread group
+    let wrong_tgid = pid + 1;
+    let ret = sys_rt_tgsigqueueinfo(wrong_tgid, tid, SIGUSR1, &info as *const SigInfo as u64);
+
+    if ret == -3 {
+        // ESRCH - thread not in specified thread group
+        println(b"TGSIGQUEUEINFO_WRONG_TGID:OK");
+    } else {
+        print(b"TGSIGQUEUEINFO_WRONG_TGID:FAIL: expected -3 (ESRCH), got ");
         print_num(ret);
     }
 }

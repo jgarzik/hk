@@ -8,9 +8,10 @@
 //! - kill (62) - send signal to process
 //! - tgkill (234) - send signal to specific thread
 //! - tkill (200) - send signal to thread (deprecated)
-//! - rt_sigreturn (15) - return from signal handler
+//!
+//! Note: rt_sigreturn (15) is implemented in arch-specific signal.rs files
 
-use crate::arch::Uaccess;
+use crate::arch::{CurrentArch, PerCpuOps, Uaccess};
 use crate::signal::{
     SIGKILL, SIGSTOP, SigAction, SigSet, UNMASKABLE_SIGNALS, get_task_sighand, send_signal,
     send_signal_to_pgrp, send_signal_to_process, with_task_signal_state,
@@ -240,6 +241,84 @@ pub fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
     .unwrap_or(-3) // ESRCH
 }
 
+// =============================================================================
+// Kill Permission Check
+// =============================================================================
+
+/// Check if current task has permission to send a signal to target task
+///
+/// Based on Linux kernel/signal.c:check_kill_permission()
+///
+/// # Arguments
+/// * `target_pid` - Target process ID
+/// * `sig` - Signal number (SIGCONT has special handling)
+///
+/// # Returns
+/// 0 if permitted, -1 (EPERM) if denied, -3 (ESRCH) if target not found
+fn check_kill_permission(target_pid: u64, sig: u32) -> i32 {
+    use crate::signal::SIGCONT;
+    use crate::task::percpu::{TASK_TABLE, current_sid, current_tid};
+    use crate::task::{CAP_KILL, capable, current_cred};
+
+    let caller_tid = current_tid();
+    let caller_cred = current_cred();
+
+    // Get target task info
+    let target_info = {
+        let table = TASK_TABLE.lock();
+        // Find the thread group leader for this pid
+        table
+            .tasks
+            .iter()
+            .find(|t| t.pid == target_pid)
+            .map(|t| (t.tgid, t.sid, t.cred.clone()))
+    };
+
+    let (target_tgid, target_sid, target_cred) = match target_info {
+        Some(info) => info,
+        None => return -3, // ESRCH - no such process
+    };
+
+    // Get caller's tgid
+    let caller_tgid = {
+        let table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter()
+            .find(|t| t.tid == caller_tid)
+            .map(|t| t.tgid)
+            .unwrap_or(0)
+    };
+
+    // Same thread group - always allowed
+    if caller_tgid == target_tgid {
+        return 0;
+    }
+
+    // CAP_KILL capability - always allowed
+    if capable(CAP_KILL) {
+        return 0;
+    }
+
+    // UID match check (like Linux kill_ok_by_cred)
+    // Caller's real or effective UID must match target's real or saved UID
+    let uid_ok = caller_cred.euid == target_cred.suid
+        || caller_cred.euid == target_cred.uid
+        || caller_cred.uid == target_cred.suid
+        || caller_cred.uid == target_cred.uid;
+
+    if uid_ok {
+        return 0;
+    }
+
+    // SIGCONT special case: same session allows SIGCONT
+    if sig == SIGCONT && current_sid() == target_sid {
+        return 0;
+    }
+
+    -1 // EPERM - permission denied
+}
+
 /// kill(pid, sig) - send signal to process
 ///
 /// # Arguments
@@ -257,10 +336,12 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
         return -22; // EINVAL
     }
 
-    // TODO: Permission checks (CAP_KILL, same user, etc.)
-
     if pid > 0 {
-        // Send to specific process
+        // Send to specific process - check permissions first
+        let perm = check_kill_permission(pid as u64, sig);
+        if perm != 0 {
+            return perm as i64;
+        }
         send_signal_to_process(pid as u64, sig) as i64
     } else if pid == 0 {
         // Send to all processes in caller's process group
@@ -311,12 +392,26 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
 /// # Returns
 /// 0 on success, negative errno on error
 pub fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> i64 {
+    use crate::task::percpu::TASK_TABLE;
+
     if sig > 64 || tid <= 0 || tgid <= 0 {
         return -22; // EINVAL
     }
 
-    // TODO: Verify tid belongs to tgid (thread group)
-    // For now, just send to the specified tid
+    // Verify tid belongs to tgid (thread group validation)
+    let valid = {
+        let table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter()
+            .find(|t| t.tid == tid as u64)
+            .map(|t| t.tgid == tgid as u64)
+            .unwrap_or(false)
+    };
+
+    if !valid {
+        return -3; // ESRCH - thread not in specified thread group
+    }
 
     send_signal(tid as u64, sig) as i64
 }
@@ -392,7 +487,7 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
 /// * -ESRCH: No such process/thread
 /// * -EFAULT: Bad uinfo pointer
 pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
-    use crate::task::percpu::current_pid;
+    use crate::task::percpu::{TASK_TABLE, current_pid};
 
     // Validate arguments
     if tid <= 0 || tgid <= 0 {
@@ -416,8 +511,20 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
         return -1; // EPERM
     }
 
-    // TODO: Verify tid belongs to tgid (thread group check)
-    // For now, just send to the specified tid
+    // Verify tid belongs to tgid (thread group validation)
+    let valid = {
+        let table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter()
+            .find(|t| t.tid == tid as u64)
+            .map(|t| t.tgid == tgid as u64)
+            .unwrap_or(false)
+    };
+
+    if !valid {
+        return -3; // ESRCH - thread not in specified thread group
+    }
 
     // Send signal to specific thread
     send_signal(tid as u64, sig) as i64
@@ -790,26 +897,6 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
     }
 }
 
-/// rt_sigreturn() - return from signal handler
-///
-/// This is called by the user-space signal trampoline after the signal
-/// handler returns. It restores the saved context from the signal frame.
-///
-/// # Safety
-/// This function never returns normally - it restores context and jumps
-/// back to the interrupted code.
-#[allow(dead_code)]
-pub fn sys_rt_sigreturn() -> ! {
-    // TODO: Implement signal return
-    // 1. Read signal frame from user stack
-    // 2. Restore blocked mask from frame
-    // 3. Restore registers from ucontext
-    // 4. Check for more pending signals
-    // 5. Return to original code
-
-    panic!("rt_sigreturn not yet implemented");
-}
-
 /// sigaltstack(ss, oss) - set/get alternate signal stack
 ///
 /// Sets up or queries an alternate signal stack for signal handling.
@@ -827,7 +914,17 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
 
     let tid = current_tid();
 
+    // Get current user stack pointer to check if on signal stack
+    let user_sp = CurrentArch::get_syscall_user_rsp();
+
     with_task_signal_state(tid, |state| {
+        // Check if currently executing on the altstack
+        let on_stack = state.altstack.is_enabled() && {
+            let sp_start = state.altstack.ss_sp;
+            let sp_end = sp_start + state.altstack.ss_size as u64;
+            user_sp >= sp_start && user_sp < sp_end
+        };
+
         // Return old stack if requested
         if oss_ptr != 0 {
             let old = &state.altstack;
@@ -835,8 +932,13 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
             if put_user::<Uaccess, u64>(oss_ptr, old.ss_sp).is_err() {
                 return -14i64; // EFAULT
             }
-            // Write ss_flags (offset 8)
-            if put_user::<Uaccess, i32>(oss_ptr + 8, old.ss_flags).is_err() {
+            // Write ss_flags (offset 8) - add SS_ONSTACK if we're on the stack
+            let flags = if on_stack {
+                old.ss_flags | ss_flags::SS_ONSTACK
+            } else {
+                old.ss_flags
+            };
+            if put_user::<Uaccess, i32>(oss_ptr + 8, flags).is_err() {
                 return -14; // EFAULT
             }
             // Write ss_size (offset 16, with padding after flags)
@@ -847,6 +949,11 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
 
         // Set new stack if provided
         if ss_ptr != 0 {
+            // Cannot change while on signal stack
+            if on_stack {
+                return -1; // EPERM
+            }
+
             // Read ss_sp (offset 0)
             let ss_sp = match get_user::<Uaccess, u64>(ss_ptr) {
                 Ok(v) => v,
@@ -862,10 +969,6 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
                 Ok(v) => v as usize,
                 Err(_) => return -14, // EFAULT
             };
-
-            // Cannot change while on signal stack
-            // TODO: Check if currently on signal stack using SP
-            // For now, we skip this check
 
             // Validate flags - only SS_DISABLE and SS_FLAG_BITS are valid
             let mode = ss_flags_val & !ss_flags::SS_FLAG_BITS;
