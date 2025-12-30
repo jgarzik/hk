@@ -13,7 +13,7 @@
 use crate::arch::IrqSpinlock;
 use crate::console::{ConsoleDriver, ConsoleFlags, ConsolePriority, register_console};
 
-use super::io::{inb, outb};
+use super::io::outb;
 
 /// VGA text buffer physical address
 const VGA_BUFFER_PHYS: u64 = 0xB8000;
@@ -27,11 +27,47 @@ const VGA_CRTC_INDEX: u16 = 0x3D4;
 const VGA_CRTC_DATA: u16 = 0x3D5;
 
 /// CRT Controller register indices
+const CRTC_CURSOR_START: u8 = 0x0A;
+const CRTC_CURSOR_END: u8 = 0x0B;
 const CRTC_CURSOR_HI: u8 = 0x0E;
 const CRTC_CURSOR_LO: u8 = 0x0F;
 
 /// Default text attribute: light gray on black
 const DEFAULT_ATTR: u8 = 0x07;
+
+/// Probe VGA buffer to verify hardware presence and wake it up
+///
+/// Uses complementary test patterns (Linux-style) to verify the VGA
+/// buffer responds correctly. This also serves to "wake up" VGA
+/// hardware that may be in a low-power state on some systems.
+///
+/// Returns true if VGA buffer is present and responsive.
+fn probe_vga_buffer() -> bool {
+    let p = VGA_BUFFER_PHYS as *mut u16;
+    unsafe {
+        // Save original values
+        let saved1 = core::ptr::read_volatile(p);
+        let saved2 = core::ptr::read_volatile(p.add(1));
+
+        // Test pattern 1: 0xAA55 / 0x55AA
+        core::ptr::write_volatile(p, 0xAA55);
+        core::ptr::write_volatile(p.add(1), 0x55AA);
+        let ok1 =
+            core::ptr::read_volatile(p) == 0xAA55 && core::ptr::read_volatile(p.add(1)) == 0x55AA;
+
+        // Test pattern 2: complementary (0x55AA / 0xAA55)
+        core::ptr::write_volatile(p, 0x55AA);
+        core::ptr::write_volatile(p.add(1), 0xAA55);
+        let ok2 =
+            core::ptr::read_volatile(p) == 0x55AA && core::ptr::read_volatile(p.add(1)) == 0xAA55;
+
+        // Restore original values
+        core::ptr::write_volatile(p, saved1);
+        core::ptr::write_volatile(p.add(1), saved2);
+
+        ok1 && ok2
+    }
+}
 
 /// VGA text console state
 struct VgaConState {
@@ -67,20 +103,51 @@ impl VgaConState {
     fn init(&mut self) {
         // VGA buffer at 0xB8000 is identity-mapped in our kernel
         self.buffer = VGA_BUFFER_PHYS as *mut u16;
+        self.attribute = DEFAULT_ATTR;
 
-        // Read current cursor position from CRT controller
-        let cursor_pos = read_cursor_position();
-        self.cursor_x = cursor_pos % VGA_WIDTH;
-        self.cursor_y = cursor_pos / VGA_WIDTH;
-
-        // Clamp to valid range
-        if self.cursor_y >= VGA_HEIGHT {
-            self.cursor_y = VGA_HEIGHT - 1;
-            self.cursor_x = 0;
+        // Probe VGA buffer - this also "wakes up" VGA hardware that may
+        // be in a low-power state on some systems (like Dell Optiplex 3020)
+        if !probe_vga_buffer() {
+            // VGA not present or not responding - don't initialize
+            return;
         }
 
-        self.attribute = DEFAULT_ATTR;
+        // Initialize cursor hardware (scan lines for visibility)
+        self.init_cursor_hardware();
+
+        // Clear screen to known state
+        self.clear_screen();
+
+        // Set cursor to top-left
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+        self.update_cursor();
+
         self.initialized = true;
+    }
+
+    /// Initialize cursor hardware registers for visibility
+    fn init_cursor_hardware(&self) {
+        // Set cursor start scan line (register 0x0A)
+        // Bit 5: cursor disabled (0 = enabled)
+        // Bits 0-4: start scan line (14 for underline cursor)
+        outb(VGA_CRTC_INDEX, CRTC_CURSOR_START);
+        outb(VGA_CRTC_DATA, 0x0E);
+
+        // Set cursor end scan line (register 0x0B)
+        // Bits 0-4: end scan line (15 for underline cursor)
+        outb(VGA_CRTC_INDEX, CRTC_CURSOR_END);
+        outb(VGA_CRTC_DATA, 0x0F);
+    }
+
+    /// Clear the entire screen
+    fn clear_screen(&mut self) {
+        let blank = (self.attribute as u16) << 8 | 0x20u16; // Space with attribute
+        unsafe {
+            for i in 0..(VGA_WIDTH * VGA_HEIGHT) {
+                core::ptr::write_volatile(self.buffer.add(i), blank);
+            }
+        }
     }
 
     /// Write a character at the current cursor position
@@ -169,19 +236,6 @@ impl VgaConState {
         let pos = (self.cursor_y * VGA_WIDTH + self.cursor_x) as u16;
         write_cursor_position(pos);
     }
-}
-
-/// Read cursor position from CRT controller
-fn read_cursor_position() -> usize {
-    // Read high byte (register 14)
-    outb(VGA_CRTC_INDEX, CRTC_CURSOR_HI);
-    let high = inb(VGA_CRTC_DATA);
-
-    // Read low byte (register 15)
-    outb(VGA_CRTC_INDEX, CRTC_CURSOR_LO);
-    let low = inb(VGA_CRTC_DATA);
-
-    ((high as usize) << 8) | (low as usize)
 }
 
 /// Write cursor position to CRT controller
