@@ -1610,8 +1610,9 @@ fn test_ioprio_get_set() {
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 fn test_arch_prctl() {
-    // Set FS base to a test value
-    let test_addr: u64 = 0x12345678_ABCD0000;
+    // Set FS base to a test value (must be canonical address - upper bits match bit 47)
+    // Use a low canonical address that's safe for testing
+    let test_addr: u64 = 0x0000_7FFF_ABCD_0000;
     let ret = sys_arch_prctl(ARCH_SET_FS, test_addr);
     if ret != 0 {
         print(b"ARCH_PRCTL_SET:FAIL ret=");
