@@ -12,8 +12,12 @@ KERNEL_ARM = target/$(TARGET_ARM)/release/kernel
 VFAT_IMAGE = target/vfat.img
 VFAT_SIZE_KB = 1024
 
+# Machine-specific ISO configuration
+# Usage: make iso MACHINE=dell
+MACHINE ?=
+
 .PHONY: all build debug user iso iso-debug run run-debug test check clean info help vfat-image
-.PHONY: build-arm run-arm check-arm user-arm clippy clippy-arm fmt
+.PHONY: build-arm run-arm check-arm user-arm clippy clippy-arm fmt list-machines
 
 # Default: build everything (kernel, user binaries, ISO)
 all: iso
@@ -27,6 +31,8 @@ help:
 	@echo "  make user     - Build userspace binaries and initramfs"
 	@echo "  make iso      - Build bootable ISO image"
 	@echo "  make iso-debug- Build bootable ISO with debug kernel"
+	@echo "  make iso MACHINE=<name> - Build ISO for specific machine (e.g., MACHINE=dell)"
+	@echo "  make list-machines      - List available machine configurations"
 	@echo ""
 	@echo "  make run      - Run kernel in QEMU"
 	@echo "  make run-debug- Run debug kernel in QEMU (no reboot on crash)"
@@ -70,16 +76,46 @@ iso: build user vfat-image
 	@cp $(KERNEL) target/iso/boot/kernel
 	@cp user/initramfs-x86_64.cpio target/iso/boot/initramfs.cpio
 	@cp $(VFAT_IMAGE) target/iso/boot/vfat.img
+ifdef MACHINE
+	@if [ ! -f "boot/machines/$(MACHINE)/grub.cfg" ]; then \
+		echo "Error: Machine '$(MACHINE)' not found (missing boot/machines/$(MACHINE)/grub.cfg)"; \
+		exit 1; \
+	fi
+	@cp boot/machines/$(MACHINE)/grub.cfg target/iso/boot/grub/grub.cfg
+	@grub-mkrescue -o target/$(MACHINE).iso target/iso 2>/dev/null
+	@echo "Created target/$(MACHINE).iso"
+else
 	@cp boot/grub.cfg target/iso/boot/grub/grub.cfg
 	@grub-mkrescue -o target/hk-x86_64.iso target/iso 2>/dev/null
+endif
 
 iso-debug: debug user vfat-image
 	@mkdir -p target/iso/boot/grub
 	@cp $(KERNEL_DEBUG) target/iso/boot/kernel
 	@cp user/initramfs-x86_64.cpio target/iso/boot/initramfs.cpio
 	@cp $(VFAT_IMAGE) target/iso/boot/vfat.img
+ifdef MACHINE
+	@if [ ! -f "boot/machines/$(MACHINE)/grub.cfg" ]; then \
+		echo "Error: Machine '$(MACHINE)' not found (missing boot/machines/$(MACHINE)/grub.cfg)"; \
+		exit 1; \
+	fi
+	@cp boot/machines/$(MACHINE)/grub.cfg target/iso/boot/grub/grub.cfg
+	@grub-mkrescue -o target/$(MACHINE)-debug.iso target/iso 2>/dev/null
+	@echo "Created target/$(MACHINE)-debug.iso"
+else
 	@cp boot/grub.cfg target/iso/boot/grub/grub.cfg
 	@grub-mkrescue -o target/hk-x86_64.iso target/iso 2>/dev/null
+endif
+
+# List available machine configurations
+list-machines:
+	@echo "Available machines for ISO builds:"
+	@for dir in boot/machines/*/; do \
+		name=$$(basename "$$dir"); \
+		if [ -f "$$dir/grub.cfg" ]; then \
+			echo "  - $$name (make iso MACHINE=$$name)"; \
+		fi; \
+	done
 
 run: iso
 	@if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then \
