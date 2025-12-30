@@ -31,3 +31,6 @@ Run `make check` or `make check-arm`.  Run `make help` for more info.
 
 Requires qemu, dosfstools, and iso tools.
 
+## Naming
+
+hk stands for... happy koala, or hacker kernel, or hong kong,
