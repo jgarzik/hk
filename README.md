@@ -21,7 +21,6 @@ Uses the Linux syscall ABI for each respective architecture.
 
 ### Wishlist
 
-* io_uring model for syscalls and ioctls
 * hybrid kernel/user model for DMA'ing device drivers
 * eBPF even more widely used
 * Policy cut-off for legacy hardware:  Require >= 2021 ?  Open to debate.
