@@ -389,8 +389,13 @@ impl NlSock {
     }
 
     /// Something to read (or an error to report)
+    /// (a pending dump part counts: recv produces it)
     pub fn readable(&self) -> bool {
-        !self.rxq.lock().is_empty() || self.err.load(Ordering::Acquire) != 0
+        // Separate statements: never hold rxq while taking dump (order
+        // is dump -> rxq)
+        let queued = !self.rxq.lock().is_empty();
+        let dumping = self.dump.lock().is_some();
+        queued || dumping || self.err.load(Ordering::Acquire) != 0
     }
 
     pub fn has_error(&self) -> bool {
@@ -414,6 +419,11 @@ impl NlSock {
             if let Some(skb) = self.dequeue(peek) {
                 self.dump_more();
                 return Ok(skb);
+            }
+            // Never wait on an empty queue while a dump is pending: its
+            // next part always fits an empty buffer
+            if self.dump_step() {
+                continue;
             }
             if nonblock {
                 return Err(KernelError::WouldBlock);
@@ -464,14 +474,20 @@ impl NlSock {
 
     /// Queue the next part of the running dump if it fits; ends with
     /// NLMSG_DONE carrying 0 or the dump's error (Linux netlink_dump)
-    fn dump_step(&self) {
+    ///
+    /// Always makes progress when it runs: a part holds at least one
+    /// object (even one larger than rcvbuf, admitted into an empty
+    /// buffer like Linux's first skb) or ends the dump, and the cursor
+    /// only moves forward, so objects removed mid-dump cannot stall it.
+    /// Returns whether a part was queued.
+    fn dump_step(&self) -> bool {
         let mut d = self.dump.lock();
         let Some(st) = d.as_mut() else {
-            return;
+            return false;
         };
         let r = self.rmem.load(Ordering::Acquire);
         if r != 0 && r >= self.rcvbuf.load(Ordering::Acquire) as usize {
-            return;
+            return false;
         }
         let mut buf = Vec::new();
         let done = match st.cb.fill(self, &mut buf) {
@@ -494,6 +510,7 @@ impl NlSock {
             portid: 0,
             group: 0,
         });
+        true
     }
 
     /// Send `data` to `dst` from this socket (Linux netlink_sendmsg

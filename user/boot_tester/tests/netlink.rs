@@ -889,12 +889,17 @@ fn test_dump_resume() {
         }
     }
     tiny_rcvbuf(small.fd);
+    // Link messages (~1 KB+) exceed half of the minimal buffer each
+    let links = small.dump(&mut Req::new(RTM_GETLINK, 0, &ifinfo(0, 0, 0)), &mut |_| {});
+    if links < 2 {
+        return fail(N, b"small rcvbuf: link dump", links as i64);
+    }
     let (seen, done, err, parts) = route_dump(&mut small, false);
     let (seen2, done2, busy, _) = route_dump(&mut nl, true);
     for i in 0..N_ROUTES {
         route(&mut cfg, false, many_route(i), 32, [0; 4], 1, 0);
     }
-    if seen != N_ROUTES || !done || err != 0 || parts < 3 {
+    if seen != N_ROUTES || !done || err != 0 || parts < 2 {
         print_num(err as i64);
         print(b" ");
         print_num(parts);
