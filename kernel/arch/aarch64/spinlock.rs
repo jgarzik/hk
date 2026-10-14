@@ -19,7 +19,15 @@ use ::core::cell::UnsafeCell;
 use ::core::ops::{Deref, DerefMut};
 use ::core::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(test))]
 use super::percpu;
+
+/// Host unit tests run in userspace: no per-CPU data or preemption
+#[cfg(test)]
+mod percpu {
+    pub fn preempt_disable() {}
+    pub fn preempt_enable() {}
+}
 
 /// An IRQ-safe spinlock
 ///
@@ -169,6 +177,7 @@ impl<T> Drop for IrqSpinlockGuard<'_, T> {
 ///
 /// Returns the DAIF register value.
 /// DAIF bits: [9]=D (Debug), [8]=A (SError), [7]=I (IRQ), [6]=F (FIQ)
+#[cfg(not(test))]
 #[inline]
 fn save_and_disable_irq() -> u64 {
     let daif: u64;
@@ -188,6 +197,7 @@ fn save_and_disable_irq() -> u64 {
 /// Restore interrupt state
 ///
 /// Restores DAIF to the saved value.
+#[cfg(not(test))]
 #[inline]
 fn restore_irq(saved_daif: u64) {
     unsafe {
@@ -198,3 +208,12 @@ fn restore_irq(saved_daif: u64) {
         );
     }
 }
+
+/// Host unit tests run in userspace, where IRQ masking is privileged
+#[cfg(test)]
+fn save_and_disable_irq() -> u64 {
+    0
+}
+
+#[cfg(test)]
+fn restore_irq(_saved_daif: u64) {}

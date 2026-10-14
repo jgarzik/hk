@@ -19,7 +19,15 @@ use ::core::cell::UnsafeCell;
 use ::core::ops::{Deref, DerefMut};
 use ::core::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(test))]
 use super::percpu;
+
+/// Host unit tests run in userspace: no per-CPU data or preemption
+#[cfg(test)]
+mod percpu {
+    pub fn preempt_disable() {}
+    pub fn preempt_enable() {}
+}
 
 /// An IRQ-safe spinlock
 ///
@@ -168,6 +176,7 @@ impl<T> Drop for IrqSpinlockGuard<'_, T> {
 /// Save current interrupt state and disable interrupts
 ///
 /// Returns true if interrupts were enabled (IF flag was set).
+#[cfg(not(test))]
 #[inline]
 fn save_and_disable_irq() -> bool {
     let flags: u64;
@@ -187,6 +196,7 @@ fn save_and_disable_irq() -> bool {
 /// Restore interrupt state
 ///
 /// If `was_enabled` is true, enables interrupts; otherwise leaves them disabled.
+#[cfg(not(test))]
 #[inline]
 fn restore_irq(was_enabled: bool) {
     if was_enabled {
@@ -195,3 +205,12 @@ fn restore_irq(was_enabled: bool) {
         }
     }
 }
+
+/// Host unit tests run in userspace, where IRQ masking is privileged
+#[cfg(test)]
+fn save_and_disable_irq() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn restore_irq(_was_enabled: bool) {}

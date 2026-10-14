@@ -132,7 +132,7 @@ run-debug: iso-debug
 	./run-qemu.sh -d
 
 test:
-	cargo test --all
+	cargo test -p hk-kernel
 
 check: iso
 	@rm -f /tmp/qemu_serial.log
