@@ -152,8 +152,8 @@ fn test_getpgid() {
     let pgid = sys_getpgid(0);
     print(b"getpgid(0) = ");
     print_num(pgid);
-    // Init process should be its own process group leader
-    if pgid == 1 {
+    // Init starts in init_task's process group 0 (Linux init/init_task.c)
+    if pgid == 0 {
         println(b"GETPGID:OK");
     } else {
         println(b"GETPGID:FAIL");
@@ -165,8 +165,8 @@ fn test_getsid() {
     let sid = sys_getsid(0);
     print(b"getsid(0) = ");
     print_num(sid);
-    // Init process should be session leader
-    if sid == 1 {
+    // Init starts in init_task's session 0 until it calls setsid()
+    if sid == 0 {
         println(b"GETSID:OK");
     } else {
         println(b"GETSID:FAIL");
@@ -178,7 +178,7 @@ fn test_getpgid_explicit() {
     let pgid_explicit = sys_getpgid(1);
     print(b"getpgid(1) = ");
     print_num(pgid_explicit);
-    if pgid_explicit == 1 {
+    if pgid_explicit == 0 {
         println(b"GETPGID_EXPLICIT:OK");
     } else {
         println(b"GETPGID_EXPLICIT:FAIL");
@@ -190,7 +190,7 @@ fn test_getsid_explicit() {
     let sid_explicit = sys_getsid(1);
     print(b"getsid(1) = ");
     print_num(sid_explicit);
-    if sid_explicit == 1 {
+    if sid_explicit == 0 {
         println(b"GETSID_EXPLICIT:OK");
     } else {
         println(b"GETSID_EXPLICIT:FAIL");
@@ -223,13 +223,16 @@ fn test_getsid_esrch() {
     }
 }
 
-/// Test 14: setsid (should fail because init is already process group leader)
+/// Test 14: setsid: init (pgid 0) may create its own session once; after
+/// that it is a process group leader and a second setsid() fails EPERM
 fn test_setsid_eperm() {
-    let setsid_ret = sys_setsid();
+    let first = sys_setsid();
+    let second = sys_setsid();
     print(b"setsid() = ");
-    print_num(setsid_ret);
-    // setsid should fail with EPERM (-1)
-    if setsid_ret == -1 {
+    print_num(first);
+    print(b", again = ");
+    print_num(second);
+    if first == 1 && second == -1 && sys_getpgid(0) == 1 && sys_getsid(0) == 1 {
         println(b"SETSID_EPERM:OK");
     } else {
         println(b"SETSID_EPERM:FAIL");
