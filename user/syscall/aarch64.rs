@@ -1629,6 +1629,11 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
     unsafe { syscall3!(SYS_FCNTL, fd, cmd, arg) }
 }
 
+#[inline(always)]
+pub fn sys_dup3(oldfd: i32, newfd: i32, flags: u32) -> i64 {
+    unsafe { syscall3!(SYS_DUP3, oldfd, newfd, flags) }
+}
+
 /// ioctl(fd, request, arg) - device control operations
 #[inline(always)]
 pub fn sys_ioctl(fd: i32, request: u64, arg: u64) -> i64 {

@@ -633,8 +633,6 @@ pub struct FdTable<F> {
     files: BTreeMap<Fd, Arc<F>>,
     /// Per-fd flags (FD_CLOEXEC, etc.)
     fd_flags: BTreeMap<Fd, u32>,
-    /// Next file descriptor to allocate
-    next_fd: Fd,
 }
 
 impl<F> FdTable<F> {
@@ -643,7 +641,6 @@ impl<F> FdTable<F> {
         Self {
             files: BTreeMap::new(),
             fd_flags: BTreeMap::new(),
-            next_fd: 3, // 0, 1, 2 reserved for stdin/stdout/stderr
         }
     }
 
@@ -652,7 +649,6 @@ impl<F> FdTable<F> {
         Self {
             files: BTreeMap::new(),
             fd_flags: BTreeMap::new(),
-            next_fd: 3,
         }
     }
 
@@ -763,9 +759,6 @@ impl<F> FdTable<F> {
         if flags != 0 {
             self.fd_flags.insert(fd, flags);
         }
-        if fd >= self.next_fd {
-            self.next_fd = fd + 1;
-        }
         Ok(fd)
     }
 
@@ -798,20 +791,12 @@ impl<F> FdTable<F> {
         Self {
             files: self.files.clone(),
             fd_flags: self.fd_flags.clone(),
-            next_fd: self.next_fd,
         }
     }
 
     /// Get the number of open file descriptors
     pub fn count(&self) -> usize {
         self.files.len()
-    }
-
-    /// Get the next fd that would be allocated
-    ///
-    /// Used for RLIMIT_NOFILE enforcement.
-    pub fn next_fd(&self) -> Fd {
-        self.next_fd
     }
 }
 

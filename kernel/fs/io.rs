@@ -3,7 +3,6 @@
 use alloc::vec;
 
 use crate::arch::Uaccess;
-use crate::console::console_write;
 use crate::fs::KernelError;
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 
@@ -19,12 +18,6 @@ pub fn sys_read(fd: i32, buf_ptr: u64, count: u64) -> i64 {
     // Validate user buffer address
     if !Uaccess::access_ok(buf_ptr, count) {
         return KernelError::BadAddress.sysret();
-    }
-
-    // Handle special fds (stdin)
-    if fd == 0 {
-        // stdin - not implemented yet
-        return 0;
     }
 
     // Get file from fd table
@@ -94,26 +87,6 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    // Handle special fds (stdout, stderr) - no RLIMIT_FSIZE check needed
-    if fd == 1 || fd == 2 {
-        // Use stack buffer for small writes
-        if count <= SMALL_BUF_SIZE {
-            let mut stack_buf = [0u8; SMALL_BUF_SIZE];
-            let write_buf = &mut stack_buf[..count];
-            if copy_from_user::<Uaccess>(&mut write_buf[..count], buf_ptr, count).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            console_write(write_buf);
-        } else {
-            let mut kernel_buf = vec![0u8; count];
-            if copy_from_user::<Uaccess>(&mut kernel_buf[..count], buf_ptr, count).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            console_write(&kernel_buf);
-        }
-        return count as i64;
-    }
-
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
@@ -122,7 +95,7 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
 
     // Check RLIMIT_FSIZE for regular files (files with inodes)
     // Pipes and special files don't have size limits
-    if file.get_inode().is_some()
+    if file.get_inode().is_some_and(|i| i.mode().is_file())
         && let Err(e) = check_fsize_limit(file.get_pos(), count)
     {
         return e;
@@ -220,11 +193,6 @@ pub fn sys_pread64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    // Handle special fds (stdin) - not supported for pread
-    if fd == 0 {
-        return KernelError::IllegalSeek.sysret(); // stdin is not seekable
-    }
-
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
@@ -306,11 +274,6 @@ pub fn sys_pwrite64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    // Handle special fds (stdout, stderr) - not supported for pwrite
-    if fd == 1 || fd == 2 {
-        return KernelError::IllegalSeek.sysret(); // stdout/stderr are not seekable
-    }
-
     // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
@@ -318,7 +281,7 @@ pub fn sys_pwrite64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
     };
 
     // Check RLIMIT_FSIZE for regular files (pwrite uses explicit offset)
-    if file.get_inode().is_some()
+    if file.get_inode().is_some_and(|i| i.mode().is_file())
         && let Err(e) = check_fsize_limit(offset, count)
     {
         return e;

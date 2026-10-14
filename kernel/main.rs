@@ -1046,6 +1046,9 @@ fn kmain() -> ! {
     // tid=2, pid=1, ppid=0, pgid=1, sid=1 (init process)
     task::percpu::set_current_task(2, 1, 0, 0, 0, task::Cred::ROOT);
 
+    // stdin/stdout/stderr of init: /dev/console (Linux kernel_init)
+    fs::open::console_on_rootfs();
+
     // Jump to user mode!
     // This never returns.
     //

@@ -352,6 +352,7 @@ pub const SYS_GET_ROBUST_LIST: u64 = 274;
 pub const SYS_FUTEX_WAITV: u64 = 449;
 pub const SYS_UTIMENSAT: u64 = 280;
 pub const SYS_PIPE2: u64 = 293;
+pub const SYS_DUP3: u64 = 292;
 pub const SYS_PREADV: u64 = 295;
 pub const SYS_PWRITEV: u64 = 296;
 pub const SYS_PREADV2: u64 = 327;
@@ -436,6 +437,11 @@ pub fn sys_open(path: *const u8, flags: u32, mode: u32) -> i64 {
 #[inline(always)]
 pub fn sys_close(fd: u64) -> i64 {
     unsafe { syscall1!(SYS_CLOSE, fd) }
+}
+
+#[inline(always)]
+pub fn sys_dup3(oldfd: i32, newfd: i32, flags: u32) -> i64 {
+    unsafe { syscall3!(SYS_DUP3, oldfd, newfd, flags) }
 }
 
 #[inline(always)]

@@ -3,7 +3,6 @@
 use alloc::vec;
 
 use crate::arch::Uaccess;
-use crate::console::console_write;
 use crate::fs::{KernelError, RwFlags};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 
@@ -103,11 +102,6 @@ pub fn sys_readv(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
     // Empty iovec array - return 0
     if iovecs.is_empty() {
         return 0;
-    }
-
-    // Handle special fds (stdin)
-    if fd == 0 {
-        return 0; // stdin not implemented
     }
 
     // Get file from fd table
@@ -232,64 +226,6 @@ pub fn sys_readv(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
     total_read as i64
 }
 
-/// Helper for writev to stdout/stderr (console)
-///
-/// Gathers data from all iovecs and writes to console.
-fn writev_console(iovecs: &[IoVec]) -> i64 {
-    let mut total_written: usize = 0;
-
-    for iov in iovecs {
-        if iov.iov_len == 0 {
-            continue;
-        }
-
-        let count = core::cmp::min(iov.iov_len as usize, MAX_RW_COUNT - total_written);
-        if count == 0 {
-            break;
-        }
-
-        // Validate user buffer (already validated in validate_iovec_array, but double-check)
-        if !Uaccess::access_ok(iov.iov_base, count) {
-            return if total_written > 0 {
-                total_written as i64
-            } else {
-                KernelError::BadAddress.sysret()
-            };
-        }
-
-        if count <= SMALL_BUF_SIZE {
-            let mut stack_buf = [0u8; SMALL_BUF_SIZE];
-            let buf = &mut stack_buf[..count];
-
-            if copy_from_user::<Uaccess>(&mut buf[..count], iov.iov_base, count).is_err() {
-                return if total_written > 0 {
-                    total_written as i64
-                } else {
-                    KernelError::BadAddress.sysret()
-                };
-            }
-
-            console_write(buf);
-        } else {
-            let mut kernel_buf = vec![0u8; count];
-
-            if copy_from_user::<Uaccess>(&mut kernel_buf[..count], iov.iov_base, count).is_err() {
-                return if total_written > 0 {
-                    total_written as i64
-                } else {
-                    KernelError::BadAddress.sysret()
-                };
-            }
-
-            console_write(&kernel_buf);
-        }
-
-        total_written += count;
-    }
-
-    total_written as i64
-}
-
 /// sys_writev - gather write to a file descriptor
 ///
 /// Writes data from multiple buffers to fd (gather I/O).
@@ -311,11 +247,6 @@ pub fn sys_writev(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
     // Empty iovec array - return 0
     if iovecs.is_empty() {
         return 0;
-    }
-
-    // Handle special fds (stdout, stderr) - gather all data first
-    if fd == 1 || fd == 2 {
-        return writev_console(&iovecs);
     }
 
     // Get file from fd table
@@ -448,11 +379,6 @@ pub fn sys_preadv(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
     // Empty iovec array - return 0
     if iovecs.is_empty() {
         return 0;
-    }
-
-    // Handle stdin - pipes don't support positioned I/O
-    if fd == 0 {
-        return KernelError::IllegalSeek.sysret();
     }
 
     // Get file from fd table
@@ -609,11 +535,6 @@ pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
     // Empty iovec array - return 0
     if iovecs.is_empty() {
         return 0;
-    }
-
-    // Handle stdout/stderr - these don't support positioned I/O
-    if fd == 1 || fd == 2 {
-        return KernelError::IllegalSeek.sysret();
     }
 
     // Get file from fd table

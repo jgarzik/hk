@@ -10,7 +10,7 @@ use crate::fs::{
 };
 use crate::uaccess::strncpy_from_user;
 
-use super::flags::{O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_TRUNC};
+use super::flags::{O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDWR, O_TRUNC};
 use super::syscall::{AT_FDCWD, PATH_MAX, current_fd_table, get_nofile_limit};
 
 /// Create regular file `name` in `parent` for O_CREAT (Linux
@@ -148,7 +148,26 @@ fn do_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Result<i64, Ke
         Path::from_dentry(file.dentry.clone())
     };
 
-    let (dentry, created) = open_target(start, &path, flags, mode)?;
+    let file = filp_open(start, &path, flags, mode)?;
+
+    // Allocate file descriptor (RLIMIT_NOFILE enforced inside alloc)
+    let fd_table = current_fd_table();
+    let mut table = fd_table.lock();
+    match table.alloc(file, get_nofile_limit()) {
+        Ok(fd) => Ok(fd as i64),
+        Err(e) => Ok(-(e as i64)),
+    }
+}
+
+/// Open `path` (relative to `start`) as a new file (Linux do_filp_open):
+/// resolve or create the target, may_open, O_TRUNC, then the file object
+fn filp_open(
+    start: Option<Path>,
+    path: &str,
+    flags: u32,
+    mode: u32,
+) -> Result<Arc<File>, KernelError> {
+    let (dentry, created) = open_target(start, path, flags, mode)?;
     let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
 
     // O_NOFOLLOW on a trailing symlink: ELOOP (may_open's symlink case)
@@ -173,14 +192,23 @@ fn do_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Result<i64, Ke
             .unwrap_or(&RAMFS_FILE_OPS)
     };
 
-    let file = Arc::new(File::new(dentry, flags, f_op));
+    Ok(Arc::new(File::new(dentry, flags, f_op)))
+}
 
-    // Allocate file descriptor (RLIMIT_NOFILE enforced inside alloc)
-    let fd_table = current_fd_table();
-    let mut table = fd_table.lock();
-    match table.alloc(file, get_nofile_limit()) {
-        Ok(fd) => Ok(fd as i64),
-        Err(e) => Ok(-(e as i64)),
+/// Give init /dev/console as stdin, stdout and stderr (Linux
+/// console_on_rootfs); call in init's context before it runs
+pub fn console_on_rootfs() {
+    let file = match filp_open(None, "/dev/console", O_RDWR, 0) {
+        Ok(f) => f,
+        Err(_) => {
+            crate::printkln!("Warning: unable to open an initial console.");
+            return;
+        }
+    };
+    let table = current_fd_table();
+    let mut t = table.lock();
+    for fd in 0..3 {
+        t.alloc_at(fd, file.clone());
     }
 }
 
@@ -188,11 +216,6 @@ fn do_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Result<i64, Ke
 ///
 /// Returns 0 on success, negative errno on error.
 pub fn sys_close(fd: i32) -> i64 {
-    // Don't close stdin/stdout/stderr
-    if fd < 3 {
-        return 0;
-    }
-
     match current_fd_table().lock().close(fd) {
         Some(_) => 0,
         None => KernelError::BadFd.sysret(),
