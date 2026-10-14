@@ -1077,69 +1077,36 @@ fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool)
 /// 3. For user handlers, sets up the signal frame
 /// 4. For default actions, performs the action (terminate, stop, etc.)
 ///
+/// If a syscall left a temporary mask in place (`saved_sigmask`, e.g.
+/// rt_sigsuspend), the signal is dequeued under the temporary mask and the
+/// saved original mask is stored in the signal frame so rt_sigreturn restores
+/// it. If no handler frame is set up, the saved mask is restored immediately
+/// (Linux: set_restore_sigmask / restore_saved_sigmask).
+///
 /// Returns true if a signal was handled (frame set up or action taken),
 /// false if no signals were deliverable.
-#[cfg(target_arch = "x86_64")]
 pub fn do_signal() -> bool {
-    use crate::arch::x86_64::signal;
-
     let tid = crate::task::percpu::current_tid();
 
-    // Check if there are pending signals
-    if !has_pending_signals(tid) {
-        return false;
+    let handled = do_signal_inner(tid);
+    if !handled {
+        restore_saved_sigmask(tid);
     }
-
-    // Get next deliverable signal
-    let (sig, action) = match get_signal_to_deliver(tid) {
-        Some((s, a)) => (s, a),
-        None => return false,
-    };
-
-    // Handle based on action type
-    match action.handler {
-        SigHandler::Default => {
-            // Perform default action
-            handle_default_action(tid, sig)
-        }
-        SigHandler::Ignore => {
-            // Signal ignored, nothing to do
-            false
-        }
-        SigHandler::Handler(_) => {
-            // Get current blocked mask
-            let blocked =
-                with_task_signal_state(tid, |state| state.blocked).unwrap_or(SigSet::EMPTY);
-
-            // Set up signal frame
-            match signal::setup_rt_frame(sig, &action, blocked) {
-                Ok(()) => {
-                    // Update blocked mask: add action.mask and the signal itself (unless SA_NODEFER)
-                    with_task_signal_state(tid, |state| {
-                        state.blocked = state.blocked.union(&action.mask);
-                        if action.flags & sa_flags::SA_NODEFER == 0 {
-                            state.blocked.add(sig);
-                        }
-                        state.recalc_sigpending();
-                    });
-                    true
-                }
-                Err(_) => {
-                    // Frame setup failed (invalid stack) - force SIGSEGV
-                    force_sigsegv(tid);
-                    true
-                }
-            }
-        }
-    }
+    handled
 }
 
-/// Check for and deliver pending signals (aarch64 version)
-#[cfg(target_arch = "aarch64")]
-pub fn do_signal() -> bool {
-    use crate::arch::aarch64::signal;
+/// Restore and clear `saved_sigmask` if a syscall left one in place
+fn restore_saved_sigmask(tid: Tid) {
+    with_task_signal_state(tid, |state| {
+        if let Some(saved) = state.saved_sigmask.take() {
+            state.blocked = saved;
+            state.recalc_sigpending();
+        }
+    });
+}
 
-    let tid = crate::task::percpu::current_tid();
+fn do_signal_inner(tid: Tid) -> bool {
+    use crate::arch::signal;
 
     // Check if there are pending signals
     if !has_pending_signals(tid) {
@@ -1163,15 +1130,19 @@ pub fn do_signal() -> bool {
             false
         }
         SigHandler::Handler(_) => {
-            // Get current blocked mask
-            let blocked =
-                with_task_signal_state(tid, |state| state.blocked).unwrap_or(SigSet::EMPTY);
+            // Mask to save in the frame (restored by rt_sigreturn): the
+            // pre-syscall mask if a temporary one is in effect, else current.
+            let frame_mask =
+                with_task_signal_state(tid, |state| state.saved_sigmask.unwrap_or(state.blocked))
+                    .unwrap_or(SigSet::EMPTY);
 
             // Set up signal frame
-            match signal::setup_rt_frame(sig, &action, blocked) {
+            match signal::setup_rt_frame(sig, &action, frame_mask) {
                 Ok(()) => {
                     // Update blocked mask: add action.mask and the signal itself (unless SA_NODEFER)
                     with_task_signal_state(tid, |state| {
+                        // Saved mask now lives in the frame
+                        state.saved_sigmask = None;
                         state.blocked = state.blocked.union(&action.mask);
                         if action.flags & sa_flags::SA_NODEFER == 0 {
                             state.blocked.add(sig);
@@ -1182,6 +1153,7 @@ pub fn do_signal() -> bool {
                 }
                 Err(_) => {
                     // Frame setup failed (invalid stack) - force SIGSEGV
+                    restore_saved_sigmask(tid);
                     force_sigsegv(tid);
                     true
                 }

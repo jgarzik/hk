@@ -25,7 +25,7 @@ use hk_syscall::{
     sys_rt_sigaction, sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigqueueinfo,
     sys_rt_sigsuspend, sys_rt_sigtimedwait, sys_rt_tgsigqueueinfo, sys_sigaltstack,
     sys_tgkill, sys_tkill, sys_wait4, sys_write,
-    CLONE_CLEAR_SIGHAND, SA_RESTORER, SA_SIGINFO, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_UNBLOCK,
+    CLONE_CLEAR_SIGHAND, SA_RESTORER, SA_SIGINFO, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_SETMASK, SIG_UNBLOCK,
     SIGCHLD, SIGKILL, SIGPIPE, SIGUSR1,
 };
 
@@ -569,21 +569,45 @@ fn test_tgsigqueueinfo_wrong_tgid() {
     }
 }
 
-/// Test: rt_sigsuspend() - should return -EINTR
+/// Test: rt_sigsuspend() - returns -EINTR once a pending signal is delivered
+///
+/// Block SIGUSR1, make it pending, then suspend with an empty mask: the
+/// signal is delivered immediately (handler runs) and sigsuspend returns
+/// -EINTR. Without a pending signal, sigsuspend would block forever.
 fn test_sigsuspend() {
-    // sigsuspend always returns -EINTR when a signal is pending/delivered
-    // For this test, we set an empty mask (allowing all signals)
-    // and expect immediate -EINTR due to kernel's stub behavior
+    unsafe {
+        core::ptr::write_volatile(&raw mut HANDLER_INVOKED, false);
+    }
+    let action = SigActionData {
+        handler: test_signal_handler as *const () as u64,
+        flags: SA_SIGINFO | SA_RESTORER,
+        restorer: signal_restorer as *const () as u64,
+        mask: 0,
+    };
+    let default_action = SigActionData { handler: SIG_DFL, flags: 0, restorer: 0, mask: 0 };
+    let usr1_mask: u64 = 1 << (SIGUSR1 - 1);
+    let mut old_mask: u64 = 0;
 
-    let empty_mask: u64 = 0; // Don't block any signals
+    sys_rt_sigaction(SIGUSR1, &action as *const SigActionData as u64, 0, 8);
+    sys_rt_sigprocmask(SIG_BLOCK, &usr1_mask as *const u64 as u64, &mut old_mask as *mut u64 as u64, 8);
+    sys_kill(sys_getpid(), SIGUSR1);
+
+    let empty_mask: u64 = 0;
     let ret = sys_rt_sigsuspend(&empty_mask as *const u64 as u64, 8);
+    let invoked = unsafe { core::ptr::read_volatile(&raw const HANDLER_INVOKED) };
 
-    if ret == -4 {
-        // EINTR
+    sys_rt_sigprocmask(SIG_SETMASK, &old_mask as *const u64 as u64, 0, 8);
+    sys_rt_sigaction(SIGUSR1, &default_action as *const SigActionData as u64, 0, 8);
+
+    if ret == -4 && invoked {
         println(b"SIGSUSPEND:OK");
     } else {
-        print(b"SIGSUSPEND:FAIL: expected -4 (EINTR), got ");
+        print(b"SIGSUSPEND:FAIL: expected -4 (EINTR) with handler run, got ");
         print_num(ret);
+        if !invoked {
+            print(b" (handler not invoked)");
+        }
+        println(b"");
     }
 }
 

@@ -532,8 +532,11 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
 
 /// rt_sigsuspend(mask, sigsetsize) - wait for signal with temporary mask
 ///
-/// Temporarily replaces the signal mask and waits for a signal.
-/// Returns when a signal handler is invoked or a signal terminates the process.
+/// Atomically replaces the signal mask with `mask` and sleeps until a signal
+/// becomes deliverable. The original mask is kept in `saved_sigmask`; the
+/// syscall-return path (`do_signal`) delivers the signal under the temporary
+/// mask, stores the original mask in the signal frame (restored by
+/// rt_sigreturn), or restores it directly if no handler runs.
 ///
 /// # Arguments
 /// * `mask_ptr` - Pointer to temporary signal mask
@@ -544,8 +547,6 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
 /// * -EINVAL: Invalid sigsetsize
 /// * -EFAULT: Bad mask_ptr pointer
 pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
-    use crate::signal::has_pending_signals;
-
     if sigsetsize != 8 {
         return -22; // EINVAL
     }
@@ -558,45 +559,26 @@ pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
 
     let tid = current_tid();
 
-    // Save old mask and set new mask
-    let old_mask = with_task_signal_state(tid, |state| {
-        let old = state.blocked;
-        // Set new blocked mask, but never block SIGKILL/SIGSTOP
+    // Save old mask (restored on return to user) and install the new one
+    let ok = with_task_signal_state(tid, |state| {
+        state.saved_sigmask = Some(state.blocked);
+        // Never block SIGKILL/SIGSTOP
         state.blocked = new_mask.subtract(&UNMASKABLE_SIGNALS);
         state.recalc_sigpending();
-        old
     });
-
-    let old_mask = match old_mask {
-        Some(m) => m,
-        None => return -3, // ESRCH
-    };
-
-    // Check for immediately deliverable signals
-    // In a full implementation, we would loop here and block
-    // until a signal becomes deliverable
-    if has_pending_signals(tid) {
-        // Restore old mask before returning
-        with_task_signal_state(tid, |state| {
-            state.blocked = old_mask;
-            state.recalc_sigpending();
-        });
-        return -4; // EINTR
+    if ok.is_none() {
+        return -3; // ESRCH
     }
 
-    // TODO: In a complete implementation, we would:
-    // 1. Mark the task as sleeping/waiting
-    // 2. Schedule another task
-    // 3. When woken by a signal, restore the old mask
-    // 4. Return -EINTR
-    //
-    // For now, restore mask and return -EINTR
-    // This is sufficient for testing but not for real signal waiting
-    with_task_signal_state(tid, |state| {
-        state.blocked = old_mask;
-        state.recalc_sigpending();
-    });
+    // Sleep until a signal is deliverable under the temporary mask.
+    // Signal senders do not wake sleepers directly, so re-check every tick.
+    while !with_task_signal_state(tid, |state| state.has_deliverable_signals()).unwrap_or(true) {
+        let wake_tick = crate::time::current_ticks().saturating_add(1);
+        crate::task::percpu::sleep_current_until(wake_tick);
+    }
 
+    // Linux returns -ERESTARTNOHAND, which becomes -EINTR once a handler
+    // runs; hk has no syscall restart, so return -EINTR directly.
     -4 // EINTR
 }
 

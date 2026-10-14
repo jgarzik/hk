@@ -77,6 +77,13 @@ pub use x86_64::ptrace;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::ptrace;
 
+// Signal frame setup (setup_rt_frame) / rt_sigreturn
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::signal;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::signal;
+
 // Physical-to-virtual address conversion
 // Phase 1: Identity mapping (PAGE_OFFSET = 0)
 // Phase 2: High-address kernel (PAGE_OFFSET = direct map base)
