@@ -7,6 +7,7 @@ hk: Rust (stable, no nightly features) no_std SMP kernel, x86-64 + aarch64, Linu
 - Syscalls: aim for 100%. ioctls and /proc (/sys): pragmatic subset, driven by what real apps need — don't chase completeness.
 - Core functionality + modern hardware first; no legacy-hardware work. Test targets: QEMU (virtio), virtio guests, a Dell OptiPlex 3020 (real HW).
 - IPv6: full support is planned in a later chunk — never bake IPv4-only assumptions into shared network layers.
+- No users yet: complete freedom of internal design (rewrite, no compat shims for old internal APIs) as long as `doc/LOCKING.md` stays correct and the change fits this mission. External compatibility (Linux syscall ABI/semantics, `make check-linux`) is binding.
 
 ## Build / verify
 - Use Makefile targets only; bare `cargo build/clippy` fails (no_std needs `--target`).
