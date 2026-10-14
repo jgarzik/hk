@@ -68,6 +68,8 @@ impl HeapAllocator {
     /// The memory region must be valid and not used elsewhere.
     pub unsafe fn init(&self, start: usize, size: usize) {
         let mut inner = self.inner.lock();
+        let start = round_up(start, GRAIN);
+        let size = size & !(GRAIN - 1);
         inner.heap_start = start;
         inner.heap_end = start + size;
 
@@ -81,98 +83,92 @@ impl HeapAllocator {
     }
 }
 
+/// Block granularity: every block starts and ends 16-byte aligned so
+/// headers of split remainders are aligned
+const GRAIN: usize = 16;
+const HDR: usize = core::mem::size_of::<Block>();
+
+const fn round_up(n: usize, a: usize) -> usize {
+    (n + a - 1) & !(a - 1)
+}
+
 unsafe impl GlobalAlloc for HeapAllocator {
+    /// First fit over an address-ordered free list; a block is split
+    /// only if the remainder can hold a header and a minimal block,
+    /// otherwise the whole block is used (no bytes are ever lost)
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut inner = self.inner.lock();
-
         let size = layout.size().max(MIN_BLOCK_SIZE);
-        // Ensure alignment is at least usize for the back-pointer we store
         let align = layout.align().max(core::mem::align_of::<usize>());
-
-        // Total size needed: Block header + space for back-pointer + alignment + user data
-        // We need to store block_start just before the aligned user pointer
-        let total_size =
-            core::mem::size_of::<Block>() + core::mem::size_of::<usize>() + align + size;
-
-        // Search free list for suitable block
         let mut prev: Option<*mut Block> = None;
         let mut current = inner.free_list;
-
         while let Some(block) = current {
             unsafe {
-                if (*block).size >= total_size {
-                    // Found a suitable block
-                    let block_start = block as usize;
-                    let block_size = (*block).size;
-
-                    // Calculate where user data starts:
-                    // - After Block header
-                    // - After space for back-pointer (usize)
-                    // - Properly aligned
-                    let after_header =
-                        block_start + core::mem::size_of::<Block>() + core::mem::size_of::<usize>();
-                    let aligned_start = (after_header + align - 1) & !(align - 1);
-
-                    // Store block_start pointer just before user data
-                    let backptr_loc = (aligned_start - core::mem::size_of::<usize>()) as *mut usize;
-                    *backptr_loc = block_start;
-
-                    // Remove block from free list
+                let start = block as usize;
+                let bsize = (*block).size;
+                let aligned = round_up(start + HDR + core::mem::size_of::<usize>(), align);
+                let used = round_up(aligned - start + size, GRAIN);
+                if bsize >= used {
                     let next = (*block).next;
-                    if let Some(p) = prev {
-                        (*p).next = next;
+                    let link = if bsize - used >= HDR + MIN_BLOCK_SIZE {
+                        let rest = (start + used) as *mut Block;
+                        (*rest).size = bsize - used;
+                        (*rest).next = next;
+                        (*block).size = used;
+                        Some(rest)
                     } else {
-                        inner.free_list = next;
+                        next
+                    };
+                    match prev {
+                        Some(p) => (*p).next = link,
+                        None => inner.free_list = link,
                     }
-
-                    // Store the total allocated size in the block header (for dealloc)
-                    let used_size = aligned_start - block_start + size;
-                    (*block).size = used_size;
-
-                    // If there's enough remaining space, create a new free block
-                    if block_size - used_size >= MIN_BLOCK_SIZE + core::mem::size_of::<Block>() {
-                        let new_block = (block_start + used_size) as *mut Block;
-                        (*new_block).size = block_size - used_size;
-                        (*new_block).next = inner.free_list;
-                        inner.free_list = Some(new_block);
-                    }
-
-                    return aligned_start as *mut u8;
+                    *((aligned - core::mem::size_of::<usize>()) as *mut usize) = start;
+                    return aligned as *mut u8;
                 }
-
                 prev = current;
                 current = (*block).next;
             }
         }
-
-        // No suitable block found
         core::ptr::null_mut()
     }
 
+    /// Return a block to the address-ordered free list and merge it with
+    /// adjacent free neighbours, so freed memory does not fragment
+    /// forever
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         if ptr.is_null() {
             return;
         }
-
         let mut inner = self.inner.lock();
-
-        // Retrieve the block start from the back-pointer stored just before user data
-        let backptr_loc = (ptr as usize - core::mem::size_of::<usize>()) as *const usize;
-        let block_start = unsafe { *backptr_loc };
-
-        // Get the block header
-        let block = block_start as *mut Block;
-        let block_size = unsafe { (*block).size };
-
-        // Add block back to free list
         unsafe {
-            (*block).next = inner.free_list;
+            let start = *((ptr as usize - core::mem::size_of::<usize>()) as *const usize);
+            let block = start as *mut Block;
+            let mut prev: Option<*mut Block> = None;
+            let mut cur = inner.free_list;
+            while let Some(c) = cur {
+                if c as usize > start {
+                    break;
+                }
+                prev = cur;
+                cur = (*c).next;
+            }
+            (*block).next = cur;
+            if let Some(c) = cur
+                && start + (*block).size == c as usize
+            {
+                (*block).size += (*c).size;
+                (*block).next = (*c).next;
+            }
+            match prev {
+                Some(p) if p as usize + (*p).size == start => {
+                    (*p).size += (*block).size;
+                    (*p).next = (*block).next;
+                }
+                Some(p) => (*p).next = Some(block),
+                None => inner.free_list = Some(block),
+            }
         }
-        inner.free_list = Some(block);
-
-        // Note: We don't coalesce adjacent blocks for simplicity.
-        // A more sophisticated allocator would merge adjacent free blocks.
-        let _ = block_size; // Silence unused warning (size is already in block header)
     }
 }
 
@@ -181,5 +177,40 @@ unsafe impl Sync for HeapAllocator {}
 impl Default for HeapAllocator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(align(16))]
+    struct Arena([u8; 64 * 1024]);
+
+    #[test]
+    fn frees_coalesce() {
+        let mut arena = Box::new(Arena([0; 64 * 1024]));
+        let h = HeapAllocator::new();
+        unsafe { h.init(arena.0.as_mut_ptr() as usize, arena.0.len()) };
+        let big = Layout::from_size_align(60 * 1024, 8).unwrap();
+        let mut ptrs = std::vec::Vec::new();
+        for i in 0..200 {
+            let l = Layout::from_size_align(16 + (i % 7) * 40, 8 << (i % 3)).unwrap();
+            let p = unsafe { h.alloc(l) };
+            assert!(!p.is_null());
+            assert_eq!(p as usize % l.align(), 0);
+            ptrs.push((p, l));
+        }
+        // Free in an interleaved order, then the whole arena is one block
+        for (i, (p, l)) in ptrs.iter().enumerate().filter(|(i, _)| i % 2 == 0) {
+            let _ = i;
+            unsafe { h.dealloc(*p, *l) };
+        }
+        for (p, l) in ptrs.iter().skip(1).step_by(2) {
+            unsafe { h.dealloc(*p, *l) };
+        }
+        let p = unsafe { h.alloc(big) };
+        assert!(!p.is_null());
+        unsafe { h.dealloc(p, big) };
     }
 }
