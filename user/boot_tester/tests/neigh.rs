@@ -159,7 +159,7 @@ fn test_admin(idx: u32) {
     };
     let ip = [10, 0, 2, 99];
     let mac = [0x02, 0, 0, 0, 0, 0x99];
-    let mut add = |nl: &mut Nl, ifindex: u32, flags: u16, dst: bool, ll: bool| -> i64 {
+    let add = |nl: &mut Nl, ifindex: u32, flags: u16, dst: bool, ll: bool| -> i64 {
         let mut r = Req::new(RTM_NEWNEIGH, flags, &ndmsg(AF_INET, ifindex, NUD_PERMANENT));
         if dst {
             r.attr(NDA_DST, &ip);
@@ -198,7 +198,7 @@ fn test_admin(idx: u32) {
     let n = read_file(b"/proc/net/arp\0", &mut abuf);
     let line = arp_line(&abuf[..n.max(0) as usize], b"10.0.2.99");
     t.ok(b"proc perm", line.is_some_and(|l| contains(l, b"0x6 ") && contains(l, b"02:00:00:00:00:99")), 0);
-    let mut del = |nl: &mut Nl| -> i64 {
+    let del = |nl: &mut Nl| -> i64 {
         let mut r = Req::new(RTM_DELNEIGH, 0, &ndmsg(AF_INET, idx, 0));
         r.attr(NDA_DST, &ip);
         nl.ack(&mut r) as i64

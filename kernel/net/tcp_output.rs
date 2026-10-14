@@ -88,7 +88,7 @@ pub fn tcp_sendmsg(socket: &Arc<TcpSock>, data: &[u8]) -> Result<usize, KernelEr
         skb.saddr = Some(local_addr);
         skb.daddr = Some(remote_addr);
 
-        ipv4::ip_queue_xmit(&socket.sk.net, skb, IPPROTO_TCP)?;
+        ipv4::ip_queue_xmit(&socket.sk.net, skb, IPPROTO_TCP, socket.inet.params())?;
 
         sent += chunk_len;
     }
@@ -127,7 +127,7 @@ pub fn tcp_send_syn(socket: &Arc<TcpSock>) -> Result<(), KernelError> {
     skb.saddr = Some(local_addr);
     skb.daddr = Some(remote_addr);
 
-    ipv4::ip_queue_xmit(&socket.sk.net, skb, IPPROTO_TCP)
+    ipv4::ip_queue_xmit(&socket.sk.net, skb, IPPROTO_TCP, socket.inet.params())
 }
 
 /// Send an ACK segment
@@ -157,7 +157,7 @@ pub fn tcp_send_ack(socket: &Arc<TcpSock>) -> Result<(), KernelError> {
     skb.saddr = Some(local_addr);
     skb.daddr = Some(remote_addr);
 
-    ipv4::ip_queue_xmit(&socket.sk.net, skb, IPPROTO_TCP)
+    ipv4::ip_queue_xmit(&socket.sk.net, skb, IPPROTO_TCP, socket.inet.params())
 }
 
 /// Send a FIN segment
@@ -190,7 +190,7 @@ pub fn tcp_send_fin(socket: &Arc<TcpSock>) -> Result<(), KernelError> {
     skb.saddr = Some(local_addr);
     skb.daddr = Some(remote_addr);
 
-    ipv4::ip_queue_xmit(&socket.sk.net, skb, IPPROTO_TCP)
+    ipv4::ip_queue_xmit(&socket.sk.net, skb, IPPROTO_TCP, socket.inet.params())
 }
 
 /// Send a SYN-ACK segment in response to a SYN on a listening socket
@@ -221,7 +221,7 @@ pub fn tcp_send_synack(listener: &Arc<TcpSock>, req: &RequestSock) -> Result<(),
     skb.saddr = Some(req.local_addr);
     skb.daddr = Some(req.remote_addr);
 
-    ipv4::ip_queue_xmit(&listener.sk.net, skb, IPPROTO_TCP)
+    ipv4::ip_queue_xmit(&listener.sk.net, skb, IPPROTO_TCP, listener.inet.params())
 }
 
 /// Send a RST segment (with ACK of `ack` if given; Linux
@@ -254,7 +254,7 @@ pub fn tcp_send_rst(
     )?;
     skb.saddr = Some(local_addr);
     skb.daddr = Some(remote_addr);
-    ipv4::ip_queue_xmit(net, skb, IPPROTO_TCP)
+    ipv4::ip_queue_xmit(net, skb, IPPROTO_TCP, Default::default())
 }
 
 /// Build a TCP header

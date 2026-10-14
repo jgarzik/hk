@@ -168,7 +168,7 @@ fn icmp_echo_reply(
     skb.daddr = Some(dest);
 
     // Send through IP layer
-    if ipv4::ip_queue_xmit(net, skb, IPPROTO_ICMP).is_ok() {
+    if ipv4::ip_queue_xmit(net, skb, IPPROTO_ICMP, Default::default()).is_ok() {
         ICMP_OUT_ECHO_REPS.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -195,7 +195,7 @@ pub fn icmp_send_echo(
     let checksum = compute_checksum(skb.data());
     skb.data_mut()[2..4].copy_from_slice(&checksum.to_be_bytes());
     skb.daddr = Some(dest);
-    ipv4::ip_queue_xmit(net, skb, IPPROTO_ICMP)
+    ipv4::ip_queue_xmit(net, skb, IPPROTO_ICMP, Default::default())
 }
 
 /// Compute ICMP checksum
@@ -227,3 +227,8 @@ fn compute_checksum(data: &[u8]) -> u16 {
 fn verify_checksum(data: &[u8]) -> bool {
     compute_checksum(data) == 0
 }
+
+/// A reassembly queue timed out with its first fragment in (`first`:
+/// its IP header + leading payload): ICMP time exceeded comes with the
+/// ICMP error rework
+pub fn frag_expired(_net: &NetNamespace, _first: &[u8]) {}

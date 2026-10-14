@@ -789,38 +789,17 @@ fn skb_truesize(skb: &SkBuff) -> usize {
 /// Registered tables (pruned when their namespace goes away)
 static TABLES: Mutex<Vec<Weak<NeighTable>>> = Mutex::new(Vec::new());
 
-/// The armed kernel timer and its deadline (ms)
-struct Armed {
-    handle: crate::timer::TimerHandle,
-    at: u64,
-}
-
-static TIMER: Mutex<Armed> = Mutex::new(Armed {
-    handle: crate::timer::TimerHandle::NULL,
-    at: u64::MAX,
-});
+static ALARM: crate::timer::Alarm = crate::timer::Alarm::new(neigh_timer);
 
 /// Make sure the neighbour timer fires no later than `at` (ms)
 fn arm(at: u64) {
-    let mut t = TIMER.lock();
-    if t.handle.is_valid() && t.at <= at {
-        return;
-    }
-    if t.handle.is_valid() {
-        crate::timer::timer_del(t.handle);
-    }
-    t.at = at;
-    t.handle = crate::timer::timer_add(at.saturating_mul(1_000_000), 0, neigh_timer, 0);
+    ALARM.arm(at.saturating_mul(1_000_000));
 }
 
 /// Timer callback (ktimerd): run every table, re-arm for the earliest
 /// deadline
 fn neigh_timer(_: u64) {
-    {
-        let mut t = TIMER.lock();
-        t.handle = crate::timer::TimerHandle::NULL;
-        t.at = u64::MAX;
-    }
+    ALARM.fired();
     let tables: Vec<Arc<NeighTable>> = {
         let mut v = TABLES.lock();
         v.retain(|w| w.strong_count() > 0);

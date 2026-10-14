@@ -93,6 +93,8 @@ pub struct SkBuff {
     pub ip_tos: u8,
     /// Start of the MAC header in the buffer (null until received)
     mac: *mut u8,
+    /// Start of the IP header of a received packet (null until marked)
+    nh: *mut u8,
 }
 
 /// Checksum state for hardware offload
@@ -158,6 +160,7 @@ impl SkBuff {
             ip_ttl: 0,
             ip_tos: 0,
             mac: core::ptr::null_mut(),
+            nh: core::ptr::null_mut(),
         }))
     }
 
@@ -338,6 +341,7 @@ impl SkBuff {
         self.pkt_type = PktType::Host;
         self.ip_bcast = false;
         self.mac = core::ptr::null_mut();
+        self.nh = core::ptr::null_mut();
     }
 
     // Header offset helpers
@@ -390,6 +394,21 @@ impl SkBuff {
         }
         let len = self.tail as usize - self.mac as usize;
         Some(unsafe { core::slice::from_raw_parts(self.mac, len) })
+    }
+
+    /// Record the current data pointer as the start of the IP header
+    pub fn mark_network_header(&mut self) {
+        self.nh = self.data;
+    }
+
+    /// The received packet from its IP header to the end (after the
+    /// header was pulled), if one was recorded
+    pub fn network_packet(&self) -> Option<&[u8]> {
+        if self.nh.is_null() {
+            return None;
+        }
+        let len = self.tail as usize - self.nh as usize;
+        Some(unsafe { core::slice::from_raw_parts(self.nh, len) })
     }
 
     /// Network namespace of the skb's device (receive path: the namespace

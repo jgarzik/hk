@@ -77,6 +77,15 @@ pub struct NetNamespace {
     /// /proc/sys/net values (`net::sysctl`)
     pub sysctl: crate::net::sysctl::NetSysctl,
 
+    /// IPv4 reassembly queues
+    pub frags: crate::net::inet::frag::FragTable,
+
+    /// Learned path MTUs
+    pub pmtu: crate::net::inet::route::PmtuCache,
+
+    /// Key of the IP identification hash (Linux ip_id_key)
+    pub ip_id_key: [u64; 2],
+
     /// ARP neighbour table (IPv6 neighbour discovery gets its own)
     pub arp: Arc<crate::net::neigh::NeighTable>,
 
@@ -98,6 +107,14 @@ impl NetNamespace {
             tcp_bind: Default::default(),
             port_range: PortRange::default(),
             sysctl: Default::default(),
+            frags: Default::default(),
+            pmtu: Default::default(),
+            ip_id_key: [
+                ((crate::random::get_random_u32() as u64) << 32)
+                    | crate::random::get_random_u32() as u64,
+                ((crate::random::get_random_u32() as u64) << 32)
+                    | crate::random::get_random_u32() as u64,
+            ],
             arp: crate::net::neigh::NeighTable::new(&crate::net::arp::ARP_OPS),
             loopback: RwLock::new(None),
         });

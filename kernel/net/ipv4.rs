@@ -5,14 +5,17 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::net::KernelError;
 use crate::net::NetNamespace;
 use crate::net::arp;
 use crate::net::ethernet::{self, ETH_ALEN, EtherType};
+use crate::net::inet::frag::Defrag;
 use crate::net::inet::route::{self, IpInput};
-use crate::net::skb::SkBuff;
+use crate::net::skb::{NET_SKB_PAD, SkBuff};
 use crate::net::tcp;
 use crate::net::udp;
 
@@ -201,12 +204,39 @@ impl Ipv4Hdr {
     }
 }
 
-/// Global IP ID counter for fragmentation
-static IP_ID: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
+/// Identification buckets (Linux ip_idents / ip_tstamps)
+const IDENTS: usize = 2048;
+static IP_IDENTS: [AtomicU32; IDENTS] = [const { AtomicU32::new(0) }; IDENTS];
+static IP_TSTAMPS: [AtomicU32; IDENTS] = [const { AtomicU32::new(0) }; IDENTS];
 
-/// Get next IP ID
-fn next_ip_id() -> u16 {
-    IP_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+/// Reserve `segs` ids from bucket `hash`, jumping by a random amount
+/// that grows with the time since the bucket was last used, so ids do
+/// not leak traffic counts (Linux ip_idents_reserve)
+fn idents_reserve(hash: u32, segs: u32) -> u32 {
+    let b = hash as usize & (IDENTS - 1);
+    let now = crate::time::current_ticks() as u32;
+    let old = IP_TSTAMPS[b].load(Ordering::Relaxed);
+    let mut delta = 0;
+    if old != now
+        && IP_TSTAMPS[b]
+            .compare_exchange(old, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        delta = crate::random::get_random_u32() % now.wrapping_sub(old).max(1);
+    }
+    IP_IDENTS[b]
+        .fetch_add(segs + delta, Ordering::Relaxed)
+        .wrapping_add(delta)
+}
+
+/// IP id for a datagram without a connected socket's counter (Linux
+/// __ip_select_ident: per-destination bucket chosen by a keyed hash)
+pub fn select_ident(net: &NetNamespace, saddr: Ipv4Addr, daddr: Ipv4Addr, proto: u8) -> u16 {
+    let h = crate::net::inet::port::siphash(
+        net.ip_id_key,
+        &[((daddr.0 as u64) << 32) | saddr.0 as u64, proto as u64],
+    );
+    idents_reserve(h as u32, 1) as u16
 }
 
 /// Compute IP checksum
@@ -272,103 +302,165 @@ pub fn pseudo_header_checksum(saddr: Ipv4Addr, daddr: Ipv4Addr, protocol: u8, le
 /// `skb.data()` starts at the IP header (eth_type_trans pulled the MAC
 /// header). The packet's namespace is its device's.
 pub fn ip_rcv(mut skb: SkBuff) {
-    if skb.len() < IP_HLEN_MIN {
+    let Some(ihl) = ip_check(&mut skb) else {
         return;
-    }
-
-    // Parse IP header
-    let hdr = unsafe { &*(skb.data().as_ptr() as *const Ipv4Hdr) };
-
-    // Validate version
-    if hdr.version() != 4 {
-        return;
-    }
-
-    // Validate header length
-    let ihl = hdr.ihl();
-    if ihl < IP_HLEN_MIN || ihl > skb.len() {
-        return;
-    }
-
-    // Verify checksum
-    if !ip_check_checksum(&skb.data()[..ihl]) {
-        return;
-    }
-
-    // Validate total length
-    let tot_len = hdr.tot_len() as usize;
-    if tot_len < ihl || tot_len > skb.len() {
-        return;
-    }
-
-    // Trim any padding
-    if tot_len < skb.len() {
-        skb.trim(skb.len() - tot_len);
-    }
-
-    // We don't support fragmentation yet
-    if hdr.is_fragment() {
-        return;
-    }
-
-    // Input route (Linux ip_route_input_slow): local delivery only, no
-    // forwarding; martians and frames for other hosts are dropped
+    };
     let Some(dev) = skb.dev.clone() else {
         return;
     };
     let Some(net) = dev.net() else {
         return;
     };
-    match route::input(&net, hdr.saddr(), hdr.daddr(), &dev) {
-        IpInput::Local => skb.ip_bcast = false,
-        IpInput::Broadcast => skb.ip_bcast = true,
+    let (saddr, daddr) = {
+        let h = skb.data();
+        (
+            Ipv4Addr::from_be_bytes([h[12], h[13], h[14], h[15]]),
+            Ipv4Addr::from_be_bytes([h[16], h[17], h[18], h[19]]),
+        )
+    };
+    // Input route (Linux ip_route_input_slow): local delivery only, no
+    // forwarding; martians and frames for other hosts are dropped
+    skb.ip_bcast = match route::input(&net, saddr, daddr, &dev) {
+        IpInput::Local => false,
+        IpInput::Broadcast => true,
         IpInput::Drop(_) => return,
-    }
-
-    // Store protocol info in skb
-    skb.ip_protocol = hdr.protocol;
-    skb.ip_ttl = hdr.ttl;
-    skb.ip_tos = hdr.tos;
-    skb.saddr = Some(hdr.saddr());
-    skb.daddr = Some(hdr.daddr());
-
-    // Set transport header offset
-    skb.set_transport_header(ihl);
-
-    // Skip IP header and dispatch to transport layer
-    if skb.pull(ihl).is_none() {
+    };
+    if !ip_options_ok(&skb.data()[IP_HLEN_MIN..ihl]) {
         return;
     }
-
-    match hdr.protocol {
-        IPPROTO_TCP => tcp::tcp_rcv(skb),
-        IPPROTO_UDP => udp::udp_rcv(skb),
-        IPPROTO_ICMP => crate::net::icmp::icmp_rcv(skb),
-        _ => {
-            // Unknown protocol, drop
-        }
+    let fo = u16::from_be_bytes([skb.data()[6], skb.data()[7]]);
+    if fo & 0x3fff == 0 {
+        return ip_local_deliver(skb);
+    }
+    // Linux ip_local_deliver -> ip_defrag
+    if let Defrag::Whole(pkt) = net.frags.add(&net, skb.data())
+        && let Some(whole) = rebuild(&skb, &pkt)
+    {
+        ip_local_deliver(whole);
     }
 }
 
-/// Queue a packet for transmission in namespace `net` with default
-/// TOS/TTL: routes `skb.daddr` from `skb.saddr` (0 = the route's
-/// source), then `ip_send_rt`
+/// Header validation (Linux ip_rcv_core): version, header length,
+/// checksum, total length; trims link-layer padding. Returns the
+/// header length.
+fn ip_check(skb: &mut SkBuff) -> Option<usize> {
+    let h = skb.data();
+    if h.len() < IP_HLEN_MIN || h[0] >> 4 != 4 {
+        return None;
+    }
+    let ihl = ((h[0] & 0x0f) as usize) * 4;
+    if ihl < IP_HLEN_MIN || ihl > h.len() || !ip_check_checksum(&h[..ihl]) {
+        return None;
+    }
+    let tot = u16::from_be_bytes([h[2], h[3]]) as usize;
+    if tot < ihl || tot > h.len() {
+        return None;
+    }
+    let pad = h.len() - tot;
+    skb.trim(pad)?;
+    Some(ihl)
+}
+
+/// IP option types
+const IPOPT_END: u8 = 0;
+const IPOPT_NOOP: u8 = 1;
+const IPOPT_LSRR: u8 = 131;
+const IPOPT_SSRR: u8 = 137;
+
+/// Options are skipped, but must be well formed, and source-routed
+/// packets are dropped (Linux ip_options_compile + accept_source_route
+/// = 0)
+pub fn ip_options_ok(opt: &[u8]) -> bool {
+    let mut i = 0;
+    while i < opt.len() {
+        match opt[i] {
+            IPOPT_END => return true,
+            IPOPT_NOOP => i += 1,
+            t => {
+                let Some(&l) = opt.get(i + 1) else {
+                    return false;
+                };
+                let l = l as usize;
+                if l < 2 || i + l > opt.len() || t == IPOPT_LSRR || t == IPOPT_SSRR {
+                    return false;
+                }
+                i += l;
+            }
+        }
+    }
+    true
+}
+
+/// A reassembled datagram as a received skb (device and link-layer
+/// classification of its last fragment)
+fn rebuild(last: &SkBuff, pkt: &[u8]) -> Option<SkBuff> {
+    let mut s = SkBuff::alloc(NET_SKB_PAD, pkt.len())?;
+    s.put_slice(pkt)?;
+    s.dev = last.dev.clone();
+    s.pkt_type = last.pkt_type;
+    s.ip_bcast = last.ip_bcast;
+    Some(*s)
+}
+
+/// Deliver a whole datagram for us to its protocol (Linux
+/// ip_local_deliver_finish)
+fn ip_local_deliver(mut skb: SkBuff) {
+    let mut h = [0u8; IP_HLEN_MIN];
+    h.copy_from_slice(&skb.data()[..IP_HLEN_MIN]);
+    let ihl = ((h[0] & 0x0f) as usize) * 4;
+    let proto = h[9];
+    skb.ip_protocol = proto;
+    skb.ip_tos = h[1];
+    skb.ip_ttl = h[8];
+    skb.saddr = Some(Ipv4Addr::from_be_bytes([h[12], h[13], h[14], h[15]]));
+    skb.daddr = Some(Ipv4Addr::from_be_bytes([h[16], h[17], h[18], h[19]]));
+    skb.mark_network_header();
+    if skb.pull(ihl).is_none() {
+        return;
+    }
+    match proto {
+        IPPROTO_TCP => tcp::tcp_rcv(skb),
+        IPPROTO_UDP => udp::udp_rcv(skb),
+        IPPROTO_ICMP => crate::net::icmp::icmp_rcv(skb),
+        _ => {}
+    }
+}
+
+/// Transmit a packet from `skb.saddr` (0 = the route's source) to
+/// `skb.daddr` in namespace `net` (Linux ip_queue_xmit without the
+/// socket's cached route)
 pub fn ip_queue_xmit(
     net: &NetNamespace,
     skb: Box<SkBuff>,
     protocol: u8,
+    p: IpParams,
 ) -> Result<(), KernelError> {
     let daddr = skb.daddr.ok_or(KernelError::InvalidArgument)?;
     let src = skb.saddr.unwrap_or_default();
     let rt = route::output(net, daddr, src, 0)?;
-    ip_send_rt(net, &rt, skb, protocol, IpParams::default())
+    ip_send_rt(net, &rt, skb, protocol, p)
 }
 
-/// Per-packet IP header parameters (Linux ipcm_cookie subset)
+/// Path MTU discovery modes (IP_MTU_DISCOVER values)
+pub mod pmtu {
+    pub const DONT: u8 = 0;
+    pub const WANT: u8 = 1;
+    pub const DO: u8 = 2;
+    pub const PROBE: u8 = 3;
+    pub const INTERFACE: u8 = 4;
+    pub const OMIT: u8 = 5;
+}
+
+/// Per-packet IP header parameters (Linux ipcm_cookie + inet_sock bits)
 #[derive(Clone, Copy, Debug)]
 pub struct IpParams {
     pub tos: u8,
     pub ttl: u8,
+    /// IP_MTU_DISCOVER mode (`pmtu::*`)
+    pub pmtudisc: u8,
+    /// Identification from a connected socket's counter (Linux
+    /// inet_id); None = DF packets get 0, others a hashed id
+    pub id: Option<u16>,
 }
 
 impl Default for IpParams {
@@ -376,16 +468,39 @@ impl Default for IpParams {
         Self {
             tos: 0,
             ttl: IP_DEFAULT_TTL,
+            pmtudisc: pmtu::WANT,
+            id: None,
         }
     }
 }
 
+impl IpParams {
+    /// MTU the packet is sized against (Linux ip_sk_use_pmtu: PROBE,
+    /// INTERFACE and OMIT ignore the learned path MTU)
+    fn mtu(&self, rt: &route::Rtable) -> usize {
+        if self.pmtudisc < pmtu::PROBE {
+            rt.mtu as usize
+        } else {
+            rt.dev.mtu() as usize
+        }
+    }
+
+    /// Larger datagrams may be fragmented (Linux ip_sk_ignore_df)
+    fn may_frag(&self) -> bool {
+        self.pmtudisc < pmtu::DO || self.pmtudisc == pmtu::OMIT
+    }
+
+    /// DF on a packet that fits (Linux __ip_make_skb)
+    fn df(&self) -> bool {
+        matches!(self.pmtudisc, pmtu::WANT | pmtu::DO | pmtu::PROBE)
+    }
+}
+
 /// Build the IP header for `skb` (source `skb.saddr`, else the route's)
-/// and send it along `rt` (`lo` for local destinations; ARP for the next
-/// hop otherwise). EMSGSIZE above the device MTU (DF; no fragmentation
-/// yet). Never delivers synchronously: `lo` queues to the receive
-/// backlog. Callers may hold a socket lock (lock order: socket -> FIB
-/// -> ARP -> device TX).
+/// and send it along `rt`, fragmenting a datagram larger than the MTU
+/// when the socket's PMTU mode allows (else EMSGSIZE). Never delivers
+/// synchronously: `lo` queues to the receive backlog. Callers may hold a
+/// socket lock (lock order: socket -> FIB -> neighbour -> device TX).
 pub fn ip_send_rt(
     net: &NetNamespace,
     rt: &route::Rtable,
@@ -395,33 +510,92 @@ pub fn ip_send_rt(
 ) -> Result<(), KernelError> {
     let src = skb.saddr.unwrap_or_default();
     let saddr = if src.is_unspecified() { rt.saddr } else { src };
-    let daddr = rt.daddr;
-    let dev = rt.dev.clone();
-    let next_hop = rt.nexthop();
     let tot_len = IP_HLEN_MIN + skb.len();
-    if tot_len > dev.mtu() as usize || tot_len > u16::MAX as usize {
+    let mtu = p.mtu(rt);
+    let frag = tot_len > mtu;
+    if tot_len > u16::MAX as usize || (frag && !p.may_frag()) {
         return Err(KernelError::MessageTooLong);
     }
-    let ip_hdr = skb.push(IP_HLEN_MIN).ok_or(KernelError::NoBufferSpace)?;
-    ip_hdr[0] = 0x45;
-    ip_hdr[1] = p.tos;
-    ip_hdr[2..4].copy_from_slice(&(tot_len as u16).to_be_bytes());
-    ip_hdr[4..6].copy_from_slice(&next_ip_id().to_be_bytes());
-    // Don't Fragment
-    ip_hdr[6] = 0x40;
-    ip_hdr[7] = 0;
-    ip_hdr[8] = p.ttl;
-    ip_hdr[9] = protocol;
-    ip_hdr[10] = 0;
-    ip_hdr[11] = 0;
-    ip_hdr[12..16].copy_from_slice(&saddr.to_be_bytes());
-    ip_hdr[16..20].copy_from_slice(&daddr.to_be_bytes());
-    let checksum = ip_checksum(&ip_hdr[..IP_HLEN_MIN]);
-    ip_hdr[10..12].copy_from_slice(&checksum.to_be_bytes());
-    skb.dev = Some(Arc::clone(&dev));
+    let df = !frag && p.df();
+    let id = match p.id {
+        Some(id) => id,
+        None if df => 0,
+        None => select_ident(net, saddr, rt.daddr, protocol),
+    };
+    let h = skb.push(IP_HLEN_MIN).ok_or(KernelError::NoBufferSpace)?;
+    h[0] = 0x45;
+    h[1] = p.tos;
+    h[2..4].copy_from_slice(&(tot_len as u16).to_be_bytes());
+    h[4..6].copy_from_slice(&id.to_be_bytes());
+    h[6] = if df { 0x40 } else { 0 };
+    h[7] = 0;
+    h[8] = p.ttl;
+    h[9] = protocol;
+    h[10] = 0;
+    h[11] = 0;
+    h[12..16].copy_from_slice(&saddr.to_be_bytes());
+    h[16..20].copy_from_slice(&rt.daddr.to_be_bytes());
+    let c = ip_checksum(&h[..IP_HLEN_MIN]);
+    h[10..12].copy_from_slice(&c.to_be_bytes());
+    ip_output(net, rt, skb, saddr, mtu)
+}
 
+/// Send a packet with a complete IP header along `rt`, fragmenting it
+/// to `mtu` if needed (Linux ip_finish_output -> ip_fragment)
+pub fn ip_output(
+    net: &NetNamespace,
+    rt: &route::Rtable,
+    mut skb: Box<SkBuff>,
+    saddr: Ipv4Addr,
+    mtu: usize,
+) -> Result<(), KernelError> {
+    skb.dev = Some(Arc::clone(&rt.dev));
     skb.saddr = Some(saddr);
-    neigh_output(net, &dev, rt, next_hop, skb)
+    skb.daddr = Some(rt.daddr);
+    if skb.len() <= mtu {
+        return neigh_output(net, &rt.dev, rt, rt.nexthop(), skb);
+    }
+    for f in fragment(&skb, mtu)? {
+        neigh_output(net, &rt.dev, rt, rt.nexthop(), f)?;
+    }
+    Ok(())
+}
+
+/// Split an IP packet (no options are ever generated, so every fragment
+/// repeats the header) into fragments of at most `mtu` bytes (Linux
+/// ip_do_fragment slow path)
+pub fn fragment(skb: &SkBuff, mtu: usize) -> Result<Vec<Box<SkBuff>>, KernelError> {
+    let pkt = skb.data();
+    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+    let room = (mtu.saturating_sub(ihl)) & !7;
+    if room == 0 {
+        return Err(KernelError::MessageTooLong);
+    }
+    let payload = &pkt[ihl..];
+    let mut out = Vec::new();
+    let mut off = 0;
+    while off < payload.len() {
+        let len = room.min(payload.len() - off);
+        let more = off + len < payload.len();
+        let mut f = SkBuff::alloc_tx(ihl + len).ok_or(KernelError::NoBufferSpace)?;
+        f.put_slice(&pkt[..ihl]).ok_or(KernelError::NoBufferSpace)?;
+        f.put_slice(&payload[off..off + len])
+            .ok_or(KernelError::NoBufferSpace)?;
+        let h = f.data_mut();
+        h[2..4].copy_from_slice(&((ihl + len) as u16).to_be_bytes());
+        let fo = (off / 8) as u16 | if more { 0x2000 } else { 0 };
+        h[6..8].copy_from_slice(&fo.to_be_bytes());
+        h[10] = 0;
+        h[11] = 0;
+        let c = ip_checksum(&h[..ihl]);
+        h[10..12].copy_from_slice(&c.to_be_bytes());
+        f.dev = skb.dev.clone();
+        f.saddr = skb.saddr;
+        f.daddr = skb.daddr;
+        out.push(f);
+        off += len;
+    }
+    Ok(out)
 }
 
 /// Link-layer destination of a routed packet (Linux ip_finish_output2:

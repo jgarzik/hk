@@ -29,6 +29,8 @@ pub struct Rtable {
     pub gateway: Option<Ipv4Addr>,
     /// Table the route came from (RT_TABLE_*; 0 if synthesized)
     pub table: u32,
+    /// Path MTU: the device's, or less if learned (ICMP frag needed)
+    pub mtu: u32,
 }
 
 impl Rtable {
@@ -43,8 +45,23 @@ fn zeronet(a: Ipv4Addr) -> bool {
 }
 
 /// Route a locally generated packet to `daddr` from `saddr` (0 = pick
-/// one) through `oif` (0 = any)
+/// one) through `oif` (0 = any); the MTU reflects a learned path MTU
 pub fn output(
+    net: &NetNamespace,
+    daddr: Ipv4Addr,
+    saddr: Ipv4Addr,
+    oif: u32,
+) -> Result<Rtable, KernelError> {
+    let mut rt = output_fib(net, daddr, saddr, oif)?;
+    if rt.rtype == RouteType::Unicast
+        && let Some(m) = net.pmtu.get(rt.daddr)
+    {
+        rt.mtu = rt.mtu.min(m);
+    }
+    Ok(rt)
+}
+
+fn output_fib(
     net: &NetNamespace,
     mut daddr: Ipv4Addr,
     mut saddr: Ipv4Addr,
@@ -172,6 +189,7 @@ fn make(
     } else {
         None
     };
+    let mtu = dev.mtu();
     Ok(Rtable {
         dev,
         rtype,
@@ -179,7 +197,62 @@ fn make(
         daddr,
         gateway,
         table,
+        mtu,
     })
+}
+
+/// ip_rt_min_pmtu / ip_rt_mtu_expires
+pub const MIN_PMTU: u32 = 552;
+const PMTU_EXPIRES: u64 = 600_000;
+/// Destinations remembered
+const PMTU_MAX: usize = 256;
+
+/// Learned path MTUs by destination (Linux fib_nh_exception PMTU part).
+/// Peer-driven (ICMP frag needed), so bounded: at most `PMTU_MAX`
+/// entries, the soonest-expiring evicted first; entries expire after
+/// 10 minutes. `spin::Mutex` leaf, thread context only.
+#[derive(Default)]
+pub struct PmtuCache {
+    m: spin::Mutex<alloc::collections::BTreeMap<Ipv4Addr, (u32, u64)>>,
+}
+
+impl PmtuCache {
+    /// Learned MTU towards `daddr`, if still valid
+    pub fn get(&self, daddr: Ipv4Addr) -> Option<u32> {
+        let now = crate::net::neigh::now_ms();
+        let mut m = self.m.lock();
+        match m.get(&daddr) {
+            Some(&(mtu, exp)) if exp > now => Some(mtu),
+            Some(_) => {
+                m.remove(&daddr);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// ICMP frag needed said `mtu` towards `daddr` (current route MTU
+    /// `cur`): lower it, never below ip_rt_min_pmtu (Linux
+    /// __ip_rt_update_pmtu)
+    pub fn update(&self, daddr: Ipv4Addr, mtu: u32, cur: u32) {
+        if mtu >= cur {
+            return;
+        }
+        let mtu = if mtu < MIN_PMTU {
+            cur.min(MIN_PMTU)
+        } else {
+            mtu
+        };
+        let now = crate::net::neigh::now_ms();
+        let mut m = self.m.lock();
+        if m.len() >= PMTU_MAX && !m.contains_key(&daddr) {
+            let victim = m.iter().min_by_key(|(_, v)| v.1).map(|(k, _)| *k);
+            if let Some(k) = victim {
+                m.remove(&k);
+            }
+        }
+        m.insert(daddr, (mtu, now + PMTU_EXPIRES));
+    }
 }
 
 /// Input routing decision for a received IPv4 packet

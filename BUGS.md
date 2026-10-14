@@ -38,8 +38,7 @@ VFS handler is registered.
 Listed because real traffic reaches them: TCP has no retransmission or
 timers, so a dropped segment (TX ring full, backlog overflow) stalls a
 connection, TIME_WAIT ends immediately (no 2MSL), close does not RST
-unread data and SO_LINGER is stored only (P6); no IP fragmentation/reassembly, so datagrams larger than
-the device MTU fail with EMSGSIZE where Linux fragments (P5); no ICMP
+unread data and SO_LINGER is stored only (P6); no ICMP
 errors are generated or delivered (port unreachable, connected-UDP
 ECONNREFUSED, IP_RECVERR queue: MSG_ERRQUEUE is always EAGAIN) (P5).
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and

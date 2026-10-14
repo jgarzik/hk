@@ -22,6 +22,7 @@ pub mod sockets;
 pub mod sk;
 pub mod sockcore;
 pub mod udp;
+pub mod frag;
 pub mod sysctl;
 pub mod sockopts;
 pub mod nonblock;
@@ -85,6 +86,7 @@ pub fn run_all_tests() {
     sockets::run_tests();
     sockcore::run_tests();
     udp::run_tests();
+    frag::run_tests();
     sysctl::run_tests();
     sockopts::run_tests();
     nonblock::run_tests();

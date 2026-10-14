@@ -288,6 +288,18 @@ impl UdpSock {
         Ok(rt)
     }
 
+    /// IP_MTU: path MTU towards the connected peer (Linux: ENOTCONN
+    /// without a cached route)
+    fn mtu(&self) -> Result<i32, KernelError> {
+        if !self.connected.load(Ordering::Acquire) {
+            return Err(KernelError::NotConnected);
+        }
+        let a = self.inet.get();
+        let rt = route::output(&self.sk.net, a.daddr, a.saddr, self.sk.bound_dev_if())
+            .map_err(|_| KernelError::NotConnected)?;
+        Ok(rt.mtu as i32)
+    }
+
     /// Build and send one datagram
     fn xmit(
         &self,
@@ -520,6 +532,7 @@ impl ProtoOps for UdpSock {
     fn getsockopt(&self, level: i32, opt: i32) -> Option<Result<OptOut, KernelError>> {
         match level {
             SOL_SOCKET => None,
+            SOL_IP if opt == af_inet::IP_MTU => Some(self.mtu().map(OptOut::Int)),
             SOL_IP => Some(self.inet.getsockopt(opt)),
             SOL_UDP => Some(Err(KernelError::NoProtocolOption)),
             // Linux do_ip_getsockopt: other levels are EOPNOTSUPP
@@ -552,10 +565,9 @@ impl ProtoOps for UdpSock {
             c.saddr
         };
         let rt = self.route(daddr, saddr, oif)?;
-        let p = IpParams {
-            tos: c.tos.unwrap_or(self.inet.tos()),
-            ttl: c.ttl.unwrap_or(self.inet.ttl()),
-        };
+        let mut p = self.inet.params();
+        p.tos = c.tos.unwrap_or(p.tos);
+        p.ttl = c.ttl.unwrap_or(p.ttl);
         self.xmit(&rt, a.sport, dport, &data, p)?;
         Ok(len)
     }

@@ -13,13 +13,13 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 use spin::Mutex;
 
 use crate::error::KernelError;
 use crate::net::inet::fib::RouteType;
-use crate::net::ipv4::{IP_DEFAULT_TTL, Ipv4Addr};
+use crate::net::ipv4::{IP_DEFAULT_TTL, IpParams, Ipv4Addr};
 use crate::net::msg::Cmsg;
 use crate::net::sock::Sock;
 use crate::net::socket::{AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SOCK_DGRAM, SOCK_STREAM};
@@ -89,6 +89,8 @@ pub struct Inet {
     flags: AtomicU32,
     pmtudisc: AtomicU8,
     mc_ttl: AtomicU8,
+    /// IP id counter of a connected socket (Linux inet_id)
+    id: AtomicU16,
 }
 
 /// `Inet.flags` bits
@@ -109,8 +111,9 @@ impl Default for Inet {
             ttl: AtomicI32::new(-1),
             tos: AtomicU8::new(0),
             flags: AtomicU32::new(ipf::MC_LOOP),
-            pmtudisc: AtomicU8::new(1),
+            pmtudisc: AtomicU8::new(crate::net::ipv4::pmtu::WANT),
             mc_ttl: AtomicU8::new(1),
+            id: AtomicU16::new(crate::random::get_random_u32() as u16),
         }
     }
 }
@@ -142,6 +145,22 @@ impl Inet {
 
     pub fn tos(&self) -> u8 {
         self.tos.load(Ordering::Acquire)
+    }
+
+    pub fn pmtudisc(&self) -> u8 {
+        self.pmtudisc.load(Ordering::Acquire)
+    }
+
+    /// IP parameters of the next packet (Linux ip_select_ident_segs:
+    /// a connected socket numbers its packets from its own counter)
+    pub fn params(&self) -> IpParams {
+        let connected = !self.get().daddr.is_unspecified();
+        IpParams {
+            tos: self.tos(),
+            ttl: self.ttl(),
+            pmtudisc: self.pmtudisc(),
+            id: connected.then(|| self.id.fetch_add(1, Ordering::Relaxed)),
+        }
     }
 
     /// A child (accept) inherits the options of its listener

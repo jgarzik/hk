@@ -309,3 +309,43 @@ pub fn time_until_next() -> Option<u64> {
 pub fn timer_count() -> usize {
     TIMERS.lock().len()
 }
+
+/// A one-shot timer that tracks its earliest wanted deadline (for
+/// subsystems that keep their own per-object deadlines and need one
+/// kernel timer: neighbour tables, IP reassembly).
+///
+/// The callback must call [`Alarm::fired`] before it scans its state and
+/// then re-arm for the earliest remaining deadline, so a deadline set
+/// concurrently is never lost. Locking: `st` is a `spin::Mutex` taken
+/// in thread context only and held across `timer_add/timer_del` (-> the
+/// `TIMERS` IrqSpinlock).
+pub struct Alarm {
+    st: spin::Mutex<(TimerHandle, u64)>,
+    cb: TimerCallback,
+}
+
+impl Alarm {
+    pub const fn new(cb: TimerCallback) -> Self {
+        Self {
+            st: spin::Mutex::new((TimerHandle::NULL, u64::MAX)),
+            cb,
+        }
+    }
+
+    /// Fire no later than `at_ns` (monotonic)
+    pub fn arm(&self, at_ns: u64) {
+        let mut s = self.st.lock();
+        if s.0.is_valid() && s.1 <= at_ns {
+            return;
+        }
+        if s.0.is_valid() {
+            timer_del(s.0);
+        }
+        *s = (timer_add(at_ns, 0, self.cb, 0), at_ns);
+    }
+
+    /// The timer ran (call first thing in the callback)
+    pub fn fired(&self) {
+        *self.st.lock() = (TimerHandle::NULL, u64::MAX);
+    }
+}
