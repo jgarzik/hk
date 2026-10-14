@@ -394,8 +394,12 @@ pub fn sys_ppoll(fds: u64, nfds: u32, tmo_p: u64, sigmask_ptr: u64, sigsetsize: 
     let check_signals = saved_mask.is_some();
     let result = do_poll_internal(fds, nfds, timeout_ms, check_signals);
 
-    // Restore mask if we changed it
-    if let Some(old) = saved_mask {
+    // Restore mask if we changed it, unless interrupted by a signal: then
+    // the temporary mask stays in effect for signal delivery and do_signal()
+    // restores saved_sigmask (Linux: restore_saved_sigmask_unless()).
+    if let Some(old) = saved_mask
+        && result != KernelError::Interrupted.sysret()
+    {
         restore_poll_sigmask(old);
     }
 
@@ -570,8 +574,12 @@ pub fn sys_pselect6(
         check_signals,
     );
 
-    // Restore mask if we changed it
-    if let Some(old) = saved_mask {
+    // Restore mask if we changed it, unless interrupted by a signal: then
+    // the temporary mask stays in effect for signal delivery and do_signal()
+    // restores saved_sigmask (Linux: restore_saved_sigmask_unless()).
+    if let Some(old) = saved_mask
+        && result != KernelError::Interrupted.sysret()
+    {
         restore_poll_sigmask(old);
     }
 
