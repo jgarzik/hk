@@ -36,3 +36,28 @@ jobs:
 
       - name: Build aarch64 (kernel + userspace)
         run: make build-arm
+
+  boot-x86:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # /dev/kvm is not writable by the runner user, so QEMU uses TCG
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 grub-pc-bin grub-common xorriso mtools dosfstools cpio
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Boot test x86-64
+        run: make check
+
+      - name: Upload serial log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-serial-x86
+          path: /tmp/qemu_serial.log
+          if-no-files-found: ignore
