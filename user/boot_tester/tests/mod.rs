@@ -25,6 +25,7 @@ pub mod posix_timer;
 pub mod xattr;
 pub mod mqueue;
 pub mod netdev;
+pub mod nl;
 pub mod capabilities;
 pub mod eventfd;
 pub mod epoll;

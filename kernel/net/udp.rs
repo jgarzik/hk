@@ -166,19 +166,11 @@ pub fn udp_sendmsg(
         }
     };
 
-    // Unbound/wildcard source: loopback for 127/8, else the namespace's
-    // configured address (P3: inet_select_addr on the output route)
-    let src_addr = if !src_addr.is_unspecified() {
-        src_addr
-    } else if dest_addr.is_loopback() {
-        Ipv4Addr::new(127, 0, 0, 1)
-    } else {
-        socket
-            .net
-            .get_config()
-            .map(|c| c.ipv4_addr)
-            .ok_or(KernelError::AddressNotAvailable)?
-    };
+    // Wildcard source: the output route's (Linux udp_sendmsg ->
+    // ip_route_output_flow); this also fails early for unroutable
+    // destinations
+    let rt = crate::net::inet::route::output(&socket.net, dest_addr, src_addr, 0)?;
+    let src_addr = rt.saddr;
 
     // Build and send UDP packet
     udp_build_and_send(&socket.net, src_addr, src_port, dest_addr, dest_port, data)?;

@@ -12,6 +12,7 @@ use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags as file_flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec};
 use crate::net::ipv4::Ipv4Addr;
+use crate::net::netlink;
 use crate::net::socket::{AddressFamily, SockAddrIn, Socket, SocketType, sock_flags};
 use crate::net::socket_file::SocketFileOps;
 use crate::net::tcp::{self, TcpState};
@@ -63,6 +64,13 @@ fn create_socket_dentry() -> Result<Arc<Dentry>, i64> {
 
 /// socket(domain, type, protocol) - create a socket
 pub fn sys_socket(domain: i32, sock_type: i32, protocol: i32) -> i64 {
+    if sock_type & !(0xFF | sock_flags::SOCK_NONBLOCK | sock_flags::SOCK_CLOEXEC) != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+    if domain == netlink::AF_NETLINK {
+        return netlink::sys::socket(sock_type & 0xFF, protocol, sock_file_flags(sock_type));
+    }
+
     // Parse address family
     let family = match AddressFamily::from_i32(domain) {
         Some(AddressFamily::Inet) => AddressFamily::Inet,
@@ -72,7 +80,6 @@ pub fn sys_socket(domain: i32, sock_type: i32, protocol: i32) -> i64 {
     // Extract type and flags
     let type_only = sock_type & 0xFF;
     let nonblock = sock_type & sock_flags::SOCK_NONBLOCK != 0;
-    let cloexec = sock_type & sock_flags::SOCK_CLOEXEC != 0;
 
     // Parse socket type
     let stype = match SocketType::from_i32(type_only) {
@@ -102,38 +109,46 @@ pub fn sys_socket(domain: i32, sock_type: i32, protocol: i32) -> i64 {
         socket.set_nonblocking(true);
     }
 
-    // Create file operations (leaked for 'static lifetime like pipe.rs)
+    // File operations (leaked for 'static lifetime like pipe.rs; P4
+    // gives sockets real sockfs inodes)
     let ops: &'static dyn FileOps = Box::leak(Box::new(SocketFileOps::new(socket)));
+    install_file(ops, sock_file_flags(sock_type))
+}
 
-    // Create dummy dentry for socket
+/// File status flags for a socket(2) type argument
+fn sock_file_flags(sock_type: i32) -> u32 {
+    let mut flags = file_flags::O_RDWR;
+    if sock_type & sock_flags::SOCK_NONBLOCK != 0 {
+        flags |= file_flags::O_NONBLOCK;
+    }
+    if sock_type & sock_flags::SOCK_CLOEXEC != 0 {
+        flags |= file_flags::O_CLOEXEC;
+    }
+    flags
+}
+
+/// Install a socket file with `ops` in the lowest free fd
+pub(crate) fn install_file(ops: &'static dyn FileOps, flags: u32) -> i64 {
     let dentry = match create_socket_dentry() {
         Ok(d) => d,
         Err(_) => return KernelError::OutOfMemory.sysret(),
     };
-
-    // Determine file flags
-    let mut flags = file_flags::O_RDWR;
-    if nonblock {
-        flags |= file_flags::O_NONBLOCK;
-    }
-    if cloexec {
-        flags |= file_flags::O_CLOEXEC;
-    }
     let file = Arc::new(File::new(dentry, flags, ops));
-
-    // Allocate fd
     let fd_table = match get_task_fd(current_tid()) {
         Some(t) => t,
         None => return KernelError::OutOfMemory.sysret(),
     };
     match fd_table.lock().alloc(file, get_nofile_limit()) {
         Ok(fd) => fd as i64,
-        Err(_) => KernelError::OutOfMemory.sysret(),
+        Err(_) => KernelError::ProcessFileLimit.sysret(),
     }
 }
 
 /// connect(fd, addr, addrlen) - connect to remote address
 pub fn sys_connect(fd: i32, addr: u64, addrlen: u64) -> i64 {
+    if let Some((_, nl)) = nl_sock(fd) {
+        return netlink::sys::connect(&nl, addr, addrlen);
+    }
     if addrlen < core::mem::size_of::<SockAddrIn>() as u64 {
         return KernelError::InvalidArgument.sysret();
     }
@@ -202,6 +217,9 @@ pub fn sys_connect(fd: i32, addr: u64, addrlen: u64) -> i64 {
 
 /// bind(fd, addr, addrlen) - bind to local address
 pub fn sys_bind(fd: i32, addr: u64, addrlen: u64) -> i64 {
+    if let Some((_, nl)) = nl_sock(fd) {
+        return netlink::sys::bind(&nl, addr, addrlen);
+    }
     if addrlen < core::mem::size_of::<SockAddrIn>() as u64 {
         return KernelError::InvalidArgument.sysret();
     }
@@ -220,19 +238,12 @@ pub fn sys_bind(fd: i32, addr: u64, addrlen: u64) -> i64 {
         return KernelError::AddressFamilyNotSupported.sysret();
     }
 
-    let mut local_addr = sockaddr.addr();
+    let local_addr = sockaddr.addr();
     let mut local_port = sockaddr.port();
 
     // Allocate ephemeral port if port is 0
     if local_port == 0 {
         local_port = socket.net.alloc_port();
-    }
-
-    // Use configured IP if addr is 0.0.0.0
-    if local_addr.is_unspecified()
-        && let Some(config) = socket.net.get_config()
-    {
-        local_addr = config.ipv4_addr;
     }
 
     socket.set_local(local_addr, local_port);
@@ -257,6 +268,12 @@ pub fn sys_bind(fd: i32, addr: u64, addrlen: u64) -> i64 {
 /// 3. Set TCP state to Listen
 /// 4. Register in listener hash table
 pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
+    if let Some((_, nl)) = nl_sock(fd) {
+        return {
+            let _ = nl;
+            KernelError::OperationNotSupported.sysret()
+        };
+    }
     let socket = match get_socket(fd) {
         Ok(s) => s,
         Err(e) => return e,
@@ -304,6 +321,12 @@ pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
 /// 4. Create new fd for child socket
 /// 5. Copy peer address to user if requested
 pub fn sys_accept(fd: i32, addr: u64, addrlen: u64) -> i64 {
+    if let Some((_, nl)) = nl_sock(fd) {
+        return {
+            let _ = nl;
+            KernelError::OperationNotSupported.sysret()
+        };
+    }
     let socket = match get_socket(fd) {
         Ok(s) => s,
         Err(e) => return e,
@@ -565,7 +588,7 @@ pub struct MMsgHdr {
 }
 
 /// Read msghdr from user space
-fn read_msghdr(addr: u64) -> Result<UserMsgHdr, i64> {
+pub(crate) fn read_msghdr(addr: u64) -> Result<UserMsgHdr, i64> {
     if addr == 0 {
         return Err(KernelError::BadAddress.sysret());
     }
@@ -592,7 +615,7 @@ fn read_msghdr(addr: u64) -> Result<UserMsgHdr, i64> {
 }
 
 /// Read a user iovec array (at most UIO_MAXIOV entries)
-fn read_iovecs(iov_ptr: u64, iovlen: usize) -> Result<alloc::vec::Vec<IoVec>, i64> {
+pub(crate) fn read_iovecs(iov_ptr: u64, iovlen: usize) -> Result<alloc::vec::Vec<IoVec>, i64> {
     if iovlen > 1024 {
         // UIO_MAXIOV
         return Err(KernelError::InvalidArgument.sysret());
@@ -615,7 +638,7 @@ fn read_iovecs(iov_ptr: u64, iovlen: usize) -> Result<alloc::vec::Vec<IoVec>, i6
 }
 
 /// Copy `len` bytes in from user memory
-fn copy_in(addr: u64, len: usize) -> Result<alloc::vec::Vec<u8>, i64> {
+pub(crate) fn copy_in(addr: u64, len: usize) -> Result<alloc::vec::Vec<u8>, i64> {
     let mut v = alloc::vec![0u8; len];
     if len > 0 {
         copy_from_user::<Uaccess>(&mut v, addr, len)
@@ -629,7 +652,7 @@ fn copy_in(addr: u64, len: usize) -> Result<alloc::vec::Vec<u8>, i64> {
 const SOCK_IO_MAX: usize = 65536;
 
 /// Gather data from iovec array into a single buffer
-fn gather_iovec(iov_ptr: u64, iovlen: usize) -> Result<alloc::vec::Vec<u8>, i64> {
+pub(crate) fn gather_iovec(iov_ptr: u64, iovlen: usize) -> Result<alloc::vec::Vec<u8>, i64> {
     use alloc::vec::Vec;
 
     if iovlen == 0 {
@@ -657,7 +680,7 @@ fn gather_iovec(iov_ptr: u64, iovlen: usize) -> Result<alloc::vec::Vec<u8>, i64>
 }
 
 /// Scatter data to iovec array, returns bytes written
-fn scatter_iovec(iov_ptr: u64, iovlen: usize, data: &[u8]) -> usize {
+pub(crate) fn scatter_iovec(iov_ptr: u64, iovlen: usize, data: &[u8]) -> usize {
     if iovlen == 0 || iov_ptr == 0 || data.is_empty() {
         return 0;
     }
@@ -685,6 +708,9 @@ fn scatter_iovec(iov_ptr: u64, iovlen: usize, data: &[u8]) -> usize {
 
 /// sendmsg(fd, msg, flags) - send a message on a socket
 pub fn sys_sendmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
+    if let Some((_, nl)) = nl_sock(fd) {
+        return netlink::sys::sendmsg(&nl, msg);
+    }
     let socket = match get_socket(fd) {
         Ok(s) => s,
         Err(e) => return e,
@@ -738,6 +764,9 @@ pub fn sys_sendmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
 
 /// recvmsg(fd, msg, flags) - receive a message from a socket
 pub fn sys_recvmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
+    if let Some((file, nl)) = nl_sock(fd) {
+        return netlink::sys::recvmsg(&nl, &file, msg, _flags);
+    }
     let socket = match get_socket(fd) {
         Ok(s) => s,
         Err(e) => return e,
@@ -770,7 +799,7 @@ pub fn sys_recvmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
             match socket.read(&mut buf) {
                 Ok(n) => {
                     let written = scatter_iovec(msghdr.msg_iov, msghdr.msg_iovlen, &buf[..n]);
-                    if write_msghdr_out(msg, 0, 0).is_err() {
+                    if write_msghdr_out(msg, 0, 0, 0).is_err() {
                         return KernelError::BadAddress.sysret();
                     }
                     written as i64
@@ -796,7 +825,7 @@ pub fn sys_recvmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
                         msghdr.msg_namelen = core::mem::size_of::<SockAddrIn>() as u32;
                     }
 
-                    if write_msghdr_out(msg, msghdr.msg_namelen, 0).is_err() {
+                    if write_msghdr_out(msg, msghdr.msg_namelen, 0, 0).is_err() {
                         return KernelError::BadAddress.sysret();
                     }
                     written as i64
@@ -876,6 +905,12 @@ pub fn sys_recvmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32, _timeout: u64) 
 
 /// shutdown(fd, how) - shutdown socket
 pub fn sys_shutdown(fd: i32, how: i32) -> i64 {
+    if let Some((_, nl)) = nl_sock(fd) {
+        return {
+            let _ = (nl, how);
+            KernelError::OperationNotSupported.sysret()
+        };
+    }
     let socket = match get_socket(fd) {
         Ok(s) => s,
         Err(e) => return e,
@@ -908,6 +943,9 @@ pub fn sys_shutdown(fd: i32, how: i32) -> i64 {
 
 /// getsockname(fd, addr, addrlen) - get local socket address
 pub fn sys_getsockname(fd: i32, addr: u64, addrlen: u64) -> i64 {
+    if let Some((_, nl)) = nl_sock(fd) {
+        return netlink::sys::getname(&nl, addr, addrlen, false);
+    }
     let socket = match get_socket(fd) {
         Ok(s) => s,
         Err(e) => return e,
@@ -924,6 +962,9 @@ pub fn sys_getsockname(fd: i32, addr: u64, addrlen: u64) -> i64 {
 
 /// getpeername(fd, addr, addrlen) - get remote socket address
 pub fn sys_getpeername(fd: i32, addr: u64, addrlen: u64) -> i64 {
+    if let Some((_, nl)) = nl_sock(fd) {
+        return netlink::sys::getname(&nl, addr, addrlen, true);
+    }
     let socket = match get_socket(fd) {
         Ok(s) => s,
         Err(e) => return e,
@@ -963,6 +1004,9 @@ const TCP_KEEPCNT: i32 = 6;
 
 /// setsockopt(fd, level, optname, optval, optlen) - set socket option
 pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u64) -> i64 {
+    if let Some((_, nl)) = nl_sock(fd) {
+        return netlink::sys::setsockopt(&nl, level, optname, optval, optlen);
+    }
     let socket = match get_socket(fd) {
         Ok(s) => s,
         Err(e) => return e,
@@ -1090,6 +1134,9 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u6
 
 /// getsockopt(fd, level, optname, optval, optlen) - get socket option
 pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u64) -> i64 {
+    if let Some((_, nl)) = nl_sock(fd) {
+        return netlink::sys::getsockopt(&nl, level, optname, optval, optlen);
+    }
     let socket = match get_socket(fd) {
         Ok(s) => s,
         Err(e) => return e,
@@ -1240,6 +1287,9 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u6
 
 /// sendto(fd, buf, len, flags, dest_addr, addrlen) - send data
 pub fn sys_sendto(fd: i32, buf: u64, len: u64, _flags: i32, dest_addr: u64, addrlen: u64) -> i64 {
+    if let Some((_, nl)) = nl_sock(fd) {
+        return netlink::sys::sendto(&nl, buf, len, dest_addr, addrlen);
+    }
     let socket = match get_socket(fd) {
         Ok(s) => s,
         Err(e) => return e,
@@ -1290,6 +1340,9 @@ pub fn sys_sendto(fd: i32, buf: u64, len: u64, _flags: i32, dest_addr: u64, addr
 
 /// recvfrom(fd, buf, len, flags, src_addr, addrlen) - receive data
 pub fn sys_recvfrom(fd: i32, buf: u64, len: u64, _flags: i32, src_addr: u64, addrlen: u64) -> i64 {
+    if let Some((file, nl)) = nl_sock(fd) {
+        return netlink::sys::recvfrom(&nl, &file, buf, len, _flags, src_addr, addrlen);
+    }
     let socket = match get_socket(fd) {
         Ok(s) => s,
         Err(e) => return e,
@@ -1338,6 +1391,18 @@ pub fn sys_recvfrom(fd: i32, buf: u64, len: u64, _flags: i32, src_addr: u64, add
 
 // Helper functions
 
+/// The netlink socket behind `fd`, if it is one
+fn nl_sock(fd: i32) -> Option<(Arc<File>, Arc<netlink::NlSock>)> {
+    let file = get_task_fd(current_tid())?.lock().get(fd)?;
+    let sk = file
+        .ops()
+        .as_any()
+        .downcast_ref::<netlink::sys::NlFile>()?
+        .sk
+        .clone();
+    Some((file, sk))
+}
+
 /// Get socket from file descriptor
 fn get_socket(fd: i32) -> Result<Arc<Socket>, i64> {
     if fd < 0 {
@@ -1383,6 +1448,12 @@ fn read_sockaddr_in(addr: u64) -> Result<SockAddrIn, i64> {
 
 /// Write sockaddr_in to user space
 fn write_sockaddr_in(addr: u64, addrlen: u64, sockaddr: &SockAddrIn) -> i64 {
+    put_addr(addr, addrlen, sockaddr_bytes(sockaddr))
+}
+
+/// Copy a socket address out (Linux move_addr_to_user): min(*addrlen,
+/// size) bytes, then the real size in *addrlen
+pub(crate) fn put_addr(addr: u64, addrlen: u64, bytes: &[u8]) -> i64 {
     if addr == 0 || addrlen == 0 {
         return KernelError::BadAddress.sysret();
     }
@@ -1395,7 +1466,6 @@ fn write_sockaddr_in(addr: u64, addrlen: u64, sockaddr: &SockAddrIn) -> i64 {
     if ulen < 0 {
         return KernelError::InvalidArgument.sysret();
     }
-    let bytes = sockaddr_bytes(sockaddr);
     let n = (ulen as usize).min(bytes.len());
     if copy_to_user::<Uaccess>(addr, &bytes[..n]).is_err()
         || put_user::<Uaccess, u32>(addrlen, bytes.len() as u32).is_err()
@@ -1419,13 +1489,21 @@ fn sockaddr_bytes(sa: &SockAddrIn) -> &[u8] {
 
 /// Offsets in struct msghdr / mmsghdr (64-bit Linux layout)
 const MSGHDR_NAMELEN_OFFSET: u64 = 8;
+const MSGHDR_CONTROLLEN_OFFSET: u64 = 40;
 const MSGHDR_FLAGS_OFFSET: u64 = 48;
 const MMSG_LEN_OFFSET: u64 = 56;
 const _: () = assert!(core::mem::size_of::<UserMsgHdr>() == 56);
 const _: () = assert!(core::mem::size_of::<MMsgHdr>() == 64);
 
-/// Write back the recvmsg outputs (msg_namelen, msg_flags) to user msghdr
-fn write_msghdr_out(msg: u64, namelen: u32, flags: i32) -> Result<(), ()> {
+/// Write back the recvmsg outputs (msg_namelen, msg_controllen,
+/// msg_flags) to the user msghdr
+pub(crate) fn write_msghdr_out(
+    msg: u64,
+    namelen: u32,
+    flags: i32,
+    controllen: usize,
+) -> Result<(), ()> {
     put_user::<Uaccess, u32>(msg + MSGHDR_NAMELEN_OFFSET, namelen).map_err(|_| ())?;
+    put_user::<Uaccess, u64>(msg + MSGHDR_CONTROLLEN_OFFSET, controllen as u64).map_err(|_| ())?;
     put_user::<Uaccess, i32>(msg + MSGHDR_FLAGS_OFFSET, flags).map_err(|_| ())
 }

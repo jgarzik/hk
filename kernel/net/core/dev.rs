@@ -395,6 +395,11 @@ pub fn netif_receive_skb(mut skb: Box<SkBuff>) {
         return;
     };
     this_softnet().processed.fetch_add(1, Ordering::Relaxed);
+    if !dev.is_up() {
+        // Closed device (a frame raced with dev_close)
+        dev.stats.inc_rx_dropped();
+        return;
+    }
 
     let Some(ethertype) = ethernet::eth_type_trans(&mut skb, &dev) else {
         dev.stats.inc_rx_errors();

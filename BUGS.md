@@ -41,8 +41,23 @@ dropped segment (TX ring full, backlog overflow) stalls a connection
 (P6); closed UDP/TCP sockets stay in the namespace tables, so a port is
 never freed and the stale socket can still match lookups (P4); ARP has
 no state machine, every unresolved packet sends a request and entries
-never expire (P5); no IP fragmentation/reassembly (P5). The static
-10.0.2.15/24 configuration remains until netlink (P3).
+never expire (P5); no IP fragmentation/reassembly (P5); bind() to an
+address that is not local is accepted (Linux: EADDRNOTAVAIL) (P4).
+
+## NETLINK_ROUTE / SIOC* subset gaps (P3)
+
+**Location**: `kernel/net/netlink/rtnetlink.rs`, `kernel/net/devioctl.rs`
+
+Implemented: link get/dump/change (IFF_UP, MTU), IPv4 address and route
+add/delete/dump, route get (output routes), ARP dump, notifications.
+Missing, each answered with a Linux errno rather than silently: link
+creation and rename (EOPNOTSUPP), multipath routes and nexthop objects
+(EOPNOTSUPP), input-route simulation `ip route get ... iif` (EOPNOTSUPP),
+NLM_F_ECHO (not echoed), extended-ACK message/offset TLVs (plain errors),
+RTM_GETRULE dumps nothing (Linux lists its three default IPv4 rules; there
+is no rule engine: lookups are local then main), address lifetimes are
+always infinite, promote_secondaries is off. Dumps are built in full when
+requested instead of as the reader drains them.
 
 ## Rare arm64 kernel instruction abort in the fault-signal tests
 

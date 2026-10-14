@@ -3,9 +3,10 @@
 //! - PROC_NET_DEV: Linux header and an `lo:` line (both kernels)
 //! - LO_COUNTERS: UDP over 127.0.0.1 raises lo rx/tx packets (both)
 //! - NETNS_PROC_NET_DEV: a new network namespace lists only lo (both)
-//! - ETH0_DNS (hk only; Linux harness has no NIC yet): a DNS query to the
-//!   QEMU slirp resolver 10.0.2.3:53 over eth0 gets a reply, which proves
-//!   ARP + TX + RX + IRQ + DMA end to end
+//! - ETH0_DNS (both): configure the first Ethernet link over netlink
+//!   (`net_setup_eth0`), then a DNS query to the QEMU slirp resolver
+//!   10.0.2.3:53 gets a reply, which proves ARP + TX + RX + IRQ + DMA end
+//!   to end
 
 use hk_syscall::{
     sys_bind, sys_close, sys_exit, sys_fork, sys_open, sys_poll, sys_read, sys_recvfrom,
@@ -14,6 +15,8 @@ use hk_syscall::{
 };
 
 use super::helpers::{host_mode, print, print_num, println, skip};
+use super::nl::net_setup_eth0;
+use hk_syscall::sys_ioctl;
 
 pub fn run_tests() {
     println(b"=== Netdev Tests ===");
@@ -241,15 +244,37 @@ fn dns_query(id: u16, out: &mut [u8; 64]) -> usize {
     n
 }
 
-fn test_eth0_dns() {
-    if host_mode() {
-        skip(b"ETH0_DNS", b"no NIC in the Linux harness");
-        return;
+/// Interface name of index `idx` (SIOCGIFNAME)
+fn ifname(idx: u32, out: &mut [u8; 16]) -> usize {
+    const SIOCGIFNAME: u64 = 0x8910;
+    let mut ifr = [0u8; 40];
+    ifr[16..20].copy_from_slice(&idx.to_ne_bytes());
+    let fd = sys_socket(AF_INET, SOCK_DGRAM, 0);
+    let r = sys_ioctl(fd as i32, SIOCGIFNAME, ifr.as_mut_ptr() as u64);
+    sys_close(fd as u64);
+    if r != 0 {
+        return 0;
     }
+    out.copy_from_slice(&ifr[..16]);
+    out.iter().position(|&c| c == 0).unwrap_or(16)
+}
+
+fn test_eth0_dns() {
+    let idx = match net_setup_eth0() {
+        Ok(i) => i,
+        Err(e) => {
+            print(b"ETH0_DNS:FAIL net_setup_eth0: ");
+            println(e.as_bytes());
+            return;
+        }
+    };
+    let mut name = [0u8; 16];
+    let nlen = ifname(idx, &mut name);
+    let name = &name[..nlen];
     let mut buf = [0u8; 4096];
     let n = read_proc_net_dev(&mut buf);
-    let Some(eth_before) = (if n > 0 { dev_counters(&buf[..n as usize], b"eth0") } else { None }) else {
-        println(b"ETH0_DNS:FAIL no eth0 in /proc/net/dev");
+    let Some(eth_before) = (if n > 0 { dev_counters(&buf[..n as usize], name) } else { None }) else {
+        println(b"ETH0_DNS:FAIL no ethernet link in /proc/net/dev");
         return;
     };
 
@@ -287,14 +312,14 @@ fn test_eth0_dns() {
     sys_close(fd as u64);
 
     let n = read_proc_net_dev(&mut buf);
-    let eth_after = if n > 0 { dev_counters(&buf[..n as usize], b"eth0") } else { None };
+    let eth_after = if n > 0 { dev_counters(&buf[..n as usize], name) } else { None };
     let (rx, tx) = match eth_after {
         Some(a) => (a[1] - eth_before[1], a[9] - eth_before[9]),
         None => (0, 0),
     };
     let reply_ok = got >= 12 && u16::from_be_bytes([reply[0], reply[1]]) == id && reply[2] & 0x80 != 0;
     if reply_ok {
-        print(b"eth0: DNS reply ");
+        print(b"eth: DNS reply ");
         print_num(got);
         print(b" bytes, rcode=");
         print_num((reply[3] & 0x0f) as i64);

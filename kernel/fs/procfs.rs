@@ -1325,7 +1325,7 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
         ProcfsInodeData::new_file(gen_mounts),
     ))));
 
-    // Create /proc/net (directory) with /proc/net/dev; contents follow
+    // Create /proc/net (directory) with /proc/net/{dev,route}; contents follow
     // the reader's network namespace
     let net_dir_inode = Arc::new(Inode::new(
         sb.alloc_ino(),
@@ -1351,8 +1351,22 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
     net_dev_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::new_file(crate::net::proc::proc_net_dev),
     ))));
+    let net_route_inode = Arc::new(Inode::new(
+        sb.alloc_ino(),
+        InodeMode::regular(0o444),
+        0,
+        0,
+        0,
+        current_time(),
+        Arc::downgrade(&sb),
+        &PROCFS_INODE_OPS,
+    ));
+    net_route_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+        ProcfsInodeData::new_file(crate::net::proc::proc_net_route),
+    ))));
     if let ProcfsInodeData::Directory { children } = &mut net_dir {
         children.insert(String::from("dev"), net_dev_inode);
+        children.insert(String::from("route"), net_route_inode);
     }
     net_dir_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(net_dir))));
 

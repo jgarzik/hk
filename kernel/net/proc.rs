@@ -40,3 +40,56 @@ pub fn proc_net_dev() -> Vec<u8> {
     }
     out.into_bytes()
 }
+
+/// `/proc/net/route`: the main table in Linux's legacy format
+/// (net/ipv4/fib_trie.c fib_route_seq_show): addresses as the raw
+/// network-order u32 in hex, every line padded to 127 columns
+pub fn proc_net_route() -> Vec<u8> {
+    use crate::net::inet::fib::{RT_TABLE_MAIN, RouteType};
+    const RTF_UP: u32 = 0x0001;
+    const RTF_GATEWAY: u32 = 0x0002;
+    const RTF_HOST: u32 = 0x0004;
+    const RTF_REJECT: u32 = 0x0200;
+    let mut out = String::new();
+    let pad = |out: &mut String, line: &str| {
+        let _ = writeln!(out, "{:<127}", line);
+    };
+    pad(
+        &mut out,
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT",
+    );
+    let raw = |a: crate::net::Ipv4Addr| u32::from_ne_bytes(a.to_be_bytes());
+    let net = crate::net::current_net_ns();
+    for e in net.fib.table(RT_TABLE_MAIN) {
+        if matches!(e.rtype, RouteType::Broadcast | RouteType::Multicast) {
+            continue;
+        }
+        let mask = crate::net::inet::ifaddr::inet_make_mask(e.dst_len);
+        let mut flags = RTF_UP;
+        if matches!(e.rtype, RouteType::Unreachable | RouteType::Prohibit) {
+            flags |= RTF_REJECT;
+        }
+        if e.gateway.is_some() {
+            flags |= RTF_GATEWAY;
+        }
+        if e.dst_len == 32 {
+            flags |= RTF_HOST;
+        }
+        let line = alloc::format!(
+            "{}\t{:08X}\t{:08X}\t{:04X}\t{}\t{}\t{}\t{:08X}\t{}\t{}\t{}",
+            e.dev.as_ref().map_or("*", |d| d.name()),
+            raw(e.dst),
+            raw(e.gateway.unwrap_or_default()),
+            flags,
+            0,
+            0,
+            e.priority as i32,
+            raw(mask),
+            0,
+            0,
+            0
+        );
+        pad(&mut out, &line);
+    }
+    out.into_bytes()
+}

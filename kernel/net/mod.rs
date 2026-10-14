@@ -17,7 +17,7 @@
 //! Transport Layer (tcp.rs, udp.rs)
 //!         |
 //!         v
-//! Network Layer (ipv4.rs, route.rs, icmp.rs)
+//! Network Layer (ipv4.rs, inet/{ifaddr,fib,route}.rs, icmp.rs)
 //!         |
 //!         v
 //! Link Layer (ethernet.rs, arp.rs)
@@ -37,12 +37,12 @@
 //! loopback) run the protocol code. The namespace of a received packet is
 //! that of its device (`skb.net()`), never the current task's.
 //!
-//! ## Static Network Configuration
+//! ## Configuration
 //!
-//! For MVP, we use static IP configuration:
-//! - Guest IP: 10.0.2.15/24
-//! - Gateway: 10.0.2.2 (QEMU slirp default)
-//! - DNS: 10.0.2.3 (optional)
+//! Like Linux, interfaces start down and unconfigured (`lo` included; it
+//! gets 127.0.0.1/8 when brought up). Userspace configures links,
+//! addresses and routes with NETLINK_ROUTE (`netlink/`) or SIOC* ioctls
+//! (`devioctl.rs`); all changes serialize on RTNL (`rtnl.rs`).
 
 use alloc::sync::Arc;
 
@@ -54,13 +54,16 @@ pub mod arp;
 #[path = "core/dev.rs"]
 pub mod dev;
 pub mod device;
+pub mod devioctl;
 pub mod driver;
 pub mod ethernet;
 pub mod icmp;
+pub mod inet;
 pub mod ipv4;
+pub mod netlink;
 pub mod proc;
 pub mod request_sock;
-pub mod route;
+pub mod rtnl;
 pub mod skb;
 pub mod socket;
 pub mod socket_file;
@@ -87,67 +90,30 @@ pub fn start_threads() {
 
 /// Initialize the network subsystem
 pub fn init() {
-    crate::printkln!("net: initializing network subsystem");
-
-    // Static IP configuration for QEMU slirp networking
-    let config = NetConfig {
-        ipv4_addr: Ipv4Addr::new(10, 0, 2, 15),
-        ipv4_netmask: Ipv4Addr::new(255, 255, 255, 0),
-        ipv4_gateway: Ipv4Addr::new(10, 0, 2, 2),
-    };
-
-    // Store config in init network namespace
-    INIT_NET_NS.set_config(config);
-
     // Protocol handlers by EtherType (IPv6 will add 0x86DD here)
     dev::dev_add_pack(EtherType::Ipv4.to_be(), ipv4::ip_rcv);
     dev::dev_add_pack(EtherType::Arp.to_be(), arp::arp_rcv);
-
-    crate::printkln!("net: configured 10.0.2.15/24, gw 10.0.2.2");
 }
 
-/// Network configuration
-#[derive(Debug, Clone, Copy)]
-pub struct NetConfig {
-    pub ipv4_addr: Ipv4Addr,
-    pub ipv4_netmask: Ipv4Addr,
-    pub ipv4_gateway: Ipv4Addr,
+/// Name for a new physical device from a template like "eth%d" (unique
+/// in the init namespace, where physical devices register)
+pub fn dev_alloc_name(template: &str) -> alloc::string::String {
+    init_net_ns().dev_alloc_name(template)
 }
 
-/// Register a network device
-///
-/// Physical devices are registered in the init network namespace.
+/// Register a physical network device in the init namespace; it starts
+/// down and unconfigured
 pub fn register_netdev(dev: Arc<NetDevice>) {
+    let m = dev.mac();
     crate::printkln!(
         "net: registered {} (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
         dev.name(),
-        dev.mac()[0],
-        dev.mac()[1],
-        dev.mac()[2],
-        dev.mac()[3],
-        dev.mac()[4],
-        dev.mac()[5]
+        m[0],
+        m[1],
+        m[2],
+        m[3],
+        m[4],
+        m[5]
     );
-
-    // Register device in init network namespace
-    let init_ns = init_net_ns();
-
-    // Configure device with static IP if this is the first physical device
-    // (init namespace starts with only loopback)
-    if init_ns.device_count() == 1
-        && let Some(config) = init_ns.get_config()
-    {
-        dev.set_ipv4(config.ipv4_addr, config.ipv4_netmask);
-
-        // Add routes for this device in init namespace
-        init_ns.add_interface_route(
-            config.ipv4_addr & config.ipv4_netmask,
-            config.ipv4_netmask,
-            Arc::clone(&dev),
-        );
-        init_ns.add_default_route(config.ipv4_gateway, Arc::clone(&dev));
-    }
-
-    // Add to init namespace
-    init_ns.register_device(dev);
+    init_net_ns().register_device(dev);
 }

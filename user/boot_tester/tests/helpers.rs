@@ -26,11 +26,10 @@ pub fn host_setup() {
     sys_mkdir(b"/dev\0".as_ptr(), 0o755);
     sys_mount(b"devtmpfs\0".as_ptr(), b"/dev\0".as_ptr(), b"devtmpfs\0".as_ptr(), 0, 0);
     sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
-    loopback_up();
 }
 
-/// Bring up `lo` (Linux auto-assigns 127.0.0.1); hk's loopback is always up
-fn loopback_up() {
+/// Bring up `lo` (both kernels start it down; up assigns 127.0.0.1/8)
+pub fn loopback_up() {
     const SIOCGIFFLAGS: u64 = 0x8913;
     const SIOCSIFFLAGS: u64 = 0x8914;
     const IFF_UP: u16 = 0x1;

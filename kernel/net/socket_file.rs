@@ -162,6 +162,11 @@ impl FileOps for SocketFileOps {
         mask
     }
 
+    fn ioctl(&self, _file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        let inet = self.socket.family == crate::net::socket::AddressFamily::Inet;
+        crate::net::devioctl::ioctl(&self.socket.net, inet, cmd, arg)
+    }
+
     fn release(&self, _file: &File) -> Result<(), KernelError> {
         // Close the TCP connection
         if self.socket.tcp.is_some() {

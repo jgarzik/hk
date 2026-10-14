@@ -102,15 +102,29 @@ fn selftest_thread(_arg: usize) {
         Err(e) => check("kthread_run", false, e.errno() as u64),
     }
 
-    // 5. ICMP echo to 127.0.0.1 and to our own eth0 address: request and
-    //    reply both travel through the real lo (xmit -> netif_rx backlog ->
-    //    softnet thread of this CPU -> icmp_rcv), never synchronously
+    // 5. ICMP echo over a real lo in a private network namespace (the
+    //    init namespace belongs to userspace): bring lo up (127.0.0.1/8
+    //    appears, like Linux), add 192.0.2.1/24 on it, ping both. Request
+    //    and reply travel xmit -> netif_rx backlog -> softnet -> icmp_rcv.
     use crate::net::icmp;
-    let net = crate::net::init_net_ns();
-    let mut targets = alloc::vec![crate::net::Ipv4Addr::new(127, 0, 0, 1)];
-    if let Some(c) = net.get_config() {
-        targets.push(c.ipv4_addr);
+    use crate::net::inet::ifaddr::{InIfaddr, inet_insert_ifa};
+    use crate::net::netlink::NlInfo;
+    use crate::net::{Ipv4Addr, device::flags::IFF_UP, rtnl};
+    let net = crate::net::NetNamespace::new();
+    let extra = Ipv4Addr::new(192, 0, 2, 1);
+    if let Some(lo) = net.loopback() {
+        let r = rtnl::lock();
+        let up =
+            rtnl::dev_change_flags(&r, &net, &lo, lo.admin_flags() | IFF_UP, NlInfo::default());
+        check("netns_lo_up", up.is_ok(), 0);
+        let ifa = InIfaddr::new(extra, 24, lo.name());
+        check(
+            "netns_lo_addr",
+            inet_insert_ifa(&r, &net, &lo, ifa, NlInfo::default()).is_ok(),
+            0,
+        );
     }
+    let targets = [Ipv4Addr::new(127, 0, 0, 1), extra];
     for (i, &dst) in targets.iter().enumerate() {
         let before = icmp::ICMP_IN_ECHO_REPS.load(Ordering::Acquire);
         let sent = icmp::icmp_send_echo(&net, dst, 0x6b6b, i as u16, b"hk-selftest");

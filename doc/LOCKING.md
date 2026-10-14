@@ -1594,11 +1594,16 @@ do not rely on that.
 | `TcpSock.sk_lock` | `spin::Mutex<()>` | thread only | Linux `lock_sock` (no backlog: input is thread context). Held by `tcp_rcv` per segment and by `tcp_sendmsg`/`tcp_connect`/`tcp_close`; never across a sleep |
 | `Socket.accept_queue` | `spin::Mutex` | thread only | under the listener's `sk_lock`; dropped before transmitting |
 | `Socket.{local,remote}_addr`, `rx_buffer`, `dgram_rx_queue`, `TcpSock.{retransmit,ooo}_queue` | `spin::Mutex` | thread only | leaf; TCP state/sequence numbers are atomics |
-| `NetNamespace` tables (`devices`, `routes`, `tcp_connections`, `tcp_listeners`, `udp_sockets`, `config`, `loopback`) | `spin::RwLock` | thread only | private; reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes: RCU-ready) |
-| `NetNamespace.arp_pending` -> `arp_entries` | `spin::Mutex` | thread only | `arp_resolve_or_queue` checks the cache and queues under `arp_pending`, so a racing reply cannot strand a packet; queue capped at 16 per address |
-| `NetDevice.net` | `spin::RwLock<Weak<NetNamespace>>` | thread only | read per received packet |
-| `NetDevice.ipv4_{addr,netmask}` | `spin::Mutex` | thread only | leaf |
-| `NetDevice.stats`, `flags`, `carrier` | atomics | any | |
+| `RTNL` (`net/rtnl.rs`) | `spin::Mutex<()>` | thread only (syscalls, kernel config; never softnet) | OUTERMOST network lock: serializes all configuration changes (link up/down + MTU, addresses, routes) from netlink, SIOCS* ioctls and the kernel. Functions needing it take `&RtnlGuard`. Holders never sleep and never take a socket lock (`sk_lock`) |
+| `NetNamespace` tables (`devices`, `tcp_connections`, `tcp_listeners`, `udp_sockets`, `loopback`) | `spin::RwLock` | thread only | private; reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes: RCU-ready) |
+| `Fib.tables` (`net/inet/fib.rs`, per netns) | `spin::RwLock` | thread only | leaf; written only under RTNL; read by input/output routing (softnet, socket syscalls, possibly under `sk_lock`) and dumps; returns `Arc<FibEntry>` clones; notifications are sent after the guard is dropped |
+| `NetDevice.addrs` (IPv4 list; IPv6 later) | `spin::RwLock` | thread only | leaf; written only under RTNL (`inet::ifaddr`), read via snapshots (`inet_addrs()`) |
+| `NetNamespace.arp_pending` -> `arp_entries` | `spin::Mutex` | thread only | `arp_resolve_or_queue` checks the cache and queues under `arp_pending`, so a racing reply cannot strand a packet; queue capped at 16 per address; `arp_flush_dev` (device down, under RTNL) takes both in the same order |
+| `NlTable.socks` (`net/netlink`, per netns) | `spin::RwLock` | thread only | leaf; bound netlink sockets by (protocol, portid); lookups return `Arc` clones |
+| `NlSock.rxq`, `NlSock.dst` | `spin::Mutex` | thread only | leaf; replies, dumps and notifications are pushed under it, `wq` is woken after it is dropped |
+| `NlSock` portid/groups/flags/err/rmem, autobind `ROVER` | atomics | thread only | |
+| `NetDevice.net` | `spin::RwLock<Weak<NetNamespace>>` | thread only | read per received packet; written at registration |
+| `NetDevice.stats`, `flags`, `mtu`, `ifindex`, `carrier` | atomics | any | `flags` holds administrative state only; IFF_RUNNING/IFF_LOWER_UP/operstate are derived on read |
 | e1000 `rx` ring | `spin::Mutex` | thread only (NAPI poll) | leaf; frames are delivered after it is dropped |
 | e1000 `tx` ring | `spin::Mutex` | thread only (xmit, poll reclaim) | leaf; ring full -> drop, `tx_dropped`, ENOBUFS |
 | e1000 `pending_icr`, irq counters | atomics | IRQ + thread | ISR ORs ICR causes in; poll swaps them out |
@@ -1606,18 +1611,29 @@ do not rely on that.
 **Lock order (outermost first):**
 
 ```
-TcpSock.sk_lock (listener before child; a child is never locked while
-                 its creator holds the listener)
-  -> Socket.accept_queue / per-socket buffers
-  -> NetNamespace tables (RwLock; lookups drop the guard before returning)
+RTNL (configuration only)        TcpSock.sk_lock (listener before child; a
+  |                                 child is never locked while its creator
+  |                                 holds the listener)
+  |                                 -> Socket.accept_queue / per-socket buffers
+  v                                 |
+NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
+  the guard before returning)
   -> arp_pending -> arp_entries
+  -> NlTable.socks -> NlSock.rxq (netlink replies/notifications)
   -> device TX lock (e1000 tx)
   -> Softnet.backlog (lo xmit)           Softnet.poll_list / WaitQueue / rq
                                           (IrqSpinlocks, innermost)
 ```
 
-No network lock is held while taking a socket lock (lookups return `Arc`
-handles), and no lock is held across `netif_rx_flush_local()`.
+RTNL and `sk_lock` are never held together. No network lock is held
+while taking a socket lock (lookups return `Arc` handles), and no lock is
+held across `netif_rx_flush_local()`. Netlink requests are processed in
+the sender's `sendmsg` with no lock held on entry; mutating handlers take
+RTNL. Carrier changes (`netif_carrier_on/off`, from a driver's NAPI poll
+or `open()`) send RTM_NEWLINK without RTNL (NlTable.socks -> NlSock.rxq
+only). A device that is closed while its NAPI poll runs stays masked: the
+poll rewrites IMS only if the device is still up, and `netif_receive_skb`
+drops frames of a down device.
 
 **Driver ISR rules (e1000 pattern):** read ICR (read-to-clear; 0 => not
 ours on a shared line, return false), write IMC (mask all), record causes
@@ -1630,8 +1646,8 @@ line), it reschedules itself.
 
 **Known gaps (later phases):** TCP has no timers/retransmit (P6); UDP/TCP
 tables are not unregistered on close (P4); neighbour state machine and
-ARP rate limiting (P5); RCU for the read-mostly tables (decision after P2,
-see plan 3a).
+ARP rate limiting (P5); RCU for the read-mostly tables (FIB, device list,
+address lists: COW snapshots are the intended next step; see plan 3a).
 
 #### Key Device Driver Rules
 

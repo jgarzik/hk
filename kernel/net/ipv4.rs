@@ -10,8 +10,8 @@ use core::fmt;
 use crate::net::KernelError;
 use crate::net::NetNamespace;
 use crate::net::arp;
-use crate::net::device::flags::IFF_LOOPBACK;
 use crate::net::ethernet::{self, ETH_ALEN, EtherType};
+use crate::net::inet::route::{self, IpInput};
 use crate::net::skb::SkBuff;
 use crate::net::tcp;
 use crate::net::udp;
@@ -319,18 +319,7 @@ pub fn ip_rcv(mut skb: SkBuff) {
     let Some(net) = dev.net() else {
         return;
     };
-    let dev_bcast = match (dev.ipv4_addr(), dev.ipv4_netmask()) {
-        (Some(a), Some(m)) if m.0 != 0xFFFF_FFFF => Some(a.broadcast(m)),
-        _ => None,
-    };
-    let verdict = ip_input_classify(
-        hdr.saddr(),
-        hdr.daddr(),
-        dev.get_flags() & IFF_LOOPBACK != 0,
-        dev_bcast,
-        |a| net.is_local_addr(a),
-    );
-    match verdict {
+    match route::input(&net, hdr.saddr(), hdr.daddr(), &dev) {
         IpInput::Local => skb.ip_bcast = false,
         IpInput::Broadcast => skb.ip_bcast = true,
         IpInput::Drop(_) => return,
@@ -359,118 +348,26 @@ pub fn ip_rcv(mut skb: SkBuff) {
     }
 }
 
-/// Input routing decision for a received IPv4 packet
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IpInput {
-    /// Unicast to one of our addresses
-    Local,
-    /// Limited (255.255.255.255) or our subnet's directed broadcast
-    Broadcast,
-    /// Dropped (reason, for debugging)
-    Drop(&'static str),
-}
-
-/// Classify a received packet (Linux ip_route_input_slow defaults:
-/// route_localnet=0, no forwarding, no multicast routing/IGMP yet).
-///
-/// `loopback`: received on `lo`; `dev_bcast`: the receiving device's
-/// subnet broadcast address; `is_local`: address assigned in the
-/// namespace (127/8 included).
-pub fn ip_input_classify(
-    saddr: Ipv4Addr,
-    daddr: Ipv4Addr,
-    loopback: bool,
-    dev_bcast: Option<Ipv4Addr>,
-    is_local: impl Fn(Ipv4Addr) -> bool,
-) -> IpInput {
-    if daddr.is_multicast() {
-        return IpInput::Drop("multicast destination");
-    }
-    if saddr.is_multicast() || saddr.is_broadcast() {
-        return IpInput::Drop("martian source");
-    }
-    if loopback {
-        // lo only carries our own traffic
-        return if daddr.is_unspecified() {
-            IpInput::Drop("zero destination")
-        } else {
-            IpInput::Local
-        };
-    }
-    // On a real device, 127/8 is martian in either direction
-    if saddr.is_loopback() || daddr.is_loopback() {
-        return IpInput::Drop("loopback address on non-loopback device");
-    }
-    // Limited broadcast may come from 0.0.0.0 (DHCP)
-    if daddr.is_broadcast() {
-        return if saddr.is_unspecified() || !is_local(saddr) {
-            IpInput::Broadcast
-        } else {
-            IpInput::Drop("martian source")
-        };
-    }
-    if (saddr.0 >> 24) == 0 {
-        return IpInput::Drop("martian source (0.0.0.0/8)");
-    }
-    if (daddr.0 >> 24) == 0 {
-        return IpInput::Drop("martian destination (0.0.0.0/8)");
-    }
-    if Some(saddr) == dev_bcast || is_local(saddr) {
-        // Our own or our subnet's broadcast address as source: spoofed
-        return IpInput::Drop("martian source");
-    }
-    if Some(daddr) == dev_bcast {
-        return IpInput::Broadcast;
-    }
-    if is_local(daddr) {
-        IpInput::Local
-    } else {
-        IpInput::Drop("not for us (no forwarding)")
-    }
-}
-
 /// Queue a packet for transmission in namespace `net`
 ///
-/// This function:
-/// 1. Picks the output device: local destinations (127/8 or an address of
-///    this namespace) go through `lo`; others use the routing table
-/// 2. Builds the IP header
-/// 3. Resolves the next-hop MAC (ARP; `lo` needs none)
-/// 4. Builds the Ethernet header and transmits via the device
+/// Routes `skb.daddr` (`inet::route::output`; local destinations leave
+/// through `lo`), builds the IP header with `skb.saddr` (or the route's
+/// source), resolves the next hop (ARP; `lo` needs none) and transmits.
 ///
 /// Never delivers synchronously: `lo` queues to the receive backlog.
-/// Callers may hold a socket lock (lock order: socket -> netns tables ->
-/// ARP -> device TX).
+/// Callers may hold a socket lock (lock order: socket -> FIB -> ARP ->
+/// device TX).
 pub fn ip_queue_xmit(
     net: &NetNamespace,
     mut skb: Box<SkBuff>,
     protocol: u8,
 ) -> Result<(), KernelError> {
     let daddr = skb.daddr.ok_or(KernelError::InvalidArgument)?;
-
-    // Route: local destinations via lo (Linux local table), else the FIB
-    let (dev, next_hop) = if net.is_local_addr(daddr) {
-        (
-            net.loopback().ok_or(KernelError::NetworkUnreachable)?,
-            daddr,
-        )
-    } else {
-        net.route_lookup(daddr)?
-    };
-
-    // Source address: the caller's, else the output device's
-    let saddr = match skb.saddr {
-        Some(a) if !a.is_unspecified() => a,
-        _ => {
-            if daddr.is_loopback() {
-                Ipv4Addr::new(127, 0, 0, 1)
-            } else {
-                dev.ipv4_addr()
-                    .or_else(|| net.get_config().map(|c| c.ipv4_addr))
-                    .ok_or(KernelError::AddressNotAvailable)?
-            }
-        }
-    };
+    let src = skb.saddr.unwrap_or_default();
+    let rt = route::output(net, daddr, src, 0)?;
+    let saddr = if src.is_unspecified() { rt.saddr } else { src };
+    let dev = rt.dev.clone();
+    let next_hop = rt.nexthop();
 
     // Build IP header
     let payload_len = skb.len();
@@ -509,8 +406,11 @@ pub fn ip_queue_xmit(
     skb.dev = Some(Arc::clone(&dev));
 
     // Loopback has no link-layer resolution (Linux: NUD_NOARP neighbour)
-    if dev.get_flags() & IFF_LOOPBACK != 0 {
+    if dev.is_loopback() {
         return ip_finish_output(skb, dev.mac());
+    }
+    if rt.rtype == crate::net::inet::fib::RouteType::Broadcast {
+        return ip_finish_output(skb, ethernet::ETH_BROADCAST);
     }
 
     // Resolve next-hop MAC address and transmit
@@ -529,79 +429,4 @@ pub fn ip_finish_output(mut skb: Box<SkBuff>, dest_mac: [u8; ETH_ALEN]) -> Resul
 
     // Transmit
     crate::net::dev::dev_queue_xmit(skb)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
-        Ipv4Addr::new(a, b, c, d)
-    }
-
-    fn eth(saddr: Ipv4Addr, daddr: Ipv4Addr) -> IpInput {
-        let me = ip(10, 0, 2, 15);
-        ip_input_classify(saddr, daddr, false, Some(ip(10, 0, 2, 255)), |a| {
-            a == me || a.is_loopback()
-        })
-    }
-
-    #[test]
-    fn unicast_to_us_is_local() {
-        assert_eq!(eth(ip(10, 0, 2, 3), ip(10, 0, 2, 15)), IpInput::Local);
-        assert_eq!(eth(ip(8, 8, 8, 8), ip(10, 0, 2, 15)), IpInput::Local);
-    }
-
-    #[test]
-    fn other_hosts_are_not_forwarded() {
-        assert!(matches!(
-            eth(ip(10, 0, 2, 3), ip(10, 0, 2, 16)),
-            IpInput::Drop(_)
-        ));
-    }
-
-    #[test]
-    fn broadcasts() {
-        assert_eq!(
-            eth(ip(10, 0, 2, 2), ip(255, 255, 255, 255)),
-            IpInput::Broadcast
-        );
-        // DHCP: limited broadcast from 0.0.0.0
-        assert_eq!(
-            eth(ip(0, 0, 0, 0), ip(255, 255, 255, 255)),
-            IpInput::Broadcast
-        );
-        assert_eq!(eth(ip(10, 0, 2, 2), ip(10, 0, 2, 255)), IpInput::Broadcast);
-        // Zero source only for limited broadcast
-        assert!(matches!(
-            eth(ip(0, 0, 0, 0), ip(10, 0, 2, 255)),
-            IpInput::Drop(_)
-        ));
-    }
-
-    #[test]
-    fn martians_dropped() {
-        let d = |s, t| matches!(eth(s, t), IpInput::Drop(_));
-        assert!(d(ip(127, 0, 0, 1), ip(10, 0, 2, 15)));
-        assert!(d(ip(10, 0, 2, 3), ip(127, 0, 0, 1)));
-        assert!(d(ip(224, 0, 0, 1), ip(10, 0, 2, 15)));
-        assert!(d(ip(255, 255, 255, 255), ip(10, 0, 2, 15)));
-        assert!(d(ip(0, 0, 0, 0), ip(10, 0, 2, 15)));
-        assert!(d(ip(10, 0, 2, 3), ip(0, 0, 0, 0)));
-        assert!(d(ip(10, 0, 2, 3), ip(224, 0, 0, 1)));
-        assert!(d(ip(10, 0, 2, 255), ip(10, 0, 2, 15)));
-        // Spoofed own address
-        assert!(d(ip(10, 0, 2, 15), ip(10, 0, 2, 15)));
-    }
-
-    #[test]
-    fn loopback_device() {
-        let lo = |s, t| ip_input_classify(s, t, true, None, |_| true);
-        assert_eq!(lo(ip(127, 0, 0, 1), ip(127, 0, 0, 1)), IpInput::Local);
-        assert_eq!(lo(ip(10, 0, 2, 15), ip(10, 0, 2, 15)), IpInput::Local);
-        assert!(matches!(
-            lo(ip(127, 0, 0, 1), ip(224, 0, 0, 1)),
-            IpInput::Drop(_)
-        ));
-    }
 }

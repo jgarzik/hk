@@ -80,7 +80,7 @@
 - [x] tee
 - [x] vmsplice
 - [x] copy_file_range
-- [x] ioctl (FIONBIO, FIOASYNC, FIOCLEX, FIONCLEX, FIONREAD, TIOCGWINSZ, terminal/tty, virtio-blk, xHCI USB)
+- [x] ioctl (FIONBIO, FIOASYNC, FIOCLEX, FIONCLEX, FIONREAD, TIOCGWINSZ, terminal/tty, virtio-blk, xHCI USB; sockets: SIOCGIFCONF, SIOCGIFINDEX, SIOCGIFNAME, SIOC[GS]IFFLAGS, SIOC[GS]IFADDR, SIOC[GS]IFNETMASK, SIOC[GS]IFBRDADDR, SIOCGIFHWADDR, SIOC[GS]IFMTU, SIOCADDRT, SIOCDELRT)
 - [x] sync
 - [x] fsync
 - [x] fdatasync
@@ -283,6 +283,11 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 8. Networking & sockets
 
 Linux groups the socket syscalls as their own "network" category.
+
+Families: AF_INET (SOCK_STREAM/TCP, SOCK_DGRAM/UDP) and AF_NETLINK
+(SOCK_RAW/SOCK_DGRAM, NETLINK_ROUTE: links, IPv4 addresses and routes,
+neighbours; SOL_NETLINK options ADD/DROP_MEMBERSHIP, PKTINFO, NO_ENOBUFS,
+CAP_ACK, EXT_ACK, GET_STRICT_CHK, LIST_MEMBERSHIPS).
 
 - [x] socket
 - [x] socketpair

@@ -26,7 +26,6 @@
 //!   Taken under socket/ARP locks (end of the network lock order). Leaf.
 
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
@@ -43,7 +42,7 @@ use crate::bus::driver::{Device, DriverError};
 use crate::bus::pci::PciDevice;
 use crate::dma::DmaCoherent;
 use crate::net::dev::{NAPI_POLL_WEIGHT, Napi, NapiPoll, napi_complete_done, napi_schedule};
-use crate::net::device::{NetDevice, NetDeviceOps};
+use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
 use crate::net::{self, KernelError};
 use crate::printkln;
@@ -499,6 +498,11 @@ impl NapiPoll for E1000 {
 
         if work < budget {
             napi_complete_done(napi, work);
+            // A closed device stays masked (stop() wrote IMC; a frame that
+            // still slips through is dropped by netif_receive_skb)
+            if !self.netdev().is_some_and(|d| d.is_up()) {
+                return work;
+            }
             self.write_reg(reg::IMS, int::ENABLE);
             // On a shared line our ISR may have run during the poll (for
             // another device's interrupt) and consumed ICR causes: those
@@ -535,7 +539,16 @@ impl NetDeviceOps for E1000Ops {
         1500
     }
 
-    fn open(&self) -> Result<(), KernelError> {
+    fn max_mtu(&self) -> u32 {
+        1500 // no jumbo frames (RX buffers are 2 KB)
+    }
+
+    fn open(&self, dev: &NetDevice) -> Result<(), KernelError> {
+        if self.device.link_up() {
+            dev.netif_carrier_on();
+        } else {
+            dev.netif_carrier_off();
+        }
         let c = self.device.read_reg(reg::CTRL);
         self.device.write_reg(reg::CTRL, c | ctrl::SLU | ctrl::ASDE);
         self.device.write_reg(reg::ITR, 0);
@@ -572,7 +585,7 @@ impl Device for E1000DeviceWrapper {
             self.device.irqs_not_ours.load(Ordering::Relaxed),
             self.device.napi.polls(),
         );
-        let _ = self.netdev.down();
+        self.device.write_reg(reg::IMC, 0xFFFF_FFFF);
     }
 }
 
@@ -690,7 +703,12 @@ impl BusDriver for E1000PciDriver {
         let ops: &'static dyn NetDeviceOps = Box::leak(Box::new(E1000Ops {
             device: Arc::clone(&device),
         }));
-        let netdev = Arc::new(NetDevice::new(String::from("eth0"), mac, ops));
+        let netdev = Arc::new(NetDevice::new(
+            net::dev_alloc_name("eth%d"),
+            mac,
+            LinkInfo::ETHER,
+            ops,
+        ));
         device.netdev.call_once(|| Arc::downgrade(&netdev));
 
         // Carrier from the PHY now; later changes arrive as LSC interrupts
@@ -705,7 +723,7 @@ impl BusDriver for E1000PciDriver {
         );
 
         // Shareable level-triggered INTx; the device's interrupts stay
-        // masked until open() below
+        // masked until userspace brings the interface up (open())
         match pci.register_irq_handler(e1000_isr, Arc::as_ptr(&device) as *mut ()) {
             Ok(irq) => printkln!("e1000: IRQ {}", irq),
             Err(e) => {
@@ -714,7 +732,6 @@ impl BusDriver for E1000PciDriver {
             }
         }
 
-        netdev.up().map_err(|_| DriverError::InitFailed)?;
         net::register_netdev(Arc::clone(&netdev));
 
         Ok(Box::new(E1000DeviceWrapper { netdev, device }))

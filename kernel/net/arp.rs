@@ -10,6 +10,8 @@ use alloc::sync::Arc;
 use crate::net::KernelError;
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{self, ETH_ALEN, ETH_BROADCAST, ETH_HLEN, EtherType};
+use crate::net::inet::fib::RouteType;
+use crate::net::inet::ifaddr::{RT_SCOPE_LINK, inet_select_addr};
 use crate::net::ipv4::{self, Ipv4Addr};
 use crate::net::skb::SkBuff;
 
@@ -53,6 +55,8 @@ pub struct ArpEntry {
     pub expires: u64,
     /// Retry count
     pub retries: u8,
+    /// Device the neighbour was learned on
+    pub ifindex: u32,
 }
 
 /// Packets waiting for ARP resolution
@@ -135,6 +139,10 @@ pub fn arp_rcv(skb: SkBuff) {
     };
     let now = crate::time::current_ticks();
 
+    let Some(dev) = skb.dev.as_ref() else {
+        return;
+    };
+
     // Update cache with sender's info (learning)
     ns.arp_insert(ArpEntry {
         ip: sender_ip,
@@ -142,6 +150,7 @@ pub fn arp_rcv(skb: SkBuff) {
         state: ArpState::Reachable,
         expires: now + ARP_TIMEOUT,
         retries: 0,
+        ifindex: dev.ifindex(),
     });
 
     // If we have pending packets for this IP, send them
@@ -152,13 +161,9 @@ pub fn arp_rcv(skb: SkBuff) {
 
     match op {
         ARPOP_REQUEST => {
-            // Check if this request is for our IP
-            if let Some(dev) = skb.dev.as_ref()
-                && let Some(our_ip) = dev.ipv4_addr()
-                && target_ip == our_ip
-            {
-                // Send ARP reply
-                send_arp_reply(dev, sender_ip, &sender_mac);
+            // Answer for any local address (Linux arp_ignore=0)
+            if ns.fib.addr_type(target_ip) == RouteType::Local {
+                send_arp_reply(dev, target_ip, sender_ip, &sender_mac);
             }
         }
         ARPOP_REPLY => {
@@ -209,20 +214,20 @@ pub fn arp_resolve(
         state: ArpState::Incomplete,
         expires: now + ARP_TIMEOUT,
         retries: 0,
+        ifindex: dev.ifindex(),
     });
 
     // Send ARP request
-    send_arp_request(dev, ip);
+    send_arp_request(ns, dev, ip);
 
     // Packet is queued, return success (it will be sent when ARP completes)
     Ok(())
 }
 
-/// Send an ARP request
-fn send_arp_request(dev: &NetDevice, target_ip: Ipv4Addr) {
-    let Some(our_ip) = dev.ipv4_addr() else {
-        return;
-    };
+/// Send an ARP request (Linux arp_solicit; sender address from
+/// inet_select_addr, 0.0.0.0 if the device has none)
+fn send_arp_request(ns: &crate::net::NetNamespace, dev: &NetDevice, target_ip: Ipv4Addr) {
+    let our_ip = inet_select_addr(ns, dev, target_ip, RT_SCOPE_LINK).unwrap_or_default();
 
     let mut skb = match SkBuff::alloc(64, ARP_HLEN + ETH_HLEN) {
         Some(s) => s,
@@ -258,12 +263,13 @@ fn send_arp_request(dev: &NetDevice, target_ip: Ipv4Addr) {
     let _ = dev.xmit(skb);
 }
 
-/// Send an ARP reply
-fn send_arp_reply(dev: &NetDevice, target_ip: Ipv4Addr, target_mac: &[u8; ETH_ALEN]) {
-    let Some(our_ip) = dev.ipv4_addr() else {
-        return;
-    };
-
+/// Send an ARP reply claiming `our_ip`
+fn send_arp_reply(
+    dev: &NetDevice,
+    our_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+    target_mac: &[u8; ETH_ALEN],
+) {
     let mut skb = match SkBuff::alloc(64, ARP_HLEN + ETH_HLEN) {
         Some(s) => s,
         None => return,

@@ -290,16 +290,9 @@ pub fn tcp_connect(
     // Allocate local port
     let local_port = socket.net.alloc_port();
 
-    // For loopback destinations, use loopback as local address
-    let local_addr = if remote_addr.is_loopback() {
-        remote_addr // Use same loopback address
-    } else {
-        socket
-            .net
-            .get_config()
-            .ok_or(KernelError::InvalidArgument)?
-            .ipv4_addr
-    };
+    // Source address from the output route (Linux ip_route_connect)
+    let bound = socket.local_addr().map(|(a, _)| a).unwrap_or_default();
+    let local_addr = crate::net::inet::route::output(&socket.net, remote_addr, bound, 0)?.saddr;
 
     // Set socket addresses
     socket.set_local(local_addr, local_port);
