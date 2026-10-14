@@ -183,10 +183,9 @@ fn check_syscall_impl(
 
     let filter = {
         let table = TASK_TABLE.lock();
-        match table.tasks.iter().find(|t| t.tid == current_task.tid) {
-            Some(task) => task.seccomp_filter.clone(),
-            None => return None, // No task found, allow (shouldn't happen)
-        }
+        // No task found -> allow (shouldn't happen)
+        let task = table.tasks.iter().find(|t| t.tid == current_task.tid)?;
+        task.seccomp_filter.clone()
     };
 
     // Run the check

@@ -70,9 +70,7 @@ impl BitmapFrameAllocator {
 
         // Mark all frames as free
         let full_words = inner.total_frames / 64;
-        for i in 0..full_words {
-            inner.bitmap[i] = !0u64; // All 1s = all free
-        }
+        inner.bitmap[..full_words].fill(!0u64); // All 1s = all free
 
         // Handle remaining bits
         let remaining = inner.total_frames % 64;

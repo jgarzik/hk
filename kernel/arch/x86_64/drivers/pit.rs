@@ -75,17 +75,9 @@ impl Device for Pit8254 {
 
 impl Timer for Pit8254 {
     fn init(&self, frequency_hz: u32) {
-        let divisor = if frequency_hz == 0 {
-            0xFFFF
-        } else {
-            let div = self.clock_freq / frequency_hz;
-            if div > 0xFFFF {
-                0xFFFF
-            } else if div < 1 {
-                1
-            } else {
-                div as u16
-            }
+        let divisor = match self.clock_freq.checked_div(frequency_hz) {
+            None => 0xFFFF,
+            Some(div) => div.clamp(1, 0xFFFF) as u16,
         };
 
         // Send command: channel 0, access mode lo/hi, mode 2 (rate generator)

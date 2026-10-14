@@ -411,8 +411,8 @@ fn handle_getresources(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError
     if res.connector_id_ptr != 0 && res.count_connectors > 0 {
         let copy_count = (res.count_connectors as usize).min(resources.connector_ids.len());
         let dst = res.connector_id_ptr as *mut u32;
-        for i in 0..copy_count {
-            unsafe { *dst.add(i) = resources.connector_ids[i] };
+        for (i, &id) in resources.connector_ids.iter().take(copy_count).enumerate() {
+            unsafe { *dst.add(i) = id };
         }
     }
     res.count_connectors = resources.connector_ids.len() as u32;
@@ -421,8 +421,8 @@ fn handle_getresources(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError
     if res.crtc_id_ptr != 0 && res.count_crtcs > 0 {
         let copy_count = (res.count_crtcs as usize).min(resources.crtc_ids.len());
         let dst = res.crtc_id_ptr as *mut u32;
-        for i in 0..copy_count {
-            unsafe { *dst.add(i) = resources.crtc_ids[i] };
+        for (i, &id) in resources.crtc_ids.iter().take(copy_count).enumerate() {
+            unsafe { *dst.add(i) = id };
         }
     }
     res.count_crtcs = resources.crtc_ids.len() as u32;
@@ -431,8 +431,8 @@ fn handle_getresources(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError
     if res.encoder_id_ptr != 0 && res.count_encoders > 0 {
         let copy_count = (res.count_encoders as usize).min(resources.encoder_ids.len());
         let dst = res.encoder_id_ptr as *mut u32;
-        for i in 0..copy_count {
-            unsafe { *dst.add(i) = resources.encoder_ids[i] };
+        for (i, &id) in resources.encoder_ids.iter().take(copy_count).enumerate() {
+            unsafe { *dst.add(i) = id };
         }
     }
     res.count_encoders = resources.encoder_ids.len() as u32;
@@ -441,8 +441,8 @@ fn handle_getresources(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError
     if res.fb_id_ptr != 0 && res.count_fbs > 0 {
         let copy_count = (res.count_fbs as usize).min(resources.fb_ids.len());
         let dst = res.fb_id_ptr as *mut u32;
-        for i in 0..copy_count {
-            unsafe { *dst.add(i) = resources.fb_ids[i] };
+        for (i, &id) in resources.fb_ids.iter().take(copy_count).enumerate() {
+            unsafe { *dst.add(i) = id };
         }
     }
     res.count_fbs = resources.fb_ids.len() as u32;
@@ -550,8 +550,8 @@ fn handle_getconnector(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError
     if conn_cmd.modes_ptr != 0 && conn_cmd.count_modes > 0 {
         let copy_count = (conn_cmd.count_modes as usize).min(connector.modes.len());
         let dst = conn_cmd.modes_ptr as *mut GfxModeModeinfo;
-        for i in 0..copy_count {
-            let mode_info = GfxModeModeinfo::from(&connector.modes[i]);
+        for (i, mode) in connector.modes.iter().take(copy_count).enumerate() {
+            let mode_info = GfxModeModeinfo::from(mode);
             unsafe { *dst.add(i) = mode_info };
         }
     }
@@ -561,8 +561,8 @@ fn handle_getconnector(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError
     if conn_cmd.encoders_ptr != 0 && conn_cmd.count_encoders > 0 {
         let copy_count = (conn_cmd.count_encoders as usize).min(connector.encoder_ids.len());
         let dst = conn_cmd.encoders_ptr as *mut u32;
-        for i in 0..copy_count {
-            unsafe { *dst.add(i) = connector.encoder_ids[i] };
+        for (i, &id) in connector.encoder_ids.iter().take(copy_count).enumerate() {
+            unsafe { *dst.add(i) = id };
         }
     }
     conn_cmd.count_encoders = connector.encoder_ids.len() as u32;

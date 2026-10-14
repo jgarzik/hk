@@ -19,17 +19,9 @@ const PIT_CMD_MODE_RATE: u8 = 0x04; // Mode 2: rate generator
 
 /// Initialize the PIT for periodic interrupts at the given frequency
 pub fn init(frequency_hz: u32) {
-    let divisor = if frequency_hz == 0 {
-        0xFFFF // Maximum divisor for ~18.2 Hz
-    } else {
-        let div = PIT_FREQUENCY / frequency_hz;
-        if div > 0xFFFF {
-            0xFFFF
-        } else if div < 1 {
-            1
-        } else {
-            div as u16
-        }
+    let divisor = match PIT_FREQUENCY.checked_div(frequency_hz) {
+        None => 0xFFFF, // Maximum divisor for ~18.2 Hz
+        Some(div) => div.clamp(1, 0xFFFF) as u16,
     };
 
     // Send command: channel 0, access mode lo/hi, mode 2 (rate generator)

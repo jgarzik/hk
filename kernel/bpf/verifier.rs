@@ -587,8 +587,8 @@ impl<'a> Verifier<'a> {
     /// Verify helper call
     fn verify_call(&self, insn: &BpfInsn, state: &mut VerifierState) -> Result<(), KernelError> {
         // R1-R5 are caller-saved, become undefined after call
-        for i in 1..=5 {
-            state.regs[i] = RegState::new();
+        for reg in &mut state.regs[1..=5] {
+            *reg = RegState::new();
         }
 
         // R0 contains return value

@@ -670,8 +670,11 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let sem_array: &SemArray =
                 unsafe { &*(sem.as_ref() as *const dyn IpcObject as *const SemArray) };
 
-            for i in 0..sem_array.nsems as usize {
-                let val = sem_array.sems[i].semval.load(Ordering::Acquire) as u16;
+            for (i, s) in sem_array.sems[..sem_array.nsems as usize]
+                .iter()
+                .enumerate()
+            {
+                let val = s.semval.load(Ordering::Acquire) as u16;
                 let offset = arg + (i * 2) as u64;
                 put_user::<Uaccess, u16>(offset, val)
                     .map_err(|_| KernelError::BadAddress.errno())?;
@@ -693,7 +696,10 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 unsafe { &*(sem.as_ref() as *const dyn IpcObject as *const SemArray) };
 
             let pid = current_pid() as i32;
-            for i in 0..sem_array.nsems as usize {
+            for (i, s) in sem_array.sems[..sem_array.nsems as usize]
+                .iter()
+                .enumerate()
+            {
                 let offset = arg + (i * 2) as u64;
                 let val: u16 = get_user::<Uaccess, u16>(offset)
                     .map_err(|_| KernelError::BadAddress.errno())?;
@@ -703,10 +709,8 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                     return Err(KernelError::Range.errno());
                 }
 
-                sem_array.sems[i]
-                    .semval
-                    .store(val as i32, Ordering::Release);
-                sem_array.sems[i].sempid.store(pid, Ordering::Release);
+                s.semval.store(val as i32, Ordering::Release);
+                s.sempid.store(pid, Ordering::Release);
             }
 
             sem_array

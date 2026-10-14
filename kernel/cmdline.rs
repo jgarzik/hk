@@ -134,12 +134,9 @@ fn parse_baud_rate(s: &str) -> u32 {
 /// Check if a console device was specified on the command line
 pub fn is_cmdline_console(name: &str) -> bool {
     let console = CMDLINE_CONSOLE.lock();
-    for i in 0..console.count {
-        if console.specs[i].matches(name) {
-            return true;
-        }
-    }
-    false
+    console.specs[..console.count]
+        .iter()
+        .any(|spec| spec.matches(name))
 }
 
 /// Get the number of console specifications
