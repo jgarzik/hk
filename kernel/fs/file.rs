@@ -418,6 +418,16 @@ impl File {
         self.owner_sig.load(Ordering::Relaxed)
     }
 
+    /// file_remove_privs before a non-empty write: set-id bits go unless
+    /// the writer has CAP_FSETID
+    fn remove_privs(&self, buf: &[u8]) {
+        if !buf.is_empty()
+            && let Some(inode) = self.get_inode()
+        {
+            super::dac::remove_privs(&inode);
+        }
+    }
+
     /// Read from file
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, KernelError> {
         if !self.is_readable() {
@@ -431,6 +441,7 @@ impl File {
         if !self.is_writable() {
             return Err(KernelError::PermissionDenied);
         }
+        self.remove_privs(buf);
         self.f_op.write(self, buf)
     }
 
@@ -447,6 +458,7 @@ impl File {
         if !self.is_writable() {
             return Err(KernelError::PermissionDenied);
         }
+        self.remove_privs(buf);
         self.f_op.pwrite(self, buf, offset)
     }
 
@@ -463,6 +475,7 @@ impl File {
         if !self.is_writable() {
             return Err(KernelError::PermissionDenied);
         }
+        self.remove_privs(buf);
         self.f_op.write_with_flags(self, buf, flags)
     }
 
@@ -489,6 +502,7 @@ impl File {
         if !self.is_writable() {
             return Err(KernelError::PermissionDenied);
         }
+        self.remove_privs(buf);
         self.f_op.pwrite_with_flags(self, buf, offset, flags)
     }
 

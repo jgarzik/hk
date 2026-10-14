@@ -778,6 +778,11 @@ fn resolve_path_to_ino(pathname: &str, mask: u32) -> Result<(u64, bool), i64> {
         None => return Err(-2), // ENOENT
     };
 
+    // inotify_find_inode: the watched inode must be readable
+    if let Err(e) = crate::fs::dac::permission(&inode, crate::fs::MAY_READ) {
+        return Err(e.sysret());
+    }
+
     let ino = inode.ino;
     let is_dir = inode.mode().is_dir();
 

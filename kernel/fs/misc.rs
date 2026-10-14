@@ -73,9 +73,7 @@ pub fn sys_mount(
     // Look up the mount point (must be a directory)
     let mountpoint_dentry = match lookup_path_flags(&target, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Verify it's a directory
@@ -132,9 +130,7 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
     // Look up the target path
     let target_dentry = match lookup_path_flags(&target, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Find the mount at this path
@@ -188,9 +184,7 @@ pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     // 3. Look up new_root path (must be directory)
     let new_root_dentry = match lookup_path_flags(&new_root_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // 4. Verify new_root is a mount point
@@ -203,9 +197,7 @@ pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     // 5. Look up put_old path (must be directory)
     let put_old_dentry = match lookup_path_flags(&put_old_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // 6. Verify put_old is at or under new_root
@@ -548,15 +540,17 @@ fn do_setxattr(
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
         None => return KernelError::NotFound.sysret(),
     };
+
+    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
+        return e.sysret();
+    }
 
     // Call inode operation
     match inode.i_op.setxattr(&inode, &name, &value, flags as u32) {
@@ -599,6 +593,10 @@ pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i
         Some(i) => i,
         None => return KernelError::BadFd.sysret(),
     };
+
+    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
+        return e.sysret();
+    }
 
     // Call inode operation
     match inode.i_op.setxattr(&inode, &name, &value, flags as u32) {
@@ -663,15 +661,17 @@ fn do_getxattr(
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
         None => return KernelError::NotFound.sysret(),
     };
+
+    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_READ) {
+        return e.sysret();
+    }
 
     // If size is 0, query the size needed
     if size == 0 {
@@ -731,6 +731,10 @@ pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
         Some(i) => i,
         None => return KernelError::BadFd.sysret(),
     };
+
+    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_READ) {
+        return e.sysret();
+    }
 
     // If size is 0, query the size needed
     if size == 0 {
@@ -805,9 +809,7 @@ fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) 
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     let inode = match dentry.get_inode() {
@@ -936,15 +938,17 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
         None => return KernelError::NotFound.sysret(),
     };
+
+    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
+        return e.sysret();
+    }
 
     // Call inode operation
     match inode.i_op.removexattr(&inode, &name) {
@@ -976,6 +980,10 @@ pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
         Some(i) => i,
         None => return KernelError::BadFd.sysret(),
     };
+
+    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
+        return e.sysret();
+    }
 
     // Call inode operation
     match inode.i_op.removexattr(&inode, &name) {

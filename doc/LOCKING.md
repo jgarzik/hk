@@ -755,6 +755,20 @@ fn sys_mkdir(...) {
 }
 ```
 
+**Lookup and permission under the lock (Linux lookup_open /
+filename_create):** `open.rs::create_in` (O_CREAT), `path.rs::create_entry`
+(mkdir, mknod, symlink, link) and `path.rs::delete_entry` (unlink, rmdir)
+take the parent's `inode_lock()` first and, while holding it, look the name
+up (`lookup_one`: dentry `d_lock`, then the file system's `lookup`), decide
+EEXIST / "created by this call", run the DAC checks (`dac::may_create`,
+`dac::may_delete`; these read the inode's atomic mode/uid/gid and, for the
+new mode, the task's umask under `FsStruct.inner`) and perform the
+operation. So the existence check, the permission decision and the change
+are atomic with respect to other directory operations on that parent.
+Order: parent `i_rwsem` -> `FsStruct.inner` (umask read, leaf) and parent
+`i_rwsem` -> dentry `d_lock` -> fs-internal locks. Rename does the same
+lookups and checks (`link.rs::rename_locked`) inside `lock_rename()`.
+
 **Filesystem implications:**
 Filesystems can trust that VFS has serialized directory operations. Complex
 internal locking (like lock ordering for cross-directory operations) is

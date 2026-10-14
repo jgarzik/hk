@@ -1,10 +1,21 @@
 //! Directory navigation syscalls (chdir, fchdir, chroot, getcwd)
 
 use crate::arch::Uaccess;
-use crate::fs::{KernelError, LookupFlags, Path, lookup_path_at};
+use crate::fs::dac::{self, MAY_CHDIR, MAY_EXEC};
+use crate::fs::{Dentry, KernelError, LookupFlags, Path, lookup_path_at};
 use crate::uaccess::{UaccessArch, copy_to_user, strncpy_from_user};
 
 use super::syscall::{PATH_MAX, current_fd_table};
+
+/// chdir/fchdir/chroot target: a directory with search permission
+/// (MAY_EXEC | MAY_CHDIR)
+fn may_chdir(d: &Dentry) -> Result<(), KernelError> {
+    let inode = d.get_inode().ok_or(KernelError::NotFound)?;
+    if !inode.mode().is_dir() {
+        return Err(KernelError::NotDirectory);
+    }
+    dac::permission(&inode, MAY_EXEC | MAY_CHDIR)
+}
 
 /// sys_chdir - change working directory
 ///
@@ -23,21 +34,13 @@ pub fn sys_chdir(path_ptr: u64) -> i64 {
     // Get current task's cwd as starting point for relative paths
     let start = crate::task::percpu::current_cwd();
 
-    // Look up the path (must be a directory)
+    // Look up the path (must be a directory), then search permission
     let dentry = match lookup_path_at(start, &path_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
-
-    // Verify it's a directory
-    if let Some(inode) = dentry.get_inode() {
-        if !inode.mode().is_dir() {
-            return KernelError::NotDirectory.sysret();
-        }
-    } else {
-        return KernelError::NotFound.sysret();
+    if let Err(e) = may_chdir(&dentry) {
+        return e.sysret();
     }
 
     // Create new Path and update FsStruct
@@ -64,9 +67,9 @@ pub fn sys_fchdir(fd: i32) -> i64 {
         None => return KernelError::BadFd.sysret(),
     };
 
-    // Must be a directory
-    if !file.is_dir() {
-        return KernelError::NotDirectory.sysret();
+    // Must be a searchable directory
+    if let Err(e) = may_chdir(&file.dentry) {
+        return e.sysret();
     }
 
     // Create new Path and update FsStruct
@@ -97,11 +100,6 @@ pub fn sys_fchdir(fd: i32) -> i64 {
 /// * EACCES - No execute permission on path
 /// * EPERM - Caller lacks CAP_SYS_CHROOT capability
 pub fn sys_chroot(path_ptr: u64) -> i64 {
-    // Check capability (must be root or have CAP_SYS_CHROOT)
-    if !crate::task::capable(crate::task::CAP_SYS_CHROOT) {
-        return KernelError::NotPermitted.sysret();
-    }
-
     // Copy path from user space
     let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
         Ok(p) => p,
@@ -111,22 +109,17 @@ pub fn sys_chroot(path_ptr: u64) -> i64 {
     // Start from current working directory for relative paths
     let start = crate::task::percpu::current_cwd();
 
-    // Look up the path - must be a directory and we must follow symlinks
+    // Look up the path: a searchable directory
     let dentry = match lookup_path_at(start, &path_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(KernelError::PermissionDenied) => return KernelError::PermissionDenied.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
-
-    // Verify it's a directory (should be guaranteed by opendir() flags, but check anyway)
-    if let Some(inode) = dentry.get_inode() {
-        if !inode.mode().is_dir() {
-            return KernelError::NotDirectory.sysret();
-        }
-    } else {
-        return KernelError::NotFound.sysret();
+    if let Err(e) = may_chdir(&dentry) {
+        return e.sysret();
+    }
+    // CAP_SYS_CHROOT is checked after the lookup, like Linux
+    if !crate::task::capable(crate::task::CAP_SYS_CHROOT) {
+        return KernelError::NotPermitted.sysret();
     }
 
     // Update the root directory

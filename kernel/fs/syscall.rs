@@ -180,10 +180,7 @@ pub fn lookup_parent_at(
     // Look up parent directory
     let parent_dentry = match lookup_path_at(start, parent_path, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return Err(KernelError::NotFound.sysret()),
-        Err(KernelError::NotDirectory) => return Err(KernelError::NotDirectory.sysret()),
-        Err(KernelError::TooManySymlinks) => return Err(KernelError::TooManySymlinks.sysret()),
-        Err(_) => return Err(KernelError::InvalidArgument.sysret()),
+        Err(e) => return Err(e.sysret()),
     };
 
     Ok((parent_dentry, alloc::string::String::from(name)))

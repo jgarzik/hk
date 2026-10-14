@@ -53,6 +53,20 @@ SO_PEEK_OFF is EOPNOTSUPP. TCP binds share a port only per the
 SO_REUSEADDR/SO_REUSEPORT rules; connect() picks an entirely unused
 ephemeral port instead of Linux's per-4-tuple reuse.
 
+## File permission (DAC) gaps
+
+**Location**: `kernel/fs/dac.rs`, `kernel/task/exec.rs`
+
+Linux DAC is enforced on the VFS paths (search on every walked directory,
+may_open, may_create/may_delete with the sticky rule, owner-only attribute
+changes, set-id clearing, capability overrides by fsuid/fsgid). Missing:
+no supplementary groups (no setgroups/getgroups; group class checks use the
+fsgid only); fs.protected_hardlinks/symlinks/fifos/regular do not exist
+(behave as their kernel default 0); execve ignores S_ISUID/S_ISGID and file
+capabilities; no read-only, noexec, nodev or nosuid mounts and no
+immutable/append-only inodes (no EROFS, no IS_APPEND/IS_IMMUTABLE EPERM);
+chmod/chown do not update ctime; ETXTBSY is not enforced.
+
 ## Global init is not protected from default-action signals
 
 **Location**: `kernel/signal/mod.rs` send_signal

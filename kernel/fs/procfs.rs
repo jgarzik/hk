@@ -27,6 +27,7 @@ use super::dentry::Dentry;
 use super::file::{DirEntry, File, FileOps};
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::superblock::{FileSystemType, PROC_SUPER_MAGIC, StatFs, SuperBlock, SuperOps};
+use crate::task::Cred;
 use crate::task::Pid;
 
 /// Get current timestamp for new inodes
@@ -348,17 +349,16 @@ impl InodeOps for ProcfsInodeOps {
         }
     }
 
-    /// /proc/sys files: Linux sysctl_perm (no root override of the mode)
-    fn open_perm(&self, inode: &Inode, flags: u32) -> Result<(), KernelError> {
+    /// /proc/sys files: Linux proc_sys_permission (never executable,
+    /// then sysctl_perm: no capability override of the mode)
+    fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
         let Some(ctl) = sysctl_of(inode) else {
-            return Ok(());
+            return crate::fs::dac::generic_permission(cred, inode, mask);
         };
-        let want = match flags & 3 {
-            0 => 4,
-            1 => 2,
-            _ => 6,
-        };
-        crate::sysctl::permission(ctl, want)
+        if mask & crate::fs::MAY_EXEC != 0 {
+            return Err(KernelError::PermissionDenied);
+        }
+        crate::sysctl::permission(ctl, cred, mask)
     }
 
     fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError> {
@@ -980,7 +980,7 @@ impl FileOps for ProcfsFileOps {
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let ctl = sysctl_of(&inode).ok_or(KernelError::Io)?;
-        crate::sysctl::permission(ctl, 2)?;
+        crate::sysctl::permission(ctl, &crate::task::current_cred(), crate::fs::MAY_WRITE)?;
         let n = crate::sysctl::write(ctl, buf, file.get_pos())?;
         file.advance_pos(n as u64);
         Ok(n)

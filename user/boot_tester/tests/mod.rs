@@ -9,6 +9,7 @@ pub mod file_io;
 pub mod fs_common;
 pub mod fs_ops;
 pub mod permissions;
+pub mod dac;
 pub mod sync;
 pub mod sysinfo;
 pub mod signals;
@@ -76,6 +77,7 @@ pub fn run_all_tests() {
     file_io::run_tests();
     fs_ops::run_tests();
     permissions::run_tests();
+    dac::run_tests();
     sync::run_tests();
     sysinfo::run_tests();
     signals::run_tests();

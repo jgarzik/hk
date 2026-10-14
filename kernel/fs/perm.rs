@@ -8,7 +8,10 @@
 //! - utime, utimes, utimensat, futimens (timestamp modification)
 
 use crate::arch::Uaccess;
-use crate::fs::{KernelError, LookupFlags, Path, lookup_path_at};
+use alloc::sync::Arc;
+
+use crate::fs::dac::{self, MAY_ACCESS};
+use crate::fs::{Dentry, Inode, KernelError, LookupFlags, Path, lookup_path_at};
 use crate::uaccess::{UaccessArch, copy_val_from_user, strncpy_from_user};
 
 use super::syscall::{AT_FDCWD, PATH_MAX, current_fd_table};
@@ -35,100 +38,86 @@ const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 /// If pathname is empty, check dirfd itself
 const AT_EMPTY_PATH: i32 = 0x1000;
 
-/// Common helper for access/faccessat/faccessat2
-fn do_faccessat(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
-    // Validate mode - only F_OK, R_OK, W_OK, X_OK are allowed
-    if mode & !(F_OK | R_OK | W_OK | X_OK) != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Validate flags
-    let valid_flags = AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
-    if flags & !valid_flags != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Read path from user space
-    let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Handle AT_EMPTY_PATH
-    if path_str.is_empty() {
-        if flags & AT_EMPTY_PATH == 0 {
-            return KernelError::NotFound.sysret();
+/// Resolve `dirfd` + user path for the *at() attribute syscalls:
+/// AT_EMPTY_PATH (when `empty_ok`) names dirfd itself, AT_SYMLINK_NOFOLLOW
+/// stops at a final symlink
+fn resolve(
+    dirfd: i32,
+    path_ptr: u64,
+    flags: i32,
+    empty_ok: bool,
+) -> Result<Arc<Dentry>, KernelError> {
+    let path =
+        strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX).map_err(|_| KernelError::BadAddress)?;
+    if path.is_empty() {
+        if !empty_ok || flags & AT_EMPTY_PATH == 0 {
+            return Err(KernelError::NotFound);
         }
-        return KernelError::InvalidArgument.sysret();
+        if dirfd == AT_FDCWD {
+            return crate::task::percpu::current_cwd()
+                .map(|p| p.dentry.clone())
+                .ok_or(KernelError::NotFound);
+        }
+        let file = current_fd_table()
+            .lock()
+            .get(dirfd)
+            .ok_or(KernelError::BadFd)?;
+        return Ok(file.dentry.clone());
     }
-
-    // Determine starting path for relative paths
-    let start: Option<Path> = if path_str.starts_with('/') {
+    let start: Option<Path> = if path.starts_with('/') {
         None
     } else if dirfd == AT_FDCWD {
         crate::task::percpu::current_cwd()
     } else {
-        let file = match current_fd_table().lock().get(dirfd) {
-            Some(f) => f,
-            None => return KernelError::BadFd.sysret(),
-        };
+        let file = current_fd_table()
+            .lock()
+            .get(dirfd)
+            .ok_or(KernelError::BadFd)?;
         if !file.is_dir() {
-            return KernelError::NotDirectory.sysret();
+            return Err(KernelError::NotDirectory);
         }
         Path::from_dentry(file.dentry.clone())
     };
-
-    // Set up lookup flags
-    let mut lookup_flags = LookupFlags::open();
+    let mut lf = LookupFlags::open();
     if flags & AT_SYMLINK_NOFOLLOW != 0 {
-        lookup_flags.follow = false;
+        lf.follow = false;
     }
+    lookup_path_at(start, &path, lf)
+}
 
-    // Look up the path
-    let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
-        Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(KernelError::PermissionDenied) => return KernelError::PermissionDenied.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
-    };
+fn inode_of(d: &Dentry) -> Result<Arc<Inode>, KernelError> {
+    d.get_inode().ok_or(KernelError::NotFound)
+}
 
-    // F_OK just checks existence - path lookup succeeded
-    if mode == F_OK {
-        return 0;
-    }
-
-    // Get inode for permission check
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    // Get credentials - use effective if AT_EACCESS, else real
-    let cred = crate::task::percpu::current_cred();
-    let (uid, gid) = if flags & AT_EACCESS != 0 {
-        (cred.euid, cred.egid)
-    } else {
-        (cred.uid, cred.gid)
-    };
-
-    // Convert mode to permission mask
-    let mut mask: u32 = 0;
-    if mode & R_OK != 0 {
-        mask |= super::MAY_READ;
-    }
-    if mode & W_OK != 0 {
-        mask |= super::MAY_WRITE;
-    }
-    if mode & X_OK != 0 {
-        mask |= super::MAY_EXEC;
-    }
-
-    // Check permissions
-    match super::inode_permission(&inode, uid, gid, mask) {
+fn ret(r: Result<(), KernelError>) -> i64 {
+    match r {
         Ok(()) => 0,
-        Err(_) => KernelError::PermissionDenied.sysret(),
+        Err(e) => e.sysret(),
     }
+}
+
+/// Common helper for access/faccessat/faccessat2 (Linux do_faccessat):
+/// without AT_EACCESS the check uses the real uid/gid
+/// (access_override_creds), with it the current fs ids
+fn do_faccessat(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
+    if mode & !(F_OK | R_OK | W_OK | X_OK) != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+    if flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+    let r = resolve(dirfd, path_ptr, flags, true).and_then(|d| {
+        let inode = inode_of(&d)?;
+        let cur = dac::cred();
+        let c = if flags & AT_EACCESS != 0 {
+            cur
+        } else {
+            dac::access_cred(&cur)
+        };
+        // R_OK/W_OK/X_OK are MAY_READ/MAY_WRITE/MAY_EXEC
+        dac::permission_as(&c, &inode, mode as u32 | MAY_ACCESS)
+    });
+    ret(r)
 }
 
 /// sys_access - check file access permissions
@@ -136,12 +125,13 @@ pub fn sys_access(path_ptr: u64, mode: i32) -> i64 {
     do_faccessat(AT_FDCWD, path_ptr, mode, 0)
 }
 
-/// sys_faccessat - check file access relative to directory fd
-pub fn sys_faccessat(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
-    do_faccessat(dirfd, path_ptr, mode, flags)
+/// sys_faccessat - check file access relative to directory fd (no flags
+/// argument: that is faccessat2)
+pub fn sys_faccessat(dirfd: i32, path_ptr: u64, mode: i32) -> i64 {
+    do_faccessat(dirfd, path_ptr, mode, 0)
 }
 
-/// sys_faccessat2 - check file access (same as faccessat)
+/// sys_faccessat2 - check file access with flags
 pub fn sys_faccessat2(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
     do_faccessat(dirfd, path_ptr, mode, flags)
 }
@@ -152,65 +142,11 @@ pub fn sys_faccessat2(dirfd: i32, path_ptr: u64, mode: i32, flags: i32) -> i64 {
 
 /// Internal helper for fchmodat/fchmodat2
 fn do_fchmodat(dirfd: i32, pathname: u64, mode: u32, flags: i32) -> i64 {
-    const FCHMODAT_VALID_FLAGS: i32 = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
-    if (flags & !FCHMODAT_VALID_FLAGS) != 0 {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return KernelError::InvalidArgument.sysret();
     }
-
-    let path_str = match strncpy_from_user::<Uaccess>(pathname, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Handle AT_EMPTY_PATH - operate on dirfd itself
-    let dentry = if path_str.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
-        if dirfd < 0 {
-            return KernelError::BadFd.sysret();
-        }
-        match current_fd_table().lock().get(dirfd) {
-            Some(f) => f.dentry.clone(),
-            None => return KernelError::BadFd.sysret(),
-        }
-    } else {
-        let start: Option<Path> = if path_str.starts_with('/') {
-            None
-        } else if dirfd == AT_FDCWD {
-            crate::task::percpu::current_cwd()
-        } else {
-            let file = match current_fd_table().lock().get(dirfd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
-            };
-            if !file.is_dir() {
-                return KernelError::NotDirectory.sysret();
-            }
-            Path::from_dentry(file.dentry.clone())
-        };
-
-        let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
-            LookupFlags {
-                follow: false,
-                ..LookupFlags::open()
-            }
-        } else {
-            LookupFlags::open()
-        };
-
-        match lookup_path_at(start, &path_str, lookup_flags) {
-            Ok(d) => d,
-            Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-            Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-            Err(_) => return KernelError::InvalidArgument.sysret(),
-        }
-    };
-
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    inode.set_mode_perm((mode & 0o7777) as u16);
-    0
+    ret(resolve(dirfd, pathname, flags, true)
+        .and_then(|d| dac::chmod(&*inode_of(&d)?, (mode & 0o7777) as u16)))
 }
 
 /// sys_fchmodat - change file permissions relative to directory fd
@@ -228,77 +164,36 @@ pub fn sys_chmod(pathname: u64, mode: u32) -> i64 {
     sys_fchmodat(AT_FDCWD, pathname, mode, 0)
 }
 
+/// Inode of an open fd
+fn fd_inode(fd: i32) -> Result<Arc<Inode>, KernelError> {
+    let file = current_fd_table()
+        .lock()
+        .get(fd)
+        .ok_or(KernelError::BadFd)?;
+    file.get_inode().ok_or(KernelError::BadFd)
+}
+
 /// sys_fchmod - change file permissions by fd
 pub fn sys_fchmod(fd: i32, mode: u32) -> i64 {
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    inode.set_mode_perm((mode & 0o7777) as u16);
-    0
+    ret(fd_inode(fd).and_then(|i| dac::chmod(&i, (mode & 0o7777) as u16)))
 }
 
 // =============================================================================
 // chown, lchown, fchown, fchownat syscalls
 // =============================================================================
 
+/// -1 leaves an id unchanged
+fn id(v: u32) -> Option<u32> {
+    (v != u32::MAX).then_some(v)
+}
+
 /// sys_fchownat - change file ownership relative to directory fd
 pub fn sys_fchownat(dirfd: i32, pathname: u64, owner: u32, group: u32, flags: i32) -> i64 {
-    let path_str = match strncpy_from_user::<Uaccess>(pathname, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    let start: Option<Path> = if path_str.starts_with('/') {
-        None
-    } else if dirfd == AT_FDCWD {
-        crate::task::percpu::current_cwd()
-    } else {
-        let file = match current_fd_table().lock().get(dirfd) {
-            Some(f) => f,
-            None => return KernelError::BadFd.sysret(),
-        };
-        if !file.is_dir() {
-            return KernelError::NotDirectory.sysret();
-        }
-        Path::from_dentry(file.dentry.clone())
-    };
-
-    let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
-        LookupFlags {
-            follow: false,
-            ..LookupFlags::open()
-        }
-    } else {
-        LookupFlags::open()
-    };
-
-    let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
-        Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
-    };
-
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    if owner != 0xFFFFFFFF {
-        inode.set_uid(owner);
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return KernelError::InvalidArgument.sysret();
     }
-    if group != 0xFFFFFFFF {
-        inode.set_gid(group);
-    }
-
-    0
+    ret(resolve(dirfd, pathname, flags, true)
+        .and_then(|d| dac::chown(&*inode_of(&d)?, id(owner), id(group))))
 }
 
 /// sys_chown - change file ownership (follows symlinks)
@@ -313,24 +208,7 @@ pub fn sys_lchown(pathname: u64, owner: u32, group: u32) -> i64 {
 
 /// sys_fchown - change file ownership by fd
 pub fn sys_fchown(fd: i32, owner: u32, group: u32) -> i64 {
-    let file = match current_fd_table().lock().get(fd) {
-        Some(f) => f,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    let inode = match file.get_inode() {
-        Some(i) => i,
-        None => return KernelError::BadFd.sysret(),
-    };
-
-    if owner != 0xFFFFFFFF {
-        inode.set_uid(owner);
-    }
-    if group != 0xFFFFFFFF {
-        inode.set_gid(group);
-    }
-
-    0
+    ret(fd_inode(fd).and_then(|i| dac::chown(&i, id(owner), id(group))))
 }
 
 // =============================================================================
@@ -371,114 +249,83 @@ fn current_time() -> crate::time::Timespec {
     TIMEKEEPER.current_time()
 }
 
-/// sys_utimensat - change file timestamps with nanosecond precision
-pub fn sys_utimensat(dirfd: i32, pathname: u64, times: u64, flags: i32) -> i64 {
+/// Linux vfs_utimes: `times` None (or both UTIME_NOW) is a "touch" that
+/// needs ownership or write permission; anything else is an explicit
+/// update that needs ownership or CAP_FOWNER. `pathname` 0 means dirfd.
+fn do_utimes(dirfd: i32, pathname: u64, times: Option<[UserTimespec; 2]>, flags: i32) -> i64 {
+    let valid = |n: i64| (0..1_000_000_000).contains(&n) || n == UTIME_NOW || n == UTIME_OMIT;
+    if let Some(t) = times
+        && !(valid(t[0].tv_nsec) && valid(t[1].tv_nsec))
+    {
+        return KernelError::InvalidArgument.sysret();
+    }
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
     let inode = if pathname == 0 {
         if dirfd == AT_FDCWD {
             return KernelError::InvalidArgument.sysret();
         }
-        let file = match current_fd_table().lock().get(dirfd) {
-            Some(f) => f,
-            None => return KernelError::BadFd.sysret(),
-        };
-        match file.get_inode() {
-            Some(i) => i,
-            None => return KernelError::BadFd.sysret(),
-        }
+        fd_inode(dirfd)
     } else {
-        let path_str = match strncpy_from_user::<Uaccess>(pathname, PATH_MAX) {
-            Ok(p) => p,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        };
-
-        let start: Option<Path> = if path_str.starts_with('/') {
-            None
-        } else if dirfd == AT_FDCWD {
-            crate::task::percpu::current_cwd()
-        } else {
-            let file = match current_fd_table().lock().get(dirfd) {
-                Some(f) => f,
-                None => return KernelError::BadFd.sysret(),
-            };
-            if !file.is_dir() {
-                return KernelError::NotDirectory.sysret();
-            }
-            Path::from_dentry(file.dentry.clone())
-        };
-
-        let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
-            LookupFlags {
-                follow: false,
-                ..LookupFlags::open()
-            }
-        } else {
-            LookupFlags::open()
-        };
-
-        let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
-            Ok(d) => d,
-            Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-            Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-            Err(_) => return KernelError::InvalidArgument.sysret(),
-        };
-
-        match dentry.get_inode() {
-            Some(i) => i,
-            None => return KernelError::NotFound.sysret(),
-        }
+        resolve(dirfd, pathname, flags, true).and_then(|d| inode_of(&d))
     };
-
-    let now = current_time();
-
-    let (new_atime, new_mtime) = if times == 0 {
-        (Some(now), Some(now))
-    } else {
-        let size = core::mem::size_of::<[UserTimespec; 2]>();
-        if !Uaccess::access_ok(times, size) {
-            return KernelError::BadAddress.sysret();
-        }
-        let ts: [UserTimespec; 2] = match copy_val_from_user::<Uaccess, [UserTimespec; 2]>(times) {
-            Ok(v) => v,
-            Err(_) => return KernelError::BadAddress.sysret(),
-        };
-
-        let atime = if ts[0].tv_nsec == UTIME_OMIT {
-            None
-        } else if ts[0].tv_nsec == UTIME_NOW {
-            Some(now)
-        } else {
-            Some(crate::time::Timespec {
-                sec: ts[0].tv_sec,
-                nsec: ts[0].tv_nsec as u32,
-            })
-        };
-
-        let mtime = if ts[1].tv_nsec == UTIME_OMIT {
-            None
-        } else if ts[1].tv_nsec == UTIME_NOW {
-            Some(now)
-        } else {
-            Some(crate::time::Timespec {
-                sec: ts[1].tv_sec,
-                nsec: ts[1].tv_nsec as u32,
-            })
-        };
-
-        (atime, mtime)
+    let inode = match inode {
+        Ok(i) => i,
+        Err(e) => return e.sysret(),
     };
-
-    {
-        let _guard = inode.lock.write();
-        if let Some(atime) = new_atime {
-            inode.set_atime(atime);
-        }
-        if let Some(mtime) = new_mtime {
-            inode.set_mtime(mtime);
-        }
-        inode.set_ctime(now);
+    let times = times.filter(|t| !(t[0].tv_nsec == UTIME_NOW && t[1].tv_nsec == UTIME_NOW));
+    if let Err(e) = dac::may_utimes(&inode, times.is_some()) {
+        return e.sysret();
     }
 
+    let now = current_time();
+    let pick = |t: &UserTimespec| match t.tv_nsec {
+        UTIME_OMIT => None,
+        UTIME_NOW => Some(now),
+        n => Some(crate::time::Timespec {
+            sec: t.tv_sec,
+            nsec: n as u32,
+        }),
+    };
+    let (atime, mtime) = match &times {
+        None => (Some(now), Some(now)),
+        Some(t) => (pick(&t[0]), pick(&t[1])),
+    };
+    let _guard = inode.lock.write();
+    if let Some(t) = atime {
+        inode.set_atime(t);
+    }
+    if let Some(t) = mtime {
+        inode.set_mtime(t);
+    }
+    inode.set_ctime(now);
     0
+}
+
+/// Copy a user array of two `T`
+fn copy_pair<T: Copy + Default>(ptr: u64) -> Result<[T; 2], KernelError> {
+    if !Uaccess::access_ok(ptr, core::mem::size_of::<[T; 2]>()) {
+        return Err(KernelError::BadAddress);
+    }
+    copy_val_from_user::<Uaccess, [T; 2]>(ptr).map_err(|_| KernelError::BadAddress)
+}
+
+/// sys_utimensat - change file timestamps with nanosecond precision
+pub fn sys_utimensat(dirfd: i32, pathname: u64, times: u64, flags: i32) -> i64 {
+    let ts = if times == 0 {
+        None
+    } else {
+        match copy_pair::<UserTimespec>(times) {
+            Ok(t) => Some(t),
+            Err(e) => return e.sysret(),
+        }
+    };
+    // Nothing to do: not even the path is checked
+    if ts.is_some_and(|t| t[0].tv_nsec == UTIME_OMIT && t[1].tv_nsec == UTIME_OMIT) {
+        return 0;
+    }
+    do_utimes(dirfd, pathname, ts, flags)
 }
 
 /// sys_futimens - change file timestamps by fd
@@ -488,121 +335,53 @@ pub fn sys_futimens(fd: i32, times: u64) -> i64 {
 
 /// sys_utimes - change file timestamps (microsecond precision)
 pub fn sys_utimes(pathname: u64, times: u64) -> i64 {
-    if times == 0 {
-        return sys_utimensat(AT_FDCWD, pathname, 0, 0);
-    }
-
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
     struct Timeval {
         tv_sec: i64,
         tv_usec: i64,
     }
-
-    let size = core::mem::size_of::<[Timeval; 2]>();
-    if !Uaccess::access_ok(times, size) {
-        return KernelError::BadAddress.sysret();
-    }
-    let tv: [Timeval; 2] = match copy_val_from_user::<Uaccess, [Timeval; 2]>(times) {
-        Ok(v) => v,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let ts = if times == 0 {
+        None
+    } else {
+        let tv = match copy_pair::<Timeval>(times) {
+            Ok(t) => t,
+            Err(e) => return e.sysret(),
+        };
+        if tv.iter().any(|t| !(0..1_000_000).contains(&t.tv_usec)) {
+            return KernelError::InvalidArgument.sysret();
+        }
+        Some(tv.map(|t| UserTimespec {
+            tv_sec: t.tv_sec,
+            tv_nsec: t.tv_usec * 1000,
+        }))
     };
-
-    let ts: [UserTimespec; 2] = [
-        UserTimespec {
-            tv_sec: tv[0].tv_sec,
-            tv_nsec: tv[0].tv_usec * 1000,
-        },
-        UserTimespec {
-            tv_sec: tv[1].tv_sec,
-            tv_nsec: tv[1].tv_usec * 1000,
-        },
-    ];
-
-    let path_str = match strncpy_from_user::<Uaccess>(pathname, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    let start = crate::task::percpu::current_cwd();
-    let dentry = match lookup_path_at(start, &path_str, LookupFlags::open()) {
-        Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
-    };
-
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    let now = current_time();
-
-    {
-        let _guard = inode.lock.write();
-        inode.set_atime(crate::time::Timespec {
-            sec: ts[0].tv_sec,
-            nsec: ts[0].tv_nsec as u32,
-        });
-        inode.set_mtime(crate::time::Timespec {
-            sec: ts[1].tv_sec,
-            nsec: ts[1].tv_nsec as u32,
-        });
-        inode.set_ctime(now);
-    }
-
-    0
+    do_utimes(AT_FDCWD, pathname, ts, 0)
 }
 
 /// sys_utime - change file timestamps (second precision)
 pub fn sys_utime(pathname: u64, times: u64) -> i64 {
-    if times == 0 {
-        return sys_utimensat(AT_FDCWD, pathname, 0, 0);
-    }
-
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
     struct Utimbuf {
         actime: i64,
         modtime: i64,
     }
-
-    let size = core::mem::size_of::<Utimbuf>();
-    if !Uaccess::access_ok(times, size) {
-        return KernelError::BadAddress.sysret();
-    }
-    let buf: Utimbuf = match copy_val_from_user::<Uaccess, Utimbuf>(times) {
-        Ok(v) => v,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    let ts = if times == 0 {
+        None
+    } else {
+        if !Uaccess::access_ok(times, core::mem::size_of::<Utimbuf>()) {
+            return KernelError::BadAddress.sysret();
+        }
+        let b = match copy_val_from_user::<Uaccess, Utimbuf>(times) {
+            Ok(v) => v,
+            Err(_) => return KernelError::BadAddress.sysret(),
+        };
+        let at = |sec| UserTimespec {
+            tv_sec: sec,
+            tv_nsec: 0,
+        };
+        Some([at(b.actime), at(b.modtime)])
     };
-
-    let path_str = match strncpy_from_user::<Uaccess>(pathname, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    let start = crate::task::percpu::current_cwd();
-    let dentry = match lookup_path_at(start, &path_str, LookupFlags::open()) {
-        Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
-    };
-
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    let now = current_time();
-
-    {
-        let _guard = inode.lock.write();
-        inode.set_atime(crate::time::Timespec::from_secs(buf.actime));
-        inode.set_mtime(crate::time::Timespec::from_secs(buf.modtime));
-        inode.set_ctime(now);
-    }
-
-    0
+    do_utimes(AT_FDCWD, pathname, ts, 0)
 }

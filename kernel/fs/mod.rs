@@ -5,6 +5,7 @@
 
 // Core VFS modules
 pub mod blkdev_ops;
+pub mod dac;
 pub mod dentry;
 pub mod file;
 pub mod fsstruct;
@@ -47,6 +48,7 @@ pub use crate::error::KernelError;
 pub use blkdev_ops::BLOCK_FILE_OPS;
 pub use cgroupfs::{CGROUPFS_FILE_OPS, CGROUPFS_TYPE};
 pub use cpio::unpack_cpio;
+pub use dac::{MAY_EXEC, MAY_READ, MAY_WRITE};
 pub use dentry::{DCACHE, Dentry, DentryCache, is_subdir};
 pub use file::{CHAR_FILE_OPS, DirEntry, File, FileOps, RwFlags, flags, seek};
 pub use fsstruct::{FsStruct, clone_task_fs, exit_task_fs, get_task_fs, init_task_fs};
@@ -55,10 +57,7 @@ pub use mount::{
     Mount, MountNamespace, current_mnt_ns, do_mount, do_mount_dev, do_umount, follow_mount,
     init_mnt_ns, mount_at_path, umount_flags,
 };
-pub use path::{
-    LookupFlags, MAY_EXEC, MAY_READ, MAY_WRITE, create_dir, create_file, inode_permission,
-    lookup_path, lookup_path_at, lookup_path_flags,
-};
+pub use path::{LookupFlags, lookup_one, lookup_path, lookup_path_at, lookup_path_flags};
 pub use path_ref::Path;
 pub use procfs::{
     NamespaceType, PROCFS_FILE_OPS, PROCFS_TYPE, ProcfsInodeData, ProcfsInodeWrapper,
@@ -92,55 +91,24 @@ impl From<&str> for KernelError {
 
 use alloc::sync::Arc;
 
-/// Open a file for kernel use (kernel-internal open for execution)
+/// Open a file for execve (Linux do_open_execat): the walk's search
+/// checks, then may_open for MAY_EXEC (x permission; CAP_DAC_OVERRIDE
+/// only if some x bit is set; directories and devices EACCES) and a
+/// regular file. Kernel-internal callers (init) have root credentials.
 ///
-/// This is a kernel-internal helper that opens a file by path using the VFS.
-/// It checks for execute permission and returns an Arc<File> suitable for reading.
-///
-/// # Arguments
-/// * `path` - Path to the file to open
-///
-/// # Returns
-/// * `Ok(Arc<File>)` - File handle for reading
-/// * `Err(i32)` - Negative errno on error (ENOENT, EACCES, etc.)
+/// Returns a read-only file, or a positive errno (ENOENT, EACCES, ...).
 pub fn kernel_open_exec(path: &str) -> Result<Arc<File>, i32> {
-    const ENOENT: i32 = 2;
-    const EACCES: i32 = 13;
-
-    // Look up the path
-    let dentry = lookup_path_flags(path, LookupFlags::open()).map_err(|e| match e {
-        KernelError::NotFound => ENOENT,
-        KernelError::NotDirectory => ENOENT,
-        KernelError::PermissionDenied => EACCES,
-        _ => ENOENT,
-    })?;
-
-    // Get the inode
-    let inode = dentry.get_inode().ok_or(ENOENT)?;
-
-    // Must be a regular file
+    let dentry = lookup_path_flags(path, LookupFlags::open()).map_err(|e| e as i32)?;
+    let inode = dentry.get_inode().ok_or(KernelError::NotFound as i32)?;
+    dac::may_open(&dac::cred(), &inode, MAY_EXEC, flags::O_RDONLY).map_err(|e| e as i32)?;
     if !inode.mode().is_file() {
-        return Err(EACCES);
+        return Err(KernelError::PermissionDenied as i32);
     }
-
-    // Check execute permission (mode has S_IXUSR, S_IXGRP, S_IXOTH)
-    // For now, root bypasses this - real implementation would check credentials
-    let mode = inode.mode().perm();
-    if mode & 0o111 == 0 {
-        // No execute permission bits set
-        return Err(EACCES);
-    }
-
-    // Get the file operations from the filesystem type via superblock
     let f_op: &'static dyn FileOps = dentry
         .superblock()
         .map(|sb| sb.fs_type.file_ops)
         .unwrap_or(&ramfs::RAMFS_FILE_OPS);
-
-    // Create file object with read-only access
-    let file = Arc::new(File::new(dentry, flags::O_RDONLY, f_op));
-
-    Ok(file)
+    Ok(Arc::new(File::new(dentry, flags::O_RDONLY, f_op)))
 }
 
 // ============================================================================

@@ -71,9 +71,7 @@ pub fn sys_stat(path_ptr: u64, statbuf: u64) -> i64 {
     // Look up the path (follow symlinks)
     let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Get the inode
@@ -200,10 +198,7 @@ pub fn sys_fstatat(dirfd: i32, path_ptr: u64, statbuf: u64, flags: i32) -> i64 {
     // Look up the path
     let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(KernelError::TooManySymlinks) => return KernelError::TooManySymlinks.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Get the inode
@@ -251,10 +246,7 @@ pub fn sys_lstat(path_ptr: u64, statbuf: u64) -> i64 {
 
     let dentry = match lookup_path_flags(&path, flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(KernelError::TooManySymlinks) => return KernelError::TooManySymlinks.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Get the inode
@@ -430,9 +422,7 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
     // Look up path to get dentry/superblock
     let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Get superblock
@@ -618,9 +608,7 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> 
 
         match lookup_path_at(start, &path, lookup_flags) {
             Ok(d) => d,
-            Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-            Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-            Err(_) => return KernelError::InvalidArgument.sysret(),
+            Err(e) => return e.sysret(),
         }
     };
 

@@ -840,6 +840,13 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
             return -20; // ENOTDIR
         }
 
+        // fanotify_find_path: the marked object must be readable
+        if let Some(inode) = dentry.get_inode()
+            && let Err(e) = crate::fs::dac::permission(&inode, crate::fs::MAY_READ)
+        {
+            return e.sysret();
+        }
+
         // Get target ID based on mark type
         if (mark_flags & FAN_MARK_FILESYSTEM) != 0 {
             // Use superblock ID (use dev_id from superblock)

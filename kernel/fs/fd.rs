@@ -68,17 +68,18 @@ pub fn sys_ftruncate(fd: i32, length: i64) -> i64 {
         None => return KernelError::BadFd.sysret(),
     };
 
-    // Check file is writable
-    if !file.is_writable() {
-        return KernelError::InvalidArgument.sysret(); // EBADF or EINVAL depending on interpretation
-    }
-
     // Get the inode
     let inode = match file.get_inode() {
         Some(i) => i,
         None => return KernelError::BadFd.sysret(),
     };
 
+    // Linux do_ftruncate: a regular file open for writing, else EINVAL
+    if !file.is_writable() || !inode.mode().is_file() {
+        return KernelError::InvalidArgument.sysret();
+    }
+
+    super::dac::remove_privs(&inode);
     do_truncate(&inode, length as u64)
 }
 
@@ -108,9 +109,7 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
     // Look up the file (follow symlinks for truncate)
     let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Get the inode
@@ -119,6 +118,11 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
         None => return KernelError::NotFound.sysret(),
     };
 
+    // vfs_truncate: EISDIR / EINVAL / write permission, then set-id removal
+    if let Err(e) = super::dac::may_truncate(&inode) {
+        return e.sysret();
+    }
+    super::dac::remove_privs(&inode);
     do_truncate(&inode, length as u64)
 }
 

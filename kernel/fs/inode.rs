@@ -15,6 +15,7 @@ use super::superblock::SuperBlock;
 // Re-export device types from chardev module
 pub use crate::chardev::{DevId, DeviceType};
 
+use crate::task::Cred;
 /// Re-export credential types from task module
 pub use crate::task::{Gid, Uid};
 
@@ -149,43 +150,6 @@ impl InodeMode {
     pub fn raw(&self) -> u16 {
         self.0
     }
-
-    /// Check if given uid/gid has the requested access permission
-    ///
-    /// # Arguments
-    /// * `uid` - User ID of the requesting process (fsuid)
-    /// * `gid` - Group ID of the requesting process (fsgid)
-    /// * `inode_uid` - Owner user ID of the inode
-    /// * `inode_gid` - Owner group ID of the inode
-    /// * `mask` - Permission mask (MAY_READ=4, MAY_WRITE=2, MAY_EXEC=1)
-    ///
-    /// # Returns
-    /// `true` if access is allowed, `false` otherwise
-    ///
-    /// Note: Root (uid=0) bypasses all permission checks - this should be
-    /// handled by the caller before calling this method.
-    pub fn check_permission(
-        &self,
-        uid: Uid,
-        gid: Gid,
-        inode_uid: Uid,
-        inode_gid: Gid,
-        mask: u32,
-    ) -> bool {
-        let perm = self.perm();
-        let bits = if uid == inode_uid {
-            // Owner bits (bits 6-8)
-            (perm >> 6) & 0o7
-        } else if gid == inode_gid {
-            // Group bits (bits 3-5)
-            (perm >> 3) & 0o7
-        } else {
-            // Other bits (bits 0-2)
-            perm & 0o7
-        };
-
-        (bits as u32 & mask) == mask
-    }
 }
 
 /// Inode operations trait - filesystem-specific behavior
@@ -193,12 +157,11 @@ pub trait InodeOps: Send + Sync {
     /// Look up a child entry in a directory inode
     fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError>;
 
-    /// Extra open-time access check for files whose rules are not the
-    /// mode bits (Linux ->permission, e.g. /proc/sys: no root bypass);
-    /// `flags` are the open flags. Default: allowed.
-    fn open_perm(&self, inode: &Inode, flags: u32) -> Result<(), KernelError> {
-        let _ = (inode, flags);
-        Ok(())
+    /// Access check for `mask` (MAY_* bits) by `cred` (Linux
+    /// ->permission). Default: generic_permission (mode bits plus
+    /// capability overrides); /proc/sys overrides it with sysctl_perm.
+    fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
+        super::dac::generic_permission(cred, inode, mask)
     }
 
     /// Create a new file in a directory
@@ -552,6 +515,11 @@ impl Inode {
                 break;
             }
         }
+    }
+
+    /// Clear mode bits (set-id removal on write, truncate, chown)
+    pub fn clear_mode_bits(&self, bits: u16) {
+        self.mode.fetch_and(!(bits & 0o7777), Ordering::AcqRel);
     }
 
     /// Get owner user ID

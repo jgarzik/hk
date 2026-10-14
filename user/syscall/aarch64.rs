@@ -453,6 +453,9 @@ pub const SYS_FREMOVEXATTR: u64 = 16;
 pub const XATTR_CREATE: i32 = 0x1;
 pub const XATTR_REPLACE: i32 = 0x2;
 pub const SYS_CHROOT: u64 = 51;
+pub const SYS_FACCESSAT: u64 = 48;
+pub const SYS_CHDIR: u64 = 49;
+pub const SYS_FCHDIR: u64 = 50;
 pub const SYS_FCHMODAT2: u64 = 452;
 
 // ============================================================================
@@ -1041,6 +1044,22 @@ pub fn sys_umask(mask: u32) -> i64 {
 /// chroot(pathname)
 pub fn sys_chroot(pathname: *const u8) -> i64 {
     unsafe { syscall1!(SYS_CHROOT, pathname) }
+}
+
+/// chdir(pathname)
+pub fn sys_chdir(pathname: *const u8) -> i64 {
+    unsafe { syscall1!(SYS_CHDIR, pathname) }
+}
+
+/// fchdir(fd)
+pub fn sys_fchdir(fd: i32) -> i64 {
+    unsafe { syscall1!(SYS_FCHDIR, fd) }
+}
+
+/// faccessat(dirfd, pathname, mode, flags) (the syscall has no flags
+/// argument: flags other than 0 go through faccessat2 in libc)
+pub fn sys_faccessat(dirfd: i32, pathname: *const u8, mode: i32) -> i64 {
+    unsafe { syscall3!(SYS_FACCESSAT, dirfd, pathname, mode) }
 }
 
 /// fchmodat2(dirfd, pathname, mode, flags)

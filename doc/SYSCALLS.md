@@ -70,8 +70,8 @@
 - [x] pwritev
 - [x] pwritev2
 - [x] lseek
-- [x] truncate (x86-64 only, legacy)
-- [x] ftruncate (x86-64 only, legacy)
+- [x] truncate
+- [x] ftruncate
 
 2.3 Special I/O helpers
 
@@ -128,7 +128,7 @@ New kernels mostly use statx; older ones use stat/lstat/fstat.
 Permissions and ownership:
 
 - [x] access (x86-64 only, legacy; use faccessat)
-- [x] faccessat
+- [x] faccessat (no flags argument; flags need faccessat2)
 - [x] faccessat2
 - [x] chmod (x86-64 only, legacy; use fchmodat)
 - [x] fchmod

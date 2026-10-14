@@ -1644,7 +1644,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_FCHDIR => sys_fchdir(arg0 as i32) as u64,
         SYS_CHROOT => sys_chroot(arg0) as u64,
         SYS_OPENAT => sys_openat(arg0 as i32, arg1, arg2 as u32, arg3 as u32) as u64,
-        SYS_FACCESSAT => sys_faccessat(arg0 as i32, arg1, arg2 as i32, arg3 as i32) as u64,
+        SYS_FACCESSAT => sys_faccessat(arg0 as i32, arg1, arg2 as i32) as u64,
         SYS_DUP3 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as u32) as u64,
         SYS_PIPE => sys_pipe(arg0) as u64,
         SYS_PIPE2 => sys_pipe2(arg0, arg1 as u32) as u64,

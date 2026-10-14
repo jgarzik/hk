@@ -78,21 +78,20 @@ pub fn write(ctl: &Ctl, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
     Ok(buf.len())
 }
 
-/// Linux sysctl_perm / net_ctl_permissions: root or CAP_NET_ADMIN use
-/// the owner bits, group root the group bits, others the rest (no
-/// CAP_DAC_OVERRIDE: a read-only sysctl is read-only for root too).
-/// `want` is MAY_READ (4) / MAY_WRITE (2) bits.
-pub fn permission(ctl: &Ctl, want: u16) -> Result<(), KernelError> {
-    let c = crate::task::current_cred();
-    let m = ctl.mode;
-    let bits = if c.euid == 0 || crate::task::capable(crate::task::CAP_NET_ADMIN) {
-        (m >> 6) & 7
+/// Linux sysctl_perm / net_ctl_permissions for credentials `c`: euid 0
+/// or CAP_NET_ADMIN use the owner bits, egid 0 the group bits, others the
+/// rest (no CAP_DAC_OVERRIDE: a read-only sysctl is read-only for root
+/// too). `mask` holds MAY_READ / MAY_WRITE / MAY_EXEC bits.
+pub fn permission(ctl: &Ctl, c: &crate::task::Cred, mask: u32) -> Result<(), KernelError> {
+    let m = ctl.mode as u32;
+    let bits = if c.euid == 0 || c.cap_effective.has(crate::task::CAP_NET_ADMIN) {
+        m >> 6
     } else if c.egid == 0 {
-        (m >> 3) & 7
+        m >> 3
     } else {
-        m & 7
+        m
     };
-    if want & !bits & 7 != 0 {
+    if mask & !bits & 7 != 0 {
         return Err(KernelError::PermissionDenied);
     }
     Ok(())

@@ -257,15 +257,16 @@ impl InodeOps for RamfsInodeOps {
             return Err(KernelError::AlreadyExists);
         }
 
-        // Create new inode (inherit uid/gid from parent directory for now)
+        // Owner from the caller's fs ids (inode_init_owner)
         let ino = sb.alloc_ino();
         let file_id = ramfs_file_id(&sb, ino);
+        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
 
         let new_inode = Arc::new(Inode::new(
             ino,
             mode,
-            dir.uid(),
-            dir.gid(),
+            uid,
+            gid,
             0,
             current_time(),
             Arc::downgrade(&sb),
@@ -296,12 +297,13 @@ impl InodeOps for RamfsInodeOps {
             return Err(KernelError::AlreadyExists);
         }
 
-        // Create new directory inode (inherit uid/gid from parent)
+        // Owner from the caller's fs ids (inode_init_owner)
+        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
         let new_inode = Arc::new(Inode::new(
             sb.alloc_ino(),
             mode,
-            dir.uid(),
-            dir.gid(),
+            uid,
+            gid,
             0,
             current_time(),
             Arc::downgrade(&sb),
@@ -447,11 +449,12 @@ impl InodeOps for RamfsInodeOps {
         }
 
         // Create symlink inode (mode = S_IFLNK | 0777)
+        let (uid, gid, mode) = super::dac::init_owner(dir, InodeMode::symlink());
         let new_inode = Arc::new(Inode::new(
             sb.alloc_ino(),
-            InodeMode::symlink(),
-            dir.uid(),
-            dir.gid(),
+            mode,
+            uid,
+            gid,
             target.len() as u64, // size = target length
             current_time(),
             Arc::downgrade(&sb),
