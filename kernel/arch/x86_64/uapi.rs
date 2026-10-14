@@ -25,3 +25,9 @@ pub struct Stat {
     pub st_ctime_nsec: i64,
     pub __unused: [i64; 3],
 }
+
+// O_* flags whose values differ per arch (include/uapi/asm-generic/fcntl.h)
+/// Must be a directory
+pub const O_DIRECTORY: u32 = 0o200000;
+/// Don't follow a trailing symlink
+pub const O_NOFOLLOW: u32 = 0o400000;

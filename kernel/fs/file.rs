@@ -51,10 +51,8 @@ pub mod flags {
     pub const O_NONBLOCK: u32 = 0o4000;
     /// Asynchronous I/O (generate SIGIO)
     pub const O_ASYNC: u32 = 0o20000;
-    /// Must be a directory
-    pub const O_DIRECTORY: u32 = 0o200000;
-    /// Don't follow symlinks
-    pub const O_NOFOLLOW: u32 = 0o400000;
+    /// Must be a directory / don't follow symlinks (values differ per arch)
+    pub use crate::arch::uapi::{O_DIRECTORY, O_NOFOLLOW};
     /// Close on exec
     pub const O_CLOEXEC: u32 = 0o2000000;
 }

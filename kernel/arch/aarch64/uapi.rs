@@ -28,3 +28,9 @@ pub struct Stat {
     pub __unused4: u32,
     pub __unused5: u32,
 }
+
+// O_* flags whose values differ per arch (arch/arm64/include/uapi/asm/fcntl.h)
+/// Must be a directory
+pub const O_DIRECTORY: u32 = 0o40000;
+/// Don't follow a trailing symlink
+pub const O_NOFOLLOW: u32 = 0o100000;

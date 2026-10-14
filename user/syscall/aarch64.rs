@@ -2650,3 +2650,9 @@ pub struct Stat {
     pub _unused4: u32,
     pub _unused5: u32,
 }
+
+// O_* flags whose values differ per arch (arch/arm64/include/uapi/asm/fcntl.h)
+pub const O_DIRECTORY: u32 = 0o40000;
+pub const O_NOFOLLOW: u32 = 0o100000;
+pub const O_DIRECT: u32 = 0o200000;
+pub const O_LARGEFILE: u32 = 0o400000;

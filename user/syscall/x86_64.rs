@@ -2384,3 +2384,9 @@ pub struct Stat {
     pub st_ctime_nsec: i64,
     pub _unused: [i64; 3],
 }
+
+// O_* flags whose values differ per arch (include/uapi/asm-generic/fcntl.h)
+pub const O_DIRECT: u32 = 0o40000;
+pub const O_LARGEFILE: u32 = 0o100000;
+pub const O_DIRECTORY: u32 = 0o200000;
+pub const O_NOFOLLOW: u32 = 0o400000;

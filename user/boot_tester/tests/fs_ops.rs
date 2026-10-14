@@ -12,7 +12,7 @@ use super::helpers::{print, print_num, println, host_mode, skip};
 use hk_syscall::{
     sys_close, sys_link, sys_lseek, sys_mkdir, sys_mknod, sys_mount, sys_open, sys_read,
     sys_readlink, sys_rename, sys_rmdir, sys_symlink, sys_truncate, sys_umount2, sys_unlink,
-    sys_write, O_CREAT, O_RDONLY, O_WRONLY, SEEK_SET,
+    sys_write, O_CREAT, O_NOFOLLOW, O_RDONLY, O_WRONLY, SEEK_SET,
 };
 
 /// Run all filesystem ops tests
@@ -31,6 +31,7 @@ pub fn run_tests() {
     test_symlink();
     test_readlink();
     test_symlink_read();
+    test_symlink_nofollow();
     test_symlink_eexist();
     test_readlink_einval();
 
@@ -106,6 +107,22 @@ fn test_readlink() {
     } else {
         print(b"READLINK:FAIL: expected 9, got ");
         print_num(ret);
+    }
+}
+
+/// Test: open(O_NOFOLLOW) on a symlink fails with ELOOP
+fn test_symlink_nofollow() {
+    let symlink_path = b"/link_to_test\0";
+    let ret = sys_open(symlink_path.as_ptr(), O_RDONLY | O_NOFOLLOW, 0);
+    if ret == -40 {
+        println(b"SYMLINK_NOFOLLOW:OK");
+    } else {
+        print(b"SYMLINK_NOFOLLOW:FAIL: expected -40 (ELOOP), got ");
+        print_num(ret);
+        println(b"");
+        if ret >= 0 {
+            sys_close(ret as u64);
+        }
     }
 }
 
