@@ -5,7 +5,7 @@ use alloc::vec;
 use crate::arch::Uaccess;
 use crate::console::console_write;
 use crate::fs::KernelError;
-use crate::uaccess::{UaccessArch, copy_to_user};
+use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 
 use super::syscall::{MAX_RW_COUNT, SMALL_BUF_SIZE, check_fsize_limit, current_fd_table};
 
@@ -98,22 +98,14 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         if count <= SMALL_BUF_SIZE {
             let mut stack_buf = [0u8; SMALL_BUF_SIZE];
             let write_buf = &mut stack_buf[..count];
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(buf_ptr as *const u8, write_buf.as_mut_ptr(), count);
-                Uaccess::user_access_end();
+            if copy_from_user::<Uaccess>(&mut write_buf[..count], buf_ptr, count).is_err() {
+                return KernelError::BadAddress.sysret();
             }
             console_write(write_buf);
         } else {
             let mut kernel_buf = vec![0u8; count];
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(
-                    buf_ptr as *const u8,
-                    kernel_buf.as_mut_ptr(),
-                    count,
-                );
-                Uaccess::user_access_end();
+            if copy_from_user::<Uaccess>(&mut kernel_buf[..count], buf_ptr, count).is_err() {
+                return KernelError::BadAddress.sysret();
             }
             console_write(&kernel_buf);
         }
@@ -140,10 +132,8 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         let write_buf = &mut stack_buf[..count];
 
         // Copy from user space to kernel buffer
-        unsafe {
-            Uaccess::user_access_begin();
-            core::ptr::copy_nonoverlapping(buf_ptr as *const u8, write_buf.as_mut_ptr(), count);
-            Uaccess::user_access_end();
+        if copy_from_user::<Uaccess>(&mut write_buf[..count], buf_ptr, count).is_err() {
+            return KernelError::BadAddress.sysret();
         }
 
         // Perform write
@@ -157,10 +147,8 @@ pub fn sys_write(fd: i32, buf_ptr: u64, count: u64) -> i64 {
         let mut kernel_buf = vec![0u8; count];
 
         // Copy from user space to kernel buffer
-        unsafe {
-            Uaccess::user_access_begin();
-            core::ptr::copy_nonoverlapping(buf_ptr as *const u8, kernel_buf.as_mut_ptr(), count);
-            Uaccess::user_access_end();
+        if copy_from_user::<Uaccess>(&mut kernel_buf[..count], buf_ptr, count).is_err() {
+            return KernelError::BadAddress.sysret();
         }
 
         // Perform write
@@ -340,10 +328,8 @@ pub fn sys_pwrite64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
         let write_buf = &mut stack_buf[..count];
 
         // Copy from user space to kernel buffer
-        unsafe {
-            Uaccess::user_access_begin();
-            core::ptr::copy_nonoverlapping(buf_ptr as *const u8, write_buf.as_mut_ptr(), count);
-            Uaccess::user_access_end();
+        if copy_from_user::<Uaccess>(&mut write_buf[..count], buf_ptr, count).is_err() {
+            return KernelError::BadAddress.sysret();
         }
 
         // Perform positioned write
@@ -358,10 +344,8 @@ pub fn sys_pwrite64(fd: i32, buf_ptr: u64, count: u64, offset: i64) -> i64 {
         let mut kernel_buf = vec![0u8; count];
 
         // Copy from user space to kernel buffer
-        unsafe {
-            Uaccess::user_access_begin();
-            core::ptr::copy_nonoverlapping(buf_ptr as *const u8, kernel_buf.as_mut_ptr(), count);
-            Uaccess::user_access_end();
+        if copy_from_user::<Uaccess>(&mut kernel_buf[..count], buf_ptr, count).is_err() {
+            return KernelError::BadAddress.sysret();
         }
 
         // Perform positioned write

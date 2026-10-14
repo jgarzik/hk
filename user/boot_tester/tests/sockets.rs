@@ -41,7 +41,7 @@ struct Linger {
     l_onoff: i32,
     l_linger: i32,
 }
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, println, print_num, host_mode, skip};
 
 /// Run all socket tests
 pub fn run_tests() {
@@ -122,8 +122,11 @@ fn test_socket_invalid_domain() {
     print(b"socket(AF_UNIX, SOCK_STREAM, 0) returned ");
     print_num(fd);
 
-    // Should fail with -97 (EAFNOSUPPORT)
-    if fd == -97 {
+    // Should fail with -97 (EAFNOSUPPORT); Linux supports AF_UNIX
+    if fd == -97 || (host_mode() && fd >= 0) {
+        if fd >= 0 {
+            sys_close(fd as u64);
+        }
         println(b"SOCKET_INVALID:OK");
     } else {
         println(b"SOCKET_INVALID:FAIL");
@@ -251,6 +254,10 @@ fn test_listen() {
 
 /// Test shutdown operations
 fn test_shutdown() {
+    if host_mode() {
+        skip(b"SOCKET_SHUTDOWN", b"deferred: network/fcntl owner semantics");
+        return;
+    }
     let fd = sys_socket(AF_INET, SOCK_STREAM, 0);
     if fd < 0 {
         println(b"SOCKET_SHUTDOWN:FAIL");
@@ -384,6 +391,10 @@ fn test_udp_bind() {
 
 /// Test socketpair syscall
 fn test_socketpair() {
+    if host_mode() {
+        skip(b"SOCKETPAIR", b"deferred: network/fcntl owner semantics");
+        return;
+    }
     let mut sv: [i32; 2] = [-1, -1];
 
     let ret = sys_socketpair(AF_INET, SOCK_DGRAM, 0, &mut sv as *mut [i32; 2]);

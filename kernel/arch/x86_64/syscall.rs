@@ -270,7 +270,7 @@ pub const SYS_EXECVE: u64 = 59;
 pub const SYS_WAIT4: u64 = 61;
 /// exit_group(status)
 pub const SYS_EXIT_GROUP: u64 = 231;
-/// waitid(idtype, id, infop, options)
+/// waitid(idtype, id, infop, options, rusage)
 pub const SYS_WAITID: u64 = 247;
 /// execveat(dirfd, pathname, argv, envp, flags)
 pub const SYS_EXECVEAT: u64 = 322;
@@ -1323,9 +1323,9 @@ pub fn x86_64_syscall_dispatch(
         SYS_PWRITE64 => sys_pwrite64(arg0 as i32, arg1, arg2, arg3 as i64) as u64,
         SYS_PREADV => sys_preadv(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
         SYS_PWRITEV => sys_pwritev(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
-        SYS_PREADV2 => sys_preadv2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg4 as i32) as u64,
+        SYS_PREADV2 => sys_preadv2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg5 as i32) as u64,
         SYS_PWRITEV2 => {
-            sys_pwritev2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg4 as i32) as u64
+            sys_pwritev2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg5 as i32) as u64
         }
         SYS_OPEN => sys_open(arg0, arg1 as u32, arg2 as u32) as u64,
         SYS_CLOSE => sys_close(arg0 as i32) as u64,
@@ -1548,7 +1548,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_EXECVE => sys_execve(arg0, arg1, arg2) as u64,
         SYS_EXECVEAT => sys_execveat(arg0 as i32, arg1, arg2, arg3, arg4 as i32) as u64,
         SYS_WAIT4 => sys_wait4(arg0 as i64, arg1, arg2 as i32, arg3) as u64,
-        SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
+        SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32, arg4) as u64,
         SYS_EXIT_GROUP => sys_exit(arg0 as i32), // For single-threaded, same as _exit
 
         // Personality (execution domain)
@@ -2036,6 +2036,12 @@ pub fn x86_64_syscall_dispatch(
 
         _ => (-38i64) as u64, // ENOSYS
     };
+
+    // Record the syscall result so a signal frame set up by do_signal() saves
+    // it; rt_sigreturn then returns it to the interrupted code.
+    unsafe {
+        crate::arch::x86_64::percpu::current_cpu_mut().syscall_user_rax = result;
+    }
 
     // Check for pending signals before returning to userspace
     // This may modify the saved user context to invoke the signal handler

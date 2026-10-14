@@ -4,6 +4,8 @@
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
+// Host unit tests (`make test`) build only a subset; skip dead-code noise
+#![cfg_attr(test, allow(dead_code, unused))]
 
 extern crate alloc;
 
@@ -70,6 +72,7 @@ pub mod signal;
 pub mod task;
 mod time_syscall;
 
+#[cfg(not(test))]
 use ::core::panic::PanicInfo;
 
 // Architecture type alias for generic kernel code
@@ -116,8 +119,8 @@ const KERNEL_HEAP_START: usize = 0x4080_0000; // 8MB after kernel load
 #[cfg(target_arch = "aarch64")]
 const KERNEL_HEAP_SIZE: usize = 0x0100_0000; // 16MB
 
-/// Kernel heap allocator
-#[global_allocator]
+/// Kernel heap allocator (host unit tests use the std allocator)
+#[cfg_attr(not(test), global_allocator)]
 static ALLOCATOR: HeapAllocator = HeapAllocator::new();
 
 /// Global page cache (1024 pages = 4MB max)
@@ -157,7 +160,7 @@ pub static EMBEDDED_INITRAMFS: &[u8] = include_bytes!("../user/initramfs-aarch64
 /// x86_64 Kernel entry point called by bootloader
 ///
 /// multiboot_info: Pointer to multiboot2 info structure (passed in RDI)
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(test)))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(multiboot_info: u64) -> ! {
     // Save multiboot info for later use
@@ -200,7 +203,7 @@ pub extern "C" fn _start(multiboot_info: u64) -> ! {
 /// AArch64 Kernel entry point called from boot.S
 ///
 /// dtb_ptr: Pointer to Device Tree Blob (passed in x0)
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(test)))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
     // Initialize serial FIRST before anything else
@@ -982,7 +985,8 @@ fn kmain() -> ! {
 
     // Register user task with scheduler (pid=1, tid=2)
     // Note: idle task has tid=1, pid=0 (kernel swapper convention)
-    // Init process: ppid=0 (no parent), pgid=1 (own group), sid=1 (session leader)
+    // Init process: ppid=0 (no parent), pgid=sid=0 like Linux's init_task
+    // (init/init_task.c); init calls setsid() itself if it wants a session
     // Save the page table root before moving user_pt
     let page_table_root = user_pt.root_table_phys();
 
@@ -990,8 +994,8 @@ fn kmain() -> ! {
         pid: 1,  // init process (PID 1)
         tid: 2,  // tid=2 since idle task has tid=1
         ppid: 0, // init has no parent
-        pgid: 1, // init is its own process group leader
-        sid: 1,  // init is the session leader
+        pgid: 0, // inherited from init_task, not a group leader
+        sid: 0,  // not a session leader until setsid()
         priority: task::PRIORITY_NORMAL,
         kstack_top: kernel_stack,
         user_stack_top,
@@ -1010,7 +1014,7 @@ fn kmain() -> ! {
 
     // Set per-CPU current task state
     // tid=2, pid=1, ppid=0, pgid=1, sid=1 (init process)
-    task::percpu::set_current_task(2, 1, 0, 1, 1, task::Cred::ROOT);
+    task::percpu::set_current_task(2, 1, 0, 0, 0, task::Cred::ROOT);
 
     // Jump to user mode!
     // This never returns.
@@ -1176,6 +1180,7 @@ pub fn init_vfat_ramdisk(
 }
 
 /// Panic handler (only for bare metal)
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // Disable interrupts to prevent further issues

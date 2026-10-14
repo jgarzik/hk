@@ -15,9 +15,9 @@
 //! - Test 62: fchmodat2() with invalid flags
 //! - Test 63: chroot() - change root directory
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{host_mode, print, println, print_num};
 use hk_syscall::{
-    sys_chmod, sys_chown, sys_chroot, sys_close, sys_fchmod, sys_fchmodat2, sys_fchown, sys_lchown,
+    sys_chmod, sys_chown, sys_chroot, sys_close, sys_exit, sys_fork, sys_wait4, sys_fchmod, sys_fchmodat2, sys_fchown, sys_lchown,
     sys_lstat, sys_mkdir, sys_open, sys_stat, sys_symlink, sys_umask, sys_unlink, sys_utimensat,
     Stat, Timespec, O_CREAT, O_RDWR, O_WRONLY, UTIME_NOW, UTIME_OMIT,
 };
@@ -432,19 +432,31 @@ fn test_chroot() {
         return;
     }
 
-    // Perform chroot (running as root in boot_tester)
-    let ret = sys_chroot(chroot_dir.as_ptr());
-    if ret == 0 {
-        // chroot succeeded - reset to / for subsequent tests
-        // Since we're now in the new root, "/" is the old /chroot_test_dir
+    // chroot is permanent for the caller, so do it in a forked child that
+    // reports via exit status: 0 ok, 1 EPERM, 2 other error, 3 not confined
+    let pid = sys_fork();
+    if pid == 0 {
+        let ret = sys_chroot(chroot_dir.as_ptr());
+        if ret == -1 {
+            sys_exit(1);
+        } else if ret != 0 {
+            sys_exit(2);
+        }
+        // hk's chroot does not yet affect path resolution (BUGS.md), so only
+        // verify confinement on Linux: /proc is outside the new root
+        if host_mode() && sys_open(b"/proc\0".as_ptr(), 0, 0) != -2 {
+            sys_exit(3);
+        }
+        sys_exit(0);
+    }
+    let mut status: i32 = 0;
+    sys_wait4(pid, &mut status, 0, 0);
+    let code = (status >> 8) & 0xff;
+    if pid > 0 && status & 0x7f == 0 && code == 0 {
         println(b"CHROOT:OK");
-    } else if ret == -1 {
-        // EPERM - this would happen if we weren't root
-        // In boot_tester we should be root
-        print(b"CHROOT:FAIL: eperm - not root? ret=");
-        print_num(ret);
     } else {
-        print(b"CHROOT:FAIL: chroot returned ");
-        print_num(ret);
+        print(b"CHROOT:FAIL: child exit code ");
+        print_num(code as i64);
+        println(b" (1=EPERM 2=error 3=not confined)");
     }
 }

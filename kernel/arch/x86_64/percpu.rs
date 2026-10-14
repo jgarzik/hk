@@ -88,6 +88,10 @@ pub struct PerCpu {
     pub syscall_user_r9: u64,
     pub syscall_user_r10: u64,
 
+    /// Syscall return value (user RAX), recorded before signal delivery so the
+    /// signal frame saves it and rt_sigreturn returns it to the interrupted code
+    pub syscall_user_rax: u64,
+
     /// Flag set when signal delivery modifies the return context
     /// When true, the syscall return path should update the stack frame from percpu
     pub signal_context_modified: bool,
@@ -124,6 +128,7 @@ impl PerCpu {
             syscall_user_r8: 0,
             syscall_user_r9: 0,
             syscall_user_r10: 0,
+            syscall_user_rax: 0,
             signal_context_modified: false,
         }
     }
@@ -334,6 +339,10 @@ pub const ARCH_SET_FS: i32 = 0x1002;
 pub const ARCH_GET_FS: i32 = 0x1003;
 /// arch_prctl: Get GS base address
 pub const ARCH_GET_GS: i32 = 0x1004;
+/// arch_prctl: Get CPUID enable state (1 = enabled, 0 = faulting)
+pub const ARCH_GET_CPUID: i32 = 0x1011;
+/// arch_prctl: Enable (1) or disable/fault (0) the CPUID instruction
+pub const ARCH_SET_CPUID: i32 = 0x1012;
 
 // ============================================================================
 // Preemption Control

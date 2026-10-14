@@ -79,6 +79,10 @@ pub mod wait_options {
     pub const WEXITED: i32 = 4;
     /// Leave child in waitable state (can be waited for again)
     pub const WNOWAIT: i32 = 0x01000000;
+    /// Wait only for "clone" children (exit_signal != SIGCHLD)
+    pub const __WCLONE: i32 = 0x80000000u32 as i32;
+    /// Wait for all children regardless of exit_signal
+    pub const __WALL: i32 = 0x40000000;
 
     // idtype_t values for waitid
     /// Wait for any child
@@ -539,10 +543,10 @@ pub mod prctl_ops {
     pub const PR_SET_TIMERSLACK: i32 = 29;
     /// Get timer slack value (nanoseconds)
     pub const PR_GET_TIMERSLACK: i32 = 30;
-    /// Get child subreaper flag
-    pub const PR_GET_CHILD_SUBREAPER: i32 = 36;
     /// Set child subreaper flag
-    pub const PR_SET_CHILD_SUBREAPER: i32 = 37;
+    pub const PR_SET_CHILD_SUBREAPER: i32 = 36;
+    /// Get child subreaper flag
+    pub const PR_GET_CHILD_SUBREAPER: i32 = 37;
     /// Disable privilege escalation via setuid/setgid (irreversible)
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     /// Get no_new_privs flag
@@ -551,10 +555,6 @@ pub mod prctl_ops {
     pub const PR_SET_THP_DISABLE: i32 = 41;
     /// Get THP disable flag
     pub const PR_GET_THP_DISABLE: i32 = 42;
-    /// Get CPUID faulting mode (x86-64 only)
-    pub const PR_GET_CPUID: i32 = 48;
-    /// Set CPUID faulting mode (x86-64 only)
-    pub const PR_SET_CPUID: i32 = 49;
 
     /// TSC mode: allow RDTSC instruction
     pub const PR_TSC_ENABLE: i32 = 1;
@@ -597,10 +597,6 @@ pub struct PrctlState {
     /// Controls whether RDTSC instruction is allowed
     #[cfg(target_arch = "x86_64")]
     pub tsc_mode: u8,
-    /// CPUID faulting enabled (x86-64 only)
-    /// When set, CPUID instruction causes SIGSEGV
-    #[cfg(target_arch = "x86_64")]
-    pub cpuid_fault: bool,
     /// Transparent Huge Pages disabled for this process
     pub thp_disable: bool,
 }
@@ -616,8 +612,6 @@ impl Default for PrctlState {
             child_subreaper: false,
             #[cfg(target_arch = "x86_64")]
             tsc_mode: prctl_ops::PR_TSC_ENABLE as u8, // RDTSC allowed by default
-            #[cfg(target_arch = "x86_64")]
-            cpuid_fault: false,
             thp_disable: false,
         }
     }

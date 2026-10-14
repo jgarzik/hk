@@ -1,6 +1,7 @@
 //! File status syscalls (stat, fstat, fstatat, lstat, statfs, fstatfs, statx)
 
 use crate::arch::Uaccess;
+use crate::arch::uapi::Stat;
 use crate::fs::{
     Inode, KernelError, LinuxStatFs, LookupFlags, Path, lookup_path_at, lookup_path_flags,
 };
@@ -11,32 +12,6 @@ use super::syscall::{AT_FDCWD, PATH_MAX, current_fd_table};
 // =============================================================================
 // Stat structure and helpers
 // =============================================================================
-
-/// Linux stat structure (x86-64)
-///
-/// This matches the kernel's `struct stat` for x86-64.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Stat {
-    pub st_dev: u64,
-    pub st_ino: u64,
-    pub st_nlink: u64,
-    pub st_mode: u32,
-    pub st_uid: u32,
-    pub st_gid: u32,
-    pub __pad0: u32,
-    pub st_rdev: u64,
-    pub st_size: i64,
-    pub st_blksize: i64,
-    pub st_blocks: i64,
-    pub st_atime: i64,
-    pub st_atime_nsec: i64,
-    pub st_mtime: i64,
-    pub st_mtime_nsec: i64,
-    pub st_ctime: i64,
-    pub st_ctime_nsec: i64,
-    pub __unused: [i64; 3],
-}
 
 /// Fill a Stat structure from an inode
 fn fill_stat(inode: &Inode) -> Stat {
@@ -52,25 +27,25 @@ fn fill_stat(inode: &Inode) -> Stat {
         0
     };
 
+    // Field types differ per arch (e.g. st_nlink/st_blksize width), hence `as _`
     Stat {
         st_dev,
         st_ino: attr.ino,
-        st_nlink: attr.nlink as u64,
+        st_nlink: attr.nlink as _,
         st_mode: attr.mode.raw() as u32,
         st_uid: attr.uid,
         st_gid: attr.gid,
-        __pad0: 0,
         st_rdev,
         st_size: attr.size as i64,
         st_blksize: 4096,
         st_blocks: attr.size.div_ceil(512) as i64,
         st_atime: attr.atime.sec,
-        st_atime_nsec: attr.atime.nsec as i64,
+        st_atime_nsec: attr.atime.nsec as _,
         st_mtime: attr.mtime.sec,
-        st_mtime_nsec: attr.mtime.nsec as i64,
+        st_mtime_nsec: attr.mtime.nsec as _,
         st_ctime: attr.ctime.sec,
-        st_ctime_nsec: attr.ctime.nsec as i64,
-        __unused: [0; 3],
+        st_ctime_nsec: attr.ctime.nsec as _,
+        ..Default::default()
     }
 }
 

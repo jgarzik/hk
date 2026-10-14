@@ -9,6 +9,8 @@
 
 use super::helpers::{print, println, print_num};
 use hk_syscall::{
+    sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_open, sys_read, sys_uname, sys_wait4,
+    sys_write, Timespec, UtsName,
     sys_madvise, sys_mincore, sys_mmap, sys_mprotect, sys_mremap, sys_msync, sys_munmap,
     sys_mlock, sys_mlock2, sys_munlock, sys_mlockall, sys_munlockall,
     MADV_COLD, MADV_DONTNEED, MADV_KEEPONFORK, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM,
@@ -22,6 +24,9 @@ use hk_syscall::{
 
 /// Run all mmap tests
 pub fn run_tests() {
+    test_uaccess_demand_fault();
+    test_uaccess_efault();
+    test_uaccess_cow_child();
     test_anonymous_mmap();
     test_mmap_write_read();
     test_munmap();
@@ -2263,4 +2268,107 @@ fn test_madvise_wipeonfork() {
 
     sys_munmap(ptr as u64, 4096);
     println(b"MADVISE_WIPEONFORK:OK");
+}
+
+/// Map `pages` untouched anonymous pages; returns 0 on failure
+fn mmap_untouched(pages: u64) -> u64 {
+    let p = sys_mmap(0, pages * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p < 0 { 0 } else { p as u64 }
+}
+
+/// Test: kernel writes into never-touched anonymous pages must demand-fault
+/// them in (Linux: do_user_addr_fault for kernel-mode faults), not panic
+fn test_uaccess_demand_fault() {
+    let base = mmap_untouched(4);
+    if base == 0 {
+        println(b"UACCESS_DEMAND_FAULT:FAIL mmap");
+        return;
+    }
+    // read() into the middle of untouched memory, spanning a page boundary
+    let fd = sys_open(b"/test.txt\0".as_ptr(), 0, 0);
+    if fd < 0 {
+        println(b"UACCESS_DEMAND_FAULT:FAIL open");
+        return;
+    }
+    let buf = base + 4096 - 5;
+    let n = sys_read(fd as u64, buf as *mut u8, 17);
+    sys_close(fd as u64);
+    let got = unsafe { core::slice::from_raw_parts(buf as *const u8, 17) };
+    // clock_gettime / uname into further untouched pages
+    let ts = (base + 2 * 4096) as *mut Timespec;
+    let r1 = sys_clock_gettime(1, ts);
+    let uts = (base + 3 * 4096 - 64) as *mut UtsName; // crosses into page 3
+    let r2 = sys_uname(uts);
+    let sysname_ok = unsafe { (*uts).sysname[0] != 0 };
+    if n == 17 && got == b"Hello from ramfs!" && r1 == 0 && r2 == 0 && sysname_ok {
+        println(b"UACCESS_DEMAND_FAULT:OK");
+    } else {
+        print(b"UACCESS_DEMAND_FAULT:FAIL read=");
+        print_num(n);
+        print(b" clock_gettime=");
+        print_num(r1);
+        print(b" uname=");
+        print_num(r2);
+        println(b"");
+    }
+    sys_munmap(base, 4 * 4096);
+}
+
+/// Test: kernel access to an unmapped user address returns EFAULT, no panic
+fn test_uaccess_efault() {
+    let base = mmap_untouched(1);
+    if base == 0 {
+        println(b"UACCESS_EFAULT:FAIL mmap");
+        return;
+    }
+    sys_munmap(base, 4096);
+    let fd = sys_open(b"/test.txt\0".as_ptr(), 0, 0);
+    if fd < 0 {
+        println(b"UACCESS_EFAULT:FAIL open");
+        return;
+    }
+    let r = sys_read(fd as u64, base as *mut u8, 17);
+    sys_close(fd as u64);
+    let w = sys_write(1, base as *const u8, 4);
+    if r == -14 && w == -14 {
+        println(b"UACCESS_EFAULT:OK");
+    } else {
+        print(b"UACCESS_EFAULT:FAIL read=");
+        print_num(r);
+        print(b" write=");
+        print_num(w);
+        println(b"");
+    }
+}
+
+/// Test: a kernel write into a COW-shared page in the child must not leak
+/// into the parent's copy (x86 needs CR0.WP for kernel writes to fault)
+fn test_uaccess_cow_child() {
+    let base = mmap_untouched(1);
+    if base == 0 {
+        println(b"UACCESS_COW:FAIL mmap");
+        return;
+    }
+    let p = base as *mut u8;
+    unsafe { core::ptr::write_bytes(p, b'A', 32) };
+    let pid = sys_fork();
+    if pid == 0 {
+        let fd = sys_open(b"/test.txt\0".as_ptr(), 0, 0);
+        let n = sys_read(fd as u64, p, 17);
+        let ok = n == 17 && unsafe { *p } == b'H';
+        sys_exit(if ok { 0 } else { 1 });
+    }
+    let mut status: i32 = 0;
+    sys_wait4(pid, &mut status, 0, 0);
+    let parent_ok = unsafe { *p == b'A' && *p.add(16) == b'A' };
+    if pid > 0 && status == 0 && parent_ok {
+        println(b"UACCESS_COW:OK");
+    } else {
+        print(b"UACCESS_COW:FAIL status=");
+        print_num(status as i64);
+        print(b" parent_intact=");
+        print_num(parent_ok as i64);
+        println(b"");
+    }
+    sys_munmap(base, 4096);
 }

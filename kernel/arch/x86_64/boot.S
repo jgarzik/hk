@@ -94,7 +94,7 @@ _start32:
 
     /* Enable paging in CR0 */
     movl %cr0, %eax
-    orl $0x80000000, %eax               /* PG bit */
+    orl $0x80010000, %eax               /* PG + WP (kernel writes honor R/O user PTEs, for COW) */
     movl %eax, %cr0
 
     /* Load 64-bit GDT */

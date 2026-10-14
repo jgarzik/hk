@@ -11,7 +11,7 @@
 //! - Test 77: settimeofday() - set time (x86_64 only)
 //! - Test 78: settimeofday() EINVAL - invalid usec (x86_64 only)
 
-use super::helpers::{print, println, print_num, print_cstr, starts_with};
+use super::helpers::{print, println, print_num, print_cstr, starts_with, host_mode};
 use hk_syscall::{sys_sethostname, sys_setdomainname, sys_uname, sys_clock_settime, sys_clock_gettime, UtsName, Timespec};
 #[cfg(target_arch = "x86_64")]
 use hk_syscall::{sys_settimeofday, sys_gettimeofday, Timeval};
@@ -55,8 +55,9 @@ fn test_uname() {
         print(b"machine: ");
         print_cstr(&uts.machine);
 
-        // Verify sysname is "hk"
-        if uts.sysname[0] == b'h' && uts.sysname[1] == b'k' && uts.sysname[2] == 0 {
+        // Verify sysname is "hk" (on a Linux host: any nonempty sysname)
+        let is_hk = uts.sysname[0] == b'h' && uts.sysname[1] == b'k' && uts.sysname[2] == 0;
+        if is_hk || (host_mode() && uts.sysname[0] != 0) {
             println(b"UNAME:OK");
         } else {
             println(b"UNAME:FAIL: sysname should be 'hk'");

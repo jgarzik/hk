@@ -7,7 +7,7 @@
 //! - Test iopl lower privilege (always allowed)
 //! - Test ioperm returns ENOSYS (not yet implemented)
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, println, print_num, host_mode};
 use hk_syscall::{sys_iopl, sys_ioperm};
 
 // Error codes
@@ -85,7 +85,11 @@ fn test_iopl_lower_privilege() {
 fn test_ioperm_enosys() {
     // Try to enable access to port 0x80 (POST diagnostic port)
     let ret = sys_ioperm(0x80, 1, 1);
-    if ret == -ENOSYS {
+    // Linux implements ioperm (root may enable ports)
+    if ret == -ENOSYS || (host_mode() && ret == 0) {
+        if ret == 0 {
+            sys_ioperm(0x80, 1, 0);
+        }
         println(b"IOPERM_ENOSYS:OK");
     } else {
         print(b"IOPERM_ENOSYS:FAIL: expected -38, got ");

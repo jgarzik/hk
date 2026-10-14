@@ -364,6 +364,12 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
                     // Return to user mode, signal will be delivered on syscall exit path
                     return 1;
                 }
+                // Kernel-mode fault inside a user-copy routine: resume at its
+                // fixup, which reports the uncopied bytes (-> EFAULT)
+                if let Some(fixup) = super::uaccess::uaccess_fixup(frame.rip) {
+                    frame.rip = fixup;
+                    return 1;
+                }
                 // Kernel mode fault - fall through to fatal handler
             }
         }
@@ -546,6 +552,9 @@ fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
     let present = (error_code & 1) != 0;
     let write = (error_code & 2) != 0;
     let user = (error_code & 4) != 0;
+    // Kernel-mode access to a user address (copy_to_user etc.) is resolved
+    // exactly like a user access (Linux: do_user_addr_fault)
+    let user = user || fault_addr < 0x0000_8000_0000_0000;
 
     // Case 0: Swap fault - non-present page with swap entry in PTE
     // Must check before demand paging since swapped pages have valid PTEs

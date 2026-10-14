@@ -4,7 +4,7 @@
 //! - F_SETOWN/F_GETOWN: Set/get owner PID/PGID for signal delivery
 //! - F_SETSIG/F_GETSIG: Set/get signal number for async I/O
 
-use super::helpers::{print, print_num, println};
+use super::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{sys_close, sys_fcntl, sys_mkdir, sys_open, O_CREAT, O_RDWR};
 
 // fcntl commands
@@ -66,6 +66,10 @@ fn test_setown_getown() {
 
 /// Test F_SETOWN with negative value (PGID)
 fn test_setown_negative() {
+    if host_mode() {
+        skip(b"FCNTL_OWNER_PGID", b"deferred: network/fcntl owner semantics");
+        return;
+    }
     let path = b"/tmp/fcntl_owner_pgid\0";
 
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);

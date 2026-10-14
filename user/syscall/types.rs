@@ -115,28 +115,7 @@ pub struct SigInfo {
 // Stat structures
 // ============================================================================
 
-/// Linux stat structure (common layout)
-#[repr(C)]
-pub struct Stat {
-    pub st_dev: u64,
-    pub st_ino: u64,
-    pub st_nlink: u64,
-    pub st_mode: u32,
-    pub st_uid: u32,
-    pub st_gid: u32,
-    pub _pad0: u32,
-    pub st_rdev: u64,
-    pub st_size: i64,
-    pub st_blksize: i64,
-    pub st_blocks: i64,
-    pub st_atime: i64,
-    pub st_atime_nsec: i64,
-    pub st_mtime: i64,
-    pub st_mtime_nsec: i64,
-    pub st_ctime: i64,
-    pub st_ctime_nsec: i64,
-    pub _unused: [i64; 3],
-}
+// `struct stat` is per-arch: see `Stat` in x86_64.rs / aarch64.rs.
 
 /// Linux dirent64 structure
 #[repr(C, packed)]
@@ -157,7 +136,7 @@ pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
 pub const O_CREAT: u32 = 0o100;
 pub const O_TRUNC: u32 = 0o1000;
-pub const O_DIRECTORY: u32 = 0o200000;
+// O_DIRECTORY/O_NOFOLLOW/O_DIRECT/O_LARGEFILE are per-arch: see x86_64.rs / aarch64.rs.
 
 // lseek whence constants
 pub const SEEK_SET: i32 = 0;
@@ -174,6 +153,8 @@ pub const CLONE_PARENT: u64 = 0x00008000;
 pub const CLONE_NEWNS: u64 = 0x0002_0000;
 pub const CLONE_SYSVSEM: u64 = 0x00040000;
 pub const CLONE_SETTLS: u64 = 0x00080000;
+pub const CLONE_PARENT_SETTID: u64 = 0x00100000;
+pub const CLONE_CHILD_SETTID: u64 = 0x01000000;
 pub const CLONE_NEWUTS: u64 = 0x0400_0000;
 pub const CLONE_NEWIPC: u64 = 0x0800_0000;
 pub const CLONE_NEWUSER: u64 = 0x1000_0000;
@@ -722,6 +703,24 @@ pub const IPC_SET: i32 = 1;
 pub const IPC_STAT: i32 = 2;
 pub const IPC_INFO: i32 = 3;
 
+/// `struct ipc64_perm` (include/uapi/asm-generic/ipcbuf.h; same on x86_64/arm64)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Ipc64Perm {
+    pub key: i32,
+    pub uid: u32,
+    pub gid: u32,
+    pub cuid: u32,
+    pub cgid: u32,
+    pub mode: u32,
+    pub seq: u16,
+    pub _pad2: u16,
+    pub _pad3: u32,
+    pub _unused1: u64,
+    pub _unused2: u64,
+}
+// `struct semid64_ds` is per-arch: see x86_64.rs / aarch64.rs.
+
 /// Shared memory flags
 pub const SHM_RDONLY: i32 = 0o10000;
 pub const SHM_RND: i32 = 0o20000;
@@ -1035,8 +1034,8 @@ pub const PR_SET_NAME: i32 = 15;
 pub const PR_GET_NAME: i32 = 16;
 pub const PR_SET_TIMERSLACK: i32 = 29;
 pub const PR_GET_TIMERSLACK: i32 = 30;
-pub const PR_GET_CHILD_SUBREAPER: i32 = 36;
-pub const PR_SET_CHILD_SUBREAPER: i32 = 37;
+pub const PR_SET_CHILD_SUBREAPER: i32 = 36;
+pub const PR_GET_CHILD_SUBREAPER: i32 = 37;
 pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
 pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 pub const PR_SET_THP_DISABLE: i32 = 41;
@@ -1047,10 +1046,6 @@ pub const PR_GET_THP_DISABLE: i32 = 42;
 pub const PR_GET_TSC: i32 = 25;
 #[cfg(target_arch = "x86_64")]
 pub const PR_SET_TSC: i32 = 26;
-#[cfg(target_arch = "x86_64")]
-pub const PR_GET_CPUID: i32 = 48;
-#[cfg(target_arch = "x86_64")]
-pub const PR_SET_CPUID: i32 = 49;
 
 // TSC mode values (x86-64 only)
 #[cfg(target_arch = "x86_64")]
@@ -1393,20 +1388,9 @@ pub const CAP_LAST_CAP: u32 = 40;
 // epoll types and constants
 // ============================================================================
 
-/// epoll_event structure (Linux ABI)
-///
-/// Note: This is packed to match Linux's x86-64 ABI where the structure
-/// is 12 bytes (not 16). The data field is a union in Linux but we use u64.
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct EpollEvent {
-    /// Event mask (EPOLLIN, EPOLLOUT, etc.)
-    pub events: u32,
-    /// User data (passed back unchanged)
-    pub data: u64,
-}
+// `struct epoll_event` is per-arch (packed only on x86_64): see x86_64.rs / aarch64.rs.
 
-impl EpollEvent {
+impl crate::EpollEvent {
     /// Create a new epoll_event
     pub const fn new(events: u32, data: u64) -> Self {
         Self { events, data }
@@ -1418,7 +1402,7 @@ impl EpollEvent {
     }
 }
 
-impl Default for EpollEvent {
+impl Default for crate::EpollEvent {
     fn default() -> Self {
         Self::empty()
     }

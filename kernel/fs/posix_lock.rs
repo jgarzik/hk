@@ -46,13 +46,19 @@ pub struct Flock {
     pub l_type: i16,
     /// How to interpret l_start: SEEK_SET, SEEK_CUR, or SEEK_END
     pub l_whence: i16,
+    /// Explicit padding (always zero; avoids leaking kernel bytes)
+    pub _pad0: u32,
     /// Starting offset of the lock
     pub l_start: i64,
     /// Length of the lock (0 = to EOF)
     pub l_len: i64,
     /// PID of lock owner (filled in by F_GETLK)
     pub l_pid: i32,
+    /// Explicit tail padding (always zero)
+    pub _pad1: u32,
 }
+
+const _: () = assert!(core::mem::size_of::<Flock>() == 32);
 
 // =============================================================================
 // Lock Types

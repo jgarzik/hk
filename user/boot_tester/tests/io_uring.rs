@@ -56,7 +56,7 @@ pub fn run_tests() {
     // Phase 1 tests
     test_io_uring_setup_basic();
     test_io_uring_setup_einval_zero();
-    test_io_uring_setup_einval_non_pow2();
+    test_io_uring_setup_round_non_pow2();
     test_io_uring_setup_clamp();
     test_io_uring_setup_params_filled();
     // Phase 5 tests
@@ -110,22 +110,22 @@ fn test_io_uring_setup_einval_zero() {
     }
 }
 
-/// Test io_uring_setup rejects non-power-of-2 entries (without CLAMP)
-fn test_io_uring_setup_einval_non_pow2() {
+/// Test io_uring_setup rounds non-power-of-2 entries up even without CLAMP
+/// (Linux io_uring_fill_params: roundup_pow_of_two)
+fn test_io_uring_setup_round_non_pow2() {
     let mut params = IoUringParams::default();
-    // 5 is not a power of 2, and without IORING_SETUP_CLAMP it should fail
     let fd = sys_io_uring_setup(5, &mut params as *mut IoUringParams);
-
-    // Should return -EINVAL (-22)
-    if fd == -22 {
-        println(b"IO_URING_SETUP_EINVAL_POW2:OK");
+    if fd >= 0 && params.sq_entries == 8 && params.cq_entries == 16 {
+        println(b"IO_URING_SETUP_ROUND_POW2:OK");
     } else {
-        print(b"IO_URING_SETUP_EINVAL_POW2:FAIL: expected -22, got ");
+        print(b"IO_URING_SETUP_ROUND_POW2:FAIL: expected fd>=0 sq=8, got fd=");
         print_num(fd);
+        print(b" sq=");
+        print_num(params.sq_entries as i64);
         println(b"");
-        if fd >= 0 {
-            sys_close(fd as u64);
-        }
+    }
+    if fd >= 0 {
+        sys_close(fd as u64);
     }
 }
 

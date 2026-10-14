@@ -19,7 +19,7 @@
 //!   - No `chmod`, `chown`, `lchown` - use *at variants
 //!   - No `truncate` - use ftruncate with openat
 
-use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Stat, Timespec, Timeval, Timex, UtsName, AT_FDCWD};
+use crate::types::{CloneArgs, FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Timespec, Timeval, Timex, UtsName, AT_FDCWD};
 
 // ============================================================================
 // Syscall macros for aarch64
@@ -318,7 +318,7 @@ pub const SYS_RT_SIGACTION: u64 = 134;
 pub const SYS_RT_SIGPROCMASK: u64 = 135;
 pub const SYS_RT_SIGPENDING: u64 = 136;
 pub const SYS_RT_SIGTIMEDWAIT: u64 = 137;
-pub const SYS_RT_SIGQUEUEINFO: u64 = 128;
+pub const SYS_RT_SIGQUEUEINFO: u64 = 138;
 pub const SYS_RT_SIGSUSPEND: u64 = 133;
 pub const SYS_RT_SIGRETURN: u64 = 139;
 pub const SYS_RT_TGSIGQUEUEINFO: u64 = 240;
@@ -556,9 +556,12 @@ pub fn sys_gettid() -> i64 {
 }
 
 /// clone(flags, child_stack, parent_tidptr, child_tidptr, tls)
+///
+/// arm64 selects CONFIG_CLONE_BACKWARDS, so the raw syscall order is
+/// (flags, newsp, parent_tidptr, tls, child_tidptr).
 #[inline(always)]
 pub fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: u64, child_tidptr: u64, tls: u64) -> i64 {
-    unsafe { syscall5!(SYS_CLONE, flags, child_stack, parent_tidptr, child_tidptr, tls) }
+    unsafe { syscall5!(SYS_CLONE, flags, child_stack, parent_tidptr, tls, child_tidptr) }
 }
 
 /// fork() - compatibility wrapper using clone
@@ -805,10 +808,10 @@ pub fn sys_mq_getsetattr(mqdes: i32, newattr: *const MqAttr, oldattr: *mut MqAtt
     unsafe { syscall3!(SYS_MQ_GETSETATTR, mqdes, newattr, oldattr) }
 }
 
-/// waitid(idtype, id, infop, options)
+/// waitid(idtype, id, infop, options, rusage)
 #[inline(always)]
-pub fn sys_waitid(idtype: i32, id: u64, infop: *mut SigInfo, options: i32) -> i64 {
-    unsafe { syscall4!(SYS_WAITID, idtype, id, infop, options) }
+pub fn sys_waitid(idtype: i32, id: u64, infop: *mut SigInfo, options: i32, rusage: u64) -> i64 {
+    unsafe { syscall5!(SYS_WAITID, idtype, id, infop, options, rusage) }
 }
 
 /// execve(pathname, argv, envp)
@@ -856,13 +859,15 @@ pub fn sys_pwritev(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> i64 
 /// preadv2(fd, iov, iovcnt, offset, flags)
 #[inline(always)]
 pub fn sys_preadv2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
-    unsafe { syscall5!(SYS_PREADV2, fd, iov, iovcnt, offset, flags) }
+    // Linux ABI: (fd, vec, vlen, pos_l, pos_h, flags), like glibc's LO_HI_LONG
+    unsafe { syscall6!(SYS_PREADV2, fd, iov, iovcnt, offset, (offset as u64) >> 32, flags) }
 }
 
 /// pwritev2(fd, iov, iovcnt, offset, flags)
 #[inline(always)]
 pub fn sys_pwritev2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
-    unsafe { syscall5!(SYS_PWRITEV2, fd, iov, iovcnt, offset, flags) }
+    // Linux ABI: (fd, vec, vlen, pos_l, pos_h, flags), like glibc's LO_HI_LONG
+    unsafe { syscall6!(SYS_PWRITEV2, fd, iov, iovcnt, offset, (offset as u64) >> 32, flags) }
 }
 
 /// mkdirat(dirfd, pathname, mode)
@@ -1126,6 +1131,19 @@ pub fn sys_exit(status: u64) -> ! {
         core::arch::asm!(
             "svc #0",
             in("x8") SYS_EXIT,
+            in("x0") status,
+            options(noreturn, nostack),
+        );
+    }
+}
+
+/// exit_group(status) - terminate all threads in the process
+#[inline(always)]
+pub fn sys_exit_group(status: u64) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_EXIT_GROUP,
             in("x0") status,
             options(noreturn, nostack),
         );
@@ -2602,4 +2620,62 @@ pub const BPF_EXIST: u64 = 2;
 #[inline(always)]
 pub fn sys_bpf(cmd: i32, attr: u64, size: u32) -> i64 {
     unsafe { syscall3!(SYS_BPF, cmd, attr, size) }
+}
+
+// ============================================================================
+// Architecture-specific ABI structures
+// ============================================================================
+
+/// `struct stat` (include/uapi/asm-generic/stat.h, used by arm64)
+#[repr(C)]
+pub struct Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    pub _pad1: u64,
+    pub st_size: i64,
+    pub st_blksize: i32,
+    pub _pad2: i32,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: u64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: u64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: u64,
+    pub _unused4: u32,
+    pub _unused5: u32,
+}
+
+// O_* flags whose values differ per arch (arch/arm64/include/uapi/asm/fcntl.h)
+pub const O_DIRECTORY: u32 = 0o40000;
+pub const O_NOFOLLOW: u32 = 0o100000;
+pub const O_DIRECT: u32 = 0o200000;
+pub const O_LARGEFILE: u32 = 0o400000;
+
+/// `struct epoll_event` (include/uapi/linux/eventpoll.h): not packed on
+/// arm64, so 16 bytes with `data` at offset 8.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EpollEvent {
+    /// Event mask (EPOLLIN, EPOLLOUT, etc.)
+    pub events: u32,
+    /// User data (passed back unchanged)
+    pub data: u64,
+}
+
+/// `struct semid64_ds` (include/uapi/asm-generic/sembuf.h, used by arm64)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Semid64Ds {
+    pub sem_perm: crate::types::Ipc64Perm,
+    pub sem_otime: i64,
+    pub sem_ctime: i64,
+    pub sem_nsems: u64,
+    pub _unused3: u64,
+    pub _unused4: u64,
 }

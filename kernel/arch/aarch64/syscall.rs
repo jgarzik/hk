@@ -296,7 +296,7 @@ pub const SYS_RT_SIGTIMEDWAIT: u64 = 137;
 #[allow(dead_code)] // Infrastructure for future signal delivery
 pub const SYS_RT_SIGRETURN: u64 = 139;
 /// rt_sigqueueinfo(pid, sig, uinfo)
-pub const SYS_RT_SIGQUEUEINFO: u64 = 128;
+pub const SYS_RT_SIGQUEUEINFO: u64 = 138;
 /// rt_sigsuspend(mask, sigsetsize)
 pub const SYS_RT_SIGSUSPEND: u64 = 133;
 /// rt_tgsigqueueinfo(tgid, tid, sig, uinfo)
@@ -608,9 +608,9 @@ pub fn aarch64_syscall_dispatch(
         SYS_PWRITE64 => sys_pwrite64(arg0 as i32, arg1, arg2, arg3 as i64) as u64,
         SYS_PREADV => sys_preadv(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
         SYS_PWRITEV => sys_pwritev(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
-        SYS_PREADV2 => sys_preadv2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg4 as i32) as u64,
+        SYS_PREADV2 => sys_preadv2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg5 as i32) as u64,
         SYS_PWRITEV2 => {
-            sys_pwritev2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg4 as i32) as u64
+            sys_pwritev2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg5 as i32) as u64
         }
         SYS_OPENAT => sys_openat(arg0 as i32, arg1, arg2 as u32, arg3 as u32) as u64,
         SYS_CLOSE => sys_close(arg0 as i32) as u64,
@@ -883,8 +883,10 @@ pub fn aarch64_syscall_dispatch(
 
         // Process lifecycle
         SYS_EXIT | SYS_EXIT_GROUP => sys_exit(arg0 as i32),
-        SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
-        SYS_CLONE => sys_clone(arg0, arg1, arg2, arg3, arg4) as u64,
+        SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32, arg4) as u64,
+        // arm64 selects CONFIG_CLONE_BACKWARDS (kernel/fork.c): the raw
+        // order is (flags, newsp, parent_tidptr, tls, child_tidptr).
+        SYS_CLONE => sys_clone(arg0, arg1, arg2, arg4, arg3) as u64,
         SYS_CLONE3 => {
             use crate::task::syscall::sys_clone3;
             sys_clone3(arg0, arg1) as u64

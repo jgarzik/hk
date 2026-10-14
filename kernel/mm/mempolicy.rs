@@ -6,7 +6,7 @@
 use crate::arch::Uaccess;
 use crate::error::KernelError;
 use crate::numa::NUMA_TOPOLOGY;
-use crate::uaccess::UaccessArch;
+use crate::uaccess::{UaccessArch, get_user};
 
 // ============================================================================
 // Policy modes (MPOL_*)
@@ -426,21 +426,25 @@ pub fn sys_migrate_pages(pid: i64, maxnode: u64, old_nodes_ptr: u64, new_nodes_p
         }
     }
 
-    // Validate and read new_nodes if provided
+    // Validate and read new_nodes if provided; NULL is an empty mask
+    let mut new_mask: u64 = 0;
     if new_nodes_ptr != 0 {
         if !Uaccess::access_ok(new_nodes_ptr, mask_bytes as usize) {
             return KernelError::BadAddress.sysret();
         }
-        let new_mask: u64 = unsafe {
-            Uaccess::user_access_begin();
-            let mask = core::ptr::read(new_nodes_ptr as *const u64);
-            Uaccess::user_access_end();
-            mask
+        new_mask = match get_user::<Uaccess, u64>(new_nodes_ptr) {
+            Ok(m) => m,
+            Err(_) => return KernelError::BadAddress.sysret(),
         };
         // Validate new_nodes are online
         if new_mask != 0 && new_mask & !online_mask != 0 {
             return KernelError::InvalidArgument.sysret();
         }
+    }
+
+    // No allowed target node: EINVAL (Linux kernel_migrate_pages)
+    if new_mask & online_mask == 0 {
+        return KernelError::InvalidArgument.sysret();
     }
 
     // Node masks validated - actual page migration is Phase 5
@@ -525,6 +529,20 @@ pub fn sys_move_pages(
     // Get online nodes mask
     let online_mask = NUMA_TOPOLOGY.lock().online_mask();
 
+    // Any invalid or offline target node fails the whole call with ENODEV
+    // (Linux mm/migrate.c do_pages_move)
+    if nodes_ptr != 0 {
+        for i in 0..nr_pages as usize {
+            let node = match get_user::<Uaccess, i32>(nodes_ptr + (i * 4) as u64) {
+                Ok(n) => n,
+                Err(_) => return KernelError::BadAddress.sysret(),
+            };
+            if !(0..64).contains(&node) || online_mask & (1u64 << node) == 0 {
+                return KernelError::NoDevice.sysret();
+            }
+        }
+    }
+
     // Write status for each page
     unsafe {
         Uaccess::user_access_begin();
@@ -535,18 +553,8 @@ pub fn sys_move_pages(
                 // Real implementation in Phase 5 will look up actual page node
                 0
             } else {
-                // Move mode: check if target node is online
-                let node = core::ptr::read((nodes_ptr as *const i32).add(i));
-                if node == -1 {
-                    // "don't move": success
-                    0
-                } else if node >= 0 && (online_mask & (1u64 << node)) != 0 {
-                    // Node is online: success (actual migration in Phase 5)
-                    0
-                } else {
-                    // Node doesn't exist: -ENODEV
-                    -19 // ENODEV
-                }
+                // Move mode: nodes validated above (actual migration in Phase 5)
+                0
             };
             core::ptr::write((status_ptr as *mut i32).add(i), status);
         }

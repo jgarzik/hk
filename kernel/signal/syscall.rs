@@ -455,16 +455,11 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
         Err(e) => return -(e as i64),
     };
 
-    // Security check: si_code validation per Linux kernel
-    // - si_code >= 0 means kernel-generated (SI_USER=0, SI_KERNEL=128, etc.)
-    // - si_code < 0 means user-generated (SI_QUEUE=-1, SI_TKILL=-6, etc.)
-    //
-    // User cannot:
-    // 1. Pretend to be the kernel (si_code >= 0)
-    // 2. Use SI_TKILL code (reserved for tgkill/tkill)
-    // 3. Pretend to be a different process (si_pid != current_pid)
-    let caller_pid = current_pid() as i32;
-    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && info.pid() != caller_pid {
+    // Security check (Linux kernel/signal.c do_rt_sigqueueinfo): si_code
+    // values reserved to the kernel (>= 0, or SI_TKILL) may only be queued
+    // to the caller itself, never used to forge signals to other processes
+    let caller_pid = current_pid() as i64;
+    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && pid != caller_pid {
         return -1; // EPERM
     }
 
@@ -487,7 +482,7 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
 /// * -ESRCH: No such process/thread
 /// * -EFAULT: Bad uinfo pointer
 pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
-    use crate::task::percpu::{TASK_TABLE, current_pid};
+    use crate::task::percpu::TASK_TABLE;
 
     // Validate arguments
     if tid <= 0 || tgid <= 0 {
@@ -504,10 +499,10 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
         Err(e) => return -(e as i64),
     };
 
-    // Security check: same as rt_sigqueueinfo
-    // Cannot pretend to be kernel or use SI_TKILL code unless actually this process
-    let caller_pid = current_pid() as i32;
-    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && info.pid() != caller_pid {
+    // Security check (Linux do_rt_tgsigqueueinfo): kernel-reserved si_code
+    // only when targeting the calling thread itself
+    let caller_tid = crate::task::percpu::current_tid() as i64;
+    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && tid != caller_tid {
         return -1; // EPERM
     }
 
@@ -532,8 +527,11 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
 
 /// rt_sigsuspend(mask, sigsetsize) - wait for signal with temporary mask
 ///
-/// Temporarily replaces the signal mask and waits for a signal.
-/// Returns when a signal handler is invoked or a signal terminates the process.
+/// Atomically replaces the signal mask with `mask` and sleeps until a signal
+/// becomes deliverable. The original mask is kept in `saved_sigmask`; the
+/// syscall-return path (`do_signal`) delivers the signal under the temporary
+/// mask, stores the original mask in the signal frame (restored by
+/// rt_sigreturn), or restores it directly if no handler runs.
 ///
 /// # Arguments
 /// * `mask_ptr` - Pointer to temporary signal mask
@@ -544,8 +542,6 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
 /// * -EINVAL: Invalid sigsetsize
 /// * -EFAULT: Bad mask_ptr pointer
 pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
-    use crate::signal::has_pending_signals;
-
     if sigsetsize != 8 {
         return -22; // EINVAL
     }
@@ -558,45 +554,26 @@ pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
 
     let tid = current_tid();
 
-    // Save old mask and set new mask
-    let old_mask = with_task_signal_state(tid, |state| {
-        let old = state.blocked;
-        // Set new blocked mask, but never block SIGKILL/SIGSTOP
+    // Save old mask (restored on return to user) and install the new one
+    let ok = with_task_signal_state(tid, |state| {
+        state.saved_sigmask = Some(state.blocked);
+        // Never block SIGKILL/SIGSTOP
         state.blocked = new_mask.subtract(&UNMASKABLE_SIGNALS);
         state.recalc_sigpending();
-        old
     });
-
-    let old_mask = match old_mask {
-        Some(m) => m,
-        None => return -3, // ESRCH
-    };
-
-    // Check for immediately deliverable signals
-    // In a full implementation, we would loop here and block
-    // until a signal becomes deliverable
-    if has_pending_signals(tid) {
-        // Restore old mask before returning
-        with_task_signal_state(tid, |state| {
-            state.blocked = old_mask;
-            state.recalc_sigpending();
-        });
-        return -4; // EINTR
+    if ok.is_none() {
+        return -3; // ESRCH
     }
 
-    // TODO: In a complete implementation, we would:
-    // 1. Mark the task as sleeping/waiting
-    // 2. Schedule another task
-    // 3. When woken by a signal, restore the old mask
-    // 4. Return -EINTR
-    //
-    // For now, restore mask and return -EINTR
-    // This is sufficient for testing but not for real signal waiting
-    with_task_signal_state(tid, |state| {
-        state.blocked = old_mask;
-        state.recalc_sigpending();
-    });
+    // Sleep until a signal is deliverable under the temporary mask.
+    // Signal senders do not wake sleepers directly, so re-check every tick.
+    while !with_task_signal_state(tid, |state| state.has_deliverable_signals()).unwrap_or(true) {
+        let wake_tick = crate::task::percpu::get_ticks().saturating_add(1);
+        crate::task::percpu::sleep_current_until(wake_tick);
+    }
 
+    // Linux returns -ERESTARTNOHAND, which becomes -EINTR once a handler
+    // runs; hk has no syscall restart, so return -EINTR directly.
     -4 // EINTR
 }
 

@@ -251,7 +251,7 @@ pub fn setup_rt_frame(sig: u32, action: &SigAction, blocked: SigSet) -> Result<(
         rbp,
         rbx,
         rdx,
-        rax: 0,        // Will be syscall return value, not important for signal context
+        rax: unsafe { percpu::current_cpu_mut().syscall_user_rax }, // syscall return value
         rcx: user_rip, // RCX was overwritten by syscall with RIP
         rsp: user_rsp,
         rip: user_rip,

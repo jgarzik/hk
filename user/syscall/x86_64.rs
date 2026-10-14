@@ -8,7 +8,7 @@
 //! - Return value in RAX
 //! - RCX and R11 are clobbered by the syscall instruction
 
-use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigInfo, SigEvent, Stat, Timespec, Timeval, Timex, UtsName};
+use crate::types::{CloneArgs, FdSet, IoVec, MqAttr, PollFd, RLimit, SigInfo, SigEvent, Timespec, Timeval, Timex, UtsName};
 
 // ============================================================================
 // Syscall helper macros
@@ -204,6 +204,7 @@ pub const SYS_FORK: u64 = 57;
 pub const SYS_VFORK: u64 = 58;
 pub const SYS_EXECVE: u64 = 59;
 pub const SYS_EXIT: u64 = 60;
+pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_WAIT4: u64 = 61;
 pub const SYS_KILL: u64 = 62;
 pub const SYS_UNAME: u64 = 63;
@@ -397,6 +398,8 @@ pub const ARCH_SET_GS: i32 = 0x1001;
 pub const ARCH_SET_FS: i32 = 0x1002;
 pub const ARCH_GET_FS: i32 = 0x1003;
 pub const ARCH_GET_GS: i32 = 0x1004;
+pub const ARCH_GET_CPUID: i32 = 0x1011;
+pub const ARCH_SET_CPUID: i32 = 0x1012;
 
 // New syscall numbers
 pub const SYS_CLONE3: u64 = 435;
@@ -466,12 +469,14 @@ pub fn sys_pwritev(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> i64 
 
 #[inline(always)]
 pub fn sys_preadv2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
-    unsafe { syscall5!(SYS_PREADV2, fd, iov, iovcnt, offset, flags) }
+    // Linux ABI: (fd, vec, vlen, pos_l, pos_h, flags), like glibc's LO_HI_LONG
+    unsafe { syscall6!(SYS_PREADV2, fd, iov, iovcnt, offset, (offset as u64) >> 32, flags) }
 }
 
 #[inline(always)]
 pub fn sys_pwritev2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
-    unsafe { syscall5!(SYS_PWRITEV2, fd, iov, iovcnt, offset, flags) }
+    // Linux ABI: (fd, vec, vlen, pos_l, pos_h, flags), like glibc's LO_HI_LONG
+    unsafe { syscall6!(SYS_PWRITEV2, fd, iov, iovcnt, offset, (offset as u64) >> 32, flags) }
 }
 
 #[inline(always)]
@@ -718,14 +723,21 @@ pub fn sys_exit(status: u64) -> ! {
     loop {}
 }
 
+/// exit_group(status) - terminate all threads in the process
+#[inline(always)]
+pub fn sys_exit_group(status: u64) -> ! {
+    unsafe { syscall1!(SYS_EXIT_GROUP, status) };
+    loop {}
+}
+
 #[inline(always)]
 pub fn sys_wait4(pid: i64, wstatus: *mut i32, options: i32, rusage: u64) -> i64 {
     unsafe { syscall4!(SYS_WAIT4, pid, wstatus, options, rusage) }
 }
 
 #[inline(always)]
-pub fn sys_waitid(idtype: i32, id: u64, infop: *mut SigInfo, options: i32) -> i64 {
-    unsafe { syscall4!(SYS_WAITID, idtype, id, infop, options) }
+pub fn sys_waitid(idtype: i32, id: u64, infop: *mut SigInfo, options: i32, rusage: u64) -> i64 {
+    unsafe { syscall5!(SYS_WAITID, idtype, id, infop, options, rusage) }
 }
 
 // --- User/Group IDs ---
@@ -2344,4 +2356,63 @@ pub const BPF_EXIST: u64 = 2;
 #[inline(always)]
 pub fn sys_bpf(cmd: i32, attr: u64, size: u32) -> i64 {
     unsafe { syscall3!(SYS_BPF, cmd, attr, size) }
+}
+
+// ============================================================================
+// Architecture-specific ABI structures
+// ============================================================================
+
+/// `struct stat` (arch/x86/include/uapi/asm/stat.h, x86_64 layout)
+#[repr(C)]
+pub struct Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_nlink: u64,
+    pub st_mode: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub _pad0: u32,
+    pub st_rdev: u64,
+    pub st_size: i64,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: i64,
+    pub _unused: [i64; 3],
+}
+
+// O_* flags whose values differ per arch (include/uapi/asm-generic/fcntl.h)
+pub const O_DIRECT: u32 = 0o40000;
+pub const O_LARGEFILE: u32 = 0o100000;
+pub const O_DIRECTORY: u32 = 0o200000;
+pub const O_NOFOLLOW: u32 = 0o400000;
+
+/// `struct epoll_event` (include/uapi/linux/eventpoll.h): EPOLL_PACKED on
+/// x86_64, so 12 bytes with `data` at offset 4.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct EpollEvent {
+    /// Event mask (EPOLLIN, EPOLLOUT, etc.)
+    pub events: u32,
+    /// User data (passed back unchanged)
+    pub data: u64,
+}
+
+/// `struct semid64_ds` (arch/x86/include/uapi/asm/sembuf.h): x86_64 keeps
+/// an unused word after each time field
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Semid64Ds {
+    pub sem_perm: crate::types::Ipc64Perm,
+    pub sem_otime: i64,
+    pub _unused1: u64,
+    pub sem_ctime: i64,
+    pub _unused2: u64,
+    pub sem_nsems: u64,
+    pub _unused3: u64,
+    pub _unused4: u64,
 }

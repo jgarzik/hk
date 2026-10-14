@@ -206,9 +206,13 @@ pub struct Ipc64Perm {
     pub __pad1: [u8; 2], // Padding for mode_t if 16-bit
     pub seq: u16,
     pub __pad2: u16,
+    /// Explicit padding before __unused1 (always zero; implicit in Linux)
+    pub __pad3: u32,
     pub __unused1: u64,
     pub __unused2: u64,
 }
+
+const _: () = assert!(core::mem::size_of::<Ipc64Perm>() == 48);
 
 /// Shared memory segment descriptor (64-bit version)
 #[repr(C)]
@@ -226,17 +230,8 @@ pub struct Shmid64Ds {
     pub __unused5: u64,
 }
 
-/// Semaphore array descriptor (64-bit version)
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Semid64Ds {
-    pub sem_perm: Ipc64Perm,
-    pub sem_otime: i64,
-    pub sem_ctime: i64,
-    pub sem_nsems: u64,
-    pub __unused3: u64,
-    pub __unused4: u64,
-}
+/// Semaphore array descriptor (64-bit version; layout differs per arch)
+pub use crate::arch::uapi::Semid64Ds;
 
 /// Message queue descriptor (64-bit version)
 #[repr(C)]

@@ -1,7 +1,7 @@
 //! Additional prctl tests
 //!
 //! Tests for PR_SET/GET_KEEPCAPS, PR_SET/GET_CHILD_SUBREAPER, PR_SET/GET_THP_DISABLE,
-//! and x86-64 specific PR_SET/GET_TSC, PR_SET/GET_CPUID
+//! x86-64 specific PR_SET/GET_TSC, and x86-64 arch_prctl(ARCH_GET/SET_CPUID)
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -10,7 +10,8 @@ use hk_syscall::{
 };
 #[cfg(target_arch = "x86_64")]
 use hk_syscall::{
-    PR_GET_TSC, PR_SET_TSC, PR_GET_CPUID, PR_SET_CPUID, PR_TSC_ENABLE, PR_TSC_SIGSEGV,
+    sys_arch_prctl, ARCH_GET_CPUID, ARCH_SET_CPUID, PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE,
+    PR_TSC_SIGSEGV,
 };
 
 /// Run all prctl extra tests
@@ -285,40 +286,73 @@ fn test_tsc_mode() {
     println(b"PRCTL_TSC:OK");
 }
 
-/// Test: CPUID fault set and get (x86-64 only)
+/// Test: CPUID faulting via arch_prctl(ARCH_GET/SET_CPUID) (x86-64 only)
+///
+/// Linux (arch/x86/kernel/process.c): ARCH_GET_CPUID returns 1 when CPUID
+/// is enabled (the default), 0 when it faults. ARCH_SET_CPUID returns
+/// -ENODEV when the CPU lacks CPUID faulting. There is no prctl() for this:
+/// prctl options 48/49 are unassigned and must fail with EINVAL.
 #[cfg(target_arch = "x86_64")]
 fn test_cpuid_fault() {
-    // Get default (should be 0)
-    let ret = sys_prctl(PR_GET_CPUID, 0, 0, 0, 0);
-    if ret != 0 {
-        print(b"PRCTL_CPUID:FAIL: default not 0, got ");
-        print_num(ret);
-        println(b"");
-        return;
+    const ENODEV: i64 = -19;
+    const EINVAL: i64 = -22;
+
+    // prctl(48/49) are not CPUID controls on Linux
+    for opt in [48, 49] {
+        let ret = sys_prctl(opt, 0, 0, 0, 0);
+        if ret != EINVAL {
+            print(b"PRCTL_CPUID:FAIL: prctl(");
+            print_num(opt as i64);
+            print(b") returned ");
+            print_num(ret);
+            println(b" expected -EINVAL");
+            return;
+        }
     }
 
-    // Set CPUID fault to 1 (disable CPUID)
-    let ret = sys_prctl(PR_SET_CPUID, 1, 0, 0, 0);
-    if ret != 0 {
-        print(b"PRCTL_CPUID:FAIL: set 1 returned ");
-        print_num(ret);
-        println(b"");
-        return;
-    }
-
-    // Get - should be 1
-    let ret = sys_prctl(PR_GET_CPUID, 0, 0, 0, 0);
+    // Default: CPUID enabled
+    let ret = sys_arch_prctl(ARCH_GET_CPUID, 0);
     if ret != 1 {
-        print(b"PRCTL_CPUID:FAIL: get returned ");
+        print(b"PRCTL_CPUID:FAIL: ARCH_GET_CPUID default returned ");
         print_num(ret);
         println(b" expected 1");
         return;
     }
 
-    // Set back to 0
-    let ret = sys_prctl(PR_SET_CPUID, 0, 0, 0, 0);
+    // Disable CPUID (fault). ENODEV if the CPU lacks CPUID faulting.
+    let ret = sys_arch_prctl(ARCH_SET_CPUID, 0);
+    if ret == ENODEV {
+        // Without the feature, the mode must stay "enabled"
+        let ret = sys_arch_prctl(ARCH_GET_CPUID, 0);
+        if ret != 1 {
+            print(b"PRCTL_CPUID:FAIL: after ENODEV, get returned ");
+            print_num(ret);
+            println(b"");
+            return;
+        }
+        println(b"PRCTL_CPUID:OK");
+        return;
+    }
     if ret != 0 {
-        print(b"PRCTL_CPUID:FAIL: clear returned ");
+        print(b"PRCTL_CPUID:FAIL: ARCH_SET_CPUID(0) returned ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+
+    let ret = sys_arch_prctl(ARCH_GET_CPUID, 0);
+    if ret != 0 {
+        print(b"PRCTL_CPUID:FAIL: get after disable returned ");
+        print_num(ret);
+        println(b" expected 0");
+        sys_arch_prctl(ARCH_SET_CPUID, 1);
+        return;
+    }
+
+    // Re-enable CPUID
+    let ret = sys_arch_prctl(ARCH_SET_CPUID, 1);
+    if ret != 0 {
+        print(b"PRCTL_CPUID:FAIL: ARCH_SET_CPUID(1) returned ");
         print_num(ret);
         println(b"");
         return;

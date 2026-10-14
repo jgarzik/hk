@@ -8,7 +8,7 @@
 
 use super::helpers::{print, println, print_num};
 use hk_syscall::{
-    sys_brk, sys_clock_getres, sys_clock_nanosleep, sys_clone, sys_execve, sys_exit, sys_fork,
+    sys_brk, sys_prctl, sys_clock_getres, sys_clock_nanosleep, sys_clone, sys_execve, sys_exit, sys_fork,
     sys_getcpu, sys_getegid, sys_geteuid, sys_getgid, sys_getpgid, sys_getpid, sys_getppid,
     sys_getpriority, sys_getresgid, sys_getresuid, sys_getrusage, sys_getsid, sys_gettid,
     sys_getuid, sys_ioprio_get, sys_ioprio_set, sys_nanosleep, sys_sched_getaffinity,
@@ -16,7 +16,8 @@ use hk_syscall::{
     sys_set_tid_address, sys_setfsgid, sys_setfsuid,
     sys_setgid, sys_setpriority, sys_setregid, sys_setresgid, sys_setresuid, sys_setreuid,
     sys_setsid, sys_setuid, sys_sysinfo, sys_vfork, sys_wait4, sys_waitid, ioprio_prio_value,
-    SchedParam, SigInfo, Timespec, CLOCK_MONOTONIC, CLOCK_REALTIME, CLONE_VM, IOPRIO_CLASS_BE,
+    SchedParam, SigInfo, Timespec, CLOCK_MONOTONIC, CLOCK_REALTIME, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, CLONE_VM,
+    IOPRIO_CLASS_BE,
     IOPRIO_WHO_PROCESS, P_ALL, P_PID, PRIO_PROCESS, SCHED_NORMAL, WEXITED,
 };
 #[cfg(target_arch = "x86_64")]
@@ -38,6 +39,7 @@ pub fn run_tests() {
     test_getsid_esrch();
     test_setsid_eperm();
     test_clone();
+    test_clone_settid();
     test_fork();
     test_fork_memory_isolation();
     test_vfork();
@@ -150,8 +152,8 @@ fn test_getpgid() {
     let pgid = sys_getpgid(0);
     print(b"getpgid(0) = ");
     print_num(pgid);
-    // Init process should be its own process group leader
-    if pgid == 1 {
+    // Init starts in init_task's process group 0 (Linux init/init_task.c)
+    if pgid == 0 {
         println(b"GETPGID:OK");
     } else {
         println(b"GETPGID:FAIL");
@@ -163,8 +165,8 @@ fn test_getsid() {
     let sid = sys_getsid(0);
     print(b"getsid(0) = ");
     print_num(sid);
-    // Init process should be session leader
-    if sid == 1 {
+    // Init starts in init_task's session 0 until it calls setsid()
+    if sid == 0 {
         println(b"GETSID:OK");
     } else {
         println(b"GETSID:FAIL");
@@ -176,7 +178,7 @@ fn test_getpgid_explicit() {
     let pgid_explicit = sys_getpgid(1);
     print(b"getpgid(1) = ");
     print_num(pgid_explicit);
-    if pgid_explicit == 1 {
+    if pgid_explicit == 0 {
         println(b"GETPGID_EXPLICIT:OK");
     } else {
         println(b"GETPGID_EXPLICIT:FAIL");
@@ -188,7 +190,7 @@ fn test_getsid_explicit() {
     let sid_explicit = sys_getsid(1);
     print(b"getsid(1) = ");
     print_num(sid_explicit);
-    if sid_explicit == 1 {
+    if sid_explicit == 0 {
         println(b"GETSID_EXPLICIT:OK");
     } else {
         println(b"GETSID_EXPLICIT:FAIL");
@@ -221,13 +223,16 @@ fn test_getsid_esrch() {
     }
 }
 
-/// Test 14: setsid (should fail because init is already process group leader)
+/// Test 14: setsid: init (pgid 0) may create its own session once; after
+/// that it is a process group leader and a second setsid() fails EPERM
 fn test_setsid_eperm() {
-    let setsid_ret = sys_setsid();
+    let first = sys_setsid();
+    let second = sys_setsid();
     print(b"setsid() = ");
-    print_num(setsid_ret);
-    // setsid should fail with EPERM (-1)
-    if setsid_ret == -1 {
+    print_num(first);
+    print(b", again = ");
+    print_num(second);
+    if first == 1 && second == -1 && sys_getpgid(0) == 1 && sys_getsid(0) == 1 {
         println(b"SETSID_EPERM:OK");
     } else {
         println(b"SETSID_EPERM:FAIL");
@@ -236,6 +241,8 @@ fn test_setsid_eperm() {
 
 /// Test 15: clone(CLONE_VM) - thread creation
 fn test_clone() {
+    const WNOHANG: i32 = 1;
+    const WALL: i32 = 0x4000_0000; // __WALL
 
     // Static child stack (must be outside function stack frame)
     #[repr(C, align(16))]
@@ -273,9 +280,14 @@ fn test_clone() {
         print(b"Parent: clone() returned child TID=");
         print_num(clone_ret);
 
+        // No exit signal makes this a "clone" child: plain wait4 must not
+        // see it (ECHILD), only __WALL/__WCLONE (Linux eligible_child)
         let mut wstatus: i32 = 0;
-        let wait_ret = sys_wait4(-1, &mut wstatus, 0, 0);
-        print(b"Parent: wait4() returned ");
+        let plain = sys_wait4(clone_ret, &mut wstatus, WNOHANG, 0);
+        let wait_ret = sys_wait4(clone_ret, &mut wstatus, WALL, 0);
+        print(b"Parent: plain wait4() returned ");
+        print_num(plain);
+        print(b", wait4(__WALL) returned ");
         print_num(wait_ret);
         print(b", wstatus=");
         print_num(wstatus as i64);
@@ -285,11 +297,64 @@ fn test_clone() {
         print_num(child_done as i64);
 
         let exit_status = (wstatus >> 8) & 0xff;
-        if wait_ret == clone_ret && exit_status == 42 && child_done == 42 {
+        if plain == -10 && wait_ret == clone_ret && exit_status == 42 && child_done == 42 {
             println(b"CLONE:OK");
         } else {
             println(b"CLONE:FAIL");
         }
+    }
+}
+
+/// clone() with CLONE_PARENT_SETTID | CLONE_CHILD_SETTID (fork-style)
+///
+/// Exercises the per-arch raw clone() argument order: x86_64 is
+/// (flags, newsp, ptid, ctid, tls); arm64 selects CLONE_BACKWARDS
+/// (flags, newsp, ptid, tls, ctid). The sys_clone wrapper keeps the
+/// glibc-style (flags, stack, ptid, ctid, tls) signature on both arches.
+fn test_clone_settid() {
+    static mut PTID: i32 = 0;
+    static mut CTID: i32 = 0;
+    let ptid_ptr = core::ptr::addr_of_mut!(PTID);
+    let ctid_ptr = core::ptr::addr_of_mut!(CTID);
+    // Pre-fault the (demand-paged) static pages from user mode.
+    unsafe {
+        core::ptr::write_volatile(ptid_ptr, 0);
+        core::ptr::write_volatile(ctid_ptr, 0);
+    }
+
+    let flags = CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | 17; // SIGCHLD
+    let ret = sys_clone(flags, 0, ptid_ptr as u64, ctid_ptr as u64, 0);
+    if ret < 0 {
+        print(b"CLONE_SETTID:FAIL: clone returned ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+    if ret == 0 {
+        // Child: CLONE_CHILD_SETTID wrote our TID into our copy of CTID
+        let ctid = unsafe { core::ptr::read_volatile(ctid_ptr) };
+        sys_exit(if ctid as i64 == sys_gettid() { 0 } else { 1 });
+    }
+
+    let mut wstatus: i32 = 0;
+    let wait_ret = sys_wait4(ret, &mut wstatus, 0, 0);
+    let ptid = unsafe { core::ptr::read_volatile(ptid_ptr) };
+    let child_code = (wstatus >> 8) & 0xff;
+    if wait_ret != ret {
+        print(b"CLONE_SETTID:FAIL: wait4 returned ");
+        print_num(wait_ret);
+        println(b"");
+    } else if ptid <= 0 {
+        // Linux writes the child TID (== returned PID for a non-thread
+        // clone). hk numbers PIDs and TIDs separately, so only check
+        // that the parent TID was written.
+        print(b"CLONE_SETTID:FAIL: parent_tid not set: ");
+        print_num(ptid as i64);
+        println(b"");
+    } else if child_code != 0 {
+        println(b"CLONE_SETTID:FAIL: child_tid not set in child");
+    } else {
+        println(b"CLONE_SETTID:OK");
     }
 }
 
@@ -428,7 +493,16 @@ fn test_waitid() {
             _pad: [0; 128 - 28],
         };
 
-        let waitid_ret = sys_waitid(P_PID, fork_ret3 as u64, &mut info, WEXITED);
+        // 5th arg: struct rusage * (144 bytes). Pre-fill with a poison
+        // pattern; the kernel must overwrite it with the child's usage.
+        let mut ru = [0xAAu8; 144];
+        let waitid_ret = sys_waitid(
+            P_PID,
+            fork_ret3 as u64,
+            &mut info,
+            WEXITED,
+            ru.as_mut_ptr() as u64,
+        );
         print(b"Parent: waitid() returned ");
         print_num(waitid_ret);
 
@@ -438,7 +512,19 @@ fn test_waitid() {
             print(b"  si_status=");
             print_num(info.si_status as i64);
 
-            if info.si_pid == fork_ret3 as i32 && info.si_status == 55 {
+            // ru_utime.tv_usec (offset 8) and ru_stime.tv_usec (offset 24)
+            // must be valid microsecond values, not the poison pattern.
+            let rd = |off: usize| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&ru[off..off + 8]);
+                i64::from_ne_bytes(b)
+            };
+            let ru_ok = (0..1_000_000).contains(&rd(8)) && (0..1_000_000).contains(&rd(24));
+            if !ru_ok {
+                println(b"  rusage not filled");
+            }
+
+            if info.si_pid == fork_ret3 as i32 && info.si_status == 55 && ru_ok {
                 println(b"WAITID:OK");
             } else {
                 println(b"WAITID:FAIL");
@@ -473,7 +559,7 @@ fn test_waitid_pall() {
             _pad: [0; 128 - 28],
         };
 
-        let waitid_ret = sys_waitid(P_ALL, 0, &mut info, WEXITED);
+        let waitid_ret = sys_waitid(P_ALL, 0, &mut info, WEXITED, 0);
         print(b"Parent: waitid(P_ALL) returned ");
         print_num(waitid_ret);
 
@@ -1093,14 +1179,39 @@ fn test_setregid() {
     }
 }
 
+/// Run `f` in a forked child: credential changes make Linux drop the
+/// process's dumpable flag, which must not leak into pid 1
+fn in_child(f: fn()) {
+    let pid = sys_fork();
+    if pid == 0 {
+        f();
+        sys_exit(0);
+    }
+    let mut status: i32 = 0;
+    sys_wait4(pid, &mut status, 0, 0);
+}
+
 /// Test 41: setfsuid syscall - set filesystem UID
 fn test_setfsuid() {
+    in_child(setfsuid_body);
+}
+
+fn setfsuid_body() {
     // setfsuid returns OLD value, not error code
     // Initial fsuid should be 0 (root)
     let old_fsuid = sys_setfsuid(1000);
     if old_fsuid != 0 {
         print(b"SETFSUID:FAIL expected old=0 got=");
         print_num(old_fsuid);
+        println(b"");
+        return;
+    }
+
+    // Changing fsuid resets dumpable to suid_dumpable (0) (kernel/cred.c)
+    let dumpable = sys_prctl(hk_syscall::PR_GET_DUMPABLE, 0, 0, 0, 0);
+    if dumpable != 0 {
+        print(b"SETFSUID:FAIL dumpable after fsuid change=");
+        print_num(dumpable);
         println(b"");
         return;
     }
@@ -1128,6 +1239,10 @@ fn test_setfsuid() {
 
 /// Test 42: setfsgid syscall - set filesystem GID
 fn test_setfsgid() {
+    in_child(setfsgid_body);
+}
+
+fn setfsgid_body() {
     // setfsgid returns OLD value, not error code
     // Initial fsgid should be 0 (root)
     let old_fsgid = sys_setfsgid(2000);
@@ -1454,8 +1569,9 @@ fn test_sched_rr_get_interval() {
     print(b", nsec=");
     print_num(ts.tv_nsec);
 
-    // For SCHED_NORMAL, interval should be 0
-    if ret == 0 && ts.tv_sec == 0 && ts.tv_nsec == 0 {
+    // For SCHED_NORMAL, the slice is 0 or the CFS/EEVDF slice
+    // (Linux kernel/sched/fair.c get_rr_interval_fair), e.g. a few ms
+    if ret == 0 && ts.tv_sec == 0 && (0..1_000_000_000).contains(&ts.tv_nsec) {
         println(b"SCHED_RR_GET_INTERVAL:OK");
     } else if ret < 0 {
         print(b"SCHED_RR_GET_INTERVAL:FAIL errno=");

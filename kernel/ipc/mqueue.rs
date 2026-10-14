@@ -6,13 +6,14 @@
 //! ## Design
 //!
 //! Unlike SysV message queues, POSIX mqueues use file descriptors and are identified
-//! by names (starting with '/'). Messages are prioritized (higher priority first)
-//! and delivered FIFO within the same priority.
+//! by names (raw syscall names have no '/'; libc strips the leading one).
+//! Messages are prioritized (higher priority first) and delivered FIFO within
+//! the same priority.
 //!
 //! ## Key Features
 //!
 //! - File descriptor-based access (integrates with close, read, poll)
-//! - Name-based registry (names must start with '/')
+//! - Name-based registry (single path component; '/' in a name is EACCES)
 //! - Priority-ordered message delivery (0 to MQ_PRIO_MAX-1)
 //! - Blocking/non-blocking send and receive with timeouts
 //! - SIGEV_SIGNAL and SIGEV_THREAD_ID notifications
@@ -24,7 +25,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -475,6 +476,25 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<A
 // Syscall Implementations
 // ============================================================================
 
+/// Validate a raw mq_open/mq_unlink name.
+///
+/// The raw syscall name has no leading '/' (libc strips it). Linux looks the
+/// name up as a single component in the mqueue fs root
+/// (ipc/mqueue.c -> lookup_noperm_common() in fs/namei.c): an empty name is
+/// ENOENT (getname), "." / ".." or any '/' is EACCES.
+fn validate_mq_name(name: &str) -> Result<(), KernelError> {
+    if name.is_empty() {
+        return Err(KernelError::NotFound);
+    }
+    if name.len() > NAME_MAX {
+        return Err(KernelError::NameTooLong);
+    }
+    if name == "." || name == ".." || name.contains('/') {
+        return Err(KernelError::PermissionDenied);
+    }
+    Ok(())
+}
+
 /// mq_open - open a message queue
 pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
     // Read name from user space
@@ -483,22 +503,10 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
         Err(_) => return KernelError::BadAddress.sysret(),
     };
 
-    // Validate name (must start with '/', no embedded '/')
-    if !name.starts_with('/') {
-        return KernelError::InvalidArgument.sysret();
+    if let Err(e) = validate_mq_name(&name) {
+        return e.sysret();
     }
-    if name.len() < 2 {
-        return KernelError::InvalidArgument.sysret();
-    }
-    if name[1..].contains('/') {
-        return KernelError::InvalidArgument.sysret();
-    }
-    if name.len() > NAME_MAX {
-        return KernelError::NameTooLong.sysret();
-    }
-
-    // Extract name without leading '/'
-    let queue_name = name[1..].to_string();
+    let queue_name = name;
     let access_mode = oflag & O_ACCMODE;
 
     // Check flags
@@ -588,15 +596,10 @@ pub fn sys_mq_unlink(name_ptr: u64) -> i64 {
         Err(_) => return KernelError::BadAddress.sysret(),
     };
 
-    // Validate name
-    if !name.starts_with('/') {
-        return KernelError::InvalidArgument.sysret();
+    if let Err(e) = validate_mq_name(&name) {
+        return e.sysret();
     }
-    if name.len() < 2 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    let queue_name = name[1..].to_string();
+    let queue_name = name;
 
     let mut registry = MQ_REGISTRY.write();
     if let Some(q) = registry.get(&queue_name) {

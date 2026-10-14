@@ -291,11 +291,6 @@ pub fn sys_linkat(
         None => return KernelError::NotFound.sysret(),
     };
 
-    // Cannot hard link directories
-    if old_inode.mode().is_dir() {
-        return KernelError::NotPermitted.sysret();
-    }
-
     // Look up parent directory of the new link
     let (parent_dentry, name) = match lookup_parent_at(newdirfd, &newpath) {
         Ok(p) => p,
@@ -322,6 +317,13 @@ pub fn sys_linkat(
     if parent_dentry.lookup_child(&name).is_some() {
         unsafe { parent_inode.inode_unlock() };
         return KernelError::AlreadyExists.sysret();
+    }
+
+    // Cannot hard link directories; checked after EXDEV/EEXIST like Linux
+    // (fs/namei.c: do_linkat mount check, then vfs_link)
+    if old_inode.mode().is_dir() {
+        unsafe { parent_inode.inode_unlock() };
+        return KernelError::NotPermitted.sysret();
     }
 
     // Create the hard link

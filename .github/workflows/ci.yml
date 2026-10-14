@@ -34,6 +34,9 @@ jobs:
       - name: Build x86-64 (kernel + userspace)
         run: make build user
 
+      - name: Unit tests (host x86-64)
+        run: make test
+
       - name: Build aarch64 (kernel + userspace)
         run: make build-arm
 
@@ -62,6 +65,20 @@ jobs:
           path: /tmp/qemu_serial.log
           if-no-files-found: ignore
 
+      # Differential run of boot_tester on Ubuntu's Linux kernel (TCG here,
+      # hence the long timeout).
+      - name: Boot test on Linux (x86-64)
+        id: linux_x86
+        run: make check-linux LINUX_TEST_TIMEOUT=300
+
+      - name: Upload Linux serial log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-serial-linux-x86
+          path: /tmp/qemu_serial_linux.log
+          if-no-files-found: ignore
+
   boot-arm:
     runs-on: ubuntu-24.04-arm
     steps:
@@ -87,10 +104,28 @@ jobs:
       - name: Boot test aarch64
         run: make check-arm
 
+      # After check-arm: the aarch64 kernel include_bytes!()s the initramfs
+      - name: Unit tests (host arm64)
+        run: make test
+
       - name: Upload serial log
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: qemu-serial-arm
           path: /tmp/qemu_serial_arm.log
+          if-no-files-found: ignore
+
+      # Differential run on Ubuntu's arm64 Linux kernel (kernel .deb comes
+      # from apt-get download; apt lists were updated above).
+      - name: Boot test on Linux (aarch64)
+        id: linux_arm
+        run: make check-linux LINUX_TEST_TIMEOUT=300
+
+      - name: Upload Linux serial log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-serial-linux-arm
+          path: /tmp/qemu_serial_linux.log
           if-no-files-found: ignore

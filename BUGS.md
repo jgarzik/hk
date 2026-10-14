@@ -1,5 +1,72 @@
 # Known Bugs
 
+## chroot() does not affect path resolution (security)
+
+**Location**: `kernel/fs/path.rs` ~111-119 (absolute-path lookup)
+
+`sys_chroot` records the new root (`fs.set_root`), but path walking
+always starts absolute paths at the mount namespace root
+(`mnt_ns.get_root_dentry()`) and never consults the task's fs root, so a
+chrooted process can still reach everything. `..` at the chroot root is
+not clamped either. Boot test `CHROOT` only verifies confinement on a
+Linux host (`user/boot_tester/tests/permissions.rs`).
+
+## PID and TID come from separate counters
+
+**Location**: `kernel/task/percpu.rs` do_clone (`next_pid` / `next_tid`)
+
+Linux allocates one ID per task; a single-threaded process has
+pid == tid. hk draws pids and tids from separate counters, so e.g.
+`fork()`/`clone()` return the child's PID (2) while the child's
+`gettid()`, CLONE_PARENT_SETTID/CLONE_CHILD_SETTID stores and futex
+TIDs say 3. Anything comparing those values (pthread joins, tgkill to a
+returned pid, `/proc/<pid>/task`) can disagree with Linux.
+
+## Raw user-memory copies outside kernel/uaccess.rs
+
+**Location**: `kernel/fs/iov.rs`, `kernel/task/process_vm.rs`,
+`kernel/mm/mempolicy.rs`, `kernel/ipc/mqueue.rs`, `kernel/ns/uts.rs`,
+`kernel/fs/perm.rs`, and direct `*(ptr as *mut T)` writes (e.g. wait4
+status)
+
+Unpopulated-but-valid user pages are now demand-faulted for any kernel
+access, but only `copy_{to,from}_user`/`get_user`/`put_user`/
+`strncpy_from_user` and `read`/`write` have an exception fixup. Other
+sites still copy with `core::ptr` and panic on a truly invalid user
+address instead of returning EFAULT; convert them to the uaccess helpers.
+
+## Signal-killed children report as exited
+
+**Location**: `kernel/signal/mod.rs` handle_default_action,
+`kernel/task/proc.rs` sys_wait4 / sys_waitid
+
+A child killed by a signal is recorded as `exit(sig | 0x80)`, so wait4
+gives wstatus 0x8900 (WIFEXITED) instead of WIFSIGNALED/WTERMSIG=sig,
+and waitid never reports CLD_KILLED. Shells and supervisors misreport
+crashes. Track exit code and terminating signal separately.
+
+## x86-64: SIGKILL does not wake a task sleeping in rt_sigsuspend
+
+A child blocked in rt_sigsuspend that later receives SIGKILL from its
+parent never wakes (stays on the sleep queue) while the parent spins in
+wait4's `yield_now` loop; the boot test hangs. Same test completes on
+aarch64. Root cause unknown. Related: `send_signal` does not wake
+sleeping tasks in general (sigsuspend/poll re-check each tick).
+
+## x86-64 syscall 34 is dispatched as nice, not pause
+
+On x86-64, 34 is `pause` (neither arch has a `nice` syscall), and hk
+has no `sys_pause` at all although doc/SYSCALLS.md lists it. Fix:
+implement pause (sleep until a signal is delivered, return -EINTR),
+remove the dead sys_nice. A test is blocked on the two bugs above.
+
+## aarch64 tick length vs. NS_PER_TICK
+
+`kernel/time_syscall.rs` nanosleep assumes 10 ms ticks, but on aarch64
+3 ticks measured ~6 ms. Check the arm timer programming vs. the
+constant; sleeps may be wrong by the ratio.
+
+
 ## Heap Corruption in Arc<T> Struct Fields
 
 **Status**: Unresolved (workaround in place)

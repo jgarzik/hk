@@ -5,10 +5,11 @@
 //! - Test epoll_ctl ADD/DEL/MOD
 //! - Test epoll_wait with pipes
 //! - Test epoll_wait with eventfd
+//! - Test epoll_event layout: 64-bit data, multiple events
 //! - Test epoll_wait timeout behavior
 //! - Test EPOLLONESHOT mode
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{host_mode, print, println, print_num, skip};
 use hk_syscall::{
     sys_close, sys_write, sys_pipe2, sys_eventfd2,
     sys_epoll_create, sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait, sys_epoll_pwait2,
@@ -24,6 +25,8 @@ pub fn run_tests() {
     test_epoll_add_del();
     test_epoll_wait_pipe();
     test_epoll_wait_eventfd();
+    test_epoll_wait_multi_data64();
+    test_epoll_event_pad_zero();
     test_epoll_timeout();
     test_epoll_modify();
     test_epoll_oneshot();
@@ -229,6 +232,81 @@ fn test_epoll_wait_eventfd() {
     sys_close(epfd as u64);
     sys_close(efd as u64);
     println(b"EPOLL_WAIT_EVENTFD:OK");
+}
+
+/// Test epoll_event ABI layout: full 64-bit data, two events returned
+///
+/// epoll_event is packed (12 bytes) only on x86_64; on arm64 it is 16 bytes
+/// with data at offset 8 (include/uapi/linux/eventpoll.h EPOLL_PACKED).
+fn test_epoll_wait_multi_data64() {
+    const D1: u64 = 0xA1B2_C3D4_0000_0001;
+    const D2: u64 = 0x0102_0304_0506_0708;
+    let epfd = sys_epoll_create1(0);
+    let efd1 = sys_eventfd2(1, 0);
+    let efd2 = sys_eventfd2(1, 0);
+    if epfd < 0 || efd1 < 0 || efd2 < 0 {
+        println(b"EPOLL_WAIT_MULTI_DATA64:FAIL: setup failed");
+        return;
+    }
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, efd1 as i32, &EpollEvent::new(EPOLLIN, D1));
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, efd2 as i32, &EpollEvent::new(EPOLLIN, D2));
+
+    let mut events = [EpollEvent::empty(); 4];
+    let ret = sys_epoll_wait(epfd as i32, events.as_mut_ptr(), 4, 0);
+    let (e0, e1) = (events[0], events[1]);
+    let (d0, d1, ev0, ev1) = (e0.data, e1.data, e0.events, e1.events);
+    sys_close(epfd as u64);
+    sys_close(efd1 as u64);
+    sys_close(efd2 as u64);
+
+    let data_ok = (d0 == D1 && d1 == D2) || (d0 == D2 && d1 == D1);
+    if ret == 2 && data_ok && ev0 & EPOLLIN != 0 && ev1 & EPOLLIN != 0 {
+        println(b"EPOLL_WAIT_MULTI_DATA64:OK");
+    } else {
+        print(b"EPOLL_WAIT_MULTI_DATA64:FAIL: ret=");
+        print_num(ret);
+        print(b" data0=");
+        print_num(d0 as i64);
+        print(b" data1=");
+        print_num(d1 as i64);
+        println(b"");
+    }
+}
+
+/// Test: kernel zeroes epoll_event padding (bytes 4..8 on arm64) instead of
+/// leaking kernel memory. Linux never writes the padding (ep_send_events
+/// stores events/data separately), so the check is hk-only.
+fn test_epoll_event_pad_zero() {
+    let size = core::mem::size_of::<EpollEvent>();
+    if size == 12 {
+        println(b"EPOLL_EVENT_PAD_ZERO:OK"); // packed (x86_64): no padding
+        return;
+    }
+    if host_mode() {
+        skip(b"EPOLL_EVENT_PAD_ZERO", b"Linux leaves user padding untouched");
+        return;
+    }
+    let epfd = sys_epoll_create1(0);
+    let efd = sys_eventfd2(1, 0);
+    if epfd < 0 || efd < 0 {
+        println(b"EPOLL_EVENT_PAD_ZERO:FAIL: setup failed");
+        return;
+    }
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, efd as i32, &EpollEvent::new(EPOLLIN, 7));
+    let mut buf = [0xAAAA_AAAA_AAAA_AAAAu64; 8];
+    let ret = sys_epoll_wait(epfd as i32, buf.as_mut_ptr() as *mut EpollEvent, 4, 0);
+    sys_close(epfd as u64);
+    sys_close(efd as u64);
+    let pad = (buf[0] >> 32) as u32;
+    if ret == 1 && pad == 0 {
+        println(b"EPOLL_EVENT_PAD_ZERO:OK");
+    } else {
+        print(b"EPOLL_EVENT_PAD_ZERO:FAIL: ret=");
+        print_num(ret);
+        print(b" pad=");
+        print_num(pad as i64);
+        println(b"");
+    }
 }
 
 /// Test epoll_wait timeout behavior

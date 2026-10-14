@@ -680,7 +680,30 @@ pub fn mark_zombie(tid: Tid, status: i32) {
 /// # Returns
 /// * Some((child_pid, exit_status)) if a zombie child was found and reaped
 /// * None if no zombie child matches
-pub fn reap_zombie_child(parent_pid: Pid, target_pid: i64) -> Option<(Pid, i32)> {
+pub fn reap_zombie_child(parent_pid: Pid, target_pid: i64, wflags: i32) -> Option<(Pid, i32)> {
+    reap_zombie_child_times(parent_pid, target_pid, wflags).map(|(pid, status, _, _)| (pid, status))
+}
+
+/// Whether `child`'s exit_signal makes it eligible under `wflags`
+/// (Linux kernel/exit.c eligible_child): __WALL waits for all children;
+/// otherwise "clone" children (exit_signal != SIGCHLD) are waited for only
+/// with __WCLONE, and normal children only without it.
+fn wait_eligible(exit_signal: i32, wflags: i32) -> bool {
+    use super::wait_options::{__WALL, __WCLONE};
+    if wflags & __WALL != 0 {
+        return true;
+    }
+    let is_clone = exit_signal != crate::signal::SIGCHLD as i32;
+    is_clone == (wflags & __WCLONE != 0)
+}
+
+/// Like [`reap_zombie_child`], but also returns the reaped child's CPU times
+/// as `(pid, exit_status, utime_ns, stime_ns)` (for wait rusage reporting).
+pub fn reap_zombie_child_times(
+    parent_pid: Pid,
+    target_pid: i64,
+    wflags: i32,
+) -> Option<(Pid, i32, u64, u64)> {
     let mut table = TASK_TABLE.lock();
 
     // Find a zombie child matching the criteria
@@ -692,6 +715,10 @@ pub fn reap_zombie_child(parent_pid: Pid, target_pid: i64) -> Option<(Pid, i32)>
 
         // Must be a zombie
         if !matches!(t.state, TaskState::Zombie(_)) {
+            return false;
+        }
+
+        if !wait_eligible(t.exit_signal, wflags) {
             return false;
         }
 
@@ -711,7 +738,7 @@ pub fn reap_zombie_child(parent_pid: Pid, target_pid: i64) -> Option<(Pid, i32)>
     if let Some(idx) = zombie_idx {
         let task = table.tasks.remove(idx);
         if let TaskState::Zombie(status) = task.state {
-            return Some((task.pid, status));
+            return Some((task.pid, status, task.utime, task.stime));
         }
     }
 
@@ -726,12 +753,16 @@ pub fn reap_zombie_child(parent_pid: Pid, target_pid: i64) -> Option<(Pid, i32)>
 ///   - > 0: check for specific child PID
 ///   - -1: check for any child
 ///   - 0: check for any child in same process group
-pub fn has_children(parent_pid: Pid, target_pid: i64) -> bool {
+pub fn has_children(parent_pid: Pid, target_pid: i64, wflags: i32) -> bool {
     let table = TASK_TABLE.lock();
 
     table.tasks.iter().any(|t| {
         // Must be a child of the parent
         if t.ppid != parent_pid {
+            return false;
+        }
+
+        if !wait_eligible(t.exit_signal, wflags) {
             return false;
         }
 
@@ -1092,8 +1123,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             child_subreaper: false,                          // Not inherited
             #[cfg(target_arch = "x86_64")]
             tsc_mode: parent_prctl.tsc_mode, // Inherited
-            #[cfg(target_arch = "x86_64")]
-            cpuid_fault: parent_prctl.cpuid_fault, // Inherited
             thp_disable: parent_prctl.thp_disable,           // Inherited
         },
         // Process personality (inherited from parent)
@@ -1494,6 +1523,17 @@ pub fn timer_tick() {
 /// Get current tick count
 pub fn get_ticks() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
+}
+
+/// Sleep the current task for at least `ms` milliseconds
+///
+/// `sleep_current_until` takes scheduler ticks (`get_ticks`), whose period is
+/// arch/timer dependent, so sleep a tick at a time against the ms clock.
+pub fn sleep_current_ms(ms: u64) {
+    let deadline = crate::time::current_ticks().saturating_add(ms);
+    while crate::time::current_ticks() < deadline {
+        sleep_current_until(get_ticks().saturating_add(1));
+    }
 }
 
 /// Called after context switch to release the scheduler lock
@@ -2392,13 +2432,26 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
 
     // Update per-CPU cache first (so current task sees new creds immediately)
     let mut current = CurrentArch::get_current_task();
+    let old = current.cred;
     current.cred = *new;
     CurrentArch::set_current_task(&current);
+
+    // Changing euid/egid/fsuid/fsgid makes the task non-dumpable
+    // (suid_dumpable, default 0), so a less-privileged identity can't ptrace
+    // or core-dump state obtained under the old one (Linux kernel/cred.c
+    // commit_creds)
+    let ids_changed = old.euid != new.euid
+        || old.egid != new.egid
+        || old.fsuid != new.fsuid
+        || old.fsgid != new.fsgid;
 
     // Update TASK_TABLE (persistent storage for context switch)
     let mut table = TASK_TABLE.lock();
     if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
         task.cred = new;
+        if ids_changed {
+            task.prctl.dumpable = crate::task::dumpable::SUID_DUMP_DISABLE;
+        }
     }
 }
 

@@ -620,6 +620,11 @@ pub fn sys_swapoff(path_ptr: u64) -> i64 {
         Ok(p) => p,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
+    // Resolve the path first: a nonexistent file is ENOENT, an existing
+    // non-swap file EINVAL (Linux mm/swapfile.c swapoff: file_open_name)
+    if let Err(e) = lookup_path(&path_str) {
+        return e.sysret();
+    }
     let path = path_str.into_bytes();
 
     // Find swap device by path

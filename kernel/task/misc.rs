@@ -18,7 +18,7 @@ use super::Pid;
 /// Linux sysinfo structure (matches Linux kernel struct sysinfo layout)
 ///
 /// Used by the sysinfo(2) syscall to return system-wide statistics.
-/// The compiler automatically adds padding for alignment with #[repr(C)].
+/// All padding is explicit so no uninitialized bytes reach userspace.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SysInfo {
@@ -42,14 +42,17 @@ pub struct SysInfo {
     pub procs: u16,
     /// Padding for alignment
     pub pad: u16,
-    // Compiler adds 4 bytes of implicit padding here for u64 alignment
+    /// Explicit padding for u64 alignment (always zero)
+    pub _pad2: u32,
     /// Total high memory size (0 for 64-bit)
     pub totalhigh: u64,
     /// Available high memory size (0 for 64-bit)
     pub freehigh: u64,
     /// Memory unit size in bytes (1 = bytes)
     pub mem_unit: u32,
-    // Compiler adds 4 bytes of implicit padding here for struct alignment
+    /// Explicit tail padding (Linux `_f[20-2*sizeof(long)-sizeof(int)]` is
+    /// empty on 64-bit; this covers the struct alignment tail). Always zero.
+    pub _f: u32,
 }
 
 // Compile-time assertion that SysInfo is 112 bytes (matches Linux and userspace)
@@ -68,9 +71,11 @@ impl Default for SysInfo {
             freeswap: 0,
             procs: 0,
             pad: 0,
+            _pad2: 0,
             totalhigh: 0,
             freehigh: 0,
             mem_unit: 1,
+            _f: 0,
         }
     }
 }
@@ -182,9 +187,11 @@ pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
         freeswap: 0,
         procs,
         pad: 0,
+        _pad2: 0,
         totalhigh: 0,
         freehigh: 0,
         mem_unit: 1, // All sizes in bytes
+        _f: 0,
     };
 
     // Copy to user space
@@ -201,6 +208,26 @@ fn timeval_from_ns(ns: u64) -> Timeval {
         tv_sec: (ns / 1_000_000_000) as i64,
         tv_usec: ((ns % 1_000_000_000) / 1000) as i64,
     }
+}
+
+/// Write a `struct rusage` holding the given CPU times to user space.
+///
+/// Used by waitid()/wait4() to report a reaped child's resource usage.
+/// Fields other than utime/stime are not tracked and are zeroed.
+pub fn put_rusage_times<A: crate::uaccess::UaccessArch>(
+    usage_ptr: u64,
+    utime_ns: u64,
+    stime_ns: u64,
+) -> Result<(), KernelError> {
+    let usage = Rusage {
+        ru_utime: timeval_from_ns(utime_ns),
+        ru_stime: timeval_from_ns(stime_ns),
+        ..Rusage::default()
+    };
+    if !A::access_ok(usage_ptr, core::mem::size_of::<Rusage>()) {
+        return Err(KernelError::BadAddress);
+    }
+    crate::uaccess::put_user::<A, Rusage>(usage_ptr, usage).map_err(|_| KernelError::BadAddress)
 }
 
 /// sys_getrusage - get resource usage
@@ -340,9 +367,7 @@ use crate::task::prctl_ops::{
     PR_SET_PDEATHSIG, PR_SET_SECCOMP, PR_SET_THP_DISABLE, PR_SET_TIMERSLACK,
 };
 #[cfg(target_arch = "x86_64")]
-use crate::task::prctl_ops::{
-    PR_GET_CPUID, PR_GET_TSC, PR_SET_CPUID, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSEGV,
-};
+use crate::task::prctl_ops::{PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSEGV};
 
 /// sys_prctl - Process/thread control operations
 ///
@@ -360,15 +385,15 @@ use crate::task::prctl_ops::{
 /// - PR_GET_NAME (16): Get thread name (arg2 = char* buffer)
 /// - PR_SET_TIMERSLACK (29): Set timer slack (arg2 = nanoseconds)
 /// - PR_GET_TIMERSLACK (30): Get timer slack (returns nanoseconds)
-/// - PR_SET_CHILD_SUBREAPER (37): Make process a subreaper (arg2 = 0 or 1)
-/// - PR_GET_CHILD_SUBREAPER (36): Get subreaper flag (arg2 = int* for result)
+/// - PR_SET_CHILD_SUBREAPER (36): Make process a subreaper (arg2 = 0 or 1)
+/// - PR_GET_CHILD_SUBREAPER (37): Get subreaper flag (arg2 = int* for result)
 /// - PR_SET_NO_NEW_PRIVS (38): Disable privilege escalation (arg2 = 1, irreversible)
 /// - PR_GET_NO_NEW_PRIVS (39): Get no_new_privs flag (returns 0 or 1)
 ///
 /// Returns 0 on success (or value for GET operations), negative errno on error.
 pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 {
     use crate::arch::Uaccess;
-    use crate::task::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_ROOT, SUID_DUMP_USER};
+    use crate::task::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_USER};
     use crate::task::percpu::{TASK_TABLE, current_tid};
     use crate::uaccess::{get_user, put_user};
 
@@ -461,11 +486,12 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
         }
 
         PR_SET_DUMPABLE => {
-            // Set dumpable flag (0, 1, or 2)
-            let value = arg2 as u8;
-            if value != SUID_DUMP_DISABLE && value != SUID_DUMP_USER && value != SUID_DUMP_ROOT {
+            // Only 0/1 are settable; SUID_DUMP_ROOT (2) is reserved to the
+            // suid_dumpable sysctl (Linux kernel/sys.c PR_SET_DUMPABLE)
+            if arg2 != SUID_DUMP_DISABLE as u64 && arg2 != SUID_DUMP_USER as u64 {
                 return KernelError::InvalidArgument.sysret();
             }
+            let value = arg2 as u8;
 
             let mut table = TASK_TABLE.lock();
             if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
@@ -650,41 +676,6 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             }
         }
 
-        #[cfg(target_arch = "x86_64")]
-        PR_GET_CPUID => {
-            // Get CPUID faulting mode (x86-64 only)
-            // Returns 0 if CPUID allowed, 1 if CPUID faulting enabled
-            let table = TASK_TABLE.lock();
-            match table.tasks.iter().find(|t| t.tid == tid) {
-                Some(task) => {
-                    if task.prctl.cpuid_fault {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                None => KernelError::NoProcess.sysret(),
-            }
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        PR_SET_CPUID => {
-            // Set CPUID faulting mode (x86-64 only)
-            // arg2: 0 = allow CPUID, 1 = fault on CPUID
-            if arg2 > 1 {
-                return KernelError::InvalidArgument.sysret();
-            }
-
-            let mut table = TASK_TABLE.lock();
-            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-                task.prctl.cpuid_fault = arg2 != 0;
-                // Note: Actually enabling CPUID faulting requires MSR manipulation
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
-        }
-
         PR_SET_THP_DISABLE => {
             // Disable transparent huge pages for this process
             let mut table = TASK_TABLE.lock();
@@ -721,7 +712,8 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
 
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::percpu::{
-    ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_FS, ARCH_SET_GS, read_fs_base, write_fs_base,
+    ARCH_GET_CPUID, ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_CPUID, ARCH_SET_FS, ARCH_SET_GS,
+    read_fs_base, write_fs_base,
 };
 
 /// sys_arch_prctl - Architecture-specific thread state (x86_64 only)
@@ -734,6 +726,8 @@ use crate::arch::x86_64::percpu::{
 /// - ARCH_GET_FS (0x1003): Get FS base address
 /// - ARCH_SET_GS (0x1001): Not supported (GS is kernel per-CPU)
 /// - ARCH_GET_GS (0x1004): Not supported
+/// - ARCH_GET_CPUID (0x1011): Returns 1 (CPUID enabled; no faulting support)
+/// - ARCH_SET_CPUID (0x1012): -ENODEV (CPUID faulting not supported)
 ///
 /// Returns 0 on success, negative errno on error.
 #[cfg(target_arch = "x86_64")]
@@ -764,6 +758,11 @@ pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
             }
             0
         }
+        // CPUID faulting is not supported, so CPUID is always enabled.
+        // Matches Linux on CPUs without X86_FEATURE_CPUID_FAULT
+        // (arch/x86/kernel/process.c get_cpuid_mode/set_cpuid_mode).
+        ARCH_GET_CPUID => 1,
+        ARCH_SET_CPUID => KernelError::NoDevice.sysret(),
         ARCH_SET_GS | ARCH_GET_GS => {
             // GS base is used by kernel for per-CPU data, not available to user
             KernelError::InvalidArgument.sysret()

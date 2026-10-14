@@ -78,18 +78,8 @@ pub const EPOLL_CLOEXEC: i32 = 0o2000000;
 /// Maximum events that can be returned in a single epoll_wait call
 const EP_MAX_EVENTS: i32 = 4096;
 
-/// User-space epoll_event structure (Linux ABI)
-///
-/// Note: This is packed on x86-64 to match Linux's structure layout.
-/// The data field is a union in Linux (fd, u32, u64, ptr) but we use u64.
-#[repr(C, packed)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct EpollEvent {
-    /// Event mask (EPOLLIN, EPOLLOUT, etc.)
-    pub events: u32,
-    /// User data (passed back unchanged)
-    pub data: u64,
-}
+/// User-space epoll_event (layout differs per arch: packed only on x86_64)
+pub use crate::arch::uapi::EpollEvent;
 
 /// Per-monitored-fd entry (like Linux's struct epitem)
 struct EpItem {
@@ -285,10 +275,7 @@ impl Eventpoll {
 
                         // Add to result
                         if collected < max_events {
-                            events[collected] = EpollEvent {
-                                events: masked,
-                                data: item.event.data,
-                            };
+                            events[collected] = EpollEvent::new(masked, item.event.data);
                             collected += 1;
 
                             // Handle EPOLLONESHOT

@@ -489,7 +489,9 @@ fn test_keyctl_invalidate() {
         0,
     );
 
-    if ret == ENOKEY {
+    // Linux: ENOKEY, or EACCES if the key GC already unlinked it from the
+    // keyring so the lookup lost its possession permission (racy)
+    if ret == ENOKEY || ret == -13 {
         println(b"KEYCTL_INVALIDATE:OK");
     } else {
         print(b"KEYCTL_INVALIDATE:FAIL: read after invalidate returned ");

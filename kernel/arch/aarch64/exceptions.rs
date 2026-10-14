@@ -54,6 +54,33 @@ extern "C" fn handle_el1_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             unsafe {
                 asm!("mrs {}, far_el1", out(reg) far, options(nostack, nomem));
             }
+
+            // Kernel access to a user address (copy_to_user etc.): resolve
+            // demand-paging, swap and COW faults exactly like a user access
+            // (Linux: do_page_fault handles EL1 faults on TTBR0 addresses).
+            let dfsc = iss & 0x3F;
+            let is_write = (iss & (1 << 6)) != 0;
+            let is_translation_fault = (0x04..=0x07).contains(&dfsc);
+            let is_permission_fault = (0x0C..=0x0F).contains(&dfsc);
+            let is_user_addr = far >> 48 == 0; // TTBR0 (user) range
+            if is_user_addr {
+                if is_translation_fault
+                    && (handle_swap_fault(far) == Some(true)
+                        || handle_mmap_fault(far, is_write) == Some(true))
+                {
+                    return;
+                }
+                if is_permission_fault && is_write && handle_cow_fault(far) == Some(true) {
+                    return;
+                }
+                // Unresolvable fault inside a user-copy routine: resume at its
+                // fixup, which reports the uncopied bytes (-> EFAULT)
+                if let Some(fixup) = super::uaccess::uaccess_fixup(frame.elr) {
+                    frame.elr = fixup;
+                    return;
+                }
+            }
+
             panic!(
                 "Kernel data abort at ELR={:#x}, FAR={:#x}, ISS={:#x}",
                 frame.elr, far, iss

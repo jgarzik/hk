@@ -8,6 +8,7 @@
 //! - SysV message queues (msgget, msgsnd, msgrcv, msgctl)
 
 use hk_syscall::{
+    sys_clock_gettime,
     sys_close, sys_open, sys_pipe, sys_poll, sys_read, sys_select, sys_write,
     sys_sendfile, sys_splice, sys_tee, sys_vmsplice,
     sys_shmget, sys_shmat, sys_shmdt, sys_shmctl,
@@ -15,7 +16,7 @@ use hk_syscall::{
     sys_msgget, sys_msgsnd, sys_msgrcv, sys_msgctl,
     FdSet, IoVec, PollFd, Timeval, Sembuf, Timespec,
     POLLIN, POLLNVAL, POLLOUT,
-    IPC_CREAT, IPC_PRIVATE, IPC_RMID,
+    IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, Semid64Ds,
     GETVAL, SETVAL, GETALL, SETALL,
     O_RDONLY,
 };
@@ -34,6 +35,8 @@ pub fn run_tests() {
     test_poll_write_ready();
     test_select_data_ready();
     test_select_no_data();
+    test_poll_empty_timeout();
+    test_select_empty_timeout();
 
     // Splice tests
     println(b"--- Splice / Tee / Vmsplice / Sendfile ---");
@@ -54,6 +57,7 @@ pub fn run_tests() {
     println(b"--- SysV Semaphores ---");
     test_semget_create();
     test_semctl_setval_getval();
+    test_semctl_ipc_stat();
     test_semop_increment();
     test_semtimedop_timeout();
     test_semctl_all_efault();
@@ -509,6 +513,32 @@ fn test_semctl_setval_getval() {
         println(b" SEMCTL_VAL:OK");
     } else {
         println(b" SEMCTL_VAL:FAIL");
+    }
+}
+
+/// Test semctl(IPC_STAT): semid64_ds layout (differs x86_64 vs asm-generic)
+fn test_semctl_ipc_stat() {
+    let semid = sys_semget(IPC_PRIVATE, 3, IPC_CREAT | 0o640);
+    if semid < 0 {
+        println(b"SEMCTL_IPC_STAT:FAIL: semget failed");
+        return;
+    }
+    let mut ds = Semid64Ds::default();
+    let ret = sys_semctl(semid as i32, 0, IPC_STAT, &mut ds as *mut Semid64Ds as u64);
+    sys_semctl(semid as i32, 0, IPC_RMID, 0);
+    let (nsems, mode, ctime) = (ds.sem_nsems, ds.sem_perm.mode, ds.sem_ctime);
+    if ret == 0 && nsems == 3 && mode & 0o777 == 0o640 && ctime > 0 {
+        println(b"SEMCTL_IPC_STAT:OK");
+    } else {
+        print(b"SEMCTL_IPC_STAT:FAIL: ret=");
+        print_num(ret);
+        print(b" nsems=");
+        print_num(nsems as i64);
+        print(b" mode=");
+        print_num((mode & 0o777) as i64);
+        print(b" ctime=");
+        print_num(ctime);
+        println(b"");
     }
 }
 
@@ -1040,5 +1070,46 @@ fn test_semctl_all_efault() {
         println(b" SEMCTL_ALL_EFAULT:OK");
     } else {
         println(b" SEMCTL_ALL_EFAULT:FAIL");
+    }
+}
+
+/// Monotonic time in milliseconds
+fn mono_ms() -> i64 {
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    sys_clock_gettime(1, &mut ts); // CLOCK_MONOTONIC
+    ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
+}
+
+/// Test: poll(NULL, 0, 30) is a plain 30ms sleep returning 0
+fn test_poll_empty_timeout() {
+    let t0 = mono_ms();
+    let ret = sys_poll(core::ptr::null_mut(), 0, 30);
+    let dt = mono_ms() - t0;
+    if ret == 0 && (20..2000).contains(&dt) {
+        println(b"POLL_EMPTY_TIMEOUT:OK");
+    } else {
+        print(b"POLL_EMPTY_TIMEOUT:FAIL: ret=");
+        print_num(ret);
+        print(b" elapsed_ms=");
+        print_num(dt);
+        println(b"");
+    }
+}
+
+/// Test: select(0, NULL, NULL, NULL, 30ms) is a plain sleep returning 0
+fn test_select_empty_timeout() {
+    let mut tv = Timeval { tv_sec: 0, tv_usec: 30_000 };
+    let null = core::ptr::null_mut();
+    let t0 = mono_ms();
+    let ret = sys_select(0, null, null, null, &mut tv);
+    let dt = mono_ms() - t0;
+    if ret == 0 && (20..2000).contains(&dt) {
+        println(b"SELECT_EMPTY_TIMEOUT:OK");
+    } else {
+        print(b"SELECT_EMPTY_TIMEOUT:FAIL: ret=");
+        print_num(ret);
+        print(b" elapsed_ms=");
+        print_num(dt);
+        println(b"");
     }
 }

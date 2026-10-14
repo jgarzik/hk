@@ -71,6 +71,17 @@ pub trait UaccessArch {
     /// defeats SMAP protection.
     unsafe fn user_access_begin();
 
+    /// Copy `len` bytes where `src` and/or `dst` is a user address.
+    ///
+    /// Faults on not-yet-populated user pages are resolved by the page-fault
+    /// handler; an unresolvable fault is caught via the arch exception fixup.
+    /// Returns the number of bytes NOT copied (0 = success).
+    ///
+    /// # Safety
+    /// The kernel side must be valid for `len` bytes; must be called between
+    /// `user_access_begin()`/`user_access_end()`.
+    unsafe fn copy_user_raw(dst: *mut u8, src: *const u8, len: usize) -> usize;
+
     /// Disable user memory access (for SMAP-enabled CPUs)
     ///
     /// On x86_64 with SMAP, this executes `clac` to clear the AC flag.
@@ -112,12 +123,16 @@ pub fn copy_to_user<A: UaccessArch>(to: u64, from: &[u8]) -> UaccessResult<usize
     }
 
     // Perform the copy with SMAP protection disabled
-    unsafe {
+    let left = unsafe {
         A::user_access_begin();
-        ::core::ptr::copy_nonoverlapping(from.as_ptr(), to as *mut u8, len);
+        let left = A::copy_user_raw(to as *mut u8, from.as_ptr(), len);
         A::user_access_end();
-    }
+        left
+    };
 
+    if left != 0 {
+        return Err(UaccessError::Fault);
+    }
     Ok(0)
 }
 
@@ -152,12 +167,16 @@ pub fn copy_from_user<A: UaccessArch>(
     }
 
     // Perform the copy with SMAP protection disabled
-    unsafe {
+    let left = unsafe {
         A::user_access_begin();
-        ::core::ptr::copy_nonoverlapping(from as *const u8, to.as_mut_ptr(), len);
+        let left = A::copy_user_raw(to.as_mut_ptr(), from as *const u8, len);
         A::user_access_end();
-    }
+        left
+    };
 
+    if left != 0 {
+        return Err(UaccessError::Fault);
+    }
     Ok(0)
 }
 
@@ -186,12 +205,16 @@ pub fn put_user<A: UaccessArch, T: Copy>(to: u64, value: T) -> UaccessResult<()>
     }
 
     // Perform the write with SMAP protection disabled
-    unsafe {
+    let left = unsafe {
         A::user_access_begin();
-        ::core::ptr::write(to as *mut T, value);
+        let left = A::copy_user_raw(to as *mut u8, &value as *const T as *const u8, size);
         A::user_access_end();
-    }
+        left
+    };
 
+    if left != 0 {
+        return Err(UaccessError::Fault);
+    }
     Ok(())
 }
 
@@ -219,13 +242,17 @@ pub fn get_user<A: UaccessArch, T: Copy + Default>(from: u64) -> UaccessResult<T
     }
 
     // Perform the read with SMAP protection disabled
-    let value = unsafe {
+    let mut value = T::default();
+    let left = unsafe {
         A::user_access_begin();
-        let v = ::core::ptr::read(from as *const T);
+        let left = A::copy_user_raw(&mut value as *mut T as *mut u8, from as *const u8, size);
         A::user_access_end();
-        v
+        left
     };
 
+    if left != 0 {
+        return Err(UaccessError::Fault);
+    }
     Ok(value)
 }
 
@@ -265,7 +292,11 @@ pub fn strncpy_from_user<A: UaccessArch>(
                 return Err(UaccessError::BadAddress);
             }
 
-            let byte = ::core::ptr::read(ptr as *const u8);
+            let mut byte = 0u8;
+            if A::copy_user_raw(&mut byte, ptr as *const u8, 1) != 0 {
+                A::user_access_end();
+                return Err(UaccessError::Fault);
+            }
             if byte == 0 {
                 break;
             }

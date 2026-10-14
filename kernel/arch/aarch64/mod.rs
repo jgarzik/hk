@@ -25,6 +25,7 @@ pub mod spinlock;
 pub mod syscall;
 pub mod timer;
 pub mod uaccess;
+pub mod uapi;
 
 use alloc::vec;
 use core::arch::asm;

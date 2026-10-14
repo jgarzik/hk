@@ -11,12 +11,45 @@ use core::panic::PanicInfo;
 // Test modules
 mod tests;
 
-use hk_syscall::{sys_exit, sys_reboot, LINUX_REBOOT_CMD_POWER_OFF, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2};
-use tests::helpers::{println, print};
+use hk_syscall::{sys_exit, sys_exit_group, sys_getpid, sys_reboot, LINUX_REBOOT_CMD_POWER_OFF, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2};
+use tests::helpers::{fail_count, host_mode, host_setup, init_host_mode, println, print, print_num};
 
+/// Process entry: the kernel enters with a 16-byte aligned sp and no return
+/// address, so realign per the C ABI before calling into Rust.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub unsafe extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor ebp, ebp",
+        "and rsp, -16",
+        "call {main}",
+        "ud2",
+        main = sym rust_start,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "mov x29, xzr",
+        "mov x30, xzr",
+        "bl {main}",
+        "brk 0",
+        main = sym rust_start,
+    )
+}
+
+extern "C" fn rust_start() -> ! {
+    init_host_mode();
+
     println(b"=== hk Boot Tester ===");
+    if host_mode() {
+        println(b"(host mode: running on a non-hk kernel)");
+        host_setup();
+    }
     println(b"");
 
     // Run all test categories
@@ -25,6 +58,16 @@ pub extern "C" fn _start() -> ! {
     // Print final marker
     println(b"");
     println(b"BOOT_COMPLETE");
+
+    if host_mode() {
+        print(b"Host mode: ");
+        print_num(fail_count() as i64);
+        println(b" failed checks"); // must not itself contain "FAIL"
+        // Not init (run directly on a host): report via exit status
+        if sys_getpid() != 1 {
+            sys_exit_group((fail_count() != 0) as u64);
+        }
+    }
 
     // Shutdown the system via ACPI S5
     println(b"Powering off...");
