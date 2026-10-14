@@ -8,6 +8,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
+use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::{Mutex, RwLock};
 
@@ -216,6 +217,26 @@ pub trait IpcObject: Send + Sync {
     fn destroy(&self);
 }
 
+/// Counted reference to an IPC object, returned by `IpcIds` lookups
+///
+/// Holds one `perm.get_ref()` reference, released by `put_ref()` on drop,
+/// so every exit path (including `?`) balances the refcount.
+pub struct IpcRef(Arc<dyn IpcObject>);
+
+impl Deref for IpcRef {
+    type Target = Arc<dyn IpcObject>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for IpcRef {
+    fn drop(&mut self) {
+        self.0.perm().put_ref();
+    }
+}
+
 // ============================================================================
 // IPC IDs Table
 // ============================================================================
@@ -318,7 +339,7 @@ impl IpcIds {
     }
 
     /// Look up object by ID
-    pub fn find_by_id(&self, id: i32) -> Option<Arc<dyn IpcObject>> {
+    pub fn find_by_id(&self, id: i32) -> Option<IpcRef> {
         let inner = self.inner.read();
         let idx = (id as u32) & (IPCMNI - 1);
         let seq = ((id as u32) >> IPCMNI_SEQ_SHIFT) & (IPCMNI_SEQ_MAX - 1);
@@ -329,14 +350,14 @@ impl IpcIds {
             // SAFETY: We hold the lock
             let perm_mutable = unsafe { perm.mutable_ref() };
             if perm_mutable.seq == seq && !perm.is_deleted() && perm.get_ref() {
-                return Some(obj.clone());
+                return Some(IpcRef(obj.clone()));
             }
         }
         None
     }
 
     /// Look up object by key
-    pub fn find_by_key(&self, key: i32) -> Option<Arc<dyn IpcObject>> {
+    pub fn find_by_key(&self, key: i32) -> Option<IpcRef> {
         if key == IPC_PRIVATE {
             return None;
         }
@@ -347,7 +368,7 @@ impl IpcIds {
             && !obj.perm().is_deleted()
             && obj.perm().get_ref()
         {
-            return Some(obj.clone());
+            return Some(IpcRef(obj.clone()));
         }
         None
     }
@@ -452,7 +473,6 @@ pub fn ipcget<T: IpcObject + 'static>(
     if let Some(existing) = ids.find_by_key(key) {
         // Found existing - check flags
         if flags & IPC_CREAT != 0 && flags & IPC_EXCL != 0 {
-            existing.perm().put_ref();
             return Err(KernelError::AlreadyExists.errno());
         }
 
@@ -470,7 +490,6 @@ pub fn ipcget<T: IpcObject + 'static>(
         if access_flag != 0
             && let Err(e) = ipc_checkperm(perm, access_flag)
         {
-            perm.put_ref();
             return Err(e);
         }
 
@@ -478,7 +497,6 @@ pub fn ipcget<T: IpcObject + 'static>(
         // SAFETY: We hold the lock
         let id = unsafe { perm.mutable_ref() }.id;
         drop(_lock);
-        perm.put_ref();
         return Ok(id);
     }
 

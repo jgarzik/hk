@@ -391,7 +391,6 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
         if queue.try_deliver_to_receiver(&msg) {
             queue.stime.store(current_time_secs(), Ordering::Release);
             queue.lspid.store(pid, Ordering::Release);
-            queue.perm.put_ref();
             return Ok(0);
         }
 
@@ -399,7 +398,6 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
         let current_bytes = queue.cbytes.load(Ordering::Acquire);
         if current_bytes + msgsz as u64 > queue.qbytes {
             if nowait {
-                queue.perm.put_ref();
                 return Err(KernelError::WouldBlock.errno());
             }
 
@@ -431,7 +429,6 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
         // Wake any waiting receivers
         queue.waitq.wake_all();
 
-        queue.perm.put_ref();
         return Ok(0);
     }
 }
@@ -474,7 +471,6 @@ fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> R
                 // Put message back
                 let mut messages = queue.messages.lock();
                 messages.push_front(msg);
-                queue.perm.put_ref();
                 return Err(KernelError::ArgListTooLong.errno());
             }
 
@@ -505,13 +501,11 @@ fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> R
             // Wake any waiting senders
             queue.waitq.wake_all();
 
-            queue.perm.put_ref();
             return Ok(copy_len as i32);
         }
 
         // No matching message
         if nowait {
-            queue.perm.put_ref();
             return Err(KernelError::NoMessage.errno());
         }
 
@@ -520,7 +514,6 @@ fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> R
 
         // Check if queue was removed
         if queue.perm.is_deleted() {
-            queue.perm.put_ref();
             return Err(KernelError::IdentifierRemoved.errno());
         }
     }
@@ -555,7 +548,6 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                     .map_err(|_| KernelError::BadAddress.errno())?;
             }
 
-            queue.perm().put_ref();
             Ok(0)
         }
 
@@ -573,7 +565,6 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             let perm_mutable = unsafe { perm.mutable() };
             if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
                 drop(_lock);
-                perm.put_ref();
                 return Err(KernelError::NotPermitted.errno());
             }
 
@@ -588,10 +579,7 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             // Safe downcast with type verification
             let queue_inner: &MsgQueue = match downcast_msg(queue.as_ref()) {
                 Some(q) => q,
-                None => {
-                    perm.put_ref();
-                    return Err(KernelError::InvalidArgument.errno());
-                }
+                None => return Err(KernelError::InvalidArgument.errno()),
             };
 
             // Update qbytes if root
@@ -607,7 +595,6 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                 .ctime
                 .store(current_time_secs(), Ordering::Release);
 
-            perm.put_ref();
             Ok(0)
         }
 
@@ -626,11 +613,9 @@ fn do_msgctl(msqid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                 let perm_mutable = unsafe { perm.mutable_ref() };
                 if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
                     drop(_lock);
-                    perm.put_ref();
                     return Err(KernelError::NotPermitted.errno());
                 }
             }
-            perm.put_ref();
 
             if let Some(removed) = ns.msg_ids().remove(msqid) {
                 removed.destroy();

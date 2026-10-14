@@ -410,13 +410,11 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
                     record_undo_for_ops(semid, nsems, &sops);
                 }
                 sem_array.wake_pending();
-                sem_array.perm.put_ref();
                 return Ok(0);
             }
             Ok(false) => {
                 // Would block
                 if nowait {
-                    sem_array.perm.put_ref();
                     return Err(KernelError::WouldBlock.errno());
                 }
 
@@ -425,7 +423,6 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
                     let now = TIMEKEEPER.current_time();
                     let now_ns = now.sec as i128 * 1_000_000_000 + now.nsec as i128;
                     if now_ns >= deadline {
-                        sem_array.perm.put_ref();
                         return Err(KernelError::WouldBlock.errno());
                     }
                 }
@@ -458,14 +455,12 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
                 if queue.woken.load(Ordering::Acquire) {
                     let status = queue.status.load(Ordering::Acquire);
                     if status < 0 {
-                        sem_array.perm.put_ref();
                         return Err(-status);
                     }
                     // Success - record SEM_UNDO adjustments if needed
                     if has_undo {
                         record_undo_for_ops(semid, nsems, &sops);
                     }
-                    sem_array.perm.put_ref();
                     return Ok(0);
                 }
 
@@ -479,17 +474,13 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
                             let mut pending = sem_array.pending.lock();
                             pending.retain(|q| !Arc::ptr_eq(q, &queue));
                         }
-                        sem_array.perm.put_ref();
                         return Err(KernelError::WouldBlock.errno());
                     }
                 }
 
                 // Spurious wakeup or polling iteration, retry
             }
-            Err(e) => {
-                sem_array.perm.put_ref();
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -523,7 +514,6 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                     .map_err(|_| KernelError::BadAddress.errno())?;
             }
 
-            sem.perm().put_ref();
             Ok(0)
         }
 
@@ -541,7 +531,6 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             let perm_mutable = unsafe { perm.mutable() };
             if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
                 drop(_lock);
-                perm.put_ref();
                 return Err(KernelError::NotPermitted.errno());
             }
 
@@ -556,16 +545,12 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             // Safe downcast with type verification
             let sem_array: &SemArray = match downcast_sem(sem.as_ref()) {
                 Some(s) => s,
-                None => {
-                    perm.put_ref();
-                    return Err(KernelError::InvalidArgument.errno());
-                }
+                None => return Err(KernelError::InvalidArgument.errno()),
             };
             sem_array
                 .ctime
                 .store(current_time_secs(), Ordering::Relaxed);
 
-            perm.put_ref();
             Ok(0)
         }
 
@@ -584,11 +569,9 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 let perm_mutable = unsafe { perm.mutable_ref() };
                 if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
                     drop(_lock);
-                    perm.put_ref();
                     return Err(KernelError::NotPermitted.errno());
                 }
             }
-            perm.put_ref();
 
             if let Some(removed) = ns.sem_ids().remove(semid) {
                 removed.destroy();
@@ -609,14 +592,12 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 unsafe { &*(sem.as_ref() as *const dyn IpcObject as *const SemArray) };
 
             if semnum < 0 || semnum as u32 >= sem_array.nsems {
-                sem.perm().put_ref();
                 return Err(KernelError::InvalidArgument.errno());
             }
 
             let val = sem_array.sems[semnum as usize]
                 .semval
                 .load(Ordering::Acquire);
-            sem.perm().put_ref();
             Ok(val)
         }
 
@@ -632,13 +613,11 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 unsafe { &*(sem.as_ref() as *const dyn IpcObject as *const SemArray) };
 
             if semnum < 0 || semnum as u32 >= sem_array.nsems {
-                sem.perm().put_ref();
                 return Err(KernelError::InvalidArgument.errno());
             }
 
             let val = arg as i32;
             if !(0..=SEMVMX).contains(&val) {
-                sem.perm().put_ref();
                 return Err(KernelError::Range.errno());
             }
 
@@ -655,7 +634,6 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
             // Wake pending operations
             sem_array.wake_pending();
 
-            sem.perm().put_ref();
             Ok(0)
         }
 
@@ -680,7 +658,6 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                     .map_err(|_| KernelError::BadAddress.errno())?;
             }
 
-            sem.perm().put_ref();
             Ok(0)
         }
 
@@ -705,7 +682,6 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                     .map_err(|_| KernelError::BadAddress.errno())?;
 
                 if val as i32 > SEMVMX {
-                    sem.perm().put_ref();
                     return Err(KernelError::Range.errno());
                 }
 
@@ -718,7 +694,6 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 .store(current_time_secs(), Ordering::Release);
             sem_array.wake_pending();
 
-            sem.perm().put_ref();
             Ok(0)
         }
 
@@ -734,14 +709,12 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 unsafe { &*(sem.as_ref() as *const dyn IpcObject as *const SemArray) };
 
             if semnum < 0 || semnum as u32 >= sem_array.nsems {
-                sem.perm().put_ref();
                 return Err(KernelError::InvalidArgument.errno());
             }
 
             let pid = sem_array.sems[semnum as usize]
                 .sempid
                 .load(Ordering::Acquire);
-            sem.perm().put_ref();
             Ok(pid)
         }
 
@@ -753,7 +726,6 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
                 .ok_or(KernelError::InvalidArgument.errno())?;
 
             ipc_checkperm(sem.perm(), IPC_PERM_READ)?;
-            sem.perm().put_ref();
 
             // Return 0 for now (full implementation would count waiters)
             Ok(0)
@@ -960,7 +932,6 @@ pub fn exit_sem(tid: Tid) {
 
         // Downcast to SemArray
         let Some(sem_array) = downcast_sem(sem_obj.as_ref()) else {
-            sem_obj.perm().put_ref();
             continue;
         };
 
@@ -980,7 +951,6 @@ pub fn exit_sem(tid: Tid) {
 
         // Wake any pending operations that may now succeed
         sem_array.wake_pending();
-        sem_obj.perm().put_ref();
     }
 }
 
