@@ -18,7 +18,7 @@ use crate::net::tcp::{self, TcpState};
 use crate::net::udp;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
-use crate::uaccess::get_user;
+use crate::uaccess::{copy_from_user, copy_to_user, get_user, put_user};
 
 // Architecture-specific uaccess implementation
 #[cfg(target_arch = "aarch64")]
@@ -341,17 +341,10 @@ pub fn sys_accept(fd: i32, addr: u64, addrlen: u64) -> i64 {
                     && addrlen != 0
                     && let Some((remote_addr, remote_port)) = child.remote_addr()
                 {
-                    // Read addrlen from user
-                    let user_addrlen = unsafe { core::ptr::read_volatile(addrlen as *const u32) };
-
-                    if user_addrlen >= 16 {
-                        // Write sockaddr_in
-                        let sockaddr = SockAddrIn::new(remote_addr, remote_port);
-                        unsafe {
-                            core::ptr::write_volatile(addr as *mut SockAddrIn, sockaddr);
-                            core::ptr::write_volatile(addrlen as *mut u32, 16);
-                        }
-                    }
+                    // The fd is installed: like Linux, a fault writing the
+                    // address does not undo the accept
+                    let sockaddr = SockAddrIn::new(remote_addr, remote_port);
+                    let _ = write_sockaddr_in(addr, addrlen, &sockaddr);
                 }
 
                 return child_fd;
@@ -510,10 +503,10 @@ pub fn sys_socketpair(domain: i32, sock_type: i32, protocol: i32, sv: u64) -> i6
     };
 
     // Write file descriptors to user space
-    unsafe {
-        let sv_ptr = sv as *mut [i32; 2];
-        (*sv_ptr)[0] = fd1 as i32;
-        (*sv_ptr)[1] = fd2 as i32;
+    if put_user::<Uaccess, [i32; 2]>(sv, [fd1 as i32, fd2 as i32]).is_err() {
+        let _ = fd_table.lock().close(fd1);
+        let _ = fd_table.lock().close(fd2);
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -572,9 +565,64 @@ fn read_msghdr(addr: u64) -> Result<UserMsgHdr, i64> {
     if addr == 0 {
         return Err(KernelError::BadAddress.sysret());
     }
-    let ptr = addr as *const UserMsgHdr;
-    Ok(unsafe { core::ptr::read(ptr) })
+    let mut hdr = UserMsgHdr {
+        msg_name: 0,
+        msg_namelen: 0,
+        _pad1: 0,
+        msg_iov: 0,
+        msg_iovlen: 0,
+        msg_control: 0,
+        msg_controllen: 0,
+        msg_flags: 0,
+        _pad2: 0,
+    };
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(
+            &mut hdr as *mut UserMsgHdr as *mut u8,
+            core::mem::size_of::<UserMsgHdr>(),
+        )
+    };
+    copy_from_user::<Uaccess>(buf, addr, buf.len())
+        .map_err(|_| KernelError::BadAddress.sysret())?;
+    Ok(hdr)
 }
+
+/// Read a user iovec array (at most UIO_MAXIOV entries)
+fn read_iovecs(iov_ptr: u64, iovlen: usize) -> Result<alloc::vec::Vec<IoVec>, i64> {
+    if iovlen > 1024 {
+        // UIO_MAXIOV
+        return Err(KernelError::InvalidArgument.sysret());
+    }
+    let mut out = alloc::vec::Vec::with_capacity(iovlen);
+    for i in 0..iovlen as u64 {
+        let base = iov_ptr
+            .checked_add(i * 16)
+            .ok_or(KernelError::BadAddress.sysret())?;
+        let iov_base =
+            get_user::<Uaccess, u64>(base).map_err(|_| KernelError::BadAddress.sysret())?;
+        let iov_len =
+            get_user::<Uaccess, u64>(base + 8).map_err(|_| KernelError::BadAddress.sysret())?;
+        out.push(IoVec {
+            iov_base,
+            iov_len: iov_len as usize,
+        });
+    }
+    Ok(out)
+}
+
+/// Copy `len` bytes in from user memory
+fn copy_in(addr: u64, len: usize) -> Result<alloc::vec::Vec<u8>, i64> {
+    let mut v = alloc::vec![0u8; len];
+    if len > 0 {
+        copy_from_user::<Uaccess>(&mut v, addr, len)
+            .map_err(|_| KernelError::BadAddress.sysret())?;
+    }
+    Ok(v)
+}
+
+/// Largest single socket send/receive buffered in the kernel at once
+/// (UDP: max datagram; TCP: callers get a short count, like a full window)
+const SOCK_IO_MAX: usize = 65536;
 
 /// Gather data from iovec array into a single buffer
 fn gather_iovec(iov_ptr: u64, iovlen: usize) -> Result<alloc::vec::Vec<u8>, i64> {
@@ -586,26 +634,18 @@ fn gather_iovec(iov_ptr: u64, iovlen: usize) -> Result<alloc::vec::Vec<u8>, i64>
     if iov_ptr == 0 {
         return Err(KernelError::BadAddress.sysret());
     }
-    if iovlen > 1024 {
-        // UIO_MAXIOV
-        return Err(KernelError::InvalidArgument.sysret());
-    }
+    let iovecs = read_iovecs(iov_ptr, iovlen)?;
 
-    let iovecs = unsafe { core::slice::from_raw_parts(iov_ptr as *const IoVec, iovlen) };
-
-    // Calculate total size
-    let mut total_len = 0usize;
-    for iov in iovecs {
-        total_len = total_len.saturating_add(iov.iov_len);
-    }
-
-    // Gather data
-    let mut data = Vec::with_capacity(total_len);
-    for iov in iovecs {
-        if iov.iov_base != 0 && iov.iov_len > 0 {
-            let slice =
-                unsafe { core::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len) };
-            data.extend_from_slice(slice);
+    // Gather data (bounded: see SOCK_IO_MAX)
+    let mut data = Vec::new();
+    for iov in &iovecs {
+        let room = SOCK_IO_MAX - data.len();
+        if room == 0 {
+            break;
+        }
+        let n = iov.iov_len.min(room);
+        if n > 0 {
+            data.extend_from_slice(&copy_in(iov.iov_base, n)?);
         }
     }
 
@@ -618,17 +658,20 @@ fn scatter_iovec(iov_ptr: u64, iovlen: usize, data: &[u8]) -> usize {
         return 0;
     }
 
-    let iovecs = unsafe { core::slice::from_raw_parts(iov_ptr as *const IoVec, iovlen) };
+    let Ok(iovecs) = read_iovecs(iov_ptr, iovlen) else {
+        return 0;
+    };
 
     let mut offset = 0;
-    for iov in iovecs {
+    for iov in &iovecs {
         if offset >= data.len() {
             break;
         }
-        if iov.iov_base != 0 && iov.iov_len > 0 {
+        if iov.iov_len > 0 {
             let to_copy = (data.len() - offset).min(iov.iov_len);
-            let dst = unsafe { core::slice::from_raw_parts_mut(iov.iov_base as *mut u8, to_copy) };
-            dst.copy_from_slice(&data[offset..offset + to_copy]);
+            if copy_to_user::<Uaccess>(iov.iov_base, &data[offset..offset + to_copy]).is_err() {
+                break;
+            }
             offset += to_copy;
         }
     }
@@ -699,11 +742,14 @@ pub fn sys_recvmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
     };
 
     // Calculate total iovec space
-    let total_space = if msghdr.msg_iov != 0 && msghdr.msg_iovlen > 0 {
-        let iovecs = unsafe {
-            core::slice::from_raw_parts(msghdr.msg_iov as *const IoVec, msghdr.msg_iovlen)
-        };
-        iovecs.iter().map(|iov| iov.iov_len).sum()
+    let total_space = if msghdr.msg_iovlen > 0 {
+        match read_iovecs(msghdr.msg_iov, msghdr.msg_iovlen) {
+            Ok(iovecs) => iovecs
+                .iter()
+                .fold(0usize, |a, iov| a.saturating_add(iov.iov_len))
+                .min(SOCK_IO_MAX),
+            Err(e) => return e,
+        }
     } else {
         0
     };
@@ -716,11 +762,8 @@ pub fn sys_recvmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
             match socket.read(&mut buf) {
                 Ok(n) => {
                     let written = scatter_iovec(msghdr.msg_iov, msghdr.msg_iovlen, &buf[..n]);
-                    msghdr.msg_flags = 0;
-                    // Write back msghdr (mainly msg_flags)
-                    unsafe {
-                        let ptr = msg as *mut UserMsgHdr;
-                        core::ptr::write(ptr, msghdr);
+                    if write_msghdr_out(msg, 0, 0).is_err() {
+                        return KernelError::BadAddress.sysret();
                     }
                     written as i64
                 }
@@ -737,18 +780,16 @@ pub fn sys_recvmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
                     // Write source address to msg_name if provided
                     if msghdr.msg_name != 0 && msghdr.msg_namelen >= 16 {
                         let sockaddr = SockAddrIn::new(src_addr, src_port);
-                        unsafe {
-                            let ptr = msghdr.msg_name as *mut SockAddrIn;
-                            core::ptr::write(ptr, sockaddr);
+                        if copy_to_user::<Uaccess>(msghdr.msg_name, sockaddr_bytes(&sockaddr))
+                            .is_err()
+                        {
+                            return KernelError::BadAddress.sysret();
                         }
                         msghdr.msg_namelen = core::mem::size_of::<SockAddrIn>() as u32;
                     }
 
-                    msghdr.msg_flags = 0;
-                    // Write back msghdr
-                    unsafe {
-                        let ptr = msg as *mut UserMsgHdr;
-                        core::ptr::write(ptr, msghdr);
+                    if write_msghdr_out(msg, msghdr.msg_namelen, 0).is_err() {
+                        return KernelError::BadAddress.sysret();
                     }
                     written as i64
                 }
@@ -769,12 +810,10 @@ pub fn sys_sendmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
 
-    let msgs = unsafe { core::slice::from_raw_parts_mut(msgvec as *mut MMsgHdr, vlen as usize) };
-
     let mut sent = 0i64;
-    for mmsg in msgs.iter_mut() {
-        // Get pointer to the embedded UserMsgHdr
-        let msg_ptr = &mmsg.msg_hdr as *const UserMsgHdr as u64;
+    for i in 0..vlen as u64 {
+        // User address of msgvec[i].msg_hdr
+        let msg_ptr = msgvec.wrapping_add(i * core::mem::size_of::<MMsgHdr>() as u64);
         let result = sys_sendmsg(fd, msg_ptr, flags);
         if result < 0 {
             if sent == 0 {
@@ -782,7 +821,13 @@ pub fn sys_sendmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32) -> i64 {
             }
             break; // Stop on error but return count of successful sends
         }
-        mmsg.msg_len = result as u32;
+        if put_user::<Uaccess, u32>(msg_ptr + MMSG_LEN_OFFSET, result as u32).is_err() {
+            return if sent == 0 {
+                KernelError::BadAddress.sysret()
+            } else {
+                sent
+            };
+        }
         sent += 1;
     }
 
@@ -798,11 +843,9 @@ pub fn sys_recvmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32, _timeout: u64) 
         return KernelError::InvalidArgument.sysret();
     }
 
-    let msgs = unsafe { core::slice::from_raw_parts_mut(msgvec as *mut MMsgHdr, vlen as usize) };
-
     let mut received = 0i64;
-    for mmsg in msgs.iter_mut() {
-        let msg_ptr = &mut mmsg.msg_hdr as *mut UserMsgHdr as u64;
+    for i in 0..vlen as u64 {
+        let msg_ptr = msgvec.wrapping_add(i * core::mem::size_of::<MMsgHdr>() as u64);
         let result = sys_recvmsg(fd, msg_ptr, flags);
         if result < 0 {
             if received == 0 {
@@ -813,7 +856,13 @@ pub fn sys_recvmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32, _timeout: u64) 
         if result == 0 {
             break; // EOF
         }
-        mmsg.msg_len = result as u32;
+        if put_user::<Uaccess, u32>(msg_ptr + MMSG_LEN_OFFSET, result as u32).is_err() {
+            return if received == 0 {
+                KernelError::BadAddress.sysret()
+            } else {
+                received
+            };
+        }
         received += 1;
     }
 
@@ -918,7 +967,10 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u6
     }
 
     // Read the option value (assume i32 for most options)
-    let value = unsafe { *(optval as *const i32) };
+    let value = match get_user::<Uaccess, i32>(optval) {
+        Ok(v) => v,
+        Err(_) => return KernelError::BadAddress.sysret(),
+    };
     let bool_value = value != 0;
 
     match level {
@@ -973,7 +1025,13 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u6
                 if optlen < 8 {
                     return KernelError::InvalidArgument.sysret();
                 }
-                let linger = unsafe { *(optval as *const super::socket::Linger) };
+                let linger = super::socket::Linger {
+                    l_onoff: value,
+                    l_linger: match get_user::<Uaccess, i32>(optval + 4) {
+                        Ok(v) => v,
+                        Err(_) => return KernelError::BadAddress.sysret(),
+                    },
+                };
                 // Pack l_onoff and l_linger into u32: high 16 bits = onoff, low 16 = linger
                 let packed =
                     (((linger.l_onoff != 0) as u32) << 16) | ((linger.l_linger as u32) & 0xFFFF);
@@ -1037,15 +1095,10 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u6
 
     // Helper to write an i32 option value
     let write_i32 = |value: i32| {
-        unsafe {
-            let ptr = optval as *mut i32;
-            if !ptr.is_null() {
-                *ptr = value;
-            }
-            let len_ptr = optlen as *mut u32;
-            if !len_ptr.is_null() {
-                *len_ptr = 4;
-            }
+        if put_user::<Uaccess, i32>(optval, value).is_err()
+            || put_user::<Uaccess, u32>(optlen, 4).is_err()
+        {
+            return KernelError::BadAddress.sysret();
         }
         0i64
     };
@@ -1128,16 +1181,10 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u6
                     .load(core::sync::atomic::Ordering::Acquire);
                 let l_onoff = ((packed >> 16) & 1) as i32;
                 let l_linger = (packed & 0xFFFF) as i32;
-                unsafe {
-                    let ptr = optval as *mut super::socket::Linger;
-                    if !ptr.is_null() {
-                        (*ptr).l_onoff = l_onoff;
-                        (*ptr).l_linger = l_linger;
-                    }
-                    let len_ptr = optlen as *mut u32;
-                    if !len_ptr.is_null() {
-                        *len_ptr = 8; // sizeof(struct linger)
-                    }
+                if put_user::<Uaccess, [i32; 2]>(optval, [l_onoff, l_linger]).is_err()
+                    || put_user::<Uaccess, u32>(optlen, 8).is_err()
+                {
+                    return KernelError::BadAddress.sysret();
                 }
                 0
             }
@@ -1191,7 +1238,16 @@ pub fn sys_sendto(fd: i32, buf: u64, len: u64, _flags: i32, dest_addr: u64, addr
         Err(e) => return e,
     };
 
-    let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) };
+    // Copy the payload in (bounded: see SOCK_IO_MAX; UDP rejects more)
+    let len = len as usize;
+    if socket.sock_type == SocketType::Dgram && len > SOCK_IO_MAX {
+        return KernelError::MessageTooLong.sysret();
+    }
+    let data = match copy_in(buf, len.min(SOCK_IO_MAX)) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let data = &data[..];
 
     match socket.sock_type {
         SocketType::Stream => {
@@ -1228,13 +1284,20 @@ pub fn sys_recvfrom(fd: i32, buf: u64, len: u64, _flags: i32, src_addr: u64, add
         Err(e) => return e,
     };
 
-    let buffer = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+    // Receive into a kernel buffer, then copy out
+    let mut kbuf = alloc::vec![0u8; (len as usize).min(SOCK_IO_MAX)];
+    let buffer = &mut kbuf[..];
 
     match socket.sock_type {
         SocketType::Stream => {
             // TCP: use regular read
             match socket.read(buffer) {
-                Ok(n) => n as i64,
+                Ok(n) => {
+                    if copy_to_user::<Uaccess>(buf, &buffer[..n]).is_err() {
+                        return KernelError::BadAddress.sysret();
+                    }
+                    n as i64
+                }
                 Err(e) => e as i64,
             }
         }
@@ -1242,10 +1305,16 @@ pub fn sys_recvfrom(fd: i32, buf: u64, len: u64, _flags: i32, src_addr: u64, add
             // UDP: read datagram with source address
             match socket.read_datagram(buffer) {
                 Ok((n, src_ip, src_port)) => {
+                    if copy_to_user::<Uaccess>(buf, &buffer[..n]).is_err() {
+                        return KernelError::BadAddress.sysret();
+                    }
                     // Write source address if requested
                     if src_addr != 0 && addrlen != 0 {
                         let sockaddr = SockAddrIn::new(src_ip, src_port);
-                        let _ = write_sockaddr_in(src_addr, addrlen, &sockaddr);
+                        let r = write_sockaddr_in(src_addr, addrlen, &sockaddr);
+                        if r < 0 {
+                            return r;
+                        }
                     }
                     n as i64
                 }
@@ -1307,15 +1376,45 @@ fn write_sockaddr_in(addr: u64, addrlen: u64, sockaddr: &SockAddrIn) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    unsafe {
-        let ptr = addr as *mut SockAddrIn;
-        *ptr = *sockaddr;
-
-        let len_ptr = addrlen as *mut u32;
-        if !len_ptr.is_null() {
-            *len_ptr = core::mem::size_of::<SockAddrIn>() as u32;
-        }
+    // Linux move_addr_to_user: copy min(*addrlen, real size) bytes, then
+    // report the real size
+    let Ok(ulen) = get_user::<Uaccess, i32>(addrlen) else {
+        return KernelError::BadAddress.sysret();
+    };
+    if ulen < 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+    let bytes = sockaddr_bytes(sockaddr);
+    let n = (ulen as usize).min(bytes.len());
+    if copy_to_user::<Uaccess>(addr, &bytes[..n]).is_err()
+        || put_user::<Uaccess, u32>(addrlen, bytes.len() as u32).is_err()
+    {
+        return KernelError::BadAddress.sysret();
     }
 
     0
+}
+
+/// sockaddr_in as bytes (all fields named, no padding)
+fn sockaddr_bytes(sa: &SockAddrIn) -> &[u8] {
+    const _: () = assert!(core::mem::size_of::<SockAddrIn>() == 16);
+    unsafe {
+        core::slice::from_raw_parts(
+            sa as *const SockAddrIn as *const u8,
+            core::mem::size_of::<SockAddrIn>(),
+        )
+    }
+}
+
+/// Offsets in struct msghdr / mmsghdr (64-bit Linux layout)
+const MSGHDR_NAMELEN_OFFSET: u64 = 8;
+const MSGHDR_FLAGS_OFFSET: u64 = 48;
+const MMSG_LEN_OFFSET: u64 = 56;
+const _: () = assert!(core::mem::size_of::<UserMsgHdr>() == 56);
+const _: () = assert!(core::mem::size_of::<MMsgHdr>() == 64);
+
+/// Write back the recvmsg outputs (msg_namelen, msg_flags) to user msghdr
+fn write_msghdr_out(msg: u64, namelen: u32, flags: i32) -> Result<(), ()> {
+    put_user::<Uaccess, u32>(msg + MSGHDR_NAMELEN_OFFSET, namelen).map_err(|_| ())?;
+    put_user::<Uaccess, i32>(msg + MSGHDR_FLAGS_OFFSET, flags).map_err(|_| ())
 }
