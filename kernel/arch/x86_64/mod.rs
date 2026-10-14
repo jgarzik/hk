@@ -34,6 +34,7 @@ pub mod spinlock;
 pub mod syscall;
 pub mod tsc;
 pub mod uaccess;
+pub mod uapi;
 pub mod vgacon;
 
 use crate::arch::{Arch, CpuOps, SchedArch, UserModeOps};

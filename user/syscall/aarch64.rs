@@ -19,7 +19,7 @@
 //!   - No `chmod`, `chown`, `lchown` - use *at variants
 //!   - No `truncate` - use ftruncate with openat
 
-use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Stat, Timespec, Timeval, Timex, UtsName, AT_FDCWD};
+use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Timespec, Timeval, Timex, UtsName, AT_FDCWD};
 
 // ============================================================================
 // Syscall macros for aarch64
@@ -2620,4 +2620,33 @@ pub const BPF_EXIST: u64 = 2;
 #[inline(always)]
 pub fn sys_bpf(cmd: i32, attr: u64, size: u32) -> i64 {
     unsafe { syscall3!(SYS_BPF, cmd, attr, size) }
+}
+
+// ============================================================================
+// Architecture-specific ABI structures
+// ============================================================================
+
+/// `struct stat` (include/uapi/asm-generic/stat.h, used by arm64)
+#[repr(C)]
+pub struct Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    pub _pad1: u64,
+    pub st_size: i64,
+    pub st_blksize: i32,
+    pub _pad2: i32,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: u64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: u64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: u64,
+    pub _unused4: u32,
+    pub _unused5: u32,
 }
