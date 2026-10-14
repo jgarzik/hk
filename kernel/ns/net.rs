@@ -36,6 +36,13 @@ use crate::net::arp::ArpEntry;
 
 /// Network namespace - isolates network stack per-namespace
 ///
+/// Tables are reached only through the lookup/insert methods below, which
+/// return owned values or `Arc` handles and never let a lock guard escape,
+/// so the backing synchronization (today `RwLock`/`Mutex`, thread context
+/// only, leaf locks) can later become RCU without touching callers. Lock
+/// order: a socket lock may be held while calling these; none of them is
+/// held while taking a socket lock.
+///
 /// Each network namespace has its own:
 /// - Network devices (loopback always present)
 /// - Routing table
@@ -44,35 +51,35 @@ use crate::net::arp::ArpEntry;
 /// - Network configuration
 pub struct NetNamespace {
     /// Network devices in this namespace
-    pub devices: RwLock<Vec<Arc<NetDevice>>>,
+    devices: RwLock<Vec<Arc<NetDevice>>>,
 
     /// Network configuration (IP, netmask, gateway)
-    pub config: RwLock<Option<NetConfig>>,
+    config: RwLock<Option<NetConfig>>,
 
     /// Routing table
-    pub routes: RwLock<Vec<Route>>,
+    routes: RwLock<Vec<Route>>,
 
     /// TCP connection table (four-tuple -> socket)
-    pub tcp_connections: RwLock<BTreeMap<TcpFourTuple, Arc<Socket>>>,
+    tcp_connections: RwLock<BTreeMap<TcpFourTuple, Arc<Socket>>>,
 
     /// TCP listening sockets (local_port -> socket)
     /// Following Linux's inet_hashtables listening hash
-    pub tcp_listeners: RwLock<BTreeMap<u16, Arc<Socket>>>,
+    tcp_listeners: RwLock<BTreeMap<u16, Arc<Socket>>>,
 
     /// UDP socket table (two-tuple -> socket)
-    pub udp_sockets: RwLock<BTreeMap<UdpTwoTuple, Arc<Socket>>>,
+    udp_sockets: RwLock<BTreeMap<UdpTwoTuple, Arc<Socket>>>,
 
     /// ARP cache entries indexed by IP address
-    pub arp_entries: Mutex<BTreeMap<u32, ArpEntry>>,
+    arp_entries: Mutex<BTreeMap<u32, ArpEntry>>,
 
     /// Packets waiting for ARP resolution
-    pub arp_pending: Mutex<BTreeMap<u32, VecDeque<crate::net::arp::PendingPacket>>>,
+    arp_pending: Mutex<BTreeMap<u32, VecDeque<crate::net::arp::PendingPacket>>>,
 
     /// Next ephemeral port
-    pub next_port: AtomicU32,
+    next_port: AtomicU32,
 
     /// Loopback device for this namespace
-    pub loopback: RwLock<Option<Arc<NetDevice>>>,
+    loopback: RwLock<Option<Arc<NetDevice>>>,
 }
 
 impl NetNamespace {
@@ -93,6 +100,7 @@ impl NetNamespace {
 
         // Create loopback device for this namespace
         let lo = create_loopback_device();
+        lo.set_net(&ns);
         ns.devices.write().push(lo.clone());
         *ns.loopback.write() = Some(lo.clone());
 
@@ -275,13 +283,39 @@ impl NetNamespace {
         self.arp_entries.lock().insert(entry.ip.to_u32(), entry);
     }
 
-    /// Queue a packet waiting for ARP resolution
-    pub fn arp_queue_packet(&self, ip: Ipv4Addr, packet: crate::net::arp::PendingPacket) {
-        self.arp_pending
+    /// Insert an ARP entry unless one exists for its address
+    pub fn arp_insert_if_absent(&self, entry: ArpEntry) {
+        self.arp_entries
             .lock()
-            .entry(ip.to_u32())
-            .or_default()
-            .push_back(packet);
+            .entry(entry.ip.to_u32())
+            .or_insert(entry);
+    }
+
+    /// Return the resolved MAC for `ip`, or queue `packet` until it is
+    /// resolved (at most `ARP_QUEUE_LEN` packets per address, oldest
+    /// dropped). Checking and queueing happen under `arp_pending`, which
+    /// `arp_take_pending` also takes after the cache insert, so a reply
+    /// racing with this call can never strand the packet.
+    ///
+    /// Lock order: `arp_pending` -> `arp_entries` (both leaf otherwise).
+    pub fn arp_resolve_or_queue(
+        &self,
+        ip: Ipv4Addr,
+        packet: crate::net::arp::PendingPacket,
+    ) -> Result<(), ([u8; 6], crate::net::arp::PendingPacket)> {
+        const ARP_QUEUE_LEN: usize = 16;
+        let mut pending = self.arp_pending.lock();
+        if let Some(e) = self.arp_entries.lock().get(&ip.to_u32())
+            && e.state == crate::net::arp::ArpState::Reachable
+        {
+            return Err((e.mac, packet));
+        }
+        let q = pending.entry(ip.to_u32()).or_default();
+        if q.len() >= ARP_QUEUE_LEN {
+            q.pop_front();
+        }
+        q.push_back(packet);
+        Ok(())
     }
 
     /// Take all pending packets for an IP (after ARP resolution)
@@ -310,8 +344,37 @@ impl NetNamespace {
         self.devices.read().first().cloned()
     }
 
-    /// Register a network device in this namespace
-    pub fn register_device(&self, dev: Arc<NetDevice>) {
+    /// Snapshot of this namespace's devices (registration order)
+    pub fn devices(&self) -> Vec<Arc<NetDevice>> {
+        self.devices.read().clone()
+    }
+
+    /// Number of devices in this namespace
+    pub fn device_count(&self) -> usize {
+        self.devices.read().len()
+    }
+
+    /// The namespace's loopback device
+    pub fn loopback(&self) -> Option<Arc<NetDevice>> {
+        self.loopback.read().clone()
+    }
+
+    /// True if `addr` is assigned to a device in this namespace (or is in
+    /// 127/8): such destinations are delivered through `lo` (Linux's local
+    /// routing table, until P3 adds real FIB local routes)
+    pub fn is_local_addr(&self, addr: Ipv4Addr) -> bool {
+        addr.is_loopback()
+            || self
+                .devices
+                .read()
+                .iter()
+                .any(|d| d.ipv4_addr() == Some(addr))
+    }
+
+    /// Register a network device in this namespace (the device's netns is
+    /// set to this one)
+    pub fn register_device(self: &Arc<Self>, dev: Arc<NetDevice>) {
+        dev.set_net(self);
         self.devices.write().push(dev);
     }
 
@@ -326,25 +389,6 @@ impl NetNamespace {
     }
 }
 
-impl Default for NetNamespace {
-    fn default() -> Self {
-        // Can't use Self::new() here since it returns Arc
-        // This is only used internally
-        Self {
-            devices: RwLock::new(Vec::new()),
-            config: RwLock::new(None),
-            routes: RwLock::new(Vec::new()),
-            tcp_connections: RwLock::new(BTreeMap::new()),
-            tcp_listeners: RwLock::new(BTreeMap::new()),
-            udp_sockets: RwLock::new(BTreeMap::new()),
-            arp_entries: Mutex::new(BTreeMap::new()),
-            arp_pending: Mutex::new(BTreeMap::new()),
-            next_port: AtomicU32::new(32768),
-            loopback: RwLock::new(None),
-        }
-    }
-}
-
 // ============================================================================
 // Loopback Device Implementation
 // ============================================================================
@@ -353,11 +397,15 @@ impl Default for NetNamespace {
 struct LoopbackOps;
 
 impl NetDeviceOps for LoopbackOps {
+    /// Linux loopback_xmit: the frame comes straight back as received,
+    /// through this CPU's backlog (never processed synchronously, so the
+    /// transmit path never re-enters the receive path)
     fn xmit(&self, skb: alloc::boxed::Box<crate::net::skb::SkBuff>) -> Result<(), KernelError> {
-        // Loopback: packet comes right back as received
-        // For a proper implementation, we'd queue it for rx processing
-        // For now, just drop it (loopback in userspace isn't critical for namespace tests)
-        drop(skb);
+        let len = skb.len();
+        let dev = skb.dev.clone().ok_or(KernelError::NoDevice)?;
+        if crate::net::dev::netif_rx(skb) {
+            dev.stats.rx_packet(len);
+        }
         Ok(())
     }
 

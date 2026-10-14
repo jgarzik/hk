@@ -185,6 +185,14 @@ pub struct TcpSock {
 
     /// Out-of-order receive queue
     pub ooo_queue: Mutex<BTreeMap<u32, Vec<u8>>>,
+
+    /// Socket lock (Linux lock_sock, without the backlog: input runs in
+    /// thread context). Serializes segment processing (softnet or an
+    /// inline backlog flush) against sendmsg/connect/close on any CPU.
+    /// Thread context only; never held across a sleep. Order: outermost
+    /// network lock (listener before child; then netns tables, ARP,
+    /// device TX, softnet backlog).
+    sk_lock: Mutex<()>,
 }
 
 /// Segment in retransmit queue
@@ -218,7 +226,13 @@ impl TcpSock {
             rto: 1000, // 1 second initial RTO
             retransmit_queue: Mutex::new(Vec::new()),
             ooo_queue: Mutex::new(BTreeMap::new()),
+            sk_lock: Mutex::new(()),
         }
+    }
+
+    /// Take the socket lock
+    pub fn lock(&self) -> spin::MutexGuard<'_, ()> {
+        self.sk_lock.lock()
     }
 
     /// Get current state
@@ -258,29 +272,10 @@ impl Default for TcpSock {
     }
 }
 
-/// Register a connection in the current namespace's table
+/// Register a connection in the socket's namespace
 pub fn tcp_register_connection(tuple: TcpFourTuple, socket: Arc<Socket>) {
-    crate::net::current_net_ns().tcp_register(tuple, socket);
-}
-
-/// Remove a connection from the current namespace's table
-pub fn tcp_unregister_connection(tuple: &TcpFourTuple) {
-    crate::net::current_net_ns().tcp_unregister(tuple);
-}
-
-/// Look up a connection in the current namespace
-pub fn tcp_lookup_connection(tuple: &TcpFourTuple) -> Option<Arc<Socket>> {
-    crate::net::current_net_ns().tcp_lookup(tuple)
-}
-
-/// Allocate an ephemeral port in the current namespace
-pub fn tcp_alloc_port() -> u16 {
-    crate::net::current_net_ns().alloc_port()
-}
-
-/// Look up a listening socket by port in the current namespace
-pub fn tcp_lookup_listener(local_port: u16) -> Option<Arc<Socket>> {
-    crate::net::current_net_ns().tcp_lookup_listener(local_port)
+    let net = Arc::clone(&socket.net);
+    net.tcp_register(tuple, socket);
 }
 
 /// Initiate a TCP connection (active open)
@@ -290,16 +285,20 @@ pub fn tcp_connect(
     remote_port: u16,
 ) -> Result<(), KernelError> {
     let tcp = socket.tcp.as_ref().ok_or(KernelError::InvalidArgument)?;
-    let config = crate::net::get_config().ok_or(KernelError::InvalidArgument)?;
+    let _guard = tcp.lock();
 
     // Allocate local port
-    let local_port = tcp_alloc_port();
+    let local_port = socket.net.alloc_port();
 
     // For loopback destinations, use loopback as local address
     let local_addr = if remote_addr.is_loopback() {
         remote_addr // Use same loopback address
     } else {
-        config.ipv4_addr
+        socket
+            .net
+            .get_config()
+            .ok_or(KernelError::InvalidArgument)?
+            .ipv4_addr
     };
 
     // Set socket addresses
@@ -329,6 +328,7 @@ pub fn tcp_connect(
 /// Close a TCP connection
 pub fn tcp_close(socket: &Arc<Socket>) -> Result<(), KernelError> {
     let tcp = socket.tcp.as_ref().ok_or(KernelError::InvalidArgument)?;
+    let _guard = tcp.lock();
 
     match tcp.state() {
         TcpState::Closed | TcpState::Listen => {

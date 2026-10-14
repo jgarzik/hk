@@ -1014,10 +1014,12 @@ fn kmain() -> ! {
     task::percpu::enable();
 
     // Schedulers for the APs, then the kernel threads: timer callbacks
-    // (ktimerd), the system workqueue worker and the boot self-test
+    // (ktimerd), the system workqueue worker, the per-CPU network softnet
+    // threads and the boot self-test
     task::percpu::init_ap_schedulers(&mut frame_alloc);
     crate::timer::start_ktimerd();
     crate::workqueue::init();
+    crate::net::start_threads();
     crate::selftest::start();
 
     // Set per-CPU current task state

@@ -15,18 +15,22 @@ use crate::net::request_sock::RequestSock;
 use crate::net::skb::SkBuff;
 use crate::net::socket::{AddressFamily, Socket, SocketType};
 use crate::net::tcp::{
-    TCP_HLEN_MIN, TcpFourTuple, TcpHdr, TcpState, flags, tcp_checksum, tcp_lookup_connection,
-    tcp_lookup_listener, tcp_register_connection,
+    TCP_HLEN_MIN, TcpFourTuple, TcpHdr, TcpState, flags, tcp_checksum, tcp_register_connection,
 };
 
 /// Receive a TCP segment
 ///
-/// Called by IP layer after demultiplexing.
+/// Called by IP layer after demultiplexing (thread context). Lookups use
+/// the receiving device's namespace; each segment is processed under its
+/// socket's lock.
 /// Following Linux's tcp_v4_rcv() flow.
 pub fn tcp_rcv(skb: SkBuff) {
     if skb.len() < TCP_HLEN_MIN {
         return;
     }
+    let Some(net) = skb.net() else {
+        return;
+    };
 
     // Get IP addresses from skb
     let saddr = match skb.saddr {
@@ -61,11 +65,12 @@ pub fn tcp_rcv(skb: SkBuff) {
     };
 
     // First, try to find an established connection (like __inet_lookup_established)
-    if let Some(socket) = tcp_lookup_connection(&tuple) {
+    if let Some(socket) = net.tcp_lookup(&tuple) {
         let tcp = match socket.tcp.as_ref() {
             Some(t) => t,
             None => return,
         };
+        let _guard = tcp.lock();
 
         // Get payload
         let payload = &skb.data()[data_offset..];
@@ -99,11 +104,12 @@ pub fn tcp_rcv(skb: SkBuff) {
     }
 
     // No established connection - check for listening socket (like __inet_lookup_listener)
-    if let Some(listener) = tcp_lookup_listener(hdr.dest_port()) {
+    if let Some(listener) = net.tcp_lookup_listener(hdr.dest_port()) {
         let tcp = match listener.tcp.as_ref() {
             Some(t) => t,
             None => return,
         };
+        let _guard = tcp.lock();
 
         if tcp.state() != TcpState::Listen {
             return;
@@ -162,9 +168,9 @@ fn process_listen(
         // This way, when the ACK arrives, it will find the req in the queue
         accept_queue.syn_queue_add(req.clone());
 
-        // Drop the lock BEFORE sending SYN-ACK
-        // The SYN-ACK will trigger a synchronous loopback delivery of the client's ACK,
-        // which needs to acquire this lock in process_listen
+        // Drop the queue lock before transmitting (not needed for
+        // loopback any more, which is asynchronous, but keeps the
+        // accept-queue lock a leaf)
         drop(accept_queue_guard);
 
         // Send SYN-ACK (like tcp_v4_send_synack)
@@ -224,12 +230,17 @@ fn process_listen(
 /// - Set up TCP state for established connection
 /// - Register in connection table
 fn create_child_socket(
-    _listener: &Arc<Socket>,
+    listener: &Arc<Socket>,
     req: &RequestSock,
     hdr: &TcpHdr,
 ) -> Option<Arc<Socket>> {
     // Create new socket (like inet_csk_clone_lock)
-    let child = Socket::new(AddressFamily::Inet, SocketType::Stream, 0);
+    let child = Socket::new_in(
+        Arc::clone(&listener.net),
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+    );
 
     // Set addresses
     child.set_local(req.local_addr, req.local_port);

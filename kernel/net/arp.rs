@@ -106,15 +106,10 @@ impl ArpHdr {
     }
 }
 
-/// Receive an ARP packet
+/// Receive an ARP packet (EtherType 0x0806 handler; thread context)
 ///
-/// Called from interrupt context, uses init namespace for physical devices.
-pub fn arp_rcv(mut skb: SkBuff) {
-    // Skip Ethernet header
-    if skb.pull(ETH_HLEN).is_none() {
-        return;
-    }
-
+/// Uses the receiving device's namespace.
+pub fn arp_rcv(skb: SkBuff) {
     if skb.len() < ARP_HLEN {
         return;
     }
@@ -135,8 +130,9 @@ pub fn arp_rcv(mut skb: SkBuff) {
     let target_ip = hdr.target_ip();
     let op = hdr.operation();
 
-    // Use init namespace for interrupt context (physical device traffic)
-    let ns = crate::net::init_net_ns();
+    let Some(ns) = skb.net() else {
+        return;
+    };
     let now = crate::time::current_ticks();
 
     // Update cache with sender's info (learning)
@@ -187,44 +183,33 @@ pub fn arp_rcv(mut skb: SkBuff) {
 /// Returns the MAC if cached, otherwise sends ARP request and
 /// queues the packet for later transmission.
 ///
-/// Uses current namespace's ARP cache.
+/// Uses the ARP cache of `ns` (the output device's namespace).
 pub fn arp_resolve(
+    ns: &crate::net::NetNamespace,
     dev: &Arc<NetDevice>,
     ip: Ipv4Addr,
     skb: Box<SkBuff>,
 ) -> Result<(), KernelError> {
-    let ns = crate::net::current_net_ns();
     let now = crate::time::current_ticks();
 
-    // Check ARP cache
-    if let Some(entry) = ns.arp_lookup(ip)
-        && entry.state == ArpState::Reachable
-    {
-        // MAC cached - transmit packet now
-        return crate::net::ipv4::ip_finish_output(skb, entry.mac);
+    // Cached: transmit now; else queue until the reply arrives
+    let skb = match ns.arp_resolve_or_queue(ip, PendingPacket { skb }) {
+        Ok(()) => None,
+        Err((mac, packet)) => Some((mac, packet.skb)),
+    };
+    if let Some((mac, skb)) = skb {
+        return crate::net::ipv4::ip_finish_output(skb, mac);
     }
 
-    // Check again in case of race
-    if let Some(entry) = ns.arp_lookup(ip)
-        && entry.state == ArpState::Reachable
-    {
-        // MAC cached - transmit packet now
-        return crate::net::ipv4::ip_finish_output(skb, entry.mac);
-    }
-
-    // Queue the packet for later transmission when ARP completes
-    ns.arp_queue_packet(ip, PendingPacket { skb });
-
-    // Add incomplete entry if not present
-    if ns.arp_lookup(ip).is_none() {
-        ns.arp_insert(ArpEntry {
-            ip,
-            mac: [0; 6],
-            state: ArpState::Incomplete,
-            expires: now + ARP_TIMEOUT,
-            retries: 0,
-        });
-    }
+    // Add incomplete entry if not present (never overwrites a reply that
+    // raced in)
+    ns.arp_insert_if_absent(ArpEntry {
+        ip,
+        mac: [0; 6],
+        state: ArpState::Incomplete,
+        expires: now + ARP_TIMEOUT,
+        retries: 0,
+    });
 
     // Send ARP request
     send_arp_request(dev, ip);
@@ -311,17 +296,4 @@ fn send_arp_reply(dev: &NetDevice, target_ip: Ipv4Addr, target_mac: &[u8; ETH_AL
 
     // Transmit
     let _ = dev.xmit(skb);
-}
-
-/// Manually add an ARP entry (for testing)
-pub fn arp_add_entry(ip: Ipv4Addr, mac: [u8; ETH_ALEN]) {
-    let ns = crate::net::current_net_ns();
-    let now = crate::time::current_ticks();
-    ns.arp_insert(ArpEntry {
-        ip,
-        mac,
-        state: ArpState::Reachable,
-        expires: now + ARP_TIMEOUT,
-        retries: 0,
-    });
 }

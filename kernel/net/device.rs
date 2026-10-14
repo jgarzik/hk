@@ -5,9 +5,10 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use alloc::sync::{Arc, Weak};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use spin::Mutex;
+use spin::{Mutex, RwLock};
 
 use crate::net::KernelError;
 use crate::net::ipv4::Ipv4Addr;
@@ -95,6 +96,8 @@ pub struct NetDeviceStats {
     pub multicast: AtomicU64,
     /// Collisions
     pub collisions: AtomicU64,
+    /// Received frames with no protocol handler (Linux rx_nohandler)
+    pub rx_nohandler: AtomicU64,
 }
 
 impl NetDeviceStats {
@@ -133,6 +136,16 @@ impl NetDeviceStats {
     pub fn inc_tx_dropped(&self) {
         self.tx_dropped.fetch_add(1, Ordering::Relaxed);
     }
+
+    pub fn inc_rx_nohandler(&self) {
+        self.rx_nohandler.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one received packet of `len` bytes
+    pub fn rx_packet(&self, len: usize) {
+        self.rx_packets.fetch_add(1, Ordering::Relaxed);
+        self.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+    }
 }
 
 /// Network device structure
@@ -168,6 +181,13 @@ pub struct NetDevice {
 
     /// Wait queue for TX space available
     tx_wait: WaitQueue,
+
+    /// Network namespace the device lives in (weak: the namespace owns
+    /// its devices). Thread context only; read on every received packet.
+    net: RwLock<Weak<crate::net::NetNamespace>>,
+
+    /// Physical link state (Linux carrier; IFF_RUNNING = up && carrier)
+    carrier: AtomicBool,
 }
 
 impl NetDevice {
@@ -185,7 +205,38 @@ impl NetDevice {
             ipv4_netmask: Mutex::new(None),
             rx_wait: WaitQueue::new(),
             tx_wait: WaitQueue::new(),
+            net: RwLock::new(Weak::new()),
+            carrier: AtomicBool::new(true),
         }
+    }
+
+    /// Network namespace of this device
+    pub fn net(&self) -> Option<Arc<crate::net::NetNamespace>> {
+        self.net.read().upgrade()
+    }
+
+    /// Move the device into `net` (registration)
+    pub fn set_net(&self, net: &Arc<crate::net::NetNamespace>) {
+        *self.net.write() = Arc::downgrade(net);
+    }
+
+    /// Link came up (Linux netif_carrier_on); callable from any thread
+    pub fn netif_carrier_on(&self) {
+        self.carrier.store(true, Ordering::Release);
+        if self.is_up() {
+            self.flags.fetch_or(flags::IFF_RUNNING, Ordering::Release);
+        }
+    }
+
+    /// Link went down (Linux netif_carrier_off)
+    pub fn netif_carrier_off(&self) {
+        self.carrier.store(false, Ordering::Release);
+        self.flags.fetch_and(!flags::IFF_RUNNING, Ordering::Release);
+    }
+
+    /// Physical link state
+    pub fn carrier_ok(&self) -> bool {
+        self.carrier.load(Ordering::Acquire)
     }
 
     /// Get interface name
@@ -226,8 +277,13 @@ impl NetDevice {
     /// Bring interface up
     pub fn up(&self) -> Result<(), KernelError> {
         self.ops.open()?;
+        let running = if self.carrier_ok() {
+            flags::IFF_RUNNING
+        } else {
+            0
+        };
         self.flags
-            .fetch_or(flags::IFF_UP | flags::IFF_RUNNING, Ordering::Release);
+            .fetch_or(flags::IFF_UP | running, Ordering::Release);
         Ok(())
     }
 
@@ -277,6 +333,11 @@ impl NetDevice {
                 self.stats.inc_tx_packets();
                 self.stats.add_tx_bytes(len);
                 Ok(())
+            }
+            Err(KernelError::NoBufferSpace) => {
+                // Queue (TX ring) full: dropped, like a qdisc drop
+                self.stats.inc_tx_dropped();
+                Err(KernelError::NoBufferSpace)
             }
             Err(e) => {
                 self.stats.inc_tx_errors();

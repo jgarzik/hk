@@ -52,23 +52,18 @@ pub struct UdpTwoTuple {
     pub local_port: u16,
 }
 
-/// Register a UDP socket in the current namespace
+/// Register a UDP socket in its namespace
 pub fn udp_register_socket(tuple: UdpTwoTuple, socket: Arc<Socket>) {
-    crate::net::current_net_ns().udp_register(tuple, socket);
+    let net = Arc::clone(&socket.net);
+    net.udp_register(tuple, socket);
 }
 
-/// Unregister a UDP socket from the current namespace
-pub fn udp_unregister_socket(tuple: &UdpTwoTuple) {
-    crate::net::current_net_ns().udp_unregister(tuple);
-}
-
-/// Look up a UDP socket in the current namespace by port
-pub fn udp_lookup_socket(local_port: u16) -> Option<Arc<Socket>> {
-    crate::net::current_net_ns().udp_lookup_by_port(local_port)
-}
-
-/// Receive a UDP packet (called from ipv4::ip_rcv)
+/// Receive a UDP packet (called from ipv4::ip_rcv; thread context; the
+/// namespace is the receiving device's)
 pub fn udp_rcv(skb: SkBuff) {
+    let Some(net) = skb.net() else {
+        return;
+    };
     // Check minimum length
     if skb.len() < UDP_HLEN {
         return;
@@ -104,7 +99,7 @@ pub fn udp_rcv(skb: SkBuff) {
     let payload = &skb.data()[UDP_HLEN..UDP_HLEN + payload_len];
 
     // Look up socket by destination port
-    if let Some(socket) = udp_lookup_socket(dest_port) {
+    if let Some(socket) = net.udp_lookup_by_port(dest_port) {
         // Verify socket type is datagram
         if socket.sock_type != SocketType::Dgram {
             return;
@@ -142,7 +137,7 @@ pub fn udp_sendmsg(
         Some((addr, port)) => {
             if port == 0 {
                 // Need to allocate ephemeral port and register for receiving
-                let port = crate::net::current_net_ns().alloc_port();
+                let port = socket.net.alloc_port();
                 socket.set_local(addr, port);
                 // Register socket so we can receive replies
                 let tuple = UdpTwoTuple {
@@ -156,28 +151,44 @@ pub fn udp_sendmsg(
             }
         }
         None => {
-            // Get source IP from config and allocate port
-            let config = crate::net::get_config().ok_or(KernelError::InvalidArgument)?;
-            let port = crate::net::current_net_ns().alloc_port();
-            socket.set_local(config.ipv4_addr, port);
+            // Autobind: wildcard address (the source is picked per packet
+            // by the output route) and an ephemeral port
+            let any = Ipv4Addr::new(0, 0, 0, 0);
+            let port = socket.net.alloc_port();
+            socket.set_local(any, port);
             // Register socket so we can receive replies
             let tuple = UdpTwoTuple {
-                local_addr: config.ipv4_addr,
+                local_addr: any,
                 local_port: port,
             };
             udp_register_socket(tuple, Arc::clone(socket));
-            (config.ipv4_addr, port)
+            (any, port)
         }
     };
 
+    // Unbound/wildcard source: loopback for 127/8, else the namespace's
+    // configured address (P3: inet_select_addr on the output route)
+    let src_addr = if !src_addr.is_unspecified() {
+        src_addr
+    } else if dest_addr.is_loopback() {
+        Ipv4Addr::new(127, 0, 0, 1)
+    } else {
+        socket
+            .net
+            .get_config()
+            .map(|c| c.ipv4_addr)
+            .ok_or(KernelError::AddressNotAvailable)?
+    };
+
     // Build and send UDP packet
-    udp_build_and_send(src_addr, src_port, dest_addr, dest_port, data)?;
+    udp_build_and_send(&socket.net, src_addr, src_port, dest_addr, dest_port, data)?;
 
     Ok(data.len())
 }
 
 /// Build UDP header, add IP header, and transmit
 fn udp_build_and_send(
+    net: &crate::net::NetNamespace,
     saddr: Ipv4Addr,
     sport: u16,
     daddr: Ipv4Addr,
@@ -213,7 +224,7 @@ fn udp_build_and_send(
     skb.daddr = Some(daddr);
 
     // Hand off to IP layer (skb is already Box<SkBuff>)
-    ipv4::ip_queue_xmit(skb, IPPROTO_UDP)?;
+    ipv4::ip_queue_xmit(net, skb, IPPROTO_UDP)?;
 
     Ok(())
 }

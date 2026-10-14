@@ -100,22 +100,12 @@ impl FileOps for SocketFileOps {
             return Err(KernelError::from_errno(-err));
         }
 
-        // For TCP sockets, use tcp_sendmsg
+        // For TCP sockets, use tcp_sendmsg; then deliver what loopback
+        // queued (no locks held here; see netif_rx_flush_local)
         if let Some(ref _tcp) = self.socket.tcp {
-            match tcp::tcp_sendmsg(&self.socket, buf) {
-                Ok(n) => Ok(n),
-                Err(crate::net::KernelError::WouldBlock) => {
-                    if nonblock {
-                        Err(KernelError::WouldBlock)
-                    } else {
-                        // Block and retry
-                        self.socket.tx_wait.wait();
-                        // Retry once after wakeup
-                        tcp::tcp_sendmsg(&self.socket, buf).map_err(|_| KernelError::WouldBlock)
-                    }
-                }
-                Err(e) => Err(KernelError::from_errno(-e.to_errno_neg())),
-            }
+            let r = self.tcp_write(buf, nonblock);
+            crate::net::dev::netif_rx_flush_local();
+            r
         } else {
             Err(KernelError::OperationNotSupported)
         }
@@ -131,7 +121,12 @@ impl FileOps for SocketFileOps {
         let mut mask = 0u16;
 
         // Check for readable
-        if self.socket.poll_read() {
+        let readable = if self.socket.sock_type == crate::net::socket::SocketType::Dgram {
+            self.socket.poll_read_dgram()
+        } else {
+            self.socket.poll_read()
+        };
+        if readable {
             mask |= POLLIN | POLLRDNORM;
         }
 
@@ -182,6 +177,26 @@ impl KernelError {
         match errno {
             11 => KernelError::WouldBlock,
             _ => KernelError::Io,
+        }
+    }
+}
+
+impl SocketFileOps {
+    /// TCP write: send, blocking once for window space unless nonblocking
+    fn tcp_write(&self, buf: &[u8], nonblock: bool) -> Result<usize, KernelError> {
+        match tcp::tcp_sendmsg(&self.socket, buf) {
+            Ok(n) => Ok(n),
+            Err(crate::net::KernelError::WouldBlock) => {
+                if nonblock {
+                    Err(KernelError::WouldBlock)
+                } else {
+                    // Block and retry
+                    self.socket.tx_wait.wait();
+                    // Retry once after wakeup
+                    tcp::tcp_sendmsg(&self.socket, buf).map_err(|_| KernelError::WouldBlock)
+                }
+            }
+            Err(e) => Err(KernelError::from_errno(-e.to_errno_neg())),
         }
     }
 }

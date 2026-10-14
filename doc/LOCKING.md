@@ -382,7 +382,8 @@ control block. `kthread_should_stop/should_park/parkme` and
 `kthread_stop/park/unpark` use atomics + `wake_up_task` + the block's
 `ack` WaitQueue. Unbound threads go round-robin to APs (CPU 0 runs the
 cooperative user tasks). Standing threads: `ktimerd` (CPU 0, runs software
-timer callbacks), the system workqueue worker, `kselftest` (boot only).
+timer callbacks), the system workqueue worker, `softnet/N` (one per CPU,
+network receive; see 3.10), `kselftest` (boot only).
 
 Every online AP gets an idle task (`init_ap_schedulers`) and enters the
 scheduler from its boot idle loop. User tasks still run only on CPU 0. On
@@ -1496,8 +1497,9 @@ if self._guard.is_some() {
 
 ### 3.10 Device Drivers
 
-Device drivers use thread-context locks (Mutex, RwLock) rather than IrqSpinlock.
-ISRs set atomic flags but never acquire locks, deferring work to thread context.
+Device drivers use thread-context locks (Mutex, RwLock) for their state.
+ISRs only ack the device, set atomics and use IRQ-safe deferral
+(`napi_schedule`, `WaitQueue::wake_*`), deferring work to thread context.
 
 #### Device IRQ Registration (kernel/arch/{x86_64,aarch64}/irq.rs)
 
@@ -1555,41 +1557,72 @@ locks to avoid deadlock with the request queue.
 
 #### Network Subsystem
 
-**Location:** `kernel/net/`, `kernel/ns/net.rs`
+**Location:** `kernel/net/`, `kernel/net/core/dev.rs`, `kernel/ns/net.rs`
 
-> **Status (2026-10): being redesigned** by the network-stack chunk (NAPI-style
-> per-CPU `softnet` kthreads; all protocol work in thread context; per-socket
-> lock; per-netns table RwLocks). This section MUST be updated in the same
-> commit as each network locking change. The table below describes the code as
-> it exists before that work.
+**Execution model (NAPI-like, no softirqs).** No protocol code runs in
+interrupt context. A NIC ISR only reads/acks its interrupt cause, masks the
+device's interrupts and calls `napi_schedule()`. Per-CPU `softnet/N`
+kthreads (one per CPU with a scheduler, `kthread_run` bound to CPU N) poll
+the scheduled NAPI contexts (weight 64, 300 packets per round, then
+`yield_now()` if work remains) and the CPU's `netif_rx` backlog, calling
+`netif_receive_skb()` -> EtherType handler (`ip_rcv`, `arp_rcv`) -> TCP/UDP/
+ICMP. `lo` transmits with `netif_rx()` into the sending CPU's backlog; the
+transmit path therefore never re-enters the receive path. A sending socket
+syscall then runs `netif_rx_flush_local()` at a point where it holds no
+locks (Linux runs pending softirqs at `local_bh_enable()` after
+`dev_queue_xmit`), so loopback data is normally queued at the peer before
+`sendto()` returns. A received packet's namespace is its device's
+(`skb.net()`), never `current_net_ns()`; a socket's is `Socket.net`.
 
-| Lock | Type | Purpose |
-|------|------|---------|
-| `Socket.local_addr` | `Mutex` | Per-socket local address |
-| `Socket.remote_addr` | `Mutex` | Per-socket remote address |
-| `Socket.rx_buffer` | `Mutex` | Receive buffer (stream) |
-| `Socket.dgram_rx_queue` | `Mutex` | Datagram queue |
-| `TcpSock.retransmit_queue` | `Mutex` | TCP retransmit queue (never retransmitted yet) |
-| `E1000Driver.tx_*` | `Mutex` | TX ring management |
-| `NetNamespace` tables (routes, ARP, sockets) | `RwLock`/`Mutex` | Per-netns state |
+Today all device IRQs are routed to CPU 0 (PIC / GIC IROUTER) and user
+tasks run only on CPU 0, so in practice protocol work for eth0 and lo runs
+on CPU 0 (`softnet/0` or a CPU-0 task); kernel threads on other CPUs (e.g.
+the ICMP self-test on CPU 1) use their own CPU's softnet. The locks below
+do not rely on that.
 
-**Socket Lock Ordering:** When acquiring multiple socket locks, acquire in this order:
-1. `local_addr`
-2. `remote_addr`
-3. `rx_buffer` / `dgram_rx_queue`
+| Lock | Type | IRQ class | Notes |
+|------|------|-----------|-------|
+| `Softnet.poll_list` (per CPU) | `IrqSpinlock<VecDeque<Arc<Napi>>>` | taken in IRQ (`napi_schedule`) and by `softnet/N` | leaf; capacity reserved by `netif_napi_add`, so the ISR never allocates |
+| `Softnet.wq` (per CPU) | `WaitQueue` | woken from IRQ | leaf (see Wait Queues) |
+| `Softnet.backlog` (per CPU) | `spin::Mutex<VecDeque<Box<SkBuff>>>` | thread only (`netif_rx`, `softnet/N`, inline flush) | leaf; max 1000 packets, then drop + `rx_dropped` |
+| `Napi.sched` | `AtomicBool` | IRQ + thread | set by `napi_schedule` (only the setter queues it), cleared by `napi_complete_done` |
+| `PTYPE_BASE`, `PTYPE_ALL` | `spin::RwLock<Vec<..>>` | thread only | leaf; handler copied out, called after unlock |
+| `NAPI_LIST`, `SOFTNET_THREADS` | `spin::Mutex<Vec<..>>` | thread only | leaf; registration |
+| `TcpSock.sk_lock` | `spin::Mutex<()>` | thread only | Linux `lock_sock` (no backlog: input is thread context). Held by `tcp_rcv` per segment and by `tcp_sendmsg`/`tcp_connect`/`tcp_close`; never across a sleep |
+| `Socket.accept_queue` | `spin::Mutex` | thread only | under the listener's `sk_lock`; dropped before transmitting |
+| `Socket.{local,remote}_addr`, `rx_buffer`, `dgram_rx_queue`, `TcpSock.{retransmit,ooo}_queue` | `spin::Mutex` | thread only | leaf; TCP state/sequence numbers are atomics |
+| `NetNamespace` tables (`devices`, `routes`, `tcp_connections`, `tcp_listeners`, `udp_sockets`, `config`, `loopback`) | `spin::RwLock` | thread only | private; reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes: RCU-ready) |
+| `NetNamespace.arp_pending` -> `arp_entries` | `spin::Mutex` | thread only | `arp_resolve_or_queue` checks the cache and queues under `arp_pending`, so a racing reply cannot strand a packet; queue capped at 16 per address |
+| `NetDevice.net` | `spin::RwLock<Weak<NetNamespace>>` | thread only | read per received packet |
+| `NetDevice.ipv4_{addr,netmask}` | `spin::Mutex` | thread only | leaf |
+| `NetDevice.stats`, `flags`, `carrier` | atomics | any | |
 
-**TCP State:** Uses atomics (`AtomicU8` for state, `AtomicU32` for sequence numbers).
+**Lock order (outermost first):**
 
-**Current reality (pre-redesign):** no driver receives packets and no network
-code runs in IRQ context: the e1000 driver registers no IRQ handler, and
-loopback delivery is a synchronous call from the sender's syscall context
-(`ip_queue_xmit` shortcut). None of these locks is IRQ-safe, so no network
-lock may ever be taken from an interrupt handler.
+```
+TcpSock.sk_lock (listener before child; a child is never locked while
+                 its creator holds the listener)
+  -> Socket.accept_queue / per-socket buffers
+  -> NetNamespace tables (RwLock; lookups drop the guard before returning)
+  -> arp_pending -> arp_entries
+  -> device TX lock (driver)
+  -> Softnet.backlog (lo xmit)           Softnet.poll_list / WaitQueue / rq
+                                          (IrqSpinlocks, innermost)
+```
+
+No network lock is held while taking a socket lock (lookups return `Arc`
+handles), and no lock is held across `netif_rx_flush_local()`.
+
+**Known gaps (later phases):** TCP has no timers/retransmit (P6); UDP/TCP
+tables are not unregistered on close (P4); neighbour state machine and
+ARP rate limiting (P5); RCU for the read-mostly tables (decision after P2,
+see plan 3a).
 
 #### Key Device Driver Rules
 
-1. **No IrqSpinlock in drivers** - All driver locks are thread-context only
-2. **ISRs set flags only** - Never acquire locks, defer to thread context
+1. **Driver locks are thread-context only** - ISR-shared state is atomics or
+   core IrqSpinlocks (`napi_schedule`, wait queues)
+2. **ISRs ack and defer** - never take a driver Mutex, defer to thread context
 3. **Atomics for hot paths** - Use atomics for frequently-accessed state
 4. **Completion callbacks are lock-free** - Don't acquire locks in bio/skb completion
 
@@ -1805,6 +1838,8 @@ percpu::preempt_enable();   // preempt_count--
 - `timer::check_timers()` (CPU 0 tick): peeks `TIMERS` (IrqSpinlock) and
   wakes `ktimerd`; timer callbacks themselves run in `ktimerd`, process
   context (they may send signals, take Mutexes, allocate)
+- `napi_schedule()` (NIC ISRs): `Softnet.poll_list` IrqSpinlock push
+  (pre-reserved, no allocation) and a wake of `softnet/N`
 - Workqueues have no IRQ-side work: the worker thread promotes expired
   delayed work itself, sleeping with a timeout until the next deadline
 - Set reschedule flags (atomic)
@@ -1825,7 +1860,7 @@ If interrupt context needs to trigger something that requires non-IRQ-safe locks
 1. Record the event (atomic, or an IrqSpinlock-protected queue)
 2. Wake a kernel thread (`WaitQueue::wake_*` / `wake_up_task`, IRQ-safe)
 3. The actual work is done in thread context (`ktimerd`, workqueue
-   workers; later softnet threads)
+   workers, `softnet/N` threads for network receive)
 
 Example: the CPU 0 tick notices an expired software timer and wakes
 `ktimerd`, which runs the callback (posix timers send signals there). The
@@ -1926,7 +1961,7 @@ Features present in Linux but not yet implemented in hk:
 |---------|-------|-----|--------|
 | `spin_lock_bh()` | Disables softirqs | N/A | No softirqs in hk |
 | Softirqs/Tasklets | Deferred interrupt work | Not implemented | ISRs must be minimal |
-| NAPI | Network interrupt mitigation | Not implemented (planned: softnet kthreads) | No network RX path yet |
+| NAPI | Network interrupt mitigation | NAPI-like: per-CPU `softnet/N` kthreads poll drivers | Receive processing in thread context |
 | Threaded IRQs | IRQ handlers in thread context | Not implemented | All IRQs run in interrupt context |
 | lockdep | Runtime deadlock detection | Not implemented | Manual ordering verification |
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
@@ -1937,9 +1972,9 @@ Features present in Linux but not yet implemented in hk:
 1. **No softirqs**: Device drivers cannot defer work to bottom-half context. All
    deferred work must use workqueues or be handled synchronously.
 
-2. **No NAPI (yet)**: Planned design: driver ISRs only ack/mask and schedule a
-   per-CPU `softnet` kthread that polls the device; protocol processing never
-   runs in interrupt context.
+2. **NAPI without softirqs**: driver ISRs only ack/mask and `napi_schedule`
+   a per-CPU `softnet/N` kthread that polls the device; protocol processing
+   never runs in interrupt context (see 3.10 Network Subsystem).
 
 3. **No lockdep**: Lock ordering must be verified manually via code review.
    Consider adding compile-time lock ordering enforcement in the future.

@@ -3,6 +3,8 @@
 //! This module handles Ethernet frame parsing, building, and
 //! EtherType demultiplexing.
 
+use crate::net::device::NetDevice;
+use crate::net::device::flags::IFF_LOOPBACK;
 use crate::net::skb::SkBuff;
 
 /// Ethernet address length
@@ -103,25 +105,50 @@ impl EthHdr {
     }
 }
 
-/// Determine protocol type and strip Ethernet header
+/// Classification of a received frame by destination MAC (Linux PACKET_*)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PktType {
+    /// To us
+    #[default]
+    Host,
+    /// To all
+    Broadcast,
+    /// To a group
+    Multicast,
+    /// To someone else (seen in promiscuous mode / by taps)
+    OtherHost,
+}
+
+/// Classify a received frame and strip its Ethernet header (Linux
+/// `eth_type_trans`)
 ///
-/// This is called by drivers after receiving a packet. It:
-/// 1. Parses the Ethernet header
-/// 2. Sets skb.protocol
-/// 3. Advances data pointer past Ethernet header
-///
-/// Returns the EtherType for dispatch.
-pub fn eth_type_trans(skb: &SkBuff) -> EtherType {
+/// Sets `skb.protocol`, `skb.pkt_type` and the MAC header offset, pulls
+/// the 14-byte header and returns the EtherType (host order), or None for
+/// a runt frame.
+pub fn eth_type_trans(skb: &mut SkBuff, dev: &NetDevice) -> Option<u16> {
     if skb.len() < ETH_HLEN {
-        return EtherType::Unknown(0);
+        return None;
     }
-
-    // Parse Ethernet header
     let data = skb.data();
-    let proto_bytes = [data[12], data[13]];
-    let proto = u16::from_be_bytes(proto_bytes);
+    let mut dest = [0u8; ETH_ALEN];
+    dest.copy_from_slice(&data[0..ETH_ALEN]);
+    let proto = u16::from_be_bytes([data[12], data[13]]);
 
-    EtherType::from_be(proto)
+    skb.pkt_type = if dest[0] & 0x01 != 0 {
+        if dest == ETH_BROADCAST {
+            PktType::Broadcast
+        } else {
+            PktType::Multicast
+        }
+    } else if dest == dev.mac() || dev.get_flags() & IFF_LOOPBACK != 0 {
+        PktType::Host
+    } else {
+        PktType::OtherHost
+    };
+    skb.protocol = EtherType::from_be(proto);
+    skb.mark_mac_header();
+    skb.pull(ETH_HLEN)?;
+    Some(proto)
 }
 
 /// Build an Ethernet header

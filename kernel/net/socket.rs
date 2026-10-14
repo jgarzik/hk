@@ -238,11 +238,25 @@ pub struct Socket {
     /// Wait queue for accept() blocking - separate from accept_queue to avoid
     /// holding the Mutex while waiting (which would deadlock with tcp_rcv)
     pub accept_wait: WaitQueue,
+
+    /// Network namespace the socket was created in (Linux sock_net): all
+    /// its table registrations, routing and output use it
+    pub net: Arc<crate::net::NetNamespace>,
 }
 
 impl Socket {
-    /// Create a new socket
+    /// Create a new socket in the current task's network namespace
     pub fn new(family: AddressFamily, sock_type: SocketType, protocol: i32) -> Arc<Self> {
+        Self::new_in(crate::net::current_net_ns(), family, sock_type, protocol)
+    }
+
+    /// Create a new socket in `net` (e.g. a TCP child in its listener's)
+    pub fn new_in(
+        net: Arc<crate::net::NetNamespace>,
+        family: AddressFamily,
+        sock_type: SocketType,
+        protocol: i32,
+    ) -> Arc<Self> {
         let tcp = if sock_type == SocketType::Stream && family == AddressFamily::Inet {
             Some(TcpSock::new())
         } else {
@@ -268,6 +282,7 @@ impl Socket {
             eof: AtomicBool::new(false),
             accept_queue: Mutex::new(None),
             accept_wait: WaitQueue::new(),
+            net,
         })
     }
 

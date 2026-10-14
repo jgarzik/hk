@@ -27,7 +27,7 @@ use alloc::sync::Arc;
 
 use crate::dma::DmaAddr;
 use crate::net::device::NetDevice;
-use crate::net::ethernet::EtherType;
+use crate::net::ethernet::{EtherType, PktType};
 use crate::net::ipv4::Ipv4Addr;
 
 /// Standard headroom to reserve for headers
@@ -81,6 +81,11 @@ pub struct SkBuff {
     // IP addresses (set by IP layer for routing)
     pub saddr: Option<Ipv4Addr>,
     pub daddr: Option<Ipv4Addr>,
+
+    /// Receive classification (set by eth_type_trans)
+    pub pkt_type: PktType,
+    /// Start of the MAC header in the buffer (null until received)
+    mac: *mut u8,
 }
 
 /// Checksum state for hardware offload
@@ -141,6 +146,8 @@ impl SkBuff {
             ip_summed: ChecksumState::None,
             saddr: None,
             daddr: None,
+            pkt_type: PktType::Host,
+            mac: core::ptr::null_mut(),
         }))
     }
 
@@ -318,6 +325,8 @@ impl SkBuff {
         self.ip_summed = ChecksumState::None;
         self.saddr = None;
         self.daddr = None;
+        self.pkt_type = PktType::Host;
+        self.mac = core::ptr::null_mut();
     }
 
     // Header offset helpers
@@ -355,6 +364,27 @@ impl SkBuff {
     /// Get MAC header as slice
     pub fn mac_header(&self) -> &[u8] {
         &self.data()[self.mac_header..]
+    }
+
+    /// Record the current data pointer as the start of the MAC header
+    pub fn mark_mac_header(&mut self) {
+        self.mac = self.data;
+    }
+
+    /// The received frame from its MAC header to the end (after the
+    /// header was pulled), if one was recorded
+    pub fn frame_from_mac(&self) -> Option<&[u8]> {
+        if self.mac.is_null() {
+            return None;
+        }
+        let len = self.tail as usize - self.mac as usize;
+        Some(unsafe { core::slice::from_raw_parts(self.mac, len) })
+    }
+
+    /// Network namespace of the skb's device (receive path: the namespace
+    /// the packet arrived in; never the current task's)
+    pub fn net(&self) -> Option<Arc<crate::net::NetNamespace>> {
+        self.dev.as_ref()?.net()
     }
 }
 

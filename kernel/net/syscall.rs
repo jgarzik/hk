@@ -170,7 +170,9 @@ pub fn sys_connect(fd: i32, addr: u64, addrlen: u64) -> i64 {
     }
 
     // Initiate connection
-    if let Err(e) = tcp::tcp_connect(&socket, remote_addr, remote_port) {
+    let r = tcp::tcp_connect(&socket, remote_addr, remote_port);
+    crate::net::dev::netif_rx_flush_local();
+    if let Err(e) = r {
         return e.sysret();
     }
 
@@ -223,12 +225,12 @@ pub fn sys_bind(fd: i32, addr: u64, addrlen: u64) -> i64 {
 
     // Allocate ephemeral port if port is 0
     if local_port == 0 {
-        local_port = crate::net::current_net_ns().alloc_port();
+        local_port = socket.net.alloc_port();
     }
 
     // Use configured IP if addr is 0.0.0.0
     if local_addr.is_unspecified()
-        && let Some(config) = crate::net::get_config()
+        && let Some(config) = socket.net.get_config()
     {
         local_addr = config.ipv4_addr;
     }
@@ -286,7 +288,9 @@ pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
 
     // Register in listener hash table (like inet_csk_listen_start)
     let (_, local_port) = socket.local_addr().unwrap();
-    crate::net::current_net_ns().tcp_listen_register(local_port, Arc::clone(&socket));
+    socket
+        .net
+        .tcp_listen_register(local_port, Arc::clone(&socket));
 
     0
 }
@@ -435,8 +439,8 @@ pub fn sys_socketpair(domain: i32, sock_type: i32, protocol: i32, sv: u64) -> i6
     let local_addr = Ipv4Addr::new(127, 0, 0, 1);
 
     // Allocate ports
-    let port1 = crate::net::current_net_ns().alloc_port();
-    let port2 = crate::net::current_net_ns().alloc_port();
+    let port1 = socket1.net.alloc_port();
+    let port2 = socket1.net.alloc_port();
 
     // Bind sockets
     socket1.set_local(local_addr, port1);
@@ -712,14 +716,18 @@ pub fn sys_sendmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
     match socket.sock_type {
         SocketType::Stream => {
             // For TCP, ignore dest - use connected address
-            match tcp::tcp_sendmsg(&socket, &data) {
+            let r = tcp::tcp_sendmsg(&socket, &data);
+            crate::net::dev::netif_rx_flush_local();
+            match r {
                 Ok(n) => n as i64,
                 Err(e) => e.sysret(),
             }
         }
         SocketType::Dgram => {
             // For UDP, use dest if provided, otherwise use connected address
-            match udp::udp_sendmsg(&socket, &data, dest) {
+            let r = udp::udp_sendmsg(&socket, &data, dest);
+            crate::net::dev::netif_rx_flush_local();
+            match r {
                 Ok(n) => n as i64,
                 Err(e) => e.sysret(),
             }
@@ -885,7 +893,9 @@ pub fn sys_shutdown(fd: i32, how: i32) -> i64 {
         }
         1 | 2 => {
             // SHUT_WR or SHUT_RDWR - close the connection
-            if let Err(e) = tcp::tcp_close(&socket) {
+            let r = tcp::tcp_close(&socket);
+            crate::net::dev::netif_rx_flush_local();
+            if let Err(e) = r {
                 return e.sysret();
             }
             if how == 2 {
@@ -1252,7 +1262,9 @@ pub fn sys_sendto(fd: i32, buf: u64, len: u64, _flags: i32, dest_addr: u64, addr
     match socket.sock_type {
         SocketType::Stream => {
             // TCP: use tcp_sendmsg (ignores dest_addr)
-            match tcp::tcp_sendmsg(&socket, data) {
+            let r = tcp::tcp_sendmsg(&socket, data);
+            crate::net::dev::netif_rx_flush_local();
+            match r {
                 Ok(n) => n as i64,
                 Err(e) => e.sysret(),
             }
@@ -1268,7 +1280,9 @@ pub fn sys_sendto(fd: i32, buf: u64, len: u64, _flags: i32, dest_addr: u64, addr
                 None
             };
 
-            match udp::udp_sendmsg(&socket, data, dest) {
+            let r = udp::udp_sendmsg(&socket, data, dest);
+            crate::net::dev::netif_rx_flush_local();
+            match r {
                 Ok(n) => n as i64,
                 Err(e) => e.sysret(),
             }

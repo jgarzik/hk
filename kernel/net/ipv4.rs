@@ -8,9 +8,10 @@ use alloc::sync::Arc;
 use core::fmt;
 
 use crate::net::KernelError;
+use crate::net::NetNamespace;
 use crate::net::arp;
-use crate::net::ethernet::{self, ETH_ALEN, ETH_HLEN, EtherType};
-use crate::net::route;
+use crate::net::device::flags::IFF_LOOPBACK;
+use crate::net::ethernet::{self, ETH_ALEN, EtherType};
 use crate::net::skb::SkBuff;
 use crate::net::tcp;
 use crate::net::udp;
@@ -266,15 +267,11 @@ pub fn pseudo_header_checksum(saddr: Ipv4Addr, daddr: Ipv4Addr, protocol: u8, le
     sum
 }
 
-/// Receive an IP packet
+/// Receive an IP packet (EtherType 0x0800 handler; thread context)
 ///
-/// Called by the Ethernet layer after identifying IPv4 protocol.
+/// `skb.data()` starts at the IP header (eth_type_trans pulled the MAC
+/// header). The packet's namespace is its device's.
 pub fn ip_rcv(mut skb: SkBuff) {
-    // Skip Ethernet header
-    if skb.pull(ETH_HLEN).is_none() {
-        return;
-    }
-
     if skb.len() < IP_HLEN_MIN {
         return;
     }
@@ -337,72 +334,48 @@ pub fn ip_rcv(mut skb: SkBuff) {
     }
 }
 
-/// Queue a packet for transmission
+/// Queue a packet for transmission in namespace `net`
 ///
 /// This function:
-/// 1. Looks up the route
+/// 1. Picks the output device: local destinations (127/8 or an address of
+///    this namespace) go through `lo`; others use the routing table
 /// 2. Builds the IP header
-/// 3. Resolves the next-hop MAC via ARP
-/// 4. Builds the Ethernet header
-/// 5. Transmits via the device
-pub fn ip_queue_xmit(mut skb: Box<SkBuff>, protocol: u8) -> Result<(), KernelError> {
+/// 3. Resolves the next-hop MAC (ARP; `lo` needs none)
+/// 4. Builds the Ethernet header and transmits via the device
+///
+/// Never delivers synchronously: `lo` queues to the receive backlog.
+/// Callers may hold a socket lock (lock order: socket -> netns tables ->
+/// ARP -> device TX).
+pub fn ip_queue_xmit(
+    net: &NetNamespace,
+    mut skb: Box<SkBuff>,
+    protocol: u8,
+) -> Result<(), KernelError> {
     let daddr = skb.daddr.ok_or(KernelError::InvalidArgument)?;
-    let config = crate::net::get_config().ok_or(KernelError::InvalidArgument)?;
 
-    // For loopback destinations, use loopback as source address
-    let saddr = if daddr.is_loopback() {
-        skb.saddr.unwrap_or(daddr) // Use loopback address
+    // Route: local destinations via lo (Linux local table), else the FIB
+    let (dev, next_hop) = if net.is_local_addr(daddr) {
+        (
+            net.loopback().ok_or(KernelError::NetworkUnreachable)?,
+            daddr,
+        )
     } else {
-        skb.saddr.unwrap_or(config.ipv4_addr)
+        net.route_lookup(daddr)?
     };
 
-    // Loopback shortcut: deliver locally without going through network device
-    let is_local = daddr.is_loopback() || daddr == config.ipv4_addr || daddr == saddr;
-    if is_local {
-        // Build IP header for loopback
-        let payload_len = skb.len();
-        let tot_len = (IP_HLEN_MIN + payload_len) as u16;
-
-        let ip_hdr = skb.push(IP_HLEN_MIN).ok_or(KernelError::NoBufferSpace)?;
-        ip_hdr[0] = 0x45; // Version (4) + IHL (5)
-        ip_hdr[1] = 0; // TOS
-        ip_hdr[2..4].copy_from_slice(&tot_len.to_be_bytes());
-        ip_hdr[4..6].copy_from_slice(&next_ip_id().to_be_bytes());
-        ip_hdr[6] = 0x40; // Don't Fragment
-        ip_hdr[7] = 0;
-        ip_hdr[8] = IP_DEFAULT_TTL;
-        ip_hdr[9] = protocol;
-        ip_hdr[10] = 0; // Checksum (computed below)
-        ip_hdr[11] = 0;
-        ip_hdr[12..16].copy_from_slice(&saddr.to_be_bytes());
-        ip_hdr[16..20].copy_from_slice(&daddr.to_be_bytes());
-
-        let checksum = ip_checksum(&ip_hdr[..IP_HLEN_MIN]);
-        ip_hdr[10..12].copy_from_slice(&checksum.to_be_bytes());
-
-        // Unbox and prepare for receive path
-        let mut loopback_skb = *skb;
-        loopback_skb.saddr = Some(saddr);
-        loopback_skb.daddr = Some(daddr);
-        loopback_skb.ip_protocol = protocol;
-
-        // Set transport header offset and skip IP header
-        loopback_skb.set_transport_header(IP_HLEN_MIN);
-        if loopback_skb.pull(IP_HLEN_MIN).is_none() {
-            return Err(KernelError::InvalidArgument);
+    // Source address: the caller's, else the output device's
+    let saddr = match skb.saddr {
+        Some(a) if !a.is_unspecified() => a,
+        _ => {
+            if daddr.is_loopback() {
+                Ipv4Addr::new(127, 0, 0, 1)
+            } else {
+                dev.ipv4_addr()
+                    .or_else(|| net.get_config().map(|c| c.ipv4_addr))
+                    .ok_or(KernelError::AddressNotAvailable)?
+            }
         }
-
-        // Dispatch to transport layer
-        match protocol {
-            IPPROTO_TCP => tcp::tcp_rcv(loopback_skb),
-            IPPROTO_UDP => udp::udp_rcv(loopback_skb),
-            _ => {}
-        }
-        return Ok(());
-    }
-
-    // Route lookup
-    let (dev, next_hop) = route::route_lookup(daddr)?;
+    };
 
     // Build IP header
     let payload_len = skb.len();
@@ -440,9 +413,14 @@ pub fn ip_queue_xmit(mut skb: Box<SkBuff>, protocol: u8) -> Result<(), KernelErr
     // Set device on skb
     skb.dev = Some(Arc::clone(&dev));
 
+    // Loopback has no link-layer resolution (Linux: NUD_NOARP neighbour)
+    if dev.get_flags() & IFF_LOOPBACK != 0 {
+        return ip_finish_output(skb, dev.mac());
+    }
+
     // Resolve next-hop MAC address and transmit
     // arp_resolve either transmits immediately (MAC cached) or queues for later (ARP pending)
-    arp::arp_resolve(&dev, next_hop, skb)
+    arp::arp_resolve(net, &dev, next_hop, skb)
 }
 
 /// Build IP header and transmit (called by ARP when resolution completes)
@@ -455,5 +433,5 @@ pub fn ip_finish_output(mut skb: Box<SkBuff>, dest_mac: [u8; ETH_ALEN]) -> Resul
         .ok_or(KernelError::NoBufferSpace)?;
 
     // Transmit
-    crate::net::dev_queue_xmit(skb)
+    crate::net::dev::dev_queue_xmit(skb)
 }
