@@ -386,7 +386,7 @@ use crate::task::prctl_ops::{PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSE
 /// Returns 0 on success (or value for GET operations), negative errno on error.
 pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 {
     use crate::arch::Uaccess;
-    use crate::task::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_ROOT, SUID_DUMP_USER};
+    use crate::task::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_USER};
     use crate::task::percpu::{TASK_TABLE, current_tid};
     use crate::uaccess::{get_user, put_user};
 
@@ -479,11 +479,12 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
         }
 
         PR_SET_DUMPABLE => {
-            // Set dumpable flag (0, 1, or 2)
-            let value = arg2 as u8;
-            if value != SUID_DUMP_DISABLE && value != SUID_DUMP_USER && value != SUID_DUMP_ROOT {
+            // Only 0/1 are settable; SUID_DUMP_ROOT (2) is reserved to the
+            // suid_dumpable sysctl (Linux kernel/sys.c PR_SET_DUMPABLE)
+            if arg2 != SUID_DUMP_DISABLE as u64 && arg2 != SUID_DUMP_USER as u64 {
                 return KernelError::InvalidArgument.sysret();
             }
+            let value = arg2 as u8;
 
             let mut table = TASK_TABLE.lock();
             if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {

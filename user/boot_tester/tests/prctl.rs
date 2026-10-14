@@ -139,19 +139,13 @@ fn test_prctl_dumpable() {
         return;
     }
 
-    // Set to SUID_DUMP_ROOT
+    // SUID_DUMP_ROOT is only a suid_dumpable sysctl value; prctl accepts
+    // just 0/1 (Linux kernel/sys.c PR_SET_DUMPABLE)
     let ret = sys_prctl(PR_SET_DUMPABLE, SUID_DUMP_ROOT as u64, 0, 0, 0);
-    if ret != 0 {
+    if ret != -22 {
         print(b"PRCTL_DUMPABLE:FAIL: set ROOT returned ");
         print_num(ret);
-        return;
-    }
-
-    // Verify it was set
-    let ret = sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
-    if ret != SUID_DUMP_ROOT as i64 {
-        print(b"PRCTL_DUMPABLE:FAIL: get after set ROOT returned ");
-        print_num(ret);
+        print(b", expected -22 (EINVAL)");
         return;
     }
 
