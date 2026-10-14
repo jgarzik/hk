@@ -559,12 +559,15 @@ pub struct BitmapFrameAllocator {
 
 ```rust
 pub struct HeapAllocator {
-    inner: Mutex<HeapAllocatorInner>,
+    inner: IrqSpinlock<HeapAllocatorInner>,
 }
 ```
 
-- Single `Mutex` protects the free list
-- **NOT IRQ-safe** - must not be called from interrupt context
+- Single `IrqSpinlock` protects the free list (fixed-size heap, never
+  grows, so it takes no other lock): an allocation in interrupt context
+  cannot deadlock against an interrupted allocator
+- Policy is still **no allocation in IRQ context** (failure handling and
+  latency); IRQ paths reserve capacity up front (e.g. `netif_napi_add`)
 - Implements `GlobalAlloc` trait
 - Used by Rust's `alloc` crate for `Box`, `Vec`, `String`, etc.
 
@@ -1859,7 +1862,8 @@ percpu::preempt_enable();   // preempt_count--
 
 ### 7.2 What CANNOT Run in Interrupt Context
 
-- **Memory allocation** (heap/frame allocator use Mutex)
+- **Memory allocation** (frame allocator is a Mutex; the heap is IRQ-safe
+  but IRQ paths must not depend on allocating)
 - **TASK_TABLE access** (uses Mutex)
 - **VFS operations** (use RwLock)
 - **printk** (uses Mutex, consider try_lock for exceptions)
@@ -1895,7 +1899,6 @@ interrupt-safety invariant:
 | `TASK_TLS` | kernel/task/tls.rs | `Mutex` | TLS base addresses |
 | `UID_PROCESS_COUNT` | kernel/task/mod.rs | `Mutex` | RLIMIT_NPROC tracking |
 | `FRAME_ALLOCATOR` | kernel/frame_alloc.rs | `Mutex` | Physical frame allocation |
-| Heap allocator | kernel/heap.rs | `Mutex` | Kernel heap allocation |
 | `PAGE_CACHE` | core/page_cache.rs | `Mutex` | Page cache lookup |
 | All VFS locks | kernel/fs/*.rs | `RwLock` | Inodes, dentries, mounts |
 
