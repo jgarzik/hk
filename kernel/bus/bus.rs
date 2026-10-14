@@ -262,7 +262,7 @@ impl BusManager {
         self.buses.insert(name.to_string(), bus);
 
         // Process any new buses created during enumeration
-        let new_buses: Vec<_> = ctx.new_buses.drain(..).collect();
+        let new_buses = core::mem::take(&mut ctx.new_buses);
         for (new_name, new_bus) in new_buses {
             self.register_bus(new_name, new_bus);
             // Recursively enumerate the new bus

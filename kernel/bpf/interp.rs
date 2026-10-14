@@ -57,13 +57,7 @@ pub unsafe fn bpf_run(prog: &[BpfInsn], ctx: *const u8, ctx_len: usize) -> u64 {
                     BPF_ADD => dst_val.wrapping_add(src_val),
                     BPF_SUB => dst_val.wrapping_sub(src_val),
                     BPF_MUL => dst_val.wrapping_mul(src_val),
-                    BPF_DIV => {
-                        if src_val == 0 {
-                            0
-                        } else {
-                            dst_val / src_val
-                        }
-                    }
+                    BPF_DIV => dst_val.checked_div(src_val).unwrap_or(0),
                     BPF_OR => dst_val | src_val,
                     BPF_AND => dst_val & src_val,
                     BPF_LSH => dst_val << (src_val & 0x3f),

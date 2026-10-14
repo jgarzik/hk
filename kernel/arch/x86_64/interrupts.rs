@@ -830,15 +830,13 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
         None => {
             // No VMA found - try stack expansion for VM_GROWSDOWN VMAs
             // Linux: mm/memory.c expand_stack() called from __do_page_fault()
-            if let Some(vma_idx) = mm_guard.find_expandable_vma(fault_addr) {
-                if mm_guard.expand_downwards(vma_idx, fault_addr).is_err() {
-                    return Some(false); // Expansion failed
-                }
-                // Re-lookup the VMA after expansion
-                mm_guard.find_vma(fault_addr)?
-            } else {
-                return None; // No VMA and no expandable VMA
+            // No VMA and no expandable VMA -> None
+            let vma_idx = mm_guard.find_expandable_vma(fault_addr)?;
+            if mm_guard.expand_downwards(vma_idx, fault_addr).is_err() {
+                return Some(false); // Expansion failed
             }
+            // Re-lookup the VMA after expansion
+            mm_guard.find_vma(fault_addr)?
         }
     };
 

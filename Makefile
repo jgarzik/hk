@@ -203,13 +203,16 @@ info-arm: build-arm
 # Code quality targets
 # ============================================================================
 
+# Extra clippy args, e.g. CLIPPY_FLAGS="-D warnings" (CI)
+CLIPPY_FLAGS ?=
+
 # Run clippy for x86-64 kernel (must specify target for no_std)
 clippy:
-	cargo clippy --target $(TARGET) -p hk-kernel
+	cargo clippy --target $(TARGET) -p hk-kernel -- $(CLIPPY_FLAGS)
 
 # Run clippy for aarch64 kernel
-clippy-arm:
-	cargo clippy --target $(TARGET_ARM) -p hk-kernel
+clippy-arm: user-arm
+	cargo clippy --target $(TARGET_ARM) -p hk-kernel -- $(CLIPPY_FLAGS)
 
 # Format all code
 fmt:

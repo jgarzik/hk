@@ -457,7 +457,9 @@ fn bpf_prog_load(attr_buf: &[u8]) -> i64 {
 
     // Convert bytes to instructions
     let insns: Vec<BpfInsn> = insn_buf
-        .chunks_exact(size_of::<BpfInsn>())
+        .as_chunks::<{ size_of::<BpfInsn>() }>()
+        .0
+        .iter()
         .map(|chunk| unsafe { core::ptr::read_unaligned(chunk.as_ptr() as *const BpfInsn) })
         .collect();
 

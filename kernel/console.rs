@@ -160,8 +160,8 @@ impl ConsoleRegistry {
         flags: ConsoleFlags,
     ) -> bool {
         // Check if already registered
-        for i in 0..self.count {
-            if let Some(existing) = self.consoles[i].console
+        for entry in &self.consoles[..self.count] {
+            if let Some(existing) = entry.console
                 && existing.name() == console.name()
             {
                 return false;
@@ -204,8 +204,8 @@ impl ConsoleRegistry {
     /// unregistration.
     pub fn unregister(&mut self, name: &str) -> bool {
         // First, find and flush the console before removal
-        for i in 0..self.count {
-            if let Some(console) = self.consoles[i].console
+        for entry in &self.consoles[..self.count] {
+            if let Some(console) = entry.console
                 && console.name() == name
             {
                 console.flush();
@@ -236,8 +236,8 @@ impl ConsoleRegistry {
         if found {
             self.count = write_idx;
             // Clear remaining entries
-            for i in write_idx..MAX_CONSOLES {
-                self.consoles[i] = ConsoleEntry::empty();
+            for entry in &mut self.consoles[write_idx..] {
+                *entry = ConsoleEntry::empty();
             }
         }
 
@@ -257,9 +257,9 @@ impl ConsoleRegistry {
     ///
     /// Only writes to consoles with ENABLED flag set.
     pub fn write_all(&self, data: &[u8]) {
-        for i in 0..self.count {
-            if let Some(console) = self.consoles[i].console
-                && self.consoles[i].flags.contains(ConsoleFlags::ENABLED)
+        for entry in &self.consoles[..self.count] {
+            if let Some(console) = entry.console
+                && entry.flags.contains(ConsoleFlags::ENABLED)
             {
                 console.write(data);
             }
@@ -268,8 +268,8 @@ impl ConsoleRegistry {
 
     /// Flush all consoles
     pub fn flush_all(&self) {
-        for i in 0..self.count {
-            if let Some(console) = self.consoles[i].console {
+        for entry in &self.consoles[..self.count] {
+            if let Some(console) = entry.console {
                 console.flush();
             }
         }
@@ -299,12 +299,9 @@ impl ConsoleRegistry {
 
     /// Check if any boot consoles are registered
     pub fn has_boot_consoles(&self) -> bool {
-        for i in 0..self.count {
-            if self.consoles[i].flags.contains(ConsoleFlags::BOOT) {
-                return true;
-            }
-        }
-        false
+        self.consoles[..self.count]
+            .iter()
+            .any(|entry| entry.flags.contains(ConsoleFlags::BOOT))
     }
 
     /// Collect names of boot consoles for later unregistration
@@ -314,9 +311,9 @@ impl ConsoleRegistry {
     fn boot_console_names(&self) -> [Option<&'static str>; MAX_CONSOLES] {
         let mut names = [None; MAX_CONSOLES];
         let mut idx = 0;
-        for i in 0..self.count {
-            if self.consoles[i].flags.contains(ConsoleFlags::BOOT)
-                && let Some(console) = self.consoles[i].console
+        for entry in &self.consoles[..self.count] {
+            if entry.flags.contains(ConsoleFlags::BOOT)
+                && let Some(console) = entry.console
             {
                 names[idx] = Some(console.name());
                 idx += 1;

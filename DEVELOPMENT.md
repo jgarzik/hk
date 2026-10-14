@@ -22,7 +22,7 @@ sudo apt install gcc-aarch64-linux-gnu
 
 ### Rust Components
 
-The project uses nightly Rust. Components are specified in `rust-toolchain.toml` and should be installed automatically. If needed:
+The project uses stable Rust (no nightly features). Toolchain, components and targets are specified in `rust-toolchain.toml` and should be installed automatically. If needed:
 
 ```bash
 rustup target add x86_64-unknown-none
@@ -72,7 +72,7 @@ Userspace builds automatically as part of `make check`/`make check-arm`:
 
 ```bash
 cd user && make             # x86-64 userspace
-cd user && make arm         # aarch64 userspace
+cd user && make ARCH=aarch64 # aarch64 userspace
 ```
 
 The userspace build creates:
@@ -106,8 +106,8 @@ make run-arm        # aarch64
 ./run-qemu.sh -g        # Enable GDB server on port 1234
 
 # aarch64
-./run-qemu-arm.sh       # Basic run
-./run-qemu-arm.sh -d    # Debug mode
+./run-qemu.sh --arch arm     # Basic run
+./run-qemu.sh --arch arm -d  # Debug mode
 ```
 
 ### QEMU Configuration
@@ -134,7 +134,7 @@ make check          # Build x86-64 + run boot tests
 make check-arm      # Build aarch64 + run boot tests
 ```
 
-Tests are defined in `user/tests/*.rs` and cover:
+Tests are defined in `user/boot_tester/tests/*.rs` and cover:
 - Process management (fork, exec, clone, signals)
 - Memory management (mmap, mlock, munmap)
 - File system operations
@@ -264,9 +264,8 @@ which qemu-system-aarch64
 
 ### Build fails with target errors
 
-Ensure the nightly toolchain and targets are installed:
+`rust-toolchain.toml` should install these automatically; if not:
 ```bash
-rustup override set nightly
 rustup target add x86_64-unknown-none aarch64-unknown-none
 rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 ```
@@ -283,7 +282,7 @@ sudo apt install gcc-aarch64-linux-gnu
 Run with debug mode to see the error:
 ```bash
 ./run-qemu.sh -d        # x86-64
-./run-qemu-arm.sh -d    # aarch64
+./run-qemu.sh --arch arm -d  # aarch64
 ```
 
 Or enable GDB for step-by-step debugging:

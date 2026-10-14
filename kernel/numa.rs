@@ -119,9 +119,9 @@ impl NumaTopology {
         node.present_pages = total_pages;
 
         // Assign all CPUs to node 0
-        for cpu in 0..nr_cpus.min(64) {
+        for (cpu, slot) in self.cpu_to_node[..nr_cpus.min(64)].iter_mut().enumerate() {
             node.add_cpu(cpu as u32);
-            self.cpu_to_node[cpu] = 0;
+            *slot = 0;
         }
 
         self.nodes[0] = Some(node);
@@ -164,13 +164,13 @@ impl NumaTopology {
 
     /// Initialize default distances (LOCAL for same node, REMOTE for different)
     pub fn init_default_distances(&mut self) {
-        for from in 0..MAX_NUMA_NODES {
-            for to in 0..MAX_NUMA_NODES {
-                if from == to {
-                    self.distance[from][to] = LOCAL_DISTANCE;
+        for (from, row) in self.distance.iter_mut().enumerate() {
+            for (to, dist) in row.iter_mut().enumerate() {
+                *dist = if from == to {
+                    LOCAL_DISTANCE
                 } else {
-                    self.distance[from][to] = REMOTE_DISTANCE;
-                }
+                    REMOTE_DISTANCE
+                };
             }
         }
     }
@@ -287,8 +287,8 @@ pub fn print_topology() {
     }
 
     crate::printkln!("NUMA: {} node(s) online", topology.nr_nodes);
-    for node_id in 0..MAX_NUMA_NODES {
-        if let Some(node) = &topology.nodes[node_id] {
+    for (node_id, node) in topology.nodes.iter().enumerate() {
+        if let Some(node) = node {
             let mb = node.memory_size() / (1024 * 1024);
             let cpus = node.cpu_mask.count_ones();
             crate::printkln!(

@@ -162,10 +162,8 @@ pub fn sys_connect(fd: i32, addr: u64, addrlen: u64) -> i64 {
     if let Some(ref tcp) = socket.tcp {
         match tcp.state() {
             TcpState::Established => return KernelError::AlreadyConnected.sysret(),
-            TcpState::SynSent | TcpState::SynReceived => {
-                if socket.is_nonblocking() {
-                    return KernelError::AlreadyInProgress.sysret();
-                }
+            TcpState::SynSent | TcpState::SynReceived if socket.is_nonblocking() => {
+                return KernelError::AlreadyInProgress.sysret();
             }
             _ => {}
         }

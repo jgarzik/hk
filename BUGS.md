@@ -4,7 +4,7 @@
 
 **Status**: Unresolved (workaround in place)
 **Discovered**: During USB Mass Storage driver implementation
-**Location**: `kernel/platform/usb/msc.rs`
+**Location**: `kernel/usb/msc.rs`
 **Affects**: `UsbMscDevice` struct stored in `Arc<T>` within a static `Mutex<Option<Arc<T>>>`
 
 ### Symptoms
@@ -104,7 +104,7 @@ These are set during probe and used in `execute()` and `bot_transfer()` instead 
 
 ### Files Involved
 
-- `kernel/platform/usb/msc.rs` - Contains workaround
+- `kernel/usb/msc.rs` - Contains workaround
 - `kernel/core/heap.rs` - Heap allocator (prime suspect)
 - `kernel/core/frame.rs` - Frame allocator
-- `kernel/platform/usb/serial.rs` - USB-serial driver (runs between set/get)
+- `kernel/usb/serial.rs` - USB-serial driver (runs between set/get)

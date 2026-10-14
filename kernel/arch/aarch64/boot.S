@@ -204,7 +204,7 @@ ap_entry_point:
  * BSS section symbols (defined by linker script)
  */
 .section .bss
-.align 16
+.balign 16                  /* 16-byte (AAPCS64 SP); .align N is 2^N on arm */
 __stack_bottom:
     .skip 32768                 /* 32KB stack for BSP */
 .global __stack_top

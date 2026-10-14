@@ -258,18 +258,12 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
     } else {
         IPC_PERM_READ | IPC_PERM_WRITE
     };
-    if let Err(e) = ipc_checkperm(perm, access) {
-        perm.put_ref();
-        return Err(e);
-    }
+    ipc_checkperm(perm, access)?;
 
     // Get the ShmidKernel (safe downcast with type verification)
     let shm_kernel: &ShmidKernel = match downcast_shm(shm_obj.as_ref()) {
         Some(shm) => shm,
-        None => {
-            perm.put_ref();
-            return Err(KernelError::InvalidArgument.errno());
-        }
+        None => return Err(KernelError::InvalidArgument.errno()),
     };
 
     let size = shm_kernel.segsz;
@@ -277,10 +271,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
     // Get task's mm
     let mm = match get_task_mm(tid) {
         Some(m) => m,
-        None => {
-            perm.put_ref();
-            return Err(KernelError::OutOfMemory.errno());
-        }
+        None => return Err(KernelError::OutOfMemory.errno()),
     };
 
     // Find address and create VMA
@@ -292,10 +283,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
             // Kernel chooses address
             match mm_guard.find_free_area(size as u64) {
                 Some(a) => a,
-                None => {
-                    perm.put_ref();
-                    return Err(KernelError::OutOfMemory.errno());
-                }
+                None => return Err(KernelError::OutOfMemory.errno()),
             }
         } else {
             // User requested specific address
@@ -303,7 +291,6 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
                 shmaddr & !(PAGE_SIZE as u64 - 1)
             } else {
                 if shmaddr & (PAGE_SIZE as u64 - 1) != 0 {
-                    perm.put_ref();
                     return Err(KernelError::InvalidArgument.errno());
                 }
                 shmaddr
@@ -312,7 +299,6 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
             // Check if requested range is available
             if mm_guard.overlaps(aligned_addr, aligned_addr + size as u64) {
                 if shmflg & SHM_REMAP == 0 {
-                    perm.put_ref();
                     return Err(KernelError::InvalidArgument.errno());
                 }
                 // SHM_REMAP: remove overlapping VMAs
@@ -340,7 +326,6 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
     // Map the physical frames into the process's page tables
     let cr3 = get_current_task_cr3();
     if cr3 == 0 {
-        perm.put_ref();
         return Err(KernelError::OutOfMemory.errno());
     }
 
@@ -389,7 +374,6 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
                     crate::arch::x86_64::interrupts::unmap_user_page(cr3, unmap_va);
                 }
                 drop(frames);
-                perm.put_ref();
                 return Err(KernelError::OutOfMemory.errno());
             }
         }
@@ -404,7 +388,6 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
                     crate::arch::aarch64::exceptions::unmap_user_page(cr3, unmap_va);
                 }
                 drop(frames);
-                perm.put_ref();
                 return Err(KernelError::OutOfMemory.errno());
             }
         }
@@ -420,7 +403,6 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
         .lpid
         .store(current_pid() as i32, Ordering::Relaxed);
 
-    perm.put_ref();
     Ok(addr)
 }
 
@@ -508,8 +490,6 @@ fn do_shmdt(shmaddr: u64) -> Result<i32, i32> {
             .lpid
             .store(current_pid() as i32, Ordering::Relaxed);
 
-        shm_obj.perm().put_ref();
-
         // If segment was marked for deletion and this was last attachment, destroy it
         if old_nattch == 1 && shm_obj.perm().is_deleted() {
             shm_obj.destroy();
@@ -558,7 +538,6 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                     .map_err(|_| KernelError::BadAddress.errno())?;
             }
 
-            shm.perm().put_ref();
             Ok(0)
         }
 
@@ -577,7 +556,6 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             let perm_mutable = unsafe { perm.mutable() };
             if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
                 drop(_lock);
-                perm.put_ref();
                 return Err(KernelError::NotPermitted.errno());
             }
 
@@ -593,16 +571,12 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
             // Update ctime (safe downcast with type verification)
             let shm_kernel: &ShmidKernel = match downcast_shm(shm.as_ref()) {
                 Some(shm) => shm,
-                None => {
-                    perm.put_ref();
-                    return Err(KernelError::InvalidArgument.errno());
-                }
+                None => return Err(KernelError::InvalidArgument.errno()),
             };
             shm_kernel
                 .ctim
                 .store(current_time_secs(), Ordering::Relaxed);
 
-            perm.put_ref();
             Ok(0)
         }
 
@@ -622,11 +596,9 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                 let perm_mutable = unsafe { perm.mutable_ref() };
                 if uid != perm_mutable.uid && uid != perm.cuid && uid != 0 {
                     drop(_lock);
-                    perm.put_ref();
                     return Err(KernelError::NotPermitted.errno());
                 }
             }
-            perm.put_ref();
 
             // Remove from ID table
             if let Some(removed) = ns.shm_ids().remove(shmid) {
@@ -645,11 +617,10 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
         SHM_LOCK | SHM_UNLOCK => {
             // Lock/unlock requires CAP_IPC_LOCK
             // For now, just validate and return success (no swap anyway)
-            let shm = ns
+            let _shm = ns
                 .shm_ids()
                 .find_by_id(shmid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
-            shm.perm().put_ref();
             Ok(0)
         }
 
