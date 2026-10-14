@@ -2,6 +2,8 @@
 
 use crate::arch::Uaccess;
 use crate::fs::path::{create_entry, delete_entry};
+use alloc::vec::Vec;
+
 use crate::fs::{DirContext, DirEntry, FileType, InodeMode, KernelError, dac};
 use crate::task::CAP_MKNOD;
 use crate::uaccess::{UaccessArch, copy_to_user, strncpy_from_user};
@@ -43,28 +45,42 @@ fn dt(t: FileType) -> u8 {
 /// Header size of a linux_dirent64 (name follows)
 const DIRENT_HDR: usize = core::mem::size_of::<LinuxDirent64>();
 
-/// Build one linux_dirent64 record in `rec`; returns its (8-aligned)
-/// length
-fn fill_dirent(rec: &mut [u8; DIRENT_HDR + 256 + 8], e: &DirEntry, d_off: u64) -> usize {
+/// Most bytes of records one getdents64 call gathers (a short read is
+/// fine: callers loop until 0)
+const GETDENTS_CHUNK: usize = 32 * 1024;
+
+/// Append one linux_dirent64 record for `e` to `buf` if it fits in
+/// `limit` bytes
+fn put_dirent(buf: &mut Vec<u8>, limit: usize, e: &DirEntry, d_off: u64) -> bool {
     let name_len = e.name.len().min(255);
     let reclen = (DIRENT_HDR + name_len + 1 + 7) & !7;
-    rec[..reclen].fill(0);
+    if buf.len() + reclen > limit {
+        return false;
+    }
+    let start = buf.len();
+    buf.resize(start + reclen, 0);
     let hdr = LinuxDirent64 {
         d_ino: e.ino,
         d_off: d_off as i64,
         d_reclen: reclen as u16,
         d_type: dt(e.file_type),
     };
-    // SAFETY: LinuxDirent64 is packed plain data; `rec` holds DIRENT_HDR bytes
-    unsafe { core::ptr::write_unaligned(rec.as_mut_ptr() as *mut LinuxDirent64, hdr) };
-    rec[DIRENT_HDR..DIRENT_HDR + name_len].copy_from_slice(&e.name[..name_len]);
-    reclen
+    // SAFETY: LinuxDirent64 is packed plain data and `buf` has
+    // DIRENT_HDR bytes at `start`
+    unsafe { core::ptr::write_unaligned(buf[start..].as_mut_ptr() as *mut LinuxDirent64, hdr) };
+    buf[start + DIRENT_HDR..start + DIRENT_HDR + name_len].copy_from_slice(&e.name[..name_len]);
+    true
 }
 
 /// sys_getdents64 - get directory entries (Linux getdents64 +
 /// iterate_dir): resumes at the file position, which ends up just past
 /// the last entry returned (the d_off cookie); 0 at the end. EINVAL if
 /// `count` cannot hold the next entry.
+///
+/// File systems emit entries while holding their directory locks
+/// (spinlocks in hk), so records are gathered into a kernel buffer of
+/// at most GETDENTS_CHUNK bytes and copied to user space only after
+/// `readdir` returned and every lock is dropped.
 pub fn sys_getdents64(fd: i32, dirp: u64, count: u64) -> i64 {
     let count = core::cmp::min(count as usize, MAX_RW_COUNT);
     if !Uaccess::access_ok(dirp, count) {
@@ -78,35 +94,31 @@ pub fn sys_getdents64(fd: i32, dirp: u64, count: u64) -> i64 {
         return KernelError::NotDirectory.sysret();
     }
 
-    let mut used = 0usize;
-    let mut err = None;
-    let mut rec = [0u8; DIRENT_HDR + 256 + 8];
+    let limit = count.min(GETDENTS_CHUNK);
+    let mut buf = Vec::new();
+    let mut full = false;
     let mut actor = |e: &DirEntry, d_off: u64| {
-        let len = fill_dirent(&mut rec, e, d_off);
-        if used + len > count {
-            err = Some(KernelError::InvalidArgument);
-            return false;
-        }
-        if copy_to_user::<Uaccess>(dirp + used as u64, &rec[..len]).is_err() {
-            err = Some(KernelError::BadAddress);
-            return false;
-        }
-        used += len;
-        true
+        full = !put_dirent(&mut buf, limit, e, d_off);
+        !full
     };
     let mut ctx = DirContext::new(file.get_pos(), &mut actor);
     let r = file.readdir(&mut ctx);
     let pos = ctx.pos;
-    file.set_pos(pos);
 
-    // Entries already copied win over a later error (Linux)
-    if used > 0 {
-        return used as i64;
+    if buf.is_empty() {
+        return match r {
+            Err(e) => e.sysret(),
+            // The next entry does not fit in `count`
+            Ok(()) if full => KernelError::InvalidArgument.sysret(),
+            Ok(()) => 0,
+        };
     }
-    match (r, err) {
-        (Err(e), _) | (Ok(()), Some(e)) => e.sysret(),
-        (Ok(()), None) => 0,
+    if copy_to_user::<Uaccess>(dirp, &buf).is_err() {
+        return KernelError::BadAddress.sysret();
     }
+    // Entries already gathered win over a later error (Linux)
+    file.set_pos(pos);
+    buf.len() as i64
 }
 
 /// sys_mkdir - create a directory

@@ -881,6 +881,22 @@ Without a per-superblock lock, this race is possible:
 
 Does not acquire `s_vfs_rename_mutex` - only the directory's `i_rwsem`.
 
+#### Directory Iteration (getdents64)
+
+Linux holds the directory's `i_rwsem` shared across `iterate_shared` and
+`filldir64` copies each record straight to user memory. hk file systems
+emit entries while holding spinlocks (ramfs `RamfsInodeData.children`
+read lock, procfs/cgroupfs inode-data read locks), so user memory must
+not be touched from the emit callback (a fault could sleep under a
+spinlock). `dir.rs::sys_getdents64` therefore gathers records into a
+kernel buffer bounded by `GETDENTS_CHUNK` (32 KiB, independent of the
+user `count`), and copies it to user space after `readdir` returned and
+every lock is dropped; a call may return fewer bytes than fit (callers
+loop until 0). Positions are stable cookies (ramfs per-directory
+position counter, vfat slot index, procfs pid/fd based), so nothing has
+to stay locked between calls. The file position is updated without a
+lock until `f_pos_lock` exists (see below).
+
 #### Inode Timestamp Locking (Linux i_rwsem Pattern)
 
 **Location:** `fs/inode.rs`, `fs/syscall.rs`
