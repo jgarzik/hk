@@ -22,6 +22,7 @@ hk: Rust (stable, no nightly features) no_std SMP kernel, x86-64 + aarch64, Linu
 - New syscall → add boot test in `user/boot_tester/tests/`, register in `tests/mod.rs::run_all_tests`, update `doc/SYSCALLS.md`.
 - Locking correctness is top priority (many-core). Read `doc/LOCKING.md` before touching locks. IRQ-reachable state → `IrqSpinlock`; never take `Mutex`/`RwLock` in IRQ context; never sleep holding a spinlock.
 - Every new/changed lock: state its IRQ class and lock-order position, and update the matching `doc/LOCKING.md` section in the SAME commit. Lock-order cycles and sleeping under a spinlock are critical bugs.
+- Style: small functions; short, Linux-kernel-style names (`tcp_rcv`, `fib::lookup` — the module path gives context), not sentence-length names.
 - `user/boot_tester` is no_std: provides its own `mem*`/`bcmp` symbols.
 
 ## Known issues
