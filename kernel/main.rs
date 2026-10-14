@@ -389,6 +389,12 @@ where
                         }
                     }
 
+                    // The page came whole from the file: clear what lies
+                    // past the segment's file data (.bss), which would
+                    // otherwise hold the following file bytes
+                    let file_end = seg_start + segment.file_size as u64;
+                    zero_bss(private_frame, va, file_end, seg_end);
+
                     private_frame
                 } else {
                     // Read-only segment: can share cached pages
@@ -444,6 +450,19 @@ where
     printkln!("Page cache: {}/{} pages", cached, max);
 
     Ok(())
+}
+
+/// Zero the part of the page at `va` (backed by `frame`) that lies in
+/// [file_end, mem_end): a segment's .bss (Linux padzero + anonymous
+/// pages)
+fn zero_bss(frame: u64, va: u64, file_end: u64, mem_end: u64) {
+    let lo = file_end.max(va);
+    let hi = mem_end.min(va + PAGE_SIZE);
+    if lo < hi {
+        unsafe {
+            ::core::ptr::write_bytes((frame + (lo - va)) as *mut u8, 0, (hi - lo) as usize);
+        }
+    }
 }
 
 /// Apply ELF relocations for PIE binaries

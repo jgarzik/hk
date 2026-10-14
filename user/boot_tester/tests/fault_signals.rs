@@ -209,6 +209,8 @@ fn verify(
     }
     print(b":FAIL: check ");
     print_num(err);
+    print(b" count=");
+    print_num(s.count as i64);
     print(b" signo=");
     print_num(s.signo as i64);
     print(b" code=");
