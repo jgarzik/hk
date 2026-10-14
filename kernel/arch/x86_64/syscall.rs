@@ -2037,6 +2037,12 @@ pub fn x86_64_syscall_dispatch(
         _ => (-38i64) as u64, // ENOSYS
     };
 
+    // Record the syscall result so a signal frame set up by do_signal() saves
+    // it; rt_sigreturn then returns it to the interrupted code.
+    unsafe {
+        crate::arch::x86_64::percpu::current_cpu_mut().syscall_user_rax = result;
+    }
+
     // Check for pending signals before returning to userspace
     // This may modify the saved user context to invoke the signal handler
     crate::signal::do_signal();

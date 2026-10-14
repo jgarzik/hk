@@ -88,6 +88,10 @@ pub struct PerCpu {
     pub syscall_user_r9: u64,
     pub syscall_user_r10: u64,
 
+    /// Syscall return value (user RAX), recorded before signal delivery so the
+    /// signal frame saves it and rt_sigreturn returns it to the interrupted code
+    pub syscall_user_rax: u64,
+
     /// Flag set when signal delivery modifies the return context
     /// When true, the syscall return path should update the stack frame from percpu
     pub signal_context_modified: bool,
@@ -124,6 +128,7 @@ impl PerCpu {
             syscall_user_r8: 0,
             syscall_user_r9: 0,
             syscall_user_r10: 0,
+            syscall_user_rax: 0,
             signal_context_modified: false,
         }
     }
