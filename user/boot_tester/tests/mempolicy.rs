@@ -226,8 +226,8 @@ fn test_migrate_pages_null_masks() {
 
     let ret = sys_migrate_pages(0, 64, core::ptr::null(), core::ptr::null());
 
-    // Should succeed with null masks (no-op)
-    if ret == 0 {
+    // NULL new_nodes is an empty mask: EINVAL (Linux kernel_migrate_pages)
+    if ret == -22 {
         println(b"PASS");
     } else {
         print(b"FAIL (ret=");
@@ -257,6 +257,9 @@ fn test_move_pages_query() {
         println(b")");
         return;
     }
+
+    // Populate the page: Linux reports -EFAULT status for unmapped pages
+    unsafe { core::ptr::write_volatile(ptr as *mut u8, 1) };
 
     let pages: [u64; 1] = [ptr as u64];
     let mut status: [i32; 1] = [-1];
@@ -304,6 +307,9 @@ fn test_move_pages_node0() {
         println(b")");
         return;
     }
+
+    // Populate the page: Linux reports -EFAULT status for unmapped pages
+    unsafe { core::ptr::write_volatile(ptr as *mut u8, 1) };
 
     let pages: [u64; 1] = [ptr as u64];
     let nodes: [i32; 1] = [0]; // Node 0
@@ -367,8 +373,9 @@ fn test_move_pages_invalid_node() {
 
     sys_munmap(ptr as u64, 4096);
 
-    // Syscall returns 0, but status should be -ENODEV (-19)
-    if ret == 0 && status[0] == -19 {
+    // An invalid target node fails the whole call with ENODEV
+    // (Linux mm/migrate.c do_pages_move)
+    if ret == -19 {
         println(b"PASS");
     } else {
         print(b"FAIL (ret=");
