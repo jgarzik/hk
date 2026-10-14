@@ -556,9 +556,12 @@ pub fn sys_gettid() -> i64 {
 }
 
 /// clone(flags, child_stack, parent_tidptr, child_tidptr, tls)
+///
+/// arm64 selects CONFIG_CLONE_BACKWARDS, so the raw syscall order is
+/// (flags, newsp, parent_tidptr, tls, child_tidptr).
 #[inline(always)]
 pub fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: u64, child_tidptr: u64, tls: u64) -> i64 {
-    unsafe { syscall5!(SYS_CLONE, flags, child_stack, parent_tidptr, child_tidptr, tls) }
+    unsafe { syscall5!(SYS_CLONE, flags, child_stack, parent_tidptr, tls, child_tidptr) }
 }
 
 /// fork() - compatibility wrapper using clone

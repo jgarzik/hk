@@ -16,7 +16,8 @@ use hk_syscall::{
     sys_set_tid_address, sys_setfsgid, sys_setfsuid,
     sys_setgid, sys_setpriority, sys_setregid, sys_setresgid, sys_setresuid, sys_setreuid,
     sys_setsid, sys_setuid, sys_sysinfo, sys_vfork, sys_wait4, sys_waitid, ioprio_prio_value,
-    SchedParam, SigInfo, Timespec, CLOCK_MONOTONIC, CLOCK_REALTIME, CLONE_VM, IOPRIO_CLASS_BE,
+    SchedParam, SigInfo, Timespec, CLOCK_MONOTONIC, CLOCK_REALTIME, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, CLONE_VM,
+    IOPRIO_CLASS_BE,
     IOPRIO_WHO_PROCESS, P_ALL, P_PID, PRIO_PROCESS, SCHED_NORMAL, WEXITED,
 };
 #[cfg(target_arch = "x86_64")]
@@ -38,6 +39,7 @@ pub fn run_tests() {
     test_getsid_esrch();
     test_setsid_eperm();
     test_clone();
+    test_clone_settid();
     test_fork();
     test_fork_memory_isolation();
     test_vfork();
@@ -290,6 +292,59 @@ fn test_clone() {
         } else {
             println(b"CLONE:FAIL");
         }
+    }
+}
+
+/// clone() with CLONE_PARENT_SETTID | CLONE_CHILD_SETTID (fork-style)
+///
+/// Exercises the per-arch raw clone() argument order: x86_64 is
+/// (flags, newsp, ptid, ctid, tls); arm64 selects CLONE_BACKWARDS
+/// (flags, newsp, ptid, tls, ctid). The sys_clone wrapper keeps the
+/// glibc-style (flags, stack, ptid, ctid, tls) signature on both arches.
+fn test_clone_settid() {
+    static mut PTID: i32 = 0;
+    static mut CTID: i32 = 0;
+    let ptid_ptr = core::ptr::addr_of_mut!(PTID);
+    let ctid_ptr = core::ptr::addr_of_mut!(CTID);
+    // Pre-fault the (demand-paged) static pages from user mode.
+    unsafe {
+        core::ptr::write_volatile(ptid_ptr, 0);
+        core::ptr::write_volatile(ctid_ptr, 0);
+    }
+
+    let flags = CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | 17; // SIGCHLD
+    let ret = sys_clone(flags, 0, ptid_ptr as u64, ctid_ptr as u64, 0);
+    if ret < 0 {
+        print(b"CLONE_SETTID:FAIL: clone returned ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+    if ret == 0 {
+        // Child: CLONE_CHILD_SETTID wrote our TID into our copy of CTID
+        let ctid = unsafe { core::ptr::read_volatile(ctid_ptr) };
+        sys_exit(if ctid as i64 == sys_gettid() { 0 } else { 1 });
+    }
+
+    let mut wstatus: i32 = 0;
+    let wait_ret = sys_wait4(ret, &mut wstatus, 0, 0);
+    let ptid = unsafe { core::ptr::read_volatile(ptid_ptr) };
+    let child_code = (wstatus >> 8) & 0xff;
+    if wait_ret != ret {
+        print(b"CLONE_SETTID:FAIL: wait4 returned ");
+        print_num(wait_ret);
+        println(b"");
+    } else if ptid <= 0 {
+        // Linux writes the child TID (== returned PID for a non-thread
+        // clone). hk numbers PIDs and TIDs separately, so only check
+        // that the parent TID was written.
+        print(b"CLONE_SETTID:FAIL: parent_tid not set: ");
+        print_num(ptid as i64);
+        println(b"");
+    } else if child_code != 0 {
+        println(b"CLONE_SETTID:FAIL: child_tid not set in child");
+    } else {
+        println(b"CLONE_SETTID:OK");
     }
 }
 
