@@ -539,10 +539,10 @@ pub mod prctl_ops {
     pub const PR_SET_TIMERSLACK: i32 = 29;
     /// Get timer slack value (nanoseconds)
     pub const PR_GET_TIMERSLACK: i32 = 30;
-    /// Get child subreaper flag
-    pub const PR_GET_CHILD_SUBREAPER: i32 = 36;
     /// Set child subreaper flag
-    pub const PR_SET_CHILD_SUBREAPER: i32 = 37;
+    pub const PR_SET_CHILD_SUBREAPER: i32 = 36;
+    /// Get child subreaper flag
+    pub const PR_GET_CHILD_SUBREAPER: i32 = 37;
     /// Disable privilege escalation via setuid/setgid (irreversible)
     pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
     /// Get no_new_privs flag

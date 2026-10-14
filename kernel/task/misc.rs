@@ -380,8 +380,8 @@ use crate::task::prctl_ops::{
 /// - PR_GET_NAME (16): Get thread name (arg2 = char* buffer)
 /// - PR_SET_TIMERSLACK (29): Set timer slack (arg2 = nanoseconds)
 /// - PR_GET_TIMERSLACK (30): Get timer slack (returns nanoseconds)
-/// - PR_SET_CHILD_SUBREAPER (37): Make process a subreaper (arg2 = 0 or 1)
-/// - PR_GET_CHILD_SUBREAPER (36): Get subreaper flag (arg2 = int* for result)
+/// - PR_SET_CHILD_SUBREAPER (36): Make process a subreaper (arg2 = 0 or 1)
+/// - PR_GET_CHILD_SUBREAPER (37): Get subreaper flag (arg2 = int* for result)
 /// - PR_SET_NO_NEW_PRIVS (38): Disable privilege escalation (arg2 = 1, irreversible)
 /// - PR_GET_NO_NEW_PRIVS (39): Get no_new_privs flag (returns 0 or 1)
 ///
