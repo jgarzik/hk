@@ -18,7 +18,6 @@ use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use crate::error::KernelError;
 use crate::net::NetNamespace;
 use crate::task::Cred;
-use crate::task::percpu::{MAX_SCHEDULE_TIMEOUT, ns_to_ticks};
 use crate::waitqueue::WaitQueue;
 
 /// Linux rmem_default / wmem_default and rmem_max / wmem_max
@@ -295,20 +294,21 @@ impl Sock {
         if timeo == 0 {
             return Err(KernelError::WouldBlock);
         }
-        let start = crate::time::monotonic_ns();
-        let ticks = if timeo == TIMEO_FOREVER {
-            MAX_SCHEDULE_TIMEOUT
-        } else {
-            ns_to_ticks(timeo).max(1)
-        };
-        match self.wq.wait_event_interruptible_timeout(&mut cond, ticks) {
-            Ok(0) => Err(KernelError::WouldBlock),
-            Ok(_) if timeo == TIMEO_FOREVER => Ok(timeo),
-            Ok(_) => {
-                let used = crate::time::monotonic_ns().saturating_sub(start);
-                Ok(timeo.saturating_sub(used).max(1))
-            }
-            Err(_) if timeo == TIMEO_FOREVER => Err(KernelError::RestartSys),
+        if timeo == TIMEO_FOREVER {
+            return match self.wq.wait_event_interruptible(&mut cond) {
+                Ok(()) => Ok(timeo),
+                Err(_) => Err(KernelError::RestartSys),
+            };
+        }
+        // A CLOCK_MONOTONIC deadline, so tick granularity never ends the
+        // wait early
+        let deadline = crate::time::monotonic_ns().saturating_add(timeo);
+        match self
+            .wq
+            .wait_event_interruptible_deadline(&mut cond, Some(deadline))
+        {
+            Ok(true) => Ok(deadline.saturating_sub(crate::time::monotonic_ns()).max(1)),
+            Ok(false) => Err(KernelError::WouldBlock),
             Err(_) => Err(KernelError::Interrupted),
         }
     }

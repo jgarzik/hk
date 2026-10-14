@@ -24,6 +24,7 @@ pub fn run_tests() {
     test_lo_counters();
     test_netns_proc_net_dev();
     test_eth0_dns();
+    test_eth0_dns_connected();
 }
 
 /// Read /proc/net/dev into `buf`; returns the length (or <0)
@@ -338,4 +339,43 @@ fn test_eth0_dns() {
         print_num(tx as i64);
         println(b")");
     }
+}
+
+/// glibc send_dg style over eth0 (after ETH0_DNS configured it): a
+/// connected UDP socket, send(), poll(POLLIN), recv(MSG_DONTWAIT);
+/// the source is the interface address and IP_PKTINFO names eth0
+fn test_eth0_dns_connected() {
+    use super::sk::*;
+    let mut t = T::new(b"ETH0_DNS_CONNECTED");
+    let fd = udp();
+    t.eq(b"connect", connect(fd, [10, 0, 2, 3], 53), 0);
+    let (ip, p) = name(fd);
+    t.ok(b"source", ip == [10, 0, 2, 15] && p != 0, ip[3] as i64);
+    setint(fd, SOL_IP, IP_PKTINFO, 1);
+    let mut q = [0u8; 64];
+    let mut id = 0x5a17u16;
+    let mut ok = false;
+    let mut ifidx = 0;
+    for _ in 0..3 {
+        let qlen = dns_query(id, &mut q);
+        if !t.eq(b"send", send(fd, &q[..qlen], 0), qlen as i64) {
+            break;
+        }
+        if poll1(fd, 1, 3000).1 & 1 != 0 {
+            let mut reply = [0u8; 512];
+            let mut ctl = [0u8; 64];
+            let (n, _, cl) = recv_msg(fd, &mut reply, &mut ctl, MSG_DONTWAIT);
+            if n >= 12 && u16::from_be_bytes([reply[0], reply[1]]) == id && reply[2] & 0x80 != 0 {
+                ok = true;
+                ifidx = cmsg_find(&ctl, cl, SOL_IP, IP_PKTINFO)
+                    .map_or(0, |d| i32::from_ne_bytes([d[0], d[1], d[2], d[3]]));
+                break;
+            }
+        }
+        id = id.wrapping_add(1);
+    }
+    t.ok(b"reply", ok, 0);
+    t.ok(b"pktinfo ifindex", !ok || ifidx > 1, ifidx as i64);
+    close(fd);
+    t.done();
 }

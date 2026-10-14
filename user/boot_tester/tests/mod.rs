@@ -23,6 +23,7 @@ pub mod sk;
 pub mod sockcore;
 pub mod udp;
 pub mod sockopts;
+pub mod nonblock;
 pub mod futex;
 pub mod timerfd;
 pub mod posix_timer;
@@ -83,6 +84,7 @@ pub fn run_all_tests() {
     sockcore::run_tests();
     udp::run_tests();
     sockopts::run_tests();
+    nonblock::run_tests();
     futex::run_tests();
     timerfd::run_tests();
     posix_timer::run_tests();

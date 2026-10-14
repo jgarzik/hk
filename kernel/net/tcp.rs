@@ -319,6 +319,9 @@ pub struct TcpSock {
     done: AtomicBool,
     /// Owns its local port in `TcpBind`
     bound: AtomicBool,
+    /// A non-blocking connect is in progress (Linux SS_CONNECTING): the
+    /// next connect() reports its outcome
+    connecting: AtomicBool,
     /// Registered connection tuple
     tuple: Mutex<Option<TcpFourTuple>>,
     /// Stored IPPROTO_TCP options, by option number
@@ -346,6 +349,7 @@ impl TcpSock {
             accept_queue: Mutex::new(None),
             done: AtomicBool::new(false),
             bound: AtomicBool::new(false),
+            connecting: AtomicBool::new(false),
             tuple: Mutex::new(None),
             opts: Mutex::new(BTreeMap::new()),
             me: me.clone(),
@@ -835,21 +839,33 @@ impl ProtoOps for TcpSock {
             *self.inet.addr.lock() = Default::default();
             return Ok(());
         }
-        match self.tcp.state() {
-            TcpState::SynSent | TcpState::SynReceived => {
-                if nonblock {
-                    return Err(KernelError::AlreadyInProgress);
-                }
-                return self.wait_connect(false);
+        let state = self.tcp.state();
+        if matches!(state, TcpState::SynSent | TcpState::SynReceived) {
+            if nonblock {
+                return Err(KernelError::AlreadyInProgress);
             }
-            TcpState::Closed => {}
-            _ => return Err(KernelError::AlreadyConnected),
+            let r = self.wait_connect(false);
+            self.connecting.store(false, Ordering::Release);
+            return r;
+        }
+        // The outcome of an earlier non-blocking connect (SS_CONNECTING)
+        if self.connecting.swap(false, Ordering::AcqRel) {
+            return match state {
+                TcpState::Closed => {
+                    Err(self.sk.take_err().unwrap_or(KernelError::ConnectionAborted))
+                }
+                _ => Ok(()),
+            };
+        }
+        if state != TcpState::Closed {
+            return Err(KernelError::AlreadyConnected);
         }
         let (daddr, dport) = af_inet::sin_parse(a, false)?;
         let r = self.start_connect(daddr, dport);
         crate::net::dev::netif_rx_flush_local();
         r?;
         if nonblock {
+            self.connecting.store(true, Ordering::Release);
             return Err(KernelError::InProgress);
         }
         self.wait_connect(false)
