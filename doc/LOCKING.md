@@ -928,8 +928,8 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
 
 #### File Writes and Positions (Linux i_rwsem / f_pos_lock)
 
-**Location:** `fs/file.rs` (`File::write_at`, `File::pos_lock`),
-`fs/io.rs` (`do_readv`, `do_writev`, `sys_lseek`), `fs/fd.rs`
+**Location:** `fs/file.rs` (`File::write_from`, `File::pos_lock`),
+`fs/io.rs` (`file_readv`, `file_writev`, `sys_lseek`), `fs/fd.rs`
 (`do_truncate`)
 
 - `File.f_pos_lock` (`sync::Mutex<()>`, Linux `f_pos_lock` with
@@ -940,16 +940,21 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
   position. Pipes, sockets and devices are not position-based and skip
   it, as in Linux.
 - `Inode.i_rwsem` is held across every write to a regular file
-  (`File::write_at`, i.e. write/writev/pwrite/pwritev*/io_uring/splice
+  (`File::write_from`, i.e. write/writev/pwrite/pwritev*/io_uring/splice
   users of `File::write`/`pwrite`): with O_APPEND (or RWF_APPEND) the
   position is set to `i_size` under the lock, so appends from separate
   open files never overlap, and the data copy, the size update,
   RLIMIT_FSIZE check and set-id stripping are atomic with respect to
   other writers. `truncate`/`ftruncate`/O_TRUNC take it too (Linux
   do_truncate). Reads do not take it (Linux generic_file_read_iter).
-- User data is copied into a kernel buffer before `f_pos_lock`/`i_rwsem`
-  are taken (and copied out after the read returns), so no user page
-  fault happens under them.
+- Data moves between user memory and the file through a kernel buffer
+  of at most 64 KiB (`file::WRITE_CHUNK`) per step, so one call never
+  pins more kernel memory than that (a full-size buffer per blocked
+  reader exhausted the heap). As in Linux, the user copies (and their
+  page faults) happen under `f_pos_lock` and, for writes, `i_rwsem`
+  (held across all chunks, which keeps a large O_APPEND write
+  contiguous); the fault path takes neither lock, and both are sleeping
+  locks, so a fault may sleep.
 - Order: `f_pos_lock` -> file `i_rwsem` -> page cache / page locks ->
   fs-internal locks. A directory `i_rwsem` is never held while a file's
   `i_rwsem` is taken (O_CREAT drops the parent's lock before O_TRUNC).

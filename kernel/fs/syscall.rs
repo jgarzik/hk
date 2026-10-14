@@ -66,8 +66,9 @@ pub const AT_FDCWD: i32 = -100;
 /// Maximum path length for user strings
 pub const PATH_MAX: usize = 4096;
 
-/// Maximum single I/O transfer size (1MB)
-pub const MAX_RW_COUNT: usize = 1024 * 1024;
+/// Largest single read/write transfer (Linux MAX_RW_COUNT = INT_MAX & PAGE_MASK);
+/// data moves through bounded kernel buffers (`file::WRITE_CHUNK`)
+pub const MAX_RW_COUNT: usize = 0x7fff_f000;
 
 /// Maximum number of iovec entries (Linux default)
 pub const IOV_MAX: usize = 1024;

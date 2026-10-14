@@ -3,9 +3,9 @@
 
 use alloc::sync::Arc;
 use alloc::vec;
-use alloc::vec::Vec;
 
 use crate::arch::Uaccess;
+use crate::fs::file::WRITE_CHUNK;
 use crate::fs::{File, KernelError, RwFlags};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 
@@ -23,35 +23,117 @@ fn seg_len(segs: &[IoVec]) -> usize {
     total.min(MAX_RW_COUNT)
 }
 
-/// Copy the user segments into one kernel buffer (at most MAX_RW_COUNT)
-fn gather(segs: &[IoVec]) -> Result<Vec<u8>, KernelError> {
-    let mut buf = vec![0u8; seg_len(segs)];
-    let mut off = 0;
-    for s in segs {
-        let n = (s.iov_len as usize).min(buf.len() - off);
-        if n == 0 {
-            continue;
-        }
-        copy_from_user::<Uaccess>(&mut buf[off..off + n], s.iov_base, n)
-            .map_err(|_| KernelError::BadAddress)?;
-        off += n;
-    }
-    Ok(buf)
+/// Position in a list of user segments (Linux iov_iter over user
+/// memory)
+struct Cursor<'a> {
+    segs: &'a [IoVec],
+    i: usize,
+    off: usize,
 }
 
-/// Copy `data` out to the user segments in order
-fn scatter(segs: &[IoVec], data: &[u8]) -> Result<(), KernelError> {
-    let mut off = 0;
-    for s in segs {
-        let n = (s.iov_len as usize).min(data.len() - off);
-        if n == 0 {
-            continue;
-        }
-        copy_to_user::<Uaccess>(s.iov_base, &data[off..off + n])
-            .map_err(|_| KernelError::BadAddress)?;
-        off += n;
+impl<'a> Cursor<'a> {
+    fn new(segs: &'a [IoVec]) -> Self {
+        Self { segs, i: 0, off: 0 }
     }
-    Ok(())
+
+    /// Visit the next `len` bytes of user memory as (address, length)
+    /// runs and advance past them
+    fn step(
+        &mut self,
+        mut len: usize,
+        f: &mut dyn FnMut(u64, usize, usize) -> Result<(), ()>,
+    ) -> Result<(), KernelError> {
+        let mut done = 0;
+        while len > 0 {
+            let s = self.segs.get(self.i).ok_or(KernelError::BadAddress)?;
+            let n = (s.iov_len as usize - self.off).min(len);
+            if n > 0 {
+                f(s.iov_base + self.off as u64, n, done).map_err(|_| KernelError::BadAddress)?;
+            }
+            self.off += n;
+            done += n;
+            len -= n;
+            if self.off == s.iov_len as usize {
+                self.i += 1;
+                self.off = 0;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fill `buf` from the user segments
+    fn copy_in(&mut self, buf: &mut [u8]) -> Result<(), KernelError> {
+        self.step(buf.len(), &mut |a, n, at| {
+            copy_from_user::<Uaccess>(&mut buf[at..at + n], a, n)
+                .map(|_| ())
+                .map_err(|_| ())
+        })
+    }
+
+    /// Copy `data` out to the user segments
+    fn copy_out(&mut self, data: &[u8]) -> Result<(), KernelError> {
+        self.step(data.len(), &mut |a, n, at| {
+            copy_to_user::<Uaccess>(a, &data[at..at + n])
+                .map(|_| ())
+                .map_err(|_| ())
+        })
+    }
+}
+
+/// Files whose reads return everything asked for unless at EOF (more
+/// chunks are read); for others (pipes, sockets, terminals) one chunk is
+/// one read, since a second could block although data was returned
+fn reads_fully(file: &File) -> bool {
+    file.get_inode()
+        .is_some_and(|i| i.mode().is_file() || i.mode().is_blkdev())
+}
+
+/// Read from `file` into `segs` at `at` (None: the file position)
+/// through a kernel buffer of at most `WRITE_CHUNK` bytes (Linux
+/// vfs_readv). Data already returned wins over a later error.
+pub fn file_readv(
+    file: &File,
+    segs: &[IoVec],
+    at: Option<u64>,
+    flags: RwFlags,
+) -> Result<usize, KernelError> {
+    let total = seg_len(segs);
+    let mut buf = vec![0u8; total.min(WRITE_CHUNK)];
+    let mut cur = Cursor::new(segs);
+    let mut done = 0;
+    loop {
+        let n = (total - done).min(WRITE_CHUNK);
+        let r = match at {
+            None => file.read_with_flags(&mut buf[..n], flags),
+            Some(o) => file.pread_with_flags(&mut buf[..n], o + done as u64, flags),
+        };
+        let r = match r {
+            Ok(r) => r,
+            Err(_) if done > 0 => return Ok(done),
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = cur.copy_out(&buf[..r]) {
+            return if done > 0 { Ok(done) } else { Err(e) };
+        }
+        done += r;
+        if r < n || done >= total || !reads_fully(file) {
+            return Ok(done);
+        }
+    }
+}
+
+/// Write `segs` to `file` as one write (see `File::write_from`)
+pub fn file_writev(
+    file: &File,
+    segs: &[IoVec],
+    at: Option<u64>,
+    flags: RwFlags,
+    append: Option<bool>,
+) -> Result<usize, KernelError> {
+    let mut cur = Cursor::new(segs);
+    file.write_from(seg_len(segs), at, flags, append, &mut |dst| {
+        cur.copy_in(dst)
+    })
 }
 
 /// errno for a failed read/write: no access is EBADF, a missing op is
@@ -78,17 +160,9 @@ pub fn do_readv(fd: i32, segs: &[IoVec], at: Option<u64>, flags: RwFlags) -> i64
     if file.is_dir() {
         return KernelError::IsDirectory.sysret();
     }
-    let mut buf = vec![0u8; seg_len(segs)];
     let _pos = at.is_none().then(|| file.pos_lock());
-    let r = match at {
-        None => file.read_with_flags(&mut buf, flags),
-        Some(o) => file.pread_with_flags(&mut buf, o, flags),
-    };
-    match r {
-        Ok(n) => match scatter(segs, &buf[..n]) {
-            Ok(()) => n as i64,
-            Err(e) => e.sysret(),
-        },
+    match file_readv(&file, segs, at, flags) {
+        Ok(n) => n as i64,
         Err(e) => rw_err(e, at, flags),
     }
 }
@@ -110,12 +184,8 @@ pub fn do_writev(
     if file.is_dir() {
         return KernelError::IsDirectory.sysret();
     }
-    let buf = match gather(segs) {
-        Ok(b) => b,
-        Err(e) => return e.sysret(),
-    };
     let _pos = at.is_none().then(|| file.pos_lock());
-    match file.write_at(&buf, at, flags, append) {
+    match file_writev(&file, segs, at, flags, append) {
         Ok(n) => n as i64,
         Err(e) => rw_err(e, at, flags),
     }

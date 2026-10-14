@@ -30,6 +30,10 @@ use crate::frame_alloc::FrameAllocRef;
 use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
 use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
+/// Largest kernel bounce buffer one read/write call uses: transfers
+/// bigger than this go through it in steps
+pub const WRITE_CHUNK: usize = 64 * 1024;
+
 /// Open file flags (Linux O_* flags)
 pub mod flags {
     /// Open for reading only
@@ -478,16 +482,6 @@ impl File {
         self.owner_sig.load(Ordering::Relaxed)
     }
 
-    /// file_remove_privs before a non-empty write: set-id bits go unless
-    /// the writer has CAP_FSETID
-    fn remove_privs(&self, buf: &[u8]) {
-        if !buf.is_empty()
-            && let Some(inode) = self.get_inode()
-        {
-            super::dac::remove_privs(&inode);
-        }
-    }
-
     /// Read from file
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, KernelError> {
         if !self.is_readable() {
@@ -535,13 +529,8 @@ impl File {
         self.f_op.pread_with_flags(self, buf, offset, flags)
     }
 
-    /// Write `buf` at `at` (None: the file position, which advances)
-    /// (Linux vfs_write + generic_file_write_iter). Regular files are
-    /// written under the inode's i_rwsem: in append mode (`append`:
-    /// RWF_APPEND / RWF_NOAPPEND, None = the file's O_APPEND) the data
-    /// goes to the current end of file, also for pwrite (Linux), and
-    /// position, data and new size change atomically with respect to
-    /// other writers and truncate.
+    /// Write `buf` at `at` (None: the file position, which advances);
+    /// see [`File::write_from`]
     pub fn write_at(
         &self,
         buf: &[u8],
@@ -549,12 +538,39 @@ impl File {
         flags: RwFlags,
         append: Option<bool>,
     ) -> Result<usize, KernelError> {
+        let mut off = 0;
+        self.write_from(buf.len(), at, flags, append, &mut |dst| {
+            dst.copy_from_slice(&buf[off..off + dst.len()]);
+            off += dst.len();
+            Ok(())
+        })
+    }
+
+    /// Write `len` bytes produced in order by `src` at `at` (None: the
+    /// file position, which advances) (Linux vfs_write +
+    /// generic_file_write_iter). The data passes through a kernel buffer
+    /// of at most `WRITE_CHUNK` bytes, so a call never pins more kernel
+    /// memory than that. Regular files are written under the inode's
+    /// i_rwsem, held across all chunks: in append mode (`append`:
+    /// RWF_APPEND / RWF_NOAPPEND, None = the file's O_APPEND) the data
+    /// goes to the current end of file, also for pwrite (Linux), and
+    /// position, data and new size change atomically with respect to
+    /// other writers and truncate. A short chunk ends the write; an
+    /// error after some bytes were written returns their count (Linux).
+    pub fn write_from(
+        &self,
+        len: usize,
+        at: Option<u64>,
+        flags: RwFlags,
+        append: Option<bool>,
+        src: &mut dyn FnMut(&mut [u8]) -> Result<(), KernelError>,
+    ) -> Result<usize, KernelError> {
         if !self.is_writable() {
             return Err(KernelError::PermissionDenied);
         }
         let inode = match self.get_inode() {
             Some(i) if i.mode().is_file() => i,
-            _ => return self.do_write(buf, at, flags),
+            _ => return self.write_chunks(len, at, flags, src),
         };
         let append = append.unwrap_or(self.get_flags() & flags::O_APPEND != 0);
         inode.inode_lock();
@@ -568,14 +584,43 @@ impl File {
                 (false, at) => at,
             };
             let pos = at.unwrap_or_else(|| self.get_pos());
-            super::syscall::check_fsize_limit(pos, buf.len())
-                .map_err(|_| KernelError::FileTooLarge)?;
-            self.remove_privs(buf);
-            self.do_write(buf, at, flags)
+            super::syscall::check_fsize_limit(pos, len).map_err(|_| KernelError::FileTooLarge)?;
+            if len > 0 {
+                // file_remove_privs: set-id bits go unless CAP_FSETID
+                super::dac::remove_privs(&inode);
+            }
+            self.write_chunks(len, at, flags, src)
         })();
         // SAFETY: taken above by this thread
         unsafe { inode.inode_unlock() };
         r
+    }
+
+    /// The chunk loop of `write_from`
+    fn write_chunks(
+        &self,
+        len: usize,
+        at: Option<u64>,
+        flags: RwFlags,
+        src: &mut dyn FnMut(&mut [u8]) -> Result<(), KernelError>,
+    ) -> Result<usize, KernelError> {
+        let mut buf = alloc::vec![0u8; len.min(WRITE_CHUNK)];
+        let mut done = 0;
+        loop {
+            let n = (len - done).min(WRITE_CHUNK);
+            let r = src(&mut buf[..n])
+                .and_then(|()| self.do_write(&buf[..n], at.map(|o| o + done as u64), flags));
+            match r {
+                Ok(w) => {
+                    done += w;
+                    if w < n || done >= len {
+                        return Ok(done);
+                    }
+                }
+                Err(_) if done > 0 => return Ok(done),
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn do_write(&self, buf: &[u8], at: Option<u64>, flags: RwFlags) -> Result<usize, KernelError> {

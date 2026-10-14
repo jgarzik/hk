@@ -58,6 +58,7 @@ pub mod swap;
 pub mod adjtimex;
 pub mod io_uring;
 pub mod tcp;
+pub mod bigio;
 pub mod keys;
 pub mod kcmp;
 pub mod process_vm;
@@ -85,6 +86,7 @@ pub fn run_all_tests() {
     mountflags::run_tests();
     process::run_tests();
     file_io::run_tests();
+    bigio::run_tests();
     fs_ops::run_tests();
     permissions::run_tests();
     dac::run_tests();

@@ -50,12 +50,13 @@ use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
+use crate::fs::iov::IoVec;
 use crate::mm::PAGE_SIZE;
 use crate::pipe::FD_CLOEXEC;
 use crate::poll::PollTable;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
-use crate::uaccess::{copy_from_user, copy_to_user, copy_val_from_user, get_user, put_user};
+use crate::uaccess::{UaccessArch, copy_from_user, copy_val_from_user, get_user, put_user};
 use crate::waitqueue::WaitQueue;
 
 // ============================================================================
@@ -660,30 +661,15 @@ impl IoUring {
             return KernelError::InvalidArgument.to_errno_neg();
         }
 
-        // Allocate kernel buffer
-        let mut kbuf = alloc::vec![0u8; len];
-
-        // Read from file
-        let result = if offset == u64::MAX {
-            // Use current file position (offset -1 means current pos)
-            match file.read(&mut kbuf) {
-                Ok(n) => n as i32,
-                Err(e) => fs_error_to_errno(e) as i32,
-            }
-        } else {
-            // Use specified offset (pread)
-            match file.pread(&mut kbuf, offset) {
-                Ok(n) => n as i32,
-                Err(e) => fs_error_to_errno(e) as i32,
-            }
-        };
-
-        // Copy to userspace if read succeeded
-        if result > 0 && copy_to_user::<Uaccess>(buf_addr, &kbuf[..result as usize]).is_err() {
-            return KernelError::BadAddress.to_errno_neg();
-        }
-
-        result
+        rw_one(
+            &file,
+            &[IoVec {
+                iov_base: buf_addr,
+                iov_len: len as u64,
+            }],
+            offset,
+            false,
+        )
     }
 
     /// Handle IORING_OP_WRITE
@@ -716,26 +702,15 @@ impl IoUring {
             return KernelError::InvalidArgument.to_errno_neg();
         }
 
-        // Copy from userspace
-        let mut kbuf = alloc::vec![0u8; len];
-        if copy_from_user::<Uaccess>(&mut kbuf, buf_addr, len).is_err() {
-            return KernelError::BadAddress.to_errno_neg();
-        }
-
-        // Write to file
-        if offset == u64::MAX {
-            // Use current file position
-            match file.write(&kbuf) {
-                Ok(n) => n as i32,
-                Err(e) => fs_error_to_errno(e) as i32,
-            }
-        } else {
-            // Use specified offset (pwrite)
-            match file.pwrite(&kbuf, offset) {
-                Ok(n) => n as i32,
-                Err(e) => fs_error_to_errno(e) as i32,
-            }
-        }
+        rw_one(
+            &file,
+            &[IoVec {
+                iov_base: buf_addr,
+                iov_len: len as u64,
+            }],
+            offset,
+            true,
+        )
     }
 
     /// Handle IORING_OP_READV (vectored read)
@@ -767,52 +742,10 @@ impl IoUring {
             return KernelError::InvalidArgument.to_errno_neg();
         }
 
-        // Read iovec array from userspace
-        let mut total_read: usize = 0;
-
-        for i in 0..iov_count {
-            let iov = match read_user_iovec(iov_addr, i) {
-                Ok(v) => v,
-                Err(e) => return if total_read > 0 { total_read as i32 } else { e },
-            };
-            if iov.iov_len == 0 {
-                continue;
-            }
-
-            let mut kbuf = alloc::vec![0u8; iov.iov_len];
-
-            let result = if offset == u64::MAX {
-                file.read(&mut kbuf)
-            } else {
-                let adjusted_offset = offset.saturating_add(total_read as u64);
-                file.pread(&mut kbuf, adjusted_offset)
-            };
-
-            match result {
-                Ok(n) => {
-                    // Copy to userspace
-                    if copy_to_user::<Uaccess>(iov.iov_base, &kbuf[..n]).is_err() {
-                        return if total_read > 0 {
-                            total_read as i32
-                        } else {
-                            KernelError::BadAddress.to_errno_neg()
-                        };
-                    }
-                    total_read += n;
-                    if n < iov.iov_len {
-                        break; // Short read
-                    }
-                }
-                Err(e) => {
-                    if total_read > 0 {
-                        return total_read as i32;
-                    }
-                    return fs_error_to_errno(e) as i32;
-                }
-            }
+        match read_user_iovecs(iov_addr, iov_count) {
+            Ok(v) => rw_one(&file, &v, offset, false),
+            Err(e) => e,
         }
-
-        total_read as i32
     }
 
     /// Handle IORING_OP_WRITEV (vectored write)
@@ -844,58 +777,10 @@ impl IoUring {
             return KernelError::InvalidArgument.to_errno_neg();
         }
 
-        // Read iovec array from userspace and write
-        let mut total_written: usize = 0;
-
-        for i in 0..iov_count {
-            let iov = match read_user_iovec(iov_addr, i) {
-                Ok(v) => v,
-                Err(e) => {
-                    return if total_written > 0 {
-                        total_written as i32
-                    } else {
-                        e
-                    };
-                }
-            };
-            if iov.iov_len == 0 {
-                continue;
-            }
-
-            // Copy from userspace
-            let mut kbuf = alloc::vec![0u8; iov.iov_len];
-            if copy_from_user::<Uaccess>(&mut kbuf, iov.iov_base, iov.iov_len).is_err() {
-                return if total_written > 0 {
-                    total_written as i32
-                } else {
-                    KernelError::BadAddress.to_errno_neg()
-                };
-            }
-
-            let result = if offset == u64::MAX {
-                file.write(&kbuf)
-            } else {
-                let adjusted_offset = offset.saturating_add(total_written as u64);
-                file.pwrite(&kbuf, adjusted_offset)
-            };
-
-            match result {
-                Ok(n) => {
-                    total_written += n;
-                    if n < iov.iov_len {
-                        break; // Short write
-                    }
-                }
-                Err(e) => {
-                    if total_written > 0 {
-                        return total_written as i32;
-                    }
-                    return fs_error_to_errno(e) as i32;
-                }
-            }
+        match read_user_iovecs(iov_addr, iov_count) {
+            Ok(v) => rw_one(&file, &v, offset, true),
+            Err(e) => e,
         }
-
-        total_written as i32
     }
 
     // =========================================================================
@@ -1437,12 +1322,38 @@ fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, KernelError> {
 // Helper structures and functions
 // ============================================================================
 
-/// iovec structure for vectored I/O
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct IoVec {
-    iov_base: u64,  // Pointer to buffer
-    iov_len: usize, // Length of buffer
+/// The `n` iovecs at `iov_addr` (EINVAL beyond IOV_MAX, EFAULT for a bad
+/// array or buffer)
+fn read_user_iovecs(iov_addr: u64, n: usize) -> Result<Vec<IoVec>, i32> {
+    if n > crate::fs::syscall::IOV_MAX {
+        return Err(KernelError::InvalidArgument.to_errno_neg());
+    }
+    let v = (0..n)
+        .map(|i| read_user_iovec(iov_addr, i))
+        .collect::<Result<Vec<_>, _>>()?;
+    if v.iter()
+        .any(|s| s.iov_len > 0 && !Uaccess::access_ok(s.iov_base, s.iov_len as usize))
+    {
+        return Err(KernelError::BadAddress.to_errno_neg());
+    }
+    Ok(v)
+}
+
+/// Read or write `segs` at `offset` (u64::MAX: the file position, under
+/// f_pos_lock) through the bounded read/write core
+fn rw_one(file: &File, segs: &[IoVec], offset: u64, write: bool) -> i32 {
+    use crate::fs::RwFlags;
+    let at = (offset != u64::MAX).then_some(offset);
+    let _pos = at.is_none().then(|| file.pos_lock());
+    let r = if write {
+        crate::fs::io::file_writev(file, segs, at, RwFlags::empty(), None)
+    } else {
+        crate::fs::io::file_readv(file, segs, at, RwFlags::empty())
+    };
+    match r {
+        Ok(n) => n as i32,
+        Err(e) => fs_error_to_errno(e) as i32,
+    }
 }
 
 /// Read element `i` of a user iovec array (negative errno on fault)

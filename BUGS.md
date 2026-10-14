@@ -148,6 +148,17 @@ panic handler then dropped formatted messages, so ELR/FAR were lost; it
 prints them now. Not reproduced in 90 further runs (sequential and 8 in
 parallel). Next occurrence: capture the Message line.
 
+## Unlinked ramfs files keep their page-cache pages
+
+**Location**: `kernel/mm/page_cache.rs` (`invalidate_file` has no
+caller), `kernel/fs/ramfs.rs`
+
+The page cache holds at most 1024 pages, and ramfs pages are
+unevictable. When the last reference to an unlinked ramfs file goes
+away its pages are not released (only truncate frees them), so writing
+and deleting a few MB of /tmp files makes later writes fail with EIO.
+Tests truncate big files before unlinking them.
+
 ## Partial munmap of an anonymous mapping drops the rest of it
 
 mmap(2 pages) then munmap(second page): mincore on the still-mapped
