@@ -185,6 +185,13 @@ pub trait FileOps: Send + Sync {
         Ok(())
     }
 
+    /// Device/file-specific ioctl (Linux f_op->unlocked_ioctl), reached
+    /// by `sys_ioctl` after the generic FIO* commands for files that are
+    /// not block or character devices (e.g. sockets). Default: ENOTTY.
+    fn ioctl(&self, _file: &File, _cmd: u32, _arg: u64) -> Result<i64, KernelError> {
+        Err(KernelError::NotTty)
+    }
+
     /// Poll for events (like f_op->poll in Linux)
     ///
     /// Returns mask of ready events (POLLIN, POLLOUT, etc.).

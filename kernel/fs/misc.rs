@@ -412,8 +412,11 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
             Err(_) => KernelError::Io.sysret(),
         }
     } else {
-        // Not a device - ioctl not supported
-        KernelError::NotTty.sysret()
+        // Other files (sockets, ...): the file's own ioctl
+        match file.ops().ioctl(&file, cmd, arg) {
+            Ok(v) => v,
+            Err(e) => e.sysret(),
+        }
     }
 }
 
