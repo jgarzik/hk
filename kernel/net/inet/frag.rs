@@ -105,7 +105,14 @@ impl FragQueue {
                 self.len = end;
             }
         }
-        if end <= off || hdr.len() + self.len > IP_MAX {
+        // The whole datagram, with the first fragment's header, must fit
+        // in 16 bits (ping of death): never truncate a length later
+        let fihl = if off == 0 {
+            hdr.len()
+        } else {
+            self.first_ihl()
+        };
+        if end <= off || fihl + self.len > IP_MAX {
             return Ins::Kill;
         }
         match self.place(off, end) {
@@ -143,6 +150,15 @@ impl FragQueue {
         }
     }
 
+    /// Header length of the first fragment (minimum until it arrived)
+    fn first_ihl(&self) -> usize {
+        self.first
+            .as_ref()
+            .map_or(crate::net::ipv4::IP_HLEN_MIN, |f| {
+                ((f[0] & 0x0f) as usize) * 4
+            })
+    }
+
     fn done(&self) -> bool {
         self.last_in && self.first.is_some() && self.meat == self.len
     }
@@ -152,16 +168,20 @@ impl FragQueue {
         self.first.as_deref()
     }
 
-    /// The whole datagram: first header (fixed up) + payload
-    pub fn assemble(&self) -> Vec<u8> {
-        let first = self.first.as_ref().expect("complete queue");
+    /// The whole datagram: first header (fixed up) + payload; None if
+    /// incomplete or beyond 65535 bytes (Linux "Oversized IP packet")
+    pub fn assemble(&self) -> Option<Vec<u8>> {
+        let first = self.first.as_ref()?;
         let ihl = ((first[0] & 0x0f) as usize) * 4;
+        if !self.done() || ihl + self.len > IP_MAX {
+            return None;
+        }
         let mut out = Vec::with_capacity(ihl + self.len);
         out.extend_from_slice(&first[..ihl]);
         for d in self.frags.values() {
             out.extend_from_slice(d);
         }
-        let tot = out.len() as u16;
+        let tot = u16::try_from(out.len()).ok()?;
         out[2..4].copy_from_slice(&tot.to_be_bytes());
         out[6] = 0;
         out[7] = 0;
@@ -169,7 +189,7 @@ impl FragQueue {
         out[11] = 0;
         let c = crate::net::ipv4::ip_checksum(&out[..ihl]);
         out[10..12].copy_from_slice(&c.to_be_bytes());
-        out
+        Some(out)
     }
 }
 
@@ -247,7 +267,7 @@ impl FragTable {
                 Defrag::Pending
             }
             Ins::Done => {
-                let whole = st.q.get(&key).map(|q| q.assemble());
+                let whole = st.q.get(&key).and_then(|q| q.assemble());
                 self.remove(&mut st, &key);
                 whole.map_or(Defrag::Pending, Defrag::Whole)
             }
@@ -346,7 +366,7 @@ mod tests {
         let mut q = FragQueue::new(0);
         assert_eq!(q.insert(0, &data(16, 1), true, &HDR), Ins::More);
         assert_eq!(q.insert(16, &data(8, 2), false, &HDR), Ins::Done);
-        let d = q.assemble();
+        let d = q.assemble().unwrap();
         assert_eq!(d.len(), 44);
         assert_eq!(u16::from_be_bytes([d[2], d[3]]), 44);
         assert_eq!(&d[20..36], &[1; 16]);
@@ -394,7 +414,32 @@ mod tests {
         let mut q = FragQueue::new(0);
         assert_eq!(q.insert(0, &data(13, 1), true, &HDR), Ins::More);
         assert_eq!(q.insert(8, &data(8, 2), false, &HDR), Ins::Done);
-        assert_eq!(q.assemble().len(), 36);
+        assert_eq!(q.assemble().unwrap().len(), 36);
+    }
+
+    #[test]
+    fn oversized_never_truncated() {
+        // A long first header, then a fragment pushing the total past
+        // 65535 with a short header of its own
+        let mut big = [0u8; 60];
+        big[0] = 0x4f;
+        let mut q = FragQueue::new(0);
+        assert_eq!(q.insert(0, &data(8, 1), true, &big), Ins::More);
+        assert_eq!(q.insert(65464, &data(16, 2), false, &HDR), Ins::Kill);
+        // Same pieces, first fragment last
+        let mut q = FragQueue::new(0);
+        assert_eq!(q.insert(65464, &data(16, 2), false, &HDR), Ins::More);
+        assert_eq!(q.insert(0, &data(8, 1), true, &big), Ins::Kill);
+        // Exactly 65535 is fine and its header says so
+        let mut q = FragQueue::new(0);
+        assert_eq!(q.insert(0, &data(65512, 1), true, &HDR), Ins::More);
+        assert_eq!(q.insert(65512, &data(3, 2), false, &HDR), Ins::Done);
+        let d = q.assemble().unwrap();
+        assert_eq!(d.len(), 65535);
+        assert_eq!(u16::from_be_bytes([d[2], d[3]]), 65535);
+        // Largest offset with a payload overflowing 16 bits
+        let mut q = FragQueue::new(0);
+        assert_eq!(q.insert(65528, &data(64, 1), false, &HDR), Ins::Kill);
     }
 
     #[test]
