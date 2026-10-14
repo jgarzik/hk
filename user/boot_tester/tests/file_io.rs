@@ -23,9 +23,9 @@
 //! - Test 41: pwritev2() with offset=-1 uses current file position
 //! - Test 42: pwritev2() with RWF_APPEND appends to file
 //! - Test 43: preadv2() with invalid flags returns -EOPNOTSUPP
-//! - Test 44: preadv2() with RWF_NOWAIT returns -EOPNOTSUPP (Phase 1)
+//! - Test 44: preadv2() with RWF_NOWAIT on ramfs returns -EOPNOTSUPP
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, println, print_num, host_mode};
 use hk_syscall::{
     sys_close, sys_fcntl, sys_fstatfs, sys_getrandom, sys_ioctl, sys_lseek, sys_open, sys_pipe2,
     sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read,
@@ -36,6 +36,7 @@ use hk_syscall::{
 
 // RWF flags for preadv2/pwritev2
 const RWF_NOWAIT: i32 = 0x08;
+const TMPFS_MAGIC: i64 = 0x0102_1994;
 const RWF_APPEND: i32 = 0x10;
 
 // fcntl commands
@@ -1119,9 +1120,9 @@ fn test_preadv2_invalid_flags() {
     }
 }
 
-/// Test 44: preadv2() with RWF_NOWAIT on ramfs file succeeds
+/// Test 44: preadv2() with RWF_NOWAIT on a ramfs file is EOPNOTSUPP:
+/// ramfs/tmpfs files lack FMODE_NOWAIT (Linux kiocb_set_rw_flags)
 fn test_preadv2_rwf_nowait() {
-    // Test RWF_NOWAIT on ramfs file - should succeed since ramfs never blocks
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
@@ -1133,20 +1134,13 @@ fn test_preadv2_rwf_nowait() {
 
     let mut buf = [0u8; 4];
     let iov: [IoVec; 1] = [IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() }];
-
-    // RWF_NOWAIT on ramfs should work (ramfs is in-memory and never blocks)
     let ret = sys_preadv2(fd as i32, iov.as_ptr(), 1, 0, RWF_NOWAIT);
-
     sys_close(fd as u64);
 
-    // Should return bytes read (4), not error
-    if ret == 4 {
+    if ret == -95 {
         println(b"PREADV2_RWF_NOWAIT:OK");
-    } else if ret == -95 {
-        print(b"PREADV2_RWF_NOWAIT:FAIL: got EOPNOTSUPP, but ramfs should support NOWAIT");
-        println(b"");
     } else {
-        print(b"PREADV2_RWF_NOWAIT:FAIL: expected 4, got ");
+        print(b"PREADV2_RWF_NOWAIT:FAIL: expected -95 (EOPNOTSUPP), got ");
         print_num(ret);
         println(b"");
     }

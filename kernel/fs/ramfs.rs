@@ -29,7 +29,7 @@ use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
 
 use super::KernelError;
 use super::dentry::Dentry;
-use super::file::{DirEntry, File, FileOps, RwFlags};
+use super::file::{DirEntry, File, FileOps};
 use super::inode::{AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::superblock::{
     FileSystemType, RAMFS_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps,
@@ -1226,49 +1226,8 @@ impl FileOps for RamfsFileOps {
         Ok(())
     }
 
-    // RWF_NOWAIT support: ramfs is in-memory and never blocks
-
-    fn read_with_flags(
-        &self,
-        file: &File,
-        buf: &mut [u8],
-        _flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        // In-memory filesystem never blocks
-        self.read(file, buf)
-    }
-
-    fn pread_with_flags(
-        &self,
-        file: &File,
-        buf: &mut [u8],
-        offset: u64,
-        _flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        // In-memory filesystem never blocks
-        self.pread(file, buf, offset)
-    }
-
-    fn write_with_flags(
-        &self,
-        file: &File,
-        buf: &[u8],
-        _flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        // In-memory filesystem never blocks
-        self.write(file, buf)
-    }
-
-    fn pwrite_with_flags(
-        &self,
-        file: &File,
-        buf: &[u8],
-        offset: u64,
-        _flags: RwFlags,
-    ) -> Result<usize, KernelError> {
-        // In-memory filesystem never blocks
-        self.pwrite(file, buf, offset)
-    }
+    // No RWF_NOWAIT overrides: like Linux ramfs/tmpfs (no FMODE_NOWAIT),
+    // the default *_with_flags methods reject NOWAIT with EOPNOTSUPP
 }
 
 /// Static ramfs file ops
