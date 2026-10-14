@@ -13,6 +13,7 @@
 extern crate alloc;
 
 pub mod acpi;
+pub mod barrier;
 pub mod context;
 pub mod cpu;
 pub mod drivers;

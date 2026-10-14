@@ -64,7 +64,13 @@ pub use x86_64::power;
 pub use aarch64::power;
 
 // IRQ-safe spinlock - architecture-specific implementation
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::barrier;
 /// Device IRQ registration (shareable handlers, PCI INTx routing)
+// Device I/O memory barriers (dma_wmb/dma_rmb/wmb)
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::barrier;
+
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::irq;
 #[cfg(target_arch = "x86_64")]
