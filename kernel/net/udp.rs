@@ -540,6 +540,11 @@ impl UdpTable {
         self.socks.read().get(&port).cloned().unwrap_or_default()
     }
 
+    /// All bound sockets (by port)
+    fn all(&self) -> Vec<Arc<UdpSock>> {
+        self.socks.read().values().flatten().cloned().collect()
+    }
+
     /// Number of bound sockets
     pub fn len(&self) -> usize {
         self.socks.read().values().map(|v| v.len()).sum()
@@ -732,4 +737,49 @@ pub fn udp_checksum(saddr: Ipv4Addr, daddr: Ipv4Addr, udp: &[u8]) -> u16 {
     let sum = ipv4::pseudo_header_checksum(saddr, daddr, IPPROTO_UDP as u8, udp.len() as u16);
     let r = !fold(add_words(sum, udp));
     if r == 0 { 0xffff } else { r }
+}
+
+/// `/proc/net/udp` (Linux udp4_seq_show): every bound socket of the
+/// reader's namespace, addresses as raw network-order hex, lines padded
+/// to 127 columns
+pub fn proc_net_udp() -> Vec<u8> {
+    use core::fmt::Write;
+    let mut out = alloc::string::String::new();
+    let _ = writeln!(
+        out,
+        "{:<127}",
+        "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops"
+    );
+    let raw = |a: Ipv4Addr| u32::from_ne_bytes(a.to_be_bytes());
+    for s in crate::net::current_net_ns().udp.all() {
+        let a = s.inet.get();
+        // TCP_ESTABLISHED (1) when connected, else TCP_CLOSE (7)
+        let st = if s.connected.load(Ordering::Acquire) {
+            1
+        } else {
+            7
+        };
+        let line = alloc::format!(
+            "{:5}: {:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} {} {:016x} {}",
+            a.sport & 127,
+            raw(a.rcv_saddr),
+            a.sport,
+            raw(a.daddr),
+            a.dport,
+            st,
+            0,
+            s.rxq.rmem(),
+            0,
+            0,
+            0,
+            s.sk.cred.euid,
+            0,
+            s.sk.ino.load(Ordering::Relaxed),
+            2,
+            0,
+            s.sk.drops.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(out, "{:<127}", line);
+    }
+    out.into_bytes()
 }

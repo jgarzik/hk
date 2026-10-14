@@ -106,6 +106,11 @@ impl RxQueue {
         self.q.lock().front().map_or(0, |d| d.data.len())
     }
 
+    /// Bytes charged (Linux sk_rmem_alloc)
+    pub fn rmem(&self) -> usize {
+        self.rmem.load(Ordering::Relaxed)
+    }
+
     pub fn clear(&self) {
         self.q.lock().clear();
         self.rmem.store(0, Ordering::Release);

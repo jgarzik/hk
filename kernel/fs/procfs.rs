@@ -1547,6 +1547,12 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
         children.insert(String::from("dev"), net_dev_inode);
         children.insert(String::from("route"), net_route_inode);
         children.insert(String::from("arp"), net_arp_inode);
+        let udp = mk_inode(
+            &sb,
+            InodeMode::regular(0o444),
+            ProcfsInodeData::new_file(crate::net::udp::proc_net_udp),
+        );
+        children.insert(String::from("udp"), udp);
     }
     net_dir_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(net_dir))));
 

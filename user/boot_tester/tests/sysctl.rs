@@ -15,6 +15,7 @@ pub fn run_tests() {
     test_port_range();
     test_validation();
     test_perm();
+    test_proc_net_udp();
 }
 
 /// Read a NUL-terminated path into `buf`; returns the length or -errno
@@ -157,5 +158,79 @@ fn test_perm() {
     let mut st = 0;
     sys_wait4(pid, &mut st, 0, 0);
     t.eq(b"child", st as i64, 0);
+    t.done();
+}
+
+/// Upper-case hex of `v` in `w` digits
+fn hex(v: u64, w: usize, out: &mut [u8]) {
+    for i in 0..w {
+        let d = ((v >> (4 * (w - 1 - i))) & 0xf) as u8;
+        out[i] = if d < 10 { b'0' + d } else { b'A' + d - 10 };
+    }
+}
+
+/// Decimal text of `v`
+fn dec(mut v: u64, out: &mut [u8; 20]) -> usize {
+    let mut tmp = [0u8; 20];
+    let mut n = 0;
+    loop {
+        tmp[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in 0..n {
+        out[i] = tmp[n - 1 - i];
+    }
+    n
+}
+
+/// /proc/net/udp lists a bound socket: local 127.0.0.1:port, state 07
+/// (unconnected) or 01 with the peer, its inode
+fn test_proc_net_udp() {
+    use hk_syscall::{sys_fstat, Stat};
+    let mut t = T::new(b"PROC_NET_UDP");
+    let (a, pa) = udp_lo();
+    let (b, pb) = udp_lo();
+    connect(b, LO, pa);
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    sys_fstat(a, &mut st);
+    let mut buf = [0u8; 8192];
+    let n = read_file(b"/proc/net/udp\0", &mut buf);
+    let text = &buf[..n.max(0) as usize];
+    t.ok(b"header", text.starts_with(b"   sl  local_address rem_address   st tx_queue rx_queue"), n);
+    let find = |port: u16| {
+        let mut key = *b"0100007F:0000";
+        hex(port as u64, 4, &mut key[9..]);
+        text.split(|&c| c == b'\n')
+            .find(|l| l.len() > 20 && &l[7..20] == &key[..])
+    };
+    let la = find(pa);
+    t.ok(b"a listed", la.is_some(), pa as i64);
+    if let Some(l) = la {
+        t.ok(b"a unconnected", &l[21..34] == b"00000000:0000" && &l[35..37] == b"07", 0);
+        let mut d = [0u8; 20];
+        let k = dec(st.st_ino, &mut d);
+        let has = l.windows(k + 2).any(|w| w[0] == b' ' && &w[1..k + 1] == &d[..k] && w[k + 1] == b' ');
+        t.ok(b"inode", has, st.st_ino as i64);
+        t.eq(b"width", l.len() as i64, 127);
+    }
+    let lb = find(pb);
+    t.ok(b"b listed", lb.is_some(), pb as i64);
+    if let Some(l) = lb {
+        let mut rem = *b"0100007F:0000";
+        hex(pa as u64, 4, &mut rem[9..]);
+        t.ok(b"b connected", &l[21..34] == &rem[..] && &l[35..37] == b"01", 0);
+    }
+    close(a);
+    close(b);
+    let n = read_file(b"/proc/net/udp\0", &mut buf);
+    let text = &buf[..n.max(0) as usize];
+    let mut key = *b"0100007F:0000";
+    hex(pa as u64, 4, &mut key[9..]);
+    let gone = !text.windows(13).any(|w| w == &key[..]);
+    t.ok(b"gone after close", gone, 0);
     t.done();
 }
