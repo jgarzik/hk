@@ -45,7 +45,9 @@ use crate::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::rlimit;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
-use crate::uaccess::{UaccessArch, get_user, put_user, strncpy_from_user};
+use crate::uaccess::{
+    UaccessArch, copy_from_user, copy_to_user, get_user, put_user, strncpy_from_user,
+};
 use crate::waitqueue::WaitQueue;
 
 // ============================================================================
@@ -660,10 +662,8 @@ pub fn sys_mq_timedsend(
         if !Uaccess::access_ok(msg_ptr, msg_len) {
             return KernelError::BadAddress.sysret();
         }
-        unsafe {
-            Uaccess::user_access_begin();
-            core::ptr::copy_nonoverlapping(msg_ptr as *const u8, msg_buf.as_mut_ptr(), msg_len);
-            Uaccess::user_access_end();
+        if copy_from_user::<Uaccess>(&mut msg_buf, msg_ptr, msg_len).is_err() {
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -726,10 +726,8 @@ pub fn sys_mq_timedreceive(
         if !Uaccess::access_ok(msg_ptr, len) {
             return KernelError::BadAddress.sysret();
         }
-        unsafe {
-            Uaccess::user_access_begin();
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), msg_ptr as *mut u8, len);
-            Uaccess::user_access_end();
+        if copy_to_user::<Uaccess>(msg_ptr, &buf[..len]).is_err() {
+            return KernelError::BadAddress.sysret();
         }
     }
 

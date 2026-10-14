@@ -55,7 +55,7 @@ use crate::pipe::FD_CLOEXEC;
 use crate::poll::PollTable;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
-use crate::uaccess::{get_user, put_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_val_from_user, get_user, put_user};
 use crate::waitqueue::WaitQueue;
 
 // ============================================================================
@@ -629,7 +629,6 @@ impl IoUring {
     }
 
     /// Handle IORING_OP_READ
-    #[allow(clippy::needless_range_loop)] // Need raw pointer indexing for user memory
     fn do_read(&self, sqe: &IoUringSqe) -> i32 {
         let fd = sqe.fd;
         let buf_addr = sqe.addr;
@@ -675,21 +674,14 @@ impl IoUring {
         };
 
         // Copy to userspace if read succeeded
-        if result > 0 {
-            let bytes_to_copy = result as usize;
-            let user_ptr = buf_addr as *mut u8;
-            for i in 0..bytes_to_copy {
-                unsafe {
-                    core::ptr::write_volatile(user_ptr.add(i), kbuf[i]);
-                }
-            }
+        if result > 0 && copy_to_user::<Uaccess>(buf_addr, &kbuf[..result as usize]).is_err() {
+            return KernelError::BadAddress.to_errno_neg();
         }
 
         result
     }
 
     /// Handle IORING_OP_WRITE
-    #[allow(clippy::needless_range_loop)] // Need raw pointer indexing for user memory
     fn do_write(&self, sqe: &IoUringSqe) -> i32 {
         let fd = sqe.fd;
         let buf_addr = sqe.addr;
@@ -716,11 +708,8 @@ impl IoUring {
 
         // Copy from userspace
         let mut kbuf = alloc::vec![0u8; len];
-        let user_ptr = buf_addr as *const u8;
-        for i in 0..len {
-            unsafe {
-                kbuf[i] = core::ptr::read_volatile(user_ptr.add(i));
-            }
+        if copy_from_user::<Uaccess>(&mut kbuf, buf_addr, len).is_err() {
+            return KernelError::BadAddress.to_errno_neg();
         }
 
         // Write to file
@@ -740,7 +729,6 @@ impl IoUring {
     }
 
     /// Handle IORING_OP_READV (vectored read)
-    #[allow(clippy::needless_range_loop)] // Need raw pointer indexing for user memory
     fn do_readv(&self, sqe: &IoUringSqe) -> i32 {
         let fd = sqe.fd;
         let iov_addr = sqe.addr;
@@ -766,10 +754,12 @@ impl IoUring {
 
         // Read iovec array from userspace
         let mut total_read: usize = 0;
-        let iov_ptr = iov_addr as *const IoVec;
 
         for i in 0..iov_count {
-            let iov: IoVec = unsafe { core::ptr::read_volatile(iov_ptr.add(i)) };
+            let iov = match read_user_iovec(iov_addr, i) {
+                Ok(v) => v,
+                Err(e) => return if total_read > 0 { total_read as i32 } else { e },
+            };
             if iov.iov_len == 0 {
                 continue;
             }
@@ -786,11 +776,12 @@ impl IoUring {
             match result {
                 Ok(n) => {
                     // Copy to userspace
-                    let user_ptr = iov.iov_base as *mut u8;
-                    for j in 0..n {
-                        unsafe {
-                            core::ptr::write_volatile(user_ptr.add(j), kbuf[j]);
-                        }
+                    if copy_to_user::<Uaccess>(iov.iov_base, &kbuf[..n]).is_err() {
+                        return if total_read > 0 {
+                            total_read as i32
+                        } else {
+                            KernelError::BadAddress.to_errno_neg()
+                        };
                     }
                     total_read += n;
                     if n < iov.iov_len {
@@ -810,7 +801,6 @@ impl IoUring {
     }
 
     /// Handle IORING_OP_WRITEV (vectored write)
-    #[allow(clippy::needless_range_loop)] // Need raw pointer indexing for user memory
     fn do_writev(&self, sqe: &IoUringSqe) -> i32 {
         let fd = sqe.fd;
         let iov_addr = sqe.addr;
@@ -836,21 +826,30 @@ impl IoUring {
 
         // Read iovec array from userspace and write
         let mut total_written: usize = 0;
-        let iov_ptr = iov_addr as *const IoVec;
 
         for i in 0..iov_count {
-            let iov: IoVec = unsafe { core::ptr::read_volatile(iov_ptr.add(i)) };
+            let iov = match read_user_iovec(iov_addr, i) {
+                Ok(v) => v,
+                Err(e) => {
+                    return if total_written > 0 {
+                        total_written as i32
+                    } else {
+                        e
+                    };
+                }
+            };
             if iov.iov_len == 0 {
                 continue;
             }
 
             // Copy from userspace
             let mut kbuf = alloc::vec![0u8; iov.iov_len];
-            let user_ptr = iov.iov_base as *const u8;
-            for j in 0..iov.iov_len {
-                unsafe {
-                    kbuf[j] = core::ptr::read_volatile(user_ptr.add(j));
-                }
+            if copy_from_user::<Uaccess>(&mut kbuf, iov.iov_base, iov.iov_len).is_err() {
+                return if total_written > 0 {
+                    total_written as i32
+                } else {
+                    KernelError::BadAddress.to_errno_neg()
+                };
             }
 
             let result = if offset == u64::MAX {
@@ -1143,8 +1142,11 @@ impl IoUring {
 
         // Read timespec from userspace
         // struct __kernel_timespec { i64 tv_sec; i64 tv_nsec; }
-        let tv_sec: i64 = unsafe { core::ptr::read_volatile(ts_ptr as *const i64) };
-        let tv_nsec: i64 = unsafe { core::ptr::read_volatile((ts_ptr + 8) as *const i64) };
+        let ts = match copy_val_from_user::<Uaccess, [i64; 2]>(ts_ptr) {
+            Ok(v) => v,
+            Err(_) => return KernelError::BadAddress.to_errno_neg(),
+        };
+        let (tv_sec, tv_nsec) = (ts[0], ts[1]);
 
         if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
             return KernelError::InvalidArgument.to_errno_neg();
@@ -1417,10 +1419,28 @@ fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, KernelError> {
 
 /// iovec structure for vectored I/O
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct IoVec {
     iov_base: u64,  // Pointer to buffer
     iov_len: usize, // Length of buffer
+}
+
+/// Read element `i` of a user iovec array (negative errno on fault)
+fn read_user_iovec(iov_addr: u64, i: usize) -> Result<IoVec, i32> {
+    let addr = (i as u64)
+        .checked_mul(core::mem::size_of::<IoVec>() as u64)
+        .and_then(|o| iov_addr.checked_add(o))
+        .ok_or(KernelError::BadAddress.to_errno_neg())?;
+    copy_val_from_user::<Uaccess, IoVec>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
+}
+
+/// Copy an `int fds[n]` array from user space
+fn read_user_fds(arg: u64, n: usize) -> Result<Vec<i32>, KernelError> {
+    let mut fds = alloc::vec![0i32; n];
+    // SAFETY: byte view of the `n` initialized i32 elements of `fds`
+    let bytes = unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr() as *mut u8, n * 4) };
+    copy_from_user::<Uaccess>(bytes, arg, n * 4).map_err(|_| KernelError::BadAddress)?;
+    Ok(fds)
 }
 
 /// Get file from fd for current task
@@ -1662,7 +1682,6 @@ pub fn sys_io_uring_enter(
 ///
 /// # Returns
 /// 0 on success, or negative errno
-#[allow(clippy::needless_range_loop)] // Need raw pointer indexing for user memory
 pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i64 {
     // Get io_uring from fd
     let fd_table = match get_task_fd(current_tid()) {
@@ -1698,14 +1717,10 @@ pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i6
             }
 
             // Read fd array from userspace
-            let fds_ptr = arg as *const i32;
-            let mut fds = alloc::vec![0i32; nr_args as usize];
-
-            for i in 0..nr_args as usize {
-                unsafe {
-                    fds[i] = core::ptr::read_volatile(fds_ptr.add(i));
-                }
-            }
+            let fds = match read_user_fds(arg, nr_args as usize) {
+                Ok(f) => f,
+                Err(e) => return e.sysret(),
+            };
 
             ring.register_files(&fds)
         }
@@ -1721,14 +1736,10 @@ pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i6
             }
 
             // Read fd array from userspace
-            let fds_ptr = arg as *const i32;
-            let mut fds = alloc::vec![0i32; nr_args as usize];
-
-            for i in 0..nr_args as usize {
-                unsafe {
-                    fds[i] = core::ptr::read_volatile(fds_ptr.add(i));
-                }
-            }
+            let fds = match read_user_fds(arg, nr_args as usize) {
+                Ok(f) => f,
+                Err(e) => return e.sysret(),
+            };
 
             ring.update_files(0, &fds)
         }

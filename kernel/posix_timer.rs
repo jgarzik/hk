@@ -513,7 +513,9 @@ pub fn exit_posix_timers(tid: Tid) {
 // Syscall implementations
 // =============================================================================
 
+use crate::arch::Uaccess;
 use crate::task::percpu::current_tid;
+use crate::uaccess::{copy_val_from_user, copy_val_to_user, get_user, put_user};
 
 /// sys_timer_create - Create a POSIX timer
 ///
@@ -529,8 +531,10 @@ pub fn sys_timer_create(clockid: i32, sevp: u64, timerid: u64) -> i64 {
 
     // Read sigevent from user space if provided
     let sigevent = if sevp != 0 {
-        let sev = unsafe { *(sevp as *const SigEvent) };
-        Some(sev)
+        match copy_val_from_user::<Uaccess, SigEvent>(sevp) {
+            Ok(sev) => Some(sev),
+            Err(_) => return -14, // EFAULT
+        }
     } else {
         None
     };
@@ -539,10 +543,10 @@ pub fn sys_timer_create(clockid: i32, sevp: u64, timerid: u64) -> i64 {
     match create_posix_timer(tid, clockid, sigevent) {
         Ok(timer_id) => {
             // Write timer ID to user space
-            if timerid != 0 {
-                unsafe {
-                    *(timerid as *mut TimerT) = timer_id;
-                }
+            if timerid != 0 && put_user::<Uaccess, TimerT>(timerid, timer_id).is_err() {
+                // Linux releases the new timer if the ID cannot be stored
+                let _ = delete_posix_timer(tid, timer_id);
+                return -14; // EFAULT
             }
             0
         }
@@ -578,8 +582,6 @@ pub fn sys_timer_settime(timerid: TimerT, flags: i32, new_value: u64, old_value:
     if new_value == 0 {
         return -14; // EFAULT
     }
-    use crate::arch::Uaccess;
-    use crate::uaccess::{get_user, put_user};
     let new_spec: ITimerSpec = match get_user::<Uaccess, ITimerSpec>(new_value) {
         Ok(v) => v,
         Err(_) => return -14, // EFAULT
@@ -625,8 +627,8 @@ pub fn sys_timer_gettime(timerid: TimerT, curr_value: u64) -> i64 {
     let curr_spec = timer.gettime();
 
     // Write to user space
-    unsafe {
-        *(curr_value as *mut ITimerSpec) = curr_spec;
+    if copy_val_to_user::<Uaccess, ITimerSpec>(curr_value, &curr_spec).is_err() {
+        return -14; // EFAULT
     }
 
     0
