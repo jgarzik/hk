@@ -650,6 +650,11 @@ impl IoUring {
             }
         };
 
+        // The fd's access mode, like read(2)/write(2) (EBADF)
+        if !file.is_readable() {
+            return KernelError::BadFd.to_errno_neg();
+        }
+
         // Create buffer for read
         if buf_addr == 0 || len == 0 {
             return KernelError::InvalidArgument.to_errno_neg();
@@ -661,13 +666,13 @@ impl IoUring {
         // Read from file
         let result = if offset == u64::MAX {
             // Use current file position (offset -1 means current pos)
-            match file.f_op.read(&file, &mut kbuf) {
+            match file.read(&mut kbuf) {
                 Ok(n) => n as i32,
                 Err(e) => fs_error_to_errno(e) as i32,
             }
         } else {
             // Use specified offset (pread)
-            match file.f_op.pread(&file, &mut kbuf, offset) {
+            match file.pread(&mut kbuf, offset) {
                 Ok(n) => n as i32,
                 Err(e) => fs_error_to_errno(e) as i32,
             }
@@ -701,6 +706,11 @@ impl IoUring {
             }
         };
 
+        // The fd's access mode, like read(2)/write(2) (EBADF)
+        if !file.is_writable() {
+            return KernelError::BadFd.to_errno_neg();
+        }
+
         // Validate buffer
         if buf_addr == 0 || len == 0 {
             return KernelError::InvalidArgument.to_errno_neg();
@@ -715,13 +725,13 @@ impl IoUring {
         // Write to file
         if offset == u64::MAX {
             // Use current file position
-            match file.f_op.write(&file, &kbuf) {
+            match file.write(&kbuf) {
                 Ok(n) => n as i32,
                 Err(e) => fs_error_to_errno(e) as i32,
             }
         } else {
             // Use specified offset (pwrite)
-            match file.f_op.pwrite(&file, &kbuf, offset) {
+            match file.pwrite(&kbuf, offset) {
                 Ok(n) => n as i32,
                 Err(e) => fs_error_to_errno(e) as i32,
             }
@@ -748,6 +758,11 @@ impl IoUring {
             }
         };
 
+        // The fd's access mode, like read(2)/write(2) (EBADF)
+        if !file.is_readable() {
+            return KernelError::BadFd.to_errno_neg();
+        }
+
         if iov_addr == 0 || iov_count == 0 {
             return KernelError::InvalidArgument.to_errno_neg();
         }
@@ -767,10 +782,10 @@ impl IoUring {
             let mut kbuf = alloc::vec![0u8; iov.iov_len];
 
             let result = if offset == u64::MAX {
-                file.f_op.read(&file, &mut kbuf)
+                file.read(&mut kbuf)
             } else {
                 let adjusted_offset = offset.saturating_add(total_read as u64);
-                file.f_op.pread(&file, &mut kbuf, adjusted_offset)
+                file.pread(&mut kbuf, adjusted_offset)
             };
 
             match result {
@@ -820,6 +835,11 @@ impl IoUring {
             }
         };
 
+        // The fd's access mode, like read(2)/write(2) (EBADF)
+        if !file.is_writable() {
+            return KernelError::BadFd.to_errno_neg();
+        }
+
         if iov_addr == 0 || iov_count == 0 {
             return KernelError::InvalidArgument.to_errno_neg();
         }
@@ -853,10 +873,10 @@ impl IoUring {
             }
 
             let result = if offset == u64::MAX {
-                file.f_op.write(&file, &kbuf)
+                file.write(&kbuf)
             } else {
                 let adjusted_offset = offset.saturating_add(total_written as u64);
-                file.f_op.pwrite(&file, &kbuf, adjusted_offset)
+                file.pwrite(&kbuf, adjusted_offset)
             };
 
             match result {
