@@ -48,6 +48,9 @@ pub struct SigContext {
     pub pc: u64,
     /// Processor state (PSTATE)
     pub pstate: u64,
+    /// Explicit (zeroed) padding up to the 16-byte aligned `__reserved`;
+    /// implicit padding would copy uninitialized kernel stack to user
+    pub _pad: u64,
 }
 
 /// Size of `sigcontext.__reserved`
@@ -88,9 +91,11 @@ pub struct UContext {
     pub uc_stack: StackT,
     /// Signal mask
     pub uc_sigmask: SigSet,
-    /// Padding (Linux: 1024 bits of sigset_t space)
-    pub _pad: [u8; 120],
-    /// Machine context (16-byte aligned, so it starts at offset 176)
+    /// Padding: Linux's 120-byte `__unused` (1024 bits of sigset_t space)
+    /// plus the 8 alignment bytes before the 16-byte aligned
+    /// `uc_mcontext`, explicit so they are zeroed, never stack garbage
+    pub _pad: [u8; 128],
+    /// Machine context (16-byte aligned, starts at offset 176)
     pub uc_mcontext: SigContext,
 }
 
@@ -101,7 +106,7 @@ impl Default for UContext {
             uc_link: 0,
             uc_stack: StackT::default(),
             uc_sigmask: SigSet::EMPTY,
-            _pad: [0; 120],
+            _pad: [0; 128],
             uc_mcontext: SigContext::default(),
         }
     }
@@ -146,7 +151,20 @@ pub struct RtSigFrame {
 /// Offset of `uc.uc_mcontext.__reserved` in the frame
 pub const RESERVED_OFFSET: usize = core::mem::size_of::<RtSigFrame>();
 
+// Layouts match Linux (arch/arm64/include/uapi/asm/{sigcontext,ucontext}.h,
+// asm-generic siginfo) and every byte is a named field: the frame is
+// copied whole to user memory, so implicit padding would leak kernel stack
+const _: () = assert!(core::mem::size_of::<SigContext>() == 8 + 31 * 8 + 3 * 8 + 8);
+const _: () = assert!(core::mem::size_of::<StackT>() == 24);
+const _: () = assert!(core::mem::size_of::<SigSet>() == 8);
+const _: () = assert!(core::mem::size_of::<SigInfo>() == 128);
+const _: () = assert!(core::mem::offset_of!(UContext, uc_stack) == 16);
+const _: () = assert!(core::mem::offset_of!(UContext, uc_sigmask) == 40);
+const _: () = assert!(core::mem::offset_of!(UContext, _pad) == 48);
+const _: () = assert!(core::mem::size_of::<UContext>() == 176 + core::mem::size_of::<SigContext>());
 const _: () = assert!(core::mem::offset_of!(RtSigFrame, uc) == 128);
+const _: () = assert!(core::mem::size_of::<CtxHead>() == 8);
+const _: () = assert!(core::mem::size_of::<EsrContext>() == 16);
 const _: () = assert!(core::mem::offset_of!(UContext, uc_mcontext) == 176);
 const _: () = assert!(RESERVED_OFFSET == 128 + 176 + 288);
 
@@ -342,7 +360,7 @@ pub fn setup_rt_frame(
                 ss_size: 0,
             },
             uc_sigmask: blocked,
-            _pad: [0; 120],
+            _pad: [0; 128],
             uc_mcontext: SigContext {
                 // FAR of a data/instruction abort
                 fault_address: if info.error != 0 { info.addr } else { 0 },
@@ -350,6 +368,7 @@ pub fn setup_rt_frame(
                 sp: user_sp,
                 pc: user_elr,
                 pstate: user_spsr,
+                _pad: 0,
             },
         },
     };

@@ -176,6 +176,23 @@ pub struct RtSigFrame {
     // The FP image (sigcontext.fpstate) lives above the frame, 64-aligned
 }
 
+// Layouts match Linux (arch/x86/include/uapi/asm/sigcontext.h, ucontext.h,
+// asm-generic siginfo, rt_sigframe) and every byte is a named field: the
+// frame is copied whole to user memory, so implicit padding would leak
+// kernel stack
+const _: () = assert!(core::mem::size_of::<SigContext>() == 256);
+const _: () = assert!(core::mem::offset_of!(SigContext, cs) == 144);
+const _: () = assert!(core::mem::offset_of!(SigContext, err) == 152);
+const _: () = assert!(core::mem::size_of::<StackT>() == 24);
+const _: () = assert!(core::mem::size_of::<SigSet>() == 8);
+const _: () = assert!(core::mem::offset_of!(UContext, uc_mcontext) == 40);
+const _: () = assert!(core::mem::offset_of!(UContext, uc_sigmask) == 296);
+const _: () = assert!(core::mem::size_of::<UContext>() == 304);
+const _: () = assert!(core::mem::size_of::<SigInfo>() == 128);
+const _: () = assert!(core::mem::offset_of!(RtSigFrame, uc) == 8);
+const _: () = assert!(core::mem::offset_of!(RtSigFrame, info) == 312);
+const _: () = assert!(core::mem::size_of::<RtSigFrame>() == 440);
+
 /// uc_flags: the FP image is in XSAVE format with `_fpx_sw_bytes`
 const UC_FP_XSTATE: u64 = 0x1;
 /// uc_flags: sigcontext.ss is valid / must be restored strictly
