@@ -7,6 +7,7 @@
 #![no_std]
 #![no_main]
 
+use core::ffi::c_void;
 use core::panic::PanicInfo;
 
 use hk_syscall::{sys_exit, sys_getpid, sys_getppid, sys_write};
@@ -66,11 +67,12 @@ fn panic(_info: &PanicInfo) -> ! {
 
 // Compiler intrinsics required for no_std
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memset(dest: *mut c_void, c: i32, n: usize) -> *mut c_void {
+    let d = dest as *mut u8;
     unsafe {
         let mut i = 0;
         while i < n {
-            *dest.add(i) = c as u8;
+            *d.add(i) = c as u8;
             i += 1;
         }
     }
@@ -78,11 +80,13 @@ pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    let d = dest as *mut u8;
+    let s = src as *const u8;
     unsafe {
         let mut i = 0;
         while i < n {
-            *dest.add(i) = *src.add(i);
+            *d.add(i) = *s.add(i);
             i += 1;
         }
     }
