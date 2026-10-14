@@ -196,8 +196,9 @@ check-arm: build-arm vfat-image
 	fi
 
 # Differential test: boot_tester as init on a real Linux kernel (native arch)
+LINUX_TEST_TIMEOUT ?= 120
 check-linux:
-	./tools/linux-boot-tester.sh
+	./tools/linux-boot-tester.sh -T $(LINUX_TEST_TIMEOUT)
 
 info-arm: build-arm
 	@echo "ARM Kernel: $(KERNEL_ARM)"
