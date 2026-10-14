@@ -186,6 +186,18 @@ pub enum KernelError {
     KeyRevoked = 128,
     /// Key was rejected by service (EKEYREJECTED)
     KeyRejected = 129,
+
+    // =========================================================================
+    // Kernel-internal restart codes (include/linux/errno.h); never reach
+    // user space: the syscall exit path turns them into a restart or EINTR
+    // =========================================================================
+    /// Interrupted by a signal; restart if the handler has SA_RESTART (or
+    /// no handler ran), else EINTR (ERESTARTSYS)
+    RestartSys = 512,
+    /// Always restart, even after a handler (ERESTARTNOINTR)
+    RestartNoIntr = 513,
+    /// Restart only if no handler ran, else EINTR (ERESTARTNOHAND)
+    RestartNoHand = 514,
 }
 
 impl KernelError {

@@ -279,8 +279,11 @@ impl Timerfd {
                 return Err(KernelError::WouldBlock);
             }
 
-            // Wait for timer to fire
-            self.wait_queue.wait();
+            // Wait for the timer to fire or be disarmed (a signal ends the wait)
+            self.wait_queue.wait_event_interruptible(|| {
+                let inner = self.inner.lock();
+                inner.ticks > 0 || inner.expires_ns == 0
+            })?;
         }
     }
 

@@ -908,6 +908,8 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub reset_on_fork: bool,
     /// CPU affinity mask (bit N = CPU N is allowed)
     pub cpus_allowed: CpuMask,
+    /// CPU whose run queue owns this task (tasks never migrate)
+    pub cpu: u32,
     /// Page table for this task
     pub page_table: PT,
     /// Saved CPU state

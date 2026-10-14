@@ -29,11 +29,12 @@
 //! - `./select-poll.md` - Implementation guide
 //! - `./external-linux/fs/select.c` - Linux implementation
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+use crate::fs::File;
 use crate::task::Tid;
-use crate::waitqueue::WaitQueue;
+use crate::waitqueue::{WaitEntry, WaitQueue};
 
 // =============================================================================
 // Poll Event Masks (from include/uapi/asm-generic/poll.h)
@@ -164,59 +165,22 @@ impl Default for FdSet {
 }
 
 // =============================================================================
-// Poll Registration Entry
-// =============================================================================
-
-/// A registration on a wait queue for poll
-///
-/// This is created when a file's poll() method calls poll_wait().
-/// When the wait queue is woken, it sets the triggered flag on the PollContext.
-#[allow(dead_code)] // Fields used for wait queue cleanup in full implementation
-pub struct PollEntry {
-    /// Pointer to the wait queue we're registered on
-    /// Safety: This is valid for the lifetime of the PollContext
-    wait_queue: *const WaitQueue,
-    /// Event mask for this registration
-    key: u32,
-    /// Task ID we registered with
-    tid: Tid,
-}
-
-// Safety: PollEntry is only accessed by the task that created it
-unsafe impl Send for PollEntry {}
-unsafe impl Sync for PollEntry {}
-
-impl PollEntry {
-    fn new(wq: &WaitQueue, key: u32, tid: Tid) -> Self {
-        Self {
-            wait_queue: wq as *const WaitQueue,
-            key,
-            tid,
-        }
-    }
-}
-
-// =============================================================================
 // Poll Context (Per-Syscall State)
 // =============================================================================
 
 /// Per-syscall poll context (like Linux poll_wqueues)
 ///
-/// This holds all state for a single poll/select syscall invocation.
-/// It tracks:
-/// - The polling task
-/// - All wait queue registrations (for cleanup)
-/// - A triggered flag set by wakeups
-/// - Any error that occurred during setup
+/// Holds the polling task's registrations on the wait queues of the polled
+/// files (non-autoremove entries: every wakeup wakes the poller until the
+/// poll ends) and references to those files, which keep the wait queues
+/// alive. Dropping the context removes all registrations.
 pub struct PollContext {
     /// Task ID of the polling task
     pub task: Tid,
-    /// Flag set when a registered wait queue fires
-    pub triggered: AtomicBool,
-    /// Error code (e.g., ENOMEM) if setup failed
-    pub error: AtomicI32,
-    /// All wait queue registrations
-    entries: Vec<PollEntry>,
+    /// Registered (wait queue, entry) pairs
+    entries: Vec<(*const WaitQueue, WaitEntry)>,
+    /// Files whose wait queues we registered on (keeps them alive)
+    files: Vec<Arc<File>>,
 }
 
 impl PollContext {
@@ -224,40 +188,25 @@ impl PollContext {
     pub fn new(tid: Tid) -> Self {
         Self {
             task: tid,
-            triggered: AtomicBool::new(false),
-            error: AtomicI32::new(0),
             entries: Vec::new(),
+            files: Vec::new(),
         }
     }
 
-    /// Check if triggered
-    pub fn is_triggered(&self) -> bool {
-        self.triggered.load(Ordering::Acquire)
+    /// Keep `file` alive for the lifetime of this context (call before
+    /// polling it with a registering table)
+    pub fn hold_file(&mut self, file: Arc<File>) {
+        self.files.push(file);
     }
 
-    /// Set triggered flag (called by wake callback)
-    pub fn set_triggered(&self) {
-        self.triggered.store(true, Ordering::Release);
-    }
-
-    /// Reset triggered flag (before sleeping)
-    pub fn reset_triggered(&self) {
-        self.triggered.store(false, Ordering::SeqCst);
-    }
-
-    /// Get error code
-    pub fn get_error(&self) -> i32 {
-        self.error.load(Ordering::Relaxed)
-    }
-
-    /// Set error code
-    pub fn set_error(&self, err: i32) {
-        self.error.store(err, Ordering::Relaxed);
-    }
-
-    /// Add a wait queue registration
-    pub fn add_entry(&mut self, wq: &WaitQueue, key: u32) {
-        self.entries.push(PollEntry::new(wq, key, self.task));
+    /// Register the polling task on `wq`
+    fn add_entry(&mut self, wq: &WaitQueue) {
+        if self.entries.iter().any(|(q, _)| core::ptr::eq(*q, wq)) {
+            return;
+        }
+        let mut entry = WaitEntry::new();
+        wq.add_poll_entry(&mut entry);
+        self.entries.push((wq as *const WaitQueue, entry));
     }
 
     /// Number of registrations
@@ -268,10 +217,12 @@ impl PollContext {
 
 impl Drop for PollContext {
     fn drop(&mut self) {
-        // Clean up all wait queue registrations
-        // For now, we don't actually add to wait queues (simplified implementation)
-        // A full implementation would remove entries from wait queues here
-        self.entries.clear();
+        for (wq, entry) in self.entries.drain(..) {
+            // Safety: the wait queues belong to files in `self.files`,
+            // which are still alive (dropped after this loop)
+            unsafe { (*wq).remove_entry(&entry) };
+        }
+        self.files.clear();
     }
 }
 
@@ -313,16 +264,16 @@ impl<'a> PollTable<'a> {
         if !self.qproc_enabled {
             return;
         }
+        // Wakeups are not filtered by key: the poller re-scans all fds
+        self.ctx.add_entry(wq);
+    }
 
-        // Record the registration
-        self.ctx.add_entry(wq, self.key);
-
-        // Note: In a full implementation, we would:
-        // 1. Add an entry to the wait queue that, when woken, sets ctx.triggered
-        // 2. The wake callback would filter by key mask
-        //
-        // For now, we use a simplified approach where we just record the
-        // registration and rely on polling to check readiness.
+    /// Keep `file` alive while registered on its wait queues (no-op once
+    /// registration is disabled)
+    pub fn hold_file(&mut self, file: &Arc<File>) {
+        if self.qproc_enabled {
+            self.ctx.hold_file(file.clone());
+        }
     }
 
     /// Disable further registrations

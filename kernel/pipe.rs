@@ -555,10 +555,11 @@ impl FileOps for PipeReadFileOps {
                 return Err(KernelError::WouldBlock);
             }
 
-            // Block waiting for data
-            // In a full implementation, we'd use the wait queue properly
-            // For now, just yield and retry
-            crate::task::percpu::yield_now();
+            // Block until data or EOF; a signal ends the wait (-ERESTARTSYS)
+            let pipe = &self.pipe;
+            pipe.wait_queue.wait_event_interruptible(|| {
+                !pipe.inner.lock().is_empty() || !pipe.has_writers()
+            })?;
         }
     }
 
@@ -708,8 +709,10 @@ impl FileOps for PipeWriteFileOps {
                 return Err(KernelError::WouldBlock);
             }
 
-            // Block waiting for space
-            crate::task::percpu::yield_now();
+            // Block until space or no readers; a signal ends the wait
+            let pipe = &self.pipe;
+            pipe.wait_queue
+                .wait_event_interruptible(|| !pipe.inner.lock().is_full() || !pipe.has_readers())?;
         }
     }
 

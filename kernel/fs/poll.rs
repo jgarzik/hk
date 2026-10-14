@@ -9,7 +9,7 @@ use alloc::vec;
 
 use crate::arch::Uaccess;
 use crate::fs::KernelError;
-use crate::signal::{SigSet, UNMASKABLE_SIGNALS, has_pending_signals, with_task_signal_state};
+use crate::signal::{SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
 use crate::task::percpu::current_tid;
 
 use super::syscall::current_fd_table;
@@ -42,6 +42,55 @@ fn restore_poll_sigmask(old_mask: SigSet) {
         state.saved_sigmask = None;
         state.recalc_sigpending();
     });
+}
+
+// =============================================================================
+// Poll sleep helpers
+// =============================================================================
+
+/// Absolute CLOCK_MONOTONIC deadline for a poll timeout in ms (<0 = none)
+fn poll_deadline(timeout_ms: i32) -> Option<u64> {
+    if timeout_ms < 0 {
+        None
+    } else {
+        Some(crate::time::monotonic_ns().saturating_add(timeout_ms as u64 * 1_000_000))
+    }
+}
+
+/// Called after a scan (done with the task state set Interruptible) found
+/// nothing ready: sleep until a registered wait queue fires, a signal, or
+/// the deadline. Returns `Some(retval)` when the poll must stop.
+fn poll_sleep(deadline: Option<u64>) -> Option<i64> {
+    use crate::task::percpu::{
+        SleepState, ns_to_ticks, schedule, schedule_timeout, set_current_state,
+    };
+    if crate::waitqueue::signal_pending() {
+        set_current_state(SleepState::Running);
+        return Some(KernelError::RestartNoHand.sysret());
+    }
+    match deadline {
+        None => schedule(),
+        Some(d) => {
+            let now = crate::time::monotonic_ns();
+            if now >= d {
+                set_current_state(SleepState::Running);
+                return Some(0);
+            }
+            schedule_timeout(ns_to_ticks(d - now));
+        }
+    }
+    None
+}
+
+/// Sleep with nothing to poll: until the deadline (`Ok`) or a signal
+fn poll_sleep_only(deadline: Option<u64>) -> i64 {
+    use crate::task::percpu::{SleepState, set_current_state};
+    loop {
+        set_current_state(SleepState::Interruptible);
+        if let Some(r) = poll_sleep(deadline) {
+            return r;
+        }
+    }
 }
 
 // ============================================================================
@@ -171,10 +220,7 @@ pub fn sys_syncfs(fd: i32) -> i64 {
 /// * -EINVAL if nfds exceeds limit
 /// * -EINTR if interrupted by signal
 pub fn sys_poll(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
-    // poll() doesn't change signal mask, so don't return EINTR for most signals
-    // This matches Linux behavior where poll() typically doesn't return EINTR
-    // unless interrupted by a signal with a handler
-    do_poll_internal(fds, nfds, timeout_ms, false)
+    do_poll_internal(fds, nfds, timeout_ms)
 }
 
 /// Internal poll implementation
@@ -183,9 +229,12 @@ pub fn sys_poll(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
 /// * `fds` - Pointer to array of pollfd structures
 /// * `nfds` - Number of fds in the array
 /// * `timeout_ms` - Timeout in milliseconds (-1 = infinite, 0 = immediate)
-/// * `check_signals` - If true, return EINTR on pending signals (for ppoll with sigmask)
-fn do_poll_internal(fds: u64, nfds: u32, timeout_ms: i32, check_signals: bool) -> i64 {
+///
+/// Sleeps on the polled files' wait queues; a deliverable signal ends the
+/// wait with -ERESTARTNOHAND (EINTR once a handler runs).
+fn do_poll_internal(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
     use crate::poll::{POLLNVAL, PollContext, PollFd, PollTable};
+    use crate::task::percpu::{SleepState, set_current_state};
     use crate::uaccess::{copy_from_user, copy_to_user};
 
     // Limit nfds to prevent DoS
@@ -196,17 +245,12 @@ fn do_poll_internal(fds: u64, nfds: u32, timeout_ms: i32, check_signals: bool) -
 
     let tid = current_tid();
 
-    // Handle empty poll (just sleep for timeout)
+    // Empty poll: just sleep for the timeout (or until a signal)
     if nfds == 0 {
-        if timeout_ms > 0 {
-            // Sleep for the specified timeout
-            crate::task::percpu::sleep_current_ms(timeout_ms as u64);
-            // Check if interrupted by signal (only if using signal mask variant)
-            if check_signals && has_pending_signals(tid) {
-                return KernelError::Interrupted.sysret();
-            }
+        if timeout_ms == 0 {
+            return 0;
         }
-        return 0;
+        return poll_sleep_only(poll_deadline(timeout_ms));
     }
 
     // Copy pollfd array from user space
@@ -221,22 +265,22 @@ fn do_poll_internal(fds: u64, nfds: u32, timeout_ms: i32, check_signals: bool) -
         return KernelError::BadAddress.sysret();
     }
 
-    // Create poll context
+    // Create poll context (wait queue registrations, dropped at return)
     let mut ctx = PollContext::new(tid);
-
-    // Do the poll loop
+    let deadline = poll_deadline(timeout_ms);
+    let mut first_pass = true;
     let mut ready_count;
 
-    // Calculate timeout end time (in milliseconds/ticks)
-    let timeout_end = if timeout_ms < 0 {
-        u64::MAX // Infinite timeout
-    } else {
-        crate::time::current_ticks().saturating_add(timeout_ms as u64)
-    };
-
     loop {
-        // Reset poll table for this iteration
+        // State first, then scan: a wakeup during the scan is not lost
+        set_current_state(SleepState::Interruptible);
+
+        // Register on wait queues during the first scan only
         let mut poll_table = PollTable::new(&mut ctx);
+        if !first_pass || timeout_ms == 0 {
+            poll_table.disable();
+        }
+        first_pass = false;
         ready_count = 0;
 
         // Get FD table
@@ -265,6 +309,7 @@ fn do_poll_internal(fds: u64, nfds: u32, timeout_ms: i32, check_signals: bool) -
 
             // Set key for this fd's events
             poll_table.set_key(pollfd.events as u16);
+            poll_table.hold_file(&file);
 
             // Call file's poll method
             let mask = file.poll(Some(&mut poll_table));
@@ -284,26 +329,17 @@ fn do_poll_internal(fds: u64, nfds: u32, timeout_ms: i32, check_signals: bool) -
 
         // If any fds are ready, or timeout is 0 (immediate), return
         if ready_count > 0 || timeout_ms == 0 {
+            set_current_state(SleepState::Running);
             break;
         }
 
-        // Check for pending signals (only if using signal mask variant)
-        if check_signals && has_pending_signals(tid) {
-            return KernelError::Interrupted.sysret();
+        match poll_sleep(deadline) {
+            Some(0) => break,
+            Some(r) => return r,
+            None => {}
         }
-
-        // Check if timeout has elapsed
-        let now = crate::time::current_ticks();
-        if now >= timeout_end {
-            break;
-        }
-
-        // Yield to let other tasks run, then re-check
-        // Note: We use yield_now() rather than sleep because the poll infrastructure
-        // doesn't currently wire up wait queues to wake sleeping tasks. We rely on
-        // polling loops that yield to the scheduler.
-        crate::task::percpu::yield_now();
     }
+    drop(ctx);
 
     // Copy results back to user space
     let result_bytes =
@@ -388,16 +424,13 @@ pub fn sys_ppoll(fds: u64, nfds: u32, tmo_p: u64, sigmask_ptr: u64, sigsetsize: 
         None
     };
 
-    // Call internal poll implementation
-    // Only check signals if a signal mask was provided (proper ppoll semantics)
-    let check_signals = saved_mask.is_some();
-    let result = do_poll_internal(fds, nfds, timeout_ms, check_signals);
+    let result = do_poll_internal(fds, nfds, timeout_ms);
 
     // Restore mask if we changed it, unless interrupted by a signal: then
     // the temporary mask stays in effect for signal delivery and do_signal()
     // restores saved_sigmask (Linux: restore_saved_sigmask_unless()).
     if let Some(old) = saved_mask
-        && result != KernelError::Interrupted.sysret()
+        && result != KernelError::RestartNoHand.sysret()
     {
         restore_poll_sigmask(old);
     }
@@ -466,7 +499,7 @@ pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeou
     };
 
     // select() doesn't change signal mask, so don't return EINTR for most signals
-    do_select_internal(nfds, readfds, writefds, exceptfds, timeout_ms, false)
+    do_select_internal(nfds, readfds, writefds, exceptfds, timeout_ms)
 }
 
 /// pselect6 - synchronous I/O multiplexing with timespec and signal mask
@@ -561,23 +594,13 @@ pub fn sys_pselect6(
         None
     };
 
-    // Call internal select implementation
-    // Only check signals if a signal mask was provided (proper pselect6 semantics)
-    let check_signals = saved_mask.is_some();
-    let result = do_select_internal(
-        nfds,
-        readfds,
-        writefds,
-        exceptfds,
-        timeout_ms,
-        check_signals,
-    );
+    let result = do_select_internal(nfds, readfds, writefds, exceptfds, timeout_ms);
 
     // Restore mask if we changed it, unless interrupted by a signal: then
     // the temporary mask stays in effect for signal delivery and do_signal()
     // restores saved_sigmask (Linux: restore_saved_sigmask_unless()).
     if let Some(old) = saved_mask
-        && result != KernelError::Interrupted.sysret()
+        && result != KernelError::RestartNoHand.sysret()
     {
         restore_poll_sigmask(old);
     }
@@ -593,16 +616,15 @@ pub fn sys_pselect6(
 /// * `writefds` - Optional pointer to fd_set for write readiness
 /// * `exceptfds` - Optional pointer to fd_set for exceptional conditions
 /// * `timeout_ms` - Timeout in milliseconds (-1 = infinite, 0 = immediate)
-/// * `check_signals` - If true, return EINTR on pending signals (for pselect6 with sigmask)
 fn do_select_internal(
     nfds: i32,
     readfds: u64,
     writefds: u64,
     exceptfds: u64,
     timeout_ms: i32,
-    check_signals: bool,
 ) -> i64 {
     use crate::poll::{FdSet, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, PollContext, PollTable};
+    use crate::task::percpu::{SleepState, set_current_state};
     use crate::uaccess::{copy_from_user, copy_to_user};
 
     // Validate nfds
@@ -613,17 +635,12 @@ fn do_select_internal(
 
     let tid = current_tid();
 
-    // Handle empty select (just sleep for timeout)
+    // Empty select: just sleep for the timeout (or until a signal)
     if nfds == 0 && readfds == 0 && writefds == 0 && exceptfds == 0 {
-        if timeout_ms > 0 {
-            // Sleep for the specified timeout
-            crate::task::percpu::sleep_current_ms(timeout_ms as u64);
-            // Check if interrupted by signal (only if using signal mask variant)
-            if check_signals && has_pending_signals(tid) {
-                return KernelError::Interrupted.sysret();
-            }
+        if timeout_ms == 0 {
+            return 0;
         }
-        return 0;
+        return poll_sleep_only(poll_deadline(timeout_ms));
     }
 
     // Calculate how many bytes to copy
@@ -665,23 +682,27 @@ fn do_select_internal(
     let mut ctx = PollContext::new(tid);
 
     // Output sets (initially zeroed)
-    let mut out_read = FdSet::new();
-    let mut out_write = FdSet::new();
-    let mut out_except = FdSet::new();
+    let mut out_read;
+    let mut out_write;
+    let mut out_except;
 
-    // Do the select loop
+    let deadline = poll_deadline(timeout_ms);
+    let mut first_pass = true;
     let mut ready_count;
 
-    // Calculate timeout end time (in milliseconds/ticks)
-    let timeout_end = if timeout_ms < 0 {
-        u64::MAX // Infinite timeout
-    } else {
-        crate::time::current_ticks().saturating_add(timeout_ms as u64)
-    };
-
     loop {
+        // State first, then scan: a wakeup during the scan is not lost
+        set_current_state(SleepState::Interruptible);
+        // Register on wait queues during the first scan only
         let mut poll_table = PollTable::new(&mut ctx);
+        if !first_pass || timeout_ms == 0 {
+            poll_table.disable();
+        }
+        first_pass = false;
         ready_count = 0i32;
+        out_read = FdSet::new();
+        out_write = FdSet::new();
+        out_except = FdSet::new();
 
         // Get FD table
         let fd_table = current_fd_table();
@@ -701,9 +722,11 @@ fn do_select_internal(
             let file = match table.get(fd) {
                 Some(f) => f,
                 None => {
+                    set_current_state(SleepState::Running);
                     return KernelError::BadFd.sysret();
                 }
             };
+            poll_table.hold_file(&file);
 
             // Set key for events we're interested in
             let mut events = 0u16;
@@ -749,26 +772,17 @@ fn do_select_internal(
 
         // If any fds are ready, or timeout is 0 (immediate), return
         if ready_count > 0 || timeout_ms == 0 {
+            set_current_state(SleepState::Running);
             break;
         }
 
-        // Check for pending signals (only if using signal mask variant)
-        if check_signals && has_pending_signals(tid) {
-            return KernelError::Interrupted.sysret();
+        match poll_sleep(deadline) {
+            Some(0) => break,
+            Some(r) => return r,
+            None => {}
         }
-
-        // Check if timeout has elapsed
-        let now = crate::time::current_ticks();
-        if now >= timeout_end {
-            break;
-        }
-
-        // Yield to let other tasks run, then re-check
-        // Note: We use yield_now() rather than sleep because the poll infrastructure
-        // doesn't currently wire up wait queues to wake sleeping tasks. We rely on
-        // polling loops that yield to the scheduler.
-        crate::task::percpu::yield_now();
     }
+    drop(ctx);
 
     // Copy results back to user space
     if readfds != 0 && bytes_needed > 0 {

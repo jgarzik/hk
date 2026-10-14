@@ -622,6 +622,24 @@ impl PerCpuOps for Aarch64Arch {
             .map(|p| p.syscall_user_sp)
             .unwrap_or(0)
     }
+
+    type SyscallUserState = percpu::SyscallUserState;
+
+    fn save_syscall_user_state() -> percpu::SyscallUserState {
+        percpu::save_syscall_user_state()
+    }
+
+    fn restore_syscall_user_state(state: &percpu::SyscallUserState) {
+        percpu::restore_syscall_user_state(state)
+    }
+
+    fn set_syscall_return(val: u64) {
+        unsafe { percpu::current_cpu_mut().syscall_user_regs[0] = val };
+    }
+
+    fn syscall_restart() -> u64 {
+        percpu::syscall_restart()
+    }
 }
 
 // ============================================================================

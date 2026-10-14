@@ -151,25 +151,9 @@ pub fn sys_nanosleep(req: u64, rem: u64) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
 
-    // Convert to ticks (10ms per tick = 100 ticks/second)
-    // Each tick is 10,000,000 nanoseconds
-    const NS_PER_TICK: i64 = 10_000_000;
-    let total_ns = request.tv_sec * 1_000_000_000 + request.tv_nsec;
-    let sleep_ticks = (total_ns + NS_PER_TICK - 1) / NS_PER_TICK; // Round up
-
-    // Get current tick and calculate wake tick
-    let current_tick = crate::task::percpu::get_ticks();
-    let wake_tick = current_tick + sleep_ticks as u64;
-
-    // Put current task to sleep
-    do_nanosleep(wake_tick);
-
-    // For now, assume successful completion (no signals)
-    // EINTR handling blocked on signal infrastructure (task signal state,
-    // rt_sigaction syscall, signal delivery in scheduler)
-    let _ = rem;
-
-    0
+    let total_ns = request.tv_sec as u64 * 1_000_000_000 + request.tv_nsec as u64;
+    let deadline = crate::time::monotonic_ns().saturating_add(total_ns);
+    do_nanosleep(deadline, rem)
 }
 
 /// sys_clock_nanosleep - high-resolution sleep with specified clock
@@ -202,28 +186,26 @@ pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 
         return KernelError::InvalidArgument.sysret();
     }
 
-    const NS_PER_TICK: i64 = 10_000_000;
-
-    let wake_tick = if flags & TIMER_ABSTIME != 0 {
-        // Absolute time - calculate ticks from epoch
-        // For now, simplified: just use monotonic time as ticks
-        let target_ns = request.tv_sec * 1_000_000_000 + request.tv_nsec;
-        let target_ticks = target_ns / NS_PER_TICK;
-        target_ticks as u64
+    let req_ns = request.tv_sec as u64 * 1_000_000_000 + request.tv_nsec as u64;
+    let now_mono = crate::time::monotonic_ns();
+    if flags & TIMER_ABSTIME != 0 {
+        // Absolute time on `clockid`: convert to a CLOCK_MONOTONIC deadline
+        let clock = if clockid == CLOCK_REALTIME {
+            ClockId::Realtime
+        } else {
+            ClockId::Monotonic
+        };
+        let ts = TIMEKEEPER.read(clock, TIMEKEEPER.get_read_cycles());
+        let clock_now = ts.sec as u64 * 1_000_000_000 + ts.nsec as u64;
+        let deadline = now_mono.saturating_add(req_ns.saturating_sub(clock_now));
+        // Absolute sleeps are restarted unchanged; no remaining time
+        match crate::task::percpu::sleep_until_ns(deadline, true) {
+            Ok(()) => 0,
+            Err(_) => KernelError::RestartNoHand.sysret(),
+        }
     } else {
-        // Relative time - same as nanosleep
-        let total_ns = request.tv_sec * 1_000_000_000 + request.tv_nsec;
-        let sleep_ticks = (total_ns + NS_PER_TICK - 1) / NS_PER_TICK;
-        let current_tick = crate::task::percpu::get_ticks();
-        current_tick + sleep_ticks as u64
-    };
-
-    // Put current task to sleep
-    do_nanosleep(wake_tick);
-
-    // EINTR handling blocked on signal infrastructure
-    let _ = rem;
-    0
+        do_nanosleep(now_mono.saturating_add(req_ns), rem)
+    }
 }
 
 /// sys_clock_getres - get resolution of specified clock
@@ -290,17 +272,28 @@ pub fn sys_time(tloc: u64) -> i64 {
     seconds
 }
 
-/// Internal sleep implementation
-fn do_nanosleep(wake_tick: u64) {
-    // Get current task TID
-    let tid = crate::task::percpu::current_tid();
-    if tid == 0 {
-        return; // No current task
+/// Sleep until the CLOCK_MONOTONIC `deadline`, interruptibly
+///
+/// On a signal, stores the remaining time in `rem` (if non-NULL) and returns
+/// -ERESTARTNOHAND: -EINTR once a handler runs (Linux returns
+/// -ERESTART_RESTARTBLOCK and restarts with the remaining time when no
+/// handler runs; hk restarts with the original request).
+fn do_nanosleep(deadline: u64, rem: u64) -> i64 {
+    match crate::task::percpu::sleep_until_ns(deadline, true) {
+        Ok(()) => 0,
+        Err(left) => {
+            if rem != 0 {
+                let ts = LinuxTimespec {
+                    tv_sec: (left / 1_000_000_000) as i64,
+                    tv_nsec: (left % 1_000_000_000) as i64,
+                };
+                if put_user::<Uaccess, LinuxTimespec>(rem, ts).is_err() {
+                    return KernelError::BadAddress.sysret();
+                }
+            }
+            KernelError::RestartNoHand.sysret()
+        }
     }
-
-    // Add to sleep queue and yield
-    // The scheduler will wake us when wake_tick is reached
-    crate::task::percpu::sleep_current_until(wake_tick);
 }
 
 /// sys_clock_settime - set time for specified clock

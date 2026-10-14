@@ -535,8 +535,8 @@ pub const SYS_SCHED_RR_GET_INTERVAL: u64 = 148;
 pub const SYS_SCHED_SETAFFINITY: u64 = 203;
 /// sched_getaffinity(pid, cpusetsize, mask)
 pub const SYS_SCHED_GETAFFINITY: u64 = 204;
-/// nice(inc)
-pub const SYS_NICE: u64 = 34;
+/// pause()
+pub const SYS_PAUSE: u64 = 34;
 
 // Resource limits
 /// getrlimit(resource, rlim)
@@ -1305,6 +1305,11 @@ pub fn x86_64_syscall_dispatch(
     // Account for entering kernel mode
     percpu::account_syscall_enter();
 
+    // Remember the syscall number for -ERESTART* restarts
+    unsafe {
+        crate::arch::x86_64::percpu::current_cpu_mut().syscall_nr = num;
+    }
+
     // Check seccomp policy before executing syscall
     // Note: ip is not available here, pass 0 for now
     if let Some(result) =
@@ -1887,14 +1892,7 @@ pub fn x86_64_syscall_dispatch(
             use crate::task::syscall::sys_sched_rr_get_interval;
             sys_sched_rr_get_interval::<Uaccess>(arg0 as i64, arg1, percpu::current_pid()) as u64
         }
-        SYS_NICE => {
-            use crate::task::syscall::sys_nice;
-            sys_nice(
-                arg0 as i32,
-                percpu::current_pid(),
-                percpu::current_cred().euid,
-            ) as u64
-        }
+        SYS_PAUSE => crate::signal::syscall::sys_pause() as u64,
 
         // System information
         SYS_GETCPU => {
@@ -2037,15 +2035,10 @@ pub fn x86_64_syscall_dispatch(
         _ => (-38i64) as u64, // ENOSYS
     };
 
-    // Record the syscall result so a signal frame set up by do_signal() saves
-    // it; rt_sigreturn then returns it to the interrupted code.
-    unsafe {
-        crate::arch::x86_64::percpu::current_cpu_mut().syscall_user_rax = result;
-    }
-
-    // Check for pending signals before returning to userspace
-    // This may modify the saved user context to invoke the signal handler
-    crate::signal::do_signal();
+    // Deliver pending signals / apply -ERESTART* rules before returning to
+    // user space (may redirect the return context to a handler or back up
+    // over the syscall instruction)
+    let result = crate::signal::syscall_exit_signal_work(result, num != SYS_RT_SIGRETURN);
 
     // Account for exiting kernel mode
     percpu::account_syscall_exit();

@@ -65,10 +65,10 @@ pub use aarch64::power;
 
 // IRQ-safe spinlock - architecture-specific implementation
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::spinlock::IrqSpinlock;
+pub use x86_64::spinlock::{IrqSpinlock, IrqSpinlockGuard};
 
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::spinlock::IrqSpinlock;
+pub use aarch64::spinlock::{IrqSpinlock, IrqSpinlockGuard};
 
 // Ptrace architecture-specific support
 #[cfg(target_arch = "x86_64")]
@@ -277,6 +277,25 @@ pub trait PerCpuOps {
 
     /// Get saved syscall user RSP (stack pointer for fork)
     fn get_syscall_user_rsp() -> u64;
+
+    /// Per-CPU syscall user-register block (see `save_syscall_user_state`)
+    type SyscallUserState: Copy;
+
+    /// Capture this CPU's syscall user-register block. The block belongs to
+    /// the current task; the scheduler keeps it on the task's kernel stack
+    /// across context switches.
+    fn save_syscall_user_state() -> Self::SyscallUserState;
+
+    /// Restore a block captured by `save_syscall_user_state`
+    fn restore_syscall_user_state(state: &Self::SyscallUserState);
+
+    /// Record the syscall return value in the user-register block (so a
+    /// signal frame saves it)
+    fn set_syscall_return(val: u64);
+
+    /// Make the current syscall re-execute on return to user (restart after
+    /// -ERESTART*). Returns the value the return register must hold.
+    fn syscall_restart() -> u64;
 }
 
 /// CPU control operations

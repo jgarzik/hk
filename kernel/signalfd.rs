@@ -235,8 +235,9 @@ impl Signalfd {
                 return Err(KernelError::WouldBlock);
             }
 
-            // Wait for signals
-            self.wait_queue.wait();
+            // Wait for signals (a signal ends the wait)
+            self.wait_queue
+                .wait_event_interruptible(|| self.has_pending_signals())?;
         }
     }
 

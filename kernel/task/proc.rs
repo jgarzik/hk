@@ -17,18 +17,31 @@ pub fn sys_sched_yield() {
     super::percpu::yield_now();
 }
 
+/// Wait queue for parents in wait4/waitid: woken whenever a task exits
+/// (Linux signal->wait_chldexit, simplified to one global queue; waiters
+/// re-check for their own zombies)
+pub static CHILD_EXIT_WQ: crate::waitqueue::WaitQueue = crate::waitqueue::WaitQueue::new();
+
 /// sys_exit - terminate the calling process
 ///
 /// # Arguments
-/// * `status` - Exit status (stored in zombie state for waitpid)
+/// * `status` - Exit code; the low 8 bits are reported to the parent
 ///
 /// This function never returns. The task is marked as zombie and the
 /// scheduler switches to the next runnable task.
 pub fn sys_exit(status: i32) -> u64 {
+    do_exit((status & 0xff) << 8)
+}
+
+/// Terminate the current task with a Linux wait status word
+///
+/// `(code << 8)` for a normal exit, the signal number (| 0x80 if a core was
+/// dumped) for a signal death, exactly what wait4 reports.
+pub fn do_exit(wait_status: i32) -> ! {
     let tid = super::percpu::current_tid();
 
-    // Mark task as Zombie (stores exit status for waitpid)
-    super::percpu::mark_zombie(tid, status);
+    // Mark task as Zombie (stores the status for wait4/waitid)
+    super::percpu::mark_zombie(tid, wait_status);
 
     // Remove from run queue and switch to another task (never returns)
     super::percpu::exit_current();
@@ -355,39 +368,44 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, _rusage: u64) -> i64 {
 
     let current_pid = super::percpu::current_pid();
 
-    // Loop until we find a zombie child or determine there are no children
-    loop {
-        // Try to reap a zombie child
-        if let Some((child_pid, exit_status)) =
+    use super::percpu::{SleepState, schedule};
+    use crate::waitqueue::{WaitEntry, signal_pending};
+
+    // Sleep on CHILD_EXIT_WQ until a matching child is a zombie
+    let mut w = WaitEntry::new();
+    let result = loop {
+        CHILD_EXIT_WQ.prepare_to_wait(&mut w, SleepState::Interruptible);
+
+        if let Some((child_pid, wait_status)) =
             super::percpu::reap_zombie_child(current_pid, pid, options)
         {
-            // Write status to user space if pointer is non-null
+            // The zombie holds the Linux wait status word
             if wstatus != 0 {
-                // Linux encodes exit status as (exit_code << 8)
-                let status_word = exit_status << 8;
-                unsafe {
-                    let ptr = wstatus as *mut i32;
-                    *ptr = status_word;
+                use crate::arch::Uaccess;
+                if crate::uaccess::put_user::<Uaccess, i32>(wstatus, wait_status).is_err() {
+                    break KernelError::BadAddress.sysret();
                 }
             }
-            return child_pid as i64;
+            break child_pid as i64;
         }
 
         // No zombie child found - check if we have any children at all
         if !super::percpu::has_children(current_pid, pid, options) {
-            return KernelError::NoChild.sysret();
+            break KernelError::NoChild.sysret();
         }
 
         // If WNOHANG, return 0 (no child ready)
         if options & WNOHANG != 0 {
-            return 0;
+            break 0;
         }
 
-        // Children exist but none are zombies yet - yield and retry
-        // This is a simple busy-wait implementation; a proper implementation
-        // would put the parent to sleep and wake it when a child exits.
-        super::percpu::yield_now();
-    }
+        if signal_pending() {
+            break KernelError::RestartSys.sysret();
+        }
+        schedule();
+    };
+    CHILD_EXIT_WQ.finish_wait(&w);
+    result
 }
 
 /// Simplified siginfo_t structure for waitid
@@ -415,9 +433,7 @@ pub struct SigInfo {
 
 // Signal codes for SIGCHLD
 const CLD_EXITED: i32 = 1; // Child has exited
-#[allow(dead_code)]
 const CLD_KILLED: i32 = 2; // Child was killed
-#[allow(dead_code)]
 const CLD_DUMPED: i32 = 3; // Child terminated abnormally
 #[allow(dead_code)]
 const CLD_TRAPPED: i32 = 4; // Traced child has trapped
@@ -507,39 +523,54 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
         _ => return KernelError::InvalidArgument.sysret(),
     };
 
-    // Loop until we find a zombie child or determine there are no children
-    loop {
+    use super::percpu::{SleepState, schedule};
+    use crate::waitqueue::{WaitEntry, signal_pending};
+
+    // Sleep on CHILD_EXIT_WQ until a matching child is a zombie
+    let mut w = WaitEntry::new();
+    let result = loop {
+        CHILD_EXIT_WQ.prepare_to_wait(&mut w, SleepState::Interruptible);
+
         // Try to reap a zombie child (or peek if WNOWAIT)
         // Note: WNOWAIT leaves child in waitable state - we don't fully support this yet
-        if let Some((child_pid, exit_status, utime, stime)) =
+        if let Some((child_pid, wait_status, utime, stime)) =
             super::percpu::reap_zombie_child_times(current_pid, wait_pid, options)
         {
             if rusage != 0
                 && super::misc::put_rusage_times::<Uaccess>(rusage, utime, stime).is_err()
             {
-                return KernelError::BadAddress.sysret();
+                break KernelError::BadAddress.sysret();
             }
             // Fill siginfo_t structure if pointer is non-null
             if infop != 0 {
+                // Decode the wait status word (exit code vs. killing signal)
+                let termsig = wait_status & 0x7f;
+                let (si_code, si_status) = if termsig == 0 {
+                    (CLD_EXITED, (wait_status >> 8) & 0xff)
+                } else if wait_status & 0x80 != 0 {
+                    (CLD_DUMPED, termsig)
+                } else {
+                    (CLD_KILLED, termsig)
+                };
                 let info = SigInfo {
                     si_signo: SIGCHLD,
                     si_errno: 0,
-                    si_code: CLD_EXITED,
+                    si_code,
                     _pad0: 0,
                     si_pid: child_pid as i32,
                     si_uid: 0,
-                    si_status: exit_status,
+                    si_status,
                 };
                 if put_user::<Uaccess, SigInfo>(infop, info).is_err() {
-                    return KernelError::BadAddress.sysret();
+                    break KernelError::BadAddress.sysret();
                 }
             }
-            return 0; // Success
+            break 0; // Success
         }
 
         // No zombie child found - check if we have any children at all
         if !super::percpu::has_children(current_pid, wait_pid, options) {
-            return KernelError::NoChild.sysret();
+            break KernelError::NoChild.sysret();
         }
 
         // If WNOHANG, return 0 but leave infop->si_pid as 0 to indicate no child
@@ -556,15 +587,19 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
                     si_status: 0,
                 };
                 if put_user::<Uaccess, SigInfo>(infop, info).is_err() {
-                    return KernelError::BadAddress.sysret();
+                    break KernelError::BadAddress.sysret();
                 }
             }
-            return 0;
+            break 0;
         }
 
-        // Children exist but none are zombies yet - yield and retry
-        super::percpu::yield_now();
-    }
+        if signal_pending() {
+            break KernelError::RestartSys.sysret();
+        }
+        schedule();
+    };
+    CHILD_EXIT_WQ.finish_wait(&w);
+    result
 }
 
 /// sys_set_tid_address - Set pointer for thread ID clearing on exit

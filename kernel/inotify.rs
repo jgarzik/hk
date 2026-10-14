@@ -439,8 +439,9 @@ impl Inotify {
                 return Err(KernelError::WouldBlock);
             }
 
-            // Wait for events
-            self.wait_queue.wait();
+            // Wait for events (a signal ends the wait)
+            self.wait_queue
+                .wait_event_interruptible(|| !self.inner.lock().events.is_empty())?;
         }
     }
 

@@ -621,16 +621,22 @@ pub fn get_task_sighand(tid: Tid) -> Option<Arc<SigHand>> {
 }
 
 /// Access a task's signal state for modification
+///
+/// Afterwards the task's TIF_SIGPENDING flag is recomputed, so it always
+/// means "a signal is deliverable under the current blocked mask" (what
+/// interruptible sleeps test via `signal_pending()`).
 pub fn with_task_signal_state<F, R>(tid: Tid, f: F) -> Option<R>
 where
     F: FnOnce(&mut TaskSignalState) -> R,
 {
     let mut table = TASK_TABLE.lock();
-    table
-        .tasks
-        .iter_mut()
-        .find(|t| t.tid == tid)
-        .map(|t| f(&mut t.signal_state))
+    table.tasks.iter_mut().find(|t| t.tid == tid).map(|t| {
+        let r = f(&mut t.signal_state);
+        t.signal_state.recalc_sigpending();
+        t.tif_sigpending
+            .store(t.signal_state.sigpending, Ordering::Release);
+        r
+    })
 }
 
 /// Clone signal state for fork/clone
@@ -726,23 +732,6 @@ pub fn exit_task_signal(tid: Tid) {
 // Signal Sending
 // =============================================================================
 
-/// Set TIF_SIGPENDING flag for a task
-fn set_tif_sigpending(tid: Tid) {
-    let table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter().find(|t| t.tid == tid) {
-        task.tif_sigpending.store(true, Ordering::Release);
-    }
-}
-
-/// Clear TIF_SIGPENDING flag for a task
-#[allow(dead_code)]
-fn clear_tif_sigpending(tid: Tid) {
-    let table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter().find(|t| t.tid == tid) {
-        task.tif_sigpending.store(false, Ordering::Release);
-    }
-}
-
 /// Check if a task has pending signals (fast path)
 pub fn has_pending_signals(tid: Tid) -> bool {
     let table = TASK_TABLE.lock();
@@ -754,7 +743,33 @@ pub fn has_pending_signals(tid: Tid) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `sig` would be discarded on arrival (Linux sig_ignored): its
+/// handler is SIG_IGN, or SIG_DFL with an "ignore" default (SIGCHLD,
+/// SIGURG, SIGWINCH, and SIGCONT, which hk does not act on), and it is not
+/// blocked (a blocked signal stays queued: the handler may change)
+fn sig_ignored(state: &TaskSignalState, sighand: Option<&Arc<SigHand>>, sig: u32) -> bool {
+    if state.blocked.contains(sig) || sig == SIGKILL || sig == SIGSTOP {
+        return false;
+    }
+    let Some(action) = sighand.and_then(|h| h.get_action(sig)) else {
+        return false;
+    };
+    match action.handler {
+        SigHandler::Ignore => true,
+        SigHandler::Default => matches!(
+            default_action(sig),
+            DefaultAction::Ignore | DefaultAction::Continue
+        ),
+        SigHandler::Handler(_) => false,
+    }
+}
+
 /// Send a signal to a specific task (thread)
+///
+/// Queues the signal and, if it is deliverable, wakes the task from an
+/// interruptible sleep (Linux signal_wake_up) so the blocked syscall can
+/// return -ERESTART*/-EINTR and the signal is delivered on the way out.
+/// Process context only (takes TASK_TABLE).
 ///
 /// Returns 0 on success, negative errno on error.
 pub fn send_signal(tid: Tid, sig: u32) -> i32 {
@@ -772,21 +787,27 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
         return -22; // EINVAL
     }
 
-    // Add to pending
+    // Queue unless ignored; note whether it is deliverable now
+    let sighand = get_task_sighand(tid);
     let result = with_task_signal_state(tid, |state| {
+        if sig_ignored(state, sighand.as_ref(), sig) {
+            return false;
+        }
         state.pending.add(sig);
-        state.recalc_sigpending();
+        !state.blocked.contains(sig)
     });
 
-    if result.is_none() {
-        return -3; // ESRCH
-    }
-
-    // Set TIF_SIGPENDING flag
-    set_tif_sigpending(tid);
+    let deliverable = match result {
+        None => return -3, // ESRCH
+        Some(d) => d,
+    };
 
     // Wake any signalfds monitoring this signal
     crate::signalfd::wake_signalfds_for_signal(tid, sig);
+
+    if deliverable {
+        crate::task::percpu::wake_up_tid(tid, crate::task::percpu::WakeMode::Interruptible);
+    }
 
     0
 }
@@ -1069,30 +1090,83 @@ fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool)
 // Signal Delivery Entry Point
 // =============================================================================
 
-/// Check for and deliver pending signals
+/// Signal work on syscall exit (Linux arch_do_signal_or_restart)
 ///
-/// This function is called from the syscall return path. It:
-/// 1. Checks if there are any deliverable signals
-/// 2. Dequeues the next signal
-/// 3. For user handlers, sets up the signal frame
-/// 4. For default actions, performs the action (terminate, stop, etc.)
+/// `result` is the syscall's return value; `restartable` is false for
+/// rt_sigreturn (its "result" is restored user state). Delivers pending
+/// signals (handler frame, default action or ignore) and applies the
+/// restart rules for the kernel-internal codes:
+///
+/// | result         | handler runs                     | no handler |
+/// |----------------|----------------------------------|------------|
+/// | -ERESTARTSYS   | restart if SA_RESTART, else EINTR| restart    |
+/// | -ERESTARTNOINTR| restart                          | restart    |
+/// | -ERESTARTNOHAND| EINTR                            | restart    |
+///
+/// "Restart" backs the user PC up over the syscall instruction and restores
+/// the syscall's first register, so the syscall runs again (after the
+/// handler, if any). Returns the value for the user return register.
 ///
 /// If a syscall left a temporary mask in place (`saved_sigmask`, e.g.
-/// rt_sigsuspend), the signal is dequeued under the temporary mask and the
-/// saved original mask is stored in the signal frame so rt_sigreturn restores
-/// it. If no handler frame is set up, the saved mask is restored immediately
-/// (Linux: set_restore_sigmask / restore_saved_sigmask).
-///
-/// Returns true if a signal was handled (frame set up or action taken),
-/// false if no signals were deliverable.
-pub fn do_signal() -> bool {
-    let tid = crate::task::percpu::current_tid();
+/// rt_sigsuspend), signals are dequeued under it and the saved mask goes
+/// into the signal frame; with no frame it is restored here.
+pub fn syscall_exit_signal_work(result: u64, restartable: bool) -> u64 {
+    use crate::arch::{CurrentArch, PerCpuOps};
+    use crate::error::KernelError;
 
-    let handled = do_signal_inner(tid);
-    if !handled {
-        restore_saved_sigmask(tid);
+    const ERESTARTSYS: i64 = KernelError::RestartSys.sysret();
+    const ERESTARTNOINTR: i64 = KernelError::RestartNoIntr.sysret();
+    const ERESTARTNOHAND: i64 = KernelError::RestartNoHand.sysret();
+    const EINTR: u64 = KernelError::Interrupted.sysret() as u64;
+
+    let tid = crate::task::percpu::current_tid();
+    let err = result as i64;
+    let restart = restartable && matches!(err, ERESTARTSYS | ERESTARTNOINTR | ERESTARTNOHAND);
+
+    // The signal frame saves the user return register
+    CurrentArch::set_syscall_return(result);
+
+    while has_pending_signals(tid) {
+        let Some((sig, action)) = get_signal_to_deliver(tid) else {
+            break;
+        };
+        match action.handler {
+            SigHandler::Ignore => continue,
+            SigHandler::Default => match default_action(sig) {
+                DefaultAction::Terminate | DefaultAction::Core => {
+                    // Killed by the signal: wait status = signal number
+                    crate::task::proc::do_exit(sig as i32);
+                }
+                // Stop/continue are not implemented: treat as ignored
+                _ => continue,
+            },
+            SigHandler::Handler(_) => {
+                let mut ret = result;
+                if restart {
+                    let restart_now = err == ERESTARTNOINTR
+                        || (err == ERESTARTSYS && action.flags & sa_flags::SA_RESTART != 0);
+                    ret = if restart_now {
+                        CurrentArch::syscall_restart()
+                    } else {
+                        CurrentArch::set_syscall_return(EINTR);
+                        EINTR
+                    };
+                }
+                if deliver_to_handler(tid, sig, &action) {
+                    return ret;
+                }
+                // Frame setup failed: SIGSEGV was forced; deliver it
+                continue;
+            }
+        }
     }
-    handled
+
+    // No handler ran
+    restore_saved_sigmask(tid);
+    if restart {
+        return CurrentArch::syscall_restart();
+    }
+    result
 }
 
 /// Restore and clear `saved_sigmask` if a syscall left one in place
@@ -1105,84 +1179,34 @@ fn restore_saved_sigmask(tid: Tid) {
     });
 }
 
-fn do_signal_inner(tid: Tid) -> bool {
+/// Set up the handler frame for `sig`; false if that failed (SIGSEGV forced)
+fn deliver_to_handler(tid: Tid, sig: u32, action: &SigAction) -> bool {
     use crate::arch::signal;
 
-    // Check if there are pending signals
-    if !has_pending_signals(tid) {
-        return false;
-    }
+    // Mask to save in the frame (restored by rt_sigreturn): the
+    // pre-syscall mask if a temporary one is in effect, else current.
+    let frame_mask =
+        with_task_signal_state(tid, |state| state.saved_sigmask.unwrap_or(state.blocked))
+            .unwrap_or(SigSet::EMPTY);
 
-    // Get next deliverable signal
-    let (sig, action) = match get_signal_to_deliver(tid) {
-        Some((s, a)) => (s, a),
-        None => return false,
-    };
-
-    // Handle based on action type
-    match action.handler {
-        SigHandler::Default => {
-            // Perform default action
-            handle_default_action(tid, sig)
-        }
-        SigHandler::Ignore => {
-            // Signal ignored, nothing to do
-            false
-        }
-        SigHandler::Handler(_) => {
-            // Mask to save in the frame (restored by rt_sigreturn): the
-            // pre-syscall mask if a temporary one is in effect, else current.
-            let frame_mask =
-                with_task_signal_state(tid, |state| state.saved_sigmask.unwrap_or(state.blocked))
-                    .unwrap_or(SigSet::EMPTY);
-
-            // Set up signal frame
-            match signal::setup_rt_frame(sig, &action, frame_mask) {
-                Ok(()) => {
-                    // Update blocked mask: add action.mask and the signal itself (unless SA_NODEFER)
-                    with_task_signal_state(tid, |state| {
-                        // Saved mask now lives in the frame
-                        state.saved_sigmask = None;
-                        state.blocked = state.blocked.union(&action.mask);
-                        if action.flags & sa_flags::SA_NODEFER == 0 {
-                            state.blocked.add(sig);
-                        }
-                        state.recalc_sigpending();
-                    });
-                    true
+    match signal::setup_rt_frame(sig, action, frame_mask) {
+        Ok(()) => {
+            // Block action.mask and the signal itself (unless SA_NODEFER)
+            with_task_signal_state(tid, |state| {
+                // Saved mask now lives in the frame
+                state.saved_sigmask = None;
+                state.blocked = state.blocked.union(&action.mask);
+                if action.flags & sa_flags::SA_NODEFER == 0 {
+                    state.blocked.add(sig);
                 }
-                Err(_) => {
-                    // Frame setup failed (invalid stack) - force SIGSEGV
-                    restore_saved_sigmask(tid);
-                    force_sigsegv(tid);
-                    true
-                }
-            }
-        }
-    }
-}
-
-/// Handle default signal action
-fn handle_default_action(_tid: Tid, sig: u32) -> bool {
-    match default_action(sig) {
-        DefaultAction::Terminate | DefaultAction::Core => {
-            // Terminate the process with signal exit status
-            // Signal exit status is (signal | 0x80) by convention
-            crate::task::proc::sys_exit((sig as i32) | 0x80);
+                state.recalc_sigpending();
+            });
             true
         }
-        DefaultAction::Stop => {
-            // TODO: Implement process stop
-            // For now, just ignore
-            false
-        }
-        DefaultAction::Continue => {
-            // TODO: Implement process continue
-            // For now, just ignore
-            false
-        }
-        DefaultAction::Ignore => {
-            // Signal ignored
+        Err(_) => {
+            // Frame setup failed (invalid stack) - force SIGSEGV
+            restore_saved_sigmask(tid);
+            force_sigsegv(tid);
             false
         }
     }

@@ -12,6 +12,7 @@
 //! Note: rt_sigreturn (15) is implemented in arch-specific signal.rs files
 
 use crate::arch::{CurrentArch, PerCpuOps, Uaccess};
+use crate::error::KernelError;
 use crate::signal::{
     SIGKILL, SIGSTOP, SigAction, SigSet, UNMASKABLE_SIGNALS, get_task_sighand, send_signal,
     send_signal_to_pgrp, send_signal_to_process, with_task_signal_state,
@@ -565,16 +566,32 @@ pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
         return -3; // ESRCH
     }
 
-    // Sleep until a signal is deliverable under the temporary mask.
-    // Signal senders do not wake sleepers directly, so re-check every tick.
-    while !with_task_signal_state(tid, |state| state.has_deliverable_signals()).unwrap_or(true) {
-        let wake_tick = crate::task::percpu::get_ticks().saturating_add(1);
-        crate::task::percpu::sleep_current_until(wake_tick);
-    }
+    // Sleep until a signal is deliverable under the temporary mask
+    // (send_signal wakes interruptible sleepers)
+    wait_for_signal();
 
-    // Linux returns -ERESTARTNOHAND, which becomes -EINTR once a handler
-    // runs; hk has no syscall restart, so return -EINTR directly.
-    -4 // EINTR
+    // -EINTR once the handler runs (the saved mask goes into its frame)
+    KernelError::RestartNoHand.sysret()
+}
+
+/// Sleep interruptibly until a signal is deliverable
+fn wait_for_signal() {
+    use crate::task::percpu::{SleepState, schedule, set_current_state};
+    loop {
+        set_current_state(SleepState::Interruptible);
+        if crate::waitqueue::signal_pending() {
+            break;
+        }
+        schedule();
+    }
+    set_current_state(SleepState::Running);
+}
+
+/// pause() - sleep until a signal handler runs (x86-64 only; arm64 libc
+/// uses ppoll). Returns -EINTR after the handler, like Linux.
+pub fn sys_pause() -> i64 {
+    wait_for_signal();
+    KernelError::RestartNoHand.sysret()
 }
 
 /// siginfo_t structure for user space (Linux ABI)

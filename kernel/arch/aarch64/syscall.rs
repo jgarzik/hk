@@ -1281,17 +1281,8 @@ pub fn aarch64_syscall_dispatch(
         }
     };
 
-    // Update percpu.syscall_user_regs[0] with the syscall result BEFORE calling do_signal()
-    // This is important because if do_signal() sets up a signal frame, the saved context
-    // should have the correct return value (not the original x0 argument).
-    // When the signal handler returns via rt_sigreturn, x0 will be restored to this value.
-    unsafe {
-        super::percpu::current_cpu_mut().syscall_user_regs[0] = result;
-    }
-
-    // Check for pending signals before returning to userspace
-    // This may modify the saved user context to invoke the signal handler
-    crate::signal::do_signal();
-
-    result
+    // Deliver pending signals / apply -ERESTART* rules before returning to
+    // user space (may redirect the return context to a handler or back up
+    // over the svc)
+    crate::signal::syscall_exit_signal_work(result, num != SYS_RT_SIGRETURN)
 }

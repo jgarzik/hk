@@ -49,6 +49,7 @@ pub fn sys_read(fd: i32, buf_ptr: u64, count: u64) -> i64 {
             Err(KernelError::IsDirectory) => return KernelError::IsDirectory.sysret(),
             Err(KernelError::PermissionDenied) => return KernelError::BadFd.sysret(),
             Err(KernelError::WouldBlock) => return KernelError::WouldBlock.sysret(),
+            Err(e @ (KernelError::RestartSys | KernelError::Interrupted)) => return e.sysret(),
             Err(_) => return KernelError::InvalidArgument.sysret(),
         };
 
@@ -68,6 +69,7 @@ pub fn sys_read(fd: i32, buf_ptr: u64, count: u64) -> i64 {
             Err(KernelError::IsDirectory) => return KernelError::IsDirectory.sysret(),
             Err(KernelError::PermissionDenied) => return KernelError::BadFd.sysret(),
             Err(KernelError::WouldBlock) => return KernelError::WouldBlock.sysret(),
+            Err(e @ (KernelError::RestartSys | KernelError::Interrupted)) => return e.sysret(),
             Err(_) => return KernelError::InvalidArgument.sysret(),
         };
 

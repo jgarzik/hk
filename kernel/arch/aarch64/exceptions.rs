@@ -171,6 +171,7 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
                 percpu.syscall_user_sp = frame.sp;
                 // Save all GPRs for fork/clone (child needs to inherit parent's registers)
                 percpu.syscall_user_regs = frame.x;
+                percpu.syscall_orig_x0 = frame.x[0];
             }
             // Syscall number in x8, arguments in x0-x5, return value in x0
             let result = super::syscall::aarch64_syscall_dispatch(

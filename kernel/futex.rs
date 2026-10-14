@@ -38,7 +38,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::error::KernelError;
-use crate::task::{Priority, TaskState, Tid};
+use crate::task::{Priority, Tid};
 use crate::uaccess::{get_user, put_user};
 
 // Architecture-specific uaccess implementation
@@ -131,17 +131,80 @@ pub struct FutexQ {
     pub priority: Priority,
     /// Bitset for selective wake (FUTEX_WAIT_BITSET/FUTEX_WAKE_BITSET)
     pub bitset: u32,
+    /// CPU owning the waiting task (for the wakeup)
+    pub cpu: u32,
 }
 
 impl FutexQ {
-    /// Create a new futex queue entry
+    /// Create a new futex queue entry for a task on the current CPU
     pub fn new(key: FutexKey, tid: Tid, priority: Priority, bitset: u32) -> Self {
         Self {
             key,
             tid,
             priority,
             bitset,
+            cpu: crate::task::percpu::current_cpu(),
         }
+    }
+}
+
+/// Why a futex sleep ended
+enum FutexSleep {
+    /// Our queue entry was removed by a waker
+    Woken,
+    /// A signal is pending
+    Signal,
+    /// The deadline passed
+    Timeout,
+}
+
+/// Current time on the futex timeout clock, in ns
+fn futex_clock_ns(realtime: bool) -> u64 {
+    use crate::time::{ClockId, TIMEKEEPER};
+    let clock = if realtime {
+        ClockId::Realtime
+    } else {
+        ClockId::Monotonic
+    };
+    let ts = TIMEKEEPER.read(clock, TIMEKEEPER.get_read_cycles());
+    (ts.sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.nsec as u64)
+}
+
+/// Sleep interruptibly until `queued()` turns false (a waker dequeued us),
+/// a signal arrives, or `deadline_ns` (on the given clock) passes
+fn futex_sleep<F: Fn() -> bool>(queued: F, deadline_ns: Option<u64>, realtime: bool) -> FutexSleep {
+    use crate::task::percpu::{
+        SleepState, ns_to_ticks, schedule, schedule_timeout, set_current_state,
+    };
+    let result = loop {
+        set_current_state(SleepState::Interruptible);
+        if !queued() {
+            break FutexSleep::Woken;
+        }
+        if crate::waitqueue::signal_pending() {
+            break FutexSleep::Signal;
+        }
+        match deadline_ns {
+            None => schedule(),
+            Some(d) => {
+                let now = futex_clock_ns(realtime);
+                if now >= d {
+                    break FutexSleep::Timeout;
+                }
+                schedule_timeout(ns_to_ticks(d - now));
+            }
+        }
+    };
+    set_current_state(SleepState::Running);
+    result
+}
+
+/// Wake the tasks dequeued by a futex wake/requeue (bucket locks dropped)
+fn futex_wake_tasks(tasks: &[(Tid, u32)]) {
+    for &(tid, cpu) in tasks {
+        crate::task::percpu::wake_up_task(tid, cpu, crate::task::percpu::WakeMode::Any);
     }
 }
 
@@ -343,11 +406,12 @@ fn get_current_task_info() -> (Tid, u64, Priority) {
 pub fn futex_wait(
     uaddr: u64,
     expected: u32,
-    timeout_ns: Option<u64>,
+    deadline_ns: Option<u64>,
+    realtime: bool,
     bitset: u32,
     is_private: bool,
 ) -> i32 {
-    use crate::task::percpu::{SCHEDULING_ENABLED, TASK_TABLE, current_percpu_sched};
+    use crate::task::percpu::SCHEDULING_ENABLED;
 
     // Validate bitset (0 is invalid per Linux ABI)
     if bitset == 0 {
@@ -408,60 +472,36 @@ pub fn futex_wait(
         return KernelError::WouldBlock.to_errno_neg();
     }
 
-    // Mark task as sleeping
-    {
-        let mut table = TASK_TABLE.lock();
-        if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-            task.state = TaskState::Sleeping;
-        }
-    }
+    let still_queued = || {
+        bucket
+            .waiters
+            .lock()
+            .iter()
+            .any(|q| q.tid == tid && q.key == key)
+    };
+    let why = futex_sleep(still_queued, deadline_ns, realtime);
 
-    // Schedule away (with optional timeout)
-    let deadline = timeout_ns.map(|ns| {
-        let ts = crate::time::TIMEKEEPER.current_time();
-        let now_ns = (ts.sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(ts.nsec as u64);
-        now_ns.saturating_add(ns)
-    });
-
-    // Add to sleep queue if timeout specified
-    if let Some(deadline_ns) = deadline
-        && let Some(sched) = current_percpu_sched()
-        && sched.initialized.load(Ordering::Acquire)
-    {
-        use crate::task::sched::SleepEntry;
-        let mut rq = sched.lock.lock();
-        rq.sleep_queue.push(SleepEntry {
-            tid,
-            wake_tick: deadline_ns,
-            priority,
-        });
-        rq.sleep_queue.sort_by_key(|e| e.wake_tick);
-    }
-
-    // Yield to scheduler
-    crate::task::syscall::sys_sched_yield();
-
-    // We've been woken (or timed out)
-    // Check if we're still in the queue (indicates timeout, not wake)
-    let was_timeout = {
+    // Dequeue ourselves unless a waker already did
+    let dequeued_self = {
         let mut waiters = bucket.waiters.lock();
         if let Some(pos) = waiters.iter().position(|q| q.tid == tid && q.key == key) {
-            // Still in queue - we weren't woken by futex_wake
             waiters.remove(pos);
             bucket.dec_waiters();
             true
         } else {
-            // Not in queue - we were woken normally
             false
         }
     };
-
-    if was_timeout && timeout_ns.is_some() {
-        KernelError::TimedOut.to_errno_neg()
-    } else {
-        0
+    if !dequeued_self {
+        return 0; // woken by futex_wake (possibly racing a signal/timeout)
+    }
+    match why {
+        FutexSleep::Woken => 0,
+        FutexSleep::Timeout => KernelError::TimedOut.to_errno_neg(),
+        // Linux: -ERESTARTSYS without timeout; with one it restarts via
+        // restart_block, approximated here by -EINTR (callers retry)
+        FutexSleep::Signal if deadline_ns.is_none() => KernelError::RestartSys.to_errno_neg(),
+        FutexSleep::Signal => KernelError::Interrupted.to_errno_neg(),
     }
 }
 
@@ -478,9 +518,6 @@ pub fn futex_wait(
 /// # Returns
 /// Number of waiters woken (non-negative), or -EINVAL if bitset is 0
 pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i32 {
-    use crate::task::TaskState;
-    use crate::task::percpu::{TASK_TABLE, current_percpu_sched};
-
     if num_wake <= 0 {
         return 0;
     }
@@ -510,7 +547,7 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i
 
     // Collect waiters to wake
     let mut woken = 0i32;
-    let mut to_wake: Vec<(Tid, Priority)> = Vec::new();
+    let mut to_wake: Vec<(Tid, u32)> = Vec::new();
 
     {
         let mut waiters = bucket.waiters.lock();
@@ -520,7 +557,7 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i
             if waiters[i].key == key && (waiters[i].bitset & bitset) != 0 {
                 let q = waiters.remove(i);
                 bucket.dec_waiters();
-                to_wake.push((q.tid, q.priority));
+                to_wake.push((q.tid, q.cpu));
                 woken += 1;
             } else {
                 i += 1;
@@ -529,24 +566,7 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i
     }
 
     // Wake tasks outside the bucket lock
-    for (tid, priority) in to_wake {
-        // Mark task as ready
-        {
-            let mut table = TASK_TABLE.lock();
-            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-                task.state = TaskState::Ready;
-            }
-        }
-
-        // Add to run queue
-        if let Some(sched) = current_percpu_sched()
-            && sched.initialized.load(Ordering::Acquire)
-        {
-            let mut rq = sched.lock.lock();
-            rq.queue().enqueue(tid, priority);
-            rq.nr_running += 1;
-        }
-    }
+    futex_wake_tasks(&to_wake);
 
     woken
 }
@@ -574,9 +594,6 @@ pub fn futex_requeue(
     cmpval: Option<u32>,
     is_private: bool,
 ) -> i32 {
-    use crate::task::TaskState;
-    use crate::task::percpu::{TASK_TABLE, current_percpu_sched};
-
     if nr_wake < 0 || nr_requeue < 0 {
         return KernelError::InvalidArgument.to_errno_neg();
     }
@@ -599,7 +616,7 @@ pub fn futex_requeue(
     let bucket2 = futex_bucket(&key2);
     let same_bucket = core::ptr::eq(bucket1, bucket2);
 
-    let mut to_wake: Vec<(Tid, Priority)> = Vec::new();
+    let mut to_wake: Vec<(Tid, u32)> = Vec::new();
     let mut to_requeue: Vec<FutexQ> = Vec::new();
     let mut woken = 0i32;
     let mut requeued = 0i32;
@@ -626,7 +643,7 @@ pub fn futex_requeue(
                     // Wake this waiter
                     let q = waiters.remove(i);
                     bucket1.dec_waiters();
-                    to_wake.push((q.tid, q.priority));
+                    to_wake.push((q.tid, q.cpu));
                     woken += 1;
                 } else if requeued < nr_requeue {
                     // Mark for requeue
@@ -664,22 +681,7 @@ pub fn futex_requeue(
     }
 
     // Phase 3: Wake collected tasks
-    for (tid, priority) in to_wake {
-        {
-            let mut table = TASK_TABLE.lock();
-            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-                task.state = TaskState::Ready;
-            }
-        }
-
-        if let Some(sched) = current_percpu_sched()
-            && sched.initialized.load(Ordering::Acquire)
-        {
-            let mut rq = sched.lock.lock();
-            rq.queue().enqueue(tid, priority);
-            rq.nr_running += 1;
-        }
-    }
+    futex_wake_tasks(&to_wake);
 
     woken + requeued
 }
@@ -895,15 +897,24 @@ pub fn sys_futex(
 
     let op = futex_op & FUTEX_CMD_MASK;
     let is_private = (futex_op & FUTEX_PRIVATE_FLAG) != 0;
-    let _use_realtime = (futex_op & FUTEX_CLOCK_REALTIME) != 0;
+    let use_realtime = (futex_op & FUTEX_CLOCK_REALTIME) != 0;
 
     match op {
         FUTEX_WAIT => {
+            // Relative timeout, always on CLOCK_MONOTONIC
             let timeout = match read_user_timeout(timeout_or_val2) {
                 Ok(t) => t,
                 Err(e) => return e,
             };
-            futex_wait(uaddr, val, timeout, FUTEX_BITSET_MATCH_ANY, is_private)
+            let deadline = timeout.map(|ns| futex_clock_ns(false).saturating_add(ns));
+            futex_wait(
+                uaddr,
+                val,
+                deadline,
+                false,
+                FUTEX_BITSET_MATCH_ANY,
+                is_private,
+            )
         }
 
         FUTEX_WAKE => futex_wake(uaddr, val as i32, FUTEX_BITSET_MATCH_ANY, is_private),
@@ -912,11 +923,12 @@ pub fn sys_futex(
             if val3 == 0 {
                 return KernelError::InvalidArgument.to_errno_neg();
             }
-            let timeout = match read_user_timeout(timeout_or_val2) {
+            // Absolute timeout on CLOCK_MONOTONIC (or REALTIME if flagged)
+            let deadline = match read_user_timeout(timeout_or_val2) {
                 Ok(t) => t,
                 Err(e) => return e,
             };
-            futex_wait(uaddr, val, timeout, val3, is_private)
+            futex_wait(uaddr, val, deadline, use_realtime, val3, is_private)
         }
 
         FUTEX_WAKE_BITSET => {
@@ -1119,10 +1131,9 @@ pub fn sys_futex_waitv(
 fn futex_wait_multiple(
     entries: &mut [FutexWaitvEntry],
     timeout_ns: Option<u64>,
-    _use_realtime: bool,
+    use_realtime: bool,
 ) -> i32 {
-    use crate::task::TaskState;
-    use crate::task::percpu::{SCHEDULING_ENABLED, TASK_TABLE, current_percpu_sched};
+    use crate::task::percpu::SCHEDULING_ENABLED;
 
     // Check scheduling is enabled
     if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
@@ -1214,73 +1225,49 @@ fn futex_wait_multiple(
             return KernelError::WouldBlock.to_errno_neg(); // Same as -EWOULDBLOCK
         }
 
-        // All values match and we're enqueued on all futexes
-        // Mark task as sleeping
-        {
-            let mut table = TASK_TABLE.lock();
-            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-                task.state = TaskState::Sleeping;
-            }
-        }
+        // All values match and we're enqueued on all futexes: sleep until a
+        // waker dequeues us from any of them, a signal, or the deadline
+        let why = {
+            let entries_ref: &[FutexWaitvEntry] = entries;
+            let queued_all = || {
+                entries_ref.iter().all(|e| {
+                    futex_bucket(&e.key)
+                        .waiters
+                        .lock()
+                        .iter()
+                        .any(|q| q.tid == tid && q.key == e.key)
+                })
+            };
+            futex_sleep(queued_all, timeout_ns, use_realtime)
+        };
 
-        // Add to sleep queue if timeout specified
-        if let Some(deadline_ns) = timeout_ns
-            && let Some(sched) = current_percpu_sched()
-            && sched.initialized.load(Ordering::Acquire)
-        {
-            use crate::task::sched::SleepEntry;
-            let mut rq = sched.lock.lock();
-            rq.sleep_queue.push(SleepEntry {
-                tid,
-                wake_tick: deadline_ns,
-                priority,
-            });
-            rq.sleep_queue.sort_by_key(|e| e.wake_tick);
-        }
-
-        // Phase 3: Sleep - yield to scheduler
-        crate::task::syscall::sys_sched_yield();
-
-        // Phase 4: We've been woken - check which futex was woken
+        // Dequeue from the futexes nobody woke us from
         let mut woken_index: i32 = -1;
-
         for (i, entry) in entries.iter_mut().enumerate() {
             let bucket = futex_bucket(&entry.key);
             let mut waiters = bucket.waiters.lock();
-
-            // Check if we're still in this bucket's queue
             if let Some(pos) = waiters
                 .iter()
                 .position(|q| q.tid == tid && q.key == entry.key)
             {
-                // Still in queue - we weren't woken from this futex
                 waiters.remove(pos);
                 bucket.dec_waiters();
             } else {
-                // Not in queue - we were woken from this futex
+                // A waker dequeued us (and already dropped the count)
                 entry.woken = true;
                 if woken_index < 0 {
                     woken_index = i as i32;
                 }
-                bucket.dec_waiters();
             }
         }
 
-        // If we found a woken futex, return its index
         if woken_index >= 0 {
             return woken_index;
         }
-
-        // No futex was woken - check for timeout
-        if let Some(deadline_ns) = timeout_ns {
-            // Check if timeout has expired
-            let ts = crate::time::TIMEKEEPER.current_time();
-            let now_ns = (ts.sec as u64)
-                .saturating_mul(1_000_000_000)
-                .saturating_add(ts.nsec as u64);
-            if now_ns >= deadline_ns {
-                return KernelError::TimedOut.to_errno_neg();
-            }
+        match why {
+            FutexSleep::Timeout => return KernelError::TimedOut.to_errno_neg(),
+            FutexSleep::Signal => return KernelError::RestartSys.to_errno_neg(),
+            FutexSleep::Woken => {}
         }
 
         // Spurious wakeup - retry the entire operation

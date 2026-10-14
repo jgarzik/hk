@@ -257,7 +257,7 @@ Other CPUs cannot cause deadlock because:
 
 ### 3.1 Scheduler
 
-**Location:** `kernel/percpu_sched.rs`
+**Location:** `kernel/task/percpu.rs`
 
 The scheduler uses a per-CPU locking model to minimize contention.
 
@@ -289,35 +289,70 @@ pub needs_reschedule: AtomicBool, // Reschedule request flag
 
 #### Locking Rules
 
-1. **Each CPU only locks its own run queue** - Cross-CPU operations go through
-   `TASK_TABLE` or use IPIs.
+1. **Each CPU only locks its own run queue** - no CPU ever takes another
+   CPU's `PerCpuScheduler.lock`. A wakeup for a task owned by another CPU is
+   posted to that CPU's `wake_list` (an `IrqSpinlock<Vec<(Tid, WakeMode)>>`,
+   a leaf lock) and applied by the owner, under its rq lock, at its next
+   `schedule()`/`yield_now()`/tick (Linux ttwu_queue). Tasks never migrate:
+   `Task.cpu` names the owning run queue.
 
 2. **Run queue lock is IRQ-safe** - Timer interrupts cannot cause deadlocks.
+   Lock order: rq lock → `wake_list` (drain) and rq lock → `TASK_TABLE`
+   (switch info, priority refresh). Never take an rq lock while holding
+   `TASK_TABLE`, and never call a wakeup (`wake_up_task`, `WaitQueue::wake*`)
+   while holding this CPU's rq lock (it is not recursive).
 
-3. **Context switch happens with lock held** - The lock is released after
-   returning from `context_switch()`.
+3. **Context switch happens with lock held** - The lock is released by the
+   task switched to (its guard drop, or `finish_context_switch` for a new
+   task).
 
 4. **Drop lock before `context_switch_first()`** - The initial switch to a
    task never returns, so the lock must be explicitly dropped.
 
-5. **Timer ISR only touches local CPU** - `wake_sleepers()` only processes
-   the current CPU's sleep queue to maintain locality.
+5. **Timer ISR only touches local CPU** - `wake_sleepers()` drains the local
+   `wake_list` and wakes expired sleepers of the local sleep queue only.
 
-**Lock acquisition pattern:**
-```rust
-// In yield_now() or try_schedule()
-let sched = get_percpu_sched(cpu_id);
-let mut rq = sched.lock.lock();  // IRQs disabled, preempt_count++
+6. **Per-CPU syscall user state belongs to the current task** - the
+   `syscall_user_*` block in per-CPU data is saved on the outgoing task's
+   kernel stack across every `context_switch` and restored when it runs
+   again, so a task that slept inside a syscall returns (and builds signal
+   frames) with its own registers.
 
-// Safe to acquire TASK_TABLE while holding IrqSpinlock
-// (interrupts are disabled, so no ISR can try to acquire TASK_TABLE)
-let table = TASK_TABLE.lock();
+#### Sleep / Wakeup Protocol (Linux set_current_state / try_to_wake_up)
 
-// ... modify run queue, select next task ...
+Each run-queue entry (`KernelThreadContext`) carries the scheduling truth:
+`state: SleepState {Running, Interruptible, Uninterruptible}` and `queued`
+(present in the priority queue; prevents double enqueue).
 
-unsafe { context_switch(curr, next, next_kstack); }
-// Lock automatically released when guard drops after context switch returns
+```text
+sleeper                                   waker (any CPU, any context)
+-------                                   -----
+register on wait queue                    make condition true
+set_current_state(Interruptible)          wake_up_task(tid, cpu, mode):
+if condition: done                          own CPU:  lock rq, try_wake
+if signal_pending(): -ERESTARTSYS           remote:   push to wake_list
+schedule()  // returns at once if a       try_wake: state != Running →
+            // wakeup already set Running   Running, enqueue unless current
 ```
+
+`WakeMode::Interruptible` (signals) wakes only `Interruptible` sleepers;
+`WakeMode::Any` (wait queues, timeouts) wakes both. `schedule_timeout(t)`
+adds a sleep-queue entry; whichever of wakeup and timeout comes first ends
+the sleep and the entry is removed afterwards. Spurious wakeups are allowed:
+every sleeper re-checks its condition.
+
+**Preemption model:** hk is non-preemptive (cooperative). The timer tick
+never switches tasks, in kernel or user mode; switches happen only in
+`schedule()`, `yield_now()`, `exit_current()` and AP startup. Therefore a
+`spin::Mutex`/`RwLock` holder is never involuntarily preempted, and the only
+same-CPU hazard is an IRQ handler taking a lock the interrupted code holds
+(hence the IRQ rules). A `PreemptSpinlock` is not needed today; if
+preemption is ever added it must honor `preempt_count`, and `spin::Mutex`
+would then need a preempt-disabling wrapper.
+
+**RCU hook:** `PerCpuScheduler.nr_switches` counts context switches per CPU;
+since kernel code cannot be preempted, a change in a CPU's counter (or the
+CPU being idle) is a quiescent state for a future QSBR RCU.
 
 ### 3.1.1 Task Struct and Credentials
 
@@ -449,27 +484,20 @@ so the global TASK_TABLE lock is sufficient.
 
 ### 3.1.3 Task State Invariants
 
-The `TaskState` enum is primarily informational, not the source of scheduling truth:
+The `TaskState` enum in `TASK_TABLE` is informational (and records
+`Zombie(wait_status)` / `Traced`), not the scheduling source of truth:
 
-**Source of Truth for Scheduling:**
-1. **Runnable**: Task is in a run queue (`CpuRunQueue.queue`)
-2. **Sleeping**: Task is in a wait queue or sleep queue
-3. **Current**: Task is `CpuRunQueue.current`
-4. **Zombie**: `TaskState::Zombie(status)` is set AND task is NOT in any queue
+**Source of Truth for Scheduling** (owner CPU's rq, IrqSpinlock):
+1. **Runnable**: entry `queued` (in `CpuRunQueue.queue`)
+2. **Current**: `CpuRunQueue.current`
+3. **Sleeping**: entry `state != Running`, not queued, not current; reachable
+   from a wait queue, futex bucket, the sleep queue, or a signal
+4. **Zombie**: `TaskState::Zombie(status)` set AND the entry removed from the
+   rq (`exit_current`)
 
-**Why TaskState is Not the Scheduling Source of Truth:**
-
-In timer ISR, we cannot acquire TASK_TABLE (non-IRQ-safe Mutex). Therefore:
-- `wake_sleepers()` adds tasks to run queue WITHOUT updating TaskState
-- The task becomes runnable (in run queue) while TaskState may still say Sleeping
-- This is safe because:
-  - Scheduler checks run queue membership, not TaskState
-  - waitpid() checks TaskState::Zombie which IS reliably set (in process context)
-
-**Consistency Points:**
-- TaskState is set correctly in process context operations (fork, exit, explicit wait)
-- TaskState may be transiently stale after timer-based wakeup
-- Code must NOT rely on TaskState for scheduling decisions
+Wakers (possibly in IRQ context) never touch `TASK_TABLE`; code must NOT rely
+on `TaskState` for scheduling decisions. `Zombie(status)` holds the Linux
+wait status word (`code << 8` or the killing signal).
 
 ### 3.2 Memory Management
 
@@ -837,63 +865,48 @@ let ctime = inode.ctime();
 to atomics would complicate the API and still require paired loads/stores for
 consistency. The struct-level locking pattern matches Linux's approach.
 
-#### Wait Queues (Linux folio_wait_table Pattern)
+#### Wait Queues (kernel/waitqueue.rs)
 
-**Location:** `core/waitqueue.rs`
-
-Wait queues provide event-based blocking where tasks sleep until woken by another
-task. This is used for page locking and can be used for other blocking primitives.
-
-**Key Components:**
-```rust
-/// A wait queue for blocking synchronization
-pub struct WaitQueue {
-    head: IrqSpinlock<WaitQueueHead>,
-}
-
-/// Global page wait hash table (like Linux folio_wait_table)
-static PAGE_WAIT_TABLE: [WaitQueue; 256];
-```
-
-**API:**
-```rust
-impl WaitQueue {
-    fn wait(&self);        // Sleep until woken
-    fn wake_one(&self);    // Wake first waiter (fair)
-    fn wake_all(&self);    // Wake all waiters
-}
-
-/// Get wait queue for a page address
-fn page_wait_queue(page_addr: u64) -> &'static WaitQueue;
-```
-
-**Page Locking:**
-
-Page cache pages use sleeping locks instead of spinning. When a page is already
-locked, waiters sleep on the page's wait queue until the holder calls `unlock()`:
+Linux-style wait queues (`include/linux/wait.h`, `kernel/sched/wait.c`).
 
 ```rust
-impl CachedPage {
-    pub fn lock(&self) {
-        // Fast path: try immediate acquire
-        if self.locked.compare_exchange(...).is_ok() { return; }
+pub struct WaitQueue { head: IrqSpinlock<Vec<WaitQueueEntry>> } // leaf lock
 
-        // Slow path: sleep on wait queue
-        loop {
-            if self.locked.compare_exchange(...).is_ok() { return; }
-            page_wait_queue(self.frame).wait();
-        }
-    }
+// Sleeper side (process context, no spinlocks held)
+wq.wait_event(|| cond);                                  // uninterruptible
+wq.wait_event_interruptible(|| cond)?;                   // Err(RestartSys) on signal
+wq.wait_event_timeout(|| cond, ticks) -> u64;            // 0 = timed out
+wq.wait_event_interruptible_timeout(|| cond, ticks)?;    // Ok(left) / Err
+// open-coded: prepare_to_wait(&mut WaitEntry, state); check; schedule(); finish_wait
+// poll/select: add_poll_entry/remove_entry (non-autoremove registrations)
 
-    pub fn unlock(&self) {
-        self.locked.store(false, Ordering::Release);
-        page_wait_queue(self.frame).wake_one();
-    }
-}
+// Waker side (any context, including IRQ handlers)
+wq.wake_one(); wq.wake_all();
 ```
 
-**Early Boot Fallback:** If scheduling is not yet enabled, page locking falls
-back to spinning instead of sleeping.
+- **IRQ class:** the head lock is an `IrqSpinlock` and a leaf: entries are
+  collected under it, the lock is dropped, then tasks are woken
+  (`wake_up_task`: own rq lock or the target's `wake_list`). Wakers never
+  take `TASK_TABLE`, so `wake_*` is safe from IRQ handlers.
+- **No lost wakeups:** the sleeper registers and sets its state before
+  re-checking the condition (see 3.1 Sleep / Wakeup Protocol). Wakers must
+  make the condition true before calling `wake_*`.
+- **Autoremove:** a woken entry is removed by the waker; `finish_wait`
+  removes it otherwise. Poll entries stay until the poll ends.
+- **Legacy `wait()`:** unconditional sleep bounded to one tick (callers check
+  their condition before calling, so a wakeup in that gap would otherwise be
+  lost). Remaining users: SysV msg/sem, POSIX mqueue, network sockets. New
+  code uses `wait_event*`.
+- `cond` closures run with the task state set; they may take sleeping-context
+  locks (Mutex) but must not sleep themselves.
+
+**Page Locking (Linux folio_wait_table Pattern):**
+
+`PAGE_WAIT_TABLE: [WaitQueue; 256]` is hashed by page frame. `CachedPage::lock`
+sleeps with `wait_event(|| !locked)` and retries its CAS; `unlock` and end of
+writeback use `wake_all` (the bucket is shared by unrelated pages, so a
+single wakeup could be consumed by the wrong waiter). **Early Boot
+Fallback:** if scheduling is not yet enabled, page locking spins.
 
 ### 3.4 Namespaces
 
@@ -1261,13 +1274,22 @@ with_task_signal_state(tid, |state| {   // TASK_SIGNAL_STATE lookup
 });
 ```
 
-**kill(2)/tgkill(2):** Send signal to task:
+**kill(2)/tgkill(2):** Send signal to task (`send_signal`, process context
+only):
 ```rust
-with_task_signal_state(tid, |state| {   // TASK_SIGNAL_STATE lookup
+let deliverable = with_task_signal_state(tid, |state| {  // TASK_TABLE
+    if sig_ignored(..) { return false }   // SIG_IGN / default-ignore: dropped
     state.pending.add(sig);
-});
-set_tif_sigpending(tid);                // TASK_TIF_SIGPENDING update
+    !state.blocked.contains(sig)
+});                                       // tif_sigpending recomputed
+// TASK_TABLE released, then:
+wake_up_tid(tid, WakeMode::Interruptible) // signal_wake_up
 ```
+`with_task_signal_state` recomputes `tif_sigpending` after every access, so it
+means "a signal is deliverable under the current mask"; interruptible sleeps
+test it via `waitqueue::signal_pending()` and return `-ERESTARTSYS`/
+`-ERESTARTNOHAND`. `syscall_exit_signal_work` (arch syscall exit) delivers
+the signal and restarts or fails the syscall per SA_RESTART.
 
 #### Reference Counting
 
@@ -1328,12 +1350,14 @@ Neither thread can miss the other's update.
 #### Lock Ordering
 
 ```
-1. FutexHashBucket.waiters (IrqSpinlock)
-   ↓
-2. TASK_TABLE (Mutex, for task state updates during wake)
-   ↓
-3. Per-CPU scheduler lock (IrqSpinlock, for run queue updates)
+FutexHashBucket.waiters (IrqSpinlock): leaf. Wakers dequeue FutexQ entries
+under it, drop it, then wake_up_task(tid, cpu) (no TASK_TABLE).
 ```
+
+Waiters sleep with the Sleep / Wakeup Protocol (section 3.1): state set to
+Interruptible, then "still queued?" re-checked under the bucket lock, then
+`schedule_timeout`. A waker that dequeued the entry is the wake; signal or
+timeout dequeue the entry themselves.
 
 For `futex_requeue()` with two different buckets:
 - Lock buckets in address order (lower pointer address first)
@@ -1351,7 +1375,7 @@ Robust futexes are cleaned up during task exit via `exit_robust_list()`:
 
 1. **Bucket lock is IRQ-safe** - Safe from signal handlers
 2. **Memory barriers before userspace access** - Prevents lost wakeups
-3. **Lock order: bucket → TASK_TABLE → scheduler** - Consistent ordering
+3. **Bucket lock is a leaf** - wakeups are issued after dropping it
 4. **Multi-bucket operations use address ordering** - Prevents deadlock
 5. **Robust cleanup has entry limit** - Prevents infinite loop from corrupted list
 
@@ -1715,6 +1739,7 @@ percpu::preempt_enable();   // preempt_count--
 
 - Timer tick updates (atomic only)
 - Wake sleepers (IrqSpinlock only, per-CPU only)
+- `WaitQueue::wake_one/wake_all` and `wake_up_task` (IrqSpinlocks only)
 - Set reschedule flags (atomic)
 - Read per-CPU data (via GS segment)
 

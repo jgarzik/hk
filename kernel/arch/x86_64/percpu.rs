@@ -92,9 +92,88 @@ pub struct PerCpu {
     /// signal frame saves it and rt_sigreturn returns it to the interrupted code
     pub syscall_user_rax: u64,
 
+    /// Syscall number of the syscall in progress (for -ERESTART* restarts)
+    pub syscall_nr: u64,
+
     /// Flag set when signal delivery modifies the return context
     /// When true, the syscall return path should update the stack frame from percpu
     pub signal_context_modified: bool,
+}
+
+/// Snapshot of the per-CPU syscall user-register block
+///
+/// The block describes the *current task's* syscall, but lives in per-CPU
+/// data; the scheduler saves it on the outgoing task's kernel stack around
+/// every context switch so a task that slept inside a syscall still returns
+/// (and builds signal frames) with its own registers.
+#[derive(Clone, Copy)]
+pub struct SyscallUserState {
+    regs: [u64; 18],
+    modified: bool,
+}
+
+/// Capture the syscall user-register block of this CPU
+pub fn save_syscall_user_state() -> SyscallUserState {
+    let p = unsafe { current_cpu_mut() };
+    SyscallUserState {
+        regs: [
+            p.syscall_user_rip,
+            p.syscall_user_rflags,
+            p.syscall_user_rsp,
+            p.syscall_user_rbx,
+            p.syscall_user_rbp,
+            p.syscall_user_r12,
+            p.syscall_user_r13,
+            p.syscall_user_r14,
+            p.syscall_user_r15,
+            p.syscall_user_rdi,
+            p.syscall_user_rsi,
+            p.syscall_user_rdx,
+            p.syscall_user_r8,
+            p.syscall_user_r9,
+            p.syscall_user_r10,
+            p.syscall_user_rax,
+            p.syscall_nr,
+            0,
+        ],
+        modified: p.signal_context_modified,
+    }
+}
+
+/// Restore a block captured by [`save_syscall_user_state`]
+pub fn restore_syscall_user_state(s: &SyscallUserState) {
+    let p = unsafe { current_cpu_mut() };
+    let r = &s.regs;
+    p.syscall_user_rip = r[0];
+    p.syscall_user_rflags = r[1];
+    p.syscall_user_rsp = r[2];
+    p.syscall_user_rbx = r[3];
+    p.syscall_user_rbp = r[4];
+    p.syscall_user_r12 = r[5];
+    p.syscall_user_r13 = r[6];
+    p.syscall_user_r14 = r[7];
+    p.syscall_user_r15 = r[8];
+    p.syscall_user_rdi = r[9];
+    p.syscall_user_rsi = r[10];
+    p.syscall_user_rdx = r[11];
+    p.syscall_user_r8 = r[12];
+    p.syscall_user_r9 = r[13];
+    p.syscall_user_r10 = r[14];
+    p.syscall_user_rax = r[15];
+    p.syscall_nr = r[16];
+    p.signal_context_modified = s.modified;
+}
+
+/// Arrange for the current syscall to be re-executed on return to user
+/// (-ERESTART* with no handler, or SA_RESTART): back RIP up over the 2-byte
+/// `syscall` instruction and put the syscall number back in RAX. Returns the
+/// value the syscall must "return" (RAX).
+pub fn syscall_restart() -> u64 {
+    let p = unsafe { current_cpu_mut() };
+    p.syscall_user_rip = p.syscall_user_rip.wrapping_sub(2);
+    p.syscall_user_rax = p.syscall_nr;
+    p.signal_context_modified = true;
+    p.syscall_nr
 }
 
 impl PerCpu {
@@ -129,6 +208,7 @@ impl PerCpu {
             syscall_user_r9: 0,
             syscall_user_r10: 0,
             syscall_user_rax: 0,
+            syscall_nr: 0,
             signal_context_modified: false,
         }
     }
@@ -682,5 +762,23 @@ impl PerCpuOps for X86_64Arch {
     #[inline]
     fn get_syscall_user_rsp() -> u64 {
         get_syscall_user_rsp()
+    }
+
+    type SyscallUserState = SyscallUserState;
+
+    fn save_syscall_user_state() -> SyscallUserState {
+        save_syscall_user_state()
+    }
+
+    fn restore_syscall_user_state(state: &SyscallUserState) {
+        restore_syscall_user_state(state)
+    }
+
+    fn set_syscall_return(val: u64) {
+        unsafe { current_cpu_mut().syscall_user_rax = val };
+    }
+
+    fn syscall_restart() -> u64 {
+        syscall_restart()
     }
 }
