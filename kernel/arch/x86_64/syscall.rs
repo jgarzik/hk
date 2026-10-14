@@ -1323,9 +1323,9 @@ pub fn x86_64_syscall_dispatch(
         SYS_PWRITE64 => sys_pwrite64(arg0 as i32, arg1, arg2, arg3 as i64) as u64,
         SYS_PREADV => sys_preadv(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
         SYS_PWRITEV => sys_pwritev(arg0 as i32, arg1, arg2 as i32, arg3 as i64) as u64,
-        SYS_PREADV2 => sys_preadv2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg4 as i32) as u64,
+        SYS_PREADV2 => sys_preadv2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg5 as i32) as u64,
         SYS_PWRITEV2 => {
-            sys_pwritev2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg4 as i32) as u64
+            sys_pwritev2(arg0 as i32, arg1, arg2 as i32, arg3 as i64, arg5 as i32) as u64
         }
         SYS_OPEN => sys_open(arg0, arg1 as u32, arg2 as u32) as u64,
         SYS_CLOSE => sys_close(arg0 as i32) as u64,

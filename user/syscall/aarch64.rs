@@ -856,13 +856,15 @@ pub fn sys_pwritev(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> i64 
 /// preadv2(fd, iov, iovcnt, offset, flags)
 #[inline(always)]
 pub fn sys_preadv2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
-    unsafe { syscall5!(SYS_PREADV2, fd, iov, iovcnt, offset, flags) }
+    // Linux ABI: (fd, vec, vlen, pos_l, pos_h, flags), like glibc's LO_HI_LONG
+    unsafe { syscall6!(SYS_PREADV2, fd, iov, iovcnt, offset, (offset as u64) >> 32, flags) }
 }
 
 /// pwritev2(fd, iov, iovcnt, offset, flags)
 #[inline(always)]
 pub fn sys_pwritev2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
-    unsafe { syscall5!(SYS_PWRITEV2, fd, iov, iovcnt, offset, flags) }
+    // Linux ABI: (fd, vec, vlen, pos_l, pos_h, flags), like glibc's LO_HI_LONG
+    unsafe { syscall6!(SYS_PWRITEV2, fd, iov, iovcnt, offset, (offset as u64) >> 32, flags) }
 }
 
 /// mkdirat(dirfd, pathname, mode)
