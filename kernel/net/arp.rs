@@ -1,18 +1,22 @@
-//! Address Resolution Protocol (ARP)
+//! Address Resolution Protocol (Linux net/ipv4/arp.c)
 //!
-//! This module implements ARP for IPv4 to Ethernet address resolution.
-//!
-//! ARP cache entries are stored per-namespace in NetNamespace.
+//! ARP is the IPv4 user of the generic neighbour table
+//! (`net::neigh`): each namespace has an `arp` table with `ARP_OPS`
+//! (solicit = ARP request, output = Ethernet transmit of an IPv4
+//! packet, error report = ICMP host unreachable to the sender). This
+//! module parses and answers ARP packets and feeds the table.
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt::Write;
 
-use crate::net::KernelError;
 use crate::net::device::NetDevice;
-use crate::net::ethernet::{self, ETH_ALEN, ETH_BROADCAST, ETH_HLEN, EtherType};
+use crate::net::ethernet::{self, ETH_ALEN, ETH_BROADCAST, ETH_HLEN, EtherType, PktType};
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::ifaddr::{RT_SCOPE_LINK, inet_select_addr};
 use crate::net::ipv4::{self, Ipv4Addr};
+use crate::net::neigh::{self, Key, Lladdr, NeighOps, Neighbour, nud, upd};
 use crate::net::skb::SkBuff;
 
 /// ARP hardware type: Ethernet
@@ -25,44 +29,6 @@ pub const ARPOP_REPLY: u16 = 2;
 
 /// ARP header size (for Ethernet/IPv4)
 pub const ARP_HLEN: usize = 28;
-
-/// ARP cache entry timeout (in timer ticks, ~5 minutes)
-const ARP_TIMEOUT: u64 = 300 * 100; // 300 seconds at 100Hz
-
-/// ARP entry state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArpState {
-    /// Entry is incomplete (waiting for reply)
-    Incomplete,
-    /// Entry is reachable
-    Reachable,
-    /// Entry is stale (needs refresh)
-    Stale,
-    /// ARP failed (no response)
-    Failed,
-}
-
-/// ARP cache entry
-#[derive(Clone)]
-pub struct ArpEntry {
-    /// Target IP address
-    pub ip: Ipv4Addr,
-    /// Resolved MAC address
-    pub mac: [u8; ETH_ALEN],
-    /// Entry state
-    pub state: ArpState,
-    /// Expiration time (timer ticks)
-    pub expires: u64,
-    /// Retry count
-    pub retries: u8,
-    /// Device the neighbour was learned on
-    pub ifindex: u32,
-}
-
-/// Packets waiting for ARP resolution
-pub struct PendingPacket {
-    pub skb: Box<SkBuff>,
-}
 
 /// ARP header structure (Ethernet/IPv4)
 #[repr(C, packed)]
@@ -174,6 +140,15 @@ pub fn classify(
     }
 }
 
+/// The ARP table hooks
+pub static ARP_OPS: NeighOps = NeighOps {
+    family: 2,
+    key_len: 4,
+    solicit: arp_solicit,
+    output: ipv4::ip_finish_output,
+    error_report: ipv4::ip_link_failure,
+};
+
 /// Receive an ARP packet (EtherType 0x0806 handler; thread context)
 ///
 /// Uses the receiving device's namespace.
@@ -192,43 +167,37 @@ pub fn arp_rcv(skb: SkBuff) {
         return;
     };
     let (sip, sha, tip) = (hdr.sender_ip(), hdr.ar_sha, hdr.target_ip());
-    let act = classify(hdr.operation(), sip, &sha, tip, &dev.mac(), |a| {
-        ns.fib.addr_type(a)
-    });
+    let op = hdr.operation();
+    let act = classify(op, sip, &sha, tip, &dev.mac(), |a| ns.fib.addr_type(a));
     match act {
         ArpAction::Drop(_) => {}
         ArpAction::Conflict => conflict(sip, &sha),
         ArpAction::ProbeReply => send_arp_reply(dev, tip, sip, &sha),
         ArpAction::Reply => {
-            learn(&ns, sip, &sha, dev.ifindex(), true);
+            // Linux neigh_event_ns: the requester's entry, STALE
+            if let Ok(n) = ns.arp.create(dev, &neigh::key4(sip)) {
+                ns.arp.update(&n, Some(sha), nud::STALE, upd::OVERRIDE);
+            }
             send_arp_reply(dev, tip, sip, &sha);
         }
-        ArpAction::Update => learn(&ns, sip, &sha, dev.ifindex(), false),
-    }
-}
-
-/// Record `sip` at `sha` (`create`: even without an existing entry),
-/// then transmit the packets that were waiting for it
-fn learn(
-    ns: &crate::net::NetNamespace,
-    sip: Ipv4Addr,
-    sha: &[u8; ETH_ALEN],
-    ifindex: u32,
-    create: bool,
-) {
-    let entry = ArpEntry {
-        ip: sip,
-        mac: *sha,
-        state: ArpState::Reachable,
-        expires: crate::time::current_ticks() + ARP_TIMEOUT,
-        retries: 0,
-        ifindex,
-    };
-    if !ns.arp_update(entry, create) {
-        return;
-    }
-    for packet in ns.arp_take_pending(sip) {
-        let _ = ipv4::ip_finish_output(packet.skb, *sha);
+        ArpAction::Update => {
+            let Some(n) = ns.arp.lookup(dev.ifindex(), &neigh::key4(sip)) else {
+                return;
+            };
+            // Only a unicast reply to us confirms reachability
+            let state = if op == ARPOP_REPLY && skb.pkt_type == PktType::Host {
+                nud::REACHABLE
+            } else {
+                nud::STALE
+            };
+            let garp = op == ARPOP_REQUEST && tip == sip;
+            let flags = if garp || ns.arp.may_override(&n) {
+                upd::OVERRIDE
+            } else {
+                0
+            };
+            ns.arp.update(&n, Some(sha), state, flags);
+        }
     }
 }
 
@@ -253,125 +222,119 @@ fn conflict(sip: Ipv4Addr, sha: &[u8; ETH_ALEN]) {
     );
 }
 
-/// Resolve an IP address to MAC address
-///
-/// Returns the MAC if cached, otherwise sends ARP request and
-/// queues the packet for later transmission.
-///
-/// Uses the ARP cache of `ns` (the output device's namespace).
-pub fn arp_resolve(
-    ns: &crate::net::NetNamespace,
-    dev: &Arc<NetDevice>,
-    ip: Ipv4Addr,
-    skb: Box<SkBuff>,
-) -> Result<(), KernelError> {
-    let now = crate::time::current_ticks();
-
-    // Cached: transmit now; else queue until the reply arrives
-    let skb = match ns.arp_resolve_or_queue(ip, PendingPacket { skb }) {
-        Ok(()) => None,
-        Err((mac, packet)) => Some((mac, packet.skb)),
+/// Send an ARP request for `n` (Linux arp_solicit, arp_announce = 0):
+/// the queued packet's source if it is ours, else the device address
+/// facing the target; unicast to `dst` when re-probing a known entry
+fn arp_solicit(n: &Neighbour, dst: Option<Lladdr>, hint: Option<Key>) {
+    let Some(net) = n.dev.net() else {
+        return;
     };
-    if let Some((mac, skb)) = skb {
-        return crate::net::ipv4::ip_finish_output(skb, mac);
-    }
-
-    // Add incomplete entry if not present (never overwrites a reply that
-    // raced in)
-    ns.arp_insert_if_absent(ArpEntry {
-        ip,
-        mac: [0; 6],
-        state: ArpState::Incomplete,
-        expires: now + ARP_TIMEOUT,
-        retries: 0,
-        ifindex: dev.ifindex(),
-    });
-
-    // Send ARP request
-    send_arp_request(ns, dev, ip);
-
-    // Packet is queued, return success (it will be sent when ARP completes)
-    Ok(())
+    let target = n.key4();
+    let hint = hint.map(|k| Ipv4Addr::from_be_bytes([k[0], k[1], k[2], k[3]]));
+    let saddr = match hint {
+        Some(a) if net.fib.addr_type(a) == RouteType::Local => a,
+        _ => inet_select_addr(&net, &n.dev, target, RT_SCOPE_LINK).unwrap_or_default(),
+    };
+    send_arp(&n.dev, ARPOP_REQUEST, saddr, target, dst.as_ref(), None);
 }
 
-/// Send an ARP request (Linux arp_solicit; sender address from
-/// inet_select_addr, 0.0.0.0 if the device has none)
-fn send_arp_request(ns: &crate::net::NetNamespace, dev: &NetDevice, target_ip: Ipv4Addr) {
-    let our_ip = inet_select_addr(ns, dev, target_ip, RT_SCOPE_LINK).unwrap_or_default();
-
-    let mut skb = match SkBuff::alloc(64, ARP_HLEN + ETH_HLEN) {
-        Some(s) => s,
-        None => return,
+/// Build and transmit an ARP packet: Ethernet destination `eth_dst`
+/// (broadcast if None), target hardware address `tha` (zero if None)
+fn send_arp(
+    dev: &NetDevice,
+    op: u16,
+    sip: Ipv4Addr,
+    tip: Ipv4Addr,
+    eth_dst: Option<&Lladdr>,
+    tha: Option<&Lladdr>,
+) {
+    let Some(mut skb) = SkBuff::alloc(64, ARP_HLEN + ETH_HLEN) else {
+        return;
     };
-
-    // Build ARP payload
-    let arp_data = skb.put(ARP_HLEN).unwrap();
-
-    // Hardware type: Ethernet
-    arp_data[0..2].copy_from_slice(&ARPHRD_ETHER.to_be_bytes());
-    // Protocol type: IPv4
-    arp_data[2..4].copy_from_slice(&0x0800u16.to_be_bytes());
-    // Hardware address length
-    arp_data[4] = 6;
-    // Protocol address length
-    arp_data[5] = 4;
-    // Operation: Request
-    arp_data[6..8].copy_from_slice(&ARPOP_REQUEST.to_be_bytes());
-    // Sender hardware address
-    arp_data[8..14].copy_from_slice(&dev.mac());
-    // Sender protocol address
-    arp_data[14..18].copy_from_slice(&our_ip.to_be_bytes());
-    // Target hardware address (unknown)
-    arp_data[18..24].copy_from_slice(&[0; 6]);
-    // Target protocol address
-    arp_data[24..28].copy_from_slice(&target_ip.to_be_bytes());
-
-    // Build Ethernet header (broadcast)
-    ethernet::eth_header(&mut skb, &ETH_BROADCAST, &dev.mac(), EtherType::Arp);
-
-    // Transmit
+    let Some(d) = skb.put(ARP_HLEN) else {
+        return;
+    };
+    d[0..2].copy_from_slice(&ARPHRD_ETHER.to_be_bytes());
+    d[2..4].copy_from_slice(&0x0800u16.to_be_bytes());
+    d[4] = 6;
+    d[5] = 4;
+    d[6..8].copy_from_slice(&op.to_be_bytes());
+    d[8..14].copy_from_slice(&dev.mac());
+    d[14..18].copy_from_slice(&sip.to_be_bytes());
+    d[18..24].copy_from_slice(tha.unwrap_or(&[0; 6]));
+    d[24..28].copy_from_slice(&tip.to_be_bytes());
+    let dst = eth_dst.unwrap_or(&ETH_BROADCAST);
+    ethernet::eth_header(&mut skb, dst, &dev.mac(), EtherType::Arp);
     let _ = dev.xmit(skb);
 }
 
 /// Send an ARP reply claiming `our_ip`
-fn send_arp_reply(
-    dev: &NetDevice,
-    our_ip: Ipv4Addr,
-    target_ip: Ipv4Addr,
-    target_mac: &[u8; ETH_ALEN],
-) {
-    let mut skb = match SkBuff::alloc(64, ARP_HLEN + ETH_HLEN) {
-        Some(s) => s,
-        None => return,
-    };
+fn send_arp_reply(dev: &NetDevice, our_ip: Ipv4Addr, target_ip: Ipv4Addr, target_mac: &Lladdr) {
+    send_arp(
+        dev,
+        ARPOP_REPLY,
+        our_ip,
+        target_ip,
+        Some(target_mac),
+        Some(target_mac),
+    );
+}
 
-    // Build ARP payload
-    let arp_data = skb.put(ARP_HLEN).unwrap();
+/// ATF_* flags of /proc/net/arp (Linux arp_state_to_flags)
+const ATF_COM: u32 = 0x02;
+const ATF_PERM: u32 = 0x04;
 
-    // Hardware type: Ethernet
-    arp_data[0..2].copy_from_slice(&ARPHRD_ETHER.to_be_bytes());
-    // Protocol type: IPv4
-    arp_data[2..4].copy_from_slice(&0x0800u16.to_be_bytes());
-    // Hardware address length
-    arp_data[4] = 6;
-    // Protocol address length
-    arp_data[5] = 4;
-    // Operation: Reply
-    arp_data[6..8].copy_from_slice(&ARPOP_REPLY.to_be_bytes());
-    // Sender hardware address (our MAC)
-    arp_data[8..14].copy_from_slice(&dev.mac());
-    // Sender protocol address (our IP)
-    arp_data[14..18].copy_from_slice(&our_ip.to_be_bytes());
-    // Target hardware address
-    arp_data[18..24].copy_from_slice(target_mac);
-    // Target protocol address
-    arp_data[24..28].copy_from_slice(&target_ip.to_be_bytes());
+/// `/proc/net/arp` (Linux arp_seq_show; NOARP entries are hidden)
+pub fn proc_net_arp() -> Vec<u8> {
+    let mut out = String::from(
+        "IP address       HW type     Flags       HW address            Mask     Device\n",
+    );
+    for e in crate::net::current_net_ns().arp.dump() {
+        if e.state & nud::NOARP != 0 {
+            continue;
+        }
+        let flags = if e.state & nud::PERMANENT != 0 {
+            ATF_PERM | ATF_COM
+        } else if e.state & nud::VALID != 0 {
+            ATF_COM
+        } else {
+            0
+        };
+        let ip = Ipv4Addr::from_be_bytes([e.key[0], e.key[1], e.key[2], e.key[3]]);
+        let m = e.ha;
+        let hw = alloc::format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            m[0],
+            m[1],
+            m[2],
+            m[3],
+            m[4],
+            m[5]
+        );
+        let _ = writeln!(
+            out,
+            "{:<16} 0x{:<10x}0x{:<10x}{:<17}     {:<8} {}",
+            alloc::format!("{}", ip),
+            ARPHRD_ETHER,
+            flags,
+            hw,
+            "*",
+            e.dev.name()
+        );
+    }
+    out.into_bytes()
+}
 
-    // Build Ethernet header
-    ethernet::eth_header(&mut skb, target_mac, &dev.mac(), EtherType::Arp);
-
-    // Transmit
-    let _ = dev.xmit(skb);
+/// Send an IPv4 packet to its next hop on `dev` through the ARP table
+/// (Linux ip_finish_output2 + neigh_output)
+pub fn output(
+    net: &crate::net::NetNamespace,
+    dev: &alloc::sync::Arc<NetDevice>,
+    nexthop: Ipv4Addr,
+    skb: Box<SkBuff>,
+) -> Result<(), crate::error::KernelError> {
+    let n = net.arp.create(dev, &neigh::key4(nexthop))?;
+    net.arp.output(&n, skb)
 }
 
 #[cfg(test)]

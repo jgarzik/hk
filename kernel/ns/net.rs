@@ -15,12 +15,11 @@
 //! - Sockets, routes, and ARP entries are namespace-local
 
 use alloc::collections::BTreeMap;
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use spin::{Lazy, Mutex, RwLock};
+use spin::{Lazy, RwLock};
 
 use crate::error::KernelError;
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
@@ -30,9 +29,6 @@ use crate::net::ipv4::Ipv4Addr;
 use crate::net::netlink::NlTable;
 use crate::net::tcp::{TcpFourTuple, TcpSock};
 use crate::net::udp::UdpTable;
-
-// ARP types from arp.rs that we need
-use crate::net::arp::ArpEntry;
 
 /// Network namespace - isolates network stack per-namespace
 ///
@@ -81,11 +77,8 @@ pub struct NetNamespace {
     /// /proc/sys/net values (`net::sysctl`)
     pub sysctl: crate::net::sysctl::NetSysctl,
 
-    /// ARP cache entries indexed by IP address
-    arp_entries: Mutex<BTreeMap<u32, ArpEntry>>,
-
-    /// Packets waiting for ARP resolution
-    arp_pending: Mutex<BTreeMap<u32, VecDeque<crate::net::arp::PendingPacket>>>,
+    /// ARP neighbour table (IPv6 neighbour discovery gets its own)
+    pub arp: Arc<crate::net::neigh::NeighTable>,
 
     /// Loopback device for this namespace
     loopback: RwLock<Option<Arc<NetDevice>>>,
@@ -105,8 +98,7 @@ impl NetNamespace {
             tcp_bind: Default::default(),
             port_range: PortRange::default(),
             sysctl: Default::default(),
-            arp_entries: Mutex::new(BTreeMap::new()),
-            arp_pending: Mutex::new(BTreeMap::new()),
+            arp: crate::net::neigh::NeighTable::new(&crate::net::arp::ARP_OPS),
             loopback: RwLock::new(None),
         });
 
@@ -200,94 +192,6 @@ impl NetNamespace {
         };
         let best = v.iter().map(|s| score(s)).max().filter(|&b| b >= 0)?;
         v.iter().find(|s| score(s) == best).cloned()
-    }
-
-    // ========================================================================
-    // ARP cache management
-    // ========================================================================
-
-    /// Look up an ARP entry in this namespace
-    pub fn arp_lookup(&self, ip: Ipv4Addr) -> Option<ArpEntry> {
-        self.arp_entries.lock().get(&ip.to_u32()).cloned()
-    }
-
-    /// Update the entry for `entry.ip` (creating it only if `create`;
-    /// Linux neigh_update vs neigh_event_ns). Returns whether an entry
-    /// now holds the address.
-    pub fn arp_update(&self, entry: ArpEntry, create: bool) -> bool {
-        let mut t = self.arp_entries.lock();
-        match t.get_mut(&entry.ip.to_u32()) {
-            Some(e) => *e = entry,
-            None if create => {
-                t.insert(entry.ip.to_u32(), entry);
-            }
-            None => return false,
-        }
-        true
-    }
-
-    /// Insert an ARP entry unless one exists for its address
-    pub fn arp_insert_if_absent(&self, entry: ArpEntry) {
-        self.arp_entries
-            .lock()
-            .entry(entry.ip.to_u32())
-            .or_insert(entry);
-    }
-
-    /// Return the resolved MAC for `ip`, or queue `packet` until it is
-    /// resolved (at most `ARP_QUEUE_LEN` packets per address, oldest
-    /// dropped). Checking and queueing happen under `arp_pending`, which
-    /// `arp_take_pending` also takes after the cache insert, so a reply
-    /// racing with this call can never strand the packet.
-    ///
-    /// Lock order: `arp_pending` -> `arp_entries` (both leaf otherwise).
-    pub fn arp_resolve_or_queue(
-        &self,
-        ip: Ipv4Addr,
-        packet: crate::net::arp::PendingPacket,
-    ) -> Result<(), ([u8; 6], crate::net::arp::PendingPacket)> {
-        const ARP_QUEUE_LEN: usize = 16;
-        let mut pending = self.arp_pending.lock();
-        if let Some(e) = self.arp_entries.lock().get(&ip.to_u32())
-            && e.state == crate::net::arp::ArpState::Reachable
-        {
-            return Err((e.mac, packet));
-        }
-        let q = pending.entry(ip.to_u32()).or_default();
-        if q.len() >= ARP_QUEUE_LEN {
-            q.pop_front();
-        }
-        q.push_back(packet);
-        Ok(())
-    }
-
-    /// Snapshot of the ARP cache (RTM_GETNEIGH, /proc/net/arp)
-    pub fn arp_entries(&self) -> Vec<ArpEntry> {
-        self.arp_entries.lock().values().cloned().collect()
-    }
-
-    /// Forget the entries and queued packets of a device going down
-    /// (Linux arp_ifdown)
-    pub fn arp_flush_dev(&self, ifindex: u32) {
-        let mut pending = self.arp_pending.lock();
-        let mut entries = self.arp_entries.lock();
-        let gone: Vec<u32> = entries
-            .iter()
-            .filter(|(_, e)| e.ifindex == ifindex)
-            .map(|(&k, _)| k)
-            .collect();
-        for k in gone {
-            entries.remove(&k);
-            pending.remove(&k);
-        }
-    }
-
-    /// Take all pending packets for an IP (after ARP resolution)
-    pub fn arp_take_pending(&self, ip: Ipv4Addr) -> VecDeque<crate::net::arp::PendingPacket> {
-        self.arp_pending
-            .lock()
-            .remove(&ip.to_u32())
-            .unwrap_or_default()
     }
 
     // ========================================================================

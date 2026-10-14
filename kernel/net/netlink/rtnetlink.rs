@@ -2,8 +2,8 @@
 //! fib_frontend.c, route.c, net/core/neighbour.c)
 //!
 //! Requests are dispatched by message type and family: links (any
-//! family), IPv4 addresses and routes (AF_INET), the ARP cache
-//! (RTM_GETNEIGH) and an empty rule dump. AF_INET6 requests get empty
+//! family), IPv4 addresses and routes (AF_INET), the ARP neighbour
+//! table (RTM_{NEW,DEL,GET}NEIGH) and an empty rule dump. AF_INET6 requests get empty
 //! dumps (no IPv6 addresses/routes exist yet) and EAFNOSUPPORT for
 //! changes. NEW/DEL/SET need CAP_NET_ADMIN.
 //!
@@ -17,7 +17,6 @@ use alloc::vec::Vec;
 use super::attr::{Attrs, Hdr, Msg, NLMSG_HDRLEN, align, header};
 use super::*;
 use crate::net::NetNamespace;
-use crate::net::arp::{ArpEntry, ArpState};
 use crate::net::device::{NetDevice, flags as dflags};
 use crate::net::inet::fib::{
     self, FibConfig, FibEntry, FlowKey, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE, RT_TABLE_MAIN,
@@ -26,6 +25,7 @@ use crate::net::inet::fib::{
 use crate::net::inet::ifaddr::{self, IFA_F_PERMANENT, IFNAMSIZ, INFINITY_LIFE_TIME, InIfaddr};
 use crate::net::inet::route;
 use crate::net::ipv4::Ipv4Addr;
+use crate::net::neigh::{self, NeighInfo, nud};
 use crate::net::rtnl;
 
 // Message types (Linux RTM_*)
@@ -41,6 +41,7 @@ pub const RTM_NEWROUTE: u16 = 24;
 pub const RTM_DELROUTE: u16 = 25;
 pub const RTM_GETROUTE: u16 = 26;
 pub const RTM_NEWNEIGH: u16 = 28;
+pub const RTM_DELNEIGH: u16 = 29;
 pub const RTM_GETNEIGH: u16 = 30;
 pub const RTM_GETRULE: u16 = 34;
 const RTM_MAX: u16 = 123;
@@ -111,10 +112,7 @@ const NDA_DST: u16 = 1;
 const NDA_LLADDR: u16 = 2;
 const NDA_CACHEINFO: u16 = 3;
 const NDA_PROBES: u16 = 4;
-const NUD_INCOMPLETE: u16 = 0x01;
-const NUD_REACHABLE: u16 = 0x02;
-const NUD_STALE: u16 = 0x04;
-const NUD_FAILED: u16 = 0x20;
+const NDA_MAX: u16 = 16;
 
 /// Family header sizes
 const IFINFOMSG_LEN: usize = 16;
@@ -214,6 +212,9 @@ fn rcv_msg(sk: &Arc<NlSock>, h: &Hdr, p: &[u8], explicit: bool) -> Result<Done, 
         seq: h.seq,
     };
     match h.ty {
+        RTM_NEWNEIGH => newneigh(sk, h, p),
+        RTM_DELNEIGH => delneigh(sk, p),
+        RTM_GETNEIGH => getneigh(sk, h, p),
         RTM_NEWLINK | RTM_SETLINK => setlink(sk, h, p, nl),
         RTM_GETLINK => getlink(sk, h, p),
         RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE | RTM_GETROUTE => match family {
@@ -328,7 +329,7 @@ impl DumpCb for RtDump {
                 Ok(self.take(buf, &rts, |e| fill_route(e, RTM_NEWROUTE, f, seq, pid)))
             }
             DumpKind::Neigh => {
-                let n = net.arp_entries();
+                let n = net.arp.dump();
                 Ok(self.take(buf, &n, |e| fill_neigh(e, RTM_NEWNEIGH, f, seq, pid)))
             }
         }
@@ -906,25 +907,99 @@ fn fill_rt(rt: &route::Rtable, src: Ipv4Addr, seq: u32, pid: u32) -> Vec<u8> {
 // Neighbours
 // ============================================================================
 
-/// RTM_NEWNEIGH message for an ARP entry (Linux neigh_fill_info)
-fn fill_neigh(e: &ArpEntry, ty: u16, flags: u16, seq: u32, pid: u32) -> Vec<u8> {
-    let state = match e.state {
-        ArpState::Incomplete => NUD_INCOMPLETE,
-        ArpState::Reachable => NUD_REACHABLE,
-        ArpState::Stale => NUD_STALE,
-        ArpState::Failed => NUD_FAILED,
-    };
+/// RTM_NEWNEIGH message for a neighbour (Linux neigh_fill_info)
+fn fill_neigh(e: &NeighInfo, ty: u16, flags: u16, seq: u32, pid: u32) -> Vec<u8> {
     let mut m = Msg::new(ty, flags, seq, pid);
     let mut h = [0u8; NDMSG_LEN];
     h[0] = AF_INET;
     h[4..8].copy_from_slice(&e.ifindex.to_ne_bytes());
-    h[8..10].copy_from_slice(&state.to_ne_bytes());
+    h[8..10].copy_from_slice(&(e.state as u16).to_ne_bytes());
     h[11] = RouteType::Unicast as u8;
-    m.put(&h).attr(NDA_DST, &e.ip.to_be_bytes());
-    if e.state != ArpState::Incomplete && e.state != ArpState::Failed {
-        m.attr(NDA_LLADDR, &e.mac);
+    m.put(&h).attr(NDA_DST, &e.key[..4]);
+    if e.state & nud::VALID != 0 {
+        m.attr(NDA_LLADDR, &e.ha);
     }
-    m.u32(NDA_PROBES, e.retries as u32)
-        .attr(NDA_CACHEINFO, &[0u8; 16]);
+    // struct nda_cacheinfo: ages in clock_t (USER_HZ = 100)
+    let mut ci = [0u8; 16];
+    ci[0..4].copy_from_slice(&((e.confirmed / 10) as u32).to_ne_bytes());
+    ci[4..8].copy_from_slice(&((e.used / 10) as u32).to_ne_bytes());
+    ci[8..12].copy_from_slice(&((e.updated / 10) as u32).to_ne_bytes());
+    m.u32(NDA_PROBES, e.probes).attr(NDA_CACHEINFO, &ci);
     m.finish()
+}
+
+/// struct ndmsg fields and the request's attributes
+struct NdReq<'a> {
+    family: u8,
+    ifindex: u32,
+    state: u8,
+    attrs: Attrs<'a>,
+}
+
+fn ndmsg(p: &[u8]) -> Result<NdReq<'_>, KernelError> {
+    if p.len() < NDMSG_LEN {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(NdReq {
+        family: p[0],
+        ifindex: u32::from_ne_bytes([p[4], p[5], p[6], p[7]]),
+        state: u16::from_ne_bytes([p[8], p[9]]) as u8,
+        attrs: Attrs::parse(&p[NDMSG_LEN..], NDA_MAX)?,
+    })
+}
+
+/// Device and key of a neighbour request (Linux neigh_add/neigh_delete
+/// checks, in their order): EINVAL without NDA_DST or a device,
+/// ENODEV for an unknown device, EAFNOSUPPORT for other families
+fn nd_target(net: &NetNamespace, r: &NdReq) -> Result<(Arc<NetDevice>, neigh::Key), KernelError> {
+    let dst = r.attrs.get(NDA_DST).ok_or(KernelError::InvalidArgument)?;
+    let dev = match r.ifindex {
+        0 => None,
+        i => Some(net.dev_get_by_index(i).ok_or(KernelError::NoDevice)?),
+    };
+    if r.family != AF_INET {
+        return Err(KernelError::AddressFamilyNotSupported);
+    }
+    if dst.len() < 4 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let dev = dev.ok_or(KernelError::InvalidArgument)?;
+    let a = Ipv4Addr::from_be_bytes([dst[0], dst[1], dst[2], dst[3]]);
+    Ok((dev, neigh::key4(a)))
+}
+
+/// RTM_NEWNEIGH ("ip neigh add/replace/change"; Linux neigh_add)
+fn newneigh(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
+    let r = ndmsg(p)?;
+    let (dev, key) = nd_target(sk.net(), &r)?;
+    let ll = match r.attrs.get(NDA_LLADDR) {
+        Some(a) if a.len() < 6 => return Err(KernelError::InvalidArgument),
+        Some(a) => Some([a[0], a[1], a[2], a[3], a[4], a[5]]),
+        None => None,
+    };
+    sk.net().arp.admin_add(&dev, &key, ll, r.state, h.flags)?;
+    Ok(Done::Ok)
+}
+
+/// RTM_DELNEIGH (Linux neigh_delete): ENOENT if absent
+fn delneigh(sk: &NlSock, p: &[u8]) -> Result<Done, KernelError> {
+    let r = ndmsg(p)?;
+    let (dev, key) = nd_target(sk.net(), &r)?;
+    sk.net().arp.admin_del(dev.ifindex(), &key)?;
+    Ok(Done::Ok)
+}
+
+/// RTM_GETNEIGH for one entry (Linux neigh_get): ENOENT if absent
+fn getneigh(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
+    let r = ndmsg(p)?;
+    let (dev, key) = nd_target(sk.net(), &r)?;
+    let e = sk
+        .net()
+        .arp
+        .dump()
+        .into_iter()
+        .find(|e| e.ifindex == dev.ifindex() && e.key == key)
+        .ok_or(KernelError::NotFound)?;
+    reply(sk, fill_neigh(&e, RTM_NEWNEIGH, 0, h.seq, sk.portid()));
+    Ok(Done::Ok)
 }

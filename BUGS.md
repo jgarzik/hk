@@ -38,9 +38,7 @@ VFS handler is registered.
 Listed because real traffic reaches them: TCP has no retransmission or
 timers, so a dropped segment (TX ring full, backlog overflow) stalls a
 connection, TIME_WAIT ends immediately (no 2MSL), close does not RST
-unread data and SO_LINGER is stored only (P6); ARP has no state
-machine, every unresolved packet sends a request and entries never
-expire (P5); no IP fragmentation/reassembly, so datagrams larger than
+unread data and SO_LINGER is stored only (P6); no IP fragmentation/reassembly, so datagrams larger than
 the device MTU fail with EMSGSIZE where Linux fragments (P5); no ICMP
 errors are generated or delivered (port unreachable, connected-UDP
 ECONNREFUSED, IP_RECVERR queue: MSG_ERRQUEUE is always EAGAIN) (P5).
@@ -74,7 +72,9 @@ up to RLIMIT_STACK.
 **Location**: `kernel/net/netlink/rtnetlink.rs`, `kernel/net/devioctl.rs`
 
 Implemented: link get/dump/change (IFF_UP, MTU), IPv4 address and route
-add/delete/dump, route get (output routes), ARP dump, notifications.
+add/delete/dump, route get (output routes), neighbour get/dump/add/delete,
+notifications (none yet for neighbour state changes: no RTNLGRP_NEIGH;
+no proxy ARP entries, NTF_USE or NDA_PROTOCOL).
 Missing, each answered with a Linux errno rather than silently: link
 creation and rename (EOPNOTSUPP), multipath routes and nexthop objects
 (EOPNOTSUPP), input-route simulation `ip route get ... iif` (EOPNOTSUPP),

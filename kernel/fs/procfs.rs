@@ -1538,9 +1538,15 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
     net_route_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
         ProcfsInodeData::new_file(crate::net::proc::proc_net_route),
     ))));
+    let net_arp_inode = mk_inode(
+        &sb,
+        InodeMode::regular(0o444),
+        ProcfsInodeData::new_file(crate::net::arp::proc_net_arp),
+    );
     if let ProcfsInodeData::Directory { children } = &mut net_dir {
         children.insert(String::from("dev"), net_dev_inode);
         children.insert(String::from("route"), net_route_inode);
+        children.insert(String::from("arp"), net_arp_inode);
     }
     net_dir_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(net_dir))));
 

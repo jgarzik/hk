@@ -1602,7 +1602,9 @@ do not rely on that.
 | `NetNamespace` tables (`devices`, `tcp_connections`, `tcp_listeners`, `loopback`), `UdpTable.socks`, `TcpBind.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes: RCU-ready); the UDP/TCP port tables read each candidate's `Inet.addr` under their lock |
 | `Fib.tables` (`net/inet/fib.rs`, per netns) | `spin::RwLock` | thread only | leaf; written only under RTNL; read by input/output routing (softnet, socket syscalls, possibly under `sk_lock`) and dumps; returns `Arc<FibEntry>` clones; notifications are sent after the guard is dropped |
 | `NetDevice.addrs` (IPv4 list; IPv6 later) | `spin::RwLock` | thread only | leaf; written only under RTNL (`inet::ifaddr`), read via snapshots (`inet_addrs()`) |
-| `NetNamespace.arp_pending` -> `arp_entries` | `spin::Mutex` | thread only | `arp_resolve_or_queue` checks the cache and queues under `arp_pending`, so a racing reply cannot strand a packet; queue capped at 16 per address; `arp_flush_dev` (device down, under RTNL) takes both in the same order |
+| `NeighTable.hash` (`net/core/neigh.rs`; `NetNamespace.arp`, IPv6 ND later) | `spin::RwLock` | thread only (softnet, socket output, ktimerd) | (ifindex, address) -> `Arc<Neighbour>`; lookups drop the guard; GC/flush take each entry's `inner` under the write lock (order hash -> inner) |
+| `Neighbour.inner` | `spin::Mutex` | thread only | leaf: NUD state + bounded unresolved queue (unres_qlen_bytes). Never held while transmitting, soliciting or reporting errors: state changes return actions run after the unlock |
+| neighbour `TABLES`, `TIMER` | `spin::Mutex` | thread only | `TABLES` leaf (snapshot of registered tables); `TIMER` is held across `timer_add/timer_del` (-> `TIMERS` IrqSpinlock). One kernel timer runs all tables' due entries and GC on `ktimerd` |
 | `NlTable.socks` (`net/netlink`, per netns) | `spin::RwLock` | thread only | leaf; bound netlink sockets by (protocol, portid); lookups return `Arc` clones |
 | `NlSock.dump` | `spin::Mutex<Option<Dump>>` | thread only (sender's `sendmsg`, reader's `recvmsg`) | running dump cursor; held while it snapshots devices/FIB/ARP and while its part is pushed to `rxq` (keeps parts ordered); never with RTNL |
 | `NlSock.rxq`, `NlSock.dst` | `spin::Mutex` | thread only | leaf; replies, dump parts and notifications are pushed under it (each charged to rcvbuf first), `wq` is woken after it is dropped |
@@ -1626,7 +1628,7 @@ RTNL (configuration only)        TcpCb.sk_lock (listener before child; a
   v                                 |
 NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
   the guard before returning)
-  -> arp_pending -> arp_entries
+  -> NeighTable.hash -> Neighbour.inner (dropped before any transmit)
   -> NlTable.socks -> NlSock.rxq (netlink replies/notifications)
   (NlSock.dump -> devices/FIB/ARP snapshots -> NlSock.rxq: dump parts)
   -> device TX lock (e1000 tx)
@@ -1660,8 +1662,7 @@ last close (`ProtoOps::release`; TCP connections when their close
 handshake ends).
 
 **Known gaps (later phases):** TCP has no timers/retransmit (P6);
-neighbour state machine and
-ARP rate limiting (P5); RCU for the read-mostly tables (FIB, device list,
+RCU for the read-mostly tables (FIB, device list,
 address lists: COW snapshots are the intended next step; see plan 3a).
 
 #### Key Device Driver Rules

@@ -62,6 +62,8 @@ pub mod icmp;
 pub mod inet;
 pub mod ipv4;
 pub mod msg;
+#[path = "core/neigh.rs"]
+pub mod neigh;
 pub mod netlink;
 pub mod proc;
 pub mod request_sock;

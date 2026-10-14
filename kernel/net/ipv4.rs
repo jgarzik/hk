@@ -420,14 +420,42 @@ pub fn ip_send_rt(
     ip_hdr[10..12].copy_from_slice(&checksum.to_be_bytes());
     skb.dev = Some(Arc::clone(&dev));
 
-    // Loopback has no link-layer resolution (Linux: NUD_NOARP neighbour)
-    if dev.is_loopback() {
+    skb.saddr = Some(saddr);
+    neigh_output(net, &dev, rt, next_hop, skb)
+}
+
+/// Link-layer destination of a routed packet (Linux ip_finish_output2:
+/// NOARP devices and broadcast/multicast map directly, unicast next hops
+/// go through the ARP table)
+fn neigh_output(
+    net: &NetNamespace,
+    dev: &Arc<crate::net::NetDevice>,
+    rt: &route::Rtable,
+    next_hop: Ipv4Addr,
+    skb: Box<SkBuff>,
+) -> Result<(), KernelError> {
+    use crate::net::device::flags::IFF_NOARP;
+    use crate::net::inet::fib::RouteType;
+    if dev.is_loopback() || dev.get_flags() & IFF_NOARP != 0 {
         return ip_finish_output(skb, dev.mac());
     }
-    if rt.rtype == crate::net::inet::fib::RouteType::Broadcast {
-        return ip_finish_output(skb, ethernet::ETH_BROADCAST);
+    match rt.rtype {
+        RouteType::Broadcast => ip_finish_output(skb, ethernet::ETH_BROADCAST),
+        RouteType::Multicast => ip_finish_output(skb, mc_map(rt.daddr)),
+        _ => arp::output(net, dev, next_hop, skb),
     }
-    arp::arp_resolve(net, &dev, next_hop, skb)
+}
+
+/// Ethernet address of an IPv4 multicast group (Linux ip_eth_mc_map)
+fn mc_map(a: Ipv4Addr) -> [u8; ETH_ALEN] {
+    let o = a.octets();
+    [0x01, 0x00, 0x5e, o[1] & 0x7f, o[2], o[3]]
+}
+
+/// A queued packet's next hop never answered (Linux ipv4_link_failure
+/// via arp_error_report): tell its sender
+pub fn ip_link_failure(skb: Box<SkBuff>) {
+    drop(skb);
 }
 
 /// Build IP header and transmit (called by ARP when resolution completes)

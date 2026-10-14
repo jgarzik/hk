@@ -305,7 +305,7 @@ pub fn inetdev_up(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
 /// it go, except host-scope (local) ones
 pub fn inetdev_down(rtnl: &RtnlGuard, net: &NetNamespace, dev: &Arc<NetDevice>) {
     fib::fib_disable_dev(rtnl, net, dev, false);
-    net.arp_flush_dev(dev.ifindex());
+    net.arp.flush_dev(dev.ifindex());
 }
 
 /// Type of `addr` in the namespace (Linux inet_addr_type)
