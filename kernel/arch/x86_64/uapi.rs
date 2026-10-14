@@ -31,3 +31,14 @@ pub struct Stat {
 pub const O_DIRECTORY: u32 = 0o200000;
 /// Don't follow a trailing symlink
 pub const O_NOFOLLOW: u32 = 0o400000;
+
+/// `struct epoll_event` (include/uapi/linux/eventpoll.h): EPOLL_PACKED on
+/// x86_64, so 12 bytes with `data` at offset 4. `data` is a union in Linux.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EpollEvent {
+    /// Event mask (EPOLLIN, EPOLLOUT, etc.)
+    pub events: u32,
+    /// User data (passed back unchanged)
+    pub data: u64,
+}

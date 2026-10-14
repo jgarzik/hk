@@ -19,7 +19,7 @@
 //!   - No `chmod`, `chown`, `lchown` - use *at variants
 //!   - No `truncate` - use ftruncate with openat
 
-use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Timespec, Timeval, Timex, UtsName, AT_FDCWD};
+use crate::types::{CloneArgs, FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Timespec, Timeval, Timex, UtsName, AT_FDCWD};
 
 // ============================================================================
 // Syscall macros for aarch64
@@ -2656,3 +2656,14 @@ pub const O_DIRECTORY: u32 = 0o40000;
 pub const O_NOFOLLOW: u32 = 0o100000;
 pub const O_DIRECT: u32 = 0o200000;
 pub const O_LARGEFILE: u32 = 0o400000;
+
+/// `struct epoll_event` (include/uapi/linux/eventpoll.h): not packed on
+/// arm64, so 16 bytes with `data` at offset 8.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EpollEvent {
+    /// Event mask (EPOLLIN, EPOLLOUT, etc.)
+    pub events: u32,
+    /// User data (passed back unchanged)
+    pub data: u64,
+}

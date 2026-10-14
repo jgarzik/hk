@@ -8,7 +8,7 @@
 //! - Return value in RAX
 //! - RCX and R11 are clobbered by the syscall instruction
 
-use crate::types::{CloneArgs, EpollEvent, FdSet, IoVec, MqAttr, PollFd, RLimit, SigInfo, SigEvent, Timespec, Timeval, Timex, UtsName};
+use crate::types::{CloneArgs, FdSet, IoVec, MqAttr, PollFd, RLimit, SigInfo, SigEvent, Timespec, Timeval, Timex, UtsName};
 
 // ============================================================================
 // Syscall helper macros
@@ -2390,3 +2390,14 @@ pub const O_DIRECT: u32 = 0o40000;
 pub const O_LARGEFILE: u32 = 0o100000;
 pub const O_DIRECTORY: u32 = 0o200000;
 pub const O_NOFOLLOW: u32 = 0o400000;
+
+/// `struct epoll_event` (include/uapi/linux/eventpoll.h): EPOLL_PACKED on
+/// x86_64, so 12 bytes with `data` at offset 4.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct EpollEvent {
+    /// Event mask (EPOLLIN, EPOLLOUT, etc.)
+    pub events: u32,
+    /// User data (passed back unchanged)
+    pub data: u64,
+}

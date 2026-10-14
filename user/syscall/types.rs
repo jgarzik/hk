@@ -1370,20 +1370,9 @@ pub const CAP_LAST_CAP: u32 = 40;
 // epoll types and constants
 // ============================================================================
 
-/// epoll_event structure (Linux ABI)
-///
-/// Note: This is packed to match Linux's x86-64 ABI where the structure
-/// is 12 bytes (not 16). The data field is a union in Linux but we use u64.
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct EpollEvent {
-    /// Event mask (EPOLLIN, EPOLLOUT, etc.)
-    pub events: u32,
-    /// User data (passed back unchanged)
-    pub data: u64,
-}
+// `struct epoll_event` is per-arch (packed only on x86_64): see x86_64.rs / aarch64.rs.
 
-impl EpollEvent {
+impl crate::EpollEvent {
     /// Create a new epoll_event
     pub const fn new(events: u32, data: u64) -> Self {
         Self { events, data }
@@ -1395,7 +1384,7 @@ impl EpollEvent {
     }
 }
 
-impl Default for EpollEvent {
+impl Default for crate::EpollEvent {
     fn default() -> Self {
         Self::empty()
     }

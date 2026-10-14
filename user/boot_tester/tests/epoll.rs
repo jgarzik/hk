@@ -5,6 +5,7 @@
 //! - Test epoll_ctl ADD/DEL/MOD
 //! - Test epoll_wait with pipes
 //! - Test epoll_wait with eventfd
+//! - Test epoll_event layout: 64-bit data, multiple events
 //! - Test epoll_wait timeout behavior
 //! - Test EPOLLONESHOT mode
 
@@ -24,6 +25,7 @@ pub fn run_tests() {
     test_epoll_add_del();
     test_epoll_wait_pipe();
     test_epoll_wait_eventfd();
+    test_epoll_wait_multi_data64();
     test_epoll_timeout();
     test_epoll_modify();
     test_epoll_oneshot();
@@ -229,6 +231,45 @@ fn test_epoll_wait_eventfd() {
     sys_close(epfd as u64);
     sys_close(efd as u64);
     println(b"EPOLL_WAIT_EVENTFD:OK");
+}
+
+/// Test epoll_event ABI layout: full 64-bit data, two events returned
+///
+/// epoll_event is packed (12 bytes) only on x86_64; on arm64 it is 16 bytes
+/// with data at offset 8 (include/uapi/linux/eventpoll.h EPOLL_PACKED).
+fn test_epoll_wait_multi_data64() {
+    const D1: u64 = 0xA1B2_C3D4_0000_0001;
+    const D2: u64 = 0x0102_0304_0506_0708;
+    let epfd = sys_epoll_create1(0);
+    let efd1 = sys_eventfd2(1, 0);
+    let efd2 = sys_eventfd2(1, 0);
+    if epfd < 0 || efd1 < 0 || efd2 < 0 {
+        println(b"EPOLL_WAIT_MULTI_DATA64:FAIL: setup failed");
+        return;
+    }
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, efd1 as i32, &EpollEvent::new(EPOLLIN, D1));
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, efd2 as i32, &EpollEvent::new(EPOLLIN, D2));
+
+    let mut events = [EpollEvent::empty(); 4];
+    let ret = sys_epoll_wait(epfd as i32, events.as_mut_ptr(), 4, 0);
+    let (e0, e1) = (events[0], events[1]);
+    let (d0, d1, ev0, ev1) = (e0.data, e1.data, e0.events, e1.events);
+    sys_close(epfd as u64);
+    sys_close(efd1 as u64);
+    sys_close(efd2 as u64);
+
+    let data_ok = (d0 == D1 && d1 == D2) || (d0 == D2 && d1 == D1);
+    if ret == 2 && data_ok && ev0 & EPOLLIN != 0 && ev1 & EPOLLIN != 0 {
+        println(b"EPOLL_WAIT_MULTI_DATA64:OK");
+    } else {
+        print(b"EPOLL_WAIT_MULTI_DATA64:FAIL: ret=");
+        print_num(ret);
+        print(b" data0=");
+        print_num(d0 as i64);
+        print(b" data1=");
+        print_num(d1 as i64);
+        println(b"");
+    }
 }
 
 /// Test epoll_wait timeout behavior
