@@ -9,7 +9,7 @@
 
 use crate::arch::Uaccess;
 use crate::fs::{KernelError, LookupFlags, Path, lookup_path_at};
-use crate::uaccess::{UaccessArch, strncpy_from_user};
+use crate::uaccess::{UaccessArch, copy_val_from_user, strncpy_from_user};
 
 use super::syscall::{AT_FDCWD, PATH_MAX, current_fd_table};
 
@@ -359,6 +359,7 @@ const UTIME_OMIT: i64 = 0x3ffffffe;
 
 /// Userspace timespec structure
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct UserTimespec {
     tv_sec: i64,
     tv_nsec: i64,
@@ -436,11 +437,9 @@ pub fn sys_utimensat(dirfd: i32, pathname: u64, times: u64, flags: i32) -> i64 {
         if !Uaccess::access_ok(times, size) {
             return KernelError::BadAddress.sysret();
         }
-        let ts: [UserTimespec; 2] = unsafe {
-            Uaccess::user_access_begin();
-            let val = core::ptr::read(times as *const [UserTimespec; 2]);
-            Uaccess::user_access_end();
-            val
+        let ts: [UserTimespec; 2] = match copy_val_from_user::<Uaccess, [UserTimespec; 2]>(times) {
+            Ok(v) => v,
+            Err(_) => return KernelError::BadAddress.sysret(),
         };
 
         let atime = if ts[0].tv_nsec == UTIME_OMIT {
@@ -494,6 +493,7 @@ pub fn sys_utimes(pathname: u64, times: u64) -> i64 {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy, Default)]
     struct Timeval {
         tv_sec: i64,
         tv_usec: i64,
@@ -503,11 +503,9 @@ pub fn sys_utimes(pathname: u64, times: u64) -> i64 {
     if !Uaccess::access_ok(times, size) {
         return KernelError::BadAddress.sysret();
     }
-    let tv: [Timeval; 2] = unsafe {
-        Uaccess::user_access_begin();
-        let val = core::ptr::read(times as *const [Timeval; 2]);
-        Uaccess::user_access_end();
-        val
+    let tv: [Timeval; 2] = match copy_val_from_user::<Uaccess, [Timeval; 2]>(times) {
+        Ok(v) => v,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     let ts: [UserTimespec; 2] = [
@@ -564,6 +562,7 @@ pub fn sys_utime(pathname: u64, times: u64) -> i64 {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy, Default)]
     struct Utimbuf {
         actime: i64,
         modtime: i64,
@@ -573,11 +572,9 @@ pub fn sys_utime(pathname: u64, times: u64) -> i64 {
     if !Uaccess::access_ok(times, size) {
         return KernelError::BadAddress.sysret();
     }
-    let buf: Utimbuf = unsafe {
-        Uaccess::user_access_begin();
-        let val = core::ptr::read(times as *const Utimbuf);
-        Uaccess::user_access_end();
-        val
+    let buf: Utimbuf = match copy_val_from_user::<Uaccess, Utimbuf>(times) {
+        Ok(v) => v,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     let path_str = match strncpy_from_user::<Uaccess>(pathname, PATH_MAX) {

@@ -5,7 +5,7 @@ use alloc::vec;
 use crate::arch::Uaccess;
 use crate::console::console_write;
 use crate::fs::{KernelError, RwFlags};
-use crate::uaccess::{UaccessArch, copy_to_user};
+use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 
 use super::syscall::{
     IOV_MAX, MAX_RW_COUNT, RWF_APPEND, RWF_ATOMIC, RWF_DONTCACHE, RWF_DSYNC, RWF_NOWAIT,
@@ -17,7 +17,7 @@ use super::syscall::{
 /// Used by readv/writev syscalls to specify multiple buffers
 /// in a single system call.
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 pub struct IoVec {
     /// Base address of the buffer (void* in userspace)
     pub iov_base: u64,
@@ -59,15 +59,13 @@ fn validate_iovec_array(iov_ptr: u64, iovcnt: i32) -> Result<alloc::vec::Vec<IoV
     }
 
     // Copy iovec array from user space
-    let mut iovecs = alloc::vec::Vec::with_capacity(iovcnt);
-
-    unsafe {
-        Uaccess::user_access_begin();
-        for i in 0..iovcnt {
-            let iov = core::ptr::read((iov_ptr as *const IoVec).add(i));
-            iovecs.push(iov);
-        }
-        Uaccess::user_access_end();
+    let mut iovecs = vec![IoVec::default(); iovcnt];
+    // SAFETY: IoVec is repr(C) plain data; the byte view covers exactly the
+    // `iovcnt` initialized elements of `iovecs`.
+    let bytes =
+        unsafe { core::slice::from_raw_parts_mut(iovecs.as_mut_ptr() as *mut u8, total_size) };
+    if copy_from_user::<Uaccess>(bytes, iov_ptr, total_size).is_err() {
+        return Err(KernelError::BadAddress.sysret());
     }
 
     // Validate each iovec buffer (non-zero length only)
@@ -263,24 +261,24 @@ fn writev_console(iovecs: &[IoVec]) -> i64 {
             let mut stack_buf = [0u8; SMALL_BUF_SIZE];
             let buf = &mut stack_buf[..count];
 
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(iov.iov_base as *const u8, buf.as_mut_ptr(), count);
-                Uaccess::user_access_end();
+            if copy_from_user::<Uaccess>(&mut buf[..count], iov.iov_base, count).is_err() {
+                return if total_written > 0 {
+                    total_written as i64
+                } else {
+                    KernelError::BadAddress.sysret()
+                };
             }
 
             console_write(buf);
         } else {
             let mut kernel_buf = vec![0u8; count];
 
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(
-                    iov.iov_base as *const u8,
-                    kernel_buf.as_mut_ptr(),
-                    count,
-                );
-                Uaccess::user_access_end();
+            if copy_from_user::<Uaccess>(&mut kernel_buf[..count], iov.iov_base, count).is_err() {
+                return if total_written > 0 {
+                    total_written as i64
+                } else {
+                    KernelError::BadAddress.sysret()
+                };
             }
 
             console_write(&kernel_buf);
@@ -348,14 +346,12 @@ pub fn sys_writev(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
             let write_buf = &mut stack_buf[..count];
 
             // Copy from user space
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(
-                    iov.iov_base as *const u8,
-                    write_buf.as_mut_ptr(),
-                    count,
-                );
-                Uaccess::user_access_end();
+            if copy_from_user::<Uaccess>(&mut write_buf[..count], iov.iov_base, count).is_err() {
+                return if total_written > 0 {
+                    total_written as i64
+                } else {
+                    KernelError::BadAddress.sysret()
+                };
             }
 
             let bytes_written = match file.write(write_buf) {
@@ -385,14 +381,12 @@ pub fn sys_writev(fd: i32, iov_ptr: u64, iovcnt: i32) -> i64 {
         } else {
             let mut kernel_buf = vec![0u8; count];
 
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(
-                    iov.iov_base as *const u8,
-                    kernel_buf.as_mut_ptr(),
-                    count,
-                );
-                Uaccess::user_access_end();
+            if copy_from_user::<Uaccess>(&mut kernel_buf[..count], iov.iov_base, count).is_err() {
+                return if total_written > 0 {
+                    total_written as i64
+                } else {
+                    KernelError::BadAddress.sysret()
+                };
             }
 
             let bytes_written = match file.write(&kernel_buf) {
@@ -520,14 +514,12 @@ pub fn sys_preadv(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
             };
 
             // Copy to user space
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(
-                    read_buf.as_ptr(),
-                    iov.iov_base as *mut u8,
-                    bytes_read,
-                );
-                Uaccess::user_access_end();
+            if copy_to_user::<Uaccess>(iov.iov_base, &read_buf[..bytes_read]).is_err() {
+                return if total_read > 0 {
+                    total_read as i64
+                } else {
+                    KernelError::BadAddress.sysret()
+                };
             }
 
             total_read += bytes_read;
@@ -567,14 +559,12 @@ pub fn sys_preadv(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
             };
 
             // Copy to user space
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(
-                    kernel_buf.as_ptr(),
-                    iov.iov_base as *mut u8,
-                    bytes_read,
-                );
-                Uaccess::user_access_end();
+            if copy_to_user::<Uaccess>(iov.iov_base, &kernel_buf[..bytes_read]).is_err() {
+                return if total_read > 0 {
+                    total_read as i64
+                } else {
+                    KernelError::BadAddress.sysret()
+                };
             }
 
             total_read += bytes_read;
@@ -659,14 +649,12 @@ pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
             let write_buf = &mut stack_buf[..count];
 
             // Copy from user space
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(
-                    iov.iov_base as *const u8,
-                    write_buf.as_mut_ptr(),
-                    count,
-                );
-                Uaccess::user_access_end();
+            if copy_from_user::<Uaccess>(&mut write_buf[..count], iov.iov_base, count).is_err() {
+                return if total_written > 0 {
+                    total_written as i64
+                } else {
+                    KernelError::BadAddress.sysret()
+                };
             }
 
             // Use positioned write (doesn't modify file position)
@@ -705,14 +693,12 @@ pub fn sys_pwritev(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64) -> i64 {
         } else {
             let mut kernel_buf = vec![0u8; count];
 
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(
-                    iov.iov_base as *const u8,
-                    kernel_buf.as_mut_ptr(),
-                    count,
-                );
-                Uaccess::user_access_end();
+            if copy_from_user::<Uaccess>(&mut kernel_buf[..count], iov.iov_base, count).is_err() {
+                return if total_written > 0 {
+                    total_written as i64
+                } else {
+                    KernelError::BadAddress.sysret()
+                };
             }
 
             // Use positioned write (doesn't modify file position)
@@ -1064,14 +1050,12 @@ pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32)
             let write_buf = &mut stack_buf[..count];
 
             // Copy from user space
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(
-                    iov.iov_base as *const u8,
-                    write_buf.as_mut_ptr(),
-                    count,
-                );
-                Uaccess::user_access_end();
+            if copy_from_user::<Uaccess>(&mut write_buf[..count], iov.iov_base, count).is_err() {
+                return if total_written > 0 {
+                    total_written as i64
+                } else {
+                    KernelError::BadAddress.sysret()
+                };
             }
 
             let result = if use_position {
@@ -1129,14 +1113,12 @@ pub fn sys_pwritev2(fd: i32, iov_ptr: u64, iovcnt: i32, offset: i64, flags: i32)
             let mut kernel_buf = vec![0u8; count];
 
             // Copy from user space
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(
-                    iov.iov_base as *const u8,
-                    kernel_buf.as_mut_ptr(),
-                    count,
-                );
-                Uaccess::user_access_end();
+            if copy_from_user::<Uaccess>(&mut kernel_buf[..count], iov.iov_base, count).is_err() {
+                return if total_written > 0 {
+                    total_written as i64
+                } else {
+                    KernelError::BadAddress.sysret()
+                };
             }
 
             let result = if use_position {

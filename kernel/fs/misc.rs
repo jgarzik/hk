@@ -12,7 +12,7 @@ use alloc::vec;
 use crate::arch::Uaccess;
 use crate::fs::{KernelError, LookupFlags, Path, is_subdir, lookup_path_flags};
 use crate::storage::get_blkdev;
-use crate::uaccess::{UaccessArch, put_user, strncpy_from_user};
+use crate::uaccess::{UaccessArch, copy_to_user, put_user, strncpy_from_user};
 
 use super::syscall::{PATH_MAX, current_fd_table};
 
@@ -408,6 +408,7 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
             Err(crate::chardev::DeviceError::NotTty) => KernelError::NotTty.sysret(),
             Err(crate::chardev::DeviceError::InvalidArg) => KernelError::InvalidArgument.sysret(),
             Err(crate::chardev::DeviceError::NotSupported) => KernelError::NotTty.sysret(),
+            Err(crate::chardev::DeviceError::Fault) => KernelError::BadAddress.sysret(),
             Err(_) => KernelError::Io.sysret(),
         }
     } else {
@@ -688,8 +689,8 @@ fn do_getxattr(
     match inode.i_op.getxattr(&inode, &name, &mut value) {
         Ok(attr_size) => {
             // Copy to user
-            unsafe {
-                core::ptr::copy_nonoverlapping(value.as_ptr(), value_ptr as *mut u8, attr_size);
+            if copy_to_user::<Uaccess>(value_ptr, &value[..attr_size]).is_err() {
+                return KernelError::BadAddress.sysret();
             }
             attr_size as i64
         }
@@ -747,8 +748,8 @@ pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
     match inode.i_op.getxattr(&inode, &name, &mut value) {
         Ok(attr_size) => {
             // Copy to user
-            unsafe {
-                core::ptr::copy_nonoverlapping(value.as_ptr(), value_ptr as *mut u8, attr_size);
+            if copy_to_user::<Uaccess>(value_ptr, &value[..attr_size]).is_err() {
+                return KernelError::BadAddress.sysret();
             }
             attr_size as i64
         }
@@ -825,8 +826,8 @@ fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) 
     match inode.i_op.listxattr(&inode, &mut list) {
         Ok(list_size) => {
             // Copy to user
-            unsafe {
-                core::ptr::copy_nonoverlapping(list.as_ptr(), list_ptr as *mut u8, list_size);
+            if copy_to_user::<Uaccess>(list_ptr, &list[..list_size]).is_err() {
+                return KernelError::BadAddress.sysret();
             }
             list_size as i64
         }
@@ -868,8 +869,8 @@ pub fn sys_flistxattr(fd: i32, list_ptr: u64, size: u64) -> i64 {
     match inode.i_op.listxattr(&inode, &mut list) {
         Ok(list_size) => {
             // Copy to user
-            unsafe {
-                core::ptr::copy_nonoverlapping(list.as_ptr(), list_ptr as *mut u8, list_size);
+            if copy_to_user::<Uaccess>(list_ptr, &list[..list_size]).is_err() {
+                return KernelError::BadAddress.sysret();
             }
             list_size as i64
         }

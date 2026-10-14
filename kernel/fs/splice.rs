@@ -26,6 +26,7 @@
 
 use alloc::sync::Arc;
 
+use crate::arch::Uaccess;
 use crate::fs::KernelError;
 use crate::fs::file::File;
 use crate::mm::page_cache::{CachedPage, PAGE_SIZE};
@@ -36,6 +37,7 @@ use crate::pipe::{
 };
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
+use crate::uaccess::{copy_from_user, get_user, put_user};
 
 // =============================================================================
 // Splice flags (from include/linux/splice.h)
@@ -308,6 +310,30 @@ fn get_file_from_fd(fd: i32) -> Option<Arc<File>> {
     fd_table.lock().get(fd)
 }
 
+/// Read a user `loff_t *` (NULL = use and advance the file position)
+fn read_user_offset(ptr: u64) -> Result<Option<u64>, KernelError> {
+    if ptr == 0 {
+        return Ok(None);
+    }
+    let off = get_user::<Uaccess, i64>(ptr).map_err(|_| KernelError::BadAddress)?;
+    if off < 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(Some(off as u64))
+}
+
+/// After a transfer that started at user offset `pos`, store the advanced
+/// offset back to `*ptr` (Linux updates `*off_in`/`*off_out`/`*offset`).
+fn write_back_offset(ptr: u64, pos: Option<u64>, ret: i64) -> i64 {
+    if let Some(p) = pos
+        && ret > 0
+        && put_user::<Uaccess, u64>(ptr, p + ret as u64).is_err()
+    {
+        return KernelError::BadAddress.sysret();
+    }
+    ret
+}
+
 // =============================================================================
 // Splice syscall implementations
 // =============================================================================
@@ -383,7 +409,12 @@ pub fn sys_splice(
             return KernelError::IllegalSeek.sysret();
         }
 
-        return do_splice_file_to_pipe(&in_file, off_in, &out_pipe, len, flags);
+        let pos = match read_user_offset(off_in) {
+            Ok(p) => p,
+            Err(e) => return e.sysret(),
+        };
+        let ret = do_splice_file_to_pipe(&in_file, pos, &out_pipe, len, flags);
+        return write_back_offset(off_in, pos, ret);
     }
 
     // Pipe-to-file splice
@@ -398,7 +429,12 @@ pub fn sys_splice(
             return KernelError::IllegalSeek.sysret();
         }
 
-        return do_splice_pipe_to_file(&in_pipe, &out_file, off_out, len, flags);
+        let pos = match read_user_offset(off_out) {
+            Ok(p) => p,
+            Err(e) => return e.sysret(),
+        };
+        let ret = do_splice_pipe_to_file(&in_pipe, &out_file, pos, len, flags);
+        return write_back_offset(off_out, pos, ret);
     }
 
     KernelError::InvalidArgument.sysret()
@@ -493,7 +529,7 @@ fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64
 /// Splice from file to pipe (read file into pipe)
 fn do_splice_file_to_pipe(
     file: &Arc<File>,
-    off_in: u64,
+    off_in: Option<u64>,
     pipe: &Pipe,
     len: usize,
     flags: u32,
@@ -519,7 +555,7 @@ fn do_splice_file_to_pipe(
     let to_read = len.min(PAGE_SIZE);
 
     // Read from file
-    let bytes_read = if off_in != 0 {
+    let bytes_read = if let Some(off_in) = off_in {
         // Use pread at specified offset
         match file.pread(&mut buf[..to_read], off_in) {
             Ok(n) => n,
@@ -589,7 +625,7 @@ fn do_splice_file_to_pipe(
 fn do_splice_pipe_to_file(
     pipe: &Pipe,
     file: &Arc<File>,
-    off_out: u64,
+    off_out: Option<u64>,
     len: usize,
     flags: u32,
 ) -> i64 {
@@ -635,7 +671,7 @@ fn do_splice_pipe_to_file(
         }
 
         // Write to file
-        let bytes_written = if off_out != 0 {
+        let bytes_written = if let Some(off_out) = off_out {
             let actual_offset = off_out + written as u64;
             match file.pwrite(&buf[..to_write], actual_offset) {
                 Ok(n) => n,
@@ -807,7 +843,7 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
     // Read iovec from user space
     // struct iovec { void *iov_base; size_t iov_len; }
     #[repr(C)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Default)]
     struct IoVec {
         base: u64,
         len: u64,
@@ -820,7 +856,10 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
         let iov_ptr = iov + (i * iov_size) as u64;
 
         // Read the iovec from user space
-        let user_iov = unsafe { *(iov_ptr as *const IoVec) };
+        let user_iov = match get_user::<Uaccess, IoVec>(iov_ptr) {
+            Ok(v) => v,
+            Err(_) => return KernelError::BadAddress.sysret(),
+        };
 
         if user_iov.len == 0 {
             continue;
@@ -834,12 +873,17 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
 
         // Copy user data to page (limited to PAGE_SIZE)
         let to_copy = (user_iov.len as usize).min(PAGE_SIZE);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                user_iov.base as *const u8,
-                page.frame as *mut u8,
-                to_copy,
-            );
+        // SAFETY: page.frame is a freshly allocated, kernel-mapped page of
+        // PAGE_SIZE bytes owned by this pipe buffer.
+        let dst = unsafe { core::slice::from_raw_parts_mut(page.frame as *mut u8, to_copy) };
+        if copy_from_user::<Uaccess>(dst, user_iov.base, to_copy).is_err() {
+            // Bytes already queued count as success (Linux iov_iter)
+            pipe.wait_queue.wake_all();
+            return if total > 0 {
+                total as i64
+            } else {
+                KernelError::BadAddress.sysret()
+            };
         }
 
         // Insert into pipe
@@ -909,24 +953,27 @@ pub fn sys_sendfile64(out_fd: i32, in_fd: i32, offset: u64, count: usize) -> i64
         return KernelError::InvalidArgument.sysret();
     }
 
-    // Check if output is a socket for optimized path
-    if let Some(socket_ops) = out_file.f_op.as_any().downcast_ref::<SocketFileOps>() {
-        return do_sendfile_to_socket(&in_file, offset, socket_ops, count);
-    }
+    let pos = match read_user_offset(offset) {
+        Ok(p) => p,
+        Err(e) => return e.sysret(),
+    };
 
-    // Check if output is a pipe
-    if let Some(out_pipe) = get_pipe_from_fd(out_fd) {
-        return do_splice_file_to_pipe(&in_file, offset, &out_pipe, count, 0);
-    }
-
-    // File to file (rare, but supported)
-    do_sendfile_to_file(&in_file, offset, &out_file, count)
+    let ret = if let Some(socket_ops) = out_file.f_op.as_any().downcast_ref::<SocketFileOps>() {
+        // Output is a socket: optimized path
+        do_sendfile_to_socket(&in_file, pos, socket_ops, count)
+    } else if let Some(out_pipe) = get_pipe_from_fd(out_fd) {
+        do_splice_file_to_pipe(&in_file, pos, &out_pipe, count, 0)
+    } else {
+        // File to file (rare, but supported)
+        do_sendfile_to_file(&in_file, pos, &out_file, count)
+    };
+    write_back_offset(offset, pos, ret)
 }
 
 /// Sendfile to socket
 fn do_sendfile_to_socket(
     in_file: &Arc<File>,
-    offset: u64,
+    offset: Option<u64>,
     socket_ops: &SocketFileOps,
     count: usize,
 ) -> i64 {
@@ -943,7 +990,7 @@ fn do_sendfile_to_socket(
         let to_read = (count - sent).min(PAGE_SIZE);
 
         // Read from file
-        let bytes_read = if offset != 0 {
+        let bytes_read = if let Some(offset) = offset {
             let actual_offset = offset + sent as u64;
             match in_file.pread(&mut buf[..to_read], actual_offset) {
                 Ok(n) => n,
@@ -973,22 +1020,13 @@ fn do_sendfile_to_socket(
         }
     }
 
-    // Update offset pointer if provided
-    if offset != 0 && sent > 0 {
-        // Write back updated offset to user space
-        unsafe {
-            let offset_ptr = offset as *mut u64;
-            *offset_ptr += sent as u64;
-        }
-    }
-
     sent as i64
 }
 
 /// Sendfile to regular file
 fn do_sendfile_to_file(
     in_file: &Arc<File>,
-    offset: u64,
+    offset: Option<u64>,
     out_file: &Arc<File>,
     count: usize,
 ) -> i64 {
@@ -999,7 +1037,7 @@ fn do_sendfile_to_file(
         let to_read = (count - transferred).min(PAGE_SIZE);
 
         // Read from input file
-        let bytes_read = if offset != 0 {
+        let bytes_read = if let Some(offset) = offset {
             let actual_offset = offset + transferred as u64;
             match in_file.pread(&mut buf[..to_read], actual_offset) {
                 Ok(n) => n,
@@ -1063,8 +1101,7 @@ pub fn sys_copy_file_range(
     len: u64,
     flags: u32,
 ) -> i64 {
-    use crate::arch::Uaccess;
-    use crate::uaccess::{UaccessArch, get_user, put_user};
+    use crate::uaccess::UaccessArch;
 
     // flags must be 0 (reserved for future use)
     if flags != 0 {
