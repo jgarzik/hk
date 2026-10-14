@@ -252,6 +252,11 @@ extern "C" fn ap_rust_entry(boot_data: *const ApBootData) -> ! {
     // Initialize exception vectors for this CPU
     exceptions::init();
 
+    // Privileged Access Never, if the boot CPU found it implemented
+    if super::uaccess::pan_enabled() {
+        super::uaccess::pan_init_cpu();
+    }
+
     // Initialize GIC for this CPU (redistributor + CPU interface)
     gic::init();
 

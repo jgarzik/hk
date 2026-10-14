@@ -68,6 +68,12 @@ pub fn init() {
         asm!("msr cpacr_el1, {}", in(reg) cpacr);
         asm!("isb");
     }
+
+    // Privileged Access Never (ARMv8.1+), if implemented
+    super::uaccess::pan_init_cpu();
+    if super::uaccess::pan_enabled() {
+        crate::printkln!("CPU: PAN (Privileged Access Never) enabled");
+    }
 }
 
 /// Halt the CPU until an interrupt arrives
