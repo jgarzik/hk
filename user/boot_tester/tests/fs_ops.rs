@@ -200,6 +200,9 @@ fn test_link_dir_eperm() {
     } else {
         print(b"LINK_DIR_EPERM:FAIL: expected -1 (EPERM), got ");
         print_num(ret);
+        print(b", /proc expected -18 (EXDEV), got ");
+        print_num(xdev);
+        println(b"");
     }
 }
 
