@@ -66,14 +66,13 @@ jobs:
           if-no-files-found: ignore
 
       # Differential run of boot_tester on Ubuntu's Linux kernel (TCG here,
-      # hence the long timeout). Advisory until it has proven stable.
+      # hence the long timeout).
       - name: Boot test on Linux (x86-64)
         id: linux_x86
-        continue-on-error: true
         run: make check-linux LINUX_TEST_TIMEOUT=300
 
       - name: Upload Linux serial log
-        if: steps.linux_x86.outcome == 'failure'
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: qemu-serial-linux-x86
@@ -118,14 +117,13 @@ jobs:
           if-no-files-found: ignore
 
       # Differential run on Ubuntu's arm64 Linux kernel (kernel .deb comes
-      # from apt-get download; apt lists were updated above). Advisory.
+      # from apt-get download; apt lists were updated above).
       - name: Boot test on Linux (aarch64)
         id: linux_arm
-        continue-on-error: true
         run: make check-linux LINUX_TEST_TIMEOUT=300
 
       - name: Upload Linux serial log
-        if: steps.linux_arm.outcome == 'failure'
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: qemu-serial-linux-arm
