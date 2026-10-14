@@ -1347,7 +1347,7 @@ fn gen_mounts() -> Vec<u8> {
     if let Some(root_mount) = current_mnt_ns().get_root() {
         // Output root mount
         let fs_name = root_mount.sb.fs_type.name;
-        let _ = writeln!(output, "none / {} rw 0 0", fs_name);
+        let _ = writeln!(output, "none / {} {} 0 0", fs_name, root_mount.opts());
 
         // Walk children recursively
         gen_mounts_recursive(&root_mount, &mut output);
@@ -1370,7 +1370,13 @@ fn gen_mounts_recursive(mount: &super::mount::Mount, output: &mut String) {
             String::from("unknown")
         };
 
-        let _ = writeln!(output, "none {} {} rw 0 0", mountpoint, fs_name);
+        let _ = writeln!(
+            output,
+            "none {} {} {} 0 0",
+            mountpoint,
+            fs_name,
+            child.opts()
+        );
 
         // Recurse into children
         gen_mounts_recursive(child, output);

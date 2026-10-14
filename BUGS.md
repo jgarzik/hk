@@ -63,9 +63,26 @@ changes, set-id clearing, capability overrides by fsuid/fsgid). Missing:
 no supplementary groups (no setgroups/getgroups; group class checks use the
 fsgid only); fs.protected_hardlinks/symlinks/fifos/regular do not exist
 (behave as their kernel default 0); execve ignores S_ISUID/S_ISGID and file
-capabilities; no read-only, noexec, nodev or nosuid mounts and no
-immutable/append-only inodes (no EROFS, no IS_APPEND/IS_IMMUTABLE EPERM);
+capabilities (so MS_NOSUID has nothing to suppress); no
+immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM);
 chmod/chown do not update ctime; ETXTBSY is not enforced.
+
+## Mount flag gaps
+
+**Location**: `kernel/fs/misc.rs` sys_mount/sys_umount2, `kernel/fs/mount.rs`
+
+Honored: CAP_SYS_ADMIN (EPERM), MS_RDONLY (EROFS on every change, on the
+superblock), MS_NOSUID/MS_NODEV/MS_NOEXEC (per mount), MS_REMOUNT of those
+flags, statfs f_flags and /proc/mounts options. Accepted without effect
+because hk already behaves that way: atime flags (no atime updates),
+MS_SILENT, MS_MANDLOCK, MS_POSIXACL, MS_I_VERSION, MS_LAZYTIME, and
+MS_PRIVATE/MS_UNBINDABLE (mounts never propagate, no bind mounts).
+EINVAL instead of Linux behavior: MS_BIND (also MS_REMOUNT|MS_BIND),
+MS_MOVE, MS_SHARED, MS_SLAVE, MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW
+and umount2 MNT_EXPIRE. Not done: a read-only remount does not fail with
+EBUSY while files are open for writing (and those writes still succeed);
+mmap(PROT_EXEC) of a noexec file is allowed; mount data/options strings
+are ignored; mounts are not user-namespace aware (plain capable()).
 
 ## Global init is not protected from default-action signals
 

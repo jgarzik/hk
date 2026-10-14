@@ -4,7 +4,7 @@ use crate::arch::Uaccess;
 use crate::fs::path::{create_entry, delete_entry};
 use alloc::vec::Vec;
 
-use crate::fs::{DirContext, DirEntry, FileType, InodeMode, KernelError, dac};
+use crate::fs::{DevId, DirContext, DirEntry, FileType, InodeMode, KernelError, dac};
 use crate::task::CAP_MKNOD;
 use crate::uaccess::{UaccessArch, copy_to_user, strncpy_from_user};
 
@@ -210,7 +210,7 @@ pub fn sys_mknod(pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
 /// Device nodes need CAP_MKNOD (checked after the parent's permission,
 /// like vfs_mknod). FIFOs, sockets and device nodes are created as
 /// regular files for now.
-pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, _dev: u64) -> i64 {
+pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
     const S_IFREG: u32 = 0o100000;
     const S_IFCHR: u32 = 0o020000;
     const S_IFBLK: u32 = 0o060000;
@@ -229,7 +229,7 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, _dev: u64) -> i64 {
 
     // may_mknod: file type validity
     let ty = mode & S_IFMT;
-    let dev = match ty {
+    let is_dev = match ty {
         S_IFREG | 0 | S_IFIFO | S_IFSOCK => false,
         S_IFCHR | S_IFBLK => true,
         S_IFDIR => return KernelError::NotPermitted.sysret(),
@@ -241,11 +241,19 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, _dev: u64) -> i64 {
         Err(e) => return e,
     };
     let r = create_entry(&parent, &name, |dir, c| {
-        if dev && !dac::capable(c, CAP_MKNOD) {
+        if is_dev && !dac::capable(c, CAP_MKNOD) {
             return Err(KernelError::NotPermitted);
         }
         let perm = dac::create_mode(c, dir, (mode & 0o7777) as u16);
-        dir.i_op.create(dir, &name, InodeMode::regular(perm))
+        match ty {
+            S_IFCHR => dir
+                .i_op
+                .mknod(dir, &name, InodeMode::chardev(perm), DevId::from_user(dev)),
+            S_IFBLK => dir
+                .i_op
+                .mknod(dir, &name, InodeMode::blockdev(perm), DevId::from_user(dev)),
+            _ => dir.i_op.create(dir, &name, InodeMode::regular(perm)),
+        }
     });
     match r {
         Ok(_) => 0,

@@ -690,6 +690,8 @@ Linux `vfsmount.mnt_count` pattern:
 | `Mount.parent` | `RwLock<Option<Weak<Mount>>>` | Parent mount reference |
 | `Mount.children` | `RwLock<Vec<Arc<Mount>>>` | Child mounts |
 | `Mount.mnt_count` | `AtomicU64` | Open file reference count |
+| `Mount.mnt_flags` | `AtomicU32` | MNT_NOSUID/NODEV/NOEXEC; set by mount/remount, read lock-free (open, exec, statfs) |
+| `SuperBlock.s_flags` | `AtomicU32` | SB_RDONLY; set by mount/remount, read lock-free by permission checks |
 
 **Reference Counting (mntget/mntput):**
 

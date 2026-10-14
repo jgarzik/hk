@@ -100,6 +100,10 @@ use alloc::sync::Arc;
 pub fn kernel_open_exec(path: &str) -> Result<Arc<File>, i32> {
     let dentry = lookup_path_flags(path, LookupFlags::open()).map_err(|e| e as i32)?;
     let inode = dentry.get_inode().ok_or(KernelError::NotFound as i32)?;
+    // may_open: no exec from a noexec mount (path_noexec)
+    if inode.mode().is_file() && mount::mnt_flags_of(&dentry) & mount::MNT_NOEXEC != 0 {
+        return Err(KernelError::PermissionDenied as i32);
+    }
     dac::may_open(&dac::cred(), &inode, MAY_EXEC, flags::O_RDONLY).map_err(|e| e as i32)?;
     if !inode.mode().is_file() {
         return Err(KernelError::PermissionDenied as i32);

@@ -8,6 +8,7 @@ pub mod stdio;
 pub mod dirents;
 pub mod cloexec;
 pub mod append;
+pub mod mountflags;
 pub mod process;
 pub mod file_io;
 pub mod fs_common;
@@ -81,6 +82,7 @@ pub fn run_all_tests() {
     dirents::run_tests();
     cloexec::run_tests();
     append::run_tests();
+    mountflags::run_tests();
     process::run_tests();
     file_io::run_tests();
     fs_ops::run_tests();

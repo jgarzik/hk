@@ -5,7 +5,7 @@
 
 use alloc::sync::Arc;
 
-use ::core::sync::atomic::{AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spin::RwLock;
 
 use crate::mutex::SleepMutex;
@@ -111,7 +111,7 @@ pub struct LinuxStatFs {
 
 impl StatFs {
     /// Convert internal StatFs to Linux ABI format
-    pub fn to_linux(&self, dev_id: u64, mount_flags: u32) -> LinuxStatFs {
+    pub fn to_linux(&self, dev_id: u64, st_flags: u64) -> LinuxStatFs {
         LinuxStatFs {
             f_type: self.f_type as i64,
             f_bsize: self.f_bsize as i64,
@@ -123,16 +123,9 @@ impl StatFs {
             f_fsid: [(dev_id & 0xFFFFFFFF) as i32, (dev_id >> 32) as i32],
             f_namelen: self.f_namelen as i64,
             f_frsize: self.f_bsize as i64, // Same as bsize for simplicity
-            f_flags: Self::mount_flags_to_st_flags(mount_flags) as i64,
+            f_flags: st_flags as i64,
             f_spare: [0; 4],
         }
-    }
-
-    /// Convert internal mount flags to ST_* flags for userspace
-    fn mount_flags_to_st_flags(_mnt_flags: u32) -> u64 {
-        // ST_RDONLY = 1, ST_NOSUID = 2, ST_NODEV = 4, etc.
-        // For now return 0; can expand when mount flags are implemented
-        0
     }
 }
 
@@ -182,6 +175,9 @@ pub mod fs_flags {
 static NEXT_DEV_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The superblock structure - represents a mounted filesystem instance
+/// Read-only file system (Linux SB_RDONLY)
+pub const SB_RDONLY: u32 = 1;
+
 pub struct SuperBlock {
     /// Filesystem type
     pub fs_type: &'static FileSystemType,
@@ -192,8 +188,8 @@ pub struct SuperBlock {
     /// Superblock operations
     pub s_op: &'static dyn SuperOps,
 
-    /// Mount flags
-    pub flags: u32,
+    /// SB_* flags (Linux s_flags): SB_RDONLY
+    s_flags: AtomicU32,
 
     /// Next inode number to allocate
     next_ino: AtomicU64,
@@ -228,12 +224,26 @@ impl SuperBlock {
             fs_type,
             root: RwLock::new(None),
             s_op,
-            flags,
+            s_flags: AtomicU32::new(flags),
             next_ino: AtomicU64::new(1), // Start inode numbers at 1
             dev_id: NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed),
             private: RwLock::new(None),
             s_vfs_rename_mutex: SleepMutex::new(()),
         })
+    }
+
+    /// True if mounted read-only (Linux sb_rdonly)
+    pub fn rdonly(&self) -> bool {
+        self.s_flags.load(Ordering::Relaxed) & SB_RDONLY != 0
+    }
+
+    /// Make the file system read-only or read-write (mount, remount)
+    pub fn set_rdonly(&self, ro: bool) {
+        if ro {
+            self.s_flags.fetch_or(SB_RDONLY, Ordering::Relaxed);
+        } else {
+            self.s_flags.fetch_and(!SB_RDONLY, Ordering::Relaxed);
+        }
     }
 
     /// Set the root dentry

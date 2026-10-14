@@ -178,6 +178,18 @@ pub trait InodeOps: Send + Sync {
         Err(KernelError::OperationNotSupported)
     }
 
+    /// Create a character or block device node (Linux i_op->mknod)
+    fn mknod(
+        &self,
+        dir: &Inode,
+        name: &str,
+        mode: InodeMode,
+        rdev: DevId,
+    ) -> Result<Arc<Inode>, KernelError> {
+        let _ = (dir, name, mode, rdev);
+        Err(KernelError::OperationNotSupported)
+    }
+
     /// Remove a file
     fn unlink(&self, dir: &Inode, name: &str) -> Result<(), KernelError> {
         let _ = (dir, name);

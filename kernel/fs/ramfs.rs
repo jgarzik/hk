@@ -352,6 +352,41 @@ impl InodeOps for RamfsInodeOps {
         Ok(new_inode)
     }
 
+    fn mknod(
+        &self,
+        dir: &Inode,
+        name: &str,
+        mode: InodeMode,
+        rdev: DevId,
+    ) -> Result<Arc<Inode>, KernelError> {
+        let sb = dir.superblock().ok_or(KernelError::Io)?;
+        let private = dir.get_private().ok_or(KernelError::Io)?;
+        let dir_data = private
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RamfsInodeData>()
+            .ok_or(KernelError::Io)?;
+        if dir_data.children.read().contains_key(name) {
+            return Err(KernelError::AlreadyExists);
+        }
+        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
+        let inode = Arc::new(Inode::new_device(
+            sb.alloc_ino(),
+            mode,
+            uid,
+            gid,
+            rdev,
+            current_time(),
+            Arc::downgrade(&sb),
+            &RAMFS_INODE_OPS,
+        ));
+        dir_data
+            .children
+            .write()
+            .insert(String::from(name), inode.clone());
+        Ok(inode)
+    }
+
     fn mkdir(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let private = dir.get_private().ok_or(KernelError::Io)?;

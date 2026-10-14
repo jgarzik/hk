@@ -2,10 +2,11 @@
 //!
 //! Manages the mount tree that connects filesystems into a unified namespace.
 
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use ::core::sync::atomic::{AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spin::RwLock;
 
 use super::KernelError;
@@ -20,6 +21,13 @@ use crate::storage::get_blkdev;
 /// This struct mirrors Linux's `struct vfsmount`. The reference count
 /// (`mnt_count`) tracks users of this mount - each open file that references
 /// this mount holds a reference via `mntget()`.
+/// Ignore set-user/group-ID bits on exec (Linux MNT_NOSUID)
+pub const MNT_NOSUID: u32 = 0x1;
+/// No access to device nodes (Linux MNT_NODEV)
+pub const MNT_NODEV: u32 = 0x2;
+/// No program execution (Linux MNT_NOEXEC)
+pub const MNT_NOEXEC: u32 = 0x4;
+
 pub struct Mount {
     /// The mounted filesystem's superblock
     pub sb: Arc<SuperBlock>,
@@ -37,8 +45,9 @@ pub struct Mount {
     /// Child mounts (filesystems mounted under this one)
     pub children: RwLock<Vec<Arc<Mount>>>,
 
-    /// Mount flags
-    pub flags: u32,
+    /// Per-mount MNT_* flags (Linux mnt_flags): MNT_NOSUID, MNT_NODEV,
+    /// MNT_NOEXEC
+    mnt_flags: AtomicU32,
 
     /// Reference count for this mount (like Linux mnt_count)
     ///
@@ -57,9 +66,35 @@ impl Mount {
             mountpoint: RwLock::new(None),
             parent: RwLock::new(None),
             children: RwLock::new(Vec::new()),
-            flags,
+            mnt_flags: AtomicU32::new(flags),
             mnt_count: AtomicU64::new(0),
         })
+    }
+
+    /// MNT_* flags
+    pub fn flags(&self) -> u32 {
+        self.mnt_flags.load(Ordering::Relaxed)
+    }
+
+    /// Replace the MNT_* flags (mount, remount)
+    pub fn set_flags(&self, f: u32) {
+        self.mnt_flags.store(f, Ordering::Relaxed);
+    }
+
+    /// Option string for /proc/mounts ("ro,nosuid,nodev,noexec")
+    pub fn opts(&self) -> String {
+        let mut o = String::from(if self.sb.rdonly() { "ro" } else { "rw" });
+        let f = self.flags();
+        for (bit, name) in [
+            (MNT_NOSUID, ",nosuid"),
+            (MNT_NODEV, ",nodev"),
+            (MNT_NOEXEC, ",noexec"),
+        ] {
+            if f & bit != 0 {
+                o.push_str(name);
+            }
+        }
+        o
     }
 
     /// Increment mount reference count (like Linux mntget)
@@ -166,7 +201,7 @@ impl Mount {
             mountpoint: RwLock::new(None), // Root has no mountpoint
             parent: RwLock::new(None),     // Root has no parent
             children: RwLock::new(Vec::new()),
-            flags: root.flags,
+            mnt_flags: AtomicU32::new(root.flags()),
             mnt_count: AtomicU64::new(0),
         });
 
@@ -187,7 +222,7 @@ impl Mount {
             mountpoint: RwLock::new(old_mount.mountpoint.read().clone()),
             parent: RwLock::new(Some(Arc::downgrade(new_parent))),
             children: RwLock::new(Vec::new()),
-            flags: old_mount.flags,
+            mnt_flags: AtomicU32::new(old_mount.flags()),
             mnt_count: AtomicU64::new(0),
         });
 
@@ -532,6 +567,13 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
     *mount.mountpoint.write() = None;
 
     Ok(())
+}
+
+/// MNT_* flags of the mount `dentry` belongs to (0 if none)
+pub fn mnt_flags_of(dentry: &Arc<Dentry>) -> u32 {
+    current_mnt_ns()
+        .find_mount_for_dentry(dentry)
+        .map_or(0, |m| m.flags())
 }
 
 /// Check if a dentry is a mount point and get the mounted filesystem's root

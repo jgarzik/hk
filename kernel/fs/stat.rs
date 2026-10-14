@@ -433,7 +433,7 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
 
     // Get stats from filesystem
     let statfs = sb.s_op.statfs();
-    let linux_statfs = statfs.to_linux(sb.dev_id, sb.flags);
+    let linux_statfs = statfs.to_linux(sb.dev_id, st_flags(&dentry, &sb));
 
     // Copy to user
     if put_user::<Uaccess, LinuxStatFs>(buf, linux_statfs).is_err() {
@@ -441,6 +441,15 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
     }
 
     0
+}
+
+/// statfs f_flags (Linux calculate_f_flags): ST_VALID, ST_RDONLY from
+/// the superblock, ST_NOSUID/NODEV/NOEXEC from the mount
+fn st_flags(dentry: &alloc::sync::Arc<super::Dentry>, sb: &super::SuperBlock) -> u64 {
+    const ST_VALID: u64 = 0x20;
+    // MNT_NOSUID/NODEV/NOEXEC (1, 2, 4) map to ST_NOSUID/NODEV/NOEXEC (2, 4, 8)
+    let mnt = super::mount::mnt_flags_of(dentry) as u64;
+    ST_VALID | sb.rdonly() as u64 | (mnt & 7) << 1
 }
 
 /// sys_fstatfs - get filesystem statistics by file descriptor
@@ -471,7 +480,7 @@ pub fn sys_fstatfs(fd: i32, buf: u64) -> i64 {
 
     // Get stats
     let statfs = sb.s_op.statfs();
-    let linux_statfs = statfs.to_linux(sb.dev_id, sb.flags);
+    let linux_statfs = statfs.to_linux(sb.dev_id, st_flags(&file.dentry, &sb));
 
     // Copy to user
     if put_user::<Uaccess, LinuxStatFs>(buf, linux_statfs).is_err() {

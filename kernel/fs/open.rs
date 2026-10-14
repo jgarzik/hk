@@ -11,6 +11,7 @@ use crate::fs::{
 use crate::uaccess::strncpy_from_user;
 
 use super::flags::{O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDWR, O_TRUNC};
+use super::mount::{MNT_NODEV, mnt_flags_of};
 use super::syscall::{AT_FDCWD, PATH_MAX, current_fd_table, get_nofile_limit};
 use crate::task::FD_CLOEXEC;
 
@@ -175,6 +176,12 @@ fn filp_open(
 ) -> Result<Arc<File>, KernelError> {
     let (dentry, created) = open_target(start, path, flags, mode)?;
     let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
+
+    // may_open_dev: device nodes on a nodev mount cannot be opened
+    let m = inode.mode();
+    if (m.is_chrdev() || m.is_blkdev()) && mnt_flags_of(&dentry) & MNT_NODEV != 0 {
+        return Err(KernelError::PermissionDenied);
+    }
 
     // O_NOFOLLOW on a trailing symlink: ELOOP (may_open's symlink case)
     let acc = if created { 0 } else { dac::acc_mode(flags) };
