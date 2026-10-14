@@ -428,7 +428,16 @@ fn test_waitid() {
             _pad: [0; 128 - 28],
         };
 
-        let waitid_ret = sys_waitid(P_PID, fork_ret3 as u64, &mut info, WEXITED);
+        // 5th arg: struct rusage * (144 bytes). Pre-fill with a poison
+        // pattern; the kernel must overwrite it with the child's usage.
+        let mut ru = [0xAAu8; 144];
+        let waitid_ret = sys_waitid(
+            P_PID,
+            fork_ret3 as u64,
+            &mut info,
+            WEXITED,
+            ru.as_mut_ptr() as u64,
+        );
         print(b"Parent: waitid() returned ");
         print_num(waitid_ret);
 
@@ -438,7 +447,19 @@ fn test_waitid() {
             print(b"  si_status=");
             print_num(info.si_status as i64);
 
-            if info.si_pid == fork_ret3 as i32 && info.si_status == 55 {
+            // ru_utime.tv_usec (offset 8) and ru_stime.tv_usec (offset 24)
+            // must be valid microsecond values, not the poison pattern.
+            let rd = |off: usize| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&ru[off..off + 8]);
+                i64::from_ne_bytes(b)
+            };
+            let ru_ok = (0..1_000_000).contains(&rd(8)) && (0..1_000_000).contains(&rd(24));
+            if !ru_ok {
+                println(b"  rusage not filled");
+            }
+
+            if info.si_pid == fork_ret3 as i32 && info.si_status == 55 && ru_ok {
                 println(b"WAITID:OK");
             } else {
                 println(b"WAITID:FAIL");
@@ -473,7 +494,7 @@ fn test_waitid_pall() {
             _pad: [0; 128 - 28],
         };
 
-        let waitid_ret = sys_waitid(P_ALL, 0, &mut info, WEXITED);
+        let waitid_ret = sys_waitid(P_ALL, 0, &mut info, WEXITED, 0);
         print(b"Parent: waitid(P_ALL) returned ");
         print_num(waitid_ret);
 

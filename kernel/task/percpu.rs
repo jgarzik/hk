@@ -681,6 +681,12 @@ pub fn mark_zombie(tid: Tid, status: i32) {
 /// * Some((child_pid, exit_status)) if a zombie child was found and reaped
 /// * None if no zombie child matches
 pub fn reap_zombie_child(parent_pid: Pid, target_pid: i64) -> Option<(Pid, i32)> {
+    reap_zombie_child_times(parent_pid, target_pid).map(|(pid, status, _, _)| (pid, status))
+}
+
+/// Like [`reap_zombie_child`], but also returns the reaped child's CPU times
+/// as `(pid, exit_status, utime_ns, stime_ns)` (for wait rusage reporting).
+pub fn reap_zombie_child_times(parent_pid: Pid, target_pid: i64) -> Option<(Pid, i32, u64, u64)> {
     let mut table = TASK_TABLE.lock();
 
     // Find a zombie child matching the criteria
@@ -711,7 +717,7 @@ pub fn reap_zombie_child(parent_pid: Pid, target_pid: i64) -> Option<(Pid, i32)>
     if let Some(idx) = zombie_idx {
         let task = table.tasks.remove(idx);
         if let TaskState::Zombie(status) = task.state {
-            return Some((task.pid, status));
+            return Some((task.pid, status, task.utime, task.stime));
         }
     }
 

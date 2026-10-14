@@ -883,7 +883,7 @@ pub fn aarch64_syscall_dispatch(
 
         // Process lifecycle
         SYS_EXIT | SYS_EXIT_GROUP => sys_exit(arg0 as i32),
-        SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
+        SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32, arg4) as u64,
         SYS_CLONE => sys_clone(arg0, arg1, arg2, arg3, arg4) as u64,
         SYS_CLONE3 => {
             use crate::task::syscall::sys_clone3;

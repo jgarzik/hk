@@ -805,10 +805,10 @@ pub fn sys_mq_getsetattr(mqdes: i32, newattr: *const MqAttr, oldattr: *mut MqAtt
     unsafe { syscall3!(SYS_MQ_GETSETATTR, mqdes, newattr, oldattr) }
 }
 
-/// waitid(idtype, id, infop, options)
+/// waitid(idtype, id, infop, options, rusage)
 #[inline(always)]
-pub fn sys_waitid(idtype: i32, id: u64, infop: *mut SigInfo, options: i32) -> i64 {
-    unsafe { syscall4!(SYS_WAITID, idtype, id, infop, options) }
+pub fn sys_waitid(idtype: i32, id: u64, infop: *mut SigInfo, options: i32, rusage: u64) -> i64 {
+    unsafe { syscall5!(SYS_WAITID, idtype, id, infop, options, rusage) }
 }
 
 /// execve(pathname, argv, envp)

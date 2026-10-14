@@ -291,7 +291,7 @@ fn test_waitid_p_pidfd() {
         si_status: 0,
         _pad: [0u8; 128 - 28],
     };
-    let ret = sys_waitid(P_PIDFD, pidfd as u64, &mut info, WEXITED);
+    let ret = sys_waitid(P_PIDFD, pidfd as u64, &mut info, WEXITED, 0);
 
     sys_close(pidfd as u64);
 

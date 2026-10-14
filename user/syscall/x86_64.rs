@@ -734,8 +734,8 @@ pub fn sys_wait4(pid: i64, wstatus: *mut i32, options: i32, rusage: u64) -> i64 
 }
 
 #[inline(always)]
-pub fn sys_waitid(idtype: i32, id: u64, infop: *mut SigInfo, options: i32) -> i64 {
-    unsafe { syscall4!(SYS_WAITID, idtype, id, infop, options) }
+pub fn sys_waitid(idtype: i32, id: u64, infop: *mut SigInfo, options: i32, rusage: u64) -> i64 {
+    unsafe { syscall5!(SYS_WAITID, idtype, id, infop, options, rusage) }
 }
 
 // --- User/Group IDs ---

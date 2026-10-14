@@ -427,12 +427,14 @@ const SIGCHLD: i32 = 17;
 /// * `id` - The ID value (PID or PGID depending on idtype)
 /// * `infop` - Pointer to siginfo_t structure to fill
 /// * `options` - WEXITED, WSTOPPED, WCONTINUED, WNOHANG, WNOWAIT
+/// * `rusage` - Optional `struct rusage *` filled with the child's usage
+///   (Linux kernel/exit.c: waitid takes 5 args)
 ///
 /// # Returns
 /// * 0: Success (or WNOHANG with no child ready)
 /// * -ECHILD: No matching children
 /// * -EINVAL: Invalid arguments
-pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32) -> i64 {
+pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -> i64 {
     use super::wait_options::{P_ALL, P_PGID, P_PID, P_PIDFD, WEXITED, WNOHANG};
     use crate::arch::Uaccess;
     use crate::uaccess::{UaccessArch, put_user};
@@ -497,9 +499,14 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32) -> i64 {
     loop {
         // Try to reap a zombie child (or peek if WNOWAIT)
         // Note: WNOWAIT leaves child in waitable state - we don't fully support this yet
-        if let Some((child_pid, exit_status)) =
-            super::percpu::reap_zombie_child(current_pid, wait_pid)
+        if let Some((child_pid, exit_status, utime, stime)) =
+            super::percpu::reap_zombie_child_times(current_pid, wait_pid)
         {
+            if rusage != 0
+                && super::misc::put_rusage_times::<Uaccess>(rusage, utime, stime).is_err()
+            {
+                return KernelError::BadAddress.sysret();
+            }
             // Fill siginfo_t structure if pointer is non-null
             if infop != 0 {
                 let info = SigInfo {

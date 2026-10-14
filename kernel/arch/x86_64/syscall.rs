@@ -270,7 +270,7 @@ pub const SYS_EXECVE: u64 = 59;
 pub const SYS_WAIT4: u64 = 61;
 /// exit_group(status)
 pub const SYS_EXIT_GROUP: u64 = 231;
-/// waitid(idtype, id, infop, options)
+/// waitid(idtype, id, infop, options, rusage)
 pub const SYS_WAITID: u64 = 247;
 /// execveat(dirfd, pathname, argv, envp, flags)
 pub const SYS_EXECVEAT: u64 = 322;
@@ -1548,7 +1548,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_EXECVE => sys_execve(arg0, arg1, arg2) as u64,
         SYS_EXECVEAT => sys_execveat(arg0 as i32, arg1, arg2, arg3, arg4 as i32) as u64,
         SYS_WAIT4 => sys_wait4(arg0 as i64, arg1, arg2 as i32, arg3) as u64,
-        SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
+        SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32, arg4) as u64,
         SYS_EXIT_GROUP => sys_exit(arg0 as i32), // For single-threaded, same as _exit
 
         // Personality (execution domain)
