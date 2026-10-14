@@ -102,6 +102,26 @@ fn selftest_thread(_arg: usize) {
         Err(e) => check("kthread_run", false, e.errno() as u64),
     }
 
+    // 5. ICMP echo to 127.0.0.1 and to our own eth0 address: request and
+    //    reply both travel through the real lo (xmit -> netif_rx backlog ->
+    //    softnet thread of this CPU -> icmp_rcv), never synchronously
+    use crate::net::icmp;
+    let net = crate::net::init_net_ns();
+    let mut targets = alloc::vec![crate::net::Ipv4Addr::new(127, 0, 0, 1)];
+    if let Some(c) = net.get_config() {
+        targets.push(c.ipv4_addr);
+    }
+    for (i, &dst) in targets.iter().enumerate() {
+        let before = icmp::ICMP_IN_ECHO_REPS.load(Ordering::Acquire);
+        let sent = icmp::icmp_send_echo(&net, dst, 0x6b6b, i as u16, b"hk-selftest");
+        check("icmp_lo_send", sent.is_ok(), i as u64);
+        let left = icmp::ICMP_ECHO_REPLY_WQ.wait_event_timeout(
+            || icmp::ICMP_IN_ECHO_REPS.load(Ordering::Acquire) > before,
+            200,
+        );
+        check("icmp_lo_reply", left > 0, dst.to_u32() as u64);
+    }
+
     if ok {
         printkln!("\nKSELFTEST:OK");
     }
