@@ -68,6 +68,7 @@ pub mod neigh;
 pub mod netlink;
 pub mod ping;
 pub mod proc;
+pub mod raw;
 pub mod request_sock;
 pub mod rtnl;
 pub mod skb;

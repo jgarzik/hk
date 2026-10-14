@@ -418,15 +418,16 @@ fn ip_local_deliver(mut skb: SkBuff) {
     if skb.pull(ihl).is_none() {
         return;
     }
+    let Some(net) = skb.net() else {
+        return;
+    };
+    let raw = crate::net::raw::raw_deliver(&net, &skb);
     match proto {
         IPPROTO_TCP => tcp::tcp_rcv(skb),
         IPPROTO_UDP => udp::udp_rcv(skb),
         IPPROTO_ICMP => crate::net::icmp::icmp_rcv(skb),
-        _ => {
-            if let Some(net) = skb.net() {
-                crate::net::icmp::prot_unreach(&net, &skb);
-            }
-        }
+        _ if !raw => crate::net::icmp::prot_unreach(&net, &skb),
+        _ => {}
     }
 }
 

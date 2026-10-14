@@ -438,6 +438,7 @@ fn update_pmtu(net: &NetNamespace, e: &IcmpErr) {
 
 /// Hand an error to the raw sockets and the inner protocol
 fn deliver_err(net: &NetNamespace, e: &IcmpErr) {
+    crate::net::raw::raw_err(net, e);
     // TCP soft/hard errors (EHOSTUNREACH on SYN_SENT, PMTU) come with
     // the TCP rewrite
     match e.proto() {

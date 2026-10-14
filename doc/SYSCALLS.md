@@ -298,7 +298,8 @@ raises SIGPIPE unless MSG_NOSIGNAL. Unknown options are ENOPROTOOPT
 (EOPNOTSUPP for getsockopt at unknown levels, like Linux).
 
 - [x] socket (AF_INET: TCP, UDP, ping SOCK_DGRAM/IPPROTO_ICMP gated by
-  ping_group_range; AF_NETLINK)
+  ping_group_range, SOCK_RAW with CAP_NET_RAW: IP_HDRINCL, SOL_RAW
+  ICMP_FILTER; AF_NETLINK)
 - [x] socketpair (AF_INET/AF_NETLINK: EOPNOTSUPP like Linux; AF_UNIX later)
 - [x] bind (SO_REUSEADDR/SO_REUSEPORT rules, EADDRNOTAVAIL, EACCES < 1024)
 - [x] listen (autobinds; backlog capped at somaxconn 4096)

@@ -22,7 +22,9 @@ use crate::net::inet::fib::RouteType;
 use crate::net::ipv4::{IP_DEFAULT_TTL, IpParams, Ipv4Addr};
 use crate::net::msg::Cmsg;
 use crate::net::sock::Sock;
-use crate::net::socket::{AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SOCK_DGRAM, SOCK_STREAM};
+use crate::net::socket::{
+    AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM,
+};
 
 pub const IPPROTO_IP: i32 = 0;
 pub const IPPROTO_ICMP: i32 = 1;
@@ -60,6 +62,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
             IPPROTO_ICMP => crate::net::ping::create(),
             _ => Err(KernelError::ProtocolNotSupported),
         },
+        SOCK_RAW => crate::net::raw::create(protocol),
         _ => Err(KernelError::SocketTypeNotSupported),
     }
 }
@@ -104,6 +107,7 @@ pub mod ipf {
     pub const FREEBIND: u32 = 1 << 4;
     pub const BIND_NO_PORT: u32 = 1 << 5;
     pub const MC_LOOP: u32 = 1 << 6;
+    pub const HDRINCL: u32 = 1 << 7;
 }
 
 impl Default for Inet {
@@ -135,6 +139,10 @@ impl Inet {
         } else {
             self.flags.fetch_and(!f, Ordering::AcqRel);
         }
+    }
+
+    pub fn set_hdrincl(&self, on: bool) {
+        self.set_flag(ipf::HDRINCL, on);
     }
 
     /// TTL for output
@@ -191,6 +199,9 @@ impl Inet {
             return Ok(());
         }
         match opt {
+            // Linux do_ip_setsockopt: raw sockets only
+            IP_HDRINCL if sk.stype != SOCK_RAW => return Err(KernelError::NoProtocolOption),
+            IP_HDRINCL => self.set_hdrincl(v.int_or_byte()? != 0),
             IP_TOS => {
                 let mut t = v.int_or_byte()? as u8;
                 if sk.stype == SOCK_STREAM {
@@ -240,6 +251,7 @@ impl Inet {
             IP_MTU_DISCOVER => self.pmtudisc.load(Ordering::Acquire) as i32,
             IP_MULTICAST_TTL => self.mc_ttl.load(Ordering::Acquire) as i32,
             IP_MULTICAST_LOOP => self.flag(ipf::MC_LOOP) as i32,
+            IP_HDRINCL => self.flag(ipf::HDRINCL) as i32,
             _ => return Err(KernelError::NoProtocolOption),
         };
         Ok(OptOut::Int(v))
