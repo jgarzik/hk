@@ -39,7 +39,7 @@ use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
 use crate::pipe::FD_CLOEXEC;
-use crate::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDNORM, POLLWRNORM, PollTable};
+use crate::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::task::Fd;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
@@ -203,120 +203,106 @@ impl Eventpoll {
 
     /// Wait for events (epoll_wait/epoll_pwait core logic)
     ///
-    /// Returns the number of ready events, or negative error code.
+    /// Like poll(): the task state is set before each scan and the first
+    /// scan registers on every watched file's wait queues, so a wakeup
+    /// between scan and sleep is never lost. Returns the number of ready
+    /// events; 0 on timeout; -EINTR on a signal (epoll_wait is never
+    /// restarted).
     pub fn wait(&self, events: &mut [EpollEvent], timeout_ms: i32) -> Result<usize, i64> {
+        use crate::poll::PollContext;
+        use crate::task::percpu::{
+            SleepState, ns_to_ticks, schedule, schedule_timeout, set_current_state,
+        };
         if events.is_empty() {
             return Ok(0);
         }
-
-        let max_events = events.len();
-        let mut collected = 0;
-
-        // Calculate deadline tick if timeout is positive
-        // Each tick is 10ms (100 ticks/second)
-        let deadline_tick = if timeout_ms > 0 {
-            let current_tick = crate::task::percpu::get_ticks();
-            let timeout_ticks = (timeout_ms as u64).div_ceil(10);
-            Some(current_tick + timeout_ticks)
-        } else {
-            None
-        };
-
-        loop {
-            // Poll all monitored fds
-            {
-                let mut inner = self.inner.lock();
-
-                for item in inner.items.values_mut() {
-                    // Skip disabled items (EPOLLONESHOT that already fired)
-                    if item.disabled {
-                        continue;
+        let deadline = (timeout_ms > 0)
+            .then(|| crate::time::monotonic_ns().saturating_add(timeout_ms as u64 * 1_000_000));
+        let mut ctx = PollContext::new(current_tid());
+        let mut first = true;
+        let r = loop {
+            set_current_state(SleepState::Interruptible);
+            let n = self.scan(events, &mut ctx, first && timeout_ms != 0);
+            first = false;
+            if n > 0 || timeout_ms == 0 {
+                break Ok(n);
+            }
+            if crate::waitqueue::signal_pending() {
+                break Err(KernelError::Interrupted.sysret());
+            }
+            match deadline {
+                None => schedule(),
+                Some(d) => {
+                    let now = crate::time::monotonic_ns();
+                    if now >= d {
+                        break Ok(0);
                     }
-
-                    // Poll the file
-                    let revents = item.file.f_op.poll(&item.file, None);
-
-                    // Convert poll events to epoll events
-                    let mut ep_events: u32 = 0;
-                    if revents & POLLIN != 0 {
-                        ep_events |= EPOLLIN;
-                    }
-                    if revents & POLLOUT != 0 {
-                        ep_events |= EPOLLOUT;
-                    }
-                    if revents & POLLERR != 0 {
-                        ep_events |= EPOLLERR;
-                    }
-                    if revents & POLLHUP != 0 {
-                        ep_events |= EPOLLHUP;
-                    }
-                    if revents & POLLPRI != 0 {
-                        ep_events |= EPOLLPRI;
-                    }
-                    if revents & POLLRDNORM != 0 {
-                        ep_events |= EPOLLRDNORM;
-                    }
-                    if revents & POLLWRNORM != 0 {
-                        ep_events |= EPOLLWRNORM;
-                    }
-
-                    // Mask with requested events (but always report ERR/HUP)
-                    let masked =
-                        (ep_events & item.event.events) | (ep_events & (EPOLLERR | EPOLLHUP));
-
-                    if masked != 0 {
-                        // Edge-triggered mode: only report if events changed
-                        if item.event.events & EPOLLET != 0 {
-                            if masked == item.last_events {
-                                continue; // No change, skip
-                            }
-                            item.last_events = masked;
-                        }
-
-                        // Add to result
-                        if collected < max_events {
-                            events[collected] = EpollEvent::new(masked, item.event.data);
-                            collected += 1;
-
-                            // Handle EPOLLONESHOT
-                            if item.event.events & EPOLLONESHOT != 0 {
-                                item.disabled = true;
-                            }
-                        }
-                    }
+                    schedule_timeout(ns_to_ticks(d - now));
                 }
             }
+        };
+        set_current_state(SleepState::Running);
+        r
+    }
 
-            // If we found events, return them
-            if collected > 0 {
-                return Ok(collected);
+    /// One pass over the interest list: poll each file outside the item
+    /// lock (registering on its wait queues if `register`), then record
+    /// ready events (EPOLLET / EPOLLONESHOT bookkeeping under the lock)
+    fn scan(
+        &self,
+        events: &mut [EpollEvent],
+        ctx: &mut crate::poll::PollContext,
+        register: bool,
+    ) -> usize {
+        let items: Vec<(Fd, Arc<File>)> = {
+            let inner = self.inner.lock();
+            inner
+                .items
+                .iter()
+                .filter(|(_, it)| !it.disabled)
+                .map(|(fd, it)| (*fd, it.file.clone()))
+                .collect()
+        };
+        let mut ready = Vec::new();
+        for (fd, file) in items {
+            let mut pt = PollTable::new(ctx);
+            if !register {
+                pt.disable();
             }
-
-            // Non-blocking: return immediately
-            if timeout_ms == 0 {
-                return Ok(0);
-            }
-
-            // Check deadline for timeout
-            if let Some(dl) = deadline_tick
-                && crate::task::percpu::get_ticks() >= dl
-            {
-                return Ok(0); // Timeout
-            }
-
-            // For simplicity in non-blocking case, just poll once and return
-            // A proper implementation would register with file wait queues and block
-            // For now, with timeout=-1 (infinite), we do a single poll and return 0
-            // if nothing ready (caller should handle this)
-            if timeout_ms < 0 {
-                // Infinite wait - do a brief yield and retry once
-                // This is simplified; proper impl would block on wait queues
-                return Ok(0);
-            }
-
-            // Short sleep before retry (simplified polling)
-            crate::task::percpu::yield_now();
+            pt.hold_file(&file);
+            // epoll event bits equal the poll bits in the low 16 bits
+            ready.push((fd, file.f_op.poll(&file, Some(&mut pt)) as u32));
         }
+        let mut inner = self.inner.lock();
+        let mut n = 0;
+        for (fd, revents) in ready {
+            if n == events.len() {
+                break;
+            }
+            let Some(item) = inner.items.get_mut(&fd) else {
+                continue;
+            };
+            if item.disabled {
+                continue;
+            }
+            let masked = revents & (item.event.events | EPOLLERR | EPOLLHUP);
+            if masked == 0 {
+                item.last_events = 0;
+                continue;
+            }
+            if item.event.events & EPOLLET != 0 {
+                if masked == item.last_events {
+                    continue;
+                }
+                item.last_events = masked;
+            }
+            events[n] = EpollEvent::new(masked, item.event.data);
+            n += 1;
+            if item.event.events & EPOLLONESHOT != 0 {
+                item.disabled = true;
+            }
+        }
+        n
     }
 
     /// Poll for readiness (for nested epoll)

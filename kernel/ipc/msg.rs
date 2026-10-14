@@ -133,6 +133,22 @@ impl MsgQueue {
     }
 
     /// Find a message matching the type criteria
+    /// A message matching (`msgtyp`, `msgflg`) is queued
+    fn has_msg(&self, msgtyp: i64, msgflg: i32) -> bool {
+        let messages = self.messages.lock();
+        if msgtyp == 0 {
+            return !messages.is_empty();
+        }
+        let except = msgflg & MSG_EXCEPT != 0;
+        messages.iter().any(|m| {
+            if msgtyp > 0 {
+                (m.mtype == msgtyp) != except
+            } else {
+                m.mtype <= -msgtyp
+            }
+        })
+    }
+
     fn find_msg(&self, msgtyp: i64, msgflg: i32) -> Option<MsgMsg> {
         let mut messages = self.messages.lock();
 
@@ -220,7 +236,7 @@ impl MsgQueue {
                 }
                 receiver.woken.store(true, Ordering::Release);
                 receivers.remove(i);
-                self.waitq.wake_one();
+                self.waitq.wake_all();
                 return true;
             }
         }
@@ -401,10 +417,19 @@ fn do_msgsnd(msqid: i32, msgp: u64, msgsz: usize, msgflg: i32) -> Result<i32, i3
                 return Err(KernelError::WouldBlock.errno());
             }
 
-            // Block until space available
-            // For simplicity, just sleep and retry
-            // A full implementation would add to senders queue
-            queue.waitq.wait();
+            // Sleep until space or removal; a signal ends the call
+            // (System V IPC is never restarted after a handler)
+            let room = || {
+                queue.cbytes.load(Ordering::Acquire) + msgsz as u64 <= queue.qbytes
+                    || queue.perm.is_deleted()
+            };
+            queue
+                .waitq
+                .wait_event_interruptible(room)
+                .map_err(|_| KernelError::RestartNoHand.errno())?;
+            if queue.perm.is_deleted() {
+                return Err(KernelError::IdentifierRemoved.errno());
+            }
             continue;
         }
 
@@ -509,8 +534,11 @@ fn do_msgrcv(msqid: i32, msgp: u64, msgsz: usize, msgtyp: i64, msgflg: i32) -> R
             return Err(KernelError::NoMessage.errno());
         }
 
-        // Block until message available
-        queue.waitq.wait();
+        // Sleep until a matching message arrives or the queue is removed
+        queue
+            .waitq
+            .wait_event_interruptible(|| queue.has_msg(msgtyp, msgflg) || queue.perm.is_deleted())
+            .map_err(|_| KernelError::RestartNoHand.errno())?;
 
         // Check if queue was removed
         if queue.perm.is_deleted() {

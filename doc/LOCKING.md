@@ -936,8 +936,11 @@ wq.wake_one(); wq.wake_all();
   removes it otherwise. Poll entries stay until the poll ends.
 - **Legacy `wait()`:** unconditional sleep bounded to one tick (callers check
   their condition before calling, so a wakeup in that gap would otherwise be
-  lost). Remaining users: SysV msg/sem, POSIX mqueue, network sockets. New
-  code uses `wait_event*`.
+  lost). Remaining users: network sockets (until the P4 socket core). New
+  code uses `wait_event*` (`wait_event_interruptible_deadline` for
+  CLOCK_MONOTONIC deadlines). Wakers of queues shared by waiters with
+  different conditions (SysV sem/msg, mqueue) use `wake_all`: a
+  `wake_one` could pick a waiter whose condition is still false.
 - `cond` closures run with the task state set; they may take sleeping-context
   locks (Mutex) but must not sleep themselves.
 

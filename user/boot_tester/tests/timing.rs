@@ -14,6 +14,12 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
+    sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait, sys_getppid, sys_mq_open, sys_mq_timedreceive,
+    sys_mq_unlink, sys_msgctl, sys_msgget, sys_msgrcv, sys_msgsnd, sys_rt_sigtimedwait, sys_semctl,
+    sys_semget, sys_semop, EpollEvent, Sembuf, CLOCK_REALTIME, EPOLLIN, EPOLL_CTL_ADD, IPC_CREAT,
+    IPC_PRIVATE, IPC_RMID, O_CREAT, O_RDWR,
+};
+use hk_syscall::{
     sys_clock_gettime, sys_clone, sys_close, sys_exit, sys_fork, sys_futex, sys_kill,
     sys_nanosleep, sys_pause, sys_pipe, sys_poll, sys_read, sys_rt_sigaction, sys_rt_sigprocmask, sys_rt_sigsuspend,
     sys_wait4, sys_waitid, sys_write, PollFd, SigInfo, Timespec, CLOCK_MONOTONIC, CLONE_VM,
@@ -57,6 +63,11 @@ pub fn run_tests() {
     test_kernel_pointer_efault();
     test_timerfd_huge_values();
     test_posix_timer_huge_values();
+    test_epoll_block();
+    test_sigtimedwait_block();
+    test_mq_timeout();
+    test_msgrcv_block();
+    test_semop_block();
     sys_rt_sigprocmask(SIG_SETMASK, &saved as *const u64 as u64, 0, 8);
 }
 
@@ -854,6 +865,156 @@ fn test_posix_timer_huge_values() {
         print_num(r_get);
         print(b" neg=");
         print_num(r_neg);
+        println(b"");
+    }
+}
+
+// ============================================================================
+// Blocking waits woken by another process (formerly one-tick polling)
+// ============================================================================
+
+/// Fork a child that sleeps `ms` then runs `f`; returns its pid
+fn later(ms: u64, f: fn()) -> i64 {
+    let pid = sys_fork();
+    if pid == 0 {
+        sleep_ms(ms);
+        f();
+        sys_exit(0);
+    }
+    pid
+}
+
+static mut WAKE_FD: i32 = -1;
+static mut WAKE_ID: i32 = -1;
+
+fn write_wake_fd() {
+    sys_write(unsafe { WAKE_FD } as u64, b"x".as_ptr(), 1);
+}
+
+/// epoll_wait(-1) sleeps until another process makes a fd readable
+fn test_epoll_block() {
+    const N: &[u8] = b"TIMING_EPOLL_BLOCK";
+    let mut p = [0i32; 2];
+    sys_pipe(p.as_mut_ptr());
+    let ep = sys_epoll_create1(0) as i32;
+    let ev = EpollEvent::new(EPOLLIN, 7);
+    sys_epoll_ctl(ep, EPOLL_CTL_ADD, p[0], &ev);
+    unsafe { WAKE_FD = p[1] };
+    let pid = later(100, write_wake_fd);
+    let mut out = [EpollEvent::empty(); 2];
+    let r = sys_epoll_wait(ep, out.as_mut_ptr(), 2, -1);
+    let _ = reap_within(pid, 5000);
+    for f in [p[0], p[1], ep] {
+        sys_close(f as u64);
+    }
+    print(N);
+    if r == 1 {
+        println(b":OK");
+    } else {
+        print(b":FAIL ret=");
+        print_num(r);
+        println(b"");
+    }
+}
+
+fn kill_parent_usr1() {
+    sys_kill(sys_getppid(), SIGUSR1);
+}
+
+/// rt_sigtimedwait sleeps: a 300 ms timeout is EAGAIN after ~300 ms; a
+/// blocked signal sent later is returned
+fn test_sigtimedwait_block() {
+    let set: u64 = 1 << (SIGUSR1 - 1);
+    let mut old: u64 = 0;
+    sys_rt_sigprocmask(0 /* SIG_BLOCK */, &set as *const u64 as u64, &mut old as *mut u64 as u64, 8);
+    let ts = Timespec { tv_sec: 0, tv_nsec: 300_000_000 };
+    let t0 = now_ms();
+    let r = sys_rt_sigtimedwait(&set as *const u64 as u64, 0, &ts as *const Timespec as u64, 8);
+    check_elapsed(b"TIMING_SIGTIMEDWAIT_TIMEOUT", r, -11, now_ms() - t0);
+    let pid = later(100, kill_parent_usr1);
+    let r = sys_rt_sigtimedwait(&set as *const u64 as u64, 0, 0, 8);
+    let _ = reap_within(pid, 5000);
+    sys_rt_sigprocmask(SIG_SETMASK, &old as *const u64 as u64, 0, 8);
+    print(b"TIMING_SIGTIMEDWAIT_BLOCK");
+    if r == SIGUSR1 as i64 {
+        println(b":OK");
+    } else {
+        print(b":FAIL ret=");
+        print_num(r);
+        println(b"");
+    }
+}
+
+/// mq_timedreceive on an empty queue: ETIMEDOUT after the absolute
+/// CLOCK_REALTIME timeout (~300 ms)
+fn test_mq_timeout() {
+    let name = b"hk_timing_mq\0";
+    let fd = sys_mq_open(name.as_ptr(), (O_CREAT | O_RDWR) as i32, 0o600, core::ptr::null()) as i32;
+    if fd < 0 {
+        print(b"TIMING_MQ_TIMEOUT:FAIL mq_open ");
+        print_num(fd as i64);
+        println(b"");
+        return;
+    }
+    let mut now = Timespec { tv_sec: 0, tv_nsec: 0 };
+    sys_clock_gettime(CLOCK_REALTIME, &mut now);
+    let mut abs = Timespec { tv_sec: now.tv_sec, tv_nsec: now.tv_nsec + 300_000_000 };
+    if abs.tv_nsec >= 1_000_000_000 {
+        abs.tv_sec += 1;
+        abs.tv_nsec -= 1_000_000_000;
+    }
+    let mut buf = [0u8; 8192];
+    let t0 = now_ms();
+    let r = sys_mq_timedreceive(fd, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut(), &abs);
+    check_elapsed(b"TIMING_MQ_TIMEOUT", r, -110, now_ms() - t0);
+    sys_close(fd as u64);
+    sys_mq_unlink(name.as_ptr());
+}
+
+fn send_wake_msg() {
+    let m: [u8; 16] = [1, 0, 0, 0, 0, 0, 0, 0, b'h', b'i', 0, 0, 0, 0, 0, 0];
+    sys_msgsnd(unsafe { WAKE_ID }, m.as_ptr(), 2, 0);
+}
+
+/// msgrcv sleeps until another process sends
+fn test_msgrcv_block() {
+    let id = sys_msgget(IPC_PRIVATE, IPC_CREAT | 0o600) as i32;
+    unsafe { WAKE_ID = id };
+    let pid = later(100, send_wake_msg);
+    let mut m = [0u8; 16];
+    let r = sys_msgrcv(id, m.as_mut_ptr(), 8, 0, 0);
+    let _ = reap_within(pid, 5000);
+    sys_msgctl(id, IPC_RMID, 0);
+    print(b"TIMING_MSGRCV_BLOCK");
+    if r == 2 && &m[8..10] == b"hi" {
+        println(b":OK");
+    } else {
+        print(b":FAIL ret=");
+        print_num(r);
+        println(b"");
+    }
+}
+
+fn sem_post() {
+    let op = Sembuf { sem_num: 0, sem_op: 1, sem_flg: 0 };
+    sys_semop(unsafe { WAKE_ID }, &op, 1);
+}
+
+/// semop(-1) sleeps until another process increments
+fn test_semop_block() {
+    let id = sys_semget(IPC_PRIVATE, 1, IPC_CREAT | 0o600) as i32;
+    unsafe { WAKE_ID = id };
+    let pid = later(100, sem_post);
+    let op = Sembuf { sem_num: 0, sem_op: -1, sem_flg: 0 };
+    let r = sys_semop(id, &op, 1);
+    let _ = reap_within(pid, 5000);
+    sys_semctl(id, 0, IPC_RMID, 0);
+    print(b"TIMING_SEMOP_BLOCK");
+    if r == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL ret=");
+        print_num(r);
         println(b"");
     }
 }

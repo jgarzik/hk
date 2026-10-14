@@ -837,58 +837,93 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
     mask.remove(SIGKILL);
     mask.remove(SIGSTOP);
 
-    // Check if any signals in the set are already pending
-    let dequeued_sig = with_task_signal_state(tid, |state| {
-        // Check private pending
-        let deliverable = state.pending.signal.intersect(&mask);
+    let mut sig = dequeue_in(tid, &mask);
+    if sig.is_none() && timeout_ns != Some(0) {
+        // Linux do_sigtimedwait: unblock the awaited signals while
+        // sleeping so their arrival wakes us, then restore the mask
+        let saved = with_task_signal_state(tid, |st| {
+            let old = st.blocked;
+            st.blocked = old.subtract(&mask);
+            st.recalc_sigpending();
+            old
+        });
+        let deadline = timeout_ns.map(|ns| crate::time::monotonic_ns().saturating_add(ns));
+        sleep_until_signal(deadline);
+        if let Some(old) = saved {
+            with_task_signal_state(tid, |st| {
+                st.blocked = old;
+                st.recalc_sigpending();
+            });
+        }
+        sig = dequeue_in(tid, &mask);
+        if sig.is_none() {
+            // Another signal (EINTR) or the timeout (EAGAIN)
+            let timed_out = deadline.is_some_and(|d| crate::time::monotonic_ns() >= d);
+            return if timed_out {
+                KernelError::WouldBlock.sysret()
+            } else {
+                KernelError::Interrupted.sysret()
+            };
+        }
+    }
+    let Some(sig) = sig else {
+        return KernelError::WouldBlock.sysret();
+    };
+    if info_ptr != 0 {
+        // Basic siginfo (SI_USER with pid/uid 0: senders are not tracked)
+        let siginfo = SigInfo::from_kill(sig, 0, 0);
+        if siginfo.write_to_user(info_ptr).is_err() {
+            return KernelError::BadAddress.sysret();
+        }
+    }
+    sig as i64
+}
+
+/// Dequeue the lowest pending signal of `mask` (private, then shared)
+fn dequeue_in(tid: crate::task::Tid, mask: &SigSet) -> Option<u32> {
+    with_task_signal_state(tid, |state| {
+        let deliverable = state.pending.signal.intersect(mask);
         if let Some(sig) = deliverable.first() {
             state.pending.remove(sig);
             state.recalc_sigpending();
             return Some(sig);
         }
-
-        // Check shared pending
         let mut shared = state.shared_pending.lock();
-        let deliverable = shared.signal.intersect(&mask);
+        let deliverable = shared.signal.intersect(mask);
         if let Some(sig) = deliverable.first() {
             shared.remove(sig);
             drop(shared);
             state.recalc_sigpending();
             return Some(sig);
         }
-
         None
-    });
+    })
+    .flatten()
+}
 
-    if let Some(Some(sig)) = dequeued_sig {
-        // Signal was pending - return it
-        if info_ptr != 0 {
-            // Create basic siginfo (SI_USER with pid/uid 0 since we don't track sender)
-            let siginfo = SigInfo::from_kill(sig, 0, 0);
-            if siginfo.write_to_user(info_ptr).is_err() {
-                return -14; // EFAULT
+/// Sleep interruptibly until a signal is deliverable or the
+/// CLOCK_MONOTONIC `deadline` (ns) passes
+fn sleep_until_signal(deadline: Option<u64>) {
+    use crate::task::percpu::{
+        SleepState, ns_to_ticks, schedule, schedule_timeout, set_current_state,
+    };
+    loop {
+        set_current_state(SleepState::Interruptible);
+        if crate::waitqueue::signal_pending() {
+            break;
+        }
+        match deadline {
+            None => schedule(),
+            Some(d) => {
+                let now = crate::time::monotonic_ns();
+                if now >= d {
+                    break;
+                }
+                schedule_timeout(ns_to_ticks(d - now));
             }
         }
-        return sig as i64;
     }
-
-    // No signal pending - check if we should wait
-    match timeout_ns {
-        Some(0) => {
-            // Zero timeout - return immediately
-            -11 // EAGAIN
-        }
-        Some(_ns) => {
-            // Non-zero timeout - for now, just return EAGAIN
-            // TODO: Implement actual sleeping with timeout
-            -11 // EAGAIN
-        }
-        None => {
-            // Infinite wait - for now, just return EAGAIN
-            // TODO: Implement actual sleeping
-            -11 // EAGAIN
-        }
-    }
+    set_current_state(SleepState::Running);
 }
 
 /// sigaltstack(ss, oss) - set/get alternate signal stack

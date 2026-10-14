@@ -195,6 +195,32 @@ impl WaitQueue {
         self.wait_common(cond, timeout, SleepState::Interruptible)
     }
 
+    /// Sleep until `cond()` is true, a signal, or the CLOCK_MONOTONIC
+    /// `deadline` in ns (`None` = never). `Ok(true)`: condition true;
+    /// `Ok(false)`: deadline passed; `Err(RestartSys)`: signal.
+    pub fn wait_event_interruptible_deadline<F: FnMut() -> bool>(
+        &self,
+        mut cond: F,
+        deadline: Option<u64>,
+    ) -> Result<bool, KernelError> {
+        loop {
+            let ticks = match deadline {
+                None => MAX_SCHEDULE_TIMEOUT,
+                Some(d) => {
+                    let now = crate::time::monotonic_ns();
+                    if now >= d {
+                        return Ok(cond());
+                    }
+                    crate::task::percpu::ns_to_ticks(d - now)
+                }
+            };
+            if self.wait_event_interruptible_timeout(&mut cond, ticks)? != 0 {
+                return Ok(true);
+            }
+            // Tick granularity: re-check the clock before giving up
+        }
+    }
+
     fn wait_common<F: FnMut() -> bool>(
         &self,
         mut cond: F,
@@ -228,12 +254,8 @@ impl WaitQueue {
         result
     }
 
-    /// Legacy unconditional wait: sleep until woken, at most one tick
-    ///
-    /// Callers check their condition before calling and loop; since that
-    /// check is not covered by the sleep state, a wakeup in between would be
-    /// lost, so the sleep is bounded to one tick. New code should use the
-    /// `wait_event*` family.
+    /// Legacy unconditional wait (sleep at most one tick); remaining users:
+    /// network sockets until the socket core moves to `wait_event*`
     pub fn wait(&self) {
         let mut w = WaitEntry::new();
         self.prepare_to_wait(&mut w, SleepState::Uninterruptible);

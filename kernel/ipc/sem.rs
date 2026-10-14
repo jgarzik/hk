@@ -195,7 +195,7 @@ impl SemArray {
                     // Success - wake the task
                     queue.status.store(0, Ordering::Release);
                     queue.woken.store(true, Ordering::Release);
-                    self.waitq.wake_one();
+                    self.waitq.wake_all();
                     pending.remove(i);
                 }
                 Ok(false) => {
@@ -206,7 +206,7 @@ impl SemArray {
                     // Error - wake with error
                     queue.status.store(-e, Ordering::Release);
                     queue.woken.store(true, Ordering::Release);
-                    self.waitq.wake_one();
+                    self.waitq.wake_all();
                     pending.remove(i);
                 }
             }
@@ -441,14 +441,26 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
                     pending.push_back(queue.clone());
                 }
 
-                // Sleep until woken or timeout
-                // If we have a deadline, use polling with yields instead of blocking
-                if deadline_ns.is_some() {
-                    // Just yield to let other tasks run
-                    crate::task::percpu::yield_now();
-                } else {
-                    // No timeout - block indefinitely
-                    sem_array.waitq.wait();
+                // Sleep until woken, the deadline or a signal (semop is
+                // never restarted: EINTR)
+                let ticks = match deadline_ns {
+                    Some(d) => {
+                        let now = TIMEKEEPER.current_time();
+                        let now_ns = now.sec as i128 * 1_000_000_000 + now.nsec as i128;
+                        crate::task::percpu::ns_to_ticks((d - now_ns).max(0) as u64)
+                    }
+                    None => crate::task::percpu::MAX_SCHEDULE_TIMEOUT,
+                };
+                let r = sem_array.waitq.wait_event_interruptible_timeout(
+                    || queue.woken.load(Ordering::Acquire),
+                    ticks,
+                );
+                if r.is_err() && !queue.woken.load(Ordering::Acquire) {
+                    sem_array.pending.lock().retain(|q| !Arc::ptr_eq(q, &queue));
+                    // A wakeup may have raced with the removal
+                    if !queue.woken.load(Ordering::Acquire) {
+                        return Err(KernelError::Interrupted.errno());
+                    }
                 }
 
                 // Check result
