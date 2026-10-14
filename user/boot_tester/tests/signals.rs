@@ -21,7 +21,7 @@
 
 use super::helpers::{print, println, print_num};
 use hk_syscall::{
-    sys_clone, sys_clone3, sys_close, sys_exit, sys_getpid, sys_gettid, sys_kill, sys_pipe,
+    sys_clone, sys_clone3, sys_close, sys_exit, sys_fork, sys_read, sys_getpid, sys_gettid, sys_kill, sys_pipe,
     sys_rt_sigaction, sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigqueueinfo,
     sys_rt_sigsuspend, sys_rt_sigtimedwait, sys_rt_tgsigqueueinfo, sys_sigaltstack,
     sys_tgkill, sys_tkill, sys_wait4, sys_write,
@@ -518,22 +518,45 @@ fn test_sigqueueinfo() {
     }
 }
 
-/// Test: rt_sigqueueinfo() with invalid si_code (should fail with EPERM)
+/// Test: rt_sigqueueinfo() with a kernel-reserved si_code (>= 0) is EPERM
+/// unless the target is the caller itself (Linux do_rt_sigqueueinfo)
 fn test_sigqueueinfo_eperm() {
     let pid = sys_getpid();
+    // SI_USER = 0 with a fake si_pid: impersonating the kernel
+    let info = SigInfo::new(SIGUSR1, 0, 12345, 0);
 
-    // Try to impersonate kernel (si_code >= 0 with wrong pid)
-    // SI_USER = 0, so using si_code=0 with a fake pid should fail
-    let info = SigInfo::new(SIGUSR1, 0, 12345, 0); // Wrong PID (not ours)
+    // To self: allowed (block and consume the signal)
+    let mask: u64 = 1 << (SIGUSR1 - 1);
+    sys_rt_sigprocmask(SIG_BLOCK, &mask as *const u64 as u64, 0, 8);
+    let self_ret = sys_rt_sigqueueinfo(pid, SIGUSR1, &info as *const SigInfo as u64);
+    let ts = [0i64, 0i64];
+    sys_rt_sigtimedwait(&mask as *const u64 as u64, 0, ts.as_ptr() as u64, 8);
+    sys_rt_sigprocmask(SIG_UNBLOCK, &mask as *const u64 as u64, 0, 8);
 
-    let ret = sys_rt_sigqueueinfo(pid, SIGUSR1, &info as *const SigInfo as u64);
+    // To another process: EPERM. Child blocks on a pipe until we close it.
+    let mut fds = [0i32; 2];
+    sys_pipe(fds.as_mut_ptr());
+    let child = sys_fork();
+    if child == 0 {
+        sys_close(fds[1] as u64);
+        let mut b = [0u8; 1];
+        sys_read(fds[0] as u64, b.as_mut_ptr(), 1);
+        sys_exit(0);
+    }
+    sys_close(fds[0] as u64);
+    let other_ret = sys_rt_sigqueueinfo(child, SIGUSR1, &info as *const SigInfo as u64);
+    sys_close(fds[1] as u64);
+    let mut status = 0i32;
+    sys_wait4(child, &mut status, 0, 0);
 
-    if ret == -1 {
-        // EPERM
+    if self_ret == 0 && other_ret == -1 {
         println(b"SIGQUEUEINFO_EPERM:OK");
     } else {
-        print(b"SIGQUEUEINFO_EPERM:FAIL: expected -1, got ");
-        print_num(ret);
+        print(b"SIGQUEUEINFO_EPERM:FAIL: self=");
+        print_num(self_ret);
+        print(b" (expected 0), other=");
+        print_num(other_ret);
+        println(b" (expected -1)");
     }
 }
 

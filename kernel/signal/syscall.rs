@@ -455,16 +455,11 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
         Err(e) => return -(e as i64),
     };
 
-    // Security check: si_code validation per Linux kernel
-    // - si_code >= 0 means kernel-generated (SI_USER=0, SI_KERNEL=128, etc.)
-    // - si_code < 0 means user-generated (SI_QUEUE=-1, SI_TKILL=-6, etc.)
-    //
-    // User cannot:
-    // 1. Pretend to be the kernel (si_code >= 0)
-    // 2. Use SI_TKILL code (reserved for tgkill/tkill)
-    // 3. Pretend to be a different process (si_pid != current_pid)
-    let caller_pid = current_pid() as i32;
-    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && info.pid() != caller_pid {
+    // Security check (Linux kernel/signal.c do_rt_sigqueueinfo): si_code
+    // values reserved to the kernel (>= 0, or SI_TKILL) may only be queued
+    // to the caller itself, never used to forge signals to other processes
+    let caller_pid = current_pid() as i64;
+    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && pid != caller_pid {
         return -1; // EPERM
     }
 
@@ -487,7 +482,7 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
 /// * -ESRCH: No such process/thread
 /// * -EFAULT: Bad uinfo pointer
 pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
-    use crate::task::percpu::{TASK_TABLE, current_pid};
+    use crate::task::percpu::TASK_TABLE;
 
     // Validate arguments
     if tid <= 0 || tgid <= 0 {
@@ -504,10 +499,10 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
         Err(e) => return -(e as i64),
     };
 
-    // Security check: same as rt_sigqueueinfo
-    // Cannot pretend to be kernel or use SI_TKILL code unless actually this process
-    let caller_pid = current_pid() as i32;
-    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && info.pid() != caller_pid {
+    // Security check (Linux do_rt_tgsigqueueinfo): kernel-reserved si_code
+    // only when targeting the calling thread itself
+    let caller_tid = crate::task::percpu::current_tid() as i64;
+    if (info.code() >= 0 || info.code() == si_code::SI_TKILL) && tid != caller_tid {
         return -1; // EPERM
     }
 
