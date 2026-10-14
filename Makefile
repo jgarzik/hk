@@ -139,6 +139,9 @@ test:
 # QEMU boot test timeout in seconds (TCG on CI hosts without KVM is slow)
 BOOT_TEST_TIMEOUT ?= 90
 
+# QEMU -cpu override for the boot tests (see run-qemu.sh), e.g. QEMU_CPU=max
+export QEMU_CPU
+
 check: iso
 	@rm -f /tmp/qemu_serial.log
 	@echo "Running boot test ($(BOOT_TEST_TIMEOUT) second timeout)..."

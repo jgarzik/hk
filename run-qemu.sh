@@ -9,6 +9,10 @@
 #   -T N         Timeout in seconds for test mode (default: 30)
 #   -u           USB serial console mode (x86 only, for make check-usb)
 #
+# Environment:
+#   QEMU_CPU     Override the -cpu model (x86 default: host under KVM,
+#                qemu64 under TCG; arm default: cortex-a72), e.g. QEMU_CPU=max
+#
 # Serial output:
 #   x86: /tmp/qemu_serial.log (or /tmp/qemu_usb_serial.log with -u)
 #   arm: /tmp/qemu_serial_arm.log
@@ -93,7 +97,7 @@ setup_x86_config() {
     if [ -w /dev/kvm ]; then
         QEMU_ARGS=(
             -enable-kvm
-            -cpu host
+            -cpu "${QEMU_CPU:-host}"
             -cdrom "$ISO"
             -boot d
             -nographic
@@ -102,7 +106,7 @@ setup_x86_config() {
         )
     else
         QEMU_ARGS=(
-            -cpu qemu64
+            -cpu "${QEMU_CPU:-qemu64}"
             -cdrom "$ISO"
             -boot d
             -nographic
@@ -177,7 +181,7 @@ setup_arm_config() {
     # Base QEMU arguments
     QEMU_ARGS=(
         -machine virt,gic-version=3
-        -cpu cortex-a72
+        -cpu "${QEMU_CPU:-cortex-a72}"
         -smp 4
         -m 512M
         -kernel "$KERNEL"
