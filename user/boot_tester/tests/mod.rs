@@ -25,6 +25,8 @@ pub mod posix_timer;
 pub mod xattr;
 pub mod mqueue;
 pub mod netdev;
+pub mod netdev_ioctl;
+pub mod netlink;
 pub mod nl;
 pub mod capabilities;
 pub mod eventfd;
@@ -93,6 +95,8 @@ pub fn run_all_tests() {
     adjtimex::run_tests();
     io_uring::run_tests();
     tcp::run_tests();
+    netlink::run_tests();
+    netdev_ioctl::run_tests();
     netdev::run_tests();
     keys::run_tests();
     kcmp::run_tests();
