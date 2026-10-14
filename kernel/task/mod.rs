@@ -1288,6 +1288,29 @@ pub const fn cap_valid(cap: u32) -> bool {
 ///
 /// # Returns
 /// true if the current task has the capability in its effective set
+/// Linux cap_emulate_setxuid: leaving uid 0 entirely (real, effective
+/// and saved all non-zero) clears permitted and effective capabilities
+/// (unless PR_SET_KEEPCAPS) and ambient ones; an effective uid change
+/// away from 0 clears effective capabilities, back to 0 restores them
+/// from permitted
+pub fn cap_fix_setuid(old: &Cred, new: &mut Cred, keep_caps: bool) {
+    let had_root = old.uid == 0 || old.euid == 0 || old.suid == 0;
+    let has_root = new.uid == 0 || new.euid == 0 || new.suid == 0;
+    if had_root && !has_root {
+        if !keep_caps {
+            new.cap_permitted = CAP_EMPTY_SET;
+            new.cap_effective = CAP_EMPTY_SET;
+        }
+        new.cap_ambient = CAP_EMPTY_SET;
+    }
+    if old.euid == 0 && new.euid != 0 {
+        new.cap_effective = CAP_EMPTY_SET;
+    }
+    if old.euid != 0 && new.euid == 0 {
+        new.cap_effective = new.cap_permitted;
+    }
+}
+
 pub fn capable(cap: u32) -> bool {
     if cap > CAP_LAST_CAP {
         return false;

@@ -2650,7 +2650,26 @@ pub fn set_current_uid_all(uid: crate::task::Uid) {
     new_cred.suid = uid;
     new_cred.euid = uid;
     new_cred.fsuid = uid;
+    commit_uid_change(new_cred);
+}
+
+/// Commit a uid change after the Linux capability fixup
+/// (cap_emulate_setxuid)
+fn commit_uid_change(mut new_cred: crate::task::Cred) {
+    let old = current_cred();
+    crate::task::cap_fix_setuid(&old, &mut new_cred, current_keep_caps());
     crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
+}
+
+/// PR_SET_KEEPCAPS of the current task
+fn current_keep_caps() -> bool {
+    let tid = current_tid();
+    TASK_TABLE
+        .lock()
+        .tasks
+        .iter()
+        .find(|t| t.tid == tid)
+        .is_some_and(|t| t.prctl.keep_caps)
 }
 
 /// Update current task's effective UID only (euid and fsuid)
@@ -2664,7 +2683,7 @@ pub fn set_current_euid(euid: crate::task::Uid) {
     let mut new_cred = crate::task::prepare_creds();
     new_cred.euid = euid;
     new_cred.fsuid = euid; // fsuid follows euid
-    crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
+    commit_uid_change(new_cred);
 }
 
 /// Update current task's GID (all fields: gid, sgid, egid, fsgid)
@@ -2731,7 +2750,7 @@ pub fn set_current_resuid(
     if let Some(uid) = suid {
         new_cred.suid = uid;
     }
-    crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
+    commit_uid_change(new_cred);
 }
 
 /// Update current task's real, effective, and saved GIDs selectively
@@ -2794,7 +2813,7 @@ pub fn set_current_reuid(
     if let Some(uid) = new_suid {
         new_cred.suid = uid;
     }
-    crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
+    commit_uid_change(new_cred);
 }
 
 /// Update current task's real and effective GIDs (setregid semantics)
