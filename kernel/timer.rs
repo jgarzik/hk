@@ -6,7 +6,13 @@
 //! ## Architecture
 //!
 //! Timers are stored in a global list sorted by expiration time. The timer
-//! interrupt handler calls `check_timers()` which fires any expired callbacks.
+//! interrupt (CPU 0) calls `check_timers()`, which only notices that the
+//! earliest timer expired and wakes the `ktimerd` kernel thread; callbacks
+//! run there, in process context (they may take sleeping locks, allocate,
+//! send signals). Before `ktimerd` starts, expired timers simply wait.
+//!
+//! Locking: `TIMERS` is an `IrqSpinlock` (leaf; IRQ-reachable). Callbacks
+//! run with no timer lock held.
 //!
 //! ## Usage
 //!
@@ -19,7 +25,7 @@
 //! ```
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::time::{ClockId, TIMEKEEPER};
@@ -195,62 +201,74 @@ pub fn timer_mod(handle: TimerHandle, expires_ns: u64, interval_ns: u64) -> bool
     }
 }
 
-/// Check and fire expired timers
-///
-/// Should be called from the timer interrupt handler.
-/// Fires callbacks for all expired timers.
+/// Wait queue `ktimerd` sleeps on
+static KTIMERD_WQ: crate::waitqueue::WaitQueue = crate::waitqueue::WaitQueue::new();
+
+/// Set once `ktimerd` runs (IRQ-side wakeups are pointless before)
+static KTIMERD_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// True if the earliest timer has expired
+fn earliest_expired() -> bool {
+    let now = now_ns();
+    TIMERS.lock().first().is_some_and(|t| t.expires_ns <= now)
+}
+
+/// Timer tick hook (IRQ context, CPU 0): wake `ktimerd` if a timer expired
 pub fn check_timers() {
-    if !TIMEKEEPER.is_initialized() {
+    if !TIMEKEEPER.is_initialized() || !KTIMERD_RUNNING.load(Ordering::Acquire) {
         return;
     }
+    if earliest_expired() {
+        KTIMERD_WQ.wake_one();
+    }
+}
 
+/// Fire all expired timers (process context)
+fn run_expired_timers() {
     let current_ns = now_ns();
 
-    // Collect expired timers (can't call callbacks while holding lock)
-    let expired: Vec<(TimerCallback, u64, u64, TimerHandle)> = {
+    // Collect expired timers; periodic ones are re-armed (catching up past
+    // missed periods) and re-inserted in order
+    let expired: Vec<(TimerCallback, u64)> = {
         let mut timers = TIMERS.lock();
-
-        let mut expired_list = Vec::new();
-        let mut to_remove = Vec::new();
-        let mut to_reschedule = Vec::new();
-
-        for (idx, timer) in timers.iter().enumerate() {
-            if timer.expires_ns <= current_ns {
-                expired_list.push((timer.callback, timer.data, timer.interval_ns, timer.handle));
-                if timer.interval_ns > 0 {
-                    // Periodic timer - will be rescheduled
-                    to_reschedule.push((idx, timer.expires_ns + timer.interval_ns));
-                } else {
-                    // One-shot timer - remove it
-                    to_remove.push(idx);
-                }
-            } else {
-                // List is sorted, no more expired timers
-                break;
+        let mut fired = Vec::new();
+        while timers.first().is_some_and(|t| t.expires_ns <= current_ns) {
+            let mut timer = timers.remove(0);
+            fired.push((timer.callback, timer.data));
+            let late = current_ns - timer.expires_ns;
+            if let Some(missed) = late.checked_div(timer.interval_ns) {
+                timer.expires_ns += (missed + 1) * timer.interval_ns;
+                let pos = timers.partition_point(|t| t.expires_ns <= timer.expires_ns);
+                timers.insert(pos, timer);
             }
         }
-
-        // Remove one-shot timers (in reverse order to maintain indices)
-        for idx in to_remove.into_iter().rev() {
-            timers.remove(idx);
-        }
-
-        // Reschedule periodic timers
-        for (idx, new_expires) in to_reschedule {
-            if idx < timers.len() {
-                timers[idx].expires_ns = new_expires;
-            }
-        }
-
-        // Re-sort the list if we rescheduled any timers
-        timers.sort_by_key(|t| t.expires_ns);
-
-        expired_list
+        fired
     };
 
-    // Fire callbacks (outside of lock)
-    for (callback, data, _interval, _handle) in expired {
+    for (callback, data) in expired {
         callback(data);
+    }
+}
+
+/// `ktimerd`: runs expired timer callbacks in process context
+fn ktimerd(_arg: usize) {
+    loop {
+        KTIMERD_WQ.wait_event(earliest_expired);
+        run_expired_timers();
+    }
+}
+
+/// Start `ktimerd` on CPU 0 (where the timer tick checks timers)
+pub fn start_ktimerd() {
+    match crate::task::kthread::kthread_run_prio(
+        "ktimerd",
+        ktimerd,
+        0,
+        Some(0),
+        crate::task::PRIORITY_HIGH,
+    ) {
+        Ok(_) => KTIMERD_RUNNING.store(true, Ordering::Release),
+        Err(e) => crate::printkln!("timer: cannot start ktimerd: {:?}", e),
     }
 }
 

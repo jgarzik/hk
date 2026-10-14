@@ -332,9 +332,9 @@ pub extern "C" fn ap_entry(_cpu_id: u32, apic_id: u32) -> ! {
 /// AP idle loop - waits for work
 fn ap_idle_loop() -> ! {
     loop {
-        // Check if there's preemption pending (timer interrupt may have fired)
-        // This will call yield_now() which tries to schedule a task
-        super::timer_preempt_check();
+        // Once the BSP gave this CPU a scheduler (idle task), switch into it
+        // for good; until then just take interrupts
+        crate::task::percpu::try_schedule();
 
         // If no task was scheduled, wait for next interrupt
         unsafe {

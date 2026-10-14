@@ -354,6 +354,25 @@ would then need a preempt-disabling wrapper.
 since kernel code cannot be preempted, a change in a CPU's counter (or the
 CPU being idle) is a quiescent state for a future QSBR RCU.
 
+#### Kernel Threads (kernel/task/kthread.rs)
+
+`kthread_run(name, fn, arg, cpu)` creates a pid-0 task bound to one CPU
+(created asleep in that CPU's rq, then woken). `KTHREADS`
+(`spin::Mutex<Vec<Arc<KThread>>>`, process context only, never held across
+a wakeup/sleep; order: may be taken while holding nothing else) maps tid ->
+control block. `kthread_should_stop/should_park/parkme` and
+`kthread_stop/park/unpark` use atomics + `wake_up_task` + the block's
+`ack` WaitQueue. Unbound threads go round-robin to APs (CPU 0 runs the
+cooperative user tasks). Standing threads: `ktimerd` (CPU 0, runs software
+timer callbacks), the system workqueue worker, `kselftest` (boot only).
+
+Every online AP gets an idle task (`init_ap_schedulers`) and enters the
+scheduler from its boot idle loop. User tasks still run only on CPU 0. On
+x86-64 the TSS (RSP0) and the syscall entry stack are global: kernel
+threads switch with kernel stack 0, which leaves them untouched, so an AP
+switch cannot clobber CPU 0's user-entry stack. Per-CPU TSS is required
+before user tasks run on APs.
+
 ### 3.1.1 Task Struct and Credentials
 
 **Location:** `kernel/task/mod.rs`, `kernel/task/percpu.rs`
@@ -1740,6 +1759,11 @@ percpu::preempt_enable();   // preempt_count--
 - Timer tick updates (atomic only)
 - Wake sleepers (IrqSpinlock only, per-CPU only)
 - `WaitQueue::wake_one/wake_all` and `wake_up_task` (IrqSpinlocks only)
+- `timer::check_timers()` (CPU 0 tick): peeks `TIMERS` (IrqSpinlock) and
+  wakes `ktimerd`; timer callbacks themselves run in `ktimerd`, process
+  context (they may send signals, take Mutexes, allocate)
+- Workqueues have no IRQ-side work: the worker thread promotes expired
+  delayed work itself, sleeping with a timeout until the next deadline
 - Set reschedule flags (atomic)
 - Read per-CPU data (via GS segment)
 
@@ -1755,12 +1779,15 @@ percpu::preempt_enable();   // preempt_count--
 
 If interrupt context needs to trigger something that requires non-IRQ-safe locks:
 
-1. Set a flag (atomic)
-2. The flag is checked at safe points (interrupt exit, scheduler tick)
-3. The actual work is done in thread context
+1. Record the event (atomic, or an IrqSpinlock-protected queue)
+2. Wake a kernel thread (`WaitQueue::wake_*` / `wake_up_task`, IRQ-safe)
+3. The actual work is done in thread context (`ktimerd`, workqueue
+   workers; later softnet threads)
 
-Example: `needs_reschedule` flag is set in timer ISR, actual reschedule happens
-at interrupt exit when `preempt_count == 0`.
+Example: the CPU 0 tick notices an expired software timer and wakes
+`ktimerd`, which runs the callback (posix timers send signals there). The
+`needs_reschedule` flag set by the tick is currently unused for preemption
+(hk is non-preemptive, see 3.1).
 
 ### 7.4 Complete List of Locks Never Acquired from Interrupt Context
 

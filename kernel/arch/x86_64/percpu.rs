@@ -764,6 +764,10 @@ impl PerCpuOps for X86_64Arch {
         get_syscall_user_rsp()
     }
 
+    fn cpu_online(cpu: u32) -> bool {
+        (cpu as usize) < MAX_CPUS && get_percpu(cpu).is_online.load(Ordering::Acquire)
+    }
+
     type SyscallUserState = SyscallUserState;
 
     fn save_syscall_user_state() -> SyscallUserState {

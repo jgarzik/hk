@@ -3,6 +3,7 @@
 pub mod exec;
 pub mod fdtable;
 pub mod id;
+pub mod kthread;
 pub mod misc;
 pub mod percpu;
 pub mod pgrp;

@@ -154,6 +154,13 @@ ap_entry_point:
     /* Load page table base from ApBootData */
     ldr     x20, [x19, #8]          /* ttbr0 - save for later */
 
+    /* Enable FP/SIMD (CPACR_EL1.FPEN = 0b11) like the BSP: the kernel is
+     * built for aarch64-unknown-none, which uses NEON registers */
+    mrs     x1, cpacr_el1
+    orr     x1, x1, #(3 << 20)
+    msr     cpacr_el1, x1
+    isb
+
     /* Invalidate TLB */
     tlbi    vmalle1
     dsb     ish

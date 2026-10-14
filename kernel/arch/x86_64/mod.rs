@@ -503,16 +503,6 @@ pub unsafe fn set_timer_preempt_callback(callback: fn()) {
     }
 }
 
-/// Called from timer interrupt handler to check for preemption
-#[inline]
-pub fn timer_preempt_check() {
-    // Safety: This is only called from the timer interrupt handler,
-    // and the callback is set once during init before interrupts are enabled.
-    if let Some(callback) = unsafe { TIMER_PREEMPT_CALLBACK } {
-        callback();
-    }
-}
-
 /// Architecture-specific bus/driver initialization
 ///
 /// Called after BusManager is created. Registers the platform bus with

@@ -761,7 +761,12 @@ static mut SYSCALL_KERNEL_STACK: u64 = 0;
 ///
 /// Called from switch_to.S assembly during initial context switch.
 #[unsafe(no_mangle)]
+///
+/// Global like the TSS: `stack == 0` (kernel threads) leaves it alone.
 pub extern "C" fn set_syscall_kernel_stack(stack: u64) {
+    if stack == 0 {
+        return;
+    }
     unsafe {
         SYSCALL_KERNEL_STACK = stack;
     }

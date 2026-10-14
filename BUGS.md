@@ -53,6 +53,18 @@ faulting instruction re-faults until the task makes a syscall (it never
 does): the task spins. Delivering at fault time needs a signal frame built
 from the trap frame (x86-64: the per-CPU syscall block lacks RCX/R11).
 
+## aarch64: user FP/SIMD registers are not preserved
+
+**Location**: `kernel/arch/aarch64/context.rs`, kernel target
+
+The aarch64 kernel is built for `aarch64-unknown-none`, which uses NEON
+registers (e.g. memcpy), and neither syscall entry nor `context_switch`
+saves user q0-q31/FPCR/FPSR. Any syscall or task switch can corrupt a
+user task's FP/SIMD state. Fix: save/restore user FP state per task (lazy
+or eager), or build the kernel soft-float. (x86-64 uses the soft-float
+`x86_64-unknown-none` target, but `context_switch` does not save user
+XMM/x87 state either, so a switch between two user tasks can corrupt it.)
+
 ## Heap Corruption in Arc<T> Struct Fields
 
 **Status**: Unresolved (workaround in place)

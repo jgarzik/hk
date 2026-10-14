@@ -1499,14 +1499,8 @@ extern "C" fn handle_lapic_timer(_frame: &X86_64TrapFrame) {
         crate::time::TIMEKEEPER.update(super::tsc::read_tsc);
     }
 
-    // Increment global tick count for percpu_sched
-    crate::task::percpu::timer_tick();
-
-    // Check for expired delayed work items (workqueue-based periodic tasks)
-    crate::workqueue::timer_tick();
-
-    // Wake any tasks whose sleep time has expired
-    crate::task::percpu::wake_sleepers();
+    // Global ticks/timers and this CPU's scheduler work
+    crate::task::percpu::scheduler_tick();
 
     // Send EOI to LAPIC (must be done before any potential context switch)
     lapic::eoi();

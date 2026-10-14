@@ -278,6 +278,9 @@ pub trait PerCpuOps {
     /// Get saved syscall user RSP (stack pointer for fork)
     fn get_syscall_user_rsp() -> u64;
 
+    /// Whether logical CPU `cpu` has been brought online
+    fn cpu_online(cpu: u32) -> bool;
+
     /// Per-CPU syscall user-register block (see `save_syscall_user_state`)
     type SyscallUserState: Copy;
 

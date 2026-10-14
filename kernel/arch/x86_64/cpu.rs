@@ -351,7 +351,14 @@ pub fn init_gdt() {
 ///
 /// Called from switch_to.S assembly during context switch.
 #[unsafe(no_mangle)]
+///
+/// The TSS is global (shared by all CPUs) and only CPU 0 runs user tasks;
+/// kernel threads never enter user mode and switch with `stack_top == 0`,
+/// which leaves RSP0 alone (a switch on an AP must not clobber CPU 0's).
 pub extern "C" fn set_kernel_stack(stack_top: u64) {
+    if stack_top == 0 {
+        return;
+    }
     unsafe {
         TSS.privilege_stack_table[0] = stack_top;
     }

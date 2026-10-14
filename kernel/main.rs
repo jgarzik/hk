@@ -28,6 +28,7 @@ pub mod pipe;
 pub mod poll;
 pub mod posix_timer;
 pub mod printk;
+pub mod selftest;
 pub mod signalfd;
 pub mod storage;
 mod time;
@@ -1011,6 +1012,13 @@ fn kmain() -> ! {
 
     // Enable scheduling
     task::percpu::enable();
+
+    // Schedulers for the APs, then the kernel threads: timer callbacks
+    // (ktimerd), the system workqueue worker and the boot self-test
+    task::percpu::init_ap_schedulers(&mut frame_alloc);
+    crate::timer::start_ktimerd();
+    crate::workqueue::init();
+    crate::selftest::start();
 
     // Set per-CPU current task state
     // tid=2, pid=1, ppid=0, pgid=1, sid=1 (init process)

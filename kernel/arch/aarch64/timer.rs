@@ -126,14 +126,8 @@ pub fn handle_timer_irq() {
         crate::time::TIMEKEEPER.update(crate::time::TIMEKEEPER.get_read_cycles());
     }
 
-    // Call scheduler timer tick to update tick counter
-    crate::task::percpu::timer_tick();
-
-    // Check for expired delayed work items (workqueue-based periodic tasks)
-    crate::workqueue::timer_tick();
-
-    // Wake any sleeping tasks whose wake time has arrived
-    crate::task::percpu::wake_sleepers();
+    // Global ticks/timers and this CPU's scheduler work
+    crate::task::percpu::scheduler_tick();
 
     // Call preemption callback if registered
     unsafe {

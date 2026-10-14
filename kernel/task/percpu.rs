@@ -121,6 +121,9 @@ type TaskContext = <CurrentArch as ContextOps>::TaskContext;
 // Get MAX_CPUS from the architecture
 const MAX_CPUS: usize = <CurrentArch as PerCpuOps>::MAX_CPUS;
 
+/// Number of per-CPU scheduler slots (logical CPU ids are below this)
+pub const MAX_SCHED_CPUS: usize = MAX_CPUS;
+
 /// Size of kernel stack per thread (16KB)
 pub const KERNEL_STACK_SIZE: usize = 16 * 1024;
 
@@ -453,54 +456,54 @@ fn idle_task_entry() -> ! {
 /// Size of idle task stack (8KB - smaller than regular threads)
 const IDLE_STACK_SIZE: usize = 8 * 1024;
 
-/// Create the idle task for a specific CPU
+/// Create a kernel task (pid 0, kernel page table) owned by `cpu_id`
 ///
-/// Called once per CPU during scheduler initialization.
-/// The idle task is always runnable at PRIORITY_IDLE (0).
-fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
+/// `entry` runs on a fresh stack of `stack_size` bytes with the rq lock
+/// released (`finish_context_switch`) but interrupts still disabled; it must
+/// enable them. The task is made runnable unless it is the idle task (the
+/// caller enqueues that). Kernel threads use pid 0 like the idle tasks so
+/// that user pids are unaffected.
+fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
     cpu_id: u32,
+    name: &str,
+    entry: usize,
+    priority: Priority,
+    stack_size: usize,
+    start_asleep: bool,
     frame_alloc: &mut FA,
 ) -> Result<Tid, &'static str> {
-    // Allocate TID from global table, but use pid=0 for kernel idle task
-    // This follows Linux convention where pid=0 is the swapper/idle process
     let tid = {
         let mut table = TASK_TABLE.lock();
         let tid = table.next_tid;
         table.next_tid += 1;
-        // Don't increment next_pid - idle task uses special pid=0
         tid
     };
-    // Idle task gets special pid=0 (kernel swapper/idle convention)
     let pid = 0;
 
-    // Allocate kernel stack for idle task (8KB = 2 pages)
-    let stack_pages = IDLE_STACK_SIZE / PAGE_SIZE as usize;
+    // Allocate the kernel stack (consecutive frames, as for clone)
+    let stack_pages = stack_size / PAGE_SIZE as usize;
     let mut stack_base: Option<u64> = None;
-
     for i in 0..stack_pages {
         let frame = frame_alloc
             .alloc_frame()
-            .ok_or("Out of memory for idle task stack")?;
-
+            .ok_or("Out of memory for kernel thread stack")?;
         if i == 0 {
             stack_base = Some(frame);
         }
-
-        // Zero the page
         unsafe {
             core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
         }
     }
-
     let stack_base = stack_base.unwrap();
-    let stack_top = stack_base + IDLE_STACK_SIZE as u64;
+    let stack_top = stack_base + stack_size as u64;
 
-    // Create the task context
-    let context = TaskContext::new_kernel_thread(idle_task_entry as *const () as usize, stack_top);
-    let thread_ctx = KernelThreadContext::new(context, stack_base, PRIORITY_IDLE);
+    let context = TaskContext::new_kernel_thread(entry, stack_top);
+    let mut thread_ctx = KernelThreadContext::new(context, stack_base, priority);
+    if start_asleep {
+        // Not runnable until wake_up_task (lets the creator finish setup)
+        thread_ctx.state = SleepState::Uninterruptible;
+    }
 
-    // Create the task structure
-    // Idle task: ppid=0 (no parent), pgid=pid (own group), sid=pid (own session)
     let task = Task {
         magic: crate::task::TASK_MAGIC,
         pid,
@@ -526,11 +529,15 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         cred: alloc::sync::Arc::new(Cred::ROOT), // Kernel threads run as root
         kind: TaskKind::KernelThread,
         state: TaskState::Ready,
-        priority: PRIORITY_IDLE,
-        policy: crate::task::SCHED_IDLE,
+        priority,
+        policy: if priority == PRIORITY_IDLE {
+            crate::task::SCHED_IDLE
+        } else {
+            crate::task::SCHED_NORMAL
+        },
         rt_priority: 0,
         reset_on_fork: false,
-        cpus_allowed: crate::task::CPU_MASK_ALL,
+        cpus_allowed: 1 << cpu_id,
         cpu: cpu_id,
         page_table: ArchPageTable::kernel_identity(),
         trap_frame: Default::default(),
@@ -555,7 +562,12 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         tif_sigpending: core::sync::atomic::AtomicBool::new(false),
         robust_list: 0,
         // prctl state
-        prctl: crate::task::PrctlState::default(),
+        prctl: {
+            let mut p = crate::task::PrctlState::default();
+            let n = name.len().min(15);
+            p.name[..n].copy_from_slice(&name.as_bytes()[..n]);
+            p
+        },
         // Process personality (execution domain)
         personality: 0,
         // NUMA memory policy (kernel threads use default)
@@ -574,27 +586,82 @@ fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
         ptrace_options: 0,
     };
 
-    // Add task to global table
-    {
-        let mut table = TASK_TABLE.lock();
-        table.tasks.push(task);
-    }
+    TASK_TABLE.lock().tasks.push(task);
 
-    // Add to this CPU's run queue; the CPU may enter the scheduler only
-    // once its idle task is runnable, so mark it initialized last
     let sched = get_percpu_sched(cpu_id);
-    {
-        let mut rq = sched.lock.lock();
-        rq.init();
-        rq.add_task(tid, thread_ctx);
+    let mut rq = sched.lock.lock();
+    rq.init();
+    rq.add_task(tid, thread_ctx);
+    if !start_asleep {
         rq.enqueue_task(tid);
-        rq.idle_tid = Some(tid);
     }
-    sched.initialized.store(true, Ordering::Release);
-
-    printkln!("IDLE_TASK_CREATED: cpu={} tid={}", cpu_id, tid);
-
     Ok(tid)
+}
+
+/// Create the idle task for a specific CPU and mark its scheduler ready
+///
+/// The idle task is always runnable at PRIORITY_IDLE (0). The CPU may enter
+/// the scheduler only once this is done, so `initialized` is set last.
+fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
+    cpu_id: u32,
+    frame_alloc: &mut FA,
+) -> Result<Tid, &'static str> {
+    let tid = create_kernel_task(
+        cpu_id,
+        "swapper",
+        idle_task_entry as *const () as usize,
+        PRIORITY_IDLE,
+        IDLE_STACK_SIZE,
+        false,
+        frame_alloc,
+    )?;
+    let sched = get_percpu_sched(cpu_id);
+    sched.lock.lock().idle_tid = Some(tid);
+    sched.initialized.store(true, Ordering::Release);
+    printkln!("IDLE_TASK_CREATED: cpu={} tid={}", cpu_id, tid);
+    Ok(tid)
+}
+
+/// Create a kernel thread on `cpu_id`, asleep (see `task::kthread`; start
+/// it with `wake_up_task`)
+pub fn create_kthread_task(
+    cpu_id: u32,
+    name: &str,
+    entry: usize,
+    priority: Priority,
+) -> Result<Tid, &'static str> {
+    if !get_percpu_sched(cpu_id).initialized.load(Ordering::Acquire) {
+        return Err("CPU has no scheduler");
+    }
+    let mut fa = crate::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
+    create_kernel_task(
+        cpu_id,
+        name,
+        entry,
+        priority,
+        KERNEL_STACK_SIZE,
+        true,
+        &mut fa,
+    )
+}
+
+/// Give every online AP a scheduler (idle task); each AP switches into it
+/// from its boot idle loop via `try_schedule()`
+pub fn init_ap_schedulers<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) {
+    let bsp = CurrentArch::try_current_cpu_id().unwrap_or(0);
+    for cpu in 0..MAX_CPUS as u32 {
+        if cpu != bsp
+            && CurrentArch::cpu_online(cpu)
+            && let Err(e) = create_idle_task(cpu, frame_alloc)
+        {
+            printkln!("SCHED: no scheduler for CPU {}: {}", cpu, e);
+        }
+    }
+}
+
+/// Whether `cpu` runs a scheduler (can own tasks)
+pub fn cpu_has_scheduler(cpu: u32) -> bool {
+    (cpu as usize) < MAX_CPUS && get_percpu_sched(cpu).initialized.load(Ordering::Acquire)
 }
 
 /// Initialize the global scheduler with idle task for BSP
@@ -1606,8 +1673,16 @@ fn switch_info(tid: Tid) -> (u64, u64, CurrentTask) {
         .iter()
         .find(|t| t.tid == tid)
         .map(|t| {
+            // Kernel threads never return to user mode: 0 keeps the arch
+            // from loading their stack as the user-entry stack (x86-64 TSS
+            // RSP0 / syscall stack are global, owned by CPU 0's user tasks)
+            let kstack = if matches!(t.kind, TaskKind::KernelThread) {
+                0
+            } else {
+                t.kstack_top
+            };
             (
-                t.kstack_top,
+                kstack,
                 t.page_table.root_table_phys(),
                 CurrentTask {
                     tid,
@@ -1805,11 +1880,15 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
     ns.div_ceil(TICK_NS)
 }
 
-/// Called on timer tick
-pub fn timer_tick() {
+/// Per-CPU timer tick (IRQ context, every CPU)
+///
+/// Advances the global tick count and runs global timer work, then does
+/// this CPU's scheduler work (remote wakeups, expired sleepers).
+pub fn scheduler_tick() {
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-    // Check and fire any expired software timers
+    // Wake ktimerd if a software timer expired
     crate::timer::check_timers();
+    wake_sleepers();
 }
 
 /// Get current tick count

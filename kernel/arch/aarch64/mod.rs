@@ -623,6 +623,13 @@ impl PerCpuOps for Aarch64Arch {
             .unwrap_or(0)
     }
 
+    fn cpu_online(cpu: u32) -> bool {
+        (cpu as usize) < percpu::MAX_CPUS
+            && percpu::get_percpu(cpu)
+                .is_online
+                .load(core::sync::atomic::Ordering::Acquire)
+    }
+
     type SyscallUserState = percpu::SyscallUserState;
 
     fn save_syscall_user_state() -> percpu::SyscallUserState {
