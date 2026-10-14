@@ -60,6 +60,7 @@ pub mod ethernet;
 pub mod icmp;
 pub mod inet;
 pub mod ipv4;
+pub mod msg;
 pub mod netlink;
 pub mod proc;
 pub mod request_sock;

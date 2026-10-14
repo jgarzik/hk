@@ -179,6 +179,11 @@ impl NlSock {
         }
     }
 
+    /// Largest message accepted by sendmsg (Linux: sndbuf - 32)
+    pub fn max_msg(&self) -> usize {
+        (self.sndbuf.load(Ordering::Acquire) as usize).saturating_sub(32)
+    }
+
     /// Connected destination (portid, group)
     pub fn dst(&self) -> (u32, u32) {
         *self.dst.lock()
@@ -329,7 +334,7 @@ impl NlSock {
         group: u32,
     ) -> Result<usize, KernelError> {
         self.autobind()?;
-        if data.len() + 32 > self.sndbuf.load(Ordering::Acquire) as usize {
+        if data.len() > self.max_msg() {
             return Err(KernelError::MessageTooLong);
         }
         let me = self.portid();

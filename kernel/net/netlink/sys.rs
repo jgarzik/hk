@@ -9,9 +9,9 @@ use alloc::sync::Arc;
 
 use super::*;
 use crate::fs::file::{File, FileOps, flags as fflags};
+use crate::net::msg::Iov;
 use crate::net::syscall::{
-    UserMsgHdr, copy_in, gather_iovec, install_file, put_addr, read_iovecs, read_msghdr,
-    scatter_iovec, write_msghdr_out,
+    UserMsgHdr, copy_in, install_file, put_addr, read_msghdr, write_msghdr_out,
 };
 use crate::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::uaccess::{copy_to_user, get_user, put_user};
@@ -206,15 +206,21 @@ fn dest(sk: &NlSock, name: u64, namelen: u64) -> Result<(u32, u32), KernelError>
     Ok((pid, group))
 }
 
+/// Copy in a message after the size check (Linux netlink_sendmsg:
+/// EMSGSIZE above sndbuf - 32, before any allocation)
+fn send_iov(sk: &Arc<NlSock>, iov: &Iov, pid: u32, group: u32) -> Result<i64, KernelError> {
+    if iov.total > sk.max_msg() {
+        return Err(KernelError::MessageTooLong);
+    }
+    let data = iov.gather(iov.total)?;
+    Ok(sk.send(&data, pid, group)? as i64)
+}
+
 /// sendto(2)
 pub fn sendto(sk: &Arc<NlSock>, buf: u64, len: u64, name: u64, namelen: u64) -> i64 {
     ret((|| {
         let (pid, group) = dest(sk, name, namelen)?;
-        if len as usize + 32 > sk.sndbuf.load(core::sync::atomic::Ordering::Acquire) as usize {
-            return Err(KernelError::MessageTooLong);
-        }
-        let data = copy_in(buf, len as usize).map_err(|_| KernelError::BadAddress)?;
-        Ok(sk.send(&data, pid, group)? as i64)
+        send_iov(sk, &Iov::single(buf, len)?, pid, group)
     })())
 }
 
@@ -223,17 +229,8 @@ pub fn sendmsg(sk: &Arc<NlSock>, msg: u64) -> i64 {
     ret((|| {
         let h = read_msghdr(msg).map_err(|_| KernelError::BadAddress)?;
         let (pid, group) = dest(sk, h.msg_name, h.msg_namelen as u64)?;
-        let data = gather_iovec(h.msg_iov, h.msg_iovlen).map_err(err_of)?;
-        Ok(sk.send(&data, pid, group)? as i64)
+        send_iov(sk, &Iov::from_msg(h.msg_iov, h.msg_iovlen)?, pid, group)
     })())
-}
-
-fn err_of(e: i64) -> KernelError {
-    if e == KernelError::InvalidArgument.sysret() {
-        KernelError::InvalidArgument
-    } else {
-        KernelError::BadAddress
-    }
 }
 
 /// recvfrom(2)
@@ -247,9 +244,10 @@ pub fn recvfrom(
     namelen: u64,
 ) -> i64 {
     ret((|| {
+        let iov = Iov::single(buf, len)?;
         let skb = sk.recv(flags & MSG_PEEK != 0, nonblock(file, flags))?;
-        let n = skb.data.len().min(len as usize);
-        copy_to_user::<Uaccess>(buf, &skb.data[..n]).map_err(|_| KernelError::BadAddress)?;
+        let n = skb.data.len().min(iov.total);
+        iov.scatter(0, &skb.data[..n])?;
         if name != 0 && namelen != 0 {
             let r = put_addr(
                 name,
@@ -281,13 +279,10 @@ fn group_mask(group: u32) -> u32 {
 pub fn recvmsg(sk: &NlSock, file: &File, msg: u64, flags: i32) -> i64 {
     ret((|| {
         let h: UserMsgHdr = read_msghdr(msg).map_err(|_| KernelError::BadAddress)?;
-        let space = read_iovecs(h.msg_iov, h.msg_iovlen)
-            .map_err(err_of)?
-            .iter()
-            .fold(0usize, |a, v| a.saturating_add(v.iov_len));
+        let iov = Iov::from_msg(h.msg_iov, h.msg_iovlen)?;
         let skb = sk.recv(flags & MSG_PEEK != 0, nonblock(file, flags))?;
-        let n = skb.data.len().min(space);
-        scatter_iovec(h.msg_iov, h.msg_iovlen, &skb.data[..n]);
+        let n = skb.data.len().min(iov.total);
+        iov.scatter(0, &skb.data[..n])?;
         let mut oflags = 0;
         if n < skb.data.len() {
             oflags |= MSG_TRUNC;

@@ -89,6 +89,7 @@ pub const POLLNVAL: i16 = 0x0020;
 
 /// iovec structure for readv/writev
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct IoVec {
     pub iov_base: *const u8,
     pub iov_len: usize,

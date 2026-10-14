@@ -81,9 +81,12 @@ impl Msg {
         }
     }
 
-    /// Attribute with a raw payload
+    /// Attribute with a raw payload (skipped if it cannot be encoded,
+    /// like nla_put's EMSGSIZE)
     pub fn attr(&mut self, ty: u16, data: &[u8]) -> &mut Self {
-        let len = (NLA_HDRLEN + data.len()) as u16;
+        let Ok(len) = u16::try_from(NLA_HDRLEN + data.len()) else {
+            return self;
+        };
         self.buf.extend_from_slice(&len.to_ne_bytes());
         self.buf.extend_from_slice(&ty.to_ne_bytes());
         self.put(data)

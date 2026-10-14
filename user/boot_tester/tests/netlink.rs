@@ -9,7 +9,7 @@
 
 use hk_syscall::{
     sys_bind, sys_capget, sys_capset, sys_close, sys_exit, sys_fork, sys_getpid, sys_getsockname,
-    sys_getsockopt, sys_recvmsg, sys_setsockopt, sys_socket, sys_wait4, CapUserData,
+    sys_getsockopt, sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt, sys_socket, sys_wait4, CapUserData,
     CapUserHeader, IoVec, MsgHdr, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, _LINUX_CAPABILITY_VERSION_3,
 };
 
@@ -18,9 +18,11 @@ use super::nl::*;
 
 const EPERM: i32 = -1;
 const ESRCH: i32 = -3;
+const EFAULT: i32 = -14;
 const ENODEV: i32 = -19;
 const EEXIST: i32 = -17;
 const EINVAL: i32 = -22;
+const EMSGSIZE: i32 = -90;
 const ENOPROTOOPT: i32 = -92;
 const EPROTONOSUPPORT: i32 = -93;
 const ESOCKTNOSUPPORT: i32 = -94;
@@ -51,6 +53,7 @@ pub fn run_tests() {
     test_strict_dump();
     test_other_dumps();
     test_eperm();
+    test_overflow();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -768,6 +771,49 @@ fn test_eperm() {
     let code = (st >> 8) & 0xff;
     if st & 0x7f != 0 || code != 0 {
         return fail(N, b"child code", code as i64);
+    }
+    ok(N);
+}
+
+fn sendmsg_iov(fd: i32, iov: &mut [IoVec]) -> i32 {
+    let msg = MsgHdr::new(iov.as_mut_ptr(), iov.len());
+    sys_sendmsg(fd, &msg, 0) as i32
+}
+
+/// Hostile lengths: huge iov_len (EFAULT), totals above sndbuf - 32
+/// (EMSGSIZE, before copying anything), oversized sendto lengths
+/// (clamped, then EMSGSIZE), more than UIO_MAXIOV segments (EMSGSIZE)
+fn test_overflow() {
+    const N: &[u8] = b"NL_OVERFLOW";
+    let Some(nl) = Nl::open() else {
+        return fail(N, b"open", 0);
+    };
+    let buf = rxbuf();
+    let p = buf.as_ptr();
+    let mut huge = [
+        IoVec { iov_base: p, iov_len: 16 },
+        IoVec { iov_base: p, iov_len: usize::MAX / 2 },
+    ];
+    if !expect(N, b"huge iov_len", sendmsg_iov(nl.fd, &mut huge), EFAULT) {
+        return;
+    }
+    // 10 x 32 KB = 320 KB > default sndbuf (212992)
+    let mut big = [IoVec { iov_base: p, iov_len: buf.len() }; 10];
+    if !expect(N, b"total > sndbuf", sendmsg_iov(nl.fd, &mut big), EMSGSIZE) {
+        return;
+    }
+    let k = nladdr(0, 0);
+    let r = sys_sendto(nl.fd, p, usize::MAX, 0, k.as_ptr(), 12) as i32;
+    if !expect(N, b"sendto len max", r, EMSGSIZE) {
+        return;
+    }
+    // 1025 segments (zero length) inside the 32 KB receive buffer
+    let many = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut IoVec, 1025) };
+    for v in many.iter_mut() {
+        *v = IoVec { iov_base: p, iov_len: 0 };
+    }
+    if !expect(N, b"iovlen 1025", sendmsg_iov(nl.fd, many), EMSGSIZE) {
+        return;
     }
     ok(N);
 }
