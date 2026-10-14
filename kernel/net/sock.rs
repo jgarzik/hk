@@ -115,10 +115,12 @@ impl Sock {
         }
     }
 
-    /// A child (accept) inheriting the listener's options (Linux
-    /// sk_clone_lock)
+    /// A child (accept) inheriting the listener's options and owner
+    /// (Linux sk_clone_lock: sk_uid comes from the listener, never from
+    /// whatever task runs the receive path)
     pub fn clone_from(p: &Sock) -> Self {
-        let s = Self::new(p.net.clone(), p.family, p.stype, p.protocol);
+        let mut s = Self::new(p.net.clone(), p.family, p.stype, p.protocol);
+        s.cred = p.cred;
         s.rcvbuf.store(p.rcvbuf(), Ordering::Relaxed);
         s.sndbuf.store(p.sndbuf(), Ordering::Relaxed);
         s.rcvtimeo
@@ -178,6 +180,11 @@ impl Sock {
 
     pub fn shutdown(&self) -> u8 {
         self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Reset after a disconnect (Linux tcp_disconnect)
+    pub fn clear_shutdown(&self) {
+        self.shutdown.store(0, Ordering::Release);
     }
 
     pub fn set_shutdown(&self, how: u8) {

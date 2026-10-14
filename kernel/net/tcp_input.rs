@@ -72,6 +72,13 @@ pub fn tcp_rcv(skb: SkBuff) {
         // Get payload
         let payload = &skb.data()[data_offset..];
 
+        // Blind-injection checks for synchronized states (RFC 5961)
+        if !matches!(tcp.state(), TcpState::SynSent | TcpState::Closed)
+            && !acceptable(&socket, hdr, payload.len())
+        {
+            return;
+        }
+
         // Process based on state
         match tcp.state() {
             TcpState::SynSent => {
@@ -101,7 +108,8 @@ pub fn tcp_rcv(skb: SkBuff) {
     }
 
     // No established connection - check for listening socket (like __inet_lookup_listener)
-    if let Some(listener) = net.tcp_lookup_listener(hdr.dest_port()) {
+    let dif = skb.dev.as_ref().map_or(0, |d| d.ifindex());
+    if let Some(listener) = net.tcp_lookup_listener(daddr, hdr.dest_port(), dif) {
         let tcp = &listener.tcp;
         let _guard = tcp.lock();
 
@@ -139,6 +147,59 @@ fn send_reset(
         crate::net::tcp_output::tcp_send_rst(net, laddr, lp, raddr, rp, 0, Some(ack))
     };
     let _ = r;
+}
+
+/// Receive window right now
+fn rcv_wnd(t: &crate::net::tcp::TcpCb) -> u32 {
+    t.rcv_wnd.load(Ordering::Acquire).max(1)
+}
+
+/// RFC 5961 / RFC 9293 acceptability for a synchronized connection:
+/// RST only at exactly rcv_nxt (in-window: challenge ACK), SYN always
+/// challenged, data must start inside the window, ACKs beyond snd_nxt
+/// are challenged. Returns whether to process the segment.
+fn acceptable(s: &Arc<TcpSock>, hdr: &TcpHdr, plen: usize) -> bool {
+    let t = &s.tcp;
+    let (seq, rcv_nxt) = (hdr.seq(), t.rcv_nxt());
+    let off = seq.wrapping_sub(rcv_nxt);
+    let in_wnd = off < rcv_wnd(t);
+    let challenge = || {
+        let _ = crate::net::tcp_output::tcp_send_ack(s);
+    };
+    if hdr.has_flag(flags::RST) {
+        if seq == rcv_nxt {
+            return true;
+        }
+        if in_wnd {
+            challenge();
+        }
+        return false;
+    }
+    if hdr.has_flag(flags::SYN) {
+        challenge();
+        return false;
+    }
+    if !hdr.has_flag(flags::ACK) {
+        return false;
+    }
+    let (una, nxt) = (t.snd_una.load(Ordering::Acquire), t.snd_nxt());
+    if hdr.ack_seq().wrapping_sub(una) > nxt.wrapping_sub(una)
+        && una.wrapping_sub(hdr.ack_seq()) > 65535
+    {
+        // Acknowledges data never sent (or far in the past)
+        challenge();
+        return false;
+    }
+    // Data (or FIN) must start inside the window; old duplicates are
+    // re-ACKed so the peer stops retransmitting
+    let fin = hdr.has_flag(flags::FIN);
+    if (plen > 0 || fin) && !in_wnd {
+        if off >= 0x8000_0000 {
+            challenge();
+        }
+        return false;
+    }
+    true
 }
 
 /// Process packet to a listening socket
@@ -214,6 +275,10 @@ fn process_listen(
                 return;
             }
 
+            // Accept queue full: drop the ACK (Linux listen_overflow)
+            if accept_queue.accept_queue_is_full() {
+                return;
+            }
             // Remove from SYN queue
             if let Some(req) = accept_queue.syn_queue_remove(remote_addr, remote_port) {
                 // Drop the lock before creating the child socket
@@ -284,7 +349,9 @@ fn create_child_socket(
         remote_addr: req.remote_addr,
         remote_port: req.remote_port,
     };
-    tcp_register_connection(tuple, Arc::clone(&child));
+    if !tcp_register_connection(tuple, Arc::clone(&child)) {
+        return None;
+    }
 
     Some(child)
 }
@@ -392,10 +459,14 @@ fn process_established(socket: &Arc<TcpSock>, hdr: &TcpHdr, payload: &[u8], _sad
 
             // Wake readers
             socket.wake_rx();
-        } else if seq.wrapping_sub(rcv_nxt) < 0x80000000 {
-            // Future data - queue for later
+        } else if seq.wrapping_sub(rcv_nxt) < rcv_wnd(tcp) {
+            // Future data inside the window - queue for later (bounded
+            // by the window; reassembly is P6)
             let mut ooo = tcp.ooo_queue.lock();
-            ooo.insert(seq, payload.to_vec());
+            let queued: usize = ooo.values().map(|v| v.len()).sum();
+            if queued + payload.len() <= rcv_wnd(tcp) as usize {
+                ooo.insert(seq, payload.to_vec());
+            }
 
             // Send duplicate ACK
             let _ = crate::net::tcp_output::tcp_send_ack(socket);

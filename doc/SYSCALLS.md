@@ -119,7 +119,7 @@ New kernels mostly use statx; older ones use stat/lstat/fstat.
 
 - [x] stat (x86-64 only, legacy; use fstatat/statx)
 - [x] lstat (x86-64 only, legacy; use fstatat/statx)
-- [x] fstat (x86-64 only, legacy; use fstatat/statx)
+- [x] fstat (x86-64 and arm64: __NR3264_fstat 80)
 - [x] newfstatat (fstatat on aarch64)
 - [x] statfs (x86-64 only, legacy)
 - [x] fstatfs (x86-64 only, legacy)

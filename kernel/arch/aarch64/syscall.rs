@@ -68,6 +68,7 @@ pub const SYS_STATFS: u64 = 43;
 pub const SYS_FSTATFS: u64 = 44;
 pub const SYS_READLINKAT: u64 = 78;
 pub const SYS_FSTATAT: u64 = 79;
+pub const SYS_FSTAT: u64 = 80;
 pub const SYS_UTIMENSAT: u64 = 88;
 
 // Sync syscalls
@@ -645,6 +646,7 @@ pub fn aarch64_syscall_dispatch(
         }
         SYS_FCHOWN => sys_fchown(arg0 as i32, arg1 as u32, arg2 as u32) as u64,
         SYS_FSTATAT => sys_fstatat(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
+        SYS_FSTAT => crate::fs::stat::sys_fstat(arg0 as i32, arg1) as u64,
         SYS_UTIMENSAT => sys_utimensat(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
         SYS_UMASK => sys_umask(arg0 as u32) as u64,
         SYS_STATFS => sys_statfs(arg0, arg1) as u64,

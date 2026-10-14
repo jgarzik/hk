@@ -188,7 +188,7 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
         Ok(new_pos) => new_pos as i64,
         Err(KernelError::InvalidArgument) => KernelError::InvalidArgument.sysret(),
         Err(KernelError::OperationNotSupported) => -29, // ESPIPE - illegal seek (e.g., on pipe)
-        Err(_) => KernelError::InvalidArgument.sysret(),
+        Err(e) => e.sysret(),
     }
 }
 

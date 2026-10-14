@@ -382,6 +382,8 @@ pub const SYS_SOCKETPAIR: u64 = 199;
 pub const SYS_BIND: u64 = 200;
 pub const SYS_LISTEN: u64 = 201;
 pub const SYS_ACCEPT: u64 = 202;
+pub const SYS_ACCEPT4: u64 = 242;
+pub const SYS_FSTAT: u64 = 80;
 pub const SYS_CONNECT: u64 = 203;
 pub const SYS_GETSOCKNAME: u64 = 204;
 pub const SYS_GETPEERNAME: u64 = 205;
@@ -1736,6 +1738,18 @@ pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
 #[inline(always)]
 pub fn sys_accept(fd: i32, addr: *mut u8, addrlen: *mut u32) -> i64 {
     unsafe { syscall3!(SYS_ACCEPT, fd, addr, addrlen) }
+}
+
+/// accept4(fd, addr, addrlen, flags)
+#[inline(always)]
+pub fn sys_accept4(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_ACCEPT4, fd, addr, addrlen, flags) }
+}
+
+/// fstat(fd, statbuf)
+#[inline(always)]
+pub fn sys_fstat(fd: i32, statbuf: *mut Stat) -> i64 {
+    unsafe { syscall2!(SYS_FSTAT, fd, statbuf) }
 }
 
 /// shutdown(fd, how) - shut down part of a full-duplex connection

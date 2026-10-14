@@ -183,9 +183,6 @@ impl UdpSock {
     /// Queue a datagram unless the receive buffer is full (Linux
     /// __udp_enqueue_schedule_skb: admit while rmem <= rcvbuf)
     fn enqueue(&self, mut d: Dgram) {
-        if self.sk.shutdown() & RCV_SHUTDOWN != 0 {
-            return;
-        }
         let ts = truesize(d.data.len());
         let limit = self.sk.rcvbuf() as usize;
         if self.rmem.load(Ordering::Acquire) > limit {
@@ -215,8 +212,9 @@ impl UdpSock {
         Some(d)
     }
 
-    /// Wait for a datagram (Linux __skb_recv_udp): a pending error first,
-    /// None after SHUT_RD (recv returns 0), EAGAIN / signal per timeout
+    /// Wait for a datagram (Linux __skb_recv_udp): a pending error
+    /// first; non-blocking: EAGAIN; blocking after SHUT_RD: None (recv
+    /// returns 0); timeout EAGAIN; signals per `Sock::wait`
     fn recv_dgram(&self, flags: i32) -> Result<Option<Dgram>, KernelError> {
         let nb = flags & crate::net::msg::MSG_DONTWAIT != 0;
         let mut timeo = self.sk.rcv_timeo(nb);
@@ -226,6 +224,9 @@ impl UdpSock {
             }
             if let Some(d) = self.dequeue(flags & MSG_PEEK != 0) {
                 return Ok(Some(d));
+            }
+            if timeo == 0 {
+                return Err(KernelError::WouldBlock);
             }
             if self.sk.shutdown() & RCV_SHUTDOWN != 0 {
                 return Ok(None);

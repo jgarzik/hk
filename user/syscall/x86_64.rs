@@ -188,6 +188,8 @@ pub const SYS_GETPID: u64 = 39;
 pub const SYS_SOCKET: u64 = 41;
 pub const SYS_CONNECT: u64 = 42;
 pub const SYS_ACCEPT: u64 = 43;
+pub const SYS_ACCEPT4: u64 = 288;
+pub const SYS_FSTAT: u64 = 5;
 pub const SYS_SENDTO: u64 = 44;
 pub const SYS_RECVFROM: u64 = 45;
 pub const SYS_SENDMSG: u64 = 46;
@@ -1473,6 +1475,18 @@ pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
 #[inline(always)]
 pub fn sys_accept(fd: i32, addr: *mut u8, addrlen: *mut u32) -> i64 {
     unsafe { syscall3!(SYS_ACCEPT, fd, addr, addrlen) }
+}
+
+/// accept4(fd, addr, addrlen, flags)
+#[inline(always)]
+pub fn sys_accept4(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_ACCEPT4, fd, addr, addrlen, flags) }
+}
+
+/// fstat(fd, statbuf)
+#[inline(always)]
+pub fn sys_fstat(fd: i32, statbuf: *mut Stat) -> i64 {
+    unsafe { syscall2!(SYS_FSTAT, fd, statbuf) }
 }
 
 #[inline(always)]

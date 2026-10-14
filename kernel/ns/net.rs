@@ -67,7 +67,7 @@ pub struct NetNamespace {
 
     /// TCP listening sockets (local_port -> socket)
     /// Following Linux's inet_hashtables listening hash
-    tcp_listeners: RwLock<BTreeMap<u16, Arc<TcpSock>>>,
+    tcp_listeners: RwLock<BTreeMap<u16, Vec<Arc<TcpSock>>>>,
 
     /// UDP sockets by local port
     pub udp: UdpTable,
@@ -127,39 +127,75 @@ impl NetNamespace {
     // TCP connection management
     // ========================================================================
 
-    /// Register a TCP connection in this namespace
-    pub fn tcp_register(&self, tuple: TcpFourTuple, socket: Arc<TcpSock>) {
-        self.tcp_connections.write().insert(tuple, socket);
+    /// Register a TCP connection; false if the four-tuple is taken (an
+    /// existing connection is never replaced or shadowed: Linux
+    /// inet_ehash_insert / __inet_hash_connect uniqueness)
+    pub fn tcp_register(&self, tuple: TcpFourTuple, socket: Arc<TcpSock>) -> bool {
+        let mut t = self.tcp_connections.write();
+        if t.contains_key(&tuple) {
+            return false;
+        }
+        t.insert(tuple, socket);
+        true
     }
 
-    /// Unregister a TCP connection from this namespace
-    pub fn tcp_unregister(&self, tuple: &TcpFourTuple) {
-        self.tcp_connections.write().remove(tuple);
+    /// Unregister `socket`'s connection entry (only if it is the owner)
+    pub fn tcp_unregister(&self, tuple: &TcpFourTuple, socket: &TcpSock) {
+        let mut t = self.tcp_connections.write();
+        if t.get(tuple)
+            .is_some_and(|s| core::ptr::eq(Arc::as_ptr(s), socket))
+        {
+            t.remove(tuple);
+        }
     }
 
-    /// Look up a TCP connection in this namespace
+    /// Look up a TCP connection by its full four-tuple
     pub fn tcp_lookup(&self, tuple: &TcpFourTuple) -> Option<Arc<TcpSock>> {
         self.tcp_connections.read().get(tuple).cloned()
     }
 
-    /// Register a listening socket in this namespace
-    ///
-    /// Following Linux's inet_csk_listen_start() which adds to listening hash.
+    /// Register a listening socket (several per port: different
+    /// addresses, or a SO_REUSEPORT group)
     pub fn tcp_listen_register(&self, port: u16, socket: Arc<TcpSock>) {
-        self.tcp_listeners.write().insert(port, socket);
+        self.tcp_listeners
+            .write()
+            .entry(port)
+            .or_default()
+            .push(socket);
     }
 
-    /// Unregister a listening socket from this namespace
-    pub fn tcp_listen_unregister(&self, port: u16) {
-        self.tcp_listeners.write().remove(&port);
+    /// Unregister listening socket `socket` from `port`
+    pub fn tcp_listen_unregister(&self, port: u16, socket: &TcpSock) {
+        let mut t = self.tcp_listeners.write();
+        if let Some(v) = t.get_mut(&port) {
+            v.retain(|s| !core::ptr::eq(Arc::as_ptr(s), socket));
+            if v.is_empty() {
+                t.remove(&port);
+            }
+        }
     }
 
-    /// Look up a listening socket by port
-    ///
-    /// Following Linux's __inet_lookup_listener().
-    /// For now we just match by port; Linux also considers local address.
-    pub fn tcp_lookup_listener(&self, local_port: u16) -> Option<Arc<TcpSock>> {
-        self.tcp_listeners.read().get(&local_port).cloned()
+    /// Listener for a segment to `daddr:port` received on `dif` (Linux
+    /// __inet_lookup_listener: the bound address must match or be the
+    /// wildcard, exact matches win; a bound device must match)
+    pub fn tcp_lookup_listener(
+        &self,
+        daddr: Ipv4Addr,
+        port: u16,
+        dif: u32,
+    ) -> Option<Arc<TcpSock>> {
+        let t = self.tcp_listeners.read();
+        let v = t.get(&port)?;
+        let score = |s: &TcpSock| -> i32 {
+            let a = s.inet.get().rcv_saddr;
+            let dev = s.sk.bound_dev_if();
+            if (!a.is_unspecified() && a != daddr) || (dev != 0 && dev != dif) {
+                return -1;
+            }
+            (!a.is_unspecified()) as i32 * 2 + (dev != 0) as i32
+        };
+        let best = v.iter().map(|s| score(s)).max().filter(|&b| b >= 0)?;
+        v.iter().find(|s| score(s) == best).cloned()
     }
 
     // ========================================================================

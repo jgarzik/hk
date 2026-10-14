@@ -19,6 +19,8 @@ pub mod mmap;
 pub mod rlimit;
 pub mod namespace;
 pub mod sockets;
+pub mod sk;
+pub mod sockcore;
 pub mod futex;
 pub mod timerfd;
 pub mod posix_timer;
@@ -76,6 +78,7 @@ pub fn run_all_tests() {
     rlimit::run_tests();
     namespace::run_tests();
     sockets::run_tests();
+    sockcore::run_tests();
     futex::run_tests();
     timerfd::run_tests();
     posix_timer::run_tests();

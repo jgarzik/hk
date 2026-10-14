@@ -454,21 +454,25 @@ impl TcpSock {
         Ok(p)
     }
 
-    /// Register the connection four-tuple
-    fn hash(&self, t: TcpFourTuple) {
+    /// Register the connection four-tuple: EADDRNOTAVAIL if another
+    /// connection already uses it (Linux __inet_hash_connect)
+    fn hash(&self, t: TcpFourTuple) -> Result<(), KernelError> {
+        if !self.sk.net.tcp_register(t, self.arc()) {
+            return Err(KernelError::AddressNotAvailable);
+        }
         *self.tuple.lock() = Some(t);
-        self.sk.net.tcp_register(t, self.arc());
+        Ok(())
     }
 
     /// Leave every table (Linux tcp_done / inet_put_port)
     pub fn unhash(&self) {
         if let Some(t) = self.tuple.lock().take() {
-            self.sk.net.tcp_unregister(&t);
+            self.sk.net.tcp_unregister(&t, self);
         }
         let port = self.inet.get().sport;
         if self.sk.flag(sf::ACCEPTCONN) {
             self.sk.set_flag(sf::ACCEPTCONN, false);
-            self.sk.net.tcp_listen_unregister(port);
+            self.sk.net.tcp_listen_unregister(port, self);
         }
         if self.bound.swap(false, Ordering::AcqRel) {
             self.sk.net.tcp_bind.remove(self, port);
@@ -480,7 +484,7 @@ impl TcpSock {
     pub fn done(&self) {
         self.done.store(true, Ordering::Release);
         self.unhash();
-        self.sk.state_change();
+        self.sk.set_shutdown(SHUTDOWN_MASK);
     }
 
     /// Abort: RST to the peer (if synchronized), CLOSED, done
@@ -532,14 +536,20 @@ impl TcpSock {
             };
             self.get_port(saddr, 0, flow)?
         };
-        self.set_local(saddr, sport);
-        self.set_remote(daddr, dport);
-        self.hash(TcpFourTuple {
+        let t = TcpFourTuple {
             local_addr: saddr,
             local_port: sport,
             remote_addr: daddr,
             remote_port: dport,
-        });
+        };
+        if let Err(e) = self.hash(t) {
+            if a.sport == 0 {
+                self.unhash();
+            }
+            return Err(e);
+        }
+        self.set_local(saddr, sport);
+        self.set_remote(daddr, dport);
         self.tcp.set_state(TcpState::SynSent);
         let me = self.arc();
         if let Err(e) = crate::net::tcp_output::tcp_send_syn(&me) {
@@ -818,8 +828,11 @@ impl ProtoOps for TcpSock {
     /// Linux __inet_stream_connect
     fn connect(&self, a: &[u8], nonblock: bool) -> Result<(), KernelError> {
         if af_inet::sa_family(a)? == AF_UNSPEC {
+            // Linux tcp_disconnect: abort, back to an unconnected socket
             self.abort();
             self.done.store(false, Ordering::Release);
+            self.sk.clear_shutdown();
+            *self.inet.addr.lock() = Default::default();
             return Ok(());
         }
         match self.tcp.state() {
@@ -1087,10 +1100,11 @@ impl TcpSock {
     }
 }
 
-/// Register a connection in the socket's namespace (accepted children)
-pub fn tcp_register_connection(tuple: TcpFourTuple, socket: Arc<TcpSock>) {
-    socket.hash(tuple);
+/// Register an accepted child's connection; false if the four-tuple is
+/// already in use (the child is then dropped)
+pub fn tcp_register_connection(tuple: TcpFourTuple, socket: Arc<TcpSock>) -> bool {
     socket.bound.store(false, Ordering::Release);
+    socket.hash(tuple).is_ok()
 }
 
 /// Initiate a FIN close of a synchronized connection
