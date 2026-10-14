@@ -207,9 +207,19 @@ impl NetNamespace {
         self.arp_entries.lock().get(&ip.to_u32()).cloned()
     }
 
-    /// Insert an ARP entry in this namespace
-    pub fn arp_insert(&self, entry: ArpEntry) {
-        self.arp_entries.lock().insert(entry.ip.to_u32(), entry);
+    /// Update the entry for `entry.ip` (creating it only if `create`;
+    /// Linux neigh_update vs neigh_event_ns). Returns whether an entry
+    /// now holds the address.
+    pub fn arp_update(&self, entry: ArpEntry, create: bool) -> bool {
+        let mut t = self.arp_entries.lock();
+        match t.get_mut(&entry.ip.to_u32()) {
+            Some(e) => *e = entry,
+            None if create => {
+                t.insert(entry.ip.to_u32(), entry);
+            }
+            None => return false,
+        }
+        true
     }
 
     /// Insert an ARP entry unless one exists for its address

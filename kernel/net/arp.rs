@@ -110,6 +110,70 @@ impl ArpHdr {
     }
 }
 
+/// What to do with a received ARP packet (Linux arp_process with
+/// arp_accept=0, arp_ignore=0, route_localnet=0)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArpAction {
+    /// Ignore it (reason, for debugging)
+    Drop(&'static str),
+    /// Another host claims one of our addresses: log, ignore
+    Conflict,
+    /// Duplicate address probe (sender 0.0.0.0) for our address: reply,
+    /// learn nothing
+    ProbeReply,
+    /// Request for one of our addresses: create/update the sender's
+    /// entry, reply
+    Reply,
+    /// Anything else: update an existing entry for the sender only
+    Update,
+}
+
+/// Decide how to handle an ARP packet from `sip`/`sha` for `tip`
+/// received on a device with MAC `our_mac`. `addr_type` classifies
+/// addresses in the device's namespace. Entries are only *created* for
+/// requests addressed to us, so unsolicited replies and gratuitous ARP
+/// cannot poison the cache.
+pub fn classify(
+    op: u16,
+    sip: Ipv4Addr,
+    sha: &[u8; ETH_ALEN],
+    tip: Ipv4Addr,
+    our_mac: &[u8; ETH_ALEN],
+    addr_type: impl Fn(Ipv4Addr) -> RouteType,
+) -> ArpAction {
+    if op != ARPOP_REQUEST && op != ARPOP_REPLY {
+        return ArpAction::Drop("unknown op");
+    }
+    if tip.is_multicast() || tip.is_loopback() {
+        return ArpAction::Drop("bad target");
+    }
+    if sha[0] & 1 != 0 || sha.iter().all(|&b| b == 0) {
+        return ArpAction::Drop("multicast or zero sender MAC");
+    }
+    let tip_local = addr_type(tip) == RouteType::Local;
+    if sip.is_unspecified() {
+        return if op == ARPOP_REQUEST && tip_local {
+            ArpAction::ProbeReply
+        } else {
+            ArpAction::Drop("zero sender")
+        };
+    }
+    if sip.is_multicast() || sip.is_broadcast() || sip.is_loopback() || (sip.0 >> 24) == 0 {
+        return ArpAction::Drop("martian sender");
+    }
+    match addr_type(sip) {
+        RouteType::Local if sha != our_mac => return ArpAction::Conflict,
+        RouteType::Local => return ArpAction::Drop("own packet"),
+        RouteType::Broadcast => return ArpAction::Drop("broadcast sender"),
+        _ => {}
+    }
+    if op == ARPOP_REQUEST && tip_local {
+        ArpAction::Reply
+    } else {
+        ArpAction::Update
+    }
+}
+
 /// Receive an ARP packet (EtherType 0x0806 handler; thread context)
 ///
 /// Uses the receiving device's namespace.
@@ -117,70 +181,76 @@ pub fn arp_rcv(skb: SkBuff) {
     if skb.len() < ARP_HLEN {
         return;
     }
-
-    // Parse ARP header
-    let hdr = unsafe { &*(skb.data().as_ptr() as *const ArpHdr) };
-
-    // Validate hardware/protocol types
+    let hdr = unsafe { core::ptr::read_unaligned(skb.data().as_ptr() as *const ArpHdr) };
     if hdr.hardware_type() != ARPHRD_ETHER || hdr.protocol_type() != 0x0800 {
         return;
     }
     if hdr.ar_hln != 6 || hdr.ar_pln != 4 {
         return;
     }
-
-    let sender_ip = hdr.sender_ip();
-    let sender_mac = hdr.ar_sha;
-    let target_ip = hdr.target_ip();
-    let op = hdr.operation();
-
-    let Some(ns) = skb.net() else {
+    let (Some(ns), Some(dev)) = (skb.net(), skb.dev.as_ref()) else {
         return;
     };
-    let now = crate::time::current_ticks();
-
-    let Some(dev) = skb.dev.as_ref() else {
-        return;
-    };
-
-    // Update cache with sender's info (learning)
-    ns.arp_insert(ArpEntry {
-        ip: sender_ip,
-        mac: sender_mac,
-        state: ArpState::Reachable,
-        expires: now + ARP_TIMEOUT,
-        retries: 0,
-        ifindex: dev.ifindex(),
+    let (sip, sha, tip) = (hdr.sender_ip(), hdr.ar_sha, hdr.target_ip());
+    let act = classify(hdr.operation(), sip, &sha, tip, &dev.mac(), |a| {
+        ns.fib.addr_type(a)
     });
-
-    // If we have pending packets for this IP, send them
-    let pending = ns.arp_take_pending(sender_ip);
-    for packet in pending {
-        let _ = ipv4::ip_finish_output(packet.skb, sender_mac);
-    }
-
-    match op {
-        ARPOP_REQUEST => {
-            // Answer for any local address (Linux arp_ignore=0)
-            if ns.fib.addr_type(target_ip) == RouteType::Local {
-                send_arp_reply(dev, target_ip, sender_ip, &sender_mac);
-            }
+    match act {
+        ArpAction::Drop(_) => {}
+        ArpAction::Conflict => conflict(sip, &sha),
+        ArpAction::ProbeReply => send_arp_reply(dev, tip, sip, &sha),
+        ArpAction::Reply => {
+            learn(&ns, sip, &sha, dev.ifindex(), true);
+            send_arp_reply(dev, tip, sip, &sha);
         }
-        ARPOP_REPLY => {
-            // Already handled by cache update above
-            crate::printkln!(
-                "arp: reply from {} ({:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
-                sender_ip,
-                sender_mac[0],
-                sender_mac[1],
-                sender_mac[2],
-                sender_mac[3],
-                sender_mac[4],
-                sender_mac[5]
-            );
-        }
-        _ => {}
+        ArpAction::Update => learn(&ns, sip, &sha, dev.ifindex(), false),
     }
+}
+
+/// Record `sip` at `sha` (`create`: even without an existing entry),
+/// then transmit the packets that were waiting for it
+fn learn(
+    ns: &crate::net::NetNamespace,
+    sip: Ipv4Addr,
+    sha: &[u8; ETH_ALEN],
+    ifindex: u32,
+    create: bool,
+) {
+    let entry = ArpEntry {
+        ip: sip,
+        mac: *sha,
+        state: ArpState::Reachable,
+        expires: crate::time::current_ticks() + ARP_TIMEOUT,
+        retries: 0,
+        ifindex,
+    };
+    if !ns.arp_update(entry, create) {
+        return;
+    }
+    for packet in ns.arp_take_pending(sip) {
+        let _ = ipv4::ip_finish_output(packet.skb, *sha);
+    }
+}
+
+/// Log a host claiming one of our addresses (rate limited)
+fn conflict(sip: Ipv4Addr, sha: &[u8; ETH_ALEN]) {
+    static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let now = crate::time::current_ticks();
+    let last = LAST.load(core::sync::atomic::Ordering::Relaxed);
+    if last != 0 && now.wrapping_sub(last) < 500 {
+        return;
+    }
+    LAST.store(now, core::sync::atomic::Ordering::Relaxed);
+    crate::printkln!(
+        "arp: {} claimed by {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, ignored",
+        sip,
+        sha[0],
+        sha[1],
+        sha[2],
+        sha[3],
+        sha[4],
+        sha[5]
+    );
 }
 
 /// Resolve an IP address to MAC address
@@ -302,4 +372,92 @@ fn send_arp_reply(
 
     // Transmit
     let _ = dev.xmit(skb);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OUR: [u8; 6] = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+    const PEER: [u8; 6] = [0x52, 0x55, 0x0a, 0, 2, 2];
+
+    fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
+        Ipv4Addr::new(a, b, c, d)
+    }
+
+    fn atype(a: Ipv4Addr) -> RouteType {
+        if a == ip(10, 0, 2, 15) {
+            RouteType::Local
+        } else if a == ip(10, 0, 2, 255) {
+            RouteType::Broadcast
+        } else {
+            RouteType::Unicast
+        }
+    }
+
+    fn c(op: u16, sip: Ipv4Addr, sha: [u8; 6], tip: Ipv4Addr) -> ArpAction {
+        classify(op, sip, &sha, tip, &OUR, atype)
+    }
+
+    #[test]
+    fn creates_only_for_requests_to_us() {
+        let (gw, me) = (ip(10, 0, 2, 2), ip(10, 0, 2, 15));
+        assert_eq!(c(ARPOP_REQUEST, gw, PEER, me), ArpAction::Reply);
+        // Unsolicited reply / gratuitous ARP / request for someone else:
+        // update only
+        assert_eq!(c(ARPOP_REPLY, gw, PEER, me), ArpAction::Update);
+        assert_eq!(c(ARPOP_REQUEST, gw, PEER, gw), ArpAction::Update);
+        assert_eq!(
+            c(ARPOP_REQUEST, gw, PEER, ip(10, 0, 2, 3)),
+            ArpAction::Update
+        );
+    }
+
+    #[test]
+    fn spoofing_and_martians() {
+        let me = ip(10, 0, 2, 15);
+        assert_eq!(c(ARPOP_REPLY, me, PEER, me), ArpAction::Conflict);
+        assert!(matches!(c(ARPOP_REPLY, me, OUR, me), ArpAction::Drop(_)));
+        for bad in [
+            ip(255, 255, 255, 255),
+            ip(224, 0, 0, 1),
+            ip(127, 0, 0, 1),
+            ip(0, 1, 2, 3),
+            ip(10, 0, 2, 255),
+        ] {
+            assert!(
+                matches!(c(ARPOP_REQUEST, bad, PEER, me), ArpAction::Drop(_)),
+                "{bad}"
+            );
+        }
+        assert!(matches!(
+            c(ARPOP_REQUEST, ip(10, 0, 2, 2), PEER, ip(127, 0, 0, 1)),
+            ArpAction::Drop(_)
+        ));
+        assert!(matches!(
+            c(ARPOP_REQUEST, ip(10, 0, 2, 2), [0xff; 6], me),
+            ArpAction::Drop(_)
+        ));
+        assert!(matches!(
+            c(ARPOP_REQUEST, ip(10, 0, 2, 2), [0; 6], me),
+            ArpAction::Drop(_)
+        ));
+        assert!(matches!(
+            c(3, ip(10, 0, 2, 2), PEER, me),
+            ArpAction::Drop(_)
+        ));
+    }
+
+    #[test]
+    fn duplicate_address_probe() {
+        let me = ip(10, 0, 2, 15);
+        assert_eq!(
+            c(ARPOP_REQUEST, ip(0, 0, 0, 0), PEER, me),
+            ArpAction::ProbeReply
+        );
+        assert!(matches!(
+            c(ARPOP_REQUEST, ip(0, 0, 0, 0), PEER, ip(10, 0, 2, 9)),
+            ArpAction::Drop(_)
+        ));
+    }
 }
