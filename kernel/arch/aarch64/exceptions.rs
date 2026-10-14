@@ -54,6 +54,22 @@ extern "C" fn handle_el1_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             unsafe {
                 asm!("mrs {}, far_el1", out(reg) far, options(nostack, nomem));
             }
+
+            // Kernel write to a COW-marked user page (e.g. put_user() of
+            // CLONE_PARENT_SETTID right after fork made the parent's pages
+            // COW): resolve the COW like a user fault, as x86 does.
+            let dfsc = iss & 0x3F;
+            let is_write = (iss & (1 << 6)) != 0;
+            let is_permission_fault = (0x0C..=0x0F).contains(&dfsc);
+            let is_user_addr = far >> 48 == 0; // TTBR0 (user) range
+            if is_user_addr
+                && is_permission_fault
+                && is_write
+                && let Some(true) = handle_cow_fault(far)
+            {
+                return;
+            }
+
             panic!(
                 "Kernel data abort at ELR={:#x}, FAR={:#x}, ISS={:#x}",
                 frame.elr, far, iss
