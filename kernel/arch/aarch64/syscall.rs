@@ -296,7 +296,7 @@ pub const SYS_RT_SIGTIMEDWAIT: u64 = 137;
 #[allow(dead_code)] // Infrastructure for future signal delivery
 pub const SYS_RT_SIGRETURN: u64 = 139;
 /// rt_sigqueueinfo(pid, sig, uinfo)
-pub const SYS_RT_SIGQUEUEINFO: u64 = 128;
+pub const SYS_RT_SIGQUEUEINFO: u64 = 138;
 /// rt_sigsuspend(mask, sigsetsize)
 pub const SYS_RT_SIGSUSPEND: u64 = 133;
 /// rt_tgsigqueueinfo(tgid, tid, sig, uinfo)
