@@ -1469,24 +1469,36 @@ locks to avoid deadlock with the request queue.
 
 #### Network Subsystem
 
-**Location:** `kernel/net/`
+**Location:** `kernel/net/`, `kernel/ns/net.rs`
+
+> **Status (2026-10): being redesigned** by the network-stack chunk (NAPI-style
+> per-CPU `softnet` kthreads; all protocol work in thread context; per-socket
+> lock; per-netns table RwLocks). This section MUST be updated in the same
+> commit as each network locking change. The table below describes the code as
+> it exists before that work.
 
 | Lock | Type | Purpose |
 |------|------|---------|
 | `Socket.local_addr` | `Mutex` | Per-socket local address |
 | `Socket.remote_addr` | `Mutex` | Per-socket remote address |
-| `Socket.rx_buffer` | `Mutex` | Receive buffer |
+| `Socket.rx_buffer` | `Mutex` | Receive buffer (stream) |
 | `Socket.dgram_rx_queue` | `Mutex` | Datagram queue |
-| `TcpConnection.retransmit_queue` | `Mutex` | TCP retransmit queue |
+| `TcpSock.retransmit_queue` | `Mutex` | TCP retransmit queue (never retransmitted yet) |
 | `E1000Driver.tx_*` | `Mutex` | TX ring management |
+| `NetNamespace` tables (routes, ARP, sockets) | `RwLock`/`Mutex` | Per-netns state |
 
 **Socket Lock Ordering:** When acquiring multiple socket locks, acquire in this order:
 1. `local_addr`
 2. `remote_addr`
 3. `rx_buffer` / `dgram_rx_queue`
 
-**TCP State:** Uses atomics (`AtomicU8` for state, `AtomicU32` for sequence numbers)
-for lock-free access from packet receive path.
+**TCP State:** Uses atomics (`AtomicU8` for state, `AtomicU32` for sequence numbers).
+
+**Current reality (pre-redesign):** no driver receives packets and no network
+code runs in IRQ context: the e1000 driver registers no IRQ handler, and
+loopback delivery is a synchronous call from the sender's syscall context
+(`ip_queue_xmit` shortcut). None of these locks is IRQ-safe, so no network
+lock may ever be taken from an interrupt handler.
 
 #### Key Device Driver Rules
 
@@ -1819,7 +1831,7 @@ Features present in Linux but not yet implemented in hk:
 |---------|-------|-----|--------|
 | `spin_lock_bh()` | Disables softirqs | N/A | No softirqs in hk |
 | Softirqs/Tasklets | Deferred interrupt work | Not implemented | ISRs must be minimal |
-| NAPI | Network interrupt mitigation | Not implemented | Higher network IRQ overhead |
+| NAPI | Network interrupt mitigation | Not implemented (planned: softnet kthreads) | No network RX path yet |
 | Threaded IRQs | IRQ handlers in thread context | Not implemented | All IRQs run in interrupt context |
 | lockdep | Runtime deadlock detection | Not implemented | Manual ordering verification |
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
@@ -1830,8 +1842,9 @@ Features present in Linux but not yet implemented in hk:
 1. **No softirqs**: Device drivers cannot defer work to bottom-half context. All
    deferred work must use workqueues or be handled synchronously.
 
-2. **No NAPI**: Network drivers process each packet in ISR context. High packet
-   rates may cause increased interrupt load.
+2. **No NAPI (yet)**: Planned design: driver ISRs only ack/mask and schedule a
+   per-CPU `softnet` kthread that polls the device; protocol processing never
+   runs in interrupt context.
 
 3. **No lockdep**: Lock ordering must be verified manually via code review.
    Consider adding compile-time lock ordering enforcement in the future.
