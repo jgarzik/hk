@@ -226,10 +226,12 @@ pub fn setup_rt_frame(sig: u32, action: &SigAction, blocked: SigSet) -> Result<(
         return Err(-22); // EINVAL
     };
 
-    // Calculate frame size and location on user stack
-    // Frame must be 16-byte aligned (x86-64 ABI requirement)
+    // Calculate frame size and location on user stack (Linux get_sigframe):
+    // skip the 128-byte red zone, then place the frame so the handler starts
+    // as if called: RSP + 8 is 16-byte aligned (pretcode is its "return
+    // address")
     let frame_size = signal_frame_size();
-    let frame_addr = (user_rsp - frame_size as u64) & !0xF;
+    let frame_addr = ((user_rsp - 128 - frame_size as u64) & !0xF) - 8;
 
     // Validate user stack address
     if !Uaccess::access_ok(frame_addr, frame_size) {
