@@ -254,15 +254,6 @@ impl WaitQueue {
         result
     }
 
-    /// Legacy unconditional wait (sleep at most one tick); remaining users:
-    /// network sockets until the socket core moves to `wait_event*`
-    pub fn wait(&self) {
-        let mut w = WaitEntry::new();
-        self.prepare_to_wait(&mut w, SleepState::Uninterruptible);
-        schedule_timeout(1);
-        self.finish_wait(&w);
-    }
-
     /// Collect up to `nr` waiters to wake (`usize::MAX` = all)
     fn take_waiters(&self, nr: usize) -> Vec<(Tid, u32)> {
         let mut head = self.head.lock();

@@ -1,1509 +1,377 @@
-//! Socket System Call Handlers
+//! Socket system calls (Linux net/socket.c)
 //!
-//! This module implements the socket-related system calls for the network stack.
+//! Thin entry points: resolve the descriptor (EBADF / ENOTSOCK), copy
+//! arguments in with uaccess, call the protocol, copy results out. The
+//! file's O_NONBLOCK is read at every call.
 
-use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::sync::Weak;
+use alloc::vec::Vec;
 
+use crate::arch::Uaccess;
 use crate::error::KernelError;
-use crate::fs::dentry::Dentry;
-use crate::fs::file::{File, FileOps, flags as file_flags};
-use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec};
-use crate::net::ipv4::Ipv4Addr;
-use crate::net::netlink;
-use crate::net::socket::{AddressFamily, SockAddrIn, Socket, SocketType, sock_flags};
-use crate::net::socket_file::SocketFileOps;
-use crate::net::tcp::{self, TcpState};
-use crate::net::udp;
-use crate::task::fdtable::get_task_fd;
-use crate::task::percpu::current_tid;
-use crate::uaccess::{copy_from_user, copy_to_user, get_user, put_user};
+use crate::fs::file::File;
+use crate::net::msg::{
+    self, Dst, Iov, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_WAITFORONE, MsgHdr, RecvMsg,
+    SendMsg, Src, addr_in, addr_out,
+};
+use crate::net::socket::{
+    OptIn, ProtoOps, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_TYPE_MASK, SOL_SOCKET, file_nb, put_opt,
+    sock_alloc_file, sock_create, sock_getsockopt, sock_of, sock_sendmsg, sock_setsockopt,
+};
+use crate::uaccess::{copy_to_user, get_user, put_user};
 
-// Architecture-specific uaccess implementation
-#[cfg(target_arch = "aarch64")]
-use crate::arch::aarch64::uaccess::Aarch64Uaccess as Uaccess;
-#[cfg(target_arch = "x86_64")]
-use crate::arch::x86_64::uaccess::X86_64Uaccess as Uaccess;
+fn ret(r: Result<i64, KernelError>) -> i64 {
+    r.unwrap_or_else(|e| e.sysret())
+}
 
-/// Get RLIMIT_NOFILE limit for fd allocation
-#[inline]
-fn get_nofile_limit() -> u64 {
-    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
-    if limit == crate::rlimit::RLIM_INFINITY {
+/// The socket behind `fd`: EBADF, or ENOTSOCK for other files
+fn sockfd(fd: i32) -> Result<(Arc<File>, Arc<dyn ProtoOps>), KernelError> {
+    let table = crate::task::fdtable::get_task_fd(crate::task::percpu::current_tid())
+        .ok_or(KernelError::BadFd)?;
+    let file = table.lock().get(fd).ok_or(KernelError::BadFd)?;
+    let s = sock_of(&file).ok_or(KernelError::NotSocket)?;
+    Ok((file, s))
+}
+
+fn nofile() -> u64 {
+    let l = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NOFILE);
+    if l == crate::rlimit::RLIM_INFINITY {
         u64::MAX
     } else {
-        limit
+        l
     }
 }
 
-/// Create a dummy dentry for sockets
-///
-/// Sockets don't have a real filesystem entry, but our File struct
-/// requires a dentry. This creates a minimal anonymous dentry.
-fn create_socket_dentry() -> Result<Arc<Dentry>, i64> {
-    // Create anonymous inode for socket
-    let mode = InodeMode::socket(0o600);
-    let inode = Arc::new(Inode::new(
-        0, // ino=0 for anonymous
-        mode,
-        0,                      // uid (root)
-        0,                      // gid (root)
-        0,                      // size
-        Timespec::from_secs(0), // mtime
-        Weak::new(),            // no superblock for anonymous inode
-        &NULL_INODE_OPS,
-    ));
-
-    // Create anonymous dentry
-    let dentry = Arc::new(Dentry::new_anonymous(String::from("socket"), Some(inode)));
-
-    Ok(dentry)
-}
-
-/// socket(domain, type, protocol) - create a socket
-pub fn sys_socket(domain: i32, sock_type: i32, protocol: i32) -> i64 {
-    if sock_type & !(0xFF | sock_flags::SOCK_NONBLOCK | sock_flags::SOCK_CLOEXEC) != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-    if domain == netlink::AF_NETLINK {
-        return netlink::sys::socket(sock_type & 0xFF, protocol, sock_file_flags(sock_type));
-    }
-
-    // Parse address family
-    let family = match AddressFamily::from_i32(domain) {
-        Some(AddressFamily::Inet) => AddressFamily::Inet,
-        Some(_) | None => return KernelError::AddressFamilyNotSupported.sysret(),
-    };
-
-    // Extract type and flags
-    let type_only = sock_type & 0xFF;
-    let nonblock = sock_type & sock_flags::SOCK_NONBLOCK != 0;
-
-    // Parse socket type
-    let stype = match SocketType::from_i32(type_only) {
-        Some(SocketType::Stream) => SocketType::Stream,
-        Some(SocketType::Dgram) => SocketType::Dgram,
-        Some(SocketType::Raw) => return KernelError::SocketTypeNotSupported.sysret(),
-        None => return KernelError::SocketTypeNotSupported.sysret(),
-    };
-
-    // Protocol: 0 means default for type
-    // 6 = IPPROTO_TCP, 17 = IPPROTO_UDP
-    if protocol != 0 {
-        match (stype, protocol) {
-            (SocketType::Stream, 6) => {} // TCP
-            (SocketType::Dgram, 17) => {} // UDP
-            (SocketType::Stream, _) => return KernelError::ProtocolNotSupported.sysret(),
-            (SocketType::Dgram, _) => return KernelError::ProtocolNotSupported.sysret(),
-            _ => return KernelError::ProtocolNotSupported.sysret(),
-        }
-    }
-
-    // Create socket
-    let socket = Socket::new(family, stype, protocol);
-
-    // Apply flags
-    if nonblock {
-        socket.set_nonblocking(true);
-    }
-
-    // File operations (leaked for 'static lifetime like pipe.rs; P4
-    // gives sockets real sockfs inodes)
-    let ops: &'static dyn FileOps = Box::leak(Box::new(SocketFileOps::new(socket)));
-    install_file(ops, sock_file_flags(sock_type))
-}
-
-/// File status flags for a socket(2) type argument
-fn sock_file_flags(sock_type: i32) -> u32 {
-    let mut flags = file_flags::O_RDWR;
-    if sock_type & sock_flags::SOCK_NONBLOCK != 0 {
-        flags |= file_flags::O_NONBLOCK;
-    }
-    if sock_type & sock_flags::SOCK_CLOEXEC != 0 {
-        flags |= file_flags::O_CLOEXEC;
-    }
-    flags
-}
-
-/// Install a socket file with `ops` in the lowest free fd
-pub(crate) fn install_file(ops: &'static dyn FileOps, flags: u32) -> i64 {
-    let dentry = match create_socket_dentry() {
-        Ok(d) => d,
-        Err(_) => return KernelError::OutOfMemory.sysret(),
-    };
-    let file = Arc::new(File::new(dentry, flags, ops));
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::OutOfMemory.sysret(),
-    };
-    match fd_table.lock().alloc(file, get_nofile_limit()) {
-        Ok(fd) => fd as i64,
-        Err(_) => KernelError::ProcessFileLimit.sysret(),
-    }
-}
-
-/// connect(fd, addr, addrlen) - connect to remote address
-pub fn sys_connect(fd: i32, addr: u64, addrlen: u64) -> i64 {
-    if let Some((_, nl)) = nl_sock(fd) {
-        return netlink::sys::connect(&nl, addr, addrlen);
-    }
-    if addrlen < core::mem::size_of::<SockAddrIn>() as u64 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Get socket from fd
-    let socket = match get_socket(fd) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    // Read sockaddr_in from user
-    let sockaddr = match read_sockaddr_in(addr) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    // Verify address family
-    if sockaddr.sin_family != AddressFamily::Inet as u16 {
-        return KernelError::AddressFamilyNotSupported.sysret();
-    }
-
-    let remote_addr = sockaddr.addr();
-    let remote_port = sockaddr.port();
-
-    // Check TCP state
-    if let Some(ref tcp) = socket.tcp {
-        match tcp.state() {
-            TcpState::Established => return KernelError::AlreadyConnected.sysret(),
-            TcpState::SynSent | TcpState::SynReceived if socket.is_nonblocking() => {
-                return KernelError::AlreadyInProgress.sysret();
-            }
-            _ => {}
-        }
-    }
-
-    // Initiate connection
-    let r = tcp::tcp_connect(&socket, remote_addr, remote_port);
-    crate::net::dev::netif_rx_flush_local();
-    if let Err(e) = r {
-        return e.sysret();
-    }
-
-    // Non-blocking: return EINPROGRESS
-    if socket.is_nonblocking() {
-        return KernelError::InProgress.sysret();
-    }
-
-    // Blocking: wait for connection
-    loop {
-        if let Some(ref tcp) = socket.tcp {
-            match tcp.state() {
-                TcpState::Established => return 0,
-                TcpState::Closed => {
-                    let err = socket.get_error();
-                    if err != 0 {
-                        return err as i64;
-                    }
-                    return KernelError::NotConnected.sysret();
-                }
-                _ => {}
-            }
-        }
-        socket.connect_wait().wait();
-    }
-}
-
-/// bind(fd, addr, addrlen) - bind to local address
-pub fn sys_bind(fd: i32, addr: u64, addrlen: u64) -> i64 {
-    if let Some((_, nl)) = nl_sock(fd) {
-        return netlink::sys::bind(&nl, addr, addrlen);
-    }
-    if addrlen < core::mem::size_of::<SockAddrIn>() as u64 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    let socket = match get_socket(fd) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    let sockaddr = match read_sockaddr_in(addr) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    if sockaddr.sin_family != AddressFamily::Inet as u16 {
-        return KernelError::AddressFamilyNotSupported.sysret();
-    }
-
-    let local_addr = sockaddr.addr();
-    let mut local_port = sockaddr.port();
-
-    // Allocate ephemeral port if port is 0
-    if local_port == 0 {
-        local_port = socket.net.alloc_port();
-    }
-
-    socket.set_local(local_addr, local_port);
-
-    // For UDP sockets, register in the UDP socket table
-    if socket.sock_type == SocketType::Dgram {
-        let tuple = udp::UdpTwoTuple {
-            local_addr,
-            local_port,
-        };
-        udp::udp_register_socket(tuple, Arc::clone(&socket));
-    }
-
-    0
-}
-
-/// listen(fd, backlog) - start listening for connections
-///
-/// Following Linux's inet_listen() -> inet_csk_listen_start():
-/// 1. Check socket is bound
-/// 2. Initialize accept queue with backlog
-/// 3. Set TCP state to Listen
-/// 4. Register in listener hash table
-pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
-    if let Some((_, nl)) = nl_sock(fd) {
-        return {
-            let _ = nl;
-            KernelError::OperationNotSupported.sysret()
-        };
-    }
-    let socket = match get_socket(fd) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    // Must be TCP socket
-    let tcp = match socket.tcp.as_ref() {
-        Some(t) => t,
-        None => return KernelError::OperationNotSupported.sysret(),
-    };
-
-    // Must be bound (have local address)
-    if socket.local_addr().is_none() {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Can only listen from Closed state
-    if tcp.state() != TcpState::Closed {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Initialize accept queue with backlog (like inet_csk_listen_start)
-    // Linux clamps backlog to somaxconn, we use a simpler approach
-    let backlog = (backlog as u32).clamp(1, 128);
-    socket.init_accept_queue(backlog);
-
-    // Set TCP state to Listen
-    tcp.set_state(TcpState::Listen);
-
-    // Register in listener hash table (like inet_csk_listen_start)
-    let (_, local_port) = socket.local_addr().unwrap();
-    socket
-        .net
-        .tcp_listen_register(local_port, Arc::clone(&socket));
-
-    0
-}
-
-/// accept(fd, addr, addrlen) - accept incoming connection
-///
-/// Following Linux's inet_accept() -> inet_csk_accept():
-/// 1. Check socket is listening
-/// 2. Wait for connection in accept queue (or return EAGAIN if non-blocking)
-/// 3. Dequeue child socket
-/// 4. Create new fd for child socket
-/// 5. Copy peer address to user if requested
-pub fn sys_accept(fd: i32, addr: u64, addrlen: u64) -> i64 {
-    if let Some((_, nl)) = nl_sock(fd) {
-        return {
-            let _ = nl;
-            KernelError::OperationNotSupported.sysret()
-        };
-    }
-    let socket = match get_socket(fd) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    // Must be TCP socket
-    let tcp = match socket.tcp.as_ref() {
-        Some(t) => t,
-        None => return KernelError::OperationNotSupported.sysret(),
-    };
-
-    // Must be in Listen state
-    if tcp.state() != TcpState::Listen {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Get accept queue
-    loop {
-        // Try to get a connection from accept queue
-        {
-            let accept_queue_guard = socket.accept_queue.lock();
-            let accept_queue = match accept_queue_guard.as_ref() {
-                Some(q) => q,
-                None => return KernelError::InvalidArgument.sysret(),
-            };
-
-            if let Some(child) = accept_queue.accept_queue_remove() {
-                // Got a connection - create fd for it
-                drop(accept_queue_guard);
-
-                // Create file descriptor for child socket
-                let child_fd = match create_socket_fd(child.clone()) {
-                    Ok(fd) => fd,
-                    Err(e) => return e,
-                };
-
-                // Write peer address if requested
-                if addr != 0
-                    && addrlen != 0
-                    && let Some((remote_addr, remote_port)) = child.remote_addr()
-                {
-                    // The fd is installed: like Linux, a fault writing the
-                    // address does not undo the accept
-                    let sockaddr = SockAddrIn::new(remote_addr, remote_port);
-                    let _ = write_sockaddr_in(addr, addrlen, &sockaddr);
-                }
-
-                return child_fd;
-            }
-        }
-
-        // Queue is empty
-        if socket.is_nonblocking() {
-            return KernelError::WouldBlock.sysret();
-        }
-
-        // Block waiting for connection
-        // Use socket's accept_wait_block() which doesn't hold the accept_queue lock
-        socket.accept_wait_block();
-    }
-}
-
-/// Create a file descriptor for a socket
-fn create_socket_fd(socket: Arc<Socket>) -> Result<i64, i64> {
-    // Create socket file operations (leaked for 'static lifetime like in sys_socket)
-    let ops: &'static dyn crate::fs::file::FileOps =
-        Box::leak(Box::new(SocketFileOps::new(socket)));
-
-    // Create dummy dentry for socket
-    let dentry = create_socket_dentry()?;
-
-    // Create file
-    let file = Arc::new(File::new(dentry, file_flags::O_RDWR, ops));
-
-    // Allocate fd
-    let fd_table = get_task_fd(current_tid()).ok_or(KernelError::BadFd.sysret())?;
-    let fd = fd_table
+/// Install `file` in a new descriptor (EMFILE at the limit)
+fn fd_install(file: Arc<File>, cloexec: bool) -> Result<i64, KernelError> {
+    let table = crate::task::fdtable::get_task_fd(crate::task::percpu::current_tid())
+        .ok_or(KernelError::BadFd)?;
+    let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
+    let fd = table
         .lock()
-        .alloc(file, get_nofile_limit())
-        .map_err(|_| KernelError::ProcessFileLimit.sysret())?;
-
+        .alloc_with_flags(file, fl, nofile())
+        .map_err(|_| KernelError::ProcessFileLimit)?;
     Ok(fd as i64)
 }
 
-/// accept4(fd, addr, addrlen, flags) - accept with flags
-pub fn sys_accept4(fd: i32, addr: u64, addrlen: u64, _flags: i32) -> i64 {
-    sys_accept(fd, addr, addrlen)
+/// SOCK_NONBLOCK / SOCK_CLOEXEC of a type or accept4 flags argument
+fn type_flags(f: i32) -> Result<(bool, bool), KernelError> {
+    if f & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok((f & SOCK_NONBLOCK != 0, f & SOCK_CLOEXEC != 0))
 }
 
-/// socketpair(domain, type, protocol, sv) - create pair of connected sockets
-///
-/// For AF_INET, creates two UDP sockets connected to each other.
-pub fn sys_socketpair(domain: i32, sock_type: i32, protocol: i32, sv: u64) -> i64 {
-    if sv == 0 {
-        return KernelError::BadAddress.sysret();
+/// socket(domain, type, protocol)
+pub fn sys_socket(domain: i32, stype: i32, protocol: i32) -> i64 {
+    ret((|| {
+        let (nb, cloexec) = type_flags(stype & !SOCK_TYPE_MASK)?;
+        let s = sock_create(domain, stype & SOCK_TYPE_MASK, protocol)?;
+        fd_install(sock_alloc_file(s, nb), cloexec)
+    })())
+}
+
+/// socketpair(domain, type, protocol, sv): families without pairs
+/// (AF_INET, AF_NETLINK) are EOPNOTSUPP after validating the arguments
+/// (Linux sock_no_socketpair; `sv` is checked first: EFAULT); AF_UNIX
+/// comes with P8
+pub fn sys_socketpair(domain: i32, stype: i32, protocol: i32, sv: u64) -> i64 {
+    ret((|| {
+        type_flags(stype & !SOCK_TYPE_MASK)?;
+        let cur = get_user::<Uaccess, [i32; 2]>(sv).map_err(|_| KernelError::BadAddress)?;
+        put_user::<Uaccess, [i32; 2]>(sv, cur).map_err(|_| KernelError::BadAddress)?;
+        let a = sock_create(domain, stype & SOCK_TYPE_MASK, protocol)?;
+        a.release();
+        Err(KernelError::OperationNotSupported)
+    })())
+}
+
+/// The address argument as bytes (empty when none)
+fn addr_arg(addr: u64, len: u64) -> Result<Vec<u8>, KernelError> {
+    if len > i32::MAX as u64 {
+        return Err(KernelError::InvalidArgument);
     }
+    Ok(addr_in(addr, len)?.unwrap_or_default())
+}
 
-    // Only support AF_INET for now
-    let family = match AddressFamily::from_i32(domain) {
-        Some(AddressFamily::Inet) => AddressFamily::Inet,
-        Some(AddressFamily::Unix) => return KernelError::AddressFamilyNotSupported.sysret(), // AF_UNIX not implemented
-        _ => return KernelError::AddressFamilyNotSupported.sysret(),
-    };
+/// bind(fd, addr, addrlen)
+pub fn sys_bind(fd: i32, addr: u64, len: u64) -> i64 {
+    ret((|| {
+        let (_, s) = sockfd(fd)?;
+        s.bind(&addr_arg(addr, len)?)?;
+        Ok(0)
+    })())
+}
 
-    // Extract type and flags
-    let type_only = sock_type & 0xFF;
-    let nonblock = sock_type & sock_flags::SOCK_NONBLOCK != 0;
-    let cloexec = sock_type & sock_flags::SOCK_CLOEXEC != 0;
+/// connect(fd, addr, addrlen)
+pub fn sys_connect(fd: i32, addr: u64, len: u64) -> i64 {
+    ret((|| {
+        let (file, s) = sockfd(fd)?;
+        let a = addr_arg(addr, len)?;
+        let nb = file_nb(&file, 0) & MSG_DONTWAIT != 0;
+        let r = s.connect(&a, nb);
+        crate::net::dev::netif_rx_flush_local();
+        r?;
+        Ok(0)
+    })())
+}
 
-    // Parse socket type - only SOCK_DGRAM makes sense for socketpair with AF_INET
-    let stype = match SocketType::from_i32(type_only) {
-        Some(SocketType::Dgram) => SocketType::Dgram,
-        Some(SocketType::Stream) => return KernelError::OperationNotSupported.sysret(), // TCP socketpair needs more work
-        _ => return KernelError::SocketTypeNotSupported.sysret(),
-    };
+/// listen(fd, backlog)
+pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
+    ret((|| {
+        let (_, s) = sockfd(fd)?;
+        s.listen(backlog)?;
+        Ok(0)
+    })())
+}
 
-    // Validate protocol
-    if protocol != 0 && protocol != 17 {
-        // 17 = IPPROTO_UDP
-        return KernelError::ProtocolNotSupported.sysret();
-    }
+/// accept(fd, addr, addrlen)
+pub fn sys_accept(fd: i32, addr: u64, lenp: u64) -> i64 {
+    sys_accept4(fd, addr, lenp, 0)
+}
 
-    // Create two sockets
-    let socket1 = Socket::new(family, stype, protocol);
-    let socket2 = Socket::new(family, stype, protocol);
-
-    if nonblock {
-        socket1.set_nonblocking(true);
-        socket2.set_nonblocking(true);
-    }
-
-    // Get local address (use loopback 127.0.0.1)
-    let local_addr = Ipv4Addr::new(127, 0, 0, 1);
-
-    // Allocate ports
-    let port1 = socket1.net.alloc_port();
-    let port2 = socket1.net.alloc_port();
-
-    // Bind sockets
-    socket1.set_local(local_addr, port1);
-    socket1.set_remote(local_addr, port2);
-    socket2.set_local(local_addr, port2);
-    socket2.set_remote(local_addr, port1);
-
-    // Register in UDP socket table
-    let tuple1 = udp::UdpTwoTuple {
-        local_addr,
-        local_port: port1,
-    };
-    let tuple2 = udp::UdpTwoTuple {
-        local_addr,
-        local_port: port2,
-    };
-    udp::udp_register_socket(tuple1, Arc::clone(&socket1));
-    udp::udp_register_socket(tuple2, Arc::clone(&socket2));
-
-    // Create file operations
-    let ops1: &'static dyn FileOps = Box::leak(Box::new(SocketFileOps::new(socket1)));
-    let ops2: &'static dyn FileOps = Box::leak(Box::new(SocketFileOps::new(socket2)));
-
-    // Create dentries
-    let dentry1 = match create_socket_dentry() {
-        Ok(d) => d,
-        Err(_) => return KernelError::OutOfMemory.sysret(),
-    };
-    let dentry2 = match create_socket_dentry() {
-        Ok(d) => d,
-        Err(_) => return KernelError::OutOfMemory.sysret(),
-    };
-
-    // Determine file flags
-    let mut flags = file_flags::O_RDWR;
-    if nonblock {
-        flags |= file_flags::O_NONBLOCK;
-    }
-    if cloexec {
-        flags |= file_flags::O_CLOEXEC;
-    }
-
-    let file1 = Arc::new(File::new(dentry1, flags, ops1));
-    let file2 = Arc::new(File::new(dentry2, flags, ops2));
-
-    // Allocate file descriptors
-    let fd_table = match get_task_fd(current_tid()) {
-        Some(t) => t,
-        None => return KernelError::OutOfMemory.sysret(),
-    };
-
-    let nofile = get_nofile_limit();
-    let fd1 = match fd_table.lock().alloc(file1, nofile) {
-        Ok(fd) => fd,
-        Err(_) => return KernelError::OutOfMemory.sysret(),
-    };
-    let fd2 = match fd_table.lock().alloc(file2, nofile) {
-        Ok(fd) => fd,
-        Err(_) => {
-            // Clean up fd1
-            let _ = fd_table.lock().close(fd1);
-            return KernelError::OutOfMemory.sysret();
+/// accept4(fd, addr, addrlen, flags) (Linux do_accept: a fault copying
+/// the peer address drops the new connection and returns EFAULT)
+pub fn sys_accept4(fd: i32, addr: u64, lenp: u64, flags: i32) -> i64 {
+    ret((|| {
+        let (nb_new, cloexec) = type_flags(flags)?;
+        let (file, s) = sockfd(fd)?;
+        let nb = file_nb(&file, 0) & MSG_DONTWAIT != 0;
+        let child = s.accept(nb)?;
+        let peer = child.getname(true);
+        let newfile = sock_alloc_file(child, nb_new);
+        if addr != 0 {
+            let a = peer.map_err(|_| KernelError::ConnectionAborted)?;
+            addr_out(addr, lenp, &a)?;
         }
-    };
-
-    // Write file descriptors to user space
-    if put_user::<Uaccess, [i32; 2]>(sv, [fd1 as i32, fd2 as i32]).is_err() {
-        let _ = fd_table.lock().close(fd1);
-        let _ = fd_table.lock().close(fd2);
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
+        fd_install(newfile, cloexec)
+    })())
 }
 
-// ============================================================================
-// Message-based send/receive syscalls
-// ============================================================================
-
-/// msghdr structure from userspace
-#[repr(C)]
-pub struct UserMsgHdr {
-    /// Optional address
-    pub msg_name: u64,
-    /// Size of address
-    pub msg_namelen: u32,
-    /// Padding for alignment
-    _pad1: u32,
-    /// Scatter/gather array
-    pub msg_iov: u64,
-    /// Number of elements in iov
-    pub msg_iovlen: usize,
-    /// Ancillary data
-    pub msg_control: u64,
-    /// Ancillary data length
-    pub msg_controllen: usize,
-    /// Flags on received message
-    pub msg_flags: i32,
-    /// Padding for alignment
-    _pad2: i32,
+/// getsockname(fd, addr, addrlen)
+pub fn sys_getsockname(fd: i32, addr: u64, lenp: u64) -> i64 {
+    getname(fd, addr, lenp, false)
 }
 
-/// iovec structure
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IoVec {
-    /// Base address
-    pub iov_base: u64,
-    /// Length
-    pub iov_len: usize,
+/// getpeername(fd, addr, addrlen)
+pub fn sys_getpeername(fd: i32, addr: u64, lenp: u64) -> i64 {
+    getname(fd, addr, lenp, true)
 }
 
-/// mmsghdr structure for sendmmsg/recvmmsg
-#[repr(C)]
-pub struct MMsgHdr {
-    /// Message header
-    pub msg_hdr: UserMsgHdr,
-    /// Number of bytes transmitted/received
-    pub msg_len: u32,
-    /// Padding
-    _pad: u32,
+fn getname(fd: i32, addr: u64, lenp: u64, peer: bool) -> i64 {
+    ret((|| {
+        let (_, s) = sockfd(fd)?;
+        addr_out(addr, lenp, &s.getname(peer)?)?;
+        Ok(0)
+    })())
 }
 
-/// Read msghdr from user space
-pub(crate) fn read_msghdr(addr: u64) -> Result<UserMsgHdr, i64> {
-    if addr == 0 {
-        return Err(KernelError::BadAddress.sysret());
-    }
-    let mut hdr = UserMsgHdr {
-        msg_name: 0,
-        msg_namelen: 0,
-        _pad1: 0,
-        msg_iov: 0,
-        msg_iovlen: 0,
-        msg_control: 0,
-        msg_controllen: 0,
-        msg_flags: 0,
-        _pad2: 0,
-    };
-    let buf = unsafe {
-        core::slice::from_raw_parts_mut(
-            &mut hdr as *mut UserMsgHdr as *mut u8,
-            core::mem::size_of::<UserMsgHdr>(),
-        )
-    };
-    copy_from_user::<Uaccess>(buf, addr, buf.len())
-        .map_err(|_| KernelError::BadAddress.sysret())?;
-    Ok(hdr)
+/// shutdown(fd, how)
+pub fn sys_shutdown(fd: i32, how: i32) -> i64 {
+    ret((|| {
+        let (_, s) = sockfd(fd)?;
+        let r = s.shutdown(how);
+        crate::net::dev::netif_rx_flush_local();
+        r?;
+        Ok(0)
+    })())
 }
 
-/// Read a user iovec array (at most UIO_MAXIOV entries)
-pub(crate) fn read_iovecs(iov_ptr: u64, iovlen: usize) -> Result<alloc::vec::Vec<IoVec>, i64> {
-    if iovlen > 1024 {
-        // UIO_MAXIOV
-        return Err(KernelError::InvalidArgument.sysret());
-    }
-    let mut out = alloc::vec::Vec::with_capacity(iovlen);
-    for i in 0..iovlen as u64 {
-        let base = iov_ptr
-            .checked_add(i * 16)
-            .ok_or(KernelError::BadAddress.sysret())?;
-        let iov_base =
-            get_user::<Uaccess, u64>(base).map_err(|_| KernelError::BadAddress.sysret())?;
-        let iov_len =
-            get_user::<Uaccess, u64>(base + 8).map_err(|_| KernelError::BadAddress.sysret())?;
-        out.push(IoVec {
-            iov_base,
-            iov_len: iov_len as usize,
-        });
-    }
-    Ok(out)
-}
-
-/// Copy `len` bytes in from user memory
-pub(crate) fn copy_in(addr: u64, len: usize) -> Result<alloc::vec::Vec<u8>, i64> {
-    let mut v = alloc::vec![0u8; len];
-    if len > 0 {
-        copy_from_user::<Uaccess>(&mut v, addr, len)
-            .map_err(|_| KernelError::BadAddress.sysret())?;
-    }
-    Ok(v)
-}
-
-/// Largest single socket send/receive buffered in the kernel at once
-/// (UDP: max datagram; TCP: callers get a short count, like a full window)
-const SOCK_IO_MAX: usize = 65536;
-
-/// Gather data from iovec array into a single buffer
-pub(crate) fn gather_iovec(iov_ptr: u64, iovlen: usize) -> Result<alloc::vec::Vec<u8>, i64> {
-    use alloc::vec::Vec;
-
-    if iovlen == 0 {
-        return Ok(Vec::new());
-    }
-    if iov_ptr == 0 {
-        return Err(KernelError::BadAddress.sysret());
-    }
-    let iovecs = read_iovecs(iov_ptr, iovlen)?;
-
-    // Gather data (bounded: see SOCK_IO_MAX)
-    let mut data = Vec::new();
-    for iov in &iovecs {
-        let room = SOCK_IO_MAX - data.len();
-        if room == 0 {
-            break;
+/// setsockopt(fd, level, optname, optval, optlen)
+pub fn sys_setsockopt(fd: i32, level: i32, opt: i32, val: u64, len: u64) -> i64 {
+    ret((|| {
+        let len = len as i32;
+        if len < 0 {
+            return Err(KernelError::InvalidArgument);
         }
-        let n = iov.iov_len.min(room);
-        if n > 0 {
-            data.extend_from_slice(&copy_in(iov.iov_base, n)?);
+        let (_, s) = sockfd(fd)?;
+        let v = OptIn {
+            ptr: val,
+            len: len as usize,
+        };
+        match s.setsockopt(level, opt, v) {
+            Some(r) => r?,
+            None if level == SOL_SOCKET => sock_setsockopt(&*s, opt, v)?,
+            None => return Err(KernelError::NoProtocolOption),
         }
-    }
-
-    Ok(data)
+        Ok(0)
+    })())
 }
 
-/// Scatter data to iovec array, returns bytes written
-pub(crate) fn scatter_iovec(iov_ptr: u64, iovlen: usize, data: &[u8]) -> usize {
-    if iovlen == 0 || iov_ptr == 0 || data.is_empty() {
-        return 0;
-    }
-
-    let Ok(iovecs) = read_iovecs(iov_ptr, iovlen) else {
-        return 0;
-    };
-
-    let mut offset = 0;
-    for iov in &iovecs {
-        if offset >= data.len() {
-            break;
+/// getsockopt(fd, level, optname, optval, optlen)
+pub fn sys_getsockopt(fd: i32, level: i32, opt: i32, val: u64, lenp: u64) -> i64 {
+    ret((|| {
+        let (_, s) = sockfd(fd)?;
+        let len = get_user::<Uaccess, i32>(lenp).map_err(|_| KernelError::BadAddress)?;
+        if len < 0 {
+            return Err(KernelError::InvalidArgument);
         }
-        if iov.iov_len > 0 {
-            let to_copy = (data.len() - offset).min(iov.iov_len);
-            if copy_to_user::<Uaccess>(iov.iov_base, &data[offset..offset + to_copy]).is_err() {
+        let out = match s.getsockopt(level, opt) {
+            Some(r) => r?,
+            None if level == SOL_SOCKET => sock_getsockopt(&*s, opt)?,
+            None => return Err(KernelError::NoProtocolOption),
+        };
+        put_opt(out, val, lenp, len)?;
+        Ok(0)
+    })())
+}
+
+/// sendto(fd, buf, len, flags, addr, addrlen)
+pub fn sys_sendto(fd: i32, buf: u64, len: u64, flags: i32, addr: u64, alen: u64) -> i64 {
+    ret((|| {
+        let (file, s) = sockfd(fd)?;
+        let data = Src::User(Iov::single(buf, len)?);
+        let addr = if addr != 0 {
+            addr_in(addr, alen)?
+        } else {
+            None
+        };
+        let mut m = SendMsg {
+            addr,
+            data,
+            control: Vec::new(),
+        };
+        let r = sock_sendmsg(&*s, &mut m, file_nb(&file, flags));
+        crate::net::dev::netif_rx_flush_local();
+        Ok(r? as i64)
+    })())
+}
+
+/// recvfrom(fd, buf, len, flags, addr, addrlen)
+pub fn sys_recvfrom(fd: i32, buf: u64, len: u64, flags: i32, addr: u64, lenp: u64) -> i64 {
+    ret((|| {
+        let (file, s) = sockfd(fd)?;
+        let mut m = RecvMsg::new(Dst::User(Iov::single(buf, len)?), addr != 0, 0);
+        let n = s.recvmsg(&mut m, file_nb(&file, flags))?;
+        if addr != 0 {
+            addr_out(addr, lenp, m.name.as_deref().unwrap_or(&[]))?;
+        }
+        Ok(n as i64)
+    })())
+}
+
+/// One sendmsg on an already resolved socket
+fn sendmsg_one(file: &File, s: &dyn ProtoOps, msg: u64, flags: i32) -> Result<usize, KernelError> {
+    let h = MsgHdr::read(msg)?;
+    let data = Src::User(h.iov()?);
+    let mut m = SendMsg {
+        addr: h.addr()?,
+        data,
+        control: h.control_in()?,
+    };
+    let r = sock_sendmsg(s, &mut m, file_nb(file, flags));
+    crate::net::dev::netif_rx_flush_local();
+    r
+}
+
+/// sendmsg(fd, msg, flags)
+pub fn sys_sendmsg(fd: i32, msg: u64, flags: i32) -> i64 {
+    ret((|| {
+        let (file, s) = sockfd(fd)?;
+        Ok(sendmsg_one(&file, &*s, msg, flags)? as i64)
+    })())
+}
+
+/// One recvmsg; writes msg_namelen/msg_controllen/msg_flags back
+fn recvmsg_one(file: &File, s: &dyn ProtoOps, msg: u64, flags: i32) -> Result<usize, KernelError> {
+    let h = MsgHdr::read(msg)?;
+    let mut m = RecvMsg::new(Dst::User(h.iov()?), h.name != 0, h.controllen);
+    m.flags = flags & MSG_CMSG_CLOEXEC;
+    let n = s.recvmsg(&mut m, file_nb(file, flags))?;
+    let mut namelen = 0;
+    if let (Some(a), true) = (&m.name, h.name != 0) {
+        let k = (h.namelen as usize).min(a.len());
+        copy_to_user::<Uaccess>(h.name, &a[..k]).map_err(|_| KernelError::BadAddress)?;
+        namelen = a.len() as u32;
+    }
+    if !m.cmsg.buf.is_empty() {
+        copy_to_user::<Uaccess>(h.control, &m.cmsg.buf).map_err(|_| KernelError::BadAddress)?;
+    }
+    let mut fl = m.flags;
+    if m.cmsg.trunc {
+        fl |= MSG_CTRUNC;
+    }
+    msg::msghdr_out(msg, namelen, m.cmsg.buf.len(), fl)?;
+    Ok(n)
+}
+
+/// recvmsg(fd, msg, flags)
+pub fn sys_recvmsg(fd: i32, msg: u64, flags: i32) -> i64 {
+    ret((|| {
+        let (file, s) = sockfd(fd)?;
+        Ok(recvmsg_one(&file, &*s, msg, flags)? as i64)
+    })())
+}
+
+/// sizeof(struct mmsghdr) and the offset of msg_len
+const MMSG_SIZE: u64 = 64;
+const MMSG_LEN_OFF: u64 = 56;
+
+/// sendmmsg(fd, msgvec, vlen, flags): the count sent, or the first
+/// error if none was (vlen clamped to UIO_MAXIOV like Linux)
+pub fn sys_sendmmsg(fd: i32, vec: u64, vlen: u32, flags: i32) -> i64 {
+    ret((|| {
+        let (file, s) = sockfd(fd)?;
+        let mut n = 0u64;
+        for i in 0..(vlen as u64).min(msg::UIO_MAXIOV as u64) {
+            let at = vec.wrapping_add(i * MMSG_SIZE);
+            match sendmsg_one(&file, &*s, at, flags) {
+                Ok(k) => {
+                    put_user::<Uaccess, u32>(at + MMSG_LEN_OFF, k as u32)
+                        .map_err(|_| KernelError::BadAddress)?;
+                    n += 1;
+                }
+                Err(e) if n == 0 => return Err(e),
+                Err(_) => break,
+            }
+        }
+        Ok(n as i64)
+    })())
+}
+
+/// recvmmsg(fd, msgvec, vlen, flags, timeout): MSG_WAITFORONE makes all
+/// but the first non-blocking; the timeout is checked after each
+/// datagram (Linux do_recvmmsg)
+pub fn sys_recvmmsg(fd: i32, vec: u64, vlen: u32, flags: i32, timeout: u64) -> i64 {
+    ret((|| {
+        let (file, s) = sockfd(fd)?;
+        let deadline = mmsg_deadline(timeout)?;
+        let mut flags = flags;
+        let mut n = 0u64;
+        for i in 0..(vlen as u64).min(msg::UIO_MAXIOV as u64) {
+            let at = vec.wrapping_add(i * MMSG_SIZE);
+            match recvmsg_one(&file, &*s, at, flags) {
+                Ok(k) => {
+                    put_user::<Uaccess, u32>(at + MMSG_LEN_OFF, k as u32)
+                        .map_err(|_| KernelError::BadAddress)?;
+                    n += 1;
+                }
+                Err(e) if n == 0 => return Err(e),
+                Err(_) => break,
+            }
+            if flags & MSG_WAITFORONE != 0 {
+                flags |= MSG_DONTWAIT;
+            }
+            if deadline.is_some_and(|d| crate::time::monotonic_ns() >= d) {
                 break;
             }
-            offset += to_copy;
         }
-    }
-
-    offset
+        Ok(n as i64)
+    })())
 }
 
-/// sendmsg(fd, msg, flags) - send a message on a socket
-pub fn sys_sendmsg(fd: i32, msg: u64, flags: i32) -> i64 {
-    if let Some((file, nl)) = nl_sock(fd) {
-        return netlink::sys::sendmsg(&nl, &file, msg, flags);
+/// CLOCK_MONOTONIC deadline of a recvmmsg timeout (struct timespec *)
+fn mmsg_deadline(ts: u64) -> Result<Option<u64>, KernelError> {
+    if ts == 0 {
+        return Ok(None);
     }
-    let socket = match get_socket(fd) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    // Read msghdr from user
-    let msghdr = match read_msghdr(msg) {
-        Ok(m) => m,
-        Err(e) => return e,
-    };
-
-    // Gather data from iovec
-    let data = match gather_iovec(msghdr.msg_iov, msghdr.msg_iovlen) {
-        Ok(d) => d,
-        Err(e) => return e,
-    };
-
-    // Get destination address from msg_name (optional for connected sockets)
-    let dest = if msghdr.msg_name != 0 && msghdr.msg_namelen >= 16 {
-        match read_sockaddr_in(msghdr.msg_name) {
-            Ok(addr) => Some((addr.addr(), addr.port())),
-            Err(e) => return e,
-        }
-    } else {
-        None
-    };
-
-    // Send based on socket type
-    match socket.sock_type {
-        SocketType::Stream => {
-            // For TCP, ignore dest - use connected address
-            let r = tcp::tcp_sendmsg(&socket, &data);
-            crate::net::dev::netif_rx_flush_local();
-            match r {
-                Ok(n) => n as i64,
-                Err(e) => e.sysret(),
-            }
-        }
-        SocketType::Dgram => {
-            // For UDP, use dest if provided, otherwise use connected address
-            let r = udp::udp_sendmsg(&socket, &data, dest);
-            crate::net::dev::netif_rx_flush_local();
-            match r {
-                Ok(n) => n as i64,
-                Err(e) => e.sysret(),
-            }
-        }
-        _ => KernelError::OperationNotSupported.sysret(),
+    let sec = get_user::<Uaccess, i64>(ts).map_err(|_| KernelError::BadAddress)?;
+    let nsec = get_user::<Uaccess, i64>(ts + 8).map_err(|_| KernelError::BadAddress)?;
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return Err(KernelError::InvalidArgument);
     }
-}
-
-/// recvmsg(fd, msg, flags) - receive a message from a socket
-pub fn sys_recvmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
-    if let Some((file, nl)) = nl_sock(fd) {
-        return netlink::sys::recvmsg(&nl, &file, msg, _flags);
-    }
-    let socket = match get_socket(fd) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    // Read msghdr from user
-    let mut msghdr = match read_msghdr(msg) {
-        Ok(m) => m,
-        Err(e) => return e,
-    };
-
-    // Calculate total iovec space
-    let total_space = if msghdr.msg_iovlen > 0 {
-        match read_iovecs(msghdr.msg_iov, msghdr.msg_iovlen) {
-            Ok(iovecs) => iovecs
-                .iter()
-                .fold(0usize, |a, iov| a.saturating_add(iov.iov_len))
-                .min(SOCK_IO_MAX),
-            Err(e) => return e,
-        }
-    } else {
-        0
-    };
-
-    // Receive based on socket type
-    match socket.sock_type {
-        SocketType::Stream => {
-            // TCP: read into temporary buffer then scatter
-            let mut buf = alloc::vec![0u8; total_space];
-            match socket.read(&mut buf) {
-                Ok(n) => {
-                    let written = scatter_iovec(msghdr.msg_iov, msghdr.msg_iovlen, &buf[..n]);
-                    if write_msghdr_out(msg, 0, 0, 0).is_err() {
-                        return KernelError::BadAddress.sysret();
-                    }
-                    written as i64
-                }
-                Err(e) => e as i64,
-            }
-        }
-        SocketType::Dgram => {
-            // UDP: read datagram and get source address
-            let mut buf = alloc::vec![0u8; total_space];
-            match socket.read_datagram(&mut buf) {
-                Ok((n, src_addr, src_port)) => {
-                    let written = scatter_iovec(msghdr.msg_iov, msghdr.msg_iovlen, &buf[..n]);
-
-                    // Write source address to msg_name if provided
-                    if msghdr.msg_name != 0 && msghdr.msg_namelen >= 16 {
-                        let sockaddr = SockAddrIn::new(src_addr, src_port);
-                        if copy_to_user::<Uaccess>(msghdr.msg_name, sockaddr_bytes(&sockaddr))
-                            .is_err()
-                        {
-                            return KernelError::BadAddress.sysret();
-                        }
-                        msghdr.msg_namelen = core::mem::size_of::<SockAddrIn>() as u32;
-                    }
-
-                    if write_msghdr_out(msg, msghdr.msg_namelen, 0, 0).is_err() {
-                        return KernelError::BadAddress.sysret();
-                    }
-                    written as i64
-                }
-                Err(e) => e as i64,
-            }
-        }
-        _ => KernelError::OperationNotSupported.sysret(),
-    }
-}
-
-/// sendmmsg(fd, msgvec, vlen, flags) - send multiple messages
-pub fn sys_sendmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32) -> i64 {
-    if msgvec == 0 || vlen == 0 {
-        return 0;
-    }
-    // Linux clamps vlen to UIO_MAXIOV (1024) rather than failing
-    let vlen = vlen.min(1024);
-
-    let mut sent = 0i64;
-    for i in 0..vlen as u64 {
-        // User address of msgvec[i].msg_hdr
-        let msg_ptr = msgvec.wrapping_add(i * core::mem::size_of::<MMsgHdr>() as u64);
-        let result = sys_sendmsg(fd, msg_ptr, flags);
-        if result < 0 {
-            if sent == 0 {
-                return result; // Return error if no messages sent
-            }
-            break; // Stop on error but return count of successful sends
-        }
-        if put_user::<Uaccess, u32>(msg_ptr + MMSG_LEN_OFFSET, result as u32).is_err() {
-            return if sent == 0 {
-                KernelError::BadAddress.sysret()
-            } else {
-                sent
-            };
-        }
-        sent += 1;
-    }
-
-    sent
-}
-
-/// recvmmsg(fd, msgvec, vlen, flags, timeout) - receive multiple messages
-pub fn sys_recvmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32, _timeout: u64) -> i64 {
-    if msgvec == 0 || vlen == 0 {
-        return 0;
-    }
-    // Linux clamps vlen to UIO_MAXIOV (1024) rather than failing
-    let vlen = vlen.min(1024);
-
-    let mut received = 0i64;
-    for i in 0..vlen as u64 {
-        let msg_ptr = msgvec.wrapping_add(i * core::mem::size_of::<MMsgHdr>() as u64);
-        let result = sys_recvmsg(fd, msg_ptr, flags);
-        if result < 0 {
-            if received == 0 {
-                return result;
-            }
-            break;
-        }
-        if result == 0 {
-            break; // EOF
-        }
-        if put_user::<Uaccess, u32>(msg_ptr + MMSG_LEN_OFFSET, result as u32).is_err() {
-            return if received == 0 {
-                KernelError::BadAddress.sysret()
-            } else {
-                received
-            };
-        }
-        received += 1;
-    }
-
-    received
-}
-
-/// shutdown(fd, how) - shutdown socket
-pub fn sys_shutdown(fd: i32, how: i32) -> i64 {
-    if let Some((_, nl)) = nl_sock(fd) {
-        return {
-            let _ = (nl, how);
-            KernelError::OperationNotSupported.sysret()
-        };
-    }
-    let socket = match get_socket(fd) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    // how: 0 = SHUT_RD, 1 = SHUT_WR, 2 = SHUT_RDWR
-    match how {
-        0 => {
-            // SHUT_RD - mark EOF on receive side
-            socket.set_eof();
-            socket.wake_rx();
-        }
-        1 | 2 => {
-            // SHUT_WR or SHUT_RDWR - close the connection
-            let r = tcp::tcp_close(&socket);
-            crate::net::dev::netif_rx_flush_local();
-            if let Err(e) = r {
-                return e.sysret();
-            }
-            if how == 2 {
-                socket.set_eof();
-                socket.wake_all();
-            }
-        }
-        _ => return KernelError::InvalidArgument.sysret(),
-    }
-
-    0
-}
-
-/// getsockname(fd, addr, addrlen) - get local socket address
-pub fn sys_getsockname(fd: i32, addr: u64, addrlen: u64) -> i64 {
-    if let Some((_, nl)) = nl_sock(fd) {
-        return netlink::sys::getname(&nl, addr, addrlen, false);
-    }
-    let socket = match get_socket(fd) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    let (local_addr, local_port) = match socket.local_addr() {
-        Some(a) => a,
-        None => (Ipv4Addr::new(0, 0, 0, 0), 0),
-    };
-
-    let sockaddr = SockAddrIn::new(local_addr, local_port);
-    write_sockaddr_in(addr, addrlen, &sockaddr)
-}
-
-/// getpeername(fd, addr, addrlen) - get remote socket address
-pub fn sys_getpeername(fd: i32, addr: u64, addrlen: u64) -> i64 {
-    if let Some((_, nl)) = nl_sock(fd) {
-        return netlink::sys::getname(&nl, addr, addrlen, true);
-    }
-    let socket = match get_socket(fd) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    let (remote_addr, remote_port) = match socket.remote_addr() {
-        Some(a) => a,
-        None => return KernelError::NotConnected.sysret(),
-    };
-
-    let sockaddr = SockAddrIn::new(remote_addr, remote_port);
-    write_sockaddr_in(addr, addrlen, &sockaddr)
-}
-
-/// Socket level constants
-const SOL_SOCKET: i32 = 1;
-const IPPROTO_TCP: i32 = 6;
-
-/// Socket option constants (SOL_SOCKET level)
-const SO_REUSEADDR: i32 = 2;
-const SO_TYPE: i32 = 3;
-const SO_ERROR: i32 = 4;
-const SO_DONTROUTE: i32 = 5;
-const SO_BROADCAST: i32 = 6;
-const SO_SNDBUF: i32 = 7;
-const SO_RCVBUF: i32 = 8;
-const SO_KEEPALIVE: i32 = 9;
-const SO_LINGER: i32 = 13;
-const SO_PROTOCOL: i32 = 38;
-const SO_DOMAIN: i32 = 39;
-
-/// TCP option constants (IPPROTO_TCP level)
-const TCP_NODELAY: i32 = 1;
-const TCP_KEEPIDLE: i32 = 4;
-const TCP_KEEPINTVL: i32 = 5;
-const TCP_KEEPCNT: i32 = 6;
-
-/// setsockopt(fd, level, optname, optval, optlen) - set socket option
-pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u64) -> i64 {
-    if let Some((_, nl)) = nl_sock(fd) {
-        return netlink::sys::setsockopt(&nl, level, optname, optval, optlen);
-    }
-    let socket = match get_socket(fd) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    // Need at least 4 bytes for integer options
-    if optval == 0 || optlen < 4 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Read the option value (assume i32 for most options)
-    let value = match get_user::<Uaccess, i32>(optval) {
-        Ok(v) => v,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-    let bool_value = value != 0;
-
-    match level {
-        SOL_SOCKET => match optname {
-            SO_REUSEADDR => {
-                socket
-                    .options
-                    .reuse_addr
-                    .store(bool_value, core::sync::atomic::Ordering::Release);
-                0
-            }
-            SO_KEEPALIVE => {
-                socket
-                    .options
-                    .keepalive
-                    .store(bool_value, core::sync::atomic::Ordering::Release);
-                0
-            }
-            SO_RCVBUF => {
-                // Clamp to reasonable range (1KB to 16MB)
-                let size = (value as u32).clamp(1024, 16 * 1024 * 1024);
-                socket
-                    .options
-                    .recv_buf_size
-                    .store(size, core::sync::atomic::Ordering::Release);
-                0
-            }
-            SO_SNDBUF => {
-                let size = (value as u32).clamp(1024, 16 * 1024 * 1024);
-                socket
-                    .options
-                    .send_buf_size
-                    .store(size, core::sync::atomic::Ordering::Release);
-                0
-            }
-            SO_BROADCAST => {
-                socket
-                    .options
-                    .broadcast
-                    .store(bool_value, core::sync::atomic::Ordering::Release);
-                0
-            }
-            SO_DONTROUTE => {
-                socket
-                    .options
-                    .dontroute
-                    .store(bool_value, core::sync::atomic::Ordering::Release);
-                0
-            }
-            SO_LINGER => {
-                // Need at least 8 bytes for struct linger
-                if optlen < 8 {
-                    return KernelError::InvalidArgument.sysret();
-                }
-                let linger = super::socket::Linger {
-                    l_onoff: value,
-                    l_linger: match get_user::<Uaccess, i32>(optval + 4) {
-                        Ok(v) => v,
-                        Err(_) => return KernelError::BadAddress.sysret(),
-                    },
-                };
-                // Pack l_onoff and l_linger into u32: high 16 bits = onoff, low 16 = linger
-                let packed =
-                    (((linger.l_onoff != 0) as u32) << 16) | ((linger.l_linger as u32) & 0xFFFF);
-                socket
-                    .options
-                    .linger
-                    .store(packed, core::sync::atomic::Ordering::Release);
-                0
-            }
-            _ => 0, // Accept unknown options silently
-        },
-        IPPROTO_TCP => match optname {
-            TCP_NODELAY => {
-                socket
-                    .options
-                    .tcp_nodelay
-                    .store(bool_value, core::sync::atomic::Ordering::Release);
-                0
-            }
-            TCP_KEEPIDLE => {
-                let val = (value as u32).max(1); // minimum 1 second
-                socket
-                    .options
-                    .tcp_keepidle
-                    .store(val, core::sync::atomic::Ordering::Release);
-                0
-            }
-            TCP_KEEPINTVL => {
-                let val = (value as u32).max(1);
-                socket
-                    .options
-                    .tcp_keepintvl
-                    .store(val, core::sync::atomic::Ordering::Release);
-                0
-            }
-            TCP_KEEPCNT => {
-                let val = (value as u32).clamp(1, 127); // Linux max is 127
-                socket
-                    .options
-                    .tcp_keepcnt
-                    .store(val, core::sync::atomic::Ordering::Release);
-                0
-            }
-            _ => 0, // Accept unknown options silently
-        },
-        _ => 0, // Accept unknown levels silently
-    }
-}
-
-/// getsockopt(fd, level, optname, optval, optlen) - get socket option
-pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u64) -> i64 {
-    if let Some((_, nl)) = nl_sock(fd) {
-        return netlink::sys::getsockopt(&nl, level, optname, optval, optlen);
-    }
-    let socket = match get_socket(fd) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    // Check we have valid pointers and space for an i32
-    if optval == 0 || optlen == 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Helper to write an i32 option value
-    let write_i32 = |value: i32| {
-        if put_user::<Uaccess, i32>(optval, value).is_err()
-            || put_user::<Uaccess, u32>(optlen, 4).is_err()
-        {
-            return KernelError::BadAddress.sysret();
-        }
-        0i64
-    };
-
-    match level {
-        SOL_SOCKET => match optname {
-            SO_ERROR => {
-                // Get and clear pending error
-                let err = socket.get_error();
-                write_i32(-err)
-            }
-            SO_TYPE => {
-                // Return socket type (SOCK_STREAM=1, SOCK_DGRAM=2)
-                write_i32(socket.sock_type as i32)
-            }
-            SO_DOMAIN => {
-                // Return address family (AF_INET=2)
-                write_i32(socket.family as i32)
-            }
-            SO_PROTOCOL => {
-                // Return protocol (6=TCP, 17=UDP, or stored protocol)
-                let proto = if socket.protocol != 0 {
-                    socket.protocol
-                } else {
-                    match socket.sock_type {
-                        super::socket::SocketType::Stream => 6, // IPPROTO_TCP
-                        super::socket::SocketType::Dgram => 17, // IPPROTO_UDP
-                        _ => 0,
-                    }
-                };
-                write_i32(proto)
-            }
-            SO_REUSEADDR => {
-                let val = socket
-                    .options
-                    .reuse_addr
-                    .load(core::sync::atomic::Ordering::Acquire);
-                write_i32(if val { 1 } else { 0 })
-            }
-            SO_KEEPALIVE => {
-                let val = socket
-                    .options
-                    .keepalive
-                    .load(core::sync::atomic::Ordering::Acquire);
-                write_i32(if val { 1 } else { 0 })
-            }
-            SO_RCVBUF => {
-                let val = socket
-                    .options
-                    .recv_buf_size
-                    .load(core::sync::atomic::Ordering::Acquire);
-                write_i32(val as i32)
-            }
-            SO_SNDBUF => {
-                let val = socket
-                    .options
-                    .send_buf_size
-                    .load(core::sync::atomic::Ordering::Acquire);
-                write_i32(val as i32)
-            }
-            SO_BROADCAST => {
-                let val = socket
-                    .options
-                    .broadcast
-                    .load(core::sync::atomic::Ordering::Acquire);
-                write_i32(if val { 1 } else { 0 })
-            }
-            SO_DONTROUTE => {
-                let val = socket
-                    .options
-                    .dontroute
-                    .load(core::sync::atomic::Ordering::Acquire);
-                write_i32(if val { 1 } else { 0 })
-            }
-            SO_LINGER => {
-                // Return struct linger (8 bytes)
-                let packed = socket
-                    .options
-                    .linger
-                    .load(core::sync::atomic::Ordering::Acquire);
-                let l_onoff = ((packed >> 16) & 1) as i32;
-                let l_linger = (packed & 0xFFFF) as i32;
-                if put_user::<Uaccess, [i32; 2]>(optval, [l_onoff, l_linger]).is_err()
-                    || put_user::<Uaccess, u32>(optlen, 8).is_err()
-                {
-                    return KernelError::BadAddress.sysret();
-                }
-                0
-            }
-            _ => {
-                // Unknown option - return 0 with value 0
-                write_i32(0)
-            }
-        },
-        IPPROTO_TCP => match optname {
-            TCP_NODELAY => {
-                let val = socket
-                    .options
-                    .tcp_nodelay
-                    .load(core::sync::atomic::Ordering::Acquire);
-                write_i32(if val { 1 } else { 0 })
-            }
-            TCP_KEEPIDLE => {
-                let val = socket
-                    .options
-                    .tcp_keepidle
-                    .load(core::sync::atomic::Ordering::Acquire);
-                write_i32(val as i32)
-            }
-            TCP_KEEPINTVL => {
-                let val = socket
-                    .options
-                    .tcp_keepintvl
-                    .load(core::sync::atomic::Ordering::Acquire);
-                write_i32(val as i32)
-            }
-            TCP_KEEPCNT => {
-                let val = socket
-                    .options
-                    .tcp_keepcnt
-                    .load(core::sync::atomic::Ordering::Acquire);
-                write_i32(val as i32)
-            }
-            _ => write_i32(0),
-        },
-        _ => {
-            // Unknown level - return 0 with value 0
-            write_i32(0)
-        }
-    }
-}
-
-/// sendto(fd, buf, len, flags, dest_addr, addrlen) - send data
-pub fn sys_sendto(fd: i32, buf: u64, len: u64, flags: i32, dest_addr: u64, addrlen: u64) -> i64 {
-    if let Some((file, nl)) = nl_sock(fd) {
-        return netlink::sys::sendto(&nl, &file, buf, len, flags, dest_addr, addrlen);
-    }
-    let socket = match get_socket(fd) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    // Copy the payload in (bounded: see SOCK_IO_MAX; UDP rejects more)
-    let len = len as usize;
-    if socket.sock_type == SocketType::Dgram && len > SOCK_IO_MAX {
-        return KernelError::MessageTooLong.sysret();
-    }
-    let data = match copy_in(buf, len.min(SOCK_IO_MAX)) {
-        Ok(d) => d,
-        Err(e) => return e,
-    };
-    let data = &data[..];
-
-    match socket.sock_type {
-        SocketType::Stream => {
-            // TCP: use tcp_sendmsg (ignores dest_addr)
-            let r = tcp::tcp_sendmsg(&socket, data);
-            crate::net::dev::netif_rx_flush_local();
-            match r {
-                Ok(n) => n as i64,
-                Err(e) => e.sysret(),
-            }
-        }
-        SocketType::Dgram => {
-            // UDP: parse optional destination address
-            let dest = if dest_addr != 0 && addrlen >= core::mem::size_of::<SockAddrIn>() as u64 {
-                match read_sockaddr_in(dest_addr) {
-                    Ok(addr) => Some((addr.addr(), addr.port())),
-                    Err(e) => return e,
-                }
-            } else {
-                None
-            };
-
-            let r = udp::udp_sendmsg(&socket, data, dest);
-            crate::net::dev::netif_rx_flush_local();
-            match r {
-                Ok(n) => n as i64,
-                Err(e) => e.sysret(),
-            }
-        }
-        _ => KernelError::OperationNotSupported.sysret(),
-    }
-}
-
-/// recvfrom(fd, buf, len, flags, src_addr, addrlen) - receive data
-pub fn sys_recvfrom(fd: i32, buf: u64, len: u64, _flags: i32, src_addr: u64, addrlen: u64) -> i64 {
-    if let Some((file, nl)) = nl_sock(fd) {
-        return netlink::sys::recvfrom(&nl, &file, buf, len, _flags, src_addr, addrlen);
-    }
-    let socket = match get_socket(fd) {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-
-    // Receive into a kernel buffer, then copy out
-    let mut kbuf = alloc::vec![0u8; (len as usize).min(SOCK_IO_MAX)];
-    let buffer = &mut kbuf[..];
-
-    match socket.sock_type {
-        SocketType::Stream => {
-            // TCP: use regular read
-            match socket.read(buffer) {
-                Ok(n) => {
-                    if copy_to_user::<Uaccess>(buf, &buffer[..n]).is_err() {
-                        return KernelError::BadAddress.sysret();
-                    }
-                    n as i64
-                }
-                Err(e) => e as i64,
-            }
-        }
-        SocketType::Dgram => {
-            // UDP: read datagram with source address
-            match socket.read_datagram(buffer) {
-                Ok((n, src_ip, src_port)) => {
-                    if copy_to_user::<Uaccess>(buf, &buffer[..n]).is_err() {
-                        return KernelError::BadAddress.sysret();
-                    }
-                    // Write source address if requested
-                    if src_addr != 0 && addrlen != 0 {
-                        let sockaddr = SockAddrIn::new(src_ip, src_port);
-                        let r = write_sockaddr_in(src_addr, addrlen, &sockaddr);
-                        if r < 0 {
-                            return r;
-                        }
-                    }
-                    n as i64
-                }
-                Err(e) => e as i64,
-            }
-        }
-        _ => KernelError::OperationNotSupported.sysret(),
-    }
-}
-
-// Helper functions
-
-/// The netlink socket behind `fd`, if it is one
-fn nl_sock(fd: i32) -> Option<(Arc<File>, Arc<netlink::NlSock>)> {
-    let file = get_task_fd(current_tid())?.lock().get(fd)?;
-    let sk = file
-        .ops()
-        .as_any()
-        .downcast_ref::<netlink::sys::NlFile>()?
-        .sk
-        .clone();
-    Some((file, sk))
-}
-
-/// Get socket from file descriptor
-fn get_socket(fd: i32) -> Result<Arc<Socket>, i64> {
-    if fd < 0 {
-        return Err(KernelError::BadFd.sysret());
-    }
-
-    let fd_table = get_task_fd(current_tid()).ok_or(KernelError::BadFd.sysret())?;
-    let file = fd_table.lock().get(fd).ok_or(KernelError::BadFd.sysret())?;
-
-    // Try to downcast FileOps to SocketFileOps
-    let ops = file.ops();
-    let socket_ops = ops
-        .as_any()
-        .downcast_ref::<SocketFileOps>()
-        .ok_or(KernelError::NotSocket.sysret())?;
-
-    Ok(Arc::clone(socket_ops.socket()))
-}
-
-/// Read sockaddr_in from user space
-fn read_sockaddr_in(addr: u64) -> Result<SockAddrIn, i64> {
-    if addr == 0 {
-        return Err(KernelError::BadAddress.sysret());
-    }
-
-    // Use get_user to properly access user memory with SMAP protection
-    // SockAddrIn layout: sin_family (u16), sin_port (u16), sin_addr (u32), sin_zero ([u8; 8])
-    let sin_family: u16 =
-        get_user::<Uaccess, u16>(addr).map_err(|_| KernelError::BadAddress.sysret())?;
-    let sin_port: u16 =
-        get_user::<Uaccess, u16>(addr + 2).map_err(|_| KernelError::BadAddress.sysret())?;
-    let sin_addr: u32 =
-        get_user::<Uaccess, u32>(addr + 4).map_err(|_| KernelError::BadAddress.sysret())?;
-
-    // sin_zero is padding, we don't need to read it
-    Ok(SockAddrIn {
-        sin_family,
-        sin_port,
-        sin_addr,
-        sin_zero: [0; 8],
-    })
-}
-
-/// Write sockaddr_in to user space
-fn write_sockaddr_in(addr: u64, addrlen: u64, sockaddr: &SockAddrIn) -> i64 {
-    put_addr(addr, addrlen, sockaddr_bytes(sockaddr))
-}
-
-/// Copy a socket address out (Linux move_addr_to_user): min(*addrlen,
-/// size) bytes, then the real size in *addrlen
-pub(crate) fn put_addr(addr: u64, addrlen: u64, bytes: &[u8]) -> i64 {
-    if addr == 0 || addrlen == 0 {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Linux move_addr_to_user: copy min(*addrlen, real size) bytes, then
-    // report the real size
-    let Ok(ulen) = get_user::<Uaccess, i32>(addrlen) else {
-        return KernelError::BadAddress.sysret();
-    };
-    if ulen < 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-    let n = (ulen as usize).min(bytes.len());
-    if copy_to_user::<Uaccess>(addr, &bytes[..n]).is_err()
-        || put_user::<Uaccess, u32>(addrlen, bytes.len() as u32).is_err()
-    {
-        return KernelError::BadAddress.sysret();
-    }
-
-    0
-}
-
-/// sockaddr_in as bytes (all fields named, no padding)
-fn sockaddr_bytes(sa: &SockAddrIn) -> &[u8] {
-    const _: () = assert!(core::mem::size_of::<SockAddrIn>() == 16);
-    unsafe {
-        core::slice::from_raw_parts(
-            sa as *const SockAddrIn as *const u8,
-            core::mem::size_of::<SockAddrIn>(),
-        )
-    }
-}
-
-/// Offsets in struct msghdr / mmsghdr (64-bit Linux layout)
-const MSGHDR_NAMELEN_OFFSET: u64 = 8;
-const MSGHDR_CONTROLLEN_OFFSET: u64 = 40;
-const MSGHDR_FLAGS_OFFSET: u64 = 48;
-const MMSG_LEN_OFFSET: u64 = 56;
-const _: () = assert!(core::mem::size_of::<UserMsgHdr>() == 56);
-const _: () = assert!(core::mem::size_of::<MMsgHdr>() == 64);
-
-/// Write back the recvmsg outputs (msg_namelen, msg_controllen,
-/// msg_flags) to the user msghdr
-pub(crate) fn write_msghdr_out(
-    msg: u64,
-    namelen: u32,
-    flags: i32,
-    controllen: usize,
-) -> Result<(), ()> {
-    put_user::<Uaccess, u32>(msg + MSGHDR_NAMELEN_OFFSET, namelen).map_err(|_| ())?;
-    put_user::<Uaccess, u64>(msg + MSGHDR_CONTROLLEN_OFFSET, controllen as u64).map_err(|_| ())?;
-    put_user::<Uaccess, i32>(msg + MSGHDR_FLAGS_OFFSET, flags).map_err(|_| ())
+    let d = (sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u64);
+    Ok(Some(crate::time::monotonic_ns().saturating_add(d)))
 }

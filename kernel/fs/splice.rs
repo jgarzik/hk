@@ -30,8 +30,6 @@ use crate::arch::Uaccess;
 use crate::fs::KernelError;
 use crate::fs::file::File;
 use crate::mm::page_cache::{CachedPage, PAGE_SIZE};
-use crate::net::socket_file::SocketFileOps;
-use crate::net::tcp;
 use crate::pipe::{
     PIPE_BUFFERS, Pipe, PipeBuffer, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags,
 };
@@ -646,11 +644,6 @@ fn do_splice_pipe_to_file(
         }
     }
 
-    // Check if output is a socket for zero-copy path
-    if let Some(socket_ops) = file.f_op.as_any().downcast_ref::<SocketFileOps>() {
-        return do_splice_pipe_to_socket(pipe, socket_ops, len, flags);
-    }
-
     // Regular file path - extract data and write
     let mut written = 0;
 
@@ -699,65 +692,6 @@ fn do_splice_pipe_to_file(
     }
 
     written as i64
-}
-
-/// Splice from pipe to socket (zero-copy network send)
-fn do_splice_pipe_to_socket(
-    pipe: &Pipe,
-    socket_ops: &SocketFileOps,
-    len: usize,
-    flags: u32,
-) -> i64 {
-    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
-    let socket = socket_ops.socket();
-
-    // Check if socket is ready for writing
-    if socket.tcp.is_none() {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    let mut sent = 0;
-
-    while sent < len {
-        // Get data from pipe
-        let (page, offset, buf_len) = match splice_from_pipe(pipe) {
-            Some(data) => data,
-            None => break,
-        };
-
-        let to_send = (len - sent).min(buf_len as usize);
-
-        // For now, copy to buffer and send via tcp_sendmsg
-        // A true zero-copy implementation would pass the page directly
-        let mut buf = [0u8; PAGE_SIZE];
-        unsafe {
-            let src = (page.frame as *const u8).add(offset as usize);
-            core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), to_send);
-        }
-
-        match tcp::tcp_sendmsg(socket, &buf[..to_send]) {
-            Ok(n) => {
-                sent += n;
-                if n < to_send {
-                    break; // Partial send
-                }
-            }
-            Err(KernelError::WouldBlock) => {
-                if nonblock {
-                    break;
-                }
-                // Would need to wait - for now just return what we've sent
-                break;
-            }
-            Err(_) => break,
-        }
-    }
-
-    if sent == 0 && nonblock {
-        return KernelError::WouldBlock.sysret();
-    }
-
-    sent as i64
 }
 
 /// Allocate a page for pipe buffer
@@ -958,69 +892,13 @@ pub fn sys_sendfile64(out_fd: i32, in_fd: i32, offset: u64, count: usize) -> i64
         Err(e) => return e.sysret(),
     };
 
-    let ret = if let Some(socket_ops) = out_file.f_op.as_any().downcast_ref::<SocketFileOps>() {
-        // Output is a socket: optimized path
-        do_sendfile_to_socket(&in_file, pos, socket_ops, count)
-    } else if let Some(out_pipe) = get_pipe_from_fd(out_fd) {
+    let ret = if let Some(out_pipe) = get_pipe_from_fd(out_fd) {
         do_splice_file_to_pipe(&in_file, pos, &out_pipe, count, 0)
     } else {
         // File to file (rare, but supported)
         do_sendfile_to_file(&in_file, pos, &out_file, count)
     };
     write_back_offset(offset, pos, ret)
-}
-
-/// Sendfile to socket
-fn do_sendfile_to_socket(
-    in_file: &Arc<File>,
-    offset: Option<u64>,
-    socket_ops: &SocketFileOps,
-    count: usize,
-) -> i64 {
-    let socket = socket_ops.socket();
-
-    if socket.tcp.is_none() {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    let mut buf = [0u8; PAGE_SIZE];
-    let mut sent = 0;
-
-    while sent < count {
-        let to_read = (count - sent).min(PAGE_SIZE);
-
-        // Read from file
-        let bytes_read = if let Some(offset) = offset {
-            let actual_offset = offset + sent as u64;
-            match in_file.pread(&mut buf[..to_read], actual_offset) {
-                Ok(n) => n,
-                Err(_) => break,
-            }
-        } else {
-            match in_file.read(&mut buf[..to_read]) {
-                Ok(n) => n,
-                Err(_) => break,
-            }
-        };
-
-        if bytes_read == 0 {
-            break; // EOF
-        }
-
-        // Send to socket
-        match tcp::tcp_sendmsg(socket, &buf[..bytes_read]) {
-            Ok(n) => {
-                sent += n;
-                if n < bytes_read {
-                    break; // Partial send
-                }
-            }
-            Err(KernelError::WouldBlock) => break,
-            Err(_) => break,
-        }
-    }
-
-    sent as i64
 }
 
 /// Sendfile to regular file

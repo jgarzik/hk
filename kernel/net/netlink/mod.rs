@@ -35,8 +35,8 @@
 //!   never taken under `NlSock.dump`.
 
 pub mod attr;
+pub mod ops;
 pub mod rtnetlink;
-pub mod sys;
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -48,7 +48,8 @@ use spin::{Mutex, RwLock};
 
 use crate::error::KernelError;
 use crate::net::NetNamespace;
-use crate::waitqueue::WaitQueue;
+use crate::net::sock::Sock;
+use crate::net::socket::{ProtoOps, SOCK_DGRAM, SOCK_RAW};
 
 pub const AF_NETLINK: i32 = 16;
 pub const NETLINK_ROUTE: i32 = 0;
@@ -89,10 +90,6 @@ pub const NLMSGERR_ATTR_MSG: u16 = 1;
 
 /// sizeof(struct sockaddr_nl)
 pub const SOCKADDR_NL_LEN: usize = 12;
-/// Linux rmem_default / wmem_default
-const SK_BUF_DEFAULT: u32 = 212_992;
-/// Linux SOCK_MIN_RCVBUF-ish floor for SO_RCVBUF
-const SK_BUF_MIN: u32 = 2304;
 /// Multicast groups of NETLINK_ROUTE (RTNLGRP_MAX)
 pub const RTNL_NGROUPS: u32 = 39;
 
@@ -135,10 +132,8 @@ pub mod sflags {
 
 /// A netlink socket (Linux struct netlink_sock)
 pub struct NlSock {
-    pub protocol: i32,
-    /// SOCK_RAW or SOCK_DGRAM (same behavior)
-    pub stype: i32,
-    pub net: Arc<NetNamespace>,
+    /// Common state (type SOCK_RAW or SOCK_DGRAM: same behavior)
+    pub sk: Sock,
     portid: AtomicU32,
     bound: AtomicBool,
     /// Subscribed groups: bit g-1 for group g
@@ -147,21 +142,14 @@ pub struct NlSock {
     dst: Mutex<(u32, u32)>,
     rxq: Mutex<VecDeque<NlSkb>>,
     rmem: AtomicUsize,
-    /// SO_RCVBUF / SO_SNDBUF (already doubled, as reported)
-    pub rcvbuf: AtomicU32,
-    pub sndbuf: AtomicU32,
     pub flags: AtomicU32,
-    /// Capabilities of the opener (the socket file's f_cred)
-    opener: crate::task::KernelCap,
-    /// Pending socket error (positive errno; ENOBUFS on overrun)
-    err: AtomicI32,
     /// Receive queue overran; cleared when the reader empties it
     congested: AtomicBool,
     /// Messages dropped on overrun
     drops: AtomicU32,
     /// Running dump (Linux cb_running + netlink_callback)
     dump: Mutex<Option<Dump>>,
-    pub wq: WaitQueue,
+    me: Weak<NlSock>,
 }
 
 /// Bytes charged to rcvbuf per queued message (Linux skb truesize:
@@ -189,25 +177,20 @@ static ROVER: AtomicI32 = AtomicI32::new(-4097);
 impl NlSock {
     /// New socket in the current task's namespace
     pub fn new(protocol: i32, stype: i32) -> Arc<Self> {
-        Arc::new(Self {
-            protocol,
-            stype,
-            net: crate::net::current_net_ns(),
+        let net = crate::net::current_net_ns();
+        Arc::new_cyclic(|me| Self {
+            sk: Sock::new(net, AF_NETLINK as u16, stype, protocol),
             portid: AtomicU32::new(0),
             bound: AtomicBool::new(false),
             groups: AtomicU64::new(0),
             dst: Mutex::new((0, 0)),
             rxq: Mutex::new(VecDeque::new()),
             rmem: AtomicUsize::new(0),
-            rcvbuf: AtomicU32::new(SK_BUF_DEFAULT),
-            sndbuf: AtomicU32::new(SK_BUF_DEFAULT),
             flags: AtomicU32::new(0),
-            opener: crate::task::current_cred().cap_effective,
-            err: AtomicI32::new(0),
             congested: AtomicBool::new(false),
             drops: AtomicU32::new(0),
             dump: Mutex::new(None),
-            wq: WaitQueue::new(),
+            me: me.clone(),
         })
     }
 
@@ -217,7 +200,7 @@ impl NlSock {
     /// write()s to a descriptor it was handed cannot be abused as a
     /// confused deputy.
     pub fn net_capable(&self, cap: u32, explicit_dst: bool) -> bool {
-        (explicit_dst || self.opener.has(cap)) && crate::task::capable(cap)
+        (explicit_dst || self.sk.cred.cap_effective.has(cap)) && crate::task::capable(cap)
     }
 
     pub fn portid(&self) -> u32 {
@@ -243,7 +226,15 @@ impl NlSock {
 
     /// Largest message accepted by sendmsg (Linux: sndbuf - 32)
     pub fn max_msg(&self) -> usize {
-        (self.sndbuf.load(Ordering::Acquire) as usize).saturating_sub(32)
+        (self.sk.sndbuf() as usize).saturating_sub(32)
+    }
+
+    pub fn net(&self) -> &Arc<NetNamespace> {
+        &self.sk.net
+    }
+
+    pub fn protocol(&self) -> i32 {
+        self.sk.protocol
     }
 
     /// Connected destination (portid, group)
@@ -272,7 +263,7 @@ impl NlSock {
     }
 
     fn insert(self: &Arc<Self>, portid: u32) -> Result<(), KernelError> {
-        self.net.nl.insert(self.protocol, portid, self)?;
+        self.sk.net.nl.insert(self.sk.protocol, portid, self)?;
         self.portid.store(portid, Ordering::Release);
         self.bound.store(true, Ordering::Release);
         Ok(())
@@ -331,7 +322,7 @@ impl NlSock {
     fn charge(&self, skb: &NlSkb) -> bool {
         let ts = truesize(skb.data.len());
         let before = self.rmem.fetch_add(ts, Ordering::AcqRel);
-        let limit = self.rcvbuf.load(Ordering::Acquire) as usize;
+        let limit = self.sk.rcvbuf() as usize;
         if (before == 0 || before + ts <= limit) && !self.congested.load(Ordering::Acquire) {
             return true;
         }
@@ -341,7 +332,7 @@ impl NlSock {
 
     fn push(&self, skb: NlSkb) {
         self.rxq.lock().push_back(skb);
-        self.wq.wake_all();
+        self.sk.wq.wake_all();
     }
 
     /// Queue a kernel message (reply, ACK, notification): dropped with
@@ -360,32 +351,27 @@ impl NlSock {
     /// (unless NETLINK_NO_ENOBUFS) and count the drop
     fn overrun(&self) {
         if !self.has_flag(sflags::NO_ENOBUFS) && !self.congested.swap(true, Ordering::AcqRel) {
-            self.err
-                .store(KernelError::NoBufferSpace.errno(), Ordering::Release);
-            self.wq.wake_all();
+            self.sk.set_err(KernelError::NoBufferSpace);
         }
         self.drops.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Queue a message from a user socket: wait for room unless
     /// `nonblock` (EAGAIN), like netlink_attachskb with a send timeout
-    fn deliver(&self, skb: NlSkb, nonblock: bool) -> Result<(), KernelError> {
+    fn deliver(&self, skb: NlSkb, timeo: u64) -> Result<(), KernelError> {
+        let mut timeo = timeo;
         loop {
             if self.charge(&skb) {
                 self.push(skb);
                 return Ok(());
             }
-            if nonblock {
-                return Err(KernelError::WouldBlock);
-            }
-            self.wq.wait_event_interruptible(|| self.has_room())?;
+            timeo = self.sk.wait(timeo, || self.has_room())?;
         }
     }
 
     fn has_room(&self) -> bool {
         let r = self.rmem.load(Ordering::Acquire);
-        (r == 0 || r < self.rcvbuf.load(Ordering::Acquire) as usize)
-            && !self.congested.load(Ordering::Acquire)
+        (r == 0 || r < self.sk.rcvbuf() as usize) && !self.congested.load(Ordering::Acquire)
     }
 
     /// Something to read (or an error to report)
@@ -395,26 +381,21 @@ impl NlSock {
         // is dump -> rxq)
         let queued = !self.rxq.lock().is_empty();
         let dumping = self.dump.lock().is_some();
-        queued || dumping || self.err.load(Ordering::Acquire) != 0
+        queued || dumping || self.sk.has_err()
     }
 
     pub fn has_error(&self) -> bool {
-        self.err.load(Ordering::Acquire) != 0
-    }
-
-    /// Take the pending error (SO_ERROR / recvmsg)
-    pub fn take_error(&self) -> i32 {
-        self.err.swap(0, Ordering::AcqRel)
+        self.sk.has_err()
     }
 
     /// Next datagram: removed unless `peek`; EAGAIN if `nonblock` and
     /// empty; a pending overrun is reported first as ENOBUFS. Reading
     /// makes room, so a running dump continues (Linux netlink_recvmsg).
     pub fn recv(&self, peek: bool, nonblock: bool) -> Result<NlSkb, KernelError> {
+        let mut timeo = self.sk.rcv_timeo(nonblock);
         loop {
-            let e = self.take_error();
-            if e != 0 {
-                return Err(KernelError::NoBufferSpace);
+            if let Some(e) = self.sk.take_err() {
+                return Err(e);
             }
             if let Some(skb) = self.dequeue(peek) {
                 self.dump_more();
@@ -425,10 +406,7 @@ impl NlSock {
             if self.dump_step() {
                 continue;
             }
-            if nonblock {
-                return Err(KernelError::WouldBlock);
-            }
-            self.wq.wait_event_interruptible(|| self.readable())?;
+            timeo = self.sk.wait(timeo, || self.readable())?;
         }
     }
 
@@ -446,7 +424,7 @@ impl NlSock {
         if empty {
             self.congested.store(false, Ordering::Release);
         }
-        self.wq.wake_all();
+        self.sk.wq.wake_all();
         Some(skb)
     }
 
@@ -466,7 +444,7 @@ impl NlSock {
 
     /// Continue a running dump once at most half the buffer is used
     fn dump_more(&self) {
-        let half = self.rcvbuf.load(Ordering::Acquire) as usize / 2;
+        let half = self.sk.rcvbuf() as usize / 2;
         if self.rmem.load(Ordering::Acquire) <= half {
             self.dump_step();
         }
@@ -486,7 +464,7 @@ impl NlSock {
             return false;
         };
         let r = self.rmem.load(Ordering::Acquire);
-        if r != 0 && r >= self.rcvbuf.load(Ordering::Acquire) as usize {
+        if r != 0 && r >= self.sk.rcvbuf() as usize {
             return false;
         }
         let mut buf = Vec::new();
@@ -537,7 +515,7 @@ impl NlSock {
                 portid: me,
                 group,
             };
-            broadcast(&self.net, self.protocol, skb, me);
+            broadcast(&self.sk.net, self.sk.protocol, skb, me);
         }
         if portid == 0 {
             if group == 0 {
@@ -546,16 +524,17 @@ impl NlSock {
             return Ok(data.len());
         }
         let peer = self
+            .sk
             .net
             .nl
-            .get(self.protocol, portid)
+            .get(self.sk.protocol, portid)
             .ok_or(KernelError::ConnectionRefused)?;
         let skb = NlSkb {
             data: data.to_vec(),
             portid: me,
             group: 0,
         };
-        peer.deliver(skb, nonblock)?;
+        peer.deliver(skb, self.sk.snd_timeo(nonblock))?;
         Ok(data.len())
     }
 
@@ -563,7 +542,7 @@ impl NlSock {
     pub fn release(&self) {
         *self.dump.lock() = None;
         if self.bound.load(Ordering::Acquire) {
-            self.net.nl.remove(self.protocol, self.portid());
+            self.sk.net.nl.remove(self.sk.protocol, self.portid());
         }
     }
 }
@@ -638,4 +617,15 @@ impl NlTable {
             .filter_map(|(_, w)| w.upgrade())
             .collect()
     }
+}
+
+/// socket(AF_NETLINK, type, protocol): NETLINK_ROUTE only
+pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelError> {
+    if stype != SOCK_RAW && stype != SOCK_DGRAM {
+        return Err(KernelError::SocketTypeNotSupported);
+    }
+    if protocol != NETLINK_ROUTE {
+        return Err(KernelError::ProtocolNotSupported);
+    }
+    Ok(NlSock::new(protocol, stype))
 }

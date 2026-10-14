@@ -934,13 +934,10 @@ wq.wake_one(); wq.wake_all();
   make the condition true before calling `wake_*`.
 - **Autoremove:** a woken entry is removed by the waker; `finish_wait`
   removes it otherwise. Poll entries stay until the poll ends.
-- **Legacy `wait()`:** unconditional sleep bounded to one tick (callers check
-  their condition before calling, so a wakeup in that gap would otherwise be
-  lost). Remaining users: network sockets (until the P4 socket core). New
-  code uses `wait_event*` (`wait_event_interruptible_deadline` for
-  CLOCK_MONOTONIC deadlines). Wakers of queues shared by waiters with
-  different conditions (SysV sem/msg, mqueue) use `wake_all`: a
-  `wake_one` could pick a waiter whose condition is still false.
+- `wait_event_interruptible_deadline` takes a CLOCK_MONOTONIC deadline.
+  Wakers of queues shared by waiters with different conditions (SysV
+  sem/msg, mqueue, sockets) use `wake_all`: a `wake_one` could pick a
+  waiter whose condition is still false.
 - `cond` closures run with the task state set; they may take sleeping-context
   locks (Mutex) but must not sleep themselves.
 
@@ -1594,11 +1591,15 @@ do not rely on that.
 | `Napi.sched` | `AtomicBool` | IRQ + thread | set by `napi_schedule` (only the setter queues it), cleared by `napi_complete_done` |
 | `PTYPE_BASE`, `PTYPE_ALL` | `spin::RwLock<Vec<..>>` | thread only | leaf; handler copied out, called after unlock |
 | `NAPI_LIST`, `SOFTNET_THREADS` | `spin::Mutex<Vec<..>>` | thread only | leaf; registration |
-| `TcpSock.sk_lock` | `spin::Mutex<()>` | thread only | Linux `lock_sock` (no backlog: input is thread context). Held by `tcp_rcv` per segment and by `tcp_sendmsg`/`tcp_connect`/`tcp_close`; never across a sleep |
-| `Socket.accept_queue` | `spin::Mutex` | thread only | under the listener's `sk_lock`; dropped before transmitting |
-| `Socket.{local,remote}_addr`, `rx_buffer`, `dgram_rx_queue`, `TcpSock.{retransmit,ooo}_queue` | `spin::Mutex` | thread only | leaf; TCP state/sequence numbers are atomics |
+| `Sock` (`net/sock.rs`, in every protocol socket) | atomics + `Sock.wq` (`WaitQueue`) | any (wakeups) | error, shutdown, buffer sizes, timeouts, SOL_SOCKET flags; one wait queue per socket for readers, writers, connect/accept and pollers (`sk_data_ready`/`sk_write_space`/`sk_state_change` = `wake_all`), always woken after protocol locks are dropped |
+| sockfs inode `private` | `spin::RwLock` (VFS, `Inode.private`) | thread only | read per socket file operation (`sock_of`) to reach the protocol socket; leaf |
+| `TcpCb.sk_lock` | `spin::Mutex<()>` | thread only | Linux `lock_sock` (no backlog: input is thread context). Held by `tcp_rcv` per segment and by connect/bind/listen/send/close; never across a sleep |
+| `TcpSock.{rx, accept_queue, tuple, opts}`, `TcpCb.{retransmit,ooo}_queue` | `spin::Mutex` | thread only | leaves; TCP state/sequence numbers are atomics; the accept queue is dropped before transmitting |
+| `UdpSock.op` | `spin::Mutex<()>` | thread only | UDP socket lock (bind/connect/disconnect/autobind); never across a sleep or a transmit |
+| `UdpSock.rxq` | `spin::Mutex` | thread only (softnet enqueue, recvmsg) | leaf; bounded by SO_RCVBUF (`rmem` atomic) |
+| `Inet.addr` (`net/af_inet.rs`) | `spin::Mutex` | thread only | leaf: addresses/ports of a TCP or UDP socket; read under the UDP/TCP port tables during lookups |
 | `RTNL` (`net/rtnl.rs`) | `spin::Mutex<()>` | thread only (syscalls, kernel config; never softnet) | OUTERMOST network lock: serializes all configuration changes (link up/down + MTU, addresses, routes) from netlink, SIOCS* ioctls and the kernel. Functions needing it take `&RtnlGuard`. Holders never sleep and never take a socket lock (`sk_lock`) |
-| `NetNamespace` tables (`devices`, `tcp_connections`, `tcp_listeners`, `udp_sockets`, `loopback`) | `spin::RwLock` | thread only | private; reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes: RCU-ready) |
+| `NetNamespace` tables (`devices`, `tcp_connections`, `tcp_listeners`, `loopback`), `UdpTable.socks`, `TcpBind.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes: RCU-ready); the UDP/TCP port tables read each candidate's `Inet.addr` under their lock |
 | `Fib.tables` (`net/inet/fib.rs`, per netns) | `spin::RwLock` | thread only | leaf; written only under RTNL; read by input/output routing (softnet, socket syscalls, possibly under `sk_lock`) and dumps; returns `Arc<FibEntry>` clones; notifications are sent after the guard is dropped |
 | `NetDevice.addrs` (IPv4 list; IPv6 later) | `spin::RwLock` | thread only | leaf; written only under RTNL (`inet::ifaddr`), read via snapshots (`inet_addrs()`) |
 | `NetNamespace.arp_pending` -> `arp_entries` | `spin::Mutex` | thread only | `arp_resolve_or_queue` checks the cache and queues under `arp_pending`, so a racing reply cannot strand a packet; queue capped at 16 per address; `arp_flush_dev` (device down, under RTNL) takes both in the same order |
@@ -1615,10 +1616,12 @@ do not rely on that.
 **Lock order (outermost first):**
 
 ```
-RTNL (configuration only)        TcpSock.sk_lock (listener before child; a
+RTNL (configuration only)        TcpCb.sk_lock (listener before child; a
   |                                 child is never locked while its creator
-  |                                 holds the listener)
-  |                                 -> Socket.accept_queue / per-socket buffers
+  |                                 holds the listener) / UdpSock.op
+  |                                 -> TcpBind.socks / UdpTable.socks / conn
+  |                                    tables -> Inet.addr
+  |                                 -> TcpSock.{rx,accept_queue,..} / UdpSock.rxq
   v                                 |
 NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
   the guard before returning)
@@ -1649,8 +1652,14 @@ budget calls `napi_complete_done` and rewrites IMS (a cause latched while
 masked fires then). If its own ISR consumed causes during the poll (shared
 line), it reschedules itself.
 
-**Known gaps (later phases):** TCP has no timers/retransmit (P6); UDP/TCP
-tables are not unregistered on close (P4); neighbour state machine and
+Sockets block only in `Sock::wait` (`wait_event_interruptible_timeout`
+on `Sock.wq`) with no lock held; receive paths make the condition true
+under their leaf lock, drop it, then wake. A socket leaves every table at
+last close (`ProtoOps::release`; TCP connections when their close
+handshake ends).
+
+**Known gaps (later phases):** TCP has no timers/retransmit (P6);
+neighbour state machine and
 ARP rate limiting (P5); RCU for the read-mostly tables (FIB, device list,
 address lists: COW snapshots are the intended next step; see plan 3a).
 

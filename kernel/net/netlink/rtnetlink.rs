@@ -267,7 +267,7 @@ impl RtDump {
                 Err(e) => DumpKind::Bad(e),
             },
             RTM_GETLINK => DumpKind::Link,
-            RTM_GETADDR if inet => addr_dump_kind(&sk.net, p, strict, &mut flags),
+            RTM_GETADDR if inet => addr_dump_kind(sk.net(), p, strict, &mut flags),
             RTM_GETROUTE if inet => route_dump_kind(p, strict, &mut flags),
             RTM_GETNEIGH if inet => DumpKind::Neigh,
             _ => DumpKind::Empty,
@@ -298,7 +298,7 @@ impl RtDump {
 
 impl DumpCb for RtDump {
     fn fill(&mut self, sk: &NlSock, buf: &mut Vec<u8>) -> Result<bool, KernelError> {
-        let net = &sk.net;
+        let net = sk.net();
         let (f, seq, pid) = (self.flags, self.seq, self.pid);
         match self.kind {
             DumpKind::Bad(e) => Err(e),
@@ -393,7 +393,7 @@ fn link_dev(
 fn getlink(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
     let ifm = ifinfo(p)?;
     let a = Attrs::parse(&p[IFINFOMSG_LEN..], IFLA_MAX)?;
-    let dev = link_dev(&sk.net, &ifm, &a)?.ok_or(KernelError::NoDevice)?;
+    let dev = link_dev(sk.net(), &ifm, &a)?.ok_or(KernelError::NoDevice)?;
     reply(sk, fill_link(&dev, RTM_NEWLINK, 0, h.seq, sk.portid(), 0));
     Ok(Done::Ok)
 }
@@ -403,7 +403,7 @@ fn getlink(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
 fn setlink(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
     let ifm = ifinfo(p)?;
     let a = Attrs::parse(&p[IFINFOMSG_LEN..], IFLA_MAX)?;
-    let net = &sk.net;
+    let net = sk.net();
     let found = match link_dev(net, &ifm, &a) {
         Err(KernelError::InvalidArgument) if h.ty == RTM_NEWLINK => None,
         r => r?,
@@ -640,7 +640,7 @@ fn newaddr(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelErr
     if local.is_unspecified() {
         return Ok(Done::Ok);
     }
-    let net = &sk.net;
+    let net = sk.net();
     let r = rtnl::lock();
     let dev = net
         .dev_get_by_index(ifm.index)
@@ -678,7 +678,7 @@ fn deladdr(sk: &NlSock, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
     let local = a.in_addr(IFA_LOCAL)?;
     let label = a.str(IFA_LABEL, IFNAMSIZ)?;
     let address = a.in_addr(IFA_ADDRESS)?;
-    let net = &sk.net;
+    let net = sk.net();
     let r = rtnl::lock();
     let dev = net
         .dev_get_by_index(ifm.index)
@@ -754,14 +754,14 @@ fn fib_config(h: &Hdr, p: &[u8], nl: NlInfo) -> Result<FibConfig, KernelError> {
 fn newroute(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
     let cfg = fib_config(h, p, nl)?;
     let r = rtnl::lock();
-    fib::fib_table_insert(&r, &sk.net, &cfg)?;
+    fib::fib_table_insert(&r, sk.net(), &cfg)?;
     Ok(Done::Ok)
 }
 
 fn delroute(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelError> {
     let cfg = fib_config(h, p, nl)?;
     let r = rtnl::lock();
-    fib::fib_table_delete(&r, &sk.net, &cfg)?;
+    fib::fib_table_delete(&r, sk.net(), &cfg)?;
     Ok(Done::Ok)
 }
 
@@ -853,7 +853,7 @@ fn getroute(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
     let dst = a.in_addr(RTA_DST)?.unwrap_or_default();
     let src = a.in_addr(RTA_SRC)?.unwrap_or_default();
     let oif = a.u32(RTA_OIF)?.unwrap_or(0);
-    let net = &sk.net;
+    let net = sk.net();
     if rtm.flags & RTM_F_FIB_MATCH != 0 {
         let key = FlowKey {
             daddr: dst,

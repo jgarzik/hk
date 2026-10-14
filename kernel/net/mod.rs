@@ -11,7 +11,7 @@
 //! Socket Syscalls (socket, connect, read, write, etc.)
 //!         |
 //!         v
-//! Socket Layer (socket.rs, socket_file.rs)
+//! Socket layer (socket.rs: sockfs + per-family ops; sock.rs: common state)
 //!         |
 //!         v
 //! Transport Layer (tcp.rs, udp.rs)
@@ -50,6 +50,7 @@ use alloc::sync::Arc;
 pub use crate::ns::{INIT_NET_NS, NetNamespace, current_net_ns, init_net_ns};
 
 // Submodules
+pub mod af_inet;
 pub mod arp;
 #[path = "core/dev.rs"]
 pub mod dev;
@@ -66,8 +67,8 @@ pub mod proc;
 pub mod request_sock;
 pub mod rtnl;
 pub mod skb;
+pub mod sock;
 pub mod socket;
-pub mod socket_file;
 pub mod syscall;
 pub mod tcp;
 pub mod tcp_input;
@@ -79,7 +80,6 @@ pub use device::{NetDevice, NetDeviceOps, NetDeviceStats};
 pub use ethernet::EtherType;
 pub use ipv4::Ipv4Addr;
 pub use skb::SkBuff;
-pub use socket::{Socket, SocketOptions};
 
 // Import unified error type
 use crate::error::KernelError;

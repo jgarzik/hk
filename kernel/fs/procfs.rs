@@ -177,6 +177,8 @@ pub enum ProcfsInodeData {
     ///
     /// Symlink to the open file descriptor.
     FdSymlink { pid: Pid, fd: i32 },
+    /// /proc/self: symlink to the reader's process directory
+    SelfLink,
     /// Fdinfo file (/proc/<pid>/fdinfo/<n>)
     ///
     /// File containing information about an open file descriptor.
@@ -324,6 +326,25 @@ impl InodeData for ProcfsInodeWrapper {}
 pub struct ProcfsInodeOps;
 
 impl InodeOps for ProcfsInodeOps {
+    /// Targets of /proc/self and /proc/<pid>/fd/<n> (Linux
+    /// proc_self_get_link, proc_fd_link + d_path/d_dname)
+    fn readlink(&self, inode: &Inode) -> Result<String, KernelError> {
+        let private = inode.get_private().ok_or(KernelError::Io)?;
+        let wrapper = private
+            .as_ref()
+            .as_any()
+            .downcast_ref::<ProcfsInodeWrapper>()
+            .ok_or(KernelError::Io)?;
+        let data = wrapper.0.read();
+        match &*data {
+            ProcfsInodeData::SelfLink => {
+                Ok(alloc::format!("{}", crate::task::percpu::current_pid()))
+            }
+            ProcfsInodeData::FdSymlink { pid, fd } => fd_link(*pid, *fd),
+            _ => Err(KernelError::InvalidArgument),
+        }
+    }
+
     fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError> {
         let private = dir.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
@@ -344,6 +365,9 @@ impl InodeOps for ProcfsInodeOps {
                 // Root /proc has ino == 1 typically (first allocated inode)
                 // We detect root by checking if it's the procfs root (has static entries like "version")
                 if children.contains_key("version") {
+                    if name == "self" {
+                        return Ok(create_self_link(dir));
+                    }
                     // This is /proc root - check for numeric PID lookup
                     if let Ok(pid) = name.parse::<u64>()
                         && task_exists(pid)
@@ -373,6 +397,7 @@ impl InodeOps for ProcfsInodeOps {
             ProcfsInodeData::File { .. }
             | ProcfsInodeData::NamespaceFile { .. }
             | ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::SelfLink
             | ProcfsInodeData::FdinfoFile { .. }
             | ProcfsInodeData::PidCgroupFile { .. } => Err(KernelError::NotDirectory),
         }
@@ -404,7 +429,7 @@ impl InodeOps for ProcfsInodeOps {
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
             ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
-            ProcfsInodeData::FdSymlink { .. } => {
+            ProcfsInodeData::FdSymlink { .. } | ProcfsInodeData::SelfLink => {
                 // Symlinks don't have content, readlink() handles them
                 return Err(KernelError::Io);
             }
@@ -578,6 +603,46 @@ fn lookup_pid_ns_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, 
         ProcfsInodeData::new_ns_file(pid, ns_type),
     ))));
     Ok(inode)
+}
+
+/// /proc/self (resolved at readlink time to the reader's pid)
+fn create_self_link(parent: &Inode) -> Arc<Inode> {
+    let sb = parent.superblock().expect("superblock dropped");
+    let inode = Arc::new(Inode::new(
+        pid_ino(0, 999),
+        InodeMode::symlink(),
+        0,
+        0,
+        0,
+        current_time(),
+        Arc::downgrade(&sb),
+        &PROCFS_INODE_OPS,
+    ));
+    inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+        ProcfsInodeData::SelfLink,
+    ))));
+    inode
+}
+
+/// Target of /proc/<pid>/fd/<fd>: `socket:[ino]` / `pipe:[ino]` for
+/// sockets and pipes, `anon_inode:<name>` for other files without a
+/// filesystem, else the path
+fn fd_link(pid: Pid, fd: i32) -> Result<String, KernelError> {
+    let tid = get_tid_for_pid(pid).ok_or(KernelError::NotFound)?;
+    let table = crate::task::fdtable::get_task_fd(tid).ok_or(KernelError::NotFound)?;
+    let file = table.lock().get(fd).ok_or(KernelError::NotFound)?;
+    let inode = file.get_inode().ok_or(KernelError::NotFound)?;
+    let mode = inode.mode();
+    if mode.is_socket() {
+        return Ok(alloc::format!("socket:[{}]", inode.ino));
+    }
+    if inode.superblock().is_none() {
+        if mode.file_type() == Some(crate::fs::inode::FileType::Fifo) {
+            return Ok(alloc::format!("pipe:[{}]", inode.ino));
+        }
+        return Ok(alloc::format!("anon_inode:{}", file.dentry.name));
+    }
+    Ok(file.dentry.full_path())
 }
 
 /// Look up entries in /proc/<pid>/fd/
@@ -824,7 +889,9 @@ impl FileOps for ProcfsFileOps {
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
             ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
-            ProcfsInodeData::FdSymlink { .. } => return Err(KernelError::Io),
+            ProcfsInodeData::FdSymlink { .. } | ProcfsInodeData::SelfLink => {
+                return Err(KernelError::Io);
+            }
             ProcfsInodeData::Directory { .. }
             | ProcfsInodeData::PidDirectory { .. }
             | ProcfsInodeData::PidNsDirectory { .. }
@@ -864,7 +931,9 @@ impl FileOps for ProcfsFileOps {
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
             ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
-            ProcfsInodeData::FdSymlink { .. } => return Err(KernelError::Io),
+            ProcfsInodeData::FdSymlink { .. } | ProcfsInodeData::SelfLink => {
+                return Err(KernelError::Io);
+            }
             ProcfsInodeData::Directory { .. }
             | ProcfsInodeData::PidDirectory { .. }
             | ProcfsInodeData::PidNsDirectory { .. }
@@ -976,6 +1045,7 @@ impl FileOps for ProcfsFileOps {
             ProcfsInodeData::File { .. }
             | ProcfsInodeData::NamespaceFile { .. }
             | ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::SelfLink
             | ProcfsInodeData::FdinfoFile { .. }
             | ProcfsInodeData::PidCgroupFile { .. } => {
                 return Err(KernelError::NotDirectory);

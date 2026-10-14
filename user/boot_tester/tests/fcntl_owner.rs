@@ -2,10 +2,11 @@
 //!
 //! Tests for async I/O owner tracking:
 //! - F_SETOWN/F_GETOWN: Set/get owner PID/PGID for signal delivery
+//!   (ESRCH for a process or group that does not exist)
 //! - F_SETSIG/F_GETSIG: Set/get signal number for async I/O
 
-use super::helpers::{host_mode, print, print_num, println, skip};
-use hk_syscall::{sys_close, sys_fcntl, sys_mkdir, sys_open, O_CREAT, O_RDWR};
+use super::helpers::{print, print_num, println};
+use hk_syscall::{sys_close, sys_fcntl, sys_getpgid, sys_getpid, sys_mkdir, sys_open, O_CREAT, O_RDWR};
 
 // fcntl commands
 const F_SETOWN: i32 = 8;
@@ -15,6 +16,7 @@ const F_GETSIG: i32 = 11;
 
 // Error codes
 const EBADF: i64 = -9;
+const ESRCH: i64 = -3;
 
 /// Run all fcntl owner tests
 pub fn run_tests() {
@@ -40,8 +42,9 @@ fn test_setown_getown() {
         return;
     }
 
-    // Set owner to PID 42
-    let ret = sys_fcntl(fd as i32, F_SETOWN, 42);
+    // Set owner to our own pid (an existing process)
+    let me = sys_getpid();
+    let ret = sys_fcntl(fd as i32, F_SETOWN, me as u64);
     if ret != 0 {
         print(b"FCNTL_OWNER_SETOWN:FAIL: F_SETOWN returned ");
         print_num(ret);
@@ -52,10 +55,19 @@ fn test_setown_getown() {
 
     // Get owner back
     let owner = sys_fcntl(fd as i32, F_GETOWN, 0);
-    if owner != 42 {
+    if owner != me {
         print(b"FCNTL_OWNER_SETOWN:FAIL: F_GETOWN returned ");
         print_num(owner);
-        println(b" expected 42");
+        println(b" expected own pid");
+        sys_close(fd as u64);
+        return;
+    }
+    // No such process: ESRCH, owner unchanged
+    let ret = sys_fcntl(fd as i32, F_SETOWN, 0x3f_fff0);
+    if ret != ESRCH || sys_fcntl(fd as i32, F_GETOWN, 0) != me {
+        print(b"FCNTL_OWNER_SETOWN:FAIL: unknown pid returned ");
+        print_num(ret);
+        println(b"");
         sys_close(fd as u64);
         return;
     }
@@ -66,10 +78,6 @@ fn test_setown_getown() {
 
 /// Test F_SETOWN with negative value (PGID)
 fn test_setown_negative() {
-    if host_mode() {
-        skip(b"FCNTL_OWNER_PGID", b"deferred: network/fcntl owner semantics");
-        return;
-    }
     let path = b"/tmp/fcntl_owner_pgid\0";
 
     let fd = sys_open(path.as_ptr(), O_RDWR | O_CREAT, 0o644);
@@ -80,8 +88,18 @@ fn test_setown_negative() {
         return;
     }
 
-    // Set owner to PGID -100 (process group 100)
-    let ret = sys_fcntl(fd as i32, F_SETOWN, (-100i32) as u64);
+    // Unknown process group: ESRCH
+    let ret = sys_fcntl(fd as i32, F_SETOWN, (-0x3f_fff0i32) as u64);
+    if ret != ESRCH {
+        print(b"FCNTL_OWNER_PGID:FAIL: unknown pgid returned ");
+        print_num(ret);
+        println(b"");
+        sys_close(fd as u64);
+        return;
+    }
+    // Our own process group
+    let pg = -(sys_getpgid(0) as i32);
+    let ret = sys_fcntl(fd as i32, F_SETOWN, pg as u64);
     if ret != 0 {
         print(b"FCNTL_OWNER_PGID:FAIL: F_SETOWN returned ");
         print_num(ret);
@@ -90,12 +108,12 @@ fn test_setown_negative() {
         return;
     }
 
-    // Get owner back - should be -100
+    // Get owner back: -pgid
     let owner = sys_fcntl(fd as i32, F_GETOWN, 0);
-    if owner != -100 {
+    if owner != pg as i64 {
         print(b"FCNTL_OWNER_PGID:FAIL: F_GETOWN returned ");
         print_num(owner);
-        println(b" expected -100");
+        println(b" expected -pgid");
         sys_close(fd as u64);
         return;
     }

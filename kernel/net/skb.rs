@@ -37,7 +37,8 @@ pub const NET_SKB_PAD: usize = 64;
 pub const ETH_FRAME_LEN: usize = 1514;
 
 /// Maximum packet size we'll allocate
-pub const MAX_SKB_SIZE: usize = 2048;
+/// Largest buffer: a 64 KB IP datagram plus headroom (loopback MTU)
+pub const MAX_SKB_SIZE: usize = 65536 + 512;
 
 /// Network buffer - equivalent to Linux sk_buff
 pub struct SkBuff {
@@ -87,6 +88,9 @@ pub struct SkBuff {
     /// Received IP packet was addressed to a broadcast address (Linux
     /// RTCF_BROADCAST; set by ip_rcv)
     pub ip_bcast: bool,
+    /// Received IP header TTL and TOS (for IP_RECVTTL / IP_RECVTOS)
+    pub ip_ttl: u8,
+    pub ip_tos: u8,
     /// Start of the MAC header in the buffer (null until received)
     mac: *mut u8,
 }
@@ -151,6 +155,8 @@ impl SkBuff {
             daddr: None,
             pkt_type: PktType::Host,
             ip_bcast: false,
+            ip_ttl: 0,
+            ip_tos: 0,
             mac: core::ptr::null_mut(),
         }))
     }

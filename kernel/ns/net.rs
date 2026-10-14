@@ -25,11 +25,11 @@ use spin::{Lazy, Mutex, RwLock};
 use crate::error::KernelError;
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::inet::fib::Fib;
+use crate::net::inet::port::PortRange;
 use crate::net::ipv4::Ipv4Addr;
 use crate::net::netlink::NlTable;
-use crate::net::socket::Socket;
-use crate::net::tcp::TcpFourTuple;
-use crate::net::udp::UdpTwoTuple;
+use crate::net::tcp::{TcpFourTuple, TcpSock};
+use crate::net::udp::UdpTable;
 
 // ARP types from arp.rs that we need
 use crate::net::arp::ArpEntry;
@@ -63,23 +63,26 @@ pub struct NetNamespace {
     pub nl: NlTable,
 
     /// TCP connection table (four-tuple -> socket)
-    tcp_connections: RwLock<BTreeMap<TcpFourTuple, Arc<Socket>>>,
+    tcp_connections: RwLock<BTreeMap<TcpFourTuple, Arc<TcpSock>>>,
 
     /// TCP listening sockets (local_port -> socket)
     /// Following Linux's inet_hashtables listening hash
-    tcp_listeners: RwLock<BTreeMap<u16, Arc<Socket>>>,
+    tcp_listeners: RwLock<BTreeMap<u16, Arc<TcpSock>>>,
 
-    /// UDP socket table (two-tuple -> socket)
-    udp_sockets: RwLock<BTreeMap<UdpTwoTuple, Arc<Socket>>>,
+    /// UDP sockets by local port
+    pub udp: UdpTable,
+
+    /// TCP sockets owning a local port
+    pub tcp_bind: crate::net::tcp::TcpBind,
+
+    /// net.ipv4.ip_local_port_range
+    pub port_range: PortRange,
 
     /// ARP cache entries indexed by IP address
     arp_entries: Mutex<BTreeMap<u32, ArpEntry>>,
 
     /// Packets waiting for ARP resolution
     arp_pending: Mutex<BTreeMap<u32, VecDeque<crate::net::arp::PendingPacket>>>,
-
-    /// Next ephemeral port
-    next_port: AtomicU32,
 
     /// Loopback device for this namespace
     loopback: RwLock<Option<Arc<NetDevice>>>,
@@ -95,10 +98,11 @@ impl NetNamespace {
             nl: NlTable::new(),
             tcp_connections: RwLock::new(BTreeMap::new()),
             tcp_listeners: RwLock::new(BTreeMap::new()),
-            udp_sockets: RwLock::new(BTreeMap::new()),
+            udp: UdpTable::default(),
+            tcp_bind: Default::default(),
+            port_range: PortRange::default(),
             arp_entries: Mutex::new(BTreeMap::new()),
             arp_pending: Mutex::new(BTreeMap::new()),
-            next_port: AtomicU32::new(32768),
             loopback: RwLock::new(None),
         });
 
@@ -124,7 +128,7 @@ impl NetNamespace {
     // ========================================================================
 
     /// Register a TCP connection in this namespace
-    pub fn tcp_register(&self, tuple: TcpFourTuple, socket: Arc<Socket>) {
+    pub fn tcp_register(&self, tuple: TcpFourTuple, socket: Arc<TcpSock>) {
         self.tcp_connections.write().insert(tuple, socket);
     }
 
@@ -134,14 +138,14 @@ impl NetNamespace {
     }
 
     /// Look up a TCP connection in this namespace
-    pub fn tcp_lookup(&self, tuple: &TcpFourTuple) -> Option<Arc<Socket>> {
+    pub fn tcp_lookup(&self, tuple: &TcpFourTuple) -> Option<Arc<TcpSock>> {
         self.tcp_connections.read().get(tuple).cloned()
     }
 
     /// Register a listening socket in this namespace
     ///
     /// Following Linux's inet_csk_listen_start() which adds to listening hash.
-    pub fn tcp_listen_register(&self, port: u16, socket: Arc<Socket>) {
+    pub fn tcp_listen_register(&self, port: u16, socket: Arc<TcpSock>) {
         self.tcp_listeners.write().insert(port, socket);
     }
 
@@ -154,48 +158,8 @@ impl NetNamespace {
     ///
     /// Following Linux's __inet_lookup_listener().
     /// For now we just match by port; Linux also considers local address.
-    pub fn tcp_lookup_listener(&self, local_port: u16) -> Option<Arc<Socket>> {
+    pub fn tcp_lookup_listener(&self, local_port: u16) -> Option<Arc<TcpSock>> {
         self.tcp_listeners.read().get(&local_port).cloned()
-    }
-
-    /// Allocate an ephemeral port in this namespace
-    pub fn alloc_port(&self) -> u16 {
-        let port = self.next_port.fetch_add(1, Ordering::Relaxed);
-        if port > 60999 {
-            self.next_port.store(32768, Ordering::Relaxed);
-        }
-        port as u16
-    }
-
-    // ========================================================================
-    // UDP socket management
-    // ========================================================================
-
-    /// Register a UDP socket in this namespace
-    pub fn udp_register(&self, tuple: UdpTwoTuple, socket: Arc<Socket>) {
-        self.udp_sockets.write().insert(tuple, socket);
-    }
-
-    /// Unregister a UDP socket from this namespace
-    pub fn udp_unregister(&self, tuple: &UdpTwoTuple) {
-        self.udp_sockets.write().remove(tuple);
-    }
-
-    /// Look up a UDP socket by port in this namespace
-    ///
-    /// For UDP, we only need to match by local port (and optionally local address).
-    /// This is simpler than TCP's four-tuple matching.
-    pub fn udp_lookup_by_port(&self, local_port: u16) -> Option<Arc<Socket>> {
-        let sockets = self.udp_sockets.read();
-
-        // First try to find exact match with any local address
-        for (tuple, socket) in sockets.iter() {
-            if tuple.local_port == local_port {
-                return Some(Arc::clone(socket));
-            }
-        }
-
-        None
     }
 
     // ========================================================================

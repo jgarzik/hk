@@ -2213,6 +2213,11 @@ pub fn lookup_task_pgid(pid: Pid) -> Option<Pid> {
     table.tasks.iter().find(|t| t.pid == pid).map(|t| t.pgid)
 }
 
+/// True if some task is in process group `pgid`
+pub fn pgrp_exists(pgid: Pid) -> bool {
+    TASK_TABLE.lock().tasks.iter().any(|t| t.pgid == pgid)
+}
+
 /// Look up a task's session ID by PID
 ///
 /// Returns None if the process is not found.

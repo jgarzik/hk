@@ -13,7 +13,7 @@ use core::sync::atomic::Ordering;
 use crate::net::ipv4::Ipv4Addr;
 use crate::net::request_sock::RequestSock;
 use crate::net::skb::SkBuff;
-use crate::net::socket::{AddressFamily, Socket, SocketType};
+use crate::net::tcp::TcpSock;
 use crate::net::tcp::{
     TCP_HLEN_MIN, TcpFourTuple, TcpHdr, TcpState, flags, tcp_checksum, tcp_register_connection,
 };
@@ -66,10 +66,7 @@ pub fn tcp_rcv(skb: SkBuff) {
 
     // First, try to find an established connection (like __inet_lookup_established)
     if let Some(socket) = net.tcp_lookup(&tuple) {
-        let tcp = match socket.tcp.as_ref() {
-            Some(t) => t,
-            None => return,
-        };
+        let tcp = &socket.tcp;
         let _guard = tcp.lock();
 
         // Get payload
@@ -105,10 +102,7 @@ pub fn tcp_rcv(skb: SkBuff) {
 
     // No established connection - check for listening socket (like __inet_lookup_listener)
     if let Some(listener) = net.tcp_lookup_listener(hdr.dest_port()) {
-        let tcp = match listener.tcp.as_ref() {
-            Some(t) => t,
-            None => return,
-        };
+        let tcp = &listener.tcp;
         let _guard = tcp.lock();
 
         if tcp.state() != TcpState::Listen {
@@ -120,10 +114,31 @@ pub fn tcp_rcv(skb: SkBuff) {
         return;
     }
 
-    // No connection and no listener - send RST if not RST
-    if !hdr.has_flag(flags::RST) {
-        // TODO: send RST for closed port
+    // No connection and no listener: reset (never answer a RST)
+    if !hdr.has_flag(flags::RST) && !skb.ip_bcast {
+        let plen = (skb.len() - data_offset) as u32;
+        send_reset(&net, daddr, saddr, hdr, plen);
     }
+}
+
+/// RST answering segment `hdr` (RFC 9293 3.10.7.1, Linux
+/// tcp_v4_send_reset): seq = their ACK if any, else ACK their segment
+fn send_reset(
+    net: &crate::net::NetNamespace,
+    laddr: Ipv4Addr,
+    raddr: Ipv4Addr,
+    hdr: &TcpHdr,
+    plen: u32,
+) {
+    let (lp, rp) = (hdr.dest_port(), hdr.source_port());
+    let r = if hdr.has_flag(flags::ACK) {
+        crate::net::tcp_output::tcp_send_rst(net, laddr, lp, raddr, rp, hdr.ack_seq(), None)
+    } else {
+        let syn_fin = hdr.has_flag(flags::SYN) as u32 + hdr.has_flag(flags::FIN) as u32;
+        let ack = hdr.seq().wrapping_add(plen + syn_fin);
+        crate::net::tcp_output::tcp_send_rst(net, laddr, lp, raddr, rp, 0, Some(ack))
+    };
+    let _ = r;
 }
 
 /// Process packet to a listening socket
@@ -132,7 +147,7 @@ pub fn tcp_rcv(skb: SkBuff) {
 /// - SYN: Create request_sock, send SYN-ACK, add to SYN queue
 /// - ACK: Complete 3WHS, create child socket, add to accept queue
 fn process_listen(
-    listener: &Arc<Socket>,
+    listener: &Arc<TcpSock>,
     hdr: &TcpHdr,
     remote_addr: Ipv4Addr,
     local_addr: Ipv4Addr,
@@ -230,24 +245,19 @@ fn process_listen(
 /// - Set up TCP state for established connection
 /// - Register in connection table
 fn create_child_socket(
-    listener: &Arc<Socket>,
+    listener: &Arc<TcpSock>,
     req: &RequestSock,
     hdr: &TcpHdr,
-) -> Option<Arc<Socket>> {
+) -> Option<Arc<TcpSock>> {
     // Create new socket (like inet_csk_clone_lock)
-    let child = Socket::new_in(
-        Arc::clone(&listener.net),
-        AddressFamily::Inet,
-        SocketType::Stream,
-        0,
-    );
+    let child = TcpSock::child(listener);
 
     // Set addresses
     child.set_local(req.local_addr, req.local_port);
     child.set_remote(req.remote_addr, req.remote_port);
 
     // Initialize TCP state for established connection
-    let tcp = child.tcp.as_ref()?;
+    let tcp = &child.tcp;
 
     // Set sequence numbers
     // Our ISS was req.iss, SYN-ACK consumed 1, so snd_una = snd_nxt = iss + 1
@@ -280,8 +290,8 @@ fn create_child_socket(
 }
 
 /// Process segment in SYN-SENT state
-fn process_syn_sent(socket: &Arc<Socket>, hdr: &TcpHdr, _payload: &[u8]) {
-    let tcp = socket.tcp.as_ref().unwrap();
+fn process_syn_sent(socket: &Arc<TcpSock>, hdr: &TcpHdr, _payload: &[u8]) {
+    let tcp = &socket.tcp;
 
     // Expecting SYN-ACK
     if hdr.has_flag(flags::ACK) {
@@ -299,8 +309,9 @@ fn process_syn_sent(socket: &Arc<Socket>, hdr: &TcpHdr, _payload: &[u8]) {
 
         if hdr.has_flag(flags::RST) {
             // Connection refused
+            socket.set_error(crate::error::KernelError::ConnectionRefused);
             tcp.set_state(TcpState::Closed);
-            socket.set_error(crate::error::KernelError::ConnectionRefused.to_errno_neg());
+            socket.done();
             socket.wake_connect();
             return;
         }
@@ -327,13 +338,14 @@ fn process_syn_sent(socket: &Arc<Socket>, hdr: &TcpHdr, _payload: &[u8]) {
 }
 
 /// Process segment in ESTABLISHED state
-fn process_established(socket: &Arc<Socket>, hdr: &TcpHdr, payload: &[u8], _saddr: Ipv4Addr) {
-    let tcp = socket.tcp.as_ref().unwrap();
+fn process_established(socket: &Arc<TcpSock>, hdr: &TcpHdr, payload: &[u8], _saddr: Ipv4Addr) {
+    let tcp = &socket.tcp;
 
     // Check RST
     if hdr.has_flag(flags::RST) {
+        socket.set_error(crate::error::KernelError::ConnectionReset);
         tcp.set_state(TcpState::Closed);
-        socket.set_error(crate::error::KernelError::ConnectionReset.to_errno_neg());
+        socket.done();
         socket.wake_all();
         return;
     }
@@ -408,12 +420,13 @@ fn process_established(socket: &Arc<Socket>, hdr: &TcpHdr, payload: &[u8], _sadd
 }
 
 /// Process segment in FIN-WAIT-1 state
-fn process_fin_wait1(socket: &Arc<Socket>, hdr: &TcpHdr, _payload: &[u8]) {
-    let tcp = socket.tcp.as_ref().unwrap();
+fn process_fin_wait1(socket: &Arc<TcpSock>, hdr: &TcpHdr, _payload: &[u8]) {
+    let tcp = &socket.tcp;
 
     // Check RST
     if hdr.has_flag(flags::RST) {
         tcp.set_state(TcpState::Closed);
+        socket.done();
         socket.wake_all();
         return;
     }
@@ -436,6 +449,7 @@ fn process_fin_wait1(socket: &Arc<Socket>, hdr: &TcpHdr, _payload: &[u8]) {
 
         if tcp.state() == TcpState::FinWait2 {
             tcp.set_state(TcpState::TimeWait);
+            socket.done();
         } else {
             tcp.set_state(TcpState::Closing);
         }
@@ -448,8 +462,8 @@ fn process_fin_wait1(socket: &Arc<Socket>, hdr: &TcpHdr, _payload: &[u8]) {
 }
 
 /// Process segment in FIN-WAIT-2 state
-fn process_fin_wait2(socket: &Arc<Socket>, hdr: &TcpHdr, _payload: &[u8]) {
-    let tcp = socket.tcp.as_ref().unwrap();
+fn process_fin_wait2(socket: &Arc<TcpSock>, hdr: &TcpHdr, _payload: &[u8]) {
+    let tcp = &socket.tcp;
 
     // Process FIN
     if hdr.has_flag(flags::FIN) {
@@ -457,6 +471,8 @@ fn process_fin_wait2(socket: &Arc<Socket>, hdr: &TcpHdr, _payload: &[u8]) {
         tcp.set_rcv_nxt(rcv_nxt.wrapping_add(1));
 
         tcp.set_state(TcpState::TimeWait);
+
+        socket.done();
 
         // Send ACK for FIN
         let _ = crate::net::tcp_output::tcp_send_ack(socket);
@@ -466,22 +482,24 @@ fn process_fin_wait2(socket: &Arc<Socket>, hdr: &TcpHdr, _payload: &[u8]) {
 }
 
 /// Process segment in CLOSE-WAIT state
-fn process_close_wait(socket: &Arc<Socket>, hdr: &TcpHdr) {
-    let tcp = socket.tcp.as_ref().unwrap();
+fn process_close_wait(socket: &Arc<TcpSock>, hdr: &TcpHdr) {
+    let tcp = &socket.tcp;
 
     if hdr.has_flag(flags::RST) {
         tcp.set_state(TcpState::Closed);
+        socket.done();
         socket.wake_all();
     }
 }
 
 /// Process segment in LAST-ACK state
-fn process_last_ack(socket: &Arc<Socket>, hdr: &TcpHdr) {
-    let tcp = socket.tcp.as_ref().unwrap();
+fn process_last_ack(socket: &Arc<TcpSock>, hdr: &TcpHdr) {
+    let tcp = &socket.tcp;
 
     if hdr.has_flag(flags::ACK) {
         // Our FIN was ACKed
         tcp.set_state(TcpState::Closed);
+        socket.done();
         socket.wake_all();
     }
 }

@@ -41,7 +41,7 @@ struct Linger {
     l_onoff: i32,
     l_linger: i32,
 }
-use super::helpers::{print, println, print_num, host_mode, skip};
+use super::helpers::{print, println, print_num, host_mode};
 
 /// Run all socket tests
 pub fn run_tests() {
@@ -254,10 +254,6 @@ fn test_listen() {
 
 /// Test shutdown operations
 fn test_shutdown() {
-    if host_mode() {
-        skip(b"SOCKET_SHUTDOWN", b"deferred: network/fcntl owner semantics");
-        return;
-    }
     let fd = sys_socket(AF_INET, SOCK_STREAM, 0);
     if fd < 0 {
         println(b"SOCKET_SHUTDOWN:FAIL");
@@ -297,8 +293,8 @@ fn test_shutdown() {
 
     sys_close(fd3 as u64);
 
-    // All shutdown calls should succeed (returns 0)
-    if ret_rd == 0 && ret_wr == 0 && ret_rdwr == 0 {
+    // Not connected: ENOTCONN for every direction (Linux inet_shutdown)
+    if ret_rd == -107 && ret_wr == -107 && ret_rdwr == -107 {
         println(b"SOCKET_SHUTDOWN:OK");
     } else {
         println(b"SOCKET_SHUTDOWN:FAIL");
@@ -391,10 +387,6 @@ fn test_udp_bind() {
 
 /// Test socketpair syscall
 fn test_socketpair() {
-    if host_mode() {
-        skip(b"SOCKETPAIR", b"deferred: network/fcntl owner semantics");
-        return;
-    }
     let mut sv: [i32; 2] = [-1, -1];
 
     let ret = sys_socketpair(AF_INET, SOCK_DGRAM, 0, &mut sv as *mut [i32; 2]);
@@ -407,17 +399,11 @@ fn test_socketpair() {
     print_num(sv[1] as i64);
     print(b"]");
 
-    if ret == 0 && sv[0] >= 0 && sv[1] >= 0 && sv[0] != sv[1] {
-        sys_close(sv[0] as u64);
-        sys_close(sv[1] as u64);
+    // AF_INET has no socket pairs (Linux sock_no_socketpair; Linux has
+    // already stored descriptor numbers in sv, which it then releases)
+    if ret == -95 {
         println(b"SOCKETPAIR:OK");
     } else {
-        if sv[0] >= 0 {
-            sys_close(sv[0] as u64);
-        }
-        if sv[1] >= 0 {
-            sys_close(sv[1] as u64);
-        }
         println(b"SOCKETPAIR:FAIL");
     }
 }
@@ -442,17 +428,17 @@ fn test_sendmsg_recvmsg() {
 
     let msg = MsgHdr::new(&mut iov as *mut IoVec, 1);
 
-    // sendmsg on unconnected TCP socket should fail with ENOTCONN (-107)
-    // or EPIPE (-32) depending on implementation
-    let ret = sys_sendmsg(fd as i32, &msg as *const MsgHdr, 0);
+    // sendmsg on an unconnected TCP socket: EPIPE (Linux
+    // sk_stream_wait_connect); MSG_NOSIGNAL suppresses SIGPIPE
+    const MSG_NOSIGNAL: i32 = 0x4000;
+    let ret = sys_sendmsg(fd as i32, &msg as *const MsgHdr, MSG_NOSIGNAL);
 
     print(b"sendmsg on unconnected socket returned ");
     print_num(ret);
 
     sys_close(fd as u64);
 
-    // We expect an error (negative) since socket is not connected
-    if ret < 0 {
+    if ret == -32 {
         println(b"SENDMSG_RECVMSG:OK");
     } else {
         println(b"SENDMSG_RECVMSG:FAIL");

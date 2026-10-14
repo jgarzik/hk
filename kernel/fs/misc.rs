@@ -329,6 +329,13 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
             current_fd_table().lock().set_fd_flags(fd, 0);
             return 0;
         }
+        FIONREAD if file.get_inode().is_some_and(|i| i.mode().is_socket()) => {
+            // Sockets answer FIONREAD/SIOCINQ themselves
+            return match file.f_op.ioctl(&file, cmd, arg) {
+                Ok(v) => v,
+                Err(e) => e.sysret(),
+            };
+        }
         FIONREAD => {
             // Get bytes available for reading
             if arg == 0 {

@@ -31,18 +31,47 @@ tests run with SMAP on x86 TCG `-cpu max` and PAN on arm `neoverse-n1`).
 The only raw access left is the early minimal `write`, unused once the
 VFS handler is registered.
 
-## Network stack gaps reachable since eth0 receives (P2)
+## Network stack gaps (later phases of the network chunk)
 
 **Location**: `kernel/net/`
 
-Planned for later phases of the network chunk, listed because real
-traffic now reaches them: TCP has no retransmission or timers, so a
-dropped segment (TX ring full, backlog overflow) stalls a connection
-(P6); closed UDP/TCP sockets stay in the namespace tables, so a port is
-never freed and the stale socket can still match lookups (P4); ARP has
-no state machine, every unresolved packet sends a request and entries
-never expire (P5); no IP fragmentation/reassembly (P5); bind() to an
-address that is not local is accepted (Linux: EADDRNOTAVAIL) (P4).
+Listed because real traffic reaches them: TCP has no retransmission or
+timers, so a dropped segment (TX ring full, backlog overflow) stalls a
+connection, TIME_WAIT ends immediately (no 2MSL), close does not RST
+unread data and SO_LINGER is stored only (P6); ARP has no state
+machine, every unresolved packet sends a request and entries never
+expire (P5); no IP fragmentation/reassembly, so datagrams larger than
+the device MTU fail with EMSGSIZE where Linux fragments (P5); no ICMP
+errors are generated or delivered (port unreachable, connected-UDP
+ECONNREFUSED, IP_RECVERR queue: MSG_ERRQUEUE is always EAGAIN) (P5).
+UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
+SO_PEEK_OFF is EOPNOTSUPP. TCP binds share a port only per the
+SO_REUSEADDR/SO_REUSEPORT rules; connect() picks an entirely unused
+ephemeral port instead of Linux's per-4-tuple reuse.
+
+## Global init is not protected from default-action signals
+
+**Location**: `kernel/signal/mod.rs` send_signal
+
+Linux drops signals with a default action of terminate/stop sent to
+global init (SIGNAL_UNKILLABLE), e.g. SIGPIPE from a write to a broken
+socket. hk delivers them, so pid 1 (the boot tester) dies. Socket tests
+use MSG_NOSIGNAL / SIG_IGN and check SIGPIPE in forked children.
+
+## New descriptors are not the lowest free number
+
+**Location**: `kernel/task/mod.rs` FdTable::alloc / alloc_with_flags
+
+Linux returns the lowest unused descriptor (POSIX requires it for open,
+socket, dup, ...); hk hands out an ever-increasing counter, so programs
+that close 0-2 and reopen, or expect small numbers, diverge.
+
+## Large user stack frames hang the boot tester
+
+A test function with a 16 KB local array (`[IoVec; 1025]`) inlined into
+its caller made the boot tester hang before printing anything instead
+of running or faulting. Not investigated (user stack growth / guard
+handling suspected); tests keep big buffers static.
 
 ## NETLINK_ROUTE / SIOC* subset gaps (P3)
 

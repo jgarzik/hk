@@ -327,6 +327,8 @@ pub fn ip_rcv(mut skb: SkBuff) {
 
     // Store protocol info in skb
     skb.ip_protocol = hdr.protocol;
+    skb.ip_ttl = hdr.ttl;
+    skb.ip_tos = hdr.tos;
     skb.saddr = Some(hdr.saddr());
     skb.daddr = Some(hdr.daddr());
 
@@ -348,61 +350,74 @@ pub fn ip_rcv(mut skb: SkBuff) {
     }
 }
 
-/// Queue a packet for transmission in namespace `net`
-///
-/// Routes `skb.daddr` (`inet::route::output`; local destinations leave
-/// through `lo`), builds the IP header with `skb.saddr` (or the route's
-/// source), resolves the next hop (ARP; `lo` needs none) and transmits.
-///
-/// Never delivers synchronously: `lo` queues to the receive backlog.
-/// Callers may hold a socket lock (lock order: socket -> FIB -> ARP ->
-/// device TX).
+/// Queue a packet for transmission in namespace `net` with default
+/// TOS/TTL: routes `skb.daddr` from `skb.saddr` (0 = the route's
+/// source), then `ip_send_rt`
 pub fn ip_queue_xmit(
     net: &NetNamespace,
-    mut skb: Box<SkBuff>,
+    skb: Box<SkBuff>,
     protocol: u8,
 ) -> Result<(), KernelError> {
     let daddr = skb.daddr.ok_or(KernelError::InvalidArgument)?;
     let src = skb.saddr.unwrap_or_default();
     let rt = route::output(net, daddr, src, 0)?;
+    ip_send_rt(net, &rt, skb, protocol, IpParams::default())
+}
+
+/// Per-packet IP header parameters (Linux ipcm_cookie subset)
+#[derive(Clone, Copy, Debug)]
+pub struct IpParams {
+    pub tos: u8,
+    pub ttl: u8,
+}
+
+impl Default for IpParams {
+    fn default() -> Self {
+        Self {
+            tos: 0,
+            ttl: IP_DEFAULT_TTL,
+        }
+    }
+}
+
+/// Build the IP header for `skb` (source `skb.saddr`, else the route's)
+/// and send it along `rt` (`lo` for local destinations; ARP for the next
+/// hop otherwise). EMSGSIZE above the device MTU (DF; no fragmentation
+/// yet). Never delivers synchronously: `lo` queues to the receive
+/// backlog. Callers may hold a socket lock (lock order: socket -> FIB
+/// -> ARP -> device TX).
+pub fn ip_send_rt(
+    net: &NetNamespace,
+    rt: &route::Rtable,
+    mut skb: Box<SkBuff>,
+    protocol: u8,
+    p: IpParams,
+) -> Result<(), KernelError> {
+    let src = skb.saddr.unwrap_or_default();
     let saddr = if src.is_unspecified() { rt.saddr } else { src };
+    let daddr = rt.daddr;
     let dev = rt.dev.clone();
     let next_hop = rt.nexthop();
-
-    // Build IP header
-    let payload_len = skb.len();
-    let tot_len = (IP_HLEN_MIN + payload_len) as u16;
-
+    let tot_len = IP_HLEN_MIN + skb.len();
+    if tot_len > dev.mtu() as usize || tot_len > u16::MAX as usize {
+        return Err(KernelError::MessageTooLong);
+    }
     let ip_hdr = skb.push(IP_HLEN_MIN).ok_or(KernelError::NoBufferSpace)?;
-
-    // Version (4) + IHL (5 = 20 bytes)
     ip_hdr[0] = 0x45;
-    // TOS
-    ip_hdr[1] = 0;
-    // Total length
-    ip_hdr[2..4].copy_from_slice(&tot_len.to_be_bytes());
-    // ID
+    ip_hdr[1] = p.tos;
+    ip_hdr[2..4].copy_from_slice(&(tot_len as u16).to_be_bytes());
     ip_hdr[4..6].copy_from_slice(&next_ip_id().to_be_bytes());
-    // Flags + Fragment offset (Don't Fragment)
+    // Don't Fragment
     ip_hdr[6] = 0x40;
     ip_hdr[7] = 0;
-    // TTL
-    ip_hdr[8] = IP_DEFAULT_TTL;
-    // Protocol
+    ip_hdr[8] = p.ttl;
     ip_hdr[9] = protocol;
-    // Checksum (compute later)
     ip_hdr[10] = 0;
     ip_hdr[11] = 0;
-    // Source address
     ip_hdr[12..16].copy_from_slice(&saddr.to_be_bytes());
-    // Destination address
     ip_hdr[16..20].copy_from_slice(&daddr.to_be_bytes());
-
-    // Compute IP checksum
     let checksum = ip_checksum(&ip_hdr[..IP_HLEN_MIN]);
     ip_hdr[10..12].copy_from_slice(&checksum.to_be_bytes());
-
-    // Set device on skb
     skb.dev = Some(Arc::clone(&dev));
 
     // Loopback has no link-layer resolution (Linux: NUD_NOARP neighbour)
@@ -412,9 +427,6 @@ pub fn ip_queue_xmit(
     if rt.rtype == crate::net::inet::fib::RouteType::Broadcast {
         return ip_finish_output(skb, ethernet::ETH_BROADCAST);
     }
-
-    // Resolve next-hop MAC address and transmit
-    // arp_resolve either transmits immediately (MAC cached) or queues for later (ARP pending)
     arp::arp_resolve(net, &dev, next_hop, skb)
 }
 

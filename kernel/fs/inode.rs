@@ -110,6 +110,11 @@ impl InodeMode {
         self.file_type() == Some(FileType::BlockDev)
     }
 
+    /// Check if this is a socket
+    pub fn is_socket(&self) -> bool {
+        self.file_type() == Some(FileType::Socket)
+    }
+
     /// Check if this is any device (char or block)
     pub fn is_device(&self) -> bool {
         self.is_chrdev() || self.is_blkdev()

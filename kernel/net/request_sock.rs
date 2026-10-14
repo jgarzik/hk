@@ -20,8 +20,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Mutex;
 
 use crate::net::ipv4::Ipv4Addr;
-use crate::net::socket::Socket;
-use crate::waitqueue::WaitQueue;
+use crate::net::tcp::TcpSock;
 
 /// Mini-socket representing a connection request in SYN_RECV state.
 ///
@@ -104,15 +103,12 @@ pub struct RequestSockQueue {
     syn_queue_len: AtomicU32,
 
     /// Queue of completed connections (child sockets ready for accept)
-    accept_queue: Mutex<VecDeque<Arc<Socket>>>,
+    accept_queue: Mutex<VecDeque<Arc<TcpSock>>>,
     /// Length of accept queue (atomic for fast check)
     accept_queue_len: AtomicU32,
 
     /// Maximum backlog (from listen() call)
     max_backlog: AtomicU32,
-
-    /// Wait queue for accept() blocking
-    accept_wait: WaitQueue,
 }
 
 impl RequestSockQueue {
@@ -124,7 +120,6 @@ impl RequestSockQueue {
             accept_queue: Mutex::new(VecDeque::new()),
             accept_queue_len: AtomicU32::new(0),
             max_backlog: AtomicU32::new(backlog.max(1)),
-            accept_wait: WaitQueue::new(),
         }
     }
 
@@ -177,27 +172,19 @@ impl RequestSockQueue {
 
     /// Add a completed connection to the accept queue
     /// Called after 3WHS completes and child socket is created
-    pub fn accept_queue_add(&self, socket: Arc<Socket>) {
+    pub fn accept_queue_add(&self, socket: Arc<TcpSock>) {
         let mut queue = self.accept_queue.lock();
         queue.push_back(socket);
         self.accept_queue_len.fetch_add(1, Ordering::Release);
-
-        // Wake up any waiting accept() calls
-        self.accept_wait.wake_one();
     }
 
     /// Remove and return the next completed connection from accept queue
     /// Called by accept() syscall
-    pub fn accept_queue_remove(&self) -> Option<Arc<Socket>> {
+    pub fn accept_queue_remove(&self) -> Option<Arc<TcpSock>> {
         let mut queue = self.accept_queue.lock();
         let socket = queue.pop_front()?;
         self.accept_queue_len.fetch_sub(1, Ordering::Release);
         Some(socket)
-    }
-
-    /// Wait for a connection to be available in accept queue
-    pub fn wait(&self) {
-        self.accept_wait.wait();
     }
 
     /// Get current SYN queue length

@@ -13,6 +13,7 @@ use crate::fs::{KernelError, LookupFlags, lookup_path_flags};
 use crate::task::percpu::current_tid;
 use crate::uaccess::{copy_from_user, copy_to_user, strncpy_from_user};
 
+use super::file::File;
 use super::posix_lock::{Flock, posix_getlk, posix_setlk, posix_setlkw};
 use super::syscall::{PATH_MAX, current_fd_table, get_nofile_limit};
 
@@ -554,13 +555,14 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
         }
 
         F_SETOWN => {
-            // Set owner PID/PGID for async I/O signals
             let file = match table.get(fd) {
                 Some(f) => f,
                 None => return KernelError::BadFd.sysret(),
             };
-            file.set_owner(arg as i32);
-            0
+            match f_setown(&file, arg as i32) {
+                Ok(()) => 0,
+                Err(e) => e.sysret(),
+            }
         }
 
         F_GETOWN => {
@@ -598,4 +600,23 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
 
         _ => KernelError::InvalidArgument.sysret(),
     }
+}
+
+/// Set the SIGIO owner of `file` (Linux f_setown): `who` > 0 is a
+/// process, < 0 a process group, 0 clears; ESRCH if none exists,
+/// EINVAL for INT_MIN
+pub fn f_setown(file: &File, who: i32) -> Result<(), KernelError> {
+    if who == i32::MIN {
+        return Err(KernelError::InvalidArgument);
+    }
+    let exists = match who {
+        0 => true,
+        w if w > 0 => crate::task::percpu::lookup_task_pgid(w as u64).is_some(),
+        w => crate::task::percpu::pgrp_exists(w.unsigned_abs() as u64),
+    };
+    if !exists {
+        return Err(KernelError::NoProcess);
+    }
+    file.set_owner(who);
+    Ok(())
 }

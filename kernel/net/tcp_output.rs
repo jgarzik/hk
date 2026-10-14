@@ -9,12 +9,12 @@ use crate::net::KernelError;
 use crate::net::ipv4::{self, IPPROTO_TCP, Ipv4Addr};
 use crate::net::request_sock::RequestSock;
 use crate::net::skb::SkBuff;
-use crate::net::socket::Socket;
+use crate::net::tcp::TcpSock;
 use crate::net::tcp::{TCP_HLEN_MIN, TcpSegment, TcpState, flags, tcp_checksum};
 
 /// Send data over a TCP connection
-pub fn tcp_sendmsg(socket: &Arc<Socket>, data: &[u8]) -> Result<usize, KernelError> {
-    let tcp = socket.tcp.as_ref().ok_or(KernelError::InvalidArgument)?;
+pub fn tcp_sendmsg(socket: &Arc<TcpSock>, data: &[u8]) -> Result<usize, KernelError> {
+    let tcp = &socket.tcp;
     let _guard = tcp.lock();
 
     // Check state
@@ -88,7 +88,7 @@ pub fn tcp_sendmsg(socket: &Arc<Socket>, data: &[u8]) -> Result<usize, KernelErr
         skb.saddr = Some(local_addr);
         skb.daddr = Some(remote_addr);
 
-        ipv4::ip_queue_xmit(&socket.net, skb, IPPROTO_TCP)?;
+        ipv4::ip_queue_xmit(&socket.sk.net, skb, IPPROTO_TCP)?;
 
         sent += chunk_len;
     }
@@ -97,8 +97,8 @@ pub fn tcp_sendmsg(socket: &Arc<Socket>, data: &[u8]) -> Result<usize, KernelErr
 }
 
 /// Send a SYN segment
-pub fn tcp_send_syn(socket: &Arc<Socket>) -> Result<(), KernelError> {
-    let tcp = socket.tcp.as_ref().ok_or(KernelError::InvalidArgument)?;
+pub fn tcp_send_syn(socket: &Arc<TcpSock>) -> Result<(), KernelError> {
+    let tcp = &socket.tcp;
     let (local_addr, local_port) = socket.local_addr().ok_or(KernelError::InvalidArgument)?;
     let (remote_addr, remote_port) = socket.remote_addr().ok_or(KernelError::InvalidArgument)?;
 
@@ -127,12 +127,12 @@ pub fn tcp_send_syn(socket: &Arc<Socket>) -> Result<(), KernelError> {
     skb.saddr = Some(local_addr);
     skb.daddr = Some(remote_addr);
 
-    ipv4::ip_queue_xmit(&socket.net, skb, IPPROTO_TCP)
+    ipv4::ip_queue_xmit(&socket.sk.net, skb, IPPROTO_TCP)
 }
 
 /// Send an ACK segment
-pub fn tcp_send_ack(socket: &Arc<Socket>) -> Result<(), KernelError> {
-    let tcp = socket.tcp.as_ref().ok_or(KernelError::InvalidArgument)?;
+pub fn tcp_send_ack(socket: &Arc<TcpSock>) -> Result<(), KernelError> {
+    let tcp = &socket.tcp;
     let (local_addr, local_port) = socket.local_addr().ok_or(KernelError::InvalidArgument)?;
     let (remote_addr, remote_port) = socket.remote_addr().ok_or(KernelError::InvalidArgument)?;
 
@@ -157,12 +157,12 @@ pub fn tcp_send_ack(socket: &Arc<Socket>) -> Result<(), KernelError> {
     skb.saddr = Some(local_addr);
     skb.daddr = Some(remote_addr);
 
-    ipv4::ip_queue_xmit(&socket.net, skb, IPPROTO_TCP)
+    ipv4::ip_queue_xmit(&socket.sk.net, skb, IPPROTO_TCP)
 }
 
 /// Send a FIN segment
-pub fn tcp_send_fin(socket: &Arc<Socket>) -> Result<(), KernelError> {
-    let tcp = socket.tcp.as_ref().ok_or(KernelError::InvalidArgument)?;
+pub fn tcp_send_fin(socket: &Arc<TcpSock>) -> Result<(), KernelError> {
+    let tcp = &socket.tcp;
     let (local_addr, local_port) = socket.local_addr().ok_or(KernelError::InvalidArgument)?;
     let (remote_addr, remote_port) = socket.remote_addr().ok_or(KernelError::InvalidArgument)?;
 
@@ -190,7 +190,7 @@ pub fn tcp_send_fin(socket: &Arc<Socket>) -> Result<(), KernelError> {
     skb.saddr = Some(local_addr);
     skb.daddr = Some(remote_addr);
 
-    ipv4::ip_queue_xmit(&socket.net, skb, IPPROTO_TCP)
+    ipv4::ip_queue_xmit(&socket.sk.net, skb, IPPROTO_TCP)
 }
 
 /// Send a SYN-ACK segment in response to a SYN on a listening socket
@@ -198,7 +198,7 @@ pub fn tcp_send_fin(socket: &Arc<Socket>) -> Result<(), KernelError> {
 /// Following Linux's tcp_v4_send_synack() -> tcp_make_synack():
 /// This is sent from a listening socket to a client that sent a SYN.
 /// The RequestSock contains the connection parameters from the SYN.
-pub fn tcp_send_synack(listener: &Arc<Socket>, req: &RequestSock) -> Result<(), KernelError> {
+pub fn tcp_send_synack(listener: &Arc<TcpSock>, req: &RequestSock) -> Result<(), KernelError> {
     let mut skb = SkBuff::alloc_tx(0).ok_or(KernelError::OutOfMemory)?;
 
     // SYN-ACK: seq = our ISS, ack = client's ISN + 1
@@ -221,10 +221,12 @@ pub fn tcp_send_synack(listener: &Arc<Socket>, req: &RequestSock) -> Result<(), 
     skb.saddr = Some(req.local_addr);
     skb.daddr = Some(req.remote_addr);
 
-    ipv4::ip_queue_xmit(&listener.net, skb, IPPROTO_TCP)
+    ipv4::ip_queue_xmit(&listener.sk.net, skb, IPPROTO_TCP)
 }
 
-/// Send a RST segment
+/// Send a RST segment (with ACK of `ack` if given; Linux
+/// tcp_v4_send_reset)
+#[allow(clippy::too_many_arguments)]
 pub fn tcp_send_rst(
     net: &crate::net::NetNamespace,
     local_addr: Ipv4Addr,
@@ -232,24 +234,26 @@ pub fn tcp_send_rst(
     remote_addr: Ipv4Addr,
     remote_port: u16,
     seq: u32,
+    ack: Option<u32>,
 ) -> Result<(), KernelError> {
     let mut skb = SkBuff::alloc_tx(0).ok_or(KernelError::OutOfMemory)?;
-
+    let (fl, a) = match ack {
+        Some(a) => (flags::RST | flags::ACK, a),
+        None => (flags::RST, 0),
+    };
     build_tcp_header(
         &mut skb,
         local_port,
         remote_port,
         seq,
-        0,
-        flags::RST,
+        a,
+        fl,
         0,
         local_addr,
         remote_addr,
     )?;
-
     skb.saddr = Some(local_addr);
     skb.daddr = Some(remote_addr);
-
     ipv4::ip_queue_xmit(net, skb, IPPROTO_TCP)
 }
 
