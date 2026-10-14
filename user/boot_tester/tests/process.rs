@@ -1569,8 +1569,9 @@ fn test_sched_rr_get_interval() {
     print(b", nsec=");
     print_num(ts.tv_nsec);
 
-    // For SCHED_NORMAL, interval should be 0
-    if ret == 0 && ts.tv_sec == 0 && ts.tv_nsec == 0 {
+    // For SCHED_NORMAL, the slice is 0 or the CFS/EEVDF slice
+    // (Linux kernel/sched/fair.c get_rr_interval_fair), e.g. a few ms
+    if ret == 0 && ts.tv_sec == 0 && (0..1_000_000_000).contains(&ts.tv_nsec) {
         println(b"SCHED_RR_GET_INTERVAL:OK");
     } else if ret < 0 {
         print(b"SCHED_RR_GET_INTERVAL:FAIL errno=");
