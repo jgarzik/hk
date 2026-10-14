@@ -91,10 +91,7 @@ pub fn tcp_rcv(skb: SkBuff) {
                 process_last_ack(&socket, hdr);
             }
             TcpState::TimeWait => {
-                // In TIME_WAIT, just ACK and restart timer
-                if hdr.has_flag(flags::FIN) {
-                    // Re-ACK the FIN
-                }
+                // TODO: on retransmitted FIN, re-ACK and restart the 2MSL timer
             }
             _ => {}
         }
