@@ -580,8 +580,11 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
     const MAX_FRAMES: usize = 16;
 
     while frame_ptr != 0 && frame_count < MAX_FRAMES {
-        // Validate frame pointer
-        if !(0x1000..=0xFFFF_FFFF_FFFF_0000).contains(&frame_ptr) {
+        // Only follow frame pointers on the faulting kernel stack: RBP may
+        // hold a user value (no frame pointers, or a user-mode fault), and
+        // dereferencing it here would fault again under SMAP.
+        if frame.cs & 3 != 0 || !(frame.rsp..frame.rsp.saturating_add(0x10000)).contains(&frame_ptr)
+        {
             break;
         }
 

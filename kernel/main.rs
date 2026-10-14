@@ -1251,8 +1251,9 @@ fn panic(info: &PanicInfo) -> ! {
         const MAX_FRAMES: usize = 16;
 
         while frame_ptr != 0 && frame_count < MAX_FRAMES {
-            // Validate frame pointer (must be in reasonable kernel range)
-            if !(0x1000..=0xFFFF_FFFF_FFFF_0000).contains(&frame_ptr) {
+            // Only follow frames on the current kernel stack: RBP may hold a
+            // user value, and reading it would fault again under SMAP
+            if !(rsp..rsp.saturating_add(0x10000)).contains(&frame_ptr) {
                 break;
             }
 
