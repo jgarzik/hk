@@ -199,11 +199,14 @@ pub fn create_entry(
         return Err(KernelError::NotDirectory);
     }
     let c = cred();
+    // filename_create: write access first, its EROFS reported after EEXIST
+    let w = super::dac::want_write(&dir);
     dir.inode_lock();
     let r = (|| {
         if lookup_one(parent, name).is_ok() {
             return Err(KernelError::AlreadyExists);
         }
+        let _w = w?;
         super::dac::may_create(&c, &dir)?;
         let inode = make(&dir, &c)?;
         let d = Arc::new(Dentry::new(
@@ -224,6 +227,7 @@ pub fn create_entry(
 /// rule, type vs `isdir`), then the file system's unlink or rmdir
 pub fn delete_entry(parent: &Arc<Dentry>, name: &str, isdir: bool) -> Result<(), KernelError> {
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
+    let _w = super::dac::want_write(&dir)?;
     let c = cred();
     dir.inode_lock();
     let r = (|| {

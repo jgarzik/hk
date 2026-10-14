@@ -54,8 +54,8 @@ pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, RwFlags, flag
 pub use fsstruct::{FsStruct, clone_task_fs, exit_task_fs, get_task_fs, init_task_fs};
 pub use inode::{DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, Uid};
 pub use mount::{
-    Mount, MountNamespace, current_mnt_ns, do_mount, do_mount_dev, do_umount, follow_mount,
-    init_mnt_ns, mount_at_path, umount_flags,
+    Mount, MountNamespace, current_mnt_ns, do_mount, do_umount, follow_mount, init_mnt_ns,
+    mount_at_path, umount_flags,
 };
 pub use path::{LookupFlags, lookup_one, lookup_path, lookup_path_at, lookup_path_flags};
 pub use path_ref::Path;

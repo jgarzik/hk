@@ -275,6 +275,11 @@ fn do_utimes(dirfd: i32, pathname: u64, times: Option<[UserTimespec; 2]>, flags:
         Err(e) => return e.sysret(),
     };
     let times = times.filter(|t| !(t[0].tv_nsec == UTIME_NOW && t[1].tv_nsec == UTIME_NOW));
+    // vfs_utimes: write access first (EROFS), held across the update
+    let _w = match dac::want_write(&inode) {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
     if let Err(e) = dac::may_utimes(&inode, times.is_some()) {
         return e.sysret();
     }

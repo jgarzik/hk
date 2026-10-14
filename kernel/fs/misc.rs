@@ -90,10 +90,18 @@ fn mnt_flags(flags: u64) -> u32 {
     f
 }
 
-/// Apply mount(2) flags to a mount and its superblock
-fn set_mount_attrs(m: &Arc<super::mount::Mount>, flags: u64) {
-    m.sb.set_rdonly(flags & ms::RDONLY != 0);
+/// MS_REMOUNT (Linux do_remount): the mount's flags become exactly the
+/// requested set. The read-only switch goes first and is all-or-nothing
+/// (EBUSY while files are open for writing or changes are in progress,
+/// with nothing changed); only then the per-mount flags are replaced.
+fn remount(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
+    if flags & ms::RDONLY != 0 {
+        m.sb.make_rdonly()?;
+    } else {
+        m.sb.make_rdwr();
+    }
     m.set_flags(mnt_flags(flags));
+    Ok(())
 }
 
 /// Mount whose root `target` is (Linux path_mounted), else EINVAL
@@ -152,8 +160,7 @@ fn path_mount(
         return Err(KernelError::InvalidArgument);
     }
     if flags & ms::REMOUNT != 0 {
-        set_mount_attrs(&mount_at(&mp)?, flags);
-        return Ok(());
+        return remount(&mount_at(&mp)?, flags);
     }
     if flags & (ms::PRIVATE | ms::UNBINDABLE) != 0 {
         return mount_at(&mp).map(|_| ());
@@ -172,16 +179,17 @@ fn new_mount(
     if !mp.get_inode().ok_or(KernelError::NotFound)?.mode().is_dir() {
         return Err(KernelError::NotDirectory);
     }
-    let r = if fs_type.mount_dev.is_some() && !source.is_empty() {
-        super::mount::do_mount_dev(fs_type, source, Some(mp))
+    // Flags are set before the mount becomes visible (Linux do_new_mount)
+    let sb = if fs_type.mount_dev.is_some() && !source.is_empty() {
+        super::mount::dev_super(fs_type, source)
     } else {
-        super::mount::do_mount(fs_type, Some(mp))
+        (fs_type.mount)(fs_type)
     };
+    let r = sb.and_then(|sb| {
+        super::mount::attach(sb, Some(mp), mnt_flags(flags), flags & ms::RDONLY != 0)
+    });
     match r {
-        Ok(m) => {
-            set_mount_attrs(&m, flags);
-            Ok(())
-        }
+        Ok(_) => Ok(()),
         Err(
             e @ (KernelError::NotBlockDevice
             | KernelError::NoDevice
@@ -645,6 +653,11 @@ fn do_setxattr(
         None => return KernelError::NotFound.sysret(),
     };
 
+    // setxattr/removexattr: write access first (EROFS), held across
+    let _w = match super::dac::want_write(&inode) {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
     if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
         return e.sysret();
     }
@@ -691,6 +704,11 @@ pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i
         None => return KernelError::BadFd.sysret(),
     };
 
+    // setxattr/removexattr: write access first (EROFS), held across
+    let _w = match super::dac::want_write(&inode) {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
     if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
         return e.sysret();
     }
@@ -1043,6 +1061,11 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
         None => return KernelError::NotFound.sysret(),
     };
 
+    // setxattr/removexattr: write access first (EROFS), held across
+    let _w = match super::dac::want_write(&inode) {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
     if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
         return e.sysret();
     }
@@ -1078,6 +1101,11 @@ pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
         None => return KernelError::BadFd.sysret(),
     };
 
+    // setxattr/removexattr: write access first (EROFS), held across
+    let _w = match super::dac::want_write(&inode) {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
     if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
         return e.sysret();
     }

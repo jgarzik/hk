@@ -91,10 +91,15 @@ MS_SILENT, MS_MANDLOCK, MS_POSIXACL, MS_I_VERSION, MS_LAZYTIME, and
 MS_PRIVATE/MS_UNBINDABLE (mounts never propagate, no bind mounts).
 EINVAL instead of Linux behavior: MS_BIND (also MS_REMOUNT|MS_BIND),
 MS_MOVE, MS_SHARED, MS_SLAVE, MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW
-and umount2 MNT_EXPIRE. Not done: a read-only remount does not fail with
-EBUSY while files are open for writing (and those writes still succeed);
-mmap(PROT_EXEC) of a noexec file is allowed; mount data/options strings
-are ignored; mounts are not user-namespace aware (plain capable()).
+and umount2 MNT_EXPIRE. Read-only state is one flag, SB_RDONLY on the
+superblock (no separate MNT_READONLY: without bind mounts a superblock
+has one mount per namespace). Write access (`SuperBlock::want_write`,
+Linux mnt_want_write) is held by open-for-write files and across each
+modifying syscall; a rw->ro remount is EBUSY while any is held. Unlike
+Linux (MNT_WRITE_HOLD), a want_write racing a remount that then fails
+with EBUSY can see a spurious EROFS. Not done: mount data/options
+strings are ignored; mounts are not user-namespace aware (plain
+capable()).
 
 ## Global init is not protected from default-action signals
 

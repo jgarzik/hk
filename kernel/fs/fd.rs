@@ -122,7 +122,19 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
         None => return KernelError::NotFound.sysret(),
     };
 
-    // vfs_truncate: EISDIR / EINVAL / write permission, then set-id removal
+    // vfs_truncate: EISDIR / EINVAL, write access (EROFS), write
+    // permission, then set-id removal
+    let m = inode.mode();
+    if m.is_dir() {
+        return KernelError::IsDirectory.sysret();
+    }
+    if !m.is_file() {
+        return KernelError::InvalidArgument.sysret();
+    }
+    let _w = match super::dac::want_write(&inode) {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
     if let Err(e) = super::dac::may_truncate(&inode) {
         return e.sysret();
     }

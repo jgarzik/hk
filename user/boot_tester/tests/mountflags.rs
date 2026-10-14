@@ -5,6 +5,8 @@
 
 use super::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
+    sys_chown, sys_link, sys_mmap, sys_mprotect, sys_munmap, sys_removexattr, sys_rename, sys_setxattr,
+    sys_symlink, sys_utimensat, MAP_PRIVATE, O_TRUNC, PROT_READ, AT_FDCWD,
     sys_chmod, sys_close, sys_execve, sys_exit, sys_fork, sys_mkdir, sys_mknod, sys_mount,
     sys_open, sys_read, sys_rmdir, sys_setresgid, sys_setresuid, sys_statfs, sys_truncate,
     sys_umount2, sys_unlink, sys_wait4, sys_write, LinuxStatFs, O_CREAT, O_RDONLY, O_WRONLY,
@@ -14,6 +16,8 @@ const EPERM: i64 = -1;
 const EACCES: i64 = -13;
 const EINVAL: i64 = -22;
 const EROFS: i64 = -30;
+const EBUSY: i64 = -16;
+const PROT_EXEC: u32 = 4;
 
 const MS_RDONLY: u64 = 1;
 const MS_NODEV: u64 = 4;
@@ -32,6 +36,96 @@ pub fn run_tests() {
     test_noexec();
     test_nodev();
     test_unsupported();
+    test_ro_ops();
+    test_remount_busy();
+    test_noexec_mmap();
+}
+
+/// Every modifying syscall on a read-only mount is EROFS
+fn test_ro_ops() {
+    let n = b"MOUNT_RO_OPS";
+    let mp = b"/tmp/mnt_rops\0";
+    sys_mkdir(mp.as_ptr(), 0o755);
+    let mut f = chk(n, b"mount", ramfs(mp, 0), 0);
+    let fd = sys_open(b"/tmp/mnt_rops/f\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    sys_close(fd as u64);
+    sys_mkdir(b"/tmp/mnt_rops/d\0".as_ptr(), 0o755);
+    f += chk(n, b"remount ro", remount(mp, MS_RDONLY), 0);
+    let p = |s: &'static [u8]| s.as_ptr();
+    let ops: [(&[u8], i64); 15] = [
+        (b"creat", sys_open(p(b"/tmp/mnt_rops/g\0"), O_CREAT | O_WRONLY, 0o644)),
+        (b"rdonly trunc", sys_open(p(b"/tmp/mnt_rops/f\0"), O_RDONLY | O_TRUNC, 0)),
+        (b"rdwr", sys_open(p(b"/tmp/mnt_rops/f\0"), hk_syscall::O_RDWR, 0)),
+        (b"mkdir", sys_mkdir(p(b"/tmp/mnt_rops/e\0"), 0o755)),
+        (b"mknod", sys_mknod(p(b"/tmp/mnt_rops/n\0"), 0o100644, 0)),
+        (b"symlink", sys_symlink(p(b"f\0"), p(b"/tmp/mnt_rops/s\0"))),
+        (b"link", sys_link(p(b"/tmp/mnt_rops/f\0"), p(b"/tmp/mnt_rops/h\0"))),
+        (b"unlink", sys_unlink(p(b"/tmp/mnt_rops/f\0"))),
+        (b"rmdir", sys_rmdir(p(b"/tmp/mnt_rops/d\0"))),
+        (b"rename", sys_rename(p(b"/tmp/mnt_rops/f\0"), p(b"/tmp/mnt_rops/r\0"))),
+        (b"chmod", sys_chmod(p(b"/tmp/mnt_rops/f\0"), 0o600)),
+        (b"chown", sys_chown(p(b"/tmp/mnt_rops/f\0"), 0, 0)),
+        (b"utimens", sys_utimensat(AT_FDCWD, p(b"/tmp/mnt_rops/f\0"), core::ptr::null(), 0)),
+        (b"setxattr", sys_setxattr(p(b"/tmp/mnt_rops/f\0"), p(b"user.x\0"), p(b"v"), 1, 0)),
+        (b"removexattr", sys_removexattr(p(b"/tmp/mnt_rops/f\0"), p(b"user.x\0"))),
+    ];
+    for (why, got) in ops {
+        f += chk(n, why, got, EROFS);
+    }
+    f += chk(n, b"truncate", sys_truncate(p(b"/tmp/mnt_rops/f\0"), 0), EROFS);
+    remount(mp, 0);
+    sys_unlink(p(b"/tmp/mnt_rops/f\0"));
+    sys_rmdir(p(b"/tmp/mnt_rops/d\0"));
+    sys_umount2(mp.as_ptr(), 0);
+    sys_rmdir(mp.as_ptr());
+    done(n, f);
+}
+
+/// rw -> ro remount fails with EBUSY (nothing changed) while a file is
+/// open for writing; succeeds after it is closed
+fn test_remount_busy() {
+    let n = b"MOUNT_REMOUNT_BUSY";
+    let mp = b"/tmp/mnt_busy\0";
+    sys_mkdir(mp.as_ptr(), 0o755);
+    let mut f = chk(n, b"mount", ramfs(mp, 0), 0);
+    let fd = sys_open(b"/tmp/mnt_busy/f\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
+    f += chk(n, b"remount ro busy", remount(mp, MS_RDONLY), EBUSY);
+    f += chk(n, b"still rw", st_flags(mp) & ST_RDONLY, 0);
+    f += chk(n, b"write", sys_write(fd as u64, b"x".as_ptr(), 1), 1);
+    sys_close(fd as u64);
+    f += chk(n, b"remount ro", remount(mp, MS_RDONLY), 0);
+    remount(mp, 0);
+    sys_unlink(b"/tmp/mnt_busy/f\0".as_ptr());
+    sys_umount2(mp.as_ptr(), 0);
+    sys_rmdir(mp.as_ptr());
+    done(n, f);
+}
+
+/// PROT_EXEC of a file on a noexec mount: mmap EPERM, mprotect EACCES
+fn test_noexec_mmap() {
+    let n = b"MOUNT_NOEXEC_MMAP";
+    let mp = b"/tmp/mnt_nxm\0";
+    let file = b"/tmp/mnt_nxm/f\0";
+    sys_mkdir(mp.as_ptr(), 0o755);
+    let mut f = chk(n, b"mount", ramfs(mp, MS_NOEXEC), 0);
+    let fd = sys_open(file.as_ptr(), O_CREAT | O_WRONLY, 0o755);
+    let page = [0u8; 4096];
+    sys_write(fd as u64, page.as_ptr(), 4096);
+    sys_close(fd as u64);
+    let fd = sys_open(file.as_ptr(), O_RDONLY, 0);
+    let r = sys_mmap(0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd as i32, 0);
+    f += chk(n, b"mmap exec", r, EPERM);
+    let a = sys_mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd as i32, 0);
+    f += chk(n, b"mmap read", (a > 0) as i64, 1);
+    if a > 0 {
+        f += chk(n, b"mprotect exec", sys_mprotect(a as u64, 4096, PROT_READ | PROT_EXEC), EACCES);
+        sys_munmap(a as u64, 4096);
+    }
+    sys_close(fd as u64);
+    sys_unlink(file.as_ptr());
+    sys_umount2(mp.as_ptr(), 0);
+    sys_rmdir(mp.as_ptr());
+    done(n, f);
 }
 
 /// Child-side check: prints the mismatch, returns 1 on failure
@@ -217,6 +311,14 @@ fn test_unsupported() {
         return;
     }
     let n = b"MOUNT_UNSUPPORTED";
-    let f = chk(n, b"MS_MOVE", ramfs(b"/tmp\0", MS_MOVE), EINVAL);
+    let mut f = chk(n, b"MS_MOVE", ramfs(b"/tmp\0", MS_MOVE), EINVAL);
+    // A rejected remount changes nothing
+    let mp = b"/tmp/mnt_uns\0";
+    sys_mkdir(mp.as_ptr(), 0o755);
+    f += chk(n, b"mount", ramfs(mp, MS_RDONLY | MS_NOEXEC), 0);
+    f += chk(n, b"remount move", remount(mp, MS_MOVE), EINVAL);
+    f += chk(n, b"flags kept", st_flags(mp) & (ST_RDONLY | ST_NOEXEC), ST_RDONLY | ST_NOEXEC);
+    sys_umount2(mp.as_ptr(), 0);
+    sys_rmdir(mp.as_ptr());
     done(n, f);
 }

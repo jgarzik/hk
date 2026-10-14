@@ -178,6 +178,26 @@ static NEXT_DEV_ID: AtomicU64 = AtomicU64::new(1);
 /// Read-only file system (Linux SB_RDONLY)
 pub const SB_RDONLY: u32 = 1;
 
+/// Write access to a file system (from `SuperBlock::want_write`),
+/// released on drop (Linux mnt_drop_write); `none()` for objects without
+/// a superblock
+pub struct WriteAccess(Option<Arc<SuperBlock>>);
+
+impl WriteAccess {
+    /// No file system to hold
+    pub const fn none() -> Self {
+        Self(None)
+    }
+}
+
+impl Drop for WriteAccess {
+    fn drop(&mut self) {
+        if let Some(sb) = &self.0 {
+            sb.s_writers.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 pub struct SuperBlock {
     /// Filesystem type
     pub fs_type: &'static FileSystemType,
@@ -190,6 +210,10 @@ pub struct SuperBlock {
 
     /// SB_* flags (Linux s_flags): SB_RDONLY
     s_flags: AtomicU32,
+
+    /// Holders of write access (Linux mnt writers, mnt_want_write):
+    /// open-for-write files and in-progress modifications
+    s_writers: AtomicU64,
 
     /// Next inode number to allocate
     next_ino: AtomicU64,
@@ -225,6 +249,7 @@ impl SuperBlock {
             root: RwLock::new(None),
             s_op,
             s_flags: AtomicU32::new(flags),
+            s_writers: AtomicU64::new(0),
             next_ino: AtomicU64::new(1), // Start inode numbers at 1
             dev_id: NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed),
             private: RwLock::new(None),
@@ -234,16 +259,41 @@ impl SuperBlock {
 
     /// True if mounted read-only (Linux sb_rdonly)
     pub fn rdonly(&self) -> bool {
-        self.s_flags.load(Ordering::Relaxed) & SB_RDONLY != 0
+        self.s_flags.load(Ordering::SeqCst) & SB_RDONLY != 0
     }
 
-    /// Make the file system read-only or read-write (mount, remount)
-    pub fn set_rdonly(&self, ro: bool) {
-        if ro {
-            self.s_flags.fetch_or(SB_RDONLY, Ordering::Relaxed);
-        } else {
-            self.s_flags.fetch_and(!SB_RDONLY, Ordering::Relaxed);
+    /// Take write access (Linux mnt_want_write): EROFS on a read-only
+    /// file system. Held until the returned guard drops.
+    ///
+    /// Against `make_rdonly`: each side publishes its change (SeqCst)
+    /// before reading the other's, so either the writer sees SB_RDONLY
+    /// or the remount sees the writer, never neither.
+    pub fn want_write(self: &Arc<Self>) -> Result<WriteAccess, KernelError> {
+        self.s_writers.fetch_add(1, Ordering::SeqCst);
+        if self.rdonly() {
+            self.s_writers.fetch_sub(1, Ordering::SeqCst);
+            return Err(KernelError::ReadOnlyFs);
         }
+        Ok(WriteAccess(Some(self.clone())))
+    }
+
+    /// Make the file system read-only (Linux sb_prepare_remount_readonly
+    /// and SB_RDONLY): EBUSY, and nothing changed, while anyone holds
+    /// write access
+    pub fn make_rdonly(&self) -> Result<(), KernelError> {
+        if self.s_flags.fetch_or(SB_RDONLY, Ordering::SeqCst) & SB_RDONLY != 0 {
+            return Ok(());
+        }
+        if self.s_writers.load(Ordering::SeqCst) != 0 {
+            self.s_flags.fetch_and(!SB_RDONLY, Ordering::SeqCst);
+            return Err(KernelError::Busy);
+        }
+        Ok(())
+    }
+
+    /// Make the file system read-write
+    pub fn make_rdwr(&self) {
+        self.s_flags.fetch_and(!SB_RDONLY, Ordering::SeqCst);
     }
 
     /// Set the root dentry

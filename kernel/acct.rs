@@ -240,14 +240,18 @@ fn open_acct_file(path: &str) -> Result<Arc<File>, i64> {
         }
     }
 
-    // Create file for writing (append mode)
-    let file = Arc::new(File::new(
+    // Open for writing: hold write access (EROFS on a read-only fs)
+    let w = match dentry.get_inode() {
+        Some(i) => Some(dac::want_write(&i).map_err(|e| e.sysret())?),
+        None => None,
+    };
+    let mut file = File::new(
         dentry,
         flags::O_WRONLY | flags::O_APPEND,
         &crate::fs::file::NULL_FILE_OPS,
-    ));
-
-    Ok(file)
+    );
+    file.write_access = w;
+    Ok(Arc::new(file))
 }
 
 // =============================================================================

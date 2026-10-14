@@ -383,34 +383,36 @@ pub fn do_mount(
     fs_type: &'static FileSystemType,
     mountpoint: Option<Arc<Dentry>>,
 ) -> Result<Arc<Mount>, KernelError> {
-    // Create the superblock by calling the filesystem's mount function
     let sb = (fs_type.mount)(fs_type)?;
+    attach(sb, mountpoint, 0, false)
+}
 
-    // Get the root dentry from the superblock
+/// Mount `sb` on `mountpoint` (None: as the namespace root) with MNT_*
+/// flags `mnt_flags` and read-only state `ro`, which are set before the
+/// mount becomes visible (Linux do_new_mount: no window with weaker
+/// flags)
+pub fn attach(
+    sb: Arc<SuperBlock>,
+    mountpoint: Option<Arc<Dentry>>,
+    mnt_flags: u32,
+    ro: bool,
+) -> Result<Arc<Mount>, KernelError> {
     let root = sb.get_root().ok_or(KernelError::InvalidArgument)?;
-
-    // Create the mount
-    let mount = Mount::new(sb, root, 0);
-
-    // Get the current mount namespace (falls back to init for early boot)
+    if ro {
+        sb.make_rdonly()?;
+    }
+    let mount = Mount::new(sb, root, mnt_flags);
     let mnt_ns = current_mnt_ns();
-
-    // If there's a mount point, set up the relationship
     if let Some(mp) = mountpoint {
         mount.set_mountpoint(mp.clone());
-
-        // Find parent mount and add as child
+        // For simplicity, add to the root mount's children
         if let Some(root_mount) = mnt_ns.get_root() {
-            // For simplicity, add to root mount's children
-            // A real implementation would walk the mount tree
             mount.set_parent(&root_mount);
             root_mount.add_child(mount.clone());
         }
     } else {
-        // This is the root mount - set in namespace
         mnt_ns.set_root(mount.clone());
     }
-
     Ok(mount)
 }
 
@@ -429,24 +431,12 @@ pub fn mount_at_path(
     }
 }
 
-/// Mount a device-backed filesystem
-///
-/// Used for filesystems that require a backing block device (ext4, vfat, etc.).
-///
-/// Uses the current task's mount namespace.
-///
-/// # Arguments
-/// * `fs_type` - Filesystem type (must have mount_dev function)
-/// * `source` - Path to the block device (e.g., "/dev/rd1")
-/// * `mountpoint` - Dentry where to mount (None for root)
-///
-/// # Returns
-/// The created mount on success
-pub fn do_mount_dev(
+/// Superblock of a device-backed filesystem (vfat, ...) on the block
+/// device at `source` (e.g. "/dev/rd1"); mount it with `attach`
+pub fn dev_super(
     fs_type: &'static FileSystemType,
     source: &str,
-    mountpoint: Option<Arc<Dentry>>,
-) -> Result<Arc<Mount>, KernelError> {
+) -> Result<Arc<SuperBlock>, KernelError> {
     // The filesystem must support device mounting
     let mount_dev_fn = fs_type
         .mount_dev
@@ -465,32 +455,7 @@ pub fn do_mount_dev(
     let bdev = get_blkdev(source_inode.rdev).ok_or(KernelError::NoDevice)?;
 
     // Call the filesystem's mount_dev function
-    let sb = mount_dev_fn(fs_type, bdev)?;
-
-    // Get the root dentry from the superblock
-    let root = sb.get_root().ok_or(KernelError::InvalidArgument)?;
-
-    // Create the mount
-    let mount = Mount::new(sb, root, 0);
-
-    // Get the current mount namespace
-    let mnt_ns = current_mnt_ns();
-
-    // If there's a mount point, set up the relationship
-    if let Some(mp) = mountpoint {
-        mount.set_mountpoint(mp.clone());
-
-        // Find parent mount and add as child
-        if let Some(root_mount) = mnt_ns.get_root() {
-            mount.set_parent(&root_mount);
-            root_mount.add_child(mount.clone());
-        }
-    } else {
-        // This is the root mount - set in namespace
-        mnt_ns.set_root(mount.clone());
-    }
-
-    Ok(mount)
+    mount_dev_fn(fs_type, bdev)
 }
 
 // ============================================================================

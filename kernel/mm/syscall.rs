@@ -52,6 +52,25 @@ pub const MCL_ONFAULT: i32 = 4;
 ///
 /// # Returns
 /// Address of mapping on success, negative errno on failure
+/// File checks of do_mmap (Linux): the file must be readable, a shared
+/// writable mapping needs it open for writing and not append-only, and
+/// PROT_EXEC is refused on a noexec mount (`noexec`: EPERM for mmap,
+/// EACCES for mprotect, where Linux clears VM_MAYEXEC)
+fn file_prot_ok(f: &File, prot: u32, shared: bool, noexec: KernelError) -> Result<(), KernelError> {
+    use crate::fs::flags::O_APPEND;
+    use crate::fs::mount::{MNT_NOEXEC, mnt_flags_of};
+    if !f.is_readable() {
+        return Err(KernelError::PermissionDenied);
+    }
+    if shared && prot & PROT_WRITE != 0 && (!f.is_writable() || f.get_flags() & O_APPEND != 0) {
+        return Err(KernelError::PermissionDenied);
+    }
+    if prot & super::PROT_EXEC != 0 && mnt_flags_of(&f.dentry) & MNT_NOEXEC != 0 {
+        return Err(noexec);
+    }
+    Ok(())
+}
+
 pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: u64) -> i64 {
     // Validate length
     if length == 0 {
@@ -108,6 +127,11 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     } else {
         None
     };
+    if let Some(f) = &file
+        && let Err(e) = file_prot_ok(f, prot, is_shared, KernelError::NotPermitted)
+    {
+        return e.sysret();
+    }
 
     // Get or create mm for current task
     let tid = current_tid();
@@ -1406,11 +1430,17 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
         let update_start = vma.start.max(start);
         let update_end = vma.end.min(end);
 
-        // Check if we're trying to write-protect a read-only file mapping
-        // (simplified check - full implementation would check file permissions)
-        if prot & PROT_WRITE != 0 && !vma.is_anonymous() && vma.is_shared() {
-            // For shared file mappings, we'd need to check file write permissions
-            // For now, we allow it (the page fault handler will handle actual access)
+        // Added permissions must be allowed by the mapped file (Linux
+        // VM_MAYWRITE / VM_MAYEXEC)
+        if let Some(f) = &vma.file
+            && let Err(e) = file_prot_ok(
+                f,
+                prot & !vma.prot,
+                vma.is_shared(),
+                KernelError::PermissionDenied,
+            )
+        {
+            return e.sysret();
         }
 
         vmas_to_update.push((update_start, update_end, vma.prot));

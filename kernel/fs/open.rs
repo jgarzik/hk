@@ -10,7 +10,9 @@ use crate::fs::{
 };
 use crate::uaccess::strncpy_from_user;
 
-use super::flags::{O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDWR, O_TRUNC};
+use super::flags::{
+    O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_TRUNC,
+};
 use super::mount::{MNT_NODEV, mnt_flags_of};
 use super::syscall::{AT_FDCWD, PATH_MAX, current_fd_table, get_nofile_limit};
 use crate::task::FD_CLOEXEC;
@@ -30,11 +32,14 @@ fn create_in(
         return Err(KernelError::NotDirectory);
     }
     let c = dac::cred();
+    // lookup_open: write access is needed only to create
+    let w = dac::want_write(&dir);
     dir.inode_lock();
     let r = (|| {
         if let Ok(d) = lookup_one(parent, name) {
             return Ok((d, false));
         }
+        let _w = w?;
         dac::may_create(&c, &dir)?;
         let perm = dac::create_mode(&c, &dir, (mode & 0o7777) as u16);
         let inode = dir.i_op.create(&dir, name, InodeMode::regular(perm))?;
@@ -187,6 +192,15 @@ fn filp_open(
     let acc = if created { 0 } else { dac::acc_mode(flags) };
     dac::may_open(&dac::cred(), &inode, acc, flags)?;
 
+    // An open for writing holds write access until the file is released
+    // (Linux FMODE_WRITER); O_TRUNC needs it too (handle_truncate)
+    let writer = flags & O_ACCMODE != O_RDONLY || flags & O_TRUNC != 0;
+    let w = if writer && inode.mode().is_file() {
+        Some(dac::want_write(&inode)?)
+    } else {
+        None
+    };
+
     // O_TRUNC of an existing regular file (Linux handle_truncate)
     if flags & O_TRUNC != 0 && !created && inode.mode().is_file() {
         inode.inode_lock();
@@ -208,7 +222,11 @@ fn filp_open(
             .unwrap_or(&RAMFS_FILE_OPS)
     };
 
-    Ok(Arc::new(File::new(dentry, flags, f_op)))
+    let mut file = File::new(dentry, flags, f_op);
+    if flags & O_ACCMODE != O_RDONLY {
+        file.write_access = w;
+    }
+    Ok(Arc::new(file))
 }
 
 /// Give init /dev/console as stdin, stdout and stderr (Linux

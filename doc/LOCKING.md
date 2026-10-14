@@ -701,6 +701,7 @@ Linux `vfsmount.mnt_count` pattern:
 | `Mount.mnt_count` | `AtomicU64` | Open file reference count |
 | `Mount.mnt_flags` | `AtomicU32` | MNT_NOSUID/NODEV/NOEXEC; set by mount/remount, read lock-free (open, exec, statfs) |
 | `SuperBlock.s_flags` | `AtomicU32` | SB_RDONLY; set by mount/remount, read lock-free by permission checks |
+| `SuperBlock.s_writers` | `AtomicU64` | Write-access holders (`want_write` guard, Linux mnt_want_write). Lock-free protocol against `make_rdonly`: the writer increments `s_writers` then reads `s_flags`; the remount sets SB_RDONLY then reads `s_writers` (all SeqCst), backing out (EROFS / EBUSY) if it sees the other side, so a writer and a read-only remount never both succeed |
 
 **Reference Counting (mntget/mntput):**
 

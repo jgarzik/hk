@@ -13,6 +13,7 @@
 use super::KernelError;
 use super::file::flags::{O_ACCMODE, O_APPEND, O_TRUNC};
 use super::inode::{Gid, Inode, InodeMode, Uid};
+use super::superblock::WriteAccess;
 use crate::task::{
     CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_EMPTY_SET, CAP_FOWNER, CAP_FSETID,
     CAP_SYS_ADMIN, Cred,
@@ -110,20 +111,22 @@ pub fn generic_permission(c: &Cred, inode: &Inode, mask: u32) -> Result<(), Kern
     Err(KernelError::PermissionDenied)
 }
 
-/// mnt_want_write: no changes on a read-only file system (EROFS)
-pub fn want_write(inode: &Inode) -> Result<(), KernelError> {
-    if inode.superblock().is_some_and(|sb| sb.rdonly()) {
-        return Err(KernelError::ReadOnlyFs);
+/// mnt_want_write on the file system of `inode`: EROFS if read-only;
+/// hold the guard across the modification
+pub fn want_write(inode: &Inode) -> Result<WriteAccess, KernelError> {
+    match inode.superblock() {
+        Some(sb) => sb.want_write(),
+        None => Ok(WriteAccess::none()),
     }
-    Ok(())
 }
 
 /// sb_permission: writing a regular file, directory or symlink of a
 /// read-only file system is EROFS (devices, FIFOs, sockets are fine)
 fn sb_permission(inode: &Inode, mask: u32) -> Result<(), KernelError> {
     let m = inode.mode();
-    if mask & MAY_WRITE != 0 && (m.is_file() || m.is_dir() || m.is_symlink()) {
-        want_write(inode)?;
+    let ro = inode.superblock().is_some_and(|sb| sb.rdonly());
+    if mask & MAY_WRITE != 0 && ro && (m.is_file() || m.is_dir() || m.is_symlink()) {
+        return Err(KernelError::ReadOnlyFs);
     }
     Ok(())
 }
@@ -294,7 +297,7 @@ pub fn remove_privs(inode: &Inode) {
 /// chmod: owner or CAP_FOWNER; S_ISGID silently dropped unless the
 /// caller is in the file's group or has CAP_FSETID
 pub fn chmod(inode: &Inode, perm: u16) -> Result<(), KernelError> {
-    want_write(inode)?;
+    let _w = want_write(inode)?;
     let c = cred();
     if !owner_or_capable(&c, inode) {
         return Err(KernelError::NotPermitted);
@@ -322,7 +325,7 @@ fn chgrp_ok(c: &Cred, inode: &Inode, gid: Gid) -> bool {
 /// non-directories S_ISUID is always cleared and S_ISGID when
 /// group-executable or the caller could not keep it (even for root)
 pub fn chown(inode: &Inode, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), KernelError> {
-    want_write(inode)?;
+    let _w = want_write(inode)?;
     let c = cred();
     if uid.is_some_and(|u| !chown_ok(&c, inode, u)) || gid.is_some_and(|g| !chgrp_ok(&c, inode, g))
     {
@@ -356,7 +359,6 @@ pub fn chown(inode: &Inode, uid: Option<Uid>, gid: Option<Gid>) -> Result<(), Ke
 /// Timestamp updates: explicit times need ownership (or CAP_FOWNER);
 /// "now" needs ownership or write permission
 pub fn may_utimes(inode: &Inode, explicit: bool) -> Result<(), KernelError> {
-    want_write(inode)?;
     let c = cred();
     if owner_or_capable(&c, inode) {
         return Ok(());
@@ -386,9 +388,6 @@ pub fn may_truncate(inode: &Inode) -> Result<(), KernelError> {
 /// writes); then plain permission. Denials that hide a name are ENODATA
 /// for reads.
 pub fn xattr_permission(inode: &Inode, name: &str, mask: u32) -> Result<(), KernelError> {
-    if mask & MAY_WRITE != 0 {
-        want_write(inode)?;
-    }
     let c = cred();
     let hidden = if mask & MAY_WRITE != 0 {
         KernelError::NotPermitted

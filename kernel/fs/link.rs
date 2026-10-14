@@ -439,7 +439,11 @@ pub fn sys_renameat2(
         None => return KernelError::NotFound.sysret(),
     };
 
-    // Lock directories for rename (Linux lock_rename pattern)
+    // Write access, then lock directories (Linux do_renameat2)
+    let _w = match super::dac::want_write(&old_parent_inode) {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
     let _trap = lock_rename(&old_parent_dentry, &new_parent_dentry);
     let r = rename_locked(
         (&old_parent_dentry, &old_parent_inode, &old_name),
