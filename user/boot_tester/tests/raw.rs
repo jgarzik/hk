@@ -164,6 +164,15 @@ fn test_hdrincl() {
     let mut buf = [0u8; 16];
     let (n, ip, sp) = recv_from(u, &mut buf, 0);
     t.ok(b"udp got it", n == 5 && &buf[..5] == b"hello" && ip == LO && sp == 4321, n);
+    // IP options (four NOPs) are skipped on receive
+    let mut opt = [0u8; 64];
+    opt[..20].copy_from_slice(&pkt[..20]);
+    opt[0] = 0x46;
+    opt[20..24].copy_from_slice(&[1, 1, 1, 1]);
+    opt[24..37].copy_from_slice(&pkt[20..33]);
+    t.eq(b"send opts", send_to(fd, &opt[..37], LO, 0, 0), 37);
+    let (n, _, _) = recv_from(u, &mut buf, MSG_DONTWAIT);
+    t.ok(b"with options", n == 5 && &buf[..5] == b"hello", n);
     t.eq(b"short", send_to(fd, &pkt[..12], LO, 0, 0), EINVAL);
     pkt[0] = 0x4f;
     t.eq(b"bad ihl", send_to(fd, &pkt[..33], LO, 0, 0), EINVAL);

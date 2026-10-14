@@ -41,6 +41,13 @@ connection, TIME_WAIT ends immediately (no 2MSL), close does not RST
 unread data and SO_LINGER is stored only (P6); ICMP errors about TCP
 segments (host unreachable on SYN_SENT, frag needed) are not delivered
 to TCP sockets yet (P6); ICMP timestamp requests are not answered.
+Neighbour entries are not confirmed by TCP progress (only ARP), there is
+no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
+IP: no ipfrag_max_dist, no IP options on output (received options are
+validated and skipped; source-routed packets are dropped), no
+IP_TRANSPARENT. Ping sockets check only the effective gid against
+ping_group_range (hk has no supplementary groups). /proc/net/raw and
+/proc/net/icmp do not exist.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP. TCP binds share a port only per the
 SO_REUSEADDR/SO_REUSEPORT rules; connect() picks an entirely unused

@@ -1636,6 +1636,8 @@ RTNL (configuration only)        TcpCb.sk_lock (listener before child; a
 NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
   the guard before returning)
   -> NeighTable.hash -> Neighbour.inner (dropped before any transmit)
+  (RawTable.socks -> Inet.addr; FragTable.st, PmtuCache.m, IcmpRate.st,
+   Sock.errq, RxQueue.q: leaves, never held while transmitting)
   -> NlTable.socks -> NlSock.rxq (netlink replies/notifications)
   (NlSock.dump -> devices/FIB/ARP snapshots -> NlSock.rxq: dump parts)
   -> device TX lock (e1000 tx)
