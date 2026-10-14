@@ -282,6 +282,7 @@ pub fn icmp_rcv(skb: SkBuff) {
         icmp_type::ECHO_REPLY => {
             ICMP_IN_ECHO_REPS.fetch_add(1, Ordering::Relaxed);
             ICMP_ECHO_REPLY_WQ.wake_all();
+            crate::net::ping::ping_rcv(&net, &skb);
         }
         icmp_type::DEST_UNREACH
         | icmp_type::TIME_EXCEEDED
@@ -439,8 +440,10 @@ fn update_pmtu(net: &NetNamespace, e: &IcmpErr) {
 fn deliver_err(net: &NetNamespace, e: &IcmpErr) {
     // TCP soft/hard errors (EHOSTUNREACH on SYN_SENT, PMTU) come with
     // the TCP rewrite
-    if e.proto() == ipv4::IPPROTO_UDP {
-        crate::net::udp::udp_err(net, e);
+    match e.proto() {
+        ipv4::IPPROTO_UDP => crate::net::udp::udp_err(net, e),
+        IPPROTO_ICMP => crate::net::ping::ping_err(net, e),
+        _ => {}
     }
 }
 

@@ -297,7 +297,8 @@ restart per SA_RESTART unless a socket timeout is set (EINTR). EPIPE
 raises SIGPIPE unless MSG_NOSIGNAL. Unknown options are ENOPROTOOPT
 (EOPNOTSUPP for getsockopt at unknown levels, like Linux).
 
-- [x] socket
+- [x] socket (AF_INET: TCP, UDP, ping SOCK_DGRAM/IPPROTO_ICMP gated by
+  ping_group_range; AF_NETLINK)
 - [x] socketpair (AF_INET/AF_NETLINK: EOPNOTSUPP like Linux; AF_UNIX later)
 - [x] bind (SO_REUSEADDR/SO_REUSEPORT rules, EADDRNOTAVAIL, EACCES < 1024)
 - [x] listen (autobinds; backlog capped at somaxconn 4096)

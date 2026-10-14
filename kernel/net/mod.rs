@@ -56,6 +56,7 @@ pub mod arp;
 pub mod dev;
 pub mod device;
 pub mod devioctl;
+pub mod dgram;
 pub mod driver;
 pub mod ethernet;
 pub mod icmp;
@@ -65,6 +66,7 @@ pub mod msg;
 #[path = "core/neigh.rs"]
 pub mod neigh;
 pub mod netlink;
+pub mod ping;
 pub mod proc;
 pub mod request_sock;
 pub mod rtnl;

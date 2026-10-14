@@ -1597,8 +1597,9 @@ do not rely on that.
 | `TcpSock.{rx, accept_queue, tuple, opts}`, `TcpCb.{retransmit,ooo}_queue` | `spin::Mutex` | thread only | leaves; TCP state/sequence numbers are atomics; the accept queue is dropped before transmitting |
 | `Sock.errq` (`net/sock.rs`) | `spin::Mutex` | thread only (softnet ICMP error delivery, recvmsg MSG_ERRQUEUE, poll) | leaf: IP_RECVERR queue, bounded by SO_RCVBUF (own charge); the wakeup follows the unlock |
 | `IcmpRate.st` (`net/icmp.rs`, per netns) | `spin::Mutex` | thread only | leaf: global + per-destination (bounded, 256) ICMP error token buckets |
-| `UdpSock.op` | `spin::Mutex<()>` | thread only | UDP socket lock (bind/connect/disconnect/autobind); never across a sleep or a transmit |
-| `UdpSock.rxq` | `spin::Mutex` | thread only (softnet enqueue, recvmsg) | leaf; bounded by SO_RCVBUF (`rmem` atomic) |
+| `UdpSock.op`, `PingSock.op` | `spin::Mutex<()>` | thread only | datagram socket lock (bind/connect/disconnect/autobind); never across a sleep or a transmit; taken before the protocol's port/identifier table |
+| `RxQueue.q` (`net/dgram.rs`: UDP, ping, raw receive queues) | `spin::Mutex` | thread only (softnet enqueue, recvmsg) | leaf; bounded by SO_RCVBUF (`rmem` atomic) |
+| `PingTable.socks` (`net/ping.rs`, per netns) | `spin::RwLock` | thread only | ping sockets by echo identifier; receive/error lookups clone the `Arc` and queue after dropping it; reads candidates' `Inet.addr` under it (order table -> Inet.addr) |
 | `Inet.addr` (`net/af_inet.rs`) | `spin::Mutex` | thread only | leaf: addresses/ports of a TCP or UDP socket; read under the UDP/TCP port tables during lookups |
 | `RTNL` (`net/rtnl.rs`) | `spin::Mutex<()>` | thread only (syscalls, kernel config; never softnet) | OUTERMOST network lock: serializes all configuration changes (link up/down + MTU, addresses, routes) from netlink, SIOCS* ioctls and the kernel. Functions needing it take `&RtnlGuard`. Holders never sleep and never take a socket lock (`sk_lock`) |
 | `NetNamespace` tables (`devices`, `tcp_connections`, `tcp_listeners`, `loopback`), `UdpTable.socks`, `TcpBind.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes: RCU-ready); the UDP/TCP port tables read each candidate's `Inet.addr` under their lock |
@@ -1626,10 +1627,10 @@ do not rely on that.
 ```
 RTNL (configuration only)        TcpCb.sk_lock (listener before child; a
   |                                 child is never locked while its creator
-  |                                 holds the listener) / UdpSock.op
-  |                                 -> TcpBind.socks / UdpTable.socks / conn
+  |                                 holds the listener) / UdpSock.op / PingSock.op
+  |                                 -> TcpBind.socks / UdpTable.socks / PingTable.socks / conn
   |                                    tables -> Inet.addr
-  |                                 -> TcpSock.{rx,accept_queue,..} / UdpSock.rxq
+  |                                 -> TcpSock.{rx,accept_queue,..} / RxQueue.q
   v                                 |
 NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
   the guard before returning)

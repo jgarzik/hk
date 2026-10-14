@@ -25,6 +25,7 @@ use crate::net::sock::Sock;
 use crate::net::socket::{AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SOCK_DGRAM, SOCK_STREAM};
 
 pub const IPPROTO_IP: i32 = 0;
+pub const IPPROTO_ICMP: i32 = 1;
 pub const IPPROTO_TCP: i32 = 6;
 pub const IPPROTO_UDP: i32 = 17;
 pub const SOL_IP: i32 = 0;
@@ -56,6 +57,7 @@ pub fn create(stype: i32, protocol: i32) -> Result<Arc<dyn ProtoOps>, KernelErro
         },
         SOCK_DGRAM => match protocol {
             IPPROTO_IP | IPPROTO_UDP => Ok(crate::net::udp::create()),
+            IPPROTO_ICMP => crate::net::ping::create(),
             _ => Err(KernelError::ProtocolNotSupported),
         },
         _ => Err(KernelError::SocketTypeNotSupported),
@@ -272,6 +274,31 @@ pub struct RxInfo {
     pub daddr: Ipv4Addr,
     pub ttl: u8,
     pub tos: u8,
+}
+
+impl RxInfo {
+    /// Metadata of a received IP packet; a broadcast's spec_dst is our
+    /// address on the link (Linux ipv4_pktinfo_prepare)
+    pub fn of(net: &crate::net::NetNamespace, skb: &crate::net::skb::SkBuff) -> Self {
+        use crate::net::inet::ifaddr::{RT_SCOPE_LINK, inet_select_addr};
+        let daddr = skb.daddr.unwrap_or_default();
+        let saddr = skb.saddr.unwrap_or_default();
+        let spec_dst = if skb.ip_bcast {
+            skb.dev
+                .as_ref()
+                .and_then(|d| inet_select_addr(net, d, saddr, RT_SCOPE_LINK))
+                .unwrap_or_default()
+        } else {
+            daddr
+        };
+        Self {
+            ifindex: skb.dev.as_ref().map_or(0, |d| d.ifindex()),
+            spec_dst,
+            daddr,
+            ttl: skb.ip_ttl,
+            tos: skb.ip_tos,
+        }
+    }
 }
 
 /// A struct sockaddr_in

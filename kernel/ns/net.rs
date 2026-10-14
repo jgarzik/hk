@@ -86,6 +86,9 @@ pub struct NetNamespace {
     /// ICMP rate-limit state
     pub icmp: crate::net::icmp::IcmpRate,
 
+    /// Ping sockets by echo identifier
+    pub ping: crate::net::ping::PingTable,
+
     /// Key of the IP identification hash (Linux ip_id_key)
     pub ip_id_key: [u64; 2],
 
@@ -113,6 +116,7 @@ impl NetNamespace {
             frags: Default::default(),
             pmtu: Default::default(),
             icmp: Default::default(),
+            ping: Default::default(),
             ip_id_key: [
                 ((crate::random::get_random_u32() as u64) << 32)
                     | crate::random::get_random_u32() as u64,

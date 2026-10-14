@@ -19,11 +19,11 @@
 //! and then each candidate's `Inet.addr`; it never holds the table lock
 //! while queueing. No lock is held across a sleep or a transmit.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use spin::{Mutex, RwLock};
 
@@ -31,19 +31,17 @@ use crate::error::KernelError;
 use crate::net::af_inet::{
     self, IP_PKTINFO, IP_TOS, IP_TTL, IPPROTO_UDP, Inet, InetAddr, RxInfo, SOL_IP,
 };
+use crate::net::dgram::{self, Dgram, RxQueue};
 use crate::net::inet::fib::RouteType;
 use crate::net::inet::port::{self, BindInfo, Flow};
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IpParams, Ipv4Addr};
-use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, MSG_TRUNC, RecvMsg, SendMsg, cmsgs};
+use crate::net::msg::{MSG_ERRQUEUE, MSG_OOB, RecvMsg, SendMsg, cmsgs};
 use crate::net::skb::SkBuff;
-use crate::net::sock::{RCV_SHUTDOWN, SHUTDOWN_MASK, Sock, sf};
+use crate::net::sock::{SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::{
     AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SOCK_DGRAM, SOL_SOCKET,
     shut_bits,
-};
-use crate::poll::{
-    POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
 
 /// UDP header length
@@ -52,29 +50,6 @@ pub const UDP_HLEN: usize = 8;
 pub const UDP_MAX: usize = 65507;
 /// Socket level of UDP options
 pub const SOL_UDP: i32 = 17;
-/// SCM_TIMESTAMP / SCM_TIMESTAMPNS (= SO_TIMESTAMP*_OLD)
-const SCM_TIMESTAMP: i32 = 29;
-const SCM_TIMESTAMPNS: i32 = 35;
-const SO_RXQ_OVFL: i32 = 40;
-
-/// A queued datagram
-#[derive(Clone)]
-struct Dgram {
-    src: Ipv4Addr,
-    sport: u16,
-    data: Vec<u8>,
-    info: RxInfo,
-    /// CLOCK_REALTIME arrival (ns)
-    stamp: i128,
-    /// Socket drop count when queued (SO_RXQ_OVFL)
-    drops: u32,
-}
-
-/// Bytes charged to rcvbuf per datagram (payload + skb overhead)
-fn truesize(len: usize) -> usize {
-    len + 512
-}
-
 /// A UDP socket
 pub struct UdpSock {
     sk: Sock,
@@ -85,8 +60,7 @@ pub struct UdpSock {
     connected: AtomicBool,
     /// In the namespace table
     hashed: AtomicBool,
-    rxq: Mutex<VecDeque<Dgram>>,
-    rmem: AtomicUsize,
+    rxq: RxQueue,
     me: Weak<UdpSock>,
 }
 
@@ -99,8 +73,7 @@ pub fn create() -> Arc<dyn ProtoOps> {
         op: Mutex::new(()),
         connected: AtomicBool::new(false),
         hashed: AtomicBool::new(false),
-        rxq: Mutex::new(VecDeque::new()),
-        rmem: AtomicUsize::new(0),
+        rxq: RxQueue::default(),
         me: me.clone(),
     })
 }
@@ -178,83 +151,6 @@ impl UdpSock {
         }
     }
 
-    // --- receive queue ---------------------------------------------------
-
-    /// Queue a datagram unless the receive buffer is full (Linux
-    /// __udp_enqueue_schedule_skb: admit while rmem <= rcvbuf)
-    fn enqueue(&self, mut d: Dgram) {
-        let ts = truesize(d.data.len());
-        let limit = self.sk.rcvbuf() as usize;
-        if self.rmem.load(Ordering::Acquire) > limit {
-            self.sk.drops.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        self.rmem.fetch_add(ts, Ordering::AcqRel);
-        d.drops = self.sk.drops.load(Ordering::Relaxed);
-        self.rxq.lock().push_back(d);
-        self.sk.data_ready();
-    }
-
-    fn readable(&self) -> bool {
-        !self.rxq.lock().is_empty()
-    }
-
-    /// Next datagram (copy if `peek`)
-    fn dequeue(&self, peek: bool) -> Option<Dgram> {
-        let mut q = self.rxq.lock();
-        if peek {
-            return q.front().cloned();
-        }
-        let d = q.pop_front()?;
-        drop(q);
-        self.rmem
-            .fetch_sub(truesize(d.data.len()), Ordering::AcqRel);
-        Some(d)
-    }
-
-    /// Wait for a datagram (Linux __skb_recv_udp): a pending error
-    /// first; non-blocking: EAGAIN; blocking after SHUT_RD: None (recv
-    /// returns 0); timeout EAGAIN; signals per `Sock::wait`
-    fn recv_dgram(&self, flags: i32) -> Result<Option<Dgram>, KernelError> {
-        let nb = flags & crate::net::msg::MSG_DONTWAIT != 0;
-        let mut timeo = self.sk.rcv_timeo(nb);
-        loop {
-            if let Some(e) = self.sk.take_err() {
-                return Err(e);
-            }
-            if let Some(d) = self.dequeue(flags & MSG_PEEK != 0) {
-                return Ok(Some(d));
-            }
-            if timeo == 0 {
-                return Err(KernelError::WouldBlock);
-            }
-            if self.sk.shutdown() & RCV_SHUTDOWN != 0 {
-                return Ok(None);
-            }
-            timeo = self.sk.wait(timeo, || {
-                self.readable() || self.sk.has_err() || self.sk.shutdown() & RCV_SHUTDOWN != 0
-            })?;
-        }
-    }
-
-    /// SOL_SOCKET control messages (Linux __sock_recv_cmsgs)
-    fn sock_cmsgs(&self, m: &mut RecvMsg, d: &Dgram) {
-        if self.sk.flag(sf::TIMESTAMPNS) {
-            let mut b = [0u8; 16];
-            b[..8].copy_from_slice(&((d.stamp / 1_000_000_000) as i64).to_ne_bytes());
-            b[8..].copy_from_slice(&((d.stamp % 1_000_000_000) as i64).to_ne_bytes());
-            m.cmsg.put(SOL_SOCKET, SCM_TIMESTAMPNS, &b);
-        } else if self.sk.flag(sf::TIMESTAMP) {
-            let mut b = [0u8; 16];
-            b[..8].copy_from_slice(&((d.stamp / 1_000_000_000) as i64).to_ne_bytes());
-            b[8..].copy_from_slice(&((d.stamp % 1_000_000_000 / 1000) as i64).to_ne_bytes());
-            m.cmsg.put(SOL_SOCKET, SCM_TIMESTAMP, &b);
-        }
-        if self.sk.flag(sf::RXQ_OVFL) && d.drops != 0 {
-            m.cmsg.put(SOL_SOCKET, SO_RXQ_OVFL, &d.drops.to_ne_bytes());
-        }
-    }
-
     // --- send ------------------------------------------------------------
 
     /// Destination of a send: msg_name or the connected peer
@@ -327,14 +223,14 @@ impl UdpSock {
 
 /// Per-message IP parameters from sendmsg control data (Linux
 /// ip_cmsg_send: IP_PKTINFO, IP_TTL, IP_TOS)
-struct TxCmsg {
-    oif: u32,
-    saddr: Ipv4Addr,
-    ttl: Option<u8>,
-    tos: Option<u8>,
+pub struct TxCmsg {
+    pub oif: u32,
+    pub saddr: Ipv4Addr,
+    pub ttl: Option<u8>,
+    pub tos: Option<u8>,
 }
 
-fn tx_cmsgs(c: &[u8]) -> Result<TxCmsg, KernelError> {
+pub fn tx_cmsgs(c: &[u8]) -> Result<TxCmsg, KernelError> {
     let mut t = TxCmsg {
         oif: 0,
         saddr: Ipv4Addr::default(),
@@ -402,8 +298,7 @@ impl ProtoOps for UdpSock {
     fn release(&self) {
         self.unhash();
         self.sk.set_shutdown(SHUTDOWN_MASK);
-        self.rxq.lock().clear();
-        self.rmem.store(0, Ordering::Release);
+        self.rxq.clear();
         self.sk.purge_err();
     }
 
@@ -476,22 +371,7 @@ impl ProtoOps for UdpSock {
 
     /// Linux udp_poll / datagram_poll
     fn poll(&self) -> u16 {
-        let mut mask = 0;
-        if self.sk.err_pending() {
-            mask |= POLLERR;
-        }
-        let sh = self.sk.shutdown();
-        if sh & RCV_SHUTDOWN != 0 {
-            mask |= POLLRDHUP | POLLIN | POLLRDNORM;
-        }
-        if sh == SHUTDOWN_MASK {
-            mask |= POLLHUP;
-        }
-        if self.readable() {
-            mask |= POLLIN | POLLRDNORM;
-        }
-        // Sends are synchronous: always writable
-        mask | POLLOUT | POLLWRNORM | POLLWRBAND
+        dgram::poll(&self.sk, &self.rxq)
     }
 
     fn ioctl(&self, cmd: u32, arg: u64) -> Result<i64, KernelError> {
@@ -508,7 +388,7 @@ impl ProtoOps for UdpSock {
     /// Payload length of the first queued datagram (Linux
     /// first_packet_length)
     fn inq(&self) -> usize {
-        self.rxq.lock().front().map_or(0, |d| d.data.len())
+        self.rxq.inq()
     }
 
     /// Linux inet_shutdown for datagram sockets: ENOTCONN when not
@@ -590,23 +470,10 @@ impl ProtoOps for UdpSock {
         if flags & MSG_ERRQUEUE != 0 {
             return af_inet::ip_recv_error(&self.sk, &self.inet, m);
         }
-        let Some(d) = self.recv_dgram(flags)? else {
+        let Some(d) = self.rxq.recv(&self.sk, flags)? else {
             return Ok(0);
         };
-        let n = m.data.put(0, &d.data)?;
-        if n < d.data.len() {
-            m.flags |= MSG_TRUNC;
-        }
-        if m.want_name {
-            m.name = Some(af_inet::sin_bytes(d.src, d.sport));
-        }
-        self.sock_cmsgs(m, &d);
-        self.inet.recv_cmsgs(&mut m.cmsg, &d.info);
-        Ok(if flags & MSG_TRUNC != 0 {
-            d.data.len()
-        } else {
-            n
-        })
+        dgram::deliver(&self.sk, &self.inet, m, &d, flags)
     }
 }
 
@@ -780,35 +647,8 @@ pub fn udp_rcv(skb: SkBuff) {
         dport: u16::from_be_bytes([b[2], b[3]]),
         dif,
     };
-    let spec_dst = if skb.ip_bcast {
-        skb.dev
-            .as_ref()
-            .and_then(|d| {
-                crate::net::inet::ifaddr::inet_select_addr(
-                    &net,
-                    d,
-                    saddr,
-                    crate::net::inet::ifaddr::RT_SCOPE_LINK,
-                )
-            })
-            .unwrap_or_default()
-    } else {
-        daddr
-    };
-    let d = Dgram {
-        src: saddr,
-        sport: k.sport,
-        data: pkt[UDP_HLEN..].to_vec(),
-        info: RxInfo {
-            ifindex: dif,
-            spec_dst,
-            daddr,
-            ttl: skb.ip_ttl,
-            tos: skb.ip_tos,
-        },
-        stamp: crate::time::TIMEKEEPER.current_time().to_nanos(),
-        drops: 0,
-    };
+    let info = RxInfo::of(&net, &skb);
+    let d = Dgram::new(saddr, k.sport, pkt[UDP_HLEN..].to_vec(), info);
     if skb.ip_bcast || daddr.is_multicast() {
         for s in net
             .udp
@@ -816,12 +656,12 @@ pub fn udp_rcv(skb: SkBuff) {
             .iter()
             .filter(|s| bcast_match(s, &k))
         {
-            s.enqueue(d.clone());
+            s.rxq.enqueue(&s.sk, d.clone());
         }
         return;
     }
     match lookup(&net.udp, &k) {
-        Some(s) => s.enqueue(d),
+        Some(s) => s.rxq.enqueue(&s.sk, d),
         None => crate::net::icmp::port_unreach(&net, &skb),
     }
 }

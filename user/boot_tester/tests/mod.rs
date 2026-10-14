@@ -115,6 +115,7 @@ pub fn run_all_tests() {
     netdev::run_tests();
     neigh::run_tests();
     icmp::run_tests();
+    icmp::run_ping_tests();
     keys::run_tests();
     kcmp::run_tests();
     process_vm::run_tests();

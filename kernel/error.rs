@@ -178,6 +178,8 @@ pub enum KernelError {
     // =========================================================================
     // Additional errno values
     // =========================================================================
+    /// Remote I/O error (EREMOTEIO)
+    RemoteIo = 121,
     /// Disk quota exceeded (EDQUOT)
     QuotaExceeded = 122,
     /// Operation canceled (ECANCELED)
@@ -283,6 +285,7 @@ impl KernelError {
             113 => Self::HostUnreachable,
             114 => Self::AlreadyInProgress,
             115 => Self::InProgress,
+            121 => Self::RemoteIo,
             122 => Self::QuotaExceeded,
             125 => Self::Canceled,
             126 => Self::NoKey,
