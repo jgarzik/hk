@@ -22,7 +22,7 @@ sudo apt install gcc-aarch64-linux-gnu
 
 ### Rust Components
 
-The project uses nightly Rust. Components are specified in `rust-toolchain.toml` and should be installed automatically. If needed:
+The project uses stable Rust (no nightly features). Toolchain, components and targets are specified in `rust-toolchain.toml` and should be installed automatically. If needed:
 
 ```bash
 rustup target add x86_64-unknown-none
@@ -264,9 +264,8 @@ which qemu-system-aarch64
 
 ### Build fails with target errors
 
-Ensure the nightly toolchain and targets are installed:
+`rust-toolchain.toml` should install these automatically; if not:
 ```bash
-rustup override set nightly
 rustup target add x86_64-unknown-none aarch64-unknown-none
 rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 ```

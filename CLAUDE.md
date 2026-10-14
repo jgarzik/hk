@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-hk: Rust no_std SMP kernel, x86-64 + aarch64, Linux syscall ABI. No `src/` dirs; sources live in crate roots.
+hk: Rust (stable, no nightly features) no_std SMP kernel, x86-64 + aarch64, Linux syscall ABI. No `src/` dirs; sources live in crate roots.
 
 ## Build / verify
 - Use Makefile targets only; bare `cargo build/clippy` fails (no_std needs `--target`).
