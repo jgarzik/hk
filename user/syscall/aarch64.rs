@@ -1132,6 +1132,19 @@ pub fn sys_exit(status: u64) -> ! {
     }
 }
 
+/// exit_group(status) - terminate all threads in the process
+#[inline(always)]
+pub fn sys_exit_group(status: u64) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") SYS_EXIT_GROUP,
+            in("x0") status,
+            options(noreturn, nostack),
+        );
+    }
+}
+
 // ============================================================================
 // UTS namespace syscalls
 // ============================================================================

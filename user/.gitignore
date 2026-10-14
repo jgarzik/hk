@@ -2,3 +2,4 @@
 target/
 *.cpio
 
+target-host/

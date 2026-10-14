@@ -24,7 +24,7 @@ BOOT_TESTER = target/$(TARGET)/release/boot_tester
 BOOT_TESTER2 = target/$(TARGET)/release/boot_tester2
 INITRD_ROOT = initrd-root
 
-.PHONY: all clean boot_tester initramfs
+.PHONY: all clean boot_tester initramfs host
 
 all: $(INITRAMFS)
 
@@ -46,7 +46,17 @@ $(INITRAMFS): $(BOOT_TESTER) $(BOOT_TESTER2)
 	@echo "Created $(INITRAMFS)"
 	@ls -la $(INITRAMFS)
 
+# Linux-host build for differential testing (../tools/linux-boot-tester.sh).
+# Non-PIE static: Linux does not relocate an interpreter-less static-pie,
+# while hk's ELF loader does. RUSTFLAGS replaces .cargo/config.toml rustflags.
+HOST_TARGET_DIR = target-host
+HOST_RUSTFLAGS = -C relocation-model=static -C target-feature=+crt-static -C link-arg=-nostartfiles
+
+host:
+	RUSTFLAGS="$(HOST_RUSTFLAGS)" CARGO_TARGET_DIR=$(HOST_TARGET_DIR) $(CARGO) build --release --target $(TARGET)
+
 clean:
 	$(CARGO) clean
+	rm -rf $(HOST_TARGET_DIR)
 	rm -f initramfs-*.cpio
 	rm -rf $(INITRD_ROOT)

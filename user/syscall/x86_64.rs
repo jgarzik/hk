@@ -204,6 +204,7 @@ pub const SYS_FORK: u64 = 57;
 pub const SYS_VFORK: u64 = 58;
 pub const SYS_EXECVE: u64 = 59;
 pub const SYS_EXIT: u64 = 60;
+pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_WAIT4: u64 = 61;
 pub const SYS_KILL: u64 = 62;
 pub const SYS_UNAME: u64 = 63;
@@ -715,6 +716,13 @@ pub fn sys_execve(pathname: *const u8, argv: *const *const u8, envp: *const *con
 #[inline(always)]
 pub fn sys_exit(status: u64) -> ! {
     unsafe { syscall1!(SYS_EXIT, status) };
+    loop {}
+}
+
+/// exit_group(status) - terminate all threads in the process
+#[inline(always)]
+pub fn sys_exit_group(status: u64) -> ! {
+    unsafe { syscall1!(SYS_EXIT_GROUP, status) };
     loop {}
 }
 
