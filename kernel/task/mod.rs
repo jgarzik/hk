@@ -794,6 +794,22 @@ impl<F> FdTable<F> {
         }
     }
 
+    /// Copy for exec (Linux unshare_files + do_close_on_exec): the
+    /// descriptors without FD_CLOEXEC, with their flags
+    pub fn exec_copy(&self) -> Self {
+        let mut t = Self::new();
+        for (&fd, file) in &self.files {
+            let fl = self.get_fd_flags(fd);
+            if fl & FD_CLOEXEC == 0 {
+                t.files.insert(fd, file.clone());
+                if fl != 0 {
+                    t.fd_flags.insert(fd, fl);
+                }
+            }
+        }
+        t
+    }
+
     /// Get the number of open file descriptors
     pub fn count(&self) -> usize {
         self.files.len()

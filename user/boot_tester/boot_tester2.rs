@@ -3,6 +3,9 @@
 //! This program is executed by boot_tester via execve() to verify
 //! that exec works correctly. It prints some diagnostic info and
 //! exits with status 123, which the parent process validates.
+//!
+//! `boot_tester2 fdcheck`: exit 0 if fd 10 is closed (it was
+//! close-on-exec) and fd 11 is open, else a nonzero code.
 
 #![no_std]
 #![no_main]
@@ -10,7 +13,7 @@
 use core::ffi::c_void;
 use core::panic::PanicInfo;
 
-use hk_syscall::{sys_exit, sys_getpid, sys_getppid, sys_write};
+use hk_syscall::{sys_exit, sys_fcntl, sys_getpid, sys_getppid, sys_write};
 
 /// Print a string to stdout
 fn print(s: &[u8]) {
@@ -37,8 +40,69 @@ fn print_num(n: i64) {
     sys_write(1, &digit as *const u8, 1);
 }
 
+/// Process entry: pass the initial stack pointer (argc, argv...) on
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub unsafe extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "xor ebp, ebp",
+        "mov rdi, rsp",
+        "and rsp, -16",
+        "call {main}",
+        "ud2",
+        main = sym rust_start,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "mov x29, xzr",
+        "mov x30, xzr",
+        "mov x0, sp",
+        "bl {main}",
+        "brk 0",
+        main = sym rust_start,
+    )
+}
+
+/// argv[1] as bytes (without NUL), if present
+fn arg1(sp: *const u64) -> &'static [u8] {
+    unsafe {
+        if *sp < 2 {
+            return b"";
+        }
+        let p = *sp.add(2) as *const u8;
+        // volatile: a plain loop becomes a strlen call (no libc here)
+        let mut n = 0;
+        while n < 64 && core::ptr::read_volatile(p.add(n)) != 0 {
+            n += 1;
+        }
+        core::slice::from_raw_parts(p, n)
+    }
+}
+
+/// fdcheck mode: fd 10 must be gone after exec, fd 11 must remain
+fn fdcheck() -> ! {
+    const F_GETFD: i32 = 1;
+    const EBADF: i64 = -9;
+    if sys_fcntl(10, F_GETFD, 0) != EBADF {
+        sys_exit(1);
+    }
+    if sys_fcntl(11, F_GETFD, 0) != 0 {
+        sys_exit(2);
+    }
+    sys_exit(0);
+}
+
+extern "C" fn rust_start(sp: *const u64) -> ! {
+    if arg1(sp) == b"fdcheck" {
+        fdcheck();
+    }
+
     // Print marker that we're running in boot_tester2
     println(b"EXEC_CHILD: Hello from boot_tester2!");
 

@@ -566,9 +566,13 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     // Now we need to update the current task and switch to the new address space
     // This is the point of no return
 
+    let tid = percpu::current_tid();
+
+    // Private fd table without the close-on-exec descriptors
+    crate::task::fdtable::exec_task_fd(tid);
+
     // Signal vfork completion if parent is waiting
     // Must be done before we switch address spaces since parent may be blocked
-    let tid = percpu::current_tid();
     percpu::signal_vfork_done(tid);
 
     // Initialize brk for the new process

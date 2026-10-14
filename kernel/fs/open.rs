@@ -10,8 +10,9 @@ use crate::fs::{
 };
 use crate::uaccess::strncpy_from_user;
 
-use super::flags::{O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDWR, O_TRUNC};
+use super::flags::{O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDWR, O_TRUNC};
 use super::syscall::{AT_FDCWD, PATH_MAX, current_fd_table, get_nofile_limit};
+use crate::task::FD_CLOEXEC;
 
 /// Create regular file `name` in `parent` for O_CREAT (Linux
 /// lookup_open + may_o_create) under the parent's lock: an entry that
@@ -151,9 +152,14 @@ fn do_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Result<i64, Ke
     let file = filp_open(start, &path, flags, mode)?;
 
     // Allocate file descriptor (RLIMIT_NOFILE enforced inside alloc)
+    let fd_flags = if flags & O_CLOEXEC != 0 {
+        FD_CLOEXEC
+    } else {
+        0
+    };
     let fd_table = current_fd_table();
     let mut table = fd_table.lock();
-    match table.alloc(file, get_nofile_limit()) {
+    match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
         Ok(fd) => Ok(fd as i64),
         Err(e) => Ok(-(e as i64)),
     }
