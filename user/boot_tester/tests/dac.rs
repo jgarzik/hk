@@ -7,10 +7,10 @@
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     sys_chdir, sys_chmod, sys_chown, sys_close, sys_execve, sys_exit, sys_faccessat, sys_fchmod,
-    sys_fchown, sys_fork, sys_link, sys_mkdir, sys_open, sys_rename, sys_rmdir, sys_setfsuid,
+    sys_fchown, sys_fork, sys_fstat, sys_link, sys_mkdir, sys_open, sys_rename, sys_rmdir, sys_setfsuid,
     sys_setresgid, sys_setresuid, sys_setxattr, sys_stat, sys_symlink, sys_truncate, sys_umask,
     sys_unlink, sys_utimensat, sys_wait4, sys_write, Stat, Timespec, AT_FDCWD, O_CREAT,
-    O_DIRECTORY, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, UTIME_NOW, UTIME_OMIT,
+    O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, UTIME_NOW, UTIME_OMIT,
 };
 
 const EPERM: i64 = -1;
@@ -45,6 +45,7 @@ pub fn run_tests() {
     run_root(b"DAC_ROOT_OVERRIDE", t_root);
     run_root(b"DAC_FSUID", t_fsuid);
     run_root(b"DAC_CHOWN_KILL_SUID", t_root_chown);
+    creat_race();
 }
 
 // ---------------------------------------------------------------------------
@@ -411,4 +412,41 @@ fn t_root_chown(n: &[u8]) -> u64 {
     f += chk(n, b"chown", sys_chown(p.as_ptr(), 0, 0), 0);
     f += chk(n, b"mode", mode_of(p), 0o755);
     f
+}
+
+/// O_CREAT racing another creator: root keeps creating and removing a
+/// 0600 file under a name the unprivileged child opens with O_CREAT|O_RDWR;
+/// the child may only ever get a file it created itself
+fn creat_race() {
+    const N: u32 = 2000;
+    let p = b"/tmp/dac/sticky/race\0";
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_setresgid(USER, USER, USER) != 0 || sys_setresuid(USER, USER, USER) != 0 {
+            sys_exit(90);
+        }
+        for _ in 0..N {
+            let fd = sys_open(p.as_ptr(), O_CREAT | O_RDWR, 0o600);
+            if fd < 0 {
+                continue;
+            }
+            let mut st: Stat = unsafe { core::mem::zeroed() };
+            sys_fstat(fd as i32, &mut st);
+            sys_close(fd as u64);
+            if st.st_uid != USER {
+                sys_exit(1);
+            }
+            sys_unlink(p.as_ptr());
+        }
+        sys_exit(0);
+    }
+    for _ in 0..N {
+        let fd = sys_open(p.as_ptr(), O_CREAT | O_EXCL | O_WRONLY, 0o600);
+        if fd >= 0 {
+            sys_close(fd as u64);
+            sys_unlink(p.as_ptr());
+        }
+    }
+    wait_ok(b"DAC_CREAT_RACE", pid);
+    sys_unlink(p.as_ptr());
 }
