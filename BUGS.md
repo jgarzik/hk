@@ -22,20 +22,27 @@ pid == tid. hk draws pids and tids from separate counters, so e.g.
 TIDs say 3. Anything comparing those values (pthread joins, tgkill to a
 returned pid, `/proc/<pid>/task`) can disagree with Linux.
 
-## Raw user-memory accesses in the network syscalls (SMAP/PAN fault)
+## Raw user-memory access in the pre-VFS minimal write
 
-**Location**: `kernel/net/syscall.rs` (accept addr/addrlen, sendmsg/
-recvmsg iovecs and msghdr, send/recvmmsg, get/setsockopt optval,
-getsockname/getpeername, sendto/recvfrom buffers)
+**Location**: `kernel/arch/x86_64/syscall.rs`
 
-These still dereference user pointers with `core::ptr`/`from_raw_parts`
-instead of the uaccess helpers. With the default boot-test CPUs (x86 TCG
-`-cpu max` has SMAP, arm `neoverse-n1` has PAN) the socket tests fault
-in the kernel (first: `sys_getsockname`), and on any CPU a bad pointer
-panics instead of returning EFAULT. All other syscall paths were
-converted; the only other raw user access left is the pre-VFS minimal
-`write` in `kernel/arch/x86_64/syscall.rs` (unused once the VFS handler
-is registered).
+All syscall paths copy user memory through the uaccess helpers (the boot
+tests run with SMAP on x86 TCG `-cpu max` and PAN on arm `neoverse-n1`).
+The only raw access left is the early minimal `write`, unused once the
+VFS handler is registered.
+
+## Network stack gaps reachable since eth0 receives (P2)
+
+**Location**: `kernel/net/`
+
+Planned for later phases of the network chunk, listed because real
+traffic now reaches them: TCP has no retransmission or timers, so a
+dropped segment (TX ring full, backlog overflow) stalls a connection
+(P6); closed UDP/TCP sockets stay in the namespace tables, so a port is
+never freed and the stale socket can still match lookups (P4); ARP has
+no state machine, every unresolved packet sends a request and entries
+never expire (P5); no IP fragmentation/reassembly (P5). The static
+10.0.2.15/24 configuration remains until netlink (P3).
 
 ## Partial munmap of an anonymous mapping drops the rest of it
 
