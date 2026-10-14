@@ -80,7 +80,7 @@ ap_pm32:
 
     /* Enable paging (CR0.PG = bit 31) - this activates long mode */
     movl %cr0, %eax
-    orl $(1 << 31), %eax
+    orl $((1 << 31) | (1 << 16)), %eax   /* PG + WP */
     movl %eax, %cr0
 
     /* Far jump to 64-bit long mode code (selector 0x18 = 64-bit code segment) */
