@@ -30,9 +30,7 @@ use crate::arch::Uaccess;
 use crate::fs::KernelError;
 use crate::fs::file::File;
 use crate::mm::page_cache::{CachedPage, PAGE_SIZE};
-use crate::pipe::{
-    PIPE_BUFFERS, Pipe, PipeBuffer, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags,
-};
+use crate::pipe::{PIPE_RING, Pipe, PipeBuffer, PipeReadFileOps, PipeWriteFileOps, pipe_buf_flags};
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 use crate::uaccess::{copy_from_user, get_user, put_user};
@@ -134,7 +132,7 @@ pub fn splice_from_pipe(pipe: &Pipe) -> Option<(Arc<CachedPage>, u32, u32)> {
     let pipe_buf = &mut inner.bufs[tail_idx];
 
     if pipe_buf.is_empty() {
-        inner.tail = (inner.tail + 1) % PIPE_BUFFERS;
+        inner.tail = (inner.tail + 1) % PIPE_RING;
         return None;
     }
 
@@ -145,7 +143,7 @@ pub fn splice_from_pipe(pipe: &Pipe) -> Option<(Arc<CachedPage>, u32, u32)> {
 
     // Consume the buffer
     pipe_buf.release();
-    inner.tail = (inner.tail + 1) % PIPE_BUFFERS;
+    inner.tail = (inner.tail + 1) % PIPE_RING;
     inner.total_len = inner.total_len.saturating_sub(len as usize);
 
     // Wake writers - there's now space
@@ -230,7 +228,7 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
             }
         }
 
-        src_idx = (src_idx + 1) % PIPE_BUFFERS;
+        src_idx = (src_idx + 1) % PIPE_RING;
     }
 
     // Wake readers on destination
@@ -479,7 +477,7 @@ fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64
         let src_buf = &mut src_guard.bufs[tail_idx];
 
         if src_buf.is_empty() {
-            src_guard.tail = (src_guard.tail + 1) % PIPE_BUFFERS;
+            src_guard.tail = (src_guard.tail + 1) % PIPE_RING;
             continue;
         }
 
@@ -502,7 +500,7 @@ fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64
             // Consume from source
             if to_move == available {
                 src_buf.release();
-                src_guard.tail = (src_guard.tail + 1) % PIPE_BUFFERS;
+                src_guard.tail = (src_guard.tail + 1) % PIPE_RING;
             } else {
                 src_buf.offset += to_move as u32;
                 src_buf.len -= to_move as u32;
@@ -510,7 +508,7 @@ fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64
             src_guard.total_len = src_guard.total_len.saturating_sub(to_move);
             moved += to_move;
         } else {
-            src_guard.tail = (src_guard.tail + 1) % PIPE_BUFFERS;
+            src_guard.tail = (src_guard.tail + 1) % PIPE_RING;
         }
     }
 
