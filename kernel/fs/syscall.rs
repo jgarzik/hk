@@ -130,7 +130,6 @@ pub fn current_fd_table() -> alloc::sync::Arc<spin::Mutex<crate::task::FdTable<F
     get_task_fd(current_tid()).expect("current task has no FD table")
 }
 
-
 ///
 /// Returns the parent dentry and the final component name.
 pub fn lookup_parent_at(
