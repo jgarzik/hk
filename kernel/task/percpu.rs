@@ -2421,13 +2421,26 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
 
     // Update per-CPU cache first (so current task sees new creds immediately)
     let mut current = CurrentArch::get_current_task();
+    let old = current.cred;
     current.cred = *new;
     CurrentArch::set_current_task(&current);
+
+    // Changing euid/egid/fsuid/fsgid makes the task non-dumpable
+    // (suid_dumpable, default 0), so a less-privileged identity can't ptrace
+    // or core-dump state obtained under the old one (Linux kernel/cred.c
+    // commit_creds)
+    let ids_changed = old.euid != new.euid
+        || old.egid != new.egid
+        || old.fsuid != new.fsuid
+        || old.fsgid != new.fsgid;
 
     // Update TASK_TABLE (persistent storage for context switch)
     let mut table = TASK_TABLE.lock();
     if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
         task.cred = new;
+        if ids_changed {
+            task.prctl.dumpable = crate::task::dumpable::SUID_DUMP_DISABLE;
+        }
     }
 }
 

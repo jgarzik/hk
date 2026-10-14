@@ -8,7 +8,7 @@
 
 use super::helpers::{print, println, print_num};
 use hk_syscall::{
-    sys_brk, sys_clock_getres, sys_clock_nanosleep, sys_clone, sys_execve, sys_exit, sys_fork,
+    sys_brk, sys_prctl, sys_clock_getres, sys_clock_nanosleep, sys_clone, sys_execve, sys_exit, sys_fork,
     sys_getcpu, sys_getegid, sys_geteuid, sys_getgid, sys_getpgid, sys_getpid, sys_getppid,
     sys_getpriority, sys_getresgid, sys_getresuid, sys_getrusage, sys_getsid, sys_gettid,
     sys_getuid, sys_ioprio_get, sys_ioprio_set, sys_nanosleep, sys_sched_getaffinity,
@@ -1176,14 +1176,39 @@ fn test_setregid() {
     }
 }
 
+/// Run `f` in a forked child: credential changes make Linux drop the
+/// process's dumpable flag, which must not leak into pid 1
+fn in_child(f: fn()) {
+    let pid = sys_fork();
+    if pid == 0 {
+        f();
+        sys_exit(0);
+    }
+    let mut status: i32 = 0;
+    sys_wait4(pid, &mut status, 0, 0);
+}
+
 /// Test 41: setfsuid syscall - set filesystem UID
 fn test_setfsuid() {
+    in_child(setfsuid_body);
+}
+
+fn setfsuid_body() {
     // setfsuid returns OLD value, not error code
     // Initial fsuid should be 0 (root)
     let old_fsuid = sys_setfsuid(1000);
     if old_fsuid != 0 {
         print(b"SETFSUID:FAIL expected old=0 got=");
         print_num(old_fsuid);
+        println(b"");
+        return;
+    }
+
+    // Changing fsuid resets dumpable to suid_dumpable (0) (kernel/cred.c)
+    let dumpable = sys_prctl(hk_syscall::PR_GET_DUMPABLE, 0, 0, 0, 0);
+    if dumpable != 0 {
+        print(b"SETFSUID:FAIL dumpable after fsuid change=");
+        print_num(dumpable);
         println(b"");
         return;
     }
@@ -1211,6 +1236,10 @@ fn test_setfsuid() {
 
 /// Test 42: setfsgid syscall - set filesystem GID
 fn test_setfsgid() {
+    in_child(setfsgid_body);
+}
+
+fn setfsgid_body() {
     // setfsgid returns OLD value, not error code
     // Initial fsgid should be 0 (root)
     let old_fsgid = sys_setfsgid(2000);
