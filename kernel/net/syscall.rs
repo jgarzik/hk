@@ -707,9 +707,9 @@ pub(crate) fn scatter_iovec(iov_ptr: u64, iovlen: usize, data: &[u8]) -> usize {
 }
 
 /// sendmsg(fd, msg, flags) - send a message on a socket
-pub fn sys_sendmsg(fd: i32, msg: u64, _flags: i32) -> i64 {
-    if let Some((_, nl)) = nl_sock(fd) {
-        return netlink::sys::sendmsg(&nl, msg);
+pub fn sys_sendmsg(fd: i32, msg: u64, flags: i32) -> i64 {
+    if let Some((file, nl)) = nl_sock(fd) {
+        return netlink::sys::sendmsg(&nl, &file, msg, flags);
     }
     let socket = match get_socket(fd) {
         Ok(s) => s,
@@ -1286,9 +1286,9 @@ pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: u64, optlen: u6
 }
 
 /// sendto(fd, buf, len, flags, dest_addr, addrlen) - send data
-pub fn sys_sendto(fd: i32, buf: u64, len: u64, _flags: i32, dest_addr: u64, addrlen: u64) -> i64 {
-    if let Some((_, nl)) = nl_sock(fd) {
-        return netlink::sys::sendto(&nl, buf, len, dest_addr, addrlen);
+pub fn sys_sendto(fd: i32, buf: u64, len: u64, flags: i32, dest_addr: u64, addrlen: u64) -> i64 {
+    if let Some((file, nl)) = nl_sock(fd) {
+        return netlink::sys::sendto(&nl, &file, buf, len, flags, dest_addr, addrlen);
     }
     let socket = match get_socket(fd) {
         Ok(s) => s,

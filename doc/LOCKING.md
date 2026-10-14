@@ -1600,8 +1600,9 @@ do not rely on that.
 | `NetDevice.addrs` (IPv4 list; IPv6 later) | `spin::RwLock` | thread only | leaf; written only under RTNL (`inet::ifaddr`), read via snapshots (`inet_addrs()`) |
 | `NetNamespace.arp_pending` -> `arp_entries` | `spin::Mutex` | thread only | `arp_resolve_or_queue` checks the cache and queues under `arp_pending`, so a racing reply cannot strand a packet; queue capped at 16 per address; `arp_flush_dev` (device down, under RTNL) takes both in the same order |
 | `NlTable.socks` (`net/netlink`, per netns) | `spin::RwLock` | thread only | leaf; bound netlink sockets by (protocol, portid); lookups return `Arc` clones |
-| `NlSock.rxq`, `NlSock.dst` | `spin::Mutex` | thread only | leaf; replies, dumps and notifications are pushed under it, `wq` is woken after it is dropped |
-| `NlSock` portid/groups/flags/err/rmem, autobind `ROVER` | atomics | thread only | |
+| `NlSock.dump` | `spin::Mutex<Option<Dump>>` | thread only (sender's `sendmsg`, reader's `recvmsg`) | running dump cursor; held while it snapshots devices/FIB/ARP and while its part is pushed to `rxq` (keeps parts ordered); never with RTNL |
+| `NlSock.rxq`, `NlSock.dst` | `spin::Mutex` | thread only | leaf; replies, dump parts and notifications are pushed under it (each charged to rcvbuf first), `wq` is woken after it is dropped |
+| `NlSock` portid/groups/flags/err/rmem/congested, autobind `ROVER` | atomics | thread only | |
 | `NetDevice.net` | `spin::RwLock<Weak<NetNamespace>>` | thread only | read per received packet; written at registration |
 | `NetDevice.stats`, `flags`, `mtu`, `ifindex`, `carrier` | atomics | any | `flags` holds administrative state only; IFF_RUNNING/IFF_LOWER_UP/operstate are derived on read |
 | e1000 `rx` ring | `spin::Mutex` | thread only (NAPI poll) | leaf; frames are delivered after it is dropped |
@@ -1620,6 +1621,7 @@ NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
   the guard before returning)
   -> arp_pending -> arp_entries
   -> NlTable.socks -> NlSock.rxq (netlink replies/notifications)
+  (NlSock.dump -> devices/FIB/ARP snapshots -> NlSock.rxq: dump parts)
   -> device TX lock (e1000 tx)
   -> Softnet.backlog (lo xmit)           Softnet.poll_list / WaitQueue / rq
                                           (IrqSpinlocks, innermost)

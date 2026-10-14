@@ -7,10 +7,10 @@
 //! dumps (no IPv6 addresses/routes exist yet) and EAFNOSUPPORT for
 //! changes. NEW/DEL/SET need CAP_NET_ADMIN.
 //!
-//! Dumps are built completely when requested and queued as NLM_F_MULTI
-//! datagrams of at most `DUMP_SIZE` bytes followed by NLMSG_DONE (Linux
-//! builds them as the reader drains the queue; the result is the same).
+//! Dumps are resumable cursors (`RtDump`): parts of at most `DUMP_SIZE`
+//! bytes are produced as the reader drains its queue, NLMSG_DONE last.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -205,12 +205,8 @@ fn rcv_msg(sk: &Arc<NlSock>, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
         ) {
             return Err(KernelError::OperationNotSupported);
         }
-        // Errors found while dumping end the dump: NLMSG_DONE carries them
-        let (msgs, err) = match dump(sk, h, family, p) {
-            Ok(m) => (m, 0),
-            Err(e) => (Vec::new(), -e.errno()),
-        };
-        queue_dump(sk, h, msgs, err);
+        let cb = RtDump::new(sk, h, family, p);
+        sk.dump_start(Box::new(cb), h.seq)?;
         return Ok(Done::Dump);
     }
     let nl = NlInfo {
@@ -235,48 +231,108 @@ fn rcv_msg(sk: &Arc<NlSock>, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
     }
 }
 
-/// Build a dump's messages
-fn dump(sk: &NlSock, h: &Hdr, family: u8, p: &[u8]) -> Result<Vec<Vec<u8>>, KernelError> {
-    let net = &sk.net;
-    let strict = sk.has_flag(sflags::STRICT_CHK);
-    let (seq, pid) = (h.seq, sk.portid());
-    let flags = NLM_F_MULTI;
-    let inet = family != AF_INET6;
-    match h.ty {
-        RTM_GETLINK => {
-            if strict {
-                link_dump_check(p)?;
-            }
-            Ok(net
-                .devices()
-                .iter()
-                .map(|d| fill_link(d, RTM_NEWLINK, flags, seq, pid, 0))
-                .collect())
+/// What a dump lists
+enum DumpKind {
+    Link,
+    /// Addresses (of one ifindex if non-zero)
+    Addr(u32),
+    /// Routes (of one table if non-zero)
+    Route(u32),
+    Neigh,
+    /// Nothing (other families, empty rule dump, RTM_F_CLONED)
+    Empty,
+    /// Request rejected by strict checking: DONE carries the error
+    Bad(KernelError),
+}
+
+/// A resumable rtnetlink dump: `pos` counts the objects already sent;
+/// each part re-snapshots the table and continues from there (Linux
+/// cb->args), so changes between parts are tolerated like on Linux
+struct RtDump {
+    kind: DumpKind,
+    flags: u16,
+    seq: u32,
+    pid: u32,
+    pos: usize,
+}
+
+impl RtDump {
+    fn new(sk: &NlSock, h: &Hdr, family: u8, p: &[u8]) -> Self {
+        let strict = sk.has_flag(sflags::STRICT_CHK);
+        let mut flags = NLM_F_MULTI;
+        let inet = family != AF_INET6;
+        let kind = match h.ty {
+            RTM_GETLINK if strict => match link_dump_check(p) {
+                Ok(()) => DumpKind::Link,
+                Err(e) => DumpKind::Bad(e),
+            },
+            RTM_GETLINK => DumpKind::Link,
+            RTM_GETADDR if inet => addr_dump_kind(&sk.net, p, strict, &mut flags),
+            RTM_GETROUTE if inet => route_dump_kind(p, strict, &mut flags),
+            RTM_GETNEIGH if inet => DumpKind::Neigh,
+            _ => DumpKind::Empty,
+        };
+        Self {
+            kind,
+            flags,
+            seq: h.seq,
+            pid: sk.portid(),
+            pos: 0,
         }
-        RTM_GETADDR if inet => addr_dump(net, p, strict, seq, pid),
-        RTM_GETROUTE if inet => route_dump(net, p, strict, seq, pid),
-        RTM_GETNEIGH if inet => Ok(net
-            .arp_entries()
-            .iter()
-            .map(|e| fill_neigh(e, RTM_NEWNEIGH, flags, seq, pid))
-            .collect()),
-        _ => Ok(Vec::new()),
+    }
+
+    /// Append messages for `items[pos..]` while they fit in a part
+    fn take<T>(&mut self, buf: &mut Vec<u8>, items: &[T], f: impl Fn(&T) -> Vec<u8>) -> bool {
+        for it in items.iter().skip(self.pos) {
+            let m = f(it);
+            if !buf.is_empty() && buf.len() + m.len() > DUMP_SIZE {
+                return false;
+            }
+            buf.extend_from_slice(&m);
+            self.pos += 1;
+        }
+        // Leave room for NLMSG_DONE in the same part, like Linux
+        buf.len() + NLMSG_HDRLEN + 4 <= DUMP_SIZE || buf.is_empty()
     }
 }
 
-/// Pack dump messages into datagrams and finish with NLMSG_DONE
-/// carrying `err` (0 or a negative errno)
-fn queue_dump(sk: &NlSock, h: &Hdr, msgs: Vec<Vec<u8>>, err: i32) {
-    let mut done = Msg::new(NLMSG_DONE, NLM_F_MULTI, h.seq, sk.portid());
-    done.put(&err.to_ne_bytes());
-    let mut cur: Vec<u8> = Vec::new();
-    for m in msgs.into_iter().chain(core::iter::once(done.finish())) {
-        if !cur.is_empty() && cur.len() + m.len() > DUMP_SIZE {
-            reply(sk, core::mem::take(&mut cur));
+impl DumpCb for RtDump {
+    fn fill(&mut self, sk: &NlSock, buf: &mut Vec<u8>) -> Result<bool, KernelError> {
+        let net = &sk.net;
+        let (f, seq, pid) = (self.flags, self.seq, self.pid);
+        match self.kind {
+            DumpKind::Bad(e) => Err(e),
+            DumpKind::Empty => Ok(true),
+            DumpKind::Link => {
+                let devs = net.devices();
+                Ok(self.take(buf, &devs, |d| fill_link(d, RTM_NEWLINK, f, seq, pid, 0)))
+            }
+            DumpKind::Addr(only) => {
+                let addrs: Vec<(Arc<NetDevice>, InIfaddr)> = net
+                    .devices()
+                    .into_iter()
+                    .filter(|d| only == 0 || d.ifindex() == only)
+                    .flat_map(|d| d.inet_addrs().into_iter().map(move |a| (d.clone(), a)))
+                    .collect();
+                Ok(self.take(buf, &addrs, |(d, a)| {
+                    fill_addr(d, a, RTM_NEWADDR, f, seq, pid)
+                }))
+            }
+            DumpKind::Route(table) => {
+                let rts: Vec<Arc<FibEntry>> = net
+                    .fib
+                    .dump()
+                    .into_iter()
+                    .filter(|e| table == 0 || e.table == table)
+                    .collect();
+                Ok(self.take(buf, &rts, |e| fill_route(e, RTM_NEWROUTE, f, seq, pid)))
+            }
+            DumpKind::Neigh => {
+                let n = net.arp_entries();
+                Ok(self.take(buf, &n, |e| fill_neigh(e, RTM_NEWNEIGH, f, seq, pid)))
+            }
         }
-        cur.extend_from_slice(&m);
     }
-    reply(sk, cur);
 }
 
 // ============================================================================
@@ -495,37 +551,25 @@ fn ifaddrmsg(p: &[u8]) -> Result<IfAddrMsg, KernelError> {
     })
 }
 
-fn addr_dump(
-    net: &NetNamespace,
-    p: &[u8],
-    strict: bool,
-    seq: u32,
-    pid: u32,
-) -> Result<Vec<Vec<u8>>, KernelError> {
-    let mut only = 0;
-    let mut flags = NLM_F_MULTI;
-    if strict {
-        // Linux inet_valid_dump_ifaddr_req
-        let ifm = ifaddrmsg(p)?;
-        if ifm.prefixlen != 0 || ifm.flags != 0 || ifm.scope != 0 {
-            return Err(KernelError::InvalidArgument);
-        }
-        if ifm.index != 0 {
-            only = ifm.index;
-            flags |= NLM_F_DUMP_FILTERED;
-            net.dev_get_by_index(only).ok_or(KernelError::NoDevice)?;
+/// Address dump filter (Linux inet_valid_dump_ifaddr_req when strict)
+fn addr_dump_kind(net: &NetNamespace, p: &[u8], strict: bool, flags: &mut u16) -> DumpKind {
+    if !strict {
+        return DumpKind::Addr(0);
+    }
+    let ifm = match ifaddrmsg(p) {
+        Ok(m) => m,
+        Err(e) => return DumpKind::Bad(e),
+    };
+    if ifm.prefixlen != 0 || ifm.flags != 0 || ifm.scope != 0 {
+        return DumpKind::Bad(KernelError::InvalidArgument);
+    }
+    if ifm.index != 0 {
+        *flags |= NLM_F_DUMP_FILTERED;
+        if net.dev_get_by_index(ifm.index).is_none() {
+            return DumpKind::Bad(KernelError::NoDevice);
         }
     }
-    let mut out = Vec::new();
-    for dev in net.devices() {
-        if only != 0 && dev.ifindex() != only {
-            continue;
-        }
-        for ifa in dev.inet_addrs() {
-            out.push(fill_addr(&dev, &ifa, RTM_NEWADDR, flags, seq, pid));
-        }
-    }
-    Ok(out)
+    DumpKind::Addr(ifm.index)
 }
 
 /// RTM_NEWADDR/DELADDR message (Linux inet_fill_ifaddr)
@@ -721,34 +765,31 @@ fn delroute(sk: &NlSock, h: &Hdr, p: &[u8], nl: NlInfo) -> Result<Done, KernelEr
     Ok(Done::Ok)
 }
 
-fn route_dump(
-    net: &NetNamespace,
-    p: &[u8],
-    strict: bool,
-    seq: u32,
-    pid: u32,
-) -> Result<Vec<Vec<u8>>, KernelError> {
-    let mut table = 0;
-    let mut flags = NLM_F_MULTI;
-    if strict {
+/// Route dump filter (strict: table, RTM_F_CLONED = empty cache dump)
+fn route_dump_kind(p: &[u8], strict: bool, flags: &mut u16) -> DumpKind {
+    if !strict {
+        return DumpKind::Route(0);
+    }
+    let parse = || -> Result<DumpKind, KernelError> {
         let rtm = rtmsg(p)?;
         let a = Attrs::parse(&p[RTMSG_LEN..], RTA_MAX)?;
-        table = a.u32(RTA_TABLE)?.unwrap_or(rtm.table as u32);
         if rtm.flags & RTM_F_CLONED != 0 {
-            // Route cache: none
-            return Ok(Vec::new());
+            return Ok(DumpKind::Empty);
         }
-        if table != 0 {
-            flags |= NLM_F_DUMP_FILTERED;
+        Ok(DumpKind::Route(
+            a.u32(RTA_TABLE)?.unwrap_or(rtm.table as u32),
+        ))
+    };
+    match parse() {
+        Ok(DumpKind::Route(t)) => {
+            if t != 0 {
+                *flags |= NLM_F_DUMP_FILTERED;
+            }
+            DumpKind::Route(t)
         }
+        Ok(k) => k,
+        Err(e) => DumpKind::Bad(e),
     }
-    Ok(net
-        .fib
-        .dump()
-        .iter()
-        .filter(|e| table == 0 || e.table == table)
-        .map(|e| fill_route(e, RTM_NEWROUTE, flags, seq, pid))
-        .collect())
 }
 
 /// RTM_NEWROUTE/DELROUTE message for a FIB entry (Linux fib_dump_info)

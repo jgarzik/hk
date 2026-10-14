@@ -56,8 +56,7 @@ creation and rename (EOPNOTSUPP), multipath routes and nexthop objects
 NLM_F_ECHO (not echoed), extended-ACK message/offset TLVs (plain errors),
 RTM_GETRULE dumps nothing (Linux lists its three default IPv4 rules; there
 is no rule engine: lookups are local then main), address lifetimes are
-always infinite, promote_secondaries is off. Dumps are built in full when
-requested instead of as the reader drains them.
+always infinite, promote_secondaries is off.
 
 ## Rare arm64 kernel instruction abort in the fault-signal tests
 

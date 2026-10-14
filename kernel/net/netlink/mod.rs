@@ -7,25 +7,38 @@
 //! notifications go to every subscribed socket of the namespace.
 //!
 //! Requests sent to the kernel (nl_pid 0) are processed synchronously in
-//! the sender's `sendmsg` (Linux netlink_unicast_kernel); replies, ACKs and
-//! whole dumps (precomputed into <= 8 KB NLM_F_MULTI datagrams + DONE) are
-//! queued on the sender's receive queue. Multicast delivery respects the
-//! receive buffer: a full queue drops the message and reports ENOBUFS on
-//! the next recvmsg (unless NETLINK_NO_ENOBUFS).
+//! the sender's `sendmsg` (Linux netlink_unicast_kernel); replies and
+//! ACKs are queued on the sender's receive queue.
+//!
+//! Every queued message is charged to the receiver's rcvbuf (`truesize`
+//! = payload + overhead), so per-socket memory is bounded by rcvbuf plus
+//! one message. Kernel messages (replies, ACKs, notifications) that do
+//! not fit are dropped and reported once as ENOBUFS (Linux
+//! netlink_overrun; not with NETLINK_NO_ENOBUFS); user-to-user unicast
+//! waits for room or fails with EAGAIN. Dumps are resumable (Linux
+//! netlink_dump): a `DumpCb` cursor produces <= 8 KB NLM_F_MULTI parts,
+//! the first at request time, later ones as recvmsg drains the queue to
+//! half of rcvbuf; NLMSG_DONE ends it. A second dump while one runs is
+//! EBUSY.
 //!
 //! ## Locking
 //!
 //! - `NlTable.socks` (per netns): `spin::RwLock`, thread context only,
 //!   leaf; lookups return `Arc` clones (no guard escapes).
+//! - `NlSock.dump`: `spin::Mutex`, thread context only; held while the
+//!   cursor reads table snapshots and while its part is queued.
 //! - `NlSock.rxq`: `spin::Mutex`, thread context only, leaf. Senders
-//!   (notifications under RTNL, requests, peers) push and wake `wq` after
-//!   dropping it.
-//! - Order: RTNL -> FIB/addresses -> `NlTable.socks` -> `NlSock.rxq`.
+//!   (notifications under RTNL, requests, peers, dump steps) push and
+//!   wake `wq` after dropping it.
+//! - Order: RTNL -> FIB/addresses -> `NlTable.socks` -> `NlSock.rxq`;
+//!   `NlSock.dump` -> devices/FIB/ARP snapshots -> `NlSock.rxq`. RTNL is
+//!   never taken under `NlSock.dump`.
 
 pub mod attr;
 pub mod rtnetlink;
 pub mod sys;
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -131,7 +144,32 @@ pub struct NlSock {
     pub flags: AtomicU32,
     /// Pending socket error (positive errno; ENOBUFS on overrun)
     err: AtomicI32,
+    /// Receive queue overran; cleared when the reader empties it
+    congested: AtomicBool,
+    /// Messages dropped on overrun
+    drops: AtomicU32,
+    /// Running dump (Linux cb_running + netlink_callback)
+    dump: Mutex<Option<Dump>>,
     pub wq: WaitQueue,
+}
+
+/// Bytes charged to rcvbuf per queued message (Linux skb truesize:
+/// payload plus buffer overhead), so tiny messages cannot pin unbounded
+/// memory
+fn truesize(len: usize) -> usize {
+    len + 256
+}
+
+/// A dump producer (Linux netlink_callback.dump): appends the next
+/// messages to `buf` (at least one if any are left, at most about
+/// `rtnetlink::DUMP_SIZE` bytes); `Ok(true)` when finished
+pub trait DumpCb: Send {
+    fn fill(&mut self, sk: &NlSock, buf: &mut Vec<u8>) -> Result<bool, KernelError>;
+}
+
+struct Dump {
+    cb: Box<dyn DumpCb>,
+    seq: u32,
 }
 
 /// Next negative autobind port id (Linux netlink_autobind rover)
@@ -154,6 +192,9 @@ impl NlSock {
             sndbuf: AtomicU32::new(SK_BUF_DEFAULT),
             flags: AtomicU32::new(0),
             err: AtomicI32::new(0),
+            congested: AtomicBool::new(false),
+            drops: AtomicU32::new(0),
+            dump: Mutex::new(None),
             wq: WaitQueue::new(),
         })
     }
@@ -263,26 +304,67 @@ impl NlSock {
         self.groups.load(Ordering::Acquire)
     }
 
-    /// Queue `skb` unconditionally (replies to this socket's requests)
-    pub fn queue(&self, skb: NlSkb) {
-        self.rmem.fetch_add(skb.data.len(), Ordering::AcqRel);
+    /// Charge `skb` to the receive buffer if it fits (Linux
+    /// netlink_attachskb: the first skb always fits, later ones while
+    /// rmem stays within rcvbuf and the socket is not congested)
+    fn charge(&self, skb: &NlSkb) -> bool {
+        let ts = truesize(skb.data.len());
+        let before = self.rmem.fetch_add(ts, Ordering::AcqRel);
+        let limit = self.rcvbuf.load(Ordering::Acquire) as usize;
+        if (before == 0 || before + ts <= limit) && !self.congested.load(Ordering::Acquire) {
+            return true;
+        }
+        self.rmem.fetch_sub(ts, Ordering::AcqRel);
+        false
+    }
+
+    fn push(&self, skb: NlSkb) {
         self.rxq.lock().push_back(skb);
         self.wq.wake_all();
     }
 
-    /// Queue if the receive buffer has room, else record ENOBUFS
-    /// (Linux netlink_overrun); returns false when dropped
-    pub fn queue_bounded(&self, skb: NlSkb) -> bool {
-        if self.rmem.load(Ordering::Acquire) > self.rcvbuf.load(Ordering::Acquire) as usize {
-            if !self.has_flag(sflags::NO_ENOBUFS) {
-                self.err
-                    .store(KernelError::NoBufferSpace.errno(), Ordering::Release);
-                self.wq.wake_all();
-            }
+    /// Queue a kernel message (reply, ACK, notification): dropped with
+    /// an ENOBUFS overrun when the receive buffer is full (Linux
+    /// netlink_unicast/broadcast from the kernel, MSG_DONTWAIT)
+    pub fn queue(&self, skb: NlSkb) -> bool {
+        if !self.charge(&skb) {
+            self.overrun();
             return false;
         }
-        self.queue(skb);
+        self.push(skb);
         true
+    }
+
+    /// Linux netlink_overrun: report ENOBUFS once per congestion episode
+    /// (unless NETLINK_NO_ENOBUFS) and count the drop
+    fn overrun(&self) {
+        if !self.has_flag(sflags::NO_ENOBUFS) && !self.congested.swap(true, Ordering::AcqRel) {
+            self.err
+                .store(KernelError::NoBufferSpace.errno(), Ordering::Release);
+            self.wq.wake_all();
+        }
+        self.drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Queue a message from a user socket: wait for room unless
+    /// `nonblock` (EAGAIN), like netlink_attachskb with a send timeout
+    fn deliver(&self, skb: NlSkb, nonblock: bool) -> Result<(), KernelError> {
+        loop {
+            if self.charge(&skb) {
+                self.push(skb);
+                return Ok(());
+            }
+            if nonblock {
+                return Err(KernelError::WouldBlock);
+            }
+            self.wq.wait_event_interruptible(|| self.has_room())?;
+        }
+    }
+
+    fn has_room(&self) -> bool {
+        let r = self.rmem.load(Ordering::Acquire);
+        (r == 0 || r < self.rcvbuf.load(Ordering::Acquire) as usize)
+            && !self.congested.load(Ordering::Acquire)
     }
 
     /// Something to read (or an error to report)
@@ -300,29 +382,97 @@ impl NlSock {
     }
 
     /// Next datagram: removed unless `peek`; EAGAIN if `nonblock` and
-    /// empty; a pending overrun is reported first as ENOBUFS
+    /// empty; a pending overrun is reported first as ENOBUFS. Reading
+    /// makes room, so a running dump continues (Linux netlink_recvmsg).
     pub fn recv(&self, peek: bool, nonblock: bool) -> Result<NlSkb, KernelError> {
         loop {
             let e = self.take_error();
             if e != 0 {
                 return Err(KernelError::NoBufferSpace);
             }
-            {
-                let mut q = self.rxq.lock();
-                if let Some(front) = q.front() {
-                    if peek {
-                        return Ok(front.clone());
-                    }
-                    let skb = q.pop_front().unwrap();
-                    self.rmem.fetch_sub(skb.data.len(), Ordering::AcqRel);
-                    return Ok(skb);
-                }
+            if let Some(skb) = self.dequeue(peek) {
+                self.dump_more();
+                return Ok(skb);
             }
             if nonblock {
                 return Err(KernelError::WouldBlock);
             }
             self.wq.wait_event_interruptible(|| self.readable())?;
         }
+    }
+
+    fn dequeue(&self, peek: bool) -> Option<NlSkb> {
+        let mut q = self.rxq.lock();
+        if peek {
+            return q.front().cloned();
+        }
+        let skb = q.pop_front()?;
+        self.rmem
+            .fetch_sub(truesize(skb.data.len()), Ordering::AcqRel);
+        let empty = q.is_empty();
+        drop(q);
+        // Linux netlink_rcv_wake
+        if empty {
+            self.congested.store(false, Ordering::Release);
+        }
+        self.wq.wake_all();
+        Some(skb)
+    }
+
+    /// Start a dump (Linux netlink_dump_start): EBUSY while one runs;
+    /// the first part is queued now, the rest as the reader drains
+    pub fn dump_start(&self, cb: Box<dyn DumpCb>, seq: u32) -> Result<(), KernelError> {
+        {
+            let mut d = self.dump.lock();
+            if d.is_some() {
+                return Err(KernelError::Busy);
+            }
+            *d = Some(Dump { cb, seq });
+        }
+        self.dump_step();
+        Ok(())
+    }
+
+    /// Continue a running dump once at most half the buffer is used
+    fn dump_more(&self) {
+        let half = self.rcvbuf.load(Ordering::Acquire) as usize / 2;
+        if self.rmem.load(Ordering::Acquire) <= half {
+            self.dump_step();
+        }
+    }
+
+    /// Queue the next part of the running dump if it fits; ends with
+    /// NLMSG_DONE carrying 0 or the dump's error (Linux netlink_dump)
+    fn dump_step(&self) {
+        let mut d = self.dump.lock();
+        let Some(st) = d.as_mut() else {
+            return;
+        };
+        let r = self.rmem.load(Ordering::Acquire);
+        if r != 0 && r >= self.rcvbuf.load(Ordering::Acquire) as usize {
+            return;
+        }
+        let mut buf = Vec::new();
+        let done = match st.cb.fill(self, &mut buf) {
+            Ok(false) => None,
+            Ok(true) => Some(0),
+            Err(e) => Some(-e.errno()),
+        };
+        if let Some(err) = done {
+            let mut m = attr::Msg::new(NLMSG_DONE, NLM_F_MULTI, st.seq, self.portid());
+            m.put(&err.to_ne_bytes());
+            buf.extend_from_slice(&m.finish());
+            *d = None;
+        }
+        // Admission was checked above (a racing notification may push
+        // rmem past rcvbuf, which Linux also allows for one skb). Pushed
+        // under the dump lock so parts stay in order.
+        self.rmem.fetch_add(truesize(buf.len()), Ordering::AcqRel);
+        self.push(NlSkb {
+            data: buf,
+            portid: 0,
+            group: 0,
+        });
     }
 
     /// Send `data` to (`portid`, `group`) from this socket (Linux
@@ -332,6 +482,7 @@ impl NlSock {
         data: &[u8],
         portid: u32,
         group: u32,
+        nonblock: bool,
     ) -> Result<usize, KernelError> {
         self.autobind()?;
         if data.len() > self.max_msg() {
@@ -362,14 +513,13 @@ impl NlSock {
             portid: me,
             group: 0,
         };
-        if !peer.queue_bounded(skb) {
-            return Err(KernelError::WouldBlock);
-        }
+        peer.deliver(skb, nonblock)?;
         Ok(data.len())
     }
 
-    /// Close: leave the namespace table
+    /// Close: leave the namespace table, drop a running dump
     pub fn release(&self) {
+        *self.dump.lock() = None;
         if self.bound.load(Ordering::Acquire) {
             self.net.nl.remove(self.protocol, self.portid());
         }
@@ -394,7 +544,7 @@ pub fn broadcast(net: &NetNamespace, protocol: i32, skb: NlSkb, exclude: u32) {
     let bit = 1u64 << (skb.group - 1);
     for s in net.nl.socks(protocol) {
         if s.portid() != exclude && s.groups_all() & bit != 0 {
-            s.queue_bounded(skb.clone());
+            s.queue(skb.clone());
         }
     }
 }

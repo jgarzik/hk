@@ -71,9 +71,9 @@ impl FileOps for NlFile {
         Ok(n)
     }
 
-    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         let (pid, group) = self.sk.dst();
-        self.sk.send(buf, pid, group)
+        self.sk.send(buf, pid, group, nonblock(file, 0))
     }
 
     fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
@@ -208,28 +208,37 @@ fn dest(sk: &NlSock, name: u64, namelen: u64) -> Result<(u32, u32), KernelError>
 
 /// Copy in a message after the size check (Linux netlink_sendmsg:
 /// EMSGSIZE above sndbuf - 32, before any allocation)
-fn send_iov(sk: &Arc<NlSock>, iov: &Iov, pid: u32, group: u32) -> Result<i64, KernelError> {
+fn send_iov(sk: &Arc<NlSock>, iov: &Iov, dst: (u32, u32), nb: bool) -> Result<i64, KernelError> {
     if iov.total > sk.max_msg() {
         return Err(KernelError::MessageTooLong);
     }
     let data = iov.gather(iov.total)?;
-    Ok(sk.send(&data, pid, group)? as i64)
+    Ok(sk.send(&data, dst.0, dst.1, nb)? as i64)
 }
 
 /// sendto(2)
-pub fn sendto(sk: &Arc<NlSock>, buf: u64, len: u64, name: u64, namelen: u64) -> i64 {
+pub fn sendto(
+    sk: &Arc<NlSock>,
+    file: &File,
+    buf: u64,
+    len: u64,
+    flags: i32,
+    name: u64,
+    namelen: u64,
+) -> i64 {
     ret((|| {
-        let (pid, group) = dest(sk, name, namelen)?;
-        send_iov(sk, &Iov::single(buf, len)?, pid, group)
+        let dst = dest(sk, name, namelen)?;
+        send_iov(sk, &Iov::single(buf, len)?, dst, nonblock(file, flags))
     })())
 }
 
 /// sendmsg(2)
-pub fn sendmsg(sk: &Arc<NlSock>, msg: u64) -> i64 {
+pub fn sendmsg(sk: &Arc<NlSock>, file: &File, msg: u64, flags: i32) -> i64 {
     ret((|| {
         let h = read_msghdr(msg).map_err(|_| KernelError::BadAddress)?;
-        let (pid, group) = dest(sk, h.msg_name, h.msg_namelen as u64)?;
-        send_iov(sk, &Iov::from_msg(h.msg_iov, h.msg_iovlen)?, pid, group)
+        let dst = dest(sk, h.msg_name, h.msg_namelen as u64)?;
+        let iov = Iov::from_msg(h.msg_iov, h.msg_iovlen)?;
+        send_iov(sk, &iov, dst, nonblock(file, flags))
     })())
 }
 

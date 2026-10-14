@@ -9,7 +9,7 @@
 
 use hk_syscall::{
     sys_bind, sys_capget, sys_capset, sys_close, sys_exit, sys_fork, sys_getpid, sys_getsockname,
-    sys_getsockopt, sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt, sys_socket, sys_wait4, CapUserData,
+    sys_getsockopt, sys_recvfrom, sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt, sys_socket, sys_wait4, CapUserData,
     CapUserHeader, IoVec, MsgHdr, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, _LINUX_CAPABILITY_VERSION_3,
 };
 
@@ -22,6 +22,12 @@ const EFAULT: i32 = -14;
 const ENODEV: i32 = -19;
 const EEXIST: i32 = -17;
 const EINVAL: i32 = -22;
+const EBUSY: i32 = -16;
+const EAGAIN: i32 = -11;
+const ENOBUFS: i32 = -105;
+const SOL_SOCKET: i32 = 1;
+const SO_RCVBUF: i32 = 8;
+const MSG_DONTWAIT: i32 = 0x40;
 const EMSGSIZE: i32 = -90;
 const ENOPROTOOPT: i32 = -92;
 const EPROTONOSUPPORT: i32 = -93;
@@ -54,6 +60,8 @@ pub fn run_tests() {
     test_other_dumps();
     test_eperm();
     test_overflow();
+    test_dump_resume();
+    test_overrun();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -814,6 +822,141 @@ fn test_overflow() {
     }
     if !expect(N, b"iovlen 1025", sendmsg_iov(nl.fd, many), EMSGSIZE) {
         return;
+    }
+    ok(N);
+}
+
+/// Smallest receive buffer (SO_RCVBUF 0 -> SOCK_MIN_RCVBUF)
+fn tiny_rcvbuf(fd: i32) {
+    let v: i32 = 0;
+    sys_setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &v as *const i32 as *const u8, 4);
+}
+
+const N_ROUTES: u32 = 400;
+
+fn many_route(i: u32) -> [u8; 4] {
+    [10, 99, (i / 250) as u8, (i % 250 + 1) as u8]
+}
+
+/// Route dump with an optional concurrent second dump: (routes of
+/// ours seen, DONE seen, error of the second dump, datagrams)
+fn route_dump(nl: &mut Nl, second: bool) -> (u32, bool, i32, i64) {
+    let mut d1 = Req::new(RTM_GETROUTE, NLM_F_DUMP, &rtmsg(0, 0, 0, 0, 0));
+    let s1 = nl.send(&mut d1);
+    let mut s2 = 0;
+    if second {
+        s2 = nl.send(&mut Req::new(RTM_GETLINK, NLM_F_DUMP, &ifinfo(0, 0, 0)));
+    }
+    let (mut seen, mut done, mut busy, mut parts) = (0u32, false, 0, 0);
+    while !(done && (busy != 0 || !second)) && parts < 200 {
+        let buf = rxbuf();
+        let n = nl.recv(buf, 0);
+        if n <= 0 {
+            return (seen, done, n as i32, parts);
+        }
+        parts += 1;
+        each_msg(&buf[..n as usize], &mut |m| {
+            let ours = m.attr_ip(12, RTA_DST).is_some_and(|d| d[0] == 10 && d[1] == 99);
+            if m.seq == s1 && m.ty == RTM_NEWROUTE && ours {
+                seen += 1;
+            } else if m.seq == s1 && m.ty == NLMSG_DONE {
+                done = true;
+            } else if second && m.seq == s2 && m.ty == NLMSG_ERROR {
+                busy = m.error();
+            }
+        });
+    }
+    (seen, done, busy, parts)
+}
+
+/// A dump larger than the receive buffer continues as it is read (all
+/// entries arrive, DONE last); a second dump while one runs is EBUSY
+fn test_dump_resume() {
+    const N: &[u8] = b"NL_DUMP_RESUME";
+    let (Some(mut cfg), Some(mut small), Some(mut nl)) = (Nl::open(), Nl::open(), Nl::open()) else {
+        return fail(N, b"open", 0);
+    };
+    for i in 0..N_ROUTES {
+        let r = route(&mut cfg, true, many_route(i), 32, [0; 4], 1, NLM_F_CREATE | NLM_F_EXCL);
+        if r != 0 {
+            return fail(N, b"route add", r as i64);
+        }
+    }
+    tiny_rcvbuf(small.fd);
+    let (seen, done, err, parts) = route_dump(&mut small, false);
+    let (seen2, done2, busy, _) = route_dump(&mut nl, true);
+    for i in 0..N_ROUTES {
+        route(&mut cfg, false, many_route(i), 32, [0; 4], 1, 0);
+    }
+    if seen != N_ROUTES || !done || err != 0 || parts < 3 {
+        print_num(err as i64);
+        print(b" ");
+        print_num(parts);
+        return fail(N, b"small rcvbuf: routes", seen as i64);
+    }
+    if seen2 != N_ROUTES || !done2 {
+        return fail(N, b"routes", seen2 as i64);
+    }
+    if !expect(N, b"second dump", busy, EBUSY) {
+        return;
+    }
+    ok(N);
+}
+
+/// Change lo's MTU (one RTM_NEWLINK notification each)
+fn lo_mtu(nl: &mut Nl, mtu: u32) -> i32 {
+    let mut r = Req::new(RTM_NEWLINK, 0, &ifinfo(1, 0, 0));
+    r.u32(IFLA_MTU, mtu);
+    nl.ack(&mut r)
+}
+
+/// Read a monitor without blocking: (ENOBUFS seen first, messages)
+fn drain(fd: i32) -> (bool, i32) {
+    let buf = rxbuf();
+    let mut first = true;
+    let (mut enobufs, mut msgs) = (false, 0);
+    loop {
+        let r = sys_recvfrom(fd, buf.as_mut_ptr(), buf.len(), MSG_DONTWAIT, core::ptr::null_mut(), core::ptr::null_mut()) as i32;
+        if r == ENOBUFS && first {
+            enobufs = true;
+        } else if r == EAGAIN {
+            return (enobufs, msgs);
+        } else if r < 0 {
+            return (enobufs, r);
+        } else {
+            msgs += 1;
+        }
+        first = false;
+    }
+}
+
+/// Notifications beyond the receive buffer are dropped and reported
+/// once with ENOBUFS (not with NETLINK_NO_ENOBUFS)
+fn test_overrun() {
+    const N: &[u8] = b"NL_OVERRUN";
+    let (Some(mut cfg), Some(mon), Some(quiet)) = (Nl::open(), Nl::open(), Nl::open()) else {
+        return fail(N, b"open", 0);
+    };
+    let one: i32 = 1;
+    let g: i32 = RTNLGRP_LINK;
+    for fd in [mon.fd, quiet.fd] {
+        tiny_rcvbuf(fd);
+        sys_setsockopt(fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &g as *const i32 as *const u8, 4);
+    }
+    sys_setsockopt(quiet.fd, SOL_NETLINK, NETLINK_NO_ENOBUFS, &one as *const i32 as *const u8, 4);
+    for i in 0..10 {
+        let r = lo_mtu(&mut cfg, if i % 2 == 0 { 65535 } else { 65536 });
+        if r != 0 {
+            return fail(N, b"mtu", r as i64);
+        }
+    }
+    let (e1, m1) = drain(mon.fd);
+    let (e2, m2) = drain(quiet.fd);
+    if !e1 || m1 < 1 || m1 >= 10 {
+        return fail(N, b"monitor msgs", m1 as i64);
+    }
+    if e2 || m2 < 1 || m2 >= 10 {
+        return fail(N, b"NO_ENOBUFS msgs", m2 as i64);
     }
     ok(N);
 }
