@@ -7,7 +7,7 @@ hk: Rust (stable, no nightly features) no_std SMP kernel, x86-64 + aarch64, Linu
 - Done = all pass: `make test` `make check` `make check-arm` `make check-linux` `make clippy` `make clippy-arm` `make fmt-check`. Clippy must be warning-free.
 - `check*` boot QEMU and run `user/boot_tester`; pass = shutdown msg + no `FAIL` in `/tmp/qemu_serial.log` (arm: `/tmp/qemu_serial_arm.log`).
 - `user/` and `tools/` are separate cargo workspaces (excluded from root). Setup/pkgs: `DEVELOPMENT.md`.
-- `make check-linux`: same boot_tester as init on a real Linux kernel in QEMU (no root). Tests must pass on BOTH hk and Linux — expectations come from Linux, not hk. Host-only branches: `tests/helpers.rs` `host_mode()`/`skip()`. Linux source: `~/tmp/repo/linux`.
+- `make check-linux`: same boot_tester as init on a real Linux kernel in QEMU (no root). Tests must pass on BOTH hk and Linux — expectations come from Linux, not hk. Host-only branches: `tests/helpers.rs` `host_mode()`/`skip()`.
 
 ## Rules
 - Cross-platform first: generic code + arch callbacks in `kernel/arch/{x86_64,aarch64}/`, not `#[cfg(target_arch)]` sprinkled around.
