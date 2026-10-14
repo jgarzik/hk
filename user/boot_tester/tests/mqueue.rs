@@ -26,6 +26,7 @@ const EAGAIN: i64 = -11;
 const EEXIST: i64 = -17;
 #[allow(dead_code)] // Available for future tests
 const EINVAL: i64 = -22;
+const EACCES: i64 = -13;
 const EMSGSIZE: i64 = -90;
 
 // Access modes for future tests
@@ -47,11 +48,12 @@ pub fn run_tests() {
     test_mq_getsetattr();
     test_mq_close_fd();
     test_mq_emsgsize();
+    test_mq_name_slash();
 }
 
 /// Test mq_open creates a new queue
 fn test_mq_open_create() {
-    let name = b"/test_mq_create\0";
+    let name = b"test_mq_create\0";
 
     // Create a new queue
     let attr = MqAttr::new(10, 256);
@@ -72,7 +74,7 @@ fn test_mq_open_create() {
 
 /// Test mq_open opens existing queue
 fn test_mq_open_existing() {
-    let name = b"/test_mq_existing\0";
+    let name = b"test_mq_existing\0";
 
     // Create the queue first
     let attr = MqAttr::new(10, 256);
@@ -110,7 +112,7 @@ fn test_mq_open_existing() {
 
 /// Test mq_open with O_CREAT|O_EXCL returns EEXIST if queue exists
 fn test_mq_open_excl() {
-    let name = b"/test_mq_excl\0";
+    let name = b"test_mq_excl\0";
 
     // Create the queue first
     let attr = MqAttr::new(10, 256);
@@ -136,7 +138,7 @@ fn test_mq_open_excl() {
 
 /// Test mq_open without O_CREAT returns ENOENT for non-existent queue
 fn test_mq_open_enoent() {
-    let name = b"/test_mq_nonexistent\0";
+    let name = b"test_mq_nonexistent\0";
 
     // Try to open non-existent queue without O_CREAT
     let fd = sys_mq_open(name.as_ptr(), O_RDWR as i32, 0, core::ptr::null());
@@ -154,7 +156,7 @@ fn test_mq_open_enoent() {
 
 /// Test mq_unlink removes queue
 fn test_mq_unlink() {
-    let name = b"/test_mq_unlink\0";
+    let name = b"test_mq_unlink\0";
 
     // Create queue
     let attr = MqAttr::new(10, 256);
@@ -190,7 +192,7 @@ fn test_mq_unlink() {
 
 /// Test mq_send and mq_receive
 fn test_mq_send_receive() {
-    let name = b"/test_mq_sendrecv\0";
+    let name = b"test_mq_sendrecv\0";
     let msg = b"Hello, mqueue!";
 
     // Create queue
@@ -238,7 +240,7 @@ fn test_mq_send_receive() {
 
 /// Test mq_priority ordering (higher priority received first)
 fn test_mq_priority_ordering() {
-    let name = b"/test_mq_priority\0";
+    let name = b"test_mq_priority\0";
     let msg_lo = b"low priority";
     let msg_hi = b"high priority";
 
@@ -297,7 +299,7 @@ fn test_mq_priority_ordering() {
 
 /// Test mq_nonblock returns EAGAIN on empty queue
 fn test_mq_nonblock_eagain() {
-    let name = b"/test_mq_nonblock\0";
+    let name = b"test_mq_nonblock\0";
 
     // Create queue with O_NONBLOCK
     let attr = MqAttr::new(10, 256);
@@ -325,7 +327,7 @@ fn test_mq_nonblock_eagain() {
 
 /// Test mq_getsetattr
 fn test_mq_getsetattr() {
-    let name = b"/test_mq_attr\0";
+    let name = b"test_mq_attr\0";
 
     // Create queue
     let attr = MqAttr::new(10, 256);
@@ -363,7 +365,7 @@ fn test_mq_getsetattr() {
 
 /// Test mq operations on closed fd returns EBADF
 fn test_mq_close_fd() {
-    let name = b"/test_mq_close\0";
+    let name = b"test_mq_close\0";
 
     // Create and immediately close
     let attr = MqAttr::new(10, 256);
@@ -391,7 +393,7 @@ fn test_mq_close_fd() {
 
 /// Test mq_send with message too large returns EMSGSIZE
 fn test_mq_emsgsize() {
-    let name = b"/test_mq_msgsize\0";
+    let name = b"test_mq_msgsize\0";
 
     // Create queue with small message size
     let attr = MqAttr::new(10, 16); // Only 16 bytes max
@@ -414,4 +416,34 @@ fn test_mq_emsgsize() {
 
     sys_close(fd as u64);
     sys_mq_unlink(name.as_ptr());
+}
+
+/// Test raw mq_open/mq_unlink reject names containing '/'
+///
+/// The raw syscall takes the name without the leading '/' (libc strips it).
+/// A '/' anywhere in the name is rejected with EACCES (ipc/mqueue.c ->
+/// lookup_noperm_common() in fs/namei.c).
+fn test_mq_name_slash() {
+    let names: [&[u8]; 3] = [b"/test_mq_slash\0", b"test/mq_slash\0", b"..\0"];
+    for name in names {
+        let fd = sys_mq_open(name.as_ptr(), O_RDWR as i32 | O_CREAT as i32, 0o600, core::ptr::null());
+        if fd != EACCES {
+            print(b"MQ_NAME_SLASH:FAIL: mq_open expected -13, got ");
+            print_num(fd);
+            println(b"");
+            if fd >= 0 {
+                sys_close(fd as u64);
+                sys_mq_unlink(name.as_ptr());
+            }
+            return;
+        }
+    }
+    let ret = sys_mq_unlink(b"/test_mq_slash\0".as_ptr());
+    if ret != EACCES {
+        print(b"MQ_NAME_SLASH:FAIL: mq_unlink expected -13, got ");
+        print_num(ret);
+        println(b"");
+        return;
+    }
+    println(b"MQ_NAME_SLASH:OK");
 }
