@@ -31,6 +31,7 @@ pub mod printk;
 pub mod selftest;
 pub mod signalfd;
 pub mod storage;
+pub mod sysctl;
 mod time;
 pub mod timer;
 pub mod timerfd;

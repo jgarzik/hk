@@ -70,6 +70,7 @@ pub mod skb;
 pub mod sock;
 pub mod socket;
 pub mod syscall;
+pub mod sysctl;
 pub mod tcp;
 pub mod tcp_input;
 pub mod tcp_output;

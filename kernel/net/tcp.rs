@@ -291,8 +291,6 @@ impl Default for TcpCb {
 
 /// Receive queue limit (bytes beyond are dropped; window management is P6)
 const RX_LIMIT: usize = 65536;
-/// Linux net.core.somaxconn default
-const SOMAXCONN: u32 = 4096;
 
 /// TCP options stored for P6/P7 (level IPPROTO_TCP)
 pub const TCP_NODELAY: i32 = 1;
@@ -874,7 +872,8 @@ impl ProtoOps for TcpSock {
     /// Linux inet_listen (autobinds an unbound socket)
     fn listen(&self, backlog: i32) -> Result<(), KernelError> {
         let _g = self.tcp.lock();
-        let backlog = (backlog as u32).clamp(1, SOMAXCONN);
+        // Linux __sys_listen: capped at net.core.somaxconn
+        let backlog = (backlog as u32).min(self.sk.net.sysctl.somaxconn()).max(1);
         match self.tcp.state() {
             TcpState::Listen => return Ok(()),
             TcpState::Closed => {}

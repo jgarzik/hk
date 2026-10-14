@@ -190,6 +190,10 @@ pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> i64 {
         return KernelError::TooManySymlinks.sysret();
     }
 
+    if let Err(e) = inode.i_op.open_perm(&inode, flags) {
+        return e.sysret();
+    }
+
     // Handle O_TRUNC - truncate file to zero length
     if flags & super::flags::O_TRUNC != 0 && !inode.mode().is_dir() {
         inode.i_op.truncate(&inode, 0).ok();

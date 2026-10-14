@@ -78,6 +78,9 @@ pub struct NetNamespace {
     /// net.ipv4.ip_local_port_range
     pub port_range: PortRange,
 
+    /// /proc/sys/net values (`net::sysctl`)
+    pub sysctl: crate::net::sysctl::NetSysctl,
+
     /// ARP cache entries indexed by IP address
     arp_entries: Mutex<BTreeMap<u32, ArpEntry>>,
 
@@ -101,6 +104,7 @@ impl NetNamespace {
             udp: UdpTable::default(),
             tcp_bind: Default::default(),
             port_range: PortRange::default(),
+            sysctl: Default::default(),
             arp_entries: Mutex::new(BTreeMap::new()),
             arp_pending: Mutex::new(BTreeMap::new()),
             loopback: RwLock::new(None),

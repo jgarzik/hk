@@ -193,6 +193,14 @@ pub trait InodeOps: Send + Sync {
     /// Look up a child entry in a directory inode
     fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError>;
 
+    /// Extra open-time access check for files whose rules are not the
+    /// mode bits (Linux ->permission, e.g. /proc/sys: no root bypass);
+    /// `flags` are the open flags. Default: allowed.
+    fn open_perm(&self, inode: &Inode, flags: u32) -> Result<(), KernelError> {
+        let _ = (inode, flags);
+        Ok(())
+    }
+
     /// Create a new file in a directory
     fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, mode);
