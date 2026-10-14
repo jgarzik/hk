@@ -22,18 +22,26 @@ pid == tid. hk draws pids and tids from separate counters, so e.g.
 TIDs say 3. Anything comparing those values (pthread joins, tgkill to a
 returned pid, `/proc/<pid>/task`) can disagree with Linux.
 
-## Raw user-memory copies outside kernel/uaccess.rs
+## Raw user-memory accesses in the network syscalls (SMAP/PAN fault)
 
-**Location**: `kernel/fs/iov.rs`, `kernel/task/process_vm.rs`,
-`kernel/mm/mempolicy.rs`, `kernel/ipc/mqueue.rs`, `kernel/ns/uts.rs`,
-`kernel/fs/perm.rs`, and direct `*(ptr as *mut T)` writes (e.g. wait4
-status)
+**Location**: `kernel/net/syscall.rs` (accept addr/addrlen, sendmsg/
+recvmsg iovecs and msghdr, send/recvmmsg, get/setsockopt optval,
+getsockname/getpeername, sendto/recvfrom buffers)
 
-Unpopulated-but-valid user pages are now demand-faulted for any kernel
-access, but only `copy_{to,from}_user`/`get_user`/`put_user`/
-`strncpy_from_user` and `read`/`write` have an exception fixup. Other
-sites still copy with `core::ptr` and panic on a truly invalid user
-address instead of returning EFAULT; convert them to the uaccess helpers.
+These still dereference user pointers with `core::ptr`/`from_raw_parts`
+instead of the uaccess helpers. With the default boot-test CPUs (x86 TCG
+`-cpu max` has SMAP, arm `neoverse-n1` has PAN) the socket tests fault
+in the kernel (first: `sys_getsockname`), and on any CPU a bad pointer
+panics instead of returning EFAULT. All other syscall paths were
+converted; the only other raw user access left is the pre-VFS minimal
+`write` in `kernel/arch/x86_64/syscall.rs` (unused once the VFS handler
+is registered).
+
+## Partial munmap of an anonymous mapping drops the rest of it
+
+mmap(2 pages) then munmap(second page): mincore on the still-mapped
+first page returns ENOMEM (no VMA), where Linux returns 0. Seen while
+writing the uaccess boot tests; not investigated.
 
 ## Heap Corruption in Arc<T> Struct Fields
 
