@@ -70,6 +70,11 @@ pub fn sys_clone(
     let parent_rflags = get_syscall_user_rflags();
     let parent_rsp = get_syscall_user_rsp();
 
+    // Legacy clone() only takes the low 32 flag bits (kernel/fork.c:
+    // lower_32_bits(clone_flags)); higher flags such as CLONE_CLEAR_SIGHAND
+    // are only reachable through clone3().
+    let flags = flags & 0xffff_ffff;
+
     // Extract exit_signal from low 8 bits of flags (CSIGNAL mask = 0xff)
     let exit_signal = (flags & 0xff) as i32;
 
@@ -115,6 +120,11 @@ pub fn sys_clone(
     let parent_rip = Aarch64Arch::get_syscall_user_rip();
     let parent_rflags = Aarch64Arch::get_syscall_user_rflags();
     let parent_rsp = Aarch64Arch::get_syscall_user_rsp();
+
+    // Legacy clone() only takes the low 32 flag bits (kernel/fork.c:
+    // lower_32_bits(clone_flags)); higher flags such as CLONE_CLEAR_SIGHAND
+    // are only reachable through clone3().
+    let flags = flags & 0xffff_ffff;
 
     // Extract exit_signal from low 8 bits of flags (CSIGNAL mask = 0xff)
     let exit_signal = (flags & 0xff) as i32;
