@@ -60,6 +60,12 @@ impl UaccessArch for X86_64Uaccess {
         }
     }
 
+    /// Fault-tolerant copy; returns the number of bytes NOT copied
+    #[inline(always)]
+    unsafe fn copy_user_raw(dst: *mut u8, src: *const u8, len: usize) -> usize {
+        unsafe { hk_copy_user(dst, src, len) }
+    }
+
     /// Disable user memory access by clearing AC flag
     ///
     /// Executes `clac` if SMAP is available, otherwise no-op.
@@ -70,6 +76,43 @@ impl UaccessArch for X86_64Uaccess {
                 ::core::arch::asm!("clac", options(nomem, nostack, preserves_flags));
             }
         }
+    }
+}
+
+// Fault-tolerant user copy (Linux: copy_user_generic + _ASM_EXTABLE_UA).
+// A fault on `rep movsb` that the page-fault handler cannot resolve resumes
+// at the fixup, which returns the remaining byte count left in RCX.
+core::arch::global_asm!(
+    ".pushsection .text.hk_copy_user, \"ax\"",
+    ".global hk_copy_user",
+    "hk_copy_user:",
+    "    mov rcx, rdx",
+    ".global hk_copy_user_insn",
+    "hk_copy_user_insn:",
+    "    rep movsb",
+    "    xor eax, eax",
+    "    ret",
+    ".global hk_copy_user_fixup",
+    "hk_copy_user_fixup:",
+    "    mov rax, rcx",
+    "    ret",
+    ".popsection",
+);
+
+unsafe extern "C" {
+    fn hk_copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
+    static hk_copy_user_insn: u8;
+    static hk_copy_user_fixup: u8;
+}
+
+/// Exception-table lookup: if a kernel-mode fault at `rip` is inside the
+/// user-copy routine, return the address to resume at (Linux: fixup_exception)
+pub fn uaccess_fixup(rip: u64) -> Option<u64> {
+    let insn = &raw const hk_copy_user_insn as u64;
+    if rip == insn {
+        Some(&raw const hk_copy_user_fixup as u64)
+    } else {
+        None
     }
 }
 

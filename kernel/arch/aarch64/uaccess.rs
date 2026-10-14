@@ -52,6 +52,12 @@ impl UaccessArch for Aarch64Uaccess {
         // "msr pan, #0" via .inst directive if supported.
     }
 
+    /// Fault-tolerant copy; returns the number of bytes NOT copied
+    #[inline(always)]
+    unsafe fn copy_user_raw(dst: *mut u8, src: *const u8, len: usize) -> usize {
+        unsafe { hk_copy_user(dst, src, len) }
+    }
+
     /// End user access (re-enable PAN if available)
     ///
     /// This restores protection against accidental user memory access.
@@ -68,5 +74,60 @@ impl UaccessArch for Aarch64Uaccess {
 
         // PAN (Privileged Access Never) is an ARMv8.1+ feature.
         // For ARMv8.0 CPUs like cortex-a57, this is a no-op.
+    }
+}
+
+// Fault-tolerant user copy (Linux: __arch_copy_to_user + USER() extable).
+// x0=dst, x1=src, x2=len. Loads/stores have no effect when they fault, so
+// on an unresolvable fault x2 is the (conservative) remaining byte count and
+// the fixup returns it.
+core::arch::global_asm!(
+    ".pushsection .text.hk_copy_user, \"ax\"",
+    ".global hk_copy_user",
+    "hk_copy_user:",
+    ".global hk_copy_user_start",
+    "hk_copy_user_start:",
+    "1:  cmp x2, #8",
+    "    b.lo 2f",
+    "    ldr x3, [x1]",
+    "    str x3, [x0]",
+    "    add x0, x0, #8",
+    "    add x1, x1, #8",
+    "    sub x2, x2, #8",
+    "    b 1b",
+    "2:  cbz x2, 3f",
+    "    ldrb w3, [x1]",
+    "    strb w3, [x0]",
+    "    add x0, x0, #1",
+    "    add x1, x1, #1",
+    "    sub x2, x2, #1",
+    "    b 2b",
+    "3:  mov x0, #0",
+    "    ret",
+    ".global hk_copy_user_end",
+    "hk_copy_user_end:",
+    ".global hk_copy_user_fixup",
+    "hk_copy_user_fixup:",
+    "    mov x0, x2",
+    "    ret",
+    ".popsection",
+);
+
+unsafe extern "C" {
+    fn hk_copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
+    static hk_copy_user_start: u8;
+    static hk_copy_user_end: u8;
+    static hk_copy_user_fixup: u8;
+}
+
+/// Exception-table lookup: if a kernel-mode fault at `pc` is inside the
+/// user-copy routine, return the address to resume at (Linux: fixup_exception)
+pub fn uaccess_fixup(pc: u64) -> Option<u64> {
+    let start = &raw const hk_copy_user_start as u64;
+    let end = &raw const hk_copy_user_end as u64;
+    if (start..end).contains(&pc) {
+        Some(&raw const hk_copy_user_fixup as u64)
+    } else {
+        None
     }
 }
