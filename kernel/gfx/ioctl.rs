@@ -7,6 +7,8 @@ use alloc::string::ToString;
 
 use super::mode::GfxModeInfo;
 use super::{GfxDriver, GfxError};
+use crate::arch::Uaccess;
+use crate::uaccess::{copy_to_user, copy_val_from_user, copy_val_to_user};
 use core::mem::size_of;
 
 /// DRM ioctl base (from Linux)
@@ -338,17 +340,33 @@ pub fn dispatch_ioctl(driver: &dyn GfxDriver, cmd: u32, arg: u64) -> Result<i64,
     }
 }
 
+/// Copy an ioctl argument struct in from user space
+fn read_arg<T: Copy + Default>(addr: u64) -> Result<T, GfxError> {
+    copy_val_from_user::<Uaccess, T>(addr).map_err(|_| GfxError::Fault)
+}
+
+/// Copy an ioctl argument struct back out to user space
+fn write_arg<T: Copy>(addr: u64, val: &T) -> Result<(), GfxError> {
+    copy_val_to_user::<Uaccess, T>(addr, val).map_err(|_| GfxError::Fault)
+}
+
+/// Copy an object-ID array out to a user `u32 *`
+fn write_ids(addr: u64, ids: &[u32]) -> Result<(), GfxError> {
+    let bytes: alloc::vec::Vec<u8> = ids.iter().flat_map(|id| id.to_ne_bytes()).collect();
+    copy_to_user::<Uaccess>(addr, &bytes).map_err(|_| GfxError::Fault)?;
+    Ok(())
+}
+
 /// Handle GFX_IOCTL_VERSION
 fn handle_version(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
-    let ptr = arg as *mut GfxVersion;
-    if ptr.is_null() {
+    if arg == 0 {
         return Err(GfxError::InvalidArg);
     }
 
     let (major, minor, patch) = driver.version();
 
     // Read current struct to get buffer pointers
-    let mut ver = unsafe { core::ptr::read(ptr) };
+    let mut ver: GfxVersion = read_arg(arg)?;
 
     ver.version_major = major as i32;
     ver.version_minor = minor as i32;
@@ -359,9 +377,8 @@ fn handle_version(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
     let name = driver.name();
     if ver.name != 0 && ver.name_len > 0 {
         let copy_len = (ver.name_len as usize).min(name.len());
-        unsafe {
-            core::ptr::copy_nonoverlapping(name.as_ptr(), ver.name as *mut u8, copy_len);
-        }
+        copy_to_user::<Uaccess>(ver.name, &name.as_bytes()[..copy_len])
+            .map_err(|_| GfxError::Fault)?;
     }
     ver.name_len = name.len() as u64;
 
@@ -369,9 +386,8 @@ fn handle_version(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
     let date = driver.date();
     if ver.date != 0 && ver.date_len > 0 {
         let copy_len = (ver.date_len as usize).min(date.len());
-        unsafe {
-            core::ptr::copy_nonoverlapping(date.as_ptr(), ver.date as *mut u8, copy_len);
-        }
+        copy_to_user::<Uaccess>(ver.date, &date.as_bytes()[..copy_len])
+            .map_err(|_| GfxError::Fault)?;
     }
     ver.date_len = date.len() as u64;
 
@@ -379,76 +395,61 @@ fn handle_version(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
     let desc = driver.desc();
     if ver.desc != 0 && ver.desc_len > 0 {
         let copy_len = (ver.desc_len as usize).min(desc.len());
-        unsafe {
-            core::ptr::copy_nonoverlapping(desc.as_ptr(), ver.desc as *mut u8, copy_len);
-        }
+        copy_to_user::<Uaccess>(ver.desc, &desc.as_bytes()[..copy_len])
+            .map_err(|_| GfxError::Fault)?;
     }
     ver.desc_len = desc.len() as u64;
 
-    unsafe { core::ptr::write(ptr, ver) };
+    write_arg(arg, &ver)?;
     Ok(0)
 }
 
 /// Handle GFX_IOCTL_GET_CAP
 fn handle_get_cap(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
-    let ptr = arg as *mut GfxGetCap;
-    if ptr.is_null() {
+    if arg == 0 {
         return Err(GfxError::InvalidArg);
     }
 
-    let mut cap = unsafe { core::ptr::read(ptr) };
+    let mut cap: GfxGetCap = read_arg(arg)?;
     cap.value = driver.get_cap(cap.capability)?;
-    unsafe { core::ptr::write(ptr, cap) };
+    write_arg(arg, &cap)?;
     Ok(0)
 }
 
 /// Handle GFX_IOCTL_MODE_GETRESOURCES
 fn handle_getresources(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
-    let ptr = arg as *mut GfxModeCardRes;
-    if ptr.is_null() {
+    if arg == 0 {
         return Err(GfxError::InvalidArg);
     }
 
     let resources = driver.get_resources();
-    let mut res = unsafe { core::ptr::read(ptr) };
+    let mut res: GfxModeCardRes = read_arg(arg)?;
 
     // Copy connector IDs if buffer provided
     if res.connector_id_ptr != 0 && res.count_connectors > 0 {
         let copy_count = (res.count_connectors as usize).min(resources.connector_ids.len());
-        let dst = res.connector_id_ptr as *mut u32;
-        for (i, &id) in resources.connector_ids.iter().take(copy_count).enumerate() {
-            unsafe { *dst.add(i) = id };
-        }
+        write_ids(res.connector_id_ptr, &resources.connector_ids[..copy_count])?;
     }
     res.count_connectors = resources.connector_ids.len() as u32;
 
     // Copy CRTC IDs if buffer provided
     if res.crtc_id_ptr != 0 && res.count_crtcs > 0 {
         let copy_count = (res.count_crtcs as usize).min(resources.crtc_ids.len());
-        let dst = res.crtc_id_ptr as *mut u32;
-        for (i, &id) in resources.crtc_ids.iter().take(copy_count).enumerate() {
-            unsafe { *dst.add(i) = id };
-        }
+        write_ids(res.crtc_id_ptr, &resources.crtc_ids[..copy_count])?;
     }
     res.count_crtcs = resources.crtc_ids.len() as u32;
 
     // Copy encoder IDs if buffer provided
     if res.encoder_id_ptr != 0 && res.count_encoders > 0 {
         let copy_count = (res.count_encoders as usize).min(resources.encoder_ids.len());
-        let dst = res.encoder_id_ptr as *mut u32;
-        for (i, &id) in resources.encoder_ids.iter().take(copy_count).enumerate() {
-            unsafe { *dst.add(i) = id };
-        }
+        write_ids(res.encoder_id_ptr, &resources.encoder_ids[..copy_count])?;
     }
     res.count_encoders = resources.encoder_ids.len() as u32;
 
     // Copy FB IDs if buffer provided
     if res.fb_id_ptr != 0 && res.count_fbs > 0 {
         let copy_count = (res.count_fbs as usize).min(resources.fb_ids.len());
-        let dst = res.fb_id_ptr as *mut u32;
-        for (i, &id) in resources.fb_ids.iter().take(copy_count).enumerate() {
-            unsafe { *dst.add(i) = id };
-        }
+        write_ids(res.fb_id_ptr, &resources.fb_ids[..copy_count])?;
     }
     res.count_fbs = resources.fb_ids.len() as u32;
 
@@ -457,18 +458,17 @@ fn handle_getresources(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError
     res.min_height = resources.min_height;
     res.max_height = resources.max_height;
 
-    unsafe { core::ptr::write(ptr, res) };
+    write_arg(arg, &res)?;
     Ok(0)
 }
 
 /// Handle GFX_IOCTL_MODE_GETCRTC
 fn handle_getcrtc(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
-    let ptr = arg as *mut GfxModeCrtc;
-    if ptr.is_null() {
+    if arg == 0 {
         return Err(GfxError::InvalidArg);
     }
 
-    let mut crtc_cmd = unsafe { core::ptr::read(ptr) };
+    let mut crtc_cmd: GfxModeCrtc = read_arg(arg)?;
     let crtc = driver.get_crtc(crtc_cmd.crtc_id)?;
 
     crtc_cmd.fb_id = crtc.fb_id;
@@ -481,25 +481,23 @@ fn handle_getcrtc(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
         crtc_cmd.mode = GfxModeModeinfo::from(mode);
     }
 
-    unsafe { core::ptr::write(ptr, crtc_cmd) };
+    write_arg(arg, &crtc_cmd)?;
     Ok(0)
 }
 
 /// Handle GFX_IOCTL_MODE_SETCRTC
 fn handle_setcrtc(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
-    let ptr = arg as *mut GfxModeCrtc;
-    if ptr.is_null() {
+    if arg == 0 {
         return Err(GfxError::InvalidArg);
     }
 
-    let crtc_cmd = unsafe { core::ptr::read(ptr) };
+    let crtc_cmd: GfxModeCrtc = read_arg(arg)?;
 
     // Read connector IDs
     let mut connectors = alloc::vec::Vec::new();
     if crtc_cmd.count_connectors > 0 && crtc_cmd.set_connectors_ptr != 0 {
-        let src = crtc_cmd.set_connectors_ptr as *const u32;
         for i in 0..crtc_cmd.count_connectors {
-            connectors.push(unsafe { *src.add(i as usize) });
+            connectors.push(read_arg::<u32>(crtc_cmd.set_connectors_ptr + i as u64 * 4)?);
         }
     }
 
@@ -524,12 +522,11 @@ fn handle_setcrtc(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
 
 /// Handle GFX_IOCTL_MODE_GETENCODER
 fn handle_getencoder(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
-    let ptr = arg as *mut GfxModeGetEncoder;
-    if ptr.is_null() {
+    if arg == 0 {
         return Err(GfxError::InvalidArg);
     }
 
-    let mut enc_cmd = unsafe { core::ptr::read(ptr) };
+    let mut enc_cmd: GfxModeGetEncoder = read_arg(arg)?;
     let encoder = driver.get_encoder(enc_cmd.encoder_id)?;
 
     enc_cmd.encoder_type = encoder.encoder_type;
@@ -537,27 +534,26 @@ fn handle_getencoder(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> 
     enc_cmd.possible_crtcs = encoder.possible_crtcs;
     enc_cmd.possible_clones = encoder.possible_clones;
 
-    unsafe { core::ptr::write(ptr, enc_cmd) };
+    write_arg(arg, &enc_cmd)?;
     Ok(0)
 }
 
 /// Handle GFX_IOCTL_MODE_GETCONNECTOR
 fn handle_getconnector(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
-    let ptr = arg as *mut GfxModeGetConnector;
-    if ptr.is_null() {
+    if arg == 0 {
         return Err(GfxError::InvalidArg);
     }
 
-    let mut conn_cmd = unsafe { core::ptr::read(ptr) };
+    let mut conn_cmd: GfxModeGetConnector = read_arg(arg)?;
     let connector = driver.get_connector(conn_cmd.connector_id)?;
 
     // Copy modes if buffer provided
     if conn_cmd.modes_ptr != 0 && conn_cmd.count_modes > 0 {
         let copy_count = (conn_cmd.count_modes as usize).min(connector.modes.len());
-        let dst = conn_cmd.modes_ptr as *mut GfxModeModeinfo;
         for (i, mode) in connector.modes.iter().take(copy_count).enumerate() {
             let mode_info = GfxModeModeinfo::from(mode);
-            unsafe { *dst.add(i) = mode_info };
+            let dst = conn_cmd.modes_ptr + (i * size_of::<GfxModeModeinfo>()) as u64;
+            write_arg(dst, &mode_info)?;
         }
     }
     conn_cmd.count_modes = connector.modes.len() as u32;
@@ -565,10 +561,7 @@ fn handle_getconnector(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError
     // Copy encoder IDs if buffer provided
     if conn_cmd.encoders_ptr != 0 && conn_cmd.count_encoders > 0 {
         let copy_count = (conn_cmd.count_encoders as usize).min(connector.encoder_ids.len());
-        let dst = conn_cmd.encoders_ptr as *mut u32;
-        for (i, &id) in connector.encoder_ids.iter().take(copy_count).enumerate() {
-            unsafe { *dst.add(i) = id };
-        }
+        write_ids(conn_cmd.encoders_ptr, &connector.encoder_ids[..copy_count])?;
     }
     conn_cmd.count_encoders = connector.encoder_ids.len() as u32;
 
@@ -581,18 +574,17 @@ fn handle_getconnector(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError
     conn_cmd.subpixel = connector.subpixel;
     conn_cmd.count_props = 0; // No properties for now
 
-    unsafe { core::ptr::write(ptr, conn_cmd) };
+    write_arg(arg, &conn_cmd)?;
     Ok(0)
 }
 
 /// Handle GFX_IOCTL_MODE_ADDFB
 fn handle_addfb(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
-    let ptr = arg as *mut GfxModeFbCmd;
-    if ptr.is_null() {
+    if arg == 0 {
         return Err(GfxError::InvalidArg);
     }
 
-    let mut fb_cmd = unsafe { core::ptr::read(ptr) };
+    let mut fb_cmd: GfxModeFbCmd = read_arg(arg)?;
     let fb_id = driver.add_fb(
         fb_cmd.width,
         fb_cmd.height,
@@ -603,62 +595,58 @@ fn handle_addfb(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
     )?;
     fb_cmd.fb_id = fb_id;
 
-    unsafe { core::ptr::write(ptr, fb_cmd) };
+    write_arg(arg, &fb_cmd)?;
     Ok(0)
 }
 
 /// Handle GFX_IOCTL_MODE_RMFB
 fn handle_rmfb(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
-    let ptr = arg as *mut u32;
-    if ptr.is_null() {
+    if arg == 0 {
         return Err(GfxError::InvalidArg);
     }
 
-    let fb_id = unsafe { core::ptr::read(ptr) };
+    let fb_id: u32 = read_arg(arg)?;
     driver.rm_fb(fb_id)?;
     Ok(0)
 }
 
 /// Handle GFX_IOCTL_MODE_CREATE_DUMB
 fn handle_create_dumb(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
-    let ptr = arg as *mut GfxModeCreateDumb;
-    if ptr.is_null() {
+    if arg == 0 {
         return Err(GfxError::InvalidArg);
     }
 
-    let mut create = unsafe { core::ptr::read(ptr) };
+    let mut create: GfxModeCreateDumb = read_arg(arg)?;
     let dumb = driver.create_dumb(create.width, create.height, create.bpp)?;
 
     create.handle = dumb.handle;
     create.pitch = dumb.pitch;
     create.size = dumb.size;
 
-    unsafe { core::ptr::write(ptr, create) };
+    write_arg(arg, &create)?;
     Ok(0)
 }
 
 /// Handle GFX_IOCTL_MODE_MAP_DUMB
 fn handle_map_dumb(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
-    let ptr = arg as *mut GfxModeMapDumb;
-    if ptr.is_null() {
+    if arg == 0 {
         return Err(GfxError::InvalidArg);
     }
 
-    let mut map = unsafe { core::ptr::read(ptr) };
+    let mut map: GfxModeMapDumb = read_arg(arg)?;
     map.offset = driver.map_dumb(map.handle)?;
 
-    unsafe { core::ptr::write(ptr, map) };
+    write_arg(arg, &map)?;
     Ok(0)
 }
 
 /// Handle GFX_IOCTL_MODE_DESTROY_DUMB
 fn handle_destroy_dumb(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
-    let ptr = arg as *mut GfxModeDestroyDumb;
-    if ptr.is_null() {
+    if arg == 0 {
         return Err(GfxError::InvalidArg);
     }
 
-    let destroy = unsafe { core::ptr::read(ptr) };
+    let destroy: GfxModeDestroyDumb = read_arg(arg)?;
     driver.destroy_dumb(destroy.handle)?;
     Ok(0)
 }

@@ -77,6 +77,8 @@ pub enum GfxError {
     InvalidIoctl,
     /// No such connector/crtc/encoder/framebuffer
     NoSuchObject,
+    /// Bad user pointer (EFAULT)
+    Fault,
 }
 
 impl From<GfxError> for DeviceError {
@@ -90,6 +92,7 @@ impl From<GfxError> for DeviceError {
             GfxError::PermissionDenied => DeviceError::IoError,
             GfxError::InvalidIoctl => DeviceError::NotSupported,
             GfxError::NoSuchObject => DeviceError::NotFound,
+            GfxError::Fault => DeviceError::Fault,
         }
     }
 }

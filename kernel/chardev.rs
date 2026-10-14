@@ -117,6 +117,8 @@ pub enum DeviceError {
     NotFound,
     /// No such ioctl
     NotTty,
+    /// Bad user pointer (EFAULT)
+    Fault,
 }
 
 /// Character device trait

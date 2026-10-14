@@ -564,6 +564,7 @@ impl CharDevFileOps {
             DeviceError::InvalidArg => KernelError::InvalidArgument,
             DeviceError::NotFound => KernelError::NotFound,
             DeviceError::NotTty => KernelError::NotTty,
+            DeviceError::Fault => KernelError::BadAddress,
         }
     }
 }
