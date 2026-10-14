@@ -364,7 +364,7 @@ Linux groups the socket syscalls as their own "network" category.
 10.4 Misc security / sandboxing
 
 - [x] seccomp (SECCOMP_SET_MODE_STRICT, SECCOMP_SET_MODE_FILTER with eBPF support)
-- [x] prctl (PR_SET/GET_NAME, PR_SET/GET_DUMPABLE, PR_SET/GET_NO_NEW_PRIVS, PR_SET/GET_TIMERSLACK, PR_SET/GET_SECCOMP, PR_SET/GET_KEEPCAPS, PR_SET/GET_CHILD_SUBREAPER, PR_SET/GET_THP_DISABLE, PR_SET/GET_TSC [x86-64], PR_SET/GET_CPUID [x86-64])
+- [x] prctl (PR_SET/GET_NAME, PR_SET/GET_DUMPABLE, PR_SET/GET_NO_NEW_PRIVS, PR_SET/GET_TIMERSLACK, PR_SET/GET_SECCOMP, PR_SET/GET_KEEPCAPS, PR_SET/GET_CHILD_SUBREAPER, PR_SET/GET_THP_DISABLE, PR_SET/GET_TSC [x86-64])
 - [x] mlock / mlockall (already listed under memory)
 
 11. Namespaces, containers, mounts, cgroups
@@ -417,7 +417,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 
 14. Thread-local, arch-specific, misc
 
-- [x] arch_prctl (x86-64 only; TLS, FS/GS base)
+- [x] arch_prctl (x86-64 only; TLS, FS/GS base, ARCH_GET/SET_CPUID [no CPUID faulting: SET → ENODEV])
 - [x] iopl (x86-64 only; I/O port privilege level)
 - [x] ioperm (x86-64 only; returns ENOSYS - requires TSS I/O bitmap)
 - [ ] modify_ldt (x86-64 only; LDT manipulation)

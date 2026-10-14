@@ -360,9 +360,7 @@ use crate::task::prctl_ops::{
     PR_SET_PDEATHSIG, PR_SET_SECCOMP, PR_SET_THP_DISABLE, PR_SET_TIMERSLACK,
 };
 #[cfg(target_arch = "x86_64")]
-use crate::task::prctl_ops::{
-    PR_GET_CPUID, PR_GET_TSC, PR_SET_CPUID, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSEGV,
-};
+use crate::task::prctl_ops::{PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSEGV};
 
 /// sys_prctl - Process/thread control operations
 ///
@@ -670,41 +668,6 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             }
         }
 
-        #[cfg(target_arch = "x86_64")]
-        PR_GET_CPUID => {
-            // Get CPUID faulting mode (x86-64 only)
-            // Returns 0 if CPUID allowed, 1 if CPUID faulting enabled
-            let table = TASK_TABLE.lock();
-            match table.tasks.iter().find(|t| t.tid == tid) {
-                Some(task) => {
-                    if task.prctl.cpuid_fault {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                None => KernelError::NoProcess.sysret(),
-            }
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        PR_SET_CPUID => {
-            // Set CPUID faulting mode (x86-64 only)
-            // arg2: 0 = allow CPUID, 1 = fault on CPUID
-            if arg2 > 1 {
-                return KernelError::InvalidArgument.sysret();
-            }
-
-            let mut table = TASK_TABLE.lock();
-            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-                task.prctl.cpuid_fault = arg2 != 0;
-                // Note: Actually enabling CPUID faulting requires MSR manipulation
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
-        }
-
         PR_SET_THP_DISABLE => {
             // Disable transparent huge pages for this process
             let mut table = TASK_TABLE.lock();
@@ -741,7 +704,8 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
 
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::percpu::{
-    ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_FS, ARCH_SET_GS, read_fs_base, write_fs_base,
+    ARCH_GET_CPUID, ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_CPUID, ARCH_SET_FS, ARCH_SET_GS,
+    read_fs_base, write_fs_base,
 };
 
 /// sys_arch_prctl - Architecture-specific thread state (x86_64 only)
@@ -754,6 +718,8 @@ use crate::arch::x86_64::percpu::{
 /// - ARCH_GET_FS (0x1003): Get FS base address
 /// - ARCH_SET_GS (0x1001): Not supported (GS is kernel per-CPU)
 /// - ARCH_GET_GS (0x1004): Not supported
+/// - ARCH_GET_CPUID (0x1011): Returns 1 (CPUID enabled; no faulting support)
+/// - ARCH_SET_CPUID (0x1012): -ENODEV (CPUID faulting not supported)
 ///
 /// Returns 0 on success, negative errno on error.
 #[cfg(target_arch = "x86_64")]
@@ -784,6 +750,11 @@ pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
             }
             0
         }
+        // CPUID faulting is not supported, so CPUID is always enabled.
+        // Matches Linux on CPUs without X86_FEATURE_CPUID_FAULT
+        // (arch/x86/kernel/process.c get_cpuid_mode/set_cpuid_mode).
+        ARCH_GET_CPUID => 1,
+        ARCH_SET_CPUID => KernelError::NoDevice.sysret(),
         ARCH_SET_GS | ARCH_GET_GS => {
             // GS base is used by kernel for per-CPU data, not available to user
             KernelError::InvalidArgument.sysret()

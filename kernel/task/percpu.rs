@@ -1098,8 +1098,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             child_subreaper: false,                          // Not inherited
             #[cfg(target_arch = "x86_64")]
             tsc_mode: parent_prctl.tsc_mode, // Inherited
-            #[cfg(target_arch = "x86_64")]
-            cpuid_fault: parent_prctl.cpuid_fault, // Inherited
             thp_disable: parent_prctl.thp_disable,           // Inherited
         },
         // Process personality (inherited from parent)

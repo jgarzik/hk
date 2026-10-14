@@ -398,6 +398,8 @@ pub const ARCH_SET_GS: i32 = 0x1001;
 pub const ARCH_SET_FS: i32 = 0x1002;
 pub const ARCH_GET_FS: i32 = 0x1003;
 pub const ARCH_GET_GS: i32 = 0x1004;
+pub const ARCH_GET_CPUID: i32 = 0x1011;
+pub const ARCH_SET_CPUID: i32 = 0x1012;
 
 // New syscall numbers
 pub const SYS_CLONE3: u64 = 435;

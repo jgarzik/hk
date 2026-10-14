@@ -1047,10 +1047,6 @@ pub const PR_GET_THP_DISABLE: i32 = 42;
 pub const PR_GET_TSC: i32 = 25;
 #[cfg(target_arch = "x86_64")]
 pub const PR_SET_TSC: i32 = 26;
-#[cfg(target_arch = "x86_64")]
-pub const PR_GET_CPUID: i32 = 48;
-#[cfg(target_arch = "x86_64")]
-pub const PR_SET_CPUID: i32 = 49;
 
 // TSC mode values (x86-64 only)
 #[cfg(target_arch = "x86_64")]

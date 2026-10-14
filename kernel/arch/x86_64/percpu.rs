@@ -339,6 +339,10 @@ pub const ARCH_SET_FS: i32 = 0x1002;
 pub const ARCH_GET_FS: i32 = 0x1003;
 /// arch_prctl: Get GS base address
 pub const ARCH_GET_GS: i32 = 0x1004;
+/// arch_prctl: Get CPUID enable state (1 = enabled, 0 = faulting)
+pub const ARCH_GET_CPUID: i32 = 0x1011;
+/// arch_prctl: Enable (1) or disable/fault (0) the CPUID instruction
+pub const ARCH_SET_CPUID: i32 = 0x1012;
 
 // ============================================================================
 // Preemption Control
