@@ -314,3 +314,35 @@ pub fn strncpy_from_user<A: UaccessArch>(
 
     Ok(result)
 }
+
+/// Copy a NUL-terminated byte string from user space (Linux
+/// `strndup_user` without the UTF-8 assumption of [`strncpy_from_user`]).
+///
+/// Copies in chunks that never cross a page boundary, so a string that
+/// ends just before an unmapped page is read without faulting.
+///
+/// # Returns
+/// * `Ok(bytes)` without the terminator
+/// * `Err(BadAddress)` / `Err(Fault)` for an invalid or unmapped address
+/// * `Err(Overflow)` if no NUL is found within `max_len` bytes
+pub fn strndup_user_bytes<A: UaccessArch>(
+    from: u64,
+    max_len: usize,
+) -> UaccessResult<alloc::vec::Vec<u8>> {
+    const PAGE: u64 = 4096;
+    let mut out = alloc::vec::Vec::new();
+    let mut ptr = from;
+    let mut chunk = [0u8; 256];
+    while out.len() < max_len {
+        let to_page_end = (PAGE - (ptr % PAGE)) as usize;
+        let n = chunk.len().min(to_page_end).min(max_len - out.len());
+        copy_from_user::<A>(&mut chunk[..n], ptr, n)?;
+        if let Some(z) = chunk[..n].iter().position(|&b| b == 0) {
+            out.extend_from_slice(&chunk[..z]);
+            return Ok(out);
+        }
+        out.extend_from_slice(&chunk[..n]);
+        ptr = ptr.checked_add(n as u64).ok_or(UaccessError::Overflow)?;
+    }
+    Err(UaccessError::Overflow)
+}
