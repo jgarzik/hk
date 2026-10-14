@@ -5,9 +5,10 @@
 # Same initramfs layout and QEMU machine as hk, but booting Ubuntu's generic
 # kernel. Tests whose expectations disagree with real Linux FAIL here.
 # Needs no root: the kernel .deb is fetched with `apt-get download` and
-# cached under target/linux-kernel/. Native architecture only.
+# cached under target/linux-kernel/. Defaults to the native architecture;
+# `-a` selects the other one (emulated; kernel fetched from Ubuntu ports).
 #
-# Usage: tools/linux-boot-tester.sh [-T timeout_seconds]
+# Usage: tools/linux-boot-tester.sh [-a x86_64|aarch64] [-T timeout_seconds]
 # Env:   LINUX_KERNEL=/path/to/vmlinuz  use this kernel instead of Ubuntu's
 
 set -euo pipefail
@@ -15,14 +16,18 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TIMEOUT=120
-while getopts "T:" opt; do
+ARCH=$(uname -m)
+while getopts "a:T:" opt; do
     case $opt in
+        a) ARCH=$OPTARG ;;
         T) TIMEOUT=$OPTARG ;;
-        *) echo "Usage: $0 [-T seconds]"; exit 1 ;;
+        *) echo "Usage: $0 [-a x86_64|aarch64] [-T seconds]"; exit 1 ;;
     esac
 done
+NATIVE=false
+[ "$ARCH" = "$(uname -m)" ] && NATIVE=true
 
-case "$(uname -m)" in
+case "$ARCH" in
     x86_64)
         ARCH=x86_64; DEB_ARCH=amd64; QEMU_BIN=qemu-system-x86_64
         QEMU_MACHINE=(-cpu max)
@@ -33,7 +38,7 @@ case "$(uname -m)" in
         QEMU_MACHINE=(-machine virt,gic-version=3 -cpu max)
         CONSOLE=ttyAMA0
         ;;
-    *) echo "Unsupported host architecture: $(uname -m)"; exit 1 ;;
+    *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
 WORK=target/linux-test-$ARCH
@@ -49,8 +54,15 @@ if [ -z "${LINUX_KERNEL:-}" ]; then
     if [ ! -f "$LINUX_KERNEL" ]; then
         echo "Fetching Linux $KVER ($DEB_ARCH)..."
         mkdir -p "$KDIR"
-        (cd "$KDIR" && apt-get download "linux-image-$KVER" >/dev/null)
-        dpkg-deb -x "$KDIR"/linux-image-*.deb "$KDIR"
+        if $NATIVE; then
+            (cd "$KDIR" && apt-get download "linux-image-$KVER" >/dev/null)
+        else
+            # Foreign arch: same version from the ports archive (no multiarch needed)
+            PKGVER=$(apt-cache show "linux-image-$KVER" | sed -n 's/^Version: //p' | head -1)
+            curl -sSfo "$KDIR/linux-image.deb" \
+                "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-image-unsigned-${KVER}_${PKGVER}_${DEB_ARCH}.deb"
+        fi
+        dpkg-deb -x "$KDIR"/linux-image*.deb "$KDIR"
     fi
 fi
 echo "Kernel: $LINUX_KERNEL"
@@ -67,7 +79,7 @@ echo -n "Hello from ramfs!" > "$ROOT/test.txt"
 (cd "$ROOT" && find . | cpio -o -H newc --quiet) > "$WORK/initramfs.cpio"
 
 KVM=()
-if [ -w /dev/kvm ] && [ "$ARCH" = x86_64 ]; then
+if [ -w /dev/kvm ] && $NATIVE && [ "$ARCH" = x86_64 ]; then
     KVM=(-enable-kvm)
     QEMU_MACHINE=(-cpu host)
 fi

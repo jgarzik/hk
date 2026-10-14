@@ -17,7 +17,7 @@ VFAT_SIZE_KB = 1024
 MACHINE ?=
 
 .PHONY: all build debug user iso iso-debug run run-debug test check clean info help vfat-image
-.PHONY: build-arm run-arm check-arm check-linux user-arm clippy clippy-arm fmt list-machines
+.PHONY: build-arm run-arm check-arm check-linux check-linux-arm user-arm clippy clippy-arm fmt list-machines
 
 # Default: build everything (kernel, user binaries, ISO)
 all: iso
@@ -44,6 +44,7 @@ help:
 	@echo "  make run-arm   - Run ARM64 kernel in QEMU"
 	@echo "  make check-arm - Boot ARM64 kernel, verify tests pass"
 	@echo "  make check-linux - Run boot tests on a real Linux kernel (native arch)"
+	@echo "  make check-linux-arm - Same, aarch64 Linux (emulated on x86 hosts)"
 	@echo ""
 	@echo "  make clippy   - Run clippy linter (x86-64)"
 	@echo "  make clippy-arm - Run clippy linter (aarch64)"
@@ -199,6 +200,10 @@ check-arm: build-arm vfat-image
 LINUX_TEST_TIMEOUT ?= 120
 check-linux:
 	./tools/linux-boot-tester.sh -T $(LINUX_TEST_TIMEOUT)
+
+# Same, aarch64 Linux emulated on any host (for local iteration on x86)
+check-linux-arm:
+	./tools/linux-boot-tester.sh -a aarch64 -T $(LINUX_TEST_TIMEOUT)
 
 info-arm: build-arm
 	@echo "ARM Kernel: $(KERNEL_ARM)"
