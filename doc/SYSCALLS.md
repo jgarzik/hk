@@ -80,7 +80,7 @@
 - [x] tee
 - [x] vmsplice
 - [x] copy_file_range
-- [x] ioctl (FIONBIO, FIOASYNC, FIOCLEX, FIONCLEX, FIONREAD, TIOCGWINSZ, terminal/tty, virtio-blk, xHCI USB; sockets: SIOCGIFCONF, SIOCGIFINDEX, SIOCGIFNAME, SIOC[GS]IFFLAGS, SIOC[GS]IFADDR, SIOC[GS]IFNETMASK, SIOC[GS]IFBRDADDR, SIOCGIFHWADDR, SIOC[GS]IFMTU, SIOCADDRT, SIOCDELRT)
+- [x] ioctl (FIONBIO, FIOASYNC, FIOCLEX, FIONCLEX, FIONREAD, TIOCGWINSZ, terminal/tty, virtio-blk, xHCI USB; sockets: FIONREAD/SIOCINQ, SIOCOUTQ, FIOSETOWN/SIOCSPGRP, FIOGETOWN/SIOCGPGRP, SIOCGIFCONF, SIOCGIFINDEX, SIOCGIFNAME, SIOC[GS]IFFLAGS, SIOC[GS]IFADDR, SIOC[GS]IFNETMASK, SIOC[GS]IFBRDADDR, SIOCGIFHWADDR, SIOC[GS]IFMTU, SIOCADDRT, SIOCDELRT)
 - [x] sync
 - [x] fsync
 - [x] fdatasync
@@ -287,26 +287,45 @@ Linux groups the socket syscalls as their own "network" category.
 Families: AF_INET (SOCK_STREAM/TCP, SOCK_DGRAM/UDP) and AF_NETLINK
 (SOCK_RAW/SOCK_DGRAM, NETLINK_ROUTE: links, IPv4 addresses and routes,
 neighbours; SOL_NETLINK options ADD/DROP_MEMBERSHIP, PKTINFO, NO_ENOBUFS,
-CAP_ACK, EXT_ACK, GET_STRICT_CHK, LIST_MEMBERSHIPS).
+CAP_ACK, EXT_ACK, GET_STRICT_CHK, LIST_MEMBERSHIPS). Other families
+(AF_INET6, AF_UNIX, AF_PACKET) are EAFNOSUPPORT for now.
+
+Sockets are sockfs inodes (fstat S_IFSOCK, /proc/<pid>/fd -> socket:[N]).
+Blocking follows the file's O_NONBLOCK at every call (fcntl, FIONBIO)
+and MSG_DONTWAIT; SO_RCVTIMEO/SO_SNDTIMEO time out with EAGAIN; signals
+restart per SA_RESTART unless a socket timeout is set (EINTR). EPIPE
+raises SIGPIPE unless MSG_NOSIGNAL. Unknown options are ENOPROTOOPT
+(EOPNOTSUPP for getsockopt at unknown levels, like Linux).
 
 - [x] socket
-- [x] socketpair
-- [x] bind
-- [x] listen
+- [x] socketpair (AF_INET/AF_NETLINK: EOPNOTSUPP like Linux; AF_UNIX later)
+- [x] bind (SO_REUSEADDR/SO_REUSEPORT rules, EADDRNOTAVAIL, EACCES < 1024)
+- [x] listen (autobinds; backlog capped at somaxconn 4096)
 - [x] accept
-- [x] accept4
-- [x] connect
+- [x] accept4 (SOCK_NONBLOCK, SOCK_CLOEXEC)
+- [x] connect (UDP: route + autobind, AF_UNSPEC disconnects; TCP:
+  EINPROGRESS/EALREADY/EISCONN, ECONNREFUSED)
 - [x] getsockname
 - [x] getpeername
-- [x] getsockopt (SO_REUSEADDR, SO_ERROR, SO_TYPE, SO_DOMAIN, SO_PROTOCOL, SO_BROADCAST, SO_DONTROUTE, SO_LINGER, SO_SNDBUF, SO_RCVBUF, SO_KEEPALIVE, TCP_NODELAY, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT)
-- [x] setsockopt (SO_REUSEADDR, SO_BROADCAST, SO_DONTROUTE, SO_LINGER, SO_SNDBUF, SO_RCVBUF, SO_KEEPALIVE, TCP_NODELAY, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT)
+- [x] getsockopt / setsockopt: SOL_SOCKET (SO_TYPE, SO_DOMAIN,
+  SO_PROTOCOL, SO_ERROR, SO_ACCEPTCONN, SO_REUSEADDR, SO_REUSEPORT,
+  SO_KEEPALIVE, SO_BROADCAST, SO_DONTROUTE, SO_OOBINLINE, SO_LINGER,
+  SO_SNDBUF/RCVBUF (+FORCE), SO_RCVLOWAT, SO_SNDLOWAT, SO_RCVTIMEO,
+  SO_SNDTIMEO, SO_BINDTODEVICE, SO_BINDTOIFINDEX, SO_PRIORITY, SO_MARK,
+  SO_TIMESTAMP, SO_TIMESTAMPNS, SO_RXQ_OVFL, SO_PASSCRED, SO_PEERCRED,
+  SO_COOKIE, SO_DEBUG), SOL_IP (IP_TOS, IP_TTL, IP_PKTINFO, IP_RECVTTL,
+  IP_RECVTOS, IP_RECVERR, IP_MTU_DISCOVER, IP_FREEBIND,
+  IP_BIND_ADDRESS_NO_PORT, IP_MULTICAST_TTL/LOOP), IPPROTO_TCP
+  (TCP_NODELAY, TCP_MAXSEG, TCP_CORK, TCP_KEEPIDLE, TCP_KEEPINTVL,
+  TCP_KEEPCNT, TCP_SYNCNT, TCP_QUICKACK, TCP_USER_TIMEOUT: stored)
 - [x] sendto
 - [x] recvfrom
-- [x] sendmsg
-- [x] recvmsg
+- [x] sendmsg (IP_PKTINFO/IP_TTL/IP_TOS control messages)
+- [x] recvmsg (MSG_PEEK, MSG_TRUNC, MSG_WAITALL, MSG_ERRQUEUE; IP_PKTINFO,
+  IP_TTL, IP_TOS, SCM_TIMESTAMP(NS), SO_RXQ_OVFL control messages)
 - [x] sendmmsg
-- [x] recvmmsg
-- [x] shutdown
+- [x] recvmmsg (MSG_WAITFORONE, timeout)
+- [x] shutdown (ENOTCONN when not connected)
 
 9. Polling & event notification
 9.1 Select/poll/epoll

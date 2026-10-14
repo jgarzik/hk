@@ -374,6 +374,7 @@ pub const SO_MARK: i32 = 36;
 pub const SO_PROTOCOL: i32 = 38;
 pub const SO_DOMAIN: i32 = 39;
 pub const SO_RXQ_OVFL: i32 = 40;
+pub const SO_PEEK_OFF: i32 = 42;
 pub const SO_COOKIE: i32 = 57;
 pub const SO_BINDTOIFINDEX: i32 = 62;
 pub const SO_RCVTIMEO_NEW: i32 = 66;
@@ -457,6 +458,8 @@ pub fn sock_setsockopt(s: &dyn ProtoOps, opt: i32, v: OptIn) -> Result<(), Kerne
             sk.mark.store(val as u32, Ordering::Release);
         }
         SO_BINDTOIFINDEX => bind_ifindex(sk, val)?,
+        // Datagram peek offsets are not implemented (BUGS.md)
+        SO_PEEK_OFF => return Err(KernelError::OperationNotSupported),
         o => {
             let f = bool_opt(o).ok_or(KernelError::NoProtocolOption)?;
             sk.set_flag(f, val != 0);
