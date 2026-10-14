@@ -1596,6 +1596,9 @@ do not rely on that.
 | `NetDevice.net` | `spin::RwLock<Weak<NetNamespace>>` | thread only | read per received packet |
 | `NetDevice.ipv4_{addr,netmask}` | `spin::Mutex` | thread only | leaf |
 | `NetDevice.stats`, `flags`, `carrier` | atomics | any | |
+| e1000 `rx` ring | `spin::Mutex` | thread only (NAPI poll) | leaf; frames are delivered after it is dropped |
+| e1000 `tx` ring | `spin::Mutex` | thread only (xmit, poll reclaim) | leaf; ring full -> drop, `tx_dropped`, ENOBUFS |
+| e1000 `pending_icr`, irq counters | atomics | IRQ + thread | ISR ORs ICR causes in; poll swaps them out |
 
 **Lock order (outermost first):**
 
@@ -1605,13 +1608,22 @@ TcpSock.sk_lock (listener before child; a child is never locked while
   -> Socket.accept_queue / per-socket buffers
   -> NetNamespace tables (RwLock; lookups drop the guard before returning)
   -> arp_pending -> arp_entries
-  -> device TX lock (driver)
+  -> device TX lock (e1000 tx)
   -> Softnet.backlog (lo xmit)           Softnet.poll_list / WaitQueue / rq
                                           (IrqSpinlocks, innermost)
 ```
 
 No network lock is held while taking a socket lock (lookups return `Arc`
 handles), and no lock is held across `netif_rx_flush_local()`.
+
+**Driver ISR rules (e1000 pattern):** read ICR (read-to-clear; 0 => not
+ours on a shared line, return false), write IMC (mask all), record causes
+in an atomic, `napi_schedule`. The poll handles link changes (LSC ->
+`netif_carrier_on/off`), reclaims TX, receives up to `budget` frames by
+copying them out of coherent bounce buffers, and when it did less than its
+budget calls `napi_complete_done` and rewrites IMS (a cause latched while
+masked fires then). If its own ISR consumed causes during the poll (shared
+line), it reschedules itself.
 
 **Known gaps (later phases):** TCP has no timers/retransmit (P6); UDP/TCP
 tables are not unregistered on close (P4); neighbour state machine and
