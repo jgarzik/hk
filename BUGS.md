@@ -58,14 +58,6 @@ global init (SIGNAL_UNKILLABLE), e.g. SIGPIPE from a write to a broken
 socket. hk delivers them, so pid 1 (the boot tester) dies. Socket tests
 use MSG_NOSIGNAL / SIG_IGN and check SIGPIPE in forked children.
 
-## New descriptors are not the lowest free number
-
-**Location**: `kernel/task/mod.rs` FdTable::alloc / alloc_with_flags
-
-Linux returns the lowest unused descriptor (POSIX requires it for open,
-socket, dup, ...); hk hands out an ever-increasing counter, so programs
-that close 0-2 and reopen, or expect small numbers, diverge.
-
 ## Large user stack frames hang the boot tester
 
 A test function with a 16 KB local array (`[IoVec; 1025]`) inlined into
