@@ -128,18 +128,26 @@ fn read(&self) -> RwLockReadGuard<'_, T>
 fn write(&self) -> RwLockWriteGuard<'_, T>
 ```
 
-### 1.4 SleepMutex<T> (kernel/mutex.rs)
+### 1.4 Sleeping locks: sync::Mutex<T>, sync::RwSem (kernel/sync/)
 
-Linux `struct mutex`: a contended `lock()` sleeps on the mutex's
-`WaitQueue` instead of spinning (spins only before scheduling is
-enabled). The holder may sleep (page locks, block I/O, user page
-faults). Thread context only; never taken in IRQ context or while a
-spinlock is held. `unlock` wakes one waiter, which retries the CAS.
-Raw `lock_raw`/`unlock_raw` exist for lock/unlock pairs that span
-functions (`inode_lock`, `lock_rename`).
+Linux `struct mutex` and `struct rw_semaphore`: a contended lock sleeps
+on the lock's `WaitQueue` instead of spinning (it spins only before
+scheduling is enabled), so the holder may sleep (page locks, block I/O,
+user page faults, blocking pipe/socket I/O).
 
-**Used for:** `Inode.i_rwsem`, `SuperBlock.s_vfs_rename_mutex`,
-`File.f_pos_lock`.
+- `Mutex<T>`: owner tid recorded (debug builds catch recursive locking
+  and foreign unlocks); `unlock` wakes one waiter, which retries.
+- `RwSem`: `down_read`/`up_read` (shared), `down_write`/`up_write`
+  (exclusive); writer preference: once a writer waits, new readers wait
+  behind it. Its count word is a short `spin::Mutex` leaf never held
+  across a sleep; release wakes all waiters (mixed conditions).
+- Rules: thread context only; never taken in IRQ context or while any
+  spinlock is held (`might_sleep` asserts a zero preempt count in debug
+  builds; `IrqSpinlock` raises it). Sleeping locks order ABOVE every
+  spinlock: a spinlock may be taken under them, never the reverse.
+
+**Used for:** `Inode.i_rwsem` (`RwSem`), `SuperBlock.s_vfs_rename_mutex`
+and `File.f_pos_lock` (`Mutex`).
 
 ### 1.5 Atomic Types
 
@@ -168,7 +176,7 @@ lock ordering from outermost to innermost is:
 
 ```
 VFS locks (detailed order):
-    File.f_pos_lock (SleepMutex; read/write/lseek/getdents by position)
+    File.f_pos_lock (sync::Mutex; read/write/lseek/getdents by position)
         ↓
     MOUNT_NS.root
         ↓
@@ -176,8 +184,9 @@ VFS locks (detailed order):
         ↓
     SuperBlock.s_vfs_rename_mutex (cross-directory rename only)
         ↓
-    Inode.i_rwsem (SleepMutex; directory operations, lock_rename, regular
-                   file write and truncate, like Linux i_rwsem)
+    Inode.i_rwsem (sync::RwSem; exclusive: directory operations,
+                   lock_rename, regular file write and truncate; shared:
+                   path-walk lookup on a dcache miss, readdir)
         ↓
     Dentry.d_lock (single d_lock like Linux; short, never held across i_rwsem)
         ↓
@@ -651,7 +660,7 @@ The VFS uses fine-grained locking with `RwLock` for concurrent read access.
 pub struct Inode {
     pub size: AtomicU64,                           // Lock-free size updates
     pub lock: RwLock<()>,                          // Metadata protection
-    i_rwsem: SleepMutex<()>,                       // Dir ops, file write/truncate
+    i_rwsem: RwSem,                                // Dir ops, file write/truncate
     pub private: RwLock<Option<Arc<dyn InodeData>>>, // FS-specific data
 }
 ```
@@ -883,7 +892,7 @@ Without a per-superblock lock, this race is possible:
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `s_vfs_rename_mutex` | `SleepMutex<()>` | Serializes cross-directory renames |
+| `s_vfs_rename_mutex` | `sync::Mutex<()>` | Serializes cross-directory renames |
 
 **Lock Ordering for Cross-Directory Rename:**
 
@@ -906,7 +915,8 @@ Linux holds the directory's `i_rwsem` shared across `iterate_shared` and
 emit entries while holding spinlocks (ramfs `RamfsInodeData.children`
 read lock, procfs/cgroupfs inode-data read locks), so user memory must
 not be touched from the emit callback (a fault could sleep under a
-spinlock). `dir.rs::sys_getdents64` therefore gathers records into a
+spinlock). `sys_getdents64` holds the directory's `i_rwsem` shared
+across `readdir` (Linux iterate_dir) and gathers records into a
 kernel buffer bounded by `GETDENTS_CHUNK` (32 KiB, independent of the
 user `count`), and copies it to user space after `readdir` returned and
 every lock is dropped; a call may return fewer bytes than fit (callers
@@ -921,7 +931,7 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
 `fs/io.rs` (`do_readv`, `do_writev`, `sys_lseek`), `fs/fd.rs`
 (`do_truncate`)
 
-- `File.f_pos_lock` (`SleepMutex<()>`, Linux `f_pos_lock` with
+- `File.f_pos_lock` (`sync::Mutex<()>`, Linux `f_pos_lock` with
   FMODE_ATOMIC_POS): taken by read/readv/write/writev/lseek/getdents64
   on regular files and directories for the whole call (not by
   pread/pwrite, which do not use the position), so processes sharing an
@@ -942,8 +952,13 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
 - Order: `f_pos_lock` -> file `i_rwsem` -> page cache / page locks ->
   fs-internal locks. A directory `i_rwsem` is never held while a file's
   `i_rwsem` is taken (O_CREAT drops the parent's lock before O_TRUNC).
-- Both are sleeping locks: the vfat write path may wait for page locks
-  and block I/O while holding `i_rwsem`, which a spinlock would forbid.
+- Both are sleeping locks (`kernel/sync`): the vfat write path may wait
+  for page locks and block I/O while holding `i_rwsem`, which a spinlock
+  would forbid.
+- Path walk (`path.rs::lookup_slow`) takes a directory's `i_rwsem`
+  shared on a dcache miss (Linux lookup_slow); callers already holding
+  that directory exclusively (create, unlink, rename) use `lookup_one`
+  directly.
 
 #### Inode Timestamp Locking (Linux i_rwsem Pattern)
 
@@ -2094,7 +2109,6 @@ Features present in Linux but not yet implemented in hk:
 | Threaded IRQs | IRQ handlers in thread context | Not implemented | All IRQs run in interrupt context |
 | lockdep | Runtime deadlock detection | Not implemented | Manual ordering verification |
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
-| `rw_semaphore` | Shared/exclusive sleeping lock (`i_rwsem`) | `SleepMutex` (exclusive only) | Lookup/readdir do not take `i_rwsem` shared |
 | Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
 
 ### Implications

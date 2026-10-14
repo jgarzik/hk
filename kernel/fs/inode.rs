@@ -9,7 +9,7 @@ use ::core::cell::Cell;
 use ::core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use spin::RwLock;
 
-use crate::mutex::SleepMutex;
+use crate::sync::RwSem;
 
 use super::KernelError;
 use super::superblock::SuperBlock;
@@ -431,7 +431,7 @@ pub struct Inode {
     ///
     /// For rename operations involving two directories, use lock_rename()
     /// instead which handles proper lock ordering.
-    i_rwsem: SleepMutex<()>,
+    i_rwsem: RwSem,
 
     /// Filesystem-specific private data
     pub private: RwLock<Option<Arc<dyn InodeData>>>,
@@ -467,7 +467,7 @@ impl Inode {
             sb,
             i_op,
             lock: RwLock::new(()),
-            i_rwsem: SleepMutex::new(()),
+            i_rwsem: RwSem::new(),
             private: RwLock::new(None),
         }
     }
@@ -502,7 +502,7 @@ impl Inode {
             sb,
             i_op,
             lock: RwLock::new(()),
-            i_rwsem: SleepMutex::new(()),
+            i_rwsem: RwSem::new(),
             private: RwLock::new(None),
         }
     }
@@ -666,7 +666,7 @@ impl Inode {
     /// Caller must ensure inode_unlock() is called to release the lock.
     /// For operations on two directories (rename), use lock_rename() instead.
     pub fn inode_lock(&self) {
-        self.i_rwsem.lock_raw();
+        self.i_rwsem.down_write();
     }
 
     /// Release exclusive lock on directory
@@ -675,7 +675,21 @@ impl Inode {
     /// Must only be called after a successful inode_lock() call.
     /// The lock must have been acquired by this thread.
     pub unsafe fn inode_unlock(&self) {
-        unsafe { self.i_rwsem.unlock_raw() };
+        unsafe { self.i_rwsem.up_write() };
+    }
+
+    /// Shared inode lock (Linux inode_lock_shared): lookup and readdir
+    /// exclude directory changes but not each other
+    pub fn inode_lock_shared(&self) {
+        self.i_rwsem.down_read();
+    }
+
+    /// Release inode_lock_shared()
+    ///
+    /// # Safety
+    /// Must pair with inode_lock_shared() by this thread.
+    pub unsafe fn inode_unlock_shared(&self) {
+        unsafe { self.i_rwsem.up_read() };
     }
 }
 

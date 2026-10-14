@@ -16,7 +16,7 @@ use ::core::cmp::min;
 use ::core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use spin::Mutex;
 
-use crate::mutex::{SleepMutex, SleepMutexGuard};
+use crate::sync;
 
 use super::KernelError;
 use super::dentry::Dentry;
@@ -334,7 +334,7 @@ pub struct File {
 
     /// Serializes position updates of read/write/lseek/getdents on
     /// regular files and directories (Linux f_pos_lock, FMODE_ATOMIC_POS)
-    f_pos_lock: SleepMutex<()>,
+    f_pos_lock: sync::Mutex<()>,
 
     /// Open flags (protected by f_lock, like Linux)
     f_lock: Mutex<u32>,
@@ -373,7 +373,7 @@ impl File {
             dentry,
             mnt,
             pos: AtomicU64::new(0),
-            f_pos_lock: SleepMutex::new(()),
+            f_pos_lock: sync::Mutex::new(()),
             f_lock: Mutex::new(flags),
             f_op,
             owner_pid: AtomicI32::new(0),
@@ -399,7 +399,7 @@ impl File {
 
     /// Take f_pos_lock for a position-based syscall (Linux fdget_pos):
     /// only regular files and directories need it (FMODE_ATOMIC_POS)
-    pub fn pos_lock(&self) -> Option<SleepMutexGuard<'_, ()>> {
+    pub fn pos_lock(&self) -> Option<sync::MutexGuard<'_, ()>> {
         let m = self.get_inode()?.mode();
         (m.is_file() || m.is_dir()).then(|| self.f_pos_lock.lock())
     }

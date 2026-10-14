@@ -74,11 +74,15 @@ pub use x86_64::barrier;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::irq;
 #[cfg(target_arch = "x86_64")]
+pub use x86_64::percpu::preempt_count;
+#[cfg(target_arch = "x86_64")]
 pub use x86_64::spinlock::{IrqSpinlock, IrqSpinlockGuard};
 
 /// Device IRQ registration (shareable handlers, PCI INTx routing)
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::irq;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::percpu::preempt_count;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::spinlock::{IrqSpinlock, IrqSpinlockGuard};
 

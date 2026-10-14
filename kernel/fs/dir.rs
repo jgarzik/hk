@@ -103,7 +103,16 @@ pub fn sys_getdents64(fd: i32, dirp: u64, count: u64) -> i64 {
         !full
     };
     let mut ctx = DirContext::new(file.get_pos(), &mut actor);
+    // Linux iterate_dir: the directory's inode lock, shared
+    let dir = file.get_inode();
+    if let Some(d) = &dir {
+        d.inode_lock_shared();
+    }
     let r = file.readdir(&mut ctx);
+    if let Some(d) = &dir {
+        // SAFETY: taken above by this thread
+        unsafe { d.inode_unlock_shared() };
+    }
     let pos = ctx.pos;
 
     if buf.is_empty() {

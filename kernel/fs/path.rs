@@ -94,6 +94,21 @@ pub fn lookup_one(parent: &Arc<Dentry>, name: &str) -> Result<Arc<Dentry>, Kerne
     Ok(child)
 }
 
+/// Path-walk lookup (Linux lookup_fast + lookup_slow): a dcache hit
+/// needs no lock; a miss asks the file system under the directory's
+/// shared inode lock, so it cannot race a create/unlink/rename there
+fn lookup_slow(parent: &Arc<Dentry>, name: &str) -> Result<Arc<Dentry>, KernelError> {
+    if let Some(child) = parent.lookup_child(name) {
+        return Ok(child);
+    }
+    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
+    dir.inode_lock_shared();
+    let r = lookup_one(parent, name);
+    // SAFETY: taken above by this thread
+    unsafe { dir.inode_unlock_shared() };
+    r
+}
+
 /// may_lookup: `dir` must be a searchable directory
 fn may_lookup(c: &Cred, dir: &Dentry) -> Result<(), KernelError> {
     let inode = dir.get_inode().ok_or(KernelError::NotFound)?;
@@ -132,7 +147,7 @@ fn walk(
             }
             _ => {}
         }
-        let child = lookup_one(&cur, name)?;
+        let child = lookup_slow(&cur, name)?;
         let child = if flags.no_xdev {
             child
         } else {

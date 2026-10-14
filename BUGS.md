@@ -67,6 +67,18 @@ capabilities (so MS_NOSUID has nothing to suppress); no
 immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM);
 chmod/chown do not update ctime; ETXTBSY is not enforced.
 
+## Spinlocks where Linux uses sleeping locks
+
+**Location**: `kernel/sync` (Mutex, RwSem), various
+
+Only `i_rwsem`, `s_vfs_rename_mutex` and `f_pos_lock` are sleeping locks
+so far. Linux rw_semaphores/mutexes still modeled as `spin` locks include
+the mmap lock (`MmStruct`), the mount namespace/topology locks
+(namespace_sem, `Mount` RwLocks), `s_umount` (absent), the fd table lock,
+pipe locks and RTNL: their holders must not sleep. There are no
+`_killable`/`_interruptible`/`try` variants of the sleeping locks yet
+(no callers need them).
+
 ## Mount flag gaps
 
 **Location**: `kernel/fs/misc.rs` sys_mount/sys_umount2, `kernel/fs/mount.rs`

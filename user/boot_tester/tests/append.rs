@@ -7,6 +7,7 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
+    sys_mmap, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ,
     sys_close, sys_exit, sys_fork, sys_fstat, sys_lseek, sys_open, sys_pipe, sys_pread64,
     sys_pwrite64, sys_read, sys_unlink, sys_wait4, sys_write, Stat, O_APPEND, O_CREAT, O_RDONLY,
     O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR,
@@ -17,6 +18,7 @@ const NREC: usize = 1000;
 
 pub fn run_tests() {
     test_append_race();
+    test_faulting_writer();
     test_append_pwrite();
     test_shared_pos();
 }
@@ -96,6 +98,75 @@ fn test_append_race() {
     sys_unlink(path.as_ptr());
     let ok = sa == 0 && sb == 0 && size == (2 * NREC * REC) as i64 && bad == 0;
     verdict(b"APPEND_RACE", ok && count == [NREC, NREC], if ok { bad } else { size });
+}
+
+const BIG: usize = 1 << 20;
+
+/// Child: one 1 MiB O_APPEND write from untouched anonymous memory (the
+/// copy faults in every page) racing NREC small appends
+fn big_appender(path: &[u8]) -> ! {
+    let fd = sys_open(path.as_ptr(), O_WRONLY | O_APPEND, 0);
+    let buf = sys_mmap(0, BIG as u64, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if fd < 0 || buf < 0 {
+        sys_exit(2);
+    }
+    let n = sys_write(fd as u64, buf as *const u8, BIG as u64);
+    sys_exit(if n == BIG as i64 { 0 } else { 3 });
+}
+
+/// The big write lands in one piece (writes are atomic under i_rwsem),
+/// the records around it stay intact, nothing deadlocks
+fn test_faulting_writer() {
+    let path = b"/tmp/append_fault\0";
+    let fd = sys_open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 {
+        return verdict(b"APPEND_FAULTING_WRITER", false, fd);
+    }
+    let a = sys_fork();
+    if a == 0 {
+        big_appender(path);
+    }
+    let b = sys_fork();
+    if b == 0 {
+        appender(path, b'B');
+    }
+    let (mut sa, mut sb) = (0, 0);
+    sys_wait4(a, &mut sa, 0, 0);
+    sys_wait4(b, &mut sb, 0, 0);
+    let size = size_of(fd);
+    let (mut pos, mut recs, mut blocks, mut bad) = (0i64, 0, 0, 0);
+    let mut rec = [0u8; REC];
+    while pos < size && bad == 0 {
+        if sys_pread64(fd as i32, rec.as_mut_ptr(), REC as u64, pos) != REC as i64 {
+            bad += 1;
+        } else if rec[0] == 0 {
+            // The zero block: BIG bytes of zeros from here
+            let mut off = 0;
+            while off < BIG && bad == 0 {
+                let n = sys_pread64(fd as i32, rec.as_mut_ptr(), REC as u64, pos + off as i64);
+                if n != REC as i64 || rec.iter().any(|&c| c != 0) {
+                    bad += 1;
+                }
+                off += REC;
+            }
+            blocks += 1;
+            pos += BIG as i64;
+        } else {
+            if rec[0] != b'B' || rec[REC - 1] != b'\n' {
+                bad += 1;
+            }
+            recs += 1;
+            pos += REC as i64;
+        }
+    }
+    sys_close(fd as u64);
+    sys_unlink(path.as_ptr());
+    let ok = sa == 0 && sb == 0 && size == (BIG + NREC * REC) as i64;
+    verdict(
+        b"APPEND_FAULTING_WRITER",
+        ok && bad == 0 && blocks == 1 && recs == NREC,
+        if ok { bad * 1000 + blocks } else { size },
+    );
 }
 
 /// O_APPEND: write() leaves the position at the end, pwrite() appends
