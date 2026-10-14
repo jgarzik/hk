@@ -52,6 +52,7 @@ pub mod fcntl_owner;
 pub mod prctl_extra;
 pub mod poll;
 pub mod timing;
+pub mod uaccess;
 #[cfg(target_arch = "x86_64")]
 pub mod ioport;
 
@@ -105,6 +106,7 @@ pub fn run_all_tests() {
     prctl_extra::run_tests();
     poll::run_tests();
     timing::run_tests();
+    uaccess::run_tests();
     #[cfg(target_arch = "x86_64")]
     ioport::run_tests();
 }
