@@ -1213,11 +1213,41 @@ fn deliver_to_handler(tid: Tid, sig: u32, action: &SigAction) -> bool {
 }
 
 /// Force delivery of SIGSEGV (for stack errors during signal setup)
-fn force_sigsegv(tid: Tid) {
+///
+/// Like Linux force_sigsegv: the handler is reset to SIG_DFL and SIGSEGV is
+/// unblocked, so the task is killed on its way back to user space.
+pub fn force_sigsegv(tid: Tid) {
     // Reset SIGSEGV to default action
     if let Some(sighand) = get_task_sighand(tid) {
         let _ = sighand.set_action(SIGSEGV, SigAction::default());
     }
+    with_task_signal_state(tid, |state| state.blocked.remove(SIGSEGV));
     // Send SIGSEGV to self
     send_signal(tid, SIGSEGV);
+}
+
+/// A synchronous fault in user mode (page fault, illegal instruction, ...)
+///
+/// If the task has a handler for `sig` (and does not block it) the signal is
+/// queued; otherwise the task is killed right away, like Linux force_sig
+/// with a default/blocked/ignored disposition. Without this a faulting
+/// instruction would re-fault forever, since signals are only delivered on
+/// syscall exit. Process context (the faulting task), interrupts enabled.
+pub fn force_sig_fault(sig: u32) {
+    let tid = crate::task::percpu::current_tid();
+    let handled = get_task_sighand(tid)
+        .and_then(|h| h.get_action(sig))
+        .is_some_and(|a| matches!(a.handler, SigHandler::Handler(_)))
+        && !with_task_signal_state(tid, |s| s.blocked.contains(sig)).unwrap_or(true);
+    if !handled {
+        crate::task::proc::do_exit(sig as i32);
+    }
+    send_signal(tid, sig);
+}
+
+/// rt_sigreturn found an unusable frame (Linux badframe): kill the caller
+/// with SIGSEGV. Returns -EFAULT for the (never seen) syscall result.
+pub fn sigreturn_badframe() -> i64 {
+    force_sigsegv(crate::task::percpu::current_tid());
+    -14 // EFAULT
 }

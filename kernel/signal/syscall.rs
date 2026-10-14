@@ -915,7 +915,7 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
         // Check if currently executing on the altstack
         let on_stack = state.altstack.is_enabled() && {
             let sp_start = state.altstack.ss_sp;
-            let sp_end = sp_start + state.altstack.ss_size as u64;
+            let sp_end = sp_start.saturating_add(state.altstack.ss_size as u64);
             user_sp >= sp_start && user_sp < sp_end
         };
 
@@ -932,11 +932,11 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
             } else {
                 old.ss_flags
             };
-            if put_user::<Uaccess, i32>(oss_ptr + 8, flags).is_err() {
+            if put_user::<Uaccess, i32>(oss_ptr.wrapping_add(8), flags).is_err() {
                 return -14; // EFAULT
             }
             // Write ss_size (offset 16, with padding after flags)
-            if put_user::<Uaccess, u64>(oss_ptr + 16, old.ss_size as u64).is_err() {
+            if put_user::<Uaccess, u64>(oss_ptr.wrapping_add(16), old.ss_size as u64).is_err() {
                 return -14; // EFAULT
             }
         }
@@ -954,12 +954,12 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
                 Err(_) => return -14, // EFAULT
             };
             // Read ss_flags (offset 8)
-            let ss_flags_val = match get_user::<Uaccess, i32>(ss_ptr + 8) {
+            let ss_flags_val = match get_user::<Uaccess, i32>(ss_ptr.wrapping_add(8)) {
                 Ok(v) => v,
                 Err(_) => return -14, // EFAULT
             };
             // Read ss_size (offset 16)
-            let ss_size = match get_user::<Uaccess, u64>(ss_ptr + 16) {
+            let ss_size = match get_user::<Uaccess, u64>(ss_ptr.wrapping_add(16)) {
                 Ok(v) => v as usize,
                 Err(_) => return -14, // EFAULT
             };

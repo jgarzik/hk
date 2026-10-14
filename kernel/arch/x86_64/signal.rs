@@ -231,7 +231,15 @@ pub fn setup_rt_frame(sig: u32, action: &SigAction, blocked: SigSet) -> Result<(
     // as if called: RSP + 8 is 16-byte aligned (pretcode is its "return
     // address")
     let frame_size = signal_frame_size();
-    let frame_addr = ((user_rsp - 128 - frame_size as u64) & !0xF) - 8;
+    // user_rsp is user-controlled: an underflow means no room (EFAULT, and
+    // the caller forces SIGSEGV), never a wrapped address
+    let frame_addr = match user_rsp
+        .checked_sub(128 + frame_size as u64)
+        .and_then(|a| (a & !0xF).checked_sub(8))
+    {
+        Some(a) => a,
+        None => return Err(-14), // EFAULT
+    };
 
     // Validate user stack address
     if !Uaccess::access_ok(frame_addr, frame_size) {
@@ -359,22 +367,25 @@ pub fn sys_rt_sigreturn() -> i64 {
     // (pretcode) has been popped from the stack, so RSP has moved up by 8 bytes.
     // The signal frame is 8 bytes below the current RSP.
     // This matches Linux: frame = (struct rt_sigframe __user *)(regs->sp - sizeof(long))
-    let frame_addr = percpu::get_syscall_user_rsp() - 8;
-
-    // Calculate offset to UContext within frame
+    // User-controlled: never let the arithmetic wrap (badframe instead)
     let uc_offset = core::mem::offset_of!(RtSigFrame, uc);
-    let uc_addr = frame_addr + uc_offset as u64;
+    let Some(uc_addr) = percpu::get_syscall_user_rsp()
+        .checked_sub(8)
+        .and_then(|frame| frame.checked_add(uc_offset as u64))
+    else {
+        return crate::signal::sigreturn_badframe();
+    };
     let uc_size = core::mem::size_of::<UContext>();
 
     // Validate address
     if !Uaccess::access_ok(uc_addr, uc_size) {
-        return -14; // EFAULT
+        return crate::signal::sigreturn_badframe();
     }
 
     // Read UContext from user stack
     let mut uc_bytes = [0u8; core::mem::size_of::<UContext>()];
     if copy_from_user::<Uaccess>(&mut uc_bytes, uc_addr, uc_size).is_err() {
-        return -14; // EFAULT
+        return crate::signal::sigreturn_badframe();
     }
 
     // Safety: UContext is repr(C) and we read the correct size

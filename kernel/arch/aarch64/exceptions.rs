@@ -257,9 +257,9 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
                 crate::signal::SIGSEGV
             };
 
-            let tid = crate::task::percpu::current_tid();
-            crate::signal::send_signal(tid, sig);
-            // Return to user - signal will be delivered on next syscall exit
+            // Kill unless a handler takes it (queued for the next syscall exit)
+            super::cpu::enable_interrupts();
+            crate::signal::force_sig_fault(sig);
         }
         EC_IABORT_LOWER => {
             let far: u64;
@@ -274,9 +274,9 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             );
 
             // Send SIGSEGV for instruction abort
-            let tid = crate::task::percpu::current_tid();
-            crate::signal::send_signal(tid, crate::signal::SIGSEGV);
-            // Return to user - signal will be delivered on next syscall exit
+            // Kill unless a handler takes it (queued for the next syscall exit)
+            super::cpu::enable_interrupts();
+            crate::signal::force_sig_fault(crate::signal::SIGSEGV);
         }
         _ => {
             // Unknown/unhandled exception from userland - send signal instead of terminating.
@@ -289,9 +289,9 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             );
 
             // Send SIGILL for unknown exceptions (likely illegal instruction)
-            let tid = crate::task::percpu::current_tid();
-            crate::signal::send_signal(tid, crate::signal::SIGILL);
-            // Return to user - signal will be delivered on next syscall exit
+            // Kill unless a handler takes it (queued for the next syscall exit)
+            super::cpu::enable_interrupts();
+            crate::signal::force_sig_fault(crate::signal::SIGILL);
         }
     }
 }

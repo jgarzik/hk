@@ -197,7 +197,12 @@ pub fn setup_rt_frame(sig: u32, action: &SigAction, blocked: SigSet) -> Result<(
     // Calculate frame size and location on user stack
     // Frame must be 128-byte aligned on aarch64
     let frame_size = signal_frame_size();
-    let frame_addr = (user_sp - frame_size as u64) & !(SIGNAL_FRAME_ALIGN as u64 - 1);
+    // user_sp is user-controlled: an underflow means no room (EFAULT, and
+    // the caller forces SIGSEGV), never a wrapped address
+    let frame_addr = match user_sp.checked_sub(frame_size as u64) {
+        Some(a) => a & !(SIGNAL_FRAME_ALIGN as u64 - 1),
+        None => return Err(-14), // EFAULT
+    };
 
     // Validate user stack address
     if !Uaccess::access_ok(frame_addr, frame_size) {
@@ -323,36 +328,41 @@ pub fn sys_rt_sigreturn() -> i64 {
     // RtSigFrame layout: { info: SigInfo, uc: UContext }
     // UContext layout: { uc_flags, uc_link, uc_stack, uc_sigmask, _pad, uc_mcontext }
     let uc_offset = core::mem::offset_of!(RtSigFrame, uc);
-    let uc_addr = frame_addr + uc_offset as u64;
-
-    // Read uc_sigmask from ucontext
     let sigmask_offset = core::mem::offset_of!(UContext, uc_sigmask);
-    let sigmask_addr = uc_addr + sigmask_offset as u64;
+    // User-controlled: never let the arithmetic wrap (badframe instead)
+    let Some(uc_addr) = frame_addr.checked_add(uc_offset as u64) else {
+        return crate::signal::sigreturn_badframe();
+    };
+    let Some(sigmask_addr) = uc_addr.checked_add(sigmask_offset as u64) else {
+        return crate::signal::sigreturn_badframe();
+    };
 
     // Validate address for sigmask
     if !Uaccess::access_ok(sigmask_addr, core::mem::size_of::<SigSet>()) {
-        return -14; // EFAULT
+        return crate::signal::sigreturn_badframe();
     }
 
     const SIGMASK_SIZE: usize = core::mem::size_of::<SigSet>();
     let mut sigmask_bytes = [0u8; SIGMASK_SIZE];
     if copy_from_user::<Uaccess>(&mut sigmask_bytes, sigmask_addr, SIGMASK_SIZE).is_err() {
-        return -14; // EFAULT
+        return crate::signal::sigreturn_badframe();
     }
     let sigmask: SigSet = unsafe { core::ptr::read(sigmask_bytes.as_ptr() as *const SigSet) };
 
     // Read the minimal sigcontext (without _reserved array to avoid stack overflow)
     let mcontext_offset = core::mem::offset_of!(UContext, uc_mcontext);
-    let mcontext_addr = uc_addr + mcontext_offset as u64;
+    let Some(mcontext_addr) = uc_addr.checked_add(mcontext_offset as u64) else {
+        return crate::signal::sigreturn_badframe();
+    };
     let minimal_size = core::mem::size_of::<SigContextMinimal>();
 
     if !Uaccess::access_ok(mcontext_addr, minimal_size) {
-        return -14; // EFAULT
+        return crate::signal::sigreturn_badframe();
     }
 
     let mut sc_bytes = [0u8; core::mem::size_of::<SigContextMinimal>()];
     if copy_from_user::<Uaccess>(&mut sc_bytes, mcontext_addr, minimal_size).is_err() {
-        return -14; // EFAULT
+        return crate::signal::sigreturn_badframe();
     }
     let sc: SigContextMinimal =
         unsafe { core::ptr::read(sc_bytes.as_ptr() as *const SigContextMinimal) };

@@ -358,10 +358,9 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
                         crate::signal::SIGSEGV
                     };
 
-                    let tid = crate::task::percpu::current_tid();
-                    crate::signal::send_signal(tid, sig);
-
-                    // Return to user mode, signal will be delivered on syscall exit path
+                    // Kill unless a handler takes it (queued for syscall exit)
+                    enable();
+                    crate::signal::force_sig_fault(sig);
                     return 1;
                 }
                 // Kernel-mode fault inside a user-copy routine: resume at its
@@ -373,6 +372,22 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
                 // Kernel mode fault - fall through to fatal handler
             }
         }
+    }
+
+    // Any other exception raised by user code (#DE, #UD, #GP, ...) is the
+    // task's fault, not the kernel's: signal it instead of halting
+    if frame.cs & 3 == 3 && vector != 14 {
+        use crate::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
+        let sig = match vector {
+            0 | 16 | 19 => SIGFPE, // #DE, #MF, #XM
+            1 | 3 => SIGTRAP,      // #DB, #BP
+            6 => SIGILL,           // #UD
+            17 => SIGBUS,          // #AC
+            _ => SIGSEGV,          // #GP, #SS, #NP, ...
+        };
+        enable();
+        crate::signal::force_sig_fault(sig);
+        return 1;
     }
 
     // Cast to u8 for the rest of the handler

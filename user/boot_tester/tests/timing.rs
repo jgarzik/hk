@@ -51,6 +51,10 @@ pub fn run_tests() {
     test_waitid_cld_killed();
     test_pipe_wake_stress();
     test_futex_wake_stress();
+    test_sigframe_bad_stack();
+    test_sigreturn_bad_frame();
+    test_user_fault_kills();
+    test_kernel_pointer_efault();
     sys_rt_sigprocmask(SIG_SETMASK, &saved as *const u64 as u64, 0, 8);
 }
 
@@ -581,5 +585,146 @@ fn test_futex_wake_stress() {
             print(b" child not reaped");
         }
         println(b"");
+    }
+}
+
+// ============================================================================
+// Signal frames on hostile user stack pointers
+// ============================================================================
+
+/// With SP = 64, raise SIGUSR1 (handled) via raw kill(): the kernel cannot
+/// place a signal frame and must kill the task with SIGSEGV (not panic).
+#[cfg(target_arch = "x86_64")]
+fn kill_self_with_tiny_stack(pid: i64) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, 64",
+            "syscall",
+            "ud2",
+            in("rax") 62u64, // kill
+            in("rdi") pid,
+            in("rsi") SIGUSR1 as u64,
+            options(noreturn)
+        )
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn kill_self_with_tiny_stack(pid: i64) -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov x9, 64",
+            "mov sp, x9",
+            "svc 0",
+            "brk 0",
+            in("x8") 129u64, // kill
+            in("x0") pid,
+            in("x1") SIGUSR1 as u64,
+            options(noreturn)
+        )
+    }
+}
+
+/// rt_sigreturn with SP = 64: no readable frame, Linux badframe -> SIGSEGV
+#[cfg(target_arch = "x86_64")]
+fn sigreturn_with_tiny_stack() -> ! {
+    unsafe {
+        core::arch::asm!("mov rsp, 64", "syscall", "ud2", in("rax") 15u64, options(noreturn))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn sigreturn_with_tiny_stack() -> ! {
+    unsafe {
+        core::arch::asm!(
+            "mov x9, 64",
+            "mov sp, x9",
+            "svc 0",
+            "brk 0",
+            in("x8") 139u64,
+            options(noreturn)
+        )
+    }
+}
+
+fn expect_sigsegv(name: &[u8], pid: i64) {
+    expect_killed_by(name, pid, 11);
+}
+
+fn expect_killed_by(name: &[u8], pid: i64, sig: i32) {
+    let st = reap_within(pid, 3000);
+    print(name);
+    match st {
+        Some(s) if s & 0x7f == sig => println(b":OK"),
+        Some(s) => {
+            print(b":FAIL wstatus=");
+            print_num(s as i64);
+            print(b" (want WTERMSIG=");
+            print_num(sig as i64);
+            println(b")");
+        }
+        None => {
+            println(b":FAIL child not reaped");
+            kill_and_reap(pid);
+        }
+    }
+}
+
+/// A handled signal with an unusable user stack kills the task with SIGSEGV
+fn test_sigframe_bad_stack() {
+    set_handler(SIGUSR1, 0);
+    let pid = sys_fork();
+    if pid == 0 {
+        kill_self_with_tiny_stack(hk_syscall::sys_getpid());
+    }
+    reset_handler(SIGUSR1);
+    expect_sigsegv(b"SIGFRAME_BAD_STACK_SIGSEGV", pid);
+}
+
+/// rt_sigreturn on an unreadable frame kills the task with SIGSEGV
+fn test_sigreturn_bad_frame() {
+    let pid = sys_fork();
+    if pid == 0 {
+        sigreturn_with_tiny_stack();
+    }
+    expect_sigsegv(b"SIGRETURN_BAD_FRAME_SIGSEGV", pid);
+}
+
+/// An illegal instruction in user mode kills the task with SIGILL (default
+/// disposition) and leaves the kernel running
+fn test_user_fault_kills() {
+    let pid = sys_fork();
+    if pid == 0 {
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!("ud2", options(noreturn));
+            #[cfg(target_arch = "aarch64")]
+            core::arch::asm!("udf #0", options(noreturn));
+        }
+    }
+    expect_killed_by(b"USER_FAULT_SIGILL", pid, 4);
+}
+
+/// A user pointer into the kernel's identity-mapped region (kernel image on
+/// hk; unmapped on Linux) must fail with EFAULT, not read kernel memory
+fn test_kernel_pointer_efault() {
+    #[cfg(target_arch = "x86_64")]
+    const KADDR: u64 = 0x10_0000; // 1 MB: hk kernel image
+    #[cfg(target_arch = "aarch64")]
+    const KADDR: u64 = 0x4008_0000; // hk kernel image (virt RAM base + 512K)
+    let mut fds = [0i32; 2];
+    if sys_pipe(fds.as_mut_ptr()) != 0 {
+        println(b"UACCESS_KERNEL_PTR_EFAULT:FAIL pipe");
+        return;
+    }
+    let r = sys_write(fds[1] as u64, KADDR as *const u8, 16);
+    sys_close(fds[0] as u64);
+    sys_close(fds[1] as u64);
+    if r == -14 {
+        println(b"UACCESS_KERNEL_PTR_EFAULT:OK");
+    } else {
+        print(b"UACCESS_KERNEL_PTR_EFAULT:FAIL write returned ");
+        print_num(r);
+        println(b" (want -14 EFAULT)");
     }
 }
