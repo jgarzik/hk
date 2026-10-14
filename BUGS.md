@@ -1,5 +1,41 @@
 # Known Bugs
 
+## chroot() does not affect path resolution (security)
+
+**Location**: `kernel/fs/path.rs` ~111-119 (absolute-path lookup)
+
+`sys_chroot` records the new root (`fs.set_root`), but path walking
+always starts absolute paths at the mount namespace root
+(`mnt_ns.get_root_dentry()`) and never consults the task's fs root, so a
+chrooted process can still reach everything. `..` at the chroot root is
+not clamped either. Boot test `CHROOT` only verifies confinement on a
+Linux host (`user/boot_tester/tests/permissions.rs`).
+
+## PID and TID come from separate counters
+
+**Location**: `kernel/task/percpu.rs` do_clone (`next_pid` / `next_tid`)
+
+Linux allocates one ID per task; a single-threaded process has
+pid == tid. hk draws pids and tids from separate counters, so e.g.
+`fork()`/`clone()` return the child's PID (2) while the child's
+`gettid()`, CLONE_PARENT_SETTID/CLONE_CHILD_SETTID stores and futex
+TIDs say 3. Anything comparing those values (pthread joins, tgkill to a
+returned pid, `/proc/<pid>/task`) can disagree with Linux.
+
+## Raw user-memory copies outside kernel/uaccess.rs
+
+**Location**: `kernel/fs/iov.rs`, `kernel/task/process_vm.rs`,
+`kernel/mm/mempolicy.rs`, `kernel/ipc/mqueue.rs`, `kernel/ns/uts.rs`,
+`kernel/fs/perm.rs`, and direct `*(ptr as *mut T)` writes (e.g. wait4
+status)
+
+Unpopulated-but-valid user pages are now demand-faulted for any kernel
+access, but only `copy_{to,from}_user`/`get_user`/`put_user`/
+`strncpy_from_user` and `read`/`write` have an exception fixup. Other
+sites still copy with `core::ptr` and panic on a truly invalid user
+address instead of returning EFAULT; convert them to the uaccess helpers.
+
+
 ## Heap Corruption in Arc<T> Struct Fields
 
 **Status**: Unresolved (workaround in place)
