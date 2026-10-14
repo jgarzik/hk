@@ -62,7 +62,7 @@ extern "C" fn rust_start() -> ! {
     if host_mode() {
         print(b"Host mode: ");
         print_num(fail_count() as i64);
-        println(b" FAIL lines");
+        println(b" failed checks"); // must not itself contain "FAIL"
         // Not init (run directly on a host): report via exit status
         if sys_getpid() != 1 {
             sys_exit_group((fail_count() != 0) as u64);

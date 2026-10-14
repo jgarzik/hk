@@ -8,7 +8,7 @@
 //! 5. VFAT-specific tests
 
 use super::fs_common;
-use super::helpers::{print, print_num, println};
+use super::helpers::{print, print_num, println, host_mode, skip};
 use hk_syscall::{
     sys_close, sys_link, sys_lseek, sys_mkdir, sys_mknod, sys_mount, sys_open, sys_read,
     sys_readlink, sys_rename, sys_rmdir, sys_symlink, sys_truncate, sys_umount2, sys_unlink,
@@ -54,6 +54,11 @@ pub fn run_tests() {
     // ========================================
     // Part 4: VFAT mount and normalized tests
     // ========================================
+    // Linux host run has no /dev/sd0 VFAT image
+    if host_mode() {
+        skip(b"VFAT", b"no /dev/sd0 on host");
+        return;
+    }
     if !mount_vfat() {
         println(b"VFAT mount failed, skipping VFAT tests");
         return;

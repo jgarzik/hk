@@ -1201,8 +1201,8 @@ fn test_statfs_root() {
         return;
     }
 
-    // Verify we got valid data (ramfs magic)
-    if buf.f_type != RAMFS_MAGIC {
+    // Verify we got valid data (ramfs magic; Linux's initramfs root is tmpfs)
+    if buf.f_type != RAMFS_MAGIC && !(host_mode() && buf.f_type == TMPFS_MAGIC) {
         print(b"STATFS_ROOT:FAIL: expected ramfs magic ");
         print_num(RAMFS_MAGIC);
         print(b", got ");
@@ -1295,8 +1295,8 @@ fn test_fstatfs() {
         return;
     }
 
-    // Verify we got ramfs magic (root fs)
-    if buf.f_type != RAMFS_MAGIC {
+    // Verify we got ramfs magic (root fs; tmpfs on a Linux host)
+    if buf.f_type != RAMFS_MAGIC && !(host_mode() && buf.f_type == TMPFS_MAGIC) {
         print(b"FSTATFS:FAIL: expected ramfs magic, got ");
         print_num(buf.f_type);
         println(b"");

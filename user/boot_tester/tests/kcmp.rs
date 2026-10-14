@@ -2,7 +2,7 @@
 //!
 //! Tests for comparing kernel resources between processes.
 
-use super::helpers::{print, print_num, println};
+use super::helpers::{print, print_num, println, host_mode};
 use hk_syscall::{sys_getpid, sys_kcmp, KCMP_FILE, KCMP_FILES, KCMP_FS, KCMP_SIGHAND, KCMP_VM};
 
 const ESRCH: i64 = -3;
@@ -154,7 +154,8 @@ fn test_kcmp_epoll_tfd_unsupported() {
     print(b"  kcmp EPOLL_TFD unsupported: ");
     let pid = sys_getpid() as u64;
     let ret = sys_kcmp(pid, pid, KCMP_EPOLL_TFD, 0, 0);
-    if ret == EOPNOTSUPP {
+    // Linux supports EPOLL_TFD: NULL kcmp_epoll_slot is EFAULT
+    if ret == EOPNOTSUPP || (host_mode() && ret == -14) {
         println(b"PASS");
     } else {
         print(b"FAIL (expected EOPNOTSUPP=");
