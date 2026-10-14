@@ -84,6 +84,9 @@ pub struct SkBuff {
 
     /// Receive classification (set by eth_type_trans)
     pub pkt_type: PktType,
+    /// Received IP packet was addressed to a broadcast address (Linux
+    /// RTCF_BROADCAST; set by ip_rcv)
+    pub ip_bcast: bool,
     /// Start of the MAC header in the buffer (null until received)
     mac: *mut u8,
 }
@@ -147,6 +150,7 @@ impl SkBuff {
             saddr: None,
             daddr: None,
             pkt_type: PktType::Host,
+            ip_bcast: false,
             mac: core::ptr::null_mut(),
         }))
     }
@@ -326,6 +330,7 @@ impl SkBuff {
         self.saddr = None;
         self.daddr = None;
         self.pkt_type = PktType::Host;
+        self.ip_bcast = false;
         self.mac = core::ptr::null_mut();
     }
 

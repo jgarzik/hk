@@ -97,6 +97,10 @@ pub fn icmp_rcv(skb: SkBuff) {
     match hdr.icmp_type {
         icmp_type::ECHO_REQUEST => {
             ICMP_IN_ECHOS.fetch_add(1, Ordering::Relaxed);
+            // icmp_echo_ignore_broadcasts=1 (Linux default; smurf defense)
+            if skb.ip_bcast {
+                return;
+            }
             icmp_echo_reply(&net, saddr, daddr, hdr, &skb.data()[ICMP_HLEN..]);
         }
         icmp_type::ECHO_REPLY => {
@@ -119,6 +123,12 @@ fn icmp_echo_reply(
     req_hdr: &IcmpHdr,
     data: &[u8],
 ) {
+    // Never answer to, or from, a broadcast/multicast/unspecified address
+    let bad = |a: Ipv4Addr| a.is_broadcast() || a.is_multicast() || (a.0 >> 24) == 0;
+    if bad(dest) || bad(src) {
+        return;
+    }
+
     // Allocate skb for response
     let payload_len = data.len();
     let mut skb = match SkBuff::alloc_tx(ICMP_HLEN + payload_len) {
