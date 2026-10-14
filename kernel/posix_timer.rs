@@ -228,8 +228,8 @@ impl PosixTimer {
                 value_ns
             }
         } else {
-            // Relative time
-            Self::now_ns() + value_ns
+            // Relative time (saturates: a huge value never fires)
+            crate::time::deadline_after(Self::now_ns(), value_ns)
         };
 
         inner.expires_ns = expires_ns;
@@ -578,16 +578,23 @@ pub fn sys_timer_settime(timerid: TimerT, flags: i32, new_value: u64, old_value:
     if new_value == 0 {
         return -14; // EFAULT
     }
-    let new_spec = unsafe { *(new_value as *const ITimerSpec) };
+    use crate::arch::Uaccess;
+    use crate::uaccess::{get_user, put_user};
+    let new_spec: ITimerSpec = match get_user::<Uaccess, ITimerSpec>(new_value) {
+        Ok(v) => v,
+        Err(_) => return -14, // EFAULT
+    };
+    // Linux itimerspec64_valid: negative or unnormalized values -> EINVAL
+    if !new_spec.is_valid() {
+        return -22;
+    }
 
     // Set the timer
     let old_spec = timer.settime(&new_spec, flags);
 
     // Write old value to user space if requested
-    if old_value != 0 {
-        unsafe {
-            *(old_value as *mut ITimerSpec) = old_spec;
-        }
+    if old_value != 0 && put_user::<Uaccess, ITimerSpec>(old_value, old_spec).is_err() {
+        return -14; // EFAULT
     }
 
     0

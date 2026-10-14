@@ -394,7 +394,10 @@ pub fn sys_ppoll(fds: u64, nfds: u32, tmo_p: u64, sigmask_ptr: u64, sigsetsize: 
         }
 
         // Convert to milliseconds (clamped to i32 range)
-        let ms = ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000;
+        let ms = ts
+            .tv_sec
+            .saturating_mul(1000)
+            .saturating_add(ts.tv_nsec / 1_000_000);
         if ms > i32::MAX as i64 {
             i32::MAX
         } else if ms < 0 {
@@ -486,7 +489,10 @@ pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeou
         }
 
         // Convert to milliseconds
-        let ms = tv.tv_sec * 1000 + tv.tv_usec / 1000;
+        let ms = tv
+            .tv_sec
+            .saturating_mul(1000)
+            .saturating_add(tv.tv_usec / 1000);
         if ms > i32::MAX as i64 {
             i32::MAX
         } else if ms < 0 {
@@ -549,7 +555,10 @@ pub fn sys_pselect6(
         }
 
         // Convert to milliseconds
-        let ms = ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000;
+        let ms = ts
+            .tv_sec
+            .saturating_mul(1000)
+            .saturating_add(ts.tv_nsec / 1_000_000);
         if ms > i32::MAX as i64 {
             i32::MAX
         } else if ms < 0 {

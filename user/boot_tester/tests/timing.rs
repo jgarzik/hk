@@ -55,6 +55,8 @@ pub fn run_tests() {
     test_sigreturn_bad_frame();
     test_user_fault_kills();
     test_kernel_pointer_efault();
+    test_timerfd_huge_values();
+    test_posix_timer_huge_values();
     sys_rt_sigprocmask(SIG_SETMASK, &saved as *const u64 as u64, 0, 8);
 }
 
@@ -726,5 +728,132 @@ fn test_kernel_pointer_efault() {
         print(b"UACCESS_KERNEL_PTR_EFAULT:FAIL write returned ");
         print_num(r);
         println(b" (want -14 EFAULT)");
+    }
+}
+
+// ============================================================================
+// Timers with enormous user-supplied values
+// ============================================================================
+
+const HUGE_SEC: i64 = i64::MAX / 2;
+
+/// timerfd with a 1 ms first expiry and an interval of ~i64::MAX/2 seconds:
+/// fires once, then never again (Linux clamps to KTIME_MAX); a huge first
+/// value never fires; negative seconds are EINVAL. The kernel must neither
+/// panic nor livelock re-arming the timer.
+fn test_timerfd_huge_values() {
+    use hk_syscall::{sys_timerfd_create, sys_timerfd_settime, ITimerSpec, TFD_NONBLOCK};
+    let fd = sys_timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if fd < 0 {
+        println(b"TIMERFD_HUGE_INTERVAL:FAIL timerfd_create");
+        return;
+    }
+    let fd = fd as i32;
+    let mut count = [0u8; 8];
+    let read_count = |buf: &mut [u8; 8]| sys_read(fd as u64, buf.as_mut_ptr(), 8);
+
+    // Huge interval: one expiry, then effectively never
+    let spec = ITimerSpec {
+        it_interval: Timespec { tv_sec: HUGE_SEC, tv_nsec: 999_999_999 },
+        it_value: Timespec { tv_sec: 0, tv_nsec: 1_000_000 },
+    };
+    let r_set = sys_timerfd_settime(fd, 0, &spec, core::ptr::null_mut());
+    sleep_ms(50);
+    let r1 = read_count(&mut count);
+    let n1 = u64::from_ne_bytes(count);
+    sleep_ms(50);
+    let r2 = read_count(&mut count);
+    print(b"TIMERFD_HUGE_INTERVAL");
+    if r_set == 0 && r1 == 8 && n1 == 1 && r2 == -11 {
+        println(b":OK");
+    } else {
+        print(b":FAIL set=");
+        print_num(r_set);
+        print(b" read1=");
+        print_num(r1);
+        print(b" n=");
+        print_num(n1 as i64);
+        print(b" read2=");
+        print_num(r2);
+        println(b"");
+    }
+
+    // Huge first expiry: armed, never fires
+    let spec = ITimerSpec {
+        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: Timespec { tv_sec: HUGE_SEC, tv_nsec: 0 },
+    };
+    let r_set = sys_timerfd_settime(fd, 0, &spec, core::ptr::null_mut());
+    sleep_ms(20);
+    let r = read_count(&mut count);
+    print(b"TIMERFD_HUGE_VALUE");
+    if r_set == 0 && r == -11 {
+        println(b":OK");
+    } else {
+        print(b":FAIL set=");
+        print_num(r_set);
+        print(b" read=");
+        print_num(r);
+        println(b"");
+    }
+
+    // Negative seconds are invalid
+    let spec = ITimerSpec {
+        it_interval: Timespec { tv_sec: -1, tv_nsec: 0 },
+        it_value: Timespec { tv_sec: 1, tv_nsec: 0 },
+    };
+    let r = sys_timerfd_settime(fd, 0, &spec, core::ptr::null_mut());
+    print(b"TIMERFD_NEGATIVE_EINVAL");
+    if r == -22 {
+        println(b":OK");
+    } else {
+        print(b":FAIL got ");
+        print_num(r);
+        println(b"");
+    }
+    sys_close(fd as u64);
+}
+
+/// POSIX timer (SIGEV_NONE) with a tiny value and a huge interval: settime
+/// succeeds and the kernel keeps running (no re-arm livelock)
+fn test_posix_timer_huge_values() {
+    use hk_syscall::{
+        sys_timer_create, sys_timer_delete, sys_timer_gettime, sys_timer_settime, ITimerSpec,
+        SigEvent,
+    };
+    let sev = SigEvent::none();
+    let mut id: i32 = 0;
+    if sys_timer_create(CLOCK_MONOTONIC, &sev, &mut id) != 0 {
+        println(b"POSIX_TIMER_HUGE_INTERVAL:FAIL timer_create");
+        return;
+    }
+    let spec = ITimerSpec {
+        it_interval: Timespec { tv_sec: HUGE_SEC, tv_nsec: 0 },
+        it_value: Timespec { tv_sec: 0, tv_nsec: 1_000_000 },
+    };
+    let r_set = sys_timer_settime(id, 0, &spec, core::ptr::null_mut());
+    sleep_ms(50);
+    let mut cur = ITimerSpec {
+        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: Timespec { tv_sec: 0, tv_nsec: 0 },
+    };
+    let r_get = sys_timer_gettime(id, &mut cur);
+    let bad = ITimerSpec {
+        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: Timespec { tv_sec: -5, tv_nsec: 0 },
+    };
+    let r_neg = sys_timer_settime(id, 0, &bad, core::ptr::null_mut());
+    sys_timer_delete(id);
+    print(b"POSIX_TIMER_HUGE_INTERVAL");
+    if r_set == 0 && r_get == 0 && r_neg == -22 {
+        println(b":OK");
+    } else {
+        print(b":FAIL set=");
+        print_num(r_set);
+        print(b" get=");
+        print_num(r_get);
+        print(b" neg=");
+        print_num(r_neg);
+        println(b"");
     }
 }

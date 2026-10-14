@@ -137,7 +137,7 @@ pub fn timer_add_relative(
     callback: TimerCallback,
     data: u64,
 ) -> TimerHandle {
-    let expires_ns = now_ns() + delay_ns;
+    let expires_ns = crate::time::deadline_after(now_ns(), delay_ns);
     timer_add(expires_ns, interval_ns, callback, data)
 }
 
@@ -223,22 +223,36 @@ pub fn check_timers() {
     }
 }
 
+/// Bound on callbacks per pass; ktimerd loops (it is still woken) if more
+/// timers are due
+const MAX_FIRE_PER_RUN: usize = 256;
+
 /// Fire all expired timers (process context)
 fn run_expired_timers() {
     let current_ns = now_ns();
 
-    // Collect expired timers; periodic ones are re-armed (catching up past
-    // missed periods) and re-inserted in order
+    // Collect expired timers; periodic ones are re-armed past `current_ns`
+    // (catching up missed periods) and re-inserted in order. Intervals are
+    // user-controlled: a re-arm that overflows or reaches KTIME_MAX disarms
+    // the timer (it would never fire again anyway), and each firing moves
+    // the timer strictly past `current_ns`, so this loop always ends.
     let expired: Vec<(TimerCallback, u64)> = {
         let mut timers = TIMERS.lock();
         let mut fired = Vec::new();
-        while timers.first().is_some_and(|t| t.expires_ns <= current_ns) {
+        while fired.len() < MAX_FIRE_PER_RUN
+            && timers.first().is_some_and(|t| t.expires_ns <= current_ns)
+        {
             let mut timer = timers.remove(0);
             fired.push((timer.callback, timer.data));
             let late = current_ns - timer.expires_ns;
-            if let Some(missed) = late.checked_div(timer.interval_ns) {
-                timer.expires_ns += (missed + 1) * timer.interval_ns;
-                let pos = timers.partition_point(|t| t.expires_ns <= timer.expires_ns);
+            let next = late
+                .checked_div(timer.interval_ns)
+                .and_then(|missed| (missed + 1).checked_mul(timer.interval_ns))
+                .and_then(|step| timer.expires_ns.checked_add(step))
+                .filter(|&next| next > current_ns && next < crate::time::KTIME_MAX);
+            if let Some(next) = next {
+                timer.expires_ns = next;
+                let pos = timers.partition_point(|t| t.expires_ns <= next);
                 timers.insert(pos, timer);
             }
         }

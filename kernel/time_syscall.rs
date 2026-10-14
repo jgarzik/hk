@@ -151,8 +151,8 @@ pub fn sys_nanosleep(req: u64, rem: u64) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
 
-    let total_ns = request.tv_sec as u64 * 1_000_000_000 + request.tv_nsec as u64;
-    let deadline = crate::time::monotonic_ns().saturating_add(total_ns);
+    let total_ns = crate::time::timespec_to_ns(request.tv_sec, request.tv_nsec);
+    let deadline = crate::time::deadline_after(crate::time::monotonic_ns(), total_ns);
     do_nanosleep(deadline, rem)
 }
 
@@ -186,7 +186,7 @@ pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 
         return KernelError::InvalidArgument.sysret();
     }
 
-    let req_ns = request.tv_sec as u64 * 1_000_000_000 + request.tv_nsec as u64;
+    let req_ns = crate::time::timespec_to_ns(request.tv_sec, request.tv_nsec);
     let now_mono = crate::time::monotonic_ns();
     if flags & TIMER_ABSTIME != 0 {
         // Absolute time on `clockid`: convert to a CLOCK_MONOTONIC deadline
@@ -197,14 +197,14 @@ pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 
         };
         let ts = TIMEKEEPER.read(clock, TIMEKEEPER.get_read_cycles());
         let clock_now = ts.sec as u64 * 1_000_000_000 + ts.nsec as u64;
-        let deadline = now_mono.saturating_add(req_ns.saturating_sub(clock_now));
+        let deadline = crate::time::deadline_after(now_mono, req_ns.saturating_sub(clock_now));
         // Absolute sleeps are restarted unchanged; no remaining time
         match crate::task::percpu::sleep_until_ns(deadline, true) {
             Ok(()) => 0,
             Err(_) => KernelError::RestartNoHand.sysret(),
         }
     } else {
-        do_nanosleep(now_mono.saturating_add(req_ns), rem)
+        do_nanosleep(crate::time::deadline_after(now_mono, req_ns), rem)
     }
 }
 
@@ -486,12 +486,8 @@ pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: u64, old_value: u64) 
         Err(_) => return KernelError::BadAddress.sysret(),
     };
 
-    // Validate timespec values
-    if new_spec.it_value.tv_nsec < 0
-        || new_spec.it_value.tv_nsec >= 1_000_000_000
-        || new_spec.it_interval.tv_nsec < 0
-        || new_spec.it_interval.tv_nsec >= 1_000_000_000
-    {
+    // Validate timespec values (Linux itimerspec64_valid)
+    if !new_spec.is_valid() {
         return KernelError::InvalidArgument.sysret();
     }
 
@@ -807,9 +803,15 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
     // Handle ADJ_SETOFFSET - inject time offset
     if txc.modes & ADJ_SETOFFSET != 0 {
         let offset_ns = if txc.modes & ADJ_NANO != 0 {
-            txc.time.tv_sec * 1_000_000_000 + txc.time.tv_usec
+            txc.time
+                .tv_sec
+                .saturating_mul(1_000_000_000)
+                .saturating_add(txc.time.tv_usec)
         } else {
-            txc.time.tv_sec * 1_000_000_000 + txc.time.tv_usec * 1000
+            txc.time
+                .tv_sec
+                .saturating_mul(1_000_000_000)
+                .saturating_add(txc.time.tv_usec.saturating_mul(1000))
         };
 
         // Get current realtime and add offset

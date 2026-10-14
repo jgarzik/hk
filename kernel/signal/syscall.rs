@@ -825,7 +825,7 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
             return -22; // EINVAL
         }
 
-        Some(tv_sec as u64 * 1_000_000_000 + tv_nsec as u64)
+        Some(crate::time::timespec_to_ns(tv_sec, tv_nsec))
     } else {
         None // Infinite wait
     };
