@@ -15,7 +15,7 @@ use crate::task::kthread::{
     kthread_park, kthread_parkme, kthread_run, kthread_should_park, kthread_should_stop,
     kthread_stop, kthread_unpark,
 };
-use crate::task::percpu::{cpu_has_scheduler, get_ticks, sleep_until_ns};
+use crate::task::percpu::{TICK_MS, cpu_has_scheduler, get_ticks, sleep_until_ns};
 use crate::waitqueue::WaitQueue;
 use crate::workqueue::{DelayedWork, SYSTEM_WQ, Work};
 
@@ -29,7 +29,7 @@ static CHILD_COUNT: AtomicU64 = AtomicU64::new(0);
 pub fn start() {
     let cpu = if cpu_has_scheduler(1) { 1 } else { 0 };
     if let Err(e) = kthread_run("kselftest", selftest_thread, 0, Some(cpu)) {
-        printkln!("KSELFTEST:FAIL cannot start kthread: {:?}", e);
+        printkln!("\nKSELFTEST:FAIL cannot start kthread: {:?}", e);
     }
 }
 
@@ -41,10 +41,17 @@ fn selftest_thread(_arg: usize) {
     let mut ok = true;
     let mut check = |name: &str, pass: bool, detail: u64| {
         if !pass {
-            printkln!("KSELFTEST:FAIL {} ({})", name, detail);
+            printkln!("\nKSELFTEST:FAIL {} ({})", name, detail);
             ok = false;
         }
     };
+
+    // 1. Scheduler tick rate: 200 ms of CLOCK_MONOTONIC is ~20 ticks
+    let k0 = get_ticks();
+    sleep_ms(200);
+    let dk = get_ticks() - k0;
+    let want = 200 / TICK_MS;
+    check("tick_rate", dk >= want * 3 / 4 && dk <= want * 3 / 2, dk);
 
     // 2. queue_work runs on the system workqueue worker
     let work = Arc::new(Mutex::new(Work::new(|| {
@@ -96,7 +103,7 @@ fn selftest_thread(_arg: usize) {
     }
 
     if ok {
-        printkln!("KSELFTEST:OK");
+        printkln!("\nKSELFTEST:OK");
     }
 }
 

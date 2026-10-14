@@ -35,13 +35,6 @@ access, but only `copy_{to,from}_user`/`get_user`/`put_user`/
 sites still copy with `core::ptr` and panic on a truly invalid user
 address instead of returning EFAULT; convert them to the uaccess helpers.
 
-## aarch64 tick length vs. NS_PER_TICK
-
-`kernel/time_syscall.rs` nanosleep assumes 10 ms ticks, but on aarch64
-3 ticks measured ~6 ms. Check the arm timer programming vs. the
-constant; sleeps may be wrong by the ratio.
-
-
 ## Fault-time signal handlers are not invoked
 
 **Location**: `kernel/signal/mod.rs` force_sig_fault, arch fault handlers

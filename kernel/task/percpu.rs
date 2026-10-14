@@ -1882,12 +1882,16 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
 
 /// Per-CPU timer tick (IRQ context, every CPU)
 ///
-/// Advances the global tick count and runs global timer work, then does
-/// this CPU's scheduler work (remote wakeups, expired sleepers).
+/// Every CPU's local timer fires every TICK_MS, so only CPU 0 advances the
+/// global tick count (jiffies) and checks software timers; previously each
+/// CPU advanced it, making time run ~Ncpu times too fast. All CPUs then do
+/// their own scheduler work (remote wakeups, expired sleepers).
 pub fn scheduler_tick() {
-    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-    // Wake ktimerd if a software timer expired
-    crate::timer::check_timers();
+    if CurrentArch::try_current_cpu_id() == Some(0) {
+        TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+        // Wake ktimerd if a software timer expired
+        crate::timer::check_timers();
+    }
     wake_sleepers();
 }
 
