@@ -1,4 +1,4 @@
-//! Directory syscalls (getdents64, mkdir, mkdirat, rmdir, mknod, mknodat)
+//! Directory syscalls (getdents, getdents64, mkdir, mkdirat, rmdir, mknod, mknodat)
 
 use crate::arch::Uaccess;
 use crate::fs::path::{create_entry, delete_entry};
@@ -49,26 +49,41 @@ const DIRENT_HDR: usize = core::mem::size_of::<LinuxDirent64>();
 /// fine: callers loop until 0)
 const GETDENTS_CHUNK: usize = 32 * 1024;
 
-/// Append one linux_dirent64 record for `e` to `buf` if it fits in
-/// `limit` bytes
-fn put_dirent(buf: &mut Vec<u8>, limit: usize, e: &DirEntry, d_off: u64) -> bool {
+/// Record format of a getdents call
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fmt {
+    /// struct linux_dirent64 (getdents64)
+    Dirent64,
+    /// Legacy struct linux_dirent (getdents, x86-64 only): d_ino, d_off,
+    /// d_reclen, d_name, then d_type in the record's last byte
+    Dirent,
+}
+
+/// Offset of d_name in a legacy linux_dirent
+const OLD_NAME_OFF: usize = 18;
+
+/// Append one record for `e` to `buf` if it fits in `limit` bytes
+/// (Linux filldir64 / filldir)
+fn put_dirent(buf: &mut Vec<u8>, limit: usize, e: &DirEntry, d_off: u64, fmt: Fmt) -> bool {
     let name_len = e.name.len().min(255);
-    let reclen = (DIRENT_HDR + name_len + 1 + 7) & !7;
+    let (name_off, reclen) = match fmt {
+        Fmt::Dirent64 => (DIRENT_HDR, (DIRENT_HDR + name_len + 1 + 7) & !7),
+        Fmt::Dirent => (OLD_NAME_OFF, (OLD_NAME_OFF + name_len + 2 + 7) & !7),
+    };
     if buf.len() + reclen > limit {
         return false;
     }
     let start = buf.len();
     buf.resize(start + reclen, 0);
-    let hdr = LinuxDirent64 {
-        d_ino: e.ino,
-        d_off: d_off as i64,
-        d_reclen: reclen as u16,
-        d_type: dt(e.file_type),
-    };
-    // SAFETY: LinuxDirent64 is packed plain data and `buf` has
-    // DIRENT_HDR bytes at `start`
-    unsafe { core::ptr::write_unaligned(buf[start..].as_mut_ptr() as *mut LinuxDirent64, hdr) };
-    buf[start + DIRENT_HDR..start + DIRENT_HDR + name_len].copy_from_slice(&e.name[..name_len]);
+    let r = &mut buf[start..];
+    r[0..8].copy_from_slice(&e.ino.to_ne_bytes());
+    r[8..16].copy_from_slice(&d_off.to_ne_bytes());
+    r[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+    match fmt {
+        Fmt::Dirent64 => r[18] = dt(e.file_type),
+        Fmt::Dirent => r[reclen - 1] = dt(e.file_type),
+    }
+    r[name_off..name_off + name_len].copy_from_slice(&e.name[..name_len]);
     true
 }
 
@@ -76,12 +91,20 @@ fn put_dirent(buf: &mut Vec<u8>, limit: usize, e: &DirEntry, d_off: u64) -> bool
 /// iterate_dir): resumes at the file position, which ends up just past
 /// the last entry returned (the d_off cookie); 0 at the end. EINVAL if
 /// `count` cannot hold the next entry.
-///
+pub fn sys_getdents64(fd: i32, dirp: u64, count: u64) -> i64 {
+    getdents(fd, dirp, count, Fmt::Dirent64)
+}
+
+/// sys_getdents - legacy getdents with struct linux_dirent (x86-64)
+pub fn sys_getdents(fd: i32, dirp: u64, count: u64) -> i64 {
+    getdents(fd, dirp, count, Fmt::Dirent)
+}
+
 /// File systems emit entries while holding their directory locks
 /// (spinlocks in hk), so records are gathered into a kernel buffer of
 /// at most GETDENTS_CHUNK bytes and copied to user space only after
 /// `readdir` returned and every lock is dropped.
-pub fn sys_getdents64(fd: i32, dirp: u64, count: u64) -> i64 {
+fn getdents(fd: i32, dirp: u64, count: u64, fmt: Fmt) -> i64 {
     let count = core::cmp::min(count as usize, MAX_RW_COUNT);
     if !Uaccess::access_ok(dirp, count) {
         return KernelError::BadAddress.sysret();
@@ -99,7 +122,7 @@ pub fn sys_getdents64(fd: i32, dirp: u64, count: u64) -> i64 {
     let mut buf = Vec::new();
     let mut full = false;
     let mut actor = |e: &DirEntry, d_off: u64| {
-        full = !put_dirent(&mut buf, limit, e, d_off);
+        full = !put_dirent(&mut buf, limit, e, d_off, fmt);
         !full
     };
     let mut ctx = DirContext::new(file.get_pos(), &mut actor);

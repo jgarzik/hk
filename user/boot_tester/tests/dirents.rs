@@ -18,6 +18,83 @@ pub fn run_tests() {
     sys_mkdir(b"/tmp\0".as_ptr(), 0o1777); // hk boots without /tmp
     check_dir(b"/tmp", b"GETDENTS_RAMFS", 300);
     check_proc();
+    #[cfg(target_arch = "x86_64")]
+    check_legacy();
+}
+
+/// Legacy getdents (x86-64): struct linux_dirent records (d_ino, d_off,
+/// d_reclen, d_name, d_type in the last byte), 8-byte aligned
+#[cfg(target_arch = "x86_64")]
+fn check_legacy() {
+    const NAME: &[u8] = b"GETDENTS_LEGACY";
+    const N: usize = 40;
+    let mut p = [0u8; 64];
+    let dir: &[u8] = b"/tmp/gdl";
+    if sys_mkdir(join(&mut p, dir, b"").as_ptr(), 0o755) != 0 {
+        return verdict(NAME, b"mkdir", -1);
+    }
+    for i in 0..N {
+        let fd = sys_open(join(&mut p, dir, &fname(i)).as_ptr(), O_CREAT | O_WRONLY, 0o644);
+        sys_close(fd as u64);
+    }
+    let why = legacy_walk(dir, N);
+    for i in 0..N {
+        sys_unlink(join(&mut p, dir, &fname(i)).as_ptr());
+    }
+    sys_rmdir(join(&mut p, dir, b"").as_ptr());
+    match why {
+        Ok(()) => verdict(NAME, b"", 0),
+        Err((w, got)) => verdict(NAME, w, got),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn legacy_walk(dir: &[u8], n: usize) -> Result<(), (&'static [u8], i64)> {
+    const DT_DIR: u8 = 4;
+    const DT_REG: u8 = 8;
+    let mut p = [0u8; 64];
+    let fd = sys_open(join(&mut p, dir, b"").as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+    if fd < 0 {
+        return Err((b"open", fd));
+    }
+    let mut seen = [0u8; 64];
+    let (mut dots, mut bad) = (0i64, 0i64);
+    let mut buf = [0u8; 200];
+    let r = loop {
+        let r = hk_syscall::sys_getdents(fd as u64, buf.as_mut_ptr(), buf.len() as u64);
+        if r <= 0 {
+            break r;
+        }
+        let mut off = 0usize;
+        while off < r as usize {
+            let reclen = u16::from_ne_bytes([buf[off + 16], buf[off + 17]]) as usize;
+            if reclen < 24 || reclen % 8 != 0 || off + reclen > r as usize {
+                sys_close(fd as u64);
+                return Err((b"reclen", reclen as i64));
+            }
+            let rec = &buf[off..off + reclen];
+            let name = &rec[18..reclen - 1];
+            let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+            let ty = rec[reclen - 1];
+            match idx(name) {
+                Some(i) if i < n && ty == DT_REG => seen[i] += 1,
+                _ if (name == b"." || name == b"..") && ty == DT_DIR => dots += 1,
+                _ => bad += 1,
+            }
+            off += reclen;
+        }
+    };
+    sys_close(fd as u64);
+    if r < 0 {
+        return Err((b"getdents", r));
+    }
+    if let Some(i) = seen[..n].iter().position(|&c| c != 1) {
+        return Err((b"entry count", i as i64));
+    }
+    if dots != 2 || bad != 0 {
+        return Err((b"dots/bad", dots * 1000 + bad));
+    }
+    Ok(())
 }
 
 fn verdict(name: &[u8], why: &[u8], got: i64) {

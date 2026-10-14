@@ -224,6 +224,7 @@ pub const SYS_FSYNC: u64 = 74;
 pub const SYS_FDATASYNC: u64 = 75;
 pub const SYS_TRUNCATE: u64 = 76;
 pub const SYS_FTRUNCATE: u64 = 77;
+pub const SYS_GETDENTS: u64 = 78;
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_RENAME: u64 = 82;
 pub const SYS_MKDIR: u64 = 83;
@@ -489,6 +490,12 @@ pub fn sys_preadv2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: 
 pub fn sys_pwritev2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
     // Linux ABI: (fd, vec, vlen, pos_l, pos_h, flags), like glibc's LO_HI_LONG
     unsafe { syscall6!(SYS_PWRITEV2, fd, iov, iovcnt, offset, (offset as u64) >> 32, flags) }
+}
+
+/// Legacy getdents (struct linux_dirent; x86-64 only)
+#[inline(always)]
+pub fn sys_getdents(fd: u64, dirp: *mut u8, count: u64) -> i64 {
+    unsafe { syscall3!(SYS_GETDENTS, fd, dirp, count) }
 }
 
 #[inline(always)]

@@ -110,6 +110,8 @@ pub const SYS_EXIT: u64 = 60;
 pub const SYS_GETTIMEOFDAY: u64 = 96;
 /// gettid()
 pub const SYS_GETTID: u64 = 186;
+/// getdents(fd, dirp, count) (legacy struct linux_dirent)
+pub const SYS_GETDENTS: u64 = 78;
 /// getdents64(fd, dirp, count)
 pub const SYS_GETDENTS64: u64 = 217;
 /// clock_gettime(clockid, tp)
@@ -1260,6 +1262,7 @@ pub fn x86_64_syscall_dispatch(
         sys_fsync,
         sys_ftruncate,
         sys_getcwd,
+        sys_getdents,
         sys_getdents64,
         sys_getxattr,
         // ioctl
@@ -1402,6 +1405,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_GETPID => sys_getpid(percpu::current_pid()) as u64,
         SYS_GETTIMEOFDAY => sys_gettimeofday(arg0, arg1) as u64,
         SYS_GETTID => sys_gettid(percpu::current_tid()) as u64,
+        SYS_GETDENTS => sys_getdents(arg0 as i32, arg1, arg2) as u64,
         SYS_GETDENTS64 => sys_getdents64(arg0 as i32, arg1, arg2) as u64,
         SYS_CLOCK_GETTIME => sys_clock_gettime(arg0 as i32, arg1) as u64,
         SYS_CLOCK_GETRES => sys_clock_getres(arg0 as i32, arg1) as u64,
