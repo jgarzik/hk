@@ -1294,6 +1294,30 @@ pub fn cap_fix_setuid(old: &Cred, new: &mut Cred, keep_caps: bool) {
     }
 }
 
+/// Capabilities that fsuid 0 historically implied (Linux CAP_FS_SET)
+pub const CAP_FS_SET: KernelCap = KernelCap(
+    1 << CAP_CHOWN
+        | 1 << CAP_MKNOD
+        | 1 << CAP_DAC_OVERRIDE
+        | 1 << CAP_DAC_READ_SEARCH
+        | 1 << CAP_FOWNER
+        | 1 << CAP_FSETID
+        | 1 << CAP_MAC_OVERRIDE
+        | 1 << CAP_LINUX_IMMUTABLE,
+);
+
+/// Linux cap_task_fix_setuid(LSM_SETID_FS): leaving fsuid 0 drops the
+/// file system capabilities from the effective set, returning to fsuid 0
+/// raises them again from the permitted set
+pub fn cap_fix_setfsuid(old: &Cred, new: &mut Cred) {
+    if old.fsuid == 0 && new.fsuid != 0 {
+        new.cap_effective = KernelCap(new.cap_effective.0 & !CAP_FS_SET.0);
+    }
+    if old.fsuid != 0 && new.fsuid == 0 {
+        new.cap_effective = KernelCap(new.cap_effective.0 | (new.cap_permitted.0 & CAP_FS_SET.0));
+    }
+}
+
 pub fn capable(cap: u32) -> bool {
     if cap > CAP_LAST_CAP {
         return false;

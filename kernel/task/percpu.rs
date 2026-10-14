@@ -2852,6 +2852,7 @@ pub fn set_current_regid(
 pub fn set_current_fsuid(fsuid: crate::task::Uid) {
     let mut new_cred = crate::task::prepare_creds();
     new_cred.fsuid = fsuid;
+    crate::task::cap_fix_setfsuid(&current_cred(), &mut new_cred);
     crate::task::commit_creds(alloc::sync::Arc::new(new_cred));
 }
 
