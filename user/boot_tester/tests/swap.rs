@@ -36,17 +36,20 @@ fn test_swapon_enoent() {
     }
 }
 
-/// Test: swapoff on non-active path returns EINVAL
+/// Test: swapoff on a nonexistent path is ENOENT (Linux opens it first),
+/// on an existing non-swap file EINVAL
 fn test_swapoff_einval() {
     print(b"  swapoff EINVAL: ");
-    let path = b"/nonexistent_swap\0";
-    let ret = sys_swapoff(path.as_ptr());
-    if ret == EINVAL {
+    let missing = sys_swapoff(b"/nonexistent_swap\0".as_ptr());
+    let ret = sys_swapoff(b"/test.txt\0".as_ptr());
+    if missing == -2 && ret == EINVAL {
         println(b"PASS");
     } else {
         print(b"FAIL (got ");
+        print_num(missing);
+        print(b" / ");
         print_num(ret);
-        println(b")");
+        println(b", expected -2 / -22)");
     }
 }
 
