@@ -8,12 +8,17 @@
 //!
 //! ## Locking
 //!
-//! `Sock` holds only atomics and its `WaitQueue` (IrqSpinlock leaf).
-//! Wakeups (`data_ready`, `write_space`, `state_change`) are issued after
-//! the caller dropped its protocol locks.
+//! `Sock` holds atomics, its `WaitQueue` (IrqSpinlock leaf) and the
+//! error queue `errq` (`spin::Mutex` leaf, thread only). Wakeups
+//! (`data_ready`, `write_space`, `state_change`, `error_report`) are
+//! issued after the caller dropped its protocol locks.
 
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+use spin::Mutex;
 
 use crate::error::KernelError;
 use crate::net::NetNamespace;
@@ -52,6 +57,37 @@ pub mod sf {
     pub const ACCEPTCONN: u32 = 1 << 14;
 }
 
+/// sock_extended_err origins (SO_EE_ORIGIN_*)
+pub const EE_ORIGIN_LOCAL: u8 = 1;
+pub const EE_ORIGIN_ICMP: u8 = 2;
+
+/// An error-queue entry (Linux sock_exterr_skb): `struct
+/// sock_extended_err` plus what recvmsg(MSG_ERRQUEUE) returns with it.
+/// Addresses are kept as socket addresses, so IPv6 can reuse it.
+#[derive(Clone, Debug, Default)]
+pub struct ErrSkb {
+    pub errno: u32,
+    pub origin: u8,
+    pub ty: u8,
+    pub code: u8,
+    pub info: u32,
+    /// msg_name: the offending packet's destination (sockaddr)
+    pub name: Vec<u8>,
+    /// SO_EE_OFFENDER: who reported it (sockaddr; empty = none)
+    pub offender: Vec<u8>,
+    /// Data returned: the offending packet's payload as quoted
+    pub payload: Vec<u8>,
+    /// Receive metadata of the ICMP message (for IP_PKTINFO etc.)
+    pub rx: Option<crate::net::af_inet::RxInfo>,
+}
+
+impl ErrSkb {
+    /// Bytes charged to the receive buffer
+    fn truesize(&self) -> usize {
+        self.payload.len() + 256
+    }
+}
+
 /// Timeout "never" (MAX_SCHEDULE_TIMEOUT in ns)
 pub const TIMEO_FOREVER: u64 = u64::MAX;
 
@@ -85,6 +121,9 @@ pub struct Sock {
     pub drops: AtomicU32,
     /// sockfs inode number (0 until the file exists)
     pub ino: AtomicU64,
+    /// Error queue (IP_RECVERR, MSG_ERRQUEUE) and its memory charge
+    errq: Mutex<VecDeque<ErrSkb>>,
+    errmem: AtomicUsize,
 }
 
 impl Sock {
@@ -111,6 +150,8 @@ impl Sock {
             mark: AtomicU32::new(0),
             drops: AtomicU32::new(0),
             ino: AtomicU64::new(0),
+            errq: Mutex::new(VecDeque::new()),
+            errmem: AtomicUsize::new(0),
         }
     }
 
@@ -158,6 +199,58 @@ impl Sock {
 
     pub fn has_err(&self) -> bool {
         self.err.load(Ordering::Acquire) != 0
+    }
+
+    /// Set the pending error without a wakeup (callers report later)
+    pub fn store_err(&self, errno: u32) {
+        self.err.store(errno as i32, Ordering::Release);
+    }
+
+    /// POLLERR condition (Linux datagram_poll): a pending error or a
+    /// queued extended error
+    pub fn err_pending(&self) -> bool {
+        self.has_err() || !self.errq.lock().is_empty()
+    }
+
+    /// Queue an extended error (Linux sock_queue_err_skb): dropped when
+    /// it would exceed the receive buffer
+    pub fn queue_err(&self, e: ErrSkb) -> bool {
+        let ts = e.truesize();
+        if self.errmem.load(Ordering::Acquire) + ts >= self.rcvbuf() as usize {
+            return false;
+        }
+        self.errmem.fetch_add(ts, Ordering::AcqRel);
+        self.errq.lock().push_back(e);
+        self.wq.wake_all();
+        true
+    }
+
+    /// Take the oldest extended error (Linux sock_dequeue_err_skb): the
+    /// pending error follows the next queued ICMP error, or is cleared
+    /// when the taken one was an ICMP error and no other follows
+    pub fn dequeue_err(&self) -> Option<ErrSkb> {
+        let (e, next) = {
+            let mut q = self.errq.lock();
+            let e = q.pop_front()?;
+            let next = q.front().map(|n| (n.origin, n.errno));
+            (e, next)
+        };
+        self.errmem.fetch_sub(e.truesize(), Ordering::AcqRel);
+        match next {
+            Some((EE_ORIGIN_ICMP, errno)) => self.store_err(errno),
+            _ if e.origin == EE_ORIGIN_ICMP => self.store_err(0),
+            _ => {}
+        }
+        if next.is_some() {
+            self.wq.wake_all();
+        }
+        Some(e)
+    }
+
+    /// Drop all queued extended errors (close)
+    pub fn purge_err(&self) {
+        self.errq.lock().clear();
+        self.errmem.store(0, Ordering::Release);
     }
 
     /// Take the pending error (Linux sock_error)

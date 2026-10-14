@@ -33,6 +33,7 @@ pub mod xattr;
 pub mod mqueue;
 pub mod netdev;
 pub mod neigh;
+pub mod icmp;
 pub mod netdev_ioctl;
 pub mod netlink;
 pub mod nl;
@@ -113,6 +114,7 @@ pub fn run_all_tests() {
     netdev_ioctl::run_tests();
     netdev::run_tests();
     neigh::run_tests();
+    icmp::run_tests();
     keys::run_tests();
     kcmp::run_tests();
     process_vm::run_tests();

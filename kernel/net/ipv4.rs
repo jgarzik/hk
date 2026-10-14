@@ -422,7 +422,11 @@ fn ip_local_deliver(mut skb: SkBuff) {
         IPPROTO_TCP => tcp::tcp_rcv(skb),
         IPPROTO_UDP => udp::udp_rcv(skb),
         IPPROTO_ICMP => crate::net::icmp::icmp_rcv(skb),
-        _ => {}
+        _ => {
+            if let Some(net) = skb.net() {
+                crate::net::icmp::prot_unreach(&net, &skb);
+            }
+        }
     }
 }
 
@@ -629,7 +633,7 @@ fn mc_map(a: Ipv4Addr) -> [u8; ETH_ALEN] {
 /// A queued packet's next hop never answered (Linux ipv4_link_failure
 /// via arp_error_report): tell its sender
 pub fn ip_link_failure(skb: Box<SkBuff>) {
-    drop(skb);
+    crate::net::icmp::link_failure(&skb);
 }
 
 /// Build IP header and transmit (called by ARP when resolution completes)

@@ -83,6 +83,9 @@ pub struct NetNamespace {
     /// Learned path MTUs
     pub pmtu: crate::net::inet::route::PmtuCache,
 
+    /// ICMP rate-limit state
+    pub icmp: crate::net::icmp::IcmpRate,
+
     /// Key of the IP identification hash (Linux ip_id_key)
     pub ip_id_key: [u64; 2],
 
@@ -109,6 +112,7 @@ impl NetNamespace {
             sysctl: Default::default(),
             frags: Default::default(),
             pmtu: Default::default(),
+            icmp: Default::default(),
             ip_id_key: [
                 ((crate::random::get_random_u32() as u64) << 32)
                     | crate::random::get_random_u32() as u64,

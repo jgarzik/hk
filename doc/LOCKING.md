@@ -1595,6 +1595,8 @@ do not rely on that.
 | sockfs inode `private` | `spin::RwLock` (VFS, `Inode.private`) | thread only | read per socket file operation (`sock_of`) to reach the protocol socket; leaf |
 | `TcpCb.sk_lock` | `spin::Mutex<()>` | thread only | Linux `lock_sock` (no backlog: input is thread context). Held by `tcp_rcv` per segment and by connect/bind/listen/send/close; never across a sleep |
 | `TcpSock.{rx, accept_queue, tuple, opts}`, `TcpCb.{retransmit,ooo}_queue` | `spin::Mutex` | thread only | leaves; TCP state/sequence numbers are atomics; the accept queue is dropped before transmitting |
+| `Sock.errq` (`net/sock.rs`) | `spin::Mutex` | thread only (softnet ICMP error delivery, recvmsg MSG_ERRQUEUE, poll) | leaf: IP_RECVERR queue, bounded by SO_RCVBUF (own charge); the wakeup follows the unlock |
+| `IcmpRate.st` (`net/icmp.rs`, per netns) | `spin::Mutex` | thread only | leaf: global + per-destination (bounded, 256) ICMP error token buckets |
 | `UdpSock.op` | `spin::Mutex<()>` | thread only | UDP socket lock (bind/connect/disconnect/autobind); never across a sleep or a transmit |
 | `UdpSock.rxq` | `spin::Mutex` | thread only (softnet enqueue, recvmsg) | leaf; bounded by SO_RCVBUF (`rmem` atomic) |
 | `Inet.addr` (`net/af_inet.rs`) | `spin::Mutex` | thread only | leaf: addresses/ports of a TCP or UDP socket; read under the UDP/TCP port tables during lookups |

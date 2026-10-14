@@ -345,3 +345,88 @@ pub fn bind_check(
     }
     Ok((addr, port, ty))
 }
+
+// ============================================================================
+// Extended errors (Linux ip_sockglue.c ip_icmp_error / ip_local_error /
+// ip_recv_error)
+// ============================================================================
+
+/// Queue an ICMP error for a socket with IP_RECVERR (Linux
+/// ip_icmp_error): the offending packet's destination and `port` become
+/// msg_name, `payload` (its transport payload as quoted) the data
+pub fn ip_icmp_error(
+    sk: &Sock,
+    e: &crate::net::icmp::IcmpErr,
+    errno: KernelError,
+    port: u16,
+    payload: &[u8],
+) {
+    sk.queue_err(crate::net::sock::ErrSkb {
+        errno: errno as u32,
+        origin: crate::net::sock::EE_ORIGIN_ICMP,
+        ty: e.ty,
+        code: e.code,
+        info: e.info,
+        name: sin_bytes(e.inner_daddr(), port),
+        offender: sin_bytes(e.from, 0),
+        payload: payload.to_vec(),
+        rx: Some(e.rx),
+    });
+}
+
+/// Queue a locally detected error (EMSGSIZE) if IP_RECVERR is on (Linux
+/// ip_local_error)
+pub fn ip_local_error(
+    sk: &Sock,
+    inet: &Inet,
+    errno: KernelError,
+    daddr: Ipv4Addr,
+    port: u16,
+    info: u32,
+) {
+    if !inet.flag(ipf::RECVERR) {
+        return;
+    }
+    sk.queue_err(crate::net::sock::ErrSkb {
+        errno: errno as u32,
+        origin: crate::net::sock::EE_ORIGIN_LOCAL,
+        info,
+        name: sin_bytes(daddr, port),
+        ..Default::default()
+    });
+}
+
+/// recvmsg(MSG_ERRQUEUE) (Linux ip_recv_error): EAGAIN when empty; the
+/// data is the quoted payload, msg_name the original destination, and
+/// an IP_RECVERR control message carries sock_extended_err + offender
+pub fn ip_recv_error(
+    sk: &Sock,
+    inet: &Inet,
+    m: &mut crate::net::msg::RecvMsg,
+) -> Result<usize, KernelError> {
+    use crate::net::msg::{MSG_ERRQUEUE, MSG_TRUNC};
+    let e = sk.dequeue_err().ok_or(KernelError::WouldBlock)?;
+    let n = m.data.put(0, &e.payload)?;
+    if n < e.payload.len() {
+        m.flags |= MSG_TRUNC;
+    }
+    if m.want_name && !e.name.is_empty() {
+        m.name = Some(e.name.clone());
+    }
+    let mut ee = [0u8; 32];
+    ee[0..4].copy_from_slice(&e.errno.to_ne_bytes());
+    ee[4] = e.origin;
+    ee[5] = e.ty;
+    ee[6] = e.code;
+    ee[8..12].copy_from_slice(&e.info.to_ne_bytes());
+    if e.origin == crate::net::sock::EE_ORIGIN_ICMP {
+        ee[16..16 + e.offender.len().min(16)]
+            .copy_from_slice(&e.offender[..e.offender.len().min(16)]);
+        if let Some(rx) = &e.rx {
+            inet.recv_cmsgs(&mut m.cmsg, rx);
+        }
+    }
+    m.cmsg.put(SOL_IP, IP_RECVERR, &ee);
+    m.flags |= MSG_ERRQUEUE;
+    Ok(n)
+}

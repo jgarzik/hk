@@ -38,9 +38,9 @@ VFS handler is registered.
 Listed because real traffic reaches them: TCP has no retransmission or
 timers, so a dropped segment (TX ring full, backlog overflow) stalls a
 connection, TIME_WAIT ends immediately (no 2MSL), close does not RST
-unread data and SO_LINGER is stored only (P6); no ICMP
-errors are generated or delivered (port unreachable, connected-UDP
-ECONNREFUSED, IP_RECVERR queue: MSG_ERRQUEUE is always EAGAIN) (P5).
+unread data and SO_LINGER is stored only (P6); ICMP errors about TCP
+segments (host unreachable on SYN_SENT, frag needed) are not delivered
+to TCP sockets yet (P6); ICMP timestamp requests are not answered.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP. TCP binds share a port only per the
 SO_REUSEADDR/SO_REUSEPORT rules; connect() picks an entirely unused

@@ -108,6 +108,10 @@ pub enum KernelError {
     NoData = 61,
     /// Timer expired (ETIME)
     TimerExpired = 62,
+    /// Machine is not on the network (ENONET)
+    NoNetwork = 64,
+    /// Protocol error (EPROTO)
+    ProtocolError = 71,
     /// Value too large for defined data type (EOVERFLOW)
     Overflow = 75,
     /// Bad message (EBADMSG)
@@ -247,6 +251,8 @@ impl KernelError {
             42 => Self::NoMessage,
             43 => Self::IdentifierRemoved,
             61 => Self::NoData,
+            64 => Self::NoNetwork,
+            71 => Self::ProtocolError,
             62 => Self::TimerExpired,
             75 => Self::Overflow,
             74 => Self::BadMessage,

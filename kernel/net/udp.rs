@@ -404,6 +404,7 @@ impl ProtoOps for UdpSock {
         self.sk.set_shutdown(SHUTDOWN_MASK);
         self.rxq.lock().clear();
         self.rmem.store(0, Ordering::Release);
+        self.sk.purge_err();
     }
 
     /// Linux inet_bind for UDP
@@ -476,7 +477,7 @@ impl ProtoOps for UdpSock {
     /// Linux udp_poll / datagram_poll
     fn poll(&self) -> u16 {
         let mut mask = 0;
-        if self.sk.has_err() {
+        if self.sk.err_pending() {
             mask |= POLLERR;
         }
         let sh = self.sk.shutdown();
@@ -568,15 +569,26 @@ impl ProtoOps for UdpSock {
         let mut p = self.inet.params();
         p.tos = c.tos.unwrap_or(p.tos);
         p.ttl = c.ttl.unwrap_or(p.ttl);
-        self.xmit(&rt, a.sport, dport, &data, p)?;
-        Ok(len)
+        // Linux sock_alloc_send_pskb: a pending (ICMP) error first
+        if let Some(e) = self.sk.take_err() {
+            return Err(e);
+        }
+        match self.xmit(&rt, a.sport, dport, &data, p) {
+            Err(KernelError::MessageTooLong) => {
+                // Linux __ip_append_data: IP_RECVERR also queues it
+                // (msg_name port: the connected one)
+                let e = KernelError::MessageTooLong;
+                af_inet::ip_local_error(&self.sk, &self.inet, e, daddr, a.dport, rt.mtu);
+                Err(e)
+            }
+            r => r.map(|()| len),
+        }
     }
 
     /// Linux udp_recvmsg
     fn recvmsg(&self, m: &mut RecvMsg, flags: i32) -> Result<usize, KernelError> {
         if flags & MSG_ERRQUEUE != 0 {
-            // No ICMP errors are queued yet (IP_RECVERR, P5)
-            return Err(KernelError::WouldBlock);
+            return af_inet::ip_recv_error(&self.sk, &self.inet, m);
         }
         let Some(d) = self.recv_dgram(flags)? else {
             return Ok(0);
@@ -808,10 +820,40 @@ pub fn udp_rcv(skb: SkBuff) {
         }
         return;
     }
-    // No socket: ICMP port unreachable comes with P5
-    if let Some(s) = lookup(&net.udp, &k) {
-        s.enqueue(d);
+    match lookup(&net.udp, &k) {
+        Some(s) => s.enqueue(d),
+        None => crate::net::icmp::port_unreach(&net, &skb),
     }
+}
+
+/// An ICMP error about a datagram we sent (Linux udp_err): the socket
+/// that sent it gets the error queued (IP_RECVERR) and/or as its pending
+/// error; without IP_RECVERR only hard errors on connected sockets count
+pub fn udp_err(net: &crate::net::NetNamespace, e: &crate::net::icmp::IcmpErr) {
+    let l4 = e.l4();
+    let (sport, dport) = (
+        u16::from_be_bytes([l4[0], l4[1]]),
+        u16::from_be_bytes([l4[2], l4[3]]),
+    );
+    let k = Key {
+        saddr: e.inner_daddr(),
+        sport: dport,
+        daddr: e.inner_saddr(),
+        dport: sport,
+        dif: e.rx.ifindex,
+    };
+    let Some(s) = lookup(&net.udp, &k) else {
+        return;
+    };
+    let Some((err, hard)) = e.errno(s.inet.pmtudisc()) else {
+        return;
+    };
+    if s.inet.flag(af_inet::ipf::RECVERR) {
+        af_inet::ip_icmp_error(&s.sk, e, err, dport, &l4[UDP_HLEN..]);
+    } else if !hard || !s.connected.load(Ordering::Acquire) {
+        return;
+    }
+    s.sk.set_err(err);
 }
 
 /// Verify a received UDP checksum (pseudo header + header + data sum to
