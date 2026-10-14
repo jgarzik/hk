@@ -256,6 +256,30 @@ pub fn get_user<A: UaccessArch, T: Copy + Default>(from: u64) -> UaccessResult<T
     Ok(value)
 }
 
+/// Copy a plain-data value from user space (no alignment requirement,
+/// unlike [`get_user`]); for user structs such as `struct timespec[2]`.
+///
+/// `T` must be valid for any bit pattern (repr(C) integer fields).
+pub fn copy_val_from_user<A: UaccessArch, T: Copy + Default>(from: u64) -> UaccessResult<T> {
+    let mut value = T::default();
+    let size = ::core::mem::size_of::<T>();
+    // SAFETY: the byte view covers exactly `value`; T is plain data.
+    let bytes = unsafe { ::core::slice::from_raw_parts_mut(&mut value as *mut T as *mut u8, size) };
+    copy_from_user::<A>(bytes, from, size)?;
+    Ok(value)
+}
+
+/// Copy a plain-data value to user space (no alignment requirement, unlike
+/// [`put_user`]). `T` must have no implicit padding (it would leak kernel
+/// stack bytes).
+pub fn copy_val_to_user<A: UaccessArch, T: Copy>(to: u64, value: &T) -> UaccessResult<()> {
+    let size = ::core::mem::size_of::<T>();
+    // SAFETY: the byte view covers exactly `*value`.
+    let bytes = unsafe { ::core::slice::from_raw_parts(value as *const T as *const u8, size) };
+    copy_to_user::<A>(to, bytes)?;
+    Ok(())
+}
+
 /// Read a null-terminated string from user space
 ///
 /// Reads up to `max_len` bytes from user space, stopping at the first null byte.
