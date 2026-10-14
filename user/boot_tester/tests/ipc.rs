@@ -16,7 +16,7 @@ use hk_syscall::{
     FdSet, IoVec, PollFd, Timeval, Sembuf, Timespec,
     POLLIN, POLLNVAL, POLLOUT,
     IPC_CREAT, IPC_PRIVATE, IPC_RMID,
-    GETVAL, SETVAL,
+    GETVAL, SETVAL, GETALL, SETALL,
     O_RDONLY,
 };
 use super::helpers::{print, println, print_num};
@@ -56,6 +56,7 @@ pub fn run_tests() {
     test_semctl_setval_getval();
     test_semop_increment();
     test_semtimedop_timeout();
+    test_semctl_all_efault();
 
     println(b"--- SysV Message Queues ---");
     test_msgget_create();
@@ -990,4 +991,54 @@ fn test_sendfile_invalid_pipe_input() {
     sys_close(pipefd[1] as u64);
     sys_close(dst_pipe[0] as u64);
     sys_close(dst_pipe[1] as u64);
+}
+
+/// Test semctl() GETALL/SETALL error paths: a bad user pointer must yield
+/// -EFAULT and leave the set fully usable and removable afterwards.
+fn test_semctl_all_efault() {
+    const EFAULT: i64 = -14;
+    const BAD_ADDR: u64 = 0xffff_8000_0000_0000; // kernel half
+
+    let semid = sys_semget(IPC_PRIVATE, 3, IPC_CREAT | 0o666);
+    if semid < 0 {
+        println(b"semget failed SEMCTL_ALL_EFAULT:FAIL");
+        return;
+    }
+    let semid = semid as i32;
+
+    let get_bad = sys_semctl(semid, 0, GETALL, BAD_ADDR);
+    let set_bad = sys_semctl(semid, 0, SETALL, BAD_ADDR);
+
+    let vals: [u16; 3] = [7, 8, 9];
+    let set_ok = sys_semctl(semid, 0, SETALL, vals.as_ptr() as u64);
+    let mut out: [u16; 3] = [0; 3];
+    let get_ok = sys_semctl(semid, 0, GETALL, out.as_mut_ptr() as u64);
+    let rmid = sys_semctl(semid, 0, IPC_RMID, 0);
+    let after = sys_semctl(semid, 0, GETVAL, 0);
+
+    print(b"semctl GETALL(bad)=");
+    print_num(get_bad);
+    print(b" SETALL(bad)=");
+    print_num(set_bad);
+    print(b" SETALL=");
+    print_num(set_ok);
+    print(b" GETALL=");
+    print_num(get_ok);
+    print(b" RMID=");
+    print_num(rmid);
+    print(b" GETVAL(after rmid)=");
+    print_num(after);
+
+    if get_bad == EFAULT
+        && set_bad == EFAULT
+        && set_ok == 0
+        && get_ok == 0
+        && out == vals
+        && rmid == 0
+        && after < 0
+    {
+        println(b" SEMCTL_ALL_EFAULT:OK");
+    } else {
+        println(b" SEMCTL_ALL_EFAULT:FAIL");
+    }
 }
