@@ -226,17 +226,8 @@ pub struct Shmid64Ds {
     pub __unused5: u64,
 }
 
-/// Semaphore array descriptor (64-bit version)
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Semid64Ds {
-    pub sem_perm: Ipc64Perm,
-    pub sem_otime: i64,
-    pub sem_ctime: i64,
-    pub sem_nsems: u64,
-    pub __unused3: u64,
-    pub __unused4: u64,
-}
+/// Semaphore array descriptor (64-bit version; layout differs per arch)
+pub use crate::arch::uapi::Semid64Ds;
 
 /// Message queue descriptor (64-bit version)
 #[repr(C)]

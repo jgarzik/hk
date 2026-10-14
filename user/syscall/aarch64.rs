@@ -2667,3 +2667,15 @@ pub struct EpollEvent {
     /// User data (passed back unchanged)
     pub data: u64,
 }
+
+/// `struct semid64_ds` (include/uapi/asm-generic/sembuf.h, used by arm64)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Semid64Ds {
+    pub sem_perm: crate::types::Ipc64Perm,
+    pub sem_otime: i64,
+    pub sem_ctime: i64,
+    pub sem_nsems: u64,
+    pub _unused3: u64,
+    pub _unused4: u64,
+}

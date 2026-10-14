@@ -2401,3 +2401,18 @@ pub struct EpollEvent {
     /// User data (passed back unchanged)
     pub data: u64,
 }
+
+/// `struct semid64_ds` (arch/x86/include/uapi/asm/sembuf.h): x86_64 keeps
+/// an unused word after each time field
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Semid64Ds {
+    pub sem_perm: crate::types::Ipc64Perm,
+    pub sem_otime: i64,
+    pub _unused1: u64,
+    pub sem_ctime: i64,
+    pub _unused2: u64,
+    pub sem_nsems: u64,
+    pub _unused3: u64,
+    pub _unused4: u64,
+}

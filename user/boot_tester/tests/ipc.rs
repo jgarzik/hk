@@ -15,7 +15,7 @@ use hk_syscall::{
     sys_msgget, sys_msgsnd, sys_msgrcv, sys_msgctl,
     FdSet, IoVec, PollFd, Timeval, Sembuf, Timespec,
     POLLIN, POLLNVAL, POLLOUT,
-    IPC_CREAT, IPC_PRIVATE, IPC_RMID,
+    IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, Semid64Ds,
     GETVAL, SETVAL, GETALL, SETALL,
     O_RDONLY,
 };
@@ -54,6 +54,7 @@ pub fn run_tests() {
     println(b"--- SysV Semaphores ---");
     test_semget_create();
     test_semctl_setval_getval();
+    test_semctl_ipc_stat();
     test_semop_increment();
     test_semtimedop_timeout();
     test_semctl_all_efault();
@@ -509,6 +510,32 @@ fn test_semctl_setval_getval() {
         println(b" SEMCTL_VAL:OK");
     } else {
         println(b" SEMCTL_VAL:FAIL");
+    }
+}
+
+/// Test semctl(IPC_STAT): semid64_ds layout (differs x86_64 vs asm-generic)
+fn test_semctl_ipc_stat() {
+    let semid = sys_semget(IPC_PRIVATE, 3, IPC_CREAT | 0o640);
+    if semid < 0 {
+        println(b"SEMCTL_IPC_STAT:FAIL: semget failed");
+        return;
+    }
+    let mut ds = Semid64Ds::default();
+    let ret = sys_semctl(semid as i32, 0, IPC_STAT, &mut ds as *mut Semid64Ds as u64);
+    sys_semctl(semid as i32, 0, IPC_RMID, 0);
+    let (nsems, mode, ctime) = (ds.sem_nsems, ds.sem_perm.mode, ds.sem_ctime);
+    if ret == 0 && nsems == 3 && mode & 0o777 == 0o640 && ctime > 0 {
+        println(b"SEMCTL_IPC_STAT:OK");
+    } else {
+        print(b"SEMCTL_IPC_STAT:FAIL: ret=");
+        print_num(ret);
+        print(b" nsems=");
+        print_num(nsems as i64);
+        print(b" mode=");
+        print_num((mode & 0o777) as i64);
+        print(b" ctime=");
+        print_num(ctime);
+        println(b"");
     }
 }
 

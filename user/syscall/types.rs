@@ -703,6 +703,24 @@ pub const IPC_SET: i32 = 1;
 pub const IPC_STAT: i32 = 2;
 pub const IPC_INFO: i32 = 3;
 
+/// `struct ipc64_perm` (include/uapi/asm-generic/ipcbuf.h; same on x86_64/arm64)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Ipc64Perm {
+    pub key: i32,
+    pub uid: u32,
+    pub gid: u32,
+    pub cuid: u32,
+    pub cgid: u32,
+    pub mode: u32,
+    pub seq: u16,
+    pub _pad2: u16,
+    pub _pad3: u32,
+    pub _unused1: u64,
+    pub _unused2: u64,
+}
+// `struct semid64_ds` is per-arch: see x86_64.rs / aarch64.rs.
+
 /// Shared memory flags
 pub const SHM_RDONLY: i32 = 0o10000;
 pub const SHM_RND: i32 = 0o20000;

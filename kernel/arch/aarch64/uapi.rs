@@ -58,3 +58,15 @@ impl EpollEvent {
         }
     }
 }
+
+/// `struct semid64_ds` (include/uapi/asm-generic/sembuf.h)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Semid64Ds {
+    pub sem_perm: crate::ipc::Ipc64Perm,
+    pub sem_otime: i64,
+    pub sem_ctime: i64,
+    pub sem_nsems: u64,
+    pub __unused3: u64,
+    pub __unused4: u64,
+}
