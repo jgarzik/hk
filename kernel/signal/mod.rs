@@ -223,6 +223,34 @@ pub mod sa_flags {
 // Signal information (siginfo)
 // =============================================================================
 
+/// siginfo `si_code` values (include/uapi/asm-generic/siginfo.h)
+pub mod si_code {
+    /// Sent by kill/raise
+    pub const SI_USER: i32 = 0;
+    /// Sent by the kernel
+    pub const SI_KERNEL: i32 = 0x80;
+    /// SIGILL: illegal opcode / illegal operand
+    pub const ILL_ILLOPC: i32 = 1;
+    pub const ILL_ILLOPN: i32 = 2;
+    /// SIGFPE codes
+    pub const FPE_INTDIV: i32 = 1;
+    pub const FPE_INTOVF: i32 = 2;
+    pub const FPE_FLTDIV: i32 = 3;
+    pub const FPE_FLTOVF: i32 = 4;
+    pub const FPE_FLTUND: i32 = 5;
+    pub const FPE_FLTRES: i32 = 6;
+    pub const FPE_FLTINV: i32 = 7;
+    /// SIGSEGV: address not mapped / no permission for the mapping
+    pub const SEGV_MAPERR: i32 = 1;
+    pub const SEGV_ACCERR: i32 = 2;
+    /// SIGBUS: invalid alignment / nonexistent physical address
+    pub const BUS_ADRALN: i32 = 1;
+    pub const BUS_ADRERR: i32 = 2;
+    /// SIGTRAP: breakpoint / trace trap
+    pub const TRAP_BRKPT: i32 = 1;
+    pub const TRAP_TRACE: i32 = 2;
+}
+
 /// What the signal frame reports about a signal (Linux kernel_siginfo
 /// subset, plus the arch fault details of sigcontext)
 #[derive(Debug, Clone, Copy, Default)]
@@ -236,6 +264,19 @@ pub struct KSigInfo {
     /// x86-64: sigcontext.err (exception error code); arm64: ESR_EL1
     /// (reported in an esr_context record when non-zero)
     pub error: u64,
+}
+
+/// si_code for a SIGSEGV at user address `addr` (Linux bad_area vs
+/// bad_area_access_error): SEGV_ACCERR if a VMA of the current task
+/// covers it, else SEGV_MAPERR
+pub fn segv_code(addr: u64) -> i32 {
+    let tid = crate::task::percpu::current_tid();
+    let mapped = crate::mm::get_task_mm(tid).is_some_and(|mm| mm.lock().find_vma(addr).is_some());
+    if mapped {
+        si_code::SEGV_ACCERR
+    } else {
+        si_code::SEGV_MAPERR
+    }
 }
 
 // =============================================================================
@@ -1247,21 +1288,49 @@ pub fn force_sigsegv(tid: Tid) {
 
 /// A synchronous fault in user mode (page fault, illegal instruction, ...)
 ///
-/// If the task has a handler for `sig` (and does not block it) the signal is
-/// queued; otherwise the task is killed right away, like Linux force_sig
-/// with a default/blocked/ignored disposition. Without this a faulting
-/// instruction would re-fault forever, since signals are only delivered on
-/// syscall exit. Process context (the faulting task), interrupts enabled.
-pub fn force_sig_fault(sig: u32) {
+/// Linux force_sig_fault semantics, delivered at once (the faulting
+/// instruction must not run again first):
+/// - a handler that is not blocked: its frame is set up now, from the
+///   per-CPU user-register block, which the arch fault path loaded from the
+///   trap frame and copies back to it afterwards (handler entry). If the
+///   frame cannot be written the task dies by SIGSEGV (force_sigsegv).
+/// - blocked or ignored: the action is reset to SIG_DFL and the signal
+///   unblocked (force_sig_info_to_task); the default action of every
+///   synchronous fault signal (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP) kills
+///   the task, as does SIG_DFL.
+///
+/// Process context (the faulting task), interrupts enabled.
+pub fn force_sig_fault(sig: u32, info: KSigInfo) {
+    use crate::task::proc::do_exit;
+
     let tid = crate::task::percpu::current_tid();
-    let handled = get_task_sighand(tid)
+    let sighand = get_task_sighand(tid);
+    let action = sighand
+        .as_ref()
         .and_then(|h| h.get_action(sig))
-        .is_some_and(|a| matches!(a.handler, SigHandler::Handler(_)))
-        && !with_task_signal_state(tid, |s| s.blocked.contains(sig)).unwrap_or(true);
-    if !handled {
-        crate::task::proc::do_exit(sig as i32);
+        .unwrap_or_default();
+    let blocked = with_task_signal_state(tid, |s| s.blocked.contains(sig)).unwrap_or(true);
+
+    if let SigHandler::Handler(_) = action.handler
+        && !blocked
+    {
+        if deliver_to_handler(tid, sig, &action, &info) {
+            return;
+        }
+        // No room for the frame: SIGSEGV was reset to SIG_DFL and queued
+        do_exit(SIGSEGV as i32);
     }
-    send_signal(tid, sig);
+
+    if blocked || action.handler == SigHandler::Ignore {
+        if let Some(h) = &sighand {
+            let _ = h.set_action(sig, SigAction::default());
+        }
+        with_task_signal_state(tid, |s| {
+            s.blocked.remove(sig);
+            s.recalc_sigpending();
+        });
+    }
+    do_exit(sig as i32);
 }
 
 /// rt_sigreturn found an unusable frame (Linux badframe): kill the caller

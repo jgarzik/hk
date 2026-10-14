@@ -10,6 +10,7 @@ use super::cpu::KERNEL_CODE_SELECTOR;
 use super::lapic;
 use super::paging::phys_to_virt;
 use super::pic;
+use crate::signal::{KSigInfo, si_code};
 
 /// LAPIC timer interrupt vector
 pub const LAPIC_TIMER_VECTOR: u8 = 0x40;
@@ -20,6 +21,9 @@ const IDT_ENTRIES: usize = 256;
 /// IDT gate types
 const GATE_INTERRUPT: u8 = 0x8E; // Present, DPL=0, 64-bit interrupt gate
 const GATE_TRAP: u8 = 0x8F; // Present, DPL=0, 64-bit trap gate
+/// Present, DPL=3, 64-bit trap gate: reachable by `int3`/`into` from user
+/// mode (Linux: X86_TRAP_BP and X86_TRAP_OF are system gates)
+const GATE_TRAP_USER: u8 = 0xEF;
 
 /// IDT entry (16 bytes in 64-bit mode)
 #[derive(Clone, Copy)]
@@ -120,8 +124,8 @@ pub fn init_idt() {
             GATE_INTERRUPT,
             super::cpu::IST_NMI,
         );
-        IDT[3].set_handler(exception_handler_3 as *const () as u64, GATE_TRAP);
-        IDT[4].set_handler(exception_handler_4 as *const () as u64, GATE_TRAP);
+        IDT[3].set_handler(exception_handler_3 as *const () as u64, GATE_TRAP_USER);
+        IDT[4].set_handler(exception_handler_4 as *const () as u64, GATE_TRAP_USER);
         IDT[5].set_handler(exception_handler_5 as *const () as u64, GATE_TRAP);
         IDT[6].set_handler(exception_handler_6 as *const () as u64, GATE_TRAP);
         IDT[7].set_handler(exception_handler_7 as *const () as u64, GATE_TRAP);
@@ -324,6 +328,52 @@ unsafe extern "C" fn exception_common() {
     );
 }
 
+/// si_code for a user x87 (#MF) or SIMD (#XM) floating-point exception
+/// (Linux fpu__exception_code): the first unmasked pending exception
+fn math_error_code(vector: u64) -> i32 {
+    let err: u32 = if vector == 19 {
+        let mut mxcsr: u32 = 0;
+        unsafe {
+            ::core::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack));
+        }
+        (mxcsr & 0x3f) & !((mxcsr >> 7) & 0x3f)
+    } else {
+        let (mut cwd, mut swd): (u16, u16) = (0, 0);
+        unsafe {
+            ::core::arch::asm!(
+                "fnstcw [{}]",
+                "fnstsw [{}]",
+                in(reg) &mut cwd,
+                in(reg) &mut swd,
+                options(nostack)
+            );
+        }
+        (swd & !cwd) as u32
+    };
+    if err & 0x001 != 0 {
+        si_code::FPE_FLTINV
+    } else if err & 0x004 != 0 {
+        si_code::FPE_FLTDIV
+    } else if err & 0x008 != 0 {
+        si_code::FPE_FLTOVF
+    } else if err & 0x012 != 0 {
+        si_code::FPE_FLTUND
+    } else if err & 0x020 != 0 {
+        si_code::FPE_FLTRES
+    } else {
+        0
+    }
+}
+
+/// Deliver a synchronous fault signal (force_sig_fault) for the user
+/// context in `frame`: if a handler runs, IRETQ enters it with every
+/// register taken from the (redirected) per-CPU user-register block
+fn user_fault(frame: &mut X86_64TrapFrame, sig: u32, info: KSigInfo) {
+    super::percpu::load_user_regs_from_trapframe(frame);
+    crate::signal::force_sig_fault(sig, info);
+    super::percpu::store_user_regs_to_trapframe(frame);
+}
+
 /// Rust exception handler
 /// Returns 1 if the exception was handled and execution can resume, 0 otherwise
 extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 {
@@ -349,18 +399,22 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
                 // Error code bit 2: User mode access (1) or supervisor (0)
                 let user = (frame.error_code & 4) != 0;
                 if user {
-                    // User mode page fault - send signal instead of halting
+                    // User mode page fault - signal the task
                     // Error code bit 3: Reserved bit violation (SIGBUS)
                     let is_bus_error = (frame.error_code & 8) != 0;
-                    let sig = if is_bus_error {
-                        crate::signal::SIGBUS
-                    } else {
-                        crate::signal::SIGSEGV
-                    };
-
-                    // Kill unless a handler takes it (queued for syscall exit)
                     enable();
-                    crate::signal::force_sig_fault(sig);
+                    let (sig, code) = if is_bus_error {
+                        (crate::signal::SIGBUS, si_code::BUS_ADRERR)
+                    } else {
+                        (crate::signal::SIGSEGV, crate::signal::segv_code(cr2))
+                    };
+                    let info = KSigInfo {
+                        code,
+                        addr: cr2,
+                        trapno: 14,
+                        error: frame.error_code,
+                    };
+                    user_fault(frame, sig, info);
                     return 1;
                 }
                 // Kernel-mode fault inside a user-copy routine: resume at its
@@ -378,15 +432,33 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
     // task's fault, not the kernel's: signal it instead of halting
     if frame.cs & 3 == 3 && vector != 14 {
         use crate::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
-        let sig = match vector {
-            0 | 16 | 19 => SIGFPE, // #DE, #MF, #XM
-            1 | 3 => SIGTRAP,      // #DB, #BP
-            6 => SIGILL,           // #UD
-            17 => SIGBUS,          // #AC
-            _ => SIGSEGV,          // #GP, #SS, #NP, ...
+        // Linux arch/x86/kernel/traps.c: signal, si_code, si_addr
+        let rip = frame.rip;
+        let (sig, code, addr) = match vector {
+            0 => (SIGFPE, si_code::FPE_INTDIV, rip),    // #DE
+            1 => (SIGTRAP, si_code::TRAP_TRACE, rip),   // #DB
+            3 => (SIGTRAP, si_code::SI_KERNEL, 0),      // #BP (int3)
+            6 => (SIGILL, si_code::ILL_ILLOPN, rip),    // #UD
+            11 | 12 => (SIGBUS, si_code::SI_KERNEL, 0), // #NP, #SS
+            16 | 19 => {
+                // #MF, #XM: code from the unmasked exception flags
+                let code = math_error_code(vector);
+                if code == 0 {
+                    return 1; // spurious (Linux: no signal)
+                }
+                (SIGFPE, code, rip)
+            }
+            17 => (SIGBUS, si_code::BUS_ADRALN, 0), // #AC
+            _ => (SIGSEGV, si_code::SI_KERNEL, 0),  // #GP, #TS, ...
         };
         enable();
-        crate::signal::force_sig_fault(sig);
+        let info = KSigInfo {
+            code,
+            addr,
+            trapno: vector,
+            error: frame.error_code,
+        };
+        user_fault(frame, sig, info);
         return 1;
     }
 

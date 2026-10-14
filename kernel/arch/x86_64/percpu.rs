@@ -712,6 +712,60 @@ pub extern "C" fn fill_iret_frame(out: *mut u64) {
     }
 }
 
+/// Load the per-CPU user-register block from the trap frame of a user
+/// fault, so signal delivery builds its frame from the faulting context
+pub fn load_user_regs_from_trapframe(f: &super::X86_64TrapFrame) {
+    let p = unsafe { current_cpu_mut() };
+    p.syscall_user_rip = f.rip;
+    p.syscall_user_rflags = f.rflags;
+    p.syscall_user_rsp = f.rsp;
+    p.syscall_user_rax = f.rax;
+    p.syscall_user_rbx = f.rbx;
+    p.syscall_user_rcx = f.rcx;
+    p.syscall_user_rdx = f.rdx;
+    p.syscall_user_rsi = f.rsi;
+    p.syscall_user_rdi = f.rdi;
+    p.syscall_user_rbp = f.rbp;
+    p.syscall_user_r8 = f.r8;
+    p.syscall_user_r9 = f.r9;
+    p.syscall_user_r10 = f.r10;
+    p.syscall_user_r11 = f.r11;
+    p.syscall_user_r12 = f.r12;
+    p.syscall_user_r13 = f.r13;
+    p.syscall_user_r14 = f.r14;
+    p.syscall_user_r15 = f.r15;
+    p.signal_context_modified = false;
+    p.syscall_full_restore = false;
+}
+
+/// Write back a user context changed by signal delivery into the trap
+/// frame the fault returns through (IRETQ restores every register)
+pub fn store_user_regs_to_trapframe(f: &mut super::X86_64TrapFrame) {
+    let p = unsafe { current_cpu_mut() };
+    if !core::mem::take(&mut p.signal_context_modified) {
+        return;
+    }
+    p.syscall_full_restore = false;
+    f.rip = p.syscall_user_rip;
+    f.rflags = p.syscall_user_rflags;
+    f.rsp = p.syscall_user_rsp;
+    f.rax = p.syscall_user_rax;
+    f.rbx = p.syscall_user_rbx;
+    f.rcx = p.syscall_user_rcx;
+    f.rdx = p.syscall_user_rdx;
+    f.rsi = p.syscall_user_rsi;
+    f.rdi = p.syscall_user_rdi;
+    f.rbp = p.syscall_user_rbp;
+    f.r8 = p.syscall_user_r8;
+    f.r9 = p.syscall_user_r9;
+    f.r10 = p.syscall_user_r10;
+    f.r11 = p.syscall_user_r11;
+    f.r12 = p.syscall_user_r12;
+    f.r13 = p.syscall_user_r13;
+    f.r14 = p.syscall_user_r14;
+    f.r15 = p.syscall_user_r15;
+}
+
 // ============================================================================
 // PerCpuOps trait implementation
 // ============================================================================

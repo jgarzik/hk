@@ -35,17 +35,6 @@ access, but only `copy_{to,from}_user`/`get_user`/`put_user`/
 sites still copy with `core::ptr` and panic on a truly invalid user
 address instead of returning EFAULT; convert them to the uaccess helpers.
 
-## Fault-time signal handlers are not invoked
-
-**Location**: `kernel/signal/mod.rs` force_sig_fault, arch fault handlers
-
-Signals are delivered only on syscall exit. A synchronous user fault
-(#PF/#GP/#UD, aarch64 aborts) whose signal has no handler now kills the
-task, but if a handler *is* installed the signal is only queued and the
-faulting instruction re-faults until the task makes a syscall (it never
-does): the task spins. Delivering at fault time needs a signal frame built
-from the trap frame (x86-64: the per-CPU syscall block lacks RCX/R11).
-
 ## Heap Corruption in Arc<T> Struct Fields
 
 **Status**: Unresolved (workaround in place)

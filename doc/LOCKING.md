@@ -316,7 +316,9 @@ pub needs_reschedule: AtomicBool, // Reschedule request flag
    `syscall_user_*` block in per-CPU data is saved on the outgoing task's
    kernel stack across every `context_switch` and restored when it runs
    again, so a task that slept inside a syscall returns (and builds signal
-   frames) with its own registers.
+   frames) with its own registers. A user fault that delivers a signal
+   (`force_sig_fault`) loads the block from the fault's trap frame and
+   copies it back afterwards; the task is not inside a syscall then.
 
 7. **User FP/SIMD state is saved eagerly, per task, never lazily** - no
    lock is involved; the state always lives with the task it belongs to:
