@@ -35,6 +35,37 @@ access, but only `copy_{to,from}_user`/`get_user`/`put_user`/
 sites still copy with `core::ptr` and panic on a truly invalid user
 address instead of returning EFAULT; convert them to the uaccess helpers.
 
+## Signal-killed children report as exited
+
+**Location**: `kernel/signal/mod.rs` handle_default_action,
+`kernel/task/proc.rs` sys_wait4 / sys_waitid
+
+A child killed by a signal is recorded as `exit(sig | 0x80)`, so wait4
+gives wstatus 0x8900 (WIFEXITED) instead of WIFSIGNALED/WTERMSIG=sig,
+and waitid never reports CLD_KILLED. Shells and supervisors misreport
+crashes. Track exit code and terminating signal separately.
+
+## x86-64: SIGKILL does not wake a task sleeping in rt_sigsuspend
+
+A child blocked in rt_sigsuspend that later receives SIGKILL from its
+parent never wakes (stays on the sleep queue) while the parent spins in
+wait4's `yield_now` loop; the boot test hangs. Same test completes on
+aarch64. Root cause unknown. Related: `send_signal` does not wake
+sleeping tasks in general (sigsuspend/poll re-check each tick).
+
+## x86-64 syscall 34 is dispatched as nice, not pause
+
+On x86-64, 34 is `pause` (neither arch has a `nice` syscall), and hk
+has no `sys_pause` at all although doc/SYSCALLS.md lists it. Fix:
+implement pause (sleep until a signal is delivered, return -EINTR),
+remove the dead sys_nice. A test is blocked on the two bugs above.
+
+## aarch64 tick length vs. NS_PER_TICK
+
+`kernel/time_syscall.rs` nanosleep assumes 10 ms ticks, but on aarch64
+3 ticks measured ~6 ms. Check the arm timer programming vs. the
+constant; sleeps may be wrong by the ratio.
+
 
 ## Heap Corruption in Arc<T> Struct Fields
 
