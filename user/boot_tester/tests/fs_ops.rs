@@ -187,10 +187,14 @@ fn test_link() {
 /// Test: link() to directory should fail with EPERM
 fn test_link_dir_eperm() {
 
-    let dir_path = b"/proc\0";
-    let dir_link = b"/proc_link\0";
+    // Same-fs directory: a cross-fs one (e.g. /proc) gets EXDEV first
+    let dir_path = b"/ld_dir\0";
+    let dir_link = b"/ld_link\0";
+    sys_mkdir(dir_path.as_ptr(), 0o755);
     let ret = sys_link(dir_path.as_ptr(), dir_link.as_ptr());
-    if ret == -1 {
+    let xdev = sys_link(b"/proc\0".as_ptr(), b"/proc_link\0".as_ptr());
+    sys_rmdir(dir_path.as_ptr());
+    if ret == -1 && xdev == -18 {
         // EPERM
         println(b"LINK_DIR_EPERM:OK");
     } else {
