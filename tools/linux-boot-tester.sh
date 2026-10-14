@@ -115,10 +115,16 @@ if [ -w /dev/kvm ] && $NATIVE && [ "$ARCH" = x86_64 ]; then
     QEMU_MACHINE=(-cpu host)
 fi
 
+# Network: same slirp network as hk (tools/qemu-net.sh); virtio-net is
+# built into Ubuntu's generic kernel (CONFIG_VIRTIO_NET=y, VIRTIO_PCI=y on
+# amd64 and arm64), so it comes up as eth0 without modules
+. tools/qemu-net.sh
+qemu_net_args virtio-net-pci
+
 echo "Booting boot_tester on Linux (${TIMEOUT}s timeout)..."
 rm -f "$SERIAL_LOG"
 timeout "$TIMEOUT" "$QEMU_BIN" "${KVM[@]}" "${QEMU_MACHINE[@]}" \
-    -m 512M -smp 4 -nographic -no-reboot -monitor none \
+    -m 512M -smp 4 -nographic -no-reboot -monitor none "${QEMU_NET[@]}" \
     -kernel "$LINUX_KERNEL" -initrd "$WORK/initramfs.cpio" \
     -append "console=$CONSOLE rdinit=/bin/init panic=-1 quiet" \
     -serial file:"$SERIAL_LOG" </dev/null || true

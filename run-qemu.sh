@@ -22,6 +22,9 @@
 
 set -e
 
+# Shared network options
+. "$(dirname "$0")/tools/qemu-net.sh"
+
 # Default options
 ARCH="x86"
 DEBUG_MODE=false
@@ -148,12 +151,9 @@ setup_x86_config() {
         )
     fi
 
-    # Network: Intel e1000 with user-mode (slirp) networking
-    # Guest can reach host at 10.0.2.2, gateway/DNS at 10.0.2.2/10.0.2.3
-    QEMU_ARGS+=(
-        -netdev user,id=n0
-        -device e1000,netdev=n0
-    )
+    # Network: Intel e1000 on the shared slirp network (tools/qemu-net.sh)
+    qemu_net_args e1000
+    QEMU_ARGS+=("${QEMU_NET[@]}")
 }
 
 setup_arm_config() {
@@ -213,12 +213,9 @@ setup_arm_config() {
         )
     fi
 
-    # Network: Intel e1000 with user-mode (slirp) networking
-    # Guest can reach host at 10.0.2.2, gateway/DNS at 10.0.2.2/10.0.2.3
-    QEMU_ARGS+=(
-        -netdev user,id=n0
-        -device e1000,netdev=n0
-    )
+    # Network: Intel e1000 on the shared slirp network (tools/qemu-net.sh)
+    qemu_net_args e1000
+    QEMU_ARGS+=("${QEMU_NET[@]}")
 }
 
 # Check QEMU availability
