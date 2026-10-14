@@ -58,12 +58,16 @@ global init (SIGNAL_UNKILLABLE), e.g. SIGPIPE from a write to a broken
 socket. hk delivers them, so pid 1 (the boot tester) dies. Socket tests
 use MSG_NOSIGNAL / SIG_IGN and check SIGPIPE in forked children.
 
-## Large user stack frames hang the boot tester
+## The initial user stack does not grow
 
-A test function with a 16 KB local array (`[IoVec; 1025]`) inlined into
-its caller made the boot tester hang before printing anything instead
-of running or faulting. Not investigated (user stack growth / guard
-handling suspected); tests keep big buffers static.
+**Location**: `kernel/task/exec.rs` setup_user_stack, `kernel/main.rs`
+(init)
+
+The main thread's stack is mapped eagerly at exec (RLIMIT_STACK, or
+1 MB when unlimited; init's is 1 MB: it was 16 KB, which made deep
+frames fault or hang the boot tester)
+and is not a growable VMA: Linux maps it lazily and expands it on demand
+up to RLIMIT_STACK.
 
 ## NETLINK_ROUTE / SIOC* subset gaps (P3)
 

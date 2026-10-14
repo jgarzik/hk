@@ -25,9 +25,10 @@ const PAGE_SIZE: u64 = 4096;
 /// User stack virtual address (near top of user space, below canonical hole)
 const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
 
-/// Default number of pages for user stack (16KB)
-/// This is used if RLIMIT_STACK is larger or infinite.
-const USER_STACK_PAGES: usize = 4;
+/// Pages of user stack mapped at exec when RLIMIT_STACK is unlimited
+/// (1 MB; the stack does not grow on demand yet, see BUGS.md). It was
+/// 16 KB, which deep frames (signal delivery, large locals) overran.
+const USER_STACK_PAGES: usize = 256;
 
 /// Maximum number of pages for user stack (8MB, matching default RLIMIT_STACK)
 const MAX_STACK_PAGES: usize = 2048;

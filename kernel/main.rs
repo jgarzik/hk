@@ -279,7 +279,7 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
 
 // ELF loading constants - shared by both architectures
 const PAGE_SIZE: u64 = 4096;
-const USER_STACK_PAGES: usize = 4;
+const USER_STACK_PAGES: usize = 256;
 
 // x86_64: User stack at top of lower half of 48-bit VA space
 #[cfg(target_arch = "x86_64")]
