@@ -27,6 +27,7 @@ pub fn run_tests() {
     test_reuseport_owner();
     test_unique_tuple();
     test_nonblock_refused();
+    test_churn();
 }
 
 const S_IFMT: u32 = 0o170000;
@@ -352,5 +353,63 @@ fn test_nonblock_refused() {
     t.eq(b"blocking refused", connect(b, LO, dead), ECONNREFUSED);
     close(b);
     let _ = sys_close;
+    t.done();
+}
+
+/// Ports and table entries are released on every close path: a fixed
+/// local port is reusable after (a) a refused connect + close, (b)
+/// listen + close; (c) many connect/accept/close pairs all succeed
+fn test_churn() {
+    let mut t = T::new(b"SOCKCORE_CHURN");
+    let probe = tcp();
+    bind(probe, LO, 0);
+    let dead = port(probe);
+    close(probe);
+    let fixed = {
+        let p = tcp();
+        bind(p, LO, 0);
+        let x = port(p);
+        close(p);
+        x
+    };
+    for i in 0..5000 {
+        let fd = tcp();
+        let b = bind(fd, LO, fixed);
+        let c = connect(fd, LO, dead);
+        close(fd);
+        if !t.eq(b"refused bind", b, 0) || !t.eq(b"refused connect", c, ECONNREFUSED) {
+            super::helpers::print_num(i);
+            break;
+        }
+    }
+    for _ in 0..2000 {
+        let fd = tcp();
+        let b = bind(fd, LO, fixed);
+        let l = sys_listen(fd, 4);
+        close(fd);
+        if !t.eq(b"listen bind", b, 0) || !t.eq(b"listen", l, 0) {
+            break;
+        }
+    }
+    let l = tcp();
+    bind(l, LO, fixed);
+    sys_listen(l, 8);
+    let mut buf = [0u8; 4];
+    for _ in 0..1000 {
+        let c = tcp();
+        let r = connect(c, LO, fixed);
+        let a = sys_accept(l, core::ptr::null_mut(), core::ptr::null_mut()) as i32;
+        if !t.eq(b"pair connect", r, 0) || !t.ok(b"pair accept", a >= 0, a as i64) {
+            close(c);
+            break;
+        }
+        close(a);
+        let eof = recv(c, &mut buf, 0);
+        close(c);
+        if !t.eq(b"pair eof", eof, 0) {
+            break;
+        }
+    }
+    close(l);
     t.done();
 }
