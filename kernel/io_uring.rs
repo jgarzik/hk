@@ -1462,11 +1462,6 @@ fn round_up_pow2(n: u32) -> u32 {
     v + 1
 }
 
-/// Check if n is a power of 2
-fn is_power_of_2(n: u32) -> bool {
-    n != 0 && (n & (n - 1)) == 0
-}
-
 /// sys_io_uring_setup - Set up an io_uring instance
 ///
 /// # Arguments
@@ -1476,8 +1471,8 @@ fn is_power_of_2(n: u32) -> bool {
 /// # Returns
 /// File descriptor on success, negative errno on failure
 pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
-    // Validate entries
-    if entries == 0 || entries > IORING_MAX_ENTRIES {
+    // Validate entries (oversize is checked below, CLAMP may allow it)
+    if entries == 0 {
         return KernelError::InvalidArgument.sysret();
     }
 
@@ -1504,33 +1499,27 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
 
-    // Round entries to power of 2
-    let sq_entries = if params.flags & IORING_SETUP_CLAMP != 0 {
-        core::cmp::min(round_up_pow2(entries), IORING_MAX_ENTRIES)
-    } else {
-        if !is_power_of_2(entries) {
-            return KernelError::InvalidArgument.sysret();
-        }
-        entries
-    };
+    // Sizes round up to a power of 2; oversize is EINVAL unless CLAMP
+    // (Linux io_uring/io_uring.c io_uring_fill_params)
+    let clamp = params.flags & IORING_SETUP_CLAMP != 0;
+    if entries > IORING_MAX_ENTRIES && !clamp {
+        return KernelError::InvalidArgument.sysret();
+    }
+    let sq_entries = round_up_pow2(core::cmp::min(entries, IORING_MAX_ENTRIES));
 
     // Determine CQ entries (default 2x SQ, or custom if IORING_SETUP_CQSIZE)
     let cq_entries = if params.flags & IORING_SETUP_CQSIZE != 0 {
         let cq = params.cq_entries;
-        if cq == 0 || cq > IORING_MAX_ENTRIES * 2 {
+        if cq == 0 || (cq > IORING_MAX_ENTRIES * 2 && !clamp) {
             return KernelError::InvalidArgument.sysret();
         }
-        if params.flags & IORING_SETUP_CLAMP != 0 {
-            core::cmp::min(round_up_pow2(cq), IORING_MAX_ENTRIES * 2)
-        } else {
-            if !is_power_of_2(cq) {
-                return KernelError::InvalidArgument.sysret();
-            }
-            cq
+        let cq = round_up_pow2(core::cmp::min(cq, IORING_MAX_ENTRIES * 2));
+        if cq < sq_entries {
+            return KernelError::InvalidArgument.sysret();
         }
+        cq
     } else {
-        // Default: CQ is 2x SQ size
-        core::cmp::min(sq_entries * 2, IORING_MAX_ENTRIES * 2)
+        sq_entries * 2
     };
 
     // Create io_uring instance
