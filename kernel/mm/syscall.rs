@@ -2319,13 +2319,8 @@ pub fn sys_mincore(addr: u64, length: u64, vec: u64) -> i64 {
     drop(mm_guard);
 
     // Copy result to user space
-    let vec_ptr = vec as *mut u8;
-    for (i, &byte) in result.iter().enumerate() {
-        unsafe {
-            // Safety: We're writing to user-space memory
-            // A more robust implementation would use proper Uaccess methods
-            core::ptr::write_volatile(vec_ptr.add(i), byte);
-        }
+    if crate::uaccess::copy_to_user::<crate::arch::Uaccess>(vec, &result).is_err() {
+        return KernelError::BadAddress.sysret();
     }
 
     0

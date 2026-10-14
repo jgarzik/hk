@@ -6,7 +6,7 @@
 use crate::arch::Uaccess;
 use crate::error::KernelError;
 use crate::numa::NUMA_TOPOLOGY;
-use crate::uaccess::{UaccessArch, get_user};
+use crate::uaccess::{UaccessArch, copy_to_user, get_user, put_user};
 
 // ============================================================================
 // Policy modes (MPOL_*)
@@ -170,10 +170,8 @@ pub fn sys_get_mempolicy(
             MPOL_LOCAL
         };
 
-        unsafe {
-            Uaccess::user_access_begin();
-            core::ptr::write(policy_ptr as *mut i32, policy);
-            Uaccess::user_access_end();
+        if put_user::<Uaccess, i32>(policy_ptr, policy).is_err() {
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -189,18 +187,13 @@ pub fn sys_get_mempolicy(
         // Get the online node mask from real topology
         let online_mask = NUMA_TOPOLOGY.lock().online_mask();
 
-        unsafe {
-            Uaccess::user_access_begin();
-
-            // Write first word with online nodes mask
-            core::ptr::write(nmask_ptr as *mut u64, online_mask);
-
-            // Clear remaining words if any (we only support up to 64 nodes)
-            for i in 1..(mask_bytes / 8) {
-                core::ptr::write((nmask_ptr as *mut u64).add(i as usize), 0u64);
-            }
-
-            Uaccess::user_access_end();
+        // First word holds the online nodes; remaining words are zero
+        // (we only support up to 64 nodes)
+        let mut words = alloc::vec![0u64; (mask_bytes / 8) as usize];
+        words[0] = online_mask;
+        let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        if copy_to_user::<Uaccess>(nmask_ptr, &bytes).is_err() {
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -250,11 +243,9 @@ pub fn sys_set_mempolicy(mode: i32, nmask_ptr: u64, maxnode: u64) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    let nodemask: u64 = unsafe {
-        Uaccess::user_access_begin();
-        let mask = core::ptr::read(nmask_ptr as *const u64);
-        Uaccess::user_access_end();
-        mask
+    let nodemask: u64 = match get_user::<Uaccess, u64>(nmask_ptr) {
+        Ok(m) => m,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Empty mask is invalid for most policies
@@ -340,11 +331,9 @@ pub fn sys_mbind(start: u64, len: u64, mode: u64, nmask_ptr: u64, maxnode: u64, 
         }
 
         // Read node mask
-        let nodemask: u64 = unsafe {
-            Uaccess::user_access_begin();
-            let mask = core::ptr::read(nmask_ptr as *const u64);
-            Uaccess::user_access_end();
-            mask
+        let nodemask: u64 = match get_user::<Uaccess, u64>(nmask_ptr) {
+            Ok(m) => m,
+            Err(_) => return KernelError::BadAddress.sysret(),
         };
 
         // Empty mask is invalid
@@ -414,11 +403,9 @@ pub fn sys_migrate_pages(pid: i64, maxnode: u64, old_nodes_ptr: u64, new_nodes_p
         if !Uaccess::access_ok(old_nodes_ptr, mask_bytes as usize) {
             return KernelError::BadAddress.sysret();
         }
-        let old_mask: u64 = unsafe {
-            Uaccess::user_access_begin();
-            let mask = core::ptr::read(old_nodes_ptr as *const u64);
-            Uaccess::user_access_end();
-            mask
+        let old_mask: u64 = match get_user::<Uaccess, u64>(old_nodes_ptr) {
+            Ok(m) => m,
+            Err(_) => return KernelError::BadAddress.sysret(),
         };
         // Validate old_nodes are online
         if old_mask != 0 && old_mask & !online_mask != 0 {
@@ -544,22 +531,18 @@ pub fn sys_move_pages(
     }
 
     // Write status for each page
-    unsafe {
-        Uaccess::user_access_begin();
-
-        for i in 0..nr_pages as usize {
-            let status: i32 = if nodes_ptr == 0 {
-                // Query mode: return current node (node 0 for now)
-                // Real implementation in Phase 5 will look up actual page node
-                0
-            } else {
-                // Move mode: nodes validated above (actual migration in Phase 5)
-                0
-            };
-            core::ptr::write((status_ptr as *mut i32).add(i), status);
+    for i in 0..nr_pages as usize {
+        let status: i32 = if nodes_ptr == 0 {
+            // Query mode: return current node (node 0 for now)
+            // Real implementation in Phase 5 will look up actual page node
+            0
+        } else {
+            // Move mode: nodes validated above (actual migration in Phase 5)
+            0
+        };
+        if put_user::<Uaccess, i32>(status_ptr + (i * 4) as u64, status).is_err() {
+            return KernelError::BadAddress.sysret();
         }
-
-        Uaccess::user_access_end();
     }
 
     0
