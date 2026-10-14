@@ -58,6 +58,7 @@ pub mod driver;
 pub mod ethernet;
 pub mod icmp;
 pub mod ipv4;
+pub mod proc;
 pub mod request_sock;
 pub mod route;
 pub mod skb;

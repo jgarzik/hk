@@ -1325,6 +1325,37 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
         ProcfsInodeData::new_file(gen_mounts),
     ))));
 
+    // Create /proc/net (directory) with /proc/net/dev; contents follow
+    // the reader's network namespace
+    let net_dir_inode = Arc::new(Inode::new(
+        sb.alloc_ino(),
+        InodeMode::directory(0o555),
+        0,
+        0,
+        0,
+        current_time(),
+        Arc::downgrade(&sb),
+        &PROCFS_INODE_OPS,
+    ));
+    let mut net_dir = ProcfsInodeData::new_dir();
+    let net_dev_inode = Arc::new(Inode::new(
+        sb.alloc_ino(),
+        InodeMode::regular(0o444),
+        0,
+        0,
+        0,
+        current_time(),
+        Arc::downgrade(&sb),
+        &PROCFS_INODE_OPS,
+    ));
+    net_dev_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+        ProcfsInodeData::new_file(crate::net::proc::proc_net_dev),
+    ))));
+    if let ProcfsInodeData::Directory { children } = &mut net_dir {
+        children.insert(String::from("dev"), net_dev_inode);
+    }
+    net_dir_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(net_dir))));
+
     // Add files to root directory
     {
         let private = root_inode.get_private().unwrap();
@@ -1337,6 +1368,7 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
         if let ProcfsInodeData::Directory { children } = &mut *data {
             children.insert(String::from("version"), version_inode);
             children.insert(String::from("mounts"), mounts_inode);
+            children.insert(String::from("net"), net_dir_inode);
         }
     }
 
