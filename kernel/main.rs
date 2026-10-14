@@ -1214,11 +1214,9 @@ fn panic(info: &PanicInfo) -> ! {
     }
 
     // Print panic message
-    if let Some(message) = info.message().as_str() {
-        printkln!("Message: {}", message);
-    } else {
-        printkln!("Message: <no message>");
-    }
+    // Formatted messages (panic!("... {:#x}", v)) have no static str:
+    // print through Display, or e.g. the faulting address is lost
+    printkln!("Message: {}", info.message());
 
     // Architecture-specific register dump and backtrace
     #[cfg(target_arch = "x86_64")]
