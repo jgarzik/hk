@@ -182,6 +182,7 @@ pub const SYS_MADVISE: u64 = 28;
 pub const SYS_SHMGET: u64 = 29;
 pub const SYS_SHMAT: u64 = 30;
 pub const SYS_SHMCTL: u64 = 31;
+pub const SYS_PAUSE: u64 = 34;
 pub const SYS_NANOSLEEP: u64 = 35;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_SOCKET: u64 = 41;
@@ -813,6 +814,12 @@ pub fn sys_setfsgid(gid: u32) -> i64 {
 }
 
 // --- Time ---
+
+/// pause() - sleep until a signal handler runs (always -EINTR)
+#[inline(always)]
+pub fn sys_pause() -> i64 {
+    unsafe { syscall0!(SYS_PAUSE) }
+}
 
 #[inline(always)]
 pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> i64 {

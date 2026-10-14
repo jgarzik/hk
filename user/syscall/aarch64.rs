@@ -592,6 +592,12 @@ pub fn sys_getdents64(fd: u64, dirp: *mut u8, count: u64) -> i64 {
     unsafe { syscall3!(SYS_GETDENTS64, fd, dirp, count) }
 }
 
+/// pause() - arm64 has no pause syscall; glibc uses ppoll(NULL, 0, NULL, NULL)
+#[inline(always)]
+pub fn sys_pause() -> i64 {
+    sys_ppoll(core::ptr::null_mut(), 0, core::ptr::null(), 0, 0)
+}
+
 /// nanosleep(req, rem)
 #[inline(always)]
 pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> i64 {
