@@ -72,7 +72,7 @@ Userspace builds automatically as part of `make check`/`make check-arm`:
 
 ```bash
 cd user && make             # x86-64 userspace
-cd user && make arm         # aarch64 userspace
+cd user && make ARCH=aarch64 # aarch64 userspace
 ```
 
 The userspace build creates:
@@ -106,8 +106,8 @@ make run-arm        # aarch64
 ./run-qemu.sh -g        # Enable GDB server on port 1234
 
 # aarch64
-./run-qemu-arm.sh       # Basic run
-./run-qemu-arm.sh -d    # Debug mode
+./run-qemu.sh --arch arm     # Basic run
+./run-qemu.sh --arch arm -d  # Debug mode
 ```
 
 ### QEMU Configuration
@@ -134,7 +134,7 @@ make check          # Build x86-64 + run boot tests
 make check-arm      # Build aarch64 + run boot tests
 ```
 
-Tests are defined in `user/tests/*.rs` and cover:
+Tests are defined in `user/boot_tester/tests/*.rs` and cover:
 - Process management (fork, exec, clone, signals)
 - Memory management (mmap, mlock, munmap)
 - File system operations
@@ -283,7 +283,7 @@ sudo apt install gcc-aarch64-linux-gnu
 Run with debug mode to see the error:
 ```bash
 ./run-qemu.sh -d        # x86-64
-./run-qemu-arm.sh -d    # aarch64
+./run-qemu.sh --arch arm -d  # aarch64
 ```
 
 Or enable GDB for step-by-step debugging:
