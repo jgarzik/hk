@@ -46,6 +46,17 @@ fn make_path<'a>(prefix: &[u8], suffix: &[u8], buf: &'a mut [u8; 128]) -> &'a [u
     &buf[..=i]
 }
 
+/// getdents64 resume/rewind/seekdir/unlink-walk on 40 entries
+fn test_getdents(prefix: &[u8], fs_name: &[u8]) {
+    let mut name = [0u8; 32];
+    let mut i = 0;
+    for &b in fs_name.iter().take_while(|&&b| b != 0).chain(b"_GETDENTS") {
+        name[i] = b;
+        i += 1;
+    }
+    super::dirents::check_dir(prefix, &name[..i], 40);
+}
+
 /// Print test marker in format: "{FS_NAME}_{TEST_NAME}:OK" or ":FAIL"
 fn print_marker(fs_name: &[u8], test_name: &[u8], success: bool) {
     print_cstr(fs_name);
@@ -69,6 +80,7 @@ pub fn run_normalized_tests(prefix: &[u8], fs_name: &[u8]) {
     println(b" ===");
 
     test_mkdir(prefix, fs_name);
+    test_getdents(prefix, fs_name);
     test_rmdir(prefix, fs_name);
     test_rmdir_nonempty(prefix, fs_name);
     test_create_write_read(prefix, fs_name);

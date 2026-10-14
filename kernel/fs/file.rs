@@ -97,6 +97,51 @@ pub struct DirEntry {
     pub name: Vec<u8>,
 }
 
+/// Directory iteration state (Linux struct dir_context): `pos` is where
+/// iteration starts and, after each accepted entry, the position just
+/// past it (that entry's d_off). File systems hand entries to `emit_at`
+/// (stable positions, increasing) or `emit` (the n-th entry of a fixed
+/// listing order is position n); both skip entries before `pos` and
+/// return false once the consumer is full.
+pub struct DirContext<'a> {
+    /// Current position (resume point)
+    pub pos: u64,
+    /// Position of the next `emit`
+    next: u64,
+    /// Consumer: entry and its d_off; false = no room, stop
+    actor: &'a mut dyn FnMut(&DirEntry, u64) -> bool,
+}
+
+impl<'a> DirContext<'a> {
+    /// Iterate from `pos`, feeding `actor`
+    pub fn new(pos: u64, actor: &'a mut dyn FnMut(&DirEntry, u64) -> bool) -> Self {
+        Self {
+            pos,
+            next: 0,
+            actor,
+        }
+    }
+
+    /// dir_emit of the entry at position `at`
+    pub fn emit_at(&mut self, at: u64, e: DirEntry) -> bool {
+        if at < self.pos {
+            return true;
+        }
+        if !(self.actor)(&e, at + 1) {
+            return false;
+        }
+        self.pos = at + 1;
+        true
+    }
+
+    /// dir_emit of the next entry of a fixed listing order
+    pub fn emit(&mut self, e: DirEntry) -> bool {
+        let at = self.next;
+        self.next += 1;
+        self.emit_at(at, e)
+    }
+}
+
 /// File operations trait - filesystem-specific behavior for open files
 pub trait FileOps: Send + Sync {
     /// Returns self as Any for downcasting to concrete types
@@ -165,13 +210,9 @@ pub trait FileOps: Send + Sync {
         Ok(new_pos)
     }
 
-    /// Read directory entries
-    fn readdir(
-        &self,
-        file: &File,
-        callback: &mut dyn FnMut(DirEntry) -> bool,
-    ) -> Result<(), KernelError> {
-        let _ = (file, callback);
+    /// Read directory entries from `ctx.pos` on (Linux iterate_shared)
+    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
+        let _ = (file, ctx);
         Err(KernelError::NotDirectory)
     }
 
@@ -512,11 +553,11 @@ impl File {
     }
 
     /// Read directory entries
-    pub fn readdir(&self, callback: &mut dyn FnMut(DirEntry) -> bool) -> Result<(), KernelError> {
+    pub fn readdir(&self, ctx: &mut DirContext) -> Result<(), KernelError> {
         if !self.is_dir() {
             return Err(KernelError::NotDirectory);
         }
-        self.f_op.readdir(self, callback)
+        self.f_op.readdir(self, ctx)
     }
 
     /// Poll for events

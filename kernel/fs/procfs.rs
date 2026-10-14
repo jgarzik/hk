@@ -24,7 +24,7 @@ use spin::RwLock;
 
 use super::KernelError;
 use super::dentry::Dentry;
-use super::file::{DirEntry, File, FileOps};
+use super::file::{DirContext, DirEntry, File, FileOps};
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::superblock::{FileSystemType, PROC_SUPER_MAGIC, StatFs, SuperBlock, SuperOps};
 use crate::task::Cred;
@@ -986,11 +986,7 @@ impl FileOps for ProcfsFileOps {
         Ok(n)
     }
 
-    fn readdir(
-        &self,
-        file: &File,
-        callback: &mut dyn FnMut(DirEntry) -> bool,
-    ) -> Result<(), KernelError> {
+    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
 
         if !inode.mode().is_dir() {
@@ -1007,7 +1003,7 @@ impl FileOps for ProcfsFileOps {
         let data = wrapper.0.read();
 
         // Emit "." and ".."
-        let should_continue = callback(DirEntry {
+        let should_continue = ctx.emit(DirEntry {
             ino: inode.ino,
             file_type: FileType::Directory,
             name: Vec::from(b"."),
@@ -1024,7 +1020,7 @@ impl FileOps for ProcfsFileOps {
             .map(|i| i.ino)
             .unwrap_or(inode.ino);
 
-        let should_continue = callback(DirEntry {
+        let should_continue = ctx.emit(DirEntry {
             ino: parent_ino,
             file_type: FileType::Directory,
             name: Vec::from(b".."),
@@ -1040,7 +1036,7 @@ impl FileOps for ProcfsFileOps {
                 for (name, child_inode) in children.iter() {
                     let file_type = child_inode.mode().file_type().unwrap_or(FileType::Regular);
 
-                    let should_continue = callback(DirEntry {
+                    let should_continue = ctx.emit(DirEntry {
                         ino: child_inode.ino,
                         file_type,
                         name: Vec::from(name.as_bytes()),
@@ -1051,26 +1047,34 @@ impl FileOps for ProcfsFileOps {
                     }
                 }
 
-                // If this is /proc root (has "version"), also emit PIDs
+                // /proc root (has "version"): "self", then the PIDs
                 if children.contains_key("version") {
-                    readdir_emit_pids(inode.ino, callback)?;
+                    let me = DirEntry {
+                        ino: pid_ino(0, 999),
+                        file_type: FileType::Symlink,
+                        name: Vec::from(b"self"),
+                    };
+                    if !ctx.emit(me) {
+                        return Ok(());
+                    }
+                    readdir_emit_pids(inode.ino, ctx)?;
                 }
             }
             ProcfsInodeData::PidDirectory { pid } => {
                 // Emit /proc/<pid>/* entries
-                readdir_emit_pid_entries(*pid, callback)?;
+                readdir_emit_pid_entries(*pid, ctx)?;
             }
             ProcfsInodeData::PidNsDirectory { pid } => {
                 // Emit /proc/<pid>/ns/* entries
-                readdir_emit_ns_entries(*pid, callback)?;
+                readdir_emit_ns_entries(*pid, ctx)?;
             }
             ProcfsInodeData::PidFdDirectory { pid } => {
                 // Emit /proc/<pid>/fd/* entries
-                readdir_emit_fd_entries(*pid, callback)?;
+                readdir_emit_fd_entries(*pid, ctx)?;
             }
             ProcfsInodeData::PidFdinfoDirectory { pid } => {
                 // Emit /proc/<pid>/fdinfo/* entries
-                readdir_emit_fdinfo_entries(*pid, callback)?;
+                readdir_emit_fdinfo_entries(*pid, ctx)?;
             }
             ProcfsInodeData::File { .. }
             | ProcfsInodeData::NamespaceFile { .. }
@@ -1087,34 +1091,35 @@ impl FileOps for ProcfsFileOps {
     }
 }
 
-/// Emit PID directory entries for /proc readdir
-fn readdir_emit_pids(
-    proc_ino: u64,
-    callback: &mut dyn FnMut(DirEntry) -> bool,
-) -> Result<(), KernelError> {
+/// First readdir position of the PID entries in /proc (Linux
+/// FIRST_PROCESS_ENTRY): the static entries sit below it
+const PID_POS: u64 = 256;
+
+/// Emit PID directory entries for /proc readdir; a PID's position is
+/// PID_POS + pid (Linux proc_pid_readdir), stable while others exit
+fn readdir_emit_pids(proc_ino: u64, ctx: &mut DirContext) -> Result<(), KernelError> {
     use crate::task::percpu::TASK_TABLE;
 
-    // Collect PIDs first to release lock quickly
-    let pids: Vec<Pid> = {
+    // Collect PIDs first to release lock quickly (sorted, unique)
+    let pids: alloc::collections::BTreeSet<Pid> = {
         let table = TASK_TABLE.lock();
-        table.tasks.iter().map(|t| t.pid).collect()
+        table
+            .tasks
+            .iter()
+            .map(|t| t.pid)
+            .filter(|&p| p != 0)
+            .collect()
     };
 
-    // Emit entries for each unique PID
-    let mut seen_pids = alloc::collections::BTreeSet::new();
     for pid in pids {
-        if seen_pids.insert(pid) {
-            // Convert PID to string
-            let name = alloc::format!("{}", pid);
-            let should_continue = callback(DirEntry {
-                ino: pid_ino(pid, 0),
-                file_type: FileType::Directory,
-                name: Vec::from(name.as_bytes()),
-            });
-
-            if !should_continue {
-                break;
-            }
+        let name = alloc::format!("{}", pid);
+        let e = DirEntry {
+            ino: pid_ino(pid, 0),
+            file_type: FileType::Directory,
+            name: Vec::from(name.as_bytes()),
+        };
+        if !ctx.emit_at(PID_POS + pid, e) {
+            break;
         }
     }
 
@@ -1123,12 +1128,9 @@ fn readdir_emit_pids(
 }
 
 /// Emit entries for /proc/<pid>/ directory
-fn readdir_emit_pid_entries(
-    pid: Pid,
-    callback: &mut dyn FnMut(DirEntry) -> bool,
-) -> Result<(), KernelError> {
+fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), KernelError> {
     // Emit "ns" subdirectory
-    let should_continue = callback(DirEntry {
+    let should_continue = ctx.emit(DirEntry {
         ino: pid_ino(pid, 1),
         file_type: FileType::Directory,
         name: Vec::from(b"ns"),
@@ -1139,7 +1141,7 @@ fn readdir_emit_pid_entries(
     }
 
     // Emit "fd" subdirectory
-    let should_continue = callback(DirEntry {
+    let should_continue = ctx.emit(DirEntry {
         ino: pid_ino(pid, 100),
         file_type: FileType::Directory,
         name: Vec::from(b"fd"),
@@ -1150,7 +1152,7 @@ fn readdir_emit_pid_entries(
     }
 
     // Emit "fdinfo" subdirectory
-    let should_continue = callback(DirEntry {
+    let should_continue = ctx.emit(DirEntry {
         ino: pid_ino(pid, 101),
         file_type: FileType::Directory,
         name: Vec::from(b"fdinfo"),
@@ -1161,7 +1163,7 @@ fn readdir_emit_pid_entries(
     }
 
     // Emit "cgroup" file
-    let should_continue = callback(DirEntry {
+    let should_continue = ctx.emit(DirEntry {
         ino: pid_ino(pid, 102),
         file_type: FileType::Regular,
         name: Vec::from(b"cgroup"),
@@ -1177,13 +1179,10 @@ fn readdir_emit_pid_entries(
 }
 
 /// Emit entries for /proc/<pid>/ns/ directory
-fn readdir_emit_ns_entries(
-    pid: Pid,
-    callback: &mut dyn FnMut(DirEntry) -> bool,
-) -> Result<(), KernelError> {
+fn readdir_emit_ns_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), KernelError> {
     // Emit all namespace files
     for (idx, ns_type) in NamespaceType::all().iter().enumerate() {
-        let should_continue = callback(DirEntry {
+        let should_continue = ctx.emit(DirEntry {
             ino: pid_ino(pid, 2 + idx as u64),
             file_type: FileType::Regular, // Namespace files appear as regular files
             name: Vec::from(ns_type.as_str().as_bytes()),
@@ -1198,10 +1197,7 @@ fn readdir_emit_ns_entries(
 }
 
 /// Emit entries for /proc/<pid>/fd/ directory
-fn readdir_emit_fd_entries(
-    pid: Pid,
-    callback: &mut dyn FnMut(DirEntry) -> bool,
-) -> Result<(), KernelError> {
+fn readdir_emit_fd_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), KernelError> {
     // Get the task's TID
     let tid = match get_tid_for_pid(pid) {
         Some(t) => t,
@@ -1221,11 +1217,15 @@ fn readdir_emit_fd_entries(
     // Emit all FD symlinks
     for fd in fds {
         let name = alloc::format!("{}", fd);
-        let should_continue = callback(DirEntry {
-            ino: pid_ino(pid, 200 + fd as u64),
-            file_type: FileType::Symlink,
-            name: Vec::from(name.as_bytes()),
-        });
+        // Position fd + 2, after "." and ".." (Linux proc_readfd_common)
+        let should_continue = ctx.emit_at(
+            fd as u64 + 2,
+            DirEntry {
+                ino: pid_ino(pid, 200 + fd as u64),
+                file_type: FileType::Symlink,
+                name: Vec::from(name.as_bytes()),
+            },
+        );
 
         if !should_continue {
             break;
@@ -1236,10 +1236,7 @@ fn readdir_emit_fd_entries(
 }
 
 /// Emit entries for /proc/<pid>/fdinfo/ directory
-fn readdir_emit_fdinfo_entries(
-    pid: Pid,
-    callback: &mut dyn FnMut(DirEntry) -> bool,
-) -> Result<(), KernelError> {
+fn readdir_emit_fdinfo_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), KernelError> {
     // Get the task's TID
     let tid = match get_tid_for_pid(pid) {
         Some(t) => t,
@@ -1259,11 +1256,15 @@ fn readdir_emit_fdinfo_entries(
     // Emit all fdinfo files
     for fd in fds {
         let name = alloc::format!("{}", fd);
-        let should_continue = callback(DirEntry {
-            ino: pid_ino(pid, 500 + fd as u64),
-            file_type: FileType::Regular,
-            name: Vec::from(name.as_bytes()),
-        });
+        // Position fd + 2, after "." and ".." (Linux proc_readfd_common)
+        let should_continue = ctx.emit_at(
+            fd as u64 + 2,
+            DirEntry {
+                ino: pid_ino(pid, 500 + fd as u64),
+                file_type: FileType::Regular,
+                name: Vec::from(name.as_bytes()),
+            },
+        );
 
         if !should_continue {
             break;

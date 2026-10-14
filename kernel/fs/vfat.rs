@@ -25,7 +25,7 @@ use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
 use super::dentry::Dentry;
 use super::file::{
-    DirEntry as VfsDirEntry, File, FileOps, generic_file_pread, generic_file_pwrite,
+    DirContext, DirEntry as VfsDirEntry, File, FileOps, generic_file_pread, generic_file_pwrite,
     generic_file_read, generic_file_write,
 };
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
@@ -837,6 +837,9 @@ pub struct ParsedDirEntry {
     pub start_cluster: u32,
     /// File size
     pub file_size: u32,
+    /// Index of the short entry's 32-byte slot in the directory (its
+    /// stable readdir position, like Linux fat_readdir's cpos)
+    pub slot: u64,
 }
 
 impl ParsedDirEntry {
@@ -933,7 +936,7 @@ fn read_directory_entries(
     let mut lfn_parts: Vec<(u8, Vec<char>)> = Vec::new();
     let mut lfn_checksum_expected: Option<u8> = None;
 
-    for &cluster in &chain {
+    for (ci, &cluster) in chain.iter().enumerate() {
         let cluster_offset = cluster_to_offset(sb_data, cluster);
         let entries_per_cluster = sb_data.cluster_size as usize / 32;
 
@@ -1028,6 +1031,7 @@ fn read_directory_entries(
                     attr,
                     start_cluster,
                     file_size: dirent.file_size,
+                    slot: (ci * entries_per_cluster + i) as u64,
                 });
             }
         }
@@ -2595,11 +2599,7 @@ impl FileOps for VfatFileOps {
 
     // llseek: use default implementation from FileOps trait
 
-    fn readdir(
-        &self,
-        file: &File,
-        callback: &mut dyn FnMut(VfsDirEntry) -> bool,
-    ) -> Result<(), KernelError> {
+    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let sb = inode.superblock().ok_or(KernelError::Io)?;
         let sb_data = get_sb_data(&sb)?;
@@ -2609,25 +2609,17 @@ impl FileOps for VfatFileOps {
             return Err(KernelError::NotDirectory);
         }
 
-        // Emit . and ..
-        if !callback(VfsDirEntry {
-            ino: inode.ino,
+        // "." and ".." at positions 0 and 1, slot n at n + 2
+        let dot = |name: &[u8], ino| VfsDirEntry {
+            ino,
             file_type: FileType::Directory,
-            name: b".".to_vec(),
-        }) {
-            return Ok(());
-        }
-        if !callback(VfsDirEntry {
-            ino: 1,
-            file_type: FileType::Directory,
-            name: b"..".to_vec(),
-        }) {
+            name: name.to_vec(),
+        };
+        if !ctx.emit_at(0, dot(b".", inode.ino)) || !ctx.emit_at(1, dot(b"..", 1)) {
             return Ok(());
         }
 
-        // Read directory entries
         let entries = read_directory_entries(&sb_data, inode_data.start_cluster)?;
-
         for entry in entries {
             let file_type = if entry.is_dir() {
                 FileType::Directory
@@ -2642,15 +2634,15 @@ impl FileOps for VfatFileOps {
                 sb.alloc_ino()
             };
 
-            if !callback(VfsDirEntry {
+            let e = VfsDirEntry {
                 ino,
                 file_type,
                 name: entry.name.as_bytes().to_vec(),
-            }) {
+            };
+            if !ctx.emit_at(entry.slot + 2, e) {
                 break;
             }
         }
-
         Ok(())
     }
 }

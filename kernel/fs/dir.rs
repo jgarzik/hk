@@ -2,13 +2,11 @@
 
 use crate::arch::Uaccess;
 use crate::fs::path::{create_entry, delete_entry};
-use crate::fs::{FileType, InodeMode, KernelError, dac};
+use crate::fs::{DirContext, DirEntry, FileType, InodeMode, KernelError, dac};
 use crate::task::CAP_MKNOD;
 use crate::uaccess::{UaccessArch, copy_to_user, strncpy_from_user};
 
-use super::syscall::{
-    AT_FDCWD, MAX_RW_COUNT, PATH_MAX, SMALL_BUF_SIZE, current_fd_table, lookup_parent_at,
-};
+use super::syscall::{AT_FDCWD, MAX_RW_COUNT, PATH_MAX, current_fd_table, lookup_parent_at};
 
 /// Linux dirent64 structure for getdents64
 #[repr(C, packed)]
@@ -29,95 +27,85 @@ const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
 const DT_SOCK: u8 = 12;
 
-/// sys_getdents64 - get directory entries
-///
-/// Returns number of bytes read into buffer, 0 on end of directory, negative errno on error.
-pub fn sys_getdents64(fd: i32, dirp: u64, count: u64) -> i64 {
-    // Limit count to prevent allocation failure
-    let count = core::cmp::min(count as usize, MAX_RW_COUNT);
+/// d_type of a file type
+fn dt(t: FileType) -> u8 {
+    match t {
+        FileType::Regular => DT_REG,
+        FileType::Directory => DT_DIR,
+        FileType::Symlink => DT_LNK,
+        FileType::CharDev => DT_CHR,
+        FileType::BlockDev => DT_BLK,
+        FileType::Fifo => DT_FIFO,
+        FileType::Socket => DT_SOCK,
+    }
+}
 
-    // Validate user buffer address
+/// Header size of a linux_dirent64 (name follows)
+const DIRENT_HDR: usize = core::mem::size_of::<LinuxDirent64>();
+
+/// Build one linux_dirent64 record in `rec`; returns its (8-aligned)
+/// length
+fn fill_dirent(rec: &mut [u8; DIRENT_HDR + 256 + 8], e: &DirEntry, d_off: u64) -> usize {
+    let name_len = e.name.len().min(255);
+    let reclen = (DIRENT_HDR + name_len + 1 + 7) & !7;
+    rec[..reclen].fill(0);
+    let hdr = LinuxDirent64 {
+        d_ino: e.ino,
+        d_off: d_off as i64,
+        d_reclen: reclen as u16,
+        d_type: dt(e.file_type),
+    };
+    // SAFETY: LinuxDirent64 is packed plain data; `rec` holds DIRENT_HDR bytes
+    unsafe { core::ptr::write_unaligned(rec.as_mut_ptr() as *mut LinuxDirent64, hdr) };
+    rec[DIRENT_HDR..DIRENT_HDR + name_len].copy_from_slice(&e.name[..name_len]);
+    reclen
+}
+
+/// sys_getdents64 - get directory entries (Linux getdents64 +
+/// iterate_dir): resumes at the file position, which ends up just past
+/// the last entry returned (the d_off cookie); 0 at the end. EINVAL if
+/// `count` cannot hold the next entry.
+pub fn sys_getdents64(fd: i32, dirp: u64, count: u64) -> i64 {
+    let count = core::cmp::min(count as usize, MAX_RW_COUNT);
     if !Uaccess::access_ok(dirp, count) {
         return KernelError::BadAddress.sysret();
     }
-
-    // Get file from fd table
     let file = match current_fd_table().lock().get(fd) {
         Some(f) => f,
         None => return KernelError::BadFd.sysret(),
     };
-
     if !file.is_dir() {
         return KernelError::NotDirectory.sysret();
     }
 
-    // Use stack buffer for small directory listings
-    let mut stack_buf = [0u8; SMALL_BUF_SIZE];
-    let kernel_buf: &mut [u8] = if count <= SMALL_BUF_SIZE {
-        &mut stack_buf[..count]
-    } else {
-        // For large buffers, just use the small stack buffer
-        // Directory listings rarely need more than 4KB
-        &mut stack_buf[..]
+    let mut used = 0usize;
+    let mut err = None;
+    let mut rec = [0u8; DIRENT_HDR + 256 + 8];
+    let mut actor = |e: &DirEntry, d_off: u64| {
+        let len = fill_dirent(&mut rec, e, d_off);
+        if used + len > count {
+            err = Some(KernelError::InvalidArgument);
+            return false;
+        }
+        if copy_to_user::<Uaccess>(dirp + used as u64, &rec[..len]).is_err() {
+            err = Some(KernelError::BadAddress);
+            return false;
+        }
+        used += len;
+        true
     };
-    let mut offset = 0usize;
-    let mut dir_offset = 0i64;
+    let mut ctx = DirContext::new(file.get_pos(), &mut actor);
+    let r = file.readdir(&mut ctx);
+    let pos = ctx.pos;
+    file.set_pos(pos);
 
-    let result = file.readdir(&mut |entry| {
-        // Calculate record length (header + name + null + alignment)
-        let name_len = entry.name.len();
-        let reclen = core::mem::size_of::<LinuxDirent64>() + name_len + 1;
-        let aligned_reclen = (reclen + 7) & !7; // 8-byte alignment
-
-        // Check if we have space
-        if offset + aligned_reclen > kernel_buf.len() {
-            return false; // Stop iteration
-        }
-
-        // Determine d_type
-        let d_type = match entry.file_type {
-            FileType::Regular => DT_REG,
-            FileType::Directory => DT_DIR,
-            FileType::Symlink => DT_LNK,
-            FileType::CharDev => DT_CHR,
-            FileType::BlockDev => DT_BLK,
-            FileType::Fifo => DT_FIFO,
-            FileType::Socket => DT_SOCK,
-        };
-
-        dir_offset += 1;
-
-        // Write dirent64 structure to kernel buffer
-        unsafe {
-            let dirent = &mut *(kernel_buf.as_mut_ptr().add(offset) as *mut LinuxDirent64);
-            dirent.d_ino = entry.ino;
-            dirent.d_off = dir_offset;
-            dirent.d_reclen = aligned_reclen as u16;
-            dirent.d_type = d_type;
-
-            // Copy name after the header
-            let name_ptr = kernel_buf
-                .as_mut_ptr()
-                .add(offset + core::mem::size_of::<LinuxDirent64>());
-            core::ptr::copy_nonoverlapping(entry.name.as_ptr(), name_ptr, name_len);
-            // Null terminate
-            *name_ptr.add(name_len) = 0;
-        }
-
-        offset += aligned_reclen;
-        true // Continue iteration
-    });
-
-    match result {
-        Ok(()) => {
-            // Copy from kernel buffer to user space
-            if offset > 0 && copy_to_user::<Uaccess>(dirp, &kernel_buf[..offset]).is_err() {
-                return KernelError::BadAddress.sysret();
-            }
-            offset as i64
-        }
-        Err(KernelError::NotDirectory) => KernelError::NotDirectory.sysret(),
-        Err(_) => KernelError::InvalidArgument.sysret(),
+    // Entries already copied win over a later error (Linux)
+    if used > 0 {
+        return used as i64;
+    }
+    match (r, err) {
+        (Err(e), _) | (Ok(()), Some(e)) => e.sysret(),
+        (Ok(()), None) => 0,
     }
 }
 
