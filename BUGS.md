@@ -44,6 +44,17 @@ no state machine, every unresolved packet sends a request and entries
 never expire (P5); no IP fragmentation/reassembly (P5). The static
 10.0.2.15/24 configuration remains until netlink (P3).
 
+## Rare arm64 kernel instruction abort in the fault-signal tests
+
+**Location**: unknown (CPU 0, right after `FAULT_SEGV_ACCERR`, i.e. while
+`FAULT_SIGILL` runs `udf` in user mode)
+
+Seen once in ~100 `make check-arm` runs (QEMU neoverse-n1 with PAN, -smp
+4): "KERNEL PANIC ... exceptions.rs:95" (kernel instruction abort). The
+panic handler then dropped formatted messages, so ELR/FAR were lost; it
+prints them now. Not reproduced in 90 further runs (sequential and 8 in
+parallel). Next occurrence: capture the Message line.
+
 ## Partial munmap of an anonymous mapping drops the rest of it
 
 mmap(2 pages) then munmap(second page): mincore on the still-mapped
