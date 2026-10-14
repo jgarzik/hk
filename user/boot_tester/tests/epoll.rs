@@ -9,7 +9,7 @@
 //! - Test epoll_wait timeout behavior
 //! - Test EPOLLONESHOT mode
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{host_mode, print, println, print_num, skip};
 use hk_syscall::{
     sys_close, sys_write, sys_pipe2, sys_eventfd2,
     sys_epoll_create, sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait, sys_epoll_pwait2,
@@ -26,6 +26,7 @@ pub fn run_tests() {
     test_epoll_wait_pipe();
     test_epoll_wait_eventfd();
     test_epoll_wait_multi_data64();
+    test_epoll_event_pad_zero();
     test_epoll_timeout();
     test_epoll_modify();
     test_epoll_oneshot();
@@ -268,6 +269,42 @@ fn test_epoll_wait_multi_data64() {
         print_num(d0 as i64);
         print(b" data1=");
         print_num(d1 as i64);
+        println(b"");
+    }
+}
+
+/// Test: kernel zeroes epoll_event padding (bytes 4..8 on arm64) instead of
+/// leaking kernel memory. Linux never writes the padding (ep_send_events
+/// stores events/data separately), so the check is hk-only.
+fn test_epoll_event_pad_zero() {
+    let size = core::mem::size_of::<EpollEvent>();
+    if size == 12 {
+        println(b"EPOLL_EVENT_PAD_ZERO:OK"); // packed (x86_64): no padding
+        return;
+    }
+    if host_mode() {
+        skip(b"EPOLL_EVENT_PAD_ZERO", b"Linux leaves user padding untouched");
+        return;
+    }
+    let epfd = sys_epoll_create1(0);
+    let efd = sys_eventfd2(1, 0);
+    if epfd < 0 || efd < 0 {
+        println(b"EPOLL_EVENT_PAD_ZERO:FAIL: setup failed");
+        return;
+    }
+    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, efd as i32, &EpollEvent::new(EPOLLIN, 7));
+    let mut buf = [0xAAAA_AAAA_AAAA_AAAAu64; 8];
+    let ret = sys_epoll_wait(epfd as i32, buf.as_mut_ptr() as *mut EpollEvent, 4, 0);
+    sys_close(epfd as u64);
+    sys_close(efd as u64);
+    let pad = (buf[0] >> 32) as u32;
+    if ret == 1 && pad == 0 {
+        println(b"EPOLL_EVENT_PAD_ZERO:OK");
+    } else {
+        print(b"EPOLL_EVENT_PAD_ZERO:FAIL: ret=");
+        print_num(ret);
+        print(b" pad=");
+        print_num(pad as i64);
         println(b"");
     }
 }

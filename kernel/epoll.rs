@@ -275,10 +275,7 @@ impl Eventpoll {
 
                         // Add to result
                         if collected < max_events {
-                            events[collected] = EpollEvent {
-                                events: masked,
-                                data: item.event.data,
-                            };
+                            events[collected] = EpollEvent::new(masked, item.event.data);
                             collected += 1;
 
                             // Handle EPOLLONESHOT

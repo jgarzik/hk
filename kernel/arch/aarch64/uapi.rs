@@ -42,6 +42,19 @@ pub const O_NOFOLLOW: u32 = 0o100000;
 pub struct EpollEvent {
     /// Event mask (EPOLLIN, EPOLLOUT, etc.)
     pub events: u32,
+    /// Explicit padding: always zero so no kernel bytes leak to userspace
+    pub __pad: u32,
     /// User data (passed back unchanged)
     pub data: u64,
+}
+
+impl EpollEvent {
+    /// Build an event with zeroed padding
+    pub const fn new(events: u32, data: u64) -> Self {
+        Self {
+            events,
+            __pad: 0,
+            data,
+        }
+    }
 }

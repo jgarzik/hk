@@ -42,3 +42,10 @@ pub struct EpollEvent {
     /// User data (passed back unchanged)
     pub data: u64,
 }
+
+impl EpollEvent {
+    /// Build an event
+    pub const fn new(events: u32, data: u64) -> Self {
+        Self { events, data }
+    }
+}
