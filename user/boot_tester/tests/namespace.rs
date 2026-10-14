@@ -137,111 +137,73 @@ fn test_unshare_newnet() {
 
 /// Test: unshare(CLONE_NEWPID) creates new PID namespace
 fn test_unshare_newpid() {
-    // On aarch64, there's a kernel data abort when forking after namespace tests
-    // For now, just verify the syscall returns success without a child process
-    #[cfg(target_arch = "aarch64")]
-    {
-        // Simplified test for aarch64: just call unshare without fork
-        let ret = sys_unshare(CLONE_NEWPID);
-        if ret == 0 {
-            println(b"UNSHARE_NEWPID:OK");
-        } else {
-            print(b"UNSHARE_NEWPID:FAIL ret=");
-            print_num(ret);
-            println(b"");
-        }
+    let pid = sys_fork();
+    if pid < 0 {
+        print(b"UNSHARE_NEWPID:FAIL fork failed ");
+        print_num(pid);
+        println(b"");
         return;
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let pid = sys_fork();
-        if pid < 0 {
-            print(b"UNSHARE_NEWPID:FAIL fork failed ");
-            print_num(pid);
-            println(b"");
-            return;
-        }
-
-        if pid == 0 {
-            // Child: just call unshare(CLONE_NEWPID) and exit
-            // This tests that the syscall doesn't crash
-            let ret = sys_unshare(CLONE_NEWPID);
-            if ret == 0 {
-                sys_exit(0);
-            } else {
-                sys_exit(1);
-            }
+    if pid == 0 {
+        // Child: just call unshare(CLONE_NEWPID) and exit
+        // This tests that the syscall doesn't crash
+        let ret = sys_unshare(CLONE_NEWPID);
+        if ret == 0 {
+            sys_exit(0);
         } else {
-            // Parent: wait for child
-            let mut wstatus: i32 = 0;
-            sys_wait4(pid, &mut wstatus, 0, 0);
+            sys_exit(1);
+        }
+    } else {
+        // Parent: wait for child
+        let mut wstatus: i32 = 0;
+        sys_wait4(pid, &mut wstatus, 0, 0);
 
-            let exit_status = (wstatus >> 8) & 0xff;
-            if exit_status == 0 {
-                println(b"UNSHARE_NEWPID:OK");
-            } else {
-                print(b"UNSHARE_NEWPID:FAIL exit_status=");
-                print_num(exit_status as i64);
-                println(b"");
-            }
+        let exit_status = (wstatus >> 8) & 0xff;
+        if exit_status == 0 {
+            println(b"UNSHARE_NEWPID:OK");
+        } else {
+            print(b"UNSHARE_NEWPID:FAIL exit_status=");
+            print_num(exit_status as i64);
+            println(b"");
         }
     }
 }
 
 /// Test: unshare(CLONE_NEWUSER) creates new user namespace
 fn test_unshare_newuser() {
-    // On aarch64, there's a kernel data abort when forking after namespace tests
-    // For now, just verify the syscall returns success without a child process
-    #[cfg(target_arch = "aarch64")]
-    {
-        // Simplified test for aarch64: just call unshare without fork
-        let ret = sys_unshare(CLONE_NEWUSER);
-        if ret == 0 {
-            println(b"UNSHARE_NEWUSER:OK");
-        } else {
-            print(b"UNSHARE_NEWUSER:FAIL ret=");
-            print_num(ret);
-            println(b"");
-        }
+    let pid = sys_fork();
+    if pid < 0 {
+        print(b"UNSHARE_NEWUSER:FAIL fork failed ");
+        print_num(pid);
+        println(b"");
         return;
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let pid = sys_fork();
-        if pid < 0 {
-            print(b"UNSHARE_NEWUSER:FAIL fork failed ");
-            print_num(pid);
+    if pid == 0 {
+        // Child: unshare user namespace
+        let ret = sys_unshare(CLONE_NEWUSER);
+        if ret != 0 {
+            print(b"UNSHARE_NEWUSER child: unshare failed ");
+            print_num(ret);
             println(b"");
-            return;
+            sys_exit(1);
         }
 
-        if pid == 0 {
-            // Child: unshare user namespace
-            let ret = sys_unshare(CLONE_NEWUSER);
-            if ret != 0 {
-                print(b"UNSHARE_NEWUSER child: unshare failed ");
-                print_num(ret);
-                println(b"");
-                sys_exit(1);
-            }
+        // Success - we created a new user namespace
+        sys_exit(0);
+    } else {
+        // Parent: wait for child
+        let mut wstatus: i32 = 0;
+        sys_wait4(pid, &mut wstatus, 0, 0);
 
-            // Success - we created a new user namespace
-            sys_exit(0);
+        let exit_status = (wstatus >> 8) & 0xff;
+        if exit_status == 0 {
+            println(b"UNSHARE_NEWUSER:OK");
         } else {
-            // Parent: wait for child
-            let mut wstatus: i32 = 0;
-            sys_wait4(pid, &mut wstatus, 0, 0);
-
-            let exit_status = (wstatus >> 8) & 0xff;
-            if exit_status == 0 {
-                println(b"UNSHARE_NEWUSER:OK");
-            } else {
-                print(b"UNSHARE_NEWUSER:FAIL exit_status=");
-                print_num(exit_status as i64);
-                println(b"");
-            }
+            print(b"UNSHARE_NEWUSER:FAIL exit_status=");
+            print_num(exit_status as i64);
+            println(b"");
         }
     }
 }
@@ -369,54 +331,35 @@ fn test_setns_uts() {
 
 /// Test: unshare(CLONE_NEWNS) creates new mount namespace
 fn test_unshare_newns() {
-    // On aarch64, there's a kernel data abort when forking after namespace tests
-    // For now, just verify the syscall returns success without a child process
-    #[cfg(target_arch = "aarch64")]
-    {
-        // Simplified test for aarch64: just call unshare without fork
-        let ret = sys_unshare(CLONE_NEWNS);
-        if ret == 0 {
-            println(b"UNSHARE_NEWNS:OK");
-        } else {
-            print(b"UNSHARE_NEWNS:FAIL ret=");
-            print_num(ret);
-            println(b"");
-        }
+    let pid = sys_fork();
+    if pid < 0 {
+        print(b"UNSHARE_NEWNS:FAIL fork failed ");
+        print_num(pid);
+        println(b"");
         return;
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let pid = sys_fork();
-        if pid < 0 {
-            print(b"UNSHARE_NEWNS:FAIL fork failed ");
-            print_num(pid);
-            println(b"");
-            return;
+    if pid == 0 {
+        // Child: unshare mount namespace
+        let ret = sys_unshare(CLONE_NEWNS);
+        if ret != 0 {
+            sys_exit(1);
         }
 
-        if pid == 0 {
-            // Child: unshare mount namespace
-            let ret = sys_unshare(CLONE_NEWNS);
-            if ret != 0 {
-                sys_exit(1);
-            }
+        // Success - we created a new mount namespace with cloned mount tree
+        sys_exit(0);
+    } else {
+        // Parent: wait for child
+        let mut wstatus: i32 = 0;
+        sys_wait4(pid, &mut wstatus, 0, 0);
 
-            // Success - we created a new mount namespace with cloned mount tree
-            sys_exit(0);
+        let exit_status = (wstatus >> 8) & 0xff;
+        if exit_status == 0 {
+            println(b"UNSHARE_NEWNS:OK");
         } else {
-            // Parent: wait for child
-            let mut wstatus: i32 = 0;
-            sys_wait4(pid, &mut wstatus, 0, 0);
-
-            let exit_status = (wstatus >> 8) & 0xff;
-            if exit_status == 0 {
-                println(b"UNSHARE_NEWNS:OK");
-            } else {
-                print(b"UNSHARE_NEWNS:FAIL exit_status=");
-                print_num(exit_status as i64);
-                println(b"");
-            }
+            print(b"UNSHARE_NEWNS:FAIL exit_status=");
+            print_num(exit_status as i64);
+            println(b"");
         }
     }
 }
