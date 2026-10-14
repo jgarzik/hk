@@ -206,9 +206,13 @@ pub struct Ipc64Perm {
     pub __pad1: [u8; 2], // Padding for mode_t if 16-bit
     pub seq: u16,
     pub __pad2: u16,
+    /// Explicit padding before __unused1 (always zero; implicit in Linux)
+    pub __pad3: u32,
     pub __unused1: u64,
     pub __unused2: u64,
 }
+
+const _: () = assert!(core::mem::size_of::<Ipc64Perm>() == 48);
 
 /// Shared memory segment descriptor (64-bit version)
 #[repr(C)]

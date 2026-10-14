@@ -181,6 +181,7 @@ impl KernIpcPerm {
         out.seq = inner.seq as u16;
         out.__pad1 = [0; 2];
         out.__pad2 = 0;
+        out.__pad3 = 0;
         out.__unused1 = 0;
         out.__unused2 = 0;
     }

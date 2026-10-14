@@ -136,6 +136,8 @@ pub struct GfxVersion {
     pub version_major: i32,
     pub version_minor: i32,
     pub version_patchlevel: i32,
+    /// Explicit padding (always zero; implicit in Linux drm_version)
+    pub _pad0: u32,
     pub name_len: u64,
     pub name: u64, // pointer
     pub date_len: u64,
@@ -143,6 +145,8 @@ pub struct GfxVersion {
     pub desc_len: u64,
     pub desc: u64, // pointer
 }
+
+const _: () = assert!(core::mem::size_of::<GfxVersion>() == 64);
 
 /// DRM get capability structure
 #[repr(C)]
@@ -349,6 +353,7 @@ fn handle_version(driver: &dyn GfxDriver, arg: u64) -> Result<i64, GfxError> {
     ver.version_major = major as i32;
     ver.version_minor = minor as i32;
     ver.version_patchlevel = patch as i32;
+    ver._pad0 = 0;
 
     // Copy name if buffer provided
     let name = driver.name();

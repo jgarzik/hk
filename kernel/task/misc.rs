@@ -18,7 +18,7 @@ use super::Pid;
 /// Linux sysinfo structure (matches Linux kernel struct sysinfo layout)
 ///
 /// Used by the sysinfo(2) syscall to return system-wide statistics.
-/// The compiler automatically adds padding for alignment with #[repr(C)].
+/// All padding is explicit so no uninitialized bytes reach userspace.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SysInfo {
@@ -42,14 +42,17 @@ pub struct SysInfo {
     pub procs: u16,
     /// Padding for alignment
     pub pad: u16,
-    // Compiler adds 4 bytes of implicit padding here for u64 alignment
+    /// Explicit padding for u64 alignment (always zero)
+    pub _pad2: u32,
     /// Total high memory size (0 for 64-bit)
     pub totalhigh: u64,
     /// Available high memory size (0 for 64-bit)
     pub freehigh: u64,
     /// Memory unit size in bytes (1 = bytes)
     pub mem_unit: u32,
-    // Compiler adds 4 bytes of implicit padding here for struct alignment
+    /// Explicit tail padding (Linux `_f[20-2*sizeof(long)-sizeof(int)]` is
+    /// empty on 64-bit; this covers the struct alignment tail). Always zero.
+    pub _f: u32,
 }
 
 // Compile-time assertion that SysInfo is 112 bytes (matches Linux and userspace)
@@ -68,9 +71,11 @@ impl Default for SysInfo {
             freeswap: 0,
             procs: 0,
             pad: 0,
+            _pad2: 0,
             totalhigh: 0,
             freehigh: 0,
             mem_unit: 1,
+            _f: 0,
         }
     }
 }
@@ -182,9 +187,11 @@ pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
         freeswap: 0,
         procs,
         pad: 0,
+        _pad2: 0,
         totalhigh: 0,
         freehigh: 0,
         mem_unit: 1, // All sizes in bytes
+        _f: 0,
     };
 
     // Copy to user space
