@@ -21,6 +21,8 @@ pub mod namespace;
 pub mod sockets;
 pub mod sk;
 pub mod sockcore;
+pub mod udp;
+pub mod sockopts;
 pub mod futex;
 pub mod timerfd;
 pub mod posix_timer;
@@ -79,6 +81,8 @@ pub fn run_all_tests() {
     namespace::run_tests();
     sockets::run_tests();
     sockcore::run_tests();
+    udp::run_tests();
+    sockopts::run_tests();
     futex::run_tests();
     timerfd::run_tests();
     posix_timer::run_tests();

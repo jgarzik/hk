@@ -314,8 +314,7 @@ impl UdpSock {
 }
 
 /// Per-message IP parameters from sendmsg control data (Linux
-/// ip_cmsg_send: IP_PKTINFO, IP_TTL, IP_TOS; other SOL_SOCKET messages
-/// are EINVAL on IPv4)
+/// ip_cmsg_send: IP_PKTINFO, IP_TTL, IP_TOS)
 struct TxCmsg {
     oif: u32,
     saddr: Ipv4Addr,
@@ -333,7 +332,13 @@ fn tx_cmsgs(c: &[u8]) -> Result<TxCmsg, KernelError> {
     for r in cmsgs(c) {
         let (level, ty, d) = r?;
         if level == SOL_SOCKET {
-            return Err(KernelError::InvalidArgument);
+            // Linux __sock_cmsg_send: SCM_RIGHTS/SCM_CREDENTIALS are
+            // ignored on non-unix sockets, SO_MARK/SO_PRIORITY/
+            // SO_TIMESTAMPING/SCM_TXTIME accepted, anything else EINVAL
+            if !matches!(ty, 1 | 2 | 12 | 36 | 37 | 61) {
+                return Err(KernelError::InvalidArgument);
+            }
+            continue;
         }
         if level != SOL_IP {
             continue;
@@ -516,7 +521,9 @@ impl ProtoOps for UdpSock {
         match level {
             SOL_SOCKET => None,
             SOL_IP => Some(self.inet.getsockopt(opt)),
-            _ => Some(Err(KernelError::NoProtocolOption)),
+            SOL_UDP => Some(Err(KernelError::NoProtocolOption)),
+            // Linux do_ip_getsockopt: other levels are EOPNOTSUPP
+            _ => Some(Err(KernelError::OperationNotSupported)),
         }
     }
 

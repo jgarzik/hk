@@ -1047,7 +1047,8 @@ impl ProtoOps for TcpSock {
             SOL_SOCKET => None,
             SOL_IP => Some(self.inet.getsockopt(opt)),
             PROTO_TCP => Some(self.get_tcp_opt(opt)),
-            _ => Some(Err(KernelError::NoProtocolOption)),
+            // Linux do_ip_getsockopt: other levels are EOPNOTSUPP
+            _ => Some(Err(KernelError::OperationNotSupported)),
         }
     }
 

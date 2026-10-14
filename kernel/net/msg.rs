@@ -70,7 +70,8 @@ impl Iov {
     }
 
     fn push(&mut self, base: u64, len: u64) -> Result<(), KernelError> {
-        if len > isize::MAX as u64 || !Uaccess::access_ok(base, len as usize) {
+        // Like Linux access_ok, an empty segment is never checked
+        if len > isize::MAX as u64 || (len != 0 && !Uaccess::access_ok(base, len as usize)) {
             return Err(KernelError::BadAddress);
         }
         let len = (len as usize).min(MAX_RW_COUNT - self.total);
