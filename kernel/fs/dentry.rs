@@ -14,7 +14,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use spin::{Mutex, RwLock};
+use spin::RwLock;
 
 use super::inode::Inode;
 use super::superblock::SuperBlock;
@@ -51,9 +51,6 @@ struct DentryInner {
 /// the Linux kernel's dentry locking model. The `name` and `sb` fields
 /// are immutable after creation and don't need locking.
 ///
-/// Additionally, `rename_lock` is used by lock_rename()/unlock_rename()
-/// to coordinate directory locking during rename operations, following
-/// Linux's lock_rename() pattern in fs/namei.c.
 pub struct Dentry {
     /// Name of this entry (empty string for root) - immutable after creation
     pub name: String,
@@ -63,10 +60,6 @@ pub struct Dentry {
 
     /// Single lock protecting all mutable state (like Linux d_lock)
     d_lock: RwLock<DentryInner>,
-
-    /// Lock for rename coordination (used by lock_rename/unlock_rename)
-    /// This is separate from d_lock to allow holding across function calls
-    rename_lock: Mutex<()>,
 }
 
 impl Dentry {
@@ -81,7 +74,6 @@ impl Dentry {
                 children: BTreeMap::new(),
                 flags: DentryFlags::default(),
             }),
-            rename_lock: Mutex::new(()),
         }
     }
 
@@ -96,7 +88,6 @@ impl Dentry {
                 children: BTreeMap::new(),
                 flags: DentryFlags::default(),
             }),
-            rename_lock: Mutex::new(()),
         }
     }
 
@@ -114,7 +105,6 @@ impl Dentry {
                 children: BTreeMap::new(),
                 flags: DentryFlags::default(),
             }),
-            rename_lock: Mutex::new(()),
         }
     }
 
@@ -182,31 +172,23 @@ impl Dentry {
     // Rename locking (Linux lock_rename pattern)
     // ========================================================================
 
-    /// Acquire rename lock on this dentry
-    ///
-    /// Used by lock_rename() to coordinate directory locking during rename.
-    /// This lock is held across the entire rename operation.
-    ///
-    /// # Safety
-    /// Caller must ensure rename_unlock() is called to release the lock.
-    /// Using lock_rename()/unlock_rename() helpers is preferred.
+    /// lock_rename() step: lock this directory's inode (i_rwsem), the
+    /// same lock every other directory operation takes (Linux
+    /// lock_rename uses inode_lock_nested)
     pub fn rename_lock(&self) {
-        // Acquire the mutex - this will spin until acquired
-        // We use forget() to prevent the guard from being dropped,
-        // allowing us to hold the lock across function calls
-        let guard = self.rename_lock.lock();
-        core::mem::forget(guard);
+        if let Some(inode) = self.get_inode() {
+            inode.inode_lock();
+        }
     }
 
-    /// Release rename lock on this dentry
+    /// Release rename_lock()
     ///
     /// # Safety
-    /// Must only be called after a successful rename_lock() call.
-    /// The lock must have been acquired by this thread.
+    /// Must only be called after rename_lock() on this dentry by this thread.
     pub unsafe fn rename_unlock(&self) {
-        // Force unlock the mutex
-        // Safety: caller guarantees we hold the lock
-        unsafe { self.rename_lock.force_unlock() };
+        if let Some(inode) = self.get_inode() {
+            unsafe { inode.inode_unlock() };
+        }
     }
 
     /// Get the full path from root to this dentry

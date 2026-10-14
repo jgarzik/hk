@@ -144,7 +144,7 @@ pub fn kernel_open_exec(path: &str) -> Result<Arc<File>, i32> {
 /// * `None` - If directories are unrelated or the same
 pub fn lock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     // Same directory - single lock, no need for superblock mutex
-    if Arc::ptr_eq(p1, p2) {
+    if same_dir(p1, p2) {
         p1.rename_lock();
         return None;
     }
@@ -193,6 +193,13 @@ pub fn lock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     None
 }
 
+/// Same directory for lock_rename: the same dentry, or two dentries of
+/// one inode (bind mounts) - its i_rwsem must be taken once
+fn same_dir(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> bool {
+    Arc::ptr_eq(p1, p2)
+        || matches!((p1.get_inode(), p2.get_inode()), (Some(a), Some(b)) if Arc::ptr_eq(&a, &b))
+}
+
 /// Unlock directories after rename operation
 ///
 /// Must be called after lock_rename() to release the locks.
@@ -209,7 +216,7 @@ pub fn unlock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) {
         p2.rename_unlock();
 
         // Only unlock p1 and release superblock mutex if cross-directory
-        if !Arc::ptr_eq(p1, p2) {
+        if !same_dir(p1, p2) {
             p1.rename_unlock();
 
             // Release superblock mutex for cross-directory case

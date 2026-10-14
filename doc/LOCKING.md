@@ -159,9 +159,11 @@ VFS locks (detailed order):
         ↓
     Mount.{children, parent, mountpoint}
         ↓
-    Dentry.{d_lock, rename_lock} (single d_lock like Linux, rename_lock for lock_rename)
+    SuperBlock.s_vfs_rename_mutex (cross-directory rename only)
         ↓
-    Inode.i_rwsem (directory operation serialization, like Linux i_rwsem)
+    Inode.i_rwsem (directory operations and lock_rename, like Linux i_rwsem)
+        ↓
+    Dentry.d_lock (single d_lock like Linux; short, never held across i_rwsem)
         ↓
     Inode.{lock, private}
         ↓
@@ -793,19 +795,13 @@ This ordering prevents deadlocks because:
 - The address-based fallback provides a total order for unrelated directories
 - No two concurrent renames can acquire locks in opposite order
 
-**Dentry Rename Lock:**
-
-Each dentry has a dedicated `rename_lock` (Mutex) separate from `d_lock`:
-
-```rust
-pub struct Dentry {
-    d_lock: RwLock<DentryInner>,  // Protects inode, parent, children, flags
-    rename_lock: Mutex<()>,       // For lock_rename() coordination
-}
-```
-
-The separate lock allows holding across function calls (not RAII-bound) and
-avoids interfering with concurrent reads of dentry metadata.
+**Directory locks:** `lock_rename()` locks each directory's inode
+`i_rwsem` (via `Dentry::rename_lock()` -> `Inode::inode_lock()`), the same
+lock create/mkdir/unlink/rmdir/link/symlink/mknod take on the parent, so a
+rename excludes every other operation on both directories, as in Linux
+(lock_rename -> inode_lock_nested). Order: `SuperBlock.s_vfs_rename_mutex`
+(cross-directory only) -> directory `i_rwsem`s (ancestor first, else by
+address) -> dentry `d_lock` -> fs-internal locks.
 
 **API:**
 
@@ -839,10 +835,10 @@ if source_inode.mode().is_dir() {
 
 **Two-Level Locking:**
 
-The VFS layer acquires dentry rename_locks via `lock_rename()`. Filesystems may
-still use internal locks for their data structures (e.g., ramfs children BTreeMap)
-to protect against concurrent non-rename operations. The VFS rename_lock ensures
-only one rename operates on a given directory pair at a time.
+The VFS layer locks both directories' `i_rwsem` via `lock_rename()`, which
+excludes renames and all other directory operations on them. Filesystems may
+still use internal locks for their data structures (e.g., ramfs children
+BTreeMap).
 
 **Error Conditions:**
 - `EINVAL`: new_parent is subdirectory of source (cycle)
@@ -883,8 +879,7 @@ Without a per-superblock lock, this race is possible:
 
 **Same-Directory Rename:**
 
-Does not acquire `s_vfs_rename_mutex` - only needs the single dentry's
-`rename_lock`.
+Does not acquire `s_vfs_rename_mutex` - only the directory's `i_rwsem`.
 
 #### Inode Timestamp Locking (Linux i_rwsem Pattern)
 

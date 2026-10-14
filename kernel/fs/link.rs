@@ -491,7 +491,7 @@ fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
             if exchange { d.mode().is_dir() } else { is_dir },
         )?,
     }
-    if !Arc::ptr_eq(op, np) {
+    if !Arc::ptr_eq(odir, ndir) {
         if is_dir {
             dac::permission_as(&c, &sinode, MAY_WRITE)?;
         }
