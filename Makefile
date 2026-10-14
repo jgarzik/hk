@@ -172,10 +172,10 @@ user-arm:
 build-arm: user-arm
 	cargo build -p hk-kernel --target $(TARGET_ARM) --release
 
-run-arm: build-arm
+run-arm: build-arm vfat-image
 	./run-qemu.sh --arch arm
 
-check-arm: build-arm
+check-arm: build-arm vfat-image
 	@rm -f /tmp/qemu_serial_arm.log
 	@echo "Running ARM boot test (30 second timeout)..."
 	@./run-qemu.sh --arch arm -t -T 30
