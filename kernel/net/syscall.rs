@@ -813,10 +813,8 @@ pub fn sys_sendmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32) -> i64 {
     if msgvec == 0 || vlen == 0 {
         return 0;
     }
-    if vlen > 1024 {
-        // UIO_MAXIOV limit
-        return KernelError::InvalidArgument.sysret();
-    }
+    // Linux clamps vlen to UIO_MAXIOV (1024) rather than failing
+    let vlen = vlen.min(1024);
 
     let mut sent = 0i64;
     for i in 0..vlen as u64 {
@@ -847,9 +845,8 @@ pub fn sys_recvmmsg(fd: i32, msgvec: u64, vlen: u32, flags: i32, _timeout: u64) 
     if msgvec == 0 || vlen == 0 {
         return 0;
     }
-    if vlen > 1024 {
-        return KernelError::InvalidArgument.sysret();
-    }
+    // Linux clamps vlen to UIO_MAXIOV (1024) rather than failing
+    let vlen = vlen.min(1024);
 
     let mut received = 0i64;
     for i in 0..vlen as u64 {
