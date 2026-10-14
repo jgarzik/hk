@@ -8,6 +8,7 @@
 //! - SysV message queues (msgget, msgsnd, msgrcv, msgctl)
 
 use hk_syscall::{
+    sys_clock_gettime,
     sys_close, sys_open, sys_pipe, sys_poll, sys_read, sys_select, sys_write,
     sys_sendfile, sys_splice, sys_tee, sys_vmsplice,
     sys_shmget, sys_shmat, sys_shmdt, sys_shmctl,
@@ -34,6 +35,8 @@ pub fn run_tests() {
     test_poll_write_ready();
     test_select_data_ready();
     test_select_no_data();
+    test_poll_empty_timeout();
+    test_select_empty_timeout();
 
     // Splice tests
     println(b"--- Splice / Tee / Vmsplice / Sendfile ---");
@@ -1067,5 +1070,46 @@ fn test_semctl_all_efault() {
         println(b" SEMCTL_ALL_EFAULT:OK");
     } else {
         println(b" SEMCTL_ALL_EFAULT:FAIL");
+    }
+}
+
+/// Monotonic time in milliseconds
+fn mono_ms() -> i64 {
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    sys_clock_gettime(1, &mut ts); // CLOCK_MONOTONIC
+    ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
+}
+
+/// Test: poll(NULL, 0, 30) is a plain 30ms sleep returning 0
+fn test_poll_empty_timeout() {
+    let t0 = mono_ms();
+    let ret = sys_poll(core::ptr::null_mut(), 0, 30);
+    let dt = mono_ms() - t0;
+    if ret == 0 && (20..2000).contains(&dt) {
+        println(b"POLL_EMPTY_TIMEOUT:OK");
+    } else {
+        print(b"POLL_EMPTY_TIMEOUT:FAIL: ret=");
+        print_num(ret);
+        print(b" elapsed_ms=");
+        print_num(dt);
+        println(b"");
+    }
+}
+
+/// Test: select(0, NULL, NULL, NULL, 30ms) is a plain sleep returning 0
+fn test_select_empty_timeout() {
+    let mut tv = Timeval { tv_sec: 0, tv_usec: 30_000 };
+    let null = core::ptr::null_mut();
+    let t0 = mono_ms();
+    let ret = sys_select(0, null, null, null, &mut tv);
+    let dt = mono_ms() - t0;
+    if ret == 0 && (20..2000).contains(&dt) {
+        println(b"SELECT_EMPTY_TIMEOUT:OK");
+    } else {
+        print(b"SELECT_EMPTY_TIMEOUT:FAIL: ret=");
+        print_num(ret);
+        print(b" elapsed_ms=");
+        print_num(dt);
+        println(b"");
     }
 }

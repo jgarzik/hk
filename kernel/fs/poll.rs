@@ -10,7 +10,7 @@ use alloc::vec;
 use crate::arch::Uaccess;
 use crate::fs::KernelError;
 use crate::signal::{SigSet, UNMASKABLE_SIGNALS, has_pending_signals, with_task_signal_state};
-use crate::task::percpu::{current_tid, sleep_current_until};
+use crate::task::percpu::current_tid;
 
 use super::syscall::current_fd_table;
 
@@ -200,8 +200,7 @@ fn do_poll_internal(fds: u64, nfds: u32, timeout_ms: i32, check_signals: bool) -
     if nfds == 0 {
         if timeout_ms > 0 {
             // Sleep for the specified timeout
-            let wake_tick = crate::time::current_ticks().saturating_add(timeout_ms as u64);
-            sleep_current_until(wake_tick);
+            crate::task::percpu::sleep_current_ms(timeout_ms as u64);
             // Check if interrupted by signal (only if using signal mask variant)
             if check_signals && has_pending_signals(tid) {
                 return KernelError::Interrupted.sysret();
@@ -618,8 +617,7 @@ fn do_select_internal(
     if nfds == 0 && readfds == 0 && writefds == 0 && exceptfds == 0 {
         if timeout_ms > 0 {
             // Sleep for the specified timeout
-            let wake_tick = crate::time::current_ticks().saturating_add(timeout_ms as u64);
-            sleep_current_until(wake_tick);
+            crate::task::percpu::sleep_current_ms(timeout_ms as u64);
             // Check if interrupted by signal (only if using signal mask variant)
             if check_signals && has_pending_signals(tid) {
                 return KernelError::Interrupted.sysret();

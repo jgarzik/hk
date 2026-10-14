@@ -568,7 +568,7 @@ pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
     // Sleep until a signal is deliverable under the temporary mask.
     // Signal senders do not wake sleepers directly, so re-check every tick.
     while !with_task_signal_state(tid, |state| state.has_deliverable_signals()).unwrap_or(true) {
-        let wake_tick = crate::time::current_ticks().saturating_add(1);
+        let wake_tick = crate::task::percpu::get_ticks().saturating_add(1);
         crate::task::percpu::sleep_current_until(wake_tick);
     }
 

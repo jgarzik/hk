@@ -1525,6 +1525,17 @@ pub fn get_ticks() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
 }
 
+/// Sleep the current task for at least `ms` milliseconds
+///
+/// `sleep_current_until` takes scheduler ticks (`get_ticks`), whose period is
+/// arch/timer dependent, so sleep a tick at a time against the ms clock.
+pub fn sleep_current_ms(ms: u64) {
+    let deadline = crate::time::current_ticks().saturating_add(ms);
+    while crate::time::current_ticks() < deadline {
+        sleep_current_until(get_ticks().saturating_add(1));
+    }
+}
+
 /// Called after context switch to release the scheduler lock
 ///
 /// When context_switch is called, the IrqSpinlock guard is on the old task's
