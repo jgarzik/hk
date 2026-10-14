@@ -139,7 +139,7 @@ enum Done {
 
 /// Process a buffer of requests sent to the kernel (Linux
 /// netlink_rcv_skb + rtnetlink_rcv_msg)
-pub fn rcv(sk: &Arc<NlSock>, mut data: &[u8]) {
+pub fn rcv(sk: &Arc<NlSock>, mut data: &[u8], explicit: bool) {
     while data.len() >= NLMSG_HDRLEN {
         let h = Hdr::parse(data).unwrap();
         let len = h.len as usize;
@@ -150,7 +150,7 @@ pub fn rcv(sk: &Arc<NlSock>, mut data: &[u8]) {
         let res = if h.flags & NLM_F_REQUEST == 0 || h.ty < NLMSG_MIN_TYPE {
             Ok(Done::Ok)
         } else {
-            rcv_msg(sk, &h, &msg[NLMSG_HDRLEN..])
+            rcv_msg(sk, &h, &msg[NLMSG_HDRLEN..], explicit)
         };
         match res {
             Ok(Done::Dump) => {}
@@ -185,7 +185,7 @@ fn reply(sk: &NlSock, data: Vec<u8>) {
 }
 
 /// One request: permission, then dump or do
-fn rcv_msg(sk: &Arc<NlSock>, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
+fn rcv_msg(sk: &Arc<NlSock>, h: &Hdr, p: &[u8], explicit: bool) -> Result<Done, KernelError> {
     if h.ty > RTM_MAX {
         return Err(KernelError::OperationNotSupported);
     }
@@ -195,7 +195,7 @@ fn rcv_msg(sk: &Arc<NlSock>, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
     };
     let kind = (h.ty - RTM_BASE) & 3;
     const KIND_GET: u16 = 2;
-    if kind != KIND_GET && !crate::task::capable(crate::task::CAP_NET_ADMIN) {
+    if kind != KIND_GET && !sk.net_capable(crate::task::CAP_NET_ADMIN, explicit) {
         return Err(KernelError::NotPermitted);
     }
     if kind == KIND_GET && h.flags & NLM_F_DUMP != 0 {

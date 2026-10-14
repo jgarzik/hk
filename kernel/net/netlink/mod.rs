@@ -103,6 +103,15 @@ pub struct NlInfo {
     pub seq: u32,
 }
 
+/// Destination of a send: (portid, group), and whether the sender named
+/// it (msg_name) rather than using the connected default
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NlDst {
+    pub portid: u32,
+    pub group: u32,
+    pub explicit: bool,
+}
+
 /// A queued datagram
 #[derive(Clone)]
 pub struct NlSkb {
@@ -142,6 +151,8 @@ pub struct NlSock {
     pub rcvbuf: AtomicU32,
     pub sndbuf: AtomicU32,
     pub flags: AtomicU32,
+    /// Capabilities of the opener (the socket file's f_cred)
+    opener: crate::task::KernelCap,
     /// Pending socket error (positive errno; ENOBUFS on overrun)
     err: AtomicI32,
     /// Receive queue overran; cleared when the reader empties it
@@ -191,12 +202,22 @@ impl NlSock {
             rcvbuf: AtomicU32::new(SK_BUF_DEFAULT),
             sndbuf: AtomicU32::new(SK_BUF_DEFAULT),
             flags: AtomicU32::new(0),
+            opener: crate::task::current_cred().cap_effective,
             err: AtomicI32::new(0),
             congested: AtomicBool::new(false),
             drops: AtomicU32::new(0),
             dump: Mutex::new(None),
             wq: WaitQueue::new(),
         })
+    }
+
+    /// Linux __netlink_ns_capable: the sender holds `cap`, and so does
+    /// the opener of the socket unless the message named its destination
+    /// explicitly (NETLINK_SKB_DST). A privileged program that merely
+    /// write()s to a descriptor it was handed cannot be abused as a
+    /// confused deputy.
+    pub fn net_capable(&self, cap: u32, explicit_dst: bool) -> bool {
+        (explicit_dst || self.opener.has(cap)) && crate::task::capable(cap)
     }
 
     pub fn portid(&self) -> u32 {
@@ -475,15 +496,19 @@ impl NlSock {
         });
     }
 
-    /// Send `data` to (`portid`, `group`) from this socket (Linux
-    /// netlink_sendmsg after address checks): portid 0 = the kernel
+    /// Send `data` to `dst` from this socket (Linux netlink_sendmsg
+    /// after address checks): portid 0 = the kernel
     pub fn send(
         self: &Arc<Self>,
         data: &[u8],
-        portid: u32,
-        group: u32,
+        dst: NlDst,
         nonblock: bool,
     ) -> Result<usize, KernelError> {
+        let NlDst {
+            portid,
+            group,
+            explicit,
+        } = dst;
         self.autobind()?;
         if data.len() > self.max_msg() {
             return Err(KernelError::MessageTooLong);
@@ -499,7 +524,7 @@ impl NlSock {
         }
         if portid == 0 {
             if group == 0 {
-                rtnetlink::rcv(self, data);
+                rtnetlink::rcv(self, data, explicit);
             }
             return Ok(data.len());
         }

@@ -72,8 +72,13 @@ impl FileOps for NlFile {
     }
 
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        let (pid, group) = self.sk.dst();
-        self.sk.send(buf, pid, group, nonblock(file, 0))
+        let (portid, group) = self.sk.dst();
+        let dst = NlDst {
+            portid,
+            group,
+            explicit: false,
+        };
+        self.sk.send(buf, dst, nonblock(file, 0))
     }
 
     fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
@@ -187,9 +192,14 @@ pub fn getname(sk: &NlSock, addr: u64, len: u64, peer: bool) -> i64 {
 }
 
 /// Destination of a send: explicit sockaddr_nl or the connected one
-fn dest(sk: &NlSock, name: u64, namelen: u64) -> Result<(u32, u32), KernelError> {
-    if name == 0 {
-        return Ok(sk.dst());
+fn dest(sk: &NlSock, name: u64, namelen: u64) -> Result<NlDst, KernelError> {
+    if name == 0 || namelen == 0 {
+        let (portid, group) = sk.dst();
+        return Ok(NlDst {
+            portid,
+            group,
+            explicit: false,
+        });
     }
     let (fam, pid, groups) = read_nladdr(name, namelen)?;
     if fam != AF_NETLINK as u16 {
@@ -203,17 +213,21 @@ fn dest(sk: &NlSock, name: u64, namelen: u64) -> Result<(u32, u32), KernelError>
     if (group != 0 || pid != 0) && !crate::task::capable(crate::task::CAP_NET_ADMIN) {
         return Err(KernelError::NotPermitted);
     }
-    Ok((pid, group))
+    Ok(NlDst {
+        portid: pid,
+        group,
+        explicit: true,
+    })
 }
 
 /// Copy in a message after the size check (Linux netlink_sendmsg:
 /// EMSGSIZE above sndbuf - 32, before any allocation)
-fn send_iov(sk: &Arc<NlSock>, iov: &Iov, dst: (u32, u32), nb: bool) -> Result<i64, KernelError> {
+fn send_iov(sk: &Arc<NlSock>, iov: &Iov, dst: NlDst, nb: bool) -> Result<i64, KernelError> {
     if iov.total > sk.max_msg() {
         return Err(KernelError::MessageTooLong);
     }
     let data = iov.gather(iov.total)?;
-    Ok(sk.send(&data, dst.0, dst.1, nb)? as i64)
+    Ok(sk.send(&data, dst, nb)? as i64)
 }
 
 /// sendto(2)

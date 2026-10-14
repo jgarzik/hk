@@ -302,6 +302,11 @@ pub struct File {
     /// Signal to send for async I/O (F_SETSIG/F_GETSIG)
     /// 0 = use default SIGIO
     owner_sig: AtomicI32,
+
+    /// Credentials of the opener (Linux file->f_cred): permission checks
+    /// that must not be satisfied by whoever later uses the descriptor
+    /// (confused deputy), e.g. netlink configuration requests
+    pub f_cred: crate::task::Cred,
 }
 
 impl File {
@@ -325,6 +330,7 @@ impl File {
             f_op,
             owner_pid: AtomicI32::new(0),
             owner_sig: AtomicI32::new(0),
+            f_cred: crate::task::current_cred(),
         }
     }
 

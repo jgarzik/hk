@@ -8,7 +8,7 @@
 //! unconfigured; every test leaves it down without addresses.
 
 use hk_syscall::{
-    sys_bind, sys_capget, sys_capset, sys_close, sys_exit, sys_fork, sys_getpid, sys_getsockname,
+    sys_bind, sys_capget, sys_pidfd_getfd, sys_pidfd_open, sys_pipe2, sys_read, sys_write, sys_capset, sys_close, sys_exit, sys_fork, sys_getpid, sys_getsockname,
     sys_getsockopt, sys_recvfrom, sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt, sys_socket, sys_wait4, CapUserData,
     CapUserHeader, IoVec, MsgHdr, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, _LINUX_CAPABILITY_VERSION_3,
 };
@@ -62,6 +62,7 @@ pub fn run_tests() {
     test_overflow();
     test_dump_resume();
     test_overrun();
+    test_deputy();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -748,6 +749,11 @@ fn test_other_dumps() {
 
 /// Drop all effective capabilities of this process
 pub fn drop_caps() -> bool {
+    set_eff(false)
+}
+
+/// Clear (or restore from permitted) the effective capability set
+fn set_eff(on: bool) -> bool {
     let mut h = CapUserHeader {
         version: _LINUX_CAPABILITY_VERSION_3,
         pid: 0,
@@ -756,8 +762,8 @@ pub fn drop_caps() -> bool {
     if sys_capget(&mut h, d.as_mut_ptr()) != 0 {
         return false;
     }
-    d[0].effective = 0;
-    d[1].effective = 0;
+    d[0].effective = if on { d[0].permitted } else { 0 };
+    d[1].effective = if on { d[1].permitted } else { 0 };
     sys_capset(&h, d.as_ptr()) == 0
 }
 
@@ -957,6 +963,90 @@ fn test_overrun() {
     }
     if e2 || m2 < 1 || m2 >= 10 {
         return fail(N, b"NO_ENOBUFS msgs", m2 as i64);
+    }
+    ok(N);
+}
+
+/// NEWADDR of TEST_IP on lo through `fd`, sent with write() (no
+/// destination address) or sendto() to the kernel; returns the ACK code
+fn newaddr_on(fd: i32, write: bool) -> i32 {
+    let mut nl = Nl::from_fd(fd);
+    let mut r = Req::new(RTM_NEWADDR, NLM_F_CREATE | NLM_F_ACK, &ifaddr(AF_INET, 24, 1));
+    r.attr(IFA_LOCAL, &TEST_IP).attr(IFA_ADDRESS, &TEST_IP);
+    let code = if write {
+        let b = r.bytes(7777);
+        sys_write(fd as u64, b.as_ptr(), b.len() as u64);
+        nl.wait_ack(7777)
+    } else {
+        nl.ack(&mut r)
+    };
+    core::mem::forget(nl);
+    if code == 0 {
+        if let Some(mut c) = Nl::open() {
+            addr(&mut c, false, 1, TEST_IP, 24, 0);
+        }
+    }
+    code
+}
+
+/// Confused deputy (Linux __netlink_ns_capable): a request written
+/// without a destination address needs CAP_NET_ADMIN of the socket's
+/// opener as well as of the sender. (1) A privileged process writing to
+/// a socket opened unprivileged (fetched with pidfd_getfd) gets EPERM;
+/// naming the kernel with sendto() is allowed (NETLINK_SKB_DST). (2) A
+/// socket opened unprivileged, written after regaining the capability:
+/// EPERM. (3) The sender always needs the capability.
+fn test_deputy() {
+    const N: &[u8] = b"NL_DEPUTY";
+    let mut p = [0i32; 2];
+    let mut q = [0i32; 2];
+    if sys_pipe2(p.as_mut_ptr(), 0) != 0 || sys_pipe2(q.as_mut_ptr(), 0) != 0 {
+        return fail(N, b"pipe", 0);
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        if !drop_caps() {
+            sys_exit(2);
+        }
+        let Some(nl) = Nl::open() else { sys_exit(3) };
+        let fd = nl.fd;
+        sys_write(p[1] as u64, &fd as *const i32 as *const u8, 4);
+        let mut b = [0u8; 1];
+        sys_read(q[0] as u64, b.as_mut_ptr(), 1);
+        sys_exit(0);
+    }
+    let mut cfd: i32 = -1;
+    sys_read(p[0] as u64, &mut cfd as *mut i32 as *mut u8, 4);
+    let pidfd = sys_pidfd_open(pid as i32, 0) as i32;
+    let fd = if pidfd >= 0 { sys_pidfd_getfd(pidfd, cfd, 0) as i32 } else { pidfd };
+    let (w1, s1) = if fd >= 0 { (newaddr_on(fd, true), newaddr_on(fd, false)) } else { (fd, fd) };
+    sys_write(q[1] as u64, b"x".as_ptr(), 1);
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    for f in [p[0], p[1], q[0], q[1], pidfd, fd] {
+        if f >= 0 {
+            sys_close(f as u64);
+        }
+    }
+    if !expect(N, b"write, unprivileged opener", w1, EPERM) || !expect(N, b"sendto kernel", s1, 0) {
+        return;
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        set_eff(false);
+        let Some(nl) = Nl::open() else { sys_exit(3) };
+        if !set_eff(true) {
+            sys_exit(2);
+        }
+        let w = newaddr_on(nl.fd, true);
+        drop_caps();
+        let s = newaddr_on(nl.fd, false);
+        sys_exit(if w == EPERM && s == EPERM { 0 } else { 4 });
+    }
+    sys_wait4(pid, &mut st, 0, 0);
+    let code = (st >> 8) & 0xff;
+    if st & 0x7f != 0 || code != 0 {
+        return fail(N, b"regained caps / sender, code", code as i64);
     }
     ok(N);
 }

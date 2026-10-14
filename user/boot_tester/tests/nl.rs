@@ -263,6 +263,11 @@ impl Nl {
         })
     }
 
+    /// Wrap an existing socket
+    pub fn from_fd(fd: i32) -> Self {
+        Nl { fd, seq: 5000 }
+    }
+
     /// Send `req` to the kernel; returns its sequence number
     pub fn send(&mut self, req: &mut Req) -> u32 {
         self.seq += 1;
