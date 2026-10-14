@@ -358,7 +358,9 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, _rusage: u64) -> i64 {
     // Loop until we find a zombie child or determine there are no children
     loop {
         // Try to reap a zombie child
-        if let Some((child_pid, exit_status)) = super::percpu::reap_zombie_child(current_pid, pid) {
+        if let Some((child_pid, exit_status)) =
+            super::percpu::reap_zombie_child(current_pid, pid, options)
+        {
             // Write status to user space if pointer is non-null
             if wstatus != 0 {
                 // Linux encodes exit status as (exit_code << 8)
@@ -372,7 +374,7 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, _rusage: u64) -> i64 {
         }
 
         // No zombie child found - check if we have any children at all
-        if !super::percpu::has_children(current_pid, pid) {
+        if !super::percpu::has_children(current_pid, pid, options) {
             return KernelError::NoChild.sysret();
         }
 
@@ -510,7 +512,7 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
         // Try to reap a zombie child (or peek if WNOWAIT)
         // Note: WNOWAIT leaves child in waitable state - we don't fully support this yet
         if let Some((child_pid, exit_status, utime, stime)) =
-            super::percpu::reap_zombie_child_times(current_pid, wait_pid)
+            super::percpu::reap_zombie_child_times(current_pid, wait_pid, options)
         {
             if rusage != 0
                 && super::misc::put_rusage_times::<Uaccess>(rusage, utime, stime).is_err()
@@ -536,7 +538,7 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
         }
 
         // No zombie child found - check if we have any children at all
-        if !super::percpu::has_children(current_pid, wait_pid) {
+        if !super::percpu::has_children(current_pid, wait_pid, options) {
             return KernelError::NoChild.sysret();
         }
 

@@ -238,6 +238,8 @@ fn test_setsid_eperm() {
 
 /// Test 15: clone(CLONE_VM) - thread creation
 fn test_clone() {
+    const WNOHANG: i32 = 1;
+    const WALL: i32 = 0x4000_0000; // __WALL
 
     // Static child stack (must be outside function stack frame)
     #[repr(C, align(16))]
@@ -275,9 +277,14 @@ fn test_clone() {
         print(b"Parent: clone() returned child TID=");
         print_num(clone_ret);
 
+        // No exit signal makes this a "clone" child: plain wait4 must not
+        // see it (ECHILD), only __WALL/__WCLONE (Linux eligible_child)
         let mut wstatus: i32 = 0;
-        let wait_ret = sys_wait4(-1, &mut wstatus, 0, 0);
-        print(b"Parent: wait4() returned ");
+        let plain = sys_wait4(clone_ret, &mut wstatus, WNOHANG, 0);
+        let wait_ret = sys_wait4(clone_ret, &mut wstatus, WALL, 0);
+        print(b"Parent: plain wait4() returned ");
+        print_num(plain);
+        print(b", wait4(__WALL) returned ");
         print_num(wait_ret);
         print(b", wstatus=");
         print_num(wstatus as i64);
@@ -287,7 +294,7 @@ fn test_clone() {
         print_num(child_done as i64);
 
         let exit_status = (wstatus >> 8) & 0xff;
-        if wait_ret == clone_ret && exit_status == 42 && child_done == 42 {
+        if plain == -10 && wait_ret == clone_ret && exit_status == 42 && child_done == 42 {
             println(b"CLONE:OK");
         } else {
             println(b"CLONE:FAIL");

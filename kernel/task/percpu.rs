@@ -680,13 +680,30 @@ pub fn mark_zombie(tid: Tid, status: i32) {
 /// # Returns
 /// * Some((child_pid, exit_status)) if a zombie child was found and reaped
 /// * None if no zombie child matches
-pub fn reap_zombie_child(parent_pid: Pid, target_pid: i64) -> Option<(Pid, i32)> {
-    reap_zombie_child_times(parent_pid, target_pid).map(|(pid, status, _, _)| (pid, status))
+pub fn reap_zombie_child(parent_pid: Pid, target_pid: i64, wflags: i32) -> Option<(Pid, i32)> {
+    reap_zombie_child_times(parent_pid, target_pid, wflags).map(|(pid, status, _, _)| (pid, status))
+}
+
+/// Whether `child`'s exit_signal makes it eligible under `wflags`
+/// (Linux kernel/exit.c eligible_child): __WALL waits for all children;
+/// otherwise "clone" children (exit_signal != SIGCHLD) are waited for only
+/// with __WCLONE, and normal children only without it.
+fn wait_eligible(exit_signal: i32, wflags: i32) -> bool {
+    use super::wait_options::{__WALL, __WCLONE};
+    if wflags & __WALL != 0 {
+        return true;
+    }
+    let is_clone = exit_signal != crate::signal::SIGCHLD as i32;
+    is_clone == (wflags & __WCLONE != 0)
 }
 
 /// Like [`reap_zombie_child`], but also returns the reaped child's CPU times
 /// as `(pid, exit_status, utime_ns, stime_ns)` (for wait rusage reporting).
-pub fn reap_zombie_child_times(parent_pid: Pid, target_pid: i64) -> Option<(Pid, i32, u64, u64)> {
+pub fn reap_zombie_child_times(
+    parent_pid: Pid,
+    target_pid: i64,
+    wflags: i32,
+) -> Option<(Pid, i32, u64, u64)> {
     let mut table = TASK_TABLE.lock();
 
     // Find a zombie child matching the criteria
@@ -698,6 +715,10 @@ pub fn reap_zombie_child_times(parent_pid: Pid, target_pid: i64) -> Option<(Pid,
 
         // Must be a zombie
         if !matches!(t.state, TaskState::Zombie(_)) {
+            return false;
+        }
+
+        if !wait_eligible(t.exit_signal, wflags) {
             return false;
         }
 
@@ -732,12 +753,16 @@ pub fn reap_zombie_child_times(parent_pid: Pid, target_pid: i64) -> Option<(Pid,
 ///   - > 0: check for specific child PID
 ///   - -1: check for any child
 ///   - 0: check for any child in same process group
-pub fn has_children(parent_pid: Pid, target_pid: i64) -> bool {
+pub fn has_children(parent_pid: Pid, target_pid: i64, wflags: i32) -> bool {
     let table = TASK_TABLE.lock();
 
     table.tasks.iter().any(|t| {
         // Must be a child of the parent
         if t.ppid != parent_pid {
+            return false;
+        }
+
+        if !wait_eligible(t.exit_signal, wflags) {
             return false;
         }
 

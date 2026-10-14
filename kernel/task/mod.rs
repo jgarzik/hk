@@ -79,6 +79,10 @@ pub mod wait_options {
     pub const WEXITED: i32 = 4;
     /// Leave child in waitable state (can be waited for again)
     pub const WNOWAIT: i32 = 0x01000000;
+    /// Wait only for "clone" children (exit_signal != SIGCHLD)
+    pub const __WCLONE: i32 = 0x80000000u32 as i32;
+    /// Wait for all children regardless of exit_signal
+    pub const __WALL: i32 = 0x40000000;
 
     // idtype_t values for waitid
     /// Wait for any child
