@@ -52,11 +52,11 @@ pub fn output(
 ) -> Result<Rtable, KernelError> {
     let lo = || net.loopback().ok_or(KernelError::NetworkUnreachable);
     if !saddr.is_unspecified() {
-        if saddr.is_multicast() || saddr.is_broadcast() || zeronet(saddr) {
-            return Err(KernelError::InvalidArgument);
-        }
-        if ip_dev_find(net, saddr).is_none() {
-            return Err(KernelError::InvalidArgument);
+        let dev = src_dev(net, saddr)?;
+        // Multicast / limited broadcast without oif leave through the
+        // source address's device
+        if oif == 0 && (daddr.is_multicast() || daddr.is_broadcast()) {
+            return make(dev, daddr, saddr, None, 0);
         }
     }
     let mut odev = None;
@@ -125,6 +125,26 @@ pub fn output(
         rt.rtype = RouteType::Broadcast;
     }
     Ok(rt)
+}
+
+/// Validate a caller-chosen source address (Linux
+/// ip_route_output_key_hash_rcu, no FLOWI_FLAG_ANYSRC: there is no
+/// IP_TRANSPARENT; raw IP_HDRINCL senders do not route with their
+/// header's source). Multicast and limited broadcast are EINVAL; any
+/// other address that is not local in this namespace (inet_addr_type !=
+/// RTN_LOCAL, so a deleted address too) is ENETUNREACH, which stops
+/// source spoofing through IP_PKTINFO or a stale bound address. Returns
+/// a device owning it (lo for addresses only covered by a local route).
+fn src_dev(net: &NetNamespace, saddr: Ipv4Addr) -> Result<Arc<NetDevice>, KernelError> {
+    if saddr.is_multicast() || saddr.is_broadcast() {
+        return Err(KernelError::InvalidArgument);
+    }
+    if net.fib.addr_type(saddr) != RouteType::Local {
+        return Err(KernelError::NetworkUnreachable);
+    }
+    ip_dev_find(net, saddr)
+        .or_else(|| net.loopback())
+        .ok_or(KernelError::NetworkUnreachable)
 }
 
 /// Linux __mkroute_output checks and type

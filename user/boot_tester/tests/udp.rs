@@ -30,6 +30,7 @@ pub fn run_tests() {
     test_poll_epoll();
     test_shut_rd();
     test_errqueue();
+    test_src_spoof();
 }
 
 /// sendto/recvfrom with the source address
@@ -411,5 +412,54 @@ fn test_errqueue() {
     ctl[12..16].copy_from_slice(&99i32.to_ne_bytes());
     t.eq(b"unknown cmsg", sys_sendmsg(fd, &m, 0), EINVAL);
     close(fd);
+    t.done();
+}
+
+/// sendmsg with IP_PKTINFO ipi_spec_dst
+fn send_spec(fd: i32, src: [u8; 4], dst: [u8; 4], port: u16) -> i64 {
+    let mut ctl = [0u8; 32];
+    ctl[..8].copy_from_slice(&28u64.to_ne_bytes());
+    ctl[8..12].copy_from_slice(&SOL_IP.to_ne_bytes());
+    ctl[12..16].copy_from_slice(&IP_PKTINFO.to_ne_bytes());
+    ctl[20..24].copy_from_slice(&src);
+    let mut to = sin(dst, port);
+    let mut iov = IoVec { iov_base: b"s".as_ptr(), iov_len: 1 };
+    let mut m = MsgHdr::with_addr(&mut to, &mut iov, 1);
+    m.msg_control = ctl.as_mut_ptr();
+    m.msg_controllen = 32;
+    sys_sendmsg(fd, &m, 0)
+}
+
+/// Source addresses must be local (Linux ip_route_output_key_hash_rcu):
+/// IP_PKTINFO spec_dst and bound addresses that were deleted
+fn test_src_spoof() {
+    use super::nl::{addr, Nl};
+    let mut t = T::new(b"UDP_SRC_SPOOF");
+    let (a, _) = udp_lo();
+    let (b, pb) = udp_lo();
+    let mut buf = [0u8; 8];
+    t.eq(b"foreign", send_spec(a, [1, 2, 3, 4], LO, pb), ENETUNREACH);
+    t.eq(b"lbcast", send_spec(a, [255; 4], LO, pb), EINVAL);
+    t.eq(b"mcast", send_spec(a, [224, 0, 0, 1], LO, pb), EINVAL);
+    t.eq(b"own", send_spec(a, LO, LO, pb), 1);
+    t.eq(b"own recv", recv(b, &mut buf, MSG_DONTWAIT), 1);
+    // Any address of a local route (127/8) is local
+    t.eq(b"127.0.0.2", send_spec(a, [127, 0, 0, 2], LO, pb), 1);
+    let (n, ip, _) = recv_from(b, &mut buf, MSG_DONTWAIT);
+    t.ok(b"127.0.0.2 src", n == 1 && ip == [127, 0, 0, 2], n);
+    // Bound to an address that is then deleted
+    let mut nl = Nl::open();
+    let x = [10, 9, 9, 9];
+    if let Some(nl) = nl.as_mut() {
+        t.eq(b"add addr", addr(nl, true, 1, x, 32, 0x400 | 0x200) as i64, 0);
+        let c = udp();
+        t.eq(b"bind", bind(c, x, 0), 0);
+        t.eq(b"send bound", send_to(c, b"y", LO, pb, 0), 1);
+        t.eq(b"del addr", addr(nl, false, 1, x, 32, 0) as i64, 0);
+        t.eq(b"send deleted", send_to(c, b"y", LO, pb, 0), ENETUNREACH);
+        close(c);
+    }
+    close(a);
+    close(b);
     t.done();
 }
