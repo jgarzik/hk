@@ -155,8 +155,7 @@ pub fn lock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) -> Option<Arc<Dentry>> {
     if let Some(sb) = p1.superblock() {
         // Acquire s_vfs_rename_mutex - prevents any other rename
         // from modifying tree topology during our ancestor check
-        let guard = sb.s_vfs_rename_mutex.lock();
-        core::mem::forget(guard); // Hold across function calls
+        sb.s_vfs_rename_mutex.lock_raw(); // held until unlock_rename
     }
 
     // Now safe to check ancestor relationships - topology is stable
@@ -221,7 +220,7 @@ pub fn unlock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) {
 
             // Release superblock mutex for cross-directory case
             if let Some(sb) = p1.superblock() {
-                sb.s_vfs_rename_mutex.force_unlock();
+                sb.s_vfs_rename_mutex.unlock_raw();
             }
         }
     }

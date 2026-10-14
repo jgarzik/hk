@@ -182,8 +182,11 @@ fn filp_open(
 
     // O_TRUNC of an existing regular file (Linux handle_truncate)
     if flags & O_TRUNC != 0 && !created && inode.mode().is_file() {
+        inode.inode_lock();
         dac::remove_privs(&inode);
         inode.i_op.truncate(&inode, 0).ok();
+        // SAFETY: taken above by this thread
+        unsafe { inode.inode_unlock() };
     }
 
     // Get the file operations based on inode type

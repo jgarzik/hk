@@ -7,7 +7,9 @@ use alloc::sync::{Arc, Weak};
 
 use ::core::cell::Cell;
 use ::core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
-use spin::{Mutex, RwLock};
+use spin::RwLock;
+
+use crate::mutex::SleepMutex;
 
 use super::KernelError;
 use super::superblock::SuperBlock;
@@ -417,7 +419,7 @@ pub struct Inode {
     ///
     /// For rename operations involving two directories, use lock_rename()
     /// instead which handles proper lock ordering.
-    i_rwsem: Mutex<()>,
+    i_rwsem: SleepMutex<()>,
 
     /// Filesystem-specific private data
     pub private: RwLock<Option<Arc<dyn InodeData>>>,
@@ -453,7 +455,7 @@ impl Inode {
             sb,
             i_op,
             lock: RwLock::new(()),
-            i_rwsem: Mutex::new(()),
+            i_rwsem: SleepMutex::new(()),
             private: RwLock::new(None),
         }
     }
@@ -488,7 +490,7 @@ impl Inode {
             sb,
             i_op,
             lock: RwLock::new(()),
-            i_rwsem: Mutex::new(()),
+            i_rwsem: SleepMutex::new(()),
             private: RwLock::new(None),
         }
     }
@@ -652,8 +654,7 @@ impl Inode {
     /// Caller must ensure inode_unlock() is called to release the lock.
     /// For operations on two directories (rename), use lock_rename() instead.
     pub fn inode_lock(&self) {
-        let guard = self.i_rwsem.lock();
-        core::mem::forget(guard);
+        self.i_rwsem.lock_raw();
     }
 
     /// Release exclusive lock on directory
@@ -662,7 +663,7 @@ impl Inode {
     /// Must only be called after a successful inode_lock() call.
     /// The lock must have been acquired by this thread.
     pub unsafe fn inode_unlock(&self) {
-        unsafe { self.i_rwsem.force_unlock() };
+        unsafe { self.i_rwsem.unlock_raw() };
     }
 }
 

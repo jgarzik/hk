@@ -128,7 +128,20 @@ fn read(&self) -> RwLockReadGuard<'_, T>
 fn write(&self) -> RwLockWriteGuard<'_, T>
 ```
 
-### 1.4 Atomic Types
+### 1.4 SleepMutex<T> (kernel/mutex.rs)
+
+Linux `struct mutex`: a contended `lock()` sleeps on the mutex's
+`WaitQueue` instead of spinning (spins only before scheduling is
+enabled). The holder may sleep (page locks, block I/O, user page
+faults). Thread context only; never taken in IRQ context or while a
+spinlock is held. `unlock` wakes one waiter, which retries the CAS.
+Raw `lock_raw`/`unlock_raw` exist for lock/unlock pairs that span
+functions (`inode_lock`, `lock_rename`).
+
+**Used for:** `Inode.i_rwsem`, `SuperBlock.s_vfs_rename_mutex`,
+`File.f_pos_lock`.
+
+### 1.5 Atomic Types
 
 Lock-free atomic operations from `core::sync::atomic`. Used for simple counters,
 flags, and lock-free algorithms.
@@ -155,13 +168,16 @@ lock ordering from outermost to innermost is:
 
 ```
 VFS locks (detailed order):
+    File.f_pos_lock (SleepMutex; read/write/lseek/getdents by position)
+        ↓
     MOUNT_NS.root
         ↓
     Mount.{children, parent, mountpoint}
         ↓
     SuperBlock.s_vfs_rename_mutex (cross-directory rename only)
         ↓
-    Inode.i_rwsem (directory operations and lock_rename, like Linux i_rwsem)
+    Inode.i_rwsem (SleepMutex; directory operations, lock_rename, regular
+                   file write and truncate, like Linux i_rwsem)
         ↓
     Dentry.d_lock (single d_lock like Linux; short, never held across i_rwsem)
         ↓
@@ -635,7 +651,7 @@ The VFS uses fine-grained locking with `RwLock` for concurrent read access.
 pub struct Inode {
     pub size: AtomicU64,                           // Lock-free size updates
     pub lock: RwLock<()>,                          // Metadata protection
-    i_rwsem: Mutex<()>,                            // Directory operation serialization
+    i_rwsem: SleepMutex<()>,                       // Dir ops, file write/truncate
     pub private: RwLock<Option<Arc<dyn InodeData>>>, // FS-specific data
 }
 ```
@@ -865,7 +881,7 @@ Without a per-superblock lock, this race is possible:
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `s_vfs_rename_mutex` | `Mutex<()>` | Serializes cross-directory renames |
+| `s_vfs_rename_mutex` | `SleepMutex<()>` | Serializes cross-directory renames |
 
 **Lock Ordering for Cross-Directory Rename:**
 
@@ -894,8 +910,38 @@ user `count`), and copies it to user space after `readdir` returned and
 every lock is dropped; a call may return fewer bytes than fit (callers
 loop until 0). Positions are stable cookies (ramfs per-directory
 position counter, vfat slot index, procfs pid/fd based), so nothing has
-to stay locked between calls. The file position is updated without a
-lock until `f_pos_lock` exists (see below).
+to stay locked between calls. The call holds the file's `f_pos_lock`
+(below), like Linux `fdget_pos`.
+
+#### File Writes and Positions (Linux i_rwsem / f_pos_lock)
+
+**Location:** `fs/file.rs` (`File::write_at`, `File::pos_lock`),
+`fs/io.rs` (`do_readv`, `do_writev`, `sys_lseek`), `fs/fd.rs`
+(`do_truncate`)
+
+- `File.f_pos_lock` (`SleepMutex<()>`, Linux `f_pos_lock` with
+  FMODE_ATOMIC_POS): taken by read/readv/write/writev/lseek/getdents64
+  on regular files and directories for the whole call (not by
+  pread/pwrite, which do not use the position), so processes sharing an
+  open file (fork, dup, SCM_RIGHTS) never read or write at the same
+  position. Pipes, sockets and devices are not position-based and skip
+  it, as in Linux.
+- `Inode.i_rwsem` is held across every write to a regular file
+  (`File::write_at`, i.e. write/writev/pwrite/pwritev*/io_uring/splice
+  users of `File::write`/`pwrite`): with O_APPEND (or RWF_APPEND) the
+  position is set to `i_size` under the lock, so appends from separate
+  open files never overlap, and the data copy, the size update,
+  RLIMIT_FSIZE check and set-id stripping are atomic with respect to
+  other writers. `truncate`/`ftruncate`/O_TRUNC take it too (Linux
+  do_truncate). Reads do not take it (Linux generic_file_read_iter).
+- User data is copied into a kernel buffer before `f_pos_lock`/`i_rwsem`
+  are taken (and copied out after the read returns), so no user page
+  fault happens under them.
+- Order: `f_pos_lock` -> file `i_rwsem` -> page cache / page locks ->
+  fs-internal locks. A directory `i_rwsem` is never held while a file's
+  `i_rwsem` is taken (O_CREAT drops the parent's lock before O_TRUNC).
+- Both are sleeping locks: the vfat write path may wait for page locks
+  and block I/O while holding `i_rwsem`, which a spinlock would forbid.
 
 #### Inode Timestamp Locking (Linux i_rwsem Pattern)
 
@@ -2046,6 +2092,7 @@ Features present in Linux but not yet implemented in hk:
 | Threaded IRQs | IRQ handlers in thread context | Not implemented | All IRQs run in interrupt context |
 | lockdep | Runtime deadlock detection | Not implemented | Manual ordering verification |
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
+| `rw_semaphore` | Shared/exclusive sleeping lock (`i_rwsem`) | `SleepMutex` (exclusive only) | Lookup/readdir do not take `i_rwsem` shared |
 | Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
 
 ### Implications

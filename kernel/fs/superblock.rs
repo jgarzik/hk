@@ -8,6 +8,8 @@ use alloc::sync::Arc;
 use ::core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
+use crate::mutex::SleepMutex;
+
 use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{Inode, InodeId, InodeMode, InodeOps};
@@ -207,7 +209,7 @@ pub struct SuperBlock {
     /// Serializes all cross-directory renames on this filesystem to
     /// prevent races during ancestor relationship checks. Same-directory
     /// renames don't need this mutex.
-    pub s_vfs_rename_mutex: Mutex<()>,
+    pub s_vfs_rename_mutex: SleepMutex<()>,
 }
 
 use super::inode::AsAny;
@@ -230,7 +232,7 @@ impl SuperBlock {
             next_ino: AtomicU64::new(1), // Start inode numbers at 1
             dev_id: NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed),
             private: RwLock::new(None),
-            s_vfs_rename_mutex: Mutex::new(()),
+            s_vfs_rename_mutex: SleepMutex::new(()),
         })
     }
 

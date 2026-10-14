@@ -137,6 +137,7 @@ pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
 pub const O_CREAT: u32 = 0o100;
 pub const O_TRUNC: u32 = 0o1000;
+pub const O_APPEND: u32 = 0o2000;
 // O_DIRECTORY/O_NOFOLLOW/O_DIRECT/O_LARGEFILE are per-arch: see x86_64.rs / aarch64.rs.
 
 // lseek whence constants

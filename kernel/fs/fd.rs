@@ -34,8 +34,12 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64) -> i64 {
         }
     }
 
-    // Perform truncate
-    match inode.i_op.truncate(inode, length) {
+    // Under i_rwsem, like Linux do_truncate: atomic with writes
+    inode.inode_lock();
+    let r = inode.i_op.truncate(inode, length);
+    // SAFETY: taken above by this thread
+    unsafe { inode.inode_unlock() };
+    match r {
         Ok(()) => 0,
         Err(KernelError::IsDirectory) => KernelError::IsDirectory.sysret(),
         Err(KernelError::OperationNotSupported) => KernelError::InvalidArgument.sysret(),

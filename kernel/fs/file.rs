@@ -16,6 +16,8 @@ use ::core::cmp::min;
 use ::core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use spin::Mutex;
 
+use crate::mutex::{SleepMutex, SleepMutexGuard};
+
 use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{FileType, Inode, InodeId};
@@ -330,6 +332,10 @@ pub struct File {
     /// Current file position
     pos: AtomicU64,
 
+    /// Serializes position updates of read/write/lseek/getdents on
+    /// regular files and directories (Linux f_pos_lock, FMODE_ATOMIC_POS)
+    f_pos_lock: SleepMutex<()>,
+
     /// Open flags (protected by f_lock, like Linux)
     f_lock: Mutex<u32>,
 
@@ -367,6 +373,7 @@ impl File {
             dentry,
             mnt,
             pos: AtomicU64::new(0),
+            f_pos_lock: SleepMutex::new(()),
             f_lock: Mutex::new(flags),
             f_op,
             owner_pid: AtomicI32::new(0),
@@ -388,6 +395,13 @@ impl File {
     /// Set file position
     pub fn set_pos(&self, pos: u64) {
         self.pos.store(pos, Ordering::Relaxed);
+    }
+
+    /// Take f_pos_lock for a position-based syscall (Linux fdget_pos):
+    /// only regular files and directories need it (FMODE_ATOMIC_POS)
+    pub fn pos_lock(&self) -> Option<SleepMutexGuard<'_, ()>> {
+        let m = self.get_inode()?.mode();
+        (m.is_file() || m.is_dir()).then(|| self.f_pos_lock.lock())
     }
 
     /// Advance file position by n bytes
@@ -477,13 +491,9 @@ impl File {
         self.f_op.read(self, buf)
     }
 
-    /// Write to file
+    /// Write at the file position
     pub fn write(&self, buf: &[u8]) -> Result<usize, KernelError> {
-        if !self.is_writable() {
-            return Err(KernelError::PermissionDenied);
-        }
-        self.remove_privs(buf);
-        self.f_op.write(self, buf)
+        self.write_at(buf, None, RwFlags::empty(), None)
     }
 
     /// Positioned read - read at given offset without modifying file position
@@ -494,13 +504,9 @@ impl File {
         self.f_op.pread(self, buf, offset)
     }
 
-    /// Positioned write - write at given offset without modifying file position
+    /// Positioned write (the file position is not used or changed)
     pub fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
-        if !self.is_writable() {
-            return Err(KernelError::PermissionDenied);
-        }
-        self.remove_privs(buf);
-        self.f_op.pwrite(self, buf, offset)
+        self.write_at(buf, Some(offset), RwFlags::empty(), None)
     }
 
     /// Read with RWF flags (for preadv2/pwritev2 with RWF_NOWAIT support)
@@ -509,15 +515,6 @@ impl File {
             return Err(KernelError::PermissionDenied);
         }
         self.f_op.read_with_flags(self, buf, flags)
-    }
-
-    /// Write with RWF flags
-    pub fn write_with_flags(&self, buf: &[u8], flags: RwFlags) -> Result<usize, KernelError> {
-        if !self.is_writable() {
-            return Err(KernelError::PermissionDenied);
-        }
-        self.remove_privs(buf);
-        self.f_op.write_with_flags(self, buf, flags)
     }
 
     /// Positioned read with RWF flags
@@ -533,18 +530,54 @@ impl File {
         self.f_op.pread_with_flags(self, buf, offset, flags)
     }
 
-    /// Positioned write with RWF flags
-    pub fn pwrite_with_flags(
+    /// Write `buf` at `at` (None: the file position, which advances)
+    /// (Linux vfs_write + generic_file_write_iter). Regular files are
+    /// written under the inode's i_rwsem: in append mode (`append`:
+    /// RWF_APPEND / RWF_NOAPPEND, None = the file's O_APPEND) the data
+    /// goes to the current end of file, also for pwrite (Linux), and
+    /// position, data and new size change atomically with respect to
+    /// other writers and truncate.
+    pub fn write_at(
         &self,
         buf: &[u8],
-        offset: u64,
+        at: Option<u64>,
         flags: RwFlags,
+        append: Option<bool>,
     ) -> Result<usize, KernelError> {
         if !self.is_writable() {
             return Err(KernelError::PermissionDenied);
         }
-        self.remove_privs(buf);
-        self.f_op.pwrite_with_flags(self, buf, offset, flags)
+        let inode = match self.get_inode() {
+            Some(i) if i.mode().is_file() => i,
+            _ => return self.do_write(buf, at, flags),
+        };
+        let append = append.unwrap_or(self.get_flags() & flags::O_APPEND != 0);
+        inode.inode_lock();
+        let r = (|| {
+            let at = match (append, at) {
+                (true, None) => {
+                    self.set_pos(inode.get_size());
+                    None
+                }
+                (true, Some(_)) => Some(inode.get_size()),
+                (false, at) => at,
+            };
+            let pos = at.unwrap_or_else(|| self.get_pos());
+            super::syscall::check_fsize_limit(pos, buf.len())
+                .map_err(|_| KernelError::FileTooLarge)?;
+            self.remove_privs(buf);
+            self.do_write(buf, at, flags)
+        })();
+        // SAFETY: taken above by this thread
+        unsafe { inode.inode_unlock() };
+        r
+    }
+
+    fn do_write(&self, buf: &[u8], at: Option<u64>, flags: RwFlags) -> Result<usize, KernelError> {
+        match at {
+            None => self.f_op.write_with_flags(self, buf, flags),
+            Some(o) => self.f_op.pwrite_with_flags(self, buf, o, flags),
+        }
     }
 
     /// Seek

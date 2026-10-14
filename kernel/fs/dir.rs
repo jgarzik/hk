@@ -94,6 +94,7 @@ pub fn sys_getdents64(fd: i32, dirp: u64, count: u64) -> i64 {
         return KernelError::NotDirectory.sysret();
     }
 
+    let _pos = file.pos_lock();
     let limit = count.min(GETDENTS_CHUNK);
     let mut buf = Vec::new();
     let mut full = false;

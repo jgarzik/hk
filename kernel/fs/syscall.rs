@@ -130,8 +130,6 @@ pub fn current_fd_table() -> alloc::sync::Arc<spin::Mutex<crate::task::FdTable<F
     get_task_fd(current_tid()).expect("current task has no FD table")
 }
 
-/// Small buffer size for stack-based I/O (4KB)
-pub const SMALL_BUF_SIZE: usize = 4096;
 
 ///
 /// Returns the parent dentry and the final component name.
