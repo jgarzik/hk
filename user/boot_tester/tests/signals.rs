@@ -800,6 +800,11 @@ unsafe extern "C" fn signal_restorer() -> ! {
     )
 }
 
+/// Address of the SA_RESTORER trampoline (for other test modules)
+pub fn restorer_addr() -> u64 {
+    signal_restorer as *const () as u64
+}
+
 /// Simple signal handler that sets the global flag
 ///
 /// For SA_SIGINFO handlers: fn(signo: i32, info: *const SigInfo, ucontext: *const u8)

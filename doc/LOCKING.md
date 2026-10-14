@@ -318,6 +318,22 @@ pub needs_reschedule: AtomicBool, // Reschedule request flag
    again, so a task that slept inside a syscall returns (and builds signal
    frames) with its own registers.
 
+7. **User FP/SIMD state is saved eagerly, per task, never lazily** - no
+   lock is involved; the state always lives with the task it belongs to:
+   - x86-64: the kernel is soft-float and never touches x87/XMM/YMM, so a
+     task's user FP state stays in the registers while it is in the kernel.
+     `context_switch` XSAVEs (or FXSAVEs) it into an area on the outgoing
+     task's kernel stack and XRSTORs it when that task runs again; a fork
+     child gets the parent's state in a reserve above its trap frame
+     (`SchedArch::CLONE_FPU_RESERVE`), loaded by `clone_child_entry`.
+   - aarch64: the kernel uses NEON, so every exception entry (EL0 and EL1)
+     saves q0-q31/FPCR/FPSR in its trap frame and restores them on exit;
+     the EL0 frame (per-CPU `user_frame`, saved with the syscall block of
+     rule 6) holds the user FP state. `__switch_to_asm` preserves d8-d15.
+   Signal frames, fork and execve read/write the state in these places;
+   nothing may use user FP registers between a context switch's save and
+   the task's next return to user mode except through them.
+
 #### Sleep / Wakeup Protocol (Linux set_current_state / try_to_wake_up)
 
 Each run-queue entry (`KernelThreadContext`) carries the scheduling truth:

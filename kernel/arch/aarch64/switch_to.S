@@ -31,6 +31,10 @@
  *   offset 0x50: fp (x29)
  *   offset 0x58: lr (x30)
  *   offset 0x60: sp
+ *   offset 0x68: d8-d15 (callee-saved FP registers; kernel code uses NEON)
+ *
+ * User FP/SIMD state is not handled here: it lives in the task's EL0 trap
+ * frame (vectors.S) while the task is in the kernel.
  */
 __switch_to_asm:
     /* Save callee-saved registers to prev context */
@@ -42,6 +46,10 @@ __switch_to_asm:
     stp     x29, x30, [x0, #0x50]   // FP, LR
     mov     x9, sp
     str     x9, [x0, #0x60]         // SP
+    stp     d8, d9, [x0, #0x68]
+    stp     d10, d11, [x0, #0x78]
+    stp     d12, d13, [x0, #0x88]
+    stp     d14, d15, [x0, #0x98]
 
     /* Switch to new user page table */
     msr     ttbr0_el1, x3
@@ -59,6 +67,10 @@ __switch_to_asm:
     ldp     x29, x30, [x1, #0x50]   // FP, LR
     ldr     x9, [x1, #0x60]
     mov     sp, x9                  // SP
+    ldp     d8, d9, [x1, #0x68]
+    ldp     d10, d11, [x1, #0x78]
+    ldp     d12, d13, [x1, #0x88]
+    ldp     d14, d15, [x1, #0x98]
 
     ret                             // Return to new task's LR
 
@@ -91,5 +103,9 @@ __switch_to_asm_first:
     ldp     x29, x30, [x0, #0x50]   // FP, LR
     ldr     x9, [x0, #0x60]
     mov     sp, x9                  // SP
+    ldp     d8, d9, [x0, #0x68]
+    ldp     d10, d11, [x0, #0x78]
+    ldp     d12, d13, [x0, #0x88]
+    ldp     d14, d15, [x0, #0x98]
 
     ret                             // Jump to task's entry (via LR)

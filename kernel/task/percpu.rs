@@ -1211,10 +1211,13 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         config.child_stack
     };
 
-    // Build child's TrapFrame on the child's kernel stack
+    // Build child's TrapFrame on the child's kernel stack, below the arch's
+    // reserve for the inherited FP/SIMD state (filled here, loaded by
+    // clone_child_entry before it returns to user mode)
     // This will be restored by clone_child_entry via IRETQ
     let trapframe_size = core::mem::size_of::<<CurrentArch as Arch>::TrapFrame>() as u64;
-    let trapframe_ptr = kstack_top - trapframe_size;
+    let trapframe_ptr = kstack_top - CurrentArch::CLONE_FPU_RESERVE - trapframe_size;
+    CurrentArch::clone_child_fpu(kstack_top);
 
     // Use architecture-specific TrapFrame construction
     let child_trapframe =

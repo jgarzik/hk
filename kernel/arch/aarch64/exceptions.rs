@@ -157,6 +157,7 @@ extern "C" fn handle_el1_irq(_frame: &mut Aarch64TrapFrame) {
 extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
     let ec = (esr >> 26) & 0x3F;
     let iss = esr & 0x1FFFFFF;
+    set_user_frame(frame);
 
     match ec {
         EC_SVC64 => {
@@ -296,9 +297,17 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
     }
 }
 
+/// Record the trap frame of an entry from EL0 as the current task's user frame
+fn set_user_frame(frame: &mut Aarch64TrapFrame) {
+    if super::percpu::try_current_cpu().is_some() {
+        unsafe { super::percpu::current_cpu_mut() }.user_frame = frame;
+    }
+}
+
 /// Handle IRQ from EL0 (user mode)
 #[unsafe(no_mangle)]
 extern "C" fn handle_el0_irq(frame: &mut Aarch64TrapFrame) {
+    set_user_frame(frame);
     // For now, handle same as EL1 IRQ
     handle_el1_irq(frame);
 }

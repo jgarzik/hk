@@ -41,8 +41,11 @@ use crate::task::{CurrentTask, Tid};
 
 /// AArch64 trap frame for saving/restoring CPU state on exception entry
 ///
-/// This captures all general-purpose registers plus exception state.
-/// Layout matches the order we push/pop in exception vectors.
+/// This captures all general-purpose registers, exception state and the
+/// FP/SIMD registers (the kernel uses NEON, so every exception saves them).
+/// Layout matches the order we push/pop in exception vectors (vectors.S
+/// TRAP_FRAME_SIZE / TF_*). For an exception from EL0 this is the task's
+/// user state, at the top of its kernel stack.
 #[repr(C)]
 #[derive(Clone, Default)]
 pub struct Aarch64TrapFrame {
@@ -54,7 +57,16 @@ pub struct Aarch64TrapFrame {
     pub elr: u64,
     /// Saved Program Status Register
     pub spsr: u64,
+    /// Floating-point status register
+    pub fpsr: u32,
+    /// Floating-point control register
+    pub fpcr: u32,
+    /// SIMD/FP registers V0-V31
+    pub v: [u128; 32],
 }
+
+const _: () = assert!(core::mem::size_of::<Aarch64TrapFrame>() == 0x320);
+const _: () = assert!(core::mem::offset_of!(Aarch64TrapFrame, v) == 0x120);
 
 // Re-export TaskContext from context module
 pub use context::Aarch64TaskContext;
@@ -501,6 +513,43 @@ impl UserModeOps for Aarch64Arch {
                 "mov x29, #0", // FP
                 "mov x30, #0", // LR
 
+                // A new program image starts with zeroed FP/SIMD registers
+                // and the default FPCR/FPSR (no kernel data leaks either)
+                "msr fpcr, xzr",
+                "msr fpsr, xzr",
+                "movi v0.2d, #0",
+                "movi v1.2d, #0",
+                "movi v2.2d, #0",
+                "movi v3.2d, #0",
+                "movi v4.2d, #0",
+                "movi v5.2d, #0",
+                "movi v6.2d, #0",
+                "movi v7.2d, #0",
+                "movi v8.2d, #0",
+                "movi v9.2d, #0",
+                "movi v10.2d, #0",
+                "movi v11.2d, #0",
+                "movi v12.2d, #0",
+                "movi v13.2d, #0",
+                "movi v14.2d, #0",
+                "movi v15.2d, #0",
+                "movi v16.2d, #0",
+                "movi v17.2d, #0",
+                "movi v18.2d, #0",
+                "movi v19.2d, #0",
+                "movi v20.2d, #0",
+                "movi v21.2d, #0",
+                "movi v22.2d, #0",
+                "movi v23.2d, #0",
+                "movi v24.2d, #0",
+                "movi v25.2d, #0",
+                "movi v26.2d, #0",
+                "movi v27.2d, #0",
+                "movi v28.2d, #0",
+                "movi v29.2d, #0",
+                "movi v30.2d, #0",
+                "movi v31.2d, #0",
+
                 // Return to user mode
                 "eret",
 
@@ -719,6 +768,11 @@ impl Aarch64Arch {
 impl SchedArch for Aarch64Arch {
     type SchedPageTable = Aarch64PageTable;
 
+    // The child's TrapFrame carries the inherited FP/SIMD registers
+    const CLONE_FPU_RESERVE: u64 = 0;
+
+    fn clone_child_fpu(_kstack_top: u64) {}
+
     fn clone_child_trapframe(
         parent_rip: u64,
         parent_rflags: u64,
@@ -729,12 +783,20 @@ impl SchedArch for Aarch64Arch {
         // Child returns 0 from fork/clone (x0 is the return value)
         regs[0] = 0;
 
-        Aarch64TrapFrame {
+        let mut tf = Aarch64TrapFrame {
             x: regs,             // All parent GPRs (with x0 = 0 for child)
             elr: parent_rip,     // Return address
             spsr: parent_rflags, // Saved PSTATE
             sp: child_rsp,       // Child's stack pointer
+            ..Default::default()
+        };
+        // The child inherits the parent's FP/SIMD registers
+        if let Some(parent) = percpu::current_user_frame() {
+            tf.fpsr = parent.fpsr;
+            tf.fpcr = parent.fpcr;
+            tf.v = parent.v;
         }
+        tf
     }
 }
 

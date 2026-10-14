@@ -16,6 +16,7 @@ pub mod acpi;
 pub mod context;
 pub mod cpu;
 pub mod drivers;
+pub mod fpu;
 pub mod interrupts;
 pub mod io;
 pub mod ioremap;
@@ -84,22 +85,23 @@ impl CpuOps for X86_64Arch {
 #[derive(Debug, Clone, Default)]
 #[repr(C)]
 pub struct X86_64TrapFrame {
-    // General purpose registers (pushed by software)
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
-    pub r11: u64,
-    pub r10: u64,
-    pub r9: u64,
-    pub r8: u64,
-    pub rbp: u64,
-    pub rdi: u64,
-    pub rsi: u64,
-    pub rdx: u64,
-    pub rcx: u64,
-    pub rbx: u64,
+    // General purpose registers (pushed by software; `exception_common`
+    // pushes r15 first, so rax is at the lowest address)
     pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
 
     // Pushed by CPU on interrupt/exception
     pub error_code: u64,
@@ -151,6 +153,8 @@ impl UserModeOps for X86_64Arch {
         page_table_root: u64,
         kernel_stack: u64,
     ) -> ! {
+        // A new program image starts with the initial FP/SIMD state
+        fpu::load_init_state();
         unsafe {
             syscall::jump_to_user_iret(entry, user_stack, page_table_root, kernel_stack);
         }
@@ -163,6 +167,12 @@ impl UserModeOps for X86_64Arch {
 
 impl SchedArch for X86_64Arch {
     type SchedPageTable = paging::X86_64PageTable;
+
+    const CLONE_FPU_RESERVE: u64 = fpu::CLONE_FPU_RESERVE;
+
+    fn clone_child_fpu(kstack_top: u64) {
+        fpu::save_for_clone_child(kstack_top);
+    }
 
     fn clone_child_trapframe(
         parent_rip: u64,
@@ -467,8 +477,8 @@ pub fn early_init() {
     uaccess::enable_smep();
     uaccess::enable_smap();
 
-    // Initialize FPU and SSE
-    cpu::init_fpu_sse();
+    // Enable x87/SSE(/AVX) for user tasks; pick XSAVE or FXSAVE
+    fpu::init_cpu(true);
 
     // Initialize IDT (with IST entries for DF/NMI)
     interrupts::init_idt();

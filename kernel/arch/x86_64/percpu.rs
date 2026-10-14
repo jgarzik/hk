@@ -92,6 +92,16 @@ pub struct PerCpu {
     /// signal frame saves it and rt_sigreturn returns it to the interrupted code
     pub syscall_user_rax: u64,
 
+    /// User RCX/R11. On syscall entry they equal RIP/RFLAGS (the `syscall`
+    /// instruction overwrote them); after a fault or rt_sigreturn they are
+    /// real values, returned to user mode by the IRETQ exit path
+    pub syscall_user_rcx: u64,
+    pub syscall_user_r11: u64,
+
+    /// Set by rt_sigreturn: return to user mode with IRETQ restoring every
+    /// register (SYSRET would clobber RCX/R11)
+    pub syscall_full_restore: bool,
+
     /// Syscall number of the syscall in progress (for -ERESTART* restarts)
     pub syscall_nr: u64,
 
@@ -108,8 +118,9 @@ pub struct PerCpu {
 /// (and builds signal frames) with its own registers.
 #[derive(Clone, Copy)]
 pub struct SyscallUserState {
-    regs: [u64; 18],
+    regs: [u64; 19],
     modified: bool,
+    full_restore: bool,
 }
 
 /// Capture the syscall user-register block of this CPU
@@ -134,9 +145,11 @@ pub fn save_syscall_user_state() -> SyscallUserState {
             p.syscall_user_r10,
             p.syscall_user_rax,
             p.syscall_nr,
-            0,
+            p.syscall_user_rcx,
+            p.syscall_user_r11,
         ],
         modified: p.signal_context_modified,
+        full_restore: p.syscall_full_restore,
     }
 }
 
@@ -161,7 +174,10 @@ pub fn restore_syscall_user_state(s: &SyscallUserState) {
     p.syscall_user_r10 = r[14];
     p.syscall_user_rax = r[15];
     p.syscall_nr = r[16];
+    p.syscall_user_rcx = r[17];
+    p.syscall_user_r11 = r[18];
     p.signal_context_modified = s.modified;
+    p.syscall_full_restore = s.full_restore;
 }
 
 /// Arrange for the current syscall to be re-executed on return to user
@@ -208,6 +224,9 @@ impl PerCpu {
             syscall_user_r9: 0,
             syscall_user_r10: 0,
             syscall_user_rax: 0,
+            syscall_user_rcx: 0,
+            syscall_user_r11: 0,
+            syscall_full_restore: false,
             syscall_nr: 0,
             signal_context_modified: false,
         }
@@ -504,6 +523,9 @@ pub fn save_syscall_state(
             let percpu_mut = current_cpu_mut();
             percpu_mut.syscall_user_rip = user_rip;
             percpu_mut.syscall_user_rflags = user_rflags;
+            // `syscall` put RIP/RFLAGS in RCX/R11
+            percpu_mut.syscall_user_rcx = user_rip;
+            percpu_mut.syscall_user_r11 = user_rflags;
             percpu_mut.syscall_user_rsp = user_rsp;
             percpu_mut.syscall_user_rbx = user_rbx;
             percpu_mut.syscall_user_rbp = user_rbp;
@@ -628,14 +650,18 @@ pub fn get_syscall_user_caller_saved() -> (u64, u64, u64, u64, u64, u64) {
 ///   frame_base+104: r11 (user RFLAGS)
 ///   frame_base+112: rcx (user RIP)
 ///   frame_base+120: user_rsp
+///
+/// Returns 1 if the syscall must return through IRETQ with every register
+/// (incl. RCX/R11) taken from the per-CPU block (see [`fill_iret_frame`]),
+/// 0 for the normal SYSRET exit.
 #[inline]
-pub fn update_syscall_return_frame(frame_base: *mut u64) {
+pub extern "C" fn update_syscall_return_frame(frame_base: *mut u64) -> u64 {
     if let Some(_percpu) = try_current_cpu() {
         unsafe {
             let percpu_mut = current_cpu_mut();
             // Only update if signal delivery modified the context
             if !percpu_mut.signal_context_modified {
-                return;
+                return 0;
             }
             // Clear the flag
             percpu_mut.signal_context_modified = false;
@@ -660,7 +686,29 @@ pub fn update_syscall_return_frame(frame_base: *mut u64) {
             *frame_base.add(9) = percpu_mut.syscall_user_r13; // offset 72
             *frame_base.add(8) = percpu_mut.syscall_user_r14; // offset 64
             *frame_base.add(7) = percpu_mut.syscall_user_r15; // offset 56
+            if core::mem::take(&mut percpu_mut.syscall_full_restore) {
+                return 1;
+            }
         }
+    }
+    0
+}
+
+/// IRETQ exit of a syscall (after rt_sigreturn): fill `out` with the IRET
+/// frame (RIP, CS, RFLAGS, RSP, SS) followed by the user RCX and R11
+pub extern "C" fn fill_iret_frame(out: *mut u64) {
+    let p = unsafe { current_cpu_mut() };
+    let vals = [
+        p.syscall_user_rip,
+        super::cpu::USER_CODE_SELECTOR as u64,
+        p.syscall_user_rflags,
+        p.syscall_user_rsp,
+        super::cpu::USER_DATA_SELECTOR as u64,
+        p.syscall_user_rcx,
+        p.syscall_user_r11,
+    ];
+    for (i, v) in vals.iter().enumerate() {
+        unsafe { *out.add(i) = *v };
     }
 }
 

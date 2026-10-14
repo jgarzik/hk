@@ -11,6 +11,7 @@
 //! TLS (Thread Local Storage) handling follows the Linux kernel pattern:
 //! save/restore FS base in Rust before calling the pure-asm switch.
 
+use super::fpu::{self, FpuArea};
 use super::percpu::{read_fs_base, write_fs_base};
 use crate::task::percpu::current_tid;
 use crate::task::{Tid, get_task_tls, set_task_tls};
@@ -205,27 +206,32 @@ pub extern "C" fn clone_child_entry() -> ! {
         "wrmsr",
         "1:",
 
+        // Load the FP/SIMD state the parent saved above the TrapFrame
+        // (fpu::save_for_clone_child)
+        "lea rdi, [rsp + {tf_size}]",
+        "call {fpu_restore}",
+
         // RSP points to the TrapFrame we prepared on the child's kernel stack
         // TrapFrame layout:
-        //   r15, r14, r13, r12, r11, r10, r9, r8, rbp, rdi, rsi, rdx, rcx, rbx, rax,
+        //   rax, rbx, rcx, rdx, rsi, rdi, rbp, r8-r15,
         //   error_code, rip, cs, rflags, rsp, ss
 
         // Restore general purpose registers from TrapFrame
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rbp",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rbx",
         "pop rax",     // Will be 0 (child return value)
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop rbp",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
 
         // Skip error_code
         "add rsp, 8",
@@ -237,6 +243,8 @@ pub extern "C" fn clone_child_entry() -> ! {
         get_cr3 = sym crate::task::percpu::get_current_task_cr3,
         write_child_tid = sym crate::task::percpu::write_child_tid_if_needed,
         get_tls = sym crate::task::percpu::get_current_task_tls,
+        fpu_restore = sym super::fpu::restore_from_raw,
+        tf_size = const core::mem::size_of::<super::X86_64TrapFrame>(),
     );
 }
 
@@ -339,12 +347,19 @@ pub unsafe fn context_switch(
     //   next_sp - the RSP value to switch to
     //   new_kstack - kernel stack top for TSS.RSP0
     //   new_cr3 - new task's page table physical address
+    //
+    // The outgoing task's user FP/SIMD registers (the kernel itself never
+    // touches them: soft-float) are kept in `fpu_area` on its own kernel
+    // stack and reloaded when it is switched back in.
+    let mut fpu_area = core::mem::MaybeUninit::<FpuArea>::uninit();
     unsafe {
+        fpu::save_raw(fpu_area.as_mut_ptr());
         let prev_sp_ptr = &raw mut (*old_ctx).rsp;
         let next_sp = (*new_ctx).rsp;
         __switch_to_asm(prev_sp_ptr, next_sp, new_kstack, new_cr3);
+        // Back on this task: its FP state is in `fpu_area`
+        fpu::restore_raw(fpu_area.as_ptr());
     }
-    // When we return here, we're a different task that was switched back to us
 }
 
 /// Switch to a new task without saving the old context

@@ -23,7 +23,7 @@ pub const IST_NMI: u8 = 2;
 ///
 /// Note: We need to preserve rbx since LLVM uses it internally.
 /// We push/pop it manually in the asm block.
-fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
+pub(crate) fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     let (eax, ebx, ecx, edx): (u32, u32, u32, u32);
     unsafe {
         ::core::arch::asm!(
@@ -109,27 +109,6 @@ pub fn enable_nx() {
     let efer = rdmsr(MSR_EFER);
     if efer & EFER_NXE == 0 {
         wrmsr(MSR_EFER, efer | EFER_NXE);
-    }
-}
-
-/// Initialize FPU and SSE
-pub fn init_fpu_sse() {
-    unsafe {
-        // CR0: Clear EM (bit 2), set MP (bit 1)
-        let mut cr0: u64;
-        ::core::arch::asm!("mov {}, cr0", out(reg) cr0);
-        cr0 &= !(1 << 2); // Clear EM (emulation)
-        cr0 |= 1 << 1; // Set MP (monitor coprocessor)
-        ::core::arch::asm!("mov cr0, {}", in(reg) cr0);
-
-        // CR4: Set OSFXSR (bit 9) and OSXMMEXCPT (bit 10)
-        let mut cr4: u64;
-        ::core::arch::asm!("mov {}, cr4", out(reg) cr4);
-        cr4 |= (1 << 9) | (1 << 10);
-        ::core::arch::asm!("mov cr4, {}", in(reg) cr4);
-
-        // Initialize FPU
-        ::core::arch::asm!("fninit");
     }
 }
 

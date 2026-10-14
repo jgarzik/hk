@@ -220,6 +220,25 @@ pub mod sa_flags {
 }
 
 // =============================================================================
+// Signal information (siginfo)
+// =============================================================================
+
+/// What the signal frame reports about a signal (Linux kernel_siginfo
+/// subset, plus the arch fault details of sigcontext)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KSigInfo {
+    /// si_code
+    pub code: i32,
+    /// si_addr: faulting address or instruction (fault signals)
+    pub addr: u64,
+    /// x86-64: sigcontext.trapno (exception vector)
+    pub trapno: u64,
+    /// x86-64: sigcontext.err (exception error code); arm64: ESR_EL1
+    /// (reported in an esr_context record when non-zero)
+    pub error: u64,
+}
+
+// =============================================================================
 // Signal Handler
 // =============================================================================
 
@@ -1152,7 +1171,7 @@ pub fn syscall_exit_signal_work(result: u64, restartable: bool) -> u64 {
                         EINTR
                     };
                 }
-                if deliver_to_handler(tid, sig, &action) {
+                if deliver_to_handler(tid, sig, &action, &KSigInfo::default()) {
                     return ret;
                 }
                 // Frame setup failed: SIGSEGV was forced; deliver it
@@ -1180,7 +1199,7 @@ fn restore_saved_sigmask(tid: Tid) {
 }
 
 /// Set up the handler frame for `sig`; false if that failed (SIGSEGV forced)
-fn deliver_to_handler(tid: Tid, sig: u32, action: &SigAction) -> bool {
+fn deliver_to_handler(tid: Tid, sig: u32, action: &SigAction, info: &KSigInfo) -> bool {
     use crate::arch::signal;
 
     // Mask to save in the frame (restored by rt_sigreturn): the
@@ -1189,7 +1208,7 @@ fn deliver_to_handler(tid: Tid, sig: u32, action: &SigAction) -> bool {
         with_task_signal_state(tid, |state| state.saved_sigmask.unwrap_or(state.blocked))
             .unwrap_or(SigSet::EMPTY);
 
-    match signal::setup_rt_frame(sig, action, frame_mask) {
+    match signal::setup_rt_frame(sig, action, frame_mask, info) {
         Ok(()) => {
             // Block action.mask and the signal itself (unless SA_NODEFER)
             with_task_signal_state(tid, |state| {

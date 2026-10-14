@@ -111,15 +111,33 @@ el0_32_serror:
 // ============================================================================
 
 /*
- * Macro to save all general-purpose registers to the stack.
+ * Size of an Aarch64TrapFrame: x0-x30, sp, elr, spsr (0x110 bytes), then
+ * the FP/SIMD state: fpsr, fpcr (0x110), q0-q31 (0x120..0x320).
+ *
+ * The kernel is compiled with NEON (aarch64-unknown-none), so every
+ * exception saves the full FP/SIMD state: on entry from EL0 this is the
+ * user's FP state (it lives in this frame while the task is in the kernel,
+ * like pt_regs: signal frames, fork and execve read/write it here), on
+ * entry from EL1 it is the interrupted kernel code's.
+ */
+.set TRAP_FRAME_SIZE, 0x320
+.set TF_FPSR, 0x110
+.set TF_FPCR, 0x114
+.set TF_V, 0x120
+
+/*
+ * Macro to save all general-purpose and FP/SIMD registers to the stack.
  * Creates an Aarch64TrapFrame on the stack.
  *
  * Stack layout (grows down):
- *   sp+0x110: spsr
- *   sp+0x108: elr
- *   sp+0x100: sp (saved SP)
- *   sp+0x0F8: x30
- *   sp+0x0F0: x29
+ *   sp+0x120: q0-q31
+ *   sp+0x114: fpcr
+ *   sp+0x110: fpsr
+ *   sp+0x108: spsr
+ *   sp+0x100: elr
+ *   sp+0x0F8: sp (saved SP)
+ *   sp+0x0F0: x30
+ *   sp+0x0E8: x29
  *   ...
  *   sp+0x008: x1
  *   sp+0x000: x0
@@ -127,8 +145,8 @@ el0_32_serror:
  * Parameter: use_sp_el0 - if 1, save SP_EL0 (user stack), else save SP_EL1 (kernel stack)
  */
 .macro SAVE_CONTEXT use_sp_el0=0
-    // Allocate space for trap frame (31 regs + sp + elr + spsr = 34 * 8 = 272 bytes)
-    sub     sp, sp, #272
+    // Allocate space for the trap frame
+    sub     sp, sp, #TRAP_FRAME_SIZE
 
     // Save x0-x29 (30 registers)
     stp     x0, x1, [sp, #0x00]
@@ -154,7 +172,7 @@ el0_32_serror:
 .if \use_sp_el0
     mrs     x0, sp_el0
 .else
-    add     x0, sp, #272
+    add     x0, sp, #TRAP_FRAME_SIZE
 .endif
     str     x0, [sp, #0xf8]
 
@@ -165,6 +183,59 @@ el0_32_serror:
     // Save SPSR_EL1 (saved program status)
     mrs     x0, spsr_el1
     str     x0, [sp, #0x108]
+
+    // Save FP/SIMD state
+    mrs     x0, fpsr
+    str     w0, [sp, #TF_FPSR]
+    mrs     x0, fpcr
+    str     w0, [sp, #TF_FPCR]
+    stp     q0, q1, [sp, #TF_V + 0x000]
+    stp     q2, q3, [sp, #TF_V + 0x020]
+    stp     q4, q5, [sp, #TF_V + 0x040]
+    stp     q6, q7, [sp, #TF_V + 0x060]
+    stp     q8, q9, [sp, #TF_V + 0x080]
+    stp     q10, q11, [sp, #TF_V + 0x0a0]
+    stp     q12, q13, [sp, #TF_V + 0x0c0]
+    stp     q14, q15, [sp, #TF_V + 0x0e0]
+    stp     q16, q17, [sp, #TF_V + 0x100]
+    stp     q18, q19, [sp, #TF_V + 0x120]
+    stp     q20, q21, [sp, #TF_V + 0x140]
+    stp     q22, q23, [sp, #TF_V + 0x160]
+    stp     q24, q25, [sp, #TF_V + 0x180]
+    stp     q26, q27, [sp, #TF_V + 0x1a0]
+    stp     q28, q29, [sp, #TF_V + 0x1c0]
+    stp     q30, q31, [sp, #TF_V + 0x1e0]
+.if \use_sp_el0
+    // Kernel code runs with the default FP control state
+    msr     fpcr, xzr
+.endif
+.endm
+
+/*
+ * Restore the FP/SIMD state from the trap frame at sp (clobbers x0).
+ * Shared with clone_child_entry.
+ */
+.macro RESTORE_FP
+    ldp     q0, q1, [sp, #TF_V + 0x000]
+    ldp     q2, q3, [sp, #TF_V + 0x020]
+    ldp     q4, q5, [sp, #TF_V + 0x040]
+    ldp     q6, q7, [sp, #TF_V + 0x060]
+    ldp     q8, q9, [sp, #TF_V + 0x080]
+    ldp     q10, q11, [sp, #TF_V + 0x0a0]
+    ldp     q12, q13, [sp, #TF_V + 0x0c0]
+    ldp     q14, q15, [sp, #TF_V + 0x0e0]
+    ldp     q16, q17, [sp, #TF_V + 0x100]
+    ldp     q18, q19, [sp, #TF_V + 0x120]
+    ldp     q20, q21, [sp, #TF_V + 0x140]
+    ldp     q22, q23, [sp, #TF_V + 0x160]
+    ldp     q24, q25, [sp, #TF_V + 0x180]
+    ldp     q26, q27, [sp, #TF_V + 0x1a0]
+    ldp     q28, q29, [sp, #TF_V + 0x1c0]
+    ldp     q30, q31, [sp, #TF_V + 0x1e0]
+    ldr     w0, [sp, #TF_FPSR]
+    msr     fpsr, x0
+    ldr     w0, [sp, #TF_FPCR]
+    msr     fpcr, x0
 .endm
 
 /*
@@ -173,6 +244,8 @@ el0_32_serror:
  * Parameter: use_sp_el0 - if 1, restore SP_EL0 from trap frame (for return to user mode)
  */
 .macro RESTORE_CONTEXT use_sp_el0=0
+    RESTORE_FP
+
     // Restore SPSR_EL1
     ldr     x0, [sp, #0x108]
     msr     spsr_el1, x0
@@ -208,7 +281,7 @@ el0_32_serror:
     ldp     x0, x1, [sp, #0x00]
 
     // Deallocate frame
-    add     sp, sp, #272
+    add     sp, sp, #TRAP_FRAME_SIZE
 .endm
 
 

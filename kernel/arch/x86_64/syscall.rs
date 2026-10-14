@@ -955,6 +955,10 @@ unsafe extern "C" fn syscall_entry() {
         // Pass RSP as the frame base pointer
         "mov rdi, rsp",
         "call {update_frame}",
+        // Non-zero: rt_sigreturn restored a full user context; leave through
+        // IRETQ, which (unlike SYSRET) restores RCX and R11 too
+        "test rax, rax",
+        "jnz 5f",
 
         // Restore caller-saved registers (in reverse order of pushes)
         // Push order was: rax, rdi, rsi, rdx, r10, r8, r9
@@ -1008,11 +1012,40 @@ unsafe extern "C" fn syscall_entry() {
         // All other registers have been properly restored
         "sysretq",
 
+        // IRETQ exit. Frame layout as above, F = frame base:
+        //   F+0 r9, F+8 r8, F+16 r10, F+24 rdx, F+32 rsi, F+40 rdi, F+48 rax,
+        //   F+56 r15 .. F+96 rbx, F+104..F+128 rflags/rip/user rsp
+        // Below it: IRET frame (rip, cs, rflags, rsp, ss) + user rcx, r11
+        "5:",
+        "sub rsp, 56",
+        "mov rdi, rsp",
+        "call {fill_iret}",
+        // F = rsp + 56; the empty kernel stack starts at F + 128
+        "lea rax, [rsp + 184]",
+        "mov [rip + {kstack}], rax",
+        "mov r9, [rsp + 56]",
+        "mov r8, [rsp + 64]",
+        "mov r10, [rsp + 72]",
+        "mov rdx, [rsp + 80]",
+        "mov rsi, [rsp + 88]",
+        "mov rdi, [rsp + 96]",
+        "mov rax, [rsp + 104]",
+        "mov r15, [rsp + 112]",
+        "mov r14, [rsp + 120]",
+        "mov r13, [rsp + 128]",
+        "mov r12, [rsp + 136]",
+        "mov rbp, [rsp + 144]",
+        "mov rbx, [rsp + 152]",
+        "mov rcx, [rsp + 40]",
+        "mov r11, [rsp + 48]",
+        "iretq",
+
         handler = sym syscall_handler,
         kstack = sym SYSCALL_KERNEL_STACK,
         save_syscall_state = sym super::percpu::save_syscall_state,
         save_syscall_caller_saved = sym super::percpu::save_syscall_caller_saved,
         update_frame = sym super::percpu::update_syscall_return_frame,
+        fill_iret = sym super::percpu::fill_iret_frame,
     );
 }
 

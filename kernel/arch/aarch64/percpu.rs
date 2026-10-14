@@ -71,6 +71,10 @@ pub struct PerCpu {
     /// Flag set when signal delivery modifies the return context
     /// When true, the syscall return path should update the stack frame from percpu
     pub signal_context_modified: bool,
+
+    /// Trap frame of the current task's last entry from EL0 (top of its
+    /// kernel stack): holds its user FP/SIMD state while it is in the kernel
+    pub user_frame: *mut super::Aarch64TrapFrame,
 }
 
 /// Snapshot of the per-CPU syscall user-register block
@@ -87,6 +91,7 @@ pub struct SyscallUserState {
     regs: [u64; 31],
     orig_x0: u64,
     modified: bool,
+    user_frame: *mut super::Aarch64TrapFrame,
 }
 
 /// Capture the syscall user-register block of this CPU
@@ -99,6 +104,7 @@ pub fn save_syscall_user_state() -> SyscallUserState {
         regs: p.syscall_user_regs,
         orig_x0: p.syscall_orig_x0,
         modified: p.signal_context_modified,
+        user_frame: p.user_frame,
     }
 }
 
@@ -111,6 +117,16 @@ pub fn restore_syscall_user_state(s: &SyscallUserState) {
     p.syscall_user_regs = s.regs;
     p.syscall_orig_x0 = s.orig_x0;
     p.signal_context_modified = s.modified;
+    p.user_frame = s.user_frame;
+}
+
+/// The current task's user trap frame (see `PerCpu::user_frame`)
+///
+/// # Safety
+/// Only meaningful in process context of a task that entered from EL0.
+pub fn current_user_frame() -> Option<&'static mut super::Aarch64TrapFrame> {
+    let p = try_current_cpu()?;
+    unsafe { p.user_frame.as_mut() }
 }
 
 /// Arrange for the current syscall to be re-executed on return to user
@@ -151,6 +167,7 @@ impl PerCpu {
             syscall_user_regs: [0; 31],
             syscall_orig_x0: 0,
             signal_context_modified: false,
+            user_frame: core::ptr::null_mut(),
         }
     }
 
@@ -176,6 +193,7 @@ impl PerCpu {
         self.syscall_user_sp = 0;
         self.syscall_user_regs = [0; 31];
         self.signal_context_modified = false;
+        self.user_frame = core::ptr::null_mut();
     }
 
     /// Mark this CPU as online

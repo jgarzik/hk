@@ -53,6 +53,8 @@ pub struct Aarch64TaskContext {
     pub lr: u64,
     /// Stack pointer
     pub sp: u64,
+    /// Callee-saved FP registers d8-d15 (AAPCS64; the kernel uses FP/SIMD)
+    pub d8_d15: [u64; 8],
 }
 
 impl Aarch64TaskContext {
@@ -70,6 +72,7 @@ impl Aarch64TaskContext {
             fp: 0,
             lr: kernel_thread_start as *const () as u64, // Return address
             sp: stack_top,
+            d8_d15: [0; 8],
         }
     }
 
@@ -86,6 +89,7 @@ impl Aarch64TaskContext {
             fp: 0,
             lr: clone_child_entry as *const () as u64, // Return address
             sp: kstack_with_trapframe,
+            d8_d15: [0; 8],
         }
     }
 }
@@ -160,11 +164,34 @@ pub extern "C" fn clone_child_entry() -> ! {
         "msr tpidr_el0, x0",
 
         // SP points to the TrapFrame we prepared on the child's kernel stack
-        // TrapFrame layout (272 bytes):
+        // TrapFrame layout (Aarch64TrapFrame, 0x320 bytes):
         //   sp+0x000: x0-x30 (31 * 8 = 248 bytes)
         //   sp+0x0f8: sp
         //   sp+0x100: elr
         //   sp+0x108: spsr
+        //   sp+0x110: fpsr, sp+0x114: fpcr
+        //   sp+0x120: q0-q31 (inherited from the parent)
+
+        "ldp q0, q1, [sp, #0x120]",
+        "ldp q2, q3, [sp, #0x140]",
+        "ldp q4, q5, [sp, #0x160]",
+        "ldp q6, q7, [sp, #0x180]",
+        "ldp q8, q9, [sp, #0x1a0]",
+        "ldp q10, q11, [sp, #0x1c0]",
+        "ldp q12, q13, [sp, #0x1e0]",
+        "ldp q14, q15, [sp, #0x200]",
+        "ldp q16, q17, [sp, #0x220]",
+        "ldp q18, q19, [sp, #0x240]",
+        "ldp q20, q21, [sp, #0x260]",
+        "ldp q22, q23, [sp, #0x280]",
+        "ldp q24, q25, [sp, #0x2a0]",
+        "ldp q26, q27, [sp, #0x2c0]",
+        "ldp q28, q29, [sp, #0x2e0]",
+        "ldp q30, q31, [sp, #0x300]",
+        "ldr w0, [sp, #0x110]",
+        "msr fpsr, x0",
+        "ldr w0, [sp, #0x114]",
+        "msr fpcr, x0",
 
         // Restore SPSR_EL1
         "ldr x0, [sp, #0x108]",
@@ -202,7 +229,7 @@ pub extern "C" fn clone_child_entry() -> ! {
         "ldp x0, x1, [sp, #0x00]",
 
         // Deallocate frame (but we won't return to kernel, so this just cleans up)
-        "add sp, sp, #272",
+        "add sp, sp, #0x320",
 
         // Return to user mode
         "eret",

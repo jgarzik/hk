@@ -438,6 +438,15 @@ pub trait SchedArch: Arch + PerCpuOps + CpuOps + ContextOps + UserModeOps {
         parent_rflags: u64,
         child_rsp: u64,
     ) -> Self::TrapFrame;
+
+    /// Bytes reserved at the top of a clone child's kernel stack, above its
+    /// TrapFrame, for the user FP/SIMD state it inherits (0 when the
+    /// TrapFrame itself carries the FP state)
+    const CLONE_FPU_RESERVE: u64;
+
+    /// Save the calling task's user FP/SIMD state into the reserve of a
+    /// clone child whose kernel stack top is `kstack_top`
+    fn clone_child_fpu(kstack_top: u64);
 }
 
 // ============================================================================
