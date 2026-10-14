@@ -644,33 +644,35 @@ impl PciDevice {
         );
     }
 
-    /// Register an IRQ handler for this PCI device (x86_64 only)
-    ///
-    /// # Arguments
-    /// - `handler`: IRQ handler function
-    /// - `data`: Opaque pointer to driver state (passed to handler)
+    /// IRQ number of this device's INTx pin (arch routing: x86-64 legacy
+    /// PIC line from config space; aarch64 DT interrupt-map / virt swizzle)
+    pub fn intx_irq(&self) -> Option<u32> {
+        crate::arch::irq::pci_intx_irq(
+            self.bus,
+            self.device,
+            self.function,
+            self.header.interrupt_pin,
+            self.header.interrupt_line,
+        )
+    }
+
+    /// Unique handler id for this device (bus/device/function)
+    fn irq_id(&self) -> usize {
+        ((self.bus as usize) << 16) | ((self.device as usize) << 8) | (self.function as usize)
+    }
+
+    /// Register a (shareable, level-triggered) INTx handler for this device
+    /// and enable INTx at the device
     ///
     /// # Returns
     /// The IRQ number on success, or an error description
-    #[cfg(target_arch = "x86_64")]
     pub fn register_irq_handler(
         &self,
-        handler: crate::arch::x86_64::irq::IrqHandler,
+        handler: crate::arch::irq::IrqHandler,
         data: *mut (),
-    ) -> Result<u8, &'static str> {
-        let irq = self.header.interrupt_line;
-
-        // Check for invalid/unassigned IRQ
-        if irq == 0xFF || irq >= 16 {
-            return Err("No valid IRQ assigned to device");
-        }
-
-        // Generate unique ID from device address
-        let id =
-            ((self.bus as usize) << 16) | ((self.device as usize) << 8) | (self.function as usize);
-
-        // Register with the IRQ subsystem
-        crate::arch::x86_64::irq::register_irq_handler(irq, handler, data, id)?;
+    ) -> Result<u32, &'static str> {
+        let irq = self.intx_irq().ok_or("No valid IRQ assigned to device")?;
+        crate::arch::irq::register_irq_handler(irq, handler, data, self.irq_id())?;
 
         // Clear INTERRUPT_DISABLE bit in command register to enable interrupts
         let cmd = pci_read16(self.bus, self.device, self.function, offset::COMMAND);
@@ -681,78 +683,16 @@ impl PciDevice {
             offset::COMMAND,
             cmd & !command::INTERRUPT_DISABLE,
         );
-
-        // Enable this IRQ in the PIC
-        crate::arch::x86_64::pic::enable_irq(irq);
-
         Ok(irq)
     }
 
-    /// Register an IRQ handler for this PCI device (ARM/GIC version)
-    ///
-    /// On ARM, PCI interrupts are routed through the GIC as SPIs.
-    /// The interrupt_line field from PCI config space is mapped to GIC SPI.
-    #[cfg(target_arch = "aarch64")]
-    pub fn register_irq_handler(
-        &self,
-        handler: crate::arch::aarch64::irq::IrqHandler,
-        data: *mut (),
-    ) -> Result<u8, &'static str> {
-        let irq_line = self.header.interrupt_line;
-
-        // Check for invalid/unassigned IRQ
-        if irq_line == 0xFF {
-            return Err("No valid IRQ assigned to device");
-        }
-
-        // On ARM, PCI interrupts are typically wired to GIC SPIs starting at 32
-        // The exact mapping depends on the platform. For QEMU virt, PCI uses SPIs 32+
-        let gic_irq = 32 + irq_line as u32;
-
-        // Generate unique ID from device address
-        let id =
-            ((self.bus as usize) << 16) | ((self.device as usize) << 8) | (self.function as usize);
-
-        // Register with the GIC IRQ subsystem
-        crate::arch::aarch64::irq::register_irq_handler(gic_irq, handler, data, id)?;
-
-        // Clear INTERRUPT_DISABLE bit in command register to enable interrupts
-        let cmd = pci_read16(self.bus, self.device, self.function, offset::COMMAND);
-        pci_write16(
-            self.bus,
-            self.device,
-            self.function,
-            offset::COMMAND,
-            cmd & !command::INTERRUPT_DISABLE,
-        );
-
-        // GIC distributor enables all SPIs during gic::init()
-
-        Ok(irq_line)
-    }
-
-    /// Unregister IRQ handler for this PCI device (x86_64 version)
-    ///
-    /// Called during device removal (hotplug). Disables interrupts at the
-    /// device level and unregisters the handler from the IRQ subsystem.
-    ///
-    /// # Arguments
-    /// - None (uses device's IRQ and ID from PCI config)
+    /// Unregister this device's INTx handler (device removal / hotplug):
+    /// disables INTx at the device first
     ///
     /// # Returns
     /// The IRQ number that was unregistered, or an error
-    #[cfg(target_arch = "x86_64")]
-    pub fn unregister_irq_handler(&self) -> Result<u8, &'static str> {
-        let irq = self.header.interrupt_line;
-
-        // Check for invalid/unassigned IRQ
-        if irq == 0xFF || irq >= 16 {
-            return Err("No valid IRQ assigned to device");
-        }
-
-        // Generate the same unique ID that was used during registration
-        let id =
-            ((self.bus as usize) << 16) | ((self.device as usize) << 8) | (self.function as usize);
+    pub fn unregister_irq_handler(&self) -> Result<u32, &'static str> {
+        let irq = self.intx_irq().ok_or("No valid IRQ assigned to device")?;
 
         // Disable interrupts at device level first (set INTERRUPT_DISABLE bit)
         let cmd = pci_read16(self.bus, self.device, self.function, offset::COMMAND);
@@ -764,45 +704,8 @@ impl PciDevice {
             cmd | command::INTERRUPT_DISABLE,
         );
 
-        // Unregister from the IRQ subsystem
-        crate::arch::x86_64::irq::unregister_irq_handler(irq, id)?;
-
+        crate::arch::irq::unregister_irq_handler(irq, self.irq_id())?;
         Ok(irq)
-    }
-
-    /// Unregister IRQ handler for this PCI device (ARM/GIC version)
-    ///
-    /// On ARM, PCI interrupts are routed through the GIC as SPIs.
-    #[cfg(target_arch = "aarch64")]
-    pub fn unregister_irq_handler(&self) -> Result<u8, &'static str> {
-        let irq_line = self.header.interrupt_line;
-
-        // Check for invalid/unassigned IRQ
-        if irq_line == 0xFF {
-            return Err("No valid IRQ assigned to device");
-        }
-
-        // On ARM, PCI interrupts are typically wired to GIC SPIs starting at 32
-        let gic_irq = 32 + irq_line as u32;
-
-        // Generate the same unique ID that was used during registration
-        let id =
-            ((self.bus as usize) << 16) | ((self.device as usize) << 8) | (self.function as usize);
-
-        // Disable interrupts at device level first (set INTERRUPT_DISABLE bit)
-        let cmd = pci_read16(self.bus, self.device, self.function, offset::COMMAND);
-        pci_write16(
-            self.bus,
-            self.device,
-            self.function,
-            offset::COMMAND,
-            cmd | command::INTERRUPT_DISABLE,
-        );
-
-        // Unregister from the GIC IRQ subsystem
-        crate::arch::aarch64::irq::unregister_irq_handler(gic_irq, id)?;
-
-        Ok(irq_line)
     }
 
     /// Check if this is an xHCI USB controller

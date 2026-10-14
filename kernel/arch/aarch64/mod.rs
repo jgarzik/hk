@@ -14,6 +14,7 @@ pub mod gic;
 pub mod ioremap;
 pub mod irq;
 pub mod paging;
+pub mod pci_irq;
 pub mod percpu;
 pub mod power;
 pub mod ptrace;

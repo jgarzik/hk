@@ -1481,6 +1481,31 @@ if self._guard.is_some() {
 Device drivers use thread-context locks (Mutex, RwLock) rather than IrqSpinlock.
 ISRs set atomic flags but never acquire locks, deferring work to thread context.
 
+#### Device IRQ Registration (kernel/arch/{x86_64,aarch64}/irq.rs)
+
+| Lock | Type | IRQ class | Order |
+|------|------|-----------|-------|
+| `IRQ_TABLE` (per arch) | `IrqSpinlock` | taken in IRQ (`dispatch_irq`) and process context (register/unregister) | leaf except for the interrupt-controller MMIO it programs; handlers run under it |
+
+Generic interface (`crate::arch::irq`): `IrqHandler = fn(u32, *mut ()) ->
+bool`, `register_irq_handler(irq, handler, data, id)` (shareable; first
+handler unmasks the line, last one masks it), `unregister_irq_handler`,
+`pci_intx_irq(bus, dev, fn, pin, line)`. `PciDevice::register_irq_handler`
+uses these on both arches. Every handler of a shared line is called; a line
+nobody claims 100000 times in a row is masked (stuck level INTx).
+
+- aarch64: SPIs are configured by `gic::enable_spi` (level/edge in ICFGR,
+  priority 0x80, Group 1, IROUTER -> CPU 0, ISENABLER); PCI INTx comes from
+  the host bridge DT `interrupt-map`/`interrupt-map-mask` parsed at boot
+  (`arch/aarch64/pci_irq.rs`, matching in `bus/pci_intx.rs`), else the QEMU
+  virt swizzle INTID 35 + (slot + pin - 1) % 4.
+- x86-64: legacy 8259 PIC with the firmware-assigned config-space Interrupt
+  Line (QEMU `pc`). Real hardware in APIC mode (Dell OptiPlex 3020 target)
+  needs IOAPIC + ACPI `_PRT` routing (not implemented).
+- Handlers run in IRQ context with the table lock held: they must only ack
+  the device, touch atomics/IrqSpinlocks and wake threads; they must not
+  register/unregister IRQs.
+
 #### USB Subsystem
 
 **Location:** `kernel/usb/`

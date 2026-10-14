@@ -1,24 +1,36 @@
-//! IRQ Handler Registration and Dispatch
+//! IRQ Handler Registration and Dispatch (GICv3 SPIs)
 //!
-//! Provides a mechanism for drivers to register handlers for hardware IRQs.
-//! Supports IRQ sharing via handler chaining - each handler returns whether
-//! it handled the interrupt.
+//! Drivers register handlers for shared peripheral interrupts; several
+//! handlers may share one line (each returns whether it handled the
+//! interrupt). Registering the first handler configures and unmasks the SPI
+//! (level-triggered, routed to CPU 0); removing the last masks it.
 //!
 //! ARM GIC interrupt number ranges:
 //! - SGI (Software Generated Interrupts): 0-15 (used for IPIs)
 //! - PPI (Private Peripheral Interrupts): 16-31 (per-CPU, e.g., timer)
 //! - SPI (Shared Peripheral Interrupts): 32-1019 (shared across CPUs)
+//!
+//! Locking: `IRQ_TABLE` is an `IrqSpinlock` (taken by `dispatch_irq` in IRQ
+//! context, by register/unregister in process context). Handlers run with it
+//! held and must not register/unregister.
 
 use alloc::vec::Vec;
-use spin::Mutex;
+
+use super::gic::{self, Trigger};
+use crate::arch::IrqSpinlock;
 
 /// Maximum number of SPI interrupts supported
 const MAX_SPI: usize = 256;
 
-/// IRQ handler function signature
+/// Consecutive unclaimed interrupts after which a line is masked (Linux
+/// note_interrupt's "nobody cared"; a stuck level-triggered line would
+/// otherwise storm forever)
+const UNHANDLED_LIMIT: u32 = 100_000;
+
+/// IRQ handler function signature (same on all arches)
 ///
 /// Arguments:
-/// - `irq`: The IRQ number
+/// - `irq`: The IRQ number (GIC INTID)
 /// - `data`: Opaque pointer to driver instance state
 ///
 /// Returns `true` if the interrupt was handled by this driver
@@ -31,134 +43,125 @@ struct IrqEntry {
     id: usize,
 }
 
-// SAFETY: IrqEntry is only accessed with interrupts disabled (in ISR context)
-// or under the IRQ_TABLE lock
+// SAFETY: IrqEntry is only accessed under the IRQ_TABLE lock
 unsafe impl Send for IrqEntry {}
 unsafe impl Sync for IrqEntry {}
 
+/// One SPI line
+struct IrqLine {
+    handlers: Vec<IrqEntry>,
+    unhandled: u32,
+}
+
 /// IRQ handler table for SPIs (32-287)
 struct IrqTable {
-    handlers: [Vec<IrqEntry>; MAX_SPI],
+    lines: [IrqLine; MAX_SPI],
 }
 
 impl IrqTable {
     const fn new() -> Self {
-        // Initialize array with empty Vecs
-        // Using const fn so we need this verbose initialization
-        const EMPTY: Vec<IrqEntry> = Vec::new();
+        const EMPTY: IrqLine = IrqLine {
+            handlers: Vec::new(),
+            unhandled: 0,
+        };
         Self {
-            handlers: [EMPTY; MAX_SPI],
+            lines: [EMPTY; MAX_SPI],
         }
     }
 }
 
 /// Global IRQ handler table for SPIs
-static IRQ_TABLE: Mutex<IrqTable> = Mutex::new(IrqTable::new());
+static IRQ_TABLE: IrqSpinlock<IrqTable> = IrqSpinlock::new(IrqTable::new());
 
-/// Register an IRQ handler for an SPI (32+)
+fn spi_index(irq: u32) -> Result<usize, &'static str> {
+    if irq < 32 {
+        return Err("only SPIs (>= 32) can be registered");
+    }
+    let index = (irq - 32) as usize;
+    if index >= MAX_SPI {
+        return Err("IRQ number out of range");
+    }
+    Ok(index)
+}
+
+/// Register a (shareable) handler for an SPI and unmask it
 ///
 /// # Arguments
-/// - `irq`: IRQ number (32-287 for SPIs)
+/// - `irq`: GIC INTID (32-287)
 /// - `handler`: Handler function
 /// - `data`: Opaque pointer to driver state (passed to handler)
 /// - `id`: Unique identifier for unregistration (typically device address)
-///
-/// # Returns
-/// `Ok(())` on success, `Err` with description on failure
 pub fn register_irq_handler(
     irq: u32,
     handler: IrqHandler,
     data: *mut (),
     id: usize,
 ) -> Result<(), &'static str> {
-    // Only handle SPIs (32+) in this table
-    // PPIs are per-CPU and handled differently
-    if irq < 32 {
-        return Err("Use register_ppi_handler for PPIs (< 32)");
+    let index = spi_index(irq)?;
+    let first = {
+        let mut table = IRQ_TABLE.lock();
+        let line = &mut table.lines[index];
+        if line.handlers.iter().any(|e| e.id == id) {
+            return Err("Handler with this ID already registered");
+        }
+        line.handlers.push(IrqEntry { handler, data, id });
+        line.unhandled = 0;
+        line.handlers.len() == 1
+    };
+    if first {
+        gic::enable_spi(irq, Trigger::Level);
     }
-
-    let index = (irq - 32) as usize;
-    if index >= MAX_SPI {
-        return Err("IRQ number out of range");
-    }
-
-    let mut table = IRQ_TABLE.lock();
-    let handlers = &mut table.handlers[index];
-
-    // Check for duplicate registration
-    if handlers.iter().any(|e| e.id == id) {
-        return Err("Handler with this ID already registered");
-    }
-
-    handlers.push(IrqEntry { handler, data, id });
-
     Ok(())
 }
 
-/// Unregister an IRQ handler
-///
-/// # Arguments
-/// - `irq`: IRQ number
-/// - `id`: The ID that was used during registration
-#[allow(dead_code)]
+/// Unregister a handler; the SPI is masked when its last handler goes
 pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<(), &'static str> {
-    if irq < 32 {
-        return Err("Use unregister_ppi_handler for PPIs (< 32)");
-    }
-
-    let index = (irq - 32) as usize;
-    if index >= MAX_SPI {
-        return Err("IRQ number out of range");
-    }
-
+    let index = spi_index(irq)?;
     let mut table = IRQ_TABLE.lock();
-    let handlers = &mut table.handlers[index];
-
-    if let Some(pos) = handlers.iter().position(|e| e.id == id) {
-        handlers.remove(pos);
-        Ok(())
-    } else {
-        Err("Handler not found")
+    let line = &mut table.lines[index];
+    let pos = line
+        .handlers
+        .iter()
+        .position(|e| e.id == id)
+        .ok_or("Handler not found")?;
+    line.handlers.remove(pos);
+    if line.handlers.is_empty() {
+        gic::disable_spi(irq);
     }
+    Ok(())
 }
 
-/// Dispatch an SPI to registered handlers
-///
-/// Called from the IRQ handler in interrupt context.
-/// Uses `try_lock()` to avoid blocking in ISR.
+/// Dispatch an SPI to registered handlers (IRQ context)
 ///
 /// # Returns
 /// `true` if any handler claimed the interrupt
 pub fn dispatch_irq(irq: u32) -> bool {
-    // Only handle SPIs here
-    if irq < 32 {
+    let Ok(index) = spi_index(irq) else {
         return false;
-    }
-
-    let index = (irq - 32) as usize;
-    if index >= MAX_SPI {
-        return false;
-    }
-
-    // Use try_lock to avoid blocking in interrupt context
-    let table = match IRQ_TABLE.try_lock() {
-        Some(t) => t,
-        None => {
-            // Table is locked - this shouldn't happen in normal operation
-            // since we're in ISR context and the lock holder should have
-            // completed quickly. Log and return.
-            return false;
-        }
     };
+    let mut table = IRQ_TABLE.lock();
+    let line = &mut table.lines[index];
 
-    let handlers = &table.handlers[index];
-
-    // Call each handler until one claims the interrupt
-    for entry in handlers {
-        if (entry.handler)(irq, entry.data) {
-            return true;
+    // Every handler of a shared line gets a look
+    let mut handled = false;
+    for entry in &line.handlers {
+        handled |= (entry.handler)(irq, entry.data);
+    }
+    if handled {
+        line.unhandled = 0;
+    } else {
+        line.unhandled += 1;
+        if line.handlers.is_empty() || line.unhandled >= UNHANDLED_LIMIT {
+            gic::disable_spi(irq);
         }
     }
+    handled
+}
 
-    false
+/// GIC INTID for a PCI device's INTx pin
+///
+/// `pin` is the config-space Interrupt Pin (1 = INTA .. 4 = INTD; 0 = none).
+/// Uses the host bridge's DT `interrupt-map`, else the QEMU virt swizzle.
+pub fn pci_intx_irq(bus: u8, device: u8, function: u8, pin: u8, _line: u8) -> Option<u32> {
+    super::pci_irq::intx_to_intid(bus, device, function, pin)
 }

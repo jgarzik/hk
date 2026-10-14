@@ -1,20 +1,38 @@
-//! IRQ Handler Registration and Dispatch
+//! IRQ Handler Registration and Dispatch (legacy 8259 PIC)
 //!
-//! Provides a mechanism for drivers to register handlers for hardware IRQs.
-//! Supports IRQ sharing via handler chaining - each handler returns whether
-//! it handled the interrupt.
+//! Drivers register handlers for hardware IRQs 0-15; several handlers may
+//! share a line (each returns whether it handled the interrupt). The first
+//! handler unmasks the line at the PIC, the last one to go masks it.
+//!
+//! PCI INTx: with QEMU `pc` and legacy BIOS routing the firmware writes the
+//! PIC line into the config-space Interrupt Line register, which is what
+//! `pci_intx_irq` returns. Real hardware with APIC-mode routing (e.g. the
+//! Dell OptiPlex 3020 target) needs IOAPIC + ACPI `_PRT` support instead
+//! (not implemented).
+//!
+//! Locking: `IRQ_TABLE` is an `IrqSpinlock` (taken by `dispatch_irq` in IRQ
+//! context, by register/unregister in process context). Handlers run with
+//! it held and must not register/unregister.
 
 use alloc::vec::Vec;
-use spin::Mutex;
 
-/// IRQ handler function signature
+use crate::arch::IrqSpinlock;
+
+/// Number of legacy PIC lines
+const NR_IRQS: usize = 16;
+
+/// Consecutive unclaimed interrupts after which a line is masked (Linux
+/// note_interrupt's "nobody cared")
+const UNHANDLED_LIMIT: u32 = 100_000;
+
+/// IRQ handler function signature (same on all arches)
 ///
 /// Arguments:
 /// - `irq`: The IRQ number (0-15)
 /// - `data`: Opaque pointer to driver instance state
 ///
 /// Returns `true` if the interrupt was handled by this driver
-pub type IrqHandler = fn(irq: u8, data: *mut ()) -> bool;
+pub type IrqHandler = fn(irq: u32, data: *mut ()) -> bool;
 
 /// Entry in the IRQ handler table
 struct IrqEntry {
@@ -23,130 +41,110 @@ struct IrqEntry {
     id: usize,
 }
 
-// SAFETY: IrqEntry is only accessed with interrupts disabled (in ISR context)
-// or under the IRQ_TABLE lock
+// SAFETY: IrqEntry is only accessed under the IRQ_TABLE lock
 unsafe impl Send for IrqEntry {}
 unsafe impl Sync for IrqEntry {}
 
-/// IRQ handler table - 16 entries for IRQs 0-15
+/// One PIC line
+struct IrqLine {
+    handlers: Vec<IrqEntry>,
+    unhandled: u32,
+}
+
+/// IRQ handler table - 16 lines
 struct IrqTable {
-    handlers: [Vec<IrqEntry>; 16],
+    lines: [IrqLine; NR_IRQS],
 }
 
 impl IrqTable {
     const fn new() -> Self {
+        const EMPTY: IrqLine = IrqLine {
+            handlers: Vec::new(),
+            unhandled: 0,
+        };
         Self {
-            handlers: [
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ],
+            lines: [EMPTY; NR_IRQS],
         }
     }
 }
 
 /// Global IRQ handler table
-static IRQ_TABLE: Mutex<IrqTable> = Mutex::new(IrqTable::new());
+static IRQ_TABLE: IrqSpinlock<IrqTable> = IrqSpinlock::new(IrqTable::new());
 
-/// Register an IRQ handler
-///
-/// # Arguments
-/// - `irq`: IRQ number (0-15)
-/// - `handler`: Handler function
-/// - `data`: Opaque pointer to driver state (passed to handler)
-/// - `id`: Unique identifier for unregistration (typically device address)
-///
-/// # Returns
-/// `Ok(())` on success, `Err` with description on failure
+/// Register a (shareable) handler for IRQ `irq` (0-15) and unmask it
 pub fn register_irq_handler(
-    irq: u8,
+    irq: u32,
     handler: IrqHandler,
     data: *mut (),
     id: usize,
 ) -> Result<(), &'static str> {
-    if irq >= 16 {
+    if irq as usize >= NR_IRQS {
         return Err("IRQ number out of range (0-15)");
     }
-
     let mut table = IRQ_TABLE.lock();
-    let handlers = &mut table.handlers[irq as usize];
-
-    // Check for duplicate registration
-    if handlers.iter().any(|e| e.id == id) {
+    let line = &mut table.lines[irq as usize];
+    if line.handlers.iter().any(|e| e.id == id) {
         return Err("Handler with this ID already registered");
     }
-
-    handlers.push(IrqEntry { handler, data, id });
-
+    line.handlers.push(IrqEntry { handler, data, id });
+    line.unhandled = 0;
+    if line.handlers.len() == 1 {
+        super::pic::enable_irq(irq as u8);
+    }
     Ok(())
 }
 
-/// Unregister an IRQ handler
-///
-/// # Arguments
-/// - `irq`: IRQ number (0-15)
-/// - `id`: The ID that was used during registration
-#[allow(dead_code)]
-pub fn unregister_irq_handler(irq: u8, id: usize) -> Result<(), &'static str> {
-    if irq >= 16 {
+/// Unregister a handler; the line is masked when its last handler goes
+pub fn unregister_irq_handler(irq: u32, id: usize) -> Result<(), &'static str> {
+    if irq as usize >= NR_IRQS {
         return Err("IRQ number out of range (0-15)");
     }
-
     let mut table = IRQ_TABLE.lock();
-    let handlers = &mut table.handlers[irq as usize];
-
-    if let Some(pos) = handlers.iter().position(|e| e.id == id) {
-        handlers.remove(pos);
-        Ok(())
-    } else {
-        Err("Handler not found")
+    let line = &mut table.lines[irq as usize];
+    let pos = line
+        .handlers
+        .iter()
+        .position(|e| e.id == id)
+        .ok_or("Handler not found")?;
+    line.handlers.remove(pos);
+    if line.handlers.is_empty() {
+        super::pic::disable_irq(irq as u8);
     }
+    Ok(())
 }
 
-/// Dispatch an IRQ to registered handlers
-///
-/// Called from the IRQ handler stub in interrupt context.
-/// Uses `try_lock()` to avoid blocking in ISR.
+/// Dispatch an IRQ to registered handlers (IRQ context)
 ///
 /// # Returns
 /// `true` if any handler claimed the interrupt
 pub fn dispatch_irq(irq: u8) -> bool {
-    if irq >= 16 {
+    if irq as usize >= NR_IRQS {
         return false;
     }
+    let mut table = IRQ_TABLE.lock();
+    let line = &mut table.lines[irq as usize];
 
-    // Use try_lock to avoid blocking in interrupt context
-    let table = match IRQ_TABLE.try_lock() {
-        Some(t) => t,
-        None => {
-            // Table is locked - this shouldn't happen in normal operation
-            // since we're in ISR context and the lock holder should have
-            // completed quickly. Log and return.
-            return false;
-        }
-    };
-
-    let handlers = &table.handlers[irq as usize];
-
-    // Call each handler until one claims the interrupt
-    for entry in handlers {
-        if (entry.handler)(irq, entry.data) {
-            return true;
+    // Every handler of a shared line gets a look
+    let mut handled = false;
+    for entry in &line.handlers {
+        handled |= (entry.handler)(irq as u32, entry.data);
+    }
+    if handled {
+        line.unhandled = 0;
+    } else {
+        line.unhandled += 1;
+        if !line.handlers.is_empty() && line.unhandled >= UNHANDLED_LIMIT {
+            super::pic::disable_irq(irq);
         }
     }
+    handled
+}
 
-    false
+/// IRQ for a PCI device's INTx pin: the firmware-assigned PIC line from
+/// config space (`line`), if the device uses a pin and the line is valid
+pub fn pci_intx_irq(_bus: u8, _device: u8, _function: u8, pin: u8, line: u8) -> Option<u32> {
+    if pin == 0 || line >= NR_IRQS as u8 {
+        return None;
+    }
+    Some(line as u32)
 }

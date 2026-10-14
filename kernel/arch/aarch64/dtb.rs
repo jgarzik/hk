@@ -45,6 +45,9 @@ pub fn parse_dtb(dtb_ptr: u64) -> Option<AcpiInfo> {
     // Extract GIC distributor base address
     let gic_base = extract_gic_base(&dt)?;
 
+    // PCI INTx routing (host bridge interrupt-map)
+    super::pci_irq::init_from_dt(&dt);
+
     // Extract CPU list
     let cpus = extract_cpus(&dt);
 
