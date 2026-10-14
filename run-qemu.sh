@@ -11,7 +11,10 @@
 #
 # Environment:
 #   QEMU_CPU     Override the -cpu model (x86 default: host under KVM,
-#                qemu64 under TCG; arm default: cortex-a72), e.g. QEMU_CPU=max
+#                max under TCG; arm default: neoverse-n1), e.g. QEMU_CPU=qemu64.
+#                The defaults have SMAP/SMEP (x86) and PAN (arm), so boot
+#                tests catch kernel accesses to user memory that bypass the
+#                uaccess helpers.
 #
 # Serial output:
 #   x86: /tmp/qemu_serial.log (or /tmp/qemu_usb_serial.log with -u)
@@ -106,7 +109,8 @@ setup_x86_config() {
         )
     else
         QEMU_ARGS=(
-            -cpu "${QEMU_CPU:-qemu64}"
+            # TCG: max has SMAP/SMEP, keeping SMAP coverage in CI
+            -cpu "${QEMU_CPU:-max}"
             -cdrom "$ISO"
             -boot d
             -nographic
@@ -181,7 +185,8 @@ setup_arm_config() {
     # Base QEMU arguments
     QEMU_ARGS=(
         -machine virt,gic-version=3
-        -cpu "${QEMU_CPU:-cortex-a72}"
+        # neoverse-n1 (ARMv8.2) has PAN, the arm64 analogue of SMAP
+        -cpu "${QEMU_CPU:-neoverse-n1}"
         -smp 4
         -m 512M
         -kernel "$KERNEL"
