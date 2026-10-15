@@ -195,7 +195,10 @@ impl TcpCb {
             return None;
         }
         let in_flight = self.snd_nxt != self.snd_una;
-        if n < self.mss && !fin && push != Push::Force {
+        // Retransmissions (after a timeout rewound SND.NXT) are never
+        // held (Linux tcp_retransmit_skb ignores Nagle and cork)
+        let rexmit = before(self.snd_nxt, self.snd_max);
+        if n < self.mss && !fin && push != Push::Force && !rexmit {
             // Sender SWS avoidance (RFC 9293 3.8.6.2.1): with data in
             // flight, wait for a full segment unless this ends the queue
             if n < avail && in_flight && n < self.max_wnd / 2 {

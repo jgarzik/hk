@@ -37,10 +37,11 @@ VFS handler is registered.
 
 Listed because real traffic reaches them: TCP has no SACK (never
 advertised), no CUBIC (only "reno"; Linux defaults to cubic), no
-receive buffer autotuning (the window is SO_RCVBUF / 2), no rate limit
-on out-of-window / challenge ACKs (Linux tcp_invalid_ratelimit; hk
-answers each such segment once), and TCP_DEFER_ACCEPT / TCP_FASTOPEN
-are stored only. No SYN cookies (a full listener drops SYNs). ICMP
+receive buffer autotuning (the window is SO_RCVBUF / 2), no per-netns
+RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
+limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
+tcp_timestamps accepts 0..255 like Linux; any value but 1 sends the raw
+ms clock (no offset), as in Linux. No SYN cookies (a full listener drops SYNs). ICMP
 timestamp requests are not answered.
 Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).

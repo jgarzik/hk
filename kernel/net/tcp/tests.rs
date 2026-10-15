@@ -661,15 +661,16 @@ fn rst_rules_rfc5961() {
         ts: None,
         data: &[],
     };
-    // In window, not exact: challenge ACK
+    // In window, not exact: challenge ACK (spaced past the 500 ms
+    // per-connection rate limit)
     let mut out = Out::default();
-    p.a.input(&rst(nxt + 10), 0, &mut out);
+    p.a.input(&rst(nxt + 10), 1000, &mut out);
     assert_eq!(p.a.state, TcpState::Established);
     assert_eq!(out.segs.len(), 1);
     assert!(out.segs[0].has(flags::ACK) && out.segs[0].ack == nxt);
     // Out of window: silently dropped
     let mut out = Out::default();
-    p.a.input(&rst(nxt.wrapping_sub(100_000)), 0, &mut out);
+    p.a.input(&rst(nxt.wrapping_sub(100_000)), 2000, &mut out);
     assert!(out.segs.is_empty() && p.a.state == TcpState::Established);
     // SYN on an established connection: challenge ACK
     let syn = SegIn {
@@ -677,7 +678,7 @@ fn rst_rules_rfc5961() {
         ..rst(nxt)
     };
     let mut out = Out::default();
-    p.a.input(&syn, 0, &mut out);
+    p.a.input(&syn, 3000, &mut out);
     assert_eq!(p.a.state, TcpState::Established);
     assert!(out.segs[0].has(flags::ACK));
     // ACK of data never sent: ACK back, segment dropped
@@ -688,12 +689,12 @@ fn rst_rules_rfc5961() {
         ..rst(nxt)
     };
     let mut out = Out::default();
-    p.a.input(&bad, 0, &mut out);
+    p.a.input(&bad, 4000, &mut out);
     assert_eq!(p.a.rcvq_len(), 0);
     assert!(out.segs[0].has(flags::ACK));
     // Exact: reset
     let mut out = Out::default();
-    p.a.input(&rst(nxt), 0, &mut out);
+    p.a.input(&rst(nxt), 5000, &mut out);
     assert_eq!(p.a.state, TcpState::Closed);
     assert_eq!(out.err, Some(KernelError::ConnectionReset));
     assert!(out.done);
@@ -1482,4 +1483,129 @@ fn tw_reopens_with_newer_timestamp() {
     assert!(!tw.tw_syn_ok(&syn(old, tw.ts_recent.wrapping_sub(1))));
     assert!(tw.tw_syn_ok(&syn(old, tw.ts_recent.wrapping_add(1))));
     assert!(tw.tw_syn_ok(&syn(tw.rcv_nxt.wrapping_add(1), 0)));
+}
+
+// ============================================================================
+// Review findings (reproduce first)
+// ============================================================================
+
+#[test]
+fn ts_recent_needs_valid_ack() {
+    // An in-window segment with an impossible ACK must not move
+    // TS.Recent (Linux updates it only after the ACK checks): else a blind
+    // attacker pushes TS.Recent ahead and PAWS drops the real peer
+    let mut p = Pair::new(1460);
+    let before_ts = p.b.ts_recent;
+    let bogus = SegIn {
+        seq: p.b.rcv_nxt,
+        ack: p.b.snd_max.wrapping_add(100_000),
+        flags: flags::ACK,
+        wnd: 1000,
+        ts: Some((before_ts.wrapping_add(0x7fff_0000), 0)),
+        ..Default::default()
+    };
+    p.b.input(&bogus, p.now, &mut Out::default());
+    assert_eq!(p.b.ts_recent, before_ts);
+    // The real peer still gets through
+    let data = pattern(1000);
+    assert_eq!(transfer(&mut p, &data, 1000), data);
+}
+
+#[test]
+fn old_ack_does_not_update_window() {
+    // An ACK below SND.UNA (Linux old_ack) carries no window update
+    let mut p = Pair::new(1000);
+    p.send_a(&pattern(5000));
+    p.run();
+    let wnd = p.a.snd_wnd;
+    assert!(wnd > 0);
+    let old = SegIn {
+        seq: p.a.rcv_nxt.wrapping_add(10),
+        ack: p.a.snd_una.wrapping_sub(500),
+        flags: flags::ACK,
+        wnd: 0,
+        ts: Some((p.a.ts_recent.wrapping_add(1), 0)),
+        ..Default::default()
+    };
+    p.a.input(&old, p.now, &mut Out::default());
+    assert_eq!(p.a.snd_wnd, wnd);
+    // The acceptable ACK range is bounded by the bytes acknowledged so
+    // far (Linux: min(max_window, bytes_acked))
+    let mut q = Pair::new(1000);
+    q.send_a(b"x");
+    q.run();
+    let far = SegIn {
+        seq: q.a.rcv_nxt,
+        ack: q.a.snd_una.wrapping_sub(5000),
+        flags: flags::ACK,
+        wnd: 0,
+        ts: Some((q.a.ts_recent.wrapping_add(1), 0)),
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    q.a.input(&far, q.now, &mut out);
+    assert!(q.a.snd_wnd > 0);
+    assert_eq!(
+        out.segs.len(),
+        1,
+        "challenge ACK for an ACK below the range"
+    );
+}
+
+#[test]
+fn corked_segment_is_retransmitted() {
+    // A lost corked partial segment must be retransmitted (Linux
+    // tcp_retransmit_skb ignores Nagle and cork)
+    let mut p = Pair::new(1000);
+    p.a.opts.cork = true;
+    fn drop_first_data(_: &Pair, to_b: bool, s: &Seg, i: usize) -> Fate {
+        if to_b && !s.data.is_empty() && i == 2 {
+            Fate::Drop
+        } else {
+            Fate::Pass
+        }
+    }
+    p.filter = drop_first_data;
+    p.send_a(&pattern(100));
+    // The probe pushes it (lost), the RTO must resend it
+    p.until(
+        |p| p.b.rcvq_len() == 100 || p.a.state == TcpState::Closed,
+        30,
+    );
+    assert_eq!(p.a.state, TcpState::Established);
+    assert_eq!(p.b.rcvq_len(), 100);
+}
+
+#[test]
+fn oow_acks_rate_limited() {
+    // Out-of-window pure segments get at most one dupack per 500 ms
+    // (Linux tcp_oow_rate_limited); data segments are not limited
+    let mut p = Pair::new(1460);
+    let stale = SegIn {
+        seq: p.a.rcv_nxt.wrapping_sub(5000),
+        ack: p.a.snd_una,
+        flags: flags::ACK,
+        wnd: 1000,
+        ..Default::default()
+    };
+    let mut n = 0;
+    for _ in 0..10 {
+        let mut out = Out::default();
+        p.a.input(&stale, p.now, &mut out);
+        n += out.segs.len();
+    }
+    assert_eq!(n, 1);
+    let mut out = Out::default();
+    p.a.input(&stale, p.now + 500, &mut out);
+    assert_eq!(out.segs.len(), 1);
+    // Challenge ACKs (in-window RST) share the limit
+    let rst = SegIn {
+        seq: p.a.rcv_nxt.wrapping_add(10),
+        flags: flags::RST,
+        ..Default::default()
+    };
+    let mut out = Out::default();
+    p.a.input(&rst, p.now + 600, &mut out);
+    assert!(out.segs.is_empty());
+    assert_eq!(p.a.state, TcpState::Established);
 }

@@ -305,7 +305,7 @@ with a newer timestamp reopens), half-close, RST on close with unread
 data and with SO_LINGER {1, 0}, SO_LINGER timeouts on close, ICMP errors
 (hard in SYN_SENT, soft otherwise, SO_ERROR on timeout). RFC 7323 window
 scaling (scale from tcp_rmem[2], or the buffer when SO_RCVBUF is set)
-and timestamps (ms clock with a keyed per-address-pair offset; RTT from
+and timestamps (ms clock with a keyed per-connection offset; RTT from
 every echo; PAWS with Linux's RST and disordered-ACK exceptions).
 Congestion control: Reno/NewReno behind a pluggable interface (only
 "reno"; CUBIC is not implemented), RFC 6928 initial window, byte-counted
@@ -318,8 +318,9 @@ tcp_syn_retries, tcp_synack_retries, tcp_retries2, tcp_fin_timeout,
 tcp_window_scaling, tcp_timestamps, tcp_rmem, tcp_keepalive_time/intvl/
 probes, tcp_congestion_control, tcp_available_congestion_control.
 /proc/net/tcp lists listeners, connections and TIME_WAIT entries. Not
-yet: SACK (never advertised), receive buffer autotuning, out-of-window
-ACK rate limiting; listeners keep full child sockets in SYN_RECEIVED
+yet: SACK (never advertised), receive buffer autotuning, the per-netns
+challenge-ACK budget (out-of-window and challenge ACKs are limited per
+connection to one per 500 ms like tcp_invalid_ratelimit); listeners keep full child sockets in SYN_RECEIVED
 (no SYN cookies).
 
 - [x] socket (AF_INET: TCP, UDP, ping SOCK_DGRAM/IPPROTO_ICMP gated by

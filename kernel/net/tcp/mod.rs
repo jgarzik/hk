@@ -180,10 +180,14 @@ fn isn(t: &Tuple) -> u32 {
     h.wrapping_add((crate::time::monotonic_ns() >> 6) as u32)
 }
 
-/// Timestamp offset of an address pair (Linux secure_tcp_ts_off: keyed
-/// hash, so the clock leaks neither uptime nor other peers' offsets)
+/// Timestamp offset of a connection (Linux secure_tcp_seq_and_ts_off:
+/// keyed hash of the four-tuple, RFC 7323 7.1, so the clock leaks
+/// neither uptime nor other connections' offsets)
 fn ts_off(t: &Tuple) -> u32 {
-    let w = [((t.laddr.0 as u64) << 32) | t.raddr.0 as u64];
+    let w = [
+        ((t.laddr.0 as u64) << 32) | t.raddr.0 as u64,
+        ((t.lport as u64) << 16) | t.rport as u64,
+    ];
     crate::net::inet::port::secure_hash(0x7463_7074_736f, &w) as u32
 }
 

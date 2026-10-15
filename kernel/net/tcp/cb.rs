@@ -19,8 +19,8 @@
 //! Options (RFC 7323): window scaling and timestamps are negotiated on
 //! the SYN/SYN-ACK; timestamps give RTT samples on every ACK of new data
 //! and PAWS (`input.rs`). The TS clock is the caller's ms clock plus a
-//! per-address-pair keyed offset (`Open.ts_off`, Linux
-//! secure_tcp_ts_off). SACK is not implemented and never advertised.
+//! per-connection keyed offset (`Open.ts_off`, Linux
+//! secure_tcp_seq_and_ts_off over the four-tuple). SACK is not implemented and never advertised.
 //! Delayed ACKs live in `ack.rs`, Nagle/cork in `output.rs`, keepalive
 //! and the user timeout in `timer.rs`.
 
@@ -108,6 +108,9 @@ pub const RTO_FALLBACK: u64 = 3000;
 pub const TIMEWAIT_LEN: u64 = 60_000;
 /// Retransmissions of an orphaned connection (Linux tcp_orphan_retries 0)
 pub const ORPHAN_RETRIES: u32 = 8;
+/// Linux tcp_invalid_ratelimit: at most one out-of-window / challenge
+/// ACK per this many ms per connection
+pub const OOW_RATELIMIT: u64 = 500;
 /// Linux TCP_PAWS_WRAP (INT_MAX / USEC_PER_SEC s): TS.Recent older
 /// than this (ms) is not trusted
 pub const PAWS_WRAP: u64 = (i32::MAX as u64 / 1_000_000) * 1000;
@@ -535,6 +538,8 @@ pub struct TcpCb {
     pub soft_err: Option<KernelError>,
     /// An ACK must go out now (pure ACK if no data segment carries it)
     pub(super) ack_now: bool,
+    /// When the last out-of-window / challenge ACK went out
+    pub(super) last_oow: Option<u64>,
     /// Counters (TCP_INFO)
     pub(super) stats: Stats,
     /// Bytes charged to the global TCP memory
@@ -619,6 +624,7 @@ impl TcpCb {
             orphan: false,
             soft_err: None,
             ack_now: false,
+            last_oow: None,
             stats: Stats::default(),
             charged: 0,
         }

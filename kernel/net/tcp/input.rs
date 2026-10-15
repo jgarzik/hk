@@ -16,8 +16,8 @@
 //! goes out, or the delayed ACK timer is armed (`ack.rs`).
 
 use super::cb::{
-    Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TIMEWAIT_LEN, TcpCb, TcpState, Tmr, after, before,
-    between, flags,
+    OOW_RATELIMIT, Out, PAWS_WRAP, RCV_SHUTDOWN, Seg, SegIn, TIMEWAIT_LEN, TcpCb, TcpState, Tmr,
+    after, before, between, flags,
 };
 use crate::error::KernelError;
 
@@ -156,7 +156,7 @@ impl TcpCb {
     fn may_update_window(&self, s: &SegIn) -> bool {
         after(s.ack, self.snd_una)
             || after(s.seq, self.snd_wl1)
-            || (s.seq == self.snd_wl1 && self.seg_wnd(s) > self.snd_wnd)
+            || (s.seq == self.snd_wl1 && (self.seg_wnd(s) > self.snd_wnd || s.wnd == 0))
     }
 
     /// RFC 7323 4.3 (Linux tcp_replace_ts_recent): remember the TSval of
@@ -197,14 +197,16 @@ impl TcpCb {
         }
         if self.paws_reject(s) {
             if s.has(flags::SYN) {
-                self.send_ack(out); // challenge ACK
-            } else if !(s.seq_len() == 0 && before(s.seq, self.rcv_nxt)) {
+                self.challenge_ack(out);
+            } else if !(s.seq_len() == 0 && before(s.seq, self.rcv_nxt)) && !self.oow_limited(s) {
                 self.send_ack(out); // dupack (an old pure ACK is just dropped)
             }
             return;
         }
         if !self.acceptable(s) {
-            if !s.has(flags::RST) {
+            if s.has(flags::SYN) {
+                self.challenge_ack(out);
+            } else if !s.has(flags::RST) && !self.oow_limited(s) {
                 self.dupack(s, out);
             }
             return;
@@ -213,18 +215,17 @@ impl TcpCb {
             if s.seq == self.rcv_nxt {
                 self.on_reset(out);
             } else {
-                self.send_ack(out); // RFC 5961 3.2 challenge ACK
+                self.challenge_ack(out); // RFC 5961 3.2
             }
             return;
         }
         if s.has(flags::SYN) {
-            self.send_ack(out); // RFC 5961 4.2 challenge ACK
+            self.challenge_ack(out); // RFC 5961 4.2
             return;
         }
         if !s.has(flags::ACK) {
             return;
         }
-        self.update_ts_recent(s);
         if self.state == TcpState::SynReceived {
             if !after(s.ack, self.snd_una) || after(s.ack, self.snd_max) {
                 out.segs.push(Seg {
@@ -234,6 +235,7 @@ impl TcpCb {
                 });
                 return;
             }
+            self.update_ts_recent(s);
             self.snd_una = s.ack;
             self.established(s, now, out);
         } else if !self.rcv_ack(s, now, out) {
@@ -244,6 +246,37 @@ impl TcpCb {
         }
         self.rcv_text(s, now, out);
         self.output(now, out);
+    }
+
+    /// Linux __tcp_oow_rate_limited: true if an out-of-window or
+    /// challenge ACK went out less than OOW_RATELIMIT ago (else note now)
+    fn oow_recent(&mut self) -> bool {
+        let now = self.clock;
+        if self
+            .last_oow
+            .is_some_and(|t| now.saturating_sub(t) < OOW_RATELIMIT)
+        {
+            return true;
+        }
+        self.last_oow = Some(now);
+        false
+    }
+
+    /// Linux tcp_oow_rate_limited: data segments are never limited
+    /// (they are not part of an ACK loop), pure ones and SYNs are
+    fn oow_limited(&mut self, s: &SegIn) -> bool {
+        if !s.data.is_empty() && !s.has(flags::SYN) {
+            return false;
+        }
+        self.oow_recent()
+    }
+
+    /// RFC 5961 challenge ACK, rate limited per connection (Linux
+    /// tcp_send_challenge_ack)
+    fn challenge_ack(&mut self, out: &mut Out) {
+        if !self.oow_recent() {
+            self.send_ack(out);
+        }
     }
 
     /// An unacceptable or old segment: ACK at once (Linux
@@ -292,14 +325,23 @@ impl TcpCb {
         self.fail(err, out);
     }
 
-    /// The ACK field (RFC 9293 3.10.7.4 fifth check, RFC 5961 5.2);
-    /// false if the segment must be dropped
+    /// The ACK field (RFC 9293 3.10.7.4 fifth check, RFC 5961 5.2: the
+    /// acceptable range below SND.UNA is min(max window, bytes acked) as
+    /// in Linux tcp_ack); false if the segment must be dropped. An old
+    /// ACK (below SND.UNA) updates neither TS.Recent nor the window.
     fn rcv_ack(&mut self, s: &SegIn, now: u64, out: &mut Out) -> bool {
         let ack = s.ack;
-        if after(ack, self.snd_max) || before(ack, self.snd_una.wrapping_sub(self.max_wnd)) {
-            self.send_ack(out);
+        let span = self
+            .max_wnd
+            .min(self.stats.bytes_acked.min(u32::MAX as u64) as u32);
+        if after(ack, self.snd_max) || before(ack, self.snd_una.wrapping_sub(span)) {
+            self.challenge_ack(out);
             return false;
         }
+        if before(ack, self.snd_una) {
+            return true;
+        }
+        self.update_ts_recent(s);
         self.probes = 0;
         self.rcv_tstamp = now;
         let old_wnd = self.snd_wnd;
