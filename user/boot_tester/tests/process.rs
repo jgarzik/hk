@@ -46,6 +46,7 @@ pub fn run_tests() {
     test_waitid();
     test_waitid_pall();
     test_waitid_wnowait();
+    test_wait4_wnowait_einval();
     test_execve();
     test_getuid();
     test_geteuid();
@@ -596,6 +597,13 @@ fn test_waitid_wnowait() {
     let reaped = sys_wait4(pid, &mut st, 0, 0);
     let ok = pid > 0 && peek == 0 && seen == (pid as i32, 21) && reaped == pid && st == 21 << 8;
     println(if ok { b"WAITID_WNOWAIT:OK" } else { b"WAITID_WNOWAIT:FAIL" });
+}
+
+/// wait4 takes no waitid-only flags: WNOWAIT is EINVAL
+fn test_wait4_wnowait_einval() {
+    const WNOWAIT: i32 = 0x0100_0000;
+    let r = sys_wait4(-1, core::ptr::null_mut(), WNOWAIT, 0);
+    println(if r == -22 { b"WAIT4_WNOWAIT_EINVAL:OK" } else { b"WAIT4_WNOWAIT_EINVAL:FAIL" });
 }
 
 /// Test 21: execve() - execute a new program

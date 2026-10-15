@@ -362,6 +362,20 @@ pub fn sys_vfork() -> i64 {
 pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, _rusage: u64) -> i64 {
     use super::wait_options::WNOHANG;
 
+    // Linux kernel_wait4: WEXITED/WNOWAIT and the like are waitid-only
+    const WUNTRACED: i32 = 2;
+    const WCONTINUED: i32 = 8;
+    const WNOTHREAD: i32 = 0x2000_0000;
+    let valid = WNOHANG
+        | WUNTRACED
+        | WCONTINUED
+        | WNOTHREAD
+        | super::wait_options::__WCLONE
+        | super::wait_options::__WALL;
+    if options & !valid != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+
     let current_pid = super::percpu::current_pid();
 
     use super::percpu::{SleepState, schedule};
