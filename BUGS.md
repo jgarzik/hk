@@ -71,6 +71,11 @@ so the busybox end-to-end tests (`tests/busybox.rs`) are skipped on hk
 of the low half (the planned `PAGE_OFFSET = 0xffff_8880_0000_0000` on
 x86, TTBR1 on aarch64) so all of the lower half belongs to user space.
 
+Same root cause on x86: the ioremap window (virtual 224MB-512MB) reuses
+identity-mapped addresses, so RAM above 224MB is left out of the frame
+allocator (a frame there would alias device registers). With
+MAX_FRAMES that leaves about 206MB of frames under QEMU's 512MB.
+
 ## AF_PACKET gaps
 
 **Location**: `kernel/net/packet/`

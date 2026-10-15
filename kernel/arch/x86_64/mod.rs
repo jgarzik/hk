@@ -422,11 +422,17 @@ impl MemoryLayoutOps for X86_64Arch {
             crate::multiboot2::find_largest_region_above(multiboot_info, FRAME_ALLOC_BASE)
         };
 
+        // The kernel reaches frames through the identity map, and the
+        // ioremap window (IOREMAP_BASE..) reuses those virtual addresses
+        // for MMIO: frames above IOREMAP_BASE would alias device
+        // registers (writing a page there wrote to the e1000 and xHCI)
+        let mem_end = mem_end.min(ioremap::IOREMAP_BASE);
+
         // Use parsed memory map if valid, otherwise fall back to hardcoded values
         if mem_start >= FRAME_ALLOC_BASE && mem_end > mem_start {
             (mem_start, mem_end - mem_start)
         } else {
-            (FRAME_ALLOC_BASE, FRAME_ALLOC_SIZE)
+            (FRAME_ALLOC_BASE, FRAME_ALLOC_SIZE.min(ioremap::IOREMAP_BASE - FRAME_ALLOC_BASE))
         }
     }
 }
