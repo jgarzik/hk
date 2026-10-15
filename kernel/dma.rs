@@ -301,36 +301,16 @@ impl DmaOps for DirectDmaOps {
         // Calculate number of frames needed
         let num_frames = size.div_ceil(FRAME_SIZE);
 
-        // For simplicity, we allocate one frame at a time
-        // A production implementation would support contiguous allocation
+        // Multi-frame buffers must be physically contiguous: frames
+        // allocated one by one are not, once memory has been freed
         if num_frames > 1 {
-            // For multi-frame allocations, allocate frames and hope they're contiguous
-            // This is a limitation - real implementation needs contiguous allocator
-            let mut frames = Vec::with_capacity(num_frames);
-            let mut first_frame = 0u64;
-
-            for i in 0..num_frames {
-                let frame = self.frame_alloc.alloc()?;
-                if i == 0 {
-                    first_frame = frame;
-                    // Check if first frame fits in mask
-                    if !self.check_mask(frame, config.coherent_dma_mask) {
-                        self.frame_alloc.free(frame);
-                        return None;
-                    }
-                } else {
-                    // Check contiguity (required for coherent allocations)
-                    let expected = first_frame + (i as u64 * FRAME_SIZE as u64);
-                    if frame != expected {
-                        // Not contiguous - free all and fail
-                        for f in frames {
-                            self.frame_alloc.free(f);
-                        }
-                        self.frame_alloc.free(frame);
-                        return None;
-                    }
+            let first_frame = self.frame_alloc.alloc_contig(num_frames)?;
+            let last = first_frame + (num_frames * FRAME_SIZE) as u64 - 1;
+            if !self.check_mask(last, config.coherent_dma_mask) {
+                for i in 0..num_frames {
+                    self.frame_alloc.free(first_frame + (i * FRAME_SIZE) as u64);
                 }
-                frames.push(frame);
+                return None;
             }
 
             // Zero the memory (coherent memory should be zeroed)

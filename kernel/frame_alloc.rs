@@ -590,27 +590,29 @@ impl BitmapFrameAllocator {
 }
 
 impl BitmapFrameAllocator {
-    /// Allocate `n` contiguous frames (n a power of two, 1..=64, aligned
-    /// to n frames), each with refcount 1
+    /// Allocate `n` physically contiguous frames (aligned to n rounded
+    /// up to a power of two, at most 2MB), each with refcount 1: kernel
+    /// stacks and multi-frame DMA buffers. Linear scan; rare callers.
     pub fn alloc_contig(&self, n: usize) -> Option<u64> {
-        if n == 0 || n > 64 || !n.is_power_of_two() {
+        if n == 0 {
             return None;
         }
+        let align = n.next_power_of_two().min(FRAMES_PER_HUGE_PAGE);
         let mut inner = self.inner.lock();
-        let num_words = inner.total_frames.div_ceil(64);
-        let run = if n == 64 { !0u64 } else { (1u64 << n) - 1 };
-        for offset in 0..num_words {
-            let w = (inner.next_free / 64 + offset) % num_words;
-            let word = inner.bitmap[w];
-            for k in 0..64 / n {
-                let mask = run << (k * n);
-                let first = w * 64 + k * n;
-                if word & mask == mask && first + n <= inner.total_frames {
-                    inner.set_word(w, word & !mask);
-                    for f in first..first + n {
+        let total = inner.total_frames;
+        let free = |inner: &BitmapFrameAllocatorInner, f: usize| {
+            inner.bitmap[f / 64] & (1u64 << (f % 64)) != 0
+        };
+        let mut start = 0;
+        while start + n <= total {
+            match (start..start + n).rev().find(|&f| !free(&inner, f)) {
+                Some(used) => start = (used + 1).next_multiple_of(align),
+                None => {
+                    for f in start..start + n {
+                        inner.set_free(f, false);
                         inner.refcounts[f] = 1;
                     }
-                    return Some(inner.base + (first * FRAME_SIZE) as u64);
+                    return Some(inner.base + (start * FRAME_SIZE) as u64);
                 }
             }
         }
