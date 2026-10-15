@@ -82,8 +82,9 @@ impl TimeWait {
             }
             g.0.input(s, now, &mut out);
             self.post(&mut g, &out);
+            // Transmitted under the entry lock, in order
+            self.send(&out);
         }
-        self.send(&out);
         true
     }
 
@@ -110,7 +111,7 @@ impl Expire for TimeWait {
             timer::fired(&mut g.1, id);
             g.0.on_timer(now, &mut out);
             self.post(&mut g, &out);
+            self.send(&out);
         }
-        self.send(&out);
     }
 }

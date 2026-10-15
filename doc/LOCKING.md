@@ -1825,7 +1825,7 @@ do not rely on that.
 | `NAPI_LIST`, `SOFTNET_THREADS` | `spin::Mutex<Vec<..>>` | thread only | leaf; registration |
 | `Sock` (`net/sock.rs`, in every protocol socket) | atomics + `Sock.wq` (`WaitQueue`) | any (wakeups) | error, shutdown, buffer sizes, timeouts, SOL_SOCKET flags; one wait queue per socket for readers, writers, connect/accept and pollers (`sk_data_ready`/`sk_write_space`/`sk_state_change` = `wake_all`), always woken after protocol locks are dropped |
 | sockfs inode `private` | `spin::RwLock` (VFS, `Inode.private`) | thread only | read per socket file operation (`sock_of`) to reach the protocol socket; leaf |
-| `TcpSock.cb` (`net/tcp/mod.rs`) | `spin::Mutex<Inner>` | thread only (softnet input, softnet/0 timers, socket calls) | the TCP socket lock: Linux `bh_lock_sock` plus the `tcp_sock` state it guards (the whole I/O-free `TcpCb`: state, sequence space, send/receive/out-of-order queues, RFC 7323 option state, delayed-ACK state, RTO, all timers, the IPPROTO_TCP options (`TcpCb.opts`; the separate `TcpSock.opts` leaf is gone); tuple, port ownership, listener link). Held for one bounded step: never across a sleep, a user copy or a transmit (work is returned as `Out` and run after unlock). A listener's is taken before its new child's (creating it); a child never takes its listener's `cb` |
+| `TcpSock.cb` (`net/tcp/mod.rs`) | `spin::Mutex<Inner>` | thread only (softnet input, softnet/0 timers, socket calls) | the TCP socket lock: Linux `bh_lock_sock` plus the `tcp_sock` state it guards (the whole I/O-free `TcpCb`: state, sequence space, send/receive/out-of-order queues, RFC 7323 option state, delayed-ACK state, RTO, all timers, the IPPROTO_TCP options (`TcpCb.opts`; the separate `TcpSock.opts` leaf is gone); tuple, port ownership, listener link). Held for one bounded step: never across a sleep or a user copy. The step's `Out` is applied before the unlock (Linux transmits under the socket lock): error and shutdown bits are published and segments transmitted under it (cb -> FIB / neighbour / device TX, which never re-enter a socket lock), so one connection's segments are never reordered across CPUs; only wakeups follow the unlock. A listener's is taken before its new child's (creating it, and sending its SYN-ACK); a child never takes its listener's `cb` (it queues itself under the listener's `queue` leaf and the listener is woken after the child's unlock) |
 | `TcpSock.rd` | `sync::Mutex<()>` (sleeping) | thread only (recvmsg) | serializes readers across peek -> user copy -> consume, so a faulting copy leaves the data queued (reader half of Linux `lock_sock`); held only for that step, never across a wait; above `cb` |
 | `TcpSock.queue` | `spin::Mutex<Option<Accept>>` | thread only | leaf: a listener's SYN_RECEIVED children and accept queue; taken under the listener's or a child's `cb` |
 | `TimeWait.inner` (`net/tcp/timewait.rs`) | `spin::Mutex` | thread only | a TIME_WAIT entry's queue-less control block + timer slot; same position as `TcpSock.cb` |
@@ -1964,11 +1964,14 @@ user data through a bounded (64 KiB) kernel buffer outside the lock and
 re-check the state at every step, and sleep in `Sock::wait` with no lock
 held. Consequences (deviations): input never waits for a sleeping user
 (no backlog), and concurrent senders on one socket interleave at
-64 KiB steps rather than at sndbuf-wait points. Segments, wakeups and
-errors decided under the lock are carried out after it is dropped
-(`TcpSock::finish`), so no TCP lock is held across a transmit; the
-loopback flush (`netif_rx_flush_local`) runs only at the end of socket
-calls.
+64 KiB steps rather than at sndbuf-wait points. Like Linux, segments
+are transmitted and errors/shutdown bits published under the lock
+(`TcpSock::emit`, at the end of `TcpSock::step`); wakeups follow the
+unlock. Transmitting under `cb` is safe because the output path only
+takes FIB/neighbour/device-TX leaves and `lo` queues to the receive
+backlog instead of delivering inline; the loopback flush
+(`netif_rx_flush_local`) runs only at the end of socket calls, with no
+lock held. A TIME_WAIT entry transmits under its `inner` the same way.
 
 **Known gaps (later phases):** RCU for the read-mostly tables (FIB,
 device list, address lists: COW snapshots are the intended next step;
