@@ -903,12 +903,29 @@ pub enum PidGen {
 
 /// The address space a /proc/<pid>/ file reads, if the caller may
 /// (Linux mm_access): EACCES without ptrace-read access
+///
+/// The mm is taken first and the check is repeated around it: if the
+/// task exec'd in between (new mm, maybe new credentials), the access
+/// is decided again for the new image, so the result is never an mm
+/// the check did not cover (hk has no exec lock; Linux holds
+/// exec_update_lock across mm_access)
 fn mm_access(pid: Pid) -> Result<Option<Arc<spin::Mutex<crate::mm::MmStruct>>>, KernelError> {
-    if !crate::task::ptrace::may_read_proc(pid) {
-        return Err(KernelError::PermissionDenied);
+    let task_mm = || get_tid_for_pid(pid).and_then(crate::mm::get_task_mm);
+    loop {
+        let mm = task_mm();
+        if !crate::task::ptrace::may_read_proc(pid) {
+            return Err(KernelError::PermissionDenied);
+        }
+        let now = task_mm();
+        let same = match (&mm, &now) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return Ok(mm);
+        }
     }
-    let tid = get_tid_for_pid(pid).ok_or(KernelError::NoProcess)?;
-    Ok(crate::mm::get_task_mm(tid))
 }
 
 /// Content of a per-process file for this open file (or, with none,

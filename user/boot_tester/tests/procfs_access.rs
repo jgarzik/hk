@@ -6,7 +6,7 @@
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     sys_close, sys_exit, sys_fork, sys_kill, sys_nanosleep, sys_open, sys_pipe2, sys_prctl,
-    sys_read, sys_readlink, sys_setresuid, sys_setuid, sys_wait4, sys_write, Timespec, O_DIRECTORY, O_RDONLY,
+    sys_execve, sys_pread64, sys_read, sys_readlink, sys_setresuid, sys_setuid, sys_wait4, sys_write, Timespec, O_DIRECTORY, O_RDONLY,
 };
 
 const EACCES: i64 = -13;
@@ -19,6 +19,7 @@ pub fn run_tests() {
     in_child(b"PROC_ACCESS_OTHER_UID_DENIED", other_uid_denied);
     test_nondumpable();
     test_suid_differs();
+    test_maps_after_exec();
 }
 
 fn report(name: &[u8], ok: bool, v: i64) {
@@ -189,3 +190,39 @@ fn test_suid_differs() {
     sys_close(p[1] as u64);
     report(b"PROC_ACCESS_SUID_DIFFERS", st == 0, (st >> 8) as i64);
 }
+
+/// An open maps file keeps reading the address space it was opened on:
+/// after the target execs, a read gives the old image, EOF or ESRCH
+/// (Linux), never the new one
+fn test_maps_after_exec() {
+    let mut p = [0i32; 2];
+    sys_pipe2(p.as_mut_ptr(), 0);
+    let a = sys_fork();
+    if a == 0 {
+        let mut c = [0u8; 1];
+        sys_read(p[0] as u64, c.as_mut_ptr(), 1);
+        let argv: [*const u8; 2] = [b"boot_tester2\0".as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        sys_execve(b"/bin/boot_tester2\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        sys_exit(99);
+    }
+    let mut b = [0u8; 64];
+    let fd = sys_open(path(&mut b, a, b"maps").as_ptr(), O_RDONLY, 0);
+    let mut before = [0u8; 2048];
+    let n1 = sys_pread64(fd as i32, before.as_mut_ptr(), before.len() as u64, 0);
+    sys_write(p[1] as u64, b"x".as_ptr(), 1);
+    let mut st = 0i32;
+    sys_wait4(a, &mut st, 0, 0);
+    let mut after = [0u8; 2048];
+    let n2 = sys_pread64(fd as i32, after.as_mut_ptr(), after.len() as u64, 0);
+    sys_close(fd as u64);
+    sys_close(p[0] as u64);
+    sys_close(p[1] as u64);
+    let same = n2 == n1 && (0..n1.max(0) as usize).all(|i| before[i] == after[i]);
+    // Linux: ESRCH once the old address space is gone, EOF while it is
+    // being torn down; hk keeps it alive and shows the old image
+    const ESRCH: i64 = -3;
+    let ok = fd >= 0 && n1 > 0 && (n2 == 0 || n2 == ESRCH || same) && (st >> 8) & 0xff == 123;
+    report(b"PROC_MAPS_AFTER_EXEC", ok, n2);
+}
+
