@@ -1685,14 +1685,6 @@ pub fn set_clear_child_tid(tid: Tid, addr: u64) {
     }
 }
 
-/// Remove the clear_child_tid pointer for a task (on exit, after processing)
-pub fn remove_clear_child_tid(tid: Tid) {
-    let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.clear_child_tid = 0;
-    }
-}
-
 // =============================================================================
 // Per-task set_child_tid pointer (for CLONE_CHILD_SETTID on fork)
 // =============================================================================

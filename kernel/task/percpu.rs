@@ -1573,9 +1573,6 @@ pub fn exit_current() -> ! {
         // Clean up TLS pointer for exiting task
         crate::task::remove_task_tls(tid);
 
-        // Clean up clear_child_tid pointer for exiting task
-        crate::task::remove_clear_child_tid(tid);
-
         // Clean up namespace context for exiting task
         crate::ns::exit_task_ns(tid);
 
@@ -1584,9 +1581,6 @@ pub fn exit_current() -> ! {
 
         // Clean up signal state for exiting task
         crate::signal::exit_task_signal(tid);
-
-        // Clean up memory descriptor for exiting task
-        crate::mm::exit_task_mm(tid);
 
         // Clean up robust futex list for exiting task
         // Get pid for futex key creation
@@ -1609,6 +1603,10 @@ pub fn exit_current() -> ! {
         // Signal vfork completion if parent is waiting
         // This must be done after CLEARTID but before we switch away
         signal_vfork_done(tid);
+
+        // Leave the address space last: the robust list and CLEARTID
+        // writes above still use it (Linux mm_release before exit_mm)
+        crate::mm::exit_task_mm(tid);
     }
 
     // Let a parent sleeping in wait4/waitid re-check for zombies

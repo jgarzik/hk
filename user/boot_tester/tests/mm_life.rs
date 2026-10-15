@@ -2,10 +2,19 @@
 //! processes exit or exec (Linux mmput/exit_mmap, exec_mmap)
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{sys_close, sys_open, sys_read, O_RDONLY};
+use hk_syscall::{
+    sys_clone, sys_close, sys_exit, sys_open, sys_read, sys_sched_yield, CLONE_SIGHAND, CLONE_VM,
+    O_RDONLY,
+};
+
+const CLONE_THREAD: u64 = 0x0001_0000;
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 
 pub fn run_tests() {
     meminfo_format();
+    // An exiting thread clears and wakes its CLONE_CHILD_CLEARTID word
+    // (Linux mm_release), before it leaves the address space
+    report(b"MM_LIFE_CLEARTID", thread(), 0);
 }
 
 /// Read /proc/meminfo into `buf`; its length (0 on error)
@@ -81,4 +90,33 @@ fn meminfo_format() {
         bad = 10;
     }
     report(b"MEMINFO_FORMAT", bad == 0, bad);
+}
+
+/// A thread is created and exits; its user stack is reused only after
+/// CLONE_CHILD_CLEARTID shows it gone
+fn thread() -> bool {
+    #[repr(C, align(16))]
+    struct Stack([u8; 8192]);
+    static mut STACK: Stack = Stack([0; 8192]);
+    static mut CTID: u32 = 0;
+    let top = unsafe { (&raw mut STACK as *mut u8).add(8192) } as u64;
+    let ctid = &raw mut CTID;
+    unsafe { core::ptr::write_volatile(ctid, 1) };
+    let flags = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD | CLONE_CHILD_CLEARTID;
+    let r = sys_clone(flags, top, 0, ctid as u64, 0);
+    if r == 0 {
+        sys_exit(0); // exit(2): this thread only
+    }
+    if r < 0 {
+        return false;
+    }
+    let mut spins = 0u32;
+    while unsafe { core::ptr::read_volatile(ctid) } != 0 {
+        spins += 1;
+        if spins > 1_000_000 {
+            return false;
+        }
+        sys_sched_yield();
+    }
+    true
 }
