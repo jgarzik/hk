@@ -279,7 +279,31 @@ pub fn prepare_creds() -> Cred {
 ///
 /// The new credentials take effect immediately.
 pub fn commit_creds(new: Arc<Cred>) {
+    let old = current_cred().uid;
+    if old != new.uid {
+        flag_nproc_exceeded(new.uid);
+    }
+    nproc_move(old, new.uid);
     percpu::commit_creds_impl(new);
+}
+
+/// execve's RLIMIT_NPROC check (Linux do_execveat_common): EAGAIN if a
+/// real-uid change flagged the task and it is still over; else the flag
+/// is cleared
+pub fn nproc_exec_check() -> Result<(), i32> {
+    let tid = percpu::current_tid();
+    let uid = current_cred().uid;
+    // rlimit() takes TASK_TABLE: decide before locking it
+    let over = nproc_overlimit(nproc_count(uid));
+    let mut table = percpu::TASK_TABLE.lock();
+    let Some(t) = table.tasks.iter_mut().find(|t| t.tid == tid) else {
+        return Ok(());
+    };
+    if t.nproc_exceeded && over {
+        return Err(11); // EAGAIN
+    }
+    t.nproc_exceeded = false;
+    Ok(())
 }
 
 /// Copy credentials for fork/clone
@@ -1002,6 +1026,10 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     #[cfg(target_arch = "x86_64")]
     pub iopl_emul: u8,
 
+    /// A real-uid change left this task over RLIMIT_NPROC: its next
+    /// execve rechecks (Linux PF_NPROC_EXCEEDED)
+    pub nproc_exceeded: bool,
+
     // =========================================================================
     // Ptrace state (like Linux task_struct ptrace fields)
     // =========================================================================
@@ -1330,28 +1358,23 @@ pub fn capable(cap: u32) -> bool {
 // Per-UID process counting (for RLIMIT_NPROC)
 // =============================================================================
 
-/// Global table tracking process count per UID
-///
-/// Used for RLIMIT_NPROC enforcement. Each process (not thread) increments
-/// the count for its UID on creation and decrements on exit.
-static UID_PROCESS_COUNT: Mutex<BTreeMap<Uid, u64>> = Mutex::new(BTreeMap::new());
+/// Tasks per real uid for RLIMIT_NPROC (Linux ucounts
+/// UCOUNT_RLIMIT_NPROC): every task, threads included, is charged to its
+/// real uid from clone until it is released (reaped, or at exit for a
+/// non-leader thread); a real-uid change moves the charge
+static NPROC: Mutex<BTreeMap<Uid, u64>> = Mutex::new(BTreeMap::new());
 
-/// Increment the process count for a UID
-///
-/// Called when a new process (not thread) is created successfully.
-/// Returns the new count after incrementing.
-pub fn increment_user_process_count(uid: Uid) -> u64 {
-    let mut counts = UID_PROCESS_COUNT.lock();
+/// Charge one task to `uid`; the new count
+pub fn nproc_charge(uid: Uid) -> u64 {
+    let mut counts = NPROC.lock();
     let count = counts.entry(uid).or_insert(0);
     *count += 1;
     *count
 }
 
-/// Decrement the process count for a UID
-///
-/// Called when a process exits. Safe to call even if count is already 0.
-pub fn decrement_user_process_count(uid: Uid) {
-    let mut counts = UID_PROCESS_COUNT.lock();
+/// Release one task's charge to `uid`
+pub fn nproc_uncharge(uid: Uid) {
+    let mut counts = NPROC.lock();
     if let Some(count) = counts.get_mut(&uid) {
         *count = count.saturating_sub(1);
         if *count == 0 {
@@ -1360,12 +1383,75 @@ pub fn decrement_user_process_count(uid: Uid) {
     }
 }
 
-/// Get the current process count for a UID
-///
-/// Used by RLIMIT_NPROC enforcement before creating a new process.
-pub fn get_user_process_count(uid: Uid) -> u64 {
-    let counts = UID_PROCESS_COUNT.lock();
-    counts.get(&uid).copied().unwrap_or(0)
+/// Tasks charged to `uid`
+pub fn nproc_count(uid: Uid) -> u64 {
+    NPROC.lock().get(&uid).copied().unwrap_or(0)
+}
+
+/// `count` tasks exceed the caller's RLIMIT_NPROC (Linux
+/// is_rlimit_overlimit)
+pub fn nproc_overlimit(count: u64) -> bool {
+    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NPROC);
+    limit != crate::rlimit::RLIM_INFINITY && count > limit
+}
+
+/// clone's check (Linux copy_process): over the limit fails unless the
+/// task's user is root or it has CAP_SYS_RESOURCE/CAP_SYS_ADMIN
+pub fn nproc_over(uid: Uid, count: u64) -> bool {
+    nproc_overlimit(count) && uid != 0 && !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN)
+}
+
+/// A pending RLIMIT_NPROC charge for a task being created: uncharged on
+/// drop unless `keep` hands it to the created task
+pub struct NprocCharge {
+    pub uid: Uid,
+    /// Tasks charged to `uid`, this one included
+    pub count: u64,
+    armed: bool,
+}
+
+impl NprocCharge {
+    pub fn new(uid: Uid) -> Self {
+        Self {
+            uid,
+            count: nproc_charge(uid),
+            armed: true,
+        }
+    }
+
+    /// The task exists: it now owns the charge
+    pub fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for NprocCharge {
+    fn drop(&mut self) {
+        if self.armed {
+            nproc_uncharge(self.uid);
+        }
+    }
+}
+
+/// The current task's real uid changes from `old` to `new` (Linux
+/// commit_creds): move its charge
+pub fn nproc_move(old: Uid, new: Uid) {
+    if old != new {
+        nproc_charge(new);
+        nproc_uncharge(old);
+    }
+}
+
+/// Linux set_user / flag_nproc_exceeded: a task whose real uid becomes
+/// `new` is flagged if that user is already over RLIMIT_NPROC (root's
+/// user never is); the flag is cleared otherwise
+fn flag_nproc_exceeded(new: Uid) {
+    let over = new != 0 && nproc_overlimit(nproc_count(new));
+    let tid = percpu::current_tid();
+    let mut table = percpu::TASK_TABLE.lock();
+    if let Some(t) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        t.nproc_exceeded = over;
+    }
 }
 
 // =============================================================================

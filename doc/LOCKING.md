@@ -2125,7 +2125,7 @@ interrupt-safety invariant:
 | `TASK_FS` | kernel/fs/context.rs | `Mutex` | Filesystem context |
 | `TASK_NS` | kernel/ns/mod.rs | `Mutex` | Namespace context |
 | `TASK_TLS` | kernel/task/tls.rs | `Mutex` | TLS base addresses |
-| `UID_PROCESS_COUNT` | kernel/task/mod.rs | `Mutex` | RLIMIT_NPROC tracking |
+| `NPROC` | kernel/task/mod.rs | `Mutex` | RLIMIT_NPROC tasks per real uid (leaf: may be taken under TASK_TABLE, takes no lock) |
 | `FRAME_ALLOCATOR` | kernel/frame_alloc.rs | `Mutex` | Physical frame allocation |
 | `PAGE_CACHE` | core/page_cache.rs | `Mutex` | Page cache lookup |
 | All VFS locks | kernel/fs/*.rs | `RwLock` | Inodes, dentries, mounts |

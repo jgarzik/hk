@@ -573,6 +573,7 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
         // I/O port permissions (x86-64 only, kernel threads don't use I/O ports)
         #[cfg(target_arch = "x86_64")]
         iopl_emul: 0,
+        nproc_exceeded: false,
         // Ptrace state (kernel threads are not traced)
         ptrace: 0,
         ptracer_tid: None,
@@ -759,6 +760,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         // I/O port permissions (x86-64 only, no I/O port access initially)
         #[cfg(target_arch = "x86_64")]
         iopl_emul: 0,
+        nproc_exceeded: false,
         // Ptrace state (not traced initially)
         ptrace: 0,
         ptracer_tid: None,
@@ -920,6 +922,10 @@ pub fn reap_zombie_child_times(
 
     if let Some(idx) = zombie_idx {
         let task = table.tasks.remove(idx);
+        // Released: drop the RLIMIT_NPROC charge (threads drop it at exit)
+        if task.tid == task.pid {
+            crate::task::nproc_uncharge(task.cred.uid);
+        }
         if let TaskState::Zombie(status) = task.state {
             return Some((task.pid, status, task.utime, task.stime));
         }
@@ -1017,28 +1023,22 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         return Err(22); // EINVAL
     }
 
-    // RLIMIT_NPROC enforcement for new processes (not threads)
-    // Following Linux pattern: increment first (atomically), then check if over limit
-    // This avoids the TOCTOU race where multiple concurrent clones could all pass
-    // a check-then-increment pattern before any of them increment.
-    let is_new_process = config.flags & CLONE_THREAD == 0;
-    let (nproc_uid, nproc_incremented) = if is_new_process {
-        let cred = current_cred();
-        let new_count = crate::task::increment_user_process_count(cred.uid);
-
-        // Check if over limit (CAP_SYS_RESOURCE bypasses)
-        if !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
-            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NPROC);
-            if limit != crate::rlimit::RLIM_INFINITY && new_count > limit {
-                // Over limit - decrement and return error
-                crate::task::decrement_user_process_count(cred.uid);
-                return Err(11); // EAGAIN - resource temporarily unavailable
-            }
-        }
-        (cred.uid, true)
-    } else {
-        (0, false) // Threads don't count toward RLIMIT_NPROC
+    // RLIMIT_NPROC: every task, threads included, is charged to its
+    // real uid until it is released; over the limit is EAGAIN unless
+    // root or CAP_SYS_RESOURCE/CAP_SYS_ADMIN (Linux copy_process). The
+    // guard uncharges on every error return.
+    let nproc = crate::task::NprocCharge::new(current_cred().uid);
+    let parent_nproc_exceeded = {
+        let table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter()
+            .find(|t| t.tid == current_tid())
+            .is_some_and(|t| t.nproc_exceeded)
     };
+    if crate::task::nproc_over(nproc.uid, nproc.count) {
+        return Err(11); // EAGAIN
+    }
 
     // Check cgroup pids controller limit (if task is in a cgroup with pids.max)
     // This is checked before allocating resources so we fail early if over limit
@@ -1049,27 +1049,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     if let Some(ref cgroup) = parent_cgroup
         && !crate::cgroup::pids_can_fork(cgroup)
     {
-        if nproc_incremented {
-            crate::task::decrement_user_process_count(nproc_uid);
-        }
         return Err(11); // EAGAIN - resource temporarily unavailable
     }
 
     // Helper macro to handle early returns with NPROC cleanup
     // If we incremented the process count and then fail, we must decrement it
-    macro_rules! try_with_cleanup {
-        ($expr:expr) => {
-            match $expr {
-                Ok(val) => val,
-                Err(e) => {
-                    if nproc_incremented {
-                        crate::task::decrement_user_process_count(nproc_uid);
-                    }
-                    return Err(e);
-                }
-            }
-        };
-    }
 
     // Get current CPU ID
     let cpu_id = CurrentArch::try_current_cpu_id().unwrap_or(0);
@@ -1098,7 +1082,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_ptracer_tid,
     ) = {
         let table = TASK_TABLE.lock();
-        let parent = try_with_cleanup!(table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)); // ESRCH - no such process
+        let parent = table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)?; // ESRCH - no such process
         (
             parent.pid,
             parent.tgid,
@@ -1137,9 +1121,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Validate CLONE_PARENT: cannot be used by init process (pid 1)
     // Linux checks for SIGNAL_UNKILLABLE flag, but we simplify to pid == 1
     if config.flags & CLONE_PARENT != 0 && parent_pid == 1 {
-        if nproc_incremented {
-            crate::task::decrement_user_process_count(nproc_uid);
-        }
         return Err(22); // EINVAL
     }
 
@@ -1170,7 +1151,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Allocate kernel stack for child (16KB = 4 pages, physically
     // contiguous: separately allocated frames need not be adjacent)
     let stack_pages = KERNEL_STACK_SIZE / PAGE_SIZE as usize;
-    let stack_base = try_with_cleanup!(frame_alloc.alloc_contig(stack_pages).ok_or(12)); // ENOMEM
+    let stack_base = frame_alloc.alloc_contig(stack_pages).ok_or(12)?; // ENOMEM
     let stack_base = crate::arch::phys_to_virt(stack_base) as u64;
     unsafe {
         core::ptr::write_bytes(stack_base as *mut u8, 0, KERNEL_STACK_SIZE);
@@ -1184,7 +1165,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     } else {
         // Fork: duplicate the entire user address space
         let parent_pt = ArchPageTable::new(parent_pt_phys);
-        try_with_cleanup!(parent_pt.duplicate_user_space(frame_alloc))
+        parent_pt.duplicate_user_space(frame_alloc)?
     };
 
     // Determine child's user stack pointer
@@ -1310,6 +1291,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         // I/O port permissions (x86-64 only, inherited from parent)
         #[cfg(target_arch = "x86_64")]
         iopl_emul: parent_iopl_emul,
+        // Copied like the rest of task->flags (Linux dup_task_struct)
+        nproc_exceeded: parent_nproc_exceeded,
         // Ptrace state: inherited if CLONE_PTRACE is set and parent is traced
         // CLONE_UNTRACED prevents forced inheritance even when tracer requests it
         ptrace: if config.flags & CLONE_UNTRACED != 0 {
@@ -1358,11 +1341,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Handle namespace context (CLONE_NEW* flags)
     // This must come after filesystem context since mount namespace affects VFS
-    try_with_cleanup!(crate::ns::copy_namespaces(
-        current_tid,
-        child_tid,
-        config.flags
-    ));
+    crate::ns::copy_namespaces(current_tid, child_tid, config.flags)?;
 
     // Handle cgroup membership
     // If CLONE_INTO_CGROUP is set, look up cgroup from fd and use that
@@ -1374,10 +1353,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
                 crate::cgroup::attach_task(child_tid, &cgroup);
             }
             None => {
-                // Invalid cgroup fd - cleanup and return error
-                if nproc_incremented {
-                    crate::task::decrement_user_process_count(nproc_uid);
-                }
+                // Invalid cgroup fd
                 return Err(9); // EBADF
             }
         }
@@ -1471,6 +1447,16 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         register_vfork_child(child_tid);
     }
 
+    // The child exists now: its charge is released with it; the parent
+    // forked within its limit (Linux clears PF_NPROC_EXCEEDED)
+    nproc.keep();
+    {
+        let mut table = TASK_TABLE.lock();
+        if let Some(t) = table.tasks.iter_mut().find(|t| t.tid == current_tid) {
+            t.nproc_exceeded = false;
+        }
+    }
+
     // Only a fully set up child becomes runnable (Linux: wake_up_new_task
     // at the end of kernel_clone); before this it has no mm, files or
     // signal state to run with
@@ -1549,16 +1535,14 @@ pub fn exit_current() -> ! {
     // take sleeping-context locks and may wake other tasks (futex CLEARTID,
     // robust futexes), which needs this CPU's rq lock.
     if tid != 0 {
-        // Decrement user process count for process exits (thread group leader)
-        // A process exits when tid == pid (thread group leader)
+        // A non-leader thread is released at exit (Linux autoreaps it):
+        // its RLIMIT_NPROC charge goes now; a process's when it is reaped
         {
             let table = TASK_TABLE.lock();
-            if let Some(task) = table.tasks.iter().find(|t| t.tid == tid) {
-                // Thread group leader: tid == pid
-                if task.tid == task.pid {
-                    let cred = current_cred();
-                    crate::task::decrement_user_process_count(cred.uid);
-                }
+            if let Some(task) = table.tasks.iter().find(|t| t.tid == tid)
+                && task.tid != task.pid
+            {
+                crate::task::nproc_uncharge(task.cred.uid);
             }
         }
 

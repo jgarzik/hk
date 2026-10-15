@@ -517,6 +517,9 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     envp: Vec<Vec<u8>>,
     frame_alloc: &mut FA,
 ) -> i32 {
+    if let Err(e) = crate::task::nproc_exec_check() {
+        return -e;
+    }
     let pathname = &path[..];
     // Convert pathname to string for VFS lookup
     let path_str = match core::str::from_utf8(pathname) {
