@@ -156,14 +156,15 @@ extern "C" fn kthread_entry() -> ! {
 }
 
 /// Terminate the current kernel thread (nobody reaps kernel threads, so the
-/// task leaves the task table at once; its 16 KB stack is not reclaimed)
+/// task leaves the task table at once; its stack is freed once the CPU
+/// has switched away)
 fn kthread_exit() -> ! {
     let tid = current_tid();
     crate::task::percpu::TASK_TABLE
         .lock()
         .tasks
         .retain(|t| t.tid != tid);
-    crate::task::percpu::exit_current()
+    crate::task::percpu::exit_current(None)
 }
 
 /// True once `kthread_stop` was called on the current thread

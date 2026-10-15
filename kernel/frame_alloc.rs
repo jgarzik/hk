@@ -393,6 +393,17 @@ impl BitmapFrameAllocator {
         }
     }
 
+    /// A huge page was split into 512 4KB mappings: every frame now
+    /// carries the head's count, so each is released by its own PTE
+    pub fn split_huge(&self, frame: u64) {
+        let mut inner = self.inner.lock();
+        let Some(idx) = inner.huge_index(frame) else {
+            return;
+        };
+        let count = inner.refcounts[idx];
+        inner.refcounts[idx + 1..idx + FRAMES_PER_HUGE_PAGE].fill(count);
+    }
+
     /// Increment reference count for a huge page
     ///
     /// Used when sharing a huge page between page tables (e.g., fork with COW).
@@ -787,5 +798,21 @@ mod tests {
         assert_eq!(a.alloc_huge(), None);
         assert!(a.decref_huge(h));
         assert_eq!(a.alloc_huge(), Some(h));
+    }
+
+    #[test]
+    fn split_huge_frames_free_one_by_one() {
+        let (a, _b) = fa(1100);
+        let h = a.alloc_huge().expect("huge");
+        let free = a.free_frames();
+        a.split_huge(h);
+        assert_eq!(a.refcount(pa(1023)), 1);
+        // A shared (forked) tail frame survives one put
+        a.incref(pa(600));
+        assert!(!a.decref(pa(600)));
+        for i in 512..1024 {
+            assert!(a.decref(pa(i)), "frame {i}");
+        }
+        assert_eq!(a.free_frames(), free + 512);
     }
 }

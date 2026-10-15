@@ -7,6 +7,7 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -15,6 +16,7 @@ use crate::task::Tid;
 pub mod anon_vma;
 pub mod huge_page;
 pub mod lru;
+pub mod memory;
 pub mod mempolicy;
 pub mod page;
 pub mod page_cache;
@@ -241,6 +243,13 @@ impl MmStruct {
     /// Get iterator over all VMAs
     pub fn iter(&self) -> impl Iterator<Item = &Vma> {
         self.vmas.iter()
+    }
+
+    /// Remove every VMA, resetting the VM counters (exit_mmap)
+    pub fn take_vmas(&mut self) -> Vec<Vma> {
+        self.total_vm = 0;
+        self.locked_vm = 0;
+        core::mem::take(&mut self.vmas)
     }
 
     /// Clone all VMAs (for fork)
@@ -551,88 +560,186 @@ impl MmStruct {
 }
 
 // =============================================================================
-// Task MM accessors - uses Task.mm field directly via TASK_TABLE
+// Address-space lifetime (Linux mm_struct: mm_users / mm_count)
 // =============================================================================
+
+/// An address space: its page tables and its VMAs (Linux mm_struct)
+///
+/// Two counts, as in Linux: `users` (mm_users) counts what uses the
+/// address space -- tasks running in it and pinned readers ([`MmRef`]);
+/// when it drops to zero the mappings and user page tables are torn
+/// down ([`memory::exit_mmap`]). The `Arc` strong count (mm_count) keeps
+/// the struct and its top-level table: the table is freed only when the
+/// last `Arc` goes ([`Drop`], Linux __mmdrop), after every CPU has left
+/// it (an exiting task keeps its `Arc` until it has switched away).
+pub struct Mm {
+    /// mm_users
+    users: AtomicUsize,
+    /// Physical address of the top-level table (owned; never changes)
+    pgd: u64,
+    /// The VMA tree and accounting; this spin lock is hk's mmap_lock
+    map: Mutex<MmStruct>,
+}
+
+impl Mm {
+    /// Top-level page table (CR3 / TTBR0 value)
+    pub fn pgd(&self) -> u64 {
+        self.pgd
+    }
+
+    /// Lock the VMA tree (mmap_lock)
+    pub fn lock(&self) -> spin::MutexGuard<'_, MmStruct> {
+        self.map.lock()
+    }
+
+    /// Current mm_users (diagnostics)
+    pub fn users(&self) -> usize {
+        self.users.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Mm {
+    /// __mmdrop: free the top-level table (the user tables are gone)
+    fn drop(&mut self) {
+        crate::FRAME_ALLOCATOR.free(self.pgd);
+    }
+}
+
+/// One mm_users reference: the holder may use the address space; it is
+/// torn down when the last one is dropped (mmput)
+pub struct MmRef(Arc<Mm>);
+
+impl MmRef {
+    /// A new address space rooted at the fresh table `pgd`, with one user
+    pub fn new(pgd: u64, map: MmStruct) -> Self {
+        MmRef(Arc::new(Mm {
+            users: AtomicUsize::new(1),
+            pgd,
+            map: Mutex::new(map),
+        }))
+    }
+
+    /// The address space, as an mm_count reference (mmgrab)
+    pub fn arc(&self) -> &Arc<Mm> {
+        &self.0
+    }
+}
+
+impl core::ops::Deref for MmRef {
+    type Target = Mm;
+    fn deref(&self) -> &Mm {
+        &self.0
+    }
+}
+
+impl Clone for MmRef {
+    /// mmget: another user of a live address space
+    fn clone(&self) -> Self {
+        self.0.users.fetch_add(1, Ordering::Relaxed);
+        MmRef(self.0.clone())
+    }
+}
+
+impl Drop for MmRef {
+    /// mmput: the last user tears the address space down. Never drop a
+    /// user reference under a spinlock: teardown drops file references.
+    fn drop(&mut self) {
+        if self.0.users.fetch_sub(1, Ordering::AcqRel) == 1 {
+            memory::exit_mmap(&self.0);
+        }
+    }
+}
+
+/// mmget_not_zero: a user reference, unless the address space is
+/// already being torn down
+pub fn mmget_not_zero(mm: &Arc<Mm>) -> Option<MmRef> {
+    let mut n = mm.users.load(Ordering::Relaxed);
+    while n != 0 {
+        match mm
+            .users
+            .compare_exchange_weak(n, n + 1, Ordering::Acquire, Ordering::Relaxed)
+        {
+            Ok(_) => return Some(MmRef(mm.clone())),
+            Err(v) => n = v,
+        }
+    }
+    None
+}
 
 use crate::task::percpu::TASK_TABLE;
 
-/// Get the memory descriptor for a task
-pub fn get_task_mm(tid: Tid) -> Option<Arc<Mutex<MmStruct>>> {
+/// The address space of task `tid` (an mm_count reference; the task
+/// itself holds the user reference, so it stays mapped while the task
+/// uses it)
+pub fn get_task_mm(tid: Tid) -> Option<Arc<Mm>> {
     let table = TASK_TABLE.lock();
     table
         .tasks
         .iter()
         .find(|t| t.tid == tid)
-        .and_then(|t| t.mm.clone())
+        .and_then(|t| t.mm.as_ref().map(|m| m.arc().clone()))
 }
 
-/// Initialize memory descriptor for a task
-pub fn init_task_mm(tid: Tid, mm: Arc<Mutex<MmStruct>>) {
-    let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.mm = Some(mm);
-    }
+/// A user reference to task `tid`'s address space (Linux get_task_mm),
+/// None for a task without one or one exiting
+pub fn get_task_mm_users(tid: Tid) -> Option<MmRef> {
+    let mm = get_task_mm(tid)?;
+    mmget_not_zero(&mm)
 }
 
-/// Remove memory descriptor for a task (called on exit)
-///
-/// Returns the removed MmStruct for cleanup.
-pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mutex<MmStruct>>> {
-    let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.mm.take()
-    } else {
-        None
-    }
+/// Detach task `tid` from its address space (Linux exit_mm). The user
+/// reference is dropped here (the last one tears the mappings down);
+/// the returned mm_count reference keeps the top-level table, still
+/// loaded on this CPU, until the task has switched away.
+pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
+    let mm = {
+        let mut table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter_mut()
+            .find(|t| t.tid == tid)
+            .and_then(|t| t.mm.take())
+    }?;
+    let keep = mm.arc().clone();
+    drop(mm);
+    Some(keep)
 }
 
-/// Clone memory descriptor from parent to child
+/// A copy-on-write duplicate of `parent` for fork (Linux dup_mm)
 ///
-/// If `share_vm` is true (CLONE_VM), both tasks share the same MmStruct.
-/// Otherwise, the child gets a copy of the parent's VMAs.
-///
-/// For fork (share_vm=false), the child's VMAs share the parent's anon_vma
-/// structures to enable proper reverse mapping for COW pages.
-pub fn clone_task_mm(parent_tid: Tid, child_tid: Tid, share_vm: bool) {
-    let parent_mm = match get_task_mm(parent_tid) {
-        Some(mm) => mm,
-        None => return, // Parent has no mm (kernel thread)
-    };
-
-    if share_vm {
-        // Threads share the same mm
-        init_task_mm(child_tid, parent_mm);
-    } else {
-        // Fork: create independent copy of VMAs
-        let parent_guard = parent_mm.lock();
-        let mut child_vmas = parent_guard.clone_vmas();
-
-        // Register child's VMAs with their anon_vma structures
-        // This enables reverse mapping to find both parent and child's PTEs
-        for vma in &mut child_vmas {
-            if let Some(ref anon_vma) = vma.anon_vma {
-                anon_vma.add_vma(child_tid, vma.start, vma.end);
-            }
+/// The child is rooted at `pgd` (a fresh table with the kernel half
+/// linked); `dup` copies the parent's pages into it given the parent's
+/// table. The VMAs and pages are copied under the parent's mmap_lock so
+/// no mapping changes under the copy. On error the partial copy is torn
+/// down with the child mm.
+pub fn dup_mm(
+    parent: &MmRef,
+    pgd: u64,
+    dup: impl FnOnce(u64) -> Result<(), i32>,
+) -> Result<MmRef, i32> {
+    let guard = parent.lock();
+    let mut map = MmStruct::new(guard.mmap_base);
+    map.vmas = guard.clone_vmas();
+    for vma in &map.vmas {
+        if let Some(ref anon_vma) = vma.anon_vma {
+            anon_vma.add_vma(pgd, vma.start, vma.end);
         }
-
-        let new_mm = MmStruct {
-            vmas: child_vmas,
-            mmap_base: parent_guard.mmap_base,
-            start_brk: parent_guard.start_brk,
-            brk: parent_guard.brk,
-            // Copy mlock state for fork
-            locked_vm: parent_guard.locked_vm,
-            // Copy total VM for fork
-            total_vm: parent_guard.total_vm,
-            def_flags: parent_guard.def_flags,
-            exe: parent_guard.exe.clone(),
-        };
-        drop(parent_guard);
-        init_task_mm(child_tid, Arc::new(Mutex::new(new_mm)));
     }
+    map.start_brk = guard.start_brk;
+    map.brk = guard.brk;
+    map.locked_vm = guard.locked_vm;
+    map.total_vm = guard.total_vm;
+    map.def_flags = guard.def_flags;
+    map.exe = guard.exe.clone();
+    let child = MmRef::new(pgd, map);
+    let res = dup(parent.pgd());
+    drop(guard);
+    // On error `child` goes with its partial copy (outside the lock)
+    res.map(|_| child).map_err(|e| e.unsigned_abs() as i32)
 }
 
-/// Create a default MmStruct for a new user task
-pub fn create_default_mm() -> Arc<Mutex<MmStruct>> {
-    Arc::new(Mutex::new(MmStruct::new(mmap_base())))
+/// A fresh, empty address space for exec / the first task, rooted at
+/// `pgd`
+pub fn mm_alloc(pgd: u64) -> MmRef {
+    MmRef::new(pgd, MmStruct::new(mmap_base()))
 }

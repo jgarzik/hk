@@ -187,9 +187,10 @@ pub enum WakeMode {
 pub struct KernelThreadContext {
     /// Context for switching (callee-saved registers)
     pub context: TaskContext,
-    /// Base address of allocated kernel stack (for freeing)
-    #[allow(dead_code)]
+    /// Base address of the kernel stack (direct map)
     pub stack_base: u64,
+    /// Its size in bytes, freed when the task is dead; 0 if not owned
+    pub stack_size: usize,
     /// Sleep state (see [`SleepState`])
     pub state: SleepState,
     /// True while the task sits in the priority run queue (prevents
@@ -200,10 +201,11 @@ pub struct KernelThreadContext {
 }
 
 impl KernelThreadContext {
-    fn new(context: TaskContext, stack_base: u64, priority: Priority) -> Self {
+    fn new(context: TaskContext, stack_base: u64, stack_size: usize, priority: Priority) -> Self {
         Self {
             context,
             stack_base,
+            stack_size,
             state: SleepState::Running,
             queued: false,
             priority,
@@ -229,6 +231,32 @@ pub struct CpuRunQueue {
     pub idle_tid: Option<Tid>,
     /// Sleep queue for tasks waiting on timer (sorted by wake_tick)
     pub sleep_queue: Vec<SleepEntry>,
+    /// Tasks that exited on this CPU, released once it has switched
+    /// away from them (Linux finish_task_switch for TASK_DEAD)
+    pub dead: Vec<DeadTask>,
+}
+
+/// What an exited task still holds while its CPU runs on its stack and
+/// its page tables: freed by the next task (`DeadTask::drop`)
+pub struct DeadTask {
+    /// Kernel stack (direct-map address) and size; size 0 = not owned
+    stack: (u64, usize),
+    /// mm_count reference on the address space it last ran in (mmdrop)
+    mm: Option<alloc::sync::Arc<crate::mm::Mm>>,
+}
+
+impl Drop for DeadTask {
+    fn drop(&mut self) {
+        let (base, size) = self.stack;
+        if size != 0 {
+            let phys = crate::arch::virt_to_phys(base);
+            for off in (0..size as u64).step_by(PAGE_SIZE as usize) {
+                crate::FRAME_ALLOCATOR.free(phys + off);
+            }
+        }
+        // mmdrop: the last reference frees the top-level table
+        drop(self.mm.take());
+    }
 }
 
 impl CpuRunQueue {
@@ -241,6 +269,7 @@ impl CpuRunQueue {
             nr_running: 0,
             idle_tid: None,
             sleep_queue: Vec::new(),
+            dead: Vec::new(),
         }
     }
 
@@ -493,7 +522,7 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
     let stack_top = stack_base + stack_size as u64;
 
     let context = TaskContext::new_kernel_thread(entry, stack_top);
-    let mut thread_ctx = KernelThreadContext::new(context, stack_base, priority);
+    let mut thread_ctx = KernelThreadContext::new(context, stack_base, stack_size, priority);
     if start_asleep {
         // Not runnable until wake_up_task (lets the creator finish setup)
         thread_ctx.state = SleepState::Uninterruptible;
@@ -693,6 +722,8 @@ pub fn enable() {
 /// * `config` - User task configuration (pid, tid, ppid, pgid, sid, priority, stacks, page table)
 pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
     let cpu_id = CurrentArch::try_current_cpu_id().unwrap_or(0);
+    // The first address space owns the boot-built tables
+    let mm = crate::mm::mm_alloc(config.page_table.root_table_phys());
 
     // Create Task entry
     let task = Task {
@@ -736,7 +767,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         clear_child_tid: 0,
         set_child_tid: 0,
         // Shared resources (will be initialized by caller via init_* functions)
-        mm: None,
+        mm: Some(mm),
         files: None,
         fs: None,
         nsproxy: None,
@@ -786,9 +817,11 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
     // Initialize with current kernel stack - when the user task makes a syscall,
     // we save its kernel-mode context here for sleeping/yielding
     let context = TaskContext::default();
+    // The boot-allocated stack of the first task is never freed
     let thread_ctx = KernelThreadContext::new(
         context,
         config.kstack_top - KERNEL_STACK_SIZE as u64,
+        0,
         config.priority,
     );
 
@@ -816,9 +849,6 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         config.tid,
         alloc::sync::Arc::new(crate::signal::SigHand::new()),
     );
-
-    // Initialize memory descriptor for the init task
-    crate::mm::init_task_mm(config.tid, crate::mm::create_default_mm());
 
     printkln!("USER_TASK_CREATED: pid={} tid={}", config.pid, config.tid);
     Ok(())
@@ -1158,6 +1188,30 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         (tid, pid)
     };
 
+    // The child's address space (Linux copy_mm): shared for CLONE_VM,
+    // else a copy-on-write duplicate. Dropped on any error below.
+    let parent_mm = {
+        let table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter()
+            .find(|t| t.tid == current_tid)
+            .and_then(|t| t.mm.clone())
+    };
+    let child_mm = match parent_mm {
+        None => None,
+        Some(pm) if config.flags & CLONE_VM != 0 => Some(pm),
+        Some(pm) => {
+            let mut pt = ArchPageTable::new_user(frame_alloc).ok_or(12)?; // ENOMEM
+            pt.copy_kernel_mappings();
+            let pgd = pt.root_table_phys();
+            let dup =
+                |parent| ArchPageTable::new(parent).duplicate_user_space(&mut pt, frame_alloc);
+            Some(crate::mm::dup_mm(&pm, pgd, dup)?)
+        }
+    };
+    let child_pt = ArchPageTable::new(child_mm.as_ref().map_or(parent_pt_phys, |m| m.pgd()));
+
     // Allocate kernel stack for child (16KB = 4 pages, physically
     // contiguous: separately allocated frames need not be adjacent)
     let stack_pages = KERNEL_STACK_SIZE / PAGE_SIZE as usize;
@@ -1167,16 +1221,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         core::ptr::write_bytes(stack_base as *mut u8, 0, KERNEL_STACK_SIZE);
     }
     let kstack_top = stack_base + KERNEL_STACK_SIZE as u64;
-
-    // Determine page table
-    let child_pt = if config.flags & CLONE_VM != 0 {
-        // Share address space - just copy the page table reference (threads)
-        ArchPageTable::new(parent_pt_phys)
-    } else {
-        // Fork: duplicate the entire user address space
-        let parent_pt = ArchPageTable::new(parent_pt_phys);
-        parent_pt.duplicate_user_space(frame_alloc)?
-    };
 
     // Determine child's user stack pointer
     // For fork (child_stack == 0): inherit parent's stack
@@ -1208,7 +1252,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Create TaskContext pointing to clone_child_entry
     // RSP points to the TrapFrame we just placed
     let context = CurrentArch::new_clone_child_context(trapframe_ptr);
-    let thread_ctx = KernelThreadContext::new(context, stack_base, child_priority);
+    let thread_ctx =
+        KernelThreadContext::new(context, stack_base, KERNEL_STACK_SIZE, child_priority);
 
     // Determine child's parent PID
     // CLONE_PARENT or CLONE_THREAD: child becomes sibling (same parent as caller)
@@ -1266,7 +1311,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         clear_child_tid: 0,
         set_child_tid: 0,
         // Shared resources (will be cloned/shared based on clone flags below)
-        mm: None,
+        mm: child_mm,
         files: None,
         fs: None,
         nsproxy: None,
@@ -1343,11 +1388,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // If CLONE_FILES is set, child shares parent's FD table
     // Otherwise, child gets an independent deep copy
     crate::task::fdtable::clone_task_fd(current_tid, child_tid, config.flags & CLONE_FILES != 0);
-
-    // Handle memory descriptor (CLONE_VM)
-    // If CLONE_VM is set, child shares parent's mm (threads)
-    // Otherwise, child gets an independent copy of VMAs (fork)
-    crate::mm::clone_task_mm(current_tid, child_tid, config.flags & CLONE_VM != 0);
 
     // Handle namespace context (CLONE_NEW* flags)
     // This must come after filesystem context since mount namespace affects VFS
@@ -1538,7 +1578,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 /// This function never returns. The current task is removed from the
 /// run queue (but kept in TASK_TABLE as zombie), and execution switches
 /// to the next available task (typically idle if no others).
-pub fn exit_current() -> ! {
+///
+/// With a `status`, the task becomes a zombie carrying it once everything
+/// it owned is released (Linux exit_notify after exit_mm/exit_files): a
+/// parent's wait never sees it, and never removes it, while it still
+/// runs on its resources.
+pub fn exit_current(status: Option<i32>) -> ! {
     let tid = current_tid();
 
     // Release the task's resources first, without the rq lock: these paths
@@ -1603,10 +1648,18 @@ pub fn exit_current() -> ! {
         // Signal vfork completion if parent is waiting
         // This must be done after CLEARTID but before we switch away
         signal_vfork_done(tid);
+    }
 
-        // Leave the address space last: the robust list and CLEARTID
-        // writes above still use it (Linux mm_release before exit_mm)
-        crate::mm::exit_task_mm(tid);
+    // Leave the address space (Linux exit_mm, after mm_release above has
+    // used it for the robust list and CLEARTID): the last user tears it
+    // down; its top-level table stays loaded here until we switched away
+    let dead_mm = if tid != 0 {
+        crate::mm::exit_task_mm(tid)
+    } else {
+        None
+    };
+    if let Some(st) = status {
+        mark_zombie(tid, st);
     }
 
     // Let a parent sleeping in wait4/waitid re-check for zombies
@@ -1616,12 +1669,21 @@ pub fn exit_current() -> ! {
     let mut rq = sched.lock.lock();
     sched.drain_wakes(&mut rq);
 
-    // Remove from the run queue (the Task stays in TASK_TABLE as a zombie)
+    // Remove from the run queue (the Task stays in TASK_TABLE as a zombie);
+    // its stack and mm go once this CPU runs something else
+    let mut dead = DeadTask {
+        stack: (0, 0),
+        mm: dead_mm,
+    };
     if let Some(tid) = rq.current.take() {
-        rq.contexts.retain(|(t, _)| *t != tid);
+        if let Some(pos) = rq.contexts.iter().position(|(t, _)| *t == tid) {
+            let (_, ctx) = rq.contexts.remove(pos);
+            dead.stack = (ctx.stack_base, ctx.stack_size);
+        }
         rq.sleep_queue.retain(|e| e.tid != tid);
         rq.nr_running = rq.nr_running.saturating_sub(1);
     }
+    rq.dead.push(dead);
 
     let next_tid = rq.dequeue_next();
     let (next_kstack, next_cr3, next_task) = switch_info(next_tid);
@@ -1643,8 +1705,10 @@ pub fn exit_current() -> ! {
     CurrentArch::set_current_task(&next_task);
     sched.nr_switches.fetch_add(1, Ordering::Relaxed);
 
-    // Release lock before switch (context_switch_first doesn't return)
-    drop(rq);
+    // The rq lock stays held across the switch, as for any switch: the
+    // next task releases it (its own guard, or finish_context_switch),
+    // and only then frees our stack (`rq.dead`)
+    core::mem::forget(rq);
 
     // Switch to next task - never returns
     unsafe {
@@ -1720,7 +1784,9 @@ fn context_switch_locked(
     }
     // Back on `cur` (the rq lock is held again; `rq` releases it)
     CurrentArch::restore_syscall_user_state(&saved);
+    let dead = core::mem::take(&mut rq.dead);
     drop(rq);
+    drop(dead);
 }
 
 /// This CPU's scheduler, if initialized
@@ -1946,6 +2012,9 @@ pub fn finish_context_switch() {
     unsafe {
         sched.lock.force_unlock();
     }
+    // Free what tasks that exited here left (we are off their stacks)
+    let dead = core::mem::take(&mut sched.lock.lock().dead);
+    drop(dead);
 }
 
 /// Get the current task's CR3 (page table root physical address)
@@ -2862,56 +2931,32 @@ pub fn set_current_fsgid(fsgid: crate::task::Gid) {
 
 /// Replace current task's address space and jump to new entry point
 ///
-/// This is used by execve to replace the current process image.
-/// The function never returns - it jumps directly to user mode.
+/// This is used by execve to replace the current process image (Linux
+/// exec_mmap): the task switches to `mm` first, then drops its user
+/// reference on the old address space. That tears it down only if
+/// nothing else uses it -- a vfork parent or other CLONE_VM threads keep
+/// it alive. The function never returns.
 ///
 /// # Arguments
-/// * `new_page_table` - The new page table for the process
+/// * `mm` - The new address space (its top-level table is loaded)
 /// * `entry_point` - The entry point address in the new program
 /// * `user_sp` - The initial user stack pointer
-pub fn exec_replace_image(new_page_table: ArchPageTable, entry_point: u64, user_sp: u64) -> ! {
-    use crate::FRAME_ALLOCATOR;
-    use crate::arch::PageTable;
-
+pub fn exec_replace_image(mm: crate::mm::MmRef, entry_point: u64, user_sp: u64) -> ! {
     let tid = current_tid();
-    let cr3 = new_page_table.root_table_phys();
+    let cr3 = mm.pgd();
 
-    // Install the new page table. The old one is freed only if no other
-    // task uses it: a vfork parent or the other threads (CLONE_VM) still
-    // run on it (Linux: exec_mmap drops one mm reference)
-    let old_frames = {
+    let old = {
         let mut table = TASK_TABLE.lock();
-        let old_root = table
-            .tasks
-            .iter()
-            .find(|t| t.tid == tid)
-            .map(|t| t.page_table.root_table_phys());
-        let shared = old_root.is_some_and(|root| {
-            table
-                .tasks
-                .iter()
-                .any(|t| t.tid != tid && t.page_table.root_table_phys() == root)
-        });
-        match table.tasks.iter_mut().find(|t| t.tid == tid) {
-            Some(task) => {
-                let frames = if shared {
-                    alloc::vec::Vec::new()
-                } else {
-                    task.page_table.collect_table_frames()
-                };
-                task.page_table = new_page_table;
-                frames
-            }
-            None => alloc::vec::Vec::new(),
-        }
+        let task = table.tasks.iter_mut().find(|t| t.tid == tid);
+        let task = task.expect("exec: current task not in the task table");
+        task.page_table = ArchPageTable::new(cr3);
+        task.mm.replace(mm)
     };
 
-    // Leave the old tables before freeing them: their frames may be
+    // Leave the old tables before releasing them: their frames may be
     // reused at once by another CPU
     crate::arch::paging::activate(cr3);
-    for frame in old_frames {
-        FRAME_ALLOCATOR.free(frame);
-    }
+    drop(old);
 
     // Get kernel stack for syscall/interrupt return
     let kstack_top = {

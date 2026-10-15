@@ -14,7 +14,7 @@
 
 use core::arch::asm;
 
-use crate::arch::{FrameAlloc, MapError, PageFlags, PageTable};
+use crate::arch::{FrameAlloc, Leaf, MapError, PageFlags, PageTable};
 
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
@@ -159,6 +159,51 @@ pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
 /// A leaf entry maps a page
 pub fn pte_present(pte: u64) -> bool {
     pte & 1 != 0
+}
+
+/// Tear down the user tables under the TTBR0 root `l0_phys` (the
+/// mapping and table part of Linux exit_mmap: unmap_vmas +
+/// free_pgtables). The L0 entries are detached and the TLB invalidated
+/// on all CPUs (`tlbi vmalle1is`) before anything is freed; then each
+/// leaf goes to `put` and every lower table frame is freed. The root
+/// frame itself is left to the caller.
+pub fn free_user(l0_phys: u64, put: &mut dyn FnMut(Leaf)) {
+    let l0 = phys_to_virt_table(l0_phys);
+    let mut top = alloc::vec::Vec::new();
+    for i in 0..ENTRIES_PER_TABLE {
+        // SAFETY: a live root table reached through the linear map; its
+        // entries belong to the caller
+        unsafe {
+            let e = *(*l0).entry(i);
+            if e.is_table() {
+                top.push(e.addr());
+            }
+            (*l0).entry_mut(i).clear();
+        }
+    }
+    flush_tlb_all();
+    for t in top {
+        free_level(t, 1, put);
+    }
+}
+
+/// Release the table at `phys` (`level` 1, 2 or 3) and everything below
+fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
+    let table = phys_to_virt_table_const(phys);
+    for i in 0..ENTRIES_PER_TABLE {
+        // SAFETY: a detached table frame owned by the caller
+        let e = unsafe { *(*table).entry(i) };
+        match level {
+            3 if e.0 & 0b11 == DESC_PAGE => put(Leaf::Page(e.addr())),
+            3 if e.0 != 0 => put(Leaf::Swap(e.0)),
+            // 1GB user blocks are never created
+            1 if e.is_table() => free_level(e.addr(), 2, put),
+            2 if e.is_block() => put(Leaf::Huge(e.addr())),
+            2 if e.is_table() => free_level(e.addr(), 3, put),
+            _ => {}
+        }
+    }
+    crate::FRAME_ALLOCATOR.free(phys);
 }
 
 /// Switch this CPU's user address space (TTBR0) to `root`
@@ -559,13 +604,14 @@ impl Aarch64PageTable {
     /// - On first write, a page fault triggers COW resolution (copy then)
     ///
     /// This is much more efficient than eager copying, especially for fork+exec patterns.
+    ///
+    /// `new_pt` is the child's fresh TTBR0 table; on error it holds part
+    /// of the copy, which the caller tears down with the child mm.
     pub fn duplicate_user_space<FA: FrameAlloc<PhysAddr = u64>>(
         &self,
+        new_pt: &mut Self,
         frame_alloc: &mut FA,
-    ) -> Result<Self, i32> {
-        // New TTBR0 table: holds only user mappings
-        let new_pt = Self::new_user(frame_alloc).ok_or(-12i32)?; // ENOMEM
-
+    ) -> Result<(), i32> {
         // Track range for batch TLB flush
         let mut flush_start: Option<u64> = None;
         let mut flush_end: u64 = 0;
@@ -661,13 +707,11 @@ impl Aarch64PageTable {
                                 pte_value
                             };
 
-                            // Increment reference count on shared frame
-                            crate::FRAME_ALLOCATOR.incref(src_phys);
-
-                            // Map in child - we need to map with the raw PTE value
-                            // to preserve PAGE_COW flag
+                            // Map in child with the raw PTE value (keeps
+                            // PAGE_COW); the child's PTE holds a reference
                             Self::map_raw_pte(new_pt.root_phys, vaddr, child_pte, frame_alloc)
                                 .map_err(|_| -12i32)?;
+                            crate::FRAME_ALLOCATOR.incref(src_phys);
                         }
                     }
                 }
@@ -679,7 +723,7 @@ impl Aarch64PageTable {
             }
         }
 
-        Ok(new_pt)
+        Ok(())
     }
 
     /// Map a page with a raw PTE value (used by COW to preserve PAGE_COW flag)
@@ -1209,56 +1253,6 @@ impl PageTable for Aarch64PageTable {
     fn kernel_identity() -> Self {
         Aarch64PageTable::kernel_identity()
     }
-
-    fn collect_table_frames(&self) -> alloc::vec::Vec<Self::PhysAddr> {
-        use alloc::vec::Vec;
-        let mut frames = Vec::new();
-
-        // Add the root L0 frame
-        frames.push(self.root_phys);
-
-        unsafe {
-            let l0 = phys_to_virt_table_const(self.root_phys);
-
-            // Walk L0 entries (user space is in lower addresses)
-            for l0_idx in 0..512 {
-                let l0_entry = (*l0).entry(l0_idx);
-                if !l0_entry.is_valid() || l0_entry.is_block() {
-                    continue;
-                }
-
-                let l1_phys = l0_entry.addr();
-                frames.push(l1_phys);
-                let l1 = phys_to_virt_table_const(l1_phys);
-
-                // Walk L1 entries
-                for l1_idx in 0..512 {
-                    let l1_entry = (*l1).entry(l1_idx);
-                    if !l1_entry.is_valid() || l1_entry.is_block() {
-                        continue;
-                    }
-
-                    let l2_phys = l1_entry.addr();
-                    frames.push(l2_phys);
-                    let l2 = phys_to_virt_table_const(l2_phys);
-
-                    // Walk L2 entries
-                    for l2_idx in 0..512 {
-                        let l2_entry = (*l2).entry(l2_idx);
-                        if !l2_entry.is_valid() || l2_entry.is_block() {
-                            continue;
-                        }
-
-                        let l3_phys = l2_entry.addr();
-                        frames.push(l3_phys);
-                        // Don't recurse into L3 - those are user page frames, not table frames
-                    }
-                }
-            }
-        }
-
-        frames
-    }
 }
 
 // ============================================================================
@@ -1514,6 +1508,9 @@ impl Aarch64PageTable {
 
             // Flush entire TLB - splitting affects many addresses
             flush_tlb_all();
+
+            // Each 4KB PTE now holds its own frame reference
+            crate::FRAME_ALLOCATOR.split_huge(huge_phys);
 
             Ok(huge_phys)
         }

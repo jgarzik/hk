@@ -14,9 +14,10 @@
 //!
 //! 1. PAGE_DESCRIPTORS (read)
 //! 2. AnonVma lock
-//! 3. TASK_TABLE lock
-//! 4. MmStruct lock (per-task)
-//! 5. Page table access (no lock, but we flush TLB)
+//! 3. Page table access (no lock, but we flush TLB)
+//!
+//! Chains name the address space by its top-level table; exit_mmap and
+//! munmap drop an address space's chains before freeing its tables.
 
 extern crate alloc;
 
@@ -26,8 +27,6 @@ use alloc::vec::Vec;
 use crate::mm::anon_vma::AnonVma;
 use crate::mm::page::{PG_ANON, page_descriptor};
 use crate::mm::swap_entry::SwapEntry;
-use crate::task::Tid;
-use crate::task::percpu::TASK_TABLE;
 
 use core::sync::atomic::Ordering;
 
@@ -38,8 +37,6 @@ use core::sync::atomic::Ordering;
 /// Result of finding a PTE for a page
 #[derive(Debug, Clone)]
 pub struct PteMapping {
-    /// Task ID owning the mapping
-    pub tid: Tid,
     /// Virtual address of the mapping
     pub vaddr: u64,
     /// Page table root physical address (CR3 on x86-64, TTBR0 on aarch64)
@@ -89,7 +86,7 @@ pub fn rmap_walk(frame_phys: u64) -> Vec<PteMapping> {
     // Check each VMA for mappings to this frame
     for chain in vmas {
         if let Some(mapping) =
-            check_vma_for_page(chain.tid, chain.vma_start, chain.vma_end, frame_phys)
+            check_vma_for_page(chain.root, chain.vma_start, chain.vma_end, frame_phys)
         {
             results.push(mapping);
         }
@@ -103,18 +100,11 @@ pub fn rmap_walk(frame_phys: u64) -> Vec<PteMapping> {
 /// Walks the page table for each page in the VMA range until we find
 /// one that maps to our target frame.
 fn check_vma_for_page(
-    tid: Tid,
+    pt_root: u64,
     vma_start: u64,
     vma_end: u64,
     frame_phys: u64,
 ) -> Option<PteMapping> {
-    // Get the task's page table root
-    let pt_root = {
-        let table = TASK_TABLE.lock();
-        let task = table.tasks.iter().find(|t| t.tid == tid)?;
-        task.page_table.root_table_phys()
-    };
-
     // Walk pages in VMA to find one mapping our frame
     let mut addr = vma_start;
     while addr < vma_end {
@@ -122,7 +112,6 @@ fn check_vma_for_page(
             let phys_page = phys & !0xFFF;
             if phys_page == frame_phys {
                 return Some(PteMapping {
-                    tid,
                     vaddr: addr,
                     pt_root,
                 });
@@ -145,7 +134,7 @@ pub fn rmap_walk_anon_vma(anon_vma: &Arc<AnonVma>, frame_phys: u64) -> Vec<PteMa
 
     for chain in vmas {
         if let Some(mapping) =
-            check_vma_for_page(chain.tid, chain.vma_start, chain.vma_end, frame_phys)
+            check_vma_for_page(chain.root, chain.vma_start, chain.vma_end, frame_phys)
         {
             results.push(mapping);
         }
@@ -304,12 +293,10 @@ mod tests {
     #[test]
     fn test_pte_mapping_struct() {
         let mapping = PteMapping {
-            tid: 1,
             vaddr: 0x1000,
             pt_root: 0x2000,
         };
 
-        assert_eq!(mapping.tid, 1);
         assert_eq!(mapping.vaddr, 0x1000);
         assert_eq!(mapping.pt_root, 0x2000);
     }

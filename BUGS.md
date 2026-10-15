@@ -53,16 +53,30 @@ ping_group_range (hk has no supplementary groups). /proc/net/raw and
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
 
-## User memory is not freed at exit or exec
+## Memory management gaps
 
-**Location**: `kernel/task/percpu.rs` (`exit_current`, `exec_replace_image`),
-`kernel/mm/mod.rs` (`exit_task_mm`)
+**Location**: `kernel/mm/`, `kernel/arch/*/paging.rs`, `kernel/ipc/shm.rs`
 
-When the last task of an address space exits or execs, its user pages
-are not unmapped and their frames are not released (Linux exit_mmap);
-exec frees only the old page-table frames (when no other task shares
-them) and exit frees nothing. Every process leaks its private memory,
-so long runs eventually exhaust frames.
+Address spaces are reference counted and torn down like Linux
+(doc/MEMORY.md, Address space lifetime); what is still missing:
+
+- Page descriptors are never initialized (`init_page_descriptors` has
+  no caller), so rmap, the LRU lists and swap-out are inert. Before
+  enabling them: `set_anon_mapping` stores an AnonVma pointer without
+  taking a reference while `clear_mapping` drops one, swap-out frees a
+  frame even when the rmap walk missed a mapping, and a swap-cache hit
+  maps the cached frame without taking a reference for the PTE.
+- fork copies neither 2MB (THP) mappings nor swap PTEs (the child sees
+  zero pages there) and turns every writable PTE copy-on-write, MAP_SHARED
+  mappings included (writes after fork are not shared).
+- SysV shm: fork and exit do not update `shm_nattch`; a segment removed
+  with IPC_RMID while attached by a process that exits without shmdt is
+  never destroyed (its own reference on the frames is never dropped).
+- Exited non-leader threads stay in the task table as zombies (Linux
+  reaps them at once); their kernel stacks and memory are freed.
+- munmap keeps page-table pages that become empty (freed at exit).
+- x86 has no user TLB shootdown, and the page-fault path installs PTEs
+  after dropping the mm lock (doc/LOCKING.md section 9).
 
 ## No dynamically linked executables
 
@@ -138,7 +152,7 @@ chmod/chown do not update ctime; ETXTBSY is not enforced.
 
 Only `i_rwsem`, `s_vfs_rename_mutex` and `f_pos_lock` are sleeping locks
 so far. Linux rw_semaphores/mutexes still modeled as `spin` locks include
-the mmap lock (`MmStruct`), the mount namespace/topology locks
+the mmap lock (`Mm::lock`), the mount namespace/topology locks
 (namespace_sem, `Mount` RwLocks), `s_umount` (absent), the fd table lock,
 pipe locks and RTNL: their holders must not sleep. There are no
 `_killable`/`_interruptible`/`try` variants of the sleeping locks yet

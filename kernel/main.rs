@@ -1132,7 +1132,7 @@ fn kmain() -> ! {
         m.set_brk(start_brk);
         m.set_exe(alloc::string::String::from("/bin/init"));
         let stack_bottom = USER_STACK_TOP - USER_STACK_PAGES as u64 * PAGE_SIZE;
-        for vma in task::exec::image_vmas(2, &elf, base_addr, stack_bottom) {
+        for vma in task::exec::image_vmas(mm.pgd(), &elf, base_addr, stack_bottom) {
             m.insert_vma(vma);
         }
     }

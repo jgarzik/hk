@@ -92,3 +92,37 @@ Linux: `Documentation/arch/arm64/memory.rst`.
 - `access_ok` accepts a range only if it ends at or below `TASK_SIZE`;
   SMAP (x86) and PAN (arm64) catch stray kernel accesses to user memory.
 
+
+## Address space lifetime (both arches)
+
+An address space is an `Mm` (Linux mm_struct, `kernel/mm/mod.rs`): its
+top-level table (x86 PML4, arm64 TTBR0 L0) and its VMAs. Locking and the
+reference rules are in `doc/LOCKING.md` (Address Spaces).
+
+- **Two counts, as in Linux.** `users` (mm_users): the tasks running in
+  it (threads and a vfork parent share one) and short-lived pinned users
+  (ptrace, process_vm_*, a /proc/<pid>/maps read). The `Arc` count
+  (mm_count) keeps the struct and the top-level table.
+- **Frame references.** Every present user PTE holds one reference on its
+  frame: a fault allocates with count 1, fork increfs each copy-on-write
+  frame, a SysV shm attachment takes one per page (the segment holds its
+  own), splitting a 2MB page gives each 4KB frame the head's count.
+  Unmapping drops the reference and the last one frees the frame. Frames
+  outside the allocator (MMIO) have no count and are never freed.
+- **Teardown (Linux exit_mmap).** When `users` drops to zero (last task
+  exits, or the old image at exec), the VMAs and their rmap chains go,
+  the user half is detached from the top-level table and the TLB
+  flushed, then every user leaf is released (4KB pages, 2MB pages, swap
+  slots) and every lower table frame (all levels) freed. The kernel half
+  (x86 PML4 256-511, shared) and TTBR1 are never touched.
+- **Top-level table (Linux __mmdrop).** Freed with the last `Arc`: an
+  exiting task keeps one until its CPU has switched to another task
+  (the next task frees it with the dead task's kernel stack).
+- **exec** builds the new image in a fresh `Mm` (an error frees it),
+  switches the task to it, then drops its user reference on the old one,
+  which is torn down only if no vfork parent or other thread uses it.
+- **munmap / MAP_FIXED / brk shrink / shmdt** release the pages in the
+  range under the mm lock; empty page-table pages are kept until exit
+  (reused by later mappings at the same addresses).
+- `/proc/meminfo` reports MemTotal and MemFree from the frame allocator
+  (exact free count).

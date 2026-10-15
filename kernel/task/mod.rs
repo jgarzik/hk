@@ -104,7 +104,6 @@ use core::sync::atomic::AtomicBool;
 use crate::arch::{Arch, PageTable};
 use crate::fs::{File, FsStruct};
 use crate::ipc::sem::SemUndoList;
-use crate::mm::MmStruct;
 use crate::mm::page_cache::CachedPage;
 use crate::ns::NsProxy;
 use crate::seccomp::SeccompFilter;
@@ -949,8 +948,8 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     // =========================================================================
     // Shared resources (Arc for clone-sharing, like Linux pointers)
     // =========================================================================
-    /// Memory descriptor (shared when CLONE_VM)
-    pub mm: Option<Arc<Mutex<MmStruct>>>,
+    /// Address space, one mm_users reference (shared when CLONE_VM)
+    pub mm: Option<crate::mm::MmRef>,
 
     /// File descriptor table (shared when CLONE_FILES)
     pub files: Option<Arc<Mutex<FdTable<File>>>>,

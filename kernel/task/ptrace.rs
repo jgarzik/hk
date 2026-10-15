@@ -554,16 +554,12 @@ fn ptrace_kill(target_pid: Pid) -> i64 {
 // =============================================================================
 
 /// Get target's memory descriptor and page table root
-fn get_target_mm_and_pt(
-    target_tid: Tid,
-) -> Option<(alloc::sync::Arc<spin::Mutex<crate::mm::MmStruct>>, u64)> {
-    let table = TASK_TABLE.lock();
-    let task = table.tasks.iter().find(|t| t.tid == target_tid)?;
-
-    let mm = task.mm.clone()?;
-    let pt_root = task.page_table.root_table_phys();
-
-    Some((mm, pt_root))
+fn get_target_mm_and_pt(target_tid: Tid) -> Option<(crate::mm::MmRef, u64)> {
+    // A user reference: the address space cannot be torn down while we
+    // access it (Linux get_task_mm)
+    let mm = crate::mm::get_task_mm_users(target_tid)?;
+    let pgd = mm.pgd();
+    Some((mm, pgd))
 }
 
 /// Read a word from tracee's memory.

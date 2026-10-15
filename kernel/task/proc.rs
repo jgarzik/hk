@@ -38,13 +38,9 @@ pub fn sys_exit(status: i32) -> u64 {
 /// `(code << 8)` for a normal exit, the signal number (| 0x80 if a core was
 /// dumped) for a signal death, exactly what wait4 reports.
 pub fn do_exit(wait_status: i32) -> ! {
-    let tid = super::percpu::current_tid();
-
-    // Mark task as Zombie (stores the status for wait4/waitid)
-    super::percpu::mark_zombie(tid, wait_status);
-
-    // Remove from run queue and switch to another task (never returns)
-    super::percpu::exit_current();
+    // Release everything, become a zombie carrying the status for
+    // wait4/waitid, switch away (never returns)
+    super::percpu::exit_current(Some(wait_status));
 }
 
 /// sys_clone - create a new thread or process

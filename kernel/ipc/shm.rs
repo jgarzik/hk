@@ -145,10 +145,12 @@ impl IpcObject for ShmidKernel {
     }
 
     fn destroy(&self) {
-        // Free all frames
+        // Drop the segment's reference on each frame: a page still mapped
+        // somewhere (a child that inherited the attach) lives on until
+        // its last PTE goes
         let frames = self.frames.lock();
         for &frame in frames.iter() {
-            crate::FRAME_ALLOCATOR.free(frame);
+            crate::FRAME_ALLOCATOR.decref(frame);
         }
 
         // Update namespace totals
@@ -275,6 +277,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
     };
 
     // Find address and create VMA
+    let mut replaced = Vec::new();
     let addr = {
         let mut mm_guard = mm.lock();
 
@@ -301,8 +304,13 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
                 if shmflg & SHM_REMAP == 0 {
                     return Err(KernelError::InvalidArgument.errno());
                 }
-                // SHM_REMAP: remove overlapping VMAs
-                mm_guard.remove_range(aligned_addr, aligned_addr + size as u64);
+                // SHM_REMAP: unmap what was there
+                replaced = crate::mm::syscall::munmap_locked(
+                    &mut mm_guard,
+                    mm.pgd(),
+                    aligned_addr,
+                    aligned_addr + size as u64,
+                );
             }
             aligned_addr
         };
@@ -322,6 +330,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
 
         addr
     }; // mm_guard dropped here
+    drop(replaced);
 
     // Map the physical frames into the process's page tables
     let cr3 = get_current_task_cr3();
@@ -371,7 +380,9 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
                 // Mapping failed - unmap what we've done so far and fail
                 for j in 0..i {
                     let unmap_va = addr + (j * PAGE_SIZE) as u64;
-                    crate::arch::x86_64::interrupts::unmap_user_page(cr3, unmap_va);
+                    if crate::arch::x86_64::interrupts::unmap_user_page(cr3, unmap_va).is_some() {
+                        crate::FRAME_ALLOCATOR.decref(frames[j]);
+                    }
                 }
                 drop(frames);
                 return Err(KernelError::OutOfMemory.errno());
@@ -385,12 +396,16 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
                 // Mapping failed - unmap what we've done so far and fail
                 for j in 0..i {
                     let unmap_va = addr + (j * PAGE_SIZE) as u64;
-                    crate::arch::aarch64::exceptions::unmap_user_page(cr3, unmap_va);
+                    if crate::arch::aarch64::exceptions::unmap_user_page(cr3, unmap_va).is_some() {
+                        crate::FRAME_ALLOCATOR.decref(frames[j]);
+                    }
                 }
                 drop(frames);
                 return Err(KernelError::OutOfMemory.errno());
             }
         }
+        // The PTE holds a reference, dropped when it is unmapped
+        crate::FRAME_ALLOCATOR.incref(frame);
     }
     drop(frames);
 
@@ -447,33 +462,13 @@ fn do_shmdt(shmaddr: u64) -> Result<i32, i32> {
         (shmid, size)
     }; // mm_guard dropped
 
-    // Get page table root
-    let cr3 = get_current_task_cr3();
-    if cr3 == 0 {
-        return Err(KernelError::InvalidArgument.errno());
-    }
-
-    // Unmap pages from page tables
-    let pages = (size / PAGE_SIZE as u64) as usize;
-    for i in 0..pages {
-        let va = shmaddr + (i * PAGE_SIZE) as u64;
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::arch::x86_64::interrupts::unmap_user_page(cr3, va);
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            crate::arch::aarch64::exceptions::unmap_user_page(cr3, va);
-        }
-    }
-
-    // Remove VMA
-    {
+    // Unmap the attachment (Linux do_munmap of the shm VMA): each PTE
+    // drops its frame reference
+    let gone = {
         let mut mm_guard = mm.lock();
-        mm_guard.remove_range(shmaddr, shmaddr + size);
-    }
+        crate::mm::syscall::munmap_locked(&mut mm_guard, mm.pgd(), shmaddr, shmaddr + size)
+    };
+    drop(gone);
 
     // Update segment statistics
     if let Some(shm_obj) = ns.shm_ids().find_by_id(shmid) {

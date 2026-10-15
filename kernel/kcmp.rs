@@ -191,7 +191,8 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
 
         KCMP_VM => {
             // Compare memory address spaces
-            compare_arc_option(&task1.mm, &task2.mm, KCMP_VM)
+            let vm = |t: &Option<crate::mm::MmRef>| t.as_ref().map(|m| m.arc().clone());
+            compare_arc_option(&vm(&task1.mm), &vm(&task2.mm), KCMP_VM)
         }
 
         KCMP_FILES => {

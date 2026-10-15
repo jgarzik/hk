@@ -20,6 +20,7 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
+use core::sync::atomic::Ordering;
 
 use spin::Mutex;
 
@@ -196,7 +197,11 @@ pub static LRU: Mutex<LruLists> = Mutex::new(LruLists::new());
 /// Add a new page to LRU (convenience wrapper)
 #[inline]
 pub fn lru_add_new(frame: u64) {
-    LRU.lock().add_new(frame);
+    // Membership is tracked by PG_LRU: without a page descriptor the page
+    // could never be taken off again (and the lists would only grow)
+    if page_descriptor(frame).is_some() {
+        LRU.lock().add_new(frame);
+    }
 }
 
 /// Mark page as accessed (convenience wrapper)
@@ -208,7 +213,9 @@ pub fn lru_mark_accessed(frame: u64) {
 /// Remove page from LRU (convenience wrapper)
 #[inline]
 pub fn lru_remove(frame: u64) {
-    LRU.lock().remove(frame);
+    if page_descriptor(frame).is_some_and(|p| p.flags.load(Ordering::Relaxed) & PG_LRU != 0) {
+        LRU.lock().remove(frame);
+    }
 }
 
 // ============================================================================

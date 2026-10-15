@@ -217,6 +217,8 @@ Per-CPU scheduler locks (IrqSpinlock)  ← IRQ-safe, can hold while acquiring be
     ↓
 Global subsystem locks (TASK_TABLE, PAGE_CACHE, FD_TABLE)  ← NOT IRQ-safe
     ↓
+Address space: Mm lock (mmap_lock) → AnonVma, LRU  ← never nested with TASK_TABLE (3.2)
+    ↓
 Memory allocator locks (FRAME_ALLOCATOR, heap)  ← NOT IRQ-safe
 
 Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
@@ -333,8 +335,11 @@ pub needs_reschedule: AtomicBool, // Reschedule request flag
    task switched to (its guard drop, or `finish_context_switch` for a new
    task).
 
-4. **Drop lock before `context_switch_first()`** - The initial switch to a
-   task never returns, so the lock must be explicitly dropped.
+4. **`context_switch_first()`** - An exiting task (`exit_current`) keeps
+   the lock held across its final switch like any other switch (the guard
+   is forgotten; the next task releases it), so nothing runs on this CPU
+   between leaving the dead task and the next task taking over. Only the
+   boot-time first switch (`try_schedule`) drops it before switching.
 
 5. **Timer ISR only touches local CPU** - `wake_sleepers()` drains the local
    `wake_list` and wakes expired sleepers of the local sleep queue only.
@@ -362,6 +367,16 @@ pub needs_reschedule: AtomicBool, // Reschedule request flag
    Signal frames, fork and execve read/write the state in these places;
    nothing may use user FP registers between a context switch's save and
    the task's next return to user mode except through them.
+
+8. **Dead tasks are freed by the next task (Linux finish_task_switch)** -
+   `exit_current` cannot free the kernel stack it runs on, nor the
+   top-level page table still loaded in CR3/TTBR0. It pushes them as a
+   `DeadTask` (stack, mm_count reference) on its rq's `dead` list, under
+   the rq lock held across the switch. The task switched to takes the list
+   under the rq lock and frees it after releasing the lock (in
+   `context_switch_locked`, or `finish_context_switch` for a new task):
+   frame frees and the last `Arc<Mm>` drop (top-level table, heap) never
+   happen under the rq lock.
 
 #### Sleep / Wakeup Protocol (Linux set_current_state / try_to_wake_up)
 
@@ -582,6 +597,54 @@ pub struct BitmapFrameAllocator {
 - Policy: no frame allocation in interrupt context
 - Thread-safe via `&self` methods (`alloc()`, `free()`)
 
+#### Address Spaces (Mm: mm_users / mm_count, mmap_lock)
+
+**Location:** `kernel/mm/mod.rs` (`Mm`, `MmRef`), `kernel/mm/memory.rs`
+(`exit_mmap`), `kernel/task/percpu.rs` (`exit_current`, `exec_replace_image`,
+`do_clone`)
+
+- `Mm.users` (`AtomicUsize`, Linux mm_users) counts the tasks running in
+  the address space and pinned users (`MmRef`: ptrace PEEK/POKE,
+  process_vm_*, a /proc/<pid>/maps read). The last `MmRef` drop runs
+  `exit_mmap`, which takes the VMAs under the mm lock, drops the rmap
+  chains, then tears down the user half (`paging::free_user`) and drops
+  the VMAs (file references) with no lock held. **Never drop an `MmRef`
+  under a spinlock** (TASK_TABLE included): take it out (`Option::take`,
+  `replace`) and drop it after unlocking. `mmget_not_zero` refuses an
+  address space already being torn down.
+- `Arc<Mm>` (Linux mm_count) keeps the struct and its top-level table,
+  freed on the last drop (`Mm::drop`, __mmdrop). Holders: every `MmRef`,
+  `get_task_mm` callers (the task's own user reference keeps the mappings),
+  an open /proc/<pid>/maps (Linux proc_mem_open: mmgrab only), and an
+  exited task's `DeadTask` until its CPU has switched away (scheduler
+  rule 8).
+- `Task.mm` is set and taken under `TASK_TABLE`: at clone (`dup_mm` or a
+  shared `MmRef`), at exec (`exec_replace_image` loads the new table, then
+  drops the old user reference: a vfork parent or other CLONE_VM threads
+  keep it alive), at exit (`exit_task_mm`, after the robust list and
+  CLEARTID writes that still need the mappings, Linux mm_release before
+  exit_mm). A task becomes a zombie only after that, so a reaping parent
+  never drops a task that still uses its mm.
+- The mm lock (`Mm::lock`, a `spin::Mutex`) is hk's mmap_lock: it guards
+  the VMA tree and VM counters. `dup_mm` holds the parent's mm lock while
+  it copies VMAs and page tables. munmap / MAP_FIXED / brk shrink / shmdt
+  zap pages under it (`munmap_locked`). Order: mm lock → AnonVma lock,
+  `LRU`, page descriptors, swap slots → `FRAME_ALLOCATOR`; nothing taken
+  under those leaf locks takes an mm lock (the swap rmap walk uses the
+  roots recorded in AnonVma chains, not the task table or mm locks).
+  `TASK_TABLE` is never held while taking an mm lock.
+- The page-fault paths find the VMA under the mm lock but drop it before
+  allocating and installing the PTE (they may sleep reading a file), so a
+  fault can race munmap of the same range in another thread (gap vs Linux,
+  which holds mmap_lock for read across the fault and the page table lock
+  around the PTE update; section 9).
+- Teardown TLB: `free_user` detaches the user half from the top-level
+  table, flushes (arm64: `tlbi vmalle1is`, all CPUs; x86: this CPU, if
+  the table is loaded here), then frees pages and tables. A CPU that last
+  ran the address space (another thread still in `exit_current`) is only
+  covered on arm64; on x86 it may keep stale user TLB entries until its
+  next CR3 load, but it no longer touches user memory (section 9).
+
 #### Kernel Page Tables (kernel half)
 
 **Location:** `kernel/arch/x86_64/kmap.rs`, `kernel/arch/x86_64/ioremap.rs`,
@@ -608,9 +671,9 @@ layout in `doc/MEMORY.md`
   iounmap another CPU may still cache the old translation of a range
   that is handed out again (gap vs Linux `flush_tlb_kernel_range`,
   section 9; drivers do not iounmap in practice).
-- User half: per address space, changed only by its owner under the
-  task's mm lock (see the page fault and mmap paths); never contains a
-  kernel mapping.
+- User half: per address space, changed by its tasks under the mm lock
+  (the fault paths install PTEs after dropping it, see Address Spaces);
+  never contains a kernel mapping.
 
 #### Heap Allocator
 
@@ -2210,6 +2273,8 @@ Features present in Linux but not yet implemented in hk:
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
 | Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
 | Kernel TLB shootdown | `flush_tlb_kernel_range` IPIs | x86: local `invlpg` only | Stale ioremap translation on other CPUs after iounmap |
+| User TLB shootdown | `flush_tlb_mm_range` IPIs to `mm_cpumask` | x86: local `invlpg` / CR3 reload only (arm64 broadcasts `tlbi ...is`) | Another CPU running a thread of the same process may use a stale translation after munmap/mprotect/exit_mmap |
+| mmap_lock across faults | `mmap_read_lock` + PTE lock in the fault path | Fault drops the mm lock before installing the PTE | A fault can race munmap of the same range in another thread |
 
 ### Implications
 

@@ -308,7 +308,7 @@ fn check_segments(elf: &ElfExecutable, base: u64) -> Result<(), i32> {
 /// PT_LOAD segment (pages already populated) and the stack
 /// (growsdown), so mprotect/munmap/brk and /proc/<pid>/maps see them
 pub fn image_vmas(
-    tid: crate::task::Tid,
+    pgd: u64,
     elf: &ElfExecutable,
     base: u64,
     stack_bottom: u64,
@@ -320,7 +320,7 @@ pub fn image_vmas(
     let anon = |start: u64, end: u64, prot: u32| {
         let mut v = Vma::new(start, end, prot, MAP_PRIVATE | MAP_ANONYMOUS);
         let av = AnonVma::new();
-        av.add_vma(tid, start, end);
+        av.add_vma(pgd, start, end);
         v.set_anon_vma(av);
         v
     };
@@ -577,6 +577,10 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     // Link the kernel half (x86; arm64 keeps the kernel in TTBR1)
     new_page_table.copy_kernel_mappings();
 
+    // The new address space owns the table from here: an error below
+    // drops it, freeing whatever was loaded (Linux bprm->mm)
+    let mm = crate::mm::mm_alloc(new_page_table.root_table_phys());
+
     // Load ELF segments and get the end address for brk initialization
     let segments_end =
         match load_elf_segments(&elf, &elf_data, &mut new_page_table, frame_alloc, base_addr) {
@@ -623,17 +627,15 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     // Calculate page-aligned start_brk (end of loaded segments, rounded up)
     let start_brk = (segments_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
-    // Create fresh MmStruct for the new process (exec replaces address space)
-    let mm = crate::mm::create_default_mm();
+    // The new image's VMAs
     {
         let mut m = mm.lock();
         m.set_brk(start_brk);
         m.set_exe(file.dentry.full_path());
-        for vma in image_vmas(tid, &elf, base_addr, stack_bottom) {
+        for vma in image_vmas(mm.pgd(), &elf, base_addr, stack_bottom) {
             m.insert_vma(vma);
         }
     }
-    crate::mm::init_task_mm(tid, mm);
 
     // exec_replace_image never returns: free everything owned here first
     // (the file image alone is megabytes of heap)
@@ -644,8 +646,8 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     drop(envp);
     drop(path);
 
-    // Update the current task's page table and jump to user mode
-    percpu::exec_replace_image(new_page_table, entry_point, user_sp);
+    // Switch to the new address space and jump to user mode
+    percpu::exec_replace_image(mm, entry_point, user_sp);
 }
 
 /// sys_execve - execute a program

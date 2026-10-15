@@ -3,7 +3,7 @@
 //! Implements the PageTable trait for x86-64 4-level paging:
 //! PML4 -> PDPT -> PD -> PT -> Physical Page
 
-use crate::arch::{FrameAlloc, MapError, PageFlags, PageTable};
+use crate::arch::{FrameAlloc, Leaf, MapError, PageFlags, PageTable};
 
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
@@ -103,6 +103,52 @@ pub fn pte_present(pte: u64) -> bool {
 /// Switch this CPU to the address space rooted at `root`
 pub fn activate(root: u64) {
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack)) };
+}
+
+/// Tear down the user half under `pml4_phys` (the mapping and table
+/// part of Linux exit_mmap: unmap_vmas + free_pgtables). The user PML4
+/// entries are detached and, if the table is live on this CPU, the TLB
+/// is flushed before anything is freed; then each user leaf goes to
+/// `put` and every lower table frame is freed. The root frame and the
+/// shared kernel half (PML4 256-511) are left untouched. Other CPUs are
+/// not shot down (no x86 TLB shootdown yet, doc/LOCKING.md).
+pub fn free_user(pml4_phys: u64, put: &mut dyn FnMut(Leaf)) {
+    let mut top = [PageTableEntry::empty(); KERNEL_PML4_START];
+    let pml4 = phys_to_virt_table(pml4_phys);
+    for (i, e) in top.iter_mut().enumerate() {
+        // SAFETY: `pml4_phys` is a live root table reached through the
+        // direct map; its user entries belong to the caller
+        unsafe {
+            *e = *(*pml4).entry(i);
+            (*pml4).entry_mut(i).clear();
+        }
+    }
+    if X86_64PageTable::current_cr3() & ADDR_MASK == pml4_phys {
+        X86_64PageTable::flush_tlb_all();
+    }
+    for e in top.iter().filter(|e| e.is_present()) {
+        free_level(e.addr(), 3, put);
+    }
+}
+
+/// Release the table at `phys` and everything below it; `level` 3 is a
+/// PDPT, 2 a PD, 1 a PT
+fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
+    let table = phys_to_virt_table_const(phys);
+    for i in 0..ENTRIES_PER_TABLE {
+        // SAFETY: a detached table frame owned by the caller
+        let e = unsafe { *(*table).entry(i) };
+        match level {
+            1 if e.is_present() => put(Leaf::Page(e.addr())),
+            1 if e.0 != 0 => put(Leaf::Swap(e.0)),
+            // 1GB user pages are never created
+            3 if e.is_present() && !e.is_huge() => free_level(e.addr(), 2, put),
+            2 if e.is_present() && e.is_huge() => put(Leaf::Huge(e.addr())),
+            2 if e.is_present() => free_level(e.addr(), 1, put),
+            _ => {}
+        }
+    }
+    crate::FRAME_ALLOCATOR.free(phys);
 }
 
 /// Flush the TLB entry for `va` on this CPU
@@ -621,56 +667,6 @@ impl PageTable for X86_64PageTable {
         // Delegate to the inherent method
         X86_64PageTable::kernel_identity()
     }
-
-    fn collect_table_frames(&self) -> alloc::vec::Vec<Self::PhysAddr> {
-        use alloc::vec::Vec;
-        let mut frames = Vec::new();
-
-        // Add the root PML4 frame
-        frames.push(self.pml4_phys);
-
-        unsafe {
-            let pml4 = phys_to_virt_table_const(self.pml4_phys);
-
-            // Walk PML4 entries (only user-space portion, indices 0-255)
-            for pml4_idx in 0..256 {
-                let pml4_entry = (*pml4).entry(pml4_idx);
-                if !pml4_entry.is_present() || pml4_entry.is_huge() {
-                    continue;
-                }
-
-                let pdpt_phys = pml4_entry.addr();
-                frames.push(pdpt_phys);
-                let pdpt = phys_to_virt_table_const(pdpt_phys);
-
-                // Walk PDPT entries
-                for pdpt_idx in 0..512 {
-                    let pdpt_entry = (*pdpt).entry(pdpt_idx);
-                    if !pdpt_entry.is_present() || pdpt_entry.is_huge() {
-                        continue;
-                    }
-
-                    let pd_phys = pdpt_entry.addr();
-                    frames.push(pd_phys);
-                    let pd = phys_to_virt_table_const(pd_phys);
-
-                    // Walk PD entries
-                    for pd_idx in 0..512 {
-                        let pd_entry = (*pd).entry(pd_idx);
-                        if !pd_entry.is_present() || pd_entry.is_huge() {
-                            continue;
-                        }
-
-                        let pt_phys = pd_entry.addr();
-                        frames.push(pt_phys);
-                        // Don't recurse into PT - those are user page frames, not table frames
-                    }
-                }
-            }
-        }
-
-        frames
-    }
 }
 
 /// COW (Copy-on-Write) flag - we use an available bit in the PTE
@@ -702,33 +698,35 @@ impl X86_64PageTable {
     /// If `force_copy_fn` is provided, pages where the callback returns true
     /// will be copied immediately instead of using COW. This is used for
     /// mlock'd pages that must remain resident.
+    ///
+    /// `new_pt` is the child's fresh table (kernel half linked); on error
+    /// it holds part of the copy, which the caller tears down with the
+    /// child mm.
     pub fn duplicate_user_space<FA: FrameAlloc<PhysAddr = u64>>(
         &self,
+        new_pt: &mut Self,
         frame_alloc: &mut FA,
-    ) -> Result<Self, i32> {
-        self.duplicate_user_space_inner(frame_alloc, None)
+    ) -> Result<(), i32> {
+        self.duplicate_user_space_inner(new_pt, frame_alloc, None)
     }
 
     /// Duplicate user space with optional force-copy callback for mlock'd pages
     pub fn duplicate_user_space_with_callback<FA: FrameAlloc<PhysAddr = u64>>(
         &self,
+        new_pt: &mut Self,
         frame_alloc: &mut FA,
         force_copy_fn: ForceCopyFn,
-    ) -> Result<Self, i32> {
-        self.duplicate_user_space_inner(frame_alloc, Some(force_copy_fn))
+    ) -> Result<(), i32> {
+        self.duplicate_user_space_inner(new_pt, frame_alloc, Some(force_copy_fn))
     }
 
     /// Internal implementation of user space duplication
     fn duplicate_user_space_inner<FA: FrameAlloc<PhysAddr = u64>>(
         &self,
+        new_pt: &mut Self,
         frame_alloc: &mut FA,
         force_copy_fn: Option<ForceCopyFn>,
-    ) -> Result<Self, i32> {
-        // New address space: the kernel half is linked, the user half
-        // (PML4 0-255) is copied below
-        let mut new_pt = Self::new_user(frame_alloc).ok_or(-12i32)?; // ENOMEM
-        new_pt.copy_kernel_mappings();
-
+    ) -> Result<(), i32> {
         // Track range of modified parent PTEs for batch TLB flush
         let mut flush_start: Option<u64> = None;
         let mut flush_end: u64 = 0;
@@ -828,10 +826,8 @@ impl X86_64PageTable {
                                         flush_end = vaddr + PAGE_SIZE;
                                     }
 
-                                    // Increment reference count for the shared frame
-                                    crate::FRAME_ALLOCATOR.incref(old_phys);
-
-                                    // Map same physical frame in child with COW flags
+                                    // Map same physical frame in child with COW
+                                    // flags; the child's PTE holds a reference
                                     new_pt.ensure_pt_entry(
                                         pml4_idx,
                                         pdpt_idx,
@@ -840,6 +836,7 @@ impl X86_64PageTable {
                                         PageTableEntry(old_phys | cow_flags),
                                         frame_alloc,
                                     )?;
+                                    crate::FRAME_ALLOCATOR.incref(old_phys);
                                 }
                             }
                         }
@@ -854,7 +851,7 @@ impl X86_64PageTable {
             Self::flush_tlb_range(start, flush_end);
         }
 
-        Ok(new_pt)
+        Ok(())
     }
 
     /// Helper: Ensure PT entry exists and copy a 4KB page entry
@@ -1418,6 +1415,9 @@ impl X86_64PageTable {
             // Note: On x86-64, we need to flush all 512 entries since invlpg
             // on a single address only invalidates that TLB entry
             Self::flush_tlb_all();
+
+            // Each 4KB PTE now holds its own frame reference
+            crate::FRAME_ALLOCATOR.split_huge(huge_phys);
 
             Ok(huge_phys)
         }

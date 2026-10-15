@@ -897,7 +897,8 @@ pub enum PidGen {
     /// World-readable content of the process
     Pub(fn(Pid) -> Vec<u8>),
     /// Private content of the address space: open needs ptrace-read
-    /// access and pins the mm it reads from (Linux proc_mem_open)
+    /// access and pins the mm it reads from (Linux proc_mem_open: an
+    /// mm_count reference)
     Mm(fn(&crate::mm::MmStruct) -> Vec<u8>),
 }
 
@@ -909,7 +910,7 @@ pub enum PidGen {
 /// is decided again for the new image, so the result is never an mm
 /// the check did not cover (hk has no exec lock; Linux holds
 /// exec_update_lock across mm_access)
-fn mm_access(pid: Pid) -> Result<Option<Arc<spin::Mutex<crate::mm::MmStruct>>>, KernelError> {
+fn mm_access(pid: Pid) -> Result<Option<Arc<crate::mm::Mm>>, KernelError> {
     let task_mm = || get_tid_for_pid(pid).and_then(crate::mm::get_task_mm);
     loop {
         let mm = task_mm();
@@ -935,13 +936,22 @@ fn pid_content(file: Option<&File>, pid: Pid, g: PidGen) -> Result<Vec<u8>, Kern
         PidGen::Pub(f) => Ok(f(pid)),
         PidGen::Mm(f) => {
             let mm = match file.and_then(|fl| fl.private.get()) {
-                Some(p) => p
-                    .clone()
-                    .downcast::<spin::Mutex<crate::mm::MmStruct>>()
-                    .ok(),
+                Some(p) => p.clone().downcast::<crate::mm::Mm>().ok(),
                 None => mm_access(pid)?,
             };
-            Ok(mm.map(|m| f(&m.lock())).unwrap_or_default())
+            // The open file pins only the struct (mm_count); a read uses
+            // the address space only while it still has users, else it
+            // reads as empty; once the task is reaped it is ESRCH (Linux
+            // m_start: get_proc_task, mmget_not_zero)
+            if get_tid_for_pid(pid).is_none() {
+                return Err(KernelError::NoProcess);
+            }
+            let users = mm.as_ref().and_then(crate::mm::mmget_not_zero);
+            let Some(m) = users else {
+                return Ok(Vec::new());
+            };
+            let out = f(&m.lock());
+            Ok(out)
         }
     }
 }

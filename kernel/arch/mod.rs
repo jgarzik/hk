@@ -167,6 +167,18 @@ pub enum MapError {
     NotMapped,
 }
 
+/// A user mapping met while tearing down an address space
+/// (`paging::free_user`); the mm layer drops the reference it holds
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Leaf {
+    /// A present 4KB page (physical address)
+    Page(u64),
+    /// A present 2MB page (physical address of its head frame)
+    Huge(u64),
+    /// A non-present, non-empty PTE (a swap entry), raw value
+    Swap(u64),
+}
+
 /// Page table abstraction trait
 ///
 /// This trait provides architecture-independent page table operations.
@@ -225,16 +237,6 @@ pub trait PageTable: Sized {
     /// This uses the currently active page table (e.g., CR3 on x86-64).
     /// No new allocation is performed.
     fn kernel_identity() -> Self;
-
-    /// Collect all page table frame addresses (for freeing)
-    ///
-    /// Walks the page table hierarchy and collects all intermediate table
-    /// frame addresses (not the mapped user pages, just the table frames).
-    /// Used to free page table memory during exec() or process exit.
-    ///
-    /// Returns a vector of physical addresses of all page table frames,
-    /// including the root table.
-    fn collect_table_frames(&self) -> alloc::vec::Vec<Self::PhysAddr>;
 }
 
 /// Frame allocator trait
