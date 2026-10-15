@@ -46,6 +46,7 @@ pub mod gfx;
 pub mod net;
 pub mod tty;
 pub mod usb;
+pub mod virtio;
 
 // printkln macro is re-exported at crate root via #[macro_export]
 

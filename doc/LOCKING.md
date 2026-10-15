@@ -1837,6 +1837,8 @@ do not rely on that.
 | e1000 `rx` ring | `spin::Mutex` | thread only (NAPI poll) | leaf; frames are delivered after it is dropped |
 | e1000 `tx` ring | `spin::Mutex` | thread only (xmit, poll reclaim) | leaf; ring full -> drop, `tx_dropped`, ENOBUFS |
 | e1000 `pending_icr`, irq counters | atomics | IRQ + thread | ISR ORs ICR causes in; poll swaps them out |
+| virtio-PCI transport (`virtio/pci.rs`) | none | probe (single-threaded enumeration), then IRQ (ISR byte) | common config written only during probe; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
+| `virtio::DRIVERS` | `spin::Mutex<Vec>` | thread only (boot) | leaf; registered before bus enumeration, read by the PCI match/probe |
 
 **Lock order (outermost first):**
 
