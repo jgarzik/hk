@@ -1,48 +1,84 @@
-//! Per-task file descriptor table management
+//! Per-task file descriptor tables (Linux files_struct)
 //!
-//! This module manages per-task FD tables following the same pattern as
-//! `fs/fsstruct.rs` for filesystem context. Each task has its own FD table,
-//! which can be shared (CLONE_FILES) or copied (fork without CLONE_FILES).
-//!
-//! ## Design
-//!
-//! - `TASK_FD`: Global BTreeMap mapping TID to Arc<Mutex<FdTable>>
-//! - Multiple tasks can share the same Arc when CLONE_FILES is used
-//! - Fork without CLONE_FILES creates a deep copy of the FD table
+//! Each task points at a `Files` table, shared by CLONE_FILES or copied
+//! by fork. `Task.files` is reached through TASK_TABLE; the table has
+//! its own lock.
 //!
 //! ## Locking
 //!
-//! Two levels of locking:
-//! 1. `TASK_FD` mutex - protects the TID->FdTable mapping
-//! 2. Per-table mutex - protects individual FD table operations
-//!
-//! Always acquire TASK_FD first, then the table mutex.
+//! `Files` wraps the table's `spin::Mutex` (Linux files->file_lock).
+//! Releasing a file can sleep (TCP SO_LINGER, socket release paths), so
+//! no file is ever dropped under that lock: the table parks the files
+//! it detaches (close, dup2 over an open descriptor, a refused install)
+//! and `FilesGuard` drops them after unlocking (Linux
+//! file_close_fd_locked, then filp_close/fput after spin_unlock).
+//! Likewise a task's last reference to its table is dropped after
+//! TASK_TABLE is released, never under it.
 
 use alloc::sync::Arc;
-use spin::Mutex;
+use core::mem::ManuallyDrop;
+use core::ops::{Deref, DerefMut};
+use spin::{Mutex, MutexGuard};
 
 use super::percpu::TASK_TABLE;
 use super::{FdTable, Tid};
 use crate::fs::File;
 
-// =============================================================================
-// Task FD accessors - uses Task.files field directly via TASK_TABLE
-// =============================================================================
+/// A descriptor table (Linux files_struct)
+pub struct Files(Mutex<FdTable<File>>);
 
-/// Initialize FD table for a new task
-///
-/// Called when creating the initial task or when a task needs a new FD table.
-pub fn init_task_fd(tid: Tid, fd_table: Arc<Mutex<FdTable<File>>>) {
-    let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.files = Some(fd_table);
+/// The locked table; files it detached are released after the unlock
+pub struct FilesGuard<'a>(ManuallyDrop<MutexGuard<'a, FdTable<File>>>);
+
+impl Files {
+    pub fn new(t: FdTable<File>) -> Self {
+        Self(Mutex::new(t))
+    }
+
+    /// Lock the table (Linux spin_lock(&files->file_lock))
+    pub fn lock(&self) -> FilesGuard<'_> {
+        FilesGuard(ManuallyDrop::new(self.0.lock()))
     }
 }
 
-/// Get the FD table for a task (returns cloned Arc)
-///
-/// Returns None if the task doesn't have an FD table registered.
-pub fn get_task_fd(tid: Tid) -> Option<Arc<Mutex<FdTable<File>>>> {
+impl Deref for FilesGuard<'_> {
+    type Target = FdTable<File>;
+    fn deref(&self) -> &FdTable<File> {
+        &self.0
+    }
+}
+
+impl DerefMut for FilesGuard<'_> {
+    fn deref_mut(&mut self) -> &mut FdTable<File> {
+        &mut self.0
+    }
+}
+
+impl Drop for FilesGuard<'_> {
+    fn drop(&mut self) {
+        let dead = self.0.take_dead();
+        // SAFETY: dropped exactly once, here
+        unsafe { ManuallyDrop::drop(&mut self.0) };
+        drop(dead);
+    }
+}
+
+/// Point `tid` at `files`; the table it had is dropped after TASK_TABLE
+/// is released
+pub fn init_task_fd(tid: Tid, files: Arc<Files>) {
+    let old = {
+        let mut table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter_mut()
+            .find(|t| t.tid == tid)
+            .and_then(|t| t.files.replace(files))
+    };
+    drop(old);
+}
+
+/// The descriptor table of `tid`
+pub fn get_task_fd(tid: Tid) -> Option<Arc<Files>> {
     let table = TASK_TABLE.lock();
     table
         .tasks
@@ -51,16 +87,19 @@ pub fn get_task_fd(tid: Tid) -> Option<Arc<Mutex<FdTable<File>>>> {
         .and_then(|t| t.files.clone())
 }
 
-/// Remove FD table mapping when task exits
-///
-/// This decrements the Arc refcount. If this was the last reference
-/// (no other tasks sharing this FD table), the table is dropped
-/// and all file descriptors are closed.
+/// Exit (Linux exit_files): drop the task's reference; the last one
+/// closes every descriptor, after TASK_TABLE is released (releasing a
+/// socket can sleep and the scheduler takes TASK_TABLE)
 pub fn exit_task_fd(tid: Tid) {
-    let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.files = None;
-    }
+    let files = {
+        let mut table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter_mut()
+            .find(|t| t.tid == tid)
+            .and_then(|t| t.files.take())
+    };
+    drop(files);
 }
 
 /// At exec's point of no return: give the task a private table without
@@ -72,44 +111,24 @@ pub fn exec_task_fd(tid: Tid) {
     let Some(old) = get_task_fd(tid) else {
         return;
     };
-    let new = Arc::new(Mutex::new(old.lock().exec_copy()));
+    let new = Arc::new(Files::new(old.lock().exec_copy()));
     init_task_fd(tid, new);
     drop(old);
 }
 
-/// Clone FD table for fork/clone
-///
-/// If `share` is true (CLONE_FILES set), the child shares the parent's FD table.
-/// If `share` is false (normal fork), the child gets a deep copy.
-///
-/// # Arguments
-/// * `parent_tid` - Parent task's TID
-/// * `child_tid` - Child task's TID
-/// * `share` - If true, share the same FD table (CLONE_FILES)
+/// Clone the table for fork/clone: shared with CLONE_FILES (`share`),
+/// else a copy
 pub fn clone_task_fd(parent_tid: Tid, child_tid: Tid, share: bool) {
-    let child_fd = if share {
-        // CLONE_FILES: share the same Arc<Mutex<FdTable>>
-        get_task_fd(parent_tid)
-    } else {
-        // Normal fork: deep copy the FD table
-        get_task_fd(parent_tid).map(|fd_table| {
-            let table = fd_table.lock();
-            Arc::new(Mutex::new(table.deep_clone()))
-        })
+    let parent = get_task_fd(parent_tid);
+    let child = match parent {
+        Some(p) if share => p,
+        Some(p) => Arc::new(Files::new(p.lock().deep_clone())),
+        None => create_empty_fd_table(),
     };
-
-    if let Some(fd) = child_fd {
-        init_task_fd(child_tid, fd);
-    } else {
-        // Fallback: create new empty FD table
-        init_task_fd(child_tid, Arc::new(Mutex::new(FdTable::new())));
-    }
+    init_task_fd(child_tid, child);
 }
 
-/// Create a new empty FD table
-///
-/// The init process is expected to open stdin/stdout/stderr itself
-/// by opening /dev/console or similar.
-pub fn create_empty_fd_table() -> Arc<Mutex<FdTable<File>>> {
-    Arc::new(Mutex::new(FdTable::new()))
+/// A new empty table (init opens its console descriptors itself)
+pub fn create_empty_fd_table() -> Arc<Files> {
+    Arc::new(Files::new(FdTable::new()))
 }

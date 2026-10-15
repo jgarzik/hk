@@ -99,10 +99,8 @@ pub fn sys_socketpair(domain: i32, stype: i32, protocol: i32, sv: u64) -> i64 {
     })())
 }
 
-/// Install two files in new descriptors, or neither (an undone first
-/// descriptor's file is dropped after the table lock is released; a
-/// file the table refused is dropped inside it, which is fine for the
-/// fresh sockets passed here)
+/// Install two files in new descriptors, or neither (the table
+/// releases undone and refused files after its lock is dropped)
 fn install_pair(a: Arc<File>, b: Arc<File>, cloexec: bool) -> Result<[i32; 2], KernelError> {
     let table = crate::task::fdtable::get_task_fd(crate::task::percpu::current_tid())
         .ok_or(KernelError::BadFd)?;
@@ -114,9 +112,7 @@ fn install_pair(a: Arc<File>, b: Arc<File>, cloexec: bool) -> Result<[i32; 2], K
     match t.alloc_with_flags(b, fl, nofile()) {
         Ok(fd2) => Ok([fd1, fd2]),
         Err(_) => {
-            let undo = t.close(fd1);
-            drop(t);
-            drop(undo);
+            t.close(fd1);
             Err(KernelError::ProcessFileLimit)
         }
     }

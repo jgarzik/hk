@@ -102,7 +102,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
 
 use crate::arch::{Arch, PageTable};
-use crate::fs::{File, FsStruct};
+use crate::fs::FsStruct;
 use crate::ipc::sem::SemUndoList;
 use crate::mm::page_cache::CachedPage;
 use crate::ns::NsProxy;
@@ -651,20 +651,26 @@ pub type Fd = i32;
 pub const FD_CLOEXEC: u32 = 1;
 
 /// File descriptor table for a process
+///
+/// Files the table lets go of (close, dup2/dup3 over an open descriptor,
+/// an install it refused) are parked in `dead` instead of being dropped
+/// under the table lock: releasing a file can sleep (TCP SO_LINGER, a
+/// socket's release path), so `fdtable::FilesGuard` drops them after
+/// unlocking (Linux file_close_fd_locked under files->file_lock, then
+/// filp_close/fput after spin_unlock).
 pub struct FdTable<F> {
     /// Mapping from fd number to file object
     files: BTreeMap<Fd, Arc<F>>,
     /// Per-fd flags (FD_CLOEXEC, etc.)
     fd_flags: BTreeMap<Fd, u32>,
+    /// Detached files, released once the lock is dropped
+    dead: Vec<Arc<F>>,
 }
 
 impl<F> FdTable<F> {
     /// Create a new empty file descriptor table
     pub fn new() -> Self {
-        Self {
-            files: BTreeMap::new(),
-            fd_flags: BTreeMap::new(),
-        }
+        Self::new_const()
     }
 
     /// Create a new empty file descriptor table (const)
@@ -672,7 +678,19 @@ impl<F> FdTable<F> {
         Self {
             files: BTreeMap::new(),
             fd_flags: BTreeMap::new(),
+            dead: Vec::new(),
         }
+    }
+
+    /// Park `file` for release after the table lock is dropped
+    fn defer(&mut self, file: Arc<F>) {
+        self.dead.push(file);
+    }
+
+    /// The files detached since the lock was taken (`FilesGuard` drops
+    /// them after unlocking)
+    pub fn take_dead(&mut self) -> Vec<Arc<F>> {
+        core::mem::take(&mut self.dead)
     }
 
     /// Allocate the lowest free file descriptor for a file (POSIX).
@@ -691,6 +709,7 @@ impl<F> FdTable<F> {
     /// (stdin=0, stdout=1, stderr=2) where limits don't apply.
     pub fn alloc_at(&mut self, fd: Fd, file: Arc<F>) -> bool {
         if self.files.contains_key(&fd) {
+            self.defer(file);
             return false;
         }
         self.files.insert(fd, file);
@@ -702,10 +721,17 @@ impl<F> FdTable<F> {
         self.files.get(&fd).cloned()
     }
 
-    /// Close a file descriptor
-    pub fn close(&mut self, fd: Fd) -> Option<Arc<F>> {
+    /// Close a file descriptor (false: EBADF); the file is released
+    /// after the table lock is dropped
+    pub fn close(&mut self, fd: Fd) -> bool {
         self.fd_flags.remove(&fd);
-        self.files.remove(&fd)
+        match self.files.remove(&fd) {
+            Some(f) => {
+                self.defer(f);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Check if a file descriptor is valid
@@ -744,9 +770,11 @@ impl<F> FdTable<F> {
     ) -> Result<(), i32> {
         // RLIMIT_NOFILE enforcement
         if (fd as u64) >= nofile {
+            self.defer(file);
             return Err(24); // EMFILE - too many open files
         }
         if self.files.contains_key(&fd) {
+            self.defer(file);
             return Err(9); // EBADF - fd already in use
         }
         self.files.insert(fd, file);
@@ -776,6 +804,7 @@ impl<F> FdTable<F> {
         }
         // RLIMIT_NOFILE enforcement
         if (fd as u64) >= nofile {
+            self.defer(file);
             return Err(24); // EMFILE - too many open files
         }
         self.files.insert(fd, file);
@@ -814,6 +843,7 @@ impl<F> FdTable<F> {
         Self {
             files: self.files.clone(),
             fd_flags: self.fd_flags.clone(),
+            dead: Vec::new(),
         }
     }
 
@@ -952,7 +982,7 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub mm: Option<crate::mm::MmRef>,
 
     /// File descriptor table (shared when CLONE_FILES)
-    pub files: Option<Arc<Mutex<FdTable<File>>>>,
+    pub files: Option<Arc<fdtable::Files>>,
 
     /// Filesystem context (shared when CLONE_FS)
     pub fs: Option<Arc<FsStruct>>,

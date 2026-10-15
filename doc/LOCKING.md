@@ -215,7 +215,8 @@ Filesystem context locks (TASK_FS)
     ↓
 Per-CPU scheduler locks (IrqSpinlock)  ← IRQ-safe, can hold while acquiring below
     ↓
-Global subsystem locks (TASK_TABLE, PAGE_CACHE, FD_TABLE)  ← NOT IRQ-safe
+Global subsystem locks (TASK_TABLE, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-safe;
+    no file is released under `Files` (3.3, Descriptor Tables)
     ↓
 Address space: Mm lock (mmap_lock) → AnonVma, LRU  ← never nested with TASK_TABLE (3.2)
     ↓
@@ -235,7 +236,7 @@ Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
    an IRQ-safe lock and a non-IRQ-safe lock, acquire the IrqSpinlock first.
 
 2. **Never acquire non-IRQ-safe locks from interrupt context** - This is the
-   fundamental rule. TASK_TABLE, PAGE_CACHE, FD_TABLE, and allocator locks must
+   fundamental rule. TASK_TABLE, PAGE_CACHE, fd tables, and allocator locks must
    NEVER be acquired from timer ISR or any interrupt handler.
 
 3. **Parent before child** - When locking multiple inodes in a directory
@@ -757,6 +758,23 @@ The VFS uses fine-grained locking with `RwLock` for concurrent read access.
 |----------|------|---------|
 | `DCACHE` | `DentryCache` (contains `RwLock`) | Dentry cache root |
 | `MOUNT_NS` | `MountNamespace` (contains `RwLock`) | Mount namespace root |
+
+#### Descriptor Tables (Linux files_struct)
+
+**Location:** `task/fdtable.rs`, `task/mod.rs` (`FdTable`)
+
+`Files` (one per task, shared by CLONE_FILES) wraps the table's
+`spin::Mutex` (Linux `files->file_lock`), thread context only, a leaf
+apart from the heap. Releasing a file can sleep (a TCP socket with
+SO_LINGER waits for its close handshake; socket release paths take
+sleeping locks), so **no file is ever released under it**: close,
+dup2/dup3 over an open descriptor and installs the table refuses
+(EMFILE) park the detached `Arc<File>`s in the table, and
+`FilesGuard::drop` releases them after unlocking (Linux
+`file_close_fd_locked` under the lock, `filp_close`/`fput` after
+`spin_unlock`). Files looked up with `get` are clones taken while the
+table holds its own reference, so dropping them under the lock is never
+the last reference.
 
 #### Per-Object Locks
 

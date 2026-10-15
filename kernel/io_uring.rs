@@ -1532,7 +1532,7 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: u64) -> i64 {
     // Write params back to user space
     if put_user::<Uaccess, IoUringParams>(params_ptr, params).is_err() {
         // Close the fd we just allocated
-        let _ = fd_table.lock().close(fd);
+        fd_table.lock().close(fd);
         return KernelError::BadAddress.sysret();
     }
 
