@@ -180,6 +180,41 @@ impl Default for HeapAllocator {
     }
 }
 
+/// Boot-time memory the heap must never cover (kernel image, boot
+/// modules, DTB, initrd): the kernel reads it after the heap is live
+#[derive(Clone, Copy)]
+pub struct BootRange {
+    pub name: &'static str,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl BootRange {
+    fn hits(&self, start: usize, end: usize) -> bool {
+        self.start < self.end && self.start < end && start < self.end
+    }
+}
+
+/// Lowest `align`-aligned (power of two) start >= `lo` whose
+/// `size` bytes miss every busy range
+pub fn place(lo: usize, size: usize, align: usize, busy: &[BootRange]) -> usize {
+    let mut start = round_up(lo, align);
+    while let Some(r) = busy.iter().find(|r| r.hits(start, start + size)) {
+        start = round_up(r.end, align);
+    }
+    start
+}
+
+/// Boot assertion: a heap over boot data corrupts it silently, so stop
+pub fn check(start: usize, end: usize, r: &BootRange) {
+    if r.hits(start, end) {
+        panic!(
+            "heap {:#x}-{:#x} overlaps {} {:#x}-{:#x}",
+            start, end, r.name, r.start, r.end
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +247,31 @@ mod tests {
         let p = unsafe { h.alloc(big) };
         assert!(!p.is_null());
         unsafe { h.dealloc(p, big) };
+    }
+
+    #[test]
+    fn place_skips_busy() {
+        let r = |start, end| BootRange {
+            name: "x",
+            start,
+            end,
+        };
+        let busy = [r(0x100, 0x2000), r(0x5000, 0x6001), r(0x9000, 0x9000)];
+        assert_eq!(place(0, 0x1000, 0x1000, &busy), 0x2000);
+        assert_eq!(place(0, 0x4000, 0x1000, &busy), 0x7000);
+        // empty ranges never block
+        assert_eq!(place(0x8000, 0x2000, 0x1000, &busy), 0x8000);
+        check(0x2000, 0x5000, &busy[1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "overlaps")]
+    fn check_panics() {
+        let r = BootRange {
+            name: "initrd",
+            start: 0x1000,
+            end: 0x2000,
+        };
+        check(0x1fff, 0x3000, &r);
     }
 }

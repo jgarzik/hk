@@ -216,6 +216,37 @@ pub unsafe fn find_largest_region_above(info_ptr: u64, min_addr: u64) -> (u64, u
     (best_start, best_end)
 }
 
+/// Every range the bootloader placed in memory that the kernel still
+/// reads: the info structure itself and each module, as (start, end)
+///
+/// # Safety
+/// The caller must ensure info_ptr points to valid multiboot2 info structure.
+pub unsafe fn boot_ranges(info_ptr: u64, mut f: impl FnMut(&'static str, u64, u64)) {
+    if info_ptr == 0 {
+        return;
+    }
+    unsafe {
+        let total_size = (*(info_ptr as *const Multiboot2Info)).total_size;
+        let info_end = info_ptr + total_size as u64;
+        f("multiboot info", info_ptr, info_end);
+        let mut tag_ptr = (info_ptr + 8) as *const TagHeader;
+        while (tag_ptr as u64) < info_end {
+            let tag = &*tag_ptr;
+            if tag.tag_type == TAG_END {
+                break;
+            }
+            if tag.tag_type == TAG_MODULE {
+                let p = tag_ptr as *const u8;
+                let start = *(p.add(8) as *const u32) as u64;
+                let end = *(p.add(12) as *const u32) as u64;
+                f("multiboot module", start, end);
+            }
+            let next_offset = ((tag.size + 7) & !7) as usize;
+            tag_ptr = (tag_ptr as *const u8).add(next_offset) as *const TagHeader;
+        }
+    }
+}
+
 /// Find a module loaded by the bootloader by its command line string
 ///
 /// GRUB's `module2` command loads files as multiboot2 modules. Each module
@@ -227,36 +258,6 @@ pub unsafe fn find_largest_region_above(info_ptr: u64, min_addr: u64) -> (u64, u
 /// The caller must ensure info_ptr points to valid multiboot2 info structure.
 /// The returned slice is valid for the lifetime of the boot info structure
 /// (i.e., as long as the physical memory is identity-mapped).
-/// End (exclusive) of everything the bootloader placed in memory that
-/// the kernel still reads: every module and the info structure itself.
-///
-/// # Safety
-/// The caller must ensure info_ptr points to valid multiboot2 info structure.
-pub unsafe fn boot_data_end(info_ptr: u64) -> u64 {
-    if info_ptr == 0 {
-        return 0;
-    }
-    unsafe {
-        let total_size = (*(info_ptr as *const Multiboot2Info)).total_size;
-        let info_end = info_ptr + total_size as u64;
-        let mut end = info_end;
-        let mut tag_ptr = (info_ptr + 8) as *const TagHeader;
-        while (tag_ptr as u64) < info_end {
-            let tag = &*tag_ptr;
-            if tag.tag_type == TAG_END {
-                break;
-            }
-            if tag.tag_type == TAG_MODULE {
-                let mod_end = *((tag_ptr as *const u8).add(12) as *const u32) as u64;
-                end = end.max(mod_end);
-            }
-            let next_offset = ((tag.size + 7) & !7) as usize;
-            tag_ptr = (tag_ptr as *const u8).add(next_offset) as *const TagHeader;
-        }
-        end
-    }
-}
-
 pub unsafe fn find_module(info_ptr: u64, name: &str) -> Option<&'static [u8]> {
     if info_ptr == 0 {
         return None;

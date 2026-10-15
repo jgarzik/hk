@@ -139,6 +139,20 @@ fn extract_cpus(dt: &DeviceTree) -> Vec<CpuInfo> {
     cpus
 }
 
+/// Total size of the FDT blob at `dtb_ptr` (header `totalsize`), if
+/// the magic matches; reads only the header, so it is usable before the
+/// heap exists
+pub fn total_size(dtb_ptr: u64) -> Option<usize> {
+    if dtb_ptr == 0 {
+        return None;
+    }
+    let h = unsafe { core::slice::from_raw_parts(dtb_ptr as *const u8, 8) };
+    if h[..4] != [0xd0, 0x0d, 0xfe, 0xed] {
+        return None;
+    }
+    Some(u32::from_be_bytes([h[4], h[5], h[6], h[7]]) as usize)
+}
+
 /// Initramfs location from DTB
 #[derive(Debug, Clone, Copy)]
 pub struct InitramfsInfo {

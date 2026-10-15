@@ -819,15 +819,24 @@ pub unsafe fn init_mmu() {
 // Kernel Init Unification Trait Implementations
 // ============================================================================
 
-// Memory layout constants for aarch64 (QEMU virt machine)
-const AARCH64_FRAME_ALLOC_BASE: u64 = 0x4100_0000; // 16MB after kernel load
-const AARCH64_FRAME_ALLOC_SIZE: u64 = 0x1000_0000; // 256MB
+// Memory layout constants for aarch64 (QEMU virt machine): frames run
+// from the heap end (placed past the kernel image, `aarch64_heap`) to a
+// fixed end
+const AARCH64_FRAME_ALLOC_END: u64 = 0x5100_0000;
 
 impl MemoryLayoutOps for Aarch64Arch {
     fn get_frame_alloc_region() -> (u64, u64) {
         // For now, use hardcoded constants for QEMU virt machine
         // Future: could parse DTB memory node for actual available memory
-        (AARCH64_FRAME_ALLOC_BASE, AARCH64_FRAME_ALLOC_SIZE)
+        let base = crate::HEAP_END.load(core::sync::atomic::Ordering::Relaxed) as u64;
+        assert!(base != 0 && base < AARCH64_FRAME_ALLOC_END);
+        (base, AARCH64_FRAME_ALLOC_END - base)
+    }
+
+    fn for_each_reserved(f: &mut dyn FnMut(u64, u64)) {
+        if let Some(i) = dtb::extract_initramfs(unsafe { crate::DTB_PTR }) {
+            f(i.start, i.end);
+        }
     }
 }
 

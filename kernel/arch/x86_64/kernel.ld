@@ -9,6 +9,7 @@ SECTIONS
 {
     /* Kernel loads at 1MB (after real mode memory) */
     . = 1M;
+    __kernel_start = .;
 
     /* Multiboot header must be in first 8KB of the file */
     .multiboot ALIGN(4K) : {

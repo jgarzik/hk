@@ -756,6 +756,11 @@ pub trait MemoryLayoutOps {
     /// Returns (base, size) where base is the physical address to start
     /// frame allocation from, and size is the total bytes available.
     fn get_frame_alloc_region() -> (u64, u64);
+
+    /// Boot data inside the frame allocator region that must never be
+    /// handed out (e.g. an initrd the firmware placed there), as
+    /// (start, end) ranges
+    fn for_each_reserved(_f: &mut dyn FnMut(u64, u64)) {}
 }
 
 /// Exception and interrupt controller initialization
