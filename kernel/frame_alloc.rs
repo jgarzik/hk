@@ -16,9 +16,6 @@ pub const FRAME_SIZE: usize = 4096;
 /// Number of 4KB frames per 2MB huge page
 pub const FRAMES_PER_HUGE_PAGE: usize = 512;
 
-/// Maximum number of frames we can track (256MB worth of 4KB frames)
-const MAX_FRAMES: usize = 65536;
-
 /// Bitmap frame allocator
 ///
 /// Uses a bitmap to track which physical frames are available.
@@ -32,11 +29,12 @@ pub struct BitmapFrameAllocator {
 }
 
 struct BitmapFrameAllocatorInner {
-    /// Bitmap of free frames (1 = free, 0 = used)
-    bitmap: [u64; MAX_FRAMES / 64],
+    /// Bitmap of free frames (1 = free, 0 = used); lives in the first
+    /// frames of the managed region, sized to it
+    bitmap: &'static mut [u64],
     /// Reference counts for each frame (0 = free, 1+ = in use)
     /// Using u16 to save space while allowing up to 65535 references
-    refcounts: [u16; MAX_FRAMES],
+    refcounts: &'static mut [u16],
     /// Base physical address
     base: u64,
     /// Total number of frames
@@ -74,8 +72,8 @@ impl BitmapFrameAllocator {
     pub const fn new() -> Self {
         Self {
             inner: IrqSpinlock::new(BitmapFrameAllocatorInner {
-                bitmap: [0; MAX_FRAMES / 64],
-                refcounts: [0; MAX_FRAMES],
+                bitmap: &mut [],
+                refcounts: &mut [],
                 base: 0,
                 total_frames: 0,
                 next_free: 0,
@@ -84,25 +82,30 @@ impl BitmapFrameAllocator {
         }
     }
 
-    /// Initialize with a memory region
+    /// Initialize with a memory region (all of it, however large)
     ///
-    /// The region from `base` to `base + size` will be available for allocation.
+    /// The region from `base` to `base + size` will be available for
+    /// allocation, except its first frames, which hold the bitmap and
+    /// the reference counts (used through the direct map)
     pub fn init(&self, base: u64, size: u64) {
+        let n = size as usize / FRAME_SIZE;
+        let words = n.div_ceil(64);
+        let meta = (words * 8 + n * 2).div_ceil(FRAME_SIZE);
+        assert!(meta < n, "frame region too small");
+        let p = crate::arch::phys_to_virt(base);
         let mut inner = self.inner.lock();
-        inner.base = base;
-        inner.total_frames = (size as usize / FRAME_SIZE).min(MAX_FRAMES);
-        inner.next_free = 0;
-
-        // Mark all frames as free
-        let full_words = inner.total_frames / 64;
-        inner.bitmap[..full_words].fill(!0u64); // All 1s = all free
-
-        // Handle remaining bits
-        let remaining = inner.total_frames % 64;
-        if remaining > 0 {
-            inner.bitmap[full_words] = (1u64 << remaining) - 1;
+        unsafe {
+            core::ptr::write_bytes(p, 0, meta * FRAME_SIZE);
+            inner.bitmap = core::slice::from_raw_parts_mut(p as *mut u64, words);
+            inner.refcounts = core::slice::from_raw_parts_mut(p.add(words * 8) as *mut u16, n);
         }
-        inner.free = inner.total_frames;
+        inner.base = base;
+        inner.total_frames = n;
+        inner.next_free = meta;
+        inner.free = 0;
+        for f in meta..n {
+            inner.set_free(f, true);
+        }
     }
 
     /// Allocate a physical frame (thread-safe, takes &self)
