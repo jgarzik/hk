@@ -64,6 +64,14 @@ exec frees only the old page-table frames (when no other task shares
 them) and exit frees nothing. Every process leaks its private memory,
 so long runs eventually exhaust frames.
 
+## No dynamically linked executables
+
+**Location**: `kernel/task/exec.rs` (`do_execve`)
+
+A PT_INTERP program interpreter is never loaded: exec of a dynamic
+executable fails with ENOEXEC (ENOENT if the interpreter does not
+exist, as on Linux). Only static and static-pie programs run.
+
 ## Interval timers: ITIMER_VIRTUAL and ITIMER_PROF
 
 **Location**: `kernel/posix_timer.rs` (`sys_setitimer`)

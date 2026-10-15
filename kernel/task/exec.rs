@@ -270,14 +270,36 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     Ok((sp, stack_bottom))
 }
 
-/// Every PT_LOAD segment must land in mappable user space: below
-/// mmap_min_addr is EPERM (Linux security_mmap_addr), past TASK_SIZE
-/// ENOMEM
-fn check_segments(elf: &ElfExecutable<u64>, base: u64) -> Result<(), i32> {
-    for seg in elf.segments.iter().filter(|s| s.mem_size > 0) {
-        let start = (seg.vaddr + base) & !(PAGE_SIZE - 1);
-        let len = seg.vaddr + base + seg.mem_size as u64 - start;
-        crate::mm::check_fixed(start, len).map_err(|e| e.errno())?;
+/// Every PT_LOAD segment and the entry point must land in mappable
+/// user space: past TASK_SIZE (or overflowing) is EINVAL (Linux
+/// BAD_ADDR), below mmap_min_addr EPERM (security_mmap_addr)
+fn check_segments(elf: &ElfExecutable, base: u64) -> Result<(), i32> {
+    const EINVAL: i32 = 22;
+    for seg in &elf.segments {
+        let va = seg.vaddr.checked_add(base).ok_or(EINVAL)?;
+        let end = va.checked_add(seg.mem_size as u64).ok_or(EINVAL)?;
+        if end > crate::mm::TASK_SIZE {
+            return Err(EINVAL);
+        }
+        let start = va & !(PAGE_SIZE - 1);
+        crate::mm::check_fixed(start, end - start).map_err(|e| e.errno())?;
+    }
+    if elf
+        .entry
+        .checked_add(base)
+        .is_none_or(|e| e >= crate::mm::TASK_SIZE)
+    {
+        return Err(EINVAL);
+    }
+    // Segments are populated at exec: an image larger than free memory
+    // is ENOMEM up front, not after exhausting it
+    let pages: u64 = elf
+        .segments
+        .iter()
+        .map(|s| (s.mem_size as u64).div_ceil(PAGE_SIZE) + 1)
+        .sum();
+    if pages > crate::FRAME_ALLOCATOR.free_frames() as u64 {
+        return Err(ENOMEM);
     }
     Ok(())
 }
@@ -287,7 +309,7 @@ fn check_segments(elf: &ElfExecutable<u64>, base: u64) -> Result<(), i32> {
 /// (growsdown), so mprotect/munmap/brk and /proc/<pid>/maps see them
 pub fn image_vmas(
     tid: crate::task::Tid,
-    elf: &ElfExecutable<u64>,
+    elf: &ElfExecutable,
     base: u64,
     stack_bottom: u64,
 ) -> Vec<crate::mm::Vma> {
@@ -328,7 +350,7 @@ pub fn image_vmas(
 ///
 /// Returns the end address of the highest loaded segment (for setting brk).
 fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
-    elf: &ElfExecutable<u64>,
+    elf: &ElfExecutable,
     elf_data: &[u8],
     page_table: &mut ArchPageTable,
     frame_alloc: &mut FA,
@@ -380,39 +402,15 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
                 }
             }
 
-            // Calculate the offset within the page where segment data starts
-            // For the first page of a non-page-aligned segment, this is non-zero
-            let in_page_offset = if va < seg_start {
-                (seg_start - va) as usize
-            } else {
-                0
-            };
-
-            // Calculate the offset into the segment's file data
-            let seg_data_offset = va.saturating_sub(seg_start);
-
-            // Calculate file offset
-            let file_offset = segment.offset + seg_data_offset;
-
-            // Calculate how much data to copy
-            if (file_offset as usize) < elf_data.len() && seg_data_offset < segment.file_size as u64
-            {
-                let copy_start = file_offset as usize;
-                let remaining_file = segment.file_size as u64 - seg_data_offset;
-                let available_space = PAGE_SIZE as usize - in_page_offset;
-                let copy_len = core::cmp::min(
-                    core::cmp::min(available_space as u64, remaining_file),
-                    (elf_data.len() - copy_start) as u64,
-                ) as usize;
-
-                if copy_len > 0 {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            elf_data.as_ptr().add(copy_start),
-                            crate::arch::phys_to_virt(frame).add(in_page_offset),
-                            copy_len,
-                        );
-                    }
+            // File bytes for this page, bounds-checked against the page,
+            // the segment and the file (elf::ElfSegment::page_fill)
+            if let Some((dst, src, len)) = segment.page_fill(base_addr, va, elf_data.len()) {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        elf_data.as_ptr().add(src),
+                        crate::arch::phys_to_virt(frame).add(dst),
+                        len,
+                    );
                 }
             }
 
@@ -445,10 +443,17 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
 }
 
 /// Apply ELF relocations for PIE binaries
-fn apply_relocations(elf: &ElfExecutable<u64>, base_addr: u64, page_table: &ArchPageTable) {
+fn apply_relocations(elf: &ElfExecutable, base_addr: u64, page_table: &ArchPageTable) {
     for reloc in &elf.relocations {
-        let target_vaddr = base_addr + reloc.offset;
-        let value = (base_addr as i64 + reloc.addend) as u64;
+        // The 8-byte store must stay inside one user page of the image:
+        // an unaligned or wrapping offset from a crafted file is skipped
+        let Some(target_vaddr) = base_addr.checked_add(reloc.offset) else {
+            continue;
+        };
+        if !target_vaddr.is_multiple_of(8) || target_vaddr >= crate::mm::TASK_SIZE {
+            continue;
+        }
+        let value = (base_addr as i64).wrapping_add(reloc.addend) as u64;
 
         if let Some(phys) = page_table.translate(target_vaddr) {
             unsafe {
@@ -532,13 +537,18 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     };
 
     // Parse ELF
-    fn addr_from_u64(v: u64) -> u64 {
-        v
-    }
-    let elf = match ElfExecutable::<u64>::parse(&elf_data, addr_from_u64) {
+    let elf = match ElfExecutable::parse(&elf_data) {
         Ok(e) => e,
-        Err(_) => return -ENOEXEC,
+        Err(e) => return -e.errno(),
     };
+    // Dynamically linked: no program interpreter is loaded yet (BUGS.md);
+    // a missing one is ENOENT like Linux's open_exec of it
+    if let Some(interp) = &elf.interp {
+        let found = core::str::from_utf8(interp)
+            .ok()
+            .is_some_and(|p| kernel_open_exec(p).is_ok());
+        return if found { -ENOEXEC } else { -ENOENT };
+    }
 
     // Release all POSIX advisory locks (POSIX semantics: locks released on exec)
     crate::fs::posix_lock::release_all_posix_locks_for_pid(crate::task::percpu::current_pid());

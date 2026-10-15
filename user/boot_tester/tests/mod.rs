@@ -24,6 +24,7 @@ pub mod ipc;
 pub mod mmap;
 pub mod layout;
 pub mod startup;
+pub mod elf_exec;
 pub mod rlimit;
 pub mod namespace;
 pub mod sockets;
@@ -128,6 +129,7 @@ pub fn run_all_tests() {
     mmap::run_tests();
     isolated(b"LAYOUT", layout::run_tests);
     isolated(b"STARTUP", startup::run_tests);
+    isolated(b"ELF_EXEC", elf_exec::run_tests);
     rlimit::run_tests();
     namespace::run_tests();
     sockets::run_tests();

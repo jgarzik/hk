@@ -389,7 +389,7 @@ const USER_STACK_PAGES: usize = 256;
 use crate::mm::{ELF_ET_DYN_BASE, STACK_TOP as USER_STACK_TOP};
 
 fn load_elf_with_cache<PT, FA>(
-    elf: &crate::elf::ElfExecutable<u64>,
+    elf: &crate::elf::ElfExecutable,
     file_id: FileId,
     elf_data: &[u8],
     page_table: &mut PT,
@@ -565,7 +565,7 @@ fn zero_bss(frame: u64, va: u64, file_end: u64, mem_end: u64) {
 /// Apply ELF relocations for PIE binaries
 ///
 /// For R_*_RELATIVE relocations: *(base + offset) = base + addend
-fn apply_relocations<PT>(elf: &crate::elf::ElfExecutable<u64>, base_addr: u64, page_table: &PT)
+fn apply_relocations<PT>(elf: &crate::elf::ElfExecutable, base_addr: u64, page_table: &PT)
 where
     PT: crate::arch::PageTable<VirtAddr = u64, PhysAddr = u64>,
 {
@@ -1014,10 +1014,7 @@ fn kmain() -> ! {
     let init_bytes: &[u8] = &init_data_vec;
 
     // Parse ELF header
-    fn addr_from_u64(v: u64) -> u64 {
-        v
-    }
-    let elf = match crate::elf::ElfExecutable::<u64>::parse(init_bytes, addr_from_u64) {
+    let elf = match crate::elf::ElfExecutable::parse(init_bytes) {
         Ok(e) => e,
         Err(_) => {
             printkln!("ERR: ELF parse failed");
