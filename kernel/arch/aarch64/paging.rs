@@ -161,6 +161,21 @@ pub fn pte_present(pte: u64) -> bool {
     pte & 1 != 0
 }
 
+/// Switch this CPU's user address space (TTBR0) to `root`
+pub fn activate(root: u64) {
+    unsafe {
+        asm!(
+            "msr ttbr0_el1, {}",
+            "isb",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            in(reg) root,
+            options(nostack)
+        );
+    }
+}
+
 // ============================================================================
 // Page Table Entry Type
 // ============================================================================

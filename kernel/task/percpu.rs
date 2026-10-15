@@ -2874,20 +2874,39 @@ pub fn exec_replace_image(new_page_table: ArchPageTable, entry_point: u64, user_
     let tid = current_tid();
     let cr3 = new_page_table.root_table_phys();
 
-    // Update the task's page table in the task table
-    // Collect old frames before replacing, then free them
+    // Install the new page table. The old one is freed only if no other
+    // task uses it: a vfork parent or the other threads (CLONE_VM) still
+    // run on it (Linux: exec_mmap drops one mm reference)
     let old_frames = {
         let mut table = TASK_TABLE.lock();
-        if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-            let old_frames = task.page_table.collect_table_frames();
-            task.page_table = new_page_table;
-            old_frames
-        } else {
-            alloc::vec::Vec::new()
+        let old_root = table
+            .tasks
+            .iter()
+            .find(|t| t.tid == tid)
+            .map(|t| t.page_table.root_table_phys());
+        let shared = old_root.is_some_and(|root| {
+            table
+                .tasks
+                .iter()
+                .any(|t| t.tid != tid && t.page_table.root_table_phys() == root)
+        });
+        match table.tasks.iter_mut().find(|t| t.tid == tid) {
+            Some(task) => {
+                let frames = if shared {
+                    alloc::vec::Vec::new()
+                } else {
+                    task.page_table.collect_table_frames()
+                };
+                task.page_table = new_page_table;
+                frames
+            }
+            None => alloc::vec::Vec::new(),
         }
     };
 
-    // Free old page table frames (outside lock to avoid deadlock)
+    // Leave the old tables before freeing them: their frames may be
+    // reused at once by another CPU
+    crate::arch::paging::activate(cr3);
     for frame in old_frames {
         FRAME_ALLOCATOR.free(frame);
     }

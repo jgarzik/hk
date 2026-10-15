@@ -100,6 +100,11 @@ pub fn pte_present(pte: u64) -> bool {
     pte & PAGE_PRESENT != 0
 }
 
+/// Switch this CPU to the address space rooted at `root`
+pub fn activate(root: u64) {
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack)) };
+}
+
 /// Flush the TLB entry for `va` on this CPU
 pub fn flush_tlb(va: u64) {
     X86_64PageTable::flush_tlb(va);
