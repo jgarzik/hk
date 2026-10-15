@@ -53,23 +53,16 @@ ping_group_range (hk has no supplementary groups). /proc/net/raw and
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
 
-## Non-PIE executables cannot be loaded (user space starts at 2GB)
+## User memory is not freed at exit or exec
 
-**Location**: `kernel/task/exec.rs` (`load_elf_segments`),
-`kernel/arch/x86_64/paging.rs` (`copy_kernel_mappings`, `PAGE_OFFSET`),
-`kernel/arch/aarch64/paging.rs` (`copy_kernel_mappings_with_alloc`)
+**Location**: `kernel/task/percpu.rs` (`exit_current`, `exec_replace_image`),
+`kernel/mm/mod.rs` (`exit_task_mm`)
 
-The kernel runs from identity mappings in the low 2GB of every address
-space: on x86 the shared PML4[0] maps the first 512MB with 2MB pages
-(kernel image at 1MB, heap from ~4MB to 18MB, then the frame
-allocator), on aarch64 L1[0]/L1[1] map devices and RAM. User space
-therefore starts at 2GB (static-pie binaries load at 0x8000_0000). A
-classic ET_EXEC binary linked at 0x400000 collides with those mappings
-and execve fails with ENOMEM. Ubuntu's busybox-static is such a binary,
-so the busybox end-to-end tests (`tests/busybox.rs`) are skipped on hk
-(they pass on Linux). Fix: move the kernel's direct map and image out
-of the low half (the planned `PAGE_OFFSET = 0xffff_8880_0000_0000` on
-x86, TTBR1 on aarch64) so all of the lower half belongs to user space.
+When the last task of an address space exits or execs, its user pages
+are not unmapped and their frames are not released (Linux exit_mmap);
+exec frees only the old page-table frames (when no other task shares
+them) and exit frees nothing. Every process leaks its private memory,
+so long runs eventually exhaust frames.
 
 ## AF_PACKET gaps
 

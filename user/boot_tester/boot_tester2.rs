@@ -6,6 +6,9 @@
 //!
 //! `boot_tester2 fdcheck`: exit 0 if fd 10 is closed (it was
 //! close-on-exec) and fd 11 is open, else a nonzero code.
+//! `boot_tester2 auxv`: exit 0 if the initial stack and auxiliary
+//! vector are what the Linux ELF loader provides, else the failed check.
+//! `boot_tester2 exe`: exit 0 if /proc/self/exe names this program.
 
 #![no_std]
 #![no_main]
@@ -13,7 +16,10 @@
 use core::ffi::c_void;
 use core::panic::PanicInfo;
 
-use hk_syscall::{sys_exit, sys_fcntl, sys_getpid, sys_getppid, sys_write};
+use hk_syscall::{
+    sys_exit, sys_fcntl, sys_getegid, sys_geteuid, sys_getgid, sys_getpid, sys_getppid, sys_getuid,
+    sys_readlink, sys_write,
+};
 
 /// Print a string to stdout
 fn print(s: &[u8]) {
@@ -98,9 +104,129 @@ fn fdcheck() -> ! {
     sys_exit(0);
 }
 
+/// NUL-terminated string at `p` equals `want`
+fn cstr_is(p: u64, want: &[u8]) -> bool {
+    if p == 0 {
+        return false;
+    }
+    let p = p as *const u8;
+    for (i, &c) in want.iter().chain(&[0]).enumerate() {
+        if unsafe { core::ptr::read_volatile(p.add(i)) } != c {
+            return false;
+        }
+    }
+    true
+}
+
+/// Value of auxv entry `key`, if present
+fn aux(auxv: *const u64, key: u64) -> Option<u64> {
+    let mut p = auxv;
+    unsafe {
+        while *p != 0 {
+            if *p == key {
+                return Some(*p.add(1));
+            }
+            p = p.add(2);
+        }
+    }
+    None
+}
+
+/// auxv mode: check the initial process stack (Linux create_elf_tables)
+fn auxv_check(sp: *const u64) -> ! {
+    const AT_PHDR: u64 = 3;
+    const AT_PHENT: u64 = 4;
+    const AT_PHNUM: u64 = 5;
+    const AT_PAGESZ: u64 = 6;
+    const AT_ENTRY: u64 = 9;
+    const AT_UID: u64 = 11;
+    const AT_EUID: u64 = 12;
+    const AT_GID: u64 = 13;
+    const AT_EGID: u64 = 14;
+    const AT_PLATFORM: u64 = 15;
+    const AT_HWCAP: u64 = 16;
+    const AT_SECURE: u64 = 23;
+    const AT_RANDOM: u64 = 25;
+    const AT_EXECFN: u64 = 31;
+    const PT_LOAD: u32 = 1;
+    #[cfg(target_arch = "x86_64")]
+    const PLATFORM: &[u8] = b"x86_64";
+    #[cfg(target_arch = "aarch64")]
+    const PLATFORM: &[u8] = b"aarch64";
+
+    // The ABI's initial stack pointer is 16-byte aligned
+    if sp as u64 % 16 != 0 {
+        sys_exit(10);
+    }
+    let argc = unsafe { *sp } as usize;
+    let envp = unsafe { sp.add(1 + argc + 1) };
+    let mut p = envp;
+    while unsafe { *p } != 0 {
+        p = unsafe { p.add(1) };
+    }
+    let auxv = unsafe { p.add(1) };
+    let get = |k| aux(auxv, k).unwrap_or(u64::MAX);
+    if get(AT_PAGESZ) != 4096 {
+        sys_exit(11);
+    }
+    if get(AT_ENTRY) != _start as *const () as u64 {
+        sys_exit(12);
+    }
+    if get(AT_PHENT) != 56 || get(AT_PHNUM) == 0 || get(AT_PHNUM) > 64 {
+        sys_exit(13);
+    }
+    // AT_PHDR points at this program's headers: one of them is PT_LOAD
+    let phdr = get(AT_PHDR);
+    let has_load = phdr != u64::MAX
+        && (0..get(AT_PHNUM)).any(|i| unsafe {
+            core::ptr::read_volatile((phdr + i * 56) as *const u32) == PT_LOAD
+        });
+    if !has_load {
+        sys_exit(14);
+    }
+    let r = get(AT_RANDOM);
+    let bytes = unsafe { core::ptr::read_unaligned(r as *const u128) };
+    if r == u64::MAX || bytes == 0 {
+        sys_exit(15);
+    }
+    let ids = [
+        (AT_UID, sys_getuid()),
+        (AT_EUID, sys_geteuid()),
+        (AT_GID, sys_getgid()),
+        (AT_EGID, sys_getegid()),
+    ];
+    if ids.iter().any(|&(k, v)| get(k) != v as u64) || get(AT_SECURE) != 0 {
+        sys_exit(16);
+    }
+    if !cstr_is(get(AT_EXECFN), b"/bin/boot_tester2") {
+        sys_exit(17);
+    }
+    if !cstr_is(get(AT_PLATFORM), PLATFORM) {
+        sys_exit(18);
+    }
+    if aux(auxv, AT_HWCAP).is_none() {
+        sys_exit(19);
+    }
+    sys_exit(0);
+}
+
+/// exe mode: /proc/self/exe is the executed file
+fn exe_check() -> ! {
+    let mut buf = [0u8; 64];
+    let n = sys_readlink(b"/proc/self/exe\0".as_ptr(), buf.as_mut_ptr(), buf.len() as u64);
+    let want = b"/bin/boot_tester2";
+    // byte loop: a slice compare becomes a bcmp call (no libc here)
+    let ok = n == want.len() as i64
+        && (0..want.len()).all(|i| unsafe { core::ptr::read_volatile(&buf[i]) } == want[i]);
+    sys_exit(if ok { 0 } else { 1 });
+}
+
 extern "C" fn rust_start(sp: *const u64) -> ! {
-    if arg1(sp) == b"fdcheck" {
-        fdcheck();
+    match arg1(sp) {
+        b"fdcheck" => fdcheck(),
+        b"auxv" => auxv_check(sp),
+        b"exe" => exe_check(),
+        _ => {}
     }
 
     // Print marker that we're running in boot_tester2

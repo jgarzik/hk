@@ -718,13 +718,10 @@ fn test_user_fault_kills() {
     expect_killed_by(b"USER_FAULT_SIGILL", pid, 4);
 }
 
-/// A user pointer into the kernel's identity-mapped region (kernel image on
-/// hk; unmapped on Linux) must fail with EFAULT, not read kernel memory
+/// A user pointer into the kernel half (the direct map of the kernel
+/// image on hk) must fail with EFAULT (access_ok), not read kernel memory
 fn test_kernel_pointer_efault() {
-    #[cfg(target_arch = "x86_64")]
-    const KADDR: u64 = 0x10_0000; // 1 MB: hk kernel image
-    #[cfg(target_arch = "aarch64")]
-    const KADDR: u64 = 0x4008_0000; // hk kernel image (virt RAM base + 512K)
+    const KADDR: u64 = super::layout::KERNEL_ADDR;
     let mut fds = [0i32; 2];
     if sys_pipe(fds.as_mut_ptr()) != 0 {
         println(b"UACCESS_KERNEL_PTR_EFAULT:FAIL pipe");

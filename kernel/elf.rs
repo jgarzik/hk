@@ -106,6 +106,14 @@ pub struct ElfExecutable<VA> {
     pub is_pie: bool,
     /// Relocations to apply (only for PIE, R_X86_64_RELATIVE type)
     pub relocations: Vec<ElfRelocation>,
+    /// Virtual address of the program headers (AT_PHDR, before the PIE
+    /// base is added; 0 if no loaded segment holds them)
+    pub phdr: u64,
+    /// Program header entry size and count (AT_PHENT, AT_PHNUM)
+    pub phent: u64,
+    pub phnum: u64,
+    /// Largest PT_LOAD alignment (the PIE base is aligned to it)
+    pub align: u64,
 }
 
 /// ELF parsing error
@@ -176,6 +184,8 @@ impl<VA: Copy> ElfExecutable<VA> {
 
         // Parse program headers
         let mut segments = Vec::new();
+        let mut phdr = 0u64;
+        let mut align = 4096u64;
         let mut dynamic_offset: Option<usize> = None;
         let mut dynamic_size: usize = 0;
 
@@ -198,6 +208,12 @@ impl<VA: Copy> ElfExecutable<VA> {
                     let p_vaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
                     let p_filesz = u64::from_le_bytes(ph[32..40].try_into().unwrap());
                     let p_memsz = u64::from_le_bytes(ph[40..48].try_into().unwrap());
+                    let p_align = u64::from_le_bytes(ph[48..56].try_into().unwrap());
+                    align = align.max(p_align);
+                    // Linux: AT_PHDR = load address of the headers' file offset
+                    if (p_offset..p_offset + p_filesz).contains(&(e_phoff as u64)) {
+                        phdr = p_vaddr + (e_phoff as u64 - p_offset);
+                    }
 
                     segments.push(ElfSegment {
                         vaddr: addr_from_u64(p_vaddr),
@@ -293,6 +309,10 @@ impl<VA: Copy> ElfExecutable<VA> {
             segments,
             is_pie,
             relocations,
+            phdr,
+            phent: e_phentsize as u64,
+            phnum: e_phnum as u64,
+            align,
         })
     }
 }

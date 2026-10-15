@@ -99,3 +99,40 @@ pub fn disable_interrupts() {
         asm!("msr daifset, #2", options(nomem, nostack));
     }
 }
+
+/// ELF auxv AT_HWCAP (Linux arch/arm64/include/uapi/asm/hwcap.h): FP and
+/// ASIMD (always present here), plus the ID_AA64ISAR0_EL1 crypto, CRC32
+/// and LSE atomics features. HWCAP_CPUID is not reported: EL0 reads of
+/// ID registers are not emulated.
+pub fn elf_hwcap() -> u64 {
+    const FP: u64 = 1 << 0;
+    const ASIMD: u64 = 1 << 1;
+    const AES: u64 = 1 << 3;
+    const PMULL: u64 = 1 << 4;
+    const SHA1: u64 = 1 << 5;
+    const SHA2: u64 = 1 << 6;
+    const CRC32: u64 = 1 << 7;
+    const ATOMICS: u64 = 1 << 8;
+    let isar0: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack))
+    };
+    let field = |shift: u32| (isar0 >> shift) & 0xf;
+    let mut hwcap = FP | ASIMD;
+    for (on, bit) in [
+        (field(4) >= 1, AES),
+        (field(4) >= 2, PMULL),
+        (field(8) >= 1, SHA1),
+        (field(12) >= 1, SHA2),
+        (field(16) >= 1, CRC32),
+        (field(20) >= 2, ATOMICS),
+    ] {
+        if on {
+            hwcap |= bit;
+        }
+    }
+    hwcap
+}
+
+/// ELF auxv AT_PLATFORM string
+pub const ELF_PLATFORM: &[u8] = b"aarch64";

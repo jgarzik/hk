@@ -487,3 +487,11 @@ pub fn reload_idt() {
         }
     }
 }
+
+/// ELF auxv AT_HWCAP: CPUID.1:EDX (Linux ELF_HWCAP on x86-64)
+pub fn elf_hwcap() -> u64 {
+    core::arch::x86_64::__cpuid(1).edx as u64
+}
+
+/// ELF auxv AT_PLATFORM string
+pub const ELF_PLATFORM: &[u8] = b"x86_64";

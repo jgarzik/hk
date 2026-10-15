@@ -107,6 +107,20 @@ pub use x86_64::uapi;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::uapi;
 
+// The current task's user TLS register (FS base / TPIDR_EL0)
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::percpu::read_fs_base as read_user_tls;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::percpu::read_tpidr_el0 as read_user_tls;
+
+// ELF auxv hardware capabilities and platform string
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::cpu::{ELF_PLATFORM, elf_hwcap};
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::cpu::{ELF_PLATFORM, elf_hwcap};
+
 // Physical-to-virtual address conversion
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::{self, phys_to_virt, virt_to_phys};

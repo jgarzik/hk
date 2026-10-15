@@ -72,3 +72,23 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   TTBR1 and the identity map, jumps high, and `ap_rust_entry` drops the
   identity map.
 
+## User address space (both arches)
+
+- `mmap_min_addr` is 65536 (Linux vm.mmap_min_addr default): below it a
+  fixed mapping fails with EPERM unless the task has CAP_SYS_RAWIO, and
+  no mapping is ever placed there.
+- Executables load at their linked address (non-PIE `ET_EXEC`, e.g.
+  busybox at 0x400000) or, for PIE, at `ELF_ET_DYN_BASE`
+  (0x555555554000 on x86-64, 0xaaaaaaaa0000 on arm64; no ASLR). Each
+  PT_LOAD segment and the stack are VMAs (`/proc/<pid>/maps`).
+- `brk` starts at the page after the last segment.
+- The stack ends at `STACK_TOP` (0x7ffffffff000 on x86-64, 2^48 on
+  arm64) and grows down up to RLIMIT_STACK; the initial stack holds
+  argc/argv/envp and the Linux auxiliary vector (AT_PHDR, AT_RANDOM,
+  AT_EXECFN, AT_HWCAP, ...).
+- `mmap` without a hint allocates top-down from below the stack gap
+  (STACK_TOP less RLIMIT_STACK, at least 128 MB); hints are used when
+  the whole range is free and mappable.
+- `access_ok` accepts a range only if it ends at or below `TASK_SIZE`;
+  SMAP (x86) and PAN (arm64) catch stray kernel accesses to user memory.
+

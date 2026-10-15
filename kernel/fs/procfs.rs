@@ -184,11 +184,16 @@ pub enum ProcfsInodeData {
     ///
     /// File containing information about an open file descriptor.
     FdinfoFile { pid: Pid, fd: i32 },
-    /// Cgroup file (/proc/<pid>/cgroup)
-    ///
-    /// Shows the cgroup(s) the process belongs to.
-    /// For cgroup v2: "0::<path>\n"
-    PidCgroupFile { pid: Pid },
+    /// Generated per-process file (/proc/<pid>/cgroup, maps, ...)
+    PidFile {
+        pid: Pid,
+        generator: fn(Pid) -> Vec<u8>,
+    },
+    /// Per-process symlink (/proc/<pid>/exe)
+    PidLink {
+        pid: Pid,
+        target: fn(Pid) -> Result<String, KernelError>,
+    },
     /// /proc/sys file (readable, maybe writable)
     Sysctl { ctl: &'static crate::sysctl::Ctl },
 }
@@ -241,9 +246,9 @@ impl ProcfsInodeData {
         Self::FdinfoFile { pid, fd }
     }
 
-    /// Create cgroup file data
-    pub fn new_pid_cgroup_file(pid: Pid) -> Self {
-        Self::PidCgroupFile { pid }
+    /// Create per-process generated file data
+    pub fn new_pid_file(pid: Pid, generator: fn(Pid) -> Vec<u8>) -> Self {
+        Self::PidFile { pid, generator }
     }
 
     /// Get children map (for static directories)
@@ -281,7 +286,8 @@ impl ProcfsInodeData {
             | Self::PidFdinfoDirectory { pid }
             | Self::FdSymlink { pid, .. }
             | Self::FdinfoFile { pid, .. }
-            | Self::PidCgroupFile { pid } => Some(*pid),
+            | Self::PidFile { pid, .. }
+            | Self::PidLink { pid, .. } => Some(*pid),
             _ => None,
         }
     }
@@ -345,6 +351,7 @@ impl InodeOps for ProcfsInodeOps {
                 Ok(alloc::format!("{}", crate::task::percpu::current_pid()))
             }
             ProcfsInodeData::FdSymlink { pid, fd } => fd_link(*pid, *fd),
+            ProcfsInodeData::PidLink { pid, target } => target(*pid),
             _ => Err(KernelError::InvalidArgument),
         }
     }
@@ -413,9 +420,10 @@ impl InodeOps for ProcfsInodeOps {
             ProcfsInodeData::File { .. }
             | ProcfsInodeData::NamespaceFile { .. }
             | ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::PidLink { .. }
             | ProcfsInodeData::SelfLink
             | ProcfsInodeData::FdinfoFile { .. }
-            | ProcfsInodeData::PidCgroupFile { .. }
+            | ProcfsInodeData::PidFile { .. }
             | ProcfsInodeData::Sysctl { .. } => Err(KernelError::NotDirectory),
         }
     }
@@ -445,9 +453,11 @@ impl InodeOps for ProcfsInodeOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
+            ProcfsInodeData::PidFile { pid, generator } => generator(*pid),
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
-            ProcfsInodeData::FdSymlink { .. } | ProcfsInodeData::SelfLink => {
+            ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::PidLink { .. }
+            | ProcfsInodeData::SelfLink => {
                 // Symlinks don't have content, readlink() handles them
                 return Err(KernelError::Io);
             }
@@ -563,11 +573,31 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
             ))));
             Ok(inode)
         }
-        "cgroup" => {
-            // Create /proc/<pid>/cgroup file
+        "exe" => {
             let sb = dir.superblock().ok_or(KernelError::Io)?;
             let inode = Arc::new(Inode::new(
-                pid_ino(pid, 102),         // offset 102 for cgroup file
+                pid_ino(pid, 104),
+                InodeMode::symlink(),
+                0,
+                0,
+                0,
+                current_time(),
+                Arc::downgrade(&sb),
+                &PROCFS_INODE_OPS,
+            ));
+            inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+                ProcfsInodeData::PidLink {
+                    pid,
+                    target: exe_link,
+                },
+            ))));
+            Ok(inode)
+        }
+        name if pid_file(name).is_some() => {
+            let (off, generator) = pid_file(name).ok_or(KernelError::NotFound)?;
+            let sb = dir.superblock().ok_or(KernelError::Io)?;
+            let inode = Arc::new(Inode::new(
+                pid_ino(pid, off),
                 InodeMode::regular(0o444), // r--r--r--
                 0,
                 0,
@@ -577,11 +607,10 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
                 &PROCFS_INODE_OPS,
             ));
             inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
-                ProcfsInodeData::new_pid_cgroup_file(pid),
+                ProcfsInodeData::new_pid_file(pid, generator),
             ))));
             Ok(inode)
         }
-        // Future: add "status", "cmdline", "maps", etc.
         _ => Err(KernelError::NotFound),
     }
 }
@@ -830,6 +859,82 @@ fn gen_cgroup_content(pid: Pid) -> Vec<u8> {
     Vec::from(output.as_bytes())
 }
 
+/// Generated files in /proc/<pid>/: name, inode offset, generator
+/// Content generator of a per-process file
+type PidGen = fn(Pid) -> Vec<u8>;
+
+const PID_FILES: &[(&str, u64, PidGen)] = &[
+    ("cgroup", 102, gen_cgroup_content),
+    ("maps", 103, gen_maps_content),
+];
+
+fn pid_file(name: &str) -> Option<(u64, PidGen)> {
+    PID_FILES
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|&(_, off, g)| (off, g))
+}
+
+/// /proc/<pid>/exe: the executable's path (ENOENT for kernel threads)
+fn exe_link(pid: Pid) -> Result<String, KernelError> {
+    let mm = get_tid_for_pid(pid)
+        .and_then(crate::mm::get_task_mm)
+        .ok_or(KernelError::NotFound)?;
+    let exe = mm.lock().exe().ok_or(KernelError::NotFound)?;
+    Ok(exe)
+}
+
+/// /proc/<pid>/maps: one line per VMA (Linux show_map_vma)
+fn gen_maps_content(pid: Pid) -> Vec<u8> {
+    use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let Some(mm) = get_tid_for_pid(pid).and_then(crate::mm::get_task_mm) else {
+        return Vec::new();
+    };
+    let mm = mm.lock();
+    let (start_brk, brk) = (mm.get_start_brk(), mm.get_brk());
+    for v in mm.iter() {
+        let bit = |b: bool, c: char| if b { c } else { '-' };
+        let (ino, dev, name) = match &v.file {
+            Some(f) => {
+                let ino = f.get_inode().map(|i| i.ino).unwrap_or(0);
+                (ino, "00:00", f.dentry.full_path())
+            }
+            None if v.flags & VM_GROWSDOWN != 0 => (0, "00:00", String::from("[stack]")),
+            None if v.start >= start_brk
+                && v.end <= brk.next_multiple_of(4096)
+                && brk > start_brk =>
+            {
+                (0, "00:00", String::from("[heap]"))
+            }
+            None => (0, "00:00", String::new()),
+        };
+        let mut line = String::new();
+        let _ = write!(
+            line,
+            "{:08x}-{:08x} {}{}{}{} {:08x} {} {} ",
+            v.start,
+            v.end,
+            bit(v.prot & PROT_READ != 0, 'r'),
+            bit(v.prot & PROT_WRITE != 0, 'w'),
+            bit(v.prot & PROT_EXEC != 0, 'x'),
+            if v.flags & VM_SHARED != 0 { 's' } else { 'p' },
+            if v.file.is_some() { v.offset } else { 0 },
+            dev,
+            ino
+        );
+        if !name.is_empty() {
+            while line.len() < 73 {
+                line.push(' ');
+            }
+            line.push_str(&name);
+        }
+        let _ = writeln!(out, "{}", line.trim_end());
+    }
+    Vec::from(out.as_bytes())
+}
+
 /// Get the cgroup path for a task (virtualized to its namespace)
 fn get_task_cgroup_path(pid: Pid) -> String {
     use crate::cgroup::TASK_CGROUP;
@@ -906,9 +1011,11 @@ impl FileOps for ProcfsFileOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
+            ProcfsInodeData::PidFile { pid, generator } => generator(*pid),
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
-            ProcfsInodeData::FdSymlink { .. } | ProcfsInodeData::SelfLink => {
+            ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::PidLink { .. }
+            | ProcfsInodeData::SelfLink => {
                 return Err(KernelError::Io);
             }
             ProcfsInodeData::Directory { .. }
@@ -949,9 +1056,11 @@ impl FileOps for ProcfsFileOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
+            ProcfsInodeData::PidFile { pid, generator } => generator(*pid),
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
-            ProcfsInodeData::FdSymlink { .. } | ProcfsInodeData::SelfLink => {
+            ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::PidLink { .. }
+            | ProcfsInodeData::SelfLink => {
                 return Err(KernelError::Io);
             }
             ProcfsInodeData::Directory { .. }
@@ -1079,9 +1188,10 @@ impl FileOps for ProcfsFileOps {
             ProcfsInodeData::File { .. }
             | ProcfsInodeData::NamespaceFile { .. }
             | ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::PidLink { .. }
             | ProcfsInodeData::SelfLink
             | ProcfsInodeData::FdinfoFile { .. }
-            | ProcfsInodeData::PidCgroupFile { .. }
+            | ProcfsInodeData::PidFile { .. }
             | ProcfsInodeData::Sysctl { .. } => {
                 return Err(KernelError::NotDirectory);
             }
@@ -1162,18 +1272,23 @@ fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), Kernel
         return Ok(());
     }
 
-    // Emit "cgroup" file
-    let should_continue = ctx.emit(DirEntry {
-        ino: pid_ino(pid, 102),
-        file_type: FileType::Regular,
-        name: Vec::from(b"cgroup"),
-    });
-
-    if !should_continue {
+    if !ctx.emit(DirEntry {
+        ino: pid_ino(pid, 104),
+        file_type: FileType::Symlink,
+        name: Vec::from(&b"exe"[..]),
+    }) {
         return Ok(());
     }
-
-    // Future: add "status", "cmdline", "maps", etc.
+    for (name, off, _) in PID_FILES {
+        let more = ctx.emit(DirEntry {
+            ino: pid_ino(pid, *off),
+            file_type: FileType::Regular,
+            name: Vec::from(name.as_bytes()),
+        });
+        if !more {
+            return Ok(());
+        }
+    }
 
     Ok(())
 }

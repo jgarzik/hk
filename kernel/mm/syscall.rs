@@ -76,6 +76,9 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     if length == 0 {
         return KernelError::InvalidArgument.sysret();
     }
+    if length > super::TASK_SIZE {
+        return KernelError::OutOfMemory.sysret();
+    }
 
     // Round up length to page boundary
     let length = (length + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -153,6 +156,9 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         if addr & (PAGE_SIZE - 1) != 0 {
             return KernelError::InvalidArgument.sysret(); // Must be page-aligned
         }
+        if let Err(e) = super::check_fixed(addr, length) {
+            return e.sysret();
+        }
         // MAP_FIXED_NOREPLACE: fail if address range overlaps existing mapping
         if is_fixed_noreplace && mm_guard.overlaps(addr, addr + length) {
             return KernelError::AlreadyExists.sysret();
@@ -162,7 +168,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
             mm_guard.remove_range(addr, addr + length);
         }
         addr
-    } else if addr != 0 {
+    } else if addr != 0 && super::hint_ok(addr & !(PAGE_SIZE - 1), length) {
         // Hint address - try to use it, fall back to search
         let aligned = addr & !(PAGE_SIZE - 1);
         if !mm_guard.overlaps(aligned, aligned + length) {
@@ -1977,6 +1983,9 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
             if !(new_end <= old_addr || new_addr >= old_end) {
                 return KernelError::InvalidArgument.sysret();
             }
+        }
+        if let Err(e) = super::check_fixed(new_addr, new_len_aligned) {
+            return e.sysret();
         }
     }
 

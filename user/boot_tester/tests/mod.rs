@@ -22,6 +22,8 @@ pub mod fpu;
 pub mod fault_signals;
 pub mod ipc;
 pub mod mmap;
+pub mod layout;
+pub mod startup;
 pub mod rlimit;
 pub mod namespace;
 pub mod sockets;
@@ -103,6 +105,8 @@ pub fn run_all_tests() {
     fault_signals::run_tests();
     ipc::run_tests();
     mmap::run_tests();
+    layout::run_tests();
+    startup::run_tests();
     rlimit::run_tests();
     namespace::run_tests();
     sockets::run_tests();

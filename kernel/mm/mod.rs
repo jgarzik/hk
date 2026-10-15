@@ -39,24 +39,63 @@ pub use swap_state::{
 
 pub use vma::*;
 
-// Address space layout for mmap region
-// These are user-space virtual addresses where mmap allocations go
+// User address space layout (doc/MEMORY.md): image at its link address
+// (PIE at ELF_ET_DYN_BASE), brk after it, mmap top-down from below the
+// stack gap, stack at STACK_TOP
 
-/// Base address for mmap region (x86-64)
+pub use crate::arch::paging::TASK_SIZE;
+
+/// Lowest mappable user address (Linux vm.mmap_min_addr default)
+pub const MMAP_MIN_ADDR: u64 = 65536;
+
+/// Top of the initial user stack (Linux STACK_TOP, no randomization)
 #[cfg(target_arch = "x86_64")]
-pub const MMAP_BASE: u64 = 0x7F00_0000_0000;
+pub const STACK_TOP: u64 = 0x7FFF_FFFF_F000;
+#[cfg(target_arch = "aarch64")]
+pub const STACK_TOP: u64 = TASK_SIZE;
 
-/// End address for mmap region (x86-64)
+/// Load address of PIE executables (Linux ELF_ET_DYN_BASE, 2/3 of
+/// TASK_SIZE, without randomization)
 #[cfg(target_arch = "x86_64")]
-pub const MMAP_END: u64 = 0x8000_0000_0000;
-
-/// Base address for mmap region (aarch64)
+pub const ELF_ET_DYN_BASE: u64 = 0x5555_5555_4000;
 #[cfg(target_arch = "aarch64")]
-pub const MMAP_BASE: u64 = 0x0000_7F00_0000_0000;
+pub const ELF_ET_DYN_BASE: u64 = 0xAAAA_AAAA_0000;
 
-/// End address for mmap region (aarch64)
-#[cfg(target_arch = "aarch64")]
-pub const MMAP_END: u64 = 0x0000_8000_0000_0000;
+/// A fixed mapping at [addr, addr + len): below MMAP_MIN_ADDR is EPERM
+/// without CAP_SYS_RAWIO (Linux security_mmap_addr / cap_mmap_addr),
+/// past TASK_SIZE is ENOMEM
+pub fn check_fixed(addr: u64, len: u64) -> Result<(), crate::error::KernelError> {
+    use crate::error::KernelError;
+    if addr < MMAP_MIN_ADDR && !crate::task::capable(crate::task::CAP_SYS_RAWIO) {
+        return Err(KernelError::NotPermitted);
+    }
+    match addr.checked_add(len) {
+        Some(end) if end <= TASK_SIZE => Ok(()),
+        _ => Err(KernelError::OutOfMemory),
+    }
+}
+
+/// A placement hint is used only if the whole range is mappable
+pub fn hint_ok(addr: u64, len: u64) -> bool {
+    addr >= MMAP_MIN_ADDR && addr.checked_add(len).is_some_and(|end| end <= TASK_SIZE)
+}
+
+/// Top of the mmap region: STACK_TOP less a gap for the stack from
+/// RLIMIT_STACK (Linux mmap_base: at least 128MB, at most 5/6 of the
+/// space). An unlimited stack gets the minimum gap: hk always lays out
+/// top-down (Linux switches to the legacy bottom-up layout).
+pub fn mmap_base() -> u64 {
+    const MIN_GAP: u64 = 128 << 20;
+    const MAX_GAP: u64 = STACK_TOP / 6 * 5;
+    let rlim = crate::rlimit::rlimit(crate::rlimit::RLIMIT_STACK);
+    let rlim = if rlim == crate::rlimit::RLIM_INFINITY {
+        0
+    } else {
+        rlim
+    };
+    let gap = rlim.saturating_add(STACK_GUARD_GAP).clamp(MIN_GAP, MAX_GAP);
+    (STACK_TOP - gap) & !0xFFF
+}
 
 /// Stack guard gap (256KB like Linux default)
 /// Prevents growsdown VMAs from expanding too close to adjacent VMAs
@@ -68,10 +107,8 @@ pub const STACK_GUARD_GAP: u64 = 256 * 1024;
 pub struct MmStruct {
     /// List of VMAs, sorted by start address
     vmas: Vec<Vma>,
-    /// Base address for mmap region
+    /// Top of the mmap region: allocations grow down from here
     mmap_base: u64,
-    /// End address for mmap region
-    mmap_end: u64,
     /// Initial program break (page-aligned end of loaded segments)
     start_brk: u64,
     /// Current program break
@@ -85,21 +122,33 @@ pub struct MmStruct {
     /// Default flags for new VMAs (set by mlockall with MCL_FUTURE)
     /// Contains VM_LOCKED and/or VM_LOCKONFAULT when MCL_FUTURE is active
     def_flags: u32,
+    /// Path of the executable (Linux mm->exe_file), for /proc/<pid>/exe
+    exe: Option<alloc::string::String>,
 }
 
 impl MmStruct {
     /// Create a new memory descriptor
-    pub fn new(mmap_base: u64, mmap_end: u64) -> Self {
+    pub fn new(mmap_base: u64) -> Self {
         Self {
             vmas: Vec::new(),
             mmap_base,
-            mmap_end,
             start_brk: 0,
             brk: 0,
             locked_vm: 0,
             total_vm: 0,
             def_flags: 0,
+            exe: None,
         }
+    }
+
+    /// Executable path (/proc/<pid>/exe)
+    pub fn exe(&self) -> Option<alloc::string::String> {
+        self.exe.clone()
+    }
+
+    /// Record the executable at exec
+    pub fn set_exe(&mut self, path: alloc::string::String) {
+        self.exe = Some(path);
     }
 
     /// Set the program break region (called during ELF loading)
@@ -166,30 +215,20 @@ impl MmStruct {
 
     /// Find a free virtual address range of the given size
     ///
-    /// Uses a simple first-fit algorithm starting from mmap_base.
+    /// Top-down: the highest gap below mmap_base and above MMAP_MIN_ADDR
+    /// that fits (Linux arch_get_unmapped_area_topdown).
     pub fn find_free_area(&self, size: u64) -> Option<u64> {
-        let mut current = self.mmap_base;
-
-        for vma in &self.vmas {
-            // Only consider VMAs in the mmap region
-            if vma.start >= self.mmap_base {
-                // Check if there's enough space before this VMA
-                if vma.start >= current && vma.start - current >= size {
-                    return Some(current);
-                }
-                // Move past this VMA
-                if vma.end > current {
-                    current = vma.end;
-                }
+        let mut top = self.mmap_base;
+        for vma in self.vmas.iter().rev() {
+            if vma.start >= top {
+                continue;
             }
+            if vma.end <= top && top - vma.end >= size {
+                return top.checked_sub(size).filter(|&a| a >= MMAP_MIN_ADDR);
+            }
+            top = top.min(vma.start);
         }
-
-        // Check space after the last VMA
-        if current < self.mmap_end && self.mmap_end - current >= size {
-            Some(current)
-        } else {
-            None
-        }
+        top.checked_sub(size).filter(|&a| a >= MMAP_MIN_ADDR)
     }
 
     /// Check if the given range overlaps any existing VMA
@@ -314,6 +353,12 @@ impl MmStruct {
             return Err(EFAULT);
         }
 
+        // The stack may not grow past RLIMIT_STACK (Linux acct_stack_growth)
+        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_STACK);
+        if vma.end - address > limit {
+            return Err(EFAULT);
+        }
+
         let grow_pages = (vma.start - address) >> 12;
 
         // Update VMA
@@ -361,8 +406,7 @@ impl MmStruct {
             }
         }
 
-        // Check against mmap_end
-        if new_end > self.mmap_end {
+        if new_end > TASK_SIZE {
             return false;
         }
 
@@ -574,7 +618,6 @@ pub fn clone_task_mm(parent_tid: Tid, child_tid: Tid, share_vm: bool) {
         let new_mm = MmStruct {
             vmas: child_vmas,
             mmap_base: parent_guard.mmap_base,
-            mmap_end: parent_guard.mmap_end,
             start_brk: parent_guard.start_brk,
             brk: parent_guard.brk,
             // Copy mlock state for fork
@@ -582,6 +625,7 @@ pub fn clone_task_mm(parent_tid: Tid, child_tid: Tid, share_vm: bool) {
             // Copy total VM for fork
             total_vm: parent_guard.total_vm,
             def_flags: parent_guard.def_flags,
+            exe: parent_guard.exe.clone(),
         };
         drop(parent_guard);
         init_task_mm(child_tid, Arc::new(Mutex::new(new_mm)));
@@ -590,5 +634,5 @@ pub fn clone_task_mm(parent_tid: Tid, child_tid: Tid, share_vm: bool) {
 
 /// Create a default MmStruct for a new user task
 pub fn create_default_mm() -> Arc<Mutex<MmStruct>> {
-    Arc::new(Mutex::new(MmStruct::new(MMAP_BASE, MMAP_END)))
+    Arc::new(Mutex::new(MmStruct::new(mmap_base())))
 }

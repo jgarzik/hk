@@ -386,18 +386,7 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
 const PAGE_SIZE: u64 = 4096;
 const USER_STACK_PAGES: usize = 256;
 
-// x86_64: User stack at top of lower half of 48-bit VA space
-#[cfg(target_arch = "x86_64")]
-const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
-// aarch64: User stack at top of TTBR0 range (just under 512GB for QEMU virt)
-#[cfg(target_arch = "aarch64")]
-const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000; // Same as x86 for simplicity
-
-// PIE base address - where position-independent executables load
-#[cfg(target_arch = "x86_64")]
-const USER_PIE_BASE: u64 = 0x20000000;
-#[cfg(target_arch = "aarch64")]
-const USER_PIE_BASE: u64 = 0x8000_0000; // Above the 2GB kernel identity-mapped region
+use crate::mm::{ELF_ET_DYN_BASE, STACK_TOP as USER_STACK_TOP};
 
 fn load_elf_with_cache<PT, FA>(
     elf: &crate::elf::ElfExecutable<u64>,
@@ -1048,7 +1037,11 @@ fn kmain() -> ! {
     user_pt.copy_kernel_mappings();
 
     // Load ELF segments into user page table using page cache
-    let base_addr = if elf.is_pie { USER_PIE_BASE } else { 0 };
+    let base_addr = if elf.is_pie {
+        ELF_ET_DYN_BASE & !(elf.align.max(PAGE_SIZE) - 1)
+    } else {
+        0
+    };
     if let Err(e) = load_elf_with_cache(
         &elf,
         file_id,
@@ -1138,7 +1131,12 @@ fn kmain() -> ! {
     // Initialize brk for the init task (tid=2)
     // This must be done after create_user_task which creates a default mm
     if let Some(mm) = mm::get_task_mm(2) {
-        mm.lock().set_brk(start_brk);
+        let mut m = mm.lock();
+        m.set_brk(start_brk);
+        let stack_bottom = USER_STACK_TOP - USER_STACK_PAGES as u64 * PAGE_SIZE;
+        for vma in task::exec::image_vmas(2, &elf, base_addr, stack_bottom) {
+            m.insert_vma(vma);
+        }
     }
 
     // Enable scheduling

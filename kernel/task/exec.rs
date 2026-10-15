@@ -18,12 +18,10 @@ type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 use super::percpu;
 use crate::elf::ElfExecutable;
 use crate::fs::{File, kernel_open_exec};
+use crate::mm::{ELF_ET_DYN_BASE, STACK_TOP};
 
 /// Page size constant
 const PAGE_SIZE: u64 = 4096;
-
-/// User stack virtual address (near top of user space, below canonical hole)
-const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
 
 /// Pages of user stack mapped at exec when RLIMIT_STACK is unlimited
 /// (1 MB; the stack does not grow on demand yet, see BUGS.md). It was
@@ -32,11 +30,6 @@ const USER_STACK_PAGES: usize = 256;
 
 /// Maximum number of pages for user stack (8MB, matching default RLIMIT_STACK)
 const MAX_STACK_PAGES: usize = 2048;
-
-/// Base address for loading PIE (position-independent) executables
-/// On aarch64, kernel identity maps 0-2GB, so PIE base must be above 2GB.
-/// On x86_64, this can be lower, but 2GB is safe for both.
-const USER_PIE_BASE: u64 = 0x8000_0000; // 2GB
 
 /// Maximum combined size of argv + envp (128KB like Linux's MAX_ARG_STRLEN * MAX_ARG_STRINGS)
 const MAX_ARG_PAGES: usize = 32;
@@ -89,60 +82,123 @@ fn total_string_bytes(strings: &[Vec<u8>]) -> usize {
     strings.iter().map(|s| s.len() + 1).sum() // +1 for null terminator
 }
 
-/// Set up the user stack with argc, argv, envp, and auxv
+/// What the new image tells the program through the auxiliary vector
+pub struct ExecInfo<'a> {
+    /// Entry point (AT_ENTRY)
+    pub entry: u64,
+    /// Program headers in memory (AT_PHDR, AT_PHENT, AT_PHNUM)
+    pub phdr: u64,
+    pub phent: u64,
+    pub phnum: u64,
+    /// Path the program was executed as (AT_EXECFN)
+    pub execfn: &'a [u8],
+}
+
+/// Writes the initial stack image through the new page table
+struct StackWriter<'a> {
+    pt: &'a ArchPageTable,
+    /// Next free byte below the data written so far
+    top: u64,
+}
+
+impl StackWriter<'_> {
+    /// Copy `data` to user address `va`
+    fn write(&self, va: u64, data: &[u8]) -> Result<(), i32> {
+        for (i, &b) in data.iter().enumerate() {
+            let phys = self.pt.translate(va + i as u64).ok_or(EFAULT)?;
+            unsafe { core::ptr::write(phys_to_virt(phys), b) };
+        }
+        Ok(())
+    }
+
+    /// Push bytes below the current top; their address
+    fn push(&mut self, data: &[u8]) -> Result<u64, i32> {
+        self.top -= data.len() as u64;
+        self.write(self.top, data)?;
+        Ok(self.top)
+    }
+
+    /// Push a NUL-terminated string; its address
+    fn push_str(&mut self, s: &[u8]) -> Result<u64, i32> {
+        self.push(&[0])?;
+        self.push(s)
+    }
+}
+
+/// Auxiliary vector (Linux fs/binfmt_elf.c create_elf_tables)
+fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64); 19] {
+    const AT_NULL: u64 = 0;
+    const AT_PHDR: u64 = 3;
+    const AT_PHENT: u64 = 4;
+    const AT_PHNUM: u64 = 5;
+    const AT_PAGESZ: u64 = 6;
+    const AT_BASE: u64 = 7;
+    const AT_FLAGS: u64 = 8;
+    const AT_ENTRY: u64 = 9;
+    const AT_UID: u64 = 11;
+    const AT_EUID: u64 = 12;
+    const AT_GID: u64 = 13;
+    const AT_EGID: u64 = 14;
+    const AT_PLATFORM: u64 = 15;
+    const AT_HWCAP: u64 = 16;
+    const AT_CLKTCK: u64 = 17;
+    const AT_SECURE: u64 = 23;
+    const AT_RANDOM: u64 = 25;
+    const AT_HWCAP2: u64 = 26;
+    const AT_EXECFN: u64 = 31;
+    let c = crate::task::current_cred();
+    let secure = c.uid != c.euid || c.gid != c.egid;
+    [
+        (AT_HWCAP, crate::arch::elf_hwcap()),
+        (AT_PAGESZ, PAGE_SIZE),
+        (AT_CLKTCK, 100),
+        (AT_PHDR, info.phdr),
+        (AT_PHENT, info.phent),
+        (AT_PHNUM, info.phnum),
+        (AT_BASE, 0),
+        (AT_FLAGS, 0),
+        (AT_ENTRY, info.entry),
+        (AT_UID, c.uid as u64),
+        (AT_EUID, c.euid as u64),
+        (AT_GID, c.gid as u64),
+        (AT_EGID, c.egid as u64),
+        (AT_SECURE, secure as u64),
+        (AT_RANDOM, random),
+        (AT_HWCAP2, 0),
+        (AT_EXECFN, execfn),
+        (AT_PLATFORM, platform),
+        (AT_NULL, 0),
+    ]
+}
+
+/// Map the user stack below STACK_TOP and build the initial process
+/// stack (Linux layout): strings and AT_RANDOM bytes at the top, then
+/// the auxiliary vector, envp, argv and argc at the 16-byte aligned
+/// initial stack pointer.
 ///
-/// Stack layout (growing down, addresses decrease):
-///
-/// High addresses (stack top)
-/// ```
-///   [padding for alignment]
-///   [environment strings]
-///   [argument strings]
-///   [auxv entries] (16 bytes each: type, value)
-///   [NULL] (end of envp)
-///   [envp[n-1] pointer]
-///   ...
-///   [envp[0] pointer]
-///   [NULL] (end of argv)
-///   [argv[argc-1] pointer]
-///   ...
-///   [argv[0] pointer]
-///   [argc]
-/// ```
-/// Low addresses (initial RSP)
-///
-/// Returns the initial RSP value.
+/// Returns (initial SP, lowest mapped stack address).
 fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     page_table: &mut ArchPageTable,
     frame_alloc: &mut FA,
     argv: &[Vec<u8>],
     envp: &[Vec<u8>],
-    entry_point: u64,
-) -> Result<u64, i32> {
+    info: &ExecInfo,
+) -> Result<(u64, u64), i32> {
     // Calculate stack pages based on RLIMIT_STACK
     let stack_limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_STACK);
     let stack_pages = if stack_limit == crate::rlimit::RLIM_INFINITY {
-        // Unlimited - use default
         USER_STACK_PAGES
     } else {
-        // Limit stack to RLIMIT_STACK bytes, clamped between defaults
-        let pages = (stack_limit / PAGE_SIZE) as usize;
-        pages.clamp(USER_STACK_PAGES, MAX_STACK_PAGES)
+        ((stack_limit / PAGE_SIZE) as usize).clamp(USER_STACK_PAGES, MAX_STACK_PAGES)
     };
-
-    // Allocate stack pages
-    let stack_bottom = USER_STACK_TOP - (stack_pages as u64 * PAGE_SIZE);
+    let stack_bottom = STACK_TOP - (stack_pages as u64 * PAGE_SIZE);
 
     for i in 0..stack_pages {
         let va = stack_bottom + (i as u64 * PAGE_SIZE);
         let frame = frame_alloc.alloc_frame().ok_or(ENOMEM)?;
-
-        // Zero the frame
         unsafe {
             ::core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
-
-        // Map with read/write/user permissions
         page_table
             .map_with_alloc(
                 va,
@@ -153,160 +209,119 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
             .map_err(|_| ENOMEM)?;
     }
 
-    // Start from top of stack and work down
-    let mut sp = USER_STACK_TOP;
-
-    // We'll build the stack contents in physical memory
-    // For now, translate virtual to physical
-
-    // Calculate string area size
-    let argv_strings_size: usize = argv.iter().map(|s| s.len() + 1).sum();
-    let envp_strings_size: usize = envp.iter().map(|s| s.len() + 1).sum();
-    let strings_size = argv_strings_size + envp_strings_size;
-
-    // Auxiliary vector (minimal for now)
-    // AT_NULL (0) terminates, AT_PAGESZ (6), AT_ENTRY (9)
-    let auxv_entries: [(u64, u64); 3] = [
-        (6, PAGE_SIZE),   // AT_PAGESZ
-        (9, entry_point), // AT_ENTRY
-        (0, 0),           // AT_NULL (terminator)
-    ];
-    let auxv_size = auxv_entries.len() * 16;
-
-    // Pointers: argc (8) + argv pointers (argc+1) + envp pointers (envc+1)
-    let argc = argv.len();
-    let envc = envp.len();
-    let pointers_size = 8 + (argc + 1) * 8 + (envc + 1) * 8;
-
-    // Total size (align to 16 bytes)
-    let total_size = (strings_size + auxv_size + pointers_size).div_ceil(16) * 16;
-
-    // Check if it fits in stack (using actual allocated pages)
-    if total_size > stack_pages * PAGE_SIZE as usize {
+    // Everything must fit in the mapped stack, with room to run
+    let strings: usize = argv.iter().chain(envp).map(|s| s.len() + 1).sum();
+    let words = 1 + argv.len() + 1 + envp.len() + 1 + 2 * 19;
+    let need = strings + info.execfn.len() + 64 + 16 + words * 8 + 64;
+    if need > stack_pages * PAGE_SIZE as usize / 2 {
         return Err(E2BIG);
     }
 
-    // Move sp down to make room
-    sp -= total_size as u64;
-
-    // Align to 16 bytes, then subtract 8 for ABI compliance.
-    // x86-64 ABI requires RSP to be 8 bytes below 16-byte alignment at function entry
-    // (as if a 'call' had pushed an 8-byte return address).
-    sp &= !15;
-    sp -= 8;
-
-    // Now write data to the stack
-    // We need to translate virtual addresses to physical
-
-    // Helper to write to virtual address via page table
-    let write_u64 = |pt: &ArchPageTable, va: u64, val: u64| -> Result<(), i32> {
-        if let Some(phys) = pt.translate(va) {
-            unsafe {
-                let ptr = phys_to_virt(phys) as *mut u64;
-                core::ptr::write(ptr, val);
-            }
-            Ok(())
-        } else {
-            Err(EFAULT)
-        }
+    let mut w = StackWriter {
+        pt: page_table,
+        top: STACK_TOP - 8, // NULL end marker (Linux)
     };
-
-    let write_bytes = |pt: &ArchPageTable, va: u64, data: &[u8]| -> Result<(), i32> {
-        for (i, &byte) in data.iter().enumerate() {
-            let addr = va + i as u64;
-            if let Some(phys) = pt.translate(addr) {
-                unsafe {
-                    let ptr = phys_to_virt(phys);
-                    core::ptr::write(ptr, byte);
-                }
-            } else {
-                return Err(EFAULT);
-            }
-        }
-        Ok(())
-    };
-
-    // Current position for writing
-    let mut ptr = sp;
-
-    // Write argc
-    write_u64(page_table, ptr, argc as u64)?;
-    ptr += 8;
-
-    // Calculate where strings will be placed
-    let strings_base = sp + pointers_size as u64 + auxv_size as u64;
-    let mut string_ptr = strings_base;
-
-    // Collect argv string addresses
-    let mut argv_addrs = Vec::new();
-    for arg in argv {
-        argv_addrs.push(string_ptr);
-        string_ptr += (arg.len() + 1) as u64; // +1 for null terminator
+    let execfn = w.push_str(info.execfn)?;
+    let mut envp_addrs = Vec::with_capacity(envp.len());
+    for e in envp.iter().rev() {
+        envp_addrs.push(w.push_str(e)?);
     }
-
-    // Collect envp string addresses
-    let mut envp_addrs = Vec::new();
-    for env in envp {
-        envp_addrs.push(string_ptr);
-        string_ptr += (env.len() + 1) as u64;
+    envp_addrs.reverse();
+    let mut argv_addrs = Vec::with_capacity(argv.len());
+    for a in argv.iter().rev() {
+        argv_addrs.push(w.push_str(a)?);
     }
+    argv_addrs.reverse();
+    let platform = w.push_str(crate::arch::ELF_PLATFORM)?;
+    let mut rnd = [0u8; 16];
+    let _ = crate::random::get_random_bytes(&mut rnd, 0);
+    w.top &= !15;
+    let random = w.push(&rnd)?;
 
-    // Write argv pointers
-    for addr in &argv_addrs {
-        write_u64(page_table, ptr, *addr)?;
-        ptr += 8;
+    // argc, argv[], NULL, envp[], NULL, auxv pairs
+    let mut v: Vec<u64> = Vec::with_capacity(words);
+    v.push(argv.len() as u64);
+    v.extend_from_slice(&argv_addrs);
+    v.push(0);
+    v.extend_from_slice(&envp_addrs);
+    v.push(0);
+    for (k, val) in auxv(info, random, execfn, platform) {
+        v.push(k);
+        v.push(val);
     }
-    // NULL terminator for argv
-    write_u64(page_table, ptr, 0)?;
-    ptr += 8;
+    let sp = (w.top - v.len() as u64 * 8) & !15;
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    w.write(sp, &bytes)?;
 
-    // Write envp pointers
-    for addr in &envp_addrs {
-        write_u64(page_table, ptr, *addr)?;
-        ptr += 8;
-    }
-    // NULL terminator for envp
-    write_u64(page_table, ptr, 0)?;
-    ptr += 8;
-
-    // Write auxv
-    for (tag, val) in &auxv_entries {
-        write_u64(page_table, ptr, *tag)?;
-        ptr += 8;
-        write_u64(page_table, ptr, *val)?;
-        ptr += 8;
-    }
-
-    // Write argv strings
-    let mut string_ptr = strings_base;
-    for arg in argv {
-        write_bytes(page_table, string_ptr, arg)?;
-        write_bytes(page_table, string_ptr + arg.len() as u64, &[0])?; // null terminator
-        string_ptr += (arg.len() + 1) as u64;
-    }
-
-    // Write envp strings
-    for env in envp {
-        write_bytes(page_table, string_ptr, env)?;
-        write_bytes(page_table, string_ptr + env.len() as u64, &[0])?;
-        string_ptr += (env.len() + 1) as u64;
-    }
-
-    // ARM64: Flush data cache for all stack pages we just wrote.
-    // The kernel writes via phys_to_virt (kernel VA) but user reads via
-    // user VA - ARM requires cache flush for coherency across different VAs.
+    // ARM64: the kernel wrote through the linear map; clean the data
+    // cache so the user mapping sees it
     #[cfg(target_arch = "aarch64")]
     {
         use crate::arch::aarch64::cache;
-        for i in 0..stack_pages {
-            let va = stack_bottom + (i as u64 * PAGE_SIZE);
+        let mut va = sp & !(PAGE_SIZE - 1);
+        while va < STACK_TOP {
             if let Some(phys) = page_table.translate(va) {
                 cache::cache_clean_range(phys_to_virt(phys) as *const u8, PAGE_SIZE as usize);
             }
+            va += PAGE_SIZE;
         }
     }
 
-    Ok(sp)
+    Ok((sp, stack_bottom))
+}
+
+/// Every PT_LOAD segment must land in mappable user space: below
+/// mmap_min_addr is EPERM (Linux security_mmap_addr), past TASK_SIZE
+/// ENOMEM
+fn check_segments(elf: &ElfExecutable<u64>, base: u64) -> Result<(), i32> {
+    for seg in elf.segments.iter().filter(|s| s.mem_size > 0) {
+        let start = (seg.vaddr + base) & !(PAGE_SIZE - 1);
+        let len = seg.vaddr + base + seg.mem_size as u64 - start;
+        crate::mm::check_fixed(start, len).map_err(|e| e.errno())?;
+    }
+    Ok(())
+}
+
+/// VMAs of a freshly loaded image: one private anonymous VMA per
+/// PT_LOAD segment (pages already populated) and the stack
+/// (growsdown), so mprotect/munmap/brk and /proc/<pid>/maps see them
+pub fn image_vmas(
+    tid: crate::task::Tid,
+    elf: &ElfExecutable<u64>,
+    base: u64,
+    stack_bottom: u64,
+) -> Vec<crate::mm::Vma> {
+    use crate::mm::{
+        MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, VM_GROWSDOWN, Vma,
+        anon_vma::AnonVma,
+    };
+    let anon = |start: u64, end: u64, prot: u32| {
+        let mut v = Vma::new(start, end, prot, MAP_PRIVATE | MAP_ANONYMOUS);
+        let av = AnonVma::new();
+        av.add_vma(tid, start, end);
+        v.set_anon_vma(av);
+        v
+    };
+    let mut vmas: Vec<Vma> = Vec::new();
+    let mut prev_end = 0;
+    for seg in elf.segments.iter().filter(|s| s.mem_size > 0) {
+        // A page shared with the previous segment stays in its VMA
+        let start = ((seg.vaddr + base) & !(PAGE_SIZE - 1)).max(prev_end);
+        let end = (seg.vaddr + base + seg.mem_size as u64).next_multiple_of(PAGE_SIZE);
+        if start >= end {
+            continue;
+        }
+        let f = &seg.flags;
+        let prot = (f.read as u32 * PROT_READ)
+            | (f.write as u32 * PROT_WRITE)
+            | (f.execute as u32 * PROT_EXEC);
+        vmas.push(anon(start, end, prot));
+        prev_end = end;
+    }
+    let mut stack = anon(stack_bottom, STACK_TOP, PROT_READ | PROT_WRITE);
+    stack.flags |= VM_GROWSDOWN;
+    vmas.push(stack);
+    vmas
 }
 
 /// Load ELF segments into a page table
@@ -347,12 +362,22 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
 
         let mut va = page_start;
         while va < page_end {
-            // Allocate a frame for this page
-            let frame = frame_alloc.alloc_frame().ok_or(ENOMEM)?;
+            // A page shared with the previous segment is filled in place
+            let mapped = page_table.translate(va).map(|p| p & !(PAGE_SIZE - 1));
+            let frame = match mapped {
+                Some(f) => f,
+                None => frame_alloc.alloc_frame().ok_or(ENOMEM)?,
+            };
 
-            // Zero the frame first (for BSS and partial pages)
-            unsafe {
-                ::core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
+            // Zero a new frame first (for BSS and partial pages)
+            if mapped.is_none() {
+                unsafe {
+                    ::core::ptr::write_bytes(
+                        crate::arch::phys_to_virt(frame),
+                        0,
+                        PAGE_SIZE as usize,
+                    );
+                }
             }
 
             // Calculate the offset within the page where segment data starts
@@ -406,9 +431,11 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
             }
 
             // Map the page
-            page_table
-                .map_with_alloc(va, frame, flags, frame_alloc)
-                .map_err(|_| ENOMEM)?;
+            if mapped.is_none() {
+                page_table
+                    .map_with_alloc(va, frame, flags, frame_alloc)
+                    .map_err(|_| ENOMEM)?;
+            }
 
             va += PAGE_SIZE;
         }
@@ -480,11 +507,12 @@ fn read_file_contents(file: &File) -> Result<Vec<u8>, i32> {
 /// On success, this function never returns - it jumps to the new program.
 /// On error, it returns the error code and the process continues.
 pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
-    pathname: &[u8],
+    path: Vec<u8>,
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
     frame_alloc: &mut FA,
 ) -> i32 {
+    let pathname = &path[..];
     // Convert pathname to string for VFS lookup
     let path_str = match core::str::from_utf8(pathname) {
         Ok(s) => s,
@@ -515,8 +543,16 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     // Release all POSIX advisory locks (POSIX semantics: locks released on exec)
     crate::fs::posix_lock::release_all_posix_locks_for_pid(crate::task::percpu::current_pid());
 
-    // Calculate base address
-    let base_addr = if elf.is_pie { USER_PIE_BASE } else { 0 };
+    // PIE images load at ELF_ET_DYN_BASE (aligned to their segments),
+    // ET_EXEC at their link address
+    let base_addr = if elf.is_pie {
+        ELF_ET_DYN_BASE & !(elf.align.max(PAGE_SIZE) - 1)
+    } else {
+        0
+    };
+    if let Err(e) = check_segments(&elf, base_addr) {
+        return -e;
+    }
     let entry_point = elf.entry + base_addr;
 
     // Create new page table for the process
@@ -540,10 +576,21 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         apply_relocations(&elf, base_addr, &new_page_table);
     }
 
-    // Set up user stack with argv, envp
-    let user_sp =
-        match setup_user_stack(&mut new_page_table, frame_alloc, &argv, &envp, entry_point) {
-            Ok(sp) => sp,
+    // Set up user stack with argv, envp and the auxiliary vector
+    let info = ExecInfo {
+        entry: entry_point,
+        phdr: if elf.phdr != 0 {
+            elf.phdr + base_addr
+        } else {
+            0
+        },
+        phent: elf.phent,
+        phnum: elf.phnum,
+        execfn: pathname,
+    };
+    let (user_sp, stack_bottom) =
+        match setup_user_stack(&mut new_page_table, frame_alloc, &argv, &envp, &info) {
+            Ok(r) => r,
             Err(e) => return -e,
         };
 
@@ -565,11 +612,26 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Create fresh MmStruct for the new process (exec replaces address space)
     let mm = crate::mm::create_default_mm();
-    mm.lock().set_brk(start_brk);
+    {
+        let mut m = mm.lock();
+        m.set_brk(start_brk);
+        m.set_exe(file.dentry.full_path());
+        for vma in image_vmas(tid, &elf, base_addr, stack_bottom) {
+            m.insert_vma(vma);
+        }
+    }
     crate::mm::init_task_mm(tid, mm);
 
+    // exec_replace_image never returns: free everything owned here first
+    // (the file image alone is megabytes of heap)
+    drop(elf);
+    drop(elf_data);
+    drop(file);
+    drop(argv);
+    drop(envp);
+    drop(path);
+
     // Update the current task's page table and jump to user mode
-    // This function never returns on success
     percpu::exec_replace_image(new_page_table, entry_point, user_sp);
 }
 
@@ -615,7 +677,7 @@ pub fn sys_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
 
     // Do the exec - on success this never returns, on error returns negative errno
-    let result = do_execve(&path, argv, envp, &mut frame_alloc);
+    let result = do_execve(path, argv, envp, &mut frame_alloc);
     // If we get here, exec failed - result is already negative
     result as i64
 }
@@ -682,7 +744,7 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
     let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
 
     // Do the exec - on success this never returns, on error returns negative errno
-    let result = do_execve(&path, argv, envp, &mut frame_alloc);
+    let result = do_execve(path, argv, envp, &mut frame_alloc);
     // If we get here, exec failed - result is already negative
     result as i64
 }
