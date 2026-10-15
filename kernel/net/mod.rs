@@ -77,6 +77,7 @@ pub mod syscall;
 pub mod sysctl;
 pub mod tcp;
 pub mod udp;
+pub mod unix;
 
 // Re-export commonly used types
 pub use device::{NetDevice, NetDeviceOps, NetDeviceStats};

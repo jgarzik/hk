@@ -162,6 +162,8 @@ pub enum KernelError {
     NotConnected = 107,
     /// Cannot send after transport endpoint shutdown (ESHUTDOWN)
     Shutdown = 108,
+    /// Too many references: cannot splice (ETOOMANYREFS)
+    TooManyRefs = 109,
     /// Connection timed out (ETIMEDOUT)
     TimedOut = 110,
     /// Connection refused (ECONNREFUSED)
@@ -279,6 +281,7 @@ impl KernelError {
             106 => Self::AlreadyConnected,
             107 => Self::NotConnected,
             108 => Self::Shutdown,
+            109 => Self::TooManyRefs,
             110 => Self::TimedOut,
             111 => Self::ConnectionRefused,
             112 => Self::HostDown,

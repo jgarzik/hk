@@ -148,6 +148,16 @@ pub trait ProtoOps: Send + Sync {
     fn inq(&self) -> usize {
         0
     }
+    /// Join this new socket and `other` (same family and type) back to
+    /// back (Linux proto_ops.socketpair; sock_no_socketpair default)
+    fn socketpair(&self, _other: &dyn ProtoOps) -> Result<(), KernelError> {
+        Err(KernelError::OperationNotSupported)
+    }
+    /// Whether EPIPE from sendmsg raises SIGPIPE (Linux: stream
+    /// protocols send it; AF_UNIX datagram/seqpacket sockets do not)
+    fn sigpipe(&self) -> bool {
+        true
+    }
 }
 
 /// Inode private data: the protocol socket (Linux SOCKET_I)
@@ -224,9 +234,10 @@ pub fn sock_create(
 
 type CreateFn = fn(i32, i32) -> Result<Arc<dyn ProtoOps>, KernelError>;
 
-/// Registered families (AF_INET6 joins with IPv6, AF_UNIX in P8,
-/// AF_PACKET in P9; until then socket() is EAFNOSUPPORT for them)
+/// Registered families (AF_INET6 joins with IPv6, AF_PACKET in P9;
+/// until then socket() is EAFNOSUPPORT for them)
 static FAMILIES: &[(u16, CreateFn)] = &[
+    (AF_UNIX, crate::net::unix::create),
     (AF_INET, crate::net::af_inet::create),
     (AF_NETLINK, crate::net::netlink::create),
 ];
@@ -248,7 +259,7 @@ pub fn file_nb(file: &File, flags: i32) -> i32 {
 /// (Linux sock_sendmsg callers / sk_stream_error)
 pub fn sock_sendmsg(s: &dyn ProtoOps, m: &mut SendMsg, flags: i32) -> Result<usize, KernelError> {
     let r = s.sendmsg(m, flags);
-    if r == Err(KernelError::BrokenPipe) && flags & MSG_NOSIGNAL == 0 {
+    if r == Err(KernelError::BrokenPipe) && flags & MSG_NOSIGNAL == 0 && s.sigpipe() {
         let tid = crate::task::percpu::current_tid();
         crate::signal::send_signal(tid, crate::signal::SIGPIPE);
     }
@@ -567,14 +578,7 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
         }
         SO_RCVTIMEO_OLD | SO_RCVTIMEO_NEW => Ok(OptOut::Bytes(timeval_bytes(sk.rcvtimeo()))),
         SO_SNDTIMEO_OLD | SO_SNDTIMEO_NEW => Ok(OptOut::Bytes(timeval_bytes(sk.sndtimeo()))),
-        SO_PEERCRED => {
-            // No peer process for this family: pid 0, overflow uid/gid
-            let mut b = Vec::with_capacity(12);
-            b.extend_from_slice(&0i32.to_ne_bytes());
-            b.extend_from_slice(&65534u32.to_ne_bytes());
-            b.extend_from_slice(&65534u32.to_ne_bytes());
-            Ok(OptOut::Bytes(b))
-        }
+        SO_PEERCRED => Ok(OptOut::Bytes(peercred_bytes(None))),
         SO_BINDTODEVICE => {
             let i = sk.bound_dev_if();
             let mut b = Vec::new();
@@ -589,6 +593,17 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
             int(sk.flag(f) as i32)
         }
     }
+}
+
+/// struct ucred of SO_PEERCRED (Linux cred_to_ucred): without peer
+/// credentials pid 0 and uid/gid -1
+pub fn peercred_bytes(c: Option<(i32, u32, u32)>) -> Vec<u8> {
+    let (pid, uid, gid) = c.unwrap_or((0, u32::MAX, u32::MAX));
+    let mut b = Vec::with_capacity(12);
+    b.extend_from_slice(&pid.to_ne_bytes());
+    b.extend_from_slice(&uid.to_ne_bytes());
+    b.extend_from_slice(&gid.to_ne_bytes());
+    b
 }
 
 /// Copy a getsockopt result out: `len` is the user's (validated >= 0)

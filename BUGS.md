@@ -53,6 +53,29 @@ ping_group_range (hk has no supplementary groups). /proc/net/raw and
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
 
+## AF_UNIX gaps
+
+**Location**: `kernel/net/unix/`
+
+No garbage collector for in-flight sockets: a socket whose only
+references are messages queued on sockets that are themselves only
+reachable that way (e.g. a socket's own descriptor sent to itself, then
+closed) stays allocated with its queue. Linux collects such cycles
+(net/unix/garbage.c). hk bounds them instead: files in flight are
+charged to the sending user and further SCM_RIGHTS sends fail with
+ETOOMANYREFS once the count exceeds RLIMIT_NOFILE (Linux's
+too_many_unix_fds rule), so a user can pin at most about RLIMIT_NOFILE
+files (plus the queues of those sockets, each bounded by SO_SNDBUF and
+max_dgram_qlen). Unlike Linux the count is also capped at 2024 (Linux's
+UNIX_INFLIGHT_SANE_USER), so raising RLIMIT_NOFILE does not raise what
+can be pinned. Socket paths must be UTF-8 (other bytes are EINVAL).
+
+Not implemented: MSG_OOB on streams (EOPNOTSUPP; Linux supports one
+out-of-band byte), SO_PEEK_OFF, SO_PASSPIDFD / SCM_PIDFD /
+SO_PEERPIDFD, SO_PEERGROUPS, SO_INQ / SCM_INQ, SO_RIGHTS_NOTRUNC,
+SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
+mknod(S_IFIFO) still creates a regular file.
+
 ## File permission (DAC) gaps
 
 **Location**: `kernel/fs/dac.rs`, `kernel/task/exec.rs`

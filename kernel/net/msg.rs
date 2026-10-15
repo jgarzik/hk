@@ -390,6 +390,16 @@ impl Cmsg {
         }
     }
 
+    /// The caller's control buffer size (0: no control buffer)
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Bytes still free in the control buffer
+    pub fn room(&self) -> usize {
+        self.cap - self.buf.len()
+    }
+
     /// Append one control message
     pub fn put(&mut self, level: i32, ty: i32, data: &[u8]) {
         let room = self.cap - self.buf.len();

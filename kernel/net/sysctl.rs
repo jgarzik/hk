@@ -53,6 +53,8 @@ pub struct NetSysctl {
     pub frag_low: AtomicUsize,
     /// ipfrag_time in seconds
     pub frag_time: AtomicI32,
+    /// net.unix.max_dgram_qlen (queue limit of new AF_UNIX sockets)
+    pub unix_max_dgram_qlen: AtomicI32,
 }
 
 impl Default for NetSysctl {
@@ -85,6 +87,7 @@ impl Default for NetSysctl {
             frag_high: AtomicUsize::new(4 * 1024 * 1024),
             frag_low: AtomicUsize::new(3 * 1024 * 1024),
             frag_time: AtomicI32::new(30),
+            unix_max_dgram_qlen: AtomicI32::new(10),
         }
     }
 }
@@ -439,6 +442,13 @@ pub static CTLS: &[Ctl] = &[
         mode: 0o644,
         show: || get_i32(|s| &s.somaxconn),
         store: |v| set_int(|s| &s.somaxconn, v, 0, INT_MAX),
+        text: None,
+    },
+    Ctl {
+        path: "net/unix/max_dgram_qlen",
+        mode: 0o644,
+        show: || get_i32(|s| &s.unix_max_dgram_qlen),
+        store: |v| set_int(|s| &s.unix_max_dgram_qlen, v, INT_MIN, INT_MAX),
         text: None,
     },
 ];

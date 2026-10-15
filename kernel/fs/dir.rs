@@ -297,3 +297,29 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
         Err(e) => e.sysret(),
     }
 }
+
+/// Create the socket inode an AF_UNIX bind names (Linux unix_bind_bsd:
+/// filename_create at AT_FDCWD + vfs_mknod(S_IFSOCK)): `perm` is
+/// reduced by the umask, DAC on the parent applies, an existing name is
+/// EEXIST; returns the new dentry
+pub fn mknod_sock(path: &str, perm: u16) -> Result<alloc::sync::Arc<super::Dentry>, KernelError> {
+    let (parent, name) = lookup_parent_at(AT_FDCWD, path)
+        .map_err(|e| KernelError::from_errno(-e as i32).unwrap_or(KernelError::Io))?;
+    let r = create_entry(&parent, &name, |dir, c| {
+        let perm = dac::create_mode(c, dir, perm);
+        dir.i_op
+            .mknod(dir, &name, InodeMode::socket(perm), DevId::from_user(0))
+    });
+    match r {
+        Err(KernelError::OperationNotSupported) => Err(KernelError::NotPermitted),
+        r => r,
+    }
+}
+
+/// Remove the entry `mknod_sock` created when the bind then failed
+/// (Linux unix_bind_bsd out_unlink)
+pub fn unlink_sock(path: &str) {
+    if let Ok((parent, name)) = lookup_parent_at(AT_FDCWD, path) {
+        let _ = delete_entry(&parent, &name, false);
+    }
+}

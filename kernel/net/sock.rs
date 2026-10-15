@@ -281,6 +281,12 @@ impl Sock {
         self.shutdown.store(0, Ordering::Release);
     }
 
+    /// Set shutdown bits without a wakeup (callers holding a protocol
+    /// lock wake after dropping it)
+    pub fn or_shutdown(&self, how: u8) {
+        self.shutdown.fetch_or(how, Ordering::AcqRel);
+    }
+
     pub fn set_shutdown(&self, how: u8) {
         self.shutdown.fetch_or(how, Ordering::AcqRel);
         self.wq.wake_all();
@@ -378,35 +384,42 @@ impl Sock {
         self.wq.wake_all();
     }
 
-    /// Wait until `cond()` (Linux sk_wait_event + sock_intr_errno):
-    /// `timeo` ns (0 = do not wait: EAGAIN; `TIMEO_FOREVER`). Returns
-    /// the time left. A timeout is EAGAIN; a signal is ERESTARTSYS when
-    /// waiting forever, EINTR with a socket timeout (never restarted,
-    /// like Linux).
-    pub fn wait<F: FnMut() -> bool>(&self, timeo: u64, mut cond: F) -> Result<u64, KernelError> {
-        if cond() {
-            return Ok(timeo);
-        }
-        if timeo == 0 {
-            return Err(KernelError::WouldBlock);
-        }
-        if timeo == TIMEO_FOREVER {
-            return match self.wq.wait_event_interruptible(&mut cond) {
-                Ok(()) => Ok(timeo),
-                Err(_) => Err(KernelError::RestartSys),
-            };
-        }
-        // A CLOCK_MONOTONIC deadline, so tick granularity never ends the
-        // wait early
-        let deadline = crate::time::monotonic_ns().saturating_add(timeo);
-        match self
-            .wq
-            .wait_event_interruptible_deadline(&mut cond, Some(deadline))
-        {
-            Ok(true) => Ok(deadline.saturating_sub(crate::time::monotonic_ns()).max(1)),
-            Ok(false) => Err(KernelError::WouldBlock),
-            Err(_) => Err(KernelError::Interrupted),
-        }
+    /// Wait on this socket's queue until `cond()` (`wait_on`)
+    pub fn wait<F: FnMut() -> bool>(&self, timeo: u64, cond: F) -> Result<u64, KernelError> {
+        wait_on(&self.wq, timeo, cond)
+    }
+}
+
+/// Wait on `wq` until `cond()` (Linux sk_wait_event + sock_intr_errno):
+/// `timeo` ns (0 = do not wait: EAGAIN; `TIMEO_FOREVER`). Returns the
+/// time left. A timeout is EAGAIN; a signal is ERESTARTSYS when waiting
+/// forever, EINTR with a socket timeout (never restarted, like Linux).
+/// `wq` may belong to another socket (AF_UNIX waits for room in its
+/// peer's queue); the caller keeps that socket alive.
+pub fn wait_on<F: FnMut() -> bool>(
+    wq: &WaitQueue,
+    timeo: u64,
+    mut cond: F,
+) -> Result<u64, KernelError> {
+    if cond() {
+        return Ok(timeo);
+    }
+    if timeo == 0 {
+        return Err(KernelError::WouldBlock);
+    }
+    if timeo == TIMEO_FOREVER {
+        return match wq.wait_event_interruptible(&mut cond) {
+            Ok(()) => Ok(timeo),
+            Err(_) => Err(KernelError::RestartSys),
+        };
+    }
+    // A CLOCK_MONOTONIC deadline, so tick granularity never ends the
+    // wait early
+    let deadline = crate::time::monotonic_ns().saturating_add(timeo);
+    match wq.wait_event_interruptible_deadline(&mut cond, Some(deadline)) {
+        Ok(true) => Ok(deadline.saturating_sub(crate::time::monotonic_ns()).max(1)),
+        Ok(false) => Err(KernelError::WouldBlock),
+        Err(_) => Err(KernelError::Interrupted),
     }
 }
 

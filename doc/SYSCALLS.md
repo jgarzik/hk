@@ -107,7 +107,8 @@
 - [x] readlink (x86-64 only, legacy; use readlinkat)
 - [x] readlinkat
 - [x] mknod (x86-64 only, legacy; use mknodat)
-- [x] mknodat
+- [x] mknodat (S_IFSOCK makes a socket inode; FIFOs are created as
+  regular files for now)
 - [x] chdir
 - [x] fchdir
 - [x] getcwd
@@ -287,8 +288,9 @@ Linux groups the socket syscalls as their own "network" category.
 Families: AF_INET (SOCK_STREAM/TCP, SOCK_DGRAM/UDP) and AF_NETLINK
 (SOCK_RAW/SOCK_DGRAM, NETLINK_ROUTE: links, IPv4 addresses and routes,
 neighbours; SOL_NETLINK options ADD/DROP_MEMBERSHIP, PKTINFO, NO_ENOBUFS,
-CAP_ACK, EXT_ACK, GET_STRICT_CHK, LIST_MEMBERSHIPS). Other families
-(AF_INET6, AF_UNIX, AF_PACKET) are EAFNOSUPPORT for now.
+CAP_ACK, EXT_ACK, GET_STRICT_CHK, LIST_MEMBERSHIPS), AF_UNIX
+(SOCK_STREAM, SOCK_DGRAM (SOCK_RAW is an alias), SOCK_SEQPACKET). Other
+families (AF_INET6, AF_PACKET) are EAFNOSUPPORT for now.
 
 Sockets are sockfs inodes (fstat S_IFSOCK, /proc/<pid>/fd -> socket:[N]).
 Blocking follows the file's O_NONBLOCK at every call (fcntl, FIONBIO)
@@ -326,7 +328,8 @@ connection to one per 500 ms like tcp_invalid_ratelimit); listeners keep full ch
 - [x] socket (AF_INET: TCP, UDP, ping SOCK_DGRAM/IPPROTO_ICMP gated by
   ping_group_range, SOCK_RAW with CAP_NET_RAW: IP_HDRINCL, SOL_RAW
   ICMP_FILTER; AF_NETLINK)
-- [x] socketpair (AF_INET/AF_NETLINK: EOPNOTSUPP like Linux; AF_UNIX later)
+- [x] socketpair (AF_UNIX all types, peer credentials of the creator;
+  AF_INET/AF_NETLINK: EOPNOTSUPP like Linux)
 - [x] bind (SO_REUSEADDR/SO_REUSEPORT rules, EADDRNOTAVAIL, EACCES < 1024)
 - [x] listen (autobinds; backlog capped at somaxconn 4096; at most
   backlog + 1 connections wait for accept, later SYNs are dropped)
@@ -363,7 +366,32 @@ connection to one per 500 ms like tcp_invalid_ratelimit); listeners keep full ch
 - [x] sendmmsg
 - [x] recvmmsg (MSG_WAITFORONE, timeout)
 - [x] shutdown (ENOTCONN when not connected; TCP SHUT_WR sends a FIN
-  and keeps receiving)
+  and keeps receiving; AF_UNIX mirrors it onto a stream/seqpacket peer)
+
+AF_UNIX (Linux af_unix.c): filesystem names create an S_IFSOCK inode
+(umask, DAC on the directory; EADDRINUSE if it exists; connect needs
+write permission on it; unlink does not unbind), abstract names
+(sun_path[0] == 0) per network namespace and socket type, autobind
+("\0" + 5 hex digits) on bind with only the family or on connect/send
+with SO_PASSCRED; Linux name lengths (unnamed = 2). Streams: listen
+backlog (full: blocks, or EAGAIN), connect completes before accept,
+reads join messages but stop after one carrying files (and, with
+SO_PASSCRED, at a change of sender), SO_SNDBUF bounds what a writer has
+queued, EPIPE + SIGPIPE, ECONNRESET when the peer closed with unread
+data. Datagrams: boundaries, MSG_TRUNC, net.unix.max_dgram_qlen (10)
+for senders the receiver is not connected back to (blocks, EAGAIN, no
+POLLOUT until room), EPERM from a socket connected elsewhere,
+ECONNREFUSED once when a connected peer closed. SEQPACKET: boundaries,
+EOF after the peer closes, EPIPE without SIGPIPE. Ancillary data:
+SCM_RIGHTS (up to 253 files per message, MSG_CTRUNC and the extra files
+closed when the control buffer is short, MSG_CMSG_CLOEXEC, MSG_PEEK
+duplicates), SCM_CREDENTIALS with SO_PASSCRED (senders may only claim
+their own pid and ids without CAP_SYS_ADMIN/CAP_SETUID/CAP_SETGID),
+SO_PEERCRED. In-flight files are capped per user near RLIMIT_NOFILE
+(ETOOMANYREFS). FIONREAD/SIOCINQ/SIOCOUTQ; /proc/net/unix. Not yet:
+MSG_OOB, garbage collection of unreachable in-flight sockets (the cap
+bounds them), SO_PEEK_OFF, SO_PASSPIDFD/SCM_PIDFD, SO_PEERGROUPS,
+SO_INQ, SIOCUNIXFILE.
 
 9. Polling & event notification
 9.1 Select/poll/epoll

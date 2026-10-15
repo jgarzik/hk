@@ -43,7 +43,7 @@ fn nofile() -> u64 {
 }
 
 /// Install `file` in a new descriptor (EMFILE at the limit)
-fn fd_install(file: Arc<File>, cloexec: bool) -> Result<i64, KernelError> {
+pub fn fd_install(file: Arc<File>, cloexec: bool) -> Result<i64, KernelError> {
     let table = crate::task::fdtable::get_task_fd(crate::task::percpu::current_tid())
         .ok_or(KernelError::BadFd)?;
     let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
@@ -71,19 +71,55 @@ pub fn sys_socket(domain: i32, stype: i32, protocol: i32) -> i64 {
     })())
 }
 
-/// socketpair(domain, type, protocol, sv): families without pairs
-/// (AF_INET, AF_NETLINK) are EOPNOTSUPP after validating the arguments
-/// (Linux sock_no_socketpair; `sv` is checked first: EFAULT); AF_UNIX
-/// comes with P8
+/// socketpair(domain, type, protocol, sv) (Linux __sys_socketpair):
+/// `sv` is checked first (EFAULT), families without pairs (AF_INET,
+/// AF_NETLINK) are EOPNOTSUPP (sock_no_socketpair); both descriptors
+/// are installed or neither (EMFILE)
 pub fn sys_socketpair(domain: i32, stype: i32, protocol: i32, sv: u64) -> i64 {
     ret((|| {
-        type_flags(stype & !SOCK_TYPE_MASK)?;
+        let (nb, cloexec) = type_flags(stype & !SOCK_TYPE_MASK)?;
         let cur = get_user::<Uaccess, [i32; 2]>(sv).map_err(|_| KernelError::BadAddress)?;
         put_user::<Uaccess, [i32; 2]>(sv, cur).map_err(|_| KernelError::BadAddress)?;
         let a = sock_create(domain, stype & SOCK_TYPE_MASK, protocol)?;
-        a.release();
-        Err(KernelError::OperationNotSupported)
+        let b = match sock_create(domain, stype & SOCK_TYPE_MASK, protocol) {
+            Ok(b) => b,
+            Err(e) => {
+                a.release();
+                return Err(e);
+            }
+        };
+        if let Err(e) = a.socketpair(&*b) {
+            a.release();
+            b.release();
+            return Err(e);
+        }
+        let fds = install_pair(sock_alloc_file(a, nb), sock_alloc_file(b, nb), cloexec)?;
+        put_user::<Uaccess, [i32; 2]>(sv, fds).map_err(|_| KernelError::BadAddress)?;
+        Ok(0)
     })())
+}
+
+/// Install two files in new descriptors, or neither (an undone first
+/// descriptor's file is dropped after the table lock is released; a
+/// file the table refused is dropped inside it, which is fine for the
+/// fresh sockets passed here)
+fn install_pair(a: Arc<File>, b: Arc<File>, cloexec: bool) -> Result<[i32; 2], KernelError> {
+    let table = crate::task::fdtable::get_task_fd(crate::task::percpu::current_tid())
+        .ok_or(KernelError::BadFd)?;
+    let fl = if cloexec { crate::task::FD_CLOEXEC } else { 0 };
+    let mut t = table.lock();
+    let fd1 = t
+        .alloc_with_flags(a, fl, nofile())
+        .map_err(|_| KernelError::ProcessFileLimit)?;
+    match t.alloc_with_flags(b, fl, nofile()) {
+        Ok(fd2) => Ok([fd1, fd2]),
+        Err(_) => {
+            let undo = t.close(fd1);
+            drop(t);
+            drop(undo);
+            Err(KernelError::ProcessFileLimit)
+        }
+    }
 }
 
 /// The address argument as bytes (empty when none)

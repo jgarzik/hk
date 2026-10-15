@@ -1715,6 +1715,14 @@ do not rely on that.
 | `NlSock.dump` | `spin::Mutex<Option<Dump>>` | thread only (sender's `sendmsg`, reader's `recvmsg`) | running dump cursor; held while it snapshots devices/FIB/ARP and while its part is pushed to `rxq` (keeps parts ordered); never with RTNL |
 | `NlSock.rxq`, `NlSock.dst` | `spin::Mutex` | thread only | leaf; replies, dump parts and notifications are pushed under it (each charged to rcvbuf first), `wq` is woken after it is dropped |
 | `NlSock` portid/groups/flags/err/rmem/congested, autobind `ROVER` | atomics | thread only | |
+| `UnixSock.bindlock` (`net/unix`) | `sync::Mutex<()>` (sleeping) | thread only | Linux u->bindlock: bind/autobind; taken with no spinlock held, before `UnixTable.st`/`BSD`. A path bind runs the VFS mknod (parent `i_rwsem`) first and takes `bindlock` after it returns (Linux nests them; hk does not need to) |
+| `UnixSock.iolock` | `sync::Mutex<()>` (sleeping) | thread only (recvmsg) | Linux u->iolock: one reader across dequeue -> user copy -> consume; dropped before waiting for data; above `st`/`rq` |
+| `UnixSock.st` | `spin::Mutex<Option<Arc<UnixSock>>>` | thread only | Linux unix_state_lock: the peer; `state`, shutdown bits and `dead` change under it. Two at once only as listener -> connecting socket (stream connect; a socket that is not CLOSE fails before taking its own, so listeners never nest) or in ascending address order (`lock2`, Linux unix_state_double_lock: dgram connect, socketpair). Senders queue under the receiver's `st`, so nothing is queued to a released socket |
+| `UnixSock.rq` | `spin::Mutex<RxQueue>` | thread only | receive queue (Linux sk_receive_queue.lock), under `st`; a listener's queue holds embryo connections |
+| `UnixTable.st` (per netns), `unix::BSD` (global, by inode) | `spin::RwLock` | thread only | all sockets + abstract names (per type) / filesystem bindings; after `bindlock`, before `UnixSock.addr` (published under them); lookups return `Arc`s, no socket lock under them |
+| `UnixSock.addr`, `UnixSock.peercred`, `UnixSock.relay` | `spin::RwLock` / `spin::Mutex` | thread only | leaves (Linux u->addr, sk_peer_lock, peer_wait.lock for peer_wake relays); `relay` also guards the registered sockets' `peer_wake` atomics |
+| `unix::scm::INFLIGHT`, `unix::scm::DEFERRED` | `spin::Mutex` | thread only | leaves: per-user in-flight file counts (charged under the receiver's `st`), files awaiting `defer_fput` |
+| `UnixSock` `state`/`dead`/`wmem`/`backlog`/`peer_wake`, `DRAINING` | atomics | thread only | |
 | `NetDevice.net` | `spin::RwLock<Weak<NetNamespace>>` | thread only | read per received packet; written at registration |
 | `NetNamespace.sysctl`, `port_range` (`/proc/sys/net`, `kernel/sysctl.rs`) | atomics | thread only | no locks; a multi-value sysctl (ping_group_range) is one packed `AtomicU64`, so readers never see half an update |
 | `NetDevice.stats`, `flags`, `mtu`, `ifindex`, `carrier` | atomics | any | `flags` holds administrative state only; IFF_RUNNING/IFF_LOWER_UP/operstate are derived on read |
@@ -1739,11 +1747,26 @@ NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
   (RawTable.socks -> Inet.addr; FragTable.st, PmtuCache.m, IcmpRate.st,
    Sock.errq, RxQueue.q: leaves, never held while transmitting)
   -> NlTable.socks -> NlSock.rxq (netlink replies/notifications)
+  (AF_UNIX: UnixSock.bindlock (sleeping) -> UnixTable.st / BSD
+   -> UnixSock.addr; UnixSock.iolock (sleeping) -> UnixSock.st (listener
+   before connector, else by address) -> UnixSock.rq / peercred / addr /
+   INFLIGHT; UnixSock.relay leaf)
   (NlSock.dump -> devices/FIB/ARP snapshots -> NlSock.rxq: dump parts)
   -> device TX lock (e1000 tx)
   -> Softnet.backlog (lo xmit)           Softnet.poll_list / WaitQueue / rq
                                           (IrqSpinlocks, innermost)
 ```
+
+**AF_UNIX** (`net/unix/`, Linux af_unix.c order). Sockets talk
+directly: a sender queues a message on the receiver's `rq` while
+holding the receiver's `st`, after copying the data in with no lock
+held; readers copy out under `iolock` only. Messages (and the files
+they carry) are dropped only with no spinlock held: dropping a file
+can release a socket, which takes its own and its peer's `st`.
+`scm::defer_fput` drops files from one loop, so a chain of sockets in
+flight releases iteratively, never by recursion. Waits (`sock::wait_on`
+on our `Sock.wq` or a peer's `peer_wait`) hold no lock; wakeups follow
+the unlock.
 
 RTNL and `sk_lock` are never held together. No network lock is held
 while taking a socket lock (lookups return `Arc` handles), and no lock is

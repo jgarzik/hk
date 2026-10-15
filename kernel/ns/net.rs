@@ -82,6 +82,9 @@ pub struct NetNamespace {
     /// Raw sockets by protocol
     pub raw: crate::net::raw::RawTable,
 
+    /// AF_UNIX sockets and abstract names
+    pub unix: crate::net::unix::UnixTable,
+
     /// Key of the IP identification hash (Linux ip_id_key)
     pub ip_id_key: [u64; 2],
 
@@ -109,6 +112,7 @@ impl NetNamespace {
             icmp: Default::default(),
             ping: Default::default(),
             raw: Default::default(),
+            unix: Default::default(),
             ip_id_key: [
                 ((crate::random::get_random_u32() as u64) << 32)
                     | crate::random::get_random_u32() as u64,
