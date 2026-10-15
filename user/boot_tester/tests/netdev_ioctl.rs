@@ -6,8 +6,9 @@
 //! Leaves the Ethernet link down without addresses.
 
 use hk_syscall::{
-    sys_close, sys_exit, sys_fork, sys_ioctl, sys_open, sys_read, sys_socket, sys_wait4, AF_INET,
-    O_RDONLY, SOCK_DGRAM, SOCK_RAW,
+    sys_close, sys_exit, sys_fork, sys_ioctl, sys_mmap, sys_munmap, sys_open, sys_read,
+    sys_socket, sys_unlink, sys_wait4, sys_write, AF_INET, MAP_PRIVATE, O_CREAT, O_RDONLY, O_RDWR,
+    O_TRUNC, PROT_READ, SOCK_DGRAM, SOCK_RAW,
 };
 
 use super::helpers::{print, print_num, println};
@@ -59,6 +60,7 @@ pub fn run_tests() {
     test_eth_addr(fd, &eth);
     test_ifconf(fd);
     test_rt(fd, &eth);
+    test_rt_dev_fault(fd);
     test_proc_route();
     test_netlink_fd();
     test_errors(fd, &eth);
@@ -388,6 +390,31 @@ fn test_rt(fd: i32, eth: &Ifr) {
     }
     if del != 0 || del2 != ESRCH || eaf != EAFNOSUPPORT {
         return fail(N, b"del/del2/eafnosupport", del);
+    }
+    ok(N);
+}
+
+/// SIOCADDRT/DELRT whose rt_dev name sits in a file page not faulted
+/// in yet: Linux copies it under RTNL (rtentry_to_fib_config), so the
+/// page fault runs with RTNL held (a sleeping lock)
+fn test_rt_dev_fault(fd: i32) {
+    const N: &[u8] = b"IOC_ROUTE_DEV_FAULT";
+    const PATH: &[u8] = b"/tmp/rt_dev_name\0";
+    let f = sys_open(PATH.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o600);
+    sys_write(f as u64, b"lo\0".as_ptr(), 3);
+    let m = sys_mmap(0, 4096, PROT_READ, MAP_PRIVATE, f as i32, 0);
+    sys_close(f as u64);
+    sys_unlink(PATH.as_ptr());
+    if m < 0 {
+        return fail(N, b"mmap", m);
+    }
+    let mut rt = rtentry([198, 51, 100, 0], [255, 255, 255, 0], [0; 4], RTF_UP, m as *const u8);
+    let p = rt.as_mut_ptr() as u64;
+    let add = sys_ioctl(fd, SIOCADDRT, p);
+    let del = sys_ioctl(fd, SIOCDELRT, p);
+    sys_munmap(m as u64, 4096);
+    if add != 0 || del != 0 {
+        return fail(N, b"add/del", add * 1000 + del);
     }
     ok(N);
 }

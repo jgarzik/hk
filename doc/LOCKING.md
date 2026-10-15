@@ -146,8 +146,9 @@ user page faults, blocking pipe/socket I/O).
   builds; `IrqSpinlock` raises it). Sleeping locks order ABOVE every
   spinlock: a spinlock may be taken under them, never the reverse.
 
-**Used for:** `Inode.i_rwsem` (`RwSem`), `SuperBlock.s_vfs_rename_mutex`
-and `File.f_pos_lock` (`Mutex`).
+**Used for:** `Inode.i_rwsem` (`RwSem`), `SuperBlock.s_vfs_rename_mutex`,
+`File.f_pos_lock`, RTNL (Linux rtnl_mutex), `TcpSock.rd`,
+`UnixSock.bindlock` and `UnixSock.iolock` (`Mutex`).
 
 ### 1.5 Atomic Types
 
@@ -1840,7 +1841,7 @@ do not rely on that.
 | `PacketSock.mclist` | `spin::Mutex<Vec<Mreq>>` | thread only | PACKET_ADD/DROP_MEMBERSHIP list, changed only under RTNL (Linux packet_mc_add takes rtnl_lock); RTNL -> `mclist`, dropped before the device's promiscuity changes (`NetDevice.set_promiscuity`, RTNL held, may call the driver) |
 | `PingTable.socks` (`net/ping.rs`, per netns) | `spin::RwLock` | thread only | ping sockets by echo identifier; receive/error lookups clone the `Arc` and queue after dropping it; reads candidates' `Inet.addr` under it (order table -> Inet.addr) |
 | `Inet.addr` (`net/af_inet.rs`) | `spin::Mutex` | thread only | leaf: addresses/ports of a TCP or UDP socket; read under the UDP/TCP port tables during lookups |
-| `RTNL` (`net/rtnl.rs`) | `spin::Mutex<()>` | thread only (syscalls, kernel config; never softnet) | OUTERMOST network lock: serializes all configuration changes (link up/down + MTU, addresses, routes) from netlink, SIOCS* ioctls and the kernel. Functions needing it take `&RtnlGuard`. Holders never sleep and never take a socket lock (`sk_lock`) |
+| `RTNL` (`net/rtnl.rs`) | `sync::Mutex<()>` (sleeping, Linux rtnl_mutex) | thread only (syscalls, kernel config; never softnet) | OUTERMOST network lock: serializes all configuration changes (link up/down + MTU, addresses, routes) from netlink, SIOCS* ioctls and the kernel. Functions needing it take `&RtnlGuard`. Never taken while any spinlock is held (a socket's last close, which may take it for AF_PACKET memberships, runs only after the fd table lock is dropped). Holders may sleep (user copies such as SIOCADDRT's `rt_dev` name, like Linux rtentry_to_fib_config; driver open/stop waiting for NAPI) but never take a socket lock (`sk_lock`) and never wait for packets |
 | `NetNamespace` tables (`devices`, `loopback`), `UdpTable.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes: RCU-ready); the UDP port table reads each candidate's `Inet.addr` under its lock |
 | `Fib.tables` (`net/inet/fib.rs`, per netns) | `spin::RwLock` | thread only | leaf; written only under RTNL; read by input/output routing (softnet, socket syscalls, possibly under `sk_lock`) and dumps; returns `Arc<FibEntry>` clones; notifications are sent after the guard is dropped |
 | `NetDevice.addrs` (IPv4 list; IPv6 later) | `spin::RwLock` | thread only | leaf; written only under RTNL (`inet::ifaddr`), read via snapshots (`inet_addrs()`) |
@@ -1877,7 +1878,7 @@ do not rely on that.
 **Lock order (outermost first):**
 
 ```
-RTNL (configuration only)        TcpSock.rd (sleeping) -> TcpSock.cb (listener before its new child;
+RTNL (sleeping; configuration)   TcpSock.rd (sleeping) -> TcpSock.cb (listener before its new child;
   |                                 a child never takes its listener's cb) /
   |                                 TimeWait.inner / UdpSock.op / PingSock.op
   |                                 -> TCP bhash -> ehash, lhash / UdpTable.socks /

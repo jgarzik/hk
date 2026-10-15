@@ -166,8 +166,12 @@ fn mc_drop(s: &PacketSock, m: &Mreq) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Drop all memberships (close; Linux packet_flush_mclist)
+/// Drop all memberships (close; Linux packet_flush_mclist: RTNL only
+/// when there are any)
 pub fn flush_mclist(s: &PacketSock) {
+    if s.mclist.lock().is_empty() {
+        return;
+    }
     let r = rtnl::lock();
     let l: Vec<Mreq> = core::mem::take(&mut *s.mclist.lock());
     for e in l {
