@@ -1820,7 +1820,8 @@ do not rely on that.
 | `Softnet.wq` (per CPU) | `WaitQueue` | woken from IRQ | leaf (see Wait Queues) |
 | `Softnet.backlog` (per CPU) | `spin::Mutex<VecDeque<Box<SkBuff>>>` | thread only (`netif_rx`, `softnet/N`, inline flush) | leaf; max 1000 packets, then drop + `rx_dropped` |
 | `dev::TIMER_DUE` | `AtomicBool` | thread (ktimerd sets, softnet/0 clears) | protocol timers are due: softnet/0 runs `tcp::timer::run` with no lock held |
-| `Napi.sched` | `AtomicBool` | IRQ + thread | set by `napi_schedule` (only the setter queues it), cleared by `napi_complete_done` |
+| `Napi.sched`, `Napi.disable` | `AtomicBool` | IRQ + thread | `sched` set by `napi_schedule` (only the setter queues it), cleared by `napi_complete_done` (a SeqCst RMW: a full barrier before the driver re-checks its pending causes, Linux cmpxchg), held by `napi_disable` (driver `stop`, RTNL held, sleeps until a running poll completes) until `napi_enable` (driver `open`); `disable` makes softnet complete an over-budget poll instead of requeueing it |
+| `NetDevice.running` | `AtomicBool` | thread (RTNL writers; NAPI poll readers) | Linux __LINK_STATE_START (`netif_running`): set before the driver's `open`, cleared before its `stop`; polls re-enable device interrupts only while set, checked under the driver's `rx` lock that `stop` takes to mask, so open/close never strand a device masked or leave a stopped one unmasked |
 | `PTYPE_BASE`, `PTYPE_ALL` | `spin::RwLock` (`Vec<..>` / fixed array of taps) | thread only | leaf; handlers copied out, called after unlock. Taps (AF_PACKET) run from `netif_receive_skb` and from `dev_queue_xmit` (PACKET_OUTGOING), i.e. possibly under a caller's socket or neighbour-free transmit path: they take only the AF_PACKET leaves below |
 | `NAPI_LIST`, `SOFTNET_THREADS` | `spin::Mutex<Vec<..>>` | thread only | leaf; registration |
 | `Sock` (`net/sock.rs`, in every protocol socket) | atomics + `Sock.wq` (`WaitQueue`) | any (wakeups) | error, shutdown, buffer sizes, timeouts, SOL_SOCKET flags; one wait queue per socket for readers, writers, connect/accept and pollers (`sk_data_ready`/`sk_write_space`/`sk_state_change` = `wake_all`), always woken after protocol locks are dropped |
@@ -1871,7 +1872,7 @@ do not rely on that.
 | e1000 `pending_icr`, irq counters | atomics | IRQ + thread | ISR ORs ICR causes in; poll swaps them out |
 | virtio-net `rx` queue (`net/driver/virtio_net.rs`) | `spin::Mutex` | thread only (NAPI poll, open) | leaf: virtqueue + bounce buffers; frames are delivered after it is dropped |
 | virtio-net `tx` queue | `spin::Mutex` | thread only (xmit, poll reclaim) | leaf; one descriptor per frame; ring full -> drop, `tx_dropped`, ENOBUFS |
-| virtio-net `opened`, `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` |
+| virtio-net `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` only while `netif_running`, and `stop` suppresses under `rx` |
 | virtio-PCI transport (`virtio/pci.rs`) | none | probe (single-threaded enumeration), then IRQ (ISR byte) | common config written only during probe; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
 | `virtio::DRIVERS` | `spin::Mutex<Vec>` | thread only (boot) | leaf; registered before bus enumeration, read by the PCI match/probe |
 
@@ -1922,18 +1923,24 @@ held across `netif_rx_flush_local()`. Netlink requests are processed in
 the sender's `sendmsg` with no lock held on entry; mutating handlers take
 RTNL. Carrier changes (`netif_carrier_on/off`, from a driver's NAPI poll
 or `open()`) send RTM_NEWLINK without RTNL (NlTable.socks -> NlSock.rxq
-only). A device that is closed while its NAPI poll runs stays masked: the
-poll rewrites IMS only if the device is still up, and `netif_receive_skb`
-drops frames of a down device.
+only). Open/close follow Linux __dev_open/__dev_close: `running` is set
+before the driver's open (which `napi_enable`s, then unmasks) and cleared
+before its stop (which `napi_disable`s, waiting for a running poll, then
+masks under `rx`). A poll re-enables interrupts only while `running`,
+under `rx`: a poll racing with open re-enables them, one racing with
+close leaves the device masked; `netif_receive_skb` drops frames of a
+down device.
 
 **Driver ISR rules (e1000 pattern):** read ICR (read-to-clear; 0 => not
 ours on a shared line, return false), write IMC (mask all), record causes
 in an atomic, `napi_schedule`. The poll handles link changes (LSC ->
 `netif_carrier_on/off`), reclaims TX, receives up to `budget` frames by
 copying them out of coherent bounce buffers, and when it did less than its
-budget calls `napi_complete_done` and rewrites IMS (a cause latched while
-masked fires then). If its own ISR consumed causes during the poll (shared
-line), it reschedules itself.
+budget calls `napi_complete_done` and (while running, under `rx`)
+rewrites IMS (a cause latched while masked fires then). If its own ISR
+consumed causes during the poll (shared line), it masks and reschedules
+itself; `napi_complete_done`'s full barrier orders the ISR's
+`pending_icr` update before this re-check.
 
 **virtio-net** follows the same shape over the virtio transport: the
 transport ISR reads the ISR status byte (read-to-clear; 0 => not ours),

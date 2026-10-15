@@ -43,7 +43,9 @@ use spin::{Mutex, Once};
 
 use crate::bus::driver::{Device, DriverError};
 use crate::dma::DmaCoherent;
-use crate::net::dev::{NAPI_POLL_WEIGHT, Napi, NapiPoll, napi_complete_done, napi_schedule};
+use crate::net::dev::{
+    NAPI_POLL_WEIGHT, Napi, NapiPoll, napi_complete_done, napi_disable, napi_enable, napi_schedule,
+};
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
 use crate::net::{self, KernelError};
@@ -142,8 +144,6 @@ struct VirtioNet {
     rx_cb: VringCb,
     napi: Arc<Napi>,
     netdev: Once<Weak<NetDevice>>,
-    /// Interface open: RX interrupts may be re-enabled
-    opened: AtomicBool,
     /// A config interrupt not yet handled by the poll
     config_pending: AtomicBool,
 }
@@ -249,11 +249,18 @@ impl VirtioNet {
         n
     }
 
-    /// Re-enable RX interrupts after a completed poll; true if work
-    /// arrived meanwhile and the poll must run again
+    /// Re-enable RX interrupts after a completed poll while the device
+    /// is running (checked under `rx`, which `stop` takes to suppress
+    /// them, so a closing device stays suppressed); true if work arrived
+    /// meanwhile and the poll must run again
     fn rearm(&self) -> bool {
-        let pending = !self.rx.lock().vq.enable_cb();
-        pending || self.config_pending.load(Ordering::Acquire)
+        let rx = self.rx.lock();
+        if !self.netdev().is_some_and(|d| d.netif_running()) {
+            return false;
+        }
+        let pending = !rx.vq.enable_cb();
+        drop(rx);
+        pending || self.config_pending.load(Ordering::SeqCst)
     }
 }
 
@@ -292,7 +299,7 @@ impl NapiPoll for VirtioNet {
         if work < budget {
             napi_complete_done(napi, work);
             // A closed device keeps RX interrupts suppressed
-            if self.opened.load(Ordering::Acquire) && self.rearm() {
+            if self.rearm() {
                 self.rx_cb.disable();
                 napi_schedule(&self.napi);
             }
@@ -329,7 +336,7 @@ impl NetDeviceOps for VirtioNetOps {
     fn open(&self, dev: &NetDevice) -> Result<(), KernelError> {
         let d = &self.device;
         d.update_carrier(dev);
-        d.opened.store(true, Ordering::Release);
+        napi_enable(&d.napi);
         if d.rearm() {
             d.rx_cb.disable();
             napi_schedule(&d.napi);
@@ -337,8 +344,10 @@ impl NetDeviceOps for VirtioNetOps {
         Ok(())
     }
 
+    /// NAPI off (waits for a running poll), then suppress RX interrupts
     fn stop(&self) -> Result<(), KernelError> {
-        self.device.opened.store(false, Ordering::Release);
+        napi_disable(&self.device.napi);
+        let _rx = self.device.rx.lock();
         self.device.rx_cb.disable();
         Ok(())
     }
@@ -433,7 +442,6 @@ impl VirtioDriver for VirtioNetDriver {
             rx_cb,
             napi: Napi::new(NAPI_POLL_WEIGHT),
             netdev: Once::new(),
-            opened: AtomicBool::new(false),
             config_pending: AtomicBool::new(false),
         });
         let poller: Weak<dyn NapiPoll> = Arc::downgrade(&device) as Weak<dyn NapiPoll>;

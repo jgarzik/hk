@@ -254,6 +254,11 @@ pub struct NetDevice {
     /// Physical link state (Linux carrier)
     carrier: AtomicBool,
 
+    /// Open (Linux __LINK_STATE_START / netif_running): set before the
+    /// driver's open runs and cleared before its stop, so a NAPI poll
+    /// racing with either sees whether it may re-enable interrupts
+    running: AtomicBool,
+
     /// Number of carrier transitions (IFLA_CARRIER_CHANGES)
     carrier_changes: AtomicU32,
 
@@ -280,6 +285,7 @@ impl NetDevice {
             addrs: RwLock::new(IfAddrs::default()),
             net: RwLock::new(Weak::new()),
             carrier: AtomicBool::new(true),
+            running: AtomicBool::new(false),
             carrier_changes: AtomicU32::new(0),
             promiscuity: AtomicU32::new(0),
             allmulti: AtomicU32::new(0),
@@ -423,16 +429,30 @@ impl NetDevice {
         self.admin_flags() & flags::IFF_LOOPBACK != 0
     }
 
-    /// Open the device (RTNL held; see `rtnl::dev_change_flags`)
+    /// The device is open (Linux netif_running): drivers re-enable
+    /// interrupts after a poll only while it is
+    pub fn netif_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// Open the device (RTNL held; see `rtnl::dev_change_flags`). Like
+    /// Linux __dev_open, running is set before the driver's open, so a
+    /// poll scheduled by an interrupt it enables re-enables them.
     pub(crate) fn open(&self) -> Result<(), KernelError> {
-        self.ops.open(self)?;
+        self.running.store(true, Ordering::SeqCst);
+        if let Err(e) = self.ops.open(self) {
+            self.running.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
         self.flags.fetch_or(flags::IFF_UP, Ordering::AcqRel);
         Ok(())
     }
 
-    /// Close the device (RTNL held)
+    /// Close the device (RTNL held; Linux __dev_close: running is
+    /// cleared before the driver's stop, which disables NAPI)
     pub(crate) fn close(&self) {
         self.flags.fetch_and(!flags::IFF_UP, Ordering::AcqRel);
+        self.running.store(false, Ordering::SeqCst);
         let _ = self.ops.stop();
     }
 

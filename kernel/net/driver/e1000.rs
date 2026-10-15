@@ -41,7 +41,9 @@ use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
 use crate::bus::pci::PciDevice;
 use crate::dma::DmaCoherent;
-use crate::net::dev::{NAPI_POLL_WEIGHT, Napi, NapiPoll, napi_complete_done, napi_schedule};
+use crate::net::dev::{
+    NAPI_POLL_WEIGHT, Napi, NapiPoll, napi_complete_done, napi_disable, napi_enable, napi_schedule,
+};
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
 use crate::net::{self, KernelError};
@@ -498,22 +500,40 @@ impl NapiPoll for E1000 {
 
         if work < budget {
             napi_complete_done(napi, work);
-            // A closed device stays masked (stop() wrote IMC; a frame that
-            // still slips through is dropped by netif_receive_skb)
-            if !self.netdev().is_some_and(|d| d.is_up()) {
-                return work;
-            }
-            self.write_reg(reg::IMS, int::ENABLE);
-            // On a shared line our ISR may have run during the poll (for
-            // another device's interrupt) and consumed ICR causes: those
-            // will not interrupt again, so poll once more (Linux
-            // NAPIF_STATE_MISSED)
-            if self.pending_icr.load(Ordering::Acquire) != 0 {
-                self.write_reg(reg::IMC, 0xFFFF_FFFF);
+            if self.rearm() {
                 napi_schedule(&self.napi);
             }
         }
         work
+    }
+}
+
+impl E1000 {
+    /// Re-enable interrupts after a completed poll while the device is
+    /// running (checked under `rx`, which `stop` takes to mask, so a
+    /// closing device stays masked). True: causes arrived meanwhile,
+    /// interrupts are masked again and the poll must run again.
+    fn rearm(&self) -> bool {
+        let _rx = self.rx.lock();
+        if !self.netdev().is_some_and(|d| d.netif_running()) {
+            return false;
+        }
+        self.write_reg(reg::IMS, int::ENABLE);
+        // On a shared line our ISR may have run during the poll (for
+        // another device's interrupt) and consumed ICR causes: those
+        // will not interrupt again, so poll once more (Linux
+        // NAPIF_STATE_MISSED). napi_complete_done was a full barrier.
+        if self.pending_icr.load(Ordering::SeqCst) != 0 {
+            self.write_reg(reg::IMC, 0xFFFF_FFFF);
+            return true;
+        }
+        false
+    }
+
+    /// Mask every cause (under `rx`, serialized with `rearm`)
+    fn mask(&self) {
+        let _rx = self.rx.lock();
+        self.write_reg(reg::IMC, 0xFFFF_FFFF);
     }
 }
 
@@ -552,12 +572,15 @@ impl NetDeviceOps for E1000Ops {
         let c = self.device.read_reg(reg::CTRL);
         self.device.write_reg(reg::CTRL, c | ctrl::SLU | ctrl::ASDE);
         self.device.write_reg(reg::ITR, 0);
+        napi_enable(&self.device.napi);
         self.device.write_reg(reg::IMS, int::ENABLE);
         Ok(())
     }
 
+    /// Linux e1000_down: NAPI off (waits for a running poll), then mask
     fn stop(&self) -> Result<(), KernelError> {
-        self.device.write_reg(reg::IMC, 0xFFFF_FFFF);
+        napi_disable(&self.device.napi);
+        self.device.mask();
         Ok(())
     }
 }

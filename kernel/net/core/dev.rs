@@ -133,8 +133,12 @@ pub trait NapiPoll: Send + Sync {
 
 /// NAPI context (Linux struct napi_struct)
 pub struct Napi {
-    /// Scheduled: on a poll list or being polled
+    /// Scheduled: on a poll list or being polled (held by
+    /// `napi_disable` while disabled, so it cannot be scheduled)
     sched: AtomicBool,
+    /// `napi_disable` waits: the softnet loop completes it instead of
+    /// polling it again (Linux NAPI_STATE_DISABLE)
+    disable: AtomicBool,
     /// Packets per poll
     weight: usize,
     /// The driver (weak: the driver owns the Napi)
@@ -148,6 +152,7 @@ impl Napi {
     pub fn new(weight: usize) -> Arc<Self> {
         Arc::new(Self {
             sched: AtomicBool::new(false),
+            disable: AtomicBool::new(false),
             weight: weight.clamp(1, NAPI_POLL_WEIGHT),
             poller: Once::new(),
             polls: AtomicU64::new(0),
@@ -212,9 +217,40 @@ pub fn napi_schedule(napi: &Arc<Napi>) {
 
 /// Mark a NAPI poll complete (called by the driver's poll when it did less
 /// than its budget, before re-enabling device interrupts)
+///
+/// A full barrier (SeqCst RMW, like Linux's cmpxchg): an ISR that found
+/// the NAPI still scheduled (its `napi_schedule` was a no-op) recorded
+/// its causes before that, so the driver's re-check of pending causes
+/// after this call sees them.
 pub fn napi_complete_done(napi: &Napi, _work_done: usize) -> bool {
-    napi.sched.store(false, Ordering::Release);
+    napi.sched.swap(false, Ordering::SeqCst);
     true
+}
+
+/// Stop polling `napi` (Linux napi_disable; process context, may
+/// sleep): waits for a scheduled or running poll to complete, then
+/// holds `sched` so it cannot be scheduled again until `napi_enable`
+pub fn napi_disable(napi: &Napi) {
+    napi.disable.store(true, Ordering::SeqCst);
+    while napi.sched.swap(true, Ordering::SeqCst) {
+        napi_wait();
+    }
+    napi.disable.store(false, Ordering::SeqCst);
+}
+
+/// Allow `napi` to be scheduled again (Linux napi_enable)
+pub fn napi_enable(napi: &Napi) {
+    napi.sched.store(false, Ordering::SeqCst);
+}
+
+/// Back off while a poll finishes
+fn napi_wait() {
+    if crate::task::percpu::SCHEDULING_ENABLED.load(Ordering::Acquire) {
+        let ms = crate::time::monotonic_ns() + 1_000_000;
+        let _ = crate::task::percpu::sleep_until_ns(ms, false);
+    } else {
+        core::hint::spin_loop();
+    }
 }
 
 // ============================================================================
@@ -343,8 +379,13 @@ fn softnet_thread(cpu: usize) {
             let work = napi.poll(quota);
             budget = budget.saturating_sub(work);
             if work >= quota {
-                // Not completed: keep polling it (sched stays set)
-                sd.poll_list.lock().push_back(napi);
+                if napi.disable.load(Ordering::SeqCst) {
+                    // napi_disable waits: complete it (Linux __napi_poll)
+                    napi_complete_done(&napi, work);
+                } else {
+                    // Not completed: keep polling it (sched stays set)
+                    sd.poll_list.lock().push_back(napi);
+                }
             }
         }
 
