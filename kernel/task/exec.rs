@@ -525,27 +525,8 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         None => return -ENOMEM,
     };
 
-    // Copy kernel mappings to the new page table
-    #[cfg(target_arch = "aarch64")]
-    {
-        // ARM64: Use dedicated L1 table like fork does, to avoid sharing L1
-        // table with parent which can cause TLB coherency issues.
-        // When we do tlbi vmalle1is (global TLB invalidate), if we share the L1
-        // table with the parent process, the TLB flush affects mappings that the
-        // parent is still using, causing the parent's cached data to become stale.
-        if new_page_table
-            .copy_kernel_mappings_with_alloc(frame_alloc)
-            .is_err()
-        {
-            return -ENOMEM;
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        // x86-64: Sharing PML4[0] is safe because x86 has hardware-coherent caches
-        // and doesn't have ARM's cache maintenance requirements.
-        new_page_table.copy_kernel_mappings();
-    }
+    // Link the kernel half (x86; arm64 keeps the kernel in TTBR1)
+    new_page_table.copy_kernel_mappings();
 
     // Load ELF segments and get the end address for brk initialization
     let segments_end =

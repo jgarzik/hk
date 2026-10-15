@@ -133,12 +133,6 @@ impl Arch for X86_64Arch {
     type VirtAddr = u64;
     type PhysAddr = u64;
 
-    /// User space starts at 4MB (after kernel low memory)
-    const USER_START: u64 = 0x0000_0000_0040_0000;
-
-    /// User space ends at canonical hole (128TB)
-    const USER_END: u64 = 0x0000_8000_0000_0000;
-
     fn user_entry_frame(entry: Self::VirtAddr, user_stack_top: Self::VirtAddr) -> Self::TrapFrame {
         X86_64TrapFrame::new_user(entry, user_stack_top)
     }

@@ -37,3 +37,38 @@ Linux: `Documentation/arch/x86/x86_64/mm.rst`.
 - **Kernel memory**: the heap is a fixed physical range after the boot
   modules, used through the direct map; kernel stacks and DMA buffers
   are physically contiguous frame runs, also through the direct map.
+
+## arm64 (4KB granule, 48-bit virtual)
+
+Linux: `Documentation/arch/arm64/memory.rst`.
+
+| Virtual range | Size | Contents |
+|---|---|---|
+| `0000000000000000 - 0000ffffffffffff` | 256 TB | user space (TTBR0, `TASK_SIZE`) |
+| `ffff000000000000 - ...` | RAM | linear map of RAM (`PAGE_OFFSET` + phys) |
+| `ffff800040100000 - ...` | image | kernel image (`KIMAGE_OFFSET` + phys) |
+| `ffff800100000000 - ffff80013fffffff` | 1 GB | vmalloc/ioremap window |
+| `ffff800200000000 - ffff80023fffffff` | 1 GB | device window: physical 0-1 GB as Device-nGnRnE (`io_va`) |
+
+- **TTBR0** holds only user mappings; kernel threads run with an empty
+  table (Linux `reserved_pg_dir`). **TTBR1** is the kernel table, built
+  once by `kmap::init` and never switched per process.
+- **Kernel image**: QEMU loads the ELF at physical 0x40100000 and
+  enters at the physical entry point with the MMU off. `boot.S` is
+  position independent until it enables the MMU on boot tables (1 GB
+  blocks: an identity map of the kernel's RAM gigabyte in TTBR0; in
+  TTBR1 the first RAM gigabyte, the image and the device window), then
+  jumps to the linked address. W^X as on x86.
+- **Linear map**: the DTB `/memory` range, 1 GB blocks where possible,
+  2 MB otherwise; built after the heap exists (the DTB parser needs
+  it), then TTBR1 is switched from the identity map
+  (`__replace_ttbr1`, Linux `cpu_replace_ttbr1`).
+- **Device window**: an early fixmap for QEMU virt's fixed devices
+  (GIC, PL011, PL031) and PCI MMIO below 1 GB; `ioremap` returns
+  window addresses for that range and maps anything else (PCI ECAM)
+  into the ioremap window.
+- **APs**: PSCI `CPU_ON` enters `ap_entry_point` (physical) with the
+  boot data's physical address; it enables the MMU with the kernel
+  TTBR1 and the identity map, jumps high, and `ap_rust_entry` drops the
+  identity map.
+

@@ -14,6 +14,7 @@ pub mod exceptions;
 pub mod gic;
 pub mod ioremap;
 pub mod irq;
+pub mod kmap;
 pub mod paging;
 pub mod pci_irq;
 pub mod percpu;
@@ -80,11 +81,6 @@ impl Arch for Aarch64Arch {
     type TrapFrame = Aarch64TrapFrame;
     type VirtAddr = u64;
     type PhysAddr = u64;
-
-    /// User space starts at 4MB (skip null page and low addresses)
-    const USER_START: u64 = 0x0000_0000_0040_0000;
-    /// User space ends at TTBR0 limit (48-bit VA space)
-    const USER_END: u64 = 0x0000_FFFF_FFFF_FFFF;
 
     fn user_entry_frame(entry: Self::VirtAddr, user_stack_top: Self::VirtAddr) -> Self::TrapFrame {
         // SPSR: EL0t (return to EL0, use SP_EL0), DAIF clear (interrupts enabled)
@@ -801,40 +797,26 @@ impl SchedArch for Aarch64Arch {
     }
 }
 
-/// Initialize page tables and enable the MMU
-///
-/// This should be called after early_init but before the heap is used.
-/// After this, all memory accesses go through the MMU.
-///
-/// # Safety
-/// Must be called exactly once during early boot.
-pub unsafe fn init_mmu() {
-    unsafe {
-        paging::init_boot_page_tables();
-        paging::enable_mmu();
-    }
-}
-
 // ============================================================================
 // Kernel Init Unification Trait Implementations
 // ============================================================================
 
-// Memory layout constants for aarch64 (QEMU virt machine): frames run
-// from the heap end (placed past the kernel image, `aarch64_heap`) to a
-// fixed end
-const AARCH64_FRAME_ALLOC_END: u64 = 0x5100_0000;
-
 impl MemoryLayoutOps for Aarch64Arch {
     fn get_frame_alloc_region() -> (u64, u64) {
-        // For now, use hardcoded constants for QEMU virt machine
-        // Future: could parse DTB memory node for actual available memory
+        // Frames run from the heap end (placed past the kernel image,
+        // `aarch64_heap`) to the end of the linear-mapped RAM
         let base = crate::HEAP_END.load(core::sync::atomic::Ordering::Relaxed) as u64;
-        assert!(base != 0 && base < AARCH64_FRAME_ALLOC_END);
-        (base, AARCH64_FRAME_ALLOC_END - base)
+        let end = kmap::direct_end();
+        assert!(base != 0 && base < end, "no RAM for frames");
+        (base, end - base)
     }
 
     fn for_each_reserved(f: &mut dyn FnMut(u64, u64)) {
-        if let Some(i) = dtb::extract_initramfs(unsafe { crate::DTB_PTR }) {
+        let dtb = unsafe { crate::DTB_PTR };
+        if let Some(n) = dtb::total_size(dtb) {
+            f(dtb, dtb + n as u64);
+        }
+        if let Some(i) = dtb::extract_initramfs(dtb) {
             f(i.start, i.end);
         }
     }

@@ -4,6 +4,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use super::kmap::pa_symbol;
+use super::paging::phys_to_virt;
 use super::{cpu, exceptions, gic, percpu, power, timer};
 use crate::arch::{AcpiInfo, FrameAlloc};
 use crate::printkln;
@@ -21,8 +23,9 @@ const PAGE_SIZE: usize = 4096;
 pub struct ApBootData {
     /// Stack top for this AP
     pub stack_top: u64,
-    /// Page table base (TTBR0/TTBR1 value)
-    pub ttbr0: u64,
+    /// Kernel page table (TTBR1, physical); boot.S supplies the
+    /// identity map for TTBR0
+    pub ttbr1: u64,
     /// Virtual address of Rust entry point
     pub entry_point: u64,
     /// MPIDR of this CPU
@@ -37,7 +40,7 @@ impl ApBootData {
     const fn zeroed() -> Self {
         Self {
             stack_top: 0,
-            ttbr0: 0,
+            ttbr1: 0,
             entry_point: 0,
             mpidr: 0,
             cpu_id: 0,
@@ -46,7 +49,7 @@ impl ApBootData {
     }
 }
 
-/// Static boot data for each AP (must be in identity-mapped memory)
+/// Static boot data for each AP (read by the AP with the MMU off)
 static mut AP_BOOT_DATA: [ApBootData; percpu::MAX_CPUS] =
     [const { ApBootData::zeroed() }; percpu::MAX_CPUS];
 
@@ -76,12 +79,6 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F
 
     // Initialize BSP per-CPU data
     percpu::init_bsp(bsp_mpidr, bsp_stack_top);
-
-    // Get current page table base
-    let ttbr0: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0);
-    }
 
     // Test PSCI is working
     let psci_ver = power::psci_version();
@@ -127,7 +124,7 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F
         unsafe {
             let boot_data = &mut AP_BOOT_DATA[cpu_id as usize];
             boot_data.stack_top = stack_top;
-            boot_data.ttbr0 = ttbr0;
+            boot_data.ttbr1 = super::kmap::swapper_phys();
             boot_data.entry_point = ap_rust_entry as *const () as u64;
             boot_data.mpidr = target_mpidr;
             boot_data.cpu_id = cpu_id;
@@ -139,10 +136,9 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F
         // Clear ready flag
         AP_READY.store(0, Ordering::SeqCst);
 
-        // Physical address of AP entry point and boot data
-        // Since we use identity mapping, virt == phys for kernel addresses
-        let entry_phys = ap_entry_point as *const () as u64;
-        let context_phys = unsafe { &AP_BOOT_DATA[cpu_id as usize] as *const _ as u64 };
+        // Physical addresses of the AP entry point and its boot data
+        let entry_phys = pa_symbol(ap_entry_point as *const () as u64);
+        let context_phys = pa_symbol(unsafe { &raw const AP_BOOT_DATA[cpu_id as usize] } as u64);
 
         // Call PSCI CPU_ON
         let result = power::psci_cpu_on(target_mpidr, entry_phys, context_phys);
@@ -173,23 +169,13 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F
     total
 }
 
-/// Allocate stack for an AP
+/// Allocate stack for an AP (physically contiguous, through the linear
+/// map); its virtual base
 fn allocate_ap_stack<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) -> Option<u64> {
-    let pages = AP_STACK_SIZE / PAGE_SIZE;
-    let mut base: Option<u64> = None;
-
-    for i in 0..pages {
-        let frame = frame_alloc.alloc_frame()?;
-        if i == 0 {
-            base = Some(frame);
-        }
-        // Zero the frame
-        unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
-        }
-    }
-
-    base
+    let phys = frame_alloc.alloc_contig(AP_STACK_SIZE / PAGE_SIZE)?;
+    let base = phys_to_virt(phys);
+    unsafe { core::ptr::write_bytes(base, 0, AP_STACK_SIZE) };
+    Some(base as u64)
 }
 
 /// Wait for an AP to signal ready using spin loop
@@ -243,8 +229,10 @@ pub fn enable_ap_scheduling() {
 ///
 /// Called from assembly after MMU is enabled.
 #[unsafe(no_mangle)]
-extern "C" fn ap_rust_entry(boot_data: *const ApBootData) -> ! {
-    let boot_data = unsafe { &*boot_data };
+extern "C" fn ap_rust_entry(boot_data_phys: u64) -> ! {
+    // Off the boot identity map; the boot data is in the image
+    super::kmap::drop_idmap();
+    let boot_data = unsafe { &*(super::kmap::kimage_va(boot_data_phys) as *const ApBootData) };
 
     // Initialize per-CPU data
     let cpu_id = percpu::init_ap(boot_data.mpidr, boot_data.stack_top);

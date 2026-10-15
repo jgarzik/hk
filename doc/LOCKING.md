@@ -584,7 +584,8 @@ pub struct BitmapFrameAllocator {
 
 #### Kernel Page Tables (kernel half)
 
-**Location:** `kernel/arch/x86_64/kmap.rs`, `kernel/arch/x86_64/ioremap.rs`;
+**Location:** `kernel/arch/x86_64/kmap.rs`, `kernel/arch/x86_64/ioremap.rs`,
+`kernel/arch/aarch64/kmap.rs`, `kernel/arch/aarch64/ioremap.rs`;
 layout in `doc/MEMORY.md`
 
 - The kernel half (direct map of RAM, kernel image, vmalloc/ioremap
@@ -592,8 +593,9 @@ layout in `doc/MEMORY.md`
   address space exists. Every top-level kernel entry is created then,
   including the (empty) vmalloc table, and never changes afterwards:
   x86 copies PML4[256..512] into each new address space
-  (`copy_kernel_mappings`). Linux: `preallocate_vmalloc_pages`,
-  swapper_pg_dir.
+  (`copy_kernel_mappings`); arm64 keeps the kernel in TTBR1, which no
+  address space owns (TTBR0 is user-only; kernel threads get an empty
+  table). Linux: `preallocate_vmalloc_pages`, swapper_pg_dir.
 - Direct-map and image entries are immutable after boot: read without a
   lock (page walks, `phys_to_virt`/`virt_to_phys` are pure arithmetic).
 - The ioremap window's lower tables are shared by every address space
@@ -601,8 +603,8 @@ layout in `doc/MEMORY.md`
   taken in IRQ context). Under it `FRAME_ALLOCATOR` is taken for new
   table frames; `IOREMAP` is a leaf otherwise (Linux: `vmap_area_lock`
   + `init_mm.page_table_lock`).
-- TLB: ioremap/iounmap flush the local CPU only (`invlpg`); x86 has no
-  kernel TLB shootdown yet, so after
+- TLB: ioremap/iounmap flush with `invlpg` (local) on x86 and
+  `tlbi vae1is` (broadcast) on arm64; x86 has no kernel TLB shootdown yet, so after
   iounmap another CPU may still cache the old translation of a range
   that is handed out again (gap vs Linux `flush_tlb_kernel_range`,
   section 9; drivers do not iounmap in practice).

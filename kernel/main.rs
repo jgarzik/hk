@@ -343,47 +343,22 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
     // Direct serial output for early boot debugging (bypasses console subsystem)
     crate::arch::aarch64::serial::write_str("hk kernel starting... (aarch64)\r\n");
 
-    // Find DTB in memory (QEMU virt ELF boot places DTB at RAM start)
+    // Find DTB in memory (QEMU virt ELF boot places DTB at RAM start);
+    // the boot tables linear-map the first RAM gigabyte
     {
         const DTB_MAGIC_BE: u32 = 0xd00dfeed;
-        let ram_end = 0x6000_0000u64;
-        let kernel_end = 0x4200_0000u64;
-
-        let specific_addrs: [u64; 4] = [0x4000_0000, 0x4008_0000, 0x4400_0000, 0x4800_0000];
-        let mut found_dtb = false;
-        for &addr in &specific_addrs {
-            let magic = unsafe { ::core::ptr::read_volatile(addr as *const u32) };
-            if magic.swap_bytes() == DTB_MAGIC_BE {
-                unsafe {
-                    DTB_PTR = addr;
-                }
-                found_dtb = true;
-                break;
-            }
-        }
-
-        if !found_dtb {
-            let mut scan_addr = kernel_end;
-            while scan_addr < ram_end {
-                let magic = unsafe { ::core::ptr::read_volatile(scan_addr as *const u32) };
-                if magic.swap_bytes() == DTB_MAGIC_BE {
-                    unsafe {
-                        DTB_PTR = scan_addr;
-                    }
-                    break;
-                }
-                scan_addr += 0x1000;
-            }
+        let magic = |pa: u64| unsafe { ::core::ptr::read_volatile(phys_to_virt(pa) as *const u32) };
+        let found = [0x4000_0000, 0x4008_0000, 0x4400_0000, 0x4800_0000]
+            .into_iter()
+            .chain((0x4200_0000u64..0x6000_0000).step_by(0x1000))
+            .find(|&pa| magic(pa).swap_bytes() == DTB_MAGIC_BE);
+        if let Some(pa) = found {
+            unsafe { DTB_PTR = pa };
         }
     }
 
     // Initialize architecture (CPU features, RTC, etc.)
     CurrentArch::early_init();
-
-    // Initialize page tables and enable MMU
-    unsafe {
-        crate::arch::aarch64::init_mmu();
-    }
 
     // Initialize heap allocator
     let (heap_start, heap_size) = aarch64_heap(unsafe { DTB_PTR });
@@ -391,8 +366,12 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
         ALLOCATOR.init(phys_to_virt(heap_start as u64) as usize, heap_size);
     }
 
+    // Final kernel page tables (linear map of all RAM; parsing the DTB
+    // needs the heap)
+    unsafe { crate::arch::aarch64::kmap::init(DTB_PTR) };
+
     // Extract and parse kernel command line from DTB /chosen/bootargs
-    if let Some(cmdline) = crate::arch::aarch64::dtb::extract_bootargs(dtb_ptr as *const u8)
+    if let Some(cmdline) = crate::arch::aarch64::dtb::extract_bootargs(unsafe { DTB_PTR })
         && !cmdline.is_empty()
     {
         printkln!("Cmdline: {}", cmdline);

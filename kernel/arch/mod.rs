@@ -134,11 +134,6 @@ pub trait Arch {
     /// Physical address type
     type PhysAddr: Copy + Eq;
 
-    /// Start of user address space
-    const USER_START: Self::VirtAddr;
-    /// End of user address space
-    const USER_END: Self::VirtAddr;
-
     /// Create a trap frame for entering user mode
     fn user_entry_frame(entry: Self::VirtAddr, user_stack_top: Self::VirtAddr) -> Self::TrapFrame;
 }

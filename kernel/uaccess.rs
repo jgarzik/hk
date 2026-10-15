@@ -40,24 +40,17 @@ pub type UaccessResult<T> = Result<T, UaccessError>;
 /// - User address space bounds checking (`access_ok`)
 /// - SMAP/SMEP or equivalent protection toggling
 pub trait UaccessArch {
-    /// Start of valid user address space
-    const USER_START: u64;
-    /// End of valid user address space (exclusive)
-    const USER_END: u64;
+    /// End of user space (exclusive; Linux TASK_SIZE_MAX)
+    const TASK_SIZE: u64;
 
-    /// Check if a user address range is valid for access
+    /// Check if a user address range is valid
     ///
-    /// Returns true if the entire range [addr, addr+size) is within user space.
-    /// This is equivalent to Linux's `access_ok()` macro.
+    /// True if the whole range [addr, addr+size) lies below TASK_SIZE
+    /// (Linux `access_ok`: no lower bound; a pointer into an unmapped
+    /// low page faults and the copy returns EFAULT).
     fn access_ok(addr: u64, size: usize) -> bool {
-        // Check for overflow
-        let end = match addr.checked_add(size as u64) {
-            Some(e) => e,
-            None => return false,
-        };
-
-        // Check bounds
-        addr >= Self::USER_START && end <= Self::USER_END
+        addr.checked_add(size as u64)
+            .is_some_and(|end| end <= Self::TASK_SIZE)
     }
 
     /// Enable user memory access (for SMAP-enabled CPUs)

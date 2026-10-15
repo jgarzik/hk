@@ -69,28 +69,7 @@ pub fn pan_enabled() -> bool {
 pub struct Aarch64Uaccess;
 
 impl UaccessArch for Aarch64Uaccess {
-    /// Start of valid user address space. The low 2 GB are the kernel's
-    /// identity map (device + kernel RAM, EL1-only) and are present in
-    /// every user TTBR0, so user pointers below this would reach kernel
-    /// memory; user mappings always start at 2 GB (USER_PIE_BASE, mmap).
-    const USER_START: u64 = 0x0000_0000_8000_0000;
-    /// End of valid user address space (48-bit VA with lower half for user)
-    const USER_END: u64 = 0x0001_0000_0000_0000;
-
-    /// Check if a user address range is valid
-    ///
-    /// On aarch64, user space is typically 0x0000_0000_0000_0000 to
-    /// 0x0000_FFFF_FFFF_FFFF (with 48-bit virtual addressing).
-    fn access_ok(addr: u64, size: usize) -> bool {
-        // Check for overflow
-        let end = match addr.checked_add(size as u64) {
-            Some(e) => e,
-            None => return false,
-        };
-
-        // Must be entirely within user space
-        addr >= Self::USER_START && end <= Self::USER_END
-    }
+    const TASK_SIZE: u64 = super::paging::TASK_SIZE;
 
     /// Begin user access (disable PAN if available)
     ///
