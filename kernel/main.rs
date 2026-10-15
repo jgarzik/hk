@@ -108,11 +108,28 @@ use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
 use spin::Mutex;
 
 // Memory layout constants - x86_64
-// NOTE: Heap must not overlap with multiboot2 modules loaded at ~0x200000-0x400000
+// The heap starts at 4MB or above the multiboot2 modules and info (GRUB
+// places them right after the kernel image), whichever is higher, and
+// ends at 18MB where the frame allocator starts (`x86_64_heap`)
 #[cfg(target_arch = "x86_64")]
-const KERNEL_HEAP_START: usize = 0x400000; // 4MB (above multiboot modules)
+const KERNEL_HEAP_START: usize = 0x400000; // 4MB
 #[cfg(target_arch = "x86_64")]
 const KERNEL_HEAP_SIZE: usize = 0xE00000; // 14MB (up to 18MB where frame allocator starts)
+
+/// x86 heap (start, size): never over the boot modules, which are read
+/// after the heap is in use (a fixed 4MB start broke once kernel +
+/// initramfs + vfat image passed 4MB)
+#[cfg(target_arch = "x86_64")]
+fn x86_64_heap(multiboot_info: u64) -> (usize, usize) {
+    let end = KERNEL_HEAP_START + KERNEL_HEAP_SIZE;
+    let boot_end = unsafe { multiboot2::boot_data_end(multiboot_info) } as usize;
+    let start = KERNEL_HEAP_START.max(boot_end.next_multiple_of(4096));
+    assert!(
+        start + 0x400000 <= end,
+        "multiboot modules leave no room for the heap"
+    );
+    (start, end - start)
+}
 
 // Memory layout constants - aarch64
 // QEMU virt machine loads kernel at 0x40000000
@@ -192,8 +209,9 @@ pub extern "C" fn _start(multiboot_info: u64) -> ! {
     }
 
     // Initialize heap allocator
+    let (heap_start, heap_size) = x86_64_heap(multiboot_info);
     unsafe {
-        ALLOCATOR.init(KERNEL_HEAP_START, KERNEL_HEAP_SIZE);
+        ALLOCATOR.init(heap_start, heap_size);
     }
 
     // Initialize architecture-specific code (GDT, IDT, PIC, PIT)
