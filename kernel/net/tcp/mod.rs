@@ -386,7 +386,8 @@ impl TcpSock {
             }
             return;
         }
-        if !s.has(flags::SYN) {
+        // Only a plain SYN opens (Linux drops SYN+FIN in LISTEN)
+        if !s.has(flags::SYN) || s.has(flags::FIN) {
             return;
         }
         let g = self.cb.lock();

@@ -317,7 +317,9 @@ pub fn parse(b: &[u8]) -> Option<(u16, u16, SegIn<'_>)> {
     Some((be16(0), be16(2), s))
 }
 
-/// The MSS option of a SYN, if present and well formed
+/// The MSS option, if present and well formed (Linux
+/// tcp_parse_options: parsing stops at EOL, a length below 2 or past the
+/// header; an MSS of 0 is ignored)
 fn mss_opt(mut o: &[u8]) -> Option<u16> {
     while let Some(&k) = o.first() {
         match k {
@@ -329,7 +331,8 @@ fn mss_opt(mut o: &[u8]) -> Option<u16> {
                     return None;
                 }
                 if k == OPT_MSS && l == 4 {
-                    return Some(u16::from_be_bytes([o[2], o[3]]));
+                    let m = u16::from_be_bytes([o[2], o[3]]);
+                    return (m != 0).then_some(m);
                 }
                 o = &o[l..];
             }
@@ -343,12 +346,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn header_bounds() {
+        let mut h = [0u8; 24];
+        h[12] = 0x40; // doff 4 words: below the minimum
+        assert!(parse(&h).is_none());
+        h[12] = 0x70; // doff 28 bytes > segment
+        assert!(parse(&h).is_none());
+        h[12] = 0x60;
+        h[20..24].copy_from_slice(&[2, 4, 0, 0]);
+        let (_, _, s) = parse(&h).unwrap();
+        assert_eq!((s.mss, s.data.len()), (None, 0));
+        h[22..24].copy_from_slice(&[0x05, 0xb4]);
+        assert_eq!(parse(&h).unwrap().2.mss, Some(1460));
+        // An option running past the header is not read
+        h[20..24].copy_from_slice(&[1, 2, 4, 5]);
+        assert_eq!(parse(&h[..24]).unwrap().2.mss, None);
+        assert!(parse(&h[..19]).is_none());
+    }
+
+    #[test]
     fn options() {
         assert_eq!(mss_opt(&[1, 1, 2, 4, 0x05, 0xb4]), Some(1460));
         assert_eq!(mss_opt(&[3, 3, 7, 2, 4, 0x02, 0x18]), Some(536));
         assert_eq!(mss_opt(&[0, 2, 4, 1, 1]), None);
         assert_eq!(mss_opt(&[2, 9, 0]), None);
         assert_eq!(mss_opt(&[8, 0]), None);
+        assert_eq!(mss_opt(&[8, 1, 2, 4, 5, 0]), None);
+        assert_eq!(mss_opt(&[2, 4, 5]), None);
     }
 
     #[test]
