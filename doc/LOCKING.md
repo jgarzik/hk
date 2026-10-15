@@ -342,8 +342,10 @@ pub needs_reschedule: AtomicBool, // Reschedule request flag
 4. **`context_switch_first()`** - An exiting task (`exit_current`) keeps
    the lock held across its final switch like any other switch (the guard
    is forgotten; the next task releases it), so nothing runs on this CPU
-   between leaving the dead task and the next task taking over. Only the
-   boot-time first switch (`try_schedule`) drops it before switching.
+   between leaving the dead task and the next task taking over. The
+   boot-time first switch (`try_schedule`) does the same, so the per-CPU
+   preempt count stays balanced (dropping the guard there and releasing
+   again in `finish_context_switch` left it at -1).
 
 5. **Timer ISR only touches local CPU** - `wake_sleepers()` drains the local
    `wake_list` and wakes expired sleepers of the local sleep queue only.

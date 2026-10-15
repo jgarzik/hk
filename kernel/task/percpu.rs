@@ -3106,7 +3106,10 @@ pub fn try_schedule() {
     CurrentArch::set_current_tid(next);
     CurrentArch::set_current_task(&next_task);
     sched.nr_switches.fetch_add(1, Ordering::Relaxed);
-    drop(rq); // context_switch_first never returns
+    // Held across the switch like any other: the task switched to
+    // releases it (finish_context_switch or its own guard). Dropping it
+    // here left the per-CPU preempt count at -1 after that release.
+    core::mem::forget(rq); // context_switch_first never returns
     unsafe {
         CurrentArch::context_switch_first(next_ctx, next_kstack, next_cr3, next);
     }
