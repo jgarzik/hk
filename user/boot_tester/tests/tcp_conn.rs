@@ -18,6 +18,7 @@ const POLLIN: i16 = 1;
 const POLLOUT: i16 = 4;
 const POLLRDHUP: i16 = 0x2000;
 const SYN_RETRIES: &[u8] = b"/proc/sys/net/ipv4/tcp_syn_retries\0";
+const PORTS: &[u8] = b"/proc/sys/net/ipv4/ip_local_port_range\0";
 
 pub fn run_tests() {
     super::helpers::println(b"=== TCP Connection Tests ===");
@@ -26,6 +27,7 @@ pub fn run_tests() {
     test_rst_unread();
     test_linger0();
     test_time_wait_bind();
+    test_ephemeral_owners();
     test_eth0_refused();
     test_connect_timeout();
 }
@@ -182,6 +184,35 @@ fn test_time_wait_bind() {
     let s2 = accept(r);
     t.ok(b"accept", s2 >= 0, s2 as i64);
     for f in [c2, s2, r] {
+        close(f);
+    }
+    t.done();
+}
+
+/// connect() never takes a port another socket bound, and shares a port
+/// it chose only between different four-tuples (Linux
+/// __inet_hash_connect)
+fn test_ephemeral_owners() {
+    let mut t = T::new(b"TCP_EPHEMERAL_OWNERS");
+    let mut old = [0u8; 32];
+    let n = read_file(PORTS, &mut old);
+    let (l1, p1) = listener(4);
+    let (l2, p2) = listener(4);
+    t.ok(b"set range", write_file(PORTS, b"40100 40101\n") > 0, 0);
+    let b = tcp();
+    t.eq(b"bind", bind(b, LO, 40100), 0);
+    let c1 = tcp();
+    t.eq(b"connect 1", connect(c1, LO, p1), 0);
+    t.eq(b"skips bound port", port(c1) as i64, 40101);
+    let c2 = tcp();
+    t.eq(b"same tuple", connect(c2, LO, p1), EADDRNOTAVAIL);
+    let c3 = tcp();
+    t.eq(b"other peer", connect(c3, LO, p2), 0);
+    t.eq(b"port shared", port(c3) as i64, 40101);
+    if n > 0 {
+        write_file(PORTS, &old[..n as usize]);
+    }
+    for f in [b, c1, c2, c3, l1, l2] {
         close(f);
     }
     t.done();
