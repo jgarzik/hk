@@ -5,7 +5,7 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_clone, sys_execve, sys_exit, sys_fork, sys_kill, sys_nanosleep, sys_setrlimit, sys_setuid, sys_wait4,
+    sys_clone, sys_execve, sys_exit, sys_fork, sys_kill, sys_nanosleep, sys_sched_yield, sys_setrlimit, sys_setuid, sys_wait4,
     RLimit, Timespec, CLONE_SIGHAND, CLONE_VM, RLIMIT_NPROC,
 };
 
@@ -19,6 +19,83 @@ pub fn run_tests() {
     run(b"RLIMIT_NPROC", nproc);
     run(b"RLIMIT_NPROC_ROOT_EXEMPT", root_exempt);
     run(b"RLIMIT_NPROC_SETUID_EXEC", setuid_exec);
+    run(b"RLIMIT_NPROC_CHURN", churn);
+}
+
+/// 2000 processes and 2000 threads created and released under a low
+/// limit leave the count where it started
+fn churn() -> u64 {
+    if sys_setuid(4244) != 0 {
+        return 1;
+    }
+    // One extra task at a time: the threads share one static stack
+    let lim = RLimit { rlim_cur: 2, rlim_max: 3 };
+    if sys_setrlimit(RLIMIT_NPROC, &lim) != 0 {
+        return 2;
+    }
+    for _ in 0..2000 {
+        // The previous thread may still be exiting: retry while busy
+        let mut tries = 0;
+        let pid = loop {
+            let pid = sys_fork();
+            if pid != EAGAIN {
+                break pid;
+            }
+            tries += 1;
+            if tries > 100_000 {
+                return 3;
+            }
+            sys_sched_yield();
+        };
+        if pid == 0 {
+            sys_exit(0);
+        }
+        if pid < 0 {
+            return 7;
+        }
+        sys_wait4(pid, core::ptr::null_mut(), 0, 0);
+        let mut tries = 0;
+        while thread() == EAGAIN {
+            tries += 1;
+            if tries > 100_000 {
+                return 4;
+            }
+            sys_sched_yield();
+        }
+    }
+    // Wait for the last thread's slot, then the count is back to 1
+    let mut tries = 0;
+    loop {
+        let pid = sys_fork();
+        if pid > 0 {
+            sys_wait4(pid, core::ptr::null_mut(), 0, 0);
+            break;
+        }
+        if pid == 0 {
+            sys_exit(0);
+        }
+        tries += 1;
+        if tries > 100_000 {
+            return 5;
+        }
+        sys_sched_yield();
+    }
+    let lim = RLimit { rlim_cur: 3, rlim_max: 3 };
+    sys_setrlimit(RLIMIT_NPROC, &lim);
+    let a = sleeper();
+    let b = sleeper();
+    let c = sys_fork();
+    let ok = a > 0 && b > 0 && c == EAGAIN;
+    for k in [a, b] {
+        if k > 0 {
+            sys_kill(k, SIGKILL);
+            sys_wait4(k, core::ptr::null_mut(), 0, 0);
+        }
+    }
+    if c == 0 {
+        sys_exit(0);
+    }
+    if ok { 0 } else { 6 }
 }
 
 /// Run `f` in a child; it returns the failed step, 0 on success

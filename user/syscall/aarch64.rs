@@ -2738,3 +2738,11 @@ pub fn sys_getitimer(which: i32, curr: *mut super::ITimerVal) -> i64 {
 pub fn sys_setitimer(which: i32, new: *const super::ITimerVal, old: *mut super::ITimerVal) -> i64 {
     unsafe { syscall3!(SYS_SETITIMER, which, new, old) }
 }
+
+pub const SYS_SCHED_YIELD: u64 = 124;
+
+/// sched_yield()
+#[inline(always)]
+pub fn sys_sched_yield() -> i64 {
+    unsafe { syscall0!(SYS_SCHED_YIELD) }
+}

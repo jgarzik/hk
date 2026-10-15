@@ -2498,3 +2498,11 @@ pub fn sys_setitimer(which: i32, new: *const super::ITimerVal, old: *mut super::
 pub fn sys_alarm(seconds: u32) -> i64 {
     unsafe { syscall1!(SYS_ALARM, seconds) }
 }
+
+pub const SYS_SCHED_YIELD: u64 = 24;
+
+/// sched_yield()
+#[inline(always)]
+pub fn sys_sched_yield() -> i64 {
+    unsafe { syscall0!(SYS_SCHED_YIELD) }
+}
