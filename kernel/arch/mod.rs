@@ -239,6 +239,13 @@ pub trait FrameAlloc {
 
     /// Free a physical frame
     fn free_frame(&mut self, frame: Self::PhysAddr);
+
+    /// Allocate `n` physically contiguous frames (n a power of two up
+    /// to 64, aligned to n frames): kernel stacks. None if unsupported
+    /// or no such run is free.
+    fn alloc_contig(&mut self, _n: usize) -> Option<Self::PhysAddr> {
+        None
+    }
 }
 
 // ============================================================================

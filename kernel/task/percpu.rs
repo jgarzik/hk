@@ -480,21 +480,15 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
     };
     let pid = 0;
 
-    // Allocate the kernel stack (consecutive frames, as for clone)
+    // Allocate the kernel stack (physically contiguous: it is used
+    // through the direct map)
     let stack_pages = stack_size / PAGE_SIZE as usize;
-    let mut stack_base: Option<u64> = None;
-    for i in 0..stack_pages {
-        let frame = frame_alloc
-            .alloc_frame()
-            .ok_or("Out of memory for kernel thread stack")?;
-        if i == 0 {
-            stack_base = Some(frame);
-        }
-        unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
-        }
+    let stack_base = frame_alloc
+        .alloc_contig(stack_pages)
+        .ok_or("Out of memory for kernel thread stack")?;
+    unsafe {
+        core::ptr::write_bytes(stack_base as *mut u8, 0, stack_size);
     }
-    let stack_base = stack_base.unwrap();
     let stack_top = stack_base + stack_size as u64;
 
     let context = TaskContext::new_kernel_thread(entry, stack_top);
@@ -1172,24 +1166,13 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         (tid, pid)
     };
 
-    // Allocate kernel stack for child (16KB = 4 pages)
+    // Allocate kernel stack for child (16KB = 4 pages, physically
+    // contiguous: separately allocated frames need not be adjacent)
     let stack_pages = KERNEL_STACK_SIZE / PAGE_SIZE as usize;
-    let mut stack_base: Option<u64> = None;
-
-    for i in 0..stack_pages {
-        let frame = try_with_cleanup!(frame_alloc.alloc_frame().ok_or(12)); // ENOMEM
-
-        if i == 0 {
-            stack_base = Some(frame);
-        }
-
-        // Zero the page
-        unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
-        }
+    let stack_base = try_with_cleanup!(frame_alloc.alloc_contig(stack_pages).ok_or(12)); // ENOMEM
+    unsafe {
+        core::ptr::write_bytes(stack_base as *mut u8, 0, KERNEL_STACK_SIZE);
     }
-
-    let stack_base = stack_base.unwrap();
     let kstack_top = stack_base + KERNEL_STACK_SIZE as u64;
 
     // Determine page table

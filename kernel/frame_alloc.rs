@@ -43,6 +43,30 @@ struct BitmapFrameAllocatorInner {
     total_frames: usize,
     /// Next hint for free frame search
     next_free: usize,
+    /// Free frames (set bits in `bitmap`), kept exact by `set_free`
+    free: usize,
+}
+
+impl BitmapFrameAllocatorInner {
+    /// Mark frame `idx` free or used, keeping the free count exact (a
+    /// double free or double mark changes nothing)
+    fn set_free(&mut self, idx: usize, free: bool) {
+        let (w, b) = (idx / 64, 1u64 << (idx % 64));
+        let was = self.bitmap[w] & b != 0;
+        if free && !was {
+            self.bitmap[w] |= b;
+            self.free += 1;
+        } else if !free && was {
+            self.bitmap[w] &= !b;
+            self.free -= 1;
+        }
+    }
+
+    /// Set a whole bitmap word (huge pages), keeping the free count exact
+    fn set_word(&mut self, w: usize, v: u64) {
+        self.free = self.free + v.count_ones() as usize - self.bitmap[w].count_ones() as usize;
+        self.bitmap[w] = v;
+    }
 }
 
 impl BitmapFrameAllocator {
@@ -55,6 +79,7 @@ impl BitmapFrameAllocator {
                 base: 0,
                 total_frames: 0,
                 next_free: 0,
+                free: 0,
             }),
         }
     }
@@ -77,6 +102,7 @@ impl BitmapFrameAllocator {
         if remaining > 0 {
             inner.bitmap[full_words] = (1u64 << remaining) - 1;
         }
+        inner.free = inner.total_frames;
     }
 
     /// Allocate a physical frame (thread-safe, takes &self)
@@ -96,7 +122,7 @@ impl BitmapFrameAllocator {
 
                 if frame < inner.total_frames {
                     // Mark as used
-                    inner.bitmap[word_idx] &= !(1u64 << bit);
+                    inner.set_free(frame, false);
                     inner.next_free = frame + 1;
                     // Set initial refcount to 1
                     inner.refcounts[frame] = 1;
@@ -123,9 +149,7 @@ impl BitmapFrameAllocator {
 
         let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
         if frame_idx < inner.total_frames {
-            let word = frame_idx / 64;
-            let bit = frame_idx % 64;
-            inner.bitmap[word] |= 1u64 << bit;
+            inner.set_free(frame_idx, true);
             inner.refcounts[frame_idx] = 0;
 
             // Update hint
@@ -170,9 +194,7 @@ impl BitmapFrameAllocator {
 
             if inner.refcounts[frame_idx] == 0 {
                 // Frame is no longer referenced, free it
-                let word = frame_idx / 64;
-                let bit = frame_idx % 64;
-                inner.bitmap[word] |= 1u64 << bit;
+                inner.set_free(frame_idx, true);
 
                 // Update hint
                 if frame_idx < inner.next_free {
@@ -222,9 +244,7 @@ impl BitmapFrameAllocator {
         for i in 0..num_frames {
             let frame = start_frame + i;
             if frame < inner.total_frames {
-                let word = frame / 64;
-                let bit = frame % 64;
-                inner.bitmap[word] &= !(1u64 << bit);
+                inner.set_free(frame, false);
             }
         }
     }
@@ -276,7 +296,7 @@ impl BitmapFrameAllocator {
             if all_free {
                 // Mark all 512 frames as used (set all 8 words to 0)
                 for w in 0..WORDS_PER_HUGE_PAGE {
-                    inner.bitmap[word_start + w] = 0;
+                    inner.set_word(word_start + w, 0);
                 }
 
                 // Set refcount for the head frame (we track huge pages by head frame only)
@@ -321,7 +341,7 @@ impl BitmapFrameAllocator {
 
         // Mark all 512 frames as free (set all 8 words to all 1s)
         for w in 0..WORDS_PER_HUGE_PAGE {
-            inner.bitmap[word_start + w] = !0u64;
+            inner.set_word(word_start + w, !0u64);
         }
 
         // Clear refcount for head frame
@@ -387,7 +407,7 @@ impl BitmapFrameAllocator {
             let word_start = frame_idx / 64;
 
             for w in 0..WORDS_PER_HUGE_PAGE {
-                inner.bitmap[word_start + w] = !0u64;
+                inner.set_word(word_start + w, !0u64);
             }
 
             // Update hint
@@ -454,6 +474,10 @@ impl BitmapFrameAllocator {
 impl FrameAlloc for BitmapFrameAllocator {
     type PhysAddr = u64;
 
+    fn alloc_contig(&mut self, n: usize) -> Option<Self::PhysAddr> {
+        BitmapFrameAllocator::alloc_contig(self, n)
+    }
+
     fn alloc_frame(&mut self) -> Option<Self::PhysAddr> {
         // Delegate to shared implementation
         (&*self).alloc_frame()
@@ -469,6 +493,10 @@ impl FrameAlloc for BitmapFrameAllocator {
 /// This works because BitmapFrameAllocator uses interior mutability (Mutex)
 impl FrameAlloc for &BitmapFrameAllocator {
     type PhysAddr = u64;
+
+    fn alloc_contig(&mut self, n: usize) -> Option<Self::PhysAddr> {
+        BitmapFrameAllocator::alloc_contig(self, n)
+    }
 
     fn alloc_frame(&mut self) -> Option<Self::PhysAddr> {
         let mut inner = self.inner.lock();
@@ -486,7 +514,7 @@ impl FrameAlloc for &BitmapFrameAllocator {
 
                 if frame < inner.total_frames {
                     // Mark as used
-                    inner.bitmap[word_idx] &= !(1u64 << bit);
+                    inner.set_free(frame, false);
                     inner.next_free = frame + 1;
 
                     let phys_addr = inner.base + (frame as u64 * FRAME_SIZE as u64);
@@ -507,9 +535,7 @@ impl FrameAlloc for &BitmapFrameAllocator {
 
         let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
         if frame_idx < inner.total_frames {
-            let word = frame_idx / 64;
-            let bit = frame_idx % 64;
-            inner.bitmap[word] |= 1u64 << bit;
+            inner.set_free(frame_idx, true);
 
             // Update hint
             if frame_idx < inner.next_free {
@@ -563,6 +589,41 @@ impl BitmapFrameAllocator {
     }
 }
 
+impl BitmapFrameAllocator {
+    /// Allocate `n` contiguous frames (n a power of two, 1..=64, aligned
+    /// to n frames), each with refcount 1
+    pub fn alloc_contig(&self, n: usize) -> Option<u64> {
+        if n == 0 || n > 64 || !n.is_power_of_two() {
+            return None;
+        }
+        let mut inner = self.inner.lock();
+        let num_words = inner.total_frames.div_ceil(64);
+        let run = if n == 64 { !0u64 } else { (1u64 << n) - 1 };
+        for offset in 0..num_words {
+            let w = (inner.next_free / 64 + offset) % num_words;
+            let word = inner.bitmap[w];
+            for k in 0..64 / n {
+                let mask = run << (k * n);
+                let first = w * 64 + k * n;
+                if word & mask == mask && first + n <= inner.total_frames {
+                    inner.set_word(w, word & !mask);
+                    for f in first..first + n {
+                        inner.refcounts[f] = 1;
+                    }
+                    return Some(inner.base + (first * FRAME_SIZE) as u64);
+                }
+            }
+        }
+        None
+    }
+
+    /// Free frames now (exact, O(1))
+    pub fn free_frames(&self) -> usize {
+        self.inner.lock().free
+    }
+
+}
+
 impl Default for BitmapFrameAllocator {
     fn default() -> Self {
         Self::new()
@@ -574,6 +635,10 @@ pub struct FrameAllocRef<'a>(pub &'a BitmapFrameAllocator);
 
 impl FrameAlloc for FrameAllocRef<'_> {
     type PhysAddr = u64;
+
+    fn alloc_contig(&mut self, n: usize) -> Option<Self::PhysAddr> {
+        self.0.alloc_contig(n)
+    }
 
     fn alloc_frame(&mut self) -> Option<Self::PhysAddr> {
         self.0.alloc()

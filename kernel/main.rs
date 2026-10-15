@@ -1086,21 +1086,13 @@ fn kmain() -> ! {
         const INIT_KERNEL_STACK_SIZE: usize = 16 * 1024;
         const FRAME_SIZE: usize = 4096;
         let stack_pages = INIT_KERNEL_STACK_SIZE / FRAME_SIZE;
-        let mut stack_base: Option<u64> = None;
-
-        for i in 0..stack_pages {
-            let frame = frame_alloc
-                .alloc_frame()
-                .expect("Failed to allocate kernel stack for init");
-            if i == 0 {
-                stack_base = Some(frame);
-            }
-            unsafe {
-                ::core::ptr::write_bytes(frame as *mut u8, 0, FRAME_SIZE);
-            }
+        let stack_base = frame_alloc
+            .alloc_contig(stack_pages)
+            .expect("Failed to allocate kernel stack for init");
+        unsafe {
+            ::core::ptr::write_bytes(stack_base as *mut u8, 0, INIT_KERNEL_STACK_SIZE);
         }
-
-        stack_base.unwrap() + INIT_KERNEL_STACK_SIZE as u64
+        stack_base + INIT_KERNEL_STACK_SIZE as u64
     };
 
     printkln!("KERNEL_READY");
