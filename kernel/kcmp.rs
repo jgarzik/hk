@@ -163,8 +163,11 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
 
     match kcmp_type {
         KCMP_FILE => {
-            // Compare specific file descriptors
-            let ptr1 = match &task1.files {
+            // Compare specific file descriptors; the tables are locked
+            // after TASK_TABLE is dropped (order: fd table -> TASK_TABLE)
+            let (files1, files2) = (task1.files.clone(), task2.files.clone());
+            drop(table);
+            let ptr1 = match &files1 {
                 Some(files) => {
                     let fd_table = files.lock();
                     match fd_table.get(idx1 as i32) {
@@ -175,7 +178,7 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
                 None => return KernelError::BadFd.sysret(),
             };
 
-            let ptr2 = match &task2.files {
+            let ptr2 = match &files2 {
                 Some(files) => {
                     let fd_table = files.lock();
                     match fd_table.get(idx2 as i32) {

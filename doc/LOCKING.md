@@ -217,7 +217,11 @@ Filesystem context locks (TASK_FS)
 Per-CPU scheduler locks (IrqSpinlock)  ← IRQ-safe, can hold while acquiring below
     ↓
 Global subsystem locks (TASK_TABLE, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-safe;
-    no file is released under `Files` (3.3, Descriptor Tables)
+    no file is released under `Files` (3.3, Descriptor Tables); order
+    `Files` -> TASK_TABLE (descriptor allocation reads RLIMIT_NOFILE
+    under the table lock; kcmp clones the tables out of TASK_TABLE and
+    locks them after dropping it); no user memory is accessed under any
+    of them
     ↓
 Address space: Mm lock (mmap_lock) → AnonVma, LRU  ← never nested with TASK_TABLE (3.2)
     ↓

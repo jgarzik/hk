@@ -171,19 +171,20 @@ pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oset_ptr: u64, sigsetsize: u64
 
     let tid = current_tid();
 
-    with_task_signal_state(tid, |state| {
-        // Return old mask if requested
-        if oset_ptr != 0 && put_user::<Uaccess, u64>(oset_ptr, state.blocked.bits()).is_err() {
-            return -14i64; // EFAULT
+    // User memory is read before and written after the signal state is
+    // locked (TASK_TABLE: no user access under a spinlock), like Linux
+    let new_set = if set_ptr != 0 {
+        match get_user::<Uaccess, u64>(set_ptr) {
+            Ok(v) => Some(SigSet::from_bits(v)),
+            Err(_) => return -14, // EFAULT
         }
+    } else {
+        None
+    };
 
-        // Modify mask if requested
-        if set_ptr != 0 {
-            let new_set = match get_user::<Uaccess, u64>(set_ptr) {
-                Ok(v) => SigSet::from_bits(v),
-                Err(_) => return -14, // EFAULT
-            };
-
+    let r = with_task_signal_state(tid, |state| {
+        let old = state.blocked.bits();
+        if let Some(new_set) = new_set {
             match how {
                 SIG_BLOCK => {
                     state.blocked = state.blocked.union(&new_set);
@@ -194,7 +195,7 @@ pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oset_ptr: u64, sigsetsize: u64
                 SIG_SETMASK => {
                     state.blocked = new_set;
                 }
-                _ => return -22i64, // EINVAL
+                _ => return Err(-22i64), // EINVAL
             }
 
             // Never allow blocking SIGKILL/SIGSTOP
@@ -203,10 +204,19 @@ pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oset_ptr: u64, sigsetsize: u64
             // Recalculate pending flag
             state.recalc_sigpending();
         }
+        Ok(old)
+    });
+    let old = match r {
+        Some(Ok(old)) => old,
+        Some(Err(e)) => return e,
+        None => return -3, // ESRCH
+    };
 
-        0i64
-    })
-    .unwrap_or(-3) // ESRCH
+    // Return old mask if requested
+    if oset_ptr != 0 && put_user::<Uaccess, u64>(oset_ptr, old).is_err() {
+        return -14; // EFAULT
+    }
+    0
 }
 
 /// rt_sigpending(set, sigsetsize) - examine pending signals
@@ -228,18 +238,20 @@ pub fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
 
     let tid = current_tid();
 
-    with_task_signal_state(tid, |state| {
+    let pending = with_task_signal_state(tid, |state| {
         // Combine private and shared pending
         let shared = state.shared_pending.lock();
-        let pending = state.pending.signal.union(&shared.signal);
+        state.pending.signal.union(&shared.signal).bits()
+    });
+    let Some(pending) = pending else {
+        return -3; // ESRCH
+    };
 
-        if put_user::<Uaccess, u64>(set_ptr, pending.bits()).is_err() {
-            return -14i64; // EFAULT
-        }
-
-        0i64
-    })
-    .unwrap_or(-3) // ESRCH
+    // Written after the signal state is unlocked
+    if put_user::<Uaccess, u64>(set_ptr, pending).is_err() {
+        return -14; // EFAULT
+    }
+    0
 }
 
 // =============================================================================
@@ -946,63 +958,49 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
     // Get current user stack pointer to check if on signal stack
     let user_sp = CurrentArch::get_syscall_user_rsp();
 
-    with_task_signal_state(tid, |state| {
+    // Read the new stack before locking the signal state (Linux
+    // copy_from_user, then do_sigaltstack, then copy_to_user)
+    let new = if ss_ptr != 0 {
+        let rd = || -> Option<(u64, i32, usize)> {
+            Some((
+                get_user::<Uaccess, u64>(ss_ptr).ok()?,
+                get_user::<Uaccess, i32>(ss_ptr.wrapping_add(8)).ok()?,
+                get_user::<Uaccess, u64>(ss_ptr.wrapping_add(16)).ok()? as usize,
+            ))
+        };
+        match rd() {
+            Some(v) => Some(v),
+            None => return -14, // EFAULT
+        }
+    } else {
+        None
+    };
+
+    let r = with_task_signal_state(tid, |state| {
         // Check if currently executing on the altstack
         let on_stack = state.altstack.is_enabled() && {
             let sp_start = state.altstack.ss_sp;
             let sp_end = sp_start.saturating_add(state.altstack.ss_size as u64);
             user_sp >= sp_start && user_sp < sp_end
         };
-
-        // Return old stack if requested
-        if oss_ptr != 0 {
-            let old = &state.altstack;
-            // Write ss_sp (offset 0)
-            if put_user::<Uaccess, u64>(oss_ptr, old.ss_sp).is_err() {
-                return -14i64; // EFAULT
-            }
-            // Write ss_flags (offset 8) - add SS_ONSTACK if we're on the stack
-            let flags = if on_stack {
-                old.ss_flags | ss_flags::SS_ONSTACK
-            } else {
-                old.ss_flags
-            };
-            if put_user::<Uaccess, i32>(oss_ptr.wrapping_add(8), flags).is_err() {
-                return -14; // EFAULT
-            }
-            // Write ss_size (offset 16, with padding after flags)
-            if put_user::<Uaccess, u64>(oss_ptr.wrapping_add(16), old.ss_size as u64).is_err() {
-                return -14; // EFAULT
-            }
-        }
+        let old = (state.altstack.ss_sp, state.altstack.ss_size);
+        let old_flags = if on_stack {
+            state.altstack.ss_flags | ss_flags::SS_ONSTACK
+        } else {
+            state.altstack.ss_flags
+        };
 
         // Set new stack if provided
-        if ss_ptr != 0 {
+        if let Some((ss_sp, ss_flags_val, ss_size)) = new {
             // Cannot change while on signal stack
             if on_stack {
-                return -1; // EPERM
+                return Err(-1i64); // EPERM
             }
-
-            // Read ss_sp (offset 0)
-            let ss_sp = match get_user::<Uaccess, u64>(ss_ptr) {
-                Ok(v) => v,
-                Err(_) => return -14, // EFAULT
-            };
-            // Read ss_flags (offset 8)
-            let ss_flags_val = match get_user::<Uaccess, i32>(ss_ptr.wrapping_add(8)) {
-                Ok(v) => v,
-                Err(_) => return -14, // EFAULT
-            };
-            // Read ss_size (offset 16)
-            let ss_size = match get_user::<Uaccess, u64>(ss_ptr.wrapping_add(16)) {
-                Ok(v) => v as usize,
-                Err(_) => return -14, // EFAULT
-            };
 
             // Validate flags - only SS_DISABLE and SS_FLAG_BITS are valid
             let mode = ss_flags_val & !ss_flags::SS_FLAG_BITS;
             if mode != 0 && mode != ss_flags::SS_DISABLE {
-                return -22; // EINVAL
+                return Err(-22); // EINVAL
             }
 
             if mode == ss_flags::SS_DISABLE {
@@ -1015,7 +1013,7 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
             } else {
                 // Enable/update the alternate stack
                 if ss_size < MINSIGSTKSZ {
-                    return -12; // ENOMEM
+                    return Err(-12); // ENOMEM
                 }
 
                 state.altstack = AltStack {
@@ -1025,10 +1023,23 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
                 };
             }
         }
+        Ok((old, old_flags))
+    });
+    let (old, old_flags) = match r {
+        Some(Ok(v)) => v,
+        Some(Err(e)) => return e,
+        None => return -3, // ESRCH
+    };
 
-        0i64
-    })
-    .unwrap_or(-3) // ESRCH
+    // Return old stack if requested: ss_sp @0, ss_flags @8, ss_size @16
+    if oss_ptr != 0
+        && (put_user::<Uaccess, u64>(oss_ptr, old.0).is_err()
+            || put_user::<Uaccess, i32>(oss_ptr.wrapping_add(8), old_flags).is_err()
+            || put_user::<Uaccess, u64>(oss_ptr.wrapping_add(16), old.1 as u64).is_err())
+    {
+        return -14; // EFAULT
+    }
+    0
 }
 
 /// signalfd4(fd, mask, sizemask, flags) - create/update signalfd
