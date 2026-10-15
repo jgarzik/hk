@@ -6,9 +6,9 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
+use crate::sync::spin::Mutex;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
 
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};

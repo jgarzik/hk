@@ -210,10 +210,10 @@ const PMTU_MAX: usize = 256;
 /// Learned path MTUs by destination (Linux fib_nh_exception PMTU part).
 /// Peer-driven (ICMP frag needed), so bounded: at most `PMTU_MAX`
 /// entries, the soonest-expiring evicted first; entries expire after
-/// 10 minutes. `spin::Mutex` leaf, thread context only.
+/// 10 minutes. `crate::sync::spin::Mutex` leaf, thread context only.
 #[derive(Default)]
 pub struct PmtuCache {
-    m: spin::Mutex<alloc::collections::BTreeMap<Ipv4Addr, (u32, u64)>>,
+    m: crate::sync::spin::Mutex<alloc::collections::BTreeMap<Ipv4Addr, (u32, u64)>>,
 }
 
 impl PmtuCache {

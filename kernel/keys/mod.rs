@@ -29,10 +29,10 @@ pub use keyring::*;
 pub use syscall::{sys_add_key, sys_keyctl, sys_request_key};
 pub use types::{KeyType, KeyringKeyType, UserKeyType};
 
+use crate::sync::spin::RwLock;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI32, Ordering};
-use spin::RwLock;
 
 // =============================================================================
 // Special keyring IDs (negative values, Linux ABI compatible)

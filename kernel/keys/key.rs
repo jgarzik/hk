@@ -3,11 +3,11 @@
 //! This module defines the Key struct which represents a security key
 //! in the Linux keyring subsystem.
 
+use crate::sync::spin::RwLock;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
-use spin::RwLock;
 
 use crate::error::KernelError;
 

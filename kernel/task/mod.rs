@@ -109,7 +109,7 @@ use crate::ns::NsProxy;
 use crate::seccomp::SeccompFilter;
 use crate::signal::{SigHand, SignalStruct, TaskSignalState};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 /// Process ID type
 pub type Pid = u64;

@@ -4,7 +4,7 @@
 //! MMIO regions to kernel virtual addresses. Uses a dedicated virtual
 //! address region separate from the kernel heap and user space.
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use super::kmap::swapper_phys;
 use super::paging::{

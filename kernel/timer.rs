@@ -316,18 +316,18 @@ pub fn timer_count() -> usize {
 ///
 /// The callback must call [`Alarm::fired`] before it scans its state and
 /// then re-arm for the earliest remaining deadline, so a deadline set
-/// concurrently is never lost. Locking: `st` is a `spin::Mutex` taken
+/// concurrently is never lost. Locking: `st` is a `crate::sync::spin::Mutex` taken
 /// in thread context only and held across `timer_add/timer_del` (-> the
 /// `TIMERS` IrqSpinlock).
 pub struct Alarm {
-    st: spin::Mutex<(TimerHandle, u64)>,
+    st: crate::sync::spin::Mutex<(TimerHandle, u64)>,
     cb: TimerCallback,
 }
 
 impl Alarm {
     pub const fn new(cb: TimerCallback) -> Self {
         Self {
-            st: spin::Mutex::new((TimerHandle::NULL, u64::MAX)),
+            st: crate::sync::spin::Mutex::new((TimerHandle::NULL, u64::MAX)),
             cb,
         }
     }

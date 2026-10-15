@@ -2,7 +2,7 @@
 //!
 //! Simple linked-list allocator for the kernel heap.
 //!
-//! Uses IrqSpinlock instead of spin::Mutex to prevent deadlocks
+//! Uses IrqSpinlock instead of crate::sync::spin::Mutex to prevent deadlocks
 //! when page fault handlers (e.g., COW) need to allocate memory
 //! while interrupts are enabled.
 

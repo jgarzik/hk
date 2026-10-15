@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::task::Tid;
 
@@ -593,7 +593,7 @@ impl Mm {
     }
 
     /// Lock the VMA tree (mmap_lock)
-    pub fn lock(&self) -> spin::MutexGuard<'_, MmStruct> {
+    pub fn lock(&self) -> crate::sync::spin::MutexGuard<'_, MmStruct> {
         self.map.lock()
     }
 

@@ -18,7 +18,7 @@
 //!
 //! ## Locking
 //!
-//! `KTHREADS` (spin::Mutex, process context only) maps tid -> control
+//! `KTHREADS` (crate::sync::spin::Mutex, process context only) maps tid -> control
 //! block; it is never held across a wakeup or sleep. Stop/park requests are
 //! atomics plus a direct `wake_up_task`; requesters wait on the control
 //! block's `WaitQueue` for the thread to acknowledge.
@@ -27,7 +27,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::error::KernelError;
 use crate::task::percpu::{

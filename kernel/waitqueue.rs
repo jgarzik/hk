@@ -152,6 +152,7 @@ impl WaitQueue {
 
     /// Sleep (uninterruptibly) until `cond()` is true
     pub fn wait_event<F: FnMut() -> bool>(&self, mut cond: F) {
+        crate::sync::might_sleep();
         if cond() {
             return;
         }
@@ -229,6 +230,7 @@ impl WaitQueue {
         timeout: u64,
         state: SleepState,
     ) -> Result<u64, KernelError> {
+        crate::sync::might_sleep();
         if cond() {
             return Ok(timeout.max(1));
         }

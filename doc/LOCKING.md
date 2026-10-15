@@ -85,9 +85,10 @@ let mut rq = sched.lock.lock();  // IRQs disabled, preemption disabled
 // IRQs and preemption restored automatically on drop
 ```
 
-### 1.2 Mutex<T> (spin crate)
+### 1.2 Mutex<T> (spin crate, via `sync::spin`)
 
-A standard spinning mutex from the `spin` crate. Used for data structures that
+A standard spinning mutex from the `spin` crate (taken through
+`crate::sync::spin`, tracked by lockdep-lite in `LOCKDEP=1` builds, 1.5). Used for data structures that
 are **NOT** accessed from interrupt context.
 
 **Properties:**
@@ -107,7 +108,7 @@ are **NOT** accessed from interrupt context.
 need to access the data from an interrupt handler, use `IrqSpinlock` instead or
 defer the work.
 
-### 1.3 RwLock<T> (spin crate)
+### 1.3 RwLock<T> (spin crate, via `sync::spin`)
 
 A read-write lock from the `spin` crate. Allows multiple concurrent readers
 or one exclusive writer.
@@ -150,7 +151,38 @@ user page faults, blocking pipe/socket I/O).
 `File.f_pos_lock`, RTNL (Linux rtnl_mutex), `TcpSock.rd`,
 `UnixSock.bindlock` and `UnixSock.iolock` (`Mutex`).
 
-### 1.5 Atomic Types
+### 1.5 Lockdep-lite (`sync::lockdep`, feature `lockdep`)
+
+Kernel code takes `crate::sync::spin::{Mutex, RwLock}` (never the `spin`
+crate's types directly; `printk` and lockdep itself are the exceptions).
+In a normal build these are re-exports of `spin`'s types (zero cost).
+Built with `make check LOCKDEP=1` (cargo feature `lockdep`) they are
+tracked wrappers, and the kernel reports, once each, as `LOCKDEP:FAIL`
+(so the boot test fails):
+
+- **Sleeping in atomic context:** `sync::might_sleep()` (sleeping locks,
+  `schedule`/`yield_now`, wait queues, `Sock::wait`, user copies via
+  `might_fault`, skipped while page faults are disabled) with a tracked
+  spin lock held, a nonzero preempt count (any `IrqSpinlock`) or in an
+  interrupt handler. Without the feature it is the old debug-build
+  preempt-count assertion.
+- **Lock order:** a lock's class is the source location of its `new()`
+  (`#[track_caller]`, like Linux's static lock_class_key: all `TcpSock.cb`
+  share one class). Taking B while holding A records A -> B; taking B
+  under A after A was taken under B reports both acquisitions. Only
+  direct inversions (no transitive cycles); nesting within one class is
+  not checked (listener -> child `cb`, `lock2` of two unix sockets).
+- **IRQ safety:** a tracked lock taken in an interrupt handler (the timer
+  tick and device IRQ dispatch call `lockdep::irq_enter/exit`).
+
+The held-lock stacks are per CPU (the kernel is not preemptive and a task
+never sleeps holding a spin lock, which is itself checked), the edge
+table is a fixed array: nothing allocates. Power-off prints a
+`lockdep: N reports, M order edges` summary. `IrqSpinlock` acquisitions
+are not tracked for order (they are leaves or near-leaves); they count
+through the preempt count.
+
+### 1.6 Atomic Types
 
 Lock-free atomic operations from `core::sync::atomic`. Used for simple counters,
 flags, and lock-free algorithms.

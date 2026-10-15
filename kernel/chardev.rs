@@ -11,9 +11,9 @@
 //! Top:          console framework (kernel log + active console(s)).
 //! ```
 
+use crate::sync::spin::RwLock;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use spin::RwLock;
 
 /// Major device number type
 pub type DevMajor = u16;

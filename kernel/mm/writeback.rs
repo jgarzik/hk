@@ -20,7 +20,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use spin::{Mutex, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
 
 use crate::PAGE_CACHE;
 use crate::mm::page_cache::{AddressSpace, DIRTY_ADDRESS_SPACES, FileId, PAGE_SIZE};

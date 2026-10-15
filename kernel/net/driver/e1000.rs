@@ -21,8 +21,8 @@
 //! ## Locking (doc/LOCKING.md, Network)
 //!
 //! - ISR: touches only MMIO, atomics and `napi_schedule` (IrqSpinlock).
-//! - `rx`: `spin::Mutex`, thread context only (NAPI poll). Leaf.
-//! - `tx`: `spin::Mutex`, thread context only (xmit, NAPI poll reclaim).
+//! - `rx`: `crate::sync::spin::Mutex`, thread context only (NAPI poll). Leaf.
+//! - `tx`: `crate::sync::spin::Mutex`, thread context only (xmit, NAPI poll reclaim).
 //!   Taken under socket/ARP locks (end of the network lock order). Leaf.
 
 use alloc::boxed::Box;
@@ -32,7 +32,8 @@ use core::any::Any;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use spin::{Mutex, Once};
+use crate::sync::spin::Mutex;
+use spin::Once;
 
 use crate::CurrentArch;
 use crate::arch::IoremapOps;

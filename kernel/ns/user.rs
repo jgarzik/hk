@@ -24,9 +24,10 @@
 //! - `UserNamespace.uid_map.extents`: RwLock
 //! - `UserNamespace.gid_map.extents`: RwLock
 
+use crate::sync::spin::RwLock;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use spin::{Lazy, RwLock};
+use spin::Lazy;
 
 use crate::task::percpu;
 

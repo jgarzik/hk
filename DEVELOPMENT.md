@@ -44,6 +44,11 @@ make check          # Build + boot test in QEMU
 # Build and test aarch64
 make check-arm      # Build + boot test in QEMU
 
+# Locking debug: lockdep-lite (spin-lock order, sleep-in-atomic) reports
+# LOCKDEP:FAIL lines; run after lock changes (doc/LOCKING.md 1.5)
+make check LOCKDEP=1
+make check-arm LOCKDEP=1
+
 # Run interactively
 make run            # x86-64 in QEMU
 make run-arm        # aarch64 in QEMU

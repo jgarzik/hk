@@ -15,3 +15,6 @@ bitflags.workspace = true
 
 [features]
 default = []
+# Lockdep-lite: spin-lock tracking, lock order and sleep-in-atomic checks
+# (debug aid; `make check LOCKDEP=1`)
+lockdep = []

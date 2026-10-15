@@ -53,6 +53,16 @@ pub fn pagefault_disabled() -> bool {
     pf_slot().is_some_and(|s| s.load(Ordering::Relaxed) != 0)
 }
 
+/// Linux might_fault: a user access may sleep resolving a fault, unless
+/// faults are disabled
+#[track_caller]
+#[inline]
+fn might_fault() {
+    if !pagefault_disabled() {
+        crate::sync::might_sleep();
+    }
+}
+
 /// Error type for user memory access failures
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UaccessError {
@@ -140,7 +150,9 @@ pub trait UaccessArch {
 ///     // Success
 /// }
 /// ```
+#[track_caller]
 pub fn copy_to_user<A: UaccessArch>(to: u64, from: &[u8]) -> UaccessResult<usize> {
+    might_fault();
     let len = from.len();
 
     // Validate user address
@@ -177,11 +189,13 @@ pub fn copy_to_user<A: UaccessArch>(to: u64, from: &[u8]) -> UaccessResult<usize
 /// # Safety
 /// The kernel destination slice must be valid and have capacity >= len.
 /// The user source is validated by this function.
+#[track_caller]
 pub fn copy_from_user<A: UaccessArch>(
     to: &mut [u8],
     from: u64,
     len: usize,
 ) -> UaccessResult<usize> {
+    might_fault();
     // Validate user address
     if !A::access_ok(from, len) {
         return Err(UaccessError::BadAddress);
@@ -217,7 +231,9 @@ pub fn copy_from_user<A: UaccessArch>(
 /// # Returns
 /// * `Ok(())` on success
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
+#[track_caller]
 pub fn put_user<A: UaccessArch, T: Copy>(to: u64, value: T) -> UaccessResult<()> {
+    might_fault();
     let size = ::core::mem::size_of::<T>();
 
     // Validate user address
@@ -254,7 +270,9 @@ pub fn put_user<A: UaccessArch, T: Copy>(to: u64, value: T) -> UaccessResult<()>
 /// # Returns
 /// * `Ok(value)` on success
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
+#[track_caller]
 pub fn get_user<A: UaccessArch, T: Copy + Default>(from: u64) -> UaccessResult<T> {
+    might_fault();
     let size = ::core::mem::size_of::<T>();
 
     // Validate user address
@@ -318,10 +336,12 @@ pub fn copy_val_to_user<A: UaccessArch, T: Copy>(to: u64, value: &T) -> UaccessR
 /// * `Ok(String)` containing the string (without null terminator) on success
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
 /// * `Err(UaccessError::Overflow)` if string exceeds max_len
+#[track_caller]
 pub fn strncpy_from_user<A: UaccessArch>(
     from: u64,
     max_len: usize,
 ) -> UaccessResult<alloc::string::String> {
+    might_fault();
     use alloc::string::String;
 
     // Validate initial address (we'll check byte by byte)

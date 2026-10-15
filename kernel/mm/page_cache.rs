@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 
 use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use spin::{Mutex, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
 
 use crate::arch::FrameAlloc;
 use crate::error::KernelError;

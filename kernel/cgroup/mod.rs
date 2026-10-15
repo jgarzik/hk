@@ -23,12 +23,13 @@
 //! - `memory`: Memory usage limits and accounting
 //! - `io`: Block I/O bandwidth limits
 
+use crate::sync::spin::{Mutex, RwLock};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use spin::{Lazy, Mutex, RwLock};
+use spin::Lazy;
 
 use crate::error::KernelError;
 use crate::task::Pid;

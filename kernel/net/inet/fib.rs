@@ -14,7 +14,7 @@
 //!
 //! ## Locking
 //!
-//! `Fib.tables`: `spin::RwLock`, thread context only. Writers hold RTNL
+//! `Fib.tables`: `crate::sync::spin::RwLock`, thread context only. Writers hold RTNL
 //! (every mutating function takes the `RtnlGuard`); readers (input/output
 //! routing, dumps) take the read lock briefly and get `Arc<FibEntry>`
 //! clones, so no guard escapes (RCU-ready, plan 3a). Order: RTNL ->
@@ -25,7 +25,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use spin::RwLock;
+use crate::sync::spin::RwLock;
 
 use crate::error::KernelError;
 use crate::net::NetNamespace;

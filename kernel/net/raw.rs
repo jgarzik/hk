@@ -12,7 +12,7 @@
 //!
 //! ## Locking (thread context only)
 //!
-//! `RawTable.socks` (`spin::RwLock`, per namespace) -> `Inet.addr`;
+//! `RawTable.socks` (`crate::sync::spin::RwLock`, per namespace) -> `Inet.addr`;
 //! delivery clones the matching `Arc`s and queues (`RxQueue`, leaf)
 //! after dropping the table lock. `RawSock.filter` is an atomic.
 
@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use spin::RwLock;
+use crate::sync::spin::RwLock;
 
 use crate::error::KernelError;
 use crate::net::af_inet::{self, Inet, RxInfo, SOL_IP, ipf};

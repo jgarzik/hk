@@ -34,10 +34,10 @@
 //! - Linux pipe(7) man page
 //! - Linux fs/pipe.c
 
+use crate::sync::spin::Mutex;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
-use spin::Mutex;
 
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags};

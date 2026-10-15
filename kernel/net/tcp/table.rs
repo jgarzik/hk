@@ -14,7 +14,7 @@
 //!
 //! ## Locking
 //!
-//! `spin::RwLock`s, thread context only, reached only through the
+//! `crate::sync::spin::RwLock`s, thread context only, reached only through the
 //! methods below (no guard escapes; RCU-ready). Order: `bhash` ->
 //! `ehash` (connect picks a port and inserts its tuple atomically);
 //! `lhash` is a leaf. Candidate owners' `Inet.addr` and `Sock` flags are
@@ -25,7 +25,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use spin::RwLock;
+use crate::sync::spin::RwLock;
 
 use super::TcpSock;
 use super::output::Tuple;

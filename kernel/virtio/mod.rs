@@ -16,7 +16,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::bus::driver::{Device, DriverError};
 

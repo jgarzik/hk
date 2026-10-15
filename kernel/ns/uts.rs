@@ -14,8 +14,9 @@
 //! `UtsNamespace.name` is protected by `RwLock` for read-heavy access
 //! (uname is called frequently, sethostname/setdomainname are rare).
 
+use crate::sync::spin::RwLock;
 use alloc::sync::Arc;
-use spin::{Lazy, RwLock};
+use spin::Lazy;
 
 use crate::arch::Uaccess;
 use crate::error::KernelError;

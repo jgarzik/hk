@@ -22,9 +22,10 @@
 //! - `PidNamespace.pid_map`: RwLock for PID→TID mapping
 //! - `PidNamespace.next_pid`: Mutex for PID allocation
 
+use crate::sync::spin::{Mutex, RwLock};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use spin::{Lazy, Mutex, RwLock};
+use spin::Lazy;
 
 use crate::task::Tid;
 

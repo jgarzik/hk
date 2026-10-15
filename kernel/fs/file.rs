@@ -12,9 +12,9 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::sync::spin::Mutex;
 use ::core::cmp::min;
 use ::core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use spin::Mutex;
 
 use crate::sync;
 

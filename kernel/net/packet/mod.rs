@@ -20,11 +20,11 @@
 //!
 //! ## Locking (thread context only)
 //!
-//! `PacketTable.socks` (`spin::RwLock`, per namespace, leaf): delivery
+//! `PacketTable.socks` (`crate::sync::spin::RwLock`, per namespace, leaf): delivery
 //! clones the matching `Arc`s and queues after dropping it. Per socket:
-//! `bind` is an atomic; `rxq` (`spin::Mutex` leaf) and `filter`
-//! (`spin::RwLock` leaf, the `Arc` is cloned out before running it).
-//! `mclist` (`spin::Mutex` leaf) is changed under RTNL, which device
+//! `bind` is an atomic; `rxq` (`crate::sync::spin::Mutex` leaf) and `filter`
+//! (`crate::sync::spin::RwLock` leaf, the `Arc` is cloned out before running it).
+//! `mclist` (`crate::sync::spin::Mutex` leaf) is changed under RTNL, which device
 //! promiscuity changes need: RTNL -> `mclist`.
 
 mod opts;
@@ -35,7 +35,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use spin::{Mutex, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
 
 use crate::error::KernelError;
 use crate::net::device::NetDevice;

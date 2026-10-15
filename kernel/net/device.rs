@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use spin::RwLock;
+use crate::sync::spin::RwLock;
 
 use crate::net::KernelError;
 use crate::net::inet::ifaddr::IfAddrs;

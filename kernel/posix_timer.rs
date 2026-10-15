@@ -406,7 +406,7 @@ impl Default for PosixTimerRegistry {
 // Per-task POSIX timer storage
 // =============================================================================
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 /// Global table mapping TID -> PosixTimerRegistry
 static TASK_POSIX_TIMERS: Mutex<BTreeMap<Tid, PosixTimerRegistry>> = Mutex::new(BTreeMap::new());

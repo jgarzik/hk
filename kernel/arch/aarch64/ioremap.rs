@@ -9,8 +9,8 @@
 //! other addresses get pages in the ioremap window. Both are in TTBR1,
 //! shared by every address space.
 
+use crate::sync::spin::Mutex;
 use core::arch::asm;
-use spin::Mutex;
 
 use super::paging::{
     AF, AP_EL1_RW, ATTR_IDX_DEVICE, IO_BASE, IO_SIZE, PAGE_SIZE, PXN, PageTableEntry, SH_INNER,

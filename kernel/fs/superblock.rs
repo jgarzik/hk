@@ -5,8 +5,8 @@
 
 use alloc::sync::Arc;
 
+use crate::sync::spin::RwLock;
 use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use spin::RwLock;
 
 use crate::sync;
 
@@ -347,8 +347,8 @@ pub static NULL_SUPER_OPS: NullSuperOps = NullSuperOps;
 // Filesystem Type Registry
 // ============================================================================
 
+use crate::sync::spin::Mutex;
 use alloc::collections::BTreeMap;
-use spin::Mutex;
 
 /// Global filesystem type registry
 static FS_TYPES: Mutex<BTreeMap<&'static str, &'static FileSystemType>> =

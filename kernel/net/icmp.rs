@@ -16,13 +16,13 @@
 //!
 //! ## Locking
 //!
-//! `IcmpRate.st` (`spin::Mutex`, per namespace, thread only) is a leaf
+//! `IcmpRate.st` (`crate::sync::spin::Mutex`, per namespace, thread only) is a leaf
 //! taken around the token-bucket arithmetic only.
 
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::net::NetNamespace;
 use crate::net::af_inet::RxInfo;

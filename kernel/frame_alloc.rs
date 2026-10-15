@@ -3,7 +3,7 @@
 //! Bitmap-based allocator for physical memory frames.
 //! Supports reference counting for copy-on-write (COW) pages.
 //!
-//! Uses IrqSpinlock instead of spin::Mutex to prevent deadlocks
+//! Uses IrqSpinlock instead of crate::sync::spin::Mutex to prevent deadlocks
 //! when page fault handlers (COW) need to allocate frames while
 //! interrupts are enabled.
 

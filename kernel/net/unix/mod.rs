@@ -28,19 +28,19 @@
 //! - `iolock` (`sync::Mutex`, sleeping): one reader at a time across
 //!   dequeue -> user copy -> consume (Linux u->iolock); never held
 //!   while waiting for data.
-//! - `st` (`spin::Mutex`, the Linux unix_state_lock): peer pointer;
+//! - `st` (`crate::sync::spin::Mutex`, the Linux unix_state_lock): peer pointer;
 //!   `state`, shutdown bits and `dead` change under it. Two at once:
 //!   a listener's before the connecting socket's (stream connect),
 //!   otherwise in ascending address order (`lock2`, Linux
 //!   unix_state_double_lock).
-//! - `rq` (`spin::Mutex`): receive queue, under `st` (senders queue
+//! - `rq` (`crate::sync::spin::Mutex`): receive queue, under `st` (senders queue
 //!   while holding the receiver's `st`, so they never queue to a dead
 //!   socket); leaf except for `relay` wakeups done after unlock.
-//! - `UnixTable.st` (per netns) and `BSD` (`spin::RwLock`): after
-//!   `bindlock`; `addr` (`spin::RwLock` leaf) is set under them, so a
+//! - `UnixTable.st` (per netns) and `BSD` (`crate::sync::spin::RwLock`): after
+//!   `bindlock`; `addr` (`crate::sync::spin::RwLock` leaf) is set under them, so a
 //!   name found in a table always has its address. Lookups return
 //!   `Arc`s; no socket lock is taken under a table lock.
-//! - `relay` (`spin::Mutex` leaf; Linux peer_wait.lock for peer_wake),
+//! - `relay` (`crate::sync::spin::Mutex` leaf; Linux peer_wait.lock for peer_wake),
 //!   `peercred` (leaf, Linux sk_peer_lock).
 //! - Wakeups (`Sock.wq`, `peer_wait`) happen after unlocking; queued
 //!   messages and their files are always dropped with no lock held.
@@ -57,7 +57,7 @@ use core::any::Any;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
-use spin::{Mutex, MutexGuard, RwLock};
+use crate::sync::spin::{Mutex, MutexGuard, RwLock};
 
 use crate::arch::Uaccess;
 use crate::error::KernelError;

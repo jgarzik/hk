@@ -6,7 +6,7 @@
 //!
 //! ## Locking
 //!
-//! `Files` wraps the table's `spin::Mutex` (Linux files->file_lock).
+//! `Files` wraps the table's `crate::sync::spin::Mutex` (Linux files->file_lock).
 //! Releasing a file can sleep (TCP SO_LINGER, socket release paths), so
 //! no file is ever dropped under that lock: the table parks the files
 //! it detaches (close, dup2 over an open descriptor, a refused install)
@@ -15,10 +15,10 @@
 //! Likewise a task's last reference to its table is dropped after
 //! TASK_TABLE is released, never under it.
 
+use crate::sync::spin::{Mutex, MutexGuard};
 use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
-use spin::{Mutex, MutexGuard};
 
 use super::percpu::TASK_TABLE;
 use super::{FdTable, Tid};

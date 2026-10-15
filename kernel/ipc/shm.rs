@@ -17,10 +17,10 @@ use crate::mm::vma::{
     MAP_SHARED, PROT_READ as VMA_PROT_READ, PROT_WRITE as VMA_PROT_WRITE, VM_SHM,
 };
 use crate::mm::{Vma, get_task_mm};
+use crate::sync::spin::Mutex;
 use crate::task::percpu::{current_pid, current_tid, get_current_task_cr3};
 use crate::time::TIMEKEEPER;
 use crate::uaccess::{get_user, put_user};
-use spin::Mutex;
 
 const PAGE_SIZE: usize = 4096;
 

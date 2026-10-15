@@ -15,11 +15,11 @@ use alloc::vec::Vec;
 
 use crate::arch::{ContextOps, CpuOps, FrameAlloc, IrqSpinlock, PerCpuOps, SchedArch, UserModeOps};
 use crate::printkln;
+use crate::sync::spin::Mutex;
 use crate::task::sched::{PriorityRunQueue, SleepEntry};
 use crate::task::{
     Cred, CurrentTask, PRIORITY_IDLE, Pid, Priority, Task, TaskKind, TaskState, Tid,
 };
-use spin::Mutex;
 
 /// Vfork completion state
 ///
@@ -1895,6 +1895,7 @@ pub fn set_current_state(state: SleepState) {
 /// [`set_current_state`], re-check their condition, then call this. If a
 /// wakeup already arrived (state back to Running) it returns at once.
 pub fn schedule() {
+    crate::sync::might_sleep();
     let Some(sched) = this_sched() else { return };
     let mut rq = sched.lock.lock();
     sched.drain_wakes(&mut rq);
@@ -2026,12 +2027,14 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
 /// CPU advanced it, making time run ~Ncpu times too fast. All CPUs then do
 /// their own scheduler work (remote wakeups, expired sleepers).
 pub fn scheduler_tick() {
+    crate::sync::lockdep::irq_enter();
     if CurrentArch::try_current_cpu_id() == Some(0) {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
         // Wake ktimerd if a software timer expired
         crate::timer::check_timers();
     }
     wake_sleepers();
+    crate::sync::lockdep::irq_exit();
 }
 
 /// Get current tick count
@@ -2199,6 +2202,7 @@ pub fn wake_sleepers() {
 /// The current thread stays runnable and goes to the back of its priority
 /// queue; another runnable thread (if any) gets to run.
 pub fn yield_now() {
+    crate::sync::might_sleep();
     let Some(sched) = this_sched() else { return };
     let mut rq = sched.lock.lock();
     sched.drain_wakes(&mut rq);

@@ -25,7 +25,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 // ============================================================================
 // AnonVma

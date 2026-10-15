@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use spin::{Mutex, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
 
 // Re-use DevId from chardev
 pub use crate::chardev::{DevId, DevMajor, DevMinor};

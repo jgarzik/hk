@@ -9,12 +9,12 @@
 //! new SYN beyond its RCV.NXT or with a newer timestamp ends it early so
 //! the tuple can be reused (Linux tcp_timewait_state_process TCP_TW_SYN).
 //!
-//! Locking: `inner` is a `spin::Mutex` leaf like `TcpSock.cb` (thread
+//! Locking: `inner` is a `crate::sync::spin::Mutex` leaf like `TcpSock.cb` (thread
 //! context only; table and timer locks may be taken under it).
 
 use alloc::sync::{Arc, Weak};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use super::cb::{Out, SegIn, TcpCb};
 use super::output::Tuple;

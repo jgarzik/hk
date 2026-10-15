@@ -246,7 +246,7 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
 impl Pipe {
     /// Get a reference to the inner pipe data
     #[allow(dead_code)]
-    pub fn inner(&self) -> &spin::Mutex<crate::pipe::PipeInner> {
+    pub fn inner(&self) -> &crate::sync::spin::Mutex<crate::pipe::PipeInner> {
         &self.inner
     }
 }

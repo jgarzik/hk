@@ -14,7 +14,7 @@
 //! ## Timer service (thread context only)
 //!
 //! Connections and timewait entries register their earliest deadline in
-//! `TIMERS` (a `spin::Mutex` leaf: deadline-ordered map of weak
+//! `TIMERS` (a `crate::sync::spin::Mutex` leaf: deadline-ordered map of weak
 //! handles). One `timer::Alarm` (ktimerd) is armed for the earliest
 //! deadline; it only raises a flag and wakes `softnet/0` (decision 1:
 //! protocol timers run in softnet), which calls [`run`]: due entries are
@@ -27,7 +27,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use super::cb::{ORPHAN_RETRIES, Out, RTO_FALLBACK, RTO_MAX, RTO_MIN, TcpCb, TcpState, Tmr};
 use super::output::Push;

@@ -55,7 +55,11 @@ pub fn sys_reboot(magic1: u32, magic2: u32, cmd: u32, _arg: u64) -> i64 {
 
     // Dispatch to architecture-specific implementation
     match cmd {
-        cmd::POWER_OFF => crate::arch::power::shutdown(),
+        cmd::POWER_OFF => {
+            #[cfg(feature = "lockdep")]
+            crate::sync::lockdep::summary();
+            crate::arch::power::shutdown()
+        }
         cmd::RESTART => crate::arch::power::reboot(),
         cmd::HALT => crate::arch::power::halt(),
         _ => KernelError::InvalidArgument.sysret(),

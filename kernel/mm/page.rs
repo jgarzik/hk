@@ -15,7 +15,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use spin::RwLock;
+use crate::sync::spin::RwLock;
 
 use crate::mm::anon_vma::AnonVma;
 

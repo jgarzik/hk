@@ -106,7 +106,7 @@ use crate::mm::page_cache::{FileId, NULL_AOPS, PAGE_SIZE as PC_PAGE_SIZE, PageCa
 #[allow(unused_imports)]
 use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 // Memory layout constants - x86_64
 // The heap starts at 4MB or above the multiboot2 modules and info (GRUB

@@ -12,7 +12,7 @@
 //! ## Locking (thread context only)
 //!
 //! `PingSock.op` (socket lock: bind/connect/autobind) -> `PingTable.socks`
-//! (`spin::RwLock`) -> `Inet.addr`; `RxQueue` and `Sock.errq` are
+//! (`crate::sync::spin::RwLock`) -> `Inet.addr`; `RxQueue` and `Sock.errq` are
 //! separate leaves. Receive takes the table read lock, clones the `Arc`
 //! and queues after dropping it.
 
@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
-use spin::{Mutex, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
 
 use crate::error::KernelError;
 use crate::net::af_inet::{self, Inet, RxInfo, SOL_IP};

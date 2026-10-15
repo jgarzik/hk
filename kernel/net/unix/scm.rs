@@ -24,7 +24,7 @@
 //!
 //! ## Locking
 //!
-//! `INFLIGHT` and `DEFERRED` are `spin::Mutex` leaves (thread context
+//! `INFLIGHT` and `DEFERRED` are `crate::sync::spin::Mutex` leaves (thread context
 //! only); no file is ever dropped while either is held.
 
 use alloc::collections::BTreeMap;
@@ -32,7 +32,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::error::KernelError;
 use crate::fs::file::File;

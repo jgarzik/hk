@@ -4,14 +4,14 @@
 //!
 //! ## Locking
 //!
-//! `RxQueue.q` is a `spin::Mutex` leaf (thread only: softnet enqueue,
+//! `RxQueue.q` is a `crate::sync::spin::Mutex` leaf (thread only: softnet enqueue,
 //! recvmsg); the socket is woken after it is dropped.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::error::KernelError;
 use crate::net::af_inet::{self, Inet, RxInfo};

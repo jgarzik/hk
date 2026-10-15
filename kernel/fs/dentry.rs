@@ -14,7 +14,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use spin::RwLock;
+use crate::sync::spin::RwLock;
 
 use super::inode::Inode;
 use super::superblock::SuperBlock;

@@ -11,7 +11,7 @@
 //!
 //! ## Locking (thread context only; see doc/LOCKING.md, Network)
 //!
-//! `TcpSock.cb` (`spin::Mutex<Inner>`) is the socket lock: Linux
+//! `TcpSock.cb` (`crate::sync::spin::Mutex<Inner>`) is the socket lock: Linux
 //! bh_lock_sock and the tcp_sock fields it protects. Segment input
 //! (softnet), timers (softnet/0) and the socket calls take it for a
 //! bounded step and never sleep or touch user memory under it. Unlike
@@ -49,7 +49,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use spin::{Mutex, MutexGuard};
+use crate::sync::spin::{Mutex, MutexGuard};
 
 use self::cb::{Cfg, Open, Out, Seg, SegIn, TcpCb, flags};
 use self::output::Tuple;

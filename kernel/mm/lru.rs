@@ -22,7 +22,7 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 use core::sync::atomic::Ordering;
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::mm::page::{PG_ACTIVE, PG_LRU, page_descriptor};
 

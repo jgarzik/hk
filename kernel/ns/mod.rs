@@ -15,7 +15,7 @@
 //! ## Locking
 //!
 //! - `TASK_TABLE`: Protects task struct access (including nsproxy field)
-//! - Per-namespace data: `spin::RwLock` (read-heavy)
+//! - Per-namespace data: `crate::sync::spin::RwLock` (read-heavy)
 //!
 //! ## Lock Ordering
 //!
@@ -27,8 +27,9 @@ pub mod pid;
 pub mod user;
 pub mod uts;
 
+use crate::sync::spin::RwLock;
 use alloc::sync::Arc;
-use spin::{Lazy, RwLock};
+use spin::Lazy;
 
 use crate::task::Tid;
 pub use cgroup::{CgroupNamespace, INIT_CGROUP_NS};

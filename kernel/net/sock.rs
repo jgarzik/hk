@@ -9,7 +9,7 @@
 //! ## Locking
 //!
 //! `Sock` holds atomics, its `WaitQueue` (IrqSpinlock leaf) and the
-//! error queue `errq` (`spin::Mutex` leaf, thread only). Wakeups
+//! error queue `errq` (`crate::sync::spin::Mutex` leaf, thread only). Wakeups
 //! (`data_ready`, `write_space`, `state_change`, `error_report`) are
 //! issued after the caller dropped its protocol locks.
 
@@ -18,7 +18,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::error::KernelError;
 use crate::net::NetNamespace;
@@ -385,7 +385,9 @@ impl Sock {
     }
 
     /// Wait on this socket's queue until `cond()` (`wait_on`)
+    #[track_caller]
     pub fn wait<F: FnMut() -> bool>(&self, timeo: u64, cond: F) -> Result<u64, KernelError> {
+        crate::sync::might_sleep();
         wait_on(&self.wq, timeo, cond)
     }
 }

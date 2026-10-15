@@ -9,6 +9,7 @@
 //! - `io.max`: Per-device limits ("$MAJ:$MIN rbps=$N wbps=$N riops=$N wiops=$N")
 //! - `io.stat`: Per-device I/O statistics
 
+use crate::sync::spin::RwLock;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -16,7 +17,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::RwLock;
 
 use crate::error::KernelError;
 use crate::task::Pid;

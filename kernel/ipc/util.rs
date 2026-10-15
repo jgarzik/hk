@@ -5,12 +5,12 @@
 //! - Permission checking following Linux semantics
 //! - Common traits and structures for IPC objects
 
+use crate::sync::spin::{Mutex, RwLock};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use spin::{Mutex, RwLock};
 
 use crate::error::KernelError;
 use crate::ipc::{IPC_CREAT, IPC_EXCL, IPC_PRIVATE};

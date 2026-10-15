@@ -18,7 +18,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use spin::{Lazy, RwLock};
+use crate::sync::spin::RwLock;
+use spin::Lazy;
 
 use crate::error::KernelError;
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};

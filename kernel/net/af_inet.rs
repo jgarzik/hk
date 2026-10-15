@@ -8,14 +8,14 @@
 //!
 //! ## Locking
 //!
-//! `Inet.addr` is a `spin::Mutex` leaf (thread context only); the
+//! `Inet.addr` is a `crate::sync::spin::Mutex` leaf (thread context only); the
 //! IP-level options are atomics.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::error::KernelError;
 use crate::net::inet::fib::RouteType;

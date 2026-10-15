@@ -9,10 +9,10 @@
 //! This module manages the per-task keyring references and provides
 //! functions to resolve special keyring IDs to actual key serials.
 
+use crate::sync::spin::RwLock;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
-use spin::RwLock;
 
 use crate::error::KernelError;
 

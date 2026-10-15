@@ -44,7 +44,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::arch::IrqSpinlock;
 use crate::task::Tid;

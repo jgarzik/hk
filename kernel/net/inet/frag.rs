@@ -17,7 +17,7 @@
 //!
 //! ## Locking
 //!
-//! `FragTable.st` is a `spin::Mutex` (thread only: softnet and the
+//! `FragTable.st` is a `crate::sync::spin::Mutex` (thread only: softnet and the
 //! reassembly timer on ktimerd), a leaf: completed datagrams and expiry
 //! ICMP errors are handled after it is dropped.
 
@@ -25,7 +25,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::net::ipv4::Ipv4Addr;
 

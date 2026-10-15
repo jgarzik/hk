@@ -22,8 +22,8 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+use crate::sync::spin::RwLock;
 use ::core::cmp::min;
-use spin::RwLock;
 
 use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
 

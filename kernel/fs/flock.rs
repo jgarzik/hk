@@ -25,8 +25,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use crate::error::KernelError;
 use crate::fs::File;
 use crate::fs::syscall::current_fd_table;
+use crate::sync::spin::Mutex;
 use crate::task::percpu::current_pid;
-use spin::Mutex;
 
 // =============================================================================
 // flock operation constants (Linux ABI)

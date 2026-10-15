@@ -21,7 +21,7 @@
 
 use alloc::sync::Arc;
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use super::path_ref::Path;
 use crate::task::Tid;

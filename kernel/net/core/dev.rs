@@ -27,12 +27,12 @@
 //! - `Softnet.poll_list`: `IrqSpinlock`, leaf. Taken by `napi_schedule`
 //!   (ISR) and the softnet thread. Capacity is reserved when a NAPI is
 //!   added, so the ISR never allocates.
-//! - `Softnet.backlog`: `spin::Mutex`, thread context only, leaf.
-//! - `PTYPE_BASE` / `PTYPE_ALL`: `spin::RwLock`, thread context only, leaf;
+//! - `Softnet.backlog`: `crate::sync::spin::Mutex`, thread context only, leaf.
+//! - `PTYPE_BASE` / `PTYPE_ALL`: `crate::sync::spin::RwLock`, thread context only, leaf;
 //!   handlers are copied out and called after the guard is dropped. Taps
 //!   run in the receive path (softnet or an inline backlog flush) and in
 //!   `dev_queue_xmit` callers, with no lock held by this module.
-//! - `NAPI_LIST`: `spin::Mutex`, thread context only, leaf.
+//! - `NAPI_LIST`: `crate::sync::spin::Mutex`, thread context only, leaf.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -40,7 +40,8 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use spin::{Mutex, Once, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
+use spin::Once;
 
 use crate::arch::IrqSpinlock;
 use crate::net::device::NetDevice;

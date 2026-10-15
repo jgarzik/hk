@@ -29,8 +29,8 @@
 //! ## Locking (doc/LOCKING.md, Network)
 //!
 //! - ISR callbacks: lock-free (VringCb, atomics, `napi_schedule`).
-//! - `rx`: `spin::Mutex`, thread context only (NAPI poll, open). Leaf.
-//! - `tx`: `spin::Mutex`, thread context only (xmit, NAPI poll reclaim);
+//! - `rx`: `crate::sync::spin::Mutex`, thread context only (NAPI poll, open). Leaf.
+//! - `tx`: `crate::sync::spin::Mutex`, thread context only (xmit, NAPI poll reclaim);
 //!   taken under socket/ARP locks (end of the network lock order). Leaf.
 
 use alloc::boxed::Box;
@@ -39,7 +39,8 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use spin::{Mutex, Once};
+use crate::sync::spin::Mutex;
+use spin::Once;
 
 use crate::bus::driver::{Device, DriverError};
 use crate::dma::DmaCoherent;

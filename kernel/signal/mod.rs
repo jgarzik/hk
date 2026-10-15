@@ -18,9 +18,9 @@
 
 pub mod syscall;
 
+use crate::sync::spin::Mutex;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
 
 use crate::arch::IrqSpinlock;
 use crate::task::{Pid, Tid};

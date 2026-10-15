@@ -12,10 +12,10 @@
 //! - dma_map_single / dma_unmap_single for streaming mappings
 //! - dma_map_sg / dma_unmap_sg for scatter-gather lists
 
+use crate::sync::spin::RwLock;
 use alloc::vec::Vec;
 #[cfg(target_arch = "x86_64")]
 use core::sync::atomic::{Ordering, fence};
-use spin::RwLock;
 
 use crate::arch::{phys_to_virt, virt_to_phys};
 use crate::frame_alloc::{BitmapFrameAllocator, FRAME_SIZE};

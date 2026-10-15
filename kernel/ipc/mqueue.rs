@@ -33,7 +33,8 @@ use core::any::Any;
 use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use spin::{Lazy, Mutex, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
+use spin::Lazy;
 
 use crate::arch::Uaccess;
 use crate::error::KernelError;
@@ -546,7 +547,6 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
     let creating = (oflag & O_CREAT) != 0;
     let exclusive = (oflag & O_EXCL) != 0;
 
-    // Try to find or create queue
     // Attributes are read before the registry is locked (Linux do_mq_open
     // copies them first; no user access under a spinlock)
     let attr_in = if creating && attr_ptr != 0 {
@@ -558,6 +558,7 @@ pub fn sys_mq_open(name_ptr: u64, oflag: i32, mode: u32, attr_ptr: u64) -> i64 {
         None
     };
 
+    // Try to find or create queue
     let queue = {
         let mut registry = MQ_REGISTRY.write();
 

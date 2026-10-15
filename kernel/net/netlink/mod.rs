@@ -23,11 +23,11 @@
 //!
 //! ## Locking
 //!
-//! - `NlTable.socks` (per netns): `spin::RwLock`, thread context only,
+//! - `NlTable.socks` (per netns): `crate::sync::spin::RwLock`, thread context only,
 //!   leaf; lookups return `Arc` clones (no guard escapes).
-//! - `NlSock.dump`: `spin::Mutex`, thread context only; held while the
+//! - `NlSock.dump`: `crate::sync::spin::Mutex`, thread context only; held while the
 //!   cursor reads table snapshots and while its part is queued.
-//! - `NlSock.rxq`: `spin::Mutex`, thread context only, leaf. Senders
+//! - `NlSock.rxq`: `crate::sync::spin::Mutex`, thread context only, leaf. Senders
 //!   (notifications under RTNL, requests, peers, dump steps) push and
 //!   wake `wq` after dropping it.
 //! - Order: RTNL -> FIB/addresses -> `NlTable.socks` -> `NlSock.rxq`;
@@ -44,7 +44,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use spin::{Mutex, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
 
 use crate::error::KernelError;
 use crate::net::NetNamespace;
