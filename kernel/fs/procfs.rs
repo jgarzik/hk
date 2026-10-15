@@ -1549,6 +1549,31 @@ fn gen_version() -> Vec<u8> {
     Vec::from(output.as_bytes())
 }
 
+/// Generate /proc/meminfo content (Linux meminfo_proc_show subset:
+/// 16-column labels, values in kB). Free memory is the frame
+/// allocator's exact count; hk has no reclaimable caches counted yet,
+/// so MemAvailable equals MemFree.
+fn gen_meminfo() -> Vec<u8> {
+    use alloc::fmt::Write;
+    let fa = &crate::FRAME_ALLOCATOR;
+    let total = fa.stats().total_bytes >> 10;
+    let free = (fa.free_frames() as u64 * 4096) >> 10;
+    let mut out = String::new();
+    for (label, kb) in [
+        ("MemTotal:", total),
+        ("MemFree:", free),
+        ("MemAvailable:", free),
+        ("Buffers:", 0),
+        ("Cached:", 0),
+        ("SwapCached:", 0),
+        ("SwapTotal:", 0),
+        ("SwapFree:", 0),
+    ] {
+        let _ = writeln!(out, "{label:<16}{kb:>8} kB");
+    }
+    out.into_bytes()
+}
+
 /// Generate /proc/mounts content
 ///
 /// Format: device mountpoint fstype options dump pass
@@ -1722,6 +1747,12 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
         ProcfsInodeData::new_file(gen_mounts),
     ))));
 
+    let meminfo_inode = mk_inode(
+        &sb,
+        InodeMode::regular(0o444),
+        ProcfsInodeData::new_file(gen_meminfo),
+    );
+
     // Create /proc/net (directory) with /proc/net/{dev,route}; contents follow
     // the reader's network namespace
     let net_dir_inode = Arc::new(Inode::new(
@@ -1809,6 +1840,7 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
         if let ProcfsInodeData::Directory { children } = &mut *data {
             children.insert(String::from("version"), version_inode);
             children.insert(String::from("mounts"), mounts_inode);
+            children.insert(String::from("meminfo"), meminfo_inode);
             children.insert(String::from("net"), net_dir_inode);
         }
     }
