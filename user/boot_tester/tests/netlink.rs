@@ -63,6 +63,7 @@ pub fn run_tests() {
     test_dump_resume();
     test_overrun();
     test_deputy();
+    test_dead_receiver();
 }
 
 fn fail(name: &[u8], why: &[u8], v: i64) {
@@ -1052,6 +1053,54 @@ fn test_deputy() {
     let code = (st >> 8) & 0xff;
     if st & 0x7f != 0 || code != 0 {
         return fail(N, b"regained caps / sender, code", code as i64);
+    }
+    ok(N);
+}
+
+/// A sender blocked on a full user socket is woken when the receiver's
+/// last reference is closed and fails with ECONNREFUSED (Linux
+/// netlink_release wakes it; netlink_attachskb sees SOCK_DEAD)
+fn test_dead_receiver() {
+    const N: &[u8] = b"NL_DEAD_RECEIVER";
+    const ECONNREFUSED: i32 = -111;
+    const SO_SNDTIMEO: i32 = 21;
+    let rx = sys_socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) as i32;
+    let tx = sys_socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) as i32;
+    tiny_rcvbuf(rx);
+    let any = nladdr(0, 0);
+    sys_bind(rx, any.as_ptr(), 12);
+    sys_bind(tx, any.as_ptr(), 12);
+    let (_, port, _) = sockname(rx);
+    // A missed wakeup ends in EAGAIN after 5 s instead of hanging
+    let tv = [5i64, 0];
+    sys_setsockopt(tx, SOL_SOCKET, SO_SNDTIMEO, tv.as_ptr() as *const u8, 16);
+    let pid = sys_fork();
+    if pid == 0 {
+        // Holds the last reference once the parent closed its copy
+        msleep(300);
+        sys_close(rx as u64);
+        sys_exit(0);
+    }
+    sys_close(rx as u64);
+    let dst = nladdr(port, 0);
+    let msg = [0u8; 1024];
+    let t0 = super::sk::now_ms();
+    let mut r = 0;
+    for _ in 0..1000 {
+        r = sys_sendto(tx, msg.as_ptr(), msg.len(), 0, dst.as_ptr(), 12) as i32;
+        if r < 0 {
+            break;
+        }
+    }
+    let ms = super::sk::now_ms() - t0;
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    sys_close(tx as u64);
+    if r != ECONNREFUSED {
+        return fail(N, b"send", r as i64);
+    }
+    if ms >= 4000 {
+        return fail(N, b"woken after ms", ms as i64);
     }
     ok(N);
 }
