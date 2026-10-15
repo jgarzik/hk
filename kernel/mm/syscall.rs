@@ -878,21 +878,25 @@ fn populate_page(
         // Initialize page contents
         if is_anonymous {
             unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
             }
         } else if let Some(f) = file {
             // File-backed: read from file
             let file_offset = vma_offset + (addr - vma_start);
             unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
             }
-            let buf =
-                unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE as usize) };
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(
+                    crate::arch::phys_to_virt(frame),
+                    PAGE_SIZE as usize,
+                )
+            };
             let _ = f.pread(buf, file_offset);
         } else {
             // No file, zero-fill
             unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
             }
         }
 
@@ -938,19 +942,23 @@ fn populate_page(
         // Initialize page contents
         if is_anonymous {
             unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
             }
         } else if let Some(f) = file {
             let file_offset = vma_offset + (addr - vma_start);
             unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
             }
-            let buf =
-                unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE as usize) };
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(
+                    crate::arch::phys_to_virt(frame),
+                    PAGE_SIZE as usize,
+                )
+            };
             let _ = f.pread(buf, file_offset);
         } else {
             unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
             }
         }
 

@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
 use spin::RwLock;
 
-use crate::arch::phys_to_virt;
+use crate::arch::{phys_to_virt, virt_to_phys};
 use crate::frame_alloc::{BitmapFrameAllocator, FRAME_SIZE};
 
 /// DMA address type - what devices see
@@ -278,11 +278,9 @@ impl DirectDmaOps {
         Self { frame_alloc }
     }
 
-    /// Convert CPU address to physical address
-    /// Assumes identity mapping for kernel addresses
+    /// Convert a CPU (direct-map or kernel image) address to physical
     fn cpu_to_phys(&self, cpu_addr: *const u8) -> u64 {
-        // In identity-mapped kernel, virtual == physical
-        cpu_addr as u64
+        virt_to_phys(cpu_addr as u64)
     }
 
     /// Check if physical address fits within DMA mask
@@ -315,11 +313,11 @@ impl DmaOps for DirectDmaOps {
 
             // Zero the memory (coherent memory should be zeroed)
             unsafe {
-                core::ptr::write_bytes(first_frame as *mut u8, 0, size);
+                core::ptr::write_bytes(phys_to_virt(first_frame), 0, size);
             }
 
             return Some(DmaCoherent {
-                cpu_addr: first_frame as *mut u8,
+                cpu_addr: phys_to_virt(first_frame),
                 dma_addr: DmaAddr(first_frame),
                 size,
             });
@@ -406,8 +404,7 @@ impl DmaOps for DirectDmaOps {
             use crate::arch::aarch64::cache;
             match direction {
                 DmaDirection::FromDevice | DmaDirection::Bidirectional => {
-                    // dma_addr == cpu_addr for direct mapping
-                    cache::cache_invalidate_range(dma_addr.0 as *const u8, size);
+                    cache::cache_invalidate_range(phys_to_virt(dma_addr.0), size);
                 }
                 DmaDirection::ToDevice => {
                     // No invalidation needed - device only read the data
@@ -473,7 +470,7 @@ impl DmaOps for DirectDmaOps {
             use crate::arch::aarch64::cache;
             match direction {
                 DmaDirection::FromDevice | DmaDirection::Bidirectional => {
-                    cache::cache_invalidate_range(dma_addr.0 as *const u8, size);
+                    cache::cache_invalidate_range(phys_to_virt(dma_addr.0), size);
                 }
                 DmaDirection::ToDevice => {}
             }
@@ -500,7 +497,7 @@ impl DmaOps for DirectDmaOps {
             use crate::arch::aarch64::cache;
             match direction {
                 DmaDirection::ToDevice | DmaDirection::Bidirectional => {
-                    cache::cache_clean_range(dma_addr.0 as *const u8, size);
+                    cache::cache_clean_range(phys_to_virt(dma_addr.0), size);
                 }
                 DmaDirection::FromDevice => {}
             }

@@ -591,7 +591,11 @@ fn do_splice_file_to_pipe(
 
     // Copy data to page
     unsafe {
-        core::ptr::copy_nonoverlapping(buf.as_ptr(), page.frame as *mut u8, bytes_read);
+        core::ptr::copy_nonoverlapping(
+            buf.as_ptr(),
+            crate::arch::phys_to_virt(page.frame),
+            bytes_read,
+        );
     }
 
     // Insert into pipe
@@ -657,7 +661,7 @@ fn do_splice_pipe_to_file(
         // Copy data from page to temporary buffer
         let mut buf = [0u8; PAGE_SIZE];
         unsafe {
-            let src = (page.frame as *const u8).add(offset as usize);
+            let src = (crate::arch::phys_to_virt(page.frame) as *const u8).add(offset as usize);
             core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), to_write);
         }
 
@@ -807,7 +811,9 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
         let to_copy = (user_iov.len as usize).min(PAGE_SIZE);
         // SAFETY: page.frame is a freshly allocated, kernel-mapped page of
         // PAGE_SIZE bytes owned by this pipe buffer.
-        let dst = unsafe { core::slice::from_raw_parts_mut(page.frame as *mut u8, to_copy) };
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(page.frame), to_copy)
+        };
         if copy_from_user::<Uaccess>(dst, user_iov.base, to_copy).is_err() {
             // Bytes already queued count as success (Linux iov_iter)
             pipe.wait_queue.wake_all();

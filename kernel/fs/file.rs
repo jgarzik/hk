@@ -870,7 +870,7 @@ pub fn generic_file_read(
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             page_buf.as_ptr(),
-                            page.frame as *mut u8,
+                            crate::arch::phys_to_virt(page.frame),
                             PAGE_SIZE,
                         );
                     }
@@ -886,7 +886,7 @@ pub fn generic_file_read(
 
         // Copy data from page to user buffer (page is refcounted, safe to access)
         unsafe {
-            let src = (page.frame as *const u8).add(offset_in_page);
+            let src = (crate::arch::phys_to_virt(page.frame) as *const u8).add(offset_in_page);
             core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
         }
 
@@ -992,7 +992,7 @@ pub fn generic_file_write(
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         page_buf.as_ptr(),
-                        page.frame as *mut u8,
+                        crate::arch::phys_to_virt(page.frame),
                         PAGE_SIZE,
                     );
                 }
@@ -1004,7 +1004,7 @@ pub fn generic_file_write(
 
         // Write data to the page
         unsafe {
-            let dst = (page.frame as *mut u8).add(offset_in_page);
+            let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
             core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
         }
 
@@ -1114,7 +1114,7 @@ pub fn generic_file_pread(
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             page_buf.as_ptr(),
-                            page.frame as *mut u8,
+                            crate::arch::phys_to_virt(page.frame),
                             PAGE_SIZE,
                         );
                     }
@@ -1130,7 +1130,7 @@ pub fn generic_file_pread(
 
         // Copy data from page to user buffer (page is refcounted, safe to access)
         unsafe {
-            let src = (page.frame as *const u8).add(offset_in_page);
+            let src = (crate::arch::phys_to_virt(page.frame) as *const u8).add(offset_in_page);
             core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
         }
 
@@ -1234,7 +1234,7 @@ pub fn generic_file_pwrite(
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         page_buf.as_ptr(),
-                        page.frame as *mut u8,
+                        crate::arch::phys_to_virt(page.frame),
                         PAGE_SIZE,
                     );
                 }
@@ -1246,7 +1246,7 @@ pub fn generic_file_pwrite(
 
         // Write data to the page
         unsafe {
-            let dst = (page.frame as *mut u8).add(offset_in_page);
+            let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
             core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
         }
 

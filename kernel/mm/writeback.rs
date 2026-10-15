@@ -196,7 +196,11 @@ pub fn do_writepages(addr_space: &AddressSpace, wbc: &mut WritebackControl) -> R
         // Copy page content to temporary buffer
         let mut buf = [0u8; PAGE_SIZE];
         unsafe {
-            core::ptr::copy_nonoverlapping(page.frame as *const u8, buf.as_mut_ptr(), PAGE_SIZE);
+            core::ptr::copy_nonoverlapping(
+                crate::arch::phys_to_virt(page.frame) as *const u8,
+                buf.as_mut_ptr(),
+                PAGE_SIZE,
+            );
         }
 
         // Call filesystem's writepage

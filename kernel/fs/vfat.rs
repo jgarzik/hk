@@ -509,7 +509,9 @@ fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), Ker
 
         // Read from block device AFTER releasing the lock
         if needs_read {
-            let page_buf = unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE) };
+            let page_buf = unsafe {
+                core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(frame), PAGE_SIZE)
+            };
             bdev.disk
                 .queue
                 .driver()
@@ -519,7 +521,7 @@ fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), Ker
         // Copy data from page to buffer
         unsafe {
             core::ptr::copy_nonoverlapping(
-                (frame as *const u8).add(offset_in_page),
+                (crate::arch::phys_to_virt(frame) as *const u8).add(offset_in_page),
                 buf.as_mut_ptr().add(buf_offset),
                 chunk_size,
             );
@@ -575,8 +577,9 @@ fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), Kernel
 
         // If this is a partial page write and the page is new, read existing data first
         if needs_read && (offset_in_page != 0 || chunk_size != PAGE_SIZE) {
-            let page_buf =
-                unsafe { core::slice::from_raw_parts_mut(page.frame as *mut u8, PAGE_SIZE) };
+            let page_buf = unsafe {
+                core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(page.frame), PAGE_SIZE)
+            };
             bdev.disk
                 .queue
                 .driver()
@@ -587,7 +590,7 @@ fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), Kernel
         unsafe {
             core::ptr::copy_nonoverlapping(
                 buf.as_ptr().add(buf_offset),
-                (page.frame as *mut u8).add(offset_in_page),
+                crate::arch::phys_to_virt(page.frame).add(offset_in_page),
                 chunk_size,
             );
         }
@@ -2179,7 +2182,7 @@ impl InodeOps for VfatInodeOps {
                         // Lock the page, zero the bytes, mark dirty, unlock
                         page.lock();
                         unsafe {
-                            let ptr = (page.frame as *mut u8).add(offset_in_page);
+                            let ptr = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
                             core::ptr::write_bytes(ptr, 0, zero_len);
                         }
                         page.mark_dirty();

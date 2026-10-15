@@ -22,6 +22,7 @@ pub mod interrupts;
 pub mod io;
 pub mod ioremap;
 pub mod irq;
+pub mod kmap;
 pub mod lapic;
 pub mod paging;
 pub mod percpu;
@@ -409,34 +410,26 @@ impl ArchBusOps for X86_64Arch {
 // Kernel Init Unification Trait Implementations
 // ============================================================================
 
-// Memory layout constants for x86_64
+// Frames start above the boot-time heap (`x86_64_heap` in main.rs)
 const FRAME_ALLOC_BASE: u64 = 0x1200000; // 18MB
-const FRAME_ALLOC_SIZE: u64 = 0xE000000; // ~224MB (up to 256MB total)
 
 impl MemoryLayoutOps for X86_64Arch {
     fn get_frame_alloc_region() -> (u64, u64) {
-        // Try to get memory map from multiboot2
-        let multiboot_info = unsafe { crate::MULTIBOOT2_INFO };
+        let mbi = unsafe { crate::MULTIBOOT2_INFO };
+        let (start, end) =
+            unsafe { crate::multiboot2::find_largest_region_above(mbi, FRAME_ALLOC_BASE) };
+        // Frames are used through the direct map
+        let end = end.min(kmap::direct_end());
+        assert!(
+            start >= FRAME_ALLOC_BASE && end > start,
+            "no RAM for frames"
+        );
+        (start, end - start)
+    }
 
-        let (mem_start, mem_end) = unsafe {
-            crate::multiboot2::find_largest_region_above(multiboot_info, FRAME_ALLOC_BASE)
-        };
-
-        // The kernel reaches frames through the identity map, and the
-        // ioremap window (IOREMAP_BASE..) reuses those virtual addresses
-        // for MMIO: frames above IOREMAP_BASE would alias device
-        // registers (writing a page there wrote to the e1000 and xHCI)
-        let mem_end = mem_end.min(ioremap::IOREMAP_BASE);
-
-        // Use parsed memory map if valid, otherwise fall back to hardcoded values
-        if mem_start >= FRAME_ALLOC_BASE && mem_end > mem_start {
-            (mem_start, mem_end - mem_start)
-        } else {
-            (
-                FRAME_ALLOC_BASE,
-                FRAME_ALLOC_SIZE.min(ioremap::IOREMAP_BASE - FRAME_ALLOC_BASE),
-            )
-        }
+    fn for_each_reserved(f: &mut dyn FnMut(u64, u64)) {
+        let mbi = unsafe { crate::MULTIBOOT2_INFO };
+        unsafe { crate::multiboot2::boot_ranges(mbi, |_, start, end| f(start, end)) };
     }
 }
 

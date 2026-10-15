@@ -572,13 +572,43 @@ wait status word (`code << 8` or the killing signal).
 
 ```rust
 pub struct BitmapFrameAllocator {
-    inner: Mutex<BitmapFrameAllocatorInner>,
+    inner: IrqSpinlock<BitmapFrameAllocatorInner>,
 }
 ```
 
-- Single `Mutex` protects the bitmap and allocation state
-- **NOT IRQ-safe** - must not be called from interrupt context
+- Single `IrqSpinlock` protects the bitmap, refcounts and allocation
+  state (page-fault paths allocate with interrupts enabled; a leaf lock,
+  takes no other lock)
+- Policy: no frame allocation in interrupt context
 - Thread-safe via `&self` methods (`alloc()`, `free()`)
+
+#### Kernel Page Tables (kernel half)
+
+**Location:** `kernel/arch/x86_64/kmap.rs`, `kernel/arch/x86_64/ioremap.rs`;
+layout in `doc/MEMORY.md`
+
+- The kernel half (direct map of RAM, kernel image, vmalloc/ioremap
+  window) is built once on the BSP before SMP and before any user
+  address space exists. Every top-level kernel entry is created then,
+  including the (empty) vmalloc table, and never changes afterwards:
+  x86 copies PML4[256..512] into each new address space
+  (`copy_kernel_mappings`). Linux: `preallocate_vmalloc_pages`,
+  swapper_pg_dir.
+- Direct-map and image entries are immutable after boot: read without a
+  lock (page walks, `phys_to_virt`/`virt_to_phys` are pure arithmetic).
+- The ioremap window's lower tables are shared by every address space
+  and changed only under `IOREMAP` (`spin::Mutex`, not IRQ-safe, never
+  taken in IRQ context). Under it `FRAME_ALLOCATOR` is taken for new
+  table frames; `IOREMAP` is a leaf otherwise (Linux: `vmap_area_lock`
+  + `init_mm.page_table_lock`).
+- TLB: ioremap/iounmap flush the local CPU only (`invlpg`); x86 has no
+  kernel TLB shootdown yet, so after
+  iounmap another CPU may still cache the old translation of a range
+  that is handed out again (gap vs Linux `flush_tlb_kernel_range`,
+  section 9; drivers do not iounmap in practice).
+- User half: per address space, changed only by its owner under the
+  task's mm lock (see the page fault and mmap paths); never contains a
+  kernel mapping.
 
 #### Heap Allocator
 
@@ -2177,6 +2207,7 @@ Features present in Linux but not yet implemented in hk:
 | lockdep | Runtime deadlock detection | Not implemented | Manual ordering verification |
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
 | Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
+| Kernel TLB shootdown | `flush_tlb_kernel_range` IPIs | x86: local `invlpg` only | Stale ioremap translation on other CPUs after iounmap |
 
 ### Implications
 

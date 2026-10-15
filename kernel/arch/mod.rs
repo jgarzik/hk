@@ -108,13 +108,11 @@ pub use x86_64::uapi;
 pub use aarch64::uapi;
 
 // Physical-to-virtual address conversion
-// Phase 1: Identity mapping (PAGE_OFFSET = 0)
-// Phase 2: High-address kernel (PAGE_OFFSET = direct map base)
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::paging::phys_to_virt;
+pub use x86_64::paging::{self, phys_to_virt, virt_to_phys};
 
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::paging::phys_to_virt;
+pub use aarch64::paging::{self, phys_to_virt, virt_to_phys};
 
 bitflags! {
     /// Page flags for memory mapping

@@ -499,7 +499,11 @@ impl InodeOps for RamfsInodeOps {
         // Copy from page to buffer
         let page_size = buf.len();
         unsafe {
-            core::ptr::copy_nonoverlapping(page.frame as *const u8, buf.as_mut_ptr(), page_size);
+            core::ptr::copy_nonoverlapping(
+                crate::arch::phys_to_virt(page.frame) as *const u8,
+                buf.as_mut_ptr(),
+                page_size,
+            );
         }
 
         Ok(page_size)
@@ -543,7 +547,11 @@ impl InodeOps for RamfsInodeOps {
 
         // Copy from buffer to page
         unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), page.frame as *mut u8, page_size);
+            core::ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                crate::arch::phys_to_virt(page.frame),
+                page_size,
+            );
         }
         page.mark_dirty();
 
@@ -1078,7 +1086,7 @@ impl FileOps for RamfsFileOps {
 
             // Copy data from page to user buffer
             unsafe {
-                let src = (page.frame as *const u8).add(offset_in_page);
+                let src = (crate::arch::phys_to_virt(page.frame) as *const u8).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
             }
 
@@ -1147,7 +1155,7 @@ impl FileOps for RamfsFileOps {
 
             // Copy data from user buffer to page
             unsafe {
-                let dst = (page.frame as *mut u8).add(offset_in_page);
+                let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
             }
 
@@ -1224,7 +1232,7 @@ impl FileOps for RamfsFileOps {
 
             // Copy data from page to user buffer
             unsafe {
-                let src = (page.frame as *const u8).add(offset_in_page);
+                let src = (crate::arch::phys_to_virt(page.frame) as *const u8).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
             }
 
@@ -1293,7 +1301,7 @@ impl FileOps for RamfsFileOps {
 
             // Copy data from user buffer to page
             unsafe {
-                let dst = (page.frame as *mut u8).add(offset_in_page);
+                let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
             }
 
@@ -1596,7 +1604,7 @@ pub fn ramfs_create_file_with_timestamp(
 
             // Copy content to page
             unsafe {
-                let dst = (page.frame as *mut u8).add(offset_in_page);
+                let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(content[bytes_written..].as_ptr(), dst, chunk_size);
             }
             page.mark_dirty();

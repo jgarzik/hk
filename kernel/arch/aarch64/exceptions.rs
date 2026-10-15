@@ -393,7 +393,11 @@ fn try_huge_page_fault(
 
     // Zero the 2MB region
     unsafe {
-        core::ptr::write_bytes(huge_frame as *mut u8, 0, HUGE_PAGE_SIZE as usize);
+        core::ptr::write_bytes(
+            crate::arch::phys_to_virt(huge_frame),
+            0,
+            HUGE_PAGE_SIZE as usize,
+        );
     }
 
     // Build page flags from VMA protection
@@ -532,7 +536,7 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
     if vma_is_anonymous {
         // Anonymous mapping - zero the page
         unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
     } else if let Some(file) = vma_file {
         // File-backed mapping - read file contents into the page
@@ -542,20 +546,22 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
 
         // First zero the frame in case the read is partial (e.g., at EOF)
         unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
 
         // Read from file into the frame
         // Note: We read directly into the physical frame since it's identity-mapped
         // in the kernel's address space for low physical addresses
-        let buf = unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE as usize) };
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(frame), PAGE_SIZE as usize)
+        };
         let _read_result = file.pread(buf, file_offset);
         // If read fails or returns less than PAGE_SIZE, the remaining bytes are already zeroed
         // This matches Linux behavior for holes/errors
     } else {
         // File-backed but no file reference (shouldn't happen) - zero it
         unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
     }
 

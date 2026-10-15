@@ -96,7 +96,7 @@ impl ShmidKernel {
 
             // Zero the frame
             unsafe {
-                let ptr = frame as *mut u8;
+                let ptr = crate::arch::phys_to_virt(frame);
                 core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
             }
 

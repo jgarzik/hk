@@ -750,7 +750,7 @@ impl AddressSpace {
             let mut buf = [0u8; PAGE_SIZE];
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    page.frame as *const u8,
+                    crate::arch::phys_to_virt(page.frame) as *const u8,
                     buf.as_mut_ptr(),
                     PAGE_SIZE,
                 );
@@ -989,7 +989,7 @@ impl PageCache {
         // Copy data to frame
         unsafe {
             // Zero the frame first (important for partial pages and BSS)
-            ::core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
+            ::core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE);
 
             // Calculate how much data to copy
             let file_offset = page_offset * PAGE_SIZE as u64;
@@ -997,7 +997,7 @@ impl PageCache {
                 let copy_len = ::core::cmp::min(PAGE_SIZE, file_data.len() - file_offset as usize);
                 ::core::ptr::copy_nonoverlapping(
                     file_data.as_ptr().add(file_offset as usize),
-                    frame as *mut u8,
+                    crate::arch::phys_to_virt(frame),
                     copy_len,
                 );
             }
@@ -1118,7 +1118,7 @@ impl PageCache {
                     let mut buf = [0u8; PAGE_SIZE];
                     unsafe {
                         core::ptr::copy_nonoverlapping(
-                            entry.page.frame as *const u8,
+                            crate::arch::phys_to_virt(entry.page.frame) as *const u8,
                             buf.as_mut_ptr(),
                             PAGE_SIZE,
                         );
@@ -1217,7 +1217,7 @@ impl PageCache {
 
         // Zero the frame
         unsafe {
-            ::core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
+            ::core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE);
         }
 
         // Create cached page

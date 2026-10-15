@@ -641,14 +641,16 @@ fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
     // - Bit 2 (U): User mode access (1) or supervisor (0)
     let present = (error_code & 1) != 0;
     let write = (error_code & 2) != 0;
-    let user = (error_code & 4) != 0;
-    // Kernel-mode access to a user address (copy_to_user etc.) is resolved
-    // exactly like a user access (Linux: do_user_addr_fault)
-    let user = user || fault_addr < 0x0000_8000_0000_0000;
+    // Only user addresses are demand-paged or COW; a kernel access to
+    // one (copy_to_user etc.) is resolved like a user access (Linux:
+    // do_user_addr_fault). Kernel-half addresses are never resolved.
+    if fault_addr >= crate::arch::x86_64::paging::TASK_SIZE {
+        return None;
+    }
 
     // Case 0: Swap fault - non-present page with swap entry in PTE
     // Must check before demand paging since swapped pages have valid PTEs
-    if !present && user {
+    if !present {
         // Get current task's page table
         let cr3: u64;
         unsafe {
@@ -663,10 +665,7 @@ fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
     }
 
     // Case 1: Demand paging - page not present, check if in mmap'd VMA
-    if !present
-        && user
-        && let Some(result) = handle_mmap_fault(fault_addr, write)
-    {
+    if !present && let Some(result) = handle_mmap_fault(fault_addr, write) {
         return Some(result);
     }
     // Fall through - might be a legitimate segfault
@@ -851,7 +850,7 @@ fn try_huge_page_fault(
 
     // Zero the 2MB region
     unsafe {
-        core::ptr::write_bytes(huge_frame as *mut u8, 0, HUGE_PAGE_SIZE as usize);
+        core::ptr::write_bytes(phys_to_virt(huge_frame), 0, HUGE_PAGE_SIZE as usize);
     }
 
     // Build page flags from VMA protection
@@ -987,7 +986,7 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
     if vma_is_anonymous {
         // Anonymous mapping - zero the page
         unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
     } else if let Some(file) = vma_file {
         // File-backed mapping - read file contents into the page
@@ -997,20 +996,19 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
 
         // First zero the frame in case the read is partial (e.g., at EOF)
         unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
 
-        // Read from file into the frame
-        // Note: We read directly into the physical frame since it's identity-mapped
-        // in the kernel's address space for low physical addresses
-        let buf = unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE as usize) };
+        // Read from file into the frame (through the direct map)
+        let buf =
+            unsafe { core::slice::from_raw_parts_mut(phys_to_virt(frame), PAGE_SIZE as usize) };
         let _read_result = file.pread(buf, file_offset);
         // If read fails or returns less than PAGE_SIZE, the remaining bytes are already zeroed
         // This matches Linux behavior for holes/errors
     } else {
         // File-backed but no file reference (shouldn't happen) - zero it
         unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
     }
 
@@ -1084,39 +1082,39 @@ pub fn map_user_page(cr3: u64, vaddr: u64, paddr: u64, flags: u64) -> Result<(),
     let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
 
     unsafe {
-        let pml4 = cr3 as *mut u64;
+        let pml4 = phys_to_virt(cr3) as *mut u64;
 
         // Get or create PDPT
         let pml4_entry = *pml4.add(pml4_idx);
         let pdpt = if pml4_entry & PAGE_PRESENT != 0 {
-            (pml4_entry & 0x000F_FFFF_FFFF_F000) as *mut u64
+            phys_to_virt(pml4_entry & 0x000F_FFFF_FFFF_F000) as *mut u64
         } else {
             let new_pdpt = crate::FRAME_ALLOCATOR.alloc().ok_or(())?;
-            core::ptr::write_bytes(new_pdpt as *mut u8, 0, 4096);
+            core::ptr::write_bytes(phys_to_virt(new_pdpt), 0, 4096);
             *pml4.add(pml4_idx) = new_pdpt | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-            new_pdpt as *mut u64
+            phys_to_virt(new_pdpt) as *mut u64
         };
 
         // Get or create PD
         let pdpt_entry = *pdpt.add(pdpt_idx);
         let pd = if pdpt_entry & PAGE_PRESENT != 0 {
-            (pdpt_entry & 0x000F_FFFF_FFFF_F000) as *mut u64
+            phys_to_virt(pdpt_entry & 0x000F_FFFF_FFFF_F000) as *mut u64
         } else {
             let new_pd = crate::FRAME_ALLOCATOR.alloc().ok_or(())?;
-            core::ptr::write_bytes(new_pd as *mut u8, 0, 4096);
+            core::ptr::write_bytes(phys_to_virt(new_pd), 0, 4096);
             *pdpt.add(pdpt_idx) = new_pd | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-            new_pd as *mut u64
+            phys_to_virt(new_pd) as *mut u64
         };
 
         // Get or create PT
         let pd_entry = *pd.add(pd_idx);
         let pt = if pd_entry & PAGE_PRESENT != 0 {
-            (pd_entry & 0x000F_FFFF_FFFF_F000) as *mut u64
+            phys_to_virt(pd_entry & 0x000F_FFFF_FFFF_F000) as *mut u64
         } else {
             let new_pt = crate::FRAME_ALLOCATOR.alloc().ok_or(())?;
-            core::ptr::write_bytes(new_pt as *mut u8, 0, 4096);
+            core::ptr::write_bytes(phys_to_virt(new_pt), 0, 4096);
             *pd.add(pd_idx) = new_pt | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-            new_pt as *mut u64
+            phys_to_virt(new_pt) as *mut u64
         };
 
         // Set the PTE
@@ -1151,14 +1149,14 @@ pub fn unmap_user_page(cr3: u64, vaddr: u64) -> Option<u64> {
 
     unsafe {
         // PML4
-        let pml4 = cr3 as *const u64;
+        let pml4 = phys_to_virt(cr3) as *const u64;
         let pml4_entry = *pml4.add(pml4_idx);
         if pml4_entry & PAGE_PRESENT == 0 {
             return None;
         }
 
         // PDPT
-        let pdpt = (pml4_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pdpt = phys_to_virt(pml4_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
         let pdpt_entry = *pdpt.add(pdpt_idx);
         if pdpt_entry & PAGE_PRESENT == 0 {
             return None;
@@ -1168,7 +1166,7 @@ pub fn unmap_user_page(cr3: u64, vaddr: u64) -> Option<u64> {
         }
 
         // PD
-        let pd = (pdpt_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pd = phys_to_virt(pdpt_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
         let pd_entry = *pd.add(pd_idx);
         if pd_entry & PAGE_PRESENT == 0 {
             return None;
@@ -1178,7 +1176,7 @@ pub fn unmap_user_page(cr3: u64, vaddr: u64) -> Option<u64> {
         }
 
         // PT
-        let pt = (pd_entry & 0x000F_FFFF_FFFF_F000) as *mut u64;
+        let pt = phys_to_virt(pd_entry & 0x000F_FFFF_FFFF_F000) as *mut u64;
         let pte_ptr = pt.add(pt_idx);
         let pte_value = *pte_ptr;
 
@@ -1216,14 +1214,14 @@ unsafe fn get_pte_for_addr(cr3: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
 
     unsafe {
         // PML4
-        let pml4 = cr3 as *const u64;
+        let pml4 = phys_to_virt(cr3) as *const u64;
         let pml4_entry = *pml4.add(pml4_idx);
         if pml4_entry & PAGE_PRESENT == 0 {
             return None;
         }
 
         // PDPT
-        let pdpt = (pml4_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pdpt = phys_to_virt(pml4_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
         let pdpt_entry = *pdpt.add(pdpt_idx);
         if pdpt_entry & PAGE_PRESENT == 0 {
             return None;
@@ -1233,7 +1231,7 @@ unsafe fn get_pte_for_addr(cr3: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
         }
 
         // PD
-        let pd = (pdpt_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pd = phys_to_virt(pdpt_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
         let pd_entry = *pd.add(pd_idx);
         if pd_entry & PAGE_PRESENT == 0 {
             return None;
@@ -1243,7 +1241,7 @@ unsafe fn get_pte_for_addr(cr3: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
         }
 
         // PT
-        let pt = (pd_entry & 0x000F_FFFF_FFFF_F000) as *mut u64;
+        let pt = phys_to_virt(pd_entry & 0x000F_FFFF_FFFF_F000) as *mut u64;
         let pte_ptr = pt.add(pt_idx);
         let pte_value = *pte_ptr;
 
@@ -1271,14 +1269,14 @@ unsafe fn get_pte_for_swap(cr3: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
 
     unsafe {
         // PML4 - must be present
-        let pml4 = cr3 as *const u64;
+        let pml4 = phys_to_virt(cr3) as *const u64;
         let pml4_entry = *pml4.add(pml4_idx);
         if pml4_entry & PAGE_PRESENT == 0 {
             return None;
         }
 
         // PDPT - must be present
-        let pdpt = (pml4_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pdpt = phys_to_virt(pml4_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
         let pdpt_entry = *pdpt.add(pdpt_idx);
         if pdpt_entry & PAGE_PRESENT == 0 {
             return None;
@@ -1288,7 +1286,7 @@ unsafe fn get_pte_for_swap(cr3: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
         }
 
         // PD - must be present
-        let pd = (pdpt_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pd = phys_to_virt(pdpt_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
         let pd_entry = *pd.add(pd_idx);
         if pd_entry & PAGE_PRESENT == 0 {
             return None;
@@ -1298,7 +1296,7 @@ unsafe fn get_pte_for_swap(cr3: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
         }
 
         // PT - return PTE regardless of present bit (for swap detection)
-        let pt = (pd_entry & 0x000F_FFFF_FFFF_F000) as *mut u64;
+        let pt = phys_to_virt(pd_entry & 0x000F_FFFF_FFFF_F000) as *mut u64;
         let pte_ptr = pt.add(pt_idx);
         let pte_value = *pte_ptr;
 

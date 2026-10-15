@@ -9,6 +9,7 @@ use ::core::sync::atomic::{AtomicU32, Ordering};
 use super::acpi::AcpiInfo;
 use super::cpu;
 use super::lapic::LocalApic;
+use super::paging::phys_to_virt;
 use super::percpu::{self, MAX_CPUS};
 use crate::arch::FrameAlloc;
 use crate::printkln;
@@ -63,8 +64,9 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
     cpu::save_kernel_gdt_for_aps();
     cpu::save_kernel_idt_for_aps();
 
-    // Get current CR3 for APs to use (they share the same page table)
-    let cr3 = cpu::read_cr3();
+    // APs enable paging on the trampoline table (low identity map +
+    // kernel half), then switch to the kernel table in ap_entry
+    let cr3 = super::kmap::trampoline_pgd();
 
     // Copy trampoline code to low memory
     copy_trampoline();
@@ -105,11 +107,12 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
             let cpu_id_offset = &raw const __ap_data_cpu_id as usize - start;
             let apic_id_offset = &raw const __ap_data_apic_id as usize - start;
 
-            let pml4_ptr = (TRAMPOLINE_ADDR + pml4_offset as u64) as *mut u64;
-            let entry_ptr = (TRAMPOLINE_ADDR + entry_offset as u64) as *mut u64;
-            let stack_ptr = (TRAMPOLINE_ADDR + stack_offset as u64) as *mut u64;
-            let cpu_id_ptr = (TRAMPOLINE_ADDR + cpu_id_offset as u64) as *mut u32;
-            let apic_id_ptr = (TRAMPOLINE_ADDR + apic_id_offset as u64) as *mut u32;
+            let base = phys_to_virt(TRAMPOLINE_ADDR);
+            let pml4_ptr = base.add(pml4_offset) as *mut u64;
+            let entry_ptr = base.add(entry_offset) as *mut u64;
+            let stack_ptr = base.add(stack_offset) as *mut u64;
+            let cpu_id_ptr = base.add(cpu_id_offset) as *mut u32;
+            let apic_id_ptr = base.add(apic_id_offset) as *mut u32;
 
             core::ptr::write_volatile(pml4_ptr, cr3);
             core::ptr::write_volatile(entry_ptr, ap_entry as *const () as u64);
@@ -134,26 +137,15 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
     total
 }
 
-/// Allocate a stack for an AP
+/// Allocate a stack for an AP (physically contiguous, used through
+/// the direct map); its virtual base, 0 if out of memory
 fn allocate_ap_stack<F: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut F) -> u64 {
-    let pages = AP_STACK_SIZE / PAGE_SIZE;
-    let mut base: Option<u64> = None;
-
-    for i in 0..pages {
-        let frame = match frame_alloc.alloc_frame() {
-            Some(f) => f,
-            None => return 0,
-        };
-        if i == 0 {
-            base = Some(frame);
-        }
-        // Zero the frame
-        unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
-        }
-    }
-
-    base.unwrap_or(0)
+    let Some(phys) = frame_alloc.alloc_contig(AP_STACK_SIZE / PAGE_SIZE) else {
+        return 0;
+    };
+    let base = phys_to_virt(phys);
+    unsafe { core::ptr::write_bytes(base, 0, AP_STACK_SIZE) };
+    base as u64
 }
 
 /// Start an AP using INIT-SIPI-SIPI sequence
@@ -269,7 +261,7 @@ fn copy_trampoline() {
         let size = end as usize - start as usize;
 
         // Copy trampoline code to low memory (0x8000)
-        let dest = TRAMPOLINE_ADDR as *mut u8;
+        let dest = phys_to_virt(TRAMPOLINE_ADDR);
         core::ptr::copy_nonoverlapping(start, dest, size);
     }
 }
@@ -290,6 +282,11 @@ pub fn enable_ap_scheduling() {
 /// initialized state.
 #[unsafe(no_mangle)]
 pub extern "C" fn ap_entry(_cpu_id: u32, apic_id: u32) -> ! {
+    // Leave the trampoline table (with its low identity map)
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) super::kmap::swapper_phys(), options(nostack));
+    }
+
     // Load the kernel's GDT (AP is using trampoline's minimal GDT)
     cpu::reload_gdt();
 

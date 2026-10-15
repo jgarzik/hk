@@ -48,6 +48,12 @@ pub fn phys_to_virt(phys: u64) -> *mut u8 {
     (phys + PAGE_OFFSET) as *mut u8
 }
 
+/// Convert a kernel virtual address to physical
+#[inline]
+pub fn virt_to_phys(virt: u64) -> u64 {
+    virt - PAGE_OFFSET
+}
+
 /// Convert physical address to page table pointer
 #[inline]
 pub fn phys_to_virt_table(phys: u64) -> *mut RawPageTable {
@@ -175,6 +181,29 @@ pub const TCR_VALUE: u64 = TCR_T0SZ
     | TCR_ORGN1_WB
     | TCR_IRGN1_WB
     | TCR_IPS_40BIT;
+
+/// Physical address bits of a page table entry
+pub const PTE_ADDR_MASK: u64 = ADDR_MASK;
+
+/// Pointer to the 4KB leaf (L3) entry for `va` in the tables rooted at
+/// `root` (valid or not, e.g. a swap entry); None if an upper level is
+/// missing or is a block
+pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
+    let mut table = phys_to_virt(root) as *mut u64;
+    for shift in [39, 30, 21] {
+        let e = unsafe { *table.add(((va >> shift) & 511) as usize) };
+        if e & 0b11 != DESC_TABLE {
+            return None;
+        }
+        table = phys_to_virt(e & ADDR_MASK) as *mut u64;
+    }
+    Some(unsafe { table.add(((va >> 12) & 511) as usize) })
+}
+
+/// A leaf entry maps a page
+pub fn pte_present(pte: u64) -> bool {
+    pte & 1 != 0
+}
 
 // ============================================================================
 // Page Table Entry Type

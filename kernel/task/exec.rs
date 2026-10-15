@@ -139,7 +139,7 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
 
         // Zero the frame
         unsafe {
-            ::core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            ::core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
 
         // Map with read/write/user permissions
@@ -352,7 +352,7 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
 
             // Zero the frame first (for BSS and partial pages)
             unsafe {
-                ::core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+                ::core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
             }
 
             // Calculate the offset within the page where segment data starts
@@ -384,7 +384,7 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             elf_data.as_ptr().add(copy_start),
-                            (frame as *mut u8).add(in_page_offset),
+                            crate::arch::phys_to_virt(frame).add(in_page_offset),
                             copy_len,
                         );
                     }
@@ -399,7 +399,10 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
             #[cfg(target_arch = "aarch64")]
             {
                 use crate::arch::aarch64::cache;
-                cache::cache_clean_range(frame as *const u8, PAGE_SIZE as usize);
+                cache::cache_clean_range(
+                    crate::arch::phys_to_virt(frame) as *const u8,
+                    PAGE_SIZE as usize,
+                );
             }
 
             // Map the page

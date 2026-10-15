@@ -486,6 +486,7 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
     let stack_base = frame_alloc
         .alloc_contig(stack_pages)
         .ok_or("Out of memory for kernel thread stack")?;
+    let stack_base = crate::arch::phys_to_virt(stack_base) as u64;
     unsafe {
         core::ptr::write_bytes(stack_base as *mut u8, 0, stack_size);
     }
@@ -1170,6 +1171,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // contiguous: separately allocated frames need not be adjacent)
     let stack_pages = KERNEL_STACK_SIZE / PAGE_SIZE as usize;
     let stack_base = try_with_cleanup!(frame_alloc.alloc_contig(stack_pages).ok_or(12)); // ENOMEM
+    let stack_base = crate::arch::phys_to_virt(stack_base) as u64;
     unsafe {
         core::ptr::write_bytes(stack_base as *mut u8, 0, KERNEL_STACK_SIZE);
     }

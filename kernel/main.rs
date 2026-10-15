@@ -90,7 +90,7 @@ use crate::arch::ArchBusOps;
 use crate::arch::{
     AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps,
     MemoryLayoutOps, PerCpuOps, PowerOps, SmpOps, TimekeeperOps, TimerCallbackOps, VfsInitOps,
-    phys_to_virt,
+    phys_to_virt, virt_to_phys,
 };
 use crate::arch::{SchedArch, SyscallOps, UserModeOps};
 
@@ -116,7 +116,7 @@ const KERNEL_HEAP_START: usize = 0x400000; // 4MB
 #[cfg(target_arch = "x86_64")]
 const KERNEL_HEAP_SIZE: usize = 0xE00000; // 14MB (up to 18MB where frame allocator starts)
 
-/// The kernel image as linked (start and end symbols in kernel.ld)
+/// The kernel image in physical memory (start and end symbols in kernel.ld)
 fn kernel_range() -> heap::BootRange {
     unsafe extern "C" {
         static __kernel_start: u8;
@@ -124,8 +124,8 @@ fn kernel_range() -> heap::BootRange {
     }
     heap::BootRange {
         name: "kernel image",
-        start: &raw const __kernel_start as usize,
-        end: &raw const __kernel_end as usize,
+        start: virt_to_phys(&raw const __kernel_start as u64) as usize,
+        end: virt_to_phys(&raw const __kernel_end as u64) as usize,
     }
 }
 
@@ -287,8 +287,9 @@ pub static EMBEDDED_INITRAMFS: &[u8] = include_bytes!("../user/initramfs-aarch64
 #[cfg(all(target_arch = "x86_64", not(test)))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(multiboot_info: u64) -> ! {
-    // Save multiboot info for later use
+    // Kernel page table first: the boot tables' identity map goes away
     unsafe {
+        arch::x86_64::kmap::init(multiboot_info);
         MULTIBOOT2_INFO = multiboot_info;
     }
 
@@ -315,7 +316,7 @@ pub extern "C" fn _start(multiboot_info: u64) -> ! {
     // Initialize heap allocator
     let (heap_start, heap_size) = x86_64_heap(multiboot_info);
     unsafe {
-        ALLOCATOR.init(heap_start, heap_size);
+        ALLOCATOR.init(phys_to_virt(heap_start as u64) as usize, heap_size);
     }
 
     // Initialize architecture-specific code (GDT, IDT, PIC, PIT)
@@ -387,7 +388,7 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
     // Initialize heap allocator
     let (heap_start, heap_size) = aarch64_heap(unsafe { DTB_PTR });
     unsafe {
-        ALLOCATOR.init(heap_start, heap_size);
+        ALLOCATOR.init(phys_to_virt(heap_start as u64) as usize, heap_size);
     }
 
     // Extract and parse kernel command line from DTB /chosen/bootargs
@@ -480,7 +481,11 @@ where
 
                     // Zero the frame first
                     unsafe {
-                        ::core::ptr::write_bytes(private_frame as *mut u8, 0, PAGE_SIZE as usize);
+                        ::core::ptr::write_bytes(
+                            phys_to_virt(private_frame),
+                            0,
+                            PAGE_SIZE as usize,
+                        );
                     }
 
                     // Try to get data from cache or directly from file
@@ -489,8 +494,8 @@ where
                         // Copy from cached page
                         unsafe {
                             ::core::ptr::copy_nonoverlapping(
-                                cached_page.frame as *const u8,
-                                private_frame as *mut u8,
+                                phys_to_virt(cached_page.frame) as *const u8,
+                                phys_to_virt(private_frame),
                                 PC_PAGE_SIZE,
                             );
                         }
@@ -506,7 +511,7 @@ where
                             unsafe {
                                 ::core::ptr::copy_nonoverlapping(
                                     elf_data.as_ptr().add(file_offset as usize),
-                                    private_frame as *mut u8,
+                                    phys_to_virt(private_frame),
                                     copy_len,
                                 );
                             }
@@ -584,7 +589,7 @@ fn zero_bss(frame: u64, va: u64, file_end: u64, mem_end: u64) {
     let hi = mem_end.min(va + PAGE_SIZE);
     if lo < hi {
         unsafe {
-            ::core::ptr::write_bytes((frame + (lo - va)) as *mut u8, 0, (hi - lo) as usize);
+            ::core::ptr::write_bytes(phys_to_virt(frame + (lo - va)), 0, (hi - lo) as usize);
         }
     }
 }
@@ -641,7 +646,7 @@ where
 
         // Zero the frame
         unsafe {
-            ::core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            ::core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
 
         // Map the page
@@ -1021,7 +1026,7 @@ fn kmain() -> ! {
             // Copy from page to buffer
             unsafe {
                 ::core::ptr::copy_nonoverlapping(
-                    (page.frame as *const u8).add(offset_in_page),
+                    (phys_to_virt(page.frame) as *const u8).add(offset_in_page),
                     init_data_vec[bytes_read..].as_mut_ptr(),
                     chunk_size,
                 );
@@ -1100,13 +1105,15 @@ fn kmain() -> ! {
         const INIT_KERNEL_STACK_SIZE: usize = 16 * 1024;
         const FRAME_SIZE: usize = 4096;
         let stack_pages = INIT_KERNEL_STACK_SIZE / FRAME_SIZE;
-        let stack_base = frame_alloc
-            .alloc_contig(stack_pages)
-            .expect("Failed to allocate kernel stack for init");
+        let stack_base = phys_to_virt(
+            frame_alloc
+                .alloc_contig(stack_pages)
+                .expect("Failed to allocate kernel stack for init"),
+        );
         unsafe {
-            ::core::ptr::write_bytes(stack_base as *mut u8, 0, INIT_KERNEL_STACK_SIZE);
+            ::core::ptr::write_bytes(stack_base, 0, INIT_KERNEL_STACK_SIZE);
         }
-        stack_base + INIT_KERNEL_STACK_SIZE as u64
+        stack_base as u64 + INIT_KERNEL_STACK_SIZE as u64
     };
 
     printkln!("KERNEL_READY");

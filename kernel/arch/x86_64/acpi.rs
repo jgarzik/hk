@@ -172,7 +172,7 @@ fn map_acpi_table(phys_addr: u64) -> Result<*mut u8, &'static str> {
 
 /// Parse ACPI tables and extract SMP and power information
 pub fn parse_acpi() -> Result<AcpiInfo, &'static str> {
-    // Find RSDP (always in low memory, identity-mapped)
+    // Find RSDP (in low memory, read through the direct map)
     let rsdp = find_rsdp()?;
 
     // Get RSDT or XSDT address (physical address, may be above 512MB!)
@@ -209,7 +209,8 @@ pub fn parse_acpi() -> Result<AcpiInfo, &'static str> {
 fn find_rsdp() -> Result<*const Rsdp, &'static str> {
     // Search EBDA (Extended BIOS Data Area)
     // The EBDA segment is stored at physical address 0x40E
-    let ebda_segment = unsafe { core::ptr::read_volatile(0x40E as *const u16) };
+    let ebda_segment =
+        unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(0x40E) as *const u16) };
     let ebda_addr = (ebda_segment as usize) << 4;
 
     if ebda_addr != 0
@@ -233,18 +234,20 @@ fn search_rsdp(start: usize, length: usize) -> Option<*const Rsdp> {
     let start_aligned = start & !0xF;
     let end = start + length;
 
+    // Low memory is read through the direct map
+    let virt = |phys: usize| super::paging::phys_to_virt(phys as u64) as usize;
     let mut addr = start_aligned;
     while addr < end {
         // Read signature bytes using volatile reads
-        let sig_ptr = addr as *const [u8; 8];
+        let sig_ptr = virt(addr) as *const [u8; 8];
         let signature = unsafe { core::ptr::read_volatile(sig_ptr) };
 
         if signature == *RSDP_SIGNATURE {
-            let ptr = addr as *const Rsdp;
+            let ptr = virt(addr) as *const Rsdp;
             // Verify basic checksum (first 20 bytes)
             if checksum_valid(ptr as *const u8, core::mem::size_of::<Rsdp>()) {
                 // For ACPI 2.0+, also verify extended checksum (full 36 bytes)
-                let revision = unsafe { core::ptr::read_volatile((addr + 15) as *const u8) };
+                let revision = unsafe { core::ptr::read_volatile(virt(addr + 15) as *const u8) };
                 if revision >= 2 && !checksum_valid(ptr as *const u8, core::mem::size_of::<Rsdp2>())
                 {
                     // Extended checksum failed, keep searching
