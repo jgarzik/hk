@@ -77,6 +77,7 @@ pub mod prctl_extra;
 pub mod poll;
 pub mod timing;
 pub mod uaccess;
+pub mod packet;
 #[cfg(target_arch = "x86_64")]
 pub mod ioport;
 
@@ -137,6 +138,7 @@ pub fn run_all_tests() {
     icmp::run_tests();
     icmp::run_ping_tests();
     raw::run_tests();
+    packet::run_tests();
     tcp_xfer::run_tests();
     tcp_conn::run_tests();
     tcp_opt::run_tests();
