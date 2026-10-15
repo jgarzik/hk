@@ -137,7 +137,8 @@ test:
 	cargo test -p hk-kernel
 
 # QEMU boot test timeout in seconds (TCG on CI hosts without KVM is slow)
-BOOT_TEST_TIMEOUT ?= 90
+# Bounds hangs only; the full suite takes ~1 min locally, longer on CI
+BOOT_TEST_TIMEOUT ?= 600
 
 # QEMU -cpu override for the boot tests (see run-qemu.sh), e.g. QEMU_CPU=max
 export QEMU_CPU
