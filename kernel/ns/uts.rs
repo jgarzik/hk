@@ -19,7 +19,7 @@ use spin::{Lazy, RwLock};
 
 use crate::arch::Uaccess;
 use crate::error::KernelError;
-use crate::uaccess::UaccessArch;
+use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 
 /// Maximum string length for UTS fields (not including NUL terminator)
 ///
@@ -203,10 +203,15 @@ pub fn sys_uname(buf: u64) -> i64 {
     let tmp: NewUtsname = *uts_ns.name.read();
 
     // Copy to user space
-    unsafe {
-        Uaccess::user_access_begin();
-        core::ptr::copy_nonoverlapping(&tmp as *const NewUtsname, buf as *mut NewUtsname, 1);
-        Uaccess::user_access_end();
+    // SAFETY: NewUtsname is repr(C) plain bytes with no padding
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &tmp as *const NewUtsname as *const u8,
+            core::mem::size_of::<NewUtsname>(),
+        )
+    };
+    if copy_to_user::<Uaccess>(buf, bytes).is_err() {
+        return KernelError::BadAddress.sysret();
     }
 
     0
@@ -246,10 +251,8 @@ pub fn sys_sethostname(name: u64, len: u64) -> i64 {
 
     // Copy from user
     let mut tmp = [0u8; UTS_FIELD_SIZE];
-    unsafe {
-        Uaccess::user_access_begin();
-        core::ptr::copy_nonoverlapping(name as *const u8, tmp.as_mut_ptr(), len);
-        Uaccess::user_access_end();
+    if copy_from_user::<Uaccess>(&mut tmp, name, len).is_err() {
+        return KernelError::BadAddress.sysret();
     }
 
     // Get UTS namespace and update
@@ -296,10 +299,8 @@ pub fn sys_setdomainname(name: u64, len: u64) -> i64 {
 
     // Copy from user
     let mut tmp = [0u8; UTS_FIELD_SIZE];
-    unsafe {
-        Uaccess::user_access_begin();
-        core::ptr::copy_nonoverlapping(name as *const u8, tmp.as_mut_ptr(), len);
-        Uaccess::user_access_end();
+    if copy_from_user::<Uaccess>(&mut tmp, name, len).is_err() {
+        return KernelError::BadAddress.sysret();
     }
 
     // Get UTS namespace and update

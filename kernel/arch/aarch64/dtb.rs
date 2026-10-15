@@ -45,6 +45,9 @@ pub fn parse_dtb(dtb_ptr: u64) -> Option<AcpiInfo> {
     // Extract GIC distributor base address
     let gic_base = extract_gic_base(&dt)?;
 
+    // PCI INTx routing (host bridge interrupt-map)
+    super::pci_irq::init_from_dt(&dt);
+
     // Extract CPU list
     let cpus = extract_cpus(&dt);
 
@@ -134,6 +137,20 @@ fn extract_cpus(dt: &DeviceTree) -> Vec<CpuInfo> {
     cpus.sort_by_key(|c| c.hw_cpu_id);
 
     cpus
+}
+
+/// Total size of the FDT blob at `dtb_ptr` (header `totalsize`), if
+/// the magic matches; reads only the header, so it is usable before the
+/// heap exists
+pub fn total_size(dtb_ptr: u64) -> Option<usize> {
+    if dtb_ptr == 0 {
+        return None;
+    }
+    let h = unsafe { core::slice::from_raw_parts(dtb_ptr as *const u8, 8) };
+    if h[..4] != [0xd0, 0x0d, 0xfe, 0xed] {
+        return None;
+    }
+    Some(u32::from_be_bytes([h[4], h[5], h[6], h[7]]) as usize)
 }
 
 /// Initramfs location from DTB

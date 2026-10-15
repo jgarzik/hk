@@ -155,49 +155,6 @@ pub fn sys_setpriority(
     }
 }
 
-/// sys_nice - adjust process priority (nice value)
-///
-/// Adds `inc` to the nice value for the calling process.
-/// Positive values decrease priority, negative values increase it.
-///
-/// # Arguments
-/// * `inc` - Nice value increment
-/// * `caller_pid` - PID of calling process
-/// * `caller_euid` - Effective UID of calling process
-///
-/// # Returns
-/// * New nice value on success (can be negative!)
-/// * Note: Unlike POSIX, Linux nice() returns the new nice value
-///
-/// # Permission Model
-/// - Any process can lower its priority (increase nice)
-/// - Only root can raise its priority (decrease nice)
-///
-/// # Locking
-/// Acquires TASK_TABLE lock to modify priority.
-pub fn sys_nice(inc: i32, caller_pid: Pid, caller_euid: super::Uid) -> i64 {
-    // Get current nice value
-    let current_nice = match super::percpu::lookup_task_priority(caller_pid) {
-        Some(priority) => super::priority_to_nice(priority),
-        None => return KernelError::NoProcess.sysret(),
-    };
-
-    // Calculate new nice value (clamped to valid range)
-    let new_nice = (current_nice + inc).clamp(super::PRIO_MIN, super::PRIO_MAX);
-
-    // Permission check: non-root cannot increase priority (decrease nice)
-    if new_nice < current_nice && caller_euid != 0 {
-        return KernelError::NotPermitted.sysret();
-    }
-
-    // Set the new priority
-    let new_priority = super::nice_to_priority(new_nice);
-    match super::percpu::set_task_priority(caller_pid, new_priority) {
-        Ok(()) => new_nice as i64,
-        Err(errno) => -(errno as i64),
-    }
-}
-
 /// sys_sched_getscheduler - get scheduling policy
 ///
 /// Returns the scheduling policy of the process specified by pid.

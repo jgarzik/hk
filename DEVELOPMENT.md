@@ -118,6 +118,11 @@ The default QEMU setup:
 - Display: `-nographic` (console mode)
 - x86-64: Boots from ISO with GRUB
 - aarch64: Direct kernel boot with device tree
+- CPU: x86-64 `-cpu host` under KVM, `-cpu max` under TCG (SMAP/SMEP);
+  aarch64 `-cpu neoverse-n1` (PAN). SMAP/PAN make any kernel access to
+  user memory outside `kernel/uaccess.rs` fault, so the boot tests catch
+  it. Override with `QEMU_CPU`, e.g. `make check QEMU_CPU=qemu64` or
+  `make check-arm QEMU_CPU=cortex-a72` (no SMAP/PAN).
 
 ### Boot Test
 

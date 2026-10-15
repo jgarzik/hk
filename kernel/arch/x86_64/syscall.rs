@@ -110,6 +110,8 @@ pub const SYS_EXIT: u64 = 60;
 pub const SYS_GETTIMEOFDAY: u64 = 96;
 /// gettid()
 pub const SYS_GETTID: u64 = 186;
+/// getdents(fd, dirp, count) (legacy struct linux_dirent)
+pub const SYS_GETDENTS: u64 = 78;
 /// getdents64(fd, dirp, count)
 pub const SYS_GETDENTS64: u64 = 217;
 /// clock_gettime(clockid, tp)
@@ -535,8 +537,8 @@ pub const SYS_SCHED_RR_GET_INTERVAL: u64 = 148;
 pub const SYS_SCHED_SETAFFINITY: u64 = 203;
 /// sched_getaffinity(pid, cpusetsize, mask)
 pub const SYS_SCHED_GETAFFINITY: u64 = 204;
-/// nice(inc)
-pub const SYS_NICE: u64 = 34;
+/// pause()
+pub const SYS_PAUSE: u64 = 34;
 
 // Resource limits
 /// getrlimit(resource, rlim)
@@ -761,7 +763,12 @@ static mut SYSCALL_KERNEL_STACK: u64 = 0;
 ///
 /// Called from switch_to.S assembly during initial context switch.
 #[unsafe(no_mangle)]
+///
+/// Global like the TSS: `stack == 0` (kernel threads) leaves it alone.
 pub extern "C" fn set_syscall_kernel_stack(stack: u64) {
+    if stack == 0 {
+        return;
+    }
     unsafe {
         SYSCALL_KERNEL_STACK = stack;
     }
@@ -950,6 +957,10 @@ unsafe extern "C" fn syscall_entry() {
         // Pass RSP as the frame base pointer
         "mov rdi, rsp",
         "call {update_frame}",
+        // Non-zero: rt_sigreturn restored a full user context; leave through
+        // IRETQ, which (unlike SYSRET) restores RCX and R11 too
+        "test rax, rax",
+        "jnz 5f",
 
         // Restore caller-saved registers (in reverse order of pushes)
         // Push order was: rax, rdi, rsi, rdx, r10, r8, r9
@@ -1003,11 +1014,40 @@ unsafe extern "C" fn syscall_entry() {
         // All other registers have been properly restored
         "sysretq",
 
+        // IRETQ exit. Frame layout as above, F = frame base:
+        //   F+0 r9, F+8 r8, F+16 r10, F+24 rdx, F+32 rsi, F+40 rdi, F+48 rax,
+        //   F+56 r15 .. F+96 rbx, F+104..F+128 rflags/rip/user rsp
+        // Below it: IRET frame (rip, cs, rflags, rsp, ss) + user rcx, r11
+        "5:",
+        "sub rsp, 56",
+        "mov rdi, rsp",
+        "call {fill_iret}",
+        // F = rsp + 56; the empty kernel stack starts at F + 128
+        "lea rax, [rsp + 184]",
+        "mov [rip + {kstack}], rax",
+        "mov r9, [rsp + 56]",
+        "mov r8, [rsp + 64]",
+        "mov r10, [rsp + 72]",
+        "mov rdx, [rsp + 80]",
+        "mov rsi, [rsp + 88]",
+        "mov rdi, [rsp + 96]",
+        "mov rax, [rsp + 104]",
+        "mov r15, [rsp + 112]",
+        "mov r14, [rsp + 120]",
+        "mov r13, [rsp + 128]",
+        "mov r12, [rsp + 136]",
+        "mov rbp, [rsp + 144]",
+        "mov rbx, [rsp + 152]",
+        "mov rcx, [rsp + 40]",
+        "mov r11, [rsp + 48]",
+        "iretq",
+
         handler = sym syscall_handler,
         kstack = sym SYSCALL_KERNEL_STACK,
         save_syscall_state = sym super::percpu::save_syscall_state,
         save_syscall_caller_saved = sym super::percpu::save_syscall_caller_saved,
         update_frame = sym super::percpu::update_syscall_return_frame,
+        fill_iret = sym super::percpu::fill_iret_frame,
     );
 }
 
@@ -1222,6 +1262,7 @@ pub fn x86_64_syscall_dispatch(
         sys_fsync,
         sys_ftruncate,
         sys_getcwd,
+        sys_getdents,
         sys_getdents64,
         sys_getxattr,
         // ioctl
@@ -1305,6 +1346,11 @@ pub fn x86_64_syscall_dispatch(
     // Account for entering kernel mode
     percpu::account_syscall_enter();
 
+    // Remember the syscall number for -ERESTART* restarts
+    unsafe {
+        crate::arch::x86_64::percpu::current_cpu_mut().syscall_nr = num;
+    }
+
     // Check seccomp policy before executing syscall
     // Note: ip is not available here, pass 0 for now
     if let Some(result) =
@@ -1359,6 +1405,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_GETPID => sys_getpid(percpu::current_pid()) as u64,
         SYS_GETTIMEOFDAY => sys_gettimeofday(arg0, arg1) as u64,
         SYS_GETTID => sys_gettid(percpu::current_tid()) as u64,
+        SYS_GETDENTS => sys_getdents(arg0 as i32, arg1, arg2) as u64,
         SYS_GETDENTS64 => sys_getdents64(arg0 as i32, arg1, arg2) as u64,
         SYS_CLOCK_GETTIME => sys_clock_gettime(arg0 as i32, arg1) as u64,
         SYS_CLOCK_GETRES => sys_clock_getres(arg0 as i32, arg1) as u64,
@@ -1601,7 +1648,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_FCHDIR => sys_fchdir(arg0 as i32) as u64,
         SYS_CHROOT => sys_chroot(arg0) as u64,
         SYS_OPENAT => sys_openat(arg0 as i32, arg1, arg2 as u32, arg3 as u32) as u64,
-        SYS_FACCESSAT => sys_faccessat(arg0 as i32, arg1, arg2 as i32, arg3 as i32) as u64,
+        SYS_FACCESSAT => sys_faccessat(arg0 as i32, arg1, arg2 as i32) as u64,
         SYS_DUP3 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as u32) as u64,
         SYS_PIPE => sys_pipe(arg0) as u64,
         SYS_PIPE2 => sys_pipe2(arg0, arg1 as u32) as u64,
@@ -1887,14 +1934,7 @@ pub fn x86_64_syscall_dispatch(
             use crate::task::syscall::sys_sched_rr_get_interval;
             sys_sched_rr_get_interval::<Uaccess>(arg0 as i64, arg1, percpu::current_pid()) as u64
         }
-        SYS_NICE => {
-            use crate::task::syscall::sys_nice;
-            sys_nice(
-                arg0 as i32,
-                percpu::current_pid(),
-                percpu::current_cred().euid,
-            ) as u64
-        }
+        SYS_PAUSE => crate::signal::syscall::sys_pause() as u64,
 
         // System information
         SYS_GETCPU => {
@@ -2037,15 +2077,10 @@ pub fn x86_64_syscall_dispatch(
         _ => (-38i64) as u64, // ENOSYS
     };
 
-    // Record the syscall result so a signal frame set up by do_signal() saves
-    // it; rt_sigreturn then returns it to the interrupted code.
-    unsafe {
-        crate::arch::x86_64::percpu::current_cpu_mut().syscall_user_rax = result;
-    }
-
-    // Check for pending signals before returning to userspace
-    // This may modify the saved user context to invoke the signal handler
-    crate::signal::do_signal();
+    // Deliver pending signals / apply -ERESTART* rules before returning to
+    // user space (may redirect the return context to a handler or back up
+    // over the syscall instruction)
+    let result = crate::signal::syscall_exit_signal_work(result, num != SYS_RT_SIGRETURN);
 
     // Account for exiting kernel mode
     percpu::account_syscall_exit();

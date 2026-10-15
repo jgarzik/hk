@@ -6,7 +6,7 @@
 use crate::arch::Uaccess;
 use crate::error::KernelError;
 use crate::numa::NUMA_TOPOLOGY;
-use crate::uaccess::{UaccessArch, get_user};
+use crate::uaccess::{UaccessArch, copy_to_user, get_user, put_user};
 
 // ============================================================================
 // Policy modes (MPOL_*)
@@ -170,15 +170,17 @@ pub fn sys_get_mempolicy(
             MPOL_LOCAL
         };
 
-        unsafe {
-            Uaccess::user_access_begin();
-            core::ptr::write(policy_ptr as *mut i32, policy);
-            Uaccess::user_access_end();
+        if put_user::<Uaccess, i32>(policy_ptr, policy).is_err() {
+            return KernelError::BadAddress.sysret();
         }
     }
 
     // Return node mask if requested
     if nmask_ptr != 0 && maxnode > 0 {
+        // The copy is sized by the user: bound it (no huge allocation)
+        if maxnode > MAX_MASK_BITS + 1 {
+            return KernelError::InvalidArgument.sysret();
+        }
         // Calculate mask size in bytes (rounded up to unsigned long boundary)
         let mask_bytes = maxnode.div_ceil(64) * 8;
 
@@ -189,18 +191,13 @@ pub fn sys_get_mempolicy(
         // Get the online node mask from real topology
         let online_mask = NUMA_TOPOLOGY.lock().online_mask();
 
-        unsafe {
-            Uaccess::user_access_begin();
-
-            // Write first word with online nodes mask
-            core::ptr::write(nmask_ptr as *mut u64, online_mask);
-
-            // Clear remaining words if any (we only support up to 64 nodes)
-            for i in 1..(mask_bytes / 8) {
-                core::ptr::write((nmask_ptr as *mut u64).add(i as usize), 0u64);
-            }
-
-            Uaccess::user_access_end();
+        // First word holds the online nodes; remaining words are zero
+        // (we only support up to 64 nodes)
+        let mut words = alloc::vec![0u64; (mask_bytes / 8) as usize];
+        words[0] = online_mask;
+        let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        if copy_to_user::<Uaccess>(nmask_ptr, &bytes).is_err() {
+            return KernelError::BadAddress.sysret();
         }
     }
 
@@ -250,11 +247,9 @@ pub fn sys_set_mempolicy(mode: i32, nmask_ptr: u64, maxnode: u64) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    let nodemask: u64 = unsafe {
-        Uaccess::user_access_begin();
-        let mask = core::ptr::read(nmask_ptr as *const u64);
-        Uaccess::user_access_end();
-        mask
+    let nodemask: u64 = match get_user::<Uaccess, u64>(nmask_ptr) {
+        Ok(m) => m,
+        Err(_) => return KernelError::BadAddress.sysret(),
     };
 
     // Empty mask is invalid for most policies
@@ -340,11 +335,9 @@ pub fn sys_mbind(start: u64, len: u64, mode: u64, nmask_ptr: u64, maxnode: u64, 
         }
 
         // Read node mask
-        let nodemask: u64 = unsafe {
-            Uaccess::user_access_begin();
-            let mask = core::ptr::read(nmask_ptr as *const u64);
-            Uaccess::user_access_end();
-            mask
+        let nodemask: u64 = match get_user::<Uaccess, u64>(nmask_ptr) {
+            Ok(m) => m,
+            Err(_) => return KernelError::BadAddress.sysret(),
         };
 
         // Empty mask is invalid
@@ -406,6 +399,9 @@ pub fn sys_migrate_pages(pid: i64, maxnode: u64, old_nodes_ptr: u64, new_nodes_p
         }
     }
 
+    if maxnode > MAX_MASK_BITS + 1 {
+        return KernelError::InvalidArgument.sysret();
+    }
     let mask_bytes = maxnode.div_ceil(64) * 8;
     let online_mask = NUMA_TOPOLOGY.lock().online_mask();
 
@@ -414,11 +410,9 @@ pub fn sys_migrate_pages(pid: i64, maxnode: u64, old_nodes_ptr: u64, new_nodes_p
         if !Uaccess::access_ok(old_nodes_ptr, mask_bytes as usize) {
             return KernelError::BadAddress.sysret();
         }
-        let old_mask: u64 = unsafe {
-            Uaccess::user_access_begin();
-            let mask = core::ptr::read(old_nodes_ptr as *const u64);
-            Uaccess::user_access_end();
-            mask
+        let old_mask: u64 = match get_user::<Uaccess, u64>(old_nodes_ptr) {
+            Ok(m) => m,
+            Err(_) => return KernelError::BadAddress.sysret(),
         };
         // Validate old_nodes are online
         if old_mask != 0 && old_mask & !online_mask != 0 {
@@ -506,24 +500,18 @@ pub fn sys_move_pages(
         }
     }
 
-    // Validate pages array pointer
-    let pages_size = nr_pages as usize * core::mem::size_of::<u64>();
-    if pages_ptr == 0 || !Uaccess::access_ok(pages_ptr, pages_size) {
+    // Validate the user arrays; sizes are user-controlled, so an
+    // overflowing size is EFAULT (never a wrapped address)
+    let array_ok = |ptr: u64, elem: u64| {
+        nr_pages
+            .checked_mul(elem)
+            .is_some_and(|size| ptr != 0 && Uaccess::access_ok(ptr, size as usize))
+    };
+    if !array_ok(pages_ptr, 8) || !array_ok(status_ptr, 4) {
         return KernelError::BadAddress.sysret();
     }
-
-    // Validate status array pointer (required)
-    let status_size = nr_pages as usize * core::mem::size_of::<i32>();
-    if status_ptr == 0 || !Uaccess::access_ok(status_ptr, status_size) {
+    if nodes_ptr != 0 && !array_ok(nodes_ptr, 4) {
         return KernelError::BadAddress.sysret();
-    }
-
-    // Validate nodes array pointer if provided
-    if nodes_ptr != 0 {
-        let nodes_size = nr_pages as usize * core::mem::size_of::<i32>();
-        if !Uaccess::access_ok(nodes_ptr, nodes_size) {
-            return KernelError::BadAddress.sysret();
-        }
     }
 
     // Get online nodes mask
@@ -532,8 +520,12 @@ pub fn sys_move_pages(
     // Any invalid or offline target node fails the whole call with ENODEV
     // (Linux mm/migrate.c do_pages_move)
     if nodes_ptr != 0 {
-        for i in 0..nr_pages as usize {
-            let node = match get_user::<Uaccess, i32>(nodes_ptr + (i * 4) as u64) {
+        for i in 0..nr_pages {
+            if let Err(e) = move_pages_resched(i) {
+                return e;
+            }
+            // In range: access_ok checked nodes_ptr + nr_pages * 4
+            let node = match get_user::<Uaccess, i32>(nodes_ptr + i * 4) {
                 Ok(n) => n,
                 Err(_) => return KernelError::BadAddress.sysret(),
             };
@@ -544,23 +536,44 @@ pub fn sys_move_pages(
     }
 
     // Write status for each page
-    unsafe {
-        Uaccess::user_access_begin();
-
-        for i in 0..nr_pages as usize {
-            let status: i32 = if nodes_ptr == 0 {
-                // Query mode: return current node (node 0 for now)
-                // Real implementation in Phase 5 will look up actual page node
-                0
-            } else {
-                // Move mode: nodes validated above (actual migration in Phase 5)
-                0
-            };
-            core::ptr::write((status_ptr as *mut i32).add(i), status);
+    for i in 0..nr_pages {
+        if let Err(e) = move_pages_resched(i) {
+            return e;
         }
-
-        Uaccess::user_access_end();
+        let status: i32 = if nodes_ptr == 0 {
+            // Query mode: return current node (node 0 for now)
+            // Real implementation in Phase 5 will look up actual page node
+            0
+        } else {
+            // Move mode: nodes validated above (actual migration in Phase 5)
+            0
+        };
+        if put_user::<Uaccess, i32>(status_ptr + i * 4, status).is_err() {
+            return KernelError::BadAddress.sysret();
+        }
     }
 
     0
 }
+
+/// Entries handled between scheduling points in move_pages (Linux works
+/// in chunks with cond_resched)
+const MOVE_PAGES_CHUNK: u64 = 1024;
+
+/// Every `MOVE_PAGES_CHUNK` entries: let other tasks run (the scheduler is
+/// cooperative, so a huge user-supplied count would otherwise monopolize
+/// the CPU) and stop for a pending signal (restartable: the work done so
+/// far is idempotent)
+fn move_pages_resched(i: u64) -> Result<(), i64> {
+    if i > 0 && i.is_multiple_of(MOVE_PAGES_CHUNK) {
+        crate::task::percpu::yield_now();
+        if crate::waitqueue::signal_pending() {
+            return Err(KernelError::RestartSys.sysret());
+        }
+    }
+    Ok(())
+}
+
+/// Largest node mask accepted from/copied to user space: one page of bits
+/// (Linux get_nodes / copy_nodes_to_user)
+const MAX_MASK_BITS: u64 = 4096 * 8;

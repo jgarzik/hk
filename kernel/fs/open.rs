@@ -5,94 +5,70 @@ use alloc::sync::Arc;
 
 use crate::arch::Uaccess;
 use crate::fs::{
-    Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, lookup_path_at,
+    Dentry, File, InodeMode, KernelError, LookupFlags, Path, RAMFS_FILE_OPS, dac, lookup_one,
+    lookup_path_at,
 };
 use crate::uaccess::strncpy_from_user;
 
+use super::flags::{
+    O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDONLY, O_RDWR, O_TRUNC,
+};
+use super::mount::{MNT_NODEV, mnt_flags_of};
 use super::syscall::{AT_FDCWD, PATH_MAX, current_fd_table, get_nofile_limit};
+use crate::task::FD_CLOEXEC;
 
-/// Create a file at the given path with the specified mode
-///
-/// Helper function for O_CREAT handling in sys_openat.
-///
-/// # Arguments
-/// * `start` - Starting point for relative path resolution
-/// * `path` - Full path string
-/// * `mode` - File mode (permission bits)
-///
-/// # Returns
-/// The dentry of the created file on success
-fn create_file_at(start: Option<Path>, path: &str, mode: u32) -> Result<Arc<Dentry>, KernelError> {
-    // Find the last path component
-    let path = path.trim_end_matches('/');
-    if path.is_empty() {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    let (parent_path, name) = match path.rfind('/') {
-        Some(pos) => {
-            let parent = if pos == 0 { "/" } else { &path[..pos] };
-            let name = &path[pos + 1..];
-            (parent, name)
-        }
-        None => {
-            // Relative path with no slash - parent is start or root
-            (".", path)
-        }
-    };
-
-    if name.is_empty() {
-        return Err(KernelError::InvalidArgument);
-    }
-
-    // Look up the parent directory
-    let parent_dentry = if parent_path == "." {
-        // Use start or root
-        start
-            .map(|p| p.dentry.clone())
-            .or_else(|| crate::fs::mount::current_mnt_ns().get_root_dentry())
-            .ok_or(KernelError::NotFound)?
-    } else {
-        lookup_path_at(start, parent_path, LookupFlags::opendir())?
-    };
-
-    let parent_inode = parent_dentry.get_inode().ok_or(KernelError::NotFound)?;
-    if !parent_inode.mode().is_dir() {
+/// Create regular file `name` in `parent` for O_CREAT (Linux
+/// lookup_open + may_o_create) under the parent's lock: an entry that
+/// appeared meanwhile is returned as is (created = false); otherwise
+/// write+search on the parent, the mode gets the umask and SGID
+/// stripping, the owner comes from init_owner
+fn create_in(
+    parent: &Arc<Dentry>,
+    name: &str,
+    mode: u32,
+) -> Result<(Arc<Dentry>, bool), KernelError> {
+    let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
+    if !dir.mode().is_dir() {
         return Err(KernelError::NotDirectory);
     }
-
-    // Lock parent directory (Linux i_rwsem pattern)
-    parent_inode.inode_lock();
-
-    // Check if file already exists (with lock held)
-    if parent_dentry.lookup_child(name).is_some() {
-        unsafe { parent_inode.inode_unlock() };
-        return Err(KernelError::AlreadyExists);
-    }
-
-    // Create the file with requested permission bits
-    let file_mode = InodeMode::regular((mode & 0o7777) as u16);
-    let new_inode = match parent_inode.i_op.create(&parent_inode, name, file_mode) {
-        Ok(i) => i,
-        Err(e) => {
-            unsafe { parent_inode.inode_unlock() };
-            return Err(e);
+    let c = dac::cred();
+    // lookup_open: write access is needed only to create
+    let w = dac::want_write(&dir);
+    dir.inode_lock();
+    let r = (|| {
+        if let Ok(d) = lookup_one(parent, name) {
+            return Ok((d, false));
         }
+        let _w = w?;
+        dac::may_create(&c, &dir)?;
+        let perm = dac::create_mode(&c, &dir, (mode & 0o7777) as u16);
+        let inode = dir.i_op.create(&dir, name, InodeMode::regular(perm))?;
+        let d = Arc::new(Dentry::new(
+            String::from(name),
+            Some(inode),
+            parent.sb.clone(),
+        ));
+        d.set_parent(parent);
+        parent.add_child(d.clone());
+        Ok((d, true))
+    })();
+    unsafe { dir.inode_unlock() };
+    r
+}
+
+/// Split `path` into its parent and final component (Linux
+/// filename_parentat); the parent is walked with search checks
+fn parent_of(start: Option<Path>, path: &str) -> Result<(Arc<Dentry>, &str), KernelError> {
+    let path = path.trim_end_matches('/');
+    let (dir, name) = match path.rfind('/') {
+        Some(0) => ("/", &path[1..]),
+        Some(pos) => (&path[..pos], &path[pos + 1..]),
+        None => (".", path),
     };
-
-    // Create the dentry
-    let new_dentry = Arc::new(Dentry::new(
-        String::from(name),
-        Some(new_inode),
-        parent_dentry.sb.clone(),
-    ));
-    new_dentry.set_parent(&parent_dentry);
-    parent_dentry.add_child(new_dentry.clone());
-
-    // Unlock parent directory
-    unsafe { parent_inode.inode_unlock() };
-
-    Ok(new_dentry)
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(KernelError::IsDirectory);
+    }
+    Ok((lookup_path_at(start, dir, LookupFlags::opendir())?, name))
 }
 
 /// sys_open - open a file
@@ -101,6 +77,42 @@ fn create_file_at(start: Option<Path>, path: &str, mode: u32) -> Result<Arc<Dent
 /// This is a wrapper around sys_openat with AT_FDCWD.
 pub fn sys_open(path_ptr: u64, flags: u32, mode: u32) -> i64 {
     sys_openat(AT_FDCWD, path_ptr, flags, mode)
+}
+
+/// Resolve the open target: an existing file, or (O_CREAT) a newly
+/// created one; the bool says it was created by this call
+fn open_target(
+    start: Option<Path>,
+    path: &str,
+    flags: u32,
+    mode: u32,
+) -> Result<(Arc<Dentry>, bool), KernelError> {
+    let mut lf = LookupFlags::open();
+    if flags & O_DIRECTORY != 0 {
+        lf.directory = true;
+    }
+    // O_CREAT|O_EXCL never follows a final symlink (it is EEXIST)
+    if flags & O_NOFOLLOW != 0 || flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL {
+        lf.follow = false;
+    }
+    if flags & O_CREAT == 0 {
+        return Ok((lookup_path_at(start, path, lf)?, false));
+    }
+    let (d, created) = match lookup_path_at(start.clone(), path, lf) {
+        Ok(d) => (d, false),
+        Err(KernelError::NotFound) => {
+            let (parent, name) = parent_of(start, path)?;
+            create_in(&parent, name, mode)?
+        }
+        Err(e) => return Err(e),
+    };
+    if !created && flags & O_EXCL != 0 {
+        return Err(KernelError::AlreadyExists);
+    }
+    if !created && d.get_inode().is_some_and(|i| i.mode().is_dir()) {
+        return Err(KernelError::IsDirectory);
+    }
+    Ok((d, created))
 }
 
 /// sys_openat - open a file relative to a directory file descriptor
@@ -114,112 +126,128 @@ pub fn sys_open(path_ptr: u64, flags: u32, mode: u32) -> i64 {
 /// # Returns
 /// File descriptor on success, negative errno on error.
 pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> i64 {
-    // Read path from user space with proper validation
-    let path_str = match strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
+    match do_openat(dirfd, path_ptr, flags, mode) {
+        Ok(fd) => fd,
+        Err(e) => e.sysret(),
+    }
+}
 
-    // Determine starting path for relative paths
-    let start: Option<Path> = if path_str.starts_with('/') {
-        // Absolute path - lookup_path_at will use root
+fn do_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> Result<i64, KernelError> {
+    let path =
+        strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX).map_err(|_| KernelError::BadAddress)?;
+    if path.is_empty() {
+        return Err(KernelError::NotFound);
+    }
+
+    // Starting point for relative paths
+    let start: Option<Path> = if path.starts_with('/') {
         None
     } else if dirfd == AT_FDCWD {
-        // Use current working directory
         crate::task::percpu::current_cwd()
     } else {
-        // Use directory from file descriptor
-        let file = match current_fd_table().lock().get(dirfd) {
-            Some(f) => f,
-            None => return KernelError::BadFd.sysret(),
-        };
+        let file = current_fd_table()
+            .lock()
+            .get(dirfd)
+            .ok_or(KernelError::BadFd)?;
         if !file.is_dir() {
-            return KernelError::NotDirectory.sysret();
+            return Err(KernelError::NotDirectory);
         }
-        // Create Path from the file's dentry
         Path::from_dentry(file.dentry.clone())
     };
 
-    // Set up lookup flags based on open flags
-    let mut lookup_flags = LookupFlags::open();
-    if flags & super::flags::O_DIRECTORY != 0 {
-        lookup_flags.directory = true;
+    let file = filp_open(start, &path, flags, mode)?;
+
+    // Allocate file descriptor (RLIMIT_NOFILE enforced inside alloc)
+    let fd_flags = if flags & O_CLOEXEC != 0 {
+        FD_CLOEXEC
+    } else {
+        0
+    };
+    let fd_table = current_fd_table();
+    let mut table = fd_table.lock();
+    match table.alloc_with_flags(file, fd_flags, get_nofile_limit()) {
+        Ok(fd) => Ok(fd as i64),
+        Err(e) => Ok(-(e as i64)),
     }
-    if flags & super::flags::O_NOFOLLOW != 0 {
-        lookup_flags.follow = false;
+}
+
+/// Open `path` (relative to `start`) as a new file (Linux do_filp_open):
+/// resolve or create the target, may_open, O_TRUNC, then the file object
+fn filp_open(
+    start: Option<Path>,
+    path: &str,
+    flags: u32,
+    mode: u32,
+) -> Result<Arc<File>, KernelError> {
+    let (dentry, created) = open_target(start, path, flags, mode)?;
+    let inode = dentry.get_inode().ok_or(KernelError::NotFound)?;
+
+    // may_open_dev: device nodes on a nodev mount cannot be opened
+    let m = inode.mode();
+    if (m.is_chrdev() || m.is_blkdev()) && mnt_flags_of(&dentry) & MNT_NODEV != 0 {
+        return Err(KernelError::PermissionDenied);
     }
 
-    // Look up the path
-    let dentry = match lookup_path_at(start.clone(), &path_str, lookup_flags) {
-        Ok(d) => {
-            // File exists - check for O_EXCL
-            if flags & super::flags::O_CREAT != 0 && flags & super::flags::O_EXCL != 0 {
-                return KernelError::AlreadyExists.sysret();
-            }
-            d
-        }
-        Err(KernelError::NotFound) => {
-            // File doesn't exist - try to create if O_CREAT is set
-            if flags & super::flags::O_CREAT == 0 {
-                return KernelError::NotFound.sysret();
-            }
-            // Create the file
-            match create_file_at(start, &path_str, mode) {
-                Ok(d) => d,
-                Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-                Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-                Err(KernelError::AlreadyExists) => return KernelError::AlreadyExists.sysret(),
-                Err(KernelError::PermissionDenied) => {
-                    return KernelError::PermissionDenied.sysret();
-                }
-                Err(_) => return KernelError::InvalidArgument.sysret(),
-            }
-        }
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+    // O_NOFOLLOW on a trailing symlink: ELOOP (may_open's symlink case)
+    let acc = if created { 0 } else { dac::acc_mode(flags) };
+    dac::may_open(&dac::cred(), &inode, acc, flags)?;
+
+    // A socket inode cannot be opened (Linux no_open_fops): ENXIO
+    if m.is_socket() {
+        return Err(KernelError::NoDeviceOrAddress);
+    }
+
+    // An open for writing holds write access until the file is released
+    // (Linux FMODE_WRITER); O_TRUNC needs it too (handle_truncate)
+    let writer = flags & O_ACCMODE != O_RDONLY || flags & O_TRUNC != 0;
+    let w = if writer && inode.mode().is_file() {
+        Some(dac::want_write(&inode)?)
+    } else {
+        None
     };
 
-    // Check if trying to open directory without O_DIRECTORY when reading
-    let inode = match dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    // O_NOFOLLOW on a trailing symlink fails with ELOOP (Linux do_open)
-    if flags & super::flags::O_NOFOLLOW != 0 && inode.mode().is_symlink() {
-        return KernelError::TooManySymlinks.sysret();
-    }
-
-    // Handle O_TRUNC - truncate file to zero length
-    if flags & super::flags::O_TRUNC != 0 && !inode.mode().is_dir() {
+    // O_TRUNC of an existing regular file (Linux handle_truncate)
+    if flags & O_TRUNC != 0 && !created && inode.mode().is_file() {
+        inode.inode_lock();
+        dac::remove_privs(&inode);
         inode.i_op.truncate(&inode, 0).ok();
+        // SAFETY: taken above by this thread
+        unsafe { inode.inode_unlock() };
     }
 
     // Get the file operations based on inode type
     let f_op: &'static dyn super::FileOps = if inode.mode().is_blkdev() {
-        // Block device - use block file operations
         &super::BLOCK_FILE_OPS
     } else if inode.mode().is_chrdev() {
-        // Character device - use character device file operations
         &super::CHAR_FILE_OPS
     } else {
-        // Regular file/directory - use filesystem operations
         dentry
             .superblock()
             .map(|sb| sb.fs_type.file_ops)
             .unwrap_or(&RAMFS_FILE_OPS)
     };
 
-    // Create file object
-    let file = Arc::new(File::new(dentry, flags, f_op));
+    let mut file = File::new(dentry, flags, f_op);
+    if flags & O_ACCMODE != O_RDONLY {
+        file.write_access = w;
+    }
+    Ok(Arc::new(file))
+}
 
-    // Allocate file descriptor (RLIMIT_NOFILE enforced inside alloc)
-    let fd_table = current_fd_table();
-    let mut table = fd_table.lock();
-
-    match table.alloc(file, get_nofile_limit()) {
-        Ok(fd) => fd as i64,
-        Err(e) => -(e as i64),
+/// Give init /dev/console as stdin, stdout and stderr (Linux
+/// console_on_rootfs); call in init's context before it runs
+pub fn console_on_rootfs() {
+    let file = match filp_open(None, "/dev/console", O_RDWR, 0) {
+        Ok(f) => f,
+        Err(_) => {
+            crate::printkln!("Warning: unable to open an initial console.");
+            return;
+        }
+    };
+    let table = current_fd_table();
+    let mut t = table.lock();
+    for fd in 0..3 {
+        t.alloc_at(fd, file.clone());
     }
 }
 
@@ -227,11 +255,6 @@ pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> i64 {
 ///
 /// Returns 0 on success, negative errno on error.
 pub fn sys_close(fd: i32) -> i64 {
-    // Don't close stdin/stdout/stderr
-    if fd < 3 {
-        return 0;
-    }
-
     match current_fd_table().lock().close(fd) {
         Some(_) => 0,
         None => KernelError::BadFd.sysret(),

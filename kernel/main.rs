@@ -28,8 +28,11 @@ pub mod pipe;
 pub mod poll;
 pub mod posix_timer;
 pub mod printk;
+pub mod selftest;
 pub mod signalfd;
 pub mod storage;
+pub mod sync;
+pub mod sysctl;
 mod time;
 pub mod timer;
 pub mod timerfd;
@@ -105,19 +108,126 @@ use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
 use spin::Mutex;
 
 // Memory layout constants - x86_64
-// NOTE: Heap must not overlap with multiboot2 modules loaded at ~0x200000-0x400000
+// The heap starts at 4MB or above the multiboot2 modules and info (GRUB
+// places them right after the kernel image), whichever is higher, and
+// ends at 18MB where the frame allocator starts (`x86_64_heap`)
 #[cfg(target_arch = "x86_64")]
-const KERNEL_HEAP_START: usize = 0x400000; // 4MB (above multiboot modules)
+const KERNEL_HEAP_START: usize = 0x400000; // 4MB
 #[cfg(target_arch = "x86_64")]
 const KERNEL_HEAP_SIZE: usize = 0xE00000; // 14MB (up to 18MB where frame allocator starts)
 
+/// The kernel image as linked (start and end symbols in kernel.ld)
+fn kernel_range() -> heap::BootRange {
+    unsafe extern "C" {
+        static __kernel_start: u8;
+        static __kernel_end: u8;
+    }
+    heap::BootRange {
+        name: "kernel image",
+        start: &raw const __kernel_start as usize,
+        end: &raw const __kernel_end as usize,
+    }
+}
+
+/// Boot data the x86 heap must avoid: kernel image, multiboot info and
+/// modules (up to 7; more panics rather than going unchecked)
+#[cfg(target_arch = "x86_64")]
+fn x86_64_boot_ranges(multiboot_info: u64) -> [heap::BootRange; 8] {
+    let none = heap::BootRange {
+        name: "",
+        start: 0,
+        end: 0,
+    };
+    let mut busy = [none; 8];
+    busy[0] = kernel_range();
+    let mut n = 1;
+    let mut add = |name, start: u64, end: u64| {
+        assert!(n < busy.len(), "too many multiboot modules");
+        busy[n] = heap::BootRange {
+            name,
+            start: start as usize,
+            end: end as usize,
+        };
+        n += 1;
+    };
+    unsafe { multiboot2::boot_ranges(multiboot_info, &mut add) };
+    busy
+}
+
+/// x86 heap (start, size): never over the boot modules, which are read
+/// after the heap is in use (a fixed 4MB start broke once kernel +
+/// initramfs + vfat image passed 4MB); ends where frames start
+#[cfg(target_arch = "x86_64")]
+fn x86_64_heap(multiboot_info: u64) -> (usize, usize) {
+    const MIN: usize = 0x400000;
+    let end = KERNEL_HEAP_START + KERNEL_HEAP_SIZE;
+    let busy = x86_64_boot_ranges(multiboot_info);
+    // Above all boot data: the heap runs to a fixed end, so a gap
+    // below a module could not hold it anyway
+    let top = busy.iter().map(|r| r.end).max().unwrap_or(0);
+    let start = heap::place(KERNEL_HEAP_START.max(top), MIN, 4096, &busy);
+    assert!(
+        start + MIN <= end,
+        "boot modules leave no room for the heap"
+    );
+    for r in &busy {
+        heap::check(start, end, r);
+    }
+    (start, end - start)
+}
+
 // Memory layout constants - aarch64
-// QEMU virt machine loads kernel at 0x40000000
-// We place heap after the kernel image (starting at 0x40800000 = kernel + 8MB)
-#[cfg(target_arch = "aarch64")]
-const KERNEL_HEAP_START: usize = 0x4080_0000; // 8MB after kernel load
+// QEMU virt loads the kernel at 0x40100000 with the DTB below it; the
+// heap goes at the first 2MB boundary past the kernel image that also
+// misses the DTB and any initrd (`aarch64_heap`); the frame allocator
+// starts at the heap end (`HEAP_END`)
 #[cfg(target_arch = "aarch64")]
 const KERNEL_HEAP_SIZE: usize = 0x0100_0000; // 16MB
+
+/// End of the heap: the aarch64 frame allocator starts here
+#[cfg(target_arch = "aarch64")]
+pub static HEAP_END: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Boot data the aarch64 heap must avoid: kernel image, DTB, initrd
+#[cfg(target_arch = "aarch64")]
+fn aarch64_boot_ranges(dtb: u64) -> [heap::BootRange; 3] {
+    let none = heap::BootRange {
+        name: "",
+        start: 0,
+        end: 0,
+    };
+    let fdt = match arch::aarch64::dtb::total_size(dtb) {
+        Some(n) => heap::BootRange {
+            name: "DTB",
+            start: dtb as usize,
+            end: dtb as usize + n,
+        },
+        None => none,
+    };
+    let initrd = match arch::aarch64::dtb::extract_initramfs(dtb) {
+        Some(i) => heap::BootRange {
+            name: "initrd",
+            start: i.start as usize,
+            end: i.end as usize,
+        },
+        None => none,
+    };
+    [kernel_range(), fdt, initrd]
+}
+
+/// aarch64 heap (start, size) computed from the linked kernel end, so
+/// kernel growth can never silently run into it
+#[cfg(target_arch = "aarch64")]
+fn aarch64_heap(dtb: u64) -> (usize, usize) {
+    let busy = aarch64_boot_ranges(dtb);
+    let start = heap::place(busy[0].end, KERNEL_HEAP_SIZE, 0x20_0000, &busy);
+    let end = start + KERNEL_HEAP_SIZE;
+    for r in &busy {
+        heap::check(start, end, r);
+    }
+    HEAP_END.store(end, core::sync::atomic::Ordering::Relaxed);
+    (start, KERNEL_HEAP_SIZE)
+}
 
 /// Kernel heap allocator (host unit tests use the std allocator)
 #[cfg_attr(not(test), global_allocator)]
@@ -189,8 +299,9 @@ pub extern "C" fn _start(multiboot_info: u64) -> ! {
     }
 
     // Initialize heap allocator
+    let (heap_start, heap_size) = x86_64_heap(multiboot_info);
     unsafe {
-        ALLOCATOR.init(KERNEL_HEAP_START, KERNEL_HEAP_SIZE);
+        ALLOCATOR.init(heap_start, heap_size);
     }
 
     // Initialize architecture-specific code (GDT, IDT, PIC, PIT)
@@ -260,8 +371,9 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
     }
 
     // Initialize heap allocator
+    let (heap_start, heap_size) = aarch64_heap(unsafe { DTB_PTR });
     unsafe {
-        ALLOCATOR.init(KERNEL_HEAP_START, KERNEL_HEAP_SIZE);
+        ALLOCATOR.init(heap_start, heap_size);
     }
 
     // Extract and parse kernel command line from DTB /chosen/bootargs
@@ -278,7 +390,7 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
 
 // ELF loading constants - shared by both architectures
 const PAGE_SIZE: u64 = 4096;
-const USER_STACK_PAGES: usize = 4;
+const USER_STACK_PAGES: usize = 256;
 
 // x86_64: User stack at top of lower half of 48-bit VA space
 #[cfg(target_arch = "x86_64")]
@@ -387,6 +499,12 @@ where
                         }
                     }
 
+                    // The page came whole from the file: clear what lies
+                    // past the segment's file data (.bss), which would
+                    // otherwise hold the following file bytes
+                    let file_end = seg_start + segment.file_size as u64;
+                    zero_bss(private_frame, va, file_end, seg_end);
+
                     private_frame
                 } else {
                     // Read-only segment: can share cached pages
@@ -442,6 +560,19 @@ where
     printkln!("Page cache: {}/{} pages", cached, max);
 
     Ok(())
+}
+
+/// Zero the part of the page at `va` (backed by `frame`) that lies in
+/// [file_end, mem_end): a segment's .bss (Linux padzero + anonymous
+/// pages)
+fn zero_bss(frame: u64, va: u64, file_end: u64, mem_end: u64) {
+    let lo = file_end.max(va);
+    let hi = mem_end.min(va + PAGE_SIZE);
+    if lo < hi {
+        unsafe {
+            ::core::ptr::write_bytes((frame + (lo - va)) as *mut u8, 0, (hi - lo) as usize);
+        }
+    }
 }
 
 /// Apply ELF relocations for PIE binaries
@@ -610,6 +741,7 @@ fn kmain() -> ! {
     // Initialize frame allocator
     FRAME_ALLOCATOR.init(alloc_base, alloc_size);
     FRAME_ALLOCATOR.mark_used(0, alloc_base);
+    CurrentArch::for_each_reserved(&mut |start, end| FRAME_ALLOCATOR.mark_used(start, end - start));
 
     // Initialize DMA subsystem (uses frame allocator)
     dma_init(&DIRECT_DMA_OPS);
@@ -1012,9 +1144,21 @@ fn kmain() -> ! {
     // Enable scheduling
     task::percpu::enable();
 
+    // Schedulers for the APs, then the kernel threads: timer callbacks
+    // (ktimerd), the system workqueue worker, the per-CPU network softnet
+    // threads and the boot self-test
+    task::percpu::init_ap_schedulers(&mut frame_alloc);
+    crate::timer::start_ktimerd();
+    crate::workqueue::init();
+    crate::net::start_threads();
+    crate::selftest::start();
+
     // Set per-CPU current task state
     // tid=2, pid=1, ppid=0, pgid=1, sid=1 (init process)
     task::percpu::set_current_task(2, 1, 0, 0, 0, task::Cred::ROOT);
+
+    // stdin/stdout/stderr of init: /dev/console (Linux kernel_init)
+    fs::open::console_on_rootfs();
 
     // Jump to user mode!
     // This never returns.
@@ -1204,11 +1348,9 @@ fn panic(info: &PanicInfo) -> ! {
     }
 
     // Print panic message
-    if let Some(message) = info.message().as_str() {
-        printkln!("Message: {}", message);
-    } else {
-        printkln!("Message: <no message>");
-    }
+    // Formatted messages (panic!("... {:#x}", v)) have no static str:
+    // print through Display, or e.g. the faulting address is lost
+    printkln!("Message: {}", info.message());
 
     // Architecture-specific register dump and backtrace
     #[cfg(target_arch = "x86_64")]
@@ -1241,8 +1383,9 @@ fn panic(info: &PanicInfo) -> ! {
         const MAX_FRAMES: usize = 16;
 
         while frame_ptr != 0 && frame_count < MAX_FRAMES {
-            // Validate frame pointer (must be in reasonable kernel range)
-            if !(0x1000..=0xFFFF_FFFF_FFFF_0000).contains(&frame_ptr) {
+            // Only follow frames on the current kernel stack: RBP may hold a
+            // user value, and reading it would fault again under SMAP
+            if !(rsp..rsp.saturating_add(0x10000)).contains(&frame_ptr) {
                 break;
             }
 

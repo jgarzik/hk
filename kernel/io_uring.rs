@@ -50,12 +50,13 @@ use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
+use crate::fs::iov::IoVec;
 use crate::mm::PAGE_SIZE;
 use crate::pipe::FD_CLOEXEC;
 use crate::poll::PollTable;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
-use crate::uaccess::{get_user, put_user};
+use crate::uaccess::{UaccessArch, copy_from_user, copy_val_from_user, get_user, put_user};
 use crate::waitqueue::WaitQueue;
 
 // ============================================================================
@@ -629,7 +630,6 @@ impl IoUring {
     }
 
     /// Handle IORING_OP_READ
-    #[allow(clippy::needless_range_loop)] // Need raw pointer indexing for user memory
     fn do_read(&self, sqe: &IoUringSqe) -> i32 {
         let fd = sqe.fd;
         let buf_addr = sqe.addr;
@@ -651,45 +651,28 @@ impl IoUring {
             }
         };
 
+        // The fd's access mode, like read(2)/write(2) (EBADF)
+        if !file.is_readable() {
+            return KernelError::BadFd.to_errno_neg();
+        }
+
         // Create buffer for read
         if buf_addr == 0 || len == 0 {
             return KernelError::InvalidArgument.to_errno_neg();
         }
 
-        // Allocate kernel buffer
-        let mut kbuf = alloc::vec![0u8; len];
-
-        // Read from file
-        let result = if offset == u64::MAX {
-            // Use current file position (offset -1 means current pos)
-            match file.f_op.read(&file, &mut kbuf) {
-                Ok(n) => n as i32,
-                Err(e) => fs_error_to_errno(e) as i32,
-            }
-        } else {
-            // Use specified offset (pread)
-            match file.f_op.pread(&file, &mut kbuf, offset) {
-                Ok(n) => n as i32,
-                Err(e) => fs_error_to_errno(e) as i32,
-            }
-        };
-
-        // Copy to userspace if read succeeded
-        if result > 0 {
-            let bytes_to_copy = result as usize;
-            let user_ptr = buf_addr as *mut u8;
-            for i in 0..bytes_to_copy {
-                unsafe {
-                    core::ptr::write_volatile(user_ptr.add(i), kbuf[i]);
-                }
-            }
-        }
-
-        result
+        rw_one(
+            &file,
+            &[IoVec {
+                iov_base: buf_addr,
+                iov_len: len as u64,
+            }],
+            offset,
+            false,
+        )
     }
 
     /// Handle IORING_OP_WRITE
-    #[allow(clippy::needless_range_loop)] // Need raw pointer indexing for user memory
     fn do_write(&self, sqe: &IoUringSqe) -> i32 {
         let fd = sqe.fd;
         let buf_addr = sqe.addr;
@@ -709,38 +692,28 @@ impl IoUring {
             }
         };
 
+        // The fd's access mode, like read(2)/write(2) (EBADF)
+        if !file.is_writable() {
+            return KernelError::BadFd.to_errno_neg();
+        }
+
         // Validate buffer
         if buf_addr == 0 || len == 0 {
             return KernelError::InvalidArgument.to_errno_neg();
         }
 
-        // Copy from userspace
-        let mut kbuf = alloc::vec![0u8; len];
-        let user_ptr = buf_addr as *const u8;
-        for i in 0..len {
-            unsafe {
-                kbuf[i] = core::ptr::read_volatile(user_ptr.add(i));
-            }
-        }
-
-        // Write to file
-        if offset == u64::MAX {
-            // Use current file position
-            match file.f_op.write(&file, &kbuf) {
-                Ok(n) => n as i32,
-                Err(e) => fs_error_to_errno(e) as i32,
-            }
-        } else {
-            // Use specified offset (pwrite)
-            match file.f_op.pwrite(&file, &kbuf, offset) {
-                Ok(n) => n as i32,
-                Err(e) => fs_error_to_errno(e) as i32,
-            }
-        }
+        rw_one(
+            &file,
+            &[IoVec {
+                iov_base: buf_addr,
+                iov_len: len as u64,
+            }],
+            offset,
+            true,
+        )
     }
 
     /// Handle IORING_OP_READV (vectored read)
-    #[allow(clippy::needless_range_loop)] // Need raw pointer indexing for user memory
     fn do_readv(&self, sqe: &IoUringSqe) -> i32 {
         let fd = sqe.fd;
         let iov_addr = sqe.addr;
@@ -760,57 +733,22 @@ impl IoUring {
             }
         };
 
+        // The fd's access mode, like read(2)/write(2) (EBADF)
+        if !file.is_readable() {
+            return KernelError::BadFd.to_errno_neg();
+        }
+
         if iov_addr == 0 || iov_count == 0 {
             return KernelError::InvalidArgument.to_errno_neg();
         }
 
-        // Read iovec array from userspace
-        let mut total_read: usize = 0;
-        let iov_ptr = iov_addr as *const IoVec;
-
-        for i in 0..iov_count {
-            let iov: IoVec = unsafe { core::ptr::read_volatile(iov_ptr.add(i)) };
-            if iov.iov_len == 0 {
-                continue;
-            }
-
-            let mut kbuf = alloc::vec![0u8; iov.iov_len];
-
-            let result = if offset == u64::MAX {
-                file.f_op.read(&file, &mut kbuf)
-            } else {
-                let adjusted_offset = offset.saturating_add(total_read as u64);
-                file.f_op.pread(&file, &mut kbuf, adjusted_offset)
-            };
-
-            match result {
-                Ok(n) => {
-                    // Copy to userspace
-                    let user_ptr = iov.iov_base as *mut u8;
-                    for j in 0..n {
-                        unsafe {
-                            core::ptr::write_volatile(user_ptr.add(j), kbuf[j]);
-                        }
-                    }
-                    total_read += n;
-                    if n < iov.iov_len {
-                        break; // Short read
-                    }
-                }
-                Err(e) => {
-                    if total_read > 0 {
-                        return total_read as i32;
-                    }
-                    return fs_error_to_errno(e) as i32;
-                }
-            }
+        match read_user_iovecs(iov_addr, iov_count) {
+            Ok(v) => rw_one(&file, &v, offset, false),
+            Err(e) => e,
         }
-
-        total_read as i32
     }
 
     /// Handle IORING_OP_WRITEV (vectored write)
-    #[allow(clippy::needless_range_loop)] // Need raw pointer indexing for user memory
     fn do_writev(&self, sqe: &IoUringSqe) -> i32 {
         let fd = sqe.fd;
         let iov_addr = sqe.addr;
@@ -830,53 +768,19 @@ impl IoUring {
             }
         };
 
+        // The fd's access mode, like read(2)/write(2) (EBADF)
+        if !file.is_writable() {
+            return KernelError::BadFd.to_errno_neg();
+        }
+
         if iov_addr == 0 || iov_count == 0 {
             return KernelError::InvalidArgument.to_errno_neg();
         }
 
-        // Read iovec array from userspace and write
-        let mut total_written: usize = 0;
-        let iov_ptr = iov_addr as *const IoVec;
-
-        for i in 0..iov_count {
-            let iov: IoVec = unsafe { core::ptr::read_volatile(iov_ptr.add(i)) };
-            if iov.iov_len == 0 {
-                continue;
-            }
-
-            // Copy from userspace
-            let mut kbuf = alloc::vec![0u8; iov.iov_len];
-            let user_ptr = iov.iov_base as *const u8;
-            for j in 0..iov.iov_len {
-                unsafe {
-                    kbuf[j] = core::ptr::read_volatile(user_ptr.add(j));
-                }
-            }
-
-            let result = if offset == u64::MAX {
-                file.f_op.write(&file, &kbuf)
-            } else {
-                let adjusted_offset = offset.saturating_add(total_written as u64);
-                file.f_op.pwrite(&file, &kbuf, adjusted_offset)
-            };
-
-            match result {
-                Ok(n) => {
-                    total_written += n;
-                    if n < iov.iov_len {
-                        break; // Short write
-                    }
-                }
-                Err(e) => {
-                    if total_written > 0 {
-                        return total_written as i32;
-                    }
-                    return fs_error_to_errno(e) as i32;
-                }
-            }
+        match read_user_iovecs(iov_addr, iov_count) {
+            Ok(v) => rw_one(&file, &v, offset, true),
+            Err(e) => e,
         }
-
-        total_written as i32
     }
 
     // =========================================================================
@@ -1143,8 +1047,11 @@ impl IoUring {
 
         // Read timespec from userspace
         // struct __kernel_timespec { i64 tv_sec; i64 tv_nsec; }
-        let tv_sec: i64 = unsafe { core::ptr::read_volatile(ts_ptr as *const i64) };
-        let tv_nsec: i64 = unsafe { core::ptr::read_volatile((ts_ptr + 8) as *const i64) };
+        let ts = match copy_val_from_user::<Uaccess, [i64; 2]>(ts_ptr) {
+            Ok(v) => v,
+            Err(_) => return KernelError::BadAddress.to_errno_neg(),
+        };
+        let (tv_sec, tv_nsec) = (ts[0], ts[1]);
 
         if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
             return KernelError::InvalidArgument.to_errno_neg();
@@ -1415,12 +1322,56 @@ fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, KernelError> {
 // Helper structures and functions
 // ============================================================================
 
-/// iovec structure for vectored I/O
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct IoVec {
-    iov_base: u64,  // Pointer to buffer
-    iov_len: usize, // Length of buffer
+/// The `n` iovecs at `iov_addr` (EINVAL beyond IOV_MAX, EFAULT for a bad
+/// array or buffer)
+fn read_user_iovecs(iov_addr: u64, n: usize) -> Result<Vec<IoVec>, i32> {
+    if n > crate::fs::syscall::IOV_MAX {
+        return Err(KernelError::InvalidArgument.to_errno_neg());
+    }
+    let v = (0..n)
+        .map(|i| read_user_iovec(iov_addr, i))
+        .collect::<Result<Vec<_>, _>>()?;
+    if v.iter()
+        .any(|s| s.iov_len > 0 && !Uaccess::access_ok(s.iov_base, s.iov_len as usize))
+    {
+        return Err(KernelError::BadAddress.to_errno_neg());
+    }
+    Ok(v)
+}
+
+/// Read or write `segs` at `offset` (u64::MAX: the file position, under
+/// f_pos_lock) through the bounded read/write core
+fn rw_one(file: &File, segs: &[IoVec], offset: u64, write: bool) -> i32 {
+    use crate::fs::RwFlags;
+    let at = (offset != u64::MAX).then_some(offset);
+    let _pos = at.is_none().then(|| file.pos_lock());
+    let r = if write {
+        crate::fs::io::file_writev(file, segs, at, RwFlags::empty(), None)
+    } else {
+        crate::fs::io::file_readv(file, segs, at, RwFlags::empty())
+    };
+    match r {
+        Ok(n) => n as i32,
+        Err(e) => fs_error_to_errno(e) as i32,
+    }
+}
+
+/// Read element `i` of a user iovec array (negative errno on fault)
+fn read_user_iovec(iov_addr: u64, i: usize) -> Result<IoVec, i32> {
+    let addr = (i as u64)
+        .checked_mul(core::mem::size_of::<IoVec>() as u64)
+        .and_then(|o| iov_addr.checked_add(o))
+        .ok_or(KernelError::BadAddress.to_errno_neg())?;
+    copy_val_from_user::<Uaccess, IoVec>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
+}
+
+/// Copy an `int fds[n]` array from user space
+fn read_user_fds(arg: u64, n: usize) -> Result<Vec<i32>, KernelError> {
+    let mut fds = alloc::vec![0i32; n];
+    // SAFETY: byte view of the `n` initialized i32 elements of `fds`
+    let bytes = unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr() as *mut u8, n * 4) };
+    copy_from_user::<Uaccess>(bytes, arg, n * 4).map_err(|_| KernelError::BadAddress)?;
+    Ok(fds)
 }
 
 /// Get file from fd for current task
@@ -1662,7 +1613,6 @@ pub fn sys_io_uring_enter(
 ///
 /// # Returns
 /// 0 on success, or negative errno
-#[allow(clippy::needless_range_loop)] // Need raw pointer indexing for user memory
 pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i64 {
     // Get io_uring from fd
     let fd_table = match get_task_fd(current_tid()) {
@@ -1698,14 +1648,10 @@ pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i6
             }
 
             // Read fd array from userspace
-            let fds_ptr = arg as *const i32;
-            let mut fds = alloc::vec![0i32; nr_args as usize];
-
-            for i in 0..nr_args as usize {
-                unsafe {
-                    fds[i] = core::ptr::read_volatile(fds_ptr.add(i));
-                }
-            }
+            let fds = match read_user_fds(arg, nr_args as usize) {
+                Ok(f) => f,
+                Err(e) => return e.sysret(),
+            };
 
             ring.register_files(&fds)
         }
@@ -1721,14 +1667,10 @@ pub fn sys_io_uring_register(fd: u32, opcode: u32, arg: u64, nr_args: u32) -> i6
             }
 
             // Read fd array from userspace
-            let fds_ptr = arg as *const i32;
-            let mut fds = alloc::vec![0i32; nr_args as usize];
-
-            for i in 0..nr_args as usize {
-                unsafe {
-                    fds[i] = core::ptr::read_volatile(fds_ptr.add(i));
-                }
-            }
+            let fds = match read_user_fds(arg, nr_args as usize) {
+                Ok(f) => f,
+                Err(e) => return e.sysret(),
+            };
 
             ring.update_files(0, &fds)
         }

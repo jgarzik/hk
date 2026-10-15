@@ -252,6 +252,11 @@ extern "C" fn ap_rust_entry(boot_data: *const ApBootData) -> ! {
     // Initialize exception vectors for this CPU
     exceptions::init();
 
+    // Privileged Access Never, if the boot CPU found it implemented
+    if super::uaccess::pan_enabled() {
+        super::uaccess::pan_init_cpu();
+    }
+
     // Initialize GIC for this CPU (redistributor + CPU interface)
     gic::init();
 
@@ -281,13 +286,9 @@ extern "C" fn ap_rust_entry(boot_data: *const ApBootData) -> ! {
 /// AP idle loop
 fn ap_idle_loop() -> ! {
     loop {
-        // Check for reschedule request
-        if percpu::try_current_cpu()
-            .map(|p| p.needs_reschedule.load(Ordering::Relaxed))
-            .unwrap_or(false)
-        {
-            crate::task::percpu::try_schedule();
-        }
+        // Once the BSP gave this CPU a scheduler (idle task), switch into it
+        // for good; until then just take interrupts
+        crate::task::percpu::try_schedule();
 
         // Wait for next interrupt
         unsafe {

@@ -27,7 +27,7 @@ use alloc::sync::Arc;
 
 use crate::dma::DmaAddr;
 use crate::net::device::NetDevice;
-use crate::net::ethernet::EtherType;
+use crate::net::ethernet::{EtherType, PktType};
 use crate::net::ipv4::Ipv4Addr;
 
 /// Standard headroom to reserve for headers
@@ -37,7 +37,8 @@ pub const NET_SKB_PAD: usize = 64;
 pub const ETH_FRAME_LEN: usize = 1514;
 
 /// Maximum packet size we'll allocate
-pub const MAX_SKB_SIZE: usize = 2048;
+/// Largest buffer: a 64 KB IP datagram plus headroom (loopback MTU)
+pub const MAX_SKB_SIZE: usize = 65536 + 512;
 
 /// Network buffer - equivalent to Linux sk_buff
 pub struct SkBuff {
@@ -81,6 +82,19 @@ pub struct SkBuff {
     // IP addresses (set by IP layer for routing)
     pub saddr: Option<Ipv4Addr>,
     pub daddr: Option<Ipv4Addr>,
+
+    /// Receive classification (set by eth_type_trans)
+    pub pkt_type: PktType,
+    /// Received IP packet was addressed to a broadcast address (Linux
+    /// RTCF_BROADCAST; set by ip_rcv)
+    pub ip_bcast: bool,
+    /// Received IP header TTL and TOS (for IP_RECVTTL / IP_RECVTOS)
+    pub ip_ttl: u8,
+    pub ip_tos: u8,
+    /// Start of the MAC header in the buffer (null until received)
+    mac: *mut u8,
+    /// Start of the IP header of a received packet (null until marked)
+    nh: *mut u8,
 }
 
 /// Checksum state for hardware offload
@@ -141,6 +155,12 @@ impl SkBuff {
             ip_summed: ChecksumState::None,
             saddr: None,
             daddr: None,
+            pkt_type: PktType::Host,
+            ip_bcast: false,
+            ip_ttl: 0,
+            ip_tos: 0,
+            mac: core::ptr::null_mut(),
+            nh: core::ptr::null_mut(),
         }))
     }
 
@@ -318,6 +338,10 @@ impl SkBuff {
         self.ip_summed = ChecksumState::None;
         self.saddr = None;
         self.daddr = None;
+        self.pkt_type = PktType::Host;
+        self.ip_bcast = false;
+        self.mac = core::ptr::null_mut();
+        self.nh = core::ptr::null_mut();
     }
 
     // Header offset helpers
@@ -355,6 +379,42 @@ impl SkBuff {
     /// Get MAC header as slice
     pub fn mac_header(&self) -> &[u8] {
         &self.data()[self.mac_header..]
+    }
+
+    /// Record the current data pointer as the start of the MAC header
+    pub fn mark_mac_header(&mut self) {
+        self.mac = self.data;
+    }
+
+    /// The received frame from its MAC header to the end (after the
+    /// header was pulled), if one was recorded
+    pub fn frame_from_mac(&self) -> Option<&[u8]> {
+        if self.mac.is_null() {
+            return None;
+        }
+        let len = self.tail as usize - self.mac as usize;
+        Some(unsafe { core::slice::from_raw_parts(self.mac, len) })
+    }
+
+    /// Record the current data pointer as the start of the IP header
+    pub fn mark_network_header(&mut self) {
+        self.nh = self.data;
+    }
+
+    /// The received packet from its IP header to the end (after the
+    /// header was pulled), if one was recorded
+    pub fn network_packet(&self) -> Option<&[u8]> {
+        if self.nh.is_null() {
+            return None;
+        }
+        let len = self.tail as usize - self.nh as usize;
+        Some(unsafe { core::slice::from_raw_parts(self.nh, len) })
+    }
+
+    /// Network namespace of the skb's device (receive path: the namespace
+    /// the packet arrived in; never the current task's)
+    pub fn net(&self) -> Option<Arc<crate::net::NetNamespace>> {
+        self.dev.as_ref()?.net()
     }
 }
 

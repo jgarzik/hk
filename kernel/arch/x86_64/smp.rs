@@ -55,8 +55,9 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
     percpu::init_bsp(bsp_apic_id as u8, bsp_stack);
     printkln!("SMP_CPU_ONLINE: cpu=0 apic={}", bsp_apic_id);
 
-    // Enable LAPIC on BSP
+    // Enable LAPIC on BSP; legacy PIC interrupts are delivered to it
     lapic.enable();
+    lapic.enable_pic_virtual_wire();
 
     // Save kernel's GDT and IDT for APs to use
     cpu::save_kernel_gdt_for_aps();
@@ -301,6 +302,9 @@ pub extern "C" fn ap_entry(_cpu_id: u32, apic_id: u32) -> ! {
         ::core::arch::asm!("mov {}, rsp", out(reg) kernel_stack);
     }
 
+    // Same FP/SIMD setup as the BSP (CR4.OSXSAVE/XCR0 are per CPU)
+    super::fpu::init_cpu(false);
+
     // Initialize per-CPU data for this AP
     let _cpu_id = percpu::init_ap(apic_id as u8, kernel_stack);
 
@@ -332,9 +336,9 @@ pub extern "C" fn ap_entry(_cpu_id: u32, apic_id: u32) -> ! {
 /// AP idle loop - waits for work
 fn ap_idle_loop() -> ! {
     loop {
-        // Check if there's preemption pending (timer interrupt may have fired)
-        // This will call yield_now() which tries to schedule a task
-        super::timer_preempt_check();
+        // Once the BSP gave this CPU a scheduler (idle task), switch into it
+        // for good; until then just take interrupts
+        crate::task::percpu::try_schedule();
 
         // If no task was scheduled, wait for next interrupt
         unsafe {

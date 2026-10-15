@@ -8,6 +8,7 @@ use alloc::boxed::Box;
 pub mod bus;
 pub mod driver;
 pub mod pci;
+pub mod pci_intx;
 pub mod platform;
 
 pub use bus::{Bus, BusContext, BusDevice, BusDriver, BusManager, FrameAllocWrapper};

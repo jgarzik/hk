@@ -1,34 +1,49 @@
-//! Intel 82540EM (e1000) Network Driver
+//! Intel 82540EM / 82545EM (e1000) Network Driver
 //!
-//! This module implements a driver for the Intel 82540EM Gigabit Ethernet
-//! controller, commonly emulated by QEMU.
+//! Linux reference: drivers/net/ethernet/intel/e1000/e1000_main.c.
 //!
-//! ## Hardware Overview
+//! ## Design
 //!
-//! - Vendor ID: 0x8086 (Intel)
-//! - Device ID: 0x100E (82540EM)
-//! - MMIO BAR: BAR0 contains all registers
-//! - TX/RX: Ring buffer descriptors in system memory
-//! - Interrupts: Legacy PCI interrupt
+//! - PCI memory BAR0 mapped with ioremap; bus mastering enabled.
+//! - RX and TX descriptor rings and one 2 KiB bounce buffer per descriptor
+//!   live in coherent DMA memory; descriptors only ever hold DMA addresses
+//!   from the DMA API. Packets are copied into an skb on receive and out
+//!   of the skb on transmit, so no skb memory is ever exposed to the device.
+//! - Interrupts (shareable, level-triggered INTx): the ISR reads ICR
+//!   (read-to-clear), masks all causes (IMC), records the causes and calls
+//!   `napi_schedule`. The NAPI poll, in the `softnet/N` thread, reclaims TX
+//!   descriptors, receives up to `budget` frames, handles link changes, and
+//!   on completion re-enables interrupts (IMS). A cause raised while masked
+//!   stays latched in ICR and fires when IMS is rewritten.
+//! - TX ring full: the frame is dropped (`tx_dropped`, ENOBUFS to the
+//!   sender), like a qdisc drop.
+//!
+//! ## Locking (doc/LOCKING.md, Network)
+//!
+//! - ISR: touches only MMIO, atomics and `napi_schedule` (IrqSpinlock).
+//! - `rx`: `spin::Mutex`, thread context only (NAPI poll). Leaf.
+//! - `tx`: `spin::Mutex`, thread context only (xmit, NAPI poll reclaim).
+//!   Taken under socket/ARP locks (end of the network lock order). Leaf.
 
 use alloc::boxed::Box;
-use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use spin::Mutex;
+use spin::{Mutex, Once};
 
 use crate::CurrentArch;
 use crate::arch::IoremapOps;
+use crate::arch::barrier::{dma_rmb, dma_wmb, wmb};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
 use crate::bus::pci::PciDevice;
-use crate::dma::{DmaCoherent, DmaConfig, DmaDevice};
-use crate::net::device::{NetDevice, NetDeviceOps};
-use crate::net::skb::SkBuff;
+use crate::dma::DmaCoherent;
+use crate::net::dev::{NAPI_POLL_WEIGHT, Napi, NapiPoll, napi_complete_done, napi_schedule};
+use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
+use crate::net::skb::{NET_SKB_PAD, SkBuff};
 use crate::net::{self, KernelError};
 use crate::printkln;
 
@@ -45,197 +60,206 @@ const DEVICE_82545EM_COPPER: u16 = 0x100F;
 
 // Register offsets
 mod reg {
-    /// Device Control
     pub const CTRL: u32 = 0x0000;
-    /// Device Status
     pub const STATUS: u32 = 0x0008;
-    /// Interrupt Mask Set
+    pub const ICR: u32 = 0x00C0;
+    pub const ITR: u32 = 0x00C4;
     pub const IMS: u32 = 0x00D0;
-    /// Interrupt Mask Clear
     pub const IMC: u32 = 0x00D8;
-    /// Receive Control
     pub const RCTL: u32 = 0x0100;
-    /// Transmit Control
     pub const TCTL: u32 = 0x0400;
-    /// RX Descriptor Base Low
+    pub const TIPG: u32 = 0x0410;
     pub const RDBAL: u32 = 0x2800;
-    /// RX Descriptor Base High
     pub const RDBAH: u32 = 0x2804;
-    /// RX Descriptor Length
     pub const RDLEN: u32 = 0x2808;
-    /// RX Descriptor Head
     pub const RDH: u32 = 0x2810;
-    /// RX Descriptor Tail
     pub const RDT: u32 = 0x2818;
-    /// TX Descriptor Base Low
+    pub const RDTR: u32 = 0x2820;
     pub const TDBAL: u32 = 0x3800;
-    /// TX Descriptor Base High
     pub const TDBAH: u32 = 0x3804;
-    /// TX Descriptor Length
     pub const TDLEN: u32 = 0x3808;
-    /// TX Descriptor Head
     pub const TDH: u32 = 0x3810;
-    /// TX Descriptor Tail
     pub const TDT: u32 = 0x3818;
-    /// Receive Address Low (MAC)
-    pub const RAL0: u32 = 0x5400;
-    /// Receive Address High (MAC)
-    pub const RAH0: u32 = 0x5404;
-    /// Multicast Table Array
     pub const MTA: u32 = 0x5200;
+    pub const RAL0: u32 = 0x5400;
+    pub const RAH0: u32 = 0x5404;
 }
 
 // Control register bits
 mod ctrl {
-    /// Auto-Speed Detection Enable
     pub const ASDE: u32 = 1 << 5;
-    /// Set Link Up
     pub const SLU: u32 = 1 << 6;
-    /// Device Reset
     pub const RST: u32 = 1 << 26;
 }
 
 // Status register bits
 mod status {
-    /// Link Up
     pub const LU: u32 = 1 << 1;
 }
 
 // RCTL bits
 mod rctl {
-    /// Receiver Enable
     pub const EN: u32 = 1 << 1;
-    /// Broadcast Accept
     pub const BAM: u32 = 1 << 15;
-    /// Buffer Size (00 = 2048, 01 = 1024, 10 = 512, 11 = 256)
-    pub const BSIZE_2048: u32 = 0 << 16;
-    /// Strip CRC
+    /// Buffer size 2048 (BSIZE = 00, BSEX = 0)
+    pub const BSIZE_2048: u32 = 0;
     pub const SECRC: u32 = 1 << 26;
 }
 
 // TCTL bits
 mod tctl {
-    /// Transmitter Enable
     pub const EN: u32 = 1 << 1;
-    /// Pad Short Packets
     pub const PSP: u32 = 1 << 3;
-    /// Collision Threshold (shift by 4)
     pub const CT_SHIFT: u32 = 4;
-    /// Collision Distance (shift by 12)
     pub const COLD_SHIFT: u32 = 12;
 }
 
-// Interrupt bits
+// Interrupt cause bits (ICR/IMS/IMC)
 mod int {
-    /// TX Descriptor Written Back
     pub const TXDW: u32 = 1 << 0;
-    /// Link Status Change
     pub const LSC: u32 = 1 << 2;
-    /// RX Timer Interrupt
+    pub const RXSEQ: u32 = 1 << 3;
+    pub const RXDMT0: u32 = 1 << 4;
+    pub const RXO: u32 = 1 << 6;
     pub const RXT0: u32 = 1 << 7;
+    /// Causes we enable (Linux IMS_ENABLE_MASK + RXO)
+    pub const ENABLE: u32 = RXT0 | TXDW | RXDMT0 | RXSEQ | LSC | RXO;
 }
 
-/// Number of RX descriptors
-const RX_RING_SIZE: usize = 32;
-/// Number of TX descriptors
-const TX_RING_SIZE: usize = 32;
-/// RX buffer size
-const RX_BUFFER_SIZE: usize = 2048;
+/// Receive Address High: address valid
+const RAH_AV: u32 = 1 << 31;
+
+/// RX descriptors (multiple of 8; >= NAPI weight)
+const RX_RING_SIZE: usize = 128;
+/// TX descriptors (multiple of 8)
+const TX_RING_SIZE: usize = 64;
+/// Bounce buffer per descriptor (RCTL.BSIZE)
+const BUF_SIZE: usize = 2048;
+/// Largest frame accepted (no jumbo, no VLAN; CRC stripped)
+const MAX_FRAME: usize = 1518;
 
 /// Legacy RX Descriptor (16 bytes)
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct E1000RxDesc {
-    /// Buffer address (physical)
+struct RxDesc {
     buffer_addr: u64,
-    /// Length of received packet
     length: u16,
-    /// Checksum
     checksum: u16,
-    /// Status
     status: u8,
-    /// Errors
     errors: u8,
-    /// Special (VLAN tag)
     special: u16,
 }
 
 /// Legacy TX Descriptor (16 bytes)
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct E1000TxDesc {
-    /// Buffer address (physical)
+struct TxDesc {
     buffer_addr: u64,
-    /// Length
     length: u16,
-    /// Checksum offset
     cso: u8,
-    /// Command
     cmd: u8,
-    /// Status
     status: u8,
-    /// Checksum start
     css: u8,
-    /// Special (VLAN)
     special: u16,
 }
 
-// TX descriptor command bits
+const _: () = assert!(core::mem::size_of::<RxDesc>() == 16);
+const _: () = assert!(core::mem::size_of::<TxDesc>() == 16);
+
+mod rxd_stat {
+    pub const DD: u8 = 1 << 0;
+    pub const EOP: u8 = 1 << 1;
+}
+
 mod txd_cmd {
-    /// End of Packet
     pub const EOP: u8 = 1 << 0;
-    /// Insert FCS
     pub const IFCS: u8 = 1 << 1;
-    /// Report Status
     pub const RS: u8 = 1 << 3;
 }
 
-// TX descriptor status bits
 mod txd_stat {
-    /// Descriptor Done
     pub const DD: u8 = 1 << 0;
 }
 
+// ============================================================================
+// Rings
+// ============================================================================
+
+/// RX ring: descriptors + bounce buffers (NAPI poll only)
+struct RxRing {
+    desc: DmaCoherent,
+    bufs: Vec<DmaCoherent>,
+    /// Next descriptor to examine
+    next: usize,
+}
+
+/// TX ring: descriptors + bounce buffers
+struct TxRing {
+    desc: DmaCoherent,
+    bufs: Vec<DmaCoherent>,
+    /// Next descriptor to fill (software copy of TDT)
+    tail: usize,
+    /// Oldest descriptor not yet reclaimed
+    clean: usize,
+}
+
+impl RxRing {
+    fn desc(&self, i: usize) -> *mut RxDesc {
+        unsafe { (self.desc.cpu_addr as *mut RxDesc).add(i) }
+    }
+}
+
+impl TxRing {
+    fn desc(&self, i: usize) -> *mut TxDesc {
+        unsafe { (self.desc.cpu_addr as *mut TxDesc).add(i) }
+    }
+
+    /// Reclaim descriptors the device is done with; returns how many
+    fn reclaim(&mut self) -> usize {
+        let mut n = 0;
+        while self.clean != self.tail {
+            let st = unsafe { read_volatile(&(*self.desc(self.clean)).status) };
+            if st & txd_stat::DD == 0 {
+                break;
+            }
+            self.clean = (self.clean + 1) % TX_RING_SIZE;
+            n += 1;
+        }
+        n
+    }
+}
+
 /// e1000 device state
-struct E1000Device {
-    /// MMIO base address
+struct E1000 {
+    /// MMIO base (kernel virtual)
     mmio_base: u64,
     /// MAC address
     mac: [u8; 6],
-    /// DMA configuration
-    dma_config: DmaConfig,
-    /// RX descriptor ring
-    rx_ring: DmaCoherent,
-    /// TX descriptor ring
-    tx_ring: DmaCoherent,
-    /// RX buffers (owned to keep DMA allocations alive for hardware)
-    _rx_buffers: Vec<DmaCoherent>,
-    /// TX buffers (in-flight packets)
-    tx_buffers: Mutex<[Option<Box<SkBuff>>; TX_RING_SIZE]>,
-    /// Current TX index
-    tx_index: Mutex<usize>,
-    /// TX clean index (next to reclaim)
-    tx_clean: Mutex<usize>,
-    /// Link state
-    link_up: AtomicBool,
+    rx: Mutex<RxRing>,
+    tx: Mutex<TxRing>,
+    napi: Arc<Napi>,
+    /// Our net device (weak: the netdev's ops own us)
+    netdev: Once<Weak<NetDevice>>,
+    /// Causes seen by the ISR, not yet handled by the poll
+    pending_icr: AtomicU32,
+    /// Interrupts we handled
+    irqs: AtomicU64,
+    /// Interrupts on our line that were not ours (ICR == 0)
+    irqs_not_ours: AtomicU64,
 }
 
-impl E1000Device {
-    /// Read MMIO register
+impl E1000 {
     fn read_reg(&self, offset: u32) -> u32 {
         unsafe { read_volatile((self.mmio_base + offset as u64) as *const u32) }
     }
 
-    /// Write MMIO register
     fn write_reg(&self, offset: u32, value: u32) {
         unsafe { write_volatile((self.mmio_base + offset as u64) as *mut u32, value) }
     }
 
-    /// Read MAC address from hardware
     fn read_mac(&self) -> [u8; 6] {
         let ral = self.read_reg(reg::RAL0);
         let rah = self.read_reg(reg::RAH0);
-
         [
             ral as u8,
             (ral >> 8) as u8,
@@ -246,143 +270,265 @@ impl E1000Device {
         ]
     }
 
-    /// Reset the device
     fn reset(&self) {
-        // Disable interrupts
-        self.write_reg(reg::IMC, 0xFFFFFFFF);
-
-        // Reset device
+        self.write_reg(reg::IMC, 0xFFFF_FFFF);
         self.write_reg(reg::CTRL, ctrl::RST);
-
-        // Wait for reset to complete (spec says 1µs, we wait longer)
-        for _ in 0..1000 {
+        for _ in 0..100_000 {
             if self.read_reg(reg::CTRL) & ctrl::RST == 0 {
                 break;
             }
             core::hint::spin_loop();
         }
-
-        // Disable interrupts again after reset
-        self.write_reg(reg::IMC, 0xFFFFFFFF);
+        self.write_reg(reg::IMC, 0xFFFF_FFFF);
+        let _ = self.read_reg(reg::ICR);
     }
 
-    /// Initialize RX ring
+    /// Program the receive address filter with our MAC
+    fn set_mac_filter(&self) {
+        let m = self.mac;
+        let ral = u32::from_le_bytes([m[0], m[1], m[2], m[3]]);
+        let rah = u32::from(m[4]) | (u32::from(m[5]) << 8) | RAH_AV;
+        self.write_reg(reg::RAL0, ral);
+        self.write_reg(reg::RAH0, rah);
+        for i in 0..128 {
+            self.write_reg(reg::MTA + i * 4, 0);
+        }
+    }
+
     fn init_rx(&self) {
-        // Set RX descriptor ring base address
-        let rx_phys = self.rx_ring.dma_addr.0;
-        self.write_reg(reg::RDBAL, rx_phys as u32);
-        self.write_reg(reg::RDBAH, (rx_phys >> 32) as u32);
-
-        // Set ring length (in bytes)
+        let rx = self.rx.lock();
+        for i in 0..RX_RING_SIZE {
+            unsafe {
+                write_volatile(
+                    rx.desc(i),
+                    RxDesc {
+                        buffer_addr: rx.bufs[i].dma_addr.0,
+                        ..RxDesc::default()
+                    },
+                );
+            }
+        }
+        let phys = rx.desc.dma_addr.0;
+        wmb();
+        self.write_reg(reg::RDBAL, phys as u32);
+        self.write_reg(reg::RDBAH, (phys >> 32) as u32);
         self.write_reg(reg::RDLEN, (RX_RING_SIZE * 16) as u32);
-
-        // Set head and tail
         self.write_reg(reg::RDH, 0);
+        // All descriptors but one belong to the device
         self.write_reg(reg::RDT, (RX_RING_SIZE - 1) as u32);
-
-        // Configure RCTL
-        let rctl = rctl::EN | rctl::BAM | rctl::BSIZE_2048 | rctl::SECRC;
-        self.write_reg(reg::RCTL, rctl);
+        self.write_reg(reg::RDTR, 0);
+        self.write_reg(
+            reg::RCTL,
+            rctl::EN | rctl::BAM | rctl::BSIZE_2048 | rctl::SECRC,
+        );
     }
 
-    /// Initialize TX ring
     fn init_tx(&self) {
-        // Set TX descriptor ring base address
-        let tx_phys = self.tx_ring.dma_addr.0;
-        self.write_reg(reg::TDBAL, tx_phys as u32);
-        self.write_reg(reg::TDBAH, (tx_phys >> 32) as u32);
-
-        // Set ring length (in bytes)
+        let tx = self.tx.lock();
+        for i in 0..TX_RING_SIZE {
+            unsafe {
+                write_volatile(
+                    tx.desc(i),
+                    TxDesc {
+                        buffer_addr: tx.bufs[i].dma_addr.0,
+                        ..TxDesc::default()
+                    },
+                );
+            }
+        }
+        let phys = tx.desc.dma_addr.0;
+        wmb();
+        self.write_reg(reg::TDBAL, phys as u32);
+        self.write_reg(reg::TDBAH, (phys >> 32) as u32);
         self.write_reg(reg::TDLEN, (TX_RING_SIZE * 16) as u32);
-
-        // Set head and tail
         self.write_reg(reg::TDH, 0);
         self.write_reg(reg::TDT, 0);
-
-        // Configure TCTL
-        let tctl = tctl::EN
-            | tctl::PSP
-            | (15 << tctl::CT_SHIFT)      // Collision threshold
-            | (64 << tctl::COLD_SHIFT); // Collision distance
-        self.write_reg(reg::TCTL, tctl);
+        self.write_reg(reg::TIPG, 0x0060_200A);
+        self.write_reg(
+            reg::TCTL,
+            tctl::EN | tctl::PSP | (0x10 << tctl::CT_SHIFT) | (0x40 << tctl::COLD_SHIFT),
+        );
     }
 
-    /// Check link status
-    fn check_link(&self) -> bool {
-        let status = self.read_reg(reg::STATUS);
-        status & status::LU != 0
+    fn link_up(&self) -> bool {
+        self.read_reg(reg::STATUS) & status::LU != 0
     }
 
-    /// Transmit a packet
-    fn transmit(&self, skb: Box<SkBuff>) -> Result<(), KernelError> {
-        let mut tx_idx = self.tx_index.lock();
-        let mut tx_clean = self.tx_clean.lock();
+    fn netdev(&self) -> Option<Arc<NetDevice>> {
+        self.netdev.get()?.upgrade()
+    }
 
-        // Clean up completed transmits
-        while *tx_clean != *tx_idx {
-            let desc = unsafe { &*((self.tx_ring.cpu_addr as *const E1000TxDesc).add(*tx_clean)) };
-            if desc.status & txd_stat::DD == 0 {
-                break;
-            }
-
-            // Free the buffer
-            let mut buffers = self.tx_buffers.lock();
-            buffers[*tx_clean] = None;
-            drop(buffers);
-
-            *tx_clean = (*tx_clean + 1) % TX_RING_SIZE;
+    /// Transmit: copy the frame into the next descriptor's bounce buffer
+    fn transmit(&self, skb: &SkBuff) -> Result<(), KernelError> {
+        let len = skb.len();
+        if len == 0 || len > BUF_SIZE {
+            return Err(KernelError::MessageTooLong);
         }
-
-        // Check if ring is full
-        let next_idx = (*tx_idx + 1) % TX_RING_SIZE;
-        if next_idx == *tx_clean {
+        let mut tx = self.tx.lock();
+        tx.reclaim();
+        let next = (tx.tail + 1) % TX_RING_SIZE;
+        if next == tx.clean {
             return Err(KernelError::NoBufferSpace);
         }
-
-        // Get pointer to descriptor
-        let desc = unsafe { &mut *((self.tx_ring.cpu_addr as *mut E1000TxDesc).add(*tx_idx)) };
-
-        // Set up descriptor
-        desc.buffer_addr = skb.data_ptr() as u64;
-        desc.length = skb.len() as u16;
-        desc.cso = 0;
-        desc.css = 0;
-        desc.special = 0;
-        desc.status = 0;
-        desc.cmd = txd_cmd::EOP | txd_cmd::IFCS | txd_cmd::RS;
-
-        // Store skb
-        {
-            let mut buffers = self.tx_buffers.lock();
-            buffers[*tx_idx] = Some(skb);
+        let i = tx.tail;
+        unsafe {
+            core::ptr::copy_nonoverlapping(skb.data_ptr(), tx.bufs[i].cpu_addr, len);
+            let d = tx.desc(i);
+            write_volatile(&mut (*d).length, len as u16);
+            write_volatile(&mut (*d).cso, 0);
+            write_volatile(&mut (*d).css, 0);
+            write_volatile(&mut (*d).special, 0);
+            write_volatile(&mut (*d).status, 0);
+            dma_wmb();
+            write_volatile(&mut (*d).cmd, txd_cmd::EOP | txd_cmd::IFCS | txd_cmd::RS);
         }
-
-        // Update tail
-        *tx_idx = next_idx;
-        self.write_reg(reg::TDT, *tx_idx as u32);
-
+        tx.tail = next;
+        // Descriptor and buffer writes before the doorbell
+        wmb();
+        self.write_reg(reg::TDT, next as u32);
         Ok(())
     }
-}
 
-impl DmaDevice for E1000Device {
-    fn dma_config(&self) -> &DmaConfig {
-        &self.dma_config
+    /// Receive up to `budget` frames; returns them (delivered by the caller
+    /// after the ring lock is dropped)
+    #[allow(clippy::vec_box)] // skbs travel as Box<SkBuff> through the stack
+    fn receive(&self, dev: &Arc<NetDevice>, budget: usize, out: &mut Vec<Box<SkBuff>>) {
+        let mut rx = self.rx.lock();
+        let mut last = None;
+        while out.len() < budget {
+            let i = rx.next;
+            let d = rx.desc(i);
+            let st = unsafe { read_volatile(&(*d).status) };
+            if st & rxd_stat::DD == 0 {
+                break;
+            }
+            // Status before the length and data it covers
+            dma_rmb();
+            let len = unsafe { read_volatile(&(*d).length) } as usize;
+            let errors = unsafe { read_volatile(&(*d).errors) };
+            if st & rxd_stat::EOP == 0 || errors != 0 || !(14..=MAX_FRAME).contains(&len) {
+                // Multi-descriptor (oversize) or errored frame
+                dev.stats.inc_rx_errors();
+            } else {
+                // 2 extra bytes of headroom align the IP header (NET_IP_ALIGN)
+                match SkBuff::alloc(NET_SKB_PAD + 2, len) {
+                    Some(mut skb) => {
+                        let src = unsafe { core::slice::from_raw_parts(rx.bufs[i].cpu_addr, len) };
+                        let _ = skb.put_slice(src);
+                        skb.dev = Some(Arc::clone(dev));
+                        dev.stats.rx_packet(len);
+                        if src[0] & 1 != 0 {
+                            dev.stats.multicast.fetch_add(1, Ordering::Relaxed);
+                        }
+                        out.push(skb);
+                    }
+                    None => dev.stats.inc_rx_dropped(),
+                }
+            }
+            // Give the descriptor back
+            unsafe {
+                write_volatile(&mut (*d).status, 0);
+                write_volatile(&mut (*d).errors, 0);
+                write_volatile(&mut (*d).length, 0);
+            }
+            last = Some(i);
+            rx.next = (i + 1) % RX_RING_SIZE;
+        }
+        if let Some(i) = last {
+            // The processed descriptors are the device's again: the last
+            // one becomes the one software holds
+            wmb();
+            self.write_reg(reg::RDT, i as u32);
+        }
     }
 
-    fn dma_config_mut(&mut self) -> &mut DmaConfig {
-        &mut self.dma_config
+    fn handle_link_change(&self) {
+        let Some(dev) = self.netdev() else { return };
+        let up = self.link_up();
+        if up != dev.carrier_ok() {
+            if up {
+                dev.netif_carrier_on();
+            } else {
+                dev.netif_carrier_off();
+            }
+            printkln!(
+                "e1000: {} link {}",
+                dev.name(),
+                if up { "up" } else { "down" }
+            );
+        }
     }
 }
+
+/// Interrupt handler (IRQ context): ack, mask, schedule NAPI
+fn e1000_isr(_irq: u32, data: *mut ()) -> bool {
+    let dev = unsafe { &*(data as *const E1000) };
+    let icr = dev.read_reg(reg::ICR); // read-to-clear
+    if icr == 0 {
+        // Shared line: another device's interrupt
+        dev.irqs_not_ours.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    dev.irqs.fetch_add(1, Ordering::Relaxed);
+    dev.write_reg(reg::IMC, 0xFFFF_FFFF);
+    dev.pending_icr.fetch_or(icr, Ordering::AcqRel);
+    napi_schedule(&dev.napi);
+    true
+}
+
+impl NapiPoll for E1000 {
+    fn poll(&self, napi: &Napi, budget: usize) -> usize {
+        let icr = self.pending_icr.swap(0, Ordering::AcqRel);
+        if icr & int::LSC != 0 {
+            self.handle_link_change();
+        }
+
+        // TX completions
+        self.tx.lock().reclaim();
+
+        // RX
+        let mut frames = Vec::new();
+        if let Some(dev) = self.netdev() {
+            self.receive(&dev, budget, &mut frames);
+        }
+        let work = frames.len();
+        for skb in frames {
+            net::dev::netif_receive_skb(skb);
+        }
+
+        if work < budget {
+            napi_complete_done(napi, work);
+            // A closed device stays masked (stop() wrote IMC; a frame that
+            // still slips through is dropped by netif_receive_skb)
+            if !self.netdev().is_some_and(|d| d.is_up()) {
+                return work;
+            }
+            self.write_reg(reg::IMS, int::ENABLE);
+            // On a shared line our ISR may have run during the poll (for
+            // another device's interrupt) and consumed ICR causes: those
+            // will not interrupt again, so poll once more (Linux
+            // NAPIF_STATE_MISSED)
+            if self.pending_icr.load(Ordering::Acquire) != 0 {
+                self.write_reg(reg::IMC, 0xFFFF_FFFF);
+                napi_schedule(&self.napi);
+            }
+        }
+        work
+    }
+}
+
+// ============================================================================
+// Net device glue
+// ============================================================================
 
 /// e1000 NetDeviceOps implementation
 struct E1000Ops {
-    device: Arc<E1000Device>,
+    device: Arc<E1000>,
 }
 
 impl NetDeviceOps for E1000Ops {
     fn xmit(&self, skb: Box<SkBuff>) -> Result<(), KernelError> {
-        self.device.transmit(skb)
+        self.device.transmit(&skb)
     }
 
     fn mac_address(&self) -> [u8; 6] {
@@ -393,21 +539,25 @@ impl NetDeviceOps for E1000Ops {
         1500
     }
 
-    fn open(&self) -> Result<(), KernelError> {
-        // Enable interrupts
-        let ims = int::LSC | int::RXT0 | int::TXDW;
-        self.device.write_reg(reg::IMS, ims);
+    fn max_mtu(&self) -> u32 {
+        1500 // no jumbo frames (RX buffers are 2 KB)
+    }
 
-        // Set link up
-        let ctrl = self.device.read_reg(reg::CTRL);
-        self.device.write_reg(reg::CTRL, ctrl | ctrl::SLU);
-
+    fn open(&self, dev: &NetDevice) -> Result<(), KernelError> {
+        if self.device.link_up() {
+            dev.netif_carrier_on();
+        } else {
+            dev.netif_carrier_off();
+        }
+        let c = self.device.read_reg(reg::CTRL);
+        self.device.write_reg(reg::CTRL, c | ctrl::SLU | ctrl::ASDE);
+        self.device.write_reg(reg::ITR, 0);
+        self.device.write_reg(reg::IMS, int::ENABLE);
         Ok(())
     }
 
     fn stop(&self) -> Result<(), KernelError> {
-        // Disable interrupts
-        self.device.write_reg(reg::IMC, 0xFFFFFFFF);
+        self.device.write_reg(reg::IMC, 0xFFFF_FFFF);
         Ok(())
     }
 }
@@ -415,7 +565,7 @@ impl NetDeviceOps for E1000Ops {
 /// e1000 device wrapper (implements Device trait)
 struct E1000DeviceWrapper {
     netdev: Arc<NetDevice>,
-    _device: Arc<E1000Device>,
+    device: Arc<E1000>,
 }
 
 impl Device for E1000DeviceWrapper {
@@ -428,12 +578,29 @@ impl Device for E1000DeviceWrapper {
     }
 
     fn shutdown(&self) {
-        let _ = self.netdev.down();
+        printkln!(
+            "e1000: {} irqs={} not_ours={} napi_polls={}",
+            self.netdev.name(),
+            self.device.irqs.load(Ordering::Relaxed),
+            self.device.irqs_not_ours.load(Ordering::Relaxed),
+            self.device.napi.polls(),
+        );
+        self.device.write_reg(reg::IMC, 0xFFFF_FFFF);
     }
 }
 
 /// e1000 PCI driver
 pub struct E1000PciDriver;
+
+fn alloc_bufs(pci: &PciDevice, n: usize) -> Result<Vec<DmaCoherent>, DriverError> {
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        let b =
+            crate::dma::dma_alloc_coherent(pci, BUF_SIZE).ok_or(DriverError::MissingResource)?;
+        v.push(b);
+    }
+    Ok(v)
+}
 
 impl BusDriver for E1000PciDriver {
     fn name(&self) -> &str {
@@ -467,22 +634,13 @@ impl BusDriver for E1000PciDriver {
             pci.bus_id()
         );
 
-        // Get BAR0 (MMIO)
         let bar0 = pci.header.bar[0];
         if bar0 == 0 {
             printkln!("e1000: BAR0 not configured");
             return Err(DriverError::MissingResource);
         }
-
-        // MMIO physical address (mask off type bits)
         let mmio_phys = (bar0 & !0xF) as u64;
-
-        printkln!("e1000: MMIO at {:#x}", mmio_phys);
-
-        // Map MMIO region using ioremap
-        // e1000 register space is 128KB
-        let mmio_size = 128 * 1024;
-        let mmio_base = match CurrentArch::ioremap(mmio_phys, mmio_size) {
+        let mmio_base = match CurrentArch::ioremap(mmio_phys, 128 * 1024) {
             Ok(virt) => virt as u64,
             Err(e) => {
                 printkln!("e1000: Failed to ioremap MMIO region: {:?}", e);
@@ -490,55 +648,41 @@ impl BusDriver for E1000PciDriver {
             }
         };
 
-        // Use PCI device's DMA config for allocations
-        // Copy it so we can store in E1000Device
-        let dma_config = pci.dma_config;
+        // The device DMAs descriptors and packets: it must master the bus
+        pci.enable_memory_space();
+        pci.enable_bus_master();
 
-        // Allocate descriptor rings (using pci which implements DmaDevice)
-        let rx_ring = crate::dma::dma_alloc_coherent(pci, RX_RING_SIZE * 16)
+        let rx_desc = crate::dma::dma_alloc_coherent(pci, RX_RING_SIZE * 16)
             .ok_or(DriverError::MissingResource)?;
-        let tx_ring = crate::dma::dma_alloc_coherent(pci, TX_RING_SIZE * 16)
+        let tx_desc = crate::dma::dma_alloc_coherent(pci, TX_RING_SIZE * 16)
             .ok_or(DriverError::MissingResource)?;
+        let rx_bufs = alloc_bufs(pci, RX_RING_SIZE)?;
+        let tx_bufs = alloc_bufs(pci, TX_RING_SIZE)?;
 
-        // Allocate RX buffers
-        let mut rx_buffers = Vec::with_capacity(RX_RING_SIZE);
-        for i in 0..RX_RING_SIZE {
-            let buf = crate::dma::dma_alloc_coherent(pci, RX_BUFFER_SIZE)
-                .ok_or(DriverError::MissingResource)?;
-
-            // Initialize RX descriptor
-            let desc = unsafe { &mut *((rx_ring.cpu_addr as *mut E1000RxDesc).add(i)) };
-            desc.buffer_addr = buf.dma_addr.0;
-            desc.status = 0;
-
-            rx_buffers.push(buf);
-        }
-
-        // Create device
-        let device = Arc::new(E1000Device {
+        let mut dev = E1000 {
             mmio_base,
             mac: [0; 6],
-            dma_config,
-            rx_ring,
-            tx_ring,
-            _rx_buffers: rx_buffers,
-            tx_buffers: Mutex::new([const { None }; TX_RING_SIZE]),
-            tx_index: Mutex::new(0),
-            tx_clean: Mutex::new(0),
-            link_up: AtomicBool::new(false),
-        });
+            rx: Mutex::new(RxRing {
+                desc: rx_desc,
+                bufs: rx_bufs,
+                next: 0,
+            }),
+            tx: Mutex::new(TxRing {
+                desc: tx_desc,
+                bufs: tx_bufs,
+                tail: 0,
+                clean: 0,
+            }),
+            napi: Napi::new(NAPI_POLL_WEIGHT),
+            netdev: Once::new(),
+            pending_icr: AtomicU32::new(0),
+            irqs: AtomicU64::new(0),
+            irqs_not_ours: AtomicU64::new(0),
+        };
 
-        // Reset and initialize hardware
-        device.reset();
-
-        // Read MAC address
-        let mac = device.read_mac();
-        // Update MAC in device (need Arc::get_mut which won't work, so we cheat)
-        unsafe {
-            let dev_ptr = Arc::as_ptr(&device) as *mut E1000Device;
-            (*dev_ptr).mac = mac;
-        }
-
+        dev.reset();
+        dev.mac = dev.read_mac();
+        let mac = dev.mac;
         printkln!(
             "e1000: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             mac[0],
@@ -548,42 +692,48 @@ impl BusDriver for E1000PciDriver {
             mac[4],
             mac[5]
         );
+        dev.set_mac_filter();
+        dev.init_rx();
+        dev.init_tx();
 
-        // Clear multicast table
-        for i in 0..128 {
-            device.write_reg(reg::MTA + i * 4, 0);
-        }
+        let device = Arc::new(dev);
+        let poller: Weak<dyn NapiPoll> = Arc::downgrade(&device) as Weak<dyn NapiPoll>;
+        net::dev::netif_napi_add(&device.napi, poller);
 
-        // Initialize RX and TX rings
-        device.init_rx();
-        device.init_tx();
-
-        // Set up link
-        let ctrl = device.read_reg(reg::CTRL);
-        device.write_reg(reg::CTRL, ctrl | ctrl::SLU | ctrl::ASDE);
-
-        // Check link status
-        let link = device.check_link();
-        device.link_up.store(link, Ordering::Release);
-        printkln!("e1000: link {}", if link { "up" } else { "down" });
-
-        // Create NetDeviceOps
         let ops: &'static dyn NetDeviceOps = Box::leak(Box::new(E1000Ops {
             device: Arc::clone(&device),
         }));
+        let netdev = Arc::new(NetDevice::new(
+            net::dev_alloc_name("eth%d"),
+            mac,
+            LinkInfo::ETHER,
+            ops,
+        ));
+        device.netdev.call_once(|| Arc::downgrade(&netdev));
 
-        // Create NetDevice
-        let netdev = Arc::new(NetDevice::new(String::from("eth0"), mac, ops));
+        // Carrier from the PHY now; later changes arrive as LSC interrupts
+        if device.link_up() {
+            netdev.netif_carrier_on();
+        } else {
+            netdev.netif_carrier_off();
+        }
+        printkln!(
+            "e1000: link {}",
+            if device.link_up() { "up" } else { "down" }
+        );
 
-        // Bring interface up
-        netdev.up().map_err(|_| DriverError::InitFailed)?;
+        // Shareable level-triggered INTx; the device's interrupts stay
+        // masked until userspace brings the interface up (open())
+        match pci.register_irq_handler(e1000_isr, Arc::as_ptr(&device) as *mut ()) {
+            Ok(irq) => printkln!("e1000: IRQ {}", irq),
+            Err(e) => {
+                printkln!("e1000: no IRQ ({}), RX disabled", e);
+                return Err(DriverError::MissingResource);
+            }
+        }
 
-        // Register with network subsystem
         net::register_netdev(Arc::clone(&netdev));
 
-        Ok(Box::new(E1000DeviceWrapper {
-            netdev,
-            _device: device,
-        }))
+        Ok(Box::new(E1000DeviceWrapper { netdev, device }))
     }
 }

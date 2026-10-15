@@ -90,6 +90,17 @@ pub fn enable_irq(irq: u8) {
     }
 }
 
+/// Mask a specific IRQ
+pub fn disable_irq(irq: u8) {
+    if irq < 8 {
+        let mask = inb(PIC1_DATA);
+        outb(PIC1_DATA, mask | (1 << irq));
+    } else if irq < 16 {
+        let mask = inb(PIC2_DATA);
+        outb(PIC2_DATA, mask | (1 << (irq - 8)));
+    }
+}
+
 /// Send End of Interrupt (EOI) signal
 pub fn send_eoi(irq: u8) {
     if irq >= 8 {

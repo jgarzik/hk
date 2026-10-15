@@ -111,6 +111,17 @@ impl LocalApic {
         self.read(LAPIC_VERSION)
     }
 
+    /// BSP only: let the 8259 PIC reach this CPU through LINT0 (ExtINT)
+    /// and NMIs through LINT1 (Intel MP spec "virtual wire" mode, Linux
+    /// setup_local_APIC). Without it, every PIC-routed device IRQ (PCI
+    /// INTx on QEMU `pc`) is silently lost once the LAPIC is enabled.
+    pub fn enable_pic_virtual_wire(&self) {
+        const APIC_DM_EXTINT: u32 = 0x700;
+        const APIC_DM_NMI: u32 = 0x400;
+        self.write(LAPIC_LINT0_LVT, APIC_DM_EXTINT);
+        self.write(LAPIC_LINT1_LVT, APIC_DM_NMI);
+    }
+
     /// Enable the Local APIC
     pub fn enable(&self) {
         // Set spurious vector and enable APIC

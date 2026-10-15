@@ -13,6 +13,7 @@ use crate::fs::{KernelError, LookupFlags, lookup_path_flags};
 use crate::task::percpu::current_tid;
 use crate::uaccess::{copy_from_user, copy_to_user, strncpy_from_user};
 
+use super::file::File;
 use super::posix_lock::{Flock, posix_getlk, posix_setlk, posix_setlkw};
 use super::syscall::{PATH_MAX, current_fd_table, get_nofile_limit};
 
@@ -33,8 +34,12 @@ fn do_truncate(inode: &Arc<super::Inode>, length: u64) -> i64 {
         }
     }
 
-    // Perform truncate
-    match inode.i_op.truncate(inode, length) {
+    // Under i_rwsem, like Linux do_truncate: atomic with writes
+    inode.inode_lock();
+    let r = inode.i_op.truncate(inode, length);
+    // SAFETY: taken above by this thread
+    unsafe { inode.inode_unlock() };
+    match r {
         Ok(()) => 0,
         Err(KernelError::IsDirectory) => KernelError::IsDirectory.sysret(),
         Err(KernelError::OperationNotSupported) => KernelError::InvalidArgument.sysret(),
@@ -67,17 +72,18 @@ pub fn sys_ftruncate(fd: i32, length: i64) -> i64 {
         None => return KernelError::BadFd.sysret(),
     };
 
-    // Check file is writable
-    if !file.is_writable() {
-        return KernelError::InvalidArgument.sysret(); // EBADF or EINVAL depending on interpretation
-    }
-
     // Get the inode
     let inode = match file.get_inode() {
         Some(i) => i,
         None => return KernelError::BadFd.sysret(),
     };
 
+    // Linux do_ftruncate: a regular file open for writing, else EINVAL
+    if !file.is_writable() || !inode.mode().is_file() {
+        return KernelError::InvalidArgument.sysret();
+    }
+
+    super::dac::remove_privs(&inode);
     do_truncate(&inode, length as u64)
 }
 
@@ -107,9 +113,7 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
     // Look up the file (follow symlinks for truncate)
     let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Get the inode
@@ -118,6 +122,23 @@ pub fn sys_truncate(path_ptr: u64, length: i64) -> i64 {
         None => return KernelError::NotFound.sysret(),
     };
 
+    // vfs_truncate: EISDIR / EINVAL, write access (EROFS), write
+    // permission, then set-id removal
+    let m = inode.mode();
+    if m.is_dir() {
+        return KernelError::IsDirectory.sysret();
+    }
+    if !m.is_file() {
+        return KernelError::InvalidArgument.sysret();
+    }
+    let _w = match super::dac::want_write(&inode) {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
+    if let Err(e) = super::dac::may_truncate(&inode) {
+        return e.sysret();
+    }
+    super::dac::remove_privs(&inode);
     do_truncate(&inode, length as u64)
 }
 
@@ -554,13 +575,14 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
         }
 
         F_SETOWN => {
-            // Set owner PID/PGID for async I/O signals
             let file = match table.get(fd) {
                 Some(f) => f,
                 None => return KernelError::BadFd.sysret(),
             };
-            file.set_owner(arg as i32);
-            0
+            match f_setown(&file, arg as i32) {
+                Ok(()) => 0,
+                Err(e) => e.sysret(),
+            }
         }
 
         F_GETOWN => {
@@ -598,4 +620,23 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
 
         _ => KernelError::InvalidArgument.sysret(),
     }
+}
+
+/// Set the SIGIO owner of `file` (Linux f_setown): `who` > 0 is a
+/// process, < 0 a process group, 0 clears; ESRCH if none exists,
+/// EINVAL for INT_MIN
+pub fn f_setown(file: &File, who: i32) -> Result<(), KernelError> {
+    if who == i32::MIN {
+        return Err(KernelError::InvalidArgument);
+    }
+    let exists = match who {
+        0 => true,
+        w if w > 0 => crate::task::percpu::lookup_task_pgid(w as u64).is_some(),
+        w => crate::task::percpu::pgrp_exists(w.unsigned_abs() as u64),
+    };
+    if !exists {
+        return Err(KernelError::NoProcess);
+    }
+    file.set_owner(who);
+    Ok(())
 }

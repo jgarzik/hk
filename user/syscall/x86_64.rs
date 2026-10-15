@@ -182,11 +182,14 @@ pub const SYS_MADVISE: u64 = 28;
 pub const SYS_SHMGET: u64 = 29;
 pub const SYS_SHMAT: u64 = 30;
 pub const SYS_SHMCTL: u64 = 31;
+pub const SYS_PAUSE: u64 = 34;
 pub const SYS_NANOSLEEP: u64 = 35;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_SOCKET: u64 = 41;
 pub const SYS_CONNECT: u64 = 42;
 pub const SYS_ACCEPT: u64 = 43;
+pub const SYS_ACCEPT4: u64 = 288;
+pub const SYS_FSTAT: u64 = 5;
 pub const SYS_SENDTO: u64 = 44;
 pub const SYS_RECVFROM: u64 = 45;
 pub const SYS_SENDMSG: u64 = 46;
@@ -221,6 +224,7 @@ pub const SYS_FSYNC: u64 = 74;
 pub const SYS_FDATASYNC: u64 = 75;
 pub const SYS_TRUNCATE: u64 = 76;
 pub const SYS_FTRUNCATE: u64 = 77;
+pub const SYS_GETDENTS: u64 = 78;
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_RENAME: u64 = 82;
 pub const SYS_MKDIR: u64 = 83;
@@ -349,6 +353,7 @@ pub const SYS_GET_ROBUST_LIST: u64 = 274;
 pub const SYS_FUTEX_WAITV: u64 = 449;
 pub const SYS_UTIMENSAT: u64 = 280;
 pub const SYS_PIPE2: u64 = 293;
+pub const SYS_DUP3: u64 = 292;
 pub const SYS_PREADV: u64 = 295;
 pub const SYS_PWRITEV: u64 = 296;
 pub const SYS_PREADV2: u64 = 327;
@@ -373,6 +378,9 @@ pub const SYS_STATFS: u64 = 137;
 pub const SYS_FSTATFS: u64 = 138;
 pub const SYS_STATX: u64 = 332;
 pub const SYS_CHROOT: u64 = 161;
+pub const SYS_FACCESSAT: u64 = 269;
+pub const SYS_CHDIR: u64 = 80;
+pub const SYS_FCHDIR: u64 = 81;
 pub const SYS_FCHMODAT2: u64 = 452;
 
 // Extended attributes syscalls
@@ -433,6 +441,11 @@ pub fn sys_close(fd: u64) -> i64 {
 }
 
 #[inline(always)]
+pub fn sys_dup3(oldfd: i32, newfd: i32, flags: u32) -> i64 {
+    unsafe { syscall3!(SYS_DUP3, oldfd, newfd, flags) }
+}
+
+#[inline(always)]
 pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64 {
     unsafe { syscall3!(SYS_LSEEK, fd, offset, whence) }
 }
@@ -477,6 +490,12 @@ pub fn sys_preadv2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: 
 pub fn sys_pwritev2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
     // Linux ABI: (fd, vec, vlen, pos_l, pos_h, flags), like glibc's LO_HI_LONG
     unsafe { syscall6!(SYS_PWRITEV2, fd, iov, iovcnt, offset, (offset as u64) >> 32, flags) }
+}
+
+/// Legacy getdents (struct linux_dirent; x86-64 only)
+#[inline(always)]
+pub fn sys_getdents(fd: u64, dirp: *mut u8, count: u64) -> i64 {
+    unsafe { syscall3!(SYS_GETDENTS, fd, dirp, count) }
 }
 
 #[inline(always)]
@@ -586,6 +605,22 @@ pub fn sys_umask(mask: u32) -> i64 {
 #[inline(always)]
 pub fn sys_chroot(pathname: *const u8) -> i64 {
     unsafe { syscall1!(SYS_CHROOT, pathname) }
+}
+
+/// chdir(pathname)
+pub fn sys_chdir(pathname: *const u8) -> i64 {
+    unsafe { syscall1!(SYS_CHDIR, pathname) }
+}
+
+/// fchdir(fd)
+pub fn sys_fchdir(fd: i32) -> i64 {
+    unsafe { syscall1!(SYS_FCHDIR, fd) }
+}
+
+/// faccessat(dirfd, pathname, mode, flags) (the syscall has no flags
+/// argument: flags other than 0 go through faccessat2 in libc)
+pub fn sys_faccessat(dirfd: i32, pathname: *const u8, mode: i32) -> i64 {
+    unsafe { syscall3!(SYS_FACCESSAT, dirfd, pathname, mode) }
 }
 
 #[inline(always)]
@@ -813,6 +848,12 @@ pub fn sys_setfsgid(gid: u32) -> i64 {
 }
 
 // --- Time ---
+
+/// pause() - sleep until a signal handler runs (always -EINTR)
+#[inline(always)]
+pub fn sys_pause() -> i64 {
+    unsafe { syscall0!(SYS_PAUSE) }
+}
 
 #[inline(always)]
 pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> i64 {
@@ -1466,6 +1507,18 @@ pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
 #[inline(always)]
 pub fn sys_accept(fd: i32, addr: *mut u8, addrlen: *mut u32) -> i64 {
     unsafe { syscall3!(SYS_ACCEPT, fd, addr, addrlen) }
+}
+
+/// accept4(fd, addr, addrlen, flags)
+#[inline(always)]
+pub fn sys_accept4(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_ACCEPT4, fd, addr, addrlen, flags) }
+}
+
+/// fstat(fd, statbuf)
+#[inline(always)]
+pub fn sys_fstat(fd: i32, statbuf: *mut Stat) -> i64 {
+    unsafe { syscall2!(SYS_FSTAT, fd, statbuf) }
 }
 
 #[inline(always)]

@@ -215,10 +215,10 @@ pub fn sys_acct(filename_ptr: u64) -> i64 {
 /// Open the accounting file
 fn open_acct_file(path: &str) -> Result<Arc<File>, i64> {
     use crate::fs::file::flags;
-    use crate::fs::{LookupFlags, lookup_path_at};
+    use crate::fs::{LookupFlags, dac, lookup_path_flags};
 
     // Lookup the file
-    let dentry = match lookup_path_at(None, path, LookupFlags::open()) {
+    let dentry = match lookup_path_flags(path, LookupFlags::open()) {
         Ok(d) => d,
         Err(e) => {
             return Err(match e {
@@ -230,21 +230,28 @@ fn open_acct_file(path: &str) -> Result<Arc<File>, i64> {
         }
     };
 
-    // Check it's a regular file
-    if let Some(inode) = dentry.get_inode()
-        && !inode.mode().is_file()
-    {
-        return Err(-13); // EACCES - not a regular file
+    // file_open_name(O_WRONLY | O_APPEND): may_open, then a regular file
+    if let Some(inode) = dentry.get_inode() {
+        let wflags = flags::O_WRONLY | flags::O_APPEND;
+        dac::may_open(&dac::cred(), &inode, dac::acc_mode(wflags), wflags)
+            .map_err(|e| e.sysret())?;
+        if !inode.mode().is_file() {
+            return Err(-13); // EACCES - not a regular file
+        }
     }
 
-    // Create file for writing (append mode)
-    let file = Arc::new(File::new(
+    // Open for writing: hold write access (EROFS on a read-only fs)
+    let w = match dentry.get_inode() {
+        Some(i) => Some(dac::want_write(&i).map_err(|e| e.sysret())?),
+        None => None,
+    };
+    let mut file = File::new(
         dentry,
         flags::O_WRONLY | flags::O_APPEND,
         &crate::fs::file::NULL_FILE_OPS,
-    ));
-
-    Ok(file)
+    );
+    file.write_access = w;
+    Ok(Arc::new(file))
 }
 
 // =============================================================================

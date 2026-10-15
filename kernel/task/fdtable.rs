@@ -63,6 +63,20 @@ pub fn exit_task_fd(tid: Tid) {
     }
 }
 
+/// At exec's point of no return: give the task a private table without
+/// its close-on-exec descriptors (Linux unshare_files, then
+/// do_close_on_exec). A table shared through CLONE_FILES stays intact
+/// for the other tasks; the closed files are released after every lock
+/// is dropped.
+pub fn exec_task_fd(tid: Tid) {
+    let Some(old) = get_task_fd(tid) else {
+        return;
+    };
+    let new = Arc::new(Mutex::new(old.lock().exec_copy()));
+    init_task_fd(tid, new);
+    drop(old);
+}
+
 /// Clone FD table for fork/clone
 ///
 /// If `share` is true (CLONE_FILES set), the child shares the parent's FD table.

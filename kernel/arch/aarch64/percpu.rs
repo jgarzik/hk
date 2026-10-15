@@ -64,9 +64,81 @@ pub struct PerCpu {
     /// Saved user GPRs x0-x30 from syscall entry (for fork/clone)
     pub syscall_user_regs: [u64; 31],
 
+    /// Original x0 of the syscall in progress (x0 is overwritten by the
+    /// return value; needed to restart the syscall after -ERESTART*)
+    pub syscall_orig_x0: u64,
+
     /// Flag set when signal delivery modifies the return context
     /// When true, the syscall return path should update the stack frame from percpu
     pub signal_context_modified: bool,
+
+    /// Trap frame of the current task's last entry from EL0 (top of its
+    /// kernel stack): holds its user FP/SIMD state while it is in the kernel
+    pub user_frame: *mut super::Aarch64TrapFrame,
+}
+
+/// Snapshot of the per-CPU syscall user-register block
+///
+/// The block describes the *current task's* syscall, but lives in per-CPU
+/// data; the scheduler saves it on the outgoing task's kernel stack around
+/// every context switch so a task that slept inside a syscall still returns
+/// (and builds signal frames) with its own registers.
+#[derive(Clone, Copy)]
+pub struct SyscallUserState {
+    elr: u64,
+    spsr: u64,
+    sp: u64,
+    regs: [u64; 31],
+    orig_x0: u64,
+    modified: bool,
+    user_frame: *mut super::Aarch64TrapFrame,
+}
+
+/// Capture the syscall user-register block of this CPU
+pub fn save_syscall_user_state() -> SyscallUserState {
+    let p = unsafe { current_cpu_mut() };
+    SyscallUserState {
+        elr: p.syscall_user_elr,
+        spsr: p.syscall_user_spsr,
+        sp: p.syscall_user_sp,
+        regs: p.syscall_user_regs,
+        orig_x0: p.syscall_orig_x0,
+        modified: p.signal_context_modified,
+        user_frame: p.user_frame,
+    }
+}
+
+/// Restore a block captured by [`save_syscall_user_state`]
+pub fn restore_syscall_user_state(s: &SyscallUserState) {
+    let p = unsafe { current_cpu_mut() };
+    p.syscall_user_elr = s.elr;
+    p.syscall_user_spsr = s.spsr;
+    p.syscall_user_sp = s.sp;
+    p.syscall_user_regs = s.regs;
+    p.syscall_orig_x0 = s.orig_x0;
+    p.signal_context_modified = s.modified;
+    p.user_frame = s.user_frame;
+}
+
+/// The current task's user trap frame (see `PerCpu::user_frame`)
+///
+/// # Safety
+/// Only meaningful in process context of a task that entered from EL0.
+pub fn current_user_frame() -> Option<&'static mut super::Aarch64TrapFrame> {
+    let p = try_current_cpu()?;
+    unsafe { p.user_frame.as_mut() }
+}
+
+/// Arrange for the current syscall to be re-executed on return to user
+/// (-ERESTART* with no handler, or SA_RESTART): back ELR up over the `svc`
+/// and restore the original x0 (x8 still holds the syscall number). Returns
+/// the value x0 must hold on return.
+pub fn syscall_restart() -> u64 {
+    let p = unsafe { current_cpu_mut() };
+    p.syscall_user_elr = p.syscall_user_elr.wrapping_sub(4);
+    p.syscall_user_regs[0] = p.syscall_orig_x0;
+    p.signal_context_modified = true;
+    p.syscall_orig_x0
 }
 
 // Safety: PerCpu is only accessed by its owning CPU
@@ -93,7 +165,9 @@ impl PerCpu {
             syscall_user_spsr: 0,
             syscall_user_sp: 0,
             syscall_user_regs: [0; 31],
+            syscall_orig_x0: 0,
             signal_context_modified: false,
+            user_frame: core::ptr::null_mut(),
         }
     }
 
@@ -119,6 +193,7 @@ impl PerCpu {
         self.syscall_user_sp = 0;
         self.syscall_user_regs = [0; 31];
         self.signal_context_modified = false;
+        self.user_frame = core::ptr::null_mut();
     }
 
     /// Mark this CPU as online

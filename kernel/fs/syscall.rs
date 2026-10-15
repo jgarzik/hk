@@ -66,8 +66,9 @@ pub const AT_FDCWD: i32 = -100;
 /// Maximum path length for user strings
 pub const PATH_MAX: usize = 4096;
 
-/// Maximum single I/O transfer size (1MB)
-pub const MAX_RW_COUNT: usize = 1024 * 1024;
+/// Largest single read/write transfer (Linux MAX_RW_COUNT = INT_MAX & PAGE_MASK);
+/// data moves through bounded kernel buffers (`file::WRITE_CHUNK`)
+pub const MAX_RW_COUNT: usize = 0x7fff_f000;
 
 /// Maximum number of iovec entries (Linux default)
 pub const IOV_MAX: usize = 1024;
@@ -130,9 +131,6 @@ pub fn current_fd_table() -> alloc::sync::Arc<spin::Mutex<crate::task::FdTable<F
     get_task_fd(current_tid()).expect("current task has no FD table")
 }
 
-/// Small buffer size for stack-based I/O (4KB)
-pub const SMALL_BUF_SIZE: usize = 4096;
-
 ///
 /// Returns the parent dentry and the final component name.
 pub fn lookup_parent_at(
@@ -180,10 +178,7 @@ pub fn lookup_parent_at(
     // Look up parent directory
     let parent_dentry = match lookup_path_at(start, parent_path, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return Err(KernelError::NotFound.sysret()),
-        Err(KernelError::NotDirectory) => return Err(KernelError::NotDirectory.sysret()),
-        Err(KernelError::TooManySymlinks) => return Err(KernelError::TooManySymlinks.sysret()),
-        Err(_) => return Err(KernelError::InvalidArgument.sysret()),
+        Err(e) => return Err(e.sysret()),
     };
 
     Ok((parent_dentry, alloc::string::String::from(name)))

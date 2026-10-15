@@ -16,6 +16,8 @@ use ::core::cmp::min;
 use ::core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use spin::Mutex;
 
+use crate::sync;
+
 use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{FileType, Inode, InodeId};
@@ -27,6 +29,10 @@ use crate::poll::{
 use crate::frame_alloc::FrameAllocRef;
 use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
 use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
+
+/// Largest kernel bounce buffer one read/write call uses: transfers
+/// bigger than this go through it in steps
+pub const WRITE_CHUNK: usize = 64 * 1024;
 
 /// Open file flags (Linux O_* flags)
 pub mod flags {
@@ -97,6 +103,51 @@ pub struct DirEntry {
     pub name: Vec<u8>,
 }
 
+/// Directory iteration state (Linux struct dir_context): `pos` is where
+/// iteration starts and, after each accepted entry, the position just
+/// past it (that entry's d_off). File systems hand entries to `emit_at`
+/// (stable positions, increasing) or `emit` (the n-th entry of a fixed
+/// listing order is position n); both skip entries before `pos` and
+/// return false once the consumer is full.
+pub struct DirContext<'a> {
+    /// Current position (resume point)
+    pub pos: u64,
+    /// Position of the next `emit`
+    next: u64,
+    /// Consumer: entry and its d_off; false = no room, stop
+    actor: &'a mut dyn FnMut(&DirEntry, u64) -> bool,
+}
+
+impl<'a> DirContext<'a> {
+    /// Iterate from `pos`, feeding `actor`
+    pub fn new(pos: u64, actor: &'a mut dyn FnMut(&DirEntry, u64) -> bool) -> Self {
+        Self {
+            pos,
+            next: 0,
+            actor,
+        }
+    }
+
+    /// dir_emit of the entry at position `at`
+    pub fn emit_at(&mut self, at: u64, e: DirEntry) -> bool {
+        if at < self.pos {
+            return true;
+        }
+        if !(self.actor)(&e, at + 1) {
+            return false;
+        }
+        self.pos = at + 1;
+        true
+    }
+
+    /// dir_emit of the next entry of a fixed listing order
+    pub fn emit(&mut self, e: DirEntry) -> bool {
+        let at = self.next;
+        self.next += 1;
+        self.emit_at(at, e)
+    }
+}
+
 /// File operations trait - filesystem-specific behavior for open files
 pub trait FileOps: Send + Sync {
     /// Returns self as Any for downcasting to concrete types
@@ -165,13 +216,9 @@ pub trait FileOps: Send + Sync {
         Ok(new_pos)
     }
 
-    /// Read directory entries
-    fn readdir(
-        &self,
-        file: &File,
-        callback: &mut dyn FnMut(DirEntry) -> bool,
-    ) -> Result<(), KernelError> {
-        let _ = (file, callback);
+    /// Read directory entries from `ctx.pos` on (Linux iterate_shared)
+    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
+        let _ = (file, ctx);
         Err(KernelError::NotDirectory)
     }
 
@@ -183,6 +230,13 @@ pub trait FileOps: Send + Sync {
     /// Release file (called when last reference is dropped)
     fn release(&self, _file: &File) -> Result<(), KernelError> {
         Ok(())
+    }
+
+    /// Device/file-specific ioctl (Linux f_op->unlocked_ioctl), reached
+    /// by `sys_ioctl` after the generic FIO* commands for files that are
+    /// not block or character devices (e.g. sockets). Default: ENOTTY.
+    fn ioctl(&self, _file: &File, _cmd: u32, _arg: u64) -> Result<i64, KernelError> {
+        Err(KernelError::NotTty)
     }
 
     /// Poll for events (like f_op->poll in Linux)
@@ -282,6 +336,10 @@ pub struct File {
     /// Current file position
     pos: AtomicU64,
 
+    /// Serializes position updates of read/write/lseek/getdents on
+    /// regular files and directories (Linux f_pos_lock, FMODE_ATOMIC_POS)
+    f_pos_lock: sync::Mutex<()>,
+
     /// Open flags (protected by f_lock, like Linux)
     f_lock: Mutex<u32>,
 
@@ -295,6 +353,15 @@ pub struct File {
     /// Signal to send for async I/O (F_SETSIG/F_GETSIG)
     /// 0 = use default SIGIO
     owner_sig: AtomicI32,
+
+    /// Write access to the file system while open for writing (Linux
+    /// FMODE_WRITER): a read-only remount is EBUSY until it is released
+    pub write_access: Option<super::superblock::WriteAccess>,
+
+    /// Credentials of the opener (Linux file->f_cred): permission checks
+    /// that must not be satisfied by whoever later uses the descriptor
+    /// (confused deputy), e.g. netlink configuration requests
+    pub f_cred: crate::task::Cred,
 }
 
 impl File {
@@ -314,10 +381,13 @@ impl File {
             dentry,
             mnt,
             pos: AtomicU64::new(0),
+            f_pos_lock: sync::Mutex::new(()),
             f_lock: Mutex::new(flags),
             f_op,
             owner_pid: AtomicI32::new(0),
             owner_sig: AtomicI32::new(0),
+            write_access: None,
+            f_cred: crate::task::current_cred(),
         }
     }
 
@@ -334,6 +404,13 @@ impl File {
     /// Set file position
     pub fn set_pos(&self, pos: u64) {
         self.pos.store(pos, Ordering::Relaxed);
+    }
+
+    /// Take f_pos_lock for a position-based syscall (Linux fdget_pos):
+    /// only regular files and directories need it (FMODE_ATOMIC_POS)
+    pub fn pos_lock(&self) -> Option<sync::MutexGuard<'_, ()>> {
+        let m = self.get_inode()?.mode();
+        (m.is_file() || m.is_dir()).then(|| self.f_pos_lock.lock())
     }
 
     /// Advance file position by n bytes
@@ -413,12 +490,9 @@ impl File {
         self.f_op.read(self, buf)
     }
 
-    /// Write to file
+    /// Write at the file position
     pub fn write(&self, buf: &[u8]) -> Result<usize, KernelError> {
-        if !self.is_writable() {
-            return Err(KernelError::PermissionDenied);
-        }
-        self.f_op.write(self, buf)
+        self.write_at(buf, None, RwFlags::empty(), None)
     }
 
     /// Positioned read - read at given offset without modifying file position
@@ -429,12 +503,9 @@ impl File {
         self.f_op.pread(self, buf, offset)
     }
 
-    /// Positioned write - write at given offset without modifying file position
+    /// Positioned write (the file position is not used or changed)
     pub fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
-        if !self.is_writable() {
-            return Err(KernelError::PermissionDenied);
-        }
-        self.f_op.pwrite(self, buf, offset)
+        self.write_at(buf, Some(offset), RwFlags::empty(), None)
     }
 
     /// Read with RWF flags (for preadv2/pwritev2 with RWF_NOWAIT support)
@@ -443,14 +514,6 @@ impl File {
             return Err(KernelError::PermissionDenied);
         }
         self.f_op.read_with_flags(self, buf, flags)
-    }
-
-    /// Write with RWF flags
-    pub fn write_with_flags(&self, buf: &[u8], flags: RwFlags) -> Result<usize, KernelError> {
-        if !self.is_writable() {
-            return Err(KernelError::PermissionDenied);
-        }
-        self.f_op.write_with_flags(self, buf, flags)
     }
 
     /// Positioned read with RWF flags
@@ -466,17 +529,105 @@ impl File {
         self.f_op.pread_with_flags(self, buf, offset, flags)
     }
 
-    /// Positioned write with RWF flags
-    pub fn pwrite_with_flags(
+    /// Write `buf` at `at` (None: the file position, which advances);
+    /// see [`File::write_from`]
+    pub fn write_at(
         &self,
         buf: &[u8],
-        offset: u64,
+        at: Option<u64>,
         flags: RwFlags,
+        append: Option<bool>,
+    ) -> Result<usize, KernelError> {
+        let mut off = 0;
+        self.write_from(buf.len(), at, flags, append, &mut |dst| {
+            dst.copy_from_slice(&buf[off..off + dst.len()]);
+            off += dst.len();
+            Ok(())
+        })
+    }
+
+    /// Write `len` bytes produced in order by `src` at `at` (None: the
+    /// file position, which advances) (Linux vfs_write +
+    /// generic_file_write_iter). The data passes through a kernel buffer
+    /// of at most `WRITE_CHUNK` bytes, so a call never pins more kernel
+    /// memory than that. Regular files are written under the inode's
+    /// i_rwsem, held across all chunks: in append mode (`append`:
+    /// RWF_APPEND / RWF_NOAPPEND, None = the file's O_APPEND) the data
+    /// goes to the current end of file, also for pwrite (Linux), and
+    /// position, data and new size change atomically with respect to
+    /// other writers and truncate. A short chunk ends the write; an
+    /// error after some bytes were written returns their count (Linux).
+    pub fn write_from(
+        &self,
+        len: usize,
+        at: Option<u64>,
+        flags: RwFlags,
+        append: Option<bool>,
+        src: &mut dyn FnMut(&mut [u8]) -> Result<(), KernelError>,
     ) -> Result<usize, KernelError> {
         if !self.is_writable() {
             return Err(KernelError::PermissionDenied);
         }
-        self.f_op.pwrite_with_flags(self, buf, offset, flags)
+        let inode = match self.get_inode() {
+            Some(i) if i.mode().is_file() => i,
+            _ => return self.write_chunks(len, at, flags, src),
+        };
+        let append = append.unwrap_or(self.get_flags() & flags::O_APPEND != 0);
+        inode.inode_lock();
+        let r = (|| {
+            let at = match (append, at) {
+                (true, None) => {
+                    self.set_pos(inode.get_size());
+                    None
+                }
+                (true, Some(_)) => Some(inode.get_size()),
+                (false, at) => at,
+            };
+            let pos = at.unwrap_or_else(|| self.get_pos());
+            super::syscall::check_fsize_limit(pos, len).map_err(|_| KernelError::FileTooLarge)?;
+            if len > 0 {
+                // file_remove_privs: set-id bits go unless CAP_FSETID
+                super::dac::remove_privs(&inode);
+            }
+            self.write_chunks(len, at, flags, src)
+        })();
+        // SAFETY: taken above by this thread
+        unsafe { inode.inode_unlock() };
+        r
+    }
+
+    /// The chunk loop of `write_from`
+    fn write_chunks(
+        &self,
+        len: usize,
+        at: Option<u64>,
+        flags: RwFlags,
+        src: &mut dyn FnMut(&mut [u8]) -> Result<(), KernelError>,
+    ) -> Result<usize, KernelError> {
+        let mut buf = alloc::vec![0u8; len.min(WRITE_CHUNK)];
+        let mut done = 0;
+        loop {
+            let n = (len - done).min(WRITE_CHUNK);
+            let r = src(&mut buf[..n])
+                .and_then(|()| self.do_write(&buf[..n], at.map(|o| o + done as u64), flags));
+            match r {
+                Ok(w) => {
+                    done += w;
+                    if w < n || done >= len {
+                        return Ok(done);
+                    }
+                }
+                Err(_) if done > 0 => return Ok(done),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn do_write(&self, buf: &[u8], at: Option<u64>, flags: RwFlags) -> Result<usize, KernelError> {
+        match at {
+            None => self.f_op.write_with_flags(self, buf, flags),
+            Some(o) => self.f_op.pwrite_with_flags(self, buf, o, flags),
+        }
     }
 
     /// Seek
@@ -485,11 +636,11 @@ impl File {
     }
 
     /// Read directory entries
-    pub fn readdir(&self, callback: &mut dyn FnMut(DirEntry) -> bool) -> Result<(), KernelError> {
+    pub fn readdir(&self, ctx: &mut DirContext) -> Result<(), KernelError> {
         if !self.is_dir() {
             return Err(KernelError::NotDirectory);
         }
-        self.f_op.readdir(self, callback)
+        self.f_op.readdir(self, ctx)
     }
 
     /// Poll for events
@@ -564,6 +715,7 @@ impl CharDevFileOps {
             DeviceError::InvalidArg => KernelError::InvalidArgument,
             DeviceError::NotFound => KernelError::NotFound,
             DeviceError::NotTty => KernelError::NotTty,
+            DeviceError::Fault => KernelError::BadAddress,
         }
     }
 }

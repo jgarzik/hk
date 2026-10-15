@@ -108,6 +108,10 @@ pub enum KernelError {
     NoData = 61,
     /// Timer expired (ETIME)
     TimerExpired = 62,
+    /// Machine is not on the network (ENONET)
+    NoNetwork = 64,
+    /// Protocol error (EPROTO)
+    ProtocolError = 71,
     /// Value too large for defined data type (EOVERFLOW)
     Overflow = 75,
     /// Bad message (EBADMSG)
@@ -158,6 +162,8 @@ pub enum KernelError {
     NotConnected = 107,
     /// Cannot send after transport endpoint shutdown (ESHUTDOWN)
     Shutdown = 108,
+    /// Too many references: cannot splice (ETOOMANYREFS)
+    TooManyRefs = 109,
     /// Connection timed out (ETIMEDOUT)
     TimedOut = 110,
     /// Connection refused (ECONNREFUSED)
@@ -174,6 +180,8 @@ pub enum KernelError {
     // =========================================================================
     // Additional errno values
     // =========================================================================
+    /// Remote I/O error (EREMOTEIO)
+    RemoteIo = 121,
     /// Disk quota exceeded (EDQUOT)
     QuotaExceeded = 122,
     /// Operation canceled (ECANCELED)
@@ -186,9 +194,113 @@ pub enum KernelError {
     KeyRevoked = 128,
     /// Key was rejected by service (EKEYREJECTED)
     KeyRejected = 129,
+
+    // =========================================================================
+    // Kernel-internal restart codes (include/linux/errno.h); never reach
+    // user space: the syscall exit path turns them into a restart or EINTR
+    // =========================================================================
+    /// Interrupted by a signal; restart if the handler has SA_RESTART (or
+    /// no handler ran), else EINTR (ERESTARTSYS)
+    RestartSys = 512,
+    /// Always restart, even after a handler (ERESTARTNOINTR)
+    RestartNoIntr = 513,
+    /// Restart only if no handler ran, else EINTR (ERESTARTNOHAND)
+    RestartNoHand = 514,
 }
 
 impl KernelError {
+    /// The error for a positive errno (`None` if hk has no variant)
+    pub const fn from_errno(e: i32) -> Option<Self> {
+        Some(match e {
+            1 => Self::NotPermitted,
+            2 => Self::NotFound,
+            3 => Self::NoProcess,
+            4 => Self::Interrupted,
+            5 => Self::Io,
+            6 => Self::NoDeviceOrAddress,
+            7 => Self::ArgListTooLong,
+            8 => Self::ExecFormat,
+            9 => Self::BadFd,
+            10 => Self::NoChild,
+            11 => Self::WouldBlock,
+            12 => Self::OutOfMemory,
+            13 => Self::PermissionDenied,
+            14 => Self::BadAddress,
+            15 => Self::NotBlockDevice,
+            16 => Self::Busy,
+            17 => Self::AlreadyExists,
+            18 => Self::CrossDevice,
+            19 => Self::NoDevice,
+            20 => Self::NotDirectory,
+            21 => Self::IsDirectory,
+            22 => Self::InvalidArgument,
+            23 => Self::SystemFileLimit,
+            24 => Self::ProcessFileLimit,
+            25 => Self::NotTty,
+            26 => Self::TextBusy,
+            27 => Self::FileTooLarge,
+            28 => Self::NoSpace,
+            29 => Self::IllegalSeek,
+            30 => Self::ReadOnlyFs,
+            31 => Self::TooManyLinks,
+            32 => Self::BrokenPipe,
+            33 => Self::MathDomain,
+            34 => Self::Range,
+            35 => Self::Deadlock,
+            36 => Self::NameTooLong,
+            37 => Self::NoLocks,
+            38 => Self::NotImplemented,
+            39 => Self::DirectoryNotEmpty,
+            40 => Self::TooManySymlinks,
+            42 => Self::NoMessage,
+            43 => Self::IdentifierRemoved,
+            61 => Self::NoData,
+            64 => Self::NoNetwork,
+            71 => Self::ProtocolError,
+            62 => Self::TimerExpired,
+            75 => Self::Overflow,
+            74 => Self::BadMessage,
+            88 => Self::NotSocket,
+            89 => Self::DestAddrRequired,
+            90 => Self::MessageTooLong,
+            91 => Self::ProtocolType,
+            92 => Self::NoProtocolOption,
+            93 => Self::ProtocolNotSupported,
+            94 => Self::SocketTypeNotSupported,
+            95 => Self::OperationNotSupported,
+            96 => Self::ProtocolFamilyNotSupported,
+            97 => Self::AddressFamilyNotSupported,
+            98 => Self::AddressInUse,
+            99 => Self::AddressNotAvailable,
+            100 => Self::NetworkDown,
+            101 => Self::NetworkUnreachable,
+            102 => Self::NetworkReset,
+            103 => Self::ConnectionAborted,
+            104 => Self::ConnectionReset,
+            105 => Self::NoBufferSpace,
+            106 => Self::AlreadyConnected,
+            107 => Self::NotConnected,
+            108 => Self::Shutdown,
+            109 => Self::TooManyRefs,
+            110 => Self::TimedOut,
+            111 => Self::ConnectionRefused,
+            112 => Self::HostDown,
+            113 => Self::HostUnreachable,
+            114 => Self::AlreadyInProgress,
+            115 => Self::InProgress,
+            121 => Self::RemoteIo,
+            122 => Self::QuotaExceeded,
+            125 => Self::Canceled,
+            126 => Self::NoKey,
+            127 => Self::KeyExpired,
+            128 => Self::KeyRevoked,
+            129 => Self::KeyRejected,
+            512 => Self::RestartSys,
+            513 => Self::RestartNoIntr,
+            514 => Self::RestartNoHand,
+            _ => return None,
+        })
+    }
     /// Return negative errno for syscall return (i64)
     ///
     /// Example: `KernelError::BadFd.sysret()` returns -9

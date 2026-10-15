@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+pub mod barrier;
 pub mod cache;
 pub mod context;
 pub mod cpu;
@@ -14,6 +15,7 @@ pub mod gic;
 pub mod ioremap;
 pub mod irq;
 pub mod paging;
+pub mod pci_irq;
 pub mod percpu;
 pub mod power;
 pub mod ptrace;
@@ -40,8 +42,11 @@ use crate::task::{CurrentTask, Tid};
 
 /// AArch64 trap frame for saving/restoring CPU state on exception entry
 ///
-/// This captures all general-purpose registers plus exception state.
-/// Layout matches the order we push/pop in exception vectors.
+/// This captures all general-purpose registers, exception state and the
+/// FP/SIMD registers (the kernel uses NEON, so every exception saves them).
+/// Layout matches the order we push/pop in exception vectors (vectors.S
+/// TRAP_FRAME_SIZE / TF_*). For an exception from EL0 this is the task's
+/// user state, at the top of its kernel stack.
 #[repr(C)]
 #[derive(Clone, Default)]
 pub struct Aarch64TrapFrame {
@@ -53,7 +58,16 @@ pub struct Aarch64TrapFrame {
     pub elr: u64,
     /// Saved Program Status Register
     pub spsr: u64,
+    /// Floating-point status register
+    pub fpsr: u32,
+    /// Floating-point control register
+    pub fpcr: u32,
+    /// SIMD/FP registers V0-V31
+    pub v: [u128; 32],
 }
+
+const _: () = assert!(core::mem::size_of::<Aarch64TrapFrame>() == 0x320);
+const _: () = assert!(core::mem::offset_of!(Aarch64TrapFrame, v) == 0x120);
 
 // Re-export TaskContext from context module
 pub use context::Aarch64TaskContext;
@@ -500,6 +514,43 @@ impl UserModeOps for Aarch64Arch {
                 "mov x29, #0", // FP
                 "mov x30, #0", // LR
 
+                // A new program image starts with zeroed FP/SIMD registers
+                // and the default FPCR/FPSR (no kernel data leaks either)
+                "msr fpcr, xzr",
+                "msr fpsr, xzr",
+                "movi v0.2d, #0",
+                "movi v1.2d, #0",
+                "movi v2.2d, #0",
+                "movi v3.2d, #0",
+                "movi v4.2d, #0",
+                "movi v5.2d, #0",
+                "movi v6.2d, #0",
+                "movi v7.2d, #0",
+                "movi v8.2d, #0",
+                "movi v9.2d, #0",
+                "movi v10.2d, #0",
+                "movi v11.2d, #0",
+                "movi v12.2d, #0",
+                "movi v13.2d, #0",
+                "movi v14.2d, #0",
+                "movi v15.2d, #0",
+                "movi v16.2d, #0",
+                "movi v17.2d, #0",
+                "movi v18.2d, #0",
+                "movi v19.2d, #0",
+                "movi v20.2d, #0",
+                "movi v21.2d, #0",
+                "movi v22.2d, #0",
+                "movi v23.2d, #0",
+                "movi v24.2d, #0",
+                "movi v25.2d, #0",
+                "movi v26.2d, #0",
+                "movi v27.2d, #0",
+                "movi v28.2d, #0",
+                "movi v29.2d, #0",
+                "movi v30.2d, #0",
+                "movi v31.2d, #0",
+
                 // Return to user mode
                 "eret",
 
@@ -622,6 +673,31 @@ impl PerCpuOps for Aarch64Arch {
             .map(|p| p.syscall_user_sp)
             .unwrap_or(0)
     }
+
+    fn cpu_online(cpu: u32) -> bool {
+        (cpu as usize) < percpu::MAX_CPUS
+            && percpu::get_percpu(cpu)
+                .is_online
+                .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    type SyscallUserState = percpu::SyscallUserState;
+
+    fn save_syscall_user_state() -> percpu::SyscallUserState {
+        percpu::save_syscall_user_state()
+    }
+
+    fn restore_syscall_user_state(state: &percpu::SyscallUserState) {
+        percpu::restore_syscall_user_state(state)
+    }
+
+    fn set_syscall_return(val: u64) {
+        unsafe { percpu::current_cpu_mut().syscall_user_regs[0] = val };
+    }
+
+    fn syscall_restart() -> u64 {
+        percpu::syscall_restart()
+    }
 }
 
 // ============================================================================
@@ -693,6 +769,11 @@ impl Aarch64Arch {
 impl SchedArch for Aarch64Arch {
     type SchedPageTable = Aarch64PageTable;
 
+    // The child's TrapFrame carries the inherited FP/SIMD registers
+    const CLONE_FPU_RESERVE: u64 = 0;
+
+    fn clone_child_fpu(_kstack_top: u64) {}
+
     fn clone_child_trapframe(
         parent_rip: u64,
         parent_rflags: u64,
@@ -703,12 +784,20 @@ impl SchedArch for Aarch64Arch {
         // Child returns 0 from fork/clone (x0 is the return value)
         regs[0] = 0;
 
-        Aarch64TrapFrame {
+        let mut tf = Aarch64TrapFrame {
             x: regs,             // All parent GPRs (with x0 = 0 for child)
             elr: parent_rip,     // Return address
             spsr: parent_rflags, // Saved PSTATE
             sp: child_rsp,       // Child's stack pointer
+            ..Default::default()
+        };
+        // The child inherits the parent's FP/SIMD registers
+        if let Some(parent) = percpu::current_user_frame() {
+            tf.fpsr = parent.fpsr;
+            tf.fpcr = parent.fpcr;
+            tf.v = parent.v;
         }
+        tf
     }
 }
 
@@ -730,15 +819,24 @@ pub unsafe fn init_mmu() {
 // Kernel Init Unification Trait Implementations
 // ============================================================================
 
-// Memory layout constants for aarch64 (QEMU virt machine)
-const AARCH64_FRAME_ALLOC_BASE: u64 = 0x4100_0000; // 16MB after kernel load
-const AARCH64_FRAME_ALLOC_SIZE: u64 = 0x1000_0000; // 256MB
+// Memory layout constants for aarch64 (QEMU virt machine): frames run
+// from the heap end (placed past the kernel image, `aarch64_heap`) to a
+// fixed end
+const AARCH64_FRAME_ALLOC_END: u64 = 0x5100_0000;
 
 impl MemoryLayoutOps for Aarch64Arch {
     fn get_frame_alloc_region() -> (u64, u64) {
         // For now, use hardcoded constants for QEMU virt machine
         // Future: could parse DTB memory node for actual available memory
-        (AARCH64_FRAME_ALLOC_BASE, AARCH64_FRAME_ALLOC_SIZE)
+        let base = crate::HEAP_END.load(core::sync::atomic::Ordering::Relaxed) as u64;
+        assert!(base != 0 && base < AARCH64_FRAME_ALLOC_END);
+        (base, AARCH64_FRAME_ALLOC_END - base)
+    }
+
+    fn for_each_reserved(f: &mut dyn FnMut(u64, u64)) {
+        if let Some(i) = dtb::extract_initramfs(unsafe { crate::DTB_PTR }) {
+            f(i.start, i.end);
+        }
     }
 }
 

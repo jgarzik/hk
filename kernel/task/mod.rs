@@ -3,6 +3,7 @@
 pub mod exec;
 pub mod fdtable;
 pub mod id;
+pub mod kthread;
 pub mod misc;
 pub mod percpu;
 pub mod pgrp;
@@ -632,8 +633,6 @@ pub struct FdTable<F> {
     files: BTreeMap<Fd, Arc<F>>,
     /// Per-fd flags (FD_CLOEXEC, etc.)
     fd_flags: BTreeMap<Fd, u32>,
-    /// Next file descriptor to allocate
-    next_fd: Fd,
 }
 
 impl<F> FdTable<F> {
@@ -642,7 +641,6 @@ impl<F> FdTable<F> {
         Self {
             files: BTreeMap::new(),
             fd_flags: BTreeMap::new(),
-            next_fd: 3, // 0, 1, 2 reserved for stdin/stdout/stderr
         }
     }
 
@@ -651,25 +649,17 @@ impl<F> FdTable<F> {
         Self {
             files: BTreeMap::new(),
             fd_flags: BTreeMap::new(),
-            next_fd: 3,
         }
     }
 
-    /// Allocate a file descriptor for a file.
+    /// Allocate the lowest free file descriptor for a file (POSIX).
     ///
     /// The `nofile` parameter is the RLIMIT_NOFILE limit. If the allocated fd
     /// would be >= nofile, returns Err(EMFILE). Pass `u64::MAX` to disable limit.
     ///
     /// Following Linux pattern: RLIMIT_NOFILE is enforced inside allocation.
     pub fn alloc(&mut self, file: Arc<F>, nofile: u64) -> Result<Fd, i32> {
-        let fd = self.next_fd;
-        // RLIMIT_NOFILE enforcement
-        if (fd as u64) >= nofile {
-            return Err(24); // EMFILE - too many open files
-        }
-        self.files.insert(fd, file);
-        self.next_fd += 1;
-        Ok(fd)
+        self.alloc_at_or_above(file, 0, 0, nofile)
     }
 
     /// Allocate a specific file descriptor (for stdin/stdout/stderr).
@@ -713,17 +703,7 @@ impl<F> FdTable<F> {
     /// Following Linux pattern: RLIMIT_NOFILE is enforced inside allocation,
     /// not as a separate pre-check. This avoids TOCTOU races.
     pub fn alloc_with_flags(&mut self, file: Arc<F>, flags: u32, nofile: u64) -> Result<Fd, i32> {
-        let fd = self.next_fd;
-        // RLIMIT_NOFILE enforcement (Linux: alloc_fd checks fd >= end)
-        if (fd as u64) >= nofile {
-            return Err(24); // EMFILE - too many open files
-        }
-        self.files.insert(fd, file);
-        if flags != 0 {
-            self.fd_flags.insert(fd, flags);
-        }
-        self.next_fd += 1;
-        Ok(fd)
+        self.alloc_at_or_above(file, 0, flags, nofile)
     }
 
     /// Allocate a specific file descriptor with flags.
@@ -779,9 +759,6 @@ impl<F> FdTable<F> {
         if flags != 0 {
             self.fd_flags.insert(fd, flags);
         }
-        if fd >= self.next_fd {
-            self.next_fd = fd + 1;
-        }
         Ok(fd)
     }
 
@@ -814,20 +791,28 @@ impl<F> FdTable<F> {
         Self {
             files: self.files.clone(),
             fd_flags: self.fd_flags.clone(),
-            next_fd: self.next_fd,
         }
+    }
+
+    /// Copy for exec (Linux unshare_files + do_close_on_exec): the
+    /// descriptors without FD_CLOEXEC, with their flags
+    pub fn exec_copy(&self) -> Self {
+        let mut t = Self::new();
+        for (&fd, file) in &self.files {
+            let fl = self.get_fd_flags(fd);
+            if fl & FD_CLOEXEC == 0 {
+                t.files.insert(fd, file.clone());
+                if fl != 0 {
+                    t.fd_flags.insert(fd, fl);
+                }
+            }
+        }
+        t
     }
 
     /// Get the number of open file descriptors
     pub fn count(&self) -> usize {
         self.files.len()
-    }
-
-    /// Get the next fd that would be allocated
-    ///
-    /// Used for RLIMIT_NOFILE enforcement.
-    pub fn next_fd(&self) -> Fd {
-        self.next_fd
     }
 }
 
@@ -908,6 +893,8 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub reset_on_fork: bool,
     /// CPU affinity mask (bit N = CPU N is allowed)
     pub cpus_allowed: CpuMask,
+    /// CPU whose run queue owns this task (tasks never migrate)
+    pub cpu: u32,
     /// Page table for this task
     pub page_table: PT,
     /// Saved CPU state
@@ -1285,6 +1272,53 @@ pub const fn cap_valid(cap: u32) -> bool {
 ///
 /// # Returns
 /// true if the current task has the capability in its effective set
+/// Linux cap_emulate_setxuid: leaving uid 0 entirely (real, effective
+/// and saved all non-zero) clears permitted and effective capabilities
+/// (unless PR_SET_KEEPCAPS) and ambient ones; an effective uid change
+/// away from 0 clears effective capabilities, back to 0 restores them
+/// from permitted
+pub fn cap_fix_setuid(old: &Cred, new: &mut Cred, keep_caps: bool) {
+    let had_root = old.uid == 0 || old.euid == 0 || old.suid == 0;
+    let has_root = new.uid == 0 || new.euid == 0 || new.suid == 0;
+    if had_root && !has_root {
+        if !keep_caps {
+            new.cap_permitted = CAP_EMPTY_SET;
+            new.cap_effective = CAP_EMPTY_SET;
+        }
+        new.cap_ambient = CAP_EMPTY_SET;
+    }
+    if old.euid == 0 && new.euid != 0 {
+        new.cap_effective = CAP_EMPTY_SET;
+    }
+    if old.euid != 0 && new.euid == 0 {
+        new.cap_effective = new.cap_permitted;
+    }
+}
+
+/// Capabilities that fsuid 0 historically implied (Linux CAP_FS_SET)
+pub const CAP_FS_SET: KernelCap = KernelCap(
+    1 << CAP_CHOWN
+        | 1 << CAP_MKNOD
+        | 1 << CAP_DAC_OVERRIDE
+        | 1 << CAP_DAC_READ_SEARCH
+        | 1 << CAP_FOWNER
+        | 1 << CAP_FSETID
+        | 1 << CAP_MAC_OVERRIDE
+        | 1 << CAP_LINUX_IMMUTABLE,
+);
+
+/// Linux cap_task_fix_setuid(LSM_SETID_FS): leaving fsuid 0 drops the
+/// file system capabilities from the effective set, returning to fsuid 0
+/// raises them again from the permitted set
+pub fn cap_fix_setfsuid(old: &Cred, new: &mut Cred) {
+    if old.fsuid == 0 && new.fsuid != 0 {
+        new.cap_effective = KernelCap(new.cap_effective.0 & !CAP_FS_SET.0);
+    }
+    if old.fsuid != 0 && new.fsuid == 0 {
+        new.cap_effective = KernelCap(new.cap_effective.0 | (new.cap_permitted.0 & CAP_FS_SET.0));
+    }
+}
+
 pub fn capable(cap: u32) -> bool {
     if cap > CAP_LAST_CAP {
         return false;

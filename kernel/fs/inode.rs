@@ -7,7 +7,9 @@ use alloc::sync::{Arc, Weak};
 
 use ::core::cell::Cell;
 use ::core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
-use spin::{Mutex, RwLock};
+use spin::RwLock;
+
+use crate::sync::RwSem;
 
 use super::KernelError;
 use super::superblock::SuperBlock;
@@ -15,6 +17,7 @@ use super::superblock::SuperBlock;
 // Re-export device types from chardev module
 pub use crate::chardev::{DevId, DeviceType};
 
+use crate::task::Cred;
 /// Re-export credential types from task module
 pub use crate::task::{Gid, Uid};
 
@@ -110,6 +113,11 @@ impl InodeMode {
         self.file_type() == Some(FileType::BlockDev)
     }
 
+    /// Check if this is a socket
+    pub fn is_socket(&self) -> bool {
+        self.file_type() == Some(FileType::Socket)
+    }
+
     /// Check if this is any device (char or block)
     pub fn is_device(&self) -> bool {
         self.is_chrdev() || self.is_blkdev()
@@ -144,49 +152,19 @@ impl InodeMode {
     pub fn raw(&self) -> u16 {
         self.0
     }
-
-    /// Check if given uid/gid has the requested access permission
-    ///
-    /// # Arguments
-    /// * `uid` - User ID of the requesting process (fsuid)
-    /// * `gid` - Group ID of the requesting process (fsgid)
-    /// * `inode_uid` - Owner user ID of the inode
-    /// * `inode_gid` - Owner group ID of the inode
-    /// * `mask` - Permission mask (MAY_READ=4, MAY_WRITE=2, MAY_EXEC=1)
-    ///
-    /// # Returns
-    /// `true` if access is allowed, `false` otherwise
-    ///
-    /// Note: Root (uid=0) bypasses all permission checks - this should be
-    /// handled by the caller before calling this method.
-    pub fn check_permission(
-        &self,
-        uid: Uid,
-        gid: Gid,
-        inode_uid: Uid,
-        inode_gid: Gid,
-        mask: u32,
-    ) -> bool {
-        let perm = self.perm();
-        let bits = if uid == inode_uid {
-            // Owner bits (bits 6-8)
-            (perm >> 6) & 0o7
-        } else if gid == inode_gid {
-            // Group bits (bits 3-5)
-            (perm >> 3) & 0o7
-        } else {
-            // Other bits (bits 0-2)
-            perm & 0o7
-        };
-
-        (bits as u32 & mask) == mask
-    }
 }
 
 /// Inode operations trait - filesystem-specific behavior
 pub trait InodeOps: Send + Sync {
     /// Look up a child entry in a directory inode
     fn lookup(&self, dir: &Inode, name: &str) -> Result<Arc<Inode>, KernelError>;
+
+    /// Access check for `mask` (MAY_* bits) by `cred` (Linux
+    /// ->permission). Default: generic_permission (mode bits plus
+    /// capability overrides); /proc/sys overrides it with sysctl_perm.
+    fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
+        super::dac::generic_permission(cred, inode, mask)
+    }
 
     /// Create a new file in a directory
     fn create(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
@@ -197,6 +175,18 @@ pub trait InodeOps: Send + Sync {
     /// Create a new directory
     fn mkdir(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let _ = (dir, name, mode);
+        Err(KernelError::OperationNotSupported)
+    }
+
+    /// Create a character or block device node (Linux i_op->mknod)
+    fn mknod(
+        &self,
+        dir: &Inode,
+        name: &str,
+        mode: InodeMode,
+        rdev: DevId,
+    ) -> Result<Arc<Inode>, KernelError> {
+        let _ = (dir, name, mode, rdev);
         Err(KernelError::OperationNotSupported)
     }
 
@@ -441,7 +431,7 @@ pub struct Inode {
     ///
     /// For rename operations involving two directories, use lock_rename()
     /// instead which handles proper lock ordering.
-    i_rwsem: Mutex<()>,
+    i_rwsem: RwSem,
 
     /// Filesystem-specific private data
     pub private: RwLock<Option<Arc<dyn InodeData>>>,
@@ -477,7 +467,7 @@ impl Inode {
             sb,
             i_op,
             lock: RwLock::new(()),
-            i_rwsem: Mutex::new(()),
+            i_rwsem: RwSem::new(),
             private: RwLock::new(None),
         }
     }
@@ -512,7 +502,7 @@ impl Inode {
             sb,
             i_op,
             lock: RwLock::new(()),
-            i_rwsem: Mutex::new(()),
+            i_rwsem: RwSem::new(),
             private: RwLock::new(None),
         }
     }
@@ -539,6 +529,11 @@ impl Inode {
                 break;
             }
         }
+    }
+
+    /// Clear mode bits (set-id removal on write, truncate, chown)
+    pub fn clear_mode_bits(&self, bits: u16) {
+        self.mode.fetch_and(!(bits & 0o7777), Ordering::AcqRel);
     }
 
     /// Get owner user ID
@@ -671,8 +666,7 @@ impl Inode {
     /// Caller must ensure inode_unlock() is called to release the lock.
     /// For operations on two directories (rename), use lock_rename() instead.
     pub fn inode_lock(&self) {
-        let guard = self.i_rwsem.lock();
-        core::mem::forget(guard);
+        self.i_rwsem.down_write();
     }
 
     /// Release exclusive lock on directory
@@ -681,7 +675,21 @@ impl Inode {
     /// Must only be called after a successful inode_lock() call.
     /// The lock must have been acquired by this thread.
     pub unsafe fn inode_unlock(&self) {
-        unsafe { self.i_rwsem.force_unlock() };
+        unsafe { self.i_rwsem.up_write() };
+    }
+
+    /// Shared inode lock (Linux inode_lock_shared): lookup and readdir
+    /// exclude directory changes but not each other
+    pub fn inode_lock_shared(&self) {
+        self.i_rwsem.down_read();
+    }
+
+    /// Release inode_lock_shared()
+    ///
+    /// # Safety
+    /// Must pair with inode_lock_shared() by this thread.
+    pub unsafe fn inode_unlock_shared(&self) {
+        unsafe { self.i_rwsem.up_read() };
     }
 }
 

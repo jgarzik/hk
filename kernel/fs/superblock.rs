@@ -5,8 +5,10 @@
 
 use alloc::sync::Arc;
 
-use ::core::sync::atomic::{AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spin::RwLock;
+
+use crate::sync;
 
 use super::KernelError;
 use super::dentry::Dentry;
@@ -109,7 +111,7 @@ pub struct LinuxStatFs {
 
 impl StatFs {
     /// Convert internal StatFs to Linux ABI format
-    pub fn to_linux(&self, dev_id: u64, mount_flags: u32) -> LinuxStatFs {
+    pub fn to_linux(&self, dev_id: u64, st_flags: u64) -> LinuxStatFs {
         LinuxStatFs {
             f_type: self.f_type as i64,
             f_bsize: self.f_bsize as i64,
@@ -121,16 +123,9 @@ impl StatFs {
             f_fsid: [(dev_id & 0xFFFFFFFF) as i32, (dev_id >> 32) as i32],
             f_namelen: self.f_namelen as i64,
             f_frsize: self.f_bsize as i64, // Same as bsize for simplicity
-            f_flags: Self::mount_flags_to_st_flags(mount_flags) as i64,
+            f_flags: st_flags as i64,
             f_spare: [0; 4],
         }
-    }
-
-    /// Convert internal mount flags to ST_* flags for userspace
-    fn mount_flags_to_st_flags(_mnt_flags: u32) -> u64 {
-        // ST_RDONLY = 1, ST_NOSUID = 2, ST_NODEV = 4, etc.
-        // For now return 0; can expand when mount flags are implemented
-        0
     }
 }
 
@@ -180,6 +175,29 @@ pub mod fs_flags {
 static NEXT_DEV_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The superblock structure - represents a mounted filesystem instance
+/// Read-only file system (Linux SB_RDONLY)
+pub const SB_RDONLY: u32 = 1;
+
+/// Write access to a file system (from `SuperBlock::want_write`),
+/// released on drop (Linux mnt_drop_write); `none()` for objects without
+/// a superblock
+pub struct WriteAccess(Option<Arc<SuperBlock>>);
+
+impl WriteAccess {
+    /// No file system to hold
+    pub const fn none() -> Self {
+        Self(None)
+    }
+}
+
+impl Drop for WriteAccess {
+    fn drop(&mut self) {
+        if let Some(sb) = &self.0 {
+            sb.s_writers.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 pub struct SuperBlock {
     /// Filesystem type
     pub fs_type: &'static FileSystemType,
@@ -190,8 +208,12 @@ pub struct SuperBlock {
     /// Superblock operations
     pub s_op: &'static dyn SuperOps,
 
-    /// Mount flags
-    pub flags: u32,
+    /// SB_* flags (Linux s_flags): SB_RDONLY
+    s_flags: AtomicU32,
+
+    /// Holders of write access (Linux mnt writers, mnt_want_write):
+    /// open-for-write files and in-progress modifications
+    s_writers: AtomicU64,
 
     /// Next inode number to allocate
     next_ino: AtomicU64,
@@ -207,7 +229,7 @@ pub struct SuperBlock {
     /// Serializes all cross-directory renames on this filesystem to
     /// prevent races during ancestor relationship checks. Same-directory
     /// renames don't need this mutex.
-    pub s_vfs_rename_mutex: Mutex<()>,
+    pub s_vfs_rename_mutex: sync::Mutex<()>,
 }
 
 use super::inode::AsAny;
@@ -226,12 +248,52 @@ impl SuperBlock {
             fs_type,
             root: RwLock::new(None),
             s_op,
-            flags,
+            s_flags: AtomicU32::new(flags),
+            s_writers: AtomicU64::new(0),
             next_ino: AtomicU64::new(1), // Start inode numbers at 1
             dev_id: NEXT_DEV_ID.fetch_add(1, Ordering::Relaxed),
             private: RwLock::new(None),
-            s_vfs_rename_mutex: Mutex::new(()),
+            s_vfs_rename_mutex: sync::Mutex::new(()),
         })
+    }
+
+    /// True if mounted read-only (Linux sb_rdonly)
+    pub fn rdonly(&self) -> bool {
+        self.s_flags.load(Ordering::SeqCst) & SB_RDONLY != 0
+    }
+
+    /// Take write access (Linux mnt_want_write): EROFS on a read-only
+    /// file system. Held until the returned guard drops.
+    ///
+    /// Against `make_rdonly`: each side publishes its change (SeqCst)
+    /// before reading the other's, so either the writer sees SB_RDONLY
+    /// or the remount sees the writer, never neither.
+    pub fn want_write(self: &Arc<Self>) -> Result<WriteAccess, KernelError> {
+        self.s_writers.fetch_add(1, Ordering::SeqCst);
+        if self.rdonly() {
+            self.s_writers.fetch_sub(1, Ordering::SeqCst);
+            return Err(KernelError::ReadOnlyFs);
+        }
+        Ok(WriteAccess(Some(self.clone())))
+    }
+
+    /// Make the file system read-only (Linux sb_prepare_remount_readonly
+    /// and SB_RDONLY): EBUSY, and nothing changed, while anyone holds
+    /// write access
+    pub fn make_rdonly(&self) -> Result<(), KernelError> {
+        if self.s_flags.fetch_or(SB_RDONLY, Ordering::SeqCst) & SB_RDONLY != 0 {
+            return Ok(());
+        }
+        if self.s_writers.load(Ordering::SeqCst) != 0 {
+            self.s_flags.fetch_and(!SB_RDONLY, Ordering::SeqCst);
+            return Err(KernelError::Busy);
+        }
+        Ok(())
+    }
+
+    /// Make the file system read-write
+    pub fn make_rdwr(&self) {
+        self.s_flags.fetch_and(!SB_RDONLY, Ordering::SeqCst);
     }
 
     /// Set the root dentry

@@ -12,7 +12,7 @@ use alloc::vec;
 use crate::arch::Uaccess;
 use crate::fs::{KernelError, LookupFlags, Path, is_subdir, lookup_path_flags};
 use crate::storage::get_blkdev;
-use crate::uaccess::{UaccessArch, put_user, strncpy_from_user};
+use crate::uaccess::{UaccessArch, copy_to_user, put_user, strncpy_from_user};
 
 use super::syscall::{PATH_MAX, current_fd_table};
 
@@ -27,84 +27,176 @@ pub const EBUSY: i64 = -16;
 /// No such device or filesystem type
 pub const ENODEV: i64 = -19;
 
-/// sys_mount - mount a filesystem
+/// mount(2) flags (Linux uapi/linux/mount.h)
+mod ms {
+    pub const RDONLY: u64 = 1;
+    pub const NOSUID: u64 = 2;
+    pub const NODEV: u64 = 4;
+    pub const NOEXEC: u64 = 8;
+    pub const REMOUNT: u64 = 32;
+    pub const MANDLOCK: u64 = 64;
+    pub const NOATIME: u64 = 1 << 10;
+    pub const NODIRATIME: u64 = 1 << 11;
+    pub const REC: u64 = 1 << 14;
+    pub const SILENT: u64 = 1 << 15;
+    pub const POSIXACL: u64 = 1 << 16;
+    pub const UNBINDABLE: u64 = 1 << 17;
+    pub const PRIVATE: u64 = 1 << 18;
+    pub const RELATIME: u64 = 1 << 21;
+    pub const I_VERSION: u64 = 1 << 23;
+    pub const STRICTATIME: u64 = 1 << 24;
+    pub const LAZYTIME: u64 = 1 << 25;
+    pub const NOUSER: u64 = 1 << 31;
+    pub const MGC_VAL: u64 = 0xC0ED_0000;
+    pub const MGC_MSK: u64 = 0xffff_0000;
+
+    /// Flags hk honors, or may accept without effect because hk
+    /// already behaves that way (no atime updates, every mount private
+    /// and unbindable, no mandatory locks); everything else (MS_BIND,
+    /// MS_MOVE, MS_SHARED, MS_SLAVE, MS_SYNCHRONOUS, MS_DIRSYNC,
+    /// MS_NOSYMFOLLOW, ...) is EINVAL instead of being ignored
+    pub const KNOWN: u64 = RDONLY
+        | NOSUID
+        | NODEV
+        | NOEXEC
+        | REMOUNT
+        | MANDLOCK
+        | NOATIME
+        | NODIRATIME
+        | REC
+        | SILENT
+        | POSIXACL
+        | UNBINDABLE
+        | PRIVATE
+        | RELATIME
+        | I_VERSION
+        | STRICTATIME
+        | LAZYTIME;
+}
+
+/// Per-mount MNT_* flags of mount(2) flags
+fn mnt_flags(flags: u64) -> u32 {
+    use super::mount::{MNT_NODEV, MNT_NOEXEC, MNT_NOSUID};
+    let mut f = 0;
+    if flags & ms::NOSUID != 0 {
+        f |= MNT_NOSUID;
+    }
+    if flags & ms::NODEV != 0 {
+        f |= MNT_NODEV;
+    }
+    if flags & ms::NOEXEC != 0 {
+        f |= MNT_NOEXEC;
+    }
+    f
+}
+
+/// MS_REMOUNT (Linux do_remount): the mount's flags become exactly the
+/// requested set. The read-only switch goes first and is all-or-nothing
+/// (EBUSY while files are open for writing or changes are in progress,
+/// with nothing changed); only then the per-mount flags are replaced.
+fn remount(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> {
+    if flags & ms::RDONLY != 0 {
+        m.sb.make_rdonly()?;
+    } else {
+        m.sb.make_rdwr();
+    }
+    m.set_flags(mnt_flags(flags));
+    Ok(())
+}
+
+/// Mount whose root `target` is (Linux path_mounted), else EINVAL
+fn mount_at(target: &Arc<super::Dentry>) -> Result<Arc<super::mount::Mount>, KernelError> {
+    super::mount::current_mnt_ns()
+        .find_mount_at(target)
+        .ok_or(KernelError::InvalidArgument)
+}
+
+/// sys_mount - mount a filesystem (Linux do_mount + path_mount)
 ///
-/// # Arguments
-/// * `source_ptr` - User pointer to device/source path (e.g., "/dev/rd1" for device-backed fs)
-/// * `target_ptr` - User pointer to mount point path
-/// * `fstype_ptr` - User pointer to filesystem type name string
-/// * `flags` - Mount flags (MS_* flags, currently ignored)
-/// * `_data` - Filesystem-specific data (currently unused)
-///
-/// # Returns
-/// 0 on success, negative errno on error
-pub fn sys_mount(
+/// Order as in Linux: strings and the target are looked up first, then
+/// MS_NOUSER (EINVAL) and CAP_SYS_ADMIN (EPERM). MS_REMOUNT changes the
+/// flags of the mount at `target` (its root): read-only on the
+/// superblock, nosuid/nodev/noexec on the mount. MS_PRIVATE /
+/// MS_UNBINDABLE succeed on a mount root (hk mounts never propagate and
+/// cannot be bind-mounted). Unsupported flags are EINVAL.
+pub fn sys_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64, _data: u64) -> i64 {
+    match path_mount(source_ptr, target_ptr, fstype_ptr, flags) {
+        Ok(()) => 0,
+        Err(e) => e.sysret(),
+    }
+}
+
+fn path_mount(
     source_ptr: u64,
     target_ptr: u64,
     fstype_ptr: u64,
-    _flags: u64,
-    _data: u64,
-) -> i64 {
-    // Read source device path from user space (may be empty for pseudo-fs)
+    mut flags: u64,
+) -> Result<(), KernelError> {
+    let copy = |p| strncpy_from_user::<Uaccess>(p, PATH_MAX).map_err(|_| KernelError::BadAddress);
+    // Source and type may be absent for remount / propagation changes
     let source = if source_ptr != 0 {
-        strncpy_from_user::<Uaccess>(source_ptr, PATH_MAX).unwrap_or_default()
+        copy(source_ptr)?
     } else {
-        alloc::string::String::new()
+        Default::default()
     };
-
-    // Read filesystem type from user space
-    let fstype = match strncpy_from_user::<Uaccess>(fstype_ptr, PATH_MAX) {
-        Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Read target path from user space
-    let target = match strncpy_from_user::<Uaccess>(target_ptr, PATH_MAX) {
-        Ok(s) => s,
-        Err(_) => return KernelError::BadAddress.sysret(),
-    };
-
-    // Look up the filesystem type
-    let fs_type = match super::superblock::find_filesystem(&fstype) {
-        Some(ft) => ft,
-        None => return ENODEV,
-    };
-
-    // Look up the mount point (must be a directory)
-    let mountpoint_dentry = match lookup_path_flags(&target, LookupFlags::opendir()) {
-        Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
-    };
-
-    // Verify it's a directory
-    if let Some(inode) = mountpoint_dentry.get_inode() {
-        if !inode.mode().is_dir() {
-            return KernelError::NotDirectory.sysret();
-        }
+    let fstype = if fstype_ptr != 0 {
+        copy(fstype_ptr)?
     } else {
-        return KernelError::NotFound.sysret();
+        Default::default()
+    };
+    let target = copy(target_ptr)?;
+    let mp = lookup_path_flags(&target, LookupFlags::opendir())?;
+
+    if flags & ms::MGC_MSK == ms::MGC_VAL {
+        flags &= !ms::MGC_MSK;
     }
+    if flags & ms::NOUSER != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+        return Err(KernelError::NotPermitted);
+    }
+    if flags & !ms::KNOWN != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    if flags & ms::REMOUNT != 0 {
+        return remount(&mount_at(&mp)?, flags);
+    }
+    if flags & (ms::PRIVATE | ms::UNBINDABLE) != 0 {
+        return mount_at(&mp).map(|_| ());
+    }
+    new_mount(&source, &fstype, mp, flags)
+}
 
-    // Choose mount method based on filesystem type
-    if fs_type.mount_dev.is_some() && !source.is_empty() {
-        // Device-backed filesystem (vfat, ext4, etc.)
-        match super::mount::do_mount_dev(fs_type, &source, Some(mountpoint_dentry)) {
-            Ok(_mount) => 0,
-            Err(KernelError::NotBlockDevice) => ENOTBLK,
-            Err(KernelError::NoDevice) => ENODEV,
-            Err(KernelError::Busy) => EBUSY,
-            Err(_) => KernelError::InvalidArgument.sysret(),
-        }
+/// Mount a new instance of `fstype` on `mp` (Linux do_new_mount)
+fn new_mount(
+    source: &str,
+    fstype: &str,
+    mp: Arc<super::Dentry>,
+    flags: u64,
+) -> Result<(), KernelError> {
+    let fs_type = super::superblock::find_filesystem(fstype).ok_or(KernelError::NoDevice)?;
+    if !mp.get_inode().ok_or(KernelError::NotFound)?.mode().is_dir() {
+        return Err(KernelError::NotDirectory);
+    }
+    // Flags are set before the mount becomes visible (Linux do_new_mount)
+    let sb = if fs_type.mount_dev.is_some() && !source.is_empty() {
+        super::mount::dev_super(fs_type, source)
     } else {
-        // Pseudo-filesystem (ramfs, procfs, etc.)
-        match super::mount::do_mount(fs_type, Some(mountpoint_dentry)) {
-            Ok(_mount) => 0,
-            Err(KernelError::Busy) => EBUSY,
-            Err(KernelError::NoDevice) => ENODEV,
-            Err(_) => KernelError::InvalidArgument.sysret(),
-        }
+        (fs_type.mount)(fs_type)
+    };
+    let r = sb.and_then(|sb| {
+        super::mount::attach(sb, Some(mp), mnt_flags(flags), flags & ms::RDONLY != 0)
+    });
+    match r {
+        Ok(_) => Ok(()),
+        Err(
+            e @ (KernelError::NotBlockDevice
+            | KernelError::NoDevice
+            | KernelError::Busy
+            | KernelError::NotFound),
+        ) => Err(e),
+        Err(_) => Err(KernelError::InvalidArgument),
     }
 }
 
@@ -117,6 +209,12 @@ pub fn sys_mount(
 /// # Returns
 /// 0 on success, negative errno on error
 pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
+    // MNT_EXPIRE is not supported: EINVAL like any unknown flag
+    use super::mount::umount_flags::{MNT_DETACH, MNT_FORCE, UMOUNT_NOFOLLOW};
+    if flags & !(MNT_FORCE | MNT_DETACH | UMOUNT_NOFOLLOW) != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+
     // Read target path from user space
     let target = match strncpy_from_user::<Uaccess>(target_ptr, PATH_MAX) {
         Ok(s) => s,
@@ -132,10 +230,13 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
     // Look up the target path
     let target_dentry = match lookup_path_flags(&target, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
+
+    // Linux can_umount: CAP_SYS_ADMIN after the lookup
+    if !crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+        return KernelError::NotPermitted.sysret();
+    }
 
     // Find the mount at this path
     let mount = match super::mount::current_mnt_ns().find_mount_at(&target_dentry) {
@@ -188,9 +289,7 @@ pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     // 3. Look up new_root path (must be directory)
     let new_root_dentry = match lookup_path_flags(&new_root_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // 4. Verify new_root is a mount point
@@ -203,9 +302,7 @@ pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     // 5. Look up put_old path (must be directory)
     let put_old_dentry = match lookup_path_flags(&put_old_str, LookupFlags::opendir()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // 6. Verify put_old is at or under new_root
@@ -329,6 +426,13 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
             current_fd_table().lock().set_fd_flags(fd, 0);
             return 0;
         }
+        FIONREAD if file.get_inode().is_some_and(|i| i.mode().is_socket()) => {
+            // Sockets answer FIONREAD/SIOCINQ themselves
+            return match file.f_op.ioctl(&file, cmd, arg) {
+                Ok(v) => v,
+                Err(e) => e.sysret(),
+            };
+        }
         FIONREAD => {
             // Get bytes available for reading
             if arg == 0 {
@@ -408,11 +512,15 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
             Err(crate::chardev::DeviceError::NotTty) => KernelError::NotTty.sysret(),
             Err(crate::chardev::DeviceError::InvalidArg) => KernelError::InvalidArgument.sysret(),
             Err(crate::chardev::DeviceError::NotSupported) => KernelError::NotTty.sysret(),
+            Err(crate::chardev::DeviceError::Fault) => KernelError::BadAddress.sysret(),
             Err(_) => KernelError::Io.sysret(),
         }
     } else {
-        // Not a device - ioctl not supported
-        KernelError::NotTty.sysret()
+        // Other files (sockets, ...): the file's own ioctl
+        match file.ops().ioctl(&file, cmd, arg) {
+            Ok(v) => v,
+            Err(e) => e.sysret(),
+        }
     }
 }
 
@@ -537,15 +645,22 @@ fn do_setxattr(
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
         None => return KernelError::NotFound.sysret(),
     };
+
+    // setxattr/removexattr: write access first (EROFS), held across
+    let _w = match super::dac::want_write(&inode) {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
+    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
+        return e.sysret();
+    }
 
     // Call inode operation
     match inode.i_op.setxattr(&inode, &name, &value, flags as u32) {
@@ -588,6 +703,15 @@ pub fn sys_fsetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64, flags: i
         Some(i) => i,
         None => return KernelError::BadFd.sysret(),
     };
+
+    // setxattr/removexattr: write access first (EROFS), held across
+    let _w = match super::dac::want_write(&inode) {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
+    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
+        return e.sysret();
+    }
 
     // Call inode operation
     match inode.i_op.setxattr(&inode, &name, &value, flags as u32) {
@@ -652,15 +776,17 @@ fn do_getxattr(
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
         None => return KernelError::NotFound.sysret(),
     };
+
+    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_READ) {
+        return e.sysret();
+    }
 
     // If size is 0, query the size needed
     if size == 0 {
@@ -688,8 +814,8 @@ fn do_getxattr(
     match inode.i_op.getxattr(&inode, &name, &mut value) {
         Ok(attr_size) => {
             // Copy to user
-            unsafe {
-                core::ptr::copy_nonoverlapping(value.as_ptr(), value_ptr as *mut u8, attr_size);
+            if copy_to_user::<Uaccess>(value_ptr, &value[..attr_size]).is_err() {
+                return KernelError::BadAddress.sysret();
             }
             attr_size as i64
         }
@@ -721,6 +847,10 @@ pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
         None => return KernelError::BadFd.sysret(),
     };
 
+    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_READ) {
+        return e.sysret();
+    }
+
     // If size is 0, query the size needed
     if size == 0 {
         let mut empty_buf: [u8; 0] = [];
@@ -747,8 +877,8 @@ pub fn sys_fgetxattr(fd: i32, name_ptr: u64, value_ptr: u64, size: u64) -> i64 {
     match inode.i_op.getxattr(&inode, &name, &mut value) {
         Ok(attr_size) => {
             // Copy to user
-            unsafe {
-                core::ptr::copy_nonoverlapping(value.as_ptr(), value_ptr as *mut u8, attr_size);
+            if copy_to_user::<Uaccess>(value_ptr, &value[..attr_size]).is_err() {
+                return KernelError::BadAddress.sysret();
             }
             attr_size as i64
         }
@@ -794,9 +924,7 @@ fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) 
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     let inode = match dentry.get_inode() {
@@ -825,8 +953,8 @@ fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) 
     match inode.i_op.listxattr(&inode, &mut list) {
         Ok(list_size) => {
             // Copy to user
-            unsafe {
-                core::ptr::copy_nonoverlapping(list.as_ptr(), list_ptr as *mut u8, list_size);
+            if copy_to_user::<Uaccess>(list_ptr, &list[..list_size]).is_err() {
+                return KernelError::BadAddress.sysret();
             }
             list_size as i64
         }
@@ -868,8 +996,8 @@ pub fn sys_flistxattr(fd: i32, list_ptr: u64, size: u64) -> i64 {
     match inode.i_op.listxattr(&inode, &mut list) {
         Ok(list_size) => {
             // Copy to user
-            unsafe {
-                core::ptr::copy_nonoverlapping(list.as_ptr(), list_ptr as *mut u8, list_size);
+            if copy_to_user::<Uaccess>(list_ptr, &list[..list_size]).is_err() {
+                return KernelError::BadAddress.sysret();
             }
             list_size as i64
         }
@@ -925,15 +1053,22 @@ fn do_removexattr(path_ptr: u64, name_ptr: u64, follow_symlinks: bool) -> i64 {
 
     let dentry = match lookup_path_flags(&path, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     let inode = match dentry.get_inode() {
         Some(i) => i,
         None => return KernelError::NotFound.sysret(),
     };
+
+    // setxattr/removexattr: write access first (EROFS), held across
+    let _w = match super::dac::want_write(&inode) {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
+    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
+        return e.sysret();
+    }
 
     // Call inode operation
     match inode.i_op.removexattr(&inode, &name) {
@@ -965,6 +1100,15 @@ pub fn sys_fremovexattr(fd: i32, name_ptr: u64) -> i64 {
         Some(i) => i,
         None => return KernelError::BadFd.sysret(),
     };
+
+    // setxattr/removexattr: write access first (EROFS), held across
+    let _w = match super::dac::want_write(&inode) {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
+    if let Err(e) = super::dac::xattr_permission(&inode, &name, super::dac::MAY_WRITE) {
+        return e.sysret();
+    }
 
     // Call inode operation
     match inode.i_op.removexattr(&inode, &name) {

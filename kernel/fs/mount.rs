@@ -2,10 +2,11 @@
 //!
 //! Manages the mount tree that connects filesystems into a unified namespace.
 
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use ::core::sync::atomic::{AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spin::RwLock;
 
 use super::KernelError;
@@ -20,6 +21,13 @@ use crate::storage::get_blkdev;
 /// This struct mirrors Linux's `struct vfsmount`. The reference count
 /// (`mnt_count`) tracks users of this mount - each open file that references
 /// this mount holds a reference via `mntget()`.
+/// Ignore set-user/group-ID bits on exec (Linux MNT_NOSUID)
+pub const MNT_NOSUID: u32 = 0x1;
+/// No access to device nodes (Linux MNT_NODEV)
+pub const MNT_NODEV: u32 = 0x2;
+/// No program execution (Linux MNT_NOEXEC)
+pub const MNT_NOEXEC: u32 = 0x4;
+
 pub struct Mount {
     /// The mounted filesystem's superblock
     pub sb: Arc<SuperBlock>,
@@ -37,8 +45,9 @@ pub struct Mount {
     /// Child mounts (filesystems mounted under this one)
     pub children: RwLock<Vec<Arc<Mount>>>,
 
-    /// Mount flags
-    pub flags: u32,
+    /// Per-mount MNT_* flags (Linux mnt_flags): MNT_NOSUID, MNT_NODEV,
+    /// MNT_NOEXEC
+    mnt_flags: AtomicU32,
 
     /// Reference count for this mount (like Linux mnt_count)
     ///
@@ -57,9 +66,35 @@ impl Mount {
             mountpoint: RwLock::new(None),
             parent: RwLock::new(None),
             children: RwLock::new(Vec::new()),
-            flags,
+            mnt_flags: AtomicU32::new(flags),
             mnt_count: AtomicU64::new(0),
         })
+    }
+
+    /// MNT_* flags
+    pub fn flags(&self) -> u32 {
+        self.mnt_flags.load(Ordering::Relaxed)
+    }
+
+    /// Replace the MNT_* flags (mount, remount)
+    pub fn set_flags(&self, f: u32) {
+        self.mnt_flags.store(f, Ordering::Relaxed);
+    }
+
+    /// Option string for /proc/mounts ("ro,nosuid,nodev,noexec")
+    pub fn opts(&self) -> String {
+        let mut o = String::from(if self.sb.rdonly() { "ro" } else { "rw" });
+        let f = self.flags();
+        for (bit, name) in [
+            (MNT_NOSUID, ",nosuid"),
+            (MNT_NODEV, ",nodev"),
+            (MNT_NOEXEC, ",noexec"),
+        ] {
+            if f & bit != 0 {
+                o.push_str(name);
+            }
+        }
+        o
     }
 
     /// Increment mount reference count (like Linux mntget)
@@ -166,7 +201,7 @@ impl Mount {
             mountpoint: RwLock::new(None), // Root has no mountpoint
             parent: RwLock::new(None),     // Root has no parent
             children: RwLock::new(Vec::new()),
-            flags: root.flags,
+            mnt_flags: AtomicU32::new(root.flags()),
             mnt_count: AtomicU64::new(0),
         });
 
@@ -187,7 +222,7 @@ impl Mount {
             mountpoint: RwLock::new(old_mount.mountpoint.read().clone()),
             parent: RwLock::new(Some(Arc::downgrade(new_parent))),
             children: RwLock::new(Vec::new()),
-            flags: old_mount.flags,
+            mnt_flags: AtomicU32::new(old_mount.flags()),
             mnt_count: AtomicU64::new(0),
         });
 
@@ -348,34 +383,36 @@ pub fn do_mount(
     fs_type: &'static FileSystemType,
     mountpoint: Option<Arc<Dentry>>,
 ) -> Result<Arc<Mount>, KernelError> {
-    // Create the superblock by calling the filesystem's mount function
     let sb = (fs_type.mount)(fs_type)?;
+    attach(sb, mountpoint, 0, false)
+}
 
-    // Get the root dentry from the superblock
+/// Mount `sb` on `mountpoint` (None: as the namespace root) with MNT_*
+/// flags `mnt_flags` and read-only state `ro`, which are set before the
+/// mount becomes visible (Linux do_new_mount: no window with weaker
+/// flags)
+pub fn attach(
+    sb: Arc<SuperBlock>,
+    mountpoint: Option<Arc<Dentry>>,
+    mnt_flags: u32,
+    ro: bool,
+) -> Result<Arc<Mount>, KernelError> {
     let root = sb.get_root().ok_or(KernelError::InvalidArgument)?;
-
-    // Create the mount
-    let mount = Mount::new(sb, root, 0);
-
-    // Get the current mount namespace (falls back to init for early boot)
+    if ro {
+        sb.make_rdonly()?;
+    }
+    let mount = Mount::new(sb, root, mnt_flags);
     let mnt_ns = current_mnt_ns();
-
-    // If there's a mount point, set up the relationship
     if let Some(mp) = mountpoint {
         mount.set_mountpoint(mp.clone());
-
-        // Find parent mount and add as child
+        // For simplicity, add to the root mount's children
         if let Some(root_mount) = mnt_ns.get_root() {
-            // For simplicity, add to root mount's children
-            // A real implementation would walk the mount tree
             mount.set_parent(&root_mount);
             root_mount.add_child(mount.clone());
         }
     } else {
-        // This is the root mount - set in namespace
         mnt_ns.set_root(mount.clone());
     }
-
     Ok(mount)
 }
 
@@ -394,24 +431,12 @@ pub fn mount_at_path(
     }
 }
 
-/// Mount a device-backed filesystem
-///
-/// Used for filesystems that require a backing block device (ext4, vfat, etc.).
-///
-/// Uses the current task's mount namespace.
-///
-/// # Arguments
-/// * `fs_type` - Filesystem type (must have mount_dev function)
-/// * `source` - Path to the block device (e.g., "/dev/rd1")
-/// * `mountpoint` - Dentry where to mount (None for root)
-///
-/// # Returns
-/// The created mount on success
-pub fn do_mount_dev(
+/// Superblock of a device-backed filesystem (vfat, ...) on the block
+/// device at `source` (e.g. "/dev/rd1"); mount it with `attach`
+pub fn dev_super(
     fs_type: &'static FileSystemType,
     source: &str,
-    mountpoint: Option<Arc<Dentry>>,
-) -> Result<Arc<Mount>, KernelError> {
+) -> Result<Arc<SuperBlock>, KernelError> {
     // The filesystem must support device mounting
     let mount_dev_fn = fs_type
         .mount_dev
@@ -430,32 +455,7 @@ pub fn do_mount_dev(
     let bdev = get_blkdev(source_inode.rdev).ok_or(KernelError::NoDevice)?;
 
     // Call the filesystem's mount_dev function
-    let sb = mount_dev_fn(fs_type, bdev)?;
-
-    // Get the root dentry from the superblock
-    let root = sb.get_root().ok_or(KernelError::InvalidArgument)?;
-
-    // Create the mount
-    let mount = Mount::new(sb, root, 0);
-
-    // Get the current mount namespace
-    let mnt_ns = current_mnt_ns();
-
-    // If there's a mount point, set up the relationship
-    if let Some(mp) = mountpoint {
-        mount.set_mountpoint(mp.clone());
-
-        // Find parent mount and add as child
-        if let Some(root_mount) = mnt_ns.get_root() {
-            mount.set_parent(&root_mount);
-            root_mount.add_child(mount.clone());
-        }
-    } else {
-        // This is the root mount - set in namespace
-        mnt_ns.set_root(mount.clone());
-    }
-
-    Ok(mount)
+    mount_dev_fn(fs_type, bdev)
 }
 
 // ============================================================================
@@ -532,6 +532,13 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
     *mount.mountpoint.write() = None;
 
     Ok(())
+}
+
+/// MNT_* flags of the mount `dentry` belongs to (0 if none)
+pub fn mnt_flags_of(dentry: &Arc<Dentry>) -> u32 {
+    current_mnt_ns()
+        .find_mount_for_dentry(dentry)
+        .map_or(0, |m| m.flags())
 }
 
 /// Check if a dentry is a mount point and get the mounted filesystem's root

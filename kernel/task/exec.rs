@@ -25,9 +25,10 @@ const PAGE_SIZE: u64 = 4096;
 /// User stack virtual address (near top of user space, below canonical hole)
 const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
 
-/// Default number of pages for user stack (16KB)
-/// This is used if RLIMIT_STACK is larger or infinite.
-const USER_STACK_PAGES: usize = 4;
+/// Pages of user stack mapped at exec when RLIMIT_STACK is unlimited
+/// (1 MB; the stack does not grow on demand yet, see BUGS.md). It was
+/// 16 KB, which deep frames (signal delivery, large locals) overran.
+const USER_STACK_PAGES: usize = 256;
 
 /// Maximum number of pages for user stack (8MB, matching default RLIMIT_STACK)
 const MAX_STACK_PAGES: usize = 2048;
@@ -51,54 +52,33 @@ pub const E2BIG: i32 = 7; // Argument list too long
 /// Maximum path length (matching Linux PATH_MAX)
 const PATH_MAX: usize = 4096;
 
-/// Copy a null-terminated string from user space
-///
-/// Returns the string as a Vec<u8> (not including the null terminator)
-/// or an error if the string is invalid or too long.
-unsafe fn copy_string_from_user(ptr: u64, max_len: usize) -> Result<Vec<u8>, i32> {
-    if ptr == 0 {
-        return Err(EFAULT);
-    }
-
-    let mut result = Vec::new();
-    let mut p = ptr as *const u8;
-
-    for _ in 0..max_len {
-        let byte = unsafe { *p };
-        if byte == 0 {
-            return Ok(result);
-        }
-        result.push(byte);
-        p = unsafe { p.add(1) };
-    }
-
-    // String too long
-    Err(E2BIG)
+/// Copy a null-terminated string from user space (through uaccess, so
+/// SMAP/PAN stay enforced and a bad pointer is EFAULT, not a kernel fault)
+fn copy_string_from_user(ptr: u64, max_len: usize) -> Result<Vec<u8>, i32> {
+    use crate::uaccess::UaccessError;
+    crate::uaccess::strndup_user_bytes::<crate::arch::Uaccess>(ptr, max_len).map_err(|e| match e {
+        UaccessError::Overflow => E2BIG,
+        _ => EFAULT,
+    })
 }
 
 /// Copy a null-terminated array of string pointers from user space
 ///
 /// Returns a Vec of strings, or an error.
-unsafe fn copy_string_array_from_user(
-    argv_ptr: u64,
-    max_strings: usize,
-) -> Result<Vec<Vec<u8>>, i32> {
+fn copy_string_array_from_user(argv_ptr: u64, max_strings: usize) -> Result<Vec<Vec<u8>>, i32> {
     if argv_ptr == 0 {
         return Ok(Vec::new());
     }
 
     let mut result = Vec::new();
-    let mut pp = argv_ptr as *const u64;
-
-    for _ in 0..max_strings {
-        let str_ptr = unsafe { *pp };
+    for i in 0..max_strings as u64 {
+        let slot = argv_ptr.checked_add(i * 8).ok_or(EFAULT)?;
+        let str_ptr =
+            crate::uaccess::get_user::<crate::arch::Uaccess, u64>(slot).map_err(|_| EFAULT)?;
         if str_ptr == 0 {
             break;
         }
-
-        let s = unsafe { copy_string_from_user(str_ptr, PATH_MAX)? };
-        result.push(s);
-        pp = unsafe { pp.add(1) };
+        result.push(copy_string_from_user(str_ptr, PATH_MAX)?);
     }
 
     Ok(result)
@@ -586,9 +566,13 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     // Now we need to update the current task and switch to the new address space
     // This is the point of no return
 
+    let tid = percpu::current_tid();
+
+    // Private fd table without the close-on-exec descriptors
+    crate::task::fdtable::exec_task_fd(tid);
+
     // Signal vfork completion if parent is waiting
     // Must be done before we switch address spaces since parent may be blocked
-    let tid = percpu::current_tid();
     percpu::signal_vfork_done(tid);
 
     // Initialize brk for the new process
@@ -620,19 +604,19 @@ pub fn sys_execve(pathname: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     use crate::frame_alloc::FrameAllocRef;
 
     // Copy pathname from user space
-    let path = match unsafe { copy_string_from_user(pathname, PATH_MAX) } {
+    let path = match copy_string_from_user(pathname, PATH_MAX) {
         Ok(p) => p,
         Err(e) => return -(e as i64),
     };
 
     // Copy argv from user space
-    let argv = match unsafe { copy_string_array_from_user(argv_ptr, 1024) } {
+    let argv = match copy_string_array_from_user(argv_ptr, 1024) {
         Ok(a) => a,
         Err(e) => return -(e as i64),
     };
 
     // Copy envp from user space
-    let envp = match unsafe { copy_string_array_from_user(envp_ptr, 1024) } {
+    let envp = match copy_string_array_from_user(envp_ptr, 1024) {
         Ok(e) => e,
         Err(e) => return -(e as i64),
     };
@@ -683,7 +667,7 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
     }
 
     // Copy pathname from user space
-    let path = match unsafe { copy_string_from_user(pathname, PATH_MAX) } {
+    let path = match copy_string_from_user(pathname, PATH_MAX) {
         Ok(p) => p,
         Err(e) => return -(e as i64),
     };
@@ -693,13 +677,13 @@ pub fn sys_execveat(dirfd: i32, pathname: u64, argv_ptr: u64, envp_ptr: u64, fla
     // This is a simplification
 
     // Copy argv from user space
-    let argv = match unsafe { copy_string_array_from_user(argv_ptr, 1024) } {
+    let argv = match copy_string_array_from_user(argv_ptr, 1024) {
         Ok(a) => a,
         Err(e) => return -(e as i64),
     };
 
     // Copy envp from user space
-    let envp = match unsafe { copy_string_array_from_user(envp_ptr, 1024) } {
+    let envp = match copy_string_array_from_user(envp_ptr, 1024) {
         Ok(e) => e,
         Err(e) => return -(e as i64),
     };

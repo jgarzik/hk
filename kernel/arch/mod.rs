@@ -64,11 +64,27 @@ pub use x86_64::power;
 pub use aarch64::power;
 
 // IRQ-safe spinlock - architecture-specific implementation
-#[cfg(target_arch = "x86_64")]
-pub use x86_64::spinlock::IrqSpinlock;
-
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::spinlock::IrqSpinlock;
+pub use aarch64::barrier;
+/// Device IRQ registration (shareable handlers, PCI INTx routing)
+// Device I/O memory barriers (dma_wmb/dma_rmb/wmb)
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::barrier;
+
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::irq;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::percpu::preempt_count;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::spinlock::{IrqSpinlock, IrqSpinlockGuard};
+
+/// Device IRQ registration (shareable handlers, PCI INTx routing)
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::irq;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::percpu::preempt_count;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::spinlock::{IrqSpinlock, IrqSpinlockGuard};
 
 // Ptrace architecture-specific support
 #[cfg(target_arch = "x86_64")]
@@ -277,6 +293,28 @@ pub trait PerCpuOps {
 
     /// Get saved syscall user RSP (stack pointer for fork)
     fn get_syscall_user_rsp() -> u64;
+
+    /// Whether logical CPU `cpu` has been brought online
+    fn cpu_online(cpu: u32) -> bool;
+
+    /// Per-CPU syscall user-register block (see `save_syscall_user_state`)
+    type SyscallUserState: Copy;
+
+    /// Capture this CPU's syscall user-register block. The block belongs to
+    /// the current task; the scheduler keeps it on the task's kernel stack
+    /// across context switches.
+    fn save_syscall_user_state() -> Self::SyscallUserState;
+
+    /// Restore a block captured by `save_syscall_user_state`
+    fn restore_syscall_user_state(state: &Self::SyscallUserState);
+
+    /// Record the syscall return value in the user-register block (so a
+    /// signal frame saves it)
+    fn set_syscall_return(val: u64);
+
+    /// Make the current syscall re-execute on return to user (restart after
+    /// -ERESTART*). Returns the value the return register must hold.
+    fn syscall_restart() -> u64;
 }
 
 /// CPU control operations
@@ -410,6 +448,15 @@ pub trait SchedArch: Arch + PerCpuOps + CpuOps + ContextOps + UserModeOps {
         parent_rflags: u64,
         child_rsp: u64,
     ) -> Self::TrapFrame;
+
+    /// Bytes reserved at the top of a clone child's kernel stack, above its
+    /// TrapFrame, for the user FP/SIMD state it inherits (0 when the
+    /// TrapFrame itself carries the FP state)
+    const CLONE_FPU_RESERVE: u64;
+
+    /// Save the calling task's user FP/SIMD state into the reserve of a
+    /// clone child whose kernel stack top is `kstack_top`
+    fn clone_child_fpu(kstack_top: u64);
 }
 
 // ============================================================================
@@ -709,6 +756,11 @@ pub trait MemoryLayoutOps {
     /// Returns (base, size) where base is the physical address to start
     /// frame allocation from, and size is the total bytes available.
     fn get_frame_alloc_region() -> (u64, u64);
+
+    /// Boot data inside the frame allocator region that must never be
+    /// handed out (e.g. an initrd the firmware placed there), as
+    /// (start, end) ranges
+    fn for_each_reserved(_f: &mut dyn FnMut(u64, u64)) {}
 }
 
 /// Exception and interrupt controller initialization

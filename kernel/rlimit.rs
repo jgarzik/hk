@@ -19,9 +19,11 @@
 
 #![allow(dead_code)]
 
+use crate::arch::Uaccess;
 use crate::signal::get_task_signal_struct;
 use crate::task::Tid;
 use crate::task::percpu::{current_cred, current_tid};
+use crate::uaccess::{copy_val_from_user, copy_val_to_user};
 
 // =============================================================================
 // Resource Limit Constants (Linux ABI)
@@ -224,9 +226,8 @@ pub fn sys_getrlimit(resource: u32, rlim_ptr: u64) -> i64 {
     };
 
     // Copy to user (16 bytes: cur + max)
-    unsafe {
-        let ptr = rlim_ptr as *mut RLimit;
-        core::ptr::write_volatile(ptr, rlim);
+    if copy_val_to_user::<Uaccess, RLimit>(rlim_ptr, &rlim).is_err() {
+        return -14; // EFAULT
     }
     0
 }
@@ -250,9 +251,9 @@ pub fn sys_setrlimit(resource: u32, rlim_ptr: u64) -> i64 {
     }
 
     // Copy from user
-    let new_rlim = unsafe {
-        let ptr = rlim_ptr as *const RLimit;
-        core::ptr::read_volatile(ptr)
+    let new_rlim = match copy_val_from_user::<Uaccess, RLimit>(rlim_ptr) {
+        Ok(r) => r,
+        Err(_) => return -14, // EFAULT
     };
 
     // Validate: cur <= max
@@ -304,17 +305,16 @@ pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim_ptr: u64, old_rlim_ptr: u
             Some(r) => r,
             None => return -3, // ESRCH
         };
-        unsafe {
-            let ptr = old_rlim_ptr as *mut RLimit;
-            core::ptr::write_volatile(ptr, old);
+        if copy_val_to_user::<Uaccess, RLimit>(old_rlim_ptr, &old).is_err() {
+            return -14; // EFAULT
         }
     }
 
     // Set new value if provided
     if new_rlim_ptr != 0 {
-        let new = unsafe {
-            let ptr = new_rlim_ptr as *const RLimit;
-            core::ptr::read_volatile(ptr)
+        let new = match copy_val_from_user::<Uaccess, RLimit>(new_rlim_ptr) {
+            Ok(r) => r,
+            Err(_) => return -14, // EFAULT
         };
 
         if new.rlim_cur > new.rlim_max {

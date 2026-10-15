@@ -21,6 +21,11 @@ const GICR_STRIDE: u64 = 0x20000;
 const GICD_CTLR: u64 = GICD_BASE;
 const GICD_TYPER: u64 = GICD_BASE + 0x0004;
 const GICD_IPRIORITYR: u64 = GICD_BASE + 0x0400; // +n for interrupt n
+const GICD_ISENABLER: u64 = GICD_BASE + 0x0100; // +4*(n/32)
+const GICD_ICENABLER: u64 = GICD_BASE + 0x0180; // +4*(n/32)
+const GICD_ICFGR: u64 = GICD_BASE + 0x0C00; // +4*(n/16), 2 bits per INTID
+const GICD_IROUTER: u64 = GICD_BASE + 0x6000; // +8*n (n >= 32)
+const GICD_CTLR_RWP: u32 = 1 << 31;
 
 // GICD_CTLR bits
 const GICD_CTLR_ENABLE_G0: u32 = 1 << 0;
@@ -178,6 +183,71 @@ unsafe fn init_distributor() {
     }
 
     printkln!("GIC distributor initialized");
+}
+
+/// SPI trigger mode (GICD_ICFGR)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    /// Level-sensitive (PCI INTx, most device lines)
+    Level,
+    /// Edge-triggered (platform devices; PCI INTx is level)
+    #[allow(dead_code)]
+    Edge,
+}
+
+/// Wait for a distributor register write to take effect (GICD_CTLR.RWP)
+unsafe fn gicd_wait_rwp() {
+    let mut timeout = 1_000_000;
+    while unsafe { read32(GICD_CTLR) } & GICD_CTLR_RWP != 0 && timeout > 0 {
+        timeout -= 1;
+    }
+}
+
+/// Configure and enable an SPI (INTID 32..1019)
+///
+/// Sets the trigger mode, priority 0x80 and Group 1 (init already did
+/// those two for all SPIs), routes it to CPU 0 (whose tick and threads
+/// handle device interrupts for now) and unmasks it at the distributor.
+/// Safe to call again for an already enabled SPI. Process context.
+pub fn enable_spi(intid: u32, trigger: Trigger) {
+    if !(32..1020).contains(&intid) {
+        return;
+    }
+    let n = intid as u64;
+    unsafe {
+        // Trigger: bit 1 of the 2-bit field (1 = edge, 0 = level)
+        let cfg_reg = GICD_ICFGR + (n / 16) * 4;
+        let shift = (n % 16) * 2 + 1;
+        let mut cfg = read32(cfg_reg);
+        match trigger {
+            Trigger::Edge => cfg |= 1 << shift,
+            Trigger::Level => cfg &= !(1 << shift),
+        }
+        write32(cfg_reg, cfg);
+
+        // Priority (byte-addressed)
+        write_volatile((GICD_IPRIORITYR + n) as *mut u8, 0x80);
+
+        // Route to CPU 0 by affinity (ARE is enabled; IRM = 0)
+        let mpidr = super::percpu::get_percpu(0).mpidr & 0xFF_00FF_FFFF;
+        write_volatile((GICD_IROUTER + n * 8) as *mut u64, mpidr);
+
+        // Unmask
+        write32(GICD_ISENABLER + (n / 32) * 4, 1 << (n % 32));
+        gicd_wait_rwp();
+    }
+}
+
+/// Mask an SPI at the distributor (any context)
+pub fn disable_spi(intid: u32) {
+    if !(32..1020).contains(&intid) {
+        return;
+    }
+    let n = intid as u64;
+    unsafe {
+        write32(GICD_ICENABLER + (n / 32) * 4, 1 << (n % 32));
+        gicd_wait_rwp();
+    }
 }
 
 /// Enable a specific PPI/SGI interrupt (0-31)

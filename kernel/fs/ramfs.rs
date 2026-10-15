@@ -29,7 +29,7 @@ use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
 
 use super::KernelError;
 use super::dentry::Dentry;
-use super::file::{DirEntry, File, FileOps};
+use super::file::{DirContext, DirEntry, File, FileOps};
 use super::inode::{AsAny, DevId, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::superblock::{
     FileSystemType, RAMFS_MAGIC, StatFs, SuperBlock, SuperBlockData, SuperOps,
@@ -76,7 +76,7 @@ pub struct RamfsInodeData {
     pub file_id: Option<FileId>,
 
     /// Children (for directories) - maps name to inode
-    pub children: RwLock<BTreeMap<String, Arc<Inode>>>,
+    pub children: RwLock<Children>,
 
     /// Symlink target (symlinks only - stored inline, not in page cache)
     /// Symlinks are typically small, so inline storage is more efficient.
@@ -97,12 +97,81 @@ pub fn ramfs_file_id(sb: &SuperBlock, ino: u64) -> FileId {
     FileId::new(0x4000_0000_0000_0000 | (dev_id << 32) | (ino & 0xFFFF_FFFF))
 }
 
+/// Directory entries with stable readdir positions (Linux
+/// simple_offset, as in tmpfs): an entry gets its directory's next
+/// position when it is added, so a d_off cookie keeps its meaning while
+/// other entries come and go (an `rm -r` that unlinks as it reads sees
+/// every entry once). Positions 0 and 1 are "." and "..".
+pub struct Children {
+    by_name: BTreeMap<String, (u64, Arc<Inode>)>,
+    by_pos: BTreeMap<u64, String>,
+    next: u64,
+}
+
+impl Children {
+    /// Empty directory
+    pub const fn new() -> Self {
+        Self {
+            by_name: BTreeMap::new(),
+            by_pos: BTreeMap::new(),
+            next: 2,
+        }
+    }
+
+    /// Inode of entry `name`
+    pub fn get(&self, name: &str) -> Option<&Arc<Inode>> {
+        self.by_name.get(name).map(|(_, i)| i)
+    }
+
+    /// True if entry `name` exists
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+
+    /// True if the directory has no entries
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+
+    /// Add (or replace) entry `name` at the next position
+    pub fn insert(&mut self, name: String, inode: Arc<Inode>) -> Option<Arc<Inode>> {
+        let old = self.remove(&name);
+        let pos = self.next;
+        self.next += 1;
+        self.by_pos.insert(pos, name.clone());
+        self.by_name.insert(name, (pos, inode));
+        old
+    }
+
+    /// Remove entry `name`
+    pub fn remove(&mut self, name: &str) -> Option<Arc<Inode>> {
+        let (pos, inode) = self.by_name.remove(name)?;
+        self.by_pos.remove(&pos);
+        Some(inode)
+    }
+
+    /// Entries at position `pos` or later, in position order
+    pub fn from_pos(&self, pos: u64) -> impl Iterator<Item = (u64, &str, &Arc<Inode>)> {
+        self.by_pos.range(pos..).filter_map(|(&p, name)| {
+            self.by_name
+                .get(name)
+                .map(|(_, inode)| (p, name.as_str(), inode))
+        })
+    }
+}
+
+impl Default for Children {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RamfsInodeData {
     /// Create empty file data with the given FileId
     pub fn new_file(file_id: FileId) -> Self {
         Self {
             file_id: Some(file_id),
-            children: RwLock::new(BTreeMap::new()),
+            children: RwLock::new(Children::new()),
             symlink_target: None,
             xattrs: RwLock::new(BTreeMap::new()),
         }
@@ -112,7 +181,7 @@ impl RamfsInodeData {
     pub fn new_dir() -> Self {
         Self {
             file_id: None,
-            children: RwLock::new(BTreeMap::new()),
+            children: RwLock::new(Children::new()),
             symlink_target: None,
             xattrs: RwLock::new(BTreeMap::new()),
         }
@@ -122,7 +191,7 @@ impl RamfsInodeData {
     pub fn new_symlink(target: String) -> Self {
         Self {
             file_id: None,
-            children: RwLock::new(BTreeMap::new()),
+            children: RwLock::new(Children::new()),
             symlink_target: Some(target),
             xattrs: RwLock::new(BTreeMap::new()),
         }
@@ -157,9 +226,9 @@ pub struct RamfsInodeOps;
 impl RamfsInodeOps {
     /// Helper for cross-directory rename operations
     fn do_cross_dir_rename(
-        old_children: &mut BTreeMap<String, Arc<Inode>>,
+        old_children: &mut Children,
         old_name: &str,
-        new_children: &mut BTreeMap<String, Arc<Inode>>,
+        new_children: &mut Children,
         new_name: &str,
         flags: u32,
     ) -> Result<(), KernelError> {
@@ -257,15 +326,16 @@ impl InodeOps for RamfsInodeOps {
             return Err(KernelError::AlreadyExists);
         }
 
-        // Create new inode (inherit uid/gid from parent directory for now)
+        // Owner from the caller's fs ids (inode_init_owner)
         let ino = sb.alloc_ino();
         let file_id = ramfs_file_id(&sb, ino);
+        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
 
         let new_inode = Arc::new(Inode::new(
             ino,
             mode,
-            dir.uid(),
-            dir.gid(),
+            uid,
+            gid,
             0,
             current_time(),
             Arc::downgrade(&sb),
@@ -282,6 +352,41 @@ impl InodeOps for RamfsInodeOps {
         Ok(new_inode)
     }
 
+    fn mknod(
+        &self,
+        dir: &Inode,
+        name: &str,
+        mode: InodeMode,
+        rdev: DevId,
+    ) -> Result<Arc<Inode>, KernelError> {
+        let sb = dir.superblock().ok_or(KernelError::Io)?;
+        let private = dir.get_private().ok_or(KernelError::Io)?;
+        let dir_data = private
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RamfsInodeData>()
+            .ok_or(KernelError::Io)?;
+        if dir_data.children.read().contains_key(name) {
+            return Err(KernelError::AlreadyExists);
+        }
+        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
+        let inode = Arc::new(Inode::new_device(
+            sb.alloc_ino(),
+            mode,
+            uid,
+            gid,
+            rdev,
+            current_time(),
+            Arc::downgrade(&sb),
+            &RAMFS_INODE_OPS,
+        ));
+        dir_data
+            .children
+            .write()
+            .insert(String::from(name), inode.clone());
+        Ok(inode)
+    }
+
     fn mkdir(&self, dir: &Inode, name: &str, mode: InodeMode) -> Result<Arc<Inode>, KernelError> {
         let sb = dir.superblock().ok_or(KernelError::Io)?;
         let private = dir.get_private().ok_or(KernelError::Io)?;
@@ -296,12 +401,13 @@ impl InodeOps for RamfsInodeOps {
             return Err(KernelError::AlreadyExists);
         }
 
-        // Create new directory inode (inherit uid/gid from parent)
+        // Owner from the caller's fs ids (inode_init_owner)
+        let (uid, gid, mode) = super::dac::init_owner(dir, mode);
         let new_inode = Arc::new(Inode::new(
             sb.alloc_ino(),
             mode,
-            dir.uid(),
-            dir.gid(),
+            uid,
+            gid,
             0,
             current_time(),
             Arc::downgrade(&sb),
@@ -447,11 +553,12 @@ impl InodeOps for RamfsInodeOps {
         }
 
         // Create symlink inode (mode = S_IFLNK | 0777)
+        let (uid, gid, mode) = super::dac::init_owner(dir, InodeMode::symlink());
         let new_inode = Arc::new(Inode::new(
             sb.alloc_ino(),
-            InodeMode::symlink(),
-            dir.uid(),
-            dir.gid(),
+            mode,
+            uid,
+            gid,
             target.len() as u64, // size = target length
             current_time(),
             Arc::downgrade(&sb),
@@ -1160,34 +1267,17 @@ impl FileOps for RamfsFileOps {
         Ok(bytes_written)
     }
 
-    fn readdir(
-        &self,
-        file: &File,
-        callback: &mut dyn FnMut(DirEntry) -> bool,
-    ) -> Result<(), KernelError> {
+    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-
         if !inode.mode().is_dir() {
             return Err(KernelError::NotDirectory);
         }
-
         let private = inode.get_private().ok_or(KernelError::Io)?;
         let ramfs_data = private
             .as_ref()
             .as_any()
             .downcast_ref::<RamfsInodeData>()
             .ok_or(KernelError::Io)?;
-
-        // First, emit "." and ".."
-        let should_continue = callback(DirEntry {
-            ino: inode.ino,
-            file_type: FileType::Directory,
-            name: Vec::from(b"."),
-        });
-
-        if !should_continue {
-            return Ok(());
-        }
 
         // Parent directory (use same inode for root)
         let parent_ino = file
@@ -1196,38 +1286,36 @@ impl FileOps for RamfsFileOps {
             .and_then(|p| p.get_inode())
             .map(|i| i.ino)
             .unwrap_or(inode.ino);
-
-        let should_continue = callback(DirEntry {
-            ino: parent_ino,
-            file_type: FileType::Directory,
-            name: Vec::from(b".."),
-        });
-
-        if !should_continue {
+        if !ctx.emit_at(0, dot(b".", inode.ino)) || !ctx.emit_at(1, dot(b"..", parent_ino)) {
             return Ok(());
         }
 
-        // Now emit children
         let children = ramfs_data.children.read();
-        for (name, child_inode) in children.iter() {
-            let file_type = child_inode.mode().file_type().unwrap_or(FileType::Regular);
-
-            let should_continue = callback(DirEntry {
-                ino: child_inode.ino,
+        for (pos, name, child) in children.from_pos(ctx.pos) {
+            let file_type = child.mode().file_type().unwrap_or(FileType::Regular);
+            let e = DirEntry {
+                ino: child.ino,
                 file_type,
                 name: name.as_bytes().to_vec(),
-            });
-
-            if !should_continue {
+            };
+            if !ctx.emit_at(pos, e) {
                 break;
             }
         }
-
         Ok(())
     }
 
     // No RWF_NOWAIT overrides: like Linux ramfs/tmpfs (no FMODE_NOWAIT),
     // the default *_with_flags methods reject NOWAIT with EOPNOTSUPP
+}
+
+/// "." or ".." directory entry
+fn dot(name: &[u8], ino: u64) -> DirEntry {
+    DirEntry {
+        ino,
+        file_type: FileType::Directory,
+        name: name.to_vec(),
+    }
 }
 
 /// Static ramfs file ops

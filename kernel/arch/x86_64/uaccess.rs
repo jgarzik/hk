@@ -37,9 +37,11 @@ const CPUID_SMEP: u32 = 1 << 7;
 pub struct X86_64Uaccess;
 
 impl UaccessArch for X86_64Uaccess {
-    /// User space starts at address 0 on x86_64
-    /// (We allow access starting from page 1 to catch NULL pointer dereferences)
-    const USER_START: u64 = 0x0000_0000_0000_1000; // Skip first page (NULL guard)
+    /// Lowest user address. The kernel's identity map (first 512 MB,
+    /// supervisor-only) shares PML4[0] with user mappings, so user pointers
+    /// below this would reach kernel memory; user images and mmaps start at
+    /// 0x2000_0000 (init) / 2 GB (exec'd PIE) / MMAP_BASE.
+    const USER_START: u64 = 0x0000_0000_2000_0000;
 
     /// User space ends at the canonical hole
     /// The highest valid user address is 0x0000_7FFF_FFFF_FFFF

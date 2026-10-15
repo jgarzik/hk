@@ -12,6 +12,7 @@
 //! Note: rt_sigreturn (15) is implemented in arch-specific signal.rs files
 
 use crate::arch::{CurrentArch, PerCpuOps, Uaccess};
+use crate::error::KernelError;
 use crate::signal::{
     SIGKILL, SIGSTOP, SigAction, SigSet, UNMASKABLE_SIGNALS, get_task_sighand, send_signal,
     send_signal_to_pgrp, send_signal_to_process, with_task_signal_state,
@@ -565,16 +566,32 @@ pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
         return -3; // ESRCH
     }
 
-    // Sleep until a signal is deliverable under the temporary mask.
-    // Signal senders do not wake sleepers directly, so re-check every tick.
-    while !with_task_signal_state(tid, |state| state.has_deliverable_signals()).unwrap_or(true) {
-        let wake_tick = crate::task::percpu::get_ticks().saturating_add(1);
-        crate::task::percpu::sleep_current_until(wake_tick);
-    }
+    // Sleep until a signal is deliverable under the temporary mask
+    // (send_signal wakes interruptible sleepers)
+    wait_for_signal();
 
-    // Linux returns -ERESTARTNOHAND, which becomes -EINTR once a handler
-    // runs; hk has no syscall restart, so return -EINTR directly.
-    -4 // EINTR
+    // -EINTR once the handler runs (the saved mask goes into its frame)
+    KernelError::RestartNoHand.sysret()
+}
+
+/// Sleep interruptibly until a signal is deliverable
+fn wait_for_signal() {
+    use crate::task::percpu::{SleepState, schedule, set_current_state};
+    loop {
+        set_current_state(SleepState::Interruptible);
+        if crate::waitqueue::signal_pending() {
+            break;
+        }
+        schedule();
+    }
+    set_current_state(SleepState::Running);
+}
+
+/// pause() - sleep until a signal handler runs (x86-64 only; arm64 libc
+/// uses ppoll). Returns -EINTR after the handler, like Linux.
+pub fn sys_pause() -> i64 {
+    wait_for_signal();
+    KernelError::RestartNoHand.sysret()
 }
 
 /// siginfo_t structure for user space (Linux ABI)
@@ -808,7 +825,7 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
             return -22; // EINVAL
         }
 
-        Some(tv_sec as u64 * 1_000_000_000 + tv_nsec as u64)
+        Some(crate::time::timespec_to_ns(tv_sec, tv_nsec))
     } else {
         None // Infinite wait
     };
@@ -820,58 +837,93 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
     mask.remove(SIGKILL);
     mask.remove(SIGSTOP);
 
-    // Check if any signals in the set are already pending
-    let dequeued_sig = with_task_signal_state(tid, |state| {
-        // Check private pending
-        let deliverable = state.pending.signal.intersect(&mask);
+    let mut sig = dequeue_in(tid, &mask);
+    if sig.is_none() && timeout_ns != Some(0) {
+        // Linux do_sigtimedwait: unblock the awaited signals while
+        // sleeping so their arrival wakes us, then restore the mask
+        let saved = with_task_signal_state(tid, |st| {
+            let old = st.blocked;
+            st.blocked = old.subtract(&mask);
+            st.recalc_sigpending();
+            old
+        });
+        let deadline = timeout_ns.map(|ns| crate::time::monotonic_ns().saturating_add(ns));
+        sleep_until_signal(deadline);
+        if let Some(old) = saved {
+            with_task_signal_state(tid, |st| {
+                st.blocked = old;
+                st.recalc_sigpending();
+            });
+        }
+        sig = dequeue_in(tid, &mask);
+        if sig.is_none() {
+            // Another signal (EINTR) or the timeout (EAGAIN)
+            let timed_out = deadline.is_some_and(|d| crate::time::monotonic_ns() >= d);
+            return if timed_out {
+                KernelError::WouldBlock.sysret()
+            } else {
+                KernelError::Interrupted.sysret()
+            };
+        }
+    }
+    let Some(sig) = sig else {
+        return KernelError::WouldBlock.sysret();
+    };
+    if info_ptr != 0 {
+        // Basic siginfo (SI_USER with pid/uid 0: senders are not tracked)
+        let siginfo = SigInfo::from_kill(sig, 0, 0);
+        if siginfo.write_to_user(info_ptr).is_err() {
+            return KernelError::BadAddress.sysret();
+        }
+    }
+    sig as i64
+}
+
+/// Dequeue the lowest pending signal of `mask` (private, then shared)
+fn dequeue_in(tid: crate::task::Tid, mask: &SigSet) -> Option<u32> {
+    with_task_signal_state(tid, |state| {
+        let deliverable = state.pending.signal.intersect(mask);
         if let Some(sig) = deliverable.first() {
             state.pending.remove(sig);
             state.recalc_sigpending();
             return Some(sig);
         }
-
-        // Check shared pending
         let mut shared = state.shared_pending.lock();
-        let deliverable = shared.signal.intersect(&mask);
+        let deliverable = shared.signal.intersect(mask);
         if let Some(sig) = deliverable.first() {
             shared.remove(sig);
             drop(shared);
             state.recalc_sigpending();
             return Some(sig);
         }
-
         None
-    });
+    })
+    .flatten()
+}
 
-    if let Some(Some(sig)) = dequeued_sig {
-        // Signal was pending - return it
-        if info_ptr != 0 {
-            // Create basic siginfo (SI_USER with pid/uid 0 since we don't track sender)
-            let siginfo = SigInfo::from_kill(sig, 0, 0);
-            if siginfo.write_to_user(info_ptr).is_err() {
-                return -14; // EFAULT
+/// Sleep interruptibly until a signal is deliverable or the
+/// CLOCK_MONOTONIC `deadline` (ns) passes
+fn sleep_until_signal(deadline: Option<u64>) {
+    use crate::task::percpu::{
+        SleepState, ns_to_ticks, schedule, schedule_timeout, set_current_state,
+    };
+    loop {
+        set_current_state(SleepState::Interruptible);
+        if crate::waitqueue::signal_pending() {
+            break;
+        }
+        match deadline {
+            None => schedule(),
+            Some(d) => {
+                let now = crate::time::monotonic_ns();
+                if now >= d {
+                    break;
+                }
+                schedule_timeout(ns_to_ticks(d - now));
             }
         }
-        return sig as i64;
     }
-
-    // No signal pending - check if we should wait
-    match timeout_ns {
-        Some(0) => {
-            // Zero timeout - return immediately
-            -11 // EAGAIN
-        }
-        Some(_ns) => {
-            // Non-zero timeout - for now, just return EAGAIN
-            // TODO: Implement actual sleeping with timeout
-            -11 // EAGAIN
-        }
-        None => {
-            // Infinite wait - for now, just return EAGAIN
-            // TODO: Implement actual sleeping
-            -11 // EAGAIN
-        }
-    }
+    set_current_state(SleepState::Running);
 }
 
 /// sigaltstack(ss, oss) - set/get alternate signal stack
@@ -898,7 +950,7 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
         // Check if currently executing on the altstack
         let on_stack = state.altstack.is_enabled() && {
             let sp_start = state.altstack.ss_sp;
-            let sp_end = sp_start + state.altstack.ss_size as u64;
+            let sp_end = sp_start.saturating_add(state.altstack.ss_size as u64);
             user_sp >= sp_start && user_sp < sp_end
         };
 
@@ -915,11 +967,11 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
             } else {
                 old.ss_flags
             };
-            if put_user::<Uaccess, i32>(oss_ptr + 8, flags).is_err() {
+            if put_user::<Uaccess, i32>(oss_ptr.wrapping_add(8), flags).is_err() {
                 return -14; // EFAULT
             }
             // Write ss_size (offset 16, with padding after flags)
-            if put_user::<Uaccess, u64>(oss_ptr + 16, old.ss_size as u64).is_err() {
+            if put_user::<Uaccess, u64>(oss_ptr.wrapping_add(16), old.ss_size as u64).is_err() {
                 return -14; // EFAULT
             }
         }
@@ -937,12 +989,12 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
                 Err(_) => return -14, // EFAULT
             };
             // Read ss_flags (offset 8)
-            let ss_flags_val = match get_user::<Uaccess, i32>(ss_ptr + 8) {
+            let ss_flags_val = match get_user::<Uaccess, i32>(ss_ptr.wrapping_add(8)) {
                 Ok(v) => v,
                 Err(_) => return -14, // EFAULT
             };
             // Read ss_size (offset 16)
-            let ss_size = match get_user::<Uaccess, u64>(ss_ptr + 16) {
+            let ss_size = match get_user::<Uaccess, u64>(ss_ptr.wrapping_add(16)) {
                 Ok(v) => v as usize,
                 Err(_) => return -14, // EFAULT
             };

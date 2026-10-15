@@ -13,7 +13,7 @@ use crate::fs::iov::IoVec;
 use crate::mm::remote::{access_remote_vm_read, access_remote_vm_write};
 use crate::task::percpu::{TASK_TABLE, current_cred, current_tid};
 use crate::task::{CAP_SYS_PTRACE, Pid, Tid, capable};
-use crate::uaccess::UaccessArch;
+use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 
 /// Maximum number of iovec entries (same as IOV_MAX)
 const IOV_MAX: usize = 1024;
@@ -135,10 +135,12 @@ pub fn sys_process_vm_readv(
 
             // Copy to local user buffer
             let local_addr = local.iov_base + local_offset as u64;
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(buf.as_ptr(), local_addr as *mut u8, bytes_read);
-                Uaccess::user_access_end();
+            if copy_to_user::<Uaccess>(local_addr, &buf[..bytes_read]).is_err() {
+                return if total_bytes > 0 {
+                    total_bytes
+                } else {
+                    KernelError::BadAddress.sysret()
+                };
             }
 
             total_bytes += bytes_read as i64;
@@ -254,14 +256,12 @@ pub fn sys_process_vm_writev(
             // Read from local user buffer into kernel buffer
             let mut buf = alloc::vec![0u8; to_transfer];
             let local_addr = local.iov_base + local_offset as u64;
-            unsafe {
-                Uaccess::user_access_begin();
-                core::ptr::copy_nonoverlapping(
-                    local_addr as *const u8,
-                    buf.as_mut_ptr(),
-                    to_transfer,
-                );
-                Uaccess::user_access_end();
+            if copy_from_user::<Uaccess>(&mut buf, local_addr, to_transfer).is_err() {
+                return if total_bytes > 0 {
+                    total_bytes
+                } else {
+                    KernelError::BadAddress.sysret()
+                };
             }
 
             // Write to remote
@@ -369,15 +369,13 @@ fn copy_iovecs_from_user(iov_ptr: u64, count: usize) -> Result<Vec<IoVec>, Kerne
         return Err(KernelError::BadAddress);
     }
 
-    let mut iovecs = Vec::with_capacity(count);
-
-    unsafe {
-        Uaccess::user_access_begin();
-        for i in 0..count {
-            let iov = core::ptr::read((iov_ptr as *const IoVec).add(i));
-            iovecs.push(iov);
-        }
-        Uaccess::user_access_end();
+    let mut iovecs = alloc::vec![IoVec::default(); count];
+    // SAFETY: IoVec is repr(C) plain data; the byte view covers exactly the
+    // `count` initialized elements of `iovecs`.
+    let bytes =
+        unsafe { core::slice::from_raw_parts_mut(iovecs.as_mut_ptr() as *mut u8, total_size) };
+    if copy_from_user::<Uaccess>(bytes, iov_ptr, total_size).is_err() {
+        return Err(KernelError::BadAddress);
     }
 
     Ok(iovecs)

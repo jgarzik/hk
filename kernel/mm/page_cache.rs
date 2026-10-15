@@ -386,10 +386,8 @@ impl CachedPage {
                     return;
                 }
 
-                // Sleep on wait queue
-                wq.wait();
-
-                // When woken, try again (loop back to check lock)
+                // Sleep until the page looks unlocked, then retry the CAS
+                wq.wait_event(|| !self.locked.load(Ordering::Acquire));
             }
         } else {
             // Scheduling not enabled - fall back to spinning
@@ -415,10 +413,12 @@ impl CachedPage {
         // Release the lock
         self.locked.store(false, Ordering::Release);
 
-        // Wake one waiter if scheduling is enabled
+        // Wake waiters if scheduling is enabled. The hashed queue is shared
+        // with other pages, so wake all (a single wakeup could go to a waiter
+        // for a different page and be lost)
         if SCHEDULING_ENABLED.load(Ordering::Acquire) {
             let wq = page_wait_queue(self.frame);
-            wq.wake_one();
+            wq.wake_all();
         }
     }
 
@@ -500,9 +500,7 @@ impl CachedPage {
         // Slow path: wait on page wait queue
         if SCHEDULING_ENABLED.load(Ordering::Acquire) {
             let wq = page_wait_queue(self.frame);
-            while self.is_writeback() {
-                wq.wait();
-            }
+            wq.wait_event(|| !self.is_writeback());
         } else {
             // Scheduling not enabled - spin
             while self.is_writeback() {

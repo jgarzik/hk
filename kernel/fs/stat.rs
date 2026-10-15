@@ -71,9 +71,7 @@ pub fn sys_stat(path_ptr: u64, statbuf: u64) -> i64 {
     // Look up the path (follow symlinks)
     let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Get the inode
@@ -200,10 +198,7 @@ pub fn sys_fstatat(dirfd: i32, path_ptr: u64, statbuf: u64, flags: i32) -> i64 {
     // Look up the path
     let dentry = match lookup_path_at(start, &path_str, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(KernelError::TooManySymlinks) => return KernelError::TooManySymlinks.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Get the inode
@@ -251,10 +246,7 @@ pub fn sys_lstat(path_ptr: u64, statbuf: u64) -> i64 {
 
     let dentry = match lookup_path_flags(&path, flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(KernelError::TooManySymlinks) => return KernelError::TooManySymlinks.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Get the inode
@@ -430,9 +422,7 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
     // Look up path to get dentry/superblock
     let dentry = match lookup_path_flags(&path, LookupFlags::open()) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Get superblock
@@ -443,7 +433,7 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
 
     // Get stats from filesystem
     let statfs = sb.s_op.statfs();
-    let linux_statfs = statfs.to_linux(sb.dev_id, sb.flags);
+    let linux_statfs = statfs.to_linux(sb.dev_id, st_flags(&dentry, &sb));
 
     // Copy to user
     if put_user::<Uaccess, LinuxStatFs>(buf, linux_statfs).is_err() {
@@ -451,6 +441,15 @@ pub fn sys_statfs(path_ptr: u64, buf: u64) -> i64 {
     }
 
     0
+}
+
+/// statfs f_flags (Linux calculate_f_flags): ST_VALID, ST_RDONLY from
+/// the superblock, ST_NOSUID/NODEV/NOEXEC from the mount
+fn st_flags(dentry: &alloc::sync::Arc<super::Dentry>, sb: &super::SuperBlock) -> u64 {
+    const ST_VALID: u64 = 0x20;
+    // MNT_NOSUID/NODEV/NOEXEC (1, 2, 4) map to ST_NOSUID/NODEV/NOEXEC (2, 4, 8)
+    let mnt = super::mount::mnt_flags_of(dentry) as u64;
+    ST_VALID | sb.rdonly() as u64 | (mnt & 7) << 1
 }
 
 /// sys_fstatfs - get filesystem statistics by file descriptor
@@ -481,7 +480,7 @@ pub fn sys_fstatfs(fd: i32, buf: u64) -> i64 {
 
     // Get stats
     let statfs = sb.s_op.statfs();
-    let linux_statfs = statfs.to_linux(sb.dev_id, sb.flags);
+    let linux_statfs = statfs.to_linux(sb.dev_id, st_flags(&file.dentry, &sb));
 
     // Copy to user
     if put_user::<Uaccess, LinuxStatFs>(buf, linux_statfs).is_err() {
@@ -618,9 +617,7 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: i32, mask: u32, buf: u64) -> 
 
         match lookup_path_at(start, &path, lookup_flags) {
             Ok(d) => d,
-            Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-            Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-            Err(_) => return KernelError::InvalidArgument.sysret(),
+            Err(e) => return e.sysret(),
         }
     };
 

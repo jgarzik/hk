@@ -9,11 +9,21 @@
 #   -T N         Timeout in seconds for test mode (default: 30)
 #   -u           USB serial console mode (x86 only, for make check-usb)
 #
+# Environment:
+#   QEMU_CPU     Override the -cpu model (x86 default: host under KVM,
+#                max under TCG; arm default: neoverse-n1), e.g. QEMU_CPU=qemu64.
+#                The defaults have SMAP/SMEP (x86) and PAN (arm), so boot
+#                tests catch kernel accesses to user memory that bypass the
+#                uaccess helpers.
+#
 # Serial output:
 #   x86: /tmp/qemu_serial.log (or /tmp/qemu_usb_serial.log with -u)
 #   arm: /tmp/qemu_serial_arm.log
 
 set -e
+
+# Shared network options
+. "$(dirname "$0")/tools/qemu-net.sh"
 
 # Default options
 ARCH="x86"
@@ -93,7 +103,7 @@ setup_x86_config() {
     if [ -w /dev/kvm ]; then
         QEMU_ARGS=(
             -enable-kvm
-            -cpu host
+            -cpu "${QEMU_CPU:-host}"
             -cdrom "$ISO"
             -boot d
             -nographic
@@ -102,7 +112,8 @@ setup_x86_config() {
         )
     else
         QEMU_ARGS=(
-            -cpu qemu64
+            # TCG: max has SMAP/SMEP, keeping SMAP coverage in CI
+            -cpu "${QEMU_CPU:-max}"
             -cdrom "$ISO"
             -boot d
             -nographic
@@ -140,12 +151,9 @@ setup_x86_config() {
         )
     fi
 
-    # Network: Intel e1000 with user-mode (slirp) networking
-    # Guest can reach host at 10.0.2.2, gateway/DNS at 10.0.2.2/10.0.2.3
-    QEMU_ARGS+=(
-        -netdev user,id=n0
-        -device e1000,netdev=n0
-    )
+    # Network: Intel e1000 on the shared slirp network (tools/qemu-net.sh)
+    qemu_net_args e1000
+    QEMU_ARGS+=("${QEMU_NET[@]}")
 }
 
 setup_arm_config() {
@@ -177,7 +185,8 @@ setup_arm_config() {
     # Base QEMU arguments
     QEMU_ARGS=(
         -machine virt,gic-version=3
-        -cpu cortex-a72
+        # neoverse-n1 (ARMv8.2) has PAN, the arm64 analogue of SMAP
+        -cpu "${QEMU_CPU:-neoverse-n1}"
         -smp 4
         -m 512M
         -kernel "$KERNEL"
@@ -204,12 +213,9 @@ setup_arm_config() {
         )
     fi
 
-    # Network: Intel e1000 with user-mode (slirp) networking
-    # Guest can reach host at 10.0.2.2, gateway/DNS at 10.0.2.2/10.0.2.3
-    QEMU_ARGS+=(
-        -netdev user,id=n0
-        -device e1000,netdev=n0
-    )
+    # Network: Intel e1000 on the shared slirp network (tools/qemu-net.sh)
+    qemu_net_args e1000
+    QEMU_ARGS+=("${QEMU_NET[@]}")
 }
 
 # Check QEMU availability

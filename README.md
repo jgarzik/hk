@@ -1,6 +1,14 @@
 
 # hk - an operating system kernel written in Rust
 
+## Mission
+
+A Linux-compatible kernel for modern, highly multi-core 64-bit machines,
+notably x86-64 and arm64. Full Linux compatibility is the goal; it is reached
+incrementally by implementing an ever-growing subset of Linux in chunks of
+work. System calls aim for 100% coverage; ioctls and /proc are a pragmatic,
+app-driven subset. Core functionality and modern hardware come first.
+
 ## Design goals
 
 ### Modern multi-processing

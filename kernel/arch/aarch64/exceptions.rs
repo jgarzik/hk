@@ -6,6 +6,7 @@ use crate::printkln;
 use core::arch::asm;
 
 use super::Aarch64TrapFrame;
+use crate::signal::{KSigInfo, si_code};
 
 // Exception classes (ESR_EL1[31:26])
 const EC_UNKNOWN: u64 = 0x00;
@@ -157,6 +158,7 @@ extern "C" fn handle_el1_irq(_frame: &mut Aarch64TrapFrame) {
 extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
     let ec = (esr >> 26) & 0x3F;
     let iss = esr & 0x1FFFFFF;
+    set_user_frame(frame);
 
     match ec {
         EC_SVC64 => {
@@ -171,6 +173,7 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
                 percpu.syscall_user_sp = frame.sp;
                 // Save all GPRs for fork/clone (child needs to inherit parent's registers)
                 percpu.syscall_user_regs = frame.x;
+                percpu.syscall_orig_x0 = frame.x[0];
             }
             // Syscall number in x8, arguments in x0-x5, return value in x0
             let result = super::syscall::aarch64_syscall_dispatch(
@@ -239,65 +242,119 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             // If it returns Some(false), COW resolution failed (OOM)
             // In both cases, fall through to SIGSEGV
 
-            // Unhandled fault - send signal to process
-            printkln!(
-                "User data abort at ELR={:#x}, FAR={:#x}, ISS={:#x}",
-                frame.elr,
-                far,
-                iss
-            );
-
-            // Send SIGSEGV or SIGBUS depending on fault type
-            // Access flag fault (DFSC 0x08-0x0B) suggests hardware error -> SIGBUS
-            let is_bus_error = (0x08..=0x0B).contains(&dfsc);
-            let sig = if is_bus_error {
-                crate::signal::SIGBUS
-            } else {
-                crate::signal::SIGSEGV
-            };
-
-            let tid = crate::task::percpu::current_tid();
-            crate::signal::send_signal(tid, sig);
-            // Return to user - signal will be delivered on next syscall exit
+            // Unhandled fault - signal the task
+            user_abort(frame, esr, far, dfsc);
         }
         EC_IABORT_LOWER => {
             let far: u64;
             unsafe {
                 asm!("mrs {}, far_el1", out(reg) far, options(nostack, nomem));
             }
-            printkln!(
-                "User instruction abort at ELR={:#x}, FAR={:#x}, ISS={:#x}",
-                frame.elr,
-                far,
-                iss
-            );
-
-            // Send SIGSEGV for instruction abort
-            let tid = crate::task::percpu::current_tid();
-            crate::signal::send_signal(tid, crate::signal::SIGSEGV);
-            // Return to user - signal will be delivered on next syscall exit
+            user_abort(frame, esr, far, iss & 0x3F);
+        }
+        EC_BRK => {
+            // brk #imm: PC still points at it
+            let info = KSigInfo {
+                code: si_code::TRAP_BRKPT,
+                addr: frame.elr,
+                ..Default::default()
+            };
+            user_fault(frame, crate::signal::SIGTRAP, info);
+        }
+        EC_PC_ALIGN | EC_SP_ALIGN => {
+            let addr = if ec == EC_SP_ALIGN {
+                frame.sp
+            } else {
+                frame.elr
+            };
+            let info = KSigInfo {
+                code: si_code::BUS_ADRALN,
+                addr,
+                ..Default::default()
+            };
+            user_fault(frame, crate::signal::SIGBUS, info);
         }
         _ => {
-            // Unknown/unhandled exception from userland - send signal instead of terminating.
-            // This could be an illegal instruction, alignment fault, or other exception.
+            // Undefined instruction (EC 0, e.g. udf) or any other
+            // unhandled exception from userland: SIGILL at the PC
             printkln!(
                 "Unhandled EL0 sync exception: EC={:#x}, ISS={:#x}, ELR={:#x}",
                 ec,
                 iss,
                 frame.elr
             );
-
-            // Send SIGILL for unknown exceptions (likely illegal instruction)
-            let tid = crate::task::percpu::current_tid();
-            crate::signal::send_signal(tid, crate::signal::SIGILL);
-            // Return to user - signal will be delivered on next syscall exit
+            let info = KSigInfo {
+                code: si_code::ILL_ILLOPC,
+                addr: frame.elr,
+                ..Default::default()
+            };
+            user_fault(frame, crate::signal::SIGILL, info);
         }
+    }
+}
+
+/// Unresolvable data/instruction abort from EL0 at `far` (Linux
+/// do_page_fault/do_alignment_fault): SIGSEGV for translation, access-flag
+/// and permission faults, SIGBUS for alignment and other aborts
+fn user_abort(frame: &mut Aarch64TrapFrame, esr: u64, far: u64, fsc: u64) {
+    use crate::signal::{SIGBUS, SIGSEGV};
+
+    let (sig, code) = match fsc {
+        0x04..=0x0F => (SIGSEGV, crate::signal::segv_code(far)),
+        0x21 => (SIGBUS, si_code::BUS_ADRALN),
+        _ => (SIGBUS, si_code::BUS_ADRERR),
+    };
+    printkln!(
+        "User abort at ELR={:#x}, FAR={:#x}, ESR={:#x} -> signal {}",
+        frame.elr,
+        far,
+        esr,
+        sig
+    );
+    let info = KSigInfo {
+        code,
+        addr: far,
+        trapno: 0,
+        error: esr,
+    };
+    user_fault(frame, sig, info);
+}
+
+/// Deliver a synchronous fault signal (force_sig_fault) for the user
+/// context in `frame`: a handler runs when this exception returns
+fn user_fault(frame: &mut Aarch64TrapFrame, sig: u32, info: KSigInfo) {
+    use super::percpu;
+
+    super::cpu::enable_interrupts();
+    let p = unsafe { percpu::current_cpu_mut() };
+    p.syscall_user_elr = frame.elr;
+    p.syscall_user_spsr = frame.spsr;
+    p.syscall_user_sp = frame.sp;
+    p.syscall_user_regs = frame.x;
+    p.signal_context_modified = false;
+
+    crate::signal::force_sig_fault(sig, info);
+
+    let p = unsafe { percpu::current_cpu_mut() };
+    if core::mem::take(&mut p.signal_context_modified) {
+        frame.elr = p.syscall_user_elr;
+        frame.spsr = p.syscall_user_spsr;
+        frame.sp = p.syscall_user_sp;
+        frame.x = p.syscall_user_regs;
+    }
+}
+
+/// Record the trap frame of an entry from EL0 as the current task's user frame
+fn set_user_frame(frame: &mut Aarch64TrapFrame) {
+    if super::percpu::try_current_cpu().is_some() {
+        unsafe { super::percpu::current_cpu_mut() }.user_frame = frame;
     }
 }
 
 /// Handle IRQ from EL0 (user mode)
 #[unsafe(no_mangle)]
 extern "C" fn handle_el0_irq(frame: &mut Aarch64TrapFrame) {
+    set_user_frame(frame);
     // For now, handle same as EL1 IRQ
     handle_el1_irq(frame);
 }

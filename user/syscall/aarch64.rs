@@ -382,6 +382,8 @@ pub const SYS_SOCKETPAIR: u64 = 199;
 pub const SYS_BIND: u64 = 200;
 pub const SYS_LISTEN: u64 = 201;
 pub const SYS_ACCEPT: u64 = 202;
+pub const SYS_ACCEPT4: u64 = 242;
+pub const SYS_FSTAT: u64 = 80;
 pub const SYS_CONNECT: u64 = 203;
 pub const SYS_GETSOCKNAME: u64 = 204;
 pub const SYS_GETPEERNAME: u64 = 205;
@@ -451,6 +453,9 @@ pub const SYS_FREMOVEXATTR: u64 = 16;
 pub const XATTR_CREATE: i32 = 0x1;
 pub const XATTR_REPLACE: i32 = 0x2;
 pub const SYS_CHROOT: u64 = 51;
+pub const SYS_FACCESSAT: u64 = 48;
+pub const SYS_CHDIR: u64 = 49;
+pub const SYS_FCHDIR: u64 = 50;
 pub const SYS_FCHMODAT2: u64 = 452;
 
 // ============================================================================
@@ -590,6 +595,12 @@ pub fn sys_wait4(pid: i64, wstatus: *mut i32, options: i32, rusage: u64) -> i64 
 #[inline(always)]
 pub fn sys_getdents64(fd: u64, dirp: *mut u8, count: u64) -> i64 {
     unsafe { syscall3!(SYS_GETDENTS64, fd, dirp, count) }
+}
+
+/// pause() - arm64 has no pause syscall; glibc uses ppoll(NULL, 0, NULL, NULL)
+#[inline(always)]
+pub fn sys_pause() -> i64 {
+    sys_ppoll(core::ptr::null_mut(), 0, core::ptr::null(), 0, 0)
 }
 
 /// nanosleep(req, rem)
@@ -1033,6 +1044,22 @@ pub fn sys_umask(mask: u32) -> i64 {
 /// chroot(pathname)
 pub fn sys_chroot(pathname: *const u8) -> i64 {
     unsafe { syscall1!(SYS_CHROOT, pathname) }
+}
+
+/// chdir(pathname)
+pub fn sys_chdir(pathname: *const u8) -> i64 {
+    unsafe { syscall1!(SYS_CHDIR, pathname) }
+}
+
+/// fchdir(fd)
+pub fn sys_fchdir(fd: i32) -> i64 {
+    unsafe { syscall1!(SYS_FCHDIR, fd) }
+}
+
+/// faccessat(dirfd, pathname, mode, flags) (the syscall has no flags
+/// argument: flags other than 0 go through faccessat2 in libc)
+pub fn sys_faccessat(dirfd: i32, pathname: *const u8, mode: i32) -> i64 {
+    unsafe { syscall3!(SYS_FACCESSAT, dirfd, pathname, mode) }
 }
 
 /// fchmodat2(dirfd, pathname, mode, flags)
@@ -1602,6 +1629,11 @@ pub fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
     unsafe { syscall3!(SYS_FCNTL, fd, cmd, arg) }
 }
 
+#[inline(always)]
+pub fn sys_dup3(oldfd: i32, newfd: i32, flags: u32) -> i64 {
+    unsafe { syscall3!(SYS_DUP3, oldfd, newfd, flags) }
+}
+
 /// ioctl(fd, request, arg) - device control operations
 #[inline(always)]
 pub fn sys_ioctl(fd: i32, request: u64, arg: u64) -> i64 {
@@ -1730,6 +1762,18 @@ pub fn sys_listen(fd: i32, backlog: i32) -> i64 {
 #[inline(always)]
 pub fn sys_accept(fd: i32, addr: *mut u8, addrlen: *mut u32) -> i64 {
     unsafe { syscall3!(SYS_ACCEPT, fd, addr, addrlen) }
+}
+
+/// accept4(fd, addr, addrlen, flags)
+#[inline(always)]
+pub fn sys_accept4(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_ACCEPT4, fd, addr, addrlen, flags) }
+}
+
+/// fstat(fd, statbuf)
+#[inline(always)]
+pub fn sys_fstat(fd: i32, statbuf: *mut Stat) -> i64 {
+    unsafe { syscall2!(SYS_FSTAT, fd, statbuf) }
 }
 
 /// shutdown(fd, how) - shut down part of a full-duplex connection

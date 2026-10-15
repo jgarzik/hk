@@ -74,18 +74,18 @@ impl ITimerSpec {
 
     /// Convert it_value to nanoseconds
     pub fn value_to_ns(&self) -> u64 {
-        if self.it_value.tv_sec < 0 {
-            return 0;
-        }
-        self.it_value.tv_sec as u64 * 1_000_000_000 + self.it_value.tv_nsec as u64
+        crate::time::timespec_to_ns(self.it_value.tv_sec, self.it_value.tv_nsec)
     }
 
     /// Convert it_interval to nanoseconds
     pub fn interval_to_ns(&self) -> u64 {
-        if self.it_interval.tv_sec < 0 {
-            return 0;
-        }
-        self.it_interval.tv_sec as u64 * 1_000_000_000 + self.it_interval.tv_nsec as u64
+        crate::time::timespec_to_ns(self.it_interval.tv_sec, self.it_interval.tv_nsec)
+    }
+
+    /// Linux itimerspec64_valid: no negative seconds, nanoseconds < 1e9
+    pub fn is_valid(&self) -> bool {
+        let ok = |t: &LinuxTimespec| t.tv_sec >= 0 && (0..1_000_000_000).contains(&t.tv_nsec);
+        ok(&self.it_value) && ok(&self.it_interval)
     }
 
     /// Create from nanosecond values
@@ -220,8 +220,8 @@ impl Timerfd {
                 value_ns
             }
         } else {
-            // Relative time
-            Self::now_ns() + value_ns
+            // Relative time (saturates: a huge value never fires)
+            crate::time::deadline_after(Self::now_ns(), value_ns)
         };
 
         inner.expires_ns = expires_ns;
@@ -279,8 +279,11 @@ impl Timerfd {
                 return Err(KernelError::WouldBlock);
             }
 
-            // Wait for timer to fire
-            self.wait_queue.wait();
+            // Wait for the timer to fire or be disarmed (a signal ends the wait)
+            self.wait_queue.wait_event_interruptible(|| {
+                let inner = self.inner.lock();
+                inner.ticks > 0 || inner.expires_ns == 0
+            })?;
         }
     }
 

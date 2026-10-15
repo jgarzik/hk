@@ -376,6 +376,27 @@ pub fn current_ticks() -> u64 {
     ts.sec as u64 * 1000 + ts.nsec as u64 / 1_000_000
 }
 
+/// Largest time value in ns (Linux KTIME_MAX); deadlines at or beyond it
+/// never expire
+pub const KTIME_MAX: u64 = i64::MAX as u64;
+
+/// Convert a user (sec, nsec) to ns, clamping to [0, KTIME_MAX] like Linux
+/// timespec64_to_ktime (callers validate ranges/negatives first)
+pub fn timespec_to_ns(sec: i64, nsec: i64) -> u64 {
+    if sec < 0 || nsec < 0 {
+        return 0;
+    }
+    (sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|ns| ns.checked_add(nsec as u64))
+        .map_or(KTIME_MAX, |ns| ns.min(KTIME_MAX))
+}
+
+/// `now + delta` for deadlines, saturating at KTIME_MAX ("never")
+pub fn deadline_after(now_ns: u64, delta_ns: u64) -> u64 {
+    now_ns.saturating_add(delta_ns).min(KTIME_MAX)
+}
+
 /// Get current monotonic time in nanoseconds
 ///
 /// Returns the current monotonic clock time since boot in nanoseconds.

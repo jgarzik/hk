@@ -16,6 +16,7 @@ SECTIONS
 {
     /* Kernel loads at 1GB + 1MB, leaving room for DTB at 0x40000000 */
     . = 0x40100000;
+    __kernel_start = .;
 
     /* Boot code must be first */
     .text.boot ALIGN(4K) : {

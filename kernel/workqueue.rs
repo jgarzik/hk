@@ -25,6 +25,16 @@
 //! let delayed = DelayedWork::new(|| { ... });
 //! SYSTEM_WQ.queue_delayed_work(Arc::new(Mutex::new(delayed)), 500);
 //! ```
+//!
+//! ## Execution and locking
+//!
+//! Each started workqueue has one worker kernel thread (`kworker/<name>`).
+//! The worker moves expired delayed work to the pending queue itself and
+//! sleeps on `wait` with a timeout until the earliest delay expires, so
+//! nothing runs in IRQ context. `inner` is an `IrqSpinlock` (leaf); the
+//! per-item `Mutex` is never held while the work function runs, so work may
+//! re-queue itself. `queue_work`/`queue_delayed_work` are process-context
+//! only (they take the item's Mutex).
 
 extern crate alloc;
 
@@ -119,16 +129,38 @@ impl Work {
             .fetch_and(!work_flags::WORK_PENDING, Ordering::Release);
     }
 
-    /// Execute the work callback
-    fn execute(&mut self) {
+    /// Start running: mark RUNNING, clear PENDING (so the function may
+    /// re-queue the item) and hand out the callback
+    fn begin_run(&mut self) -> Option<WorkFn> {
         self.state
             .fetch_or(work_flags::WORK_RUNNING, Ordering::AcqRel);
-        if let Some(ref mut func) = self.func {
-            func();
-        }
+        self.clear_pending();
+        self.func.take()
+    }
+
+    /// Finish a run started with `begin_run`
+    fn end_run(&mut self, func: Option<WorkFn>) {
+        self.func = func;
         self.state
             .fetch_and(!work_flags::WORK_RUNNING, Ordering::Release);
-        self.clear_pending();
+    }
+
+    /// Run the callback of `work` without holding its lock during the call
+    fn run(work: &Mutex<Work>) {
+        let mut func = work.lock().begin_run();
+        if let Some(f) = func.as_mut() {
+            f();
+        }
+        work.lock().end_run(func);
+    }
+
+    /// Run a delayed work item without holding its lock during the call
+    fn run_delayed(dw: &Mutex<DelayedWork>) {
+        let mut func = dw.lock().work.begin_run();
+        if let Some(f) = func.as_mut() {
+            f();
+        }
+        dw.lock().work.end_run(func);
     }
 }
 
@@ -201,7 +233,6 @@ struct WorkqueueInner {
     /// Pending delayed work items (not sorted - we scan linearly)
     delayed: Vec<Arc<Mutex<DelayedWork>>>,
     /// Worker thread TID (0 = not started)
-    #[allow(dead_code)]
     worker_tid: Tid,
     /// Flag indicating work is available
     has_work: bool,
@@ -220,6 +251,8 @@ pub struct Workqueue {
     inner: IrqSpinlock<WorkqueueInner>,
     /// Wait queue for worker thread
     wait: WaitQueue,
+    /// Bumped whenever delayed work is added or re-timed (worker re-arms)
+    delayed_gen: AtomicU64,
     /// Initialization flag
     initialized: AtomicBool,
 }
@@ -244,6 +277,7 @@ impl Workqueue {
                 has_work: false,
             }),
             wait: WaitQueue::new(),
+            delayed_gen: AtomicU64::new(0),
             initialized: AtomicBool::new(false),
         }
     }
@@ -305,7 +339,9 @@ impl Workqueue {
             inner.delayed.push(work);
         }
 
-        // No need to wake - timer_tick will check and wake when time expires
+        // Let the worker re-arm its timeout for the new deadline
+        self.delayed_gen.fetch_add(1, Ordering::AcqRel);
+        self.wait.wake_one();
 
         true
     }
@@ -318,72 +354,47 @@ impl Workqueue {
         let current_tick = get_ticks();
         let wake_tick = current_tick.saturating_add(delay_ticks);
 
-        let guard = work.lock();
-        if guard.is_timer_pending() || guard.is_pending() {
-            guard.schedule_at(wake_tick);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Check delayed work and move expired items to pending queue
-    ///
-    /// Called from timer_tick() in interrupt context.
-    /// Uses try_lock to avoid blocking in IRQ.
-    pub fn check_delayed_work(&self, current_tick: u64) {
-        // Try to acquire lock without blocking (we're in IRQ context)
-        let mut inner = match self.inner.try_lock() {
-            Some(guard) => guard,
-            None => return, // Lock held, skip this tick
+        let modified = {
+            let guard = work.lock();
+            if guard.is_timer_pending() || guard.is_pending() {
+                guard.schedule_at(wake_tick);
+                true
+            } else {
+                false
+            }
         };
-
-        // Find expired delayed work items
-        let mut expired_indices: Vec<usize> = Vec::new();
-        for (i, dw) in inner.delayed.iter().enumerate() {
-            // Try to lock the delayed work item
-            let dw_guard: spin::MutexGuard<'_, DelayedWork> = match dw.try_lock() {
-                Some(g) => g,
-                None => continue, // Skip if locked
-            };
-            let wake_tick = dw_guard.get_wake_tick();
-            if wake_tick > 0 && wake_tick <= current_tick {
-                expired_indices.push(i);
-            }
-        }
-
-        // Move expired items to pending queue (reverse order to preserve indices)
-        let mut should_wake = false;
-        for i in expired_indices.into_iter().rev() {
-            let dw: Arc<Mutex<DelayedWork>> = inner.delayed.remove(i);
-
-            // Clear the timer, keep pending flag set
-            {
-                let dw_guard: spin::MutexGuard<'_, DelayedWork> = match dw.try_lock() {
-                    Some(g) => g,
-                    None => continue,
-                };
-                dw_guard.wake_tick.store(0, Ordering::Release);
-            }
-
-            // Create a Work wrapper that executes the delayed work
-            let dw_clone = dw.clone();
-            let work = Work::new(move || {
-                let mut guard = dw_clone.lock();
-                guard.work.execute();
-            });
-
-            inner.pending.push_back(Arc::new(Mutex::new(work)));
-            inner.has_work = true;
-            should_wake = true;
-        }
-
-        drop(inner);
-
-        // Wake worker thread if we queued work
-        if should_wake {
+        if modified {
+            self.delayed_gen.fetch_add(1, Ordering::AcqRel);
             self.wait.wake_one();
         }
+        modified
+    }
+
+    /// Move expired delayed work to the pending queue (worker thread)
+    ///
+    /// Returns the earliest remaining wake tick, if any.
+    fn promote_delayed(&self, current_tick: u64) -> Option<u64> {
+        let mut inner = self.inner.lock();
+        let mut next: Option<u64> = None;
+        let mut i = 0;
+        while i < inner.delayed.len() {
+            let wake_tick = inner.delayed[i].lock().get_wake_tick();
+            if wake_tick == 0 || wake_tick <= current_tick {
+                // Expired (or cancelled: run it now, as Linux flush does)
+                let dw = inner.delayed.remove(i);
+                dw.lock().wake_tick.store(0, Ordering::Release);
+                let dw_run = dw.clone();
+                let work = Work::new(move || Work::run_delayed(&dw_run));
+                // The wrapper is fresh: mark it pending like queue_work
+                work.try_set_pending();
+                inner.pending.push_back(Arc::new(Mutex::new(work)));
+                inner.has_work = true;
+            } else {
+                next = Some(next.map_or(wake_tick, |n: u64| n.min(wake_tick)));
+                i += 1;
+            }
+        }
+        next
     }
 
     /// Process pending work items (called by worker thread)
@@ -401,8 +412,7 @@ impl Workqueue {
 
             match work {
                 Some(w) => {
-                    let mut guard = w.lock();
-                    guard.execute();
+                    Work::run(&w);
                     processed += 1;
                 }
                 None => break,
@@ -441,97 +451,77 @@ impl Workqueue {
 /// System workqueue for general deferred work
 pub static SYSTEM_WQ: Workqueue = Workqueue::new("system", 0);
 
-/// List of all workqueues that need timer_tick processing
-static WORKQUEUES: IrqSpinlock<Vec<&'static Workqueue>> = IrqSpinlock::new(Vec::new());
+// ============================================================================
+// Worker threads
+// ============================================================================
 
-/// Register a workqueue for timer_tick processing
-#[allow(dead_code)]
-fn register_workqueue(wq: &'static Workqueue) {
-    let mut wqs = WORKQUEUES.lock();
-    wqs.push(wq);
+impl Workqueue {
+    /// Start this workqueue's worker kernel thread
+    ///
+    /// `cpu`: bind the worker to a CPU, or `None` for any (WQ_UNBOUND-like).
+    pub fn start(&'static self, cpu: Option<u32>) -> Result<(), crate::error::KernelError> {
+        let k = crate::task::kthread::kthread_run(
+            self.name,
+            worker_thread_fn,
+            self as *const Workqueue as usize,
+            cpu,
+        )?;
+        self.inner.lock().worker_tid = k.tid();
+        self.mark_initialized();
+        Ok(())
+    }
 }
 
-// ============================================================================
-// Timer Integration
-// ============================================================================
+/// Worker thread: run pending work, promote expired delayed work, sleep
+/// until new work or the next delay expires
+fn worker_thread_fn(arg: usize) {
+    use crate::task::kthread::kthread_should_stop;
+    use crate::task::percpu::MAX_SCHEDULE_TIMEOUT;
 
-/// Timer tick handler - called from timer ISR
-///
-/// Checks all registered workqueues for expired delayed work and moves
-/// them to the pending queue. This runs in interrupt context and uses
-/// try_lock to avoid blocking.
-pub fn timer_tick() {
-    // Only process if scheduling is enabled
-    if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
-        return;
-    }
-
-    let current_tick = get_ticks();
-
-    // Check system workqueue
-    SYSTEM_WQ.check_delayed_work(current_tick);
-
-    // Check any other registered workqueues
-    if let Some(wqs) = WORKQUEUES.try_lock() {
-        for wq in wqs.iter() {
-            (*wq).check_delayed_work(current_tick);
+    // Safety: `start` takes `&'static self`
+    let wq: &'static Workqueue = unsafe { &*(arg as *const Workqueue) };
+    loop {
+        // Delayed-queue changes after this point re-run the loop
+        let seen_gen = wq.delayed_gen.load(Ordering::Acquire);
+        let next = wq.promote_delayed(get_ticks());
+        wq.process_pending();
+        if kthread_should_stop() {
+            break;
         }
+        let timeout = match next {
+            Some(t) => t.saturating_sub(get_ticks()).max(1),
+            None => MAX_SCHEDULE_TIMEOUT,
+        };
+        wq.wait.wait_event_timeout(
+            || {
+                wq.has_pending()
+                    || wq.delayed_gen.load(Ordering::Acquire) != seen_gen
+                    || kthread_should_stop()
+            },
+            timeout,
+        );
     }
 }
 
-// ============================================================================
-// Initialization
-// ============================================================================
-
-/// Initialize the workqueue subsystem
+/// Initialize the workqueue subsystem: start the system workqueue's worker
 ///
-/// This should be called after the scheduler is enabled but before
-/// any code needs to queue work. It starts worker threads for the
-/// system workqueue.
-///
-/// # Panics
-///
-/// Panics if called before scheduling is enabled.
+/// Call after the schedulers are up (main.rs, before user space).
 pub fn init() {
     if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
         panic!("workqueue::init() called before scheduling enabled");
     }
-
-    // For now, just mark as initialized
-    // Worker thread creation will be added in Phase 2
-    SYSTEM_WQ.mark_initialized();
-
-    crate::printkln!("Workqueue subsystem initialized");
-}
-
-// ============================================================================
-// Worker Thread (Phase 2)
-// ============================================================================
-
-/// Worker thread entry point
-///
-/// This function runs in a kernel thread context and processes work items
-/// from the workqueue. It sleeps when no work is pending.
-#[allow(dead_code)]
-fn worker_thread_fn(wq: &'static Workqueue) -> ! {
-    loop {
-        // Process all pending work
-        wq.process_pending();
-
-        // Wait for more work
-        if !wq.has_pending() {
-            wq.wait.wait();
-        }
+    match SYSTEM_WQ.start(None) {
+        Ok(()) => crate::printkln!("Workqueue subsystem initialized"),
+        Err(e) => crate::printkln!("workqueue: no system worker: {:?}", e),
     }
 }
 
 /// Flush all pending work on a workqueue
 ///
-/// Waits for all currently pending work items to complete.
-/// Note: Does not wait for work queued after this call.
+/// Waits for all currently pending work items to complete (runs them
+/// synchronously in the caller if the queue has no worker).
 #[allow(dead_code)]
 pub fn flush_workqueue(wq: &Workqueue) {
-    // For now, process synchronously since we don't have worker threads yet
     while wq.has_pending() {
         wq.process_pending();
     }

@@ -256,6 +256,30 @@ pub fn get_user<A: UaccessArch, T: Copy + Default>(from: u64) -> UaccessResult<T
     Ok(value)
 }
 
+/// Copy a plain-data value from user space (no alignment requirement,
+/// unlike [`get_user`]); for user structs such as `struct timespec[2]`.
+///
+/// `T` must be valid for any bit pattern (repr(C) integer fields).
+pub fn copy_val_from_user<A: UaccessArch, T: Copy + Default>(from: u64) -> UaccessResult<T> {
+    let mut value = T::default();
+    let size = ::core::mem::size_of::<T>();
+    // SAFETY: the byte view covers exactly `value`; T is plain data.
+    let bytes = unsafe { ::core::slice::from_raw_parts_mut(&mut value as *mut T as *mut u8, size) };
+    copy_from_user::<A>(bytes, from, size)?;
+    Ok(value)
+}
+
+/// Copy a plain-data value to user space (no alignment requirement, unlike
+/// [`put_user`]). `T` must have no implicit padding (it would leak kernel
+/// stack bytes).
+pub fn copy_val_to_user<A: UaccessArch, T: Copy>(to: u64, value: &T) -> UaccessResult<()> {
+    let size = ::core::mem::size_of::<T>();
+    // SAFETY: the byte view covers exactly `*value`.
+    let bytes = unsafe { ::core::slice::from_raw_parts(value as *const T as *const u8, size) };
+    copy_to_user::<A>(to, bytes)?;
+    Ok(())
+}
+
 /// Read a null-terminated string from user space
 ///
 /// Reads up to `max_len` bytes from user space, stopping at the first null byte.
@@ -313,4 +337,36 @@ pub fn strncpy_from_user<A: UaccessArch>(
     }
 
     Ok(result)
+}
+
+/// Copy a NUL-terminated byte string from user space (Linux
+/// `strndup_user` without the UTF-8 assumption of [`strncpy_from_user`]).
+///
+/// Copies in chunks that never cross a page boundary, so a string that
+/// ends just before an unmapped page is read without faulting.
+///
+/// # Returns
+/// * `Ok(bytes)` without the terminator
+/// * `Err(BadAddress)` / `Err(Fault)` for an invalid or unmapped address
+/// * `Err(Overflow)` if no NUL is found within `max_len` bytes
+pub fn strndup_user_bytes<A: UaccessArch>(
+    from: u64,
+    max_len: usize,
+) -> UaccessResult<alloc::vec::Vec<u8>> {
+    const PAGE: u64 = 4096;
+    let mut out = alloc::vec::Vec::new();
+    let mut ptr = from;
+    let mut chunk = [0u8; 256];
+    while out.len() < max_len {
+        let to_page_end = (PAGE - (ptr % PAGE)) as usize;
+        let n = chunk.len().min(to_page_end).min(max_len - out.len());
+        copy_from_user::<A>(&mut chunk[..n], ptr, n)?;
+        if let Some(z) = chunk[..n].iter().position(|&b| b == 0) {
+            out.extend_from_slice(&chunk[..z]);
+            return Ok(out);
+        }
+        out.extend_from_slice(&chunk[..n]);
+        ptr = ptr.checked_add(n as u64).ok_or(UaccessError::Overflow)?;
+    }
+    Err(UaccessError::Overflow)
 }

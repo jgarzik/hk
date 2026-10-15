@@ -51,6 +51,10 @@ pub const PIPE_BUF: usize = 4096;
 /// Number of buffer slots in a pipe (like Linux's PIPE_DEF_BUFFERS)
 pub const PIPE_BUFFERS: usize = 16;
 
+/// Ring slots: one more than the capacity, so a full ring (head one
+/// behind tail) is distinguishable from an empty one (head == tail)
+pub const PIPE_RING: usize = PIPE_BUFFERS + 1;
+
 /// Pipe buffer flags
 pub mod pipe_buf_flags {
     /// Page is in LRU (can be reclaimed)
@@ -149,10 +153,10 @@ impl PipeBuffer {
 /// Public for splice module access.
 pub struct PipeInner {
     /// Ring of buffer slots (like Linux's struct pipe_inode_info.bufs)
-    pub bufs: [PipeBuffer; PIPE_BUFFERS],
-    /// Head index - producer writes here (mod PIPE_BUFFERS)
+    pub bufs: [PipeBuffer; PIPE_RING],
+    /// Head index - producer writes here (mod PIPE_RING)
     pub head: usize,
-    /// Tail index - consumer reads from here (mod PIPE_BUFFERS)
+    /// Tail index - consumer reads from here (mod PIPE_RING)
     pub tail: usize,
     /// Total bytes in all buffers
     pub total_len: usize,
@@ -164,7 +168,7 @@ impl PipeInner {
         // Initialize all buffer slots as empty
         const EMPTY_BUF: PipeBuffer = PipeBuffer::empty();
         Self {
-            bufs: [EMPTY_BUF; PIPE_BUFFERS],
+            bufs: [EMPTY_BUF; PIPE_RING],
             head: 0,
             tail: 0,
             total_len: 0,
@@ -186,7 +190,7 @@ impl PipeInner {
         if self.head >= self.tail {
             self.head - self.tail
         } else {
-            PIPE_BUFFERS - self.tail + self.head
+            PIPE_RING - self.tail + self.head
         }
     }
 
@@ -230,7 +234,7 @@ impl PipeInner {
         } else {
             // Head points to next free slot, so previous slot is (head - 1)
             let prev = if self.head == 0 {
-                PIPE_BUFFERS - 1
+                PIPE_RING - 1
             } else {
                 self.head - 1
             };
@@ -244,7 +248,7 @@ impl PipeInner {
             None
         } else {
             let prev = if self.head == 0 {
-                PIPE_BUFFERS - 1
+                PIPE_RING - 1
             } else {
                 self.head - 1
             };
@@ -256,7 +260,7 @@ impl PipeInner {
     #[allow(dead_code)]
     pub fn advance_tail(&mut self, bytes: usize) {
         self.total_len = self.total_len.saturating_sub(bytes);
-        self.tail = (self.tail + 1) % PIPE_BUFFERS;
+        self.tail = (self.tail + 1) % PIPE_RING;
     }
 
     /// Add a buffer at head position
@@ -266,7 +270,7 @@ impl PipeInner {
         }
         let bytes = buf.len as usize;
         self.bufs[self.head] = buf;
-        self.head = (self.head + 1) % PIPE_BUFFERS;
+        self.head = (self.head + 1) % PIPE_RING;
         self.total_len += bytes;
         Ok(())
     }
@@ -355,7 +359,7 @@ impl PipeInner {
 
             if pipe_buf.is_empty() {
                 // Empty buffer slot, advance and try next
-                self.tail = (self.tail + 1) % PIPE_BUFFERS;
+                self.tail = (self.tail + 1) % PIPE_RING;
                 continue;
             }
 
@@ -377,11 +381,11 @@ impl PipeInner {
                 // If buffer is now empty, release it and advance tail
                 if pipe_buf.len == 0 {
                     pipe_buf.release();
-                    self.tail = (self.tail + 1) % PIPE_BUFFERS;
+                    self.tail = (self.tail + 1) % PIPE_RING;
                 }
             } else {
                 // Shouldn't happen, but handle gracefully
-                self.tail = (self.tail + 1) % PIPE_BUFFERS;
+                self.tail = (self.tail + 1) % PIPE_RING;
             }
         }
 
@@ -555,10 +559,11 @@ impl FileOps for PipeReadFileOps {
                 return Err(KernelError::WouldBlock);
             }
 
-            // Block waiting for data
-            // In a full implementation, we'd use the wait queue properly
-            // For now, just yield and retry
-            crate::task::percpu::yield_now();
+            // Block until data or EOF; a signal ends the wait (-ERESTARTSYS)
+            let pipe = &self.pipe;
+            pipe.wait_queue.wait_event_interruptible(|| {
+                !pipe.inner.lock().is_empty() || !pipe.has_writers()
+            })?;
         }
     }
 
@@ -676,12 +681,17 @@ impl FileOps for PipeWriteFileOps {
         Err(KernelError::InvalidArgument)
     }
 
+    /// Linux pipe_write: a blocking writer stays until everything is
+    /// written; a signal or O_NONBLOCK ends it early, returning the bytes
+    /// written so far if any. Writes of at most PIPE_BUF bytes are never
+    /// split (any free slot takes them whole).
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
         if buf.is_empty() {
             return Ok(0);
         }
 
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
+        let mut done = 0;
 
         loop {
             // Check for EPIPE (no readers)
@@ -690,26 +700,54 @@ impl FileOps for PipeWriteFileOps {
                 use crate::signal::{SIGPIPE, send_signal};
                 use crate::task::percpu::current_tid;
                 let _ = send_signal(current_tid(), SIGPIPE);
-                return Err(KernelError::BrokenPipe);
+                return if done > 0 {
+                    Ok(done)
+                } else {
+                    Err(KernelError::BrokenPipe)
+                };
             }
 
             // Try to write
             {
                 let mut inner = self.pipe.inner.lock();
                 if !inner.is_full() {
-                    let n = inner.write(buf);
+                    let n = inner.write(&buf[done..]);
+                    if n == 0 {
+                        // No page for a free slot
+                        drop(inner);
+                        return if done > 0 {
+                            Ok(done)
+                        } else {
+                            Err(KernelError::OutOfMemory)
+                        };
+                    }
+                    done += n;
                     // Wake readers - there's data available
                     self.pipe.wait_queue.wake_all();
-                    return Ok(n);
                 }
+            }
+            if done == buf.len() {
+                return Ok(done);
             }
 
             if nonblock {
-                return Err(KernelError::WouldBlock);
+                return if done > 0 {
+                    Ok(done)
+                } else {
+                    Err(KernelError::WouldBlock)
+                };
             }
 
-            // Block waiting for space
-            crate::task::percpu::yield_now();
+            // Block until space or no readers; a signal ends the wait
+            let pipe = &self.pipe;
+            let r = pipe
+                .wait_queue
+                .wait_event_interruptible(|| !pipe.inner.lock().is_full() || !pipe.has_readers());
+            match r {
+                Err(_) if done > 0 => return Ok(done),
+                Err(e) => return Err(e),
+                Ok(()) => {}
+            }
         }
     }
 

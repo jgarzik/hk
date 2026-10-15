@@ -6,8 +6,10 @@
 use alloc::sync::Arc;
 
 use crate::arch::Uaccess;
+use crate::fs::path::{create_entry, delete_entry};
 use crate::fs::{
-    Dentry, KernelError, LookupFlags, Path, is_subdir, lock_rename, lookup_path_at, unlock_rename,
+    Dentry, Inode, KernelError, LookupFlags, MAY_WRITE, Path, dac, is_subdir, lock_rename,
+    lookup_one, lookup_path_at, unlock_rename,
 };
 use crate::uaccess::{UaccessArch, copy_to_user, strncpy_from_user};
 
@@ -57,50 +59,17 @@ pub fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> i64 {
         return KernelError::NotFound.sysret();
     }
 
-    // Look up parent directory of the new symlink
-    let (parent_dentry, name) = match lookup_parent_at(newdirfd, &linkpath) {
+    let (parent, name) = match lookup_parent_at(newdirfd, &linkpath) {
         Ok(p) => p,
         Err(e) => return e,
     };
-
-    // Get parent inode
-    let parent_inode = match parent_dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    // Lock parent directory (Linux i_rwsem pattern)
-    parent_inode.inode_lock();
-
-    // Check if name already exists (with lock held)
-    if parent_dentry.lookup_child(&name).is_some() {
-        unsafe { parent_inode.inode_unlock() };
-        return KernelError::AlreadyExists.sysret();
+    match create_entry(&parent, &name, |dir, _| {
+        dir.i_op.symlink(dir, &name, &target)
+    }) {
+        Ok(_) => 0,
+        Err(KernelError::OperationNotSupported) => KernelError::NotPermitted.sysret(),
+        Err(e) => e.sysret(),
     }
-
-    // Create the symlink
-    let new_inode = match parent_inode.i_op.symlink(&parent_inode, &name, &target) {
-        Ok(i) => i,
-        Err(e) => {
-            unsafe { parent_inode.inode_unlock() };
-            return match e {
-                KernelError::AlreadyExists => KernelError::AlreadyExists.sysret(),
-                KernelError::PermissionDenied => KernelError::PermissionDenied.sysret(),
-                KernelError::OperationNotSupported => KernelError::NotPermitted.sysret(),
-                _ => KernelError::InvalidArgument.sysret(),
-            };
-        }
-    };
-
-    // Create dentry for the symlink
-    let new_dentry = Arc::new(Dentry::new(name, Some(new_inode), parent_dentry.sb.clone()));
-    new_dentry.set_parent(&parent_dentry);
-    parent_dentry.add_child(new_dentry);
-
-    // Unlock parent directory
-    unsafe { parent_inode.inode_unlock() };
-
-    0
 }
 
 // =============================================================================
@@ -171,10 +140,7 @@ pub fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i
 
     let dentry = match lookup_path_at(start, &path, flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(KernelError::TooManySymlinks) => return KernelError::TooManySymlinks.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
     };
 
     // Get inode
@@ -280,73 +246,33 @@ pub fn sys_linkat(
 
     let old_dentry = match lookup_path_at(old_start, &oldpath, lookup_flags) {
         Ok(d) => d,
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::NotDirectory) => return KernelError::NotDirectory.sysret(),
-        Err(KernelError::TooManySymlinks) => return KernelError::TooManySymlinks.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        Err(e) => return e.sysret(),
+    };
+    let Some(old_inode) = old_dentry.get_inode() else {
+        return KernelError::NotFound.sysret();
     };
 
-    let old_inode = match old_dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    // Look up parent directory of the new link
-    let (parent_dentry, name) = match lookup_parent_at(newdirfd, &newpath) {
+    let (parent, name) = match lookup_parent_at(newdirfd, &newpath) {
         Ok(p) => p,
         Err(e) => return e,
     };
-
-    // Check same filesystem
-    let old_sb = old_dentry.superblock();
-    let new_sb = parent_dentry.superblock();
-    if old_sb.map(|s| s.dev_id) != new_sb.map(|s| s.dev_id) {
+    if old_dentry.superblock().map(|s| s.dev_id) != parent.superblock().map(|s| s.dev_id) {
         return KernelError::CrossDevice.sysret();
     }
 
-    // Get parent inode
-    let parent_inode = match parent_dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    // Lock parent directory (Linux i_rwsem pattern)
-    parent_inode.inode_lock();
-
-    // Check if name already exists (with lock held)
-    if parent_dentry.lookup_child(&name).is_some() {
-        unsafe { parent_inode.inode_unlock() };
-        return KernelError::AlreadyExists.sysret();
-    }
-
-    // Cannot hard link directories; checked after EXDEV/EEXIST like Linux
-    // (fs/namei.c: do_linkat mount check, then vfs_link)
-    if old_inode.mode().is_dir() {
-        unsafe { parent_inode.inode_unlock() };
-        return KernelError::NotPermitted.sysret();
-    }
-
-    // Create the hard link
-    let result = parent_inode.i_op.link(&parent_inode, &name, &old_inode);
-
-    match result {
-        Ok(()) => {
-            // Create dentry for the new link
-            let new_dentry = Arc::new(Dentry::new(name, Some(old_inode), parent_dentry.sb.clone()));
-            new_dentry.set_parent(&parent_dentry);
-            parent_dentry.add_child(new_dentry);
-            unsafe { parent_inode.inode_unlock() };
-            0
+    // vfs_link: may_create on the new parent, then no directories
+    // (fs.protected_hardlinks is not implemented: its kernel default is 0)
+    let r = create_entry(&parent, &name, |dir, _| {
+        if old_inode.mode().is_dir() {
+            return Err(KernelError::NotPermitted);
         }
-        Err(e) => {
-            unsafe { parent_inode.inode_unlock() };
-            match e {
-                KernelError::AlreadyExists => KernelError::AlreadyExists.sysret(),
-                KernelError::PermissionDenied => KernelError::PermissionDenied.sysret(),
-                KernelError::OperationNotSupported => KernelError::NotPermitted.sysret(),
-                _ => KernelError::InvalidArgument.sysret(),
-            }
-        }
+        dir.i_op.link(dir, &name, &old_inode)?;
+        Ok(old_inode.clone())
+    });
+    match r {
+        Ok(_) => 0,
+        Err(KernelError::OperationNotSupported) => KernelError::NotPermitted.sysret(),
+        Err(e) => e.sysret(),
     }
 }
 
@@ -393,121 +319,16 @@ pub fn sys_unlinkat(dirfd: i32, pathname_ptr: u64, flags: i32) -> i64 {
         return KernelError::NotFound.sysret();
     }
 
-    // If AT_REMOVEDIR is set, perform rmdir instead
     if flags & AT_REMOVEDIR != 0 {
-        // For AT_REMOVEDIR, delegate to rmdir-like logic
-        return sys_unlinkat_rmdir(dirfd, &path);
+        return super::dir::do_rmdir(dirfd, &path);
     }
-
-    // Look up parent directory and name
-    let (parent_dentry, name) = match lookup_parent_at(dirfd, &path) {
+    let (parent, name) = match lookup_parent_at(dirfd, &path) {
         Ok(p) => p,
         Err(e) => return e,
     };
-
-    // Get parent inode
-    let parent_inode = match parent_dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    // Lock parent directory (Linux i_rwsem pattern)
-    parent_inode.inode_lock();
-
-    // Check that target exists (with lock held)
-    let target_dentry = match parent_dentry.lookup_child(&name) {
-        Some(d) => d,
-        None => {
-            unsafe { parent_inode.inode_unlock() };
-            return KernelError::NotFound.sysret();
-        }
-    };
-
-    // Verify it's NOT a directory (use rmdir for directories)
-    if let Some(target_inode) = target_dentry.get_inode()
-        && target_inode.mode().is_dir()
-    {
-        unsafe { parent_inode.inode_unlock() };
-        return KernelError::IsDirectory.sysret();
-    }
-
-    // Call unlink on the parent
-    let result = parent_inode.i_op.unlink(&parent_inode, &name);
-
-    match result {
-        Ok(()) => {
-            // Remove dentry from parent's children
-            parent_dentry.remove_child(&name);
-            unsafe { parent_inode.inode_unlock() };
-            0
-        }
-        Err(e) => {
-            unsafe { parent_inode.inode_unlock() };
-            match e {
-                KernelError::NotFound => KernelError::NotFound.sysret(),
-                KernelError::PermissionDenied => KernelError::PermissionDenied.sysret(),
-                KernelError::IsDirectory => KernelError::IsDirectory.sysret(),
-                _ => KernelError::InvalidArgument.sysret(),
-            }
-        }
-    }
-}
-
-/// Helper for unlinkat with AT_REMOVEDIR flag
-fn sys_unlinkat_rmdir(dirfd: i32, path: &str) -> i64 {
-    // Look up parent directory and name
-    let (parent_dentry, name) = match lookup_parent_at(dirfd, path) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-
-    // Get parent inode
-    let parent_inode = match parent_dentry.get_inode() {
-        Some(i) => i,
-        None => return KernelError::NotFound.sysret(),
-    };
-
-    // Lock parent directory (Linux i_rwsem pattern)
-    parent_inode.inode_lock();
-
-    // Check that target exists (with lock held)
-    let target_dentry = match parent_dentry.lookup_child(&name) {
-        Some(d) => d,
-        None => {
-            unsafe { parent_inode.inode_unlock() };
-            return KernelError::NotFound.sysret();
-        }
-    };
-
-    // Verify it's a directory
-    if let Some(target_inode) = target_dentry.get_inode()
-        && !target_inode.mode().is_dir()
-    {
-        unsafe { parent_inode.inode_unlock() };
-        return KernelError::NotDirectory.sysret();
-    }
-
-    // Call rmdir on the parent
-    let result = parent_inode.i_op.rmdir(&parent_inode, &name);
-
-    match result {
-        Ok(()) => {
-            // Remove dentry from parent's children
-            parent_dentry.remove_child(&name);
-            unsafe { parent_inode.inode_unlock() };
-            0
-        }
-        Err(e) => {
-            unsafe { parent_inode.inode_unlock() };
-            match e {
-                KernelError::NotFound => KernelError::NotFound.sysret(),
-                KernelError::NotDirectory => KernelError::NotDirectory.sysret(),
-                KernelError::DirectoryNotEmpty => KernelError::DirectoryNotEmpty.sysret(),
-                KernelError::PermissionDenied => KernelError::PermissionDenied.sysret(),
-                KernelError::Busy => -16, // EBUSY
-                _ => KernelError::InvalidArgument.sysret(),
-            }
-        }
+    match delete_entry(&parent, &name, false) {
+        Ok(()) => 0,
+        Err(e) => e.sysret(),
     }
 }
 
@@ -618,70 +439,74 @@ pub fn sys_renameat2(
         None => return KernelError::NotFound.sysret(),
     };
 
-    // Lock directories for rename (Linux lock_rename pattern)
-    // This ensures proper lock ordering to prevent deadlocks:
-    // - If one directory is ancestor of other: lock ancestor first
-    // - Otherwise: lock by address order
+    // Write access, then lock directories (Linux do_renameat2)
+    let _w = match super::dac::want_write(&old_parent_inode) {
+        Ok(w) => w,
+        Err(e) => return e.sysret(),
+    };
     let _trap = lock_rename(&old_parent_dentry, &new_parent_dentry);
-
-    // Look up the source dentry for cycle detection and same-file check
-    let old_dentry = old_parent_dentry.lookup_child(&old_name);
-
-    // Look up target dentry for same-file check
-    let new_dentry = new_parent_dentry.lookup_child(&new_name);
-
-    // Same-inode check: if source and target are the same file, return success
-    // (Linux vfs_rename: "if (source == target) return 0;")
-    if let Some(ref src_dentry) = old_dentry
-        && let Some(ref dst_dentry) = new_dentry
-        && let (Some(src_inode), Some(dst_inode)) = (src_dentry.get_inode(), dst_dentry.get_inode())
-        && src_inode.ino == dst_inode.ino
-    {
-        unlock_rename(&old_parent_dentry, &new_parent_dentry);
-        return 0;
-    }
-
-    // Cycle detection: prevent moving a directory into its own subtree
-    // This would create an unreachable directory loop
-    if let Some(ref src_dentry) = old_dentry
-        && let Some(src_inode) = src_dentry.get_inode()
-        && src_inode.mode().is_dir()
-        // Check if new_parent is a subdirectory of source
-        // If so, this rename would create a cycle
-        && is_subdir(&new_parent_dentry, src_dentry)
-    {
-        unlock_rename(&old_parent_dentry, &new_parent_dentry);
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Perform the rename via inode ops
-    let result = old_parent_inode.i_op.rename(
-        &old_parent_inode,
-        &old_name,
-        &new_parent_inode,
-        &new_name,
+    let r = rename_locked(
+        (&old_parent_dentry, &old_parent_inode, &old_name),
+        (&new_parent_dentry, &new_parent_inode, &new_name),
         flags,
     );
-
-    // Unlock directories
     unlock_rename(&old_parent_dentry, &new_parent_dentry);
+    match r {
+        Ok(()) => 0,
+        Err(KernelError::OperationNotSupported) => KernelError::InvalidArgument.sysret(),
+        Err(e) => e.sysret(),
+    }
+}
 
-    // Handle result
-    match result {
-        Ok(()) => {}
-        Err(KernelError::NotFound) => return KernelError::NotFound.sysret(),
-        Err(KernelError::AlreadyExists) => return KernelError::AlreadyExists.sysret(),
-        Err(KernelError::DirectoryNotEmpty) => return KernelError::DirectoryNotEmpty.sysret(),
-        Err(KernelError::OperationNotSupported) => return KernelError::InvalidArgument.sysret(),
-        Err(KernelError::InvalidArgument) => return KernelError::InvalidArgument.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+/// Parent dentry, parent inode and name of one side of a rename
+type Side<'a> = (&'a Arc<Dentry>, &'a Arc<Inode>, &'a str);
+
+/// The rename itself with both parents locked (Linux do_renameat2 trap
+/// check + vfs_rename): may_delete of the source, may_create or
+/// may_delete of the target, and write permission on a directory that
+/// changes parent (its ".." is rewritten)
+fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
+    const RENAME_EXCHANGE: u32 = 2;
+    let (op, odir, oname) = old;
+    let (np, ndir, nname) = new;
+    let src = lookup_one(op, oname)?;
+    let sinode = src.get_inode().ok_or(KernelError::NotFound)?;
+    let dinode = lookup_one(np, nname).ok().and_then(|d| d.get_inode());
+    let is_dir = sinode.mode().is_dir();
+
+    // Moving a directory into its own subtree
+    if is_dir && is_subdir(np, &src) {
+        return Err(KernelError::InvalidArgument);
+    }
+    // Same inode: nothing to do (vfs_rename "source == target")
+    if dinode.as_ref().is_some_and(|d| d.ino == sinode.ino) {
+        return Ok(());
     }
 
-    // Update dentry cache:
-    // Remove old dentry from old parent - new lookup will re-create it
-    // For cross-directory renames or name changes, also remove target dentry
-    old_parent_dentry.remove_child(&old_name);
-    new_parent_dentry.remove_child(&new_name);
+    let c = dac::cred();
+    dac::may_delete(&c, odir, &sinode, is_dir)?;
+    let exchange = flags & RENAME_EXCHANGE != 0;
+    match &dinode {
+        None => dac::may_create(&c, ndir)?,
+        Some(d) => dac::may_delete(
+            &c,
+            ndir,
+            d,
+            if exchange { d.mode().is_dir() } else { is_dir },
+        )?,
+    }
+    if !Arc::ptr_eq(odir, ndir) {
+        if is_dir {
+            dac::permission_as(&c, &sinode, MAY_WRITE)?;
+        }
+        if let Some(d) = dinode.as_ref().filter(|d| exchange && d.mode().is_dir()) {
+            dac::permission_as(&c, d, MAY_WRITE)?;
+        }
+    }
 
-    0
+    odir.i_op.rename(odir, oname, ndir, nname, flags)?;
+    // New lookups re-create both dentries
+    op.remove_child(oname);
+    np.remove_child(nname);
+    Ok(())
 }

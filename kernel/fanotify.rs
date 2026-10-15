@@ -507,8 +507,9 @@ impl Fanotify {
                 return Err(KernelError::WouldBlock);
             }
 
-            // Wait for events
-            self.wait_queue.wait();
+            // Wait for events (a signal ends the wait)
+            self.wait_queue
+                .wait_event_interruptible(|| !self.inner.lock().events.is_empty())?;
         }
     }
 
@@ -837,6 +838,13 @@ pub fn sys_fanotify_mark(fd: i32, mark_flags: u32, mask: u64, dirfd: i32, pathna
             && !inode.mode().is_dir()
         {
             return -20; // ENOTDIR
+        }
+
+        // fanotify_find_path: the marked object must be readable
+        if let Some(inode) = dentry.get_inode()
+            && let Err(e) = crate::fs::dac::permission(&inode, crate::fs::MAY_READ)
+        {
+            return e.sysret();
         }
 
         // Get target ID based on mark type

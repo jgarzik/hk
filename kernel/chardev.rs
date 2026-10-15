@@ -53,6 +53,14 @@ impl DevId {
         ((self.major as u32) << 20) | (self.minor as u32 & 0xFFFFF)
     }
 
+    /// Decode a user dev_t (Linux new_decode_dev / huge_decode_dev)
+    pub const fn from_user(dev: u64) -> Self {
+        Self {
+            major: (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u16,
+            minor: ((dev & 0xff) | ((dev >> 12) & !0xff)) as u16,
+        }
+    }
+
     /// Decode from a single u32
     pub const fn decode(dev: u32) -> Self {
         Self {
@@ -117,6 +125,8 @@ pub enum DeviceError {
     NotFound,
     /// No such ioctl
     NotTty,
+    /// Bad user pointer (EFAULT)
+    Fault,
 }
 
 /// Character device trait

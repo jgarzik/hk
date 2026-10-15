@@ -45,7 +45,9 @@ use crate::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable};
 use crate::rlimit;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
-use crate::uaccess::{UaccessArch, get_user, put_user, strncpy_from_user};
+use crate::uaccess::{
+    UaccessArch, copy_from_user, copy_to_user, get_user, put_user, strncpy_from_user,
+};
 use crate::waitqueue::WaitQueue;
 
 // ============================================================================
@@ -251,7 +253,13 @@ impl MqQueue {
         (*self.flags.lock() & (O_NONBLOCK as i64)) != 0
     }
 
-    fn send(&self, data: &[u8], priority: u32, nonblock: bool) -> Result<(), i64> {
+    fn send(
+        &self,
+        data: &[u8],
+        priority: u32,
+        nonblock: bool,
+        deadline: Option<u64>,
+    ) -> Result<(), i64> {
         loop {
             {
                 let mut msgs = self.messages.lock();
@@ -278,7 +286,7 @@ impl MqQueue {
                     }
 
                     // Wake up receivers
-                    self.waitq_recv.wake_one();
+                    self.waitq_recv.wake_all();
                     return Ok(());
                 }
             }
@@ -287,12 +295,25 @@ impl MqQueue {
                 return Err(KernelError::WouldBlock.sysret());
             }
 
-            // Wait for space
-            self.waitq_send.wait();
+            // Wait for space (Linux wq_sleep: ERESTARTSYS, ETIMEDOUT)
+            let room = || (self.messages.lock().len() as i64) < self.maxmsg;
+            match self
+                .waitq_send
+                .wait_event_interruptible_deadline(room, deadline)
+            {
+                Ok(true) => {}
+                Ok(false) => return Err(KernelError::TimedOut.sysret()),
+                Err(e) => return Err(e.sysret()),
+            }
         }
     }
 
-    fn receive(&self, buf: &mut [u8], nonblock: bool) -> Result<(usize, u32), i64> {
+    fn receive(
+        &self,
+        buf: &mut [u8],
+        nonblock: bool,
+        deadline: Option<u64>,
+    ) -> Result<(usize, u32), i64> {
         loop {
             {
                 let mut msgs = self.messages.lock();
@@ -305,7 +326,7 @@ impl MqQueue {
                     drop(msgs);
 
                     // Wake up senders
-                    self.waitq_send.wake_one();
+                    self.waitq_send.wake_all();
                     return Ok((len, msg.priority));
                 }
             }
@@ -315,7 +336,15 @@ impl MqQueue {
             }
 
             // Wait for messages
-            self.waitq_recv.wait();
+            let ready = || !self.messages.lock().is_empty();
+            match self
+                .waitq_recv
+                .wait_event_interruptible_deadline(ready, deadline)
+            {
+                Ok(true) => {}
+                Ok(false) => return Err(KernelError::TimedOut.sysret()),
+                Err(e) => return Err(e.sysret()),
+            }
         }
     }
 
@@ -368,7 +397,7 @@ impl FileOps for MqFileOps {
             return Err(KernelError::PermissionDenied);
         }
 
-        match self.queue.receive(buf, false) {
+        match self.queue.receive(buf, false, None) {
             Ok((len, _prio)) => Ok(len),
             Err(_) => Err(KernelError::Io),
         }
@@ -380,13 +409,17 @@ impl FileOps for MqFileOps {
         }
 
         // Write with priority 0 (default)
-        match self.queue.send(buf, 0, false) {
+        match self.queue.send(buf, 0, false, None) {
             Ok(()) => Ok(buf.len()),
             Err(_) => Err(KernelError::Io),
         }
     }
 
-    fn poll(&self, _file: &File, _table: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, _file: &File, table: Option<&mut PollTable>) -> u16 {
+        if let Some(pt) = table {
+            pt.poll_wait(&self.queue.waitq_recv);
+            pt.poll_wait(&self.queue.waitq_send);
+        }
         let msgs = self.queue.messages.lock();
         let mut events = 0u16;
 
@@ -614,13 +647,31 @@ pub fn sys_mq_unlink(name_ptr: u64) -> i64 {
     }
 }
 
+/// CLOCK_MONOTONIC deadline for an absolute CLOCK_REALTIME timeout
+/// (`struct timespec *`, 0 = none; EINVAL for a bad tv_nsec, EFAULT)
+fn mq_deadline(abs: u64) -> Result<Option<u64>, KernelError> {
+    if abs == 0 {
+        return Ok(None);
+    }
+    let sec = get_user::<Uaccess, i64>(abs).map_err(|_| KernelError::BadAddress)?;
+    let nsec = get_user::<Uaccess, i64>(abs + 8).map_err(|_| KernelError::BadAddress)?;
+    if !(0..1_000_000_000).contains(&nsec) || sec < 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let want = (sec as i128) * 1_000_000_000 + nsec as i128;
+    let now = crate::time::TIMEKEEPER.current_time();
+    let now = now.sec as i128 * 1_000_000_000 + now.nsec as i128;
+    let rel = (want - now).clamp(0, u64::MAX as i128) as u64;
+    Ok(Some(crate::time::monotonic_ns().saturating_add(rel)))
+}
+
 /// mq_timedsend - send a message to a queue
 pub fn sys_mq_timedsend(
     mqdes: i32,
     msg_ptr: u64,
     msg_len: usize,
     msg_prio: u32,
-    _abs_timeout: u64,
+    abs_timeout: u64,
 ) -> i64 {
     // Validate priority
     if msg_prio >= MQ_PRIO_MAX {
@@ -660,17 +711,17 @@ pub fn sys_mq_timedsend(
         if !Uaccess::access_ok(msg_ptr, msg_len) {
             return KernelError::BadAddress.sysret();
         }
-        unsafe {
-            Uaccess::user_access_begin();
-            core::ptr::copy_nonoverlapping(msg_ptr as *const u8, msg_buf.as_mut_ptr(), msg_len);
-            Uaccess::user_access_end();
+        if copy_from_user::<Uaccess>(&mut msg_buf, msg_ptr, msg_len).is_err() {
+            return KernelError::BadAddress.sysret();
         }
     }
 
-    // Send message
-    // TODO: implement timeout
+    let deadline = match mq_deadline(abs_timeout) {
+        Ok(d) => d,
+        Err(e) => return e.sysret(),
+    };
     let nonblock = mq_ops.queue.is_nonblocking();
-    match mq_ops.queue.send(&msg_buf, msg_prio, nonblock) {
+    match mq_ops.queue.send(&msg_buf, msg_prio, nonblock, deadline) {
         Ok(()) => 0,
         Err(e) => e,
     }
@@ -682,7 +733,7 @@ pub fn sys_mq_timedreceive(
     msg_ptr: u64,
     msg_len: usize,
     prio_ptr: u64,
-    _abs_timeout: u64,
+    abs_timeout: u64,
 ) -> i64 {
     // Get file from fd
     let fd_table = match get_task_fd(current_tid()) {
@@ -711,12 +762,15 @@ pub fn sys_mq_timedreceive(
         return KernelError::MessageTooLong.sysret();
     }
 
-    // Receive message
-    // TODO: implement timeout
+    let deadline = match mq_deadline(abs_timeout) {
+        Ok(d) => d,
+        Err(e) => return e.sysret(),
+    };
     let nonblock = mq_ops.queue.is_nonblocking();
-    let mut buf = vec![0u8; msg_len];
+    // Messages are at most msgsize bytes: never allocate the user's length
+    let mut buf = vec![0u8; msg_len.min(mq_ops.queue.msgsize as usize)];
 
-    let (len, prio) = match mq_ops.queue.receive(&mut buf, nonblock) {
+    let (len, prio) = match mq_ops.queue.receive(&mut buf, nonblock, deadline) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -726,10 +780,8 @@ pub fn sys_mq_timedreceive(
         if !Uaccess::access_ok(msg_ptr, len) {
             return KernelError::BadAddress.sysret();
         }
-        unsafe {
-            Uaccess::user_access_begin();
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), msg_ptr as *mut u8, len);
-            Uaccess::user_access_end();
+        if copy_to_user::<Uaccess>(msg_ptr, &buf[..len]).is_err() {
+            return KernelError::BadAddress.sysret();
         }
     }
 

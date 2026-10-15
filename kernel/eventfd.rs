@@ -138,8 +138,9 @@ impl Eventfd {
                 return Err(KernelError::WouldBlock);
             }
 
-            // Wait for someone to write
-            self.wait_queue.wait();
+            // Wait for someone to write (a signal ends the wait)
+            self.wait_queue
+                .wait_event_interruptible(|| self.inner.lock().count > 0)?;
         }
     }
 
@@ -172,8 +173,9 @@ impl Eventfd {
                 return Err(KernelError::WouldBlock);
             }
 
-            // Wait for someone to read
-            self.wait_queue.wait();
+            // Wait for someone to read (a signal ends the wait)
+            self.wait_queue
+                .wait_event_interruptible(|| ULLONG_MAX - self.inner.lock().count > value)?;
         }
     }
 

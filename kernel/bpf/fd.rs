@@ -140,7 +140,7 @@ pub fn create_bpf_map_fd(map: Arc<BpfMap>) -> Result<i32, KernelError> {
 
     match table.alloc_with_flags(file, 0, get_nofile_limit()) {
         Ok(fd) => Ok(fd),
-        Err(e) => Err(KernelError::from_errno(e)),
+        Err(e) => Err(KernelError::from_errno(e).unwrap_or(KernelError::Io)),
     }
 }
 
@@ -161,7 +161,7 @@ pub fn create_bpf_prog_fd(prog: Arc<BpfProg>, prog_type: u32) -> Result<i32, Ker
 
     match table.alloc_with_flags(file, 0, get_nofile_limit()) {
         Ok(fd) => Ok(fd),
-        Err(e) => Err(KernelError::from_errno(e)),
+        Err(e) => Err(KernelError::from_errno(e).unwrap_or(KernelError::Io)),
     }
 }
 

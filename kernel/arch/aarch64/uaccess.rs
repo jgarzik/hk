@@ -4,14 +4,76 @@
 //! protection. On ARMv8.1+, PAN prevents kernel from accidentally accessing
 //! user memory without explicit permission.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::uaccess::UaccessArch;
+
+/// PAN is implemented and enabled (set once by the boot CPU; every CPU of
+/// a system has the same feature set)
+static PAN_ENABLED: AtomicBool = AtomicBool::new(false);
+
+// `msr pan, #imm` (ARMv8.1 FEAT_PAN) as raw encodings, so the kernel
+// assembles for a v8.0 baseline: MSR (immediate), op1=0, op2=4, CRm=imm
+macro_rules! msr_pan_0 {
+    () => {
+        ".inst 0xd500409f"
+    };
+}
+macro_rules! msr_pan_1 {
+    () => {
+        ".inst 0xd500419f"
+    };
+}
+
+/// Enable PAN (Privileged Access Never) on this CPU if implemented
+/// (Linux: cpu_enable_pan)
+///
+/// With PSTATE.PAN set, EL1 loads/stores to EL0-accessible pages fault,
+/// so only the uaccess helpers (which clear PAN around the copy) can touch
+/// user memory. SCTLR_EL1.SPAN=0 makes every exception entry to EL1 set
+/// PAN, and ERET restores the interrupted context's PAN from SPSR.
+/// Call on each CPU before it runs user tasks.
+pub fn pan_init_cpu() {
+    let mmfr1: u64;
+    // SAFETY: reading an ID register has no side effects
+    unsafe {
+        core::arch::asm!("mrs {}, id_aa64mmfr1_el1", out(reg) mmfr1, options(nomem, nostack));
+    }
+    // ID_AA64MMFR1_EL1.PAN, bits [23:20]: 0 = not implemented
+    if (mmfr1 >> 20) & 0xf == 0 {
+        return;
+    }
+    // SAFETY: clearing SCTLR_EL1.SPAN (bit 23) and setting PSTATE.PAN only
+    // restrict EL1 access to EL0-accessible pages; kernel mappings are
+    // EL1-only and user accesses go through hk_copy_user with PAN cleared.
+    unsafe {
+        core::arch::asm!(
+            "mrs {t}, sctlr_el1",
+            "bic {t}, {t}, #(1 << 23)",
+            "msr sctlr_el1, {t}",
+            "isb",
+            msr_pan_1!(),
+            t = out(reg) _,
+            options(nostack),
+        );
+    }
+    PAN_ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// Whether PAN is enabled (for diagnostics)
+pub fn pan_enabled() -> bool {
+    PAN_ENABLED.load(Ordering::Relaxed)
+}
 
 /// AArch64 user access implementation
 pub struct Aarch64Uaccess;
 
 impl UaccessArch for Aarch64Uaccess {
-    /// Start of valid user address space
-    const USER_START: u64 = 0x0000_0000_0000_0000;
+    /// Start of valid user address space. The low 2 GB are the kernel's
+    /// identity map (device + kernel RAM, EL1-only) and are present in
+    /// every user TTBR0, so user pointers below this would reach kernel
+    /// memory; user mappings always start at 2 GB (USER_PIE_BASE, mmap).
+    const USER_START: u64 = 0x0000_0000_8000_0000;
     /// End of valid user address space (48-bit VA with lower half for user)
     const USER_END: u64 = 0x0001_0000_0000_0000;
 
@@ -27,7 +89,7 @@ impl UaccessArch for Aarch64Uaccess {
         };
 
         // Must be entirely within user space
-        end <= Self::USER_END
+        addr >= Self::USER_START && end <= Self::USER_END
     }
 
     /// Begin user access (disable PAN if available)
@@ -46,10 +108,14 @@ impl UaccessArch for Aarch64Uaccess {
             core::arch::asm!("dsb ish", options(nostack, preserves_flags));
         }
 
-        // PAN (Privileged Access Never) is an ARMv8.1+ feature.
-        // For ARMv8.0 CPUs like cortex-a57, this is a no-op.
-        // A full implementation would check ID_AA64MMFR1_EL1.PAN and use
-        // "msr pan, #0" via .inst directive if supported.
+        // Clear PSTATE.PAN so EL1 may access user pages (ARMv8.1+; no-op
+        // on CPUs without PAN, e.g. cortex-a72)
+        if PAN_ENABLED.load(Ordering::Relaxed) {
+            // SAFETY: re-set by user_access_end()
+            unsafe {
+                core::arch::asm!(msr_pan_0!(), options(nostack, preserves_flags));
+            }
+        }
     }
 
     /// Fault-tolerant copy; returns the number of bytes NOT copied
@@ -72,8 +138,13 @@ impl UaccessArch for Aarch64Uaccess {
             core::arch::asm!("dsb ish", options(nostack, preserves_flags));
         }
 
-        // PAN (Privileged Access Never) is an ARMv8.1+ feature.
-        // For ARMv8.0 CPUs like cortex-a57, this is a no-op.
+        // Set PSTATE.PAN again: user pages are off limits to EL1
+        if PAN_ENABLED.load(Ordering::Relaxed) {
+            // SAFETY: setting PAN only restricts EL1 accesses
+            unsafe {
+                core::arch::asm!(msr_pan_1!(), options(nostack, preserves_flags));
+            }
+        }
     }
 }
 

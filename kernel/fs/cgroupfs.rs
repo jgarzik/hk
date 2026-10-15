@@ -27,7 +27,7 @@ use spin::RwLock;
 
 use super::KernelError;
 use super::dentry::Dentry;
-use super::file::{DirEntry, File, FileOps};
+use super::file::{DirContext, DirEntry, File, FileOps};
 use super::inode::{AsAny, FileType, Inode, InodeData, InodeMode, InodeOps, Timespec};
 use super::superblock::{FileSystemType, StatFs, SuperBlock, SuperOps};
 
@@ -659,11 +659,7 @@ impl FileOps for CgroupfsFileOps {
         }
     }
 
-    fn readdir(
-        &self,
-        file: &File,
-        callback: &mut dyn FnMut(DirEntry) -> bool,
-    ) -> Result<(), KernelError> {
+    fn readdir(&self, file: &File, ctx: &mut DirContext) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let private = inode.get_private().ok_or(KernelError::Io)?;
         let wrapper = private
@@ -678,7 +674,7 @@ impl FileOps for CgroupfsFileOps {
                 let cg = cgroup.upgrade().ok_or(KernelError::NotFound)?;
 
                 // Emit "."
-                if !callback(DirEntry {
+                if !ctx.emit(DirEntry {
                     ino: cg.ino,
                     file_type: FileType::Directory,
                     name: Vec::from(b".".as_slice()),
@@ -688,7 +684,7 @@ impl FileOps for CgroupfsFileOps {
 
                 // Emit ".."
                 let parent_ino = cg.parent().map(|p| p.ino).unwrap_or(cg.ino);
-                if !callback(DirEntry {
+                if !ctx.emit(DirEntry {
                     ino: parent_ino,
                     file_type: FileType::Directory,
                     name: Vec::from(b"..".as_slice()),
@@ -698,7 +694,7 @@ impl FileOps for CgroupfsFileOps {
 
                 // Emit child cgroups
                 for child in cg.children() {
-                    if !callback(DirEntry {
+                    if !ctx.emit(DirEntry {
                         ino: child.ino,
                         file_type: FileType::Directory,
                         name: Vec::from(child.name.as_bytes()),
@@ -709,7 +705,7 @@ impl FileOps for CgroupfsFileOps {
 
                 // Emit control files
                 for file_type in CgroupControlFileType::all() {
-                    if !callback(DirEntry {
+                    if !ctx.emit(DirEntry {
                         ino: cg.ino + 1000 + *file_type as u64,
                         file_type: FileType::Regular,
                         name: Vec::from(file_type.filename().as_bytes()),
@@ -722,7 +718,7 @@ impl FileOps for CgroupfsFileOps {
                 for controller in cg.enabled_controllers() {
                     if let Some(ops) = CGROUP_ROOT.get_controller(controller) {
                         for cf in ops.control_files() {
-                            if !callback(DirEntry {
+                            if !ctx.emit(DirEntry {
                                 ino: cg.ino + 2000 + controller as u64 * 100,
                                 file_type: FileType::Regular,
                                 name: Vec::from(cf.name.as_bytes()),

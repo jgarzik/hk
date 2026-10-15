@@ -35,7 +35,12 @@ pub const SYS_PIVOT_ROOT: u64 = 41;
 pub const SYS_SWAPON: u64 = 224;
 pub const SYS_SWAPOFF: u64 = 225;
 pub const SYS_FTRUNCATE: u64 = 46;
+pub const SYS_TRUNCATE: u64 = 45;
+pub const SYS_FACCESSAT: u64 = 48;
+pub const SYS_CHDIR: u64 = 49;
+pub const SYS_FCHDIR: u64 = 50;
 pub const SYS_CHROOT: u64 = 51;
+pub const SYS_FACCESSAT2: u64 = 439;
 pub const SYS_FCHMOD: u64 = 52;
 pub const SYS_FCHMODAT: u64 = 53;
 pub const SYS_FCHOWNAT: u64 = 54;
@@ -68,6 +73,7 @@ pub const SYS_STATFS: u64 = 43;
 pub const SYS_FSTATFS: u64 = 44;
 pub const SYS_READLINKAT: u64 = 78;
 pub const SYS_FSTATAT: u64 = 79;
+pub const SYS_FSTAT: u64 = 80;
 pub const SYS_UTIMENSAT: u64 = 88;
 
 // Sync syscalls
@@ -513,9 +519,13 @@ pub fn aarch64_syscall_dispatch(
     arg5: u64,
 ) -> u64 {
     use crate::fs::syscall::{
+        sys_chdir,
         sys_chroot,
         sys_close,
         sys_dup3,
+        sys_faccessat,
+        sys_faccessat2,
+        sys_fchdir,
         sys_fchmod,
         sys_fchmodat,
         sys_fchmodat2,
@@ -567,6 +577,7 @@ pub fn aarch64_syscall_dispatch(
         sys_symlinkat,
         sys_sync,
         sys_syncfs,
+        sys_truncate,
         sys_umask,
         sys_umount2,
         sys_unlinkat,
@@ -637,6 +648,11 @@ pub fn aarch64_syscall_dispatch(
         SYS_SWAPON => crate::mm::sys_swapon(arg0, arg1 as i32) as u64,
         SYS_SWAPOFF => crate::mm::sys_swapoff(arg0) as u64,
         SYS_CHROOT => sys_chroot(arg0) as u64,
+        SYS_CHDIR => sys_chdir(arg0) as u64,
+        SYS_FCHDIR => sys_fchdir(arg0 as i32) as u64,
+        SYS_TRUNCATE => sys_truncate(arg0, arg1 as i64) as u64,
+        SYS_FACCESSAT => sys_faccessat(arg0 as i32, arg1, arg2 as i32) as u64,
+        SYS_FACCESSAT2 => sys_faccessat2(arg0 as i32, arg1, arg2 as i32, arg3 as i32) as u64,
         SYS_FCHMOD => sys_fchmod(arg0 as i32, arg1 as u32) as u64,
         SYS_FCHMODAT => sys_fchmodat(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64,
         SYS_FCHMODAT2 => sys_fchmodat2(arg0 as i32, arg1, arg2 as u32, arg3 as i32) as u64,
@@ -645,6 +661,7 @@ pub fn aarch64_syscall_dispatch(
         }
         SYS_FCHOWN => sys_fchown(arg0 as i32, arg1 as u32, arg2 as u32) as u64,
         SYS_FSTATAT => sys_fstatat(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
+        SYS_FSTAT => crate::fs::stat::sys_fstat(arg0 as i32, arg1) as u64,
         SYS_UTIMENSAT => sys_utimensat(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
         SYS_UMASK => sys_umask(arg0 as u32) as u64,
         SYS_STATFS => sys_statfs(arg0, arg1) as u64,
@@ -1281,17 +1298,8 @@ pub fn aarch64_syscall_dispatch(
         }
     };
 
-    // Update percpu.syscall_user_regs[0] with the syscall result BEFORE calling do_signal()
-    // This is important because if do_signal() sets up a signal frame, the saved context
-    // should have the correct return value (not the original x0 argument).
-    // When the signal handler returns via rt_sigreturn, x0 will be restored to this value.
-    unsafe {
-        super::percpu::current_cpu_mut().syscall_user_regs[0] = result;
-    }
-
-    // Check for pending signals before returning to userspace
-    // This may modify the saved user context to invoke the signal handler
-    crate::signal::do_signal();
-
-    result
+    // Deliver pending signals / apply -ERESTART* rules before returning to
+    // user space (may redirect the return context to a handler or back up
+    // over the svc)
+    crate::signal::syscall_exit_signal_work(result, num != SYS_RT_SIGRETURN)
 }

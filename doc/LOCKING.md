@@ -128,7 +128,28 @@ fn read(&self) -> RwLockReadGuard<'_, T>
 fn write(&self) -> RwLockWriteGuard<'_, T>
 ```
 
-### 1.4 Atomic Types
+### 1.4 Sleeping locks: sync::Mutex<T>, sync::RwSem (kernel/sync/)
+
+Linux `struct mutex` and `struct rw_semaphore`: a contended lock sleeps
+on the lock's `WaitQueue` instead of spinning (it spins only before
+scheduling is enabled), so the holder may sleep (page locks, block I/O,
+user page faults, blocking pipe/socket I/O).
+
+- `Mutex<T>`: owner tid recorded (debug builds catch recursive locking
+  and foreign unlocks); `unlock` wakes one waiter, which retries.
+- `RwSem`: `down_read`/`up_read` (shared), `down_write`/`up_write`
+  (exclusive); writer preference: once a writer waits, new readers wait
+  behind it. Its count word is a short `spin::Mutex` leaf never held
+  across a sleep; release wakes all waiters (mixed conditions).
+- Rules: thread context only; never taken in IRQ context or while any
+  spinlock is held (`might_sleep` asserts a zero preempt count in debug
+  builds; `IrqSpinlock` raises it). Sleeping locks order ABOVE every
+  spinlock: a spinlock may be taken under them, never the reverse.
+
+**Used for:** `Inode.i_rwsem` (`RwSem`), `SuperBlock.s_vfs_rename_mutex`
+and `File.f_pos_lock` (`Mutex`).
+
+### 1.5 Atomic Types
 
 Lock-free atomic operations from `core::sync::atomic`. Used for simple counters,
 flags, and lock-free algorithms.
@@ -155,13 +176,19 @@ lock ordering from outermost to innermost is:
 
 ```
 VFS locks (detailed order):
+    File.f_pos_lock (sync::Mutex; read/write/lseek/getdents by position)
+        ↓
     MOUNT_NS.root
         ↓
     Mount.{children, parent, mountpoint}
         ↓
-    Dentry.{d_lock, rename_lock} (single d_lock like Linux, rename_lock for lock_rename)
+    SuperBlock.s_vfs_rename_mutex (cross-directory rename only)
         ↓
-    Inode.i_rwsem (directory operation serialization, like Linux i_rwsem)
+    Inode.i_rwsem (sync::RwSem; exclusive: directory operations,
+                   lock_rename, regular file write and truncate; shared:
+                   path-walk lookup on a dcache miss, readdir)
+        ↓
+    Dentry.d_lock (single d_lock like Linux; short, never held across i_rwsem)
         ↓
     Inode.{lock, private}
         ↓
@@ -257,7 +284,7 @@ Other CPUs cannot cause deadlock because:
 
 ### 3.1 Scheduler
 
-**Location:** `kernel/percpu_sched.rs`
+**Location:** `kernel/task/percpu.rs`
 
 The scheduler uses a per-CPU locking model to minimize contention.
 
@@ -268,7 +295,7 @@ The scheduler uses a per-CPU locking model to minimize contention.
 | `PERCPU_SCHEDS` | `[PerCpuScheduler; MAX_CPUS]` | Per-CPU scheduler array |
 | `TASK_TABLE` | `Mutex<GlobalTaskTable>` | Global task registry |
 | `SCHEDULING_ENABLED` | `AtomicBool` | Global scheduling enable flag |
-| `TICK_COUNT` | `AtomicU64` | Timer tick counter |
+| `TICK_COUNT` | `AtomicU64` | Global tick counter (jiffies, TICK_MS = 10 ms); advanced only by CPU 0's tick, which also runs `check_timers()`; every CPU's tick runs its own `wake_sleepers()` |
 
 #### Per-CPU State
 
@@ -289,35 +316,108 @@ pub needs_reschedule: AtomicBool, // Reschedule request flag
 
 #### Locking Rules
 
-1. **Each CPU only locks its own run queue** - Cross-CPU operations go through
-   `TASK_TABLE` or use IPIs.
+1. **Each CPU only locks its own run queue** - no CPU ever takes another
+   CPU's `PerCpuScheduler.lock`. A wakeup for a task owned by another CPU is
+   posted to that CPU's `wake_list` (an `IrqSpinlock<Vec<(Tid, WakeMode)>>`,
+   a leaf lock) and applied by the owner, under its rq lock, at its next
+   `schedule()`/`yield_now()`/tick (Linux ttwu_queue). Tasks never migrate:
+   `Task.cpu` names the owning run queue.
 
 2. **Run queue lock is IRQ-safe** - Timer interrupts cannot cause deadlocks.
+   Lock order: rq lock → `wake_list` (drain) and rq lock → `TASK_TABLE`
+   (switch info, priority refresh). Never take an rq lock while holding
+   `TASK_TABLE`, and never call a wakeup (`wake_up_task`, `WaitQueue::wake*`)
+   while holding this CPU's rq lock (it is not recursive).
 
-3. **Context switch happens with lock held** - The lock is released after
-   returning from `context_switch()`.
+3. **Context switch happens with lock held** - The lock is released by the
+   task switched to (its guard drop, or `finish_context_switch` for a new
+   task).
 
 4. **Drop lock before `context_switch_first()`** - The initial switch to a
    task never returns, so the lock must be explicitly dropped.
 
-5. **Timer ISR only touches local CPU** - `wake_sleepers()` only processes
-   the current CPU's sleep queue to maintain locality.
+5. **Timer ISR only touches local CPU** - `wake_sleepers()` drains the local
+   `wake_list` and wakes expired sleepers of the local sleep queue only.
 
-**Lock acquisition pattern:**
-```rust
-// In yield_now() or try_schedule()
-let sched = get_percpu_sched(cpu_id);
-let mut rq = sched.lock.lock();  // IRQs disabled, preempt_count++
+6. **Per-CPU syscall user state belongs to the current task** - the
+   `syscall_user_*` block in per-CPU data is saved on the outgoing task's
+   kernel stack across every `context_switch` and restored when it runs
+   again, so a task that slept inside a syscall returns (and builds signal
+   frames) with its own registers. A user fault that delivers a signal
+   (`force_sig_fault`) loads the block from the fault's trap frame and
+   copies it back afterwards; the task is not inside a syscall then.
 
-// Safe to acquire TASK_TABLE while holding IrqSpinlock
-// (interrupts are disabled, so no ISR can try to acquire TASK_TABLE)
-let table = TASK_TABLE.lock();
+7. **User FP/SIMD state is saved eagerly, per task, never lazily** - no
+   lock is involved; the state always lives with the task it belongs to:
+   - x86-64: the kernel is soft-float and never touches x87/XMM/YMM, so a
+     task's user FP state stays in the registers while it is in the kernel.
+     `context_switch` XSAVEs (or FXSAVEs) it into an area on the outgoing
+     task's kernel stack and XRSTORs it when that task runs again; a fork
+     child gets the parent's state in a reserve above its trap frame
+     (`SchedArch::CLONE_FPU_RESERVE`), loaded by `clone_child_entry`.
+   - aarch64: the kernel uses NEON, so every exception entry (EL0 and EL1)
+     saves q0-q31/FPCR/FPSR in its trap frame and restores them on exit;
+     the EL0 frame (per-CPU `user_frame`, saved with the syscall block of
+     rule 6) holds the user FP state. `__switch_to_asm` preserves d8-d15.
+   Signal frames, fork and execve read/write the state in these places;
+   nothing may use user FP registers between a context switch's save and
+   the task's next return to user mode except through them.
 
-// ... modify run queue, select next task ...
+#### Sleep / Wakeup Protocol (Linux set_current_state / try_to_wake_up)
 
-unsafe { context_switch(curr, next, next_kstack); }
-// Lock automatically released when guard drops after context switch returns
+Each run-queue entry (`KernelThreadContext`) carries the scheduling truth:
+`state: SleepState {Running, Interruptible, Uninterruptible}` and `queued`
+(present in the priority queue; prevents double enqueue).
+
+```text
+sleeper                                   waker (any CPU, any context)
+-------                                   -----
+register on wait queue                    make condition true
+set_current_state(Interruptible)          wake_up_task(tid, cpu, mode):
+if condition: done                          own CPU:  lock rq, try_wake
+if signal_pending(): -ERESTARTSYS           remote:   push to wake_list
+schedule()  // returns at once if a       try_wake: state != Running →
+            // wakeup already set Running   Running, enqueue unless current
 ```
+
+`WakeMode::Interruptible` (signals) wakes only `Interruptible` sleepers;
+`WakeMode::Any` (wait queues, timeouts) wakes both. `schedule_timeout(t)`
+adds a sleep-queue entry; whichever of wakeup and timeout comes first ends
+the sleep and the entry is removed afterwards. Spurious wakeups are allowed:
+every sleeper re-checks its condition.
+
+**Preemption model:** hk is non-preemptive (cooperative). The timer tick
+never switches tasks, in kernel or user mode; switches happen only in
+`schedule()`, `yield_now()`, `exit_current()` and AP startup. Therefore a
+`spin::Mutex`/`RwLock` holder is never involuntarily preempted, and the only
+same-CPU hazard is an IRQ handler taking a lock the interrupted code holds
+(hence the IRQ rules). A `PreemptSpinlock` is not needed today; if
+preemption is ever added it must honor `preempt_count`, and `spin::Mutex`
+would then need a preempt-disabling wrapper.
+
+**RCU hook:** `PerCpuScheduler.nr_switches` counts context switches per CPU;
+since kernel code cannot be preempted, a change in a CPU's counter (or the
+CPU being idle) is a quiescent state for a future QSBR RCU.
+
+#### Kernel Threads (kernel/task/kthread.rs)
+
+`kthread_run(name, fn, arg, cpu)` creates a pid-0 task bound to one CPU
+(created asleep in that CPU's rq, then woken). `KTHREADS`
+(`spin::Mutex<Vec<Arc<KThread>>>`, process context only, never held across
+a wakeup/sleep; order: may be taken while holding nothing else) maps tid ->
+control block. `kthread_should_stop/should_park/parkme` and
+`kthread_stop/park/unpark` use atomics + `wake_up_task` + the block's
+`ack` WaitQueue. Unbound threads go round-robin to APs (CPU 0 runs the
+cooperative user tasks). Standing threads: `ktimerd` (CPU 0, runs software
+timer callbacks), the system workqueue worker, `softnet/N` (one per CPU,
+network receive; see 3.10), `kselftest` (boot only).
+
+Every online AP gets an idle task (`init_ap_schedulers`) and enters the
+scheduler from its boot idle loop. User tasks still run only on CPU 0. On
+x86-64 the TSS (RSP0) and the syscall entry stack are global: kernel
+threads switch with kernel stack 0, which leaves them untouched, so an AP
+switch cannot clobber CPU 0's user-entry stack. Per-CPU TSS is required
+before user tasks run on APs.
 
 ### 3.1.1 Task Struct and Credentials
 
@@ -449,27 +549,20 @@ so the global TASK_TABLE lock is sufficient.
 
 ### 3.1.3 Task State Invariants
 
-The `TaskState` enum is primarily informational, not the source of scheduling truth:
+The `TaskState` enum in `TASK_TABLE` is informational (and records
+`Zombie(wait_status)` / `Traced`), not the scheduling source of truth:
 
-**Source of Truth for Scheduling:**
-1. **Runnable**: Task is in a run queue (`CpuRunQueue.queue`)
-2. **Sleeping**: Task is in a wait queue or sleep queue
-3. **Current**: Task is `CpuRunQueue.current`
-4. **Zombie**: `TaskState::Zombie(status)` is set AND task is NOT in any queue
+**Source of Truth for Scheduling** (owner CPU's rq, IrqSpinlock):
+1. **Runnable**: entry `queued` (in `CpuRunQueue.queue`)
+2. **Current**: `CpuRunQueue.current`
+3. **Sleeping**: entry `state != Running`, not queued, not current; reachable
+   from a wait queue, futex bucket, the sleep queue, or a signal
+4. **Zombie**: `TaskState::Zombie(status)` set AND the entry removed from the
+   rq (`exit_current`)
 
-**Why TaskState is Not the Scheduling Source of Truth:**
-
-In timer ISR, we cannot acquire TASK_TABLE (non-IRQ-safe Mutex). Therefore:
-- `wake_sleepers()` adds tasks to run queue WITHOUT updating TaskState
-- The task becomes runnable (in run queue) while TaskState may still say Sleeping
-- This is safe because:
-  - Scheduler checks run queue membership, not TaskState
-  - waitpid() checks TaskState::Zombie which IS reliably set (in process context)
-
-**Consistency Points:**
-- TaskState is set correctly in process context operations (fork, exit, explicit wait)
-- TaskState may be transiently stale after timer-based wakeup
-- Code must NOT rely on TaskState for scheduling decisions
+Wakers (possibly in IRQ context) never touch `TASK_TABLE`; code must NOT rely
+on `TaskState` for scheduling decisions. `Zombie(status)` holds the Linux
+wait status word (`code << 8` or the killing signal).
 
 ### 3.2 Memory Management
 
@@ -493,12 +586,15 @@ pub struct BitmapFrameAllocator {
 
 ```rust
 pub struct HeapAllocator {
-    inner: Mutex<HeapAllocatorInner>,
+    inner: IrqSpinlock<HeapAllocatorInner>,
 }
 ```
 
-- Single `Mutex` protects the free list
-- **NOT IRQ-safe** - must not be called from interrupt context
+- Single `IrqSpinlock` protects the free list (fixed-size heap, never
+  grows, so it takes no other lock): an allocation in interrupt context
+  cannot deadlock against an interrupted allocator
+- Policy is still **no allocation in IRQ context** (failure handling and
+  latency); IRQ paths reserve capacity up front (e.g. `netif_napi_add`)
 - Implements `GlobalAlloc` trait
 - Used by Rust's `alloc` crate for `Box`, `Vec`, `String`, etc.
 
@@ -564,7 +660,7 @@ The VFS uses fine-grained locking with `RwLock` for concurrent read access.
 pub struct Inode {
     pub size: AtomicU64,                           // Lock-free size updates
     pub lock: RwLock<()>,                          // Metadata protection
-    i_rwsem: Mutex<()>,                            // Directory operation serialization
+    i_rwsem: RwSem,                                // Dir ops, file write/truncate
     pub private: RwLock<Option<Arc<dyn InodeData>>>, // FS-specific data
 }
 ```
@@ -603,6 +699,9 @@ Linux `vfsmount.mnt_count` pattern:
 | `Mount.parent` | `RwLock<Option<Weak<Mount>>>` | Parent mount reference |
 | `Mount.children` | `RwLock<Vec<Arc<Mount>>>` | Child mounts |
 | `Mount.mnt_count` | `AtomicU64` | Open file reference count |
+| `Mount.mnt_flags` | `AtomicU32` | MNT_NOSUID/NODEV/NOEXEC; set by mount/remount, read lock-free (open, exec, statfs) |
+| `SuperBlock.s_flags` | `AtomicU32` | SB_RDONLY; set by mount/remount, read lock-free by permission checks |
+| `SuperBlock.s_writers` | `AtomicU64` | Write-access holders (`want_write` guard, Linux mnt_want_write). Lock-free protocol against `make_rdonly`: the writer increments `s_writers` then reads `s_flags`; the remount sets SB_RDONLY then reads `s_writers` (all SeqCst), backing out (EROFS / EBUSY) if it sees the other side, so a writer and a read-only remount never both succeed |
 
 **Reference Counting (mntget/mntput):**
 
@@ -686,6 +785,20 @@ fn sys_mkdir(...) {
 }
 ```
 
+**Lookup and permission under the lock (Linux lookup_open /
+filename_create):** `open.rs::create_in` (O_CREAT), `path.rs::create_entry`
+(mkdir, mknod, symlink, link) and `path.rs::delete_entry` (unlink, rmdir)
+take the parent's `inode_lock()` first and, while holding it, look the name
+up (`lookup_one`: dentry `d_lock`, then the file system's `lookup`), decide
+EEXIST / "created by this call", run the DAC checks (`dac::may_create`,
+`dac::may_delete`; these read the inode's atomic mode/uid/gid and, for the
+new mode, the task's umask under `FsStruct.inner`) and perform the
+operation. So the existence check, the permission decision and the change
+are atomic with respect to other directory operations on that parent.
+Order: parent `i_rwsem` -> `FsStruct.inner` (umask read, leaf) and parent
+`i_rwsem` -> dentry `d_lock` -> fs-internal locks. Rename does the same
+lookups and checks (`link.rs::rename_locked`) inside `lock_rename()`.
+
 **Filesystem implications:**
 Filesystems can trust that VFS has serialized directory operations. Complex
 internal locking (like lock ordering for cross-directory operations) is
@@ -710,19 +823,13 @@ This ordering prevents deadlocks because:
 - The address-based fallback provides a total order for unrelated directories
 - No two concurrent renames can acquire locks in opposite order
 
-**Dentry Rename Lock:**
-
-Each dentry has a dedicated `rename_lock` (Mutex) separate from `d_lock`:
-
-```rust
-pub struct Dentry {
-    d_lock: RwLock<DentryInner>,  // Protects inode, parent, children, flags
-    rename_lock: Mutex<()>,       // For lock_rename() coordination
-}
-```
-
-The separate lock allows holding across function calls (not RAII-bound) and
-avoids interfering with concurrent reads of dentry metadata.
+**Directory locks:** `lock_rename()` locks each directory's inode
+`i_rwsem` (via `Dentry::rename_lock()` -> `Inode::inode_lock()`), the same
+lock create/mkdir/unlink/rmdir/link/symlink/mknod take on the parent, so a
+rename excludes every other operation on both directories, as in Linux
+(lock_rename -> inode_lock_nested). Order: `SuperBlock.s_vfs_rename_mutex`
+(cross-directory only) -> directory `i_rwsem`s (ancestor first, else by
+address) -> dentry `d_lock` -> fs-internal locks.
 
 **API:**
 
@@ -756,10 +863,10 @@ if source_inode.mode().is_dir() {
 
 **Two-Level Locking:**
 
-The VFS layer acquires dentry rename_locks via `lock_rename()`. Filesystems may
-still use internal locks for their data structures (e.g., ramfs children BTreeMap)
-to protect against concurrent non-rename operations. The VFS rename_lock ensures
-only one rename operates on a given directory pair at a time.
+The VFS layer locks both directories' `i_rwsem` via `lock_rename()`, which
+excludes renames and all other directory operations on them. Filesystems may
+still use internal locks for their data structures (e.g., ramfs children
+BTreeMap).
 
 **Error Conditions:**
 - `EINVAL`: new_parent is subdirectory of source (cycle)
@@ -786,7 +893,7 @@ Without a per-superblock lock, this race is possible:
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `s_vfs_rename_mutex` | `Mutex<()>` | Serializes cross-directory renames |
+| `s_vfs_rename_mutex` | `sync::Mutex<()>` | Serializes cross-directory renames |
 
 **Lock Ordering for Cross-Directory Rename:**
 
@@ -800,8 +907,64 @@ Without a per-superblock lock, this race is possible:
 
 **Same-Directory Rename:**
 
-Does not acquire `s_vfs_rename_mutex` - only needs the single dentry's
-`rename_lock`.
+Does not acquire `s_vfs_rename_mutex` - only the directory's `i_rwsem`.
+
+#### Directory Iteration (getdents64)
+
+Linux holds the directory's `i_rwsem` shared across `iterate_shared` and
+`filldir64` copies each record straight to user memory. hk file systems
+emit entries while holding spinlocks (ramfs `RamfsInodeData.children`
+read lock, procfs/cgroupfs inode-data read locks), so user memory must
+not be touched from the emit callback (a fault could sleep under a
+spinlock). `sys_getdents64` holds the directory's `i_rwsem` shared
+across `readdir` (Linux iterate_dir) and gathers records into a
+kernel buffer bounded by `GETDENTS_CHUNK` (32 KiB, independent of the
+user `count`), and copies it to user space after `readdir` returned and
+every lock is dropped; a call may return fewer bytes than fit (callers
+loop until 0). Positions are stable cookies (ramfs per-directory
+position counter, vfat slot index, procfs pid/fd based), so nothing has
+to stay locked between calls. The call holds the file's `f_pos_lock`
+(below), like Linux `fdget_pos`.
+
+#### File Writes and Positions (Linux i_rwsem / f_pos_lock)
+
+**Location:** `fs/file.rs` (`File::write_from`, `File::pos_lock`),
+`fs/io.rs` (`file_readv`, `file_writev`, `sys_lseek`), `fs/fd.rs`
+(`do_truncate`)
+
+- `File.f_pos_lock` (`sync::Mutex<()>`, Linux `f_pos_lock` with
+  FMODE_ATOMIC_POS): taken by read/readv/write/writev/lseek/getdents64
+  on regular files and directories for the whole call (not by
+  pread/pwrite, which do not use the position), so processes sharing an
+  open file (fork, dup, SCM_RIGHTS) never read or write at the same
+  position. Pipes, sockets and devices are not position-based and skip
+  it, as in Linux.
+- `Inode.i_rwsem` is held across every write to a regular file
+  (`File::write_from`, i.e. write/writev/pwrite/pwritev*/io_uring/splice
+  users of `File::write`/`pwrite`): with O_APPEND (or RWF_APPEND) the
+  position is set to `i_size` under the lock, so appends from separate
+  open files never overlap, and the data copy, the size update,
+  RLIMIT_FSIZE check and set-id stripping are atomic with respect to
+  other writers. `truncate`/`ftruncate`/O_TRUNC take it too (Linux
+  do_truncate). Reads do not take it (Linux generic_file_read_iter).
+- Data moves between user memory and the file through a kernel buffer
+  of at most 64 KiB (`file::WRITE_CHUNK`) per step, so one call never
+  pins more kernel memory than that (a full-size buffer per blocked
+  reader exhausted the heap). As in Linux, the user copies (and their
+  page faults) happen under `f_pos_lock` and, for writes, `i_rwsem`
+  (held across all chunks, which keeps a large O_APPEND write
+  contiguous); the fault path takes neither lock, and both are sleeping
+  locks, so a fault may sleep.
+- Order: `f_pos_lock` -> file `i_rwsem` -> page cache / page locks ->
+  fs-internal locks. A directory `i_rwsem` is never held while a file's
+  `i_rwsem` is taken (O_CREAT drops the parent's lock before O_TRUNC).
+- Both are sleeping locks (`kernel/sync`): the vfat write path may wait
+  for page locks and block I/O while holding `i_rwsem`, which a spinlock
+  would forbid.
+- Path walk (`path.rs::lookup_slow`) takes a directory's `i_rwsem`
+  shared on a dcache miss (Linux lookup_slow); callers already holding
+  that directory exclusively (create, unlink, rename) use `lookup_one`
+  directly.
 
 #### Inode Timestamp Locking (Linux i_rwsem Pattern)
 
@@ -837,63 +1000,48 @@ let ctime = inode.ctime();
 to atomics would complicate the API and still require paired loads/stores for
 consistency. The struct-level locking pattern matches Linux's approach.
 
-#### Wait Queues (Linux folio_wait_table Pattern)
+#### Wait Queues (kernel/waitqueue.rs)
 
-**Location:** `core/waitqueue.rs`
-
-Wait queues provide event-based blocking where tasks sleep until woken by another
-task. This is used for page locking and can be used for other blocking primitives.
-
-**Key Components:**
-```rust
-/// A wait queue for blocking synchronization
-pub struct WaitQueue {
-    head: IrqSpinlock<WaitQueueHead>,
-}
-
-/// Global page wait hash table (like Linux folio_wait_table)
-static PAGE_WAIT_TABLE: [WaitQueue; 256];
-```
-
-**API:**
-```rust
-impl WaitQueue {
-    fn wait(&self);        // Sleep until woken
-    fn wake_one(&self);    // Wake first waiter (fair)
-    fn wake_all(&self);    // Wake all waiters
-}
-
-/// Get wait queue for a page address
-fn page_wait_queue(page_addr: u64) -> &'static WaitQueue;
-```
-
-**Page Locking:**
-
-Page cache pages use sleeping locks instead of spinning. When a page is already
-locked, waiters sleep on the page's wait queue until the holder calls `unlock()`:
+Linux-style wait queues (`include/linux/wait.h`, `kernel/sched/wait.c`).
 
 ```rust
-impl CachedPage {
-    pub fn lock(&self) {
-        // Fast path: try immediate acquire
-        if self.locked.compare_exchange(...).is_ok() { return; }
+pub struct WaitQueue { head: IrqSpinlock<Vec<WaitQueueEntry>> } // leaf lock
 
-        // Slow path: sleep on wait queue
-        loop {
-            if self.locked.compare_exchange(...).is_ok() { return; }
-            page_wait_queue(self.frame).wait();
-        }
-    }
+// Sleeper side (process context, no spinlocks held)
+wq.wait_event(|| cond);                                  // uninterruptible
+wq.wait_event_interruptible(|| cond)?;                   // Err(RestartSys) on signal
+wq.wait_event_timeout(|| cond, ticks) -> u64;            // 0 = timed out
+wq.wait_event_interruptible_timeout(|| cond, ticks)?;    // Ok(left) / Err
+// open-coded: prepare_to_wait(&mut WaitEntry, state); check; schedule(); finish_wait
+// poll/select: add_poll_entry/remove_entry (non-autoremove registrations)
 
-    pub fn unlock(&self) {
-        self.locked.store(false, Ordering::Release);
-        page_wait_queue(self.frame).wake_one();
-    }
-}
+// Waker side (any context, including IRQ handlers)
+wq.wake_one(); wq.wake_all();
 ```
 
-**Early Boot Fallback:** If scheduling is not yet enabled, page locking falls
-back to spinning instead of sleeping.
+- **IRQ class:** the head lock is an `IrqSpinlock` and a leaf: entries are
+  collected under it, the lock is dropped, then tasks are woken
+  (`wake_up_task`: own rq lock or the target's `wake_list`). Wakers never
+  take `TASK_TABLE`, so `wake_*` is safe from IRQ handlers.
+- **No lost wakeups:** the sleeper registers and sets its state before
+  re-checking the condition (see 3.1 Sleep / Wakeup Protocol). Wakers must
+  make the condition true before calling `wake_*`.
+- **Autoremove:** a woken entry is removed by the waker; `finish_wait`
+  removes it otherwise. Poll entries stay until the poll ends.
+- `wait_event_interruptible_deadline` takes a CLOCK_MONOTONIC deadline.
+  Wakers of queues shared by waiters with different conditions (SysV
+  sem/msg, mqueue, sockets) use `wake_all`: a `wake_one` could pick a
+  waiter whose condition is still false.
+- `cond` closures run with the task state set; they may take sleeping-context
+  locks (Mutex) but must not sleep themselves.
+
+**Page Locking (Linux folio_wait_table Pattern):**
+
+`PAGE_WAIT_TABLE: [WaitQueue; 256]` is hashed by page frame. `CachedPage::lock`
+sleeps with `wait_event(|| !locked)` and retries its CAS; `unlock` and end of
+writeback use `wake_all` (the bucket is shared by unrelated pages, so a
+single wakeup could be consumed by the wrong waiter). **Early Boot
+Fallback:** if scheduling is not yet enabled, page locking spins.
 
 ### 3.4 Namespaces
 
@@ -1261,13 +1409,22 @@ with_task_signal_state(tid, |state| {   // TASK_SIGNAL_STATE lookup
 });
 ```
 
-**kill(2)/tgkill(2):** Send signal to task:
+**kill(2)/tgkill(2):** Send signal to task (`send_signal`, process context
+only):
 ```rust
-with_task_signal_state(tid, |state| {   // TASK_SIGNAL_STATE lookup
+let deliverable = with_task_signal_state(tid, |state| {  // TASK_TABLE
+    if sig_ignored(..) { return false }   // SIG_IGN / default-ignore: dropped
     state.pending.add(sig);
-});
-set_tif_sigpending(tid);                // TASK_TIF_SIGPENDING update
+    !state.blocked.contains(sig)
+});                                       // tif_sigpending recomputed
+// TASK_TABLE released, then:
+wake_up_tid(tid, WakeMode::Interruptible) // signal_wake_up
 ```
+`with_task_signal_state` recomputes `tif_sigpending` after every access, so it
+means "a signal is deliverable under the current mask"; interruptible sleeps
+test it via `waitqueue::signal_pending()` and return `-ERESTARTSYS`/
+`-ERESTARTNOHAND`. `syscall_exit_signal_work` (arch syscall exit) delivers
+the signal and restarts or fails the syscall per SA_RESTART.
 
 #### Reference Counting
 
@@ -1328,12 +1485,14 @@ Neither thread can miss the other's update.
 #### Lock Ordering
 
 ```
-1. FutexHashBucket.waiters (IrqSpinlock)
-   ↓
-2. TASK_TABLE (Mutex, for task state updates during wake)
-   ↓
-3. Per-CPU scheduler lock (IrqSpinlock, for run queue updates)
+FutexHashBucket.waiters (IrqSpinlock): leaf. Wakers dequeue FutexQ entries
+under it, drop it, then wake_up_task(tid, cpu) (no TASK_TABLE).
 ```
+
+Waiters sleep with the Sleep / Wakeup Protocol (section 3.1): state set to
+Interruptible, then "still queued?" re-checked under the bucket lock, then
+`schedule_timeout`. A waker that dequeued the entry is the wake; signal or
+timeout dequeue the entry themselves.
 
 For `futex_requeue()` with two different buckets:
 - Lock buckets in address order (lower pointer address first)
@@ -1351,7 +1510,7 @@ Robust futexes are cleaned up during task exit via `exit_robust_list()`:
 
 1. **Bucket lock is IRQ-safe** - Safe from signal handlers
 2. **Memory barriers before userspace access** - Prevents lost wakeups
-3. **Lock order: bucket → TASK_TABLE → scheduler** - Consistent ordering
+3. **Bucket lock is a leaf** - wakeups are issued after dropping it
 4. **Multi-bucket operations use address ordering** - Prevents deadlock
 5. **Robust cleanup has entry limit** - Prevents infinite loop from corrupted list
 
@@ -1435,8 +1594,34 @@ if self._guard.is_some() {
 
 ### 3.10 Device Drivers
 
-Device drivers use thread-context locks (Mutex, RwLock) rather than IrqSpinlock.
-ISRs set atomic flags but never acquire locks, deferring work to thread context.
+Device drivers use thread-context locks (Mutex, RwLock) for their state.
+ISRs only ack the device, set atomics and use IRQ-safe deferral
+(`napi_schedule`, `WaitQueue::wake_*`), deferring work to thread context.
+
+#### Device IRQ Registration (kernel/arch/{x86_64,aarch64}/irq.rs)
+
+| Lock | Type | IRQ class | Order |
+|------|------|-----------|-------|
+| `IRQ_TABLE` (per arch) | `IrqSpinlock` | taken in IRQ (`dispatch_irq`) and process context (register/unregister) | leaf except for the interrupt-controller MMIO it programs; handlers run under it |
+
+Generic interface (`crate::arch::irq`): `IrqHandler = fn(u32, *mut ()) ->
+bool`, `register_irq_handler(irq, handler, data, id)` (shareable; first
+handler unmasks the line, last one masks it), `unregister_irq_handler`,
+`pci_intx_irq(bus, dev, fn, pin, line)`. `PciDevice::register_irq_handler`
+uses these on both arches. Every handler of a shared line is called; a line
+nobody claims 100000 times in a row is masked (stuck level INTx).
+
+- aarch64: SPIs are configured by `gic::enable_spi` (level/edge in ICFGR,
+  priority 0x80, Group 1, IROUTER -> CPU 0, ISENABLER); PCI INTx comes from
+  the host bridge DT `interrupt-map`/`interrupt-map-mask` parsed at boot
+  (`arch/aarch64/pci_irq.rs`, matching in `bus/pci_intx.rs`), else the QEMU
+  virt swizzle INTID 35 + (slot + pin - 1) % 4.
+- x86-64: legacy 8259 PIC with the firmware-assigned config-space Interrupt
+  Line (QEMU `pc`). Real hardware in APIC mode (Dell OptiPlex 3020 target)
+  needs IOAPIC + ACPI `_PRT` routing (not implemented).
+- Handlers run in IRQ context with the table lock held: they must only ack
+  the device, touch atomics/IrqSpinlocks and wake threads; they must not
+  register/unregister IRQs.
 
 #### USB Subsystem
 
@@ -1469,29 +1654,170 @@ locks to avoid deadlock with the request queue.
 
 #### Network Subsystem
 
-**Location:** `kernel/net/`
+**Location:** `kernel/net/`, `kernel/net/core/dev.rs`, `kernel/ns/net.rs`
 
-| Lock | Type | Purpose |
-|------|------|---------|
-| `Socket.local_addr` | `Mutex` | Per-socket local address |
-| `Socket.remote_addr` | `Mutex` | Per-socket remote address |
-| `Socket.rx_buffer` | `Mutex` | Receive buffer |
-| `Socket.dgram_rx_queue` | `Mutex` | Datagram queue |
-| `TcpConnection.retransmit_queue` | `Mutex` | TCP retransmit queue |
-| `E1000Driver.tx_*` | `Mutex` | TX ring management |
+**Execution model (NAPI-like, no softirqs).** No protocol code runs in
+interrupt context. A NIC ISR only reads/acks its interrupt cause, masks the
+device's interrupts and calls `napi_schedule()`. Per-CPU `softnet/N`
+kthreads (one per CPU with a scheduler, `kthread_run` bound to CPU N) poll
+the scheduled NAPI contexts (weight 64, 300 packets per round, then
+`yield_now()` if work remains) and the CPU's `netif_rx` backlog, calling
+`netif_receive_skb()` -> EtherType handler (`ip_rcv`, `arp_rcv`) -> TCP/UDP/
+ICMP. `lo` transmits with `netif_rx()` into the sending CPU's backlog; the
+transmit path therefore never re-enters the receive path. A sending socket
+syscall then runs `netif_rx_flush_local()` at a point where it holds no
+locks (Linux runs pending softirqs at `local_bh_enable()` after
+`dev_queue_xmit`), so loopback data is normally queued at the peer before
+`sendto()` returns. A received packet's namespace is its device's
+(`skb.net()`), never `current_net_ns()`; a socket's is `Socket.net`.
 
-**Socket Lock Ordering:** When acquiring multiple socket locks, acquire in this order:
-1. `local_addr`
-2. `remote_addr`
-3. `rx_buffer` / `dgram_rx_queue`
+Today all device IRQs are routed to CPU 0 (PIC / GIC IROUTER) and user
+tasks run only on CPU 0, so in practice protocol work for eth0 and lo runs
+on CPU 0 (`softnet/0` or a CPU-0 task); kernel threads on other CPUs (e.g.
+the ICMP self-test on CPU 1) use their own CPU's softnet. The locks below
+do not rely on that.
 
-**TCP State:** Uses atomics (`AtomicU8` for state, `AtomicU32` for sequence numbers)
-for lock-free access from packet receive path.
+| Lock | Type | IRQ class | Notes |
+|------|------|-----------|-------|
+| `Softnet.poll_list` (per CPU) | `IrqSpinlock<VecDeque<Arc<Napi>>>` | taken in IRQ (`napi_schedule`) and by `softnet/N` | leaf; capacity reserved by `netif_napi_add`, so the ISR never allocates |
+| `Softnet.wq` (per CPU) | `WaitQueue` | woken from IRQ | leaf (see Wait Queues) |
+| `Softnet.backlog` (per CPU) | `spin::Mutex<VecDeque<Box<SkBuff>>>` | thread only (`netif_rx`, `softnet/N`, inline flush) | leaf; max 1000 packets, then drop + `rx_dropped` |
+| `dev::TIMER_DUE` | `AtomicBool` | thread (ktimerd sets, softnet/0 clears) | protocol timers are due: softnet/0 runs `tcp::timer::run` with no lock held |
+| `Napi.sched` | `AtomicBool` | IRQ + thread | set by `napi_schedule` (only the setter queues it), cleared by `napi_complete_done` |
+| `PTYPE_BASE`, `PTYPE_ALL` | `spin::RwLock<Vec<..>>` | thread only | leaf; handler copied out, called after unlock |
+| `NAPI_LIST`, `SOFTNET_THREADS` | `spin::Mutex<Vec<..>>` | thread only | leaf; registration |
+| `Sock` (`net/sock.rs`, in every protocol socket) | atomics + `Sock.wq` (`WaitQueue`) | any (wakeups) | error, shutdown, buffer sizes, timeouts, SOL_SOCKET flags; one wait queue per socket for readers, writers, connect/accept and pollers (`sk_data_ready`/`sk_write_space`/`sk_state_change` = `wake_all`), always woken after protocol locks are dropped |
+| sockfs inode `private` | `spin::RwLock` (VFS, `Inode.private`) | thread only | read per socket file operation (`sock_of`) to reach the protocol socket; leaf |
+| `TcpSock.cb` (`net/tcp/mod.rs`) | `spin::Mutex<Inner>` | thread only (softnet input, softnet/0 timers, socket calls) | the TCP socket lock: Linux `bh_lock_sock` plus the `tcp_sock` state it guards (the whole I/O-free `TcpCb`: state, sequence space, send/receive/out-of-order queues, RFC 7323 option state, delayed-ACK state, RTO, all timers, the IPPROTO_TCP options (`TcpCb.opts`; the separate `TcpSock.opts` leaf is gone); tuple, port ownership, listener link). Held for one bounded step: never across a sleep, a user copy or a transmit (work is returned as `Out` and run after unlock). A listener's is taken before its new child's (creating it); a child never takes its listener's `cb` |
+| `TcpSock.rd` | `sync::Mutex<()>` (sleeping) | thread only (recvmsg) | serializes readers across peek -> user copy -> consume, so a faulting copy leaves the data queued (reader half of Linux `lock_sock`); held only for that step, never across a wait; above `cb` |
+| `TcpSock.queue` | `spin::Mutex<Option<Accept>>` | thread only | leaf: a listener's SYN_RECEIVED children and accept queue; taken under the listener's or a child's `cb` |
+| `TimeWait.inner` (`net/tcp/timewait.rs`) | `spin::Mutex` | thread only | a TIME_WAIT entry's queue-less control block + timer slot; same position as `TcpSock.cb` |
+| TCP `TIMERS` (`net/tcp/timer.rs`) | `spin::Mutex<BTreeMap>` | thread only | leaf under `cb`/`TimeWait.inner`: (deadline, id) -> weak owner. Its `timer::Alarm` only wakes softnet/0 (`dev::raise_timer`), which takes due entries out and runs each under its owner's lock with `TIMERS` dropped |
+| TCP tables `TcpTables.{bhash, ehash, lhash}` (`net/tcp/table.rs`, per netns) | `spin::RwLock` | thread only | `bhash` -> `ehash` (connect picks a port and inserts its four-tuple atomically); `lhash` leaf; candidates' `Inet.addr` and `Sock` flags are read under `bhash`; never a socket `cb` under a table lock (/proc/net/tcp copies the entries out, drops the table locks, then takes each `cb` / `TimeWait.inner` in turn) |
+| `Sock.errq` (`net/sock.rs`) | `spin::Mutex` | thread only (softnet ICMP error delivery, recvmsg MSG_ERRQUEUE, poll) | leaf: IP_RECVERR queue, bounded by SO_RCVBUF (own charge); the wakeup follows the unlock |
+| `IcmpRate.st` (`net/icmp.rs`, per netns) | `spin::Mutex` | thread only | leaf: global + per-destination (bounded, 256) ICMP error token buckets |
+| `UdpSock.op`, `PingSock.op` | `spin::Mutex<()>` | thread only | datagram socket lock (bind/connect/disconnect/autobind); never across a sleep or a transmit; taken before the protocol's port/identifier table |
+| `RxQueue.q` (`net/dgram.rs`: UDP, ping, raw receive queues) | `spin::Mutex` | thread only (softnet enqueue, recvmsg) | leaf; bounded by SO_RCVBUF (`rmem` atomic) |
+| `RawTable.socks` (`net/raw.rs`, per netns) | `spin::RwLock` | thread only | raw sockets by protocol; delivery and ICMP-error fan-out clone the matching `Arc`s (reading their `Inet.addr`) and queue after dropping it; `RawSock.filter` is an atomic |
+| `PingTable.socks` (`net/ping.rs`, per netns) | `spin::RwLock` | thread only | ping sockets by echo identifier; receive/error lookups clone the `Arc` and queue after dropping it; reads candidates' `Inet.addr` under it (order table -> Inet.addr) |
+| `Inet.addr` (`net/af_inet.rs`) | `spin::Mutex` | thread only | leaf: addresses/ports of a TCP or UDP socket; read under the UDP/TCP port tables during lookups |
+| `RTNL` (`net/rtnl.rs`) | `spin::Mutex<()>` | thread only (syscalls, kernel config; never softnet) | OUTERMOST network lock: serializes all configuration changes (link up/down + MTU, addresses, routes) from netlink, SIOCS* ioctls and the kernel. Functions needing it take `&RtnlGuard`. Holders never sleep and never take a socket lock (`sk_lock`) |
+| `NetNamespace` tables (`devices`, `loopback`), `UdpTable.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes: RCU-ready); the UDP port table reads each candidate's `Inet.addr` under its lock |
+| `Fib.tables` (`net/inet/fib.rs`, per netns) | `spin::RwLock` | thread only | leaf; written only under RTNL; read by input/output routing (softnet, socket syscalls, possibly under `sk_lock`) and dumps; returns `Arc<FibEntry>` clones; notifications are sent after the guard is dropped |
+| `NetDevice.addrs` (IPv4 list; IPv6 later) | `spin::RwLock` | thread only | leaf; written only under RTNL (`inet::ifaddr`), read via snapshots (`inet_addrs()`) |
+| `NeighTable.hash` (`net/core/neigh.rs`; `NetNamespace.arp`, IPv6 ND later) | `spin::RwLock` | thread only (softnet, socket output, ktimerd) | (ifindex, address) -> `Arc<Neighbour>`; lookups drop the guard; GC/flush take each entry's `inner` under the write lock (order hash -> inner) |
+| `Neighbour.inner` | `spin::Mutex` | thread only | leaf: NUD state + bounded unresolved queue (unres_qlen_bytes). Never held while transmitting, soliciting or reporting errors: state changes return actions run after the unlock |
+| neighbour `TABLES` | `spin::Mutex` | thread only | leaf (snapshot of registered tables). One `timer::Alarm` runs all tables' due entries and GC on `ktimerd`, armed with no table lock held |
+| `timer::Alarm.st` (neighbour, IP reassembly) | `spin::Mutex` | thread only | held across `timer_add/timer_del` (-> `TIMERS` IrqSpinlock); otherwise leaf |
+| `FragTable.st` (`net/inet/frag.rs`, per netns) | `spin::Mutex` | thread only (softnet, reassembly timer on ktimerd) | leaf: reassembly queues + memory charge; completed datagrams are delivered and expiry ICMP errors sent after it is dropped. Reassembly `TABLES` (registered namespaces) is a leaf `spin::Mutex` |
+| `PmtuCache.m` (`net/inet/route.rs`, per netns) | `spin::Mutex` | thread only | leaf: learned path MTUs, read by `route::output` (possibly under a socket lock), written by ICMP frag-needed handling |
+| `NlTable.socks` (`net/netlink`, per netns) | `spin::RwLock` | thread only | leaf; bound netlink sockets by (protocol, portid); lookups return `Arc` clones |
+| `NlSock.dump` | `spin::Mutex<Option<Dump>>` | thread only (sender's `sendmsg`, reader's `recvmsg`) | running dump cursor; held while it snapshots devices/FIB/ARP and while its part is pushed to `rxq` (keeps parts ordered); never with RTNL |
+| `NlSock.rxq`, `NlSock.dst` | `spin::Mutex` | thread only | leaf; replies, dump parts and notifications are pushed under it (each charged to rcvbuf first), `wq` is woken after it is dropped |
+| `NlSock` portid/groups/flags/err/rmem/congested, autobind `ROVER` | atomics | thread only | |
+| `UnixSock.bindlock` (`net/unix`) | `sync::Mutex<()>` (sleeping) | thread only | Linux u->bindlock: bind/autobind; taken with no spinlock held, before `UnixTable.st`/`BSD`. A path bind runs the VFS mknod (parent `i_rwsem`) first and takes `bindlock` after it returns (Linux nests them; hk does not need to) |
+| `UnixSock.iolock` | `sync::Mutex<()>` (sleeping) | thread only (recvmsg) | Linux u->iolock: one reader across dequeue -> user copy -> consume; dropped before waiting for data; above `st`/`rq` |
+| `UnixSock.st` | `spin::Mutex<Option<Arc<UnixSock>>>` | thread only | Linux unix_state_lock: the peer; `state`, shutdown bits and `dead` change under it. Two at once only as listener -> connecting socket (stream connect; a socket that is not CLOSE fails before taking its own, so listeners never nest) or in ascending address order (`lock2`, Linux unix_state_double_lock: dgram connect, socketpair). Senders queue under the receiver's `st`, so nothing is queued to a released socket |
+| `UnixSock.rq` | `spin::Mutex<RxQueue>` | thread only | receive queue (Linux sk_receive_queue.lock), under `st`; a listener's queue holds embryo connections |
+| `UnixTable.st` (per netns), `unix::BSD` (global, by inode) | `spin::RwLock` | thread only | all sockets + abstract names (per type) / filesystem bindings; after `bindlock`, before `UnixSock.addr` (published under them); lookups return `Arc`s, no socket lock under them |
+| `UnixSock.addr`, `UnixSock.peercred`, `UnixSock.relay` | `spin::RwLock` / `spin::Mutex` | thread only | leaves (Linux u->addr, sk_peer_lock, peer_wait.lock for peer_wake relays); `relay` also guards the registered sockets' `peer_wake` atomics |
+| `unix::scm::INFLIGHT`, `unix::scm::DEFERRED` | `spin::Mutex` | thread only | leaves: per-user in-flight file counts (charged under the receiver's `st`), files awaiting `defer_fput` |
+| `UnixSock` `state`/`dead`/`wmem`/`backlog`/`peer_wake`, `DRAINING` | atomics | thread only | |
+| `NetDevice.net` | `spin::RwLock<Weak<NetNamespace>>` | thread only | read per received packet; written at registration |
+| `NetNamespace.sysctl`, `port_range` (`/proc/sys/net`, `kernel/sysctl.rs`) | atomics | thread only | no locks; a multi-value sysctl (ping_group_range) is one packed `AtomicU64`, so readers never see half an update |
+| `NetDevice.stats`, `flags`, `mtu`, `ifindex`, `carrier` | atomics | any | `flags` holds administrative state only; IFF_RUNNING/IFF_LOWER_UP/operstate are derived on read |
+| e1000 `rx` ring | `spin::Mutex` | thread only (NAPI poll) | leaf; frames are delivered after it is dropped |
+| e1000 `tx` ring | `spin::Mutex` | thread only (xmit, poll reclaim) | leaf; ring full -> drop, `tx_dropped`, ENOBUFS |
+| e1000 `pending_icr`, irq counters | atomics | IRQ + thread | ISR ORs ICR causes in; poll swaps them out |
+
+**Lock order (outermost first):**
+
+```
+RTNL (configuration only)        TcpSock.rd (sleeping) -> TcpSock.cb (listener before its new child;
+  |                                 a child never takes its listener's cb) /
+  |                                 TimeWait.inner / UdpSock.op / PingSock.op
+  |                                 -> TCP bhash -> ehash, lhash / UdpTable.socks /
+  |                                    PingTable.socks -> Inet.addr
+  |                                 -> TcpSock.queue / RxQueue.q
+  |                                 -> TCP TIMERS -> Alarm.st -> kernel TIMERS
+  v                                 |
+NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
+  the guard before returning)
+  -> NeighTable.hash -> Neighbour.inner (dropped before any transmit)
+  (RawTable.socks -> Inet.addr; FragTable.st, PmtuCache.m, IcmpRate.st,
+   Sock.errq, RxQueue.q: leaves, never held while transmitting)
+  -> NlTable.socks -> NlSock.rxq (netlink replies/notifications)
+  (AF_UNIX: UnixSock.bindlock (sleeping) -> UnixTable.st / BSD
+   -> UnixSock.addr; UnixSock.iolock (sleeping) -> UnixSock.st (listener
+   before connector, else by address) -> UnixSock.rq / peercred / addr /
+   INFLIGHT; UnixSock.relay leaf)
+  (NlSock.dump -> devices/FIB/ARP snapshots -> NlSock.rxq: dump parts)
+  -> device TX lock (e1000 tx)
+  -> Softnet.backlog (lo xmit)           Softnet.poll_list / WaitQueue / rq
+                                          (IrqSpinlocks, innermost)
+```
+
+**AF_UNIX** (`net/unix/`, Linux af_unix.c order). Sockets talk
+directly: a sender queues a message on the receiver's `rq` while
+holding the receiver's `st`, after copying the data in with no lock
+held; readers copy out under `iolock` only. Messages (and the files
+they carry) are dropped only with no spinlock held: dropping a file
+can release a socket, which takes its own and its peer's `st`.
+`scm::defer_fput` drops files from one loop, so a chain of sockets in
+flight releases iteratively, never by recursion. Waits (`sock::wait_on`
+on our `Sock.wq` or a peer's `peer_wait`) hold no lock; wakeups follow
+the unlock.
+
+RTNL and `sk_lock` are never held together. No network lock is held
+while taking a socket lock (lookups return `Arc` handles), and no lock is
+held across `netif_rx_flush_local()`. Netlink requests are processed in
+the sender's `sendmsg` with no lock held on entry; mutating handlers take
+RTNL. Carrier changes (`netif_carrier_on/off`, from a driver's NAPI poll
+or `open()`) send RTM_NEWLINK without RTNL (NlTable.socks -> NlSock.rxq
+only). A device that is closed while its NAPI poll runs stays masked: the
+poll rewrites IMS only if the device is still up, and `netif_receive_skb`
+drops frames of a down device.
+
+**Driver ISR rules (e1000 pattern):** read ICR (read-to-clear; 0 => not
+ours on a shared line, return false), write IMC (mask all), record causes
+in an atomic, `napi_schedule`. The poll handles link changes (LSC ->
+`netif_carrier_on/off`), reclaims TX, receives up to `budget` frames by
+copying them out of coherent bounce buffers, and when it did less than its
+budget calls `napi_complete_done` and rewrites IMS (a cause latched while
+masked fires then). If its own ISR consumed causes during the poll (shared
+line), it reschedules itself.
+
+Sockets block only in `Sock::wait` (`wait_event_interruptible_timeout`
+on `Sock.wq`) with no lock held; receive paths make the condition true
+under their leaf lock, drop it, then wake. A socket leaves every table at
+last close (`ProtoOps::release`); a TCP connection leaves ehash when it
+reaches CLOSED (an orphan when its close handshake or timers end) or is
+replaced by a TIME_WAIT entry, which leaves after 2MSL.
+
+**TCP and Linux lock_sock.** Linux has two levels: `lock_sock` (an
+owner lock process context holds across user copies and sleeps, with
+a backlog where softirq input waits) and the `bh_lock_sock` spinlock.
+hk input already runs in thread context, so `TcpSock.cb` alone plays
+both parts, with a release-before-sleep discipline: socket calls copy
+user data through a bounded (64 KiB) kernel buffer outside the lock and
+re-check the state at every step, and sleep in `Sock::wait` with no lock
+held. Consequences (deviations): input never waits for a sleeping user
+(no backlog), and concurrent senders on one socket interleave at
+64 KiB steps rather than at sndbuf-wait points. Segments, wakeups and
+errors decided under the lock are carried out after it is dropped
+(`TcpSock::finish`), so no TCP lock is held across a transmit; the
+loopback flush (`netif_rx_flush_local`) runs only at the end of socket
+calls.
+
+**Known gaps (later phases):** RCU for the read-mostly tables (FIB,
+device list, address lists: COW snapshots are the intended next step;
+see plan 3a).
 
 #### Key Device Driver Rules
 
-1. **No IrqSpinlock in drivers** - All driver locks are thread-context only
-2. **ISRs set flags only** - Never acquire locks, defer to thread context
+1. **Driver locks are thread-context only** - ISR-shared state is atomics or
+   core IrqSpinlocks (`napi_schedule`, wait queues)
+2. **ISRs ack and defer** - never take a driver Mutex, defer to thread context
 3. **Atomics for hot paths** - Use atomics for frequently-accessed state
 4. **Completion callbacks are lock-free** - Don't acquire locks in bio/skb completion
 
@@ -1703,12 +2029,21 @@ percpu::preempt_enable();   // preempt_count--
 
 - Timer tick updates (atomic only)
 - Wake sleepers (IrqSpinlock only, per-CPU only)
+- `WaitQueue::wake_one/wake_all` and `wake_up_task` (IrqSpinlocks only)
+- `timer::check_timers()` (CPU 0 tick): peeks `TIMERS` (IrqSpinlock) and
+  wakes `ktimerd`; timer callbacks themselves run in `ktimerd`, process
+  context (they may send signals, take Mutexes, allocate)
+- `napi_schedule()` (NIC ISRs): `Softnet.poll_list` IrqSpinlock push
+  (pre-reserved, no allocation) and a wake of `softnet/N`
+- Workqueues have no IRQ-side work: the worker thread promotes expired
+  delayed work itself, sleeping with a timeout until the next deadline
 - Set reschedule flags (atomic)
 - Read per-CPU data (via GS segment)
 
 ### 7.2 What CANNOT Run in Interrupt Context
 
-- **Memory allocation** (heap/frame allocator use Mutex)
+- **Memory allocation** (frame allocator is a Mutex; the heap is IRQ-safe
+  but IRQ paths must not depend on allocating)
 - **TASK_TABLE access** (uses Mutex)
 - **VFS operations** (use RwLock)
 - **printk** (uses Mutex, consider try_lock for exceptions)
@@ -1718,12 +2053,15 @@ percpu::preempt_enable();   // preempt_count--
 
 If interrupt context needs to trigger something that requires non-IRQ-safe locks:
 
-1. Set a flag (atomic)
-2. The flag is checked at safe points (interrupt exit, scheduler tick)
-3. The actual work is done in thread context
+1. Record the event (atomic, or an IrqSpinlock-protected queue)
+2. Wake a kernel thread (`WaitQueue::wake_*` / `wake_up_task`, IRQ-safe)
+3. The actual work is done in thread context (`ktimerd`, workqueue
+   workers, `softnet/N` threads for network receive)
 
-Example: `needs_reschedule` flag is set in timer ISR, actual reschedule happens
-at interrupt exit when `preempt_count == 0`.
+Example: the CPU 0 tick notices an expired software timer and wakes
+`ktimerd`, which runs the callback (posix timers send signals there). The
+`needs_reschedule` flag set by the tick is currently unused for preemption
+(hk is non-preemptive, see 3.1).
 
 ### 7.4 Complete List of Locks Never Acquired from Interrupt Context
 
@@ -1741,7 +2079,6 @@ interrupt-safety invariant:
 | `TASK_TLS` | kernel/task/tls.rs | `Mutex` | TLS base addresses |
 | `UID_PROCESS_COUNT` | kernel/task/mod.rs | `Mutex` | RLIMIT_NPROC tracking |
 | `FRAME_ALLOCATOR` | kernel/frame_alloc.rs | `Mutex` | Physical frame allocation |
-| Heap allocator | kernel/heap.rs | `Mutex` | Kernel heap allocation |
 | `PAGE_CACHE` | core/page_cache.rs | `Mutex` | Page cache lookup |
 | All VFS locks | kernel/fs/*.rs | `RwLock` | Inodes, dentries, mounts |
 
@@ -1819,7 +2156,7 @@ Features present in Linux but not yet implemented in hk:
 |---------|-------|-----|--------|
 | `spin_lock_bh()` | Disables softirqs | N/A | No softirqs in hk |
 | Softirqs/Tasklets | Deferred interrupt work | Not implemented | ISRs must be minimal |
-| NAPI | Network interrupt mitigation | Not implemented | Higher network IRQ overhead |
+| NAPI | Network interrupt mitigation | NAPI-like: per-CPU `softnet/N` kthreads poll drivers | Receive processing in thread context |
 | Threaded IRQs | IRQ handlers in thread context | Not implemented | All IRQs run in interrupt context |
 | lockdep | Runtime deadlock detection | Not implemented | Manual ordering verification |
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
@@ -1830,8 +2167,9 @@ Features present in Linux but not yet implemented in hk:
 1. **No softirqs**: Device drivers cannot defer work to bottom-half context. All
    deferred work must use workqueues or be handled synchronously.
 
-2. **No NAPI**: Network drivers process each packet in ISR context. High packet
-   rates may cause increased interrupt load.
+2. **NAPI without softirqs**: driver ISRs only ack/mask and `napi_schedule`
+   a per-CPU `softnet/N` kthread that polls the device; protocol processing
+   never runs in interrupt context (see 3.10 Network Subsystem).
 
 3. **No lockdep**: Lock ordering must be verified manually via code review.
    Consider adding compile-time lock ordering enforcement in the future.

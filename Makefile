@@ -136,10 +136,16 @@ run-debug: iso-debug
 test:
 	cargo test -p hk-kernel
 
+# QEMU boot test timeout in seconds (TCG on CI hosts without KVM is slow)
+BOOT_TEST_TIMEOUT ?= 90
+
+# QEMU -cpu override for the boot tests (see run-qemu.sh), e.g. QEMU_CPU=max
+export QEMU_CPU
+
 check: iso
 	@rm -f /tmp/qemu_serial.log
-	@echo "Running boot test (30 second timeout)..."
-	@./run-qemu.sh -t -T 30
+	@echo "Running boot test ($(BOOT_TEST_TIMEOUT) second timeout)..."
+	@./run-qemu.sh -t -T $(BOOT_TEST_TIMEOUT)
 	@if [ ! -f /tmp/qemu_serial.log ]; then \
 		echo "Boot test FAILED - QEMU did not create serial log"; \
 		exit 1; \
@@ -179,8 +185,8 @@ run-arm: build-arm vfat-image
 
 check-arm: build-arm vfat-image
 	@rm -f /tmp/qemu_serial_arm.log
-	@echo "Running ARM boot test (30 second timeout)..."
-	@./run-qemu.sh --arch arm -t -T 30
+	@echo "Running ARM boot test ($(BOOT_TEST_TIMEOUT) second timeout)..."
+	@./run-qemu.sh --arch arm -t -T $(BOOT_TEST_TIMEOUT)
 	@if [ ! -f /tmp/qemu_serial_arm.log ]; then \
 		echo "ARM Boot test FAILED - QEMU did not create serial log"; \
 		exit 1; \

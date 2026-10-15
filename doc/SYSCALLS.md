@@ -70,8 +70,8 @@
 - [x] pwritev
 - [x] pwritev2
 - [x] lseek
-- [x] truncate (x86-64 only, legacy)
-- [x] ftruncate (x86-64 only, legacy)
+- [x] truncate
+- [x] ftruncate
 
 2.3 Special I/O helpers
 
@@ -80,7 +80,7 @@
 - [x] tee
 - [x] vmsplice
 - [x] copy_file_range
-- [x] ioctl (FIONBIO, FIOASYNC, FIOCLEX, FIONCLEX, FIONREAD, TIOCGWINSZ, terminal/tty, virtio-blk, xHCI USB)
+- [x] ioctl (FIONBIO, FIOASYNC, FIOCLEX, FIONCLEX, FIONREAD, TIOCGWINSZ, terminal/tty, virtio-blk, xHCI USB; sockets: FIONREAD/SIOCINQ, SIOCOUTQ, FIOSETOWN/SIOCSPGRP, FIOGETOWN/SIOCGPGRP, SIOCGIFCONF, SIOCGIFINDEX, SIOCGIFNAME, SIOC[GS]IFFLAGS, SIOC[GS]IFADDR, SIOC[GS]IFNETMASK, SIOC[GS]IFBRDADDR, SIOCGIFHWADDR, SIOC[GS]IFMTU, SIOCADDRT, SIOCDELRT)
 - [x] sync
 - [x] fsync
 - [x] fdatasync
@@ -107,7 +107,8 @@
 - [x] readlink (x86-64 only, legacy; use readlinkat)
 - [x] readlinkat
 - [x] mknod (x86-64 only, legacy; use mknodat)
-- [x] mknodat
+- [x] mknodat (S_IFSOCK makes a socket inode; FIFOs are created as
+  regular files for now)
 - [x] chdir
 - [x] fchdir
 - [x] getcwd
@@ -119,7 +120,7 @@ New kernels mostly use statx; older ones use stat/lstat/fstat.
 
 - [x] stat (x86-64 only, legacy; use fstatat/statx)
 - [x] lstat (x86-64 only, legacy; use fstatat/statx)
-- [x] fstat (x86-64 only, legacy; use fstatat/statx)
+- [x] fstat (x86-64 and arm64: __NR3264_fstat 80)
 - [x] newfstatat (fstatat on aarch64)
 - [x] statfs (x86-64 only, legacy)
 - [x] fstatfs (x86-64 only, legacy)
@@ -128,7 +129,7 @@ New kernels mostly use statx; older ones use stat/lstat/fstat.
 Permissions and ownership:
 
 - [x] access (x86-64 only, legacy; use faccessat)
-- [x] faccessat
+- [x] faccessat (no flags argument; flags need faccessat2)
 - [x] faccessat2
 - [x] chmod (x86-64 only, legacy; use fchmodat)
 - [x] fchmod
@@ -284,24 +285,113 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 
 Linux groups the socket syscalls as their own "network" category.
 
-- [x] socket
-- [x] socketpair
-- [x] bind
-- [x] listen
+Families: AF_INET (SOCK_STREAM/TCP, SOCK_DGRAM/UDP) and AF_NETLINK
+(SOCK_RAW/SOCK_DGRAM, NETLINK_ROUTE: links, IPv4 addresses and routes,
+neighbours; SOL_NETLINK options ADD/DROP_MEMBERSHIP, PKTINFO, NO_ENOBUFS,
+CAP_ACK, EXT_ACK, GET_STRICT_CHK, LIST_MEMBERSHIPS), AF_UNIX
+(SOCK_STREAM, SOCK_DGRAM (SOCK_RAW is an alias), SOCK_SEQPACKET). Other
+families (AF_INET6, AF_PACKET) are EAFNOSUPPORT for now.
+
+Sockets are sockfs inodes (fstat S_IFSOCK, /proc/<pid>/fd -> socket:[N]).
+Blocking follows the file's O_NONBLOCK at every call (fcntl, FIONBIO)
+and MSG_DONTWAIT; SO_RCVTIMEO/SO_SNDTIMEO time out with EAGAIN; signals
+restart per SA_RESTART unless a socket timeout is set (EINTR). EPIPE
+raises SIGPIPE unless MSG_NOSIGNAL. Unknown options are ENOPROTOOPT
+(EOPNOTSUPP for getsockopt at unknown levels, like Linux).
+
+TCP (RFC 9293): all eleven states, RFC 5961 checks, retransmission with
+RFC 6298 RTO (1 s initial, 200 ms - 120 s, Karn, backoff), MSS option
+(536 if absent, PMTU from ICMP frag needed), RFC 6528 ISNs, TIME_WAIT
+60 s (entries re-ACK a retransmitted FIN; SO_REUSEADDR rebinds; a SYN
+with a newer timestamp reopens), half-close, RST on close with unread
+data and with SO_LINGER {1, 0}, SO_LINGER timeouts on close, ICMP errors
+(hard in SYN_SENT, soft otherwise, SO_ERROR on timeout). RFC 7323 window
+scaling (scale from tcp_rmem[2], or the buffer when SO_RCVBUF is set)
+and timestamps (ms clock with a keyed per-connection offset; RTT from
+every echo; PAWS with Linux's RST and disordered-ACK exceptions).
+Congestion control: Reno/NewReno behind a pluggable interface (only
+"reno"; CUBIC is not implemented), RFC 6928 initial window, byte-counted
+slow start / congestion avoidance growing only while cwnd-limited,
+restart after idle. Delayed ACKs (40 ms ATO, quickack at start, ACK
+every second full segment when the reader keeps up, interactive
+pingpong mode), Nagle (Minshall), TCP_CORK and MSG_MORE (200 ms
+ceiling), zero-window probes, keepalive, TCP_USER_TIMEOUT. Sysctls:
+tcp_syn_retries, tcp_synack_retries, tcp_retries2, tcp_fin_timeout,
+tcp_window_scaling, tcp_timestamps, tcp_rmem, tcp_keepalive_time/intvl/
+probes, tcp_congestion_control, tcp_available_congestion_control.
+/proc/net/tcp lists listeners, connections and TIME_WAIT entries. Not
+yet: SACK (never advertised), receive buffer autotuning, the per-netns
+challenge-ACK budget (out-of-window and challenge ACKs are limited per
+connection to one per 500 ms like tcp_invalid_ratelimit); listeners keep full child sockets in SYN_RECEIVED
+(no SYN cookies).
+
+- [x] socket (AF_INET: TCP, UDP, ping SOCK_DGRAM/IPPROTO_ICMP gated by
+  ping_group_range, SOCK_RAW with CAP_NET_RAW: IP_HDRINCL, SOL_RAW
+  ICMP_FILTER; AF_NETLINK)
+- [x] socketpair (AF_UNIX all types, peer credentials of the creator;
+  AF_INET/AF_NETLINK: EOPNOTSUPP like Linux)
+- [x] bind (SO_REUSEADDR/SO_REUSEPORT rules, EADDRNOTAVAIL, EACCES < 1024)
+- [x] listen (autobinds; backlog capped at somaxconn 4096; at most
+  backlog + 1 connections wait for accept, later SYNs are dropped)
 - [x] accept
-- [x] accept4
-- [x] connect
+- [x] accept4 (SOCK_NONBLOCK, SOCK_CLOEXEC)
+- [x] connect (UDP: route + autobind, AF_UNSPEC disconnects; TCP:
+  EINPROGRESS/EALREADY/EISCONN, ECONNREFUSED, ETIMEDOUT, EHOSTUNREACH;
+  ephemeral ports shared by different four-tuples like Linux; AF_UNSPEC
+  disconnects)
 - [x] getsockname
 - [x] getpeername
-- [x] getsockopt (SO_REUSEADDR, SO_ERROR, SO_TYPE, SO_DOMAIN, SO_PROTOCOL, SO_BROADCAST, SO_DONTROUTE, SO_LINGER, SO_SNDBUF, SO_RCVBUF, SO_KEEPALIVE, TCP_NODELAY, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT)
-- [x] setsockopt (SO_REUSEADDR, SO_BROADCAST, SO_DONTROUTE, SO_LINGER, SO_SNDBUF, SO_RCVBUF, SO_KEEPALIVE, TCP_NODELAY, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT)
+- [x] getsockopt / setsockopt: SOL_SOCKET (SO_TYPE, SO_DOMAIN,
+  SO_PROTOCOL, SO_ERROR, SO_ACCEPTCONN, SO_REUSEADDR, SO_REUSEPORT,
+  SO_KEEPALIVE, SO_BROADCAST, SO_DONTROUTE, SO_OOBINLINE, SO_LINGER,
+  SO_SNDBUF/RCVBUF (+FORCE), SO_RCVLOWAT, SO_SNDLOWAT, SO_RCVTIMEO,
+  SO_SNDTIMEO, SO_BINDTODEVICE, SO_BINDTOIFINDEX, SO_PRIORITY, SO_MARK,
+  SO_TIMESTAMP, SO_TIMESTAMPNS, SO_RXQ_OVFL, SO_PASSCRED, SO_PEERCRED,
+  SO_COOKIE, SO_DEBUG), SOL_IP (IP_TOS, IP_TTL, IP_PKTINFO, IP_RECVTTL,
+  IP_RECVTOS, IP_RECVERR, IP_MTU_DISCOVER (DONT/WANT fragment, DO/PROBE
+  EMSGSIZE), IP_MTU, IP_FREEBIND,
+  IP_BIND_ADDRESS_NO_PORT, IP_MULTICAST_TTL/LOOP), IPPROTO_TCP
+  (TCP_NODELAY, TCP_MAXSEG, TCP_CORK, TCP_KEEPIDLE, TCP_KEEPINTVL,
+  TCP_KEEPCNT, TCP_SYNCNT, TCP_QUICKACK, TCP_USER_TIMEOUT, TCP_INFO
+  (struct tcp_info, 280 bytes), TCP_CONGESTION ("reno"; others ENOENT),
+  TCP_NOTSENT_LOWAT; TCP_DEFER_ACCEPT and TCP_FASTOPEN are accepted and
+  read back but have no effect)
 - [x] sendto
 - [x] recvfrom
-- [x] sendmsg
-- [x] recvmsg
+- [x] sendmsg (IP_PKTINFO/IP_TTL/IP_TOS control messages)
+- [x] recvmsg (MSG_PEEK, MSG_TRUNC, MSG_WAITALL, MSG_ERRQUEUE: ICMP and
+  local errors queued with IP_RECVERR, sock_extended_err + offender in
+  an IP_RECVERR cmsg; IP_PKTINFO, IP_TTL, IP_TOS, SCM_TIMESTAMP(NS),
+  SO_RXQ_OVFL control messages)
 - [x] sendmmsg
-- [x] recvmmsg
-- [x] shutdown
+- [x] recvmmsg (MSG_WAITFORONE, timeout)
+- [x] shutdown (ENOTCONN when not connected; TCP SHUT_WR sends a FIN
+  and keeps receiving; AF_UNIX mirrors it onto a stream/seqpacket peer)
+
+AF_UNIX (Linux af_unix.c): filesystem names create an S_IFSOCK inode
+(umask, DAC on the directory; EADDRINUSE if it exists; connect needs
+write permission on it; unlink does not unbind), abstract names
+(sun_path[0] == 0) per network namespace and socket type, autobind
+("\0" + 5 hex digits) on bind with only the family or on connect/send
+with SO_PASSCRED; Linux name lengths (unnamed = 2). Streams: listen
+backlog (full: blocks, or EAGAIN), connect completes before accept,
+reads join messages but stop after one carrying files (and, with
+SO_PASSCRED, at a change of sender), SO_SNDBUF bounds what a writer has
+queued, EPIPE + SIGPIPE, ECONNRESET when the peer closed with unread
+data. Datagrams: boundaries, MSG_TRUNC, net.unix.max_dgram_qlen (10)
+for senders the receiver is not connected back to (blocks, EAGAIN, no
+POLLOUT until room), EPERM from a socket connected elsewhere,
+ECONNREFUSED once when a connected peer closed. SEQPACKET: boundaries,
+EOF after the peer closes, EPIPE without SIGPIPE. Ancillary data:
+SCM_RIGHTS (up to 253 files per message, MSG_CTRUNC and the extra files
+closed when the control buffer is short, MSG_CMSG_CLOEXEC, MSG_PEEK
+duplicates), SCM_CREDENTIALS with SO_PASSCRED (senders may only claim
+their own pid and ids without CAP_SYS_ADMIN/CAP_SETUID/CAP_SETGID),
+SO_PEERCRED. In-flight files are capped per user near RLIMIT_NOFILE
+(ETOOMANYREFS). FIONREAD/SIOCINQ/SIOCOUTQ; /proc/net/unix. Not yet:
+MSG_OOB, garbage collection of unreachable in-flight sockets (the cap
+bounds them), SO_PEEK_OFF, SO_PASSPIDFD/SCM_PIDFD, SO_PEERGROUPS,
+SO_INQ, SIOCUNIXFILE.
 
 9. Polling & event notification
 9.1 Select/poll/epoll

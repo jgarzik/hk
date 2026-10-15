@@ -22,50 +22,185 @@ pid == tid. hk draws pids and tids from separate counters, so e.g.
 TIDs say 3. Anything comparing those values (pthread joins, tgkill to a
 returned pid, `/proc/<pid>/task`) can disagree with Linux.
 
-## Raw user-memory copies outside kernel/uaccess.rs
+## Raw user-memory access in the pre-VFS minimal write
 
-**Location**: `kernel/fs/iov.rs`, `kernel/task/process_vm.rs`,
-`kernel/mm/mempolicy.rs`, `kernel/ipc/mqueue.rs`, `kernel/ns/uts.rs`,
-`kernel/fs/perm.rs`, and direct `*(ptr as *mut T)` writes (e.g. wait4
-status)
+**Location**: `kernel/arch/x86_64/syscall.rs`
 
-Unpopulated-but-valid user pages are now demand-faulted for any kernel
-access, but only `copy_{to,from}_user`/`get_user`/`put_user`/
-`strncpy_from_user` and `read`/`write` have an exception fixup. Other
-sites still copy with `core::ptr` and panic on a truly invalid user
-address instead of returning EFAULT; convert them to the uaccess helpers.
+All syscall paths copy user memory through the uaccess helpers (the boot
+tests run with SMAP on x86 TCG `-cpu max` and PAN on arm `neoverse-n1`).
+The only raw access left is the early minimal `write`, unused once the
+VFS handler is registered.
 
-## Signal-killed children report as exited
+## Network stack gaps (later phases of the network chunk)
 
-**Location**: `kernel/signal/mod.rs` handle_default_action,
-`kernel/task/proc.rs` sys_wait4 / sys_waitid
+**Location**: `kernel/net/`
 
-A child killed by a signal is recorded as `exit(sig | 0x80)`, so wait4
-gives wstatus 0x8900 (WIFEXITED) instead of WIFSIGNALED/WTERMSIG=sig,
-and waitid never reports CLD_KILLED. Shells and supervisors misreport
-crashes. Track exit code and terminating signal separately.
+Listed because real traffic reaches them: TCP has no SACK (never
+advertised), no CUBIC (only "reno"; Linux defaults to cubic), no
+receive buffer autotuning (the window is SO_RCVBUF / 2), no per-netns
+RFC 5961 challenge-ACK budget (only Linux's per-connection 500 ms
+limit), and TCP_DEFER_ACCEPT / TCP_FASTOPEN are stored only.
+tcp_timestamps accepts 0..255 like Linux; any value but 1 sends the raw
+ms clock (no offset), as in Linux. No SYN cookies (a full listener drops SYNs). ICMP
+timestamp requests are not answered.
+Neighbour entries are not confirmed by TCP progress (only ARP), there is
+no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
+IP: no ipfrag_max_dist, no IP options on output (received options are
+validated and skipped; source-routed packets are dropped), no
+IP_TRANSPARENT. Ping sockets check only the effective gid against
+ping_group_range (hk has no supplementary groups). /proc/net/raw and
+/proc/net/icmp do not exist.
+UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
+SO_PEEK_OFF is EOPNOTSUPP.
 
-## x86-64: SIGKILL does not wake a task sleeping in rt_sigsuspend
+## AF_UNIX gaps
 
-A child blocked in rt_sigsuspend that later receives SIGKILL from its
-parent never wakes (stays on the sleep queue) while the parent spins in
-wait4's `yield_now` loop; the boot test hangs. Same test completes on
-aarch64. Root cause unknown. Related: `send_signal` does not wake
-sleeping tasks in general (sigsuspend/poll re-check each tick).
+**Location**: `kernel/net/unix/`
 
-## x86-64 syscall 34 is dispatched as nice, not pause
+No garbage collector for in-flight sockets: a socket whose only
+references are messages queued on sockets that are themselves only
+reachable that way (e.g. a socket's own descriptor sent to itself, then
+closed) stays allocated with its queue. Linux collects such cycles
+(net/unix/garbage.c). hk bounds them instead: files in flight are
+charged to the sending user and further SCM_RIGHTS sends fail with
+ETOOMANYREFS once the count exceeds RLIMIT_NOFILE (Linux's
+too_many_unix_fds rule), so a user can pin at most about RLIMIT_NOFILE
+files (plus the queues of those sockets, each bounded by SO_SNDBUF and
+max_dgram_qlen). Unlike Linux the count is also capped at 2024 (Linux's
+UNIX_INFLIGHT_SANE_USER), so raising RLIMIT_NOFILE does not raise what
+can be pinned. Socket paths must be UTF-8 (other bytes are EINVAL).
 
-On x86-64, 34 is `pause` (neither arch has a `nice` syscall), and hk
-has no `sys_pause` at all although doc/SYSCALLS.md lists it. Fix:
-implement pause (sleep until a signal is delivered, return -EINTR),
-remove the dead sys_nice. A test is blocked on the two bugs above.
+Not implemented: MSG_OOB on streams (EOPNOTSUPP; Linux supports one
+out-of-band byte), SO_PEEK_OFF, SO_PASSPIDFD / SCM_PIDFD /
+SO_PEERPIDFD, SO_PEERGROUPS, SO_INQ / SCM_INQ, SO_RIGHTS_NOTRUNC,
+SIOCUNIXFILE, SO_PEERSEC (ENOPROTOOPT, as on Linux without an LSM).
+mknod(S_IFIFO) still creates a regular file.
 
-## aarch64 tick length vs. NS_PER_TICK
+## File permission (DAC) gaps
 
-`kernel/time_syscall.rs` nanosleep assumes 10 ms ticks, but on aarch64
-3 ticks measured ~6 ms. Check the arm timer programming vs. the
-constant; sleeps may be wrong by the ratio.
+**Location**: `kernel/fs/dac.rs`, `kernel/task/exec.rs`
 
+Linux DAC is enforced on the VFS paths (search on every walked directory,
+may_open, may_create/may_delete with the sticky rule, owner-only attribute
+changes, set-id clearing, capability overrides by fsuid/fsgid). Missing:
+no supplementary groups (no setgroups/getgroups; group class checks use the
+fsgid only); fs.protected_hardlinks/symlinks/fifos/regular do not exist
+(behave as their kernel default 0); execve ignores S_ISUID/S_ISGID and file
+capabilities (so MS_NOSUID has nothing to suppress); no
+immutable/append-only inodes (no IS_APPEND/IS_IMMUTABLE EPERM);
+chmod/chown do not update ctime; ETXTBSY is not enforced.
+
+## Spinlocks where Linux uses sleeping locks
+
+**Location**: `kernel/sync` (Mutex, RwSem), various
+
+Only `i_rwsem`, `s_vfs_rename_mutex` and `f_pos_lock` are sleeping locks
+so far. Linux rw_semaphores/mutexes still modeled as `spin` locks include
+the mmap lock (`MmStruct`), the mount namespace/topology locks
+(namespace_sem, `Mount` RwLocks), `s_umount` (absent), the fd table lock,
+pipe locks and RTNL: their holders must not sleep. There are no
+`_killable`/`_interruptible`/`try` variants of the sleeping locks yet
+(no callers need them).
+
+## Mount flag gaps
+
+**Location**: `kernel/fs/misc.rs` sys_mount/sys_umount2, `kernel/fs/mount.rs`
+
+Honored: CAP_SYS_ADMIN (EPERM), MS_RDONLY (EROFS on every change, on the
+superblock), MS_NOSUID/MS_NODEV/MS_NOEXEC (per mount), MS_REMOUNT of those
+flags, statfs f_flags and /proc/mounts options. Accepted without effect
+because hk already behaves that way: atime flags (no atime updates),
+MS_SILENT, MS_MANDLOCK, MS_POSIXACL, MS_I_VERSION, MS_LAZYTIME, and
+MS_PRIVATE/MS_UNBINDABLE (mounts never propagate, no bind mounts).
+EINVAL instead of Linux behavior: MS_BIND (also MS_REMOUNT|MS_BIND),
+MS_MOVE, MS_SHARED, MS_SLAVE, MS_SYNCHRONOUS, MS_DIRSYNC, MS_NOSYMFOLLOW
+and umount2 MNT_EXPIRE. Read-only state is one flag, SB_RDONLY on the
+superblock (no separate MNT_READONLY: without bind mounts a superblock
+has one mount per namespace). Write access (`SuperBlock::want_write`,
+Linux mnt_want_write) is held by open-for-write files and across each
+modifying syscall; a rw->ro remount is EBUSY while any is held. Unlike
+Linux (MNT_WRITE_HOLD), a want_write racing a remount that then fails
+with EBUSY can see a spurious EROFS. Not done: mount data/options
+strings are ignored; mounts are not user-namespace aware (plain
+capable()).
+
+## Global init is not protected from default-action signals
+
+**Location**: `kernel/signal/mod.rs` send_signal
+
+Linux drops signals with a default action of terminate/stop sent to
+global init (SIGNAL_UNKILLABLE), e.g. SIGPIPE from a write to a broken
+socket. hk delivers them, so pid 1 (the boot tester) dies. Socket tests
+use MSG_NOSIGNAL / SIG_IGN and check SIGPIPE in forked children.
+
+## The initial user stack does not grow
+
+**Location**: `kernel/task/exec.rs` setup_user_stack, `kernel/main.rs`
+(init)
+
+The main thread's stack is mapped eagerly at exec (RLIMIT_STACK, or
+1 MB when unlimited; init's is 1 MB: it was 16 KB, which made deep
+frames fault or hang the boot tester)
+and is not a growable VMA: Linux maps it lazily and expands it on demand
+up to RLIMIT_STACK.
+
+## NETLINK_ROUTE / SIOC* subset gaps (P3)
+
+**Location**: `kernel/net/netlink/rtnetlink.rs`, `kernel/net/devioctl.rs`
+
+Implemented: link get/dump/change (IFF_UP, MTU), IPv4 address and route
+add/delete/dump, route get (output routes), neighbour get/dump/add/delete,
+notifications (none yet for neighbour state changes: no RTNLGRP_NEIGH;
+no proxy ARP entries, NTF_USE or NDA_PROTOCOL).
+Missing, each answered with a Linux errno rather than silently: link
+creation and rename (EOPNOTSUPP), multipath routes and nexthop objects
+(EOPNOTSUPP), input-route simulation `ip route get ... iif` (EOPNOTSUPP),
+NLM_F_ECHO (not echoed), extended-ACK message/offset TLVs (plain errors),
+RTM_GETRULE dumps nothing (Linux lists its three default IPv4 rules; there
+is no rule engine: lookups are local then main), address lifetimes are
+always infinite, promote_secondaries is off.
+
+## Rare arm64 kernel instruction abort in the fault-signal tests
+
+**Location**: unknown (CPU 0, right after `FAULT_SEGV_ACCERR`, i.e. while
+`FAULT_SIGILL` runs `udf` in user mode)
+
+Seen once in ~100 `make check-arm` runs (QEMU neoverse-n1 with PAN, -smp
+4): "KERNEL PANIC ... exceptions.rs:95" (kernel instruction abort). The
+panic handler then dropped formatted messages, so ELR/FAR were lost; it
+prints them now. Not reproduced in 90 further runs (sequential and 8 in
+parallel). Next occurrence: capture the Message line.
+
+## Unlinked ramfs files keep their page-cache pages
+
+**Location**: `kernel/mm/page_cache.rs` (`invalidate_file` has no
+caller), `kernel/fs/ramfs.rs`
+
+The page cache holds at most 1024 pages, and ramfs pages are
+unevictable. When the last reference to an unlinked ramfs file goes
+away its pages are not released (only truncate frees them), so writing
+and deleting a few MB of /tmp files makes later writes fail with EIO.
+Tests truncate big files before unlinking them.
+
+## Partial munmap of an anonymous mapping drops the rest of it
+
+mmap(2 pages) then munmap(second page): mincore on the still-mapped
+first page returns ENOMEM (no VMA), where Linux returns 0. Seen while
+writing the uaccess boot tests; not investigated.
+
+## The kernel heap is a fixed 16MB region
+
+**Location**: `kernel/main.rs` (`x86_64_heap`, `aarch64_heap`), `kernel/heap.rs`
+
+The heap is one fixed range placed at boot: on x86 from above the
+kernel image and multiboot modules/info up to 18MB (where the frame
+allocator starts, so ~14MB minus the boot data); on aarch64 16MB at the
+first 2MB boundary past the kernel image, DTB and DTB initrd, with the
+frame allocator starting at its end. Both arches panic at boot if the
+heap would overlap the kernel image or boot data. The heap never grows
+and does not draw on the frame allocator, so heap-heavy workloads hit
+allocation failure long before RAM runs out; to be fixed with the
+allocator redesign (heap backed by frames, slab caches).
 
 ## Heap Corruption in Arc<T> Struct Fields
 

@@ -1,333 +1,302 @@
 //! Wait queue infrastructure for blocking synchronization
 //!
-//! Provides a mechanism for tasks to sleep waiting for an event and be woken
-//! by another task. This follows Linux's wait queue design:
+//! Linux-style wait queues (include/linux/wait.h, kernel/sched/wait.c):
 //!
-//! - Tasks calling `wait()` are added to the queue and sleep
-//! - Tasks calling `wake_one()` or `wake_all()` wake sleeping tasks
+//! - A sleeper registers on the queue and sets its sleep state *before*
+//!   re-checking its condition (`prepare_to_wait`), then calls `schedule()`.
+//!   A wakeup that lands between the check and `schedule()` flips the state
+//!   back to Running, so `schedule()` returns at once: no lost wakeups.
+//! - `wait_event*` wrap the loop; the `_interruptible` variants return
+//!   `Err(KernelError::RestartSys)` when a signal is pending (the syscall
+//!   exit path turns that into a restart or -EINTR), `_timeout` variants
+//!   take scheduler ticks and return the ticks left.
+//! - Wakers (`wake_one`/`wake_all`) may run in any context, including IRQ
+//!   handlers: the queue lock is an `IrqSpinlock` and the task wakeup only
+//!   takes run-queue locks (never TASK_TABLE).
 //!
-//! ## Usage Example
+//! ## Usage
 //!
 //! ```ignore
-//! static WAITQ: WaitQueue = WaitQueue::new();
-//!
-//! // Thread A: Wait for event
-//! WAITQ.wait();
-//!
-//! // Thread B: Signal event
-//! WAITQ.wake_one();
+//! static WQ: WaitQueue = WaitQueue::new();
+//! // sleeper
+//! WQ.wait_event_interruptible(|| data_ready())?;
+//! // waker: make the condition true first, then
+//! WQ.wake_all();
 //! ```
 //!
 //! ## Lock Ordering
 //!
-//! WaitQueue uses an internal IrqSpinlock. It should be acquired after any
-//! higher-level locks (e.g., page cache lock) but before doing the sleep.
+//! The queue's IrqSpinlock is a leaf: no other lock is taken while holding
+//! it (wakeups are issued after it is dropped). Never call a `wait*`
+//! function while holding a spinlock.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
-use crate::task::{Priority, TaskState, Tid};
+use crate::error::KernelError;
+use crate::task::Tid;
+use crate::task::percpu::{
+    MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current_cpu, current_tid, schedule,
+    schedule_timeout, set_current_state, wake_up_task,
+};
 
-/// Wait queue entry flags
-pub mod flags {
-    /// Entry has been woken
-    pub const WQ_FLAG_WOKEN: u32 = 1 << 0;
-    /// Exclusive waiter (wake only one)
-    pub const WQ_FLAG_EXCLUSIVE: u32 = 1 << 1;
-}
+/// Source of unique wait entry ids
+static NEXT_WAIT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// An entry in the wait queue
 #[derive(Debug)]
-pub struct WaitQueueEntry {
-    /// Task ID of the waiting task
-    pub tid: Tid,
-    /// Task priority (cached for wake-up re-enqueue)
-    pub priority: Priority,
-    /// Flags (WQ_FLAG_WOKEN, etc.)
-    pub flags: AtomicU32,
+struct WaitQueueEntry {
+    /// Unique id (identifies the registration for removal)
+    id: u64,
+    /// Waiting task
+    tid: Tid,
+    /// CPU owning the waiting task
+    cpu: u32,
+    /// Remove the entry when it is woken (autoremove_wake_function); poll
+    /// registrations stay until the poll ends
+    autoremove: bool,
 }
 
-impl WaitQueueEntry {
-    /// Create a new wait queue entry for the current task
-    pub fn new(tid: Tid, priority: Priority) -> Self {
-        Self {
-            tid,
-            priority,
-            flags: AtomicU32::new(0),
-        }
-    }
-
-    /// Check if this entry has been woken
-    pub fn is_woken(&self) -> bool {
-        self.flags.load(Ordering::Acquire) & flags::WQ_FLAG_WOKEN != 0
-    }
-
-    /// Mark this entry as woken
-    pub fn set_woken(&self) {
-        self.flags.fetch_or(flags::WQ_FLAG_WOKEN, Ordering::Release);
-    }
+/// A task's registration on one wait queue (Linux `wait_queue_entry`)
+///
+/// Create with [`WaitEntry::new`], pass to `prepare_to_wait` in the wait
+/// loop and to `finish_wait` when done.
+#[derive(Debug, Default)]
+pub struct WaitEntry {
+    id: u64,
 }
 
-/// Internal wait queue head (protected by IrqSpinlock)
-struct WaitQueueHead {
-    /// List of waiting tasks
-    waiters: Vec<WaitQueueEntry>,
-}
-
-impl WaitQueueHead {
-    /// Create an empty wait queue head
-    const fn new() -> Self {
-        Self {
-            waiters: Vec::new(),
-        }
+impl WaitEntry {
+    /// A fresh (unregistered) entry
+    pub const fn new() -> Self {
+        Self { id: 0 }
     }
 }
 
 /// A wait queue for blocking synchronization
 ///
-/// Tasks can wait on this queue and be woken by other tasks.
-/// The queue is protected by an IRQ-safe spinlock to allow
-/// wake operations from interrupt context.
+/// Tasks can wait on this queue and be woken by other tasks or IRQ
+/// handlers.
 pub struct WaitQueue {
-    /// Protected wait queue head
-    head: IrqSpinlock<WaitQueueHead>,
+    /// Waiters (FIFO)
+    head: IrqSpinlock<Vec<WaitQueueEntry>>,
 }
 
 // Safety: WaitQueue uses internal synchronization via IrqSpinlock
 unsafe impl Send for WaitQueue {}
 unsafe impl Sync for WaitQueue {}
 
+/// True if the current task has a deliverable signal pending
+pub fn signal_pending() -> bool {
+    crate::signal::has_pending_signals(current_tid())
+}
+
 impl WaitQueue {
     /// Create a new empty wait queue
     pub const fn new() -> Self {
         Self {
-            head: IrqSpinlock::new(WaitQueueHead::new()),
+            head: IrqSpinlock::new(Vec::new()),
         }
     }
 
-    /// Wait on this queue until woken
+    /// Register the current task (if not registered) and set its state
     ///
-    /// The current task is added to the wait queue and put to sleep.
-    /// It will be woken when another task calls `wake_one()` or `wake_all()`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called when scheduling is not enabled or there is no current task.
-    pub fn wait(&self) {
-        use crate::arch::{ContextOps, PerCpuOps};
-        use crate::task::percpu::{SCHEDULING_ENABLED, TASK_TABLE, current_percpu_sched};
+    /// Linux `prepare_to_wait`: call at the top of every wait-loop
+    /// iteration, then re-check the condition, then `schedule()`.
+    pub fn prepare_to_wait(&self, entry: &mut WaitEntry, state: SleepState) {
+        self.add_entry(entry, true);
+        set_current_state(state);
+    }
 
-        #[cfg(target_arch = "x86_64")]
-        type CurrentArch = crate::arch::x86_64::X86_64Arch;
-        #[cfg(target_arch = "aarch64")]
-        type CurrentArch = crate::arch::aarch64::Aarch64Arch;
+    /// Register the current task without autoremove (poll/select): the
+    /// entry stays queued across wakeups until `remove_entry`.
+    pub fn add_poll_entry(&self, entry: &mut WaitEntry) {
+        self.add_entry(entry, false);
+    }
 
-        use crate::task::{Cred, CurrentTask};
-
-        if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
-            // If scheduling not enabled, busy-wait (should not happen in normal use)
-            panic!("WaitQueue::wait() called before scheduling enabled");
-        }
-
-        let sched = current_percpu_sched().expect("No scheduler for current CPU");
-        if !sched.initialized.load(Ordering::Acquire) {
-            panic!("WaitQueue::wait() called before scheduler initialized");
-        }
-
-        // Get current TID
-        let current_tid: Tid = CurrentArch::current_tid();
-        if current_tid == 0 {
-            panic!("WaitQueue::wait() called with no current task");
-        }
-
-        // Get priority and mark task as waiting (acquire TASK_TABLE first per lock ordering)
-        let priority = {
-            let mut table = TASK_TABLE.lock();
-            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == current_tid) {
-                task.state = TaskState::Sleeping;
-                task.priority
-            } else {
-                128 // Default priority
-            }
-        };
-
-        // Add ourselves to the wait queue
-        {
-            let mut head = self.head.lock();
-            head.waiters
-                .push(WaitQueueEntry::new(current_tid, priority));
-        }
-
-        // Now do the context switch to sleep
-        // Take the run queue lock
-        let mut rq = sched.lock.lock();
-
-        // Verify we're still current
-        if rq.current != Some(current_tid) {
-            // Race condition - just return
+    fn add_entry(&self, entry: &mut WaitEntry, autoremove: bool) {
+        let mut head = self.head.lock();
+        if entry.id != 0 && head.iter().any(|e| e.id == entry.id) {
             return;
         }
+        if entry.id == 0 {
+            entry.id = NEXT_WAIT_ID.fetch_add(1, Ordering::Relaxed);
+        }
+        head.push(WaitQueueEntry {
+            id: entry.id,
+            tid: current_tid(),
+            cpu: current_cpu(),
+            autoremove,
+        });
+    }
 
-        // Get next task
-        let next_tid = rq
-            .queue()
-            .dequeue_highest()
-            .expect("Idle task should always be runnable");
-
-        if next_tid == current_tid {
-            // Shouldn't happen, but handle it
+    /// Remove a registration (no-op if a wakeup already removed it)
+    pub fn remove_entry(&self, entry: &WaitEntry) {
+        if entry.id == 0 {
             return;
         }
-
-        // Get next task's info from TASK_TABLE
-        let (
-            next_kstack,
-            next_pid,
-            next_ppid,
-            next_pgid,
-            next_sid,
-            next_cr3,
-            next_cred,
-            next_seccomp_mode,
-        ) = {
-            let table = TASK_TABLE.lock();
-            table
-                .tasks
-                .iter()
-                .find(|t| t.tid == next_tid)
-                .map(|t| {
-                    (
-                        t.kstack_top,
-                        t.pid,
-                        t.ppid,
-                        t.pgid,
-                        t.sid,
-                        t.page_table.root_table_phys(),
-                        t.cred.clone(),
-                        t.seccomp_mode,
-                    )
-                })
-                .unwrap_or((0, 0, 0, 0, 0, 0, alloc::sync::Arc::new(Cred::ROOT), 0))
-        };
-
-        // Get context pointers
-        let current_ctx = rq.get_context_mut(current_tid);
-        let next_ctx = rq.get_context(next_tid);
-
-        if let (Some(curr), Some(next)) = (current_ctx, next_ctx) {
-            // Update current task
-            rq.current = Some(next_tid);
-
-            // Update per-CPU state
-            CurrentArch::set_current_tid(next_tid);
-            CurrentArch::set_current_task(&CurrentTask {
-                tid: next_tid,
-                pid: next_pid,
-                ppid: next_ppid,
-                pgid: next_pgid,
-                sid: next_sid,
-                cred: *next_cred,
-                seccomp_mode: next_seccomp_mode,
-            });
-
-            // Context switch
-            unsafe {
-                CurrentArch::context_switch(curr, next, next_kstack, next_cr3, next_tid);
-            }
+        let mut head = self.head.lock();
+        if let Some(pos) = head.iter().position(|e| e.id == entry.id) {
+            head.remove(pos);
         }
-
-        // We return here when woken up
     }
 
-    /// Wake one waiter from the queue
-    ///
-    /// Wakes the first task waiting on this queue and makes it runnable.
-    /// Returns true if a task was woken, false if the queue was empty.
-    pub fn wake_one(&self) -> bool {
-        use crate::task::TaskState;
-        use crate::task::percpu::{TASK_TABLE, current_percpu_sched};
-
-        let entry = {
-            let mut head = self.head.lock();
-            if head.waiters.is_empty() {
-                return false;
-            }
-            // Remove first waiter (FIFO order for fairness)
-            head.waiters.remove(0)
-        };
-
-        // Mark task as ready in TASK_TABLE
-        {
-            let mut table = TASK_TABLE.lock();
-            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == entry.tid) {
-                task.state = TaskState::Ready;
-            }
-        }
-
-        // Add to run queue
-        if let Some(sched) = current_percpu_sched()
-            && sched.initialized.load(Ordering::Acquire)
-        {
-            let mut rq = sched.lock.lock();
-            rq.queue().enqueue(entry.tid, entry.priority);
-            rq.nr_running += 1;
-        }
-
-        true
+    /// End a wait: back to Running and unregister (Linux `finish_wait`)
+    pub fn finish_wait(&self, entry: &WaitEntry) {
+        set_current_state(SleepState::Running);
+        self.remove_entry(entry);
     }
 
-    /// Wake all waiters from the queue
-    ///
-    /// Wakes all tasks waiting on this queue and makes them runnable.
-    /// Returns the number of tasks woken.
-    pub fn wake_all(&self) -> usize {
-        use crate::task::TaskState;
-        use crate::task::percpu::{TASK_TABLE, current_percpu_sched};
-
-        let entries: Vec<WaitQueueEntry> = {
-            let mut head = self.head.lock();
-            core::mem::take(&mut head.waiters)
-        };
-
-        if entries.is_empty() {
-            return 0;
+    /// Sleep (uninterruptibly) until `cond()` is true
+    pub fn wait_event<F: FnMut() -> bool>(&self, mut cond: F) {
+        if cond() {
+            return;
         }
+        let mut w = WaitEntry::new();
+        loop {
+            self.prepare_to_wait(&mut w, SleepState::Uninterruptible);
+            if cond() {
+                break;
+            }
+            schedule();
+        }
+        self.finish_wait(&w);
+    }
 
-        let count = entries.len();
+    /// Sleep until `cond()` is true or a signal is pending
+    ///
+    /// Returns `Err(KernelError::RestartSys)` on a signal.
+    pub fn wait_event_interruptible<F: FnMut() -> bool>(&self, cond: F) -> Result<(), KernelError> {
+        self.wait_event_interruptible_timeout(cond, MAX_SCHEDULE_TIMEOUT)
+            .map(|_| ())
+    }
 
-        // Mark all tasks as ready
-        {
-            let mut table = TASK_TABLE.lock();
-            for entry in &entries {
-                if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == entry.tid) {
-                    task.state = TaskState::Ready;
+    /// Sleep (uninterruptibly) until `cond()` is true or `timeout` ticks
+    /// pass. Returns 0 if the timeout elapsed with `cond()` false, else the
+    /// ticks left (at least 1), like Linux `wait_event_timeout`.
+    pub fn wait_event_timeout<F: FnMut() -> bool>(&self, cond: F, timeout: u64) -> u64 {
+        match self.wait_common(cond, timeout, SleepState::Uninterruptible) {
+            Ok(left) => left,
+            Err(_) => unreachable!("uninterruptible wait interrupted"),
+        }
+    }
+
+    /// Sleep until `cond()` is true, a signal is pending, or `timeout`
+    /// ticks pass (`MAX_SCHEDULE_TIMEOUT` = forever).
+    ///
+    /// `Ok(0)`: timed out; `Ok(n >= 1)`: condition true with n ticks left;
+    /// `Err(RestartSys)`: signal pending.
+    pub fn wait_event_interruptible_timeout<F: FnMut() -> bool>(
+        &self,
+        cond: F,
+        timeout: u64,
+    ) -> Result<u64, KernelError> {
+        self.wait_common(cond, timeout, SleepState::Interruptible)
+    }
+
+    /// Sleep until `cond()` is true, a signal, or the CLOCK_MONOTONIC
+    /// `deadline` in ns (`None` = never). `Ok(true)`: condition true;
+    /// `Ok(false)`: deadline passed; `Err(RestartSys)`: signal.
+    pub fn wait_event_interruptible_deadline<F: FnMut() -> bool>(
+        &self,
+        mut cond: F,
+        deadline: Option<u64>,
+    ) -> Result<bool, KernelError> {
+        loop {
+            let ticks = match deadline {
+                None => MAX_SCHEDULE_TIMEOUT,
+                Some(d) => {
+                    let now = crate::time::monotonic_ns();
+                    if now >= d {
+                        return Ok(cond());
+                    }
+                    crate::task::percpu::ns_to_ticks(d - now)
                 }
+            };
+            if self.wait_event_interruptible_timeout(&mut cond, ticks)? != 0 {
+                return Ok(true);
+            }
+            // Tick granularity: re-check the clock before giving up
+        }
+    }
+
+    fn wait_common<F: FnMut() -> bool>(
+        &self,
+        mut cond: F,
+        timeout: u64,
+        state: SleepState,
+    ) -> Result<u64, KernelError> {
+        if cond() {
+            return Ok(timeout.max(1));
+        }
+        let mut w = WaitEntry::new();
+        let mut left = timeout;
+        let result = loop {
+            self.prepare_to_wait(&mut w, state);
+            if cond() {
+                break Ok(left.max(1));
+            }
+            if state == SleepState::Interruptible && signal_pending() {
+                break Err(KernelError::RestartSys);
+            }
+            if left == 0 {
+                break Ok(0);
+            }
+            left = schedule_timeout(left);
+            if left == 0 {
+                // Timed out: one last look (Linux __wait_event_timeout)
+                self.prepare_to_wait(&mut w, state);
+                break Ok(if cond() { 1 } else { 0 });
+            }
+        };
+        self.finish_wait(&w);
+        result
+    }
+
+    /// Collect up to `nr` waiters to wake (`usize::MAX` = all)
+    fn take_waiters(&self, nr: usize) -> Vec<(Tid, u32)> {
+        let mut head = self.head.lock();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < head.len() && out.len() < nr {
+            let e = &head[i];
+            out.push((e.tid, e.cpu));
+            if e.autoremove {
+                head.remove(i);
+            } else {
+                i += 1;
             }
         }
+        out
+    }
 
-        // Add all to run queue
-        if let Some(sched) = current_percpu_sched()
-            && sched.initialized.load(Ordering::Acquire)
-        {
-            let mut rq = sched.lock.lock();
-            for entry in entries {
-                rq.queue().enqueue(entry.tid, entry.priority);
-                rq.nr_running += 1;
-            }
+    /// Wake one waiter (FIFO). Returns true if a task was woken.
+    pub fn wake_one(&self) -> bool {
+        let woken = self.take_waiters(1);
+        for &(tid, cpu) in &woken {
+            wake_up_task(tid, cpu, WakeMode::Any);
         }
+        !woken.is_empty()
+    }
 
-        count
+    /// Wake all waiters. Returns the number of waiters woken.
+    pub fn wake_all(&self) -> usize {
+        let woken = self.take_waiters(usize::MAX);
+        for &(tid, cpu) in &woken {
+            wake_up_task(tid, cpu, WakeMode::Any);
+        }
+        woken.len()
     }
 
     /// Check if the wait queue is empty
     pub fn is_empty(&self) -> bool {
-        self.head.lock().waiters.is_empty()
+        self.head.lock().is_empty()
     }
 
     /// Get the number of waiters
     pub fn len(&self) -> usize {
-        self.head.lock().waiters.len()
+        self.head.lock().len()
     }
 }
 

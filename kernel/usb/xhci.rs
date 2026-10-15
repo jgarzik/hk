@@ -96,12 +96,6 @@ static TRANSFER_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// xHCI interrupt handler
 ///
 /// Called from the IRQ dispatch system when the xHCI's IRQ fires.
-#[cfg(target_arch = "x86_64")]
-fn xhci_irq_handler(_irq: u8, _data: *mut ()) -> bool {
-    xhci_irq_handler_common()
-}
-
-#[cfg(target_arch = "aarch64")]
 fn xhci_irq_handler(_irq: u32, _data: *mut ()) -> bool {
     xhci_irq_handler_common()
 }
@@ -703,7 +697,7 @@ pub struct XhciController {
     /// Per-device state (slot_id -> DeviceState)
     device_states: BTreeMap<u8, DeviceState>,
     /// Assigned IRQ (if interrupt mode enabled)
-    irq: Option<u8>,
+    irq: Option<u32>,
 }
 
 impl XhciController {

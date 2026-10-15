@@ -518,8 +518,8 @@ pub fn sys_setfsuid(uid: u32, current_cred: super::Cred) -> i64 {
         return old_fsuid as i64;
     }
 
-    // Permission check: must be in {uid, euid, suid, fsuid} or privileged
-    let is_privileged = current_cred.euid == 0;
+    // Permission check: must be in {uid, euid, suid, fsuid} or CAP_SETUID
+    let is_privileged = current_cred.cap_effective.has(super::CAP_SETUID);
 
     let is_permitted = uid == current_cred.uid
         || uid == current_cred.euid
@@ -566,9 +566,8 @@ pub fn sys_setfsgid(gid: u32, current_cred: super::Cred) -> i64 {
         return old_fsgid as i64;
     }
 
-    // Permission check: must be in {gid, egid, sgid, fsgid} or privileged
-    // Note: Linux checks euid, not egid, for setgid privilege
-    let is_privileged = current_cred.euid == 0;
+    // Permission check: must be in {gid, egid, sgid, fsgid} or CAP_SETGID
+    let is_privileged = current_cred.cap_effective.has(super::CAP_SETGID);
 
     let is_permitted = gid == current_cred.gid
         || gid == current_cred.egid
