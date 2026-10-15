@@ -143,6 +143,9 @@ BOOT_TEST_TIMEOUT ?= 600
 # QEMU -cpu override for the boot tests (see run-qemu.sh), e.g. QEMU_CPU=max
 export QEMU_CPU
 
+# hk boot test NIC (see run-qemu.sh): virtio (default) or e1000
+export NIC
+
 check: iso
 	@rm -f /tmp/qemu_serial.log
 	@echo "Running boot test ($(BOOT_TEST_TIMEOUT) second timeout)..."

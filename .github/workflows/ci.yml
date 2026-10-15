@@ -57,6 +57,10 @@ jobs:
       - name: Boot test x86-64
         run: make check
 
+      # The default NIC is virtio-net; keep the e1000 driver covered too
+      - name: Boot test x86-64 (e1000 NIC)
+        run: make check NIC=e1000
+
       - name: Upload serial log
         if: failure()
         uses: actions/upload-artifact@v4
@@ -103,6 +107,9 @@ jobs:
 
       - name: Boot test aarch64
         run: make check-arm
+
+      - name: Boot test aarch64 (e1000 NIC)
+        run: make check-arm NIC=e1000
 
       # After check-arm: the aarch64 kernel include_bytes!()s the initramfs
       - name: Unit tests (host arm64)

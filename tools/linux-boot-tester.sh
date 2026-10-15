@@ -92,7 +92,7 @@ fi
 # built into Ubuntu's generic kernel (CONFIG_VIRTIO_NET=y, VIRTIO_PCI=y on
 # amd64 and arm64), so it comes up as eth0 without modules
 . tools/qemu-net.sh
-qemu_net_args virtio-net-pci
+qemu_net_args virtio
 
 echo "Booting boot_tester on Linux (${TIMEOUT}s timeout)..."
 rm -f "$SERIAL_LOG"

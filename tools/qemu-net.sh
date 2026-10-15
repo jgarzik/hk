@@ -7,15 +7,25 @@
 #   10.0.2.100:80  HTTP/1.0 (tools/netpeer/http.py, fixed body)
 # QEMU_NET_EXTRA appends options.
 #
-# Usage: qemu_net_args <device-model>   (e.g. e1000, virtio-net-pci)
-# Sets the QEMU_NET array.
+# Usage: qemu_net_args <nic>   (virtio: modern-only virtio-net-pci, the
+# default for hk and Linux; e1000: Intel 82540EM). Sets the QEMU_NET array.
 QEMU_NET_PEERS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/netpeer
 
+qemu_nic_model() {
+    case "$1" in
+        virtio) echo "virtio-net-pci,disable-legacy=on" ;;
+        e1000) echo e1000 ;;
+        *) echo "qemu-net.sh: unknown NIC '$1' (virtio or e1000)" >&2; exit 1 ;;
+    esac
+}
+
 qemu_net_args() {
+    local model
+    model=$(qemu_nic_model "$1") || exit 1
     local fwd="guestfwd=tcp:10.0.2.100:7-cmd:cat"
     fwd+=",guestfwd=tcp:10.0.2.100:80-cmd:python3 -I $QEMU_NET_PEERS/http.py"
     QEMU_NET=(
         -netdev "user,id=n0,ipv6=off,$fwd${QEMU_NET_EXTRA:+,$QEMU_NET_EXTRA}"
-        -device "$1,netdev=n0"
+        -device "$model,netdev=n0"
     )
 }
