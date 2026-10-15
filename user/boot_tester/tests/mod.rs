@@ -78,6 +78,7 @@ pub mod poll;
 pub mod timing;
 pub mod uaccess;
 pub mod packet;
+pub mod busybox;
 #[cfg(target_arch = "x86_64")]
 pub mod ioport;
 
@@ -156,6 +157,7 @@ pub fn run_all_tests() {
     poll::run_tests();
     timing::run_tests();
     uaccess::run_tests();
+    busybox::run_tests();
     #[cfg(target_arch = "x86_64")]
     ioport::run_tests();
 }
