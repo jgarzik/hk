@@ -240,8 +240,9 @@ pub fn sys_mknod(pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
 /// sys_mknodat - create a special or ordinary file relative to directory fd
 ///
 /// Device nodes need CAP_MKNOD (checked after the parent's permission,
-/// like vfs_mknod). FIFOs, sockets and device nodes are created as
-/// regular files for now.
+/// like vfs_mknod). Sockets get an S_IFSOCK inode (connectable only
+/// once an AF_UNIX socket binds it, so a mknod'ed one refuses
+/// connections); FIFOs are created as regular files for now.
 pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
     const S_IFREG: u32 = 0o100000;
     const S_IFCHR: u32 = 0o020000;
@@ -284,6 +285,9 @@ pub fn sys_mknodat(dirfd: i32, pathname_ptr: u64, mode: u32, dev: u64) -> i64 {
             S_IFBLK => dir
                 .i_op
                 .mknod(dir, &name, InodeMode::blockdev(perm), DevId::from_user(dev)),
+            S_IFSOCK => dir
+                .i_op
+                .mknod(dir, &name, InodeMode::socket(perm), DevId::from_user(0)),
             _ => dir.i_op.create(dir, &name, InodeMode::regular(perm)),
         }
     });

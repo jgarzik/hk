@@ -192,6 +192,11 @@ fn filp_open(
     let acc = if created { 0 } else { dac::acc_mode(flags) };
     dac::may_open(&dac::cred(), &inode, acc, flags)?;
 
+    // A socket inode cannot be opened (Linux no_open_fops): ENXIO
+    if m.is_socket() {
+        return Err(KernelError::NoDeviceOrAddress);
+    }
+
     // An open for writing holds write access until the file is released
     // (Linux FMODE_WRITER); O_TRUNC needs it too (handle_truncate)
     let writer = flags & O_ACCMODE != O_RDONLY || flags & O_TRUNC != 0;
