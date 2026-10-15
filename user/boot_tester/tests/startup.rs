@@ -1,15 +1,19 @@
 //! Process startup ABI a static glibc program relies on: the initial
-//! stack and auxiliary vector, /proc/self/exe and the TLS register
-//! across fork and context switches.
+//! stack and auxiliary vector, /proc/self/exe, the TLS register across
+//! fork and context switches and newfstatat.
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{sys_execve, sys_exit, sys_fork, sys_wait4, Timespec};
+use hk_syscall::{sys_execve, sys_exit, sys_fork, sys_fstatat, sys_wait4, Stat, Timespec};
+
+const AT_FDCWD: i32 = -100;
+const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 
 pub fn run_tests() {
     test_exec_mode(b"EXEC_AUXV", b"auxv\0");
     test_exec_mode(b"PROC_SELF_EXE", b"exe\0");
     test_fork_tls();
     test_tls_switch();
+    test_newfstatat();
 }
 
 fn report(name: &[u8], ok: bool, v: i64) {
@@ -143,4 +147,14 @@ fn test_tls_switch() {
     sys_wait4(a, &mut sa, 0, 0);
     sys_wait4(b, &mut sb, 0, 0);
     report(b"TLS_SURVIVES_SWITCH", sa == 0 && sb == 0, (sa | sb) as i64);
+}
+
+/// newfstatat (fstatat on arm64) on a directory and a missing path
+fn test_newfstatat() {
+    let mut st: Stat = unsafe { core::mem::zeroed() };
+    let r = sys_fstatat(AT_FDCWD, b"/\0".as_ptr(), &mut st, 0);
+    let dir = r == 0 && st.st_mode & 0o170000 == 0o040000;
+    let r2 = sys_fstatat(AT_FDCWD, b"/\0".as_ptr(), &mut st, AT_SYMLINK_NOFOLLOW);
+    let r3 = sys_fstatat(AT_FDCWD, b"/no/such/file\0".as_ptr(), &mut st, 0);
+    report(b"NEWFSTATAT", dir && r2 == 0 && r3 == -2, r3);
 }

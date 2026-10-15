@@ -2469,3 +2469,11 @@ pub struct Semid64Ds {
     pub _unused3: u64,
     pub _unused4: u64,
 }
+
+pub const SYS_NEWFSTATAT: u64 = 262;
+
+/// newfstatat(dirfd, pathname, statbuf, flags)
+#[inline(always)]
+pub fn sys_fstatat(dirfd: i32, pathname: *const u8, statbuf: *mut Stat, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_NEWFSTATAT, dirfd, pathname, statbuf, flags) }
+}

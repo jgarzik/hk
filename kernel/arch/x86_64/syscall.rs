@@ -60,6 +60,7 @@ pub const SYS_CLOSE: u64 = 3;
 pub const SYS_STAT: u64 = 4;
 /// fstat(fd, statbuf)
 pub const SYS_FSTAT: u64 = 5;
+pub const SYS_NEWFSTATAT: u64 = 262;
 /// lstat(pathname, statbuf) - like stat but don't follow symlinks
 pub const SYS_LSTAT: u64 = 6;
 /// lseek(fd, offset, whence)
@@ -1396,6 +1397,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_TRUNCATE => sys_truncate(arg0, arg1 as i64) as u64,
         SYS_STAT => sys_stat(arg0, arg1) as u64,
         SYS_FSTAT => sys_fstat(arg0 as i32, arg1) as u64,
+        SYS_NEWFSTATAT => crate::fs::stat::sys_fstatat(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
         SYS_STATFS => sys_statfs(arg0, arg1) as u64,
         SYS_FSTATFS => sys_fstatfs(arg0 as i32, arg1) as u64,
         SYS_STATX => sys_statx(arg0 as i32, arg1, arg2 as i32, arg3 as u32, arg4) as u64,
