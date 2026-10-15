@@ -197,20 +197,25 @@ impl MmStruct {
         pos
     }
 
-    /// Remove VMAs overlapping the given range
+    /// Remove the VMA parts inside [start, end) (Linux
+    /// do_vmi_align_munmap): a VMA straddling `start` or `end` is split
+    /// there and keeps its outside part.
     ///
-    /// Returns the removed VMAs (for cleanup of mapped pages).
+    /// Returns the removed VMAs, each within the range, for the caller
+    /// to release their pages and accounting.
     pub fn remove_range(&mut self, start: u64, end: u64) -> Vec<Vma> {
+        for at in [start, end] {
+            if let Some(i) = self.vmas.iter().position(|v| v.start < at && at < v.end) {
+                self.split_vma(i, at);
+            }
+        }
         let mut removed = Vec::new();
         self.vmas.retain(|vma| {
-            // Check for overlap: NOT (vma completely before OR vma completely after)
-            let overlaps = !(vma.end <= start || vma.start >= end);
-            if overlaps {
+            let inside = vma.start >= start && vma.end <= end;
+            if inside {
                 removed.push(vma.clone());
-                false // Remove
-            } else {
-                true // Keep
             }
+            !inside
         });
         removed
     }
@@ -742,4 +747,45 @@ pub fn dup_mm(
 /// `pgd`
 pub fn mm_alloc(pgd: u64) -> MmRef {
     MmRef::new(pgd, MmStruct::new(mmap_base()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(ranges: &[(u64, u64)]) -> MmStruct {
+        let mut m = MmStruct::new(0x7000_0000);
+        for &(a, b) in ranges {
+            m.insert_vma(Vma::new(a, b, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS));
+        }
+        m
+    }
+
+    fn spans(m: &MmStruct) -> Vec<(u64, u64)> {
+        m.iter().map(|v| (v.start, v.end)).collect()
+    }
+
+    #[test]
+    fn remove_range_splits_edges() {
+        let mut m = map(&[(0x10000, 0x20000), (0x30000, 0x40000)]);
+        let gone = m.remove_range(0x18000, 0x34000);
+        let gone: Vec<_> = gone.iter().map(|v| (v.start, v.end)).collect();
+        assert_eq!(gone, [(0x18000, 0x20000), (0x30000, 0x34000)]);
+        assert_eq!(spans(&m), [(0x10000, 0x18000), (0x34000, 0x40000)]);
+    }
+
+    #[test]
+    fn remove_range_inside_one_vma() {
+        let mut m = map(&[(0x10000, 0x20000)]);
+        let gone = m.remove_range(0x11000, 0x12000);
+        assert_eq!(gone.len(), 1);
+        assert_eq!(spans(&m), [(0x10000, 0x11000), (0x12000, 0x20000)]);
+    }
+
+    #[test]
+    fn remove_range_of_a_hole_is_empty() {
+        let mut m = map(&[(0x10000, 0x20000)]);
+        assert!(m.remove_range(0x20000, 0x30000).is_empty());
+        assert_eq!(spans(&m), [(0x10000, 0x20000)]);
+    }
 }

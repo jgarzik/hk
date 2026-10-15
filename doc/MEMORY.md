@@ -121,8 +121,8 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
 - **exec** builds the new image in a fresh `Mm` (an error frees it),
   switches the task to it, then drops its user reference on the old one,
   which is torn down only if no vfork parent or other thread uses it.
-- **munmap / MAP_FIXED / brk shrink / shmdt** release the pages in the
-  range under the mm lock; empty page-table pages are kept until exit
-  (reused by later mappings at the same addresses).
+- **munmap / MAP_FIXED / brk shrink / shmdt** split VMAs at the range
+  edges and release the pages inside; empty page-table pages are kept
+  until exit (reused by later mappings at the same addresses).
 - `/proc/meminfo` reports MemTotal and MemFree from the frame allocator
   (exact free count).

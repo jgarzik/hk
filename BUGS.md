@@ -242,12 +242,6 @@ limits (and per-user accounting) comes with the filesystem chunk.
 Reads of holes need a zeroed page each and can fail with ENOMEM when
 memory is at the reserve (Linux maps the shared zero page).
 
-## Partial munmap of an anonymous mapping drops the rest of it
-
-mmap(2 pages) then munmap(second page): mincore on the still-mapped
-first page returns ENOMEM (no VMA), where Linux returns 0. Seen while
-writing the uaccess boot tests; not investigated.
-
 ## The kernel heap is a fixed 16MB region
 
 **Location**: `kernel/main.rs` (`x86_64_heap`, `aarch64_heap`), `kernel/heap.rs`

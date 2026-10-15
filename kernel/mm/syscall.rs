@@ -346,7 +346,7 @@ pub fn sys_munmap(addr: u64, length: u64) -> i64 {
 }
 
 /// Unmap [start, end) of the current address space, mmap lock held
-/// (Linux do_vmi_munmap): the VMAs overlapping it are removed, the
+/// (Linux do_vmi_munmap): VMAs straddling the edges are split, the
 /// pages inside are released (`unmap_vma_pages`), the VM counters and
 /// rmap chains updated. Returns the removed VMAs for the caller to drop
 /// once it has unlocked.
@@ -1944,6 +1944,8 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         None => return KernelError::BadAddress.sysret(),
     };
 
+    // VMAs unmapped or moved away: dropped after the lock on every return
+    let mut gone: Vec<Vma> = Vec::new();
     let mut mm_guard = mm.lock();
 
     // Find VMA containing old_addr
@@ -2038,10 +2040,9 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
 
         // Determine target address
         let target_addr = if fixed {
-            // MREMAP_FIXED: use specified address
-            // First, unmap any existing mappings at target
+            // MREMAP_FIXED: unmap what is at the target first
             let target_end = new_addr + new_len_aligned;
-            let _ = mm_guard.remove_range(new_addr, target_end);
+            gone = munmap_locked(&mut mm_guard, mm.pgd(), new_addr, target_end);
             new_addr
         } else {
             // Find a new free area
@@ -2051,31 +2052,19 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
             }
         };
 
-        // Create new VMA at target location
+        // Retire the old VMA (found again: the unmap may have split
+        // VMAs), then insert the new one
+        move_vma_out(&mut mm_guard, old_addr, dontunmap, &mut gone);
         let mut new_vma = vma_clone.clone();
         new_vma.start = target_addr;
         new_vma.end = target_addr + new_len_aligned;
-
-        // Insert new VMA
         let new_idx = mm_guard.insert_vma(new_vma);
         mm_guard.add_total_vm(new_len_aligned / PAGE_SIZE);
-        // Try to merge with adjacent VMAs (VMA merging optimization)
         mm_guard.merge_adjacent(new_idx);
-
-        // Handle old VMA based on DONTUNMAP flag
-        if dontunmap {
-            // Keep the old VMA but mark it as anonymous (no file backing)
-            if let Some(vma) = mm_guard.get_vma_mut(vma_idx) {
-                vma.file = None;
-                vma.flags |= MAP_ANONYMOUS;
-            }
-        } else {
-            // Remove old VMA
-            let _ = mm_guard.remove_vma(vma_idx);
-        }
 
         // Release lock before page table operations
         drop(mm_guard);
+        drop(gone);
 
         // Move page table entries
         move_page_tables(old_addr, target_addr, old_len, dontunmap);
@@ -2091,30 +2080,19 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
             None => return KernelError::BadAddress.sysret(),
         };
 
-        // Unmap any existing mappings at target
+        // Unmap what is at the target, retire the old VMA, insert the new
         let target_end = new_addr + new_len_aligned;
-        let _ = mm_guard.remove_range(new_addr, target_end);
-
-        // Create new VMA at target
+        gone = munmap_locked(&mut mm_guard, mm.pgd(), new_addr, target_end);
+        move_vma_out(&mut mm_guard, old_addr, dontunmap, &mut gone);
         let mut new_vma = vma_clone.clone();
         new_vma.start = new_addr;
         new_vma.end = new_addr + new_len_aligned;
         let new_idx = mm_guard.insert_vma(new_vma);
         mm_guard.add_total_vm(new_len_aligned / PAGE_SIZE);
-        // Try to merge with adjacent VMAs (VMA merging optimization)
         mm_guard.merge_adjacent(new_idx);
 
-        // Handle old VMA
-        if dontunmap {
-            if let Some(vma) = mm_guard.get_vma_mut(vma_idx) {
-                vma.file = None;
-                vma.flags |= MAP_ANONYMOUS;
-            }
-        } else {
-            let _ = mm_guard.remove_vma(vma_idx);
-        }
-
         drop(mm_guard);
+        drop(gone);
 
         move_page_tables(old_addr, new_addr, old_len, dontunmap);
 
@@ -2123,6 +2101,22 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
 
     // Same size, no flags - just return old address
     old_addr as i64
+}
+
+/// The VMA starting at `old_addr` after mremap moved it: kept as an
+/// anonymous mapping with MREMAP_DONTUNMAP, else removed into `gone`
+fn move_vma_out(mm: &mut super::MmStruct, old_addr: u64, dontunmap: bool, gone: &mut Vec<Vma>) {
+    let Some(idx) = mm.find_vma_exact(old_addr) else {
+        return;
+    };
+    if dontunmap {
+        if let Some(vma) = mm.get_vma_mut(idx) {
+            vma.file = None;
+            vma.flags |= MAP_ANONYMOUS;
+        }
+    } else {
+        gone.extend(mm.remove_vma(idx));
+    }
 }
 
 /// Move page table entries from old location to new location

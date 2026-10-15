@@ -3,16 +3,18 @@
 
 use super::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
-    sys_clone, sys_close, sys_execve, sys_exit, sys_fork, sys_kill, sys_mmap,
-    sys_munmap, sys_nanosleep, sys_open, sys_pread64, sys_read, sys_sched_yield, sys_vfork,
-    sys_wait4, sys_waitid, SigInfo, Timespec, CLONE_SIGHAND, P_PID, WEXITED, CLONE_VM, MAP_ANONYMOUS, MAP_PRIVATE,
-    O_RDONLY, PROT_READ, PROT_WRITE,
+    sys_clone, sys_close, sys_execve, sys_exit, sys_fork, sys_kill, sys_mincore, sys_mmap,
+    sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pread64, sys_read, sys_sched_yield,
+    sys_vfork, sys_wait4, sys_waitid, SigInfo, Timespec, CLONE_SIGHAND, CLONE_VM, MAP_ANONYMOUS,
+    MAP_FIXED, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE, O_RDONLY, PROT_READ, PROT_WRITE, P_PID,
+    WEXITED,
 };
 
 const CLONE_THREAD: u64 = 0x0001_0000;
 const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 const SIGKILL: u32 = 9;
 const PAGE: u64 = 4096;
+const ENOMEM: i64 = -12;
 
 pub fn run_tests() {
     meminfo_format();
@@ -26,6 +28,9 @@ pub fn run_tests() {
     leak(b"MM_LIFE_MMAP_CYCLE", 1000, mmap_cycle);
     leak(b"MM_LIFE_EXEC_CHAIN", 10, exec_chain);
     maps_after_exit();
+    munmap_partial();
+    map_fixed_replace();
+    mremap_fixed_replace();
 }
 
 /// Read /proc/meminfo into `buf`; its length (0 on error)
@@ -324,4 +329,78 @@ fn proc_path(pid: i64, name: &[u8]) -> [u8; 48] {
     path[6 + d] = b'/';
     path[7 + d..7 + d + name.len()].copy_from_slice(name);
     path
+}
+
+/// munmap of the second page of two keeps the first mapped, with its
+/// data (Linux splits the VMA): mincore 0 on it, ENOMEM on the hole
+fn munmap_partial() {
+    let p = sys_mmap(0, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p <= 0 {
+        report(b"MM_LIFE_MUNMAP_PARTIAL", false, p);
+        return;
+    }
+    let a = p as u64;
+    unsafe {
+        core::ptr::write_volatile(a as *mut u8, 0x11);
+        core::ptr::write_volatile((a + PAGE) as *mut u8, 0x22);
+    }
+    let r = sys_munmap(a + PAGE, PAGE);
+    let mut vec = [0u8; 1];
+    let first = sys_mincore(a, PAGE, vec.as_mut_ptr());
+    let hole = sys_mincore(a + PAGE, PAGE, vec.as_mut_ptr());
+    let kept = unsafe { core::ptr::read_volatile(a as *const u8) };
+    let bad = match () {
+        _ if r != 0 => 1,
+        _ if first != 0 => 2,
+        _ if hole != ENOMEM => 3,
+        _ if kept != 0x11 => 4,
+        _ => 0,
+    };
+    sys_munmap(a, PAGE);
+    report(b"MM_LIFE_MUNMAP_PARTIAL", bad == 0, bad);
+}
+
+/// MAP_FIXED over a written page gives a fresh zero page (the old one
+/// is unmapped, Linux do_mmap -> do_vmi_munmap)
+fn map_fixed_replace() {
+    let prot = PROT_READ | PROT_WRITE;
+    let p = sys_mmap(0, PAGE, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p <= 0 {
+        report(b"MM_LIFE_MAP_FIXED_REPLACE", false, p);
+        return;
+    }
+    unsafe { core::ptr::write_volatile(p as *mut u8, 0xaa) };
+    let q = sys_mmap(p as u64, PAGE, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    let v = unsafe { core::ptr::read_volatile(p as *const u8) };
+    sys_munmap(p as u64, PAGE);
+    report(b"MM_LIFE_MAP_FIXED_REPLACE", q == p && v == 0, v as i64);
+}
+
+/// mremap(MREMAP_FIXED) onto a written page replaces it with the moved
+/// one and leaves a hole behind (Linux mremap_to unmaps the target)
+fn mremap_fixed_replace() {
+    let prot = PROT_READ | PROT_WRITE;
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    let a = sys_mmap(0, PAGE, prot, flags, -1, 0);
+    let b = sys_mmap(0, PAGE, prot, flags, -1, 0);
+    if a <= 0 || b <= 0 {
+        report(b"MM_LIFE_MREMAP_FIXED", false, -1);
+        return;
+    }
+    unsafe {
+        core::ptr::write_volatile(a as *mut u8, 0x11);
+        core::ptr::write_volatile(b as *mut u8, 0x22);
+    }
+    let r = sys_mremap(a as u64, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, b as u64);
+    let v = unsafe { core::ptr::read_volatile(b as *const u8) };
+    let mut vec = [0u8; 1];
+    let hole = sys_mincore(a as u64, PAGE, vec.as_mut_ptr());
+    sys_munmap(b as u64, PAGE);
+    let bad = match () {
+        _ if r != b => 1,
+        _ if v != 0x11 => 2,
+        _ if hole != ENOMEM => 3,
+        _ => 0,
+    };
+    report(b"MM_LIFE_MREMAP_FIXED", bad == 0, bad);
 }
