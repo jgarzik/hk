@@ -32,6 +32,10 @@ pub struct NetSysctl {
     pub icmp_msgs_per_sec: AtomicI32,
     pub icmp_msgs_burst: AtomicI32,
     pub tcp_syn_retries: AtomicU8,
+    pub tcp_synack_retries: AtomicU8,
+    pub tcp_retries2: AtomicU8,
+    /// tcp_fin_timeout in seconds
+    pub tcp_fin_timeout: AtomicI32,
     pub somaxconn: AtomicI32,
     pub frag_high: AtomicUsize,
     pub frag_low: AtomicUsize,
@@ -51,6 +55,9 @@ impl Default for NetSysctl {
             icmp_msgs_per_sec: AtomicI32::new(1000),
             icmp_msgs_burst: AtomicI32::new(50),
             tcp_syn_retries: AtomicU8::new(6),
+            tcp_synack_retries: AtomicU8::new(5),
+            tcp_retries2: AtomicU8::new(15),
+            tcp_fin_timeout: AtomicI32::new(60),
             somaxconn: AtomicI32::new(4096),
             frag_high: AtomicUsize::new(4 * 1024 * 1024),
             frag_low: AtomicUsize::new(3 * 1024 * 1024),
@@ -90,6 +97,13 @@ fn get_i32(f: fn(&NetSysctl) -> &AtomicI32) -> Vec<i64> {
 
 fn get_u8(f: fn(&NetSysctl) -> &AtomicU8) -> Vec<i64> {
     vec![f(&current_net_ns().sysctl).load(Ordering::Relaxed) as i64]
+}
+
+/// A u8 sysctl (Linux proc_dou8vec_minmax: 0..=255)
+fn set_u8(f: fn(&NetSysctl) -> &AtomicU8, v: &[i64]) -> Result<(), KernelError> {
+    range(v[0], 0, 255)?;
+    f(&current_net_ns().sysctl).store(v[0] as u8, Ordering::Relaxed);
+    Ok(())
 }
 
 fn set_bool(f: fn(&NetSysctl) -> &AtomicU8, v: &[i64]) -> Result<(), KernelError> {
@@ -232,6 +246,24 @@ pub static CTLS: &[Ctl] = &[
                 .store(v[0] as u8, Ordering::Relaxed);
             Ok(())
         },
+    },
+    Ctl {
+        path: "net/ipv4/tcp_synack_retries",
+        mode: 0o644,
+        show: || get_u8(|s| &s.tcp_synack_retries),
+        store: |v| set_u8(|s| &s.tcp_synack_retries, v),
+    },
+    Ctl {
+        path: "net/ipv4/tcp_retries2",
+        mode: 0o644,
+        show: || get_u8(|s| &s.tcp_retries2),
+        store: |v| set_u8(|s| &s.tcp_retries2, v),
+    },
+    Ctl {
+        path: "net/ipv4/tcp_fin_timeout",
+        mode: 0o644,
+        show: || get_i32(|s| &s.tcp_fin_timeout),
+        store: |v| set_int(|s| &s.tcp_fin_timeout, v, 1, INT_MAX / 1000),
     },
     Ctl {
         path: "net/ipv4/ip_forward",

@@ -65,7 +65,7 @@ const SOMAX: &[u8] = b"/proc/sys/net/core/somaxconn\0";
 /// Linux defaults
 fn test_defaults() {
     let mut t = T::new(b"SYSCTL_DEFAULTS");
-    let want: [(&[u8], &[u8]); 12] = [
+    let want: [(&[u8], &[u8]); 15] = [
         (PING, b"1\t0\n"),
         (PORTS, b"32768\t60999\n"),
         (b"/proc/sys/net/ipv4/icmp_echo_ignore_broadcasts\0", b"1\n"),
@@ -73,6 +73,9 @@ fn test_defaults() {
         (b"/proc/sys/net/ipv4/icmp_ratelimit\0", b"1000\n"),
         (b"/proc/sys/net/ipv4/icmp_ratemask\0", b"6168\n"),
         (SYN, b"6\n"),
+        (b"/proc/sys/net/ipv4/tcp_synack_retries\0", b"5\n"),
+        (b"/proc/sys/net/ipv4/tcp_retries2\0", b"15\n"),
+        (b"/proc/sys/net/ipv4/tcp_fin_timeout\0", b"60\n"),
         (b"/proc/sys/net/ipv4/ip_forward\0", b"0\n"),
         (b"/proc/sys/net/ipv4/ipfrag_high_thresh\0", b"4194304\n"),
         (b"/proc/sys/net/ipv4/ipfrag_low_thresh\0", b"3145728\n"),
