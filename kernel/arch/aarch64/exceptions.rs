@@ -64,14 +64,18 @@ extern "C" fn handle_el1_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             let is_translation_fault = (0x04..=0x07).contains(&dfsc);
             let is_permission_fault = (0x0C..=0x0F).contains(&dfsc);
             let is_user_addr = far >> 48 == 0; // TTBR0 (user) range
+            // (not resolved with page faults disabled: a spinlock is held)
             if is_user_addr {
-                if is_translation_fault
+                let resolve = !crate::uaccess::pagefault_disabled();
+                if resolve
+                    && is_translation_fault
                     && (handle_swap_fault(far) == Some(true)
                         || handle_mmap_fault(far, is_write) == Some(true))
                 {
                     return;
                 }
-                if is_permission_fault && is_write && handle_cow_fault(far) == Some(true) {
+                if resolve && is_permission_fault && is_write && handle_cow_fault(far) == Some(true)
+                {
                     return;
                 }
                 // Unresolvable fault inside a user-copy routine: resume at its

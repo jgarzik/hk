@@ -1659,6 +1659,14 @@ Robust futexes are cleaned up during task exit via `exit_robust_list()`:
 3. **Bucket lock is a leaf** - wakeups are issued after dropping it
 4. **Multi-bucket operations use address ordering** - Prevents deadlock
 5. **Robust cleanup has entry limit** - Prevents infinite loop from corrupted list
+6. **No sleeping user access under a bucket lock** - the futex word is
+   faulted in first (`get_user`, may sleep), then read under the bucket
+   lock with page faults disabled (`uaccess::pagefault_disable`, Linux
+   futex_get_value_locked): a page that went away meanwhile fails at
+   once and the call returns EAGAIN (userspace re-checks, as after a
+   value change) where Linux retries internally. Nothing else reads user
+   memory under a futex or TASK_TABLE lock (`get_robust_list` copies
+   out after unlocking).
 
 ### 3.9 TTY and Console Subsystem
 

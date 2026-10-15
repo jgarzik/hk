@@ -647,6 +647,11 @@ fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
     if fault_addr >= crate::arch::x86_64::paging::TASK_SIZE {
         return None;
     }
+    // A kernel access with page faults disabled (a spinlock is held):
+    // not resolved, the copy's fixup reports EFAULT
+    if error_code & 4 == 0 && crate::uaccess::pagefault_disabled() {
+        return None;
+    }
 
     // Case 0: Swap fault - non-present page with swap entry in PTE
     // Must check before demand paging since swapped pages have valid PTEs
