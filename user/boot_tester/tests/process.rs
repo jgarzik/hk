@@ -45,6 +45,7 @@ pub fn run_tests() {
     test_vfork();
     test_waitid();
     test_waitid_pall();
+    test_waitid_wnowait();
     test_execve();
     test_getuid();
     test_geteuid();
@@ -578,6 +579,23 @@ fn test_waitid_pall() {
             println(b"WAITID_PALL:FAIL");
         }
     }
+}
+
+/// waitid(WNOWAIT) reports a zombie child and leaves it waitable: a
+/// second wait reaps it with the same status
+fn test_waitid_wnowait() {
+    const WNOWAIT: i32 = 0x0100_0000;
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(21);
+    }
+    let mut info: SigInfo = unsafe { core::mem::zeroed() };
+    let peek = sys_waitid(P_PID, pid as u64, &mut info, WEXITED | WNOWAIT, 0);
+    let seen = (info.si_pid, info.si_status);
+    let mut st = 0i32;
+    let reaped = sys_wait4(pid, &mut st, 0, 0);
+    let ok = pid > 0 && peek == 0 && seen == (pid as i32, 21) && reaped == pid && st == 21 << 8;
+    println(if ok { b"WAITID_WNOWAIT:OK" } else { b"WAITID_WNOWAIT:FAIL" });
 }
 
 /// Test 21: execve() - execute a new program

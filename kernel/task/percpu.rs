@@ -920,6 +920,16 @@ pub fn reap_zombie_child_times(
         }
     });
 
+    // WNOWAIT (waitid): report the zombie, leave it waitable
+    if let Some(idx) = zombie_idx
+        && wflags & super::wait_options::WNOWAIT != 0
+    {
+        let t = &table.tasks[idx];
+        if let TaskState::Zombie(status) = t.state {
+            return Some((t.pid, status, t.utime, t.stime));
+        }
+    }
+
     if let Some(idx) = zombie_idx {
         let task = table.tasks.remove(idx);
         // Released: drop the RLIMIT_NPROC charge (threads drop it at exit)

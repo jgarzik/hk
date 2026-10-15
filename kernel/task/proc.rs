@@ -531,8 +531,7 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
     let result = loop {
         CHILD_EXIT_WQ.prepare_to_wait(&mut w, SleepState::Interruptible);
 
-        // Try to reap a zombie child (or peek if WNOWAIT)
-        // Note: WNOWAIT leaves child in waitable state - we don't fully support this yet
+        // Reap a zombie child (with WNOWAIT, only report it)
         if let Some((child_pid, wait_status, utime, stime)) =
             super::percpu::reap_zombie_child_times(current_pid, wait_pid, options)
         {
