@@ -19,7 +19,7 @@
 //! Window scaling and timestamps (RFC 7323) come in P7: the receive
 //! window is at most 65535 and `snd_wscale`/`rcv_wscale` stay 0.
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -232,66 +232,117 @@ pub(super) enum Tmr {
     Probe,
 }
 
-/// Out-of-order receive intervals: disjoint, non-adjacent, sorted by
-/// distance from `rcv_nxt`
+/// Most out-of-order pieces kept: a peer sending many tiny scattered
+/// segments cannot make insertion slow or the bookkeeping unbounded
+/// (Linux prunes its ofo queue by truesize); later pieces are dropped
+/// and come again with retransmissions
+pub const OOO_MAX: usize = 256;
+/// Bookkeeping charged per piece on top of its bytes (truesize-like)
+pub const OOO_OVERHEAD: usize = 64;
+
+/// Out-of-order receive data: disjoint pieces keyed by their offset from
+/// `base` (a sequence number at or before RCV.NXT). Inserting copies only
+/// the bytes not held yet (no re-concatenation), O(log n) per piece.
 #[derive(Debug, Default)]
-pub(super) struct Ooo {
-    segs: Vec<(u32, Vec<u8>)>,
+pub struct Ooo {
+    base: u32,
+    map: BTreeMap<u32, Vec<u8>>,
     bytes: usize,
 }
 
 impl Ooo {
-    pub(super) fn bytes(&self) -> usize {
+    pub fn bytes(&self) -> usize {
         self.bytes
     }
 
-    pub(super) fn is_empty(&self) -> bool {
-        self.segs.is_empty()
+    /// Bytes plus per-piece overhead, charged to the receive buffer
+    pub fn truesize(&self) -> usize {
+        self.bytes + self.map.len() * OOO_OVERHEAD
     }
 
-    /// Add `data` at `seq` (after `nxt`), merging with what overlaps or
-    /// touches it
-    pub(super) fn insert(&mut self, nxt: u32, seq: u32, data: &[u8]) {
-        let off = |s: u32| s.wrapping_sub(nxt) as u64;
-        let (mut lo, mut hi) = (off(seq), off(seq) + data.len() as u64);
-        let mut keep = Vec::new();
-        let mut merge = Vec::new();
-        for (s, d) in self.segs.drain(..) {
-            let (a, b) = (off(s), off(s) + d.len() as u64);
-            if b < lo || a > hi {
-                keep.push((s, d));
-            } else {
-                merge.push((a, d));
+    pub fn pieces(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    fn add(&mut self, off: u32, d: &[u8]) -> bool {
+        if d.is_empty() {
+            return true;
+        }
+        if self.map.len() >= OOO_MAX {
+            return false;
+        }
+        self.bytes += d.len();
+        self.map.insert(off, d.to_vec());
+        true
+    }
+
+    /// Add `data` at `seq` (after `nxt`): only the parts not held yet
+    pub fn insert(&mut self, nxt: u32, seq: u32, data: &[u8]) {
+        if self.map.is_empty() {
+            self.base = nxt;
+        } else if nxt.wrapping_sub(self.base) > 1 << 30 {
+            self.rebase(nxt);
+        }
+        let lo = seq.wrapping_sub(self.base);
+        let hi = lo + data.len() as u32;
+        let mut cur = lo;
+        // The piece starting before `lo` may cover its beginning
+        let first = self
+            .map
+            .range(..=lo)
+            .next_back()
+            .map(|(&s, d)| s + d.len() as u32);
+        if let Some(end) = first {
+            cur = cur.max(end);
+        }
+        let held: Vec<(u32, u32)> = self
+            .map
+            .range(lo..hi)
+            .map(|(&s, d)| (s, s + d.len() as u32))
+            .collect();
+        for (s, e) in held {
+            if s > cur && !self.add(cur, &data[(cur - lo) as usize..(s - lo) as usize]) {
+                return;
+            }
+            cur = cur.max(e);
+        }
+        if cur < hi {
+            self.add(cur, &data[(cur - lo) as usize..]);
+        }
+    }
+
+    /// Re-key on `nxt` so offsets stay far from wrapping (pieces it
+    /// passed are dropped)
+    fn rebase(&mut self, nxt: u32) {
+        let shift = nxt.wrapping_sub(self.base);
+        let old = core::mem::take(&mut self.map);
+        self.bytes = 0;
+        self.base = nxt;
+        for (s, d) in old {
+            let skip = shift.saturating_sub(s) as usize;
+            if skip < d.len() {
+                self.bytes += d.len() - skip;
+                self.map.insert(s + skip as u32 - shift, d[skip..].to_vec());
             }
         }
-        for (a, d) in &merge {
-            lo = lo.min(*a);
-            hi = hi.max(a + d.len() as u64);
-        }
-        let mut buf = alloc::vec![0u8; (hi - lo) as usize];
-        let at = (off(seq) - lo) as usize;
-        buf[at..at + data.len()].copy_from_slice(data);
-        for (a, d) in &merge {
-            let at = (a - lo) as usize;
-            buf[at..at + d.len()].copy_from_slice(d);
-        }
-        keep.push((nxt.wrapping_add(lo as u32), buf));
-        keep.sort_by_key(|(s, _)| off(*s));
-        self.bytes = keep.iter().map(|(_, d)| d.len()).sum();
-        self.segs = keep;
     }
 
-    /// The first interval that reaches `nxt`, trimmed to start there;
-    /// intervals `nxt` already passed are dropped on the way
-    pub(super) fn take(&mut self, nxt: u32) -> Option<Vec<u8>> {
+    /// The first piece that reaches `nxt`, trimmed to start there;
+    /// pieces `nxt` already passed are dropped on the way
+    pub fn take(&mut self, nxt: u32) -> Option<Vec<u8>> {
+        let at = nxt.wrapping_sub(self.base);
         loop {
-            let (s, _) = self.segs.first()?;
-            if after(*s, nxt) {
+            let (&s, _) = self.map.iter().next()?;
+            if s > at {
                 return None;
             }
-            let (s, d) = self.segs.remove(0);
+            let d = self.map.remove(&s)?;
             self.bytes -= d.len();
-            let skip = nxt.wrapping_sub(s) as usize;
+            let skip = (at - s) as usize;
             if skip < d.len() {
                 return Some(d[skip..].to_vec());
             }
@@ -752,7 +803,7 @@ impl TcpCb {
     /// Unused receive space (Linux tcp_space), also bounded by the
     /// global TCP memory
     fn free_space(&self) -> u32 {
-        let used = self.rcvq.len() + self.ooo.bytes();
+        let used = self.rcvq.len() + self.ooo.truesize();
         let free = (self.full_space() as usize).saturating_sub(used);
         free.min(mem_free()) as u32
     }
@@ -797,7 +848,7 @@ impl TcpCb {
 
     /// Re-charge the global TCP memory for the current queue sizes
     pub(super) fn charge(&mut self) {
-        let now = self.sndq.len() + self.rcvq.len() + self.ooo.bytes();
+        let now = self.sndq.len() + self.rcvq.len() + self.ooo.truesize();
         if now >= self.charged {
             MEM.fetch_add(now - self.charged, Ordering::Relaxed);
         } else {

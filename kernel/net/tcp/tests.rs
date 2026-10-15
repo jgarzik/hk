@@ -874,8 +874,10 @@ fn ooo_intervals_merge() {
     o.insert(100, 118, &[2; 14]);
     assert_eq!(o.bytes(), 30);
     assert_eq!(o.take(100), None);
-    let d = o.take(110).unwrap();
-    assert_eq!(d.len(), 30);
+    // Disjoint pieces, each byte stored once, delivered in order
+    assert_eq!(o.take(110).unwrap(), [1u8; 10]);
+    assert_eq!(o.take(120).unwrap(), [2u8; 10]);
+    assert_eq!(o.take(130).unwrap(), [3u8; 10]);
     assert!(o.is_empty());
     o.insert(100, 105, &[9; 10]);
     assert_eq!(o.take(108).unwrap().len(), 7);
@@ -951,4 +953,31 @@ fn shutdown_in_syn_received_sends_fin_later() {
     p.run();
     assert_eq!(p.a.state, TcpState::FinWait2);
     assert_eq!(p.b.state, TcpState::CloseWait);
+}
+
+#[test]
+fn ooo_pieces_bounded() {
+    use super::cb::{OOO_MAX, Ooo};
+    let mut o = Ooo::default();
+    // Many tiny scattered segments: bounded pieces, charged overhead
+    for i in 0..20_000u32 {
+        o.insert(0, 10 + i * 3, &[1]);
+    }
+    assert_eq!(o.pieces(), OOO_MAX);
+    assert_eq!(o.truesize(), OOO_MAX * (1 + super::cb::OOO_OVERHEAD));
+    // Adjacent tiny segments growing one range never re-copy held bytes
+    let mut o = Ooo::default();
+    for i in 0..200u32 {
+        o.insert(0, 10 + i, &[i as u8]);
+    }
+    o.insert(0, 5, &[9; 300]);
+    assert_eq!(o.bytes(), 300);
+    let d = o.take(5).unwrap();
+    assert_eq!(d.len(), 5);
+    assert_eq!(o.take(10).unwrap(), [0u8]);
+    // Rebasing keeps data
+    let mut o = Ooo::default();
+    o.insert(0, 100, &[3; 10]);
+    o.insert(0x7000_0000, 0x7000_0010, &[4; 4]);
+    assert_eq!(o.take(0x7000_0010).unwrap(), [4u8; 4]);
 }
