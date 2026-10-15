@@ -69,7 +69,6 @@ pub mod netlink;
 pub mod ping;
 pub mod proc;
 pub mod raw;
-pub mod request_sock;
 pub mod rtnl;
 pub mod skb;
 pub mod sock;
@@ -77,8 +76,6 @@ pub mod socket;
 pub mod syscall;
 pub mod sysctl;
 pub mod tcp;
-pub mod tcp_input;
-pub mod tcp_output;
 pub mod udp;
 
 // Re-export commonly used types

@@ -57,6 +57,8 @@ pub struct BindInfo {
     pub uid: u32,
     /// TCP: in LISTEN (SO_REUSEADDR does not share with a listener)
     pub listen: bool,
+    /// TCP: a TIME_WAIT entry (SO_REUSEPORT shares it with any owner)
+    pub tw: bool,
 }
 
 /// Linux inet_rcv_saddr_equal(match_wildcard = true)
@@ -72,13 +74,14 @@ fn dev_overlap(a: u32, b: u32) -> bool {
 /// udp_lib_lport_inuse): shared when both set SO_REUSEADDR, or both set
 /// SO_REUSEPORT with the same owner. TCP (inet_bind_conflict with
 /// relax): shared when both set SO_REUSEADDR and `old` is not
-/// listening, or both SO_REUSEPORT with the same owner.
+/// listening, or both SO_REUSEPORT with the same owner (any owner for a
+/// TIME_WAIT entry: Linux inet_bind_conflict).
 pub fn conflict(new: &BindInfo, old: &BindInfo, tcp: bool) -> bool {
     if !dev_overlap(new.dev, old.dev) || !addr_overlap(new.addr, old.addr) {
         return false;
     }
     let reuse = new.reuse && old.reuse && !(tcp && old.listen);
-    let reuseport = new.reuseport && old.reuseport && new.uid == old.uid;
+    let reuseport = new.reuseport && old.reuseport && (old.tw || new.uid == old.uid);
     !(reuse || reuseport)
 }
 
@@ -153,6 +156,16 @@ fn secret() -> [u64; 2] {
         SECRET[0].load(Ordering::Relaxed),
         SECRET[1].load(Ordering::Relaxed),
     ]
+}
+
+/// SipHash of `words` under the boot secret, separated by `domain`
+/// (RFC 6528 initial sequence numbers and similar keyed hashes)
+pub fn secure_hash(domain: u64, words: &[u64]) -> u64 {
+    let k = secret();
+    let mut w = alloc::vec::Vec::with_capacity(words.len() + 1);
+    w.push(domain);
+    w.extend_from_slice(words);
+    siphash([k[0] ^ domain, k[1]], &w)
 }
 
 /// RFC 6056 algorithm 4 perturbation table

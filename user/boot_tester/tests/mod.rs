@@ -58,6 +58,8 @@ pub mod swap;
 pub mod adjtimex;
 pub mod io_uring;
 pub mod tcp;
+pub mod tcp_conn;
+pub mod tcp_xfer;
 pub mod bigio;
 pub mod keys;
 pub mod kcmp;
@@ -132,6 +134,8 @@ pub fn run_all_tests() {
     icmp::run_tests();
     icmp::run_ping_tests();
     raw::run_tests();
+    tcp_xfer::run_tests();
+    tcp_conn::run_tests();
     keys::run_tests();
     kcmp::run_tests();
     process_vm::run_tests();

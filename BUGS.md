@@ -35,12 +35,11 @@ VFS handler is registered.
 
 **Location**: `kernel/net/`
 
-Listed because real traffic reaches them: TCP has no retransmission or
-timers, so a dropped segment (TX ring full, backlog overflow) stalls a
-connection, TIME_WAIT ends immediately (no 2MSL), close does not RST
-unread data and SO_LINGER is stored only (P6); ICMP errors about TCP
-segments (host unreachable on SYN_SENT, frag needed) are not delivered
-to TCP sockets yet (P6); ICMP timestamp requests are not answered.
+Listed because real traffic reaches them: TCP (P6 rewrite) lacks
+window scaling, timestamps, SACK, delayed ACKs, Nagle, keepalive,
+TCP_INFO and /proc/net/tcp (P7); no SYN cookies (a full listener drops
+SYNs). ICMP timestamp requests
+are not answered.
 Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are
@@ -49,9 +48,7 @@ IP_TRANSPARENT. Ping sockets check only the effective gid against
 ping_group_range (hk has no supplementary groups). /proc/net/raw and
 /proc/net/icmp do not exist.
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
-SO_PEEK_OFF is EOPNOTSUPP. TCP binds share a port only per the
-SO_REUSEADDR/SO_REUSEPORT rules; connect() picks an entirely unused
-ephemeral port instead of Linux's per-4-tuple reuse.
+SO_PEEK_OFF is EOPNOTSUPP.
 
 ## File permission (DAC) gaps
 

@@ -91,7 +91,7 @@ impl UdpSock {
             reuse: self.sk.flag(sf::REUSEADDR),
             reuseport: self.sk.flag(sf::REUSEPORT),
             uid: self.sk.cred.euid,
-            listen: false,
+            ..Default::default()
         }
     }
 

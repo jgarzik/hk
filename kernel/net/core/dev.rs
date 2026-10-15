@@ -228,11 +228,24 @@ impl Softnet {
     }
 
     fn has_work(&self) -> bool {
-        !self.poll_list.lock().is_empty() || !self.backlog.lock().is_empty()
+        !self.poll_list.lock().is_empty()
+            || !self.backlog.lock().is_empty()
+            || (core::ptr::eq(self, &SOFTNET[0]) && TIMER_DUE.load(Ordering::Acquire))
     }
 }
 
 static SOFTNET: [Softnet; MAX_SCHED_CPUS] = [const { Softnet::new() }; MAX_SCHED_CPUS];
+
+/// Protocol timers are due (run by softnet/0; decision 1: timers only
+/// flag and wake, protocol work stays in softnet)
+static TIMER_DUE: AtomicBool = AtomicBool::new(false);
+
+/// Ask softnet/0 to run the protocol timers (from a `timer::Alarm`
+/// callback on ktimerd; thread context)
+pub fn raise_timer() {
+    TIMER_DUE.store(true, Ordering::Release);
+    SOFTNET[0].wq.wake_all();
+}
 
 /// Softnet threads, by CPU
 static SOFTNET_THREADS: Mutex<Vec<Arc<KThread>>> = Mutex::new(Vec::new());
@@ -290,6 +303,10 @@ fn softnet_thread(cpu: usize) {
     loop {
         sd.wq.wait_event(|| sd.has_work());
         let mut budget = NETDEV_BUDGET;
+
+        if cpu == 0 && TIMER_DUE.swap(false, Ordering::AcqRel) {
+            crate::net::tcp::timer::run();
+        }
 
         // NAPI devices, round-robin, `weight` packets each
         while budget > 0 {

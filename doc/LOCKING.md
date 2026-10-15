@@ -1682,13 +1682,19 @@ do not rely on that.
 | `Softnet.poll_list` (per CPU) | `IrqSpinlock<VecDeque<Arc<Napi>>>` | taken in IRQ (`napi_schedule`) and by `softnet/N` | leaf; capacity reserved by `netif_napi_add`, so the ISR never allocates |
 | `Softnet.wq` (per CPU) | `WaitQueue` | woken from IRQ | leaf (see Wait Queues) |
 | `Softnet.backlog` (per CPU) | `spin::Mutex<VecDeque<Box<SkBuff>>>` | thread only (`netif_rx`, `softnet/N`, inline flush) | leaf; max 1000 packets, then drop + `rx_dropped` |
+| `dev::TIMER_DUE` | `AtomicBool` | thread (ktimerd sets, softnet/0 clears) | protocol timers are due: softnet/0 runs `tcp::timer::run` with no lock held |
 | `Napi.sched` | `AtomicBool` | IRQ + thread | set by `napi_schedule` (only the setter queues it), cleared by `napi_complete_done` |
 | `PTYPE_BASE`, `PTYPE_ALL` | `spin::RwLock<Vec<..>>` | thread only | leaf; handler copied out, called after unlock |
 | `NAPI_LIST`, `SOFTNET_THREADS` | `spin::Mutex<Vec<..>>` | thread only | leaf; registration |
 | `Sock` (`net/sock.rs`, in every protocol socket) | atomics + `Sock.wq` (`WaitQueue`) | any (wakeups) | error, shutdown, buffer sizes, timeouts, SOL_SOCKET flags; one wait queue per socket for readers, writers, connect/accept and pollers (`sk_data_ready`/`sk_write_space`/`sk_state_change` = `wake_all`), always woken after protocol locks are dropped |
 | sockfs inode `private` | `spin::RwLock` (VFS, `Inode.private`) | thread only | read per socket file operation (`sock_of`) to reach the protocol socket; leaf |
-| `TcpCb.sk_lock` | `spin::Mutex<()>` | thread only | Linux `lock_sock` (no backlog: input is thread context). Held by `tcp_rcv` per segment and by connect/bind/listen/send/close; never across a sleep |
-| `TcpSock.{rx, accept_queue, tuple, opts}`, `TcpCb.{retransmit,ooo}_queue` | `spin::Mutex` | thread only | leaves; TCP state/sequence numbers are atomics; the accept queue is dropped before transmitting |
+| `TcpSock.cb` (`net/tcp/mod.rs`) | `spin::Mutex<Inner>` | thread only (softnet input, softnet/0 timers, socket calls) | the TCP socket lock: Linux `bh_lock_sock` plus the `tcp_sock` state it guards (the whole I/O-free `TcpCb`: state, sequence space, send/receive/out-of-order queues, RTO, timers; tuple, port ownership, listener link). Held for one bounded step: never across a sleep, a user copy or a transmit (work is returned as `Out` and run after unlock). A listener's is taken before its new child's (creating it); a child never takes its listener's `cb` |
+| `TcpSock.rd` | `sync::Mutex<()>` (sleeping) | thread only (recvmsg) | serializes readers across peek -> user copy -> consume, so a faulting copy leaves the data queued (reader half of Linux `lock_sock`); held only for that step, never across a wait; above `cb` |
+| `TcpSock.queue` | `spin::Mutex<Option<Accept>>` | thread only | leaf: a listener's SYN_RECEIVED children and accept queue; taken under the listener's or a child's `cb` |
+| `TcpSock.opts` | `spin::Mutex` | thread only | leaf: stored IPPROTO_TCP options |
+| `TimeWait.inner` (`net/tcp/timewait.rs`) | `spin::Mutex` | thread only | a TIME_WAIT entry's queue-less control block + timer slot; same position as `TcpSock.cb` |
+| TCP `TIMERS` (`net/tcp/timer.rs`) | `spin::Mutex<BTreeMap>` | thread only | leaf under `cb`/`TimeWait.inner`: (deadline, id) -> weak owner. Its `timer::Alarm` only wakes softnet/0 (`dev::raise_timer`), which takes due entries out and runs each under its owner's lock with `TIMERS` dropped |
+| TCP tables `TcpTables.{bhash, ehash, lhash}` (`net/tcp/table.rs`, per netns) | `spin::RwLock` | thread only | `bhash` -> `ehash` (connect picks a port and inserts its four-tuple atomically); `lhash` leaf; candidates' `Inet.addr` and `Sock` flags are read under `bhash`; never a socket `cb` under a table lock |
 | `Sock.errq` (`net/sock.rs`) | `spin::Mutex` | thread only (softnet ICMP error delivery, recvmsg MSG_ERRQUEUE, poll) | leaf: IP_RECVERR queue, bounded by SO_RCVBUF (own charge); the wakeup follows the unlock |
 | `IcmpRate.st` (`net/icmp.rs`, per netns) | `spin::Mutex` | thread only | leaf: global + per-destination (bounded, 256) ICMP error token buckets |
 | `UdpSock.op`, `PingSock.op` | `spin::Mutex<()>` | thread only | datagram socket lock (bind/connect/disconnect/autobind); never across a sleep or a transmit; taken before the protocol's port/identifier table |
@@ -1697,7 +1703,7 @@ do not rely on that.
 | `PingTable.socks` (`net/ping.rs`, per netns) | `spin::RwLock` | thread only | ping sockets by echo identifier; receive/error lookups clone the `Arc` and queue after dropping it; reads candidates' `Inet.addr` under it (order table -> Inet.addr) |
 | `Inet.addr` (`net/af_inet.rs`) | `spin::Mutex` | thread only | leaf: addresses/ports of a TCP or UDP socket; read under the UDP/TCP port tables during lookups |
 | `RTNL` (`net/rtnl.rs`) | `spin::Mutex<()>` | thread only (syscalls, kernel config; never softnet) | OUTERMOST network lock: serializes all configuration changes (link up/down + MTU, addresses, routes) from netlink, SIOCS* ioctls and the kernel. Functions needing it take `&RtnlGuard`. Holders never sleep and never take a socket lock (`sk_lock`) |
-| `NetNamespace` tables (`devices`, `tcp_connections`, `tcp_listeners`, `loopback`), `UdpTable.socks`, `TcpBind.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes: RCU-ready); the UDP/TCP port tables read each candidate's `Inet.addr` under their lock |
+| `NetNamespace` tables (`devices`, `loopback`), `UdpTable.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes: RCU-ready); the UDP port table reads each candidate's `Inet.addr` under its lock |
 | `Fib.tables` (`net/inet/fib.rs`, per netns) | `spin::RwLock` | thread only | leaf; written only under RTNL; read by input/output routing (softnet, socket syscalls, possibly under `sk_lock`) and dumps; returns `Arc<FibEntry>` clones; notifications are sent after the guard is dropped |
 | `NetDevice.addrs` (IPv4 list; IPv6 later) | `spin::RwLock` | thread only | leaf; written only under RTNL (`inet::ifaddr`), read via snapshots (`inet_addrs()`) |
 | `NeighTable.hash` (`net/core/neigh.rs`; `NetNamespace.arp`, IPv6 ND later) | `spin::RwLock` | thread only (softnet, socket output, ktimerd) | (ifindex, address) -> `Arc<Neighbour>`; lookups drop the guard; GC/flush take each entry's `inner` under the write lock (order hash -> inner) |
@@ -1720,12 +1726,13 @@ do not rely on that.
 **Lock order (outermost first):**
 
 ```
-RTNL (configuration only)        TcpCb.sk_lock (listener before child; a
-  |                                 child is never locked while its creator
-  |                                 holds the listener) / UdpSock.op / PingSock.op
-  |                                 -> TcpBind.socks / UdpTable.socks / PingTable.socks / conn
-  |                                    tables -> Inet.addr
-  |                                 -> TcpSock.{rx,accept_queue,..} / RxQueue.q
+RTNL (configuration only)        TcpSock.rd (sleeping) -> TcpSock.cb (listener before its new child;
+  |                                 a child never takes its listener's cb) /
+  |                                 TimeWait.inner / UdpSock.op / PingSock.op
+  |                                 -> TCP bhash -> ehash, lhash / UdpTable.socks /
+  |                                    PingTable.socks -> Inet.addr
+  |                                 -> TcpSock.queue, TcpSock.opts / RxQueue.q
+  |                                 -> TCP TIMERS -> Alarm.st -> kernel TIMERS
   v                                 |
 NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
   the guard before returning)
@@ -1761,12 +1768,28 @@ line), it reschedules itself.
 Sockets block only in `Sock::wait` (`wait_event_interruptible_timeout`
 on `Sock.wq`) with no lock held; receive paths make the condition true
 under their leaf lock, drop it, then wake. A socket leaves every table at
-last close (`ProtoOps::release`; TCP connections when their close
-handshake ends).
+last close (`ProtoOps::release`); a TCP connection leaves ehash when it
+reaches CLOSED (an orphan when its close handshake or timers end) or is
+replaced by a TIME_WAIT entry, which leaves after 2MSL.
 
-**Known gaps (later phases):** TCP has no timers/retransmit (P6);
-RCU for the read-mostly tables (FIB, device list,
-address lists: COW snapshots are the intended next step; see plan 3a).
+**TCP and Linux lock_sock.** Linux has two levels: `lock_sock` (an
+owner lock process context holds across user copies and sleeps, with
+a backlog where softirq input waits) and the `bh_lock_sock` spinlock.
+hk input already runs in thread context, so `TcpSock.cb` alone plays
+both parts, with a release-before-sleep discipline: socket calls copy
+user data through a bounded (64 KiB) kernel buffer outside the lock and
+re-check the state at every step, and sleep in `Sock::wait` with no lock
+held. Consequences (deviations): input never waits for a sleeping user
+(no backlog), and concurrent senders on one socket interleave at
+64 KiB steps rather than at sndbuf-wait points. Segments, wakeups and
+errors decided under the lock are carried out after it is dropped
+(`TcpSock::finish`), so no TCP lock is held across a transmit; the
+loopback flush (`netif_rx_flush_local`) runs only at the end of socket
+calls.
+
+**Known gaps (later phases):** RCU for the read-mostly tables (FIB,
+device list, address lists: COW snapshots are the intended next step;
+see plan 3a).
 
 #### Key Device Driver Rules
 

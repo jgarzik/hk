@@ -297,16 +297,32 @@ restart per SA_RESTART unless a socket timeout is set (EINTR). EPIPE
 raises SIGPIPE unless MSG_NOSIGNAL. Unknown options are ENOPROTOOPT
 (EOPNOTSUPP for getsockopt at unknown levels, like Linux).
 
+TCP (RFC 9293): all eleven states, RFC 5961 checks, retransmission with
+RFC 6298 RTO (1 s initial, 200 ms - 120 s, Karn, backoff), Reno/NewReno
+congestion control, zero-window probes, MSS option (536 if absent, PMTU
+from ICMP frag needed), RFC 6528 ISNs, TIME_WAIT 60 s (entries re-ACK a
+retransmitted FIN; SO_REUSEADDR rebinds), half-close, RST on close with
+unread data and with SO_LINGER {1, 0}, SO_LINGER timeouts on close,
+tcp_syn_retries/tcp_synack_retries/tcp_retries2/tcp_fin_timeout,
+ICMP errors (hard in SYN_SENT, soft otherwise, SO_ERROR on timeout).
+Not yet (P7): window scaling, timestamps, SACK, delayed ACKs, Nagle
+(TCP_NODELAY/TCP_CORK are stored only), keepalive, TCP_INFO,
+/proc/net/tcp; listeners keep full child sockets in SYN_RECEIVED (no
+SYN cookies).
+
 - [x] socket (AF_INET: TCP, UDP, ping SOCK_DGRAM/IPPROTO_ICMP gated by
   ping_group_range, SOCK_RAW with CAP_NET_RAW: IP_HDRINCL, SOL_RAW
   ICMP_FILTER; AF_NETLINK)
 - [x] socketpair (AF_INET/AF_NETLINK: EOPNOTSUPP like Linux; AF_UNIX later)
 - [x] bind (SO_REUSEADDR/SO_REUSEPORT rules, EADDRNOTAVAIL, EACCES < 1024)
-- [x] listen (autobinds; backlog capped at somaxconn 4096)
+- [x] listen (autobinds; backlog capped at somaxconn 4096; at most
+  backlog + 1 connections wait for accept, later SYNs are dropped)
 - [x] accept
 - [x] accept4 (SOCK_NONBLOCK, SOCK_CLOEXEC)
 - [x] connect (UDP: route + autobind, AF_UNSPEC disconnects; TCP:
-  EINPROGRESS/EALREADY/EISCONN, ECONNREFUSED)
+  EINPROGRESS/EALREADY/EISCONN, ECONNREFUSED, ETIMEDOUT, EHOSTUNREACH;
+  ephemeral ports shared by different four-tuples like Linux; AF_UNSPEC
+  disconnects)
 - [x] getsockname
 - [x] getpeername
 - [x] getsockopt / setsockopt: SOL_SOCKET (SO_TYPE, SO_DOMAIN,
@@ -320,7 +336,8 @@ raises SIGPIPE unless MSG_NOSIGNAL. Unknown options are ENOPROTOOPT
   EMSGSIZE), IP_MTU, IP_FREEBIND,
   IP_BIND_ADDRESS_NO_PORT, IP_MULTICAST_TTL/LOOP), IPPROTO_TCP
   (TCP_NODELAY, TCP_MAXSEG, TCP_CORK, TCP_KEEPIDLE, TCP_KEEPINTVL,
-  TCP_KEEPCNT, TCP_SYNCNT, TCP_QUICKACK, TCP_USER_TIMEOUT: stored)
+  TCP_KEEPCNT, TCP_SYNCNT, TCP_QUICKACK, TCP_USER_TIMEOUT; TCP_MAXSEG
+  and TCP_SYNCNT act, the others are stored for P7)
 - [x] sendto
 - [x] recvfrom
 - [x] sendmsg (IP_PKTINFO/IP_TTL/IP_TOS control messages)
@@ -330,7 +347,8 @@ raises SIGPIPE unless MSG_NOSIGNAL. Unknown options are ENOPROTOOPT
   SO_RXQ_OVFL control messages)
 - [x] sendmmsg
 - [x] recvmmsg (MSG_WAITFORONE, timeout)
-- [x] shutdown (ENOTCONN when not connected)
+- [x] shutdown (ENOTCONN when not connected; TCP SHUT_WR sends a FIN
+  and keeps receiving)
 
 9. Polling & event notification
 9.1 Select/poll/epoll
