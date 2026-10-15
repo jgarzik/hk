@@ -2,10 +2,10 @@
 //! user space, nothing below vm.mmap_min_addr without CAP_SYS_RAWIO,
 //! mmap top-down below the stack, the kernel half unreachable.
 
-use super::helpers::{print, print_num, println};
+use super::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
     sys_brk, sys_close, sys_exit, sys_fork, sys_mmap, sys_munmap, sys_open, sys_read, sys_setuid,
-    sys_wait4, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, O_RDONLY, PROT_READ, PROT_WRITE,
+    sys_wait4, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, O_RDONLY, PROT_READ, PROT_WRITE,
 };
 
 /// End of user space
@@ -41,11 +41,18 @@ fn report(name: &[u8], ok: bool, v: i64) {
     }
 }
 
-/// MAP_FIXED at a low address classic executables use works, and the
-/// memory is usable
+/// A fixed mapping at a low address classic executables use works, and
+/// the memory is usable. NOREPLACE: the Linux host build of this program
+/// is itself a non-PIE executable at 0x400000 on arm64 (MAP_FIXED would
+/// unmap init's own code)
 fn test_fixed(name: &[u8], addr: u64) {
-    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+    const EEXIST: i64 = -17;
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE;
     let r = sys_mmap(addr, 8192, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if r == EEXIST && host_mode() {
+        skip(name, b"the host build of boot_tester is loaded there");
+        return;
+    }
     if r != addr as i64 {
         report(name, false, r);
         return;
