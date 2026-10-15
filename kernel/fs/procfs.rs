@@ -185,10 +185,7 @@ pub enum ProcfsInodeData {
     /// File containing information about an open file descriptor.
     FdinfoFile { pid: Pid, fd: i32 },
     /// Generated per-process file (/proc/<pid>/cgroup, maps, ...)
-    PidFile {
-        pid: Pid,
-        generator: fn(Pid) -> Vec<u8>,
-    },
+    PidFile { pid: Pid, generator: PidGen },
     /// Per-process symlink (/proc/<pid>/exe)
     PidLink {
         pid: Pid,
@@ -247,7 +244,7 @@ impl ProcfsInodeData {
     }
 
     /// Create per-process generated file data
-    pub fn new_pid_file(pid: Pid, generator: fn(Pid) -> Vec<u8>) -> Self {
+    pub fn new_pid_file(pid: Pid, generator: PidGen) -> Self {
         Self::PidFile { pid, generator }
     }
 
@@ -357,8 +354,15 @@ impl InodeOps for ProcfsInodeOps {
     }
 
     /// /proc/sys files: Linux proc_sys_permission (never executable,
-    /// then sysctl_perm: no capability override of the mode)
+    /// then sysctl_perm: no capability override of the mode); fd/ and
+    /// fdinfo/ need ptrace-read access
     fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
+        // fd/ and fdinfo/: ptrace-read access (Linux proc_fd_permission)
+        if let Some(OpenCheck::Fds(pid)) = open_check(inode)
+            && !crate::task::ptrace::may_read_proc(pid)
+        {
+            return Err(KernelError::PermissionDenied);
+        }
         let Some(ctl) = sysctl_of(inode) else {
             return crate::fs::dac::generic_permission(cred, inode, mask);
         };
@@ -453,7 +457,7 @@ impl InodeOps for ProcfsInodeOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidFile { pid, generator } => generator(*pid),
+            ProcfsInodeData::PidFile { pid, generator } => pid_content(None, *pid, *generator)?,
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
             ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::PidLink { .. }
@@ -860,12 +864,74 @@ fn gen_cgroup_content(pid: Pid) -> Vec<u8> {
 }
 
 /// Generated files in /proc/<pid>/: name, inode offset, generator
+/// Access checks a procfs file needs at open
+enum OpenCheck {
+    /// Address-space file of `pid`: pin its mm
+    Mm(Pid),
+    /// fd/ or fdinfo/ of `pid`
+    Fds(Pid),
+}
+
+/// The open-time check of `inode`, if any
+fn open_check(inode: &Inode) -> Option<OpenCheck> {
+    let private = inode.get_private()?;
+    let wrapper = private
+        .as_ref()
+        .as_any()
+        .downcast_ref::<ProcfsInodeWrapper>()?;
+    match &*wrapper.0.read() {
+        ProcfsInodeData::PidFile {
+            pid,
+            generator: PidGen::Mm(_),
+        } => Some(OpenCheck::Mm(*pid)),
+        ProcfsInodeData::PidFdDirectory { pid } | ProcfsInodeData::PidFdinfoDirectory { pid } => {
+            Some(OpenCheck::Fds(*pid))
+        }
+        _ => None,
+    }
+}
+
 /// Content generator of a per-process file
-type PidGen = fn(Pid) -> Vec<u8>;
+#[derive(Clone, Copy)]
+pub enum PidGen {
+    /// World-readable content of the process
+    Pub(fn(Pid) -> Vec<u8>),
+    /// Private content of the address space: open needs ptrace-read
+    /// access and pins the mm it reads from (Linux proc_mem_open)
+    Mm(fn(&crate::mm::MmStruct) -> Vec<u8>),
+}
+
+/// The address space a /proc/<pid>/ file reads, if the caller may
+/// (Linux mm_access): EACCES without ptrace-read access
+fn mm_access(pid: Pid) -> Result<Option<Arc<spin::Mutex<crate::mm::MmStruct>>>, KernelError> {
+    if !crate::task::ptrace::may_read_proc(pid) {
+        return Err(KernelError::PermissionDenied);
+    }
+    let tid = get_tid_for_pid(pid).ok_or(KernelError::NoProcess)?;
+    Ok(crate::mm::get_task_mm(tid))
+}
+
+/// Content of a per-process file for this open file (or, with none,
+/// checked afresh)
+fn pid_content(file: Option<&File>, pid: Pid, g: PidGen) -> Result<Vec<u8>, KernelError> {
+    match g {
+        PidGen::Pub(f) => Ok(f(pid)),
+        PidGen::Mm(f) => {
+            let mm = match file.and_then(|fl| fl.private.get()) {
+                Some(p) => p
+                    .clone()
+                    .downcast::<spin::Mutex<crate::mm::MmStruct>>()
+                    .ok(),
+                None => mm_access(pid)?,
+            };
+            Ok(mm.map(|m| f(&m.lock())).unwrap_or_default())
+        }
+    }
+}
 
 const PID_FILES: &[(&str, u64, PidGen)] = &[
-    ("cgroup", 102, gen_cgroup_content),
-    ("maps", 103, gen_maps_content),
+    ("cgroup", 102, PidGen::Pub(gen_cgroup_content)),
+    ("maps", 103, PidGen::Mm(gen_maps)),
 ];
 
 fn pid_file(name: &str) -> Option<(u64, PidGen)> {
@@ -875,24 +941,19 @@ fn pid_file(name: &str) -> Option<(u64, PidGen)> {
         .map(|&(_, off, g)| (off, g))
 }
 
-/// /proc/<pid>/exe: the executable's path (ENOENT for kernel threads)
+/// /proc/<pid>/exe: the executable's path (ENOENT for kernel threads,
+/// EACCES without ptrace-read access, Linux proc_fd_access_allowed)
 fn exe_link(pid: Pid) -> Result<String, KernelError> {
-    let mm = get_tid_for_pid(pid)
-        .and_then(crate::mm::get_task_mm)
-        .ok_or(KernelError::NotFound)?;
+    let mm = mm_access(pid)?.ok_or(KernelError::NotFound)?;
     let exe = mm.lock().exe().ok_or(KernelError::NotFound)?;
     Ok(exe)
 }
 
 /// /proc/<pid>/maps: one line per VMA (Linux show_map_vma)
-fn gen_maps_content(pid: Pid) -> Vec<u8> {
+fn gen_maps(mm: &crate::mm::MmStruct) -> Vec<u8> {
     use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
     use alloc::fmt::Write;
     let mut out = String::new();
-    let Some(mm) = get_tid_for_pid(pid).and_then(crate::mm::get_task_mm) else {
-        return Vec::new();
-    };
-    let mm = mm.lock();
     let (start_brk, brk) = (mm.get_start_brk(), mm.get_brk());
     for v in mm.iter() {
         let bit = |b: bool, c: char| if b { c } else { '-' };
@@ -995,6 +1056,25 @@ impl FileOps for ProcfsFileOps {
         self
     }
 
+    /// Private per-process files check ptrace-read access at open
+    /// (Linux proc_mem_open, proc_fd_permission); maps keeps the address
+    /// space it was opened on, so a later setuid exec cannot leak
+    fn open(&self, file: &File) -> Result<(), KernelError> {
+        let Some(check) = file.get_inode().and_then(|i| open_check(&i)) else {
+            return Ok(());
+        };
+        match check {
+            OpenCheck::Mm(pid) => {
+                if let Some(mm) = mm_access(pid)? {
+                    file.private.call_once(|| mm);
+                }
+                Ok(())
+            }
+            OpenCheck::Fds(pid) if crate::task::ptrace::may_read_proc(pid) => Ok(()),
+            OpenCheck::Fds(_) => Err(KernelError::PermissionDenied),
+        }
+    }
+
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let private = inode.get_private().ok_or(KernelError::Io)?;
@@ -1011,7 +1091,9 @@ impl FileOps for ProcfsFileOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidFile { pid, generator } => generator(*pid),
+            ProcfsInodeData::PidFile { pid, generator } => {
+                pid_content(Some(file), *pid, *generator)?
+            }
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
             ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::PidLink { .. }
@@ -1056,7 +1138,9 @@ impl FileOps for ProcfsFileOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidFile { pid, generator } => generator(*pid),
+            ProcfsInodeData::PidFile { pid, generator } => {
+                pid_content(Some(file), *pid, *generator)?
+            }
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
             ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::PidLink { .. }

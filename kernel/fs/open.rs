@@ -231,6 +231,7 @@ fn filp_open(
     if flags & O_ACCMODE != O_RDONLY {
         file.write_access = w;
     }
+    f_op.open(&file)?;
     Ok(Arc::new(file))
 }
 
