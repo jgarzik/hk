@@ -134,8 +134,64 @@ mod offset {
     pub const BAR3: u8 = 0x1C;
     pub const BAR4: u8 = 0x20;
     pub const BAR5: u8 = 0x24;
+    pub const CAPABILITY_LIST: u8 = 0x34;
     pub const INTERRUPT_LINE: u8 = 0x3C;
     pub const INTERRUPT_PIN: u8 = 0x3D;
+}
+
+/// PCI status register bits
+mod status {
+    /// Capability list present
+    pub const CAP_LIST: u16 = 1 << 4;
+}
+
+/// PCI capability IDs (Linux PCI_CAP_ID_*)
+pub mod cap_id {
+    pub const VNDR: u8 = 0x09;
+    pub const MSIX: u8 = 0x11;
+}
+
+/// Maximum capabilities walked (Linux PCI_FIND_CAP_TTL): bounds a list
+/// that loops
+const CAP_TTL: u32 = 48;
+
+/// Walk a capability list (Linux __pci_find_next_cap_ttl), reading config
+/// bytes through `read8`
+pub struct PciCapIter<F: Fn(u8) -> u8> {
+    read8: F,
+    pos: u8,
+    ttl: u32,
+}
+
+impl<F: Fn(u8) -> u8> PciCapIter<F> {
+    /// Start at the list head `first` (0 = no list)
+    pub fn new(read8: F, first: u8) -> Self {
+        Self {
+            read8,
+            pos: first,
+            ttl: CAP_TTL,
+        }
+    }
+}
+
+impl<F: Fn(u8) -> u8> Iterator for PciCapIter<F> {
+    /// (offset, capability ID)
+    type Item = (u8, u8);
+
+    fn next(&mut self) -> Option<(u8, u8)> {
+        let pos = self.pos & !3;
+        // Capabilities live after the 64-byte standard header
+        if self.ttl == 0 || pos < 0x40 {
+            return None;
+        }
+        self.ttl -= 1;
+        let id = (self.read8)(pos);
+        if id == 0xFF {
+            return None;
+        }
+        self.pos = (self.read8)(pos + 1);
+        Some((pos, id))
+    }
 }
 
 /// PCI command register bits
@@ -644,6 +700,31 @@ impl PciDevice {
         );
     }
 
+    /// Read a config space byte of this function
+    pub fn cfg_read8(&self, off: u8) -> u8 {
+        pci_read8(self.bus, self.device, self.function, off)
+    }
+
+    /// Read a config space word of this function
+    pub fn cfg_read16(&self, off: u8) -> u16 {
+        pci_read16(self.bus, self.device, self.function, off)
+    }
+
+    /// Read a config space dword of this function
+    pub fn cfg_read32(&self, off: u8) -> u32 {
+        pci_read32(self.bus, self.device, self.function, off)
+    }
+
+    /// The capability list: (offset, ID) pairs (Linux pci_find_capability)
+    pub fn caps(&self) -> PciCapIter<impl Fn(u8) -> u8 + '_> {
+        let first = if self.cfg_read16(offset::STATUS) & status::CAP_LIST != 0 {
+            self.cfg_read8(offset::CAPABILITY_LIST)
+        } else {
+            0
+        };
+        PciCapIter::new(move |off| self.cfg_read8(off), first)
+    }
+
     /// IRQ number of this device's INTx pin (arch routing: x86-64 legacy
     /// PIC line from config space; aarch64 DT interrupt-map / virt swizzle)
     pub fn intx_irq(&self) -> Option<u32> {
@@ -1107,5 +1188,49 @@ impl DmaDevice for PciDevice {
 
     fn dma_config_mut(&mut self) -> &mut DmaConfig {
         &mut self.dma_config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walk(cfg: &[u8; 256], first: u8) -> Vec<(u8, u8)> {
+        PciCapIter::new(|off| cfg[off as usize], first).collect()
+    }
+
+    #[test]
+    fn cap_list_walk() {
+        let mut cfg = [0u8; 256];
+        // 0x40: MSI-X -> 0x50: vendor -> 0x62 (low bits ignored): vendor -> end
+        cfg[0x40] = cap_id::MSIX;
+        cfg[0x41] = 0x50;
+        cfg[0x50] = cap_id::VNDR;
+        cfg[0x51] = 0x63;
+        cfg[0x60] = cap_id::VNDR;
+        cfg[0x61] = 0;
+        assert_eq!(
+            walk(&cfg, 0x40),
+            [
+                (0x40, cap_id::MSIX),
+                (0x50, cap_id::VNDR),
+                (0x60, cap_id::VNDR)
+            ]
+        );
+        assert!(walk(&cfg, 0).is_empty());
+        // A pointer into the standard header ends the list
+        cfg[0x61] = 0x10;
+        assert_eq!(walk(&cfg, 0x40).len(), 3);
+    }
+
+    #[test]
+    fn cap_list_loop_is_bounded() {
+        let mut cfg = [0u8; 256];
+        cfg[0x40] = cap_id::VNDR;
+        cfg[0x41] = 0x40; // points at itself
+        assert_eq!(walk(&cfg, 0x40).len(), CAP_TTL as usize);
+        // An all-ones read (device gone) ends the walk
+        let gone = [0xFFu8; 256];
+        assert!(walk(&gone, 0x40).is_empty());
     }
 }
