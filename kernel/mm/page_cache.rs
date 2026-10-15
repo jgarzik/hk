@@ -801,11 +801,16 @@ pub struct PageCache {
     /// FIFO eviction queue (oldest at front)
     fifo_queue: VecDeque<FifoEntry>,
 
-    /// Maximum number of pages to cache
+    /// Maximum number of evictable pages to cache (unevictable pages,
+    /// e.g. ramfs data, are bounded only by memory, like Linux's
+    /// unevictable LRU)
     max_pages: usize,
 
     /// Current number of cached pages
     current_pages: AtomicUsize,
+
+    /// Pages of unevictable address spaces among `current_pages`
+    unevictable_pages: AtomicUsize,
 }
 
 impl PageCache {
@@ -816,6 +821,33 @@ impl PageCache {
             fifo_queue: VecDeque::new(),
             max_pages,
             current_pages: AtomicUsize::new(0),
+            unevictable_pages: AtomicUsize::new(0),
+        }
+    }
+
+    /// Cached pages that count against `max_pages`
+    fn evictable_pages(&self) -> usize {
+        let all = self.current_pages.load(Ordering::Relaxed);
+        all.saturating_sub(self.unevictable_pages.load(Ordering::Relaxed))
+    }
+
+    /// Account `n` pages added to (`add`) or removed from `space`
+    fn account(&self, space: Option<&AddressSpace>, n: usize, add: bool) {
+        let c = &self.current_pages;
+        let u = &self.unevictable_pages;
+        let counters: &[&AtomicUsize] = if space.is_some_and(|a| a.is_unevictable()) {
+            &[c, u]
+        } else {
+            &[c]
+        };
+        for ctr in counters {
+            let old = ctr.load(Ordering::Relaxed);
+            let new = if add {
+                old + n
+            } else {
+                old.saturating_sub(n)
+            };
+            ctr.store(new, Ordering::Relaxed);
         }
     }
 
@@ -940,7 +972,7 @@ impl PageCache {
         a_ops: &'static dyn AddressSpaceOps,
     ) -> Result<Arc<CachedPage>, KernelError> {
         // Check if we need to evict
-        if self.current_pages.load(Ordering::Relaxed) >= self.max_pages {
+        if self.evictable_pages() >= self.max_pages {
             self.evict_one(frame_alloc)?;
         }
 
@@ -981,7 +1013,7 @@ impl PageCache {
             page: page.clone(),
         });
 
-        self.current_pages.fetch_add(1, Ordering::Relaxed);
+        self.account(Some(&addr_space), 1, true);
 
         Ok(page)
     }
@@ -1146,7 +1178,7 @@ impl PageCache {
         a_ops: &'static dyn AddressSpaceOps,
     ) -> Result<Arc<CachedPage>, KernelError> {
         // Check if we need to evict
-        if self.current_pages.load(Ordering::Relaxed) >= self.max_pages {
+        if self.evictable_pages() >= self.max_pages {
             self.evict_one(frame_alloc)?;
         }
 
@@ -1175,7 +1207,7 @@ impl PageCache {
             page: page.clone(),
         });
 
-        self.current_pages.fetch_add(1, Ordering::Relaxed);
+        self.account(Some(&addr_space), 1, true);
 
         Ok(page)
     }
@@ -1243,10 +1275,7 @@ impl PageCache {
         }
 
         self.fifo_queue = new_queue;
-        // Use atomic subtract, clamping to 0 if underflow would occur
-        let old = self.current_pages.load(Ordering::Relaxed);
-        self.current_pages
-            .store(old.saturating_sub(freed_count), Ordering::Relaxed);
+        self.account(removed_space.as_deref(), freed_count, false);
 
         freed_count
     }
@@ -1310,9 +1339,7 @@ impl PageCache {
         }
 
         self.fifo_queue = new_queue;
-        let old = self.current_pages.load(Ordering::Relaxed);
-        self.current_pages
-            .store(old.saturating_sub(freed_count), Ordering::Relaxed);
+        self.account(Some(&addr_space), freed_count, false);
 
         freed_count
     }
@@ -1358,9 +1385,7 @@ impl PageCache {
         }
 
         self.fifo_queue = new_queue;
-        let old = self.current_pages.load(Ordering::Relaxed);
-        self.current_pages
-            .store(old.saturating_sub(freed_count), Ordering::Relaxed);
+        self.account(removed_space.as_deref(), freed_count, false);
 
         freed_count
     }

@@ -16,6 +16,7 @@ pub fn run_tests() {
     // mapping drops the rest of it (BUGS.md), which would hit init
     in_child(test_file);
     in_child(test_null);
+    test_ramfs_pages();
     test_pipe();
     test_blocked_reads();
 }
@@ -31,6 +32,49 @@ fn verdict(name: &[u8], why: &[u8], got: i64) {
     print(b" got ");
     print_num(got);
     println(b"");
+}
+
+/// More ramfs data than the page cache keeps of evictable pages (hk
+/// caps those at 4MB): ramfs pages can never be evicted, so they must
+/// not count against that cap, and other files keep working
+fn test_ramfs_pages() {
+    const N: &[u8] = b"BIGIO_RAMFS_PAGES";
+    const SIZE: usize = 8 * MB;
+    let chunk = [0x5au8; 16384];
+    let fd = sys_open(b"/ramfs_big\0".as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 {
+        return verdict(N, b"open", fd);
+    }
+    let mut done = 0;
+    while done < SIZE {
+        let n = sys_write(fd as u64, chunk.as_ptr(), chunk.len() as u64);
+        if n != chunk.len() as i64 {
+            sys_close(fd as u64);
+            sys_unlink(b"/ramfs_big\0".as_ptr());
+            return verdict(N, b"big write", n);
+        }
+        done += chunk.len();
+    }
+    let small = sys_open(b"/ramfs_small\0".as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    let w = sys_write(small as u64, b"ok".as_ptr(), 2);
+    let mut b = [0u8; 2];
+    let r = sys_pread64(small as i32, b.as_mut_ptr(), 2, 0);
+    let mut last = [0u8; 1];
+    let tail = sys_pread64(fd as i32, last.as_mut_ptr(), 1, (SIZE - 1) as i64);
+    // Free the pages (truncate drops them; unlink alone does not, BUGS.md)
+    sys_ftruncate(fd as i32, 0);
+    sys_ftruncate(small as i32, 0);
+    sys_close(fd as u64);
+    sys_close(small as u64);
+    sys_unlink(b"/ramfs_big\0".as_ptr());
+    sys_unlink(b"/ramfs_small\0".as_ptr());
+    if w != 2 || r != 2 || &b != b"ok" {
+        return verdict(N, b"small file", w * 10 + r);
+    }
+    if tail != 1 || last[0] != 0x5a {
+        return verdict(N, b"big file tail", tail);
+    }
+    verdict(N, b"", 0);
 }
 
 /// Run `f` in a child process and wait for it
