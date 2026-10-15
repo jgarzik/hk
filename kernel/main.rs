@@ -757,7 +757,15 @@ fn kmain() -> ! {
     let (alloc_base, alloc_size) = CurrentArch::get_frame_alloc_region();
     printkln!("MEM: {} MB", alloc_size / (1024 * 1024));
 
-    // Initialize frame allocator
+    // Initialize frame allocator; its metadata overwrites the start of
+    // the region, which must hold no boot data
+    let meta_end = alloc_base + frame_alloc::BitmapFrameAllocator::meta_size(alloc_size);
+    CurrentArch::for_each_reserved(&mut |start, end| {
+        assert!(
+            end <= alloc_base || start >= meta_end,
+            "boot data {start:#x}-{end:#x} under frame metadata"
+        );
+    });
     FRAME_ALLOCATOR.init(alloc_base, alloc_size);
     FRAME_ALLOCATOR.mark_used(0, alloc_base);
     CurrentArch::for_each_reserved(&mut |start, end| FRAME_ALLOCATOR.mark_used(start, end - start));

@@ -43,6 +43,8 @@ struct BitmapFrameAllocatorInner {
     next_free: usize,
     /// Free frames (set bits in `bitmap`), kept exact by `set_free`
     free: usize,
+    /// Leading frames holding `bitmap` and `refcounts` (never free)
+    meta: usize,
 }
 
 impl BitmapFrameAllocatorInner {
@@ -58,6 +60,27 @@ impl BitmapFrameAllocatorInner {
             self.bitmap[w] &= !b;
             self.free -= 1;
         }
+    }
+
+    /// Index of the managed frame at `frame`; None for any address the
+    /// allocator does not hand out (outside the region, unaligned, or a
+    /// metadata frame), so a stray free or refcount op is a no-op
+    /// instead of an out-of-bounds write
+    fn index(&self, frame: u64) -> Option<usize> {
+        let off = frame.checked_sub(self.base)?;
+        if !off.is_multiple_of(FRAME_SIZE as u64) {
+            return None;
+        }
+        let idx = usize::try_from(off / FRAME_SIZE as u64).ok()?;
+        (idx >= self.meta && idx < self.total_frames).then_some(idx)
+    }
+
+    /// Index of a huge page head: 2MB-aligned (physically) and wholly
+    /// inside the managed frames
+    fn huge_index(&self, frame: u64) -> Option<usize> {
+        let idx = self.index(frame)?;
+        let fits = idx + FRAMES_PER_HUGE_PAGE <= self.total_frames;
+        (frame.is_multiple_of((FRAMES_PER_HUGE_PAGE * FRAME_SIZE) as u64) && fits).then_some(idx)
     }
 
     /// Set a whole bitmap word (huge pages), keeping the free count exact
@@ -78,6 +101,7 @@ impl BitmapFrameAllocator {
                 total_frames: 0,
                 next_free: 0,
                 free: 0,
+                meta: 0,
             }),
         }
     }
@@ -88,19 +112,43 @@ impl BitmapFrameAllocator {
     /// allocation, except its first frames, which hold the bitmap and
     /// the reference counts (used through the direct map)
     pub fn init(&self, base: u64, size: u64) {
-        let n = size as usize / FRAME_SIZE;
-        let words = n.div_ceil(64);
-        let meta = (words * 8 + n * 2).div_ceil(FRAME_SIZE);
-        assert!(meta < n, "frame region too small");
         let p = crate::arch::phys_to_virt(base);
+        unsafe { self.init_at(base, size, p) };
+    }
+
+    /// Metadata bytes for `n` frames: bitmap words, then u16 refcounts
+    fn meta_bytes(n: usize) -> usize {
+        n.div_ceil(64) * 8 + n * 2
+    }
+
+    /// Bytes at the start of a `size`-byte region that `init` overwrites
+    /// with metadata (callers check no boot data lives there)
+    pub fn meta_size(size: u64) -> u64 {
+        Self::meta_bytes((size / FRAME_SIZE as u64) as usize).next_multiple_of(FRAME_SIZE) as u64
+    }
+
+    /// `init` with the metadata at kernel address `p` (the first frames
+    /// of the region; host tests pass their own buffer)
+    ///
+    /// # Safety
+    /// `p` must be writable for `meta_bytes(size / FRAME_SIZE)` rounded
+    /// up to a frame, 8-byte aligned, and used for nothing else.
+    unsafe fn init_at(&self, base: u64, size: u64, p: *mut u8) {
+        let n = (size / FRAME_SIZE as u64) as usize;
+        let words = n.div_ceil(64);
+        let meta = Self::meta_bytes(n).div_ceil(FRAME_SIZE);
+        assert!(meta < n, "frame region too small");
         let mut inner = self.inner.lock();
         unsafe {
             core::ptr::write_bytes(p, 0, meta * FRAME_SIZE);
             inner.bitmap = core::slice::from_raw_parts_mut(p as *mut u64, words);
             inner.refcounts = core::slice::from_raw_parts_mut(p.add(words * 8) as *mut u16, n);
         }
+        // Metadata frames and the bits past `n` in the last word stay 0
+        // (used): never handed out
         inner.base = base;
         inner.total_frames = n;
+        inner.meta = meta;
         inner.next_free = meta;
         inner.free = 0;
         for f in meta..n {
@@ -146,11 +194,9 @@ impl BitmapFrameAllocator {
     pub fn free(&self, frame: u64) {
         let mut inner = self.inner.lock();
 
-        if frame < inner.base {
+        let Some(frame_idx) = inner.index(frame) else {
             return;
-        }
-
-        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+        };
         if frame_idx < inner.total_frames {
             inner.set_free(frame_idx, true);
             inner.refcounts[frame_idx] = 0;
@@ -168,11 +214,9 @@ impl BitmapFrameAllocator {
     pub fn incref(&self, frame: u64) {
         let mut inner = self.inner.lock();
 
-        if frame < inner.base {
+        let Some(frame_idx) = inner.index(frame) else {
             return;
-        }
-
-        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+        };
         if frame_idx < inner.total_frames {
             // Saturating add to prevent overflow
             inner.refcounts[frame_idx] = inner.refcounts[frame_idx].saturating_add(1);
@@ -185,11 +229,9 @@ impl BitmapFrameAllocator {
     pub fn decref(&self, frame: u64) -> bool {
         let mut inner = self.inner.lock();
 
-        if frame < inner.base {
+        let Some(frame_idx) = inner.index(frame) else {
             return false;
-        }
-
-        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+        };
         if frame_idx < inner.total_frames {
             if inner.refcounts[frame_idx] > 0 {
                 inner.refcounts[frame_idx] -= 1;
@@ -213,11 +255,9 @@ impl BitmapFrameAllocator {
     pub fn refcount(&self, frame: u64) -> u16 {
         let inner = self.inner.lock();
 
-        if frame < inner.base {
+        let Some(frame_idx) = inner.index(frame) else {
             return 0;
-        }
-
-        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+        };
         if frame_idx < inner.total_frames {
             inner.refcounts[frame_idx]
         } else {
@@ -237,18 +277,12 @@ impl BitmapFrameAllocator {
             return;
         }
 
-        // Clamp start to our base
-        let clamped_start = phys_start.max(inner.base);
-        let clamped_size = phys_end - clamped_start;
-
-        let start_frame = ((clamped_start - inner.base) / FRAME_SIZE as u64) as usize;
-        let num_frames = (clamped_size as usize).div_ceil(FRAME_SIZE);
-
-        for i in 0..num_frames {
-            let frame = start_frame + i;
-            if frame < inner.total_frames {
-                inner.set_free(frame, false);
-            }
+        // Every frame the range touches, clamped to the managed frames
+        let first = ((phys_start.max(inner.base) - inner.base) / FRAME_SIZE as u64) as usize;
+        let end = (phys_end - inner.base).div_ceil(FRAME_SIZE as u64);
+        let end = end.min(inner.total_frames as u64) as usize;
+        for frame in first..end {
+            inner.set_free(frame, false);
         }
     }
 
@@ -285,6 +319,11 @@ impl BitmapFrameAllocator {
             // Check if this huge page region is entirely within bounds
             if frame_start + FRAMES_PER_HUGE_PAGE > inner.total_frames {
                 break;
+            }
+            // The mapping needs a physically 2MB-aligned run
+            let phys = inner.base + (frame_start * FRAME_SIZE) as u64;
+            if !phys.is_multiple_of((FRAMES_PER_HUGE_PAGE * FRAME_SIZE) as u64) {
+                continue;
             }
 
             // Check if all 8 words are all 1s (all 512 frames free)
@@ -323,11 +362,9 @@ impl BitmapFrameAllocator {
     pub fn free_huge(&self, frame: u64) {
         let mut inner = self.inner.lock();
 
-        if frame < inner.base {
+        let Some(frame_idx) = inner.huge_index(frame) else {
             return;
-        }
-
-        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+        };
 
         // Verify alignment (must be at 512-frame boundary)
         if !frame_idx.is_multiple_of(FRAMES_PER_HUGE_PAGE) {
@@ -363,11 +400,9 @@ impl BitmapFrameAllocator {
     pub fn incref_huge(&self, frame: u64) {
         let mut inner = self.inner.lock();
 
-        if frame < inner.base {
+        let Some(frame_idx) = inner.huge_index(frame) else {
             return;
-        }
-
-        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+        };
 
         // Verify alignment
         if !frame_idx.is_multiple_of(FRAMES_PER_HUGE_PAGE) {
@@ -385,11 +420,9 @@ impl BitmapFrameAllocator {
     pub fn decref_huge(&self, frame: u64) -> bool {
         let mut inner = self.inner.lock();
 
-        if frame < inner.base {
+        let Some(frame_idx) = inner.huge_index(frame) else {
             return false;
-        }
-
-        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+        };
 
         // Verify alignment
         if !frame_idx.is_multiple_of(FRAMES_PER_HUGE_PAGE) {
@@ -429,11 +462,9 @@ impl BitmapFrameAllocator {
     pub fn refcount_huge(&self, frame: u64) -> u16 {
         let inner = self.inner.lock();
 
-        if frame < inner.base {
+        let Some(frame_idx) = inner.huge_index(frame) else {
             return 0;
-        }
-
-        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+        };
 
         // Verify alignment
         if !frame_idx.is_multiple_of(FRAMES_PER_HUGE_PAGE) {
@@ -454,11 +485,9 @@ impl BitmapFrameAllocator {
     pub fn is_huge_page(&self, frame: u64) -> bool {
         let inner = self.inner.lock();
 
-        if frame < inner.base {
+        let Some(frame_idx) = inner.huge_index(frame) else {
             return false;
-        }
-
-        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
+        };
 
         // Must be at 512-frame boundary
         if !frame_idx.is_multiple_of(FRAMES_PER_HUGE_PAGE) {
@@ -502,49 +531,11 @@ impl FrameAlloc for &BitmapFrameAllocator {
     }
 
     fn alloc_frame(&mut self) -> Option<Self::PhysAddr> {
-        let mut inner = self.inner.lock();
-
-        let num_words = inner.total_frames.div_ceil(64);
-
-        // Search starting from hint
-        for offset in 0..num_words {
-            let word_idx = (inner.next_free / 64 + offset) % num_words;
-            let word = inner.bitmap[word_idx];
-
-            if word != 0 {
-                let bit = word.trailing_zeros() as usize;
-                let frame = word_idx * 64 + bit;
-
-                if frame < inner.total_frames {
-                    // Mark as used
-                    inner.set_free(frame, false);
-                    inner.next_free = frame + 1;
-
-                    let phys_addr = inner.base + (frame as u64 * FRAME_SIZE as u64);
-                    return Some(phys_addr);
-                }
-            }
-        }
-
-        None
+        self.alloc()
     }
 
     fn free_frame(&mut self, frame: Self::PhysAddr) {
-        let mut inner = self.inner.lock();
-
-        if frame < inner.base {
-            return;
-        }
-
-        let frame_idx = ((frame - inner.base) / FRAME_SIZE as u64) as usize;
-        if frame_idx < inner.total_frames {
-            inner.set_free(frame_idx, true);
-
-            // Update hint
-            if frame_idx < inner.next_free {
-                inner.next_free = frame_idx;
-            }
-        }
+        self.free(frame)
     }
 }
 
@@ -666,5 +657,135 @@ impl FrameAlloc for FrameAllocRef<'_> {
 
     fn free_frame(&mut self, frame: Self::PhysAddr) {
         self.0.free(frame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: u64 = 0x4020_0000; // 2MB aligned
+
+    /// An allocator over `n` frames at BASE, metadata in a host buffer
+    fn fa(n: usize) -> (BitmapFrameAllocator, Vec<u64>) {
+        let a = BitmapFrameAllocator::new();
+        let bytes = BitmapFrameAllocator::meta_bytes(n).next_multiple_of(FRAME_SIZE);
+        let mut buf = vec![0u64; bytes / 8];
+        unsafe { a.init_at(BASE, (n * FRAME_SIZE) as u64, buf.as_mut_ptr() as *mut u8) };
+        (a, buf)
+    }
+
+    fn pa(i: usize) -> u64 {
+        BASE + (i * FRAME_SIZE) as u64
+    }
+
+    #[test]
+    fn metadata_frames_are_never_handed_out() {
+        let (a, _b) = fa(1000);
+        let meta = a.inner.lock().meta;
+        assert!(meta >= 1);
+        assert_eq!(a.free_frames(), 1000 - meta);
+        let mut got = Vec::new();
+        while let Some(f) = a.alloc() {
+            assert!(f >= pa(meta) && f < pa(1000), "{f:#x}");
+            got.push(f);
+        }
+        assert_eq!(got.len(), 1000 - meta);
+        // Freeing a metadata frame is a no-op
+        a.free(pa(0));
+        assert_eq!(a.alloc(), None);
+    }
+
+    #[test]
+    fn last_partial_word_bits_stay_used() {
+        // 70 frames: the second bitmap word has 6 valid bits
+        let (a, _b) = fa(70);
+        let mut n = 0;
+        while let Some(f) = a.alloc() {
+            assert!(f < pa(70));
+            n += 1;
+        }
+        assert_eq!(n, 70 - a.inner.lock().meta);
+        assert_eq!(a.stats().free_bytes, 0);
+    }
+
+    #[test]
+    fn out_of_range_ops_are_noops() {
+        let (a, b) = fa(128);
+        let free = a.free_frames();
+        let snapshot = b.clone();
+        for f in [
+            0,
+            BASE - FRAME_SIZE as u64,
+            pa(128),
+            pa(1 << 30),
+            u64::MAX,
+            pa(5) + 8,
+        ] {
+            a.free(f);
+            a.incref(f);
+            assert!(!a.decref(f));
+            assert_eq!(a.refcount(f), 0);
+            a.free_huge(f);
+            a.incref_huge(f);
+            assert!(!a.decref_huge(f));
+            assert!(!a.is_huge_page(f));
+        }
+        assert_eq!(a.free_frames(), free);
+        assert_eq!(b, snapshot);
+    }
+
+    #[test]
+    fn boundary_frames_round_trip() {
+        let (a, _b) = fa(256);
+        let meta = a.inner.lock().meta;
+        a.mark_used(pa(meta), (256 - meta) as u64 * FRAME_SIZE as u64);
+        assert_eq!(a.free_frames(), 0);
+        a.free(pa(255));
+        assert_eq!(a.alloc(), Some(pa(255)));
+        assert_eq!(a.refcount(pa(255)), 1);
+        a.incref(pa(255));
+        assert!(!a.decref(pa(255)));
+        assert!(a.decref(pa(255)));
+        assert_eq!(a.free_frames(), 1);
+    }
+
+    #[test]
+    fn mark_used_covers_partial_frames() {
+        let (a, _b) = fa(64);
+        let free = a.free_frames();
+        // 4096 bytes starting mid-frame touch two frames
+        a.mark_used(pa(10) + 100, FRAME_SIZE as u64);
+        assert_eq!(a.free_frames(), free - 2);
+        // A range past the end is clamped
+        a.mark_used(pa(60), 1 << 40);
+        assert_eq!(a.free_frames(), free - 6);
+    }
+
+    #[test]
+    fn contig_alloc_at_the_end() {
+        let (a, _b) = fa(64);
+        let meta = a.inner.lock().meta;
+        a.mark_used(pa(meta), (60 - meta) as u64 * FRAME_SIZE as u64);
+        // Frames 60..63 free: a run of 4 ends exactly at the region end
+        assert_eq!(a.alloc_contig(4), Some(pa(60)));
+        assert_eq!(a.alloc_contig(1), None);
+        assert_eq!(a.alloc_contig(4), None);
+        assert_eq!(a.alloc_contig(1000), None);
+        for i in 60..64 {
+            assert_eq!(a.refcount(pa(i)), 1);
+        }
+    }
+
+    #[test]
+    fn huge_pages_stay_inside_and_aligned() {
+        // 1100 frames: one full 2MB run (frames 512..1023) past metadata
+        let (a, _b) = fa(1100);
+        let h = a.alloc_huge().expect("huge");
+        assert_eq!(h, pa(512));
+        assert!(a.is_huge_page(h));
+        assert_eq!(a.alloc_huge(), None);
+        assert!(a.decref_huge(h));
+        assert_eq!(a.alloc_huge(), Some(h));
     }
 }
