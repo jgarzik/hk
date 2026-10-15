@@ -1699,6 +1699,9 @@ do not rely on that.
 | `UdpSock.op`, `PingSock.op` | `spin::Mutex<()>` | thread only | datagram socket lock (bind/connect/disconnect/autobind); never across a sleep or a transmit; taken before the protocol's port/identifier table |
 | `RxQueue.q` (`net/dgram.rs`: UDP, ping, raw receive queues) | `spin::Mutex` | thread only (softnet enqueue, recvmsg) | leaf; bounded by SO_RCVBUF (`rmem` atomic) |
 | `RawTable.socks` (`net/raw.rs`, per netns) | `spin::RwLock` | thread only | raw sockets by protocol; delivery and ICMP-error fan-out clone the matching `Arc`s (reading their `Inet.addr`) and queue after dropping it; `RawSock.filter` is an atomic |
+| `PacketTable.socks` (`net/packet/`, per netns) | `spin::RwLock<Vec<Arc<PacketSock>>>` | thread only (taps in softnet or a transmitting task, socket create/close) | leaf; the tap clones the matching `Arc`s and queues after dropping it (a global atomic count skips all work when no packet socket exists) |
+| `PacketSock.rxq` (`PktQueue.q`), `PacketSock.filter` | `spin::Mutex` / `spin::RwLock` | thread only | leaves; the queue is bounded by SO_RCVBUF (`rmem` atomic, drops counted); the filter `Arc` is cloned out and run with no lock held; the binding (protocol, ifindex) and flags are atomics |
+| `PacketSock.mclist` | `spin::Mutex<Vec<Mreq>>` | thread only | PACKET_ADD/DROP_MEMBERSHIP list, changed only under RTNL (Linux packet_mc_add takes rtnl_lock); RTNL -> `mclist`, dropped before the device's promiscuity changes (`NetDevice.set_promiscuity`, RTNL held, may call the driver) |
 | `PingTable.socks` (`net/ping.rs`, per netns) | `spin::RwLock` | thread only | ping sockets by echo identifier; receive/error lookups clone the `Arc` and queue after dropping it; reads candidates' `Inet.addr` under it (order table -> Inet.addr) |
 | `Inet.addr` (`net/af_inet.rs`) | `spin::Mutex` | thread only | leaf: addresses/ports of a TCP or UDP socket; read under the UDP/TCP port tables during lookups |
 | `RTNL` (`net/rtnl.rs`) | `spin::Mutex<()>` | thread only (syscalls, kernel config; never softnet) | OUTERMOST network lock: serializes all configuration changes (link up/down + MTU, addresses, routes) from netlink, SIOCS* ioctls and the kernel. Functions needing it take `&RtnlGuard`. Holders never sleep and never take a socket lock (`sk_lock`) |
@@ -1725,7 +1728,7 @@ do not rely on that.
 | `UnixSock` `state`/`dead`/`wmem`/`backlog`/`peer_wake`, `DRAINING` | atomics | thread only | |
 | `NetDevice.net` | `spin::RwLock<Weak<NetNamespace>>` | thread only | read per received packet; written at registration |
 | `NetNamespace.sysctl`, `port_range` (`/proc/sys/net`, `kernel/sysctl.rs`) | atomics | thread only | no locks; a multi-value sysctl (ping_group_range) is one packed `AtomicU64`, so readers never see half an update |
-| `NetDevice.stats`, `flags`, `mtu`, `ifindex`, `carrier` | atomics | any | `flags` holds administrative state only; IFF_RUNNING/IFF_LOWER_UP/operstate are derived on read |
+| `NetDevice.stats`, `flags`, `mtu`, `ifindex`, `carrier`, `promiscuity`, `allmulti` | atomics | any (`promiscuity`/`allmulti` written only under RTNL) | `flags` holds administrative state only; IFF_RUNNING/IFF_LOWER_UP/operstate are derived on read |
 | e1000 `rx` ring | `spin::Mutex` | thread only (NAPI poll) | leaf; frames are delivered after it is dropped |
 | e1000 `tx` ring | `spin::Mutex` | thread only (xmit, poll reclaim) | leaf; ring full -> drop, `tx_dropped`, ENOBUFS |
 | e1000 `pending_icr`, irq counters | atomics | IRQ + thread | ISR ORs ICR causes in; poll swaps them out |
@@ -1752,6 +1755,9 @@ NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
    before connector, else by address) -> UnixSock.rq / peercred / addr /
    INFLIGHT; UnixSock.relay leaf)
   (NlSock.dump -> devices/FIB/ARP snapshots -> NlSock.rxq: dump parts)
+  (AF_PACKET taps, from any receive or transmit path: PacketTable.socks,
+   then PacketSock.filter / PacketSock.rxq, each a leaf;
+   RTNL -> PacketSock.mclist)
   -> device TX lock (e1000 tx)
   -> Softnet.backlog (lo xmit)           Softnet.poll_list / WaitQueue / rq
                                           (IrqSpinlocks, innermost)

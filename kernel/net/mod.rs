@@ -68,6 +68,7 @@ pub mod msg;
 #[path = "core/neigh.rs"]
 pub mod neigh;
 pub mod netlink;
+pub mod packet;
 pub mod ping;
 pub mod proc;
 pub mod raw;
@@ -100,6 +101,8 @@ pub fn init() {
     // Protocol handlers by EtherType (IPv6 will add 0x86DD here)
     dev::dev_add_pack(EtherType::Ipv4.to_be(), ipv4::ip_rcv);
     dev::dev_add_pack(EtherType::Arp.to_be(), arp::arp_rcv);
+    // AF_PACKET sees frames in both directions
+    dev::dev_add_tap(packet::tap);
 }
 
 /// Name for a new physical device from a template like "eth%d" (unique

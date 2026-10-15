@@ -289,8 +289,8 @@ Families: AF_INET (SOCK_STREAM/TCP, SOCK_DGRAM/UDP) and AF_NETLINK
 (SOCK_RAW/SOCK_DGRAM, NETLINK_ROUTE: links, IPv4 addresses and routes,
 neighbours; SOL_NETLINK options ADD/DROP_MEMBERSHIP, PKTINFO, NO_ENOBUFS,
 CAP_ACK, EXT_ACK, GET_STRICT_CHK, LIST_MEMBERSHIPS), AF_UNIX
-(SOCK_STREAM, SOCK_DGRAM (SOCK_RAW is an alias), SOCK_SEQPACKET). Other
-families (AF_INET6, AF_PACKET) are EAFNOSUPPORT for now.
+(SOCK_STREAM, SOCK_DGRAM (SOCK_RAW is an alias), SOCK_SEQPACKET),
+AF_PACKET (SOCK_RAW, SOCK_DGRAM). AF_INET6 is EAFNOSUPPORT for now.
 
 Sockets are sockfs inodes (fstat S_IFSOCK, /proc/<pid>/fd -> socket:[N]).
 Blocking follows the file's O_NONBLOCK at every call (fcntl, FIONBIO)
@@ -327,7 +327,7 @@ connection to one per 500 ms like tcp_invalid_ratelimit); listeners keep full ch
 
 - [x] socket (AF_INET: TCP, UDP, ping SOCK_DGRAM/IPPROTO_ICMP gated by
   ping_group_range, SOCK_RAW with CAP_NET_RAW: IP_HDRINCL, SOL_RAW
-  ICMP_FILTER; AF_NETLINK)
+  ICMP_FILTER; AF_NETLINK; AF_PACKET with CAP_NET_RAW)
 - [x] socketpair (AF_UNIX all types, peer credentials of the creator;
   AF_INET/AF_NETLINK: EOPNOTSUPP like Linux)
 - [x] bind (SO_REUSEADDR/SO_REUSEPORT rules, EADDRNOTAVAIL, EACCES < 1024)
@@ -392,6 +392,33 @@ SO_PEERCRED. In-flight files are capped per user near RLIMIT_NOFILE
 MSG_OOB, garbage collection of unreachable in-flight sockets (the cap
 bounds them), SO_PEEK_OFF, SO_PASSPIDFD/SCM_PIDFD, SO_PEERGROUPS,
 SO_INQ, SIOCUNIXFILE.
+
+AF_PACKET (Linux af_packet.c): CAP_NET_RAW (EPERM), SOCK_RAW (frames
+from the link-layer header) and SOCK_DGRAM (from the network header);
+the protocol (network order ETH_P_ALL or an EtherType) from socket() or
+bind(sockaddr_ll: ifindex, protocol; ENODEV, ENETDOWN on the socket for
+a down device). ETH_P_ALL sockets see received frames and every
+transmitted one as PACKET_OUTGOING (not their own); protocol sockets
+see received frames of their EtherType. recvfrom fills sockaddr_ll
+(protocol, ifindex, hatype, pkttype HOST/BROADCAST/MULTICAST/OTHERHOST/
+OUTGOING, source hardware address); MSG_TRUNC; SIOCINQ. Sends: SOCK_RAW
+a whole frame (EINVAL below the link header, EMSGSIZE above MTU + header
+unless VLAN-tagged), SOCK_DGRAM gets a header from sll_addr/
+sll_protocol (EINVAL without a destination, except on lo); ENXIO
+without a device, ENETDOWN when it is down. Works on interfaces without
+IP addresses. Queues are bounded by SO_RCVBUF; PACKET_STATISTICS,
+PACKET_AUXDATA (struct tpacket_auxdata cmsg), PACKET_ORIGDEV,
+PACKET_IGNORE_OUTGOING, PACKET_ADD/DROP_MEMBERSHIP (PROMISC/ALLMULTI
+counted on the device; MULTICAST/UNICAST accepted). Classic BPF socket
+filters: SO_ATTACH_FILTER (Linux validation: known opcodes, forward
+jumps only, scratch memory stored before loaded, no division by a zero
+constant, RET last; SKF_AD_* ancillary, SKF_NET_OFF/SKF_LL_OFF loads),
+SO_DETACH_FILTER (ENOENT), SO_LOCK_FILTER (EPERM). /proc/net/packet.
+Not yet: SOCK_PACKET (ESOCKTNOSUPPORT), PACKET_RX_RING/TX_RING/mmap,
+PACKET_FANOUT, PACKET_VERSION/VNET_HDR/QDISC_BYPASS and other options
+(ENOPROTOOPT), SO_ATTACH_BPF, SO_GET_FILTER, socket filters on other
+families (ENOPROTOOPT), ENETDOWN on bound sockets when their device
+goes down later.
 
 9. Polling & event notification
 9.1 Select/poll/epoll

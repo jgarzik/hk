@@ -53,6 +53,22 @@ ping_group_range (hk has no supplementary groups). /proc/net/raw and
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
 
+## AF_PACKET gaps
+
+**Location**: `kernel/net/packet/`
+
+Not implemented: SOCK_PACKET (ESOCKTNOSUPPORT), the mmap rings
+(PACKET_RX_RING/TX_RING, PACKET_VERSION), PACKET_FANOUT,
+PACKET_VNET_HDR, PACKET_QDISC_BYPASS and the other SOL_PACKET options
+(ENOPROTOOPT; Linux accepts them), SO_ATTACH_BPF, SO_GET_FILTER, and
+socket filters on non-packet sockets (ENOPROTOOPT; Linux runs them on
+every socket). A bound socket is not told (ENETDOWN) when its device
+goes down later, only when it binds to a down device. Memberships only
+count promiscuity/allmulti users (the drivers have no promiscuous or
+multicast filtering; set_promisc is a no-op on e1000).
+PACKET_AUXDATA reports TP_STATUS_CSUM_VALID only for frames received on
+lo (hk has no checksum offload states).
+
 ## AF_UNIX gaps
 
 **Location**: `kernel/net/unix/`

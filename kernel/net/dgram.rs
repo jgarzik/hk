@@ -158,7 +158,7 @@ pub fn deliver(
     if m.want_name {
         m.name = Some(af_inet::sin_bytes(d.src, d.sport));
     }
-    sock_cmsgs(sk, m, d);
+    sock_cmsgs(sk, m, d.stamp, d.drops);
     inet.recv_cmsgs(&mut m.cmsg, &d.info);
     Ok(if flags & MSG_TRUNC != 0 {
         d.data.len()
@@ -167,21 +167,23 @@ pub fn deliver(
     })
 }
 
-/// SOL_SOCKET control messages (Linux __sock_recv_cmsgs)
-fn sock_cmsgs(sk: &Sock, m: &mut RecvMsg, d: &Dgram) {
+/// SOL_SOCKET control messages (Linux __sock_recv_cmsgs) of a packet
+/// that arrived at `stamp` (CLOCK_REALTIME ns) with the socket's drop
+/// count at `drops`
+pub fn sock_cmsgs(sk: &Sock, m: &mut RecvMsg, stamp: i128, drops: u32) {
     if sk.flag(sf::TIMESTAMPNS) {
         let mut b = [0u8; 16];
-        b[..8].copy_from_slice(&((d.stamp / 1_000_000_000) as i64).to_ne_bytes());
-        b[8..].copy_from_slice(&((d.stamp % 1_000_000_000) as i64).to_ne_bytes());
+        b[..8].copy_from_slice(&((stamp / 1_000_000_000) as i64).to_ne_bytes());
+        b[8..].copy_from_slice(&((stamp % 1_000_000_000) as i64).to_ne_bytes());
         m.cmsg.put(SOL_SOCKET, SCM_TIMESTAMPNS, &b);
     } else if sk.flag(sf::TIMESTAMP) {
         let mut b = [0u8; 16];
-        b[..8].copy_from_slice(&((d.stamp / 1_000_000_000) as i64).to_ne_bytes());
-        b[8..].copy_from_slice(&((d.stamp % 1_000_000_000 / 1000) as i64).to_ne_bytes());
+        b[..8].copy_from_slice(&((stamp / 1_000_000_000) as i64).to_ne_bytes());
+        b[8..].copy_from_slice(&((stamp % 1_000_000_000 / 1000) as i64).to_ne_bytes());
         m.cmsg.put(SOL_SOCKET, SCM_TIMESTAMP, &b);
     }
-    if sk.flag(sf::RXQ_OVFL) && d.drops != 0 {
-        m.cmsg.put(SOL_SOCKET, SO_RXQ_OVFL, &d.drops.to_ne_bytes());
+    if sk.flag(sf::RXQ_OVFL) && drops != 0 {
+        m.cmsg.put(SOL_SOCKET, SO_RXQ_OVFL, &drops.to_ne_bytes());
     }
 }
 

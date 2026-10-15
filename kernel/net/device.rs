@@ -256,6 +256,11 @@ pub struct NetDevice {
 
     /// Number of carrier transitions (IFLA_CARRIER_CHANGES)
     carrier_changes: AtomicU32,
+
+    /// Promiscuity and allmulti users (AF_PACKET memberships; Linux
+    /// dev->promiscuity / allmulti); changed under RTNL
+    promiscuity: AtomicU32,
+    allmulti: AtomicU32,
 }
 
 impl NetDevice {
@@ -276,6 +281,8 @@ impl NetDevice {
             net: RwLock::new(Weak::new()),
             carrier: AtomicBool::new(true),
             carrier_changes: AtomicU32::new(0),
+            promiscuity: AtomicU32::new(0),
+            allmulti: AtomicU32::new(0),
         }
     }
 
@@ -427,6 +434,30 @@ impl NetDevice {
     pub(crate) fn close(&self) {
         self.flags.fetch_and(!flags::IFF_UP, Ordering::AcqRel);
         let _ = self.ops.stop();
+    }
+
+    /// Add or remove a promiscuity user (Linux dev_set_promiscuity, RTNL
+    /// held): the driver is told on the first and last one. Like Linux,
+    /// the IFF_PROMISC reported to userspace is only the admin flag.
+    pub fn set_promiscuity(&self, _rtnl: &crate::net::rtnl::RtnlGuard, inc: i32) {
+        let old = self.promiscuity.load(Ordering::Acquire);
+        let new = old.saturating_add_signed(inc);
+        self.promiscuity.store(new, Ordering::Release);
+        if (old == 0) != (new == 0) {
+            self.ops.set_promisc(new != 0);
+        }
+    }
+
+    /// Add or remove an allmulti user (Linux dev_set_allmulti, RTNL held)
+    pub fn set_allmulti(&self, _rtnl: &crate::net::rtnl::RtnlGuard, inc: i32) {
+        let old = self.allmulti.load(Ordering::Acquire);
+        self.allmulti
+            .store(old.saturating_add_signed(inc), Ordering::Release);
+    }
+
+    /// Promiscuity users (AF_PACKET memberships)
+    pub fn promiscuity(&self) -> u32 {
+        self.promiscuity.load(Ordering::Acquire)
     }
 
     /// Snapshot of the IPv4 addresses (primaries before secondaries)
