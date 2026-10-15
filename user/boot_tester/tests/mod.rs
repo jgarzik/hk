@@ -27,6 +27,7 @@ pub mod namespace;
 pub mod sockets;
 pub mod sk;
 pub mod sockcore;
+pub mod unix;
 pub mod udp;
 pub mod frag;
 pub mod sysctl;
@@ -104,6 +105,7 @@ pub fn run_all_tests() {
     namespace::run_tests();
     sockets::run_tests();
     sockcore::run_tests();
+    unix::run_tests();
     udp::run_tests();
     frag::run_tests();
     sysctl::run_tests();

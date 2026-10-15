@@ -41,7 +41,7 @@ struct Linger {
     l_onoff: i32,
     l_linger: i32,
 }
-use super::helpers::{print, println, print_num, host_mode};
+use super::helpers::{print, println, print_num};
 
 /// Run all socket tests
 pub fn run_tests() {
@@ -114,21 +114,19 @@ fn test_socket_create_nonblock() {
     }
 }
 
-/// Test socket creation with invalid domain
+/// Test socket creation with invalid domain (AF_MAX: EAFNOSUPPORT)
 fn test_socket_invalid_domain() {
-    // AF_UNIX = 1, should return -EAFNOSUPPORT (-97)
-    let fd = sys_socket(1, SOCK_STREAM, 0);
+    let fd = sys_socket(46, SOCK_STREAM, 0);
 
-    print(b"socket(AF_UNIX, SOCK_STREAM, 0) returned ");
+    print(b"socket(AF_MAX, SOCK_STREAM, 0) returned ");
     print_num(fd);
 
-    // Should fail with -97 (EAFNOSUPPORT); Linux supports AF_UNIX
-    if fd == -97 || (host_mode() && fd >= 0) {
+    if fd == -97 {
+        println(b"SOCKET_INVALID:OK");
+    } else {
         if fd >= 0 {
             sys_close(fd as u64);
         }
-        println(b"SOCKET_INVALID:OK");
-    } else {
         println(b"SOCKET_INVALID:FAIL");
     }
 }
