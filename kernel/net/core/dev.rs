@@ -29,7 +29,9 @@
 //!   added, so the ISR never allocates.
 //! - `Softnet.backlog`: `spin::Mutex`, thread context only, leaf.
 //! - `PTYPE_BASE` / `PTYPE_ALL`: `spin::RwLock`, thread context only, leaf;
-//!   handlers are copied out and called after the guard is dropped.
+//!   handlers are copied out and called after the guard is dropped. Taps
+//!   run in the receive path (softnet or an inline backlog flush) and in
+//!   `dev_queue_xmit` callers, with no lock held by this module.
 //! - `NAPI_LIST`: `spin::Mutex`, thread context only, leaf.
 
 use alloc::boxed::Box;
@@ -63,14 +65,28 @@ pub const NETDEV_MAX_BACKLOG: usize = 1000;
 /// pulled (`skb.data()` starts at the network header)
 pub type PacketHandler = fn(SkBuff);
 
-/// Tap handler (Linux ptype_all, for AF_PACKET): sees every received frame
-/// (MAC header still present at `skb.mac_header()`) without consuming it
-pub type PacketTap = fn(&SkBuff);
+/// A frame shown to the taps (Linux ptype_all delivery): received
+/// frames after classification, transmitted ones as PACKET_OUTGOING
+pub struct Tap<'a> {
+    pub dev: &'a Arc<NetDevice>,
+    /// The frame from its link-layer header
+    pub frame: &'a [u8],
+    pub pkt_type: PktType,
+    /// Sending socket of an outgoing frame (`SkBuff::owner`), 0 if none
+    pub owner: usize,
+}
+
+/// Tap handler (Linux ptype_all, for AF_PACKET): sees every frame
+/// without consuming it
+pub type PacketTap = fn(&Tap);
+
+/// Most taps (each address family registers one)
+const MAX_TAPS: usize = 4;
 
 /// EtherType -> handler table (IPv4, ARP; IPv6 later)
 static PTYPE_BASE: RwLock<Vec<(u16, PacketHandler)>> = RwLock::new(Vec::new());
-/// Taps that see all frames (reserved for AF_PACKET)
-static PTYPE_ALL: RwLock<Vec<PacketTap>> = RwLock::new(Vec::new());
+/// Taps that see all frames, both directions (AF_PACKET)
+static PTYPE_ALL: RwLock<[Option<PacketTap>; MAX_TAPS]> = RwLock::new([None; MAX_TAPS]);
 
 /// Register a protocol handler for an EtherType (host byte order)
 pub fn dev_add_pack(ethertype: u16, handler: PacketHandler) {
@@ -79,9 +95,19 @@ pub fn dev_add_pack(ethertype: u16, handler: PacketHandler) {
     t.push((ethertype, handler));
 }
 
-/// Register a tap that sees every received frame
+/// Register a tap that sees every received and transmitted frame
 pub fn dev_add_tap(tap: PacketTap) {
-    PTYPE_ALL.write().push(tap);
+    let mut t = PTYPE_ALL.write();
+    let slot = t.iter_mut().find(|s| s.is_none()).expect("too many taps");
+    *slot = Some(tap);
+}
+
+/// Show a frame to the taps (copied out: called without the lock)
+fn deliver_taps(t: &Tap) {
+    let taps = *PTYPE_ALL.read();
+    for tap in taps.iter().flatten() {
+        tap(t);
+    }
 }
 
 fn ptype_lookup(ethertype: u16) -> Option<PacketHandler> {
@@ -424,12 +450,13 @@ pub fn netif_receive_skb(mut skb: Box<SkBuff>) {
     };
 
     // Taps (AF_PACKET) see every frame, including other hosts' frames
-    let taps: Vec<PacketTap> = {
-        let t = PTYPE_ALL.read();
-        if t.is_empty() { Vec::new() } else { t.clone() }
-    };
-    for tap in taps {
-        tap(&skb);
+    if let Some(frame) = skb.frame_from_mac() {
+        deliver_taps(&Tap {
+            dev: &dev,
+            frame,
+            pkt_type: skb.pkt_type,
+            owner: 0,
+        });
     }
 
     if skb.pkt_type == PktType::OtherHost {
@@ -443,9 +470,19 @@ pub fn netif_receive_skb(mut skb: Box<SkBuff>) {
     }
 }
 
-/// Transmit a frame on `skb.dev` (Linux `dev_queue_xmit`; no qdisc)
+/// Transmit a frame on `skb.dev` (Linux `dev_queue_xmit`; no qdisc).
+/// `skb.data()` starts at the link-layer header. The taps see it as
+/// PACKET_OUTGOING first (Linux dev_queue_xmit_nit), if the device is up.
 pub fn dev_queue_xmit(skb: Box<SkBuff>) -> Result<(), crate::error::KernelError> {
     let dev: Arc<NetDevice> = skb.dev.clone().ok_or(crate::error::KernelError::NoDevice)?;
+    if dev.is_up() {
+        deliver_taps(&Tap {
+            dev: &dev,
+            frame: skb.data(),
+            pkt_type: PktType::Outgoing,
+            owner: skb.owner,
+        });
+    }
     dev.xmit(skb)
 }
 

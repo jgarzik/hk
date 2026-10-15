@@ -8,6 +8,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
@@ -241,7 +242,7 @@ fn arp_solicit(n: &Neighbour, dst: Option<Lladdr>, hint: Option<Key>) {
 /// Build and transmit an ARP packet: Ethernet destination `eth_dst`
 /// (broadcast if None), target hardware address `tha` (zero if None)
 fn send_arp(
-    dev: &NetDevice,
+    dev: &Arc<NetDevice>,
     op: u16,
     sip: Ipv4Addr,
     tip: Ipv4Addr,
@@ -265,11 +266,17 @@ fn send_arp(
     d[24..28].copy_from_slice(&tip.to_be_bytes());
     let dst = eth_dst.unwrap_or(&ETH_BROADCAST);
     ethernet::eth_header(&mut skb, dst, &dev.mac(), EtherType::Arp);
-    let _ = dev.xmit(skb);
+    skb.dev = Some(dev.clone());
+    let _ = crate::net::dev::dev_queue_xmit(skb);
 }
 
 /// Send an ARP reply claiming `our_ip`
-fn send_arp_reply(dev: &NetDevice, our_ip: Ipv4Addr, target_ip: Ipv4Addr, target_mac: &Lladdr) {
+fn send_arp_reply(
+    dev: &Arc<NetDevice>,
+    our_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+    target_mac: &Lladdr,
+) {
     send_arp(
         dev,
         ARPOP_REPLY,
