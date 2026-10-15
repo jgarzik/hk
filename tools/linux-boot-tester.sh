@@ -41,37 +41,8 @@ case "$ARCH" in
     *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-# Download a .deb from Ubuntu ports with apt's chain of trust: InRelease
-# signature (archive keyring) -> Packages.xz hash -> .deb hash.
-fetch_ports_deb() {
-    local pkg=$1 ver=$2 out=$3
-    local base=https://ports.ubuntu.com/ubuntu-ports
-    local codename tmp pocket idx filename sha
-    codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
-    tmp=$(mktemp -d)
-    for pocket in "$codename-updates" "$codename-security" "$codename"; do
-        curl -sSfo "$tmp/InRelease" "$base/dists/$pocket/InRelease"
-        gpgv --keyring /usr/share/keyrings/ubuntu-archive-keyring.gpg \
-            --output "$tmp/Release" "$tmp/InRelease" 2>/dev/null
-        idx=main/binary-$DEB_ARCH/Packages.xz
-        sha=$(awk -v f="$idx" '/^SHA256:/{s=1;next} /^[^ ]/{s=0} s && $3==f {print $1}' "$tmp/Release")
-        curl -sSfo "$tmp/Packages.xz" "$base/dists/$pocket/$idx"
-        echo "$sha  $tmp/Packages.xz" | sha256sum -c --quiet
-        xz -dc "$tmp/Packages.xz" > "$tmp/Packages"
-        read -r filename sha < <(awk -v p="$pkg" -v v="$ver" '
-            /^Package: /{pk=$2} /^Version: /{vr=$2} /^Filename: /{fn=$2} /^SHA256: /{sh=$2}
-            /^$/{ if (pk==p && vr==v) {print fn, sh; exit} pk=vr=fn=sh="" }' "$tmp/Packages") || true
-        if [ -n "${filename:-}" ]; then
-            curl -sSfo "$out" "$base/$filename"
-            echo "$sha  $out" | sha256sum -c --quiet
-            rm -rf "$tmp"
-            return 0
-        fi
-    done
-    rm -rf "$tmp"
-    echo "$pkg $ver not found in Ubuntu ports ($DEB_ARCH)"
-    return 1
-}
+# Verified .deb downloads (native apt or Ubuntu archive/ports)
+. tools/fetch-deb.sh
 
 WORK=target/linux-test-$ARCH
 SERIAL_LOG=/tmp/qemu_serial_linux.log
@@ -91,7 +62,7 @@ if [ -z "${LINUX_KERNEL:-}" ]; then
         else
             # Foreign arch: same version from the ports archive (no multiarch needed)
             PKGVER=$(apt-cache show "linux-image-$KVER" | sed -n 's/^Version: //p' | head -1)
-            fetch_ports_deb "linux-image-unsigned-$KVER" "$PKGVER" "$KDIR/linux-image.deb"
+            fetch_deb "linux-image-unsigned-$KVER" "$DEB_ARCH" "$KDIR/linux-image.deb" "$PKGVER"
         fi
         dpkg-deb -x "$KDIR"/linux-image*.deb "$KDIR"
     fi
