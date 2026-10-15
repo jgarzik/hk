@@ -603,6 +603,7 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
         #[cfg(target_arch = "x86_64")]
         iopl_emul: 0,
         nproc_exceeded: false,
+        exiting: false,
         // Ptrace state (kernel threads are not traced)
         ptrace: 0,
         ptracer_tid: None,
@@ -792,6 +793,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         #[cfg(target_arch = "x86_64")]
         iopl_emul: 0,
         nproc_exceeded: false,
+        exiting: false,
         // Ptrace state (not traced initially)
         ptrace: 0,
         ptracer_tid: None,
@@ -960,18 +962,17 @@ pub fn reap_zombie_child_times(
         }
     }
 
-    if let Some(idx) = zombie_idx {
-        let task = table.tasks.remove(idx);
-        // Released: drop the RLIMIT_NPROC charge (threads drop it at exit)
-        if task.tid == task.pid {
-            crate::task::nproc_uncharge(task.cred.uid);
-        }
-        if let TaskState::Zombie(status) = task.state {
-            return Some((task.pid, status, task.utime, task.stime));
-        }
+    let task = table.tasks.remove(zombie_idx?);
+    // The Task is released after TASK_TABLE (nothing is released under it)
+    drop(table);
+    // Released: drop the RLIMIT_NPROC charge (threads drop it at exit)
+    if task.tid == task.pid {
+        crate::task::nproc_uncharge(task.cred.uid);
     }
-
-    None
+    match task.state {
+        TaskState::Zombie(status) => Some((task.pid, status, task.utime, task.stime)),
+        _ => None,
+    }
 }
 
 /// Check if a process has any children matching the criteria
@@ -1348,6 +1349,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         iopl_emul: parent_iopl_emul,
         // Copied like the rest of task->flags (Linux dup_task_struct)
         nproc_exceeded: parent_nproc_exceeded,
+        exiting: false,
         // Ptrace state: inherited if CLONE_PTRACE is set and parent is traced
         // CLONE_UNTRACED prevents forced inheritance even when tracer requests it
         ptrace: if config.flags & CLONE_UNTRACED != 0 {
@@ -1573,6 +1575,22 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     Ok(return_value)
 }
 
+/// Mark the current task `tid` exiting (Linux PF_EXITING), in TASK_TABLE
+/// and in the per-CPU current-task cache
+fn set_exiting(tid: Tid) {
+    if let Some(t) = TASK_TABLE.lock().tasks.iter_mut().find(|t| t.tid == tid) {
+        t.exiting = true;
+    }
+    let mut cur = CurrentArch::get_current_task();
+    cur.exiting = true;
+    CurrentArch::set_current_task(&cur);
+}
+
+/// The current task is exiting (Linux current->flags & PF_EXITING)
+pub fn current_exiting() -> bool {
+    CurrentArch::get_current_task().exiting
+}
+
 /// Exit the current task and switch to another
 ///
 /// This function never returns. The current task is removed from the
@@ -1590,6 +1608,9 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // take sleeping-context locks and may wake other tasks (futex CLEARTID,
     // robust futexes), which needs this CPU's rq lock.
     if tid != 0 {
+        // Linux exit_signals sets PF_EXITING first
+        set_exiting(tid);
+
         // A non-leader thread is released at exit (Linux autoreaps it):
         // its RLIMIT_NPROC charge goes now; a process's when it is reaped
         {
@@ -1745,6 +1766,7 @@ fn switch_info(tid: Tid) -> (u64, u64, CurrentTask) {
                     sid: t.sid,
                     cred: *t.cred,
                     seccomp_mode: t.seccomp_mode,
+                    exiting: t.exiting,
                 },
             )
         })

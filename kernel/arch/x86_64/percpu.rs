@@ -847,6 +847,7 @@ impl PerCpuOps for X86_64Arch {
                 current_cpu_mut().current_task.set(
                     task.tid, task.pid, task.ppid, task.pgid, task.sid, task.cred,
                 );
+                current_cpu_mut().current_task.exiting = task.exiting;
             }
         }
     }

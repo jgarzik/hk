@@ -709,9 +709,13 @@ impl TcpSock {
     }
 
     /// Wait for the close handshake up to SO_LINGER seconds (Linux
-    /// sk_stream_wait_close)
+    /// sk_stream_wait_close); an exiting task does not wait (Linux
+    /// inet_release: no linger time under PF_EXITING)
     fn linger_wait(&self) {
-        if !self.sk.flag(sf::LINGER) || self.sk.linger_secs() == 0 {
+        if !self.sk.flag(sf::LINGER)
+            || self.sk.linger_secs() == 0
+            || crate::task::percpu::current_exiting()
+        {
             return;
         }
         let ns = self.sk.linger_secs() as u64 * 1_000_000_000;

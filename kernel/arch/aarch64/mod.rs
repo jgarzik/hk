@@ -645,6 +645,7 @@ impl PerCpuOps for Aarch64Arch {
                 percpu::current_cpu_mut().current_task.set(
                     task.tid, task.pid, task.ppid, task.pgid, task.sid, task.cred,
                 );
+                percpu::current_cpu_mut().current_task.exiting = task.exiting;
             }
         }
     }

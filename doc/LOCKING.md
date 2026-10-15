@@ -456,6 +456,19 @@ all task structs. This is simpler than Linux's per-task locks (`alloc_lock`,
 1. **TASK_TABLE is NOT IRQ-safe** - Never acquire from interrupt handlers
 2. **IrqSpinlock → TASK_TABLE is safe** - IRQs disabled prevents ISR from running
 3. **wake_sleepers() caches priority** - `SleepEntry.priority` avoids TASK_TABLE in ISR
+4. **Nothing is released under TASK_TABLE** - a task's shared resources
+   (`files`, `fs`, `nsproxy`, `sighand`/`signal`, `seccomp_filter`,
+   `io_context`, `mm`, a reaped `Task`) are `take()`n or `replace()`d
+   under the lock and dropped after it: their last reference can close
+   sockets (TCP release may sleep in SO_LINGER, and `schedule()` takes
+   TASK_TABLE via `switch_info`, a self-deadlock with IRQs off) or tear
+   down a network namespace (RTNL, a sleeping lock). `Arc<Cred>` is the
+   exception: replacing it under the lock (commit_creds) frees only
+   memory.
+5. **PF_EXITING** - `exit_current` sets `Task.exiting` (and the per-CPU
+   `CurrentTask.exiting`) before releasing anything; release paths read
+   it lock-free via `current_exiting()` (TCP close skips its SO_LINGER
+   wait, Linux inet_release).
 
 #### Credential Handling (Linux Pattern)
 

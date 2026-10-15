@@ -1,9 +1,9 @@
 //! Releasing lingering TCP sockets (hk and Linux): a close or dup2
 //! whose SO_LINGER wait blocks never stalls other tasks sharing the
-//! descriptor table (CLONE_FILES).
+//! descriptor table (CLONE_FILES); an exiting process never lingers.
 
 use hk_syscall::{
-    sys_clone, sys_close, sys_exit, sys_fcntl, sys_listen, sys_nanosleep, sys_pipe,
+    sys_clone, sys_close, sys_exit, sys_fcntl, sys_fork, sys_listen, sys_nanosleep, sys_pipe,
     sys_read, sys_write, Timespec,
 };
 
@@ -20,6 +20,7 @@ pub fn run_tests() {
     super::helpers::println(b"=== TCP Close Tests ===");
     test_close_linger();
     test_dup2_linger();
+    test_exit_linger();
 }
 
 fn msleep(ms: u64) {
@@ -30,20 +31,22 @@ fn msleep(ms: u64) {
     sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
-/// A connection whose client end cannot finish closing: the server
-/// (small receive buffer) never reads and the client's send buffer is
-/// full, so FIN waits behind unacknowledged data. (listener, client,
-/// server); the client has SO_LINGER {1, LINGER_S}.
-pub fn stuck_conn() -> (i32, i32, i32) {
+/// A listener whose connections get a small receive buffer
+fn small_listener() -> i32 {
     let l = tcp();
     setint(l, SOL_SOCKET, SO_RCVBUF, 4096);
     bind(l, LO, 0);
     sys_listen(l, 4);
+    l
+}
+
+/// Connect to `l` and fill the connection (the server never reads),
+/// so FIN waits behind unacknowledged data; SO_LINGER {1, LINGER_S}
+fn stuck_client(l: i32) -> i32 {
     let c = tcp();
     setint(c, SOL_SOCKET, SO_SNDBUF, 4096);
     set_timeo(c, 10_000);
     connect(c, LO, port(l));
-    let s = accept(l);
     let buf = [0x5au8; 1024];
     let t0 = now_ms();
     while send(c, &buf, MSG_DONTWAIT) > 0 && now_ms() - t0 < 5000 {}
@@ -51,7 +54,15 @@ pub fn stuck_conn() -> (i32, i32, i32) {
     msleep(50);
     let lg = [1i32, LINGER_S];
     hk_syscall::sys_setsockopt(c, SOL_SOCKET, SO_LINGER, lg.as_ptr() as *const u8, 8);
-    (l, c, s)
+    c
+}
+
+/// A connection whose client end cannot finish closing: (listener,
+/// client, server)
+fn stuck_conn() -> (i32, i32, i32) {
+    let l = small_listener();
+    let c = stuck_client(l);
+    (l, c, accept(l))
 }
 
 /// A task sharing our descriptor table: once `go` is readable it waits
@@ -122,6 +133,35 @@ fn test_dup2_linger() {
     close(c);
     close(q[0]);
     close(q[1]);
+    t.done();
+}
+
+/// _exit with a lingering socket does not wait (Linux inet_release
+/// skips the linger time under PF_EXITING): the child is reaped at once
+fn test_exit_linger() {
+    let mut t = T::new(b"TCP_EXIT_NO_LINGER");
+    let l = small_listener();
+    let mut p = [-1i32; 2];
+    sys_pipe(p.as_mut_ptr());
+    let pid = sys_fork();
+    if pid == 0 {
+        let _c = stuck_client(l);
+        sys_write(p[1] as u64, b"x".as_ptr(), 1);
+        sys_exit(0);
+    }
+    set_timeo(l, 10_000);
+    let s = accept(l);
+    let mut b = [0u8; 1];
+    t.eq(b"ready", sys_read(p[0] as u64, b.as_mut_ptr(), 1), 1);
+    let t0 = now_ms();
+    let st = wait_child(pid);
+    let ms = now_ms() - t0;
+    t.eq(b"status", st as i64, 0);
+    t.ok(b"prompt exit", ms < 2000, ms as i64);
+    close(s);
+    close(p[0]);
+    close(p[1]);
+    close(l);
     t.done();
 }
 

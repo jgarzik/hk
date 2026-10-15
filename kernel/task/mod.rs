@@ -346,6 +346,8 @@ pub struct CurrentTask {
     /// Seccomp mode (cached for fast syscall-entry check)
     /// 0=DISABLED, 1=STRICT, 2=FILTER
     pub seccomp_mode: u8,
+    /// The task is exiting (Linux PF_EXITING)
+    pub exiting: bool,
 }
 
 impl CurrentTask {
@@ -359,6 +361,7 @@ impl CurrentTask {
             sid: 0,
             cred: Cred::ROOT,
             seccomp_mode: 0, // SECCOMP_MODE_DISABLED
+            exiting: false,
         }
     }
 
@@ -389,6 +392,7 @@ impl CurrentTask {
             sid,
             cred,
             seccomp_mode: 0, // SECCOMP_MODE_DISABLED
+            exiting: false,
         }
     }
 }
@@ -1059,6 +1063,11 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// execve rechecks (Linux PF_NPROC_EXCEEDED)
     pub nproc_exceeded: bool,
 
+    /// Set at the start of exit (Linux PF_EXITING): what the task still
+    /// releases (its files) does not wait on its behalf, e.g. no
+    /// SO_LINGER wait in TCP close
+    pub exiting: bool,
+
     // =========================================================================
     // Ptrace state (like Linux task_struct ptrace fields)
     // =========================================================================
@@ -1610,10 +1619,14 @@ pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
 
 /// Remove the I/O context for a task (on exit)
 pub fn remove_task_io_context(tid: Tid) {
-    let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.io_context = None;
-    }
+    let _old = {
+        let mut table = percpu::TASK_TABLE.lock();
+        table
+            .tasks
+            .iter_mut()
+            .find(|t| t.tid == tid)
+            .and_then(|t| t.io_context.take())
+    };
 }
 
 /// Clone I/O context for a new task
