@@ -8,7 +8,7 @@
 //! unchanged on hk and on real Linux (tools/linux-boot-tester.sh), both
 //! architectures.
 
-use super::helpers::{host_mode, print, print_num, println, skip};
+use super::helpers::{print, print_num, println, skip};
 use super::nl::{
     addr as nl_addr, ifaddr, net_setup_eth0, rtmsg, Nl, Req, AF_INET, IFA_LOCAL, RTA_GATEWAY,
     RTA_OIF, RTM_GETADDR, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWROUTE, RT_TABLE_MAIN,
@@ -182,21 +182,13 @@ fn report(name: &[u8], pass: bool, r: &Run) {
     println(r.output());
 }
 
-/// busybox runs here; on hk a known loader limit is a skip with reason
+/// busybox can be executed at all
 fn available() -> bool {
     let r = bb(&[b"true\0"], 10_000);
-    if r.ok() {
-        return true;
+    if !r.ok() {
+        report(b"BUSYBOX_EXEC", false, &r);
     }
-    if !host_mode() && r.has(EXEC_FAILED) && r.has(b"-12") {
-        skip(
-            b"BUSYBOX",
-            b"hk cannot load non-PIE executables at 0x400000 (kernel identity map, BUGS.md)",
-        );
-        return false;
-    }
-    report(b"BUSYBOX_EXEC", false, &r);
-    false
+    r.ok()
 }
 
 pub fn run_tests() {
