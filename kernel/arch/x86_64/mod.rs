@@ -432,7 +432,10 @@ impl MemoryLayoutOps for X86_64Arch {
         if mem_start >= FRAME_ALLOC_BASE && mem_end > mem_start {
             (mem_start, mem_end - mem_start)
         } else {
-            (FRAME_ALLOC_BASE, FRAME_ALLOC_SIZE.min(ioremap::IOREMAP_BASE - FRAME_ALLOC_BASE))
+            (
+                FRAME_ALLOC_BASE,
+                FRAME_ALLOC_SIZE.min(ioremap::IOREMAP_BASE - FRAME_ALLOC_BASE),
+            )
         }
     }
 }
