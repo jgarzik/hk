@@ -5,13 +5,14 @@
 //! `port_range`), atomics only; /proc/sys/net files act on the
 //! current task's namespace like Linux.
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use crate::error::KernelError;
 use crate::net::current_net_ns;
-use crate::sysctl::{Ctl, range};
+use crate::sysctl::{Ctl, Text, range};
 
 /// GID_T_MAX: largest gid in ping_group_range
 const GID_MAX: i64 = 0x7fff_ffff;
@@ -36,6 +37,17 @@ pub struct NetSysctl {
     pub tcp_retries2: AtomicU8,
     /// tcp_fin_timeout in seconds
     pub tcp_fin_timeout: AtomicI32,
+    pub tcp_window_scaling: AtomicU8,
+    /// 0 off, 1 on with a random offset per address pair, 2 no offset
+    pub tcp_timestamps: AtomicU8,
+    /// tcp_rmem min / default / max (only max is used: window scale)
+    pub tcp_rmem: [AtomicI32; 3],
+    /// tcp_keepalive_time / _intvl in seconds
+    pub tcp_keepalive_time: AtomicI32,
+    pub tcp_keepalive_intvl: AtomicI32,
+    pub tcp_keepalive_probes: AtomicU8,
+    /// Default congestion control (index into tcp::cong::ALGOS)
+    pub tcp_ca: AtomicU8,
     pub somaxconn: AtomicI32,
     pub frag_high: AtomicUsize,
     pub frag_low: AtomicUsize,
@@ -58,6 +70,17 @@ impl Default for NetSysctl {
             tcp_synack_retries: AtomicU8::new(5),
             tcp_retries2: AtomicU8::new(15),
             tcp_fin_timeout: AtomicI32::new(60),
+            tcp_window_scaling: AtomicU8::new(1),
+            tcp_timestamps: AtomicU8::new(1),
+            tcp_rmem: [
+                AtomicI32::new(4096),
+                AtomicI32::new(131_072),
+                AtomicI32::new(6_291_456),
+            ],
+            tcp_keepalive_time: AtomicI32::new(7200),
+            tcp_keepalive_intvl: AtomicI32::new(75),
+            tcp_keepalive_probes: AtomicU8::new(9),
+            tcp_ca: AtomicU8::new(0),
             somaxconn: AtomicI32::new(4096),
             frag_high: AtomicUsize::new(4 * 1024 * 1024),
             frag_low: AtomicUsize::new(3 * 1024 * 1024),
@@ -180,6 +203,50 @@ fn frag_store(high: bool, v: &[i64]) -> Result<(), KernelError> {
     Ok(())
 }
 
+fn rmem_show() -> Vec<i64> {
+    let s = &current_net_ns().sysctl;
+    s.tcp_rmem
+        .iter()
+        .map(|v| v.load(Ordering::Relaxed) as i64)
+        .collect()
+}
+
+/// tcp_rmem: three integers, each at least 1
+fn rmem_store(v: &[i64]) -> Result<(), KernelError> {
+    for &x in v {
+        range(x, 1, INT_MAX)?;
+    }
+    let s = &current_net_ns().sysctl;
+    for (a, &x) in s.tcp_rmem.iter().zip(v) {
+        a.store(x as i32, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+fn ca_show() -> String {
+    let i = current_net_ns().sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
+    String::from(crate::net::tcp::cong::ALGOS[i].name())
+}
+
+/// tcp_congestion_control: a built-in algorithm (Linux: ENOENT when
+/// no module provides it)
+fn ca_store(name: &str) -> Result<(), KernelError> {
+    let i = crate::net::tcp::cong::find(name).ok_or(KernelError::NotFound)?;
+    current_net_ns()
+        .sysctl
+        .tcp_ca
+        .store(i as u8, Ordering::Relaxed);
+    Ok(())
+}
+
+fn ro_text(_: &str) -> Result<(), KernelError> {
+    Err(KernelError::PermissionDenied)
+}
+
+fn no_ints() -> Vec<i64> {
+    Vec::new()
+}
+
 fn ro(_: &[i64]) -> Result<(), KernelError> {
     Err(KernelError::PermissionDenied)
 }
@@ -276,6 +343,68 @@ pub static CTLS: &[Ctl] = &[
         show: || get_i32(|s| &s.tcp_fin_timeout),
         store: |v| set_int(|s| &s.tcp_fin_timeout, v, 1, INT_MAX / 1000),
         text: None,
+    },
+    Ctl {
+        path: "net/ipv4/tcp_window_scaling",
+        mode: 0o644,
+        show: || get_u8(|s| &s.tcp_window_scaling),
+        store: |v| set_u8(|s| &s.tcp_window_scaling, v),
+        text: None,
+    },
+    Ctl {
+        path: "net/ipv4/tcp_timestamps",
+        mode: 0o644,
+        show: || get_u8(|s| &s.tcp_timestamps),
+        store: |v| set_u8(|s| &s.tcp_timestamps, v),
+        text: None,
+    },
+    Ctl {
+        path: "net/ipv4/tcp_rmem",
+        mode: 0o644,
+        show: rmem_show,
+        store: rmem_store,
+        text: None,
+    },
+    Ctl {
+        path: "net/ipv4/tcp_keepalive_time",
+        mode: 0o644,
+        show: || get_i32(|s| &s.tcp_keepalive_time),
+        store: |v| set_int(|s| &s.tcp_keepalive_time, v, 1, INT_MAX / 1000),
+        text: None,
+    },
+    Ctl {
+        path: "net/ipv4/tcp_keepalive_intvl",
+        mode: 0o644,
+        show: || get_i32(|s| &s.tcp_keepalive_intvl),
+        store: |v| set_int(|s| &s.tcp_keepalive_intvl, v, 1, INT_MAX / 1000),
+        text: None,
+    },
+    Ctl {
+        path: "net/ipv4/tcp_keepalive_probes",
+        mode: 0o644,
+        show: || get_u8(|s| &s.tcp_keepalive_probes),
+        store: |v| set_u8(|s| &s.tcp_keepalive_probes, v),
+        text: None,
+    },
+    Ctl {
+        path: "net/ipv4/tcp_congestion_control",
+        mode: 0o644,
+        show: no_ints,
+        store: ro,
+        text: Some(Text {
+            show: ca_show,
+            store: ca_store,
+        }),
+    },
+    Ctl {
+        path: "net/ipv4/tcp_available_congestion_control",
+        mode: 0o444,
+        show: no_ints,
+        store: ro,
+        text: Some(Text {
+            show: crate::net::tcp::cong::names,
+            store: ro_text,
+        }),
     },
     Ctl {
         path: "net/ipv4/ip_forward",

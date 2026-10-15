@@ -1,9 +1,12 @@
 //! TCP (RFC 9293; Linux net/ipv4/tcp*.c)
 //!
-//! - `cb`, `input`, `output`, `timer`, `cong`: the I/O-free control block
-//!   (state machine, queues, RTO, congestion) and the wire format.
-//! - this file: the socket (`TcpSock`, ProtoOps), segment demux
-//!   (`tcp_rcv`), listeners and their queues, ICMP errors (`tcp_err`).
+//! - `cb`, `input`, `output`, `ack`, `timer`, `cong`: the I/O-free
+//!   control block (state machine, queues, options, delayed ACK, RTO,
+//!   keepalive, congestion) and the wire format.
+//! - this file: the socket (`TcpSock`, ProtoOps, IPPROTO_TCP options),
+//!   segment demux (`tcp_rcv`), listeners and their queues, ICMP errors
+//!   (`tcp_err`).
+//! - `info`: TCP_INFO and /proc/net/tcp.
 //! - `table`: ehash / lhash / bhash; `timewait`: TIME_WAIT entries.
 //!
 //! ## Locking (thread context only; see doc/LOCKING.md, Network)
@@ -23,8 +26,10 @@
 //! `Inet.addr` -> `TcpSock.queue` (listener SYN/accept queues, leaf) ->
 //! timer `TIMERS` -> FIB / neighbour / device TX (route lookups).
 
+pub mod ack;
 pub mod cb;
 pub mod cong;
+pub mod info;
 pub mod input;
 pub mod output;
 pub mod table;
@@ -33,7 +38,7 @@ mod tests;
 pub mod timer;
 pub mod timewait;
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
@@ -41,7 +46,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use spin::{Mutex, MutexGuard};
 
-use self::cb::{Cfg, Out, Seg, SegIn, TcpCb, flags};
+use self::cb::{Cfg, Open, Out, Seg, SegIn, TcpCb, flags};
 use self::output::Tuple;
 use self::table::Ent;
 use self::timer::{Expire, Slot, now_ms};
@@ -54,13 +59,14 @@ use crate::net::inet::port::BindInfo;
 use crate::net::inet::route;
 use crate::net::ipv4::{self, IPPROTO_TCP, IpParams, Ipv4Addr};
 use crate::net::msg::{
-    MSG_DONTWAIT, MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, RecvMsg, SendMsg,
+    MSG_DONTWAIT, MSG_ERRQUEUE, MSG_MORE, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, RecvMsg,
+    SendMsg,
 };
 use crate::net::skb::SkBuff;
 use crate::net::sock::{RCV_SHUTDOWN, SEND_SHUTDOWN, SHUTDOWN_MASK, Sock, sf};
 use crate::net::socket::{
-    AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SOCK_STREAM, SOL_SOCKET,
-    shut_bits,
+    AF_INET, AF_UNSPEC, OptIn, OptOut, ProtoOps, SIOCINQ, SIOCOUTQ, SO_KEEPALIVE, SOCK_STREAM,
+    SOL_SOCKET, shut_bits,
 };
 use crate::net::{NetNamespace, dev};
 use crate::poll::{
@@ -77,8 +83,17 @@ pub const TCP_KEEPIDLE: i32 = 4;
 pub const TCP_KEEPINTVL: i32 = 5;
 pub const TCP_KEEPCNT: i32 = 6;
 pub const TCP_SYNCNT: i32 = 7;
+pub const TCP_DEFER_ACCEPT: i32 = 9;
+pub const TCP_INFO: i32 = 11;
 pub const TCP_QUICKACK: i32 = 12;
+pub const TCP_CONGESTION: i32 = 13;
 pub const TCP_USER_TIMEOUT: i32 = 18;
+pub const TCP_FASTOPEN: i32 = 23;
+pub const TCP_NOTSENT_LOWAT: i32 = 25;
+/// Linux MAX_TCP_KEEPIDLE / KEEPINTVL / KEEPCNT, MAX_TCP_SYNCNT
+const MAX_KEEPIDLE: i32 = 32767;
+const MAX_KEEPCNT: i32 = 127;
+const MAX_SYNCNT: i32 = 127;
 
 /// Bytes copied between user memory and the queues per locked step
 const CHUNK: usize = 64 * 1024;
@@ -120,8 +135,6 @@ pub struct TcpSock {
     queue: Mutex<Option<Accept>>,
     /// A non-blocking connect is in progress (Linux SS_CONNECTING)
     connecting: AtomicBool,
-    /// Stored IPPROTO_TCP options (P7 acts on most)
-    opts: Mutex<BTreeMap<i32, i32>>,
     /// Serializes readers across peek, user copy and consume (the
     /// reader part of Linux lock_sock; sleeping, above `cb`)
     rd: crate::sync::Mutex<()>,
@@ -141,11 +154,18 @@ pub fn create() -> Arc<dyn ProtoOps> {
 /// Connection knobs from the namespace's sysctls
 fn cfg(net: &NetNamespace) -> Cfg {
     let s = &net.sysctl;
+    let secs = |v: &core::sync::atomic::AtomicI32| v.load(Ordering::Relaxed).max(1) as u64 * 1000;
     Cfg {
         syn_retries: s.tcp_syn_retries.load(Ordering::Relaxed) as u32,
         synack_retries: s.tcp_synack_retries.load(Ordering::Relaxed) as u32,
         retries2: s.tcp_retries2.load(Ordering::Relaxed) as u32,
-        fin_timeout: s.tcp_fin_timeout.load(Ordering::Relaxed).max(1) as u64 * 1000,
+        fin_timeout: secs(&s.tcp_fin_timeout),
+        wscale: s.tcp_window_scaling.load(Ordering::Relaxed) != 0,
+        ts: s.tcp_timestamps.load(Ordering::Relaxed),
+        rmem_max: s.tcp_rmem[2].load(Ordering::Relaxed).max(1) as u32,
+        keepidle: secs(&s.tcp_keepalive_time),
+        keepintvl: secs(&s.tcp_keepalive_intvl),
+        keepcnt: s.tcp_keepalive_probes.load(Ordering::Relaxed) as u32,
     }
 }
 
@@ -158,6 +178,22 @@ fn isn(t: &Tuple) -> u32 {
     ];
     let h = crate::net::inet::port::secure_hash(0x7463_7073_6571, &w) as u32;
     h.wrapping_add((crate::time::monotonic_ns() >> 6) as u32)
+}
+
+/// Timestamp offset of an address pair (Linux secure_tcp_ts_off: keyed
+/// hash, so the clock leaks neither uptime nor other peers' offsets)
+fn ts_off(t: &Tuple) -> u32 {
+    let w = [((t.laddr.0 as u64) << 32) | t.raddr.0 as u64];
+    crate::net::inet::port::secure_hash(0x7463_7074_736f, &w) as u32
+}
+
+/// Opening values for `t`
+fn open(net: &NetNamespace, t: &Tuple, oif: u32) -> Open {
+    Open {
+        iss: isn(t),
+        ts_off: ts_off(t),
+        mss: route_mss(net, t.raddr, t.laddr, oif),
+    }
 }
 
 /// Transmit `seg` on `t` (route each time; no cached dst)
@@ -178,12 +214,13 @@ fn route_mss(net: &NetNamespace, daddr: Ipv4Addr, saddr: Ipv4Addr, oif: u32) -> 
 
 impl TcpSock {
     pub fn new(sk: Sock) -> Arc<Self> {
-        let c = cfg(&sk.net);
+        let mut cb = TcpCb::new(cfg(&sk.net));
+        cb.opts.ca = sk.net.sysctl.tcp_ca.load(Ordering::Relaxed) as usize;
         Arc::new_cyclic(|me| Self {
             sk,
             inet: Inet::default(),
             cb: Mutex::new(Inner {
-                cb: TcpCb::new(c),
+                cb,
                 tuple: None,
                 bound: false,
                 parent: None,
@@ -191,7 +228,6 @@ impl TcpSock {
             }),
             queue: Mutex::new(None),
             connecting: AtomicBool::new(false),
-            opts: Mutex::new(BTreeMap::new()),
             rd: crate::sync::Mutex::new(()),
             me: me.clone(),
         })
@@ -207,6 +243,7 @@ impl TcpSock {
         let mut g = self.cb.lock();
         g.cb.rcv_cap = (self.sk.rcvbuf() / 2) as usize;
         g.cb.snd_cap = (self.sk.sndbuf() / 2) as usize;
+        g.cb.rcv_locked = self.sk.flag(sf::RCVBUF_LOCK);
         g
     }
 
@@ -401,18 +438,18 @@ impl TcpSock {
                 _ => return,
             }
         }
-        let child = self.child(s, t, now);
+        let child = self.child(s, t, g.cb.opts, now);
         drop(g);
         if let Some((c, out)) = child {
             c.finish(out, Some(t));
         }
     }
 
-    /// Create, hash and queue a SYN_RECEIVED child (listener locked)
-    fn child(&self, s: &SegIn, t: Tuple, now: u64) -> Option<(Arc<TcpSock>, Out)> {
+    /// Create, hash and queue a SYN_RECEIVED child (listener locked;
+    /// `opts` are the listener's)
+    fn child(&self, s: &SegIn, t: Tuple, opts: cb::Opts, now: u64) -> Option<(Arc<TcpSock>, Out)> {
         let c = TcpSock::new(Sock::clone_from(&self.sk));
         c.inet.clone_opts(&self.inet);
-        *c.opts.lock() = self.opts.lock().clone();
         {
             let mut a = c.inet.addr.lock();
             a.rcv_saddr = t.laddr;
@@ -422,13 +459,20 @@ impl TcpSock {
             a.dport = t.rport;
         }
         let mut out = Out::default();
-        let mss = route_mss(&self.sk.net, t.raddr, t.laddr, self.oif());
+        let o = open(&self.sk.net, &t, self.oif());
         {
             let mut g = c.lock();
-            let mut user = cfg(&self.sk.net);
-            user.syn_retries = self.syncnt();
-            let bufs = (g.cb.rcv_cap, g.cb.snd_cap);
-            g.cb = TcpCb::passive(user, s, isn(&t), mss, bufs, now, &mut out);
+            // TCP_SYNCNT of a listener bounds its SYN-ACK retries (Linux
+            // reqsk_timer_handler)
+            let mut kc = cfg(&self.sk.net);
+            if opts.syncnt != 0 {
+                kc.synack_retries = opts.syncnt;
+            }
+            let mut cb = TcpCb::new(kc);
+            cb.opts = opts;
+            (cb.rcv_cap, cb.snd_cap, cb.rcv_locked) = (g.cb.rcv_cap, g.cb.snd_cap, g.cb.rcv_locked);
+            cb.passive(s, o, now, &mut out);
+            g.cb = cb;
             if !self.sk.net.tcp.hash(t, &c) {
                 return None;
             }
@@ -465,10 +509,10 @@ impl TcpSock {
     }
 
     /// TCP_SYNCNT or the sysctl
-    fn syncnt(&self) -> u32 {
-        match self.opts.lock().get(&TCP_SYNCNT) {
-            Some(&v) => v as u32,
-            None => self.sk.net.sysctl.tcp_syn_retries.load(Ordering::Relaxed) as u32,
+    fn syncnt(&self, o: &cb::Opts) -> u32 {
+        match o.syncnt {
+            0 => self.sk.net.sysctl.tcp_syn_retries.load(Ordering::Relaxed) as u32,
+            v => v,
         }
     }
 
@@ -515,13 +559,17 @@ impl TcpSock {
             }
             self.sk.clear_shutdown();
             let mut c = cfg(&self.sk.net);
-            c.syn_retries = self.syncnt();
-            let user_mss = g.cb.user_mss;
-            g.cb = TcpCb::new(c);
-            g.cb.user_mss = user_mss;
-            g.cb.rcv_cap = (self.sk.rcvbuf() / 2) as usize;
-            g.cb.snd_cap = (self.sk.sndbuf() / 2) as usize;
-            g.cb.connect(isn(&t), rt.mtu.saturating_sub(cb::HDRS), now_ms(), out);
+            c.syn_retries = self.syncnt(&g.cb.opts);
+            let mut cb = TcpCb::new(c);
+            cb.opts = g.cb.opts;
+            (cb.rcv_cap, cb.snd_cap, cb.rcv_locked) = (g.cb.rcv_cap, g.cb.snd_cap, g.cb.rcv_locked);
+            g.cb = cb;
+            let o = Open {
+                iss: isn(&t),
+                ts_off: ts_off(&t),
+                mss: rt.mtu.saturating_sub(cb::HDRS),
+            };
+            g.cb.connect(o, now_ms(), out);
             Ok(())
         })
     }
@@ -592,9 +640,9 @@ impl TcpSock {
             || self.sk.shutdown() & SEND_SHUTDOWN != 0
     }
 
-    /// Queue `data` (Linux tcp_sendmsg_locked step); Err if the
-    /// connection cannot send
-    fn push(&self, data: &[u8]) -> Result<usize, KernelError> {
+    /// Queue `data` (Linux tcp_sendmsg_locked step; `more`: MSG_MORE
+    /// holds a partial last segment); Err if the connection cannot send
+    fn push(&self, data: &[u8], more: bool) -> Result<usize, KernelError> {
         self.step(|g, out| {
             if self.sk.has_err() {
                 return Err(self.sk.take_err().unwrap_or(KernelError::BrokenPipe));
@@ -605,7 +653,9 @@ impl TcpSock {
                 return Err(KernelError::BrokenPipe);
             }
             let n = g.cb.send(data);
-            if n > 0 {
+            if n > 0 && more {
+                g.cb.output_more(now_ms(), out);
+            } else if n > 0 {
                 g.cb.output(now_ms(), out);
             }
             Ok(n)
@@ -896,7 +946,9 @@ fn tcp_sendmsg(s: &TcpSock, m: &mut SendMsg, flags: i32) -> Result<usize, Kernel
             };
             at = 0;
         }
-        let n = match s.push(&buf[at..]) {
+        // MSG_MORE holds only the last piece (Linux tcp_push)
+        let more = flags & MSG_MORE != 0 || (total - sent > buf.len() - at);
+        let n = match s.push(&buf[at..], more) {
             Ok(n) => n,
             Err(e) => break Err(e),
         };
@@ -1223,6 +1275,7 @@ impl ProtoOps for TcpSock {
 
     fn setsockopt(&self, level: i32, opt: i32, v: OptIn) -> Option<Result<(), KernelError>> {
         match level {
+            SOL_SOCKET if opt == SO_KEEPALIVE => Some(self.set_keepalive(v)),
             SOL_SOCKET => None,
             SOL_IP => Some(self.inet.setsockopt(&self.sk, opt, v)),
             PROTO_TCP => Some(self.set_tcp_opt(opt, v)),
@@ -1250,57 +1303,122 @@ impl ProtoOps for TcpSock {
 }
 
 impl TcpSock {
-    /// IPPROTO_TCP options (validated like Linux; TCP_MAXSEG and
-    /// TCP_SYNCNT act now, the rest is stored for P7)
+    /// IPPROTO_TCP setsockopt (Linux do_tcp_setsockopt)
     fn set_tcp_opt(&self, opt: i32, v: OptIn) -> Result<(), KernelError> {
+        if opt == TCP_CONGESTION {
+            return self.set_congestion(v);
+        }
         let val = v.int()?;
-        let ok = match opt {
-            TCP_NODELAY | TCP_CORK | TCP_QUICKACK => true,
-            TCP_MAXSEG => val == 0 || (88..=65535).contains(&val),
-            TCP_KEEPIDLE | TCP_KEEPINTVL => (1..=32767).contains(&val),
-            TCP_KEEPCNT => (1..=127).contains(&val),
-            TCP_SYNCNT => (1..=127).contains(&val),
-            TCP_USER_TIMEOUT => val >= 0,
-            _ => return Err(KernelError::NoProtocolOption),
-        };
-        if !ok {
+        let bad = || Err(KernelError::InvalidArgument);
+        let now = now_ms();
+        self.step(|g, out| {
+            match opt {
+                TCP_NODELAY => {
+                    g.cb.opts.nodelay = val != 0;
+                    if val != 0 {
+                        g.cb.output(now, out);
+                    }
+                }
+                TCP_CORK => {
+                    g.cb.opts.cork = val != 0;
+                    if val == 0 {
+                        g.cb.output(now, out);
+                    }
+                }
+                TCP_QUICKACK => g.cb.set_quickack(val, out),
+                TCP_MAXSEG if val != 0 && !(88..=65535).contains(&val) => return bad(),
+                TCP_MAXSEG => g.cb.opts.user_mss = val as u32,
+                TCP_KEEPIDLE if !(1..=MAX_KEEPIDLE).contains(&val) => return bad(),
+                TCP_KEEPIDLE => {
+                    g.cb.opts.keepidle = val as u32;
+                    g.cb.arm_keepalive(now);
+                }
+                TCP_KEEPINTVL if !(1..=MAX_KEEPIDLE).contains(&val) => return bad(),
+                TCP_KEEPINTVL => g.cb.opts.keepintvl = val as u32,
+                TCP_KEEPCNT if !(1..=MAX_KEEPCNT).contains(&val) => return bad(),
+                TCP_KEEPCNT => g.cb.opts.keepcnt = val as u32,
+                TCP_SYNCNT if !(1..=MAX_SYNCNT).contains(&val) => return bad(),
+                TCP_SYNCNT => g.cb.opts.syncnt = val as u32,
+                TCP_USER_TIMEOUT if val < 0 => return bad(),
+                TCP_USER_TIMEOUT => g.cb.opts.user_timeout = val as u32,
+                TCP_DEFER_ACCEPT => g.cb.opts.defer_accept = info::secs_to_retrans(val),
+                TCP_FASTOPEN => {
+                    if val < 0 || !matches!(g.cb.state, TcpState::Closed | TcpState::Listen) {
+                        return bad();
+                    }
+                    g.cb.opts.fastopen = (val as u32).min(self.sk.net.sysctl.somaxconn());
+                }
+                TCP_NOTSENT_LOWAT => {
+                    g.cb.opts.notsent_lowat = val as u32;
+                    out.wake = true;
+                }
+                _ => return Err(KernelError::NoProtocolOption),
+            }
+            Ok(())
+        })
+    }
+
+    /// TCP_CONGESTION: a NUL-terminated name of a built-in algorithm
+    /// (Linux tcp_set_congestion_control: ENOENT when none matches)
+    fn set_congestion(&self, v: OptIn) -> Result<(), KernelError> {
+        if v.len < 1 {
             return Err(KernelError::InvalidArgument);
         }
-        let val = if matches!(opt, TCP_NODELAY | TCP_CORK | TCP_QUICKACK) {
-            (val != 0) as i32
-        } else {
-            val
-        };
-        if opt == TCP_MAXSEG {
-            self.cb.lock().cb.user_mss = val as u32;
-        }
-        self.opts.lock().insert(opt, val);
+        let b = v.bytes(cong::NAME_MAX - 1)?;
+        let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        let name = core::str::from_utf8(&b[..n]).map_err(|_| KernelError::NotFound)?;
+        let i = cong::find(name).ok_or(KernelError::NotFound)?;
+        let mut g = self.lock();
+        g.cb.opts.ca = i;
+        g.cb.cong.set_algo(i);
         Ok(())
     }
 
+    /// IPPROTO_TCP getsockopt (Linux do_tcp_getsockopt)
     fn get_tcp_opt(&self, opt: i32) -> Result<OptOut, KernelError> {
-        if opt == TCP_MAXSEG {
-            // Linux: mss_cache, or the user's value when not connected
-            let g = self.cb.lock();
-            let closed = matches!(g.cb.state, TcpState::Closed | TcpState::Listen);
-            let v = if closed && g.cb.user_mss != 0 {
-                g.cb.user_mss
-            } else if closed {
-                cb::MSS_DEFAULT
-            } else {
-                g.cb.mss
-            };
-            return Ok(OptOut::Int(v as i32));
-        }
-        let default = match opt {
-            TCP_NODELAY | TCP_CORK | TCP_USER_TIMEOUT => 0,
-            TCP_QUICKACK => 1,
-            TCP_KEEPIDLE => 7200,
-            TCP_KEEPINTVL => 75,
-            TCP_KEEPCNT => 9,
-            TCP_SYNCNT => self.syncnt() as i32,
+        let g = self.lock();
+        let o = &g.cb.opts;
+        let v = match opt {
+            TCP_INFO => return Ok(OptOut::Bytes(info::tcp_info(&g.cb, now_ms()))),
+            TCP_CONGESTION => {
+                let mut b = alloc::vec![0u8; cong::NAME_MAX];
+                let name = g.cb.cong.name().as_bytes();
+                b[..name.len()].copy_from_slice(name);
+                return Ok(OptOut::Bytes(b));
+            }
+            TCP_MAXSEG => {
+                // Linux: mss_cache, or the user's value when not connected
+                let closed = matches!(g.cb.state, TcpState::Closed | TcpState::Listen);
+                if closed && o.user_mss != 0 {
+                    o.user_mss
+                } else if closed {
+                    cb::MSS_DEFAULT
+                } else {
+                    g.cb.mss
+                }
+            }
+            TCP_NODELAY => o.nodelay as u32,
+            TCP_CORK => o.cork as u32,
+            TCP_QUICKACK => g.cb.quickack() as u32,
+            TCP_KEEPIDLE => g.cb.keep_idle() as u32 / 1000,
+            TCP_KEEPINTVL => g.cb.keep_intvl() as u32 / 1000,
+            TCP_KEEPCNT => g.cb.keep_cnt(),
+            TCP_SYNCNT => self.syncnt(o),
+            TCP_USER_TIMEOUT => o.user_timeout,
+            TCP_DEFER_ACCEPT => info::retrans_to_secs(o.defer_accept),
+            TCP_FASTOPEN => o.fastopen,
+            TCP_NOTSENT_LOWAT => o.notsent_lowat,
             _ => return Err(KernelError::NoProtocolOption),
         };
-        Ok(OptOut::Int(*self.opts.lock().get(&opt).unwrap_or(&default)))
+        Ok(OptOut::Int(v as i32))
+    }
+
+    /// SO_KEEPALIVE: the generic flag plus the keepalive timer (Linux
+    /// sk_setsockopt -> tcp_set_keepalive)
+    fn set_keepalive(&self, v: OptIn) -> Result<(), KernelError> {
+        crate::net::socket::sock_setsockopt(self, SO_KEEPALIVE, v)?;
+        let on = self.sk.flag(sf::KEEPALIVE);
+        self.step(|g, _| g.cb.set_keepalive(on, now_ms()));
+        Ok(())
     }
 }

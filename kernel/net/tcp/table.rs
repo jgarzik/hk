@@ -287,7 +287,15 @@ impl TcpTables {
         v.iter().find(|s| score(s) == best).cloned()
     }
 
-    /// Connections and TIME_WAIT entries (tests, /proc/net/tcp in P7)
+    /// Listeners, then connections and TIME_WAIT entries (Linux
+    /// /proc/net/tcp order: listening hash, then established hash)
+    pub fn snapshot(&self) -> (Vec<Arc<TcpSock>>, Vec<Ent>) {
+        let l = self.lhash.read().values().flatten().cloned().collect();
+        let e = self.ehash.read().values().cloned().collect();
+        (l, e)
+    }
+
+    /// Connections and TIME_WAIT entries (tests)
     pub fn count(&self) -> (usize, usize) {
         let e = self.ehash.read();
         let tw = e.values().filter(|x| matches!(x, Ent::Tw(_))).count();

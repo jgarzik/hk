@@ -1,6 +1,15 @@
 //! TCP timers: RTO estimation (RFC 6298 with Karn's algorithm), the
-//! retransmission / persist / TIME_WAIT / FIN_WAIT_2 expiry logic of the
-//! control block (I/O-free), and the timer service that calls it.
+//! retransmission / persist / delayed ACK / keepalive / TIME_WAIT /
+//! FIN_WAIT_2 expiry logic of the control block (I/O-free), and the
+//! timer service that calls it.
+//!
+//! Keepalive (RFC 1122 4.2.3.6, Linux tcp_keepalive_timer): with
+//! SO_KEEPALIVE, after TCP_KEEPIDLE (7200 s) without anything received
+//! and nothing to send, probe every TCP_KEEPINTVL (75 s); TCP_KEEPCNT (9)
+//! unanswered probes, or TCP_USER_TIMEOUT once probing, reset the
+//! connection with ETIMEDOUT. TCP_USER_TIMEOUT also bounds how long
+//! data may stay unacknowledged while retransmitting or probing a zero
+//! window, in place of the retry counts.
 //!
 //! ## Timer service (thread context only)
 //!
@@ -21,6 +30,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
 use super::cb::{ORPHAN_RETRIES, Out, RTO_FALLBACK, RTO_MAX, RTO_MIN, TcpCb, TcpState, Tmr};
+use super::output::Push;
 use crate::error::KernelError;
 
 impl TcpCb {
@@ -29,14 +39,28 @@ impl TcpCb {
         (self.rto << self.backoff.min(16)).min(RTO_MAX)
     }
 
-    /// (Re)start the retransmission timer
+    /// (Re)start the retransmission timer (no later than the user
+    /// timeout, Linux tcp_clamp_rto_to_user_timeout)
     pub(super) fn arm_rtx(&mut self, now: u64) {
-        self.tmr = Some((Tmr::Rtx, now + self.rto_cur()));
+        let mut t = self.rto_cur();
+        if let Some(left) = self.user_left(now) {
+            t = t.min(left.max(1));
+        }
+        self.tmr = Some((Tmr::Rtx, now + t));
+    }
+
+    /// TCP_USER_TIMEOUT time left while retransmitting or probing
+    fn user_left(&self, now: u64) -> Option<u64> {
+        let ut = self.opts.user_timeout as u64;
+        let start = self.rtx_stamp?;
+        (ut != 0).then(|| (start + ut).saturating_sub(now))
     }
 
     /// RFC 6298 2.2/2.3 for a measured round trip `r` ms (srtt8 = 8 *
     /// SRTT, rttvar4 = 4 * RTTVAR); a valid sample ends the backoff
     pub(super) fn rtt_sample(&mut self, r: u64) {
+        let r = r.min(RTO_MAX);
+        self.stats.min_rtt = Some(self.stats.min_rtt.map_or(r, |m| m.min(r)));
         if self.srtt8 == 0 {
             self.srtt8 = (r * 8).max(1);
             self.rttvar4 = r * 2;
@@ -73,6 +97,15 @@ impl TcpCb {
         }
     }
 
+    /// Retransmitting or probing for too long: the retry count, or the
+    /// user timeout when set (synchronized states)
+    fn gave_up(&self, count: u32, now: u64) -> bool {
+        if self.opts.user_timeout != 0 && self.state.synced() {
+            return self.user_left(now) == Some(0);
+        }
+        count >= self.retries()
+    }
+
     /// Give up: the last soft (ICMP) error, else ETIMEDOUT
     fn timed_out(&mut self, out: &mut Out) {
         let e = self.soft_err.take().unwrap_or(KernelError::TimedOut);
@@ -81,6 +114,7 @@ impl TcpCb {
 
     /// A deadline passed (call at or after `next_timer()`)
     pub fn on_timer(&mut self, now: u64, out: &mut Out) {
+        self.tick(now);
         if self.wait_at.is_some_and(|t| t <= now) {
             self.wait_at = None;
             match self.state {
@@ -90,6 +124,13 @@ impl TcpCb {
                 _ => {}
             }
             return;
+        }
+        if self.dack.at.is_some_and(|t| t <= now) {
+            self.delack_timer(out);
+        }
+        if self.keep_at.is_some_and(|t| t <= now) {
+            self.keep_at = None;
+            self.keepalive_timer(now, out);
         }
         let Some((kind, at)) = self.tmr else {
             return;
@@ -111,7 +152,11 @@ impl TcpCb {
         if !handshake && self.snd_una == self.snd_max {
             return;
         }
-        if self.backoff >= self.retries() {
+        if self.rtx_stamp.is_none() {
+            // The head went out about one (backed-off) RTO ago
+            self.rtx_stamp = Some(now.saturating_sub(self.rto_cur()));
+        }
+        if self.gave_up(self.backoff, now) {
             self.timed_out(out);
             return;
         }
@@ -119,8 +164,10 @@ impl TcpCb {
         self.cong.on_rto(flight);
         self.rtt_seq = None;
         self.backoff += 1;
+        self.stats.rto_count += 1;
         if handshake {
             self.syn_rtx = true;
+            self.stats.total_retrans += 1;
             let s = self.syn_seg();
             out.segs.push(s);
         } else {
@@ -130,21 +177,112 @@ impl TcpCb {
         self.arm_rtx(now);
     }
 
-    /// Persist timer: probe the zero window, backing off (Linux
-    /// tcp_probe_timer); a peer that never answers is given up on
+    /// Probe timer (Linux tcp_probe_timer / tcp_send_probe0): an open
+    /// window means data held by cork or Nagle: push one segment; a zero
+    /// window is probed, backing off; a peer that never answers is given
+    /// up on
     fn probe_timer(&mut self, now: u64, out: &mut Out) {
-        if self.snd_wnd != 0 {
-            self.output(now, out);
+        if self.snd_una != self.snd_max || !self.may_send() {
             return;
         }
+        if self.snd_wnd != 0 {
+            self.xmit(now, Push::Force, out);
+            return;
+        }
+        if self.rtx_stamp.is_none() {
+            self.rtx_stamp = Some(now);
+        }
         self.probes += 1;
-        if self.probes > self.retries() {
+        if self.gave_up(self.probes - 1, now) {
             self.timed_out(out);
             return;
         }
         self.send_probe(out);
         self.backoff += 1;
-        self.tmr = Some((Tmr::Probe, now + self.rto_cur()));
+        let mut t = self.rto_cur().max(RTO_MIN);
+        if let Some(left) = self.user_left(now) {
+            t = t.min(left.max(1));
+        }
+        self.tmr = Some((Tmr::Probe, now + t));
+    }
+
+    // --- keepalive ------------------------------------------------------------
+
+    /// TCP_KEEPIDLE / TCP_KEEPINTVL in ms, TCP_KEEPCNT
+    pub(super) fn keep_idle(&self) -> u64 {
+        match self.opts.keepidle {
+            0 => self.cfg.keepidle,
+            s => s as u64 * 1000,
+        }
+    }
+
+    pub(super) fn keep_intvl(&self) -> u64 {
+        match self.opts.keepintvl {
+            0 => self.cfg.keepintvl,
+            s => s as u64 * 1000,
+        }
+    }
+
+    pub(super) fn keep_cnt(&self) -> u32 {
+        match self.opts.keepcnt {
+            0 => self.cfg.keepcnt,
+            n => n,
+        }
+    }
+
+    /// States keepalive runs in (Linux: not CLOSE, SYN_SENT, LISTEN;
+    /// TIME_WAIT has its own entry)
+    fn keep_state(&self) -> bool {
+        self.state.synced() && self.state != TcpState::TimeWait
+    }
+
+    /// Time since anything was last received
+    fn idle(&self, now: u64) -> u64 {
+        now.saturating_sub(self.dack.lrcvtime.max(self.rcv_tstamp))
+    }
+
+    /// (Re)start keepalive after the connection opened or an option
+    /// changed (Linux tcp_set_keepalive / tcp_sock_set_keepidle_locked)
+    pub fn arm_keepalive(&mut self, now: u64) {
+        self.keep_at = None;
+        if self.opts.keepalive && self.keep_state() {
+            let left = self.keep_idle().saturating_sub(self.idle(now));
+            self.keep_at = Some(now + left);
+        }
+    }
+
+    /// SO_KEEPALIVE changed
+    pub fn set_keepalive(&mut self, on: bool, now: u64) {
+        self.tick(now);
+        self.opts.keepalive = on;
+        self.arm_keepalive(now);
+    }
+
+    /// Linux tcp_keepalive_timer (keepalive part)
+    fn keepalive_timer(&mut self, now: u64, out: &mut Out) {
+        if !self.opts.keepalive || !self.keep_state() {
+            return;
+        }
+        let busy = self.snd_una != self.snd_max || !self.sndq.is_empty();
+        let idle = self.idle(now);
+        let next = if busy {
+            self.keep_idle()
+        } else if idle >= self.keep_idle() {
+            let ut = self.opts.user_timeout as u64;
+            if (ut != 0 && idle >= ut && self.probes > 0)
+                || (ut == 0 && self.probes >= self.keep_cnt())
+            {
+                self.abort(out);
+                out.err = Some(self.soft_err.take().unwrap_or(KernelError::TimedOut));
+                return;
+            }
+            self.send_probe(out);
+            self.probes += 1;
+            self.keep_intvl()
+        } else {
+            self.keep_idle() - idle
+        };
+        self.keep_at = Some(now + next);
     }
 }
 

@@ -55,6 +55,8 @@ pub mod sf {
     pub const LINGER: u32 = 1 << 13;
     /// Listening (SO_ACCEPTCONN)
     pub const ACCEPTCONN: u32 = 1 << 14;
+    /// SO_RCVBUF was set (Linux SOCK_RCVBUF_LOCK in sk_userlocks)
+    pub const RCVBUF_LOCK: u32 = 1 << 15;
 }
 
 /// sock_extended_err origins (SO_EE_ORIGIN_*)
@@ -299,6 +301,7 @@ impl Sock {
     pub fn set_rcvbuf(&self, v: i32, force: bool) {
         self.rcvbuf
             .store(buf_size(v, force, MIN_RCVBUF), Ordering::Release);
+        self.set_flag(sf::RCVBUF_LOCK, true);
         self.wq.wake_all();
     }
 

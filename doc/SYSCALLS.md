@@ -298,17 +298,29 @@ raises SIGPIPE unless MSG_NOSIGNAL. Unknown options are ENOPROTOOPT
 (EOPNOTSUPP for getsockopt at unknown levels, like Linux).
 
 TCP (RFC 9293): all eleven states, RFC 5961 checks, retransmission with
-RFC 6298 RTO (1 s initial, 200 ms - 120 s, Karn, backoff), Reno/NewReno
-congestion control, zero-window probes, MSS option (536 if absent, PMTU
-from ICMP frag needed), RFC 6528 ISNs, TIME_WAIT 60 s (entries re-ACK a
-retransmitted FIN; SO_REUSEADDR rebinds), half-close, RST on close with
-unread data and with SO_LINGER {1, 0}, SO_LINGER timeouts on close,
-tcp_syn_retries/tcp_synack_retries/tcp_retries2/tcp_fin_timeout,
-ICMP errors (hard in SYN_SENT, soft otherwise, SO_ERROR on timeout).
-Not yet (P7): window scaling, timestamps, SACK, delayed ACKs, Nagle
-(TCP_NODELAY/TCP_CORK are stored only), keepalive, TCP_INFO,
-/proc/net/tcp; listeners keep full child sockets in SYN_RECEIVED (no
-SYN cookies).
+RFC 6298 RTO (1 s initial, 200 ms - 120 s, Karn, backoff), MSS option
+(536 if absent, PMTU from ICMP frag needed), RFC 6528 ISNs, TIME_WAIT
+60 s (entries re-ACK a retransmitted FIN; SO_REUSEADDR rebinds; a SYN
+with a newer timestamp reopens), half-close, RST on close with unread
+data and with SO_LINGER {1, 0}, SO_LINGER timeouts on close, ICMP errors
+(hard in SYN_SENT, soft otherwise, SO_ERROR on timeout). RFC 7323 window
+scaling (scale from tcp_rmem[2], or the buffer when SO_RCVBUF is set)
+and timestamps (ms clock with a keyed per-address-pair offset; RTT from
+every echo; PAWS with Linux's RST and disordered-ACK exceptions).
+Congestion control: Reno/NewReno behind a pluggable interface (only
+"reno"; CUBIC is not implemented), RFC 6928 initial window, byte-counted
+slow start / congestion avoidance growing only while cwnd-limited,
+restart after idle. Delayed ACKs (40 ms ATO, quickack at start, ACK
+every second full segment when the reader keeps up, interactive
+pingpong mode), Nagle (Minshall), TCP_CORK and MSG_MORE (200 ms
+ceiling), zero-window probes, keepalive, TCP_USER_TIMEOUT. Sysctls:
+tcp_syn_retries, tcp_synack_retries, tcp_retries2, tcp_fin_timeout,
+tcp_window_scaling, tcp_timestamps, tcp_rmem, tcp_keepalive_time/intvl/
+probes, tcp_congestion_control, tcp_available_congestion_control.
+/proc/net/tcp lists listeners, connections and TIME_WAIT entries. Not
+yet: SACK (never advertised), receive buffer autotuning, out-of-window
+ACK rate limiting; listeners keep full child sockets in SYN_RECEIVED
+(no SYN cookies).
 
 - [x] socket (AF_INET: TCP, UDP, ping SOCK_DGRAM/IPPROTO_ICMP gated by
   ping_group_range, SOCK_RAW with CAP_NET_RAW: IP_HDRINCL, SOL_RAW
@@ -336,8 +348,10 @@ SYN cookies).
   EMSGSIZE), IP_MTU, IP_FREEBIND,
   IP_BIND_ADDRESS_NO_PORT, IP_MULTICAST_TTL/LOOP), IPPROTO_TCP
   (TCP_NODELAY, TCP_MAXSEG, TCP_CORK, TCP_KEEPIDLE, TCP_KEEPINTVL,
-  TCP_KEEPCNT, TCP_SYNCNT, TCP_QUICKACK, TCP_USER_TIMEOUT; TCP_MAXSEG
-  and TCP_SYNCNT act, the others are stored for P7)
+  TCP_KEEPCNT, TCP_SYNCNT, TCP_QUICKACK, TCP_USER_TIMEOUT, TCP_INFO
+  (struct tcp_info, 280 bytes), TCP_CONGESTION ("reno"; others ENOENT),
+  TCP_NOTSENT_LOWAT; TCP_DEFER_ACCEPT and TCP_FASTOPEN are accepted and
+  read back but have no effect)
 - [x] sendto
 - [x] recvfrom
 - [x] sendmsg (IP_PKTINFO/IP_TTL/IP_TOS control messages)

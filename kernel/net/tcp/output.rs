@@ -1,9 +1,15 @@
 //! Segment output: what the control block sends (Linux tcp_output.c,
-//! I/O-free) and the wire format (header, MSS option, checksum).
+//! I/O-free) and the wire format (header, options, checksum).
+//!
+//! Partial segments follow Linux: Nagle with Minshall's variant (hold a
+//! partial segment only while an earlier partial one is unacknowledged)
+//! unless TCP_NODELAY; TCP_CORK and MSG_MORE hold every partial segment
+//! until uncorked, a full segment forms, or the 200 ms (RTO-based) probe
+//! timer pushes it out (Linux tcp_write_wakeup). A FIN is never held.
 
 use alloc::vec::Vec;
 
-use super::cb::{Out, Seg, SegIn, TcpCb, TcpState, Tmr, after, copy_out, flags};
+use super::cb::{Out, RTO_MIN, Seg, SegIn, TcpCb, TcpState, Tmr, after, before, copy_out, flags};
 use crate::net::ipv4::{self, IPPROTO_TCP, Ipv4Addr};
 use crate::net::skb::SkBuff;
 
@@ -13,22 +19,72 @@ pub const HLEN: usize = 20;
 const OPT_EOL: u8 = 0;
 const OPT_NOP: u8 = 1;
 const OPT_MSS: u8 = 2;
+const OPT_WS: u8 = 3;
+const OPT_TS: u8 = 8;
+
+/// How partial segments are pushed (Linux nonagle modes)
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Push {
+    /// Nagle / TCP_NODELAY / TCP_CORK as set
+    Normal,
+    /// MSG_MORE: hold partial segments for this call
+    More,
+    /// Probe timer: one segment regardless (Linux tcp_write_wakeup)
+    Force,
+}
 
 impl TcpCb {
-    /// SYN (SYN_SENT) or SYN-ACK (SYN_RECEIVED) with our MSS
+    /// SYN (SYN_SENT) or SYN-ACK (SYN_RECEIVED) with our options
     pub(super) fn syn_seg(&mut self) -> Seg {
         let synack = self.state == TcpState::SynReceived;
+        let ts = if !self.ts_ok {
+            None
+        } else if synack {
+            Some((self.tsval(), self.ts_recent))
+        } else {
+            Some((self.tsval(), 0))
+        };
         Seg {
             seq: self.iss,
             ack: if synack { self.rcv_nxt } else { 0 },
             flags: flags::SYN | if synack { flags::ACK } else { 0 },
-            wnd: if synack {
-                self.select_window()
-            } else {
-                self.full_space() as u16
-            },
+            wnd: self.syn_window(),
             mss: Some(self.adv_mss.min(u16::MAX as u32) as u16),
+            ws: self.wscale_ok.then_some(self.rcv_wscale),
+            ts,
             data: Vec::new(),
+        }
+    }
+
+    /// A segment of this connection: ACK field, window, timestamp; an
+    /// ACK going out settles what was owed
+    pub(super) fn mk_seg(&mut self, seq: u32, fl: u8, data: Vec<u8>) -> Seg {
+        let wnd = if fl & flags::ACK != 0 {
+            self.select_window()
+        } else {
+            0
+        };
+        let ts = self.ts_ok.then(|| (self.tsval(), self.ts_recent));
+        if fl & flags::ACK != 0 {
+            self.ack_sent();
+        }
+        self.stats.segs_out += 1;
+        if !data.is_empty() {
+            self.stats.data_segs_out += 1;
+        }
+        Seg {
+            seq,
+            ack: if fl & flags::ACK != 0 {
+                self.rcv_nxt
+            } else {
+                0
+            },
+            flags: fl,
+            wnd,
+            mss: None,
+            ws: None,
+            ts,
+            data,
         }
     }
 
@@ -43,7 +99,7 @@ impl TcpCb {
     }
 
     /// States that may send data or FIN
-    fn may_send(&self) -> bool {
+    pub(super) fn may_send(&self) -> bool {
         matches!(
             self.state,
             TcpState::Established
@@ -56,39 +112,49 @@ impl TcpCb {
 
     /// Send what the peer's window and the congestion window allow,
     /// from `snd_nxt` on (new data, or a rewound range after a timeout),
-    /// ending with the FIN once all data went out; else a pure ACK if
-    /// one is owed (Linux tcp_write_xmit + tcp_send_ack)
+    /// ending with the FIN once all data went out; else an owed ACK
+    /// (Linux tcp_write_xmit + tcp_send_ack / delayed ACK)
     pub fn output(&mut self, now: u64, out: &mut Out) {
+        self.xmit(now, Push::Normal, out);
+    }
+
+    /// `output` for a send with MSG_MORE
+    pub fn output_more(&mut self, now: u64, out: &mut Out) {
+        self.xmit(now, Push::More, out);
+    }
+
+    pub(super) fn xmit(&mut self, now: u64, push: Push, out: &mut Out) {
+        self.tick(now);
         let mut sent = false;
+        let mut limited = false;
         while self.may_send() {
-            let Some(seg) = self.next_seg(now) else {
+            let Some(seg) = self.next_seg(now, push, &mut limited) else {
                 break;
             };
             let fin = seg.has(flags::FIN);
             out.segs.push(seg);
             sent = true;
-            if fin {
+            if fin || push == Push::Force {
                 break;
             }
         }
         if sent {
-            self.ack_now = false;
             if self.tmr.is_none_or(|t| t.0 != Tmr::Rtx) {
                 self.arm_rtx(now);
             }
-        } else if self.ack_now {
-            self.send_ack(out);
+            let flight = self.snd_max.wrapping_sub(self.snd_una);
+            self.cong
+                .on_sent(flight, self.snd_una, self.snd_nxt, limited);
+        } else if self.state.synced() {
+            self.ack_snd_check(now, out);
         }
         self.check_persist(now);
     }
 
-    /// The next segment `output` may send, if any
-    fn next_seg(&mut self, now: u64) -> Option<Seg> {
+    /// What `next_seg` may send from queue offset `off`: (bytes queued
+    /// there, room in the window, cwnd is the smaller window)
+    fn room(&self, off: u32) -> (u32, u32, bool) {
         let len = self.sndq.len() as u32;
-        let off = self.snd_nxt.wrapping_sub(self.sndq_seq);
-        if off > len {
-            return None; // FIN already sent
-        }
         let wnd = self.snd_wnd.min(self.cong.cwnd);
         let end = self.snd_una.wrapping_add(wnd);
         let room = if after(end, self.snd_nxt) {
@@ -96,17 +162,56 @@ impl TcpCb {
         } else {
             0
         };
-        let avail = len - off;
+        (len - off, room, self.cong.cwnd < self.snd_wnd)
+    }
+
+    /// Hold a partial segment of `n` bytes (Linux tcp_nagle_check with
+    /// Minshall's rule; cork and MSG_MORE hold all partial segments)
+    fn nagle_hold(&self, push: Push) -> bool {
+        if push == Push::Force {
+            return false;
+        }
+        if self.opts.cork || push == Push::More {
+            return true;
+        }
+        !self.opts.nodelay
+            && self.snd_nxt != self.snd_una
+            && after(self.snd_sml, self.snd_una)
+            && !after(self.snd_sml, self.snd_nxt)
+    }
+
+    /// The next segment `output` may send, if any
+    fn next_seg(&mut self, now: u64, push: Push, limited: &mut bool) -> Option<Seg> {
+        let len = self.sndq.len() as u32;
+        let off = self.snd_nxt.wrapping_sub(self.sndq_seq);
+        if off > len {
+            return None; // FIN already sent
+        }
+        let (avail, room, cwnd_bound) = self.room(off);
         let n = avail.min(self.mss).min(room);
         let fin = self.fin_queued && off + n == len && room > n;
         if n == 0 && !fin {
+            *limited |= avail > 0 && cwnd_bound;
             return None;
         }
-        // Sender SWS avoidance (RFC 9293 3.8.6.2.1): with data in flight,
-        // wait for a full segment unless this ends the queue
         let in_flight = self.snd_nxt != self.snd_una;
-        if n < avail && n < self.mss && in_flight && n < self.max_wnd / 2 {
-            return None;
+        if n < self.mss && !fin && push != Push::Force {
+            // Sender SWS avoidance (RFC 9293 3.8.6.2.1): with data in
+            // flight, wait for a full segment unless this ends the queue
+            if n < avail && in_flight && n < self.max_wnd / 2 {
+                *limited |= cwnd_bound;
+                return None;
+            }
+            if n == avail && self.nagle_hold(push) {
+                return None;
+            }
+        }
+        if self.snd_nxt == self.snd_max
+            && !in_flight
+            && now.saturating_sub(self.lsndtime) > self.rto
+        {
+            // Idle longer than an RTO: restart from the initial window
+            self.cong.restart(now - self.lsndtime, self.rto);
         }
         let mut data = alloc::vec![0u8; n as usize];
         copy_out(&self.sndq, off as usize, &mut data);
@@ -118,36 +223,34 @@ impl TcpCb {
         if fin {
             fl |= flags::FIN;
         }
-        let seg = Seg {
-            seq,
-            ack: self.rcv_nxt,
-            flags: fl,
-            wnd: self.select_window(),
-            mss: None,
-            data,
-        };
         let next = seq.wrapping_add(n + fin as u32);
+        let new = after(next, self.snd_max);
         if self.snd_nxt == self.snd_max && self.rtt_seq.is_none() {
             self.rtt_seq = Some((next, now));
         }
+        if n < self.mss {
+            self.snd_sml = next;
+        }
+        if new && n > 0 {
+            self.data_sent(now);
+            self.lsndtime = now;
+        }
+        if before(seq, self.snd_max) {
+            self.stats.total_retrans += 1;
+            self.stats.bytes_retrans += n as u64;
+        }
+        self.stats.bytes_sent += n as u64;
         self.snd_nxt = next;
-        if after(next, self.snd_max) {
+        if new {
             self.snd_max = next;
         }
-        Some(seg)
+        Some(self.mk_seg(seq, fl, data))
     }
 
     /// A pure ACK of everything received (also the RFC 5961 challenge ACK)
     pub(super) fn send_ack(&mut self, out: &mut Out) {
-        self.ack_now = false;
-        let wnd = self.select_window();
-        out.segs.push(Seg {
-            seq: self.snd_nxt,
-            ack: self.rcv_nxt,
-            flags: flags::ACK,
-            wnd,
-            ..Default::default()
-        });
+        let s = self.mk_seg(self.snd_nxt, flags::ACK, Vec::new());
+        out.segs.push(s);
     }
 
     /// Resend the oldest unacknowledged segment (fast retransmit, NewReno
@@ -178,41 +281,28 @@ impl TcpCb {
         if n == 0 && fl & flags::FIN == 0 {
             return;
         }
-        let wnd = self.select_window();
-        out.segs.push(Seg {
-            seq: self.snd_una,
-            ack: self.rcv_nxt,
-            flags: fl,
-            wnd,
-            mss: None,
-            data,
-        });
-        self.ack_now = false;
+        self.stats.total_retrans += 1;
+        self.stats.bytes_retrans += n as u64;
+        let s = self.mk_seg(self.snd_una, fl, data);
+        out.segs.push(s);
     }
 
-    /// Zero-window probe: an old sequence number that the peer answers
-    /// with an ACK carrying its window (Linux tcp_xmit_probe_skb)
+    /// Zero-window or keepalive probe: an old sequence number that the
+    /// peer answers with an ACK carrying its window (Linux
+    /// tcp_xmit_probe_skb)
     pub(super) fn send_probe(&mut self, out: &mut Out) {
-        let wnd = self.select_window();
-        out.segs.push(Seg {
-            seq: self.snd_una.wrapping_sub(1),
-            ack: self.rcv_nxt,
-            flags: flags::ACK,
-            wnd,
-            ..Default::default()
-        });
+        let s = self.mk_seg(self.snd_una.wrapping_sub(1), flags::ACK, Vec::new());
+        out.segs.push(s);
     }
 
-    /// Something to send, nothing in flight and a zero window: probe
+    /// Something to send and nothing in flight, yet nothing went out
+    /// (zero window, or a partial segment held by cork/Nagle): arm the
+    /// probe timer (Linux tcp_check_probe_timer)
     pub(super) fn check_persist(&mut self, now: u64) {
         let pending = self.snd_nxt != self.data_end().wrapping_add(self.fin_queued as u32);
-        if self.may_send()
-            && self.snd_wnd == 0
-            && pending
-            && self.snd_una == self.snd_max
-            && self.tmr.is_none()
-        {
-            self.tmr = Some((Tmr::Probe, now + self.rto_cur()));
+        if self.may_send() && pending && self.snd_una == self.snd_max && self.tmr.is_none() {
+            let t = self.rto_cur().max(RTO_MIN);
+            self.tmr = Some((Tmr::Probe, now + t));
         }
     }
 }
@@ -268,24 +358,37 @@ pub struct Tuple {
     pub rport: u16,
 }
 
+/// Option bytes of `seg` in Linux's order and padding (tcp_options_write
+/// without SACK): MSS, NOP NOP TS, NOP WS
+fn put_opts(seg: &Seg, o: &mut Vec<u8>) {
+    if let Some(m) = seg.mss {
+        o.extend_from_slice(&[OPT_MSS, 4]);
+        o.extend_from_slice(&m.to_be_bytes());
+    }
+    if let Some((v, e)) = seg.ts {
+        o.extend_from_slice(&[OPT_NOP, OPT_NOP, OPT_TS, 10]);
+        o.extend_from_slice(&v.to_be_bytes());
+        o.extend_from_slice(&e.to_be_bytes());
+    }
+    if let Some(w) = seg.ws {
+        o.extend_from_slice(&[OPT_NOP, OPT_WS, 3, w]);
+    }
+}
+
 /// Build the IP payload of `seg` from `t.laddr:lport` to `t.raddr:rport`
 pub fn build(seg: &Seg, t: &Tuple) -> Option<alloc::boxed::Box<SkBuff>> {
-    let opt = if seg.mss.is_some() { 4 } else { 0 };
-    let mut skb = SkBuff::alloc_tx(HLEN + opt + seg.data.len())?;
-    let mut h = [0u8; HLEN + 4];
-    h[0..2].copy_from_slice(&t.lport.to_be_bytes());
-    h[2..4].copy_from_slice(&t.rport.to_be_bytes());
-    h[4..8].copy_from_slice(&seg.seq.to_be_bytes());
-    h[8..12].copy_from_slice(&seg.ack.to_be_bytes());
-    h[12] = (((HLEN + opt) / 4) as u8) << 4;
-    h[13] = seg.flags;
-    h[14..16].copy_from_slice(&seg.wnd.to_be_bytes());
-    if let Some(m) = seg.mss {
-        h[20] = OPT_MSS;
-        h[21] = 4;
-        h[22..24].copy_from_slice(&m.to_be_bytes());
-    }
-    skb.put_slice(&h[..HLEN + opt])?;
+    let mut h = Vec::with_capacity(HLEN + 20);
+    h.extend_from_slice(&t.lport.to_be_bytes());
+    h.extend_from_slice(&t.rport.to_be_bytes());
+    h.extend_from_slice(&seg.seq.to_be_bytes());
+    h.extend_from_slice(&seg.ack.to_be_bytes());
+    h.extend_from_slice(&[0, seg.flags]);
+    h.extend_from_slice(&seg.wnd.to_be_bytes());
+    h.extend_from_slice(&[0; 4]);
+    put_opts(seg, &mut h);
+    h[12] = ((h.len() / 4) as u8) << 4;
+    let mut skb = SkBuff::alloc_tx(h.len() + seg.data.len())?;
+    skb.put_slice(&h)?;
     skb.put_slice(&seg.data)?;
     let c = checksum(t.laddr, t.raddr, skb.data());
     skb.data_mut()[16..18].copy_from_slice(&c.to_be_bytes());
@@ -306,48 +409,71 @@ pub fn parse(b: &[u8]) -> Option<(u16, u16, SegIn<'_>)> {
     }
     let be16 = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
     let be32 = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
-    let s = SegIn {
+    let mut s = SegIn {
         seq: be32(4),
         ack: be32(8),
         flags: b[13] & 0x3f,
         wnd: be16(14),
-        mss: mss_opt(&b[HLEN..doff]),
         data: &b[doff..],
+        ..Default::default()
     };
+    parse_opts(&b[HLEN..doff], &mut s);
     Some((be16(0), be16(2), s))
 }
 
-/// The MSS option, if present and well formed (Linux
-/// tcp_parse_options: parsing stops at EOL, a length below 2 or past the
-/// header; an MSS of 0 is ignored)
-fn mss_opt(mut o: &[u8]) -> Option<u16> {
+/// The options of a segment (Linux tcp_parse_options: parsing stops at
+/// EOL, a length below 2 or past the header; an MSS of 0 is ignored;
+/// MSS and window scale count only on a SYN; a scale above 14 is 14)
+fn parse_opts(mut o: &[u8], s: &mut SegIn) {
+    let syn = s.has(flags::SYN);
     while let Some(&k) = o.first() {
         match k {
-            OPT_EOL => return None,
+            OPT_EOL => return,
             OPT_NOP => o = &o[1..],
             _ => {
-                let l = *o.get(1)? as usize;
+                let Some(&l) = o.get(1) else {
+                    return;
+                };
+                let l = l as usize;
                 if l < 2 || l > o.len() {
-                    return None;
+                    return;
                 }
-                if k == OPT_MSS && l == 4 {
-                    let m = u16::from_be_bytes([o[2], o[3]]);
-                    return (m != 0).then_some(m);
+                match (k, l) {
+                    (OPT_MSS, 4) if syn => {
+                        let m = u16::from_be_bytes([o[2], o[3]]);
+                        s.mss = (m != 0).then_some(m);
+                    }
+                    (OPT_WS, 3) if syn => s.ws = Some(o[2].min(super::cb::MAX_WSCALE)),
+                    (OPT_TS, 10) => {
+                        let v = u32::from_be_bytes([o[2], o[3], o[4], o[5]]);
+                        let e = u32::from_be_bytes([o[6], o[7], o[8], o[9]]);
+                        s.ts = Some((v, e));
+                    }
+                    _ => {}
                 }
                 o = &o[l..];
             }
         }
     }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn opts(o: &[u8], syn: bool) -> SegIn<'static> {
+        let mut s = SegIn {
+            flags: if syn { flags::SYN } else { flags::ACK },
+            ..Default::default()
+        };
+        parse_opts(o, &mut s);
+        s
+    }
+
     #[test]
     fn header_bounds() {
         let mut h = [0u8; 24];
+        h[13] = flags::SYN;
         h[12] = 0x40; // doff 4 words: below the minimum
         assert!(parse(&h).is_none());
         h[12] = 0x70; // doff 28 bytes > segment
@@ -366,13 +492,52 @@ mod tests {
 
     #[test]
     fn options() {
-        assert_eq!(mss_opt(&[1, 1, 2, 4, 0x05, 0xb4]), Some(1460));
-        assert_eq!(mss_opt(&[3, 3, 7, 2, 4, 0x02, 0x18]), Some(536));
-        assert_eq!(mss_opt(&[0, 2, 4, 1, 1]), None);
-        assert_eq!(mss_opt(&[2, 9, 0]), None);
-        assert_eq!(mss_opt(&[8, 0]), None);
-        assert_eq!(mss_opt(&[8, 1, 2, 4, 5, 0]), None);
-        assert_eq!(mss_opt(&[2, 4, 5]), None);
+        let m = |o: &[u8]| opts(o, true).mss;
+        assert_eq!(m(&[1, 1, 2, 4, 0x05, 0xb4]), Some(1460));
+        assert_eq!(m(&[3, 3, 7, 2, 4, 0x02, 0x18]), Some(536));
+        assert_eq!(m(&[0, 2, 4, 1, 1]), None);
+        assert_eq!(m(&[2, 9, 0]), None);
+        assert_eq!(m(&[8, 0]), None);
+        assert_eq!(m(&[8, 1, 2, 4, 5, 0]), None);
+        assert_eq!(m(&[2, 4, 5]), None);
+        // MSS and window scale only on a SYN; scale capped at 14
+        assert_eq!(opts(&[2, 4, 0x05, 0xb4], false).mss, None);
+        assert_eq!(opts(&[1, 3, 3, 7], true).ws, Some(7));
+        assert_eq!(opts(&[1, 3, 3, 30], true).ws, Some(14));
+        assert_eq!(opts(&[1, 3, 3, 7], false).ws, None);
+        let ts = [1, 1, 8, 10, 0, 0, 1, 2, 0, 0, 3, 4];
+        assert_eq!(opts(&ts, false).ts, Some((0x102, 0x304)));
+        // A truncated timestamp is ignored
+        assert_eq!(opts(&ts[..11], false).ts, None);
+    }
+
+    #[test]
+    fn syn_options_on_wire() {
+        let seg = Seg {
+            seq: 1,
+            flags: flags::SYN,
+            wnd: 65535,
+            mss: Some(1460),
+            ws: Some(7),
+            ts: Some((0x11223344, 0)),
+            ..Default::default()
+        };
+        let t = Tuple::default();
+        let skb = build(&seg, &t).unwrap();
+        let b = skb.data();
+        assert_eq!(b.len(), 40);
+        assert_eq!(b[12] >> 4, 10);
+        assert_eq!(
+            &b[20..40],
+            &[
+                2, 4, 5, 0xb4, 1, 1, 8, 10, 0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0, 1, 3, 3, 7
+            ]
+        );
+        let (_, _, s) = parse(b).unwrap();
+        assert_eq!(
+            (s.mss, s.ws, s.ts),
+            (Some(1460), Some(7), Some((0x11223344, 0)))
+        );
     }
 
     #[test]
@@ -381,9 +546,8 @@ mod tests {
             seq: 100,
             ack: 7,
             flags: flags::SYN,
-            wnd: 0,
-            mss: None,
             data: &[1, 2, 3],
+            ..Default::default()
         };
         let r = reset_for(&s).unwrap();
         assert_eq!((r.seq, r.ack, r.flags), (0, 104, flags::RST | flags::ACK));

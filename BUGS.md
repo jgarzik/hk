@@ -35,11 +35,13 @@ VFS handler is registered.
 
 **Location**: `kernel/net/`
 
-Listed because real traffic reaches them: TCP (P6 rewrite) lacks
-window scaling, timestamps, SACK, delayed ACKs, Nagle, keepalive,
-TCP_INFO and /proc/net/tcp (P7); no SYN cookies (a full listener drops
-SYNs). ICMP timestamp requests
-are not answered.
+Listed because real traffic reaches them: TCP has no SACK (never
+advertised), no CUBIC (only "reno"; Linux defaults to cubic), no
+receive buffer autotuning (the window is SO_RCVBUF / 2), no rate limit
+on out-of-window / challenge ACKs (Linux tcp_invalid_ratelimit; hk
+answers each such segment once), and TCP_DEFER_ACCEPT / TCP_FASTOPEN
+are stored only. No SYN cookies (a full listener drops SYNs). ICMP
+timestamp requests are not answered.
 Neighbour entries are not confirmed by TCP progress (only ARP), there is
 no proxy ARP and no per-device neighbour sysctls (net/ipv4/neigh/*).
 IP: no ipfrag_max_dist, no IP options on output (received options are

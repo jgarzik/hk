@@ -6,8 +6,8 @@
 //! and a queue-less control block in TIME_WAIT, which re-ACKs a
 //! retransmitted FIN (restarting 2MSL), answers other segments with an
 //! ACK, dies on an acceptable RST, and after 2MSL leaves the tables. A
-//! new SYN beyond its RCV.NXT ends it early so the tuple can be reused
-//! (Linux tcp_timewait_state_process TCP_TW_SYN).
+//! new SYN beyond its RCV.NXT or with a newer timestamp ends it early so
+//! the tuple can be reused (Linux tcp_timewait_state_process TCP_TW_SYN).
 //!
 //! Locking: `inner` is a `spin::Mutex` leaf like `TcpSock.cb` (thread
 //! context only; table and timer locks may be taken under it).
@@ -16,7 +16,7 @@ use alloc::sync::{Arc, Weak};
 
 use spin::Mutex;
 
-use super::cb::{Out, SegIn, TcpCb, after, flags};
+use super::cb::{Out, SegIn, TcpCb};
 use super::output::Tuple;
 use super::timer::{self, Expire, Slot};
 use crate::net::NetNamespace;
@@ -55,6 +55,12 @@ impl TimeWait {
         })
     }
 
+    /// Milliseconds of 2MSL left at `now` (/proc/net/tcp)
+    pub fn left(&self, now: u64) -> u64 {
+        let g = self.inner.lock();
+        g.0.next_timer().map_or(0, |t| t.saturating_sub(now))
+    }
+
     /// Arm the 2MSL timer
     pub fn start(&self) {
         let mut g = self.inner.lock();
@@ -68,7 +74,7 @@ impl TimeWait {
         let mut out = Out::default();
         {
             let mut g = self.inner.lock();
-            if s.has(flags::SYN) && !s.has(flags::ACK | flags::RST) && after(s.seq, g.0.rcv_nxt) {
+            if g.0.tw_syn_ok(s) {
                 timer::rearm(&mut g.1, None, self.me.clone() as Weak<dyn Expire>);
                 drop(g);
                 self.net.tcp.tw_unhash(self);

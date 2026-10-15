@@ -16,13 +16,19 @@
 //! Time is in milliseconds on any monotonic clock chosen by the caller.
 //! Sequence numbers compare modulo 2^32 (`before`/`after`).
 //!
-//! Window scaling and timestamps (RFC 7323) come in P7: the receive
-//! window is at most 65535 and `snd_wscale`/`rcv_wscale` stay 0.
+//! Options (RFC 7323): window scaling and timestamps are negotiated on
+//! the SYN/SYN-ACK; timestamps give RTT samples on every ACK of new data
+//! and PAWS (`input.rs`). The TS clock is the caller's ms clock plus a
+//! per-address-pair keyed offset (`Open.ts_off`, Linux
+//! secure_tcp_ts_off). SACK is not implemented and never advertised.
+//! Delayed ACKs live in `ack.rs`, Nagle/cork in `output.rs`, keepalive
+//! and the user timeout in `timer.rs`.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use super::ack::Dack;
 use super::cong::Cong;
 use crate::error::KernelError;
 
@@ -82,10 +88,16 @@ impl TcpState {
 
 /// Default send MSS when the peer sends no MSS option (RFC 9293 3.7.1)
 pub const MSS_DEFAULT: u32 = 536;
+/// Smallest send MSS (Linux tcp_min_snd_mss)
+pub const MSS_MIN: u32 = 48;
 /// IPv4 + TCP header bytes (no options) per segment
 pub const HDRS: u32 = 40;
-/// Largest receive window without window scaling
+/// Option bytes of a timestamp on a non-SYN segment (NOP NOP TS)
+pub const TS_LEN: u32 = 12;
+/// Largest window field
 pub const MAX_WINDOW: u32 = 65535;
+/// Largest window scale shift (RFC 7323 2.3)
+pub const MAX_WSCALE: u8 = 14;
 /// RFC 6298 initial RTO, Linux TCP_RTO_MIN / TCP_RTO_MAX (ms)
 pub const RTO_INIT: u64 = 1000;
 pub const RTO_MIN: u64 = 200;
@@ -96,6 +108,9 @@ pub const RTO_FALLBACK: u64 = 3000;
 pub const TIMEWAIT_LEN: u64 = 60_000;
 /// Retransmissions of an orphaned connection (Linux tcp_orphan_retries 0)
 pub const ORPHAN_RETRIES: u32 = 8;
+/// Linux TCP_PAWS_WRAP (INT_MAX / USEC_PER_SEC s): TS.Recent older
+/// than this (ms) is not trusted
+pub const PAWS_WRAP: u64 = (i32::MAX as u64 / 1_000_000) * 1000;
 
 /// Global TCP buffer memory (send + receive queues of all connections;
 /// Linux tcp_mem): past `MEM_LIMIT`, senders wait and receive windows
@@ -116,6 +131,16 @@ pub struct Cfg {
     pub retries2: u32,
     /// FIN_WAIT2 lifetime of an orphan (tcp_fin_timeout, ms)
     pub fin_timeout: u64,
+    /// tcp_window_scaling
+    pub wscale: bool,
+    /// tcp_timestamps (0 off, 1 on with offset, 2 on without offset)
+    pub ts: u8,
+    /// tcp_rmem[2]: the receive space the window scale allows for
+    pub rmem_max: u32,
+    /// tcp_keepalive_time / _intvl (ms), tcp_keepalive_probes
+    pub keepidle: u64,
+    pub keepintvl: u64,
+    pub keepcnt: u32,
 }
 
 impl Default for Cfg {
@@ -125,8 +150,53 @@ impl Default for Cfg {
             synack_retries: 5,
             retries2: 15,
             fin_timeout: 60_000,
+            wscale: true,
+            ts: 1,
+            rmem_max: 6 * 1024 * 1024,
+            keepidle: 7_200_000,
+            keepintvl: 75_000,
+            keepcnt: 9,
         }
     }
+}
+
+/// Per-socket TCP options (IPPROTO_TCP setsockopt, SO_KEEPALIVE),
+/// inherited by a listener's children
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Opts {
+    /// TCP_NODELAY: no Nagle
+    pub nodelay: bool,
+    /// TCP_CORK: only full segments (partial ones after 200 ms)
+    pub cork: bool,
+    /// SO_KEEPALIVE
+    pub keepalive: bool,
+    /// TCP_KEEPIDLE / TCP_KEEPINTVL (s) and TCP_KEEPCNT; 0 = sysctl
+    pub keepidle: u32,
+    pub keepintvl: u32,
+    pub keepcnt: u32,
+    /// TCP_USER_TIMEOUT (ms; 0 = the retry counts decide)
+    pub user_timeout: u32,
+    /// TCP_MAXSEG (0 = none)
+    pub user_mss: u32,
+    /// TCP_SYNCNT (0 = sysctl)
+    pub syncnt: u32,
+    /// TCP_NOTSENT_LOWAT (0 = unlimited)
+    pub notsent_lowat: u32,
+    /// TCP_DEFER_ACCEPT (retransmissions; stored only)
+    pub defer_accept: u8,
+    /// TCP_FASTOPEN queue length (stored only: no TFO)
+    pub fastopen: u32,
+    /// TCP_CONGESTION (index into `cong::ALGOS`)
+    pub ca: usize,
+}
+
+/// Per-connection values for opening (ISN, timestamp offset, our MSS)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Open {
+    pub iss: u32,
+    pub ts_off: u32,
+    /// MSS we advertise: route MTU - 40
+    pub mss: u32,
 }
 
 /// A segment to transmit (header fields + payload; addresses and ports
@@ -137,8 +207,11 @@ pub struct Seg {
     pub ack: u32,
     pub flags: u8,
     pub wnd: u16,
-    /// MSS option (SYN and SYN-ACK)
+    /// MSS and window scale options (SYN and SYN-ACK)
     pub mss: Option<u16>,
+    pub ws: Option<u8>,
+    /// Timestamps option (TSval, TSecr)
+    pub ts: Option<(u32, u32)>,
     pub data: Vec<u8>,
 }
 
@@ -149,13 +222,15 @@ impl Seg {
 }
 
 /// A received segment, already checksummed and parsed
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SegIn<'a> {
     pub seq: u32,
     pub ack: u32,
     pub flags: u8,
     pub wnd: u16,
     pub mss: Option<u16>,
+    pub ws: Option<u8>,
+    pub ts: Option<(u32, u32)>,
     pub data: &'a [u8],
 }
 
@@ -354,6 +429,7 @@ impl Ooo {
 pub struct TcpCb {
     pub state: TcpState,
     pub cfg: Cfg,
+    pub opts: Opts,
 
     // --- send sequence space (RFC 9293 3.3.1) -----------------------------
     pub iss: u32,
@@ -362,6 +438,7 @@ pub struct TcpCb {
     pub snd_nxt: u32,
     /// Highest sequence number sent + 1
     pub snd_max: u32,
+    /// Peer's window in bytes (scaled)
     pub snd_wnd: u32,
     pub(super) snd_wl1: u32,
     pub(super) snd_wl2: u32,
@@ -374,12 +451,16 @@ pub struct TcpCb {
     pub snd_cap: usize,
     /// The user closed the sending side: a FIN follows the queued data
     pub(super) fin_queued: bool,
+    /// End of the last segment shorter than the MSS (Nagle, Minshall)
+    pub(super) snd_sml: u32,
 
     // --- receive sequence space -------------------------------------------
     pub irs: u32,
     pub rcv_nxt: u32,
     /// Right edge of the window last advertised (never moves left)
     pub(super) rcv_adv: u32,
+    /// RCV.NXT when that window was sent (RFC 7323 Last.ACK.sent)
+    pub(super) rcv_wup: u32,
     /// In-order bytes not yet read
     pub(super) rcvq: VecDeque<u8>,
     pub(super) ooo: Ooo,
@@ -387,20 +468,38 @@ pub struct TcpCb {
     pub(super) ooo_fin: Option<u32>,
     /// Receive buffer limit (from SO_RCVBUF)
     pub rcv_cap: usize,
+    /// SO_RCVBUF was set: the window scale follows it (Linux
+    /// SOCK_RCVBUF_LOCK)
+    pub rcv_locked: bool,
     /// No more data will be read (close or SHUT_RD): new data in
     /// FIN_WAIT_1/2 resets the connection (Linux tcp_rcv_state_process)
     pub rcv_shut: bool,
 
+    // --- options (RFC 7323) ------------------------------------------------
+    /// Window scale shifts: the peer's (applied to its window field)
+    /// and ours; 0 unless both SYNs carried the option
+    pub snd_wscale: u8,
+    pub rcv_wscale: u8,
+    pub wscale_ok: bool,
+    /// Timestamps negotiated
+    pub ts_ok: bool,
+    /// TSval = clock + ts_off
+    pub(super) ts_off: u32,
+    /// TS.Recent and the clock when it was stored
+    pub(super) ts_recent: u32,
+    pub(super) ts_stamp: u64,
+    /// Latest clock value seen (ms; stamps segments built without `now`)
+    pub(super) clock: u64,
+
     // --- segment sizes ----------------------------------------------------
-    /// Send MSS: min(peer's MSS option, path MTU - 40, TCP_MAXSEG)
+    /// Send MSS: payload per segment (min(peer's MSS option, path MTU -
+    /// 40, TCP_MAXSEG) less option bytes)
     pub mss: u32,
     pub(super) peer_mss: u32,
     /// Path MTU - 40 (route, then ICMP frag needed)
     pub(super) path_mss: u32,
     /// MSS we advertise (our device MTU - 40)
     pub adv_mss: u32,
-    /// TCP_MAXSEG (0 = none)
-    pub user_mss: u32,
 
     // --- timers and RTT (RFC 6298) ----------------------------------------
     pub(super) srtt8: u64,
@@ -408,7 +507,7 @@ pub struct TcpCb {
     pub(super) rto: u64,
     /// Consecutive timeouts / probes (exponential backoff)
     pub(super) backoff: u32,
-    /// Zero-window probes without an answer
+    /// Zero-window or keepalive probes without an answer
     pub(super) probes: u32,
     /// Karn: (sequence that must be acknowledged, send time)
     pub(super) rtt_seq: Option<(u32, u64)>,
@@ -416,18 +515,48 @@ pub struct TcpCb {
     pub(super) tmr: Option<(Tmr, u64)>,
     /// TIME_WAIT 2MSL or orphan FIN_WAIT_2 deadline
     pub(super) wait_at: Option<u64>,
+    /// Keepalive deadline
+    pub(super) keep_at: Option<u64>,
+    /// When the oldest unacknowledged data was (about) first sent, once
+    /// retransmitting or probing (Linux retrans_stamp; TCP_USER_TIMEOUT)
+    pub(super) rtx_stamp: Option<u64>,
+    /// Last ACK received / last data sent (keepalive, cwnd restart)
+    pub(super) rcv_tstamp: u64,
+    pub(super) lsndtime: u64,
 
     pub(super) cong: Cong,
+    /// Delayed ACK state
+    pub(super) dack: Dack,
 
     // --- misc -------------------------------------------------------------
     /// Closed by the user (no file refers to it any more)
     pub orphan: bool,
     /// Last ICMP error, reported if the connection times out
     pub soft_err: Option<KernelError>,
-    /// An ACK must go out (pure ACK if no data segment carries it)
+    /// An ACK must go out now (pure ACK if no data segment carries it)
     pub(super) ack_now: bool,
+    /// Counters (TCP_INFO)
+    pub(super) stats: Stats,
     /// Bytes charged to the global TCP memory
     charged: usize,
+}
+
+/// Counters for TCP_INFO
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stats {
+    pub total_retrans: u32,
+    pub segs_out: u32,
+    pub segs_in: u32,
+    pub data_segs_out: u32,
+    pub data_segs_in: u32,
+    pub bytes_acked: u64,
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_retrans: u64,
+    pub last_data_recv: u64,
+    pub rto_count: u32,
+    /// Smallest RTT sample (ms)
+    pub min_rtt: Option<u64>,
 }
 
 impl TcpCb {
@@ -436,6 +565,7 @@ impl TcpCb {
         Self {
             state: TcpState::Closed,
             cfg,
+            opts: Opts::default(),
             iss: 0,
             snd_una: 0,
             snd_nxt: 0,
@@ -448,19 +578,29 @@ impl TcpCb {
             sndq_seq: 0,
             snd_cap: 64 * 1024,
             fin_queued: false,
+            snd_sml: 0,
             irs: 0,
             rcv_nxt: 0,
             rcv_adv: 0,
+            rcv_wup: 0,
             rcvq: VecDeque::new(),
             ooo: Ooo::default(),
             ooo_fin: None,
             rcv_cap: 64 * 1024,
+            rcv_locked: false,
             rcv_shut: false,
+            snd_wscale: 0,
+            rcv_wscale: 0,
+            wscale_ok: false,
+            ts_ok: false,
+            ts_off: 0,
+            ts_recent: 0,
+            ts_stamp: 0,
+            clock: 0,
             mss: MSS_DEFAULT,
             peer_mss: MSS_DEFAULT,
             path_mss: 65495,
             adv_mss: MSS_DEFAULT,
-            user_mss: 0,
             srtt8: 0,
             rttvar4: 0,
             rto: RTO_INIT,
@@ -470,87 +610,148 @@ impl TcpCb {
             syn_rtx: false,
             tmr: None,
             wait_at: None,
+            keep_at: None,
+            rtx_stamp: None,
+            rcv_tstamp: 0,
+            lsndtime: 0,
             cong: Cong::default(),
+            dack: Dack::default(),
             orphan: false,
             soft_err: None,
             ack_now: false,
+            stats: Stats::default(),
             charged: 0,
         }
     }
 
-    /// Active open (Linux tcp_connect): send SYN with initial sequence
-    /// `iss`; `mss` is what we advertise (route MTU - 40)
-    pub fn connect(&mut self, iss: u32, mss: u32, now: u64, out: &mut Out) {
-        self.iss = iss;
-        self.snd_una = iss;
-        self.snd_nxt = iss.wrapping_add(1);
+    /// Advance the clock (every entry point with a time calls this)
+    pub(super) fn tick(&mut self, now: u64) {
+        self.clock = self.clock.max(now);
+    }
+
+    /// Our current TSval
+    pub(super) fn tsval(&self) -> u32 {
+        (self.clock as u32).wrapping_add(self.ts_off)
+    }
+
+    /// Common setup of both opens
+    fn open(&mut self, o: &Open, now: u64) {
+        self.tick(now);
+        self.iss = o.iss;
+        self.snd_una = o.iss;
+        self.snd_nxt = o.iss.wrapping_add(1);
         self.snd_max = self.snd_nxt;
         self.sndq_seq = self.snd_nxt;
-        self.set_adv_mss(mss);
-        self.state = TcpState::SynSent;
+        self.ts_off = if self.cfg.ts == 1 { o.ts_off } else { 0 };
+        self.cong.set_algo(self.opts.ca);
+        self.set_adv_mss(o.mss);
         self.rtt_seq = Some((self.snd_nxt, now));
+        self.rcv_tstamp = now;
+        self.lsndtime = now;
+    }
+
+    /// Active open (Linux tcp_connect): send SYN with our MSS, window
+    /// scale and timestamp options as the sysctls allow
+    pub fn connect(&mut self, o: Open, now: u64, out: &mut Out) {
+        self.open(&o, now);
+        self.wscale_ok = self.cfg.wscale;
+        self.rcv_wscale = if self.wscale_ok {
+            self.pick_wscale()
+        } else {
+            0
+        };
+        self.ts_ok = self.cfg.ts != 0;
+        self.state = TcpState::SynSent;
         out.segs.push(self.syn_seg());
         self.arm_rtx(now);
     }
 
-    /// Passive open: a child for a listener's SYN `syn`, in SYN_RECEIVED
-    /// with its SYN-ACK queued (Linux tcp_conn_request +
-    /// tcp_create_openreq_child); `bufs` = (receive, send) limits
-    pub fn passive(
-        cfg: Cfg,
-        syn: &SegIn,
-        iss: u32,
-        mss: u32,
-        bufs: (usize, usize),
-        now: u64,
-        out: &mut Out,
-    ) -> Self {
-        let mut cb = Self::new(cfg);
-        (cb.rcv_cap, cb.snd_cap) = bufs;
-        cb.iss = iss;
-        cb.snd_una = iss;
-        cb.snd_nxt = iss.wrapping_add(1);
-        cb.snd_max = cb.snd_nxt;
-        cb.sndq_seq = cb.snd_nxt;
-        cb.set_adv_mss(mss);
-        cb.syn_rcvd(syn);
-        cb.state = TcpState::SynReceived;
-        cb.rtt_seq = Some((cb.snd_nxt, now));
-        out.segs.push(cb.syn_seg());
-        cb.arm_rtx(now);
-        cb
+    /// Passive open: become a listener's child for its SYN `syn`, in
+    /// SYN_RECEIVED with the SYN-ACK queued (Linux tcp_conn_request +
+    /// tcp_create_openreq_child); options are those of the SYN that the
+    /// sysctls allow
+    pub fn passive(&mut self, syn: &SegIn, o: Open, now: u64, out: &mut Out) {
+        self.open(&o, now);
+        self.wscale_ok = self.cfg.wscale && syn.ws.is_some();
+        self.ts_ok = self.cfg.ts != 0 && syn.ts.is_some();
+        self.syn_rcvd(syn, now);
+        self.state = TcpState::SynReceived;
+        out.segs.push(self.syn_seg());
+        self.arm_rtx(now);
     }
 
-    /// Record the peer's SYN: IRS, window, MSS option
-    pub(super) fn syn_rcvd(&mut self, s: &SegIn) {
+    /// Record the peer's SYN: IRS, window, options (`wscale_ok` and
+    /// `ts_ok` hold what we offered or accept)
+    pub(super) fn syn_rcvd(&mut self, s: &SegIn, now: u64) {
         self.irs = s.seq;
         self.rcv_nxt = s.seq.wrapping_add(1);
         self.rcv_adv = self.rcv_nxt;
+        self.rcv_wup = self.rcv_nxt;
         self.snd_wnd = s.wnd as u32;
         self.max_wnd = self.snd_wnd;
         self.snd_wl1 = s.seq;
         self.snd_wl2 = s.ack;
         self.peer_mss = s.mss.map_or(MSS_DEFAULT, |m| (m as u32).max(64));
+        match s.ws {
+            Some(w) if self.wscale_ok => {
+                self.snd_wscale = w.min(MAX_WSCALE);
+                if self.state != TcpState::SynSent {
+                    self.rcv_wscale = self.pick_wscale();
+                }
+            }
+            _ => {
+                self.wscale_ok = false;
+                self.snd_wscale = 0;
+                self.rcv_wscale = 0;
+            }
+        }
+        match s.ts {
+            Some((v, _)) if self.ts_ok => {
+                self.ts_recent = v;
+                self.ts_stamp = now;
+            }
+            _ => self.ts_ok = false,
+        }
         self.update_mss();
+        self.dack
+            .init(self.adv_mss.min(self.mss), self.rcv_cap as u32);
+    }
+
+    /// Our window scale (Linux tcp_select_initial_window): enough for
+    /// tcp_rmem[2] (or the SO_RCVBUF-fixed buffer) in a 16-bit field
+    fn pick_wscale(&self) -> u8 {
+        let space = if self.rcv_locked {
+            self.rcv_cap as u32
+        } else {
+            (self.rcv_cap as u32).max(self.cfg.rmem_max)
+        };
+        let log = 31 - space.max(1).leading_zeros();
+        log.saturating_sub(15).min(MAX_WSCALE as u32) as u8
     }
 
     /// Our MSS from the route (device MTU - 40); also the path limit
     fn set_adv_mss(&mut self, mss: u32) {
         self.path_mss = mss.clamp(64, 65495);
         self.adv_mss = self.path_mss;
-        if self.user_mss != 0 {
-            self.adv_mss = self.adv_mss.min(self.user_mss);
+        if self.opts.user_mss != 0 {
+            self.adv_mss = self.adv_mss.min(self.opts.user_mss);
         }
         self.update_mss();
     }
 
-    /// Recompute the send MSS
+    /// Option bytes on every non-SYN segment
+    pub(super) fn opt_len(&self) -> u32 {
+        if self.ts_ok { TS_LEN } else { 0 }
+    }
+
+    /// Recompute the send MSS (Linux tcp_sync_mss: the peer's and the
+    /// user's clamp, then the option bytes come off)
     pub(super) fn update_mss(&mut self) {
         let mut m = self.peer_mss.min(self.path_mss);
-        if self.user_mss != 0 {
-            m = m.min(self.user_mss);
+        if self.opts.user_mss != 0 {
+            m = m.min(self.opts.user_mss);
         }
-        self.mss = m.max(64);
+        self.mss = m.saturating_sub(self.opt_len()).max(MSS_MIN);
         self.cong.set_mss(self.mss);
     }
 
@@ -559,12 +760,13 @@ impl TcpCb {
     /// tcp_v4_mtu_reduced -> tcp_simple_retransmit)
     pub fn pmtu(&mut self, mtu: u32, now: u64, out: &mut Out) {
         let m = mtu.saturating_sub(HDRS).max(68);
-        if m >= self.mss {
+        if m >= self.path_mss {
             return;
         }
+        let old = self.mss;
         self.path_mss = m;
         self.update_mss();
-        if self.state.synced() && self.snd_nxt != self.snd_una {
+        if self.mss < old && self.state.synced() && self.snd_nxt != self.snd_una {
             self.snd_nxt = self.snd_una;
             self.rtt_seq = None;
             self.output(now, out);
@@ -582,8 +784,13 @@ impl TcpCb {
         n
     }
 
-    /// Room in the send queue
+    /// Room in the send queue (none while TCP_NOTSENT_LOWAT unsent
+    /// bytes wait, Linux sk_stream_memory_free)
     pub fn snd_space(&self) -> usize {
+        let lowat = self.opts.notsent_lowat as usize;
+        if lowat != 0 && self.unsent() >= lowat {
+            return 0;
+        }
         self.snd_cap.saturating_sub(self.sndq.len()).min(mem_free())
     }
 
@@ -602,10 +809,14 @@ impl TcpCb {
     }
 
     /// Linux sk_stream_is_writeable: free space is at least half of what
-    /// is queued
+    /// is queued, and fewer unsent bytes than TCP_NOTSENT_LOWAT
     pub fn writable(&self) -> bool {
         let free = self.snd_cap.saturating_sub(self.sndq.len());
-        free > 0 && free * 2 >= self.sndq.len() && mem_free() > 0
+        let lowat = self.opts.notsent_lowat;
+        free > 0
+            && free * 2 >= self.sndq.len()
+            && mem_free() > 0
+            && (lowat == 0 || self.unsent() < lowat as usize)
     }
 
     /// Bytes readable
@@ -638,13 +849,22 @@ impl TcpCb {
         n
     }
 
-    /// After reading: advertise a window that doubled (or opened from
-    /// zero) right away
+    /// After reading (Linux tcp_cleanup_rbuf): send an owed ACK when
+    /// more than a segment is unacknowledged or the reader emptied the
+    /// queue after a small segment; advertise a window that doubled (or
+    /// opened from zero) right away
     fn cleanup_rbuf(&mut self, out: &mut Out) {
         if !matches!(
             self.state,
             TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
         ) {
+            return;
+        }
+        if self.dack.pending
+            && (self.rcv_nxt.wrapping_sub(self.rcv_wup) > self.dack.rcv_mss
+                || (self.dack.pushed && !self.dack.pingpong && self.rcvq.is_empty()))
+        {
+            self.send_ack(out);
             return;
         }
         let cur = self.rcv_wnd();
@@ -732,8 +952,7 @@ impl TcpCb {
         self.state = TcpState::Closed;
         self.sndq.clear();
         self.ooo = Ooo::default();
-        self.tmr = None;
-        self.wait_at = None;
+        self.stop_timers();
         self.charge();
         out.shut |= SHUTDOWN_MASK;
         out.wake = true;
@@ -743,7 +962,7 @@ impl TcpCb {
     /// Entering TIME_WAIT (2MSL); the glue hands it to a timewait entry
     pub(super) fn time_wait(&mut self, now: u64, out: &mut Out) {
         self.state = TcpState::TimeWait;
-        self.tmr = None;
+        self.stop_timers();
         self.sndq.clear();
         self.charge();
         self.wait_at = Some(now + TIMEWAIT_LEN);
@@ -769,19 +988,38 @@ impl TcpCb {
         t.irs = self.irs;
         t.rcv_nxt = self.rcv_nxt;
         t.rcv_adv = self.rcv_adv;
+        t.rcv_wup = self.rcv_wup;
         t.rcv_cap = self.rcv_cap;
+        t.snd_wscale = self.snd_wscale;
+        t.rcv_wscale = self.rcv_wscale;
+        t.ts_ok = self.ts_ok;
+        t.ts_off = self.ts_off;
+        t.ts_recent = self.ts_recent;
+        t.ts_stamp = self.ts_stamp;
+        t.clock = self.clock;
         t.mss = self.mss;
         t.adv_mss = self.adv_mss;
         t.wait_at = self.wait_at;
         t
     }
 
+    /// A SYN may reopen this TIME_WAIT tuple (Linux
+    /// tcp_timewait_state_process TCP_TW_SYN): beyond RCV.NXT, or with a
+    /// newer timestamp
+    pub fn tw_syn_ok(&self, s: &SegIn) -> bool {
+        s.has(flags::SYN)
+            && !s.has(flags::ACK | flags::RST)
+            && (after(s.seq, self.rcv_nxt)
+                || (self.ts_ok
+                    && s.ts
+                        .is_some_and(|(v, _)| (v.wrapping_sub(self.ts_recent) as i32) > 0)))
+    }
+
     /// The socket's side after handing TIME_WAIT over: CLOSED, readable
     /// data kept
     pub fn tw_done(&mut self, out: &mut Out) {
         self.state = TcpState::Closed;
-        self.tmr = None;
-        self.wait_at = None;
+        self.stop_timers();
         out.shut |= SHUTDOWN_MASK;
         out.wake = true;
     }
@@ -795,9 +1033,10 @@ impl TcpCb {
 
     // --- receive window ----------------------------------------------------
 
-    /// Window space for the receive buffer (Linux tcp_full_space)
+    /// Window space for the receive buffer (Linux tcp_full_space), up
+    /// to what the window field can express
     pub(super) fn full_space(&self) -> u32 {
-        (self.rcv_cap as u32).clamp(1, MAX_WINDOW)
+        (self.rcv_cap as u32).clamp(1, MAX_WINDOW << self.rcv_wscale)
     }
 
     /// Unused receive space (Linux tcp_space), also bounded by the
@@ -817,14 +1056,23 @@ impl TcpCb {
         }
     }
 
-    /// Window we would offer now (Linux __tcp_select_window without
-    /// scaling): receiver SWS avoidance, multiples of the MSS
-    fn window_now(&self) -> u32 {
+    /// Window we would offer now (Linux __tcp_select_window): receiver
+    /// SWS avoidance; without scaling in multiples of the MSS, with
+    /// scaling rounded up to the scale unit
+    pub(super) fn window_now(&mut self) -> u32 {
         let full = self.full_space();
         let mss = self.adv_mss.min(full);
-        let free = self.free_space();
-        if free < full / 2 && (free < full / 16 || free < mss) {
-            return 0;
+        let unit = 1u32 << self.rcv_wscale;
+        let mut free = self.free_space();
+        if free < full / 2 {
+            self.dack.quick = 0;
+            free = free / unit * unit;
+            if free < full / 16 || free < mss {
+                return 0;
+            }
+        }
+        if self.rcv_wscale != 0 {
+            return free.div_ceil(unit) * unit;
         }
         let cur = self.rcv_wnd();
         if cur + mss <= free || cur > free {
@@ -836,12 +1084,39 @@ impl TcpCb {
         }
     }
 
-    /// Window field for a segment; the offered right edge never moves
-    /// left (Linux tcp_select_window)
+    /// Window field for a segment (Linux tcp_select_window): the offered
+    /// right edge never moves left (a scaled window rounds up to its
+    /// unit); records Last.ACK.sent
     pub(super) fn select_window(&mut self) -> u16 {
-        let w = self.window_now().max(self.rcv_wnd()).min(MAX_WINDOW);
+        let unit = 1u32 << self.rcv_wscale;
+        let cur = self.rcv_wnd();
+        let mut w = self.window_now();
+        if w < cur {
+            w = cur.div_ceil(unit) * unit;
+        }
+        let w = w.min(MAX_WINDOW << self.rcv_wscale);
         self.rcv_adv = self.rcv_nxt.wrapping_add(w);
+        self.rcv_wup = self.rcv_nxt;
+        (w >> self.rcv_wscale) as u16
+    }
+
+    /// Window field of a SYN or SYN-ACK: never scaled (RFC 7323 2.2)
+    pub(super) fn syn_window(&mut self) -> u16 {
+        let w = self.full_space().min(MAX_WINDOW);
+        if self.state == TcpState::SynReceived {
+            self.rcv_adv = self.rcv_nxt.wrapping_add(w);
+            self.rcv_wup = self.rcv_nxt;
+        }
         w as u16
+    }
+
+    /// The peer's window field of `s` in bytes
+    pub(super) fn seg_wnd(&self, s: &SegIn) -> u32 {
+        if s.has(flags::SYN) {
+            s.wnd as u32
+        } else {
+            (s.wnd as u32) << self.snd_wscale
+        }
     }
 
     // --- memory ------------------------------------------------------------
@@ -861,10 +1136,23 @@ impl TcpCb {
 
     /// Earliest deadline the caller must call `on_timer` at
     pub fn next_timer(&self) -> Option<u64> {
-        match (self.tmr.map(|t| t.1), self.wait_at) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [
+            self.tmr.map(|t| t.1),
+            self.wait_at,
+            self.dack.at,
+            self.keep_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Cancel every timer
+    pub(super) fn stop_timers(&mut self) {
+        self.tmr = None;
+        self.wait_at = None;
+        self.dack.at = None;
+        self.keep_at = None;
     }
 }
 
