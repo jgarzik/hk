@@ -213,6 +213,9 @@ impl KernelThreadContext {
     }
 }
 
+/// Spare run-queue slots per priority beyond the CPU's task count
+const RQ_SLACK: usize = 16;
+
 /// Per-CPU run queue
 ///
 /// Each CPU has one of these. The run queue is protected by an IRQ-safe
@@ -293,10 +296,32 @@ impl CpuRunQueue {
             .map(|(_, c)| c)
     }
 
-    /// Add a new task (not yet runnable)
+    /// Add a new task (not yet runnable; thread context)
     fn add_task(&mut self, tid: Tid, ctx: KernelThreadContext) {
         self.contexts.push((tid, ctx));
         self.nr_running += 1;
+        for p in self.priorities() {
+            self.reserve_prio(p);
+        }
+    }
+
+    /// Priorities this CPU's tasks use (few distinct values)
+    fn priorities(&self) -> Vec<Priority> {
+        let mut v: Vec<Priority> = Vec::new();
+        for (_, c) in &self.contexts {
+            if !v.contains(&c.priority) {
+                v.push(c.priority);
+            }
+        }
+        v
+    }
+
+    /// Room for every task of this CPU (plus slack for stale entries of
+    /// exited tasks) in the queue of `prio`: IRQ-context wakeups enqueue
+    /// without allocating (each task is queued at most once)
+    fn reserve_prio(&mut self, prio: Priority) {
+        let n = self.contexts.len() + RQ_SLACK;
+        self.queue().reserve(prio, n);
     }
 
     /// Put `tid` on the priority queue unless it is current or already queued
@@ -378,8 +403,11 @@ impl CpuRunQueue {
 pub struct PerCpuScheduler {
     /// IRQ-safe lock protecting the run queue (owner CPU only)
     pub lock: IrqSpinlock<CpuRunQueue>,
-    /// Remote wakeups for tasks owned by this CPU. Leaf lock: nothing is
-    /// acquired while holding it; nests inside `lock` when drained.
+    /// Remote wakeups for tasks owned by this CPU, at most one entry
+    /// per task (`post_wake` merges), with capacity reserved for all of
+    /// them when a task is added: posting never allocates (IRQ
+    /// context). Leaf lock: nothing is acquired while holding it; nests
+    /// inside `lock` when drained.
     wake_list: IrqSpinlock<Vec<(Tid, WakeMode)>>,
     /// Whether this CPU's scheduler is initialized
     pub initialized: AtomicBool,
@@ -399,11 +427,36 @@ impl PerCpuScheduler {
         }
     }
 
-    /// Apply wakeups posted by other CPUs (caller holds `self.lock`)
+    /// Apply wakeups posted by other CPUs (caller holds `self.lock`);
+    /// the list keeps its capacity
     fn drain_wakes(&self, rq: &mut CpuRunQueue) {
-        let pending = core::mem::take(&mut *self.wake_list.lock());
-        for (tid, mode) in pending {
+        let mut list = self.wake_list.lock();
+        for (tid, mode) in list.drain(..) {
             rq.try_wake(tid, mode);
+        }
+    }
+
+    /// Post a remote wakeup without allocating: a task already listed
+    /// keeps one entry (`Any` wins over `Interruptible`)
+    fn post_wake(&self, tid: Tid, mode: WakeMode) {
+        let mut list = self.wake_list.lock();
+        if let Some(e) = list.iter_mut().find(|e| e.0 == tid) {
+            if mode == WakeMode::Any {
+                e.1 = WakeMode::Any;
+            }
+            return;
+        }
+        debug_assert!(list.len() < list.capacity(), "wake_list would allocate");
+        list.push((tid, mode));
+    }
+
+    /// Room in `wake_list` for each of the CPU's `n` tasks (thread
+    /// context, after adding a task)
+    fn reserve_wakes(&self, n: usize) {
+        let mut list = self.wake_list.lock();
+        if list.capacity() < n + RQ_SLACK {
+            let extra = n + RQ_SLACK - list.len();
+            list.reserve(extra);
         }
     }
 }
@@ -618,6 +671,7 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
     let mut rq = sched.lock.lock();
     rq.init();
     rq.add_task(tid, thread_ctx);
+    sched.reserve_wakes(rq.contexts.len());
     if !start_asleep {
         rq.enqueue_task(tid);
     }
@@ -832,6 +886,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
     {
         let mut rq = sched.lock.lock();
         rq.add_task(config.tid, thread_ctx);
+        sched.reserve_wakes(rq.contexts.len());
         rq.current = Some(config.tid); // Mark as currently running
     }
 
@@ -1516,6 +1571,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     {
         let mut rq = sched.lock.lock();
         rq.add_task(child_tid, thread_ctx);
+        sched.reserve_wakes(rq.contexts.len());
         rq.enqueue_task(child_tid);
     }
 
@@ -1925,7 +1981,7 @@ pub fn wake_up_task(tid: Tid, cpu: u32, mode: WakeMode) -> bool {
         let mut rq = target.lock.lock();
         rq.try_wake(tid, mode)
     } else {
-        target.wake_list.lock().push((tid, mode));
+        target.post_wake(tid, mode);
         true
     }
 }
@@ -2158,13 +2214,18 @@ pub fn yield_now() {
             .map(|t| t.priority)
             .unwrap_or(128)
     };
-    match rq.entry_mut(cur) {
+    let changed = match rq.entry_mut(cur) {
         Some(e) => {
             e.state = SleepState::Running;
+            let changed = e.priority != priority;
             e.priority = priority;
             e.queued = true;
+            changed
         }
         None => return,
+    };
+    if changed {
+        rq.reserve_prio(priority);
     }
     rq.queue().enqueue(cur, priority);
 

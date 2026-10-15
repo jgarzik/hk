@@ -323,7 +323,9 @@ pub needs_reschedule: AtomicBool, // Reschedule request flag
 1. **Each CPU only locks its own run queue** - no CPU ever takes another
    CPU's `PerCpuScheduler.lock`. A wakeup for a task owned by another CPU is
    posted to that CPU's `wake_list` (an `IrqSpinlock<Vec<(Tid, WakeMode)>>`,
-   a leaf lock) and applied by the owner, under its rq lock, at its next
+   a leaf lock; one merged entry per task, capacity reserved for all the
+   CPU's tasks when one is added, so posting never allocates) and applied
+   by the owner, under its rq lock, at its next
    `schedule()`/`yield_now()`/tick (Linux ttwu_queue). Tasks never migrate:
    `Task.cpu` names the owning run queue.
 
@@ -1142,7 +1144,7 @@ consistency. The struct-level locking pattern matches Linux's approach.
 Linux-style wait queues (`include/linux/wait.h`, `kernel/sched/wait.c`).
 
 ```rust
-pub struct WaitQueue { head: IrqSpinlock<Vec<WaitQueueEntry>> } // leaf lock
+pub struct WaitQueue { head: IrqSpinlock<Vec<WaitQueueEntry>> } // -> rq lock / wake_list
 
 // Sleeper side (process context, no spinlocks held)
 wq.wait_event(|| cond);                                  // uninterruptible
@@ -1156,10 +1158,15 @@ wq.wait_event_interruptible_timeout(|| cond, ticks)?;    // Ok(left) / Err
 wq.wake_one(); wq.wake_all();
 ```
 
-- **IRQ class:** the head lock is an `IrqSpinlock` and a leaf: entries are
-  collected under it, the lock is dropped, then tasks are woken
-  (`wake_up_task`: own rq lock or the target's `wake_list`). Wakers never
-  take `TASK_TABLE`, so `wake_*` is safe from IRQ handlers.
+- **IRQ class:** the head lock is an `IrqSpinlock`; like Linux
+  `__wake_up_common`, tasks are woken under it (`wake_up_task`: this
+  CPU's rq lock or the target's `wake_list`), so the order is head -> rq
+  lock / `wake_list` and nothing else nests inside it. Wakers never take
+  `TASK_TABLE` and never allocate (no waiter list is collected; the run
+  queues and `wake_list` have capacity reserved in thread context when a
+  task is added or changes priority), so `wake_*` is safe from IRQ
+  handlers. Registration (`prepare_to_wait`) pushes under the head lock
+  in thread context only.
 - **No lost wakeups:** the sleeper registers and sets its state before
   re-checking the condition (see 3.1 Sleep / Wakeup Protocol). Wakers must
   make the condition true before calling `wake_*`.
@@ -2200,12 +2207,15 @@ percpu::preempt_enable();   // preempt_count--
 
 - Timer tick updates (atomic only)
 - Wake sleepers (IrqSpinlock only, per-CPU only)
-- `WaitQueue::wake_one/wake_all` and `wake_up_task` (IrqSpinlocks only)
+- `WaitQueue::wake_one/wake_all` and `wake_up_task` (IrqSpinlocks only,
+  no allocation: wakes run under the head lock, run queues and remote
+  `wake_list`s have reserved capacity)
 - `timer::check_timers()` (CPU 0 tick): peeks `TIMERS` (IrqSpinlock) and
   wakes `ktimerd`; timer callbacks themselves run in `ktimerd`, process
   context (they may send signals, take Mutexes, allocate)
 - `napi_schedule()` (NIC ISRs): `Softnet.poll_list` IrqSpinlock push
-  (pre-reserved, no allocation) and a wake of `softnet/N`
+  (pre-reserved, no allocation) and a wake of `softnet/N` (allocation-free
+  as above); a no-op while the NAPI is scheduled or disabled
 - Workqueues have no IRQ-side work: the worker thread promotes expired
   delayed work itself, sleeping with a timeout until the next deadline
 - Set reschedule flags (atomic)
