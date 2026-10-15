@@ -27,6 +27,27 @@ pub struct Ctl {
     /// Validate and store a value (as many integers as `show` returns;
     /// ones the writer left out are the current values)
     pub store: fn(&[i64]) -> Result<(), KernelError>,
+    /// A string value instead (Linux proc_dostring users such as
+    /// tcp_congestion_control): show, and store of the trimmed text
+    pub text: Option<Text>,
+}
+
+/// Show / store of a string sysctl
+pub struct Text {
+    pub show: fn() -> String,
+    pub store: fn(&str) -> Result<(), KernelError>,
+}
+
+/// Current text of `ctl`
+pub fn read(ctl: &Ctl) -> Vec<u8> {
+    match &ctl.text {
+        Some(t) => {
+            let mut s = (t.show)();
+            s.push('\n');
+            s.into_bytes()
+        }
+        None => format(&(ctl.show)()),
+    }
 }
 
 /// All tables, mounted under /proc/sys
@@ -71,6 +92,11 @@ pub fn parse(buf: &[u8], cur: &[i64]) -> Result<Vec<i64>, KernelError> {
 /// Write `buf` at file offset `pos` to `ctl`; returns bytes consumed
 pub fn write(ctl: &Ctl, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
     if pos != 0 {
+        return Ok(buf.len());
+    }
+    if let Some(t) = &ctl.text {
+        let s = core::str::from_utf8(buf).map_err(|_| KernelError::InvalidArgument)?;
+        (t.store)(s.trim_end_matches('\0').trim())?;
         return Ok(buf.len());
     }
     let v = parse(buf, &(ctl.show)())?;

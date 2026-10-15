@@ -266,7 +266,7 @@ impl ProcfsInodeData {
     pub fn generate(&self) -> Option<Vec<u8>> {
         match self {
             Self::File { generator } => Some(generator()),
-            Self::Sysctl { ctl } => Some(crate::sysctl::format(&(ctl.show)())),
+            Self::Sysctl { ctl } => Some(crate::sysctl::read(ctl)),
             _ => None,
         }
     }
@@ -446,7 +446,7 @@ impl InodeOps for ProcfsInodeOps {
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
             ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
-            ProcfsInodeData::Sysctl { ctl } => crate::sysctl::format(&(ctl.show)()),
+            ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
             ProcfsInodeData::FdSymlink { .. } | ProcfsInodeData::SelfLink => {
                 // Symlinks don't have content, readlink() handles them
                 return Err(KernelError::Io);
@@ -907,7 +907,7 @@ impl FileOps for ProcfsFileOps {
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
             ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
-            ProcfsInodeData::Sysctl { ctl } => crate::sysctl::format(&(ctl.show)()),
+            ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
             ProcfsInodeData::FdSymlink { .. } | ProcfsInodeData::SelfLink => {
                 return Err(KernelError::Io);
             }
@@ -950,7 +950,7 @@ impl FileOps for ProcfsFileOps {
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
             ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
-            ProcfsInodeData::Sysctl { ctl } => crate::sysctl::format(&(ctl.show)()),
+            ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
             ProcfsInodeData::FdSymlink { .. } | ProcfsInodeData::SelfLink => {
                 return Err(KernelError::Io);
             }
