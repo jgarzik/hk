@@ -26,7 +26,7 @@
 //! Device core (core/dev.rs: netif_receive_skb, NAPI, softnet/N threads)
 //!         |
 //!         v
-//! Device Driver (driver/e1000.rs; loopback in ns/net.rs)
+//! Device Driver (driver/{virtio_net,e1000}.rs; loopback in ns/net.rs)
 //!         |
 //!         v
 //! Hardware (Intel 82540EM via PCI)

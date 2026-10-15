@@ -1837,6 +1837,9 @@ do not rely on that.
 | e1000 `rx` ring | `spin::Mutex` | thread only (NAPI poll) | leaf; frames are delivered after it is dropped |
 | e1000 `tx` ring | `spin::Mutex` | thread only (xmit, poll reclaim) | leaf; ring full -> drop, `tx_dropped`, ENOBUFS |
 | e1000 `pending_icr`, irq counters | atomics | IRQ + thread | ISR ORs ICR causes in; poll swaps them out |
+| virtio-net `rx` queue (`net/driver/virtio_net.rs`) | `spin::Mutex` | thread only (NAPI poll, open) | leaf: virtqueue + bounce buffers; frames are delivered after it is dropped |
+| virtio-net `tx` queue | `spin::Mutex` | thread only (xmit, poll reclaim) | leaf; one descriptor per frame; ring full -> drop, `tx_dropped`, ENOBUFS |
+| virtio-net `opened`, `config_pending`; `VringCb` (RX avail NO_INTERRUPT flag) | atomics / lock-free MMIO-style store | IRQ + thread | the ISR suppresses RX interrupts and flags config changes; the poll re-enables under `rx` |
 | virtio-PCI transport (`virtio/pci.rs`) | none | probe (single-threaded enumeration), then IRQ (ISR byte) | common config written only during probe; device config reads are generation-checked and lock-free; queue notify writes happen under the caller's queue lock |
 | `virtio::DRIVERS` | `spin::Mutex<Vec>` | thread only (boot) | leaf; registered before bus enumeration, read by the PCI match/probe |
 
@@ -1865,7 +1868,7 @@ NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
   (AF_PACKET taps, from any receive or transmit path: PacketTable.socks,
    then PacketSock.filter / PacketSock.rxq, each a leaf;
    RTNL -> PacketSock.mclist)
-  -> device TX lock (e1000 tx)
+  -> device TX lock (e1000 tx, virtio-net tx)
   -> Softnet.backlog (lo xmit)           Softnet.poll_list / WaitQueue / rq
                                           (IrqSpinlocks, innermost)
 ```
@@ -1899,6 +1902,19 @@ copying them out of coherent bounce buffers, and when it did less than its
 budget calls `napi_complete_done` and rewrites IMS (a cause latched while
 masked fires then). If its own ISR consumed causes during the poll (shared
 line), it reschedules itself.
+
+**virtio-net** follows the same shape over the virtio transport: the
+transport ISR reads the ISR status byte (read-to-clear; 0 => not ours),
+and calls the driver's lock-free callbacks: a queue interrupt sets the RX
+avail ring's NO_INTERRUPT flag (Linux virtqueue_disable_cb from
+vring_interrupt) and `napi_schedule`s; a config interrupt sets
+`config_pending` and schedules. The poll handles the link, reclaims TX,
+receives and reposts RX buffers, and under budget calls
+`napi_complete_done`, then (only while the interface is open) clears
+NO_INTERRUPT under `rx` and re-checks the used ring and `config_pending`:
+work that arrived meanwhile makes it suppress again and reschedule
+(Linux virtqueue_napi_complete). The ISR's flag store and the poll's
+clear can race; either order leaves NAPI scheduled or the flag clear.
 
 Sockets block only in `Sock::wait` (`wait_event_interruptible_timeout`
 on `Sock.wq`) with no lock held; receive paths make the condition true

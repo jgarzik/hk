@@ -874,6 +874,8 @@ fn kmain() -> ! {
     // Register PCI drivers
     bus_manager.register_driver("pci", Box::new(XhciPciDriver));
     bus_manager.register_driver("pci", Box::new(E1000PciDriver));
+    bus_manager.register_driver("pci", Box::new(crate::virtio::VirtioPciDriver));
+    crate::virtio::register_driver(&crate::net::driver::virtio_net::VIRTIO_NET);
 
     // Register USB drivers (queued until USB bus is created by xHCI)
     bus_manager.register_driver("usb", Box::new(UsbSerialBusDriver));
