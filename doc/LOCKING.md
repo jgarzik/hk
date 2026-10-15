@@ -639,6 +639,16 @@ The page cache uses a hierarchical locking model similar to Linux:
 - `find_or_create_page()` - Atomic find-or-create (fixes TOCTOU race)
 - `find_get_page()` - Lookup with refcount increment
 
+**Freeing ramfs pages (Linux evict_inode):** dropping a ramfs inode's
+`RamfsInodeData` (no directory entry, open file, mapping or dentry left)
+takes PAGE_CACHE -> FRAME_ALLOCATOR (`IrqSpinlock`, leaf) to free its
+pages. The page cache never holds inode references, so the last inode
+reference is never dropped with PAGE_CACHE held. Unevictable (ramfs)
+pages are kept off the eviction FIFO and are refused below the memory
+reserve (`FrameAlloc::reserve_low`: the frame allocator's exact free
+count and the heap's free-byte count, both read under their own leaf
+locks while PAGE_CACHE is held).
+
 ### 3.3 Virtual File System (VFS)
 
 **Location:** `fs/` crate

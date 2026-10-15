@@ -622,6 +622,17 @@ impl BitmapFrameAllocator {
         self.inner.lock().free
     }
 
+    /// Frames kept back from user data (page-cache pages that cannot be
+    /// evicted) so page tables, stacks and DMA buffers still get memory
+    /// when ramfs files fill RAM: 1/32 of memory, at least 4MB
+    pub fn reserve_frames(&self) -> usize {
+        (self.inner.lock().total_frames / 32).max(1024)
+    }
+
+    /// Free memory is down to the reserve (watermark-lite)
+    pub fn below_reserve(&self) -> bool {
+        self.free_frames() <= self.reserve_frames()
+    }
 }
 
 impl Default for BitmapFrameAllocator {
@@ -638,6 +649,10 @@ impl FrameAlloc for FrameAllocRef<'_> {
 
     fn alloc_contig(&mut self, n: usize) -> Option<Self::PhysAddr> {
         self.0.alloc_contig(n)
+    }
+
+    fn reserve_low(&self) -> bool {
+        self.0.below_reserve() || crate::heap_low()
     }
 
     fn alloc_frame(&mut self) -> Option<Self::PhysAddr> {

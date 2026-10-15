@@ -205,16 +205,20 @@ panic handler then dropped formatted messages, so ELR/FAR were lost; it
 prints them now. Not reproduced in 90 further runs (sequential and 8 in
 parallel). Next occurrence: capture the Message line.
 
-## Unlinked ramfs files keep their page-cache pages
+## ramfs has no size limit
 
-**Location**: `kernel/mm/page_cache.rs` (`invalidate_file` has no
-caller), `kernel/fs/ramfs.rs`
+**Location**: `kernel/fs/ramfs.rs`, `kernel/mm/page_cache.rs`,
+`kernel/frame_alloc.rs`
 
-The page cache holds at most 1024 pages, and ramfs pages are
-unevictable. When the last reference to an unlinked ramfs file goes
-away its pages are not released (only truncate frees them), so writing
-and deleting a few MB of /tmp files makes later writes fail with EIO.
-Tests truncate big files before unlinking them.
+ramfs (the root filesystem and every ramfs mount) is bounded only by
+memory, for every user: writes fail with ENOSPC once free frames reach
+the kernel's reserve (1/32 of RAM, at least 4MB) or the kernel heap is
+down to 2MB, and the memory comes back when the last link and the last
+open reference of a file are gone (or on truncate). Linux's rootfs is a
+tmpfs limited to half of RAM by default; tmpfs with `size=`/`nr_inodes=`
+limits (and per-user accounting) comes with the filesystem chunk.
+Reads of holes need a zeroed page each and can fail with ENOMEM when
+memory is at the reserve (Linux maps the shared zero page).
 
 ## Partial munmap of an anonymous mapping drops the rest of it
 

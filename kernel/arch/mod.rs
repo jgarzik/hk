@@ -246,6 +246,12 @@ pub trait FrameAlloc {
     fn alloc_contig(&mut self, _n: usize) -> Option<Self::PhysAddr> {
         None
     }
+
+    /// Memory is down to the reserve kept for the kernel: callers adding
+    /// unevictable user data (ramfs pages) must fail instead
+    fn reserve_low(&self) -> bool {
+        false
+    }
 }
 
 // ============================================================================

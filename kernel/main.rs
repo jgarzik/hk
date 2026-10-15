@@ -233,7 +233,21 @@ fn aarch64_heap(dtb: u64) -> (usize, usize) {
 #[cfg_attr(not(test), global_allocator)]
 static ALLOCATOR: HeapAllocator = HeapAllocator::new();
 
-/// Global page cache (1024 pages = 4MB max)
+/// The kernel heap is down to the 2MB kept for the kernel when user
+/// data grows (ramfs pages also cost heap: page descriptors and cache
+/// indexes)
+#[cfg(not(test))]
+pub fn heap_low() -> bool {
+    const HEAP_RESERVE: usize = 2 * 1024 * 1024;
+    ALLOCATOR.free_bytes() < HEAP_RESERVE
+}
+
+#[cfg(test)]
+pub fn heap_low() -> bool {
+    false
+}
+
+/// Global page cache (1024 evictable pages = 4MB max)
 static PAGE_CACHE: Mutex<PageCache> = Mutex::new(PageCache::new(1024));
 
 /// Global frame allocator
