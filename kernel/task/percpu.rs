@@ -1341,14 +1341,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         table.tasks.push(child_task);
     }
 
-    // Add to run queue
-    let sched = get_percpu_sched(cpu_id);
-    {
-        let mut rq = sched.lock.lock();
-        rq.add_task(child_tid, thread_ctx);
-        rq.enqueue_task(child_tid);
-    }
-
     // Handle filesystem context (CLONE_FS)
     // If CLONE_FS is set, child shares parent's FsStruct (cwd changes affect both)
     // Otherwise, child gets an independent copy
@@ -1469,11 +1461,24 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         child_pid
     };
 
-    // Handle CLONE_VFORK: parent blocks until child exec()s or _exit()s
-    // This must be done after child is fully set up and enqueued
+    // CLONE_VFORK: the completion must exist before the child can run
+    // (it may exec or exit at once on another CPU)
     if config.flags & CLONE_VFORK != 0 {
         register_vfork_child(child_tid);
-        // Wait for child to signal completion (via exec or exit)
+    }
+
+    // Only a fully set up child becomes runnable (Linux: wake_up_new_task
+    // at the end of kernel_clone); before this it has no mm, files or
+    // signal state to run with
+    let sched = get_percpu_sched(cpu_id);
+    {
+        let mut rq = sched.lock.lock();
+        rq.add_task(child_tid, thread_ctx);
+        rq.enqueue_task(child_tid);
+    }
+
+    // CLONE_VFORK: parent blocks until child exec()s or _exit()s
+    if config.flags & CLONE_VFORK != 0 {
         wait_for_vfork(child_tid);
     }
 
