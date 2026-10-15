@@ -70,11 +70,13 @@ fi
 echo "Kernel: $LINUX_KERNEL"
 
 # Initramfs: host build of boot_tester, same layout as user/Makefile
+# (busybox and /etc from tools/busybox-root.sh)
 make -s -C user host ARCH=$ARCH
 BIN=user/target-host/$ARCH-unknown-linux-gnu/release
 ROOT=$WORK/root
 rm -rf "$ROOT"
 mkdir -p "$ROOT/bin" "$ROOT/mnt"
+tools/busybox-root.sh "$ROOT" "$ARCH"
 cp "$BIN/boot_tester" "$BIN/boot_tester2" "$ROOT/bin/"
 ln -sf boot_tester "$ROOT/bin/init"
 echo -n "Hello from ramfs!" > "$ROOT/test.txt"

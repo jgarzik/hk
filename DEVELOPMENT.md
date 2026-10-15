@@ -18,6 +18,10 @@ sudo apt install build-essential cpio grub-pc-bin grub-common mtools xorriso
 
 # Cross-compiler for aarch64 userspace
 sudo apt install gcc-aarch64-linux-gnu
+
+# Verified .deb downloads (busybox-static for the initramfs, Linux kernels
+# for make check-linux*) and the HTTP test peer of the QEMU network
+sudo apt install curl gpgv xz-utils ubuntu-keyring python3
 ```
 
 ### Rust Components
@@ -78,6 +82,15 @@ cd user && make ARCH=aarch64 # aarch64 userspace
 The userspace build creates:
 - `user/initramfs-x86_64.cpio` - x86-64 initramfs
 - `user/initramfs-aarch64.cpio` - aarch64 initramfs
+
+Both initramfs images (and the one `make check-linux*` boots on Linux)
+also hold Ubuntu's static busybox (`/bin/busybox` plus applet links) and
+`user/rootfs/` (`/etc`: udhcpc script, hosts, passwd, group), installed
+by `tools/busybox-root.sh`. The busybox-static .deb is downloaded once
+with `tools/fetch-deb.sh` (apt for the native architecture, otherwise
+the Ubuntu archive/ports with the InRelease signature and hashes
+checked) and cached under `target/busybox/`; the first build needs
+network access and current apt lists (`sudo apt-get update`).
 
 ### Full Build + Test (Recommended)
 
