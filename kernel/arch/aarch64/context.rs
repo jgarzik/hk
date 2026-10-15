@@ -9,9 +9,8 @@
 //! TLS (Thread Local Storage) handling follows the Linux kernel pattern:
 //! save/restore TPIDR_EL0 in Rust before calling the pure-asm switch.
 
-use super::percpu::{read_tpidr_el0, write_tpidr_el0};
-use crate::task::percpu::current_tid;
-use crate::task::{Tid, get_task_tls, set_task_tls};
+use super::percpu::write_tpidr_el0;
+use crate::task::{Tid, get_task_tls};
 
 // External assembly functions from switch_to.S
 unsafe extern "C" {
@@ -259,15 +258,6 @@ pub unsafe fn context_switch(
     new_ttbr0: u64,
     next_tid: Tid,
 ) {
-    // Save current task's TLS (TPIDR_EL0) before switching
-    let prev_tid = current_tid();
-    if prev_tid != 0 {
-        let tpidr = read_tpidr_el0();
-        if tpidr != 0 {
-            set_task_tls(prev_tid, tpidr);
-        }
-    }
-
     // Load next task's TLS (TPIDR_EL0) before switching
     if next_tid != 0 {
         let tls = get_task_tls(next_tid).unwrap_or(0);

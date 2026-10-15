@@ -1417,8 +1417,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Handle CLONE_SETTLS: set child's TLS pointer
     // This stores the TLS value so clone_child_entry can load it into the
     // architecture-specific TLS register (FS base on x86_64, TPIDR_EL0 on aarch64)
+    // Otherwise the child inherits the parent's TLS register, as every
+    // other user register (Linux copy_thread: fsbase / tpidr_el0)
     if config.flags & CLONE_SETTLS != 0 {
         crate::task::set_task_tls(child_tid, config.tls);
+    } else {
+        crate::task::set_task_tls(child_tid, crate::arch::read_user_tls());
     }
 
     // Handle CLONE_PARENT_SETTID: write child TID to parent's address space
@@ -1707,6 +1711,12 @@ fn context_switch_locked(
     let (Some(curr_ctx), Some(next_ctx)) = (rq.get_context_mut(cur), rq.get_context(next)) else {
         return;
     };
+    // Save the outgoing task's user TLS register (user code may have
+    // changed it without a syscall, e.g. msr tpidr_el0); the arch switch
+    // loads `next`'s
+    if cur != 0 {
+        crate::task::set_task_tls(cur, crate::arch::read_user_tls());
+    }
     rq.current = Some(next);
     CurrentArch::set_current_tid(next);
     CurrentArch::set_current_task(&next_task);

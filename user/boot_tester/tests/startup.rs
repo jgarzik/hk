@@ -1,12 +1,15 @@
 //! Process startup ABI a static glibc program relies on: the initial
-//! stack and auxiliary vector and /proc/self/exe.
+//! stack and auxiliary vector, /proc/self/exe and the TLS register
+//! across fork and context switches.
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{sys_execve, sys_exit, sys_fork, sys_wait4};
+use hk_syscall::{sys_execve, sys_exit, sys_fork, sys_wait4, Timespec};
 
 pub fn run_tests() {
     test_exec_mode(b"EXEC_AUXV", b"auxv\0");
     test_exec_mode(b"PROC_SELF_EXE", b"exe\0");
+    test_fork_tls();
+    test_tls_switch();
 }
 
 fn report(name: &[u8], ok: bool, v: i64) {
@@ -46,4 +49,98 @@ fn test_exec_mode(name: &[u8], mode: &'static [u8]) {
         sys_exit(99);
     });
     report(name, st == 0, (st >> 8) as i64);
+}
+
+/// The value the TLS register is set to before forking
+const TLS_MAGIC: u64 = 0x5eed_7150_c0de_0001;
+
+static mut TLS_BLOCK: [u64; 2] = [TLS_MAGIC, 0];
+
+/// Set the TLS register (FS base / TPIDR_EL0) to `v`
+fn set_tls(v: u64) {
+    #[cfg(target_arch = "x86_64")]
+    hk_syscall::sys_arch_prctl(hk_syscall::ARCH_SET_FS, v);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("msr tpidr_el0, {}", in(reg) v)
+    };
+}
+
+/// The TLS register as user code sees it
+fn tls_ok() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let v: u64;
+        unsafe { core::arch::asm!("mov {}, fs:[0]", out(reg) v) };
+        v == TLS_MAGIC
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) v) };
+        v == &raw const TLS_BLOCK as u64
+    }
+}
+
+/// A forked child keeps its parent's TLS register (Linux copy_thread)
+fn test_fork_tls() {
+    let st = in_child(|| {
+        set_tls(&raw const TLS_BLOCK as u64);
+        let pid = sys_fork();
+        if pid == 0 {
+            sys_exit(if tls_ok() { 0 } else { 1 });
+        }
+        let mut st = 0i32;
+        sys_wait4(pid, &mut st, 0, 0);
+        sys_exit(if st == 0 { 0 } else { 2 });
+    });
+    report(b"FORK_INHERITS_TLS", st == 0, (st >> 8) as i64);
+}
+
+static mut TLS_B: [u64; 2] = [TLS_MAGIC ^ 1, 0];
+
+/// TLS register value as seen by user code (fs:[0] on x86, the register
+/// itself on arm64): what each task must keep across context switches
+fn tls_word() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let v: u64;
+        unsafe { core::arch::asm!("mov {}, fs:[0]", out(reg) v) };
+        v
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) v) };
+        v
+    }
+}
+
+/// Two processes with different TLS registers switching back and forth
+/// each keep their own (the switch saves the outgoing task's register)
+fn test_tls_switch() {
+    fn run(block: u64) -> ! {
+        set_tls(block);
+        let want = tls_word();
+        let ts = Timespec { tv_sec: 0, tv_nsec: 2_000_000 };
+        for _ in 0..30 {
+            hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+            if tls_word() != want {
+                sys_exit(1);
+            }
+        }
+        sys_exit(0);
+    }
+    let a = sys_fork();
+    if a == 0 {
+        run(&raw const TLS_BLOCK as u64);
+    }
+    let b = sys_fork();
+    if b == 0 {
+        run(&raw const TLS_B as u64);
+    }
+    let (mut sa, mut sb) = (0i32, 0i32);
+    sys_wait4(a, &mut sa, 0, 0);
+    sys_wait4(b, &mut sb, 0, 0);
+    report(b"TLS_SURVIVES_SWITCH", sa == 0 && sb == 0, (sa | sb) as i64);
 }
