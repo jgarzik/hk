@@ -227,6 +227,8 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 
 6.2 POSIX timers
 
+- [x] setitimer (ITIMER_REAL; ITIMER_VIRTUAL/PROF → EINVAL, BUGS.md)
+- [x] getitimer (ITIMER_REAL)
 - [x] timer_create
 - [x] timer_settime
 - [x] timer_gettime
@@ -544,7 +546,7 @@ Misc utilities that don't fit elsewhere:
 - [x] personality
 - [x] vhangup
 - [x] readahead
-- [x] alarm (x86-64 only, legacy; use timer APIs)
+- [x] alarm (x86-64 only, legacy; ITIMER_REAL in seconds)
 - [x] pause (x86-64 only, legacy; use sigsuspend/ppoll)
 - [x] getpgrp (x86-64 only, legacy; use getpgid(0))
 - [x] ustat (x86-64 only, legacy; deprecated filesystem syscall)

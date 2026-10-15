@@ -1,12 +1,19 @@
 //! Process startup ABI a static glibc program relies on: the initial
 //! stack and auxiliary vector, /proc/self/exe, the TLS register across
-//! fork and context switches and newfstatat.
+//! fork, newfstatat and interval timers.
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{sys_execve, sys_exit, sys_fork, sys_fstatat, sys_wait4, Stat, Timespec};
+use hk_syscall::{
+    sys_execve, sys_exit, sys_fork, sys_fstatat, sys_getitimer, sys_rt_sigprocmask,
+    sys_rt_sigtimedwait, sys_setitimer, sys_wait4, ITimerVal, Stat, Timespec, Timeval,
+    ITIMER_REAL,
+};
 
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+const SIGALRM: u64 = 14;
+const SIG_BLOCK: i32 = 0;
+const SIG_UNBLOCK: i32 = 1;
 
 pub fn run_tests() {
     test_exec_mode(b"EXEC_AUXV", b"auxv\0");
@@ -14,6 +21,9 @@ pub fn run_tests() {
     test_fork_tls();
     test_tls_switch();
     test_newfstatat();
+    test_itimer_real();
+    #[cfg(target_arch = "x86_64")]
+    test_alarm();
 }
 
 fn report(name: &[u8], ok: bool, v: i64) {
@@ -157,4 +167,52 @@ fn test_newfstatat() {
     let r2 = sys_fstatat(AT_FDCWD, b"/\0".as_ptr(), &mut st, AT_SYMLINK_NOFOLLOW);
     let r3 = sys_fstatat(AT_FDCWD, b"/no/such/file\0".as_ptr(), &mut st, 0);
     report(b"NEWFSTATAT", dir && r2 == 0 && r3 == -2, r3);
+}
+
+/// Block SIGALRM, then wait up to 2s for it; true if it arrived
+fn alrm_arrives() -> bool {
+    let set: u64 = 1 << (SIGALRM - 1);
+    let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
+    sys_rt_sigtimedwait(&set as *const u64 as u64, 0, &ts as *const Timespec as u64, 8)
+        == SIGALRM as i64
+}
+
+fn block_alrm(how: i32) {
+    let set: u64 = 1 << (SIGALRM - 1);
+    sys_rt_sigprocmask(how, &set as *const u64 as u64, 0, 8);
+}
+
+/// setitimer(ITIMER_REAL) fires SIGALRM once; getitimer reports the
+/// time left; disarming reads back as zero
+fn test_itimer_real() {
+    block_alrm(SIG_BLOCK);
+    let tv = |s, us| Timeval { tv_sec: s, tv_usec: us };
+    let it = ITimerVal { it_interval: tv(0, 0), it_value: tv(0, 200_000) };
+    let r = sys_setitimer(ITIMER_REAL, &it, core::ptr::null_mut());
+    let mut cur = ITimerVal::default();
+    sys_getitimer(ITIMER_REAL, &mut cur);
+    let left = cur.it_value.tv_sec * 1_000_000 + cur.it_value.tv_usec;
+    let fired = alrm_arrives();
+    let mut after = ITimerVal::default();
+    sys_getitimer(ITIMER_REAL, &mut after);
+    let idle = after.it_value.tv_sec == 0 && after.it_value.tv_usec == 0;
+    let bad = sys_setitimer(7, &it, core::ptr::null_mut());
+    block_alrm(SIG_UNBLOCK);
+    let ok = r == 0 && left > 0 && left <= 200_000 && fired && idle && bad == -22;
+    report(b"ITIMER_REAL", ok, left);
+}
+
+/// alarm returns the seconds left on the previous alarm and fires
+/// SIGALRM (x86-64 only; arm64 has no alarm syscall)
+#[cfg(target_arch = "x86_64")]
+fn test_alarm() {
+    use hk_syscall::sys_alarm;
+    block_alrm(SIG_BLOCK);
+    let a = sys_alarm(5);
+    let b = sys_alarm(1);
+    let fired = alrm_arrives();
+    let c = sys_alarm(0);
+    block_alrm(SIG_UNBLOCK);
+    let ok = a == 0 && b == 5 && fired && c == 0;
+    report(b"ALARM", ok, b);
 }

@@ -2471,9 +2471,30 @@ pub struct Semid64Ds {
 }
 
 pub const SYS_NEWFSTATAT: u64 = 262;
+pub const SYS_GETITIMER: u64 = 36;
+pub const SYS_ALARM: u64 = 37;
+pub const SYS_SETITIMER: u64 = 38;
 
 /// newfstatat(dirfd, pathname, statbuf, flags)
 #[inline(always)]
 pub fn sys_fstatat(dirfd: i32, pathname: *const u8, statbuf: *mut Stat, flags: i32) -> i64 {
     unsafe { syscall4!(SYS_NEWFSTATAT, dirfd, pathname, statbuf, flags) }
+}
+
+/// getitimer(which, curr_value)
+#[inline(always)]
+pub fn sys_getitimer(which: i32, curr: *mut super::ITimerVal) -> i64 {
+    unsafe { syscall2!(SYS_GETITIMER, which, curr) }
+}
+
+/// setitimer(which, new_value, old_value)
+#[inline(always)]
+pub fn sys_setitimer(which: i32, new: *const super::ITimerVal, old: *mut super::ITimerVal) -> i64 {
+    unsafe { syscall3!(SYS_SETITIMER, which, new, old) }
+}
+
+/// alarm(seconds) (x86-64 only)
+#[inline(always)]
+pub fn sys_alarm(seconds: u32) -> i64 {
+    unsafe { syscall1!(SYS_ALARM, seconds) }
 }

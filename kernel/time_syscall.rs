@@ -26,8 +26,7 @@ pub struct LinuxTimespec {
     pub tv_nsec: i64,
 }
 
-/// Linux timeval structure for gettimeofday (x86_64 only - aarch64 uses clock_gettime)
-#[cfg(target_arch = "x86_64")]
+/// Linux timeval structure (gettimeofday, itimerval)
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Timeval {

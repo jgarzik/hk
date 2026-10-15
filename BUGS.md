@@ -64,6 +64,13 @@ exec frees only the old page-table frames (when no other task shares
 them) and exit frees nothing. Every process leaks its private memory,
 so long runs eventually exhaust frames.
 
+## Interval timers: ITIMER_VIRTUAL and ITIMER_PROF
+
+**Location**: `kernel/posix_timer.rs` (`sys_setitimer`)
+
+Only ITIMER_REAL (and alarm) exist; the CPU-time timers return EINVAL
+(Linux supports them). rseq is ENOSYS (glibc runs without it).
+
 ## AF_PACKET gaps
 
 **Location**: `kernel/net/packet/`

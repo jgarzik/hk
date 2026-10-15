@@ -2723,3 +2723,18 @@ pub struct Semid64Ds {
     pub _unused3: u64,
     pub _unused4: u64,
 }
+
+pub const SYS_GETITIMER: u64 = 102;
+pub const SYS_SETITIMER: u64 = 103;
+
+/// getitimer(which, curr_value)
+#[inline(always)]
+pub fn sys_getitimer(which: i32, curr: *mut super::ITimerVal) -> i64 {
+    unsafe { syscall2!(SYS_GETITIMER, which, curr) }
+}
+
+/// setitimer(which, new_value, old_value)
+#[inline(always)]
+pub fn sys_setitimer(which: i32, new: *const super::ITimerVal, old: *mut super::ITimerVal) -> i64 {
+    unsafe { syscall3!(SYS_SETITIMER, which, new, old) }
+}
