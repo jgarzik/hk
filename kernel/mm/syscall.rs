@@ -302,7 +302,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     drop(replaced);
 
     if should_populate {
-        populate_range(map_addr, length);
+        let _ = populate_range(map_addr, length);
     }
 
     // Note: Pages are allocated on demand in the page fault handler
@@ -731,14 +731,16 @@ fn can_do_mlock() -> bool {
 /// Fault in the pages of [start, start + len) (Linux mm_populate /
 /// populate_vma_page_range): a write fault for a private writable
 /// mapping (copy-on-write is broken now), a read fault otherwise.
-/// Inaccessible VMAs and holes are skipped; errors are ignored.
+/// Inaccessible VMAs and holes are skipped. False if memory ran out
+/// (mlock reports it; MAP_POPULATE, mlockall and MADV_WILLNEED ignore
+/// it, like Linux mm_populate).
 ///
 /// Used by MAP_POPULATE, MAP_LOCKED, mlock/mlockall and MADV_WILLNEED.
-fn populate_range(start: u64, len: u64) {
+fn populate_range(start: u64, len: u64) -> bool {
     use super::fault::{Access, handle_mm_fault};
 
     let Some(mm) = get_task_mm(current_tid()) else {
-        return;
+        return true;
     };
     let end = start.saturating_add(len);
     let mut addr = start & !(PAGE_SIZE - 1);
@@ -749,11 +751,14 @@ fn populate_range(start: u64, len: u64) {
             Some(_) => Some(Access::Read),
             None => None,
         };
-        if let Some(a) = access {
-            let _ = handle_mm_fault(&mm, addr, a);
+        if let Some(a) = access
+            && handle_mm_fault(&mm, addr, a) == Err(super::fault::VmFault::Oom)
+        {
+            return false;
         }
         addr += PAGE_SIZE;
     }
+    true
 }
 
 /// mlock syscall - Lock pages in memory
@@ -887,9 +892,10 @@ fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
     // Release lock before populating (to avoid holding lock during page faults)
     drop(mm_guard);
 
-    // If not MLOCK_ONFAULT, populate pages now
-    if vm_flags & VM_LOCKONFAULT == 0 {
-        populate_range(start_aligned, len_aligned);
+    // If not MLOCK_ONFAULT, populate pages now; out of memory is EAGAIN
+    // (Linux __mlock_posix_error_return)
+    if vm_flags & VM_LOCKONFAULT == 0 && !populate_range(start_aligned, len_aligned) {
+        return KernelError::WouldBlock.sysret();
     }
 
     0
@@ -1057,7 +1063,7 @@ pub fn sys_mlockall(flags: i32) -> i64 {
 
         // Populate pages if not ONFAULT
         for (start, len) in ranges_to_populate {
-            populate_range(start, len);
+            let _ = populate_range(start, len);
         }
     }
 
@@ -1096,6 +1102,18 @@ pub fn sys_munlockall() -> i64 {
 // ============================================================================
 // mprotect syscall
 // ============================================================================
+
+/// The page at `va` is mapped by this PTE only (frame refcount 1, or a
+/// frame outside the allocator); true if not mapped (nothing to change)
+fn exclusive(pt_root: u64, va: u64) -> bool {
+    use crate::arch::paging;
+    let Some(p) = paging::pte_ptr(pt_root, va) else {
+        return true; // not mapped, or a 2MB page (never shared)
+    };
+    // SAFETY: a live table of the current mm, under its lock
+    let pte = unsafe { core::ptr::read_volatile(p) };
+    !paging::pte_present(pte) || crate::FRAME_ALLOCATOR.refcount(paging::pte_addr(pte)) <= 1
+}
 
 /// mprotect syscall - Change protection of memory region
 ///
@@ -1195,7 +1213,7 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     }
 
     // Collect VMAs that need updating and validate the range is fully mapped
-    let mut vmas_to_update: Vec<(u64, u64, u32)> = Vec::new();
+    let mut vmas_to_update: Vec<(u64, u64, bool)> = Vec::new();
     let mut covered_start = start;
 
     for vma in mm_guard.iter() {
@@ -1232,7 +1250,7 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
             return KernelError::PermissionDenied.sysret();
         }
 
-        vmas_to_update.push((update_start, update_end, vma.prot));
+        vmas_to_update.push((update_start, update_end, vma.is_shared()));
         covered_start = vma.end;
     }
 
@@ -1331,8 +1349,8 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
         ttbr0 & !0xFFF
     };
 
-    // Release mm lock before doing page table updates
-    drop(mm_guard);
+    // The PTEs are updated under the mm lock: a fault or fork must not
+    // see (or write back) an entry half-way through the change
 
     // Update page table entries for all affected pages
     let writable = prot & PROT_WRITE != 0;
@@ -1341,9 +1359,13 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     use crate::FRAME_ALLOCATOR;
     use crate::mm::huge_page::HUGE_PAGE_SIZE;
 
-    for (update_start, update_end, _old_prot) in vmas_to_update {
+    for (update_start, update_end, shared) in vmas_to_update {
         let mut page = update_start;
         while page < update_end {
+            // In a private mapping only a page no one else maps becomes
+            // writable (Linux can_change_pte_writable); a shared one stays
+            // read-only and is copied at its write fault
+            let writable = writable && (shared || exclusive(pt_root, page));
             #[cfg(target_arch = "x86_64")]
             {
                 use crate::arch::x86_64::paging::X86_64PageTable;
@@ -1410,6 +1432,7 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
         }
     }
 
+    drop(mm_guard);
     0
 }
 
@@ -1541,7 +1564,7 @@ pub fn sys_madvise(addr: u64, length: u64, advice: i32) -> i64 {
         }
         MADV_WILLNEED => {
             // Prefault pages (reuse populate_range)
-            populate_range(addr, length);
+            let _ = populate_range(addr, length);
             0
         }
         MADV_DONTNEED => {
@@ -1697,23 +1720,21 @@ fn madvise_remove(mm: &alloc::sync::Arc<super::Mm>, start: u64, end: u64) -> i64
 
 /// Handle MADV_DONTNEED - zap pages in range
 fn madvise_dontneed(mm: &alloc::sync::Arc<super::Mm>, start: u64, end: u64) -> i64 {
-    {
-        let mm_guard = mm.lock();
+    let mm_guard = mm.lock();
 
-        // Check for locked VMAs - can't DONTNEED locked pages
-        for vma in mm_guard.iter() {
-            if vma.end <= start || vma.start >= end {
-                continue;
-            }
-            if vma.is_locked() {
-                return KernelError::InvalidArgument.sysret();
-            }
+    // Check for locked VMAs - can't DONTNEED locked pages
+    for vma in mm_guard.iter() {
+        if vma.end <= start || vma.start >= end {
+            continue;
+        }
+        if vma.is_locked() {
+            return KernelError::InvalidArgument.sysret();
         }
     }
 
-    // Unmap pages in range (reuse existing infrastructure)
+    // Zap under the mm lock: no fault or fork works on these PTEs meanwhile
     unmap_pages_range(start, end);
-
+    drop(mm_guard);
     0
 }
 
@@ -1868,11 +1889,9 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         let shrink_pages = (old_len - new_len_aligned) / PAGE_SIZE;
         mm_guard.sub_total_vm(shrink_pages);
 
-        // Release lock before page table operations
-        drop(mm_guard);
-
-        // Unmap the pages
+        // Unmap the pages (under the mm lock)
         unmap_pages_range(unmap_start, unmap_end);
+        drop(mm_guard);
 
         return old_addr as i64;
     }
@@ -1932,12 +1951,10 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         mm_guard.add_total_vm(new_len_aligned / PAGE_SIZE);
         mm_guard.merge_adjacent(new_idx);
 
-        // Release lock before page table operations
+        // Move page table entries (under the mm lock)
+        move_page_tables(old_addr, target_addr, old_len);
         drop(mm_guard);
         drop(gone);
-
-        // Move page table entries
-        move_page_tables(old_addr, target_addr, old_len, dontunmap);
 
         return target_addr as i64;
     }
@@ -1961,10 +1978,9 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         mm_guard.add_total_vm(new_len_aligned / PAGE_SIZE);
         mm_guard.merge_adjacent(new_idx);
 
+        move_page_tables(old_addr, new_addr, old_len);
         drop(mm_guard);
         drop(gone);
-
-        move_page_tables(old_addr, new_addr, old_len, dontunmap);
 
         return new_addr as i64;
     }
@@ -1973,24 +1989,35 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     old_addr as i64
 }
 
-/// The VMA starting at `old_addr` after mremap moved it: kept as an
-/// anonymous mapping with MREMAP_DONTUNMAP, else removed into `gone`
+/// The VMA starting at `old_addr` after mremap moved it: kept (now
+/// empty) with MREMAP_DONTUNMAP, else removed into `gone`
 fn move_vma_out(mm: &mut super::MmStruct, old_addr: u64, dontunmap: bool, gone: &mut Vec<Vma>) {
     let Some(idx) = mm.find_vma_exact(old_addr) else {
         return;
     };
     if dontunmap {
-        if let Some(vma) = mm.get_vma_mut(idx) {
-            vma.file = None;
-            vma.flags |= MAP_ANONYMOUS;
+        // Kept with its backing (Linux): anonymous memory refaults zero
+        // pages, a file or shared object its own pages; no longer locked
+        // (dontunmap_complete)
+        let Some(vma) = mm.get_vma_mut(idx) else {
+            return;
+        };
+        let locked = vma.is_locked();
+        let pages = vma.size() / PAGE_SIZE;
+        vma.flags &= !VM_LOCKED_MASK;
+        if locked {
+            mm.sub_locked_vm(pages);
         }
     } else {
         gone.extend(mm.remove_vma(idx));
     }
 }
 
-/// Move page table entries from old location to new location
-fn move_page_tables(old_start: u64, new_start: u64, len: u64, keep_old: bool) {
+/// Move page table entries from old location to new location, mm lock
+/// held. The old range is left empty, MREMAP_DONTUNMAP included (Linux
+/// move_page_tables: its pages refault from the backing, or as zero
+/// pages for anonymous memory).
+fn move_page_tables(old_start: u64, new_start: u64, len: u64) {
     #[cfg(target_arch = "x86_64")]
     {
         use crate::FRAME_ALLOCATOR;
@@ -2013,11 +2040,9 @@ fn move_page_tables(old_start: u64, new_start: u64, len: u64, keep_old: bool) {
                 // Increment frame refcount since we have a new mapping
                 FRAME_ALLOCATOR.incref(phys);
 
-                if !keep_old {
-                    // Unmap old location
-                    if let Some(old_phys) = X86_64PageTable::unmap_page(cr3, old_addr) {
-                        FRAME_ALLOCATOR.decref(old_phys);
-                    }
+                // Unmap old location
+                if let Some(old_phys) = X86_64PageTable::unmap_page(cr3, old_addr) {
+                    FRAME_ALLOCATOR.decref(old_phys);
                 }
             }
 
@@ -2056,11 +2081,9 @@ fn move_page_tables(old_start: u64, new_start: u64, len: u64, keep_old: bool) {
                 // Increment frame refcount
                 FRAME_ALLOCATOR.incref(phys);
 
-                if !keep_old {
-                    // Unmap old location
-                    if let Some(old_phys) = Aarch64PageTable::unmap_page(pt_phys, old_addr) {
-                        FRAME_ALLOCATOR.decref(old_phys);
-                    }
+                // Unmap old location
+                if let Some(old_phys) = Aarch64PageTable::unmap_page(pt_phys, old_addr) {
+                    FRAME_ALLOCATOR.decref(old_phys);
                 }
             }
 

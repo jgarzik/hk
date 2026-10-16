@@ -196,14 +196,19 @@ pub fn pmd_huge(pmd: u64) -> bool {
 
 /// Pointer to the 4KB leaf (L3) entry for `va`, allocating the missing
 /// tables (Linux pte_alloc). A table is installed with a compare and
-/// swap, so racing faults share one. None if out of memory or a block
-/// maps `va`.
+/// swap, so racing faults share one. None if out of memory (down to
+/// the kernel's reserve) or a block maps `va`.
 pub fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
     let mut table = phys_to_virt(root) as *mut u64;
     for shift in [39, 30, 21] {
         let slot = entry_atomic(table, va >> shift);
         let mut e = slot.load(Ordering::Acquire);
         if e & 0b11 == DESC_INVALID {
+            // User page tables stop at the kernel's reserve, like
+            // user pages (Linux GFP_PGTABLE_USER at the min watermark)
+            if crate::FRAME_ALLOCATOR.below_reserve() {
+                return None;
+            }
             let new = crate::FRAME_ALLOCATOR.alloc()?;
             // SAFETY: a fresh frame, reached through the linear map
             unsafe { core::ptr::write_bytes(phys_to_virt(new), 0, PAGE_SIZE as usize) };

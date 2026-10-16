@@ -715,27 +715,50 @@ pub struct BitmapFrameAllocator {
   roots recorded in AnonVma chains, not the task table or mm locks).
   `TASK_TABLE` is never held while taking an mm lock.
 - Shared anonymous memory (`mm::shmem::Shmem`, Linux shmem): its page
-  index `Shmem.root` is a `spin::Mutex` taken by the fault path and by
-  MADV_REMOVE with no other lock held; under it only `FRAME_ALLOCATOR`
-  is taken (index nodes are frames, no heap). The object goes with its
-  last VMA (possibly under the mm lock): its drop takes no lock but
-  `FRAME_ALLOCATOR`. A SysV shm attachment (`ipc::shm::ShmAttach`, in
-  its VMA) is cloned and dropped with the VMA, possibly under the mm
-  lock: it only updates the segment's atomics (shm_nattch, times, pid),
-  and destroying a removed segment at the last detach takes no lock.
-  IPC_RMID (mark deleted, then read shm_nattch) and shmat (count the
-  attachment, then check the mark) order with SeqCst fences, so a
-  racing shmat backs out (EINVAL) or IPC_RMID sees it; destroy is
-  idempotent, so namespace totals are given back exactly once.
+  index `Shmem.root` is a `spin::Mutex` taken by the fault path under
+  the mm lock (mm lock -> Shmem.root) and by MADV_REMOVE after the mm
+  lock is dropped; under it only `FRAME_ALLOCATOR` is taken (index
+  nodes are frames, no heap). The object goes with its last VMA
+  (possibly under the mm lock): its drop takes no lock but
+  `FRAME_ALLOCATOR`.
+- A SysV shm attachment (`ipc::shm::ShmAttach`, in its VMA) is cloned
+  and dropped with the VMA, possibly under the mm lock: it only updates
+  the segment's atomics (shm_nattch, times, pid), and destroying a
+  removed segment at the last detach takes no lock. IPC_RMID (mark
+  deleted, then read shm_nattch) and shmat (count the attachment, then
+  check the mark) order with SeqCst fences, so a racing shmat backs out
+  (EINVAL) or IPC_RMID sees it; destroy is idempotent, so namespace
+  totals are given back exactly once.
 - The page-fault path (`kernel/mm/fault.rs`, `handle_mm_fault`, shared by
-  both arches) finds the VMA under the mm lock but drops it before
-  allocating and installing the PTE (it may sleep reading a file), so a
-  fault can race munmap of the same range in another thread (gap vs Linux,
-  which holds mmap_lock for read across the fault and the page table lock
-  around the PTE update; section 9). Racing faults on one page are safe:
-  a missing table is installed with a compare-and-swap (`pte_alloc`; the
-  loser frees its frame) and a PTE is set with a compare-and-swap against
-  the value the fault read (Linux pte_same), the loser dropping its page.
+  both arches) holds the mm lock from the VMA lookup through the PTE
+  update (Linux: mmap_lock for read + the page table lock), so a fault
+  cannot race fork's copy, munmap or mprotect of its range: every user
+  PTE writer holds the mm lock (fault, fork's `copy_page_range`,
+  munmap/brk `munmap_locked`, mprotect, MADV_DONTNEED/REMOVE, mremap's
+  shrink and `move_page_tables`),
+  so no entry is read, released and written back around another's
+  change. Under it:
+  page-table and page allocation (`FRAME_ALLOCATOR`), a shared object's
+  `Shmem.root`, rmap/LRU; nothing that sleeps. It drops the lock only
+  to read data that may sleep or needs a lock ordered above it (a file
+  page: `pread`, or PAGE_CACHE for a ramfs page; a swap slot), then
+  looks the VMA up again and installs the PTE only if the VMA is
+  unchanged (else it drops the page and the access retries). Racing
+  faults on one page are safe: a missing table is installed with a
+  compare-and-swap (`pte_alloc`; the loser frees its frame) and a PTE is
+  set with a compare-and-swap against the value the fault read (Linux
+  pte_same), the loser dropping its page. No user memory is accessed
+  under the mm lock (a fault there would deadlock).
+- TLB after a PTE loses permission or its page: flushed before the mm
+  lock is released and before the old frame can be freed or written
+  through by another process: fork write-protects the parent's private
+  PTEs and flushes each VMA's range (`paging::flush_tlb_range`) before
+  dropping the parent's lock (the child cannot run yet); mprotect, a
+  copy-on-write break, munmap and MADV_DONTNEED flush each page they
+  change (`paging::flush_tlb`) before dropping its reference. arm64
+  flushes are broadcast (`tlbi ...is`); x86 flushes this CPU only: the
+  shootdown IPI for other CPUs running the address space plugs into
+  these helpers (section 9, SMP TODO).
 - Teardown TLB: `free_user` detaches the user half from the top-level
   table, flushes (arm64: `tlbi vmalle1is`, all CPUs; x86: this CPU, if
   the table is loaded here), then frees pages and tables. A CPU that last
@@ -770,7 +793,7 @@ layout in `doc/MEMORY.md`
   that is handed out again (gap vs Linux `flush_tlb_kernel_range`,
   section 9; drivers do not iounmap in practice).
 - User half: per address space, changed by its tasks under the mm lock
-  (the fault paths install PTEs after dropping it, see Address Spaces);
+  (the fault path, see Address Spaces);
   never contains a kernel mapping.
 
 #### Heap Allocator
@@ -2457,8 +2480,8 @@ Features present in Linux but not yet implemented in hk:
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
 | Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
 | Kernel TLB shootdown | `flush_tlb_kernel_range` IPIs | x86: local `invlpg` only | Stale ioremap translation on other CPUs after iounmap |
-| User TLB shootdown | `flush_tlb_mm_range` IPIs to `mm_cpumask` | x86: local `invlpg` / CR3 reload only (arm64 broadcasts `tlbi ...is`) | Another CPU running a thread of the same process may use a stale translation after munmap/mprotect/exit_mmap |
-| mmap_lock across faults | `mmap_read_lock` + PTE lock in the fault path | Fault drops the mm lock before installing the PTE | A fault can race munmap of the same range in another thread |
+| User TLB shootdown | `flush_tlb_mm_range` IPIs to `mm_cpumask` | x86: local `invlpg` / CR3 reload only (arm64 broadcasts `tlbi ...is`) | Another CPU running a thread of the same process may write through a stale writable entry after fork's write-protect, a COW break, munmap, MADV_DONTNEED or mprotect: into a frame now shared with a child, or freed (write after free) |
+| mmap_lock across faults | `mmap_read_lock` + PTE lock in the fault path | The mm lock (a spinlock: exclusive, not shared) is held across the fault, except while reading a file page or swap slot (the VMA is revalidated after) | Faults in one address space are serialized; a swap-in can race munmap of its range (swap is inert) |
 
 ### Implications
 

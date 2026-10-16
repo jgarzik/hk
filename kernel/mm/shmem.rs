@@ -18,9 +18,10 @@
 //! for it stops at the reserve like its pages (Linux: user allocations
 //! stop at the min watermark).
 //!
-//! Locking: `Shmem.root` is a spin lock taken by the fault path and by
-//! MADV_REMOVE with no other lock held; under it only `FRAME_ALLOCATOR`
-//! is taken. The drop takes no lock (doc/LOCKING.md, Address Spaces).
+//! Locking: `Shmem.root` is a spin lock taken by the fault path under
+//! the mm lock (mm lock -> Shmem.root) and by MADV_REMOVE with no lock
+//! held; under it only `FRAME_ALLOCATOR` is taken. The drop takes no
+//! lock (doc/LOCKING.md, Address Spaces).
 
 use alloc::sync::Arc;
 

@@ -75,23 +75,31 @@ Address spaces are reference counted and torn down like Linux
   si->lock); to be done with the reclaim work.
 - SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
   IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
-  by id still work there); shmdt needs the address an attachment starts
-  at (Linux also finds a piece moved by mremap); SHM_EXEC is ignored;
-  shmat checks RLIMIT_AS before SHM_REMAP unmaps the old range, and an
-  address that SHM_RND rounds to 0 is EPERM (Linux picks an address).
-- MADV_REMOVE of a file mapping is EOPNOTSUPP (no filesystem punches
-  holes).
+  by id still work there).
 - File mappings: MAP_SHARED of a file on a filesystem other than ramfs
   (vfat) maps a private copy (writes do not reach the file or other
   mappings); truncating a ramfs file does not unmap its shared pages
   (they keep the old data instead of raising SIGBUS); MAP_PRIVATE file
   pages are copied at fault, not shared until written.
 - mprotect(PROT_NONE) leaves already-present pages readable.
+- MADV_REMOVE of a file mapping is EOPNOTSUPP (no filesystem punches
+  holes); shmdt needs the address an attachment starts at (Linux also
+  finds a piece moved by mremap); SHM_EXEC is ignored.
+- mremap: if a page table cannot be allocated while moving pages, the
+  page is lost (Linux fails with ENOMEM first); a 2MB page whose split
+  fails keeps its protection under a partial mprotect; shmat checks
+  RLIMIT_AS before SHM_REMAP unmaps the old range, and an address that
+  SHM_RND rounds to 0 is EPERM (Linux picks an address).
 - Exited non-leader threads stay in the task table as zombies (Linux
   reaps them at once); their kernel stacks and memory are freed.
 - munmap keeps page-table pages that become empty (freed at exit).
-- x86 has no user TLB shootdown, and the page-fault path installs PTEs
-  after dropping the mm lock (doc/LOCKING.md section 9).
+- x86 has no user TLB shootdown (doc/LOCKING.md section 9): when
+  threads of one process run on several CPUs, another CPU may keep a
+  stale writable TLB entry after fork write-protects a page, a COW
+  break replaces it, or munmap/MADV_DONTNEED frees it, and write into
+  the frame (now shared with the child, or freed: write after free).
+  The flush helpers (`paging::flush_tlb`/`flush_tlb_range`) are where
+  the shootdown IPI goes.
 
 ## No dynamically linked executables
 

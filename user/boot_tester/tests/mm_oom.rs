@@ -9,13 +9,17 @@
 //!   than the machine has is killed by SIGKILL; the kernel and the test
 //!   runner survive, its memory comes back and the next fork works
 //! - OOM_SHARED_KILL (hk only): the same with shared anonymous memory
+//! - OOM_MLOCK_EAGAIN (hk only: Linux would OOM-kill instead): mlock of
+//!   more memory than there is fails with EAGAIN, and the memory comes
+//!   back when the process exits
 
 use super::helpers::{host_mode, print, print_num, println, skip};
 use super::mm_life::meminfo;
 use hk_syscall::{
-    sys_brk, sys_close, sys_exit, sys_fork, sys_mmap, sys_mremap, sys_munmap, sys_nanosleep,
-    sys_open, sys_read, sys_setrlimit, sys_wait4, RLimit, Timespec, MAP_ANONYMOUS,
-    MAP_PRIVATE, MAP_SHARED, MREMAP_MAYMOVE, O_RDONLY, PROT_READ, PROT_WRITE, RLIMIT_AS,
+    sys_brk, sys_close, sys_exit, sys_fork, sys_mlock, sys_mmap, sys_mremap, sys_munmap,
+    sys_nanosleep, sys_open, sys_read, sys_setrlimit, sys_wait4, RLimit, Timespec,
+    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_MAYMOVE, O_RDONLY, PROT_READ, PROT_WRITE,
+    RLIMIT_AS,
 };
 
 const MAP_NORESERVE: u32 = 0x4000;
@@ -28,6 +32,19 @@ pub fn run_tests() {
     rlimit_as();
     fault_kill(b"OOM_FAULT_KILL", hog);
     fault_kill(b"OOM_SHARED_KILL", hog_shared);
+    fault_kill(b"OOM_MLOCK_EAGAIN", mlock_hog);
+}
+
+/// Child: mlock more than the machine has; EAGAIN expected (exit 0x80
+/// stands in for the SIGKILL the other children expect)
+fn mlock_hog() -> u64 {
+    let len = (meminfo(b"MemTotal:").max(0) as u64 * 1024 * 2) & !(PAGE - 1);
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+    let p = sys_mmap(0, len, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if p < 0 {
+        return 2;
+    }
+    if sys_mlock(p as u64, len) == -11 { 0x80 } else { 3 }
 }
 
 fn report(name: &[u8], ok: bool, detail: i64) {
@@ -178,7 +195,7 @@ fn fault_kill(name: &[u8], f: fn() -> u64) {
     settle();
     let before = meminfo(b"MemFree:");
     let r = in_child(f);
-    if r != 0x100 + SIGKILL as i64 {
+    if r != 0x100 + SIGKILL as i64 && r != 0x80 {
         report(name, false, r);
         return;
     }

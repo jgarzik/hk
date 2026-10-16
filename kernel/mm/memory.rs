@@ -177,6 +177,13 @@ fn copy_pte(dst: u64, src: u64, addr: u64, cow: bool) -> Result<bool, i32> {
             }
         }
         FRAME_ALLOCATOR.incref(paging::pte_addr(pte));
+        // One more mapping of an anonymous page (Linux page_dup_rmap);
+        // both mm's anon_vma chains hold the VMA (dup_mm)
+        if let Some(pg) = page_descriptor(paging::pte_addr(pte))
+            && pg.is_anon()
+        {
+            pg.inc_mapcount();
+        }
         entry(dp).store(child, Ordering::Release);
         return Ok(child != pte && paging::pte_write(pte));
     }

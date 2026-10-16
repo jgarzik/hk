@@ -10,12 +10,17 @@
 //! - FILE_SHARED_FORK: the same for a MAP_SHARED mapping of a file
 //! - FILE_SHARED_COHERENT: a shared file mapping, another mapping of the
 //!   file and read()/write() all see the same data
+//! - FILE_PRIVATE_RDONLY: a MAP_PRIVATE mapping of a read-only fd made
+//!   writable by mprotect writes a private copy, never the file; a
+//!   MAP_SHARED one cannot be made writable (EACCES)
 //! - FILE_SHARED_EOF: a shared file mapping is SIGBUS past the page
 //!   holding the end of the file
 //! - SHMEM_REMOVE_SHARED: MADV_REMOVE by one process zeroes the page
 //!   for the other too, and the page stays shared
 //! - SHMEM_REMOVE_PAST_SIZE: MADV_REMOVE of a range past the object
 //!   (mapping grown by mremap) is harmless
+//! - SHMEM_MREMAP_DONTUNMAP: after mremap(MREMAP_DONTUNMAP) of shared
+//!   anonymous memory both ranges map the same pages
 //! - SHMEM_BEYOND_SIZE: shared anonymous memory keeps the size it was
 //!   mapped with: a page past it (mapping grown by mremap) is SIGBUS
 //! - FORK_PRIVATE_COW: a MAP_PRIVATE page is copy-on-write: neither side
@@ -23,6 +28,12 @@
 //! - FORK_MPROTECT_COW: mprotect read-only then read-write after fork does
 //!   not make the shared copy-on-write page writable
 //! - FORK_RDONLY_COW: same for a page that was read-only at fork
+//! - FORK_COW_RACE: threads keep writing private pages while another
+//!   thread forks, and the parent writes right after each fork (hot TLB
+//!   entry): every child sees only its pre-fork snapshot
+//! - FAULT_MPROTECT_RACE: a thread keeps read-faulting pages in while
+//!   the range is zapped and made read-only: afterwards no page has a
+//!   writable entry left (a kernel write into each is EFAULT)
 //! - FORK_DONTFORK: a MADV_DONTFORK region is not mapped in the child
 //!   (SIGSEGV), the parent keeps it
 //! - FORK_WIPEONFORK: a MADV_WIPEONFORK region reads zero in the child
@@ -43,13 +54,17 @@
 //!   removes the segment midway; at the end the id is gone and the
 //!   memory comes back
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use super::helpers::{host_mode, print, print_num, println};
 use super::mm_life::meminfo;
 use hk_syscall::{
-    sys_close, sys_exit, sys_fork, sys_madvise, sys_mmap, sys_mprotect, sys_munmap,
-    sys_ftruncate, sys_mremap, sys_nanosleep, sys_open, sys_pipe, sys_pread64, sys_pwrite64, sys_read, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_wait4,
-    sys_unlink, sys_write, Timespec, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, MADV_DONTFORK, MADV_DONTNEED, MADV_REMOVE, MADV_WIPEONFORK,
-    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_MAYMOVE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE,
+    sys_close, sys_exit, sys_fork, sys_ftruncate, sys_madvise, sys_mmap, sys_mprotect,
+    sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pipe, sys_pread64, sys_pwrite64,
+    sys_read, sys_sched_yield, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_unlink,
+    sys_wait4, sys_write, Timespec, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT,
+    MADV_DONTFORK, MADV_DONTNEED, MADV_REMOVE, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_PRIVATE,
+    MAP_SHARED, MREMAP_MAYMOVE, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE,
 };
 
 const MADV_HUGEPAGE: i32 = 14;
@@ -68,11 +83,14 @@ pub fn run_tests() {
     file_shared();
     shmem_dontneed();
     shmem_beyond_size();
+    shmem_dontunmap();
     shmem_remove_shared();
     shmem_remove_past_size();
     private_cow();
     mprotect_cow();
     rdonly_cow();
+    cow_race();
+    mprotect_race();
     dontfork();
     wipeonfork();
     thp();
@@ -276,6 +294,7 @@ fn file_shared() {
         }
         None => report(b"FILE_SHARED_COHERENT", -1),
     }
+    report(b"FILE_PRIVATE_RDONLY", file_private_rdonly());
     match map_file(100, 2 * PAGE) {
         Some((fd, p)) => {
             report(b"FILE_SHARED_EOF", file_eof(p));
@@ -313,6 +332,46 @@ fn file_coherent(fd: i32, p: u64) -> i64 {
     code
 }
 
+/// Read-only fd: private mappings write copies, shared ones stay read-only
+fn file_private_rdonly() -> i64 {
+    let Some((fd, p)) = map_file(PAGE as i64, PAGE) else {
+        return -1;
+    };
+    put(p + 40, BEFORE);
+    sys_munmap(p, PAGE);
+    sys_close(fd as u64);
+    let fd = sys_open(FILE.as_ptr(), O_RDONLY, 0) as i32;
+    let sh = sys_mmap(0, PAGE, PROT_READ, MAP_SHARED, fd, 0);
+    let pv = sys_mmap(0, PAGE, PROT_READ, MAP_PRIVATE, fd, 0);
+    let mut code = 0;
+    if fd < 0 || sh < 0 || pv < 0 {
+        code = 1;
+    } else if sys_mprotect(sh as u64, PAGE, RW) != -13 {
+        code = 2;
+    } else {
+        // Both read-faulted in before the mprotect: the private page must
+        // be (or become) a copy, never the shared one made writable
+        if get(sh as u64 + 40) != BEFORE
+            || get(pv as u64 + 40) != BEFORE
+            || sys_mprotect(pv as u64, PAGE, RW) != 0
+        {
+            code = 3;
+        } else {
+            put(pv as u64 + 40, CHILD);
+            let mut v = 0u64;
+            sys_pread64(fd, (&mut v as *mut u64).cast(), 8, 40);
+            if v != BEFORE || get(sh as u64 + 40) != BEFORE {
+                code = 4;
+            }
+        }
+    }
+    sys_munmap(sh as u64, PAGE);
+    sys_munmap(pv as u64, PAGE);
+    sys_close(fd as u64);
+    sys_unlink(FILE.as_ptr());
+    code
+}
+
 /// The page with the end of the file reads (zero past it), the next
 /// one is SIGBUS
 fn file_eof(p: u64) -> i64 {
@@ -342,6 +401,25 @@ fn shmem_dontneed() {
             return 1;
         }
         0
+    });
+}
+
+fn shmem_dontunmap() {
+    const MREMAP_DONTUNMAP: u32 = 4;
+    one_page(b"SHMEM_MREMAP_DONTUNMAP", MAP_SHARED, |p| {
+        put(p, BEFORE);
+        let q = sys_mremap(p, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, 0);
+        if q < 0 {
+            return 1000 + q;
+        }
+        let q = q as u64;
+        let mut code = if get(q) == BEFORE && get(p) == BEFORE { 0 } else { 1 };
+        put(q + 8, CHILD);
+        if code == 0 && get(p + 8) != CHILD {
+            code = 2;
+        }
+        sys_munmap(q, PAGE);
+        code
     });
 }
 
@@ -792,4 +870,249 @@ fn shm_attach_addr() {
     }
     sys_shmctl(id, IPC_RMID, 0);
     report(b"SHM_ATTACH_ADDR", code);
+}
+
+// ---------------------------------------------------------------------
+// FORK_COW_RACE: writer threads vs fork
+// ---------------------------------------------------------------------
+
+const CLONE_THREAD_FLAGS: u64 = 0x100 // CLONE_VM
+    | 0x200 // CLONE_FS
+    | 0x400 // CLONE_FILES
+    | 0x800 // CLONE_SIGHAND
+    | 0x1_0000 // CLONE_THREAD
+    | 0x4_0000 // CLONE_SYSVSEM
+    | 0x20_0000; // CLONE_CHILD_CLEARTID
+const RACE_PAGES: u64 = 8;
+const WRITERS: usize = 2;
+
+static RACE_BASE: AtomicU64 = AtomicU64::new(0);
+static RACE_STOP: AtomicU64 = AtomicU64::new(0);
+
+#[repr(C, align(16))]
+struct ThreadStack([u8; 16384]);
+static mut STACKS: [ThreadStack; WRITERS] = [const { ThreadStack([0; 16384]) }; WRITERS];
+static mut CTIDS: [u32; WRITERS] = [0; WRITERS];
+
+/// Writer thread `idx`: bump its word (idx) of every page until stopped
+/// (yielding now and then)
+extern "C" fn writer(idx: u64) -> ! {
+    let base = RACE_BASE.load(Ordering::Relaxed);
+    let mut n = 1u64;
+    while RACE_STOP.load(Ordering::Relaxed) == 0 {
+        for pg in 0..RACE_PAGES {
+            put(base + pg * PAGE + idx * 8, n);
+        }
+        n += 1;
+        // hk does not preempt user mode: a busy thread would keep its CPU
+        if n % 16 == 0 {
+            sys_sched_yield();
+        }
+    }
+    sys_exit(0)
+}
+
+/// Start a thread running `f(arg)` on `stack_top`; its tid word `ctid`
+/// is cleared (and woken) when it exits. The tid, or -errno.
+unsafe fn spawn_thread(stack_top: u64, f: extern "C" fn(u64) -> !, arg: u64, ctid: *mut u32) -> i64 {
+    let ret: i64;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            "test rax, rax",
+            "jnz 2f",
+            "mov rdi, r12",
+            "call r13",
+            "ud2",
+            "2:",
+            inlateout("rax") 56i64 => ret,
+            in("rdi") CLONE_THREAD_FLAGS,
+            in("rsi") stack_top,
+            in("rdx") 0u64,
+            in("r10") ctid,
+            in("r8") 0u64,
+            in("r12") arg,
+            in("r13") f,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc 0",
+            "cbnz x0, 2f",
+            "mov x0, x9",
+            "blr x10",
+            "brk #0",
+            "2:",
+            inlateout("x0") CLONE_THREAD_FLAGS as i64 => ret,
+            in("x1") stack_top,
+            in("x2") 0u64,
+            in("x3") 0u64,
+            in("x4") ctid,
+            in("x8") 220u64,
+            in("x9") arg,
+            in("x10") f,
+        );
+    }
+    ret
+}
+
+/// Wait (bounded) for the thread whose tid word is `ctid` to exit
+fn join(ctid: *mut u32) -> bool {
+    for _ in 0..2_000_000u32 {
+        if unsafe { core::ptr::read_volatile(ctid) } == 0 {
+            return true;
+        }
+        sys_sched_yield();
+    }
+    false
+}
+
+/// Child of one race round: its pages must not change (the writer
+/// threads and the parent's post-fork write live in the parent only)
+fn race_child(base: u64, round: u64) -> u64 {
+    let mut snap = [0u64; RACE_PAGES as usize * WRITERS];
+    for pg in 0..RACE_PAGES {
+        for w in 0..WRITERS as u64 {
+            snap[(pg * WRITERS as u64 + w) as usize] = get(base + pg * PAGE + w * 8);
+        }
+    }
+    for _ in 0..200 {
+        sys_sched_yield();
+    }
+    if get(base + 16 * 8) != round {
+        return 1;
+    }
+    for pg in 0..RACE_PAGES {
+        for w in 0..WRITERS as u64 {
+            if get(base + pg * PAGE + w * 8) != snap[(pg * WRITERS as u64 + w) as usize] {
+                return 2;
+            }
+        }
+    }
+    0
+}
+
+fn cow_race() {
+    const NAME: &[u8] = b"FORK_COW_RACE";
+    let base = map(RACE_PAGES * PAGE, MAP_PRIVATE);
+    if base == 0 {
+        report(NAME, -1);
+        return;
+    }
+    for pg in 0..RACE_PAGES {
+        put(base + pg * PAGE, 0);
+    }
+    RACE_BASE.store(base, Ordering::Relaxed);
+    RACE_STOP.store(0, Ordering::Relaxed);
+    let mut started = 0;
+    for i in 0..WRITERS {
+        let ctid = unsafe { &raw mut CTIDS[i] } as *mut u32;
+        let top = unsafe { (&raw mut STACKS[i] as *mut u8).add(16384) } as u64;
+        unsafe { core::ptr::write_volatile(ctid, 1) };
+        if unsafe { spawn_thread(top, writer, i as u64, ctid) } > 0 {
+            started += 1;
+        }
+    }
+    let mut code = if started == WRITERS { 0 } else { -2 };
+    let marker = base + 16 * 8;
+    for round in 1..=20u64 {
+        if code != 0 {
+            break;
+        }
+        put(marker, round);
+        let pid = sys_fork();
+        if pid == 0 {
+            sys_exit(race_child(base, round));
+        }
+        // Right after fork: the parent's TLB still holds the writable
+        // entry it just used
+        put(marker, round + 1000);
+        let r = reap(pid);
+        if r != 0 {
+            code = round as i64 * 100 + r;
+        }
+    }
+    RACE_STOP.store(1, Ordering::Relaxed);
+    for i in 0..WRITERS {
+        if !join(unsafe { &raw mut CTIDS[i] } as *mut u32) && code == 0 {
+            code = -3;
+        }
+    }
+    report(NAME, code);
+    sys_munmap(base, RACE_PAGES * PAGE);
+}
+
+// ---------------------------------------------------------------------
+// FAULT_MPROTECT_RACE: read faults vs MADV_DONTNEED + mprotect
+// ---------------------------------------------------------------------
+
+const MP_PAGES: u64 = 64;
+
+/// Reader thread: read every page of the range until stopped
+extern "C" fn reader(_: u64) -> ! {
+    let base = RACE_BASE.load(Ordering::Relaxed);
+    while RACE_STOP.load(Ordering::Relaxed) == 0 {
+        for pg in 0..MP_PAGES {
+            get(base + pg * PAGE);
+        }
+        sys_sched_yield();
+    }
+    sys_exit(0)
+}
+
+/// Pages of [base, +MP_PAGES) the kernel can still write into (should
+/// be none: the range is read-only)
+fn writable_pages(base: u64) -> i64 {
+    let (r, w) = pipe();
+    let mut bad = 0;
+    for pg in 0..MP_PAGES {
+        // On EFAULT the byte stays in the pipe (at most MP_PAGES pile up)
+        send(w);
+        if sys_read(r, (base + pg * PAGE + 8) as *mut u8, 1) != -14 {
+            bad += 1;
+        }
+    }
+    sys_close(r);
+    sys_close(w);
+    bad
+}
+
+fn mprotect_race() {
+    const NAME: &[u8] = b"FAULT_MPROTECT_RACE";
+    let base = map(MP_PAGES * PAGE, MAP_PRIVATE);
+    if base == 0 {
+        report(NAME, -1);
+        return;
+    }
+    RACE_BASE.store(base, Ordering::Relaxed);
+    RACE_STOP.store(0, Ordering::Relaxed);
+    let ctid = unsafe { &raw mut CTIDS[0] } as *mut u32;
+    let top = unsafe { (&raw mut STACKS[0] as *mut u8).add(16384) } as u64;
+    unsafe { core::ptr::write_volatile(ctid, 1) };
+    let mut code = if unsafe { spawn_thread(top, reader, 0, ctid) } > 0 { 0 } else { -2 };
+    for round in 0..20 {
+        if code != 0 {
+            break;
+        }
+        sys_mprotect(base, MP_PAGES * PAGE, RW);
+        sys_madvise(base, MP_PAGES * PAGE, MADV_DONTNEED);
+        for _ in 0..4 {
+            sys_sched_yield();
+        }
+        sys_mprotect(base, MP_PAGES * PAGE, PROT_READ);
+        let bad = writable_pages(base);
+        if bad != 0 {
+            code = round * 1000 + bad;
+        }
+    }
+    RACE_STOP.store(1, Ordering::Relaxed);
+    if !join(ctid) && code == 0 {
+        code = -3;
+    }
+    report(NAME, code);
+    sys_munmap(base, MP_PAGES * PAGE);
 }
