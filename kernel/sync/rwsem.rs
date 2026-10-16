@@ -2,12 +2,12 @@
 //!
 //! Many readers or one writer. Writer preference: once a writer waits,
 //! new readers queue behind it, so a stream of readers cannot starve
-//! writers. The count word is guarded by a short spin::Mutex (a leaf,
+//! writers. The count word is guarded by a short crate::sync::spin::Mutex (a leaf,
 //! never held across a sleep); waiters sleep on one wait queue and are
 //! all woken on release (their conditions differ, see LOCKING.md wait
 //! queues).
 
-use spin::Mutex as SpinMutex;
+use crate::sync::spin::Mutex as SpinMutex;
 
 use super::{can_sleep, might_sleep};
 use crate::waitqueue::WaitQueue;
@@ -54,6 +54,7 @@ impl RwSem {
     }
 
     /// Shared acquire (Linux down_read)
+    #[track_caller]
     pub fn down_read(&self) {
         might_sleep();
         let ok = |c: &Count| !c.writer && c.waiting_writers == 0;
@@ -85,6 +86,7 @@ impl RwSem {
     }
 
     /// Exclusive acquire (Linux down_write)
+    #[track_caller]
     pub fn down_write(&self) {
         might_sleep();
         let ok = |c: &Count| !c.writer && c.readers == 0;

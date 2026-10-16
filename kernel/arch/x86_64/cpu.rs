@@ -348,15 +348,6 @@ pub fn get_kernel_stack() -> u64 {
     unsafe { TSS.privilege_stack_table[0] }
 }
 
-/// Read the current CR3 value (page table root)
-pub fn read_cr3() -> u64 {
-    let cr3: u64;
-    unsafe {
-        ::core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-    }
-    cr3
-}
-
 /// Get the current GDT pointer (limit and base)
 pub fn get_gdt_ptr() -> (u16, u64) {
     #[repr(C, packed)]
@@ -496,3 +487,11 @@ pub fn reload_idt() {
         }
     }
 }
+
+/// ELF auxv AT_HWCAP: CPUID.1:EDX (Linux ELF_HWCAP on x86-64)
+pub fn elf_hwcap() -> u64 {
+    core::arch::x86_64::__cpuid(1).edx as u64
+}
+
+/// ELF auxv AT_PLATFORM string
+pub const ELF_PLATFORM: &[u8] = b"x86_64";

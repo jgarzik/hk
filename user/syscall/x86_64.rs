@@ -354,6 +354,7 @@ pub const SYS_FUTEX_WAITV: u64 = 449;
 pub const SYS_UTIMENSAT: u64 = 280;
 pub const SYS_PIPE2: u64 = 293;
 pub const SYS_DUP3: u64 = 292;
+pub const SYS_DUP2: u64 = 33;
 pub const SYS_PREADV: u64 = 295;
 pub const SYS_PWRITEV: u64 = 296;
 pub const SYS_PREADV2: u64 = 327;
@@ -438,6 +439,11 @@ pub fn sys_open(path: *const u8, flags: u32, mode: u32) -> i64 {
 #[inline(always)]
 pub fn sys_close(fd: u64) -> i64 {
     unsafe { syscall1!(SYS_CLOSE, fd) }
+}
+
+#[inline(always)]
+pub fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
+    unsafe { syscall2!(SYS_DUP2, oldfd, newfd) }
 }
 
 #[inline(always)]
@@ -2468,4 +2474,41 @@ pub struct Semid64Ds {
     pub sem_nsems: u64,
     pub _unused3: u64,
     pub _unused4: u64,
+}
+
+pub const SYS_NEWFSTATAT: u64 = 262;
+pub const SYS_GETITIMER: u64 = 36;
+pub const SYS_ALARM: u64 = 37;
+pub const SYS_SETITIMER: u64 = 38;
+
+/// newfstatat(dirfd, pathname, statbuf, flags)
+#[inline(always)]
+pub fn sys_fstatat(dirfd: i32, pathname: *const u8, statbuf: *mut Stat, flags: i32) -> i64 {
+    unsafe { syscall4!(SYS_NEWFSTATAT, dirfd, pathname, statbuf, flags) }
+}
+
+/// getitimer(which, curr_value)
+#[inline(always)]
+pub fn sys_getitimer(which: i32, curr: *mut super::ITimerVal) -> i64 {
+    unsafe { syscall2!(SYS_GETITIMER, which, curr) }
+}
+
+/// setitimer(which, new_value, old_value)
+#[inline(always)]
+pub fn sys_setitimer(which: i32, new: *const super::ITimerVal, old: *mut super::ITimerVal) -> i64 {
+    unsafe { syscall3!(SYS_SETITIMER, which, new, old) }
+}
+
+/// alarm(seconds) (x86-64 only)
+#[inline(always)]
+pub fn sys_alarm(seconds: u32) -> i64 {
+    unsafe { syscall1!(SYS_ALARM, seconds) }
+}
+
+pub const SYS_SCHED_YIELD: u64 = 24;
+
+/// sched_yield()
+#[inline(always)]
+pub fn sys_sched_yield() -> i64 {
+    unsafe { syscall0!(SYS_SCHED_YIELD) }
 }

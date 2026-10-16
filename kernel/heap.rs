@@ -2,7 +2,7 @@
 //!
 //! Simple linked-list allocator for the kernel heap.
 //!
-//! Uses IrqSpinlock instead of spin::Mutex to prevent deadlocks
+//! Uses IrqSpinlock instead of crate::sync::spin::Mutex to prevent deadlocks
 //! when page fault handlers (e.g., COW) need to allocate memory
 //! while interrupts are enabled.
 
@@ -48,6 +48,8 @@ struct HeapAllocatorInner {
     heap_start: usize,
     /// End of heap
     heap_end: usize,
+    /// Bytes in free blocks
+    free_bytes: usize,
 }
 
 impl HeapAllocator {
@@ -58,6 +60,7 @@ impl HeapAllocator {
                 free_list: None,
                 heap_start: 0,
                 heap_end: 0,
+                free_bytes: 0,
             }),
         }
     }
@@ -80,6 +83,12 @@ impl HeapAllocator {
             (*block).next = None;
         }
         inner.free_list = Some(block);
+        inner.free_bytes = size;
+    }
+
+    /// Bytes in free blocks (fragmentation not considered)
+    pub fn free_bytes(&self) -> usize {
+        self.inner.lock().free_bytes
     }
 }
 
@@ -124,6 +133,7 @@ unsafe impl GlobalAlloc for HeapAllocator {
                         None => inner.free_list = link,
                     }
                     *((aligned - core::mem::size_of::<usize>()) as *mut usize) = start;
+                    inner.free_bytes -= (*block).size;
                     return aligned as *mut u8;
                 }
                 prev = current;
@@ -144,6 +154,7 @@ unsafe impl GlobalAlloc for HeapAllocator {
         unsafe {
             let start = *((ptr as usize - core::mem::size_of::<usize>()) as *const usize);
             let block = start as *mut Block;
+            inner.free_bytes += (*block).size;
             let mut prev: Option<*mut Block> = None;
             let mut cur = inner.free_list;
             while let Some(c) = cur {

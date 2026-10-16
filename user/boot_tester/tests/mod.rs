@@ -22,6 +22,11 @@ pub mod fpu;
 pub mod fault_signals;
 pub mod ipc;
 pub mod mmap;
+pub mod layout;
+pub mod startup;
+pub mod elf_exec;
+pub mod procfs_access;
+pub mod nproc;
 pub mod rlimit;
 pub mod namespace;
 pub mod sockets;
@@ -62,6 +67,8 @@ pub mod tcp;
 pub mod tcp_conn;
 pub mod tcp_opt;
 pub mod tcp_xfer;
+pub mod tcp_close;
+pub mod net_stress;
 pub mod bigio;
 pub mod keys;
 pub mod kcmp;
@@ -77,8 +84,32 @@ pub mod prctl_extra;
 pub mod poll;
 pub mod timing;
 pub mod uaccess;
+pub mod packet;
+pub mod busybox;
+pub mod mm_life;
 #[cfg(target_arch = "x86_64")]
 pub mod ioport;
+
+/// Run a test group in a child process: boot_tester is init, and a
+/// group that crashes must show up as a FAIL, never kill init
+fn isolated(name: &[u8], f: fn()) {
+    use hk_syscall::{sys_exit, sys_fork, sys_wait4};
+    let before = helpers::fail_count();
+    let pid = sys_fork();
+    if pid == 0 {
+        f();
+        sys_exit((helpers::fail_count() - before).min(255) as u64);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    helpers::add_fails(((st >> 8) & 0xff) as u32);
+    if st & 0x7f != 0 {
+        helpers::print(name);
+        helpers::print(b"_GROUP:FAIL killed by signal ");
+        helpers::print_num((st & 0x7f) as i64);
+        helpers::println(b"");
+    }
+}
 
 /// Run all test categories in order
 pub fn run_all_tests() {
@@ -101,6 +132,12 @@ pub fn run_all_tests() {
     fault_signals::run_tests();
     ipc::run_tests();
     mmap::run_tests();
+    isolated(b"MM_LIFE", mm_life::run_tests);
+    isolated(b"LAYOUT", layout::run_tests);
+    isolated(b"STARTUP", startup::run_tests);
+    isolated(b"ELF_EXEC", elf_exec::run_tests);
+    isolated(b"PROCFS_ACCESS", procfs_access::run_tests);
+    isolated(b"NPROC", nproc::run_tests);
     rlimit::run_tests();
     namespace::run_tests();
     sockets::run_tests();
@@ -137,9 +174,12 @@ pub fn run_all_tests() {
     icmp::run_tests();
     icmp::run_ping_tests();
     raw::run_tests();
+    packet::run_tests();
     tcp_xfer::run_tests();
     tcp_conn::run_tests();
     tcp_opt::run_tests();
+    tcp_close::run_tests();
+    net_stress::run_tests();
     keys::run_tests();
     kcmp::run_tests();
     process_vm::run_tests();
@@ -154,6 +194,7 @@ pub fn run_all_tests() {
     poll::run_tests();
     timing::run_tests();
     uaccess::run_tests();
+    isolated(b"BUSYBOX", busybox::run_tests);
     #[cfg(target_arch = "x86_64")]
     ioport::run_tests();
 }

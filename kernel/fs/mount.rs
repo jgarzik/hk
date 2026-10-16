@@ -6,8 +6,8 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+use crate::sync::spin::RwLock;
 use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use spin::RwLock;
 
 use super::KernelError;
 use super::dentry::Dentry;

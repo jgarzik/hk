@@ -18,9 +18,9 @@
 
 pub mod syscall;
 
+use crate::sync::spin::Mutex;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
 
 use crate::arch::IrqSpinlock;
 use crate::task::{Pid, Tid};
@@ -779,13 +779,15 @@ pub fn clone_task_signal(
 
 /// Clean up signal state on task exit
 pub fn exit_task_signal(tid: Tid) {
-    let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.sighand = None;
-        task.signal_state = TaskSignalState::new();
-        task.tif_sigpending = AtomicBool::new(false);
-        task.signal = None;
-    }
+    // Released after TASK_TABLE (nothing is released under it)
+    let _old = {
+        let mut table = TASK_TABLE.lock();
+        table.tasks.iter_mut().find(|t| t.tid == tid).map(|task| {
+            task.signal_state = TaskSignalState::new();
+            task.tif_sigpending = AtomicBool::new(false);
+            (task.sighand.take(), task.signal.take())
+        })
+    };
 }
 
 // =============================================================================

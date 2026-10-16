@@ -8,16 +8,18 @@
 //!
 //! ## Locking
 //!
-//! `RTNL`: `spin::Mutex<()>`, thread context only, never taken from the
-//! receive path (softnet) or IRQ context. It is the OUTERMOST network
-//! lock: RTNL -> device address lists -> FIB tables -> ARP -> netlink
-//! socket queues. Holders never sleep, never take a socket lock
-//! (`sk_lock`) and never wait for packets. Read-only users (dumps, route
-//! lookups, /proc) do not take it.
+//! `RTNL`: a sleeping `sync::Mutex<()>` (Linux rtnl_mutex), thread
+//! context only, never taken from the receive path (softnet) or IRQ
+//! context, and never while any spinlock is held. It is the OUTERMOST
+//! network lock: RTNL -> device address lists -> FIB tables -> ARP ->
+//! netlink socket queues. Holders may sleep (user copies such as the
+//! SIOCADDRT device name, driver open/stop waiting for NAPI) but never
+//! take a socket lock (`sk_lock`) and never wait for packets. Read-only
+//! users (dumps, route lookups, /proc) do not take it.
 
 use alloc::sync::Arc;
 
-use spin::{Mutex, MutexGuard};
+use crate::sync::{Mutex, MutexGuard};
 
 use crate::error::KernelError;
 use crate::net::NetNamespace;

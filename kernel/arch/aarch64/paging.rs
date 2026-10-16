@@ -9,15 +9,12 @@
 //! - L2: 512 entries, each covering 2MB (can be block descriptor)
 //! - L3: 512 entries, each covering 4KB (page descriptor)
 //!
-//! TTBR0_EL1 is used for user space (lower half of address space)
-//! TTBR1_EL1 is used for kernel space (upper half of address space)
-//!
-//! For simplicity during early boot, we use identity mapping with TTBR0 only.
+//! TTBR0_EL1 maps user space only (lower half of the address space);
+//! TTBR1_EL1 maps the kernel (upper half): see kmap.rs and doc/MEMORY.md.
 
 use core::arch::asm;
-use core::ptr::{read_volatile, write_volatile};
 
-use crate::arch::{FrameAlloc, MapError, PageFlags, PageTable};
+use crate::arch::{FrameAlloc, Leaf, MapError, PageFlags, PageTable};
 
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
@@ -29,23 +26,50 @@ const ENTRIES_PER_TABLE: usize = 512;
 const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 // ============================================================================
-// Physical-to-Virtual Address Conversion
+// Address space layout (see kmap.rs)
 // ============================================================================
-//
-// Phase 1: PAGE_OFFSET = 0 (identity mapping, no-op conversion)
-// Phase 2: PAGE_OFFSET = 0xFFFF_8000_0000_0000 (high-address kernel)
 
-/// Page offset for direct map
-///
-/// Physical address 0 maps to virtual address PAGE_OFFSET.
-/// Currently 0 for identity mapping; will be changed to
-/// 0xFFFF_8000_0000_0000 for high-address kernel.
-pub const PAGE_OFFSET: u64 = 0;
+/// Linear map of RAM: physical address p is at PAGE_OFFSET + p (start of
+/// the TTBR1 half, Linux arm64 48-bit)
+pub const PAGE_OFFSET: u64 = 0xFFFF_0000_0000_0000;
 
-/// Convert physical address to virtual address (direct map)
+/// Kernel image: linked at KIMAGE_OFFSET + physical (kernel.ld)
+pub const KIMAGE_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+
+/// vmalloc/ioremap window (1GB)
+pub const VMALLOC_START: u64 = 0xFFFF_8001_0000_0000;
+
+/// Device window: physical 0-1GB (QEMU virt's GIC, UART, RTC, PCI MMIO)
+/// mapped as Device memory at IO_BASE + physical (an early fixmap)
+pub const IO_BASE: u64 = 0xFFFF_8002_0000_0000;
+
+/// Size of the device window
+pub const IO_SIZE: u64 = 1 << 30;
+
+/// End of user space: all of TTBR0 (48-bit)
+pub const TASK_SIZE: u64 = 1 << 48;
+
+/// Device-window address of a low physical MMIO address
+pub const fn io_va(phys: u64) -> u64 {
+    IO_BASE + phys
+}
+
+/// Convert physical address to virtual address (linear map; Linux __va)
 #[inline]
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
     (phys + PAGE_OFFSET) as *mut u8
+}
+
+/// Convert a linear-map or kernel-image address to physical (Linux __pa)
+#[inline]
+pub fn virt_to_phys(virt: u64) -> u64 {
+    if virt >= KIMAGE_OFFSET {
+        debug_assert!(virt < VMALLOC_START);
+        virt - KIMAGE_OFFSET
+    } else {
+        debug_assert!(virt >= PAGE_OFFSET);
+        virt - PAGE_OFFSET
+    }
 }
 
 /// Convert physical address to page table pointer
@@ -114,67 +138,88 @@ pub const UXN: u64 = 1 << 54;
 /// temporarily read-only for COW sharing between parent and child.
 pub const PAGE_COW: u64 = 1 << 55;
 
-// ============================================================================
-// MAIR_EL1 Memory Attribute Configuration
-// ============================================================================
+/// Physical address bits of a page table entry
+pub const PTE_ADDR_MASK: u64 = ADDR_MASK;
 
-/// Normal memory, Write-Back Cacheable
-/// Outer: Write-Back Non-transient RW-Allocate (0xFF = 0b1111_1111)
-/// Inner: Write-Back Non-transient RW-Allocate
-const MAIR_ATTR_NORMAL: u64 = 0xFF;
+/// Pointer to the 4KB leaf (L3) entry for `va` in the tables rooted at
+/// `root` (valid or not, e.g. a swap entry); None if an upper level is
+/// missing or is a block
+pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
+    let mut table = phys_to_virt(root) as *mut u64;
+    for shift in [39, 30, 21] {
+        let e = unsafe { *table.add(((va >> shift) & 511) as usize) };
+        if e & 0b11 != DESC_TABLE {
+            return None;
+        }
+        table = phys_to_virt(e & ADDR_MASK) as *mut u64;
+    }
+    Some(unsafe { table.add(((va >> 12) & 511) as usize) })
+}
 
-/// Device memory, nGnRnE (non-Gathering, non-Reordering, no Early write ack)
-const MAIR_ATTR_DEVICE: u64 = 0x00;
+/// A leaf entry maps a page
+pub fn pte_present(pte: u64) -> bool {
+    pte & 1 != 0
+}
 
-/// MAIR_EL1 value: Attr0=Normal, Attr1=Device
-pub const MAIR_VALUE: u64 = (MAIR_ATTR_DEVICE << 8) | MAIR_ATTR_NORMAL;
+/// Tear down the user tables under the TTBR0 root `l0_phys` (the
+/// mapping and table part of Linux exit_mmap: unmap_vmas +
+/// free_pgtables). The L0 entries are detached and the TLB invalidated
+/// on all CPUs (`tlbi vmalle1is`) before anything is freed; then each
+/// leaf goes to `put` and every lower table frame is freed. The root
+/// frame itself is left to the caller.
+pub fn free_user(l0_phys: u64, put: &mut dyn FnMut(Leaf)) {
+    let l0 = phys_to_virt_table(l0_phys);
+    let mut top = alloc::vec::Vec::new();
+    for i in 0..ENTRIES_PER_TABLE {
+        // SAFETY: a live root table reached through the linear map; its
+        // entries belong to the caller
+        unsafe {
+            let e = *(*l0).entry(i);
+            if e.is_table() {
+                top.push(e.addr());
+            }
+            (*l0).entry_mut(i).clear();
+        }
+    }
+    flush_tlb_all();
+    for t in top {
+        free_level(t, 1, put);
+    }
+}
 
-// ============================================================================
-// TCR_EL1 Translation Control Register Configuration
-// ============================================================================
+/// Release the table at `phys` (`level` 1, 2 or 3) and everything below
+fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
+    let table = phys_to_virt_table_const(phys);
+    for i in 0..ENTRIES_PER_TABLE {
+        // SAFETY: a detached table frame owned by the caller
+        let e = unsafe { *(*table).entry(i) };
+        match level {
+            3 if e.0 & 0b11 == DESC_PAGE => put(Leaf::Page(e.addr())),
+            3 if e.0 != 0 => put(Leaf::Swap(e.0)),
+            // 1GB user blocks are never created
+            1 if e.is_table() => free_level(e.addr(), 2, put),
+            2 if e.is_block() => put(Leaf::Huge(e.addr())),
+            2 if e.is_table() => free_level(e.addr(), 3, put),
+            _ => {}
+        }
+    }
+    crate::FRAME_ALLOCATOR.free(phys);
+}
 
-/// T0SZ: Size offset for TTBR0 region (16 = 48-bit VA)
-const TCR_T0SZ: u64 = 16;
-
-/// T1SZ: Size offset for TTBR1 region (16 = 48-bit VA)
-const TCR_T1SZ: u64 = 16 << 16;
-
-/// TG0: TTBR0 granule size (0b00 = 4KB)
-const TCR_TG0_4K: u64 = 0b00 << 14;
-
-/// TG1: TTBR1 granule size (0b10 = 4KB)
-const TCR_TG1_4K: u64 = 0b10 << 30;
-
-/// SH0: TTBR0 shareability (0b11 = Inner Shareable)
-const TCR_SH0_INNER: u64 = 0b11 << 12;
-
-/// SH1: TTBR1 shareability (0b11 = Inner Shareable)
-const TCR_SH1_INNER: u64 = 0b11 << 28;
-
-/// ORGN0/IRGN0: TTBR0 outer/inner cacheability (0b01 = Write-Back RW-Allocate)
-const TCR_ORGN0_WB: u64 = 0b01 << 10;
-const TCR_IRGN0_WB: u64 = 0b01 << 8;
-
-/// ORGN1/IRGN1: TTBR1 outer/inner cacheability
-const TCR_ORGN1_WB: u64 = 0b01 << 26;
-const TCR_IRGN1_WB: u64 = 0b01 << 24;
-
-/// IPS: Intermediate Physical Address Size (from ID_AA64MMFR0_EL1.PARange)
-/// We'll detect this at runtime, but default to 40-bit (1TB)
-const TCR_IPS_40BIT: u64 = 0b010 << 32;
-
-/// TCR_EL1 value for 48-bit VA, 4KB granule
-pub const TCR_VALUE: u64 = TCR_T0SZ
-    | TCR_T1SZ
-    | TCR_TG0_4K
-    | TCR_TG1_4K
-    | TCR_SH0_INNER
-    | TCR_SH1_INNER
-    | TCR_ORGN0_WB
-    | TCR_IRGN0_WB
-    | TCR_ORGN1_WB
-    | TCR_IRGN1_WB
-    | TCR_IPS_40BIT;
+/// Switch this CPU's user address space (TTBR0) to `root`
+pub fn activate(root: u64) {
+    unsafe {
+        asm!(
+            "msr ttbr0_el1, {}",
+            "isb",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            in(reg) root,
+            options(nostack)
+        );
+    }
+}
 
 // ============================================================================
 // Page Table Entry Type
@@ -285,183 +330,8 @@ impl Default for RawPageTable {
 }
 
 // ============================================================================
-// Static Boot Page Tables (for identity mapping)
+// TLB maintenance
 // ============================================================================
-
-/// L0 page table (covers 512GB per entry, we need 1 entry for identity map)
-#[repr(C, align(4096))]
-struct BootL0Table {
-    entries: [u64; ENTRIES_PER_TABLE],
-}
-
-/// L1 page table (covers 1GB per entry, using 2MB block descriptors)
-#[repr(C, align(4096))]
-struct BootL1Table {
-    entries: [u64; ENTRIES_PER_TABLE],
-}
-
-/// L2 page table (covers 2MB per entry, using 2MB block descriptors)
-#[repr(C, align(4096))]
-struct BootL2Table {
-    entries: [u64; ENTRIES_PER_TABLE],
-}
-
-/// Static boot page tables for identity mapping
-/// We use 2MB block descriptors to map the first 4GB
-static mut BOOT_L0: BootL0Table = BootL0Table {
-    entries: [0; ENTRIES_PER_TABLE],
-};
-static mut BOOT_L1: BootL1Table = BootL1Table {
-    entries: [0; ENTRIES_PER_TABLE],
-};
-// We need 2 L2 tables to cover 2GB (kernel at 1GB needs at least 1GB mapped above it)
-static mut BOOT_L2_0: BootL2Table = BootL2Table {
-    entries: [0; ENTRIES_PER_TABLE],
-};
-static mut BOOT_L2_1: BootL2Table = BootL2Table {
-    entries: [0; ENTRIES_PER_TABLE],
-};
-
-// ============================================================================
-// MMU Setup Functions
-// ============================================================================
-
-/// Default attributes for normal memory (kernel RWX)
-const KERNEL_NORMAL_ATTRS: u64 = AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL1_RW;
-
-/// Default attributes for device memory (kernel RW, no execute)
-const DEVICE_ATTRS: u64 = AF | ATTR_IDX_DEVICE | AP_EL1_RW | PXN | UXN;
-
-/// Initialize boot page tables for identity mapping
-///
-/// Maps the first 2GB using 2MB block descriptors:
-/// - 0x0000_0000 - 0x4000_0000 (0-1GB): Device memory (for UART, GIC, etc.)
-/// - 0x4000_0000 - 0x8000_0000 (1-2GB): Normal memory (kernel code/data)
-///
-/// # Safety
-/// Must be called once during early boot before enabling MMU.
-pub unsafe fn init_boot_page_tables() {
-    unsafe {
-        // L0[0] -> L1 table
-        let l0 = core::ptr::addr_of_mut!(BOOT_L0);
-        let l1_phys = core::ptr::addr_of!(BOOT_L1) as u64;
-        (*l0).entries[0] = l1_phys | DESC_TABLE;
-
-        // L1[0] -> L2_0 table (for 0-1GB)
-        // L1[1] -> L2_1 table (for 1-2GB)
-        let l1 = core::ptr::addr_of_mut!(BOOT_L1);
-        let l2_0_phys = core::ptr::addr_of!(BOOT_L2_0) as u64;
-        let l2_1_phys = core::ptr::addr_of!(BOOT_L2_1) as u64;
-        (*l1).entries[0] = l2_0_phys | DESC_TABLE;
-        (*l1).entries[1] = l2_1_phys | DESC_TABLE;
-
-        // L2_0: Map 0-1GB as device memory (2MB blocks)
-        // This covers UART (0x0900_0000), GIC (0x0800_0000), etc.
-        let l2_0 = core::ptr::addr_of_mut!(BOOT_L2_0);
-        for i in 0..512 {
-            let phys_addr = (i as u64) * (2 * 1024 * 1024); // 2MB per entry
-            (*l2_0).entries[i] = phys_addr | DEVICE_ATTRS | DESC_BLOCK;
-        }
-
-        // L2_1: Map 1-2GB as normal memory (2MB blocks)
-        // This covers kernel code/data at 0x4000_0000
-        let l2_1 = core::ptr::addr_of_mut!(BOOT_L2_1);
-        for i in 0..512 {
-            let phys_addr = 0x4000_0000 + (i as u64) * (2 * 1024 * 1024); // 2MB per entry
-            (*l2_1).entries[i] = phys_addr | KERNEL_NORMAL_ATTRS | DESC_BLOCK;
-        }
-    }
-}
-
-/// Get the physical address of the boot L0 table
-pub fn boot_page_table_phys() -> u64 {
-    core::ptr::addr_of!(BOOT_L0) as u64
-}
-
-/// Enable the MMU
-///
-/// Follows the ARM Trusted Firmware sequence:
-/// 1. Invalidate TLB
-/// 2. Set MAIR_EL1
-/// 3. Set TCR_EL1
-/// 4. Set TTBR0_EL1/TTBR1_EL1
-/// 5. Barrier (dsb/isb)
-/// 6. Enable MMU via SCTLR_EL1
-///
-/// # Safety
-/// - Boot page tables must be initialized first
-/// - This fundamentally changes how memory is accessed
-pub unsafe fn enable_mmu() {
-    unsafe {
-        let l0_phys = boot_page_table_phys();
-
-        // Step 1: Invalidate all TLB entries for EL1
-        asm!("tlbi vmalle1", options(nostack));
-
-        // Ensure TLB invalidation completes
-        asm!("dsb ish", options(nostack));
-        asm!("isb", options(nostack));
-
-        // Step 2: Set MAIR_EL1 (Memory Attribute Indirection Register)
-        asm!(
-            "msr mair_el1, {mair}",
-            mair = in(reg) MAIR_VALUE,
-            options(nostack)
-        );
-
-        // Step 3: Set TCR_EL1 (Translation Control Register)
-        asm!(
-            "msr tcr_el1, {tcr}",
-            tcr = in(reg) TCR_VALUE,
-            options(nostack)
-        );
-
-        // Step 4a: Set TTBR0_EL1 (Translation Table Base Register 0)
-        // We use TTBR0 for both user and kernel for now (identity mapping)
-        asm!(
-            "msr ttbr0_el1, {ttbr}",
-            ttbr = in(reg) l0_phys,
-            options(nostack)
-        );
-
-        // Step 4b: Set TTBR1_EL1 to the same table for now
-        // (kernel addresses will use this later)
-        asm!(
-            "msr ttbr1_el1, {ttbr}",
-            ttbr = in(reg) l0_phys,
-            options(nostack)
-        );
-
-        // Step 5: Ensure all translation table writes have drained into memory,
-        // the TLB invalidation is complete, and translation register writes
-        // are committed before enabling the MMU
-        asm!("dsb ish", options(nostack));
-        asm!("isb", options(nostack));
-
-        // Step 6: Read SCTLR_EL1, set enable bits, and write back
-        let mut sctlr: u64;
-        asm!(
-            "mrs {sctlr}, sctlr_el1",
-            sctlr = out(reg) sctlr,
-            options(nostack)
-        );
-
-        // Set:
-        // - M (bit 0): MMU enable
-        // - C (bit 2): Data cache enable
-        // - I (bit 12): Instruction cache enable
-        sctlr |= (1 << 0) | (1 << 2) | (1 << 12);
-
-        asm!(
-            "msr sctlr_el1, {sctlr}",
-            sctlr = in(reg) sctlr,
-            options(nostack)
-        );
-
-        // Final synchronization barrier
-        asm!("isb", options(nostack));
-    }
-}
 
 /// Invalidate TLB entry for a specific virtual address
 #[inline]
@@ -567,19 +437,12 @@ impl Aarch64PageTable {
         self.root_phys
     }
 
-    /// Create a page table representing the kernel's identity mapping
-    ///
-    /// Uses the current TTBR1_EL1 value.
+    /// TTBR0 table for kernel threads: empty (the kernel is in TTBR1;
+    /// Linux reserved_pg_dir)
     pub fn kernel_identity() -> Self {
-        let ttbr1: u64;
-        unsafe {
-            asm!("mrs {}, ttbr1_el1", out(reg) ttbr1, options(nostack));
-        }
-        // Mask out ASID (bits [63:48])
-        Self::new(ttbr1 & 0x0000_FFFF_FFFF_FFFF)
+        Self::new(super::kmap::reserved_phys())
     }
 
-    /// Create a page table from current TTBR0_EL1
     /// Create a new user page table (allocates L0)
     pub fn new_user<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) -> Option<Self> {
         let l0_phys = frame_alloc.alloc_frame()?;
@@ -590,65 +453,8 @@ impl Aarch64PageTable {
         Some(Self::new(l0_phys))
     }
 
-    /// Copy kernel mappings from current page table to this one
-    ///
-    /// Creates a new L1 table and copies kernel identity mapping entries.
-    /// This allows user space to have its own mappings in separate L1 entries.
-    pub fn copy_kernel_mappings(&mut self) {
-        // For now with identity mapping, we need L0[0] to point to an L1 table
-        // that has kernel's identity mapping entries (L1[0], L1[1]) but allows
-        // user mappings in other L1 entries (L1[2], etc.)
-        //
-        // We just make L0[0] point directly to kernel's L1 table for simplicity.
-        // User mappings will create new L2/L3 tables as needed.
-        unsafe {
-            let kernel_l0 = phys_to_virt(boot_page_table_phys()) as *const u64;
-            let user_l0 = phys_to_virt(self.root_phys) as *mut u64;
-
-            // Copy L0[0] - this makes us share kernel's L1 table
-            // This is OK because user space uses different L1 entries than kernel
-            write_volatile(user_l0, read_volatile(kernel_l0));
-        }
-    }
-
-    /// Copy kernel mappings with a dedicated L1 table for fork()
-    ///
-    /// This creates a new L1 table and copies kernel entries, allowing
-    /// the forked process to have independent user mappings.
-    pub fn copy_kernel_mappings_with_alloc<FA: FrameAlloc<PhysAddr = u64>>(
-        &mut self,
-        frame_alloc: &mut FA,
-    ) -> Result<(), i32> {
-        unsafe {
-            let kernel_l0 = phys_to_virt_table_const(boot_page_table_phys());
-            let kernel_l0_entry = (*kernel_l0).entry(0);
-
-            if !kernel_l0_entry.is_valid() || !kernel_l0_entry.is_table() {
-                return Err(-22); // EINVAL - kernel L0[0] must be valid table
-            }
-
-            let kernel_l1 = phys_to_virt_table_const(kernel_l0_entry.addr());
-
-            // Allocate new L1 table for this page table
-            let new_l1_phys = frame_alloc.alloc_frame().ok_or(-12i32)?;
-            core::ptr::write_bytes(phys_to_virt(new_l1_phys), 0, PAGE_SIZE as usize);
-            let new_l1 = phys_to_virt_table(new_l1_phys);
-
-            // Copy kernel's L1 entries (0 and 1 cover identity-mapped region)
-            // L1[0] covers 0-1GB, L1[1] covers 1-2GB
-            // User space starts at 0x80000000 which is L1[2]
-            for i in 0..2 {
-                let entry = (*kernel_l1).entry(i);
-                *(*new_l1).entry_mut(i) = *entry;
-            }
-
-            // Set our L0[0] to point to the new L1 table
-            let user_l0 = phys_to_virt_table(self.root_phys);
-            (*user_l0).entry_mut(0).set_table(new_l1_phys);
-
-            Ok(())
-        }
-    }
+    /// Nothing to copy: the kernel lives in TTBR1, shared by all
+    pub fn copy_kernel_mappings(&mut self) {}
 
     /// Map a virtual address to physical with on-demand page table allocation
     pub fn map_with_alloc<FA: FrameAlloc<PhysAddr = u64>>(
@@ -798,23 +604,14 @@ impl Aarch64PageTable {
     /// - On first write, a page fault triggers COW resolution (copy then)
     ///
     /// This is much more efficient than eager copying, especially for fork+exec patterns.
+    ///
+    /// `new_pt` is the child's fresh TTBR0 table; on error it holds part
+    /// of the copy, which the caller tears down with the child mm.
     pub fn duplicate_user_space<FA: FrameAlloc<PhysAddr = u64>>(
         &self,
+        new_pt: &mut Self,
         frame_alloc: &mut FA,
-    ) -> Result<Self, i32> {
-        use crate::arch::Arch;
-        use crate::arch::aarch64::Aarch64Arch;
-
-        const USER_START: u64 = <Aarch64Arch as Arch>::USER_START;
-        const USER_END: u64 = <Aarch64Arch as Arch>::USER_END;
-
-        // Create new user page table
-        let mut new_pt = Self::new_user(frame_alloc).ok_or(-12i32)?; // ENOMEM
-
-        // Copy kernel mappings FIRST, with a dedicated L1 table
-        // This allows user mappings to be independent of other processes
-        new_pt.copy_kernel_mappings_with_alloc(frame_alloc)?;
-
+    ) -> Result<(), i32> {
         // Track range for batch TLB flush
         let mut flush_start: Option<u64> = None;
         let mut flush_end: u64 = 0;
@@ -845,12 +642,8 @@ impl Aarch64PageTable {
 
                     let vaddr_l1 = ((l0_idx as u64) << 39) | ((l1_idx as u64) << 30);
 
-                    // Check for 1GB block
+                    // 1GB blocks are never user mappings
                     if l1_entry.is_block() {
-                        // 1GB block - kernel uses these, skip user-space blocks
-                        if vaddr_l1 < USER_START {
-                            // Kernel region - will be copied via copy_kernel_mappings
-                        }
                         continue;
                     }
 
@@ -881,11 +674,6 @@ impl Aarch64PageTable {
                             }
 
                             let vaddr = vaddr_l2 | ((l3_idx as u64) << 12);
-
-                            // Skip non-user addresses
-                            if !(USER_START..USER_END).contains(&vaddr) {
-                                continue;
-                            }
 
                             // Skip kernel-only pages (ioremap, etc.)
                             // User pages have AP_EL0_RW or AP_EL0_RO set
@@ -919,13 +707,11 @@ impl Aarch64PageTable {
                                 pte_value
                             };
 
-                            // Increment reference count on shared frame
-                            crate::FRAME_ALLOCATOR.incref(src_phys);
-
-                            // Map in child - we need to map with the raw PTE value
-                            // to preserve PAGE_COW flag
+                            // Map in child with the raw PTE value (keeps
+                            // PAGE_COW); the child's PTE holds a reference
                             Self::map_raw_pte(new_pt.root_phys, vaddr, child_pte, frame_alloc)
                                 .map_err(|_| -12i32)?;
+                            crate::FRAME_ALLOCATOR.incref(src_phys);
                         }
                     }
                 }
@@ -937,7 +723,7 @@ impl Aarch64PageTable {
             }
         }
 
-        Ok(new_pt)
+        Ok(())
     }
 
     /// Map a page with a raw PTE value (used by COW to preserve PAGE_COW flag)
@@ -1467,56 +1253,6 @@ impl PageTable for Aarch64PageTable {
     fn kernel_identity() -> Self {
         Aarch64PageTable::kernel_identity()
     }
-
-    fn collect_table_frames(&self) -> alloc::vec::Vec<Self::PhysAddr> {
-        use alloc::vec::Vec;
-        let mut frames = Vec::new();
-
-        // Add the root L0 frame
-        frames.push(self.root_phys);
-
-        unsafe {
-            let l0 = phys_to_virt_table_const(self.root_phys);
-
-            // Walk L0 entries (user space is in lower addresses)
-            for l0_idx in 0..512 {
-                let l0_entry = (*l0).entry(l0_idx);
-                if !l0_entry.is_valid() || l0_entry.is_block() {
-                    continue;
-                }
-
-                let l1_phys = l0_entry.addr();
-                frames.push(l1_phys);
-                let l1 = phys_to_virt_table_const(l1_phys);
-
-                // Walk L1 entries
-                for l1_idx in 0..512 {
-                    let l1_entry = (*l1).entry(l1_idx);
-                    if !l1_entry.is_valid() || l1_entry.is_block() {
-                        continue;
-                    }
-
-                    let l2_phys = l1_entry.addr();
-                    frames.push(l2_phys);
-                    let l2 = phys_to_virt_table_const(l2_phys);
-
-                    // Walk L2 entries
-                    for l2_idx in 0..512 {
-                        let l2_entry = (*l2).entry(l2_idx);
-                        if !l2_entry.is_valid() || l2_entry.is_block() {
-                            continue;
-                        }
-
-                        let l3_phys = l2_entry.addr();
-                        frames.push(l3_phys);
-                        // Don't recurse into L3 - those are user page frames, not table frames
-                    }
-                }
-            }
-        }
-
-        frames
-    }
 }
 
 // ============================================================================
@@ -1772,6 +1508,9 @@ impl Aarch64PageTable {
 
             // Flush entire TLB - splitting affects many addresses
             flush_tlb_all();
+
+            // Each 4KB PTE now holds its own frame reference
+            crate::FRAME_ALLOCATOR.split_huge(huge_phys);
 
             Ok(huge_phys)
         }

@@ -14,10 +14,21 @@ pub struct Timespec {
 
 /// Timeval structure for select syscall
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct Timeval {
     pub tv_sec: i64,
     pub tv_usec: i64,
 }
+
+/// struct itimerval (setitimer/getitimer)
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ITimerVal {
+    pub it_interval: Timeval,
+    pub it_value: Timeval,
+}
+
+pub const ITIMER_REAL: i32 = 0;
 
 // ============================================================================
 // Poll/Select structures

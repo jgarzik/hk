@@ -554,16 +554,12 @@ fn ptrace_kill(target_pid: Pid) -> i64 {
 // =============================================================================
 
 /// Get target's memory descriptor and page table root
-fn get_target_mm_and_pt(
-    target_tid: Tid,
-) -> Option<(alloc::sync::Arc<spin::Mutex<crate::mm::MmStruct>>, u64)> {
-    let table = TASK_TABLE.lock();
-    let task = table.tasks.iter().find(|t| t.tid == target_tid)?;
-
-    let mm = task.mm.clone()?;
-    let pt_root = task.page_table.root_table_phys();
-
-    Some((mm, pt_root))
+fn get_target_mm_and_pt(target_tid: Tid) -> Option<(crate::mm::MmRef, u64)> {
+    // A user reference: the address space cannot be torn down while we
+    // access it (Linux get_task_mm)
+    let mm = crate::mm::get_task_mm_users(target_tid)?;
+    let pgd = mm.pgd();
+    Some((mm, pgd))
 }
 
 /// Read a word from tracee's memory.
@@ -901,4 +897,36 @@ pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
             -EINVAL
         }
     }
+}
+
+/// May the current task read process `pid`'s private state through
+/// /proc (Linux __ptrace_may_access with PTRACE_MODE_READ_FSCREDS):
+/// its own thread group always; otherwise the caller's fsuid/fsgid must
+/// equal all of the target's real, effective and saved ids, or the
+/// caller has CAP_SYS_PTRACE; and a non-dumpable target needs
+/// CAP_SYS_PTRACE too
+pub fn may_read_proc(pid: crate::task::Pid) -> bool {
+    use crate::task::dumpable::SUID_DUMP_USER;
+    let me = percpu::current_cred();
+    if pid == percpu::current_pid() {
+        return true;
+    }
+    let target = {
+        let table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter()
+            .find(|t| t.tgid == pid)
+            .map(|t| (*t.cred, t.prctl.dumpable, t.mm.is_some()))
+    };
+    let Some((c, dumpable, has_mm)) = target else {
+        return false;
+    };
+    let cap = capable(CAP_SYS_PTRACE);
+    let (u, g) = (me.fsuid, me.fsgid);
+    let ids = u == c.uid && u == c.euid && u == c.suid && g == c.gid && g == c.egid && g == c.sgid;
+    if !ids && !cap {
+        return false;
+    }
+    !has_mm || dumpable == SUID_DUMP_USER || cap
 }

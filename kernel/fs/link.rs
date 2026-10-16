@@ -158,7 +158,9 @@ pub fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i
     let target = match inode.i_op.readlink(&inode) {
         Ok(t) => t,
         Err(KernelError::OperationNotSupported) => return KernelError::InvalidArgument.sysret(),
-        Err(_) => return KernelError::InvalidArgument.sysret(),
+        // e.g. /proc/<pid>/exe: EACCES, ENOENT (Linux returns the
+        // get_link error)
+        Err(e) => return e.sysret(),
     };
 
     // Copy to user buffer (without null terminator)

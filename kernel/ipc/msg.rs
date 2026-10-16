@@ -19,11 +19,11 @@ use crate::ipc::util::{
 use crate::ipc::{
     IPC_64, IPC_NOWAIT, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Msqid64Ds, current_ipc_ns,
 };
+use crate::sync::spin::Mutex;
 use crate::task::percpu::current_pid;
 use crate::time::TIMEKEEPER;
 use crate::uaccess::{copy_from_user, copy_to_user, get_user, put_user};
 use crate::waitqueue::WaitQueue;
-use spin::Mutex;
 
 /// Get current time in seconds
 fn current_time_secs() -> i64 {

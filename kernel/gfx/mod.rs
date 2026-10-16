@@ -42,10 +42,10 @@ pub mod ioctl;
 pub mod mode;
 pub mod simplegfx;
 
+use crate::sync::spin::{Mutex, RwLock};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use spin::{Mutex, RwLock};
 
 use crate::chardev::{CharDevice, DevId, DeviceError};
 

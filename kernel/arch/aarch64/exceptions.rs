@@ -64,14 +64,18 @@ extern "C" fn handle_el1_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             let is_translation_fault = (0x04..=0x07).contains(&dfsc);
             let is_permission_fault = (0x0C..=0x0F).contains(&dfsc);
             let is_user_addr = far >> 48 == 0; // TTBR0 (user) range
+            // (not resolved with page faults disabled: a spinlock is held)
             if is_user_addr {
-                if is_translation_fault
+                let resolve = !crate::uaccess::pagefault_disabled();
+                if resolve
+                    && is_translation_fault
                     && (handle_swap_fault(far) == Some(true)
                         || handle_mmap_fault(far, is_write) == Some(true))
                 {
                     return;
                 }
-                if is_permission_fault && is_write && handle_cow_fault(far) == Some(true) {
+                if resolve && is_permission_fault && is_write && handle_cow_fault(far) == Some(true)
+                {
                     return;
                 }
                 // Unresolvable fault inside a user-copy routine: resume at its
@@ -218,6 +222,13 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             // Permission fault = page present but access denied (COW candidate)
             // DFSC 0x0C-0x0F are permission faults at different levels
             let is_permission_fault = (0x0C..=0x0F).contains(&dfsc);
+
+            // A kernel (TTBR1) address is never resolved: its table
+            // indices would alias a user address in TTBR0
+            if far >= super::paging::TASK_SIZE {
+                user_abort(frame, esr, far, dfsc);
+                return;
+            }
 
             if is_translation_fault {
                 // Try to handle as swap fault first (swapped-out page with swap entry in PTE)
@@ -393,7 +404,11 @@ fn try_huge_page_fault(
 
     // Zero the 2MB region
     unsafe {
-        core::ptr::write_bytes(huge_frame as *mut u8, 0, HUGE_PAGE_SIZE as usize);
+        core::ptr::write_bytes(
+            crate::arch::phys_to_virt(huge_frame),
+            0,
+            HUGE_PAGE_SIZE as usize,
+        );
     }
 
     // Build page flags from VMA protection
@@ -532,7 +547,7 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
     if vma_is_anonymous {
         // Anonymous mapping - zero the page
         unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
     } else if let Some(file) = vma_file {
         // File-backed mapping - read file contents into the page
@@ -542,20 +557,22 @@ fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
 
         // First zero the frame in case the read is partial (e.g., at EOF)
         unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
 
         // Read from file into the frame
         // Note: We read directly into the physical frame since it's identity-mapped
         // in the kernel's address space for low physical addresses
-        let buf = unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE as usize) };
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(frame), PAGE_SIZE as usize)
+        };
         let _read_result = file.pread(buf, file_offset);
         // If read fails or returns less than PAGE_SIZE, the remaining bytes are already zeroed
         // This matches Linux behavior for holes/errors
     } else {
         // File-backed but no file reference (shouldn't happen) - zero it
         unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
     }
 
@@ -617,39 +634,39 @@ pub fn map_user_page(ttbr0: u64, vaddr: u64, paddr: u64, attrs: u64) -> Result<(
     const TABLE_DESC: u64 = 0b11;
 
     unsafe {
-        let l0 = ttbr0 as *mut u64;
+        let l0 = crate::arch::aarch64::paging::phys_to_virt(ttbr0) as *mut u64;
 
         // Get or create L1 table
         let l0_entry = *l0.add(l0_idx);
         let l1 = if (l0_entry & 0b11) == TABLE_DESC {
-            (l0_entry & 0x0000_FFFF_FFFF_F000) as *mut u64
+            crate::arch::aarch64::paging::phys_to_virt(l0_entry & 0x0000_FFFF_FFFF_F000) as *mut u64
         } else {
             let new_l1 = crate::FRAME_ALLOCATOR.alloc().ok_or(())?;
-            core::ptr::write_bytes(new_l1 as *mut u8, 0, 4096);
+            core::ptr::write_bytes(crate::arch::aarch64::paging::phys_to_virt(new_l1), 0, 4096);
             *l0.add(l0_idx) = new_l1 | TABLE_DESC;
-            new_l1 as *mut u64
+            crate::arch::aarch64::paging::phys_to_virt(new_l1) as *mut u64
         };
 
         // Get or create L2 table
         let l1_entry = *l1.add(l1_idx);
         let l2 = if (l1_entry & 0b11) == TABLE_DESC {
-            (l1_entry & 0x0000_FFFF_FFFF_F000) as *mut u64
+            crate::arch::aarch64::paging::phys_to_virt(l1_entry & 0x0000_FFFF_FFFF_F000) as *mut u64
         } else {
             let new_l2 = crate::FRAME_ALLOCATOR.alloc().ok_or(())?;
-            core::ptr::write_bytes(new_l2 as *mut u8, 0, 4096);
+            core::ptr::write_bytes(crate::arch::aarch64::paging::phys_to_virt(new_l2), 0, 4096);
             *l1.add(l1_idx) = new_l2 | TABLE_DESC;
-            new_l2 as *mut u64
+            crate::arch::aarch64::paging::phys_to_virt(new_l2) as *mut u64
         };
 
         // Get or create L3 table
         let l2_entry = *l2.add(l2_idx);
         let l3 = if (l2_entry & 0b11) == TABLE_DESC {
-            (l2_entry & 0x0000_FFFF_FFFF_F000) as *mut u64
+            crate::arch::aarch64::paging::phys_to_virt(l2_entry & 0x0000_FFFF_FFFF_F000) as *mut u64
         } else {
             let new_l3 = crate::FRAME_ALLOCATOR.alloc().ok_or(())?;
-            core::ptr::write_bytes(new_l3 as *mut u8, 0, 4096);
+            core::ptr::write_bytes(crate::arch::aarch64::paging::phys_to_virt(new_l3), 0, 4096);
             *l2.add(l2_idx) = new_l3 | TABLE_DESC;
-            new_l3 as *mut u64
+            crate::arch::aarch64::paging::phys_to_virt(new_l3) as *mut u64
         };
 
         // Set the L3 entry (page descriptor)
@@ -683,28 +700,31 @@ pub fn unmap_user_page(ttbr0: u64, vaddr: u64) -> Option<u64> {
 
     unsafe {
         // L0
-        let l0 = ttbr0 as *const u64;
+        let l0 = crate::arch::aarch64::paging::phys_to_virt(ttbr0) as *const u64;
         let l0_entry = *l0.add(l0_idx);
         if (l0_entry & 0b11) != TABLE_DESC {
             return None;
         }
 
         // L1
-        let l1 = (l0_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l1 = crate::arch::aarch64::paging::phys_to_virt(l0_entry & 0x0000_FFFF_FFFF_F000)
+            as *const u64;
         let l1_entry = *l1.add(l1_idx);
         if (l1_entry & 0b11) != TABLE_DESC {
             return None;
         }
 
         // L2
-        let l2 = (l1_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l2 = crate::arch::aarch64::paging::phys_to_virt(l1_entry & 0x0000_FFFF_FFFF_F000)
+            as *const u64;
         let l2_entry = *l2.add(l2_idx);
         if (l2_entry & 0b11) != TABLE_DESC {
             return None;
         }
 
         // L3
-        let l3 = (l2_entry & 0x0000_FFFF_FFFF_F000) as *mut u64;
+        let l3 = crate::arch::aarch64::paging::phys_to_virt(l2_entry & 0x0000_FFFF_FFFF_F000)
+            as *mut u64;
         let l3_ptr = l3.add(l3_idx);
         let l3_entry = *l3_ptr;
 
@@ -738,7 +758,7 @@ unsafe fn get_pte_for_swap(ttbr0: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
     const TABLE_DESC: u64 = 0b11;
 
     unsafe {
-        let l0 = ttbr0 as *const u64;
+        let l0 = crate::arch::aarch64::paging::phys_to_virt(ttbr0) as *const u64;
 
         // L0 must be present
         let l0_entry = *l0.add(l0_idx);
@@ -747,21 +767,24 @@ unsafe fn get_pte_for_swap(ttbr0: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
         }
 
         // L1 must be present
-        let l1 = (l0_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l1 = crate::arch::aarch64::paging::phys_to_virt(l0_entry & 0x0000_FFFF_FFFF_F000)
+            as *const u64;
         let l1_entry = *l1.add(l1_idx);
         if (l1_entry & 0b11) != TABLE_DESC {
             return None;
         }
 
         // L2 must be present
-        let l2 = (l1_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l2 = crate::arch::aarch64::paging::phys_to_virt(l1_entry & 0x0000_FFFF_FFFF_F000)
+            as *const u64;
         let l2_entry = *l2.add(l2_idx);
         if (l2_entry & 0b11) != TABLE_DESC {
             return None;
         }
 
         // L3 - return PTE regardless of present bit (for swap detection)
-        let l3 = (l2_entry & 0x0000_FFFF_FFFF_F000) as *mut u64;
+        let l3 = crate::arch::aarch64::paging::phys_to_virt(l2_entry & 0x0000_FFFF_FFFF_F000)
+            as *mut u64;
         let pte_ptr = l3.add(l3_idx);
         let pte_value = *pte_ptr;
 
@@ -876,7 +899,7 @@ unsafe fn get_pte_for_cow(ttbr0: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
     const TABLE_DESC: u64 = 0b11;
 
     unsafe {
-        let l0 = ttbr0 as *const u64;
+        let l0 = crate::arch::aarch64::paging::phys_to_virt(ttbr0) as *const u64;
 
         // L0 must be present
         let l0_entry = *l0.add(l0_idx);
@@ -885,21 +908,24 @@ unsafe fn get_pte_for_cow(ttbr0: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
         }
 
         // L1 must be present
-        let l1 = (l0_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l1 = crate::arch::aarch64::paging::phys_to_virt(l0_entry & 0x0000_FFFF_FFFF_F000)
+            as *const u64;
         let l1_entry = *l1.add(l1_idx);
         if (l1_entry & 0b11) != TABLE_DESC {
             return None;
         }
 
         // L2 must be present
-        let l2 = (l1_entry & 0x0000_FFFF_FFFF_F000) as *const u64;
+        let l2 = crate::arch::aarch64::paging::phys_to_virt(l1_entry & 0x0000_FFFF_FFFF_F000)
+            as *const u64;
         let l2_entry = *l2.add(l2_idx);
         if (l2_entry & 0b11) != TABLE_DESC {
             return None;
         }
 
         // L3 - return PTE pointer and value
-        let l3 = (l2_entry & 0x0000_FFFF_FFFF_F000) as *mut u64;
+        let l3 = crate::arch::aarch64::paging::phys_to_virt(l2_entry & 0x0000_FFFF_FFFF_F000)
+            as *mut u64;
         let pte_ptr = l3.add(l3_idx);
         let pte_value = *pte_ptr;
 
@@ -996,13 +1022,16 @@ fn handle_cow_fault(fault_addr: u64) -> Option<bool> {
 
         // Copy page contents
         unsafe {
-            let src = old_phys as *const u8;
-            let dst = new_phys as *mut u8;
+            let src = crate::arch::aarch64::paging::phys_to_virt(old_phys) as *const u8;
+            let dst = crate::arch::aarch64::paging::phys_to_virt(new_phys);
             core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE as usize);
         }
 
         // Clean cache for new page
-        crate::arch::aarch64::cache::cache_clean_range(new_phys as *mut u8, PAGE_SIZE as usize);
+        crate::arch::aarch64::cache::cache_clean_range(
+            crate::arch::aarch64::paging::phys_to_virt(new_phys),
+            PAGE_SIZE as usize,
+        );
 
         // Build new PTE: new physical address, writable, no COW, preserve other attrs
         // Keep AF, SH, ATTR_IDX, PXN/UXN but change permissions

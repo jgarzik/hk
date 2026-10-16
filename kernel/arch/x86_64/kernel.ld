@@ -1,22 +1,29 @@
-/* Kernel linker script for x86-64 */
-/* Loads at 1MB, standard location for x86 kernels */
+/* Kernel linker script for x86-64
+ *
+ * GRUB loads the image at physical 1MB. The 32-bit boot stub and its
+ * page tables are linked there (virtual == physical, they run before
+ * paging and from the boot identity map); everything else is linked
+ * at __START_KERNEL_map + physical (-2GB, the kernel code model) and
+ * loaded at the physical address (AT). Linux: arch/x86/kernel/vmlinux.lds.S
+ */
 
 OUTPUT_FORMAT("elf64-x86-64")
 OUTPUT_ARCH(i386:x86-64)
 ENTRY(_start32)
 
+KERNEL_PHYS = 1M;
+KERNEL_MAP = 0xffffffff80000000;
+
 SECTIONS
 {
-    /* Kernel loads at 1MB (after real mode memory) */
-    . = 1M;
-    __kernel_start = .;
+    . = KERNEL_PHYS;
 
-    /* Multiboot header must be in first 8KB of the file */
-    .multiboot ALIGN(4K) : {
+    /* Multiboot header must be in the first 32KB of the file */
+    .multiboot : {
         KEEP(*(.multiboot))
     }
 
-    /* Boot stub (32-bit code and data) */
+    /* Boot stub: 32-bit code, its data and the boot page tables */
     .boot ALIGN(4K) : {
         *(.boot)
     }
@@ -25,44 +32,52 @@ SECTIONS
         *(.boot_data)
     }
 
-    /* Code section */
-    .text ALIGN(4K) : {
+    .boot_bss ALIGN(4K) (NOLOAD) : {
+        *(.boot_bss)
+    }
+
+    /* High half: virtual = KERNEL_MAP + physical */
+    . = ALIGN(4K);
+    . += KERNEL_MAP;
+    __kernel_start = KERNEL_MAP + KERNEL_PHYS;
+
+    /* Code (read-only, executable) */
+    .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_MAP) {
+        _text = .;
         *(.text .text.*)
     }
 
-    /* Read-only data */
-    .rodata ALIGN(4K) : {
-        *(.rodata .rodata.*)
+    /* AP trampoline code (copied to low memory at runtime) */
+    .trampoline ALIGN(16) : AT(ADDR(.trampoline) - KERNEL_MAP) {
+        *(.trampoline)
     }
+    . = ALIGN(4K);
+    _etext = .;
 
-    /* Read-write data */
-    .data ALIGN(4K) : {
+    /* Read-only data (read-only, no-execute) */
+    .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_MAP) {
+        *(.rodata .rodata.*)
+        *(.got .got.*)
+    }
+    . = ALIGN(4K);
+    __end_rodata = .;
+
+    /* Read-write data (no-execute) */
+    .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_MAP) {
+        _sdata = .;
         *(.data .data.*)
     }
 
-    /* BSS (zero-initialized data) */
-    .bss ALIGN(4K) : {
+    .bss ALIGN(4K) : AT(ADDR(.bss) - KERNEL_MAP) {
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
         __bss_end = .;
     }
 
-    /* Boot BSS (page tables and stack) */
-    .boot_bss ALIGN(4K) : {
-        *(.boot_bss)
-    }
-
-    /* AP trampoline code (will be copied to low memory at runtime) */
-    /* Symbols __trampoline_start and __trampoline_end are defined in trampoline.S */
-    .trampoline ALIGN(4K) : {
-        *(.trampoline)
-    }
-
-    /* Kernel end marker */
+    . = ALIGN(4K);
     __kernel_end = .;
 
-    /* Discard unwanted sections */
     /DISCARD/ : {
         *(.comment)
         *(.note*)

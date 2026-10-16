@@ -20,6 +20,49 @@
 
 extern crate alloc;
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::arch::{CurrentArch, PerCpuOps};
+
+/// Per-CPU page-fault-disable depth (Linux pagefault_disable)
+static PF_DISABLE: [AtomicU32; <CurrentArch as PerCpuOps>::MAX_CPUS] =
+    [const { AtomicU32::new(0) }; <CurrentArch as PerCpuOps>::MAX_CPUS];
+
+fn pf_slot() -> Option<&'static AtomicU32> {
+    PF_DISABLE.get(CurrentArch::try_current_cpu_id()? as usize)
+}
+
+/// Linux pagefault_disable: until `pagefault_enable`, a user access that
+/// faults is not resolved (no sleeping fault-in) but fails at once
+/// (EFAULT through the copy's fixup). For user reads under a spinlock
+/// (futex values); the caller stays on this CPU (it holds a spinlock).
+pub fn pagefault_disable() {
+    if let Some(s) = pf_slot() {
+        s.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn pagefault_enable() {
+    if let Some(s) = pf_slot() {
+        s.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Faults on user addresses must not be resolved here
+pub fn pagefault_disabled() -> bool {
+    pf_slot().is_some_and(|s| s.load(Ordering::Relaxed) != 0)
+}
+
+/// Linux might_fault: a user access may sleep resolving a fault, unless
+/// faults are disabled
+#[track_caller]
+#[inline]
+fn might_fault() {
+    if !pagefault_disabled() {
+        crate::sync::might_sleep();
+    }
+}
+
 /// Error type for user memory access failures
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UaccessError {
@@ -40,24 +83,17 @@ pub type UaccessResult<T> = Result<T, UaccessError>;
 /// - User address space bounds checking (`access_ok`)
 /// - SMAP/SMEP or equivalent protection toggling
 pub trait UaccessArch {
-    /// Start of valid user address space
-    const USER_START: u64;
-    /// End of valid user address space (exclusive)
-    const USER_END: u64;
+    /// End of user space (exclusive; Linux TASK_SIZE_MAX)
+    const TASK_SIZE: u64;
 
-    /// Check if a user address range is valid for access
+    /// Check if a user address range is valid
     ///
-    /// Returns true if the entire range [addr, addr+size) is within user space.
-    /// This is equivalent to Linux's `access_ok()` macro.
+    /// True if the whole range [addr, addr+size) lies below TASK_SIZE
+    /// (Linux `access_ok`: no lower bound; a pointer into an unmapped
+    /// low page faults and the copy returns EFAULT).
     fn access_ok(addr: u64, size: usize) -> bool {
-        // Check for overflow
-        let end = match addr.checked_add(size as u64) {
-            Some(e) => e,
-            None => return false,
-        };
-
-        // Check bounds
-        addr >= Self::USER_START && end <= Self::USER_END
+        addr.checked_add(size as u64)
+            .is_some_and(|end| end <= Self::TASK_SIZE)
     }
 
     /// Enable user memory access (for SMAP-enabled CPUs)
@@ -114,7 +150,9 @@ pub trait UaccessArch {
 ///     // Success
 /// }
 /// ```
+#[track_caller]
 pub fn copy_to_user<A: UaccessArch>(to: u64, from: &[u8]) -> UaccessResult<usize> {
+    might_fault();
     let len = from.len();
 
     // Validate user address
@@ -151,11 +189,13 @@ pub fn copy_to_user<A: UaccessArch>(to: u64, from: &[u8]) -> UaccessResult<usize
 /// # Safety
 /// The kernel destination slice must be valid and have capacity >= len.
 /// The user source is validated by this function.
+#[track_caller]
 pub fn copy_from_user<A: UaccessArch>(
     to: &mut [u8],
     from: u64,
     len: usize,
 ) -> UaccessResult<usize> {
+    might_fault();
     // Validate user address
     if !A::access_ok(from, len) {
         return Err(UaccessError::BadAddress);
@@ -191,7 +231,9 @@ pub fn copy_from_user<A: UaccessArch>(
 /// # Returns
 /// * `Ok(())` on success
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
+#[track_caller]
 pub fn put_user<A: UaccessArch, T: Copy>(to: u64, value: T) -> UaccessResult<()> {
+    might_fault();
     let size = ::core::mem::size_of::<T>();
 
     // Validate user address
@@ -228,7 +270,9 @@ pub fn put_user<A: UaccessArch, T: Copy>(to: u64, value: T) -> UaccessResult<()>
 /// # Returns
 /// * `Ok(value)` on success
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
+#[track_caller]
 pub fn get_user<A: UaccessArch, T: Copy + Default>(from: u64) -> UaccessResult<T> {
+    might_fault();
     let size = ::core::mem::size_of::<T>();
 
     // Validate user address
@@ -292,10 +336,12 @@ pub fn copy_val_to_user<A: UaccessArch, T: Copy>(to: u64, value: &T) -> UaccessR
 /// * `Ok(String)` containing the string (without null terminator) on success
 /// * `Err(UaccessError::BadAddress)` if user address is invalid
 /// * `Err(UaccessError::Overflow)` if string exceeds max_len
+#[track_caller]
 pub fn strncpy_from_user<A: UaccessArch>(
     from: u64,
     max_len: usize,
 ) -> UaccessResult<alloc::string::String> {
+    might_fault();
     use alloc::string::String;
 
     // Validate initial address (we'll check byte by byte)

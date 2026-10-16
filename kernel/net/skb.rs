@@ -91,6 +91,10 @@ pub struct SkBuff {
     /// Received IP header TTL and TOS (for IP_RECVTTL / IP_RECVTOS)
     pub ip_ttl: u8,
     pub ip_tos: u8,
+    /// Sending socket of a frame from an AF_PACKET socket (its address
+    /// as an id, 0 if none): its own outgoing tap skips it (Linux
+    /// skb_loop_sk)
+    pub owner: usize,
     /// Start of the MAC header in the buffer (null until received)
     mac: *mut u8,
     /// Start of the IP header of a received packet (null until marked)
@@ -159,6 +163,7 @@ impl SkBuff {
             ip_bcast: false,
             ip_ttl: 0,
             ip_tos: 0,
+            owner: 0,
             mac: core::ptr::null_mut(),
             nh: core::ptr::null_mut(),
         }))
@@ -340,6 +345,7 @@ impl SkBuff {
         self.daddr = None;
         self.pkt_type = PktType::Host;
         self.ip_bcast = false;
+        self.owner = 0;
         self.mac = core::ptr::null_mut();
         self.nh = core::ptr::null_mut();
     }

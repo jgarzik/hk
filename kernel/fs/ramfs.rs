@@ -22,8 +22,8 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+use crate::sync::spin::RwLock;
 use ::core::cmp::min;
-use spin::RwLock;
 
 use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
 
@@ -56,6 +56,23 @@ impl AddressSpaceOps for RamfsAddressSpaceOps {
     fn writepage(&self, _file_id: FileId, _page_offset: u64, _buf: &[u8]) -> Result<usize, i32> {
         // Ramfs pages are unevictable - writepage should never be called
         Err(-5) // EIO
+    }
+}
+
+/// Page-cache errors of ramfs writes: no memory for a new page is
+/// ENOSPC (like a full tmpfs; the frame reserve is kept for the kernel)
+fn page_err(e: KernelError) -> KernelError {
+    match e {
+        KernelError::OutOfMemory | KernelError::NoSpace => KernelError::NoSpace,
+        _ => KernelError::Io,
+    }
+}
+
+/// Page-cache errors of ramfs reads (a hole needs a zeroed page): ENOMEM
+fn read_err(e: KernelError) -> KernelError {
+    match e {
+        KernelError::OutOfMemory | KernelError::NoSpace => KernelError::OutOfMemory,
+        _ => KernelError::Io,
     }
 }
 
@@ -163,6 +180,21 @@ impl Children {
 impl Default for Children {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The inode is gone: no directory entry and no open file, mapping or
+/// dentry refers to it any more. Free its page-cache pages (Linux
+/// evict_inode -> truncate_inode_pages_final; ramfs has no other copy).
+/// Never runs with PAGE_CACHE held: the page cache holds no inodes.
+impl Drop for RamfsInodeData {
+    fn drop(&mut self) {
+        use crate::frame_alloc::FrameAllocRef;
+        use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
+        if let Some(id) = self.file_id {
+            let mut fa = FrameAllocRef(&FRAME_ALLOCATOR);
+            PAGE_CACHE.lock().invalidate_file(id, &mut fa);
+        }
     }
 }
 
@@ -460,14 +492,18 @@ impl InodeOps for RamfsInodeOps {
                     true,  // unevictable
                     &RAMFS_AOPS,
                 )
-                .map_err(|_| KernelError::Io)?;
+                .map_err(read_err)?;
             page
         };
 
         // Copy from page to buffer
         let page_size = buf.len();
         unsafe {
-            core::ptr::copy_nonoverlapping(page.frame as *const u8, buf.as_mut_ptr(), page_size);
+            core::ptr::copy_nonoverlapping(
+                crate::arch::phys_to_virt(page.frame) as *const u8,
+                buf.as_mut_ptr(),
+                page_size,
+            );
         }
 
         Ok(page_size)
@@ -505,13 +541,17 @@ impl InodeOps for RamfsInodeOps {
                     true,  // unevictable
                     &RAMFS_AOPS,
                 )
-                .map_err(|_| KernelError::Io)?;
+                .map_err(page_err)?;
             page
         };
 
         // Copy from buffer to page
         unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), page.frame as *mut u8, page_size);
+            core::ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                crate::arch::phys_to_virt(page.frame),
+                page_size,
+            );
         }
         page.mark_dirty();
 
@@ -1040,13 +1080,13 @@ impl FileOps for RamfsFileOps {
                         true,  // unevictable: true for ramfs
                         &RAMFS_AOPS,
                     )
-                    .map_err(|_| KernelError::Io)?;
+                    .map_err(read_err)?;
                 page
             };
 
             // Copy data from page to user buffer
             unsafe {
-                let src = (page.frame as *const u8).add(offset_in_page);
+                let src = (crate::arch::phys_to_virt(page.frame) as *const u8).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
             }
 
@@ -1093,7 +1133,7 @@ impl FileOps for RamfsFileOps {
                 let mut cache = PAGE_CACHE.lock();
                 let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
 
-                let (page, _is_new) = cache
+                let found = cache
                     .find_or_create_page(
                         file_id,
                         page_offset,
@@ -1103,13 +1143,19 @@ impl FileOps for RamfsFileOps {
                         true,  // unevictable: true for ramfs
                         &RAMFS_AOPS,
                     )
-                    .map_err(|_| KernelError::Io)?;
-                page
+                    .map_err(page_err);
+                found.map(|(p, _)| p)
+            };
+            // Out of memory: a partial write reports what was written
+            let page = match page {
+                Ok(p) => p,
+                Err(_) if bytes_written > 0 => break,
+                Err(e) => return Err(e),
             };
 
             // Copy data from user buffer to page
             unsafe {
-                let dst = (page.frame as *mut u8).add(offset_in_page);
+                let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
             }
 
@@ -1120,8 +1166,9 @@ impl FileOps for RamfsFileOps {
         }
 
         // Update file size if it grew
-        if new_size > inode.get_size() {
-            inode.set_size(new_size);
+        let end = pos + bytes_written as u64;
+        if end > inode.get_size() {
+            inode.set_size(end);
         }
 
         file.advance_pos(bytes_written as u64);
@@ -1179,13 +1226,13 @@ impl FileOps for RamfsFileOps {
                         true,  // unevictable: true for ramfs
                         &RAMFS_AOPS,
                     )
-                    .map_err(|_| KernelError::Io)?;
+                    .map_err(read_err)?;
                 page
             };
 
             // Copy data from page to user buffer
             unsafe {
-                let src = (page.frame as *const u8).add(offset_in_page);
+                let src = (crate::arch::phys_to_virt(page.frame) as *const u8).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
             }
 
@@ -1232,7 +1279,7 @@ impl FileOps for RamfsFileOps {
                 let mut cache = PAGE_CACHE.lock();
                 let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
 
-                let (page, _is_new) = cache
+                let found = cache
                     .find_or_create_page(
                         file_id,
                         page_offset,
@@ -1242,13 +1289,19 @@ impl FileOps for RamfsFileOps {
                         true,  // unevictable: true for ramfs
                         &RAMFS_AOPS,
                     )
-                    .map_err(|_| KernelError::Io)?;
-                page
+                    .map_err(page_err);
+                found.map(|(p, _)| p)
+            };
+            // Out of memory: a partial write reports what was written
+            let page = match page {
+                Ok(p) => p,
+                Err(_) if bytes_written > 0 => break,
+                Err(e) => return Err(e),
             };
 
             // Copy data from user buffer to page
             unsafe {
-                let dst = (page.frame as *mut u8).add(offset_in_page);
+                let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
             }
 
@@ -1259,8 +1312,9 @@ impl FileOps for RamfsFileOps {
         }
 
         // Update file size if it grew
-        if new_size > inode.get_size() {
-            inode.set_size(new_size);
+        let end = pos + bytes_written as u64;
+        if end > inode.get_size() {
+            inode.set_size(end);
         }
 
         // NOTE: Unlike write(), we do NOT advance file position
@@ -1544,13 +1598,13 @@ pub fn ramfs_create_file_with_timestamp(
                         true,  // unevictable
                         &RAMFS_AOPS,
                     )
-                    .map_err(|_| KernelError::Io)?;
+                    .map_err(page_err)?;
                 page
             };
 
             // Copy content to page
             unsafe {
-                let dst = (page.frame as *mut u8).add(offset_in_page);
+                let dst = crate::arch::phys_to_virt(page.frame).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(content[bytes_written..].as_ptr(), dst, chunk_size);
             }
             page.mark_dirty();

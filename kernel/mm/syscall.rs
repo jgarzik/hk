@@ -18,7 +18,7 @@ use super::{
     PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, VM_DONTCOPY, VM_DONTDUMP,
     VM_GROWSDOWN, VM_HUGEPAGE, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_NOHUGEPAGE,
     VM_NORESERVE, VM_RAND_READ, VM_SEQ_READ, VM_SHARED, VM_WIPEONFORK, Vma, anon_vma::AnonVma,
-    create_default_mm, get_task_mm, init_task_mm,
+    get_task_mm,
 };
 use crate::error::KernelError;
 
@@ -75,6 +75,9 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     // Validate length
     if length == 0 {
         return KernelError::InvalidArgument.sysret();
+    }
+    if length > super::TASK_SIZE {
+        return KernelError::OutOfMemory.sysret();
     }
 
     // Round up length to page boundary
@@ -133,18 +136,15 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         return e.sysret();
     }
 
-    // Get or create mm for current task
+    // Every user task has an address space; kernel threads have none
     let tid = current_tid();
-    let mm = match get_task_mm(tid) {
-        Some(mm) => mm,
-        None => {
-            // Create new mm for task if doesn't exist
-            let mm = create_default_mm();
-            init_task_mm(tid, mm.clone());
-            mm
-        }
+    let Some(mm) = get_task_mm(tid) else {
+        return KernelError::OutOfMemory.sysret();
     };
 
+    // Mappings replaced by MAP_FIXED: declared first so that they are
+    // dropped after the lock on every return
+    let mut replaced = Vec::new();
     let mut mm_guard = mm.lock();
 
     // Determine mapping address
@@ -153,16 +153,19 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         if addr & (PAGE_SIZE - 1) != 0 {
             return KernelError::InvalidArgument.sysret(); // Must be page-aligned
         }
+        if let Err(e) = super::check_fixed(addr, length) {
+            return e.sysret();
+        }
         // MAP_FIXED_NOREPLACE: fail if address range overlaps existing mapping
         if is_fixed_noreplace && mm_guard.overlaps(addr, addr + length) {
             return KernelError::AlreadyExists.sysret();
         }
-        // MAP_FIXED: remove any existing mappings in range
+        // MAP_FIXED: unmap whatever was there (dropped after unlocking)
         if is_fixed {
-            mm_guard.remove_range(addr, addr + length);
+            replaced = munmap_locked(&mut mm_guard, mm.pgd(), addr, addr + length);
         }
         addr
-    } else if addr != 0 {
+    } else if addr != 0 && super::hint_ok(addr & !(PAGE_SIZE - 1), length) {
         // Hint address - try to use it, fall back to search
         let aligned = addr & !(PAGE_SIZE - 1);
         if !mm_guard.overlaps(aligned, aligned + length) {
@@ -199,7 +202,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         // Set up anon_vma for private anonymous mappings (for swap-out reverse mapping)
         if is_private {
             let anon_vma = AnonVma::new();
-            anon_vma.add_vma(tid, map_addr, map_addr + length);
+            anon_vma.add_vma(mm.pgd(), map_addr, map_addr + length);
             v.set_anon_vma(anon_vma);
         }
         v
@@ -292,6 +295,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
 
     // Release lock before potential page faults
     drop(mm_guard);
+    drop(replaced);
 
     if should_populate {
         populate_range(map_addr, length);
@@ -334,30 +338,40 @@ pub fn sys_munmap(addr: u64, length: u64) -> i64 {
     };
 
     let mut mm_guard = mm.lock();
+    let removed = munmap_locked(&mut mm_guard, mm.pgd(), addr, end);
+    drop(mm_guard);
+    // The VMAs may hold the last reference to a mapped file
+    drop(removed);
+    0
+}
 
-    // Remove VMAs in range
-    let removed = mm_guard.remove_range(addr, end);
-
-    // Update total_vm for RLIMIT_AS tracking and clean up anon_vma
+/// Unmap [start, end) of the current address space, mmap lock held
+/// (Linux do_vmi_munmap): VMAs straddling the edges are split, the
+/// pages inside are released (`unmap_vma_pages`), the VM counters and
+/// rmap chains updated. Returns the removed VMAs for the caller to drop
+/// once it has unlocked.
+pub(crate) fn munmap_locked(mm: &mut super::MmStruct, pgd: u64, start: u64, end: u64) -> Vec<Vma> {
+    let removed = mm.remove_range(start, end);
     for vma in &removed {
-        let pages = (vma.end - vma.start) / PAGE_SIZE;
-        mm_guard.sub_total_vm(pages);
-
-        // Remove this VMA from its anon_vma (for reverse mapping cleanup)
-        if let Some(ref anon_vma) = vma.anon_vma {
-            anon_vma.remove_vma(tid, vma.start);
+        let pages = vma.size() / PAGE_SIZE;
+        mm.sub_total_vm(pages);
+        if vma.is_locked() {
+            mm.sub_locked_vm(pages);
+        }
+        // Drop the address space's rmap chain once no VMA uses it
+        if let Some(av) = &vma.anon_vma {
+            let used = mm
+                .iter()
+                .any(|v| v.anon_vma.as_ref().is_some_and(|a| Arc::ptr_eq(a, av)));
+            if !used {
+                av.remove_root(pgd);
+            }
         }
     }
-
-    // Release lock before doing page table operations
-    drop(mm_guard);
-
-    // Unmap pages from page table for each removed VMA
     if !removed.is_empty() {
-        unmap_vma_pages(&removed, addr, end);
+        unmap_vma_pages(&removed, start, end);
     }
-
-    0
+    removed
 }
 
 /// Unmap pages for removed VMAs
@@ -366,8 +380,6 @@ pub fn sys_munmap(addr: u64, length: u64) -> i64 {
 /// Also updates page descriptors and LRU lists for swap support.
 fn unmap_vma_pages(vmas: &[Vma], unmap_start: u64, unmap_end: u64) {
     use crate::mm::huge_page::HUGE_PAGE_SIZE;
-    use crate::mm::lru::lru_remove;
-    use crate::mm::rmap::page_remove_rmap;
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -394,11 +406,7 @@ fn unmap_vma_pages(vmas: &[Vma], unmap_start: u64, unmap_end: u64) {
                     if start <= huge_base && end >= huge_end {
                         // Unmapping entire huge page - unmap directly
                         if let Some(phys) = X86_64PageTable::unmap_huge_page(cr3, huge_base) {
-                            if vma.is_anon_private() {
-                                page_remove_rmap(phys);
-                                lru_remove(phys);
-                            }
-                            FRAME_ALLOCATOR.decref_huge(phys);
+                            crate::mm::memory::put_huge(phys);
                         }
                         page = huge_end;
                         continue;
@@ -417,13 +425,7 @@ fn unmap_vma_pages(vmas: &[Vma], unmap_start: u64, unmap_end: u64) {
 
                 // Try to unmap this page
                 if let Some(phys) = X86_64PageTable::unmap_page(cr3, page) {
-                    // Update page descriptor and LRU for anonymous pages
-                    if vma.is_anon_private() {
-                        page_remove_rmap(phys);
-                        lru_remove(phys);
-                    }
-                    // Free the physical frame
-                    FRAME_ALLOCATOR.decref(phys);
+                    crate::mm::memory::put_page(phys);
                 }
                 page += PAGE_SIZE;
             }
@@ -456,11 +458,7 @@ fn unmap_vma_pages(vmas: &[Vma], unmap_start: u64, unmap_end: u64) {
                     if start <= huge_base && end >= huge_end {
                         // Unmapping entire huge page
                         if let Some(phys) = Aarch64PageTable::unmap_huge_page(pt_phys, huge_base) {
-                            if vma.is_anon_private() {
-                                page_remove_rmap(phys);
-                                lru_remove(phys);
-                            }
-                            FRAME_ALLOCATOR.decref_huge(phys);
+                            crate::mm::memory::put_huge(phys);
                         }
                         page = huge_end;
                         continue;
@@ -475,12 +473,7 @@ fn unmap_vma_pages(vmas: &[Vma], unmap_start: u64, unmap_end: u64) {
                 }
 
                 if let Some(phys) = Aarch64PageTable::unmap_page(pt_phys, page) {
-                    // Update page descriptor and LRU for anonymous pages
-                    if vma.is_anon_private() {
-                        page_remove_rmap(phys);
-                        lru_remove(phys);
-                    }
-                    FRAME_ALLOCATOR.decref(phys);
+                    crate::mm::memory::put_page(phys);
                 }
                 page += PAGE_SIZE;
             }
@@ -513,7 +506,7 @@ fn unmap_pages_range(start: u64, end: u64) {
                 if start <= huge_base && end >= huge_end {
                     // Unmapping entire huge page
                     if let Some(phys) = X86_64PageTable::unmap_huge_page(cr3, huge_base) {
-                        FRAME_ALLOCATOR.decref_huge(phys);
+                        crate::mm::memory::put_huge(phys);
                     }
                     page = huge_end;
                     continue;
@@ -524,7 +517,7 @@ fn unmap_pages_range(start: u64, end: u64) {
             }
 
             if let Some(phys) = X86_64PageTable::unmap_page(cr3, page) {
-                FRAME_ALLOCATOR.decref(phys);
+                crate::mm::memory::put_page(phys);
             }
             page += PAGE_SIZE;
         }
@@ -549,7 +542,7 @@ fn unmap_pages_range(start: u64, end: u64) {
                 if start <= huge_base && end >= huge_end {
                     // Unmapping entire huge page
                     if let Some(phys) = Aarch64PageTable::unmap_huge_page(pt_phys, huge_base) {
-                        FRAME_ALLOCATOR.decref_huge(phys);
+                        crate::mm::memory::put_huge(phys);
                     }
                     page = huge_end;
                     continue;
@@ -564,7 +557,7 @@ fn unmap_pages_range(start: u64, end: u64) {
             }
 
             if let Some(phys) = Aarch64PageTable::unmap_page(pt_phys, page) {
-                FRAME_ALLOCATOR.decref(phys);
+                crate::mm::memory::put_page(phys);
             }
             page += PAGE_SIZE;
         }
@@ -590,14 +583,8 @@ fn unmap_pages_range(start: u64, end: u64) {
 /// * Shrinking brk - Removes pages and VMA entries for freed range
 pub fn sys_brk(brk: u64) -> i64 {
     let tid = current_tid();
-    let mm = match get_task_mm(tid) {
-        Some(mm) => mm,
-        None => {
-            // No mm - create default one (shouldn't happen for user tasks)
-            let mm = create_default_mm();
-            init_task_mm(tid, mm.clone());
-            mm
-        }
+    let Some(mm) = get_task_mm(tid) else {
+        return 0;
     };
 
     let mut mm_guard = mm.lock();
@@ -626,44 +613,11 @@ pub fn sys_brk(brk: u64) -> i64 {
     }
 
     if new_brk_aligned < old_brk_aligned {
-        // Shrinking: remove pages in [new_brk_aligned, old_brk_aligned)
-        // First, update the heap VMA if one exists
-        let start_brk_aligned = start_brk & !(PAGE_SIZE - 1);
-
-        // Find and shrink/remove the heap VMA
-        // The heap VMA starts at start_brk (or start_brk_aligned)
-        let mut vmas_to_remove = Vec::new();
-        for (i, vma) in mm_guard.iter().enumerate() {
-            // Check if this is the heap VMA (starts at or near start_brk)
-            if vma.start >= start_brk_aligned && vma.start < old_brk_aligned {
-                if vma.end <= new_brk_aligned {
-                    // VMA is completely within new range - keep it
-                    continue;
-                }
-                vmas_to_remove.push(i);
-            }
-        }
-
-        // Remove affected VMAs and potentially re-add a smaller one
-        // For simplicity, we remove overlapping VMAs and recreate if needed
-        let removed = mm_guard.remove_range(new_brk_aligned, old_brk_aligned);
-
-        // Update total_vm for RLIMIT_AS tracking
-        let shrink_pages = (old_brk_aligned - new_brk_aligned) / PAGE_SIZE;
-        mm_guard.sub_total_vm(shrink_pages);
-
-        // Update brk
+        // Unmap the freed part of the heap (the VMA below stays)
+        let removed = munmap_locked(&mut mm_guard, mm.pgd(), new_brk_aligned, old_brk_aligned);
         mm_guard.update_brk(brk);
-
-        // Release lock before page table operations
         drop(mm_guard);
-
-        // Unmap pages
-        if !removed.is_empty() {
-            unmap_vma_pages(&removed, new_brk_aligned, old_brk_aligned);
-        }
-        // Also directly unmap the range in case VMA tracking is imprecise
-        unmap_pages_range(new_brk_aligned, old_brk_aligned);
+        drop(removed);
 
         brk as i64
     } else {
@@ -878,21 +832,25 @@ fn populate_page(
         // Initialize page contents
         if is_anonymous {
             unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
             }
         } else if let Some(f) = file {
             // File-backed: read from file
             let file_offset = vma_offset + (addr - vma_start);
             unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
             }
-            let buf =
-                unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE as usize) };
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(
+                    crate::arch::phys_to_virt(frame),
+                    PAGE_SIZE as usize,
+                )
+            };
             let _ = f.pread(buf, file_offset);
         } else {
             // No file, zero-fill
             unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
             }
         }
 
@@ -938,19 +896,23 @@ fn populate_page(
         // Initialize page contents
         if is_anonymous {
             unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
             }
         } else if let Some(f) = file {
             let file_offset = vma_offset + (addr - vma_start);
             unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
             }
-            let buf =
-                unsafe { core::slice::from_raw_parts_mut(frame as *mut u8, PAGE_SIZE as usize) };
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(
+                    crate::arch::phys_to_virt(frame),
+                    PAGE_SIZE as usize,
+                )
+            };
             let _ = f.pread(buf, file_offset);
         } else {
             unsafe {
-                core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+                core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
             }
         }
 
@@ -1789,7 +1751,7 @@ pub fn sys_madvise(addr: u64, length: u64, advice: i32) -> i64 {
 
 /// Update VMA flags based on madvise advice
 fn madvise_update_vma_flags(
-    mm: &alloc::sync::Arc<spin::Mutex<super::MmStruct>>,
+    mm: &alloc::sync::Arc<super::Mm>,
     start: u64,
     end: u64,
     advice: i32,
@@ -1864,11 +1826,7 @@ fn madvise_update_vma_flags(
 }
 
 /// Handle MADV_DONTNEED - zap pages in range
-fn madvise_dontneed(
-    mm: &alloc::sync::Arc<spin::Mutex<super::MmStruct>>,
-    start: u64,
-    end: u64,
-) -> i64 {
+fn madvise_dontneed(mm: &alloc::sync::Arc<super::Mm>, start: u64, end: u64) -> i64 {
     {
         let mm_guard = mm.lock();
 
@@ -1970,6 +1928,9 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
                 return KernelError::InvalidArgument.sysret();
             }
         }
+        if let Err(e) = super::check_fixed(new_addr, new_len_aligned) {
+            return e.sysret();
+        }
     }
 
     // MREMAP_DONTUNMAP requires old_len == new_len
@@ -1983,6 +1944,8 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         None => return KernelError::BadAddress.sysret(),
     };
 
+    // VMAs unmapped or moved away: dropped after the lock on every return
+    let mut gone: Vec<Vma> = Vec::new();
     let mut mm_guard = mm.lock();
 
     // Find VMA containing old_addr
@@ -2077,10 +2040,9 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
 
         // Determine target address
         let target_addr = if fixed {
-            // MREMAP_FIXED: use specified address
-            // First, unmap any existing mappings at target
+            // MREMAP_FIXED: unmap what is at the target first
             let target_end = new_addr + new_len_aligned;
-            let _ = mm_guard.remove_range(new_addr, target_end);
+            gone = munmap_locked(&mut mm_guard, mm.pgd(), new_addr, target_end);
             new_addr
         } else {
             // Find a new free area
@@ -2090,31 +2052,19 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
             }
         };
 
-        // Create new VMA at target location
+        // Retire the old VMA (found again: the unmap may have split
+        // VMAs), then insert the new one
+        move_vma_out(&mut mm_guard, old_addr, dontunmap, &mut gone);
         let mut new_vma = vma_clone.clone();
         new_vma.start = target_addr;
         new_vma.end = target_addr + new_len_aligned;
-
-        // Insert new VMA
         let new_idx = mm_guard.insert_vma(new_vma);
         mm_guard.add_total_vm(new_len_aligned / PAGE_SIZE);
-        // Try to merge with adjacent VMAs (VMA merging optimization)
         mm_guard.merge_adjacent(new_idx);
-
-        // Handle old VMA based on DONTUNMAP flag
-        if dontunmap {
-            // Keep the old VMA but mark it as anonymous (no file backing)
-            if let Some(vma) = mm_guard.get_vma_mut(vma_idx) {
-                vma.file = None;
-                vma.flags |= MAP_ANONYMOUS;
-            }
-        } else {
-            // Remove old VMA
-            let _ = mm_guard.remove_vma(vma_idx);
-        }
 
         // Release lock before page table operations
         drop(mm_guard);
+        drop(gone);
 
         // Move page table entries
         move_page_tables(old_addr, target_addr, old_len, dontunmap);
@@ -2130,30 +2080,19 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
             None => return KernelError::BadAddress.sysret(),
         };
 
-        // Unmap any existing mappings at target
+        // Unmap what is at the target, retire the old VMA, insert the new
         let target_end = new_addr + new_len_aligned;
-        let _ = mm_guard.remove_range(new_addr, target_end);
-
-        // Create new VMA at target
+        gone = munmap_locked(&mut mm_guard, mm.pgd(), new_addr, target_end);
+        move_vma_out(&mut mm_guard, old_addr, dontunmap, &mut gone);
         let mut new_vma = vma_clone.clone();
         new_vma.start = new_addr;
         new_vma.end = new_addr + new_len_aligned;
         let new_idx = mm_guard.insert_vma(new_vma);
         mm_guard.add_total_vm(new_len_aligned / PAGE_SIZE);
-        // Try to merge with adjacent VMAs (VMA merging optimization)
         mm_guard.merge_adjacent(new_idx);
 
-        // Handle old VMA
-        if dontunmap {
-            if let Some(vma) = mm_guard.get_vma_mut(vma_idx) {
-                vma.file = None;
-                vma.flags |= MAP_ANONYMOUS;
-            }
-        } else {
-            let _ = mm_guard.remove_vma(vma_idx);
-        }
-
         drop(mm_guard);
+        drop(gone);
 
         move_page_tables(old_addr, new_addr, old_len, dontunmap);
 
@@ -2162,6 +2101,22 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
 
     // Same size, no flags - just return old address
     old_addr as i64
+}
+
+/// The VMA starting at `old_addr` after mremap moved it: kept as an
+/// anonymous mapping with MREMAP_DONTUNMAP, else removed into `gone`
+fn move_vma_out(mm: &mut super::MmStruct, old_addr: u64, dontunmap: bool, gone: &mut Vec<Vma>) {
+    let Some(idx) = mm.find_vma_exact(old_addr) else {
+        return;
+    };
+    if dontunmap {
+        if let Some(vma) = mm.get_vma_mut(idx) {
+            vma.file = None;
+            vma.flags |= MAP_ANONYMOUS;
+        }
+    } else {
+        gone.extend(mm.remove_vma(idx));
+    }
 }
 
 /// Move page table entries from old location to new location

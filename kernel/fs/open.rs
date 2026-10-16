@@ -231,6 +231,7 @@ fn filp_open(
     if flags & O_ACCMODE != O_RDONLY {
         file.write_access = w;
     }
+    f_op.open(&file)?;
     Ok(Arc::new(file))
 }
 
@@ -255,8 +256,9 @@ pub fn console_on_rootfs() {
 ///
 /// Returns 0 on success, negative errno on error.
 pub fn sys_close(fd: i32) -> i64 {
-    match current_fd_table().lock().close(fd) {
-        Some(_) => 0,
-        None => KernelError::BadFd.sysret(),
+    if current_fd_table().lock().close(fd) {
+        0
+    } else {
+        KernelError::BadFd.sysret()
     }
 }

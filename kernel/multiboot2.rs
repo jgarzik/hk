@@ -3,6 +3,8 @@
 //! Parses the multiboot2 info structure passed by the bootloader
 //! to extract the memory map and other boot information.
 
+use crate::arch::phys_to_virt;
+
 /// Multiboot2 info header
 #[repr(C)]
 pub struct Multiboot2Info {
@@ -47,278 +49,151 @@ pub const TAG_FRAMEBUFFER: u32 = 8;
 /// Memory types
 pub const MEMORY_AVAILABLE: u32 = 1;
 
-/// Iterator over available memory regions from multiboot2 memory map
-pub struct MemoryMapIter {
-    current: *const MemoryMapEntry,
+/// Tags of the info structure; the bootloader passes physical
+/// addresses, read through the direct map
+struct Tags {
+    cur: *const u8,
     end: *const u8,
-    entry_size: u32,
 }
 
-impl Iterator for MemoryMapIter {
-    type Item = (u64, u64); // (base_addr, length)
+impl Iterator for Tags {
+    type Item = *const TagHeader;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while (self.current as *const u8) < self.end {
-            let entry = unsafe { &*self.current };
-
-            // Move to next entry
-            self.current = unsafe {
-                (self.current as *const u8).add(self.entry_size as usize) as *const MemoryMapEntry
-            };
-
-            // Only return available memory regions
-            if entry.mem_type == MEMORY_AVAILABLE {
-                return Some((entry.base_addr, entry.length));
-            }
+        if self.cur >= self.end {
+            return None;
         }
-        None
+        let tag = self.cur as *const TagHeader;
+        let (kind, size) = unsafe { ((*tag).tag_type, (*tag).size) };
+        if kind == TAG_END {
+            return None;
+        }
+        self.cur = unsafe { self.cur.add(size.next_multiple_of(8) as usize) };
+        Some(tag)
     }
 }
 
-/// Parse multiboot2 info and return iterator over usable memory regions
-///
-/// Returns None if info_ptr is 0 or parsing fails.
+/// # Safety
+/// `info` is the physical address of a valid multiboot2 info structure
+/// (or 0)
+unsafe fn tags(info: u64) -> Tags {
+    if info == 0 {
+        let p = core::ptr::null();
+        return Tags { cur: p, end: p };
+    }
+    let base = phys_to_virt(info) as *const u8;
+    let total = unsafe { (*(base as *const Multiboot2Info)).total_size };
+    Tags {
+        cur: unsafe { base.add(8) },
+        end: unsafe { base.add(total as usize) },
+    }
+}
+
+/// First tag of a type
+unsafe fn find(info: u64, kind: u32) -> Option<*const TagHeader> {
+    unsafe { tags(info) }.find(|&t| unsafe { (*t).tag_type } == kind)
+}
+
+/// NUL-terminated string in the `len` bytes at `p`
+unsafe fn cstr(p: *const u8, len: usize) -> Option<&'static str> {
+    let n = (0..len).find(|&i| unsafe { *p.add(i) } == 0).unwrap_or(len);
+    core::str::from_utf8(unsafe { core::slice::from_raw_parts(p, n) }).ok()
+}
+
+/// Call `f(base, length, type)` for every memory map entry
 ///
 /// # Safety
-/// The caller must ensure info_ptr points to valid multiboot2 info structure.
-pub unsafe fn parse_memory_map(info_ptr: u64) -> Option<MemoryMapIter> {
-    if info_ptr == 0 {
-        return None;
-    }
-
+/// `info` is the physical address of a valid multiboot2 info structure.
+pub unsafe fn for_each_region(info: u64, mut f: impl FnMut(u64, u64, u32)) {
+    let Some(tag) = (unsafe { find(info, TAG_MEMORY_MAP) }) else {
+        return;
+    };
     unsafe {
-        let info = info_ptr as *const Multiboot2Info;
-        let total_size = (*info).total_size;
-
-        // Tags start after the header (8 bytes)
-        let mut tag_ptr = (info_ptr + 8) as *const TagHeader;
-        let info_end = info_ptr + total_size as u64;
-
-        // Iterate through tags to find memory map
-        while (tag_ptr as u64) < info_end {
-            let tag = &*tag_ptr;
-
-            // End tag
-            if tag.tag_type == TAG_END {
-                break;
-            }
-
-            // Found memory map tag
-            if tag.tag_type == TAG_MEMORY_MAP {
-                let mmap_tag = tag_ptr as *const MemoryMapTag;
-                let entry_size = (*mmap_tag).entry_size;
-
-                // Entries start after the tag header (16 bytes for MemoryMapTag)
-                let entries_start = (mmap_tag as *const u8).add(16) as *const MemoryMapEntry;
-                let entries_end = (tag_ptr as *const u8).add(tag.size as usize);
-
-                return Some(MemoryMapIter {
-                    current: entries_start,
-                    end: entries_end,
-                    entry_size,
-                });
-            }
-
-            // Move to next tag (8-byte aligned)
-            let next_offset = ((tag.size + 7) & !7) as usize;
-            tag_ptr = (tag_ptr as *const u8).add(next_offset) as *const TagHeader;
+        let mt = tag as *const MemoryMapTag;
+        let step = (*mt).entry_size as usize;
+        let end = (tag as *const u8).add((*tag).size as usize);
+        let mut p = (tag as *const u8).add(16);
+        while p < end {
+            let e = core::ptr::read_unaligned(p as *const MemoryMapEntry);
+            f(e.base_addr, e.length, e.mem_type);
+            p = p.add(step);
         }
-
-        None
     }
 }
 
 /// Extract the kernel command line from multiboot2 info
 ///
-/// Returns None if no command line tag is present or info_ptr is 0.
+/// # Safety
+/// `info` is the physical address of a valid multiboot2 info structure.
+pub unsafe fn get_cmdline(info: u64) -> Option<&'static str> {
+    let tag = unsafe { find(info, TAG_CMDLINE) }?;
+    unsafe { cstr((tag as *const u8).add(8), (*tag).size as usize - 8) }
+}
+
+/// Find the largest usable memory region above a given address,
+/// as physical (start, end); (0, 0) if none
 ///
 /// # Safety
-/// The caller must ensure info_ptr points to valid multiboot2 info structure.
-pub unsafe fn get_cmdline(info_ptr: u64) -> Option<&'static str> {
-    if info_ptr == 0 {
-        return None;
-    }
-
+/// `info` is the physical address of a valid multiboot2 info structure.
+pub unsafe fn find_largest_region_above(info: u64, min_addr: u64) -> (u64, u64) {
+    let mut best = (0, 0);
     unsafe {
-        let info = info_ptr as *const Multiboot2Info;
-        let total_size = (*info).total_size;
-
-        let mut tag_ptr = (info_ptr + 8) as *const TagHeader;
-        let info_end = info_ptr + total_size as u64;
-
-        while (tag_ptr as u64) < info_end {
-            let tag = &*tag_ptr;
-
-            if tag.tag_type == TAG_END {
-                break;
+        for_each_region(info, |base, len, kind| {
+            let (start, end) = (base.max(min_addr), base + len);
+            if kind == MEMORY_AVAILABLE && end > start && end - start > best.1 - best.0 {
+                best = (start, end);
             }
+        });
+    }
+    best
+}
 
-            if tag.tag_type == TAG_CMDLINE {
-                // String starts after the 8-byte tag header
-                let str_ptr = (tag_ptr as *const u8).add(8);
-                let str_len = tag.size as usize - 8; // Subtract header size
-
-                // Find null terminator (string may be shorter than tag size due to padding)
-                let mut actual_len = 0;
-                while actual_len < str_len {
-                    if *str_ptr.add(actual_len) == 0 {
-                        break;
-                    }
-                    actual_len += 1;
-                }
-
-                let slice = ::core::slice::from_raw_parts(str_ptr, actual_len);
-                return ::core::str::from_utf8(slice).ok();
-            }
-
-            // Move to next tag (8-byte aligned)
-            let next_offset = ((tag.size + 7) & !7) as usize;
-            tag_ptr = (tag_ptr as *const u8).add(next_offset) as *const TagHeader;
-        }
-
-        None
+/// Module tag fields: (physical start, physical end, cmdline)
+unsafe fn module(tag: *const TagHeader) -> (u64, u64, Option<&'static str>) {
+    unsafe {
+        let p = tag as *const u8;
+        let start = *(p.add(8) as *const u32) as u64;
+        let end = *(p.add(12) as *const u32) as u64;
+        (start, end, cstr(p.add(16), (*tag).size as usize - 16))
     }
 }
 
-/// Find the largest usable memory region above a given address
-///
-/// Returns (start, end) of the largest region, or (0, 0) if none found.
-///
-/// # Safety
-/// The caller must ensure info_ptr points to valid multiboot2 info structure.
-pub unsafe fn find_largest_region_above(info_ptr: u64, min_addr: u64) -> (u64, u64) {
-    let mut best_start = 0u64;
-    let mut best_end = 0u64;
-    let mut best_size = 0u64;
-
-    // SAFETY: parse_memory_map is unsafe but we're already in an unsafe context
-    // with the same safety requirements (valid info_ptr)
-    if let Some(iter) = unsafe { parse_memory_map(info_ptr) } {
-        for (base, length) in iter {
-            // Skip regions entirely below min_addr
-            if base + length <= min_addr {
-                continue;
-            }
-
-            // Adjust start if region starts below min_addr
-            let adjusted_start = if base < min_addr { min_addr } else { base };
-            let adjusted_length = length - (adjusted_start - base);
-            let end = adjusted_start + adjusted_length;
-
-            if adjusted_length > best_size {
-                best_start = adjusted_start;
-                best_end = end;
-                best_size = adjusted_length;
-            }
-        }
-    }
-
-    (best_start, best_end)
-}
-
-/// Every range the bootloader placed in memory that the kernel still
-/// reads: the info structure itself and each module, as (start, end)
+/// Every physical range the bootloader placed in memory that the
+/// kernel still reads: the info structure itself and each module
 ///
 /// # Safety
-/// The caller must ensure info_ptr points to valid multiboot2 info structure.
-pub unsafe fn boot_ranges(info_ptr: u64, mut f: impl FnMut(&'static str, u64, u64)) {
-    if info_ptr == 0 {
+/// `info` is the physical address of a valid multiboot2 info structure.
+pub unsafe fn boot_ranges(info: u64, mut f: impl FnMut(&'static str, u64, u64)) {
+    if info == 0 {
         return;
     }
     unsafe {
-        let total_size = (*(info_ptr as *const Multiboot2Info)).total_size;
-        let info_end = info_ptr + total_size as u64;
-        f("multiboot info", info_ptr, info_end);
-        let mut tag_ptr = (info_ptr + 8) as *const TagHeader;
-        while (tag_ptr as u64) < info_end {
-            let tag = &*tag_ptr;
-            if tag.tag_type == TAG_END {
-                break;
-            }
-            if tag.tag_type == TAG_MODULE {
-                let p = tag_ptr as *const u8;
-                let start = *(p.add(8) as *const u32) as u64;
-                let end = *(p.add(12) as *const u32) as u64;
-                f("multiboot module", start, end);
-            }
-            let next_offset = ((tag.size + 7) & !7) as usize;
-            tag_ptr = (tag_ptr as *const u8).add(next_offset) as *const TagHeader;
+        let total = (*(phys_to_virt(info) as *const Multiboot2Info)).total_size;
+        f("multiboot info", info, info + total as u64);
+        for tag in tags(info).filter(|&t| (*t).tag_type == TAG_MODULE) {
+            let (start, end, _) = module(tag);
+            f("multiboot module", start, end);
         }
     }
 }
 
-/// Find a module loaded by the bootloader by its command line string
-///
-/// GRUB's `module2` command loads files as multiboot2 modules. Each module
-/// has a command line string that can be used to identify it.
-///
-/// Returns a slice to the module data if found, None otherwise.
+/// Find a module loaded by the bootloader (GRUB `module2`) whose
+/// command line contains `name`; its data through the direct map
 ///
 /// # Safety
-/// The caller must ensure info_ptr points to valid multiboot2 info structure.
-/// The returned slice is valid for the lifetime of the boot info structure
-/// (i.e., as long as the physical memory is identity-mapped).
-pub unsafe fn find_module(info_ptr: u64, name: &str) -> Option<&'static [u8]> {
-    if info_ptr == 0 {
-        return None;
-    }
-
+/// `info` is the physical address of a valid multiboot2 info structure;
+/// the module memory must stay reserved.
+pub unsafe fn find_module(info: u64, name: &str) -> Option<&'static [u8]> {
     unsafe {
-        let info = info_ptr as *const Multiboot2Info;
-        let total_size = (*info).total_size;
-
-        let mut tag_ptr = (info_ptr + 8) as *const TagHeader;
-        let info_end = info_ptr + total_size as u64;
-
-        while (tag_ptr as u64) < info_end {
-            let tag = &*tag_ptr;
-
-            if tag.tag_type == TAG_END {
-                break;
+        for tag in tags(info).filter(|&t| (*t).tag_type == TAG_MODULE) {
+            let (start, end, cmdline) = module(tag);
+            if cmdline.is_some_and(|c| c.contains(name)) {
+                let p = phys_to_virt(start) as *const u8;
+                return Some(core::slice::from_raw_parts(p, (end - start) as usize));
             }
-
-            if tag.tag_type == TAG_MODULE {
-                // Module tag layout:
-                // - header (8 bytes): type, size
-                // - mod_start (4 bytes): physical start address
-                // - mod_end (4 bytes): physical end address
-                // - cmdline (null-terminated string)
-                let mod_start_ptr = (tag_ptr as *const u8).add(8) as *const u32;
-                let mod_end_ptr = (tag_ptr as *const u8).add(12) as *const u32;
-                let cmdline_ptr = (tag_ptr as *const u8).add(16);
-
-                let mod_start = *mod_start_ptr as u64;
-                let mod_end = *mod_end_ptr as u64;
-
-                // Extract cmdline string (null-terminated)
-                let cmdline_max_len = tag.size as usize - 16;
-                let mut cmdline_len = 0;
-                while cmdline_len < cmdline_max_len {
-                    if *cmdline_ptr.add(cmdline_len) == 0 {
-                        break;
-                    }
-                    cmdline_len += 1;
-                }
-
-                let cmdline_slice = ::core::slice::from_raw_parts(cmdline_ptr, cmdline_len);
-                if let Ok(cmdline) = ::core::str::from_utf8(cmdline_slice) {
-                    // Check if the cmdline matches or contains the name
-                    if cmdline == name || cmdline.contains(name) {
-                        let module_size = (mod_end - mod_start) as usize;
-                        let module_data =
-                            ::core::slice::from_raw_parts(mod_start as *const u8, module_size);
-                        return Some(module_data);
-                    }
-                }
-            }
-
-            // Move to next tag (8-byte aligned)
-            let next_offset = ((tag.size + 7) & !7) as usize;
-            tag_ptr = (tag_ptr as *const u8).add(next_offset) as *const TagHeader;
         }
-
-        None
     }
+    None
 }
 
 /// Framebuffer tag (type 8)
@@ -365,82 +240,45 @@ pub const FRAMEBUFFER_TYPE_EGA_TEXT: u8 = 2;
 pub unsafe fn get_framebuffer(info_ptr: u64) -> Option<crate::gfx::FramebufferInfo> {
     use crate::gfx::{FramebufferInfo, PixelFormat};
 
-    if info_ptr == 0 {
-        return None;
-    }
-
+    let fb_tag = unsafe { find(info_ptr, TAG_FRAMEBUFFER) }? as *const u8;
     unsafe {
-        let info = info_ptr as *const Multiboot2Info;
-        let total_size = (*info).total_size;
+        // Layout (packed): header(8) addr(8) pitch(4) width(4) height(4)
+        // bpp(1) type(1) reserved(2), then for direct RGB the color info
+        let addr = core::ptr::read_unaligned(fb_tag.add(8) as *const u64);
+        let pitch = core::ptr::read_unaligned(fb_tag.add(16) as *const u32);
+        let width = core::ptr::read_unaligned(fb_tag.add(20) as *const u32);
+        let height = core::ptr::read_unaligned(fb_tag.add(24) as *const u32);
+        let bpp = *fb_tag.add(28);
+        let fb_type = *fb_tag.add(29);
 
-        let mut tag_ptr = (info_ptr + 8) as *const TagHeader;
-        let info_end = info_ptr + total_size as u64;
-
-        while (tag_ptr as u64) < info_end {
-            let tag = &*tag_ptr;
-
-            if tag.tag_type == TAG_END {
-                break;
-            }
-
-            if tag.tag_type == TAG_FRAMEBUFFER {
-                let fb_tag = tag_ptr as *const u8;
-
-                // Read fields manually using raw pointer arithmetic (structure is packed)
-                // Layout: header(8) + addr(8) + pitch(4) + width(4) + height(4) + bpp(1) + type(1)
-                let addr = core::ptr::read_unaligned(fb_tag.add(8) as *const u64);
-                let pitch = core::ptr::read_unaligned(fb_tag.add(16) as *const u32);
-                let width = core::ptr::read_unaligned(fb_tag.add(20) as *const u32);
-                let height = core::ptr::read_unaligned(fb_tag.add(24) as *const u32);
-                let bpp = *fb_tag.add(28);
-                let fb_type = *fb_tag.add(29);
-
-                // Only support direct RGB framebuffer
-                if fb_type != FRAMEBUFFER_TYPE_RGB {
-                    return None;
-                }
-
-                // For direct RGB, color info follows the main structure at offset 32
-                // (header:8 + addr:8 + pitch:4 + width:4 + height:4 + bpp:1 + type:1 + reserved:2 = 32)
-                let color_info_ptr = fb_tag.add(32);
-                let red_pos = *color_info_ptr;
-                let red_size = *color_info_ptr.add(1);
-                let green_pos = *color_info_ptr.add(2);
-                let _green_size = *color_info_ptr.add(3);
-                let blue_pos = *color_info_ptr.add(4);
-                let _blue_size = *color_info_ptr.add(5);
-
-                // Determine pixel format from color positions
-                // XRGB8888: R at 16, G at 8, B at 0 (common UEFI GOP format)
-                // XBGR8888: B at 16, G at 8, R at 0
-                let format = if bpp == 32 && red_size == 8 {
-                    if red_pos == 16 && green_pos == 8 && blue_pos == 0 {
-                        PixelFormat::Xrgb8888
-                    } else if blue_pos == 16 && green_pos == 8 && red_pos == 0 {
-                        PixelFormat::Xbgr8888
-                    } else {
-                        // Unknown 32-bit format, try XRGB as fallback
-                        PixelFormat::Xrgb8888
-                    }
-                } else if bpp == 16 {
-                    PixelFormat::Rgb565
-                } else {
-                    // Unsupported bits per pixel
-                    return None;
-                };
-
-                let size = (pitch as u64) * (height as u64);
-
-                return Some(FramebufferInfo::new(
-                    addr, size, width, height, pitch, format,
-                ));
-            }
-
-            // Move to next tag (8-byte aligned)
-            let next_offset = ((tag.size + 7) & !7) as usize;
-            tag_ptr = (tag_ptr as *const u8).add(next_offset) as *const TagHeader;
+        // Only support direct RGB framebuffer
+        if fb_type != FRAMEBUFFER_TYPE_RGB {
+            return None;
         }
 
-        None
+        let color = fb_tag.add(32);
+        let red_pos = *color;
+        let red_size = *color.add(1);
+        let green_pos = *color.add(2);
+        let blue_pos = *color.add(4);
+
+        // XRGB8888: R at 16, G at 8, B at 0 (common UEFI GOP format)
+        // XBGR8888: B at 16, G at 8, R at 0
+        let format = if bpp == 32 && red_size == 8 {
+            if blue_pos == 16 && green_pos == 8 && red_pos == 0 {
+                PixelFormat::Xbgr8888
+            } else {
+                PixelFormat::Xrgb8888
+            }
+        } else if bpp == 16 {
+            PixelFormat::Rgb565
+        } else {
+            return None;
+        };
+
+        let size = (pitch as u64) * (height as u64);
+        Some(FramebufferInfo::new(
+            addr, size, width, height, pitch, format,
+        ))
     }
 }

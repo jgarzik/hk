@@ -15,7 +15,7 @@
 //! - GRND_RANDOM: Use /dev/random pool (treated same as urandom)
 //! - GRND_INSECURE: Don't block even if CRNG not ready
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 /// Flags for getrandom syscall
 pub const GRND_NONBLOCK: u32 = 0x0001;

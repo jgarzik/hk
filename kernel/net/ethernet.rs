@@ -4,7 +4,6 @@
 //! EtherType demultiplexing.
 
 use crate::net::device::NetDevice;
-use crate::net::device::flags::IFF_LOOPBACK;
 use crate::net::skb::SkBuff;
 
 /// Ethernet address length
@@ -117,6 +116,21 @@ pub enum PktType {
     Multicast,
     /// To someone else (seen in promiscuous mode / by taps)
     OtherHost,
+    /// Sent by us (taps only)
+    Outgoing,
+}
+
+impl PktType {
+    /// Linux PACKET_* value (sll_pkttype)
+    pub fn num(self) -> u8 {
+        match self {
+            PktType::Host => 0,
+            PktType::Broadcast => 1,
+            PktType::Multicast => 2,
+            PktType::OtherHost => 3,
+            PktType::Outgoing => 4,
+        }
+    }
 }
 
 /// Classify a received frame and strip its Ethernet header (Linux
@@ -134,14 +148,16 @@ pub fn eth_type_trans(skb: &mut SkBuff, dev: &NetDevice) -> Option<u16> {
     dest.copy_from_slice(&data[0..ETH_ALEN]);
     let proto = u16::from_be_bytes([data[12], data[13]]);
 
-    skb.pkt_type = if dest[0] & 0x01 != 0 {
-        if dest == ETH_BROADCAST {
+    // Linux order: our address first (lo's is all zeros), then group
+    // addresses against the device's broadcast address (lo has none)
+    skb.pkt_type = if dest == dev.mac() {
+        PktType::Host
+    } else if dest[0] & 0x01 != 0 {
+        if dest == dev.link().broadcast {
             PktType::Broadcast
         } else {
             PktType::Multicast
         }
-    } else if dest == dev.mac() || dev.get_flags() & IFF_LOOPBACK != 0 {
-        PktType::Host
     } else {
         PktType::OtherHost
     };

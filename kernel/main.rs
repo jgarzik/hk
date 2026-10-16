@@ -46,6 +46,7 @@ pub mod gfx;
 pub mod net;
 pub mod tty;
 pub mod usb;
+pub mod virtio;
 
 // printkln macro is re-exported at crate root via #[macro_export]
 
@@ -90,7 +91,7 @@ use crate::arch::ArchBusOps;
 use crate::arch::{
     AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps,
     MemoryLayoutOps, PerCpuOps, PowerOps, SmpOps, TimekeeperOps, TimerCallbackOps, VfsInitOps,
-    phys_to_virt,
+    phys_to_virt, virt_to_phys,
 };
 use crate::arch::{SchedArch, SyscallOps, UserModeOps};
 
@@ -105,7 +106,7 @@ use crate::mm::page_cache::{FileId, NULL_AOPS, PAGE_SIZE as PC_PAGE_SIZE, PageCa
 #[allow(unused_imports)]
 use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 // Memory layout constants - x86_64
 // The heap starts at 4MB or above the multiboot2 modules and info (GRUB
@@ -116,7 +117,7 @@ const KERNEL_HEAP_START: usize = 0x400000; // 4MB
 #[cfg(target_arch = "x86_64")]
 const KERNEL_HEAP_SIZE: usize = 0xE00000; // 14MB (up to 18MB where frame allocator starts)
 
-/// The kernel image as linked (start and end symbols in kernel.ld)
+/// The kernel image in physical memory (start and end symbols in kernel.ld)
 fn kernel_range() -> heap::BootRange {
     unsafe extern "C" {
         static __kernel_start: u8;
@@ -124,8 +125,8 @@ fn kernel_range() -> heap::BootRange {
     }
     heap::BootRange {
         name: "kernel image",
-        start: &raw const __kernel_start as usize,
-        end: &raw const __kernel_end as usize,
+        start: virt_to_phys(&raw const __kernel_start as u64) as usize,
+        end: virt_to_phys(&raw const __kernel_end as u64) as usize,
     }
 }
 
@@ -233,7 +234,21 @@ fn aarch64_heap(dtb: u64) -> (usize, usize) {
 #[cfg_attr(not(test), global_allocator)]
 static ALLOCATOR: HeapAllocator = HeapAllocator::new();
 
-/// Global page cache (1024 pages = 4MB max)
+/// The kernel heap is down to the 2MB kept for the kernel when user
+/// data grows (ramfs pages also cost heap: page descriptors and cache
+/// indexes)
+#[cfg(not(test))]
+pub fn heap_low() -> bool {
+    const HEAP_RESERVE: usize = 2 * 1024 * 1024;
+    ALLOCATOR.free_bytes() < HEAP_RESERVE
+}
+
+#[cfg(test)]
+pub fn heap_low() -> bool {
+    false
+}
+
+/// Global page cache (1024 evictable pages = 4MB max)
 static PAGE_CACHE: Mutex<PageCache> = Mutex::new(PageCache::new(1024));
 
 /// Global frame allocator
@@ -273,8 +288,9 @@ pub static EMBEDDED_INITRAMFS: &[u8] = include_bytes!("../user/initramfs-aarch64
 #[cfg(all(target_arch = "x86_64", not(test)))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(multiboot_info: u64) -> ! {
-    // Save multiboot info for later use
+    // Kernel page table first: the boot tables' identity map goes away
     unsafe {
+        arch::x86_64::kmap::init(multiboot_info);
         MULTIBOOT2_INFO = multiboot_info;
     }
 
@@ -301,7 +317,7 @@ pub extern "C" fn _start(multiboot_info: u64) -> ! {
     // Initialize heap allocator
     let (heap_start, heap_size) = x86_64_heap(multiboot_info);
     unsafe {
-        ALLOCATOR.init(heap_start, heap_size);
+        ALLOCATOR.init(phys_to_virt(heap_start as u64) as usize, heap_size);
     }
 
     // Initialize architecture-specific code (GDT, IDT, PIC, PIT)
@@ -328,56 +344,35 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
     // Direct serial output for early boot debugging (bypasses console subsystem)
     crate::arch::aarch64::serial::write_str("hk kernel starting... (aarch64)\r\n");
 
-    // Find DTB in memory (QEMU virt ELF boot places DTB at RAM start)
+    // Find DTB in memory (QEMU virt ELF boot places DTB at RAM start);
+    // the boot tables linear-map the first RAM gigabyte
     {
         const DTB_MAGIC_BE: u32 = 0xd00dfeed;
-        let ram_end = 0x6000_0000u64;
-        let kernel_end = 0x4200_0000u64;
-
-        let specific_addrs: [u64; 4] = [0x4000_0000, 0x4008_0000, 0x4400_0000, 0x4800_0000];
-        let mut found_dtb = false;
-        for &addr in &specific_addrs {
-            let magic = unsafe { ::core::ptr::read_volatile(addr as *const u32) };
-            if magic.swap_bytes() == DTB_MAGIC_BE {
-                unsafe {
-                    DTB_PTR = addr;
-                }
-                found_dtb = true;
-                break;
-            }
-        }
-
-        if !found_dtb {
-            let mut scan_addr = kernel_end;
-            while scan_addr < ram_end {
-                let magic = unsafe { ::core::ptr::read_volatile(scan_addr as *const u32) };
-                if magic.swap_bytes() == DTB_MAGIC_BE {
-                    unsafe {
-                        DTB_PTR = scan_addr;
-                    }
-                    break;
-                }
-                scan_addr += 0x1000;
-            }
+        let magic = |pa: u64| unsafe { ::core::ptr::read_volatile(phys_to_virt(pa) as *const u32) };
+        let found = [0x4000_0000, 0x4008_0000, 0x4400_0000, 0x4800_0000]
+            .into_iter()
+            .chain((0x4200_0000u64..0x6000_0000).step_by(0x1000))
+            .find(|&pa| magic(pa).swap_bytes() == DTB_MAGIC_BE);
+        if let Some(pa) = found {
+            unsafe { DTB_PTR = pa };
         }
     }
 
     // Initialize architecture (CPU features, RTC, etc.)
     CurrentArch::early_init();
 
-    // Initialize page tables and enable MMU
-    unsafe {
-        crate::arch::aarch64::init_mmu();
-    }
-
     // Initialize heap allocator
     let (heap_start, heap_size) = aarch64_heap(unsafe { DTB_PTR });
     unsafe {
-        ALLOCATOR.init(heap_start, heap_size);
+        ALLOCATOR.init(phys_to_virt(heap_start as u64) as usize, heap_size);
     }
 
+    // Final kernel page tables (linear map of all RAM; parsing the DTB
+    // needs the heap)
+    unsafe { crate::arch::aarch64::kmap::init(DTB_PTR) };
+
     // Extract and parse kernel command line from DTB /chosen/bootargs
-    if let Some(cmdline) = crate::arch::aarch64::dtb::extract_bootargs(dtb_ptr as *const u8)
+    if let Some(cmdline) = crate::arch::aarch64::dtb::extract_bootargs(unsafe { DTB_PTR })
         && !cmdline.is_empty()
     {
         printkln!("Cmdline: {}", cmdline);
@@ -392,21 +387,10 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
 const PAGE_SIZE: u64 = 4096;
 const USER_STACK_PAGES: usize = 256;
 
-// x86_64: User stack at top of lower half of 48-bit VA space
-#[cfg(target_arch = "x86_64")]
-const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
-// aarch64: User stack at top of TTBR0 range (just under 512GB for QEMU virt)
-#[cfg(target_arch = "aarch64")]
-const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000; // Same as x86 for simplicity
-
-// PIE base address - where position-independent executables load
-#[cfg(target_arch = "x86_64")]
-const USER_PIE_BASE: u64 = 0x20000000;
-#[cfg(target_arch = "aarch64")]
-const USER_PIE_BASE: u64 = 0x8000_0000; // Above the 2GB kernel identity-mapped region
+use crate::mm::{ELF_ET_DYN_BASE, STACK_TOP as USER_STACK_TOP};
 
 fn load_elf_with_cache<PT, FA>(
-    elf: &crate::elf::ElfExecutable<u64>,
+    elf: &crate::elf::ElfExecutable,
     file_id: FileId,
     elf_data: &[u8],
     page_table: &mut PT,
@@ -466,7 +450,11 @@ where
 
                     // Zero the frame first
                     unsafe {
-                        ::core::ptr::write_bytes(private_frame as *mut u8, 0, PAGE_SIZE as usize);
+                        ::core::ptr::write_bytes(
+                            phys_to_virt(private_frame),
+                            0,
+                            PAGE_SIZE as usize,
+                        );
                     }
 
                     // Try to get data from cache or directly from file
@@ -475,8 +463,8 @@ where
                         // Copy from cached page
                         unsafe {
                             ::core::ptr::copy_nonoverlapping(
-                                cached_page.frame as *const u8,
-                                private_frame as *mut u8,
+                                phys_to_virt(cached_page.frame) as *const u8,
+                                phys_to_virt(private_frame),
                                 PC_PAGE_SIZE,
                             );
                         }
@@ -492,7 +480,7 @@ where
                             unsafe {
                                 ::core::ptr::copy_nonoverlapping(
                                     elf_data.as_ptr().add(file_offset as usize),
-                                    private_frame as *mut u8,
+                                    phys_to_virt(private_frame),
                                     copy_len,
                                 );
                             }
@@ -570,7 +558,7 @@ fn zero_bss(frame: u64, va: u64, file_end: u64, mem_end: u64) {
     let hi = mem_end.min(va + PAGE_SIZE);
     if lo < hi {
         unsafe {
-            ::core::ptr::write_bytes((frame + (lo - va)) as *mut u8, 0, (hi - lo) as usize);
+            ::core::ptr::write_bytes(phys_to_virt(frame + (lo - va)), 0, (hi - lo) as usize);
         }
     }
 }
@@ -578,7 +566,7 @@ fn zero_bss(frame: u64, va: u64, file_end: u64, mem_end: u64) {
 /// Apply ELF relocations for PIE binaries
 ///
 /// For R_*_RELATIVE relocations: *(base + offset) = base + addend
-fn apply_relocations<PT>(elf: &crate::elf::ElfExecutable<u64>, base_addr: u64, page_table: &PT)
+fn apply_relocations<PT>(elf: &crate::elf::ElfExecutable, base_addr: u64, page_table: &PT)
 where
     PT: crate::arch::PageTable<VirtAddr = u64, PhysAddr = u64>,
 {
@@ -627,7 +615,7 @@ where
 
         // Zero the frame
         unsafe {
-            ::core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
+            ::core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
 
         // Map the page
@@ -738,7 +726,15 @@ fn kmain() -> ! {
     let (alloc_base, alloc_size) = CurrentArch::get_frame_alloc_region();
     printkln!("MEM: {} MB", alloc_size / (1024 * 1024));
 
-    // Initialize frame allocator
+    // Initialize frame allocator; its metadata overwrites the start of
+    // the region, which must hold no boot data
+    let meta_end = alloc_base + frame_alloc::BitmapFrameAllocator::meta_size(alloc_size);
+    CurrentArch::for_each_reserved(&mut |start, end| {
+        assert!(
+            end <= alloc_base || start >= meta_end,
+            "boot data {start:#x}-{end:#x} under frame metadata"
+        );
+    });
     FRAME_ALLOCATOR.init(alloc_base, alloc_size);
     FRAME_ALLOCATOR.mark_used(0, alloc_base);
     CurrentArch::for_each_reserved(&mut |start, end| FRAME_ALLOCATOR.mark_used(start, end - start));
@@ -878,6 +874,8 @@ fn kmain() -> ! {
     // Register PCI drivers
     bus_manager.register_driver("pci", Box::new(XhciPciDriver));
     bus_manager.register_driver("pci", Box::new(E1000PciDriver));
+    bus_manager.register_driver("pci", Box::new(crate::virtio::VirtioPciDriver));
+    crate::virtio::register_driver(&crate::net::driver::virtio_net::VIRTIO_NET);
 
     // Register USB drivers (queued until USB bus is created by xHCI)
     bus_manager.register_driver("usb", Box::new(UsbSerialBusDriver));
@@ -1007,7 +1005,7 @@ fn kmain() -> ! {
             // Copy from page to buffer
             unsafe {
                 ::core::ptr::copy_nonoverlapping(
-                    (page.frame as *const u8).add(offset_in_page),
+                    (phys_to_virt(page.frame) as *const u8).add(offset_in_page),
                     init_data_vec[bytes_read..].as_mut_ptr(),
                     chunk_size,
                 );
@@ -1019,10 +1017,7 @@ fn kmain() -> ! {
     let init_bytes: &[u8] = &init_data_vec;
 
     // Parse ELF header
-    fn addr_from_u64(v: u64) -> u64 {
-        v
-    }
-    let elf = match crate::elf::ElfExecutable::<u64>::parse(init_bytes, addr_from_u64) {
+    let elf = match crate::elf::ElfExecutable::parse(init_bytes) {
         Ok(e) => e,
         Err(_) => {
             printkln!("ERR: ELF parse failed");
@@ -1042,7 +1037,11 @@ fn kmain() -> ! {
     user_pt.copy_kernel_mappings();
 
     // Load ELF segments into user page table using page cache
-    let base_addr = if elf.is_pie { USER_PIE_BASE } else { 0 };
+    let base_addr = if elf.is_pie {
+        ELF_ET_DYN_BASE & !(elf.align.max(PAGE_SIZE) - 1)
+    } else {
+        0
+    };
     if let Err(e) = load_elf_with_cache(
         &elf,
         file_id,
@@ -1086,21 +1085,15 @@ fn kmain() -> ! {
         const INIT_KERNEL_STACK_SIZE: usize = 16 * 1024;
         const FRAME_SIZE: usize = 4096;
         let stack_pages = INIT_KERNEL_STACK_SIZE / FRAME_SIZE;
-        let mut stack_base: Option<u64> = None;
-
-        for i in 0..stack_pages {
-            let frame = frame_alloc
-                .alloc_frame()
-                .expect("Failed to allocate kernel stack for init");
-            if i == 0 {
-                stack_base = Some(frame);
-            }
-            unsafe {
-                ::core::ptr::write_bytes(frame as *mut u8, 0, FRAME_SIZE);
-            }
+        let stack_base = phys_to_virt(
+            frame_alloc
+                .alloc_contig(stack_pages)
+                .expect("Failed to allocate kernel stack for init"),
+        );
+        unsafe {
+            ::core::ptr::write_bytes(stack_base, 0, INIT_KERNEL_STACK_SIZE);
         }
-
-        stack_base.unwrap() + INIT_KERNEL_STACK_SIZE as u64
+        stack_base as u64 + INIT_KERNEL_STACK_SIZE as u64
     };
 
     printkln!("KERNEL_READY");
@@ -1138,7 +1131,13 @@ fn kmain() -> ! {
     // Initialize brk for the init task (tid=2)
     // This must be done after create_user_task which creates a default mm
     if let Some(mm) = mm::get_task_mm(2) {
-        mm.lock().set_brk(start_brk);
+        let mut m = mm.lock();
+        m.set_brk(start_brk);
+        m.set_exe(alloc::string::String::from("/bin/init"));
+        let stack_bottom = USER_STACK_TOP - USER_STACK_PAGES as u64 * PAGE_SIZE;
+        for vma in task::exec::image_vmas(mm.pgd(), &elf, base_addr, stack_bottom) {
+            m.insert_vma(vma);
+        }
     }
 
     // Enable scheduling

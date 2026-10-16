@@ -169,7 +169,7 @@ impl FileOps for BlockFileOps {
 
             // Copy data from page to user buffer
             unsafe {
-                let src = (frame as *const u8).add(offset_in_page);
+                let src = (crate::arch::phys_to_virt(frame) as *const u8).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
             }
 
@@ -212,7 +212,7 @@ impl FileOps for BlockFileOps {
 
             // Copy data from user buffer to page
             unsafe {
-                let dst = (frame as *mut u8).add(offset_in_page);
+                let dst = crate::arch::phys_to_virt(frame).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
             }
 
@@ -258,7 +258,7 @@ impl FileOps for BlockFileOps {
 
             // Copy data from page to user buffer
             unsafe {
-                let src = (frame as *const u8).add(offset_in_page);
+                let src = (crate::arch::phys_to_virt(frame) as *const u8).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
             }
 
@@ -299,7 +299,7 @@ impl FileOps for BlockFileOps {
 
             // Copy data from user buffer to page
             unsafe {
-                let dst = (frame as *mut u8).add(offset_in_page);
+                let dst = crate::arch::phys_to_virt(frame).add(offset_in_page);
                 core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
             }
 

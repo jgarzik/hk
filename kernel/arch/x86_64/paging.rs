@@ -3,7 +3,7 @@
 //! Implements the PageTable trait for x86-64 4-level paging:
 //! PML4 -> PDPT -> PD -> PT -> Physical Page
 
-use crate::arch::{FrameAlloc, MapError, PageFlags, PageTable};
+use crate::arch::{FrameAlloc, Leaf, MapError, PageFlags, PageTable};
 
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
@@ -26,23 +26,40 @@ const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const ENTRIES_PER_TABLE: usize = 512;
 
 // ============================================================================
-// Physical-to-Virtual Address Conversion
+// Address space layout (see kmap.rs)
 // ============================================================================
-//
-// Phase 1: PAGE_OFFSET = 0 (identity mapping, no-op conversion)
-// Phase 2: PAGE_OFFSET = 0xFFFF_8880_0000_0000 (Linux-style direct map)
 
-/// Page offset for direct map
-///
-/// Physical address 0 maps to virtual address PAGE_OFFSET.
-/// Currently 0 for identity mapping; will be changed to
-/// 0xFFFF_8880_0000_0000 for high-address kernel.
-pub const PAGE_OFFSET: u64 = 0;
+/// Direct map of all RAM: physical 0 is at PAGE_OFFSET (Linux x86-64)
+pub const PAGE_OFFSET: u64 = 0xFFFF_8880_0000_0000;
 
-/// Convert physical address to virtual address (direct map)
+/// Kernel image mapping base (Linux: __START_KERNEL_map, -2GB)
+pub const KERNEL_MAP: u64 = 0xFFFF_FFFF_8000_0000;
+
+/// vmalloc/ioremap window (Linux: VMALLOC_START)
+pub const VMALLOC_START: u64 = 0xFFFF_C900_0000_0000;
+
+/// End of user space (Linux: TASK_SIZE_MAX, one guard page below the
+/// non-canonical hole)
+pub const TASK_SIZE: u64 = 0x0000_7FFF_FFFF_F000;
+
+/// First PML4 entry of the kernel half
+pub const KERNEL_PML4_START: usize = 256;
+
+/// Convert physical address to virtual address (direct map; Linux __va)
 #[inline]
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
     (phys + PAGE_OFFSET) as *mut u8
+}
+
+/// Convert a direct-map or kernel-image address to physical (Linux __pa)
+#[inline]
+pub fn virt_to_phys(virt: u64) -> u64 {
+    if virt >= KERNEL_MAP {
+        virt - KERNEL_MAP
+    } else {
+        debug_assert!((PAGE_OFFSET..VMALLOC_START).contains(&virt));
+        virt - PAGE_OFFSET
+    }
 }
 
 /// Convert physical address to page table pointer
@@ -55,6 +72,88 @@ pub fn phys_to_virt_table(phys: u64) -> *mut RawPageTable {
 #[inline]
 pub fn phys_to_virt_table_const(phys: u64) -> *const RawPageTable {
     phys_to_virt(phys) as *const RawPageTable
+}
+
+/// Physical address bits of a page table entry
+pub const PTE_ADDR_MASK: u64 = ADDR_MASK;
+
+/// Pointer to the 4KB leaf entry for `va` in the tables rooted at
+/// `root` (present or not, e.g. a swap entry); None if an upper level
+/// is missing or maps a huge page
+pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
+    let mut table = phys_to_virt_table(root);
+    for shift in [39, 30, 21] {
+        let e = unsafe { *(*table).entry(((va >> shift) & 511) as usize) };
+        if !e.is_present() || e.is_huge() {
+            return None;
+        }
+        table = phys_to_virt_table(e.addr());
+    }
+    Some(
+        unsafe { (*table).entry_mut(((va >> 12) & 511) as usize) } as *mut PageTableEntry
+            as *mut u64,
+    )
+}
+
+/// A leaf entry maps a page
+pub fn pte_present(pte: u64) -> bool {
+    pte & PAGE_PRESENT != 0
+}
+
+/// Switch this CPU to the address space rooted at `root`
+pub fn activate(root: u64) {
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack)) };
+}
+
+/// Tear down the user half under `pml4_phys` (the mapping and table
+/// part of Linux exit_mmap: unmap_vmas + free_pgtables). The user PML4
+/// entries are detached and, if the table is live on this CPU, the TLB
+/// is flushed before anything is freed; then each user leaf goes to
+/// `put` and every lower table frame is freed. The root frame and the
+/// shared kernel half (PML4 256-511) are left untouched. Other CPUs are
+/// not shot down (no x86 TLB shootdown yet, doc/LOCKING.md).
+pub fn free_user(pml4_phys: u64, put: &mut dyn FnMut(Leaf)) {
+    let mut top = [PageTableEntry::empty(); KERNEL_PML4_START];
+    let pml4 = phys_to_virt_table(pml4_phys);
+    for (i, e) in top.iter_mut().enumerate() {
+        // SAFETY: `pml4_phys` is a live root table reached through the
+        // direct map; its user entries belong to the caller
+        unsafe {
+            *e = *(*pml4).entry(i);
+            (*pml4).entry_mut(i).clear();
+        }
+    }
+    if X86_64PageTable::current_cr3() & ADDR_MASK == pml4_phys {
+        X86_64PageTable::flush_tlb_all();
+    }
+    for e in top.iter().filter(|e| e.is_present()) {
+        free_level(e.addr(), 3, put);
+    }
+}
+
+/// Release the table at `phys` and everything below it; `level` 3 is a
+/// PDPT, 2 a PD, 1 a PT
+fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
+    let table = phys_to_virt_table_const(phys);
+    for i in 0..ENTRIES_PER_TABLE {
+        // SAFETY: a detached table frame owned by the caller
+        let e = unsafe { *(*table).entry(i) };
+        match level {
+            1 if e.is_present() => put(Leaf::Page(e.addr())),
+            1 if e.0 != 0 => put(Leaf::Swap(e.0)),
+            // 1GB user pages are never created
+            3 if e.is_present() && !e.is_huge() => free_level(e.addr(), 2, put),
+            2 if e.is_present() && e.is_huge() => put(Leaf::Huge(e.addr())),
+            2 if e.is_present() => free_level(e.addr(), 1, put),
+            _ => {}
+        }
+    }
+    crate::FRAME_ALLOCATOR.free(phys);
+}
+
+/// Flush the TLB entry for `va` on this CPU
+pub fn flush_tlb(va: u64) {
+    X86_64PageTable::flush_tlb(va);
 }
 
 /// Page table entry
@@ -153,12 +252,9 @@ impl X86_64PageTable {
         self.pml4_phys
     }
 
-    /// Create a page table representing the kernel's identity mapping
-    ///
-    /// This uses the current CR3 value, meaning kernel threads share
-    /// the kernel's page table. No new allocation is done.
+    /// The kernel page table (swapper): kernel threads run on it
     pub fn kernel_identity() -> Self {
-        Self::new(Self::current_cr3())
+        Self::new(super::kmap::swapper_phys())
     }
 
     /// Create a new user page table (allocates PML4)
@@ -277,18 +373,15 @@ impl X86_64PageTable {
         Ok(())
     }
 
-    /// Copy kernel mappings (PML4[0]) from current page table to this one
-    ///
-    /// This ensures kernel code/data remains accessible during syscalls
-    /// when the user page table is loaded.
+    /// Link the kernel half (PML4 entries 256-511 of the swapper) into
+    /// this address space; the lower-level kernel tables are shared
     pub fn copy_kernel_mappings(&mut self) {
         unsafe {
-            let kernel_pml4 = phys_to_virt_table_const(Self::current_cr3());
-            let user_pml4 = phys_to_virt_table(self.pml4_phys);
-
-            // Copy PML4[0] - this covers the identity-mapped kernel region (0-512GB)
-            // The boot assembly maps the first 512MB using 2MB huge pages
-            (*user_pml4).entries[0] = (*kernel_pml4).entries[0];
+            let kernel_pml4 = phys_to_virt_table_const(super::kmap::swapper_phys());
+            let pml4 = phys_to_virt_table(self.pml4_phys);
+            for i in KERNEL_PML4_START..ENTRIES_PER_TABLE {
+                (*pml4).entries[i] = (*kernel_pml4).entries[i];
+            }
         }
     }
 
@@ -574,62 +667,7 @@ impl PageTable for X86_64PageTable {
         // Delegate to the inherent method
         X86_64PageTable::kernel_identity()
     }
-
-    fn collect_table_frames(&self) -> alloc::vec::Vec<Self::PhysAddr> {
-        use alloc::vec::Vec;
-        let mut frames = Vec::new();
-
-        // Add the root PML4 frame
-        frames.push(self.pml4_phys);
-
-        unsafe {
-            let pml4 = phys_to_virt_table_const(self.pml4_phys);
-
-            // Walk PML4 entries (only user-space portion, indices 0-255)
-            for pml4_idx in 0..256 {
-                let pml4_entry = (*pml4).entry(pml4_idx);
-                if !pml4_entry.is_present() || pml4_entry.is_huge() {
-                    continue;
-                }
-
-                let pdpt_phys = pml4_entry.addr();
-                frames.push(pdpt_phys);
-                let pdpt = phys_to_virt_table_const(pdpt_phys);
-
-                // Walk PDPT entries
-                for pdpt_idx in 0..512 {
-                    let pdpt_entry = (*pdpt).entry(pdpt_idx);
-                    if !pdpt_entry.is_present() || pdpt_entry.is_huge() {
-                        continue;
-                    }
-
-                    let pd_phys = pdpt_entry.addr();
-                    frames.push(pd_phys);
-                    let pd = phys_to_virt_table_const(pd_phys);
-
-                    // Walk PD entries
-                    for pd_idx in 0..512 {
-                        let pd_entry = (*pd).entry(pd_idx);
-                        if !pd_entry.is_present() || pd_entry.is_huge() {
-                            continue;
-                        }
-
-                        let pt_phys = pd_entry.addr();
-                        frames.push(pt_phys);
-                        // Don't recurse into PT - those are user page frames, not table frames
-                    }
-                }
-            }
-        }
-
-        frames
-    }
 }
-
-/// User address space bounds for fork/clone
-/// User PIE base is 0x20000000 (512MB) - see USER_PIE_BASE in main.rs
-const USER_START: u64 = 0x0000_0000_2000_0000; // 512MB - where user ELF is loaded
-const USER_END: u64 = 0x0000_8000_0000_0000; // 128TB
 
 /// COW (Copy-on-Write) flag - we use an available bit in the PTE
 /// Bit 9 is one of the "available" bits (9-11) that can be used by the OS
@@ -660,40 +698,35 @@ impl X86_64PageTable {
     /// If `force_copy_fn` is provided, pages where the callback returns true
     /// will be copied immediately instead of using COW. This is used for
     /// mlock'd pages that must remain resident.
+    ///
+    /// `new_pt` is the child's fresh table (kernel half linked); on error
+    /// it holds part of the copy, which the caller tears down with the
+    /// child mm.
     pub fn duplicate_user_space<FA: FrameAlloc<PhysAddr = u64>>(
         &self,
+        new_pt: &mut Self,
         frame_alloc: &mut FA,
-    ) -> Result<Self, i32> {
-        self.duplicate_user_space_inner(frame_alloc, None)
+    ) -> Result<(), i32> {
+        self.duplicate_user_space_inner(new_pt, frame_alloc, None)
     }
 
     /// Duplicate user space with optional force-copy callback for mlock'd pages
     pub fn duplicate_user_space_with_callback<FA: FrameAlloc<PhysAddr = u64>>(
         &self,
+        new_pt: &mut Self,
         frame_alloc: &mut FA,
         force_copy_fn: ForceCopyFn,
-    ) -> Result<Self, i32> {
-        self.duplicate_user_space_inner(frame_alloc, Some(force_copy_fn))
+    ) -> Result<(), i32> {
+        self.duplicate_user_space_inner(new_pt, frame_alloc, Some(force_copy_fn))
     }
 
     /// Internal implementation of user space duplication
     fn duplicate_user_space_inner<FA: FrameAlloc<PhysAddr = u64>>(
         &self,
+        new_pt: &mut Self,
         frame_alloc: &mut FA,
         force_copy_fn: Option<ForceCopyFn>,
-    ) -> Result<Self, i32> {
-        // Create new user page table
-        let mut new_pt = Self::new_user(frame_alloc).ok_or(-12i32)?; // ENOMEM
-
-        // NOTE: We do NOT call copy_kernel_mappings() here because PML4[0] contains
-        // BOTH kernel identity mappings (2MB huge pages) AND user space mappings
-        // (4KB pages at 0x20000000+). If we copy PML4[0] wholesale, user pages
-        // would be shared instead of copied.
-        //
-        // Instead, we walk the parent's page tables and:
-        // - For kernel addresses (< USER_START): share by copying PTE directly
-        // - For user addresses (>= USER_START): copy page contents to new frame
-
+    ) -> Result<(), i32> {
         // Track range of modified parent PTEs for batch TLB flush
         let mut flush_start: Option<u64> = None;
         let mut flush_end: u64 = 0;
@@ -701,8 +734,7 @@ impl X86_64PageTable {
         unsafe {
             let parent_pml4 = phys_to_virt_table_const(self.pml4_phys);
 
-            // Walk all PML4 entries (0-511)
-            for pml4_idx in 0..ENTRIES_PER_TABLE {
+            for pml4_idx in 0..KERNEL_PML4_START {
                 let pml4_entry = (*parent_pml4).entry(pml4_idx);
                 if !pml4_entry.is_present() {
                     continue;
@@ -713,53 +745,22 @@ impl X86_64PageTable {
                 // Walk PDPT entries
                 for pdpt_idx in 0..ENTRIES_PER_TABLE {
                     let pdpt_entry = (*pdpt).entry(pdpt_idx);
-                    if !pdpt_entry.is_present() {
+                    if !pdpt_entry.is_present() || pdpt_entry.is_huge() {
                         continue;
                     }
 
                     let vaddr_pdpt = ((pml4_idx as u64) << 39) | ((pdpt_idx as u64) << 30);
-
-                    // Check for 1GB huge page
-                    if pdpt_entry.flags() & PAGE_HUGE != 0 {
-                        // 1GB huge page - kernel uses these, share directly
-                        if vaddr_pdpt < USER_START {
-                            // Kernel region - share the 1GB mapping
-                            // We'd need to set up the PDPT entry in the child
-                            // For now, rely on identity map being set up elsewhere
-                        }
-                        continue;
-                    }
-
                     let pd = phys_to_virt_table_const(pdpt_entry.addr());
 
                     // Walk PD entries
                     for pd_idx in 0..ENTRIES_PER_TABLE {
                         let pd_entry = (*pd).entry(pd_idx);
-                        if !pd_entry.is_present() {
+                        // User 2MB pages are not duplicated (not used by fork)
+                        if !pd_entry.is_present() || pd_entry.is_huge() {
                             continue;
                         }
 
                         let vaddr_pd = vaddr_pdpt | ((pd_idx as u64) << 21);
-
-                        // Check for 2MB huge page
-                        if pd_entry.flags() & PAGE_HUGE != 0 {
-                            // 2MB huge page - kernel identity map uses these
-                            if vaddr_pd < USER_START {
-                                // Kernel region - share the 2MB mapping
-                                // Copy the PD entry to child's page table
-                                // This requires ensuring intermediate tables exist
-                                new_pt.ensure_pd_entry(
-                                    pml4_idx,
-                                    pdpt_idx,
-                                    pd_idx,
-                                    *pd_entry,
-                                    frame_alloc,
-                                )?;
-                            }
-                            // Skip user 2MB pages (shouldn't exist in our setup)
-                            continue;
-                        }
-
                         let pt = phys_to_virt_table_const(pd_entry.addr());
 
                         // Walk PT entries (4KB pages)
@@ -772,23 +773,7 @@ impl X86_64PageTable {
                             // Calculate virtual address
                             let vaddr = vaddr_pd | ((pt_idx as u64) << 12);
 
-                            // Skip addresses above user space
-                            if vaddr >= USER_END {
-                                continue;
-                            }
-
-                            if vaddr < USER_START {
-                                // Kernel address - share the mapping (same physical page)
-                                // Copy the PTE to child's page table
-                                new_pt.ensure_pt_entry(
-                                    pml4_idx,
-                                    pdpt_idx,
-                                    pd_idx,
-                                    pt_idx,
-                                    *pt_entry,
-                                    frame_alloc,
-                                )?;
-                            } else {
+                            {
                                 // User address - use COW (Copy-on-Write) or force copy
                                 let old_phys = pt_entry.addr();
                                 let old_flags = pt_entry.flags();
@@ -841,10 +826,8 @@ impl X86_64PageTable {
                                         flush_end = vaddr + PAGE_SIZE;
                                     }
 
-                                    // Increment reference count for the shared frame
-                                    crate::FRAME_ALLOCATOR.incref(old_phys);
-
-                                    // Map same physical frame in child with COW flags
+                                    // Map same physical frame in child with COW
+                                    // flags; the child's PTE holds a reference
                                     new_pt.ensure_pt_entry(
                                         pml4_idx,
                                         pdpt_idx,
@@ -853,6 +836,7 @@ impl X86_64PageTable {
                                         PageTableEntry(old_phys | cow_flags),
                                         frame_alloc,
                                     )?;
+                                    crate::FRAME_ALLOCATOR.incref(old_phys);
                                 }
                             }
                         }
@@ -867,46 +851,7 @@ impl X86_64PageTable {
             Self::flush_tlb_range(start, flush_end);
         }
 
-        Ok(new_pt)
-    }
-
-    /// Helper: Ensure PD entry exists and copy a 2MB huge page entry
-    unsafe fn ensure_pd_entry<FA: FrameAlloc<PhysAddr = u64>>(
-        &mut self,
-        pml4_idx: usize,
-        pdpt_idx: usize,
-        pd_idx: usize,
-        entry: PageTableEntry,
-        frame_alloc: &mut FA,
-    ) -> Result<(), i32> {
-        unsafe {
-            let pml4 = phys_to_virt_table(self.pml4_phys);
-
-            // Ensure PML4 entry exists
-            if !(*pml4).entry(pml4_idx).is_present() {
-                let pdpt_frame = frame_alloc.alloc_frame().ok_or(-12i32)?;
-                core::ptr::write_bytes(phys_to_virt(pdpt_frame), 0, PAGE_SIZE as usize);
-                *(*pml4).entry_mut(pml4_idx) =
-                    PageTableEntry(pdpt_frame | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-            }
-
-            let pdpt = phys_to_virt_table((*pml4).entry(pml4_idx).addr());
-
-            // Ensure PDPT entry exists
-            if !(*pdpt).entry(pdpt_idx).is_present() {
-                let pd_frame = frame_alloc.alloc_frame().ok_or(-12i32)?;
-                core::ptr::write_bytes(phys_to_virt(pd_frame), 0, PAGE_SIZE as usize);
-                *(*pdpt).entry_mut(pdpt_idx) =
-                    PageTableEntry(pd_frame | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-            }
-
-            let pd = phys_to_virt_table((*pdpt).entry(pdpt_idx).addr());
-
-            // Copy the 2MB huge page entry
-            *(*pd).entry_mut(pd_idx) = entry;
-
-            Ok(())
-        }
+        Ok(())
     }
 
     /// Helper: Ensure PT entry exists and copy a 4KB page entry
@@ -1470,6 +1415,9 @@ impl X86_64PageTable {
             // Note: On x86-64, we need to flush all 512 entries since invlpg
             // on a single address only invalidates that TLB entry
             Self::flush_tlb_all();
+
+            // Each 4KB PTE now holds its own frame reference
+            crate::FRAME_ALLOCATOR.split_huge(huge_phys);
 
             Ok(huge_phys)
         }

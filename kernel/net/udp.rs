@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use spin::{Mutex, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
 
 use crate::error::KernelError;
 use crate::net::af_inet::{
@@ -113,6 +113,11 @@ impl UdpSock {
     /// Linux inet_autobind: an ephemeral port on the bound address
     fn autobind(&self) -> Result<(), KernelError> {
         let _g = self.op.lock();
+        self.autobind_locked()
+    }
+
+    /// `autobind` with `op` held
+    fn autobind_locked(&self) -> Result<(), KernelError> {
         let a = self.inet.get();
         if a.sport != 0 {
             return Ok(());
@@ -310,18 +315,28 @@ impl ProtoOps for UdpSock {
             return Err(KernelError::InvalidArgument);
         }
         let no_port = port == 0 && self.inet.flag(af_inet::ipf::BIND_NO_PORT);
-        let p = if no_port {
-            0
-        } else {
-            self.get_port(addr, port)?
-        };
-        let mut s = self.inet.addr.lock();
-        s.rcv_saddr = addr;
-        s.saddr = if matches!(ty, RouteType::Multicast | RouteType::Broadcast) {
+        // Like Linux inet_bind: the address is set before the port table
+        // entry is published (lookups read it under the table lock) and
+        // reset if that fails
+        let saddr = if matches!(ty, RouteType::Multicast | RouteType::Broadcast) {
             Ipv4Addr::default()
         } else {
             addr
         };
+        self.inet.set_saddrs(addr, saddr);
+        let p = if no_port {
+            0
+        } else {
+            match self.get_port(addr, port) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.inet
+                        .set_saddrs(Ipv4Addr::default(), Ipv4Addr::default());
+                    return Err(e);
+                }
+            }
+        };
+        let mut s = self.inet.addr.lock();
         s.sport = p;
         s.addr_lock = !addr.is_unspecified();
         s.port_lock = port != 0;
@@ -335,8 +350,10 @@ impl ProtoOps for UdpSock {
             return Ok(());
         }
         let (daddr, dport) = af_inet::sin_parse(a, false)?;
-        self.autobind()?;
+        // One socket-lock hold for autobind and the connect (Linux
+        // lock_sock around both)
         let _g = self.op.lock();
+        self.autobind_locked()?;
         let cur = self.inet.get();
         let rt = self.route(daddr, cur.saddr, self.sk.bound_dev_if())?;
         let mut s = self.inet.addr.lock();

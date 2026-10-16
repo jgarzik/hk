@@ -15,6 +15,8 @@
 #                The defaults have SMAP/SMEP (x86) and PAN (arm), so boot
 #                tests catch kernel accesses to user memory that bypass the
 #                uaccess helpers.
+#   NIC          Network card: virtio (default, modern virtio-net-pci) or
+#                e1000, e.g. make check NIC=e1000
 #
 # Serial output:
 #   x86: /tmp/qemu_serial.log (or /tmp/qemu_usb_serial.log with -u)
@@ -151,8 +153,9 @@ setup_x86_config() {
         )
     fi
 
-    # Network: Intel e1000 on the shared slirp network (tools/qemu-net.sh)
-    qemu_net_args e1000
+    # Network: virtio-net (or NIC=e1000) on the shared slirp network
+    # (tools/qemu-net.sh)
+    qemu_net_args "${NIC:-virtio}"
     QEMU_ARGS+=("${QEMU_NET[@]}")
 }
 
@@ -213,8 +216,9 @@ setup_arm_config() {
         )
     fi
 
-    # Network: Intel e1000 on the shared slirp network (tools/qemu-net.sh)
-    qemu_net_args e1000
+    # Network: virtio-net (or NIC=e1000) on the shared slirp network
+    # (tools/qemu-net.sh)
+    qemu_net_args "${NIC:-virtio}"
     QEMU_ARGS+=("${QEMU_NET[@]}")
 }
 

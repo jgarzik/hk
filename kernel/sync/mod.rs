@@ -8,8 +8,10 @@
 //! sleeping locks order above every spinlock. Before scheduling is
 //! enabled (early boot) a contended lock spins.
 
+pub mod lockdep;
 mod mutex;
 mod rwsem;
+pub mod spin;
 
 pub use mutex::{Mutex, MutexGuard};
 pub use rwsem::RwSem;
@@ -24,10 +26,15 @@ fn can_sleep() -> bool {
 }
 
 /// Linux might_sleep: no spinlock (IrqSpinlock raises the preempt
-/// count) may be held where a sleeping lock is taken
-fn might_sleep() {
+/// count; `sync::spin` locks are tracked with the `lockdep` feature) may
+/// be held where the caller can sleep: sleeping locks, `schedule`, wait
+/// queues, socket waits, user copies
+#[track_caller]
+#[inline]
+pub fn might_sleep() {
     debug_assert!(
         !can_sleep() || crate::arch::preempt_count() == 0,
-        "sleeping lock taken in atomic context"
+        "sleeping in atomic context"
     );
+    lockdep::might_sleep();
 }

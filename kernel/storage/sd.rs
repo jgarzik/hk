@@ -329,7 +329,9 @@ impl ScsiDiskDriver {
     fn handle_read(&self, bio: &Bio) -> Result<(), KernelError> {
         // For each segment in the bio, read the data
         for seg in &bio.segs {
-            let buf = unsafe { core::slice::from_raw_parts_mut(seg.frame as *mut u8, seg.len) };
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(seg.frame), seg.len)
+            };
 
             // Calculate LBA from bio.lba and segment offset
             let sectors_per_seg = seg.len / 512;
@@ -343,7 +345,12 @@ impl ScsiDiskDriver {
     /// Handle a write bio
     fn handle_write(&self, bio: &Bio) -> Result<(), KernelError> {
         for seg in &bio.segs {
-            let buf = unsafe { core::slice::from_raw_parts(seg.frame as *const u8, seg.len) };
+            let buf = unsafe {
+                core::slice::from_raw_parts(
+                    crate::arch::phys_to_virt(seg.frame) as *const u8,
+                    seg.len,
+                )
+            };
 
             let sectors_per_seg = seg.len / 512;
             self.disk

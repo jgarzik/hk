@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use spin::{Mutex, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
 
 use crate::arch::Uaccess;
 use crate::error::KernelError;

@@ -11,8 +11,8 @@ use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
 // QEMU virt GICv3 base addresses
-const GICD_BASE: u64 = 0x0800_0000;
-const GICR_BASE: u64 = 0x080A_0000;
+const GICD_BASE: u64 = super::paging::io_va(0x0800_0000);
+const GICR_BASE: u64 = super::paging::io_va(0x080A_0000);
 
 // Redistributor stride per CPU (RD_base + SGI_base = 0x20000)
 const GICR_STRIDE: u64 = 0x20000;

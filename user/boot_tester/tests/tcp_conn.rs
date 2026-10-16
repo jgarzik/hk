@@ -198,17 +198,22 @@ fn test_ephemeral_owners() {
     let n = read_file(PORTS, &mut old);
     let (l1, p1) = listener(4);
     let (l2, p2) = listener(4);
-    t.ok(b"set range", write_file(PORTS, b"40100 40101\n") > 0, 0);
+    // Earlier tests leave TIME_WAIT entries on random ephemeral ports
+    // (Linux keeps them 60 s), so probe for two free consecutive ports
+    let base = free_pair();
+    t.ok(b"free ports", base != 0, 0);
+    let range = port_range(base);
+    t.ok(b"set range", write_file(PORTS, &range.0[..range.1]) > 0, 0);
     let b = tcp();
-    t.eq(b"bind", bind(b, LO, 40100), 0);
+    t.eq(b"bind", bind(b, LO, base), 0);
     let c1 = tcp();
     t.eq(b"connect 1", connect(c1, LO, p1), 0);
-    t.eq(b"skips bound port", port(c1) as i64, 40101);
+    t.eq(b"skips bound port", port(c1) as i64, base as i64 + 1);
     let c2 = tcp();
     t.eq(b"same tuple", connect(c2, LO, p1), EADDRNOTAVAIL);
     let c3 = tcp();
     t.eq(b"other peer", connect(c3, LO, p2), 0);
-    t.eq(b"port shared", port(c3) as i64, 40101);
+    t.eq(b"port shared", port(c3) as i64, base as i64 + 1);
     if n > 0 {
         write_file(PORTS, &old[..n as usize]);
     }
@@ -216,6 +221,50 @@ fn test_ephemeral_owners() {
         close(f);
     }
     t.done();
+}
+
+/// True if a fresh socket can bind 127.0.0.1:port (unconnected sockets
+/// release the port immediately on close)
+fn port_free(port: u16) -> bool {
+    let fd = tcp();
+    let ok = bind(fd, LO, port) == 0;
+    close(fd);
+    ok
+}
+
+/// First even port in 40100..41100 where it and its successor are free
+fn free_pair() -> u16 {
+    (40100u16..41100)
+        .step_by(2)
+        .find(|&p| port_free(p) && port_free(p + 1))
+        .unwrap_or(0)
+}
+
+/// "base base+1\n" for ip_local_port_range
+fn port_range(base: u16) -> ([u8; 16], usize) {
+    let mut buf = [0u8; 16];
+    let mut n = put_num(&mut buf, 0, base as u32);
+    buf[n] = b' ';
+    n = put_num(&mut buf, n + 1, base as u32 + 1);
+    buf[n] = b'\n';
+    (buf, n + 1)
+}
+
+fn put_num(buf: &mut [u8], at: usize, v: u32) -> usize {
+    let mut d = [0u8; 10];
+    let (mut v, mut k) = (v, 0);
+    loop {
+        d[k] = b'0' + (v % 10) as u8;
+        k += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in 0..k {
+        buf[at + i] = d[k - 1 - i];
+    }
+    at + k
 }
 
 /// A closed port behind the slirp gateway: refused (slirp answers RST

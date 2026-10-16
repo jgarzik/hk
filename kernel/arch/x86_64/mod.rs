@@ -22,6 +22,7 @@ pub mod interrupts;
 pub mod io;
 pub mod ioremap;
 pub mod irq;
+pub mod kmap;
 pub mod lapic;
 pub mod paging;
 pub mod percpu;
@@ -131,12 +132,6 @@ impl Arch for X86_64Arch {
     type TrapFrame = X86_64TrapFrame;
     type VirtAddr = u64;
     type PhysAddr = u64;
-
-    /// User space starts at 4MB (after kernel low memory)
-    const USER_START: u64 = 0x0000_0000_0040_0000;
-
-    /// User space ends at canonical hole (128TB)
-    const USER_END: u64 = 0x0000_8000_0000_0000;
 
     fn user_entry_frame(entry: Self::VirtAddr, user_stack_top: Self::VirtAddr) -> Self::TrapFrame {
         X86_64TrapFrame::new_user(entry, user_stack_top)
@@ -409,25 +404,26 @@ impl ArchBusOps for X86_64Arch {
 // Kernel Init Unification Trait Implementations
 // ============================================================================
 
-// Memory layout constants for x86_64
+// Frames start above the boot-time heap (`x86_64_heap` in main.rs)
 const FRAME_ALLOC_BASE: u64 = 0x1200000; // 18MB
-const FRAME_ALLOC_SIZE: u64 = 0xE000000; // ~224MB (up to 256MB total)
 
 impl MemoryLayoutOps for X86_64Arch {
     fn get_frame_alloc_region() -> (u64, u64) {
-        // Try to get memory map from multiboot2
-        let multiboot_info = unsafe { crate::MULTIBOOT2_INFO };
+        let mbi = unsafe { crate::MULTIBOOT2_INFO };
+        let (start, end) =
+            unsafe { crate::multiboot2::find_largest_region_above(mbi, FRAME_ALLOC_BASE) };
+        // Frames are used through the direct map
+        let end = end.min(kmap::direct_end());
+        assert!(
+            start >= FRAME_ALLOC_BASE && end > start,
+            "no RAM for frames"
+        );
+        (start, end - start)
+    }
 
-        let (mem_start, mem_end) = unsafe {
-            crate::multiboot2::find_largest_region_above(multiboot_info, FRAME_ALLOC_BASE)
-        };
-
-        // Use parsed memory map if valid, otherwise fall back to hardcoded values
-        if mem_start >= FRAME_ALLOC_BASE && mem_end > mem_start {
-            (mem_start, mem_end - mem_start)
-        } else {
-            (FRAME_ALLOC_BASE, FRAME_ALLOC_SIZE)
-        }
+    fn for_each_reserved(f: &mut dyn FnMut(u64, u64)) {
+        let mbi = unsafe { crate::MULTIBOOT2_INFO };
+        unsafe { crate::multiboot2::boot_ranges(mbi, |_, start, end| f(start, end)) };
     }
 }
 

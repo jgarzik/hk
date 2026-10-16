@@ -319,6 +319,20 @@ fn read_user_u32(addr: u64) -> Result<u32, i32> {
     get_user::<Uaccess, u32>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
 }
 
+/// Read a futex word under a bucket lock (Linux
+/// futex_get_value_locked): page faults are disabled, so a page that is
+/// not present fails instead of sleeping. Callers fault the word in
+/// with `read_user_u32` before locking; if it is gone again by the time
+/// it is read under the lock they report EAGAIN (userspace re-checks
+/// and retries, as after a value change) instead of retrying in the
+/// kernel like Linux.
+fn get_value_locked(addr: u64) -> Result<u32, i32> {
+    crate::uaccess::pagefault_disable();
+    let r = get_user::<Uaccess, u32>(addr);
+    crate::uaccess::pagefault_enable();
+    r.map_err(|_| KernelError::WouldBlock.to_errno_neg())
+}
+
 /// Write a u32 to user memory
 ///
 /// Uses proper uaccess infrastructure which:
@@ -437,6 +451,12 @@ pub fn futex_wait(
 
     let bucket = futex_bucket(&key);
 
+    // Fault the word in (a real EFAULT is reported here); it is read
+    // again under the bucket lock with faults disabled
+    if let Err(e) = read_user_u32(uaddr) {
+        return e;
+    }
+
     // CRITICAL: Increment waiter count BEFORE checking value
     // This provides the memory barrier ordering with the waker
     bucket.inc_waiters();
@@ -449,7 +469,7 @@ pub fn futex_wait(
         let mut waiters = bucket.waiters.lock();
 
         // Read futex value
-        let current_val = match read_user_u32(uaddr) {
+        let current_val = match get_value_locked(uaddr) {
             Ok(v) => v,
             Err(e) => {
                 bucket.dec_waiters();
@@ -621,13 +641,20 @@ pub fn futex_requeue(
     let mut woken = 0i32;
     let mut requeued = 0i32;
 
+    // CMP_REQUEUE: fault the word in before locking
+    if cmpval.is_some()
+        && let Err(e) = read_user_u32(uaddr)
+    {
+        return e;
+    }
+
     // Phase 1: Extract waiters to wake and requeue from bucket1
     {
         let mut waiters = bucket1.waiters.lock();
 
         // If CMP_REQUEUE, check expected value while holding lock
         if let Some(expected) = cmpval {
-            let current = match read_user_u32(uaddr) {
+            let current = match get_value_locked(uaddr) {
                 Ok(v) => v,
                 Err(e) => return e,
             };
@@ -737,8 +764,8 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
         pid as Tid
     };
 
-    let table = TASK_TABLE.lock();
-    let head = table
+    let head = TASK_TABLE
+        .lock()
         .tasks
         .iter()
         .find(|t| t.tid == target_tid)
@@ -1154,6 +1181,14 @@ fn futex_wait_multiple(
             entry.woken = false;
         }
 
+        // Fault every word in (a real EFAULT is reported here); they are
+        // read again under the bucket locks with faults disabled
+        for entry in entries.iter() {
+            if let Err(e) = read_user_u32(entry.uaddr) {
+                return e;
+            }
+        }
+
         // Phase 2: Atomically check values and enqueue on all futexes
         // First, increment waiter counts for all buckets
         for entry in entries.iter() {
@@ -1172,10 +1207,10 @@ fn futex_wait_multiple(
             let bucket = futex_bucket(&entry.key);
             let mut waiters = bucket.waiters.lock();
 
-            // Read futex value
-            let current_val = match read_user_u32(entry.uaddr) {
+            // Read futex value (faulted in before; EAGAIN if it is gone)
+            let current_val = match get_value_locked(entry.uaddr) {
                 Ok(v) => v,
-                Err(_) => {
+                Err(err) => {
                     // Cleanup: unqueue all enqueued entries and decrement waiter counts
                     drop(waiters);
                     for (j, e) in entries.iter().enumerate() {
@@ -1189,7 +1224,7 @@ fn futex_wait_multiple(
                         }
                         b.dec_waiters();
                     }
-                    return KernelError::BadAddress.to_errno_neg();
+                    return err;
                 }
             };
 

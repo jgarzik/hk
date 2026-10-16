@@ -7,7 +7,7 @@ use core::fmt::{self, Write};
 use core::ptr::{read_volatile, write_volatile};
 
 /// PL011 UART base address on QEMU virt machine
-const PL011_BASE: usize = 0x0900_0000;
+const PL011_BASE: usize = super::paging::io_va(0x0900_0000) as usize;
 
 /// PL011 register offsets
 mod regs {

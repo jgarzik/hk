@@ -23,11 +23,11 @@
 //!
 //! ## Locking
 //!
-//! - `NlTable.socks` (per netns): `spin::RwLock`, thread context only,
+//! - `NlTable.socks` (per netns): `crate::sync::spin::RwLock`, thread context only,
 //!   leaf; lookups return `Arc` clones (no guard escapes).
-//! - `NlSock.dump`: `spin::Mutex`, thread context only; held while the
+//! - `NlSock.dump`: `crate::sync::spin::Mutex`, thread context only; held while the
 //!   cursor reads table snapshots and while its part is queued.
-//! - `NlSock.rxq`: `spin::Mutex`, thread context only, leaf. Senders
+//! - `NlSock.rxq`: `crate::sync::spin::Mutex`, thread context only, leaf. Senders
 //!   (notifications under RTNL, requests, peers, dump steps) push and
 //!   wake `wq` after dropping it.
 //! - Order: RTNL -> FIB/addresses -> `NlTable.socks` -> `NlSock.rxq`;
@@ -44,7 +44,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use spin::{Mutex, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
 
 use crate::error::KernelError;
 use crate::net::NetNamespace;
@@ -149,6 +149,9 @@ pub struct NlSock {
     drops: AtomicU32,
     /// Running dump (Linux cb_running + netlink_callback)
     dump: Mutex<Option<Dump>>,
+    /// Released (Linux SOCK_DEAD): senders waiting for room give up
+    /// with ECONNREFUSED
+    dead: AtomicBool,
     me: Weak<NlSock>,
 }
 
@@ -190,6 +193,7 @@ impl NlSock {
             congested: AtomicBool::new(false),
             drops: AtomicU32::new(0),
             dump: Mutex::new(None),
+            dead: AtomicBool::new(false),
             me: me.clone(),
         })
     }
@@ -250,7 +254,14 @@ impl NlSock {
                 return Err(KernelError::InvalidArgument);
             }
         } else if portid != 0 {
-            self.insert(portid)?;
+            match self.insert(portid) {
+                // A concurrent bind won: same rule as above
+                Err(KernelError::Busy) if portid != self.portid() => {
+                    return Err(KernelError::InvalidArgument);
+                }
+                Err(KernelError::Busy) => {}
+                r => r?,
+            }
         } else {
             self.autobind()?;
         }
@@ -262,11 +273,11 @@ impl NlSock {
         Ok(())
     }
 
+    /// Hash under `portid` (Linux netlink_insert: the bound check and
+    /// the publication happen under the table lock, so two binds of one
+    /// socket cannot both insert). EBUSY if it got bound meanwhile.
     fn insert(self: &Arc<Self>, portid: u32) -> Result<(), KernelError> {
-        self.sk.net.nl.insert(self.sk.protocol, portid, self)?;
-        self.portid.store(portid, Ordering::Release);
-        self.bound.store(true, Ordering::Release);
-        Ok(())
+        self.sk.net.nl.insert(self.sk.protocol, portid, self)
     }
 
     /// Linux netlink_autobind: tgid first, then unique negative ids
@@ -280,6 +291,8 @@ impl NlSock {
                 Err(KernelError::AddressInUse) => {
                     id = ROVER.fetch_sub(1, Ordering::Relaxed) as u32;
                 }
+                // Bound by a concurrent bind/autobind
+                Err(KernelError::Busy) => return Ok(()),
                 r => return r,
             }
         }
@@ -331,8 +344,13 @@ impl NlSock {
     }
 
     fn push(&self, skb: NlSkb) {
-        self.rxq.lock().push_back(skb);
+        self.enqueue(skb);
         self.sk.wq.wake_all();
+    }
+
+    /// Queue without waking (the caller wakes after its locks)
+    fn enqueue(&self, skb: NlSkb) {
+        self.rxq.lock().push_back(skb);
     }
 
     /// Queue a kernel message (reply, ACK, notification): dropped with
@@ -357,21 +375,31 @@ impl NlSock {
     }
 
     /// Queue a message from a user socket: wait for room unless
-    /// `nonblock` (EAGAIN), like netlink_attachskb with a send timeout
+    /// `nonblock` (EAGAIN), like netlink_attachskb with a send timeout;
+    /// ECONNREFUSED once the receiver is released (Linux SOCK_DEAD,
+    /// which netlink_release wakes us for)
     fn deliver(&self, skb: NlSkb, timeo: u64) -> Result<(), KernelError> {
         let mut timeo = timeo;
         loop {
+            if self.dead.load(Ordering::Acquire) {
+                return Err(KernelError::ConnectionRefused);
+            }
             if self.charge(&skb) {
                 self.push(skb);
                 return Ok(());
             }
-            timeo = self.sk.wait(timeo, || self.has_room())?;
+            let ts = truesize(skb.data.len());
+            timeo = self.sk.wait(timeo, || {
+                self.has_room(ts) || self.dead.load(Ordering::Acquire)
+            })?;
         }
     }
 
-    fn has_room(&self) -> bool {
+    /// `charge` would admit `ts` bytes now (the wait condition must be
+    /// the admission rule, or a sender spins between them)
+    fn has_room(&self, ts: usize) -> bool {
         let r = self.rmem.load(Ordering::Acquire);
-        (r == 0 || r < self.sk.rcvbuf() as usize) && !self.congested.load(Ordering::Acquire)
+        (r == 0 || r + ts <= self.sk.rcvbuf() as usize) && !self.congested.load(Ordering::Acquire)
     }
 
     /// Something to read (or an error to report)
@@ -480,14 +508,17 @@ impl NlSock {
             *d = None;
         }
         // Admission was checked above (a racing notification may push
-        // rmem past rcvbuf, which Linux also allows for one skb). Pushed
-        // under the dump lock so parts stay in order.
+        // rmem past rcvbuf, which Linux also allows for one skb). Queued
+        // under the dump lock so parts stay in order; readers are woken
+        // after it is dropped.
         self.rmem.fetch_add(truesize(buf.len()), Ordering::AcqRel);
-        self.push(NlSkb {
+        self.enqueue(NlSkb {
             data: buf,
             portid: 0,
             group: 0,
         });
+        drop(d);
+        self.sk.wq.wake_all();
         true
     }
 
@@ -538,12 +569,20 @@ impl NlSock {
         Ok(data.len())
     }
 
-    /// Close: leave the namespace table, drop a running dump
+    /// Close (Linux netlink_release): leave the namespace table, drop a
+    /// running dump, mark the socket dead, purge the receive queue and
+    /// wake senders waiting for room in it (they fail ECONNREFUSED)
     pub fn release(&self) {
-        *self.dump.lock() = None;
+        let dump = self.dump.lock().take();
+        drop(dump);
         if self.bound.load(Ordering::Acquire) {
             self.sk.net.nl.remove(self.sk.protocol, self.portid());
         }
+        self.dead.store(true, Ordering::Release);
+        let q = core::mem::take(&mut *self.rxq.lock());
+        self.rmem.store(0, Ordering::Release);
+        drop(q);
+        self.sk.wq.wake_all();
     }
 }
 
@@ -588,14 +627,21 @@ impl NlTable {
         }
     }
 
+    /// Bind `s` to `portid`: EBUSY if it is bound already (checked and
+    /// published under the write lock), EADDRINUSE if the id is taken
     fn insert(&self, protocol: i32, portid: u32, s: &Arc<NlSock>) -> Result<(), KernelError> {
         let mut t = self.socks.write();
+        if s.bound.load(Ordering::Acquire) {
+            return Err(KernelError::Busy);
+        }
         if let Some(w) = t.get(&(protocol, portid))
             && w.strong_count() > 0
         {
             return Err(KernelError::AddressInUse);
         }
         t.insert((protocol, portid), Arc::downgrade(s));
+        s.portid.store(portid, Ordering::Release);
+        s.bound.store(true, Ordering::Release);
         Ok(())
     }
 

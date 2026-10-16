@@ -199,6 +199,8 @@ pub const SYS_IO_URING_REGISTER: u64 = 427;
 
 // POSIX timer syscalls (Section 6.2)
 /// timer_create(clockid, sigevent, timerid)
+pub const SYS_GETITIMER: u64 = 102;
+pub const SYS_SETITIMER: u64 = 103;
 pub const SYS_TIMER_CREATE: u64 = 107;
 /// timer_gettime(timerid, curr_value)
 pub const SYS_TIMER_GETTIME: u64 = 108;
@@ -878,6 +880,8 @@ pub fn aarch64_syscall_dispatch(
         }
 
         // POSIX timer syscalls (Section 6.2)
+        SYS_GETITIMER => crate::posix_timer::sys_getitimer(arg0 as i32, arg1) as u64,
+        SYS_SETITIMER => crate::posix_timer::sys_setitimer(arg0 as i32, arg1, arg2) as u64,
         SYS_TIMER_CREATE => crate::posix_timer::sys_timer_create(arg0 as i32, arg1, arg2) as u64,
         SYS_TIMER_SETTIME => {
             crate::posix_timer::sys_timer_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64

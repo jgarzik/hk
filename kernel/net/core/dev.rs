@@ -27,10 +27,12 @@
 //! - `Softnet.poll_list`: `IrqSpinlock`, leaf. Taken by `napi_schedule`
 //!   (ISR) and the softnet thread. Capacity is reserved when a NAPI is
 //!   added, so the ISR never allocates.
-//! - `Softnet.backlog`: `spin::Mutex`, thread context only, leaf.
-//! - `PTYPE_BASE` / `PTYPE_ALL`: `spin::RwLock`, thread context only, leaf;
-//!   handlers are copied out and called after the guard is dropped.
-//! - `NAPI_LIST`: `spin::Mutex`, thread context only, leaf.
+//! - `Softnet.backlog`: `crate::sync::spin::Mutex`, thread context only, leaf.
+//! - `PTYPE_BASE` / `PTYPE_ALL`: `crate::sync::spin::RwLock`, thread context only, leaf;
+//!   handlers are copied out and called after the guard is dropped. Taps
+//!   run in the receive path (softnet or an inline backlog flush) and in
+//!   `dev_queue_xmit` callers, with no lock held by this module.
+//! - `NAPI_LIST`: `crate::sync::spin::Mutex`, thread context only, leaf.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -38,7 +40,8 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use spin::{Mutex, Once, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
+use spin::Once;
 
 use crate::arch::IrqSpinlock;
 use crate::net::device::NetDevice;
@@ -63,14 +66,28 @@ pub const NETDEV_MAX_BACKLOG: usize = 1000;
 /// pulled (`skb.data()` starts at the network header)
 pub type PacketHandler = fn(SkBuff);
 
-/// Tap handler (Linux ptype_all, for AF_PACKET): sees every received frame
-/// (MAC header still present at `skb.mac_header()`) without consuming it
-pub type PacketTap = fn(&SkBuff);
+/// A frame shown to the taps (Linux ptype_all delivery): received
+/// frames after classification, transmitted ones as PACKET_OUTGOING
+pub struct Tap<'a> {
+    pub dev: &'a Arc<NetDevice>,
+    /// The frame from its link-layer header
+    pub frame: &'a [u8],
+    pub pkt_type: PktType,
+    /// Sending socket of an outgoing frame (`SkBuff::owner`), 0 if none
+    pub owner: usize,
+}
+
+/// Tap handler (Linux ptype_all, for AF_PACKET): sees every frame
+/// without consuming it
+pub type PacketTap = fn(&Tap);
+
+/// Most taps (each address family registers one)
+const MAX_TAPS: usize = 4;
 
 /// EtherType -> handler table (IPv4, ARP; IPv6 later)
 static PTYPE_BASE: RwLock<Vec<(u16, PacketHandler)>> = RwLock::new(Vec::new());
-/// Taps that see all frames (reserved for AF_PACKET)
-static PTYPE_ALL: RwLock<Vec<PacketTap>> = RwLock::new(Vec::new());
+/// Taps that see all frames, both directions (AF_PACKET)
+static PTYPE_ALL: RwLock<[Option<PacketTap>; MAX_TAPS]> = RwLock::new([None; MAX_TAPS]);
 
 /// Register a protocol handler for an EtherType (host byte order)
 pub fn dev_add_pack(ethertype: u16, handler: PacketHandler) {
@@ -79,9 +96,19 @@ pub fn dev_add_pack(ethertype: u16, handler: PacketHandler) {
     t.push((ethertype, handler));
 }
 
-/// Register a tap that sees every received frame
+/// Register a tap that sees every received and transmitted frame
 pub fn dev_add_tap(tap: PacketTap) {
-    PTYPE_ALL.write().push(tap);
+    let mut t = PTYPE_ALL.write();
+    let slot = t.iter_mut().find(|s| s.is_none()).expect("too many taps");
+    *slot = Some(tap);
+}
+
+/// Show a frame to the taps (copied out: called without the lock)
+fn deliver_taps(t: &Tap) {
+    let taps = *PTYPE_ALL.read();
+    for tap in taps.iter().flatten() {
+        tap(t);
+    }
 }
 
 fn ptype_lookup(ethertype: u16) -> Option<PacketHandler> {
@@ -107,8 +134,12 @@ pub trait NapiPoll: Send + Sync {
 
 /// NAPI context (Linux struct napi_struct)
 pub struct Napi {
-    /// Scheduled: on a poll list or being polled
+    /// Scheduled: on a poll list or being polled (held by
+    /// `napi_disable` while disabled, so it cannot be scheduled)
     sched: AtomicBool,
+    /// `napi_disable` waits: the softnet loop completes it instead of
+    /// polling it again (Linux NAPI_STATE_DISABLE)
+    disable: AtomicBool,
     /// Packets per poll
     weight: usize,
     /// The driver (weak: the driver owns the Napi)
@@ -122,6 +153,7 @@ impl Napi {
     pub fn new(weight: usize) -> Arc<Self> {
         Arc::new(Self {
             sched: AtomicBool::new(false),
+            disable: AtomicBool::new(false),
             weight: weight.clamp(1, NAPI_POLL_WEIGHT),
             poller: Once::new(),
             polls: AtomicU64::new(0),
@@ -186,9 +218,40 @@ pub fn napi_schedule(napi: &Arc<Napi>) {
 
 /// Mark a NAPI poll complete (called by the driver's poll when it did less
 /// than its budget, before re-enabling device interrupts)
+///
+/// A full barrier (SeqCst RMW, like Linux's cmpxchg): an ISR that found
+/// the NAPI still scheduled (its `napi_schedule` was a no-op) recorded
+/// its causes before that, so the driver's re-check of pending causes
+/// after this call sees them.
 pub fn napi_complete_done(napi: &Napi, _work_done: usize) -> bool {
-    napi.sched.store(false, Ordering::Release);
+    napi.sched.swap(false, Ordering::SeqCst);
     true
+}
+
+/// Stop polling `napi` (Linux napi_disable; process context, may
+/// sleep): waits for a scheduled or running poll to complete, then
+/// holds `sched` so it cannot be scheduled again until `napi_enable`
+pub fn napi_disable(napi: &Napi) {
+    napi.disable.store(true, Ordering::SeqCst);
+    while napi.sched.swap(true, Ordering::SeqCst) {
+        napi_wait();
+    }
+    napi.disable.store(false, Ordering::SeqCst);
+}
+
+/// Allow `napi` to be scheduled again (Linux napi_enable)
+pub fn napi_enable(napi: &Napi) {
+    napi.sched.store(false, Ordering::SeqCst);
+}
+
+/// Back off while a poll finishes
+fn napi_wait() {
+    if crate::task::percpu::SCHEDULING_ENABLED.load(Ordering::Acquire) {
+        let ms = crate::time::monotonic_ns() + 1_000_000;
+        let _ = crate::task::percpu::sleep_until_ns(ms, false);
+    } else {
+        core::hint::spin_loop();
+    }
 }
 
 // ============================================================================
@@ -227,10 +290,13 @@ impl Softnet {
         }
     }
 
+    /// Separate statements: the poll_list IrqSpinlock guard of a
+    /// `a.lock().x() || b.lock().y()` chain would live across the
+    /// backlog lock
     fn has_work(&self) -> bool {
-        !self.poll_list.lock().is_empty()
-            || !self.backlog.lock().is_empty()
-            || (core::ptr::eq(self, &SOFTNET[0]) && TIMER_DUE.load(Ordering::Acquire))
+        let napi = !self.poll_list.lock().is_empty();
+        let backlog = !self.backlog.lock().is_empty();
+        napi || backlog || (core::ptr::eq(self, &SOFTNET[0]) && TIMER_DUE.load(Ordering::Acquire))
     }
 }
 
@@ -256,7 +322,7 @@ fn this_softnet() -> &'static Softnet {
     &SOFTNET[cpu.min(MAX_SCHED_CPUS - 1)]
 }
 
-/// Thread names (kthread names are &'static str)
+/// Thread names (kthread names are &'static str), one per possible CPU
 const SOFTNET_NAMES: [&str; 16] = [
     "softnet/0",
     "softnet/1",
@@ -275,6 +341,10 @@ const SOFTNET_NAMES: [&str; 16] = [
     "softnet/14",
     "softnet/15",
 ];
+const _: () = assert!(
+    SOFTNET_NAMES.len() >= MAX_SCHED_CPUS,
+    "a softnet name per CPU"
+);
 
 /// Start one `softnet/N` thread per CPU that runs a scheduler (after
 /// scheduling is enabled). Work queued earlier (IRQs during boot) is
@@ -317,8 +387,13 @@ fn softnet_thread(cpu: usize) {
             let work = napi.poll(quota);
             budget = budget.saturating_sub(work);
             if work >= quota {
-                // Not completed: keep polling it (sched stays set)
-                sd.poll_list.lock().push_back(napi);
+                if napi.disable.load(Ordering::SeqCst) {
+                    // napi_disable waits: complete it (Linux __napi_poll)
+                    napi_complete_done(&napi, work);
+                } else {
+                    // Not completed: keep polling it (sched stays set)
+                    sd.poll_list.lock().push_back(napi);
+                }
             }
         }
 
@@ -383,7 +458,13 @@ pub fn netif_rx(skb: Box<SkBuff>) -> bool {
 /// is delivered before `sendto()` returns).
 ///
 /// Call only at a point where the caller holds no locks (end of a socket
-/// send). If the softnet thread is mid-round, the packets are left to it.
+/// send; never under a socket lock: delivery takes socket locks). If the
+/// softnet thread is mid-round, the packets are left to it.
+///
+/// Relies on tasks never migrating: the backlog `lo` queued to in this
+/// task's transmit is this CPU's. With migration, the CPU used by
+/// `netif_rx` must be recorded (or every CPU's backlog flushed);
+/// otherwise the packets still arrive, via that CPU's softnet thread.
 pub fn netif_rx_flush_local() {
     let sd = this_softnet();
     let mut budget = NETDEV_BUDGET;
@@ -424,12 +505,13 @@ pub fn netif_receive_skb(mut skb: Box<SkBuff>) {
     };
 
     // Taps (AF_PACKET) see every frame, including other hosts' frames
-    let taps: Vec<PacketTap> = {
-        let t = PTYPE_ALL.read();
-        if t.is_empty() { Vec::new() } else { t.clone() }
-    };
-    for tap in taps {
-        tap(&skb);
+    if let Some(frame) = skb.frame_from_mac() {
+        deliver_taps(&Tap {
+            dev: &dev,
+            frame,
+            pkt_type: skb.pkt_type,
+            owner: 0,
+        });
     }
 
     if skb.pkt_type == PktType::OtherHost {
@@ -443,9 +525,19 @@ pub fn netif_receive_skb(mut skb: Box<SkBuff>) {
     }
 }
 
-/// Transmit a frame on `skb.dev` (Linux `dev_queue_xmit`; no qdisc)
+/// Transmit a frame on `skb.dev` (Linux `dev_queue_xmit`; no qdisc).
+/// `skb.data()` starts at the link-layer header. The taps see it as
+/// PACKET_OUTGOING first (Linux dev_queue_xmit_nit), if the device is up.
 pub fn dev_queue_xmit(skb: Box<SkBuff>) -> Result<(), crate::error::KernelError> {
     let dev: Arc<NetDevice> = skb.dev.clone().ok_or(crate::error::KernelError::NoDevice)?;
+    if dev.is_up() {
+        deliver_taps(&Tap {
+            dev: &dev,
+            frame: skb.data(),
+            pkt_type: PktType::Outgoing,
+            owner: skb.owner,
+        });
+    }
     dev.xmit(skb)
 }
 

@@ -8,7 +8,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::printkln;
 use crate::task::kthread::{

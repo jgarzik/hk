@@ -21,8 +21,8 @@
 //! ## Locking (doc/LOCKING.md, Network)
 //!
 //! - ISR: touches only MMIO, atomics and `napi_schedule` (IrqSpinlock).
-//! - `rx`: `spin::Mutex`, thread context only (NAPI poll). Leaf.
-//! - `tx`: `spin::Mutex`, thread context only (xmit, NAPI poll reclaim).
+//! - `rx`: `crate::sync::spin::Mutex`, thread context only (NAPI poll). Leaf.
+//! - `tx`: `crate::sync::spin::Mutex`, thread context only (xmit, NAPI poll reclaim).
 //!   Taken under socket/ARP locks (end of the network lock order). Leaf.
 
 use alloc::boxed::Box;
@@ -32,7 +32,8 @@ use core::any::Any;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use spin::{Mutex, Once};
+use crate::sync::spin::Mutex;
+use spin::Once;
 
 use crate::CurrentArch;
 use crate::arch::IoremapOps;
@@ -41,7 +42,9 @@ use crate::bus::bus::{BusContext, BusDevice, BusDriver};
 use crate::bus::driver::{Device, DriverError};
 use crate::bus::pci::PciDevice;
 use crate::dma::DmaCoherent;
-use crate::net::dev::{NAPI_POLL_WEIGHT, Napi, NapiPoll, napi_complete_done, napi_schedule};
+use crate::net::dev::{
+    NAPI_POLL_WEIGHT, Napi, NapiPoll, napi_complete_done, napi_disable, napi_enable, napi_schedule,
+};
 use crate::net::device::{LinkInfo, NetDevice, NetDeviceOps};
 use crate::net::skb::{NET_SKB_PAD, SkBuff};
 use crate::net::{self, KernelError};
@@ -498,22 +501,40 @@ impl NapiPoll for E1000 {
 
         if work < budget {
             napi_complete_done(napi, work);
-            // A closed device stays masked (stop() wrote IMC; a frame that
-            // still slips through is dropped by netif_receive_skb)
-            if !self.netdev().is_some_and(|d| d.is_up()) {
-                return work;
-            }
-            self.write_reg(reg::IMS, int::ENABLE);
-            // On a shared line our ISR may have run during the poll (for
-            // another device's interrupt) and consumed ICR causes: those
-            // will not interrupt again, so poll once more (Linux
-            // NAPIF_STATE_MISSED)
-            if self.pending_icr.load(Ordering::Acquire) != 0 {
-                self.write_reg(reg::IMC, 0xFFFF_FFFF);
+            if self.rearm() {
                 napi_schedule(&self.napi);
             }
         }
         work
+    }
+}
+
+impl E1000 {
+    /// Re-enable interrupts after a completed poll while the device is
+    /// running (checked under `rx`, which `stop` takes to mask, so a
+    /// closing device stays masked). True: causes arrived meanwhile,
+    /// interrupts are masked again and the poll must run again.
+    fn rearm(&self) -> bool {
+        let _rx = self.rx.lock();
+        if !self.netdev().is_some_and(|d| d.netif_running()) {
+            return false;
+        }
+        self.write_reg(reg::IMS, int::ENABLE);
+        // On a shared line our ISR may have run during the poll (for
+        // another device's interrupt) and consumed ICR causes: those
+        // will not interrupt again, so poll once more (Linux
+        // NAPIF_STATE_MISSED). napi_complete_done was a full barrier.
+        if self.pending_icr.load(Ordering::SeqCst) != 0 {
+            self.write_reg(reg::IMC, 0xFFFF_FFFF);
+            return true;
+        }
+        false
+    }
+
+    /// Mask every cause (under `rx`, serialized with `rearm`)
+    fn mask(&self) {
+        let _rx = self.rx.lock();
+        self.write_reg(reg::IMC, 0xFFFF_FFFF);
     }
 }
 
@@ -552,12 +573,15 @@ impl NetDeviceOps for E1000Ops {
         let c = self.device.read_reg(reg::CTRL);
         self.device.write_reg(reg::CTRL, c | ctrl::SLU | ctrl::ASDE);
         self.device.write_reg(reg::ITR, 0);
+        napi_enable(&self.device.napi);
         self.device.write_reg(reg::IMS, int::ENABLE);
         Ok(())
     }
 
+    /// Linux e1000_down: NAPI off (waits for a running poll), then mask
     fn stop(&self) -> Result<(), KernelError> {
-        self.device.write_reg(reg::IMC, 0xFFFF_FFFF);
+        napi_disable(&self.device.napi);
+        self.device.mask();
         Ok(())
     }
 }
@@ -703,12 +727,8 @@ impl BusDriver for E1000PciDriver {
         let ops: &'static dyn NetDeviceOps = Box::leak(Box::new(E1000Ops {
             device: Arc::clone(&device),
         }));
-        let netdev = Arc::new(NetDevice::new(
-            net::dev_alloc_name("eth%d"),
-            mac,
-            LinkInfo::ETHER,
-            ops,
-        ));
+        // RTNL from naming to registration (Linux register_netdev)
+        let (rtnl, netdev) = net::alloc_netdev("eth%d", mac, LinkInfo::ETHER, ops);
         device.netdev.call_once(|| Arc::downgrade(&netdev));
 
         // Carrier from the PHY now; later changes arrive as LSC interrupts
@@ -732,7 +752,7 @@ impl BusDriver for E1000PciDriver {
             }
         }
 
-        net::register_netdev(Arc::clone(&netdev));
+        net::register_netdev(rtnl, Arc::clone(&netdev));
 
         Ok(Box::new(E1000DeviceWrapper { netdev, device }))
     }

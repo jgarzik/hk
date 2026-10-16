@@ -166,7 +166,7 @@ impl NTtyData {
 pub struct NTtyLdisc {
     /// Per-tty state - using interior mutability for the static instance
     /// In a real implementation, this would be per-TTY state
-    data: spin::Mutex<NTtyData>,
+    data: crate::sync::spin::Mutex<NTtyData>,
 }
 
 impl Default for NTtyLdisc {
@@ -179,7 +179,7 @@ impl NTtyLdisc {
     /// Create a new N_TTY line discipline
     pub const fn new() -> Self {
         Self {
-            data: spin::Mutex::new(NTtyData::new()),
+            data: crate::sync::spin::Mutex::new(NTtyData::new()),
         }
     }
 

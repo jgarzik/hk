@@ -9,7 +9,7 @@
 //! ## Locking
 //!
 //! `Sock` holds atomics, its `WaitQueue` (IrqSpinlock leaf) and the
-//! error queue `errq` (`spin::Mutex` leaf, thread only). Wakeups
+//! error queue `errq` (`crate::sync::spin::Mutex` leaf, thread only). Wakeups
 //! (`data_ready`, `write_space`, `state_change`, `error_report`) are
 //! issued after the caller dropped its protocol locks.
 
@@ -18,7 +18,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::error::KernelError;
 use crate::net::NetNamespace;
@@ -94,6 +94,9 @@ impl ErrSkb {
 pub const TIMEO_FOREVER: u64 = u64::MAX;
 
 /// Common socket state
+/// SO_LINGER switch bit of `Sock.linger` (the time is the low 32 bits)
+const LINGER_ON: u64 = 1 << 32;
+
 pub struct Sock {
     pub family: u16,
     pub stype: i32,
@@ -114,8 +117,10 @@ pub struct Sock {
     rcvtimeo: AtomicU64,
     sndtimeo: AtomicU64,
     flags: AtomicU32,
-    /// SO_LINGER seconds (on/off is `sf::LINGER`)
-    linger: AtomicU32,
+    /// SO_LINGER as one word, `LINGER_ON | seconds`, so readers never
+    /// see the switch and the time of different setsockopt calls
+    /// (`sf::LINGER` mirrors the switch)
+    linger: AtomicU64,
     bound_dev_if: AtomicU32,
     pub priority: AtomicU32,
     pub mark: AtomicU32,
@@ -146,7 +151,7 @@ impl Sock {
             rcvtimeo: AtomicU64::new(TIMEO_FOREVER),
             sndtimeo: AtomicU64::new(TIMEO_FOREVER),
             flags: AtomicU32::new(0),
-            linger: AtomicU32::new(0),
+            linger: AtomicU64::new(0),
             bound_dev_if: AtomicU32::new(0),
             priority: AtomicU32::new(0),
             mark: AtomicU32::new(0),
@@ -171,7 +176,8 @@ impl Sock {
             .store(p.sndtimeo.load(Ordering::Relaxed), Ordering::Relaxed);
         let inherit = p.flags.load(Ordering::Relaxed) & !sf::ACCEPTCONN;
         s.flags.store(inherit, Ordering::Relaxed);
-        s.linger.store(p.linger_secs(), Ordering::Relaxed);
+        s.linger
+            .store(p.linger.load(Ordering::Relaxed), Ordering::Relaxed);
         s.bound_dev_if.store(p.bound_dev_if(), Ordering::Relaxed);
         s
     }
@@ -328,12 +334,22 @@ impl Sock {
         self.wq.wake_all();
     }
 
-    pub fn linger_secs(&self) -> u32 {
-        self.linger.load(Ordering::Acquire)
+    /// SO_LINGER: the time in seconds when switched on (one atomic
+    /// snapshot of both)
+    pub fn linger(&self) -> Option<u32> {
+        let v = self.linger.load(Ordering::Acquire);
+        (v & LINGER_ON != 0).then_some(v as u32)
+    }
+
+    /// SO_LINGER (l_onoff, l_linger) as (on, time)
+    pub fn linger_opt(&self) -> (bool, u32) {
+        let v = self.linger.load(Ordering::Acquire);
+        (v & LINGER_ON != 0, v as u32)
     }
 
     pub fn set_linger(&self, on: bool, secs: u32) {
-        self.linger.store(secs, Ordering::Release);
+        let on_bit = if on { LINGER_ON } else { 0 };
+        self.linger.store(on_bit | secs as u64, Ordering::Release);
         self.set_flag(sf::LINGER, on);
     }
 
@@ -385,7 +401,9 @@ impl Sock {
     }
 
     /// Wait on this socket's queue until `cond()` (`wait_on`)
+    #[track_caller]
     pub fn wait<F: FnMut() -> bool>(&self, timeo: u64, cond: F) -> Result<u64, KernelError> {
+        crate::sync::might_sleep();
         wait_on(&self.wq, timeo, cond)
     }
 }

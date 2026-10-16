@@ -18,7 +18,7 @@
 
 use alloc::vec::Vec;
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::bus::pci_intx::{IntxMapEntry as MapEntry, match_interrupt_map, qemu_virt_swizzle};
 use crate::dt::DeviceTree;

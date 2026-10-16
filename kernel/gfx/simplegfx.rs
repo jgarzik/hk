@@ -17,11 +17,11 @@
 
 extern crate alloc;
 
+use crate::sync::spin::Mutex;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use spin::Mutex;
 
 use super::dumb::DumbBuffer;
 use super::ioctl::{

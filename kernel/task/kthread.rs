@@ -18,7 +18,7 @@
 //!
 //! ## Locking
 //!
-//! `KTHREADS` (spin::Mutex, process context only) maps tid -> control
+//! `KTHREADS` (crate::sync::spin::Mutex, process context only) maps tid -> control
 //! block; it is never held across a wakeup or sleep. Stop/park requests are
 //! atomics plus a direct `wake_up_task`; requesters wait on the control
 //! block's `WaitQueue` for the thread to acknowledge.
@@ -27,7 +27,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::error::KernelError;
 use crate::task::percpu::{
@@ -156,14 +156,15 @@ extern "C" fn kthread_entry() -> ! {
 }
 
 /// Terminate the current kernel thread (nobody reaps kernel threads, so the
-/// task leaves the task table at once; its 16 KB stack is not reclaimed)
+/// task leaves the task table at once; its stack is freed once the CPU
+/// has switched away)
 fn kthread_exit() -> ! {
     let tid = current_tid();
     crate::task::percpu::TASK_TABLE
         .lock()
         .tasks
         .retain(|t| t.tid != tid);
-    crate::task::percpu::exit_current()
+    crate::task::percpu::exit_current(None)
 }
 
 /// True once `kthread_stop` was called on the current thread

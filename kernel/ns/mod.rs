@@ -15,7 +15,7 @@
 //! ## Locking
 //!
 //! - `TASK_TABLE`: Protects task struct access (including nsproxy field)
-//! - Per-namespace data: `spin::RwLock` (read-heavy)
+//! - Per-namespace data: `crate::sync::spin::RwLock` (read-heavy)
 //!
 //! ## Lock Ordering
 //!
@@ -27,8 +27,9 @@ pub mod pid;
 pub mod user;
 pub mod uts;
 
+use crate::sync::spin::RwLock;
 use alloc::sync::Arc;
-use spin::{Lazy, RwLock};
+use spin::Lazy;
 
 use crate::task::Tid;
 pub use cgroup::{CgroupNamespace, INIT_CGROUP_NS};
@@ -391,10 +392,15 @@ use crate::task::percpu::TASK_TABLE;
 ///
 /// Called when creating a new task to set up its namespace context.
 pub fn init_task_ns(tid: Tid, nsproxy: Arc<NsProxy>) {
-    let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.nsproxy = Some(nsproxy);
-    }
+    let old = {
+        let mut table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter_mut()
+            .find(|t| t.tid == tid)
+            .and_then(|t| t.nsproxy.replace(nsproxy))
+    };
+    drop(old);
 }
 
 /// Get the NsProxy for a task
@@ -413,12 +419,18 @@ pub fn get_task_ns(tid: Tid) -> Option<Arc<NsProxy>> {
 ///
 /// This decrements the Arc refcount. If this was the last reference
 /// (no other tasks sharing this NsProxy), the NsProxy is dropped,
-/// which in turn drops the namespace references.
+/// which in turn drops the namespace references (after TASK_TABLE is
+/// released: a network namespace's teardown takes RTNL).
 pub fn exit_task_ns(tid: Tid) {
-    let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.nsproxy = None;
-    }
+    let ns = {
+        let mut table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter_mut()
+            .find(|t| t.tid == tid)
+            .and_then(|t| t.nsproxy.take())
+    };
+    drop(ns);
 }
 
 /// Clone nsproxy for fork/clone

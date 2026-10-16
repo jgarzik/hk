@@ -4,21 +4,24 @@
 //! MMIO regions to kernel virtual addresses. Uses a dedicated virtual
 //! address region separate from the kernel heap and user space.
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
+use super::kmap::swapper_phys;
 use super::paging::{
-    PAGE_CACHE_DISABLE, PAGE_HUGE, PAGE_NO_EXECUTE, PAGE_PRESENT, PAGE_SIZE, PAGE_WRITABLE,
-    PAGE_WRITE_THROUGH, X86_64PageTable, phys_to_virt, phys_to_virt_table,
+    PAGE_CACHE_DISABLE, PAGE_NO_EXECUTE, PAGE_PRESENT, PAGE_SIZE, PAGE_WRITABLE,
+    PAGE_WRITE_THROUGH, VMALLOC_START, X86_64PageTable, phys_to_virt, phys_to_virt_table,
 };
 
-/// ioremap region base (224MB)
-pub const IOREMAP_BASE: u64 = 0x0E00_0000;
-
-/// ioremap region end (512MB - 1)
-pub const IOREMAP_END: u64 = 0x1FFF_FFFF;
+/// ioremap window: the first 1GB of the vmalloc area in the kernel half
+/// (its PDPT is preallocated by kmap, so every address space sees the
+/// PDs and PTs added here)
+pub const IOREMAP_BASE: u64 = VMALLOC_START;
 
 /// Total size of ioremap region
-pub const IOREMAP_SIZE: u64 = IOREMAP_END - IOREMAP_BASE + 1;
+pub const IOREMAP_SIZE: u64 = 1 << 30;
+
+/// ioremap region end (inclusive)
+pub const IOREMAP_END: u64 = IOREMAP_BASE + IOREMAP_SIZE - 1;
 
 /// Number of 4KB pages in ioremap region
 const IOREMAP_PAGES: usize = (IOREMAP_SIZE / PAGE_SIZE) as usize;
@@ -215,8 +218,8 @@ pub fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError> {
         .alloc(num_pages)
         .ok_or(IoremapError::OutOfVirtualSpace)?;
 
-    // Get current CR3 (kernel page tables)
-    let cr3 = X86_64PageTable::current_cr3();
+    // Kernel half: the same tables in every address space
+    let cr3 = swapper_phys();
 
     // Map each page
     for i in 0..num_pages {
@@ -264,7 +267,7 @@ pub fn iounmap(virt_addr: *mut u8, size: u64) {
     let aligned_size = (size + offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let num_pages = (aligned_size / PAGE_SIZE) as usize;
 
-    let cr3 = X86_64PageTable::current_cr3();
+    let cr3 = swapper_phys();
 
     // Unmap pages and flush TLB
     for i in 0..num_pages {
@@ -278,68 +281,31 @@ pub fn iounmap(virt_addr: *mut u8, size: u64) {
 }
 
 /// Map a single 4KB MMIO page
-///
-/// Handles the case where a 2MB huge page exists and needs to be split
-/// into 4KB pages before remapping.
 fn map_mmio_page(cr3: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
     let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
 
     unsafe {
+        // The window's PML4 entry is preallocated (kmap::init)
         let pml4 = phys_to_virt_table(cr3);
-
-        // Get or create PDPT
-        let pml4_entry = (*pml4).entry_mut(pml4_idx);
-        if !pml4_entry.is_present() {
-            let pdpt_phys = alloc_zeroed_frame()?;
-            pml4_entry.set(pdpt_phys, INTERMEDIATE_FLAGS);
-        }
+        let pml4_entry = (*pml4).entry(pml4_idx);
+        assert!(pml4_entry.is_present(), "ioremap: no vmalloc PDPT");
         let pdpt = phys_to_virt_table(pml4_entry.addr());
-
-        // Get or create PD
-        let pdpt_entry = (*pdpt).entry_mut(pdpt_idx);
-        if !pdpt_entry.is_present() {
-            let pd_phys = alloc_zeroed_frame()?;
-            pdpt_entry.set(pd_phys, INTERMEDIATE_FLAGS);
-        }
-        let pd = phys_to_virt_table(pdpt_entry.addr());
-
-        // Get or create PT - handle 2MB huge pages
-        let pd_entry = (*pd).entry_mut(pd_idx);
-        let pt = if !pd_entry.is_present() {
-            // No entry - allocate a new page table
-            let pt_phys = alloc_zeroed_frame()?;
-            pd_entry.set(pt_phys, INTERMEDIATE_FLAGS);
-            phys_to_virt_table(pt_phys)
-        } else if pd_entry.is_huge() {
-            // 2MB huge page - need to split into 4KB pages
-            let huge_base = pd_entry.addr();
-            let huge_flags = pd_entry.flags() & !PAGE_HUGE; // Remove huge flag for 4KB pages
-
-            // Allocate a new page table
-            let pt_phys = alloc_zeroed_frame()?;
-            let pt = phys_to_virt_table(pt_phys);
-
-            // Fill PT with 512 entries covering the same 2MB region
-            for i in 0..512 {
-                let entry_pa = huge_base + (i as u64) * PAGE_SIZE;
-                (*pt).entry_mut(i).set(entry_pa, huge_flags);
-            }
-
-            // Replace the PD entry to point to our new PT
-            pd_entry.set(pt_phys, INTERMEDIATE_FLAGS);
-
-            pt
-        } else {
-            // Regular PT entry - just use its address
-            phys_to_virt_table(pd_entry.addr())
-        };
-
-        // Map the page with MMIO flags
-        let pt_entry = (*pt).entry_mut(pt_idx);
-        pt_entry.set(pa, MMIO_FLAGS);
+        let pd = table(&mut *(*pdpt).entry_mut(pdpt_idx))?;
+        let pt = table(&mut *(*pd).entry_mut(pd_idx))?;
+        (*pt).entry_mut(pt_idx).set(pa, MMIO_FLAGS);
     }
 
     Ok(())
+}
+
+/// Table under a PDPT or PD entry, allocated if absent
+unsafe fn table(
+    e: &mut super::paging::PageTableEntry,
+) -> Result<*mut super::paging::RawPageTable, IoremapError> {
+    if !e.is_present() {
+        e.set(alloc_zeroed_frame()?, INTERMEDIATE_FLAGS);
+    }
+    Ok(phys_to_virt_table(e.addr()))
 }
 
 /// Unmap a single page (clear PTE, don't free intermediate tables)

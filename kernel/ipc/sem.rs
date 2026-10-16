@@ -21,11 +21,11 @@ use crate::ipc::{
     IPC_64, IPC_NOWAIT, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Sembuf, Semid64Ds,
     current_ipc_ns,
 };
+use crate::sync::spin::Mutex;
 use crate::task::percpu::{current_pid, current_tid};
 use crate::time::TIMEKEEPER;
 use crate::uaccess::{get_user, put_user};
 use crate::waitqueue::WaitQueue;
-use spin::Mutex;
 
 /// Get current time in seconds
 fn current_time_secs() -> i64 {
@@ -751,9 +751,9 @@ fn do_semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, i32> {
 // SEM_UNDO Support - Automatic semaphore adjustment on process exit
 // ============================================================================
 
+use crate::sync::spin::RwLock;
 use crate::task::Tid;
 use alloc::collections::BTreeMap;
-use spin::RwLock;
 
 /// Individual semaphore undo entry for a specific semaphore array
 ///

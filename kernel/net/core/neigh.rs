@@ -19,11 +19,11 @@
 //!
 //! ## Locking (thread context only; see doc/LOCKING.md)
 //!
-//! `NeighTable.hash` (`spin::RwLock`) -> `Neighbour.inner`
-//! (`spin::Mutex`, leaf). Lookups return `Arc<Neighbour>` and drop the
+//! `NeighTable.hash` (`crate::sync::spin::RwLock`) -> `Neighbour.inner`
+//! (`crate::sync::spin::Mutex`, leaf). Lookups return `Arc<Neighbour>` and drop the
 //! table lock. No packet is transmitted, solicited or reported while
 //! `inner` is held: state changes return actions that run after the
-//! unlock. `TABLES` and `TIMER` (`spin::Mutex`) are leaves except that
+//! unlock. `TABLES` and `TIMER` (`crate::sync::spin::Mutex`) are leaves except that
 //! `TIMER` is held across `timer_add/del` (-> the timer IrqSpinlock).
 
 use alloc::boxed::Box;
@@ -32,7 +32,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use spin::{Mutex, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
 
 use crate::error::KernelError;
 use crate::net::device::NetDevice;
@@ -602,7 +602,10 @@ impl NeighTable {
                 }
             }
         }
-        if let Some(t) = n.inner.lock().st.timer {
+        // Separate statement: an `if let` scrutinee's guard would stay
+        // held across arm() (Neighbour.inner is a leaf)
+        let timer = n.inner.lock().st.timer;
+        if let Some(t) = timer {
             arm(t);
         }
     }

@@ -7,6 +7,11 @@
 //!   (`net_setup_eth0`), then a DNS query to the QEMU slirp resolver
 //!   10.0.2.3:53 gets a reply, which proves ARP + TX + RX + IRQ + DMA end
 //!   to end
+//! - ETH0_NIC (both): after ETH0_DNS, the NIC as QEMU sets it up: link up
+//!   with carrier (IFF_RUNNING | IFF_LOWER_UP, operstate UP), MTU 1500,
+//!   MAC 52:54:00:12:34:56 (virtio-net: device config space; e1000:
+//!   EEPROM), and /proc/net/dev counted the traffic (rx/tx packets and
+//!   bytes > 0, no errors)
 
 use hk_syscall::{
     sys_bind, sys_close, sys_exit, sys_fork, sys_open, sys_poll, sys_read, sys_recvfrom,
@@ -25,6 +30,7 @@ pub fn run_tests() {
     test_netns_proc_net_dev();
     test_eth0_dns();
     test_eth0_dns_connected();
+    test_eth0_nic();
 }
 
 /// Read /proc/net/dev into `buf`; returns the length (or <0)
@@ -378,4 +384,69 @@ fn test_eth0_dns_connected() {
     t.ok(b"pktinfo ifindex", !ok || ifidx > 1, ifidx as i64);
     close(fd);
     t.done();
+}
+
+/// MAC of interface `name` (SIOCGIFHWADDR), or None
+fn hwaddr(name: &[u8]) -> Option<[u8; 6]> {
+    const SIOCGIFHWADDR: u64 = 0x8927;
+    let mut ifr = [0u8; 40];
+    ifr[..name.len()].copy_from_slice(name);
+    let fd = sys_socket(AF_INET, SOCK_DGRAM, 0);
+    let r = sys_ioctl(fd as i32, SIOCGIFHWADDR, ifr.as_mut_ptr() as u64);
+    sys_close(fd as u64);
+    if r != 0 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&ifr[18..24]);
+    Some(mac)
+}
+
+fn test_eth0_nic() {
+    use super::nl::{get_link, Nl, IFF_LOWER_UP, IFF_RUNNING, IFF_UP, IF_OPER_UP};
+    const N: &[u8] = b"ETH0_NIC";
+    let fail = |why: &[u8], v: i64| {
+        print(N);
+        print(b":FAIL ");
+        print(why);
+        print(b" ");
+        print_num(v);
+        println(b"");
+    };
+    let Ok(idx) = net_setup_eth0() else {
+        return fail(b"net_setup_eth0", 0);
+    };
+    let mut name = [0u8; 16];
+    let nlen = ifname(idx, &mut name);
+    let name = &name[..nlen];
+    let Some(link) = Nl::open().and_then(|mut nl| get_link(&mut nl, idx)) else {
+        return fail(b"getlink", 0);
+    };
+    let want = IFF_UP | IFF_RUNNING | IFF_LOWER_UP;
+    if link.flags & want != want || link.operstate != IF_OPER_UP {
+        return fail(b"link flags", link.flags as i64);
+    }
+    if link.mtu != 1500 {
+        return fail(b"mtu", link.mtu as i64);
+    }
+    // QEMU's default NIC address (both kernels, both NIC models)
+    if hwaddr(name) != Some([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]) {
+        return fail(b"hwaddr", 0);
+    }
+    let mut buf = [0u8; 4096];
+    let n = read_proc_net_dev(&mut buf);
+    let Some(c) = (if n > 0 { dev_counters(&buf[..n as usize], name) } else { None }) else {
+        return fail(b"/proc/net/dev", n);
+    };
+    // rx bytes, packets, errs; tx bytes, packets, errs
+    if c[0] == 0 || c[1] == 0 || c[8] == 0 || c[9] == 0 {
+        return fail(b"no traffic counted", c[1] as i64);
+    }
+    if c[0] < c[1] * 14 || c[8] < c[9] * 14 {
+        return fail(b"bytes < 14 per packet", c[0] as i64);
+    }
+    if c[2] != 0 || c[10] != 0 {
+        return fail(b"errors", (c[2] + c[10]) as i64);
+    }
+    println(b"ETH0_NIC:OK");
 }

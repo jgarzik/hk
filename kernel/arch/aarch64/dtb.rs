@@ -8,7 +8,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use crate::arch::{AcpiInfo, CpuInfo};
+use crate::arch::{AcpiInfo, CpuInfo, phys_to_virt};
 use crate::dt::DeviceTree;
 
 /// Parse DTB and extract hardware configuration
@@ -20,25 +20,7 @@ pub fn parse_dtb(dtb_ptr: u64) -> Option<AcpiInfo> {
         return None;
     }
 
-    // Safety: DTB pointer comes from bootloader (x0 register)
-    // First read header to get totalsize
-    let dtb_data = unsafe {
-        let header = core::slice::from_raw_parts(dtb_ptr as *const u8, 8);
-
-        // Check magic number first (big-endian 0xd00dfeed)
-        if header[0] != 0xd0 || header[1] != 0x0d || header[2] != 0xfe || header[3] != 0xed {
-            return None;
-        }
-
-        let totalsize = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
-
-        // Sanity check size (between 1KB and 16MB)
-        if !(1024..=16 * 1024 * 1024).contains(&totalsize) {
-            return None;
-        }
-
-        core::slice::from_raw_parts(dtb_ptr as *const u8, totalsize)
-    };
+    let dtb_data = blob(dtb_ptr)?;
 
     let dt = DeviceTree::from_fdt(dtb_data).ok()?;
 
@@ -143,14 +125,37 @@ fn extract_cpus(dt: &DeviceTree) -> Vec<CpuInfo> {
 /// the magic matches; reads only the header, so it is usable before the
 /// heap exists
 pub fn total_size(dtb_ptr: u64) -> Option<usize> {
-    if dtb_ptr == 0 {
+    blob(dtb_ptr).map(|b| b.len())
+}
+
+/// The FDT blob at physical `dtb` (read through the direct map), if
+/// the header magic matches and the size is sane (1KB-16MB)
+pub fn blob(dtb: u64) -> Option<&'static [u8]> {
+    if dtb == 0 {
         return None;
     }
-    let h = unsafe { core::slice::from_raw_parts(dtb_ptr as *const u8, 8) };
+    let p = phys_to_virt(dtb) as *const u8;
+    let h = unsafe { core::slice::from_raw_parts(p, 8) };
     if h[..4] != [0xd0, 0x0d, 0xfe, 0xed] {
         return None;
     }
-    Some(u32::from_be_bytes([h[4], h[5], h[6], h[7]]) as usize)
+    let size = u32::from_be_bytes([h[4], h[5], h[6], h[7]]) as usize;
+    if !(1024..=16 * 1024 * 1024).contains(&size) {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts(p, size) })
+}
+
+/// First RAM range of the /memory node(s), as physical (base, size)
+pub fn memory(dtb_ptr: u64) -> Option<(u64, u64)> {
+    let dt = DeviceTree::from_fdt(blob(dtb_ptr)?).ok()?;
+    let root = dt.find_node("/")?;
+    root.children()
+        .filter(|c| c.name() == "memory" || c.name().starts_with("memory@"))
+        .find_map(|c| match c.reg()? {
+            (Some(base), Some(size)) => Some((base, size)),
+            _ => None,
+        })
 }
 
 /// Initramfs location from DTB
@@ -173,7 +178,7 @@ impl InitramfsInfo {
     /// # Safety
     /// The start/end addresses must be valid and mapped.
     pub unsafe fn as_slice(&self) -> &'static [u8] {
-        unsafe { core::slice::from_raw_parts(self.start as *const u8, self.size()) }
+        unsafe { core::slice::from_raw_parts(phys_to_virt(self.start), self.size()) }
     }
 }
 
@@ -188,24 +193,7 @@ pub fn extract_initramfs(dtb_ptr: u64) -> Option<InitramfsInfo> {
         return None;
     }
 
-    // Safety: DTB pointer comes from bootloader (x0 register)
-    let dtb_data = unsafe {
-        let header = core::slice::from_raw_parts(dtb_ptr as *const u8, 8);
-
-        // Check magic number first (big-endian 0xd00dfeed)
-        if header[0] != 0xd0 || header[1] != 0x0d || header[2] != 0xfe || header[3] != 0xed {
-            return None;
-        }
-
-        let totalsize = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
-
-        // Sanity check size (between 1KB and 16MB)
-        if !(1024..=16 * 1024 * 1024).contains(&totalsize) {
-            return None;
-        }
-
-        core::slice::from_raw_parts(dtb_ptr as *const u8, totalsize)
-    };
+    let dtb_data = blob(dtb_ptr)?;
 
     let dt = DeviceTree::from_fdt(dtb_data).ok()?;
 
@@ -238,21 +226,8 @@ pub fn extract_initramfs(dtb_ptr: u64) -> Option<InitramfsInfo> {
 /// Extract kernel command line from DTB /chosen node bootargs property
 ///
 /// Returns the command line string if found, or None if not present.
-pub fn extract_bootargs(dtb_ptr: *const u8) -> Option<&'static str> {
-    if dtb_ptr.is_null() {
-        return None;
-    }
-
-    // Parse just enough to get the total size
-    let magic = unsafe { (dtb_ptr as *const u32).read() }.to_be();
-    if magic != 0xd00dfeed {
-        return None;
-    }
-
-    let totalsize = unsafe { (dtb_ptr as *const u32).add(1).read() }.to_be() as usize;
-
-    // Create a slice for the device tree
-    let dtb_data = unsafe { core::slice::from_raw_parts(dtb_ptr, totalsize) };
+pub fn extract_bootargs(dtb_ptr: u64) -> Option<&'static str> {
+    let dtb_data = blob(dtb_ptr)?;
 
     let dt = DeviceTree::from_fdt(dtb_data).ok()?;
 
@@ -280,24 +255,7 @@ pub unsafe fn extract_simple_framebuffer(dtb_ptr: u64) -> Option<crate::gfx::Fra
         return None;
     }
 
-    // Parse just enough to get the total size
-    // SAFETY: dtb_ptr was validated to be non-zero, and we're reading the DTB header
-    let magic = unsafe { (dtb_ptr as *const u32).read() }.to_be();
-    if magic != 0xd00dfeed {
-        return None;
-    }
-
-    // SAFETY: dtb_ptr is valid, and we're reading the totalsize field from the DTB header
-    let totalsize = unsafe { (dtb_ptr as *const u32).add(1).read() }.to_be() as usize;
-
-    // Sanity check size (between 1KB and 16MB)
-    if !(1024..=16 * 1024 * 1024).contains(&totalsize) {
-        return None;
-    }
-
-    // Create a slice for the device tree
-    // SAFETY: dtb_ptr is valid and totalsize has been validated to be reasonable
-    let dtb_data = unsafe { core::slice::from_raw_parts(dtb_ptr as *const u8, totalsize) };
+    let dtb_data = blob(dtb_ptr)?;
 
     let dt = DeviceTree::from_fdt(dtb_data).ok()?;
 
@@ -361,23 +319,8 @@ pub fn init_numa_topology(dtb_ptr: u64) -> Result<bool, &'static str> {
         return Ok(false);
     }
 
-    // Parse DTB header for size
-    let dtb_data = unsafe {
-        let header = core::slice::from_raw_parts(dtb_ptr as *const u8, 8);
-
-        // Check magic number first (big-endian 0xd00dfeed)
-        if header[0] != 0xd0 || header[1] != 0x0d || header[2] != 0xfe || header[3] != 0xed {
-            return Ok(false);
-        }
-
-        let totalsize = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
-
-        // Sanity check size (between 1KB and 16MB)
-        if !(1024..=16 * 1024 * 1024).contains(&totalsize) {
-            return Ok(false);
-        }
-
-        core::slice::from_raw_parts(dtb_ptr as *const u8, totalsize)
+    let Some(dtb_data) = blob(dtb_ptr) else {
+        return Ok(false);
     };
 
     let dt = match DeviceTree::from_fdt(dtb_data) {

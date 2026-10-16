@@ -16,7 +16,7 @@
 use core::ptr;
 
 /// PL031 base address on QEMU virt platform
-const PL031_BASE: usize = 0x0901_0000;
+const PL031_BASE: usize = super::paging::io_va(0x0901_0000) as usize;
 
 /// Register offsets
 const RTCDR: usize = 0x000; // Data Register (read-only current time)

@@ -19,7 +19,7 @@ pub use super::perm::*;
 pub use super::pollsys::*;
 pub use super::stat::*;
 
-use crate::fs::{File, KernelError, LookupFlags, Path, lookup_path_at};
+use crate::fs::{KernelError, LookupFlags, Path, lookup_path_at};
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
@@ -127,7 +127,7 @@ pub fn check_fsize_limit(offset: u64, count: usize) -> Result<(), i64> {
 ///
 /// Panics if the current task doesn't have an FD table registered,
 /// which would indicate a kernel bug.
-pub fn current_fd_table() -> alloc::sync::Arc<spin::Mutex<crate::task::FdTable<File>>> {
+pub fn current_fd_table() -> alloc::sync::Arc<crate::task::fdtable::Files> {
     get_task_fd(current_tid()).expect("current task has no FD table")
 }
 

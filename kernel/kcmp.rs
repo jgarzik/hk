@@ -163,8 +163,11 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
 
     match kcmp_type {
         KCMP_FILE => {
-            // Compare specific file descriptors
-            let ptr1 = match &task1.files {
+            // Compare specific file descriptors; the tables are locked
+            // after TASK_TABLE is dropped (order: fd table -> TASK_TABLE)
+            let (files1, files2) = (task1.files.clone(), task2.files.clone());
+            drop(table);
+            let ptr1 = match &files1 {
                 Some(files) => {
                     let fd_table = files.lock();
                     match fd_table.get(idx1 as i32) {
@@ -175,7 +178,7 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
                 None => return KernelError::BadFd.sysret(),
             };
 
-            let ptr2 = match &task2.files {
+            let ptr2 = match &files2 {
                 Some(files) => {
                     let fd_table = files.lock();
                     match fd_table.get(idx2 as i32) {
@@ -191,7 +194,8 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
 
         KCMP_VM => {
             // Compare memory address spaces
-            compare_arc_option(&task1.mm, &task2.mm, KCMP_VM)
+            let vm = |t: &Option<crate::mm::MmRef>| t.as_ref().map(|m| m.arc().clone());
+            compare_arc_option(&vm(&task1.mm), &vm(&task2.mm), KCMP_VM)
         }
 
         KCMP_FILES => {

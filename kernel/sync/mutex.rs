@@ -55,6 +55,7 @@ impl<T> Mutex<T> {
     }
 
     /// Acquire without a guard (pair with `unlock_raw`)
+    #[track_caller]
     pub fn lock_raw(&self) {
         might_sleep();
         let me = me();
@@ -86,6 +87,7 @@ impl<T> Mutex<T> {
     }
 
     /// Acquire, sleeping while contended
+    #[track_caller]
     pub fn lock(&self) -> MutexGuard<'_, T> {
         self.lock_raw();
         MutexGuard { m: self }

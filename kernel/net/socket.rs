@@ -234,12 +234,13 @@ pub fn sock_create(
 
 type CreateFn = fn(i32, i32) -> Result<Arc<dyn ProtoOps>, KernelError>;
 
-/// Registered families (AF_INET6 joins with IPv6, AF_PACKET in P9;
-/// until then socket() is EAFNOSUPPORT for them)
+/// Registered families (AF_INET6 joins with IPv6; until then socket()
+/// is EAFNOSUPPORT for it)
 static FAMILIES: &[(u16, CreateFn)] = &[
     (AF_UNIX, crate::net::unix::create),
     (AF_INET, crate::net::af_inet::create),
     (AF_NETLINK, crate::net::netlink::create),
+    (AF_PACKET, crate::net::packet::create),
 ];
 
 /// File operations shared by all sockets (Linux socket_file_ops)
@@ -342,7 +343,8 @@ fn sock_ioctl(s: &dyn ProtoOps, file: &File, cmd: u32, arg: u64) -> Result<i64, 
     }
     match s.ioctl(cmd, arg) {
         Err(KernelError::NotTty) => {
-            let inet = s.sk().family == AF_INET;
+            // Linux packet_ioctl hands the address ioctls to inet too
+            let inet = s.sk().family == AF_INET || s.sk().family == AF_PACKET;
             crate::net::devioctl::ioctl(&s.sk().net, inet, cmd, arg)
         }
         r => r,
@@ -572,8 +574,9 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
         )),
         SO_LINGER => {
             let mut b = Vec::with_capacity(8);
-            b.extend_from_slice(&(sk.flag(sf::LINGER) as i32).to_ne_bytes());
-            b.extend_from_slice(&(sk.linger_secs() as i32).to_ne_bytes());
+            let (on, secs) = sk.linger_opt();
+            b.extend_from_slice(&(on as i32).to_ne_bytes());
+            b.extend_from_slice(&(secs as i32).to_ne_bytes());
             Ok(OptOut::Bytes(b))
         }
         SO_RCVTIMEO_OLD | SO_RCVTIMEO_NEW => Ok(OptOut::Bytes(timeval_bytes(sk.rcvtimeo()))),

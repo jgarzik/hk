@@ -12,9 +12,8 @@
 //! save/restore FS base in Rust before calling the pure-asm switch.
 
 use super::fpu::{self, FpuArea};
-use super::percpu::{read_fs_base, write_fs_base};
-use crate::task::percpu::current_tid;
-use crate::task::{Tid, get_task_tls, set_task_tls};
+use super::percpu::write_fs_base;
+use crate::task::{Tid, get_task_tls};
 
 // External assembly functions from switch_to.S
 unsafe extern "C" {
@@ -323,15 +322,6 @@ pub unsafe fn context_switch(
     new_cr3: u64,
     next_tid: Tid,
 ) {
-    // Save current task's TLS (FS base) before switching
-    let prev_tid = current_tid();
-    if prev_tid != 0 {
-        let fs_base = read_fs_base();
-        if fs_base != 0 {
-            set_task_tls(prev_tid, fs_base);
-        }
-    }
-
     // Load next task's TLS (FS base) before switching
     if next_tid != 0 {
         let tls = get_task_tls(next_tid).unwrap_or(0);

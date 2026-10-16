@@ -20,7 +20,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use spin::{Mutex, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
 
 use crate::PAGE_CACHE;
 use crate::mm::page_cache::{AddressSpace, DIRTY_ADDRESS_SPACES, FileId, PAGE_SIZE};
@@ -196,7 +196,11 @@ pub fn do_writepages(addr_space: &AddressSpace, wbc: &mut WritebackControl) -> R
         // Copy page content to temporary buffer
         let mut buf = [0u8; PAGE_SIZE];
         unsafe {
-            core::ptr::copy_nonoverlapping(page.frame as *const u8, buf.as_mut_ptr(), PAGE_SIZE);
+            core::ptr::copy_nonoverlapping(
+                crate::arch::phys_to_virt(page.frame) as *const u8,
+                buf.as_mut_ptr(),
+                PAGE_SIZE,
+            );
         }
 
         // Call filesystem's writepage

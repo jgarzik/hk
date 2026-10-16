@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use spin::RwLock;
+use crate::sync::spin::RwLock;
 
 use crate::net::KernelError;
 use crate::net::inet::ifaddr::IfAddrs;
@@ -254,8 +254,18 @@ pub struct NetDevice {
     /// Physical link state (Linux carrier)
     carrier: AtomicBool,
 
+    /// Open (Linux __LINK_STATE_START / netif_running): set before the
+    /// driver's open runs and cleared before its stop, so a NAPI poll
+    /// racing with either sees whether it may re-enable interrupts
+    running: AtomicBool,
+
     /// Number of carrier transitions (IFLA_CARRIER_CHANGES)
     carrier_changes: AtomicU32,
+
+    /// Promiscuity and allmulti users (AF_PACKET memberships; Linux
+    /// dev->promiscuity / allmulti); changed under RTNL
+    promiscuity: AtomicU32,
+    allmulti: AtomicU32,
 }
 
 impl NetDevice {
@@ -275,7 +285,10 @@ impl NetDevice {
             addrs: RwLock::new(IfAddrs::default()),
             net: RwLock::new(Weak::new()),
             carrier: AtomicBool::new(true),
+            running: AtomicBool::new(false),
             carrier_changes: AtomicU32::new(0),
+            promiscuity: AtomicU32::new(0),
+            allmulti: AtomicU32::new(0),
         }
     }
 
@@ -416,17 +429,55 @@ impl NetDevice {
         self.admin_flags() & flags::IFF_LOOPBACK != 0
     }
 
-    /// Open the device (RTNL held; see `rtnl::dev_change_flags`)
+    /// The device is open (Linux netif_running): drivers re-enable
+    /// interrupts after a poll only while it is
+    pub fn netif_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// Open the device (RTNL held; see `rtnl::dev_change_flags`). Like
+    /// Linux __dev_open, running is set before the driver's open, so a
+    /// poll scheduled by an interrupt it enables re-enables them.
     pub(crate) fn open(&self) -> Result<(), KernelError> {
-        self.ops.open(self)?;
+        self.running.store(true, Ordering::SeqCst);
+        if let Err(e) = self.ops.open(self) {
+            self.running.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
         self.flags.fetch_or(flags::IFF_UP, Ordering::AcqRel);
         Ok(())
     }
 
-    /// Close the device (RTNL held)
+    /// Close the device (RTNL held; Linux __dev_close: running is
+    /// cleared before the driver's stop, which disables NAPI)
     pub(crate) fn close(&self) {
         self.flags.fetch_and(!flags::IFF_UP, Ordering::AcqRel);
+        self.running.store(false, Ordering::SeqCst);
         let _ = self.ops.stop();
+    }
+
+    /// Add or remove a promiscuity user (Linux dev_set_promiscuity, RTNL
+    /// held): the driver is told on the first and last one. Like Linux,
+    /// the IFF_PROMISC reported to userspace is only the admin flag.
+    pub fn set_promiscuity(&self, _rtnl: &crate::net::rtnl::RtnlGuard, inc: i32) {
+        let old = self.promiscuity.load(Ordering::Acquire);
+        let new = old.saturating_add_signed(inc);
+        self.promiscuity.store(new, Ordering::Release);
+        if (old == 0) != (new == 0) {
+            self.ops.set_promisc(new != 0);
+        }
+    }
+
+    /// Add or remove an allmulti user (Linux dev_set_allmulti, RTNL held)
+    pub fn set_allmulti(&self, _rtnl: &crate::net::rtnl::RtnlGuard, inc: i32) {
+        let old = self.allmulti.load(Ordering::Acquire);
+        self.allmulti
+            .store(old.saturating_add_signed(inc), Ordering::Release);
+    }
+
+    /// Promiscuity users (AF_PACKET memberships)
+    pub fn promiscuity(&self) -> u32 {
+        self.promiscuity.load(Ordering::Acquire)
     }
 
     /// Snapshot of the IPv4 addresses (primaries before secondaries)

@@ -127,7 +127,9 @@ pub fn dispatch_irq(irq: u8) -> bool {
     // Every handler of a shared line gets a look
     let mut handled = false;
     for entry in &line.handlers {
+        crate::sync::lockdep::irq_enter();
         handled |= (entry.handler)(irq as u32, entry.data);
+        crate::sync::lockdep::irq_exit();
     }
     if handled {
         line.unhandled = 0;

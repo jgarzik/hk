@@ -15,10 +15,11 @@
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use spin::{Mutex, RwLock};
+use crate::sync::spin::{Mutex, RwLock};
 
 use crate::arch::FrameAlloc;
 use crate::error::KernelError;
@@ -625,6 +626,12 @@ impl AddressSpace {
         self.inner.write().pages.remove(&page_offset)
     }
 
+    /// Remove and return all pages
+    fn take_pages(&self) -> Vec<Arc<CachedPage>> {
+        let pages = core::mem::take(&mut self.inner.write().pages);
+        pages.into_values().collect()
+    }
+
     /// Number of cached pages
     pub fn page_count(&self) -> usize {
         self.inner.read().pages.len()
@@ -743,7 +750,7 @@ impl AddressSpace {
             let mut buf = [0u8; PAGE_SIZE];
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    page.frame as *const u8,
+                    crate::arch::phys_to_virt(page.frame) as *const u8,
                     buf.as_mut_ptr(),
                     PAGE_SIZE,
                 );
@@ -801,11 +808,16 @@ pub struct PageCache {
     /// FIFO eviction queue (oldest at front)
     fifo_queue: VecDeque<FifoEntry>,
 
-    /// Maximum number of pages to cache
+    /// Maximum number of evictable pages to cache (unevictable pages,
+    /// e.g. ramfs data, are bounded only by memory, like Linux's
+    /// unevictable LRU)
     max_pages: usize,
 
     /// Current number of cached pages
     current_pages: AtomicUsize,
+
+    /// Pages of unevictable address spaces among `current_pages`
+    unevictable_pages: AtomicUsize,
 }
 
 impl PageCache {
@@ -816,6 +828,29 @@ impl PageCache {
             fifo_queue: VecDeque::new(),
             max_pages,
             current_pages: AtomicUsize::new(0),
+            unevictable_pages: AtomicUsize::new(0),
+        }
+    }
+
+    /// Cached pages that count against `max_pages`
+    fn evictable_pages(&self) -> usize {
+        let all = self.current_pages.load(Ordering::Relaxed);
+        all.saturating_sub(self.unevictable_pages.load(Ordering::Relaxed))
+    }
+
+    /// Account `n` pages added to (`add`) or removed from `space`
+    fn account(&self, space: Option<&AddressSpace>, n: usize, add: bool) {
+        let c = &self.current_pages;
+        let u = &self.unevictable_pages;
+        let counters: &[&AtomicUsize] = if space.is_some_and(|a| a.is_unevictable()) {
+            &[c, u]
+        } else {
+            &[c]
+        };
+        for ctr in counters {
+            let old = ctr.load(Ordering::Relaxed);
+            let new = if add { old + n } else { old.saturating_sub(n) };
+            ctr.store(new, Ordering::Relaxed);
         }
     }
 
@@ -939,8 +974,12 @@ impl PageCache {
         unevictable: bool,
         a_ops: &'static dyn AddressSpaceOps,
     ) -> Result<Arc<CachedPage>, KernelError> {
+        // Unevictable pages (ramfs) never take the kernel's reserve
+        if unevictable && frame_alloc.reserve_low() {
+            return Err(KernelError::NoSpace);
+        }
         // Check if we need to evict
-        if self.current_pages.load(Ordering::Relaxed) >= self.max_pages {
+        if self.evictable_pages() >= self.max_pages {
             self.evict_one(frame_alloc)?;
         }
 
@@ -950,7 +989,7 @@ impl PageCache {
         // Copy data to frame
         unsafe {
             // Zero the frame first (important for partial pages and BSS)
-            ::core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
+            ::core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE);
 
             // Calculate how much data to copy
             let file_offset = page_offset * PAGE_SIZE as u64;
@@ -958,7 +997,7 @@ impl PageCache {
                 let copy_len = ::core::cmp::min(PAGE_SIZE, file_data.len() - file_offset as usize);
                 ::core::ptr::copy_nonoverlapping(
                     file_data.as_ptr().add(file_offset as usize),
-                    frame as *mut u8,
+                    crate::arch::phys_to_virt(frame),
                     copy_len,
                 );
             }
@@ -972,16 +1011,19 @@ impl PageCache {
             self.get_or_create_address_space(file_id, file_size, can_writeback, unevictable, a_ops);
         addr_space.insert_page(page_offset, page.clone());
 
-        // Add to FIFO queue
-        self.fifo_queue.push_back(FifoEntry {
-            key: PageCacheKey {
-                file_id,
-                page_offset,
-            },
-            page: page.clone(),
-        });
+        // Evictable pages join the FIFO; unevictable ones are found
+        // through their address space (no queue to grow and rescan)
+        if !addr_space.is_unevictable() {
+            self.fifo_queue.push_back(FifoEntry {
+                key: PageCacheKey {
+                    file_id,
+                    page_offset,
+                },
+                page: page.clone(),
+            });
+        }
 
-        self.current_pages.fetch_add(1, Ordering::Relaxed);
+        self.account(Some(&addr_space), 1, true);
 
         Ok(page)
     }
@@ -1076,7 +1118,7 @@ impl PageCache {
                     let mut buf = [0u8; PAGE_SIZE];
                     unsafe {
                         core::ptr::copy_nonoverlapping(
-                            entry.page.frame as *const u8,
+                            crate::arch::phys_to_virt(entry.page.frame) as *const u8,
                             buf.as_mut_ptr(),
                             PAGE_SIZE,
                         );
@@ -1115,6 +1157,22 @@ impl PageCache {
         Err(KernelError::OutOfMemory)
     }
 
+    /// Free the frames of pages taken out of an unevictable address space
+    /// (they are not on the FIFO)
+    fn free_unevictable<FA: FrameAlloc<PhysAddr = u64>>(
+        &self,
+        space: &AddressSpace,
+        pages: Vec<Arc<CachedPage>>,
+        frame_alloc: &mut FA,
+    ) -> usize {
+        let n = pages.len();
+        for p in pages {
+            frame_alloc.free_frame(p.frame);
+        }
+        self.account(Some(space), n, false);
+        n
+    }
+
     /// Get cache statistics
     pub fn stats(&self) -> (usize, usize) {
         (self.current_pages.load(Ordering::Relaxed), self.max_pages)
@@ -1145,8 +1203,12 @@ impl PageCache {
         unevictable: bool,
         a_ops: &'static dyn AddressSpaceOps,
     ) -> Result<Arc<CachedPage>, KernelError> {
+        // Unevictable pages (ramfs) never take the kernel's reserve
+        if unevictable && frame_alloc.reserve_low() {
+            return Err(KernelError::NoSpace);
+        }
         // Check if we need to evict
-        if self.current_pages.load(Ordering::Relaxed) >= self.max_pages {
+        if self.evictable_pages() >= self.max_pages {
             self.evict_one(frame_alloc)?;
         }
 
@@ -1155,7 +1217,7 @@ impl PageCache {
 
         // Zero the frame
         unsafe {
-            ::core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE);
+            ::core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE);
         }
 
         // Create cached page
@@ -1166,16 +1228,19 @@ impl PageCache {
             self.get_or_create_address_space(file_id, file_size, can_writeback, unevictable, a_ops);
         addr_space.insert_page(page_offset, page.clone());
 
-        // Add to FIFO queue
-        self.fifo_queue.push_back(FifoEntry {
-            key: PageCacheKey {
-                file_id,
-                page_offset,
-            },
-            page: page.clone(),
-        });
+        // Evictable pages join the FIFO; unevictable ones are found
+        // through their address space (no queue to grow and rescan)
+        if !addr_space.is_unevictable() {
+            self.fifo_queue.push_back(FifoEntry {
+                key: PageCacheKey {
+                    file_id,
+                    page_offset,
+                },
+                page: page.clone(),
+            });
+        }
 
-        self.current_pages.fetch_add(1, Ordering::Relaxed);
+        self.account(Some(&addr_space), 1, true);
 
         Ok(page)
     }
@@ -1226,6 +1291,12 @@ impl PageCache {
         if page_count == 0 {
             return 0;
         }
+        if let Some(sp) = removed_space.as_deref()
+            && sp.is_unevictable()
+        {
+            let pages = sp.take_pages();
+            return self.free_unevictable(sp, pages, frame_alloc);
+        }
 
         // Remove matching entries from FIFO queue and free their frames
         let mut new_queue = VecDeque::with_capacity(self.fifo_queue.len());
@@ -1243,10 +1314,7 @@ impl PageCache {
         }
 
         self.fifo_queue = new_queue;
-        // Use atomic subtract, clamping to 0 if underflow would occur
-        let old = self.current_pages.load(Ordering::Relaxed);
-        self.current_pages
-            .store(old.saturating_sub(freed_count), Ordering::Relaxed);
+        self.account(removed_space.as_deref(), freed_count, false);
 
         freed_count
     }
@@ -1290,8 +1358,12 @@ impl PageCache {
         }
 
         // Remove pages from address space
-        for &offset in &pages_to_remove {
-            addr_space.remove_page(offset);
+        let removed: Vec<Arc<CachedPage>> = pages_to_remove
+            .iter()
+            .filter_map(|&offset| addr_space.remove_page(offset))
+            .collect();
+        if addr_space.is_unevictable() {
+            return self.free_unevictable(&addr_space, removed, frame_alloc);
         }
 
         // Remove from FIFO queue and free frames
@@ -1310,9 +1382,7 @@ impl PageCache {
         }
 
         self.fifo_queue = new_queue;
-        let old = self.current_pages.load(Ordering::Relaxed);
-        self.current_pages
-            .store(old.saturating_sub(freed_count), Ordering::Relaxed);
+        self.account(Some(&addr_space), freed_count, false);
 
         freed_count
     }
@@ -1341,6 +1411,12 @@ impl PageCache {
         if page_count == 0 {
             return 0;
         }
+        if let Some(sp) = removed_space.as_deref()
+            && sp.is_unevictable()
+        {
+            let pages = sp.take_pages();
+            return self.free_unevictable(sp, pages, frame_alloc);
+        }
 
         // Remove matching entries from FIFO queue and free their frames
         let mut new_queue = VecDeque::with_capacity(self.fifo_queue.len());
@@ -1358,9 +1434,7 @@ impl PageCache {
         }
 
         self.fifo_queue = new_queue;
-        let old = self.current_pages.load(Ordering::Relaxed);
-        self.current_pages
-            .store(old.saturating_sub(freed_count), Ordering::Relaxed);
+        self.account(removed_space.as_deref(), freed_count, false);
 
         freed_count
     }

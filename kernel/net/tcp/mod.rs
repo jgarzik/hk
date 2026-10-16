@@ -11,20 +11,25 @@
 //!
 //! ## Locking (thread context only; see doc/LOCKING.md, Network)
 //!
-//! `TcpSock.cb` (`spin::Mutex<Inner>`) is the socket lock: Linux
+//! `TcpSock.cb` (`crate::sync::spin::Mutex<Inner>`) is the socket lock: Linux
 //! bh_lock_sock and the tcp_sock fields it protects. Segment input
 //! (softnet), timers (softnet/0) and the socket calls take it for a
 //! bounded step and never sleep or touch user memory under it. Unlike
 //! Linux there is no separate owner lock (lock_sock) with a backlog:
 //! user calls copy data through a bounded kernel buffer outside the
 //! lock and re-check state each step, so input never waits for a
-//! sleeping user. Work decided under the lock is returned as an `Out`
-//! and done after unlocking: transmit, wakeups, errors (`finish`).
+//! sleeping user. A step's `Out` is applied before unlocking, like
+//! Linux transmitting under the socket lock: segments are transmitted
+//! (so two CPUs never reorder one connection's segments) and the error
+//! and shutdown bits are published (a reader that sees the new state
+//! sees them too); only the wakeups follow the unlock (`step`).
+//! Transmitting never re-enters a socket lock: `lo` queues to the
+//! receive backlog and `netif_rx_flush_local` is never called under it.
 //!
 //! Order: `TcpSock.cb` (a listener's before its child's; a child never
 //! takes its listener's `cb`) -> tables (`bhash` -> `ehash`, `lhash`) ->
 //! `Inet.addr` -> `TcpSock.queue` (listener SYN/accept queues, leaf) ->
-//! timer `TIMERS` -> FIB / neighbour / device TX (route lookups).
+//! timer `TIMERS`; and `cb` -> FIB / neighbour / device TX (transmit).
 
 pub mod ack;
 pub mod cb;
@@ -44,7 +49,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use spin::{Mutex, MutexGuard};
+use crate::sync::spin::{Mutex, MutexGuard};
 
 use self::cb::{Cfg, Open, Out, Seg, SegIn, TcpCb, flags};
 use self::output::Tuple;
@@ -274,15 +279,18 @@ impl TcpSock {
     // --- after a control block step -----------------------------------------
 
     /// Bookkeeping under the lock after `cb` produced `out`: TIME_WAIT
-    /// hand-over, leaving the tables, listener queues, timer
-    fn post(&self, g: &mut Inner, out: &mut Out) {
+    /// hand-over, leaving the tables, listener queues, timer. Returns a
+    /// listener to wake (a child became acceptable).
+    fn post(&self, g: &mut Inner, out: &mut Out) -> Option<Arc<TcpSock>> {
         if out.timewait {
             self.to_timewait(g, out);
         }
+        let mut ready = None;
         if out.established
             && let Some(p) = g.parent.take().and_then(|w| w.upgrade())
+            && p.child_ready(&self.arc())
         {
-            p.child_ready(&self.arc());
+            ready = Some(p);
         }
         if out.done {
             if let Some(p) = g.parent.take().and_then(|w| w.upgrade()) {
@@ -298,6 +306,7 @@ impl TcpSock {
         }
         let want = g.cb.next_timer();
         timer::rearm(&mut g.slot, want, self.me.clone() as Weak<dyn Expire>);
+        ready
     }
 
     /// Hand TIME_WAIT to a timewait entry (Linux tcp_time_wait)
@@ -341,37 +350,44 @@ impl TcpSock {
         }
     }
 
-    /// Run `out` after the lock is dropped: transmit, report, wake
-    fn finish(&self, out: Out, t: Option<Tuple>) {
-        if let Some(t) = t {
-            let p = self.inet.params();
-            for seg in &out.segs {
-                xmit(&self.sk.net, &t, seg, p, self.oif());
-            }
-        }
+    /// Apply `out` under the lock (Linux transmits and sets sk_err /
+    /// sk_shutdown under the socket lock): publish the shutdown bits and
+    /// the error, then transmit to `t`. True: wake the socket after
+    /// unlocking.
+    fn emit(&self, out: &Out, t: Option<Tuple>) -> bool {
         if out.shut != 0 {
             self.sk.set_shutdown(out.shut);
         }
         if let Some(e) = out.err {
             self.sk.set_err(e);
         }
-        if out.wake || out.err.is_some() {
-            self.sk.state_change();
+        if let Some(t) = t {
+            let p = self.inet.params();
+            for seg in &out.segs {
+                xmit(&self.sk.net, &t, seg, p, self.oif());
+            }
         }
+        out.wake || out.err.is_some()
     }
 
-    /// Lock, run `f` on the control block, post-process, unlock, finish;
-    /// the tuple segments go to is the connection's
+    /// Lock, run `f` on the control block, post-process and apply the
+    /// result, unlock, wake; the tuple segments go to is the
+    /// connection's
     fn step<R>(&self, f: impl FnOnce(&mut Inner, &mut Out) -> R) -> R {
         let mut out = Out::default();
-        let (r, t) = {
+        let (r, wake, ready) = {
             let mut g = self.lock();
             let r = f(&mut g, &mut out);
             let t = g.tuple.or_else(|| self.cur_tuple());
-            self.post(&mut g, &mut out);
-            (r, t)
+            let ready = self.post(&mut g, &mut out);
+            (r, self.emit(&out, t), ready)
         };
-        self.finish(out, t);
+        if wake {
+            self.sk.state_change();
+        }
+        if let Some(l) = ready {
+            l.sk.data_ready();
+        }
         r
     }
 
@@ -389,9 +405,14 @@ impl TcpSock {
 
     // --- segment input --------------------------------------------------------
 
-    /// A segment for this connection (Linux tcp_v4_do_rcv)
-    fn rcv(&self, s: &SegIn, now: u64) {
+    /// A segment for this connection (Linux tcp_v4_do_rcv), found in
+    /// ehash under `t`: dropped if the socket left that tuple between
+    /// the lookup and taking its lock
+    fn rcv(&self, s: &SegIn, t: Tuple, now: u64) {
         self.step(|g, out| {
+            if g.tuple != Some(t) {
+                return;
+            }
             if g.cb.state == TcpState::SynReceived
                 && s.has(flags::ACK)
                 && g.parent
@@ -442,16 +463,13 @@ impl TcpSock {
                 _ => return,
             }
         }
-        let child = self.child(s, t, g.cb.opts, now);
-        drop(g);
-        if let Some((c, out)) = child {
-            c.finish(out, Some(t));
-        }
+        self.child(s, t, g.cb.opts, now);
     }
 
-    /// Create, hash and queue a SYN_RECEIVED child (listener locked;
-    /// `opts` are the listener's)
-    fn child(&self, s: &SegIn, t: Tuple, opts: cb::Opts, now: u64) -> Option<(Arc<TcpSock>, Out)> {
+    /// Create, hash and queue a SYN_RECEIVED child and send its SYN-ACK
+    /// (listener locked, then the child's lock; `opts` are the
+    /// listener's)
+    fn child(&self, s: &SegIn, t: Tuple, opts: cb::Opts, now: u64) {
         let c = TcpSock::new(Sock::clone_from(&self.sk));
         c.inet.clone_opts(&self.inet);
         {
@@ -478,7 +496,7 @@ impl TcpSock {
             cb.passive(s, o, now, &mut out);
             g.cb = cb;
             if !self.sk.net.tcp.hash(t, &c) {
-                return None;
+                return;
             }
             g.tuple = Some(t);
             self.sk.net.tcp.inherit(&c, t.lport);
@@ -488,21 +506,22 @@ impl TcpSock {
                 q.syn.push(c.clone());
             }
             c.post(&mut g, &mut Out::default());
+            // SYN-ACK: nobody waits on a new child, no wakeup
+            c.emit(&out, Some(t));
         }
-        Some((c, out))
     }
 
-    /// A child completed its handshake (Linux inet_csk_complete_hashdance)
-    fn child_ready(&self, c: &Arc<TcpSock>) {
-        {
-            let mut q = self.queue.lock();
-            let Some(q) = q.as_mut() else {
-                return;
-            };
-            q.syn.retain(|x| !Arc::ptr_eq(x, c));
-            q.ready.push_back(c.clone());
-        }
-        self.sk.data_ready();
+    /// A child completed its handshake (Linux inet_csk_complete_hashdance;
+    /// under the child's lock). True: it was queued, the caller wakes
+    /// the listener after unlocking.
+    fn child_ready(&self, c: &Arc<TcpSock>) -> bool {
+        let mut q = self.queue.lock();
+        let Some(q) = q.as_mut() else {
+            return false;
+        };
+        q.syn.retain(|x| !Arc::ptr_eq(x, c));
+        q.ready.push_back(c.clone());
+        true
     }
 
     /// A child died before being accepted
@@ -617,11 +636,14 @@ impl TcpSock {
         let peek = flags & MSG_PEEK != 0;
         let skip = if peek { off } else { 0 };
         let want = want.min(CHUNK);
+        // Readers are serialized across peek -> copy -> consume; a
+        // discarding (MSG_TRUNC) reader too, or it would consume bytes
+        // another reader has copied but not yet consumed
+        let _rd = self.rd.lock();
         if flags & MSG_TRUNC != 0 && !peek {
             return Ok(self.step(|g, out| g.cb.discard(want, out)));
         }
         let mut buf = alloc::vec![0u8; want];
-        let _rd = self.rd.lock();
         let n = self.step(|g, out| g.cb.recv(&mut buf, skip, false, out));
         if n == 0 || flags & MSG_TRUNC != 0 {
             return Ok(n);
@@ -709,12 +731,14 @@ impl TcpSock {
     }
 
     /// Wait for the close handshake up to SO_LINGER seconds (Linux
-    /// sk_stream_wait_close)
+    /// sk_stream_wait_close); an exiting task does not wait (Linux
+    /// inet_release: no linger time under PF_EXITING)
     fn linger_wait(&self) {
-        if !self.sk.flag(sf::LINGER) || self.sk.linger_secs() == 0 {
-            return;
-        }
-        let ns = self.sk.linger_secs() as u64 * 1_000_000_000;
+        let secs = match self.sk.linger() {
+            Some(s) if s != 0 && !crate::task::percpu::current_exiting() => s,
+            _ => return,
+        };
+        let ns = secs as u64 * 1_000_000_000;
         let _ = self.sk.wait(ns, || {
             !matches!(
                 self.state(),
@@ -761,7 +785,7 @@ pub fn tcp_rcv(skb: SkBuff) {
     };
     let now = now_ms();
     match net.tcp.lookup(&t) {
-        Some(Ent::Sk(sk)) => return sk.rcv(&s, now),
+        Some(Ent::Sk(sk)) => return sk.rcv(&s, t, now),
         // A TIME_WAIT entry consumes it unless it is a new SYN
         Some(Ent::Tw(tw)) if tw.rcv(&s, now) => return,
         _ => {}
@@ -879,7 +903,8 @@ fn tcp_recvmsg(s: &TcpSock, m: &mut RecvMsg, flags: i32) -> Result<usize, Kernel
                 break;
             }
             if s.state() == TcpState::Closed {
-                return Err(KernelError::NotConnected);
+                // The step that closed it published its error first
+                return Err(s.sk.take_err().unwrap_or(KernelError::NotConnected));
             }
         }
         if flags & MSG_PEEK != 0 && copied > 0 {
@@ -922,7 +947,7 @@ fn wait_connected(s: &TcpSock, timeo: &mut u64) -> Result<(), KernelError> {
                     !matches!(s.state(), TcpState::SynSent | TcpState::SynReceived)
                 })?;
             }
-            _ => return Err(KernelError::BrokenPipe),
+            _ => return Err(s.sk.take_err().unwrap_or(KernelError::BrokenPipe)),
         }
     }
 }
@@ -1000,7 +1025,7 @@ impl ProtoOps for TcpSock {
     /// Last close (Linux tcp_close)
     fn release(&self) {
         self.sk.set_shutdown(SHUTDOWN_MASK);
-        let linger0 = self.sk.flag(sf::LINGER) && self.sk.linger_secs() == 0;
+        let linger0 = self.sk.linger() == Some(0);
         let q = self.step(|g, out| {
             g.cb.orphan = true;
             if g.cb.state == TcpState::Listen {
@@ -1037,21 +1062,30 @@ impl ProtoOps for TcpSock {
             return Err(KernelError::InvalidArgument);
         }
         let no_port = port == 0 && self.inet.flag(ipf::BIND_NO_PORT);
+        // Like Linux inet_bind: the address is set before the bhash entry
+        // is published (conflict checks read it under bhash), reset if
+        // that fails
+        self.inet.set_saddrs(addr, addr);
         let p = if no_port {
             0
         } else {
             let range = self.sk.net.port_range.get();
-            let p = self
+            match self
                 .sk
                 .net
                 .tcp
-                .bind(&me, &self.bind_info(addr), port, range)?;
-            g.bound = true;
-            p
+                .bind(&me, &self.bind_info(addr), port, range)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    self.inet
+                        .set_saddrs(Ipv4Addr::default(), Ipv4Addr::default());
+                    return Err(e);
+                }
+            }
         };
+        g.bound = !no_port;
         let mut s = self.inet.addr.lock();
-        s.rcv_saddr = addr;
-        s.saddr = addr;
         s.sport = p;
         s.addr_lock = !addr.is_unspecified();
         s.port_lock = port != 0;

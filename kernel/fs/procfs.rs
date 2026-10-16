@@ -19,8 +19,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::sync::spin::RwLock;
 use ::core::cmp::min;
-use spin::RwLock;
 
 use super::KernelError;
 use super::dentry::Dentry;
@@ -184,11 +184,13 @@ pub enum ProcfsInodeData {
     ///
     /// File containing information about an open file descriptor.
     FdinfoFile { pid: Pid, fd: i32 },
-    /// Cgroup file (/proc/<pid>/cgroup)
-    ///
-    /// Shows the cgroup(s) the process belongs to.
-    /// For cgroup v2: "0::<path>\n"
-    PidCgroupFile { pid: Pid },
+    /// Generated per-process file (/proc/<pid>/cgroup, maps, ...)
+    PidFile { pid: Pid, generator: PidGen },
+    /// Per-process symlink (/proc/<pid>/exe)
+    PidLink {
+        pid: Pid,
+        target: fn(Pid) -> Result<String, KernelError>,
+    },
     /// /proc/sys file (readable, maybe writable)
     Sysctl { ctl: &'static crate::sysctl::Ctl },
 }
@@ -241,9 +243,9 @@ impl ProcfsInodeData {
         Self::FdinfoFile { pid, fd }
     }
 
-    /// Create cgroup file data
-    pub fn new_pid_cgroup_file(pid: Pid) -> Self {
-        Self::PidCgroupFile { pid }
+    /// Create per-process generated file data
+    pub fn new_pid_file(pid: Pid, generator: PidGen) -> Self {
+        Self::PidFile { pid, generator }
     }
 
     /// Get children map (for static directories)
@@ -281,7 +283,8 @@ impl ProcfsInodeData {
             | Self::PidFdinfoDirectory { pid }
             | Self::FdSymlink { pid, .. }
             | Self::FdinfoFile { pid, .. }
-            | Self::PidCgroupFile { pid } => Some(*pid),
+            | Self::PidFile { pid, .. }
+            | Self::PidLink { pid, .. } => Some(*pid),
             _ => None,
         }
     }
@@ -345,13 +348,21 @@ impl InodeOps for ProcfsInodeOps {
                 Ok(alloc::format!("{}", crate::task::percpu::current_pid()))
             }
             ProcfsInodeData::FdSymlink { pid, fd } => fd_link(*pid, *fd),
+            ProcfsInodeData::PidLink { pid, target } => target(*pid),
             _ => Err(KernelError::InvalidArgument),
         }
     }
 
     /// /proc/sys files: Linux proc_sys_permission (never executable,
-    /// then sysctl_perm: no capability override of the mode)
+    /// then sysctl_perm: no capability override of the mode); fd/ and
+    /// fdinfo/ need ptrace-read access
     fn permission(&self, inode: &Inode, cred: &Cred, mask: u32) -> Result<(), KernelError> {
+        // fd/ and fdinfo/: ptrace-read access (Linux proc_fd_permission)
+        if let Some(OpenCheck::Fds(pid)) = open_check(inode)
+            && !crate::task::ptrace::may_read_proc(pid)
+        {
+            return Err(KernelError::PermissionDenied);
+        }
         let Some(ctl) = sysctl_of(inode) else {
             return crate::fs::dac::generic_permission(cred, inode, mask);
         };
@@ -413,9 +424,10 @@ impl InodeOps for ProcfsInodeOps {
             ProcfsInodeData::File { .. }
             | ProcfsInodeData::NamespaceFile { .. }
             | ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::PidLink { .. }
             | ProcfsInodeData::SelfLink
             | ProcfsInodeData::FdinfoFile { .. }
-            | ProcfsInodeData::PidCgroupFile { .. }
+            | ProcfsInodeData::PidFile { .. }
             | ProcfsInodeData::Sysctl { .. } => Err(KernelError::NotDirectory),
         }
     }
@@ -445,9 +457,11 @@ impl InodeOps for ProcfsInodeOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
+            ProcfsInodeData::PidFile { pid, generator } => pid_content(None, *pid, *generator)?,
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
-            ProcfsInodeData::FdSymlink { .. } | ProcfsInodeData::SelfLink => {
+            ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::PidLink { .. }
+            | ProcfsInodeData::SelfLink => {
                 // Symlinks don't have content, readlink() handles them
                 return Err(KernelError::Io);
             }
@@ -563,11 +577,31 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
             ))));
             Ok(inode)
         }
-        "cgroup" => {
-            // Create /proc/<pid>/cgroup file
+        "exe" => {
             let sb = dir.superblock().ok_or(KernelError::Io)?;
             let inode = Arc::new(Inode::new(
-                pid_ino(pid, 102),         // offset 102 for cgroup file
+                pid_ino(pid, 104),
+                InodeMode::symlink(),
+                0,
+                0,
+                0,
+                current_time(),
+                Arc::downgrade(&sb),
+                &PROCFS_INODE_OPS,
+            ));
+            inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
+                ProcfsInodeData::PidLink {
+                    pid,
+                    target: exe_link,
+                },
+            ))));
+            Ok(inode)
+        }
+        name if pid_file(name).is_some() => {
+            let (off, generator) = pid_file(name).ok_or(KernelError::NotFound)?;
+            let sb = dir.superblock().ok_or(KernelError::Io)?;
+            let inode = Arc::new(Inode::new(
+                pid_ino(pid, off),
                 InodeMode::regular(0o444), // r--r--r--
                 0,
                 0,
@@ -577,11 +611,10 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
                 &PROCFS_INODE_OPS,
             ));
             inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(
-                ProcfsInodeData::new_pid_cgroup_file(pid),
+                ProcfsInodeData::new_pid_file(pid, generator),
             ))));
             Ok(inode)
         }
-        // Future: add "status", "cmdline", "maps", etc.
         _ => Err(KernelError::NotFound),
     }
 }
@@ -830,6 +863,166 @@ fn gen_cgroup_content(pid: Pid) -> Vec<u8> {
     Vec::from(output.as_bytes())
 }
 
+/// Generated files in /proc/<pid>/: name, inode offset, generator
+/// Access checks a procfs file needs at open
+enum OpenCheck {
+    /// Address-space file of `pid`: pin its mm
+    Mm(Pid),
+    /// fd/ or fdinfo/ of `pid`
+    Fds(Pid),
+}
+
+/// The open-time check of `inode`, if any
+fn open_check(inode: &Inode) -> Option<OpenCheck> {
+    let private = inode.get_private()?;
+    let wrapper = private
+        .as_ref()
+        .as_any()
+        .downcast_ref::<ProcfsInodeWrapper>()?;
+    match &*wrapper.0.read() {
+        ProcfsInodeData::PidFile {
+            pid,
+            generator: PidGen::Mm(_),
+        } => Some(OpenCheck::Mm(*pid)),
+        ProcfsInodeData::PidFdDirectory { pid } | ProcfsInodeData::PidFdinfoDirectory { pid } => {
+            Some(OpenCheck::Fds(*pid))
+        }
+        _ => None,
+    }
+}
+
+/// Content generator of a per-process file
+#[derive(Clone, Copy)]
+pub enum PidGen {
+    /// World-readable content of the process
+    Pub(fn(Pid) -> Vec<u8>),
+    /// Private content of the address space: open needs ptrace-read
+    /// access and pins the mm it reads from (Linux proc_mem_open: an
+    /// mm_count reference)
+    Mm(fn(&crate::mm::MmStruct) -> Vec<u8>),
+}
+
+/// The address space a /proc/<pid>/ file reads, if the caller may
+/// (Linux mm_access): EACCES without ptrace-read access
+///
+/// The mm is taken first and the check is repeated around it: if the
+/// task exec'd in between (new mm, maybe new credentials), the access
+/// is decided again for the new image, so the result is never an mm
+/// the check did not cover (hk has no exec lock; Linux holds
+/// exec_update_lock across mm_access)
+fn mm_access(pid: Pid) -> Result<Option<Arc<crate::mm::Mm>>, KernelError> {
+    let task_mm = || get_tid_for_pid(pid).and_then(crate::mm::get_task_mm);
+    loop {
+        let mm = task_mm();
+        if !crate::task::ptrace::may_read_proc(pid) {
+            return Err(KernelError::PermissionDenied);
+        }
+        let now = task_mm();
+        let same = match (&mm, &now) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return Ok(mm);
+        }
+    }
+}
+
+/// Content of a per-process file for this open file (or, with none,
+/// checked afresh)
+fn pid_content(file: Option<&File>, pid: Pid, g: PidGen) -> Result<Vec<u8>, KernelError> {
+    match g {
+        PidGen::Pub(f) => Ok(f(pid)),
+        PidGen::Mm(f) => {
+            let mm = match file.and_then(|fl| fl.private.get()) {
+                Some(p) => p.clone().downcast::<crate::mm::Mm>().ok(),
+                None => mm_access(pid)?,
+            };
+            // The open file pins only the struct (mm_count); a read uses
+            // the address space only while it still has users, else it
+            // reads as empty; once the task is reaped it is ESRCH (Linux
+            // m_start: get_proc_task, mmget_not_zero)
+            if get_tid_for_pid(pid).is_none() {
+                return Err(KernelError::NoProcess);
+            }
+            let users = mm.as_ref().and_then(crate::mm::mmget_not_zero);
+            let Some(m) = users else {
+                return Ok(Vec::new());
+            };
+            let out = f(&m.lock());
+            Ok(out)
+        }
+    }
+}
+
+const PID_FILES: &[(&str, u64, PidGen)] = &[
+    ("cgroup", 102, PidGen::Pub(gen_cgroup_content)),
+    ("maps", 103, PidGen::Mm(gen_maps)),
+];
+
+fn pid_file(name: &str) -> Option<(u64, PidGen)> {
+    PID_FILES
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|&(_, off, g)| (off, g))
+}
+
+/// /proc/<pid>/exe: the executable's path (ENOENT for kernel threads,
+/// EACCES without ptrace-read access, Linux proc_fd_access_allowed)
+fn exe_link(pid: Pid) -> Result<String, KernelError> {
+    let mm = mm_access(pid)?.ok_or(KernelError::NotFound)?;
+    let exe = mm.lock().exe().ok_or(KernelError::NotFound)?;
+    Ok(exe)
+}
+
+/// /proc/<pid>/maps: one line per VMA (Linux show_map_vma)
+fn gen_maps(mm: &crate::mm::MmStruct) -> Vec<u8> {
+    use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let (start_brk, brk) = (mm.get_start_brk(), mm.get_brk());
+    for v in mm.iter() {
+        let bit = |b: bool, c: char| if b { c } else { '-' };
+        let (ino, dev, name) = match &v.file {
+            Some(f) => {
+                let ino = f.get_inode().map(|i| i.ino).unwrap_or(0);
+                (ino, "00:00", f.dentry.full_path())
+            }
+            None if v.flags & VM_GROWSDOWN != 0 => (0, "00:00", String::from("[stack]")),
+            None if v.start >= start_brk
+                && v.end <= brk.next_multiple_of(4096)
+                && brk > start_brk =>
+            {
+                (0, "00:00", String::from("[heap]"))
+            }
+            None => (0, "00:00", String::new()),
+        };
+        let mut line = String::new();
+        let _ = write!(
+            line,
+            "{:08x}-{:08x} {}{}{}{} {:08x} {} {} ",
+            v.start,
+            v.end,
+            bit(v.prot & PROT_READ != 0, 'r'),
+            bit(v.prot & PROT_WRITE != 0, 'w'),
+            bit(v.prot & PROT_EXEC != 0, 'x'),
+            if v.flags & VM_SHARED != 0 { 's' } else { 'p' },
+            if v.file.is_some() { v.offset } else { 0 },
+            dev,
+            ino
+        );
+        if !name.is_empty() {
+            while line.len() < 73 {
+                line.push(' ');
+            }
+            line.push_str(&name);
+        }
+        let _ = writeln!(out, "{}", line.trim_end());
+    }
+    Vec::from(out.as_bytes())
+}
+
 /// Get the cgroup path for a task (virtualized to its namespace)
 fn get_task_cgroup_path(pid: Pid) -> String {
     use crate::cgroup::TASK_CGROUP;
@@ -890,6 +1083,25 @@ impl FileOps for ProcfsFileOps {
         self
     }
 
+    /// Private per-process files check ptrace-read access at open
+    /// (Linux proc_mem_open, proc_fd_permission); maps keeps the address
+    /// space it was opened on, so a later setuid exec cannot leak
+    fn open(&self, file: &File) -> Result<(), KernelError> {
+        let Some(check) = file.get_inode().and_then(|i| open_check(&i)) else {
+            return Ok(());
+        };
+        match check {
+            OpenCheck::Mm(pid) => {
+                if let Some(mm) = mm_access(pid)? {
+                    file.private.call_once(|| mm);
+                }
+                Ok(())
+            }
+            OpenCheck::Fds(pid) if crate::task::ptrace::may_read_proc(pid) => Ok(()),
+            OpenCheck::Fds(_) => Err(KernelError::PermissionDenied),
+        }
+    }
+
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let private = inode.get_private().ok_or(KernelError::Io)?;
@@ -906,9 +1118,13 @@ impl FileOps for ProcfsFileOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
+            ProcfsInodeData::PidFile { pid, generator } => {
+                pid_content(Some(file), *pid, *generator)?
+            }
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
-            ProcfsInodeData::FdSymlink { .. } | ProcfsInodeData::SelfLink => {
+            ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::PidLink { .. }
+            | ProcfsInodeData::SelfLink => {
                 return Err(KernelError::Io);
             }
             ProcfsInodeData::Directory { .. }
@@ -949,9 +1165,13 @@ impl FileOps for ProcfsFileOps {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidCgroupFile { pid } => gen_cgroup_content(*pid),
+            ProcfsInodeData::PidFile { pid, generator } => {
+                pid_content(Some(file), *pid, *generator)?
+            }
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
-            ProcfsInodeData::FdSymlink { .. } | ProcfsInodeData::SelfLink => {
+            ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::PidLink { .. }
+            | ProcfsInodeData::SelfLink => {
                 return Err(KernelError::Io);
             }
             ProcfsInodeData::Directory { .. }
@@ -1079,9 +1299,10 @@ impl FileOps for ProcfsFileOps {
             ProcfsInodeData::File { .. }
             | ProcfsInodeData::NamespaceFile { .. }
             | ProcfsInodeData::FdSymlink { .. }
+            | ProcfsInodeData::PidLink { .. }
             | ProcfsInodeData::SelfLink
             | ProcfsInodeData::FdinfoFile { .. }
-            | ProcfsInodeData::PidCgroupFile { .. }
+            | ProcfsInodeData::PidFile { .. }
             | ProcfsInodeData::Sysctl { .. } => {
                 return Err(KernelError::NotDirectory);
             }
@@ -1162,18 +1383,23 @@ fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), Kernel
         return Ok(());
     }
 
-    // Emit "cgroup" file
-    let should_continue = ctx.emit(DirEntry {
-        ino: pid_ino(pid, 102),
-        file_type: FileType::Regular,
-        name: Vec::from(b"cgroup"),
-    });
-
-    if !should_continue {
+    if !ctx.emit(DirEntry {
+        ino: pid_ino(pid, 104),
+        file_type: FileType::Symlink,
+        name: Vec::from(&b"exe"[..]),
+    }) {
         return Ok(());
     }
-
-    // Future: add "status", "cmdline", "maps", etc.
+    for (name, off, _) in PID_FILES {
+        let more = ctx.emit(DirEntry {
+            ino: pid_ino(pid, *off),
+            file_type: FileType::Regular,
+            name: Vec::from(name.as_bytes()),
+        });
+        if !more {
+            return Ok(());
+        }
+    }
 
     Ok(())
 }
@@ -1331,6 +1557,31 @@ fn gen_version() -> Vec<u8> {
     let mut output = alloc::string::String::new();
     let _ = writeln!(output, "hk {}", env!("CARGO_PKG_VERSION"));
     Vec::from(output.as_bytes())
+}
+
+/// Generate /proc/meminfo content (Linux meminfo_proc_show subset:
+/// 16-column labels, values in kB). Free memory is the frame
+/// allocator's exact count; hk has no reclaimable caches counted yet,
+/// so MemAvailable equals MemFree.
+fn gen_meminfo() -> Vec<u8> {
+    use alloc::fmt::Write;
+    let fa = &crate::FRAME_ALLOCATOR;
+    let total = fa.stats().total_bytes >> 10;
+    let free = (fa.free_frames() as u64 * 4096) >> 10;
+    let mut out = String::new();
+    for (label, kb) in [
+        ("MemTotal:", total),
+        ("MemFree:", free),
+        ("MemAvailable:", free),
+        ("Buffers:", 0),
+        ("Cached:", 0),
+        ("SwapCached:", 0),
+        ("SwapTotal:", 0),
+        ("SwapFree:", 0),
+    ] {
+        let _ = writeln!(out, "{label:<16}{kb:>8} kB");
+    }
+    out.into_bytes()
 }
 
 /// Generate /proc/mounts content
@@ -1506,6 +1757,12 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
         ProcfsInodeData::new_file(gen_mounts),
     ))));
 
+    let meminfo_inode = mk_inode(
+        &sb,
+        InodeMode::regular(0o444),
+        ProcfsInodeData::new_file(gen_meminfo),
+    );
+
     // Create /proc/net (directory) with /proc/net/{dev,route}; contents follow
     // the reader's network namespace
     let net_dir_inode = Arc::new(Inode::new(
@@ -1572,6 +1829,12 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
             ProcfsInodeData::new_file(crate::net::unix::proc_net_unix),
         );
         children.insert(String::from("unix"), unix);
+        let packet = mk_inode(
+            &sb,
+            InodeMode::regular(0o444),
+            ProcfsInodeData::new_file(crate::net::packet::proc_net_packet),
+        );
+        children.insert(String::from("packet"), packet);
     }
     net_dir_inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(net_dir))));
 
@@ -1587,6 +1850,7 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
         if let ProcfsInodeData::Directory { children } = &mut *data {
             children.insert(String::from("version"), version_inode);
             children.insert(String::from("mounts"), mounts_inode);
+            children.insert(String::from("meminfo"), meminfo_inode);
             children.insert(String::from("net"), net_dir_inode);
         }
     }

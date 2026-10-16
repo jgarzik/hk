@@ -15,11 +15,11 @@ use alloc::vec::Vec;
 
 use crate::arch::{ContextOps, CpuOps, FrameAlloc, IrqSpinlock, PerCpuOps, SchedArch, UserModeOps};
 use crate::printkln;
+use crate::sync::spin::Mutex;
 use crate::task::sched::{PriorityRunQueue, SleepEntry};
 use crate::task::{
     Cred, CurrentTask, PRIORITY_IDLE, Pid, Priority, Task, TaskKind, TaskState, Tid,
 };
-use spin::Mutex;
 
 /// Vfork completion state
 ///
@@ -187,9 +187,10 @@ pub enum WakeMode {
 pub struct KernelThreadContext {
     /// Context for switching (callee-saved registers)
     pub context: TaskContext,
-    /// Base address of allocated kernel stack (for freeing)
-    #[allow(dead_code)]
+    /// Base address of the kernel stack (direct map)
     pub stack_base: u64,
+    /// Its size in bytes, freed when the task is dead; 0 if not owned
+    pub stack_size: usize,
     /// Sleep state (see [`SleepState`])
     pub state: SleepState,
     /// True while the task sits in the priority run queue (prevents
@@ -200,16 +201,20 @@ pub struct KernelThreadContext {
 }
 
 impl KernelThreadContext {
-    fn new(context: TaskContext, stack_base: u64, priority: Priority) -> Self {
+    fn new(context: TaskContext, stack_base: u64, stack_size: usize, priority: Priority) -> Self {
         Self {
             context,
             stack_base,
+            stack_size,
             state: SleepState::Running,
             queued: false,
             priority,
         }
     }
 }
+
+/// Spare run-queue slots per priority beyond the CPU's task count
+const RQ_SLACK: usize = 16;
 
 /// Per-CPU run queue
 ///
@@ -229,6 +234,32 @@ pub struct CpuRunQueue {
     pub idle_tid: Option<Tid>,
     /// Sleep queue for tasks waiting on timer (sorted by wake_tick)
     pub sleep_queue: Vec<SleepEntry>,
+    /// Tasks that exited on this CPU, released once it has switched
+    /// away from them (Linux finish_task_switch for TASK_DEAD)
+    pub dead: Vec<DeadTask>,
+}
+
+/// What an exited task still holds while its CPU runs on its stack and
+/// its page tables: freed by the next task (`DeadTask::drop`)
+pub struct DeadTask {
+    /// Kernel stack (direct-map address) and size; size 0 = not owned
+    stack: (u64, usize),
+    /// mm_count reference on the address space it last ran in (mmdrop)
+    mm: Option<alloc::sync::Arc<crate::mm::Mm>>,
+}
+
+impl Drop for DeadTask {
+    fn drop(&mut self) {
+        let (base, size) = self.stack;
+        if size != 0 {
+            let phys = crate::arch::virt_to_phys(base);
+            for off in (0..size as u64).step_by(PAGE_SIZE as usize) {
+                crate::FRAME_ALLOCATOR.free(phys + off);
+            }
+        }
+        // mmdrop: the last reference frees the top-level table
+        drop(self.mm.take());
+    }
 }
 
 impl CpuRunQueue {
@@ -241,6 +272,7 @@ impl CpuRunQueue {
             nr_running: 0,
             idle_tid: None,
             sleep_queue: Vec::new(),
+            dead: Vec::new(),
         }
     }
 
@@ -264,10 +296,32 @@ impl CpuRunQueue {
             .map(|(_, c)| c)
     }
 
-    /// Add a new task (not yet runnable)
+    /// Add a new task (not yet runnable; thread context)
     fn add_task(&mut self, tid: Tid, ctx: KernelThreadContext) {
         self.contexts.push((tid, ctx));
         self.nr_running += 1;
+        for p in self.priorities() {
+            self.reserve_prio(p);
+        }
+    }
+
+    /// Priorities this CPU's tasks use (few distinct values)
+    fn priorities(&self) -> Vec<Priority> {
+        let mut v: Vec<Priority> = Vec::new();
+        for (_, c) in &self.contexts {
+            if !v.contains(&c.priority) {
+                v.push(c.priority);
+            }
+        }
+        v
+    }
+
+    /// Room for every task of this CPU (plus slack for stale entries of
+    /// exited tasks) in the queue of `prio`: IRQ-context wakeups enqueue
+    /// without allocating (each task is queued at most once)
+    fn reserve_prio(&mut self, prio: Priority) {
+        let n = self.contexts.len() + RQ_SLACK;
+        self.queue().reserve(prio, n);
     }
 
     /// Put `tid` on the priority queue unless it is current or already queued
@@ -349,8 +403,11 @@ impl CpuRunQueue {
 pub struct PerCpuScheduler {
     /// IRQ-safe lock protecting the run queue (owner CPU only)
     pub lock: IrqSpinlock<CpuRunQueue>,
-    /// Remote wakeups for tasks owned by this CPU. Leaf lock: nothing is
-    /// acquired while holding it; nests inside `lock` when drained.
+    /// Remote wakeups for tasks owned by this CPU, at most one entry
+    /// per task (`post_wake` merges), with capacity reserved for all of
+    /// them when a task is added: posting never allocates (IRQ
+    /// context). Leaf lock: nothing is acquired while holding it; nests
+    /// inside `lock` when drained.
     wake_list: IrqSpinlock<Vec<(Tid, WakeMode)>>,
     /// Whether this CPU's scheduler is initialized
     pub initialized: AtomicBool,
@@ -370,11 +427,36 @@ impl PerCpuScheduler {
         }
     }
 
-    /// Apply wakeups posted by other CPUs (caller holds `self.lock`)
+    /// Apply wakeups posted by other CPUs (caller holds `self.lock`);
+    /// the list keeps its capacity
     fn drain_wakes(&self, rq: &mut CpuRunQueue) {
-        let pending = core::mem::take(&mut *self.wake_list.lock());
-        for (tid, mode) in pending {
+        let mut list = self.wake_list.lock();
+        for (tid, mode) in list.drain(..) {
             rq.try_wake(tid, mode);
+        }
+    }
+
+    /// Post a remote wakeup without allocating: a task already listed
+    /// keeps one entry (`Any` wins over `Interruptible`)
+    fn post_wake(&self, tid: Tid, mode: WakeMode) {
+        let mut list = self.wake_list.lock();
+        if let Some(e) = list.iter_mut().find(|e| e.0 == tid) {
+            if mode == WakeMode::Any {
+                e.1 = WakeMode::Any;
+            }
+            return;
+        }
+        debug_assert!(list.len() < list.capacity(), "wake_list would allocate");
+        list.push((tid, mode));
+    }
+
+    /// Room in `wake_list` for each of the CPU's `n` tasks (thread
+    /// context, after adding a task)
+    fn reserve_wakes(&self, n: usize) {
+        let mut list = self.wake_list.lock();
+        if list.capacity() < n + RQ_SLACK {
+            let extra = n + RQ_SLACK - list.len();
+            list.reserve(extra);
         }
     }
 }
@@ -480,25 +562,20 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
     };
     let pid = 0;
 
-    // Allocate the kernel stack (consecutive frames, as for clone)
+    // Allocate the kernel stack (physically contiguous: it is used
+    // through the direct map)
     let stack_pages = stack_size / PAGE_SIZE as usize;
-    let mut stack_base: Option<u64> = None;
-    for i in 0..stack_pages {
-        let frame = frame_alloc
-            .alloc_frame()
-            .ok_or("Out of memory for kernel thread stack")?;
-        if i == 0 {
-            stack_base = Some(frame);
-        }
-        unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
-        }
+    let stack_base = frame_alloc
+        .alloc_contig(stack_pages)
+        .ok_or("Out of memory for kernel thread stack")?;
+    let stack_base = crate::arch::phys_to_virt(stack_base) as u64;
+    unsafe {
+        core::ptr::write_bytes(stack_base as *mut u8, 0, stack_size);
     }
-    let stack_base = stack_base.unwrap();
     let stack_top = stack_base + stack_size as u64;
 
     let context = TaskContext::new_kernel_thread(entry, stack_top);
-    let mut thread_ctx = KernelThreadContext::new(context, stack_base, priority);
+    let mut thread_ctx = KernelThreadContext::new(context, stack_base, stack_size, priority);
     if start_asleep {
         // Not runnable until wake_up_task (lets the creator finish setup)
         thread_ctx.state = SleepState::Uninterruptible;
@@ -578,6 +655,8 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
         // I/O port permissions (x86-64 only, kernel threads don't use I/O ports)
         #[cfg(target_arch = "x86_64")]
         iopl_emul: 0,
+        nproc_exceeded: false,
+        exiting: false,
         // Ptrace state (kernel threads are not traced)
         ptrace: 0,
         ptracer_tid: None,
@@ -592,6 +671,7 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
     let mut rq = sched.lock.lock();
     rq.init();
     rq.add_task(tid, thread_ctx);
+    sched.reserve_wakes(rq.contexts.len());
     if !start_asleep {
         rq.enqueue_task(tid);
     }
@@ -697,6 +777,8 @@ pub fn enable() {
 /// * `config` - User task configuration (pid, tid, ppid, pgid, sid, priority, stacks, page table)
 pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
     let cpu_id = CurrentArch::try_current_cpu_id().unwrap_or(0);
+    // The first address space owns the boot-built tables
+    let mm = crate::mm::mm_alloc(config.page_table.root_table_phys());
 
     // Create Task entry
     let task = Task {
@@ -740,7 +822,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         clear_child_tid: 0,
         set_child_tid: 0,
         // Shared resources (will be initialized by caller via init_* functions)
-        mm: None,
+        mm: Some(mm),
         files: None,
         fs: None,
         nsproxy: None,
@@ -764,6 +846,8 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         // I/O port permissions (x86-64 only, no I/O port access initially)
         #[cfg(target_arch = "x86_64")]
         iopl_emul: 0,
+        nproc_exceeded: false,
+        exiting: false,
         // Ptrace state (not traced initially)
         ptrace: 0,
         ptracer_tid: None,
@@ -789,9 +873,11 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
     // Initialize with current kernel stack - when the user task makes a syscall,
     // we save its kernel-mode context here for sleeping/yielding
     let context = TaskContext::default();
+    // The boot-allocated stack of the first task is never freed
     let thread_ctx = KernelThreadContext::new(
         context,
         config.kstack_top - KERNEL_STACK_SIZE as u64,
+        0,
         config.priority,
     );
 
@@ -800,6 +886,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
     {
         let mut rq = sched.lock.lock();
         rq.add_task(config.tid, thread_ctx);
+        sched.reserve_wakes(rq.contexts.len());
         rq.current = Some(config.tid); // Mark as currently running
     }
 
@@ -819,9 +906,6 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         config.tid,
         alloc::sync::Arc::new(crate::signal::SigHand::new()),
     );
-
-    // Initialize memory descriptor for the init task
-    crate::mm::init_task_mm(config.tid, crate::mm::create_default_mm());
 
     printkln!("USER_TASK_CREATED: pid={} tid={}", config.pid, config.tid);
     Ok(())
@@ -923,14 +1007,27 @@ pub fn reap_zombie_child_times(
         }
     });
 
-    if let Some(idx) = zombie_idx {
-        let task = table.tasks.remove(idx);
-        if let TaskState::Zombie(status) = task.state {
-            return Some((task.pid, status, task.utime, task.stime));
+    // WNOWAIT (waitid): report the zombie, leave it waitable
+    if let Some(idx) = zombie_idx
+        && wflags & super::wait_options::WNOWAIT != 0
+    {
+        let t = &table.tasks[idx];
+        if let TaskState::Zombie(status) = t.state {
+            return Some((t.pid, status, t.utime, t.stime));
         }
     }
 
-    None
+    let task = table.tasks.remove(zombie_idx?);
+    // The Task is released after TASK_TABLE (nothing is released under it)
+    drop(table);
+    // Released: drop the RLIMIT_NPROC charge (threads drop it at exit)
+    if task.tid == task.pid {
+        crate::task::nproc_uncharge(task.cred.uid);
+    }
+    match task.state {
+        TaskState::Zombie(status) => Some((task.pid, status, task.utime, task.stime)),
+        _ => None,
+    }
 }
 
 /// Check if a process has any children matching the criteria
@@ -1022,28 +1119,22 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         return Err(22); // EINVAL
     }
 
-    // RLIMIT_NPROC enforcement for new processes (not threads)
-    // Following Linux pattern: increment first (atomically), then check if over limit
-    // This avoids the TOCTOU race where multiple concurrent clones could all pass
-    // a check-then-increment pattern before any of them increment.
-    let is_new_process = config.flags & CLONE_THREAD == 0;
-    let (nproc_uid, nproc_incremented) = if is_new_process {
-        let cred = current_cred();
-        let new_count = crate::task::increment_user_process_count(cred.uid);
-
-        // Check if over limit (CAP_SYS_RESOURCE bypasses)
-        if !crate::task::capable(crate::task::CAP_SYS_RESOURCE) {
-            let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NPROC);
-            if limit != crate::rlimit::RLIM_INFINITY && new_count > limit {
-                // Over limit - decrement and return error
-                crate::task::decrement_user_process_count(cred.uid);
-                return Err(11); // EAGAIN - resource temporarily unavailable
-            }
-        }
-        (cred.uid, true)
-    } else {
-        (0, false) // Threads don't count toward RLIMIT_NPROC
+    // RLIMIT_NPROC: every task, threads included, is charged to its
+    // real uid until it is released; over the limit is EAGAIN unless
+    // root or CAP_SYS_RESOURCE/CAP_SYS_ADMIN (Linux copy_process). The
+    // guard uncharges on every error return.
+    let nproc = crate::task::NprocCharge::new(current_cred().uid);
+    let parent_nproc_exceeded = {
+        let table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter()
+            .find(|t| t.tid == current_tid())
+            .is_some_and(|t| t.nproc_exceeded)
     };
+    if crate::task::nproc_over(nproc.uid, nproc.count) {
+        return Err(11); // EAGAIN
+    }
 
     // Check cgroup pids controller limit (if task is in a cgroup with pids.max)
     // This is checked before allocating resources so we fail early if over limit
@@ -1054,27 +1145,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     if let Some(ref cgroup) = parent_cgroup
         && !crate::cgroup::pids_can_fork(cgroup)
     {
-        if nproc_incremented {
-            crate::task::decrement_user_process_count(nproc_uid);
-        }
         return Err(11); // EAGAIN - resource temporarily unavailable
     }
 
     // Helper macro to handle early returns with NPROC cleanup
     // If we incremented the process count and then fail, we must decrement it
-    macro_rules! try_with_cleanup {
-        ($expr:expr) => {
-            match $expr {
-                Ok(val) => val,
-                Err(e) => {
-                    if nproc_incremented {
-                        crate::task::decrement_user_process_count(nproc_uid);
-                    }
-                    return Err(e);
-                }
-            }
-        };
-    }
 
     // Get current CPU ID
     let cpu_id = CurrentArch::try_current_cpu_id().unwrap_or(0);
@@ -1103,7 +1178,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_ptracer_tid,
     ) = {
         let table = TASK_TABLE.lock();
-        let parent = try_with_cleanup!(table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)); // ESRCH - no such process
+        let parent = table.tasks.iter().find(|t| t.tid == current_tid).ok_or(3)?; // ESRCH - no such process
         (
             parent.pid,
             parent.tgid,
@@ -1142,9 +1217,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Validate CLONE_PARENT: cannot be used by init process (pid 1)
     // Linux checks for SIGNAL_UNKILLABLE flag, but we simplify to pid == 1
     if config.flags & CLONE_PARENT != 0 && parent_pid == 1 {
-        if nproc_incremented {
-            crate::task::decrement_user_process_count(nproc_uid);
-        }
         return Err(22); // EINVAL
     }
 
@@ -1172,35 +1244,39 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         (tid, pid)
     };
 
-    // Allocate kernel stack for child (16KB = 4 pages)
-    let stack_pages = KERNEL_STACK_SIZE / PAGE_SIZE as usize;
-    let mut stack_base: Option<u64> = None;
-
-    for i in 0..stack_pages {
-        let frame = try_with_cleanup!(frame_alloc.alloc_frame().ok_or(12)); // ENOMEM
-
-        if i == 0 {
-            stack_base = Some(frame);
-        }
-
-        // Zero the page
-        unsafe {
-            core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
-        }
-    }
-
-    let stack_base = stack_base.unwrap();
-    let kstack_top = stack_base + KERNEL_STACK_SIZE as u64;
-
-    // Determine page table
-    let child_pt = if config.flags & CLONE_VM != 0 {
-        // Share address space - just copy the page table reference (threads)
-        ArchPageTable::new(parent_pt_phys)
-    } else {
-        // Fork: duplicate the entire user address space
-        let parent_pt = ArchPageTable::new(parent_pt_phys);
-        try_with_cleanup!(parent_pt.duplicate_user_space(frame_alloc))
+    // The child's address space (Linux copy_mm): shared for CLONE_VM,
+    // else a copy-on-write duplicate. Dropped on any error below.
+    let parent_mm = {
+        let table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter()
+            .find(|t| t.tid == current_tid)
+            .and_then(|t| t.mm.clone())
     };
+    let child_mm = match parent_mm {
+        None => None,
+        Some(pm) if config.flags & CLONE_VM != 0 => Some(pm),
+        Some(pm) => {
+            let mut pt = ArchPageTable::new_user(frame_alloc).ok_or(12)?; // ENOMEM
+            pt.copy_kernel_mappings();
+            let pgd = pt.root_table_phys();
+            let dup =
+                |parent| ArchPageTable::new(parent).duplicate_user_space(&mut pt, frame_alloc);
+            Some(crate::mm::dup_mm(&pm, pgd, dup)?)
+        }
+    };
+    let child_pt = ArchPageTable::new(child_mm.as_ref().map_or(parent_pt_phys, |m| m.pgd()));
+
+    // Allocate kernel stack for child (16KB = 4 pages, physically
+    // contiguous: separately allocated frames need not be adjacent)
+    let stack_pages = KERNEL_STACK_SIZE / PAGE_SIZE as usize;
+    let stack_base = frame_alloc.alloc_contig(stack_pages).ok_or(12)?; // ENOMEM
+    let stack_base = crate::arch::phys_to_virt(stack_base) as u64;
+    unsafe {
+        core::ptr::write_bytes(stack_base as *mut u8, 0, KERNEL_STACK_SIZE);
+    }
+    let kstack_top = stack_base + KERNEL_STACK_SIZE as u64;
 
     // Determine child's user stack pointer
     // For fork (child_stack == 0): inherit parent's stack
@@ -1232,7 +1308,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Create TaskContext pointing to clone_child_entry
     // RSP points to the TrapFrame we just placed
     let context = CurrentArch::new_clone_child_context(trapframe_ptr);
-    let thread_ctx = KernelThreadContext::new(context, stack_base, child_priority);
+    let thread_ctx =
+        KernelThreadContext::new(context, stack_base, KERNEL_STACK_SIZE, child_priority);
 
     // Determine child's parent PID
     // CLONE_PARENT or CLONE_THREAD: child becomes sibling (same parent as caller)
@@ -1290,7 +1367,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         clear_child_tid: 0,
         set_child_tid: 0,
         // Shared resources (will be cloned/shared based on clone flags below)
-        mm: None,
+        mm: child_mm,
         files: None,
         fs: None,
         nsproxy: None,
@@ -1325,6 +1402,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         // I/O port permissions (x86-64 only, inherited from parent)
         #[cfg(target_arch = "x86_64")]
         iopl_emul: parent_iopl_emul,
+        // Copied like the rest of task->flags (Linux dup_task_struct)
+        nproc_exceeded: parent_nproc_exceeded,
+        exiting: false,
         // Ptrace state: inherited if CLONE_PTRACE is set and parent is traced
         // CLONE_UNTRACED prevents forced inheritance even when tracer requests it
         ptrace: if config.flags & CLONE_UNTRACED != 0 {
@@ -1356,14 +1436,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         table.tasks.push(child_task);
     }
 
-    // Add to run queue
-    let sched = get_percpu_sched(cpu_id);
-    {
-        let mut rq = sched.lock.lock();
-        rq.add_task(child_tid, thread_ctx);
-        rq.enqueue_task(child_tid);
-    }
-
     // Handle filesystem context (CLONE_FS)
     // If CLONE_FS is set, child shares parent's FsStruct (cwd changes affect both)
     // Otherwise, child gets an independent copy
@@ -1374,18 +1446,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Otherwise, child gets an independent deep copy
     crate::task::fdtable::clone_task_fd(current_tid, child_tid, config.flags & CLONE_FILES != 0);
 
-    // Handle memory descriptor (CLONE_VM)
-    // If CLONE_VM is set, child shares parent's mm (threads)
-    // Otherwise, child gets an independent copy of VMAs (fork)
-    crate::mm::clone_task_mm(current_tid, child_tid, config.flags & CLONE_VM != 0);
-
     // Handle namespace context (CLONE_NEW* flags)
     // This must come after filesystem context since mount namespace affects VFS
-    try_with_cleanup!(crate::ns::copy_namespaces(
-        current_tid,
-        child_tid,
-        config.flags
-    ));
+    crate::ns::copy_namespaces(current_tid, child_tid, config.flags)?;
 
     // Handle cgroup membership
     // If CLONE_INTO_CGROUP is set, look up cgroup from fd and use that
@@ -1397,10 +1460,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
                 crate::cgroup::attach_task(child_tid, &cgroup);
             }
             None => {
-                // Invalid cgroup fd - cleanup and return error
-                if nproc_incremented {
-                    crate::task::decrement_user_process_count(nproc_uid);
-                }
+                // Invalid cgroup fd
                 return Err(9); // EBADF
             }
         }
@@ -1440,8 +1500,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Handle CLONE_SETTLS: set child's TLS pointer
     // This stores the TLS value so clone_child_entry can load it into the
     // architecture-specific TLS register (FS base on x86_64, TPIDR_EL0 on aarch64)
+    // Otherwise the child inherits the parent's TLS register, as every
+    // other user register (Linux copy_thread: fsbase / tpidr_el0)
     if config.flags & CLONE_SETTLS != 0 {
         crate::task::set_task_tls(child_tid, config.tls);
+    } else {
+        crate::task::set_task_tls(child_tid, crate::arch::read_user_tls());
     }
 
     // Handle CLONE_PARENT_SETTID: write child TID to parent's address space
@@ -1484,11 +1548,35 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         child_pid
     };
 
-    // Handle CLONE_VFORK: parent blocks until child exec()s or _exit()s
-    // This must be done after child is fully set up and enqueued
+    // CLONE_VFORK: the completion must exist before the child can run
+    // (it may exec or exit at once on another CPU)
     if config.flags & CLONE_VFORK != 0 {
         register_vfork_child(child_tid);
-        // Wait for child to signal completion (via exec or exit)
+    }
+
+    // The child exists now: its charge is released with it; the parent
+    // forked within its limit (Linux clears PF_NPROC_EXCEEDED)
+    nproc.keep();
+    {
+        let mut table = TASK_TABLE.lock();
+        if let Some(t) = table.tasks.iter_mut().find(|t| t.tid == current_tid) {
+            t.nproc_exceeded = false;
+        }
+    }
+
+    // Only a fully set up child becomes runnable (Linux: wake_up_new_task
+    // at the end of kernel_clone); before this it has no mm, files or
+    // signal state to run with
+    let sched = get_percpu_sched(cpu_id);
+    {
+        let mut rq = sched.lock.lock();
+        rq.add_task(child_tid, thread_ctx);
+        sched.reserve_wakes(rq.contexts.len());
+        rq.enqueue_task(child_tid);
+    }
+
+    // CLONE_VFORK: parent blocks until child exec()s or _exit()s
+    if config.flags & CLONE_VFORK != 0 {
         wait_for_vfork(child_tid);
     }
 
@@ -1543,28 +1631,50 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     Ok(return_value)
 }
 
+/// Mark the current task `tid` exiting (Linux PF_EXITING), in TASK_TABLE
+/// and in the per-CPU current-task cache
+fn set_exiting(tid: Tid) {
+    if let Some(t) = TASK_TABLE.lock().tasks.iter_mut().find(|t| t.tid == tid) {
+        t.exiting = true;
+    }
+    let mut cur = CurrentArch::get_current_task();
+    cur.exiting = true;
+    CurrentArch::set_current_task(&cur);
+}
+
+/// The current task is exiting (Linux current->flags & PF_EXITING)
+pub fn current_exiting() -> bool {
+    CurrentArch::get_current_task().exiting
+}
+
 /// Exit the current task and switch to another
 ///
 /// This function never returns. The current task is removed from the
 /// run queue (but kept in TASK_TABLE as zombie), and execution switches
 /// to the next available task (typically idle if no others).
-pub fn exit_current() -> ! {
+///
+/// With a `status`, the task becomes a zombie carrying it once everything
+/// it owned is released (Linux exit_notify after exit_mm/exit_files): a
+/// parent's wait never sees it, and never removes it, while it still
+/// runs on its resources.
+pub fn exit_current(status: Option<i32>) -> ! {
     let tid = current_tid();
 
     // Release the task's resources first, without the rq lock: these paths
     // take sleeping-context locks and may wake other tasks (futex CLEARTID,
     // robust futexes), which needs this CPU's rq lock.
     if tid != 0 {
-        // Decrement user process count for process exits (thread group leader)
-        // A process exits when tid == pid (thread group leader)
+        // Linux exit_signals sets PF_EXITING first
+        set_exiting(tid);
+
+        // A non-leader thread is released at exit (Linux autoreaps it):
+        // its RLIMIT_NPROC charge goes now; a process's when it is reaped
         {
             let table = TASK_TABLE.lock();
-            if let Some(task) = table.tasks.iter().find(|t| t.tid == tid) {
-                // Thread group leader: tid == pid
-                if task.tid == task.pid {
-                    let cred = current_cred();
-                    crate::task::decrement_user_process_count(cred.uid);
-                }
+            if let Some(task) = table.tasks.iter().find(|t| t.tid == tid)
+                && task.tid != task.pid
+            {
+                crate::task::nproc_uncharge(task.cred.uid);
             }
         }
 
@@ -1585,9 +1695,6 @@ pub fn exit_current() -> ! {
         // Clean up TLS pointer for exiting task
         crate::task::remove_task_tls(tid);
 
-        // Clean up clear_child_tid pointer for exiting task
-        crate::task::remove_clear_child_tid(tid);
-
         // Clean up namespace context for exiting task
         crate::ns::exit_task_ns(tid);
 
@@ -1596,9 +1703,6 @@ pub fn exit_current() -> ! {
 
         // Clean up signal state for exiting task
         crate::signal::exit_task_signal(tid);
-
-        // Clean up memory descriptor for exiting task
-        crate::mm::exit_task_mm(tid);
 
         // Clean up robust futex list for exiting task
         // Get pid for futex key creation
@@ -1623,6 +1727,18 @@ pub fn exit_current() -> ! {
         signal_vfork_done(tid);
     }
 
+    // Leave the address space (Linux exit_mm, after mm_release above has
+    // used it for the robust list and CLEARTID): the last user tears it
+    // down; its top-level table stays loaded here until we switched away
+    let dead_mm = if tid != 0 {
+        crate::mm::exit_task_mm(tid)
+    } else {
+        None
+    };
+    if let Some(st) = status {
+        mark_zombie(tid, st);
+    }
+
     // Let a parent sleeping in wait4/waitid re-check for zombies
     crate::task::proc::CHILD_EXIT_WQ.wake_all();
 
@@ -1630,12 +1746,21 @@ pub fn exit_current() -> ! {
     let mut rq = sched.lock.lock();
     sched.drain_wakes(&mut rq);
 
-    // Remove from the run queue (the Task stays in TASK_TABLE as a zombie)
+    // Remove from the run queue (the Task stays in TASK_TABLE as a zombie);
+    // its stack and mm go once this CPU runs something else
+    let mut dead = DeadTask {
+        stack: (0, 0),
+        mm: dead_mm,
+    };
     if let Some(tid) = rq.current.take() {
-        rq.contexts.retain(|(t, _)| *t != tid);
+        if let Some(pos) = rq.contexts.iter().position(|(t, _)| *t == tid) {
+            let (_, ctx) = rq.contexts.remove(pos);
+            dead.stack = (ctx.stack_base, ctx.stack_size);
+        }
         rq.sleep_queue.retain(|e| e.tid != tid);
         rq.nr_running = rq.nr_running.saturating_sub(1);
     }
+    rq.dead.push(dead);
 
     let next_tid = rq.dequeue_next();
     let (next_kstack, next_cr3, next_task) = switch_info(next_tid);
@@ -1657,8 +1782,10 @@ pub fn exit_current() -> ! {
     CurrentArch::set_current_task(&next_task);
     sched.nr_switches.fetch_add(1, Ordering::Relaxed);
 
-    // Release lock before switch (context_switch_first doesn't return)
-    drop(rq);
+    // The rq lock stays held across the switch, as for any switch: the
+    // next task releases it (its own guard, or finish_context_switch),
+    // and only then frees our stack (`rq.dead`)
+    core::mem::forget(rq);
 
     // Switch to next task - never returns
     unsafe {
@@ -1695,6 +1822,7 @@ fn switch_info(tid: Tid) -> (u64, u64, CurrentTask) {
                     sid: t.sid,
                     cred: *t.cred,
                     seccomp_mode: t.seccomp_mode,
+                    exiting: t.exiting,
                 },
             )
         })
@@ -1717,6 +1845,12 @@ fn context_switch_locked(
     let (Some(curr_ctx), Some(next_ctx)) = (rq.get_context_mut(cur), rq.get_context(next)) else {
         return;
     };
+    // Save the outgoing task's user TLS register (user code may have
+    // changed it without a syscall, e.g. msr tpidr_el0); the arch switch
+    // loads `next`'s
+    if cur != 0 {
+        crate::task::set_task_tls(cur, crate::arch::read_user_tls());
+    }
     rq.current = Some(next);
     CurrentArch::set_current_tid(next);
     CurrentArch::set_current_task(&next_task);
@@ -1728,7 +1862,9 @@ fn context_switch_locked(
     }
     // Back on `cur` (the rq lock is held again; `rq` releases it)
     CurrentArch::restore_syscall_user_state(&saved);
+    let dead = core::mem::take(&mut rq.dead);
     drop(rq);
+    drop(dead);
 }
 
 /// This CPU's scheduler, if initialized
@@ -1759,6 +1895,7 @@ pub fn set_current_state(state: SleepState) {
 /// [`set_current_state`], re-check their condition, then call this. If a
 /// wakeup already arrived (state back to Running) it returns at once.
 pub fn schedule() {
+    crate::sync::might_sleep();
     let Some(sched) = this_sched() else { return };
     let mut rq = sched.lock.lock();
     sched.drain_wakes(&mut rq);
@@ -1845,7 +1982,7 @@ pub fn wake_up_task(tid: Tid, cpu: u32, mode: WakeMode) -> bool {
         let mut rq = target.lock.lock();
         rq.try_wake(tid, mode)
     } else {
-        target.wake_list.lock().push((tid, mode));
+        target.post_wake(tid, mode);
         true
     }
 }
@@ -1890,12 +2027,14 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
 /// CPU advanced it, making time run ~Ncpu times too fast. All CPUs then do
 /// their own scheduler work (remote wakeups, expired sleepers).
 pub fn scheduler_tick() {
+    crate::sync::lockdep::irq_enter();
     if CurrentArch::try_current_cpu_id() == Some(0) {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
         // Wake ktimerd if a software timer expired
         crate::timer::check_timers();
     }
     wake_sleepers();
+    crate::sync::lockdep::irq_exit();
 }
 
 /// Get current tick count
@@ -1954,6 +2093,9 @@ pub fn finish_context_switch() {
     unsafe {
         sched.lock.force_unlock();
     }
+    // Free what tasks that exited here left (we are off their stacks)
+    let dead = core::mem::take(&mut sched.lock.lock().dead);
+    drop(dead);
 }
 
 /// Get the current task's CR3 (page table root physical address)
@@ -2060,6 +2202,7 @@ pub fn wake_sleepers() {
 /// The current thread stays runnable and goes to the back of its priority
 /// queue; another runnable thread (if any) gets to run.
 pub fn yield_now() {
+    crate::sync::might_sleep();
     let Some(sched) = this_sched() else { return };
     let mut rq = sched.lock.lock();
     sched.drain_wakes(&mut rq);
@@ -2075,13 +2218,18 @@ pub fn yield_now() {
             .map(|t| t.priority)
             .unwrap_or(128)
     };
-    match rq.entry_mut(cur) {
+    let changed = match rq.entry_mut(cur) {
         Some(e) => {
             e.state = SleepState::Running;
+            let changed = e.priority != priority;
             e.priority = priority;
             e.queued = true;
+            changed
         }
         None => return,
+    };
+    if changed {
+        rq.reserve_prio(priority);
     }
     rq.queue().enqueue(cur, priority);
 
@@ -2870,37 +3018,32 @@ pub fn set_current_fsgid(fsgid: crate::task::Gid) {
 
 /// Replace current task's address space and jump to new entry point
 ///
-/// This is used by execve to replace the current process image.
-/// The function never returns - it jumps directly to user mode.
+/// This is used by execve to replace the current process image (Linux
+/// exec_mmap): the task switches to `mm` first, then drops its user
+/// reference on the old address space. That tears it down only if
+/// nothing else uses it -- a vfork parent or other CLONE_VM threads keep
+/// it alive. The function never returns.
 ///
 /// # Arguments
-/// * `new_page_table` - The new page table for the process
+/// * `mm` - The new address space (its top-level table is loaded)
 /// * `entry_point` - The entry point address in the new program
 /// * `user_sp` - The initial user stack pointer
-pub fn exec_replace_image(new_page_table: ArchPageTable, entry_point: u64, user_sp: u64) -> ! {
-    use crate::FRAME_ALLOCATOR;
-    use crate::arch::PageTable;
-
+pub fn exec_replace_image(mm: crate::mm::MmRef, entry_point: u64, user_sp: u64) -> ! {
     let tid = current_tid();
-    let cr3 = new_page_table.root_table_phys();
+    let cr3 = mm.pgd();
 
-    // Update the task's page table in the task table
-    // Collect old frames before replacing, then free them
-    let old_frames = {
+    let old = {
         let mut table = TASK_TABLE.lock();
-        if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-            let old_frames = task.page_table.collect_table_frames();
-            task.page_table = new_page_table;
-            old_frames
-        } else {
-            alloc::vec::Vec::new()
-        }
+        let task = table.tasks.iter_mut().find(|t| t.tid == tid);
+        let task = task.expect("exec: current task not in the task table");
+        task.page_table = ArchPageTable::new(cr3);
+        task.mm.replace(mm)
     };
 
-    // Free old page table frames (outside lock to avoid deadlock)
-    for frame in old_frames {
-        FRAME_ALLOCATOR.free(frame);
-    }
+    // Leave the old tables before releasing them: their frames may be
+    // reused at once by another CPU
+    crate::arch::paging::activate(cr3);
+    drop(old);
 
     // Get kernel stack for syscall/interrupt return
     let kstack_top = {
@@ -2967,7 +3110,10 @@ pub fn try_schedule() {
     CurrentArch::set_current_tid(next);
     CurrentArch::set_current_task(&next_task);
     sched.nr_switches.fetch_add(1, Ordering::Relaxed);
-    drop(rq); // context_switch_first never returns
+    // Held across the switch like any other: the task switched to
+    // releases it (finish_context_switch or its own guard). Dropping it
+    // here left the per-CPU preempt count at -1 after that release.
+    core::mem::forget(rq); // context_switch_first never returns
     unsafe {
         CurrentArch::context_switch_first(next_ctx, next_kstack, next_cr3, next);
     }

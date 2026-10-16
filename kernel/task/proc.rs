@@ -38,13 +38,9 @@ pub fn sys_exit(status: i32) -> u64 {
 /// `(code << 8)` for a normal exit, the signal number (| 0x80 if a core was
 /// dumped) for a signal death, exactly what wait4 reports.
 pub fn do_exit(wait_status: i32) -> ! {
-    let tid = super::percpu::current_tid();
-
-    // Mark task as Zombie (stores the status for wait4/waitid)
-    super::percpu::mark_zombie(tid, wait_status);
-
-    // Remove from run queue and switch to another task (never returns)
-    super::percpu::exit_current();
+    // Release everything, become a zombie carrying the status for
+    // wait4/waitid, switch away (never returns)
+    super::percpu::exit_current(Some(wait_status));
 }
 
 /// sys_clone - create a new thread or process
@@ -366,6 +362,20 @@ pub fn sys_vfork() -> i64 {
 pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, _rusage: u64) -> i64 {
     use super::wait_options::WNOHANG;
 
+    // Linux kernel_wait4: WEXITED/WNOWAIT and the like are waitid-only
+    const WUNTRACED: i32 = 2;
+    const WCONTINUED: i32 = 8;
+    const WNOTHREAD: i32 = 0x2000_0000;
+    let valid = WNOHANG
+        | WUNTRACED
+        | WCONTINUED
+        | WNOTHREAD
+        | super::wait_options::__WCLONE
+        | super::wait_options::__WALL;
+    if options & !valid != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+
     let current_pid = super::percpu::current_pid();
 
     use super::percpu::{SleepState, schedule};
@@ -531,8 +541,7 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
     let result = loop {
         CHILD_EXIT_WQ.prepare_to_wait(&mut w, SleepState::Interruptible);
 
-        // Try to reap a zombie child (or peek if WNOWAIT)
-        // Note: WNOWAIT leaves child in waitable state - we don't fully support this yet
+        // Reap a zombie child (with WNOWAIT, only report it)
         if let Some((child_pid, wait_status, utime, stime)) =
             super::percpu::reap_zombie_child_times(current_pid, wait_pid, options)
         {

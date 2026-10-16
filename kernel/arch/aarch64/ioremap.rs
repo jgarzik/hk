@@ -4,27 +4,28 @@
 //! MMIO regions to kernel virtual addresses. Uses a dedicated virtual
 //! address region separate from the identity-mapped boot region.
 //!
-//! Note: For addresses in the boot identity-mapped device region (0-1GB),
-//! we simply return the physical address since it's already mapped with
-//! device attributes. For other addresses, we allocate from the ioremap
-//! region and create proper mappings.
+//! Physical addresses in the device window (0-1GB on QEMU virt) are
+//! already mapped with device attributes at IO_BASE + phys (kmap.rs);
+//! other addresses get pages in the ioremap window. Both are in TTBR1,
+//! shared by every address space.
 
+use crate::sync::spin::Mutex;
 use core::arch::asm;
-use spin::Mutex;
 
 use super::paging::{
-    AF, AP_EL1_RW, ATTR_IDX_DEVICE, PAGE_SIZE, PXN, PageTableEntry, SH_INNER, UXN, flush_tlb,
-    phys_to_virt, phys_to_virt_table, phys_to_virt_table_const,
+    AF, AP_EL1_RW, ATTR_IDX_DEVICE, IO_BASE, IO_SIZE, PAGE_SIZE, PXN, PageTableEntry, SH_INNER,
+    UXN, VMALLOC_START, flush_tlb, io_va, phys_to_virt, phys_to_virt_table,
+    phys_to_virt_table_const,
 };
 
-/// ioremap region base (3GB - outside identity-mapped 0-2GB)
-pub const IOREMAP_BASE: u64 = 0xC000_0000;
+/// ioremap window base (the vmalloc area, TTBR1)
+pub const IOREMAP_BASE: u64 = VMALLOC_START;
 
-/// ioremap region end (3.25GB)
-pub const IOREMAP_END: u64 = 0xD000_0000;
+/// Total size of ioremap region (1GB)
+pub const IOREMAP_SIZE: u64 = 1 << 30;
 
-/// Total size of ioremap region (256MB)
-pub const IOREMAP_SIZE: u64 = IOREMAP_END - IOREMAP_BASE;
+/// ioremap region end (exclusive)
+pub const IOREMAP_END: u64 = IOREMAP_BASE + IOREMAP_SIZE;
 
 /// Number of 4KB pages in ioremap region
 const IOREMAP_PAGES: usize = (IOREMAP_SIZE / PAGE_SIZE) as usize;
@@ -34,9 +35,6 @@ const BITMAP_SIZE: usize = IOREMAP_PAGES.div_ceil(64);
 
 /// Device memory page attributes
 const DEVICE_PAGE_ATTRS: u64 = AF | SH_INNER | ATTR_IDX_DEVICE | AP_EL1_RW | PXN | UXN;
-
-/// Boot device region end (already identity-mapped with device attributes)
-const BOOT_DEVICE_END: u64 = 0x4000_0000; // First 1GB
 
 /// ioremap error types
 #[derive(Debug, Clone, Copy)]
@@ -194,10 +192,9 @@ pub fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError> {
         return Err(IoremapError::InvalidSize);
     }
 
-    // For addresses in the boot device region, use identity mapping
-    // The boot page tables already map 0-1GB with device memory attributes
-    if (phys_addr + size) <= BOOT_DEVICE_END {
-        return Ok(phys_addr as *mut u8);
+    // The device window already maps physical 0-1GB
+    if phys_addr + size <= IO_SIZE {
+        return Ok(io_va(phys_addr) as *mut u8);
     }
 
     // For other addresses, allocate from ioremap region and map
@@ -212,12 +209,8 @@ pub fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError> {
         .alloc(num_pages)
         .ok_or(IoremapError::OutOfVirtualSpace)?;
 
-    // Get kernel page table (from TTBR0 since we use identity mapping)
-    let ttbr0: u64;
-    unsafe {
-        asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nostack));
-    }
-    let l0_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    // Kernel (TTBR1) table
+    let l0_phys = super::kmap::swapper_phys();
 
     // Map each page with device memory attributes
     for i in 0..num_pages {
@@ -248,8 +241,8 @@ pub fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError> {
 pub fn iounmap(virt_addr: *mut u8, size: u64) {
     let virt = virt_addr as u64;
 
-    // If it's in the boot device region (identity-mapped), nothing to do
-    if virt < BOOT_DEVICE_END {
+    // The device window is permanent
+    if (IO_BASE..IO_BASE + IO_SIZE).contains(&virt) {
         return;
     }
 
@@ -263,12 +256,7 @@ pub fn iounmap(virt_addr: *mut u8, size: u64) {
     let aligned_size = (size + offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let num_pages = (aligned_size / PAGE_SIZE) as usize;
 
-    // Get kernel page table
-    let ttbr0: u64;
-    unsafe {
-        asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nostack));
-    }
-    let l0_phys = ttbr0 & 0x0000_FFFF_FFFF_F000;
+    let l0_phys = super::kmap::swapper_phys();
 
     // Unmap pages and flush TLB
     for i in 0..num_pages {

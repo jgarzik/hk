@@ -168,9 +168,16 @@ use crate::task::percpu::TASK_TABLE;
 /// for the Task to be reaped). This follows the pattern used by other
 /// subsystems like namespaces and signal handling.
 pub fn exit_seccomp(tid: Tid) {
-    let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.seccomp_mode = SECCOMP_MODE_DISABLED;
-        task.seccomp_filter = None;
-    }
+    // The filter is released after TASK_TABLE
+    let _old = {
+        let mut table = TASK_TABLE.lock();
+        table
+            .tasks
+            .iter_mut()
+            .find(|t| t.tid == tid)
+            .and_then(|task| {
+                task.seccomp_mode = SECCOMP_MODE_DISABLED;
+                task.seccomp_filter.take()
+            })
+    };
 }

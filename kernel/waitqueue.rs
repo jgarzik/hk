@@ -11,8 +11,9 @@
 //!   exit path turns that into a restart or -EINTR), `_timeout` variants
 //!   take scheduler ticks and return the ticks left.
 //! - Wakers (`wake_one`/`wake_all`) may run in any context, including IRQ
-//!   handlers: the queue lock is an `IrqSpinlock` and the task wakeup only
-//!   takes run-queue locks (never TASK_TABLE).
+//!   handlers: the queue lock is an `IrqSpinlock`, the task wakeup only
+//!   takes run-queue locks (never TASK_TABLE), and nothing on the wake
+//!   path allocates.
 //!
 //! ## Usage
 //!
@@ -26,9 +27,10 @@
 //!
 //! ## Lock Ordering
 //!
-//! The queue's IrqSpinlock is a leaf: no other lock is taken while holding
-//! it (wakeups are issued after it is dropped). Never call a `wait*`
-//! function while holding a spinlock.
+//! The queue's IrqSpinlock is taken before the run-queue lock / remote
+//! `wake_list` (wakeups are issued under it, like Linux); nothing else
+//! nests inside it. Never call a `wait*` function while holding a
+//! spinlock, and never wake while holding this CPU's run-queue lock.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -150,6 +152,7 @@ impl WaitQueue {
 
     /// Sleep (uninterruptibly) until `cond()` is true
     pub fn wait_event<F: FnMut() -> bool>(&self, mut cond: F) {
+        crate::sync::might_sleep();
         if cond() {
             return;
         }
@@ -227,6 +230,7 @@ impl WaitQueue {
         timeout: u64,
         state: SleepState,
     ) -> Result<u64, KernelError> {
+        crate::sync::might_sleep();
         if cond() {
             return Ok(timeout.max(1));
         }
@@ -254,39 +258,35 @@ impl WaitQueue {
         result
     }
 
-    /// Collect up to `nr` waiters to wake (`usize::MAX` = all)
-    fn take_waiters(&self, nr: usize) -> Vec<(Tid, u32)> {
+    /// Wake up to `nr` waiters (`usize::MAX` = all) under the head lock
+    /// without allocating (Linux __wake_up_common: try_to_wake_up runs
+    /// under wq_head->lock), so IRQ handlers may wake. Order: head ->
+    /// run-queue lock / remote `wake_list`.
+    fn wake_nr(&self, nr: usize) -> usize {
         let mut head = self.head.lock();
-        let mut out = Vec::new();
+        let mut woken = 0;
         let mut i = 0;
-        while i < head.len() && out.len() < nr {
-            let e = &head[i];
-            out.push((e.tid, e.cpu));
-            if e.autoremove {
+        while i < head.len() && woken < nr {
+            let (tid, cpu, auto) = (head[i].tid, head[i].cpu, head[i].autoremove);
+            if auto {
                 head.remove(i);
             } else {
                 i += 1;
             }
+            wake_up_task(tid, cpu, WakeMode::Any);
+            woken += 1;
         }
-        out
+        woken
     }
 
     /// Wake one waiter (FIFO). Returns true if a task was woken.
     pub fn wake_one(&self) -> bool {
-        let woken = self.take_waiters(1);
-        for &(tid, cpu) in &woken {
-            wake_up_task(tid, cpu, WakeMode::Any);
-        }
-        !woken.is_empty()
+        self.wake_nr(1) != 0
     }
 
     /// Wake all waiters. Returns the number of waiters woken.
     pub fn wake_all(&self) -> usize {
-        let woken = self.take_waiters(usize::MAX);
-        for &(tid, cpu) in &woken {
-            wake_up_task(tid, cpu, WakeMode::Any);
-        }
-        woken.len()
+        self.wake_nr(usize::MAX)
     }
 
     /// Check if the wait queue is empty

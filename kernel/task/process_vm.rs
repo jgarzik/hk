@@ -85,8 +85,9 @@ pub fn sys_process_vm_readv(
         }
     }
 
-    // Lock target mm
-    let mm_guard = target_mm.lock();
+    // The target mm (hk's mmap_lock, a spin lock) is locked per remote
+    // access only, never across the local user copy (which can fault
+    // and sleep, and takes our own mm lock if it does)
 
     // Transfer data: remote -> local
     let mut total_bytes = 0i64;
@@ -115,16 +116,20 @@ pub fn sys_process_vm_readv(
 
             // Read from remote into kernel buffer
             let mut buf = alloc::vec![0u8; to_transfer];
-            let bytes_read =
-                match access_remote_vm_read(&mm_guard, page_table_root, remote_addr, &mut buf) {
-                    Ok(n) => n,
-                    Err(_) => {
-                        if total_bytes > 0 {
-                            return total_bytes;
-                        }
-                        return KernelError::BadAddress.sysret();
+            let bytes_read = match access_remote_vm_read(
+                &target_mm.lock(),
+                page_table_root,
+                remote_addr,
+                &mut buf,
+            ) {
+                Ok(n) => n,
+                Err(_) => {
+                    if total_bytes > 0 {
+                        return total_bytes;
                     }
-                };
+                    return KernelError::BadAddress.sysret();
+                }
+            };
 
             if bytes_read == 0 {
                 if total_bytes > 0 {
@@ -225,8 +230,9 @@ pub fn sys_process_vm_writev(
         }
     }
 
-    // Lock target mm
-    let mm_guard = target_mm.lock();
+    // The target mm (hk's mmap_lock, a spin lock) is locked per remote
+    // access only, never across the local user copy (which can fault
+    // and sleep, and takes our own mm lock if it does)
 
     // Transfer data: local -> remote
     let mut total_bytes = 0i64;
@@ -266,7 +272,8 @@ pub fn sys_process_vm_writev(
 
             // Write to remote
             let bytes_written =
-                match access_remote_vm_write(&mm_guard, page_table_root, remote_addr, &buf) {
+                match access_remote_vm_write(&target_mm.lock(), page_table_root, remote_addr, &buf)
+                {
                     Ok(n) => n,
                     Err(_) => {
                         if total_bytes > 0 {
@@ -344,16 +351,12 @@ fn check_process_vm_permission(target_tid: Tid) -> bool {
 }
 
 /// Get target's MmStruct and page table root physical address
-fn get_target_mm_and_pt(
-    target_tid: Tid,
-) -> Option<(alloc::sync::Arc<spin::Mutex<crate::mm::MmStruct>>, u64)> {
-    let table = TASK_TABLE.lock();
-    let task = table.tasks.iter().find(|t| t.tid == target_tid)?;
-
-    let mm = task.mm.clone()?;
-    let pt_root = task.page_table.root_table_phys();
-
-    Some((mm, pt_root))
+fn get_target_mm_and_pt(target_tid: Tid) -> Option<(crate::mm::MmRef, u64)> {
+    // A user reference: the address space cannot be torn down while we
+    // access it (Linux get_task_mm)
+    let mm = crate::mm::get_task_mm_users(target_tid)?;
+    let pgd = mm.pgd();
+    Some((mm, pgd))
 }
 
 /// Copy iovec array from user space

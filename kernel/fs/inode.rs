@@ -5,9 +5,9 @@
 
 use alloc::sync::{Arc, Weak};
 
+use crate::sync::spin::RwLock;
 use ::core::cell::Cell;
 use ::core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
-use spin::RwLock;
 
 use crate::sync::RwSem;
 

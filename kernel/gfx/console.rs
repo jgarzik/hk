@@ -6,7 +6,7 @@
 
 use core::ptr;
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use super::font::{DEFAULT_FONT, Font};
 use super::{Color, FramebufferInfo, PixelFormat};

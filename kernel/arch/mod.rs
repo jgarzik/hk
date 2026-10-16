@@ -107,14 +107,26 @@ pub use x86_64::uapi;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::uapi;
 
-// Physical-to-virtual address conversion
-// Phase 1: Identity mapping (PAGE_OFFSET = 0)
-// Phase 2: High-address kernel (PAGE_OFFSET = direct map base)
+// The current task's user TLS register (FS base / TPIDR_EL0)
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::paging::phys_to_virt;
+pub use x86_64::percpu::read_fs_base as read_user_tls;
 
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::paging::phys_to_virt;
+pub use aarch64::percpu::read_tpidr_el0 as read_user_tls;
+
+// ELF auxv hardware capabilities and platform string
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::cpu::{ELF_PLATFORM, elf_hwcap};
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::cpu::{ELF_PLATFORM, elf_hwcap};
+
+// Physical-to-virtual address conversion
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::paging::{self, phys_to_virt, virt_to_phys};
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::paging::{self, phys_to_virt, virt_to_phys};
 
 bitflags! {
     /// Page flags for memory mapping
@@ -136,11 +148,6 @@ pub trait Arch {
     /// Physical address type
     type PhysAddr: Copy + Eq;
 
-    /// Start of user address space
-    const USER_START: Self::VirtAddr;
-    /// End of user address space
-    const USER_END: Self::VirtAddr;
-
     /// Create a trap frame for entering user mode
     fn user_entry_frame(entry: Self::VirtAddr, user_stack_top: Self::VirtAddr) -> Self::TrapFrame;
 }
@@ -158,6 +165,18 @@ pub enum MapError {
     InvalidAddress,
     /// Address is not mapped (for unmap/split operations)
     NotMapped,
+}
+
+/// A user mapping met while tearing down an address space
+/// (`paging::free_user`); the mm layer drops the reference it holds
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Leaf {
+    /// A present 4KB page (physical address)
+    Page(u64),
+    /// A present 2MB page (physical address of its head frame)
+    Huge(u64),
+    /// A non-present, non-empty PTE (a swap entry), raw value
+    Swap(u64),
 }
 
 /// Page table abstraction trait
@@ -218,16 +237,6 @@ pub trait PageTable: Sized {
     /// This uses the currently active page table (e.g., CR3 on x86-64).
     /// No new allocation is performed.
     fn kernel_identity() -> Self;
-
-    /// Collect all page table frame addresses (for freeing)
-    ///
-    /// Walks the page table hierarchy and collects all intermediate table
-    /// frame addresses (not the mapped user pages, just the table frames).
-    /// Used to free page table memory during exec() or process exit.
-    ///
-    /// Returns a vector of physical addresses of all page table frames,
-    /// including the root table.
-    fn collect_table_frames(&self) -> alloc::vec::Vec<Self::PhysAddr>;
 }
 
 /// Frame allocator trait
@@ -239,6 +248,18 @@ pub trait FrameAlloc {
 
     /// Free a physical frame
     fn free_frame(&mut self, frame: Self::PhysAddr);
+
+    /// Allocate `n` physically contiguous frames (kernel stacks, DMA
+    /// buffers). None if unsupported or no such run is free.
+    fn alloc_contig(&mut self, _n: usize) -> Option<Self::PhysAddr> {
+        None
+    }
+
+    /// Memory is down to the reserve kept for the kernel: callers adding
+    /// unevictable user data (ramfs pages) must fail instead
+    fn reserve_low(&self) -> bool {
+        false
+    }
 }
 
 // ============================================================================

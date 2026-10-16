@@ -1,6 +1,22 @@
-/* 32-bit to 64-bit boot stub for multiboot2 */
-/* This code runs in 32-bit protected mode after GRUB loads us */
-/* It sets up long mode and jumps to the 64-bit Rust kernel */
+/* 32-bit to 64-bit boot stub for multiboot2
+ *
+ * GRUB enters _start32 in 32-bit protected mode, paging off, at the
+ * physical load address. The stub builds the boot page tables, enables
+ * long mode and jumps to the kernel's high-half entry (_start). Linux:
+ * arch/x86/kernel/head_64.S (early_top_pgt).
+ *
+ * Boot page tables (2MB pages):
+ *   PML4[0]   -> identity map of 0-4GB (this stub, later the AP trampoline)
+ *   PML4[273] -> same: early direct map at PAGE_OFFSET (0xffff888000000000)
+ *   PML4[511] -> PDPT[510..511]: kernel image at __START_KERNEL_map
+ *                (0xffffffff80000000 -> physical 0-2GB)
+ * paging::init replaces them with the kernel page table (swapper), which
+ * has no low mapping; boot_pml4 then serves as the AP trampoline table.
+ */
+
+.equ PML4_DIRECT, 273                  /* PAGE_OFFSET >> 39 & 511 */
+.equ PTE_TABLE, 0x03                    /* present + writable */
+.equ PTE_LARGE, 0x83                    /* present + writable + 2MB */
 
 .section .multiboot, "a"
 .align 8
@@ -21,91 +37,93 @@ multiboot_header_end:
 .section .boot_bss, "aw", @nobits
 .align 4096
 
-/* Page tables - identity map first 512MB */
-pml4:
+.global boot_pml4
+boot_pml4:
     .skip 4096
-pdpt:
+boot_pdpt_low:                          /* 0-4GB: 4 PDs */
     .skip 4096
-pd:
+boot_pdpt_high:                         /* -2GB: PDPT[510..511] */
     .skip 4096
-
-/* Stack */
-.align 16
-stack_bottom:
-    .skip 16384                         /* 16KB stack */
-stack_top:
+boot_pd:                                /* 4 x 512 x 2MB = 4GB */
+    .skip 4 * 4096
+boot_tables_end:
 
 .section .boot, "ax"
 .code32
 .global _start32
 
 _start32:
-    /* Disable interrupts */
     cli
 
     /* Save multiboot info pointer (in EBX) for later */
     movl %ebx, (multiboot_info_ptr)
 
-    /* Set up stack - use absolute address */
-    movl $stack_top, %esp
-
-    /* Clear page tables - use absolute addresses */
-    movl $pml4, %edi
+    /* Clear the boot page tables */
+    movl $boot_pml4, %edi
     xorl %eax, %eax
-    movl $3072, %ecx                    /* 3 * 4096 / 4 = 3072 dwords */
+    movl $((boot_tables_end - boot_pml4) / 4), %ecx
     rep stosl
 
-    /* Set up PML4[0] -> PDPT */
-    movl $pdpt, %eax
-    orl $0x03, %eax                     /* Present + Writable */
-    movl %eax, pml4
+    /* PML4[0] and PML4[273] -> boot_pdpt_low; PML4[511] -> boot_pdpt_high */
+    movl $boot_pdpt_low + PTE_TABLE, %eax
+    movl %eax, boot_pml4
+    movl %eax, boot_pml4 + PML4_DIRECT * 8
+    movl $boot_pdpt_high + PTE_TABLE, %eax
+    movl %eax, boot_pml4 + 511 * 8
 
-    /* Set up PDPT[0] -> PD */
-    movl $pd, %eax
-    orl $0x03, %eax
-    movl %eax, pdpt
-
-    /* Map 512MB using 2MB pages (256 entries in PD) */
-    movl $pd, %edi
-    movl $0x83, %eax                    /* Present + Writable + Huge (2MB) */
-    movl $256, %ecx                     /* 256 * 2MB = 512MB */
+    /* boot_pdpt_low[0..3] -> boot_pd[0..3] */
+    movl $boot_pdpt_low, %edi
+    movl $boot_pd + PTE_TABLE, %eax
+    movl $4, %ecx
 1:
     movl %eax, (%edi)
-    movl $0, 4(%edi)                    /* High 32 bits = 0 */
-    addl $0x200000, %eax                /* Next 2MB */
+    addl $4096, %eax
     addl $8, %edi
     decl %ecx
     jnz 1b
 
-    /* Load PML4 into CR3 */
-    movl $pml4, %eax
+    /* boot_pdpt_high[510..511] -> boot_pd[0..1] (image: physical 0-2GB) */
+    movl $boot_pd + PTE_TABLE, %eax
+    movl %eax, boot_pdpt_high + 510 * 8
+    addl $4096, %eax
+    movl %eax, boot_pdpt_high + 511 * 8
+
+    /* boot_pd: 2048 x 2MB pages, physical 0-4GB */
+    movl $boot_pd, %edi
+    movl $PTE_LARGE, %eax
+    movl $2048, %ecx
+2:
+    movl %eax, (%edi)
+    movl $0, 4(%edi)
+    addl $0x200000, %eax
+    addl $8, %edi
+    decl %ecx
+    jnz 2b
+
+    movl $boot_pml4, %eax
     movl %eax, %cr3
 
-    /* Enable PAE in CR4 */
+    /* PAE */
     movl %cr4, %eax
-    orl $0x20, %eax                     /* PAE bit */
+    orl $0x20, %eax
     movl %eax, %cr4
 
-    /* Enable long mode in EFER MSR */
-    movl $0xC0000080, %ecx              /* EFER MSR */
+    /* EFER: long mode + NX (the kernel tables use NX) */
+    movl $0xC0000080, %ecx
     rdmsr
-    orl $0x100, %eax                    /* LME bit */
+    orl $0x900, %eax
     wrmsr
 
-    /* Enable paging in CR0 */
+    /* PG + WP (kernel writes honor R/O user PTEs, for COW) */
     movl %cr0, %eax
-    orl $0x80010000, %eax               /* PG + WP (kernel writes honor R/O user PTEs, for COW) */
+    orl $0x80010000, %eax
     movl %eax, %cr0
 
-    /* Load 64-bit GDT */
     lgdt gdt64_ptr
-
-    /* Jump to 64-bit code - use far jump with absolute address */
     ljmp $0x08, $long_mode_start
 
 .code64
 long_mode_start:
-    /* Set up segment registers */
     movw $0x10, %ax
     movw %ax, %ds
     movw %ax, %es
@@ -113,26 +131,19 @@ long_mode_start:
     movw %ax, %gs
     movw %ax, %ss
 
-    /* Set up 64-bit stack */
-    movabsq $stack_top, %rsp
-
-    /* Pass multiboot2 info pointer in RDI */
-    /* Zero-extend 32-bit pointer to 64-bit (pointer is in low memory) */
+    /* High-half stack, then the high-half entry */
+    movabsq $boot_stack_top, %rsp
     movl multiboot_info_ptr, %edi
-
-    /* Jump to Rust kernel entry point */
     movabsq $_start, %rax
     call *%rax
 
-    /* Should never return, but halt if it does */
-2:
+3:
     hlt
-    jmp 2b
+    jmp 3b
 
 .section .boot_data, "a"
 .align 8
 
-/* Storage for multiboot info pointer */
 multiboot_info_ptr:
     .long 0
 
@@ -145,5 +156,12 @@ gdt64_end:
 .align 4
 gdt64_ptr:
     .word gdt64_end - gdt64 - 1         /* Limit */
-    .long gdt64                         /* Base (32-bit, sufficient for low memory) */
-    .long 0                             /* Padding for 64-bit alignment */
+    .long gdt64                         /* Base (physical, low) */
+    .long 0
+
+/* BSP boot stack (high half; the Rust entry runs on it) */
+.section .bss.boot_stack, "aw", @nobits
+.align 16
+boot_stack_bottom:
+    .skip 32768
+boot_stack_top:

@@ -25,9 +25,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use spin::Mutex;
-
-use crate::task::Tid;
+use crate::sync::spin::Mutex;
 
 // ============================================================================
 // AnonVma
@@ -44,18 +42,19 @@ pub struct AnonVma {
 
 struct AnonVmaInner {
     /// List of VMAs sharing this anon_vma
-    /// Each entry identifies a VMA by (tid, vma_start, vma_end)
+    /// Each entry identifies a VMA by (root, vma_start, vma_end)
     vmas: Vec<AnonVmaChain>,
 }
 
 /// Links a VMA to its anon_vma
 ///
-/// We store task ID and VMA address range rather than pointers to avoid
-/// lifetime issues. During rmap_walk, we look up the actual VMA.
+/// We store the address space's top-level table and the VMA range rather
+/// than pointers to avoid lifetime issues. The entries of an address
+/// space are removed before its tables are freed (exit_mmap, munmap).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnonVmaChain {
-    /// Task ID owning the VMA
-    pub tid: Tid,
+    /// Top-level page table of the address space holding the VMA
+    pub root: u64,
     /// VMA start address (used to locate VMA in task's mm)
     pub vma_start: u64,
     /// VMA end address
@@ -77,15 +76,15 @@ impl AnonVma {
     /// - A VMA is inherited during fork
     ///
     /// # Arguments
-    /// * `tid` - Task ID owning the VMA
+    /// * `root` - Top-level page table of the address space
     /// * `vma_start` - Start address of the VMA
     /// * `vma_end` - End address of the VMA
-    pub fn add_vma(&self, tid: Tid, vma_start: u64, vma_end: u64) {
+    pub fn add_vma(&self, root: u64, vma_start: u64, vma_end: u64) {
         let mut inner = self.inner.lock();
 
         // Don't add duplicates
         let chain = AnonVmaChain {
-            tid,
+            root,
             vma_start,
             vma_end,
         };
@@ -102,26 +101,32 @@ impl AnonVma {
     /// - VMA is replaced (mremap with MREMAP_FIXED)
     ///
     /// # Arguments
-    /// * `tid` - Task ID of the VMA
+    /// * `root` - Top-level page table of the address space
     /// * `vma_start` - Start address of the VMA
-    pub fn remove_vma(&self, tid: Tid, vma_start: u64) {
+    pub fn remove_vma(&self, root: u64, vma_start: u64) {
         let mut inner = self.inner.lock();
         inner
             .vmas
-            .retain(|c| !(c.tid == tid && c.vma_start == vma_start));
+            .retain(|c| !(c.root == root && c.vma_start == vma_start));
+    }
+
+    /// Drop every entry of the address space rooted at `root` (its
+    /// mappings are going away)
+    pub fn remove_root(&self, root: u64) {
+        self.inner.lock().vmas.retain(|c| c.root != root);
     }
 
     /// Update VMA bounds (e.g., after mremap resize)
     ///
     /// # Arguments
-    /// * `tid` - Task ID of the VMA
+    /// * `root` - Top-level page table of the address space
     /// * `old_start` - Original start address
     /// * `new_start` - New start address
     /// * `new_end` - New end address
-    pub fn update_vma(&self, tid: Tid, old_start: u64, new_start: u64, new_end: u64) {
+    pub fn update_vma(&self, root: u64, old_start: u64, new_start: u64, new_end: u64) {
         let mut inner = self.inner.lock();
         for chain in inner.vmas.iter_mut() {
-            if chain.tid == tid && chain.vma_start == old_start {
+            if chain.root == root && chain.vma_start == old_start {
                 chain.vma_start = new_start;
                 chain.vma_end = new_end;
                 break;
@@ -151,12 +156,12 @@ impl AnonVma {
     }
 
     /// Check if a specific VMA is registered
-    pub fn contains_vma(&self, tid: Tid, vma_start: u64) -> bool {
+    pub fn contains_vma(&self, root: u64, vma_start: u64) -> bool {
         let inner = self.inner.lock();
         inner
             .vmas
             .iter()
-            .any(|c| c.tid == tid && c.vma_start == vma_start)
+            .any(|c| c.root == root && c.vma_start == vma_start)
     }
 }
 
@@ -175,6 +180,17 @@ impl Default for AnonVma {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_anon_vma_remove_root() {
+        let av = AnonVma::new();
+        av.add_vma(0x1000, 0x10000, 0x20000);
+        av.add_vma(0x1000, 0x30000, 0x40000);
+        av.add_vma(0x2000, 0x10000, 0x20000);
+        av.remove_root(0x1000);
+        assert_eq!(av.vma_count(), 1);
+        assert!(av.contains_vma(0x2000, 0x10000));
+    }
 
     #[test]
     fn test_anon_vma_new() {
@@ -229,8 +245,8 @@ mod tests {
         let vmas = av.get_vmas();
         assert_eq!(vmas.len(), 2);
 
-        assert!(vmas.iter().any(|c| c.tid == 1 && c.vma_start == 0x1000));
-        assert!(vmas.iter().any(|c| c.tid == 2 && c.vma_start == 0x3000));
+        assert!(vmas.iter().any(|c| c.root == 1 && c.vma_start == 0x1000));
+        assert!(vmas.iter().any(|c| c.root == 2 && c.vma_start == 0x3000));
     }
 
     #[test]

@@ -36,7 +36,7 @@ pub mod serial;
 pub mod termios;
 pub mod tty_dev;
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::chardev::{CharDevice, DeviceError};
 use crate::console::ConsoleDriver;

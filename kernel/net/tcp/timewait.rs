@@ -9,12 +9,12 @@
 //! new SYN beyond its RCV.NXT or with a newer timestamp ends it early so
 //! the tuple can be reused (Linux tcp_timewait_state_process TCP_TW_SYN).
 //!
-//! Locking: `inner` is a `spin::Mutex` leaf like `TcpSock.cb` (thread
+//! Locking: `inner` is a `crate::sync::spin::Mutex` leaf like `TcpSock.cb` (thread
 //! context only; table and timer locks may be taken under it).
 
 use alloc::sync::{Arc, Weak};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use super::cb::{Out, SegIn, TcpCb};
 use super::output::Tuple;
@@ -82,8 +82,9 @@ impl TimeWait {
             }
             g.0.input(s, now, &mut out);
             self.post(&mut g, &out);
+            // Transmitted under the entry lock, in order
+            self.send(&out);
         }
-        self.send(&out);
         true
     }
 
@@ -110,7 +111,7 @@ impl Expire for TimeWait {
             timer::fired(&mut g.1, id);
             g.0.on_timer(now, &mut out);
             self.post(&mut g, &out);
+            self.send(&out);
         }
-        self.send(&out);
     }
 }

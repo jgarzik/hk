@@ -102,15 +102,14 @@ use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
 
 use crate::arch::{Arch, PageTable};
-use crate::fs::{File, FsStruct};
+use crate::fs::FsStruct;
 use crate::ipc::sem::SemUndoList;
-use crate::mm::MmStruct;
 use crate::mm::page_cache::CachedPage;
 use crate::ns::NsProxy;
 use crate::seccomp::SeccompFilter;
 use crate::signal::{SigHand, SignalStruct, TaskSignalState};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 /// Process ID type
 pub type Pid = u64;
@@ -279,7 +278,31 @@ pub fn prepare_creds() -> Cred {
 ///
 /// The new credentials take effect immediately.
 pub fn commit_creds(new: Arc<Cred>) {
+    let old = current_cred().uid;
+    if old != new.uid {
+        flag_nproc_exceeded(new.uid);
+    }
+    nproc_move(old, new.uid);
     percpu::commit_creds_impl(new);
+}
+
+/// execve's RLIMIT_NPROC check (Linux do_execveat_common): EAGAIN if a
+/// real-uid change flagged the task and it is still over; else the flag
+/// is cleared
+pub fn nproc_exec_check() -> Result<(), i32> {
+    let tid = percpu::current_tid();
+    let uid = current_cred().uid;
+    // rlimit() takes TASK_TABLE: decide before locking it
+    let over = nproc_overlimit(nproc_count(uid));
+    let mut table = percpu::TASK_TABLE.lock();
+    let Some(t) = table.tasks.iter_mut().find(|t| t.tid == tid) else {
+        return Ok(());
+    };
+    if t.nproc_exceeded && over {
+        return Err(11); // EAGAIN
+    }
+    t.nproc_exceeded = false;
+    Ok(())
 }
 
 /// Copy credentials for fork/clone
@@ -323,6 +346,8 @@ pub struct CurrentTask {
     /// Seccomp mode (cached for fast syscall-entry check)
     /// 0=DISABLED, 1=STRICT, 2=FILTER
     pub seccomp_mode: u8,
+    /// The task is exiting (Linux PF_EXITING)
+    pub exiting: bool,
 }
 
 impl CurrentTask {
@@ -336,6 +361,7 @@ impl CurrentTask {
             sid: 0,
             cred: Cred::ROOT,
             seccomp_mode: 0, // SECCOMP_MODE_DISABLED
+            exiting: false,
         }
     }
 
@@ -366,6 +392,7 @@ impl CurrentTask {
             sid,
             cred,
             seccomp_mode: 0, // SECCOMP_MODE_DISABLED
+            exiting: false,
         }
     }
 }
@@ -628,20 +655,26 @@ pub type Fd = i32;
 pub const FD_CLOEXEC: u32 = 1;
 
 /// File descriptor table for a process
+///
+/// Files the table lets go of (close, dup2/dup3 over an open descriptor,
+/// an install it refused) are parked in `dead` instead of being dropped
+/// under the table lock: releasing a file can sleep (TCP SO_LINGER, a
+/// socket's release path), so `fdtable::FilesGuard` drops them after
+/// unlocking (Linux file_close_fd_locked under files->file_lock, then
+/// filp_close/fput after spin_unlock).
 pub struct FdTable<F> {
     /// Mapping from fd number to file object
     files: BTreeMap<Fd, Arc<F>>,
     /// Per-fd flags (FD_CLOEXEC, etc.)
     fd_flags: BTreeMap<Fd, u32>,
+    /// Detached files, released once the lock is dropped
+    dead: Vec<Arc<F>>,
 }
 
 impl<F> FdTable<F> {
     /// Create a new empty file descriptor table
     pub fn new() -> Self {
-        Self {
-            files: BTreeMap::new(),
-            fd_flags: BTreeMap::new(),
-        }
+        Self::new_const()
     }
 
     /// Create a new empty file descriptor table (const)
@@ -649,7 +682,19 @@ impl<F> FdTable<F> {
         Self {
             files: BTreeMap::new(),
             fd_flags: BTreeMap::new(),
+            dead: Vec::new(),
         }
+    }
+
+    /// Park `file` for release after the table lock is dropped
+    fn defer(&mut self, file: Arc<F>) {
+        self.dead.push(file);
+    }
+
+    /// The files detached since the lock was taken (`FilesGuard` drops
+    /// them after unlocking)
+    pub fn take_dead(&mut self) -> Vec<Arc<F>> {
+        core::mem::take(&mut self.dead)
     }
 
     /// Allocate the lowest free file descriptor for a file (POSIX).
@@ -668,6 +713,7 @@ impl<F> FdTable<F> {
     /// (stdin=0, stdout=1, stderr=2) where limits don't apply.
     pub fn alloc_at(&mut self, fd: Fd, file: Arc<F>) -> bool {
         if self.files.contains_key(&fd) {
+            self.defer(file);
             return false;
         }
         self.files.insert(fd, file);
@@ -679,10 +725,17 @@ impl<F> FdTable<F> {
         self.files.get(&fd).cloned()
     }
 
-    /// Close a file descriptor
-    pub fn close(&mut self, fd: Fd) -> Option<Arc<F>> {
+    /// Close a file descriptor (false: EBADF); the file is released
+    /// after the table lock is dropped
+    pub fn close(&mut self, fd: Fd) -> bool {
         self.fd_flags.remove(&fd);
-        self.files.remove(&fd)
+        match self.files.remove(&fd) {
+            Some(f) => {
+                self.defer(f);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Check if a file descriptor is valid
@@ -721,9 +774,11 @@ impl<F> FdTable<F> {
     ) -> Result<(), i32> {
         // RLIMIT_NOFILE enforcement
         if (fd as u64) >= nofile {
+            self.defer(file);
             return Err(24); // EMFILE - too many open files
         }
         if self.files.contains_key(&fd) {
+            self.defer(file);
             return Err(9); // EBADF - fd already in use
         }
         self.files.insert(fd, file);
@@ -753,6 +808,7 @@ impl<F> FdTable<F> {
         }
         // RLIMIT_NOFILE enforcement
         if (fd as u64) >= nofile {
+            self.defer(file);
             return Err(24); // EMFILE - too many open files
         }
         self.files.insert(fd, file);
@@ -791,6 +847,7 @@ impl<F> FdTable<F> {
         Self {
             files: self.files.clone(),
             fd_flags: self.fd_flags.clone(),
+            dead: Vec::new(),
         }
     }
 
@@ -925,11 +982,11 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     // =========================================================================
     // Shared resources (Arc for clone-sharing, like Linux pointers)
     // =========================================================================
-    /// Memory descriptor (shared when CLONE_VM)
-    pub mm: Option<Arc<Mutex<MmStruct>>>,
+    /// Address space, one mm_users reference (shared when CLONE_VM)
+    pub mm: Option<crate::mm::MmRef>,
 
     /// File descriptor table (shared when CLONE_FILES)
-    pub files: Option<Arc<Mutex<FdTable<File>>>>,
+    pub files: Option<Arc<fdtable::Files>>,
 
     /// Filesystem context (shared when CLONE_FS)
     pub fs: Option<Arc<FsStruct>>,
@@ -1001,6 +1058,15 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// This is an emulation of the CPU IOPL mechanism, stored per-task.
     #[cfg(target_arch = "x86_64")]
     pub iopl_emul: u8,
+
+    /// A real-uid change left this task over RLIMIT_NPROC: its next
+    /// execve rechecks (Linux PF_NPROC_EXCEEDED)
+    pub nproc_exceeded: bool,
+
+    /// Set at the start of exit (Linux PF_EXITING): what the task still
+    /// releases (its files) does not wait on its behalf, e.g. no
+    /// SO_LINGER wait in TCP close
+    pub exiting: bool,
 
     // =========================================================================
     // Ptrace state (like Linux task_struct ptrace fields)
@@ -1330,28 +1396,23 @@ pub fn capable(cap: u32) -> bool {
 // Per-UID process counting (for RLIMIT_NPROC)
 // =============================================================================
 
-/// Global table tracking process count per UID
-///
-/// Used for RLIMIT_NPROC enforcement. Each process (not thread) increments
-/// the count for its UID on creation and decrements on exit.
-static UID_PROCESS_COUNT: Mutex<BTreeMap<Uid, u64>> = Mutex::new(BTreeMap::new());
+/// Tasks per real uid for RLIMIT_NPROC (Linux ucounts
+/// UCOUNT_RLIMIT_NPROC): every task, threads included, is charged to its
+/// real uid from clone until it is released (reaped, or at exit for a
+/// non-leader thread); a real-uid change moves the charge
+static NPROC: Mutex<BTreeMap<Uid, u64>> = Mutex::new(BTreeMap::new());
 
-/// Increment the process count for a UID
-///
-/// Called when a new process (not thread) is created successfully.
-/// Returns the new count after incrementing.
-pub fn increment_user_process_count(uid: Uid) -> u64 {
-    let mut counts = UID_PROCESS_COUNT.lock();
+/// Charge one task to `uid`; the new count
+pub fn nproc_charge(uid: Uid) -> u64 {
+    let mut counts = NPROC.lock();
     let count = counts.entry(uid).or_insert(0);
     *count += 1;
     *count
 }
 
-/// Decrement the process count for a UID
-///
-/// Called when a process exits. Safe to call even if count is already 0.
-pub fn decrement_user_process_count(uid: Uid) {
-    let mut counts = UID_PROCESS_COUNT.lock();
+/// Release one task's charge to `uid`
+pub fn nproc_uncharge(uid: Uid) {
+    let mut counts = NPROC.lock();
     if let Some(count) = counts.get_mut(&uid) {
         *count = count.saturating_sub(1);
         if *count == 0 {
@@ -1360,12 +1421,75 @@ pub fn decrement_user_process_count(uid: Uid) {
     }
 }
 
-/// Get the current process count for a UID
-///
-/// Used by RLIMIT_NPROC enforcement before creating a new process.
-pub fn get_user_process_count(uid: Uid) -> u64 {
-    let counts = UID_PROCESS_COUNT.lock();
-    counts.get(&uid).copied().unwrap_or(0)
+/// Tasks charged to `uid`
+pub fn nproc_count(uid: Uid) -> u64 {
+    NPROC.lock().get(&uid).copied().unwrap_or(0)
+}
+
+/// `count` tasks exceed the caller's RLIMIT_NPROC (Linux
+/// is_rlimit_overlimit)
+pub fn nproc_overlimit(count: u64) -> bool {
+    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NPROC);
+    limit != crate::rlimit::RLIM_INFINITY && count > limit
+}
+
+/// clone's check (Linux copy_process): over the limit fails unless the
+/// task's user is root or it has CAP_SYS_RESOURCE/CAP_SYS_ADMIN
+pub fn nproc_over(uid: Uid, count: u64) -> bool {
+    nproc_overlimit(count) && uid != 0 && !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN)
+}
+
+/// A pending RLIMIT_NPROC charge for a task being created: uncharged on
+/// drop unless `keep` hands it to the created task
+pub struct NprocCharge {
+    pub uid: Uid,
+    /// Tasks charged to `uid`, this one included
+    pub count: u64,
+    armed: bool,
+}
+
+impl NprocCharge {
+    pub fn new(uid: Uid) -> Self {
+        Self {
+            uid,
+            count: nproc_charge(uid),
+            armed: true,
+        }
+    }
+
+    /// The task exists: it now owns the charge
+    pub fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for NprocCharge {
+    fn drop(&mut self) {
+        if self.armed {
+            nproc_uncharge(self.uid);
+        }
+    }
+}
+
+/// The current task's real uid changes from `old` to `new` (Linux
+/// commit_creds): move its charge
+pub fn nproc_move(old: Uid, new: Uid) {
+    if old != new {
+        nproc_charge(new);
+        nproc_uncharge(old);
+    }
+}
+
+/// Linux set_user / flag_nproc_exceeded: a task whose real uid becomes
+/// `new` is flagged if that user is already over RLIMIT_NPROC (root's
+/// user never is); the flag is cleared otherwise
+fn flag_nproc_exceeded(new: Uid) {
+    let over = new != 0 && nproc_overlimit(nproc_count(new));
+    let tid = percpu::current_tid();
+    let mut table = percpu::TASK_TABLE.lock();
+    if let Some(t) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        t.nproc_exceeded = over;
+    }
 }
 
 // =============================================================================
@@ -1495,10 +1619,14 @@ pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
 
 /// Remove the I/O context for a task (on exit)
 pub fn remove_task_io_context(tid: Tid) {
-    let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.io_context = None;
-    }
+    let _old = {
+        let mut table = percpu::TASK_TABLE.lock();
+        table
+            .tasks
+            .iter_mut()
+            .find(|t| t.tid == tid)
+            .and_then(|t| t.io_context.take())
+    };
 }
 
 /// Clone I/O context for a new task
@@ -1596,14 +1724,6 @@ pub fn set_clear_child_tid(tid: Tid, addr: u64) {
     let mut table = percpu::TASK_TABLE.lock();
     if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
         task.clear_child_tid = addr;
-    }
-}
-
-/// Remove the clear_child_tid pointer for a task (on exit, after processing)
-pub fn remove_clear_child_tid(tid: Tid) {
-    let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.clear_child_tid = 0;
     }
 }
 

@@ -8,14 +8,14 @@
 //!
 //! ## Locking
 //!
-//! `Inet.addr` is a `spin::Mutex` leaf (thread context only); the
+//! `Inet.addr` is a `crate::sync::spin::Mutex` leaf (thread context only); the
 //! IP-level options are atomics.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::error::KernelError;
 use crate::net::inet::fib::RouteType;
@@ -127,6 +127,14 @@ impl Default for Inet {
 impl Inet {
     pub fn get(&self) -> InetAddr {
         *self.addr.lock()
+    }
+
+    /// Set the bound (receive) and source addresses (bind: before the
+    /// port is published in a table, Linux inet_bind order)
+    pub fn set_saddrs(&self, rcv: Ipv4Addr, saddr: Ipv4Addr) {
+        let mut a = self.addr.lock();
+        a.rcv_saddr = rcv;
+        a.saddr = saddr;
     }
 
     pub fn flag(&self, f: u32) -> bool {

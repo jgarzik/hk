@@ -1,6 +1,7 @@
 # Userspace build for hk kernel
 #
 # Builds boot_tester and boot_tester2 (Rust no_std) and creates initramfs.cpio
+# with busybox (tools/busybox-root.sh) and rootfs/ (/etc)
 #
 # Usage:
 #   make              - Build for x86_64 (default)
@@ -33,10 +34,14 @@ boot_tester: $(BOOT_TESTER) $(BOOT_TESTER2)
 $(BOOT_TESTER) $(BOOT_TESTER2): boot_tester/main.rs boot_tester/boot_tester2.rs boot_tester/tests/*.rs syscall/lib.rs syscall/types.rs syscall/$(ARCH).rs Cargo.toml
 	$(CARGO) build --release --target $(TARGET)
 
-$(INITRAMFS): $(BOOT_TESTER) $(BOOT_TESTER2)
+# busybox + /etc (shared with the Linux harness)
+ROOTFS_DEPS = ../tools/busybox-root.sh ../tools/fetch-deb.sh $(shell find rootfs -type f)
+
+$(INITRAMFS): $(BOOT_TESTER) $(BOOT_TESTER2) $(ROOTFS_DEPS)
 	@rm -rf $(INITRD_ROOT)
 	@mkdir -p $(INITRD_ROOT)/bin
 	@mkdir -p $(INITRD_ROOT)/mnt
+	../tools/busybox-root.sh $(INITRD_ROOT) $(ARCH)
 	cp $(BOOT_TESTER) $(INITRD_ROOT)/bin/boot_tester
 	cp $(BOOT_TESTER2) $(INITRD_ROOT)/bin/boot_tester2
 	ln -sf boot_tester $(INITRD_ROOT)/bin/init

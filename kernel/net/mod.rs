@@ -26,7 +26,7 @@
 //! Device core (core/dev.rs: netif_receive_skb, NAPI, softnet/N threads)
 //!         |
 //!         v
-//! Device Driver (driver/e1000.rs; loopback in ns/net.rs)
+//! Device Driver (driver/{virtio_net,e1000}.rs; loopback in ns/net.rs)
 //!         |
 //!         v
 //! Hardware (Intel 82540EM via PCI)
@@ -59,6 +59,8 @@ pub mod devioctl;
 pub mod dgram;
 pub mod driver;
 pub mod ethernet;
+#[path = "core/filter.rs"]
+pub mod filter;
 pub mod icmp;
 pub mod inet;
 pub mod ipv4;
@@ -66,6 +68,7 @@ pub mod msg;
 #[path = "core/neigh.rs"]
 pub mod neigh;
 pub mod netlink;
+pub mod packet;
 pub mod ping;
 pub mod proc;
 pub mod raw;
@@ -98,17 +101,28 @@ pub fn init() {
     // Protocol handlers by EtherType (IPv6 will add 0x86DD here)
     dev::dev_add_pack(EtherType::Ipv4.to_be(), ipv4::ip_rcv);
     dev::dev_add_pack(EtherType::Arp.to_be(), arp::arp_rcv);
+    // AF_PACKET sees frames in both directions
+    dev::dev_add_tap(packet::tap);
 }
 
-/// Name for a new physical device from a template like "eth%d" (unique
-/// in the init namespace, where physical devices register)
-pub fn dev_alloc_name(template: &str) -> alloc::string::String {
-    init_net_ns().dev_alloc_name(template)
+/// A new physical device named from `template` ("eth%d"), with RTNL
+/// held until `register_netdev` lists it (Linux alloc_netdev +
+/// register_netdev: the name is chosen and the device registered under
+/// one RTNL hold, so concurrent probes cannot pick the same name)
+pub fn alloc_netdev(
+    template: &str,
+    mac: [u8; 6],
+    link: device::LinkInfo,
+    ops: &'static dyn device::NetDeviceOps,
+) -> (rtnl::RtnlGuard, Arc<NetDevice>) {
+    let r = rtnl::lock();
+    let name = init_net_ns().dev_alloc_name(template);
+    (r, Arc::new(NetDevice::new(name, mac, link, ops)))
 }
 
-/// Register a physical network device in the init namespace; it starts
-/// down and unconfigured
-pub fn register_netdev(dev: Arc<NetDevice>) {
+/// Register a device from `alloc_netdev` in the init namespace and drop
+/// RTNL; it starts down and unconfigured
+pub fn register_netdev(rtnl: rtnl::RtnlGuard, dev: Arc<NetDevice>) {
     let m = dev.mac();
     crate::printkln!(
         "net: registered {} (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
@@ -121,4 +135,5 @@ pub fn register_netdev(dev: Arc<NetDevice>) {
         m[5]
     );
     init_net_ns().register_device(dev);
+    drop(rtnl);
 }

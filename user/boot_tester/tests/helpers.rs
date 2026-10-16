@@ -60,6 +60,11 @@ pub fn fail_count() -> u32 {
     FAIL_COUNT.load(Ordering::Relaxed)
 }
 
+/// Count failures reported by a child process
+pub fn add_fails(n: u32) {
+    FAIL_COUNT.store(FAIL_COUNT.load(Ordering::Relaxed) + n, Ordering::Relaxed);
+}
+
 /// Print a skip verdict: `NAME:SKIP (reason)`
 pub fn skip(name: &[u8], reason: &[u8]) {
     print(name);

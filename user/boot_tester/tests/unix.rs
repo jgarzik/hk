@@ -149,7 +149,7 @@ fn listener(t: i32, a: &Sun, backlog: i32) -> i32 {
 }
 
 /// sendmsg with one control message (level, type, payload)
-fn send_cmsg(fd: i32, data: &[u8], level: i32, ty: i32, payload: &[u8], flags: i32) -> i64 {
+pub fn send_cmsg(fd: i32, data: &[u8], level: i32, ty: i32, payload: &[u8], flags: i32) -> i64 {
     let mut ctl = [0u8; 1100];
     let clen = 16 + payload.len();
     ctl[..8].copy_from_slice(&(clen as u64).to_ne_bytes());
@@ -164,7 +164,7 @@ fn send_cmsg(fd: i32, data: &[u8], level: i32, ty: i32, payload: &[u8], flags: i
 }
 
 /// Send `data` with SCM_RIGHTS `fds`
-fn send_fds(fd: i32, data: &[u8], fds: &[i32]) -> i64 {
+pub fn send_fds(fd: i32, data: &[u8], fds: &[i32]) -> i64 {
     let mut p = [0u8; 1024];
     for (i, f) in fds.iter().enumerate() {
         p[i * 4..i * 4 + 4].copy_from_slice(&f.to_ne_bytes());
@@ -174,7 +174,7 @@ fn send_fds(fd: i32, data: &[u8], fds: &[i32]) -> i64 {
 
 /// First fd of an SCM_RIGHTS message in `ctl[..len]` (-1 if none) and
 /// the number of fds
-fn got_fds(ctl: &[u8], len: usize) -> (i32, usize) {
+pub fn got_fds(ctl: &[u8], len: usize) -> (i32, usize) {
     match cmsg_find(ctl, len, SOL_SOCKET, SCM_RIGHTS) {
         Some(d) if d.len() >= 4 => (i32::from_ne_bytes(d[..4].try_into().unwrap()), d.len() / 4),
         _ => (-1, 0),

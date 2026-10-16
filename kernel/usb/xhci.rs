@@ -13,7 +13,7 @@ use core::any::Any;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 use crate::arch::{CurrentArch, FrameAlloc, IoremapOps, phys_to_virt};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
@@ -157,7 +157,7 @@ pub fn usb_configure_endpoints(
 
 /// RAII guard that manages USB_OUTPUT_ACTIVE flag alongside the mutex guard
 struct UsbControllerGuard {
-    guard: spin::MutexGuard<'static, Option<XhciController>>,
+    guard: crate::sync::spin::MutexGuard<'static, Option<XhciController>>,
 }
 
 impl core::ops::Deref for UsbControllerGuard {

@@ -181,7 +181,7 @@ pub fn create_ramdisk_from_data(minor: u16, data: &[u8]) -> Result<Arc<BlockDevi
         unsafe {
             core::ptr::copy_nonoverlapping(
                 data.as_ptr().add(src_offset),
-                page.frame as *mut u8,
+                crate::arch::phys_to_virt(page.frame),
                 copy_len,
             );
         }

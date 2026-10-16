@@ -20,8 +20,8 @@ use alloc::vec::Vec;
 use crate::error::KernelError;
 use crate::fs::file::seek;
 use crate::fs::{File, Inode};
+use crate::sync::spin::Mutex;
 use crate::task::percpu::current_pid;
-use spin::Mutex;
 
 // =============================================================================
 // Lock type constants (Linux ABI)

@@ -41,6 +41,16 @@ impl PriorityRunQueue {
         }
     }
 
+    /// Make the queue for `priority` hold `n` tasks without growing, so
+    /// `enqueue` from an IRQ-context wakeup never allocates (thread
+    /// context)
+    pub fn reserve(&mut self, priority: Priority, n: usize) {
+        let q = &mut self.queues[priority as usize];
+        if q.capacity() < n {
+            q.reserve(n - q.len());
+        }
+    }
+
     /// Add a task to the run queue at the specified priority
     pub fn enqueue(&mut self, tid: Tid, priority: Priority) {
         let prio = priority as usize;

@@ -406,7 +406,7 @@ impl Default for PosixTimerRegistry {
 // Per-task POSIX timer storage
 // =============================================================================
 
-use spin::Mutex;
+use crate::sync::spin::Mutex;
 
 /// Global table mapping TID -> PosixTimerRegistry
 static TASK_POSIX_TIMERS: Mutex<BTreeMap<Tid, PosixTimerRegistry>> = Mutex::new(BTreeMap::new());
@@ -470,6 +470,14 @@ pub fn create_posix_timer(
 pub fn get_posix_timer(tid: Tid, timer_id: TimerT) -> Option<Arc<PosixTimer>> {
     let table = TASK_POSIX_TIMERS.lock();
     table.get(&tid).and_then(|reg| reg.get(timer_id))
+}
+
+/// A timer_create timer of `tid` (negative ids are internal: ITIMER_REAL)
+fn user_timer(tid: Tid, timer_id: TimerT) -> Option<Arc<PosixTimer>> {
+    if timer_id < 0 {
+        return None;
+    }
+    get_posix_timer(tid, timer_id)
 }
 
 /// Delete a POSIX timer
@@ -573,7 +581,7 @@ pub fn sys_timer_settime(timerid: TimerT, flags: i32, new_value: u64, old_value:
     }
 
     // Get the timer
-    let timer = match get_posix_timer(tid, timerid) {
+    let timer = match user_timer(tid, timerid) {
         Some(t) => t,
         None => return -22, // EINVAL - timer not found
     };
@@ -614,7 +622,7 @@ pub fn sys_timer_gettime(timerid: TimerT, curr_value: u64) -> i64 {
     let tid = current_tid();
 
     // Get the timer
-    let timer = match get_posix_timer(tid, timerid) {
+    let timer = match user_timer(tid, timerid) {
         Some(t) => t,
         None => return -22, // EINVAL - timer not found
     };
@@ -645,7 +653,7 @@ pub fn sys_timer_getoverrun(timerid: TimerT) -> i64 {
     let tid = current_tid();
 
     // Get the timer
-    let timer = match get_posix_timer(tid, timerid) {
+    let timer = match user_timer(tid, timerid) {
         Some(t) => t,
         None => return -22, // EINVAL - timer not found
     };
@@ -663,8 +671,150 @@ pub fn sys_timer_getoverrun(timerid: TimerT) -> i64 {
 pub fn sys_timer_delete(timerid: TimerT) -> i64 {
     let tid = current_tid();
 
+    if timerid < 0 {
+        return -22; // EINVAL: not a timer_create id
+    }
     match delete_posix_timer(tid, timerid) {
         Ok(()) => 0,
         Err(e) => e as i64,
     }
+}
+
+// =============================================================================
+// Interval timers: setitimer/getitimer/alarm (Linux kernel/time/itimer.c)
+// =============================================================================
+//
+// ITIMER_REAL is a CLOCK_MONOTONIC timer sending SIGALRM, kept in the
+// owner's timer registry under an id user timer ids never take; alarm()
+// is ITIMER_REAL in whole seconds. ITIMER_VIRTUAL and ITIMER_PROF (CPU
+// time) are not implemented (BUGS.md).
+
+/// ITIMER_REAL's slot in the owner's registry (user timer ids are >= 0)
+const ITIMER_REAL_ID: TimerT = -1;
+
+const ITIMER_REAL: i32 = 0;
+const ITIMER_VIRTUAL: i32 = 1;
+const ITIMER_PROF: i32 = 2;
+
+/// struct itimerval
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ITimerVal {
+    it_interval: crate::time_syscall::Timeval,
+    it_value: crate::time_syscall::Timeval,
+}
+
+/// The current task's ITIMER_REAL timer, created on first use
+fn itimer_real() -> Arc<PosixTimer> {
+    let tid = current_tid();
+    let mut table = TASK_POSIX_TIMERS.lock();
+    let reg = table.entry(tid).or_default();
+    if let Some(t) = reg.get(ITIMER_REAL_ID) {
+        return t;
+    }
+    let t = PosixTimer::new(ITIMER_REAL_ID, 1, tid, SigEvent::default());
+    reg.add(Arc::clone(&t));
+    t
+}
+
+/// timeval -> timespec; None if invalid (negative, usec >= 1e6)
+fn tv_to_ts(tv: crate::time_syscall::Timeval) -> Option<crate::time_syscall::LinuxTimespec> {
+    (tv.tv_sec >= 0 && (0..1_000_000).contains(&tv.tv_usec)).then(|| {
+        crate::time_syscall::LinuxTimespec {
+            tv_sec: tv.tv_sec,
+            tv_nsec: tv.tv_usec * 1000,
+        }
+    })
+}
+
+/// timespec -> timeval, rounding up a partial microsecond (Linux
+/// rounds remaining time so a live timer never reads as 0)
+fn ts_to_tv(ts: crate::time_syscall::LinuxTimespec) -> crate::time_syscall::Timeval {
+    let mut tv = crate::time_syscall::Timeval {
+        tv_sec: ts.tv_sec,
+        tv_usec: (ts.tv_nsec + 999) / 1000,
+    };
+    if tv.tv_usec >= 1_000_000 {
+        tv.tv_sec += 1;
+        tv.tv_usec -= 1_000_000;
+    }
+    tv
+}
+
+fn to_itimerval(s: ITimerSpec) -> ITimerVal {
+    ITimerVal {
+        it_interval: ts_to_tv(s.it_interval),
+        it_value: ts_to_tv(s.it_value),
+    }
+}
+
+/// Validate the timer kind: only ITIMER_REAL exists here
+fn which_ok(which: i32) -> Result<(), i64> {
+    match which {
+        ITIMER_REAL => Ok(()),
+        ITIMER_VIRTUAL | ITIMER_PROF => Err(-22), // not implemented
+        _ => Err(-22),
+    }
+}
+
+/// getitimer(which, curr_value)
+pub fn sys_getitimer(which: i32, curr: u64) -> i64 {
+    if let Err(e) = which_ok(which) {
+        return e;
+    }
+    let v = to_itimerval(itimer_real().gettime());
+    if put_user::<Uaccess, ITimerVal>(curr, v).is_err() {
+        return -14;
+    }
+    0
+}
+
+/// setitimer(which, new_value, old_value); a NULL new value disarms
+/// (Linux accepts it for compatibility)
+pub fn sys_setitimer(which: i32, new: u64, old: u64) -> i64 {
+    if let Err(e) = which_ok(which) {
+        return e;
+    }
+    let nv = if new == 0 {
+        ITimerVal::default()
+    } else {
+        match get_user::<Uaccess, ITimerVal>(new) {
+            Ok(v) => v,
+            Err(_) => return -14,
+        }
+    };
+    let (Some(interval), Some(value)) = (tv_to_ts(nv.it_interval), tv_to_ts(nv.it_value)) else {
+        return -22;
+    };
+    let prev = itimer_real().settime(
+        &ITimerSpec {
+            it_interval: interval,
+            it_value: value,
+        },
+        0,
+    );
+    if old != 0 && put_user::<Uaccess, ITimerVal>(old, to_itimerval(prev)).is_err() {
+        return -14;
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+/// alarm(seconds): arm ITIMER_REAL once, returning the seconds left on
+/// the previous alarm, rounded to the nearest second but at least 1 if
+/// one was pending (Linux alarm_setitimer)
+pub fn sys_alarm(seconds: u32) -> i64 {
+    let spec = ITimerSpec {
+        it_interval: crate::time_syscall::LinuxTimespec::default(),
+        it_value: crate::time_syscall::LinuxTimespec {
+            tv_sec: seconds as i64,
+            tv_nsec: 0,
+        },
+    };
+    let prev = to_itimerval(itimer_real().settime(&spec, 0)).it_value;
+    let mut secs = prev.tv_sec;
+    if (secs == 0 && prev.tv_usec != 0) || prev.tv_usec >= 500_000 {
+        secs += 1;
+    }
+    secs
 }

@@ -12,6 +12,10 @@ KERNEL_ARM = target/$(TARGET_ARM)/release/kernel
 VFAT_IMAGE = target/vfat.img
 VFAT_SIZE_KB = 1024
 
+# LOCKDEP=1: build with lockdep-lite (spin-lock tracking, lock order and
+# sleep-in-atomic reports as LOCKDEP:FAIL), e.g. make check LOCKDEP=1
+KERNEL_FEATURES = $(if $(LOCKDEP),--features lockdep)
+
 # Machine-specific ISO configuration
 # Usage: make iso MACHINE=dell
 MACHINE ?=
@@ -39,6 +43,7 @@ help:
 	@echo ""
 	@echo "  make test     - Run cargo tests (host)"
 	@echo "  make check    - Boot kernel in QEMU, verify tests pass"
+	@echo "  make check LOCKDEP=1 - Same with lockdep-lite (LOCKDEP:FAIL reports)"
 	@echo ""
 	@echo "  make build-arm - Build ARM64 kernel"
 	@echo "  make run-arm   - Run ARM64 kernel in QEMU"
@@ -54,10 +59,10 @@ help:
 	@echo "  make info     - Show kernel binary info"
 
 build:
-	cargo build -p hk-kernel --target $(TARGET) --release
+	cargo build -p hk-kernel --target $(TARGET) --release $(KERNEL_FEATURES)
 
 debug:
-	cargo build -p hk-kernel --target $(TARGET)
+	cargo build -p hk-kernel --target $(TARGET) $(KERNEL_FEATURES)
 
 user:
 	$(MAKE) -C user
@@ -137,10 +142,14 @@ test:
 	cargo test -p hk-kernel
 
 # QEMU boot test timeout in seconds (TCG on CI hosts without KVM is slow)
-BOOT_TEST_TIMEOUT ?= 90
+# Bounds hangs only; the full suite takes ~1 min locally, longer on CI
+BOOT_TEST_TIMEOUT ?= 600
 
 # QEMU -cpu override for the boot tests (see run-qemu.sh), e.g. QEMU_CPU=max
 export QEMU_CPU
+
+# hk boot test NIC (see run-qemu.sh): virtio (default) or e1000
+export NIC
 
 check: iso
 	@rm -f /tmp/qemu_serial.log
@@ -178,7 +187,7 @@ user-arm:
 	$(MAKE) -C user ARCH=aarch64
 
 build-arm: user-arm
-	cargo build -p hk-kernel --target $(TARGET_ARM) --release
+	cargo build -p hk-kernel --target $(TARGET_ARM) --release $(KERNEL_FEATURES)
 
 run-arm: build-arm vfat-image
 	./run-qemu.sh --arch arm

@@ -34,10 +34,10 @@
 //! - Linux pipe(7) man page
 //! - Linux fs/pipe.c
 
+use crate::sync::spin::Mutex;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
-use spin::Mutex;
 
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags};
@@ -295,7 +295,7 @@ impl PipeInner {
                 // Get page frame and write data
                 if let Some(ref page) = buf.page {
                     let offset = (buf.offset + buf.len) as usize;
-                    let dst_addr = page.frame as usize + offset;
+                    let dst_addr = crate::arch::phys_to_virt(page.frame) as usize + offset;
                     unsafe {
                         let dst = dst_addr as *mut u8;
                         core::ptr::copy_nonoverlapping(data.as_ptr(), dst, to_write);
@@ -320,7 +320,7 @@ impl PipeInner {
 
             // Copy data to the new page
             unsafe {
-                let dst = page.frame as *mut u8;
+                let dst = crate::arch::phys_to_virt(page.frame);
                 core::ptr::copy_nonoverlapping(data[written..].as_ptr(), dst, to_write);
             }
 
@@ -368,7 +368,8 @@ impl PipeInner {
 
             // Copy data from page to user buffer
             if let Some(ref page) = pipe_buf.page {
-                let src_addr = page.frame as usize + pipe_buf.offset as usize;
+                let src_addr =
+                    crate::arch::phys_to_virt(page.frame) as usize + pipe_buf.offset as usize;
                 unsafe {
                     let src = src_addr as *const u8;
                     core::ptr::copy_nonoverlapping(src, buf[read..].as_mut_ptr(), to_read);

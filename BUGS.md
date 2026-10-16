@@ -53,6 +53,63 @@ ping_group_range (hk has no supplementary groups). /proc/net/raw and
 UDP_CORK/MSG_MORE are not implemented (each send is one datagram) and
 SO_PEEK_OFF is EOPNOTSUPP.
 
+## Memory management gaps
+
+**Location**: `kernel/mm/`, `kernel/arch/*/paging.rs`, `kernel/ipc/shm.rs`
+
+Address spaces are reference counted and torn down like Linux
+(doc/MEMORY.md, Address space lifetime); what is still missing:
+
+- Page descriptors are never initialized (`init_page_descriptors` has
+  no caller), so rmap, the LRU lists and swap-out are inert. Before
+  enabling them: `set_anon_mapping` stores an AnonVma pointer without
+  taking a reference while `clear_mapping` drops one, swap-out frees a
+  frame even when the rmap walk missed a mapping, and a swap-cache hit
+  maps the cached frame without taking a reference for the PTE.
+- fork copies neither 2MB (THP) mappings nor swap PTEs (the child sees
+  zero pages there) and turns every writable PTE copy-on-write, MAP_SHARED
+  mappings included (writes after fork are not shared).
+- SysV shm: fork and exit do not update `shm_nattch`; a segment removed
+  with IPC_RMID while attached by a process that exits without shmdt is
+  never destroyed (its own reference on the frames is never dropped).
+- Exited non-leader threads stay in the task table as zombies (Linux
+  reaps them at once); their kernel stacks and memory are freed.
+- munmap keeps page-table pages that become empty (freed at exit).
+- x86 has no user TLB shootdown, and the page-fault path installs PTEs
+  after dropping the mm lock (doc/LOCKING.md section 9).
+
+## No dynamically linked executables
+
+**Location**: `kernel/task/exec.rs` (`do_execve`)
+
+A PT_INTERP program interpreter is never loaded: exec of a dynamic
+executable fails with ENOEXEC (ENOENT if the interpreter does not
+exist, as on Linux). Only static and static-pie programs run.
+
+## Interval timers: ITIMER_VIRTUAL and ITIMER_PROF
+
+**Location**: `kernel/posix_timer.rs` (`sys_setitimer`)
+
+Only ITIMER_REAL (and alarm) exist; the CPU-time timers return EINVAL
+(Linux supports them). rseq is ENOSYS (glibc runs without it).
+
+## AF_PACKET gaps
+
+**Location**: `kernel/net/packet/`
+
+Not implemented: SOCK_PACKET (ESOCKTNOSUPPORT), the mmap rings
+(PACKET_RX_RING/TX_RING, PACKET_VERSION), PACKET_FANOUT,
+PACKET_VNET_HDR, PACKET_QDISC_BYPASS and the other SOL_PACKET options
+(ENOPROTOOPT; Linux accepts them), SO_ATTACH_BPF, SO_GET_FILTER, and
+socket filters on non-packet sockets (ENOPROTOOPT; Linux runs them on
+every socket). A bound socket is not told (ENETDOWN) when its device
+goes down later, only when it binds to a down device. Memberships only
+count promiscuity/allmulti users (the drivers have no promiscuous or
+multicast filtering; set_promisc is a no-op on e1000 and virtio-net,
+which has no control queue: QEMU then delivers all frames).
+PACKET_AUXDATA reports TP_STATUS_CSUM_VALID only for frames received on
+lo (hk has no checksum offload states).
+
 ## AF_UNIX gaps
 
 **Location**: `kernel/net/unix/`
@@ -94,13 +151,26 @@ chmod/chown do not update ctime; ETXTBSY is not enforced.
 
 **Location**: `kernel/sync` (Mutex, RwSem), various
 
-Only `i_rwsem`, `s_vfs_rename_mutex` and `f_pos_lock` are sleeping locks
-so far. Linux rw_semaphores/mutexes still modeled as `spin` locks include
-the mmap lock (`MmStruct`), the mount namespace/topology locks
-(namespace_sem, `Mount` RwLocks), `s_umount` (absent), the fd table lock,
-pipe locks and RTNL: their holders must not sleep. There are no
+Sleeping locks so far: `i_rwsem`, `s_vfs_rename_mutex`, `f_pos_lock`,
+RTNL, `TcpSock.rd` and the unix socket `bindlock`/`iolock`. Linux
+rw_semaphores/mutexes still modeled as `spin` locks include the mmap
+lock (`Mm::lock`), the mount namespace/topology locks (namespace_sem,
+`Mount` RwLocks), `s_umount` (absent) and pipe locks: their holders must
+not sleep (`make check LOCKDEP=1` reports one that does). There are no
 `_killable`/`_interruptible`/`try` variants of the sleeping locks yet
 (no callers need them).
+
+## Pipes leak their file operations
+
+**Location**: `kernel/pipe.rs` (`create_pipe`)
+
+`File.f_op` is a `&'static dyn FileOps`, so `create_pipe` `Box::leak`s
+the read and write ops of every pipe, and with them the `Arc<Pipe>`
+they hold: each pipe's state stays allocated forever (about 600 bytes of
+kernel heap). A loop creating pipes exhausts the heap within a few
+thousand (found by the network stress test, which therefore passes
+socket pairs, not pipes, over SCM_RIGHTS). Fix: owned file ops
+(`Arc<dyn FileOps>`) or per-file private data, as Linux does.
 
 ## Mount flag gaps
 
@@ -171,22 +241,20 @@ panic handler then dropped formatted messages, so ELR/FAR were lost; it
 prints them now. Not reproduced in 90 further runs (sequential and 8 in
 parallel). Next occurrence: capture the Message line.
 
-## Unlinked ramfs files keep their page-cache pages
+## ramfs has no size limit
 
-**Location**: `kernel/mm/page_cache.rs` (`invalidate_file` has no
-caller), `kernel/fs/ramfs.rs`
+**Location**: `kernel/fs/ramfs.rs`, `kernel/mm/page_cache.rs`,
+`kernel/frame_alloc.rs`
 
-The page cache holds at most 1024 pages, and ramfs pages are
-unevictable. When the last reference to an unlinked ramfs file goes
-away its pages are not released (only truncate frees them), so writing
-and deleting a few MB of /tmp files makes later writes fail with EIO.
-Tests truncate big files before unlinking them.
-
-## Partial munmap of an anonymous mapping drops the rest of it
-
-mmap(2 pages) then munmap(second page): mincore on the still-mapped
-first page returns ENOMEM (no VMA), where Linux returns 0. Seen while
-writing the uaccess boot tests; not investigated.
+ramfs (the root filesystem and every ramfs mount) is bounded only by
+memory, for every user: writes fail with ENOSPC once free frames reach
+the kernel's reserve (1/32 of RAM, at least 4MB) or the kernel heap is
+down to 2MB, and the memory comes back when the last link and the last
+open reference of a file are gone (or on truncate). Linux's rootfs is a
+tmpfs limited to half of RAM by default; tmpfs with `size=`/`nr_inodes=`
+limits (and per-user accounting) comes with the filesystem chunk.
+Reads of holes need a zeroed page each and can fail with ENOMEM when
+memory is at the reserve (Linux maps the shared zero page).
 
 ## The kernel heap is a fixed 16MB region
 
@@ -200,7 +268,11 @@ frame allocator starting at its end. Both arches panic at boot if the
 heap would overlap the kernel image or boot data. The heap never grows
 and does not draw on the frame allocator, so heap-heavy workloads hit
 allocation failure long before RAM runs out; to be fixed with the
-allocator redesign (heap backed by frames, slab caches).
+allocator redesign (heap backed by frames, slab caches). By the time the
+boot tests reach the network stress test only a few MB are free on x86:
+every TCP TIME_WAIT entry keeps a full control block (about 2 KB) for
+60 s, so a burst of a thousand short connections can starve a later 2 MB
+allocation (busybox exec); the stress test bounds its connections.
 
 ## Heap Corruption in Arc<T> Struct Fields
 

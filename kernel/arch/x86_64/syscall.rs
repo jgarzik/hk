@@ -60,6 +60,7 @@ pub const SYS_CLOSE: u64 = 3;
 pub const SYS_STAT: u64 = 4;
 /// fstat(fd, statbuf)
 pub const SYS_FSTAT: u64 = 5;
+pub const SYS_NEWFSTATAT: u64 = 262;
 /// lstat(pathname, statbuf) - like stat but don't follow symlinks
 pub const SYS_LSTAT: u64 = 6;
 /// lseek(fd, offset, whence)
@@ -189,6 +190,9 @@ pub const SYS_IO_URING_REGISTER: u64 = 427;
 
 // POSIX timer syscalls (Section 6.2)
 /// timer_create(clockid, sigevent, timerid)
+pub const SYS_GETITIMER: u64 = 36;
+pub const SYS_ALARM: u64 = 37;
+pub const SYS_SETITIMER: u64 = 38;
 pub const SYS_TIMER_CREATE: u64 = 222;
 /// timer_settime(timerid, flags, new_value, old_value)
 pub const SYS_TIMER_SETTIME: u64 = 223;
@@ -1396,6 +1400,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_TRUNCATE => sys_truncate(arg0, arg1 as i64) as u64,
         SYS_STAT => sys_stat(arg0, arg1) as u64,
         SYS_FSTAT => sys_fstat(arg0 as i32, arg1) as u64,
+        SYS_NEWFSTATAT => crate::fs::stat::sys_fstatat(arg0 as i32, arg1, arg2, arg3 as i32) as u64,
         SYS_STATFS => sys_statfs(arg0, arg1) as u64,
         SYS_FSTATFS => sys_fstatfs(arg0 as i32, arg1) as u64,
         SYS_STATX => sys_statx(arg0 as i32, arg1, arg2 as i32, arg3 as u32, arg4) as u64,
@@ -1477,6 +1482,9 @@ pub fn x86_64_syscall_dispatch(
         }
 
         // POSIX timer syscalls (Section 6.2)
+        SYS_GETITIMER => crate::posix_timer::sys_getitimer(arg0 as i32, arg1) as u64,
+        SYS_SETITIMER => crate::posix_timer::sys_setitimer(arg0 as i32, arg1, arg2) as u64,
+        SYS_ALARM => crate::posix_timer::sys_alarm(arg0 as u32) as u64,
         SYS_TIMER_CREATE => crate::posix_timer::sys_timer_create(arg0 as i32, arg1, arg2) as u64,
         SYS_TIMER_SETTIME => {
             crate::posix_timer::sys_timer_settime(arg0 as i32, arg1 as i32, arg2, arg3) as u64

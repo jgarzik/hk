@@ -43,7 +43,7 @@ const DEFAULT_ATTR: u8 = 0x07;
 ///
 /// Returns true if VGA buffer is present and responsive.
 fn probe_vga_buffer() -> bool {
-    let p = VGA_BUFFER_PHYS as *mut u16;
+    let p = super::paging::phys_to_virt(VGA_BUFFER_PHYS) as *mut u16;
     unsafe {
         // Save original values
         let saved1 = core::ptr::read_volatile(p);
@@ -71,7 +71,7 @@ fn probe_vga_buffer() -> bool {
 
 /// VGA text console state
 struct VgaConState {
-    /// Virtual address of VGA buffer (same as physical in identity-mapped region)
+    /// Virtual address of VGA buffer (direct map, like Linux VGA_MAP_MEM)
     buffer: *mut u16,
     /// Current cursor column (0-79)
     cursor_x: usize,
@@ -101,8 +101,7 @@ impl VgaConState {
 
     /// Initialize the VGA console state
     fn init(&mut self) {
-        // VGA buffer at 0xB8000 is identity-mapped in our kernel
-        self.buffer = VGA_BUFFER_PHYS as *mut u16;
+        self.buffer = super::paging::phys_to_virt(VGA_BUFFER_PHYS) as *mut u16;
         self.attribute = DEFAULT_ATTR;
 
         // Probe VGA buffer - this also "wakes up" VGA hardware that may
