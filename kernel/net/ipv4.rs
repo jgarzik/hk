@@ -505,7 +505,9 @@ impl IpParams {
 /// and send it along `rt`, fragmenting a datagram larger than the MTU
 /// when the socket's PMTU mode allows (else EMSGSIZE). Never delivers
 /// synchronously: `lo` queues to the receive backlog. Callers may hold a
-/// socket lock (lock order: socket -> FIB -> neighbour -> device TX).
+/// socket lock (TCP always does: it transmits under `TcpSock.cb`; lock
+/// order: socket -> FIB -> neighbour -> device TX -> backlog), so
+/// nothing here may take a socket lock or flush the backlog.
 pub fn ip_send_rt(
     net: &NetNamespace,
     rt: &route::Rtable,

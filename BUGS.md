@@ -151,13 +151,26 @@ chmod/chown do not update ctime; ETXTBSY is not enforced.
 
 **Location**: `kernel/sync` (Mutex, RwSem), various
 
-Only `i_rwsem`, `s_vfs_rename_mutex` and `f_pos_lock` are sleeping locks
-so far. Linux rw_semaphores/mutexes still modeled as `spin` locks include
-the mmap lock (`Mm::lock`), the mount namespace/topology locks
-(namespace_sem, `Mount` RwLocks), `s_umount` (absent), the fd table lock,
-pipe locks and RTNL: their holders must not sleep. There are no
+Sleeping locks so far: `i_rwsem`, `s_vfs_rename_mutex`, `f_pos_lock`,
+RTNL, `TcpSock.rd` and the unix socket `bindlock`/`iolock`. Linux
+rw_semaphores/mutexes still modeled as `spin` locks include the mmap
+lock (`Mm::lock`), the mount namespace/topology locks (namespace_sem,
+`Mount` RwLocks), `s_umount` (absent) and pipe locks: their holders must
+not sleep (`make check LOCKDEP=1` reports one that does). There are no
 `_killable`/`_interruptible`/`try` variants of the sleeping locks yet
 (no callers need them).
+
+## Pipes leak their file operations
+
+**Location**: `kernel/pipe.rs` (`create_pipe`)
+
+`File.f_op` is a `&'static dyn FileOps`, so `create_pipe` `Box::leak`s
+the read and write ops of every pipe, and with them the `Arc<Pipe>`
+they hold: each pipe's state stays allocated forever (about 600 bytes of
+kernel heap). A loop creating pipes exhausts the heap within a few
+thousand (found by the network stress test, which therefore passes
+socket pairs, not pipes, over SCM_RIGHTS). Fix: owned file ops
+(`Arc<dyn FileOps>`) or per-file private data, as Linux does.
 
 ## Mount flag gaps
 
@@ -255,7 +268,11 @@ frame allocator starting at its end. Both arches panic at boot if the
 heap would overlap the kernel image or boot data. The heap never grows
 and does not draw on the frame allocator, so heap-heavy workloads hit
 allocation failure long before RAM runs out; to be fixed with the
-allocator redesign (heap backed by frames, slab caches).
+allocator redesign (heap backed by frames, slab caches). By the time the
+boot tests reach the network stress test only a few MB are free on x86:
+every TCP TIME_WAIT entry keeps a full control block (about 2 KB) for
+60 s, so a burst of a thousand short connections can starve a later 2 MB
+allocation (busybox exec); the stress test bounds its connections.
 
 ## Heap Corruption in Arc<T> Struct Fields
 

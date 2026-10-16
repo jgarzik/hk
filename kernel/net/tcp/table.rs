@@ -17,8 +17,9 @@
 //! `crate::sync::spin::RwLock`s, thread context only, reached only through the
 //! methods below (no guard escapes; RCU-ready). Order: `bhash` ->
 //! `ehash` (connect picks a port and inserts its tuple atomically);
-//! `lhash` is a leaf. Candidate owners' `Inet.addr` and `Sock` flags are
-//! read under `bhash`; socket locks (`TcpSock.cb`) are never taken
+//! `lhash` -> `Inet.addr` (listener lookup scores the candidates' bound
+//! address). Candidate owners' `Inet.addr` and `Sock` flags are read
+//! under `bhash` too; socket locks (`TcpSock.cb`) are never taken
 //! under a table lock (callers may hold their own socket lock).
 
 use alloc::collections::BTreeMap;
