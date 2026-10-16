@@ -492,3 +492,38 @@ pub fn pagefault_out_of_memory() -> ! {
     }
     crate::task::proc::do_exit(SIGKILL as i32)
 }
+
+/// Before a write into another process's private page by the kernel
+/// (ptrace POKEDATA, process_vm_writev; Linux FOLL_WRITE): give it its
+/// own copy if it is still shared copy-on-write, so the write cannot
+/// reach the process it is shared with. The caller checked that the
+/// VMA is writable and private, and holds the target's mm lock; the new
+/// page joins the VMA's rmap (`anon_vma`) like a write fault's copy.
+pub fn unshare_for_write(
+    pgd: u64,
+    addr: u64,
+    anon_vma: Option<Arc<AnonVma>>,
+) -> Result<(), VmFault> {
+    let Some(ptep) = paging::pte_ptr(pgd, addr) else {
+        return Ok(()); // not mapped, or a 2MB page (never shared)
+    };
+    let pte = get_pte(ptep);
+    if !paging::pte_present(pte) || paging::pte_write(pte) {
+        return Ok(());
+    }
+    let page = addr & !(PAGE_SIZE - 1);
+    let area = Area {
+        start: page,
+        end: page + PAGE_SIZE,
+        prot: PROT_READ | PROT_WRITE,
+        flags: 0,
+        shared: false,
+        anon: anon_vma.is_some(),
+        thp: false,
+        offset: 0,
+        file: None,
+        anon_vma,
+        shmem: None,
+    };
+    do_wp_page(ptep, pte, addr, &area)
+}

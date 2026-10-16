@@ -85,11 +85,18 @@ Address spaces are reference counted and torn down like Linux
 - MADV_REMOVE of a file mapping is EOPNOTSUPP (no filesystem punches
   holes); shmdt needs the address an attachment starts at (Linux also
   finds a piece moved by mremap); SHM_EXEC is ignored.
+- Remote writes (ptrace POKEDATA/POKETEXT, process_vm_writev) need a
+  writable VMA: POKE into read-only text fails with EIO (Linux
+  FOLL_FORCE writes a private copy, e.g. for breakpoints), and a page
+  not yet faulted in is not faulted (EIO / short write).
 - mremap: if a page table cannot be allocated while moving pages, the
   page is lost (Linux fails with ENOMEM first); a 2MB page whose split
   fails keeps its protection under a partial mprotect; shmat checks
   RLIMIT_AS before SHM_REMAP unmaps the old range, and an address that
   SHM_RND rounds to 0 is EPERM (Linux picks an address).
+- A remote write (ptrace, process_vm_writev) that gives the target its
+  own copy of a copy-on-write page flushes only this CPU's TLB (no x86
+  shootdown, see above).
 - Exited non-leader threads stay in the task table as zombies (Linux
   reaps them at once); their kernel stacks and memory are freed.
 - munmap keeps page-table pages that become empty (freed at exit).

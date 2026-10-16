@@ -111,7 +111,8 @@ pub fn access_remote_vm_write(
         // Check VMA if present (for permission checking)
         // Note: Some mappings (like initial stack) may not have VMAs,
         // so we only check permissions if a VMA exists
-        if let Some(vma) = mm.find_vma(current_addr)
+        let vma = mm.find_vma(current_addr);
+        if let Some(vma) = vma
             && vma.prot & PROT_WRITE == 0
         {
             if total_written > 0 {
@@ -119,9 +120,27 @@ pub fn access_remote_vm_write(
             }
             return Err(KernelError::NotPermitted);
         }
+        // A private page still shared copy-on-write (fork) gets its own
+        // copy first: the write must not reach the other process
+        let private = vma.is_none_or(|v| !v.is_shared());
+        let anon_vma = vma.and_then(|v| v.anon_vma.clone());
+        if private
+            && crate::mm::fault::unshare_for_write(page_table_root, current_addr, anon_vma).is_err()
+        {
+            if total_written > 0 {
+                return Ok(total_written);
+            }
+            return Err(KernelError::OutOfMemory);
+        }
 
-        // Write page by page using page table translation
-        let bytes_written = write_pages(page_table_root, current_addr, &buf[total_written..])?;
+        // Write within this page (each page is unshared before its write)
+        let page_left = (PAGE_SIZE - (current_addr & (PAGE_SIZE - 1))) as usize;
+        let chunk = remaining.min(page_left);
+        let bytes_written = write_pages(
+            page_table_root,
+            current_addr,
+            &buf[total_written..total_written + chunk],
+        )?;
 
         if bytes_written == 0 {
             if total_written > 0 {

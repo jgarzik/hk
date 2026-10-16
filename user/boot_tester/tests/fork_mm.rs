@@ -34,6 +34,12 @@
 //! - FAULT_MPROTECT_RACE: a thread keeps read-faulting pages in while
 //!   the range is zapped and made read-only: afterwards no page has a
 //!   writable entry left (a kernel write into each is EFAULT)
+//! - FORK_REMOTE_WRITE_COW: process_vm_writev into the child's
+//!   copy-on-write page changes the child's copy only
+//! - REMOTE_WRITE_PERM: process_vm_writev into another user's process
+//!   is EPERM
+//! - REMOTE_WRITE_RDONLY: process_vm_writev into a read-only shared
+//!   mapping is EFAULT
 //! - FORK_DONTFORK: a MADV_DONTFORK region is not mapped in the child
 //!   (SIGSEGV), the parent keeps it
 //! - FORK_WIPEONFORK: a MADV_WIPEONFORK region reads zero in the child
@@ -60,9 +66,9 @@ use super::helpers::{host_mode, print, print_num, println};
 use super::mm_life::meminfo;
 use hk_syscall::{
     sys_close, sys_exit, sys_fork, sys_ftruncate, sys_madvise, sys_mmap, sys_mprotect,
-    sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pipe, sys_pread64, sys_pwrite64,
-    sys_read, sys_sched_yield, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_unlink,
-    sys_wait4, sys_write, Timespec, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT,
+    sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pipe, sys_pread64, sys_process_vm_writev, sys_pwrite64,
+    sys_read, sys_sched_yield, sys_setresuid, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_unlink,
+    sys_wait4, sys_write, IoVec, Timespec, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT,
     MADV_DONTFORK, MADV_DONTNEED, MADV_REMOVE, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_PRIVATE,
     MAP_SHARED, MREMAP_MAYMOVE, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE,
 };
@@ -91,6 +97,8 @@ pub fn run_tests() {
     rdonly_cow();
     cow_race();
     mprotect_race();
+    remote_write_cow();
+    remote_write_perm();
     dontfork();
     wipeonfork();
     thp();
@@ -528,6 +536,81 @@ fn rdonly_cow() {
             0
         }
     });
+}
+
+fn remote_write_cow() {
+    one_page(b"FORK_REMOTE_WRITE_COW", MAP_PRIVATE, |p| {
+        put(p + 8, BEFORE);
+        let (to_child, from_parent) = pipe();
+        let pid = sys_fork();
+        if pid == 0 {
+            recv(to_child);
+            sys_exit(if get(p + 8) == CHILD { 0 } else { 1 });
+        }
+        let v = CHILD;
+        let local = IoVec { iov_base: (&v as *const u64).cast(), iov_len: 8 };
+        let remote = IoVec { iov_base: (p + 8) as *const u8, iov_len: 8 };
+        let n = sys_process_vm_writev(pid as i32, &local, 1, &remote, 1, 0);
+        send(from_parent);
+        let r = reap(pid);
+        sys_close(to_child);
+        sys_close(from_parent);
+        if n != 8 {
+            1000 + n
+        } else if r != 0 {
+            10 + r
+        } else if get(p + 8) != BEFORE {
+            2
+        } else {
+            0
+        }
+    });
+}
+
+/// A child that waits on a pipe with a page at a known address (one
+/// mmap with `prot`, `flags`); its pid, the page and the pipe to release
+/// it. The child exits 0 once released.
+fn parked_child(prot: u32, flags: u32) -> (i64, u64, u64) {
+    let p = sys_mmap(0, PAGE, prot, flags | MAP_ANONYMOUS, -1, 0) as u64;
+    let (to_child, from_parent) = pipe();
+    let pid = sys_fork();
+    if pid == 0 {
+        recv(to_child);
+        sys_exit(0);
+    }
+    sys_close(to_child);
+    (pid, p, from_parent)
+}
+
+fn remote_write_perm() {
+    let v = CHILD;
+    let local = IoVec { iov_base: (&v as *const u64).cast(), iov_len: 8 };
+    // Another user's process: EPERM
+    let (pid, p, rel) = parked_child(RW, MAP_PRIVATE);
+    let w = sys_fork();
+    if w == 0 {
+        if sys_setresuid(65534, 65534, 65534) != 0 {
+            sys_exit(9);
+        }
+        let remote = IoVec { iov_base: p as *const u8, iov_len: 8 };
+        let n = sys_process_vm_writev(pid as i32, &local, 1, &remote, 1, 0);
+        sys_exit(if n == -1 { 0 } else { 1 });
+    }
+    let r = reap(w);
+    send(rel);
+    sys_close(rel);
+    let r2 = reap(pid);
+    sys_munmap(p, PAGE);
+    report(b"REMOTE_WRITE_PERM", if r == 0 && r2 == 0 { 0 } else { r * 100 + r2 });
+    // A read-only shared mapping: EFAULT
+    let (pid, p, rel) = parked_child(PROT_READ, MAP_SHARED);
+    let remote = IoVec { iov_base: p as *const u8, iov_len: 8 };
+    let n = sys_process_vm_writev(pid as i32, &local, 1, &remote, 1, 0);
+    send(rel);
+    sys_close(rel);
+    let r2 = reap(pid);
+    sys_munmap(p, PAGE);
+    report(b"REMOTE_WRITE_RDONLY", if n == -14 && r2 == 0 { 0 } else { 1000 - n });
 }
 
 fn dontfork() {

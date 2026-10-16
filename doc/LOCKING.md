@@ -735,7 +735,7 @@ pub struct BitmapFrameAllocator {
   cannot race fork's copy, munmap or mprotect of its range: every user
   PTE writer holds the mm lock (fault, fork's `copy_page_range`,
   munmap/brk `munmap_locked`, mprotect, MADV_DONTNEED/REMOVE, mremap's
-  shrink and `move_page_tables`),
+  shrink and `move_page_tables`, a remote write's `unshare_for_write`),
   so no entry is read, released and written back around another's
   change. Under it:
   page-table and page allocation (`FRAME_ALLOCATOR`), a shared object's
