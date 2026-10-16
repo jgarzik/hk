@@ -68,6 +68,7 @@ pub mod tcp_conn;
 pub mod tcp_opt;
 pub mod tcp_xfer;
 pub mod tcp_close;
+pub mod net_stress;
 pub mod bigio;
 pub mod keys;
 pub mod kcmp;
@@ -178,6 +179,7 @@ pub fn run_all_tests() {
     tcp_conn::run_tests();
     tcp_opt::run_tests();
     tcp_close::run_tests();
+    net_stress::run_tests();
     keys::run_tests();
     kcmp::run_tests();
     process_vm::run_tests();
