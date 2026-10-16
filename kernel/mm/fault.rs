@@ -504,6 +504,10 @@ pub fn unshare_for_write(
     addr: u64,
     anon_vma: Option<Arc<AnonVma>>,
 ) -> Result<(), VmFault> {
+    // Never a kernel-half address (shared kernel tables)
+    if addr >= super::TASK_SIZE {
+        return Err(VmFault::Segv);
+    }
     let Some(ptep) = paging::pte_ptr(pgd, addr) else {
         return Ok(()); // not mapped, or a 2MB page (never shared)
     };

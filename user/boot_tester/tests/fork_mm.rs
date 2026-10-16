@@ -40,6 +40,9 @@
 //!   is EPERM
 //! - REMOTE_WRITE_RDONLY: process_vm_writev into a read-only shared
 //!   mapping is EFAULT
+//! - REMOTE_ACCESS_BOUNDS: process_vm_readv/writev at a kernel-half or
+//!   unmapped target address is EFAULT; across a page boundary the
+//!   whole range is copied
 //! - FORK_DONTFORK: a MADV_DONTFORK region is not mapped in the child
 //!   (SIGSEGV), the parent keeps it
 //! - FORK_WIPEONFORK: a MADV_WIPEONFORK region reads zero in the child
@@ -66,7 +69,7 @@ use super::helpers::{host_mode, print, print_num, println};
 use super::mm_life::meminfo;
 use hk_syscall::{
     sys_close, sys_exit, sys_fork, sys_ftruncate, sys_madvise, sys_mmap, sys_mprotect,
-    sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pipe, sys_pread64, sys_process_vm_writev, sys_pwrite64,
+    sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pipe, sys_pread64, sys_process_vm_readv, sys_process_vm_writev, sys_pwrite64,
     sys_read, sys_sched_yield, sys_setresuid, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_unlink,
     sys_wait4, sys_write, IoVec, Timespec, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT,
     MADV_DONTFORK, MADV_DONTNEED, MADV_REMOVE, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_PRIVATE,
@@ -99,6 +102,7 @@ pub fn run_tests() {
     mprotect_race();
     remote_write_cow();
     remote_write_perm();
+    remote_bounds();
     dontfork();
     wipeonfork();
     thp();
@@ -611,6 +615,72 @@ fn remote_write_perm() {
     let r2 = reap(pid);
     sys_munmap(p, PAGE);
     report(b"REMOTE_WRITE_RDONLY", if n == -14 && r2 == 0 { 0 } else { 1000 - n });
+}
+
+fn remote_bounds() {
+    #[cfg(target_arch = "x86_64")]
+    const KERNEL: u64 = 0xffff_8880_0000_0000;
+    #[cfg(target_arch = "aarch64")]
+    const KERNEL: u64 = 0xffff_0000_0000_0000;
+    let (pid, p, rel) = parked_child(RW, MAP_PRIVATE);
+    // Mapped here only after the fork: unmapped in the child
+    let hole = map(PAGE, MAP_PRIVATE);
+    let mut buf = [0u8; 16];
+    let local = IoVec { iov_base: buf.as_mut_ptr(), iov_len: 16 };
+    let rw = |addr: u64, write: bool| -> i64 {
+        let remote = IoVec { iov_base: addr as *const u8, iov_len: 16 };
+        if write {
+            sys_process_vm_writev(pid as i32, &local, 1, &remote, 1, 0)
+        } else {
+            sys_process_vm_readv(pid as i32, &local, 1, &remote, 1, 0)
+        }
+    };
+    let mut code = 0;
+    for (i, a) in [KERNEL, hole].into_iter().enumerate() {
+        if rw(a, false) != -14 || rw(a, true) != -14 {
+            code = 1 + i as i64;
+        }
+    }
+    send(rel);
+    sys_close(rel);
+    let r = reap(pid);
+    sys_munmap(p, PAGE);
+    sys_munmap(hole, PAGE);
+    // Across a boundary: two pages of a child, 16 bytes over the seam
+    let q = map(2 * PAGE, MAP_PRIVATE);
+    for i in 0..16u64 {
+        unsafe { core::ptr::write_volatile((q + PAGE - 8 + i) as *mut u8, i as u8 + 1) };
+    }
+    let (to_child, from_parent) = pipe();
+    let pid2 = sys_fork();
+    if pid2 == 0 {
+        recv(to_child);
+        let ok = (0..16u64).all(|i| unsafe {
+            core::ptr::read_volatile((q + PAGE - 8 + i) as *const u8) == 0x40 + i as u8
+        });
+        sys_exit(if ok { 0 } else { 1 });
+    }
+    let mut got = [0u8; 16];
+    let lg = IoVec { iov_base: got.as_mut_ptr(), iov_len: 16 };
+    let rem = IoVec { iov_base: (q + PAGE - 8) as *const u8, iov_len: 16 };
+    let n = sys_process_vm_readv(pid2 as i32, &lg, 1, &rem, 1, 0);
+    if code == 0 && (n != 16 || (0..16).any(|i| got[i] != i as u8 + 1)) {
+        code = 10;
+    }
+    let put16: [u8; 16] = core::array::from_fn(|i| 0x40 + i as u8);
+    let lp = IoVec { iov_base: put16.as_ptr(), iov_len: 16 };
+    if code == 0 && sys_process_vm_writev(pid2 as i32, &lp, 1, &rem, 1, 0) != 16 {
+        code = 11;
+    }
+    send(from_parent);
+    let r2 = reap(pid2);
+    sys_close(to_child);
+    sys_close(from_parent);
+    sys_munmap(q, 2 * PAGE);
+    if code == 0 && (r != 0 || r2 != 0) {
+        code = 100 + r * 10 + r2;
+    }
+    report(b"REMOTE_ACCESS_BOUNDS", code);
 }
 
 fn dontfork() {
