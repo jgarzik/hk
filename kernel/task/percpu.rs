@@ -1245,7 +1245,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     };
 
     // The child's address space (Linux copy_mm): shared for CLONE_VM,
-    // else a copy-on-write duplicate. Dropped on any error below.
+    // else a copy (dup_mm). Dropped on any error below.
     let parent_mm = {
         let table = TASK_TABLE.lock();
         table
@@ -1260,10 +1260,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         Some(pm) => {
             let mut pt = ArchPageTable::new_user(frame_alloc).ok_or(12)?; // ENOMEM
             pt.copy_kernel_mappings();
-            let pgd = pt.root_table_phys();
-            let dup =
-                |parent| ArchPageTable::new(parent).duplicate_user_space(&mut pt, frame_alloc);
-            Some(crate::mm::dup_mm(&pm, pgd, dup)?)
+            Some(crate::mm::dup_mm(&pm, pt.root_table_phys())?)
         }
     };
     let child_pt = ArchPageTable::new(child_mm.as_ref().map_or(parent_pt_phys, |m| m.pgd()));

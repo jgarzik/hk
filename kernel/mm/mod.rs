@@ -258,11 +258,6 @@ impl MmStruct {
         core::mem::take(&mut self.vmas)
     }
 
-    /// Clone all VMAs (for fork)
-    pub fn clone_vmas(&self) -> Vec<Vma> {
-        self.vmas.clone()
-    }
-
     // ========================================================================
     // Memory locking (mlock/mlockall) support
     // ========================================================================
@@ -711,37 +706,52 @@ pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
     Some(keep)
 }
 
-/// A copy-on-write duplicate of `parent` for fork (Linux dup_mm)
+/// The address space of a fork child, copied from `parent` (Linux
+/// dup_mm / dup_mmap) into the fresh table `pgd` (kernel half linked).
 ///
-/// The child is rooted at `pgd` (a fresh table with the kernel half
-/// linked); `dup` copies the parent's pages into it given the parent's
-/// table. The VMAs and pages are copied under the parent's mmap_lock so
-/// no mapping changes under the copy. On error the partial copy is torn
-/// down with the child mm.
-pub fn dup_mm(
-    parent: &MmRef,
-    pgd: u64,
-    dup: impl FnOnce(u64) -> Result<(), i32>,
-) -> Result<MmRef, i32> {
+/// Under the parent's mmap_lock, each VMA is copied with its page tables
+/// (`memory::copy_page_range`: shared mappings stay shared, private ones
+/// become copy-on-write), except that a VM_DONTCOPY (MADV_DONTFORK) VMA
+/// is left out and a VM_WIPEONFORK one starts empty. Memory locks are not
+/// inherited (VM_LOCKED cleared, locked_vm and MCL_FUTURE reset). On
+/// error the partial copy is torn down with the child mm.
+pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
     let guard = parent.lock();
     let mut map = MmStruct::new(guard.mmap_base);
-    map.vmas = guard.clone_vmas();
-    for vma in &map.vmas {
-        if let Some(ref anon_vma) = vma.anon_vma {
-            anon_vma.add_vma(pgd, vma.start, vma.end);
-        }
-    }
     map.start_brk = guard.start_brk;
     map.brk = guard.brk;
-    map.locked_vm = guard.locked_vm;
     map.total_vm = guard.total_vm;
-    map.def_flags = guard.def_flags;
     map.exe = guard.exe.clone();
+    let mut res = Ok(());
+    for vma in guard.iter() {
+        if vma.flags & VM_DONTCOPY != 0 {
+            map.total_vm -= vma.size() / PAGE_SIZE;
+            continue;
+        }
+        let mut v = vma.clone();
+        v.flags &= !VM_LOCKED_MASK;
+        if v.flags & VM_WIPEONFORK != 0 {
+            v.anon_vma = v.anon_vma.as_ref().map(|_| anon_vma::AnonVma::new());
+        }
+        if let Some(av) = &v.anon_vma {
+            av.add_vma(pgd, v.start, v.end);
+        }
+        if v.flags & VM_WIPEONFORK == 0 {
+            res = memory::copy_page_range(pgd, parent.pgd(), &v).map(|wp| {
+                if wp {
+                    crate::arch::paging::flush_tlb_range(v.start, v.end);
+                }
+            });
+        }
+        map.vmas.push(v);
+        if res.is_err() {
+            break;
+        }
+    }
     let child = MmRef::new(pgd, map);
-    let res = dup(parent.pgd());
     drop(guard);
     // On error `child` goes with its partial copy (outside the lock)
-    res.map(|_| child).map_err(|e| e.unsigned_abs() as i32)
+    res.map(|_| child)
 }
 
 /// A fresh, empty address space for exec / the first task, rooted at

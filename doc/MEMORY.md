@@ -121,11 +121,20 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   (ptrace, process_vm_*, a /proc/<pid>/maps read). The `Arc` count
   (mm_count) keeps the struct and the top-level table.
 - **Frame references.** Every present user PTE holds one reference on its
-  frame: a fault allocates with count 1, fork increfs each copy-on-write
-  frame, a SysV shm attachment takes one per page (the segment holds its
+  frame: a fault allocates with count 1, fork increfs each frame it
+  shares, a SysV shm attachment takes one per page (the segment holds its
   own), splitting a 2MB page gives each 4KB frame the head's count.
   Unmapping drops the reference and the last one frees the frame. Frames
   outside the allocator (MMIO) have no count and are never freed.
+- **fork (Linux dup_mmap / copy_page_range).** Each VMA is copied with its
+  PTEs: a MAP_SHARED mapping keeps sharing its pages (writes stay
+  visible both ways); a private one shares them copy-on-write (both
+  PTEs read-only and marked COW, also for pages read-only at fork, so a
+  later mprotect(PROT_WRITE) cannot make the shared page writable). A
+  2MB page is split into 4KB PTEs in the parent first; a swap PTE fails
+  the fork (ENOMEM; unreachable while swap-out is inert). MADV_DONTFORK VMAs are left out of the
+  child, MADV_WIPEONFORK ones start empty there, and memory locks
+  (VM_LOCKED, locked_vm, MCL_FUTURE) are not inherited.
 - **Teardown (Linux exit_mmap).** When `users` drops to zero (last task
   exits, or the old image at exec), the VMAs and their rmap chains go,
   the user half is detached from the top-level table and the TLB

@@ -64,10 +64,15 @@ Address spaces are reference counted and torn down like Linux
   no caller), so rmap, the LRU lists and swap-out are inert. Before
   enabling them: `set_anon_mapping` stores an AnonVma pointer without
   taking a reference while `clear_mapping` drops one, swap-out frees a
-  frame even when the rmap walk missed a mapping.
-- fork copies neither 2MB (THP) mappings nor swap PTEs (the child sees
-  zero pages there) and turns every writable PTE copy-on-write, MAP_SHARED
-  mappings included (writes after fork are not shared).
+  frame even when the rmap walk missed a mapping, swap slots carry no
+  reference counts (`free_swap_entry` frees at once), the swap cache is
+  never filled (`swap_cache_add` has no caller) and freeing a slot does
+  not drop a swap-cache entry (Linux SWAP_HAS_CACHE), and munmap leaks
+  the slots of swap PTEs (exit frees them).
+- fork fails with ENOMEM on a swap PTE (`memory::swap_pte_unsupported`,
+  unreachable while swap-out is inert): copying one needs counted swap
+  slots safe against a racing swap-in (Linux swap_duplicate under
+  si->lock); to be done with the reclaim work.
 - SysV shm: fork and exit do not update `shm_nattch`; a segment removed
   with IPC_RMID while attached by a process that exits without shmdt is
   never destroyed (its own reference on the frames is never dropped).

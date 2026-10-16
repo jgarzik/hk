@@ -702,7 +702,10 @@ pub struct BitmapFrameAllocator {
   never drops a task that still uses its mm.
 - The mm lock (`Mm::lock`, a `spin::Mutex`) is hk's mmap_lock: it guards
   the VMA tree and VM counters. `dup_mm` holds the parent's mm lock while
-  it copies VMAs and page tables. munmap / MAP_FIXED / brk shrink / shmdt
+  it copies VMAs and page tables (`memory::copy_page_range`: it
+  write-protects the parent's private PTEs with a compare-and-swap, since
+  the parent's other threads may be faulting, splits 2MB pages and takes
+  frame references). munmap / MAP_FIXED / brk shrink / shmdt
   zap pages under it (`munmap_locked`). Order: mm lock → AnonVma lock,
   `LRU`, page descriptors, swap slots → `FRAME_ALLOCATOR`; nothing taken
   under those leaf locks takes an mm lock (the swap rmap walk uses the

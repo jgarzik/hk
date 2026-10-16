@@ -1576,6 +1576,17 @@ fn madvise_update_vma_flags(
 ) -> i64 {
     let mut mm_guard = mm.lock();
 
+    // Only private anonymous memory can be wiped on fork (Linux
+    // madvise_vma_behavior)
+    let inside = |v: &Vma| v.end > start && v.start < end;
+    if advice == MADV_WIPEONFORK
+        && mm_guard
+            .iter()
+            .any(|v| inside(v) && (v.file.is_some() || v.is_shared()))
+    {
+        return KernelError::InvalidArgument.sysret();
+    }
+
     // Walk VMAs and update flags, collect indices for merging
     let mut modified_indices: Vec<usize> = Vec::new();
     for (idx, vma) in mm_guard.iter_mut().enumerate() {
