@@ -23,13 +23,28 @@
 //! - FORK_WIPEONFORK: a MADV_WIPEONFORK region reads zero in the child
 //! - FORK_THP: a MADV_HUGEPAGE (2MB page) region keeps its data in the
 //!   child and is copy-on-write
+//! - SHM_NATTCH_FORK: a SysV shm attachment is inherited: shm_nattch 1 ->
+//!   2 after fork, back to 1 when the child exits, 0 after shmdt; the
+//!   segment is shared both ways
+//! - SHM_RMID_EXIT: a segment removed with IPC_RMID while attached by a
+//!   process that exits without shmdt is destroyed: its id is gone and
+//!   its memory comes back
+//! - SHM_RDONLY_PERM: a SHM_RDONLY attachment cannot be made writable by
+//!   mprotect nor emptied by MADV_REMOVE (EACCES); MADV_REMOVE of private
+//!   anonymous memory is EINVAL
+//! - SHM_ATTACH_ADDR: shmat outside user space (kernel half: ENOMEM,
+//!   wrapping range: EINVAL) or SHM_REMAP without an address (EINVAL)
+//! - SHM_STRESS: four processes fork, shmdt and exit attached while one
+//!   removes the segment midway; at the end the id is gone and the
+//!   memory comes back
 
-use super::helpers::{print, print_num, println};
+use super::helpers::{host_mode, print, print_num, println};
+use super::mm_life::meminfo;
 use hk_syscall::{
     sys_close, sys_exit, sys_fork, sys_madvise, sys_mmap, sys_mprotect, sys_munmap,
-    sys_mremap, sys_pipe, sys_read, sys_wait4, sys_write, MADV_DONTFORK, MADV_DONTNEED,
-    MADV_REMOVE, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_MAYMOVE,
-    PROT_READ, PROT_WRITE,
+    sys_mremap, sys_nanosleep, sys_pipe, sys_read, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_wait4,
+    sys_write, Timespec, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, MADV_DONTFORK, MADV_DONTNEED, MADV_REMOVE, MADV_WIPEONFORK,
+    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_MAYMOVE, PROT_READ, PROT_WRITE,
 };
 
 const MADV_HUGEPAGE: i32 = 14;
@@ -55,6 +70,11 @@ pub fn run_tests() {
     dontfork();
     wipeonfork();
     thp();
+    shm_nattch_fork();
+    shm_rmid_exit();
+    shm_rdonly_perm();
+    shm_attach_addr();
+    shm_stress();
 }
 
 fn report(name: &[u8], code: i64) {
@@ -177,12 +197,18 @@ fn shared_anon() {
 }
 
 fn shared_anon_late() {
-    const NAME: &[u8] = b"FORK_SHARED_ANON_LATE";
     let p = map(2 * PAGE, MAP_SHARED);
     if p == 0 {
-        report(NAME, -1);
+        report(b"FORK_SHARED_ANON_LATE", -1);
         return;
     }
+    report(b"FORK_SHARED_ANON_LATE", shared_late(p));
+    sys_munmap(p, 2 * PAGE);
+}
+
+/// Two shared pages at `p`, untouched before fork: page 1 first
+/// touched by the child, page 0 by the parent; each sees the other's
+fn shared_late(p: u64) -> i64 {
     let (to_child, from_parent) = pipe();
     let (to_parent, from_child) = pipe();
     let pid = sys_fork();
@@ -204,8 +230,7 @@ fn shared_anon_late() {
     for fd in [to_child, from_parent, to_parent, from_child] {
         sys_close(fd);
     }
-    report(NAME, code);
-    sys_munmap(p, 2 * PAGE);
+    code
 }
 
 fn shmem_dontneed() {
@@ -417,4 +442,259 @@ fn thp() {
     }
     report(NAME, code);
     sys_munmap(p, 2 * HUGE);
+}
+
+/// shm_nattch of segment `id` (shmid64_ds: offset 88), -errno
+fn nattch(id: i32) -> i64 {
+    let mut ds = [0u64; 14];
+    let r = sys_shmctl(id, IPC_STAT, ds.as_mut_ptr() as u64);
+    if r < 0 { r } else { ds[11] as i64 }
+}
+
+fn shm_nattch_fork() {
+    const NAME: &[u8] = b"SHM_NATTCH_FORK";
+    let id = sys_shmget(IPC_PRIVATE, PAGE as usize, IPC_CREAT | 0o600) as i32;
+    let a = sys_shmat(id, 0, 0);
+    if id < 0 || a < 0 {
+        report(NAME, -1);
+        return;
+    }
+    let a = a as u64;
+    put(a, BEFORE);
+    let (to_child, from_parent) = pipe();
+    let (to_parent, from_child) = pipe();
+    let pid = sys_fork();
+    if pid == 0 {
+        let code = if get(a) == BEFORE { 0 } else { 1 };
+        put(a + 8, CHILD);
+        send(from_child);
+        recv(to_child);
+        sys_exit(code);
+    }
+    let mut code = 0;
+    recv(to_parent);
+    if nattch(id) != 2 {
+        code = 2;
+    } else if get(a + 8) != CHILD {
+        code = 3;
+    }
+    send(from_parent);
+    let r = reap(pid);
+    if code == 0 && r != 0 {
+        code = 10 + r;
+    }
+    if code == 0 && nattch(id) != 1 {
+        code = 4;
+    }
+    sys_shmdt(a);
+    if code == 0 && nattch(id) != 0 {
+        code = 5;
+    }
+    sys_shmctl(id, IPC_RMID, 0);
+    if code == 0 && nattch(id) != -22 {
+        code = 6;
+    }
+    for fd in [to_child, from_parent, to_parent, from_child] {
+        sys_close(fd);
+    }
+    report(NAME, code);
+}
+
+/// Let exited tasks' CPUs switch away
+fn settle() {
+    let ts = Timespec { tv_sec: 0, tv_nsec: 20_000_000 };
+    sys_nanosleep(&ts, core::ptr::null_mut());
+}
+
+fn shm_rmid_exit() {
+    const NAME: &[u8] = b"SHM_RMID_EXIT";
+    // Larger than the Linux MemFree noise allowed below
+    const SIZE: u64 = 96 << 20;
+    let tol = if host_mode() { 64 * 1024 } else { 512 };
+    settle();
+    let before = meminfo(b"MemFree:");
+    let (to_parent, from_child) = pipe();
+    let pid = sys_fork();
+    if pid == 0 {
+        let id = sys_shmget(IPC_PRIVATE, SIZE as usize, IPC_CREAT | 0o600) as i32;
+        let a = sys_shmat(id, 0, 0);
+        if id < 0 || a < 0 {
+            sys_exit(1);
+        }
+        for p in (a as u64..a as u64 + SIZE).step_by(PAGE as usize) {
+            put(p, p);
+        }
+        let ok = meminfo(b"MemFree:") < before - (SIZE as i64 >> 10) + tol;
+        sys_shmctl(id, IPC_RMID, 0);
+        sys_write(from_child, (&id as *const i32).cast(), 4);
+        // Exit still attached: the exit's detach destroys it
+        sys_exit(if ok { 0 } else { 2 });
+    }
+    let mut id = -1i32;
+    sys_read(to_parent, (&mut id as *mut i32).cast(), 4);
+    let mut code = reap(pid);
+    if code == 0 && nattch(id) != -22 {
+        code = 3;
+    }
+    let mut after = 0;
+    for _ in 0..50 {
+        settle();
+        after = meminfo(b"MemFree:");
+        if before - after <= tol {
+            break;
+        }
+    }
+    if code == 0 && before - after > tol {
+        print(NAME);
+        print(b": MemFree before ");
+        print_num(before);
+        print(b" kB, after ");
+        print_num(after);
+        println(b" kB");
+        code = 4;
+    }
+    sys_close(to_parent);
+    sys_close(from_child);
+    report(NAME, code);
+}
+
+/// One stress worker: 20 rounds of forking a grandchild that touches
+/// the segment and exits attached or detaches first; worker 0 removes
+/// the segment after round 10; exits attached
+fn stress_worker(id: i32, a: u64, size: u64, w: u64) -> u64 {
+    for round in 0..20u64 {
+        let pid = sys_fork();
+        if pid == 0 {
+            let off = ((w * 20 + round) * PAGE * 7) % size;
+            put(a + off, off);
+            if round % 2 == 0 {
+                sys_shmdt(a);
+            }
+            sys_exit(0);
+        }
+        if reap(pid) != 0 {
+            return 1;
+        }
+        if w == 0 && round == 10 {
+            sys_shmctl(id, IPC_RMID, 0);
+        }
+    }
+    0
+}
+
+fn shm_stress() {
+    const NAME: &[u8] = b"SHM_STRESS";
+    const SIZE: u64 = 96 << 20;
+    let tol = if host_mode() { 64 * 1024 } else { 512 };
+    settle();
+    let before = meminfo(b"MemFree:");
+    let id = sys_shmget(IPC_PRIVATE, SIZE as usize, IPC_CREAT | 0o600) as i32;
+    let a = sys_shmat(id, 0, 0);
+    if id < 0 || a < 0 {
+        report(NAME, -1);
+        return;
+    }
+    let a = a as u64;
+    for p in (a..a + SIZE).step_by(PAGE as usize) {
+        put(p, p);
+    }
+    let mut pids = [0i64; 4];
+    for (w, pid) in pids.iter_mut().enumerate() {
+        *pid = sys_fork();
+        if *pid == 0 {
+            sys_exit(stress_worker(id, a, SIZE, w as u64));
+        }
+    }
+    let mut code = 0;
+    for pid in pids {
+        let r = reap(pid);
+        if code == 0 && r != 0 {
+            code = 10 + r;
+        }
+    }
+    // Still attached here: the removed segment lives until this detach
+    if code == 0 && get(a + 8 * PAGE) != a + 8 * PAGE {
+        code = 2;
+    }
+    sys_shmdt(a);
+    if code == 0 && nattch(id) != -22 {
+        code = 3;
+    }
+    let mut after = 0;
+    for _ in 0..50 {
+        settle();
+        after = meminfo(b"MemFree:");
+        if before - after <= tol {
+            break;
+        }
+    }
+    if code == 0 && before - after > tol {
+        print(NAME);
+        print(b": MemFree before ");
+        print_num(before);
+        print(b" kB, after ");
+        print_num(after);
+        println(b" kB");
+        code = 4;
+    }
+    report(NAME, code);
+}
+
+fn shm_rdonly_perm() {
+    const SHM_RDONLY: i32 = 0o10000;
+    const EACCES: i64 = -13;
+    const EINVAL: i64 = -22;
+    let id = sys_shmget(IPC_PRIVATE, PAGE as usize, IPC_CREAT | 0o600) as i32;
+    let a = sys_shmat(id, 0, SHM_RDONLY);
+    if id < 0 || a < 0 {
+        report(b"SHM_RDONLY_PERM", -1);
+        return;
+    }
+    let a = a as u64;
+    let mut code = 0;
+    let r = sys_mprotect(a, PAGE, RW);
+    if r != EACCES {
+        code = 1000 - r;
+    }
+    let r = sys_madvise(a, PAGE, MADV_REMOVE);
+    if code == 0 && r != EACCES {
+        code = 2000 - r;
+    }
+    sys_shmdt(a);
+    sys_shmctl(id, IPC_RMID, 0);
+    let p = map(PAGE, MAP_PRIVATE);
+    let r = sys_madvise(p, PAGE, MADV_REMOVE);
+    if code == 0 && r != EINVAL {
+        code = 3000 - r;
+    }
+    sys_munmap(p, PAGE);
+    report(b"SHM_RDONLY_PERM", code);
+}
+
+fn shm_attach_addr() {
+    const SHM_REMAP: i32 = 0o40000;
+    let id = sys_shmget(IPC_PRIVATE, PAGE as usize, IPC_CREAT | 0o600) as i32;
+    if id < 0 {
+        report(b"SHM_ATTACH_ADDR", -1);
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let kernel: u64 = 0xffff_8880_0000_0000;
+    #[cfg(target_arch = "aarch64")]
+    let kernel: u64 = 0xffff_0000_0000_0000;
+    let mut code = 0;
+    let r = sys_shmat(id, kernel, 0);
+    if r != -12 {
+        code = 1000 - r;
+    }
+    let r = sys_shmat(id, 0u64.wrapping_sub(PAGE), 0);
+    if code == 0 && r != -22 {
+        code = 2000 - r;
+    }
+    let r = sys_shmat(id, 0, SHM_REMAP);
+    if code == 0 && r != -22 {
+        code = 3000 - r;
+    }
+    sys_shmctl(id, IPC_RMID, 0);
+    report(b"SHM_ATTACH_ADDR", code);
 }

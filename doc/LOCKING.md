@@ -719,7 +719,14 @@ pub struct BitmapFrameAllocator {
   MADV_REMOVE with no other lock held; under it only `FRAME_ALLOCATOR`
   is taken (index nodes are frames, no heap). The object goes with its
   last VMA (possibly under the mm lock): its drop takes no lock but
-  `FRAME_ALLOCATOR`.
+  `FRAME_ALLOCATOR`. A SysV shm attachment (`ipc::shm::ShmAttach`, in
+  its VMA) is cloned and dropped with the VMA, possibly under the mm
+  lock: it only updates the segment's atomics (shm_nattch, times, pid),
+  and destroying a removed segment at the last detach takes no lock.
+  IPC_RMID (mark deleted, then read shm_nattch) and shmat (count the
+  attachment, then check the mark) order with SeqCst fences, so a
+  racing shmat backs out (EINVAL) or IPC_RMID sees it; destroy is
+  idempotent, so namespace totals are given back exactly once.
 - The page-fault path (`kernel/mm/fault.rs`, `handle_mm_fault`, shared by
   both arches) finds the VMA under the mm lock but drops it before
   allocating and installing the PTE (it may sleep reading a file), so a

@@ -238,6 +238,8 @@ pub struct Vma {
     /// The pages of shared anonymous memory (MAP_SHARED|MAP_ANONYMOUS),
     /// indexed from `offset` like a file
     pub shmem: Option<Arc<Shmem>>,
+    /// The SysV shm attachment this VMA is (counted in shm_nattch)
+    pub shm: Option<crate::ipc::shm::ShmAttach>,
 }
 
 impl Vma {
@@ -253,6 +255,7 @@ impl Vma {
             anon_vma: None,
             mempolicy: None,
             shmem: None,
+            shm: None,
         }
     }
 
@@ -275,6 +278,7 @@ impl Vma {
             anon_vma: None,
             mempolicy: None,
             shmem: None,
+            shm: None,
         }
     }
 
@@ -293,6 +297,7 @@ impl Vma {
             anon_vma: Some(anon_vma),
             mempolicy: None,
             shmem: None,
+            shm: None,
         }
     }
 
@@ -397,6 +402,11 @@ impl Vma {
                 }
             }
             _ => return false, // One has anon_vma, other doesn't
+        }
+        // Never merge SysV shm attachments (Linux: VMAs with a vm_ops
+        // close are not merged)
+        if self.shm.is_some() || other.shm.is_some() {
+            return false;
         }
         // Must be the same shared object at contiguous offsets
         match (&self.shmem, &other.shmem) {

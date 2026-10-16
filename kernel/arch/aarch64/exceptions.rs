@@ -368,8 +368,7 @@ extern "C" fn handle_el0_irq(frame: &mut Aarch64TrapFrame) {
 
 /// Map a user page, allocating intermediate page tables as needed
 ///
-/// This function is used by demand paging and shmat to map physical frames
-/// into a user process's address space.
+/// Used by mremap to move a page into place.
 ///
 /// # Arguments
 /// * `ttbr0` - Physical address of the L0 table (page table root)
@@ -428,71 +427,5 @@ pub fn map_user_page(ttbr0: u64, vaddr: u64, paddr: u64, attrs: u64) -> Result<(
         crate::arch::aarch64::paging::flush_tlb(vaddr);
 
         Ok(())
-    }
-}
-
-/// Unmap a user page
-///
-/// Clears the page table entry for the given virtual address and flushes the TLB.
-/// Returns the physical address that was mapped, or None if not mapped.
-///
-/// # Arguments
-/// * `ttbr0` - Physical address of the L0 table (page table root)
-/// * `vaddr` - Virtual address to unmap (page-aligned)
-pub fn unmap_user_page(ttbr0: u64, vaddr: u64) -> Option<u64> {
-    let l0_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let l1_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let l2_idx = ((vaddr >> 21) & 0x1FF) as usize;
-    let l3_idx = ((vaddr >> 12) & 0x1FF) as usize;
-
-    // Table descriptor: bits [1:0] = 0b11
-    const TABLE_DESC: u64 = 0b11;
-    // Page descriptor: bits [1:0] = 0b11 for valid page
-    const PAGE_VALID: u64 = 0b11;
-
-    unsafe {
-        // L0
-        let l0 = crate::arch::aarch64::paging::phys_to_virt(ttbr0) as *const u64;
-        let l0_entry = *l0.add(l0_idx);
-        if (l0_entry & 0b11) != TABLE_DESC {
-            return None;
-        }
-
-        // L1
-        let l1 = crate::arch::aarch64::paging::phys_to_virt(l0_entry & 0x0000_FFFF_FFFF_F000)
-            as *const u64;
-        let l1_entry = *l1.add(l1_idx);
-        if (l1_entry & 0b11) != TABLE_DESC {
-            return None;
-        }
-
-        // L2
-        let l2 = crate::arch::aarch64::paging::phys_to_virt(l1_entry & 0x0000_FFFF_FFFF_F000)
-            as *const u64;
-        let l2_entry = *l2.add(l2_idx);
-        if (l2_entry & 0b11) != TABLE_DESC {
-            return None;
-        }
-
-        // L3
-        let l3 = crate::arch::aarch64::paging::phys_to_virt(l2_entry & 0x0000_FFFF_FFFF_F000)
-            as *mut u64;
-        let l3_ptr = l3.add(l3_idx);
-        let l3_entry = *l3_ptr;
-
-        if (l3_entry & PAGE_VALID) != PAGE_VALID {
-            return None;
-        }
-
-        // Get physical address before clearing
-        let phys = l3_entry & 0x0000_FFFF_FFFF_F000;
-
-        // Clear the entry
-        *l3_ptr = 0;
-
-        // Flush TLB for this address
-        crate::arch::aarch64::paging::flush_tlb(vaddr);
-
-        Some(phys)
     }
 }

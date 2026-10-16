@@ -122,8 +122,8 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   (mm_count) keeps the struct and the top-level table.
 - **Frame references.** Every present user PTE holds one reference on its
   frame: a fault allocates with count 1, fork increfs each frame it
-  shares, a SysV shm attachment takes one per page (the segment holds its
-  own), splitting a 2MB page gives each 4KB frame the head's count.
+  shares, a shared object (shared anonymous memory, a SysV shm segment)
+  holds its own on each of its pages, splitting a 2MB page gives each 4KB frame the head's count.
   Unmapping drops the reference and the last one frees the frame. Frames
   outside the allocator (MMIO) have no count and are never freed.
 - **Shared anonymous memory.** A MAP_SHARED|MAP_ANONYMOUS mapping gets a
@@ -137,7 +137,11 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   radix tree of 512-entry nodes, like a page table) are user memory
   from frames, none from the kernel heap (they stop at the kernel's
   reserve; a fault out of memory kills the process). The object holds
-  a reference on each page; it goes with its last VMA.
+  a reference on each page; it goes with its last VMA. A SysV shm
+  segment is such an object too: shmat maps it lazily, and each attach
+  VMA holds a `ShmAttach` counted in shm_nattch (Linux shm_open /
+  shm_close), so fork, split, munmap, shmdt, exit and exec keep the
+  count, and the last detach of a removed segment destroys it.
 - **fork (Linux dup_mmap / copy_page_range).** Each VMA is copied with its
   PTEs: a MAP_SHARED mapping keeps sharing its pages (writes stay
   visible both ways); a private one shares them copy-on-write (both

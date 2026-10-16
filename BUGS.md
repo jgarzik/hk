@@ -73,9 +73,14 @@ Address spaces are reference counted and torn down like Linux
   unreachable while swap-out is inert): copying one needs counted swap
   slots safe against a racing swap-in (Linux swap_duplicate under
   si->lock); to be done with the reclaim work.
-- SysV shm: fork and exit do not update `shm_nattch`; a segment removed
-  with IPC_RMID while attached by a process that exits without shmdt is
-  never destroyed (its own reference on the frames is never dropped).
+- SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
+  IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
+  by id still work there); shmdt needs the address an attachment starts
+  at (Linux also finds a piece moved by mremap); SHM_EXEC is ignored;
+  shmat checks RLIMIT_AS before SHM_REMAP unmaps the old range, and an
+  address that SHM_RND rounds to 0 is EPERM (Linux picks an address).
+- MADV_REMOVE of a file mapping is EOPNOTSUPP (no filesystem punches
+  holes).
 - Exited non-leader threads stay in the task table as zombies (Linux
   reaps them at once); their kernel stacks and memory are freed.
 - munmap keeps page-table pages that become empty (freed at exit).

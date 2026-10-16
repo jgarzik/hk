@@ -211,14 +211,12 @@ impl MmStruct {
                 self.split_vma(i, at);
             }
         }
-        let mut removed = Vec::new();
-        self.vmas.retain(|vma| {
-            let inside = vma.start >= start && vma.end <= end;
-            if inside {
-                removed.push(vma.clone());
-            }
-            !inside
-        });
+        // Moved out, not cloned: a clone would count as another SysV
+        // shm attachment
+        let (removed, kept) = core::mem::take(&mut self.vmas)
+            .into_iter()
+            .partition(|v| v.start >= start && v.end <= end);
+        self.vmas = kept;
         removed
     }
 

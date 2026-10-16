@@ -1226,6 +1226,11 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
         {
             return e.sysret();
         }
+        // A SHM_RDONLY attachment cannot be made writable (Linux: no
+        // VM_MAYWRITE)
+        if prot & PROT_WRITE != 0 && vma.shm.as_ref().is_some_and(|a| a.rdonly()) {
+            return KernelError::PermissionDenied.sysret();
+        }
 
         vmas_to_update.push((update_start, update_end, vma.prot));
         covered_start = vma.end;
@@ -1548,16 +1553,7 @@ pub fn sys_madvise(addr: u64, length: u64, advice: i32) -> i64 {
             // Simplified: treat as DONTNEED (kernel frees pages immediately)
             madvise_dontneed(&mm, addr, end)
         }
-        MADV_REMOVE => {
-            // Zap the range, then free the backing of shared anonymous
-            // memory there (Linux madvise_remove: a hole punch); file
-            // holes are not punched
-            let r = madvise_dontneed(&mm, addr, end);
-            if r == 0 {
-                madvise_punch(&mm, addr, end);
-            }
-            r
-        }
+        MADV_REMOVE => madvise_remove(&mm, addr, end),
         MADV_COLD | MADV_PAGEOUT => {
             // These are hints for memory reclaim (LRU demotion / swap out)
             // Without a proper LRU and swap infrastructure, these are no-ops
@@ -1662,22 +1658,41 @@ fn madvise_update_vma_flags(
     0
 }
 
-/// Free the shared-object pages backing [start, end) (MADV_REMOVE)
-fn madvise_punch(mm: &alloc::sync::Arc<super::Mm>, start: u64, end: u64) {
-    let holes: Vec<_> = mm
-        .lock()
-        .iter()
-        .filter(|v| v.end > start && v.start < end)
-        .filter_map(|v| {
-            let sh = v.shmem.clone()?;
+/// MADV_REMOVE on [start, end) (Linux madvise_remove): only memory
+/// with a backing object that may be written through the mapping
+/// (EINVAL for private anonymous memory; EACCES for a private file
+/// mapping, a shared one of a file not open for writing, or a SHM_RDONLY
+/// attachment; EOPNOTSUPP for a file, as for a Linux filesystem without
+/// hole punching, like ramfs); zaps the range, then punches the hole in
+/// the shared object backing it
+fn madvise_remove(mm: &alloc::sync::Arc<super::Mm>, start: u64, end: u64) -> i64 {
+    let mut holes = Vec::new();
+    for v in mm.lock().iter().filter(|v| v.end > start && v.start < end) {
+        if v.file.is_none() && v.shmem.is_none() {
+            return KernelError::InvalidArgument.sysret();
+        }
+        let maywrite = v.is_shared()
+            && v.file.as_ref().is_none_or(|f| f.is_writable())
+            && !v.shm.as_ref().is_some_and(|a| a.rdonly());
+        if !maywrite {
+            return KernelError::PermissionDenied.sysret();
+        }
+        if v.file.is_some() {
+            return KernelError::OperationNotSupported.sysret();
+        }
+        if let Some(sh) = &v.shmem {
             let first = v.offset + start.max(v.start) - v.start;
             let last = v.offset + end.min(v.end) - v.start;
-            Some((sh, first / PAGE_SIZE, last / PAGE_SIZE))
-        })
-        .collect();
-    for (sh, from, to) in holes {
-        sh.punch(from, to);
+            holes.push((sh.clone(), first / PAGE_SIZE, last / PAGE_SIZE));
+        }
     }
+    let r = madvise_dontneed(mm, start, end);
+    if r == 0 {
+        for (sh, from, to) in holes {
+            sh.punch(from, to);
+        }
+    }
+    r
 }
 
 /// Handle MADV_DONTNEED - zap pages in range
