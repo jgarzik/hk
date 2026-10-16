@@ -105,15 +105,24 @@ pub fn init() {
     dev::dev_add_tap(packet::tap);
 }
 
-/// Name for a new physical device from a template like "eth%d" (unique
-/// in the init namespace, where physical devices register)
-pub fn dev_alloc_name(template: &str) -> alloc::string::String {
-    init_net_ns().dev_alloc_name(template)
+/// A new physical device named from `template` ("eth%d"), with RTNL
+/// held until `register_netdev` lists it (Linux alloc_netdev +
+/// register_netdev: the name is chosen and the device registered under
+/// one RTNL hold, so concurrent probes cannot pick the same name)
+pub fn alloc_netdev(
+    template: &str,
+    mac: [u8; 6],
+    link: device::LinkInfo,
+    ops: &'static dyn device::NetDeviceOps,
+) -> (rtnl::RtnlGuard, Arc<NetDevice>) {
+    let r = rtnl::lock();
+    let name = init_net_ns().dev_alloc_name(template);
+    (r, Arc::new(NetDevice::new(name, mac, link, ops)))
 }
 
-/// Register a physical network device in the init namespace; it starts
-/// down and unconfigured
-pub fn register_netdev(dev: Arc<NetDevice>) {
+/// Register a device from `alloc_netdev` in the init namespace and drop
+/// RTNL; it starts down and unconfigured
+pub fn register_netdev(rtnl: rtnl::RtnlGuard, dev: Arc<NetDevice>) {
     let m = dev.mac();
     crate::printkln!(
         "net: registered {} (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
@@ -126,4 +135,5 @@ pub fn register_netdev(dev: Arc<NetDevice>) {
         m[5]
     );
     init_net_ns().register_device(dev);
+    drop(rtnl);
 }

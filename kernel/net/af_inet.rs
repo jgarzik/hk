@@ -129,6 +129,14 @@ impl Inet {
         *self.addr.lock()
     }
 
+    /// Set the bound (receive) and source addresses (bind: before the
+    /// port is published in a table, Linux inet_bind order)
+    pub fn set_saddrs(&self, rcv: Ipv4Addr, saddr: Ipv4Addr) {
+        let mut a = self.addr.lock();
+        a.rcv_saddr = rcv;
+        a.saddr = saddr;
+    }
+
     pub fn flag(&self, f: u32) -> bool {
         self.flags.load(Ordering::Acquire) & f != 0
     }

@@ -451,7 +451,13 @@ pub fn netif_rx(skb: Box<SkBuff>) -> bool {
 /// is delivered before `sendto()` returns).
 ///
 /// Call only at a point where the caller holds no locks (end of a socket
-/// send). If the softnet thread is mid-round, the packets are left to it.
+/// send; never under a socket lock: delivery takes socket locks). If the
+/// softnet thread is mid-round, the packets are left to it.
+///
+/// Relies on tasks never migrating: the backlog `lo` queued to in this
+/// task's transmit is this CPU's. With migration, the CPU used by
+/// `netif_rx` must be recorded (or every CPU's backlog flushed);
+/// otherwise the packets still arrive, via that CPU's softnet thread.
 pub fn netif_rx_flush_local() {
     let sd = this_softnet();
     let mut budget = NETDEV_BUDGET;

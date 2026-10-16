@@ -98,6 +98,11 @@ impl PingSock {
     /// Linux inet_autobind (EAGAIN when no identifier is free)
     fn autobind(&self) -> Result<(), KernelError> {
         let _g = self.op.lock();
+        self.autobind_locked()
+    }
+
+    /// `autobind` with `op` held
+    fn autobind_locked(&self) -> Result<(), KernelError> {
         if self.inet.get().sport != 0 {
             return Ok(());
         }
@@ -216,10 +221,17 @@ impl ProtoOps for PingSock {
         if self.inet.get().sport != 0 {
             return Err(KernelError::InvalidArgument);
         }
-        let id = self.get_port(ident)?;
+        // Address before the identifier table entry (Linux inet_bind)
+        self.inet.set_saddrs(addr, addr);
+        let id = match self.get_port(ident) {
+            Ok(id) => id,
+            Err(e) => {
+                self.inet
+                    .set_saddrs(Ipv4Addr::default(), Ipv4Addr::default());
+                return Err(e);
+            }
+        };
         let mut s = self.inet.addr.lock();
-        s.rcv_saddr = addr;
-        s.saddr = addr;
         s.sport = id;
         s.daddr = Ipv4Addr::default();
         s.dport = 0;
@@ -237,8 +249,8 @@ impl ProtoOps for PingSock {
             return Ok(());
         }
         let (daddr, dport) = af_inet::sin_parse(a, false)?;
-        self.autobind()?;
         let _g = self.op.lock();
+        self.autobind_locked()?;
         let rt = self.route(daddr, self.inet.get().saddr, self.sk.bound_dev_if())?;
         let mut s = self.inet.addr.lock();
         if s.saddr.is_unspecified() {

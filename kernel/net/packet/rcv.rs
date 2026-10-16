@@ -100,9 +100,13 @@ impl PktQueue {
         self.rmem.load(Ordering::Relaxed)
     }
 
+    /// Purge the queue, uncharging exactly what it held (a concurrent
+    /// enqueue charges before it pushes, a dequeue uncharges after it
+    /// pops: zeroing the counter would let them skew it)
     pub fn clear(&self) {
-        self.q.lock().clear();
-        self.rmem.store(0, Ordering::Release);
+        let q = core::mem::take(&mut *self.q.lock());
+        let n: usize = q.iter().map(|x| truesize(x.data.len())).sum();
+        self.rmem.fetch_sub(n, Ordering::AcqRel);
     }
 
     /// Wait for a frame (Linux __skb_recv_datagram: a pending error

@@ -727,12 +727,8 @@ impl BusDriver for E1000PciDriver {
         let ops: &'static dyn NetDeviceOps = Box::leak(Box::new(E1000Ops {
             device: Arc::clone(&device),
         }));
-        let netdev = Arc::new(NetDevice::new(
-            net::dev_alloc_name("eth%d"),
-            mac,
-            LinkInfo::ETHER,
-            ops,
-        ));
+        // RTNL from naming to registration (Linux register_netdev)
+        let (rtnl, netdev) = net::alloc_netdev("eth%d", mac, LinkInfo::ETHER, ops);
         device.netdev.call_once(|| Arc::downgrade(&netdev));
 
         // Carrier from the PHY now; later changes arrive as LSC interrupts
@@ -756,7 +752,7 @@ impl BusDriver for E1000PciDriver {
             }
         }
 
-        net::register_netdev(Arc::clone(&netdev));
+        net::register_netdev(rtnl, Arc::clone(&netdev));
 
         Ok(Box::new(E1000DeviceWrapper { netdev, device }))
     }

@@ -977,6 +977,8 @@ fn newneigh(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
         Some(a) => Some([a[0], a[1], a[2], a[3], a[4], a[5]]),
         None => None,
     };
+    // Configuration change: under RTNL (Linux neigh_add is a locked doit)
+    let _r = rtnl::lock();
     sk.net().arp.admin_add(&dev, &key, ll, r.state, h.flags)?;
     Ok(Done::Ok)
 }
@@ -985,6 +987,7 @@ fn newneigh(sk: &NlSock, h: &Hdr, p: &[u8]) -> Result<Done, KernelError> {
 fn delneigh(sk: &NlSock, p: &[u8]) -> Result<Done, KernelError> {
     let r = ndmsg(p)?;
     let (dev, key) = nd_target(sk.net(), &r)?;
+    let _r = rtnl::lock();
     sk.net().arp.admin_del(dev.ifindex(), &key)?;
     Ok(Done::Ok)
 }

@@ -461,12 +461,8 @@ impl VirtioDriver for VirtioNetDriver {
         let ops: &'static dyn NetDeviceOps = Box::leak(Box::new(VirtioNetOps {
             device: Arc::clone(&device),
         }));
-        let netdev = Arc::new(NetDevice::new(
-            net::dev_alloc_name("eth%d"),
-            mac,
-            LinkInfo::ETHER,
-            ops,
-        ));
+        // RTNL from naming to registration (Linux register_netdev)
+        let (rtnl, netdev) = net::alloc_netdev("eth%d", mac, LinkInfo::ETHER, ops);
         device.netdev.call_once(|| Arc::downgrade(&netdev));
         // Carrier now; later changes arrive as config interrupts
         if device.link_up() {
@@ -486,7 +482,7 @@ impl VirtioDriver for VirtioNetDriver {
             irq,
             if device.link_up() { "up" } else { "down" }
         );
-        net::register_netdev(Arc::clone(&netdev));
+        net::register_netdev(rtnl, Arc::clone(&netdev));
         Ok(Box::new(VirtioNetWrapper { netdev, device }))
     }
 }

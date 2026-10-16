@@ -405,9 +405,14 @@ impl TcpSock {
 
     // --- segment input --------------------------------------------------------
 
-    /// A segment for this connection (Linux tcp_v4_do_rcv)
-    fn rcv(&self, s: &SegIn, now: u64) {
+    /// A segment for this connection (Linux tcp_v4_do_rcv), found in
+    /// ehash under `t`: dropped if the socket left that tuple between
+    /// the lookup and taking its lock
+    fn rcv(&self, s: &SegIn, t: Tuple, now: u64) {
         self.step(|g, out| {
+            if g.tuple != Some(t) {
+                return;
+            }
             if g.cb.state == TcpState::SynReceived
                 && s.has(flags::ACK)
                 && g.parent
@@ -631,11 +636,14 @@ impl TcpSock {
         let peek = flags & MSG_PEEK != 0;
         let skip = if peek { off } else { 0 };
         let want = want.min(CHUNK);
+        // Readers are serialized across peek -> copy -> consume; a
+        // discarding (MSG_TRUNC) reader too, or it would consume bytes
+        // another reader has copied but not yet consumed
+        let _rd = self.rd.lock();
         if flags & MSG_TRUNC != 0 && !peek {
             return Ok(self.step(|g, out| g.cb.discard(want, out)));
         }
         let mut buf = alloc::vec![0u8; want];
-        let _rd = self.rd.lock();
         let n = self.step(|g, out| g.cb.recv(&mut buf, skip, false, out));
         if n == 0 || flags & MSG_TRUNC != 0 {
             return Ok(n);
@@ -779,7 +787,7 @@ pub fn tcp_rcv(skb: SkBuff) {
     };
     let now = now_ms();
     match net.tcp.lookup(&t) {
-        Some(Ent::Sk(sk)) => return sk.rcv(&s, now),
+        Some(Ent::Sk(sk)) => return sk.rcv(&s, t, now),
         // A TIME_WAIT entry consumes it unless it is a new SYN
         Some(Ent::Tw(tw)) if tw.rcv(&s, now) => return,
         _ => {}
@@ -1056,21 +1064,30 @@ impl ProtoOps for TcpSock {
             return Err(KernelError::InvalidArgument);
         }
         let no_port = port == 0 && self.inet.flag(ipf::BIND_NO_PORT);
+        // Like Linux inet_bind: the address is set before the bhash entry
+        // is published (conflict checks read it under bhash), reset if
+        // that fails
+        self.inet.set_saddrs(addr, addr);
         let p = if no_port {
             0
         } else {
             let range = self.sk.net.port_range.get();
-            let p = self
+            match self
                 .sk
                 .net
                 .tcp
-                .bind(&me, &self.bind_info(addr), port, range)?;
-            g.bound = true;
-            p
+                .bind(&me, &self.bind_info(addr), port, range)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    self.inet
+                        .set_saddrs(Ipv4Addr::default(), Ipv4Addr::default());
+                    return Err(e);
+                }
+            }
         };
+        g.bound = !no_port;
         let mut s = self.inet.addr.lock();
-        s.rcv_saddr = addr;
-        s.saddr = addr;
         s.sport = p;
         s.addr_lock = !addr.is_unspecified();
         s.port_lock = port != 0;
