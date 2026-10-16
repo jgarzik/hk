@@ -98,6 +98,14 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   back, or a write-protected page made writable (copied first if still
   shared copy-on-write). Unresolved: SIGSEGV or SIGBUS for a user
   access, EFAULT for a kernel uaccess.
+- Out of memory: pages for user data stop at the reserve kept for the
+  kernel (1/32 of RAM, at least 4MB; Linux min watermark), page tables
+  may dip into it. A user fault that finds no memory kills its process
+  with SIGKILL, logged as `Out of memory: Killed process <pid> (<comm>)`
+  (Linux pagefault_out_of_memory; hk has no OOM killer choosing another
+  victim, and never retries the fault in a loop); a kernel uaccess that
+  finds none fails with EFAULT (Linux kernelmode_fixup_or_oops). Past
+  RLIMIT_AS, mmap/mremap fail with ENOMEM and brk keeps the break.
 - `access_ok` accepts a range only if it ends at or below `TASK_SIZE`;
   SMAP (x86) and PAN (arm64) catch stray kernel accesses to user memory.
 

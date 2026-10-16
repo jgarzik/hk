@@ -327,3 +327,42 @@ fn do_wp_page(ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Result<(), Vm
     increment_min_flt();
     Ok(())
 }
+
+/// A user-mode fault found no memory (Linux pagefault_out_of_memory).
+/// hk has no OOM killer to choose a victim: the faulting process is the
+/// one killed, as the OOM killer would kill it (SIGKILL to every
+/// thread, logged like oom_kill_process), so the fault is never retried
+/// in a loop and the kernel keeps its reserve. Interrupts enabled.
+pub fn pagefault_out_of_memory() -> ! {
+    use crate::signal::{SIGKILL, send_signal};
+    use crate::task::percpu::{TASK_TABLE, current_tid};
+
+    let tid = current_tid();
+    let (pid, name, threads) = {
+        let table = TASK_TABLE.lock();
+        let me = table.tasks.iter().find(|t| t.tid == tid);
+        let pid = me.map_or(0, |t| t.pid);
+        let name = me.map_or([0; 16], |t| t.prctl.name);
+        let threads: alloc::vec::Vec<_> = table
+            .tasks
+            .iter()
+            .filter(|t| t.pid == pid && t.tid != tid)
+            .map(|t| t.tid)
+            .collect();
+        (pid, name, threads)
+    };
+    let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    let exe = super::get_task_mm(tid).and_then(|mm| mm.lock().exe());
+    let comm = match core::str::from_utf8(&name[..len]) {
+        Ok(n) if !n.is_empty() => n,
+        _ => exe
+            .as_deref()
+            .and_then(|p| p.rsplit('/').next())
+            .unwrap_or("?"),
+    };
+    crate::printkln!("Out of memory: Killed process {} ({})", pid, comm);
+    for t in threads {
+        send_signal(t, SIGKILL);
+    }
+    crate::task::proc::do_exit(SIGKILL as i32)
+}

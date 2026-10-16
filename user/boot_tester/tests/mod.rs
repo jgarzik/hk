@@ -87,6 +87,7 @@ pub mod uaccess;
 pub mod packet;
 pub mod busybox;
 pub mod mm_life;
+pub mod mm_oom;
 #[cfg(target_arch = "x86_64")]
 pub mod ioport;
 
@@ -133,6 +134,7 @@ pub fn run_all_tests() {
     ipc::run_tests();
     mmap::run_tests();
     isolated(b"MM_LIFE", mm_life::run_tests);
+    isolated(b"MM_OOM", mm_oom::run_tests);
     isolated(b"LAYOUT", layout::run_tests);
     isolated(b"STARTUP", startup::run_tests);
     isolated(b"ELF_EXEC", elf_exec::run_tests);

@@ -400,6 +400,9 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
             // Error code bit 3: reserved bit violation
             let bus = frame.error_code & 8 != 0 || err == VmFault::Bus;
             enable();
+            if err == VmFault::Oom {
+                crate::mm::fault::pagefault_out_of_memory();
+            }
             let (sig, code) = if bus {
                 (crate::signal::SIGBUS, si_code::BUS_ADRERR)
             } else {
@@ -414,7 +417,8 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
             user_fault(frame, sig, info);
             return 1;
         }
-        // Kernel-mode fault inside a user-copy routine: resume at its
+        // Kernel-mode fault inside a user-copy routine (out of memory
+        // included, Linux kernelmode_fixup_or_oops): resume at its
         // fixup, which reports the uncopied bytes (-> EFAULT)
         if let Some(fixup) = super::uaccess::uaccess_fixup(frame.rip) {
             frame.rip = fixup;

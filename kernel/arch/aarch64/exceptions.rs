@@ -291,7 +291,7 @@ fn mm_fault(far: u64, access: Access) -> Result<(), VmFault> {
 /// Unresolvable data/instruction abort from EL0 at `far` (Linux
 /// do_page_fault/do_alignment_fault): SIGSEGV for translation, access-flag
 /// and permission faults, SIGBUS for a mapping without a page there,
-/// alignment and other aborts
+/// alignment and other aborts; out of memory kills the process
 fn user_abort(
     frame: &mut Aarch64TrapFrame,
     esr: u64,
@@ -301,6 +301,10 @@ fn user_abort(
 ) {
     use crate::signal::{SIGBUS, SIGSEGV};
 
+    if res == Err(VmFault::Oom) {
+        super::cpu::enable_interrupts();
+        crate::mm::fault::pagefault_out_of_memory();
+    }
     let (sig, code) = match fsc {
         _ if res == Err(VmFault::Bus) => (SIGBUS, si_code::BUS_ADRERR),
         0x04..=0x0F => (SIGSEGV, crate::signal::segv_code(far)),
