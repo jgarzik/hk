@@ -8,13 +8,14 @@
 //!   depends on the host): a process faulting in more anonymous memory
 //!   than the machine has is killed by SIGKILL; the kernel and the test
 //!   runner survive, its memory comes back and the next fork works
+//! - OOM_SHARED_KILL (hk only): the same with shared anonymous memory
 
 use super::helpers::{host_mode, print, print_num, println, skip};
 use super::mm_life::meminfo;
 use hk_syscall::{
     sys_brk, sys_close, sys_exit, sys_fork, sys_mmap, sys_mremap, sys_munmap, sys_nanosleep,
     sys_open, sys_read, sys_setrlimit, sys_wait4, RLimit, Timespec, MAP_ANONYMOUS,
-    MAP_PRIVATE, MREMAP_MAYMOVE, O_RDONLY, PROT_READ, PROT_WRITE, RLIMIT_AS,
+    MAP_PRIVATE, MAP_SHARED, MREMAP_MAYMOVE, O_RDONLY, PROT_READ, PROT_WRITE, RLIMIT_AS,
 };
 
 const MAP_NORESERVE: u32 = 0x4000;
@@ -25,7 +26,8 @@ const MB: u64 = 1 << 20;
 
 pub fn run_tests() {
     rlimit_as();
-    fault_kill();
+    fault_kill(b"OOM_FAULT_KILL", hog);
+    fault_kill(b"OOM_SHARED_KILL", hog_shared);
 }
 
 fn report(name: &[u8], ok: bool, detail: i64) {
@@ -140,8 +142,17 @@ fn rlimit_as() {
 /// Child: fault in twice the machine's memory, one write per page; the
 /// fault that finds no memory must kill it
 fn hog() -> u64 {
+    touch_all(MAP_PRIVATE)
+}
+
+/// Child: the same with shared anonymous memory
+fn hog_shared() -> u64 {
+    touch_all(MAP_SHARED)
+}
+
+fn touch_all(share: u32) -> u64 {
     let len = (meminfo(b"MemTotal:").max(0) as u64 * 1024 * 2) & !(PAGE - 1);
-    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+    let flags = share | MAP_ANONYMOUS | MAP_NORESERVE;
     let p = sys_mmap(0, len, PROT_READ | PROT_WRITE, flags, -1, 0);
     if p < 0 {
         return 2;
@@ -159,17 +170,16 @@ fn settle() {
     sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
-fn fault_kill() {
-    const NAME: &[u8] = b"OOM_FAULT_KILL";
+fn fault_kill(name: &[u8], f: fn() -> u64) {
     if host_mode() {
-        skip(NAME, b"Linux OOM killer victim choice depends on the host");
+        skip(name, b"Linux OOM killer victim choice depends on the host");
         return;
     }
     settle();
     let before = meminfo(b"MemFree:");
-    let r = in_child(hog);
+    let r = in_child(f);
     if r != 0x100 + SIGKILL as i64 {
-        report(NAME, false, r);
+        report(name, false, r);
         return;
     }
     // Exact accounting on hk: everything comes back (a few pages may
@@ -183,15 +193,15 @@ fn fault_kill() {
         }
     }
     if before <= 0 || before - after > 512 {
-        print(NAME);
+        print(name);
         print(b": MemFree before ");
         print_num(before);
         print(b" kB, after ");
         print_num(after);
         println(b" kB");
-        report(NAME, false, -2);
+        report(name, false, -2);
         return;
     }
     let again = in_child(|| 0);
-    report(NAME, again == 0, -3);
+    report(name, again == 0, -3);
 }

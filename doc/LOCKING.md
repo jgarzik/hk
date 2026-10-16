@@ -714,6 +714,12 @@ pub struct BitmapFrameAllocator {
   under those leaf locks takes an mm lock (the swap rmap walk uses the
   roots recorded in AnonVma chains, not the task table or mm locks).
   `TASK_TABLE` is never held while taking an mm lock.
+- Shared anonymous memory (`mm::shmem::Shmem`, Linux shmem): its page
+  index `Shmem.root` is a `spin::Mutex` taken by the fault path and by
+  MADV_REMOVE with no other lock held; under it only `FRAME_ALLOCATOR`
+  is taken (index nodes are frames, no heap). The object goes with its
+  last VMA (possibly under the mm lock): its drop takes no lock but
+  `FRAME_ALLOCATOR`.
 - The page-fault path (`kernel/mm/fault.rs`, `handle_mm_fault`, shared by
   both arches) finds the VMA under the mm lock but drops it before
   allocating and installing the PTE (it may sleep reading a file), so a

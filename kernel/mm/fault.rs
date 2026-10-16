@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::anon_vma::AnonVma;
 use super::huge_page::HUGE_PAGE_SIZE;
+use super::shmem::Shmem;
 use super::{Mm, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE, SwapEntry};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{CurrentArch, PageFlags, SchedArch, paging, phys_to_virt};
@@ -55,6 +56,7 @@ struct Area {
     offset: u64,
     file: Option<Arc<File>>,
     anon_vma: Option<Arc<AnonVma>>,
+    shmem: Option<Arc<Shmem>>,
 }
 
 impl Area {
@@ -104,13 +106,14 @@ fn find_area(mm: &Mm, addr: u64, access: Access) -> Result<Area, VmFault> {
         offset: vma.offset,
         file: vma.file.clone(),
         anon_vma: vma.anon_vma.clone(),
+        shmem: vma.shmem.clone(),
     })
 }
 
 /// A frame for user data, unless free memory is down to the reserve
 /// kept for the kernel (Linux: user allocations stop at the min
 /// watermark; page tables, stacks and DMA buffers may still dip below)
-fn alloc_user() -> Option<u64> {
+pub(super) fn alloc_user() -> Option<u64> {
     if FRAME_ALLOCATOR.below_reserve() {
         return None;
     }
@@ -228,10 +231,14 @@ fn do_huge_anon(pgd: u64, addr: u64, area: &Area) -> bool {
 }
 
 /// The page to map at `addr` of a VMA with no page there yet, with a
-/// reference for the new PTE: zeroed for anonymous memory, a private
-/// copy of the file data otherwise (Linux do_anonymous_page,
-/// do_read_fault)
+/// reference for the new PTE: the shared object's page for shared
+/// anonymous memory (Linux shmem_fault), else a new page, zeroed for
+/// anonymous memory or holding a private copy of the file data (Linux
+/// do_anonymous_page, do_read_fault)
 fn fault_page(addr: u64, area: &Area) -> Result<u64, VmFault> {
+    if let Some(sh) = &area.shmem {
+        return sh.get_page(area.pgoff(addr) / PAGE_SIZE);
+    }
     let frame = alloc_user().ok_or(VmFault::Oom)?;
     // SAFETY: a fresh frame, reached through the direct map
     let buf = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(frame), PAGE_SIZE as usize) };

@@ -23,6 +23,7 @@ pub mod page;
 pub mod page_cache;
 pub mod remote;
 pub mod rmap;
+pub mod shmem;
 pub mod swap;
 pub mod swap_entry;
 pub mod swap_state;
@@ -488,8 +489,8 @@ impl MmStruct {
         let mut new_vma = vma.clone();
         new_vma.start = split_addr;
 
-        // Adjust file offset if file-backed
-        if new_vma.file.is_some() {
+        // Adjust the offset into the backing file or shared object
+        if new_vma.file.is_some() || new_vma.shmem.is_some() {
             new_vma.offset += split_addr - vma.start;
         }
 

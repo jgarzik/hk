@@ -126,6 +126,18 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   own), splitting a 2MB page gives each 4KB frame the head's count.
   Unmapping drops the reference and the last one frees the frame. Frames
   outside the allocator (MMIO) have no count and are never freed.
+- **Shared anonymous memory.** A MAP_SHARED|MAP_ANONYMOUS mapping gets a
+  `Shmem` object (Linux shmem_zero_setup) holding its pages by index:
+  every VMA mapping it (fork's copies, split pieces, mremap) faults the
+  same page in, so pages first touched after fork are shared too, and
+  MADV_DONTNEED keeps the data (MADV_REMOVE clears it for every
+  mapping: a page mapped elsewhere is zeroed in place, others freed).
+  Its size is fixed at mmap (a page past it, after mremap grew the
+  mapping, is SIGBUS, as on Linux); its pages and its index (a 4-level
+  radix tree of 512-entry nodes, like a page table) are user memory
+  from frames, none from the kernel heap (they stop at the kernel's
+  reserve; a fault out of memory kills the process). The object holds
+  a reference on each page; it goes with its last VMA.
 - **fork (Linux dup_mmap / copy_page_range).** Each VMA is copied with its
   PTEs: a MAP_SHARED mapping keeps sharing its pages (writes stay
   visible both ways); a private one shares them copy-on-write (both

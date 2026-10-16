@@ -6,6 +6,7 @@ use alloc::sync::Arc;
 
 use crate::fs::File;
 use crate::mm::anon_vma::AnonVma;
+use crate::mm::shmem::Shmem;
 
 /// Protection flags - Linux PROT_* values
 pub const PROT_NONE: u32 = 0;
@@ -234,6 +235,9 @@ pub struct Vma {
     ///
     /// If None, the task's default mempolicy is used.
     pub mempolicy: Option<crate::mm::mempolicy::TaskMempolicy>,
+    /// The pages of shared anonymous memory (MAP_SHARED|MAP_ANONYMOUS),
+    /// indexed from `offset` like a file
+    pub shmem: Option<Arc<Shmem>>,
 }
 
 impl Vma {
@@ -248,6 +252,7 @@ impl Vma {
             offset: 0,
             anon_vma: None,
             mempolicy: None,
+            shmem: None,
         }
     }
 
@@ -269,6 +274,7 @@ impl Vma {
             offset,
             anon_vma: None,
             mempolicy: None,
+            shmem: None,
         }
     }
 
@@ -286,6 +292,7 @@ impl Vma {
             offset: 0,
             anon_vma: Some(anon_vma),
             mempolicy: None,
+            shmem: None,
         }
     }
 
@@ -390,6 +397,13 @@ impl Vma {
                 }
             }
             _ => return false, // One has anon_vma, other doesn't
+        }
+        // Must be the same shared object at contiguous offsets
+        match (&self.shmem, &other.shmem) {
+            (None, None) => {}
+            (Some(a), Some(b))
+                if Arc::ptr_eq(a, b) && self.offset + self.size() == other.offset => {}
+            _ => return false,
         }
         // Must have same file backing with contiguous offsets
         match (&self.file, &other.file) {

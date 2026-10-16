@@ -199,11 +199,15 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     } else {
         // Anonymous mapping
         let mut v = Vma::new(map_addr, map_addr + length, prot, flags | MAP_ANONYMOUS);
-        // Set up anon_vma for private anonymous mappings (for swap-out reverse mapping)
+        // Set up anon_vma for private anonymous mappings (for swap-out
+        // reverse mapping); shared ones get a shared object for their
+        // pages (Linux shmem_zero_setup)
         if is_private {
             let anon_vma = AnonVma::new();
             anon_vma.add_vma(mm.pgd(), map_addr, map_addr + length);
             v.set_anon_vma(anon_vma);
+        } else {
+            v.shmem = Some(super::shmem::Shmem::new(length / PAGE_SIZE));
         }
         v
     };
@@ -1545,10 +1549,14 @@ pub fn sys_madvise(addr: u64, length: u64, advice: i32) -> i64 {
             madvise_dontneed(&mm, addr, end)
         }
         MADV_REMOVE => {
-            // MADV_REMOVE punches holes in file mappings / frees swap entries
-            // For now, treat similarly to DONTNEED (simplified)
-            // Full implementation would use fallocate(FALLOC_FL_PUNCH_HOLE) for files
-            madvise_dontneed(&mm, addr, end)
+            // Zap the range, then free the backing of shared anonymous
+            // memory there (Linux madvise_remove: a hole punch); file
+            // holes are not punched
+            let r = madvise_dontneed(&mm, addr, end);
+            if r == 0 {
+                madvise_punch(&mm, addr, end);
+            }
+            r
         }
         MADV_COLD | MADV_PAGEOUT => {
             // These are hints for memory reclaim (LRU demotion / swap out)
@@ -1652,6 +1660,24 @@ fn madvise_update_vma_flags(
     }
 
     0
+}
+
+/// Free the shared-object pages backing [start, end) (MADV_REMOVE)
+fn madvise_punch(mm: &alloc::sync::Arc<super::Mm>, start: u64, end: u64) {
+    let holes: Vec<_> = mm
+        .lock()
+        .iter()
+        .filter(|v| v.end > start && v.start < end)
+        .filter_map(|v| {
+            let sh = v.shmem.clone()?;
+            let first = v.offset + start.max(v.start) - v.start;
+            let last = v.offset + end.min(v.end) - v.start;
+            Some((sh, first / PAGE_SIZE, last / PAGE_SIZE))
+        })
+        .collect();
+    for (sh, from, to) in holes {
+        sh.punch(from, to);
+    }
 }
 
 /// Handle MADV_DONTNEED - zap pages in range

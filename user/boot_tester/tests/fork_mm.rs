@@ -3,6 +3,16 @@
 //! Tests (parent and child write a word in turn, in lock-step over pipes):
 //! - FORK_SHARED_ANON: a MAP_SHARED|MAP_ANONYMOUS page written before fork
 //!   stays shared: each side sees the other's write
+//! - FORK_SHARED_ANON_LATE: so do shared pages first touched after fork
+//! - SHMEM_DONTNEED / SHMEM_REMOVE: MADV_DONTNEED on shared anonymous
+//!   memory keeps the data (it lives in the shared object); MADV_REMOVE
+//!   frees it (reads zero)
+//! - SHMEM_REMOVE_SHARED: MADV_REMOVE by one process zeroes the page
+//!   for the other too, and the page stays shared
+//! - SHMEM_REMOVE_PAST_SIZE: MADV_REMOVE of a range past the object
+//!   (mapping grown by mremap) is harmless
+//! - SHMEM_BEYOND_SIZE: shared anonymous memory keeps the size it was
+//!   mapped with: a page past it (mapping grown by mremap) is SIGBUS
 //! - FORK_PRIVATE_COW: a MAP_PRIVATE page is copy-on-write: neither side
 //!   sees the other's write
 //! - FORK_MPROTECT_COW: mprotect read-only then read-write after fork does
@@ -16,9 +26,10 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_exit, sys_fork, sys_madvise, sys_mmap, sys_mprotect, sys_munmap, sys_pipe,
-    sys_read, sys_wait4, sys_write, MADV_DONTFORK, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_PRIVATE,
-    MAP_SHARED, PROT_READ, PROT_WRITE,
+    sys_close, sys_exit, sys_fork, sys_madvise, sys_mmap, sys_mprotect, sys_munmap,
+    sys_mremap, sys_pipe, sys_read, sys_wait4, sys_write, MADV_DONTFORK, MADV_DONTNEED,
+    MADV_REMOVE, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_MAYMOVE,
+    PROT_READ, PROT_WRITE,
 };
 
 const MADV_HUGEPAGE: i32 = 14;
@@ -28,10 +39,16 @@ const BEFORE: u64 = 0x1111_0000_0000_0001;
 const CHILD: u64 = 0x2222_0000_0000_0002;
 const PARENT: u64 = 0x3333_0000_0000_0003;
 const SIGSEGV: i32 = 11;
+const SIGBUS: i64 = 7;
 const RW: u32 = PROT_READ | PROT_WRITE;
 
 pub fn run_tests() {
     shared_anon();
+    shared_anon_late();
+    shmem_dontneed();
+    shmem_beyond_size();
+    shmem_remove_shared();
+    shmem_remove_past_size();
     private_cow();
     mprotect_cow();
     rdonly_cow();
@@ -157,6 +174,124 @@ fn one_page(name: &[u8], flags: u32, f: fn(u64) -> i64) {
 
 fn shared_anon() {
     one_page(b"FORK_SHARED_ANON", MAP_SHARED, |p| exchange(p + 8, true, nop));
+}
+
+fn shared_anon_late() {
+    const NAME: &[u8] = b"FORK_SHARED_ANON_LATE";
+    let p = map(2 * PAGE, MAP_SHARED);
+    if p == 0 {
+        report(NAME, -1);
+        return;
+    }
+    let (to_child, from_parent) = pipe();
+    let (to_parent, from_child) = pipe();
+    let pid = sys_fork();
+    if pid == 0 {
+        // Page 1 is first touched here, page 0 by the parent
+        put(p + PAGE, CHILD);
+        send(from_child);
+        recv(to_child);
+        sys_exit(if get(p) == PARENT { 0 } else { 1 });
+    }
+    recv(to_parent);
+    let mut code = if get(p + PAGE) == CHILD { 0 } else { 2 };
+    put(p, PARENT);
+    send(from_parent);
+    let r = reap(pid);
+    if r != 0 {
+        code = 10 + r;
+    }
+    for fd in [to_child, from_parent, to_parent, from_child] {
+        sys_close(fd);
+    }
+    report(NAME, code);
+    sys_munmap(p, 2 * PAGE);
+}
+
+fn shmem_dontneed() {
+    one_page(b"SHMEM_DONTNEED", MAP_SHARED, |p| {
+        put(p, BEFORE);
+        if sys_madvise(p, PAGE, MADV_DONTNEED) != 0 || get(p) != BEFORE {
+            return 1;
+        }
+        0
+    });
+    one_page(b"SHMEM_REMOVE", MAP_SHARED, |p| {
+        put(p, BEFORE);
+        if sys_madvise(p, PAGE, MADV_REMOVE) != 0 || get(p) != 0 {
+            return 1;
+        }
+        0
+    });
+}
+
+fn shmem_remove_shared() {
+    one_page(b"SHMEM_REMOVE_SHARED", MAP_SHARED, |p| {
+        put(p, BEFORE);
+        let (to_child, from_parent) = pipe();
+        let (to_parent, from_child) = pipe();
+        let pid = sys_fork();
+        if pid == 0 {
+            let r = sys_madvise(p, PAGE, MADV_REMOVE);
+            send(from_child);
+            recv(to_child);
+            sys_exit(if r == 0 && get(p) == PARENT { 0 } else { 1 });
+        }
+        recv(to_parent);
+        let mut code = if get(p) == 0 { 0 } else { 2 };
+        put(p, PARENT);
+        send(from_parent);
+        let r = reap(pid);
+        if code == 0 && r != 0 {
+            code = 10 + r;
+        }
+        for fd in [to_child, from_parent, to_parent, from_child] {
+            sys_close(fd);
+        }
+        code
+    });
+}
+
+fn shmem_remove_past_size() {
+    const NAME: &[u8] = b"SHMEM_REMOVE_PAST_SIZE";
+    let p = map(PAGE, MAP_SHARED);
+    let q = sys_mremap(p, PAGE, 1100 * PAGE, MREMAP_MAYMOVE, 0);
+    if p == 0 || q < 0 {
+        report(NAME, -1);
+        return;
+    }
+    let q = q as u64;
+    let r = sys_madvise(q + 1024 * PAGE, PAGE, MADV_REMOVE);
+    report(NAME, if r == 0 { 0 } else { 1000 - r });
+    sys_munmap(q, 1100 * PAGE);
+}
+
+fn shmem_beyond_size() {
+    const NAME: &[u8] = b"SHMEM_BEYOND_SIZE";
+    let p = map(PAGE, MAP_SHARED);
+    if p == 0 {
+        report(NAME, -1);
+        return;
+    }
+    put(p, BEFORE);
+    let q = sys_mremap(p, PAGE, 2 * PAGE, MREMAP_MAYMOVE, 0);
+    if q < 0 {
+        report(NAME, -2);
+        return;
+    }
+    let q = q as u64;
+    let mut code = if get(q) == BEFORE { 0 } else { 1 };
+    let pid = sys_fork();
+    if pid == 0 {
+        get(q + PAGE);
+        sys_exit(0);
+    }
+    let r = reap(pid);
+    if code == 0 && r != 0x100 + SIGBUS {
+        code = 10 + r;
+    }
+    report(NAME, code);
+    sys_munmap(q, 2 * PAGE);
 }
 
 fn private_cow() {
