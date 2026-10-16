@@ -10,7 +10,9 @@ use super::cpu::KERNEL_CODE_SELECTOR;
 use super::lapic;
 use super::paging::phys_to_virt;
 use super::pic;
+use crate::mm::fault::{Access, VmFault};
 use crate::signal::{KSigInfo, si_code};
+use crate::uaccess::pagefault_disabled;
 
 /// LAPIC timer interrupt vector
 pub const LAPIC_TIMER_VECTOR: u8 = 0x40;
@@ -388,44 +390,37 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
         ::core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
     }
 
-    // Handle page faults specially - check for COW, demand paging, etc.
+    // Page faults: demand paging, copy-on-write, swap-in (kernel/mm/fault.rs)
     if vector == 14 {
-        match handle_page_fault(frame, cr2) {
-            Some(true) => {
-                return 1; // Fault handled, resume execution
-            }
-            Some(false) | None => {
-                // Fault not handled - check if user mode
-                // Error code bit 2: User mode access (1) or supervisor (0)
-                let user = (frame.error_code & 4) != 0;
-                if user {
-                    // User mode page fault - signal the task
-                    // Error code bit 3: Reserved bit violation (SIGBUS)
-                    let is_bus_error = (frame.error_code & 8) != 0;
-                    enable();
-                    let (sig, code) = if is_bus_error {
-                        (crate::signal::SIGBUS, si_code::BUS_ADRERR)
-                    } else {
-                        (crate::signal::SIGSEGV, crate::signal::segv_code(cr2))
-                    };
-                    let info = KSigInfo {
-                        code,
-                        addr: cr2,
-                        trapno: 14,
-                        error: frame.error_code,
-                    };
-                    user_fault(frame, sig, info);
-                    return 1;
-                }
-                // Kernel-mode fault inside a user-copy routine: resume at its
-                // fixup, which reports the uncopied bytes (-> EFAULT)
-                if let Some(fixup) = super::uaccess::uaccess_fixup(frame.rip) {
-                    frame.rip = fixup;
-                    return 1;
-                }
-                // Kernel mode fault - fall through to fatal handler
-            }
+        let Err(err) = handle_page_fault(frame, cr2) else {
+            return 1; // resolved: retry the access
+        };
+        // Error code bit 2: user mode access
+        if frame.error_code & 4 != 0 {
+            // Error code bit 3: reserved bit violation
+            let bus = frame.error_code & 8 != 0 || err == VmFault::Bus;
+            enable();
+            let (sig, code) = if bus {
+                (crate::signal::SIGBUS, si_code::BUS_ADRERR)
+            } else {
+                (crate::signal::SIGSEGV, crate::signal::segv_code(cr2))
+            };
+            let info = KSigInfo {
+                code,
+                addr: cr2,
+                trapno: 14,
+                error: frame.error_code,
+            };
+            user_fault(frame, sig, info);
+            return 1;
         }
+        // Kernel-mode fault inside a user-copy routine: resume at its
+        // fixup, which reports the uncopied bytes (-> EFAULT)
+        if let Some(fixup) = super::uaccess::uaccess_fixup(frame.rip) {
+            frame.rip = fixup;
+            return 1;
+        }
+        // Kernel mode fault - fall through to fatal handler
     }
 
     // Any other exception raised by user code (#DE, #UD, #GP, ...) is the
@@ -624,448 +619,27 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
     }
 }
 
-/// Handle page fault, potentially as a COW or demand paging fault
-///
-/// Returns:
-/// - Some(true) if the fault was successfully handled
-/// - Some(false) if the fault was recognized but handling failed
-/// - None if the fault should fall through to fatal handler
-fn handle_page_fault(frame: &X86_64TrapFrame, fault_addr: u64) -> Option<bool> {
-    use crate::arch::x86_64::paging::{PAGE_COW, PAGE_SIZE, PAGE_WRITABLE};
-
-    let error_code = frame.error_code;
-
-    // Error code bits:
-    // - Bit 0 (P): Page was present (1) or not present (0)
-    // - Bit 1 (W): Caused by a write access (1) or read (0)
-    // - Bit 2 (U): User mode access (1) or supervisor (0)
-    let present = (error_code & 1) != 0;
-    let write = (error_code & 2) != 0;
-    // Only user addresses are demand-paged or COW; a kernel access to
-    // one (copy_to_user etc.) is resolved like a user access (Linux:
-    // do_user_addr_fault). Kernel-half addresses are never resolved.
-    if fault_addr >= crate::arch::x86_64::paging::TASK_SIZE {
-        return None;
+/// Resolve a page fault at `addr` (Linux do_user_addr_fault). Only
+/// user addresses are demand-paged or copy-on-write; a kernel access to
+/// one (copy_to_user etc.) is resolved like a user access, unless page
+/// faults are disabled (a spinlock is held: the copy's fixup reports
+/// EFAULT). Kernel-half addresses are never resolved.
+fn handle_page_fault(frame: &X86_64TrapFrame, addr: u64) -> Result<(), VmFault> {
+    let ec = frame.error_code;
+    let user = ec & 4 != 0;
+    if addr >= crate::arch::x86_64::paging::TASK_SIZE || (!user && pagefault_disabled()) {
+        return Err(VmFault::Segv);
     }
-    // A kernel access with page faults disabled (a spinlock is held):
-    // not resolved, the copy's fixup reports EFAULT
-    if error_code & 4 == 0 && crate::uaccess::pagefault_disabled() {
-        return None;
-    }
-
-    // Case 0: Swap fault - non-present page with swap entry in PTE
-    // Must check before demand paging since swapped pages have valid PTEs
-    if !present {
-        // Get current task's page table
-        let cr3: u64;
-        unsafe {
-            ::core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-        }
-
-        // Check if this is a swap entry
-        if let Some(result) = handle_swap_fault(cr3, fault_addr) {
-            return Some(result);
-        }
-        // Fall through to demand paging check
-    }
-
-    // Case 1: Demand paging - page not present, check if in mmap'd VMA
-    if !present && let Some(result) = handle_mmap_fault(fault_addr, write) {
-        return Some(result);
-    }
-    // Fall through - might be a legitimate segfault
-
-    // Case 2: COW fault - must be a write to a present page
-    if !present || !write {
-        return None; // Not a COW candidate
-    }
-
-    // Get current task's page table
-    let cr3: u64;
-    unsafe {
-        ::core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-    }
-
-    // Check if this address is in a huge page - if so, split it first
-    // This implements the "split-first" COW strategy for THP
-    {
-        use crate::arch::x86_64::paging::X86_64PageTable;
-        if let Some((huge_base, _phys)) = X86_64PageTable::is_huge_page_mapped(cr3, fault_addr) {
-            // Split the huge page into 512 4KB pages before handling COW
-            let _ = X86_64PageTable::split_huge_page(cr3, huge_base, &mut &crate::FRAME_ALLOCATOR);
-            // After splitting, the page is now a regular 4KB page - continue with COW handling
-        }
-    }
-
-    // Look up the PTE for this address
-    let (pte_ptr, pte_value) = unsafe { get_pte_for_addr(cr3, fault_addr)? };
-
-    // Check if this is a COW page (has our COW flag set)
-    if pte_value & PAGE_COW == 0 {
-        return None; // Not a COW page
-    }
-
-    // This is a COW fault - handle it
-    let old_phys = pte_value & 0x000F_FFFF_FFFF_F000; // ADDR_MASK
-    let old_flags = pte_value & !0x000F_FFFF_FFFF_F000;
-
-    // Get anon_vma from VMA for rmap updates (Linux: wp_page_copy sets up rmap)
-    use crate::mm::anon_vma::AnonVma;
-    use crate::mm::get_task_mm;
-    use crate::task::percpu::current_tid;
-    use alloc::sync::Arc;
-
-    let anon_vma: Option<Arc<AnonVma>> = {
-        let tid = current_tid();
-        get_task_mm(tid).and_then(|mm| {
-            let mm_guard = mm.lock();
-            mm_guard
-                .find_vma(fault_addr)
-                .and_then(|vma| vma.anon_vma.clone())
-        })
+    // A present user page is always readable: a read fault on one (or
+    // a reserved-bit fault) has nothing to resolve
+    let access = match ec {
+        _ if ec & 0x10 != 0 => Access::Exec,
+        _ if ec & 2 != 0 => Access::Write,
+        _ if ec & 1 != 0 => return Err(VmFault::Segv),
+        _ => Access::Read,
     };
-
-    // Check reference count
-    let refcount = crate::FRAME_ALLOCATOR.refcount(old_phys);
-
-    // Save original PTE value for race detection
-    let orig_pte = pte_value;
-
-    if refcount > 1 {
-        // Shared page: allocate new frame and copy
-        let new_phys = match crate::FRAME_ALLOCATOR.alloc() {
-            Some(p) => p,
-            None => {
-                serial_print(b"COW: Out of memory!\r\n");
-                return Some(false);
-            }
-        };
-
-        // Copy page contents (4KB)
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                phys_to_virt(old_phys) as *const u8,
-                phys_to_virt(new_phys),
-                PAGE_SIZE as usize,
-            );
-        }
-
-        // Update PTE: new frame, restore writable, clear COW flag, set young+dirty
-        // Linux: pte_mkdirty(pte_mkyoung(entry)) in wp_page_copy
-        use crate::arch::x86_64::paging::{PAGE_ACCESSED, PAGE_DIRTY};
-        let new_flags = (old_flags & !PAGE_COW) | PAGE_WRITABLE | PAGE_ACCESSED | PAGE_DIRTY;
-        let new_pte = new_phys | new_flags;
-
-        // Use atomic CAS to update PTE - prevents race with another CPU resolving same fault
-        // Linux: pte_offset_map_lock + pte_same check in wp_page_copy
-        use core::sync::atomic::{AtomicU64, Ordering};
-        let pte_atomic = unsafe { &*(pte_ptr as *const AtomicU64) };
-        match pte_atomic.compare_exchange(orig_pte, new_pte, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => {
-                // Success - we updated the PTE
-                // Update rmap: register new page, remove old page
-                // Linux: folio_add_new_anon_rmap + folio_remove_rmap_pte in wp_page_copy
-                use crate::mm::lru::lru_add_new;
-                use crate::mm::rmap::{page_add_anon_rmap, page_remove_rmap};
-
-                if let Some(ref av) = anon_vma {
-                    page_add_anon_rmap(new_phys, av, fault_addr);
-                }
-                lru_add_new(new_phys);
-
-                // Remove old page from rmap (decrements mapcount)
-                page_remove_rmap(old_phys);
-
-                // Decrement old frame's reference count
-                crate::FRAME_ALLOCATOR.decref(old_phys);
-            }
-            Err(_) => {
-                // Race detected - another CPU already resolved this fault
-                // Free the frame we allocated and return success
-                crate::FRAME_ALLOCATOR.free(new_phys);
-                // Fault is already resolved, no TLB flush needed from us
-                return Some(true);
-            }
-        }
-    } else {
-        // Exclusive page (refcount == 1): just restore writable, clear COW flag
-        // Also set young+dirty bits since we're writing
-        use crate::arch::x86_64::paging::{PAGE_ACCESSED, PAGE_DIRTY};
-        let new_flags = (old_flags & !PAGE_COW) | PAGE_WRITABLE | PAGE_ACCESSED | PAGE_DIRTY;
-        let new_pte = old_phys | new_flags;
-
-        // Use atomic CAS for exclusive case too - prevents race with munmap
-        use core::sync::atomic::{AtomicU64, Ordering};
-        let pte_atomic = unsafe { &*(pte_ptr as *const AtomicU64) };
-        if pte_atomic
-            .compare_exchange(orig_pte, new_pte, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            // Race detected - PTE changed, fault resolved elsewhere
-            return Some(true);
-        }
-    }
-
-    // Flush TLB for this address
-    unsafe {
-        core::arch::asm!(
-            "invlpg [{}]",
-            in(reg) fault_addr,
-            options(nostack, preserves_flags)
-        );
-    }
-
-    // Increment minor fault counter (COW is minor - no I/O)
-    crate::task::percpu::increment_min_flt();
-
-    Some(true) // COW fault handled successfully
-}
-
-/// Try to allocate and map a 2MB huge page for a THP-eligible VMA
-///
-/// Returns:
-/// - Some(true) if a huge page was successfully allocated and mapped
-/// - Some(false) if allocation/mapping failed
-/// - None if THP is not applicable (fall through to 4KB allocation)
-fn try_huge_page_fault(
-    cr3: u64,
-    fault_addr: u64,
-    vma_start: u64,
-    vma_end: u64,
-    vma_prot: u32,
-    anon_vma: Option<&alloc::sync::Arc<crate::mm::anon_vma::AnonVma>>,
-) -> Option<bool> {
-    use crate::arch::PageFlags;
-    use crate::arch::x86_64::paging::X86_64PageTable;
-    use crate::mm::huge_page::{HUGE_PAGE_SIZE, huge_page_align_down};
-    use crate::mm::{PROT_EXEC, PROT_WRITE};
-
-    // Calculate the 2MB-aligned region containing this fault
-    let huge_base = huge_page_align_down(fault_addr);
-    let huge_end = huge_base + HUGE_PAGE_SIZE;
-
-    // VMA must fully contain the 2MB region
-    if vma_start > huge_base || vma_end < huge_end {
-        return None; // Fall back to 4KB
-    }
-
-    // Try to allocate a contiguous 2MB physical region
-    // Falls back to 4KB allocation if no contiguous memory available
-    let huge_frame = crate::FRAME_ALLOCATOR.alloc_huge()?;
-
-    // Zero the 2MB region
-    unsafe {
-        core::ptr::write_bytes(phys_to_virt(huge_frame), 0, HUGE_PAGE_SIZE as usize);
-    }
-
-    // Build page flags from VMA protection
-    let mut flags = PageFlags::READ | PageFlags::USER;
-    if vma_prot & PROT_WRITE != 0 {
-        flags |= PageFlags::WRITE;
-    }
-    if vma_prot & PROT_EXEC != 0 {
-        flags |= PageFlags::EXECUTE;
-    }
-
-    // Map the huge page
-    if X86_64PageTable::map_huge_page(
-        cr3,
-        huge_base,
-        huge_frame,
-        flags,
-        &mut &crate::FRAME_ALLOCATOR,
-    )
-    .is_err()
-    {
-        // Mapping failed - free the huge page and fall back
-        crate::FRAME_ALLOCATOR.free_huge(huge_frame);
-        return None;
-    }
-
-    // Register with LRU (track head frame only for huge pages)
-    {
-        use crate::mm::lru::lru_add_new;
-        use crate::mm::rmap::page_add_anon_rmap;
-
-        if let Some(anon_vma) = anon_vma {
-            page_add_anon_rmap(huge_frame, anon_vma, huge_base);
-        }
-        lru_add_new(huge_frame);
-    }
-
-    // Flush TLB for the huge page region (invlpg on any address in the 2MB
-    // range invalidates the entire huge page TLB entry)
-    unsafe {
-        ::core::arch::asm!(
-            "invlpg [{}]",
-            in(reg) huge_base,
-            options(nostack, preserves_flags)
-        );
-    }
-
-    // Increment minor fault counter (THP is still minor - no I/O)
-    crate::task::percpu::increment_min_flt();
-
-    Some(true) // Huge page mapped successfully
-}
-
-/// Handle a page fault for an mmap'd region (demand paging)
-///
-/// Returns:
-/// - Some(true) if the fault was handled successfully
-/// - Some(false) if the fault was recognized but handling failed (e.g., OOM)
-/// - None if the address is not in any VMA
-fn handle_mmap_fault(fault_addr: u64, is_write: bool) -> Option<bool> {
-    use crate::arch::x86_64::paging::{
-        PAGE_NO_EXECUTE, PAGE_PRESENT, PAGE_SIZE, PAGE_USER, PAGE_WRITABLE,
-    };
-    use crate::mm::{PROT_EXEC, PROT_WRITE, get_task_mm};
-    use crate::task::percpu::current_tid;
-
-    // Get current task's mm
-    let tid = current_tid();
-    let mm = get_task_mm(tid)?;
-
-    // Lock mm and find VMA
-    let mut mm_guard = mm.lock();
-    let vma = match mm_guard.find_vma(fault_addr) {
-        Some(vma) => vma,
-        None => {
-            // No VMA found - try stack expansion for VM_GROWSDOWN VMAs
-            // Linux: mm/memory.c expand_stack() called from __do_page_fault()
-            // No VMA and no expandable VMA -> None
-            let vma_idx = mm_guard.find_expandable_vma(fault_addr)?;
-            if mm_guard.expand_downwards(vma_idx, fault_addr).is_err() {
-                return Some(false); // Expansion failed
-            }
-            // Re-lookup the VMA after expansion
-            mm_guard.find_vma(fault_addr)?
-        }
-    };
-
-    // Check permissions
-    if is_write && !vma.is_writable() {
-        return Some(false); // Write to read-only region
-    }
-
-    // Clone VMA info we need (release lock before allocating)
-    let vma_prot = vma.prot;
-    let vma_is_anonymous = vma.is_anonymous();
-    let vma_is_anon_private = vma.is_anon_private();
-    let vma_is_thp_eligible = vma.is_thp_eligible();
-    let vma_file = vma.file.clone();
-    let vma_start = vma.start;
-    let vma_end = vma.end;
-    let vma_offset = vma.offset;
-    let vma_anon_vma = vma.anon_vma.clone();
-    drop(mm_guard);
-
-    // Get current page table
-    let cr3: u64;
-    unsafe {
-        ::core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-    }
-
-    // Try THP (Transparent Huge Page) allocation for eligible VMAs
-    if vma_is_thp_eligible
-        && let Some(result) = try_huge_page_fault(
-            cr3,
-            fault_addr,
-            vma_start,
-            vma_end,
-            vma_prot,
-            vma_anon_vma.as_ref(),
-        )
-    {
-        return Some(result);
-    }
-    // Fall through to 4KB allocation if THP failed
-
-    // Allocate a physical frame
-    let frame = match crate::FRAME_ALLOCATOR.alloc() {
-        Some(f) => f,
-        None => return Some(false), // OOM
-    };
-
-    // Initialize the page contents
-    if vma_is_anonymous {
-        // Anonymous mapping - zero the page
-        unsafe {
-            core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize);
-        }
-    } else if let Some(file) = vma_file {
-        // File-backed mapping - read file contents into the page
-        // Calculate file offset for this page
-        let page_addr = fault_addr & !0xFFF;
-        let file_offset = vma_offset + (page_addr - vma_start);
-
-        // First zero the frame in case the read is partial (e.g., at EOF)
-        unsafe {
-            core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize);
-        }
-
-        // Read from file into the frame (through the direct map)
-        let buf =
-            unsafe { core::slice::from_raw_parts_mut(phys_to_virt(frame), PAGE_SIZE as usize) };
-        let _read_result = file.pread(buf, file_offset);
-        // If read fails or returns less than PAGE_SIZE, the remaining bytes are already zeroed
-        // This matches Linux behavior for holes/errors
-    } else {
-        // File-backed but no file reference (shouldn't happen) - zero it
-        unsafe {
-            core::ptr::write_bytes(phys_to_virt(frame), 0, PAGE_SIZE as usize);
-        }
-    }
-
-    // Build page table entry flags
-    // Set ACCESSED bit since we're mapping due to access (Linux: pte_mkyoung)
-    use crate::arch::x86_64::paging::PAGE_ACCESSED;
-    let mut flags = PAGE_PRESENT | PAGE_USER | PAGE_ACCESSED;
-    if vma_prot & PROT_WRITE != 0 {
-        flags |= PAGE_WRITABLE;
-    }
-    if vma_prot & PROT_EXEC == 0 {
-        flags |= PAGE_NO_EXECUTE;
-    }
-
-    // Get current page table
-    let cr3: u64;
-    unsafe {
-        ::core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-    }
-
-    // Map the page
-    let page_addr = fault_addr & !0xFFF;
-    if map_user_page(cr3, page_addr, frame, flags).is_err() {
-        // Mapping failed, free the frame
-        crate::FRAME_ALLOCATOR.free(frame);
-        return Some(false);
-    }
-
-    // Register anonymous page with LRU and page descriptors for swap support
-    if vma_is_anon_private {
-        use crate::mm::lru::lru_add_new;
-        use crate::mm::rmap::page_add_anon_rmap;
-
-        if let Some(ref anon_vma) = vma_anon_vma {
-            page_add_anon_rmap(frame, anon_vma, page_addr);
-        }
-        lru_add_new(frame);
-    }
-
-    // Flush TLB for this address
-    unsafe {
-        ::core::arch::asm!(
-            "invlpg [{}]",
-            in(reg) page_addr,
-            options(nostack, preserves_flags)
-        );
-    }
-
-    // Increment minor fault counter (demand paging is minor - no I/O from disk)
-    crate::task::percpu::increment_min_flt();
-
-    Some(true)
+    let mm = crate::mm::get_task_mm(crate::task::percpu::current_tid()).ok_or(VmFault::Segv)?;
+    crate::mm::fault::handle_mm_fault(&mm, addr, access)
 }
 
 /// Map a user page, allocating intermediate page tables as needed
@@ -1204,203 +778,6 @@ pub fn unmap_user_page(cr3: u64, vaddr: u64) -> Option<u64> {
 
         Some(phys)
     }
-}
-
-/// Walk page tables and return pointer to PTE and its current value
-///
-/// Returns (pte_pointer, pte_value) or None if page table walk fails
-unsafe fn get_pte_for_addr(cr3: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
-    use crate::arch::x86_64::paging::{PAGE_HUGE, PAGE_PRESENT};
-
-    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
-    let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
-
-    unsafe {
-        // PML4
-        let pml4 = phys_to_virt(cr3) as *const u64;
-        let pml4_entry = *pml4.add(pml4_idx);
-        if pml4_entry & PAGE_PRESENT == 0 {
-            return None;
-        }
-
-        // PDPT
-        let pdpt = phys_to_virt(pml4_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
-        let pdpt_entry = *pdpt.add(pdpt_idx);
-        if pdpt_entry & PAGE_PRESENT == 0 {
-            return None;
-        }
-        if pdpt_entry & PAGE_HUGE != 0 {
-            return None; // 1GB huge page, not handling COW for these
-        }
-
-        // PD
-        let pd = phys_to_virt(pdpt_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
-        let pd_entry = *pd.add(pd_idx);
-        if pd_entry & PAGE_PRESENT == 0 {
-            return None;
-        }
-        if pd_entry & PAGE_HUGE != 0 {
-            return None; // 2MB huge page, not handling COW for these
-        }
-
-        // PT
-        let pt = phys_to_virt(pd_entry & 0x000F_FFFF_FFFF_F000) as *mut u64;
-        let pte_ptr = pt.add(pt_idx);
-        let pte_value = *pte_ptr;
-
-        if pte_value & PAGE_PRESENT == 0 {
-            return None;
-        }
-
-        Some((pte_ptr, pte_value))
-    }
-}
-
-/// Walk page tables and return pointer to PTE, even for non-present entries
-///
-/// Unlike get_pte_for_addr, this returns the PTE value even when PAGE_PRESENT is 0,
-/// which is needed to detect swap entries.
-///
-/// Returns (pte_pointer, pte_value) or None if page table walk fails at higher levels
-unsafe fn get_pte_for_swap(cr3: u64, vaddr: u64) -> Option<(*mut u64, u64)> {
-    use crate::arch::x86_64::paging::{PAGE_HUGE, PAGE_PRESENT};
-
-    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
-    let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
-
-    unsafe {
-        // PML4 - must be present
-        let pml4 = phys_to_virt(cr3) as *const u64;
-        let pml4_entry = *pml4.add(pml4_idx);
-        if pml4_entry & PAGE_PRESENT == 0 {
-            return None;
-        }
-
-        // PDPT - must be present
-        let pdpt = phys_to_virt(pml4_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
-        let pdpt_entry = *pdpt.add(pdpt_idx);
-        if pdpt_entry & PAGE_PRESENT == 0 {
-            return None;
-        }
-        if pdpt_entry & PAGE_HUGE != 0 {
-            return None; // 1GB huge page, no swap support
-        }
-
-        // PD - must be present
-        let pd = phys_to_virt(pdpt_entry & 0x000F_FFFF_FFFF_F000) as *const u64;
-        let pd_entry = *pd.add(pd_idx);
-        if pd_entry & PAGE_PRESENT == 0 {
-            return None;
-        }
-        if pd_entry & PAGE_HUGE != 0 {
-            return None; // 2MB huge page, no swap support
-        }
-
-        // PT - return PTE regardless of present bit (for swap detection)
-        let pt = phys_to_virt(pd_entry & 0x000F_FFFF_FFFF_F000) as *mut u64;
-        let pte_ptr = pt.add(pt_idx);
-        let pte_value = *pte_ptr;
-
-        Some((pte_ptr, pte_value))
-    }
-}
-
-/// Handle a page fault for a swapped-out page
-///
-/// Detects swap entries in PTEs and performs swap-in:
-/// 1. Check if PTE contains a swap entry (non-present with swap marker)
-/// 2. Allocate a new physical frame
-/// 3. Read page data from swap device
-/// 4. Update PTE to point to the new frame
-/// 5. Free the swap slot
-///
-/// Returns:
-/// - Some(true) if the swap fault was handled successfully
-/// - Some(false) if swap-in failed (e.g., OOM, I/O error)
-/// - None if the PTE is not a swap entry
-fn handle_swap_fault(cr3: u64, fault_addr: u64) -> Option<bool> {
-    use crate::arch::x86_64::paging::{PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
-    use crate::mm::{SwapEntry, free_swap_entry, swap_cache_lookup, swap_read_page};
-
-    // Get the PTE (including non-present entries)
-    let (pte_ptr, pte_value) = unsafe { get_pte_for_swap(cr3, fault_addr)? };
-
-    // Check if this is a swap entry
-    if !SwapEntry::is_swap_pte(pte_value) {
-        return None; // Not a swap entry, let other handlers deal with it
-    }
-
-    let entry = SwapEntry::from_pte(pte_value);
-
-    // Step 1: Check swap cache first
-    if let Some(cached) = swap_cache_lookup(entry) {
-        let frame = cached.frame;
-
-        // Update PTE with cached page
-        let new_pte = frame | PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE;
-        unsafe {
-            core::ptr::write_volatile(pte_ptr, new_pte);
-        }
-
-        // Flush TLB
-        unsafe {
-            ::core::arch::asm!(
-                "invlpg [{}]",
-                in(reg) fault_addr,
-                options(nostack, preserves_flags)
-            );
-        }
-
-        // Increment major fault counter (swap cache hit still counts as major)
-        crate::task::percpu::increment_maj_flt();
-
-        return Some(true);
-    }
-
-    // Step 2: Allocate new frame
-    let frame = match crate::FRAME_ALLOCATOR.alloc() {
-        Some(f) => f,
-        None => {
-            serial_print(b"swap_fault: Out of memory!\r\n");
-            return Some(false);
-        }
-    };
-
-    // Step 3: Read from swap
-    if swap_read_page(entry, frame).is_err() {
-        // I/O error - free frame and fail
-        crate::FRAME_ALLOCATOR.free(frame);
-        serial_print(b"swap_fault: Swap I/O error!\r\n");
-        return Some(false);
-    }
-
-    // Step 4: Update PTE - clear swap entry, set present with user/writable flags
-    // Note: This is simplified - real implementation would preserve original flags
-    let new_pte = frame | PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE;
-    unsafe {
-        core::ptr::write_volatile(pte_ptr, new_pte);
-    }
-
-    // Step 5: Flush TLB for this address
-    unsafe {
-        ::core::arch::asm!(
-            "invlpg [{}]",
-            in(reg) fault_addr,
-            options(nostack, preserves_flags)
-        );
-    }
-
-    // Step 6: Free swap slot (page is now in RAM)
-    free_swap_entry(entry);
-
-    // Increment major fault counter (swap-in requires I/O)
-    crate::task::percpu::increment_maj_flt();
-
-    Some(true) // Swap-in successful
 }
 
 fn serial_print(s: &[u8]) {

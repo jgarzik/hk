@@ -13,6 +13,7 @@
 //! TTBR1_EL1 maps the kernel (upper half): see kmap.rs and doc/MEMORY.md.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{FrameAlloc, Leaf, MapError, PageFlags, PageTable};
 
@@ -159,6 +160,114 @@ pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
 /// A leaf entry maps a page
 pub fn pte_present(pte: u64) -> bool {
     pte & 1 != 0
+}
+
+// ============================================================================
+// User PTE helpers for the generic fault and fork paths (kernel/mm)
+// ============================================================================
+
+/// AP[2]: read-only at every level
+const AP_RDONLY: u64 = 1 << 7;
+
+/// The descriptor at `idx` (mod 512) of the table at `table`, as an atomic
+fn entry_atomic(table: *mut u64, idx: u64) -> &'static AtomicU64 {
+    // SAFETY: a live table frame reached through the linear map
+    unsafe { AtomicU64::from_ptr(table.add((idx & 511) as usize)) }
+}
+
+/// Pointer to the 2MB-level (L2) entry for `va` in the tables rooted at
+/// `root` (Linux pmd_offset); None if an upper level is missing
+pub fn pmd_ptr(root: u64, va: u64) -> Option<*mut u64> {
+    let mut table = phys_to_virt(root) as *mut u64;
+    for shift in [39, 30] {
+        let e = entry_atomic(table, va >> shift).load(Ordering::Acquire);
+        if e & 0b11 != DESC_TABLE {
+            return None;
+        }
+        table = phys_to_virt(e & ADDR_MASK) as *mut u64;
+    }
+    Some(entry_atomic(table, va >> 21).as_ptr())
+}
+
+/// A 2MB-level entry maps a huge page (block)
+pub fn pmd_huge(pmd: u64) -> bool {
+    pmd & 0b11 == DESC_BLOCK
+}
+
+/// Pointer to the 4KB leaf (L3) entry for `va`, allocating the missing
+/// tables (Linux pte_alloc). A table is installed with a compare and
+/// swap, so racing faults share one. None if out of memory or a block
+/// maps `va`.
+pub fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
+    let mut table = phys_to_virt(root) as *mut u64;
+    for shift in [39, 30, 21] {
+        let slot = entry_atomic(table, va >> shift);
+        let mut e = slot.load(Ordering::Acquire);
+        if e & 0b11 == DESC_INVALID {
+            let new = crate::FRAME_ALLOCATOR.alloc()?;
+            // SAFETY: a fresh frame, reached through the linear map
+            unsafe { core::ptr::write_bytes(phys_to_virt(new), 0, PAGE_SIZE as usize) };
+            let ent = new | DESC_TABLE;
+            e = match slot.compare_exchange(e, ent, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => ent,
+                Err(cur) => {
+                    crate::FRAME_ALLOCATOR.free(new);
+                    cur
+                }
+            };
+        }
+        if e & 0b11 != DESC_TABLE {
+            return None;
+        }
+        table = phys_to_virt(e & ADDR_MASK) as *mut u64;
+    }
+    Some(entry_atomic(table, va >> 12).as_ptr())
+}
+
+/// A user leaf entry for `phys` with the protection of a VMA (PROT_*),
+/// access flag set (Linux mk_pte + pte_mkyoung)
+pub fn mk_pte(phys: u64, prot: u32) -> u64 {
+    let mut pte = phys | DESC_PAGE | AF | SH_INNER | ATTR_IDX_NORMAL;
+    pte |= if prot & crate::mm::PROT_WRITE != 0 {
+        AP_EL0_RW
+    } else {
+        AP_EL0_RO
+    };
+    if prot & crate::mm::PROT_EXEC == 0 {
+        pte |= PXN | UXN;
+    }
+    pte
+}
+
+/// Physical address mapped by a 4KB leaf entry
+pub fn pte_addr(pte: u64) -> u64 {
+    pte & ADDR_MASK
+}
+
+/// The entry allows writes
+pub fn pte_write(pte: u64) -> bool {
+    pte & AP_RDONLY == 0
+}
+
+/// The entry allows instruction fetches from EL0
+pub fn pte_exec(pte: u64) -> bool {
+    pte & UXN == 0
+}
+
+/// Writable and young; no longer copy-on-write
+pub fn pte_mkwrite(pte: u64) -> u64 {
+    (pte & !(PAGE_COW | AP_RDONLY)) | AP_EL0_RW | AF
+}
+
+/// Make a page the kernel just filled visible to instruction fetches
+/// (Linux __sync_icache_dcache): clean it to the point of unification
+/// and, for an executable page, invalidate the instruction caches
+pub fn sync_page(phys: u64, exec: bool) {
+    super::cache::cache_clean_range(phys_to_virt(phys), PAGE_SIZE as usize);
+    if exec {
+        // SAFETY: cache maintenance only
+        unsafe { asm!("ic ialluis", "dsb ish", "isb", options(nostack)) };
+    }
 }
 
 /// Tear down the user tables under the TTBR0 root `l0_phys` (the

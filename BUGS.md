@@ -64,8 +64,7 @@ Address spaces are reference counted and torn down like Linux
   no caller), so rmap, the LRU lists and swap-out are inert. Before
   enabling them: `set_anon_mapping` stores an AnonVma pointer without
   taking a reference while `clear_mapping` drops one, swap-out frees a
-  frame even when the rmap walk missed a mapping, and a swap-cache hit
-  maps the cached frame without taking a reference for the PTE.
+  frame even when the rmap walk missed a mapping.
 - fork copies neither 2MB (THP) mappings nor swap PTEs (the child sees
   zero pages there) and turns every writable PTE copy-on-write, MAP_SHARED
   mappings included (writes after fork are not shared).

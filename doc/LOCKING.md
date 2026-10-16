@@ -708,11 +708,15 @@ pub struct BitmapFrameAllocator {
   under those leaf locks takes an mm lock (the swap rmap walk uses the
   roots recorded in AnonVma chains, not the task table or mm locks).
   `TASK_TABLE` is never held while taking an mm lock.
-- The page-fault paths find the VMA under the mm lock but drop it before
-  allocating and installing the PTE (they may sleep reading a file), so a
+- The page-fault path (`kernel/mm/fault.rs`, `handle_mm_fault`, shared by
+  both arches) finds the VMA under the mm lock but drops it before
+  allocating and installing the PTE (it may sleep reading a file), so a
   fault can race munmap of the same range in another thread (gap vs Linux,
   which holds mmap_lock for read across the fault and the page table lock
-  around the PTE update; section 9).
+  around the PTE update; section 9). Racing faults on one page are safe:
+  a missing table is installed with a compare-and-swap (`pte_alloc`; the
+  loser frees its frame) and a PTE is set with a compare-and-swap against
+  the value the fault read (Linux pte_same), the loser dropping its page.
 - Teardown TLB: `free_user` detaches the user half from the top-level
   table, flushes (arm64: `tlbi vmalle1is`, all CPUs; x86: this CPU, if
   the table is loaded here), then frees pages and tables. A CPU that last

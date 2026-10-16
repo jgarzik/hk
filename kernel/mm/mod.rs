@@ -14,6 +14,7 @@ use crate::sync::spin::Mutex;
 use crate::task::Tid;
 
 pub mod anon_vma;
+pub mod fault;
 pub mod huge_page;
 pub mod lru;
 pub mod memory;

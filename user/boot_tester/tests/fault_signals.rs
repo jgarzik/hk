@@ -7,6 +7,8 @@
 //!   instruction; the handler moves the PC past it and edits a register, and
 //!   every other register (x86: including RCX/R11) survives rt_sigreturn
 //! - FAULT_SEGV_ACCERR: store to a read-only page -> SEGV_ACCERR
+//! - FAULT_PROT_NONE: load from a never-touched PROT_NONE page ->
+//!   SEGV_ACCERR (the fault must not map a page there)
 //! - FAULT_SIGILL: ud2 / udf -> SIGILL (ILL_ILLOPN on x86, ILL_ILLOPC on arm64)
 //! - FAULT_SIGFPE: x86 integer divide by zero -> SIGFPE FPE_INTDIV
 //! - FAULT_SIGTRAP: int3 / brk -> SIGTRAP
@@ -17,7 +19,7 @@
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     sys_exit, sys_fork, sys_mmap, sys_munmap, sys_rt_sigaction, sys_rt_sigprocmask, sys_wait4,
-    MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, SA_RESTORER, SA_SIGINFO, SIGILL, SIGSEGV, SIGTRAP,
+    MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, SA_RESTORER, SA_SIGINFO, SIGILL, SIGSEGV, SIGTRAP,
     SIG_BLOCK, SIG_IGN,
 };
 
@@ -285,6 +287,20 @@ fn segv_accerr() -> u64 {
     verify(b"FAULT_SEGV_ACCERR", &a, SIGSEGV, SEGV_ACCERR, addr, a.fault_pc)
 }
 
+fn segv_prot_none() -> u64 {
+    if !install(SIGSEGV) {
+        return 9;
+    }
+    let page = sys_mmap(0, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) as u64;
+    let addr = page + 0x40;
+    #[cfg(target_arch = "x86_64")]
+    let a = run_fault!("mov rax, [rdi]", addr);
+    #[cfg(target_arch = "aarch64")]
+    let a = run_fault!("ldr x12, [x0]", addr);
+    sys_munmap(page, 4096);
+    verify(b"FAULT_PROT_NONE", &a, SIGSEGV, SEGV_ACCERR, addr, a.fault_pc)
+}
+
 fn sigill() -> u64 {
     if !install(SIGILL) {
         return 9;
@@ -370,6 +386,7 @@ fn prep_ignored() -> bool {
 pub fn run_tests() {
     in_child(b"FAULT_SEGV_MAPERR", segv_maperr);
     in_child(b"FAULT_SEGV_ACCERR", segv_accerr);
+    in_child(b"FAULT_PROT_NONE", segv_prot_none);
     in_child(b"FAULT_SIGILL", sigill);
     #[cfg(target_arch = "x86_64")]
     in_child(b"FAULT_SIGFPE", sigfpe);

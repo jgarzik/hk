@@ -89,6 +89,15 @@ Linux: `Documentation/arch/arm64/memory.rst`.
 - `mmap` without a hint allocates top-down from below the stack gap
   (STACK_TOP less RLIMIT_STACK, at least 128 MB); hints are used when
   the whole range is free and mappable.
+- Page faults on user addresses (user mode, or a kernel uaccess) go to
+  the generic `mm::fault::handle_mm_fault` on both arches: the VMA must
+  allow the access (Linux access_error: a read needs any of
+  PROT_READ/WRITE/EXEC, a write PROT_WRITE, an instruction fetch
+  PROT_EXEC), then a missing page is mapped (zeroed, a 2MB page for a
+  MADV_HUGEPAGE area, or a copy of the file data), a swap entry read
+  back, or a write-protected page made writable (copied first if still
+  shared copy-on-write). Unresolved: SIGSEGV or SIGBUS for a user
+  access, EFAULT for a kernel uaccess.
 - `access_ok` accepts a range only if it ends at or below `TASK_SIZE`;
   SMAP (x86) and PAN (arm64) catch stray kernel accesses to user memory.
 

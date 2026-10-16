@@ -3,6 +3,8 @@
 //! Implements the PageTable trait for x86-64 4-level paging:
 //! PML4 -> PDPT -> PD -> PT -> Physical Page
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::arch::{FrameAlloc, Leaf, MapError, PageFlags, PageTable};
 
 /// Page size (4KB)
@@ -99,6 +101,105 @@ pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
 pub fn pte_present(pte: u64) -> bool {
     pte & PAGE_PRESENT != 0
 }
+
+// ============================================================================
+// User PTE helpers for the generic fault and fork paths (kernel/mm)
+// ============================================================================
+
+/// Intermediate entries of user tables
+const USER_TABLE: u64 = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+/// The entry at `idx` (mod 512) of `table`, as an atomic
+fn entry_atomic(table: *mut RawPageTable, idx: u64) -> &'static AtomicU64 {
+    // SAFETY: a live table frame reached through the direct map
+    unsafe { AtomicU64::from_ptr((*table).entry_mut((idx & 511) as usize) as *mut _ as *mut u64) }
+}
+
+/// Pointer to the 2MB-level (PD) entry for `va` in the tables rooted at
+/// `root` (Linux pmd_offset); None if an upper level is missing
+pub fn pmd_ptr(root: u64, va: u64) -> Option<*mut u64> {
+    let mut table = phys_to_virt_table(root);
+    for shift in [39, 30] {
+        let e = PageTableEntry(entry_atomic(table, va >> shift).load(Ordering::Acquire));
+        if !e.is_present() || e.is_huge() {
+            return None;
+        }
+        table = phys_to_virt_table(e.addr());
+    }
+    Some(entry_atomic(table, va >> 21).as_ptr())
+}
+
+/// A 2MB-level entry maps a huge page
+pub fn pmd_huge(pmd: u64) -> bool {
+    pmd & (PAGE_PRESENT | PAGE_HUGE) == PAGE_PRESENT | PAGE_HUGE
+}
+
+/// Pointer to the 4KB leaf entry for `va`, allocating the missing
+/// tables (Linux pte_alloc). A table is installed with a compare and
+/// swap, so racing faults share one. None if out of memory or a huge
+/// page maps `va`.
+pub fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
+    let mut table = phys_to_virt_table(root);
+    for shift in [39, 30, 21] {
+        let slot = entry_atomic(table, va >> shift);
+        let mut e = PageTableEntry(slot.load(Ordering::Acquire));
+        if !e.is_present() {
+            let new = crate::FRAME_ALLOCATOR.alloc()?;
+            // SAFETY: a fresh frame, reached through the direct map
+            unsafe { core::ptr::write_bytes(phys_to_virt(new), 0, PAGE_SIZE as usize) };
+            let ent = new | USER_TABLE;
+            e = match slot.compare_exchange(0, ent, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => PageTableEntry(ent),
+                Err(cur) => {
+                    crate::FRAME_ALLOCATOR.free(new);
+                    PageTableEntry(cur)
+                }
+            };
+        }
+        if e.is_huge() {
+            return None;
+        }
+        table = phys_to_virt_table(e.addr());
+    }
+    Some(entry_atomic(table, va >> 12).as_ptr())
+}
+
+/// A user leaf entry for `phys` with the protection of a VMA (PROT_*),
+/// marked accessed (Linux mk_pte + pte_mkyoung)
+pub fn mk_pte(phys: u64, prot: u32) -> u64 {
+    let mut pte = phys | PAGE_PRESENT | PAGE_USER | PAGE_ACCESSED;
+    if prot & crate::mm::PROT_WRITE != 0 {
+        pte |= PAGE_WRITABLE;
+    }
+    if prot & crate::mm::PROT_EXEC == 0 {
+        pte |= PAGE_NO_EXECUTE;
+    }
+    pte
+}
+
+/// Physical address mapped by a 4KB leaf entry
+pub fn pte_addr(pte: u64) -> u64 {
+    pte & ADDR_MASK
+}
+
+/// The entry allows writes
+pub fn pte_write(pte: u64) -> bool {
+    pte & PAGE_WRITABLE != 0
+}
+
+/// The entry allows instruction fetches
+pub fn pte_exec(pte: u64) -> bool {
+    pte & PAGE_NO_EXECUTE == 0
+}
+
+/// Writable, dirty and young; no longer copy-on-write
+pub fn pte_mkwrite(pte: u64) -> u64 {
+    (pte & !PAGE_COW) | PAGE_WRITABLE | PAGE_ACCESSED | PAGE_DIRTY
+}
+
+/// Make a page the kernel just filled visible to instruction fetches
+/// (x86 caches are coherent: nothing to do)
+pub fn sync_page(_phys: u64, _exec: bool) {}
 
 /// Switch this CPU to the address space rooted at `root`
 pub fn activate(root: u64) {
