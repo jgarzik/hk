@@ -8,7 +8,7 @@
 //! Pure functions plus atomics: no locks (callers hold their table's
 //! write lock while choosing and inserting).
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::net::ipv4::Ipv4Addr;
 
@@ -18,30 +18,28 @@ pub const PORT_HI: u16 = 60999;
 
 /// A namespace's ip_local_port_range (P5 makes it writable via /proc/sys)
 pub struct PortRange {
-    lo: AtomicU32,
-    hi: AtomicU32,
+    /// `lo << 16 | hi`: one word, so a reader never pairs the low end
+    /// of one setting with the high end of another
+    r: AtomicU32,
 }
 
 impl Default for PortRange {
     fn default() -> Self {
         Self {
-            lo: AtomicU32::new(PORT_LO as u32),
-            hi: AtomicU32::new(PORT_HI as u32),
+            r: AtomicU32::new(((PORT_LO as u32) << 16) | PORT_HI as u32),
         }
     }
 }
 
 impl PortRange {
     pub fn get(&self) -> (u16, u16) {
-        (
-            self.lo.load(Ordering::Relaxed) as u16,
-            self.hi.load(Ordering::Relaxed) as u16,
-        )
+        let r = self.r.load(Ordering::Relaxed);
+        ((r >> 16) as u16, r as u16)
     }
 
     pub fn set(&self, lo: u16, hi: u16) {
-        self.lo.store(lo as u32, Ordering::Relaxed);
-        self.hi.store(hi as u32, Ordering::Relaxed);
+        self.r
+            .store(((lo as u32) << 16) | hi as u32, Ordering::Relaxed);
     }
 }
 
@@ -128,7 +126,9 @@ pub fn siphash(key: [u64; 2], words: &[u64]) -> u64 {
 }
 
 /// Boot-time secret (lazily drawn from the RNG)
-static SECRET: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Boot secret, set once (a reader never sees half of it)
+#[cfg(not(test))]
+static SECRET: spin::Once<[u64; 2]> = spin::Once::new();
 
 #[cfg(test)]
 fn secret() -> [u64; 2] {
@@ -137,25 +137,14 @@ fn secret() -> [u64; 2] {
 
 #[cfg(not(test))]
 fn secret() -> [u64; 2] {
-    let k = [
-        SECRET[0].load(Ordering::Relaxed),
-        SECRET[1].load(Ordering::Relaxed),
-    ];
-    if k != [0, 0] {
-        return k;
-    }
-    let r = |_| {
-        ((crate::random::get_random_u32() as u64) << 32)
-            | crate::random::get_random_u32() as u64
-            | 1
-    };
-    let k = [r(0), r(1)];
-    let _ = SECRET[0].compare_exchange(0, k[0], Ordering::Relaxed, Ordering::Relaxed);
-    let _ = SECRET[1].compare_exchange(0, k[1], Ordering::Relaxed, Ordering::Relaxed);
-    [
-        SECRET[0].load(Ordering::Relaxed),
-        SECRET[1].load(Ordering::Relaxed),
-    ]
+    *SECRET.call_once(|| {
+        let r = || {
+            ((crate::random::get_random_u32() as u64) << 32)
+                | crate::random::get_random_u32() as u64
+                | 1
+        };
+        [r(), r()]
+    })
 }
 
 /// SipHash of `words` under the boot secret, separated by `domain`

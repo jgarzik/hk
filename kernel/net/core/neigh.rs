@@ -602,7 +602,10 @@ impl NeighTable {
                 }
             }
         }
-        if let Some(t) = n.inner.lock().st.timer {
+        // Separate statement: an `if let` scrutinee's guard would stay
+        // held across arm() (Neighbour.inner is a leaf)
+        let timer = n.inner.lock().st.timer;
+        if let Some(t) = timer {
             arm(t);
         }
     }

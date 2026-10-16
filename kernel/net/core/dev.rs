@@ -290,10 +290,13 @@ impl Softnet {
         }
     }
 
+    /// Separate statements: the poll_list IrqSpinlock guard of a
+    /// `a.lock().x() || b.lock().y()` chain would live across the
+    /// backlog lock
     fn has_work(&self) -> bool {
-        !self.poll_list.lock().is_empty()
-            || !self.backlog.lock().is_empty()
-            || (core::ptr::eq(self, &SOFTNET[0]) && TIMER_DUE.load(Ordering::Acquire))
+        let napi = !self.poll_list.lock().is_empty();
+        let backlog = !self.backlog.lock().is_empty();
+        napi || backlog || (core::ptr::eq(self, &SOFTNET[0]) && TIMER_DUE.load(Ordering::Acquire))
     }
 }
 
@@ -319,7 +322,7 @@ fn this_softnet() -> &'static Softnet {
     &SOFTNET[cpu.min(MAX_SCHED_CPUS - 1)]
 }
 
-/// Thread names (kthread names are &'static str)
+/// Thread names (kthread names are &'static str), one per possible CPU
 const SOFTNET_NAMES: [&str; 16] = [
     "softnet/0",
     "softnet/1",
@@ -338,6 +341,10 @@ const SOFTNET_NAMES: [&str; 16] = [
     "softnet/14",
     "softnet/15",
 ];
+const _: () = assert!(
+    SOFTNET_NAMES.len() >= MAX_SCHED_CPUS,
+    "a softnet name per CPU"
+);
 
 /// Start one `softnet/N` thread per CPU that runs a scheduler (after
 /// scheduling is enabled). Work queued earlier (IRQs during boot) is

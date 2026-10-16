@@ -30,7 +30,6 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sync::spin::Mutex;
 
@@ -176,43 +175,48 @@ impl Drop for FpList {
     }
 }
 
-/// Files waiting to be dropped by the running `defer_fput`
-static DEFERRED: Mutex<Vec<Arc<File>>> = Mutex::new(Vec::new());
-static DRAINING: AtomicBool = AtomicBool::new(false);
+/// Files a task's running `defer_fput` still has to drop, by task (an
+/// entry exists while that task drains)
+static DEFERRED: Mutex<BTreeMap<crate::task::Tid, Vec<Arc<File>>>> = Mutex::new(BTreeMap::new());
 
-/// Drop `files` with no lock held (Linux defers fput to task work).
-/// A drop that releases a socket whose queue holds files lands here
-/// again: those are queued and dropped by the outer loop, so chains of
-/// sockets in flight never recurse. Callers hold no locks. One task
-/// drains for all, so a release that sleeps (e.g. SO_LINGER) delays
-/// other tasks' deferred drops until it returns.
+/// Drop `files` with no lock held (Linux defers fput to task work, run
+/// by the same task before it returns to user space). A drop that
+/// releases a socket whose queue holds files lands here again in the
+/// same task: those are queued on the task's entry and dropped by the
+/// outer frame's loop, so chains of sockets in flight never recurse.
+/// Each task drains its own files (a sleeping release, e.g. SO_LINGER,
+/// delays only the task that dropped it). Callers hold no locks.
 pub fn defer_fput(files: Vec<Arc<File>>) {
     if files.is_empty() {
         return;
     }
-    DEFERRED.lock().extend(files);
+    let tid = crate::task::percpu::current_tid();
+    {
+        let mut d = DEFERRED.lock();
+        if let Some(q) = d.get_mut(&tid) {
+            // An outer frame of this task is draining: it takes them
+            q.extend(files);
+            return;
+        }
+        d.insert(tid, Vec::new());
+    }
+    let mut pending = files;
     loop {
-        if DRAINING
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            // The running drainer (another task, or an outer frame of
-            // this one) takes them
-            return;
+        for f in pending.drain(..) {
+            drop(f);
         }
-        loop {
-            let f = DEFERRED.lock().pop();
-            match f {
-                Some(f) => drop(f),
-                None => break,
+        let more = {
+            let mut d = DEFERRED.lock();
+            let q = d.get_mut(&tid).map(core::mem::take).unwrap_or_default();
+            if q.is_empty() {
+                d.remove(&tid);
             }
-        }
-        DRAINING.store(false, Ordering::Release);
-        // A file queued just before the store would otherwise wait for
-        // the next drain
-        if DEFERRED.lock().is_empty() {
+            q
+        };
+        if more.is_empty() {
             return;
         }
+        pending = more;
     }
 }
 

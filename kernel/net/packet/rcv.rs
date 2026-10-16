@@ -254,7 +254,10 @@ impl PacketSock {
         let raw = self.sk.stype == SOCK_RAW;
         let data = if raw { t.frame } else { &t.frame[ETH_HLEN..] };
         let mut snap = data.len();
-        if let Some(f) = self.filter.read().clone() {
+        // The filter is cloned out and run with no lock held (an `if let`
+        // scrutinee's guard would live across the run)
+        let filter = self.filter.read().clone();
+        if let Some(f) = filter {
             let res = f.run(&Ctx {
                 data,
                 frame: t.frame,

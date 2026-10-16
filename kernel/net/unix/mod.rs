@@ -24,7 +24,9 @@
 //!
 //! - `bindlock` (`sync::Mutex`, sleeping): bind/autobind; taken before
 //!   the address tables. bind of a path runs the VFS mknod (parent
-//!   i_rwsem) first and takes `bindlock` after it is released.
+//!   i_rwsem) first and takes `bindlock` after it is released; a bind
+//!   that then finds the socket bound unlinks the node after dropping
+//!   `bindlock` (no i_rwsem under it).
 //! - `iolock` (`sync::Mutex`, sleeping): one reader at a time across
 //!   dequeue -> user copy -> consume (Linux u->iolock); never held
 //!   while waiting for data.
@@ -457,8 +459,11 @@ impl UnixSock {
             KernelError::AlreadyExists => KernelError::AddressInUse,
             e => e,
         })?;
-        let _b = self.bindlock.lock();
+        let b = self.bindlock.lock();
         if self.addr().is_some() {
+            // Unlinked after bindlock is dropped (Linux out_unlink: the
+            // parent's i_rwsem is never taken under bindlock)
+            drop(b);
             crate::fs::dir::unlink_sock(&path);
             return Err(KernelError::InvalidArgument);
         }

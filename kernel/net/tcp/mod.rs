@@ -734,13 +734,11 @@ impl TcpSock {
     /// sk_stream_wait_close); an exiting task does not wait (Linux
     /// inet_release: no linger time under PF_EXITING)
     fn linger_wait(&self) {
-        if !self.sk.flag(sf::LINGER)
-            || self.sk.linger_secs() == 0
-            || crate::task::percpu::current_exiting()
-        {
-            return;
-        }
-        let ns = self.sk.linger_secs() as u64 * 1_000_000_000;
+        let secs = match self.sk.linger() {
+            Some(s) if s != 0 && !crate::task::percpu::current_exiting() => s,
+            _ => return,
+        };
+        let ns = secs as u64 * 1_000_000_000;
         let _ = self.sk.wait(ns, || {
             !matches!(
                 self.state(),
@@ -1027,7 +1025,7 @@ impl ProtoOps for TcpSock {
     /// Last close (Linux tcp_close)
     fn release(&self) {
         self.sk.set_shutdown(SHUTDOWN_MASK);
-        let linger0 = self.sk.flag(sf::LINGER) && self.sk.linger_secs() == 0;
+        let linger0 = self.sk.linger() == Some(0);
         let q = self.step(|g, out| {
             g.cb.orphan = true;
             if g.cb.state == TcpState::Listen {

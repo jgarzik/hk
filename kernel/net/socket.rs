@@ -574,8 +574,9 @@ pub fn sock_getsockopt(s: &dyn ProtoOps, opt: i32) -> Result<OptOut, KernelError
         )),
         SO_LINGER => {
             let mut b = Vec::with_capacity(8);
-            b.extend_from_slice(&(sk.flag(sf::LINGER) as i32).to_ne_bytes());
-            b.extend_from_slice(&(sk.linger_secs() as i32).to_ne_bytes());
+            let (on, secs) = sk.linger_opt();
+            b.extend_from_slice(&(on as i32).to_ne_bytes());
+            b.extend_from_slice(&(secs as i32).to_ne_bytes());
             Ok(OptOut::Bytes(b))
         }
         SO_RCVTIMEO_OLD | SO_RCVTIMEO_NEW => Ok(OptOut::Bytes(timeval_bytes(sk.rcvtimeo()))),
