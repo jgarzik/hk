@@ -832,6 +832,13 @@ The page cache uses a hierarchical locking model similar to Linux:
 - `find_or_create_page()` - Atomic find-or-create (fixes TOCTOU race)
 - `find_get_page()` - Lookup with refcount increment
 
+**Mapped ramfs pages (Linux filemap_fault):** a MAP_SHARED fault on a
+ramfs file (`InodeOps::map_page`) takes PAGE_CACHE with no other lock
+held and, still under it, a frame reference for the PTE
+(PAGE_CACHE -> FRAME_ALLOCATOR), so truncate or inode eviction, which
+drop only the cache's own reference (`FrameAlloc::put_frame`), cannot
+free a frame a mapping still uses.
+
 **Freeing ramfs pages (Linux evict_inode):** dropping a ramfs inode's
 `RamfsInodeData` (no directory entry, open file, mapping or dentry left)
 takes PAGE_CACHE -> FRAME_ALLOCATOR (`IrqSpinlock`, leaf) to free its

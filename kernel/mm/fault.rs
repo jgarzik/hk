@@ -239,6 +239,11 @@ fn fault_page(addr: u64, area: &Area) -> Result<u64, VmFault> {
     if let Some(sh) = &area.shmem {
         return sh.get_page(area.pgoff(addr) / PAGE_SIZE);
     }
+    if let (true, false, Some(f)) = (area.shared, area.anon, &area.file)
+        && let Some(r) = file_page(f, area.pgoff(addr), area.prot & PROT_EXEC != 0)
+    {
+        return r;
+    }
     let frame = alloc_user().ok_or(VmFault::Oom)?;
     // SAFETY: a fresh frame, reached through the direct map
     let buf = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(frame), PAGE_SIZE as usize) };
@@ -249,6 +254,31 @@ fn fault_page(addr: u64, area: &Area) -> Result<u64, VmFault> {
         paging::sync_page(frame, area.prot & PROT_EXEC != 0);
     }
     Ok(frame)
+}
+
+/// The page-cache page at byte offset `off` of `file`, for a shared
+/// mapping of a filesystem that maps its cache (Linux filemap_fault):
+/// SIGBUS past the end of the file. None: the fault copies the data.
+fn file_page(file: &File, off: u64, exec: bool) -> Option<Result<u64, VmFault>> {
+    use crate::error::KernelError;
+
+    let inode = file.get_inode()?;
+    if !inode.i_op.maps_cache() {
+        return None;
+    }
+    if off >= inode.get_size().div_ceil(PAGE_SIZE) * PAGE_SIZE {
+        return Some(Err(VmFault::Bus));
+    }
+    Some(
+        inode
+            .i_op
+            .map_page(&inode, off / PAGE_SIZE)
+            .inspect(|&f| paging::sync_page(f, exec))
+            .map_err(|e| match e {
+                KernelError::OutOfMemory | KernelError::NoSpace => VmFault::Oom,
+                _ => VmFault::Bus,
+            }),
+    )
 }
 
 /// Map the first page at `addr` (the entry holds `old`: none)

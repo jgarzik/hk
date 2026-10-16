@@ -548,6 +548,10 @@ impl FrameAlloc for &BitmapFrameAllocator {
     fn free_frame(&mut self, frame: Self::PhysAddr) {
         self.free(frame)
     }
+
+    fn put_frame(&mut self, frame: Self::PhysAddr) {
+        self.decref(frame);
+    }
 }
 
 /// Memory statistics from frame allocator
@@ -668,6 +672,10 @@ impl FrameAlloc for FrameAllocRef<'_> {
 
     fn free_frame(&mut self, frame: Self::PhysAddr) {
         self.0.free(frame)
+    }
+
+    fn put_frame(&mut self, frame: Self::PhysAddr) {
+        self.0.decref(frame);
     }
 }
 

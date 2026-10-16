@@ -142,6 +142,12 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   VMA holds a `ShmAttach` counted in shm_nattch (Linux shm_open /
   shm_close), so fork, split, munmap, shmdt, exit and exec keep the
   count, and the last detach of a removed segment destroys it.
+- **File mappings.** A MAP_SHARED mapping of a ramfs file maps the
+  file's page-cache pages (`InodeOps::map_page`, Linux filemap_fault):
+  every mapping, fork's copies and read()/write() see the same data, and
+  a page past the one holding the end of the file is SIGBUS. Other
+  filesystems, and MAP_PRIVATE mappings, get a private copy of the data
+  at fault time.
 - **fork (Linux dup_mmap / copy_page_range).** Each VMA is copied with its
   PTEs: a MAP_SHARED mapping keeps sharing its pages (writes stay
   visible both ways); a private one shares them copy-on-write (both

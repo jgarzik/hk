@@ -81,6 +81,12 @@ Address spaces are reference counted and torn down like Linux
   address that SHM_RND rounds to 0 is EPERM (Linux picks an address).
 - MADV_REMOVE of a file mapping is EOPNOTSUPP (no filesystem punches
   holes).
+- File mappings: MAP_SHARED of a file on a filesystem other than ramfs
+  (vfat) maps a private copy (writes do not reach the file or other
+  mappings); truncating a ramfs file does not unmap its shared pages
+  (they keep the old data instead of raising SIGBUS); MAP_PRIVATE file
+  pages are copied at fault, not shared until written.
+- mprotect(PROT_NONE) leaves already-present pages readable.
 - Exited non-leader threads stay in the task table as zombies (Linux
   reaps them at once); their kernel stacks and memory are freed.
 - munmap keeps page-table pages that become empty (freed at exit).

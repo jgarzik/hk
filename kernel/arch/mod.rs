@@ -249,6 +249,13 @@ pub trait FrameAlloc {
     /// Free a physical frame
     fn free_frame(&mut self, frame: Self::PhysAddr);
 
+    /// Drop the caller's reference to a frame that a user mapping may
+    /// also hold (a page-cache page mapped MAP_SHARED): freed with the
+    /// last reference. Without reference counts it is `free_frame`.
+    fn put_frame(&mut self, frame: Self::PhysAddr) {
+        self.free_frame(frame)
+    }
+
     /// Allocate `n` physically contiguous frames (kernel stacks, DMA
     /// buffers). None if unsupported or no such run is free.
     fn alloc_contig(&mut self, _n: usize) -> Option<Self::PhysAddr> {

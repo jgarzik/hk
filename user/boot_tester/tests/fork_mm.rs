@@ -7,6 +7,11 @@
 //! - SHMEM_DONTNEED / SHMEM_REMOVE: MADV_DONTNEED on shared anonymous
 //!   memory keeps the data (it lives in the shared object); MADV_REMOVE
 //!   frees it (reads zero)
+//! - FILE_SHARED_FORK: the same for a MAP_SHARED mapping of a file
+//! - FILE_SHARED_COHERENT: a shared file mapping, another mapping of the
+//!   file and read()/write() all see the same data
+//! - FILE_SHARED_EOF: a shared file mapping is SIGBUS past the page
+//!   holding the end of the file
 //! - SHMEM_REMOVE_SHARED: MADV_REMOVE by one process zeroes the page
 //!   for the other too, and the page stays shared
 //! - SHMEM_REMOVE_PAST_SIZE: MADV_REMOVE of a range past the object
@@ -42,9 +47,9 @@ use super::helpers::{host_mode, print, print_num, println};
 use super::mm_life::meminfo;
 use hk_syscall::{
     sys_close, sys_exit, sys_fork, sys_madvise, sys_mmap, sys_mprotect, sys_munmap,
-    sys_mremap, sys_nanosleep, sys_pipe, sys_read, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_wait4,
-    sys_write, Timespec, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, MADV_DONTFORK, MADV_DONTNEED, MADV_REMOVE, MADV_WIPEONFORK,
-    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_MAYMOVE, PROT_READ, PROT_WRITE,
+    sys_ftruncate, sys_mremap, sys_nanosleep, sys_open, sys_pipe, sys_pread64, sys_pwrite64, sys_read, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_wait4,
+    sys_unlink, sys_write, Timespec, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, MADV_DONTFORK, MADV_DONTNEED, MADV_REMOVE, MADV_WIPEONFORK,
+    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_MAYMOVE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE,
 };
 
 const MADV_HUGEPAGE: i32 = 14;
@@ -60,6 +65,7 @@ const RW: u32 = PROT_READ | PROT_WRITE;
 pub fn run_tests() {
     shared_anon();
     shared_anon_late();
+    file_shared();
     shmem_dontneed();
     shmem_beyond_size();
     shmem_remove_shared();
@@ -231,6 +237,95 @@ fn shared_late(p: u64) -> i64 {
         sys_close(fd);
     }
     code
+}
+
+const FILE: &[u8] = b"/tmp/fork_mm_shared\0";
+
+/// A file of `size` bytes, MAP_SHARED over `len`: (fd, address)
+fn map_file(size: i64, len: u64) -> Option<(i32, u64)> {
+    let fd = sys_open(FILE.as_ptr(), O_RDWR | O_CREAT | O_TRUNC, 0o600) as i32;
+    if fd < 0 || sys_ftruncate(fd, size) != 0 {
+        return None;
+    }
+    let p = sys_mmap(0, len, RW, MAP_SHARED, fd, 0);
+    if p < 0 {
+        sys_close(fd as u64);
+        return None;
+    }
+    Some((fd, p as u64))
+}
+
+fn unmap_file(fd: i32, p: u64, len: u64) {
+    sys_munmap(p, len);
+    sys_close(fd as u64);
+    sys_unlink(FILE.as_ptr());
+}
+
+fn file_shared() {
+    match map_file(2 * PAGE as i64, 2 * PAGE) {
+        Some((fd, p)) => {
+            report(b"FILE_SHARED_FORK", shared_late(p));
+            unmap_file(fd, p, 2 * PAGE);
+        }
+        None => report(b"FILE_SHARED_FORK", -1),
+    }
+    match map_file(2 * PAGE as i64, 2 * PAGE) {
+        Some((fd, p)) => {
+            report(b"FILE_SHARED_COHERENT", file_coherent(fd, p));
+            unmap_file(fd, p, 2 * PAGE);
+        }
+        None => report(b"FILE_SHARED_COHERENT", -1),
+    }
+    match map_file(100, 2 * PAGE) {
+        Some((fd, p)) => {
+            report(b"FILE_SHARED_EOF", file_eof(p));
+            unmap_file(fd, p, 2 * PAGE);
+        }
+        None => report(b"FILE_SHARED_EOF", -1),
+    }
+}
+
+/// Writes through the mapping, a second mapping and write() meet
+fn file_coherent(fd: i32, p: u64) -> i64 {
+    put(p + 16, BEFORE);
+    let mut v = 0u64;
+    sys_pread64(fd, (&mut v as *mut u64).cast(), 8, 16);
+    if v != BEFORE {
+        return 1;
+    }
+    let w = PARENT;
+    sys_pwrite64(fd, (&w as *const u64).cast(), 8, PAGE as i64 + 24);
+    if get(p + PAGE + 24) != PARENT {
+        return 2;
+    }
+    let q = sys_mmap(0, PAGE, RW, MAP_SHARED, fd, 0);
+    if q < 0 {
+        return 3;
+    }
+    let q = q as u64;
+    let code = if get(q + 16) != BEFORE {
+        4
+    } else {
+        put(q + 32, CHILD);
+        if get(p + 32) == CHILD { 0 } else { 5 }
+    };
+    sys_munmap(q, PAGE);
+    code
+}
+
+/// The page with the end of the file reads (zero past it), the next
+/// one is SIGBUS
+fn file_eof(p: u64) -> i64 {
+    if get(p + 200) != 0 {
+        return 1;
+    }
+    let pid = sys_fork();
+    if pid == 0 {
+        get(p + PAGE);
+        sys_exit(0);
+    }
+    let r = reap(pid);
+    if r == 0x100 + SIGBUS { 0 } else { 10 + r }
 }
 
 fn shmem_dontneed() {
