@@ -671,6 +671,9 @@ pub struct BitmapFrameAllocator {
   takes no other lock)
 - Policy: no frame allocation in interrupt context
 - Thread-safe via `&self` methods (`alloc()`, `free()`)
+- Frame reference counts are u16 and saturate: a saturated count is
+  sticky (never decremented, the frame never freed), so more than 65535
+  mappings of one page leak it instead of freeing it while mapped
 
 #### Address Spaces (Mm: mm_users / mm_count, mmap_lock)
 
