@@ -254,18 +254,14 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
     w.write(sp, &bytes)?;
 
-    // ARM64: the kernel wrote through the linear map; clean the data
-    // cache so the user mapping sees it
-    #[cfg(target_arch = "aarch64")]
-    {
-        use crate::arch::aarch64::cache;
-        let mut va = sp & !(PAGE_SIZE - 1);
-        while va < STACK_TOP {
-            if let Some(phys) = page_table.translate(va) {
-                cache::cache_clean_range(phys_to_virt(phys) as *const u8, PAGE_SIZE as usize);
-            }
-            va += PAGE_SIZE;
+    // The kernel wrote through the linear map (arm64: clean the data
+    // cache for the user mapping)
+    let mut va = sp & !(PAGE_SIZE - 1);
+    while va < STACK_TOP {
+        if let Some(phys) = page_table.translate(va) {
+            crate::arch::paging::sync_page(phys & !(PAGE_SIZE - 1), false);
         }
+        va += PAGE_SIZE;
     }
 
     Ok((sp, stack_bottom))
@@ -423,19 +419,9 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
                 }
             }
 
-            // ARM64: Flush data cache for the frame we just wrote.
-            // ARM's D-cache is not coherent across different virtual addresses
-            // to the same physical memory. The kernel writes via identity-mapped
-            // kernel VA, but user reads via user VA - these may have separate
-            // cache entries. We must clean the D-cache to ensure user sees the data.
-            #[cfg(target_arch = "aarch64")]
-            {
-                use crate::arch::aarch64::cache;
-                cache::cache_clean_range(
-                    crate::arch::phys_to_virt(frame) as *const u8,
-                    PAGE_SIZE as usize,
-                );
-            }
+            // The kernel wrote it: code reaches the instruction caches
+            // (arm64; Linux __sync_icache_dcache on the exec mapping)
+            crate::arch::paging::sync_page(frame, segment.flags.execute);
 
             // Map the page (once mapped, the address space frees it)
             if mapped.is_none()
@@ -476,14 +462,9 @@ fn apply_relocations(
             unsafe {
                 let ptr = phys_to_virt(phys) as *mut u64;
                 core::ptr::write_volatile(ptr, value);
-
-                // ARM64: Clean the cache line for this relocation write
-                #[cfg(target_arch = "aarch64")]
-                {
-                    use crate::arch::aarch64::cache;
-                    cache::cache_clean_range(ptr as *const u8, 8);
-                }
             }
+            // Text relocations land in code
+            crate::arch::paging::sync_icache(phys, 8);
         }
     });
 }

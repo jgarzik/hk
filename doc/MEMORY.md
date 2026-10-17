@@ -57,7 +57,16 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   are non-global (nG) and tagged with their address space's ASID (in
   TTBR0, 16-bit when the CPU has it, else 8-bit; allocated by
   generation, `mm::asid`); kernel leaves are global; ASID 0 is the
-  kernel threads' (empty TTBR0). **TTBR1** is the kernel table, built
+  kernel threads' (empty TTBR0). A context switch does no TLB or
+  instruction-cache maintenance: a page the kernel fills or copies is
+  synced to the instruction caches when it is (or becomes) executable
+  (`paging::sync_page` / `sync_icache`, Linux __sync_icache_dcache:
+  DC CVAU over the range unless CTR_EL0.IDC, then IC IVAU by line, or
+  one IC IALLUIS for a range over 64KB (2MB pages) or an I-cache that is
+  not PIPT and may alias; none if CTR_EL0.DIC): exec's segments, file and anonymous faults of
+  executable mappings (a zeroed page too: its frame's old code may be
+  cached), shared memory, copy-on-write copies, swap-in, mprotect to
+  executable, relocations and ptrace/process_vm writes. **TTBR1** is the kernel table, built
   once by `kmap::init` and never switched per process.
 - **Kernel image**: QEMU loads the ELF at physical 0x40100000 and
   enters at the physical entry point with the MMU off. `boot.S` is

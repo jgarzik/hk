@@ -8,8 +8,8 @@
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_EXEC, PROT_READ, PROT_WRITE,
-    sys_close, sys_exit, sys_fork, sys_mmap, sys_mprotect, sys_munmap, sys_open, sys_unlink,
-    sys_wait4, sys_write,
+    sys_close, sys_exit, sys_fork, sys_madvise, sys_mmap, sys_mprotect, sys_munmap, sys_open,
+    sys_unlink, sys_wait4, sys_write,
 };
 
 const PAGE: u64 = 4096;
@@ -32,6 +32,7 @@ pub fn run_tests() {
     expect(b"TLB_EXEC_FILE", exec_file, 42);
     expect(b"TLB_EXEC_COW", exec_cow, 42);
     expect(b"TLB_EXEC_MUNMAP_SEGV", exec_munmap, SIGSEGV);
+    expect(b"TLB_EXEC_HUGE_REWRITE", exec_huge_rewrite, 0);
 }
 
 /// Run `f` in a child: it must exit with `want`, or die of signal
@@ -250,4 +251,54 @@ fn exec_munmap() -> i64 {
     }
     sys_munmap(a, PAGE);
     call(a)
+}
+
+/// `return v` at `a`
+#[cfg(target_arch = "x86_64")]
+fn put_ret(a: u64, v: u8) {
+    let code = [0xb8, v, 0, 0, 0, 0xc3];
+    for (i, b) in code.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((a + i as u64) as *mut u8, *b) };
+    }
+}
+
+/// `return v` at `a` (movz w0, #v; ret)
+#[cfg(target_arch = "aarch64")]
+fn put_ret(a: u64, v: u8) {
+    let movz = 0x5280_0000u32 | ((v as u32) << 5);
+    for (i, w) in [movz, 0xd65f_03c0].iter().enumerate() {
+        unsafe { core::ptr::write_volatile((a + 4 * i as u64) as *mut u32, *w) };
+    }
+}
+
+/// Code written at the start, middle and end of a 2MB-aligned region
+/// (a 2MB page on hk with MADV_HUGEPAGE) while it is not executable,
+/// then mprotect'ed executable and run; rewritten with other values
+/// (writable again), made executable again, run again: every function
+/// returns what it was last written to return (the kernel syncs the
+/// instruction caches over all 2MB when it becomes executable)
+fn exec_huge_rewrite() -> i64 {
+    const HUGE: u64 = 2 << 20;
+    const MADV_HUGEPAGE: i32 = 14;
+    let raw = map(2 * HUGE, RW);
+    let a = (raw + HUGE - 1) & !(HUGE - 1);
+    sys_madvise(a, HUGE, MADV_HUGEPAGE);
+    let offs = [0, HUGE / 2 + 0x340, HUGE - 16];
+    for round in 0..2u8 {
+        if sys_mprotect(a, HUGE, RW) != 0 {
+            return 111;
+        }
+        for (i, &o) in offs.iter().enumerate() {
+            put_ret(a + o, 10 * (round + 1) + i as u8);
+        }
+        if sys_mprotect(a, HUGE, PROT_READ | PROT_EXEC) != 0 {
+            return 112;
+        }
+        for (i, &o) in offs.iter().enumerate() {
+            if call(a + o) != (10 * (round + 1) + i as u8) as i64 {
+                return 113 + round as i64;
+            }
+        }
+    }
+    0
 }

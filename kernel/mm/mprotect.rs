@@ -88,12 +88,10 @@ pub fn change_protection(pgd: u64, start: u64, end: u64, prot: u32, shared: bool
 }
 
 /// A 2MB page at `phys` becomes executable: instruction caches see its
-/// data (each 4KB cleaned, the instruction caches invalidated once)
-fn sync_huge(phys: u64) {
-    let pages = HUGE_PAGE_SIZE / PAGE_SIZE;
-    for i in 0..pages {
-        paging::sync_page(phys + i * PAGE_SIZE, i == pages - 1);
-    }
+/// data (all 2MB cleaned to the point of unification, the instruction
+/// caches invalidated once)
+pub(super) fn sync_huge(phys: u64) {
+    paging::sync_icache(phys, HUGE_PAGE_SIZE as usize);
 }
 
 /// Rewrite the entry of the page at `addr` for `prot` if it maps one. A

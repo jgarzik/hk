@@ -308,6 +308,10 @@ pub fn pte_mkcow(pte: u64) -> u64 {
 /// (x86 caches are coherent: nothing to do)
 pub fn sync_page(_phys: u64, _exec: bool) {}
 
+/// Make code the kernel wrote visible to instruction fetches (coherent
+/// on x86: nothing to do)
+pub fn sync_icache(_phys: u64, _len: usize) {}
+
 /// The user page tables of an address space, detached from its
 /// top-level table by [`detach_user`]
 pub struct UserTables(alloc::vec::Vec<u64>);

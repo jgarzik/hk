@@ -110,6 +110,75 @@ pub fn cache_invalidate_range(addr: *const u8, len: usize) {
     dsb_sy();
 }
 
+/// CTR_EL0, read once (0: not yet)
+static CTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn ctr() -> u64 {
+    use core::sync::atomic::Ordering;
+    let mut v = CTR.load(Ordering::Relaxed);
+    if v == 0 {
+        // SAFETY: reads an ID register
+        unsafe { asm!("mrs {}, ctr_el0", out(reg) v, options(nomem, nostack)) };
+        CTR.store(v, Ordering::Relaxed);
+    }
+    v
+}
+
+/// CTR_EL0.IDC: no D-cache clean needed for I/D coherence
+const CTR_IDC: u64 = 1 << 28;
+/// CTR_EL0.DIC: no I-cache invalidation needed
+const CTR_DIC: u64 = 1 << 29;
+/// CTR_EL0.L1Ip == 0b11: PIPT instruction cache
+const L1IP_PIPT: u64 = 0b11;
+
+/// Ranges above this invalidate the whole I-cache once instead of line
+/// by line (2MB pages)
+const IC_LINES_MAX: usize = 64 * 1024;
+
+/// Make code the kernel wrote at [addr, addr + len) visible to
+/// instruction fetches on every CPU (Linux sync_icache_aliases /
+/// caches_clean_inval_pou): clean the data cache to the point of
+/// unification (DC CVAU, skipped if CTR_EL0.IDC), then invalidate the
+/// instruction cache (skipped if CTR_EL0.DIC): by line (IC IVAU,
+/// broadcast) for a PIPT I-cache and a small range; the whole I-cache
+/// (IC IALLUIS) for a large range or an I-cache that may alias (not
+/// PIPT: a line of the frame may be cached under another VA, Linux
+/// icache_is_aliasing)
+pub fn clean_inval_pou(addr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let ctr = ctr();
+    let dline = 4usize << ((ctr >> 16) & 0xf);
+    let iline = 4usize << (ctr & 0xf);
+    let (start, end) = (addr as usize, addr as usize + len);
+    if ctr & CTR_IDC == 0 {
+        let mut a = start & !(dline - 1);
+        while a < end {
+            // SAFETY: cache maintenance of mapped kernel memory
+            unsafe { asm!("dc cvau, {}", in(reg) a, options(nostack, preserves_flags)) };
+            a += dline;
+        }
+    }
+    // SAFETY: barrier only
+    unsafe { asm!("dsb ish", options(nostack, preserves_flags)) };
+    if ctr & CTR_DIC == 0 {
+        if (ctr >> 14) & 0b11 != L1IP_PIPT || len > IC_LINES_MAX {
+            // SAFETY: cache maintenance only
+            unsafe { asm!("ic ialluis", options(nostack, preserves_flags)) };
+        } else {
+            let mut a = start & !(iline - 1);
+            while a < end {
+                // SAFETY: as above
+                unsafe { asm!("ic ivau, {}", in(reg) a, options(nostack, preserves_flags)) };
+                a += iline;
+            }
+        }
+    }
+    // SAFETY: barriers only
+    unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
+}
+
 /// Clean and invalidate a range of memory
 ///
 /// Use for bidirectional DMA buffers.

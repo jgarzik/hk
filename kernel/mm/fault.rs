@@ -312,6 +312,9 @@ fn do_huge_anon(pgd: u64, addr: u64, area: &Area) -> bool {
     };
     // SAFETY: a fresh 2MB frame, reached through the direct map
     unsafe { core::ptr::write_bytes(phys_to_virt(frame), 0, HUGE_PAGE_SIZE as usize) };
+    if area.prot & PROT_EXEC != 0 {
+        super::mprotect::sync_huge(frame);
+    }
     let mut flags = PageFlags::READ | PageFlags::USER;
     if area.prot & PROT_WRITE != 0 {
         flags |= PageFlags::WRITE;
@@ -335,8 +338,11 @@ fn do_huge_anon(pgd: u64, addr: u64, area: &Area) -> bool {
 /// anonymous memory or holding a private copy of the file data (Linux
 /// do_anonymous_page, do_read_fault)
 fn fault_page(addr: u64, area: &Area) -> Result<u64, VmFault> {
+    let exec = area.prot & PROT_EXEC != 0;
     if let Some(sh) = &area.shmem {
-        return sh.get_page(area.pgoff(addr) / PAGE_SIZE);
+        return sh
+            .get_page(area.pgoff(addr) / PAGE_SIZE)
+            .inspect(|&f| paging::sync_page(f, exec));
     }
     if let (true, false, Some(f)) = (area.shared, area.anon, &area.file)
         && let Some(r) = file_page(f, area.pgoff(addr), area.prot & PROT_EXEC != 0)
@@ -347,10 +353,15 @@ fn fault_page(addr: u64, area: &Area) -> Result<u64, VmFault> {
     // SAFETY: a fresh frame, reached through the direct map
     let buf = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(frame), PAGE_SIZE as usize) };
     buf.fill(0);
+    let file = matches!((area.anon, &area.file), (false, Some(_)));
     if let (false, Some(f)) = (area.anon, &area.file) {
         // A short read (EOF, error) leaves the rest zero
         let _ = f.pread(buf, area.pgoff(addr));
-        paging::sync_page(frame, area.prot & PROT_EXEC != 0);
+    }
+    // Executable, even zeroed: the frame's old code may still sit in
+    // the instruction caches (Linux __sync_icache_dcache)
+    if file || exec {
+        paging::sync_page(frame, exec);
     }
     Ok(frame)
 }

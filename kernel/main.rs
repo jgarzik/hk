@@ -539,7 +539,8 @@ where
 
             // For pages that span segment boundaries or have BSS, we may need
             // additional handling. The cache pre-zeros frames, so BSS is covered.
-            let _ = frame; // suppress unused warning
+            // The page's code reaches the instruction caches
+            crate::arch::paging::sync_page(frame, segment.flags.execute);
 
             va += PAGE_SIZE;
         }
@@ -588,6 +589,7 @@ fn apply_relocations<PT>(
                 let ptr = phys_to_virt(phys) as *mut u64;
                 ::core::ptr::write_volatile(ptr, value);
             }
+            crate::arch::paging::sync_icache(phys, 8);
         }
         n += 1;
     });

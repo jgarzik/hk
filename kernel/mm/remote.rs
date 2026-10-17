@@ -200,6 +200,8 @@ fn write_pages(page_table_root: u64, start_addr: u64, buf: &[u8]) -> Result<usiz
             let dst = phys_to_virt(phys);
             core::ptr::copy_nonoverlapping(buf[total..].as_ptr(), dst, to_copy);
         }
+        // It may be code (ptrace POKETEXT; Linux flush_ptrace_access)
+        crate::arch::paging::sync_icache(phys, to_copy);
 
         total += to_copy;
         addr += to_copy as u64;

@@ -437,19 +437,8 @@ impl UserModeOps for Aarch64Arch {
 
         unsafe {
             asm!(
-                // Invalidate instruction cache - critical for newly loaded ELF code
-                // ARM64 I-cache is not coherent with D-cache, so after kernel writes
-                // to frames (which go to D-cache), the I-cache may have stale data.
-                // This matches Linux's behavior in arch/arm64/mm/context.c
-                "ic iallu",
-                // Full system data synchronization barrier to ensure:
-                // 1. I-cache invalidation completes
-                // 2. All prior memory writes (cache cleans) are visible
-                // Using DSB SY (full system) rather than DSB ISH (inner shareable)
-                // to ensure maximum visibility of ELF data to user mode.
-                "dsb sy",
-                // Instruction synchronization barrier
-                "isb",
+                // The image's code was synced to the instruction caches
+                // when exec loaded it (paging::sync_page)
 
                 // Set up user stack pointer (SP_EL0)
                 "msr sp_el0, {user_stack}",

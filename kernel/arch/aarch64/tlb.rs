@@ -215,7 +215,8 @@ fn rollover_flush() {
 /// Load the user table `root` into TTBR0 on this CPU (interrupts
 /// disabled) with the address space's ASID (Linux
 /// check_and_switch_context + cpu_switch_mm): no flush, unless an ASID
-/// rollover asks this CPU for one. Kernel threads (`ctx` None) run on
+/// rollover asks this CPU for one; no instruction-cache maintenance
+/// either (done where a page becomes executable: `paging::sync_page`). Kernel threads (`ctx` None) run on
 /// the empty table with ASID 0.
 pub fn load_mm(root: u64, ctx: Option<&ArchCtx>) {
     let asid = match ctx {
@@ -235,12 +236,6 @@ pub fn load_mm(root: u64, ctx: Option<&ArchCtx>) {
     unsafe {
         asm!(
             "msr ttbr0_el1, {}",
-            "isb",
-            // Pages the kernel filled with code are not yet synced
-            // where they become executable: invalidate this CPU's
-            // instruction cache at every switch for now
-            "ic iallu",
-            "dsb ish",
             "isb",
             in(reg) root | (asid << 48),
             options(nostack)

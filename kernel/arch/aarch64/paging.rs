@@ -400,11 +400,18 @@ pub fn pte_mkcow(pte: u64) -> u64 {
 /// (Linux __sync_icache_dcache): clean it to the point of unification
 /// and, for an executable page, invalidate the instruction caches
 pub fn sync_page(phys: u64, exec: bool) {
-    super::cache::cache_clean_range(phys_to_virt(phys), PAGE_SIZE as usize);
     if exec {
-        // SAFETY: cache maintenance only
-        unsafe { asm!("ic ialluis", "dsb ish", "isb", options(nostack)) };
+        sync_icache(phys, PAGE_SIZE as usize);
+    } else {
+        super::cache::cache_clean_range(phys_to_virt(phys), PAGE_SIZE as usize);
     }
+}
+
+/// Make code the kernel wrote at physical [phys, phys + len) visible to
+/// instruction fetches (Linux flush_icache_range / flush_ptrace_access):
+/// every CPU, by VA through the linear map
+pub fn sync_icache(phys: u64, len: usize) {
+    super::cache::clean_inval_pou(phys_to_virt(phys), len);
 }
 
 /// The user page tables of an address space, detached from its
