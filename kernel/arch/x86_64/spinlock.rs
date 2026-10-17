@@ -214,3 +214,20 @@ fn save_and_disable_irq() -> bool {
 
 #[cfg(test)]
 fn restore_irq(_was_enabled: bool) {}
+
+/// Saved interrupt state of this CPU (Linux local_irq_save flags)
+#[must_use]
+pub struct IrqFlags(bool);
+
+/// Disable interrupts on this CPU, returning the previous state (Linux
+/// local_irq_save)
+#[inline]
+pub fn local_irq_save() -> IrqFlags {
+    IrqFlags(save_and_disable_irq())
+}
+
+/// Restore the state saved by [`local_irq_save`]
+#[inline]
+pub fn local_irq_restore(f: IrqFlags) {
+    restore_irq(f.0)
+}

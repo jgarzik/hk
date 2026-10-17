@@ -115,3 +115,73 @@ pub fn is_within_huge_page(huge_base: u64, addr: u64) -> bool {
 pub fn offset_in_huge_page(addr: u64) -> u64 {
     addr & HUGE_PAGE_MASK
 }
+
+/// The 2MB-level entry at `p`, as an atomic
+fn pmd_entry(p: *mut u64) -> &'static core::sync::atomic::AtomicU64 {
+    // SAFETY: `p` points into a live page table of the locked mm
+    unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }
+}
+
+/// Split the 2MB page mapping `va` in `mm` into 512 4KB entries (Linux
+/// __split_huge_pmd_locked), mm lock held. The page table is allocated
+/// first, so a failure (ENOMEM) changes nothing. Then break before
+/// make (Linux pmdp_invalidate): the 2MB entry is cleared and flushed
+/// on every CPU before the table replaces it, so no CPU caches a 2MB
+/// and a 4KB translation of one address at once (ARM ARM D8.16, Intel
+/// SDM 4.10.2.3); accessed/dirty bits set until then are kept. Each
+/// 4KB frame gets the head's reference count.
+///
+/// Returns the physical base of the split page; None if `va` is not
+/// mapped by a 2MB page or out of memory.
+pub fn split_huge_pmd(mm: &super::Mm, va: u64) -> Option<u64> {
+    use crate::arch::paging;
+    use core::sync::atomic::Ordering;
+    let pmdp = paging::pmd_ptr(mm.pgd(), va)?;
+    let old = pmd_entry(pmdp).load(Ordering::Acquire);
+    if !paging::pmd_huge(old) {
+        return None;
+    }
+    let pt = crate::FRAME_ALLOCATOR.alloc()?;
+    if pmd_entry(pmdp)
+        .compare_exchange(old, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        crate::FRAME_ALLOCATOR.free(pt);
+        return None;
+    }
+    // All levels (Linux flush_pmd_tlb_range): a table replaces the block
+    flush_huge(mm, va, true);
+    // The hardware may have set accessed/dirty until the clear: `old`
+    // is the value cleared (the compare-and-swap succeeded on it)
+    let base = paging::split_table(pt, old);
+    paging::pmd_populate(pmdp, pt);
+    crate::FRAME_ALLOCATOR.split_huge(base);
+    Some(base)
+}
+
+/// Clear the 2MB page entry for `base` in `mm` and flush it (Linux
+/// zap_huge_pmd), mm lock held. Returns the page's frame, which still
+/// holds the mapping's reference.
+pub fn clear_huge_pmd(mm: &super::Mm, base: u64) -> Option<u64> {
+    use crate::arch::paging;
+    use core::sync::atomic::Ordering;
+    let pmd = pmd_entry(paging::pmd_ptr(mm.pgd(), base)?);
+    let old = pmd.load(Ordering::Acquire);
+    if !paging::pmd_huge(old)
+        || pmd
+            .compare_exchange(old, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return None;
+    }
+    flush_huge(mm, base, false);
+    Some(paging::pte_addr(old) & !HUGE_PAGE_MASK)
+}
+
+/// Flush the 2MB page translation at `va` of `mm` (`walks`: the
+/// paging-structure caches too)
+fn flush_huge(mm: &super::Mm, va: u64, walks: bool) {
+    use super::tlb::{PMD_SHIFT, flush_tlb_mm_range};
+    let base = huge_page_align_down(va);
+    flush_tlb_mm_range(mm, base, base + HUGE_PAGE_SIZE, PMD_SHIFT, walks);
+}

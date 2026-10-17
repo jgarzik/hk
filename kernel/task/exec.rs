@@ -309,7 +309,7 @@ fn check_segments(elf: &ElfExecutable, base: u64) -> Result<(), i32> {
 /// PT_LOAD segment (pages already populated) and the stack
 /// (growsdown), so mprotect/munmap/brk and /proc/<pid>/maps see them
 pub fn image_vmas(
-    pgd: u64,
+    mm: &alloc::sync::Arc<crate::mm::Mm>,
     elf: &ElfExecutable,
     base: u64,
     stack_bottom: u64,
@@ -321,7 +321,7 @@ pub fn image_vmas(
     let anon = |start: u64, end: u64, prot: u32| {
         let mut v = Vma::new(start, end, prot, MAP_PRIVATE | MAP_ANONYMOUS);
         let av = AnonVma::new();
-        av.add_vma(pgd, start, end);
+        av.add_vma(alloc::sync::Arc::downgrade(mm), mm.pgd(), start, end);
         v.set_anon_vma(av);
         v
     };
@@ -669,7 +669,7 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         let mut m = mm.lock();
         m.set_brk(start_brk);
         m.set_exe(file.dentry.full_path());
-        for vma in image_vmas(mm.pgd(), &elf, base_addr, stack_bottom) {
+        for vma in image_vmas(mm.arc(), &elf, base_addr, stack_bottom) {
             m.insert_vma(vma);
         }
     }

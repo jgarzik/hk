@@ -20,12 +20,10 @@ unsafe extern "C" {
     ///   prev_ctx - Pointer to prev task's TaskContext (to save into)
     ///   next_ctx - Pointer to next task's TaskContext (to restore from)
     ///   new_kstack - new kernel stack top (unused on aarch64)
-    ///   new_ttbr0 - new task's TTBR0_EL1 (user page table physical address)
     fn __switch_to_asm(
         prev_ctx: *mut Aarch64TaskContext,
         next_ctx: *const Aarch64TaskContext,
         new_kstack: u64,
-        new_ttbr0: u64,
     );
 
     /// Switch to a new task without saving current context
@@ -33,8 +31,7 @@ unsafe extern "C" {
     /// Arguments:
     ///   next_ctx - Pointer to next task's TaskContext (to restore from)
     ///   new_kstack - new kernel stack top (unused on aarch64)
-    ///   new_ttbr0 - new task's TTBR0_EL1 (user page table physical address)
-    fn __switch_to_asm_first(next_ctx: *const Aarch64TaskContext, new_kstack: u64, new_ttbr0: u64);
+    fn __switch_to_asm_first(next_ctx: *const Aarch64TaskContext, new_kstack: u64);
 }
 
 /// AArch64 task context for context switching
@@ -140,19 +137,10 @@ extern "C" fn kernel_thread_exit(_status: i64) {
 pub extern "C" fn clone_child_entry() -> ! {
     core::arch::naked_asm!(
         // First, release the scheduler lock that was held during context switch
+        // (the switch loaded the child's TTBR0: mm::tlb::switch_mm)
         "bl {finish_switch}",
 
-        // Get the child's TTBR0 (page table root physical address)
-        "bl {get_ttbr0}",
-        // X0 now contains the child's TTBR0
-        // Load it into TTBR0_EL1 NOW, before restoring registers
-        "msr ttbr0_el1, x0",
-        "tlbi vmalle1is",
-        "dsb ish",
-        "isb",
-
         // Write child TID if CLONE_CHILD_SETTID was used (for fork)
-        // Must be after TTBR0 switch since we're writing to child's address space
         "bl {write_child_tid}",
 
         // Get and load the child's TLS (TPIDR_EL0)
@@ -234,7 +222,6 @@ pub extern "C" fn clone_child_entry() -> ! {
         "eret",
 
         finish_switch = sym finish_context_switch,
-        get_ttbr0 = sym crate::task::percpu::get_current_task_cr3,
         write_child_tid = sym crate::task::percpu::write_child_tid_if_needed,
         get_tls = sym crate::task::percpu::get_current_task_tls,
     );
@@ -248,14 +235,13 @@ pub extern "C" fn clone_child_entry() -> ! {
 /// - `old_ctx` must point to valid, writable memory for storing the current context
 /// - `new_ctx` must point to a valid, previously saved context
 /// - `new_kstack` should be the new kernel stack top (informational on aarch64)
-/// - `new_ttbr0` must be a valid page table physical address for TTBR0_EL1
+/// - the next task's TTBR0 is loaded (`mm::tlb::switch_mm`)
 /// - Interrupts should be disabled during the switch
 /// - `next_tid` must be the TID of the task we're switching to
 pub unsafe fn context_switch(
     old_ctx: *mut Aarch64TaskContext,
     new_ctx: *const Aarch64TaskContext,
     new_kstack: u64,
-    new_ttbr0: u64,
     next_tid: Tid,
 ) {
     // Load next task's TLS (TPIDR_EL0) before switching
@@ -265,7 +251,7 @@ pub unsafe fn context_switch(
     }
 
     unsafe {
-        __switch_to_asm(old_ctx, new_ctx, new_kstack, new_ttbr0);
+        __switch_to_asm(old_ctx, new_ctx, new_kstack);
     }
     // When we return here, we're a different task that was switched back to us
 }
@@ -280,7 +266,6 @@ pub unsafe fn context_switch(
 pub unsafe fn context_switch_first(
     new_ctx: *const Aarch64TaskContext,
     new_kstack: u64,
-    new_ttbr0: u64,
     next_tid: Tid,
 ) -> ! {
     // Load next task's TLS (TPIDR_EL0) - no prev task to save
@@ -290,7 +275,7 @@ pub unsafe fn context_switch_first(
     }
 
     unsafe {
-        __switch_to_asm_first(new_ctx, new_kstack, new_ttbr0);
+        __switch_to_asm_first(new_ctx, new_kstack);
         // The above never returns
         core::hint::unreachable_unchecked()
     }

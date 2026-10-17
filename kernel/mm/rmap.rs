@@ -17,14 +17,20 @@
 //! 3. Page table access (no lock, but we flush TLB)
 //!
 //! Chains name the address space by its top-level table; exit_mmap and
-//! munmap drop an address space's chains before freeing its tables.
+//! munmap drop an address space's chains before freeing its tables. A
+//! changed PTE is flushed in its own address space (the chain's `mm`),
+//! on every CPU that has it loaded, not in whichever one this CPU runs.
+//! Still racy against exit (BUGS.md, inert while swap-out is off): the
+//! walk runs on a copy of the chains, outside the AnonVma lock.
 
 extern crate alloc;
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use crate::mm::anon_vma::AnonVma;
+use crate::mm::Mm;
+
+use crate::mm::anon_vma::{AnonVma, AnonVmaChain};
 use crate::mm::page::{PG_ANON, page_descriptor};
 use crate::mm::swap_entry::SwapEntry;
 
@@ -41,6 +47,8 @@ pub struct PteMapping {
     pub vaddr: u64,
     /// Page table root physical address (CR3 on x86-64, TTBR0 on aarch64)
     pub pt_root: u64,
+    /// The address space, for its TLB flush
+    pub mm: Weak<Mm>,
 }
 
 // ============================================================================
@@ -85,9 +93,7 @@ pub fn rmap_walk(frame_phys: u64) -> Vec<PteMapping> {
 
     // Check each VMA for mappings to this frame
     for chain in vmas {
-        if let Some(mapping) =
-            check_vma_for_page(chain.root, chain.vma_start, chain.vma_end, frame_phys)
-        {
+        if let Some(mapping) = check_vma_for_page(&chain, frame_phys) {
             results.push(mapping);
         }
     }
@@ -99,19 +105,15 @@ pub fn rmap_walk(frame_phys: u64) -> Vec<PteMapping> {
 ///
 /// Walks the page table for each page in the VMA range until we find
 /// one that maps to our target frame.
-fn check_vma_for_page(
-    pt_root: u64,
-    vma_start: u64,
-    vma_end: u64,
-    frame_phys: u64,
-) -> Option<PteMapping> {
+fn check_vma_for_page(chain: &AnonVmaChain, frame_phys: u64) -> Option<PteMapping> {
     // Walk pages in VMA to find one mapping our frame
-    let mut addr = vma_start;
-    while addr < vma_end {
-        if maps(pt_root, addr, frame_phys) {
+    let mut addr = chain.vma_start;
+    while addr < chain.vma_end {
+        if maps(chain.root, addr, frame_phys) {
             return Some(PteMapping {
                 vaddr: addr,
-                pt_root,
+                pt_root: chain.root,
+                mm: chain.mm.clone(),
             });
         }
         addr += 4096;
@@ -130,9 +132,7 @@ pub fn rmap_walk_anon_vma(anon_vma: &Arc<AnonVma>, frame_phys: u64) -> Vec<PteMa
     let vmas = anon_vma.get_vmas();
 
     for chain in vmas {
-        if let Some(mapping) =
-            check_vma_for_page(chain.root, chain.vma_start, chain.vma_end, frame_phys)
-        {
+        if let Some(mapping) = check_vma_for_page(&chain, frame_phys) {
             results.push(mapping);
         }
     }
@@ -163,7 +163,7 @@ pub fn try_to_unmap(frame_phys: u64, swap_entry: SwapEntry) -> usize {
     let mut unmapped = 0;
 
     for mapping in mappings {
-        if replace_pte_with_swap(mapping.pt_root, mapping.vaddr, frame_phys, swap_entry).is_ok() {
+        if replace_pte_with_swap(&mapping, frame_phys, swap_entry).is_ok() {
             unmapped += 1;
             // Decrement mapcount
             if let Some(page) = page_descriptor(frame_phys) {
@@ -185,7 +185,7 @@ pub fn try_to_unmap_clear(frame_phys: u64) -> usize {
     let mut unmapped = 0;
 
     for mapping in mappings {
-        if clear_pte(mapping.pt_root, mapping.vaddr, frame_phys).is_ok() {
+        if clear_pte(&mapping, frame_phys).is_ok() {
             unmapped += 1;
             if let Some(page) = page_descriptor(frame_phys) {
                 page.dec_mapcount();
@@ -237,24 +237,29 @@ fn mapped_pte(pt_root: u64, vaddr: u64, expected_phys: u64) -> Result<*mut u64, 
     }
 }
 
-/// Replace the PTE mapping `expected_phys` at `vaddr` with a swap entry
+/// Replace the PTE of `m` mapping `expected_phys` with a swap entry
 fn replace_pte_with_swap(
-    pt_root: u64,
-    vaddr: u64,
+    m: &PteMapping,
     expected_phys: u64,
     swap_entry: SwapEntry,
 ) -> Result<(), ()> {
-    let p = mapped_pte(pt_root, vaddr, expected_phys)?;
-    unsafe { core::ptr::write_volatile(p, swap_entry.to_pte()) };
-    crate::arch::paging::flush_tlb(vaddr);
-    Ok(())
+    set_mapped(m, expected_phys, swap_entry.to_pte())
 }
 
-/// Clear the PTE mapping `expected_phys` at `vaddr`
-fn clear_pte(pt_root: u64, vaddr: u64, expected_phys: u64) -> Result<(), ()> {
-    let p = mapped_pte(pt_root, vaddr, expected_phys)?;
-    unsafe { core::ptr::write_volatile(p, 0) };
-    crate::arch::paging::flush_tlb(vaddr);
+/// Clear the PTE of `m` mapping `expected_phys`
+fn clear_pte(m: &PteMapping, expected_phys: u64) -> Result<(), ()> {
+    set_mapped(m, expected_phys, 0)
+}
+
+/// Write `new` into the PTE of `m` if it maps `expected_phys`, then flush
+/// it in its address space (Linux try_to_unmap_one: ptep_clear_flush).
+/// An address space already gone (its last mm_count dropped) has no
+/// PTE left to change.
+fn set_mapped(m: &PteMapping, expected_phys: u64, new: u64) -> Result<(), ()> {
+    let mm = m.mm.upgrade().ok_or(())?;
+    let p = mapped_pte(m.pt_root, m.vaddr, expected_phys)?;
+    unsafe { core::ptr::write_volatile(p, new) };
+    crate::mm::tlb::flush_tlb_page(&mm, m.vaddr);
     Ok(())
 }
 
@@ -306,6 +311,7 @@ mod tests {
         let mapping = PteMapping {
             vaddr: 0x1000,
             pt_root: 0x2000,
+            mm: Weak::new(),
         };
 
         assert_eq!(mapping.vaddr, 0x1000);

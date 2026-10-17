@@ -16,8 +16,9 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::anon_vma::AnonVma;
-use super::huge_page::HUGE_PAGE_SIZE;
+use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
 use super::shmem::Shmem;
+use super::tlb::flush_tlb_page;
 use super::{Mm, MmStruct, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE, SwapEntry};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{CurrentArch, PageFlags, SchedArch, paging, phys_to_virt};
@@ -138,11 +139,11 @@ fn set_pte(ptep: *mut u64, old: u64, new: u64) -> bool {
 /// cleared and its TLB entry flushed before `new` is written, so no CPU
 /// caches both translations at once (arm64 break-before-make). False
 /// if the entry no longer holds `old`.
-fn replace_pte(ptep: *mut u64, old: u64, new: u64, addr: u64) -> bool {
+fn replace_pte(mm: &Mm, ptep: *mut u64, old: u64, new: u64, addr: u64) -> bool {
     if !set_pte(ptep, old, 0) {
         return false;
     }
-    paging::flush_tlb(addr);
+    flush_tlb_page(mm, addr);
     // SAFETY: as in `set_pte`
     unsafe { AtomicU64::from_ptr(ptep) }.store(new, Ordering::Release);
     true
@@ -181,7 +182,7 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
     let mut map = mm.lock();
     let area = find_area(&mut map, addr, access)?;
     let pgd = mm.pgd();
-    if let Some(r) = huge_fault(pgd, addr, &area, access) {
+    if let Some(r) = huge_fault(mm, addr, &area, access) {
         return r;
     }
     let ptep = leaf(pgd, addr)?;
@@ -192,19 +193,19 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
         // write then goes through do_wp_page; write implies read)
         let prot = (area.prot & !PROT_WRITE) | PROT_READ;
         if set_pte(ptep, pte, paging::pte_modify(pte, prot)) {
-            paging::flush_tlb(addr);
+            flush_tlb_page(mm, addr);
         }
         return Ok(());
     }
     if paging::pte_present(pte) {
         if access == Access::Write && !paging::pte_write(pte) {
-            return do_wp_page(ptep, pte, addr, &area);
+            return do_wp_page(mm, ptep, pte, addr, &area);
         }
         if access == Access::Exec && !paging::pte_exec(pte) {
             return Err(VmFault::Segv);
         }
         // Spurious: another CPU resolved it, or a stale TLB entry
-        paging::flush_tlb(addr);
+        flush_tlb_page(mm, addr);
         return Ok(());
     }
     if SwapEntry::is_swap_pte(pte) {
@@ -219,12 +220,12 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
                 return r.map_or(Ok(()), |e| e.map(|_| ()));
             }
         };
-        return do_swap_page(ptep, pte, page, cached, addr, &area);
+        return do_swap_page(mm, ptep, pte, page, cached, addr, &area);
     }
     if area.file.is_none() || area.shmem.is_some() {
         // Anonymous memory: nothing sleeps
         let page = fault_page(addr, &area)?;
-        return do_fault(ptep, pte, page, addr, &area);
+        return do_fault(mm, ptep, pte, page, addr, &area);
     }
     // A file page: read (or looked up in the page cache) unlocked
     drop(map);
@@ -242,7 +243,7 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
             return Err(e);
         }
     };
-    do_fault(ptep, pte, page, addr, &area)
+    do_fault(mm, ptep, pte, page, addr, &area)
 }
 
 /// The leaf entry for `addr`, allocating missing tables
@@ -276,14 +277,12 @@ fn same_area(map: &MmStruct, addr: u64, area: &Area) -> bool {
 }
 
 /// A fault in a 2MB region: None to continue at the 4KB level
-fn huge_fault(pgd: u64, addr: u64, area: &Area, access: Access) -> Option<Result<(), VmFault>> {
-    let pmd = get_pte(paging::pmd_ptr(pgd, addr)?);
+fn huge_fault(mm: &Mm, addr: u64, area: &Area, access: Access) -> Option<Result<(), VmFault>> {
+    let pmd = get_pte(paging::pmd_ptr(mm.pgd(), addr)?);
     if paging::pmd_huge(pmd) {
         if access == Access::Write && !paging::pte_write(pmd) {
             // Write-protected huge page: split, then fault on the 4KB page
-            let base = addr & !(HUGE_PAGE_SIZE - 1);
-            let fa = &mut &FRAME_ALLOCATOR;
-            if ArchPageTable::split_huge_page(pgd, base, fa).is_err() {
+            if split_huge_pmd(mm, addr).is_none() {
                 return Some(Err(VmFault::Oom));
             }
             return None;
@@ -291,11 +290,11 @@ fn huge_fault(pgd: u64, addr: u64, area: &Area, access: Access) -> Option<Result
         if access == Access::Exec && !paging::pte_exec(pmd) {
             return Some(Err(VmFault::Segv));
         }
-        paging::flush_tlb(addr);
+        flush_tlb_page(mm, addr);
         return Some(Ok(()));
     }
     if pmd == 0 && area.thp {
-        return do_huge_anon(pgd, addr, area).then_some(Ok(()));
+        return do_huge_anon(mm.pgd(), addr, area).then_some(Ok(()));
     }
     None
 }
@@ -383,7 +382,14 @@ fn file_page(file: &File, off: u64, exec: bool) -> Option<Result<u64, VmFault>> 
 
 /// Map `page` (with its reference for the PTE) at `addr`, where the
 /// entry held `old` (none)
-fn do_fault(ptep: *mut u64, old: u64, page: u64, addr: u64, area: &Area) -> Result<(), VmFault> {
+fn do_fault(
+    mm: &Mm,
+    ptep: *mut u64,
+    old: u64,
+    page: u64,
+    addr: u64,
+    area: &Area,
+) -> Result<(), VmFault> {
     if !set_pte(ptep, old, paging::mk_pte(page, area.prot)) {
         // A racing fault mapped the page first
         super::memory::put_page(page);
@@ -392,7 +398,7 @@ fn do_fault(ptep: *mut u64, old: u64, page: u64, addr: u64, area: &Area) -> Resu
     if area.anon_private() {
         add_anon(page, area, addr);
     }
-    paging::flush_tlb(addr);
+    flush_tlb_page(mm, addr);
     increment_min_flt();
     Ok(())
 }
@@ -418,6 +424,7 @@ fn swap_page(entry: SwapEntry, area: &Area) -> Result<(u64, bool), VmFault> {
 /// held the swap PTE `pte`, mm lock held. A swap-cache page may be
 /// mapped by others too: it is mapped copy-on-write in a private VMA.
 fn do_swap_page(
+    mm: &Mm,
     ptep: *mut u64,
     pte: u64,
     page: u64,
@@ -433,7 +440,7 @@ fn do_swap_page(
         super::memory::put_page(page);
         return Ok(());
     }
-    paging::flush_tlb(addr);
+    flush_tlb_page(mm, addr);
     if !cached {
         super::free_swap_entry(SwapEntry::from_pte(pte));
         if area.anon_private() {
@@ -448,11 +455,11 @@ fn do_swap_page(
 /// do_wp_page): a shared mapping, or a private page no one else maps,
 /// is made writable in place; a private page still shared (fork's
 /// copy-on-write) is copied first
-fn do_wp_page(ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Result<(), VmFault> {
+fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Result<(), VmFault> {
     let old = paging::pte_addr(pte);
     if area.shared || FRAME_ALLOCATOR.refcount(old) <= 1 {
         if set_pte(ptep, pte, paging::pte_mkwrite(pte)) {
-            paging::flush_tlb(addr);
+            flush_tlb_page(mm, addr);
             increment_min_flt();
         }
         return Ok(());
@@ -465,7 +472,7 @@ fn do_wp_page(ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Result<(), Vm
     };
     paging::sync_page(new, paging::pte_exec(pte));
     let entry = paging::pte_mkwrite((pte & !paging::PTE_ADDR_MASK) | new);
-    if !replace_pte(ptep, pte, entry, addr) {
+    if !replace_pte(mm, ptep, pte, entry, addr) {
         FRAME_ALLOCATOR.free(new);
         return Ok(());
     }
@@ -524,7 +531,7 @@ pub fn pagefault_out_of_memory() -> ! {
 /// VMA is writable and private, and holds the target's mm lock; the new
 /// page joins the VMA's rmap (`anon_vma`) like a write fault's copy.
 pub fn unshare_for_write(
-    pgd: u64,
+    mm: &Mm,
     addr: u64,
     anon_vma: Option<Arc<AnonVma>>,
 ) -> Result<(), VmFault> {
@@ -532,7 +539,7 @@ pub fn unshare_for_write(
     if addr >= super::TASK_SIZE {
         return Err(VmFault::Segv);
     }
-    let Some(ptep) = paging::pte_ptr(pgd, addr) else {
+    let Some(ptep) = paging::pte_ptr(mm.pgd(), addr) else {
         return Ok(()); // not mapped, or a 2MB page (never shared)
     };
     let pte = get_pte(ptep);
@@ -553,5 +560,5 @@ pub fn unshare_for_write(
         anon_vma,
         shmem: None,
     };
-    do_wp_page(ptep, pte, addr, &area)
+    do_wp_page(mm, ptep, pte, addr, &area)
 }

@@ -371,7 +371,7 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
             }
             // SHM_REMAP: unmap what was there (dropped after unlocking)
             replaced =
-                crate::mm::syscall::munmap_locked(&mut mm_guard, mm.pgd(), aligned, aligned + size);
+                crate::mm::syscall::munmap_locked(&mut mm_guard, &mm, aligned, aligned + size);
         }
         aligned
     };
@@ -424,7 +424,7 @@ fn do_shmdt(shmaddr: u64) -> Result<i32, i32> {
                 _ => break,
             }
         }
-        crate::mm::syscall::munmap_locked(&mut map, mm.pgd(), shmaddr, end)
+        crate::mm::syscall::munmap_locked(&mut map, &mm, shmaddr, end)
     };
     // Dropped unlocked: the last detach may destroy the segment
     drop(gone);

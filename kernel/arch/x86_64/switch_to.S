@@ -15,23 +15,22 @@
 .global __switch_to_asm
 .global __switch_to_asm_first
 
-/* __switch_to_asm(prev_sp_ptr: *mut u64, next_sp: u64, new_kstack: u64, new_cr3: u64)
+/* __switch_to_asm(prev_sp_ptr: *mut u64, next_sp: u64, new_kstack: u64)
  *
  * Arguments (System V AMD64 ABI):
  *   %rdi - Pointer to prev task's saved RSP location
  *   %rsi - next task's saved RSP value
  *   %rdx - new kernel stack top (for TSS.RSP0 and SYSCALL_KERNEL_STACK)
- *   %rcx - new task's CR3 (page table physical address)
  *
- * This function:
+ * The scheduler has already loaded the next task's address space
+ * (mm::tlb::switch_mm). This function:
  *   1. Saves callee-saved registers on current stack
  *   2. Saves current RSP to *prev_sp_ptr
  *   3. Loads next task's RSP
  *   4. Updates TSS.RSP0 for interrupt handling
  *   5. Updates SYSCALL_KERNEL_STACK for syscall entry
- *   6. Loads new task's CR3 (page table)
- *   7. Restores callee-saved registers from new stack
- *   8. Returns (to the new task's saved return address)
+ *   6. Restores callee-saved registers from new stack
+ *   7. Returns (to the new task's saved return address)
  */
 __switch_to_asm:
     /* Save callee-saved registers on current stack */
@@ -48,9 +47,8 @@ __switch_to_asm:
     /* Load next task's RSP */
     movq    %rsi, %rsp
 
-    /* Save new_kstack and new_cr3 in callee-saved registers for use across calls */
+    /* Save new_kstack in a callee-saved register for use across calls */
     movq    %rdx, %r12
-    movq    %rcx, %r13
 
     /* Update TSS.RSP0 for interrupt handling */
     movq    %r12, %rdi
@@ -59,10 +57,6 @@ __switch_to_asm:
     /* Update SYSCALL_KERNEL_STACK for syscall entry */
     movq    %r12, %rdi
     call    set_syscall_kernel_stack
-
-    /* Switch to new task's page table (CR3) */
-    /* This automatically flushes the TLB */
-    movq    %r13, %cr3
 
     /* Restore callee-saved registers from new stack */
     popq    %r15
@@ -74,27 +68,25 @@ __switch_to_asm:
 
     ret
 
-/* __switch_to_asm_first(next_sp: u64, new_kstack: u64, new_cr3: u64)
+/* __switch_to_asm_first(next_sp: u64, new_kstack: u64)
  *
  * Arguments:
  *   %rdi - next task's saved RSP value
  *   %rsi - new kernel stack top (for TSS.RSP0 and SYSCALL_KERNEL_STACK)
- *   %rdx - new task's CR3 (page table physical address)
  *
  * Used for initial switch to first task or when switching from exiting task.
  * Does NOT save current context (no prev task to save).
  *
  * IMPORTANT: We must NOT push to the stack after loading next_sp, as that
- * would corrupt the saved register frame. Use callee-saved registers (r12, r13)
- * to preserve new_kstack and new_cr3 across calls.
+ * would corrupt the saved register frame. Use a callee-saved register (r12)
+ * to preserve new_kstack across calls.
  */
 __switch_to_asm_first:
     /* Load next task's RSP */
     movq    %rdi, %rsp
 
-    /* Save new_kstack and new_cr3 in callee-saved registers (will be restored later anyway) */
+    /* Save new_kstack in a callee-saved register (restored later anyway) */
     movq    %rsi, %r12
-    movq    %rdx, %r13
 
     /* Update TSS.RSP0 */
     movq    %r12, %rdi
@@ -103,10 +95,6 @@ __switch_to_asm_first:
     /* Update SYSCALL_KERNEL_STACK (for syscall entry) */
     movq    %r12, %rdi
     call    set_syscall_kernel_stack
-
-    /* Switch to new task's page table (CR3) */
-    /* This automatically flushes the TLB */
-    movq    %r13, %cr3
 
     /* Restore callee-saved registers from new stack */
     popq    %r15

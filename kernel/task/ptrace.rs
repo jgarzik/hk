@@ -605,7 +605,7 @@ fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
     }
 
     // Get target's mm and page table
-    let (target_mm, page_table_root) = match get_target_mm_and_pt(target_tid) {
+    let (target_mm, _) = match get_target_mm_and_pt(target_tid) {
         Some(x) => x,
         None => return -ESRCH,
     };
@@ -613,7 +613,7 @@ fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
     // Lock mm and write to tracee
     let mm_guard = target_mm.lock();
     let buf = data.to_ne_bytes();
-    match crate::mm::remote::access_remote_vm_write(&mm_guard, page_table_root, addr, &buf) {
+    match crate::mm::remote::access_remote_vm_write(&target_mm, &mm_guard, addr, &buf) {
         Ok(8) => 0,
         _ => -EIO,
     }

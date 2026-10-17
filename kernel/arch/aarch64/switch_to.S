@@ -18,13 +18,15 @@
 
 /*
  * __switch_to_asm(prev_ctx: *mut TaskContext, next_ctx: *const TaskContext,
- *                 new_kstack: u64, new_ttbr0: u64)
+ *                 new_kstack: u64)
  *
  * Arguments (AAPCS64):
  *   x0 - Pointer to prev task's TaskContext (to save into)
  *   x1 - Pointer to next task's TaskContext (to restore from)
  *   x2 - new kernel stack top (unused on aarch64 - SP managed by context)
- *   x3 - new task's TTBR0_EL1 (user page table physical address)
+ *
+ * The scheduler has already loaded the next task's TTBR0
+ * (mm::tlb::switch_mm).
  *
  * TaskContext layout (must match Rust struct Aarch64TaskContext):
  *   offset 0x00: x19-x28 (10 registers, 80 bytes)
@@ -51,13 +53,6 @@ __switch_to_asm:
     stp     d12, d13, [x0, #0x88]
     stp     d14, d15, [x0, #0x98]
 
-    /* Switch to new user page table */
-    msr     ttbr0_el1, x3
-    tlbi    vmalle1is               // Invalidate TLB for EL1
-    ic      iallu                   // Invalidate instruction cache
-    dsb     sy                      // Full system barrier (stronger than ish)
-    isb                             // Synchronize context
-
     /* Restore callee-saved registers from next context */
     ldp     x19, x20, [x1, #0x00]
     ldp     x21, x22, [x1, #0x10]
@@ -75,25 +70,17 @@ __switch_to_asm:
     ret                             // Return to new task's LR
 
 /*
- * __switch_to_asm_first(next_ctx: *const TaskContext, new_kstack: u64, new_ttbr0: u64) -> !
+ * __switch_to_asm_first(next_ctx: *const TaskContext, new_kstack: u64) -> !
  *
  * Arguments:
  *   x0 - Pointer to next task's TaskContext (to restore from)
  *   x1 - new kernel stack top (unused on aarch64)
- *   x2 - new task's TTBR0_EL1 (user page table physical address)
  *
  * Used for initial switch to first task.
  * Does NOT save current context (no prev task to save).
  * Never returns - enters the first task.
  */
 __switch_to_asm_first:
-    /* Switch to new user page table */
-    msr     ttbr0_el1, x2
-    tlbi    vmalle1is               // Invalidate TLB
-    ic      iallu                   // Invalidate instruction cache
-    dsb     sy                      // Full system barrier
-    isb
-
     /* Restore callee-saved registers from next context */
     ldp     x19, x20, [x0, #0x00]
     ldp     x21, x22, [x0, #0x10]

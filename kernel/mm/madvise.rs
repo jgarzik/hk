@@ -16,9 +16,9 @@ use super::shmem::Shmem;
 use super::{
     MADV_COLD, MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE,
     MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM,
-    MADV_REMOVE, MADV_SEQUENTIAL, MADV_WILLNEED, MADV_WIPEONFORK, MmStruct, PAGE_SIZE, VM_DONTCOPY,
-    VM_DONTDUMP, VM_HUGEPAGE, VM_NOHUGEPAGE, VM_RAND_READ, VM_SEQ_READ, VM_WIPEONFORK, Vma,
-    get_task_mm,
+    MADV_REMOVE, MADV_SEQUENTIAL, MADV_WILLNEED, MADV_WIPEONFORK, Mm, MmStruct, PAGE_SIZE,
+    VM_DONTCOPY, VM_DONTDUMP, VM_HUGEPAGE, VM_NOHUGEPAGE, VM_RAND_READ, VM_SEQ_READ, VM_WIPEONFORK,
+    Vma, get_task_mm,
 };
 use crate::error::KernelError;
 use crate::task::percpu::current_tid;
@@ -42,7 +42,7 @@ pub fn sys_madvise(start: u64, len: u64, advice: i32) -> i64 {
     };
     let mut punch = Vec::new();
     let mut map = mm.lock();
-    let r = walk(&mut map, mm.pgd(), start, end, advice, &mut punch);
+    let r = walk(&mut map, &mm, start, end, advice, &mut punch);
     #[cfg(feature = "mmcheck")]
     super::check::verify(&map, mm.pgd(), "madvise");
     drop(map);
@@ -104,7 +104,7 @@ fn check_range(start: u64, len: u64) -> Result<Option<u64>, KernelError> {
 /// or merged under it.
 fn walk(
     mm: &mut MmStruct,
-    pgd: u64,
+    owner: &Mm,
     start: u64,
     end: u64,
     advice: i32,
@@ -125,7 +125,7 @@ fn walk(
             }
         }
         let e = ve.min(end);
-        vma_advise(mm, pgd, addr, e, advice, punch)?;
+        vma_advise(mm, owner, addr, e, advice, punch)?;
         if e >= end {
             break;
         }
@@ -142,7 +142,7 @@ fn walk(
 /// madvise_vma_behavior)
 fn vma_advise(
     mm: &mut MmStruct,
-    pgd: u64,
+    owner: &Mm,
     start: u64,
     end: u64,
     advice: i32,
@@ -153,8 +153,8 @@ fn vma_advise(
     match advice {
         MADV_WILLNEED => Ok(()),
         MADV_COLD | MADV_PAGEOUT => lru_ok(vma),
-        MADV_DONTNEED | MADV_FREE => dontneed(vma, pgd, start, end, advice),
-        MADV_REMOVE => remove(vma, pgd, start, end, punch),
+        MADV_DONTNEED | MADV_FREE => dontneed(vma, owner, start, end, advice),
+        MADV_REMOVE => remove(vma, owner, start, end, punch),
         _ => {
             let flags = new_flags(vma, advice)?;
             update_flags(mm, idx, start, end, flags)
@@ -180,12 +180,12 @@ fn lru_ok(vma: &Vma) -> Result<(), KernelError> {
 /// MADV_DONTNEED / MADV_FREE (Linux madvise_dontneed_free): not on
 /// locked memory, MADV_FREE only on private anonymous memory. MADV_FREE
 /// frees at once, like DONTNEED (the pages are not kept for reuse).
-fn dontneed(vma: &Vma, pgd: u64, start: u64, end: u64, advice: i32) -> Result<(), KernelError> {
+fn dontneed(vma: &Vma, owner: &Mm, start: u64, end: u64, advice: i32) -> Result<(), KernelError> {
     if vma.is_locked() || (advice == MADV_FREE && !is_anon(vma)) {
         return Err(KernelError::InvalidArgument);
     }
     // Zapped under the mm lock: no fault or fork works on these PTEs
-    super::memory::zap_range(pgd, start, end);
+    super::memory::zap_range(owner, start, end);
     Ok(())
 }
 
@@ -197,7 +197,7 @@ fn dontneed(vma: &Vma, pgd: u64, start: u64, end: u64, advice: i32) -> Result<()
 /// ramfs). The range is zapped and its hole recorded in `punch`.
 fn remove(
     vma: &Vma,
-    pgd: u64,
+    owner: &Mm,
     start: u64,
     end: u64,
     punch: &mut Vec<Punch>,
@@ -214,7 +214,7 @@ fn remove(
     if vma.file.is_some() {
         return Err(KernelError::OperationNotSupported);
     }
-    super::memory::zap_range(pgd, start, end);
+    super::memory::zap_range(owner, start, end);
     if let Some(sh) = &vma.shmem {
         let first = vma.offset + start - vma.start;
         let last = vma.offset + end - vma.start;

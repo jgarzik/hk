@@ -685,7 +685,8 @@ pub struct BitmapFrameAllocator {
   the address space and pinned users (`MmRef`: ptrace PEEK/POKE,
   process_vm_*, a /proc/<pid>/maps read). The last `MmRef` drop runs
   `exit_mmap`, which takes the VMAs under the mm lock, drops the rmap
-  chains, then tears down the user half (`paging::free_user`) and drops
+  chains, then tears down the user half (`paging::detach_user`, a
+  TLB flush, `UserTables::free`) and drops
   the VMAs (file references) with no lock held. **Never drop an `MmRef`
   under a spinlock** (TASK_TABLE included): take it out (`Option::take`,
   `replace`) and drop it after unlocking. `mmget_not_zero` refuses an
@@ -760,32 +761,67 @@ pub struct BitmapFrameAllocator {
   each chunk of its vector out with the mm lock dropped.
 - TLB after a PTE loses permission or its page: flushed before the mm
   lock is released and before the old frame can be freed or written
-  through by another process: fork write-protects the parent's private
-  PTEs and flushes each VMA's range (`paging::flush_tlb_range`) before
-  dropping the parent's lock (the child cannot run yet); mprotect
-  rewrites the range's PTEs (`mprotect::change_protection`), then
-  flushes the range (`flush_tlb_range`) before dropping the lock (its
-  pages keep their references); mremap's move flushes the old range
-  the same way; a copy-on-write break, munmap and MADV_DONTNEED flush
-  each page they clear (`paging::flush_tlb`) before dropping its
-  reference. arm64
-  flushes are broadcast (`tlbi ...is`); x86 flushes this CPU only: the
-  shootdown IPI for other CPUs running the address space plugs into
-  these helpers (section 9, SMP TODO).
+  through by another process, always in the address space that changed
+  (`mm::tlb`, see TLB Flushing below): fork write-protects the parent's
+  private PTEs and flushes each VMA's range (`flush_tlb_mm_range`)
+  before dropping the parent's lock (the child cannot run yet);
+  mprotect rewrites the range's PTEs (`mprotect::change_protection`),
+  then flushes the range before dropping the lock (its pages keep their
+  references); mremap's move flushes the old range the same way; a
+  copy-on-write break, munmap and MADV_DONTNEED flush each page they
+  clear (`flush_tlb_page`) before dropping its reference; rmap flushes
+  in the chain's address space, not the one this CPU runs.
 - Break-before-make: a live entry is never overwritten by one mapping
   another page or another size. A 2MB page split into a table
-  (`split_huge_page`, Linux pmdp_invalidate) and a copy-on-write break
+  (`huge_page::split_huge_pmd`, Linux pmdp_invalidate) and a copy-on-write break
   (`fault::replace_pte`, Linux ptep_clear_flush) first clear the entry
   and flush its TLB entry, then write the new one (required on arm64,
   ARM ARM D8.16; x86 needs it for the page-size change). In between
   the address faults; the fault waits for the mm lock the writer holds,
   then finds the new entry.
-- Teardown TLB: `free_user` detaches the user half from the top-level
-  table, flushes (arm64: `tlbi vmalle1is`, all CPUs; x86: this CPU, if
-  the table is loaded here), then frees pages and tables. A CPU that last
-  ran the address space (another thread still in `exit_current`) is only
-  covered on arm64; on x86 it may keep stale user TLB entries until its
-  next CR3 load, but it no longer touches user memory (section 9).
+- Teardown TLB: `exit_mmap` detaches the user half from the top-level
+  table (`paging::detach_user`), flushes the whole address space with
+  its paging-structure caches (`flush_tlb_mm`), then frees pages and
+  tables (`UserTables::free`). A CPU that last ran the address space
+  (another thread still in `exit_current`) has it loaded until it
+  switches away, so the flush reaches it (arm64 broadcast; x86 see TLB
+  Flushing).
+
+#### TLB Flushing (kernel/mm/tlb.rs; arch/{x86_64,aarch64}/tlb.rs)
+
+No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
+
+- `Mm.ctx` (`MmContext`): `cpumask` (atomic bit per CPU that has the
+  address space loaded), `tlb_gen` (AtomicU64, bumped by every flush,
+  SeqCst: a full barrier after the PTE stores), `ctx_id` and the arch
+  part (arm64 ASID). Shared by every CPU: the cpumask and generation
+  must be seen by all flushers, as in Linux.
+- `TLB_STATE[cpu]` (`TlbState`, per CPU): `loaded_mm` (the `Mm` loaded,
+  0 for the kernel table, `SWITCHING` during a switch) and `loaded_gen`.
+  Written only by its own CPU with interrupts disabled (a switch, a
+  local flush, the flush IPI handler); never read by another CPU.
+- `switch_mm` (scheduler, before the register switch, rq lock held:
+  interrupts off; exec; init's first entry) follows Linux
+  switch_mm_irqs_off: `loaded_mm` = SWITCHING, the previous address
+  space's cpumask bit cleared (x86 without PCID: the CR3 write drops
+  all its entries), this CPU's bit set in the next one's, a full
+  barrier, `tlb_gen` read, the table loaded (x86 CR3; arm64 TTBR0),
+  then `loaded_mm`/`loaded_gen` set. A flusher that misses the bit made
+  its PTE change before its barrier, so the walk after the load sees
+  it. The loaded `Mm` stays alive until its CPU switched away: its task
+  (or an exited task's `DeadTask`, scheduler rule 8) holds an mm_count
+  reference until then, so a raw `loaded_mm` is safe to dereference
+  there.
+- A flush (`flush_tlb_mm_range`, `flush_tlb_page`, `flush_tlb_mm`)
+  bumps `tlb_gen` and, with interrupts disabled, brings this CPU up to
+  date if it has the address space loaded (`flush_func`: nothing if its
+  `loaded_gen` already covers the flush, a ranged flush if it misses
+  just this one, else all; ranges over `FLUSH_CEILING` pages flush
+  all). arm64 broadcasts instead (`tlbi vale1is` / `vae1is` when page
+  tables were freed, `vmalle1is` past the ceiling; the DSB ISH waits
+  for every CPU). x86 still reaches no other CPU (section 9).
+- `flush_tlb_kernel_range` (ioremap/iounmap): arm64 `tlbi vaae1is`
+  (all CPUs); x86 this CPU only (section 9). Called with no lock held.
 
 #### Kernel Page Tables (kernel half)
 
@@ -808,8 +844,9 @@ layout in `doc/MEMORY.md`
   taken in IRQ context). Under it `FRAME_ALLOCATOR` is taken for new
   table frames; `IOREMAP` is a leaf otherwise (Linux: `vmap_area_lock`
   + `init_mm.page_table_lock`).
-- TLB: ioremap/iounmap flush with `invlpg` (local) on x86 and
-  `tlbi vae1is` (broadcast) on arm64; x86 has no kernel TLB shootdown yet, so after
+- TLB: iounmap clears the entries and flushes (`flush_tlb_kernel_range`,
+  with `IOREMAP` not held) before the range is freed; arm64 broadcasts,
+  x86 has no kernel TLB shootdown yet, so after
   iounmap another CPU may still cache the old translation of a range
   that is handed out again (gap vs Linux `flush_tlb_kernel_range`,
   section 9; drivers do not iounmap in practice).

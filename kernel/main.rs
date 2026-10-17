@@ -14,6 +14,7 @@ pub mod acct;
 pub mod bus;
 pub mod chardev;
 pub mod console;
+pub mod cpumask;
 pub mod dma;
 pub mod elf;
 pub mod epoll;
@@ -1118,8 +1119,6 @@ fn kmain() -> ! {
     // Note: idle task has tid=1, pid=0 (kernel swapper convention)
     // Init process: ppid=0 (no parent), pgid=sid=0 like Linux's init_task
     // (init/init_task.c); init calls setsid() itself if it wants a session
-    // Save the page table root before moving user_pt
-    let page_table_root = user_pt.root_table_phys();
 
     task::percpu::create_user_task(task::percpu::UserTaskConfig {
         pid: 1,  // init process (PID 1)
@@ -1141,7 +1140,7 @@ fn kmain() -> ! {
         m.set_brk(start_brk);
         m.set_exe(alloc::string::String::from("/bin/init"));
         let stack_bottom = USER_STACK_TOP - USER_STACK_PAGES as u64 * PAGE_SIZE;
-        for vma in task::exec::image_vmas(mm.pgd(), &elf, base_addr, stack_bottom) {
+        for vma in task::exec::image_vmas(&mm, &elf, base_addr, stack_bottom) {
             m.insert_vma(vma);
         }
     }
@@ -1186,8 +1185,13 @@ fn kmain() -> ! {
         );
     }
 
+    // Load init's address space (its task holds the mm reference)
+    match mm::get_task_mm(2) {
+        Some(mm) => mm::tlb::switch_mm(Some(&mm)),
+        None => panic!("init has no address space"),
+    }
     unsafe {
-        CurrentArch::jump_to_user(entry_point, user_sp, page_table_root, kernel_stack);
+        CurrentArch::jump_to_user(entry_point, user_sp, kernel_stack);
     }
 }
 

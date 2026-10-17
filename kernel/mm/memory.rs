@@ -9,13 +9,11 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::huge_page::HUGE_PAGE_SIZE;
-use super::{Mm, PAGE_SIZE, SwapEntry, Vma};
+use super::huge_page::{HUGE_PAGE_SIZE, clear_huge_pmd, split_huge_pmd};
+use super::{Mm, PAGE_SIZE, SwapEntry, Vma, tlb};
 use crate::FRAME_ALLOCATOR;
-use crate::arch::{CurrentArch, Leaf, SchedArch, paging};
+use crate::arch::{Leaf, paging};
 use crate::mm::page::page_descriptor;
-
-type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 
 const ENOMEM: i32 = 12;
 
@@ -56,7 +54,7 @@ fn release_desc(phys: u64) {
     }
 }
 
-/// Release one user mapping met by `paging::free_user`
+/// Release one user mapping met by `paging::UserTables::free`
 fn zap_leaf(leaf: Leaf) {
     use super::SwapEntry;
     match leaf {
@@ -75,8 +73,9 @@ fn zap_leaf(leaf: Leaf) {
 /// table stays until the last mm_count reference (`Mm::drop`).
 ///
 /// No task runs in it any more, but a CPU that ran its last task may
-/// still have it loaded: `free_user` detaches the user half and flushes
-/// the TLB before freeing anything.
+/// still have it loaded: the user half is detached and every such CPU
+/// flushed (paging-structure caches included) before anything is
+/// freed.
 pub(super) fn exit_mmap(mm: &Mm) {
     let vmas: Vec<_> = mm.lock().take_vmas();
     for vma in &vmas {
@@ -84,20 +83,22 @@ pub(super) fn exit_mmap(mm: &Mm) {
             av.remove_root(mm.pgd());
         }
     }
-    crate::arch::paging::free_user(mm.pgd(), &mut zap_leaf);
+    let tables = paging::detach_user(mm.pgd());
+    tlb::flush_tlb_mm(mm);
+    tables.free(&mut zap_leaf);
     // VMAs go last, outside any lock: they may hold the last reference
     // to a mapped file
     drop(vmas);
 }
 
-/// Release the pages of [start, end) in the tables rooted at `pgd`
-/// (Linux zap_page_range), mm lock held: each 4KB entry (a page,
-/// protnone included, or a swap slot) is cleared, and its TLB entry
-/// flushed before the page is released; a 2MB page wholly inside goes
-/// whole, one partly inside is split first. Empty tables are kept.
-/// Only user addresses: callers pass ranges inside VMAs, a range past
-/// TASK_SIZE is a bug (clamped).
-pub fn zap_range(pgd: u64, start: u64, end: u64) {
+/// Release the pages of [start, end) of `mm` (Linux zap_page_range),
+/// mm lock held: each 4KB entry (a page, protnone included, or a swap
+/// slot) is cleared, and its TLB entry flushed before the page is
+/// released; a 2MB page wholly inside goes whole, one partly inside is
+/// split first. Empty tables are kept. Only user addresses: callers
+/// pass ranges inside VMAs, a range past TASK_SIZE is a bug (clamped).
+pub fn zap_range(mm: &Mm, start: u64, end: u64) {
+    let pgd = mm.pgd();
     const GB: u64 = 1 << 30;
     debug_assert!(
         start <= end && end <= super::TASK_SIZE,
@@ -114,18 +115,18 @@ pub fn zap_range(pgd: u64, start: u64, end: u64) {
         let next = (base + HUGE_PAGE_SIZE).min(end);
         if paging::pmd_huge(entry(pmd).load(Ordering::Acquire)) {
             if addr == base && next == base + HUGE_PAGE_SIZE {
-                if let Some(phys) = ArchPageTable::unmap_huge_page(pgd, base) {
+                if let Some(phys) = clear_huge_pmd(mm, base) {
                     put_huge(phys);
                 }
                 addr = next;
                 continue;
             }
             // Out of memory: the 2MB page stays mapped (BUGS.md)
-            let _ = ArchPageTable::split_huge_page(pgd, base, &mut &FRAME_ALLOCATOR);
+            let _ = split_huge_pmd(mm, base);
         }
         if entry(pmd).load(Ordering::Acquire) != 0 {
             for a in (addr..next).step_by(PAGE_SIZE as usize) {
-                zap_pte(pgd, a);
+                zap_pte(mm, a);
             }
         }
         addr = next;
@@ -142,13 +143,13 @@ pub fn resident(pgd: u64, addr: u64) -> bool {
 }
 
 /// Clear the 4KB entry for `addr` and release what it held
-fn zap_pte(pgd: u64, addr: u64) {
-    let Some(p) = paging::pte_ptr(pgd, addr) else {
+fn zap_pte(mm: &Mm, addr: u64) {
+    let Some(p) = paging::pte_ptr(mm.pgd(), addr) else {
         return;
     };
     let pte = entry(p).swap(0, Ordering::AcqRel);
     if paging::pte_present(pte) {
-        paging::flush_tlb(addr);
+        tlb::flush_tlb_page(mm, addr);
         put_page(paging::pte_addr(pte));
     } else if SwapEntry::is_swap_pte(pte) {
         super::free_swap_entry(SwapEntry::from_pte(pte));
@@ -161,15 +162,16 @@ fn entry(p: *mut u64) -> &'static AtomicU64 {
     unsafe { AtomicU64::from_ptr(p) }
 }
 
-/// Copy the page tables of the parent's `vma` from the tables rooted at
-/// `src` into the child's at `dst` (Linux copy_page_range), under the
-/// parent's mm lock. A shared mapping keeps sharing its pages; a private
+/// Copy the page tables of the parent's `vma` from the address space
+/// `src` into the child's tables at `dst` (Linux copy_page_range), under
+/// the parent's mm lock. A shared mapping keeps sharing its pages; a private
 /// one shares them copy-on-write, read-only in both; a swap PTE fails
 /// the copy (ENOMEM, see `swap_pte_unsupported`). A 2MB page is split first so that its 4KB
 /// pages are copied one by one. Returns whether a parent PTE lost write
 /// permission (its TLB needs a flush).
-pub fn copy_page_range(dst: u64, src: u64, vma: &Vma) -> Result<bool, i32> {
+pub fn copy_page_range(dst: u64, src_mm: &Mm, vma: &Vma) -> Result<bool, i32> {
     const GB: u64 = 1 << 30;
+    let src = src_mm.pgd();
     let cow = !vma.is_shared();
     let mut wp = false;
     let mut addr = vma.start;
@@ -182,8 +184,7 @@ pub fn copy_page_range(dst: u64, src: u64, vma: &Vma) -> Result<bool, i32> {
         };
         let next = ((addr | (HUGE_PAGE_SIZE - 1)) + 1).min(vma.end);
         if paging::pmd_huge(entry(pmd).load(Ordering::Acquire)) {
-            let base = addr & !(HUGE_PAGE_SIZE - 1);
-            ArchPageTable::split_huge_page(src, base, &mut &FRAME_ALLOCATOR).map_err(|_| ENOMEM)?;
+            split_huge_pmd(src_mm, addr).ok_or(ENOMEM)?;
         }
         if entry(pmd).load(Ordering::Acquire) != 0 {
             for a in (addr..next).step_by(PAGE_SIZE as usize) {

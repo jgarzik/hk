@@ -158,7 +158,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         }
         // MAP_FIXED: unmap whatever was there (dropped after unlocking)
         if is_fixed {
-            replaced = munmap_locked(&mut mm_guard, mm.pgd(), addr, addr + length);
+            replaced = munmap_locked(&mut mm_guard, &mm, addr, addr + length);
         }
         addr
     } else if addr != 0 && super::hint_ok(addr & !(PAGE_SIZE - 1), length) {
@@ -200,7 +200,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         // pages (Linux shmem_zero_setup)
         if is_private {
             let anon_vma = AnonVma::new();
-            anon_vma.add_vma(mm.pgd(), map_addr, map_addr + length);
+            anon_vma.add_vma(Arc::downgrade(&mm), mm.pgd(), map_addr, map_addr + length);
             v.set_anon_vma(anon_vma);
         } else {
             v.shmem = Some(super::shmem::Shmem::new(length / PAGE_SIZE));
@@ -329,7 +329,7 @@ pub fn sys_munmap(addr: u64, length: u64) -> i64 {
     };
 
     let mut mm_guard = mm.lock();
-    let removed = munmap_locked(&mut mm_guard, mm.pgd(), addr, end);
+    let removed = munmap_locked(&mut mm_guard, &mm, addr, end);
     drop(mm_guard);
     // The VMAs may hold the last reference to a mapped file
     drop(removed);
@@ -346,7 +346,13 @@ fn page_align(x: u64) -> u64 {
 /// pages inside are released (`memory::zap_range`), the VM counters and
 /// rmap chains updated. Returns the removed VMAs for the caller to drop
 /// once it has unlocked.
-pub(crate) fn munmap_locked(mm: &mut super::MmStruct, pgd: u64, start: u64, end: u64) -> Vec<Vma> {
+pub(crate) fn munmap_locked(
+    mm: &mut super::MmStruct,
+    owner: &super::Mm,
+    start: u64,
+    end: u64,
+) -> Vec<Vma> {
+    let pgd = owner.pgd();
     let removed = mm.remove_range(start, end);
     for vma in &removed {
         let pages = vma.size() / PAGE_SIZE;
@@ -365,7 +371,7 @@ pub(crate) fn munmap_locked(mm: &mut super::MmStruct, pgd: u64, start: u64, end:
         }
     }
     for vma in &removed {
-        super::memory::zap_range(pgd, vma.start.max(start), vma.end.min(end));
+        super::memory::zap_range(owner, vma.start.max(start), vma.end.min(end));
     }
     #[cfg(feature = "mmcheck")]
     super::check::verify(mm, pgd, "munmap");
@@ -397,7 +403,7 @@ pub fn sys_brk(brk: u64) -> i64 {
         if !map.overlaps(new, old) {
             return cur as i64;
         }
-        let removed = munmap_locked(&mut map, mm.pgd(), new, old);
+        let removed = munmap_locked(&mut map, &mm, new, old);
         map.update_brk(brk);
         drop(map);
         drop(removed);
@@ -916,7 +922,7 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     // 2MB pages that cannot keep one entry are split before anything
     // changes: ENOMEM leaves the range as it was
     let pgd = mm.pgd();
-    if let Err(e) = super::mprotect::split_huge(pgd, start, mapped_end(&map, start, end), prot) {
+    if let Err(e) = super::mprotect::split_huge(&mm, start, mapped_end(&map, start, end), prot) {
         return e.sysret();
     }
 
@@ -926,7 +932,7 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     // fork never sees a VMA and its entries disagree). The TLB of the
     // range is flushed before the lock is dropped, also on an error.
     let r = mprotect_vmas(&mut map, pgd, start, end, prot);
-    crate::arch::paging::flush_tlb_range(start, end);
+    super::tlb::flush_tlb_mm_range(&mm, start, end, super::tlb::PAGE_SHIFT, false);
     #[cfg(feature = "mmcheck")]
     super::check::verify(&map, pgd, "mprotect");
     drop(map);
@@ -1244,7 +1250,6 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         _ => return KernelError::BadAddress.sysret(),
     };
 
-    let pgd = mm.pgd();
     let moves = fixed || dontunmap;
     // Shrinking: the tail is unmapped like munmap (Linux do_vmi_munmap;
     // mremap_to shrinks before it moves): the VMA is split there, so no
@@ -1253,14 +1258,14 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     if new_len_aligned < old_len {
         gone = munmap_locked(
             &mut mm_guard,
-            pgd,
+            &mm,
             old_addr + new_len_aligned,
             old_addr + old_len,
         );
         old_len = new_len_aligned;
         if !moves {
             #[cfg(feature = "mmcheck")]
-            super::check::verify(&mm_guard, pgd, "mremap shrink");
+            super::check::verify(&mm_guard, mm.pgd(), "mremap shrink");
             drop(mm_guard);
             drop(gone);
             return old_addr as i64;
@@ -1296,7 +1301,7 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
             && mm_guard.try_expand_vma(vma_idx, new_end)
         {
             #[cfg(feature = "mmcheck")]
-            super::check::verify(&mm_guard, pgd, "mremap expand");
+            super::check::verify(&mm_guard, mm.pgd(), "mremap expand");
             return old_addr as i64;
         }
         if !may_move {
@@ -1312,7 +1317,7 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     let target = if fixed {
         gone.extend(munmap_locked(
             &mut mm_guard,
-            pgd,
+            &mm,
             new_addr,
             new_addr + new_len_aligned,
         ));
@@ -1324,11 +1329,11 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         }
     };
     let (from, to) = ((old_addr, old_len), (target, new_len_aligned));
-    if let Err(e) = move_mapping(&mut mm_guard, pgd, from, to, dontunmap, &mut gone) {
+    if let Err(e) = move_mapping(&mut mm_guard, &mm, from, to, dontunmap, &mut gone) {
         return e.sysret();
     }
     #[cfg(feature = "mmcheck")]
-    super::check::verify(&mm_guard, pgd, "mremap move");
+    super::check::verify(&mm_guard, mm.pgd(), "mremap move");
     drop(mm_guard);
     drop(gone);
     target as i64
@@ -1377,15 +1382,16 @@ fn move_vma_out(mm: &mut super::MmStruct, old_addr: u64, dontunmap: bool, gone: 
 /// (each page once, with its reference).
 fn move_mapping(
     mm: &mut super::MmStruct,
-    pgd: u64,
+    owner: &super::Mm,
     from: (u64, u64),
     to: (u64, u64),
     dontunmap: bool,
     gone: &mut Vec<Vma>,
 ) -> Result<(), KernelError> {
     let ((old_addr, old_len), (new_addr, new_len)) = (from, to);
+    let pgd = owner.pgd();
     let mut alloc = |va| crate::arch::paging::pte_alloc(pgd, va);
-    super::mremap::move_prep(pgd, old_addr, new_addr, old_len, &mut alloc)?;
+    super::mremap::move_prep(owner, old_addr, new_addr, old_len, &mut alloc)?;
     mm.split_at(old_addr);
     mm.split_at(old_addr + old_len);
     let mut new_vma = mm
@@ -1404,7 +1410,7 @@ fn move_mapping(
     let idx = mm.insert_vma(new_vma);
     mm.add_total_vm(new_len / PAGE_SIZE);
     mm.merge_adjacent(idx);
-    super::mremap::move_ptes(pgd, old_addr, new_addr, old_len);
+    super::mremap::move_ptes(owner, old_addr, new_addr, old_len);
     Ok(())
 }
 

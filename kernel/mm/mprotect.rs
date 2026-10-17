@@ -10,8 +10,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::huge_page::HUGE_PAGE_SIZE;
-use super::{PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE};
+use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
+use super::{Mm, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{CurrentArch, SchedArch, paging};
 use crate::error::KernelError;
@@ -41,17 +41,16 @@ fn prot_none(prot: u32) -> bool {
 /// inaccessible (hk has no protnone 2MB entries). Called before any VMA
 /// changes, mm lock held: ENOMEM leaves the mapping as it was (a split
 /// page maps the same memory).
-pub fn split_huge(pgd: u64, start: u64, end: u64, prot: u32) -> Result<(), KernelError> {
+pub fn split_huge(mm: &Mm, start: u64, end: u64, prot: u32) -> Result<(), KernelError> {
     let mut addr = start & !(HUGE_PAGE_SIZE - 1);
     while addr < end {
-        let Some(pmd) = paging::pmd_ptr(pgd, addr) else {
+        let Some(pmd) = paging::pmd_ptr(mm.pgd(), addr) else {
             addr = next_gb(addr);
             continue;
         };
         let whole = addr >= start && addr + HUGE_PAGE_SIZE <= end;
         if paging::pmd_huge(entry(pmd).load(Ordering::Acquire)) && (!whole || prot_none(prot)) {
-            ArchPageTable::split_huge_page(pgd, addr, &mut &FRAME_ALLOCATOR)
-                .map_err(|_| KernelError::OutOfMemory)?;
+            split_huge_pmd(mm, addr).ok_or(KernelError::OutOfMemory)?;
         }
         addr += HUGE_PAGE_SIZE;
     }

@@ -221,6 +221,31 @@ pub fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
     Some(entry_atomic(table, va >> 12).as_ptr())
 }
 
+/// Fill the fresh page table `pt` with the 512 4KB entries of the 2MB
+/// entry `pmd`: same frames, protection and accessed/dirty bits (Linux
+/// __split_huge_pmd_locked). Returns the 2MB frame's base.
+pub fn split_table(pt: u64, pmd: u64) -> u64 {
+    const HUGE_MASK: u64 = (2 << 20) - 1;
+    let base = pmd & ADDR_MASK & !HUGE_MASK;
+    let flags = (pmd & !ADDR_MASK & !PAGE_HUGE) | PAGE_PRESENT;
+    let table = phys_to_virt_table(pt);
+    for i in 0..ENTRIES_PER_TABLE {
+        // SAFETY: a fresh table frame, not yet reachable
+        unsafe {
+            (*table)
+                .entry_mut(i)
+                .set(base + i as u64 * PAGE_SIZE, flags)
+        };
+    }
+    base
+}
+
+/// Install the filled table `pt` in the empty 2MB-level entry at `pmdp`
+/// (Linux pmd_populate)
+pub fn pmd_populate(pmdp: *mut u64, pt: u64) {
+    entry_ptr(pmdp).store(pt | USER_TABLE, Ordering::Release);
+}
+
 /// A user leaf entry for `phys` with the protection of a VMA (PROT_*),
 /// marked accessed (Linux mk_pte + pte_mkyoung)
 pub fn mk_pte(phys: u64, prot: u32) -> u64 {
@@ -276,39 +301,39 @@ pub fn pte_mkcow(pte: u64) -> u64 {
 /// (x86 caches are coherent: nothing to do)
 pub fn sync_page(_phys: u64, _exec: bool) {}
 
-/// Flush the TLB entries of [start, end) on this CPU
-pub fn flush_tlb_range(start: u64, end: u64) {
-    X86_64PageTable::flush_tlb_range(start, end);
-}
+/// The user page tables of an address space, detached from its
+/// top-level table by [`detach_user`]
+pub struct UserTables(alloc::vec::Vec<u64>);
 
-/// Switch this CPU to the address space rooted at `root`
-pub fn activate(root: u64) {
-    unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack)) };
-}
-
-/// Tear down the user half under `pml4_phys` (the mapping and table
-/// part of Linux exit_mmap: unmap_vmas + free_pgtables). The user PML4
-/// entries are detached and, if the table is live on this CPU, the TLB
-/// is flushed before anything is freed; then each user leaf goes to
-/// `put` and every lower table frame is freed. The root frame and the
-/// shared kernel half (PML4 256-511) are left untouched. Other CPUs are
-/// not shot down (no x86 TLB shootdown yet, doc/LOCKING.md).
-pub fn free_user(pml4_phys: u64, put: &mut dyn FnMut(Leaf)) {
-    let mut top = [PageTableEntry::empty(); KERNEL_PML4_START];
+/// Detach the user half from the top-level table `pml4_phys` (Linux
+/// exit_mmap: unmap_vmas + free_pgtables, first half): its PML4
+/// entries 0-255 are cleared, the tables below are kept intact for
+/// [`UserTables::free`], which runs after the caller flushed every CPU
+/// that may still walk them. The shared kernel half (PML4 256-511) is
+/// left untouched.
+pub fn detach_user(pml4_phys: u64) -> UserTables {
     let pml4 = phys_to_virt_table(pml4_phys);
-    for (i, e) in top.iter_mut().enumerate() {
+    let mut top = alloc::vec::Vec::new();
+    for i in 0..KERNEL_PML4_START {
         // SAFETY: `pml4_phys` is a live root table reached through the
         // direct map; its user entries belong to the caller
         unsafe {
-            *e = *(*pml4).entry(i);
+            let e = *(*pml4).entry(i);
+            if e.is_present() {
+                top.push(e.addr());
+            }
             (*pml4).entry_mut(i).clear();
         }
     }
-    if X86_64PageTable::current_cr3() & ADDR_MASK == pml4_phys {
-        X86_64PageTable::flush_tlb_all();
-    }
-    for e in top.iter().filter(|e| e.is_present()) {
-        free_level(e.addr(), 3, put);
+    UserTables(top)
+}
+
+impl UserTables {
+    /// Release each user leaf (to `put`) and free every table frame
+    pub fn free(self, put: &mut dyn FnMut(Leaf)) {
+        for t in self.0 {
+            free_level(t, 3, put);
+        }
     }
 }
 
@@ -360,11 +385,6 @@ fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
         }
     }
     crate::FRAME_ALLOCATOR.free(phys);
-}
-
-/// Flush the TLB entry for `va` on this CPU
-pub fn flush_tlb(va: u64) {
-    X86_64PageTable::flush_tlb(va);
 }
 
 /// Page table entry
@@ -573,12 +593,10 @@ impl X86_64PageTable {
             }
             let pt = phys_to_virt_table(pd_entry.addr());
 
-            // Set the final page table entry
+            // Set the final page table entry (a fresh table, never
+            // loaded: nothing to flush)
             let pt_entry = (*pt).entry_mut(pt_idx);
             pt_entry.set(pa, entry_flags);
-
-            // Flush TLB for this address
-            Self::flush_tlb(va);
         }
 
         Ok(())
@@ -607,55 +625,6 @@ impl X86_64PageTable {
             );
         }
         cr3
-    }
-
-    /// Flush a single TLB entry
-    pub fn flush_tlb(vaddr: u64) {
-        unsafe {
-            ::core::arch::asm!(
-                "invlpg [{}]",
-                in(reg) vaddr,
-                options(nostack, preserves_flags)
-            );
-        }
-    }
-
-    /// Flush entire TLB
-    #[allow(dead_code)]
-    pub fn flush_tlb_all() {
-        let cr3 = Self::current_cr3();
-        unsafe {
-            ::core::arch::asm!(
-                "mov cr3, {}",
-                in(reg) cr3,
-                options(nostack, preserves_flags)
-            );
-        }
-    }
-
-    /// Flush TLB for a range of addresses
-    ///
-    /// For large ranges (>32 pages), a full TLB flush is more efficient
-    /// than individual invlpg instructions.
-    pub fn flush_tlb_range(start: u64, end: u64) {
-        const INVLPG_THRESHOLD: u64 = 32 * PAGE_SIZE; // 32 pages
-
-        if end <= start {
-            return;
-        }
-
-        let range = end - start;
-        if range > INVLPG_THRESHOLD {
-            // Full TLB flush is cheaper for large ranges
-            Self::flush_tlb_all();
-        } else {
-            // Individual invalidations for small ranges
-            let mut addr = start & !(PAGE_SIZE - 1);
-            while addr < end {
-                Self::flush_tlb(addr);
-                addr += PAGE_SIZE;
-            }
-        }
     }
 
     /// Translate a virtual address to physical address
@@ -765,12 +734,9 @@ impl PageTable for X86_64PageTable {
             }
             let pt = phys_to_virt_table(pd_entry.addr());
 
-            // Set the final page table entry
+            // Set the final page table entry (callers flush: mm::tlb)
             let pt_entry = (*pt).entry_mut(pt_idx);
             pt_entry.set(pa, entry_flags);
-
-            // Flush TLB for this address
-            Self::flush_tlb(va);
         }
     }
 
@@ -798,10 +764,9 @@ impl PageTable for X86_64PageTable {
             }
             let pt = phys_to_virt_table(pd_entry.addr());
 
+            // Callers flush (mm::tlb)
             let pt_entry = (*pt).entry_mut(pt_idx);
             pt_entry.clear();
-
-            Self::flush_tlb(va);
         }
     }
 
@@ -885,62 +850,6 @@ impl PageTable for X86_64PageTable {
 pub const PAGE_COW: u64 = 1 << 9;
 
 impl X86_64PageTable {
-    /// Unmap a single page and return its physical address
-    ///
-    /// This is a static method that takes the page table root directly,
-    /// useful for unmapping pages without needing a full X86_64PageTable instance.
-    ///
-    /// Returns Some(phys_addr) if the page was mapped, None if not mapped.
-    pub fn unmap_page(pml4_phys: u64, va: u64) -> Option<u64> {
-        let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
-
-        unsafe {
-            let pml4 = phys_to_virt_table(pml4_phys);
-
-            let pml4_entry = (*pml4).entry(pml4_idx);
-            if !pml4_entry.is_present() {
-                return None;
-            }
-            let pdpt = phys_to_virt_table(pml4_entry.addr());
-
-            let pdpt_entry = (*pdpt).entry(pdpt_idx);
-            if !pdpt_entry.is_present() {
-                return None;
-            }
-            // 1GB huge pages not supported for unmap
-            if pdpt_entry.is_huge() {
-                return None;
-            }
-            let pd = phys_to_virt_table(pdpt_entry.addr());
-
-            let pd_entry = (*pd).entry(pd_idx);
-            if !pd_entry.is_present() {
-                return None;
-            }
-            // 2MB huge pages not supported for unmap
-            if pd_entry.is_huge() {
-                return None;
-            }
-            let pt = phys_to_virt_table(pd_entry.addr());
-
-            let pt_entry = (*pt).entry_mut(pt_idx);
-            if !pt_entry.is_present() {
-                return None;
-            }
-
-            // Get physical address before clearing
-            let phys = pt_entry.addr();
-
-            // Clear the entry
-            pt_entry.clear();
-
-            // Flush TLB for this address
-            Self::flush_tlb(va);
-
-            Some(phys)
-        }
-    }
-
     /// Update protection flags for a 2MB huge page
     ///
     /// # Arguments
@@ -1002,11 +911,8 @@ impl X86_64PageTable {
                 flags |= PAGE_NO_EXECUTE;
             }
 
-            // Write back the updated entry
+            // Write back the updated entry (the caller flushes the TLB)
             pd_entry.set(phys, flags);
-
-            // Flush TLB for this huge page
-            Self::flush_tlb(va);
 
             true
         }
@@ -1189,96 +1095,11 @@ impl X86_64PageTable {
                 return Err(MapError::AlreadyMapped);
             }
 
-            // Set the 2MB huge page entry (no PT, direct to physical frame)
+            // Set the 2MB huge page entry (no PT, direct to physical frame);
+            // it was empty: no TLB entry to flush
             pd_entry.set(pa, entry_flags);
-
-            // Flush TLB for this address
-            Self::flush_tlb(va);
         }
 
         Ok(())
-    }
-
-    /// Unmap a 2MB huge page
-    ///
-    /// Clears the PD entry for the given 2MB-aligned virtual address.
-    ///
-    /// # Arguments
-    /// * `pml4_phys` - Physical address of the PML4 table
-    /// * `va` - Virtual address (must be 2MB-aligned)
-    ///
-    /// # Returns
-    /// Some(phys_addr) if a huge page was unmapped, None otherwise
-    pub fn unmap_huge_page(pml4_phys: u64, va: u64) -> Option<u64> {
-        let (pml4_idx, pdpt_idx, pd_idx, _pt_idx) = page_indices(va);
-
-        unsafe {
-            let pml4 = phys_to_virt_table(pml4_phys);
-
-            let pml4_entry = (*pml4).entry(pml4_idx);
-            if !pml4_entry.is_present() {
-                return None;
-            }
-            let pdpt = phys_to_virt_table(pml4_entry.addr());
-
-            let pdpt_entry = (*pdpt).entry(pdpt_idx);
-            if !pdpt_entry.is_present() || pdpt_entry.is_huge() {
-                return None;
-            }
-            let pd = phys_to_virt_table(pdpt_entry.addr());
-
-            let pd_entry = (*pd).entry_mut(pd_idx);
-            if !pd_entry.is_present() || !pd_entry.is_huge() {
-                return None;
-            }
-
-            // Get physical address before clearing
-            let phys = pd_entry.addr();
-
-            // Clear the entry
-            pd_entry.clear();
-
-            // Flush TLB for this huge page region
-            Self::flush_tlb(va);
-
-            Some(phys)
-        }
-    }
-
-    /// Split the 2MB page at `va` into 512 4KB PTEs (Linux
-    /// __split_huge_pmd_locked), mm lock held. The page table is
-    /// allocated first, so a failure changes nothing. Then the PD entry
-    /// is invalidated and its TLB entry flushed before the table entry
-    /// replaces it (Linux pmdp_invalidate): no CPU caches the 2MB and a
-    /// 4KB translation of one address at once (Intel SDM 4.10.2.3), and
-    /// accessed/dirty bits set until then are kept. Each 4KB PTE gets
-    /// the 2MB entry's protection and its own frame reference.
-    ///
-    /// Returns the physical base of the split page.
-    pub fn split_huge_page<FA: FrameAlloc<PhysAddr = u64>>(
-        pml4_phys: u64,
-        va: u64,
-        frame_alloc: &mut FA,
-    ) -> Result<u64, MapError> {
-        const HUGE_MASK: u64 = (2 << 20) - 1;
-        let pmd = entry_ptr(pmd_ptr(pml4_phys, va).ok_or(MapError::NotMapped)?);
-        if !pmd_huge(pmd.load(Ordering::Acquire)) {
-            return Err(MapError::NotMapped);
-        }
-        let pt_phys = frame_alloc
-            .alloc_frame()
-            .ok_or(MapError::FrameAllocationFailed)?;
-        let old = pmd.swap(0, Ordering::AcqRel);
-        Self::flush_tlb(va & !HUGE_MASK);
-        let base = old & ADDR_MASK & !HUGE_MASK;
-        let flags = (old & !ADDR_MASK & !PAGE_HUGE) | PAGE_PRESENT;
-        let pt = phys_to_virt_table(pt_phys);
-        for i in 0..ENTRIES_PER_TABLE {
-            // SAFETY: a fresh table frame, not yet reachable
-            unsafe { (*pt).entry_mut(i).set(base + i as u64 * PAGE_SIZE, flags) };
-        }
-        pmd.store(pt_phys | USER_TABLE, Ordering::Release);
-        crate::FRAME_ALLOCATOR.split_huge(base);
-        Ok(base)
     }
 }

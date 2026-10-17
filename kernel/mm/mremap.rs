@@ -12,13 +12,11 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::PAGE_SIZE;
-use super::huge_page::HUGE_PAGE_SIZE;
+use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
+use super::{Mm, PAGE_SIZE, tlb};
 use crate::FRAME_ALLOCATOR;
-use crate::arch::{CurrentArch, SchedArch, paging};
+use crate::arch::paging;
 use crate::error::KernelError;
-
-type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 
 const GB: u64 = 1 << 30;
 
@@ -65,17 +63,16 @@ fn walk(
 /// `paging::pte_alloc`). Nothing moves: an error (ENOMEM) leaves both
 /// ranges as they were.
 pub fn move_prep(
-    pgd: u64,
+    mm: &Mm,
     old: u64,
     new: u64,
     len: u64,
     alloc: &mut dyn FnMut(u64) -> Option<*mut u64>,
 ) -> Result<(), KernelError> {
+    let pgd = mm.pgd();
     walk(pgd, old, old + len, &mut |start, end, pmd| {
         if paging::pmd_huge(pmd.load(Ordering::Acquire)) {
-            let base = start & !(HUGE_PAGE_SIZE - 1);
-            ArchPageTable::split_huge_page(pgd, base, &mut &FRAME_ALLOCATOR)
-                .map_err(|_| KernelError::OutOfMemory)?;
+            split_huge_pmd(mm, start).ok_or(KernelError::OutOfMemory)?;
         }
         for a in (start..end).step_by(PAGE_SIZE as usize) {
             if mapped(pgd, a) && alloc(new + (a - old)).is_none() {
@@ -89,7 +86,8 @@ pub fn move_prep(
 /// Move the entries of [old, old + len) to `new` after `move_prep`
 /// (same mm lock hold): the new range is unmapped, its tables exist,
 /// the old range has no 2MB page. The old range's TLB is flushed.
-pub fn move_ptes(pgd: u64, old: u64, new: u64, len: u64) {
+pub fn move_ptes(mm: &Mm, old: u64, new: u64, len: u64) {
+    let pgd = mm.pgd();
     let _ = walk(pgd, old, old + len, &mut |start, end, _| {
         for a in (start..end).step_by(PAGE_SIZE as usize) {
             let Some(src) = paging::pte_ptr(pgd, a) else {
@@ -107,16 +105,16 @@ pub fn move_ptes(pgd: u64, old: u64, new: u64, len: u64) {
         }
         Ok(())
     });
-    paging::flush_tlb_range(old, old + len);
+    tlb::flush_tlb_mm_range(mm, old, old + len, tlb::PAGE_SHIFT, false);
 }
 
 /// Boot self-test (kselftest) of the allocation-first move, on a
-/// scratch page table never loaded on a CPU: moving four pages fails
+/// scratch address space never loaded on a CPU: moving four pages fails
 /// with ENOMEM when the Nth page-table allocation fails (each N), and
 /// every old entry, frame reference and byte is then as it was; with
 /// memory, the entries move whole. None if right, else what failed.
 pub fn selftest() -> Option<&'static str> {
-    use crate::arch::{Leaf, phys_to_virt};
+    use crate::arch::phys_to_virt;
     const OLD: u64 = 0x4000_0000;
     // Another top-level entry: three table levels to allocate
     const NEW: u64 = 0x80_0000_1000;
@@ -124,6 +122,8 @@ pub fn selftest() -> Option<&'static str> {
     let root = FRAME_ALLOCATOR.alloc()?;
     // SAFETY: a fresh frame, reached through the direct map
     unsafe { core::ptr::write_bytes(phys_to_virt(root), 0, PAGE_SIZE as usize) };
+    // Owns `root`: dropping it frees the tables and pages left
+    let mm = super::mm_alloc(root);
     let mut ptes = [0u64; N as usize];
     let mut r = None;
     for (i, pte) in ptes.iter_mut().enumerate() {
@@ -155,27 +155,22 @@ pub fn selftest() -> Option<&'static str> {
                 paging::pte_alloc(root, va)
             }
         };
-        if move_prep(root, OLD, NEW, len, &mut alloc).is_ok() || !holds(root, OLD, NEW, &ptes) {
+        if move_prep(&mm, OLD, NEW, len, &mut alloc).is_ok() || !holds(root, OLD, NEW, &ptes) {
             r = Some("mremap_enomem_intact");
         }
     }
     if r.is_none() {
         let mut alloc = |va| paging::pte_alloc(root, va);
-        if move_prep(root, OLD, NEW, len, &mut alloc).is_err() {
+        if move_prep(&mm, OLD, NEW, len, &mut alloc).is_err() {
             r = Some("mremap_prep");
         } else {
-            move_ptes(root, OLD, NEW, len);
+            move_ptes(&mm, OLD, NEW, len);
             if !holds(root, NEW, OLD, &ptes) {
                 r = Some("mremap_moved");
             }
         }
     }
-    paging::free_user(root, &mut |leaf| {
-        if let Leaf::Page(p) = leaf {
-            FRAME_ALLOCATOR.free(p);
-        }
-    });
-    FRAME_ALLOCATOR.free(root);
+    drop(mm);
     r
 }
 

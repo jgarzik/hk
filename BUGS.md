@@ -108,8 +108,8 @@ Address spaces are reference counted and torn down like Linux
   stale writable TLB entry after fork write-protects a page, a COW
   break replaces it, or munmap/MADV_DONTNEED frees it, and write into
   the frame (now shared with the child, or freed: write after free).
-  The flush helpers (`paging::flush_tlb`/`flush_tlb_range`) are where
-  the shootdown IPI goes.
+  The mm-aware flushes (`mm::tlb::flush_tlb_mm_range`) know where the
+  address space is loaded (`MmContext.cpumask`) but send no IPI yet.
 
 ## No dynamically linked executables
 

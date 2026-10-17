@@ -308,6 +308,36 @@ pub fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
     Some(entry_atomic(table, va >> 12).as_ptr())
 }
 
+/// Fill the fresh L3 table `pt` with the 512 4KB pages of the 2MB block
+/// `pmd`: same frames and attributes (Linux __split_huge_pmd_locked).
+/// Returns the block's base.
+pub fn split_table(pt: u64, pmd: u64) -> u64 {
+    const HUGE_MASK: u64 = (2 << 20) - 1;
+    let base = pmd & ADDR_MASK & !HUGE_MASK;
+    let attrs = pmd & !ADDR_MASK & !0b11;
+    let l3 = phys_to_virt_table(pt);
+    for i in 0..ENTRIES_PER_TABLE {
+        // SAFETY: a fresh table frame, not yet reachable
+        unsafe {
+            (*l3)
+                .entry_mut(i)
+                .set_page(base + i as u64 * PAGE_SIZE, attrs)
+        };
+    }
+    base
+}
+
+/// Install the filled table `pt` in the invalid (broken and flushed)
+/// L2 entry at `pmdp` (Linux pmd_populate): the table's entries are
+/// visible before the table is (break-before-make, "make")
+pub fn pmd_populate(pmdp: *mut u64, pt: u64) {
+    // SAFETY: barriers only
+    unsafe { asm!("dsb ishst", options(nostack)) };
+    entry_ptr(pmdp).store(pt | DESC_TABLE, Ordering::Release);
+    // SAFETY: barriers only
+    unsafe { asm!("dsb ishst", "isb", options(nostack)) };
+}
+
 /// A user leaf entry for `phys` with the protection of a VMA (PROT_*),
 /// access flag set (Linux mk_pte + pte_mkyoung)
 pub fn mk_pte(phys: u64, prot: u32) -> u64 {
@@ -366,13 +396,16 @@ pub fn sync_page(phys: u64, exec: bool) {
     }
 }
 
-/// Tear down the user tables under the TTBR0 root `l0_phys` (the
-/// mapping and table part of Linux exit_mmap: unmap_vmas +
-/// free_pgtables). The L0 entries are detached and the TLB invalidated
-/// on all CPUs (`tlbi vmalle1is`) before anything is freed; then each
-/// leaf goes to `put` and every lower table frame is freed. The root
-/// frame itself is left to the caller.
-pub fn free_user(l0_phys: u64, put: &mut dyn FnMut(Leaf)) {
+/// The user page tables of an address space, detached from its
+/// top-level table by [`detach_user`]
+pub struct UserTables(alloc::vec::Vec<u64>);
+
+/// Detach the user tables from the TTBR0 root `l0_phys` (Linux
+/// exit_mmap: unmap_vmas + free_pgtables, first half): its L0 entries
+/// are cleared, the tables below kept intact for [`UserTables::free`],
+/// which runs after the caller flushed every CPU that may still walk
+/// them. The root frame itself is left to the caller.
+pub fn detach_user(l0_phys: u64) -> UserTables {
     let l0 = phys_to_virt_table(l0_phys);
     let mut top = alloc::vec::Vec::new();
     for i in 0..ENTRIES_PER_TABLE {
@@ -386,9 +419,18 @@ pub fn free_user(l0_phys: u64, put: &mut dyn FnMut(Leaf)) {
             (*l0).entry_mut(i).clear();
         }
     }
-    flush_tlb_all();
-    for t in top {
-        free_level(t, 1, put);
+    // The cleared entries are visible to table walks before the flush
+    // SAFETY: barrier only
+    unsafe { asm!("dsb ishst", options(nostack)) };
+    UserTables(top)
+}
+
+impl UserTables {
+    /// Release each user leaf (to `put`) and free every table frame
+    pub fn free(self, put: &mut dyn FnMut(Leaf)) {
+        for t in self.0 {
+            free_level(t, 1, put);
+        }
     }
 }
 
@@ -434,21 +476,6 @@ fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
         }
     }
     crate::FRAME_ALLOCATOR.free(phys);
-}
-
-/// Switch this CPU's user address space (TTBR0) to `root`
-pub fn activate(root: u64) {
-    unsafe {
-        asm!(
-            "msr ttbr0_el1, {}",
-            "isb",
-            "tlbi vmalle1is",
-            "dsb ish",
-            "isb",
-            in(reg) root,
-            options(nostack)
-        );
-    }
 }
 
 // ============================================================================
@@ -556,65 +583,6 @@ impl Default for RawPageTable {
 // ============================================================================
 // TLB maintenance
 // ============================================================================
-
-/// Invalidate TLB entry for a specific virtual address
-#[inline]
-pub fn flush_tlb(vaddr: u64) {
-    unsafe {
-        // TLBI VAE1IS: Invalidate by VA, EL1, Inner Shareable
-        // The address must be shifted right by 12 bits
-        let va_shifted = vaddr >> 12;
-        asm!(
-            "dsb ishst",
-            "tlbi vae1is, {va}",
-            "dsb ish",
-            "isb",
-            va = in(reg) va_shifted,
-            options(nostack)
-        );
-    }
-}
-
-/// Flush TLB for a range of virtual addresses
-///
-/// Uses full TLB flush for large ranges (more efficient than many individual flushes)
-/// and individual TLBI instructions for small ranges.
-#[inline]
-pub fn flush_tlb_range(start: u64, end: u64) {
-    const INVLPG_THRESHOLD: u64 = 32 * PAGE_SIZE;
-
-    if end <= start {
-        return;
-    }
-
-    let range = end - start;
-
-    if range > INVLPG_THRESHOLD {
-        // Full TLB flush is cheaper for large ranges
-        flush_tlb_all();
-    } else {
-        // Individual flushes for small ranges
-        let mut addr = start & !(PAGE_SIZE - 1);
-        while addr < end {
-            flush_tlb(addr);
-            addr += PAGE_SIZE;
-        }
-    }
-}
-
-/// Flush entire TLB (all entries for EL1)
-#[inline]
-pub fn flush_tlb_all() {
-    unsafe {
-        asm!(
-            "dsb ishst",
-            "tlbi vmalle1is",
-            "dsb ish",
-            "isb",
-            options(nostack)
-        );
-    }
-}
 
 // ============================================================================
 // Extract Page Table Indices from Virtual Address
@@ -737,22 +705,10 @@ impl Aarch64PageTable {
             }
             let l3 = phys_to_virt_table(l2_entry.addr());
 
-            // Set the L3 page entry
+            // Set the L3 page entry (a fresh table, never loaded:
+            // nothing to flush; table walks are cache coherent)
             let l3_entry = (*l3).entry_mut(l3_idx);
             l3_entry.set_page(pa, attrs);
-
-            // Clean the data cache for this page table entry
-            // This ensures the write is visible to the MMU
-            let entry_addr = l3_entry as *mut PageTableEntry as u64;
-            asm!(
-                "dc cvau, {}",
-                "dsb ish",
-                in(reg) entry_addr,
-                options(nostack)
-            );
-
-            // Flush TLB for this address
-            flush_tlb(va);
         }
 
         Ok(())
@@ -800,62 +756,6 @@ impl Aarch64PageTable {
             }
 
             Some(l3_entry.addr() | offset)
-        }
-    }
-
-    /// Unmap a single page and return its physical address
-    ///
-    /// This is a static method that takes the page table root directly,
-    /// useful for unmapping pages without needing a full Aarch64PageTable instance.
-    ///
-    /// Returns Some(phys_addr) if the page was mapped, None if not mapped.
-    pub fn unmap_page(l0_phys: u64, va: u64) -> Option<u64> {
-        let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
-
-        unsafe {
-            let l0 = phys_to_virt_table(l0_phys);
-
-            let l0_entry = (*l0).entry(l0_idx);
-            if !l0_entry.is_valid() || !l0_entry.is_table() {
-                return None;
-            }
-            let l1 = phys_to_virt_table(l0_entry.addr());
-
-            let l1_entry = (*l1).entry(l1_idx);
-            if !l1_entry.is_valid() {
-                return None;
-            }
-            // 1GB block pages not supported for unmap
-            if l1_entry.is_block() {
-                return None;
-            }
-            let l2 = phys_to_virt_table(l1_entry.addr());
-
-            let l2_entry = (*l2).entry(l2_idx);
-            if !l2_entry.is_valid() {
-                return None;
-            }
-            // 2MB block pages not supported for unmap
-            if l2_entry.is_block() {
-                return None;
-            }
-            let l3 = phys_to_virt_table(l2_entry.addr());
-
-            let l3_entry = (*l3).entry_mut(l3_idx);
-            if !l3_entry.is_valid() {
-                return None;
-            }
-
-            // Get physical address before clearing
-            let phys = l3_entry.addr();
-
-            // Clear the entry
-            l3_entry.clear();
-
-            // Flush TLB for this address
-            flush_tlb(va);
-
-            Some(phys)
         }
     }
 
@@ -925,16 +825,8 @@ impl Aarch64PageTable {
             // Write back the updated entry as a block descriptor
             l2_entry.set_block(phys, attrs);
 
-            // Clean data cache and flush TLB
-            let entry_addr = l2_entry as *mut PageTableEntry as u64;
-            asm!(
-                "dc cvau, {}",
-                "dsb ish",
-                in(reg) entry_addr,
-                options(nostack)
-            );
-            flush_tlb(va);
-
+            // Permissions only (no break-before-make needed); the
+            // caller flushes the TLB of the range
             true
         }
     }
@@ -1071,11 +963,9 @@ impl PageTable for Aarch64PageTable {
             }
             let l3 = phys_to_virt_table(l2_entry.addr());
 
-            // Set the page entry
+            // Set the page entry (callers flush: mm::tlb)
             let l3_entry = (*l3).entry_mut(l3_idx);
             l3_entry.set_page(pa, attrs);
-
-            flush_tlb(va);
         }
     }
 
@@ -1103,10 +993,9 @@ impl PageTable for Aarch64PageTable {
             }
             let l3 = phys_to_virt_table(l2_entry.addr());
 
+            // Callers flush (mm::tlb)
             let l3_entry = (*l3).entry_mut(l3_idx);
             l3_entry.clear();
-
-            flush_tlb(va);
         }
     }
 
@@ -1217,122 +1106,12 @@ impl Aarch64PageTable {
                 return Err(MapError::AlreadyMapped);
             }
 
-            // Set the 2MB block entry
+            // Set the 2MB block entry: it was invalid, no TLB entry to
+            // flush; visible to table walks before the access retries
             l2_entry.set_block(pa, attrs);
-
-            // Clean the data cache for this page table entry
-            let entry_addr = l2_entry as *mut PageTableEntry as u64;
-            asm!(
-                "dc cvau, {}",
-                "dsb ish",
-                in(reg) entry_addr,
-                options(nostack)
-            );
-
-            // Flush TLB for this address
-            flush_tlb(va);
+            asm!("dsb ishst", "isb", options(nostack));
         }
 
         Ok(())
-    }
-
-    /// Unmap a 2MB huge page
-    ///
-    /// Clears the L2 block entry for the given 2MB-aligned virtual address.
-    ///
-    /// # Arguments
-    /// * `l0_phys` - Physical address of the L0 (root) table
-    /// * `va` - Virtual address (must be 2MB-aligned)
-    ///
-    /// # Returns
-    /// Some(phys_addr) if a huge page was unmapped, None otherwise
-    pub fn unmap_huge_page(l0_phys: u64, va: u64) -> Option<u64> {
-        let (l0_idx, l1_idx, l2_idx, _l3_idx) = page_indices(va);
-
-        unsafe {
-            let l0 = phys_to_virt_table(l0_phys);
-
-            let l0_entry = (*l0).entry(l0_idx);
-            if !l0_entry.is_valid() || !l0_entry.is_table() {
-                return None;
-            }
-            let l1 = phys_to_virt_table(l0_entry.addr());
-
-            let l1_entry = (*l1).entry(l1_idx);
-            if !l1_entry.is_valid() || l1_entry.is_block() {
-                return None;
-            }
-            let l2 = phys_to_virt_table(l1_entry.addr());
-
-            let l2_entry = (*l2).entry_mut(l2_idx);
-            if !l2_entry.is_valid() || !l2_entry.is_block() {
-                return None;
-            }
-
-            // Get physical address before clearing
-            let phys = l2_entry.addr();
-
-            // Clear the entry
-            l2_entry.clear();
-
-            // Clean the data cache for this page table entry
-            let entry_addr = l2_entry as *mut PageTableEntry as u64;
-            asm!(
-                "dc cvau, {}",
-                "dsb ish",
-                in(reg) entry_addr,
-                options(nostack)
-            );
-
-            // Flush TLB for this huge page region
-            flush_tlb(va);
-
-            Some(phys)
-        }
-    }
-
-    /// Split the 2MB block at `va` into 512 4KB pages (Linux
-    /// __split_huge_pmd_locked), mm lock held. The L3 table is allocated
-    /// first, so a failure changes nothing. Changing a live block into a
-    /// table follows break-before-make (ARM ARM D8.16, Linux
-    /// pmdp_invalidate + pmd_populate): the block entry is invalidated,
-    /// its TLB entries broadcast-invalidated (DSB ISH, TLBI VAE1IS,
-    /// DSB ISH), the new table is made visible (DSB ISHST) and only then
-    /// written into the L2 entry. Each 4KB page gets the block's
-    /// attributes and its own frame reference.
-    ///
-    /// Returns the physical base of the split page.
-    pub fn split_huge_page<FA: FrameAlloc<PhysAddr = u64>>(
-        l0_phys: u64,
-        va: u64,
-        frame_alloc: &mut FA,
-    ) -> Result<u64, MapError> {
-        const HUGE_MASK: u64 = (2 << 20) - 1;
-        let pmd = entry_ptr(pmd_ptr(l0_phys, va).ok_or(MapError::NotMapped)?);
-        if !pmd_huge(pmd.load(Ordering::Acquire)) {
-            return Err(MapError::NotMapped);
-        }
-        let l3_phys = frame_alloc
-            .alloc_frame()
-            .ok_or(MapError::FrameAllocationFailed)?;
-        // Break: invalid entry, then the block's TLB entries go
-        let old = pmd.swap(0, Ordering::AcqRel);
-        flush_tlb(va & !HUGE_MASK);
-        let base = old & ADDR_MASK & !HUGE_MASK;
-        let attrs = old & !ADDR_MASK & !0b11;
-        let l3 = phys_to_virt_table(l3_phys);
-        for i in 0..ENTRIES_PER_TABLE {
-            // SAFETY: a fresh table frame, not yet reachable
-            let e = unsafe { (*l3).entry_mut(i) };
-            e.set_page(base + i as u64 * PAGE_SIZE, attrs);
-        }
-        // Make: the table's entries are visible before the table is.
-        // SAFETY: barriers only
-        unsafe { asm!("dsb ishst", options(nostack)) };
-        pmd.store(l3_phys | DESC_TABLE, Ordering::Release);
-        // SAFETY: barriers only
-        unsafe { asm!("dsb ishst", "isb", options(nostack)) };
-        crate::FRAME_ALLOCATOR.split_huge(base);
-        Ok(base)
     }
 }

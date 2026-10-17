@@ -101,19 +101,20 @@ pub fn access_remote_vm_read(
 /// ordinary frame (never MMIO: Linux refuses VM_IO/VM_PFNMAP)
 ///
 /// # Arguments
-/// * `mm` - The target process's memory descriptor (locked)
-/// * `page_table_root` - Physical address of the target's page table root
+/// * `target` - The target process's address space
+/// * `mm` - Its VMAs (`target` locked)
 /// * `remote_addr` - Virtual address in the target's address space
 /// * `buf` - Kernel buffer to write from
 ///
 /// # Returns
 /// Number of bytes written, or error
 pub fn access_remote_vm_write(
+    target: &crate::mm::Mm,
     mm: &MmStruct,
-    page_table_root: u64,
     remote_addr: u64,
     buf: &[u8],
 ) -> Result<usize, KernelError> {
+    let page_table_root = target.pgd();
     if remote_addr.checked_add(buf.len() as u64).is_none() {
         return Err(KernelError::BadAddress);
     }
@@ -127,8 +128,7 @@ pub fn access_remote_vm_write(
         // A private page still shared copy-on-write (fork) gets its own
         // copy first: the write must not reach the other process
         if !vma.is_shared()
-            && crate::mm::fault::unshare_for_write(page_table_root, addr, vma.anon_vma.clone())
-                .is_err()
+            && crate::mm::fault::unshare_for_write(target, addr, vma.anon_vma.clone()).is_err()
         {
             return short(done, KernelError::OutOfMemory);
         }

@@ -208,7 +208,7 @@ pub fn sys_process_vm_writev(
     }
 
     // Get target's mm and page table root
-    let (target_mm, page_table_root) = match get_target_mm_and_pt(target_tid) {
+    let (target_mm, _) = match get_target_mm_and_pt(target_tid) {
         Some(x) => x,
         None => return KernelError::NoProcess.sysret(),
     };
@@ -272,8 +272,7 @@ pub fn sys_process_vm_writev(
 
             // Write to remote
             let bytes_written =
-                match access_remote_vm_write(&target_mm.lock(), page_table_root, remote_addr, &buf)
-                {
+                match access_remote_vm_write(&target_mm, &target_mm.lock(), remote_addr, &buf) {
                     Ok(n) => n,
                     Err(_) => {
                         if total_bytes > 0 {
