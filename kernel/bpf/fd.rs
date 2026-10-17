@@ -4,7 +4,6 @@
 //! BPF objects are exposed as file descriptors to userspace, allowing them to be
 //! managed with standard fd operations (close, dup, etc.).
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 
@@ -22,22 +21,9 @@ use crate::poll::PollTable;
 // =============================================================================
 
 /// File operations for BPF maps
-pub struct BpfMapFileOps {
-    /// The underlying BPF map
-    map: Arc<BpfMap>,
-}
+pub struct BpfMapFileOps;
 
-impl BpfMapFileOps {
-    /// Create file ops for a BPF map
-    pub fn new(map: Arc<BpfMap>) -> Self {
-        Self { map }
-    }
-
-    /// Get the underlying map
-    pub fn map(&self) -> &Arc<BpfMap> {
-        &self.map
-    }
-}
+static BPF_MAP_FOPS: BpfMapFileOps = BpfMapFileOps;
 
 impl FileOps for BpfMapFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -69,30 +55,18 @@ impl FileOps for BpfMapFileOps {
 // BPF Program File Operations
 // =============================================================================
 
-/// File operations for BPF programs
-pub struct BpfProgFileOps {
+/// A BPF program fd's private data
+struct BpfProgFile {
     /// The underlying BPF program
     prog: Arc<BpfProg>,
     /// Program type
     prog_type: u32,
 }
 
-impl BpfProgFileOps {
-    /// Create file ops for a BPF program
-    pub fn new(prog: Arc<BpfProg>, prog_type: u32) -> Self {
-        Self { prog, prog_type }
-    }
+/// File operations for BPF programs
+pub struct BpfProgFileOps;
 
-    /// Get the underlying program
-    pub fn prog(&self) -> &Arc<BpfProg> {
-        &self.prog
-    }
-
-    /// Get the program type
-    pub fn prog_type(&self) -> u32 {
-        self.prog_type
-    }
-}
+static BPF_PROG_FOPS: BpfProgFileOps = BpfProgFileOps;
 
 impl FileOps for BpfProgFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -125,14 +99,11 @@ impl FileOps for BpfProgFileOps {
 
 /// Create a file descriptor for a BPF map
 pub fn create_bpf_map_fd(map: Arc<BpfMap>) -> Result<i32, KernelError> {
-    // Create file operations
-    let ops: &'static dyn FileOps = Box::leak(Box::new(BpfMapFileOps::new(map)));
-
     // Create dummy dentry for the BPF map
     let dentry = create_bpf_dentry("bpf-map");
 
     // Create file with read/write flags
-    let file = Arc::new(File::new(dentry, flags::O_RDWR, ops));
+    let file = Arc::new(File::new_anon(dentry, flags::O_RDWR, &BPF_MAP_FOPS, map));
 
     // Allocate file descriptor using the fd table
     let fd_table = current_fd_table();
@@ -146,14 +117,18 @@ pub fn create_bpf_map_fd(map: Arc<BpfMap>) -> Result<i32, KernelError> {
 
 /// Create a file descriptor for a BPF program
 pub fn create_bpf_prog_fd(prog: Arc<BpfProg>, prog_type: u32) -> Result<i32, KernelError> {
-    // Create file operations
-    let ops: &'static dyn FileOps = Box::leak(Box::new(BpfProgFileOps::new(prog, prog_type)));
+    let private = Arc::new(BpfProgFile { prog, prog_type });
 
     // Create dummy dentry for the BPF program
     let dentry = create_bpf_dentry("bpf-prog");
 
     // Create file with read/write flags
-    let file = Arc::new(File::new(dentry, flags::O_RDWR, ops));
+    let file = Arc::new(File::new_anon(
+        dentry,
+        flags::O_RDWR,
+        &BPF_PROG_FOPS,
+        private,
+    ));
 
     // Allocate file descriptor using the fd table
     let fd_table = current_fd_table();
@@ -193,11 +168,7 @@ pub fn get_bpf_map_from_fd(fd: i32) -> Result<Arc<BpfMap>, KernelError> {
 
     let file = table.get(fd).ok_or(KernelError::BadFd)?;
 
-    file.f_op
-        .as_any()
-        .downcast_ref::<BpfMapFileOps>()
-        .map(|ops| Arc::clone(ops.map()))
-        .ok_or(KernelError::BadFd)
+    file.private_arc::<BpfMap>().ok_or(KernelError::BadFd)
 }
 
 /// Get a BPF program from a file descriptor
@@ -207,10 +178,8 @@ pub fn get_bpf_prog_from_fd(fd: i32) -> Result<Arc<BpfProg>, KernelError> {
 
     let file = table.get(fd).ok_or(KernelError::BadFd)?;
 
-    file.f_op
-        .as_any()
-        .downcast_ref::<BpfProgFileOps>()
-        .map(|ops| Arc::clone(ops.prog()))
+    file.private_ref::<BpfProgFile>()
+        .map(|p| Arc::clone(&p.prog))
         .ok_or(KernelError::BadFd)
 }
 
@@ -221,9 +190,7 @@ pub fn get_bpf_prog_info_from_fd(fd: i32) -> Result<(Arc<BpfProg>, u32), KernelE
 
     let file = table.get(fd).ok_or(KernelError::BadFd)?;
 
-    file.f_op
-        .as_any()
-        .downcast_ref::<BpfProgFileOps>()
-        .map(|ops| (Arc::clone(ops.prog()), ops.prog_type()))
+    file.private_ref::<BpfProgFile>()
+        .map(|p| (Arc::clone(&p.prog), p.prog_type))
         .ok_or(KernelError::BadFd)
 }

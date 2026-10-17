@@ -39,7 +39,6 @@
 //! - Optional kernel-side polling (SQPOLL)
 //! - Registered buffers and files for performance
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -1242,15 +1241,9 @@ impl IoUring {
 // ============================================================================
 
 /// File operations for io_uring file descriptor
-pub struct IoUringFileOps {
-    ring: Arc<IoUring>,
-}
+pub struct IoUringFileOps;
 
-impl IoUringFileOps {
-    pub fn new(ring: Arc<IoUring>) -> Self {
-        Self { ring }
-    }
-}
+static IO_URING_FOPS: IoUringFileOps = IoUringFileOps;
 
 impl FileOps for IoUringFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -1267,13 +1260,16 @@ impl FileOps for IoUringFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(ring) = file.private_ref::<IoUring>() else {
+            return crate::poll::POLLERR;
+        };
         if let Some(poll_table) = pt {
-            poll_table.poll_wait(&self.ring.wq);
+            poll_table.poll_wait(&ring.wq);
         }
 
         // Check if CQEs are available
-        let inner = self.ring.inner.lock();
+        let inner = ring.inner.lock();
         if inner.cq_tail > 0 {
             crate::poll::POLLIN | crate::poll::POLLRDNORM
         } else {
@@ -1281,24 +1277,20 @@ impl FileOps for IoUringFileOps {
         }
     }
 
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
-        self.ring.release();
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        let ring = file.private_ref::<IoUring>().ok_or(KernelError::BadFd)?;
+        ring.release();
         Ok(())
     }
 }
 
 /// Get the IoUring from a File
 pub fn get_io_uring(file: &File) -> Option<Arc<IoUring>> {
-    file.f_op
-        .as_any()
-        .downcast_ref::<IoUringFileOps>()
-        .map(|ops| Arc::clone(&ops.ring))
+    file.private_arc::<IoUring>()
 }
 
 /// Create an io_uring file
 fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, KernelError> {
-    let ops: &'static dyn FileOps = Box::leak(Box::new(IoUringFileOps::new(ring)));
-
     // Create dummy dentry
     let mode = InodeMode::regular(0o600);
     let inode = Arc::new(Inode::new(
@@ -1313,7 +1305,7 @@ fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, KernelError> {
     ));
 
     let dentry = Arc::new(Dentry::new_anonymous(String::from("io_uring"), Some(inode)));
-    let file = Arc::new(File::new(dentry, flags::O_RDWR, ops));
+    let file = Arc::new(File::new_anon(dentry, flags::O_RDWR, &IO_URING_FOPS, ring));
 
     Ok(file)
 }

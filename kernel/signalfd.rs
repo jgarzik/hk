@@ -22,7 +22,6 @@
 //! - poll() support for integration with select/poll/epoll
 //! - Mask can be updated by calling signalfd4 with existing fd
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -277,16 +276,9 @@ impl Signalfd {
 }
 
 /// File operations for signalfd
-pub struct SignalfdFileOps {
-    signalfd: Arc<Signalfd>,
-}
+pub struct SignalfdFileOps;
 
-impl SignalfdFileOps {
-    /// Create file ops for a signalfd
-    pub fn new(signalfd: Arc<Signalfd>) -> Self {
-        Self { signalfd }
-    }
-}
+static SIGNALFD_FOPS: SignalfdFileOps = SignalfdFileOps;
 
 impl FileOps for SignalfdFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -294,8 +286,9 @@ impl FileOps for SignalfdFileOps {
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let signalfd = file.private_ref::<Signalfd>().ok_or(KernelError::BadFd)?;
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        self.signalfd.read(buf, nonblock)
+        signalfd.read(buf, nonblock)
     }
 
     fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
@@ -303,12 +296,16 @@ impl FileOps for SignalfdFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
-        self.signalfd.poll(pt)
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(signalfd) = file.private_ref::<Signalfd>() else {
+            return crate::poll::POLLERR;
+        };
+        signalfd.poll(pt)
     }
 
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
-        self.signalfd.release();
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        let signalfd = file.private_ref::<Signalfd>().ok_or(KernelError::BadFd)?;
+        signalfd.release();
         Ok(())
     }
 }
@@ -325,9 +322,6 @@ pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<Arc<File>, Kernel
     let tid = crate::task::percpu::current_tid();
     let signalfd = Signalfd::new(mask, tid);
 
-    // Create file operations
-    let ops: &'static dyn FileOps = Box::leak(Box::new(SignalfdFileOps::new(signalfd)));
-
     // Create dummy dentry for signalfd
     let dentry = create_signalfd_dentry()?;
 
@@ -337,7 +331,7 @@ pub fn create_signalfd(mask: SigSet, sfd_flags: i32) -> Result<Arc<File>, Kernel
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file = Arc::new(File::new(dentry, file_flags, ops));
+    let file = Arc::new(File::new_anon(dentry, file_flags, &SIGNALFD_FOPS, signalfd));
     Ok(file)
 }
 
@@ -361,10 +355,7 @@ fn create_signalfd_dentry() -> Result<Arc<Dentry>, KernelError> {
 
 /// Get the Signalfd from a File (for syscall implementations)
 pub fn get_signalfd(file: &File) -> Option<Arc<Signalfd>> {
-    file.f_op
-        .as_any()
-        .downcast_ref::<SignalfdFileOps>()
-        .map(|ops| Arc::clone(&ops.signalfd))
+    file.private_arc::<Signalfd>()
 }
 
 /// Wake all signalfds that are interested in signal `sig` for task `tid`

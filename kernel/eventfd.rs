@@ -23,7 +23,6 @@
 //! - poll() support for integration with select/poll/epoll
 //! - Semaphore mode (EFD_SEMAPHORE) for decrement-by-1 semantics
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -215,16 +214,9 @@ impl Eventfd {
 }
 
 /// File operations for eventfd
-pub struct EventfdFileOps {
-    eventfd: Arc<Eventfd>,
-}
+pub struct EventfdFileOps;
 
-impl EventfdFileOps {
-    /// Create file ops for an eventfd
-    pub fn new(eventfd: Arc<Eventfd>) -> Self {
-        Self { eventfd }
-    }
-}
+static EVENTFD_FOPS: EventfdFileOps = EventfdFileOps;
 
 impl FileOps for EventfdFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -232,13 +224,14 @@ impl FileOps for EventfdFileOps {
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let eventfd = file.private_ref::<Eventfd>().ok_or(KernelError::BadFd)?;
         // eventfd read always returns 8 bytes (u64)
         if buf.len() < 8 {
             return Err(KernelError::InvalidArgument);
         }
 
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        let count = self.eventfd.read(nonblock)?;
+        let count = eventfd.read(nonblock)?;
 
         // Write u64 to buffer (little-endian)
         buf[0..8].copy_from_slice(&count.to_le_bytes());
@@ -246,6 +239,7 @@ impl FileOps for EventfdFileOps {
     }
 
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+        let eventfd = file.private_ref::<Eventfd>().ok_or(KernelError::BadFd)?;
         // eventfd write requires exactly 8 bytes (u64)
         if buf.len() < 8 {
             return Err(KernelError::InvalidArgument);
@@ -257,15 +251,19 @@ impl FileOps for EventfdFileOps {
         ]);
 
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        self.eventfd.write(value, nonblock)
+        eventfd.write(value, nonblock)
     }
 
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
-        self.eventfd.poll(pt)
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(eventfd) = file.private_ref::<Eventfd>() else {
+            return POLLERR;
+        };
+        eventfd.poll(pt)
     }
 
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
-        self.eventfd.release();
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        let eventfd = file.private_ref::<Eventfd>().ok_or(KernelError::BadFd)?;
+        eventfd.release();
         Ok(())
     }
 }
@@ -281,9 +279,6 @@ impl FileOps for EventfdFileOps {
 pub fn create_eventfd(initval: u64, efd_flags: i32) -> Result<Arc<File>, KernelError> {
     let eventfd = Eventfd::new(initval, efd_flags);
 
-    // Create file operations
-    let ops: &'static dyn FileOps = Box::leak(Box::new(EventfdFileOps::new(eventfd)));
-
     // Create dummy dentry for eventfd
     let dentry = create_eventfd_dentry()?;
 
@@ -293,7 +288,7 @@ pub fn create_eventfd(initval: u64, efd_flags: i32) -> Result<Arc<File>, KernelE
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file = Arc::new(File::new(dentry, file_flags, ops));
+    let file = Arc::new(File::new_anon(dentry, file_flags, &EVENTFD_FOPS, eventfd));
     Ok(file)
 }
 
@@ -317,8 +312,5 @@ fn create_eventfd_dentry() -> Result<Arc<Dentry>, KernelError> {
 
 /// Get the Eventfd from a File (for syscall implementations)
 pub fn get_eventfd(file: &File) -> Option<Arc<Eventfd>> {
-    file.f_op
-        .as_any()
-        .downcast_ref::<EventfdFileOps>()
-        .map(|ops| Arc::clone(&ops.eventfd))
+    file.private_arc::<Eventfd>()
 }
