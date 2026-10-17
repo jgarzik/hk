@@ -22,6 +22,9 @@
 //!   its PTE change before the barrier, so the walk after the load sees
 //!   it; one that sees the bit reaches this CPU.
 //!
+//! - The other CPUs of the cpumask get the flush by IPI
+//!   (`smp_call_function_many`, waiting): their handler does the same.
+//!
 //! Generations order flushes: a CPU whose `loaded_gen` already covers
 //! a flush skips it; one more than one generation behind flushes all.
 
@@ -144,11 +147,26 @@ pub fn flush_tlb_mm_range(mm: &Mm, start: u64, end: u64, stride_shift: u32, free
         freed_tables,
         new_gen,
     };
+    let cpu = this_cpu();
     let irq = local_irq_save();
-    if ctx.cpumask.test(this_cpu()) {
+    if ctx.cpumask.test(cpu) {
         flush_func(&info);
     }
     local_irq_restore(irq);
+    // The other CPUs that have it loaded (Linux native_flush_tlb_multi);
+    // `info` stays alive: the call waits for all of them
+    let mut others = ctx.cpumask.snapshot();
+    others.clear(cpu);
+    if !others.is_empty() {
+        let p = &info as *const FlushInfo as usize;
+        crate::smp::smp_call_function_many(&others, flush_ipi, p, true);
+    }
+}
+
+/// `flush_func` on a target CPU (call-function IPI, interrupts off)
+fn flush_ipi(info: usize) {
+    // SAFETY: the sender's FlushInfo, alive until every target returned
+    flush_func(unsafe { &*(info as *const FlushInfo) });
 }
 
 /// Flush the page at `va` of `mm`
@@ -169,9 +187,16 @@ pub fn flush_tlb_kernel_range(start: u64, end: u64) {
     if arch::flush_kernel_range(start, end) {
         return;
     }
-    let irq = local_irq_save();
+    // Every CPU, this one included: kernel threads run everywhere
+    let range = (start, end);
+    crate::smp::on_each_cpu(kernel_flush_ipi, &range as *const (u64, u64) as usize);
+}
+
+/// The kernel-range flush on one CPU (interrupts off)
+fn kernel_flush_ipi(info: usize) {
+    // SAFETY: the sender's range, alive until every CPU returned
+    let (start, end) = unsafe { *(info as *const (u64, u64)) };
     local_flush(start, end, PAGE_SHIFT);
-    local_irq_restore(irq);
 }
 
 /// Flush [start, end) on this CPU, everything past `FLUSH_CEILING`

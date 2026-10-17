@@ -819,9 +819,21 @@ No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
   just this one, else all; ranges over `FLUSH_CEILING` pages flush
   all). arm64 broadcasts instead (`tlbi vale1is` / `vae1is` when page
   tables were freed, `vmalle1is` past the ceiling; the DSB ISH waits
-  for every CPU). x86 still reaches no other CPU (section 9).
+  for every CPU). On x86 the other CPUs of the cpumask are then sent
+  the flush and waited for (`smp_call_function_many`, Cross-CPU Calls:
+  the wait answers this CPU's own queue, so it may run with interrupts
+  off), their handler doing the same `flush_func`.
 - `flush_tlb_kernel_range` (ioremap/iounmap): arm64 `tlbi vaae1is`
-  (all CPUs); x86 this CPU only (section 9). Called with no lock held.
+  (all CPUs); x86 every active CPU (`on_each_cpu`). Called with no lock
+  held.
+- Who may flush: thread context, never under an IrqSpinlock or a lock
+  another CPU spins on with interrupts off (Cross-CPU Calls). User
+  flushes run under the mm lock, so the mm lock's waiters poll their
+  call queue (`Mm::lock` spins with `sync::spin::lock_with`, answering
+  calls: Linux's mmap_lock sleeps instead) and nothing above the mm lock
+  in section 2 is held across a flush (callers hold at most the mm lock
+  and the VFS / IPC locks taken before it, none of which is spun on with
+  interrupts off). arm64 flushes never wait on another CPU's software.
 
 #### Cross-CPU Calls (kernel/smp.rs; arch/{x86_64,aarch64}/ipi.rs)
 
@@ -886,12 +898,9 @@ layout in `doc/MEMORY.md`
   taken in IRQ context). Under it `FRAME_ALLOCATOR` is taken for new
   table frames; `IOREMAP` is a leaf otherwise (Linux: `vmap_area_lock`
   + `init_mm.page_table_lock`).
-- TLB: iounmap clears the entries and flushes (`flush_tlb_kernel_range`,
-  with `IOREMAP` not held) before the range is freed; arm64 broadcasts,
-  x86 has no kernel TLB shootdown yet, so after
-  iounmap another CPU may still cache the old translation of a range
-  that is handed out again (gap vs Linux `flush_tlb_kernel_range`,
-  section 9; drivers do not iounmap in practice).
+- TLB: iounmap clears the entries and flushes every CPU
+  (`flush_tlb_kernel_range`, with `IOREMAP` not held) before the range
+  is freed; arm64 broadcasts, x86 sends IPIs.
 - User half: per address space, changed by its tasks under the mm lock
   (the fault path, see Address Spaces);
   never contains a kernel mapping.
@@ -2579,8 +2588,7 @@ Features present in Linux but not yet implemented in hk:
 | lockdep | Runtime deadlock detection | Not implemented | Manual ordering verification |
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
 | Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
-| Kernel TLB shootdown | `flush_tlb_kernel_range` IPIs | x86: local `invlpg` only | Stale ioremap translation on other CPUs after iounmap |
-| User TLB shootdown | `flush_tlb_mm_range` IPIs to `mm_cpumask` | x86: local `invlpg` / CR3 reload only (arm64 broadcasts `tlbi ...is`) | Another CPU running a thread of the same process may write through a stale writable entry after fork's write-protect, a COW break, munmap, MADV_DONTNEED or mprotect: into a frame now shared with a child, or freed (write after free) |
+| Lazy TLB, PCID, global pages | kernel threads keep the last user mm; PCID tags; PGE | Kernel threads load the kernel table; every CR3 write flushes all | More flushes on context switch (x86) |
 | mmap_lock across faults | `mmap_read_lock` + PTE lock in the fault path | The mm lock (a spinlock: exclusive, not shared) is held across the fault, except while reading a file page or swap slot (the VMA is revalidated after) | Faults in one address space are serialized; a swap-in can race munmap of its range (swap is inert) |
 
 ### Implications

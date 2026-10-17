@@ -247,6 +247,18 @@ pub fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError> {
     Ok((virt_base + offset) as *mut u8)
 }
 
+/// Point the ioremap page at `va` to `pa` instead (TLB self-test):
+/// break (clear, flush every CPU), then make
+#[cfg(feature = "lockdep")]
+pub fn retarget(va: u64, pa: u64) -> Result<(), IoremapError> {
+    let root = swapper_phys();
+    unmap_page(root, va);
+    flush_tlb_kernel_range(va, va + PAGE_SIZE);
+    map_mmio_page(root, va, pa)?;
+    flush_tlb_kernel_range(va, va + PAGE_SIZE);
+    Ok(())
+}
+
 /// Unmap a previously ioremap'd region
 ///
 /// # Arguments

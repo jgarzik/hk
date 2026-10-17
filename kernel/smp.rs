@@ -150,6 +150,13 @@ fn csd_wait(csd: &Csd, me: u32) {
     }
 }
 
+/// Spinning for a lock with interrupts possibly off: run this CPU's
+/// queued calls, so a holder flushing this CPU does not wait forever
+/// (`Mm::lock`)
+pub fn poll_queue() {
+    poll(this_cpu());
+}
+
 /// Run the calls queued for this CPU now, with interrupts off (the IPI
 /// handler may otherwise run calls concurrently on this CPU)
 fn poll(me: u32) {

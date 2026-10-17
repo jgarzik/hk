@@ -97,19 +97,15 @@ Address spaces are reference counted and torn down like Linux
   partial mprotect or munmap) is not limited (Linux: 65530, then
   ENOMEM). A locked mapping grown by mremap is not faulted in (Linux
   populates it).
-- A remote write (ptrace, process_vm_writev) that gives the target its
-  own copy of a copy-on-write page flushes only this CPU's TLB (no x86
-  shootdown, see above).
 - Exited non-leader threads stay in the task table as zombies (Linux
   reaps them at once); their kernel stacks and memory are freed.
 - munmap keeps page-table pages that become empty (freed at exit).
-- x86 has no user TLB shootdown (doc/LOCKING.md section 9): when
-  threads of one process run on several CPUs, another CPU may keep a
-  stale writable TLB entry after fork write-protects a page, a COW
-  break replaces it, or munmap/MADV_DONTNEED frees it, and write into
-  the frame (now shared with the child, or freed: write after free).
-  The mm-aware flushes (`mm::tlb::flush_tlb_mm_range`) know where the
-  address space is loaded (`MmContext.cpumask`) but send no IPI yet.
+- x86 and arm64 syscalls run with interrupts off, so a CPU in a long
+  syscall answers a TLB shootdown IPI only when it sleeps, returns or
+  spins on the mm lock (which polls its call queue): the shooting CPU
+  waits meanwhile. Spinning with interrupts off on another lock held
+  across a shootdown would deadlock (doc/LOCKING.md, Cross-CPU Calls);
+  none is today, and user tasks still run on CPU 0 only.
 
 ## No dynamically linked executables
 

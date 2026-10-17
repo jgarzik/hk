@@ -132,6 +132,13 @@ pub use aarch64::paging::{self, phys_to_virt, virt_to_phys};
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::tlb;
 
+// TLB self-test hook (kselftest, LOCKDEP builds)
+#[cfg(all(feature = "lockdep", target_arch = "x86_64"))]
+pub use x86_64::ioremap::retarget as ioremap_retarget;
+
+#[cfg(all(feature = "lockdep", target_arch = "aarch64"))]
+pub use aarch64::ioremap::retarget as ioremap_retarget;
+
 // IPIs behind smp
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::ipi;

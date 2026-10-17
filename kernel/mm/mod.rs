@@ -610,9 +610,14 @@ impl Mm {
         self.pgd
     }
 
-    /// Lock the VMA tree (mmap_lock)
+    /// Lock the VMA tree (mmap_lock). Linux's mmap_lock sleeps, so its
+    /// waiters never block IPIs; this one is spun on, maybe with
+    /// interrupts off (a syscall), while its holder may be flushing this
+    /// CPU's TLB: the wait answers this CPU's cross-CPU calls
+    /// (doc/LOCKING.md, Cross-CPU Calls)
+    #[track_caller]
     pub fn lock(&self) -> crate::sync::spin::MutexGuard<'_, MmStruct> {
-        self.map.lock()
+        crate::sync::spin::lock_with(&self.map, crate::smp::poll_queue)
     }
 
     /// TLB state (Linux mm->context)
