@@ -25,7 +25,6 @@
 //! - Integration with waitid(P_PIDFD)
 //! - CLONE_PIDFD support for automatic pidfd creation
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -145,16 +144,9 @@ impl Pidfd {
 }
 
 /// File operations for pidfd
-pub struct PidfdFileOps {
-    pidfd: Arc<Pidfd>,
-}
+pub struct PidfdFileOps;
 
-impl PidfdFileOps {
-    /// Create file ops for a pidfd
-    pub fn new(pidfd: Arc<Pidfd>) -> Self {
-        Self { pidfd }
-    }
-}
+static PIDFD_FOPS: PidfdFileOps = PidfdFileOps;
 
 impl FileOps for PidfdFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -171,12 +163,16 @@ impl FileOps for PidfdFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
-        self.pidfd.poll(pt)
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(pidfd) = file.private_ref::<Pidfd>() else {
+            return crate::poll::POLLERR;
+        };
+        pidfd.poll(pt)
     }
 
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
-        self.pidfd.release();
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        let pidfd = file.private_ref::<Pidfd>().ok_or(KernelError::BadFd)?;
+        pidfd.release();
         Ok(())
     }
 }
@@ -192,9 +188,6 @@ impl FileOps for PidfdFileOps {
 pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError> {
     let pidfd = Pidfd::new(pid);
 
-    // Create file operations
-    let ops: &'static dyn FileOps = Box::leak(Box::new(PidfdFileOps::new(pidfd)));
-
     // Create dummy dentry for pidfd
     let dentry = create_pidfd_dentry()?;
 
@@ -204,7 +197,7 @@ pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError>
         f_flags |= flags::O_NONBLOCK;
     }
 
-    let file = Arc::new(File::new(dentry, f_flags, ops));
+    let file = Arc::new(File::new_anon(dentry, f_flags, &PIDFD_FOPS, pidfd));
     Ok(file)
 }
 
@@ -244,10 +237,7 @@ pub fn notify_process_exit(pid: Pid, status: i32) {
 ///
 /// Returns the Arc<Pidfd> if the file is a pidfd, None otherwise.
 pub fn get_pidfd(file: &File) -> Option<Arc<Pidfd>> {
-    file.f_op
-        .as_any()
-        .downcast_ref::<PidfdFileOps>()
-        .map(|ops| Arc::clone(&ops.pidfd))
+    file.private_arc::<Pidfd>()
 }
 
 /// Get the PID from a pidfd File
@@ -259,5 +249,5 @@ pub fn get_pidfd_pid(file: &File) -> Option<Pid> {
 
 /// Check if a file is a pidfd
 pub fn is_pidfd(file: &File) -> bool {
-    file.f_op.as_any().downcast_ref::<PidfdFileOps>().is_some()
+    file.f_op.as_any().is::<PidfdFileOps>()
 }

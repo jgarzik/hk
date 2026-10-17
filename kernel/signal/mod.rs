@@ -1041,6 +1041,77 @@ use crate::rlimit::{RLIM_NLIMITS, RLimit, default_rlimits};
 pub struct SignalStruct {
     /// Resource limits for this process
     rlim: IrqSpinlock<[RLimit; RLIM_NLIMITS]>,
+    /// Linux signal->cred_guard_mutex (sleeping, thread context only,
+    /// outermost): held by exec from its first check until the new
+    /// image is in place, and by ptrace attach around its decision
+    cred_guard: crate::sync::Mutex<()>,
+    /// Linux signal->exec_update_lock (sleeping RwSem, thread context
+    /// only, just inside cred_guard): exec holds it for writing while it
+    /// installs the new mm, name and dumpability; the mm_access checks
+    /// (process_vm, /proc/<pid> mm files, stat) for reading around their
+    /// decision and the mm they take
+    exec_update: crate::sync::RwSem,
+}
+
+/// A thread group's exec_update_lock held for reading, until dropped
+pub struct ExecUpdateRead(Option<Arc<SignalStruct>>);
+
+impl ExecUpdateRead {
+    /// Take task `tid`'s (none for a task without a SignalStruct)
+    pub fn lock(tid: Tid) -> Self {
+        let s = get_task_signal_struct(tid);
+        if let Some(s) = &s {
+            s.exec_update.down_read();
+        }
+        Self(s)
+    }
+}
+
+impl Drop for ExecUpdateRead {
+    fn drop(&mut self) {
+        if let Some(s) = &self.0 {
+            // SAFETY: taken in ExecUpdateRead::lock by this task
+            unsafe { s.exec_update.up_read() };
+        }
+    }
+}
+
+impl CredGuard {
+    /// Run `f` with this thread group's exec_update_lock held for
+    /// writing (exec only, inside its cred_guard)
+    pub fn exec_update<R>(&self, f: impl FnOnce() -> R) -> R {
+        let Some(s) = &self.0 else {
+            return f();
+        };
+        s.exec_update.down_write();
+        let r = f();
+        // SAFETY: taken just above by this task
+        unsafe { s.exec_update.up_write() };
+        r
+    }
+}
+
+/// A thread group's cred_guard_mutex, held until dropped
+pub struct CredGuard(Option<Arc<SignalStruct>>);
+
+impl CredGuard {
+    /// Take task `tid`'s (none for a task without a SignalStruct)
+    pub fn lock(tid: Tid) -> Self {
+        let s = get_task_signal_struct(tid);
+        if let Some(s) = &s {
+            s.cred_guard.lock_raw();
+        }
+        Self(s)
+    }
+}
+
+impl Drop for CredGuard {
+    fn drop(&mut self) {
+        if let Some(s) = &self.0 {
+            // SAFETY: taken in CredGuard::lock by this task
+            unsafe { s.cred_guard.unlock_raw() };
+        }
+    }
 }
 
 impl SignalStruct {
@@ -1048,6 +1119,8 @@ impl SignalStruct {
     pub fn new() -> Self {
         Self {
             rlim: IrqSpinlock::new(default_rlimits()),
+            cred_guard: crate::sync::Mutex::new(()),
+            exec_update: crate::sync::RwSem::new(),
         }
     }
 
@@ -1098,6 +1171,8 @@ impl SignalStruct {
         new_rlim.copy_from_slice(&*rlim);
         Arc::new(Self {
             rlim: IrqSpinlock::new(new_rlim),
+            cred_guard: crate::sync::Mutex::new(()),
+            exec_update: crate::sync::RwSem::new(),
         })
     }
 }

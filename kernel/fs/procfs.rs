@@ -343,12 +343,18 @@ impl InodeOps for ProcfsInodeOps {
             .downcast_ref::<ProcfsInodeWrapper>()
             .ok_or(KernelError::Io)?;
         let data = wrapper.0.read();
+        // A link target may sleep (exe takes exec_update_lock): call it
+        // after dropping the inode data's spinning read lock
+        if let ProcfsInodeData::PidLink { pid, target } = &*data {
+            let (pid, target) = (*pid, *target);
+            drop(data);
+            return target(pid);
+        }
         match &*data {
             ProcfsInodeData::SelfLink => {
                 Ok(alloc::format!("{}", crate::task::percpu::current_pid()))
             }
             ProcfsInodeData::FdSymlink { pid, fd } => fd_link(*pid, *fd),
-            ProcfsInodeData::PidLink { pid, target } => target(*pid),
             _ => Err(KernelError::InvalidArgument),
         }
     }
@@ -362,6 +368,13 @@ impl InodeOps for ProcfsInodeOps {
             && !crate::task::ptrace::may_read_proc(pid)
         {
             return Err(KernelError::PermissionDenied);
+        }
+        // The owner follows the task's identity and dumpability (Linux
+        // pid_revalidate -> pid_update_inode)
+        if let Some(pid) = pid_file_pid(inode) {
+            let (uid, gid) = dump_owner(pid);
+            inode.set_uid(uid);
+            inode.set_gid(gid);
         }
         let Some(ctl) = sysctl_of(inode) else {
             return crate::fs::dac::generic_permission(cred, inode, mask);
@@ -598,13 +611,14 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
             Ok(inode)
         }
         name if pid_file(name).is_some() => {
-            let (off, generator) = pid_file(name).ok_or(KernelError::NotFound)?;
+            let (off, mode, generator) = pid_file(name).ok_or(KernelError::NotFound)?;
             let sb = dir.superblock().ok_or(KernelError::Io)?;
+            let (uid, gid) = dump_owner(pid);
             let inode = Arc::new(Inode::new(
                 pid_ino(pid, off),
-                InodeMode::regular(0o444), // r--r--r--
-                0,
-                0,
+                InodeMode::regular(mode),
+                uid,
+                gid,
                 0,
                 current_time(),
                 Arc::downgrade(&sb),
@@ -899,34 +913,29 @@ pub enum PidGen {
     /// Private content of the address space: open needs ptrace-read
     /// access and pins the mm it reads from (Linux proc_mem_open: an
     /// mm_count reference)
-    Mm(fn(&crate::mm::MmStruct) -> Vec<u8>),
+    Mm(fn(&crate::mm::Mm, &crate::mm::MmStruct) -> Vec<u8>),
 }
 
 /// The address space a /proc/<pid>/ file reads, if the caller may
 /// (Linux mm_access): EACCES without ptrace-read access
 ///
-/// The mm is taken first and the check is repeated around it: if the
-/// task exec'd in between (new mm, maybe new credentials), the access
-/// is decided again for the new image, so the result is never an mm
-/// the check did not cover (hk has no exec lock; Linux holds
-/// exec_update_lock across mm_access)
+/// Decided and taken under the process's exec_update_lock (read), which
+/// exec holds for writing while it installs the new mm and
+/// dumpability, so the result is never an mm the check did not cover
+/// (Linux mm_access)
 fn mm_access(pid: Pid) -> Result<Option<Arc<crate::mm::Mm>>, KernelError> {
-    let task_mm = || get_tid_for_pid(pid).and_then(crate::mm::get_task_mm);
-    loop {
-        let mm = task_mm();
-        if !crate::task::ptrace::may_read_proc(pid) {
-            return Err(KernelError::PermissionDenied);
-        }
-        let now = task_mm();
-        let same = match (&mm, &now) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            (None, None) => true,
-            _ => false,
-        };
-        if same {
-            return Ok(mm);
-        }
+    let Some(tid) = get_tid_for_pid(pid) else {
+        return Ok(None);
+    };
+    // The check and the mm it covers under the process's
+    // exec_update_lock: no exec of it switches mm or dumpability between
+    // exec_update_lock; check and mm both of that one task, so a pid
+    // reused meanwhile cannot split them
+    let _g = crate::signal::ExecUpdateRead::lock(tid);
+    if !crate::task::ptrace::may_read_task(tid) {
+        return Err(KernelError::PermissionDenied);
     }
+    Ok(crate::mm::get_task_mm(tid))
 }
 
 /// Content of a per-process file for this open file (or, with none,
@@ -950,34 +959,86 @@ fn pid_content(file: Option<&File>, pid: Pid, g: PidGen) -> Result<Vec<u8>, Kern
             let Some(m) = users else {
                 return Ok(Vec::new());
             };
-            let out = f(&m.lock());
+            let out = f(&m, &m.lock());
             Ok(out)
         }
     }
 }
 
-const PID_FILES: &[(&str, u64, PidGen)] = &[
-    ("cgroup", 102, PidGen::Pub(gen_cgroup_content)),
-    ("maps", 103, PidGen::Mm(gen_maps)),
+/// Generated files in /proc/<pid>/: name, inode offset, mode (Linux
+/// fs/proc/base.c tgid_base_stuff), generator
+const PID_FILES: &[(&str, u64, u16, PidGen)] = &[
+    ("cgroup", 102, 0o444, PidGen::Pub(gen_cgroup_content)),
+    ("maps", 103, 0o444, PidGen::Mm(gen_maps)),
+    (
+        "status",
+        105,
+        0o444,
+        PidGen::Pub(super::proc_array::gen_status),
+    ),
+    ("stat", 106, 0o444, PidGen::Pub(super::proc_array::gen_stat)),
+    (
+        "cmdline",
+        107,
+        0o444,
+        PidGen::Pub(super::proc_array::gen_cmdline),
+    ),
+    (
+        "environ",
+        108,
+        0o400,
+        PidGen::Mm(super::proc_array::gen_environ),
+    ),
 ];
 
-fn pid_file(name: &str) -> Option<(u64, PidGen)> {
+fn pid_file(name: &str) -> Option<(u64, u16, PidGen)> {
     PID_FILES
         .iter()
-        .find(|(n, _, _)| *n == name)
-        .map(|&(_, off, g)| (off, g))
+        .find(|(n, _, _, _)| *n == name)
+        .map(|&(_, off, mode, g)| (off, mode, g))
+}
+
+/// Owner of a /proc/<pid>/ file (Linux task_dump_owner): the task's
+/// euid/egid while it is dumpable, else root, so a non-dumpable task's
+/// mode-0400 files are root's
+fn dump_owner(pid: Pid) -> (u32, u32) {
+    use crate::task::percpu::TASK_TABLE;
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tgid == pid)
+        .filter(|t| t.prctl.dumpable == crate::task::dumpable::SUID_DUMP_USER)
+        .map_or((0, 0), |t| (t.cred.euid, t.cred.egid))
+}
+
+/// The process a per-process file belongs to
+fn pid_file_pid(inode: &Inode) -> Option<Pid> {
+    let private = inode.get_private()?;
+    let wrapper = private
+        .as_ref()
+        .as_any()
+        .downcast_ref::<ProcfsInodeWrapper>()?;
+    match &*wrapper.0.read() {
+        ProcfsInodeData::PidFile { pid, .. } => Some(*pid),
+        _ => None,
+    }
 }
 
 /// /proc/<pid>/exe: the executable's path (ENOENT for kernel threads,
 /// EACCES without ptrace-read access, Linux proc_fd_access_allowed)
 fn exe_link(pid: Pid) -> Result<String, KernelError> {
+    // Through mm_access, so the check and the image it reveals are one
+    // (exec_update_lock read). An exec resolving /proc/self/exe (busybox
+    // re-execs itself) holds only cred_guard while it walks paths: it
+    // takes exec_update for writing later, in exec_replace_image
     let mm = mm_access(pid)?.ok_or(KernelError::NotFound)?;
     let exe = mm.lock().exe().ok_or(KernelError::NotFound)?;
     Ok(exe)
 }
 
 /// /proc/<pid>/maps: one line per VMA (Linux show_map_vma)
-fn gen_maps(mm: &crate::mm::MmStruct) -> Vec<u8> {
+fn gen_maps(_: &crate::mm::Mm, mm: &crate::mm::MmStruct) -> Vec<u8> {
     use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
     use alloc::fmt::Write;
     let mut out = String::new();
@@ -1072,6 +1133,29 @@ fn get_task_cgroup_path(pid: Pid) -> String {
     cgroup_ns.translate_path(&cgroup)
 }
 
+/// Copy `content` from the file position on into `buf` and advance it
+fn copy_out(file: &File, buf: &mut [u8], content: &[u8]) -> usize {
+    let pos = file.get_pos() as usize;
+    if pos >= content.len() {
+        return 0; // EOF
+    }
+    let n = min(buf.len(), content.len() - pos);
+    buf[..n].copy_from_slice(&content[pos..pos + n]);
+    file.advance_pos(n as u64);
+    n
+}
+
+/// Copy `content` from `offset` on into `buf` (pread: no position)
+fn copy_at(buf: &mut [u8], content: &[u8], offset: u64) -> usize {
+    let pos = offset as usize;
+    if pos >= content.len() {
+        return 0;
+    }
+    let n = min(buf.len(), content.len() - pos);
+    buf[..n].copy_from_slice(&content[pos..pos + n]);
+    n
+}
+
 /// Static procfs inode ops
 pub static PROCFS_INODE_OPS: ProcfsInodeOps = ProcfsInodeOps;
 
@@ -1112,15 +1196,21 @@ impl FileOps for ProcfsFileOps {
             .ok_or(KernelError::Io)?;
 
         let data = wrapper.0.read();
+        // Per-process generators may sleep (exec_update_lock, mmap_lock):
+        // they run after the inode data's spinning read lock is dropped
+        if let ProcfsInodeData::PidFile { pid, generator } = &*data {
+            let (pid, g) = (*pid, *generator);
+            drop(data);
+            let content = pid_content(Some(file), pid, g)?;
+            return Ok(copy_out(file, buf, &content));
+        }
         let content = match &*data {
             ProcfsInodeData::File { generator } => generator(),
             ProcfsInodeData::NamespaceFile { pid, ns_type } => {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidFile { pid, generator } => {
-                pid_content(Some(file), *pid, *generator)?
-            }
+            ProcfsInodeData::PidFile { .. } => return Err(KernelError::Io),
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
             ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::PidLink { .. }
@@ -1134,19 +1224,8 @@ impl FileOps for ProcfsFileOps {
             | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
         };
 
-        let pos = file.get_pos() as usize;
-
-        if pos >= content.len() {
-            return Ok(0); // EOF
-        }
-
-        let available = content.len() - pos;
-        let to_read = min(buf.len(), available);
-
-        buf[..to_read].copy_from_slice(&content[pos..pos + to_read]);
-        file.advance_pos(to_read as u64);
-
-        Ok(to_read)
+        drop(data);
+        Ok(copy_out(file, buf, &content))
     }
 
     fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
@@ -1159,15 +1238,21 @@ impl FileOps for ProcfsFileOps {
             .ok_or(KernelError::Io)?;
 
         let data = wrapper.0.read();
+        // Per-process generators may sleep (exec_update_lock, mmap_lock):
+        // they run after the inode data's spinning read lock is dropped
+        if let ProcfsInodeData::PidFile { pid, generator } = &*data {
+            let (pid, g) = (*pid, *generator);
+            drop(data);
+            let content = pid_content(Some(file), pid, g)?;
+            return Ok(copy_at(buf, &content, offset));
+        }
         let content = match &*data {
             ProcfsInodeData::File { generator } => generator(),
             ProcfsInodeData::NamespaceFile { pid, ns_type } => {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidFile { pid, generator } => {
-                pid_content(Some(file), *pid, *generator)?
-            }
+            ProcfsInodeData::PidFile { .. } => return Err(KernelError::Io),
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
             ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::PidLink { .. }
@@ -1390,7 +1475,7 @@ fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), Kernel
     }) {
         return Ok(());
     }
-    for (name, off, _) in PID_FILES {
+    for (name, off, _, _) in PID_FILES {
         let more = ctx.emit(DirEntry {
             ino: pid_ino(pid, *off),
             file_type: FileType::Regular,
@@ -1562,12 +1647,13 @@ fn gen_version() -> Vec<u8> {
 /// Generate /proc/meminfo content (Linux meminfo_proc_show subset:
 /// 16-column labels, values in kB). Free memory is the frame
 /// allocator's exact count; hk has no reclaimable caches counted yet,
-/// so MemAvailable equals MemFree.
+/// so MemAvailable equals MemFree. Slab is the kernel heap in use.
 fn gen_meminfo() -> Vec<u8> {
     use alloc::fmt::Write;
     let fa = &crate::FRAME_ALLOCATOR;
     let total = fa.stats().total_bytes >> 10;
     let free = (fa.free_frames() as u64 * 4096) >> 10;
+    let slab = (crate::ALLOCATOR.used_bytes() as u64) >> 10;
     let mut out = String::new();
     for (label, kb) in [
         ("MemTotal:", total),
@@ -1578,6 +1664,7 @@ fn gen_meminfo() -> Vec<u8> {
         ("SwapCached:", 0),
         ("SwapTotal:", 0),
         ("SwapFree:", 0),
+        ("Slab:", slab),
     ] {
         let _ = writeln!(out, "{label:<16}{kb:>8} kB");
     }

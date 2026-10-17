@@ -26,7 +26,6 @@
 //! - One-shot mode (EPOLLONESHOT) for single notification
 //! - Can monitor pipes, sockets, eventfd, timerfd, and other pollable fds
 
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -336,16 +335,9 @@ impl Eventpoll {
 }
 
 /// File operations for epoll fd
-pub struct EpollFileOps {
-    ep: Arc<Eventpoll>,
-}
+pub struct EpollFileOps;
 
-impl EpollFileOps {
-    /// Create file ops for an epoll instance
-    pub fn new(ep: Arc<Eventpoll>) -> Self {
-        Self { ep }
-    }
-}
+static EPOLL_FOPS: EpollFileOps = EpollFileOps;
 
 impl FileOps for EpollFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -362,12 +354,16 @@ impl FileOps for EpollFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
-        self.ep.poll(pt)
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(ep) = file.private_ref::<Eventpoll>() else {
+            return crate::poll::POLLERR;
+        };
+        ep.poll(pt)
     }
 
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
-        self.ep.release();
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        let ep = file.private_ref::<Eventpoll>().ok_or(KernelError::BadFd)?;
+        ep.release();
         Ok(())
     }
 }
@@ -382,9 +378,6 @@ impl FileOps for EpollFileOps {
 pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
     let ep = Eventpoll::new();
 
-    // Create file operations
-    let ops: &'static dyn FileOps = Box::leak(Box::new(EpollFileOps::new(ep)));
-
     // Create dummy dentry for epoll
     let dentry = create_epoll_dentry()?;
 
@@ -394,7 +387,7 @@ pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
         file_flags |= flags::O_CLOEXEC;
     }
 
-    let file = Arc::new(File::new(dentry, file_flags, ops));
+    let file = Arc::new(File::new_anon(dentry, file_flags, &EPOLL_FOPS, ep));
     Ok(file)
 }
 
@@ -418,10 +411,7 @@ fn create_epoll_dentry() -> Result<Arc<Dentry>, KernelError> {
 
 /// Get the Eventpoll from a File (for syscall implementations)
 pub fn get_eventpoll(file: &File) -> Option<Arc<Eventpoll>> {
-    file.f_op
-        .as_any()
-        .downcast_ref::<EpollFileOps>()
-        .map(|ops| Arc::clone(&ops.ep))
+    file.private_arc::<Eventpoll>()
 }
 
 // ============================================================================

@@ -2230,8 +2230,9 @@ impl InodeOps for VfatInodeOps {
         new_name: &str,
         flags: u32,
     ) -> Result<(), KernelError> {
-        // RENAME_EXCHANGE not supported for FAT
-        if flags != 0 {
+        // The VFS has checked RENAME_NOREPLACE; RENAME_EXCHANGE (Linux
+        // vfat_rename_exchange) is not supported yet, whiteouts never
+        if flags & !super::link::RENAME_NOREPLACE != 0 {
             return Err(KernelError::InvalidArgument);
         }
 

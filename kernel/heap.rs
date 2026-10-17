@@ -90,6 +90,12 @@ impl HeapAllocator {
     pub fn free_bytes(&self) -> usize {
         self.inner.lock().free_bytes
     }
+
+    /// Bytes allocated (block headers and alignment included)
+    pub fn used_bytes(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.heap_end - inner.heap_start - inner.free_bytes
+    }
 }
 
 /// Block granularity: every block starts and ends 16-byte aligned so

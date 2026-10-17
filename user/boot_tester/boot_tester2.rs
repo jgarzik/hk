@@ -9,6 +9,9 @@
 //! `boot_tester2 auxv`: exit 0 if the initial stack and auxiliary
 //! vector are what the Linux ELF loader provides, else the failed check.
 //! `boot_tester2 exe`: exit 0 if /proc/self/exe names this program.
+//! `boot_tester2 comm`: exit 0 if the task name (PR_GET_NAME) is
+//! "boot_tester2"; `boot_tester2 dumpable`: exit with PR_GET_DUMPABLE.
+//! `boot_tester2 sleep`: write a byte to fd 3, then sleep until killed.
 
 #![no_std]
 #![no_main]
@@ -18,7 +21,7 @@ use core::panic::PanicInfo;
 
 use hk_syscall::{
     sys_exit, sys_fcntl, sys_getegid, sys_geteuid, sys_getgid, sys_getpid, sys_getppid, sys_getuid,
-    sys_readlink, sys_write,
+    sys_pause, sys_prctl, sys_readlink, sys_write,
 };
 
 /// Print a string to stdout
@@ -224,11 +227,28 @@ fn exe_check() -> ! {
     sys_exit(if ok { 0 } else { 1 });
 }
 
+/// comm mode: exec named the task after the file
+fn comm_check() -> ! {
+    const PR_GET_NAME: i32 = 16;
+    let mut name = [0u8; 16];
+    sys_prctl(PR_GET_NAME, name.as_mut_ptr() as u64, 0, 0, 0);
+    sys_exit(if cstr_is(name.as_ptr() as u64, b"boot_tester2") { 0 } else { 1 });
+}
+
 extern "C" fn rust_start(sp: *const u64) -> ! {
+    const PR_GET_DUMPABLE: i32 = 3;
     match arg1(sp) {
         b"fdcheck" => fdcheck(),
         b"auxv" => auxv_check(sp),
         b"exe" => exe_check(),
+        b"comm" => comm_check(),
+        b"dumpable" => sys_exit(sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) as u64),
+        b"sleep" => {
+            sys_write(3, b"r".as_ptr(), 1);
+            loop {
+                sys_pause();
+            }
+        }
         _ => {}
     }
 

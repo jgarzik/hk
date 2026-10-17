@@ -51,6 +51,7 @@
 - [x] open (x86-64 only, legacy; use openat)
 - [x] openat
 - [x] close
+- [x] close_range (CLOSE_RANGE_UNSHARE, CLOSE_RANGE_CLOEXEC)
 - [x] creat (x86-64 only, legacy; use openat with O_CREAT)
 - [x] dup
 - [x] dup2 (x86-64 only, legacy; use dup3)
@@ -96,12 +97,13 @@
 - [x] mkdirat
 - [x] rmdir (x86-64 only, legacy; use unlinkat with AT_REMOVEDIR)
 - [x] link (x86-64 only, legacy; use linkat)
-- [x] linkat
+- [x] linkat (AT_SYMLINK_FOLLOW; AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH)
 - [x] unlink (x86-64 only, legacy; use unlinkat)
 - [x] unlinkat
 - [x] rename (x86-64 only, legacy; use renameat2)
-- [x] renameat (x86-64 only, legacy; use renameat2)
-- [x] renameat2
+- [x] renameat (legacy; use renameat2; arm64 keeps it, number 38)
+- [x] renameat2 (RENAME_NOREPLACE, RENAME_EXCHANGE; RENAME_WHITEOUT is
+  EINVAL: no file system makes whiteouts yet; vfat lacks EXCHANGE)
 - [x] symlink (x86-64 only, legacy; use symlinkat)
 - [x] symlinkat
 - [x] readlink (x86-64 only, legacy; use readlinkat)

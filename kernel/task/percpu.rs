@@ -476,6 +476,9 @@ static PERCPU_SCHEDS: [PerCpuScheduler; MAX_CPUS] = [const { PerCpuScheduler::ne
 ///
 /// Protected by its own lock, separate from per-CPU run queues.
 /// This is only used for fork/exit and task lookup, not hot-path scheduling.
+/// A task of this kernel's architecture (TASK_TABLE entries)
+pub type KernelTask = Task<CurrentArch, ArchPageTable>;
+
 pub struct GlobalTaskTable {
     /// All tasks in the system
     pub tasks: Vec<Task<CurrentArch, ArchPageTable>>,
@@ -834,8 +837,12 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         signal_state: crate::signal::TaskSignalState::new(),
         tif_sigpending: core::sync::atomic::AtomicBool::new(false),
         robust_list: 0,
-        // prctl state
-        prctl: crate::task::PrctlState::default(),
+        // prctl state; comm after the init binary, /bin/init (Linux
+        // names init after the file it execs)
+        prctl: crate::task::PrctlState {
+            name: *b"init\0\0\0\0\0\0\0\0\0\0\0\0",
+            ..crate::task::PrctlState::default()
+        },
         // Process personality (execution domain)
         personality: 0,
         // NUMA memory policy (user processes start with default)
@@ -1376,17 +1383,19 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         signal_state: crate::signal::TaskSignalState::new(),
         tif_sigpending: core::sync::atomic::AtomicBool::new(false),
         robust_list: 0,
-        // prctl state: inherit no_new_privs from parent, reset others
+        // prctl state: the name and dumpability are inherited (Linux
+        // copies comm with the task and dumpability with the mm: a child
+        // of a non-dumpable process holds the same secrets)
         prctl: crate::task::PrctlState {
-            name: [0u8; 16],                                 // Child gets empty name
-            dumpable: crate::task::dumpable::SUID_DUMP_USER, // Reset to default
-            no_new_privs: parent_prctl.no_new_privs,         // Inherited (irreversible)
-            timer_slack_ns: parent_prctl.timer_slack_ns,     // Inherited
-            keep_caps: false,                                // Reset on fork
-            child_subreaper: false,                          // Not inherited
+            name: parent_prctl.name,
+            dumpable: parent_prctl.dumpable,
+            no_new_privs: parent_prctl.no_new_privs, // Inherited (irreversible)
+            timer_slack_ns: parent_prctl.timer_slack_ns, // Inherited
+            keep_caps: false,                        // Reset on fork
+            child_subreaper: false,                  // Not inherited
             #[cfg(target_arch = "x86_64")]
             tsc_mode: parent_prctl.tsc_mode, // Inherited
-            thp_disable: parent_prctl.thp_disable,           // Inherited
+            thp_disable: parent_prctl.thp_disable,   // Inherited
         },
         // Process personality (inherited from parent)
         personality: parent_personality,
@@ -1760,7 +1769,8 @@ pub fn exit_current(status: Option<i32>) -> ! {
     rq.dead.push(dead);
 
     let next_tid = rq.dequeue_next();
-    let (next_kstack, next_mm, next_task) = switch_info(next_tid);
+    // The exiting task is a zombie already (never marked)
+    let (next_kstack, next_mm, next_task) = switch_info(0, false, next_tid);
 
     // Get next task's context
     let next_ctx = match rq.get_context(next_tid) {
@@ -1798,8 +1808,31 @@ pub fn exit_current(status: Option<i32>) -> ! {
 /// The address space stays alive until the switch: `tid` is not running
 /// (it is on this run queue, which the caller holds), so it cannot drop
 /// its reference (exit, exec) meanwhile.
-fn switch_info(tid: Tid) -> (u64, *const crate::mm::Mm, CurrentTask) {
-    let table = TASK_TABLE.lock();
+///
+/// It also records, for /proc, that `cur` stops running (sleeping if
+/// `cur_sleeps`, else runnable) and `tid` runs: the sleep state itself
+/// lives in the run queue, which no other CPU may lock.
+fn switch_info(cur: Tid, cur_sleeps: bool, tid: Tid) -> (u64, *const crate::mm::Mm, CurrentTask) {
+    let mut table = TASK_TABLE.lock();
+    let mark = |t: &mut KernelTask, s: TaskState| {
+        if matches!(
+            t.state,
+            TaskState::Ready | TaskState::Running | TaskState::Sleeping
+        ) {
+            t.state = s;
+        }
+    };
+    let out = if cur_sleeps {
+        TaskState::Sleeping
+    } else {
+        TaskState::Ready
+    };
+    if let Some(t) = table.tasks.iter_mut().find(|t| t.tid == cur) {
+        mark(t, out);
+    }
+    if let Some(t) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        mark(t, TaskState::Running);
+    }
     table
         .tasks
         .iter()
@@ -1857,7 +1890,10 @@ fn context_switch_locked(
     cur: Tid,
     next: Tid,
 ) {
-    let (next_kstack, next_mm, next_task) = switch_info(next);
+    let cur_sleeps = rq
+        .entry_mut(cur)
+        .is_some_and(|e| e.state != SleepState::Running);
+    let (next_kstack, next_mm, next_task) = switch_info(cur, cur_sleeps, next);
     let (Some(curr_ctx), Some(next_ctx)) = (rq.get_context_mut(cur), rq.get_context(next)) else {
         return;
     };
@@ -3028,23 +3064,35 @@ pub fn set_current_fsgid(fsgid: crate::task::Gid) {
 /// * `mm` - The new address space (its top-level table is loaded)
 /// * `entry_point` - The entry point address in the new program
 /// * `user_sp` - The initial user stack pointer
-pub fn exec_replace_image(mm: crate::mm::MmRef, entry_point: u64, user_sp: u64) -> ! {
+pub fn exec_replace_image(
+    mm: crate::mm::MmRef,
+    entry_point: u64,
+    user_sp: u64,
+    ident: crate::task::exec::ExecIdentity,
+    guard: crate::signal::CredGuard,
+) -> ! {
     let tid = current_tid();
     let new = mm.arc().clone();
 
-    let old = {
+    // The new mm, name and dumpability together (Linux exec_mmap, then
+    // __set_task_comm and set_dumpable), under cred_guard_mutex and
+    // exec_update_lock
+    let old = guard.exec_update(|| {
         let mut table = TASK_TABLE.lock();
         let task = table.tasks.iter_mut().find(|t| t.tid == tid);
         let task = task.expect("exec: current task not in the task table");
         task.page_table = ArchPageTable::new(new.pgd());
+        task.prctl.name = ident.name;
+        task.prctl.dumpable = ident.dumpable;
         task.mm.replace(mm)
-    };
+    });
 
     // Leave the old tables before releasing them: their frames may be
     // reused at once by another CPU
     crate::mm::tlb::switch_mm(Some(&new));
     drop(new);
     drop(old);
+    drop(guard);
 
     // Get kernel stack for syscall/interrupt return
     let kstack_top = {
@@ -3103,7 +3151,8 @@ pub fn try_schedule() {
     let mut rq = sched.lock.lock();
     sched.drain_wakes(&mut rq);
     let next = rq.dequeue_next();
-    let (next_kstack, next_mm, next_task) = switch_info(next);
+    // No current task: tid 0 is never in TASK_TABLE
+    let (next_kstack, next_mm, next_task) = switch_info(0, false, next);
     let Some(next_ctx) = rq.get_context(next) else {
         return;
     };

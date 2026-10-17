@@ -403,6 +403,30 @@ impl File {
         }
     }
 
+    /// An anonymous-inode file whose shared state lives in `private`
+    /// (Linux anon_inode_getfile priv): the ops stay static, and the
+    /// state goes with the last reference to the file
+    pub fn new_anon(
+        dentry: Arc<Dentry>,
+        flags: u32,
+        f_op: &'static dyn FileOps,
+        private: Arc<dyn core::any::Any + Send + Sync>,
+    ) -> Self {
+        let f = Self::new(dentry, flags, f_op);
+        f.private.call_once(|| private);
+        f
+    }
+
+    /// The per-open state, if it is a `T`
+    pub fn private_ref<T: core::any::Any>(&self) -> Option<&T> {
+        self.private.get()?.downcast_ref::<T>()
+    }
+
+    /// A reference to the per-open state, if it is a `T`
+    pub fn private_arc<T: core::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.private.get()?.clone().downcast::<T>().ok()
+    }
+
     /// Get the inode for this file
     pub fn get_inode(&self) -> Option<Arc<Inode>> {
         self.dentry.get_inode()

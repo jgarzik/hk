@@ -29,7 +29,6 @@
 //! - Multiple watches per inotify instance
 //! - Watch descriptors (wd) are unique per instance
 
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -492,16 +491,9 @@ impl Default for Inotify {
 // =============================================================================
 
 /// File operations for inotify
-pub struct InotifyFileOps {
-    inotify: Arc<Inotify>,
-}
+pub struct InotifyFileOps;
 
-impl InotifyFileOps {
-    /// Create file ops for an inotify instance
-    pub fn new(inotify: Arc<Inotify>) -> Self {
-        Self { inotify }
-    }
-}
+static INOTIFY_FOPS: InotifyFileOps = InotifyFileOps;
 
 impl FileOps for InotifyFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -509,20 +501,25 @@ impl FileOps for InotifyFileOps {
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let inotify = file.private_ref::<Inotify>().ok_or(KernelError::BadFd)?;
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        self.inotify.read(buf, nonblock)
+        inotify.read(buf, nonblock)
     }
 
     fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
-        self.inotify.poll(pt)
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(inotify) = file.private_ref::<Inotify>() else {
+            return crate::poll::POLLERR;
+        };
+        inotify.poll(pt)
     }
 
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
-        self.inotify.release();
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        let inotify = file.private_ref::<Inotify>().ok_or(KernelError::BadFd)?;
+        inotify.release();
         Ok(())
     }
 }
@@ -541,9 +538,6 @@ impl FileOps for InotifyFileOps {
 pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, KernelError> {
     let inotify = Inotify::new();
 
-    // Create file operations
-    let ops: &'static dyn FileOps = Box::leak(Box::new(InotifyFileOps::new(inotify)));
-
     // Create dummy dentry for inotify
     let dentry = create_inotify_dentry()?;
 
@@ -553,7 +547,7 @@ pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, KernelError> {
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file = Arc::new(File::new(dentry, file_flags, ops));
+    let file = Arc::new(File::new_anon(dentry, file_flags, &INOTIFY_FOPS, inotify));
     Ok(file)
 }
 
@@ -577,10 +571,7 @@ fn create_inotify_dentry() -> Result<Arc<Dentry>, KernelError> {
 
 /// Get the Inotify from a File
 pub fn get_inotify(file: &File) -> Option<Arc<Inotify>> {
-    file.f_op
-        .as_any()
-        .downcast_ref::<InotifyFileOps>()
-        .map(|ops| Arc::clone(&ops.inotify))
+    file.private_arc::<Inotify>()
 }
 
 /// Generate a unique cookie for rename event pairing

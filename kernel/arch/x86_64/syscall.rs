@@ -56,6 +56,8 @@ pub const SYS_SELECT: u64 = 23;
 pub const SYS_PSELECT6: u64 = 270;
 /// close(fd)
 pub const SYS_CLOSE: u64 = 3;
+/// close_range(fd, max_fd, flags)
+pub const SYS_CLOSE_RANGE: u64 = 436;
 /// stat(pathname, statbuf)
 pub const SYS_STAT: u64 = 4;
 /// fstat(fd, statbuf)
@@ -1237,6 +1239,7 @@ pub fn x86_64_syscall_dispatch(
         sys_chown,
         sys_chroot,
         sys_close,
+        sys_close_range,
         sys_dup,
         sys_dup2,
         sys_dup3,
@@ -1374,6 +1377,7 @@ pub fn x86_64_syscall_dispatch(
         }
         SYS_OPEN => sys_open(arg0, arg1 as u32, arg2 as u32) as u64,
         SYS_CLOSE => sys_close(arg0 as i32) as u64,
+        SYS_CLOSE_RANGE => sys_close_range(arg0 as u32, arg1 as u32, arg2 as u32) as u64,
         SYS_LSEEK => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32) as u64,
         SYS_MMAP => {
             crate::mm::syscall::sys_mmap(arg0, arg1, arg2 as u32, arg3 as u32, arg4 as i32, arg5)

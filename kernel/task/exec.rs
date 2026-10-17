@@ -18,7 +18,7 @@ type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 use super::percpu;
 use crate::elf::ElfExecutable;
 use crate::fs::{File, kernel_open_exec};
-use crate::mm::{ELF_ET_DYN_BASE, STACK_TOP};
+use crate::mm::{ELF_ET_DYN_BASE, MmLayout, STACK_TOP};
 
 /// Page size constant
 const PAGE_SIZE: u64 = 4096;
@@ -148,7 +148,7 @@ fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64)
     const AT_HWCAP2: u64 = 26;
     const AT_EXECFN: u64 = 31;
     let c = crate::task::current_cred();
-    let secure = c.uid != c.euid || c.gid != c.egid;
+    let secure = secureexec(&c);
     [
         (AT_HWCAP, crate::arch::elf_hwcap()),
         (AT_PAGESZ, PAGE_SIZE),
@@ -177,14 +177,15 @@ fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64)
 /// the auxiliary vector, envp, argv and argc at the 16-byte aligned
 /// initial stack pointer.
 ///
-/// Returns (initial SP, lowest mapped stack address).
+/// Returns (where argv, envp and the SP went, lowest mapped stack
+/// address).
 fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     page_table: &mut ArchPageTable,
     frame_alloc: &mut FA,
     argv: &[Vec<u8>],
     envp: &[Vec<u8>],
     info: &ExecInfo,
-) -> Result<(u64, u64), i32> {
+) -> Result<(MmLayout, u64), i32> {
     // Calculate stack pages based on RLIMIT_STACK
     let stack_limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_STACK);
     let stack_pages = if stack_limit == crate::rlimit::RLIM_INFINITY {
@@ -223,16 +224,20 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
         top: STACK_TOP - 8, // NULL end marker (Linux)
     };
     let execfn = w.push_str(info.execfn)?;
+    // argv then envp strings, back to back (Linux arg_start..env_end)
+    let env_end = w.top;
     let mut envp_addrs = Vec::with_capacity(envp.len());
     for e in envp.iter().rev() {
         envp_addrs.push(w.push_str(e)?);
     }
     envp_addrs.reverse();
+    let env_start = w.top;
     let mut argv_addrs = Vec::with_capacity(argv.len());
     for a in argv.iter().rev() {
         argv_addrs.push(w.push_str(a)?);
     }
     argv_addrs.reverse();
+    let arg_start = w.top;
     let platform = w.push_str(crate::arch::ELF_PLATFORM)?;
     let mut rnd = [0u8; 16];
     let _ = crate::random::get_random_bytes(&mut rnd, 0);
@@ -264,7 +269,15 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
         va += PAGE_SIZE;
     }
 
-    Ok((sp, stack_bottom))
+    let area = MmLayout {
+        arg_start,
+        arg_end: env_start,
+        env_start,
+        env_end,
+        start_stack: sp,
+        ..MmLayout::default()
+    };
+    Ok((area, stack_bottom))
 }
 
 /// Every PT_LOAD segment and the entry point must land in mappable
@@ -299,6 +312,37 @@ fn check_segments(elf: &ElfExecutable, base: u64) -> Result<(), i32> {
         return Err(ENOMEM);
     }
     Ok(())
+}
+
+/// Code and data bounds of an image loaded `base` higher (Linux
+/// load_elf_binary): code spans the executable segments' file bytes;
+/// data runs from the highest segment start to the highest file end
+pub fn image_layout(elf: &ElfExecutable, base: u64) -> MmLayout {
+    let mut l = MmLayout {
+        start_code: u64::MAX,
+        ..MmLayout::default()
+    };
+    for seg in &elf.segments {
+        let end = seg.vaddr + seg.file_size as u64;
+        if seg.flags.execute {
+            l.start_code = l.start_code.min(seg.vaddr);
+            l.end_code = l.end_code.max(end);
+        }
+        l.start_data = l.start_data.max(seg.vaddr);
+        l.end_data = l.end_data.max(end);
+    }
+    if l.start_code == u64::MAX {
+        l.start_code = 0;
+    }
+    for x in [
+        &mut l.start_code,
+        &mut l.end_code,
+        &mut l.start_data,
+        &mut l.end_data,
+    ] {
+        *x += base;
+    }
+    l
 }
 
 /// VMAs of a freshly loaded image: one private anonymous VMA per
@@ -517,6 +561,45 @@ fn user_frame() -> Result<u64, i32> {
     crate::mm::fault::alloc_user().ok_or(ENOMEM)
 }
 
+/// The new image runs with privileges its caller lacks (Linux
+/// bprm->secureexec, AT_SECURE): hk exec keeps the credentials (no
+/// set-id or file capabilities yet, BUGS.md), so this is effective ids
+/// differing from the real ones
+fn secureexec(c: &crate::task::Cred) -> bool {
+    c.uid != c.euid || c.gid != c.egid
+}
+
+/// Name and dumpability a new image gets (Linux begin_new_exec sets
+/// them after exec_mmap, under cred_guard_mutex)
+pub struct ExecIdentity {
+    pub name: [u8; 16],
+    pub dumpable: u8,
+}
+
+/// The new image's identity, decided before the point of no return and
+/// applied by `exec_replace_image` with the new mm: comm is the file
+/// name's last component (at most 15 bytes); the task is non-dumpable
+/// (suid_dumpable 0) for a secure exec or an image the caller may not
+/// read (would_dump: BINPRM_FLAGS_ENFORCE_NONDUMP, so an execute-only
+/// binary cannot be read through ptrace or /proc), else dumpable
+fn exec_identity(path: &[u8], file: &File) -> ExecIdentity {
+    use super::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_USER};
+    let base = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+    let mut name = [0u8; 16];
+    let n = base.len().min(15);
+    name[..n].copy_from_slice(&base[..n]);
+    let readable = file
+        .get_inode()
+        .is_some_and(|i| crate::fs::dac::permission(&i, crate::fs::MAY_READ).is_ok());
+    let c = crate::task::current_cred();
+    let dumpable = if readable && !secureexec(&c) {
+        SUID_DUMP_USER
+    } else {
+        SUID_DUMP_DISABLE
+    };
+    ExecIdentity { name, dumpable }
+}
+
 /// Execute a new program, replacing the current process image
 ///
 /// This is the core of execve. It:
@@ -535,6 +618,11 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     envp: Vec<Vec<u8>>,
     frame_alloc: &mut FA,
 ) -> i32 {
+    // Linux prepare_bprm_creds: the thread group's cred_guard_mutex from
+    // the first credential check until the new image is in place, so
+    // ptrace attach and mm_access never see the new mm with the old
+    // dumpability or the reverse; dropped on every error return
+    let guard = crate::signal::CredGuard::lock(percpu::current_tid());
     if let Err(e) = crate::task::nproc_exec_check() {
         return -e;
     }
@@ -623,11 +711,14 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         phnum: elf.phnum,
         execfn: pathname,
     };
-    let (user_sp, stack_bottom) =
+    let (args, stack_bottom) =
         match setup_user_stack(&mut new_page_table, frame_alloc, &argv, &envp, &info) {
             Ok(r) => r,
             Err(e) => return -e,
         };
+    let user_sp = args.start_stack;
+
+    let ident = exec_identity(pathname, &file);
 
     // Now we need to update the current task and switch to the new address space
     // This is the point of no return
@@ -650,6 +741,14 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         let mut m = mm.lock();
         m.set_brk(start_brk);
         m.set_exe(file.dentry.full_path());
+        let code = image_layout(&elf, base_addr);
+        m.set_args(MmLayout {
+            start_code: code.start_code,
+            end_code: code.end_code,
+            start_data: code.start_data,
+            end_data: code.end_data,
+            ..args
+        });
         for vma in image_vmas(mm.arc(), &elf, base_addr, stack_bottom) {
             m.insert_vma(vma);
         }
@@ -664,7 +763,7 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     drop(path);
 
     // Switch to the new address space and jump to user mode
-    percpu::exec_replace_image(mm, entry_point, user_sp);
+    percpu::exec_replace_image(mm, entry_point, user_sp, ident, guard);
 }
 
 /// sys_execve - execute a program

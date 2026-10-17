@@ -24,7 +24,6 @@
 //! - poll() support for integration with select/poll/epoll
 //! - CLOCK_REALTIME and CLOCK_MONOTONIC support
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -362,16 +361,9 @@ fn timerfd_callback(data: u64) {
 }
 
 /// File operations for timerfd
-pub struct TimerfdFileOps {
-    timerfd: Arc<Timerfd>,
-}
+pub struct TimerfdFileOps;
 
-impl TimerfdFileOps {
-    /// Create file ops for a timerfd
-    pub fn new(timerfd: Arc<Timerfd>) -> Self {
-        Self { timerfd }
-    }
-}
+static TIMERFD_FOPS: TimerfdFileOps = TimerfdFileOps;
 
 impl FileOps for TimerfdFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -379,13 +371,14 @@ impl FileOps for TimerfdFileOps {
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let timerfd = file.private_ref::<Timerfd>().ok_or(KernelError::BadFd)?;
         // timerfd read always returns 8 bytes (u64)
         if buf.len() < 8 {
             return Err(KernelError::InvalidArgument);
         }
 
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        let count = self.timerfd.read(nonblock)?;
+        let count = timerfd.read(nonblock)?;
 
         // Write u64 to buffer (little-endian)
         buf[0..8].copy_from_slice(&count.to_le_bytes());
@@ -397,12 +390,16 @@ impl FileOps for TimerfdFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
-        self.timerfd.poll(pt)
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(timerfd) = file.private_ref::<Timerfd>() else {
+            return crate::poll::POLLERR;
+        };
+        timerfd.poll(pt)
     }
 
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
-        self.timerfd.release();
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        let timerfd = file.private_ref::<Timerfd>().ok_or(KernelError::BadFd)?;
+        timerfd.release();
         Ok(())
     }
 }
@@ -418,9 +415,6 @@ impl FileOps for TimerfdFileOps {
 pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<Arc<File>, KernelError> {
     let timerfd = Timerfd::new(clockid);
 
-    // Create file operations
-    let ops: &'static dyn FileOps = Box::leak(Box::new(TimerfdFileOps::new(timerfd)));
-
     // Create dummy dentry for timerfd
     let dentry = create_timerfd_dentry()?;
 
@@ -430,7 +424,7 @@ pub fn create_timerfd(clockid: i32, tfd_flags: i32) -> Result<Arc<File>, KernelE
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file = Arc::new(File::new(dentry, file_flags, ops));
+    let file = Arc::new(File::new_anon(dentry, file_flags, &TIMERFD_FOPS, timerfd));
     Ok(file)
 }
 
@@ -454,8 +448,5 @@ fn create_timerfd_dentry() -> Result<Arc<Dentry>, KernelError> {
 
 /// Get the Timerfd from a File (for syscall implementations)
 pub fn get_timerfd(file: &File) -> Option<Arc<Timerfd>> {
-    file.f_op
-        .as_any()
-        .downcast_ref::<TimerfdFileOps>()
-        .map(|ops| Arc::clone(&ops.timerfd))
+    file.private_arc::<Timerfd>()
 }

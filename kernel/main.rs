@@ -1146,6 +1146,7 @@ fn kmain() -> ! {
         let mut m = mm.lock();
         m.set_brk(start_brk);
         m.set_exe(alloc::string::String::from("/bin/init"));
+        m.set_args(task::exec::image_layout(&elf, base_addr));
         let stack_bottom = USER_STACK_TOP - USER_STACK_PAGES as u64 * PAGE_SIZE;
         for vma in task::exec::image_vmas(&mm, &elf, base_addr, stack_bottom) {
             m.insert_vma(vma);

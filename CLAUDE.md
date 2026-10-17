@@ -29,4 +29,4 @@ hk: Rust (stable, no nightly features) no_std SMP kernel, x86-64 + aarch64, Linu
 - Commits must be bisectable: EVERY commit on `updates` passes the full gate on its own (the user may push at any time). Develop on a private branch; then publish a curated series onto `updates`, verifying each commit before creating the next. A bug-reproducing test lands together with (or after) its fix, never failing on its own.
 
 ## Known issues
-`BUGS.md` lists known bugs (chroot, PID/TID, wait status, …). Notably: unexplained `Arc<T>` field corruption in `kernel/usb/msc.rs`; its static-atomic workaround must not be "cleaned up" back into struct fields.
+`BUGS.md` lists known bugs (chroot, PID/TID, wait status, …).

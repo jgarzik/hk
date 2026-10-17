@@ -208,6 +208,12 @@ To prevent deadlocks, locks must be acquired in a consistent order. The global
 lock ordering from outermost to innermost is:
 
 ```
+SignalStruct.cred_guard (sync::Mutex; Linux cred_guard_mutex; exec,
+                         ptrace attach; outermost)
+    ↓
+SignalStruct.exec_update (sync::RwSem; Linux exec_update_lock; write:
+                          exec installing the new mm; read: mm_access)
+    ↓
 VFS locks (detailed order):
     File.f_pos_lock (sync::Mutex; read/write/lseek/getdents by position)
         ↓
@@ -219,7 +225,9 @@ VFS locks (detailed order):
         ↓
     Inode.i_rwsem (sync::RwSem; exclusive: directory operations,
                    lock_rename, regular file write and truncate; shared:
-                   path-walk lookup on a dcache miss, readdir)
+                   path-walk lookup on a dcache miss, readdir;
+                   parent directory -> the link/unlink/rename victim or
+                   link source, two non-directories by address)
         ↓
     Dentry.d_lock (single d_lock like Linux; short, never held across i_rwsem)
         ↓
@@ -560,6 +568,33 @@ Following Linux's `kernel/cred.c` pattern (see `include/linux/cred.h`):
 - Per-CPU `CurrentTask.cred` provides fast syscall access (no lock needed)
 - `Task.cred` in TASK_TABLE ensures credentials persist across context switches
 - Without TASK_TABLE persistence, credentials would be lost when switching away
+
+#### Exec vs. Credential Checks (Linux cred_guard_mutex, exec_update_lock)
+
+Two per-thread-group sleeping locks in `SignalStruct`, thread context
+only, never IRQ-reachable, outermost (nothing is held when either is
+taken, except `cred_guard` around `exec_update`):
+
+- `cred_guard` (`sync::Mutex<()>`, via `signal::CredGuard`): exec
+  (`do_execve`) holds it from its first credential check (RLIMIT_NPROC)
+  through loading the image (path walk, file reads, the new mm's
+  mmap_lock, the fd table, TASK_TABLE) until the new image is in
+  place; an error return drops it with nothing changed. PTRACE_ATTACH /
+  PTRACE_SEIZE hold the target's around the access decision and the
+  attach.
+- `exec_update` (`sync::RwSem`): `exec_replace_image` holds it for
+  writing, inside `cred_guard`, while it installs the new mm, name and
+  dumpability under TASK_TABLE; process_vm_readv/writev (`access_mm`),
+  the /proc mm_access paths (maps, environ; the stat fields gated by
+  access) hold it for reading (`signal::ExecUpdateRead`) around the
+  access decision and taking the mm.
+
+So no check sees the old dumpability with the new mm or the reverse (a
+non-dumpable process that execs a readable binary is not attachable or
+readable while its old memory is still mapped). As in Linux the split
+lets exec walk paths while holding `cred_guard`: /proc/<pid>/exe
+(followed when busybox re-execs itself) takes neither lock. Order:
+`cred_guard` -> `exec_update` -> every other lock.
 
 #### Deferred State Updates
 
@@ -1181,6 +1216,20 @@ Order: parent `i_rwsem` -> `FsStruct.inner` (umask read, leaf) and parent
 `i_rwsem` -> dentry `d_lock` -> fs-internal locks. Rename does the same
 lookups and checks (`link.rs::rename_locked`) inside `lock_rename()`.
 
+**The inode whose link count changes (Linux vfs_link / vfs_unlink /
+vfs_rmdir / vfs_rename):** inside the parent's lock, link takes the
+source inode's `i_rwsem` exclusive around its `i_nlink == 0` check
+(ENOENT) and the file system's `link`; unlink and rmdir take the
+victim's around `unlink`/`rmdir`; rename takes the non-directory source
+and target (`fs::lock_two_nondirs`, lower address first, one lock if
+they are the same inode) around the file system's `rename`. So a link
+never brings back an inode whose last link an unlink in another
+directory is dropping. Order: parent directory `i_rwsem`(s) -> that
+inode's `i_rwsem` -> dentry `d_lock` -> fs-internal locks. The victim
+is never an ancestor of the locked parents (a link source is never a
+directory; rename skips directories, which have no hard links), so this
+nests strictly below the directory order.
+
 **Filesystem implications:**
 Filesystems can trust that VFS has serialized directory operations. Complex
 internal locking (like lock ordering for cross-directory operations) is
@@ -1338,8 +1387,10 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
   contiguous); the fault path takes neither lock, and both are sleeping
   locks, so a fault may sleep.
 - Order: `f_pos_lock` -> file `i_rwsem` -> page cache / page locks ->
-  fs-internal locks. A directory `i_rwsem` is never held while a file's
-  `i_rwsem` is taken (O_CREAT drops the parent's lock before O_TRUNC).
+  fs-internal locks. A file's `i_rwsem` is taken under a directory's
+  only by link, unlink and rename (above), never the reverse: no
+  directory lock is taken while a file's `i_rwsem` is held (O_CREAT
+  drops the parent's lock before O_TRUNC).
 - Both are sleeping locks (`kernel/sync`): the vfat write path may wait
   for page locks and block I/O while holding `i_rwsem`, which a spinlock
   would forbid.

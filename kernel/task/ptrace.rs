@@ -171,46 +171,15 @@ const EINVAL: i64 = 22;
 // Helper functions
 // =============================================================================
 
-/// Check if caller has permission to ptrace the target process.
-///
-/// A process can be ptraced if:
-/// 1. Caller has CAP_SYS_PTRACE, OR
-/// 2. Caller is the real parent of the target (for TRACEME), OR
-/// 3. Caller has same effective UID as target
-///
-/// Additionally, the target must not be:
-/// - A kernel thread
-/// - The init process (TID 1)
+/// May the caller attach to the target (Linux ptrace_attach ->
+/// __ptrace_may_access, PTRACE_MODE_ATTACH_REALCREDS): [`may_access`]
+/// with the caller's real ids; init only with CAP_SYS_PTRACE
 fn ptrace_may_access(target_tid: Tid) -> bool {
-    // CAP_SYS_PTRACE bypasses all checks
-    if capable(CAP_SYS_PTRACE) {
-        return true;
-    }
-
-    // Cannot trace init or kernel threads
-    if target_tid == 1 {
+    // Cannot trace init
+    if target_tid == 1 && !capable(CAP_SYS_PTRACE) {
         return false;
     }
-
-    // Get caller and target credentials
-    let caller_cred = percpu::current_cred();
-
-    let target_cred = {
-        let table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter()
-            .find(|t| t.tid == target_tid)
-            .map(|t| *t.cred)
-    };
-
-    match target_cred {
-        Some(cred) => {
-            // Same effective UID check
-            caller_cred.euid == cred.euid
-        }
-        None => false, // Target doesn't exist
-    }
+    may_access(|t| t.tid == target_tid, false)
 }
 
 /// Check if tracee is stopped and caller is its tracer.
@@ -328,7 +297,9 @@ fn ptrace_attach(target_pid: Pid) -> i64 {
         return -EPERM;
     }
 
-    // Check permissions
+    // Check permissions and attach under the target's cred_guard_mutex
+    // (Linux ptrace_attach): no exec of it changes its dumpability between
+    let _guard = crate::signal::CredGuard::lock(target_tid);
     if !ptrace_may_access(target_tid) {
         return -EPERM;
     }
@@ -383,7 +354,9 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
         return -EPERM;
     }
 
-    // Check permissions
+    // Check permissions and attach under the target's cred_guard_mutex
+    // (Linux ptrace_attach): no exec of it changes its dumpability between
+    let _guard = crate::signal::CredGuard::lock(target_tid);
     if !ptrace_may_access(target_tid) {
         return -EPERM;
     }
@@ -900,30 +873,53 @@ pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
 }
 
 /// May the current task read process `pid`'s private state through
-/// /proc (Linux __ptrace_may_access with PTRACE_MODE_READ_FSCREDS):
-/// its own thread group always; otherwise the caller's fsuid/fsgid must
-/// equal all of the target's real, effective and saved ids, or the
-/// caller has CAP_SYS_PTRACE; and a non-dumpable target needs
-/// CAP_SYS_PTRACE too
+/// /proc (Linux __ptrace_may_access with PTRACE_MODE_READ_FSCREDS): its
+/// own thread group always, else [`may_access`] with the caller's
+/// fsuid/fsgid
 pub fn may_read_proc(pid: crate::task::Pid) -> bool {
-    use crate::task::dumpable::SUID_DUMP_USER;
-    let me = percpu::current_cred();
     if pid == percpu::current_pid() {
         return true;
     }
+    may_access(|t| t.tgid == pid, true)
+}
+
+/// [`may_read_proc`] for task `tid` itself (tids are never reused): a
+/// caller that resolved a pid once checks the very task it then uses
+pub fn may_read_task(tid: Tid) -> bool {
+    let me = percpu::current_pid();
+    let own = TASK_TABLE
+        .lock()
+        .tasks
+        .iter()
+        .any(|t| t.tid == tid && t.tgid == me);
+    own || may_access(|t| t.tid == tid, true)
+}
+
+/// Linux __ptrace_may_access for the first task `pick` selects: the
+/// caller's ids (fsuid/fsgid with `fscreds`, else the real ones) must
+/// equal all of the target's real, effective and saved ids, or the
+/// caller has CAP_SYS_PTRACE; and a non-dumpable target with an address
+/// space needs CAP_SYS_PTRACE too (get_dumpable(mm) != SUID_DUMP_USER)
+pub fn may_access(pick: impl Fn(&percpu::KernelTask) -> bool, fscreds: bool) -> bool {
+    use crate::task::dumpable::SUID_DUMP_USER;
+    let me = percpu::current_cred();
     let target = {
         let table = TASK_TABLE.lock();
         table
             .tasks
             .iter()
-            .find(|t| t.tgid == pid)
+            .find(|t| pick(t))
             .map(|t| (*t.cred, t.prctl.dumpable, t.mm.is_some()))
     };
     let Some((c, dumpable, has_mm)) = target else {
         return false;
     };
     let cap = capable(CAP_SYS_PTRACE);
-    let (u, g) = (me.fsuid, me.fsgid);
+    let (u, g) = if fscreds {
+        (me.fsuid, me.fsgid)
+    } else {
+        (me.uid, me.gid)
+    };
     let ids = u == c.uid && u == c.euid && u == c.suid && g == c.gid && g == c.egid && g == c.sgid;
     if !ids && !cap {
         return false;
