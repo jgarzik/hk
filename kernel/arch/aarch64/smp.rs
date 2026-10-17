@@ -266,6 +266,9 @@ extern "C" fn ap_rust_entry(boot_data_phys: u64) -> ! {
     // Enable interrupts
     cpu::enable_interrupts();
 
+    // From now on this CPU answers IPIs
+    crate::smp::set_active(cpu_id);
+
     // Enter idle loop
     printkln!("SMP: CPU {} entering idle loop", cpu_id);
     ap_idle_loop()

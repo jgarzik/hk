@@ -21,6 +21,7 @@ pub mod fpu;
 pub mod interrupts;
 pub mod io;
 pub mod ioremap;
+pub mod ipi;
 pub mod irq;
 pub mod kmap;
 pub mod lapic;

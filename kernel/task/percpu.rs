@@ -2000,6 +2000,9 @@ pub fn wake_up_task(tid: Tid, cpu: u32, mode: WakeMode) -> bool {
         rq.try_wake(tid, mode)
     } else {
         target.post_wake(tid, mode);
+        // Linux ttwu_queue_wakelist: an idle owner applies it now, not
+        // at its next tick
+        crate::smp::smp_send_reschedule(cpu);
         true
     }
 }

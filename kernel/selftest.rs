@@ -141,9 +141,87 @@ fn selftest_thread(_arg: usize) {
         check(what, false, 0);
     }
 
+    // 7. Cross-CPU calls from every CPU at once: none lost, no deadlock
+    if let Err((what, n)) = ipi_stress() {
+        check(what, false, n);
+    }
+
     if ok {
         printkln!("\nKSELFTEST:OK");
     }
+}
+
+/// Calls each stress thread makes to every other CPU
+const IPI_ROUNDS: u64 = 300;
+/// Calls run on each CPU by the stress test
+static IPI_RECV: [AtomicU64; crate::cpumask::NR_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpumask::NR_CPUS];
+/// Stress threads finished
+static IPI_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// One stress call: count it on the CPU running it
+fn ipi_count(_info: usize) {
+    let cpu = crate::task::percpu::current_cpu() as usize;
+    IPI_RECV[cpu].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A stress thread (one per CPU, all at once): rounds of calls to every
+/// other CPU, some without waiting, some with interrupts off (as from a
+/// syscall: the wait polls this CPU's own queue), then one call
+/// everywhere including here
+fn ipi_stress_thread(_arg: usize) {
+    use crate::arch::{local_irq_restore, local_irq_save};
+    use crate::smp::{active_cpus, on_each_cpu, smp_call_function_many};
+    let all = active_cpus();
+    for r in 0..IPI_ROUNDS {
+        let wait = r % 4 != 3 || r == IPI_ROUNDS - 1;
+        if r % 3 == 0 {
+            let irq = local_irq_save();
+            smp_call_function_many(&all, ipi_count, 0, wait);
+            local_irq_restore(irq);
+        } else {
+            smp_call_function_many(&all, ipi_count, 0, wait);
+        }
+    }
+    on_each_cpu(ipi_count, 0);
+    IPI_DONE.fetch_add(1, Ordering::Release);
+}
+
+/// Every active CPU calls every other one concurrently: each CPU must
+/// run exactly the calls sent to it, and all senders finish
+fn ipi_stress() -> Result<(), (&'static str, u64)> {
+    let cpus = crate::smp::active_cpus();
+    let n = cpus.iter().count() as u64;
+    if n < 2 {
+        return Ok(());
+    }
+    for c in &IPI_RECV {
+        c.store(0, Ordering::Relaxed);
+    }
+    IPI_DONE.store(0, Ordering::Relaxed);
+    for cpu in cpus.iter() {
+        kthread_run("ipi-stress", ipi_stress_thread, 0, Some(cpu))
+            .map_err(|e| ("ipi_stress_thread", e.errno() as u64))?;
+    }
+    // 10 s: a deadlock or a lost IPI leaves a thread waiting forever
+    for _ in 0..1000 {
+        if IPI_DONE.load(Ordering::Acquire) == n {
+            break;
+        }
+        sleep_ms(10);
+    }
+    let done = IPI_DONE.load(Ordering::Acquire);
+    if done != n {
+        return Err(("ipi_stress_hang", done));
+    }
+    let want = (n - 1) * IPI_ROUNDS + n;
+    for cpu in cpus.iter() {
+        let got = IPI_RECV[cpu as usize].load(Ordering::Relaxed);
+        if got != want {
+            return Err(("ipi_stress_count", got));
+        }
+    }
+    Ok(())
 }
 
 /// Counts loop iterations, parking and stopping on request

@@ -31,6 +31,7 @@ pub mod posix_timer;
 pub mod printk;
 pub mod selftest;
 pub mod signalfd;
+pub mod smp;
 pub mod storage;
 pub mod sync;
 pub mod sysctl;
@@ -833,6 +834,10 @@ fn kmain() -> ! {
 
                 // Enable APs to start their timers and participate in scheduling
                 CurrentArch::enable_ap_scheduling();
+
+                // This CPU answers IPIs once it takes interrupts (its
+                // first task enables them)
+                smp::set_active(task::percpu::current_cpu());
             }
         }
     } else {

@@ -214,6 +214,14 @@ fn flush_func(f: &FlushInfo) {
     let _ = f.freed_tables; // x86 INVLPG drops the paging-structure caches too
 }
 
+/// This CPU starts taking flush IPIs (`smp::set_active`): drop what it
+/// may have cached before, which a kernel-range flush did not reach
+pub fn cpu_active() {
+    let irq = local_irq_save();
+    arch::local_flush_all();
+    local_irq_restore(irq);
+}
+
 /// Switch this CPU to the address space `next` (None: the kernel's
 /// table, for kernel threads) (Linux switch_mm_irqs_off). Called by the
 /// scheduler before a context switch and by exec; interrupts are

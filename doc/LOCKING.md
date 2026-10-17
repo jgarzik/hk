@@ -823,6 +823,48 @@ No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
 - `flush_tlb_kernel_range` (ioremap/iounmap): arm64 `tlbi vaae1is`
   (all CPUs); x86 this CPU only (section 9). Called with no lock held.
 
+#### Cross-CPU Calls (kernel/smp.rs; arch/{x86_64,aarch64}/ipi.rs)
+
+No lock (Linux kernel/smp.c): `smp_call_function_many(mask, func,
+info, wait)` runs `func(info)` on other CPUs from their call-function
+IPI (x86 vector 0xfc, arm64 SGI 1); `on_each_cpu` adds this CPU;
+`smp_send_reschedule` (x86 0xfd, arm64 SGI 0) wakes a remote CPU after
+a remote wakeup was posted (`wake_up_task`).
+
+- `QUEUE[cpu]` (per CPU): the calls queued for a CPU, a lock-free list
+  (Linux llist). Senders push with a compare-and-swap (Release); only
+  the owner empties it, with one swap (Acquire), so there is no ABA
+  case and no lock: nothing to order against other locks, nothing to
+  disable for the push (an interrupt handler may push a reschedule
+  wakeup while the thread it interrupted pushes a call). A per-CPU
+  IrqSpinlock would also work but would make every sender of a many-CPU
+  shootdown contend on each target's lock with interrupts off. Only the
+  push onto an empty queue raises the IPI.
+- `CFD[sender][target]` (per sending CPU): the sender's call slots, one
+  per target (Linux cfd_data). A CPU makes one call at a time (thread
+  context, kernel not preemptive); a slot's `locked` flag (set by the
+  sender, cleared with Release by the target after `func` returned) is
+  waited for before the slot is reused and, with `wait`, before return.
+- `ACTIVE` (global `CpuMask`): CPUs that service IPIs, each set once at
+  boot after its interrupt controller is up and interrupts enabled
+  (`smp::set_active`, which then flushes its own TLB: a kernel-range
+  flush may have skipped it). Global: every sender needs every CPU's
+  state, and it changes once per CPU.
+- `func` runs in interrupt context with interrupts off (IPI handler, or
+  the sender's own wait loop): it may only touch atomics, per-CPU data
+  and IrqSpinlocks (7.4 applies).
+- **Rules** (a broken one is a deadlock): never call from interrupt
+  context or with an IrqSpinlock held (reported as `LOCKDEP:FAIL
+  smp_call_function_many in atomic context`); never with a lock held
+  that another CPU may spin on with interrupts off (TASK_TABLE: taken
+  under run-queue locks), as that CPU cannot answer. A call may be made
+  with interrupts off (x86 and arm64 syscalls run with them off): every
+  wait polls this CPU's own queue with interrupts off (`poll`), so two
+  CPUs calling each other, or a caller with interrupts off, make
+  progress. No CPU may spin-wait with interrupts off for a condition
+  another CPU sets only after its call returns, unless it polls its
+  queue.
+
 #### Kernel Page Tables (kernel half)
 
 **Location:** `kernel/arch/x86_64/kmap.rs`, `kernel/arch/x86_64/ioremap.rs`,

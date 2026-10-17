@@ -174,6 +174,12 @@ pub fn init_idt() {
         IDT[LAPIC_TIMER_VECTOR as usize]
             .set_handler(lapic_timer_handler as *const () as u64, GATE_INTERRUPT);
 
+        // IPIs (mm::tlb shootdown, smp calls, remote wakeups)
+        IDT[CALL_FUNCTION_VECTOR as usize]
+            .set_handler(call_function_ipi as *const () as u64, GATE_INTERRUPT);
+        IDT[RESCHEDULE_VECTOR as usize]
+            .set_handler(reschedule_ipi as *const () as u64, GATE_INTERRUPT);
+
         // Load IDT
         let idt_ptr = IdtPointer {
             limit: (size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
@@ -794,6 +800,88 @@ unsafe extern "C" fn lapic_timer_handler() {
         "iretq",
         sym handle_lapic_timer,
     );
+}
+
+/// Call-function IPI vector (Linux CALL_FUNCTION_VECTOR)
+pub const CALL_FUNCTION_VECTOR: u8 = 0xfc;
+/// Reschedule IPI vector (Linux RESCHEDULE_VECTOR)
+pub const RESCHEDULE_VECTOR: u8 = 0xfd;
+
+/// An IPI entry stub: saves the registers, calls `$handler`
+macro_rules! ipi_handler {
+    ($name:ident, $handler:path) => {
+        #[unsafe(naked)]
+        unsafe extern "C" fn $name() {
+            core::arch::naked_asm!(
+                "push 0",
+                "push rax",
+                "push rbx",
+                "push rcx",
+                "push rdx",
+                "push rsi",
+                "push rdi",
+                "push rbp",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                "call {}",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rbp",
+                "pop rdi",
+                "pop rsi",
+                "pop rdx",
+                "pop rcx",
+                "pop rbx",
+                "pop rax",
+                "add rsp, 8",
+                "iretq",
+                sym $handler,
+            );
+        }
+    };
+}
+
+ipi_handler!(call_function_ipi, handle_call_function);
+ipi_handler!(reschedule_ipi, handle_reschedule);
+
+/// Run `f` as an interrupt handler: interrupt depth and lockdep's
+/// interrupt context account for it
+fn in_irq(f: fn()) {
+    let percpu = super::percpu::try_current_cpu();
+    if let Some(p) = percpu {
+        p.interrupt_depth.fetch_add(1, Ordering::Relaxed);
+    }
+    crate::sync::lockdep::irq_enter();
+    f();
+    crate::sync::lockdep::irq_exit();
+    if let Some(p) = percpu {
+        p.interrupt_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Call-function IPI (Linux sysvec_call_function): EOI first, so a call
+/// queued while this one runs raises the vector again
+extern "C" fn handle_call_function() {
+    lapic::eoi();
+    in_irq(crate::smp::call_function_interrupt);
+}
+
+/// Reschedule IPI (Linux sysvec_reschedule_ipi)
+extern "C" fn handle_reschedule() {
+    lapic::eoi();
+    in_irq(crate::smp::reschedule_interrupt);
 }
 
 /// Rust LAPIC timer handler

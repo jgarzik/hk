@@ -13,6 +13,7 @@ pub mod dtb;
 pub mod exceptions;
 pub mod gic;
 pub mod ioremap;
+pub mod ipi;
 pub mod irq;
 pub mod kmap;
 pub mod paging;

@@ -115,8 +115,8 @@ extern "C" fn handle_el1_irq(_frame: &mut Aarch64TrapFrame) {
 
     match intid {
         0..=15 => {
-            // SGI (Software Generated Interrupt) - used for IPIs
-            // TODO: handle IPI for SMP
+            // SGI (Software Generated Interrupt): IPIs
+            super::ipi::handle_sgi(intid);
         }
         16..=31 => {
             // PPI (Private Peripheral Interrupt) - per-CPU interrupts
