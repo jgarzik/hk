@@ -1783,12 +1783,11 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         return KernelError::InvalidArgument.sysret();
     }
 
-    // new_len must be > 0
-    if new_len == 0 {
+    // Lengths at most TASK_SIZE once page-aligned, the new one not zero
+    // (Linux check_mremap_params; rounding cannot wrap below that)
+    if new_len == 0 || new_len > super::TASK_SIZE || old_len > super::TASK_SIZE {
         return KernelError::InvalidArgument.sysret();
     }
-
-    // Round lengths to page boundaries
     let old_len = (old_len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let new_len_aligned = (new_len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
@@ -1807,17 +1806,15 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         if new_addr & (PAGE_SIZE - 1) != 0 {
             return KernelError::InvalidArgument.sysret();
         }
-        // new_addr must not overlap with old range (unless DONTUNMAP)
-        if !dontunmap {
-            let new_end = match new_addr.checked_add(new_len_aligned) {
-                Some(e) => e,
-                None => return KernelError::InvalidArgument.sysret(),
-            };
-            let old_end = old_addr + old_len;
-            // Check for overlap
-            if !(new_end <= old_addr || new_addr >= old_end) {
-                return KernelError::InvalidArgument.sysret();
-            }
+        // The new range must not overlap the old one (Linux
+        // vrm_overlaps, MREMAP_DONTUNMAP included) and must end in
+        // user space
+        let new_end = match new_addr.checked_add(new_len_aligned) {
+            Some(e) => e,
+            None => return KernelError::InvalidArgument.sysret(),
+        };
+        if (new_end > old_addr && new_addr < old_addr + old_len) || new_end > super::TASK_SIZE {
+            return KernelError::InvalidArgument.sysret();
         }
         if let Err(e) = super::check_fixed(new_addr, new_len_aligned) {
             return e.sysret();
@@ -1839,154 +1836,111 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     let mut gone: Vec<Vma> = Vec::new();
     let mut mm_guard = mm.lock();
 
-    // Find VMA containing old_addr
-    let vma_idx = match mm_guard.find_vma_exact(old_addr) {
-        Some(idx) => idx,
-        None => {
-            // Try find_vma_index in case old_addr is not exactly at VMA start
-            // Linux allows mremap on any VMA that contains old_addr
-            match mm_guard.find_vma_index(old_addr) {
-                Some(idx) => {
-                    // Check if old_addr is at VMA start
-                    if let Some(vma) = mm_guard.get_vma(idx)
-                        && vma.start != old_addr
-                    {
-                        // For simplicity, require old_addr to be at VMA start
-                        return KernelError::BadAddress.sysret();
-                    }
-                    idx
-                }
-                None => return KernelError::BadAddress.sysret(),
-            }
-        }
+    // The VMA containing old_addr must cover the old range (it may
+    // start before old_addr: only the moves split it, Linux
+    // vma_to_resize)
+    let Some(vma_idx) = mm_guard.find_vma_index(old_addr) else {
+        return KernelError::BadAddress.sysret();
+    };
+    // A shrink's unmapped tail may cross VMAs and gaps (Linux
+    // check_prep_vma): only what stays must lie in the VMA
+    let kept = old_addr + old_len.min(new_len_aligned);
+    let vma_end = match mm_guard.get_vma(vma_idx) {
+        Some(v) if v.end >= kept => v.end,
+        _ => return KernelError::BadAddress.sysret(),
     };
 
-    // Validate the VMA covers the requested range
-    {
-        let vma = match mm_guard.get_vma(vma_idx) {
-            Some(v) => v,
-            None => return KernelError::BadAddress.sysret(),
-        };
-
-        // Check that the VMA covers [old_addr, old_addr + old_len)
-        if vma.end < old_addr + old_len {
-            return KernelError::BadAddress.sysret();
+    let pgd = mm.pgd();
+    let moves = fixed || dontunmap;
+    // Shrinking: the tail is unmapped like munmap (Linux do_vmi_munmap;
+    // mremap_to shrinks before it moves): the VMA is split there, so no
+    // VMA loses pages it still maps
+    let mut old_len = old_len;
+    if new_len_aligned < old_len {
+        gone = munmap_locked(
+            &mut mm_guard,
+            pgd,
+            old_addr + new_len_aligned,
+            old_addr + old_len,
+        );
+        old_len = new_len_aligned;
+        if !moves {
+            drop(mm_guard);
+            drop(gone);
+            return old_addr as i64;
         }
     }
 
-    // Handle shrink: new_len < old_len
-    if new_len_aligned < old_len {
-        // Unmap the tail portion
-        let unmap_start = old_addr + new_len_aligned;
-        let unmap_end = old_addr + old_len;
+    // RLIMIT_AS covers what the address space grows by: the growth, or
+    // with MREMAP_DONTUNMAP the whole new range (the old one stays;
+    // Linux vrm_calc_charge + may_expand_vm). A locked mapping that
+    // grows also needs RLIMIT_MEMLOCK room (Linux mlock_future_ok)
+    let charge = if dontunmap {
+        new_len_aligned
+    } else {
+        new_len_aligned.saturating_sub(old_len)
+    };
+    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_AS);
+    let total = (mm_guard.total_vm() * PAGE_SIZE).saturating_add(charge);
+    if charge > 0 && limit != crate::rlimit::RLIM_INFINITY && total > limit {
+        return KernelError::OutOfMemory.sysret();
+    }
+    let locked = mm_guard.get_vma(vma_idx).is_some_and(|v| v.is_locked());
+    if locked && new_len_aligned > old_len && !memlock_ok(&mm_guard, new_len_aligned - old_len) {
+        return KernelError::WouldBlock.sysret();
+    }
 
-        // Update VMA end
-        if let Some(vma) = mm_guard.get_vma_mut(vma_idx) {
-            vma.end = old_addr + new_len_aligned;
+    if new_len_aligned > old_len {
+        // Grow in place only where the old range ends its VMA (Linux
+        // vrm_can_expand_in_place) and the new end stays in user space
+        let new_end = old_addr.checked_add(new_len_aligned);
+        if !moves
+            && vma_end == old_addr + old_len
+            && let Some(new_end) = new_end.filter(|&e| e <= super::TASK_SIZE)
+            && mm_guard.try_expand_vma(vma_idx, new_end)
+        {
+            return old_addr as i64;
         }
-
-        // Update total_vm
-        let shrink_pages = (old_len - new_len_aligned) / PAGE_SIZE;
-        mm_guard.sub_total_vm(shrink_pages);
-
-        // Unmap the pages (under the mm lock)
-        unmap_pages_range(unmap_start, unmap_end);
-        drop(mm_guard);
-
+        if !may_move {
+            return KernelError::OutOfMemory.sysret();
+        }
+    } else if !moves {
+        // Same size, nothing to move
         return old_addr as i64;
     }
 
-    // Handle expand: new_len > old_len
-    if new_len_aligned > old_len {
-        // Check RLIMIT_AS before expansion
-        let expansion = new_len_aligned - old_len;
-        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_AS);
-        if limit != crate::rlimit::RLIM_INFINITY {
-            let current_bytes = mm_guard.total_vm() * PAGE_SIZE;
-            if current_bytes.saturating_add(expansion) > limit {
-                return KernelError::OutOfMemory.sysret();
-            }
+    // Move: MREMAP_FIXED unmaps its target first, in this same mm lock
+    // hold; else a free range is found
+    let target = if fixed {
+        gone.extend(munmap_locked(
+            &mut mm_guard,
+            pgd,
+            new_addr,
+            new_addr + new_len_aligned,
+        ));
+        new_addr
+    } else {
+        match mm_guard.find_free_area(new_len_aligned) {
+            Some(a) => a,
+            None => return KernelError::OutOfMemory.sysret(),
         }
-
-        // Try in-place expansion first
-        let new_end = old_addr + new_len_aligned;
-        if mm_guard.try_expand_vma(vma_idx, new_end) {
-            // Success - VMA expanded in place
-            return old_addr as i64;
-        }
-
-        // In-place expansion failed (collision with next VMA)
-        // Need to move if MREMAP_MAYMOVE is set
-        if !may_move && !fixed {
-            return KernelError::OutOfMemory.sysret();
-        }
-
-        // Clone VMA info before modifications
-        let vma_clone = match mm_guard.get_vma(vma_idx) {
-            Some(v) => v.clone(),
-            None => return KernelError::BadAddress.sysret(),
-        };
-
-        // Determine target address
-        let target_addr = if fixed {
-            // MREMAP_FIXED: unmap what is at the target first
-            let target_end = new_addr + new_len_aligned;
-            gone = munmap_locked(&mut mm_guard, mm.pgd(), new_addr, target_end);
-            new_addr
-        } else {
-            // Find a new free area
-            match mm_guard.find_free_area(new_len_aligned) {
-                Some(addr) => addr,
-                None => return KernelError::OutOfMemory.sysret(),
-            }
-        };
-
-        // Retire the old VMA (found again: the unmap may have split
-        // VMAs), then insert the new one
-        move_vma_out(&mut mm_guard, old_addr, dontunmap, &mut gone);
-        let mut new_vma = vma_clone.clone();
-        new_vma.start = target_addr;
-        new_vma.end = target_addr + new_len_aligned;
-        let new_idx = mm_guard.insert_vma(new_vma);
-        mm_guard.add_total_vm(new_len_aligned / PAGE_SIZE);
-        mm_guard.merge_adjacent(new_idx);
-
-        // Move page table entries (under the mm lock)
-        move_page_tables(old_addr, target_addr, old_len);
-        drop(mm_guard);
-        drop(gone);
-
-        return target_addr as i64;
+    };
+    let (from, to) = ((old_addr, old_len), (target, new_len_aligned));
+    if let Err(e) = move_mapping(&mut mm_guard, pgd, from, to, dontunmap, &mut gone) {
+        return e.sysret();
     }
+    drop(mm_guard);
+    drop(gone);
+    target as i64
+}
 
-    // Same size - handle MREMAP_FIXED (move to new location)
-    if fixed {
-        // Clone VMA info
-        let vma_clone = match mm_guard.get_vma(vma_idx) {
-            Some(v) => v.clone(),
-            None => return KernelError::BadAddress.sysret(),
-        };
-
-        // Unmap what is at the target, retire the old VMA, insert the new
-        let target_end = new_addr + new_len_aligned;
-        gone = munmap_locked(&mut mm_guard, mm.pgd(), new_addr, target_end);
-        move_vma_out(&mut mm_guard, old_addr, dontunmap, &mut gone);
-        let mut new_vma = vma_clone.clone();
-        new_vma.start = new_addr;
-        new_vma.end = new_addr + new_len_aligned;
-        let new_idx = mm_guard.insert_vma(new_vma);
-        mm_guard.add_total_vm(new_len_aligned / PAGE_SIZE);
-        mm_guard.merge_adjacent(new_idx);
-
-        move_page_tables(old_addr, new_addr, old_len);
-        drop(mm_guard);
-        drop(gone);
-
-        return new_addr as i64;
-    }
-
-    // Same size, no flags - just return old address
-    old_addr as i64
+/// `bytes` more of locked memory fit RLIMIT_MEMLOCK (or the task has
+/// CAP_IPC_LOCK)
+fn memlock_ok(mm: &super::MmStruct, bytes: u64) -> bool {
+    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK);
+    crate::task::capable(crate::task::CAP_IPC_LOCK)
+        || limit == crate::rlimit::RLIM_INFINITY
+        || (mm.locked_vm() * PAGE_SIZE).saturating_add(bytes) <= limit
 }
 
 /// The VMA starting at `old_addr` after mremap moved it: kept (now
@@ -2013,82 +1967,53 @@ fn move_vma_out(mm: &mut super::MmStruct, old_addr: u64, dontunmap: bool, gone: 
     }
 }
 
-/// Move page table entries from old location to new location, mm lock
-/// held. The old range is left empty, MREMAP_DONTUNMAP included (Linux
-/// move_page_tables: its pages refault from the backing, or as zero
-/// pages for anonymous memory).
-fn move_page_tables(old_start: u64, new_start: u64, len: u64) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use crate::FRAME_ALLOCATOR;
-        use crate::arch::x86_64::paging::X86_64PageTable;
-
-        let cr3: u64;
-        unsafe {
-            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
-        }
-
-        let mut offset: u64 = 0;
-        while offset < len {
-            let old_addr = old_start + offset;
-            let new_addr = new_start + offset;
-
-            // Check if old page is mapped
-            if let Some((phys, flags)) = X86_64PageTable::read_pte(cr3, old_addr) {
-                // Map at new location
-                let _ = crate::arch::x86_64::interrupts::map_user_page(cr3, new_addr, phys, flags);
-                // Increment frame refcount since we have a new mapping
-                FRAME_ALLOCATOR.incref(phys);
-
-                // Unmap old location
-                if let Some(old_phys) = X86_64PageTable::unmap_page(cr3, old_addr) {
-                    FRAME_ALLOCATOR.decref(old_phys);
-                }
-            }
-
-            offset += PAGE_SIZE;
-        }
+/// Move the old range `from` (address, length) to `to` (address, new
+/// length; Linux move_vma), mm lock held, the old range checked to lie
+/// in one VMA and the new one unmapped. What the move needs is
+/// allocated first (`mremap::move_prep`): ENOMEM leaves the old mapping
+/// as it was. Then, under the same mm lock hold, the old range is split
+/// into a VMA of its own, retired (kept empty with MREMAP_DONTUNMAP),
+/// its copy inserted at the new address, and the entries moved into it
+/// (each page once, with its reference).
+fn move_mapping(
+    mm: &mut super::MmStruct,
+    pgd: u64,
+    from: (u64, u64),
+    to: (u64, u64),
+    dontunmap: bool,
+    gone: &mut Vec<Vma>,
+) -> Result<(), KernelError> {
+    let ((old_addr, old_len), (new_addr, new_len)) = (from, to);
+    let mut alloc = |va| crate::arch::paging::pte_alloc(pgd, va);
+    super::mremap::move_prep(pgd, old_addr, new_addr, old_len, &mut alloc)?;
+    split_at(mm, old_addr);
+    split_at(mm, old_addr + old_len);
+    let mut new_vma = mm
+        .find_vma_exact(old_addr)
+        .and_then(|i| mm.get_vma(i))
+        .ok_or(KernelError::BadAddress)?
+        .clone();
+    move_vma_out(mm, old_addr, dontunmap, gone);
+    new_vma.start = new_addr;
+    new_vma.end = new_addr + new_len;
+    // The lock moves with the mapping (Linux: locked_vm charged to the
+    // new VMA)
+    if new_vma.is_locked() {
+        mm.add_locked_vm(new_len / PAGE_SIZE);
     }
+    let idx = mm.insert_vma(new_vma);
+    mm.add_total_vm(new_len / PAGE_SIZE);
+    mm.merge_adjacent(idx);
+    super::mremap::move_ptes(pgd, old_addr, new_addr, old_len);
+    Ok(())
+}
 
-    #[cfg(target_arch = "aarch64")]
+/// Split the VMA containing `addr` there, if it starts below it
+fn split_at(mm: &mut super::MmStruct, addr: u64) {
+    if let Some(i) = mm.find_vma_index(addr)
+        && mm.get_vma(i).is_some_and(|v| v.start < addr)
     {
-        use crate::FRAME_ALLOCATOR;
-        use crate::arch::aarch64::paging::Aarch64PageTable;
-
-        // Page descriptor bits for L3 entries (must be 0b11 for valid page)
-        const DESC_PAGE: u64 = 0b11;
-
-        let ttbr0: u64;
-        unsafe {
-            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack));
-        }
-        let pt_phys = ttbr0 & !0xFFF;
-
-        let mut offset: u64 = 0;
-        while offset < len {
-            let old_addr = old_start + offset;
-            let new_addr = new_start + offset;
-
-            // Check if old page is mapped
-            if let Some((phys, attrs)) = Aarch64PageTable::read_pte(pt_phys, old_addr) {
-                // Map at new location - add page descriptor bits that read_pte strips
-                let _ = crate::arch::aarch64::exceptions::map_user_page(
-                    pt_phys,
-                    new_addr,
-                    phys,
-                    attrs | DESC_PAGE,
-                );
-                // Increment frame refcount
-                FRAME_ALLOCATOR.incref(phys);
-
-                // Unmap old location
-                if let Some(old_phys) = Aarch64PageTable::unmap_page(pt_phys, old_addr) {
-                    FRAME_ALLOCATOR.decref(old_phys);
-                }
-            }
-
-            offset += PAGE_SIZE;
-        }
+        mm.split_vma(i, addr);
     }
 }
 

@@ -8,7 +8,6 @@ use ::core::sync::atomic::Ordering;
 use super::X86_64TrapFrame;
 use super::cpu::KERNEL_CODE_SELECTOR;
 use super::lapic;
-use super::paging::phys_to_virt;
 use super::pic;
 use crate::mm::fault::{Access, VmFault};
 use crate::signal::{KSigInfo, si_code};
@@ -644,73 +643,6 @@ fn handle_page_fault(frame: &X86_64TrapFrame, addr: u64) -> Result<(), VmFault> 
     };
     let mm = crate::mm::get_task_mm(crate::task::percpu::current_tid()).ok_or(VmFault::Segv)?;
     crate::mm::fault::handle_mm_fault(&mm, addr, access)
-}
-
-/// Map a user page, allocating intermediate page tables as needed
-///
-/// Used by mremap to move a page into place.
-///
-/// # Arguments
-/// * `cr3` - Physical address of the PML4 (page table root)
-/// * `vaddr` - Virtual address to map (page-aligned)
-/// * `paddr` - Physical address to map to
-/// * `flags` - Page table entry flags (PAGE_PRESENT, PAGE_WRITABLE, PAGE_USER, etc.)
-pub fn map_user_page(cr3: u64, vaddr: u64, paddr: u64, flags: u64) -> Result<(), ()> {
-    use crate::arch::x86_64::paging::{PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
-
-    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
-    let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
-
-    unsafe {
-        let pml4 = phys_to_virt(cr3) as *mut u64;
-
-        // Get or create PDPT
-        let pml4_entry = *pml4.add(pml4_idx);
-        let pdpt = if pml4_entry & PAGE_PRESENT != 0 {
-            phys_to_virt(pml4_entry & 0x000F_FFFF_FFFF_F000) as *mut u64
-        } else {
-            let new_pdpt = crate::FRAME_ALLOCATOR.alloc().ok_or(())?;
-            core::ptr::write_bytes(phys_to_virt(new_pdpt), 0, 4096);
-            *pml4.add(pml4_idx) = new_pdpt | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-            phys_to_virt(new_pdpt) as *mut u64
-        };
-
-        // Get or create PD
-        let pdpt_entry = *pdpt.add(pdpt_idx);
-        let pd = if pdpt_entry & PAGE_PRESENT != 0 {
-            phys_to_virt(pdpt_entry & 0x000F_FFFF_FFFF_F000) as *mut u64
-        } else {
-            let new_pd = crate::FRAME_ALLOCATOR.alloc().ok_or(())?;
-            core::ptr::write_bytes(phys_to_virt(new_pd), 0, 4096);
-            *pdpt.add(pdpt_idx) = new_pd | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-            phys_to_virt(new_pd) as *mut u64
-        };
-
-        // Get or create PT
-        let pd_entry = *pd.add(pd_idx);
-        let pt = if pd_entry & PAGE_PRESENT != 0 {
-            phys_to_virt(pd_entry & 0x000F_FFFF_FFFF_F000) as *mut u64
-        } else {
-            let new_pt = crate::FRAME_ALLOCATOR.alloc().ok_or(())?;
-            core::ptr::write_bytes(phys_to_virt(new_pt), 0, 4096);
-            *pd.add(pd_idx) = new_pt | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-            phys_to_virt(new_pt) as *mut u64
-        };
-
-        // Set the PTE
-        *pt.add(pt_idx) = paddr | flags;
-
-        // Flush TLB for this address
-        ::core::arch::asm!(
-            "invlpg [{}]",
-            in(reg) vaddr,
-            options(nostack, preserves_flags)
-        );
-
-        Ok(())
-    }
 }
 
 fn serial_print(s: &[u8]) {

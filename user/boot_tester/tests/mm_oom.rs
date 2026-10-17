@@ -3,7 +3,10 @@
 //!
 //! Tests:
 //! - OOM_RLIMIT_AS: past RLIMIT_AS, mmap and mremap fail with ENOMEM and
-//!   brk leaves the break where it was
+//!   brk leaves the break where it was; mremap(MREMAP_DONTUNMAP), which
+//!   keeps the old range, is charged the whole new one
+//! - OOM_RLIMIT_MEMLOCK: an unprivileged process cannot grow an mlocked
+//!   mapping with mremap past RLIMIT_MEMLOCK (EAGAIN)
 //! - OOM_FAULT_KILL (hk only: on Linux the OOM killer's victim choice
 //!   depends on the host): a process faulting in more anonymous memory
 //!   than the machine has is killed by SIGKILL; the kernel and the test
@@ -17,19 +20,21 @@ use super::helpers::{host_mode, print, print_num, println, skip};
 use super::mm_life::meminfo;
 use hk_syscall::{
     sys_brk, sys_close, sys_exit, sys_fork, sys_mlock, sys_mmap, sys_mremap, sys_munmap,
-    sys_nanosleep, sys_open, sys_read, sys_setrlimit, sys_wait4, RLimit, Timespec,
-    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_MAYMOVE, O_RDONLY, PROT_READ, PROT_WRITE,
-    RLIMIT_AS,
+    sys_nanosleep, sys_open, sys_read, sys_setresuid, sys_setrlimit, sys_wait4, RLimit, Timespec,
+    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_MAYMOVE, O_RDONLY, PROT_READ, PROT_WRITE,
+    RLIMIT_AS, RLIMIT_MEMLOCK,
 };
 
 const MAP_NORESERVE: u32 = 0x4000;
 const ENOMEM: i64 = -12;
+const EAGAIN: i64 = -11;
 const SIGKILL: i32 = 9;
 const PAGE: u64 = 4096;
 const MB: u64 = 1 << 20;
 
 pub fn run_tests() {
     rlimit_as();
+    rlimit_memlock();
     fault_kill(b"OOM_FAULT_KILL", hog);
     fault_kill(b"OOM_SHARED_KILL", hog_shared);
     fault_kill(b"OOM_MLOCK_EAGAIN", mlock_hog);
@@ -124,6 +129,11 @@ fn mapped_bytes() -> u64 {
 /// Child: limit the address space to what is mapped plus 16MB, then
 /// grow past the limit three ways. Exit code: 0, or the failed step.
 fn rlimit_as_child() -> u64 {
+    let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+    let q = sys_mmap(0, 32 * MB, PROT_READ | PROT_WRITE, anon, -1, 0);
+    if q < 0 {
+        return 7;
+    }
     let used = mapped_bytes();
     if used == 0 {
         return 1;
@@ -132,7 +142,10 @@ fn rlimit_as_child() -> u64 {
     if sys_setrlimit(RLIMIT_AS, &lim) != 0 {
         return 2;
     }
-    let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+    let dontunmap = MREMAP_MAYMOVE | MREMAP_DONTUNMAP;
+    if sys_mremap(q as u64, 32 * MB, 32 * MB, dontunmap, 0) != ENOMEM {
+        return 8;
+    }
     if sys_mmap(0, 64 * MB, PROT_READ | PROT_WRITE, anon, -1, 0) != ENOMEM {
         return 3;
     }
@@ -149,6 +162,31 @@ fn rlimit_as_child() -> u64 {
         return 6;
     }
     0
+}
+
+/// Child: RLIMIT_MEMLOCK 64KB, no privileges, 16KB mlocked; growing
+/// the locked mapping to 128KB is EAGAIN, moved or in place
+fn rlimit_memlock_child() -> u64 {
+    let lim = RLimit { rlim_cur: 64 * 1024, rlim_max: 64 * 1024 };
+    if sys_setrlimit(RLIMIT_MEMLOCK, &lim) != 0 || sys_setresuid(65534, 65534, 65534) != 0 {
+        return 1;
+    }
+    let p = sys_mmap(0, 4 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p < 0 || sys_mlock(p as u64, 4 * PAGE) != 0 {
+        return 2;
+    }
+    if sys_mremap(p as u64, 4 * PAGE, 32 * PAGE, MREMAP_MAYMOVE, 0) != EAGAIN {
+        return 3;
+    }
+    if sys_mremap(p as u64, 4 * PAGE, 32 * PAGE, 0, 0) != EAGAIN {
+        return 4;
+    }
+    0
+}
+
+fn rlimit_memlock() {
+    let r = in_child(rlimit_memlock_child);
+    report(b"OOM_RLIMIT_MEMLOCK", r == 0, r);
 }
 
 fn rlimit_as() {

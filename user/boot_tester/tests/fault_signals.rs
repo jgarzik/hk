@@ -38,8 +38,8 @@ const TRAP_BRKPT: i32 = 1;
 
 /// Value the handler stores in the result register
 const HANDLER_MARK: u64 = 0x5a5a_1234;
-const MAGIC1: u64 = 0x1122_3344_5566_7788;
-const MAGIC2: u64 = 0x0246_8ace_1357_9bdf;
+pub(super) const MAGIC1: u64 = 0x1122_3344_5566_7788;
+pub(super) const MAGIC2: u64 = 0x0246_8ace_1357_9bdf;
 
 /// What the handler saw
 #[derive(Clone, Copy)]
@@ -92,16 +92,16 @@ extern "C" fn fault_handler(signo: i32, info: *const u8, ucp: *mut u8) {
 }
 
 /// Registers observed after the faulting instruction was skipped
-struct After {
+pub(super) struct After {
     /// Result register (x86 RAX / arm64 x12): must be HANDLER_MARK
-    result: u64,
+    pub(super) result: u64,
     /// Preserved registers (x86 RCX, R11 / arm64 x10, x11)
-    keep1: u64,
-    keep2: u64,
+    pub(super) keep1: u64,
+    pub(super) keep2: u64,
     /// Address of the faulting instruction
-    fault_pc: u64,
+    pub(super) fault_pc: u64,
     /// Address after it (where the handler resumes)
-    resume_pc: u64,
+    pub(super) resume_pc: u64,
 }
 
 /// Execute `$insn` (with the operand register x86 RDI / arm64 x0 = `$arg`
@@ -165,7 +165,21 @@ macro_rules! run_fault {
     }};
 }
 
-fn install(sig: u32) -> bool {
+pub(super) use run_fault;
+
+/// The SIGSEGV of the last `run_fault!` since `reset`, if it faulted:
+/// (si_code, si_addr)
+pub(super) fn fault_seen() -> Option<(i32, u64)> {
+    let s = unsafe { core::ptr::read_volatile(&raw const SEEN) };
+    (s.count > 0).then_some((s.code, s.addr))
+}
+
+/// Forget the faults seen so far
+pub(super) fn reset() {
+    unsafe { core::ptr::write_volatile(&raw mut SEEN, Seen { count: 0, signo: 0, code: 0, addr: 0, pc: 0 }) };
+}
+
+pub(super) fn install(sig: u32) -> bool {
     let action: [u64; 4] = [
         fault_handler as *const () as u64,
         SA_SIGINFO | SA_RESTORER,

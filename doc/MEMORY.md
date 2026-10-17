@@ -179,5 +179,13 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
 - **munmap / MAP_FIXED / brk shrink / shmdt** split VMAs at the range
   edges and release the pages inside; empty page-table pages are kept
   until exit (reused by later mappings at the same addresses).
+- **mremap move (Linux move_page_tables)** allocates first: the old
+  range's 2MB pages are split and the new range's page tables
+  allocated before any VMA or entry changes (ENOMEM then leaves the
+  old mapping intact); then, under the same mm lock hold, the old VMA
+  (split at the old range's edges) is retired, the new one inserted,
+  the entries (pages, swap) moved into it with their frame references,
+  and the old range's TLB flushed. Shrinking unmaps the tail like
+  munmap.
 - `/proc/meminfo` reports MemTotal and MemFree from the frame allocator
   (exact free count).

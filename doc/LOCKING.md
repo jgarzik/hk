@@ -735,7 +735,8 @@ pub struct BitmapFrameAllocator {
   cannot race fork's copy, munmap or mprotect of its range: every user
   PTE writer holds the mm lock (fault, fork's `copy_page_range`,
   munmap/brk `munmap_locked`, mprotect, MADV_DONTNEED/REMOVE, mremap's
-  shrink and `move_page_tables`, a remote write's `unshare_for_write`),
+  shrink and move (`mremap::move_prep`, `move_ptes`), a remote write's
+  `unshare_for_write`),
   so no entry is read, released and written back around another's
   change. Under it:
   page-table and page allocation (`FRAME_ALLOCATOR`), a shared object's
@@ -753,9 +754,11 @@ pub struct BitmapFrameAllocator {
   lock is released and before the old frame can be freed or written
   through by another process: fork write-protects the parent's private
   PTEs and flushes each VMA's range (`paging::flush_tlb_range`) before
-  dropping the parent's lock (the child cannot run yet); mprotect, a
-  copy-on-write break, munmap and MADV_DONTNEED flush each page they
-  change (`paging::flush_tlb`) before dropping its reference. arm64
+  dropping the parent's lock (the child cannot run yet); mremap's move
+  flushes the old range (`flush_tlb_range`) before dropping the lock
+  (its pages keep their references); mprotect, a copy-on-write break,
+  munmap and MADV_DONTNEED flush each page they change
+  (`paging::flush_tlb`) before dropping its reference. arm64
   flushes are broadcast (`tlbi ...is`); x86 flushes this CPU only: the
   shootdown IPI for other CPUs running the address space plugs into
   these helpers (section 9, SMP TODO).

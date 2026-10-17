@@ -136,6 +136,11 @@ fn selftest_thread(_arg: usize) {
         check("icmp_lo_reply", left > 0, dst.to_u32() as u64);
     }
 
+    // 6. mremap's move allocates first: ENOMEM loses no page
+    if let Some(what) = crate::mm::mremap::selftest() {
+        check(what, false, 0);
+    }
+
     if ok {
         printkln!("\nKSELFTEST:OK");
     }
