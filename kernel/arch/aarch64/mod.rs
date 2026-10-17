@@ -815,6 +815,8 @@ impl ExceptionOps for Aarch64Arch {
     fn init_exceptions() {
         // Install exception vectors early
         exceptions::init();
+        // ASID width and TLB tagging of the boot CPU
+        tlb::init_cpu();
         // Initialize GIC (distributor + redistributor + CPU interface)
         gic::init();
     }

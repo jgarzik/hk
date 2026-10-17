@@ -282,6 +282,13 @@ pub fn pte_kexec(_pte: u64) -> bool {
     false
 }
 
+/// The user leaf `pte` is global: never (CR4.PGE is off, and user
+/// entries never set G)
+#[cfg(feature = "mmcheck")]
+pub fn pte_global(_pte: u64) -> bool {
+    false
+}
+
 /// The entry is a copy-on-write share (written only after a copy)
 pub fn pte_cow(pte: u64) -> bool {
     pte & PAGE_COW != 0

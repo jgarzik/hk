@@ -14,6 +14,8 @@ use crate::sync::spin::Mutex;
 use crate::task::Tid;
 
 pub mod anon_vma;
+#[cfg(any(test, target_arch = "aarch64"))]
+pub mod asid;
 #[cfg(feature = "mmcheck")]
 pub mod check;
 pub mod fault;

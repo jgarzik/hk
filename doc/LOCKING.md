@@ -248,6 +248,8 @@ Filesystem context locks (TASK_FS)
     ↓
 Per-CPU scheduler locks (IrqSpinlock)  ← IRQ-safe, can hold while acquiring below
     ↓
+arm64 ASID lock (IrqSpinlock, leaf; switch_mm slow path, 3.2 TLB Flushing)
+    ↓
 Global subsystem locks (TASK_TABLE, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-safe;
     no file is released under `Files` (3.3, Descriptor Tables); order
     `Files` -> TASK_TABLE (descriptor allocation reads RLIMIT_NOFILE
@@ -827,6 +829,23 @@ No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
   the flush and waited for (`smp_call_function_many`, Cross-CPU Calls:
   the wait answers this CPU's own queue, so it may run with interrupts
   off), their handler doing the same `flush_func`.
+- arm64 ASIDs (`mm/asid.rs`, `arch/aarch64/tlb.rs`, Linux
+  arch/arm64/mm/context.c): `MmContext.arch.id` (AtomicU64,
+  generation | ASID), per-CPU `active` / `flush_pending` atomics, and one
+  global **ASID lock** (`AsidAlloc.inner`, IrqSpinlock: bitmap,
+  `cur_idx`, per-CPU `reserved`). Global like Linux cpu_asid_lock: ASIDs
+  are one machine-wide namespace, and the lock is only taken on the
+  slow path (an address space's first switch in a generation, or a
+  rollover). Taken in `switch_mm` with the run-queue lock held, so
+  order: run-queue lock -> ASID lock; it is a leaf (nothing is taken
+  under it) and never taken in interrupt context. The fast path is a
+  compare-and-swap on this CPU's `active` entry, which a rollover zeroes
+  first (Linux check_and_switch_context). TTBR0 carries the ASID
+  (TCR.A1 = 0), user entries are nG, so a switch flushes nothing; a
+  rollover makes every CPU flush its own TLB before its next switch.
+  User flushes name the ASID (`tlbi vale1is/vae1is/aside1is`).
+  LOCKDEP builds allocate from 31 ASIDs, so the boot tests roll over
+  hundreds of times on real switches.
 - `flush_tlb_kernel_range` (ioremap/iounmap): arm64 `tlbi vaae1is`
   (all CPUs); x86 every active CPU (`on_each_cpu`). Called with no lock
   held.

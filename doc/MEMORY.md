@@ -53,7 +53,11 @@ Linux: `Documentation/arch/arm64/memory.rst`.
 - **TTBR0** holds only user mappings; kernel threads run with an empty
   table (Linux `reserved_pg_dir`). Every user leaf has PXN (never
   executable at EL1, as Linux sets on all user mappings; x86 relies on
-  SMEP) and UXN unless PROT_EXEC; kernel leaves have UXN. **TTBR1** is the kernel table, built
+  SMEP) and UXN unless PROT_EXEC; kernel leaves have UXN. User leaves
+  are non-global (nG) and tagged with their address space's ASID (in
+  TTBR0, 16-bit when the CPU has it, else 8-bit; allocated by
+  generation, `mm::asid`); kernel leaves are global; ASID 0 is the
+  kernel threads' (empty TTBR0). **TTBR1** is the kernel table, built
   once by `kmap::init` and never switched per process.
 - **Kernel image**: QEMU loads the ELF at physical 0x40100000 and
   enters at the physical entry point with the MMU off. `boot.S` is

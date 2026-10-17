@@ -41,6 +41,8 @@ fn excess(entry: u64, prot: u32) -> Option<&'static str> {
         Some("executable entry in a VMA without PROT_EXEC")
     } else if paging::pte_kexec(entry) {
         Some("user entry executable by the kernel")
+    } else if paging::pte_global(entry) {
+        Some("global user entry (no ASID tag)")
     } else {
         None
     }

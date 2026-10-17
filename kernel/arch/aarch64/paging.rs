@@ -133,6 +133,10 @@ pub const PXN: u64 = 1 << 53;
 /// User Execute Never (bit 54)
 pub const UXN: u64 = 1 << 54;
 
+/// Not global (bit 11): the entry is tagged with the ASID of the
+/// address space; every user entry has it, kernel entries never
+pub const NG: u64 = 1 << 11;
+
 /// COW (Copy-on-Write) flag - software-defined bit
 /// We use bit 55 which is available for OS use on ARM64
 /// When set along with AP_EL0_RO, indicates a writable page that is
@@ -210,6 +214,13 @@ pub fn pte_kexec(pte: u64) -> bool {
     pte & 1 != 0 && pte & PXN == 0
 }
 
+/// The user leaf `pte` is global (would match every ASID): never, every
+/// user leaf carries nG (`mm::check`)
+#[cfg(feature = "mmcheck")]
+pub fn pte_global(pte: u64) -> bool {
+    pte & 1 != 0 && pte & NG == 0
+}
+
 /// Leaf attributes for `flags` (Linux PAGE_*): a user page is never
 /// executable at EL1 (PXN, as Linux sets on every user mapping), a
 /// kernel page never at EL0 (UXN)
@@ -222,7 +233,7 @@ fn leaf_attrs(flags: PageFlags) -> u64 {
         (false, true) => AP_EL1_RW,
         (false, false) => AP_EL1_RO,
     };
-    attrs |= if user { PXN } else { UXN };
+    attrs |= if user { PXN | NG } else { UXN };
     if !flags.contains(PageFlags::EXECUTE) {
         attrs |= PXN | UXN;
     }
@@ -341,7 +352,7 @@ pub fn pmd_populate(pmdp: *mut u64, pt: u64) {
 /// A user leaf entry for `phys` with the protection of a VMA (PROT_*),
 /// access flag set (Linux mk_pte + pte_mkyoung)
 pub fn mk_pte(phys: u64, prot: u32) -> u64 {
-    let mut pte = phys | DESC_PAGE | AF | SH_INNER | ATTR_IDX_NORMAL;
+    let mut pte = phys | DESC_PAGE | AF | SH_INNER | ATTR_IDX_NORMAL | NG;
     pte |= if prot & crate::mm::PROT_WRITE != 0 {
         AP_EL0_RW
     } else {
