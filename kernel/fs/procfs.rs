@@ -343,12 +343,18 @@ impl InodeOps for ProcfsInodeOps {
             .downcast_ref::<ProcfsInodeWrapper>()
             .ok_or(KernelError::Io)?;
         let data = wrapper.0.read();
+        // A link target may sleep (exe takes exec_update_lock): call it
+        // after dropping the inode data's spinning read lock
+        if let ProcfsInodeData::PidLink { pid, target } = &*data {
+            let (pid, target) = (*pid, *target);
+            drop(data);
+            return target(pid);
+        }
         match &*data {
             ProcfsInodeData::SelfLink => {
                 Ok(alloc::format!("{}", crate::task::percpu::current_pid()))
             }
             ProcfsInodeData::FdSymlink { pid, fd } => fd_link(*pid, *fd),
-            ProcfsInodeData::PidLink { pid, target } => target(*pid),
             _ => Err(KernelError::InvalidArgument),
         }
     }
@@ -1127,6 +1133,29 @@ fn get_task_cgroup_path(pid: Pid) -> String {
     cgroup_ns.translate_path(&cgroup)
 }
 
+/// Copy `content` from the file position on into `buf` and advance it
+fn copy_out(file: &File, buf: &mut [u8], content: &[u8]) -> usize {
+    let pos = file.get_pos() as usize;
+    if pos >= content.len() {
+        return 0; // EOF
+    }
+    let n = min(buf.len(), content.len() - pos);
+    buf[..n].copy_from_slice(&content[pos..pos + n]);
+    file.advance_pos(n as u64);
+    n
+}
+
+/// Copy `content` from `offset` on into `buf` (pread: no position)
+fn copy_at(buf: &mut [u8], content: &[u8], offset: u64) -> usize {
+    let pos = offset as usize;
+    if pos >= content.len() {
+        return 0;
+    }
+    let n = min(buf.len(), content.len() - pos);
+    buf[..n].copy_from_slice(&content[pos..pos + n]);
+    n
+}
+
 /// Static procfs inode ops
 pub static PROCFS_INODE_OPS: ProcfsInodeOps = ProcfsInodeOps;
 
@@ -1167,15 +1196,21 @@ impl FileOps for ProcfsFileOps {
             .ok_or(KernelError::Io)?;
 
         let data = wrapper.0.read();
+        // Per-process generators may sleep (exec_update_lock, mmap_lock):
+        // they run after the inode data's spinning read lock is dropped
+        if let ProcfsInodeData::PidFile { pid, generator } = &*data {
+            let (pid, g) = (*pid, *generator);
+            drop(data);
+            let content = pid_content(Some(file), pid, g)?;
+            return Ok(copy_out(file, buf, &content));
+        }
         let content = match &*data {
             ProcfsInodeData::File { generator } => generator(),
             ProcfsInodeData::NamespaceFile { pid, ns_type } => {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidFile { pid, generator } => {
-                pid_content(Some(file), *pid, *generator)?
-            }
+            ProcfsInodeData::PidFile { .. } => return Err(KernelError::Io),
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
             ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::PidLink { .. }
@@ -1189,19 +1224,8 @@ impl FileOps for ProcfsFileOps {
             | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
         };
 
-        let pos = file.get_pos() as usize;
-
-        if pos >= content.len() {
-            return Ok(0); // EOF
-        }
-
-        let available = content.len() - pos;
-        let to_read = min(buf.len(), available);
-
-        buf[..to_read].copy_from_slice(&content[pos..pos + to_read]);
-        file.advance_pos(to_read as u64);
-
-        Ok(to_read)
+        drop(data);
+        Ok(copy_out(file, buf, &content))
     }
 
     fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
@@ -1214,15 +1238,21 @@ impl FileOps for ProcfsFileOps {
             .ok_or(KernelError::Io)?;
 
         let data = wrapper.0.read();
+        // Per-process generators may sleep (exec_update_lock, mmap_lock):
+        // they run after the inode data's spinning read lock is dropped
+        if let ProcfsInodeData::PidFile { pid, generator } = &*data {
+            let (pid, g) = (*pid, *generator);
+            drop(data);
+            let content = pid_content(Some(file), pid, g)?;
+            return Ok(copy_at(buf, &content, offset));
+        }
         let content = match &*data {
             ProcfsInodeData::File { generator } => generator(),
             ProcfsInodeData::NamespaceFile { pid, ns_type } => {
                 gen_namespace_content(*pid, *ns_type)
             }
             ProcfsInodeData::FdinfoFile { pid, fd } => gen_fdinfo_content(*pid, *fd),
-            ProcfsInodeData::PidFile { pid, generator } => {
-                pid_content(Some(file), *pid, *generator)?
-            }
+            ProcfsInodeData::PidFile { .. } => return Err(KernelError::Io),
             ProcfsInodeData::Sysctl { ctl } => crate::sysctl::read(ctl),
             ProcfsInodeData::FdSymlink { .. }
             | ProcfsInodeData::PidLink { .. }
