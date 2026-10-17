@@ -79,10 +79,20 @@ pub fn phys_to_virt_table_const(phys: u64) -> *const RawPageTable {
 /// Physical address bits of a page table entry
 pub const PTE_ADDR_MASK: u64 = ADDR_MASK;
 
+/// `va` lies in the user half (below TASK_SIZE): the user page-table
+/// walkers never reach the kernel half (x86 PML4 256-511) nor alias a
+/// user entry with an address past the user range (arm64 TTBR0)
+fn user_va(va: u64) -> bool {
+    va < TASK_SIZE
+}
+
 /// Pointer to the 4KB leaf entry for `va` in the tables rooted at
 /// `root` (present or not, e.g. a swap entry); None if an upper level
 /// is missing or maps a huge page
 pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
+    if !user_va(va) {
+        return None;
+    }
     let mut table = phys_to_virt_table(root);
     for shift in [39, 30, 21] {
         let e = unsafe { *(*table).entry(((va >> shift) & 511) as usize) };
@@ -154,6 +164,9 @@ fn entry_ptr(p: *mut u64) -> &'static AtomicU64 {
 /// Pointer to the 2MB-level (PD) entry for `va` in the tables rooted at
 /// `root` (Linux pmd_offset); None if an upper level is missing
 pub fn pmd_ptr(root: u64, va: u64) -> Option<*mut u64> {
+    if !user_va(va) {
+        return None;
+    }
     let mut table = phys_to_virt_table(root);
     for shift in [39, 30] {
         let e = PageTableEntry(entry_atomic(table, va >> shift).load(Ordering::Acquire));
@@ -175,6 +188,9 @@ pub fn pmd_huge(pmd: u64) -> bool {
 /// swap, so racing faults share one. None if out of memory (down to
 /// the kernel's reserve) or a huge page maps `va`.
 pub fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
+    if !user_va(va) {
+        return None;
+    }
     let mut table = phys_to_virt_table(root);
     for shift in [39, 30, 21] {
         let slot = entry_atomic(table, va >> shift);

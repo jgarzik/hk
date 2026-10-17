@@ -58,10 +58,14 @@
 //!   with holes ENOMEM, a bad vector EFAULT; a range running into a
 //!   hole fills the vector up to it; a range of more than PAGE_SIZE
 //!   pages is reported whole
+//! - SPARSE_POPULATE: two pages 64GB apart: mlock across both locks the
+//!   first and is ENOMEM at the hole, munlock likewise; mlockall
+//!   (MCL_CURRENT) and MAP_POPULATE fault in only what is mapped; all
+//!   quickly (the hole is jumped, not walked)
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_brk, sys_close, sys_exit, sys_msync, MS_ASYNC, MS_INVALIDATE, MS_SYNC,
+    sys_brk, sys_mlockall, sys_munlockall, MCL_CURRENT, MAP_POPULATE, sys_close, sys_exit, sys_msync, MS_ASYNC, MS_INVALIDATE, MS_SYNC,
     RLIMIT_DATA, sys_fork, sys_madvise, sys_mincore, sys_mlock, sys_mmap, sys_mprotect,
     sys_mlock2, sys_munlock, sys_munmap, sys_open, sys_read, sys_setrlimit, sys_wait4, RLimit,
     MLOCK_ONFAULT, RLIMIT_MEMLOCK, MADV_COLD, MADV_DODUMP, MADV_DOFORK,
@@ -78,6 +82,7 @@ const EINVAL: i64 = -22;
 const EEXIST: i64 = -17;
 const EBUSY: i64 = -16;
 const MADV_NOHUGEPAGE: i32 = 15;
+const MAP_NORESERVE: u32 = 0x4000;
 const EFAULT: i64 = -14;
 /// The highest page-aligned address
 const LAST: u64 = !(P - 1);
@@ -97,6 +102,7 @@ pub fn run_tests() {
     mprotect_args();
     msync_args();
     mincore_args();
+    sparse_populate();
 }
 
 // ============================================================================
@@ -1027,4 +1033,47 @@ fn mincore_big() -> i64 {
     sys_munmap(m, N * P);
     sys_munmap(vb, 2 * P);
     code
+}
+
+fn sparse_populate() {
+    const NAME: &[u8] = b"SPARSE_POPULATE";
+    report(NAME, child(&|| sparse_child() == 0) as i64);
+}
+
+/// In a child (mlockall locks it all): [p] 64GB hole [q]
+fn sparse_child() -> i64 {
+    const GAP: u64 = 64 << 30;
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+    let r = sys_mmap(0, GAP + 2 * P, PROT_NONE, flags, -1, 0);
+    if r < 0 {
+        return 1;
+    }
+    let p = r as u64;
+    let q = p + GAP + P;
+    if sys_munmap(p + P, GAP) != 0 || sys_mprotect(p, P, RW) != 0 || sys_mprotect(q, P, RW) != 0 {
+        return 2;
+    }
+    put(p, 1);
+    put(q, 2);
+    if sys_mlock(p, GAP + 2 * P) != ENOMEM || !locked(p) || locked(q) {
+        return 3;
+    }
+    if sys_munlock(p, GAP + 2 * P) != ENOMEM || locked(p) {
+        return 4;
+    }
+    if sys_mlockall(MCL_CURRENT) != 0 || !locked(p) || !locked(q) || sys_munlockall() != 0 {
+        return 5;
+    }
+    let m = sys_mmap(0, 4 * P, RW, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+    if m < 0 {
+        return 6;
+    }
+    let mut v = [0u8; 4];
+    if sys_mincore(m as u64, 4 * P, v.as_mut_ptr()) != 0 || v != [1; 4] {
+        return 7;
+    }
+    if get(p) != 1 || get(q) != 2 {
+        return 8;
+    }
+    0
 }

@@ -493,37 +493,67 @@ fn can_do_mlock() -> bool {
     crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK) > 0
 }
 
-/// Fault in the pages of [start, start + len) (Linux mm_populate /
-/// populate_vma_page_range): a write fault for a private writable
-/// mapping (copy-on-write is broken now), a read fault otherwise.
-/// Inaccessible VMAs and holes are skipped. False if memory ran out
-/// (mlock reports it; MAP_POPULATE and mlockall ignore it, like Linux
-/// mm_populate).
+/// Fault in the pages of [start, start + len) (Linux __mm_populate /
+/// populate_vma_page_range), VMA by VMA, clamped to user space: holes
+/// are jumped over, inaccessible VMAs skipped, so the work is bounded by
+/// the pages mapped, not the length. A write fault for a private
+/// writable mapping (copy-on-write is broken now), a read fault
+/// otherwise. False if memory ran out (mlock reports it; MAP_POPULATE
+/// and mlockall ignore it, like Linux mm_populate). The mm lock is not
+/// held between faults (the kernel is preemptible: no cond_resched
+/// needed); a VMA changed meanwhile is looked up again.
 ///
 /// Used by MAP_POPULATE, MAP_LOCKED and mlock/mlockall.
 fn populate_range(start: u64, len: u64) -> bool {
-    use super::fault::{Access, handle_mm_fault};
-
     let Some(mm) = get_task_mm(current_tid()) else {
         return true;
     };
-    let end = start.saturating_add(len);
+    let end = start.saturating_add(len).min(TASK_SIZE);
     let mut addr = start & !(PAGE_SIZE - 1);
     while addr < end {
-        let access = match mm.lock().find_vma(addr) {
-            Some(v) if v.prot & (PROT_READ | PROT_WRITE | super::PROT_EXEC) == 0 => None,
-            Some(v) if v.is_writable() && !v.is_shared() => Some(Access::Write),
-            Some(_) => Some(Access::Read),
-            None => None,
+        let Some((vs, ve, access)) = populate_vma(&mm.lock(), addr, end) else {
+            break;
         };
+        let from = addr.max(vs);
+        let to = ve.min(end);
         if let Some(a) = access
-            && handle_mm_fault(&mm, addr, a) == Err(super::fault::VmFault::Oom)
+            && !populate_pages(&mm, from, to, a)
         {
             return false;
         }
-        addr += PAGE_SIZE;
+        addr = to;
     }
     true
+}
+
+/// The next VMA meeting [addr, end): its bounds and the fault that
+/// populates it (None: inaccessible, skipped)
+fn populate_vma(
+    mm: &super::MmStruct,
+    addr: u64,
+    end: u64,
+) -> Option<(u64, u64, Option<super::fault::Access>)> {
+    use super::fault::Access;
+    let v = mm.next_vma(addr).and_then(|i| mm.get_vma(i))?;
+    if v.start >= end {
+        return None;
+    }
+    let access = if v.prot & (PROT_READ | PROT_WRITE | super::PROT_EXEC) == 0 {
+        None
+    } else if v.is_writable() && !v.is_shared() {
+        Some(Access::Write)
+    } else {
+        Some(Access::Read)
+    };
+    Some((v.start, v.end, access))
+}
+
+/// Fault in [from, to) of one VMA: false if memory ran out
+fn populate_pages(mm: &super::Mm, from: u64, to: u64, access: super::fault::Access) -> bool {
+    use super::fault::{VmFault, handle_mm_fault};
+    (from..to)
+        .step_by(PAGE_SIZE as usize)
+        .all(|a| handle_mm_fault(mm, a, access) != Err(VmFault::Oom))
 }
 
 /// mlock syscall - Lock pages in memory
@@ -886,7 +916,7 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     // 2MB pages that cannot keep one entry are split before anything
     // changes: ENOMEM leaves the range as it was
     let pgd = mm.pgd();
-    if let Err(e) = super::mprotect::split_huge(pgd, start, end, prot) {
+    if let Err(e) = super::mprotect::split_huge(pgd, start, mapped_end(&map, start, end), prot) {
         return e.sysret();
     }
 
@@ -933,6 +963,17 @@ fn mprotect_start(
         return Err(KernelError::InvalidArgument);
     }
     Ok(addr)
+}
+
+/// End of the mapped run from `start` (inside a VMA) toward `end`: the
+/// first hole, or `end`. What mprotect may change, so the 2MB pages
+/// split ahead of it lie in VMAs (never past TASK_SIZE).
+fn mapped_end(mm: &super::MmStruct, start: u64, end: u64) -> u64 {
+    let mut at = start;
+    while let Some(v) = mm.find_vma(at).filter(|_| at < end) {
+        at = v.end;
+    }
+    at.min(end)
 }
 
 /// The VMA may take protection `prot` (Linux: VM_MAYWRITE / VM_MAYEXEC

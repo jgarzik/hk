@@ -211,6 +211,12 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   Linux. brk refuses (keeps the break) a break that wraps when
   rounded, lies past TASK_SIZE or RLIMIT_DATA, comes within a page of
   the next mapping, or shrinks a heap no longer mapped.
+  Every walk over a user-supplied range goes VMA by VMA (holes are
+  jumped, not stepped through page by page: population for mlock,
+  mlockall and MAP_POPULATE too), and the user page-table walkers
+  (`paging::pte_ptr`, `pmd_ptr`, `pte_alloc`) refuse addresses at or
+  past TASK_SIZE, so no range reaches the kernel half (x86 PML4
+  256-511) or aliases a user entry (arm64).
 - **mremap move (Linux move_page_tables)** allocates first: the old
   range's 2MB pages are split and the new range's page tables
   allocated before any VMA or entry changes (ENOMEM then leaves the
