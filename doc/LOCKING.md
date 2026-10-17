@@ -2069,6 +2069,13 @@ nobody claims 100000 times in a row is masked (stuck level INTx).
   the device, touch atomics/IrqSpinlocks and wake threads; they must not
   register/unregister IRQs.
 
+#### DMA API (kernel/dma.rs)
+
+The backend (`DMA_OPS`) is set once at boot (`spin::Once`) and read
+without a lock, so the streaming calls (`dma_map_single`/`unmap`, sync)
+are IRQ-safe: blk-mq dispatch and completion run them in hardirq
+context. `dma_alloc_coherent` allocates frames (thread context only).
+
 #### USB Subsystem
 
 **Location:** `kernel/usb/`

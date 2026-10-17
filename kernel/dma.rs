@@ -12,7 +12,6 @@
 //! - dma_map_single / dma_unmap_single for streaming mappings
 //! - dma_map_sg / dma_unmap_sg for scatter-gather lists
 
-use crate::sync::spin::RwLock;
 use alloc::vec::Vec;
 #[cfg(target_arch = "x86_64")]
 use core::sync::atomic::{Ordering, fence};
@@ -514,11 +513,18 @@ impl DmaOps for DirectDmaOps {
 // ============================================================================
 
 /// Global DMA operations backend
-static DMA_OPS: RwLock<Option<&'static dyn DmaOps>> = RwLock::new(None);
+///
+/// Set once at boot, then read lock-free: map/unmap are callable from
+/// IRQ context (blk-mq dispatch and completion, doc/LOCKING.md 3.10)
+static DMA_OPS: spin::Once<&'static dyn DmaOps> = spin::Once::new();
+
+fn ops() -> Option<&'static dyn DmaOps> {
+    DMA_OPS.get().copied()
+}
 
 /// Initialize the DMA subsystem with a backend
 pub fn dma_init(ops: &'static dyn DmaOps) {
-    *DMA_OPS.write() = Some(ops);
+    DMA_OPS.call_once(|| ops);
     crate::printkln!("DMA: Initialized with {} backend", ops.name());
 }
 
@@ -535,13 +541,12 @@ pub fn dma_alloc_coherent_aligned<D: DmaDevice>(
     size: usize,
     align: usize,
 ) -> Option<DmaCoherent> {
-    let ops = DMA_OPS.read();
-    ops.as_ref()?.alloc_coherent(dev.dma_config(), size, align)
+    ops()?.alloc_coherent(dev.dma_config(), size, align)
 }
 
 /// Free coherent DMA memory
 pub fn dma_free_coherent<D: DmaDevice>(_dev: &D, alloc: DmaCoherent) {
-    if let Some(ops) = DMA_OPS.read().as_ref() {
+    if let Some(ops) = ops() {
         ops.free_coherent(alloc);
     }
 }
@@ -556,9 +561,7 @@ pub fn dma_map_single<D: DmaDevice>(
     size: usize,
     direction: DmaDirection,
 ) -> Option<DmaAddr> {
-    let ops = DMA_OPS.read();
-    ops.as_ref()?
-        .map_single(dev.dma_config(), cpu_addr, size, direction)
+    ops()?.map_single(dev.dma_config(), cpu_addr, size, direction)
 }
 
 /// Unmap a DMA buffer
@@ -568,7 +571,7 @@ pub fn dma_unmap_single<D: DmaDevice>(
     size: usize,
     direction: DmaDirection,
 ) {
-    if let Some(ops) = DMA_OPS.read().as_ref() {
+    if let Some(ops) = ops() {
         ops.unmap_single(dev.dma_config(), dma_addr, size, direction);
     }
 }
@@ -579,13 +582,12 @@ pub fn dma_map_sg<D: DmaDevice>(
     sg: &[(*const u8, usize)],
     direction: DmaDirection,
 ) -> Option<DmaSgList> {
-    let ops = DMA_OPS.read();
-    ops.as_ref()?.map_sg(dev.dma_config(), sg, direction)
+    ops()?.map_sg(dev.dma_config(), sg, direction)
 }
 
 /// Unmap a scatter-gather list
 pub fn dma_unmap_sg<D: DmaDevice>(dev: &D, sg: DmaSgList) {
-    if let Some(ops) = DMA_OPS.read().as_ref() {
+    if let Some(ops) = ops() {
         ops.unmap_sg(dev.dma_config(), sg);
     }
 }
@@ -604,7 +606,7 @@ pub fn dma_sync_single_for_cpu<D: DmaDevice>(
     size: usize,
     direction: DmaDirection,
 ) {
-    if let Some(ops) = DMA_OPS.read().as_ref() {
+    if let Some(ops) = ops() {
         ops.sync_for_cpu(dev.dma_config(), dma_addr, size, direction);
     }
 }
@@ -618,7 +620,7 @@ pub fn dma_sync_single_for_device<D: DmaDevice>(
     size: usize,
     direction: DmaDirection,
 ) {
-    if let Some(ops) = DMA_OPS.read().as_ref() {
+    if let Some(ops) = ops() {
         ops.sync_for_device(dev.dma_config(), dma_addr, size, direction);
     }
 }
