@@ -157,6 +157,13 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   the fork (ENOMEM; unreachable while swap-out is inert). MADV_DONTFORK VMAs are left out of the
   child, MADV_WIPEONFORK ones start empty there, and memory locks
   (VM_LOCKED, locked_vm, MCL_FUTURE) are not inherited.
+- **Page-table updates (break-before-make).** An entry that maps a
+  page is changed in place only for its permissions. To map another
+  page (a copy-on-write break) or another size (a 2MB page split into
+  512 4KB PTEs; its table allocated first, so a failed split changes
+  nothing), it is cleared and its TLB entry flushed first, then the new
+  entry written (ARM ARM break-before-make; Linux ptep_clear_flush,
+  pmdp_invalidate).
 - **Teardown (Linux exit_mmap).** When `users` drops to zero (last task
   exits, or the old image at exec), the VMAs and their rmap chains go,
   the user half is detached from the top-level table and the TLB

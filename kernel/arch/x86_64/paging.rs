@@ -115,6 +115,12 @@ fn entry_atomic(table: *mut RawPageTable, idx: u64) -> &'static AtomicU64 {
     unsafe { AtomicU64::from_ptr((*table).entry_mut((idx & 511) as usize) as *mut _ as *mut u64) }
 }
 
+/// The entry at `p` in a live table, as an atomic
+fn entry_ptr(p: *mut u64) -> &'static AtomicU64 {
+    // SAFETY: `p` points into a live table frame (direct map)
+    unsafe { AtomicU64::from_ptr(p) }
+}
+
 /// Pointer to the 2MB-level (PD) entry for `va` in the tables rooted at
 /// `root` (Linux pmd_offset); None if an upper level is missing
 pub fn pmd_ptr(root: u64, va: u64) -> Option<*mut u64> {
@@ -1240,80 +1246,41 @@ impl X86_64PageTable {
         }
     }
 
-    /// Split a 2MB huge page into 512 4KB pages
+    /// Split the 2MB page at `va` into 512 4KB PTEs (Linux
+    /// __split_huge_pmd_locked), mm lock held. The page table is
+    /// allocated first, so a failure changes nothing. Then the PD entry
+    /// is invalidated and its TLB entry flushed before the table entry
+    /// replaces it (Linux pmdp_invalidate): no CPU caches the 2MB and a
+    /// 4KB translation of one address at once (Intel SDM 4.10.2.3), and
+    /// accessed/dirty bits set until then are kept. Each 4KB PTE gets
+    /// the 2MB entry's protection and its own frame reference.
     ///
-    /// Allocates a new PT, creates 512 4KB PTEs pointing to the same
-    /// physical memory (consecutive 4KB pages), and updates the PD entry
-    /// to point to the new PT.
-    ///
-    /// # Arguments
-    /// * `pml4_phys` - Physical address of the PML4 table
-    /// * `va` - Virtual address of the huge page (must be 2MB-aligned)
-    /// * `frame_alloc` - Frame allocator for the new PT
-    ///
-    /// # Returns
-    /// Ok(phys_base) with the base physical address of the split huge page,
-    /// Err(MapError) on failure
+    /// Returns the physical base of the split page.
     pub fn split_huge_page<FA: FrameAlloc<PhysAddr = u64>>(
         pml4_phys: u64,
         va: u64,
         frame_alloc: &mut FA,
     ) -> Result<u64, MapError> {
-        let (pml4_idx, pdpt_idx, pd_idx, _pt_idx) = page_indices(va);
-
-        unsafe {
-            let pml4 = phys_to_virt_table(pml4_phys);
-
-            let pml4_entry = (*pml4).entry(pml4_idx);
-            if !pml4_entry.is_present() {
-                return Err(MapError::NotMapped);
-            }
-            let pdpt = phys_to_virt_table(pml4_entry.addr());
-
-            let pdpt_entry = (*pdpt).entry(pdpt_idx);
-            if !pdpt_entry.is_present() || pdpt_entry.is_huge() {
-                return Err(MapError::NotMapped);
-            }
-            let pd = phys_to_virt_table(pdpt_entry.addr());
-
-            let pd_entry = (*pd).entry_mut(pd_idx);
-            if !pd_entry.is_present() || !pd_entry.is_huge() {
-                return Err(MapError::NotMapped);
-            }
-
-            // Get the huge page physical address and flags
-            let huge_phys = pd_entry.addr();
-            let old_flags = pd_entry.flags();
-
-            // Convert huge page flags to 4KB page flags (remove PAGE_HUGE)
-            let new_flags = (old_flags & !PAGE_HUGE) | PAGE_PRESENT;
-
-            // Allocate a new PT
-            let pt_phys = frame_alloc
-                .alloc_frame()
-                .ok_or(MapError::FrameAllocationFailed)?;
-            let pt = phys_to_virt_table(pt_phys);
-
-            // Fill the PT with 512 entries pointing to consecutive 4KB pages
-            for i in 0..512 {
-                let page_phys = huge_phys + (i as u64 * PAGE_SIZE);
-                (*pt).entry_mut(i).set(page_phys, new_flags);
-            }
-
-            // Update PD entry to point to the new PT (remove PAGE_HUGE)
-            let pt_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-            pd_entry.set(pt_phys, pt_flags);
-
-            // Flush entire huge page region from TLB
-            // Note: On x86-64, we need to flush all 512 entries since invlpg
-            // on a single address only invalidates that TLB entry
-            Self::flush_tlb_all();
-
-            // Each 4KB PTE now holds its own frame reference
-            crate::FRAME_ALLOCATOR.split_huge(huge_phys);
-
-            Ok(huge_phys)
+        const HUGE_MASK: u64 = (2 << 20) - 1;
+        let pmd = entry_ptr(pmd_ptr(pml4_phys, va).ok_or(MapError::NotMapped)?);
+        if !pmd_huge(pmd.load(Ordering::Acquire)) {
+            return Err(MapError::NotMapped);
         }
+        let pt_phys = frame_alloc
+            .alloc_frame()
+            .ok_or(MapError::FrameAllocationFailed)?;
+        let old = pmd.swap(0, Ordering::AcqRel);
+        Self::flush_tlb(va & !HUGE_MASK);
+        let base = old & ADDR_MASK & !HUGE_MASK;
+        let flags = (old & !ADDR_MASK & !PAGE_HUGE) | PAGE_PRESENT;
+        let pt = phys_to_virt_table(pt_phys);
+        for i in 0..ENTRIES_PER_TABLE {
+            // SAFETY: a fresh table frame, not yet reachable
+            unsafe { (*pt).entry_mut(i).set(base + i as u64 * PAGE_SIZE, flags) };
+        }
+        pmd.store(pt_phys | USER_TABLE, Ordering::Release);
+        crate::FRAME_ALLOCATOR.split_huge(base);
+        Ok(base)
     }
 
     /// Check if a virtual address is mapped as a 2MB huge page

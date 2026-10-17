@@ -759,6 +759,14 @@ pub struct BitmapFrameAllocator {
   flushes are broadcast (`tlbi ...is`); x86 flushes this CPU only: the
   shootdown IPI for other CPUs running the address space plugs into
   these helpers (section 9, SMP TODO).
+- Break-before-make: a live entry is never overwritten by one mapping
+  another page or another size. A 2MB page split into a table
+  (`split_huge_page`, Linux pmdp_invalidate) and a copy-on-write break
+  (`fault::replace_pte`, Linux ptep_clear_flush) first clear the entry
+  and flush its TLB entry, then write the new one (required on arm64,
+  ARM ARM D8.16; x86 needs it for the page-size change). In between
+  the address faults; the fault waits for the mm lock the writer holds,
+  then finds the new entry.
 - Teardown TLB: `free_user` detaches the user half from the top-level
   table, flushes (arm64: `tlbi vmalle1is`, all CPUs; x86: this CPU, if
   the table is loaded here), then frees pages and tables. A CPU that last

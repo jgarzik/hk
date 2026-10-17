@@ -175,6 +175,12 @@ fn entry_atomic(table: *mut u64, idx: u64) -> &'static AtomicU64 {
     unsafe { AtomicU64::from_ptr(table.add((idx & 511) as usize)) }
 }
 
+/// The descriptor at `p` in a live table, as an atomic
+fn entry_ptr(p: *mut u64) -> &'static AtomicU64 {
+    // SAFETY: `p` points into a live table frame (linear map)
+    unsafe { AtomicU64::from_ptr(p) }
+}
+
 /// Pointer to the 2MB-level (L2) entry for `va` in the tables rooted at
 /// `root` (Linux pmd_offset); None if an upper level is missing
 pub fn pmd_ptr(root: u64, va: u64) -> Option<*mut u64> {
@@ -1351,98 +1357,49 @@ impl Aarch64PageTable {
         }
     }
 
-    /// Split a 2MB huge page into 512 4KB pages
+    /// Split the 2MB block at `va` into 512 4KB pages (Linux
+    /// __split_huge_pmd_locked), mm lock held. The L3 table is allocated
+    /// first, so a failure changes nothing. Changing a live block into a
+    /// table follows break-before-make (ARM ARM D8.16, Linux
+    /// pmdp_invalidate + pmd_populate): the block entry is invalidated,
+    /// its TLB entries broadcast-invalidated (DSB ISH, TLBI VAE1IS,
+    /// DSB ISH), the new table is made visible (DSB ISHST) and only then
+    /// written into the L2 entry. Each 4KB page gets the block's
+    /// attributes and its own frame reference.
     ///
-    /// Allocates a new L3 table, creates 512 page entries pointing to the same
-    /// physical memory (consecutive 4KB pages), and updates the L2 entry
-    /// to point to the new L3 table.
-    ///
-    /// # Arguments
-    /// * `l0_phys` - Physical address of the L0 (root) table
-    /// * `va` - Virtual address of the huge page (must be 2MB-aligned)
-    /// * `frame_alloc` - Frame allocator for the new L3 table
-    ///
-    /// # Returns
-    /// Ok(phys_base) with the base physical address of the split huge page,
-    /// Err(MapError) on failure
+    /// Returns the physical base of the split page.
     pub fn split_huge_page<FA: FrameAlloc<PhysAddr = u64>>(
         l0_phys: u64,
         va: u64,
         frame_alloc: &mut FA,
     ) -> Result<u64, MapError> {
-        let (l0_idx, l1_idx, l2_idx, _l3_idx) = page_indices(va);
-
-        unsafe {
-            let l0 = phys_to_virt_table(l0_phys);
-
-            let l0_entry = (*l0).entry(l0_idx);
-            if !l0_entry.is_valid() || !l0_entry.is_table() {
-                return Err(MapError::NotMapped);
-            }
-            let l1 = phys_to_virt_table(l0_entry.addr());
-
-            let l1_entry = (*l1).entry(l1_idx);
-            if !l1_entry.is_valid() || l1_entry.is_block() {
-                return Err(MapError::NotMapped);
-            }
-            let l2 = phys_to_virt_table(l1_entry.addr());
-
-            let l2_entry = (*l2).entry_mut(l2_idx);
-            if !l2_entry.is_valid() || !l2_entry.is_block() {
-                return Err(MapError::NotMapped);
-            }
-
-            // Get the huge page physical address and attributes
-            let huge_phys = l2_entry.addr();
-            let old_attrs = l2_entry.attrs();
-
-            // Convert block attributes to page attributes
-            // Block and page descriptors use the same attribute bits
-            let page_attrs = old_attrs & !0b11; // Clear descriptor type bits
-
-            // Allocate a new L3 table
-            let l3_phys = frame_alloc
-                .alloc_frame()
-                .ok_or(MapError::FrameAllocationFailed)?;
-            let l3 = phys_to_virt_table(l3_phys);
-
-            // Fill the L3 with 512 page entries pointing to consecutive 4KB pages
-            for i in 0..512 {
-                let page_phys = huge_phys + (i as u64 * PAGE_SIZE);
-                (*l3).entry_mut(i).set_page(page_phys, page_attrs);
-            }
-
-            // Update L2 entry to point to the new L3 table
-            l2_entry.set_table(l3_phys);
-
-            // Clean the data cache for the L2 entry and all L3 entries
-            let l2_entry_addr = l2_entry as *mut PageTableEntry as u64;
-            asm!(
-                "dc cvau, {}",
-                in(reg) l2_entry_addr,
-                options(nostack)
-            );
-
-            // Clean cache for all L3 entries
-            for i in 0..512 {
-                let l3_entry_addr = (*l3).entry(i) as *const PageTableEntry as u64;
-                asm!(
-                    "dc cvau, {}",
-                    in(reg) l3_entry_addr,
-                    options(nostack)
-                );
-            }
-
-            asm!("dsb ish", options(nostack));
-
-            // Flush entire TLB - splitting affects many addresses
-            flush_tlb_all();
-
-            // Each 4KB PTE now holds its own frame reference
-            crate::FRAME_ALLOCATOR.split_huge(huge_phys);
-
-            Ok(huge_phys)
+        const HUGE_MASK: u64 = (2 << 20) - 1;
+        let pmd = entry_ptr(pmd_ptr(l0_phys, va).ok_or(MapError::NotMapped)?);
+        if !pmd_huge(pmd.load(Ordering::Acquire)) {
+            return Err(MapError::NotMapped);
         }
+        let l3_phys = frame_alloc
+            .alloc_frame()
+            .ok_or(MapError::FrameAllocationFailed)?;
+        // Break: invalid entry, then the block's TLB entries go
+        let old = pmd.swap(0, Ordering::AcqRel);
+        flush_tlb(va & !HUGE_MASK);
+        let base = old & ADDR_MASK & !HUGE_MASK;
+        let attrs = old & !ADDR_MASK & !0b11;
+        let l3 = phys_to_virt_table(l3_phys);
+        for i in 0..ENTRIES_PER_TABLE {
+            // SAFETY: a fresh table frame, not yet reachable
+            let e = unsafe { (*l3).entry_mut(i) };
+            e.set_page(base + i as u64 * PAGE_SIZE, attrs);
+        }
+        // Make: the table's entries are visible before the table is.
+        // SAFETY: barriers only
+        unsafe { asm!("dsb ishst", options(nostack)) };
+        pmd.store(l3_phys | DESC_TABLE, Ordering::Release);
+        // SAFETY: barriers only
+        unsafe { asm!("dsb ishst", "isb", options(nostack)) };
+        crate::FRAME_ALLOCATOR.split_huge(base);
+        Ok(base)
     }
 
     /// Check if a virtual address is mapped as a 2MB huge page

@@ -133,6 +133,21 @@ fn set_pte(ptep: *mut u64, old: u64, new: u64) -> bool {
         .is_ok()
 }
 
+/// Replace the present entry `old` at `ptep` by `new`, which maps
+/// another page (Linux ptep_clear_flush + set_pte_at): the entry is
+/// cleared and its TLB entry flushed before `new` is written, so no CPU
+/// caches both translations at once (arm64 break-before-make). False
+/// if the entry no longer holds `old`.
+fn replace_pte(ptep: *mut u64, old: u64, new: u64, addr: u64) -> bool {
+    if !set_pte(ptep, old, 0) {
+        return false;
+    }
+    paging::flush_tlb(addr);
+    // SAFETY: as in `set_pte`
+    unsafe { AtomicU64::from_ptr(ptep) }.store(new, Ordering::Release);
+    true
+}
+
 /// Read the entry at `ptep`
 fn get_pte(ptep: *mut u64) -> u64 {
     // SAFETY: as in `set_pte`
@@ -440,11 +455,10 @@ fn do_wp_page(ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Result<(), Vm
     };
     paging::sync_page(new, paging::pte_exec(pte));
     let entry = paging::pte_mkwrite((pte & !paging::PTE_ADDR_MASK) | new);
-    if !set_pte(ptep, pte, entry) {
+    if !replace_pte(ptep, pte, entry, addr) {
         FRAME_ALLOCATOR.free(new);
         return Ok(());
     }
-    paging::flush_tlb(addr);
     if area.anon_private() {
         add_anon(new, area, addr);
     }
