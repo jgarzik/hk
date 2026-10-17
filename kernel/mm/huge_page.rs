@@ -150,7 +150,7 @@ pub fn split_huge_pmd(mm: &super::Mm, va: u64) -> Option<u64> {
         return None;
     }
     // All levels (Linux flush_pmd_tlb_range): a table replaces the block
-    flush_huge(mm, va, true);
+    flush_huge(mm, va);
     // The hardware may have set accessed/dirty until the clear: `old`
     // is the value cleared (the compare-and-swap succeeded on it)
     let base = paging::split_table(pt, old);
@@ -159,10 +159,10 @@ pub fn split_huge_pmd(mm: &super::Mm, va: u64) -> Option<u64> {
     Some(base)
 }
 
-/// Clear the 2MB page entry for `base` in `mm` and flush it (Linux
-/// zap_huge_pmd), mm lock held. Returns the page's frame, which still
-/// holds the mapping's reference.
-pub fn clear_huge_pmd(mm: &super::Mm, base: u64) -> Option<u64> {
+/// Clear the 2MB page entry for `base` in `mm` (Linux zap_huge_pmd), mm
+/// lock held; the caller flushes it (`Gather`) before releasing the
+/// returned frame, which still holds the mapping's reference.
+pub fn take_huge_pmd(mm: &super::Mm, base: u64) -> Option<u64> {
     use crate::arch::paging;
     use core::sync::atomic::Ordering;
     let pmd = pmd_entry(paging::pmd_ptr(mm.pgd(), base)?);
@@ -174,14 +174,13 @@ pub fn clear_huge_pmd(mm: &super::Mm, base: u64) -> Option<u64> {
     {
         return None;
     }
-    flush_huge(mm, base, false);
     Some(paging::pte_addr(old) & !HUGE_PAGE_MASK)
 }
 
-/// Flush the 2MB page translation at `va` of `mm` (`walks`: the
-/// paging-structure caches too)
-fn flush_huge(mm: &super::Mm, va: u64, walks: bool) {
+/// Flush the 2MB page translation at `va` of `mm`, paging-structure
+/// caches too
+fn flush_huge(mm: &super::Mm, va: u64) {
     use super::tlb::{PMD_SHIFT, flush_tlb_mm_range};
     let base = huge_page_align_down(va);
-    flush_tlb_mm_range(mm, base, base + HUGE_PAGE_SIZE, PMD_SHIFT, walks);
+    flush_tlb_mm_range(mm, base, base + HUGE_PAGE_SIZE, PMD_SHIFT, true);
 }

@@ -370,9 +370,12 @@ pub(crate) fn munmap_locked(
             }
         }
     }
+    // One gather for all the VMAs: one flush, then the pages go
+    let mut tlb = super::gather::Gather::new(owner);
     for vma in &removed {
-        super::memory::zap_range(owner, vma.start.max(start), vma.end.min(end));
+        super::memory::zap_range(&mut tlb, vma.start.max(start), vma.end.min(end));
     }
+    drop(tlb);
     #[cfg(feature = "mmcheck")]
     super::check::verify(mm, pgd, "munmap");
     removed

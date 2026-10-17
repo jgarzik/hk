@@ -87,6 +87,7 @@ pub mod tcp_opt;
 pub mod tcp_xfer;
 pub mod timerfd;
 pub mod timing;
+pub mod tlb;
 pub mod tty;
 pub mod uaccess;
 pub mod udp;
@@ -140,6 +141,7 @@ pub fn run_all_tests() {
     isolated(b"MM_OOM", mm_oom::run_tests);
     isolated(b"FORK_MM", fork_mm::run_tests);
     isolated(b"MPROTECT", mprotect::run_tests);
+    isolated(b"TLB", tlb::run_tests);
     isolated(b"MRANGE", mrange::run_tests);
     isolated(b"LAYOUT", layout::run_tests);
     isolated(b"STARTUP", startup::run_tests);

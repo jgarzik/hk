@@ -185,7 +185,7 @@ fn dontneed(vma: &Vma, owner: &Mm, start: u64, end: u64, advice: i32) -> Result<
         return Err(KernelError::InvalidArgument);
     }
     // Zapped under the mm lock: no fault or fork works on these PTEs
-    super::memory::zap_range(owner, start, end);
+    super::memory::zap_range(&mut super::gather::Gather::new(owner), start, end);
     Ok(())
 }
 
@@ -214,7 +214,7 @@ fn remove(
     if vma.file.is_some() {
         return Err(KernelError::OperationNotSupported);
     }
-    super::memory::zap_range(owner, start, end);
+    super::memory::zap_range(&mut super::gather::Gather::new(owner), start, end);
     if let Some(sh) = &vma.shmem {
         let first = vma.offset + start - vma.start;
         let last = vma.offset + end - vma.start;

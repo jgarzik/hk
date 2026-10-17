@@ -9,8 +9,9 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::huge_page::{HUGE_PAGE_SIZE, clear_huge_pmd, split_huge_pmd};
-use super::{Mm, PAGE_SIZE, SwapEntry, Vma, tlb};
+use super::gather::Gather;
+use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd, take_huge_pmd};
+use super::{Mm, PAGE_SIZE, SwapEntry, Vma};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{Leaf, paging};
 use crate::mm::page::page_descriptor;
@@ -54,8 +55,8 @@ fn release_desc(phys: u64) {
     }
 }
 
-/// Release one user mapping met by `paging::UserTables::free`
-fn zap_leaf(leaf: Leaf) {
+/// Release one user mapping (after its TLB flush: `Gather`)
+pub(super) fn zap_leaf(leaf: Leaf) {
     use super::SwapEntry;
     match leaf {
         Leaf::Page(p) => put_page(p),
@@ -75,7 +76,7 @@ fn zap_leaf(leaf: Leaf) {
 /// No task runs in it any more, but a CPU that ran its last task may
 /// still have it loaded: the user half is detached and every such CPU
 /// flushed (paging-structure caches included) before anything is
-/// freed.
+/// freed (Linux tlb_gather_mmu_fullmm).
 pub(super) fn exit_mmap(mm: &Mm) {
     let vmas: Vec<_> = mm.lock().take_vmas();
     for vma in &vmas {
@@ -83,21 +84,24 @@ pub(super) fn exit_mmap(mm: &Mm) {
             av.remove_root(mm.pgd());
         }
     }
-    let tables = paging::detach_user(mm.pgd());
-    tlb::flush_tlb_mm(mm);
-    tables.free(&mut zap_leaf);
+    let mut tlb = Gather::new_full(mm);
+    tlb.free_tables(paging::detach_user(mm.pgd()));
+    drop(tlb);
     // VMAs go last, outside any lock: they may hold the last reference
     // to a mapped file
     drop(vmas);
 }
 
-/// Release the pages of [start, end) of `mm` (Linux zap_page_range),
-/// mm lock held: each 4KB entry (a page, protnone included, or a swap
-/// slot) is cleared, and its TLB entry flushed before the page is
-/// released; a 2MB page wholly inside goes whole, one partly inside is
-/// split first. Empty tables are kept. Only user addresses: callers
-/// pass ranges inside VMAs, a range past TASK_SIZE is a bug (clamped).
-pub fn zap_range(mm: &Mm, start: u64, end: u64) {
+/// Clear the entries of [start, end) of the gather's address space
+/// (Linux zap_page_range / unmap_page_range), mm lock held: each 4KB
+/// entry (a page, protnone included, or a swap slot) is cleared, a 2MB
+/// page wholly inside goes whole, one partly inside is split first. The
+/// pages go to `tlb`, released only after its TLB flush (a swap slot
+/// at once: no CPU caches a swap entry). Empty tables are kept. Only
+/// user addresses: callers pass ranges inside VMAs, a range past
+/// TASK_SIZE is a bug (clamped).
+pub fn zap_range(tlb: &mut Gather, start: u64, end: u64) {
+    let mm = tlb.mm();
     let pgd = mm.pgd();
     const GB: u64 = 1 << 30;
     debug_assert!(
@@ -115,8 +119,8 @@ pub fn zap_range(mm: &Mm, start: u64, end: u64) {
         let next = (base + HUGE_PAGE_SIZE).min(end);
         if paging::pmd_huge(entry(pmd).load(Ordering::Acquire)) {
             if addr == base && next == base + HUGE_PAGE_SIZE {
-                if let Some(phys) = clear_huge_pmd(mm, base) {
-                    put_huge(phys);
+                if let Some(phys) = take_huge_pmd(mm, base) {
+                    tlb.remove_huge(base, phys);
                 }
                 addr = next;
                 continue;
@@ -126,7 +130,7 @@ pub fn zap_range(mm: &Mm, start: u64, end: u64) {
         }
         if entry(pmd).load(Ordering::Acquire) != 0 {
             for a in (addr..next).step_by(PAGE_SIZE as usize) {
-                zap_pte(mm, a);
+                zap_pte(tlb, a);
             }
         }
         addr = next;
@@ -142,15 +146,14 @@ pub fn resident(pgd: u64, addr: u64) -> bool {
     }
 }
 
-/// Clear the 4KB entry for `addr` and release what it held
-fn zap_pte(mm: &Mm, addr: u64) {
-    let Some(p) = paging::pte_ptr(mm.pgd(), addr) else {
+/// Clear the 4KB entry for `addr`; what it held goes to `tlb`
+fn zap_pte(tlb: &mut Gather, addr: u64) {
+    let Some(p) = paging::pte_ptr(tlb.mm().pgd(), addr) else {
         return;
     };
     let pte = entry(p).swap(0, Ordering::AcqRel);
     if paging::pte_present(pte) {
-        tlb::flush_tlb_page(mm, addr);
-        put_page(paging::pte_addr(pte));
+        tlb.remove_page(addr, paging::pte_addr(pte));
     } else if SwapEntry::is_swap_pte(pte) {
         super::free_swap_entry(SwapEntry::from_pte(pte));
     }

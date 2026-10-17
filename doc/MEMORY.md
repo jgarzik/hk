@@ -180,7 +180,8 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   which is torn down only if no vfork parent or other thread uses it.
 - **munmap / MAP_FIXED / brk shrink / shmdt** split VMAs at the range
   edges and release what the entries inside hold (`memory::zap_range`:
-  pages, protnone ones included, and swap slots); empty page-table
+  pages, protnone ones included, and swap slots), the pages only after
+  one TLB flush of the range (`mm::gather::Gather`, Linux mmu_gather); empty page-table
   pages are kept until exit (reused by later mappings at the same
   addresses).
 - **mprotect (Linux change_protection)** changes the VMAs and rewrites

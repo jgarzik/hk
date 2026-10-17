@@ -768,9 +768,13 @@ pub struct BitmapFrameAllocator {
   mprotect rewrites the range's PTEs (`mprotect::change_protection`),
   then flushes the range before dropping the lock (its pages keep their
   references); mremap's move flushes the old range the same way; a
-  copy-on-write break, munmap and MADV_DONTNEED flush each page they
-  clear (`flush_tlb_page`) before dropping its reference; rmap flushes
-  in the chain's address space, not the one this CPU runs.
+  copy-on-write break flushes the page it replaces (`flush_tlb_page`)
+  before dropping its reference; munmap, MADV_DONTNEED/REMOVE and exit
+  clear entries into a `Gather` (`mm/gather.rs`, Linux mmu_gather) that
+  flushes the whole range once per batch of 64 frames and only then
+  releases them (and, at exit, the page tables): no frame is reused
+  while a CPU may still reach it through its TLB. rmap flushes in the
+  chain's address space, not the one this CPU runs.
 - Break-before-make: a live entry is never overwritten by one mapping
   another page or another size. A 2MB page split into a table
   (`huge_page::split_huge_pmd`, Linux pmdp_invalidate) and a copy-on-write break
@@ -780,9 +784,9 @@ pub struct BitmapFrameAllocator {
   the address faults; the fault waits for the mm lock the writer holds,
   then finds the new entry.
 - Teardown TLB: `exit_mmap` detaches the user half from the top-level
-  table (`paging::detach_user`), flushes the whole address space with
-  its paging-structure caches (`flush_tlb_mm`), then frees pages and
-  tables (`UserTables::free`). A CPU that last ran the address space
+  table (`paging::detach_user`) into a full-mm `Gather`, which flushes
+  the whole address space with its paging-structure caches
+  (`flush_tlb_mm`), then frees pages and tables (`UserTables::free`). A CPU that last ran the address space
   (another thread still in `exit_current`) has it loaded until it
   switches away, so the flush reaches it (arm64 broadcast; x86 see TLB
   Flushing).
