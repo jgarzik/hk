@@ -1238,6 +1238,12 @@ pub fn sys_sigaltstack(ss: u64, oss: u64) -> i64 {
     unsafe { syscall2!(SYS_SIGALTSTACK, ss, oss) }
 }
 
+/// ptrace(request, pid, addr, data)
+#[inline(always)]
+pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
+    unsafe { syscall4!(101u64, request, pid, addr, data) }
+}
+
 #[inline(always)]
 pub fn sys_kill(pid: i64, sig: u32) -> i64 {
     unsafe { syscall2!(SYS_KILL, pid, sig) }

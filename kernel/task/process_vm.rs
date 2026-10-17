@@ -11,8 +11,8 @@ use crate::arch::Uaccess;
 use crate::error::KernelError;
 use crate::fs::iov::IoVec;
 use crate::mm::remote::{access_remote_vm_read, access_remote_vm_write};
-use crate::task::percpu::{TASK_TABLE, current_cred, current_tid};
-use crate::task::{CAP_SYS_PTRACE, Pid, Tid, capable};
+use crate::task::percpu::{TASK_TABLE, current_tid};
+use crate::task::{Pid, Tid};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 
 /// Maximum number of iovec entries (same as IOV_MAX)
@@ -313,40 +313,11 @@ fn find_task_by_pid(pid: Pid) -> Option<Tid> {
     table.tasks.iter().find(|t| t.pid == pid).map(|t| t.tid)
 }
 
-/// Check permission for process_vm access
-///
-/// Allows access if:
-/// - Caller has CAP_SYS_PTRACE capability, OR
-/// - Caller and target have the same effective UID
+/// May the caller access the target's memory (Linux process_vm_rw_core
+/// -> mm_access, PTRACE_MODE_ATTACH_REALCREDS): its own process, else
+/// the ptrace rules with the real ids
 fn check_process_vm_permission(target_tid: Tid) -> bool {
-    // CAP_SYS_PTRACE bypasses all checks
-    if capable(CAP_SYS_PTRACE) {
-        return true;
-    }
-
-    // Same process always allowed
-    if target_tid == current_tid() {
-        return true;
-    }
-
-    // Get caller credentials
-    let caller_cred = current_cred();
-
-    // Get target credentials
-    let target_euid = {
-        let table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter()
-            .find(|t| t.tid == target_tid)
-            .map(|t| t.cred.euid)
-    };
-
-    // Same effective UID check
-    match target_euid {
-        Some(euid) => caller_cred.euid == euid,
-        None => false,
-    }
+    target_tid == current_tid() || crate::task::ptrace::may_access(|t| t.tid == target_tid, false)
 }
 
 /// Get target's MmStruct and page table root physical address

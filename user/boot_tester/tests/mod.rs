@@ -68,6 +68,7 @@ pub mod prctl;
 pub mod prctl_extra;
 pub mod process;
 pub mod process_vm;
+pub mod ptrace_access;
 pub mod procfs_access;
 pub mod raw;
 pub mod rename2;
@@ -154,6 +155,7 @@ pub fn run_all_tests() {
     isolated(b"STARTUP", startup::run_tests);
     isolated(b"ELF_EXEC", elf_exec::run_tests);
     isolated(b"PROCFS_ACCESS", procfs_access::run_tests);
+    isolated(b"PTRACE_ACCESS", ptrace_access::run_tests);
     isolated(b"NPROC", nproc::run_tests);
     isolated(b"FD_LEAK", fd_leak::run_tests);
     rlimit::run_tests();

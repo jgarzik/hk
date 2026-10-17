@@ -476,6 +476,9 @@ static PERCPU_SCHEDS: [PerCpuScheduler; MAX_CPUS] = [const { PerCpuScheduler::ne
 ///
 /// Protected by its own lock, separate from per-CPU run queues.
 /// This is only used for fork/exit and task lookup, not hot-path scheduling.
+/// A task of this kernel's architecture (TASK_TABLE entries)
+pub type KernelTask = Task<CurrentArch, ArchPageTable>;
+
 pub struct GlobalTaskTable {
     /// All tasks in the system
     pub tasks: Vec<Task<CurrentArch, ArchPageTable>>,
