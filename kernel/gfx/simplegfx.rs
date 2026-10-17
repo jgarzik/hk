@@ -18,7 +18,6 @@
 extern crate alloc;
 
 use crate::sync::spin::Mutex;
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -173,46 +172,29 @@ impl GfxDriver for SimpleGfxDevice {
         }
     }
 
-    fn get_resources(&self) -> &GfxModeResources {
-        // This is a bit awkward - we need to return a reference but
-        // the state is behind a mutex. For simplicity, leak a copy.
-        // In a real implementation, we'd use a different pattern.
-        let state = self.state.lock();
-        // SAFETY: This leaks memory, but for a simple driver it's acceptable
-        // A real implementation would use Arc or similar
-        let resources = state.resources.clone();
-        Box::leak(Box::new(resources))
+    fn get_resources(&self) -> GfxModeResources {
+        self.state.lock().resources.clone()
     }
 
-    fn get_connector(&self, id: u32) -> Result<&GfxConnector, GfxError> {
-        let state = self.state.lock();
-        if id == Self::CONNECTOR_ID {
-            // Same leak pattern as get_resources
-            let connector = state.connector.clone();
-            Ok(Box::leak(Box::new(connector)))
-        } else {
-            Err(GfxError::NoSuchObject)
+    fn get_connector(&self, id: u32) -> Result<GfxConnector, GfxError> {
+        if id != Self::CONNECTOR_ID {
+            return Err(GfxError::NoSuchObject);
         }
+        Ok(self.state.lock().connector.clone())
     }
 
-    fn get_encoder(&self, id: u32) -> Result<&GfxEncoder, GfxError> {
-        let state = self.state.lock();
-        if id == Self::ENCODER_ID {
-            let encoder = state.encoder.clone();
-            Ok(Box::leak(Box::new(encoder)))
-        } else {
-            Err(GfxError::NoSuchObject)
+    fn get_encoder(&self, id: u32) -> Result<GfxEncoder, GfxError> {
+        if id != Self::ENCODER_ID {
+            return Err(GfxError::NoSuchObject);
         }
+        Ok(self.state.lock().encoder.clone())
     }
 
-    fn get_crtc(&self, id: u32) -> Result<&GfxCrtc, GfxError> {
-        let state = self.state.lock();
-        if id == Self::CRTC_ID {
-            let crtc = state.crtc.clone();
-            Ok(Box::leak(Box::new(crtc)))
-        } else {
-            Err(GfxError::NoSuchObject)
+    fn get_crtc(&self, id: u32) -> Result<GfxCrtc, GfxError> {
+        if id != Self::CRTC_ID {
+            return Err(GfxError::NoSuchObject);
         }
+        Ok(self.state.lock().crtc.clone())
     }
 
     fn set_crtc(
