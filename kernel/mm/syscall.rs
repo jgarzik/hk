@@ -10,15 +10,11 @@ use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
 
 use super::{
-    MADV_COLD, MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE,
-    MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM,
-    MADV_REMOVE, MADV_SEQUENTIAL, MADV_WILLNEED, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_FIXED,
-    MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_NORESERVE, MAP_POPULATE,
-    MAP_PRIVATE, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC, MS_INVALIDATE, MS_SYNC,
-    PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, VM_DONTCOPY, VM_DONTDUMP,
-    VM_GROWSDOWN, VM_HUGEPAGE, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_NOHUGEPAGE,
-    VM_NORESERVE, VM_RAND_READ, VM_SEQ_READ, VM_SHARED, VM_WIPEONFORK, Vma, anon_vma::AnonVma,
-    get_task_mm,
+    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK,
+    MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE,
+    MS_ASYNC, MS_INVALIDATE, MS_SYNC, PAGE_SIZE, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ,
+    PROT_WRITE, VM_GROWSDOWN, VM_LOCKED, VM_LOCKED_MASK, VM_LOCKONFAULT, VM_NORESERVE, VM_SHARED,
+    Vma, anon_vma::AnonVma, get_task_mm,
 };
 use crate::error::KernelError;
 
@@ -544,10 +540,10 @@ fn can_do_mlock() -> bool {
 /// populate_vma_page_range): a write fault for a private writable
 /// mapping (copy-on-write is broken now), a read fault otherwise.
 /// Inaccessible VMAs and holes are skipped. False if memory ran out
-/// (mlock reports it; MAP_POPULATE, mlockall and MADV_WILLNEED ignore
-/// it, like Linux mm_populate).
+/// (mlock reports it; MAP_POPULATE and mlockall ignore it, like Linux
+/// mm_populate).
 ///
-/// Used by MAP_POPULATE, MAP_LOCKED, mlock/mlockall and MADV_WILLNEED.
+/// Used by MAP_POPULATE, MAP_LOCKED and mlock/mlockall.
 fn populate_range(start: u64, len: u64) -> bool {
     use super::fault::{Access, handle_mm_fault};
 
@@ -1207,227 +1203,6 @@ pub fn sys_msync(addr: u64, length: u64, flags: i32) -> i64 {
 }
 
 // ============================================================================
-// madvise syscall
-// ============================================================================
-
-/// madvise syscall - Give advice about use of memory
-///
-/// Advises the kernel about how to handle paging I/O in the specified
-/// address range.
-///
-/// # Arguments
-/// * `addr` - Start address (must be page-aligned)
-/// * `length` - Length of region in bytes
-/// * `advice` - Type of advice (MADV_*)
-///
-/// # Returns
-/// 0 on success, negative errno on failure
-pub fn sys_madvise(addr: u64, length: u64, advice: i32) -> i64 {
-    // Validate alignment
-    if addr & (PAGE_SIZE - 1) != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Round up length to page boundary
-    let length = (length + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
-    // Zero length: no-op success
-    if length == 0 {
-        return 0;
-    }
-
-    let tid = current_tid();
-    let mm = match get_task_mm(tid) {
-        Some(mm) => mm,
-        None => return KernelError::OutOfMemory.sysret(),
-    };
-
-    let end = addr.saturating_add(length);
-
-    match advice {
-        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_DONTFORK | MADV_DOFORK
-        | MADV_DONTDUMP | MADV_DODUMP | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_WIPEONFORK
-        | MADV_KEEPONFORK => {
-            // These advices just update VMA flags
-            madvise_update_vma_flags(&mm, addr, end, advice)
-        }
-        MADV_WILLNEED => {
-            // Prefault pages (reuse populate_range)
-            let _ = populate_range(addr, length);
-            0
-        }
-        MADV_DONTNEED => {
-            // Zap pages - unmap and free
-            madvise_dontneed(&mm, addr, end)
-        }
-        MADV_FREE => {
-            // Mark pages as lazily freeable
-            // Simplified: treat as DONTNEED (kernel frees pages immediately)
-            madvise_dontneed(&mm, addr, end)
-        }
-        MADV_REMOVE => madvise_remove(&mm, addr, end),
-        MADV_COLD | MADV_PAGEOUT => {
-            // These are hints for memory reclaim (LRU demotion / swap out)
-            // Without a proper LRU and swap infrastructure, these are no-ops
-            // Just validate the range exists
-            let mm_guard = mm.lock();
-            for vma in mm_guard.iter() {
-                if vma.end > addr && vma.start < end {
-                    return 0; // Range is mapped, success
-                }
-            }
-            // No VMAs found in range
-            KernelError::OutOfMemory.sysret()
-        }
-        _ => KernelError::InvalidArgument.sysret(),
-    }
-}
-
-/// Update VMA flags based on madvise advice
-fn madvise_update_vma_flags(
-    mm: &alloc::sync::Arc<super::Mm>,
-    start: u64,
-    end: u64,
-    advice: i32,
-) -> i64 {
-    let mut mm_guard = mm.lock();
-
-    // Only private anonymous memory can be wiped on fork (Linux
-    // madvise_vma_behavior)
-    let inside = |v: &Vma| v.end > start && v.start < end;
-    if advice == MADV_WIPEONFORK
-        && mm_guard
-            .iter()
-            .any(|v| inside(v) && (v.file.is_some() || v.is_shared()))
-    {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Walk VMAs and update flags, collect indices for merging
-    let mut modified_indices: Vec<usize> = Vec::new();
-    for (idx, vma) in mm_guard.iter_mut().enumerate() {
-        // Skip VMAs outside our range
-        if vma.end <= start || vma.start >= end {
-            continue;
-        }
-
-        match advice {
-            MADV_NORMAL => {
-                // Clear read hints
-                vma.flags &= !(VM_RAND_READ | VM_SEQ_READ);
-            }
-            MADV_RANDOM => {
-                // Set random access hint
-                vma.flags = (vma.flags & !VM_SEQ_READ) | VM_RAND_READ;
-            }
-            MADV_SEQUENTIAL => {
-                // Set sequential access hint
-                vma.flags = (vma.flags & !VM_RAND_READ) | VM_SEQ_READ;
-            }
-            MADV_DONTFORK => {
-                // Set don't copy on fork
-                vma.flags |= VM_DONTCOPY;
-            }
-            MADV_DOFORK => {
-                // Clear don't copy on fork
-                vma.flags &= !VM_DONTCOPY;
-            }
-            MADV_DONTDUMP => {
-                // Set don't include in core dumps
-                vma.flags |= VM_DONTDUMP;
-            }
-            MADV_DODUMP => {
-                // Clear don't include in core dumps
-                vma.flags &= !VM_DONTDUMP;
-            }
-            MADV_HUGEPAGE => {
-                // Enable transparent huge pages for this VMA
-                vma.flags = (vma.flags & !VM_NOHUGEPAGE) | VM_HUGEPAGE;
-            }
-            MADV_NOHUGEPAGE => {
-                // Disable transparent huge pages for this VMA
-                vma.flags = (vma.flags & !VM_HUGEPAGE) | VM_NOHUGEPAGE;
-            }
-            MADV_WIPEONFORK => {
-                // Zero this VMA in child on fork
-                vma.flags |= VM_WIPEONFORK;
-            }
-            MADV_KEEPONFORK => {
-                // Undo MADV_WIPEONFORK (normal fork behavior)
-                vma.flags &= !VM_WIPEONFORK;
-            }
-            _ => {}
-        }
-        modified_indices.push(idx);
-    }
-
-    // Try to merge modified VMAs with adjacent VMAs (VMA merging optimization)
-    // Process in reverse order to maintain valid indices after removals
-    for &idx in modified_indices.iter().rev() {
-        mm_guard.merge_adjacent(idx);
-    }
-
-    0
-}
-
-/// MADV_REMOVE on [start, end) (Linux madvise_remove): only memory
-/// with a backing object that may be written through the mapping
-/// (EINVAL for private anonymous memory; EACCES for a private file
-/// mapping, a shared one of a file not open for writing, or a SHM_RDONLY
-/// attachment; EOPNOTSUPP for a file, as for a Linux filesystem without
-/// hole punching, like ramfs); zaps the range, then punches the hole in
-/// the shared object backing it
-fn madvise_remove(mm: &alloc::sync::Arc<super::Mm>, start: u64, end: u64) -> i64 {
-    let mut holes = Vec::new();
-    for v in mm.lock().iter().filter(|v| v.end > start && v.start < end) {
-        if v.file.is_none() && v.shmem.is_none() {
-            return KernelError::InvalidArgument.sysret();
-        }
-        let maywrite = v.is_shared()
-            && v.file.as_ref().is_none_or(|f| f.is_writable())
-            && !v.shm.as_ref().is_some_and(|a| a.rdonly());
-        if !maywrite {
-            return KernelError::PermissionDenied.sysret();
-        }
-        if v.file.is_some() {
-            return KernelError::OperationNotSupported.sysret();
-        }
-        if let Some(sh) = &v.shmem {
-            let first = v.offset + start.max(v.start) - v.start;
-            let last = v.offset + end.min(v.end) - v.start;
-            holes.push((sh.clone(), first / PAGE_SIZE, last / PAGE_SIZE));
-        }
-    }
-    let r = madvise_dontneed(mm, start, end);
-    if r == 0 {
-        for (sh, from, to) in holes {
-            sh.punch(from, to);
-        }
-    }
-    r
-}
-
-/// Handle MADV_DONTNEED - zap pages in range
-fn madvise_dontneed(mm: &alloc::sync::Arc<super::Mm>, start: u64, end: u64) -> i64 {
-    let mm_guard = mm.lock();
-
-    // Check for locked VMAs - can't DONTNEED locked pages
-    for vma in mm_guard.iter() {
-        if vma.end <= start || vma.start >= end {
-            continue;
-        }
-        if vma.is_locked() {
-            return KernelError::InvalidArgument.sysret();
-        }
-    }
-
-    // Zap under the mm lock: no fault or fork works on these PTEs meanwhile
-    super::memory::zap_range(mm.pgd(), start, end);
-    drop(mm_guard);
-    0
-}
-
-// ============================================================================
 // mremap syscall
 // ============================================================================
 
@@ -1681,8 +1456,8 @@ fn move_mapping(
     let ((old_addr, old_len), (new_addr, new_len)) = (from, to);
     let mut alloc = |va| crate::arch::paging::pte_alloc(pgd, va);
     super::mremap::move_prep(pgd, old_addr, new_addr, old_len, &mut alloc)?;
-    split_at(mm, old_addr);
-    split_at(mm, old_addr + old_len);
+    mm.split_at(old_addr);
+    mm.split_at(old_addr + old_len);
     let mut new_vma = mm
         .find_vma_exact(old_addr)
         .and_then(|i| mm.get_vma(i))
@@ -1701,15 +1476,6 @@ fn move_mapping(
     mm.merge_adjacent(idx);
     super::mremap::move_ptes(pgd, old_addr, new_addr, old_len);
     Ok(())
-}
-
-/// Split the VMA containing `addr` there, if it starts below it
-fn split_at(mm: &mut super::MmStruct, addr: u64) {
-    if let Some(i) = mm.find_vma_index(addr)
-        && mm.get_vma(i).is_some_and(|v| v.start < addr)
-    {
-        mm.split_vma(i, addr);
-    }
 }
 
 // ============================================================================

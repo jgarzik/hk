@@ -19,6 +19,7 @@ pub mod check;
 pub mod fault;
 pub mod huge_page;
 pub mod lru;
+pub mod madvise;
 pub mod memory;
 pub mod mempolicy;
 pub mod mprotect;
@@ -393,6 +394,21 @@ impl MmStruct {
     /// Returns Some(index) if a VMA contains addr, None otherwise.
     pub fn find_vma_index(&self, addr: u64) -> Option<usize> {
         self.vmas.iter().position(|vma| vma.contains(addr))
+    }
+
+    /// Index of the first VMA ending above `addr`: the one containing it,
+    /// or the next one above (Linux find_vma)
+    pub fn next_vma(&self, addr: u64) -> Option<usize> {
+        self.vmas.iter().position(|vma| vma.end > addr)
+    }
+
+    /// Split the VMA containing `addr` there, if it starts below it
+    pub fn split_at(&mut self, addr: u64) {
+        if let Some(i) = self.find_vma_index(addr)
+            && self.vmas[i].start < addr
+        {
+            self.split_vma(i, addr);
+        }
     }
 
     /// Find the index of the VMA starting at exactly the given address

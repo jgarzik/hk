@@ -751,7 +751,10 @@ pub struct BitmapFrameAllocator {
   pte_same), the loser dropping its page. No user memory is accessed
   under the mm lock (a fault there would deadlock). The debug VMA/PTE
   check (`mm::check::verify`, feature `mmcheck`) runs under it after
-  mprotect, munmap and mremap: it only reads, and takes no lock.
+  mprotect, munmap, mremap and madvise: it only reads, and takes no
+  lock. madvise holds the mm lock over its whole VMA walk (splits,
+  flag changes and zaps), and MADV_REMOVE punches the shared object's
+  holes only after dropping it.
 - TLB after a PTE loses permission or its page: flushed before the mm
   lock is released and before the old frame can be freed or written
   through by another process: fork write-protects the parent's private

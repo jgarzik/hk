@@ -1394,7 +1394,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_MLOCK2 => crate::mm::syscall::sys_mlock2(arg0, arg1, arg2 as i32) as u64,
         SYS_MSYNC => crate::mm::syscall::sys_msync(arg0, arg1, arg2 as i32) as u64,
         SYS_MINCORE => crate::mm::syscall::sys_mincore(arg0, arg1, arg2) as u64,
-        SYS_MADVISE => crate::mm::syscall::sys_madvise(arg0, arg1, arg2 as i32) as u64,
+        SYS_MADVISE => crate::mm::madvise::sys_madvise(arg0, arg1, arg2 as i32) as u64,
         SYS_MREMAP => crate::mm::syscall::sys_mremap(arg0, arg1, arg2, arg3 as u32, arg4) as u64,
         SYS_FTRUNCATE => sys_ftruncate(arg0 as i32, arg1 as i64) as u64,
         SYS_TRUNCATE => sys_truncate(arg0, arg1 as i64) as u64,

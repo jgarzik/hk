@@ -1,0 +1,269 @@
+//! madvise (Linux mm/madvise.c)
+//!
+//! The advice is checked, then applied VMA by VMA over the part of each
+//! that lies in the range (madvise_walk_vmas): advice that changes VMA
+//! flags splits a VMA at the range edges; advice that drops pages zaps
+//! only memory that is mapped. The first VMA that refuses the advice
+//! stops the walk with its error (the VMAs before it keep the advice); a
+//! range with unmapped holes is ENOMEM once the rest has been advised.
+
+extern crate alloc;
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use super::shmem::Shmem;
+use super::{
+    MADV_COLD, MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE,
+    MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM,
+    MADV_REMOVE, MADV_SEQUENTIAL, MADV_WILLNEED, MADV_WIPEONFORK, MmStruct, PAGE_SIZE, VM_DONTCOPY,
+    VM_DONTDUMP, VM_HUGEPAGE, VM_NOHUGEPAGE, VM_RAND_READ, VM_SEQ_READ, VM_WIPEONFORK, Vma,
+    get_task_mm,
+};
+use crate::error::KernelError;
+use crate::task::percpu::current_tid;
+
+/// A hole to punch in a shared object once the mm lock is dropped
+/// (MADV_REMOVE): the object and its page range [from, to)
+type Punch = (Arc<Shmem>, u64, u64);
+
+/// madvise(2): give advice about [start, start + len) (Linux do_madvise)
+pub fn sys_madvise(start: u64, len: u64, advice: i32) -> i64 {
+    if !valid(advice) {
+        return KernelError::InvalidArgument.sysret();
+    }
+    let end = match check_range(start, len) {
+        Ok(Some(end)) => end,
+        Ok(None) => return 0,
+        Err(e) => return e.sysret(),
+    };
+    let Some(mm) = get_task_mm(current_tid()) else {
+        return KernelError::OutOfMemory.sysret();
+    };
+    let mut punch = Vec::new();
+    let mut map = mm.lock();
+    let r = walk(&mut map, mm.pgd(), start, end, advice, &mut punch);
+    #[cfg(feature = "mmcheck")]
+    super::check::verify(&map, mm.pgd(), "madvise");
+    drop(map);
+    // MADV_REMOVE frees the shared object's pages after the zap, also
+    // for the VMAs done before an error (Linux punches VMA by VMA)
+    for (sh, from, to) in punch {
+        sh.punch(from, to);
+    }
+    match r {
+        Ok(()) => 0,
+        Err(e) => e.sysret(),
+    }
+}
+
+/// Advice values Linux accepts (madvise_behavior_valid), less those hk
+/// does not implement
+fn valid(advice: i32) -> bool {
+    matches!(
+        advice,
+        MADV_NORMAL
+            | MADV_RANDOM
+            | MADV_SEQUENTIAL
+            | MADV_WILLNEED
+            | MADV_DONTNEED
+            | MADV_FREE
+            | MADV_REMOVE
+            | MADV_DONTFORK
+            | MADV_DOFORK
+            | MADV_HUGEPAGE
+            | MADV_NOHUGEPAGE
+            | MADV_DONTDUMP
+            | MADV_DODUMP
+            | MADV_WIPEONFORK
+            | MADV_KEEPONFORK
+            | MADV_COLD
+            | MADV_PAGEOUT
+    )
+}
+
+/// The end of the range (Linux check_input_range): EINVAL for an
+/// unaligned start or a length that wraps when rounded up to pages;
+/// None for an empty range
+fn check_range(start: u64, len: u64) -> Result<Option<u64>, KernelError> {
+    if start & (PAGE_SIZE - 1) != 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let len_pages = len.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    if len != 0 && len_pages == 0 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let end = start
+        .checked_add(len_pages)
+        .ok_or(KernelError::InvalidArgument)?;
+    Ok((len != 0).then_some(end))
+}
+
+/// Apply `advice` to each VMA part in [start, end), mm lock held (Linux
+/// madvise_walk_vmas). The walk goes by address, as a VMA may be split
+/// or merged under it.
+fn walk(
+    mm: &mut MmStruct,
+    pgd: u64,
+    start: u64,
+    end: u64,
+    advice: i32,
+    punch: &mut Vec<Punch>,
+) -> Result<(), KernelError> {
+    let mut addr = start;
+    let mut unmapped = false;
+    loop {
+        let (vs, ve) = match mm.next_vma(addr).and_then(|i| mm.get_vma(i)) {
+            Some(v) => (v.start, v.end),
+            None => return Err(KernelError::OutOfMemory),
+        };
+        if addr < vs {
+            unmapped = true;
+            addr = vs;
+            if addr >= end {
+                break;
+            }
+        }
+        let e = ve.min(end);
+        vma_advise(mm, pgd, addr, e, advice, punch)?;
+        if e >= end {
+            break;
+        }
+        addr = e;
+    }
+    if unmapped {
+        Err(KernelError::OutOfMemory)
+    } else {
+        Ok(())
+    }
+}
+
+/// Apply `advice` to [start, end), inside one VMA (Linux
+/// madvise_vma_behavior)
+fn vma_advise(
+    mm: &mut MmStruct,
+    pgd: u64,
+    start: u64,
+    end: u64,
+    advice: i32,
+    punch: &mut Vec<Punch>,
+) -> Result<(), KernelError> {
+    let idx = mm.find_vma_index(start).ok_or(KernelError::OutOfMemory)?;
+    let vma = mm.get_vma(idx).ok_or(KernelError::OutOfMemory)?;
+    match advice {
+        MADV_WILLNEED => Ok(()),
+        MADV_COLD | MADV_PAGEOUT => lru_ok(vma),
+        MADV_DONTNEED | MADV_FREE => dontneed(vma, pgd, start, end, advice),
+        MADV_REMOVE => remove(vma, pgd, start, end, punch),
+        _ => {
+            let flags = new_flags(vma, advice)?;
+            update_flags(mm, idx, start, end, flags)
+        }
+    }
+}
+
+/// Private anonymous memory: no file, shared object or SysV segment
+/// behind it (Linux vma_is_anonymous)
+fn is_anon(vma: &Vma) -> bool {
+    vma.file.is_none() && vma.shmem.is_none() && vma.shm.is_none()
+}
+
+/// MADV_COLD / MADV_PAGEOUT: refused on locked memory (Linux
+/// can_madv_lru_vma); otherwise a hint without effect (no reclaim)
+fn lru_ok(vma: &Vma) -> Result<(), KernelError> {
+    if vma.is_locked() {
+        return Err(KernelError::InvalidArgument);
+    }
+    Ok(())
+}
+
+/// MADV_DONTNEED / MADV_FREE (Linux madvise_dontneed_free): not on
+/// locked memory, MADV_FREE only on private anonymous memory. MADV_FREE
+/// frees at once, like DONTNEED (the pages are not kept for reuse).
+fn dontneed(vma: &Vma, pgd: u64, start: u64, end: u64, advice: i32) -> Result<(), KernelError> {
+    if vma.is_locked() || (advice == MADV_FREE && !is_anon(vma)) {
+        return Err(KernelError::InvalidArgument);
+    }
+    // Zapped under the mm lock: no fault or fork works on these PTEs
+    super::memory::zap_range(pgd, start, end);
+    Ok(())
+}
+
+/// MADV_REMOVE (Linux madvise_remove): only memory with a backing object
+/// that may be written through the mapping (EINVAL for locked or private
+/// anonymous memory; EACCES for a private file mapping, a shared one of
+/// a file not open for writing, or a SHM_RDONLY attachment; EOPNOTSUPP
+/// for a file, as for a Linux filesystem without hole punching, like
+/// ramfs). The range is zapped and its hole recorded in `punch`.
+fn remove(
+    vma: &Vma,
+    pgd: u64,
+    start: u64,
+    end: u64,
+    punch: &mut Vec<Punch>,
+) -> Result<(), KernelError> {
+    if vma.is_locked() || (vma.file.is_none() && vma.shmem.is_none()) {
+        return Err(KernelError::InvalidArgument);
+    }
+    let maywrite = vma.is_shared()
+        && vma.file.as_ref().is_none_or(|f| f.is_writable())
+        && !vma.shm.as_ref().is_some_and(|a| a.rdonly());
+    if !maywrite {
+        return Err(KernelError::PermissionDenied);
+    }
+    if vma.file.is_some() {
+        return Err(KernelError::OperationNotSupported);
+    }
+    super::memory::zap_range(pgd, start, end);
+    if let Some(sh) = &vma.shmem {
+        let first = vma.offset + start - vma.start;
+        let last = vma.offset + end - vma.start;
+        punch.push((sh.clone(), first / PAGE_SIZE, last / PAGE_SIZE));
+    }
+    Ok(())
+}
+
+/// The VMA flags `advice` asks for (Linux madvise_vma_behavior)
+fn new_flags(vma: &Vma, advice: i32) -> Result<u32, KernelError> {
+    let f = vma.flags;
+    Ok(match advice {
+        MADV_NORMAL => f & !(VM_RAND_READ | VM_SEQ_READ),
+        MADV_RANDOM => (f & !VM_SEQ_READ) | VM_RAND_READ,
+        MADV_SEQUENTIAL => (f & !VM_RAND_READ) | VM_SEQ_READ,
+        MADV_DONTFORK => f | VM_DONTCOPY,
+        MADV_DOFORK => f & !VM_DONTCOPY,
+        MADV_DONTDUMP => f | VM_DONTDUMP,
+        MADV_DODUMP => f & !VM_DONTDUMP,
+        MADV_HUGEPAGE => (f & !VM_NOHUGEPAGE) | VM_HUGEPAGE,
+        MADV_NOHUGEPAGE => (f & !VM_HUGEPAGE) | VM_NOHUGEPAGE,
+        // Only private anonymous memory can be wiped on fork
+        MADV_WIPEONFORK if vma.file.is_some() || vma.is_shared() => {
+            return Err(KernelError::InvalidArgument);
+        }
+        MADV_WIPEONFORK => f | VM_WIPEONFORK,
+        MADV_KEEPONFORK => f & !VM_WIPEONFORK,
+        _ => f,
+    })
+}
+
+/// Give [start, end) of the VMA at `idx` the flags `flags` (Linux
+/// madvise_update_vma): nothing to do if they are its own, else it is
+/// split at the range edges and the part merged with its neighbours
+fn update_flags(
+    mm: &mut MmStruct,
+    idx: usize,
+    start: u64,
+    end: u64,
+    flags: u32,
+) -> Result<(), KernelError> {
+    if mm.get_vma(idx).is_some_and(|v| v.flags == flags) {
+        return Ok(());
+    }
+    mm.split_at(start);
+    mm.split_at(end);
+    let idx = mm.find_vma_exact(start).ok_or(KernelError::WouldBlock)?;
+    let vma = mm.get_vma_mut(idx).ok_or(KernelError::WouldBlock)?;
+    vma.flags = flags;
+    mm.merge_adjacent(idx);
+    Ok(())
+}

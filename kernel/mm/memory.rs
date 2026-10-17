@@ -95,8 +95,15 @@ pub(super) fn exit_mmap(mm: &Mm) {
 /// protnone included, or a swap slot) is cleared, and its TLB entry
 /// flushed before the page is released; a 2MB page wholly inside goes
 /// whole, one partly inside is split first. Empty tables are kept.
+/// Only user addresses: callers pass ranges inside VMAs, a range past
+/// TASK_SIZE is a bug (clamped).
 pub fn zap_range(pgd: u64, start: u64, end: u64) {
     const GB: u64 = 1 << 30;
+    debug_assert!(
+        start <= end && end <= super::TASK_SIZE,
+        "zap_range {start:#x}..{end:#x}"
+    );
+    let end = end.min(super::TASK_SIZE);
     let mut addr = start;
     while addr < end {
         let Some(pmd) = paging::pmd_ptr(pgd, addr) else {
