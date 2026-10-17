@@ -27,6 +27,18 @@ set -e
 # Shared network options
 . "$(dirname "$0")/tools/qemu-net.sh"
 
+# virtio-blk test disk (make disk-image), shared with
+# tools/linux-boot-tester.sh: snapshot=on, so every boot sees the
+# pristine image; two queues exercise blk-mq; modern-only like the NIC
+# (hk has no legacy virtio)
+QEMU_DISK=()
+if [ -f target/disk.img ]; then
+    QEMU_DISK=(
+        -drive file=target/disk.img,if=none,id=vd0,format=raw,snapshot=on
+        -device virtio-blk-pci,drive=vd0,num-queues=2,serial=hk0,disable-legacy=on
+    )
+fi
+
 # Default options
 ARCH="x86"
 DEBUG_MODE=false
@@ -153,6 +165,8 @@ setup_x86_config() {
         )
     fi
 
+    QEMU_ARGS+=("${QEMU_DISK[@]}")
+
     # Network: virtio-net (or NIC=e1000) on the shared slirp network
     # (tools/qemu-net.sh)
     qemu_net_args "${NIC:-virtio}"
@@ -215,6 +229,8 @@ setup_arm_config() {
             -device usb-storage,drive=usbdisk,bus=xhci.0
         )
     fi
+
+    QEMU_ARGS+=("${QEMU_DISK[@]}")
 
     # Network: virtio-net (or NIC=e1000) on the shared slirp network
     # (tools/qemu-net.sh)

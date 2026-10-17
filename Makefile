@@ -12,6 +12,9 @@ KERNEL_ARM = target/$(TARGET_ARM)/release/kernel
 VFAT_IMAGE = target/vfat.img
 VFAT_SIZE_KB = 1024
 
+# virtio-blk test disk (GPT: vfat, swap, pattern; tools/mkdisk.sh)
+DISK_IMAGE = target/disk.img
+
 # LOCKDEP=1: build with lockdep-lite (spin-lock tracking, lock order and
 # sleep-in-atomic reports as LOCKDEP:FAIL) and the VMA/PTE agreement
 # check (MMCHECK:FAIL), e.g. make check LOCKDEP=1
@@ -21,7 +24,7 @@ KERNEL_FEATURES = $(if $(LOCKDEP),--features lockdep)
 # Usage: make iso MACHINE=dell
 MACHINE ?=
 
-.PHONY: all build debug user iso iso-debug run run-debug test check clean info help vfat-image
+.PHONY: all build debug user iso iso-debug run run-debug test check clean info help vfat-image disk-image
 .PHONY: build-arm run-arm check-arm check-linux check-linux-arm user-arm clippy clippy-arm fmt list-machines
 
 # Default: build everything (kernel, user binaries, ISO)
@@ -43,6 +46,7 @@ help:
 	@echo "  make run-debug- Run debug kernel in QEMU (no reboot on crash)"
 	@echo ""
 	@echo "  make test     - Run cargo tests (host)"
+	@echo "  make disk-image - Build the virtio-blk test disk (target/disk.img)"
 	@echo "  make check    - Boot kernel in QEMU, verify tests pass"
 	@echo "  make check LOCKDEP=1 - Same with lockdep-lite (LOCKDEP:FAIL reports)"
 	@echo ""
@@ -78,6 +82,12 @@ vfat-image:
 	@mmd -i $(VFAT_IMAGE) ::TESTDIR
 	@echo "Nested file content" | mcopy -i $(VFAT_IMAGE) - ::TESTDIR/NESTED.TXT
 	@echo "Created $(VFAT_IMAGE) with test files"
+
+# Rebuilt when the script changes
+disk-image: $(DISK_IMAGE)
+
+$(DISK_IMAGE): tools/mkdisk.sh
+	@tools/mkdisk.sh $@
 
 iso: build user vfat-image
 	@mkdir -p target/iso/boot/grub
@@ -125,14 +135,14 @@ list-machines:
 		fi; \
 	done
 
-run: iso
+run: iso disk-image
 	@if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then \
 		echo "QEMU not found. Install with: sudo apt install qemu-system-x86"; \
 		exit 1; \
 	fi
 	./run-qemu.sh
 
-run-debug: iso-debug
+run-debug: iso-debug disk-image
 	@if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then \
 		echo "QEMU not found. Install with: sudo apt install qemu-system-x86"; \
 		exit 1; \
@@ -152,7 +162,7 @@ export QEMU_CPU
 # hk boot test NIC (see run-qemu.sh): virtio (default) or e1000
 export NIC
 
-check: iso
+check: iso disk-image
 	@rm -f /tmp/qemu_serial.log
 	@echo "Running boot test ($(BOOT_TEST_TIMEOUT) second timeout)..."
 	@./run-qemu.sh -t -T $(BOOT_TEST_TIMEOUT)
@@ -190,10 +200,10 @@ user-arm:
 build-arm: user-arm
 	cargo build -p hk-kernel --target $(TARGET_ARM) --release $(KERNEL_FEATURES)
 
-run-arm: build-arm vfat-image
+run-arm: build-arm vfat-image disk-image
 	./run-qemu.sh --arch arm
 
-check-arm: build-arm vfat-image
+check-arm: build-arm vfat-image disk-image
 	@rm -f /tmp/qemu_serial_arm.log
 	@echo "Running ARM boot test ($(BOOT_TEST_TIMEOUT) second timeout)..."
 	@./run-qemu.sh --arch arm -t -T $(BOOT_TEST_TIMEOUT)
@@ -214,11 +224,11 @@ check-arm: build-arm vfat-image
 
 # Differential test: boot_tester as init on a real Linux kernel (native arch)
 LINUX_TEST_TIMEOUT ?= 120
-check-linux:
+check-linux: disk-image
 	./tools/linux-boot-tester.sh -T $(LINUX_TEST_TIMEOUT)
 
 # Same, aarch64 Linux emulated on any host (for local iteration on x86)
-check-linux-arm:
+check-linux-arm: disk-image
 	./tools/linux-boot-tester.sh -a aarch64 -T $(LINUX_TEST_TIMEOUT)
 
 info-arm: build-arm

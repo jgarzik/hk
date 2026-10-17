@@ -9,6 +9,7 @@
 //! `ready()` (DRIVER_OK). Queues are split rings (`ring`) in coherent DMA
 //! memory, addressed only through the DMA API.
 
+pub mod blk;
 pub mod pci;
 pub mod ring;
 

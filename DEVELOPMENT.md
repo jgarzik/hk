@@ -13,8 +13,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # QEMU for x86-64 and aarch64 emulation
 sudo apt install qemu-system-x86 qemu-system-arm
 
-# Build tools for userspace and ISO creation
-sudo apt install build-essential cpio grub-pc-bin grub-common mtools xorriso
+# Build tools for userspace, the ISO and the test disk images
+sudo apt install build-essential cpio grub-pc-bin grub-common mtools xorriso dosfstools fdisk
 
 # Cross-compiler for aarch64 userspace
 sudo apt install gcc-aarch64-linux-gnu
@@ -96,6 +96,18 @@ with `tools/fetch-deb.sh` (apt for the native architecture, otherwise
 the Ubuntu archive/ports with the InRelease signature and hashes
 checked) and cached under `target/busybox/`; the first build needs
 network access and current apt lists (`sudo apt-get update`).
+
+The boot tests (hk and `make check-linux*`) attach `target/disk.img` as
+a virtio-blk disk (`-drive ...,snapshot=on`: every boot sees it
+pristine; modern-only device with two queues). `make disk-image` builds
+it rootless with `tools/mkdisk.sh` (sfdisk, mkfs.vfat, mcopy, mkswap,
+perl): 128 MiB GPT with vda1 32 MiB vfat (`HKDISK`, `HKDISK.TXT`), vda2
+64 MiB swap, vda3 16 MiB pattern (32-bit LE word i = i * 1103515245 +
+12345), the rest unallocated. The `check*` targets build it as needed.
+`make check-linux*` also checks that the Linux kernel has the drivers
+the tests need built in (`CONFIG_VIRTIO_BLK`, `EFI_PARTITION`,
+`DEVTMPFS`, `VFAT_FS`, `NLS_CODEPAGE_437` =y, from its linux-buildinfo
+package).
 
 ### Full Build + Test (Recommended)
 
@@ -244,6 +256,7 @@ After a full build:
 # x86-64
 target/x86_64-unknown-none/release/kernel    # Kernel binary (ELF)
 target/hk-x86_64.iso                         # Bootable ISO image
+target/disk.img                              # virtio-blk test disk (both arches)
 user/initramfs-x86_64.cpio                   # Userspace CPIO archive
 
 # aarch64

@@ -321,6 +321,20 @@ impl VirtioDevice {
         u16::from_le(unsafe { read_volatile(self.device.add(off as usize) as *const u16) })
     }
 
+    /// Device config le32 (0 if absent)
+    pub fn cfg32(&self, off: u32) -> u32 {
+        if off + 4 > self.device_len || off & 3 != 0 {
+            return 0;
+        }
+        u32::from_le(unsafe { read_volatile(self.device.add(off as usize) as *const u32) })
+    }
+
+    /// Device config le64 as two 32-bit reads, low first (spec 4.1.3.1;
+    /// wrap in `read_config` for a consistent value)
+    pub fn cfg64(&self, off: u32) -> u64 {
+        self.cfg32(off) as u64 | ((self.cfg32(off + 4) as u64) << 32)
+    }
+
     /// Set up queue `index` (spec 4.1.5.1.3); before `ready()`
     pub fn setup_vq(&self, index: u16) -> Result<Virtqueue, DriverError> {
         if index >= self.num_queues() {

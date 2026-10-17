@@ -53,6 +53,7 @@ if [ -z "${LINUX_KERNEL:-}" ]; then
     KVER=$(apt-cache depends linux-image-generic | grep -o 'linux-image-[0-9][^ ]*-generic' | head -1)
     KVER=${KVER#linux-image-}
     KDIR=target/linux-kernel/$DEB_ARCH/$KVER
+    PKGVER=$(apt-cache show "linux-image-$KVER" | sed -n 's/^Version: //p' | head -1)
     LINUX_KERNEL=$KDIR/boot/vmlinuz-$KVER
     if [ ! -f "$LINUX_KERNEL" ]; then
         echo "Fetching Linux $KVER ($DEB_ARCH)..."
@@ -61,13 +62,33 @@ if [ -z "${LINUX_KERNEL:-}" ]; then
             (cd "$KDIR" && apt-get download "linux-image-$KVER" >/dev/null)
         else
             # Foreign arch: same version from the ports archive (no multiarch needed)
-            PKGVER=$(apt-cache show "linux-image-$KVER" | sed -n 's/^Version: //p' | head -1)
             fetch_deb "linux-image-unsigned-$KVER" "$DEB_ARCH" "$KDIR/linux-image.deb" "$PKGVER"
         fi
         dpkg-deb -x "$KDIR"/linux-image*.deb "$KDIR"
     fi
 fi
 echo "Kernel: $LINUX_KERNEL"
+
+# The tests need these built in (no modules in the initramfs): check the
+# kernel's config from its linux-buildinfo package (small; fetched once)
+if [ -n "${KDIR:-}" ]; then
+    CONFIG=$KDIR/usr/lib/linux/$KVER/config
+    if [ ! -f "$CONFIG" ]; then
+        if $NATIVE; then
+            (cd "$KDIR" && apt-get download "linux-buildinfo-$KVER" >/dev/null)
+        else
+            fetch_deb "linux-buildinfo-$KVER" "$DEB_ARCH" "$KDIR/linux-buildinfo.deb" "$PKGVER"
+        fi
+        dpkg-deb -x "$KDIR"/linux-buildinfo*.deb "$KDIR"
+    fi
+    for opt in VIRTIO_BLK EFI_PARTITION DEVTMPFS VFAT_FS NLS_CODEPAGE_437; do
+        if ! grep -qx "CONFIG_$opt=y" "$CONFIG"; then
+            echo "Linux $KVER ($DEB_ARCH): CONFIG_$opt is not =y ($CONFIG);"
+            echo "the boot tests need it built in"
+            exit 1
+        fi
+    done
+fi
 
 # Initramfs: host build of boot_tester, same layout as user/Makefile
 # (busybox and /etc from tools/busybox-root.sh)
@@ -88,6 +109,13 @@ if [ -w /dev/kvm ] && $NATIVE && [ "$ARCH" = x86_64 ]; then
     QEMU_MACHINE=(-cpu host)
 fi
 
+# The virtio test disk, attached like run-qemu.sh does (make disk-image)
+DISK=()
+if [ -f target/disk.img ]; then
+    DISK=(-drive file=target/disk.img,if=none,id=vd0,format=raw,snapshot=on
+        -device virtio-blk-pci,drive=vd0,num-queues=2,serial=hk0,disable-legacy=on)
+fi
+
 # Network: same slirp network as hk (tools/qemu-net.sh); virtio-net is
 # built into Ubuntu's generic kernel (CONFIG_VIRTIO_NET=y, VIRTIO_PCI=y on
 # amd64 and arm64), so it comes up as eth0 without modules
@@ -97,7 +125,7 @@ qemu_net_args virtio
 echo "Booting boot_tester on Linux (${TIMEOUT}s timeout)..."
 rm -f "$SERIAL_LOG"
 timeout "$TIMEOUT" "$QEMU_BIN" "${KVM[@]}" "${QEMU_MACHINE[@]}" \
-    -m 512M -smp 4 -nographic -no-reboot -monitor none "${QEMU_NET[@]}" \
+    -m 512M -smp 4 -nographic -no-reboot -monitor none "${QEMU_NET[@]}" "${DISK[@]}" \
     -kernel "$LINUX_KERNEL" -initrd "$WORK/initramfs.cpio" \
     -append "console=$CONSOLE rdinit=/bin/init panic=-1 quiet" \
     -serial file:"$SERIAL_LOG" </dev/null || true

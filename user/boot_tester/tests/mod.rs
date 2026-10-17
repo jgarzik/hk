@@ -6,6 +6,7 @@ pub mod acct;
 pub mod adjtimex;
 pub mod append;
 pub mod bigio;
+pub mod blk;
 pub mod bpf;
 pub mod busybox;
 pub mod capabilities;
@@ -188,6 +189,7 @@ pub fn run_all_tests() {
     clone3_syslog::run_tests();
     pidfd::run_tests();
     swap::run_tests();
+    isolated(b"BLK", blk::run_tests);
     adjtimex::run_tests();
     io_uring::run_tests();
     tcp::run_tests();

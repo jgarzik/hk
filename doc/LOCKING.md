@@ -2105,7 +2105,8 @@ IRQ-safe.
 #### Block Device Subsystem
 
 **Location:** `kernel/storage/` (`blkdev.rs`, `blk_mq.rs`, `genhd.rs`,
-`part/`), `kernel/fs/devtmpfs.rs`, `kernel/completion.rs`
+`part/`), `kernel/virtio/blk.rs`, `kernel/fs/{blkdev_ops,devtmpfs}.rs`,
+`kernel/completion.rs`
 
 Linux model (block/bio.c, blk-mq.c, genhd.c): a bio is submitted from
 thread context, the driver completes it from its interrupt handler and
@@ -2141,10 +2142,10 @@ Rules:
   the devtmpfs root's `i_rwsem`. No path holding a directory `i_rwsem`
   takes `open_mutex` (a block device is opened after the path walk), so
   `open_mutex -> i_rwsem` cannot invert.
-- **Synchronous I/O sleeps:** `submit_bio_wait` and the `bdev_rw*`
-  helpers (vfat's block device pages, swap) are never called under a
-  spinlock. The page cache never writes a page back under `PAGE_CACHE`
-  (3.2 Page Cache): writepage sleeps on block I/O.
+- **No page cache in front of block devices yet:** device file I/O is
+  synchronous bios through bounce frames, never under a spinlock. The
+  page cache never writes a page back under `PAGE_CACHE` (3.2 Page
+  Cache): writepage sleeps on block I/O.
 
 #### Network Subsystem
 

@@ -326,6 +326,42 @@ atomics. No such workaround exists in this tree: since the first commit
 fields, and the USB vfat boot tests (both arches) pass on them. Kept
 only as a pointer if wrong USB slot/endpoint values ever show up again.
 
+## Block layer gaps (P1)
+
+**Location**: `kernel/storage/`, `kernel/virtio/blk.rs`,
+`kernel/fs/blkdev_ops.rs`, `kernel/fs/vfat.rs`
+
+- No page cache in front of block device files (P5): reads and writes
+  are synchronous bios. A filesystem's cached block device pages (vfat
+  keeps the FAT, directories and data of its partition in the global
+  page cache) are not coherent with I/O through the device node; Linux
+  shares one bdev mapping. Two writers of the same sector through
+  unaligned writes can lose one update (each reads, patches and writes
+  the sector without a page lock).
+- Partition tables are parsed in 512-byte sectors: on a disk with
+  larger logical blocks, GPT LBAs and MBR sector counts are misread
+  (Linux scales by the logical block size). MBR: no BSD, Solaris,
+  UnixWare, Minix, AIX or DM6 subpartitions. GPT: like Linux without
+  the `gpt` parameter, a bad primary header is not replaced by the
+  backup.
+- BLKRRPART is EBUSY while a partition is open, mounted or used for
+  swap (any holder of the partition besides the registry); Linux also
+  takes the whole disk for exclusive use during the scan
+  (bd_prepare_to_claim), so a rescan can race an exclusive opener.
+  BLKROSET, BLKDISCARD, BLKZEROOUT, BLKIOMIN/OPT, BLKALIGNOFF,
+  BLKSECTGET, HDIO_GETGEO and the BLKPG partition ioctls are ENOTTY.
+- virtio-blk: modern devices only (QEMU needs `disable-legacy=on`;
+  Linux also drives transitional devices), INTx only (no MSI-X),
+  capacity changes (config interrupts) are ignored, no DISCARD,
+  WRITE_ZEROES, GET_ID (serial) or secure erase. The disk's queues are
+  fixed at probe (no hot add/remove of virtio disks).
+- No /proc/devices block section, no /sys/block; the first disk
+  registered decides the dynamic major (254 down, like Linux, but Linux
+  usually has other dynamic majors registered first).
+- A mounted filesystem or active swap does not open its block device:
+  opening it O_EXCL, writes to a swap partition (Linux ETXTBSY) and
+  BLKBSZSET on a mounted partition are not refused.
+
 ## P0 review findings (open)
 
 Found by the review of the P0 series; each confirmed against the code
