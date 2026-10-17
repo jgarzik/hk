@@ -490,7 +490,10 @@ fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
     let (np, ndir, nname) = new;
     let src = lookup_one(op, oname)?;
     let sinode = src.get_inode().ok_or(KernelError::NotFound)?;
-    let dinode = lookup_one(np, nname).ok().and_then(|d| d.get_inode());
+    let dst = lookup_one(np, nname)
+        .ok()
+        .filter(|d| d.get_inode().is_some());
+    let dinode = dst.as_ref().and_then(|d| d.get_inode());
     let is_dir = sinode.mode().is_dir();
 
     // The target must exist for EXCHANGE and must not for NOREPLACE
@@ -502,9 +505,20 @@ fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
         return Err(KernelError::AlreadyExists);
     }
 
-    // Moving a directory into its own subtree
-    if is_dir && is_subdir(np, &src) {
+    // lock_rename's trap (Linux __start_renaming): the source may not
+    // be an ancestor of the new parent (moving a directory into its own
+    // subtree), nor the target one of the old parent (an exchange would
+    // move it under itself; a plain rename would replace a non-empty
+    // ancestor). Both would cut a cycle out of the tree.
+    if is_subdir(np, &src) {
         return Err(KernelError::InvalidArgument);
+    }
+    if dst.as_ref().is_some_and(|d| is_subdir(op, d)) {
+        return Err(if flags & RENAME_EXCHANGE != 0 {
+            KernelError::InvalidArgument
+        } else {
+            KernelError::DirectoryNotEmpty
+        });
     }
     // Same inode: nothing to do (vfs_rename "source == target")
     if dinode.as_ref().is_some_and(|d| d.ino == sinode.ino) {

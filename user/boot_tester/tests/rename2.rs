@@ -2,7 +2,9 @@
 //! simple_rename), on a fresh ramfs on both kernels: unknown flags and
 //! bad combinations are EINVAL before the paths are read; NOREPLACE is
 //! EEXIST on an existing target; EXCHANGE swaps two names and is ENOENT
-//! without a target; ramfs makes no whiteouts (EINVAL). On arm64,
+//! without a target; ramfs makes no whiteouts (EINVAL); no rename or
+//! exchange may move a directory under itself (EINVAL, or ENOTEMPTY for
+//! a plain rename onto an ancestor). On arm64,
 //! renameat (38) stays wired, as in Linux (arm64 keeps it).
 
 use super::helpers::{print, print_num, println};
@@ -17,6 +19,7 @@ const WHITEOUT: u32 = 1 << 2;
 const EINVAL: i64 = -22;
 const EEXIST: i64 = -17;
 const ENOENT: i64 = -2;
+const ENOTEMPTY: i64 = -39;
 
 const DIR: &[u8] = b"/tmp/rn2\0";
 const A: &[u8] = b"/tmp/rn2/a\0";
@@ -45,6 +48,8 @@ pub fn run_tests() {
     for p in [A, B, C] {
         sys_unlink(p.as_ptr());
     }
+    trap();
+    exchange_dirs();
     sys_umount2(DIR.as_ptr(), 0);
     sys_rmdir(DIR.as_ptr());
 }
@@ -120,4 +125,57 @@ fn whiteout() {
     let r = rn(B, A, WHITEOUT);
     let ok = r == EINVAL && ino(B) > 0 && ino(A) == ENOENT;
     verdict(b"RENAME2_WHITEOUT", ok, r);
+}
+
+const T: [&[u8]; 4] = [
+    b"/tmp/rn2/t\0",
+    b"/tmp/rn2/t/a\0",
+    b"/tmp/rn2/t/a/b\0",
+    b"/tmp/rn2/t/a/b/c\0",
+];
+
+/// Exchanges and renames that would move a directory under itself are
+/// refused and leave the tree as it was
+fn trap() {
+    for d in T {
+        sys_mkdir(d.as_ptr(), 0o755);
+    }
+    let before = T.map(ino);
+    let (a, c) = (T[1], T[3]);
+    let r = [rn(c, a, EXCHANGE), rn(a, c, EXCHANGE), rn(c, a, 0), rn(a, c, 0)];
+    let want = [EINVAL, EINVAL, ENOTEMPTY, EINVAL];
+    let parent_ok = ino(b"/tmp/rn2/t/a/b/c/..\0") == before[2]
+        && ino(b"/tmp/rn2/t/a/b/..\0") == before[1];
+    let intact = T.map(ino) == before && parent_ok;
+    let bad = (0..4).find(|&i| r[i] != want[i]);
+    let got = bad.map_or(if intact { 0 } else { 99 }, |i| r[i] * 10 - i as i64);
+    verdict(b"RENAME2_TRAP", bad.is_none() && intact, got);
+    for d in T.iter().rev() {
+        sys_rmdir(d.as_ptr());
+    }
+}
+
+/// Two directories in different parents trade places; each one's ".."
+/// is its new parent
+fn exchange_dirs() {
+    let dirs: [&[u8]; 4] = [
+        b"/tmp/rn2/p1\0",
+        b"/tmp/rn2/p2\0",
+        b"/tmp/rn2/p1/d\0",
+        b"/tmp/rn2/p2/e\0",
+    ];
+    for d in dirs {
+        sys_mkdir(d.as_ptr(), 0o755);
+    }
+    let before = dirs.map(ino);
+    let r = rn(dirs[2], dirs[3], EXCHANGE);
+    let ok = r == 0
+        && ino(dirs[2]) == before[3]
+        && ino(dirs[3]) == before[2]
+        && ino(b"/tmp/rn2/p1/d/..\0") == before[0]
+        && ino(b"/tmp/rn2/p2/e/..\0") == before[1];
+    verdict(b"RENAME2_EXCHANGE_DIRS", ok, r);
+    for d in dirs.iter().rev() {
+        sys_rmdir(d.as_ptr());
+    }
 }
