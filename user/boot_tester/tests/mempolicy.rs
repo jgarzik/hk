@@ -57,13 +57,7 @@ fn test_get_mempolicy_default() {
     print(b"  get_mempolicy default: ");
 
     let mut policy: i32 = -1;
-    let ret = sys_get_mempolicy(
-        &mut policy as *mut i32,
-        core::ptr::null_mut(),
-        0,
-        0,
-        0,
-    );
+    let ret = sys_get_mempolicy(&mut policy as *mut i32, core::ptr::null_mut(), 0, 0, 0);
 
     if ret == 0 && (policy == MPOL_DEFAULT || policy == MPOL_LOCAL) {
         println(b"PASS");
@@ -315,14 +309,7 @@ fn test_move_pages_node0() {
     let nodes: [i32; 1] = [0]; // Node 0
     let mut status: [i32; 1] = [-1];
 
-    let ret = sys_move_pages(
-        0,
-        1,
-        pages.as_ptr(),
-        nodes.as_ptr(),
-        status.as_mut_ptr(),
-        0,
-    );
+    let ret = sys_move_pages(0, 1, pages.as_ptr(), nodes.as_ptr(), status.as_mut_ptr(), 0);
 
     sys_munmap(ptr as u64, 4096);
 
@@ -362,14 +349,7 @@ fn test_move_pages_invalid_node() {
     let nodes: [i32; 1] = [1]; // Node 1 doesn't exist
     let mut status: [i32; 1] = [0];
 
-    let ret = sys_move_pages(
-        0,
-        1,
-        pages.as_ptr(),
-        nodes.as_ptr(),
-        status.as_mut_ptr(),
-        0,
-    );
+    let ret = sys_move_pages(0, 1, pages.as_ptr(), nodes.as_ptr(), status.as_mut_ptr(), 0);
 
     sys_munmap(ptr as u64, 4096);
 

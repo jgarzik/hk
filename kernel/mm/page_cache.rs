@@ -1158,7 +1158,8 @@ impl PageCache {
     }
 
     /// Free the frames of pages taken out of an unevictable address space
-    /// (they are not on the FIFO)
+    /// (they are not on the FIFO): the cache's reference is dropped, a
+    /// MAP_SHARED mapping of the page keeps its own
     fn free_unevictable<FA: FrameAlloc<PhysAddr = u64>>(
         &self,
         space: &AddressSpace,
@@ -1167,7 +1168,7 @@ impl PageCache {
     ) -> usize {
         let n = pages.len();
         for p in pages {
-            frame_alloc.free_frame(p.frame);
+            frame_alloc.put_frame(p.frame);
         }
         self.account(Some(space), n, false);
         n

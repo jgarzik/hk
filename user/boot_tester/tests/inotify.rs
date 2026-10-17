@@ -7,8 +7,8 @@
 //! - Test inotify close
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{sys_close, sys_inotify_init1, sys_inotify_add_watch, sys_inotify_rm_watch};
-use hk_syscall::{IN_CLOEXEC, IN_NONBLOCK, IN_CREATE, IN_DELETE, IN_MODIFY};
+use hk_syscall::{IN_CLOEXEC, IN_CREATE, IN_DELETE, IN_MODIFY, IN_NONBLOCK};
+use hk_syscall::{sys_close, sys_inotify_add_watch, sys_inotify_init1, sys_inotify_rm_watch};
 
 /// Run all inotify tests
 pub fn run_tests() {

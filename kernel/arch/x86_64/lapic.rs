@@ -6,7 +6,7 @@
 //! - Send Inter-Processor Interrupts (IPIs)
 //! - Handle the APIC timer
 
-use ::core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 // LAPIC register offsets (from base address)
 const LAPIC_ID: u32 = 0x020; // Local APIC ID
@@ -55,6 +55,10 @@ const TIMER_DIV_16: u32 = 0x3;
 /// Global LAPIC base address (set during initialization)
 static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 
+/// The LAPICs run in x2APIC mode (IA32_APIC_BASE.EXTD, as firmware left
+/// them; the same on every CPU): IPIs go through the ICR MSR
+static X2APIC: AtomicBool = AtomicBool::new(false);
+
 /// Calibrated LAPIC timer ticks per millisecond (set by BSP, copied by APs)
 static LAPIC_TICKS_PER_MS: AtomicU32 = AtomicU32::new(0);
 
@@ -70,6 +74,10 @@ impl LocalApic {
     /// The base address must be a valid, mapped LAPIC MMIO region.
     pub unsafe fn new(base: u64) -> Self {
         LAPIC_BASE.store(base, Ordering::SeqCst);
+        X2APIC.store(
+            rdmsr(IA32_APIC_BASE) & APIC_BASE_EXTD != 0,
+            Ordering::Relaxed,
+        );
         Self { base }
     }
 
@@ -259,6 +267,54 @@ impl LocalApic {
         // Note: We used divider 16, so actual frequency is base_freq / 16
         elapsed / CALIBRATION_MS
     }
+}
+
+/// IA32_APIC_BASE MSR and its x2APIC-enable bit
+const IA32_APIC_BASE: u32 = 0x1b;
+const APIC_BASE_EXTD: u64 = 1 << 10;
+/// x2APIC ICR MSR
+const X2APIC_ICR: u32 = 0x830;
+
+fn rdmsr(msr: u32) -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: reads an architectural MSR
+    unsafe {
+        core::arch::asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nostack))
+    };
+    ((hi as u64) << 32) | lo as u64
+}
+
+/// Send the fixed IPI `vector` to the CPU with APIC id `apic_id`
+/// (physical destination; Linux __default_send_IPI_dest_field,
+/// x2apic_send_IPI). Any context: the ICR is written with interrupts
+/// off, so an interrupt handler's IPI cannot interleave with ours.
+pub fn send_ipi(apic_id: u32, vector: u8) {
+    let irq = super::spinlock::local_irq_save();
+    if X2APIC.load(Ordering::Relaxed) {
+        // WRMSR to the ICR is not serializing: earlier stores (the
+        // queued call) first (Linux weak_wrmsr_fence)
+        let icr = ((apic_id as u64) << 32) | vector as u64;
+        // SAFETY: writes the x2APIC ICR
+        unsafe {
+            core::arch::asm!(
+                "mfence",
+                "lfence",
+                "wrmsr",
+                in("ecx") X2APIC_ICR,
+                in("eax") icr as u32,
+                in("edx") (icr >> 32) as u32,
+                options(nostack)
+            )
+        };
+    } else {
+        let lapic = LocalApic::get();
+        // The previous IPI must have left (Linux __xapic_wait_icr_idle);
+        // MMIO stores keep program order with the queue store
+        lapic.wait_for_ipi();
+        lapic.write(LAPIC_ICR_HIGH, apic_id << 24);
+        lapic.write(LAPIC_ICR_LOW, ICR_DEST_FIELD | vector as u32);
+    }
+    super::spinlock::local_irq_restore(irq);
 }
 
 /// Global function to send EOI (for use from interrupt handlers)

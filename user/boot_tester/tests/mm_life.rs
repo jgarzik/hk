@@ -3,11 +3,11 @@
 
 use super::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
-    sys_clone, sys_close, sys_execve, sys_exit, sys_fork, sys_kill, sys_mincore, sys_mmap,
+    CLONE_SIGHAND, CLONE_VM, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE,
+    O_RDONLY, P_PID, PROT_NONE, PROT_READ, PROT_WRITE, SigInfo, Timespec, WEXITED, sys_clone,
+    sys_close, sys_execve, sys_exit, sys_fork, sys_kill, sys_mincore, sys_mmap, sys_mprotect,
     sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pread64, sys_read, sys_sched_yield,
-    sys_vfork, sys_wait4, sys_waitid, SigInfo, Timespec, CLONE_SIGHAND, CLONE_VM, MAP_ANONYMOUS,
-    MAP_FIXED, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE, O_RDONLY, PROT_READ, PROT_WRITE, P_PID,
-    WEXITED,
+    sys_vfork, sys_wait4, sys_waitid,
 };
 
 const CLONE_THREAD: u64 = 0x0001_0000;
@@ -27,6 +27,8 @@ pub fn run_tests() {
     leak(b"MM_LIFE_THREADS", 500, thread);
     leak(b"MM_LIFE_MMAP_CYCLE", 1000, mmap_cycle);
     leak(b"MM_LIFE_EXEC_CHAIN", 10, exec_chain);
+    leak(b"MM_LIFE_PROTNONE_MUNMAP", 200, protnone_munmap);
+    leak(b"MM_LIFE_PROTNONE_EXIT", 200, protnone_exit);
     maps_after_exit();
     munmap_partial();
     map_fixed_replace();
@@ -161,7 +163,10 @@ fn leak(name: &[u8], n: u32, f: fn() -> bool) {
 
 /// Let exited tasks' CPUs switch away (their stacks are freed then)
 fn settle() {
-    let ts = Timespec { tv_sec: 0, tv_nsec: 20_000_000 };
+    let ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 20_000_000,
+    };
     sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
@@ -171,11 +176,52 @@ fn reap_ok(pid: i64) -> bool {
     pid > 0 && sys_wait4(pid, &mut st, 0, 0) == pid && st == 0
 }
 
+/// 64 pages written, then made PROT_NONE: their address
+fn protnone_pages() -> Option<u64> {
+    let len = 64 * PAGE;
+    let p = sys_mmap(
+        0,
+        len,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if p < 0 {
+        return None;
+    }
+    for a in (p as u64..p as u64 + len).step_by(PAGE as usize) {
+        unsafe { core::ptr::write_volatile(a as *mut u8, 1) };
+    }
+    (sys_mprotect(p as u64, len, PROT_NONE) == 0).then_some(p as u64)
+}
+
+/// munmap of a PROT_NONE range gives its pages back
+fn protnone_munmap() -> bool {
+    protnone_pages().is_some_and(|p| sys_munmap(p, 64 * PAGE) == 0)
+}
+
+/// So does exit
+fn protnone_exit() -> bool {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(if protnone_pages().is_some() { 0 } else { 1 });
+    }
+    reap_ok(pid)
+}
+
 /// A child that touches some memory (stack, a fresh page) and exits
 fn fork_exit() -> bool {
     let pid = sys_fork();
     if pid == 0 {
-        let p = sys_mmap(0, 8 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        let p = sys_mmap(
+            0,
+            8 * PAGE,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        );
         if p > 0 {
             unsafe { core::ptr::write_volatile(p as *mut u8, 1) };
         }
@@ -264,7 +310,14 @@ fn thread() -> bool {
 /// 2MB anonymous mapping, every page touched, unmapped
 fn mmap_cycle() -> bool {
     let len = 2 << 20;
-    let p = sys_mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let p = sys_mmap(
+        0,
+        len,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if p <= 0 {
         return false;
     }
@@ -282,7 +335,10 @@ fn maps_after_exit() {
     const ESRCH: i64 = -3;
     let pid = sys_fork();
     if pid == 0 {
-        let ts = Timespec { tv_sec: 30, tv_nsec: 0 };
+        let ts = Timespec {
+            tv_sec: 30,
+            tv_nsec: 0,
+        };
         sys_nanosleep(&ts, core::ptr::null_mut());
         sys_exit(0);
     }
@@ -334,7 +390,14 @@ fn proc_path(pid: i64, name: &[u8]) -> [u8; 48] {
 /// munmap of the second page of two keeps the first mapped, with its
 /// data (Linux splits the VMA): mincore 0 on it, ENOMEM on the hole
 fn munmap_partial() {
-    let p = sys_mmap(0, 2 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let p = sys_mmap(
+        0,
+        2 * PAGE,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if p <= 0 {
         report(b"MM_LIFE_MUNMAP_PARTIAL", false, p);
         return;
@@ -370,7 +433,14 @@ fn map_fixed_replace() {
         return;
     }
     unsafe { core::ptr::write_volatile(p as *mut u8, 0xaa) };
-    let q = sys_mmap(p as u64, PAGE, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    let q = sys_mmap(
+        p as u64,
+        PAGE,
+        prot,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+        -1,
+        0,
+    );
     let v = unsafe { core::ptr::read_volatile(p as *const u8) };
     sys_munmap(p as u64, PAGE);
     report(b"MM_LIFE_MAP_FIXED_REPLACE", q == p && v == 0, v as i64);
@@ -391,7 +461,13 @@ fn mremap_fixed_replace() {
         core::ptr::write_volatile(a as *mut u8, 0x11);
         core::ptr::write_volatile(b as *mut u8, 0x22);
     }
-    let r = sys_mremap(a as u64, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, b as u64);
+    let r = sys_mremap(
+        a as u64,
+        PAGE,
+        PAGE,
+        MREMAP_MAYMOVE | MREMAP_FIXED,
+        b as u64,
+    );
     let v = unsafe { core::ptr::read_volatile(b as *const u8) };
     let mut vec = [0u8; 1];
     let hole = sys_mincore(a as u64, PAGE, vec.as_mut_ptr());

@@ -303,7 +303,7 @@ pub extern "C" fn ap_entry(_cpu_id: u32, apic_id: u32) -> ! {
     super::fpu::init_cpu(false);
 
     // Initialize per-CPU data for this AP
-    let _cpu_id = percpu::init_ap(apic_id as u8, kernel_stack);
+    let cpu_id = percpu::init_ap(apic_id as u8, kernel_stack);
 
     // Enable local APIC for this AP
     let lapic = super::lapic::LocalApic::get();
@@ -325,6 +325,9 @@ pub extern "C" fn ap_entry(_cpu_id: u32, apic_id: u32) -> ! {
 
     // Enable interrupts so timer can fire
     super::interrupts::enable();
+
+    // From now on this CPU answers IPIs
+    crate::smp::set_active(cpu_id);
 
     // Enter idle loop
     ap_idle_loop()

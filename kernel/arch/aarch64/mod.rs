@@ -13,6 +13,7 @@ pub mod dtb;
 pub mod exceptions;
 pub mod gic;
 pub mod ioremap;
+pub mod ipi;
 pub mod irq;
 pub mod kmap;
 pub mod paging;
@@ -27,6 +28,7 @@ pub mod smp;
 pub mod spinlock;
 pub mod syscall;
 pub mod timer;
+pub mod tlb;
 pub mod uaccess;
 pub mod uapi;
 
@@ -411,16 +413,11 @@ impl ArchBusOps for Aarch64Arch {
 // ============================================================================
 
 impl UserModeOps for Aarch64Arch {
-    unsafe fn jump_to_user(
-        entry: u64,
-        user_stack: u64,
-        page_table_root: u64,
-        kernel_stack: u64,
-    ) -> ! {
-        // Switch to user page table and enter user mode via ERET
+    unsafe fn jump_to_user(entry: u64, user_stack: u64, kernel_stack: u64) -> ! {
+        // Enter user mode via ERET (the task's TTBR0 is loaded:
+        // mm::tlb::switch_mm)
         //
         // This sets up the CPU state to return to EL0 (user mode):
-        // - TTBR0_EL1: User page table (lower VA space, 0x0000_xxxx_xxxx_xxxx)
         // - SP_EL0: User stack pointer
         // - ELR_EL1: Entry point (return address for ERET)
         // - SPSR_EL1: Saved processor state - EL0t with interrupts enabled
@@ -440,25 +437,8 @@ impl UserModeOps for Aarch64Arch {
 
         unsafe {
             asm!(
-                // Switch to user page table
-                // TTBR0_EL1 holds the page table for user space (lower addresses)
-                "msr ttbr0_el1, {page_table}",
-                // Invalidate TLB entries for this ASID
-                "tlbi vmalle1is",
-                // Invalidate instruction cache - critical for newly loaded ELF code
-                // ARM64 I-cache is not coherent with D-cache, so after kernel writes
-                // to frames (which go to D-cache), the I-cache may have stale data.
-                // This matches Linux's behavior in arch/arm64/mm/context.c
-                "ic iallu",
-                // Full system data synchronization barrier to ensure:
-                // 1. TLB flush completes
-                // 2. I-cache invalidation completes
-                // 3. All prior memory writes (cache cleans) are visible
-                // Using DSB SY (full system) rather than DSB ISH (inner shareable)
-                // to ensure maximum visibility of ELF data to user mode.
-                "dsb sy",
-                // Instruction synchronization barrier
-                "isb",
+                // The image's code was synced to the instruction caches
+                // when exec loaded it (paging::sync_page)
 
                 // Set up user stack pointer (SP_EL0)
                 "msr sp_el0, {user_stack}",
@@ -550,7 +530,6 @@ impl UserModeOps for Aarch64Arch {
                 // Return to user mode
                 "eret",
 
-                page_table = in(reg) page_table_root,
                 user_stack = in(reg) user_stack,
                 kernel_stack = in(reg) kernel_stack,
                 entry = in(reg) entry,
@@ -719,22 +698,20 @@ impl ContextOps for Aarch64Arch {
         old_ctx: *mut Self::TaskContext,
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        new_page_table_root: u64,
         next_tid: Tid,
     ) {
         unsafe {
-            context::context_switch(old_ctx, new_ctx, new_kstack, new_page_table_root, next_tid);
+            context::context_switch(old_ctx, new_ctx, new_kstack, next_tid);
         }
     }
 
     unsafe fn context_switch_first(
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        new_page_table_root: u64,
         next_tid: Tid,
     ) -> ! {
         unsafe {
-            context::context_switch_first(new_ctx, new_kstack, new_page_table_root, next_tid);
+            context::context_switch_first(new_ctx, new_kstack, next_tid);
         }
     }
 }
@@ -827,6 +804,8 @@ impl ExceptionOps for Aarch64Arch {
     fn init_exceptions() {
         // Install exception vectors early
         exceptions::init();
+        // ASID width and TLB tagging of the boot CPU
+        tlb::init_cpu();
         // Initialize GIC (distributor + redistributor + CPU interface)
         gic::init();
     }

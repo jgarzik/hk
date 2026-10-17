@@ -13,6 +13,26 @@
 #[cfg(not(feature = "lockdep"))]
 pub use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+/// Lock `m`, running `wait` between attempts: a lock that may be waited
+/// for with interrupts off and held across a cross-CPU call answers
+/// this CPU's calls while it spins (`Mm::lock`)
+#[cfg(not(feature = "lockdep"))]
+pub fn lock_with<T: ?Sized>(m: &Mutex<T>, mut wait: impl FnMut()) -> MutexGuard<'_, T> {
+    loop {
+        if let Some(g) = m.try_lock() {
+            return g;
+        }
+        wait();
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(feature = "lockdep")]
+#[track_caller]
+pub fn lock_with<T: ?Sized>(m: &Mutex<T>, wait: impl FnMut()) -> MutexGuard<'_, T> {
+    m.lock_with(wait)
+}
+
 #[cfg(feature = "lockdep")]
 pub use tracked::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -61,6 +81,20 @@ mod tracked {
             MutexGuard {
                 id: self.id(),
                 g: self.inner.lock(),
+            }
+        }
+
+        /// `lock`, running `wait` between attempts (order checked as for
+        /// `lock`)
+        #[track_caller]
+        pub fn lock_with(&self, mut wait: impl FnMut()) -> MutexGuard<'_, T> {
+            lockdep::acquire(self.id(), self.class, Location::caller(), true);
+            loop {
+                if let Some(g) = self.inner.try_lock() {
+                    return MutexGuard { id: self.id(), g };
+                }
+                wait();
+                core::hint::spin_loop();
             }
         }
 

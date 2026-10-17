@@ -149,7 +149,37 @@ unsafe fn init_redistributor() {
         for i in 0..8 {
             write32(base + GICR_IPRIORITYR + (i * 4), 0x8080_8080);
         }
+
+        // The IPI SGIs (ipi.rs)
+        write32(
+            base + GICR_ISENABLER0,
+            (1 << super::ipi::SGI_RESCHEDULE) | (1 << super::ipi::SGI_CALL_FUNCTION),
+        );
     }
+}
+
+/// Send SGI `intid` to the CPU with affinity `mpidr` (ICC_SGI1R_EL1,
+/// Linux gic_send_sgi). Any context.
+pub fn send_sgi(mpidr: u64, intid: u32) {
+    let aff = |n: u32| (mpidr >> (n * 8 + if n == 3 { 8 } else { 0 })) & 0xff;
+    let aff0 = aff(0);
+    let val = (aff(3) << 48)
+        | (aff(2) << 32)
+        | ((intid as u64 & 0xf) << 24)
+        | (aff(1) << 16)
+        | ((aff0 >> 4) << 44)
+        | (1 << (aff0 & 0xf));
+    // SAFETY: earlier stores (the queued call) are visible to the
+    // target before the SGI (Linux gic_ipi_send_mask: dsb ishst)
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "msr icc_sgi1r_el1, {}",
+            "isb",
+            in(reg) val,
+            options(nostack)
+        )
+    };
 }
 
 /// Initialize the GIC distributor (CPU 0 only)

@@ -6,13 +6,13 @@
 //! on eth0 without an IP address (what busybox udhcpc does).
 
 use hk_syscall::{
-    sys_bind, sys_exit, sys_fork, sys_getpeername, sys_getsockname, sys_getsockopt, sys_ioctl,
-    sys_recvfrom, sys_sendto, sys_setresuid, sys_setsockopt, sys_shutdown, sys_socket, sys_wait4,
-    AF_INET, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM,
+    AF_INET, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, sys_bind, sys_exit, sys_fork, sys_getpeername,
+    sys_getsockname, sys_getsockopt, sys_ioctl, sys_recvfrom, sys_sendto, sys_setresuid,
+    sys_setsockopt, sys_shutdown, sys_socket, sys_wait4,
 };
 
 use super::helpers::{println, skip};
-use super::nl::{addr as nl_addr, msleep, net_setup_eth0, Nl};
+use super::nl::{Nl, addr as nl_addr, msleep, net_setup_eth0};
 use super::sk::*;
 
 const AF_PACKET: i32 = 17;
@@ -78,7 +78,11 @@ struct Sll {
 
 impl Sll {
     fn new(protocol: u16, ifindex: i32) -> Self {
-        Self { protocol, ifindex, ..Default::default() }
+        Self {
+            protocol,
+            ifindex,
+            ..Default::default()
+        }
     }
 
     fn bytes(&self) -> [u8; 20] {
@@ -155,12 +159,24 @@ fn recv_ll(fd: i32, buf: &mut [u8], ms: i32, flags: i32) -> (i64, Sll) {
     }
     let mut a = [0u8; 20];
     let mut len = 20u32;
-    let n = sys_recvfrom(fd, buf.as_mut_ptr(), buf.len(), flags | MSG_DONTWAIT, a.as_mut_ptr(), &mut len);
+    let n = sys_recvfrom(
+        fd,
+        buf.as_mut_ptr(),
+        buf.len(),
+        flags | MSG_DONTWAIT,
+        a.as_mut_ptr(),
+        &mut len,
+    );
     (n, Sll::parse(&a))
 }
 
 /// The next frame within `ms` for which `pred(frame, sll)` holds
-fn find(fd: i32, buf: &mut [u8], ms: u64, pred: &dyn Fn(&[u8], &Sll) -> bool) -> Option<(usize, Sll)> {
+fn find(
+    fd: i32,
+    buf: &mut [u8],
+    ms: u64,
+    pred: &dyn Fn(&[u8], &Sll) -> bool,
+) -> Option<(usize, Sll)> {
     let end = now_ms() + ms;
     while now_ms() < end {
         let (n, a) = recv_ll(fd, buf, 200, 0);
@@ -183,12 +199,24 @@ fn test_frame(out: &mut [u8], tag: u8, len: usize) -> &[u8] {
 /// Creation: EPERM without CAP_NET_RAW, ESOCKTNOSUPPORT for stream
 fn test_create() {
     let mut t = T::new(b"PACKET_CREATE");
-    t.eq(b"stream", psock(SOCK_STREAM, ETH_P_ALL) as i64, ESOCKTNOSUPPORT);
+    t.eq(
+        b"stream",
+        psock(SOCK_STREAM, ETH_P_ALL) as i64,
+        ESOCKTNOSUPPORT,
+    );
     for ty in [SOCK_RAW, SOCK_DGRAM] {
         let fd = psock(ty, ETH_P_ALL);
         t.ok(b"create", fd >= 0, fd as i64);
-        t.eq(b"SO_DOMAIN", getint(fd, SOL_SOCKET, SO_DOMAIN).1 as i64, AF_PACKET as i64);
-        t.eq(b"SO_TYPE", getint(fd, SOL_SOCKET, SO_TYPE).1 as i64, ty as i64);
+        t.eq(
+            b"SO_DOMAIN",
+            getint(fd, SOL_SOCKET, SO_DOMAIN).1 as i64,
+            AF_PACKET as i64,
+        );
+        t.eq(
+            b"SO_TYPE",
+            getint(fd, SOL_SOCKET, SO_TYPE).1 as i64,
+            ty as i64,
+        );
         close(fd);
     }
     let pid = sys_fork();
@@ -196,7 +224,11 @@ fn test_create() {
         if sys_setresuid(65534, 65534, 65534) != 0 {
             sys_exit(90);
         }
-        sys_exit(if psock(SOCK_RAW, ETH_P_ALL) as i64 == EPERM { 0 } else { 1 });
+        sys_exit(if psock(SOCK_RAW, ETH_P_ALL) as i64 == EPERM {
+            0
+        } else {
+            1
+        });
     }
     let mut st = 0;
     sys_wait4(pid, &mut st, 0, 0);
@@ -223,7 +255,11 @@ fn test_name(lo: i32) {
     t.eq(b"halen", a.halen as i64, 6);
     let mut b = [0u8; 20];
     let mut l = 20u32;
-    t.eq(b"getpeername", sys_getpeername(fd, b.as_mut_ptr(), &mut l), EOPNOTSUPP);
+    t.eq(
+        b"getpeername",
+        sys_getpeername(fd, b.as_mut_ptr(), &mut l),
+        EOPNOTSUPP,
+    );
     t.eq(b"shutdown", sys_shutdown(fd, 2), EOPNOTSUPP);
     close(fd);
     t.done();
@@ -243,8 +279,16 @@ fn test_bind_errors() {
     let mut f = [0u8; 64];
     let frame = test_frame(&mut f, 0, 60);
     t.eq(b"send unbound", send(fd, frame, 0), ENXIO);
-    t.eq(b"send short addr", sendto_ll(fd, frame, &Sll::new(ETH_P_TEST, 1), 10), EINVAL);
-    t.eq(b"send no device", sendto_ll(fd, frame, &Sll::new(ETH_P_TEST, 9999), 20), ENXIO);
+    t.eq(
+        b"send short addr",
+        sendto_ll(fd, frame, &Sll::new(ETH_P_TEST, 1), 10),
+        EINVAL,
+    );
+    t.eq(
+        b"send no device",
+        sendto_ll(fd, frame, &Sll::new(ETH_P_TEST, 9999), 20),
+        ENXIO,
+    );
     close(fd);
     t.done();
 }
@@ -298,7 +342,8 @@ fn test_lo_dgram(lo: i32) {
     let (u, port) = udp_lo();
     send_to(u, b"dgram", LO, port, 0);
     let mut buf = [0u8; 256];
-    let is_ours = |f: &[u8], _: &Sll| f.len() >= 33 && f[0] == 0x45 && f[22..24] == port.to_be_bytes();
+    let is_ours =
+        |f: &[u8], _: &Sll| f.len() >= 33 && f[0] == 0x45 && f[22..24] == port.to_be_bytes();
     match find(fd, &mut buf, 3000, &is_ours) {
         Some((n, a)) => {
             t.eq(b"len", n as i64, 33);
@@ -311,7 +356,11 @@ fn test_lo_dgram(lo: i32) {
         }
     }
     // Exactly one copy: no PACKET_OUTGOING for a specific protocol
-    t.ok(b"single copy", find(fd, &mut buf, 300, &is_ours).is_none(), 0);
+    t.ok(
+        b"single copy",
+        find(fd, &mut buf, 300, &is_ours).is_none(),
+        0,
+    );
     close(u);
     close(fd);
     t.done();
@@ -329,7 +378,11 @@ fn test_send(lo: i32) {
     let frame = test_frame(&mut f, 0x51, 60);
     t.eq(b"raw send", send(tx, frame, 0), 60);
     let mut buf = [0u8; 128];
-    let tagged = |tag: u8| move |f: &[u8], _: &Sll| f.len() >= 15 && f[12..14] == ETH_P_TEST.to_be_bytes() && f[14] == tag;
+    let tagged = |tag: u8| {
+        move |f: &[u8], _: &Sll| {
+            f.len() >= 15 && f[12..14] == ETH_P_TEST.to_be_bytes() && f[14] == tag
+        }
+    };
     match find(rx, &mut buf, 3000, &tagged(0x51)) {
         Some((n, a)) => {
             t.eq(b"raw len", n as i64, 60);
@@ -341,9 +394,17 @@ fn test_send(lo: i32) {
         }
     }
     let seen = find(all, &mut buf, 3000, &tagged(0x51)).map(|(_, a)| a.pkttype);
-    t.eq(b"other socket outgoing", seen.unwrap_or(99) as i64, PACKET_OUTGOING as i64);
+    t.eq(
+        b"other socket outgoing",
+        seen.unwrap_or(99) as i64,
+        PACKET_OUTGOING as i64,
+    );
     let own = find(tx, &mut buf, 1000, &tagged(0x51)).map(|(_, a)| a.pkttype);
-    t.eq(b"sender sees incoming only", own.unwrap_or(99) as i64, PACKET_HOST as i64);
+    t.eq(
+        b"sender sees incoming only",
+        own.unwrap_or(99) as i64,
+        PACKET_HOST as i64,
+    );
 
     let d = psock(SOCK_DGRAM, 0);
     let mut to = Sll::new(ETH_P_TEST, lo);
@@ -353,7 +414,11 @@ fn test_send(lo: i32) {
     match find(rx, &mut buf, 3000, &tagged(0x52)) {
         Some((n, a)) => {
             t.eq(b"dgram frame len", n as i64, 17);
-            t.ok(b"dest from sll_addr", buf[..6] == [2, 0, 0, 0, 0, 1], buf[0] as i64);
+            t.ok(
+                b"dest from sll_addr",
+                buf[..6] == [2, 0, 0, 0, 0, 1],
+                buf[0] as i64,
+            );
             t.ok(b"lo zero source", buf[6..12] == [0; 6], buf[6] as i64);
             t.eq(b"not for lo", a.pkttype as i64, 3);
         }
@@ -362,7 +427,11 @@ fn test_send(lo: i32) {
         }
     }
     let mut short = [0u8; 64];
-    t.eq(b"raw short", send(tx, test_frame(&mut short, 0, 10), 0), EINVAL);
+    t.eq(
+        b"raw short",
+        send(tx, test_frame(&mut short, 0, 10), 0),
+        EINVAL,
+    );
     close(d);
     close(tx);
     close(all);
@@ -386,7 +455,11 @@ fn test_trunc(lo: i32) {
     t.eq(b"truncated", n, 16);
     t.ok(b"MSG_TRUNC flag", flags & MSG_TRUNC != 0, flags as i64);
     poll1(rx, 1, 3000);
-    t.eq(b"real length", recv(rx, &mut small, MSG_TRUNC | MSG_DONTWAIT), 60);
+    t.eq(
+        b"real length",
+        recv(rx, &mut small, MSG_TRUNC | MSG_DONTWAIT),
+        60,
+    );
     close(tx);
     close(rx);
     t.done();
@@ -412,14 +485,26 @@ fn test_rcvbuf(lo: i32) {
     }
     let mut st = [0u32; 2];
     let mut len = 8u32;
-    let r = sys_getsockopt(rx, SOL_PACKET, PACKET_STATISTICS, st.as_mut_ptr() as *mut u8, &mut len);
+    let r = sys_getsockopt(
+        rx,
+        SOL_PACKET,
+        PACKET_STATISTICS,
+        st.as_mut_ptr() as *mut u8,
+        &mut len,
+    );
     t.eq(b"PACKET_STATISTICS", r, 0);
     t.eq(b"stats len", len as i64, 8);
     t.ok(b"some queued", got >= 1, got);
     t.ok(b"bounded", got < N, got);
     t.eq(b"drops", st[1] as i64, N - got);
     t.eq(b"packets", st[0] as i64, N);
-    let r = sys_getsockopt(rx, SOL_PACKET, PACKET_STATISTICS, st.as_mut_ptr() as *mut u8, &mut len);
+    let r = sys_getsockopt(
+        rx,
+        SOL_PACKET,
+        PACKET_STATISTICS,
+        st.as_mut_ptr() as *mut u8,
+        &mut len,
+    );
     t.ok(b"reset", r == 0 && st == [0, 0], st[0] as i64);
     close(tx);
     close(rx);
@@ -456,8 +541,16 @@ fn test_filter(lo: i32) {
     let mut ins = [0u8; 128];
     let p = fprog(&[(LD_IMM, 0, 0, 1)], &mut ins);
     t.eq(b"no ret", attach(rx, &p), EINVAL);
-    t.eq(b"optlen", sys_setsockopt(rx, SOL_SOCKET, SO_ATTACH_FILTER, p.as_ptr(), 8), EINVAL);
-    t.eq(b"detach none", sys_setsockopt(rx, SOL_SOCKET, SO_DETACH_FILTER, p.as_ptr(), 4), ENOENT);
+    t.eq(
+        b"optlen",
+        sys_setsockopt(rx, SOL_SOCKET, SO_ATTACH_FILTER, p.as_ptr(), 8),
+        EINVAL,
+    );
+    t.eq(
+        b"detach none",
+        sys_setsockopt(rx, SOL_SOCKET, SO_DETACH_FILTER, p.as_ptr(), 4),
+        ENOENT,
+    );
 
     let p = fprog(&[(RET_K, 0, 0, 0)], &mut ins);
     t.eq(b"drop all", attach(rx, &p), 0);
@@ -486,11 +579,19 @@ fn test_filter(lo: i32) {
             t.ok(b"auxdata cmsg", false, clen as i64);
         }
     }
-    t.eq(b"detach", sys_setsockopt(rx, SOL_SOCKET, SO_DETACH_FILTER, p.as_ptr(), 4), 0);
+    t.eq(
+        b"detach",
+        sys_setsockopt(rx, SOL_SOCKET, SO_DETACH_FILTER, p.as_ptr(), 4),
+        0,
+    );
     t.eq(b"lock", setint(rx, SOL_SOCKET, SO_LOCK_FILTER, 1), 0);
     t.eq(b"locked attach", attach(rx, &p), EPERM);
     t.eq(b"unlock", setint(rx, SOL_SOCKET, SO_LOCK_FILTER, 0), EPERM);
-    t.eq(b"lock get", getint(rx, SOL_SOCKET, SO_LOCK_FILTER).1 as i64, 1);
+    t.eq(
+        b"lock get",
+        getint(rx, SOL_SOCKET, SO_LOCK_FILTER).1 as i64,
+        1,
+    );
     close(tx);
     close(rx);
     t.done();
@@ -514,7 +615,11 @@ fn test_opts(lo: i32) {
     mreq[0..4].copy_from_slice(&9999i32.to_ne_bytes());
     t.eq(b"no device", set(PACKET_ADD_MEMBERSHIP, &mreq, 16), ENODEV);
     t.eq(b"unknown", setint(fd, SOL_PACKET, 999, 1), ENOPROTOOPT);
-    t.eq(b"auxdata get", getint(fd, SOL_PACKET, PACKET_AUXDATA).1 as i64, 0);
+    t.eq(
+        b"auxdata get",
+        getint(fd, SOL_PACKET, PACKET_AUXDATA).1 as i64,
+        0,
+    );
     close(fd);
     t.done();
 }
@@ -527,7 +632,11 @@ fn test_proc() {
     let n = super::sysctl::read_file(b"/proc/net/packet\0", &mut buf);
     t.ok(b"read", n > 0, n);
     let s = &buf[..n.max(0) as usize];
-    t.ok(b"header", s.starts_with(b"sk ") && contains(s, b"Proto  Iface"), 0);
+    t.ok(
+        b"header",
+        s.starts_with(b"sk ") && contains(s, b"Proto  Iface"),
+        0,
+    );
     t.ok(b"our socket", contains(s, b" 0003 "), 0);
     close(fd);
     t.done();
@@ -546,7 +655,11 @@ fn test_eth_errors(eth: i32) {
     close(d);
     let r = bound(SOCK_RAW, ETH_P_TEST, eth);
     let mut f = [0u8; 1600];
-    t.eq(b"over mtu", send(r, test_frame(&mut f, 0, 1515), 0), EMSGSIZE);
+    t.eq(
+        b"over mtu",
+        send(r, test_frame(&mut f, 0, 1515), 0),
+        EMSGSIZE,
+    );
     t.eq(b"mtu", send(r, test_frame(&mut f, 0, 1514), 0), 1514);
     close(r);
     t.done();
@@ -569,7 +682,9 @@ const UDHCPC_FILTER: [(u16, u8, u8, u32); 9] = [
 fn discover(out: &mut [u8; 300], mac: &[u8], xid: u32) {
     out.fill(0);
     let ip = &mut out[..20];
-    ip.copy_from_slice(&[0x45, 0, 0x01, 0x2c, 0, 1, 0, 0, 64, 17, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255]);
+    ip.copy_from_slice(&[
+        0x45, 0, 0x01, 0x2c, 0, 1, 0, 0, 64, 17, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255,
+    ]);
     let mut s: u32 = 0;
     for c in ip.chunks(2) {
         s += u16::from_be_bytes([c[0], c[1]]) as u32;
@@ -614,9 +729,16 @@ fn test_dhcp(eth: i32) {
 
     let mut buf = [0u8; 1600];
     let out = find(all, &mut buf, 3000, &|f: &[u8], a: &Sll| {
-        a.pkttype == PACKET_OUTGOING && f.len() >= 50 && f[36..38] == [0, 67] && f[46..50] == xid.to_be_bytes()
+        a.pkttype == PACKET_OUTGOING
+            && f.len() >= 50
+            && f[36..38] == [0, 67]
+            && f[46..50] == xid.to_be_bytes()
     });
-    t.ok(b"outgoing DISCOVER", out.is_some_and(|(_, _)| buf[..6] == [0xff; 6]), 0);
+    t.ok(
+        b"outgoing DISCOVER",
+        out.is_some_and(|(_, _)| buf[..6] == [0xff; 6]),
+        0,
+    );
 
     let offer = find(rx, &mut buf, 5000, &|f: &[u8], _: &Sll| {
         f.len() >= 244 && f[28] == 2 && f[32..36] == xid.to_be_bytes()
@@ -624,7 +746,11 @@ fn test_dhcp(eth: i32) {
     match offer {
         Some((_, a)) => {
             t.ok(b"yiaddr", buf[44..48] == [10, 0, 2, 15], buf[47] as i64);
-            t.ok(b"pkttype", a.pkttype == PACKET_HOST || a.pkttype == PACKET_BROADCAST, a.pkttype as i64);
+            t.ok(
+                b"pkttype",
+                a.pkttype == PACKET_HOST || a.pkttype == PACKET_BROADCAST,
+                a.pkttype as i64,
+            );
             t.eq(b"protocol", a.protocol as i64, ETH_P_IP as i64);
             t.eq(b"halen", a.halen as i64, 6);
             t.ok(b"server mac", a.addr[..6] != [0; 6], 0);

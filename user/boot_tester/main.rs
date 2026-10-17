@@ -11,8 +11,13 @@ use core::panic::PanicInfo;
 // Test modules
 mod tests;
 
-use hk_syscall::{sys_exit, sys_exit_group, sys_getpid, sys_reboot, LINUX_REBOOT_CMD_POWER_OFF, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2};
-use tests::helpers::{fail_count, host_mode, host_setup, init_host_mode, loopback_up, println, print, print_num};
+use hk_syscall::{
+    LINUX_REBOOT_CMD_POWER_OFF, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, sys_exit, sys_exit_group,
+    sys_getpid, sys_reboot,
+};
+use tests::helpers::{
+    fail_count, host_mode, host_setup, init_host_mode, loopback_up, print, print_num, println,
+};
 
 /// Process entry: the kernel enters with a 16-byte aligned sp and no return
 /// address, so realign per the C ABI before calling into Rust.
@@ -72,7 +77,11 @@ extern "C" fn rust_start() -> ! {
 
     // Shutdown the system via ACPI S5
     println(b"Powering off...");
-    sys_reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_POWER_OFF)
+    sys_reboot(
+        LINUX_REBOOT_MAGIC1,
+        LINUX_REBOOT_MAGIC2,
+        LINUX_REBOOT_CMD_POWER_OFF,
+    )
 }
 
 #[panic_handler]

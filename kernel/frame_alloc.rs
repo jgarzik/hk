@@ -218,7 +218,7 @@ impl BitmapFrameAllocator {
             return;
         };
         if frame_idx < inner.total_frames {
-            // Saturating add to prevent overflow
+            // Saturates: a saturated count is sticky (see `put_count`)
             inner.refcounts[frame_idx] = inner.refcounts[frame_idx].saturating_add(1);
         }
     }
@@ -233,8 +233,8 @@ impl BitmapFrameAllocator {
             return false;
         };
         if frame_idx < inner.total_frames {
-            if inner.refcounts[frame_idx] > 0 {
-                inner.refcounts[frame_idx] -= 1;
+            if !put_count(&mut inner.refcounts[frame_idx]) {
+                return false;
             }
 
             if inner.refcounts[frame_idx] == 0 {
@@ -444,8 +444,8 @@ impl BitmapFrameAllocator {
             return false;
         }
 
-        if inner.refcounts[frame_idx] > 0 {
-            inner.refcounts[frame_idx] -= 1;
+        if !put_count(&mut inner.refcounts[frame_idx]) {
+            return false;
         }
 
         if inner.refcounts[frame_idx] == 0 {
@@ -547,6 +547,10 @@ impl FrameAlloc for &BitmapFrameAllocator {
 
     fn free_frame(&mut self, frame: Self::PhysAddr) {
         self.free(frame)
+    }
+
+    fn put_frame(&mut self, frame: Self::PhysAddr) {
+        self.decref(frame);
     }
 }
 
@@ -669,6 +673,23 @@ impl FrameAlloc for FrameAllocRef<'_> {
     fn free_frame(&mut self, frame: Self::PhysAddr) {
         self.0.free(frame)
     }
+
+    fn put_frame(&mut self, frame: Self::PhysAddr) {
+        self.0.decref(frame);
+    }
+}
+
+/// Drop one reference from a frame count; false if the count must not
+/// change: a saturated count (u16::MAX references were taken; more
+/// would have wrapped) is sticky, so the frame is never freed while some
+/// of its uncounted references may remain (leaked instead, never used
+/// after free)
+fn put_count(count: &mut u16) -> bool {
+    if *count == u16::MAX {
+        return false;
+    }
+    *count = count.saturating_sub(1);
+    true
 }
 
 #[cfg(test)]
@@ -688,6 +709,19 @@ mod tests {
 
     fn pa(i: usize) -> u64 {
         BASE + (i * FRAME_SIZE) as u64
+    }
+
+    #[test]
+    fn saturated_refcount_is_sticky() {
+        let (a, _b) = fa(100);
+        let f = a.alloc().unwrap();
+        for _ in 0..70_000 {
+            a.incref(f);
+        }
+        for _ in 0..70_000 {
+            assert!(!a.decref(f));
+        }
+        assert_eq!(a.refcount(f), u16::MAX);
     }
 
     #[test]

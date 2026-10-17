@@ -1245,7 +1245,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     };
 
     // The child's address space (Linux copy_mm): shared for CLONE_VM,
-    // else a copy-on-write duplicate. Dropped on any error below.
+    // else a copy (dup_mm). Dropped on any error below.
     let parent_mm = {
         let table = TASK_TABLE.lock();
         table
@@ -1260,10 +1260,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         Some(pm) => {
             let mut pt = ArchPageTable::new_user(frame_alloc).ok_or(12)?; // ENOMEM
             pt.copy_kernel_mappings();
-            let pgd = pt.root_table_phys();
-            let dup =
-                |parent| ArchPageTable::new(parent).duplicate_user_space(&mut pt, frame_alloc);
-            Some(crate::mm::dup_mm(&pm, pgd, dup)?)
+            Some(crate::mm::dup_mm(&pm, pt.root_table_phys())?)
         }
     };
     let child_pt = ArchPageTable::new(child_mm.as_ref().map_or(parent_pt_phys, |m| m.pgd()));
@@ -1763,7 +1760,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     rq.dead.push(dead);
 
     let next_tid = rq.dequeue_next();
-    let (next_kstack, next_cr3, next_task) = switch_info(next_tid);
+    let (next_kstack, next_mm, next_task) = switch_info(next_tid);
 
     // Get next task's context
     let next_ctx = match rq.get_context(next_tid) {
@@ -1789,14 +1786,19 @@ pub fn exit_current(status: Option<i32>) -> ! {
 
     // Switch to next task - never returns
     unsafe {
-        CurrentArch::context_switch_first(next_ctx, next_kstack, next_cr3, next_tid);
+        switch_mm(next_mm);
+        CurrentArch::context_switch_first(next_ctx, next_kstack, next_tid);
     }
 }
 
-/// Kernel stack, page-table root and per-CPU task view for switching to `tid`
+/// Kernel stack, address space (null for none: kernel threads) and
+/// per-CPU task view for switching to `tid`
 ///
 /// Takes TASK_TABLE; callers hold their rq lock (rq -> TASK_TABLE order).
-fn switch_info(tid: Tid) -> (u64, u64, CurrentTask) {
+/// The address space stays alive until the switch: `tid` is not running
+/// (it is on this run queue, which the caller holds), so it cannot drop
+/// its reference (exit, exec) meanwhile.
+fn switch_info(tid: Tid) -> (u64, *const crate::mm::Mm, CurrentTask) {
     let table = TASK_TABLE.lock();
     table
         .tasks
@@ -1813,7 +1815,8 @@ fn switch_info(tid: Tid) -> (u64, u64, CurrentTask) {
             };
             (
                 kstack,
-                t.page_table.root_table_phys(),
+                t.mm.as_ref()
+                    .map_or(core::ptr::null(), |m| alloc::sync::Arc::as_ptr(m.arc())),
                 CurrentTask {
                     tid,
                     pid: t.pid,
@@ -1826,7 +1829,20 @@ fn switch_info(tid: Tid) -> (u64, u64, CurrentTask) {
                 },
             )
         })
-        .unwrap_or((0, 0, CurrentTask::from_parts(tid, 0, 0, 0, 0, Cred::ROOT)))
+        .unwrap_or((
+            0,
+            core::ptr::null(),
+            CurrentTask::from_parts(tid, 0, 0, 0, 0, Cred::ROOT),
+        ))
+}
+
+/// Load the address space of the task switched to (`switch_info`)
+///
+/// # Safety
+/// `mm` is null or an address space kept alive by that task.
+unsafe fn switch_mm(mm: *const crate::mm::Mm) {
+    // SAFETY: see above
+    crate::mm::tlb::switch_mm(unsafe { mm.as_ref() });
 }
 
 /// Switch from the current task `cur` to `next` with `rq` held
@@ -1841,7 +1857,7 @@ fn context_switch_locked(
     cur: Tid,
     next: Tid,
 ) {
-    let (next_kstack, next_cr3, next_task) = switch_info(next);
+    let (next_kstack, next_mm, next_task) = switch_info(next);
     let (Some(curr_ctx), Some(next_ctx)) = (rq.get_context_mut(cur), rq.get_context(next)) else {
         return;
     };
@@ -1858,7 +1874,8 @@ fn context_switch_locked(
 
     let saved = CurrentArch::save_syscall_user_state();
     unsafe {
-        CurrentArch::context_switch(curr_ctx, next_ctx, next_kstack, next_cr3, next);
+        switch_mm(next_mm);
+        CurrentArch::context_switch(curr_ctx, next_ctx, next_kstack, next);
     }
     // Back on `cur` (the rq lock is held again; `rq` releases it)
     CurrentArch::restore_syscall_user_state(&saved);
@@ -1983,6 +2000,9 @@ pub fn wake_up_task(tid: Tid, cpu: u32, mode: WakeMode) -> bool {
         rq.try_wake(tid, mode)
     } else {
         target.post_wake(tid, mode);
+        // Linux ttwu_queue_wakelist: an idle owner applies it now, not
+        // at its next tick
+        crate::smp::smp_send_reschedule(cpu);
         true
     }
 }
@@ -2096,26 +2116,6 @@ pub fn finish_context_switch() {
     // Free what tasks that exited here left (we are off their stacks)
     let dead = core::mem::take(&mut sched.lock.lock().dead);
     drop(dead);
-}
-
-/// Get the current task's CR3 (page table root physical address)
-///
-/// This is called from clone_child_entry to load the child's page table
-/// before returning to user mode.
-#[unsafe(no_mangle)]
-pub extern "C" fn get_current_task_cr3() -> u64 {
-    let current_tid = current_tid();
-    if current_tid == 0 {
-        return 0;
-    }
-
-    let table = TASK_TABLE.lock();
-    for task in &table.tasks {
-        if task.tid == current_tid {
-            return task.page_table.root_table_phys();
-        }
-    }
-    0
 }
 
 /// Get the current task's TLS value
@@ -3030,19 +3030,20 @@ pub fn set_current_fsgid(fsgid: crate::task::Gid) {
 /// * `user_sp` - The initial user stack pointer
 pub fn exec_replace_image(mm: crate::mm::MmRef, entry_point: u64, user_sp: u64) -> ! {
     let tid = current_tid();
-    let cr3 = mm.pgd();
+    let new = mm.arc().clone();
 
     let old = {
         let mut table = TASK_TABLE.lock();
         let task = table.tasks.iter_mut().find(|t| t.tid == tid);
         let task = task.expect("exec: current task not in the task table");
-        task.page_table = ArchPageTable::new(cr3);
+        task.page_table = ArchPageTable::new(new.pgd());
         task.mm.replace(mm)
     };
 
     // Leave the old tables before releasing them: their frames may be
     // reused at once by another CPU
-    crate::arch::paging::activate(cr3);
+    crate::mm::tlb::switch_mm(Some(&new));
+    drop(new);
     drop(old);
 
     // Get kernel stack for syscall/interrupt return
@@ -3059,7 +3060,7 @@ pub fn exec_replace_image(mm: crate::mm::MmRef, entry_point: u64, user_sp: u64) 
     // Jump to user mode at the new entry point
     // This function never returns
     unsafe {
-        CurrentArch::jump_to_user(entry_point, user_sp, cr3, kstack_top);
+        CurrentArch::jump_to_user(entry_point, user_sp, kstack_top);
     }
 }
 
@@ -3102,7 +3103,7 @@ pub fn try_schedule() {
     let mut rq = sched.lock.lock();
     sched.drain_wakes(&mut rq);
     let next = rq.dequeue_next();
-    let (next_kstack, next_cr3, next_task) = switch_info(next);
+    let (next_kstack, next_mm, next_task) = switch_info(next);
     let Some(next_ctx) = rq.get_context(next) else {
         return;
     };
@@ -3115,7 +3116,8 @@ pub fn try_schedule() {
     // here left the per-CPU preempt count at -1 after that release.
     core::mem::forget(rq); // context_switch_first never returns
     unsafe {
-        CurrentArch::context_switch_first(next_ctx, next_kstack, next_cr3, next);
+        switch_mm(next_mm);
+        CurrentArch::context_switch_first(next_ctx, next_kstack, next);
     }
 }
 

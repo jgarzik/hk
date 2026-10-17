@@ -10,14 +10,12 @@
 //! - Test invalid map type
 //! - Test invalid fd
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use core::mem::size_of;
 use hk_syscall::{
-    sys_bpf, sys_close,
-    BPF_MAP_CREATE, BPF_MAP_LOOKUP_ELEM, BPF_MAP_UPDATE_ELEM,
-    BPF_MAP_DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, BPF_PROG_LOAD,
-    BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_ARRAY, BPF_PROG_TYPE_SOCKET_FILTER,
-    BPF_ANY,
+    BPF_ANY, BPF_MAP_CREATE, BPF_MAP_DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, BPF_MAP_LOOKUP_ELEM,
+    BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BPF_MAP_UPDATE_ELEM, BPF_PROG_LOAD,
+    BPF_PROG_TYPE_SOCKET_FILTER, sys_bpf, sys_close,
 };
 
 /// Map creation attribute structure

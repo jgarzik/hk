@@ -7,10 +7,9 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_mmap, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ,
-    sys_close, sys_exit, sys_fork, sys_fstat, sys_lseek, sys_open, sys_pipe, sys_pread64,
-    sys_pwrite64, sys_read, sys_unlink, sys_wait4, sys_write, Stat, O_APPEND, O_CREAT, O_RDONLY,
-    O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR,
+    MAP_ANONYMOUS, MAP_PRIVATE, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, PROT_READ,
+    SEEK_CUR, Stat, sys_close, sys_exit, sys_fork, sys_fstat, sys_lseek, sys_mmap, sys_open,
+    sys_pipe, sys_pread64, sys_pwrite64, sys_read, sys_unlink, sys_wait4, sys_write,
 };
 
 const REC: usize = 32;
@@ -87,7 +86,9 @@ fn test_append_race() {
             continue;
         }
         let t = rec[0];
-        if (t != b'A' && t != b'B') || rec[REC - 1] != b'\n' || rec[..REC - 1].iter().any(|&c| c != t)
+        if (t != b'A' && t != b'B')
+            || rec[REC - 1] != b'\n'
+            || rec[..REC - 1].iter().any(|&c| c != t)
         {
             bad += 1;
             continue;
@@ -97,7 +98,11 @@ fn test_append_race() {
     sys_close(fd as u64);
     sys_unlink(path.as_ptr());
     let ok = sa == 0 && sb == 0 && size == (2 * NREC * REC) as i64 && bad == 0;
-    verdict(b"APPEND_RACE", ok && count == [NREC, NREC], if ok { bad } else { size });
+    verdict(
+        b"APPEND_RACE",
+        ok && count == [NREC, NREC],
+        if ok { bad } else { size },
+    );
 }
 
 const BIG: usize = 1 << 20;

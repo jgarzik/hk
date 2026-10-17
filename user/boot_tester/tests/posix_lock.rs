@@ -8,7 +8,7 @@
 //! - Test F_SETLK returns EBADF for invalid fd
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{sys_close, sys_fcntl, sys_mkdir, sys_open, sys_write, O_CREAT, O_RDWR, O_TRUNC};
+use hk_syscall::{O_CREAT, O_RDWR, O_TRUNC, sys_close, sys_fcntl, sys_mkdir, sys_open, sys_write};
 
 // fcntl commands for POSIX locks
 const F_GETLK: i32 = 5;

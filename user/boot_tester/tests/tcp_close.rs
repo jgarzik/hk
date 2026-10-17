@@ -3,8 +3,8 @@
 //! descriptor table (CLONE_FILES); an exiting process never lingers.
 
 use hk_syscall::{
-    sys_clone, sys_close, sys_exit, sys_fcntl, sys_fork, sys_listen, sys_nanosleep, sys_pipe,
-    sys_read, sys_write, Timespec,
+    Timespec, sys_clone, sys_close, sys_exit, sys_fcntl, sys_fork, sys_listen, sys_nanosleep,
+    sys_pipe, sys_read, sys_write,
 };
 
 use super::sk::*;
@@ -129,7 +129,11 @@ fn test_dup2_linger() {
     t.ok(b"dup2", r >= 0 && r as i32 == c, r);
     t.eq(b"sibling not blocked", st as i64, 0);
     t.ok(b"lingered", ms >= 3000 && ms < 15_000, ms as i64);
-    t.eq(b"not a socket now", getint(c, SOL_SOCKET, SO_TYPE).0, ENOTSOCK);
+    t.eq(
+        b"not a socket now",
+        getint(c, SOL_SOCKET, SO_TYPE).0,
+        ENOTSOCK,
+    );
     close(c);
     close(q[0]);
     close(q[1]);

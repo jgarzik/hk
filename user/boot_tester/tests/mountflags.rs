@@ -5,11 +5,11 @@
 
 use super::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
-    sys_chown, sys_link, sys_mmap, sys_mprotect, sys_munmap, sys_removexattr, sys_rename, sys_setxattr,
-    sys_symlink, sys_utimensat, MAP_PRIVATE, O_TRUNC, PROT_READ, AT_FDCWD,
-    sys_chmod, sys_close, sys_execve, sys_exit, sys_fork, sys_mkdir, sys_mknod, sys_mount,
-    sys_open, sys_read, sys_rmdir, sys_setresgid, sys_setresuid, sys_statfs, sys_truncate,
-    sys_umount2, sys_unlink, sys_wait4, sys_write, LinuxStatFs, O_CREAT, O_RDONLY, O_WRONLY,
+    AT_FDCWD, LinuxStatFs, MAP_PRIVATE, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, PROT_READ, sys_chmod,
+    sys_chown, sys_close, sys_execve, sys_exit, sys_fork, sys_link, sys_mkdir, sys_mknod, sys_mmap,
+    sys_mount, sys_mprotect, sys_munmap, sys_open, sys_read, sys_removexattr, sys_rename,
+    sys_rmdir, sys_setresgid, sys_setresuid, sys_setxattr, sys_statfs, sys_symlink, sys_truncate,
+    sys_umount2, sys_unlink, sys_utimensat, sys_wait4, sys_write,
 };
 
 const EPERM: i64 = -1;
@@ -53,26 +53,55 @@ fn test_ro_ops() {
     f += chk(n, b"remount ro", remount(mp, MS_RDONLY), 0);
     let p = |s: &'static [u8]| s.as_ptr();
     let ops: [(&[u8], i64); 15] = [
-        (b"creat", sys_open(p(b"/tmp/mnt_rops/g\0"), O_CREAT | O_WRONLY, 0o644)),
-        (b"rdonly trunc", sys_open(p(b"/tmp/mnt_rops/f\0"), O_RDONLY | O_TRUNC, 0)),
-        (b"rdwr", sys_open(p(b"/tmp/mnt_rops/f\0"), hk_syscall::O_RDWR, 0)),
+        (
+            b"creat",
+            sys_open(p(b"/tmp/mnt_rops/g\0"), O_CREAT | O_WRONLY, 0o644),
+        ),
+        (
+            b"rdonly trunc",
+            sys_open(p(b"/tmp/mnt_rops/f\0"), O_RDONLY | O_TRUNC, 0),
+        ),
+        (
+            b"rdwr",
+            sys_open(p(b"/tmp/mnt_rops/f\0"), hk_syscall::O_RDWR, 0),
+        ),
         (b"mkdir", sys_mkdir(p(b"/tmp/mnt_rops/e\0"), 0o755)),
         (b"mknod", sys_mknod(p(b"/tmp/mnt_rops/n\0"), 0o100644, 0)),
         (b"symlink", sys_symlink(p(b"f\0"), p(b"/tmp/mnt_rops/s\0"))),
-        (b"link", sys_link(p(b"/tmp/mnt_rops/f\0"), p(b"/tmp/mnt_rops/h\0"))),
+        (
+            b"link",
+            sys_link(p(b"/tmp/mnt_rops/f\0"), p(b"/tmp/mnt_rops/h\0")),
+        ),
         (b"unlink", sys_unlink(p(b"/tmp/mnt_rops/f\0"))),
         (b"rmdir", sys_rmdir(p(b"/tmp/mnt_rops/d\0"))),
-        (b"rename", sys_rename(p(b"/tmp/mnt_rops/f\0"), p(b"/tmp/mnt_rops/r\0"))),
+        (
+            b"rename",
+            sys_rename(p(b"/tmp/mnt_rops/f\0"), p(b"/tmp/mnt_rops/r\0")),
+        ),
         (b"chmod", sys_chmod(p(b"/tmp/mnt_rops/f\0"), 0o600)),
         (b"chown", sys_chown(p(b"/tmp/mnt_rops/f\0"), 0, 0)),
-        (b"utimens", sys_utimensat(AT_FDCWD, p(b"/tmp/mnt_rops/f\0"), core::ptr::null(), 0)),
-        (b"setxattr", sys_setxattr(p(b"/tmp/mnt_rops/f\0"), p(b"user.x\0"), p(b"v"), 1, 0)),
-        (b"removexattr", sys_removexattr(p(b"/tmp/mnt_rops/f\0"), p(b"user.x\0"))),
+        (
+            b"utimens",
+            sys_utimensat(AT_FDCWD, p(b"/tmp/mnt_rops/f\0"), core::ptr::null(), 0),
+        ),
+        (
+            b"setxattr",
+            sys_setxattr(p(b"/tmp/mnt_rops/f\0"), p(b"user.x\0"), p(b"v"), 1, 0),
+        ),
+        (
+            b"removexattr",
+            sys_removexattr(p(b"/tmp/mnt_rops/f\0"), p(b"user.x\0")),
+        ),
     ];
     for (why, got) in ops {
         f += chk(n, why, got, EROFS);
     }
-    f += chk(n, b"truncate", sys_truncate(p(b"/tmp/mnt_rops/f\0"), 0), EROFS);
+    f += chk(
+        n,
+        b"truncate",
+        sys_truncate(p(b"/tmp/mnt_rops/f\0"), 0),
+        EROFS,
+    );
     remount(mp, 0);
     sys_unlink(p(b"/tmp/mnt_rops/f\0"));
     sys_rmdir(p(b"/tmp/mnt_rops/d\0"));
@@ -118,7 +147,12 @@ fn test_noexec_mmap() {
     let a = sys_mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd as i32, 0);
     f += chk(n, b"mmap read", (a > 0) as i64, 1);
     if a > 0 {
-        f += chk(n, b"mprotect exec", sys_mprotect(a as u64, 4096, PROT_READ | PROT_EXEC), EACCES);
+        f += chk(
+            n,
+            b"mprotect exec",
+            sys_mprotect(a as u64, 4096, PROT_READ | PROT_EXEC),
+            EACCES,
+        );
         sys_munmap(a as u64, 4096);
     }
     sys_close(fd as u64);
@@ -152,11 +186,23 @@ fn done(name: &[u8], fails: u32) {
 }
 
 fn ramfs(target: &[u8], flags: u64) -> i64 {
-    sys_mount(b"none\0".as_ptr(), target.as_ptr(), b"ramfs\0".as_ptr(), flags, 0)
+    sys_mount(
+        b"none\0".as_ptr(),
+        target.as_ptr(),
+        b"ramfs\0".as_ptr(),
+        flags,
+        0,
+    )
 }
 
 fn remount(target: &[u8], flags: u64) -> i64 {
-    sys_mount(core::ptr::null(), target.as_ptr(), core::ptr::null(), MS_REMOUNT | flags, 0)
+    sys_mount(
+        core::ptr::null(),
+        target.as_ptr(),
+        core::ptr::null(),
+        MS_REMOUNT | flags,
+        0,
+    )
 }
 
 fn st_flags(path: &[u8]) -> i64 {
@@ -203,11 +249,31 @@ fn test_rdonly() {
     f += chk(n, b"statfs ro", st_flags(mp) & ST_RDONLY, ST_RDONLY);
     let c = sys_open(b"/tmp/mnt_ro/new\0".as_ptr(), O_CREAT | O_WRONLY, 0o644);
     f += chk(n, b"create", c, EROFS);
-    f += chk(n, b"mkdir", sys_mkdir(b"/tmp/mnt_ro/d\0".as_ptr(), 0o755), EROFS);
-    f += chk(n, b"open wr", sys_open(b"/tmp/mnt_ro/f\0".as_ptr(), O_WRONLY, 0), EROFS);
+    f += chk(
+        n,
+        b"mkdir",
+        sys_mkdir(b"/tmp/mnt_ro/d\0".as_ptr(), 0o755),
+        EROFS,
+    );
+    f += chk(
+        n,
+        b"open wr",
+        sys_open(b"/tmp/mnt_ro/f\0".as_ptr(), O_WRONLY, 0),
+        EROFS,
+    );
     f += chk(n, b"unlink", sys_unlink(b"/tmp/mnt_ro/f\0".as_ptr()), EROFS);
-    f += chk(n, b"chmod", sys_chmod(b"/tmp/mnt_ro/f\0".as_ptr(), 0o600), EROFS);
-    f += chk(n, b"truncate", sys_truncate(b"/tmp/mnt_ro/f\0".as_ptr(), 0), EROFS);
+    f += chk(
+        n,
+        b"chmod",
+        sys_chmod(b"/tmp/mnt_ro/f\0".as_ptr(), 0o600),
+        EROFS,
+    );
+    f += chk(
+        n,
+        b"truncate",
+        sys_truncate(b"/tmp/mnt_ro/f\0".as_ptr(), 0),
+        EROFS,
+    );
     let r = sys_open(b"/tmp/mnt_ro/f\0".as_ptr(), O_RDONLY, 0);
     let mut buf = [0u8; 8];
     f += chk(n, b"read", sys_read(r as u64, buf.as_mut_ptr(), 8), 4);
@@ -224,7 +290,12 @@ fn test_rdonly() {
     // A fresh read-only mount: creation fails from the start
     sys_mkdir(mp.as_ptr(), 0o755);
     f += chk(n, b"mount ro", ramfs(mp, MS_RDONLY), 0);
-    f += chk(n, b"mkdir ro", sys_mkdir(b"/tmp/mnt_ro/d\0".as_ptr(), 0o755), EROFS);
+    f += chk(
+        n,
+        b"mkdir ro",
+        sys_mkdir(b"/tmp/mnt_ro/d\0".as_ptr(), 0o755),
+        EROFS,
+    );
     sys_umount2(mp.as_ptr(), 0);
     sys_rmdir(mp.as_ptr());
     done(n, f);
@@ -292,8 +363,18 @@ fn test_nodev() {
     let mut f = chk(n, b"mount", ramfs(mp, MS_NODEV), 0);
     f += chk(n, b"statfs", st_flags(mp) & ST_NODEV, ST_NODEV);
     // /dev/null: major 1, minor 3
-    f += chk(n, b"mknod", sys_mknod(dev.as_ptr(), S_IFCHR | 0o666, (1 << 8) | 3), 0);
-    f += chk(n, b"open nodev", sys_open(dev.as_ptr(), O_WRONLY, 0), EACCES);
+    f += chk(
+        n,
+        b"mknod",
+        sys_mknod(dev.as_ptr(), S_IFCHR | 0o666, (1 << 8) | 3),
+        0,
+    );
+    f += chk(
+        n,
+        b"open nodev",
+        sys_open(dev.as_ptr(), O_WRONLY, 0),
+        EACCES,
+    );
     f += chk(n, b"remount dev", remount(mp, 0), 0);
     let fd = sys_open(dev.as_ptr(), O_WRONLY, 0);
     f += chk(n, b"open dev", (fd >= 0) as i64, 1);
@@ -317,7 +398,12 @@ fn test_unsupported() {
     sys_mkdir(mp.as_ptr(), 0o755);
     f += chk(n, b"mount", ramfs(mp, MS_RDONLY | MS_NOEXEC), 0);
     f += chk(n, b"remount move", remount(mp, MS_MOVE), EINVAL);
-    f += chk(n, b"flags kept", st_flags(mp) & (ST_RDONLY | ST_NOEXEC), ST_RDONLY | ST_NOEXEC);
+    f += chk(
+        n,
+        b"flags kept",
+        st_flags(mp) & (ST_RDONLY | ST_NOEXEC),
+        ST_RDONLY | ST_NOEXEC,
+    );
     sys_umount2(mp.as_ptr(), 0);
     sys_rmdir(mp.as_ptr());
     done(n, f);

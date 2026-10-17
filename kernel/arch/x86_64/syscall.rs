@@ -1128,31 +1128,29 @@ extern "C" fn syscall_handler(
 /// # Arguments
 /// * `entry` - User mode entry point (RIP)
 /// * `user_stack` - User mode stack pointer (RSP)
-/// * `cr3` - User page table physical address
 /// * `kernel_stack` - Kernel stack pointer to save in TSS for syscall return
 ///
 /// # Safety
 /// The caller must ensure:
+/// * the task's address space is loaded (`mm::tlb::switch_mm`)
 /// * `entry` points to valid user-mode code
 /// * `user_stack` points to valid user-mode stack
-/// * `cr3` points to a valid page table with kernel mapped
 /// * `kernel_stack` points to valid kernel stack
 #[unsafe(naked)]
 pub unsafe extern "C" fn jump_to_user_iret(
     entry: u64,        // rdi
     user_stack: u64,   // rsi
-    cr3: u64,          // rdx
-    kernel_stack: u64, // rcx
+    kernel_stack: u64, // rdx
 ) -> ! {
     core::arch::naked_asm!(
         // Save all input registers - they will be clobbered by function calls
         "push rdi",        // entry
         "push rsi",        // user_stack
-        "push rdx",        // cr3
-        "push rcx",        // kernel_stack
+        "push rdx",        // kernel_stack (twice: keeps the stack layout)
+        "push rdx",
 
         // Set kernel stack in TSS for interrupt return path
-        "mov rdi, rcx",
+        "mov rdi, rdx",
         "call {set_kstack}",
 
         // Set kernel stack for syscall entry
@@ -1160,13 +1158,10 @@ pub unsafe extern "C" fn jump_to_user_iret(
         "call {set_syscall_kstack}",
 
         // Restore all input registers
-        "pop rcx",
+        "pop rdx",
         "pop rdx",
         "pop rsi",
         "pop rdi",
-
-        // Switch to user page table
-        "mov cr3, rdx",
 
         // Build IRET frame on current stack
         // Stack layout for iretq (pushed in reverse order):
@@ -1394,7 +1389,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_MLOCK2 => crate::mm::syscall::sys_mlock2(arg0, arg1, arg2 as i32) as u64,
         SYS_MSYNC => crate::mm::syscall::sys_msync(arg0, arg1, arg2 as i32) as u64,
         SYS_MINCORE => crate::mm::syscall::sys_mincore(arg0, arg1, arg2) as u64,
-        SYS_MADVISE => crate::mm::syscall::sys_madvise(arg0, arg1, arg2 as i32) as u64,
+        SYS_MADVISE => crate::mm::madvise::sys_madvise(arg0, arg1, arg2 as i32) as u64,
         SYS_MREMAP => crate::mm::syscall::sys_mremap(arg0, arg1, arg2, arg3 as u32, arg4) as u64,
         SYS_FTRUNCATE => sys_ftruncate(arg0 as i32, arg1 as i64) as u64,
         SYS_TRUNCATE => sys_truncate(arg0, arg1 as i64) as u64,

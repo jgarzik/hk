@@ -1,0 +1,1149 @@
+//! Range arguments of the memory syscalls (Linux mm/madvise.c,
+//! mm/mlock.c, mm/vma.c do_vmi_munmap, mm/mmap.c brk, mm/mprotect.c,
+//! mm/msync.c, mm/mincore.c): errno for every kind of bad range, and
+//! the mappings left behind (/proc/self/maps, data, fork)
+//!
+//! Each table runs its cases in order; a FAIL names the first case that
+//! returned the wrong value. "top" is the end of the user address space
+//! (TASK_SIZE), probed at run time: it differs between kernels.
+//!
+//! Tests:
+//! - MADV_ARGS: invalid advice and unaligned starts are EINVAL (also
+//!   with length 0), a length that wraps when rounded up is EINVAL,
+//!   length 0 is a no-op; ranges at or past top, straddling it, or with
+//!   unmapped parts are ENOMEM; the mapping is unchanged
+//! - MADV_HOLES: advice over two VMAs with a hole between applies to
+//!   both and returns ENOMEM: MADV_DONTNEED empties both, MADV_DONTFORK
+//!   splits both at the range edges (a child misses exactly those pages)
+//! - MADV_SPLIT: flag advice on part of a VMA splits it there
+//!   (DONTFORK, WIPEONFORK, DONTDUMP: maps lines; a child sees each
+//!   part as advised) and undoing it merges the parts again; advice
+//!   that changes nothing does not split; MADV_DONTNEED of part of a
+//!   VMA empties only that part
+//! - MADV_LOCKED: DONTNEED, FREE, COLD, PAGEOUT and REMOVE are EINVAL on
+//!   a locked VMA; over [unlocked][locked] the first is emptied before
+//!   the error, over [locked][unlocked] nothing is
+//! - MADV_SHARED: MADV_REMOVE over [shared][private] punches the shared
+//!   page, then fails EINVAL; MADV_FREE is EINVAL on shared memory and
+//!   stops there
+//! - MLOCK_ARGS: mlock/munlock widen the range to whole pages (a length
+//!   that wraps doing so is a no-op), a range that wraps is EINVAL, a
+//!   start past top or in a hole ENOMEM with nothing locked; length 0
+//!   locks nothing, but an unaligned start with length 0 locks its page
+//! - MLOCK_SPLIT: locking or unlocking part of a VMA splits it there
+//!   (maps lines; MADV_COLD is EINVAL exactly on the locked pages), and
+//!   the parts merge again once unlocked; mlock2 MLOCK_ONFAULT too
+//! - MLOCK_HOLES: a range running into a hole locks (unlocks) the VMAs
+//!   before it, then returns ENOMEM
+//! - MLOCK_LIMIT: without CAP_IPC_LOCK, RLIMIT_MEMLOCK counts the pages
+//!   locked: relocking costs nothing, unlocking one page of a locked VMA
+//!   gives back exactly one page (ENOMEM past the limit)
+//! - MUNMAP_ARGS: an unaligned start, length 0, or a range not inside
+//!   user space (past or straddling top, wrapping) is EINVAL with
+//!   nothing unmapped; holes are fine, partial ranges split the VMA
+//! - BRK_ARGS: a break that cannot be had (wrapping when rounded up,
+//!   past top, below the heap, within a page of the next mapping, past
+//!   RLIMIT_DATA, a shrink of a heap no longer mapped) leaves the break
+//!   and the mappings as they were; a page short of the next mapping
+//!   is fine
+//! - MPROTECT_ARGS: unaligned start (also length 0) and bad protection
+//!   are EINVAL; a range that wraps once rounded up, past or straddling
+//!   top, or starting in a hole is ENOMEM with nothing changed; a range
+//!   running into a hole changes the VMAs before it, then is ENOMEM
+//! - MSYNC_ARGS: bad flags and unaligned starts are EINVAL, a range that
+//!   wraps once rounded up is ENOMEM (a length that wraps to 0 is a
+//!   no-op), holes are ENOMEM; MS_INVALIDATE on locked memory is EBUSY,
+//!   reached past a hole except with MS_ASYNC alone, which stops there
+//! - MINCORE_ARGS: unaligned start EINVAL, a range outside user space or
+//!   with holes ENOMEM, a bad vector EFAULT; a range running into a
+//!   hole fills the vector up to it; a range of more than PAGE_SIZE
+//!   pages is reported whole
+//! - SPARSE_POPULATE: two pages 64GB apart: mlock across both locks the
+//!   first and is ENOMEM at the hole, munlock likewise; mlockall
+//!   (MCL_CURRENT) and MAP_POPULATE fault in only what is mapped; all
+//!   quickly (the hole is jumped, not walked)
+
+use super::helpers::{print, print_num, println};
+use hk_syscall::{
+    MADV_COLD, MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE,
+    MADV_KEEPONFORK, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM, MADV_REMOVE, MADV_WILLNEED,
+    MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_POPULATE, MAP_PRIVATE,
+    MAP_SHARED, MCL_CURRENT, MLOCK_ONFAULT, MS_ASYNC, MS_INVALIDATE, MS_SYNC, O_RDONLY, PROT_NONE,
+    PROT_READ, PROT_WRITE, RLIMIT_DATA, RLIMIT_MEMLOCK, RLimit, sys_brk, sys_close, sys_exit,
+    sys_fork, sys_madvise, sys_mincore, sys_mlock, sys_mlock2, sys_mlockall, sys_mmap,
+    sys_mprotect, sys_msync, sys_munlock, sys_munlockall, sys_munmap, sys_open, sys_read,
+    sys_setrlimit, sys_wait4,
+};
+
+const P: u64 = 4096;
+const RW: u32 = PROT_READ | PROT_WRITE;
+const ENOMEM: i64 = -12;
+const EINVAL: i64 = -22;
+const EEXIST: i64 = -17;
+const EBUSY: i64 = -16;
+const MADV_NOHUGEPAGE: i32 = 15;
+const MAP_NORESERVE: u32 = 0x4000;
+const EFAULT: i64 = -14;
+/// The highest page-aligned address
+const LAST: u64 = !(P - 1);
+
+pub fn run_tests() {
+    madv_args();
+    madv_holes();
+    madv_split();
+    madv_locked();
+    madv_shared();
+    mlock_args();
+    mlock_split();
+    mlock_holes();
+    mlock_limit();
+    munmap_args();
+    brk_args();
+    mprotect_args();
+    msync_args();
+    mincore_args();
+    sparse_populate();
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+fn report(name: &[u8], code: i64) {
+    print(name);
+    if code == 0 {
+        println(b":OK");
+    } else {
+        print(b":FAIL ");
+        print_num(code);
+        println(b"");
+    }
+}
+
+/// Run `cases` (a, b, c, expected) through `f` in order: 0, or the
+/// 1-based index of the first case returning something else (printed)
+fn table(name: &[u8], cases: &[(u64, u64, i64, i64)], f: fn(u64, u64, i64) -> i64) -> i64 {
+    for (i, &(a, b, c, want)) in cases.iter().enumerate() {
+        let got = f(a, b, c);
+        if got != want {
+            print(name);
+            print(b": case ");
+            print_num(i as i64 + 1);
+            print(b" got ");
+            print_num(got);
+            print(b" want ");
+            print_num(want);
+            println(b"");
+            return i as i64 + 1;
+        }
+    }
+    0
+}
+
+fn get(a: u64) -> u64 {
+    unsafe { core::ptr::read_volatile(a as *const u64) }
+}
+
+fn put(a: u64, v: u64) {
+    unsafe { core::ptr::write_volatile(a as *mut u64, v) }
+}
+
+fn pattern(a: u64) -> u64 {
+    a ^ 0x5a5a_0000_0000_5a5a
+}
+
+/// Write the pattern word of each page of [a, a + len)
+fn fill(a: u64, len: u64) {
+    for p in (a..a + len).step_by(P as usize) {
+        put(p, pattern(p));
+    }
+}
+
+/// Each page of [a, a + len) holds its pattern word
+fn intact(a: u64, len: u64) -> bool {
+    (a..a + len)
+        .step_by(P as usize)
+        .all(|p| get(p) == pattern(p))
+}
+
+/// Each page of [a, a + len) reads zero
+fn zeroed(a: u64, len: u64) -> bool {
+    (a..a + len).step_by(P as usize).all(|p| get(p) == 0)
+}
+
+/// A VMA is mapped at `a` (mincore succeeds)
+fn mapped(a: u64) -> bool {
+    let mut v = [0u8; 1];
+    sys_mincore(a, P, v.as_mut_ptr()) == 0
+}
+
+/// `n` read-write private anonymous pages, filled, with an unmapped
+/// page below and above; None if mmap fails
+fn area(n: u64) -> Option<u64> {
+    let p = sys_mmap(0, (n + 2) * P, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p < 0 {
+        return None;
+    }
+    let p = p as u64;
+    sys_munmap(p, P);
+    sys_munmap(p + (n + 1) * P, P);
+    fill(p + P, n * P);
+    Some(p + P)
+}
+
+/// End of the user address space: the largest candidate whose last
+/// page can be mapped (or already is)
+fn top() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    const C: [u64; 2] = [(1 << 47) - P, (1 << 56) - P];
+    #[cfg(target_arch = "aarch64")]
+    const C: [u64; 2] = [1 << 48, 1 << 52];
+    let mut t = C[0];
+    for &c in &C[1..] {
+        if mappable(c - P) {
+            t = c;
+        }
+    }
+    t
+}
+
+/// The page at `a` is a user address (mapping it works or finds it taken)
+fn mappable(a: u64) -> bool {
+    let r = sys_mmap(
+        a,
+        P,
+        PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    );
+    if r == a as i64 {
+        sys_munmap(a, P);
+        return true;
+    }
+    r == EEXIST
+}
+
+/// Parse a hex number at the start of `s`: (value, digits)
+fn hex(s: &[u8]) -> (u64, usize) {
+    let mut v = 0u64;
+    let mut n = 0;
+    for &c in s {
+        let d = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => break,
+        };
+        v = (v << 4) | d as u64;
+        n += 1;
+    }
+    (v, n)
+}
+
+/// Call `f` with (start, end, perms) of each /proc/self/maps line
+fn maps(f: &mut dyn FnMut(u64, u64, &[u8])) {
+    let mut buf = [0u8; 16384];
+    let fd = sys_open(b"/proc/self/maps\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return;
+    }
+    let mut len = 0;
+    while len < buf.len() {
+        let n = sys_read(fd as u64, buf[len..].as_mut_ptr(), (buf.len() - len) as u64);
+        if n <= 0 {
+            break;
+        }
+        len += n as usize;
+    }
+    sys_close(fd as u64);
+    for l in buf[..len].split(|&b| b == b'\n') {
+        let (s, n) = hex(l);
+        let (e, m) = l.get(n + 1..).map_or((0, 0), hex);
+        if n > 0 && m > 0 {
+            f(s, e, l.get(n + m + 2..n + m + 6).unwrap_or(b""));
+        }
+    }
+}
+
+/// Number of /proc/self/maps lines (VMAs) meeting [lo, hi)
+fn vmas(lo: u64, hi: u64) -> i64 {
+    let mut n = 0;
+    maps(&mut |s, e, _| n += (s < hi && e > lo) as i64);
+    n
+}
+
+/// /proc/self/maps permissions of the VMA holding `a`
+fn perm(a: u64) -> [u8; 4] {
+    let mut p = [0u8; 4];
+    maps(&mut |s, e, perms| {
+        if s <= a && a < e && perms.len() == 4 {
+            p.copy_from_slice(perms);
+        }
+    });
+    p
+}
+
+/// Run `f` in a child; its value (0..255) as exit status, or 1000 + the
+/// signal that killed it
+fn child(f: &dyn Fn() -> bool) -> i64 {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(if f() { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f != 0 {
+        1000 + (st & 0x7f) as i64
+    } else {
+        ((st >> 8) & 0xff) as i64
+    }
+}
+
+// ============================================================================
+// madvise
+// ============================================================================
+
+fn madv(a: u64, len: u64, advice: i64) -> i64 {
+    sys_madvise(a, len, advice as i32)
+}
+
+fn madv_args() {
+    const NAME: &[u8] = b"MADV_ARGS";
+    let Some(a) = area(4) else {
+        return report(NAME, -1);
+    };
+    let t = top();
+    let hi = t + (1 << 28);
+    let n = MADV_NORMAL as i64;
+    let cases = [
+        (a + 1, P, n, EINVAL),
+        (a + 1, 0, n, EINVAL),
+        (a, P, 7, EINVAL),
+        (a, 0, 7, EINVAL),
+        (a, P, -1, EINVAL),
+        (a, P, 999, EINVAL),
+        (a, 0, n, 0),
+        (a, u64::MAX, n, EINVAL),
+        (a, u64::MAX - 2 * P, n, EINVAL),
+        (a, LAST - a + P, n, EINVAL),
+        (LAST, P, n, EINVAL),
+        (LAST, 0, n, 0),
+        (hi, P, n, ENOMEM),
+        (hi, P, MADV_DONTNEED as i64, ENOMEM),
+        (t, P, MADV_DONTNEED as i64, ENOMEM),
+        (t - P, 2 * P, n, ENOMEM),
+        (a - P, P, n, ENOMEM),
+        (a - P, 2 * P, n, ENOMEM),
+        (a, 5 * P, n, ENOMEM),
+        (a + 4 * P, P, MADV_DONTNEED as i64, ENOMEM),
+        (a, 4 * P, n, 0),
+        (a, 4 * P - 1, MADV_RANDOM as i64, 0),
+        (a, 4 * P, n, 0),
+        (a, 4 * P, MADV_WILLNEED as i64, 0),
+        (a, 4 * P, MADV_COLD as i64, 0),
+        (a, 4 * P, MADV_PAGEOUT as i64, 0),
+    ];
+    let mut code = table(NAME, &cases, madv);
+    if code == 0 && !intact(a, 4 * P) {
+        code = 100;
+    } else if code == 0 && (vmas(a - P, a + 5 * P) != 1 || mapped(a - P) || mapped(a + 4 * P)) {
+        code = 101;
+    }
+    sys_munmap(a, 4 * P);
+    report(NAME, code);
+}
+
+fn madv_holes() {
+    const NAME: &[u8] = b"MADV_HOLES";
+    let Some(b) = area(5) else {
+        return report(NAME, -1);
+    };
+    sys_munmap(b + 2 * P, P);
+    let code = madv_holes_on(b);
+    sys_munmap(b, 5 * P);
+    report(NAME, code);
+}
+
+/// [b, b + 2P) and [b + 3P, b + 5P) mapped and filled
+fn madv_holes_on(b: u64) -> i64 {
+    if madv(b, 5 * P, MADV_DONTNEED as i64) != ENOMEM {
+        return 1;
+    }
+    if !zeroed(b, 2 * P) || !zeroed(b + 3 * P, 2 * P) || mapped(b + 2 * P) {
+        return 2;
+    }
+    if vmas(b, b + 5 * P) != 2 {
+        return 3;
+    }
+    fill(b, 2 * P);
+    fill(b + 3 * P, 2 * P);
+    if madv(b + P, 3 * P, MADV_DONTFORK as i64) != ENOMEM || vmas(b, b + 5 * P) != 4 {
+        return 4;
+    }
+    let seen = || {
+        mapped(b) && !mapped(b + P) && !mapped(b + 3 * P) && get(b + 4 * P) == pattern(b + 4 * P)
+    };
+    if child(&seen) != 0 {
+        return 5;
+    }
+    if madv(b, 5 * P, MADV_DOFORK as i64) != ENOMEM || vmas(b, b + 5 * P) != 2 {
+        return 6;
+    }
+    if madv(b + 2 * P, P, MADV_NORMAL as i64) != ENOMEM {
+        return 7;
+    }
+    if madv(b + 2 * P, 2 * P, MADV_DONTNEED as i64) != ENOMEM {
+        return 8;
+    }
+    if get(b + 3 * P) != 0 || !intact(b + 4 * P, P) || !intact(b, 2 * P) {
+        return 9;
+    }
+    0
+}
+
+fn madv_split() {
+    const NAME: &[u8] = b"MADV_SPLIT";
+    let Some(a) = area(4) else {
+        return report(NAME, -1);
+    };
+    let code = madv_split_on(a);
+    sys_munmap(a, 4 * P);
+    report(NAME, code);
+}
+
+/// `a`: four filled pages, one VMA
+fn madv_split_on(a: u64) -> i64 {
+    let lines = || vmas(a, a + 4 * P);
+    if madv(a + P, P, MADV_DONTFORK as i64) != 0 || lines() != 3 {
+        return 1;
+    }
+    if madv(a + 2 * P, P, MADV_WIPEONFORK as i64) != 0 || lines() != 4 {
+        return 2;
+    }
+    let seen = || {
+        get(a) == pattern(a)
+            && !mapped(a + P)
+            && get(a + 2 * P) == 0
+            && get(a + 3 * P) == pattern(a + 3 * P)
+    };
+    if child(&seen) != 0 {
+        return 3;
+    }
+    if madv(a, 4 * P, MADV_DOFORK as i64) != 0 || lines() != 3 {
+        return 4;
+    }
+    if madv(a, 4 * P, MADV_KEEPONFORK as i64) != 0 || lines() != 1 {
+        return 5;
+    }
+    let whole = || intact(a, 4 * P);
+    if child(&whole) != 0 || !whole() {
+        return 6;
+    }
+    if madv(a + 3 * P, P, MADV_DONTDUMP as i64) != 0 || lines() != 2 {
+        return 7;
+    }
+    if madv(a, 4 * P, MADV_DODUMP as i64) != 0 || lines() != 1 {
+        return 8;
+    }
+    // Nothing changes: no split
+    if madv(a + P, P, MADV_NORMAL as i64) != 0 || lines() != 1 {
+        return 9;
+    }
+    if madv(a + P, 2 * P, MADV_DONTNEED as i64) != 0 || lines() != 1 {
+        return 10;
+    }
+    if !intact(a, P) || !zeroed(a + P, 2 * P) || !intact(a + 3 * P, P) {
+        return 11;
+    }
+    0
+}
+
+/// Two pages at `c`: read-write then read-only (two VMAs), filled, the
+/// one at `locked` (0 or 1) locked
+fn locked_pair(locked: u64) -> Option<u64> {
+    let c = area(2)?;
+    if sys_mprotect(c + P, P, PROT_READ) != 0 || sys_mlock(c + locked * P, P) != 0 {
+        sys_munmap(c, 2 * P);
+        return None;
+    }
+    Some(c)
+}
+
+fn madv_locked() {
+    const NAME: &[u8] = b"MADV_LOCKED";
+    let Some(c) = locked_pair(1) else {
+        return report(NAME, -1);
+    };
+    let l = c + P;
+    let cases = [
+        (l, P, MADV_DONTNEED as i64, EINVAL),
+        (l, P, MADV_FREE as i64, EINVAL),
+        (l, P, MADV_COLD as i64, EINVAL),
+        (l, P, MADV_PAGEOUT as i64, EINVAL),
+        (l, P, MADV_REMOVE as i64, EINVAL),
+        (l, P, MADV_NORMAL as i64, 0),
+        (l, P, MADV_WILLNEED as i64, 0),
+        (c, 2 * P, MADV_DONTNEED as i64, EINVAL),
+    ];
+    let mut code = table(NAME, &cases, madv);
+    // The unlocked page was emptied before the walk met the locked one
+    if code == 0 && (get(c) != 0 || !intact(l, P)) {
+        code = 100;
+    }
+    if code == 0 && (sys_munlock(l, P) != 0 || madv(l, P, MADV_DONTNEED as i64) != 0 || get(l) != 0)
+    {
+        code = 101;
+    }
+    sys_munmap(c, 2 * P);
+    if code == 0 {
+        code = match locked_pair(0) {
+            // Locked first: the walk stops before the second page
+            Some(d) => {
+                let r = if madv(d, 2 * P, MADV_DONTNEED as i64) != EINVAL || !intact(d, 2 * P) {
+                    102
+                } else {
+                    0
+                };
+                sys_munmap(d, 2 * P);
+                r
+            }
+            None => 103,
+        };
+    }
+    report(NAME, code);
+}
+
+fn madv_shared() {
+    const NAME: &[u8] = b"MADV_SHARED";
+    let s = sys_mmap(0, 2 * P, RW, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if s < 0 {
+        return report(NAME, -1);
+    }
+    let s = s as u64;
+    let q = sys_mmap(s + P, P, RW, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    let code = if q != (s + P) as i64 {
+        -2
+    } else {
+        madv_shared_on(s)
+    };
+    sys_munmap(s, 2 * P);
+    report(NAME, code);
+}
+
+/// [s shared][s + P private], both anonymous
+fn madv_shared_on(s: u64) -> i64 {
+    fill(s, 2 * P);
+    if madv(s, 2 * P, MADV_REMOVE as i64) != EINVAL {
+        return 1;
+    }
+    if get(s) != 0 || !intact(s + P, P) {
+        return 2;
+    }
+    fill(s, P);
+    if madv(s, P, MADV_FREE as i64) != EINVAL || !intact(s, P) {
+        return 3;
+    }
+    if madv(s, 2 * P, MADV_FREE as i64) != EINVAL || !intact(s, 2 * P) {
+        return 4;
+    }
+    if madv(s + P, P, MADV_FREE as i64) != 0 {
+        return 5;
+    }
+    0
+}
+
+// ============================================================================
+// mlock / munlock
+// ============================================================================
+
+/// The page at `p` is locked: MADV_COLD refuses locked memory
+fn locked(p: u64) -> bool {
+    madv(p, P, MADV_COLD as i64) == EINVAL
+}
+
+/// The pages of [a, a + n pages) locked as `want` says, page by page
+fn locks(a: u64, want: &[bool]) -> bool {
+    want.iter()
+        .enumerate()
+        .all(|(i, &w)| locked(a + i as u64 * P) == w)
+}
+
+fn mlock(a: u64, len: u64, _: i64) -> i64 {
+    sys_mlock(a, len)
+}
+
+fn munlock(a: u64, len: u64, _: i64) -> i64 {
+    sys_munlock(a, len)
+}
+
+fn mlock_args() {
+    const NAME: &[u8] = b"MLOCK_ARGS";
+    let Some(a) = area(4) else {
+        return report(NAME, -1);
+    };
+    let t = top();
+    let hi = t + (1 << 28);
+    let cases = [
+        (a, 0, 0, 0),
+        (a, u64::MAX, 0, 0),
+        (a + 1, u64::MAX, 0, 0),
+        (a, u64::MAX - 2 * P, 0, EINVAL),
+        (a, LAST - a + P, 0, EINVAL),
+        (LAST, P, 0, EINVAL),
+        (t, P, 0, ENOMEM),
+        (hi, P, 0, ENOMEM),
+        (t - P, 2 * P, 0, ENOMEM),
+        (a - P, 2 * P, 0, ENOMEM),
+        (a - P, P, 0, ENOMEM),
+    ];
+    let mut code = table(NAME, &cases, mlock);
+    if code == 0 && (!locks(a, &[false; 4]) || vmas(a, a + 4 * P) != 1) {
+        code = 100;
+    }
+    if code == 0 {
+        code = table(NAME, &cases, munlock);
+    }
+    // An unaligned start with length 0 still covers its page
+    if code == 0 && (sys_mlock(a + 1, 0) != 0 || !locks(a, &[true, false, false, false])) {
+        code = 101;
+    }
+    if code == 0
+        && (sys_munlock(a + 2, 0) != 0 || !locks(a, &[false; 4]) || vmas(a, a + 4 * P) != 1)
+    {
+        code = 102;
+    }
+    sys_munmap(a, 4 * P);
+    report(NAME, code);
+}
+
+fn mlock_split() {
+    const NAME: &[u8] = b"MLOCK_SPLIT";
+    let Some(a) = area(4) else {
+        return report(NAME, -1);
+    };
+    let code = mlock_split_on(a);
+    sys_munmap(a, 4 * P);
+    report(NAME, code);
+}
+
+fn mlock_split_on(a: u64) -> i64 {
+    let lines = || vmas(a, a + 4 * P);
+    if sys_mlock(a + P, 2 * P) != 0 || lines() != 3 || !locks(a, &[false, true, true, false]) {
+        return 1;
+    }
+    if sys_munlock(a + P, P) != 0 || lines() != 3 || !locks(a, &[false, false, true, false]) {
+        return 2;
+    }
+    if sys_mlock2(a, P, MLOCK_ONFAULT) != 0
+        || lines() != 4
+        || !locks(a, &[true, false, true, false])
+    {
+        return 3;
+    }
+    if sys_mlock(a + 2 * P + 8, 2 * P - 8) != 0
+        || lines() != 3
+        || !locks(a, &[true, false, true, true])
+    {
+        return 4;
+    }
+    if sys_munlock(a, 4 * P) != 0 || lines() != 1 || !locks(a, &[false; 4]) {
+        return 5;
+    }
+    if !intact(a, 4 * P) {
+        return 6;
+    }
+    0
+}
+
+fn mlock_holes() {
+    const NAME: &[u8] = b"MLOCK_HOLES";
+    let Some(a) = area(4) else {
+        return report(NAME, -1);
+    };
+    let Some(b) = area(5) else {
+        sys_munmap(a, 4 * P);
+        return report(NAME, -1);
+    };
+    sys_munmap(b + 2 * P, P);
+    let code = mlock_holes_on(a, b);
+    sys_munmap(a, 4 * P);
+    sys_munmap(b, 5 * P);
+    report(NAME, code);
+}
+
+/// `a`: four pages, one VMA; `b`: [b, b + 2P) hole [b + 3P, b + 5P)
+fn mlock_holes_on(a: u64, b: u64) -> i64 {
+    if sys_mlock(a, 5 * P) != ENOMEM || !locks(a, &[true; 4]) || vmas(a, a + 4 * P) != 1 {
+        return 1;
+    }
+    if sys_munlock(a, 5 * P) != ENOMEM || !locks(a, &[false; 4]) {
+        return 2;
+    }
+    let both = [true, true, false, false];
+    if sys_mlock(b, 5 * P) != ENOMEM || !locks(b, &both) || !locks(b + 3 * P, &[false; 2]) {
+        return 3;
+    }
+    if sys_munlock(b, 5 * P) != ENOMEM || !locks(b, &[false; 2]) {
+        return 4;
+    }
+    if sys_mlock(b + P, 3 * P) != ENOMEM
+        || !locks(b, &[false, true])
+        || !locks(b + 3 * P, &[false; 2])
+    {
+        return 5;
+    }
+    if vmas(b, b + 5 * P) != 3 {
+        return 6;
+    }
+    0
+}
+
+fn mlock_limit() {
+    const NAME: &[u8] = b"MLOCK_LIMIT";
+    let code = child(&|| mlock_limit_child() == 0);
+    report(NAME, code);
+}
+
+/// In a child: no capabilities, RLIMIT_MEMLOCK four pages
+fn mlock_limit_child() -> i64 {
+    let (Some(a), Some(b), Some(c)) = (area(4), area(1), area(3)) else {
+        return 1;
+    };
+    let lim = RLimit {
+        rlim_cur: 4 * P,
+        rlim_max: 4 * P,
+    };
+    if !super::netlink::drop_caps() || sys_setrlimit(RLIMIT_MEMLOCK, &lim) != 0 {
+        return 2;
+    }
+    if sys_mlock(a, 4 * P) != 0 || sys_mlock(a, 4 * P) != 0 {
+        return 3;
+    }
+    if sys_mlock(b, P) != ENOMEM || locked(b) {
+        return 4;
+    }
+    // One page of the four given back: exactly one more fits
+    if sys_munlock(a + P, P) != 0 || sys_mlock(b, P) != 0 || sys_mlock(a + P, P) != ENOMEM {
+        return 5;
+    }
+    sys_munmap(a, 4 * P);
+    if sys_mlock(c, 3 * P) != 0 || sys_mlock(b, P) != 0 || sys_mlock(a, P) >= 0 {
+        return 6;
+    }
+    0
+}
+
+// ============================================================================
+// munmap, brk, mprotect, msync, mincore
+// ============================================================================
+
+fn munmap(a: u64, len: u64, _: i64) -> i64 {
+    sys_munmap(a, len)
+}
+
+fn munmap_args() {
+    const NAME: &[u8] = b"MUNMAP_ARGS";
+    let Some(a) = area(4) else {
+        return report(NAME, -1);
+    };
+    let t = top();
+    let hi = t + (1 << 28);
+    let cases = [
+        (a + 1, P, 0, EINVAL),
+        (a, 0, 0, EINVAL),
+        (a + 1, 0, 0, EINVAL),
+        (t, 0, 0, EINVAL),
+        (t, P, 0, EINVAL),
+        (hi, P, 0, EINVAL),
+        (LAST, P, 0, EINVAL),
+        (t - P, 2 * P, 0, EINVAL),
+        (a, u64::MAX, 0, EINVAL),
+        (a, u64::MAX - 2 * P, 0, EINVAL),
+        (a, t - a + 1, 0, EINVAL),
+        (a - P, 0, 0, EINVAL),
+    ];
+    let mut code = table(NAME, &cases, munmap);
+    if code == 0 && (!intact(a, 4 * P) || vmas(a - P, a + 5 * P) != 1) {
+        code = 100;
+    }
+    let ok = [(a - P, P, 0, 0), (a + P, P, 0, 0), (a + 3 * P, 2 * P, 0, 0)];
+    if code == 0 {
+        code = table(NAME, &ok, munmap);
+    }
+    if code == 0 && (!intact(a, P) || !intact(a + 2 * P, P) || mapped(a + P) || mapped(a + 3 * P)) {
+        code = 101;
+    }
+    if code == 0 && (sys_munmap(a - P, 2 * P) != 0 || mapped(a) || vmas(a - P, a + 5 * P) != 1) {
+        code = 102;
+    }
+    sys_munmap(a, 4 * P);
+    report(NAME, code);
+}
+
+fn brk_args() {
+    const NAME: &[u8] = b"BRK_ARGS";
+    report(NAME, child(&|| brk_child() == 0) as i64);
+}
+
+/// `x` rounded up to a page
+fn up(x: u64) -> u64 {
+    (x + P - 1) & !(P - 1)
+}
+
+/// In a child: the break refuses what Linux refuses
+fn brk_child() -> i64 {
+    let cur = sys_brk(0) as u64;
+    let t = top();
+    let base = up(cur);
+    // A mapping 64 pages above the heap
+    let m = base + 64 * P;
+    let r = sys_mmap(
+        m,
+        P,
+        RW,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    );
+    if r != m as i64 {
+        return 1;
+    }
+    let refused = [
+        u64::MAX,
+        LAST,
+        LAST - P + 1,
+        t,
+        t + (1 << 28),
+        1 << 62,
+        P,
+        1,
+        m - 1,
+        m,
+    ];
+    for (i, &b) in refused.iter().enumerate() {
+        if sys_brk(b) as u64 != cur || sys_brk(0) as u64 != cur {
+            print(b"BRK_ARGS: refused case ");
+            print_num(i as i64 + 1);
+            println(b"");
+            return 10 + i as i64;
+        }
+    }
+    if !mapped(m) || mapped(base) {
+        return 2;
+    }
+    // One page left below the mapping: allowed
+    if sys_brk(m - P) as u64 != m - P {
+        return 3;
+    }
+    put(m - 2 * P, 7);
+    if sys_brk(cur) as u64 != cur || mapped(base) {
+        return 4;
+    }
+    // The heap unmapped by hand cannot shrink
+    if sys_brk(base + 4 * P) as u64 != base + 4 * P {
+        return 5;
+    }
+    sys_munmap(base, 4 * P);
+    if sys_brk(cur) as u64 != base + 4 * P {
+        return 6;
+    }
+    if sys_brk(base + 8 * P) as u64 != base + 8 * P || sys_brk(cur) as u64 != cur {
+        return 7;
+    }
+    let lim = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if sys_setrlimit(RLIMIT_DATA, &lim) != 0 {
+        return 8;
+    }
+    if sys_brk(base + 4 * P) as u64 != cur || mapped(base) {
+        return 9;
+    }
+    0
+}
+
+fn mprot(a: u64, len: u64, prot: i64) -> i64 {
+    sys_mprotect(a, len, prot as u32)
+}
+
+fn mprotect_args() {
+    const NAME: &[u8] = b"MPROTECT_ARGS";
+    let Some(a) = area(4) else {
+        return report(NAME, -1);
+    };
+    let Some(b) = area(5) else {
+        sys_munmap(a, 4 * P);
+        return report(NAME, -1);
+    };
+    sys_munmap(b + 2 * P, P);
+    let code = mprotect_on(a, b);
+    sys_munmap(a, 4 * P);
+    sys_munmap(b, 5 * P);
+    report(NAME, code);
+}
+
+/// `a`: four pages, one VMA; `b`: [b, b + 2P) hole [b + 3P, b + 5P)
+fn mprotect_on(a: u64, b: u64) -> i64 {
+    let t = top();
+    let hi = t + (1 << 28);
+    let r = PROT_READ as i64;
+    let rw = RW as i64;
+    let cases = [
+        (a + 1, P, r, EINVAL),
+        (a + 1, 0, r, EINVAL),
+        (a, 0, r, 0),
+        (a, 0, 0x40, 0),
+        (a, P, 0x40, EINVAL),
+        (a, u64::MAX, r, ENOMEM),
+        (a, u64::MAX, 0x40, ENOMEM),
+        (a, u64::MAX - 2 * P, r, ENOMEM),
+        (a, LAST - a + P, r, ENOMEM),
+        (LAST, P, r, ENOMEM),
+        (t, P, r, ENOMEM),
+        (hi, P, r, ENOMEM),
+        (t - P, 2 * P, rw, ENOMEM),
+        (a - P, P, r, ENOMEM),
+        (a - P, 2 * P, r, ENOMEM),
+        (b + 2 * P, 2 * P, r, ENOMEM),
+    ];
+    let code = table(b"MPROTECT_ARGS", &cases, mprot);
+    if code != 0 {
+        return code;
+    }
+    if perm(a) != *b"rw-p" || vmas(a, a + 4 * P) != 1 || perm(b + 3 * P) != *b"rw-p" {
+        return 100;
+    }
+    // Into the hole: the first VMA changes, then ENOMEM
+    if sys_mprotect(b, 5 * P, PROT_READ) != ENOMEM
+        || perm(b) != *b"r--p"
+        || perm(b + 3 * P) != *b"rw-p"
+    {
+        return 101;
+    }
+    if sys_mprotect(a, 5 * P, PROT_READ) != ENOMEM || perm(a + 3 * P) != *b"r--p" {
+        return 102;
+    }
+    if sys_mprotect(b, 5 * P, RW) != ENOMEM || sys_mprotect(a, 4 * P, RW) != 0 {
+        return 103;
+    }
+    if perm(b) != *b"rw-p"
+        || vmas(b, b + 5 * P) != 2
+        || vmas(a, a + 4 * P) != 1
+        || !intact(a, 4 * P)
+    {
+        return 104;
+    }
+    0
+}
+
+fn msync(a: u64, len: u64, flags: i64) -> i64 {
+    sys_msync(a, len, flags as i32)
+}
+
+fn msync_args() {
+    const NAME: &[u8] = b"MSYNC_ARGS";
+    let Some(a) = area(4) else {
+        return report(NAME, -1);
+    };
+    let Some(b) = area(5) else {
+        sys_munmap(a, 4 * P);
+        return report(NAME, -1);
+    };
+    sys_munmap(b + 2 * P, P);
+    let code = msync_on(a, b);
+    sys_munmap(a, 4 * P);
+    sys_munmap(b, 5 * P);
+    report(NAME, code);
+}
+
+/// `a`: four pages, one VMA; `b`: [b, b + 2P) hole [b + 3P, b + 5P)
+fn msync_on(a: u64, b: u64) -> i64 {
+    let t = top();
+    let hi = t + (1 << 28);
+    let (asy, syn, inv) = (MS_ASYNC as i64, MS_SYNC as i64, MS_INVALIDATE as i64);
+    let cases = [
+        (a + 1, P, asy, EINVAL),
+        (a, P, 8, EINVAL),
+        (a, P, asy | syn, EINVAL),
+        (a + 1, 0, asy, EINVAL),
+        (a, 0, asy, 0),
+        (a, u64::MAX, asy, 0),
+        (a, u64::MAX - 2 * P, asy, ENOMEM),
+        (LAST, P, asy, ENOMEM),
+        (t, P, asy, ENOMEM),
+        (hi, P, syn, ENOMEM),
+        (t - P, 2 * P, asy, ENOMEM),
+        (a - P, P, asy, ENOMEM),
+        (a - P, P, syn, ENOMEM),
+        (a - P, 2 * P, asy, ENOMEM),
+        (a - P, 2 * P, syn, ENOMEM),
+        (a, 5 * P, syn, ENOMEM),
+        (a, 5 * P, 0, ENOMEM),
+        (a, 4 * P, syn, 0),
+        (a, 4 * P - 1, inv, 0),
+        (b, 5 * P, asy, ENOMEM),
+        (b, 5 * P, syn, ENOMEM),
+        (b, 5 * P, asy | inv, ENOMEM),
+    ];
+    let code = table(b"MSYNC_ARGS", &cases, msync);
+    if code != 0 {
+        return code;
+    }
+    if sys_mlock(a + 3 * P, P) != 0 {
+        return 100;
+    }
+    let locked = [
+        (a, 4 * P, inv, EBUSY),
+        (a, 4 * P, syn, 0),
+        (a, 4 * P, asy, 0),
+        // MS_ASYNC alone stops at the hole; with MS_INVALIDATE the walk
+        // goes on to the locked page
+        (a - P, 5 * P, asy, ENOMEM),
+        (a - P, 5 * P, asy | inv, EBUSY),
+        (a - P, 3 * P, inv, ENOMEM),
+    ];
+    let code = table(b"MSYNC_ARGS locked", &locked, msync);
+    if code != 0 {
+        return 200 + code;
+    }
+    sys_munlock(a, 4 * P);
+    0
+}
+
+fn mincore(a: u64, len: u64, vec: i64) -> i64 {
+    sys_mincore(a, len, vec as *mut u8)
+}
+
+fn mincore_args() {
+    const NAME: &[u8] = b"MINCORE_ARGS";
+    let Some(a) = area(4) else {
+        return report(NAME, -1);
+    };
+    let mut code = mincore_on(a);
+    sys_munmap(a, 4 * P);
+    if code == 0 {
+        code = mincore_big();
+    }
+    report(NAME, code);
+}
+
+/// `a`: four filled pages, holes around
+fn mincore_on(a: u64) -> i64 {
+    let t = top();
+    let hi = t + (1 << 28);
+    let mut v = [0xaau8; 8];
+    let vp = v.as_mut_ptr() as i64;
+    let cases = [
+        (a + 1, P, vp, EINVAL),
+        (a + 1, 0, vp, EINVAL),
+        (a, 0, vp, 0),
+        (a, 0, 0, 0),
+        (t, P, vp, ENOMEM),
+        (hi, P, vp, ENOMEM),
+        (LAST, P, vp, ENOMEM),
+        (a, u64::MAX, vp, ENOMEM),
+        (a, LAST - a + P, vp, ENOMEM),
+        (t - P, 2 * P, vp, ENOMEM),
+        (a - P, P, vp, ENOMEM),
+        (a - P, 2 * P, vp, ENOMEM),
+        (a, P, -0x10000, EFAULT),
+        (a, P, 0, EFAULT),
+    ];
+    let code = table(b"MINCORE_ARGS", &cases, mincore);
+    if code != 0 {
+        return code;
+    }
+    let mut v = [0xaau8; 8];
+    // Into the hole: the four pages before it are reported
+    if sys_mincore(a, 5 * P, v.as_mut_ptr()) != ENOMEM || v[..4] != [1; 4] || v[4] != 0xaa {
+        return 100;
+    }
+    let mut v = [0xaau8; 8];
+    if sys_mincore(a, 4 * P - 1, v.as_mut_ptr()) != 0 || v[..4] != [1; 4] || v[4] != 0xaa {
+        return 101;
+    }
+    0
+}
+
+/// mincore over 5000 pages, one touched: one call, every byte right
+fn mincore_big() -> i64 {
+    const N: u64 = 5000;
+    let vb = sys_mmap(0, 2 * P, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let m = sys_mmap(0, N * P, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if vb < 0 || m < 0 {
+        return 300;
+    }
+    let (vb, m) = (vb as u64, m as u64);
+    let mut code = 0;
+    if sys_madvise(m, N * P, MADV_NOHUGEPAGE) != 0 {
+        code = 301;
+    }
+    put(m + 4500 * P, 1);
+    let v = unsafe { core::slice::from_raw_parts_mut(vb as *mut u8, 2 * P as usize) };
+    v.fill(0xaa);
+    if code == 0 && sys_mincore(m, N * P - 1, vb as *mut u8) != 0 {
+        code = 302;
+    }
+    let want = |i: usize| match i {
+        4500 => 1,
+        i if i < N as usize => 0,
+        _ => 0xaa,
+    };
+    if code == 0 && !(0..v.len()).all(|i| v[i] == want(i)) {
+        code = 303;
+    }
+    sys_munmap(m, N * P);
+    sys_munmap(vb, 2 * P);
+    code
+}
+
+fn sparse_populate() {
+    const NAME: &[u8] = b"SPARSE_POPULATE";
+    report(NAME, child(&|| sparse_child() == 0) as i64);
+}
+
+/// In a child (mlockall locks it all): [p] 64GB hole [q]
+fn sparse_child() -> i64 {
+    const GAP: u64 = 64 << 30;
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+    let r = sys_mmap(0, GAP + 2 * P, PROT_NONE, flags, -1, 0);
+    if r < 0 {
+        return 1;
+    }
+    let p = r as u64;
+    let q = p + GAP + P;
+    if sys_munmap(p + P, GAP) != 0 || sys_mprotect(p, P, RW) != 0 || sys_mprotect(q, P, RW) != 0 {
+        return 2;
+    }
+    put(p, 1);
+    put(q, 2);
+    if sys_mlock(p, GAP + 2 * P) != ENOMEM || !locked(p) || locked(q) {
+        return 3;
+    }
+    if sys_munlock(p, GAP + 2 * P) != ENOMEM || locked(p) {
+        return 4;
+    }
+    if sys_mlockall(MCL_CURRENT) != 0 || !locked(p) || !locked(q) || sys_munlockall() != 0 {
+        return 5;
+    }
+    let m = sys_mmap(
+        0,
+        4 * P,
+        RW,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
+        -1,
+        0,
+    );
+    if m < 0 {
+        return 6;
+    }
+    let mut v = [0u8; 4];
+    if sys_mincore(m as u64, 4 * P, v.as_mut_ptr()) != 0 || v != [1; 4] {
+        return 7;
+    }
+    if get(p) != 1 || get(q) != 2 {
+        return 8;
+    }
+    0
+}

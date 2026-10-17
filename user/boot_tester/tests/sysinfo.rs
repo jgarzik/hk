@@ -11,10 +11,13 @@
 //! - Test 77: settimeofday() - set time (x86_64 only)
 //! - Test 78: settimeofday() EINVAL - invalid usec (x86_64 only)
 
-use super::helpers::{print, println, print_num, print_cstr, starts_with, host_mode};
-use hk_syscall::{sys_sethostname, sys_setdomainname, sys_uname, sys_clock_settime, sys_clock_gettime, UtsName, Timespec};
+use super::helpers::{host_mode, print, print_cstr, print_num, println, starts_with};
+use hk_syscall::{
+    Timespec, UtsName, sys_clock_gettime, sys_clock_settime, sys_setdomainname, sys_sethostname,
+    sys_uname,
+};
 #[cfg(target_arch = "x86_64")]
-use hk_syscall::{sys_settimeofday, sys_gettimeofday, Timeval};
+use hk_syscall::{Timeval, sys_gettimeofday, sys_settimeofday};
 
 // Clock IDs
 const CLOCK_REALTIME: i32 = 0;
@@ -38,7 +41,6 @@ pub fn run_tests() {
 
 /// Test 70: uname() - get system identification
 fn test_uname() {
-
     let mut uts = UtsName::default();
     let ret = sys_uname(&mut uts as *mut UtsName);
     if ret != 0 {
@@ -67,7 +69,6 @@ fn test_uname() {
 
 /// Test 71: sethostname() - set hostname
 fn test_sethostname() {
-
     let hostname = b"testhost";
     let ret = sys_sethostname(hostname.as_ptr(), hostname.len() as u64);
     if ret != 0 {
@@ -94,7 +95,6 @@ fn test_sethostname() {
 
 /// Test 72: setdomainname() - set domain name
 fn test_setdomainname() {
-
     let domain = b"testdomain";
     let ret = sys_setdomainname(domain.as_ptr(), domain.len() as u64);
     if ret != 0 {
@@ -121,7 +121,6 @@ fn test_setdomainname() {
 
 /// Test 73: sethostname() with too-long name (should fail with EINVAL)
 fn test_sethostname_einval() {
-
     // 65 bytes is > 64 (max length)
     let long_name = [b'x'; 65];
     let ret = sys_sethostname(long_name.as_ptr(), 65);
@@ -137,7 +136,10 @@ fn test_sethostname_einval() {
 /// Test 74: clock_settime() - set realtime clock
 fn test_clock_settime_basic() {
     // Get current time
-    let mut ts_before = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts_before = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     let ret = sys_clock_gettime(CLOCK_REALTIME, &mut ts_before);
     if ret != 0 {
         print(b"CLOCK_SETTIME:FAIL: clock_gettime() returned ");
@@ -158,7 +160,10 @@ fn test_clock_settime_basic() {
     }
 
     // Read back and verify
-    let mut ts_after = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts_after = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     let ret = sys_clock_gettime(CLOCK_REALTIME, &mut ts_after);
     if ret != 0 {
         print(b"CLOCK_SETTIME:FAIL: clock_gettime() after set returned ");
@@ -178,7 +183,10 @@ fn test_clock_settime_basic() {
 
 /// Test 75: clock_settime() EINVAL - cannot set CLOCK_MONOTONIC
 fn test_clock_settime_monotonic_fails() {
-    let ts = Timespec { tv_sec: 1000, tv_nsec: 0 };
+    let ts = Timespec {
+        tv_sec: 1000,
+        tv_nsec: 0,
+    };
     let ret = sys_clock_settime(CLOCK_MONOTONIC, &ts);
     if ret == -22 {
         // EINVAL
@@ -191,7 +199,10 @@ fn test_clock_settime_monotonic_fails() {
 
 /// Test 76: clock_settime() EINVAL - invalid nsec value
 fn test_clock_settime_invalid_nsec() {
-    let ts = Timespec { tv_sec: 1000, tv_nsec: 1_000_000_000 }; // nsec out of range
+    let ts = Timespec {
+        tv_sec: 1000,
+        tv_nsec: 1_000_000_000,
+    }; // nsec out of range
     let ret = sys_clock_settime(CLOCK_REALTIME, &ts);
     if ret == -22 {
         // EINVAL
@@ -206,7 +217,10 @@ fn test_clock_settime_invalid_nsec() {
 #[cfg(target_arch = "x86_64")]
 fn test_settimeofday_basic() {
     // Get current time
-    let mut tv_before = Timeval { tv_sec: 0, tv_usec: 0 };
+    let mut tv_before = Timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
     let ret = sys_gettimeofday(&mut tv_before, core::ptr::null_mut());
     if ret != 0 {
         print(b"SETTIMEOFDAY:FAIL: gettimeofday() returned ");
@@ -227,7 +241,10 @@ fn test_settimeofday_basic() {
     }
 
     // Read back and verify
-    let mut tv_after = Timeval { tv_sec: 0, tv_usec: 0 };
+    let mut tv_after = Timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
     let ret = sys_gettimeofday(&mut tv_after, core::ptr::null_mut());
     if ret != 0 {
         print(b"SETTIMEOFDAY:FAIL: gettimeofday() after set returned ");
@@ -248,7 +265,10 @@ fn test_settimeofday_basic() {
 /// Test 78: settimeofday() EINVAL - invalid usec (x86_64 only)
 #[cfg(target_arch = "x86_64")]
 fn test_settimeofday_invalid_usec() {
-    let tv = Timeval { tv_sec: 1000, tv_usec: 1_000_000 }; // usec out of range
+    let tv = Timeval {
+        tv_sec: 1000,
+        tv_usec: 1_000_000,
+    }; // usec out of range
     let ret = sys_settimeofday(&tv, core::ptr::null());
     if ret == -22 {
         // EINVAL

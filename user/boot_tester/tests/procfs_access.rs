@@ -5,8 +5,9 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_exit, sys_fork, sys_kill, sys_nanosleep, sys_open, sys_pipe2, sys_prctl,
-    sys_execve, sys_pread64, sys_read, sys_readlink, sys_setresuid, sys_setuid, sys_wait4, sys_write, Timespec, O_DIRECTORY, O_RDONLY,
+    O_DIRECTORY, O_RDONLY, Timespec, sys_close, sys_execve, sys_exit, sys_fork, sys_kill,
+    sys_nanosleep, sys_open, sys_pipe2, sys_prctl, sys_pread64, sys_read, sys_readlink,
+    sys_setresuid, sys_setuid, sys_wait4, sys_write,
 };
 
 const EACCES: i64 = -13;
@@ -91,7 +92,10 @@ fn test_root_reads_all() {
     let mut l = [0u8; 64];
     let child = sys_fork();
     if child == 0 {
-        let ts = Timespec { tv_sec: 5, tv_nsec: 0 };
+        let ts = Timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
         sys_nanosleep(&ts, core::ptr::null_mut());
         sys_exit(0);
     }
@@ -101,7 +105,17 @@ fn test_root_reads_all() {
     sys_kill(child, SIGKILL);
     sys_wait4(child, core::ptr::null_mut(), 0, 0);
     let ok = maps >= 0 && exe > 0 && fd >= 0;
-    report(b"PROC_ACCESS_ROOT", ok, if maps < 0 { maps } else if exe <= 0 { exe } else { fd });
+    report(
+        b"PROC_ACCESS_ROOT",
+        ok,
+        if maps < 0 {
+            maps
+        } else if exe <= 0 {
+            exe
+        } else {
+            fd
+        },
+    );
 }
 
 /// An unprivileged task cannot read root's (pid 1's) private files but
@@ -136,7 +150,10 @@ fn test_nondumpable() {
         sys_setuid(NOBODY as u32);
         sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
         sys_write(p[1] as u64, b"r".as_ptr(), 1);
-        let ts = Timespec { tv_sec: 5, tv_nsec: 0 };
+        let ts = Timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
         sys_nanosleep(&ts, core::ptr::null_mut());
         sys_exit(0);
     }
@@ -169,7 +186,10 @@ fn test_suid_differs() {
     if a == 0 {
         sys_setresuid(UID, UID, 0);
         sys_write(p[1] as u64, b"r".as_ptr(), 1);
-        let ts = Timespec { tv_sec: 5, tv_nsec: 0 };
+        let ts = Timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
         sys_nanosleep(&ts, core::ptr::null_mut());
         sys_exit(0);
     }
@@ -203,7 +223,11 @@ fn test_maps_after_exec() {
         sys_read(p[0] as u64, c.as_mut_ptr(), 1);
         let argv: [*const u8; 2] = [b"boot_tester2\0".as_ptr(), core::ptr::null()];
         let envp: [*const u8; 1] = [core::ptr::null()];
-        sys_execve(b"/bin/boot_tester2\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        sys_execve(
+            b"/bin/boot_tester2\0".as_ptr(),
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
         sys_exit(99);
     }
     let mut b = [0u8; 64];
@@ -225,4 +249,3 @@ fn test_maps_after_exec() {
     let ok = fd >= 0 && n1 > 0 && (n2 == 0 || n2 == ESRCH || same) && (st >> 8) & 0xff == 123;
     report(b"PROC_MAPS_AFTER_EXEC", ok, n2);
 }
-

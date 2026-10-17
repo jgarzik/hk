@@ -9,13 +9,11 @@
 //! - Test epoll_wait timeout behavior
 //! - Test EPOLLONESHOT mode
 
-use super::helpers::{host_mode, print, println, print_num, skip};
+use super::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
-    sys_close, sys_write, sys_pipe2, sys_eventfd2,
-    sys_epoll_create, sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait, sys_epoll_pwait2,
-    EpollEvent, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD,
-    EPOLLIN, EPOLLOUT, EPOLLONESHOT, EPOLL_CLOEXEC,
-    Timespec,
+    EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLIN, EPOLLONESHOT, EPOLLOUT,
+    EpollEvent, Timespec, sys_close, sys_epoll_create, sys_epoll_create1, sys_epoll_ctl,
+    sys_epoll_pwait2, sys_epoll_wait, sys_eventfd2, sys_pipe2, sys_write,
 };
 
 /// Run all epoll tests
@@ -248,8 +246,18 @@ fn test_epoll_wait_multi_data64() {
         println(b"EPOLL_WAIT_MULTI_DATA64:FAIL: setup failed");
         return;
     }
-    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, efd1 as i32, &EpollEvent::new(EPOLLIN, D1));
-    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, efd2 as i32, &EpollEvent::new(EPOLLIN, D2));
+    sys_epoll_ctl(
+        epfd as i32,
+        EPOLL_CTL_ADD,
+        efd1 as i32,
+        &EpollEvent::new(EPOLLIN, D1),
+    );
+    sys_epoll_ctl(
+        epfd as i32,
+        EPOLL_CTL_ADD,
+        efd2 as i32,
+        &EpollEvent::new(EPOLLIN, D2),
+    );
 
     let mut events = [EpollEvent::empty(); 4];
     let ret = sys_epoll_wait(epfd as i32, events.as_mut_ptr(), 4, 0);
@@ -283,7 +291,10 @@ fn test_epoll_event_pad_zero() {
         return;
     }
     if host_mode() {
-        skip(b"EPOLL_EVENT_PAD_ZERO", b"Linux leaves user padding untouched");
+        skip(
+            b"EPOLL_EVENT_PAD_ZERO",
+            b"Linux leaves user padding untouched",
+        );
         return;
     }
     let epfd = sys_epoll_create1(0);
@@ -292,7 +303,12 @@ fn test_epoll_event_pad_zero() {
         println(b"EPOLL_EVENT_PAD_ZERO:FAIL: setup failed");
         return;
     }
-    sys_epoll_ctl(epfd as i32, EPOLL_CTL_ADD, efd as i32, &EpollEvent::new(EPOLLIN, 7));
+    sys_epoll_ctl(
+        epfd as i32,
+        EPOLL_CTL_ADD,
+        efd as i32,
+        &EpollEvent::new(EPOLLIN, 7),
+    );
     let mut buf = [0xAAAA_AAAA_AAAA_AAAAu64; 8];
     let ret = sys_epoll_wait(epfd as i32, buf.as_mut_ptr() as *mut EpollEvent, 4, 0);
     sys_close(epfd as u64);
@@ -503,7 +519,10 @@ fn test_epoll_pwait2_zero_timeout() {
 
     // Empty epoll, zero timeout should return 0 immediately
     let mut events = [EpollEvent::empty(); 4];
-    let timeout = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     let ret = sys_epoll_pwait2(
         epfd as i32,
         events.as_mut_ptr(),
@@ -553,7 +572,10 @@ fn test_epoll_pwait2_with_data() {
     sys_write(pipefd[1] as u64, data.as_ptr(), 1);
 
     // Use 100ms timeout (in nanoseconds)
-    let timeout = Timespec { tv_sec: 0, tv_nsec: 100_000_000 };
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 100_000_000,
+    };
     let mut events = [EpollEvent::empty(); 4];
     let ret = sys_epoll_pwait2(
         epfd as i32,

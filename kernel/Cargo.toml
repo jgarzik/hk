@@ -16,5 +16,8 @@ bitflags.workspace = true
 [features]
 default = []
 # Lockdep-lite: spin-lock tracking, lock order and sleep-in-atomic checks
-# (debug aid; `make check LOCKDEP=1`)
-lockdep = []
+# (debug aid; `make check LOCKDEP=1`); includes mmcheck
+lockdep = ["mmcheck"]
+# VMA/PTE agreement check after each address-range operation
+# (`mm::check`, MMCHECK:FAIL reports; debug aid)
+mmcheck = []

@@ -4,8 +4,8 @@
 //! used by process_vm_readv/process_vm_writev syscalls.
 
 use crate::error::KernelError;
-use crate::mm::MmStruct;
 use crate::mm::vma::{PROT_READ, PROT_WRITE};
+use crate::mm::{MmStruct, Vma};
 
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::paging::{X86_64PageTable, phys_to_virt};
@@ -27,7 +27,40 @@ fn translate_with_root(page_table_root: u64, va: u64) -> Option<u64> {
     Aarch64PageTable::translate_with_root(page_table_root, va)
 }
 
-/// Read from a remote process's memory into a kernel buffer
+/// The VMA of `addr` in the target, which must allow `prot` (Linux
+/// access_remote_vm / get_user_pages_remote): a user address with a
+/// VMA, else EFAULT; no read or write permission: EPERM
+fn remote_vma(mm: &MmStruct, addr: u64, prot: u32) -> Result<&Vma, KernelError> {
+    if addr >= crate::mm::TASK_SIZE {
+        return Err(KernelError::BadAddress);
+    }
+    let vma = mm.find_vma(addr).ok_or(KernelError::BadAddress)?;
+    if vma.prot & prot == 0 {
+        return Err(KernelError::NotPermitted);
+    }
+    Ok(vma)
+}
+
+/// `phys` is in a frame of the allocator (a 4KB page, or a 2MB page by
+/// its head), not MMIO or other memory outside it
+fn ordinary(phys: u64) -> bool {
+    let fa = &crate::FRAME_ALLOCATOR;
+    fa.refcount(phys & !(PAGE_SIZE - 1)) > 0 || fa.refcount_huge(phys & !((2 << 20) - 1)) > 0
+}
+
+/// Bytes from `addr` to the end of its page, at most `n`
+fn page_chunk(addr: u64, n: usize) -> usize {
+    n.min((PAGE_SIZE - (addr & (PAGE_SIZE - 1))) as usize)
+}
+
+/// What a remote access returns after `done` bytes when page `e` fails:
+/// the short count, or the error if nothing was done
+fn short(done: usize, e: KernelError) -> Result<usize, KernelError> {
+    if done > 0 { Ok(done) } else { Err(e) }
+}
+
+/// Read from a remote process's memory into a kernel buffer, page by
+/// page, each in a readable VMA of the user half
 ///
 /// # Arguments
 /// * `mm` - The target process's memory descriptor (locked)
@@ -43,99 +76,73 @@ pub fn access_remote_vm_read(
     remote_addr: u64,
     buf: &mut [u8],
 ) -> Result<usize, KernelError> {
-    if buf.is_empty() {
-        return Ok(0);
+    if remote_addr.checked_add(buf.len() as u64).is_none() {
+        return Err(KernelError::BadAddress);
     }
-
-    let mut total_read = 0usize;
-    let mut current_addr = remote_addr;
-    let mut remaining = buf.len();
-
-    while remaining > 0 {
-        // Check VMA if present (for permission checking)
-        // Note: Some mappings (like initial stack) may not have VMAs,
-        // so we only check permissions if a VMA exists
-        if let Some(vma) = mm.find_vma(current_addr)
-            && vma.prot & PROT_READ == 0
-        {
-            if total_read > 0 {
-                return Ok(total_read);
-            }
-            return Err(KernelError::NotPermitted);
+    let mut done = 0usize;
+    while done < buf.len() {
+        let addr = remote_addr + done as u64;
+        if let Err(e) = remote_vma(mm, addr, PROT_READ) {
+            return short(done, e);
         }
-
-        // Read page by page using page table translation
-        let bytes_read = read_pages(page_table_root, current_addr, &mut buf[total_read..])?;
-
-        if bytes_read == 0 {
-            // Page not mapped - stop
-            if total_read > 0 {
-                return Ok(total_read);
-            }
-            return Err(KernelError::BadAddress);
+        let chunk = page_chunk(addr, buf.len() - done);
+        let n = read_pages(page_table_root, addr, &mut buf[done..done + chunk])?;
+        if n == 0 {
+            // Not faulted in
+            return short(done, KernelError::BadAddress);
         }
-
-        total_read += bytes_read;
-        current_addr += bytes_read as u64;
-        remaining -= bytes_read;
+        done += n;
     }
-
-    Ok(total_read)
+    Ok(done)
 }
 
-/// Write from a kernel buffer to a remote process's memory
+/// Write from a kernel buffer to a remote process's memory, page by
+/// page, each in a writable VMA of the user half and backed by an
+/// ordinary frame (never MMIO: Linux refuses VM_IO/VM_PFNMAP)
 ///
 /// # Arguments
-/// * `mm` - The target process's memory descriptor (locked)
-/// * `page_table_root` - Physical address of the target's page table root
+/// * `target` - The target process's address space
+/// * `mm` - Its VMAs (`target` locked)
 /// * `remote_addr` - Virtual address in the target's address space
 /// * `buf` - Kernel buffer to write from
 ///
 /// # Returns
 /// Number of bytes written, or error
 pub fn access_remote_vm_write(
+    target: &crate::mm::Mm,
     mm: &MmStruct,
-    page_table_root: u64,
     remote_addr: u64,
     buf: &[u8],
 ) -> Result<usize, KernelError> {
-    if buf.is_empty() {
-        return Ok(0);
+    let page_table_root = target.pgd();
+    if remote_addr.checked_add(buf.len() as u64).is_none() {
+        return Err(KernelError::BadAddress);
     }
-
-    let mut total_written = 0usize;
-    let mut current_addr = remote_addr;
-    let mut remaining = buf.len();
-
-    while remaining > 0 {
-        // Check VMA if present (for permission checking)
-        // Note: Some mappings (like initial stack) may not have VMAs,
-        // so we only check permissions if a VMA exists
-        if let Some(vma) = mm.find_vma(current_addr)
-            && vma.prot & PROT_WRITE == 0
+    let mut done = 0usize;
+    while done < buf.len() {
+        let addr = remote_addr + done as u64;
+        let vma = match remote_vma(mm, addr, PROT_WRITE) {
+            Ok(v) => v,
+            Err(e) => return short(done, e),
+        };
+        // A private page still shared copy-on-write (fork) gets its own
+        // copy first: the write must not reach the other process
+        if !vma.is_shared()
+            && crate::mm::fault::unshare_for_write(target, addr, vma.anon_vma.clone()).is_err()
         {
-            if total_written > 0 {
-                return Ok(total_written);
-            }
-            return Err(KernelError::NotPermitted);
+            return short(done, KernelError::OutOfMemory);
         }
-
-        // Write page by page using page table translation
-        let bytes_written = write_pages(page_table_root, current_addr, &buf[total_written..])?;
-
-        if bytes_written == 0 {
-            if total_written > 0 {
-                return Ok(total_written);
-            }
-            return Err(KernelError::BadAddress);
+        if !translate_with_root(page_table_root, addr).is_some_and(ordinary) {
+            return short(done, KernelError::BadAddress);
         }
-
-        total_written += bytes_written;
-        current_addr += bytes_written as u64;
-        remaining -= bytes_written;
+        let chunk = page_chunk(addr, buf.len() - done);
+        let n = write_pages(page_table_root, addr, &buf[done..done + chunk])?;
+        if n == 0 {
+            return short(done, KernelError::BadAddress);
+        }
+        done += n;
     }
-
-    Ok(total_written)
+    Ok(done)
 }
 
 /// Read from pages using page table translation
@@ -193,6 +200,8 @@ fn write_pages(page_table_root: u64, start_addr: u64, buf: &[u8]) -> Result<usiz
             let dst = phys_to_virt(phys);
             core::ptr::copy_nonoverlapping(buf[total..].as_ptr(), dst, to_copy);
         }
+        // It may be code (ptrace POKETEXT; Linux flush_ptrace_access)
+        crate::arch::paging::sync_icache(phys, to_copy);
 
         total += to_copy;
         addr += to_copy as u64;

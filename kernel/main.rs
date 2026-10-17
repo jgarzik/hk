@@ -14,6 +14,7 @@ pub mod acct;
 pub mod bus;
 pub mod chardev;
 pub mod console;
+pub mod cpumask;
 pub mod dma;
 pub mod elf;
 pub mod epoll;
@@ -30,6 +31,7 @@ pub mod posix_timer;
 pub mod printk;
 pub mod selftest;
 pub mod signalfd;
+pub mod smp;
 pub mod storage;
 pub mod sync;
 pub mod sysctl;
@@ -537,7 +539,8 @@ where
 
             // For pages that span segment boundaries or have BSS, we may need
             // additional handling. The cache pre-zeros frames, so BSS is covered.
-            let _ = frame; // suppress unused warning
+            // The page's code reaches the instruction caches
+            crate::arch::paging::sync_page(frame, segment.flags.execute);
 
             va += PAGE_SIZE;
         }
@@ -566,11 +569,16 @@ fn zero_bss(frame: u64, va: u64, file_end: u64, mem_end: u64) {
 /// Apply ELF relocations for PIE binaries
 ///
 /// For R_*_RELATIVE relocations: *(base + offset) = base + addend
-fn apply_relocations<PT>(elf: &crate::elf::ElfExecutable, base_addr: u64, page_table: &PT)
-where
+fn apply_relocations<PT>(
+    elf: &crate::elf::ElfExecutable,
+    elf_data: &[u8],
+    base_addr: u64,
+    page_table: &PT,
+) where
     PT: crate::arch::PageTable<VirtAddr = u64, PhysAddr = u64>,
 {
-    for reloc in &elf.relocations {
+    let mut n = 0;
+    elf.for_each_relocation(elf_data, &mut |reloc| {
         let target_vaddr = base_addr + reloc.offset;
         let value = (base_addr as i64 + reloc.addend) as u64;
 
@@ -581,11 +589,13 @@ where
                 let ptr = phys_to_virt(phys) as *mut u64;
                 ::core::ptr::write_volatile(ptr, value);
             }
+            crate::arch::paging::sync_icache(phys, 8);
         }
-    }
+        n += 1;
+    });
 
-    if !elf.relocations.is_empty() {
-        printkln!("Applied {} relocations", elf.relocations.len());
+    if n != 0 {
+        printkln!("Applied {} relocations", n);
     }
 }
 
@@ -826,6 +836,10 @@ fn kmain() -> ! {
 
                 // Enable APs to start their timers and participate in scheduling
                 CurrentArch::enable_ap_scheduling();
+
+                // This CPU answers IPIs once it takes interrupts (its
+                // first task enables them)
+                smp::set_active(task::percpu::current_cpu());
             }
         }
     } else {
@@ -1055,7 +1069,7 @@ fn kmain() -> ! {
     }
 
     // Apply relocations for PIE binaries
-    apply_relocations(&elf, base_addr, &user_pt);
+    apply_relocations(&elf, init_bytes, base_addr, &user_pt);
 
     // Calculate highest segment end for brk initialization
     let mut highest_end: u64 = 0;
@@ -1112,8 +1126,6 @@ fn kmain() -> ! {
     // Note: idle task has tid=1, pid=0 (kernel swapper convention)
     // Init process: ppid=0 (no parent), pgid=sid=0 like Linux's init_task
     // (init/init_task.c); init calls setsid() itself if it wants a session
-    // Save the page table root before moving user_pt
-    let page_table_root = user_pt.root_table_phys();
 
     task::percpu::create_user_task(task::percpu::UserTaskConfig {
         pid: 1,  // init process (PID 1)
@@ -1135,7 +1147,7 @@ fn kmain() -> ! {
         m.set_brk(start_brk);
         m.set_exe(alloc::string::String::from("/bin/init"));
         let stack_bottom = USER_STACK_TOP - USER_STACK_PAGES as u64 * PAGE_SIZE;
-        for vma in task::exec::image_vmas(mm.pgd(), &elf, base_addr, stack_bottom) {
+        for vma in task::exec::image_vmas(&mm, &elf, base_addr, stack_bottom) {
             m.insert_vma(vma);
         }
     }
@@ -1180,8 +1192,13 @@ fn kmain() -> ! {
         );
     }
 
+    // Load init's address space (its task holds the mm reference)
+    match mm::get_task_mm(2) {
+        Some(mm) => mm::tlb::switch_mm(Some(&mm)),
+        None => panic!("init has no address space"),
+    }
     unsafe {
-        CurrentArch::jump_to_user(entry_point, user_sp, page_table_root, kernel_stack);
+        CurrentArch::jump_to_user(entry_point, user_sp, kernel_stack);
     }
 }
 

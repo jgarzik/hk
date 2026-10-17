@@ -509,6 +509,40 @@ impl InodeOps for RamfsInodeOps {
         Ok(page_size)
     }
 
+    fn maps_cache(&self) -> bool {
+        true
+    }
+
+    fn map_page(&self, inode: &Inode, index: u64) -> Result<u64, KernelError> {
+        use crate::frame_alloc::FrameAllocRef;
+        use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
+
+        let private = inode.get_private().ok_or(KernelError::Io)?;
+        let data = private
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RamfsInodeData>()
+            .ok_or(KernelError::Io)?;
+        let file_id = data.file_id.ok_or(KernelError::Io)?;
+        let mut cache = PAGE_CACHE.lock();
+        let (page, _) = cache
+            .find_or_create_page(
+                file_id,
+                index,
+                inode.get_size(),
+                &mut FrameAllocRef(&FRAME_ALLOCATOR),
+                false, // can_writeback
+                true,  // unevictable
+                &RAMFS_AOPS,
+            )
+            .map_err(page_err)?;
+        // Taken before the cache lock goes: truncate cannot free the
+        // frame under the new mapping
+        FRAME_ALLOCATOR.incref(page.frame);
+        page.mark_dirty();
+        Ok(page.frame)
+    }
+
     fn writepage(&self, inode: &Inode, page_offset: u64, buf: &[u8]) -> Result<usize, KernelError> {
         // Ramfs uses page cache via AddressSpaceOps (RAMFS_AOPS).
         // This InodeOps::writepage is deprecated for ramfs - use the page cache directly.

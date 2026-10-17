@@ -64,17 +64,30 @@ pub fn ee_of(ctl: &[u8], cl: usize) -> Option<Ee> {
 
 /// recvmsg(MSG_ERRQUEUE): (return, msg_flags, ee, name addr, name port)
 pub fn recv_err(fd: i32, buf: &mut [u8]) -> (i64, i32, Option<Ee>, [u8; 4], u16) {
-    use hk_syscall::{sys_recvmsg, IoVec, MsgHdr, SockAddrIn};
+    use hk_syscall::{IoVec, MsgHdr, SockAddrIn, sys_recvmsg};
     let mut ctl = [0u8; 256];
     let mut name = sin(ANY, 0);
-    let mut iov = IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() };
+    let mut iov = IoVec {
+        iov_base: buf.as_mut_ptr(),
+        iov_len: buf.len(),
+    };
     let mut m = MsgHdr::with_addr(&mut name, &mut iov, 1);
     m.msg_control = ctl.as_mut_ptr();
     m.msg_controllen = ctl.len();
     let r = sys_recvmsg(fd, &mut m, MSG_ERRQUEUE);
-    let ee = if r >= 0 { ee_of(&ctl, m.msg_controllen) } else { None };
+    let ee = if r >= 0 {
+        ee_of(&ctl, m.msg_controllen)
+    } else {
+        None
+    };
     let _: &SockAddrIn = &name;
-    (r, m.msg_flags, ee, name.sin_addr.to_ne_bytes(), u16::from_be(name.sin_port))
+    (
+        r,
+        m.msg_flags,
+        ee,
+        name.sin_addr.to_ne_bytes(),
+        u16::from_be(name.sin_port),
+    )
 }
 
 /// Connected UDP to a closed port: the port unreachable makes the next
@@ -92,7 +105,11 @@ fn test_refused_connected() {
     t.eq(b"recv again", recv(c, &mut buf, MSG_DONTWAIT), EAGAIN);
     send(c, b"d", 0);
     t.eq(b"SO_ERROR", getint(c, SOL_SOCKET, SO_ERROR).1 as i64, 111);
-    t.eq(b"SO_ERROR clear", getint(c, SOL_SOCKET, SO_ERROR).1 as i64, 0);
+    t.eq(
+        b"SO_ERROR clear",
+        getint(c, SOL_SOCKET, SO_ERROR).1 as i64,
+        0,
+    );
     // Without IP_RECVERR nothing is queued
     t.eq(b"errqueue", recv(c, &mut buf, MSG_ERRQUEUE), EAGAIN);
     close(c);
@@ -131,14 +148,22 @@ fn test_recverr() {
             t.eq(b"errno", e.errno as i64, 111);
             t.eq(b"origin", e.origin as i64, SO_EE_ORIGIN_ICMP as i64);
             t.ok(b"type/code", e.ty == 3 && e.code == 3, e.ty as i64);
-            t.ok(b"offender", e.off_family == 2 && e.offender == LO, e.off_family as i64);
+            t.ok(
+                b"offender",
+                e.off_family == 2 && e.offender == LO,
+                e.off_family as i64,
+            );
         }
         None => {
             t.ok(b"IP_RECVERR cmsg", false, 0);
         }
     }
     t.eq(b"empty", recv(fd, &mut buf, MSG_ERRQUEUE), EAGAIN);
-    t.eq(b"SO_ERROR cleared", getint(fd, SOL_SOCKET, SO_ERROR).1 as i64, 0);
+    t.eq(
+        b"SO_ERROR cleared",
+        getint(fd, SOL_SOCKET, SO_ERROR).1 as i64,
+        0,
+    );
     let (_, rev) = poll1(fd, 0, 0);
     t.ok(b"no POLLERR", rev & POLLERR == 0, rev as i64);
     // Truncated payload
@@ -169,8 +194,16 @@ fn test_hostunreach() {
     let (n, _, ee, ip, port) = recv_err(fd, &mut buf);
     t.ok(b"queued", n == 1 && ip == [10, 0, 2, 78] && port == 9, n);
     if let Some(e) = ee {
-        t.ok(b"ee", e.errno == 113 && e.ty == 3 && e.code == 1, e.errno as i64);
-        t.ok(b"offender", e.offender == [10, 0, 2, 15], e.offender[3] as i64);
+        t.ok(
+            b"ee",
+            e.errno == 113 && e.ty == 3 && e.code == 1,
+            e.errno as i64,
+        );
+        t.ok(
+            b"offender",
+            e.offender == [10, 0, 2, 15],
+            e.offender[3] as i64,
+        );
     } else {
         t.ok(b"ee", false, 0);
     }
@@ -189,9 +222,17 @@ fn test_local_emsgsize() {
     t.eq(b"send", send_to(fd, &data, [10, 0, 2, 2], 9, 0), EMSGSIZE);
     let mut buf = [0u8; 16];
     let (n, fl, ee, ip, _) = recv_err(fd, &mut buf);
-    t.ok(b"queued", n == 0 && fl & MSG_ERRQUEUE != 0 && ip == [10, 0, 2, 2], n);
+    t.ok(
+        b"queued",
+        n == 0 && fl & MSG_ERRQUEUE != 0 && ip == [10, 0, 2, 2],
+        n,
+    );
     if let Some(e) = ee {
-        t.ok(b"ee", e.errno == 90 && e.origin == SO_EE_ORIGIN_LOCAL && e.info == 1500, e.info as i64);
+        t.ok(
+            b"ee",
+            e.errno == 90 && e.origin == SO_EE_ORIGIN_LOCAL && e.info == 1500,
+            e.info as i64,
+        );
     } else {
         t.ok(b"ee", false, 0);
     }
@@ -204,7 +245,7 @@ fn test_local_emsgsize() {
 // ============================================================================
 
 use super::sysctl::write_file;
-use hk_syscall::{sys_exit, sys_fork, sys_setresgid, sys_socket, sys_wait4, AF_INET, SOCK_DGRAM};
+use hk_syscall::{AF_INET, SOCK_DGRAM, sys_exit, sys_fork, sys_setresgid, sys_socket, sys_wait4};
 
 const PING_RANGE: &[u8] = b"/proc/sys/net/ipv4/ping_group_range\0";
 const IPPROTO_ICMP: i32 = 1;
@@ -292,8 +333,16 @@ fn test_ping_lo() {
     let mut buf = [0u8; 64];
     let (r, ip) = recv_wait(fd, &mut buf, 2000);
     t.eq(b"reply len", r, n as i64);
-    t.ok(b"reply", buf[0] == 0 && buf[1] == 0 && ip == LO, buf[0] as i64);
-    t.eq(b"id", u16::from_be_bytes([buf[4], buf[5]]) as i64, ident as i64);
+    t.ok(
+        b"reply",
+        buf[0] == 0 && buf[1] == 0 && ip == LO,
+        buf[0] as i64,
+    );
+    t.eq(
+        b"id",
+        u16::from_be_bytes([buf[4], buf[5]]) as i64,
+        ident as i64,
+    );
     t.eq(b"seq", u16::from_be_bytes([buf[6], buf[7]]) as i64, 7);
     t.ok(b"payload", &buf[8..14] == b"hkping", 0);
     // connect + send
@@ -320,7 +369,11 @@ fn test_ping_errors() {
     t.eq(b"ident", port(a) as i64, 4444);
     let b = ping_socket();
     // Ping sockets start with SO_REUSEADDR (INET_PROTOSW_REUSE)
-    t.eq(b"reuse default", getint(b, SOL_SOCKET, SO_REUSEADDR).1 as i64, 1);
+    t.eq(
+        b"reuse default",
+        getint(b, SOL_SOCKET, SO_REUSEADDR).1 as i64,
+        1,
+    );
     setint(b, SOL_SOCKET, SO_REUSEADDR, 0);
     t.eq(b"busy", bind(b, ANY, 4444), EADDRINUSE);
     let c = ping_socket();
@@ -340,19 +393,34 @@ fn test_ping_eth0() {
     let fd = ping_socket();
     let mut req = [0u8; 64];
     let n = echo(0, 1, b"own", &mut req);
-    t.eq(b"own send", send_to(fd, &req[..n], [10, 0, 2, 15], 0, 0), n as i64);
+    t.eq(
+        b"own send",
+        send_to(fd, &req[..n], [10, 0, 2, 15], 0, 0),
+        n as i64,
+    );
     let mut buf = [0u8; 64];
     let (r, ip) = recv_wait(fd, &mut buf, 2000);
-    t.ok(b"own reply", r == n as i64 && buf[0] == 0 && ip == [10, 0, 2, 15], r);
+    t.ok(
+        b"own reply",
+        r == n as i64 && buf[0] == 0 && ip == [10, 0, 2, 15],
+        r,
+    );
     t.done();
     let n = echo(0, 2, b"gw", &mut req);
     send_to(fd, &req[..n], [10, 0, 2, 2], 0, 0);
     let (r, ip) = recv_wait(fd, &mut buf, 3000);
     if r == EAGAIN {
-        skip(b"PING_GATEWAY", b"slirp did not answer ICMP echo (host ping not permitted)");
+        skip(
+            b"PING_GATEWAY",
+            b"slirp did not answer ICMP echo (host ping not permitted)",
+        );
     } else {
         let mut t = T::new(b"PING_GATEWAY");
-        t.ok(b"reply", r == n as i64 && buf[0] == 0 && ip == [10, 0, 2, 2], r);
+        t.ok(
+            b"reply",
+            r == n as i64 && buf[0] == 0 && ip == [10, 0, 2, 2],
+            r,
+        );
         t.done();
     }
     close(fd);
@@ -366,12 +434,20 @@ fn test_ping_unreach() {
     setint(fd, SOL_IP, IP_RECVERR, 1);
     let mut req = [0u8; 64];
     let n = echo(0, 3, b"lost", &mut req);
-    t.eq(b"send", send_to(fd, &req[..n], [10, 0, 2, 79], 0, 0), n as i64);
+    t.eq(
+        b"send",
+        send_to(fd, &req[..n], [10, 0, 2, 79], 0, 0),
+        n as i64,
+    );
     let (r, rev) = poll1(fd, 0, 7000);
     t.ok(b"POLLERR", r == 1 && rev & POLLERR != 0, rev as i64);
     let mut buf = [0u8; 64];
     let (m, _, ee, ip, _) = recv_err(fd, &mut buf);
-    t.ok(b"queued", m == n as i64 && buf[0] == 8 && ip == [10, 0, 2, 79], m);
+    t.ok(
+        b"queued",
+        m == n as i64 && buf[0] == 8 && ip == [10, 0, 2, 79],
+        m,
+    );
     t.ok(b"ee", ee.is_some_and(|e| e.errno == 113 && e.code == 1), 0);
     close(fd);
     t.done();

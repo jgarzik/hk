@@ -8,11 +8,11 @@
 //! under spinlocks along the way.)
 
 use hk_syscall::{
-    sys_accept, sys_exit, sys_fork, sys_kill, sys_listen, sys_pipe, sys_recvmsg, sys_setsockopt,
-    sys_socketpair, sys_wait4, IoVec, MsgHdr, AF_UNIX, SOCK_DGRAM,
+    AF_UNIX, IoVec, MsgHdr, SOCK_DGRAM, sys_accept, sys_exit, sys_fork, sys_kill, sys_listen,
+    sys_pipe, sys_recvmsg, sys_setsockopt, sys_socketpair, sys_wait4,
 };
 
-use super::nl::{addr, first_ether, msleep, net_setup_eth0, route, set_link_up, Nl};
+use super::nl::{Nl, addr, first_ether, msleep, net_setup_eth0, route, set_link_up};
 use super::sk::*;
 use super::tcp_xfer::set_timeo;
 
@@ -168,8 +168,24 @@ fn w_config(until: u64) -> i32 {
     while now_ms() < until {
         let a = [10, 77, (i % 200) as u8, 1];
         addr(&mut nl, true, 1, a, 24, NLM_F_CREATE);
-        route(&mut nl, true, [10, 78, (i % 200) as u8, 0], 24, [0; 4], 1, NLM_F_CREATE);
-        route(&mut nl, false, [10, 78, (i % 200) as u8, 0], 24, [0; 4], 1, 0);
+        route(
+            &mut nl,
+            true,
+            [10, 78, (i % 200) as u8, 0],
+            24,
+            [0; 4],
+            1,
+            NLM_F_CREATE,
+        );
+        route(
+            &mut nl,
+            false,
+            [10, 78, (i % 200) as u8, 0],
+            24,
+            [0; 4],
+            1,
+            0,
+        );
         addr(&mut nl, false, 1, a, 24, 0);
         if let Some(e) = eth
             && i % 8 == 7
@@ -206,7 +222,10 @@ fn w_unix(until: u64) -> i32 {
         if i % 2 == 0 {
             let mut b = [0u8; 4];
             let mut ctl = [0u8; 128];
-            let mut iov = IoVec { iov_base: b.as_mut_ptr(), iov_len: 4 };
+            let mut iov = IoVec {
+                iov_base: b.as_mut_ptr(),
+                iov_len: 4,
+            };
             let mut m = MsgHdr::new(&mut iov, 1);
             m.msg_control = ctl.as_mut_ptr();
             m.msg_controllen = ctl.len();
@@ -247,7 +266,11 @@ fn test_churn() {
     bind(l, LO, 0);
     sys_listen(l, 4);
     set_timeo(l, 5000);
-    t.eq(b"lo works after", tcp_lo_once(l, super::sk::port(l), 7) as i64, 0);
+    t.eq(
+        b"lo works after",
+        tcp_lo_once(l, super::sk::port(l), 7) as i64,
+        0,
+    );
     close(l);
     t.done();
 }

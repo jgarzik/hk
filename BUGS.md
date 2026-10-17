@@ -64,19 +64,48 @@ Address spaces are reference counted and torn down like Linux
   no caller), so rmap, the LRU lists and swap-out are inert. Before
   enabling them: `set_anon_mapping` stores an AnonVma pointer without
   taking a reference while `clear_mapping` drops one, swap-out frees a
-  frame even when the rmap walk missed a mapping, and a swap-cache hit
-  maps the cached frame without taking a reference for the PTE.
-- fork copies neither 2MB (THP) mappings nor swap PTEs (the child sees
-  zero pages there) and turns every writable PTE copy-on-write, MAP_SHARED
-  mappings included (writes after fork are not shared).
-- SysV shm: fork and exit do not update `shm_nattch`; a segment removed
-  with IPC_RMID while attached by a process that exits without shmdt is
-  never destroyed (its own reference on the frames is never dropped).
+  frame even when the rmap walk missed a mapping, swap slots carry no
+  reference counts (`free_swap_entry` frees at once), the swap cache is
+  never filled (`swap_cache_add` has no caller) and freeing a slot does
+  not drop a swap-cache entry (Linux SWAP_HAS_CACHE), and munmap leaks
+  the slots of swap PTEs (exit frees them).
+- fork fails with ENOMEM on a swap PTE (`memory::swap_pte_unsupported`,
+  unreachable while swap-out is inert): copying one needs counted swap
+  slots safe against a racing swap-in (Linux swap_duplicate under
+  si->lock); to be done with the reclaim work.
+- SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
+  IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
+  by id still work there).
+- File mappings: MAP_SHARED of a file on a filesystem other than ramfs
+  (vfat) maps a private copy (writes do not reach the file or other
+  mappings); truncating a ramfs file does not unmap its shared pages
+  (they keep the old data instead of raising SIGBUS); MAP_PRIVATE file
+  pages are copied at fault, not shared until written.
+- MADV_REMOVE of a file mapping is EOPNOTSUPP (no filesystem punches
+  holes); shmdt needs the address an attachment starts at (Linux also
+  finds a piece moved by mremap); SHM_EXEC is ignored.
+- Remote writes (ptrace POKEDATA/POKETEXT, process_vm_writev) need a
+  writable VMA: POKE into read-only text fails with EIO (Linux
+  FOLL_FORCE writes a private copy, e.g. for breakpoints), and a page
+  not yet faulted in is not faulted (EIO / short write).
+- munmap or MADV_DONTNEED of part of a 2MB page that cannot be split
+  (out of memory) leaves the whole page mapped (Linux preallocates the
+  page table); shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
+  range, and an address that SHM_RND rounds to 0 is EPERM (Linux picks
+  an address).
+- No vm.max_map_count: the number of VMAs (new mappings, splits by a
+  partial mprotect or munmap) is not limited (Linux: 65530, then
+  ENOMEM). A locked mapping grown by mremap is not faulted in (Linux
+  populates it).
 - Exited non-leader threads stay in the task table as zombies (Linux
   reaps them at once); their kernel stacks and memory are freed.
 - munmap keeps page-table pages that become empty (freed at exit).
-- x86 has no user TLB shootdown, and the page-fault path installs PTEs
-  after dropping the mm lock (doc/LOCKING.md section 9).
+- x86 and arm64 syscalls run with interrupts off, so a CPU in a long
+  syscall answers a TLB shootdown IPI only when it sleeps, returns or
+  spins on the mm lock (which polls its call queue): the shooting CPU
+  waits meanwhile. Spinning with interrupts off on another lock held
+  across a shootdown would deadlock (doc/LOCKING.md, Cross-CPU Calls);
+  none is today, and user tasks still run on CPU 0 only.
 
 ## No dynamically linked executables
 
@@ -273,6 +302,16 @@ boot tests reach the network stress test only a few MB are free on x86:
 every TCP TIME_WAIT entry keeps a full control block (about 2 KB) for
 60 s, so a burst of a thousand short connections can starve a later 2 MB
 allocation (busybox exec); the stress test bounds its connections.
+
+exec no longer copies the binary into memory (it needed a 2.1MB
+contiguous heap block for busybox, which the fragmented heap could not
+always give: x86 `make check LOCKDEP=1` panicked "memory allocation of
+2124608 bytes failed"): `kernel/task/exec.rs` reads the ELF headers in
+bounded pieces and each PT_LOAD page straight into its user frame
+(reserve-checked like any user page). The segments are still copied at
+exec, not mapped from the page cache like Linux binfmt_elf. Each new pid that opens `/proc/self/...`
+also keeps ~1.6-2.9KB of heap after exit (suspected: procfs dentries of
+dead pids never freed; unconfirmed).
 
 ## Heap Corruption in Arc<T> Struct Fields
 

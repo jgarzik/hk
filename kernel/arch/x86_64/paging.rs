@@ -3,6 +3,8 @@
 //! Implements the PageTable trait for x86-64 4-level paging:
 //! PML4 -> PDPT -> PD -> PT -> Physical Page
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::arch::{FrameAlloc, Leaf, MapError, PageFlags, PageTable};
 
 /// Page size (4KB)
@@ -77,10 +79,20 @@ pub fn phys_to_virt_table_const(phys: u64) -> *const RawPageTable {
 /// Physical address bits of a page table entry
 pub const PTE_ADDR_MASK: u64 = ADDR_MASK;
 
+/// `va` lies in the user half (below TASK_SIZE): the user page-table
+/// walkers never reach the kernel half (x86 PML4 256-511) nor alias a
+/// user entry with an address past the user range (arm64 TTBR0)
+fn user_va(va: u64) -> bool {
+    va < TASK_SIZE
+}
+
 /// Pointer to the 4KB leaf entry for `va` in the tables rooted at
 /// `root` (present or not, e.g. a swap entry); None if an upper level
 /// is missing or maps a huge page
 pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
+    if !user_va(va) {
+        return None;
+    }
     let mut table = phys_to_virt_table(root);
     for shift in [39, 30, 21] {
         let e = unsafe { *(*table).entry(((va >> shift) & 511) as usize) };
@@ -95,39 +107,274 @@ pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
     )
 }
 
-/// A leaf entry maps a page
+/// A leaf entry maps a page: present, or protnone (Linux pte_present)
 pub fn pte_present(pte: u64) -> bool {
-    pte & PAGE_PRESENT != 0
+    pte & PAGE_PRESENT != 0 || pte_protnone(pte)
 }
 
-/// Switch this CPU to the address space rooted at `root`
-pub fn activate(root: u64) {
-    unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack)) };
+/// Software bit of a PROT_NONE entry (Linux _PAGE_PROTNONE): not
+/// present to the MMU, so every user access faults, but it keeps its
+/// frame (and the frame reference) for a later mprotect to restore
+pub const PAGE_PROTNONE: u64 = 1 << 10;
+
+/// A protnone leaf entry (never a swap entry: those carry the marker)
+pub fn pte_protnone(pte: u64) -> bool {
+    pte & (PAGE_PRESENT | PAGE_PROTNONE | crate::mm::SwapEntry::SWAP_MARKER) == PAGE_PROTNONE
 }
 
-/// Tear down the user half under `pml4_phys` (the mapping and table
-/// part of Linux exit_mmap: unmap_vmas + free_pgtables). The user PML4
-/// entries are detached and, if the table is live on this CPU, the TLB
-/// is flushed before anything is freed; then each user leaf goes to
-/// `put` and every lower table frame is freed. The root frame and the
-/// shared kernel half (PML4 256-511) are left untouched. Other CPUs are
-/// not shot down (no x86 TLB shootdown yet, doc/LOCKING.md).
-pub fn free_user(pml4_phys: u64, put: &mut dyn FnMut(Leaf)) {
-    let mut top = [PageTableEntry::empty(); KERNEL_PML4_START];
+/// `pte` with the protection `prot` (PROT_*; Linux pte_modify): none
+/// at all makes it protnone; it is writable only if `prot` asks for it
+/// and it is not a copy-on-write share. Frame, accessed/dirty and cache
+/// bits are kept.
+pub fn pte_modify(pte: u64, prot: u32) -> u64 {
+    use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE};
+    let keep = pte & !(PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE | PAGE_PROTNONE);
+    if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
+        return keep | PAGE_PROTNONE | PAGE_NO_EXECUTE;
+    }
+    let mut e = keep | PAGE_PRESENT;
+    if prot & PROT_WRITE != 0 && pte & PAGE_COW == 0 {
+        e |= PAGE_WRITABLE;
+    }
+    if prot & PROT_EXEC == 0 {
+        e |= PAGE_NO_EXECUTE;
+    }
+    e
+}
+
+// ============================================================================
+// User PTE helpers for the generic fault and fork paths (kernel/mm)
+// ============================================================================
+
+/// Intermediate entries of user tables
+const USER_TABLE: u64 = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+/// The entry at `idx` (mod 512) of `table`, as an atomic
+fn entry_atomic(table: *mut RawPageTable, idx: u64) -> &'static AtomicU64 {
+    // SAFETY: a live table frame reached through the direct map
+    unsafe { AtomicU64::from_ptr((*table).entry_mut((idx & 511) as usize) as *mut _ as *mut u64) }
+}
+
+/// The entry at `p` in a live table, as an atomic
+fn entry_ptr(p: *mut u64) -> &'static AtomicU64 {
+    // SAFETY: `p` points into a live table frame (direct map)
+    unsafe { AtomicU64::from_ptr(p) }
+}
+
+/// Pointer to the 2MB-level (PD) entry for `va` in the tables rooted at
+/// `root` (Linux pmd_offset); None if an upper level is missing
+pub fn pmd_ptr(root: u64, va: u64) -> Option<*mut u64> {
+    if !user_va(va) {
+        return None;
+    }
+    let mut table = phys_to_virt_table(root);
+    for shift in [39, 30] {
+        let e = PageTableEntry(entry_atomic(table, va >> shift).load(Ordering::Acquire));
+        if !e.is_present() || e.is_huge() {
+            return None;
+        }
+        table = phys_to_virt_table(e.addr());
+    }
+    Some(entry_atomic(table, va >> 21).as_ptr())
+}
+
+/// A 2MB-level entry maps a huge page
+pub fn pmd_huge(pmd: u64) -> bool {
+    pmd & (PAGE_PRESENT | PAGE_HUGE) == PAGE_PRESENT | PAGE_HUGE
+}
+
+/// Pointer to the 4KB leaf entry for `va`, allocating the missing
+/// tables (Linux pte_alloc). A table is installed with a compare and
+/// swap, so racing faults share one. None if out of memory (down to
+/// the kernel's reserve) or a huge page maps `va`.
+pub fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
+    if !user_va(va) {
+        return None;
+    }
+    let mut table = phys_to_virt_table(root);
+    for shift in [39, 30, 21] {
+        let slot = entry_atomic(table, va >> shift);
+        let mut e = PageTableEntry(slot.load(Ordering::Acquire));
+        if !e.is_present() {
+            // User page tables stop at the kernel's reserve, like
+            // user pages (Linux GFP_PGTABLE_USER at the min watermark)
+            if crate::FRAME_ALLOCATOR.below_reserve() {
+                return None;
+            }
+            let new = crate::FRAME_ALLOCATOR.alloc()?;
+            // SAFETY: a fresh frame, reached through the direct map
+            unsafe { core::ptr::write_bytes(phys_to_virt(new), 0, PAGE_SIZE as usize) };
+            let ent = new | USER_TABLE;
+            e = match slot.compare_exchange(0, ent, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => PageTableEntry(ent),
+                Err(cur) => {
+                    crate::FRAME_ALLOCATOR.free(new);
+                    PageTableEntry(cur)
+                }
+            };
+        }
+        if e.is_huge() {
+            return None;
+        }
+        table = phys_to_virt_table(e.addr());
+    }
+    Some(entry_atomic(table, va >> 12).as_ptr())
+}
+
+/// Fill the fresh page table `pt` with the 512 4KB entries of the 2MB
+/// entry `pmd`: same frames, protection and accessed/dirty bits (Linux
+/// __split_huge_pmd_locked). Returns the 2MB frame's base.
+pub fn split_table(pt: u64, pmd: u64) -> u64 {
+    const HUGE_MASK: u64 = (2 << 20) - 1;
+    let base = pmd & ADDR_MASK & !HUGE_MASK;
+    let flags = (pmd & !ADDR_MASK & !PAGE_HUGE) | PAGE_PRESENT;
+    let table = phys_to_virt_table(pt);
+    for i in 0..ENTRIES_PER_TABLE {
+        // SAFETY: a fresh table frame, not yet reachable
+        unsafe {
+            (*table)
+                .entry_mut(i)
+                .set(base + i as u64 * PAGE_SIZE, flags)
+        };
+    }
+    base
+}
+
+/// Install the filled table `pt` in the empty 2MB-level entry at `pmdp`
+/// (Linux pmd_populate)
+pub fn pmd_populate(pmdp: *mut u64, pt: u64) {
+    entry_ptr(pmdp).store(pt | USER_TABLE, Ordering::Release);
+}
+
+/// A user leaf entry for `phys` with the protection of a VMA (PROT_*),
+/// marked accessed (Linux mk_pte + pte_mkyoung)
+pub fn mk_pte(phys: u64, prot: u32) -> u64 {
+    let mut pte = phys | PAGE_PRESENT | PAGE_USER | PAGE_ACCESSED;
+    if prot & crate::mm::PROT_WRITE != 0 {
+        pte |= PAGE_WRITABLE;
+    }
+    if prot & crate::mm::PROT_EXEC == 0 {
+        pte |= PAGE_NO_EXECUTE;
+    }
+    pte
+}
+
+/// Physical address mapped by a 4KB leaf entry
+pub fn pte_addr(pte: u64) -> u64 {
+    pte & ADDR_MASK
+}
+
+/// The entry allows writes
+pub fn pte_write(pte: u64) -> bool {
+    pte & PAGE_WRITABLE != 0
+}
+
+/// The entry allows instruction fetches
+pub fn pte_exec(pte: u64) -> bool {
+    pte & PAGE_NO_EXECUTE == 0
+}
+
+/// The user leaf `pte` is executable by the kernel: never, SMEP
+/// (enabled at boot when the CPU has it) faults any supervisor fetch
+/// from a user page (Linux has the same exposure on CPUs without it)
+#[cfg(feature = "mmcheck")]
+pub fn pte_kexec(_pte: u64) -> bool {
+    false
+}
+
+/// The user leaf `pte` is global: never (CR4.PGE is off, and user
+/// entries never set G)
+#[cfg(feature = "mmcheck")]
+pub fn pte_global(_pte: u64) -> bool {
+    false
+}
+
+/// The entry is a copy-on-write share (written only after a copy)
+pub fn pte_cow(pte: u64) -> bool {
+    pte & PAGE_COW != 0
+}
+
+/// Writable, dirty and young; no longer copy-on-write
+pub fn pte_mkwrite(pte: u64) -> u64 {
+    (pte & !PAGE_COW) | PAGE_WRITABLE | PAGE_ACCESSED | PAGE_DIRTY
+}
+
+/// Read-only and copy-on-write (fork of a private mapping)
+pub fn pte_mkcow(pte: u64) -> u64 {
+    (pte & !PAGE_WRITABLE) | PAGE_COW
+}
+
+/// Make a page the kernel just filled visible to instruction fetches
+/// (x86 caches are coherent: nothing to do)
+pub fn sync_page(_phys: u64, _exec: bool) {}
+
+/// Make code the kernel wrote visible to instruction fetches (coherent
+/// on x86: nothing to do)
+pub fn sync_icache(_phys: u64, _len: usize) {}
+
+/// The user page tables of an address space, detached from its
+/// top-level table by [`detach_user`]
+pub struct UserTables(alloc::vec::Vec<u64>);
+
+/// Detach the user half from the top-level table `pml4_phys` (Linux
+/// exit_mmap: unmap_vmas + free_pgtables, first half): its PML4
+/// entries 0-255 are cleared, the tables below are kept intact for
+/// [`UserTables::free`], which runs after the caller flushed every CPU
+/// that may still walk them. The shared kernel half (PML4 256-511) is
+/// left untouched.
+pub fn detach_user(pml4_phys: u64) -> UserTables {
     let pml4 = phys_to_virt_table(pml4_phys);
-    for (i, e) in top.iter_mut().enumerate() {
+    let mut top = alloc::vec::Vec::new();
+    for i in 0..KERNEL_PML4_START {
         // SAFETY: `pml4_phys` is a live root table reached through the
         // direct map; its user entries belong to the caller
         unsafe {
-            *e = *(*pml4).entry(i);
+            let e = *(*pml4).entry(i);
+            if e.is_present() {
+                top.push(e.addr());
+            }
             (*pml4).entry_mut(i).clear();
         }
     }
-    if X86_64PageTable::current_cr3() & ADDR_MASK == pml4_phys {
-        X86_64PageTable::flush_tlb_all();
+    UserTables(top)
+}
+
+impl UserTables {
+    /// Release each user leaf (to `put`) and free every table frame
+    pub fn free(self, put: &mut dyn FnMut(Leaf)) {
+        for t in self.0 {
+            free_level(t, 3, put);
+        }
     }
-    for e in top.iter().filter(|e| e.is_present()) {
-        free_level(e.addr(), 3, put);
+}
+
+/// Each user leaf under `pml4_phys` that maps a page, in address order:
+/// `f(va, entry, huge)` for a 4KB entry (protnone included) or a 2MB
+/// page (debug check, `mm::check`; mm lock held)
+#[cfg(feature = "mmcheck")]
+pub fn walk_user(pml4_phys: u64, f: &mut dyn FnMut(u64, u64, bool)) {
+    walk_level(pml4_phys, 4, 0, f);
+}
+
+/// Walk the table at `phys` (`level` 4 = PML4 .. 1 = PT) mapping from `base`
+#[cfg(feature = "mmcheck")]
+fn walk_level(phys: u64, level: u32, base: u64, f: &mut dyn FnMut(u64, u64, bool)) {
+    let table = phys_to_virt_table_const(phys);
+    let n = if level == 4 {
+        KERNEL_PML4_START
+    } else {
+        ENTRIES_PER_TABLE
+    };
+    for i in 0..n {
+        // SAFETY: a live table of the locked mm
+        let e = unsafe { *(*table).entry(i) };
+        let va = base + ((i as u64) << (12 + 9 * (level - 1)));
+        match level {
+            1 if pte_present(e.0) => f(va, e.0, false),
+            2 if e.is_present() && e.is_huge() => f(va, e.0, true),
+            2..=4 if e.is_present() && !e.is_huge() => walk_level(e.addr(), level - 1, va, f),
+            _ => {}
+        }
     }
 }
 
@@ -139,7 +386,7 @@ fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
         // SAFETY: a detached table frame owned by the caller
         let e = unsafe { *(*table).entry(i) };
         match level {
-            1 if e.is_present() => put(Leaf::Page(e.addr())),
+            1 if pte_present(e.0) => put(Leaf::Page(e.addr())),
             1 if e.0 != 0 => put(Leaf::Swap(e.0)),
             // 1GB user pages are never created
             3 if e.is_present() && !e.is_huge() => free_level(e.addr(), 2, put),
@@ -149,11 +396,6 @@ fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
         }
     }
     crate::FRAME_ALLOCATOR.free(phys);
-}
-
-/// Flush the TLB entry for `va` on this CPU
-pub fn flush_tlb(va: u64) {
-    X86_64PageTable::flush_tlb(va);
 }
 
 /// Page table entry
@@ -362,12 +604,10 @@ impl X86_64PageTable {
             }
             let pt = phys_to_virt_table(pd_entry.addr());
 
-            // Set the final page table entry
+            // Set the final page table entry (a fresh table, never
+            // loaded: nothing to flush)
             let pt_entry = (*pt).entry_mut(pt_idx);
             pt_entry.set(pa, entry_flags);
-
-            // Flush TLB for this address
-            Self::flush_tlb(va);
         }
 
         Ok(())
@@ -396,55 +636,6 @@ impl X86_64PageTable {
             );
         }
         cr3
-    }
-
-    /// Flush a single TLB entry
-    pub fn flush_tlb(vaddr: u64) {
-        unsafe {
-            ::core::arch::asm!(
-                "invlpg [{}]",
-                in(reg) vaddr,
-                options(nostack, preserves_flags)
-            );
-        }
-    }
-
-    /// Flush entire TLB
-    #[allow(dead_code)]
-    pub fn flush_tlb_all() {
-        let cr3 = Self::current_cr3();
-        unsafe {
-            ::core::arch::asm!(
-                "mov cr3, {}",
-                in(reg) cr3,
-                options(nostack, preserves_flags)
-            );
-        }
-    }
-
-    /// Flush TLB for a range of addresses
-    ///
-    /// For large ranges (>32 pages), a full TLB flush is more efficient
-    /// than individual invlpg instructions.
-    pub fn flush_tlb_range(start: u64, end: u64) {
-        const INVLPG_THRESHOLD: u64 = 32 * PAGE_SIZE; // 32 pages
-
-        if end <= start {
-            return;
-        }
-
-        let range = end - start;
-        if range > INVLPG_THRESHOLD {
-            // Full TLB flush is cheaper for large ranges
-            Self::flush_tlb_all();
-        } else {
-            // Individual invalidations for small ranges
-            let mut addr = start & !(PAGE_SIZE - 1);
-            while addr < end {
-                Self::flush_tlb(addr);
-                addr += PAGE_SIZE;
-            }
-        }
     }
 
     /// Translate a virtual address to physical address
@@ -554,12 +745,9 @@ impl PageTable for X86_64PageTable {
             }
             let pt = phys_to_virt_table(pd_entry.addr());
 
-            // Set the final page table entry
+            // Set the final page table entry (callers flush: mm::tlb)
             let pt_entry = (*pt).entry_mut(pt_idx);
             pt_entry.set(pa, entry_flags);
-
-            // Flush TLB for this address
-            Self::flush_tlb(va);
         }
     }
 
@@ -587,10 +775,9 @@ impl PageTable for X86_64PageTable {
             }
             let pt = phys_to_virt_table(pd_entry.addr());
 
+            // Callers flush (mm::tlb)
             let pt_entry = (*pt).entry_mut(pt_idx);
             pt_entry.clear();
-
-            Self::flush_tlb(va);
         }
     }
 
@@ -673,376 +860,7 @@ impl PageTable for X86_64PageTable {
 /// Bit 9 is one of the "available" bits (9-11) that can be used by the OS
 pub const PAGE_COW: u64 = 1 << 9;
 
-// ============================================================================
-// PTE flag manipulation helpers (Linux-style)
-// ============================================================================
-
-/// Callback to check if a page should be force-copied instead of COW'd
-/// Used for mlock'd pages which should be copied immediately
-pub type ForceCopyFn = fn(vaddr: u64) -> bool;
-
 impl X86_64PageTable {
-    /// Duplicate the entire user address space using Copy-on-Write (COW)
-    ///
-    /// For each mapped user-space page:
-    /// 1. If writable: mark read-only in both parent and child, set COW flag
-    /// 2. Map the same physical frame in child's page table
-    /// 3. Increment the frame's reference count
-    ///
-    /// When either process writes to a COW page, the page fault handler will:
-    /// 1. Allocate a new frame
-    /// 2. Copy the page contents
-    /// 3. Update the PTE to point to the new frame with write permission
-    /// 4. Decrement the old frame's reference count
-    ///
-    /// If `force_copy_fn` is provided, pages where the callback returns true
-    /// will be copied immediately instead of using COW. This is used for
-    /// mlock'd pages that must remain resident.
-    ///
-    /// `new_pt` is the child's fresh table (kernel half linked); on error
-    /// it holds part of the copy, which the caller tears down with the
-    /// child mm.
-    pub fn duplicate_user_space<FA: FrameAlloc<PhysAddr = u64>>(
-        &self,
-        new_pt: &mut Self,
-        frame_alloc: &mut FA,
-    ) -> Result<(), i32> {
-        self.duplicate_user_space_inner(new_pt, frame_alloc, None)
-    }
-
-    /// Duplicate user space with optional force-copy callback for mlock'd pages
-    pub fn duplicate_user_space_with_callback<FA: FrameAlloc<PhysAddr = u64>>(
-        &self,
-        new_pt: &mut Self,
-        frame_alloc: &mut FA,
-        force_copy_fn: ForceCopyFn,
-    ) -> Result<(), i32> {
-        self.duplicate_user_space_inner(new_pt, frame_alloc, Some(force_copy_fn))
-    }
-
-    /// Internal implementation of user space duplication
-    fn duplicate_user_space_inner<FA: FrameAlloc<PhysAddr = u64>>(
-        &self,
-        new_pt: &mut Self,
-        frame_alloc: &mut FA,
-        force_copy_fn: Option<ForceCopyFn>,
-    ) -> Result<(), i32> {
-        // Track range of modified parent PTEs for batch TLB flush
-        let mut flush_start: Option<u64> = None;
-        let mut flush_end: u64 = 0;
-
-        unsafe {
-            let parent_pml4 = phys_to_virt_table_const(self.pml4_phys);
-
-            for pml4_idx in 0..KERNEL_PML4_START {
-                let pml4_entry = (*parent_pml4).entry(pml4_idx);
-                if !pml4_entry.is_present() {
-                    continue;
-                }
-
-                let pdpt = phys_to_virt_table_const(pml4_entry.addr());
-
-                // Walk PDPT entries
-                for pdpt_idx in 0..ENTRIES_PER_TABLE {
-                    let pdpt_entry = (*pdpt).entry(pdpt_idx);
-                    if !pdpt_entry.is_present() || pdpt_entry.is_huge() {
-                        continue;
-                    }
-
-                    let vaddr_pdpt = ((pml4_idx as u64) << 39) | ((pdpt_idx as u64) << 30);
-                    let pd = phys_to_virt_table_const(pdpt_entry.addr());
-
-                    // Walk PD entries
-                    for pd_idx in 0..ENTRIES_PER_TABLE {
-                        let pd_entry = (*pd).entry(pd_idx);
-                        // User 2MB pages are not duplicated (not used by fork)
-                        if !pd_entry.is_present() || pd_entry.is_huge() {
-                            continue;
-                        }
-
-                        let vaddr_pd = vaddr_pdpt | ((pd_idx as u64) << 21);
-                        let pt = phys_to_virt_table_const(pd_entry.addr());
-
-                        // Walk PT entries (4KB pages)
-                        for pt_idx in 0..ENTRIES_PER_TABLE {
-                            let pt_entry = (*pt).entry(pt_idx);
-                            if !pt_entry.is_present() {
-                                continue;
-                            }
-
-                            // Calculate virtual address
-                            let vaddr = vaddr_pd | ((pt_idx as u64) << 12);
-
-                            {
-                                // User address - use COW (Copy-on-Write) or force copy
-                                let old_phys = pt_entry.addr();
-                                let old_flags = pt_entry.flags();
-
-                                // Check if this page should be force-copied (e.g., mlock'd)
-                                let force_copy = force_copy_fn.is_some_and(|f| f(vaddr));
-
-                                if force_copy {
-                                    // Force copy: allocate new frame and copy contents immediately
-                                    // Used for mlock'd pages that must remain resident
-                                    let new_phys = frame_alloc.alloc_frame().ok_or(-12i32)?;
-
-                                    // Copy page contents
-                                    core::ptr::copy_nonoverlapping(
-                                        phys_to_virt(old_phys) as *const u8,
-                                        phys_to_virt(new_phys),
-                                        PAGE_SIZE as usize,
-                                    );
-
-                                    // Map new frame in child with original flags
-                                    new_pt.ensure_pt_entry(
-                                        pml4_idx,
-                                        pdpt_idx,
-                                        pd_idx,
-                                        pt_idx,
-                                        PageTableEntry(new_phys | old_flags),
-                                        frame_alloc,
-                                    )?;
-                                } else {
-                                    // Standard COW: mark read-only in both parent and child
-                                    // If the page was writable, mark it read-only and set COW flag
-                                    // in both parent and child PTEs
-                                    let cow_flags = if old_flags & PAGE_WRITABLE != 0 {
-                                        // Remove WRITABLE, add COW marker
-                                        (old_flags & !PAGE_WRITABLE) | PAGE_COW
-                                    } else {
-                                        // Already read-only, keep as-is (no COW needed)
-                                        old_flags
-                                    };
-
-                                    // Update parent's PTE to be read-only with COW flag
-                                    if old_flags & PAGE_WRITABLE != 0 {
-                                        let parent_pt =
-                                            phys_to_virt_table((*pd).entry(pd_idx).addr());
-                                        (*parent_pt).entry_mut(pt_idx).set(old_phys, cow_flags);
-                                        // Track range for batch TLB flush (instead of per-page flush)
-                                        if flush_start.is_none() {
-                                            flush_start = Some(vaddr);
-                                        }
-                                        flush_end = vaddr + PAGE_SIZE;
-                                    }
-
-                                    // Map same physical frame in child with COW
-                                    // flags; the child's PTE holds a reference
-                                    new_pt.ensure_pt_entry(
-                                        pml4_idx,
-                                        pdpt_idx,
-                                        pd_idx,
-                                        pt_idx,
-                                        PageTableEntry(old_phys | cow_flags),
-                                        frame_alloc,
-                                    )?;
-                                    crate::FRAME_ALLOCATOR.incref(old_phys);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Batch TLB flush for all modified parent PTEs
-        // This is more efficient than per-page flush for large address spaces
-        if let Some(start) = flush_start {
-            Self::flush_tlb_range(start, flush_end);
-        }
-
-        Ok(())
-    }
-
-    /// Helper: Ensure PT entry exists and copy a 4KB page entry
-    unsafe fn ensure_pt_entry<FA: FrameAlloc<PhysAddr = u64>>(
-        &mut self,
-        pml4_idx: usize,
-        pdpt_idx: usize,
-        pd_idx: usize,
-        pt_idx: usize,
-        entry: PageTableEntry,
-        frame_alloc: &mut FA,
-    ) -> Result<(), i32> {
-        unsafe {
-            let pml4 = phys_to_virt_table(self.pml4_phys);
-
-            // Ensure PML4 entry exists
-            if !(*pml4).entry(pml4_idx).is_present() {
-                let pdpt_frame = frame_alloc.alloc_frame().ok_or(-12i32)?;
-                core::ptr::write_bytes(phys_to_virt(pdpt_frame), 0, PAGE_SIZE as usize);
-                *(*pml4).entry_mut(pml4_idx) =
-                    PageTableEntry(pdpt_frame | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-            }
-
-            let pdpt = phys_to_virt_table((*pml4).entry(pml4_idx).addr());
-
-            // Ensure PDPT entry exists
-            if !(*pdpt).entry(pdpt_idx).is_present() {
-                let pd_frame = frame_alloc.alloc_frame().ok_or(-12i32)?;
-                core::ptr::write_bytes(phys_to_virt(pd_frame), 0, PAGE_SIZE as usize);
-                *(*pdpt).entry_mut(pdpt_idx) =
-                    PageTableEntry(pd_frame | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-            }
-
-            let pd = phys_to_virt_table((*pdpt).entry(pdpt_idx).addr());
-
-            // Ensure PD entry exists (non-huge)
-            if !(*pd).entry(pd_idx).is_present() {
-                let pt_frame = frame_alloc.alloc_frame().ok_or(-12i32)?;
-                core::ptr::write_bytes(phys_to_virt(pt_frame), 0, PAGE_SIZE as usize);
-                *(*pd).entry_mut(pd_idx) =
-                    PageTableEntry(pt_frame | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER);
-            }
-
-            let pt = phys_to_virt_table((*pd).entry(pd_idx).addr());
-
-            // Copy the 4KB page entry
-            *(*pt).entry_mut(pt_idx) = entry;
-
-            Ok(())
-        }
-    }
-
-    /// Unmap a single page and return its physical address
-    ///
-    /// This is a static method that takes the page table root directly,
-    /// useful for unmapping pages without needing a full X86_64PageTable instance.
-    ///
-    /// Returns Some(phys_addr) if the page was mapped, None if not mapped.
-    pub fn unmap_page(pml4_phys: u64, va: u64) -> Option<u64> {
-        let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
-
-        unsafe {
-            let pml4 = phys_to_virt_table(pml4_phys);
-
-            let pml4_entry = (*pml4).entry(pml4_idx);
-            if !pml4_entry.is_present() {
-                return None;
-            }
-            let pdpt = phys_to_virt_table(pml4_entry.addr());
-
-            let pdpt_entry = (*pdpt).entry(pdpt_idx);
-            if !pdpt_entry.is_present() {
-                return None;
-            }
-            // 1GB huge pages not supported for unmap
-            if pdpt_entry.is_huge() {
-                return None;
-            }
-            let pd = phys_to_virt_table(pdpt_entry.addr());
-
-            let pd_entry = (*pd).entry(pd_idx);
-            if !pd_entry.is_present() {
-                return None;
-            }
-            // 2MB huge pages not supported for unmap
-            if pd_entry.is_huge() {
-                return None;
-            }
-            let pt = phys_to_virt_table(pd_entry.addr());
-
-            let pt_entry = (*pt).entry_mut(pt_idx);
-            if !pt_entry.is_present() {
-                return None;
-            }
-
-            // Get physical address before clearing
-            let phys = pt_entry.addr();
-
-            // Clear the entry
-            pt_entry.clear();
-
-            // Flush TLB for this address
-            Self::flush_tlb(va);
-
-            Some(phys)
-        }
-    }
-
-    /// Update the protection flags on an already-mapped page
-    ///
-    /// This modifies the page table entry for the given virtual address
-    /// to have new protection flags, without changing the physical mapping.
-    ///
-    /// # Arguments
-    /// * `pml4_phys` - Physical address of the PML4 table
-    /// * `va` - Virtual address of the page to modify
-    /// * `writable` - Whether the page should be writable
-    /// * `executable` - Whether the page should be executable
-    ///
-    /// # Returns
-    /// `true` if the page was found and updated, `false` if not mapped
-    pub fn update_page_protection(
-        pml4_phys: u64,
-        va: u64,
-        writable: bool,
-        executable: bool,
-    ) -> bool {
-        let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
-
-        unsafe {
-            let pml4 = phys_to_virt_table(pml4_phys);
-
-            let pml4_entry = (*pml4).entry(pml4_idx);
-            if !pml4_entry.is_present() {
-                return false;
-            }
-            let pdpt = phys_to_virt_table(pml4_entry.addr());
-
-            let pdpt_entry = (*pdpt).entry(pdpt_idx);
-            if !pdpt_entry.is_present() {
-                return false;
-            }
-            // 1GB huge pages not supported for protection update
-            if pdpt_entry.is_huge() {
-                return false;
-            }
-            let pd = phys_to_virt_table(pdpt_entry.addr());
-
-            let pd_entry = (*pd).entry(pd_idx);
-            if !pd_entry.is_present() {
-                return false;
-            }
-            // 2MB huge pages not supported for protection update
-            if pd_entry.is_huge() {
-                return false;
-            }
-            let pt = phys_to_virt_table(pd_entry.addr());
-
-            let pt_entry = (*pt).entry_mut(pt_idx);
-            if !pt_entry.is_present() {
-                return false;
-            }
-
-            // Get current entry, preserve address and base flags
-            let phys = pt_entry.addr();
-            let mut flags = pt_entry.flags();
-
-            // Update writable flag
-            if writable {
-                flags |= PAGE_WRITABLE;
-            } else {
-                flags &= !PAGE_WRITABLE;
-            }
-
-            // Update executable flag (NX bit - inverted logic)
-            if executable {
-                flags &= !PAGE_NO_EXECUTE;
-            } else {
-                flags |= PAGE_NO_EXECUTE;
-            }
-
-            // Write back the updated entry
-            pt_entry.set(phys, flags);
-
-            // Flush TLB for this address
-            Self::flush_tlb(va);
-
-            true
-        }
-    }
-
     /// Update protection flags for a 2MB huge page
     ///
     /// # Arguments
@@ -1104,11 +922,8 @@ impl X86_64PageTable {
                 flags |= PAGE_NO_EXECUTE;
             }
 
-            // Write back the updated entry
+            // Write back the updated entry (the caller flushes the TLB)
             pd_entry.set(phys, flags);
-
-            // Flush TLB for this huge page
-            Self::flush_tlb(va);
 
             true
         }
@@ -1291,171 +1106,11 @@ impl X86_64PageTable {
                 return Err(MapError::AlreadyMapped);
             }
 
-            // Set the 2MB huge page entry (no PT, direct to physical frame)
+            // Set the 2MB huge page entry (no PT, direct to physical frame);
+            // it was empty: no TLB entry to flush
             pd_entry.set(pa, entry_flags);
-
-            // Flush TLB for this address
-            Self::flush_tlb(va);
         }
 
         Ok(())
-    }
-
-    /// Unmap a 2MB huge page
-    ///
-    /// Clears the PD entry for the given 2MB-aligned virtual address.
-    ///
-    /// # Arguments
-    /// * `pml4_phys` - Physical address of the PML4 table
-    /// * `va` - Virtual address (must be 2MB-aligned)
-    ///
-    /// # Returns
-    /// Some(phys_addr) if a huge page was unmapped, None otherwise
-    pub fn unmap_huge_page(pml4_phys: u64, va: u64) -> Option<u64> {
-        let (pml4_idx, pdpt_idx, pd_idx, _pt_idx) = page_indices(va);
-
-        unsafe {
-            let pml4 = phys_to_virt_table(pml4_phys);
-
-            let pml4_entry = (*pml4).entry(pml4_idx);
-            if !pml4_entry.is_present() {
-                return None;
-            }
-            let pdpt = phys_to_virt_table(pml4_entry.addr());
-
-            let pdpt_entry = (*pdpt).entry(pdpt_idx);
-            if !pdpt_entry.is_present() || pdpt_entry.is_huge() {
-                return None;
-            }
-            let pd = phys_to_virt_table(pdpt_entry.addr());
-
-            let pd_entry = (*pd).entry_mut(pd_idx);
-            if !pd_entry.is_present() || !pd_entry.is_huge() {
-                return None;
-            }
-
-            // Get physical address before clearing
-            let phys = pd_entry.addr();
-
-            // Clear the entry
-            pd_entry.clear();
-
-            // Flush TLB for this huge page region
-            Self::flush_tlb(va);
-
-            Some(phys)
-        }
-    }
-
-    /// Split a 2MB huge page into 512 4KB pages
-    ///
-    /// Allocates a new PT, creates 512 4KB PTEs pointing to the same
-    /// physical memory (consecutive 4KB pages), and updates the PD entry
-    /// to point to the new PT.
-    ///
-    /// # Arguments
-    /// * `pml4_phys` - Physical address of the PML4 table
-    /// * `va` - Virtual address of the huge page (must be 2MB-aligned)
-    /// * `frame_alloc` - Frame allocator for the new PT
-    ///
-    /// # Returns
-    /// Ok(phys_base) with the base physical address of the split huge page,
-    /// Err(MapError) on failure
-    pub fn split_huge_page<FA: FrameAlloc<PhysAddr = u64>>(
-        pml4_phys: u64,
-        va: u64,
-        frame_alloc: &mut FA,
-    ) -> Result<u64, MapError> {
-        let (pml4_idx, pdpt_idx, pd_idx, _pt_idx) = page_indices(va);
-
-        unsafe {
-            let pml4 = phys_to_virt_table(pml4_phys);
-
-            let pml4_entry = (*pml4).entry(pml4_idx);
-            if !pml4_entry.is_present() {
-                return Err(MapError::NotMapped);
-            }
-            let pdpt = phys_to_virt_table(pml4_entry.addr());
-
-            let pdpt_entry = (*pdpt).entry(pdpt_idx);
-            if !pdpt_entry.is_present() || pdpt_entry.is_huge() {
-                return Err(MapError::NotMapped);
-            }
-            let pd = phys_to_virt_table(pdpt_entry.addr());
-
-            let pd_entry = (*pd).entry_mut(pd_idx);
-            if !pd_entry.is_present() || !pd_entry.is_huge() {
-                return Err(MapError::NotMapped);
-            }
-
-            // Get the huge page physical address and flags
-            let huge_phys = pd_entry.addr();
-            let old_flags = pd_entry.flags();
-
-            // Convert huge page flags to 4KB page flags (remove PAGE_HUGE)
-            let new_flags = (old_flags & !PAGE_HUGE) | PAGE_PRESENT;
-
-            // Allocate a new PT
-            let pt_phys = frame_alloc
-                .alloc_frame()
-                .ok_or(MapError::FrameAllocationFailed)?;
-            let pt = phys_to_virt_table(pt_phys);
-
-            // Fill the PT with 512 entries pointing to consecutive 4KB pages
-            for i in 0..512 {
-                let page_phys = huge_phys + (i as u64 * PAGE_SIZE);
-                (*pt).entry_mut(i).set(page_phys, new_flags);
-            }
-
-            // Update PD entry to point to the new PT (remove PAGE_HUGE)
-            let pt_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-            pd_entry.set(pt_phys, pt_flags);
-
-            // Flush entire huge page region from TLB
-            // Note: On x86-64, we need to flush all 512 entries since invlpg
-            // on a single address only invalidates that TLB entry
-            Self::flush_tlb_all();
-
-            // Each 4KB PTE now holds its own frame reference
-            crate::FRAME_ALLOCATOR.split_huge(huge_phys);
-
-            Ok(huge_phys)
-        }
-    }
-
-    /// Check if a virtual address is mapped as a 2MB huge page
-    ///
-    /// # Arguments
-    /// * `pml4_phys` - Physical address of the PML4 table
-    /// * `va` - Virtual address to check
-    ///
-    /// # Returns
-    /// Some((phys_addr, flags)) if mapped as huge page, None otherwise
-    /// The phys_addr is the 2MB-aligned base address of the huge page
-    pub fn is_huge_page_mapped(pml4_phys: u64, va: u64) -> Option<(u64, u64)> {
-        let (pml4_idx, pdpt_idx, pd_idx, _pt_idx) = page_indices(va);
-
-        unsafe {
-            let pml4 = phys_to_virt_table_const(pml4_phys);
-
-            let pml4_entry = (*pml4).entry(pml4_idx);
-            if !pml4_entry.is_present() {
-                return None;
-            }
-            let pdpt = phys_to_virt_table_const(pml4_entry.addr());
-
-            let pdpt_entry = (*pdpt).entry(pdpt_idx);
-            if !pdpt_entry.is_present() || pdpt_entry.is_huge() {
-                return None;
-            }
-            let pd = phys_to_virt_table_const(pdpt_entry.addr());
-
-            let pd_entry = (*pd).entry(pd_idx);
-            if !pd_entry.is_present() || !pd_entry.is_huge() {
-                return None;
-            }
-
-            Some((pd_entry.addr(), pd_entry.flags()))
-        }
     }
 }

@@ -11,8 +11,8 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_pipe2, sys_poll, sys_ppoll, sys_pselect6, sys_read, sys_select, sys_write,
-    FdSet, PollFd, Timespec, Timeval, POLLIN, POLLNVAL, POLLOUT,
+    FdSet, POLLIN, POLLNVAL, POLLOUT, PollFd, Timespec, Timeval, sys_close, sys_pipe2, sys_poll,
+    sys_ppoll, sys_pselect6, sys_read, sys_select, sys_write,
 };
 
 /// Run all poll/select tests

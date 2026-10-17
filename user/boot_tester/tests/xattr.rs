@@ -14,10 +14,10 @@
 //! - Test xattr on directories
 //! - Test getxattr with buffer too small returns ERANGE
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_open, sys_setxattr, sys_getxattr, sys_listxattr, sys_removexattr,
-    sys_fsetxattr, sys_fgetxattr, sys_mkdir, XATTR_CREATE, XATTR_REPLACE, O_RDWR, O_CREAT,
+    O_CREAT, O_RDWR, XATTR_CREATE, XATTR_REPLACE, sys_close, sys_fgetxattr, sys_fsetxattr,
+    sys_getxattr, sys_listxattr, sys_mkdir, sys_open, sys_removexattr, sys_setxattr,
 };
 
 // Error codes
@@ -450,7 +450,12 @@ fn test_getxattr_erange() {
 
     // Get attribute with tiny buffer (smaller than value "hello world")
     let mut buf = [0u8; 3]; // Too small
-    let ret = sys_getxattr(path.as_ptr(), attr_name.as_ptr(), buf.as_mut_ptr(), buf.len());
+    let ret = sys_getxattr(
+        path.as_ptr(),
+        attr_name.as_ptr(),
+        buf.as_mut_ptr(),
+        buf.len(),
+    );
 
     if ret == ERANGE {
         println(b"GETXATTR_ERANGE:OK");

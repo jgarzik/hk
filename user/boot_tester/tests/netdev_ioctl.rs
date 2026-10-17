@@ -6,9 +6,9 @@
 //! Leaves the Ethernet link down without addresses.
 
 use hk_syscall::{
-    sys_close, sys_exit, sys_fork, sys_ioctl, sys_mmap, sys_munmap, sys_open, sys_read,
-    sys_socket, sys_unlink, sys_wait4, sys_write, AF_INET, MAP_PRIVATE, O_CREAT, O_RDONLY, O_RDWR,
-    O_TRUNC, PROT_READ, SOCK_DGRAM, SOCK_RAW,
+    AF_INET, MAP_PRIVATE, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, PROT_READ, SOCK_DGRAM, SOCK_RAW,
+    sys_close, sys_exit, sys_fork, sys_ioctl, sys_mmap, sys_munmap, sys_open, sys_read, sys_socket,
+    sys_unlink, sys_wait4, sys_write,
 };
 
 use super::helpers::{print, print_num, println};
@@ -189,7 +189,11 @@ fn test_lo(fd: i32) {
 fn set_up(fd: i32, eth: &Ifr, up: bool) -> i64 {
     let mut r = *eth;
     ioc(fd, SIOCGIFFLAGS, &mut r);
-    let f = if up { r.short() | IFF_UP } else { r.short() & !IFF_UP };
+    let f = if up {
+        r.short() | IFF_UP
+    } else {
+        r.short() & !IFF_UP
+    };
     r.set_short(f);
     ioc(fd, SIOCSIFFLAGS, &mut r)
 }
@@ -311,7 +315,9 @@ fn test_ifconf(fd: i32) {
     ifc[8..16].copy_from_slice(&(buf.as_mut_ptr() as u64).to_ne_bytes());
     sys_ioctl(fd, SIOCGIFCONF, ifc.as_mut_ptr() as u64);
     let got = i32::from_ne_bytes([ifc[0], ifc[1], ifc[2], ifc[3]]) as usize;
-    let lo = buf[..got.min(400)].chunks(40).any(|e| &e[..3] == b"lo\0" && e[20..24] == [127, 0, 0, 1]);
+    let lo = buf[..got.min(400)]
+        .chunks(40)
+        .any(|e| &e[..3] == b"lo\0" && e[20..24] == [127, 0, 0, 1]);
     if got != need as usize || !lo {
         return fail(N, b"entries", got as i64);
     }
@@ -341,7 +347,11 @@ fn read_file(path: &[u8], buf: &mut [u8]) -> usize {
     }
     let mut total = 0;
     loop {
-        let n = sys_read(fd as u64, buf[total..].as_mut_ptr(), (buf.len() - total) as u64);
+        let n = sys_read(
+            fd as u64,
+            buf[total..].as_mut_ptr(),
+            (buf.len() - total) as u64,
+        );
         if n <= 0 {
             break;
         }
@@ -364,7 +374,13 @@ fn test_rt(fd: i32, eth: &Ifr) {
     let mut a = *eth;
     a.set_sin([192, 0, 2, 20]);
     ioc(fd, SIOCSIFADDR, &mut a);
-    let mut rt = rtentry([198, 51, 100, 0], [255, 255, 255, 0], [192, 0, 2, 1], RTF_UP | RTF_GATEWAY, core::ptr::null());
+    let mut rt = rtentry(
+        [198, 51, 100, 0],
+        [255, 255, 255, 0],
+        [192, 0, 2, 1],
+        RTF_UP | RTF_GATEWAY,
+        core::ptr::null(),
+    );
     let p = rt.as_mut_ptr() as u64;
     let add = sys_ioctl(fd, SIOCADDRT, p);
     let dup = sys_ioctl(fd, SIOCADDRT, p);
@@ -375,7 +391,13 @@ fn test_rt(fd: i32, eth: &Ifr) {
     let line = contains(&text[..n], b"\t006433C6\t010200C0\t0003\t");
     let del = sys_ioctl(fd, SIOCDELRT, p);
     let del2 = sys_ioctl(fd, SIOCDELRT, p);
-    let mut bad = rtentry([198, 51, 100, 0], [255, 255, 255, 0], [0; 4], RTF_UP, core::ptr::null());
+    let mut bad = rtentry(
+        [198, 51, 100, 0],
+        [255, 255, 255, 0],
+        [0; 4],
+        RTF_UP,
+        core::ptr::null(),
+    );
     bad[8] = 10; // AF_INET6 destination
     let eaf = sys_ioctl(fd, SIOCADDRT, bad.as_mut_ptr() as u64);
     let mut z = *eth;
@@ -408,7 +430,13 @@ fn test_rt_dev_fault(fd: i32) {
     if m < 0 {
         return fail(N, b"mmap", m);
     }
-    let mut rt = rtentry([198, 51, 100, 0], [255, 255, 255, 0], [0; 4], RTF_UP, m as *const u8);
+    let mut rt = rtentry(
+        [198, 51, 100, 0],
+        [255, 255, 255, 0],
+        [0; 4],
+        RTF_UP,
+        m as *const u8,
+    );
     let p = rt.as_mut_ptr() as u64;
     let add = sys_ioctl(fd, SIOCADDRT, p);
     let del = sys_ioctl(fd, SIOCDELRT, p);
@@ -423,7 +451,8 @@ fn test_proc_route() {
     const N: &[u8] = b"PROC_NET_ROUTE";
     let mut text = [0u8; 4096];
     let n = read_file(b"/proc/net/route\0", &mut text);
-    let hdr = b"Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT";
+    let hdr =
+        b"Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT";
     if n < hdr.len() || &text[..hdr.len()] != hdr {
         return fail(N, b"header", n as i64);
     }
@@ -468,7 +497,11 @@ fn test_errors(fd: i32, eth: &Ifr) {
         let e2 = ioc(fd, SIOCSIFADDR, &mut a);
         let mut g = Ifr::named(b"lo");
         let e3 = ioc(fd, SIOCGIFFLAGS, &mut g);
-        sys_exit(if e1 == EPERM && e2 == EPERM && e3 == 0 { 0 } else { 3 });
+        sys_exit(if e1 == EPERM && e2 == EPERM && e3 == 0 {
+            0
+        } else {
+            3
+        });
     }
     let mut st = 0;
     sys_wait4(pid, &mut st, 0, 0);

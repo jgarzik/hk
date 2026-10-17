@@ -3,7 +3,7 @@
 //! intact by default (IP_PMTUDISC_WANT), EMSGSIZE with DF modes;
 //! IP_MTU of a connected socket.
 
-use hk_syscall::{sys_ioctl, sys_socket, AF_INET, SOCK_DGRAM};
+use hk_syscall::{AF_INET, SOCK_DGRAM, sys_ioctl, sys_socket};
 
 use super::sk::*;
 
@@ -72,7 +72,11 @@ fn test_df_modes() {
     let (b, pb) = udp_lo();
     let data = [0x5au8; 2000];
     let mut inb = [0u8; 4096];
-    t.eq(b"default", getint(a, SOL_IP, IP_MTU_DISCOVER).1 as i64, IP_PMTUDISC_WANT as i64);
+    t.eq(
+        b"default",
+        getint(a, SOL_IP, IP_MTU_DISCOVER).1 as i64,
+        IP_PMTUDISC_WANT as i64,
+    );
     for (mode, want) in [
         (IP_PMTUDISC_DO, EMSGSIZE),
         (IP_PMTUDISC_PROBE, EMSGSIZE),

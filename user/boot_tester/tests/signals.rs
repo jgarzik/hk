@@ -19,14 +19,14 @@
 //! - Test: rt_tgsigqueueinfo() wrong tgid - thread group validation (ESRCH)
 //! - Test: rt_sigsuspend() - wait for signal with temp mask
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_clone, sys_clone3, sys_close, sys_exit, sys_fork, sys_read, sys_getpid, sys_gettid, sys_kill, sys_pipe,
-    sys_rt_sigaction, sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigqueueinfo,
-    sys_rt_sigsuspend, sys_rt_sigtimedwait, sys_rt_tgsigqueueinfo, sys_sigaltstack,
-    sys_tgkill, sys_tkill, sys_wait4, sys_write,
-    CloneArgs, CLONE_ARGS_SIZE_VER0, CLONE_CLEAR_SIGHAND, SA_RESTORER, SA_SIGINFO, SIG_BLOCK, SIG_DFL, SIG_IGN, SIG_SETMASK, SIG_UNBLOCK,
-    SIGCHLD, SIGKILL, SIGPIPE, SIGUSR1,
+    CLONE_ARGS_SIZE_VER0, CLONE_CLEAR_SIGHAND, CloneArgs, SA_RESTORER, SA_SIGINFO, SIG_BLOCK,
+    SIG_DFL, SIG_IGN, SIG_SETMASK, SIG_UNBLOCK, SIGCHLD, SIGKILL, SIGPIPE, SIGUSR1, sys_clone,
+    sys_clone3, sys_close, sys_exit, sys_fork, sys_getpid, sys_gettid, sys_kill, sys_pipe,
+    sys_read, sys_rt_sigaction, sys_rt_sigpending, sys_rt_sigprocmask, sys_rt_sigqueueinfo,
+    sys_rt_sigsuspend, sys_rt_sigtimedwait, sys_rt_tgsigqueueinfo, sys_sigaltstack, sys_tgkill,
+    sys_tkill, sys_wait4, sys_write,
 };
 
 /// SI_QUEUE signal code (for rt_sigqueueinfo)
@@ -87,7 +87,6 @@ pub fn run_tests() {
 
 /// Test 74: rt_sigprocmask() - get and set signal mask
 fn test_sigprocmask() {
-
     // Get current blocked mask
     let mut old_mask: u64 = 0;
     let ret = sys_rt_sigprocmask(SIG_BLOCK, 0, &mut old_mask as *mut u64 as u64, 8);
@@ -126,7 +125,6 @@ fn test_sigprocmask() {
 
 /// Test 75: rt_sigpending() - get pending signals
 fn test_sigpending() {
-
     let mut pending: u64 = 0xFFFFFFFF; // Initialize to non-zero
     let ret = sys_rt_sigpending(&mut pending as *mut u64 as u64, 8);
     if ret == 0 {
@@ -142,7 +140,6 @@ fn test_sigpending() {
 
 /// Test 76: kill() with signal 0 - check process exists
 fn test_kill_sig0() {
-
     let pid = sys_getpid();
     let ret = sys_kill(pid, 0); // Signal 0 = check if process exists
     if ret == 0 {
@@ -155,7 +152,6 @@ fn test_kill_sig0() {
 
 /// Test 77: kill() to non-existent process should fail with ESRCH
 fn test_kill_esrch() {
-
     let ret = sys_kill(99999, 0); // Non-existent PID
     if ret == -3 {
         // ESRCH
@@ -168,7 +164,6 @@ fn test_kill_esrch() {
 
 /// Test 78: tgkill() with signal 0
 fn test_tgkill_sig0() {
-
     let pid = sys_getpid();
     let tid = sys_gettid();
     let ret = sys_tgkill(pid, tid, 0);
@@ -203,7 +198,6 @@ fn test_tgkill_wrong_tgid() {
 
 /// Test 79: tkill() with signal 0
 fn test_tkill_sig0() {
-
     let tid = sys_gettid();
     let ret = sys_tkill(tid, 0);
     if ret == 0 {
@@ -216,7 +210,6 @@ fn test_tkill_sig0() {
 
 /// Test 80: rt_sigaction() - get default action for SIGUSR1
 fn test_sigaction() {
-
     // Define a simple sigaction structure for testing
     // struct sigaction { u64 handler, u64 flags, u64 restorer, u64 mask }
     let mut old_action: [u64; 4] = [0; 4];
@@ -238,7 +231,6 @@ fn test_sigaction() {
 
 /// Test 81: rt_sigaction() with invalid signal should fail
 fn test_sigaction_einval() {
-
     let ret = sys_rt_sigaction(0, 0, 0, 8); // Signal 0 is invalid
     if ret == -22 {
         // EINVAL
@@ -251,7 +243,6 @@ fn test_sigaction_einval() {
 
 /// Test 82: rt_sigaction() on SIGKILL should fail
 fn test_sigaction_sigkill() {
-
     // Try to set a handler for SIGKILL (should fail)
     let new_action: [u64; 4] = [SIG_IGN, 0, 0, 0];
     let ret = sys_rt_sigaction(SIGKILL, new_action.as_ptr() as u64, 0, 8);
@@ -310,7 +301,12 @@ fn test_clone_clear_sighand() {
     let mut old_action: [u64; 4] = [0; 4];
     let default_action: [u64; 4] = [SIG_DFL, 0, 0, 0];
 
-    let ret = sys_rt_sigaction(SIGUSR1, new_action.as_ptr() as u64, old_action.as_mut_ptr() as u64, 8);
+    let ret = sys_rt_sigaction(
+        SIGUSR1,
+        new_action.as_ptr() as u64,
+        old_action.as_mut_ptr() as u64,
+        8,
+    );
     if ret != 0 {
         print(b"CLONE_CLEAR_SIGHAND:FAIL: could not set handler, ret = ");
         print_num(ret);
@@ -626,12 +622,22 @@ fn test_sigsuspend() {
         restorer: signal_restorer as *const () as u64,
         mask: 0,
     };
-    let default_action = SigActionData { handler: SIG_DFL, flags: 0, restorer: 0, mask: 0 };
+    let default_action = SigActionData {
+        handler: SIG_DFL,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
     let usr1_mask: u64 = 1 << (SIGUSR1 - 1);
     let mut old_mask: u64 = 0;
 
     sys_rt_sigaction(SIGUSR1, &action as *const SigActionData as u64, 0, 8);
-    sys_rt_sigprocmask(SIG_BLOCK, &usr1_mask as *const u64 as u64, &mut old_mask as *mut u64 as u64, 8);
+    sys_rt_sigprocmask(
+        SIG_BLOCK,
+        &usr1_mask as *const u64 as u64,
+        &mut old_mask as *mut u64 as u64,
+        8,
+    );
     sys_kill(sys_getpid(), SIGUSR1);
 
     let empty_mask: u64 = 0;
@@ -639,7 +645,12 @@ fn test_sigsuspend() {
     let invoked = unsafe { core::ptr::read_volatile(&raw const HANDLER_INVOKED) };
 
     sys_rt_sigprocmask(SIG_SETMASK, &old_mask as *const u64 as u64, 0, 8);
-    sys_rt_sigaction(SIGUSR1, &default_action as *const SigActionData as u64, 0, 8);
+    sys_rt_sigaction(
+        SIGUSR1,
+        &default_action as *const SigActionData as u64,
+        0,
+        8,
+    );
 
     if ret == -4 && invoked {
         println(b"SIGSUSPEND:OK");
@@ -784,9 +795,9 @@ struct SigActionData {
 #[unsafe(naked)]
 unsafe extern "C" fn signal_restorer() -> ! {
     core::arch::naked_asm!(
-        "mov rax, 15",  // SYS_rt_sigreturn
+        "mov rax, 15", // SYS_rt_sigreturn
         "syscall",
-        "ud2"           // Should never reach here
+        "ud2" // Should never reach here
     )
 }
 
@@ -794,9 +805,9 @@ unsafe extern "C" fn signal_restorer() -> ! {
 #[unsafe(naked)]
 unsafe extern "C" fn signal_restorer() -> ! {
     core::arch::naked_asm!(
-        "mov x8, 139",  // SYS_rt_sigreturn
+        "mov x8, 139", // SYS_rt_sigreturn
         "svc 0",
-        "brk 0"         // Should never reach here
+        "brk 0" // Should never reach here
     )
 }
 
@@ -872,7 +883,12 @@ fn test_signal_handler_invocation() {
             restorer: 0,
             mask: 0,
         };
-        sys_rt_sigaction(SIGUSR1, &default_action as *const SigActionData as u64, 0, 8);
+        sys_rt_sigaction(
+            SIGUSR1,
+            &default_action as *const SigActionData as u64,
+            0,
+            8,
+        );
         return;
     }
 
@@ -887,7 +903,12 @@ fn test_signal_handler_invocation() {
         restorer: 0,
         mask: 0,
     };
-    sys_rt_sigaction(SIGUSR1, &default_action as *const SigActionData as u64, 0, 8);
+    sys_rt_sigaction(
+        SIGUSR1,
+        &default_action as *const SigActionData as u64,
+        0,
+        8,
+    );
 
     if invoked && signo == SIGUSR1 as i32 {
         println(b"SIGHANDLER_INVOKE:OK");

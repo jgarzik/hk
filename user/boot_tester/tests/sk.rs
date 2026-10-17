@@ -4,9 +4,9 @@
 #![allow(dead_code)]
 
 use hk_syscall::{
-    sys_bind, sys_clock_gettime, sys_close, sys_connect, sys_getsockname, sys_getsockopt,
-    sys_poll, sys_recvfrom, sys_recvmsg, sys_sendto, sys_setsockopt, sys_socket, IoVec, MsgHdr,
-    PollFd, SockAddrIn, Timespec, AF_INET, CLOCK_MONOTONIC, SOCK_DGRAM, SOCK_STREAM,
+    AF_INET, CLOCK_MONOTONIC, IoVec, MsgHdr, PollFd, SOCK_DGRAM, SOCK_STREAM, SockAddrIn, Timespec,
+    sys_bind, sys_clock_gettime, sys_close, sys_connect, sys_getsockname, sys_getsockopt, sys_poll,
+    sys_recvfrom, sys_recvmsg, sys_sendto, sys_setsockopt, sys_socket,
 };
 
 use super::helpers::{print, print_num, println};
@@ -151,20 +151,37 @@ pub fn send(fd: i32, data: &[u8], flags: i32) -> i64 {
 }
 
 pub fn recv(fd: i32, buf: &mut [u8], flags: i32) -> i64 {
-    sys_recvfrom(fd, buf.as_mut_ptr(), buf.len(), flags, core::ptr::null_mut(), core::ptr::null_mut())
+    sys_recvfrom(
+        fd,
+        buf.as_mut_ptr(),
+        buf.len(),
+        flags,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+    )
 }
 
 /// recvfrom with the source: (return, address, port)
 pub fn recv_from(fd: i32, buf: &mut [u8], flags: i32) -> (i64, [u8; 4], u16) {
     let mut a = sin(ANY, 0);
     let mut len = 16u32;
-    let r = sys_recvfrom(fd, buf.as_mut_ptr(), buf.len(), flags, &mut a as *mut SockAddrIn as *mut u8, &mut len);
+    let r = sys_recvfrom(
+        fd,
+        buf.as_mut_ptr(),
+        buf.len(),
+        flags,
+        &mut a as *mut SockAddrIn as *mut u8,
+        &mut len,
+    );
     (r, a.sin_addr.to_ne_bytes(), u16::from_be(a.sin_port))
 }
 
 /// recvmsg with a control buffer: (return, msg_flags, control length)
 pub fn recv_msg(fd: i32, buf: &mut [u8], ctl: &mut [u8], flags: i32) -> (i64, i32, usize) {
-    let mut iov = IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() };
+    let mut iov = IoVec {
+        iov_base: buf.as_mut_ptr(),
+        iov_len: buf.len(),
+    };
     let mut m = MsgHdr::new(&mut iov, 1);
     m.msg_control = ctl.as_mut_ptr();
     m.msg_controllen = ctl.len();
@@ -192,13 +209,20 @@ pub fn cmsg_find(ctl: &[u8], len: usize, level: i32, ty: i32) -> Option<&[u8]> {
 
 /// poll one fd: (return, revents)
 pub fn poll1(fd: i32, events: i16, ms: i32) -> (i64, i16) {
-    let mut p = PollFd { fd, events, revents: 0 };
+    let mut p = PollFd {
+        fd,
+        events,
+        revents: 0,
+    };
     let r = sys_poll(&mut p, 1, ms);
     (r, p.revents)
 }
 
 pub fn now_ms() -> u64 {
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     sys_clock_gettime(CLOCK_MONOTONIC, &mut ts);
     ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
 }
@@ -218,7 +242,10 @@ pub struct T {
 
 impl T {
     pub fn new(name: &'static [u8]) -> Self {
-        Self { name, failed: false }
+        Self {
+            name,
+            failed: false,
+        }
     }
 
     /// Record `got == want` (first failure is printed)

@@ -7,8 +7,8 @@
 //! - Test iopl lower privilege (always allowed)
 //! - Test ioperm returns ENOSYS (not yet implemented)
 
-use super::helpers::{print, println, print_num, host_mode};
-use hk_syscall::{sys_iopl, sys_ioperm};
+use super::helpers::{host_mode, print, print_num, println};
+use hk_syscall::{sys_ioperm, sys_iopl};
 
 // Error codes
 const EINVAL: i64 = 22;

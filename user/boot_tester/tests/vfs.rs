@@ -5,8 +5,8 @@
 //! 2. Reading /proc/version from procfs
 //! 3. Listing /proc directory with getdents64
 
-use super::helpers::{print, println, print_num};
-use hk_syscall::{sys_close, sys_getdents64, sys_open, sys_read, sys_write, O_DIRECTORY, O_RDONLY};
+use super::helpers::{print, print_num, println};
+use hk_syscall::{O_DIRECTORY, O_RDONLY, sys_close, sys_getdents64, sys_open, sys_read, sys_write};
 
 /// Run all VFS tests
 pub fn run_tests() {

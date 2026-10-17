@@ -23,16 +23,14 @@ unsafe extern "C" {
     ///   prev_sp_ptr - Pointer to prev task's saved RSP location
     ///   next_sp - next task's saved RSP value
     ///   new_kstack - new kernel stack top (for TSS.RSP0)
-    ///   new_cr3 - new task's CR3 (page table physical address)
-    fn __switch_to_asm(prev_sp_ptr: *mut u64, next_sp: u64, new_kstack: u64, new_cr3: u64);
+    fn __switch_to_asm(prev_sp_ptr: *mut u64, next_sp: u64, new_kstack: u64);
 
     /// Switch to a new task without saving current context
     ///
     /// Arguments:
     ///   next_sp - next task's saved RSP value
     ///   new_kstack - new kernel stack top (for TSS.RSP0 and SYSCALL_KERNEL_STACK)
-    ///   new_cr3 - new task's CR3 (page table physical address)
-    fn __switch_to_asm_first(next_sp: u64, new_kstack: u64, new_cr3: u64);
+    fn __switch_to_asm_first(next_sp: u64, new_kstack: u64);
 }
 
 /// Kernel thread context (callee-saved registers only)
@@ -169,7 +167,7 @@ extern "C" fn kernel_thread_exit(_status: i64) {
 /// When we arrive here via context_switch:
 /// - RSP points to a location where we placed a TrapFrame
 /// - We need to release the scheduler lock
-/// - Load the child's page table (CR3)
+/// - The switch already loaded the child's address space (CR3)
 /// - Load the child's TLS (FS base) if CLONE_SETTLS was used
 /// - Restore all registers from TrapFrame
 /// - IRETQ to user mode with RAX=0 (child return value)
@@ -177,18 +175,10 @@ extern "C" fn kernel_thread_exit(_status: i64) {
 pub extern "C" fn clone_child_entry() -> ! {
     core::arch::naked_asm!(
         // First, release the scheduler lock that was held during context switch
+        // (the switch loaded the child's address space: mm::tlb::switch_mm)
         "call {finish_switch}",
 
-        // Get the child's CR3 (page table root physical address)
-        // This is crucial for fork() - the child has its own address space
-        "call {get_cr3}",
-        // RAX now contains the child's CR3
-        // Load it into CR3 NOW, before restoring registers
-        // This is safe because we're still in kernel mode with kernel stack
-        "mov cr3, rax",
-
         // Write child TID if CLONE_CHILD_SETTID was used (for fork)
-        // Must be after CR3 switch since we're writing to child's address space
         "call {write_child_tid}",
 
         // Get and load the child's TLS (FS base)
@@ -239,7 +229,6 @@ pub extern "C" fn clone_child_entry() -> ! {
         "iretq",
 
         finish_switch = sym finish_context_switch,
-        get_cr3 = sym crate::task::percpu::get_current_task_cr3,
         write_child_tid = sym crate::task::percpu::write_child_tid_if_needed,
         get_tls = sym crate::task::percpu::get_current_task_tls,
         fpu_restore = sym super::fpu::restore_from_raw,
@@ -306,20 +295,18 @@ impl TaskContext {
 /// - `old_ctx` must point to valid, writable memory for storing the current context
 /// - `new_ctx` must point to a valid, previously saved context
 /// - `new_kstack` must be a valid kernel stack top address
-/// - `new_cr3` must be a valid page table physical address
+/// - the next task's address space is loaded (`mm::tlb::switch_mm`)
 /// - Interrupts should be disabled during the switch
 ///
 /// # Arguments
 /// * `old_ctx` - Where to save the current task's context
 /// * `new_ctx` - The context to restore
 /// * `new_kstack` - New kernel stack top (for TSS.RSP0)
-/// * `new_cr3` - New task's page table physical address
 /// * `next_tid` - TID of the task we're switching to (for TLS lookup)
 pub unsafe fn context_switch(
     old_ctx: *mut TaskContext,
     new_ctx: *const TaskContext,
     new_kstack: u64,
-    new_cr3: u64,
     next_tid: Tid,
 ) {
     // Load next task's TLS (FS base) before switching
@@ -336,7 +323,6 @@ pub unsafe fn context_switch(
     //   prev_sp_ptr - pointer to where to save current RSP
     //   next_sp - the RSP value to switch to
     //   new_kstack - kernel stack top for TSS.RSP0
-    //   new_cr3 - new task's page table physical address
     //
     // The outgoing task's user FP/SIMD registers (the kernel itself never
     // touches them: soft-float) are kept in `fpu_area` on its own kernel
@@ -346,7 +332,7 @@ pub unsafe fn context_switch(
         fpu::save_raw(fpu_area.as_mut_ptr());
         let prev_sp_ptr = &raw mut (*old_ctx).rsp;
         let next_sp = (*new_ctx).rsp;
-        __switch_to_asm(prev_sp_ptr, next_sp, new_kstack, new_cr3);
+        __switch_to_asm(prev_sp_ptr, next_sp, new_kstack);
         // Back on this task: its FP state is in `fpu_area`
         fpu::restore_raw(fpu_area.as_ptr());
     }
@@ -359,12 +345,7 @@ pub unsafe fn context_switch(
 ///
 /// # Safety
 /// Same requirements as context_switch, except old_ctx is not used.
-pub unsafe fn context_switch_first(
-    new_ctx: *const TaskContext,
-    new_kstack: u64,
-    new_cr3: u64,
-    next_tid: Tid,
-) {
+pub unsafe fn context_switch_first(new_ctx: *const TaskContext, new_kstack: u64, next_tid: Tid) {
     // Load next task's TLS (FS base) - no prev task to save
     if next_tid != 0 {
         let tls = get_task_tls(next_tid).unwrap_or(0);
@@ -375,11 +356,10 @@ pub unsafe fn context_switch_first(
     // - Loading next task's RSP
     // - Updating TSS.RSP0
     // - Updating SYSCALL_KERNEL_STACK
-    // - Loading new task's CR3
     // - Restoring callee-saved registers from the new stack
     unsafe {
         let next_sp = (*new_ctx).rsp;
-        __switch_to_asm_first(next_sp, new_kstack, new_cr3);
+        __switch_to_asm_first(next_sp, new_kstack);
     }
 }
 
@@ -409,22 +389,20 @@ impl ContextOps for X86_64Arch {
         old_ctx: *mut Self::TaskContext,
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        new_page_table_root: u64,
         next_tid: Tid,
     ) {
         unsafe {
-            context_switch(old_ctx, new_ctx, new_kstack, new_page_table_root, next_tid);
+            context_switch(old_ctx, new_ctx, new_kstack, next_tid);
         }
     }
 
     unsafe fn context_switch_first(
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        new_page_table_root: u64,
         next_tid: Tid,
     ) -> ! {
         unsafe {
-            context_switch_first(new_ctx, new_kstack, new_page_table_root, next_tid);
+            context_switch_first(new_ctx, new_kstack, next_tid);
             // The above never returns, but we need to satisfy the type system
             core::hint::unreachable_unchecked()
         }

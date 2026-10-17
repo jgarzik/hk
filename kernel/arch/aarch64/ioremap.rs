@@ -9,13 +9,13 @@
 //! other addresses get pages in the ioremap window. Both are in TTBR1,
 //! shared by every address space.
 
+use crate::mm::tlb::flush_tlb_kernel_range;
 use crate::sync::spin::Mutex;
 use core::arch::asm;
 
 use super::paging::{
     AF, AP_EL1_RW, ATTR_IDX_DEVICE, IO_BASE, IO_SIZE, PAGE_SIZE, PXN, PageTableEntry, SH_INNER,
-    UXN, VMALLOC_START, flush_tlb, io_va, phys_to_virt, phys_to_virt_table,
-    phys_to_virt_table_const,
+    UXN, VMALLOC_START, io_va, phys_to_virt, phys_to_virt_table, phys_to_virt_table_const,
 };
 
 /// ioremap window base (the vmalloc area, TTBR1)
@@ -223,17 +223,29 @@ pub fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError> {
                 let rollback_va = virt_base + (j as u64) * PAGE_SIZE;
                 unmap_page(l0_phys, rollback_va);
             }
+            flush_tlb_kernel_range(virt_base, virt_base + aligned_size);
             IOREMAP.lock().free(virt_base, num_pages);
             return Err(e);
         }
     }
 
-    // Flush TLB for mapped range
-    for i in 0..num_pages {
-        flush_tlb(virt_base + (i as u64) * PAGE_SIZE);
-    }
+    // Make the entries visible on every CPU (a stale entry of a range
+    // used before is already gone: iounmap flushed it)
+    flush_tlb_kernel_range(virt_base, virt_base + aligned_size);
 
     Ok((virt_base + offset) as *mut u8)
+}
+
+/// Point the ioremap page at `va` to `pa` instead (TLB self-test):
+/// break (clear, flush every CPU), then make
+#[cfg(feature = "lockdep")]
+pub fn retarget(va: u64, pa: u64) -> Result<(), IoremapError> {
+    let root = super::kmap::swapper_phys();
+    unmap_page(root, va);
+    flush_tlb_kernel_range(va, va + PAGE_SIZE);
+    map_device_page(root, va, pa)?;
+    flush_tlb_kernel_range(va, va + PAGE_SIZE);
+    Ok(())
 }
 
 /// Unmap a previously ioremap'd region
@@ -258,12 +270,11 @@ pub fn iounmap(virt_addr: *mut u8, size: u64) {
 
     let l0_phys = super::kmap::swapper_phys();
 
-    // Unmap pages and flush TLB
+    // Unmap pages, then flush every CPU before the range can be reused
     for i in 0..num_pages {
-        let va = aligned_virt + (i as u64) * PAGE_SIZE;
-        unmap_page(l0_phys, va);
-        flush_tlb(va);
+        unmap_page(l0_phys, aligned_virt + (i as u64) * PAGE_SIZE);
     }
+    flush_tlb_kernel_range(aligned_virt, aligned_virt + aligned_size);
 
     // Free virtual address range
     IOREMAP.lock().free(aligned_virt, num_pages);

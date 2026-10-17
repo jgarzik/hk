@@ -8,9 +8,11 @@
 //! unconfigured; every test leaves it down without addresses.
 
 use hk_syscall::{
-    sys_bind, sys_capget, sys_pidfd_getfd, sys_pidfd_open, sys_pipe2, sys_read, sys_write, sys_capset, sys_close, sys_exit, sys_fork, sys_getpid, sys_getsockname,
-    sys_getsockopt, sys_recvfrom, sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt, sys_socket, sys_wait4, CapUserData,
-    CapUserHeader, IoVec, MsgHdr, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, _LINUX_CAPABILITY_VERSION_3,
+    _LINUX_CAPABILITY_VERSION_3, CapUserData, CapUserHeader, IoVec, MsgHdr, SOCK_DGRAM, SOCK_RAW,
+    SOCK_STREAM, sys_bind, sys_capget, sys_capset, sys_close, sys_exit, sys_fork, sys_getpid,
+    sys_getsockname, sys_getsockopt, sys_pidfd_getfd, sys_pidfd_open, sys_pipe2, sys_read,
+    sys_recvfrom, sys_recvmsg, sys_sendmsg, sys_sendto, sys_setsockopt, sys_socket, sys_wait4,
+    sys_write,
 };
 
 use super::helpers::{print, print_num, println};
@@ -311,7 +313,11 @@ fn test_ack() {
         return fail(N, b"success ack", n);
     }
     // Error: whole request echoed (missing IFA_LOCAL -> EINVAL)
-    let mut r = Req::new(RTM_NEWADDR, NLM_F_ACK | NLM_F_CREATE, &ifaddr(AF_INET, 24, 1));
+    let mut r = Req::new(
+        RTM_NEWADDR,
+        NLM_F_ACK | NLM_F_CREATE,
+        &ifaddr(AF_INET, 24, 1),
+    );
     let reqlen = r.bytes(0).len();
     let seq = nl.send(&mut r);
     let n = nl.recv(buf, 0);
@@ -380,7 +386,11 @@ fn test_updown() {
     let r = set_link_up(&mut nl, eth.index, false);
     let down = get_link(&mut nl, eth.index).unwrap_or_default();
     if !up_ok {
-        return fail(N, b"not running after up, flags", up.map_or(-1, |l| l.flags as i64));
+        return fail(
+            N,
+            b"not running after up, flags",
+            up.map_or(-1, |l| l.flags as i64),
+        );
     }
     if r != 0 || down.flags & (IFF_UP | IFF_RUNNING) != 0 || down.operstate != IF_OPER_DOWN {
         return fail(N, b"after down, flags", down.flags as i64);
@@ -404,7 +414,8 @@ fn route_scan(nl: &mut Nl, index: u32) -> RouteSeen {
         if m.ty != RTM_NEWROUTE || m.body[0] != AF_INET {
             return;
         }
-        let (dlen, table, proto, scope, rtype) = (m.body[1], m.body[4], m.body[5], m.body[6], m.body[7]);
+        let (dlen, table, proto, scope, rtype) =
+            (m.body[1], m.body[4], m.body[5], m.body[6], m.body[7]);
         let dst = m.attr_ip(12, RTA_DST).unwrap_or([0; 4]);
         let oif = m.attr_u32(12, RTA_OIF).unwrap_or(0);
         if oif != index {
@@ -419,7 +430,11 @@ fn route_scan(nl: &mut Nl, index: u32) -> RouteSeen {
         if table == RT_TABLE_LOCAL && dlen == 32 && dst == TEST_IP && rtype == RTN_LOCAL {
             s.local = true;
         }
-        if table == RT_TABLE_LOCAL && dlen == 32 && dst == [192, 0, 2, 255] && rtype == RTN_BROADCAST {
+        if table == RT_TABLE_LOCAL
+            && dlen == 32
+            && dst == [192, 0, 2, 255]
+            && rtype == RTN_BROADCAST
+        {
             s.bcast = true;
         }
         if table == RT_TABLE_MAIN && dlen == 24 && dst == TEST_NET {
@@ -470,11 +485,23 @@ fn test_addr_route() {
     let ce = NLM_F_CREATE | NLM_F_EXCL;
     let result = (|| -> Result<(), (&'static [u8], i64)> {
         let chk = |what: &'static [u8], got: i32, want: i32| {
-            if got == want { Ok(()) } else { Err((what, got as i64)) }
+            if got == want {
+                Ok(())
+            } else {
+                Err((what, got as i64))
+            }
         };
         chk(b"newaddr", addr(&mut nl, true, i, TEST_IP, 24, ce), 0)?;
-        chk(b"newaddr dup", addr(&mut nl, true, i, TEST_IP, 24, ce), EEXIST)?;
-        chk(b"newaddr bad dev", addr(&mut nl, true, 99999, TEST_IP, 24, ce), ENODEV)?;
+        chk(
+            b"newaddr dup",
+            addr(&mut nl, true, i, TEST_IP, 24, ce),
+            EEXIST,
+        )?;
+        chk(
+            b"newaddr bad dev",
+            addr(&mut nl, true, 99999, TEST_IP, 24, ce),
+            ENODEV,
+        )?;
         let (_, has) = addrs_on(&mut nl, i, TEST_IP);
         if !has {
             return Err((b"address not in dump", 0));
@@ -484,8 +511,16 @@ fn test_addr_route() {
             let v = (s.prefix as i64) | (s.local as i64) << 1 | (s.bcast as i64) << 2;
             return Err((b"kernel routes (prefix|local|bcast bits)", v));
         }
-        chk(b"newroute", route(&mut nl, true, TEST_NET, 24, TEST_GW, 0, ce), 0)?;
-        chk(b"newroute dup", route(&mut nl, true, TEST_NET, 24, TEST_GW, 0, ce), EEXIST)?;
+        chk(
+            b"newroute",
+            route(&mut nl, true, TEST_NET, 24, TEST_GW, 0, ce),
+            0,
+        )?;
+        chk(
+            b"newroute dup",
+            route(&mut nl, true, TEST_NET, 24, TEST_GW, 0, ce),
+            EEXIST,
+        )?;
         chk(
             b"unreachable gw",
             route(&mut nl, true, [203, 0, 113, 0], 24, [10, 99, 99, 1], 0, ce),
@@ -504,11 +539,27 @@ fn test_addr_route() {
             Ok((oif, ..)) => return Err((b"route get local: oif", oif as i64)),
             Err(e) => return Err((b"route get local", e as i64)),
         }
-        chk(b"route get no route", route_get(&mut nl, [203, 0, 113, 9]).err().unwrap_or(0), ENETUNREACH)?;
-        chk(b"delroute", route(&mut nl, false, TEST_NET, 24, [0; 4], 0, 0), 0)?;
-        chk(b"delroute again", route(&mut nl, false, TEST_NET, 24, [0; 4], 0, 0), ESRCH)?;
+        chk(
+            b"route get no route",
+            route_get(&mut nl, [203, 0, 113, 9]).err().unwrap_or(0),
+            ENETUNREACH,
+        )?;
+        chk(
+            b"delroute",
+            route(&mut nl, false, TEST_NET, 24, [0; 4], 0, 0),
+            0,
+        )?;
+        chk(
+            b"delroute again",
+            route(&mut nl, false, TEST_NET, 24, [0; 4], 0, 0),
+            ESRCH,
+        )?;
         chk(b"deladdr", addr(&mut nl, false, i, TEST_IP, 24, 0), 0)?;
-        chk(b"deladdr again", addr(&mut nl, false, i, TEST_IP, 24, 0), EADDRNOTAVAIL)?;
+        chk(
+            b"deladdr again",
+            addr(&mut nl, false, i, TEST_IP, 24, 0),
+            EADDRNOTAVAIL,
+        )?;
         let s = route_scan(&mut nl, i);
         if s.prefix || s.local || s.bcast {
             return Err((b"routes left after deladdr", 0));
@@ -538,11 +589,24 @@ fn test_notify() {
     let g = nladdr(sockname(mon.fd).1, RTMGRP_IPV4_IFADDR);
     let r1 = sys_bind(mon.fd, g.as_ptr(), 12);
     let one = RTNLGRP_LINK;
-    let r2 = sys_setsockopt(mon.fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &one as *const i32 as *const u8, 4);
+    let r2 = sys_setsockopt(
+        mon.fd,
+        SOL_NETLINK,
+        NETLINK_ADD_MEMBERSHIP,
+        &one as *const i32 as *const u8,
+        4,
+    );
     if r1 != 0 || r2 != 0 || sockname(mon.fd).2 & RTMGRP_IPV4_IFADDR == 0 {
         return fail(N, b"subscribe", r1 | r2);
     }
-    let added = addr(&mut nl, true, eth.index, TEST_IP, 24, NLM_F_CREATE | NLM_F_EXCL);
+    let added = addr(
+        &mut nl,
+        true,
+        eth.index,
+        TEST_IP,
+        24,
+        NLM_F_CREATE | NLM_F_EXCL,
+    );
     let seen_new = wait_notify(&mon, RTM_NEWADDR, eth.index);
     let deleted = addr(&mut nl, false, eth.index, TEST_IP, 24, 0);
     let seen_del = wait_notify(&mon, RTM_DELADDR, eth.index);
@@ -643,7 +707,13 @@ fn test_sockopt() {
     };
     let one: i32 = 1;
     let p1 = &one as *const i32 as *const u8;
-    for o in [NETLINK_EXT_ACK, NETLINK_GET_STRICT_CHK, NETLINK_CAP_ACK, NETLINK_NO_ENOBUFS, NETLINK_PKTINFO] {
+    for o in [
+        NETLINK_EXT_ACK,
+        NETLINK_GET_STRICT_CHK,
+        NETLINK_CAP_ACK,
+        NETLINK_NO_ENOBUFS,
+        NETLINK_PKTINFO,
+    ] {
         let r = sys_setsockopt(nl.fd, SOL_NETLINK, o, p1, 4);
         let (g, v) = getopt(nl.fd, SOL_NETLINK, o);
         if r != 0 || g != 0 || v != 1 {
@@ -657,7 +727,13 @@ fn test_sockopt() {
         return fail(N, b"SO_RCVBUF doubled", v as i64);
     }
     let zero: i32 = 0;
-    let r = sys_setsockopt(nl.fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &zero as *const i32 as *const u8, 4) as i32;
+    let r = sys_setsockopt(
+        nl.fd,
+        SOL_NETLINK,
+        NETLINK_ADD_MEMBERSHIP,
+        &zero as *const i32 as *const u8,
+        4,
+    ) as i32;
     if !expect(N, b"group 0", r, EINVAL) {
         return;
     }
@@ -678,7 +754,13 @@ fn test_strict_dump() {
         return fail(N, b"open", 0);
     };
     let one: i32 = 1;
-    sys_setsockopt(nl.fd, SOL_NETLINK, NETLINK_GET_STRICT_CHK, &one as *const i32 as *const u8, 4);
+    sys_setsockopt(
+        nl.fd,
+        SOL_NETLINK,
+        NETLINK_GET_STRICT_CHK,
+        &one as *const i32 as *const u8,
+        4,
+    );
     let (mut other, mut lo, mut filtered) = (0, 0, true);
     let mut r = Req::new(RTM_GETADDR, 0, &ifaddr(AF_INET, 0, 1));
     let n = nl.dump(&mut r, &mut |m| {
@@ -712,7 +794,8 @@ fn test_other_dumps() {
         if m.ty != RTM_NEWROUTE || m.body[0] != AF_INET {
             bad += 1;
         }
-        if m.body[4] == RT_TABLE_LOCAL && m.body[7] == RTN_LOCAL
+        if m.body[4] == RT_TABLE_LOCAL
+            && m.body[7] == RTN_LOCAL
             && m.attr_ip(12, RTA_DST) == Some([127, 0, 0, 1])
         {
             lo_local = true;
@@ -775,7 +858,9 @@ fn test_eperm() {
         if !drop_caps() {
             sys_exit(2);
         }
-        let Some(mut nl) = Nl::open() else { sys_exit(3) };
+        let Some(mut nl) = Nl::open() else {
+            sys_exit(3)
+        };
         let e = addr(&mut nl, true, 1, TEST_IP, 24, NLM_F_CREATE);
         let mut r = Req::new(RTM_GETLINK, 0, &ifinfo(0, 0, 0));
         let n = nl.dump(&mut r, &mut |_| {});
@@ -806,14 +891,23 @@ fn test_overflow() {
     let buf = rxbuf();
     let p = buf.as_ptr();
     let mut huge = [
-        IoVec { iov_base: p, iov_len: 16 },
-        IoVec { iov_base: p, iov_len: usize::MAX / 2 },
+        IoVec {
+            iov_base: p,
+            iov_len: 16,
+        },
+        IoVec {
+            iov_base: p,
+            iov_len: usize::MAX / 2,
+        },
     ];
     if !expect(N, b"huge iov_len", sendmsg_iov(nl.fd, &mut huge), EFAULT) {
         return;
     }
     // 10 x 32 KB = 320 KB > default sndbuf (212992)
-    let mut big = [IoVec { iov_base: p, iov_len: buf.len() }; 10];
+    let mut big = [IoVec {
+        iov_base: p,
+        iov_len: buf.len(),
+    }; 10];
     if !expect(N, b"total > sndbuf", sendmsg_iov(nl.fd, &mut big), EMSGSIZE) {
         return;
     }
@@ -825,7 +919,10 @@ fn test_overflow() {
     // 1025 segments (zero length) inside the 32 KB receive buffer
     let many = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut IoVec, 1025) };
     for v in many.iter_mut() {
-        *v = IoVec { iov_base: p, iov_len: 0 };
+        *v = IoVec {
+            iov_base: p,
+            iov_len: 0,
+        };
     }
     if !expect(N, b"iovlen 1025", sendmsg_iov(nl.fd, many), EMSGSIZE) {
         return;
@@ -863,7 +960,9 @@ fn route_dump(nl: &mut Nl, second: bool) -> (u32, bool, i32, i64) {
         }
         parts += 1;
         each_msg(&buf[..n as usize], &mut |m| {
-            let ours = m.attr_ip(12, RTA_DST).is_some_and(|d| d[0] == 10 && d[1] == 99);
+            let ours = m
+                .attr_ip(12, RTA_DST)
+                .is_some_and(|d| d[0] == 10 && d[1] == 99);
             if m.seq == s1 && m.ty == RTM_NEWROUTE && ours {
                 seen += 1;
             } else if m.seq == s1 && m.ty == NLMSG_DONE {
@@ -880,11 +979,20 @@ fn route_dump(nl: &mut Nl, second: bool) -> (u32, bool, i32, i64) {
 /// entries arrive, DONE last); a second dump while one runs is EBUSY
 fn test_dump_resume() {
     const N: &[u8] = b"NL_DUMP_RESUME";
-    let (Some(mut cfg), Some(mut small), Some(mut nl)) = (Nl::open(), Nl::open(), Nl::open()) else {
+    let (Some(mut cfg), Some(mut small), Some(mut nl)) = (Nl::open(), Nl::open(), Nl::open())
+    else {
         return fail(N, b"open", 0);
     };
     for i in 0..N_ROUTES {
-        let r = route(&mut cfg, true, many_route(i), 32, [0; 4], 1, NLM_F_CREATE | NLM_F_EXCL);
+        let r = route(
+            &mut cfg,
+            true,
+            many_route(i),
+            32,
+            [0; 4],
+            1,
+            NLM_F_CREATE | NLM_F_EXCL,
+        );
         if r != 0 {
             return fail(N, b"route add", r as i64);
         }
@@ -928,7 +1036,14 @@ fn drain(fd: i32) -> (bool, i32) {
     let mut first = true;
     let (mut enobufs, mut msgs) = (false, 0);
     loop {
-        let r = sys_recvfrom(fd, buf.as_mut_ptr(), buf.len(), MSG_DONTWAIT, core::ptr::null_mut(), core::ptr::null_mut()) as i32;
+        let r = sys_recvfrom(
+            fd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            MSG_DONTWAIT,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        ) as i32;
         if r == ENOBUFS && first {
             enobufs = true;
         } else if r == EAGAIN {
@@ -953,9 +1068,21 @@ fn test_overrun() {
     let g: i32 = RTNLGRP_LINK;
     for fd in [mon.fd, quiet.fd] {
         tiny_rcvbuf(fd);
-        sys_setsockopt(fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &g as *const i32 as *const u8, 4);
+        sys_setsockopt(
+            fd,
+            SOL_NETLINK,
+            NETLINK_ADD_MEMBERSHIP,
+            &g as *const i32 as *const u8,
+            4,
+        );
     }
-    sys_setsockopt(quiet.fd, SOL_NETLINK, NETLINK_NO_ENOBUFS, &one as *const i32 as *const u8, 4);
+    sys_setsockopt(
+        quiet.fd,
+        SOL_NETLINK,
+        NETLINK_NO_ENOBUFS,
+        &one as *const i32 as *const u8,
+        4,
+    );
     for i in 0..10 {
         let r = lo_mtu(&mut cfg, if i % 2 == 0 { 65535 } else { 65536 });
         if r != 0 {
@@ -977,7 +1104,11 @@ fn test_overrun() {
 /// destination address) or sendto() to the kernel; returns the ACK code
 fn newaddr_on(fd: i32, write: bool) -> i32 {
     let mut nl = Nl::from_fd(fd);
-    let mut r = Req::new(RTM_NEWADDR, NLM_F_CREATE | NLM_F_ACK, &ifaddr(AF_INET, 24, 1));
+    let mut r = Req::new(
+        RTM_NEWADDR,
+        NLM_F_CREATE | NLM_F_ACK,
+        &ifaddr(AF_INET, 24, 1),
+    );
     r.attr(IFA_LOCAL, &TEST_IP).attr(IFA_ADDRESS, &TEST_IP);
     let code = if write {
         let b = r.bytes(7777);
@@ -1024,8 +1155,16 @@ fn test_deputy() {
     let mut cfd: i32 = -1;
     sys_read(p[0] as u64, &mut cfd as *mut i32 as *mut u8, 4);
     let pidfd = sys_pidfd_open(pid as i32, 0) as i32;
-    let fd = if pidfd >= 0 { sys_pidfd_getfd(pidfd, cfd, 0) as i32 } else { pidfd };
-    let (w1, s1) = if fd >= 0 { (newaddr_on(fd, true), newaddr_on(fd, false)) } else { (fd, fd) };
+    let fd = if pidfd >= 0 {
+        sys_pidfd_getfd(pidfd, cfd, 0) as i32
+    } else {
+        pidfd
+    };
+    let (w1, s1) = if fd >= 0 {
+        (newaddr_on(fd, true), newaddr_on(fd, false))
+    } else {
+        (fd, fd)
+    };
     sys_write(q[1] as u64, b"x".as_ptr(), 1);
     let mut st = 0;
     sys_wait4(pid, &mut st, 0, 0);

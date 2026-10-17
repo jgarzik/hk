@@ -13,9 +13,9 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_fork, sys_getpid, sys_open, sys_poll, sys_read, sys_wait4, sys_waitid,
-    sys_pidfd_open, sys_pidfd_send_signal, sys_pidfd_getfd,
-    PollFd, SigInfo, POLLIN, P_PIDFD, WEXITED,
+    P_PIDFD, POLLIN, PollFd, SigInfo, WEXITED, sys_close, sys_fork, sys_getpid, sys_open,
+    sys_pidfd_getfd, sys_pidfd_open, sys_pidfd_send_signal, sys_poll, sys_read, sys_wait4,
+    sys_waitid,
 };
 
 /// Run all pidfd tests

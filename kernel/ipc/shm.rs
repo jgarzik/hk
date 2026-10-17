@@ -2,10 +2,18 @@
 //!
 //! Provides shared memory segments that can be attached to multiple process
 //! address spaces for inter-process communication.
+//!
+//! A segment's pages live in a shared object (`mm::shmem::Shmem`, as on
+//! Linux, where segments are shmem files), faulted in on demand. Each
+//! attachment is a VMA holding a [`ShmAttach`]: shm_nattch counts those
+//! VMAs (Linux shm_open/shm_close), so fork's copies, split pieces and
+//! their removal by munmap, shmdt, exit or exec all keep it right, and the
+//! last detach of a segment removed with IPC_RMID destroys it. The pages
+//! go when the segment and its last VMA are gone.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 
 use crate::arch::Uaccess;
 use crate::error::KernelError;
@@ -13,12 +21,12 @@ use crate::ipc::util::{
     IPC_PERM_READ, IPC_PERM_WRITE, IpcObject, IpcType, KernIpcPerm, ipc_checkperm, ipcget,
 };
 use crate::ipc::{IPC_64, IPC_RMID, IPC_SET, IPC_STAT, IpcNamespace, Shmid64Ds, current_ipc_ns};
+use crate::mm::shmem::Shmem;
 use crate::mm::vma::{
-    MAP_SHARED, PROT_READ as VMA_PROT_READ, PROT_WRITE as VMA_PROT_WRITE, VM_SHM,
+    MAP_SHARED, PROT_READ as VMA_PROT_READ, PROT_WRITE as VMA_PROT_WRITE, VM_SHARED, VM_SHM,
 };
 use crate::mm::{Vma, get_task_mm};
-use crate::sync::spin::Mutex;
-use crate::task::percpu::{current_pid, current_tid, get_current_task_cr3};
+use crate::task::percpu::{current_pid, current_tid};
 use crate::time::TIMEKEEPER;
 use crate::uaccess::{get_user, put_user};
 
@@ -76,33 +84,18 @@ pub struct ShmidKernel {
     pub cpid: i32,
     /// Last operation PID
     pub lpid: AtomicI32,
-    /// Physical frames backing this segment
-    pub frames: Mutex<Vec<u64>>,
+    /// The segment's pages
+    pub shmem: Arc<Shmem>,
+    /// Destroyed (namespace totals given back): at most once
+    destroyed: AtomicBool,
     /// Namespace this segment belongs to
     ns: Arc<IpcNamespace>,
 }
 
 impl ShmidKernel {
     /// Create a new shared memory segment
+    /// (Pages are allocated as they are first touched.)
     pub fn new(key: i32, size: usize, mode: u16, ns: Arc<IpcNamespace>) -> Result<Arc<Self>, i32> {
-        let num_pages = size.div_ceil(PAGE_SIZE);
-
-        // Allocate physical frames
-        let mut frames = Vec::with_capacity(num_pages);
-        for _ in 0..num_pages {
-            let frame = crate::FRAME_ALLOCATOR
-                .alloc()
-                .ok_or(KernelError::OutOfMemory.errno())?;
-
-            // Zero the frame
-            unsafe {
-                let ptr = crate::arch::phys_to_virt(frame);
-                core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
-            }
-
-            frames.push(frame);
-        }
-
         let now = current_time_secs();
         let pid = current_pid() as i32;
 
@@ -115,7 +108,8 @@ impl ShmidKernel {
             ctim: AtomicI64::new(now),
             cpid: pid,
             lpid: AtomicI32::new(pid),
-            frames: Mutex::new(frames),
+            shmem: Shmem::new(size.div_ceil(PAGE_SIZE) as u64),
+            destroyed: AtomicBool::new(false),
             ns,
         }))
     }
@@ -144,17 +138,13 @@ impl IpcObject for ShmidKernel {
         IpcType::Shm
     }
 
+    /// Linux shm_destroy: once removed (IPC_RMID) and detached. The
+    /// pages go with the last reference to the segment's object.
     fn destroy(&self) {
-        // Drop the segment's reference on each frame: a page still mapped
-        // somewhere (a child that inherited the attach) lives on until
-        // its last PTE goes
-        let frames = self.frames.lock();
-        for &frame in frames.iter() {
-            crate::FRAME_ALLOCATOR.decref(frame);
+        if self.destroyed.swap(true, Ordering::AcqRel) {
+            return;
         }
-
-        // Update namespace totals
-        let pages = frames.len() as u64;
+        let pages = self.segsz.div_ceil(PAGE_SIZE) as u64;
         self.ns.shm_tot.fetch_sub(pages, Ordering::Relaxed);
     }
 }
@@ -174,6 +164,89 @@ fn downcast_shm(obj: &dyn IpcObject) -> Option<&ShmidKernel> {
         Some(unsafe { &*(obj as *const dyn IpcObject as *const ShmidKernel) })
     } else {
         None
+    }
+}
+
+// ============================================================================
+// Attachments
+// ============================================================================
+
+/// One attachment of a segment, held by its VMA (Linux shm_open /
+/// shm_close through the VMA's vm_ops): counted in shm_nattch for as long
+/// as the VMA exists. Cloned with the VMA (fork, split) and dropped with
+/// it (munmap, shmdt, exit, exec); the last drop of a removed segment
+/// destroys it. Takes no lock (safe under the mm lock).
+pub struct ShmAttach {
+    seg: Arc<dyn IpcObject>,
+    /// Attached SHM_RDONLY: never writable (Linux: no VM_MAYWRITE)
+    rdonly: bool,
+}
+
+impl ShmAttach {
+    fn new(seg: Arc<dyn IpcObject>, rdonly: bool) -> Option<Self> {
+        downcast_shm(seg.as_ref())?;
+        let a = Self { seg, rdonly };
+        a.open();
+        Some(a)
+    }
+
+    fn shm(&self) -> &ShmidKernel {
+        // SAFETY of the unwrap: checked in `new`
+        downcast_shm(self.seg.as_ref()).unwrap()
+    }
+
+    /// A new attachment, unless the segment was removed meanwhile
+    /// (IPC_RMID raced the lookup): then backed out, EINVAL like a
+    /// removed id. Pairs with the fence in IPC_RMID.
+    fn attach_live(seg: Arc<dyn IpcObject>, rdonly: bool) -> Option<Self> {
+        let a = Self::new(seg, rdonly)?;
+        core::sync::atomic::fence(Ordering::SeqCst);
+        if a.seg.perm().is_deleted() {
+            return None; // the drop detaches (and destroys if last)
+        }
+        Some(a)
+    }
+
+    /// Attached read-only (SHM_RDONLY)
+    pub fn rdonly(&self) -> bool {
+        self.rdonly
+    }
+
+    /// Same segment as `other`
+    pub fn same(&self, other: &ShmAttach) -> bool {
+        Arc::ptr_eq(&self.seg, &other.seg)
+    }
+
+    /// Linux shm_open: attach time, last pid, one more attachment
+    fn open(&self) {
+        let shp = self.shm();
+        shp.atim.store(current_time_secs(), Ordering::Relaxed);
+        shp.lpid.store(current_pid() as i32, Ordering::Relaxed);
+        shp.nattch.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Clone for ShmAttach {
+    fn clone(&self) -> Self {
+        let a = Self {
+            seg: self.seg.clone(),
+            rdonly: self.rdonly,
+        };
+        a.open();
+        a
+    }
+}
+
+impl Drop for ShmAttach {
+    /// Linux shm_close: detach time, last pid; the last detach of a
+    /// removed segment destroys it
+    fn drop(&mut self) {
+        let shp = self.shm();
+        shp.dtim.store(current_time_secs(), Ordering::Relaxed);
+        shp.lpid.store(current_pid() as i32, Ordering::Relaxed);
+        if shp.nattch.fetch_sub(1, Ordering::SeqCst) == 1 && shp.perm().is_deleted() {
+            self.seg.destroy();
+        }
     }
 }
 
@@ -246,178 +319,76 @@ pub fn sys_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> i64 {
 fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
     let ns = current_ipc_ns();
     let tid = current_tid();
+    let einval = KernelError::InvalidArgument.errno();
 
-    // Find segment
-    let shm_obj = ns
-        .shm_ids()
-        .find_by_id(shmid)
-        .ok_or(KernelError::InvalidArgument.errno())?;
-    let perm = shm_obj.perm();
-
-    // Check permissions
+    let shm_obj = ns.shm_ids().find_by_id(shmid).ok_or(einval)?;
     let access = if shmflg & SHM_RDONLY != 0 {
         IPC_PERM_READ
     } else {
         IPC_PERM_READ | IPC_PERM_WRITE
     };
-    ipc_checkperm(perm, access)?;
+    ipc_checkperm(shm_obj.perm(), access)?;
+    let shm_kernel = downcast_shm(shm_obj.as_ref()).ok_or(einval)?;
+    let size = (shm_kernel.segsz as u64).div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
+    let shmem = shm_kernel.shmem.clone();
 
-    // Get the ShmidKernel (safe downcast with type verification)
-    let shm_kernel: &ShmidKernel = match downcast_shm(shm_obj.as_ref()) {
-        Some(shm) => shm,
-        None => return Err(KernelError::InvalidArgument.errno()),
-    };
-
-    let size = shm_kernel.segsz;
-
-    // Get task's mm
-    let mm = match get_task_mm(tid) {
-        Some(m) => m,
-        None => return Err(KernelError::OutOfMemory.errno()),
-    };
-
-    // Find address and create VMA
+    // SHM_REMAP needs an address (Linux do_shmat)
+    if shmaddr == 0 && shmflg & SHM_REMAP != 0 {
+        return Err(einval);
+    }
+    let mm = get_task_mm(tid).ok_or(KernelError::OutOfMemory.errno())?;
     let mut replaced = Vec::new();
-    let addr = {
-        let mut mm_guard = mm.lock();
-
-        // Find address space
-        let addr = if shmaddr == 0 {
-            // Kernel chooses address
-            match mm_guard.find_free_area(size as u64) {
-                Some(a) => a,
-                None => return Err(KernelError::OutOfMemory.errno()),
-            }
-        } else {
-            // User requested specific address
-            let aligned_addr = if shmflg & SHM_RND != 0 {
-                shmaddr & !(PAGE_SIZE as u64 - 1)
-            } else {
-                if shmaddr & (PAGE_SIZE as u64 - 1) != 0 {
-                    return Err(KernelError::InvalidArgument.errno());
-                }
-                shmaddr
-            };
-
-            // Check if requested range is available
-            if mm_guard.overlaps(aligned_addr, aligned_addr + size as u64) {
-                if shmflg & SHM_REMAP == 0 {
-                    return Err(KernelError::InvalidArgument.errno());
-                }
-                // SHM_REMAP: unmap what was there
-                replaced = crate::mm::syscall::munmap_locked(
-                    &mut mm_guard,
-                    mm.pgd(),
-                    aligned_addr,
-                    aligned_addr + size as u64,
-                );
-            }
-            aligned_addr
-        };
-
-        // Determine protection flags
-        let prot = if shmflg & SHM_RDONLY != 0 {
-            VMA_PROT_READ
-        } else {
-            VMA_PROT_READ | VMA_PROT_WRITE
-        };
-
-        // Create VMA for the shared memory mapping
-        // Store shmid in the offset field for later lookup in shmdt
-        let mut vma = Vma::new(addr, addr + size as u64, prot, MAP_SHARED | VM_SHM);
-        vma.offset = shmid as u64;
-        mm_guard.insert_vma(vma);
-
-        addr
-    }; // mm_guard dropped here
-    drop(replaced);
-
-    // Map the physical frames into the process's page tables
-    let cr3 = get_current_task_cr3();
-    if cr3 == 0 {
+    let mut mm_guard = mm.lock();
+    // RLIMIT_AS, as for any mapping (Linux may_expand_vm)
+    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_AS);
+    if limit != crate::rlimit::RLIM_INFINITY
+        && (mm_guard.total_vm() * PAGE_SIZE as u64).saturating_add(size) > limit
+    {
         return Err(KernelError::OutOfMemory.errno());
     }
-
-    // Calculate page table flags
-    #[cfg(target_arch = "x86_64")]
-    let pt_flags = {
-        use crate::arch::x86_64::paging::{PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
-        let mut flags = PAGE_PRESENT | PAGE_USER;
-        if shmflg & SHM_RDONLY == 0 {
-            flags |= PAGE_WRITABLE;
-        }
-        flags
-    };
-
-    #[cfg(target_arch = "aarch64")]
-    let pt_flags = {
-        // AArch64 page attributes for user mapping
-        // AF=1 (Access Flag), SH=11 (Inner Shareable), AP=01 (R/W from EL0)
-        const ATTR_AF: u64 = 1 << 10;
-        const ATTR_SH_INNER: u64 = 3 << 8;
-        const ATTR_AP_RW_EL0: u64 = 1 << 6;
-        const ATTR_AP_RO_EL0: u64 = 3 << 6;
-        const ATTR_NORMAL_MEMORY: u64 = 0; // Use MAIR index 0 for normal memory
-        const PAGE_VALID: u64 = 0b11; // Valid page descriptor
-
-        let ap = if shmflg & SHM_RDONLY != 0 {
-            ATTR_AP_RO_EL0
+    let addr = if shmaddr == 0 {
+        mm_guard
+            .find_free_area(size)
+            .ok_or(KernelError::OutOfMemory.errno())?
+    } else {
+        let aligned = if shmflg & SHM_RND != 0 {
+            shmaddr & !(PAGE_SIZE as u64 - 1)
+        } else if shmaddr & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(einval);
         } else {
-            ATTR_AP_RW_EL0
+            shmaddr
         };
-        PAGE_VALID | ATTR_AF | ATTR_SH_INNER | ATTR_NORMAL_MEMORY | ap
+        // A user address range (Linux do_shmat / do_mmap MAP_FIXED):
+        // EINVAL if it wraps, EPERM below mmap_min_addr, ENOMEM past
+        // TASK_SIZE
+        if aligned.checked_add(size).is_none() {
+            return Err(einval);
+        }
+        crate::mm::check_fixed(aligned, size).map_err(|e| e.errno())?;
+        if mm_guard.overlaps(aligned, aligned + size) {
+            if shmflg & SHM_REMAP == 0 {
+                return Err(einval);
+            }
+            // SHM_REMAP: unmap what was there (dropped after unlocking)
+            replaced =
+                crate::mm::syscall::munmap_locked(&mut mm_guard, &mm, aligned, aligned + size);
+        }
+        aligned
     };
-
-    // Map all frames eagerly
-    let frames = shm_kernel.frames.lock();
-    for (i, &frame) in frames.iter().enumerate() {
-        let va = addr + (i * PAGE_SIZE) as u64;
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            use crate::arch::x86_64::interrupts::map_user_page;
-            if map_user_page(cr3, va, frame, pt_flags).is_err() {
-                // Mapping failed - unmap what we've done so far and fail
-                for j in 0..i {
-                    let unmap_va = addr + (j * PAGE_SIZE) as u64;
-                    if crate::arch::x86_64::interrupts::unmap_user_page(cr3, unmap_va).is_some() {
-                        crate::FRAME_ALLOCATOR.decref(frames[j]);
-                    }
-                }
-                drop(frames);
-                return Err(KernelError::OutOfMemory.errno());
-            }
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            use crate::arch::aarch64::exceptions::map_user_page;
-            if map_user_page(cr3, va, frame, pt_flags).is_err() {
-                // Mapping failed - unmap what we've done so far and fail
-                for j in 0..i {
-                    let unmap_va = addr + (j * PAGE_SIZE) as u64;
-                    if crate::arch::aarch64::exceptions::unmap_user_page(cr3, unmap_va).is_some() {
-                        crate::FRAME_ALLOCATOR.decref(frames[j]);
-                    }
-                }
-                drop(frames);
-                return Err(KernelError::OutOfMemory.errno());
-            }
-        }
-        // The PTE holds a reference, dropped when it is unmapped
-        crate::FRAME_ALLOCATOR.incref(frame);
-    }
-    drop(frames);
-
-    // Update statistics
-    shm_kernel.nattch.fetch_add(1, Ordering::Relaxed);
-    shm_kernel
-        .atim
-        .store(current_time_secs(), Ordering::Relaxed);
-    shm_kernel
-        .lpid
-        .store(current_pid() as i32, Ordering::Relaxed);
-
+    let prot = if shmflg & SHM_RDONLY != 0 {
+        VMA_PROT_READ
+    } else {
+        VMA_PROT_READ | VMA_PROT_WRITE
+    };
+    // Pages are faulted in from the segment's object (Linux shm_mmap)
+    let mut vma = Vma::new(addr, addr + size, prot, MAP_SHARED | VM_SHARED | VM_SHM);
+    vma.shmem = Some(shmem);
+    vma.shm =
+        Some(ShmAttach::attach_live((*shm_obj).clone(), shmflg & SHM_RDONLY != 0).ok_or(einval)?);
+    mm_guard.insert_vma(vma);
+    mm_guard.add_total_vm(size / PAGE_SIZE as u64);
+    drop(mm_guard);
+    drop(replaced);
     Ok(addr)
 }
 
@@ -429,68 +400,34 @@ pub fn sys_shmdt(shmaddr: u64) -> i64 {
     result_to_i64(do_shmdt(shmaddr))
 }
 
+/// Linux ksys_shmdt: unmap the attachment starting at `shmaddr`, all of
+/// its VMAs (a split one included) up to the segment's size; dropping
+/// them updates shm_nattch
 fn do_shmdt(shmaddr: u64) -> Result<i32, i32> {
-    let tid = current_tid();
-    let ns = current_ipc_ns();
-
-    // Get task's mm
-    let mm = get_task_mm(tid).ok_or(KernelError::InvalidArgument.errno())?;
-
-    // Find and validate the VMA
-    let (shmid, size) = {
-        let mm_guard = mm.lock();
-
-        // Find VMA for this address
-        let vma = mm_guard
-            .find_vma(shmaddr)
-            .ok_or(KernelError::InvalidArgument.errno())?;
-
-        // Must detach at start address
-        if vma.start != shmaddr {
-            return Err(KernelError::InvalidArgument.errno());
-        }
-
-        // Must be a SHM VMA
-        if vma.flags & VM_SHM == 0 {
-            return Err(KernelError::InvalidArgument.errno());
-        }
-
-        // Get shmid from VMA offset field
-        let shmid = vma.offset as i32;
-        let size = vma.end - vma.start;
-
-        (shmid, size)
-    }; // mm_guard dropped
-
-    // Unmap the attachment (Linux do_munmap of the shm VMA): each PTE
-    // drops its frame reference
+    let einval = KernelError::InvalidArgument.errno();
+    let mm = get_task_mm(current_tid()).ok_or(einval)?;
     let gone = {
-        let mut mm_guard = mm.lock();
-        crate::mm::syscall::munmap_locked(&mut mm_guard, mm.pgd(), shmaddr, shmaddr + size)
-    };
-    drop(gone);
-
-    // Update segment statistics
-    if let Some(shm_obj) = ns.shm_ids().find_by_id(shmid) {
-        let shm_kernel: &ShmidKernel = match downcast_shm(shm_obj.as_ref()) {
-            Some(shm) => shm,
-            None => return Err(KernelError::InvalidArgument.errno()),
-        };
-
-        let old_nattch = shm_kernel.nattch.fetch_sub(1, Ordering::Relaxed);
-        shm_kernel
-            .dtim
-            .store(current_time_secs(), Ordering::Relaxed);
-        shm_kernel
-            .lpid
-            .store(current_pid() as i32, Ordering::Relaxed);
-
-        // If segment was marked for deletion and this was last attachment, destroy it
-        if old_nattch == 1 && shm_obj.perm().is_deleted() {
-            shm_obj.destroy();
+        let mut map = mm.lock();
+        let first = map.find_vma(shmaddr).ok_or(einval)?;
+        let att = first
+            .shm
+            .as_ref()
+            .filter(|_| first.start == shmaddr)
+            .ok_or(einval)?;
+        let limit =
+            shmaddr + (att.shm().segsz as u64).div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
+        // The contiguous VMAs of this attachment
+        let mut end = first.end;
+        while end < limit {
+            match map.find_vma(end) {
+                Some(v) if v.shm.as_ref().is_some_and(|b| b.same(att)) => end = v.end,
+                _ => break,
+            }
         }
-    }
-
+        crate::mm::syscall::munmap_locked(&mut map, &mm, shmaddr, end)
+    };
+    // Dropped unlocked: the last detach may destroy the segment
+    drop(gone);
     Ok(0)
 }
 
@@ -542,6 +479,11 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                 .find_by_id(shmid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
 
+            // Read user data first, never under the perm spinlock (Linux
+            // copies it in before taking the IPC locks)
+            let ds: Shmid64Ds =
+                get_user::<Uaccess, Shmid64Ds>(buf).map_err(|_| KernelError::BadAddress.errno())?;
+
             // Must be owner or have CAP_SYS_ADMIN
             let cred = crate::task::percpu::current_cred();
             let uid = cred.euid;
@@ -553,10 +495,6 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                 drop(_lock);
                 return Err(KernelError::NotPermitted.errno());
             }
-
-            // Read user data
-            let ds: Shmid64Ds =
-                get_user::<Uaccess, Shmid64Ds>(buf).map_err(|_| KernelError::BadAddress.errno())?;
 
             // Update fields (only uid, gid, mode can be changed)
             perm_mutable.uid = ds.shm_perm.uid;
@@ -595,12 +533,14 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
                 }
             }
 
-            // Remove from ID table
+            // Remove from ID table (marks it deleted). With no attachment
+            // destroy it now, else the last detach does; a racing shmat
+            // either is seen here or sees the mark and backs out
+            // (`attach_live`), so it is destroyed exactly once
             if let Some(removed) = ns.shm_ids().remove(shmid) {
-                // If no attachments, destroy immediately (safe downcast with type verification)
-                // Otherwise, segment will be destroyed when last process detaches
+                core::sync::atomic::fence(Ordering::SeqCst);
                 if let Some(shm_kernel) = downcast_shm(removed.as_ref())
-                    && shm_kernel.nattch.load(Ordering::Relaxed) == 0
+                    && shm_kernel.nattch.load(Ordering::SeqCst) == 0
                 {
                     removed.destroy();
                 }
@@ -610,12 +550,23 @@ fn do_shmctl(shmid: i32, cmd: i32, buf: u64) -> Result<i32, i32> {
         }
 
         SHM_LOCK | SHM_UNLOCK => {
-            // Lock/unlock requires CAP_IPC_LOCK
-            // For now, just validate and return success (no swap anyway)
-            let _shm = ns
+            // Without CAP_IPC_LOCK only the owner or creator (Linux
+            // shmctl_do_lock); nothing to lock (pages are never swapped)
+            let shm = ns
                 .shm_ids()
                 .find_by_id(shmid)
                 .ok_or(KernelError::InvalidArgument.errno())?;
+            let uid = crate::task::percpu::current_cred().euid;
+            let perm = shm.perm();
+            let owner = {
+                let _lock = perm.lock.lock();
+                // SAFETY: We hold the lock
+                unsafe { perm.mutable_ref() }.uid
+            };
+            if !crate::task::capable(crate::task::CAP_IPC_LOCK) && uid != owner && uid != perm.cuid
+            {
+                return Err(KernelError::NotPermitted.errno());
+            }
             Ok(0)
         }
 

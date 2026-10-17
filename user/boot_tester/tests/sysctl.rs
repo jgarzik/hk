@@ -3,8 +3,8 @@
 //! permissions (non-root cannot open for writing).
 
 use hk_syscall::{
-    sys_close, sys_exit, sys_fork, sys_open, sys_read, sys_setresuid, sys_wait4, sys_write,
-    O_RDONLY, O_WRONLY,
+    O_RDONLY, O_WRONLY, sys_close, sys_exit, sys_fork, sys_open, sys_read, sys_setresuid,
+    sys_wait4, sys_write,
 };
 
 use super::sk::*;
@@ -98,7 +98,11 @@ fn test_port_range() {
         *f = udp();
         let r = bind(*f, LO, 0);
         let p = port(*f);
-        t.ok(b"udp port in range", r == 0 && (40000..=40003).contains(&p), p as i64);
+        t.ok(
+            b"udp port in range",
+            r == 0 && (40000..=40003).contains(&p),
+            p as i64,
+        );
     }
     // The range is exhausted for a fifth socket on the same address
     let x = udp();
@@ -193,7 +197,7 @@ fn dec(mut v: u64, out: &mut [u8; 20]) -> usize {
 /// /proc/net/udp lists a bound socket: local 127.0.0.1:port, state 07
 /// (unconnected) or 01 with the peer, its inode
 fn test_proc_net_udp() {
-    use hk_syscall::{sys_fstat, Stat};
+    use hk_syscall::{Stat, sys_fstat};
     let mut t = T::new(b"PROC_NET_UDP");
     let (a, pa) = udp_lo();
     let (b, pb) = udp_lo();
@@ -203,7 +207,11 @@ fn test_proc_net_udp() {
     let mut buf = [0u8; 8192];
     let n = read_file(b"/proc/net/udp\0", &mut buf);
     let text = &buf[..n.max(0) as usize];
-    t.ok(b"header", text.starts_with(b"   sl  local_address rem_address   st tx_queue rx_queue"), n);
+    t.ok(
+        b"header",
+        text.starts_with(b"   sl  local_address rem_address   st tx_queue rx_queue"),
+        n,
+    );
     let find = |port: u16| {
         let mut key = *b"0100007F:0000";
         hex(port as u64, 4, &mut key[9..]);
@@ -213,10 +221,16 @@ fn test_proc_net_udp() {
     let la = find(pa);
     t.ok(b"a listed", la.is_some(), pa as i64);
     if let Some(l) = la {
-        t.ok(b"a unconnected", &l[21..34] == b"00000000:0000" && &l[35..37] == b"07", 0);
+        t.ok(
+            b"a unconnected",
+            &l[21..34] == b"00000000:0000" && &l[35..37] == b"07",
+            0,
+        );
         let mut d = [0u8; 20];
         let k = dec(st.st_ino, &mut d);
-        let has = l.windows(k + 2).any(|w| w[0] == b' ' && &w[1..k + 1] == &d[..k] && w[k + 1] == b' ');
+        let has = l
+            .windows(k + 2)
+            .any(|w| w[0] == b' ' && &w[1..k + 1] == &d[..k] && w[k + 1] == b' ');
         t.ok(b"inode", has, st.st_ino as i64);
         t.eq(b"width", l.len() as i64, 127);
     }
@@ -225,7 +239,11 @@ fn test_proc_net_udp() {
     if let Some(l) = lb {
         let mut rem = *b"0100007F:0000";
         hex(pa as u64, 4, &mut rem[9..]);
-        t.ok(b"b connected", &l[21..34] == &rem[..] && &l[35..37] == b"01", 0);
+        t.ok(
+            b"b connected",
+            &l[21..34] == &rem[..] && &l[35..37] == b"01",
+            0,
+        );
     }
     close(a);
     close(b);

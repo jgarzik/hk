@@ -6,8 +6,8 @@
 use core::ptr::addr_of_mut;
 
 use hk_syscall::{
-    sys_bind, sys_close, sys_nanosleep, sys_poll, sys_recvfrom, sys_sendto, sys_socket, PollFd,
-    Timespec, POLLIN, SOCK_CLOEXEC, SOCK_RAW,
+    POLLIN, PollFd, SOCK_CLOEXEC, SOCK_RAW, Timespec, sys_bind, sys_close, sys_nanosleep, sys_poll,
+    sys_recvfrom, sys_sendto, sys_socket,
 };
 
 pub const AF_NETLINK: i32 = 16;
@@ -96,7 +96,10 @@ pub struct Req {
 impl Req {
     /// Header + family header `fam`
     pub fn new(ty: u16, flags: u16, fam: &[u8]) -> Self {
-        let mut r = Req { buf: [0; 512], len: 16 };
+        let mut r = Req {
+            buf: [0; 512],
+            len: 16,
+        };
         r.buf[4..6].copy_from_slice(&ty.to_ne_bytes());
         r.buf[6..8].copy_from_slice(&(flags | NLM_F_REQUEST).to_ne_bytes());
         r.put(fam);
@@ -159,7 +162,9 @@ pub fn ifaddr(family: u8, prefixlen: u8, index: u32) -> [u8; 8] {
 
 /// struct rtmsg
 pub fn rtmsg(dst_len: u8, table: u8, protocol: u8, scope: u8, rtype: u8) -> [u8; 12] {
-    [AF_INET, dst_len, 0, 0, table, protocol, scope, rtype, 0, 0, 0, 0]
+    [
+        AF_INET, dst_len, 0, 0, table, protocol, scope, rtype, 0, 0, 0, 0,
+    ]
 }
 
 /// One received message
@@ -283,7 +288,14 @@ impl Nl {
         if !wait_readable(self.fd, 5000) {
             return -11;
         }
-        sys_recvfrom(self.fd, buf.as_mut_ptr(), buf.len(), flags, core::ptr::null_mut(), core::ptr::null_mut())
+        sys_recvfrom(
+            self.fd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            flags,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
     }
 
     /// Send with NLM_F_ACK and return the NLMSG_ERROR code (0 = ACK),
@@ -453,10 +465,26 @@ pub fn addr(nl: &mut Nl, add: bool, index: u32, ip: [u8; 4], plen: u8, flags: u1
 }
 
 /// Add/delete a main-table route `dst/plen` via `gw` (0 = none) on `oif`
-pub fn route(nl: &mut Nl, add: bool, dst: [u8; 4], plen: u8, gw: [u8; 4], oif: u32, flags: u16) -> i32 {
+pub fn route(
+    nl: &mut Nl,
+    add: bool,
+    dst: [u8; 4],
+    plen: u8,
+    gw: [u8; 4],
+    oif: u32,
+    flags: u16,
+) -> i32 {
     let ty = if add { RTM_NEWROUTE } else { RTM_DELROUTE };
-    let scope = if gw == [0; 4] { RT_SCOPE_LINK } else { RT_SCOPE_UNIVERSE };
-    let (proto, rtype, scope) = if add { (RTPROT_BOOT, RTN_UNICAST, scope) } else { (0, 0, 255) };
+    let scope = if gw == [0; 4] {
+        RT_SCOPE_LINK
+    } else {
+        RT_SCOPE_UNIVERSE
+    };
+    let (proto, rtype, scope) = if add {
+        (RTPROT_BOOT, RTN_UNICAST, scope)
+    } else {
+        (0, 0, 255)
+    };
     let mut r = Req::new(ty, flags, &rtmsg(plen, RT_TABLE_MAIN, proto, scope, rtype));
     if plen != 0 {
         r.attr(RTA_DST, &dst);
@@ -480,11 +508,26 @@ pub fn net_setup_eth0() -> Result<u32, &'static str> {
     if set_link_up(&mut nl, eth.index, true) != 0 {
         return Err("link up");
     }
-    let r = addr(&mut nl, true, eth.index, [10, 0, 2, 15], 24, NLM_F_CREATE | NLM_F_EXCL);
+    let r = addr(
+        &mut nl,
+        true,
+        eth.index,
+        [10, 0, 2, 15],
+        24,
+        NLM_F_CREATE | NLM_F_EXCL,
+    );
     if r != 0 && r != EEXIST {
         return Err("address");
     }
-    let r = route(&mut nl, true, [0; 4], 0, [10, 0, 2, 2], eth.index, NLM_F_CREATE | NLM_F_EXCL);
+    let r = route(
+        &mut nl,
+        true,
+        [0; 4],
+        0,
+        [10, 0, 2, 2],
+        eth.index,
+        NLM_F_CREATE | NLM_F_EXCL,
+    );
     if r != 0 && r != EEXIST {
         return Err("default route");
     }

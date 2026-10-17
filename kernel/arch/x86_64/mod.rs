@@ -21,6 +21,7 @@ pub mod fpu;
 pub mod interrupts;
 pub mod io;
 pub mod ioremap;
+pub mod ipi;
 pub mod irq;
 pub mod kmap;
 pub mod lapic;
@@ -35,6 +36,7 @@ pub mod signal;
 pub mod smp;
 pub mod spinlock;
 pub mod syscall;
+pub mod tlb;
 pub mod tsc;
 pub mod uaccess;
 pub mod uapi;
@@ -143,16 +145,11 @@ impl Arch for X86_64Arch {
 // ============================================================================
 
 impl UserModeOps for X86_64Arch {
-    unsafe fn jump_to_user(
-        entry: u64,
-        user_stack: u64,
-        page_table_root: u64,
-        kernel_stack: u64,
-    ) -> ! {
+    unsafe fn jump_to_user(entry: u64, user_stack: u64, kernel_stack: u64) -> ! {
         // A new program image starts with the initial FP/SIMD state
         fpu::load_init_state();
         unsafe {
-            syscall::jump_to_user_iret(entry, user_stack, page_table_root, kernel_stack);
+            syscall::jump_to_user_iret(entry, user_stack, kernel_stack);
         }
     }
 }

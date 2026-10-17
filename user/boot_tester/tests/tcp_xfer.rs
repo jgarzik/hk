@@ -4,8 +4,8 @@
 //! queued, and 50 concurrent connections.
 
 use hk_syscall::{
-    sys_accept, sys_exit, sys_fork, sys_listen, sys_nanosleep, sys_setsockopt, sys_shutdown,
-    sys_wait4, Timespec, SHUT_WR,
+    SHUT_WR, Timespec, sys_accept, sys_exit, sys_fork, sys_listen, sys_nanosleep, sys_setsockopt,
+    sys_shutdown, sys_wait4,
 };
 
 use super::sk::*;
@@ -57,7 +57,11 @@ pub fn send_pat(fd: i32, seed: usize, total: usize) -> i64 {
         while done < n {
             let r = send(fd, &buf[done..n], MSG_NOSIGNAL);
             if r <= 0 {
-                return if off + done > 0 { (off + done) as i64 } else { r };
+                return if off + done > 0 {
+                    (off + done) as i64
+                } else {
+                    r
+                };
             }
             done += r as usize;
         }
@@ -123,7 +127,13 @@ fn test_lo_2mb() {
             sys_exit(2);
         }
         let (n, bad, _) = recv_pat(c, 2, 2 * MB, 16384);
-        sys_exit(if n != 2 * MB { 3 } else if bad >= 0 { 4 } else { 0 });
+        sys_exit(if n != 2 * MB {
+            3
+        } else if bad >= 0 {
+            4
+        } else {
+            0
+        });
     }
     let s = accept(l);
     set_timeo(s, 30_000);
@@ -223,7 +233,14 @@ fn test_waitall() {
     let mut b = [0u8; 8];
     t.eq(b"peek", recv(s, &mut b, MSG_PEEK), 3);
     // A faulting copy leaves the data queued
-    let r = hk_syscall::sys_recvfrom(s, BAD as *mut u8, 8, 0, core::ptr::null_mut(), core::ptr::null_mut());
+    let r = hk_syscall::sys_recvfrom(
+        s,
+        BAD as *mut u8,
+        8,
+        0,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+    );
     t.eq(b"efault", r, EFAULT);
     t.eq(b"peek again", recv(s, &mut b, MSG_PEEK), 3);
     t.eq(b"read", recv(s, &mut b, 0), 3);
@@ -264,7 +281,8 @@ fn test_many() {
     for i in 0..N {
         for fd in [s[i], c[i]] {
             let n = recv(fd, &mut buf, MSG_WAITALL);
-            if !t.eq(b"recv", n, 100) || !t.ok(b"data", buf.iter().all(|&b| b == i as u8), i as i64) {
+            if !t.eq(b"recv", n, 100) || !t.ok(b"data", buf.iter().all(|&b| b == i as u8), i as i64)
+            {
                 break;
             }
         }

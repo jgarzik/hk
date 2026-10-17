@@ -8,8 +8,29 @@
 //! a loadable ELF or whose header table is cut short, EIO for an
 //! interpreter path past the end of the file, EINVAL for segments that
 //! cannot be mapped).
+//!
+//! The file is read through an [`ElfSource`], only where needed and in
+//! bounded pieces (Linux elf_read): the ELF header, the program header
+//! table (one page at most), a PT_INTERP path (PATH_MAX at most), a
+//! PT_DYNAMIC table (`MAX_DYNAMIC` at most) and the RELA table in
+//! chunks. The segments themselves are read page by page straight into
+//! the user frames at exec, never as a whole-image copy.
 
 use alloc::vec::Vec;
+
+/// Where an ELF image is read from: an open file at exec, bytes in the
+/// unit tests
+pub trait ElfSource {
+    /// The `len` bytes at offset `off`, or None if the image ends first
+    fn read_at(&self, off: u64, len: usize) -> Option<Vec<u8>>;
+}
+
+impl ElfSource for [u8] {
+    fn read_at(&self, off: u64, len: usize) -> Option<Vec<u8>> {
+        let off = usize::try_from(off).ok()?;
+        self.get(off..off.checked_add(len)?).map(|b| b.to_vec())
+    }
+}
 
 /// ELF magic number
 pub const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -77,6 +98,12 @@ const MAX_PHDRS_SIZE: usize = 4096;
 
 /// Linux: an interpreter path is at most PATH_MAX and at least 2 bytes
 const PATH_MAX: usize = 4096;
+
+/// Largest PT_DYNAMIC table read (a larger one yields no relocations)
+const MAX_DYNAMIC: usize = 64 * 1024;
+
+/// RELA entries read at a time
+const RELA_CHUNK: usize = 170;
 
 /// Page size segments are mapped with
 const PAGE: u64 = 4096;
@@ -162,8 +189,9 @@ pub struct ElfExecutable {
     /// True if this is a PIE (position-independent executable)
     /// When true, a base address must be added to all virtual addresses
     pub is_pie: bool,
-    /// Relocations to apply (only for PIE, R_*_RELATIVE type)
-    pub relocations: Vec<ElfRelocation>,
+    /// File range of the RELA table of a PIE (applied at load,
+    /// `for_each_relocation`)
+    pub rela: Option<(u64, u64)>,
     /// Virtual address of the program headers (AT_PHDR, before the PIE
     /// base is added; 0 if no loaded segment holds them)
     pub phdr: u64,
@@ -203,10 +231,8 @@ impl ElfError {
 }
 
 /// `len` bytes at `off`, or Truncated
-fn bytes(data: &[u8], off: u64, len: usize) -> Result<&[u8], ElfError> {
-    let off = usize::try_from(off).map_err(|_| ElfError::Truncated)?;
-    let end = off.checked_add(len).ok_or(ElfError::Truncated)?;
-    data.get(off..end).ok_or(ElfError::Truncated)
+fn bytes<S: ElfSource + ?Sized>(src: &S, off: u64, len: usize) -> Result<Vec<u8>, ElfError> {
+    src.read_at(off, len).ok_or(ElfError::Truncated)
 }
 
 fn u16_at(b: &[u8], i: usize) -> u16 {
@@ -249,9 +275,10 @@ impl Phdr {
 }
 
 /// The ELF header: (is_pie, entry, phoff, phnum)
-fn ehdr(data: &[u8]) -> Result<(bool, u64, u64, usize), ElfError> {
+fn ehdr<S: ElfSource + ?Sized>(src: &S) -> Result<(bool, u64, u64, usize), ElfError> {
     // Linux reads a zero-padded buffer: a short file just fails the checks
-    let h = data.get(..EHDR_SIZE).ok_or(ElfError::NotExecutable)?;
+    let h = src.read_at(0, EHDR_SIZE).ok_or(ElfError::NotExecutable)?;
+    let h = &h[..];
     if h[..4] != ELF_MAGIC || h[4] != ELFCLASS64 || h[5] != ELFDATA2LSB {
         return Err(ElfError::NotExecutable);
     }
@@ -291,12 +318,12 @@ fn load_segment(p: &Phdr) -> Result<ElfSegment, ElfError> {
 }
 
 /// PT_INTERP: a NUL-terminated path of 2..=PATH_MAX bytes in the file
-fn interp(data: &[u8], p: &Phdr) -> Result<Vec<u8>, ElfError> {
+fn interp<S: ElfSource + ?Sized>(src: &S, p: &Phdr) -> Result<Vec<u8>, ElfError> {
     let len = usize::try_from(p.filesz).map_err(|_| ElfError::NotExecutable)?;
     if !(2..=PATH_MAX).contains(&len) {
         return Err(ElfError::NotExecutable);
     }
-    let b = bytes(data, p.offset, len)?;
+    let b = bytes(src, p.offset, len)?;
     if b[len - 1] != 0 {
         return Err(ElfError::NotExecutable);
     }
@@ -311,16 +338,17 @@ fn file_offset(segs: &[ElfSegment], va: u64) -> Option<u64> {
     })
 }
 
-/// RELATIVE relocations of a PIE (its own DT_RELA table); a malformed
-/// table yields fewer relocations, never an out-of-bounds read
-fn relocations(data: &[u8], segs: &[ElfSegment], dynamic: &Phdr) -> Vec<ElfRelocation> {
-    let mut out = Vec::new();
-    let Ok(len) = usize::try_from(dynamic.filesz) else {
-        return out;
-    };
-    let Ok(dynb) = bytes(data, dynamic.offset, len) else {
-        return out;
-    };
+/// File range of a PIE's own DT_RELA table; a malformed (or too large)
+/// dynamic table yields none, never an out-of-bounds read
+fn rela_table<S: ElfSource + ?Sized>(
+    src: &S,
+    segs: &[ElfSegment],
+    dynamic: &Phdr,
+) -> Option<(u64, u64)> {
+    let len = usize::try_from(dynamic.filesz)
+        .ok()
+        .filter(|&l| l <= MAX_DYNAMIC)?;
+    let dynb = bytes(src, dynamic.offset, len).ok()?;
     let (mut rela, mut relasz, mut relaent) = (None, 0u64, RELA_SIZE as u64);
     for d in dynb.as_chunks::<DYN_SIZE>().0 {
         match u64_at(d, 0) {
@@ -332,34 +360,20 @@ fn relocations(data: &[u8], segs: &[ElfSegment], dynamic: &Phdr) -> Vec<ElfReloc
         }
     }
     if relaent != RELA_SIZE as u64 {
-        return out;
+        return None;
     }
-    let Some(off) = rela.and_then(|va| file_offset(segs, va)) else {
-        return out;
-    };
-    let Ok(len) = usize::try_from(relasz) else {
-        return out;
-    };
-    let Ok(table) = bytes(data, off, len - len % RELA_SIZE) else {
-        return out;
-    };
-    for r in table.as_chunks::<RELA_SIZE>().0 {
-        if u64_at(r, 8) & 0xffff_ffff == R_RELATIVE as u64 {
-            out.push(ElfRelocation {
-                offset: u64_at(r, 0),
-                addend: u64_at(r, 16) as i64,
-            });
-        }
-    }
-    out
+    let off = file_offset(segs, rela?)?;
+    let len = relasz - relasz % RELA_SIZE as u64;
+    off.checked_add(len)?;
+    (len > 0).then_some((off, len))
 }
 
 impl ElfExecutable {
     /// Parse and validate an ELF64 executable
-    pub fn parse(data: &[u8]) -> Result<Self, ElfError> {
-        let (is_pie, entry, phoff, phnum) = ehdr(data)?;
+    pub fn parse<S: ElfSource + ?Sized>(src: &S) -> Result<Self, ElfError> {
+        let (is_pie, entry, phoff, phnum) = ehdr(src)?;
         // Linux load_elf_phdrs fails quietly: a short table is ENOEXEC
-        let table = bytes(data, phoff, phnum * PHDR_SIZE).map_err(|_| ElfError::NotExecutable)?;
+        let table = bytes(src, phoff, phnum * PHDR_SIZE).map_err(|_| ElfError::NotExecutable)?;
         let phdrs: Vec<Phdr> = table
             .as_chunks::<PHDR_SIZE>()
             .0
@@ -387,7 +401,7 @@ impl ElfExecutable {
                         segments.push(seg);
                     }
                 }
-                PT_INTERP if interp_path.is_none() => interp_path = Some(interp(data, p)?),
+                PT_INTERP if interp_path.is_none() => interp_path = Some(interp(src, p)?),
                 PT_DYNAMIC => dynamic = Some(p),
                 _ => {}
             }
@@ -396,16 +410,16 @@ impl ElfExecutable {
             return Err(ElfError::NotExecutable);
         }
 
-        let relocations = match dynamic {
-            Some(d) if is_pie => relocations(data, &segments, d),
-            _ => Vec::new(),
+        let rela = match dynamic {
+            Some(d) if is_pie => rela_table(src, &segments, d),
+            _ => None,
         };
 
         Ok(Self {
             entry,
             segments,
             is_pie,
-            relocations,
+            rela,
             phdr,
             phent: PHDR_SIZE as u64,
             phnum: phnum as u64,
@@ -413,6 +427,35 @@ impl ElfExecutable {
             interp: interp_path,
             end,
         })
+    }
+
+    /// Each R_*_RELATIVE relocation of the RELA table, read from `src`
+    /// a chunk at a time (no copy of the table); a table cut short by
+    /// the end of the file stops there
+    pub fn for_each_relocation<S: ElfSource + ?Sized>(
+        &self,
+        src: &S,
+        f: &mut dyn FnMut(ElfRelocation),
+    ) {
+        let Some((mut off, len)) = self.rela else {
+            return;
+        };
+        let end = off + len;
+        while off < end {
+            let n = ((end - off) as usize).min(RELA_CHUNK * RELA_SIZE);
+            let Some(chunk) = src.read_at(off, n) else {
+                return;
+            };
+            for r in chunk.as_chunks::<RELA_SIZE>().0 {
+                if u64_at(r, 8) & 0xffff_ffff == R_RELATIVE as u64 {
+                    f(ElfRelocation {
+                        offset: u64_at(r, 0),
+                        addend: u64_at(r, 16) as i64,
+                    });
+                }
+            }
+            off += n as u64;
+        }
     }
 }
 
@@ -447,13 +490,19 @@ mod tests {
         }
     }
 
+    fn relocs(e: &ElfExecutable, f: &[u8]) -> Vec<ElfRelocation> {
+        let mut v = Vec::new();
+        e.for_each_relocation(f, &mut |r| v.push(r));
+        v
+    }
+
     fn err(f: &[u8]) -> Option<ElfError> {
         ElfExecutable::parse(f).err()
     }
 
     #[test]
     fn valid_exec() {
-        let e = ElfExecutable::parse(&exe()).unwrap();
+        let e = ElfExecutable::parse(&exe()[..]).unwrap();
         assert_eq!(e.segments.len(), 1);
         assert_eq!(e.phdr, 0x400040);
         assert_eq!(e.end, 0x403000);
@@ -514,7 +563,7 @@ mod tests {
         assert_eq!(err(&f), Some(ElfError::NotExecutable)); // nothing to load
         let mut f = exe();
         set_phdr(&mut f, 0, PT_LOAD, [0, 0x400000, 0x2000, 0x2000, 3]);
-        assert_eq!(ElfExecutable::parse(&f).unwrap().align, PAGE);
+        assert_eq!(ElfExecutable::parse(&f[..]).unwrap().align, PAGE);
     }
 
     #[test]
@@ -524,7 +573,7 @@ mod tests {
         f[0x1000..0x100c].copy_from_slice(b"/lib/ld.so\0\0");
         set_phdr(&mut f, 1, PT_INTERP, [0x1000, 0, 11, 11, 1]);
         assert_eq!(
-            ElfExecutable::parse(&f).unwrap().interp.unwrap(),
+            ElfExecutable::parse(&f[..]).unwrap().interp.unwrap(),
             b"/lib/ld.so"
         );
         set_phdr(&mut f, 1, PT_INTERP, [0x1000, 0, 10, 10, 1]); // unterminated
@@ -575,14 +624,44 @@ mod tests {
     }
 
     #[test]
+    fn relocations_stream_from_the_file() {
+        let mut f = exe();
+        f[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+        f[56..58].copy_from_slice(&2u16.to_le_bytes());
+        let d = 0x1000;
+        for (i, (tag, v)) in [(DT_RELA, 0x401800u64), (DT_RELASZ, 3 * 24), (0, 0)]
+            .into_iter()
+            .enumerate()
+        {
+            f[d + i * 16..d + i * 16 + 8].copy_from_slice(&tag.to_le_bytes());
+            f[d + i * 16 + 8..d + i * 16 + 16].copy_from_slice(&v.to_le_bytes());
+        }
+        set_phdr(&mut f, 1, PT_DYNAMIC, [d as u64, 0, 0x30, 0x30, 8]);
+        // Two RELATIVE entries around another type
+        for (i, kind) in [R_RELATIVE, 1, R_RELATIVE].into_iter().enumerate() {
+            let r = 0x1800 + i * 24;
+            f[r..r + 8].copy_from_slice(&(0x10 * i as u64).to_le_bytes());
+            f[r + 8..r + 16].copy_from_slice(&(kind as u64).to_le_bytes());
+            f[r + 16..r + 24].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+        }
+        let e = ElfExecutable::parse(&f[..]).unwrap();
+        let r = relocs(&e, &f);
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[1].offset, r[1].addend), (0x20, 3));
+        // Cut short by the end of the file: the entries read so far
+        let e = ElfExecutable::parse(&f[..0x1818]).unwrap();
+        assert!(relocs(&e, &f[..0x1818]).len() <= 2);
+    }
+
+    #[test]
     fn malformed_dynamic_never_panics() {
         let mut f = exe();
         f[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
         f[56..58].copy_from_slice(&2u16.to_le_bytes());
         for (off, sz) in [(0x1ff8u64, 0x100u64), (u64::MAX, 8), (0x1000, 0x10)] {
             set_phdr(&mut f, 1, PT_DYNAMIC, [off, 0, sz, sz, 8]);
-            let e = ElfExecutable::parse(&f).unwrap();
-            assert!(e.relocations.is_empty());
+            let e = ElfExecutable::parse(&f[..]).unwrap();
+            assert!(relocs(&e, &f).is_empty());
         }
         // DT_RELA pointing anywhere, huge DT_RELASZ
         let d = 0x1000;
@@ -591,6 +670,7 @@ mod tests {
         f[d + 16..d + 24].copy_from_slice(&DT_RELASZ.to_le_bytes());
         f[d + 24..d + 32].copy_from_slice(&u64::MAX.to_le_bytes());
         set_phdr(&mut f, 1, PT_DYNAMIC, [d as u64, 0, 0x30, 0x30, 8]);
-        assert!(ElfExecutable::parse(&f).unwrap().relocations.is_empty());
+        let e = ElfExecutable::parse(&f[..]).unwrap();
+        assert!(relocs(&e, &f).is_empty());
     }
 }

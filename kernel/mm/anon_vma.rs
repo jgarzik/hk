@@ -22,8 +22,10 @@
 
 extern crate alloc;
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+
+use super::Mm;
 
 use crate::sync::spin::Mutex;
 
@@ -51,8 +53,12 @@ struct AnonVmaInner {
 /// We store the address space's top-level table and the VMA range rather
 /// than pointers to avoid lifetime issues. The entries of an address
 /// space are removed before its tables are freed (exit_mmap, munmap).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AnonVmaChain {
+    /// The address space holding the VMA (an mm_count reference only
+    /// when upgraded: a chain never keeps an address space alive), for
+    /// the TLB flush of an entry rmap changes
+    pub mm: Weak<Mm>,
     /// Top-level page table of the address space holding the VMA
     pub root: u64,
     /// VMA start address (used to locate VMA in task's mm)
@@ -76,20 +82,25 @@ impl AnonVma {
     /// - A VMA is inherited during fork
     ///
     /// # Arguments
-    /// * `root` - Top-level page table of the address space
+    /// * `mm` - The address space
+    /// * `root` - Its top-level page table
     /// * `vma_start` - Start address of the VMA
     /// * `vma_end` - End address of the VMA
-    pub fn add_vma(&self, root: u64, vma_start: u64, vma_end: u64) {
+    pub fn add_vma(&self, mm: Weak<Mm>, root: u64, vma_start: u64, vma_end: u64) {
         let mut inner = self.inner.lock();
 
         // Don't add duplicates
-        let chain = AnonVmaChain {
-            root,
-            vma_start,
-            vma_end,
-        };
-        if !inner.vmas.contains(&chain) {
-            inner.vmas.push(chain);
+        let dup = inner
+            .vmas
+            .iter()
+            .any(|c| c.root == root && c.vma_start == vma_start && c.vma_end == vma_end);
+        if !dup {
+            inner.vmas.push(AnonVmaChain {
+                mm,
+                root,
+                vma_start,
+                vma_end,
+            });
         }
     }
 
@@ -184,9 +195,9 @@ mod tests {
     #[test]
     fn test_anon_vma_remove_root() {
         let av = AnonVma::new();
-        av.add_vma(0x1000, 0x10000, 0x20000);
-        av.add_vma(0x1000, 0x30000, 0x40000);
-        av.add_vma(0x2000, 0x10000, 0x20000);
+        av.add_vma(Weak::new(), 0x1000, 0x10000, 0x20000);
+        av.add_vma(Weak::new(), 0x1000, 0x30000, 0x40000);
+        av.add_vma(Weak::new(), 0x2000, 0x10000, 0x20000);
         av.remove_root(0x1000);
         assert_eq!(av.vma_count(), 1);
         assert!(av.contains_vma(0x2000, 0x10000));
@@ -204,13 +215,13 @@ mod tests {
         let av = AnonVma::new();
 
         // Add a VMA
-        av.add_vma(1, 0x1000, 0x2000);
+        av.add_vma(Weak::new(), 1, 0x1000, 0x2000);
         assert!(!av.is_empty());
         assert_eq!(av.vma_count(), 1);
         assert!(av.contains_vma(1, 0x1000));
 
         // Add another
-        av.add_vma(2, 0x3000, 0x4000);
+        av.add_vma(Weak::new(), 2, 0x3000, 0x4000);
         assert_eq!(av.vma_count(), 2);
 
         // Remove first
@@ -228,9 +239,9 @@ mod tests {
     fn test_anon_vma_no_duplicates() {
         let av = AnonVma::new();
 
-        av.add_vma(1, 0x1000, 0x2000);
-        av.add_vma(1, 0x1000, 0x2000); // Duplicate
-        av.add_vma(1, 0x1000, 0x2000); // Duplicate
+        av.add_vma(Weak::new(), 1, 0x1000, 0x2000);
+        av.add_vma(Weak::new(), 1, 0x1000, 0x2000); // Duplicate
+        av.add_vma(Weak::new(), 1, 0x1000, 0x2000); // Duplicate
 
         assert_eq!(av.vma_count(), 1);
     }
@@ -239,8 +250,8 @@ mod tests {
     fn test_anon_vma_get_vmas() {
         let av = AnonVma::new();
 
-        av.add_vma(1, 0x1000, 0x2000);
-        av.add_vma(2, 0x3000, 0x4000);
+        av.add_vma(Weak::new(), 1, 0x1000, 0x2000);
+        av.add_vma(Weak::new(), 2, 0x3000, 0x4000);
 
         let vmas = av.get_vmas();
         assert_eq!(vmas.len(), 2);
@@ -253,7 +264,7 @@ mod tests {
     fn test_anon_vma_update() {
         let av = AnonVma::new();
 
-        av.add_vma(1, 0x1000, 0x2000);
+        av.add_vma(Weak::new(), 1, 0x1000, 0x2000);
 
         // Simulate mremap that moves the VMA
         av.update_vma(1, 0x1000, 0x5000, 0x6000);

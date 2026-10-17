@@ -9,10 +9,10 @@
 //! - Test timerfd_create with TFD_NONBLOCK
 //! - Test timerfd read on disarmed timer (EAGAIN with nonblock)
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_read, sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
-    ITimerSpec, Timespec, TFD_NONBLOCK, CLOCK_MONOTONIC, CLOCK_REALTIME,
+    CLOCK_MONOTONIC, CLOCK_REALTIME, ITimerSpec, TFD_NONBLOCK, Timespec, sys_close, sys_read,
+    sys_timerfd_create, sys_timerfd_gettime, sys_timerfd_settime,
 };
 
 /// Run all timerfd tests
@@ -81,8 +81,14 @@ fn test_timerfd_settime_and_gettime() {
 
     // Set a 1-second one-shot timer
     let new_value = ITimerSpec {
-        it_value: Timespec { tv_sec: 1, tv_nsec: 0 },
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: Timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
     };
     let mut old_value = ITimerSpec::default();
 
@@ -126,8 +132,14 @@ fn test_timerfd_disarm() {
 
     // First arm the timer - use volatile write to ensure it's not optimized with disarm_value
     let arm_value = ITimerSpec {
-        it_value: Timespec { tv_sec: 10, tv_nsec: 0 },
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: Timespec {
+            tv_sec: 10,
+            tv_nsec: 0,
+        },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
     };
     let arm_ret = sys_timerfd_settime(fd as i32, 0, &arm_value, core::ptr::null_mut());
     // Ensure the arm syscall is fully complete before proceeding
@@ -142,8 +154,14 @@ fn test_timerfd_disarm() {
 
     // Now disarm it - use a completely separate stack frame by boxing
     let disarm_value = ITimerSpec {
-        it_value: Timespec { tv_sec: 0, tv_nsec: 0 },
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
     };
     let mut old_value = ITimerSpec::default();
     let ret = sys_timerfd_settime(fd as i32, 0, &disarm_value, &mut old_value);
@@ -189,8 +207,14 @@ fn test_timerfd_nonblock_eagain() {
 
     // Set a long timer (10 seconds)
     let new_value = ITimerSpec {
-        it_value: Timespec { tv_sec: 10, tv_nsec: 0 },
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: Timespec {
+            tv_sec: 10,
+            tv_nsec: 0,
+        },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
     };
     sys_timerfd_settime(fd as i32, 0, &new_value, core::ptr::null_mut());
 

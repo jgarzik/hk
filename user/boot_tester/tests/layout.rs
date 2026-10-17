@@ -4,8 +4,9 @@
 
 use super::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
+    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, O_RDONLY, PROT_READ, PROT_WRITE,
     sys_brk, sys_close, sys_exit, sys_fork, sys_mmap, sys_munmap, sys_open, sys_read, sys_setuid,
-    sys_wait4, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, O_RDONLY, PROT_READ, PROT_WRITE,
+    sys_wait4,
 };
 
 /// End of user space
@@ -86,7 +87,14 @@ fn test_low_eperm() {
 /// mmap without a hint goes top-down, high above the program break
 fn test_topdown() {
     let brk = sys_brk(0);
-    let r = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let r = sys_mmap(
+        0,
+        4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     let ok = r > 0 && (r as u64) > (1 << 46) && (r as u64) < TASK_SIZE && r > brk;
     if r > 0 {
         sys_munmap(r as u64, 4096);

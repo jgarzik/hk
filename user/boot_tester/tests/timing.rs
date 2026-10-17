@@ -14,17 +14,17 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait, sys_getppid, sys_mq_open, sys_mq_timedreceive,
-    sys_mq_unlink, sys_msgctl, sys_msgget, sys_msgrcv, sys_msgsnd, sys_rt_sigtimedwait, sys_semctl,
-    sys_semget, sys_semop, EpollEvent, Sembuf, CLOCK_REALTIME, EPOLLIN, EPOLL_CTL_ADD, IPC_CREAT,
-    IPC_PRIVATE, IPC_RMID, O_CREAT, O_RDWR,
+    CLOCK_MONOTONIC, CLONE_VM, FUTEX_WAIT, FUTEX_WAKE, P_PID, PollFd, SA_RESTART, SA_RESTORER,
+    SIG_DFL, SIG_SETMASK, SIG_UNBLOCK, SIGALRM, SIGCHLD, SIGKILL, SIGUSR1, SigInfo, Timespec,
+    sys_clock_gettime, sys_clone, sys_close, sys_exit, sys_fork, sys_futex, sys_kill,
+    sys_nanosleep, sys_pause, sys_pipe, sys_poll, sys_read, sys_rt_sigaction, sys_rt_sigprocmask,
+    sys_rt_sigsuspend, sys_wait4, sys_waitid, sys_write,
 };
 use hk_syscall::{
-    sys_clock_gettime, sys_clone, sys_close, sys_exit, sys_fork, sys_futex, sys_kill,
-    sys_nanosleep, sys_pause, sys_pipe, sys_poll, sys_read, sys_rt_sigaction, sys_rt_sigprocmask, sys_rt_sigsuspend,
-    sys_wait4, sys_waitid, sys_write, PollFd, SigInfo, Timespec, CLOCK_MONOTONIC, CLONE_VM,
-    FUTEX_WAIT, FUTEX_WAKE, P_PID, SA_RESTART, SA_RESTORER, SIGALRM, SIGCHLD, SIGKILL, SIGUSR1,
-    SIG_DFL, SIG_SETMASK, SIG_UNBLOCK,
+    CLOCK_REALTIME, EPOLL_CTL_ADD, EPOLLIN, EpollEvent, IPC_CREAT, IPC_PRIVATE, IPC_RMID, O_CREAT,
+    O_RDWR, Sembuf, sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait, sys_getppid, sys_mq_open,
+    sys_mq_timedreceive, sys_mq_unlink, sys_msgctl, sys_msgget, sys_msgrcv, sys_msgsnd,
+    sys_rt_sigtimedwait, sys_semctl, sys_semget, sys_semop,
 };
 
 const EINTR: i64 = -4;
@@ -44,7 +44,12 @@ pub fn run_tests() {
     set_handler(SIGALRM, 0);
     let ours: u64 = (1 << (SIGUSR1 - 1)) | (1 << (SIGALRM - 1));
     let mut saved: u64 = 0;
-    sys_rt_sigprocmask(SIG_UNBLOCK, &ours as *const u64 as u64, &mut saved as *mut u64 as u64, 8);
+    sys_rt_sigprocmask(
+        SIG_UNBLOCK,
+        &ours as *const u64 as u64,
+        &mut saved as *mut u64 as u64,
+        8,
+    );
     reset_handler(SIGUSR1);
     reset_handler(SIGALRM);
     test_poll_timeout();
@@ -97,13 +102,19 @@ unsafe extern "C" fn restorer() -> ! {
 
 /// CLOCK_MONOTONIC in milliseconds
 fn now_ms() -> u64 {
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     sys_clock_gettime(CLOCK_MONOTONIC, &mut ts);
     ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
 }
 
 fn sleep_ms(ms: u64) {
-    let req = Timespec { tv_sec: (ms / 1000) as i64, tv_nsec: ((ms % 1000) * 1_000_000) as i64 };
+    let req = Timespec {
+        tv_sec: (ms / 1000) as i64,
+        tv_nsec: ((ms % 1000) * 1_000_000) as i64,
+    };
     sys_nanosleep(&req, core::ptr::null_mut());
 }
 
@@ -127,7 +138,12 @@ fn set_handler(sig: u32, flags: u64) {
 }
 
 fn reset_handler(sig: u32) {
-    let act = SigActionData { handler: SIG_DFL, flags: 0, restorer: 0, mask: 0 };
+    let act = SigActionData {
+        handler: SIG_DFL,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
     sys_rt_sigaction(sig, &act as *const SigActionData as u64, 0, 8);
 }
 
@@ -209,7 +225,10 @@ fn test_poll_timeout() {
 
 /// nanosleep(300 ms) sleeps ~300 ms of CLOCK_MONOTONIC time
 fn test_nanosleep_timeout() {
-    let req = Timespec { tv_sec: 0, tv_nsec: 300_000_000 };
+    let req = Timespec {
+        tv_sec: 0,
+        tv_nsec: 300_000_000,
+    };
     let t0 = now_ms();
     let r = sys_nanosleep(&req, core::ptr::null_mut());
     check_elapsed(b"TIMING_NANOSLEEP_300MS", r, 0, now_ms() - t0);
@@ -222,7 +241,11 @@ fn test_poll_pipe_timeout() {
         println(b"TIMING_POLL_PIPE_300MS:FAIL pipe");
         return;
     }
-    let mut pfd = PollFd { fd: fds[0], events: POLLIN, revents: 0 };
+    let mut pfd = PollFd {
+        fd: fds[0],
+        events: POLLIN,
+        revents: 0,
+    };
     let t0 = now_ms();
     let r = sys_poll(&mut pfd, 1, 300);
     check_elapsed(b"TIMING_POLL_PIPE_300MS", r, 0, now_ms() - t0);
@@ -330,7 +353,10 @@ fn test_pipe_read_restart() {
             (2, b"read returned EINTR despite SA_RESTART"),
             (3, b"unexpected read result"),
             (4, b"handler did not run exactly once"),
-            (5, b"handler ran only when read completed, not while blocked"),
+            (
+                5,
+                b"handler ran only when read completed, not while blocked",
+            ),
         ],
     );
 }
@@ -479,7 +505,11 @@ fn test_pipe_wake_stress() {
             sys_write(fds[1] as u64, b"p".as_ptr(), 1);
         }
         for fds in &to_parent {
-            let mut pfd = PollFd { fd: fds[0], events: POLLIN, revents: 0 };
+            let mut pfd = PollFd {
+                fd: fds[0],
+                events: POLLIN,
+                revents: 0,
+            };
             let mut b = [0u8; 1];
             if sys_poll(&mut pfd, 1, 3000) != 1 || sys_read(fds[0] as u64, b.as_mut_ptr(), 1) != 1 {
                 failed_round = round as i64;
@@ -529,9 +559,19 @@ static mut FUTEX_CHILD_STACK: FutexStack = FutexStack([0; 16384]);
 /// TURN == me; false if that takes more than 3 s (lost wakeup)
 fn futex_wait_turn(me: u32) -> bool {
     let start = now_ms();
-    let timeout = Timespec { tv_sec: 0, tv_nsec: 500_000_000 };
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 500_000_000,
+    };
     while TURN.load(Ordering::Acquire) != me {
-        sys_futex(TURN.as_ptr(), FUTEX_WAIT, 1 - me, &timeout, core::ptr::null_mut(), 0);
+        sys_futex(
+            TURN.as_ptr(),
+            FUTEX_WAIT,
+            1 - me,
+            &timeout,
+            core::ptr::null_mut(),
+            0,
+        );
         if now_ms().saturating_sub(start) > 3000 {
             return false;
         }
@@ -541,7 +581,14 @@ fn futex_wait_turn(me: u32) -> bool {
 
 fn futex_pass_turn(to: u32) {
     TURN.store(to, Ordering::Release);
-    sys_futex(TURN.as_ptr(), FUTEX_WAKE, 1, core::ptr::null(), core::ptr::null_mut(), 0);
+    sys_futex(
+        TURN.as_ptr(),
+        FUTEX_WAKE,
+        1,
+        core::ptr::null(),
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 #[inline(never)]
@@ -641,9 +688,7 @@ fn kill_self_with_tiny_stack(pid: i64) -> ! {
 /// rt_sigreturn with SP = 64: no readable frame, Linux badframe -> SIGSEGV
 #[cfg(target_arch = "x86_64")]
 fn sigreturn_with_tiny_stack() -> ! {
-    unsafe {
-        core::arch::asm!("mov rsp, 64", "syscall", "ud2", in("rax") 15u64, options(noreturn))
-    }
+    unsafe { core::arch::asm!("mov rsp, 64", "syscall", "ud2", in("rax") 15u64, options(noreturn)) }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -750,7 +795,7 @@ const HUGE_SEC: i64 = i64::MAX / 2;
 /// value never fires; negative seconds are EINVAL. The kernel must neither
 /// panic nor livelock re-arming the timer.
 fn test_timerfd_huge_values() {
-    use hk_syscall::{sys_timerfd_create, sys_timerfd_settime, ITimerSpec, TFD_NONBLOCK};
+    use hk_syscall::{ITimerSpec, TFD_NONBLOCK, sys_timerfd_create, sys_timerfd_settime};
     let fd = sys_timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     if fd < 0 {
         println(b"TIMERFD_HUGE_INTERVAL:FAIL timerfd_create");
@@ -762,8 +807,14 @@ fn test_timerfd_huge_values() {
 
     // Huge interval: one expiry, then effectively never
     let spec = ITimerSpec {
-        it_interval: Timespec { tv_sec: HUGE_SEC, tv_nsec: 999_999_999 },
-        it_value: Timespec { tv_sec: 0, tv_nsec: 1_000_000 },
+        it_interval: Timespec {
+            tv_sec: HUGE_SEC,
+            tv_nsec: 999_999_999,
+        },
+        it_value: Timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        },
     };
     let r_set = sys_timerfd_settime(fd, 0, &spec, core::ptr::null_mut());
     sleep_ms(50);
@@ -788,8 +839,14 @@ fn test_timerfd_huge_values() {
 
     // Huge first expiry: armed, never fires
     let spec = ITimerSpec {
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
-        it_value: Timespec { tv_sec: HUGE_SEC, tv_nsec: 0 },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: Timespec {
+            tv_sec: HUGE_SEC,
+            tv_nsec: 0,
+        },
     };
     let r_set = sys_timerfd_settime(fd, 0, &spec, core::ptr::null_mut());
     sleep_ms(20);
@@ -807,8 +864,14 @@ fn test_timerfd_huge_values() {
 
     // Negative seconds are invalid
     let spec = ITimerSpec {
-        it_interval: Timespec { tv_sec: -1, tv_nsec: 0 },
-        it_value: Timespec { tv_sec: 1, tv_nsec: 0 },
+        it_interval: Timespec {
+            tv_sec: -1,
+            tv_nsec: 0,
+        },
+        it_value: Timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        },
     };
     let r = sys_timerfd_settime(fd, 0, &spec, core::ptr::null_mut());
     print(b"TIMERFD_NEGATIVE_EINVAL");
@@ -826,8 +889,8 @@ fn test_timerfd_huge_values() {
 /// succeeds and the kernel keeps running (no re-arm livelock)
 fn test_posix_timer_huge_values() {
     use hk_syscall::{
-        sys_timer_create, sys_timer_delete, sys_timer_gettime, sys_timer_settime, ITimerSpec,
-        SigEvent,
+        ITimerSpec, SigEvent, sys_timer_create, sys_timer_delete, sys_timer_gettime,
+        sys_timer_settime,
     };
     let sev = SigEvent::none();
     let mut id: i32 = 0;
@@ -836,19 +899,37 @@ fn test_posix_timer_huge_values() {
         return;
     }
     let spec = ITimerSpec {
-        it_interval: Timespec { tv_sec: HUGE_SEC, tv_nsec: 0 },
-        it_value: Timespec { tv_sec: 0, tv_nsec: 1_000_000 },
+        it_interval: Timespec {
+            tv_sec: HUGE_SEC,
+            tv_nsec: 0,
+        },
+        it_value: Timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        },
     };
     let r_set = sys_timer_settime(id, 0, &spec, core::ptr::null_mut());
     sleep_ms(50);
     let mut cur = ITimerSpec {
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
-        it_value: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
     };
     let r_get = sys_timer_gettime(id, &mut cur);
     let bad = ITimerSpec {
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
-        it_value: Timespec { tv_sec: -5, tv_nsec: 0 },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: Timespec {
+            tv_sec: -5,
+            tv_nsec: 0,
+        },
     };
     let r_neg = sys_timer_settime(id, 0, &bad, core::ptr::null_mut());
     sys_timer_delete(id);
@@ -923,10 +1004,23 @@ fn kill_parent_usr1() {
 fn test_sigtimedwait_block() {
     let set: u64 = 1 << (SIGUSR1 - 1);
     let mut old: u64 = 0;
-    sys_rt_sigprocmask(0 /* SIG_BLOCK */, &set as *const u64 as u64, &mut old as *mut u64 as u64, 8);
-    let ts = Timespec { tv_sec: 0, tv_nsec: 300_000_000 };
+    sys_rt_sigprocmask(
+        0, /* SIG_BLOCK */
+        &set as *const u64 as u64,
+        &mut old as *mut u64 as u64,
+        8,
+    );
+    let ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 300_000_000,
+    };
     let t0 = now_ms();
-    let r = sys_rt_sigtimedwait(&set as *const u64 as u64, 0, &ts as *const Timespec as u64, 8);
+    let r = sys_rt_sigtimedwait(
+        &set as *const u64 as u64,
+        0,
+        &ts as *const Timespec as u64,
+        8,
+    );
     check_elapsed(b"TIMING_SIGTIMEDWAIT_TIMEOUT", r, -11, now_ms() - t0);
     let pid = later(100, kill_parent_usr1);
     let r = sys_rt_sigtimedwait(&set as *const u64 as u64, 0, 0, 8);
@@ -946,16 +1040,27 @@ fn test_sigtimedwait_block() {
 /// CLOCK_REALTIME timeout (~300 ms)
 fn test_mq_timeout() {
     let name = b"hk_timing_mq\0";
-    let fd = sys_mq_open(name.as_ptr(), (O_CREAT | O_RDWR) as i32, 0o600, core::ptr::null()) as i32;
+    let fd = sys_mq_open(
+        name.as_ptr(),
+        (O_CREAT | O_RDWR) as i32,
+        0o600,
+        core::ptr::null(),
+    ) as i32;
     if fd < 0 {
         print(b"TIMING_MQ_TIMEOUT:FAIL mq_open ");
         print_num(fd as i64);
         println(b"");
         return;
     }
-    let mut now = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut now = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     sys_clock_gettime(CLOCK_REALTIME, &mut now);
-    let mut abs = Timespec { tv_sec: now.tv_sec, tv_nsec: now.tv_nsec + 300_000_000 };
+    let mut abs = Timespec {
+        tv_sec: now.tv_sec,
+        tv_nsec: now.tv_nsec + 300_000_000,
+    };
     if abs.tv_nsec >= 1_000_000_000 {
         abs.tv_sec += 1;
         abs.tv_nsec -= 1_000_000_000;
@@ -993,7 +1098,11 @@ fn test_msgrcv_block() {
 }
 
 fn sem_post() {
-    let op = Sembuf { sem_num: 0, sem_op: 1, sem_flg: 0 };
+    let op = Sembuf {
+        sem_num: 0,
+        sem_op: 1,
+        sem_flg: 0,
+    };
     sys_semop(unsafe { WAKE_ID }, &op, 1);
 }
 
@@ -1002,7 +1111,11 @@ fn test_semop_block() {
     let id = sys_semget(IPC_PRIVATE, 1, IPC_CREAT | 0o600) as i32;
     unsafe { WAKE_ID = id };
     let pid = later(100, sem_post);
-    let op = Sembuf { sem_num: 0, sem_op: -1, sem_flg: 0 };
+    let op = Sembuf {
+        sem_num: 0,
+        sem_op: -1,
+        sem_flg: 0,
+    };
     let r = sys_semop(id, &op, 1);
     let _ = reap_within(pid, 5000);
     sys_semctl(id, 0, IPC_RMID, 0);

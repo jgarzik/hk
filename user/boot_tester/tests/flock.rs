@@ -14,8 +14,8 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_copy_file_range, sys_fallocate, sys_flock, sys_lseek, sys_mkdir, sys_open,
-    sys_read, sys_write, O_CREAT, O_RDWR, O_TRUNC, SEEK_END, SEEK_SET,
+    O_CREAT, O_RDWR, O_TRUNC, SEEK_END, SEEK_SET, sys_close, sys_copy_file_range, sys_fallocate,
+    sys_flock, sys_lseek, sys_mkdir, sys_open, sys_read, sys_write,
 };
 
 // flock operations (from Linux include/uapi/asm-generic/fcntl.h)

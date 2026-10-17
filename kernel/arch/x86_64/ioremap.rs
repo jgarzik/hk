@@ -9,8 +9,9 @@ use crate::sync::spin::Mutex;
 use super::kmap::swapper_phys;
 use super::paging::{
     PAGE_CACHE_DISABLE, PAGE_NO_EXECUTE, PAGE_PRESENT, PAGE_SIZE, PAGE_WRITABLE,
-    PAGE_WRITE_THROUGH, VMALLOC_START, X86_64PageTable, phys_to_virt, phys_to_virt_table,
+    PAGE_WRITE_THROUGH, VMALLOC_START, phys_to_virt, phys_to_virt_table,
 };
+use crate::mm::tlb::flush_tlb_kernel_range;
 
 /// ioremap window: the first 1GB of the vmalloc area in the kernel half
 /// (its PDPT is preallocated by kmap, so every address space sees the
@@ -232,19 +233,30 @@ pub fn ioremap(phys_addr: u64, size: u64) -> Result<*mut u8, IoremapError> {
                 let rollback_va = virt_base + (j as u64) * PAGE_SIZE;
                 unmap_page(cr3, rollback_va);
             }
+            flush_tlb_kernel_range(virt_base, virt_base + aligned_size);
             // Free the virtual address range
             IOREMAP.lock().free(virt_base, num_pages);
             return Err(e);
         }
     }
 
-    // Flush TLB for mapped range
-    for i in 0..num_pages {
-        X86_64PageTable::flush_tlb(virt_base + (i as u64) * PAGE_SIZE);
-    }
+    // No flush: the entries were not present (x86 caches no
+    // not-present entry) and iounmap flushed any earlier use of the range
 
     // Return virtual address with offset
     Ok((virt_base + offset) as *mut u8)
+}
+
+/// Point the ioremap page at `va` to `pa` instead (TLB self-test):
+/// break (clear, flush every CPU), then make
+#[cfg(feature = "lockdep")]
+pub fn retarget(va: u64, pa: u64) -> Result<(), IoremapError> {
+    let root = swapper_phys();
+    unmap_page(root, va);
+    flush_tlb_kernel_range(va, va + PAGE_SIZE);
+    map_mmio_page(root, va, pa)?;
+    flush_tlb_kernel_range(va, va + PAGE_SIZE);
+    Ok(())
 }
 
 /// Unmap a previously ioremap'd region
@@ -269,12 +281,11 @@ pub fn iounmap(virt_addr: *mut u8, size: u64) {
 
     let cr3 = swapper_phys();
 
-    // Unmap pages and flush TLB
+    // Unmap pages, then flush every CPU before the range can be reused
     for i in 0..num_pages {
-        let va = aligned_virt + (i as u64) * PAGE_SIZE;
-        unmap_page(cr3, va);
-        X86_64PageTable::flush_tlb(va);
+        unmap_page(cr3, aligned_virt + (i as u64) * PAGE_SIZE);
     }
+    flush_tlb_kernel_range(aligned_virt, aligned_virt + aligned_size);
 
     // Free virtual address range
     IOREMAP.lock().free(aligned_virt, num_pages);

@@ -10,12 +10,12 @@
 
 use super::helpers::{print, print_num, println, skip};
 use super::nl::{
-    addr as nl_addr, ifaddr, net_setup_eth0, rtmsg, Nl, Req, AF_INET, IFA_LOCAL, RTA_GATEWAY,
-    RTA_OIF, RTM_GETADDR, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWROUTE, RT_TABLE_MAIN,
+    AF_INET, IFA_LOCAL, Nl, RT_TABLE_MAIN, RTA_GATEWAY, RTA_OIF, RTM_GETADDR, RTM_GETROUTE,
+    RTM_NEWADDR, RTM_NEWROUTE, Req, addr as nl_addr, ifaddr, net_setup_eth0, rtmsg,
 };
 use hk_syscall::{
-    sys_close, sys_dup3, sys_execve, sys_exit, sys_fork, sys_kill, sys_pipe2, sys_poll, sys_read,
-    sys_wait4, sys_write, PollFd, O_CLOEXEC, POLLIN, SIGKILL,
+    O_CLOEXEC, POLLIN, PollFd, SIGKILL, sys_close, sys_dup3, sys_execve, sys_exit, sys_fork,
+    sys_kill, sys_pipe2, sys_poll, sys_read, sys_wait4, sys_write,
 };
 
 /// Captured output size
@@ -50,7 +50,10 @@ pub fn contains(hay: &[u8], needle: &[u8]) -> bool {
 
 /// Monotonic milliseconds
 fn now_ms() -> i64 {
-    let mut ts = hk_syscall::Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     hk_syscall::sys_clock_gettime(1, &mut ts);
     ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
 }
@@ -117,7 +120,11 @@ pub fn spawn(args: &[&[u8]], stdin: &[u8]) -> Option<Child> {
 /// Collect a child's output until it exits, killing it after
 /// `timeout_ms`
 pub fn finish(c: Child, timeout_ms: i64) -> Run {
-    let mut r = Run { status: -1, out: [0; OUT_MAX], len: 0 };
+    let mut r = Run {
+        status: -1,
+        out: [0; OUT_MAX],
+        len: 0,
+    };
     let killed = collect(&mut r, c.fd, c.pid, timeout_ms);
     sys_close(c.fd as u64);
     let mut st = 0i32;
@@ -130,7 +137,11 @@ pub fn finish(c: Child, timeout_ms: i64) -> Run {
 pub fn bb_input(args: &[&[u8]], stdin: &[u8], timeout_ms: i64) -> Run {
     match spawn(args, stdin) {
         Some(c) => finish(c, timeout_ms),
-        None => Run { status: -1, out: [0; OUT_MAX], len: 0 },
+        None => Run {
+            status: -1,
+            out: [0; OUT_MAX],
+            len: 0,
+        },
     }
 }
 
@@ -149,7 +160,11 @@ fn collect(r: &mut Run, fd: i32, pid: i64, timeout_ms: i64) -> bool {
             sys_kill(pid, SIGKILL);
             return true;
         }
-        let mut p = PollFd { fd, events: POLLIN, revents: 0 };
+        let mut p = PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
         if sys_poll(&mut p, 1, left.min(1000) as i32) <= 0 {
             continue;
         }
@@ -236,22 +251,37 @@ fn test_false() {
 
 fn test_echo() {
     let r = bb(&[b"echo\0", b"hello\0", b"world\0"], 10_000);
-    report(b"BUSYBOX_ECHO", r.ok() && r.output() == b"hello world\n", &r);
+    report(
+        b"BUSYBOX_ECHO",
+        r.ok() && r.output() == b"hello world\n",
+        &r,
+    );
 }
 
 fn test_sh_c() {
     let r = bb(&[b"sh\0", b"-c\0", b"echo hi; exit 3\0"], 10_000);
-    report(b"BUSYBOX_SH_C", r.status == 3 << 8 && r.output() == b"hi\n", &r);
+    report(
+        b"BUSYBOX_SH_C",
+        r.status == 3 << 8 && r.output() == b"hi\n",
+        &r,
+    );
 }
 
 fn test_sh_pipe() {
-    let r = bb(&[b"sh\0", b"-c\0", b"echo a | cat; ls / | grep -c etc\0"], 10_000);
+    let r = bb(
+        &[b"sh\0", b"-c\0", b"echo a | cat; ls / | grep -c etc\0"],
+        10_000,
+    );
     report(b"BUSYBOX_SH_PIPE", r.ok() && r.output() == b"a\n1\n", &r);
 }
 
 fn test_stdin() {
     let r = bb_input(&[b"cat\0"], b"from stdin\n", 10_000);
-    report(b"BUSYBOX_STDIN", r.ok() && r.output() == b"from stdin\n", &r);
+    report(
+        b"BUSYBOX_STDIN",
+        r.ok() && r.output() == b"from stdin\n",
+        &r,
+    );
 }
 
 // ============================================================================
@@ -261,11 +291,26 @@ fn test_stdin() {
 /// `ip link/addr/route` show eth0, 10.0.2.15/24 and the default route
 fn test_ip() {
     let r = bb(&[b"ip\0", b"link\0"], 10_000);
-    report(b"BUSYBOX_IP_LINK", r.ok() && r.has(b"lo:") && r.has(b"eth0:") && r.has(b"UP"), &r);
-    let r = bb(&[b"ip\0", b"addr\0", b"show\0", b"dev\0", b"eth0\0"], 10_000);
-    report(b"BUSYBOX_IP_ADDR", r.ok() && r.has(b"inet 10.0.2.15/24"), &r);
+    report(
+        b"BUSYBOX_IP_LINK",
+        r.ok() && r.has(b"lo:") && r.has(b"eth0:") && r.has(b"UP"),
+        &r,
+    );
+    let r = bb(
+        &[b"ip\0", b"addr\0", b"show\0", b"dev\0", b"eth0\0"],
+        10_000,
+    );
+    report(
+        b"BUSYBOX_IP_ADDR",
+        r.ok() && r.has(b"inet 10.0.2.15/24"),
+        &r,
+    );
     let r = bb(&[b"ip\0", b"route\0"], 10_000);
-    report(b"BUSYBOX_IP_ROUTE", r.ok() && r.has(b"default via 10.0.2.2 dev eth0"), &r);
+    report(
+        b"BUSYBOX_IP_ROUTE",
+        r.ok() && r.has(b"default via 10.0.2.2 dev eth0"),
+        &r,
+    );
 }
 
 /// Prefix length of `ip` on link `index`, from an address dump
@@ -286,7 +331,8 @@ fn default_gw(nl: &mut Nl, index: u32) -> Option<[u8; 4]> {
     let mut r = Req::new(RTM_GETROUTE, 0, &rtmsg(0, 0, 0, 0, 0));
     nl.dump(&mut r, &mut |m| {
         let main = m.body[4] == RT_TABLE_MAIN;
-        if m.ty == RTM_NEWROUTE && m.body[1] == 0 && main && m.attr_u32(12, RTA_OIF) == Some(index) {
+        if m.ty == RTM_NEWROUTE && m.body[1] == 0 && main && m.attr_u32(12, RTA_OIF) == Some(index)
+        {
             gw = m.attr_ip(12, RTA_GATEWAY);
         }
     });
@@ -308,7 +354,16 @@ fn test_udhcpc(eth: u32) {
         return;
     }
     let r = bb(
-        &[b"udhcpc\0", b"-f\0", b"-n\0", b"-q\0", b"-i\0", b"eth0\0", b"-s\0", b"/etc/udhcpc.sh\0"],
+        &[
+            b"udhcpc\0",
+            b"-f\0",
+            b"-n\0",
+            b"-q\0",
+            b"-i\0",
+            b"eth0\0",
+            b"-s\0",
+            b"/etc/udhcpc.sh\0",
+        ],
         30_000,
     );
     let plen = addr_plen(&mut nl, eth, [10, 0, 2, 15]);
@@ -334,15 +389,25 @@ fn test_nslookup() {
 
 /// HTTP GET from the slirp HTTP peer (tools/netpeer/http.py)
 fn test_wget() {
-    let r = bb(&[b"wget\0", b"-q\0", b"-O\0", b"-\0", b"http://10.0.2.100/\0"], 30_000);
-    report(b"BUSYBOX_WGET", r.ok() && r.output() == b"hk netpeer ok\n", &r);
+    let r = bb(
+        &[b"wget\0", b"-q\0", b"-O\0", b"-\0", b"http://10.0.2.100/\0"],
+        30_000,
+    );
+    report(
+        b"BUSYBOX_WGET",
+        r.ok() && r.output() == b"hk netpeer ok\n",
+        &r,
+    );
 }
 
 /// ICMP echo to the slirp gateway; slirp without ICMP support (no host
 /// ping permission) is a skip
 fn test_ping() {
     const N: &[u8] = b"BUSYBOX_PING";
-    let r = bb(&[b"ping\0", b"-c\0", b"1\0", b"-W\0", b"3\0", b"10.0.2.2\0"], 20_000);
+    let r = bb(
+        &[b"ping\0", b"-c\0", b"1\0", b"-W\0", b"3\0", b"10.0.2.2\0"],
+        20_000,
+    );
     if r.has(b"0 packets received") {
         skip(N, b"no echo reply from slirp (host ICMP unavailable)");
         return;

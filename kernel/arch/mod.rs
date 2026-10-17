@@ -76,7 +76,7 @@ pub use x86_64::irq;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::percpu::preempt_count;
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::spinlock::{IrqSpinlock, IrqSpinlockGuard};
+pub use x86_64::spinlock::{IrqSpinlock, IrqSpinlockGuard, local_irq_restore, local_irq_save};
 
 /// Device IRQ registration (shareable handlers, PCI INTx routing)
 #[cfg(target_arch = "aarch64")]
@@ -84,7 +84,7 @@ pub use aarch64::irq;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::percpu::preempt_count;
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::spinlock::{IrqSpinlock, IrqSpinlockGuard};
+pub use aarch64::spinlock::{IrqSpinlock, IrqSpinlockGuard, local_irq_restore, local_irq_save};
 
 // Ptrace architecture-specific support
 #[cfg(target_arch = "x86_64")]
@@ -128,6 +128,27 @@ pub use x86_64::paging::{self, phys_to_virt, virt_to_phys};
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::paging::{self, phys_to_virt, virt_to_phys};
 
+// TLB primitives behind mm::tlb
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::tlb;
+
+// TLB self-test hook (kselftest, LOCKDEP builds)
+#[cfg(all(feature = "lockdep", target_arch = "x86_64"))]
+pub use x86_64::ioremap::retarget as ioremap_retarget;
+
+#[cfg(all(feature = "lockdep", target_arch = "aarch64"))]
+pub use aarch64::ioremap::retarget as ioremap_retarget;
+
+// IPIs behind smp
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::ipi;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::ipi;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::tlb;
+
 bitflags! {
     /// Page flags for memory mapping
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,7 +189,7 @@ pub enum MapError {
 }
 
 /// A user mapping met while tearing down an address space
-/// (`paging::free_user`); the mm layer drops the reference it holds
+/// (`paging::UserTables::free`); the mm layer drops the reference it holds
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Leaf {
     /// A present 4KB page (physical address)
@@ -248,6 +269,13 @@ pub trait FrameAlloc {
 
     /// Free a physical frame
     fn free_frame(&mut self, frame: Self::PhysAddr);
+
+    /// Drop the caller's reference to a frame that a user mapping may
+    /// also hold (a page-cache page mapped MAP_SHARED): freed with the
+    /// last reference. Without reference counts it is `free_frame`.
+    fn put_frame(&mut self, frame: Self::PhysAddr) {
+        self.free_frame(frame)
+    }
 
     /// Allocate `n` physically contiguous frames (kernel stacks, DMA
     /// buffers). None if unsupported or no such run is free.
@@ -395,7 +423,6 @@ pub trait ContextOps: Sized {
         old_ctx: *mut Self::TaskContext,
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        new_page_table_root: u64,
         next_tid: Tid,
     );
 
@@ -409,7 +436,6 @@ pub trait ContextOps: Sized {
     unsafe fn context_switch_first(
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        new_page_table_root: u64,
         next_tid: Tid,
     ) -> !;
 }
@@ -423,18 +449,12 @@ pub trait UserModeOps {
     /// # Arguments
     /// * `entry` - User entry point address
     /// * `user_stack` - User stack pointer
-    /// * `page_table_root` - Physical address of user page table
     /// * `kernel_stack` - Kernel stack top for syscalls/interrupts
     ///
     /// # Safety
-    /// The page table must be valid and contain proper user mappings.
-    /// This function never returns.
-    unsafe fn jump_to_user(
-        entry: u64,
-        user_stack: u64,
-        page_table_root: u64,
-        kernel_stack: u64,
-    ) -> !;
+    /// The task's address space must be loaded (`mm::tlb::switch_mm`)
+    /// and map the entry point and stack. This function never returns.
+    unsafe fn jump_to_user(entry: u64, user_stack: u64, kernel_stack: u64) -> !;
 }
 
 /// Combined scheduler architecture trait

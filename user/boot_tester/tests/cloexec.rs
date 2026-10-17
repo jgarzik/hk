@@ -6,8 +6,8 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_clone, sys_close, sys_dup3, sys_execve, sys_exit, sys_fcntl, sys_fork, sys_open,
-    sys_wait4, O_CLOEXEC, O_RDONLY,
+    O_CLOEXEC, O_RDONLY, sys_clone, sys_close, sys_dup3, sys_execve, sys_exit, sys_fcntl, sys_fork,
+    sys_open, sys_wait4,
 };
 
 const F_GETFD: i32 = 1;
@@ -40,7 +40,11 @@ fn test_open_flag() {
     let fb = sys_fcntl(b as i32, F_GETFD, 0);
     sys_close(a as u64);
     sys_close(b as u64);
-    verdict(b"CLOEXEC_OPEN_FLAG", fa == FD_CLOEXEC && fb == 0, fa * 10 + fb);
+    verdict(
+        b"CLOEXEC_OPEN_FLAG",
+        fa == FD_CLOEXEC && fb == 0,
+        fa * 10 + fb,
+    );
 }
 
 /// fd 10 close-on-exec, fd 11 not, both on /test.txt
@@ -60,7 +64,11 @@ fn exec_fdcheck() -> ! {
         core::ptr::null(),
     ];
     let envp: [*const u8; 1] = [core::ptr::null()];
-    sys_execve(b"/bin/boot_tester2\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+    sys_execve(
+        b"/bin/boot_tester2\0".as_ptr(),
+        argv.as_ptr(),
+        envp.as_ptr(),
+    );
     sys_exit(99);
 }
 
@@ -90,5 +98,9 @@ fn test_exec(name: &[u8], shared: bool) {
         sys_close(10);
         sys_close(11);
     }
-    verdict(name, pid > 0 && st == 0 && mine == FD_CLOEXEC, (st as i64) * 100 + mine);
+    verdict(
+        name,
+        pid > 0 && st == 0 && mine == FD_CLOEXEC,
+        (st as i64) * 100 + mine,
+    );
 }

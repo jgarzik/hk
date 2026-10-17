@@ -248,6 +248,8 @@ Filesystem context locks (TASK_FS)
     ↓
 Per-CPU scheduler locks (IrqSpinlock)  ← IRQ-safe, can hold while acquiring below
     ↓
+arm64 ASID lock (IrqSpinlock, leaf; switch_mm slow path, 3.2 TLB Flushing)
+    ↓
 Global subsystem locks (TASK_TABLE, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-safe;
     no file is released under `Files` (3.3, Descriptor Tables); order
     `Files` -> TASK_TABLE (descriptor allocation reads RLIMIT_NOFILE
@@ -671,6 +673,9 @@ pub struct BitmapFrameAllocator {
   takes no other lock)
 - Policy: no frame allocation in interrupt context
 - Thread-safe via `&self` methods (`alloc()`, `free()`)
+- Frame reference counts are u16 and saturate: a saturated count is
+  sticky (never decremented, the frame never freed), so more than 65535
+  mappings of one page leak it instead of freeing it while mapped
 
 #### Address Spaces (Mm: mm_users / mm_count, mmap_lock)
 
@@ -682,7 +687,8 @@ pub struct BitmapFrameAllocator {
   the address space and pinned users (`MmRef`: ptrace PEEK/POKE,
   process_vm_*, a /proc/<pid>/maps read). The last `MmRef` drop runs
   `exit_mmap`, which takes the VMAs under the mm lock, drops the rmap
-  chains, then tears down the user half (`paging::free_user`) and drops
+  chains, then tears down the user half (`paging::detach_user`, a
+  TLB flush, `UserTables::free`) and drops
   the VMAs (file references) with no lock held. **Never drop an `MmRef`
   under a spinlock** (TASK_TABLE included): take it out (`Option::take`,
   `replace`) and drop it after unlocking. `mmget_not_zero` refuses an
@@ -702,23 +708,197 @@ pub struct BitmapFrameAllocator {
   never drops a task that still uses its mm.
 - The mm lock (`Mm::lock`, a `spin::Mutex`) is hk's mmap_lock: it guards
   the VMA tree and VM counters. `dup_mm` holds the parent's mm lock while
-  it copies VMAs and page tables. munmap / MAP_FIXED / brk shrink / shmdt
+  it copies VMAs and page tables (`memory::copy_page_range`: it
+  write-protects the parent's private PTEs with a compare-and-swap, since
+  the parent's other threads may be faulting, splits 2MB pages and takes
+  frame references). munmap / MAP_FIXED / brk shrink / shmdt
   zap pages under it (`munmap_locked`). Order: mm lock → AnonVma lock,
   `LRU`, page descriptors, swap slots → `FRAME_ALLOCATOR`; nothing taken
   under those leaf locks takes an mm lock (the swap rmap walk uses the
   roots recorded in AnonVma chains, not the task table or mm locks).
   `TASK_TABLE` is never held while taking an mm lock.
-- The page-fault paths find the VMA under the mm lock but drop it before
-  allocating and installing the PTE (they may sleep reading a file), so a
-  fault can race munmap of the same range in another thread (gap vs Linux,
-  which holds mmap_lock for read across the fault and the page table lock
-  around the PTE update; section 9).
-- Teardown TLB: `free_user` detaches the user half from the top-level
-  table, flushes (arm64: `tlbi vmalle1is`, all CPUs; x86: this CPU, if
-  the table is loaded here), then frees pages and tables. A CPU that last
-  ran the address space (another thread still in `exit_current`) is only
-  covered on arm64; on x86 it may keep stale user TLB entries until its
-  next CR3 load, but it no longer touches user memory (section 9).
+- Shared anonymous memory (`mm::shmem::Shmem`, Linux shmem): its page
+  index `Shmem.root` is a `spin::Mutex` taken by the fault path under
+  the mm lock (mm lock -> Shmem.root) and by MADV_REMOVE after the mm
+  lock is dropped; under it only `FRAME_ALLOCATOR` is taken (index
+  nodes are frames, no heap). The object goes with its last VMA
+  (possibly under the mm lock): its drop takes no lock but
+  `FRAME_ALLOCATOR`.
+- A SysV shm attachment (`ipc::shm::ShmAttach`, in its VMA) is cloned
+  and dropped with the VMA, possibly under the mm lock: it only updates
+  the segment's atomics (shm_nattch, times, pid), and destroying a
+  removed segment at the last detach takes no lock. IPC_RMID (mark
+  deleted, then read shm_nattch) and shmat (count the attachment, then
+  check the mark) order with SeqCst fences, so a racing shmat backs out
+  (EINVAL) or IPC_RMID sees it; destroy is idempotent, so namespace
+  totals are given back exactly once.
+- The page-fault path (`kernel/mm/fault.rs`, `handle_mm_fault`, shared by
+  both arches) holds the mm lock from the VMA lookup through the PTE
+  update (Linux: mmap_lock for read + the page table lock), so a fault
+  cannot race fork's copy, munmap or mprotect of its range: every user
+  PTE writer holds the mm lock (fault, fork's `copy_page_range`,
+  munmap/brk `munmap_locked`, mprotect, MADV_DONTNEED/REMOVE, mremap's
+  shrink and move (`mremap::move_prep`, `move_ptes`), a remote write's
+  `unshare_for_write`),
+  so no entry is read, released and written back around another's
+  change. Under it:
+  page-table and page allocation (`FRAME_ALLOCATOR`), a shared object's
+  `Shmem.root`, rmap/LRU; nothing that sleeps. It drops the lock only
+  to read data that may sleep or needs a lock ordered above it (a file
+  page: `pread`, or PAGE_CACHE for a ramfs page; a swap slot), then
+  looks the VMA up again and installs the PTE only if the VMA is
+  unchanged (else it drops the page and the access retries). Racing
+  faults on one page are safe: a missing table is installed with a
+  compare-and-swap (`pte_alloc`; the loser frees its frame) and a PTE is
+  set with a compare-and-swap against the value the fault read (Linux
+  pte_same), the loser dropping its page. No user memory is accessed
+  under the mm lock (a fault there would deadlock). The debug VMA/PTE
+  check (`mm::check::verify`, feature `mmcheck`) runs under it after
+  mprotect, munmap, mremap and madvise: it only reads, and takes no
+  lock. madvise holds the mm lock over its whole VMA walk (splits,
+  flag changes and zaps), and MADV_REMOVE punches the shared object's
+  holes only after dropping it. msync drops the mm lock around each
+  writeback (`fsync` sleeps; it holds a reference on the file) and
+  looks the next VMA up again after it (Linux msync); mincore copies
+  each chunk of its vector out with the mm lock dropped.
+- TLB after a PTE loses permission or its page: flushed before the mm
+  lock is released and before the old frame can be freed or written
+  through by another process, always in the address space that changed
+  (`mm::tlb`, see TLB Flushing below): fork write-protects the parent's
+  private PTEs and flushes each VMA's range (`flush_tlb_mm_range`)
+  before dropping the parent's lock (the child cannot run yet);
+  mprotect rewrites the range's PTEs (`mprotect::change_protection`),
+  then flushes the range before dropping the lock (its pages keep their
+  references); mremap's move flushes the old range the same way; a
+  copy-on-write break flushes the page it replaces (`flush_tlb_page`)
+  before dropping its reference; munmap, MADV_DONTNEED/REMOVE and exit
+  clear entries into a `Gather` (`mm/gather.rs`, Linux mmu_gather) that
+  flushes the whole range once per batch of 64 frames and only then
+  releases them (and, at exit, the page tables): no frame is reused
+  while a CPU may still reach it through its TLB. rmap flushes in the
+  chain's address space, not the one this CPU runs.
+- Break-before-make: a live entry is never overwritten by one mapping
+  another page or another size. A 2MB page split into a table
+  (`huge_page::split_huge_pmd`, Linux pmdp_invalidate) and a copy-on-write break
+  (`fault::replace_pte`, Linux ptep_clear_flush) first clear the entry
+  and flush its TLB entry, then write the new one (required on arm64,
+  ARM ARM D8.16; x86 needs it for the page-size change). In between
+  the address faults; the fault waits for the mm lock the writer holds,
+  then finds the new entry.
+- Teardown TLB: `exit_mmap` detaches the user half from the top-level
+  table (`paging::detach_user`) into a full-mm `Gather`, which flushes
+  the whole address space with its paging-structure caches
+  (`flush_tlb_mm`), then frees pages and tables (`UserTables::free`). A CPU that last ran the address space
+  (another thread still in `exit_current`) has it loaded until it
+  switches away, so the flush reaches it (arm64 broadcast; x86 see TLB
+  Flushing).
+
+#### TLB Flushing (kernel/mm/tlb.rs; arch/{x86_64,aarch64}/tlb.rs)
+
+No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
+
+- `Mm.ctx` (`MmContext`): `cpumask` (atomic bit per CPU that has the
+  address space loaded), `tlb_gen` (AtomicU64, bumped by every flush,
+  SeqCst: a full barrier after the PTE stores), `ctx_id` and the arch
+  part (arm64 ASID). Shared by every CPU: the cpumask and generation
+  must be seen by all flushers, as in Linux.
+- `TLB_STATE[cpu]` (`TlbState`, per CPU): `loaded_mm` (the `Mm` loaded,
+  0 for the kernel table, `SWITCHING` during a switch) and `loaded_gen`.
+  Written only by its own CPU with interrupts disabled (a switch, a
+  local flush, the flush IPI handler); never read by another CPU.
+- `switch_mm` (scheduler, before the register switch, rq lock held:
+  interrupts off; exec; init's first entry) follows Linux
+  switch_mm_irqs_off: `loaded_mm` = SWITCHING, the previous address
+  space's cpumask bit cleared (x86 without PCID: the CR3 write drops
+  all its entries), this CPU's bit set in the next one's, a full
+  barrier, `tlb_gen` read, the table loaded (x86 CR3; arm64 TTBR0),
+  then `loaded_mm`/`loaded_gen` set. A flusher that misses the bit made
+  its PTE change before its barrier, so the walk after the load sees
+  it. The loaded `Mm` stays alive until its CPU switched away: its task
+  (or an exited task's `DeadTask`, scheduler rule 8) holds an mm_count
+  reference until then, so a raw `loaded_mm` is safe to dereference
+  there.
+- A flush (`flush_tlb_mm_range`, `flush_tlb_page`, `flush_tlb_mm`)
+  bumps `tlb_gen` and, with interrupts disabled, brings this CPU up to
+  date if it has the address space loaded (`flush_func`: nothing if its
+  `loaded_gen` already covers the flush, a ranged flush if it misses
+  just this one, else all; ranges over `FLUSH_CEILING` pages flush
+  all). arm64 broadcasts instead (`tlbi vale1is` / `vae1is` when page
+  tables were freed, `vmalle1is` past the ceiling; the DSB ISH waits
+  for every CPU). On x86 the other CPUs of the cpumask are then sent
+  the flush and waited for (`smp_call_function_many`, Cross-CPU Calls:
+  the wait answers this CPU's own queue, so it may run with interrupts
+  off), their handler doing the same `flush_func`.
+- arm64 ASIDs (`mm/asid.rs`, `arch/aarch64/tlb.rs`, Linux
+  arch/arm64/mm/context.c): `MmContext.arch.id` (AtomicU64,
+  generation | ASID), per-CPU `active` / `flush_pending` atomics, and one
+  global **ASID lock** (`AsidAlloc.inner`, IrqSpinlock: bitmap,
+  `cur_idx`, per-CPU `reserved`). Global like Linux cpu_asid_lock: ASIDs
+  are one machine-wide namespace, and the lock is only taken on the
+  slow path (an address space's first switch in a generation, or a
+  rollover). Taken in `switch_mm` with the run-queue lock held, so
+  order: run-queue lock -> ASID lock; it is a leaf (nothing is taken
+  under it) and never taken in interrupt context. The fast path is a
+  compare-and-swap on this CPU's `active` entry, which a rollover zeroes
+  first (Linux check_and_switch_context). TTBR0 carries the ASID
+  (TCR.A1 = 0), user entries are nG, so a switch flushes nothing; a
+  rollover makes every CPU flush its own TLB before its next switch.
+  User flushes name the ASID (`tlbi vale1is/vae1is/aside1is`).
+  LOCKDEP builds allocate from 31 ASIDs, so the boot tests roll over
+  hundreds of times on real switches.
+- `flush_tlb_kernel_range` (ioremap/iounmap): arm64 `tlbi vaae1is`
+  (all CPUs); x86 every active CPU (`on_each_cpu`). Called with no lock
+  held.
+- Who may flush: thread context, never under an IrqSpinlock or a lock
+  another CPU spins on with interrupts off (Cross-CPU Calls). User
+  flushes run under the mm lock, so the mm lock's waiters poll their
+  call queue (`Mm::lock` spins with `sync::spin::lock_with`, answering
+  calls: Linux's mmap_lock sleeps instead) and nothing above the mm lock
+  in section 2 is held across a flush (callers hold at most the mm lock
+  and the VFS / IPC locks taken before it, none of which is spun on with
+  interrupts off). arm64 flushes never wait on another CPU's software.
+
+#### Cross-CPU Calls (kernel/smp.rs; arch/{x86_64,aarch64}/ipi.rs)
+
+No lock (Linux kernel/smp.c): `smp_call_function_many(mask, func,
+info, wait)` runs `func(info)` on other CPUs from their call-function
+IPI (x86 vector 0xfc, arm64 SGI 1); `on_each_cpu` adds this CPU;
+`smp_send_reschedule` (x86 0xfd, arm64 SGI 0) wakes a remote CPU after
+a remote wakeup was posted (`wake_up_task`).
+
+- `QUEUE[cpu]` (per CPU): the calls queued for a CPU, a lock-free list
+  (Linux llist). Senders push with a compare-and-swap (Release); only
+  the owner empties it, with one swap (Acquire), so there is no ABA
+  case and no lock: nothing to order against other locks, nothing to
+  disable for the push (an interrupt handler may push a reschedule
+  wakeup while the thread it interrupted pushes a call). A per-CPU
+  IrqSpinlock would also work but would make every sender of a many-CPU
+  shootdown contend on each target's lock with interrupts off. Only the
+  push onto an empty queue raises the IPI.
+- `CFD[sender][target]` (per sending CPU): the sender's call slots, one
+  per target (Linux cfd_data). A CPU makes one call at a time (thread
+  context, kernel not preemptive); a slot's `locked` flag (set by the
+  sender, cleared with Release by the target after `func` returned) is
+  waited for before the slot is reused and, with `wait`, before return.
+- `ACTIVE` (global `CpuMask`): CPUs that service IPIs, each set once at
+  boot after its interrupt controller is up and interrupts enabled
+  (`smp::set_active`, which then flushes its own TLB: a kernel-range
+  flush may have skipped it). Global: every sender needs every CPU's
+  state, and it changes once per CPU.
+- `func` runs in interrupt context with interrupts off (IPI handler, or
+  the sender's own wait loop): it may only touch atomics, per-CPU data
+  and IrqSpinlocks (7.4 applies).
+- **Rules** (a broken one is a deadlock): never call from interrupt
+  context or with an IrqSpinlock held (reported as `LOCKDEP:FAIL
+  smp_call_function_many in atomic context`); never with a lock held
+  that another CPU may spin on with interrupts off (TASK_TABLE: taken
+  under run-queue locks), as that CPU cannot answer. A call may be made
+  with interrupts off (x86 and arm64 syscalls run with them off): every
+  wait polls this CPU's own queue with interrupts off (`poll`), so two
+  CPUs calling each other, or a caller with interrupts off, make
+  progress. No CPU may spin-wait with interrupts off for a condition
+  another CPU sets only after its call returns, unless it polls its
+  queue.
 
 #### Kernel Page Tables (kernel half)
 
@@ -741,13 +921,11 @@ layout in `doc/MEMORY.md`
   taken in IRQ context). Under it `FRAME_ALLOCATOR` is taken for new
   table frames; `IOREMAP` is a leaf otherwise (Linux: `vmap_area_lock`
   + `init_mm.page_table_lock`).
-- TLB: ioremap/iounmap flush with `invlpg` (local) on x86 and
-  `tlbi vae1is` (broadcast) on arm64; x86 has no kernel TLB shootdown yet, so after
-  iounmap another CPU may still cache the old translation of a range
-  that is handed out again (gap vs Linux `flush_tlb_kernel_range`,
-  section 9; drivers do not iounmap in practice).
+- TLB: iounmap clears the entries and flushes every CPU
+  (`flush_tlb_kernel_range`, with `IOREMAP` not held) before the range
+  is freed; arm64 broadcasts, x86 sends IPIs.
 - User half: per address space, changed by its tasks under the mm lock
-  (the fault paths install PTEs after dropping it, see Address Spaces);
+  (the fault path, see Address Spaces);
   never contains a kernel mapping.
 
 #### Heap Allocator
@@ -808,6 +986,13 @@ The page cache uses a hierarchical locking model similar to Linux:
 **Key APIs:**
 - `find_or_create_page()` - Atomic find-or-create (fixes TOCTOU race)
 - `find_get_page()` - Lookup with refcount increment
+
+**Mapped ramfs pages (Linux filemap_fault):** a MAP_SHARED fault on a
+ramfs file (`InodeOps::map_page`) takes PAGE_CACHE with no other lock
+held and, still under it, a frame reference for the PTE
+(PAGE_CACHE -> FRAME_ALLOCATOR), so truncate or inode eviction, which
+drop only the cache's own reference (`FrameAlloc::put_frame`), cannot
+free a frame a mapping still uses.
 
 **Freeing ramfs pages (Linux evict_inode):** dropping a ramfs inode's
 `RamfsInodeData` (no directory entry, open file, mapping or dentry left)
@@ -2426,9 +2611,8 @@ Features present in Linux but not yet implemented in hk:
 | lockdep | Runtime deadlock detection | Not implemented | Manual ordering verification |
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
 | Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
-| Kernel TLB shootdown | `flush_tlb_kernel_range` IPIs | x86: local `invlpg` only | Stale ioremap translation on other CPUs after iounmap |
-| User TLB shootdown | `flush_tlb_mm_range` IPIs to `mm_cpumask` | x86: local `invlpg` / CR3 reload only (arm64 broadcasts `tlbi ...is`) | Another CPU running a thread of the same process may use a stale translation after munmap/mprotect/exit_mmap |
-| mmap_lock across faults | `mmap_read_lock` + PTE lock in the fault path | Fault drops the mm lock before installing the PTE | A fault can race munmap of the same range in another thread |
+| Lazy TLB, PCID, global pages | kernel threads keep the last user mm; PCID tags; PGE | Kernel threads load the kernel table; every CR3 write flushes all | More flushes on context switch (x86) |
+| mmap_lock across faults | `mmap_read_lock` + PTE lock in the fault path | The mm lock (a spinlock: exclusive, not shared) is held across the fault, except while reading a file page or swap slot (the VMA is revalidated after) | Faults in one address space are serialized; a swap-in can race munmap of its range (swap is inert) |
 
 ### Implications
 

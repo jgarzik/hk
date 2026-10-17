@@ -5,7 +5,9 @@
 //! - Phase 5: Poll and Timeout operations
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{sys_close, sys_io_uring_enter, sys_io_uring_setup, sys_pipe2, IoUringParams, IORING_SETUP_CLAMP};
+use hk_syscall::{
+    IORING_SETUP_CLAMP, IoUringParams, sys_close, sys_io_uring_enter, sys_io_uring_setup, sys_pipe2,
+};
 
 // Constants for future use in mmap-based SQE submission
 #[allow(dead_code)]

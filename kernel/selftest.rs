@@ -136,9 +136,202 @@ fn selftest_thread(_arg: usize) {
         check("icmp_lo_reply", left > 0, dst.to_u32() as u64);
     }
 
+    // 6. mremap's move allocates first: ENOMEM loses no page
+    if let Some(what) = crate::mm::mremap::selftest() {
+        check(what, false, 0);
+    }
+
+    // 7. Cross-CPU calls from every CPU at once: none lost, no deadlock
+    if let Err((what, n)) = ipi_stress() {
+        check(what, false, n);
+    }
+
+    // 8. A kernel mapping changed under another CPU's TLB: it reads the
+    //    new page after flush_tlb_kernel_range (LOCKDEP builds)
+    #[cfg(feature = "lockdep")]
+    if let Err((what, n)) = tlb_canary() {
+        check(what, false, n);
+    }
+
     if ok {
         printkln!("\nKSELFTEST:OK");
     }
+}
+
+/// Calls each stress thread makes to every other CPU
+const IPI_ROUNDS: u64 = 300;
+/// Calls run on each CPU by the stress test
+static IPI_RECV: [AtomicU64; crate::cpumask::NR_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpumask::NR_CPUS];
+/// Stress threads finished
+static IPI_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// One stress call: count it on the CPU running it
+fn ipi_count(_info: usize) {
+    let cpu = crate::task::percpu::current_cpu() as usize;
+    IPI_RECV[cpu].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A stress thread (one per CPU, all at once): rounds of calls to every
+/// other CPU, some without waiting, some with interrupts off (as from a
+/// syscall: the wait polls this CPU's own queue), then one call
+/// everywhere including here
+fn ipi_stress_thread(_arg: usize) {
+    use crate::arch::{local_irq_restore, local_irq_save};
+    use crate::smp::{active_cpus, on_each_cpu, smp_call_function_many};
+    let all = active_cpus();
+    for r in 0..IPI_ROUNDS {
+        let wait = r % 4 != 3 || r == IPI_ROUNDS - 1;
+        if r % 3 == 0 {
+            let irq = local_irq_save();
+            smp_call_function_many(&all, ipi_count, 0, wait);
+            local_irq_restore(irq);
+        } else {
+            smp_call_function_many(&all, ipi_count, 0, wait);
+        }
+    }
+    on_each_cpu(ipi_count, 0);
+    IPI_DONE.fetch_add(1, Ordering::Release);
+}
+
+/// Every active CPU calls every other one concurrently: each CPU must
+/// run exactly the calls sent to it, and all senders finish
+fn ipi_stress() -> Result<(), (&'static str, u64)> {
+    let cpus = crate::smp::active_cpus();
+    let n = cpus.iter().count() as u64;
+    if n < 2 {
+        return Ok(());
+    }
+    for c in &IPI_RECV {
+        c.store(0, Ordering::Relaxed);
+    }
+    IPI_DONE.store(0, Ordering::Relaxed);
+    for cpu in cpus.iter() {
+        kthread_run("ipi-stress", ipi_stress_thread, 0, Some(cpu))
+            .map_err(|e| ("ipi_stress_thread", e.errno() as u64))?;
+    }
+    // 10 s: a deadlock or a lost IPI leaves a thread waiting forever
+    for _ in 0..1000 {
+        if IPI_DONE.load(Ordering::Acquire) == n {
+            break;
+        }
+        sleep_ms(10);
+    }
+    let done = IPI_DONE.load(Ordering::Acquire);
+    if done != n {
+        return Err(("ipi_stress_hang", done));
+    }
+    let want = (n - 1) * IPI_ROUNDS + n;
+    for cpu in cpus.iter() {
+        let got = IPI_RECV[cpu as usize].load(Ordering::Relaxed);
+        if got != want {
+            return Err(("ipi_stress_count", got));
+        }
+    }
+    Ok(())
+}
+
+/// TLB canary: the page the reader reads, its progress, what it saw
+#[cfg(feature = "lockdep")]
+static CANARY_VA: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "lockdep")]
+static CANARY_PHASE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "lockdep")]
+static CANARY_SEEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "lockdep")]
+fn canary_read() -> u64 {
+    // SAFETY: the canary's mapped page
+    unsafe { core::ptr::read_volatile(CANARY_VA.load(Ordering::Acquire) as *const u64) }
+}
+
+/// Canary reader (another CPU): read the page often enough that its
+/// TLB caches the translation, then again after the remap. Spins with
+/// interrupts on, so the flush IPI reaches it.
+#[cfg(feature = "lockdep")]
+fn canary_reader(_arg: usize) {
+    let mut v = 0;
+    for _ in 0..1000 {
+        v = canary_read();
+    }
+    CANARY_SEEN[0].store(v, Ordering::Relaxed);
+    CANARY_PHASE.store(1, Ordering::Release);
+    while CANARY_PHASE.load(Ordering::Acquire) != 2 {
+        core::hint::spin_loop();
+    }
+    CANARY_SEEN[1].store(canary_read(), Ordering::Relaxed);
+    CANARY_PHASE.store(3, Ordering::Release);
+}
+
+/// Wait (sleeping) for the canary reader to reach `phase`, up to 5 s
+#[cfg(feature = "lockdep")]
+fn canary_wait(phase: u64) -> bool {
+    for _ in 0..500 {
+        if CANARY_PHASE.load(Ordering::Acquire) == phase {
+            return true;
+        }
+        sleep_ms(10);
+    }
+    false
+}
+
+/// A kernel page (ioremap window) read on another CPU, then pointed at
+/// another frame (`ioremap_retarget`: clear, flush_tlb_kernel_range,
+/// map): the reader must see the new frame. A missed cross-CPU flush
+/// leaves it reading the old one through its TLB (x86 under KVM).
+#[cfg(feature = "lockdep")]
+fn tlb_canary() -> Result<(), (&'static str, u64)> {
+    const OLD: u64 = 0x01d0_1d01_d01d_0001;
+    const NEW: u64 = 0x0ee0_0ee0_0ee0_0002;
+    let me = crate::task::percpu::current_cpu();
+    let Some(other) = crate::smp::active_cpus().iter().find(|&c| c != me) else {
+        return Ok(());
+    };
+    let fa = &crate::FRAME_ALLOCATOR;
+    let (Some(f1), Some(f2)) = (fa.alloc(), fa.alloc()) else {
+        return Err(("tlb_canary_alloc", 0));
+    };
+    // SAFETY: fresh frames, through the direct map
+    unsafe {
+        *(crate::arch::phys_to_virt(f1) as *mut u64) = OLD;
+        *(crate::arch::phys_to_virt(f2) as *mut u64) = NEW;
+    }
+    let r = canary_run(f1, f2, other);
+    fa.free(f1);
+    fa.free(f2);
+    match r? {
+        (OLD, NEW) => Ok(()),
+        (OLD, seen) => Err(("tlb_canary_stale", seen)),
+        (seen, _) => Err(("tlb_canary_first", seen)),
+    }
+}
+
+/// Map `f1`, have `cpu` read it, retarget to `f2`, have it read again:
+/// what it saw
+#[cfg(feature = "lockdep")]
+fn canary_run(f1: u64, f2: u64, cpu: u32) -> Result<(u64, u64), (&'static str, u64)> {
+    use crate::arch::{CurrentArch, IoremapOps};
+    let va = CurrentArch::ioremap(f1, 4096).map_err(|_| ("tlb_canary_ioremap", 0))? as u64;
+    CANARY_VA.store(va, Ordering::Release);
+    CANARY_PHASE.store(0, Ordering::Release);
+    let r = (|| {
+        kthread_run("tlb-canary", canary_reader, 0, Some(cpu))
+            .map_err(|e| ("tlb_canary_thread", e.errno() as u64))?;
+        if !canary_wait(1) {
+            return Err(("tlb_canary_hang", 1));
+        }
+        crate::arch::ioremap_retarget(va, f2).map_err(|_| ("tlb_canary_remap", 0))?;
+        CANARY_PHASE.store(2, Ordering::Release);
+        if !canary_wait(3) {
+            return Err(("tlb_canary_hang", 3));
+        }
+        Ok((
+            CANARY_SEEN[0].load(Ordering::Relaxed),
+            CANARY_SEEN[1].load(Ordering::Relaxed),
+        ))
+    })();
+    CurrentArch::iounmap(va as *mut u8, 4096);
+    r
 }
 
 /// Counts loop iterations, parking and stopping on request

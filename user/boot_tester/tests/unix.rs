@@ -5,12 +5,12 @@
 //! EPIPE/SIGPIPE, poll states, /proc/net/unix.
 
 use hk_syscall::{
-    sys_accept, sys_bind, sys_chmod, sys_connect, sys_exit, sys_fcntl, sys_fork,
-    sys_getpeername, sys_getpid, sys_getsockname, sys_ioctl, sys_listen, sys_mknod, sys_open,
-    sys_pipe, sys_read, sys_recvfrom, sys_rt_sigaction, sys_sendmsg, sys_sendto, sys_setresgid,
-    sys_setresuid, sys_shutdown, sys_socket, sys_socketpair, sys_stat, sys_umask,
-    sys_unlink, sys_wait4, sys_write, IoVec, MsgHdr, Stat, AF_UNIX, FIONREAD, O_RDONLY, SHUT_RD,
-    SHUT_WR, SIGPIPE, SIG_DFL, SIG_IGN, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM,
+    AF_UNIX, FIONREAD, IoVec, MsgHdr, O_RDONLY, SHUT_RD, SHUT_WR, SIG_DFL, SIG_IGN, SIGPIPE,
+    SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, Stat, sys_accept, sys_bind, sys_chmod,
+    sys_connect, sys_exit, sys_fcntl, sys_fork, sys_getpeername, sys_getpid, sys_getsockname,
+    sys_ioctl, sys_listen, sys_mknod, sys_open, sys_pipe, sys_read, sys_recvfrom, sys_rt_sigaction,
+    sys_sendmsg, sys_sendto, sys_setresgid, sys_setresuid, sys_shutdown, sys_socket,
+    sys_socketpair, sys_stat, sys_umask, sys_unlink, sys_wait4, sys_write,
 };
 
 use super::sk::*;
@@ -82,7 +82,10 @@ fn sun_path(p: &[u8]) -> Sun {
     let mut b = [0u8; 110];
     b[..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
     b[2..2 + p.len()].copy_from_slice(p);
-    Sun { b, len: (2 + p.len() + 1) as u32 }
+    Sun {
+        b,
+        len: (2 + p.len() + 1) as u32,
+    }
 }
 
 /// Abstract name: family + NUL + name (no terminator)
@@ -90,7 +93,10 @@ fn sun_abs(p: &[u8]) -> Sun {
     let mut b = [0u8; 110];
     b[..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
     b[3..3 + p.len()].copy_from_slice(p);
-    Sun { b, len: (3 + p.len()) as u32 }
+    Sun {
+        b,
+        len: (3 + p.len()) as u32,
+    }
 }
 
 fn ux(t: i32) -> i32 {
@@ -156,7 +162,10 @@ pub fn send_cmsg(fd: i32, data: &[u8], level: i32, ty: i32, payload: &[u8], flag
     ctl[8..12].copy_from_slice(&level.to_ne_bytes());
     ctl[12..16].copy_from_slice(&ty.to_ne_bytes());
     ctl[16..clen].copy_from_slice(payload);
-    let mut iov = IoVec { iov_base: data.as_ptr(), iov_len: data.len() };
+    let mut iov = IoVec {
+        iov_base: data.as_ptr(),
+        iov_len: data.len(),
+    };
     let mut m = MsgHdr::new(&mut iov, 1);
     m.msg_control = ctl.as_mut_ptr();
     m.msg_controllen = (clen + 7) & !7;
@@ -169,7 +178,14 @@ pub fn send_fds(fd: i32, data: &[u8], fds: &[i32]) -> i64 {
     for (i, f) in fds.iter().enumerate() {
         p[i * 4..i * 4 + 4].copy_from_slice(&f.to_ne_bytes());
     }
-    send_cmsg(fd, data, SOL_SOCKET, SCM_RIGHTS, &p[..fds.len() * 4], MSG_NOSIGNAL)
+    send_cmsg(
+        fd,
+        data,
+        SOL_SOCKET,
+        SCM_RIGHTS,
+        &p[..fds.len() * 4],
+        MSG_NOSIGNAL,
+    )
 }
 
 /// First fd of an SCM_RIGHTS message in `ctl[..len]` (-1 if none) and
@@ -202,7 +218,12 @@ struct SigAction {
 }
 
 fn sigpipe(handler: u64) {
-    let a = SigAction { handler, flags: 0, restorer: 0, mask: 0 };
+    let a = SigAction {
+        handler,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
     sys_rt_sigaction(SIGPIPE, &a as *const SigAction as u64, 0, 8);
 }
 
@@ -224,7 +245,10 @@ fn ucred(pid: i32, uid: u32, gid: u32) -> [u8; 12] {
 }
 
 fn msleep(ms: u64) {
-    let ts = hk_syscall::Timespec { tv_sec: 0, tv_nsec: (ms * 1_000_000) as i64 };
+    let ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: (ms * 1_000_000) as i64,
+    };
     hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
@@ -238,15 +262,39 @@ fn test_create() {
     for ty in [SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET] {
         let fd = ux(ty);
         t.ok(b"socket", fd >= 0, fd as i64);
-        t.eq(b"SO_TYPE", getint(fd, SOL_SOCKET, SO_TYPE).1 as i64, ty as i64);
-        t.eq(b"SO_DOMAIN", getint(fd, SOL_SOCKET, SO_DOMAIN).1 as i64, AF_UNIX as i64);
+        t.eq(
+            b"SO_TYPE",
+            getint(fd, SOL_SOCKET, SO_TYPE).1 as i64,
+            ty as i64,
+        );
+        t.eq(
+            b"SO_DOMAIN",
+            getint(fd, SOL_SOCKET, SO_DOMAIN).1 as i64,
+            AF_UNIX as i64,
+        );
         close(fd);
     }
     let raw = ux(3);
-    t.eq(b"raw is dgram", getint(raw, SOL_SOCKET, SO_TYPE).1 as i64, SOCK_DGRAM as i64);
+    t.eq(
+        b"raw is dgram",
+        getint(raw, SOL_SOCKET, SO_TYPE).1 as i64,
+        SOCK_DGRAM as i64,
+    );
     close(raw);
-    t.eq(b"protocol 1", { let f = sys_socket(AF_UNIX, SOCK_STREAM, 1); close(f as i32); f.min(0) }, 0);
-    t.eq(b"protocol 2", sys_socket(AF_UNIX, SOCK_STREAM, 2), EPROTONOSUPPORT);
+    t.eq(
+        b"protocol 1",
+        {
+            let f = sys_socket(AF_UNIX, SOCK_STREAM, 1);
+            close(f as i32);
+            f.min(0)
+        },
+        0,
+    );
+    t.eq(
+        b"protocol 2",
+        sys_socket(AF_UNIX, SOCK_STREAM, 2),
+        EPROTONOSUPPORT,
+    );
     t.eq(b"type RDM", sys_socket(AF_UNIX, 4, 0), ESOCKTNOSUPPORT);
     t.done();
 }
@@ -268,7 +316,11 @@ fn test_fs_bind() {
     t.eq(b"stat", r, 0);
     t.eq(b"S_IFSOCK", (mode & S_IFMT) as i64, S_IFSOCK as i64);
     t.eq(b"mode 0755", (mode & 0o777) as i64, 0o755);
-    t.eq(b"open ENXIO", sys_open(cpath(p).as_ptr(), O_RDONLY, 0), ENXIO);
+    t.eq(
+        b"open ENXIO",
+        sys_open(cpath(p).as_ptr(), O_RDONLY, 0),
+        ENXIO,
+    );
     let s2 = ux(SOCK_STREAM);
     t.eq(b"EADDRINUSE", ubind(s2, &a), EADDRINUSE);
     t.eq(b"rebind EINVAL", ubind(s, &sun_path(p2)), EINVAL);
@@ -277,7 +329,11 @@ fn test_fs_bind() {
     let (r, len, b) = uname(s, false);
     t.eq(b"getsockname", r, 0);
     t.eq(b"name len", len as i64, (2 + p.len() + 1) as i64);
-    t.ok(b"name bytes", &b[2..2 + p.len()] == p && b[2 + p.len()] == 0, b[2] as i64);
+    t.ok(
+        b"name bytes",
+        &b[2..2 + p.len()] == p && b[2 + p.len()] == 0,
+        b[2] as i64,
+    );
     sys_listen(s, 5);
     let c = ux(SOCK_STREAM);
     t.eq(b"connect", uconnect(c, &a), 0);
@@ -330,7 +386,11 @@ fn test_fs_connect_errors() {
     let f = sys_open(cpath(reg).as_ptr(), 0o101, 0o644);
     close(f as i32);
     sys_mknod(cpath(nod).as_ptr(), S_IFSOCK | 0o666, 0);
-    t.eq(b"mknod S_IFSOCK", (mode_of(nod).1 & S_IFMT) as i64, S_IFSOCK as i64);
+    t.eq(
+        b"mknod S_IFSOCK",
+        (mode_of(nod).1 & S_IFMT) as i64,
+        S_IFSOCK as i64,
+    );
     let d = ux(SOCK_DGRAM);
     ubind(d, &sun_path(dg));
     let i = ux(SOCK_STREAM);
@@ -341,10 +401,18 @@ fn test_fs_connect_errors() {
     t.eq(b"not listening", uconnect(c, &sun_path(idle)), ECONNREFUSED);
     t.eq(b"wrong type", uconnect(c, &sun_path(dg)), EPROTOTYPE);
     t.eq(b"missing", uconnect(c, &sun_path(b"/tmp/ux_none")), ENOENT);
-    t.eq(b"short addr", sys_connect(c, sun_path(dg).b.as_ptr(), 2), EINVAL);
+    t.eq(
+        b"short addr",
+        sys_connect(c, sun_path(dg).b.as_ptr(), 2),
+        EINVAL,
+    );
     t.eq(b"listen dgram", sys_listen(d, 1), EOPNOTSUPP);
     t.eq(b"listen unbound", sys_listen(c, 1), EINVAL);
-    t.eq(b"accept unlistened", sys_accept(i, core::ptr::null_mut(), core::ptr::null_mut()), EINVAL);
+    t.eq(
+        b"accept unlistened",
+        sys_accept(i, core::ptr::null_mut(), core::ptr::null_mut()),
+        EINVAL,
+    );
     for p in [reg, nod, dg, idle] {
         unlink(p);
     }
@@ -405,7 +473,11 @@ fn test_abstract() {
     t.eq(b"bind", ubind(l, &a), 0);
     let (_, len, b) = uname(l, false);
     t.eq(b"name len", len as i64, a.len as i64);
-    t.ok(b"name bytes", b[2] == 0 && &b[3..12] == b"hk-ux-abs", b[3] as i64);
+    t.ok(
+        b"name bytes",
+        b[2] == 0 && &b[3..12] == b"hk-ux-abs",
+        b[3] as i64,
+    );
     let l2 = ux(SOCK_STREAM);
     t.eq(b"EADDRINUSE", ubind(l2, &a), EADDRINUSE);
     let d = ux(SOCK_DGRAM);
@@ -417,7 +489,11 @@ fn test_abstract() {
     t.eq(b"seqpacket refused", uconnect(s, &a), ECONNREFUSED);
     // A shorter name is a different name
     let c2 = ux(SOCK_STREAM);
-    t.eq(b"prefix refused", uconnect(c2, &sun_abs(b"hk-ux-ab")), ECONNREFUSED);
+    t.eq(
+        b"prefix refused",
+        uconnect(c2, &sun_abs(b"hk-ux-ab")),
+        ECONNREFUSED,
+    );
     close(l);
     let l3 = ux(SOCK_STREAM);
     t.eq(b"free after close", ubind(l3, &a), 0);
@@ -440,7 +516,11 @@ fn test_autobind() {
     t.eq(b"bind family only", sys_bind(s, fam.as_ptr(), 2), 0);
     let (_, len, b) = uname(s, false);
     t.eq(b"len 8", len as i64, 8);
-    t.ok(b"format", b[2] == 0 && b[3..8].iter().all(|&c| is_hex(c)), b[3] as i64);
+    t.ok(
+        b"format",
+        b[2] == 0 && b[3..8].iter().all(|&c| is_hex(c)),
+        b[3] as i64,
+    );
     t.eq(b"bound again", ubind(s, &sun_abs(b"hk-ux-auto")), EINVAL);
     t.eq(b"autobind again", sys_bind(s, fam.as_ptr(), 2), 0);
     let srv = ux(SOCK_DGRAM);
@@ -479,7 +559,11 @@ fn test_names() {
     let (r, len, b) = uname(s, false);
     t.eq(b"unbound", r, 0);
     t.eq(b"len 2", len as i64, 2);
-    t.eq(b"family", u16::from_ne_bytes([b[0], b[1]]) as i64, AF_UNIX as i64);
+    t.eq(
+        b"family",
+        u16::from_ne_bytes([b[0], b[1]]) as i64,
+        AF_UNIX as i64,
+    );
     t.eq(b"no peer", uname(s, true).0, ENOTCONN_);
     let a = sun_abs(b"hk-ux-names");
     t.eq(b"addrlen 1", sys_bind(s, a.b.as_ptr(), 1), EINVAL);
@@ -514,7 +598,11 @@ fn test_socketpair() {
         close(sv[1]);
     }
     let mut sv = [-1i32; 2];
-    t.eq(b"protocol 2", sys_socketpair(AF_UNIX, SOCK_STREAM, 2, &mut sv), EPROTONOSUPPORT);
+    t.eq(
+        b"protocol 2",
+        sys_socketpair(AF_UNIX, SOCK_STREAM, 2, &mut sv),
+        EPROTONOSUPPORT,
+    );
     t.done();
 }
 
@@ -665,7 +753,11 @@ fn test_backlog() {
     let ln = ux(SOCK_STREAM | SOCK_NONBLOCK);
     ubind(ln, &sun_abs(b"hk-ux-backlog2"));
     sys_listen(ln, 4);
-    t.eq(b"accept EAGAIN", sys_accept(ln, core::ptr::null_mut(), core::ptr::null_mut()), EAGAIN);
+    t.eq(
+        b"accept EAGAIN",
+        sys_accept(ln, core::ptr::null_mut(), core::ptr::null_mut()),
+        EAGAIN,
+    );
     for f in [l, c1, c2, s1, s2, ln] {
         close(f);
     }
@@ -690,7 +782,11 @@ fn test_sndbuf() {
     }
     t.eq(b"EAGAIN", last, EAGAIN);
     t.ok(b"bounded", total > 0 && total <= 16384, total);
-    t.ok(b"SIOCOUTQ", ioctl_int(a, SIOCOUTQ).1 as i64 >= total, ioctl_int(a, SIOCOUTQ).1 as i64);
+    t.ok(
+        b"SIOCOUTQ",
+        ioctl_int(a, SIOCOUTQ).1 as i64 >= total,
+        ioctl_int(a, SIOCOUTQ).1 as i64,
+    );
     t.eq(b"FIONREAD", ioctl_int(b, FIONREAD as u64).1 as i64, total);
     t.eq(b"not writable", poll1(a, POLLOUT, 0).0, 0);
     let mut buf = [0u8; 2048];
@@ -700,7 +796,11 @@ fn test_sndbuf() {
     let ln = ux(SOCK_STREAM);
     ubind(ln, &sun_abs(b"hk-ux-sndbuf"));
     sys_listen(ln, 1);
-    t.eq(b"listener SIOCINQ", ioctl_int(ln, FIONREAD as u64).0, EINVAL);
+    t.eq(
+        b"listener SIOCINQ",
+        ioctl_int(ln, FIONREAD as u64).0,
+        EINVAL,
+    );
     for f in [a, b, ln] {
         close(f);
     }
@@ -719,7 +819,11 @@ fn test_dgram() {
         sys_sendto(c, m.as_ptr(), m.len(), 0, sa.b.as_ptr(), sa.len);
     }
     let mut buf = [0u8; 16];
-    t.eq(b"FIONREAD first", ioctl_int(srv, FIONREAD as u64).1 as i64, 1);
+    t.eq(
+        b"FIONREAD first",
+        ioctl_int(srv, FIONREAD as u64).1 as i64,
+        1,
+    );
     for want in 1..=3 {
         t.eq(b"boundary", recv(srv, &mut buf, 0), want);
     }
@@ -729,27 +833,55 @@ fn test_dgram() {
     t.eq(b"truncated", r, 4);
     t.ok(b"MSG_TRUNC flag", fl & MSG_TRUNC != 0, fl as i64);
     sys_sendto(c, b"0123456789".as_ptr(), 10, 0, sa.b.as_ptr(), sa.len);
-    t.eq(b"MSG_TRUNC real length", recv(srv, &mut buf[..4], MSG_TRUNC), 10);
+    t.eq(
+        b"MSG_TRUNC real length",
+        recv(srv, &mut buf[..4], MSG_TRUNC),
+        10,
+    );
     t.eq(b"rest discarded", recv(srv, &mut buf, MSG_DONTWAIT), EAGAIN);
     let x = sun_path(b"/tmp/ux_nowhere");
-    t.eq(b"ENOENT", sys_sendto(c, b"x".as_ptr(), 1, 0, x.b.as_ptr(), x.len), ENOENT);
+    t.eq(
+        b"ENOENT",
+        sys_sendto(c, b"x".as_ptr(), 1, 0, x.b.as_ptr(), x.len),
+        ENOENT,
+    );
     let y = sun_abs(b"hk-ux-nobody");
-    t.eq(b"ECONNREFUSED", sys_sendto(c, b"x".as_ptr(), 1, 0, y.b.as_ptr(), y.len), ECONNREFUSED);
+    t.eq(
+        b"ECONNREFUSED",
+        sys_sendto(c, b"x".as_ptr(), 1, 0, y.b.as_ptr(), y.len),
+        ECONNREFUSED,
+    );
     t.eq(b"ENOTCONN", send(c, b"x", 0), ENOTCONN_);
     let big = [0u8; 8192];
     setint(c, SOL_SOCKET, SO_SNDBUF, 1024);
-    t.eq(b"EMSGSIZE", sys_sendto(c, big.as_ptr(), 8192, 0, sa.b.as_ptr(), sa.len), EMSGSIZE);
+    t.eq(
+        b"EMSGSIZE",
+        sys_sendto(c, big.as_ptr(), 8192, 0, sa.b.as_ptr(), sa.len),
+        EMSGSIZE,
+    );
     // srv connected to another socket refuses c
     let other = ux(SOCK_DGRAM);
     let oa = sun_abs(b"hk-ux-dg-other");
     ubind(other, &oa);
     t.eq(b"connect", uconnect(srv, &oa), 0);
     let c2 = ux(SOCK_DGRAM);
-    t.eq(b"EPERM", sys_sendto(c2, b"x".as_ptr(), 1, 0, sa.b.as_ptr(), sa.len), EPERM);
-    t.eq(b"from peer ok", sys_sendto(other, b"y".as_ptr(), 1, 0, sa.b.as_ptr(), sa.len), 1);
+    t.eq(
+        b"EPERM",
+        sys_sendto(c2, b"x".as_ptr(), 1, 0, sa.b.as_ptr(), sa.len),
+        EPERM,
+    );
+    t.eq(
+        b"from peer ok",
+        sys_sendto(other, b"y".as_ptr(), 1, 0, sa.b.as_ptr(), sa.len),
+        1,
+    );
     let unspec = [0u8; 2];
     t.eq(b"AF_UNSPEC", sys_connect(srv, unspec.as_ptr(), 2), 0);
-    t.eq(b"after disconnect", sys_sendto(c2, b"x".as_ptr(), 1, 0, sa.b.as_ptr(), sa.len), 1);
+    t.eq(
+        b"after disconnect",
+        sys_sendto(c2, b"x".as_ptr(), 1, 0, sa.b.as_ptr(), sa.len),
+        1,
+    );
     for f in [srv, c, other, c2] {
         close(f);
     }
@@ -783,7 +915,11 @@ fn test_dgram_queue() {
     let mut buf = [0u8; 4];
     recv(srv, &mut buf, 0);
     let (n, ev) = poll1(c, POLLOUT, 1000);
-    t.ok(b"POLLOUT after read", n == 1 && ev & POLLOUT != 0, ev as i64);
+    t.ok(
+        b"POLLOUT after read",
+        n == 1 && ev & POLLOUT != 0,
+        ev as i64,
+    );
     t.eq(b"room again", send(c, b"m", MSG_DONTWAIT), 1);
     // A blocked sender is woken by the reader (child reads after 100 ms)
     let pid = sys_fork();
@@ -804,7 +940,11 @@ fn test_dgram_queue() {
     }
     let t0 = now_ms();
     let (n, ev) = poll1(c, POLLOUT, 5000);
-    t.ok(b"poll woken", n == 1 && ev & POLLOUT != 0 && now_ms() - t0 < 4000, ev as i64);
+    t.ok(
+        b"poll woken",
+        n == 1 && ev & POLLOUT != 0 && now_ms() - t0 < 4000,
+        ev as i64,
+    );
     wait_status(pid);
     for f in [srv, c] {
         close(f);
@@ -841,7 +981,11 @@ fn test_seqpacket() {
     t.eq(b"EPIPE", send(s, b"x", MSG_NOSIGNAL), EPIPE);
     let u = ux(SOCK_SEQPACKET);
     t.eq(b"send unconnected", send(u, b"x", 0), ENOTCONN_);
-    t.eq(b"recv unconnected", recv(u, &mut buf, MSG_DONTWAIT), ENOTCONN_);
+    t.eq(
+        b"recv unconnected",
+        recv(u, &mut buf, MSG_DONTWAIT),
+        ENOTCONN_,
+    );
     for f in [l, s, u] {
         close(f);
     }
@@ -928,7 +1072,11 @@ fn test_scm_rights() {
     let (r, fl, clen) = recv_msg(b, &mut buf, &mut ctl, 0);
     t.eq(b"recv", r, 1);
     let (fd, n) = got_fds(&ctl, clen);
-    t.ok(b"one fd", fd >= 0 && n == 1 && fl & MSG_CTRUNC == 0, fl as i64);
+    t.ok(
+        b"one fd",
+        fd >= 0 && n == 1 && fl & MSG_CTRUNC == 0,
+        fl as i64,
+    );
     t.eq(b"no cloexec", sys_fcntl(fd, F_GETFD, 0), 0);
     let mut data = [0u8; 8];
     t.eq(b"read pipe", sys_read(fd as u64, data.as_mut_ptr(), 8), 5);
@@ -1010,7 +1158,10 @@ fn test_inflight() {
         if sys_setresgid(USER, USER, USER) != 0 || sys_setresuid(USER, USER, USER) != 0 {
             sys_exit(90);
         }
-        let lim = hk_syscall::RLimit { rlim_cur: 16, rlim_max: 16 };
+        let lim = hk_syscall::RLimit {
+            rlim_cur: 16,
+            rlim_max: 16,
+        };
         hk_syscall::sys_setrlimit(hk_syscall::RLIMIT_NOFILE, &lim);
         let (a, b) = pair(SOCK_STREAM);
         let mut sent = 0;
@@ -1049,7 +1200,11 @@ fn test_peercred() {
     t.ok(b"pair", pid == me && uid == 0 && gid == 0, pid as i64);
     let s = ux(SOCK_STREAM);
     let (_, pid, uid, gid) = peercred(s);
-    t.ok(b"unconnected", pid == 0 && uid == u32::MAX && gid == u32::MAX, uid as i64);
+    t.ok(
+        b"unconnected",
+        pid == 0 && uid == u32::MAX && gid == u32::MAX,
+        uid as i64,
+    );
     let sa = sun_abs(b"hk-ux-cred");
     let l = listener(SOCK_STREAM, &sa, 5);
     let pid = sys_fork();
@@ -1066,7 +1221,11 @@ fn test_peercred() {
     }
     let acc = sys_accept(l, core::ptr::null_mut(), core::ptr::null_mut()) as i32;
     let (_, cp, cu, cg) = peercred(acc);
-    t.ok(b"accepted", cp as i64 == pid && cu == USER && cg == USER, cp as i64);
+    t.ok(
+        b"accepted",
+        cp as i64 == pid && cu == USER && cg == USER,
+        cp as i64,
+    );
     close(acc);
     t.eq(b"child", wait_status(pid) as i64, 0);
     for f in [a, b, s, l] {
@@ -1088,14 +1247,63 @@ fn test_scm_creds() {
     let mut ctl = [0u8; 64];
     let (_, _, clen) = recv_msg(b, &mut buf, &mut ctl, 0);
     let c = cmsg_find(&ctl, clen, SOL_SOCKET, SCM_CREDENTIALS);
-    t.ok(b"creds", c.is_some_and(|d| d == ucred(me, 0, 0)), clen as i64);
-    t.eq(b"own creds", send_cmsg(a, b"x", SOL_SOCKET, SCM_CREDENTIALS, &ucred(me, 0, 0), 0), 1);
+    t.ok(
+        b"creds",
+        c.is_some_and(|d| d == ucred(me, 0, 0)),
+        clen as i64,
+    );
+    t.eq(
+        b"own creds",
+        send_cmsg(a, b"x", SOL_SOCKET, SCM_CREDENTIALS, &ucred(me, 0, 0), 0),
+        1,
+    );
     recv_msg(b, &mut buf, &mut ctl, 0);
-    t.eq(b"bad length", send_cmsg(a, b"x", SOL_SOCKET, SCM_CREDENTIALS, &ucred(me, 0, 0)[..8], 0), EINVAL);
-    t.eq(b"uid -1", send_cmsg(a, b"x", SOL_SOCKET, SCM_CREDENTIALS, &ucred(me, u32::MAX, 0), 0), EINVAL);
-    t.eq(b"ESRCH", send_cmsg(a, b"x", SOL_SOCKET, SCM_CREDENTIALS, &ucred(0x3fff_fff0, 0, 0), 0), ESRCH);
-    t.eq(b"unknown type", send_cmsg(a, b"x", SOL_SOCKET, 99, &[0; 4], 0), EINVAL);
-    t.eq(b"other level ignored", send_cmsg(a, b"x", 0, 99, &[0; 4], 0), 1);
+    t.eq(
+        b"bad length",
+        send_cmsg(
+            a,
+            b"x",
+            SOL_SOCKET,
+            SCM_CREDENTIALS,
+            &ucred(me, 0, 0)[..8],
+            0,
+        ),
+        EINVAL,
+    );
+    t.eq(
+        b"uid -1",
+        send_cmsg(
+            a,
+            b"x",
+            SOL_SOCKET,
+            SCM_CREDENTIALS,
+            &ucred(me, u32::MAX, 0),
+            0,
+        ),
+        EINVAL,
+    );
+    t.eq(
+        b"ESRCH",
+        send_cmsg(
+            a,
+            b"x",
+            SOL_SOCKET,
+            SCM_CREDENTIALS,
+            &ucred(0x3fff_fff0, 0, 0),
+            0,
+        ),
+        ESRCH,
+    );
+    t.eq(
+        b"unknown type",
+        send_cmsg(a, b"x", SOL_SOCKET, 99, &[0; 4], 0),
+        EINVAL,
+    );
+    t.eq(
+        b"other level ignored",
+        send_cmsg(a, b"x", 0, 99, &[0; 4], 0),
+        1,
+    );
     recv_msg(b, &mut buf, &mut ctl, 0);
     let pid = sys_fork();
     if pid == 0 {
@@ -1106,10 +1314,26 @@ fn test_scm_creds() {
         if send_cmsg(a, b"x", SOL_SOCKET, SCM_CREDENTIALS, &ucred(me, 0, USER), 0) != EPERM {
             sys_exit(1);
         }
-        if send_cmsg(a, b"x", SOL_SOCKET, SCM_CREDENTIALS, &ucred(1, USER, USER), 0) != EPERM {
+        if send_cmsg(
+            a,
+            b"x",
+            SOL_SOCKET,
+            SCM_CREDENTIALS,
+            &ucred(1, USER, USER),
+            0,
+        ) != EPERM
+        {
             sys_exit(2);
         }
-        if send_cmsg(a, b"x", SOL_SOCKET, SCM_CREDENTIALS, &ucred(me, USER, USER), 0) != 1 {
+        if send_cmsg(
+            a,
+            b"x",
+            SOL_SOCKET,
+            SCM_CREDENTIALS,
+            &ucred(me, USER, USER),
+            0,
+        ) != 1
+        {
             sys_exit(3);
         }
         sys_exit(0);
@@ -1117,7 +1341,11 @@ fn test_scm_creds() {
     t.eq(b"non-root spoof", wait_status(pid) as i64, 0);
     let (_, _, clen) = recv_msg(b, &mut buf, &mut ctl, 0);
     let c = cmsg_find(&ctl, clen, SOL_SOCKET, SCM_CREDENTIALS);
-    t.ok(b"child creds", c.is_some_and(|d| d[4..] == ucred(0, USER, USER)[4..]), clen as i64);
+    t.ok(
+        b"child creds",
+        c.is_some_and(|d| d[4..] == ucred(0, USER, USER)[4..]),
+        clen as i64,
+    );
     // Without control space the credentials are truncated
     send(a, b"x", 0);
     let mut none = [0u8; 0];
@@ -1135,19 +1363,39 @@ fn test_poll() {
     let (a, b) = pair(SOCK_STREAM);
     t.eq(b"idle", poll1(a, all, 0).1 as i64, POLLOUT as i64);
     send(b, b"x", 0);
-    t.eq(b"readable", poll1(a, all, 0).1 as i64, (POLLIN | POLLOUT) as i64);
+    t.eq(
+        b"readable",
+        poll1(a, all, 0).1 as i64,
+        (POLLIN | POLLOUT) as i64,
+    );
     sys_shutdown(b, SHUT_WR);
-    t.eq(b"RDHUP", poll1(a, all, 0).1 as i64, (POLLIN | POLLOUT | POLLRDHUP) as i64);
+    t.eq(
+        b"RDHUP",
+        poll1(a, all, 0).1 as i64,
+        (POLLIN | POLLOUT | POLLRDHUP) as i64,
+    );
     close(b);
-    t.eq(b"HUP", poll1(a, all, 0).1 as i64, (POLLIN | POLLOUT | POLLRDHUP | POLLHUP) as i64);
+    t.eq(
+        b"HUP",
+        poll1(a, all, 0).1 as i64,
+        (POLLIN | POLLOUT | POLLRDHUP | POLLHUP) as i64,
+    );
     let s = ux(SOCK_STREAM);
-    t.eq(b"unconnected", poll1(s, all, 0).1 as i64, (POLLOUT | POLLHUP) as i64);
+    t.eq(
+        b"unconnected",
+        poll1(s, all, 0).1 as i64,
+        (POLLOUT | POLLHUP) as i64,
+    );
     let sa = sun_abs(b"hk-ux-poll");
     let l = listener(SOCK_STREAM, &sa, 5);
     t.eq(b"listener idle", poll1(l, all, 0).0, 0);
     let c = ux(SOCK_STREAM);
     uconnect(c, &sa);
-    t.eq(b"listener pending", poll1(l, all, 0).1 as i64, POLLIN as i64);
+    t.eq(
+        b"listener pending",
+        poll1(l, all, 0).1 as i64,
+        POLLIN as i64,
+    );
     for f in [a, s, l, c] {
         close(f);
     }
@@ -1176,12 +1424,27 @@ fn test_proc() {
     }
     close(f);
     let text = &buf[..n];
-    t.ok(b"header", text.starts_with(b"Num       RefCount Protocol Flags    Type St Inode Path\n"), n as i64);
-    let line = text.split(|&c| c == b'\n').find(|l| l.ends_with(b" /tmp/ux_proc"));
+    t.ok(
+        b"header",
+        text.starts_with(b"Num       RefCount Protocol Flags    Type St Inode Path\n"),
+        n as i64,
+    );
+    let line = text
+        .split(|&c| c == b'\n')
+        .find(|l| l.ends_with(b" /tmp/ux_proc"));
     t.ok(b"path line", line.is_some(), 0);
     // Flags __SO_ACCEPTCON, type 0001, state 01 (unconnected)
-    t.ok(b"listener fields", line.is_some_and(|l| contains(l, b" 00010000 0001 01 ")), 0);
-    t.ok(b"abstract", text.split(|&c| c == b'\n').any(|l| l.ends_with(b" @hk-ux-proc")), 0);
+    t.ok(
+        b"listener fields",
+        line.is_some_and(|l| contains(l, b" 00010000 0001 01 ")),
+        0,
+    );
+    t.ok(
+        b"abstract",
+        text.split(|&c| c == b'\n')
+            .any(|l| l.ends_with(b" @hk-ux-proc")),
+        0,
+    );
     unlink(p);
     close(l);
     close(d);

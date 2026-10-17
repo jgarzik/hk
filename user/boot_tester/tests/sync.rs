@@ -11,11 +11,12 @@
 //! - Test: membarrier() - memory barrier syscall
 //! - Test: readahead() - file readahead syscall
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_fdatasync, sys_fsync, sys_membarrier, sys_open, sys_readahead, sys_sync,
-    sys_syncfs, sys_unlink, sys_write, MEMBARRIER_CMD_GLOBAL, MEMBARRIER_CMD_PRIVATE_EXPEDITED,
-    MEMBARRIER_CMD_QUERY, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, O_CREAT, O_RDONLY, O_WRONLY,
+    MEMBARRIER_CMD_GLOBAL, MEMBARRIER_CMD_PRIVATE_EXPEDITED, MEMBARRIER_CMD_QUERY,
+    MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, O_CREAT, O_RDONLY, O_WRONLY, sys_close,
+    sys_fdatasync, sys_fsync, sys_membarrier, sys_open, sys_readahead, sys_sync, sys_syncfs,
+    sys_unlink, sys_write,
 };
 
 /// Run all sync tests
@@ -33,7 +34,6 @@ pub fn run_tests() {
 
 /// Test 63: sync() - synchronize all filesystems
 fn test_sync() {
-
     let ret = sys_sync();
     if ret == 0 {
         println(b"SYNC:OK");
@@ -45,7 +45,6 @@ fn test_sync() {
 
 /// Test 64: fsync() - synchronize a file's state to storage
 fn test_fsync() {
-
     let fsync_file = b"/fsync_test.txt\0";
     let fd = sys_open(fsync_file.as_ptr(), O_CREAT | O_WRONLY, 0o644);
     if fd < 0 {
@@ -70,7 +69,6 @@ fn test_fsync() {
 
 /// Test 65: fsync() on invalid fd should fail with EBADF
 fn test_fsync_ebadf() {
-
     let ret = sys_fsync(999);
     if ret == -9 {
         // EBADF
@@ -83,7 +81,6 @@ fn test_fsync_ebadf() {
 
 /// Test 66: fdatasync() - synchronize file data to storage
 fn test_fdatasync() {
-
     let fdatasync_file = b"/fdatasync_test.txt\0";
     let fd = sys_open(fdatasync_file.as_ptr(), O_CREAT | O_WRONLY, 0o644);
     if fd < 0 {
@@ -108,7 +105,6 @@ fn test_fdatasync() {
 
 /// Test 67: fdatasync() on invalid fd should fail with EBADF
 fn test_fdatasync_ebadf() {
-
     let ret = sys_fdatasync(999);
     if ret == -9 {
         // EBADF
@@ -121,7 +117,6 @@ fn test_fdatasync_ebadf() {
 
 /// Test 68: syncfs() - synchronize filesystem containing a file
 fn test_syncfs() {
-
     let syncfs_file = b"/syncfs_test.txt\0";
     let fd = sys_open(syncfs_file.as_ptr(), O_CREAT | O_WRONLY, 0o644);
     if fd < 0 {
@@ -146,7 +141,6 @@ fn test_syncfs() {
 
 /// Test 69: syncfs() on invalid fd should fail with EBADF
 fn test_syncfs_ebadf() {
-
     let ret = sys_syncfs(999);
     if ret == -9 {
         // EBADF
