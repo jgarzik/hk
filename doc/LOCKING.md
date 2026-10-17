@@ -149,7 +149,7 @@ user page faults, blocking pipe/socket I/O).
 
 **Used for:** `Inode.i_rwsem` (`RwSem`), `SuperBlock.s_vfs_rename_mutex`,
 `File.f_pos_lock`, RTNL (Linux rtnl_mutex), `TcpSock.rd`,
-`UnixSock.bindlock` and `UnixSock.iolock` (`Mutex`).
+`UnixSock.bindlock`, `UnixSock.iolock` and `Disk.open_mutex` (`Mutex`).
 
 ### 1.5 Lockdep-lite (`sync::lockdep`, feature `lockdep`)
 
@@ -268,6 +268,13 @@ Global subsystem locks (TASK_TABLE, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-s
 Address space: Mm lock (mmap_lock) → AnonVma, LRU  ← never nested with TASK_TABLE (3.2)
     ↓
 Memory allocator locks (FRAME_ALLOCATOR, heap)  ← NOT IRQ-safe
+
+Block locks (3.10 Block Device Subsystem):
+    Disk.open_mutex (sleeping) → BLKDEV_REGISTRY, MAJORS; I/O sleeps
+    under open_mutex only
+    blk-mq software queue, hardware queue (IrqSpinlock leaves; the
+    hardware queue also from the driver ISR, under IRQ_TABLE)
+    Completion.done (IrqSpinlock) → wait queue head → run-queue lock
 
 Network locks (3.10 Network Subsystem has the full order):
     RTNL (sleeping, outermost; never under any spinlock)
@@ -1021,6 +1028,11 @@ The page cache uses a hierarchical locking model similar to Linux:
 **Key APIs:**
 - `find_or_create_page()` - Atomic find-or-create (fixes TOCTOU race)
 - `find_get_page()` - Lookup with refcount increment
+
+**No writeback under PAGE_CACHE:** eviction (`evict_one`, PAGE_CACHE
+held) skips dirty pages; while every evictable page is dirty the cache
+may exceed its limit by an eighth, then allocation fails (ENOMEM). Dirty pages are written by the flusher, fsync and sync, which
+call `writepage` with no spinlock held (it does block I/O and sleeps).
 
 **Mapped ramfs pages (Linux filemap_fault):** a MAP_SHARED fault on a
 ramfs file (`InodeOps::map_page`) takes PAGE_CACHE with no other lock
@@ -2092,18 +2104,41 @@ IRQ-safe.
 
 #### Block Device Subsystem
 
-**Location:** `kernel/storage/`
+**Location:** `kernel/storage/` (`blkdev.rs`, `blk_mq.rs`, `genhd.rs`),
+`kernel/completion.rs`
 
-| Lock | Type | Purpose |
-|------|------|---------|
-| `BLKDEV_REGISTRY` | `RwLock<BlockDeviceRegistry>` | Device registration |
-| `RequestQueue.sched` | `Mutex<Box<dyn IoScheduler>>` | Per-queue scheduler |
-| `RequestQueue.disk` | `RwLock<Option<Arc<Disk>>>` | Back-reference |
-| `Disk.capacity_sectors` | `AtomicU64` | Lock-free capacity |
-| `BlockDevice.open_count` | `AtomicUsize` | Lock-free open count |
+Linux model (block/bio.c, blk-mq.c, genhd.c): a bio is submitted from
+thread context, the driver completes it from its interrupt handler and
+`bio_endio` runs `end_io` there (hardirq). `submit_bio_wait` sleeps on a
+`Completion` that `end_io` completes.
 
-**I/O Completion:** Bio completion callbacks are synchronous and must not acquire
-locks to avoid deadlock with the request queue.
+| Lock | Type | IRQ class | Order |
+|------|------|-----------|-------|
+| `Disk.open_mutex` | `sync::Mutex` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock: block device open/release; I/O, `BLKDEV_REGISTRY` and `MAJORS` may be taken under it |
+| `BLKDEV_REGISTRY` | spin `RwLock` (dev_t -> block device; global like Linux's bdev map) | thread only | leaf |
+| `MAJORS` | spin `Mutex` (block majors, register_blkdev) | thread only | leaf |
+| blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) | leaf: never taken with the hardware queue lock held |
+| blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list and the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock) | thread (dispatch) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep; taken under `IRQ_TABLE` in the ISR |
+| `Completion.done` | `IrqSpinlock<u32>` | any context | -> its wait queue head -> run-queue lock (the wakeup is issued under it, Linux complete()) |
+| `RamDisk.pages` | spin `Mutex` | thread only (bio-based driver) | leaf |
+
+Rules:
+
+- **end_io runs in hardirq context** (virtio-blk) or in the submitter's
+  thread (bio-based drivers: ramdisk, USB sd). It may only complete a
+  `Completion`, touch atomics and wake; the bios are ended after the
+  hardware queue lock is dropped, so `end_io` can resubmit.
+  `submit_bio_wait`'s `end_io` hands the bio back and completes last:
+  once `Completion::wait` returns the waker no longer touches the
+  waiter's stack.
+- **Polled completion before scheduling:** a `submit_bio_wait` before
+  scheduling runs (boot-time I/O) reaps the hardware queues itself
+  (`BlkMq::poll`, the same path as the ISR, serialized by the hardware
+  queue lock).
+- **Synchronous I/O sleeps:** `submit_bio_wait` and the `bdev_rw*`
+  helpers (vfat's block device pages, swap) are never called under a
+  spinlock. The page cache never writes a page back under `PAGE_CACHE`
+  (3.2 Page Cache): writepage sleeps on block I/O.
 
 #### Network Subsystem
 
@@ -2315,7 +2350,8 @@ see plan 3a).
    core IrqSpinlocks (`napi_schedule`, wait queues)
 2. **ISRs ack and defer** - never take a driver Mutex, defer to thread context
 3. **Atomics for hot paths** - Use atomics for frequently-accessed state
-4. **Completion callbacks are lock-free** - Don't acquire locks in bio/skb completion
+4. **Completion callbacks are IRQ-safe** - bio `end_io` runs in hardirq: only
+   atomics, `Completion::complete` and wakeups; skb completion takes no lock
 
 ---
 
@@ -2536,6 +2572,10 @@ percpu::preempt_enable();   // preempt_count--
   as above); a no-op while the NAPI is scheduled or disabled
 - Workqueues have no IRQ-side work: the worker thread promotes expired
   delayed work itself, sleeping with a timeout until the next deadline
+- Block completion (virtio-blk ISR): the blk-mq hardware queue lock
+  (`IrqSpinlock`, leaf) to reap the virtqueue and restart dispatch, then
+  `bio_endio` with no lock held; `end_io` completes a `Completion`
+  (`IrqSpinlock` -> wait queue wakeup); the lock-free DMA API unmaps
 - Set reschedule flags (atomic)
 - Read per-CPU data (via GS segment)
 
@@ -2584,6 +2624,8 @@ interrupt-safety invariant:
 | `RTNL` and every network `spin::Mutex`/`RwLock` | kernel/net/ | `sync::Mutex` / `Mutex` / `RwLock` | Configuration, sockets, tables, queues (3.10) |
 | Driver queue locks (e1000 / virtio-net `rx`, `tx`) | kernel/net/driver/ | `Mutex` | Rings: NAPI poll, xmit, open/stop |
 | `Softnet.backlog` | kernel/net/core/dev.rs | `Mutex` | `netif_rx` (lo), softnet |
+| `BLKDEV_REGISTRY`, `MAJORS`, `RamDisk.pages` | kernel/storage/ | `RwLock` / `Mutex` | Block device lookup, majors, RAM disk pages (3.10) |
+| `Disk.open_mutex` | kernel/storage/blkdev.rs | sleeping `sync::Mutex` | Block device open/release |
 | Sleeping locks (`sync::Mutex`, `RwSem`) | kernel/sync/ | sleeping | Never in IRQ or atomic context (`might_sleep`) |
 
 With `make check LOCKDEP=1` (1.5) every tracked spin lock taken in an

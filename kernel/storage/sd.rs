@@ -1,7 +1,9 @@
 //! SCSI Disk Driver (sd)
 //!
-//! Implements the BlockDriver trait for SCSI disks.
-//! Translates Bio requests into SCSI READ/WRITE commands.
+//! A bio-based driver: bios become synchronous SCSI READ(10)/WRITE(10)/
+//! SYNCHRONIZE CACHE commands in the submitter's thread context (the
+//! USB transport sleeps and takes the controller mutex). Disks are
+//! sda, sdb, ... on major 8 with 16 minors each (Linux sd).
 //!
 //! ## Device States (following Linux kernel scsi_device.h)
 //!
@@ -14,15 +16,16 @@
 //! - `TransportOffline` - Transport layer reports offline
 //! - `Block` - Device blocked for I/O
 
-use alloc::string::String;
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-use super::{
-    Bio, BioOp, BlockDevice, BlockDriver, DevId, Disk, QueueLimits, RequestQueue, major,
-    register_blkdev, unregister_blkdev,
+use super::blkdev::{
+    Bio, BioOp, BlockDevice, BlockDriver, DevId, Disk, QueueLimits, RequestQueue, SECTOR_SHIFT,
+    bio_endio, disk_bdevs, get_blkdev, major, register_blkdev,
 };
+use super::genhd::{add_disk, del_gendisk, disk_name};
 
 use crate::error::KernelError;
 
@@ -125,8 +128,16 @@ impl ScsiDisk {
         // Get capacity
         let cap = read_capacity(&host, target, lun)?;
 
+        // Device-reported geometry is untrusted (Linux sd_read_capacity):
+        // 512..4096-byte power-of-two sectors only; READ(10) addresses
+        // at most 2^32 blocks (last LBA 0xffffffff means "use READ
+        // CAPACITY(16)", which is not issued)
         let sector_size = cap.block_length();
-        let capacity_sectors = cap.total_blocks();
+        if !(512..=4096).contains(&sector_size) || !sector_size.is_power_of_two() {
+            crate::printkln!("SCSI: unsupported sector size {}", sector_size);
+            return Err(ScsiError::NotSupported);
+        }
+        let capacity_sectors = cap.total_blocks().min(u32::MAX as u64);
 
         Ok(Self {
             host,
@@ -267,209 +278,111 @@ impl ScsiDisk {
     }
 }
 
-/// SCSI Disk Driver implementing BlockDriver trait
+/// SCSI disk driver: the bio-based side of a [`ScsiDisk`]
 pub struct ScsiDiskDriver {
-    /// The underlying SCSI disk
     disk: Arc<ScsiDisk>,
 }
 
 impl ScsiDiskDriver {
-    /// Create a new SCSI disk driver
-    pub fn new(disk: Arc<ScsiDisk>) -> Arc<Self> {
-        Arc::new(Self { disk })
+    /// Run one bio; segments are consecutive on the disk
+    fn do_bio(&self, bio: &Bio) -> Result<(), KernelError> {
+        let ss = self.disk.sector_size() as u64;
+        if bio.op == BioOp::Flush {
+            return self.disk.sync_cache().map_err(|_| KernelError::Io);
+        }
+        let mut pos = bio.sector << SECTOR_SHIFT;
+        for seg in &bio.segs {
+            if !pos.is_multiple_of(ss) || !(seg.len as u64).is_multiple_of(ss) {
+                return Err(KernelError::Io);
+            }
+            let (lba, n) = (pos / ss, (seg.len as u64 / ss) as u32);
+            let p = unsafe { crate::arch::phys_to_virt(seg.frame).add(seg.offset) };
+            let r = if bio.op == BioOp::Write {
+                let buf = unsafe { core::slice::from_raw_parts(p as *const u8, seg.len) };
+                self.disk.write_sectors(lba, n, buf)
+            } else {
+                let buf = unsafe { core::slice::from_raw_parts_mut(p, seg.len) };
+                self.disk.read_sectors(lba, n, buf)
+            };
+            r.map_err(|_| KernelError::Io)?;
+            pos += seg.len as u64;
+        }
+        Ok(())
     }
 }
 
 impl BlockDriver for ScsiDiskDriver {
-    fn submit(&self, _blk_disk: &Disk, bio: Bio) {
-        let result = match bio.op {
-            BioOp::Read => self.handle_read(&bio),
-            BioOp::Write => self.handle_write(&bio),
-            BioOp::Flush => self.handle_flush(),
-        };
-
-        bio.complete(result);
-    }
-
-    fn name(&self) -> &str {
-        "sd"
-    }
-
-    fn readpage(&self, _blk_disk: &Disk, buf: &mut [u8], page_offset: u64) {
-        // Read a single page (4096 bytes = 8 sectors)
-        let lba = page_offset * 8; // page_offset is in pages, convert to 512-byte sectors
-        crate::printkln!(
-            "sd: readpage buf={:p} page_offset={} lba={}",
-            buf.as_ptr(),
-            page_offset,
-            lba
-        );
-
-        if let Err(e) = self.disk.read_sectors(lba, 8, buf) {
-            crate::printkln!("sd: readpage error: {:?}", e);
-            // On error, zero the page
-            buf.fill(0);
-        } else {
-            crate::printkln!("sd: readpage success");
-        }
-    }
-
-    fn writepage(&self, _blk_disk: &Disk, buf: &[u8], page_offset: u64) {
-        // Write a single page (4096 bytes = 8 sectors)
-        let lba = page_offset * 8; // page_offset is in pages, convert to 512-byte sectors
-
-        if let Err(e) = self.disk.write_sectors(lba, 8, buf) {
-            crate::printkln!("sd: writepage error: {:?}", e);
-        }
+    fn submit_bio(&self, mut bio: Box<Bio>) {
+        bio.status = self.do_bio(&bio);
+        bio_endio(bio);
     }
 }
 
-impl ScsiDiskDriver {
-    /// Handle a read bio
-    fn handle_read(&self, bio: &Bio) -> Result<(), KernelError> {
-        // For each segment in the bio, read the data
-        for seg in &bio.segs {
-            let buf = unsafe {
-                core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(seg.frame), seg.len)
-            };
+/// Minors per disk: the disk and 15 partitions (Linux SD_MINORS)
+const SD_MINORS: u16 = 16;
 
-            // Calculate LBA from bio.lba and segment offset
-            let sectors_per_seg = seg.len / 512;
-            self.disk
-                .read_sectors(bio.lba, sectors_per_seg as u32, buf)
-                .map_err(|_| KernelError::Io)?;
-        }
-        Ok(())
-    }
+/// Next disk index (sda = 0)
+static SD_INDEX: AtomicU32 = AtomicU32::new(0);
 
-    /// Handle a write bio
-    fn handle_write(&self, bio: &Bio) -> Result<(), KernelError> {
-        for seg in &bio.segs {
-            let buf = unsafe {
-                core::slice::from_raw_parts(
-                    crate::arch::phys_to_virt(seg.frame) as *const u8,
-                    seg.len,
-                )
-            };
-
-            let sectors_per_seg = seg.len / 512;
-            self.disk
-                .write_sectors(bio.lba, sectors_per_seg as u32, buf)
-                .map_err(|_| KernelError::Io)?;
-        }
-        Ok(())
-    }
-
-    /// Handle a flush bio
-    fn handle_flush(&self) -> Result<(), KernelError> {
-        self.disk.sync_cache().map_err(|_| KernelError::Io)
-    }
-}
-
-/// Create and register a SCSI disk device
-///
-/// # Arguments
-/// * `host` - SCSI host adapter (e.g., SAT layer)
-/// * `target` - Target ID
-/// * `lun` - Logical Unit Number
-/// * `minor` - Minor device number (0 for sd0, 1 for sd1, etc.)
-///
-/// # Returns
-/// The created BlockDevice on success
+/// Probe a SCSI target and add it as the next sdX disk
 pub fn create_scsi_disk(
     host: Arc<dyn ScsiHost>,
     target: u8,
     lun: u8,
-    minor: u16,
 ) -> Result<Arc<BlockDevice>, KernelError> {
-    // Probe the device
     let scsi_disk =
         Arc::new(ScsiDisk::probe(host, target, lun).map_err(|_| KernelError::NotFound)?);
-
-    // Create driver
-    let driver = ScsiDiskDriver::new(scsi_disk.clone());
-
-    // Determine sector size (use 512 for compatibility)
-    let sector_size = if scsi_disk.sector_size() == 512 {
-        512
-    } else {
-        // For 4K native drives, we still expose 512-byte sectors
-        // This is a simplification; real drivers handle this more carefully
-        512
+    let index = SD_INDEX.fetch_add(1, Ordering::Relaxed);
+    if index >= 16 {
+        return Err(KernelError::NoSpace);
+    }
+    register_blkdev(major::SCSI_DISK, "sd")?;
+    let ss = scsi_disk.sector_size();
+    let limits = QueueLimits {
+        logical_block_size: ss,
+        physical_block_size: ss,
+        ..QueueLimits::default()
     };
-
-    // Calculate capacity in 512-byte sectors
-    let capacity_sectors = scsi_disk.capacity_bytes() / 512;
-
-    // Create request queue
-    let queue = Arc::new(RequestQueue::new(driver.clone(), QueueLimits::default()));
-
-    // Create disk name
-    let name = match minor {
-        0 => String::from("sd0"),
-        1 => String::from("sd1"),
-        2 => String::from("sd2"),
-        3 => String::from("sd3"),
-        n => alloc::format!("sd{}", n),
-    };
-
-    // Create disk
-    let dev_id = DevId::new(major::SCSI_DISK, minor);
-    let disk = Disk::new(dev_id, name.clone(), capacity_sectors, sector_size, queue);
-
-    // Create block device
-    let bdev = Arc::new(BlockDevice::new(disk));
-
-    // Register globally
-    register_blkdev(dev_id, bdev.clone())?;
-
+    let q = RequestQueue::new_bio(
+        Arc::new(ScsiDiskDriver {
+            disk: scsi_disk.clone(),
+        }),
+        limits,
+        true,
+    );
+    let name = disk_name("sd", index);
+    let disk = Disk::new(
+        major::SCSI_DISK,
+        index as u16 * SD_MINORS,
+        SD_MINORS,
+        name.clone(),
+        scsi_disk.capacity_bytes() >> SECTOR_SHIFT,
+        q,
+    );
+    let bdev = add_disk(disk)?;
     crate::printkln!(
         "SCSI: {} ({} MB, {} byte sectors)",
         name,
         scsi_disk.capacity_bytes() / (1024 * 1024),
-        scsi_disk.sector_size()
+        ss
     );
-
     Ok(bdev)
 }
 
-/// Unregister a SCSI disk device (hotplug removal)
-///
-/// This function handles the removal sequence following Linux kernel patterns:
-/// 1. Transition device state to Cancel (stop accepting new I/O)
-/// 2. Transition device state to Del (final removal)
-/// 3. Unregister from block device registry (marks device dead)
-/// 4. Invalidate page cache entries for this device
-///
-/// # Arguments
-/// * `minor` - Minor device number of the disk to remove
-///
-/// # Returns
-/// * `Ok(())` - Device was successfully unregistered
-/// * `Err(KernelError::NotFound)` - No device with this minor number
-pub fn unregister_scsi_disk(minor: u16) -> Result<(), KernelError> {
-    let dev_id = DevId::new(major::SCSI_DISK, minor);
-
-    crate::printkln!(
-        "SCSI: Unregistering sd{} (major={}, minor={})",
-        minor,
-        major::SCSI_DISK,
-        minor
-    );
-
-    // Unregister from block device registry
-    // This calls mark_dead() which stops the request queue
-    let _bdev = unregister_blkdev(dev_id).ok_or(KernelError::NotFound)?;
-
-    // Invalidate page cache entries for this block device
-    // This frees all cached pages belonging to this device
-    let pages_freed = crate::invalidate_blkdev_pages(major::SCSI_DISK, minor);
-
-    crate::printkln!(
-        "SCSI: sd{} removed ({} cached pages freed)",
-        minor,
-        pages_freed
-    );
-
+/// Remove SCSI disk `index` (sda = 0) on hot unplug: its block devices
+/// fail I/O from now on and its cached pages are dropped
+pub fn unregister_scsi_disk(index: u16) -> Result<(), KernelError> {
+    let dev = DevId::new(major::SCSI_DISK, index * SD_MINORS);
+    let bdev = get_blkdev(dev).ok_or(KernelError::NotFound)?;
+    // The disk and each partition: unregistered (open files see a dead
+    // device, never a new one: indexes and minors are not reused) and
+    // their cached pages dropped
+    let all = disk_bdevs(&bdev.disk);
+    del_gendisk(&bdev.disk);
+    let mut freed = 0;
+    for b in &all {
+        freed += crate::invalidate_blkdev_pages(b.dev.major, b.dev.minor);
+    }
+    crate::printkln!("SCSI: {} removed ({} cached pages freed)", bdev.name, freed);
     Ok(())
 }

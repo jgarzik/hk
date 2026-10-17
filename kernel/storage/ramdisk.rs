@@ -1,194 +1,126 @@
-//! RAM Disk Driver
+//! RAM disk (Linux drivers/block/brd.c)
 //!
-//! Page-cache-backed RAM disk with zero-copy design.
+//! A bio-based driver: the disk's pages are frames allocated on first
+//! write and kept in a sparse map; reads of absent pages return zeros.
+//! Bios run in the submitter's thread context.
 //!
-//! ## Zero-Copy Architecture
+//! ## Locking
 //!
-//! The RAM disk uses the page cache pages directly as its backing store.
-//! There is no separate storage layer - the page cache IS the storage.
-//!
-//! ```text
-//! User buffer <-> Page cache page (which IS the RAM disk data)
-//! ```
-//!
-//! For RAM disk:
-//! - `can_writeback = false` prevents eviction of dirty pages
-//! - The page cache pages ARE the persistent storage
-//! - Bio operations are essentially no-ops (data already in page cache)
-//!
-//! ## Sparse Allocation
-//!
-//! Pages are allocated on-demand:
-//! - Read from unallocated page returns zeros
-//! - Write allocates the page in page cache
+//! `pages` (spin `Mutex`, thread context, leaf; Linux brd_pages
+//! xarray lock): held only to find or insert a frame, never across a
+//! copy into user memory (copies use kernel bounce buffers).
 
-use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::sync::Arc;
 
-use super::{
-    Bio, BioOp, BlockDevice, BlockDriver, DevId, Disk, QueueLimits, RequestQueue, major,
-    register_blkdev,
+use super::blkdev::{
+    Bio, BioOp, BlockDevice, BlockDriver, Disk, QueueLimits, RequestQueue, SECTOR_SHIFT, bio_endio,
+    major, register_blkdev,
 };
+use super::genhd::add_disk;
+use crate::arch::phys_to_virt;
 use crate::error::KernelError;
-use crate::frame_alloc::FrameAllocRef;
-use crate::mm::page_cache::{FileId, NULL_AOPS, PAGE_SIZE};
-use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
+use crate::sync::spin::Mutex;
 
-/// RAM disk driver
-///
-/// Implements BlockDriver for RAM disk. Since the page cache IS the storage,
-/// bio operations are essentially no-ops - the data is already where it needs to be.
-pub struct RamDiskDriver {
-    /// Capacity in bytes (for validation)
-    #[allow(dead_code)] // Reserved for future boundary checking
-    capacity_bytes: u64,
+const PAGE: u64 = 4096;
+
+/// RAM disk storage
+pub struct RamDisk {
+    pages: Mutex<BTreeMap<u64, u64>>,
 }
 
-impl RamDiskDriver {
-    /// Create a new RAM disk driver with given capacity
-    pub fn new(capacity_bytes: u64) -> Arc<Self> {
-        Arc::new(Self { capacity_bytes })
-    }
-}
-
-impl BlockDriver for RamDiskDriver {
-    fn submit(&self, _disk: &Disk, bio: Bio) {
-        // RAM disk I/O is a no-op - the page cache already holds the data!
-        // The bio segments point to page cache pages that ARE the storage.
-        //
-        // For real hardware drivers (AHCI, NVMe), this would:
-        // - Build DMA descriptors
-        // - Submit to hardware queues
-        // - Handle completion via interrupts
-        //
-        // For RAM disk, we just complete immediately with success.
-        let result = match bio.op {
-            BioOp::Read => Ok(()),  // Data already in page cache page
-            BioOp::Write => Ok(()), // Data already written to page cache page
-            BioOp::Flush => Ok(()), // No volatile cache to flush
-        };
-
-        // Call completion callback
-        bio.complete(result);
-    }
-
-    fn name(&self) -> &str {
-        "ramdisk"
-    }
-
-    fn readpage(&self, _disk: &Disk, buf: &mut [u8], _page_offset: u64) {
-        // For RAM disk, a read of an unallocated page returns zeros.
-        // The page cache will call this when populating a new page.
-        buf.fill(0);
-    }
-}
-
-/// Create and register a RAM disk
-///
-/// Creates a RAM disk with the specified capacity and registers it
-/// with the global block device registry.
-///
-/// # Arguments
-/// * `minor` - Minor device number (0 for rd0, 1 for rd1, etc.)
-/// * `capacity_mb` - Capacity in megabytes
-///
-/// # Returns
-/// The created BlockDevice on success
-pub fn create_ramdisk(minor: u16, capacity_mb: u64) -> Result<Arc<BlockDevice>, KernelError> {
-    let capacity_bytes = capacity_mb * 1024 * 1024;
-    let capacity_sectors = capacity_bytes / 512;
-
-    // Create driver
-    let driver = RamDiskDriver::new(capacity_bytes);
-
-    // Create request queue with default limits
-    let queue = Arc::new(RequestQueue::new(driver.clone(), QueueLimits::default()));
-
-    // Create disk
-    let dev_id = DevId::new(major::RAMDISK, minor);
-    let name = match minor {
-        0 => String::from("rd0"),
-        1 => String::from("rd1"),
-        2 => String::from("rd2"),
-        3 => String::from("rd3"),
-        n => alloc::format!("rd{}", n),
-    };
-
-    let disk = Disk::new(
-        dev_id,
-        name,
-        capacity_sectors,
-        512, // Logical block size
-        queue,
-    );
-
-    // Create block device
-    let bdev = Arc::new(BlockDevice::new(disk));
-
-    // Register globally
-    register_blkdev(dev_id, bdev.clone())?;
-
-    Ok(bdev)
-}
-
-/// Create a ramdisk populated with initial data
-///
-/// Creates a RAM disk and copies the provided data into its page cache pages.
-/// This is used to load filesystem images (like VFAT) into a block device.
-///
-/// # Arguments
-/// * `minor` - Minor device number (0 for rd0, 1 for rd1, etc.)
-/// * `data` - Source data to copy into the ramdisk
-///
-/// # Returns
-/// The created BlockDevice on success
-pub fn create_ramdisk_from_data(minor: u16, data: &[u8]) -> Result<Arc<BlockDevice>, KernelError> {
-    // Round up size to MB for capacity calculation
-    let size_bytes = data.len() as u64;
-    let size_mb = size_bytes.div_ceil(1024 * 1024);
-
-    // Create the empty ramdisk first
-    let bdev = create_ramdisk(minor, size_mb)?;
-    let file_id = FileId::from_blkdev(major::RAMDISK, minor);
-    let capacity = bdev.capacity();
-
-    // Copy data into page cache pages
-    let num_pages = data.len().div_ceil(PAGE_SIZE);
-
-    for page_idx in 0..num_pages {
-        let page_offset = page_idx as u64;
-
-        // Allocate page in cache
-        let mut cache = PAGE_CACHE.lock();
-        let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-        let page = cache
-            .add_page_zeroed(
-                file_id,
-                page_offset,
-                capacity,
-                &mut frame_alloc,
-                false, // can_writeback = false for ramdisk
-                false, // not unevictable (clean pages can be evicted)
-                &NULL_AOPS,
-            )
-            .map_err(|_| KernelError::Io)?;
-
-        // Copy data to the frame
-        let src_offset = page_idx * PAGE_SIZE;
-        let copy_len = core::cmp::min(PAGE_SIZE, data.len() - src_offset);
-
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr().add(src_offset),
-                crate::arch::phys_to_virt(page.frame),
-                copy_len,
-            );
+impl RamDisk {
+    /// Frame of page `idx`; allocated (zeroed) if `alloc`
+    fn page(&self, idx: u64, alloc: bool) -> Result<Option<u64>, KernelError> {
+        let mut p = self.pages.lock();
+        if let Some(&f) = p.get(&idx) {
+            return Ok(Some(f));
         }
-
-        // Mark the page as dirty since we wrote to it
-        page.mark_dirty();
+        if !alloc {
+            return Ok(None);
+        }
+        let f = crate::FRAME_ALLOCATOR
+            .alloc()
+            .ok_or(KernelError::OutOfMemory)?;
+        unsafe { core::ptr::write_bytes(phys_to_virt(f), 0, PAGE as usize) };
+        p.insert(idx, f);
+        Ok(Some(f))
     }
 
-    Ok(bdev)
+    /// Copy `len` bytes between disk byte `pos` and kernel memory `mem`
+    /// (`write`: from `mem` to the disk)
+    fn copy(&self, write: bool, pos: u64, mem: *mut u8, len: usize) -> Result<(), KernelError> {
+        let mut done = 0;
+        while done < len {
+            let at = pos + done as u64;
+            let off = (at % PAGE) as usize;
+            let n = (len - done).min(PAGE as usize - off);
+            let m = unsafe { mem.add(done) };
+            match self.page(at / PAGE, write)? {
+                Some(f) => unsafe {
+                    let d = phys_to_virt(f).add(off);
+                    if write {
+                        core::ptr::copy_nonoverlapping(m, d, n);
+                    } else {
+                        core::ptr::copy_nonoverlapping(d, m, n);
+                    }
+                },
+                None => unsafe { core::ptr::write_bytes(m, 0, n) },
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    fn do_bio(&self, bio: &Bio) -> Result<(), KernelError> {
+        if bio.op == BioOp::Flush {
+            return Ok(());
+        }
+        let mut pos = bio.sector << SECTOR_SHIFT;
+        for s in &bio.segs {
+            let mem = unsafe { phys_to_virt(s.frame).add(s.offset) };
+            self.copy(bio.op == BioOp::Write, pos, mem, s.len)?;
+            pos += s.len as u64;
+        }
+        Ok(())
+    }
+}
+
+impl BlockDriver for RamDisk {
+    fn submit_bio(&self, mut bio: Box<Bio>) {
+        bio.status = self.do_bio(&bio);
+        bio_endio(bio);
+    }
+}
+
+/// Create RAM disk `rd<minor>` of `bytes` bytes holding `data`
+fn create(minor: u16, bytes: u64, data: &[u8]) -> Result<Arc<BlockDevice>, KernelError> {
+    register_blkdev(major::RAMDISK, "ramdisk")?;
+    let rd = Arc::new(RamDisk {
+        pages: Mutex::new(BTreeMap::new()),
+    });
+    rd.copy(true, 0, data.as_ptr() as *mut u8, data.len())?;
+    let q = RequestQueue::new_bio(rd, QueueLimits::default(), false);
+    let disk = Disk::new(
+        major::RAMDISK,
+        minor,
+        1,
+        format!("rd{}", minor),
+        bytes >> SECTOR_SHIFT,
+        q,
+    );
+    add_disk(disk)
+}
+
+/// Create an empty RAM disk of `capacity_mb` MiB
+pub fn create_ramdisk(minor: u16, capacity_mb: u64) -> Result<Arc<BlockDevice>, KernelError> {
+    create(minor, capacity_mb << 20, &[])
+}
+
+/// Create a RAM disk holding `data` (a filesystem image), its size
+/// rounded up to a MiB
+pub fn create_ramdisk_from_data(minor: u16, data: &[u8]) -> Result<Arc<BlockDevice>, KernelError> {
+    create(minor, (data.len() as u64).next_multiple_of(1 << 20), data)
 }

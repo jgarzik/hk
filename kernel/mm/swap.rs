@@ -22,6 +22,10 @@ use crate::fs::{Inode, lookup_path};
 use crate::mm::page_cache::PAGE_SIZE;
 use crate::mm::swap_entry::{MAX_SWAPFILES, SwapEntry};
 use crate::storage::BlockDevice;
+use crate::storage::blkdev::{BioOp, bdev_rw, bdev_rw_frame};
+
+/// 512-byte sectors per page
+const SECTORS_PER_PAGE: u64 = (PAGE_SIZE / 512) as u64;
 use crate::task::{CAP_SYS_ADMIN, capable};
 use crate::uaccess::strncpy_from_user;
 
@@ -176,7 +180,6 @@ impl SwapInfo {
     }
 
     /// Create a new SwapInfo for a swap partition
-    #[allow(dead_code)]
     fn new_partition(
         bdev: Arc<BlockDevice>,
         path: Vec<u8>,
@@ -445,10 +448,14 @@ pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
             core::ptr::copy_nonoverlapping(buf.as_ptr(), dest, PAGE_SIZE);
         }
         Ok(())
-    } else if let Some(ref _bdev) = si.bdev {
-        // Swap partition: direct block device I/O
-        // TODO: implement direct block device read
-        Err(KernelError::Io.sysret())
+    } else if let Some(ref bdev) = si.bdev {
+        bdev_rw_frame(
+            bdev,
+            BioOp::Read,
+            page_offset * SECTORS_PER_PAGE,
+            frame_phys,
+        )
+        .map_err(|e| e.sysret())
     } else {
         Err(KernelError::InvalidArgument.sysret())
     }
@@ -485,10 +492,14 @@ pub fn swap_write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
             return Err(KernelError::Io.sysret());
         }
         Ok(())
-    } else if let Some(ref _bdev) = si.bdev {
-        // Swap partition: direct block device I/O
-        // TODO: implement direct block device write
-        Err(KernelError::Io.sysret())
+    } else if let Some(ref bdev) = si.bdev {
+        bdev_rw_frame(
+            bdev,
+            BioOp::Write,
+            page_offset * SECTORS_PER_PAGE,
+            frame_phys,
+        )
+        .map_err(|e| e.sysret())
     } else {
         Err(KernelError::InvalidArgument.sysret())
     }
@@ -548,14 +559,23 @@ pub fn sys_swapon(path_ptr: u64, swap_flags: i32) -> i64 {
         None => return KernelError::NotFound.sysret(),
     };
 
+    // A block device swaps through bios, a file through its inode
+    let bdev = if inode.mode().is_blkdev() {
+        match crate::storage::get_blkdev(inode.rdev) {
+            Some(b) => Some(b),
+            None => return KernelError::NoDeviceOrAddress.sysret(),
+        }
+    } else {
+        None
+    };
+
     // Read and validate swap header (page 0)
     let mut header_page = [0u8; PAGE_SIZE];
-    if inode
-        .i_op
-        .readpage(&inode, 0, &mut header_page)
-        .unwrap_or(0)
-        < PAGE_SIZE
-    {
+    let read = match &bdev {
+        Some(b) => bdev_rw(b, BioOp::Read, 0, &mut header_page).map(|_| PAGE_SIZE),
+        None => inode.i_op.readpage(&inode, 0, &mut header_page),
+    };
+    if read.unwrap_or(0) < PAGE_SIZE {
         return KernelError::InvalidArgument.sysret();
     }
 
@@ -585,9 +605,15 @@ pub fn sys_swapon(path_ptr: u64, swap_flags: i32) -> i64 {
     };
 
     // Create SwapInfo
-    let si = Arc::new(SwapInfo::new_file(
-        inode, path, swap_type, max_slots, priority,
-    ));
+    let si = Arc::new(match bdev {
+        Some(b) => {
+            // No slots past the end of the device (Linux read_swap_header)
+            let max_slots = max_slots.min(b.nr_sects() / SECTORS_PER_PAGE);
+            SwapInfo::new_partition(b, path, swap_type, max_slots, priority)
+        }
+        None => SwapInfo::new_file(inode, path, swap_type, max_slots, priority),
+    });
+    let max_slots = si.max_slots;
 
     // Register in global array
     {

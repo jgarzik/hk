@@ -13,6 +13,7 @@ extern crate alloc;
 pub mod acct;
 pub mod bus;
 pub mod chardev;
+pub mod completion;
 pub mod console;
 pub mod cpumask;
 pub mod dma;
@@ -900,19 +901,10 @@ fn kmain() -> ! {
     // PCI enumerate → xHCI matched → USB bus created → USB-Serial/USB-MSC matched
     bus_manager.enumerate_all(&mut frame_alloc);
 
-    // Create SCSI disk from USB MSC device if present
-    let scsi_disk_created = if let Some(handle) = bus_manager.find_device::<UsbMscDeviceHandle>() {
-        let scsi_host = handle.scsi_host();
-        match crate::storage::create_scsi_disk(scsi_host, 0, 0, 0) {
-            Ok(bdev) => {
-                ::core::mem::forget(bdev);
-                true
-            }
-            Err(_) => false,
-        }
-    } else {
-        false
-    };
+    // SCSI disk (sda) from a USB MSC device, if present
+    let scsi_disk_created = bus_manager
+        .find_device::<UsbMscDeviceHandle>()
+        .is_some_and(|h| crate::storage::create_scsi_disk(h.scsi_host(), 0, 0).is_ok());
 
     // ========================================================================
     // Phase 5: VFS Initialization

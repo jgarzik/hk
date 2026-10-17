@@ -1,9 +1,11 @@
 //! Storage stack
 //!
-//! Block device framework, SCSI command layer, and disk drivers.
+//! Block layer (bios, blk-mq-lite, disks, partitions), the SCSI command
+//! layer and the disk drivers.
 
-// Block device framework
+pub mod blk_mq;
 pub mod blkdev;
+pub mod genhd;
 pub mod ramdisk;
 
 // SCSI layer
@@ -11,17 +13,10 @@ pub mod ramdisk;
 pub mod scsi;
 pub mod sd;
 
-// Re-export block device types
 pub use blkdev::{
-    BLKDEV_REGISTRY, Bio, BioFlags, BioOp, BioSeg, BlockDevice, BlockDeviceRegistry, BlockDriver,
-    Disk, FifoScheduler, IoScheduler, QueueLimits, RequestQueue, SECTOR_SIZE, bytes_to_sectors,
-    get_blkdev, major, register_blkdev, sectors_to_bytes, unregister_blkdev,
+    BLKDEV_REGISTRY, Bio, BioOp, BioSeg, BlockDevice, BlockDriver, DevId, DevMajor, DevMinor, Disk,
+    QueueLimits, RequestQueue, SECTOR_SIZE, get_blkdev, major, register_blkdev,
 };
-pub use blkdev::{DevId, DevMajor, DevMinor};
-
-// Re-export ramdisk
-pub use ramdisk::{RamDiskDriver, create_ramdisk, create_ramdisk_from_data};
-
-// Re-export SCSI types
+pub use ramdisk::{create_ramdisk, create_ramdisk_from_data};
 pub use scsi::{Cdb, DataDirection, ScsiCommand, ScsiError, ScsiHost, ScsiResult};
 pub use sd::{ScsiDisk, create_scsi_disk};
