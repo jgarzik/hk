@@ -11,6 +11,7 @@ pub mod busybox;
 pub mod capabilities;
 pub mod cgroup;
 pub mod cloexec;
+pub mod close_range;
 pub mod clone3_syslog;
 pub mod dac;
 pub mod dirents;
@@ -123,6 +124,7 @@ pub fn run_all_tests() {
     stdio::run_tests();
     dirents::run_tests();
     cloexec::run_tests();
+    close_range::run_tests();
     append::run_tests();
     mountflags::run_tests();
     process::run_tests();

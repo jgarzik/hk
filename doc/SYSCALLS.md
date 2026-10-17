@@ -51,6 +51,7 @@
 - [x] open (x86-64 only, legacy; use openat)
 - [x] openat
 - [x] close
+- [x] close_range (CLOSE_RANGE_UNSHARE, CLOSE_RANGE_CLOEXEC)
 - [x] creat (x86-64 only, legacy; use openat with O_CREAT)
 - [x] dup
 - [x] dup2 (x86-64 only, legacy; use dup3)

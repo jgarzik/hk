@@ -867,6 +867,26 @@ impl<F> FdTable<F> {
         t
     }
 
+    /// Detach the open descriptors in `lo..=hi` (Linux __range_close):
+    /// only the open ones are visited, however wide the range
+    pub fn close_range(&mut self, lo: Fd, hi: Fd) {
+        let mut mid = self.files.split_off(&lo);
+        let mut flags = self.fd_flags.split_off(&lo);
+        if let Some(next) = hi.checked_add(1) {
+            self.files.append(&mut mid.split_off(&next));
+            self.fd_flags.append(&mut flags.split_off(&next));
+        }
+        self.dead.extend(mid.into_values());
+    }
+
+    /// Set FD_CLOEXEC on the open descriptors in `lo..=hi` (Linux
+    /// __range_cloexec)
+    pub fn cloexec_range(&mut self, lo: Fd, hi: Fd) {
+        for &fd in self.files.range(lo..=hi).map(|(fd, _)| fd) {
+            *self.fd_flags.entry(fd).or_insert(0) |= FD_CLOEXEC;
+        }
+    }
+
     /// Get the number of open file descriptors
     pub fn count(&self) -> usize {
         self.files.len()

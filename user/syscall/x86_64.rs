@@ -158,6 +158,7 @@ pub const SYS_READ: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_OPEN: u64 = 2;
 pub const SYS_CLOSE: u64 = 3;
+pub const SYS_CLOSE_RANGE: u64 = 436;
 pub const SYS_STAT: u64 = 4;
 pub const SYS_LSTAT: u64 = 6;
 pub const SYS_POLL: u64 = 7;
@@ -442,6 +443,12 @@ pub fn sys_open(path: *const u8, flags: u32, mode: u32) -> i64 {
 #[inline(always)]
 pub fn sys_close(fd: u64) -> i64 {
     unsafe { syscall1!(SYS_CLOSE, fd) }
+}
+
+/// close_range(fd, max_fd, flags)
+#[inline(always)]
+pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> i64 {
+    unsafe { syscall3!(SYS_CLOSE_RANGE, fd as u64, max_fd as u64, flags as u64) }
 }
 
 #[inline(always)]

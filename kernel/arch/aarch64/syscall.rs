@@ -49,6 +49,7 @@ pub const SYS_FCHMODAT2: u64 = 452;
 pub const SYS_FCHOWN: u64 = 55;
 pub const SYS_OPENAT: u64 = 56;
 pub const SYS_CLOSE: u64 = 57;
+pub const SYS_CLOSE_RANGE: u64 = 436;
 pub const SYS_GETDENTS64: u64 = 61;
 pub const SYS_LSEEK: u64 = 62;
 pub const SYS_READ: u64 = 63;
@@ -524,6 +525,7 @@ pub fn aarch64_syscall_dispatch(
         sys_chdir,
         sys_chroot,
         sys_close,
+        sys_close_range,
         sys_dup3,
         sys_faccessat,
         sys_faccessat2,
@@ -627,6 +629,7 @@ pub fn aarch64_syscall_dispatch(
         }
         SYS_OPENAT => sys_openat(arg0 as i32, arg1, arg2 as u32, arg3 as u32) as u64,
         SYS_CLOSE => sys_close(arg0 as i32) as u64,
+        SYS_CLOSE_RANGE => sys_close_range(arg0 as u32, arg1 as u32, arg2 as u32) as u64,
         SYS_LSEEK => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32) as u64,
         SYS_FTRUNCATE => sys_ftruncate(arg0 as i32, arg1 as i64) as u64,
         SYS_DUP3 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as u32) as u64,
