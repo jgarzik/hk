@@ -325,3 +325,81 @@ atomics. No such workaround exists in this tree: since the first commit
 `UsbMscDevice` keeps `slot_id`, `bulk_in_ep` and `bulk_out_ep` as plain
 fields, and the USB vfat boot tests (both arches) pass on them. Kept
 only as a pointer if wrong USB slot/endpoint values ever show up again.
+
+## P0 review findings (open)
+
+Found by the review of the P0 series; each confirmed against the code
+(and Linux 6.8 where semantics matter), none fixed yet. "Fix in" names
+the phase expected to fix it; "next batch" means the next fix batch.
+
+1. **Rename leaves stale dentries; the trap is bypassed** (fix in
+   V1/V2, d_move). `kernel/fs/link.rs:593`: after a rename both
+   dentries are only `remove_child`'d, so a dentry pinned by a cwd or
+   fd keeps its old parent chain; `is_subdir`/`lock_rename`
+   (`kernel/fs/mod.rs:150`) compare with `Arc::ptr_eq`. Scenario:
+   `mkdir -p /t/a/b; cd /t/a/b; mv /t/a /t/c; rename("/t/c", "z")`
+   moves c under its own child (Linux: EINVAL). Fix: Linux d_move /
+   d_exchange (dentry name under `d_lock`); vfat must then update the
+   moved inode's `parent_cluster`/`short_name` (fs rename needs the
+   source inode).
+2. **process_vm on own process fails from a sibling thread** (next
+   batch). `kernel/task/process_vm.rs:310` exempts only
+   `target_tid == current_tid()`; Linux mm_access exempts the caller's
+   own mm and `__ptrace_may_access` the thread group. Scenario: a
+   non-dumpable uid-1000 process; its second thread gets EPERM from
+   `process_vm_readv(getpid())`.
+3. **Dumpability is per task, not per mm** (fix in P3, mm rework).
+   `prctl.dumpable` (`kernel/task/mod.rs`, read at
+   `kernel/task/ptrace.rs:912`, `kernel/fs/procfs.rs` dump_owner); Linux
+   keeps it in mm->flags. Scenario: thread B calls
+   `PR_SET_DUMPABLE 0`; thread A still reads 1 and the process stays
+   attachable/readable via the leader.
+4. **Context switch scans TASK_TABLE for /proc state** (fix in P7, SMP
+   scheduler). `kernel/task/percpu.rs:1815` switch_info does two extra
+   linear scans under the global TASK_TABLE lock per switch, only to
+   record Running/Ready/Sleeping; a woken task shows S until it runs.
+   Fix: per-task atomic run state shared with the rq entry, read by
+   /proc.
+5. **doc/LOCKING.md:596 is wrong**: /proc/<pid>/exe goes through
+   mm_access (since eb8c6b6) and takes `exec_update` for reading, not
+   "neither lock" (next batch).
+6. **linkat AT_EMPTY_PATH capability check only for empty paths**
+   (next batch). `kernel/fs/link.rs:220`: Linux 6.8 do_linkat returns
+   ENOENT for AT_EMPTY_PATH without CAP_DAC_READ_SEARCH whatever the
+   path. Scenario: unprivileged `linkat(AT_FDCWD, "f", AT_FDCWD, "g",
+   AT_EMPTY_PATH)` succeeds on hk, ENOENT on Linux.
+7. **comm bytes >= 0x80 re-encoded as UTF-8** (next batch).
+   `kernel/fs/proc_array.rs:137` pushes `b as char`; Linux
+   proc_task_name emits raw bytes (status escapes only `\n` and `\\`).
+   Scenario: `PR_SET_NAME "\xe9"`; stat/status show `\xc3\xa9`.
+8. **init has no argv/envp/auxv** (next batch). `kernel/main.rs:1149`:
+   init's stack is zeroed (argc 0, no auxv) and its mm has no
+   arg/env/start_stack layout, so /proc/1/cmdline and environ are
+   empty. Linux run_init_process: argv { "/bin/init" }, envp
+   { "HOME=/", "TERM=linux" }. Fix: build it with exec's stack builder.
+9. **ptrace "init only with CAP_SYS_PTRACE" guard is wrong** (next
+   batch). `kernel/task/ptrace.rs:179` tests `target_tid == 1`, which
+   is the idle thread (init is tid 2); Linux has no such rule.
+   ptrace_attach should instead refuse kernel threads and the caller's
+   own thread group (EPERM); hk refuses only the calling thread.
+10. **/proc/<pid>/* owner not refreshed on stat** (fix in V2).
+    `kernel/fs/procfs.rs:365`: the owner (task_dump_owner) is updated
+    at lookup and in permission() only; Linux pid_revalidate updates it
+    on every walk. Scenario: stat environ of a uid-1000 child, child
+    sets `PR_SET_DUMPABLE 0`, stat again: hk still says uid 1000
+    (Linux 0).
+11. **Mounts in link.rs** (from the security review).
+    (a) (next batch) rename, rmdir and unlink never check for a
+    mountpoint (`kernel/fs/link.rs:525` rename_locked,
+    `kernel/fs/path.rs:248`); Linux returns EBUSY for a mounted-on
+    source or target. Scenario: mount ramfs on /tmp/m; `rmdir`,
+    `rename` of /tmp/m, or renaming another dir onto it, orphans the
+    mount. (Code reading; not yet test-verified.)
+    (b) (fix in V1) EXDEV compares superblocks, not mounts
+    (`kernel/fs/link.rs:298`, `:484`): a link or rename across two
+    mounts of one superblock (bind mounts) is EXDEV on Linux. Needs
+    Path{mnt,dentry}; TODO in place for linkat.
+    (c) Checked, no gap: rename's may_delete on both sides and the
+    write check on a directory changing parent match vfs_rename,
+    including EXCHANGE; linkat's missing may_linkat is
+    fs.protected_hardlinks, whose kernel default is 0.
