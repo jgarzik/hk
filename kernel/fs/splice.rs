@@ -252,26 +252,6 @@ impl Pipe {
 }
 
 // =============================================================================
-// Pipe extraction from FileOps
-// =============================================================================
-
-impl PipeReadFileOps {
-    /// Get the underlying pipe for splice operations
-    pub fn get_pipe(&self) -> &Arc<Pipe> {
-        // Access the pipe field - we need to make it accessible
-        // This requires the pipe field to be public or have a getter
-        &self.pipe
-    }
-}
-
-impl PipeWriteFileOps {
-    /// Get the underlying pipe for splice operations
-    pub fn get_pipe(&self) -> &Arc<Pipe> {
-        &self.pipe
-    }
-}
-
-// =============================================================================
 // Helper: Extract pipe from file if it's a pipe
 // =============================================================================
 
@@ -281,17 +261,11 @@ fn get_pipe_from_fd(fd: i32) -> Option<Arc<Pipe>> {
     let fd_table = get_task_fd(tid)?;
     let file = fd_table.lock().get(fd)?;
 
-    // Try pipe read end
-    if let Some(pipe_ops) = file.f_op.as_any().downcast_ref::<PipeReadFileOps>() {
-        return Some(Arc::clone(pipe_ops.get_pipe()));
+    let ops = file.f_op.as_any();
+    if !ops.is::<PipeReadFileOps>() && !ops.is::<PipeWriteFileOps>() {
+        return None;
     }
-
-    // Try pipe write end
-    if let Some(pipe_ops) = file.f_op.as_any().downcast_ref::<PipeWriteFileOps>() {
-        return Some(Arc::clone(pipe_ops.get_pipe()));
-    }
-
-    None
+    file.private_arc::<Pipe>()
 }
 
 /// Check if fd is a pipe (either read or write end)

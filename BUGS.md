@@ -189,18 +189,6 @@ not sleep (`make check LOCKDEP=1` reports one that does). There are no
 `_killable`/`_interruptible`/`try` variants of the sleeping locks yet
 (no callers need them).
 
-## Pipes leak their file operations
-
-**Location**: `kernel/pipe.rs` (`create_pipe`)
-
-`File.f_op` is a `&'static dyn FileOps`, so `create_pipe` `Box::leak`s
-the read and write ops of every pipe, and with them the `Arc<Pipe>`
-they hold: each pipe's state stays allocated forever (about 600 bytes of
-kernel heap). A loop creating pipes exhausts the heap within a few
-thousand (found by the network stress test, which therefore passes
-socket pairs, not pipes, over SCM_RIGHTS). Fix: owned file ops
-(`Arc<dyn FileOps>`) or per-file private data, as Linux does.
-
 ## Mount flag gaps
 
 **Location**: `kernel/fs/misc.rs` sys_mount/sys_umount2, `kernel/fs/mount.rs`

@@ -20,6 +20,7 @@ pub mod eventfd;
 pub mod fanotify;
 pub mod fault_signals;
 pub mod fcntl_owner;
+pub mod fd_leak;
 pub mod file_io;
 pub mod flock;
 pub mod fork_mm;
@@ -148,6 +149,7 @@ pub fn run_all_tests() {
     isolated(b"ELF_EXEC", elf_exec::run_tests);
     isolated(b"PROCFS_ACCESS", procfs_access::run_tests);
     isolated(b"NPROC", nproc::run_tests);
+    isolated(b"FD_LEAK", fd_leak::run_tests);
     rlimit::run_tests();
     namespace::run_tests();
     sockets::run_tests();
