@@ -198,6 +198,10 @@ enable_mmu:
     orr     x1, x1, #(1 << 0)           /* M: MMU */
     orr     x1, x1, #(1 << 2)           /* C: data cache */
     orr     x1, x1, #(1 << 12)          /* I: instruction cache */
+    /* EL0 cache ops like Linux INIT_SCTLR_EL1_MMU_ON (__clear_cache, memset) */
+    orr     x1, x1, #(1 << 14)          /* DZE: DC ZVA */
+    orr     x1, x1, #(1 << 15)          /* UCT: CTR_EL0 reads */
+    orr     x1, x1, #(1 << 26)          /* UCI: DC CVAU/CIVAC/CVAC, IC IVAU */
     msr     sctlr_el1, x1
     isb
     ret

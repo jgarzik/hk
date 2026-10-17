@@ -33,6 +33,8 @@ pub fn run_tests() {
     expect(b"TLB_EXEC_COW", exec_cow, 42);
     expect(b"TLB_EXEC_MUNMAP_SEGV", exec_munmap, SIGSEGV);
     expect(b"TLB_EXEC_HUGE_REWRITE", exec_huge_rewrite, 0);
+    #[cfg(target_arch = "aarch64")]
+    expect(b"TLB_EL0_DC_ZVA", dc_zva, 0);
 }
 
 /// Run `f` in a child: it must exit with `want`, or die of signal
@@ -269,14 +271,52 @@ fn put_ret(a: u64, v: u8) {
     for (i, w) in [movz, 0xd65f_03c0].iter().enumerate() {
         unsafe { core::ptr::write_volatile((a + 4 * i as u64) as *mut u32, *w) };
     }
+    clear_cache(a, 8);
+}
+
+/// Make code this process wrote visible to instruction fetch, as a JIT
+/// must (__clear_cache): Linux only syncs pages the kernel fills, so on
+/// real hardware a user rewrite of code needs this on both kernels
+#[cfg(target_arch = "aarch64")]
+fn clear_cache(a: u64, len: u64) {
+    let ctr: u64;
+    unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+    let (dline, iline) = (4u64 << ((ctr >> 16) & 0xf), 4u64 << (ctr & 0xf));
+    for va in ((a & !(dline - 1))..a + len).step_by(dline as usize) {
+        unsafe { core::arch::asm!("dc cvau, {}", in(reg) va, options(nostack)) };
+    }
+    unsafe { core::arch::asm!("dsb ish", options(nostack)) };
+    for va in ((a & !(iline - 1))..a + len).step_by(iline as usize) {
+        unsafe { core::arch::asm!("ic ivau, {}", in(reg) va, options(nostack)) };
+    }
+    unsafe { core::arch::asm!("dsb ish", "isb", options(nostack)) };
+}
+
+/// DC ZVA from EL0 zeroes one block (glibc memset uses it; Linux sets
+/// SCTLR_EL1.DZE): 0 if it did, or if DCZID_EL0 forbids it
+#[cfg(target_arch = "aarch64")]
+fn dc_zva() -> i64 {
+    let id: u64;
+    unsafe { core::arch::asm!("mrs {}, dczid_el0", out(reg) id, options(nomem, nostack)) };
+    if id & 0x10 != 0 {
+        return 0;
+    }
+    let bs = 4u64 << (id & 0xf);
+    let a = map(4096, RW);
+    for off in (0..4096).step_by(8) {
+        put(a + off, u64::MAX);
+    }
+    unsafe { core::arch::asm!("dc zva, {}", in(reg) a, options(nostack)) };
+    let zeroed = (0..bs).step_by(8).all(|off| get(a + off) == 0);
+    if zeroed && get(a + bs) == u64::MAX { 0 } else { 1 }
 }
 
 /// Code written at the start, middle and end of a 2MB-aligned region
 /// (a 2MB page on hk with MADV_HUGEPAGE) while it is not executable,
 /// then mprotect'ed executable and run; rewritten with other values
 /// (writable again), made executable again, run again: every function
-/// returns what it was last written to return (the kernel syncs the
-/// instruction caches over all 2MB when it becomes executable)
+/// returns what it was last written to return (protection changes and
+/// TLB flushes cover all 2MB; user writes are synced by `clear_cache`)
 fn exec_huge_rewrite() -> i64 {
     const HUGE: u64 = 2 << 20;
     const MADV_HUGEPAGE: i32 = 14;
