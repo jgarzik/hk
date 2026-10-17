@@ -307,6 +307,16 @@ every TCP TIME_WAIT entry keeps a full control block (about 2 KB) for
 60 s, so a burst of a thousand short connections can starve a later 2 MB
 allocation (busybox exec); the stress test bounds its connections.
 
+exec reads the whole binary into one heap block (`kernel/exec.rs`
+`read_file_contents`): busybox needs a 2.1MB contiguous allocation, and
+by the BUSYBOX group the free heap (~3.2MB on x86) is fragmented, so
+whether it fits depends on layout. x86 `make check LOCKDEP=1` once
+panicked there ("memory allocation of 2124608 bytes failed") after a
+test group was added. Fix: map the binary from the page cache instead
+of copying it to the heap. Each new pid that opens `/proc/self/...`
+also keeps ~1.6-2.9KB of heap after exit (suspected: procfs dentries of
+dead pids never freed; unconfirmed).
+
 ## Heap Corruption in Arc<T> Struct Fields
 
 **Status**: Unresolved (workaround in place)
