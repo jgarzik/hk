@@ -5,8 +5,8 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_clone, sys_execve, sys_exit, sys_fork, sys_kill, sys_nanosleep, sys_sched_yield, sys_setrlimit, sys_setuid, sys_wait4,
-    RLimit, Timespec, CLONE_SIGHAND, CLONE_VM, RLIMIT_NPROC,
+    CLONE_SIGHAND, CLONE_VM, RLIMIT_NPROC, RLimit, Timespec, sys_clone, sys_execve, sys_exit,
+    sys_fork, sys_kill, sys_nanosleep, sys_sched_yield, sys_setrlimit, sys_setuid, sys_wait4,
 };
 
 const EAGAIN: i64 = -11;
@@ -29,7 +29,10 @@ fn churn() -> u64 {
         return 1;
     }
     // One extra task at a time: the threads share one static stack
-    let lim = RLimit { rlim_cur: 2, rlim_max: 3 };
+    let lim = RLimit {
+        rlim_cur: 2,
+        rlim_max: 3,
+    };
     if sys_setrlimit(RLIMIT_NPROC, &lim) != 0 {
         return 2;
     }
@@ -80,7 +83,10 @@ fn churn() -> u64 {
         }
         sys_sched_yield();
     }
-    let lim = RLimit { rlim_cur: 3, rlim_max: 3 };
+    let lim = RLimit {
+        rlim_cur: 3,
+        rlim_max: 3,
+    };
     sys_setrlimit(RLIMIT_NPROC, &lim);
     let a = sleeper();
     let b = sleeper();
@@ -120,7 +126,10 @@ fn run(name: &[u8], f: fn() -> u64) {
 fn sleeper() -> i64 {
     let pid = sys_fork();
     if pid == 0 {
-        let ts = Timespec { tv_sec: 30, tv_nsec: 0 };
+        let ts = Timespec {
+            tv_sec: 30,
+            tv_nsec: 0,
+        };
         sys_nanosleep(&ts, core::ptr::null_mut());
         sys_exit(0);
     }
@@ -142,7 +151,10 @@ fn thread() -> i64 {
 
 /// Root's user is exempt: fork beyond the limit works
 fn root_exempt() -> u64 {
-    let lim = RLimit { rlim_cur: 1, rlim_max: 1 };
+    let lim = RLimit {
+        rlim_cur: 1,
+        rlim_max: 1,
+    };
     if sys_setrlimit(RLIMIT_NPROC, &lim) != 0 {
         return 1;
     }
@@ -164,16 +176,25 @@ fn setuid_exec() -> u64 {
         let pid = sys_fork();
         if pid == 0 {
             sys_setuid(U);
-            let ts = Timespec { tv_sec: 30, tv_nsec: 0 };
+            let ts = Timespec {
+                tv_sec: 30,
+                tv_nsec: 0,
+            };
             sys_nanosleep(&ts, core::ptr::null_mut());
             sys_exit(0);
         }
         *k = pid;
     }
     // Let both children become uid U
-    let ts = Timespec { tv_sec: 0, tv_nsec: 200_000_000 };
+    let ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 200_000_000,
+    };
     sys_nanosleep(&ts, core::ptr::null_mut());
-    let lim = RLimit { rlim_cur: 1, rlim_max: 1 };
+    let lim = RLimit {
+        rlim_cur: 1,
+        rlim_max: 1,
+    };
     let mut step = 0;
     if sys_setrlimit(RLIMIT_NPROC, &lim) != 0 {
         step = 1;
@@ -182,7 +203,11 @@ fn setuid_exec() -> u64 {
     } else {
         let argv: [*const u8; 2] = [b"boot_tester2\0".as_ptr(), core::ptr::null()];
         let envp: [*const u8; 1] = [core::ptr::null()];
-        let r = sys_execve(b"/bin/boot_tester2\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        let r = sys_execve(
+            b"/bin/boot_tester2\0".as_ptr(),
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
         if r != EAGAIN {
             step = 3;
         }
@@ -200,7 +225,10 @@ fn nproc() -> u64 {
         return 1;
     }
     // This task plus two children fill a limit of 3
-    let lim = RLimit { rlim_cur: 3, rlim_max: 3 };
+    let lim = RLimit {
+        rlim_cur: 3,
+        rlim_max: 3,
+    };
     if sys_setrlimit(RLIMIT_NPROC, &lim) != 0 {
         return 2;
     }

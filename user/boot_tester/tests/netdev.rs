@@ -14,9 +14,9 @@
 //!   bytes > 0, no errors)
 
 use hk_syscall::{
-    sys_bind, sys_close, sys_exit, sys_fork, sys_open, sys_poll, sys_read, sys_recvfrom,
-    sys_sendto, sys_socket, sys_unshare, sys_wait4, htonl, htons, make_ipv4, PollFd, SockAddrIn,
-    AF_INET, CLONE_NEWNET, O_RDONLY, POLLIN, SOCK_DGRAM,
+    AF_INET, CLONE_NEWNET, O_RDONLY, POLLIN, PollFd, SOCK_DGRAM, SockAddrIn, htonl, htons,
+    make_ipv4, sys_bind, sys_close, sys_exit, sys_fork, sys_open, sys_poll, sys_read, sys_recvfrom,
+    sys_sendto, sys_socket, sys_unshare, sys_wait4,
 };
 
 use super::helpers::{host_mode, print, print_num, println, skip};
@@ -41,7 +41,11 @@ fn read_proc_net_dev(buf: &mut [u8]) -> i64 {
     }
     let mut total = 0usize;
     loop {
-        let n = sys_read(fd as u64, buf[total..].as_mut_ptr(), (buf.len() - total) as u64);
+        let n = sys_read(
+            fd as u64,
+            buf[total..].as_mut_ptr(),
+            (buf.len() - total) as u64,
+        );
         if n <= 0 {
             break;
         }
@@ -70,7 +74,10 @@ fn dev_counters(text: &[u8], name: &[u8]) -> Option<[u64; 16]> {
         }
         let mut vals = [0u64; 16];
         let mut n = 0;
-        for field in line[colon + 1..].split(|&b| b == b' ').filter(|f| !f.is_empty()) {
+        for field in line[colon + 1..]
+            .split(|&b| b == b' ')
+            .filter(|f| !f.is_empty())
+        {
             if n == 16 {
                 return None;
             }
@@ -160,10 +167,24 @@ fn test_lo_counters() {
         return;
     }
     let msg = b"lo counter probe";
-    let sent = sys_sendto(fd, msg.as_ptr(), msg.len(), 0, &addr as *const SockAddrIn as *const u8, alen);
+    let sent = sys_sendto(
+        fd,
+        msg.as_ptr(),
+        msg.len(),
+        0,
+        &addr as *const SockAddrIn as *const u8,
+        alen,
+    );
     let mut rbuf = [0u8; 64];
     let got = if wait_readable(fd, 5000) {
-        sys_recvfrom(fd, rbuf.as_mut_ptr(), rbuf.len(), 0, core::ptr::null_mut(), core::ptr::null_mut())
+        sys_recvfrom(
+            fd,
+            rbuf.as_mut_ptr(),
+            rbuf.len(),
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
     } else {
         -11
     };
@@ -182,7 +203,10 @@ fn test_lo_counters() {
         return;
     };
     // rx/tx packets (fields 1 and 9) and bytes (0 and 8) must grow
-    let grew = after[1] > before[1] && after[9] > before[9] && after[0] > before[0] && after[8] > before[8];
+    let grew = after[1] > before[1]
+        && after[9] > before[9]
+        && after[0] > before[0]
+        && after[8] > before[8];
     if grew {
         println(b"LO_COUNTERS:OK");
     } else {
@@ -215,7 +239,10 @@ fn test_netns_proc_net_dev() {
             sys_exit(3);
         }
         let text = &buf[..n as usize];
-        let lines = text.split(|&b| b == b'\n').filter(|l| !l.is_empty()).count();
+        let lines = text
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .count();
         let ok = lines == 3 && dev_counters(text, b"lo").is_some();
         sys_exit(if ok { 0 } else { 4 });
     }
@@ -226,7 +253,10 @@ fn test_netns_proc_net_dev() {
         println(b"NETNS_PROC_NET_DEV:OK");
     } else if code == 2 && host_mode() {
         // Unprivileged harness without CAP_SYS_ADMIN
-        skip(b"NETNS_PROC_NET_DEV", b"unshare(CLONE_NEWNET) not permitted");
+        skip(
+            b"NETNS_PROC_NET_DEV",
+            b"unshare(CLONE_NEWNET) not permitted",
+        );
     } else {
         print(b"NETNS_PROC_NET_DEV:FAIL code=");
         print_num(code as i64);
@@ -280,7 +310,11 @@ fn test_eth0_dns() {
     let name = &name[..nlen];
     let mut buf = [0u8; 4096];
     let n = read_proc_net_dev(&mut buf);
-    let Some(eth_before) = (if n > 0 { dev_counters(&buf[..n as usize], name) } else { None }) else {
+    let Some(eth_before) = (if n > 0 {
+        dev_counters(&buf[..n as usize], name)
+    } else {
+        None
+    }) else {
         println(b"ETH0_DNS:FAIL no ethernet link in /proc/net/dev");
         return;
     };
@@ -300,7 +334,14 @@ fn test_eth0_dns() {
     // A few tries: the first query also waits for ARP resolution
     for _ in 0..3 {
         let qlen = dns_query(id, &mut q);
-        let s = sys_sendto(fd, q.as_ptr(), qlen, 0, &server as *const SockAddrIn as *const u8, alen);
+        let s = sys_sendto(
+            fd,
+            q.as_ptr(),
+            qlen,
+            0,
+            &server as *const SockAddrIn as *const u8,
+            alen,
+        );
         if s != qlen as i64 {
             print(b"ETH0_DNS:FAIL sendto ");
             print_num(s);
@@ -309,7 +350,14 @@ fn test_eth0_dns() {
             return;
         }
         if wait_readable(fd, 3000) {
-            got = sys_recvfrom(fd, reply.as_mut_ptr(), reply.len(), 0, core::ptr::null_mut(), core::ptr::null_mut());
+            got = sys_recvfrom(
+                fd,
+                reply.as_mut_ptr(),
+                reply.len(),
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            );
             if got >= 12 && u16::from_be_bytes([reply[0], reply[1]]) == id {
                 break;
             }
@@ -319,12 +367,17 @@ fn test_eth0_dns() {
     sys_close(fd as u64);
 
     let n = read_proc_net_dev(&mut buf);
-    let eth_after = if n > 0 { dev_counters(&buf[..n as usize], name) } else { None };
+    let eth_after = if n > 0 {
+        dev_counters(&buf[..n as usize], name)
+    } else {
+        None
+    };
     let (rx, tx) = match eth_after {
         Some(a) => (a[1] - eth_before[1], a[9] - eth_before[9]),
         None => (0, 0),
     };
-    let reply_ok = got >= 12 && u16::from_be_bytes([reply[0], reply[1]]) == id && reply[2] & 0x80 != 0;
+    let reply_ok =
+        got >= 12 && u16::from_be_bytes([reply[0], reply[1]]) == id && reply[2] & 0x80 != 0;
     if reply_ok {
         print(b"eth: DNS reply ");
         print_num(got);
@@ -403,7 +456,7 @@ fn hwaddr(name: &[u8]) -> Option<[u8; 6]> {
 }
 
 fn test_eth0_nic() {
-    use super::nl::{get_link, Nl, IFF_LOWER_UP, IFF_RUNNING, IFF_UP, IF_OPER_UP};
+    use super::nl::{IF_OPER_UP, IFF_LOWER_UP, IFF_RUNNING, IFF_UP, Nl, get_link};
     const N: &[u8] = b"ETH0_NIC";
     let fail = |why: &[u8], v: i64| {
         print(N);
@@ -435,7 +488,11 @@ fn test_eth0_nic() {
     }
     let mut buf = [0u8; 4096];
     let n = read_proc_net_dev(&mut buf);
-    let Some(c) = (if n > 0 { dev_counters(&buf[..n as usize], name) } else { None }) else {
+    let Some(c) = (if n > 0 {
+        dev_counters(&buf[..n as usize], name)
+    } else {
+        None
+    }) else {
         return fail(b"/proc/net/dev", n);
     };
     // rx bytes, packets, errs; tx bytes, packets, errs

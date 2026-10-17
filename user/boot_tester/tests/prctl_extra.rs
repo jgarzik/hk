@@ -4,14 +4,14 @@
 //! x86-64 specific PR_SET/GET_TSC, and x86-64 arch_prctl(ARCH_GET/SET_CPUID)
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{
-    sys_prctl, PR_GET_CHILD_SUBREAPER, PR_GET_KEEPCAPS, PR_SET_CHILD_SUBREAPER, PR_SET_KEEPCAPS,
-    PR_GET_THP_DISABLE, PR_SET_THP_DISABLE,
-};
 #[cfg(target_arch = "x86_64")]
 use hk_syscall::{
-    sys_arch_prctl, ARCH_GET_CPUID, ARCH_SET_CPUID, PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE,
-    PR_TSC_SIGSEGV,
+    ARCH_GET_CPUID, ARCH_SET_CPUID, PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSEGV,
+    sys_arch_prctl,
+};
+use hk_syscall::{
+    PR_GET_CHILD_SUBREAPER, PR_GET_KEEPCAPS, PR_GET_THP_DISABLE, PR_SET_CHILD_SUBREAPER,
+    PR_SET_KEEPCAPS, PR_SET_THP_DISABLE, sys_prctl,
 };
 
 /// Run all prctl extra tests

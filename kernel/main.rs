@@ -566,11 +566,16 @@ fn zero_bss(frame: u64, va: u64, file_end: u64, mem_end: u64) {
 /// Apply ELF relocations for PIE binaries
 ///
 /// For R_*_RELATIVE relocations: *(base + offset) = base + addend
-fn apply_relocations<PT>(elf: &crate::elf::ElfExecutable, base_addr: u64, page_table: &PT)
-where
+fn apply_relocations<PT>(
+    elf: &crate::elf::ElfExecutable,
+    elf_data: &[u8],
+    base_addr: u64,
+    page_table: &PT,
+) where
     PT: crate::arch::PageTable<VirtAddr = u64, PhysAddr = u64>,
 {
-    for reloc in &elf.relocations {
+    let mut n = 0;
+    elf.for_each_relocation(elf_data, &mut |reloc| {
         let target_vaddr = base_addr + reloc.offset;
         let value = (base_addr as i64 + reloc.addend) as u64;
 
@@ -582,10 +587,11 @@ where
                 ::core::ptr::write_volatile(ptr, value);
             }
         }
-    }
+        n += 1;
+    });
 
-    if !elf.relocations.is_empty() {
-        printkln!("Applied {} relocations", elf.relocations.len());
+    if n != 0 {
+        printkln!("Applied {} relocations", n);
     }
 }
 
@@ -1055,7 +1061,7 @@ fn kmain() -> ! {
     }
 
     // Apply relocations for PIE binaries
-    apply_relocations(&elf, base_addr, &user_pt);
+    apply_relocations(&elf, init_bytes, base_addr, &user_pt);
 
     // Calculate highest segment end for brk initialization
     let mut highest_end: u64 = 0;

@@ -14,8 +14,8 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_exit, sys_getpid, sys_pipe, sys_rt_sigaction, sys_wait4, SA_RESTORER,
-    SA_SIGINFO, SIGUSR1, SIG_DFL,
+    SA_RESTORER, SA_SIGINFO, SIG_DFL, SIGUSR1, sys_close, sys_exit, sys_getpid, sys_pipe,
+    sys_rt_sigaction, sys_wait4,
 };
 
 /// Number of SIMD registers tested
@@ -73,7 +73,12 @@ struct FpImage {
 
 impl FpImage {
     const fn zero() -> Self {
-        Self { v: [[0; 2]; NREGS], ctrl: 0, ctrl2: 0, x87: 0 }
+        Self {
+            v: [[0; 2]; NREGS],
+            ctrl: 0,
+            ctrl2: 0,
+            x87: 0,
+        }
     }
 
     fn pattern(tag: u64, iter: u64) -> Self {
@@ -117,7 +122,15 @@ impl FpImage {
 /// second syscall's result.
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
-fn fp_roundtrip(inp: &FpImage, out: &mut FpImage, nr1: u64, a1: u64, nr2: u64, a2: u64, b: u64) -> i64 {
+fn fp_roundtrip(
+    inp: &FpImage,
+    out: &mut FpImage,
+    nr1: u64,
+    a1: u64,
+    nr2: u64,
+    a2: u64,
+    b: u64,
+) -> i64 {
     let ret: i64;
     unsafe {
         core::arch::asm!(
@@ -197,7 +210,15 @@ fn fp_roundtrip(inp: &FpImage, out: &mut FpImage, nr1: u64, a1: u64, nr2: u64, a
 
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn fp_roundtrip(inp: &FpImage, out: &mut FpImage, nr1: u64, a1: u64, nr2: u64, a2: u64, b: u64) -> i64 {
+fn fp_roundtrip(
+    inp: &FpImage,
+    out: &mut FpImage,
+    nr1: u64,
+    a1: u64,
+    nr2: u64,
+    a2: u64,
+    b: u64,
+) -> i64 {
     let ret: i64;
     let fpcr: u64;
     let fpsr: u64;
@@ -297,7 +318,15 @@ fn avx_usable() -> bool {
 /// Like `fp_roundtrip` for the full 256-bit YMM0-15 (`inp`/`out` hold 16 x 32 bytes)
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
-fn ymm_roundtrip(inp: &[u64; 64], out: &mut [u64; 64], nr1: u64, a1: u64, nr2: u64, a2: u64, b: u64) {
+fn ymm_roundtrip(
+    inp: &[u64; 64],
+    out: &mut [u64; 64],
+    nr1: u64,
+    a1: u64,
+    nr2: u64,
+    a2: u64,
+    b: u64,
+) {
     unsafe {
         core::arch::asm!(
             "vmovdqu ymm0, [{i} + 0]",
@@ -428,7 +457,11 @@ fn test_fpu_ctxsw() {
     }
     let mut status: i32 = 0;
     sys_wait4(pid, &mut status, 0, 0);
-    let child_bad = if status & 0x7f == 0 { ((status >> 8) & 0xff) as u64 } else { 255 };
+    let child_bad = if status & 0x7f == 0 {
+        ((status >> 8) & 0xff) as u64
+    } else {
+        255
+    };
     if bad == 0 && child_bad == 0 {
         println(b"FPU_CTXSW:OK");
         #[cfg(target_arch = "x86_64")]
@@ -474,7 +507,11 @@ fn test_fpu_fork() {
     }
     let mut status: i32 = 0;
     sys_wait4(pid, &mut status, 0, 0);
-    let child_bad = if status & 0x7f == 0 { (status >> 8) & 0xff } else { 255 };
+    let child_bad = if status & 0x7f == 0 {
+        (status >> 8) & 0xff
+    } else {
+        255
+    };
     if bad.is_none() && child_bad == 0 {
         println(b"FPU_FORK:OK");
     } else {

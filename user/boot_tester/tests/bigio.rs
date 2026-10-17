@@ -4,9 +4,9 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_exit, sys_fork, sys_mmap, sys_nanosleep, sys_open, sys_pipe,
-    sys_pread64, sys_read, sys_unlink, sys_wait4, sys_write, Timespec, MAP_ANONYMOUS,
-    MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE,
+    MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE, Timespec,
+    sys_close, sys_exit, sys_fork, sys_mmap, sys_nanosleep, sys_open, sys_pipe, sys_pread64,
+    sys_read, sys_unlink, sys_wait4, sys_write,
 };
 
 const MB: usize = 1024 * 1024;
@@ -46,7 +46,11 @@ fn test_ramfs_pages() {
         return verdict(N, b"open", fd);
     }
     let n = write_mb(fd, 8);
-    let small = sys_open(b"/ramfs_small\0".as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    let small = sys_open(
+        b"/ramfs_small\0".as_ptr(),
+        O_CREAT | O_RDWR | O_TRUNC,
+        0o644,
+    );
     let w = sys_write(small as u64, b"ok".as_ptr(), 2);
     let mut b = [0u8; 2];
     let r = sys_pread64(small as i32, b.as_mut_ptr(), 2, 0);
@@ -239,7 +243,14 @@ fn msleep(ms: u64) {
 
 /// Anonymous read-write mapping of `len` bytes (None on failure)
 fn map(len: usize) -> Option<&'static mut [u8]> {
-    let a = sys_mmap(0, len as u64, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let a = sys_mmap(
+        0,
+        len as u64,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if a < 0 {
         return None;
     }

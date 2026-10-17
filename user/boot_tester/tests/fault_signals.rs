@@ -18,9 +18,9 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_exit, sys_fork, sys_mmap, sys_munmap, sys_rt_sigaction, sys_rt_sigprocmask, sys_wait4,
-    MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, SA_RESTORER, SA_SIGINFO, SIGILL, SIGSEGV, SIGTRAP,
-    SIG_BLOCK, SIG_IGN,
+    MAP_ANONYMOUS, MAP_PRIVATE, PROT_NONE, PROT_READ, SA_RESTORER, SA_SIGINFO, SIG_BLOCK, SIG_IGN,
+    SIGILL, SIGSEGV, SIGTRAP, sys_exit, sys_fork, sys_mmap, sys_munmap, sys_rt_sigaction,
+    sys_rt_sigprocmask, sys_wait4,
 };
 
 const SEGV_MAPERR: i32 = 1;
@@ -51,7 +51,13 @@ struct Seen {
     pc: u64,
 }
 
-static mut SEEN: Seen = Seen { count: 0, signo: 0, code: 0, addr: 0, pc: 0 };
+static mut SEEN: Seen = Seen {
+    count: 0,
+    signo: 0,
+    code: 0,
+    addr: 0,
+    pc: 0,
+};
 
 // ucontext offsets (Linux): x86-64 uc_mcontext at 40; arm64 at 176
 #[cfg(target_arch = "x86_64")]
@@ -75,7 +81,13 @@ extern "C" fn fault_handler(signo: i32, info: *const u8, ucp: *mut u8) {
         #[cfg(target_arch = "x86_64")]
         {
             let pc = *(ucp.add(uc::RIP) as *const u64);
-            SEEN = Seen { count: SEEN.count + 1, signo, code, addr, pc };
+            SEEN = Seen {
+                count: SEEN.count + 1,
+                signo,
+                code,
+                addr,
+                pc,
+            };
             // Resume at the address the test left in R12; mark RAX
             *(ucp.add(uc::RIP) as *mut u64) = *(ucp.add(uc::R12) as *const u64);
             *(ucp.add(uc::RAX) as *mut u64) = HANDLER_MARK;
@@ -83,7 +95,13 @@ extern "C" fn fault_handler(signo: i32, info: *const u8, ucp: *mut u8) {
         #[cfg(target_arch = "aarch64")]
         {
             let pc = *(ucp.add(uc::PC) as *const u64);
-            SEEN = Seen { count: SEEN.count + 1, signo, code, addr, pc };
+            SEEN = Seen {
+                count: SEEN.count + 1,
+                signo,
+                code,
+                addr,
+                pc,
+            };
             // Resume at the address the test left in x9; mark x12
             *(ucp.add(uc::PC) as *mut u64) = *(ucp.add(uc::x(9)) as *const u64);
             *(ucp.add(uc::x(12)) as *mut u64) = HANDLER_MARK;
@@ -176,7 +194,18 @@ pub(super) fn fault_seen() -> Option<(i32, u64)> {
 
 /// Forget the faults seen so far
 pub(super) fn reset() {
-    unsafe { core::ptr::write_volatile(&raw mut SEEN, Seen { count: 0, signo: 0, code: 0, addr: 0, pc: 0 }) };
+    unsafe {
+        core::ptr::write_volatile(
+            &raw mut SEEN,
+            Seen {
+                count: 0,
+                signo: 0,
+                code: 0,
+                addr: 0,
+                pc: 0,
+            },
+        )
+    };
 }
 
 pub(super) fn install(sig: u32) -> bool {
@@ -191,14 +220,7 @@ pub(super) fn install(sig: u32) -> bool {
 
 /// Check what the handler saw and the state after resuming. Prints the
 /// result line; returns the child exit code.
-fn verify(
-    name: &[u8],
-    after: &After,
-    signo: u32,
-    code: i32,
-    addr: u64,
-    pc: u64,
-) -> u64 {
+fn verify(name: &[u8], after: &After, signo: u32, code: i32, addr: u64, pc: u64) -> u64 {
     let s = unsafe { core::ptr::read_volatile(&raw const SEEN) };
     let mut err: i64 = 0;
     if s.count != 1 {
@@ -282,7 +304,14 @@ fn segv_maperr() -> u64 {
     let a = run_fault!("mov rax, [rdi]", addr);
     #[cfg(target_arch = "aarch64")]
     let a = run_fault!("ldr x12, [x0]", addr);
-    verify(b"FAULT_SEGV_MAPERR", &a, SIGSEGV, SEGV_MAPERR, addr, a.fault_pc)
+    verify(
+        b"FAULT_SEGV_MAPERR",
+        &a,
+        SIGSEGV,
+        SEGV_MAPERR,
+        addr,
+        a.fault_pc,
+    )
 }
 
 fn segv_accerr() -> u64 {
@@ -298,7 +327,14 @@ fn segv_accerr() -> u64 {
     #[cfg(target_arch = "aarch64")]
     let a = run_fault!("str x10, [x0]", addr);
     sys_munmap(page, 4096);
-    verify(b"FAULT_SEGV_ACCERR", &a, SIGSEGV, SEGV_ACCERR, addr, a.fault_pc)
+    verify(
+        b"FAULT_SEGV_ACCERR",
+        &a,
+        SIGSEGV,
+        SEGV_ACCERR,
+        addr,
+        a.fault_pc,
+    )
 }
 
 fn segv_prot_none() -> u64 {
@@ -312,7 +348,14 @@ fn segv_prot_none() -> u64 {
     #[cfg(target_arch = "aarch64")]
     let a = run_fault!("ldr x12, [x0]", addr);
     sys_munmap(page, 4096);
-    verify(b"FAULT_PROT_NONE", &a, SIGSEGV, SEGV_ACCERR, addr, a.fault_pc)
+    verify(
+        b"FAULT_PROT_NONE",
+        &a,
+        SIGSEGV,
+        SEGV_ACCERR,
+        addr,
+        a.fault_pc,
+    )
 }
 
 fn sigill() -> u64 {
@@ -322,12 +365,26 @@ fn sigill() -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
         let a = run_fault!("ud2", 0u64);
-        verify(b"FAULT_SIGILL", &a, SIGILL, ILL_ILLOPN, a.fault_pc, a.fault_pc)
+        verify(
+            b"FAULT_SIGILL",
+            &a,
+            SIGILL,
+            ILL_ILLOPN,
+            a.fault_pc,
+            a.fault_pc,
+        )
     }
     #[cfg(target_arch = "aarch64")]
     {
         let a = run_fault!("udf #0", 0u64);
-        verify(b"FAULT_SIGILL", &a, SIGILL, ILL_ILLOPC, a.fault_pc, a.fault_pc)
+        verify(
+            b"FAULT_SIGILL",
+            &a,
+            SIGILL,
+            ILL_ILLOPC,
+            a.fault_pc,
+            a.fault_pc,
+        )
     }
 }
 
@@ -338,7 +395,14 @@ fn sigfpe() -> u64 {
     }
     // RDX:RAX = 0, divisor RSI = 0
     let a = run_fault!("div rsi", 0u64);
-    verify(b"FAULT_SIGFPE", &a, hk_syscall::SIGFPE, FPE_INTDIV, a.fault_pc, a.fault_pc)
+    verify(
+        b"FAULT_SIGFPE",
+        &a,
+        hk_syscall::SIGFPE,
+        FPE_INTDIV,
+        a.fault_pc,
+        a.fault_pc,
+    )
 }
 
 fn sigtrap() -> u64 {
@@ -354,7 +418,14 @@ fn sigtrap() -> u64 {
     #[cfg(target_arch = "aarch64")]
     {
         let a = run_fault!("brk #0", 0u64);
-        verify(b"FAULT_SIGTRAP", &a, SIGTRAP, TRAP_BRKPT, a.fault_pc, a.fault_pc)
+        verify(
+            b"FAULT_SIGTRAP",
+            &a,
+            SIGTRAP,
+            TRAP_BRKPT,
+            a.fault_pc,
+            a.fault_pc,
+        )
     }
 }
 

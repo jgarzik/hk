@@ -25,13 +25,13 @@
 //! - Test 43: preadv2() with invalid flags returns -EOPNOTSUPP
 //! - Test 44: preadv2() with RWF_NOWAIT on ramfs returns -EOPNOTSUPP
 
-use super::helpers::{print, println, print_num, host_mode};
+use super::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_fcntl, sys_fstatfs, sys_getrandom, sys_ioctl, sys_lseek, sys_open, sys_pipe2,
-    sys_pread64, sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read,
-    sys_readv, sys_statfs, sys_statx, sys_write, sys_writev, IoVec, LinuxStatFs, Statx,
-    AT_EMPTY_PATH, AT_FDCWD, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_NONBLOCK, PROC_SUPER_MAGIC,
-    RAMFS_MAGIC, STATX_BASIC_STATS, FIONBIO, FIOCLEX, FIONCLEX,
+    AT_EMPTY_PATH, AT_FDCWD, FIOCLEX, FIONBIO, FIONCLEX, IoVec, LinuxStatFs, O_CREAT, O_NONBLOCK,
+    O_RDONLY, O_RDWR, O_TRUNC, PROC_SUPER_MAGIC, RAMFS_MAGIC, STATX_BASIC_STATS, Statx, sys_close,
+    sys_fcntl, sys_fstatfs, sys_getrandom, sys_ioctl, sys_lseek, sys_open, sys_pipe2, sys_pread64,
+    sys_preadv, sys_preadv2, sys_pwrite64, sys_pwritev, sys_pwritev2, sys_read, sys_readv,
+    sys_statfs, sys_statx, sys_write, sys_writev,
 };
 
 // RWF flags for preadv2/pwritev2
@@ -90,15 +90,23 @@ pub fn run_tests() {
 
 /// Test 22: writev() - gather write to stdout
 fn test_writev() {
-
     let msg1 = b"Hello, ";
     let msg2 = b"writev ";
     let msg3 = b"world!\n";
 
     let iov: [IoVec; 3] = [
-        IoVec { iov_base: msg1.as_ptr(), iov_len: msg1.len() },
-        IoVec { iov_base: msg2.as_ptr(), iov_len: msg2.len() },
-        IoVec { iov_base: msg3.as_ptr(), iov_len: msg3.len() },
+        IoVec {
+            iov_base: msg1.as_ptr(),
+            iov_len: msg1.len(),
+        },
+        IoVec {
+            iov_base: msg2.as_ptr(),
+            iov_len: msg2.len(),
+        },
+        IoVec {
+            iov_base: msg3.as_ptr(),
+            iov_len: msg3.len(),
+        },
     ];
 
     let ret = sys_writev(1, iov.as_ptr(), 3);
@@ -115,7 +123,6 @@ fn test_writev() {
 
 /// Test 23: readv() - scatter read from file
 fn test_readv() {
-
     let path = b"/test.txt\0";
     let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
@@ -128,9 +135,18 @@ fn test_readv() {
         let mut buf3 = [0u8; 20];
 
         let iov_read: [IoVec; 3] = [
-            IoVec { iov_base: buf1.as_mut_ptr(), iov_len: buf1.len() },
-            IoVec { iov_base: buf2.as_mut_ptr(), iov_len: buf2.len() },
-            IoVec { iov_base: buf3.as_mut_ptr(), iov_len: buf3.len() },
+            IoVec {
+                iov_base: buf1.as_mut_ptr(),
+                iov_len: buf1.len(),
+            },
+            IoVec {
+                iov_base: buf2.as_mut_ptr(),
+                iov_len: buf2.len(),
+            },
+            IoVec {
+                iov_base: buf3.as_mut_ptr(),
+                iov_len: buf3.len(),
+            },
         ];
 
         let ret = sys_readv(fd as u64, iov_read.as_ptr(), 3);
@@ -162,14 +178,22 @@ fn test_readv() {
 
 /// Test 24: writev() with zero-length iovec
 fn test_writev_zero_len() {
-
     let msg_before = b"Before";
     let msg_after = b"After\n";
 
     let iov_zero: [IoVec; 3] = [
-        IoVec { iov_base: msg_before.as_ptr(), iov_len: msg_before.len() },
-        IoVec { iov_base: core::ptr::null(), iov_len: 0 },  // zero-length
-        IoVec { iov_base: msg_after.as_ptr(), iov_len: msg_after.len() },
+        IoVec {
+            iov_base: msg_before.as_ptr(),
+            iov_len: msg_before.len(),
+        },
+        IoVec {
+            iov_base: core::ptr::null(),
+            iov_len: 0,
+        }, // zero-length
+        IoVec {
+            iov_base: msg_after.as_ptr(),
+            iov_len: msg_after.len(),
+        },
     ];
 
     let ret = sys_writev(1, iov_zero.as_ptr(), 3);
@@ -186,9 +210,9 @@ fn test_writev_zero_len() {
 
 /// Test 25: readv() with invalid iovcnt
 fn test_readv_invalid_iovcnt() {
-
     let ret_neg = sys_readv(0, core::ptr::null(), (-1i64) as u64);
-    if ret_neg == -22 {  // EINVAL
+    if ret_neg == -22 {
+        // EINVAL
         println(b"READV_INVALID_IOVCNT:OK");
     } else {
         print(b"READV_INVALID_IOVCNT:FAIL: expected -22, got ");
@@ -393,9 +417,18 @@ fn test_preadv() {
     let mut buf3 = [0u8; 6]; // "ramfs!"
 
     let iov: [IoVec; 3] = [
-        IoVec { iov_base: buf1.as_mut_ptr(), iov_len: buf1.len() },
-        IoVec { iov_base: buf2.as_mut_ptr(), iov_len: buf2.len() },
-        IoVec { iov_base: buf3.as_mut_ptr(), iov_len: buf3.len() },
+        IoVec {
+            iov_base: buf1.as_mut_ptr(),
+            iov_len: buf1.len(),
+        },
+        IoVec {
+            iov_base: buf2.as_mut_ptr(),
+            iov_len: buf2.len(),
+        },
+        IoVec {
+            iov_base: buf3.as_mut_ptr(),
+            iov_len: buf3.len(),
+        },
     ];
 
     let pret = sys_preadv(fd as i32, iov.as_ptr(), 3, 6);
@@ -489,8 +522,14 @@ fn test_pwritev() {
     let data2 = b"BB";
 
     let iov: [IoVec; 2] = [
-        IoVec { iov_base: data1.as_ptr() as *const u8, iov_len: data1.len() },
-        IoVec { iov_base: data2.as_ptr() as *const u8, iov_len: data2.len() },
+        IoVec {
+            iov_base: data1.as_ptr() as *const u8,
+            iov_len: data1.len(),
+        },
+        IoVec {
+            iov_base: data2.as_ptr() as *const u8,
+            iov_len: data2.len(),
+        },
     ];
 
     let pret = sys_pwritev(fd as i32, iov.as_ptr(), 2, 4);
@@ -874,7 +913,10 @@ fn test_preadv2_basic() {
 
     // Read "from" starting at offset 6 with flags=0
     let mut buf = [0u8; 4];
-    let iov: [IoVec; 1] = [IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() }];
+    let iov: [IoVec; 1] = [IoVec {
+        iov_base: buf.as_mut_ptr(),
+        iov_len: buf.len(),
+    }];
 
     let ret = sys_preadv2(fd as i32, iov.as_ptr(), 1, 6, 0);
     if ret != 4 {
@@ -912,7 +954,10 @@ fn test_pwritev2_basic() {
 
     // Write "test" at offset 0 with flags=0
     let data = b"test";
-    let iov: [IoVec; 1] = [IoVec { iov_base: data.as_ptr(), iov_len: data.len() }];
+    let iov: [IoVec; 1] = [IoVec {
+        iov_base: data.as_ptr(),
+        iov_len: data.len(),
+    }];
 
     let ret = sys_pwritev2(fd as i32, iov.as_ptr(), 1, 0, 0);
     if ret != 4 {
@@ -960,7 +1005,10 @@ fn test_preadv2_offset_minus_one() {
 
     // Read with offset=-1 (should use current position)
     let mut buf = [0u8; 4];
-    let iov: [IoVec; 1] = [IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() }];
+    let iov: [IoVec; 1] = [IoVec {
+        iov_base: buf.as_mut_ptr(),
+        iov_len: buf.len(),
+    }];
 
     let ret = sys_preadv2(fd as i32, iov.as_ptr(), 1, -1, 0);
     if ret != 4 {
@@ -1011,7 +1059,10 @@ fn test_pwritev2_offset_minus_one() {
 
     // Write "BB" with offset=-1 (should use current position = 2)
     let data2 = b"BB";
-    let iov: [IoVec; 1] = [IoVec { iov_base: data2.as_ptr(), iov_len: data2.len() }];
+    let iov: [IoVec; 1] = [IoVec {
+        iov_base: data2.as_ptr(),
+        iov_len: data2.len(),
+    }];
 
     let ret = sys_pwritev2(fd as i32, iov.as_ptr(), 1, -1, 0);
     if ret != 2 {
@@ -1055,7 +1106,10 @@ fn test_pwritev2_rwf_append() {
     // Use pwritev2 with RWF_APPEND to append "World"
     // Even though offset=0, RWF_APPEND should append at end
     let data2 = b"World";
-    let iov: [IoVec; 1] = [IoVec { iov_base: data2.as_ptr(), iov_len: data2.len() }];
+    let iov: [IoVec; 1] = [IoVec {
+        iov_base: data2.as_ptr(),
+        iov_len: data2.len(),
+    }];
 
     let ret = sys_pwritev2(fd as i32, iov.as_ptr(), 1, 0, RWF_APPEND);
     if ret != 5 {
@@ -1102,7 +1156,10 @@ fn test_preadv2_invalid_flags() {
     }
 
     let mut buf = [0u8; 4];
-    let iov: [IoVec; 1] = [IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() }];
+    let iov: [IoVec; 1] = [IoVec {
+        iov_base: buf.as_mut_ptr(),
+        iov_len: buf.len(),
+    }];
 
     // Use invalid flag (bit not in RWF_SUPPORTED)
     let invalid_flags = 0x1000; // Not a valid RWF flag
@@ -1133,7 +1190,10 @@ fn test_preadv2_rwf_nowait() {
     }
 
     let mut buf = [0u8; 4];
-    let iov: [IoVec; 1] = [IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() }];
+    let iov: [IoVec; 1] = [IoVec {
+        iov_base: buf.as_mut_ptr(),
+        iov_len: buf.len(),
+    }];
     let ret = sys_preadv2(fd as i32, iov.as_ptr(), 1, 0, RWF_NOWAIT);
     sys_close(fd as u64);
 
@@ -1163,7 +1223,10 @@ fn test_preadv2_rwf_nowait_pipe_eagain() {
 
     // Try to read from empty pipe with RWF_NOWAIT
     let mut buf = [0u8; 4];
-    let iov: [IoVec; 1] = [IoVec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() }];
+    let iov: [IoVec; 1] = [IoVec {
+        iov_base: buf.as_mut_ptr(),
+        iov_len: buf.len(),
+    }];
 
     // Use offset=-1 for pipe (pipes don't support positioned I/O)
     let ret = sys_preadv2(read_fd, iov.as_ptr(), 1, -1, RWF_NOWAIT);
@@ -1367,7 +1430,13 @@ fn test_statx_at_empty_path() {
     let empty = b"\0";
 
     // statx on the fd itself using AT_EMPTY_PATH
-    let ret = sys_statx(fd as i32, empty.as_ptr(), AT_EMPTY_PATH, STATX_BASIC_STATS, &mut buf);
+    let ret = sys_statx(
+        fd as i32,
+        empty.as_ptr(),
+        AT_EMPTY_PATH,
+        STATX_BASIC_STATS,
+        &mut buf,
+    );
     sys_close(fd as u64);
 
     if ret != 0 {

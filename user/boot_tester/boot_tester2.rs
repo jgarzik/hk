@@ -178,9 +178,8 @@ fn auxv_check(sp: *const u64) -> ! {
     // AT_PHDR points at this program's headers: one of them is PT_LOAD
     let phdr = get(AT_PHDR);
     let has_load = phdr != u64::MAX
-        && (0..get(AT_PHNUM)).any(|i| unsafe {
-            core::ptr::read_volatile((phdr + i * 56) as *const u32) == PT_LOAD
-        });
+        && (0..get(AT_PHNUM))
+            .any(|i| unsafe { core::ptr::read_volatile((phdr + i * 56) as *const u32) == PT_LOAD });
     if !has_load {
         sys_exit(14);
     }
@@ -213,7 +212,11 @@ fn auxv_check(sp: *const u64) -> ! {
 /// exe mode: /proc/self/exe is the executed file
 fn exe_check() -> ! {
     let mut buf = [0u8; 64];
-    let n = sys_readlink(b"/proc/self/exe\0".as_ptr(), buf.as_mut_ptr(), buf.len() as u64);
+    let n = sys_readlink(
+        b"/proc/self/exe\0".as_ptr(),
+        buf.as_mut_ptr(),
+        buf.len() as u64,
+    );
     let want = b"/bin/boot_tester2";
     // byte loop: a slice compare becomes a bcmp call (no libc here)
     let ok = n == want.len() as i64

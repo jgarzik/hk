@@ -8,14 +8,11 @@
 //! - Test prctl timer slack
 //! - Test prctl invalid option returns EINVAL
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_prctl,
-    PR_SET_NAME, PR_GET_NAME,
-    PR_SET_DUMPABLE, PR_GET_DUMPABLE,
-    PR_SET_NO_NEW_PRIVS, PR_GET_NO_NEW_PRIVS,
-    PR_SET_TIMERSLACK, PR_GET_TIMERSLACK,
-    SUID_DUMP_DISABLE, SUID_DUMP_USER, SUID_DUMP_ROOT,
+    PR_GET_DUMPABLE, PR_GET_NAME, PR_GET_NO_NEW_PRIVS, PR_GET_TIMERSLACK, PR_SET_DUMPABLE,
+    PR_SET_NAME, PR_SET_NO_NEW_PRIVS, PR_SET_TIMERSLACK, SUID_DUMP_DISABLE, SUID_DUMP_ROOT,
+    SUID_DUMP_USER, sys_prctl,
 };
 
 /// Run all prctl tests
@@ -70,7 +67,7 @@ fn test_prctl_set_get_name() {
 fn test_prctl_name_truncation() {
     // Set a name longer than 16 bytes (including null)
     // The kernel should truncate to 15 chars + null
-    let name = b"verylongnamehere123\0";  // 19 chars + null
+    let name = b"verylongnamehere123\0"; // 19 chars + null
     let ret = sys_prctl(PR_SET_NAME, name.as_ptr() as u64, 0, 0, 0);
     if ret != 0 {
         print(b"PRCTL_TRUNCATE:FAIL: set returned ");
@@ -89,7 +86,7 @@ fn test_prctl_name_truncation() {
 
     // Should be truncated to 15 chars (name array is 16 bytes with last as null)
     // Verify the first 15 bytes match and last byte is null
-    let expected = b"verylongnameher";  // First 15 chars
+    let expected = b"verylongnameher"; // First 15 chars
     let mut matches = true;
     for i in 0..expected.len() {
         if buf[i] != expected[i] {

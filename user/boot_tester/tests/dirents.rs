@@ -6,8 +6,8 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_getdents64, sys_lseek, sys_mkdir, sys_open, sys_rmdir, sys_unlink, O_CREAT,
-    O_DIRECTORY, O_RDONLY, O_WRONLY, SEEK_SET,
+    O_CREAT, O_DIRECTORY, O_RDONLY, O_WRONLY, SEEK_SET, sys_close, sys_getdents64, sys_lseek,
+    sys_mkdir, sys_open, sys_rmdir, sys_unlink,
 };
 
 const EINVAL: i64 = -22;
@@ -34,7 +34,11 @@ fn check_legacy() {
         return verdict(NAME, b"mkdir", -1);
     }
     for i in 0..N {
-        let fd = sys_open(join(&mut p, dir, &fname(i)).as_ptr(), O_CREAT | O_WRONLY, 0o644);
+        let fd = sys_open(
+            join(&mut p, dir, &fname(i)).as_ptr(),
+            O_CREAT | O_WRONLY,
+            0o644,
+        );
         sys_close(fd as u64);
     }
     let why = legacy_walk(dir, N);
@@ -209,7 +213,11 @@ pub fn check_dir(prefix: &[u8], name: &[u8], n: usize) {
         return verdict(name, b"mkdir", r);
     }
     for i in 0..n {
-        let fd = sys_open(join(&mut p, dir, &fname(i)).as_ptr(), O_CREAT | O_WRONLY, 0o644);
+        let fd = sys_open(
+            join(&mut p, dir, &fname(i)).as_ptr(),
+            O_CREAT | O_WRONLY,
+            0o644,
+        );
         if fd < 0 {
             return verdict(name, b"create", fd);
         }
@@ -288,7 +296,11 @@ fn check_fd(fd: i64, dir: &[u8], n: usize) -> Result<(), (&'static [u8], i64)> {
     if r > 0 {
         let reclen = u16::from_ne_bytes([b2[16], b2[17]]) as usize;
         let name = &b2[19..reclen];
-        first_len = name.iter().position(|&b| b == 0).unwrap_or(name.len()).min(8);
+        first_len = name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(name.len())
+            .min(8);
         first[..first_len].copy_from_slice(&name[..first_len]);
         got_one = true;
     }

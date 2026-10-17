@@ -8,11 +8,11 @@
 //! 5. VFAT-specific tests
 
 use super::fs_common;
-use super::helpers::{print, print_num, println, host_mode, skip};
+use super::helpers::{host_mode, print, print_num, println, skip};
 use hk_syscall::{
-    sys_close, sys_link, sys_lseek, sys_mkdir, sys_mknod, sys_mount, sys_open, sys_read,
-    sys_readlink, sys_rename, sys_rmdir, sys_symlink, sys_truncate, sys_umount2, sys_unlink,
-    sys_write, O_CREAT, O_NOFOLLOW, O_RDONLY, O_WRONLY, SEEK_SET,
+    O_CREAT, O_NOFOLLOW, O_RDONLY, O_WRONLY, SEEK_SET, sys_close, sys_link, sys_lseek, sys_mkdir,
+    sys_mknod, sys_mount, sys_open, sys_read, sys_readlink, sys_rename, sys_rmdir, sys_symlink,
+    sys_truncate, sys_umount2, sys_unlink, sys_write,
 };
 
 /// Run all filesystem ops tests
@@ -83,7 +83,6 @@ pub fn run_tests() {
 
 /// Test: symlink() - create a symbolic link
 fn test_symlink() {
-
     let symlink_target = b"/test.txt\0";
     let symlink_path = b"/link_to_test\0";
     let ret = sys_symlink(symlink_target.as_ptr(), symlink_path.as_ptr());
@@ -97,7 +96,6 @@ fn test_symlink() {
 
 /// Test: readlink() - read symbolic link target
 fn test_readlink() {
-
     let symlink_path = b"/link_to_test\0";
     let mut readlink_buf: [u8; 64] = [0; 64];
     let ret = sys_readlink(symlink_path.as_ptr(), readlink_buf.as_mut_ptr(), 64);
@@ -128,7 +126,6 @@ fn test_symlink_nofollow() {
 
 /// Test: Open and read through symlink
 fn test_symlink_read() {
-
     let symlink_path = b"/link_to_test\0";
     let fd = sys_open(symlink_path.as_ptr(), O_RDONLY, 0);
     if fd >= 0 {
@@ -149,7 +146,6 @@ fn test_symlink_read() {
 
 /// Test: symlink() with existing name should fail with EEXIST
 fn test_symlink_eexist() {
-
     let symlink_target = b"/test.txt\0";
     let existing_path = b"/test.txt\0";
     let ret = sys_symlink(symlink_target.as_ptr(), existing_path.as_ptr());
@@ -164,7 +160,6 @@ fn test_symlink_eexist() {
 
 /// Test: readlink() on non-symlink should fail with EINVAL
 fn test_readlink_einval() {
-
     let regular_file = b"/test.txt\0";
     let mut buf: [u8; 64] = [0; 64];
     let ret = sys_readlink(regular_file.as_ptr(), buf.as_mut_ptr(), 64);
@@ -179,7 +174,6 @@ fn test_readlink_einval() {
 
 /// Test: link() - create a hard link
 fn test_link() {
-
     let hardlink_oldpath = b"/test.txt\0";
     let hardlink_newpath = b"/hardlink_test\0";
     let ret = sys_link(hardlink_oldpath.as_ptr(), hardlink_newpath.as_ptr());
@@ -208,7 +202,6 @@ fn test_link() {
 
 /// Test: link() to directory should fail with EPERM
 fn test_link_dir_eperm() {
-
     // Same-fs directory: a cross-fs one (e.g. /proc) gets EXDEV first
     let dir_path = b"/ld_dir\0";
     let dir_link = b"/ld_link\0";
@@ -230,7 +223,6 @@ fn test_link_dir_eperm() {
 
 /// Test: unlink() removes hardlink but file persists
 fn test_unlink_hardlink_persistence() {
-
     let hardlink_test = b"/hardlink_target\0";
     let hardlink_link = b"/hardlink_link\0";
 
@@ -268,7 +260,6 @@ fn test_unlink_hardlink_persistence() {
 
 /// Test: unlink() on directory should return EISDIR
 fn test_unlink_eisdir() {
-
     let test_dir = b"/unlink_test_dir\0";
     let ret = sys_mkdir(test_dir.as_ptr(), 0o755);
     if ret != 0 {
@@ -290,7 +281,6 @@ fn test_unlink_eisdir() {
 
 /// Test: lseek() with invalid whence
 fn test_lseek_invalid_whence() {
-
     let test_file = b"/test.txt\0";
     let fd = sys_open(test_file.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
@@ -312,7 +302,6 @@ fn test_lseek_invalid_whence() {
 
 /// Test: lseek() negative position should fail
 fn test_lseek_negative_pos() {
-
     let test_file = b"/test.txt\0";
     let fd = sys_open(test_file.as_ptr(), O_RDONLY, 0);
     if fd < 0 {
@@ -334,7 +323,6 @@ fn test_lseek_negative_pos() {
 
 /// Test: truncate() on directory should fail with EISDIR
 fn test_truncate_eisdir() {
-
     let test_dir = b"/trunc_dir_test\0";
     let ret = sys_mkdir(test_dir.as_ptr(), 0o755);
     if ret != 0 {
@@ -356,7 +344,6 @@ fn test_truncate_eisdir() {
 
 /// Test: rename() cycle detection
 fn test_rename_cycle() {
-
     let cycle_a = b"/cycle_a\0";
     let cycle_b = b"/cycle_a/cycle_b\0";
 
@@ -521,7 +508,6 @@ fn unmount_vfat() {
 
 /// Test: VFAT case-insensitive filename matching
 fn test_vfat_case_insensitive() {
-
     // Create a file with lowercase name
     let lowercase = b"/vfat_test/testfile.txt\0";
     let fd = sys_open(lowercase.as_ptr(), O_CREAT | O_WRONLY, 0o644);

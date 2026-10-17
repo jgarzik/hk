@@ -2,12 +2,11 @@
 //!
 //! Tests for the TCP protocol implementation using fork()-based server/client.
 
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_accept, sys_bind, sys_close, sys_connect, sys_fork, sys_listen,
-    sys_recvfrom, sys_sendto, sys_socket, sys_wait4,
-    AF_INET, SOCK_STREAM, SockAddrIn, htons, htonl, make_ipv4,
+    AF_INET, SOCK_STREAM, SockAddrIn, htonl, htons, make_ipv4, sys_accept, sys_bind, sys_close,
+    sys_connect, sys_fork, sys_listen, sys_recvfrom, sys_sendto, sys_socket, sys_wait4,
 };
-use super::helpers::{print, println, print_num};
 
 /// Run all TCP tests
 pub fn run_tests() {
@@ -179,11 +178,7 @@ fn run_tcp_client(port: u16) {
     print(b"\n");
 
     // Connect to server
-    let server_addr = SockAddrIn::new(
-        AF_INET as u16,
-        htons(port),
-        htonl(make_ipv4(127, 0, 0, 1)),
-    );
+    let server_addr = SockAddrIn::new(AF_INET as u16, htons(port), htonl(make_ipv4(127, 0, 0, 1)));
 
     let ret = sys_connect(
         client_fd as i32,

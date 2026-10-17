@@ -3,7 +3,7 @@
 //! Tests for cross-process memory access syscalls.
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{sys_getpid, sys_process_vm_readv, sys_process_vm_writev, IoVec};
+use hk_syscall::{IoVec, sys_getpid, sys_process_vm_readv, sys_process_vm_writev};
 
 const ESRCH: i64 = -3;
 const EINVAL: i64 = -22;
@@ -59,7 +59,10 @@ fn test_process_vm_writev_self() {
     print(b"  process_vm_writev self: ");
 
     // Source buffer with known data
-    let source: [u8; 16] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00];
+    let source: [u8; 16] = [
+        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+        0x00,
+    ];
     // Destination buffer (initially zeros)
     let mut dest: [u8; 16] = [0; 16];
 

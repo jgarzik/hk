@@ -13,10 +13,10 @@
 //! - Test mq_close fd
 //! - Test mq_emsgsize
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_mq_open, sys_mq_unlink, sys_mq_timedsend, sys_mq_timedreceive,
-    sys_mq_getsetattr, MqAttr, O_RDWR, O_CREAT, O_NONBLOCK, O_EXCL,
+    MqAttr, O_CREAT, O_EXCL, O_NONBLOCK, O_RDWR, sys_close, sys_mq_getsetattr, sys_mq_open,
+    sys_mq_timedreceive, sys_mq_timedsend, sys_mq_unlink,
 };
 
 // Error codes
@@ -124,7 +124,12 @@ fn test_mq_open_excl() {
     }
 
     // Try to create again with O_EXCL - should fail
-    let fd2 = sys_mq_open(name.as_ptr(), O_RDWR as i32 | O_CREAT as i32 | O_EXCL as i32, 0o644, &attr);
+    let fd2 = sys_mq_open(
+        name.as_ptr(),
+        O_RDWR as i32 | O_CREAT as i32 | O_EXCL as i32,
+        0o644,
+        &attr,
+    );
     if fd2 == EEXIST {
         println(b"MQ_OPEN_EXCL:OK");
     } else {
@@ -217,7 +222,13 @@ fn test_mq_send_receive() {
     // Receive message
     let mut buf = [0u8; 256];
     let mut prio: u32 = 0;
-    let ret = sys_mq_timedreceive(fd as i32, buf.as_mut_ptr(), buf.len(), &mut prio, core::ptr::null());
+    let ret = sys_mq_timedreceive(
+        fd as i32,
+        buf.as_mut_ptr(),
+        buf.len(),
+        &mut prio,
+        core::ptr::null(),
+    );
     if ret < 0 {
         print(b"MQ_SEND_RECEIVE:FAIL: receive returned ");
         print_num(ret);
@@ -254,7 +265,13 @@ fn test_mq_priority_ordering() {
     }
 
     // Send low priority first
-    let ret = sys_mq_timedsend(fd as i32, msg_lo.as_ptr(), msg_lo.len(), 1, core::ptr::null());
+    let ret = sys_mq_timedsend(
+        fd as i32,
+        msg_lo.as_ptr(),
+        msg_lo.len(),
+        1,
+        core::ptr::null(),
+    );
     if ret != 0 {
         print(b"MQ_PRIORITY:FAIL: send low returned ");
         print_num(ret);
@@ -264,7 +281,13 @@ fn test_mq_priority_ordering() {
     }
 
     // Send high priority second
-    let ret = sys_mq_timedsend(fd as i32, msg_hi.as_ptr(), msg_hi.len(), 10, core::ptr::null());
+    let ret = sys_mq_timedsend(
+        fd as i32,
+        msg_hi.as_ptr(),
+        msg_hi.len(),
+        10,
+        core::ptr::null(),
+    );
     if ret != 0 {
         print(b"MQ_PRIORITY:FAIL: send high returned ");
         print_num(ret);
@@ -276,7 +299,13 @@ fn test_mq_priority_ordering() {
     // Receive - should get high priority first
     let mut buf = [0u8; 256];
     let mut prio: u32 = 0;
-    let ret = sys_mq_timedreceive(fd as i32, buf.as_mut_ptr(), buf.len(), &mut prio, core::ptr::null());
+    let ret = sys_mq_timedreceive(
+        fd as i32,
+        buf.as_mut_ptr(),
+        buf.len(),
+        &mut prio,
+        core::ptr::null(),
+    );
     if ret < 0 {
         print(b"MQ_PRIORITY:FAIL: receive returned ");
         print_num(ret);
@@ -303,7 +332,12 @@ fn test_mq_nonblock_eagain() {
 
     // Create queue with O_NONBLOCK
     let attr = MqAttr::new(10, 256);
-    let fd = sys_mq_open(name.as_ptr(), O_RDWR as i32 | O_CREAT as i32 | O_NONBLOCK as i32, 0o644, &attr);
+    let fd = sys_mq_open(
+        name.as_ptr(),
+        O_RDWR as i32 | O_CREAT as i32 | O_NONBLOCK as i32,
+        0o644,
+        &attr,
+    );
     if fd < 0 {
         print(b"MQ_NONBLOCK:FAIL: create returned ");
         print_num(fd);
@@ -313,7 +347,13 @@ fn test_mq_nonblock_eagain() {
     // Try to receive from empty queue - should return EAGAIN
     let mut buf = [0u8; 256];
     let mut prio: u32 = 0;
-    let ret = sys_mq_timedreceive(fd as i32, buf.as_mut_ptr(), buf.len(), &mut prio, core::ptr::null());
+    let ret = sys_mq_timedreceive(
+        fd as i32,
+        buf.as_mut_ptr(),
+        buf.len(),
+        &mut prio,
+        core::ptr::null(),
+    );
     if ret == EAGAIN {
         println(b"MQ_NONBLOCK:OK");
     } else {
@@ -380,7 +420,13 @@ fn test_mq_close_fd() {
     // Try to use closed fd - should return EBADF
     let mut buf = [0u8; 256];
     let mut prio: u32 = 0;
-    let ret = sys_mq_timedreceive(fd as i32, buf.as_mut_ptr(), buf.len(), &mut prio, core::ptr::null());
+    let ret = sys_mq_timedreceive(
+        fd as i32,
+        buf.as_mut_ptr(),
+        buf.len(),
+        &mut prio,
+        core::ptr::null(),
+    );
     if ret == EBADF {
         println(b"MQ_CLOSE_FD:OK");
     } else {
@@ -426,7 +472,12 @@ fn test_mq_emsgsize() {
 fn test_mq_name_slash() {
     let names: [&[u8]; 3] = [b"/test_mq_slash\0", b"test/mq_slash\0", b"..\0"];
     for name in names {
-        let fd = sys_mq_open(name.as_ptr(), O_RDWR as i32 | O_CREAT as i32, 0o600, core::ptr::null());
+        let fd = sys_mq_open(
+            name.as_ptr(),
+            O_RDWR as i32 | O_CREAT as i32,
+            0o600,
+            core::ptr::null(),
+        );
         if fd != EACCES {
             print(b"MQ_NAME_SLASH:FAIL: mq_open expected -13, got ");
             print_num(fd);

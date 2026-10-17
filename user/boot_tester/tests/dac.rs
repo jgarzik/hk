@@ -6,11 +6,11 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_chdir, sys_chmod, sys_chown, sys_close, sys_execve, sys_exit, sys_faccessat, sys_fchmod,
-    sys_fchown, sys_fork, sys_fstat, sys_link, sys_mkdir, sys_open, sys_rename, sys_rmdir, sys_setfsuid,
-    sys_setresgid, sys_setresuid, sys_setxattr, sys_stat, sys_symlink, sys_truncate, sys_umask,
-    sys_unlink, sys_utimensat, sys_wait4, sys_write, Stat, Timespec, AT_FDCWD, O_CREAT,
-    O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, UTIME_NOW, UTIME_OMIT,
+    AT_FDCWD, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Stat, Timespec,
+    UTIME_NOW, UTIME_OMIT, sys_chdir, sys_chmod, sys_chown, sys_close, sys_execve, sys_exit,
+    sys_faccessat, sys_fchmod, sys_fchown, sys_fork, sys_fstat, sys_link, sys_mkdir, sys_open,
+    sys_rename, sys_rmdir, sys_setfsuid, sys_setresgid, sys_setresuid, sys_setxattr, sys_stat,
+    sys_symlink, sys_truncate, sys_umask, sys_unlink, sys_utimensat, sys_wait4, sys_write,
 };
 
 const EPERM: i64 = -1;
@@ -181,17 +181,57 @@ fn setup() {
 /// open() access modes against the mode bits (may_open)
 fn t_open(n: &[u8]) -> u64 {
     let mut f = 0;
-    f += chk(n, b"0600 read", try_open(b"/tmp/dac/f600\0", O_RDONLY), EACCES);
-    f += chk(n, b"0600 write", try_open(b"/tmp/dac/f600\0", O_WRONLY), EACCES);
+    f += chk(
+        n,
+        b"0600 read",
+        try_open(b"/tmp/dac/f600\0", O_RDONLY),
+        EACCES,
+    );
+    f += chk(
+        n,
+        b"0600 write",
+        try_open(b"/tmp/dac/f600\0", O_WRONLY),
+        EACCES,
+    );
     f += chk(n, b"0644 read", try_open(b"/tmp/dac/f644\0", O_RDONLY), 0);
-    f += chk(n, b"0644 write", try_open(b"/tmp/dac/f644\0", O_WRONLY), EACCES);
-    f += chk(n, b"0644 rdwr", try_open(b"/tmp/dac/f644\0", O_RDWR), EACCES);
-    f += chk(n, b"0644 trunc", try_open(b"/tmp/dac/f644\0", O_RDONLY | O_TRUNC), EACCES);
+    f += chk(
+        n,
+        b"0644 write",
+        try_open(b"/tmp/dac/f644\0", O_WRONLY),
+        EACCES,
+    );
+    f += chk(
+        n,
+        b"0644 rdwr",
+        try_open(b"/tmp/dac/f644\0", O_RDWR),
+        EACCES,
+    );
+    f += chk(
+        n,
+        b"0644 trunc",
+        try_open(b"/tmp/dac/f644\0", O_RDONLY | O_TRUNC),
+        EACCES,
+    );
     f += chk(n, b"0666 rdwr", try_open(b"/tmp/dac/f666\0", O_RDWR), 0);
     f += chk(n, b"dir write", try_open(b"/tmp/dac\0", O_WRONLY), EISDIR);
-    f += chk(n, b"noatime", try_open(b"/tmp/dac/f644\0", O_RDONLY | O_NOATIME), EPERM);
-    f += chk(n, b"access r", sys_faccessat(AT_FDCWD, b"/tmp/dac/f600\0".as_ptr(), R_OK), EACCES);
-    f += chk(n, b"access w", sys_faccessat(AT_FDCWD, b"/tmp/dac/f666\0".as_ptr(), W_OK), 0);
+    f += chk(
+        n,
+        b"noatime",
+        try_open(b"/tmp/dac/f644\0", O_RDONLY | O_NOATIME),
+        EPERM,
+    );
+    f += chk(
+        n,
+        b"access r",
+        sys_faccessat(AT_FDCWD, b"/tmp/dac/f600\0".as_ptr(), R_OK),
+        EACCES,
+    );
+    f += chk(
+        n,
+        b"access w",
+        sys_faccessat(AT_FDCWD, b"/tmp/dac/f666\0".as_ptr(), W_OK),
+        0,
+    );
     f
 }
 
@@ -199,12 +239,42 @@ fn t_open(n: &[u8]) -> u64 {
 fn t_search(n: &[u8]) -> u64 {
     let mut st: Stat = unsafe { core::mem::zeroed() };
     let mut f = 0;
-    f += chk(n, b"stat", sys_stat(b"/tmp/dac/d700/in\0".as_ptr(), &mut st), EACCES);
-    f += chk(n, b"open", try_open(b"/tmp/dac/d700/in\0", O_RDONLY), EACCES);
-    f += chk(n, b"missing", try_open(b"/tmp/dac/d700/none\0", O_RDONLY), EACCES);
-    f += chk(n, b"dotdot", try_open(b"/tmp/dac/d700/../f644\0", O_RDONLY), EACCES);
-    f += chk(n, b"opendir", try_open(b"/tmp/dac/d700\0", O_RDONLY | O_DIRECTORY), EACCES);
-    f += chk(n, b"stat dir", sys_stat(b"/tmp/dac/d700\0".as_ptr(), &mut st), 0);
+    f += chk(
+        n,
+        b"stat",
+        sys_stat(b"/tmp/dac/d700/in\0".as_ptr(), &mut st),
+        EACCES,
+    );
+    f += chk(
+        n,
+        b"open",
+        try_open(b"/tmp/dac/d700/in\0", O_RDONLY),
+        EACCES,
+    );
+    f += chk(
+        n,
+        b"missing",
+        try_open(b"/tmp/dac/d700/none\0", O_RDONLY),
+        EACCES,
+    );
+    f += chk(
+        n,
+        b"dotdot",
+        try_open(b"/tmp/dac/d700/../f644\0", O_RDONLY),
+        EACCES,
+    );
+    f += chk(
+        n,
+        b"opendir",
+        try_open(b"/tmp/dac/d700\0", O_RDONLY | O_DIRECTORY),
+        EACCES,
+    );
+    f += chk(
+        n,
+        b"stat dir",
+        sys_stat(b"/tmp/dac/d700\0".as_ptr(), &mut st),
+        0,
+    );
     f += chk(n, b"chdir", sys_chdir(b"/tmp/dac/d700\0".as_ptr()), EACCES);
     f
 }
@@ -212,14 +282,39 @@ fn t_search(n: &[u8]) -> u64 {
 /// Creating or removing names needs write+search on the parent
 fn t_create(n: &[u8]) -> u64 {
     let mut f = 0;
-    f += chk(n, b"creat", try_open(b"/tmp/dac/new\0", O_CREAT | O_WRONLY), EACCES);
-    f += chk(n, b"mkdir", sys_mkdir(b"/tmp/dac/newd\0".as_ptr(), 0o755), EACCES);
-    f += chk(n, b"mkdir exist", sys_mkdir(b"/tmp/dac/d700\0".as_ptr(), 0o755), EEXIST);
-    f += chk(n, b"symlink", sys_symlink(b"x\0".as_ptr(), b"/tmp/dac/sl\0".as_ptr()), EACCES);
+    f += chk(
+        n,
+        b"creat",
+        try_open(b"/tmp/dac/new\0", O_CREAT | O_WRONLY),
+        EACCES,
+    );
+    f += chk(
+        n,
+        b"mkdir",
+        sys_mkdir(b"/tmp/dac/newd\0".as_ptr(), 0o755),
+        EACCES,
+    );
+    f += chk(
+        n,
+        b"mkdir exist",
+        sys_mkdir(b"/tmp/dac/d700\0".as_ptr(), 0o755),
+        EEXIST,
+    );
+    f += chk(
+        n,
+        b"symlink",
+        sys_symlink(b"x\0".as_ptr(), b"/tmp/dac/sl\0".as_ptr()),
+        EACCES,
+    );
     // Own source file: protected_hardlinks (1 on Ubuntu, 0 upstream) allows it
     let r = sys_link(b"/tmp/dac/x100\0".as_ptr(), b"/tmp/dac/ln\0".as_ptr());
     f += chk(n, b"link", r, EACCES);
-    f += chk(n, b"unlink", sys_unlink(b"/tmp/dac/f644\0".as_ptr()), EACCES);
+    f += chk(
+        n,
+        b"unlink",
+        sys_unlink(b"/tmp/dac/f644\0".as_ptr()),
+        EACCES,
+    );
     f += chk(n, b"rmdir", sys_rmdir(b"/tmp/dac/d700\0".as_ptr()), EACCES);
     let r = sys_rename(b"/tmp/dac/f644\0".as_ptr(), b"/tmp/dac/sticky/x\0".as_ptr());
     f += chk(n, b"rename", r, EACCES);
@@ -232,8 +327,16 @@ fn t_sticky(n: &[u8]) -> u64 {
     let mut f = 0;
     let mine = b"/tmp/dac/sticky/mine\0";
     f += chk(n, b"create", try_open(mine, O_CREAT | O_WRONLY), 0);
-    f += chk(n, b"unlink other", sys_unlink(b"/tmp/dac/sticky/rootf\0".as_ptr()), EPERM);
-    let r = sys_rename(b"/tmp/dac/sticky/rootf\0".as_ptr(), b"/tmp/dac/sticky/y\0".as_ptr());
+    f += chk(
+        n,
+        b"unlink other",
+        sys_unlink(b"/tmp/dac/sticky/rootf\0".as_ptr()),
+        EPERM,
+    );
+    let r = sys_rename(
+        b"/tmp/dac/sticky/rootf\0".as_ptr(),
+        b"/tmp/dac/sticky/y\0".as_ptr(),
+    );
     f += chk(n, b"rename other", r, EPERM);
     let r = sys_rename(mine.as_ptr(), b"/tmp/dac/sticky/rootf\0".as_ptr());
     f += chk(n, b"replace other", r, EPERM);
@@ -254,7 +357,12 @@ fn t_exec(n: &[u8]) -> u64 {
 /// chmod is owner-only (CAP_FOWNER); SGID dropped outside the group
 fn t_chmod(n: &[u8]) -> u64 {
     let mut f = 0;
-    f += chk(n, b"other", sys_chmod(b"/tmp/dac/f666\0".as_ptr(), 0o777), EPERM);
+    f += chk(
+        n,
+        b"other",
+        sys_chmod(b"/tmp/dac/f666\0".as_ptr(), 0o777),
+        EPERM,
+    );
     let p = b"/tmp/dac/sticky/cm\0";
     let fd = sys_open(p.as_ptr(), O_CREAT | O_WRONLY, 0o644);
     f += chk(n, b"create", (fd >= 0) as i64, 1);
@@ -269,7 +377,12 @@ fn t_chmod(n: &[u8]) -> u64 {
 /// chown needs CAP_CHOWN except an owner "changing" to its own ids
 fn t_chown(n: &[u8]) -> u64 {
     let mut f = 0;
-    f += chk(n, b"other", sys_chown(b"/tmp/dac/f666\0".as_ptr(), USER, USER), EPERM);
+    f += chk(
+        n,
+        b"other",
+        sys_chown(b"/tmp/dac/f666\0".as_ptr(), USER, USER),
+        EPERM,
+    );
     let p = b"/tmp/dac/sticky/co\0";
     let fd = sys_open(p.as_ptr(), O_CREAT | O_WRONLY, 0o644);
     f += chk(n, b"give away", sys_fchown(fd as i32, 0, u32::MAX), EPERM);
@@ -283,16 +396,63 @@ fn t_chown(n: &[u8]) -> u64 {
 
 /// utimensat: explicit times need ownership, "now" needs write access
 fn t_utimes(n: &[u8]) -> u64 {
-    let set = [Timespec { tv_sec: 1, tv_nsec: 0 }, Timespec { tv_sec: 2, tv_nsec: 0 }];
-    let now = [Timespec { tv_sec: 0, tv_nsec: UTIME_NOW }, Timespec { tv_sec: 0, tv_nsec: UTIME_NOW }];
-    let omit = [Timespec { tv_sec: 0, tv_nsec: UTIME_OMIT }, Timespec { tv_sec: 0, tv_nsec: UTIME_OMIT }];
+    let set = [
+        Timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        },
+        Timespec {
+            tv_sec: 2,
+            tv_nsec: 0,
+        },
+    ];
+    let now = [
+        Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_NOW,
+        },
+        Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_NOW,
+        },
+    ];
+    let omit = [
+        Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        },
+        Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        },
+    ];
     let rw = b"/tmp/dac/f666\0".as_ptr();
     let ro = b"/tmp/dac/f644\0".as_ptr();
     let mut f = 0;
-    f += chk(n, b"explicit", sys_utimensat(AT_FDCWD, rw, set.as_ptr(), 0), EPERM);
-    f += chk(n, b"null rw", sys_utimensat(AT_FDCWD, rw, core::ptr::null(), 0), 0);
-    f += chk(n, b"now rw", sys_utimensat(AT_FDCWD, rw, now.as_ptr(), 0), 0);
-    f += chk(n, b"null ro", sys_utimensat(AT_FDCWD, ro, core::ptr::null(), 0), EACCES);
+    f += chk(
+        n,
+        b"explicit",
+        sys_utimensat(AT_FDCWD, rw, set.as_ptr(), 0),
+        EPERM,
+    );
+    f += chk(
+        n,
+        b"null rw",
+        sys_utimensat(AT_FDCWD, rw, core::ptr::null(), 0),
+        0,
+    );
+    f += chk(
+        n,
+        b"now rw",
+        sys_utimensat(AT_FDCWD, rw, now.as_ptr(), 0),
+        0,
+    );
+    f += chk(
+        n,
+        b"null ro",
+        sys_utimensat(AT_FDCWD, ro, core::ptr::null(), 0),
+        EACCES,
+    );
     f += chk(n, b"omit", sys_utimensat(AT_FDCWD, ro, omit.as_ptr(), 0), 0);
     f
 }
@@ -300,9 +460,19 @@ fn t_utimes(n: &[u8]) -> u64 {
 /// truncate needs write access
 fn t_truncate(n: &[u8]) -> u64 {
     let mut f = 0;
-    f += chk(n, b"0644", sys_truncate(b"/tmp/dac/f644\0".as_ptr(), 0), EACCES);
+    f += chk(
+        n,
+        b"0644",
+        sys_truncate(b"/tmp/dac/f644\0".as_ptr(), 0),
+        EACCES,
+    );
     f += chk(n, b"0666", sys_truncate(b"/tmp/dac/f666\0".as_ptr(), 6), 0);
-    f += chk(n, b"dir", sys_truncate(b"/tmp/dac/sticky\0".as_ptr(), 0), EISDIR);
+    f += chk(
+        n,
+        b"dir",
+        sys_truncate(b"/tmp/dac/sticky\0".as_ptr(), 0),
+        EISDIR,
+    );
     f
 }
 
@@ -312,8 +482,18 @@ fn t_rename_dir(n: &[u8]) -> u64 {
     let a = b"/tmp/dac/rn/a/rootsub\0";
     let r = sys_rename(a.as_ptr(), b"/tmp/dac/rn/b/rootsub\0".as_ptr());
     f += chk(n, b"cross", r, EACCES);
-    f += chk(n, b"same dir", sys_rename(a.as_ptr(), b"/tmp/dac/rn/a/r2\0".as_ptr()), 0);
-    f += chk(n, b"back", sys_rename(b"/tmp/dac/rn/a/r2\0".as_ptr(), a.as_ptr()), 0);
+    f += chk(
+        n,
+        b"same dir",
+        sys_rename(a.as_ptr(), b"/tmp/dac/rn/a/r2\0".as_ptr()),
+        0,
+    );
+    f += chk(
+        n,
+        b"back",
+        sys_rename(b"/tmp/dac/rn/a/r2\0".as_ptr(), a.as_ptr()),
+        0,
+    );
     f
 }
 
@@ -344,9 +524,21 @@ fn t_owner_new(n: &[u8]) -> u64 {
 fn t_xattr(n: &[u8]) -> u64 {
     let v = b"v";
     let mut f = 0;
-    let r = sys_setxattr(b"/tmp/dac/f644\0".as_ptr(), b"user.x\0".as_ptr(), v.as_ptr(), 1, 0);
+    let r = sys_setxattr(
+        b"/tmp/dac/f644\0".as_ptr(),
+        b"user.x\0".as_ptr(),
+        v.as_ptr(),
+        1,
+        0,
+    );
     f += chk(n, b"user ro", r, EACCES);
-    let r = sys_setxattr(b"/tmp/dac/f666\0".as_ptr(), b"trusted.x\0".as_ptr(), v.as_ptr(), 1, 0);
+    let r = sys_setxattr(
+        b"/tmp/dac/f666\0".as_ptr(),
+        b"trusted.x\0".as_ptr(),
+        v.as_ptr(),
+        1,
+        0,
+    );
     f += chk(n, b"trusted", r, EPERM);
     f
 }
@@ -372,7 +564,12 @@ fn t_root(n: &[u8]) -> u64 {
     let mut f = 0;
     f += chk(n, b"read 0000", try_open(b"/tmp/dac/f000\0", O_RDONLY), 0);
     f += chk(n, b"write 0000", try_open(b"/tmp/dac/f000\0", O_WRONLY), 0);
-    f += chk(n, b"search 0700", try_open(b"/tmp/dac/d700/in\0", O_RDONLY), 0);
+    f += chk(
+        n,
+        b"search 0700",
+        try_open(b"/tmp/dac/d700/in\0", O_RDONLY),
+        0,
+    );
     f += chk(n, b"exec 0644", exec(b"/tmp/dac/f644\0"), EACCES);
     f += chk(n, b"exec 0100", exec(b"/tmp/dac/x100\0"), ENOEXEC);
     let x = sys_faccessat(AT_FDCWD, b"/tmp/dac/f644\0".as_ptr(), X_OK);
@@ -380,13 +577,23 @@ fn t_root(n: &[u8]) -> u64 {
     let x = sys_faccessat(AT_FDCWD, b"/tmp/dac/x755\0".as_ptr(), X_OK);
     f += chk(n, b"access x 0755", x, 0);
     f += chk(n, b"dir write", try_open(b"/tmp/dac\0", O_RDWR), EISDIR);
-    f += chk(n, b"missing", try_open(b"/tmp/dac/none\0", O_RDONLY), ENOENT);
+    f += chk(
+        n,
+        b"missing",
+        try_open(b"/tmp/dac/none\0", O_RDONLY),
+        ENOENT,
+    );
     // Root keeps SUID on its own writes (CAP_FSETID)
     mkfile(b"/tmp/dac/rsuid\0", b"abc", 0o4755, USER);
     let fd = sys_open(b"/tmp/dac/rsuid\0".as_ptr(), O_WRONLY, 0);
     sys_write(fd as u64, b"x".as_ptr(), 1);
     sys_close(fd as u64);
-    f += chk(n, b"root write keeps suid", mode_of(b"/tmp/dac/rsuid\0"), 0o4755);
+    f += chk(
+        n,
+        b"root write keeps suid",
+        mode_of(b"/tmp/dac/rsuid\0"),
+        0o4755,
+    );
     f
 }
 
@@ -394,7 +601,12 @@ fn t_root(n: &[u8]) -> u64 {
 fn t_fsuid(n: &[u8]) -> u64 {
     let mut f = 0;
     sys_setfsuid(USER);
-    f += chk(n, b"fsuid 0600", try_open(b"/tmp/dac/f600\0", O_RDONLY), EACCES);
+    f += chk(
+        n,
+        b"fsuid 0600",
+        try_open(b"/tmp/dac/f600\0", O_RDONLY),
+        EACCES,
+    );
     f += chk(n, b"fsuid 0644", try_open(b"/tmp/dac/f644\0", O_RDONLY), 0);
     // access() checks with the real uid (0), not the fsuid
     let r = sys_faccessat(AT_FDCWD, b"/tmp/dac/f600\0".as_ptr(), R_OK);

@@ -6,7 +6,9 @@
 //! - F_SETSIG/F_GETSIG: Set/get signal number for async I/O
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{sys_close, sys_fcntl, sys_getpgid, sys_getpid, sys_mkdir, sys_open, O_CREAT, O_RDWR};
+use hk_syscall::{
+    O_CREAT, O_RDWR, sys_close, sys_fcntl, sys_getpgid, sys_getpid, sys_mkdir, sys_open,
+};
 
 // fcntl commands
 const F_SETOWN: i32 = 8;

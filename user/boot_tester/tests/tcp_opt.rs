@@ -5,7 +5,7 @@
 //! against a dead peer (a blackhole route), /proc/net/tcp lines and the
 //! TCP sysctls.
 
-use hk_syscall::{sys_exit, sys_fork, sys_getsockopt, sys_setsockopt, sys_shutdown, SHUT_WR};
+use hk_syscall::{SHUT_WR, sys_exit, sys_fork, sys_getsockopt, sys_setsockopt, sys_shutdown};
 
 use super::nl::{self, Nl, Req};
 use super::sk::*;
@@ -105,19 +105,43 @@ fn test_opts() {
     t.eq(b"keepidle default", get(TCP_KEEPIDLE), 7200);
     t.eq(b"keepintvl default", get(TCP_KEEPINTVL), 75);
     t.eq(b"keepcnt default", get(TCP_KEEPCNT), 9);
-    t.eq(b"keepintvl set", setint(fd, IPPROTO_TCP, TCP_KEEPINTVL, 3), 0);
+    t.eq(
+        b"keepintvl set",
+        setint(fd, IPPROTO_TCP, TCP_KEEPINTVL, 3),
+        0,
+    );
     t.eq(b"keepintvl", get(TCP_KEEPINTVL), 3);
-    t.eq(b"keepintvl 0", setint(fd, IPPROTO_TCP, TCP_KEEPINTVL, 0), EINVAL);
+    t.eq(
+        b"keepintvl 0",
+        setint(fd, IPPROTO_TCP, TCP_KEEPINTVL, 0),
+        EINVAL,
+    );
     setint(fd, IPPROTO_TCP, TCP_KEEPCNT, 4);
     t.eq(b"keepcnt", get(TCP_KEEPCNT), 4);
     setint(fd, IPPROTO_TCP, TCP_KEEPIDLE, 33);
     t.eq(b"keepidle", get(TCP_KEEPIDLE), 33);
-    t.eq(b"keepidle max", setint(fd, IPPROTO_TCP, TCP_KEEPIDLE, 32768), EINVAL);
-    t.eq(b"user_timeout", setint(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, 1234), 0);
+    t.eq(
+        b"keepidle max",
+        setint(fd, IPPROTO_TCP, TCP_KEEPIDLE, 32768),
+        EINVAL,
+    );
+    t.eq(
+        b"user_timeout",
+        setint(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, 1234),
+        0,
+    );
     t.eq(b"user_timeout get", get(TCP_USER_TIMEOUT), 1234);
-    t.eq(b"user_timeout neg", setint(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, -1), EINVAL);
+    t.eq(
+        b"user_timeout neg",
+        setint(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, -1),
+        EINVAL,
+    );
     t.eq(b"maxseg default", get(TCP_MAXSEG), 536);
-    t.eq(b"maxseg small", setint(fd, IPPROTO_TCP, TCP_MAXSEG, 87), EINVAL);
+    t.eq(
+        b"maxseg small",
+        setint(fd, IPPROTO_TCP, TCP_MAXSEG, 87),
+        EINVAL,
+    );
     setint(fd, IPPROTO_TCP, TCP_MAXSEG, 1000);
     t.eq(b"maxseg", get(TCP_MAXSEG), 1000);
     setint(fd, IPPROTO_TCP, TCP_SYNCNT, 3);
@@ -130,7 +154,11 @@ fn test_opts() {
     setint(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, 16384);
     t.eq(b"notsent_lowat", get(TCP_NOTSENT_LOWAT), 16384);
     t.eq(b"so_keepalive", setint(fd, SOL_SOCKET, SO_KEEPALIVE, 1), 0);
-    t.eq(b"so_keepalive get", getint(fd, SOL_SOCKET, SO_KEEPALIVE).1 as i64, 1);
+    t.eq(
+        b"so_keepalive get",
+        getint(fd, SOL_SOCKET, SO_KEEPALIVE).1 as i64,
+        1,
+    );
     // TCP_INFO of an unconnected socket: TCP_CLOSE, Linux's size
     let i = tcp_info(fd);
     t.ok(b"info len", i.len >= 104, i.len as i64);
@@ -149,7 +177,15 @@ fn test_congestion() {
     t.eq(b"get", r, 0);
     t.eq(b"len", len as i64, 16);
     t.ok(b"has a name", b[0].is_ascii_lowercase(), b[0] as i64);
-    let set = |name: &[u8]| sys_setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, name.as_ptr(), name.len() as u32);
+    let set = |name: &[u8]| {
+        sys_setsockopt(
+            fd,
+            IPPROTO_TCP,
+            TCP_CONGESTION,
+            name.as_ptr(),
+            name.len() as u32,
+        )
+    };
     t.eq(b"reno", set(b"reno"), 0);
     let mut b = [0xffu8; 16];
     let mut len = 16u32;
@@ -191,14 +227,30 @@ fn test_lo_4mb_info() {
     t.eq(b"data", bad, -1);
     let i = tcp_info(s);
     t.eq(b"state", i.state as i64, 1);
-    t.ok(b"wscale opt", i.options & TCPI_OPT_WSCALE != 0, i.options as i64);
-    t.ok(b"ts opt", i.options & TCPI_OPT_TIMESTAMPS != 0, i.options as i64);
+    t.ok(
+        b"wscale opt",
+        i.options & TCPI_OPT_WSCALE != 0,
+        i.options as i64,
+    );
+    t.ok(
+        b"ts opt",
+        i.options & TCPI_OPT_TIMESTAMPS != 0,
+        i.options as i64,
+    );
     t.ok(b"snd_wscale", i.snd_wscale > 0, i.snd_wscale as i64);
     t.ok(b"rcv_wscale", i.rcv_wscale > 0, i.rcv_wscale as i64);
-    t.ok(b"snd_mss", i.snd_mss > 0 && i.snd_mss <= 65535, i.snd_mss as i64);
+    t.ok(
+        b"snd_mss",
+        i.snd_mss > 0 && i.snd_mss <= 65535,
+        i.snd_mss as i64,
+    );
     t.ok(b"rcv_mss", i.rcv_mss > 0, i.rcv_mss as i64);
     t.ok(b"advmss", i.advmss >= i.snd_mss, i.advmss as i64);
-    t.ok(b"rto", i.rto >= 200_000 && i.rto <= 120_000_000, i.rto as i64);
+    t.ok(
+        b"rto",
+        i.rto >= 200_000 && i.rto <= 120_000_000,
+        i.rto as i64,
+    );
     t.ok(b"rtt", i.rtt < 5_000_000, i.rtt as i64);
     t.ok(b"cwnd", i.snd_cwnd > 0, i.snd_cwnd as i64);
     sys_shutdown(s, SHUT_WR);
@@ -217,8 +269,16 @@ fn test_maxseg_conn() {
     setint(c, IPPROTO_TCP, TCP_MAXSEG, 1000);
     t.eq(b"connect", connect(c, LO, p), 0);
     let s = accept(l);
-    t.eq(b"client mss", getint(c, IPPROTO_TCP, TCP_MAXSEG).1 as i64, 988);
-    t.eq(b"server mss", getint(s, IPPROTO_TCP, TCP_MAXSEG).1 as i64, 988);
+    t.eq(
+        b"client mss",
+        getint(c, IPPROTO_TCP, TCP_MAXSEG).1 as i64,
+        988,
+    );
+    t.eq(
+        b"server mss",
+        getint(s, IPPROTO_TCP, TCP_MAXSEG).1 as i64,
+        988,
+    );
     t.eq(b"info snd_mss", tcp_info(s).snd_mss as i64, 988);
     // Data still flows in 988-byte pieces
     set_timeo(s, 10_000);
@@ -288,7 +348,11 @@ fn test_proc_net_tcp() {
     let n = read_file(b"/proc/net/tcp\0", buf);
     t.ok(b"read", n > 0, n);
     let text = &buf[..n.max(0) as usize];
-    t.ok(b"header", text.starts_with(b"  sl  local_address rem_address   st tx_queue rx_queue"), 0);
+    t.ok(
+        b"header",
+        text.starts_with(b"  sl  local_address rem_address   st tx_queue rx_queue"),
+        0,
+    );
     let mut lo = *b"0100007F:0000";
     hex(p as u32, 4, &mut lo[9..]);
     let mut lc = *b"0100007F:0000";
@@ -314,10 +378,21 @@ fn test_proc_net_tcp() {
 fn test_sysctls() {
     let mut t = T::new(b"TCP_SYSCTLS");
     let mut b = [0u8; 128];
-    let n = read_file(b"/proc/sys/net/ipv4/tcp_available_congestion_control\0", &mut b);
-    t.ok(b"available has reno", n > 0 && has_line(&b[..n as usize], &[b"reno"]), n);
+    let n = read_file(
+        b"/proc/sys/net/ipv4/tcp_available_congestion_control\0",
+        &mut b,
+    );
+    t.ok(
+        b"available has reno",
+        n > 0 && has_line(&b[..n as usize], &[b"reno"]),
+        n,
+    );
     let n = read_file(b"/proc/sys/net/ipv4/tcp_congestion_control\0", &mut b);
-    t.ok(b"default", n > 1 && b[0].is_ascii_lowercase() && b[n as usize - 1] == b'\n', n);
+    t.ok(
+        b"default",
+        n > 1 && b[0].is_ascii_lowercase() && b[n as usize - 1] == b'\n',
+        n,
+    );
     for (path, want) in [
         (&b"/proc/sys/net/ipv4/tcp_window_scaling\0"[..], &b"1\n"[..]),
         (b"/proc/sys/net/ipv4/tcp_timestamps\0", b"1\n"),
@@ -326,10 +401,18 @@ fn test_sysctls() {
         (b"/proc/sys/net/ipv4/tcp_keepalive_probes\0", b"9\n"),
     ] {
         let n = read_file(path, &mut b);
-        t.ok(&path[..path.len() - 1], n > 0 && &b[..n as usize] == want, n);
+        t.ok(
+            &path[..path.len() - 1],
+            n > 0 && &b[..n as usize] == want,
+            n,
+        );
     }
     let n = read_file(b"/proc/sys/net/ipv4/tcp_rmem\0", &mut b);
-    t.ok(b"tcp_rmem 3 values", n > 0 && b[..n as usize].iter().filter(|&&c| c == b'\t').count() == 2, n);
+    t.ok(
+        b"tcp_rmem 3 values",
+        n > 0 && b[..n as usize].iter().filter(|&&c| c == b'\t').count() == 2,
+        n,
+    );
     t.done();
 }
 
@@ -367,11 +450,21 @@ const RTN_BLACKHOLE: u8 = 6;
 /// Add or delete a blackhole route for `dst`/32 in the main table
 fn blackhole(nl: &mut Nl, add: bool, dst: [u8; 4]) -> i32 {
     let (ty, flags, proto, scope, rtype) = if add {
-        (nl::RTM_NEWROUTE, nl::NLM_F_CREATE | nl::NLM_F_EXCL, nl::RTPROT_BOOT, nl::RT_SCOPE_UNIVERSE, RTN_BLACKHOLE)
+        (
+            nl::RTM_NEWROUTE,
+            nl::NLM_F_CREATE | nl::NLM_F_EXCL,
+            nl::RTPROT_BOOT,
+            nl::RT_SCOPE_UNIVERSE,
+            RTN_BLACKHOLE,
+        )
     } else {
         (nl::RTM_DELROUTE, 0, 0, 255, 0)
     };
-    let mut r = Req::new(ty, flags, &nl::rtmsg(32, nl::RT_TABLE_MAIN, proto, scope, rtype));
+    let mut r = Req::new(
+        ty,
+        flags,
+        &nl::rtmsg(32, nl::RT_TABLE_MAIN, proto, scope, rtype),
+    );
     r.attr(nl::RTA_DST, &dst);
     nl.ack(&mut r)
 }
@@ -407,7 +500,11 @@ fn test_keepalive_dead_peer() {
     let r = recv(fd, &mut b, 0);
     let dt = now_ms() - t0;
     t.eq(b"recv", r, ETIMEDOUT);
-    t.ok(b"took idle + probes", (1500..20_000).contains(&dt), dt as i64);
+    t.ok(
+        b"took idle + probes",
+        (1500..20_000).contains(&dt),
+        dt as i64,
+    );
     t.eq(b"unblackhole", blackhole(&mut nl, false, ECHO) as i64, 0);
     close(fd);
     t.done();

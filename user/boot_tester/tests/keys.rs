@@ -12,13 +12,11 @@
 //! - Test keyctl CLEAR clears keyring
 //! - Test keyctl INVALIDATE removes key
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_add_key, sys_keyctl, sys_request_key,
-    KEY_SPEC_PROCESS_KEYRING, KEY_SPEC_THREAD_KEYRING,
-    KEYCTL_GET_KEYRING_ID, KEYCTL_READ, KEYCTL_DESCRIBE,
-    KEYCTL_LINK, KEYCTL_UNLINK, KEYCTL_UPDATE, KEYCTL_REVOKE,
-    KEYCTL_CLEAR, KEYCTL_INVALIDATE,
+    KEY_SPEC_PROCESS_KEYRING, KEY_SPEC_THREAD_KEYRING, KEYCTL_CLEAR, KEYCTL_DESCRIBE,
+    KEYCTL_GET_KEYRING_ID, KEYCTL_INVALIDATE, KEYCTL_LINK, KEYCTL_READ, KEYCTL_REVOKE,
+    KEYCTL_UNLINK, KEYCTL_UPDATE, sys_add_key, sys_keyctl, sys_request_key,
 };
 
 // Error codes
@@ -265,13 +263,7 @@ fn test_keyctl_link_unlink() {
     }
 
     // Link key to thread keyring
-    let ret = sys_keyctl(
-        KEYCTL_LINK,
-        serial as u64,
-        thread_keyring as u64,
-        0,
-        0,
-    );
+    let ret = sys_keyctl(KEYCTL_LINK, serial as u64, thread_keyring as u64, 0, 0);
 
     if ret != 0 {
         print(b"KEYCTL_LINK_UNLINK:FAIL: LINK returned ");
@@ -280,13 +272,7 @@ fn test_keyctl_link_unlink() {
     }
 
     // Unlink key from thread keyring
-    let ret = sys_keyctl(
-        KEYCTL_UNLINK,
-        serial as u64,
-        thread_keyring as u64,
-        0,
-        0,
-    );
+    let ret = sys_keyctl(KEYCTL_UNLINK, serial as u64, thread_keyring as u64, 0, 0);
 
     if ret == 0 {
         println(b"KEYCTL_LINK_UNLINK:OK");
@@ -318,13 +304,7 @@ fn test_keyctl_revoke() {
     }
 
     // Revoke the key
-    let ret = sys_keyctl(
-        KEYCTL_REVOKE,
-        serial as u64,
-        0,
-        0,
-        0,
-    );
+    let ret = sys_keyctl(KEYCTL_REVOKE, serial as u64, 0, 0, 0);
 
     if ret != 0 {
         print(b"KEYCTL_REVOKE:FAIL: REVOKE returned ");
@@ -427,13 +407,7 @@ fn test_keyctl_clear() {
     }
 
     // Clear the keyring
-    let ret = sys_keyctl(
-        KEYCTL_CLEAR,
-        thread_keyring as u64,
-        0,
-        0,
-        0,
-    );
+    let ret = sys_keyctl(KEYCTL_CLEAR, thread_keyring as u64, 0, 0, 0);
 
     if ret == 0 {
         println(b"KEYCTL_CLEAR:OK");
@@ -465,13 +439,7 @@ fn test_keyctl_invalidate() {
     }
 
     // Invalidate the key
-    let ret = sys_keyctl(
-        KEYCTL_INVALIDATE,
-        serial as u64,
-        0,
-        0,
-        0,
-    );
+    let ret = sys_keyctl(KEYCTL_INVALIDATE, serial as u64, 0, 0, 0);
 
     if ret != 0 {
         print(b"KEYCTL_INVALIDATE:FAIL: INVALIDATE returned ");

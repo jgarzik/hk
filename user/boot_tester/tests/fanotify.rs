@@ -8,8 +8,8 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_fanotify_init, sys_fanotify_mark, FAN_CLOEXEC, FAN_MARK_ADD, FAN_NONBLOCK,
-    FAN_OPEN, O_RDONLY,
+    FAN_CLOEXEC, FAN_MARK_ADD, FAN_NONBLOCK, FAN_OPEN, O_RDONLY, sys_close, sys_fanotify_init,
+    sys_fanotify_mark,
 };
 
 /// AT_FDCWD constant

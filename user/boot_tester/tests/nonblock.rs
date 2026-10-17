@@ -7,10 +7,10 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use hk_syscall::{
-    sys_accept, sys_accept4, sys_exit, sys_fcntl, sys_fork, sys_getppid, sys_ioctl, sys_kill,
-    sys_listen, sys_nanosleep, sys_rt_sigaction, sys_setsockopt, sys_shutdown, sys_socket,
-    sys_wait4, Timespec, AF_INET, O_NONBLOCK, SA_RESTART, SA_RESTORER, SHUT_WR, SIGPIPE, SIGUSR1,
-    SIG_DFL, SIG_IGN, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM,
+    AF_INET, O_NONBLOCK, SA_RESTART, SA_RESTORER, SHUT_WR, SIG_DFL, SIG_IGN, SIGPIPE, SIGUSR1,
+    SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, Timespec, sys_accept, sys_accept4,
+    sys_exit, sys_fcntl, sys_fork, sys_getppid, sys_ioctl, sys_kill, sys_listen, sys_nanosleep,
+    sys_rt_sigaction, sys_setsockopt, sys_shutdown, sys_socket, sys_wait4,
 };
 
 use super::sk::*;
@@ -41,7 +41,10 @@ pub fn run_tests() {
 }
 
 fn msleep(ms: u64) {
-    let ts = Timespec { tv_sec: (ms / 1000) as i64, tv_nsec: ((ms % 1000) * 1_000_000) as i64 };
+    let ts = Timespec {
+        tv_sec: (ms / 1000) as i64,
+        tv_nsec: ((ms % 1000) * 1_000_000) as i64,
+    };
     sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
@@ -50,7 +53,11 @@ fn test_fcntl_nonblock() {
     let mut t = T::new(b"NONBLOCK_FCNTL");
     let (fd, _) = udp_lo();
     let fl = sys_fcntl(fd, F_GETFL, 0);
-    t.eq(b"F_SETFL", sys_fcntl(fd, F_SETFL, (fl as u64) | O_NONBLOCK as u64), 0);
+    t.eq(
+        b"F_SETFL",
+        sys_fcntl(fd, F_SETFL, (fl as u64) | O_NONBLOCK as u64),
+        0,
+    );
     let mut buf = [0u8; 4];
     t.eq(b"EAGAIN", recv(fd, &mut buf, 0), EAGAIN);
     sys_fcntl(fd, F_SETFL, fl as u64);
@@ -65,8 +72,16 @@ fn test_fionbio() {
     let mut t = T::new(b"NONBLOCK_FIONBIO");
     let (fd, _) = udp_lo();
     let one = 1i32;
-    t.eq(b"ioctl", sys_ioctl(fd, FIONBIO, &one as *const i32 as u64), 0);
-    t.ok(b"F_GETFL", sys_fcntl(fd, F_GETFL, 0) & O_NONBLOCK as i64 != 0, 0);
+    t.eq(
+        b"ioctl",
+        sys_ioctl(fd, FIONBIO, &one as *const i32 as u64),
+        0,
+    );
+    t.ok(
+        b"F_GETFL",
+        sys_fcntl(fd, F_GETFL, 0) & O_NONBLOCK as i64 != 0,
+        0,
+    );
     let mut buf = [0u8; 4];
     t.eq(b"EAGAIN", recv(fd, &mut buf, 0), EAGAIN);
     close(fd);
@@ -77,7 +92,11 @@ fn test_fionbio() {
 fn test_sock_nonblock() {
     let mut t = T::new(b"NONBLOCK_SOCK_FLAGS");
     let fd = sys_socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0) as i32;
-    t.ok(b"O_NONBLOCK", sys_fcntl(fd, F_GETFL, 0) & O_NONBLOCK as i64 != 0, 0);
+    t.ok(
+        b"O_NONBLOCK",
+        sys_fcntl(fd, F_GETFL, 0) & O_NONBLOCK as i64 != 0,
+        0,
+    );
     t.eq(b"FD_CLOEXEC", sys_fcntl(fd, F_GETFD, 0), 1);
     close(fd);
     t.done();
@@ -130,7 +149,12 @@ extern "C" fn on_sig(_s: i32) {
 }
 
 fn sigaction(sig: u32, handler: u64, flags: u64) {
-    let a = SigAction { handler, flags: flags | SA_RESTORER, restorer: restorer as *const () as u64, mask: 0 };
+    let a = SigAction {
+        handler,
+        flags: flags | SA_RESTORER,
+        restorer: restorer as *const () as u64,
+        mask: 0,
+    };
     sys_rt_sigaction(sig, &a as *const SigAction as u64, 0, 8);
 }
 
@@ -175,7 +199,11 @@ fn test_signals() {
     HITS.store(0, Ordering::Relaxed);
     t.eq(b"no SA_RESTART", recv_with_signal(0, 0), EINTR);
     t.eq(b"SA_RESTART", recv_with_signal(SA_RESTART, 0), 4);
-    t.eq(b"SA_RESTART + timeout", recv_with_signal(SA_RESTART, 5000), EINTR);
+    t.eq(
+        b"SA_RESTART + timeout",
+        recv_with_signal(SA_RESTART, 5000),
+        EINTR,
+    );
     t.eq(b"handler runs", HITS.load(Ordering::Relaxed) as i64, 3);
     t.done();
 }
@@ -189,7 +217,11 @@ fn test_fionread() {
     send_to(a, &[1u8; 10], LO, pb, 0);
     send_to(a, &[2u8; 20], LO, pb, 0);
     let mut v = -1i32;
-    t.eq(b"ioctl", sys_ioctl(b, FIONREAD, &mut v as *mut i32 as u64), 0);
+    t.eq(
+        b"ioctl",
+        sys_ioctl(b, FIONREAD, &mut v as *mut i32 as u64),
+        0,
+    );
     t.eq(b"udp first", v as i64, 10);
     sys_ioctl(a, SIOCOUTQ, &mut v as *mut i32 as u64);
     t.eq(b"outq", v as i64, 0);
@@ -249,16 +281,33 @@ fn test_tcp_accept() {
     let l = sys_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0) as i32;
     bind(l, LO, 0);
     sys_listen(l, 4);
-    t.eq(b"EAGAIN", sys_accept(l, core::ptr::null_mut(), core::ptr::null_mut()), EAGAIN);
+    t.eq(
+        b"EAGAIN",
+        sys_accept(l, core::ptr::null_mut(), core::ptr::null_mut()),
+        EAGAIN,
+    );
     t.eq(b"poll idle", poll1(l, POLLIN, 0).0, 0);
     let c = tcp();
     connect(c, LO, port(l));
     let (n, ev) = poll1(l, POLLIN, 2000);
     t.ok(b"poll ready", n == 1 && ev & POLLIN != 0, ev as i64);
-    t.eq(b"accept4 bad flags", sys_accept4(l, core::ptr::null_mut(), core::ptr::null_mut(), 1), EINVAL);
-    let s = sys_accept4(l, core::ptr::null_mut(), core::ptr::null_mut(), SOCK_NONBLOCK | SOCK_CLOEXEC) as i32;
+    t.eq(
+        b"accept4 bad flags",
+        sys_accept4(l, core::ptr::null_mut(), core::ptr::null_mut(), 1),
+        EINVAL,
+    );
+    let s = sys_accept4(
+        l,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        SOCK_NONBLOCK | SOCK_CLOEXEC,
+    ) as i32;
     t.ok(b"accept4", s >= 0, s as i64);
-    t.ok(b"new O_NONBLOCK", sys_fcntl(s, F_GETFL, 0) & O_NONBLOCK as i64 != 0, 0);
+    t.ok(
+        b"new O_NONBLOCK",
+        sys_fcntl(s, F_GETFL, 0) & O_NONBLOCK as i64 != 0,
+        0,
+    );
     t.eq(b"new FD_CLOEXEC", sys_fcntl(s, F_GETFD, 0), 1);
     for f in [l, c, s] {
         close(f);
@@ -303,7 +352,11 @@ fn test_tcp_rdhup() {
     let (l, c, s) = tcp_pair();
     sys_shutdown(c, SHUT_WR);
     let (n, ev) = poll1(s, POLLIN | POLLRDHUP, 2000);
-    t.ok(b"poll", n == 1 && ev & POLLIN != 0 && ev & POLLRDHUP != 0, ev as i64);
+    t.ok(
+        b"poll",
+        n == 1 && ev & POLLIN != 0 && ev & POLLRDHUP != 0,
+        ev as i64,
+    );
     let mut buf = [0u8; 4];
     t.eq(b"eof", recv(s, &mut buf, 0), 0);
     t.ok(b"writable", poll1(s, POLLOUT, 0).1 & POLLOUT != 0, 0);

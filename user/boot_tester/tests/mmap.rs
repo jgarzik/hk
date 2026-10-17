@@ -7,19 +7,16 @@
 //! - Large anonymous mmap with demand paging
 //! - mlock/mlock2/munlock/mlockall/munlockall
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_open, sys_read, sys_uname, sys_wait4,
-    sys_write, Timespec, UtsName,
-    sys_madvise, sys_mincore, sys_mmap, sys_mprotect, sys_mremap, sys_msync, sys_munmap,
-    sys_mlock, sys_mlock2, sys_munlock, sys_mlockall, sys_munlockall,
     MADV_COLD, MADV_DONTNEED, MADV_KEEPONFORK, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM,
-    MADV_WILLNEED, MADV_WIPEONFORK,
-    MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED_NOREPLACE,
-    MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED,
-    MAP_STACK, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC, MS_SYNC,
-    PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE,
-    MLOCK_ONFAULT, MCL_CURRENT, MCL_ONFAULT,
+    MADV_WILLNEED, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE,
+    MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE,
+    MAP_SHARED, MAP_STACK, MCL_CURRENT, MCL_ONFAULT, MLOCK_ONFAULT, MREMAP_FIXED, MREMAP_MAYMOVE,
+    MS_ASYNC, MS_SYNC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, Timespec, UtsName,
+    sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_madvise, sys_mincore, sys_mlock,
+    sys_mlock2, sys_mlockall, sys_mmap, sys_mprotect, sys_mremap, sys_msync, sys_munlock,
+    sys_munlockall, sys_munmap, sys_open, sys_read, sys_uname, sys_wait4, sys_write,
 };
 
 /// Run all mmap tests
@@ -97,15 +94,14 @@ pub fn run_tests() {
 
 /// Test: Basic anonymous mmap
 fn test_anonymous_mmap() {
-
     // Map one page (4096 bytes) of anonymous memory
     let ptr = sys_mmap(
-        0,                              // addr (let kernel choose)
-        4096,                           // length
-        PROT_READ | PROT_WRITE,         // prot
-        MAP_PRIVATE | MAP_ANONYMOUS,    // flags
-        -1,                             // fd (unused for anonymous)
-        0,                              // offset
+        0,                           // addr (let kernel choose)
+        4096,                        // length
+        PROT_READ | PROT_WRITE,      // prot
+        MAP_PRIVATE | MAP_ANONYMOUS, // flags
+        -1,                          // fd (unused for anonymous)
+        0,                           // offset
     );
 
     if ptr < 0 {
@@ -129,7 +125,6 @@ fn test_anonymous_mmap() {
 
 /// Test: Write to and read from mmap'd memory
 fn test_mmap_write_read() {
-
     let ptr = sys_mmap(
         0,
         4096,
@@ -152,9 +147,7 @@ fn test_mmap_write_read() {
     }
 
     // Read it back
-    let read_val = unsafe {
-        core::ptr::read_volatile(ptr as *const u32)
-    };
+    let read_val = unsafe { core::ptr::read_volatile(ptr as *const u32) };
 
     if read_val == pattern {
         println(b"MMAP_RW:OK");
@@ -168,7 +161,6 @@ fn test_mmap_write_read() {
 
 /// Test: munmap releases memory
 fn test_munmap() {
-
     let ptr = sys_mmap(
         0,
         4096,
@@ -196,7 +188,6 @@ fn test_munmap() {
 
 /// Test: Large anonymous mmap with demand paging
 fn test_large_anonymous_mmap() {
-
     let size: u64 = 1024 * 1024; // 1MB
     let ptr = sys_mmap(
         0,
@@ -228,9 +219,7 @@ fn test_large_anonymous_mmap() {
         }
 
         // Read back and verify
-        let read_val = unsafe {
-            core::ptr::read_volatile(addr as *const u8)
-        };
+        let read_val = unsafe { core::ptr::read_volatile(addr as *const u8) };
 
         if read_val != expected_val {
             print(b"MMAP_LARGE:FAIL page ");
@@ -2272,7 +2261,14 @@ fn test_madvise_wipeonfork() {
 
 /// Map `pages` untouched anonymous pages; returns 0 on failure
 fn mmap_untouched(pages: u64) -> u64 {
-    let p = sys_mmap(0, pages * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let p = sys_mmap(
+        0,
+        pages * 4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if p < 0 { 0 } else { p as u64 }
 }
 

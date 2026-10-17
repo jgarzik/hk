@@ -4,9 +4,9 @@
 //! poll/epoll readiness. The eth0 DNS exchange is in netdev.rs.
 
 use hk_syscall::{
-    sys_close, sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait, sys_read, sys_sendmsg,
-    sys_shutdown, sys_write, EpollEvent, IoVec, MsgHdr, SockAddrIn, EPOLLIN, EPOLL_CTL_ADD,
-    SHUT_RD,
+    EPOLL_CTL_ADD, EPOLLIN, EpollEvent, IoVec, MsgHdr, SHUT_RD, SockAddrIn, sys_close,
+    sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait, sys_read, sys_sendmsg, sys_shutdown,
+    sys_write,
 };
 
 use super::sk::*;
@@ -41,7 +41,11 @@ fn test_basic() {
     t.eq(b"sendto", send_to(a, b"ping", LO, pb, 0), 4);
     let mut buf = [0u8; 16];
     let (n, ip, p) = recv_from(b, &mut buf, 0);
-    t.ok(b"recvfrom", n == 4 && &buf[..4] == b"ping" && ip == LO && p == pa, n);
+    t.ok(
+        b"recvfrom",
+        n == 4 && &buf[..4] == b"ping" && ip == LO && p == pa,
+        n,
+    );
     close(a);
     close(b);
     t.done();
@@ -104,10 +108,18 @@ fn test_dest_errors() {
     t.eq(b"no dest", send(fd, b"x", 0), EDESTADDRREQ);
     t.eq(b"port 0", send_to(fd, b"x", LO, 0, 0), EINVAL);
     let a = sin(LO, 9);
-    t.eq(b"short", hk_syscall::sys_sendto(fd, b"x".as_ptr(), 1, 0, sa(&a), 8), EINVAL);
+    t.eq(
+        b"short",
+        hk_syscall::sys_sendto(fd, b"x".as_ptr(), 1, 0, sa(&a), 8),
+        EINVAL,
+    );
     let mut a6 = sin(LO, 9);
     a6.sin_family = 10;
-    t.eq(b"AF_INET6", hk_syscall::sys_sendto(fd, b"x".as_ptr(), 1, 0, sa(&a6), 16), EAFNOSUPPORT);
+    t.eq(
+        b"AF_INET6",
+        hk_syscall::sys_sendto(fd, b"x".as_ptr(), 1, 0, sa(&a6), 16),
+        EAFNOSUPPORT,
+    );
     t.eq(b"MSG_OOB", send_to(fd, b"x", LO, 9, MSG_OOB), EOPNOTSUPP);
     close(fd);
     t.done();
@@ -124,8 +136,16 @@ fn test_peek_trunc() {
     let mut small = [0u8; 4];
     let mut ctl = [0u8; 0];
     let (n, fl, _) = recv_msg(b, &mut small, &mut ctl, MSG_PEEK);
-    t.ok(b"peek short", n == 4 && fl & MSG_TRUNC != 0 && &small == b"0123", n);
-    t.eq(b"peek trunc len", recv(b, &mut small, MSG_PEEK | MSG_TRUNC), 10);
+    t.ok(
+        b"peek short",
+        n == 4 && fl & MSG_TRUNC != 0 && &small == b"0123",
+        n,
+    );
+    t.eq(
+        b"peek trunc len",
+        recv(b, &mut small, MSG_PEEK | MSG_TRUNC),
+        10,
+    );
     let (n, fl, _) = recv_msg(b, &mut small, &mut ctl, 0);
     t.ok(b"read short", n == 4 && fl & MSG_TRUNC != 0, n);
     t.eq(b"consumed", recv(b, &mut small, MSG_DONTWAIT), EAGAIN);
@@ -216,7 +236,11 @@ fn test_ephemeral() {
         *s = port(fd);
         close(fd);
     }
-    t.ok(b"range", seen.iter().all(|&p| (32768..=60999).contains(&p)), seen[0] as i64);
+    t.ok(
+        b"range",
+        seen.iter().all(|&p| (32768..=60999).contains(&p)),
+        seen[0] as i64,
+    );
     let (r, pr) = udp_lo();
     let fd = udp();
     send_to(fd, b"x", LO, pr, 0);
@@ -267,7 +291,11 @@ fn test_pktinfo() {
     let mut ctl = [0u8; 64];
     let (n, fl, cl) = recv_msg(b, &mut buf, &mut ctl, 0);
     let info = cmsg_find(&ctl, cl, SOL_IP, IP_PKTINFO);
-    t.ok(b"cmsg", n == 2 && fl & MSG_CTRUNC == 0 && info.is_some(), cl as i64);
+    t.ok(
+        b"cmsg",
+        n == 2 && fl & MSG_CTRUNC == 0 && info.is_some(),
+        cl as i64,
+    );
     if let Some(d) = info {
         let idx = i32::from_ne_bytes([d[0], d[1], d[2], d[3]]);
         t.ok(b"ifindex", idx == 1, idx as i64);
@@ -297,7 +325,8 @@ fn test_ttl_tos() {
     let mut buf = [0u8; 8];
     let mut ctl = [0u8; 128];
     let (_, _, cl) = recv_msg(b, &mut buf, &mut ctl, 0);
-    let ttl = cmsg_find(&ctl, cl, SOL_IP, IP_TTL).map_or(-1, |d| i32::from_ne_bytes([d[0], d[1], d[2], d[3]]));
+    let ttl = cmsg_find(&ctl, cl, SOL_IP, IP_TTL)
+        .map_or(-1, |d| i32::from_ne_bytes([d[0], d[1], d[2], d[3]]));
     let tos = cmsg_find(&ctl, cl, SOL_IP, IP_TOS).map_or(-1, |d| d[0] as i32);
     t.eq(b"ttl", ttl as i64, 33);
     t.eq(b"tos", tos as i64, 0x10);
@@ -358,9 +387,17 @@ fn test_poll_epoll() {
     let e = EpollEvent::new(EPOLLIN, 1);
     sys_epoll_ctl(ep, EPOLL_CTL_ADD, b, &e);
     let mut out = [EpollEvent::empty(); 1];
-    t.eq(b"epoll empty", sys_epoll_wait(ep, out.as_mut_ptr(), 1, 0), 0);
+    t.eq(
+        b"epoll empty",
+        sys_epoll_wait(ep, out.as_mut_ptr(), 1, 0),
+        0,
+    );
     send_to(a, b"x", LO, pb, 0);
-    t.eq(b"epoll ready", sys_epoll_wait(ep, out.as_mut_ptr(), 1, 2000), 1);
+    t.eq(
+        b"epoll ready",
+        sys_epoll_wait(ep, out.as_mut_ptr(), 1, 2000),
+        1,
+    );
     let (n, ev) = poll1(b, 1, 0);
     t.ok(b"pollin", n == 1 && ev & 1 != 0, ev as i64);
     sys_close(ep as u64);
@@ -404,7 +441,10 @@ fn test_errqueue() {
     ctl[12..16].copy_from_slice(&1i32.to_ne_bytes());
     ctl[16..20].copy_from_slice(&0i32.to_ne_bytes());
     let mut dst = sin(LO, p);
-    let mut iov = IoVec { iov_base: b"x".as_ptr(), iov_len: 1 };
+    let mut iov = IoVec {
+        iov_base: b"x".as_ptr(),
+        iov_len: 1,
+    };
     let mut m = MsgHdr::with_addr(&mut dst, &mut iov, 1);
     m.msg_control = ctl.as_mut_ptr();
     m.msg_controllen = 24;
@@ -423,7 +463,10 @@ fn send_spec(fd: i32, src: [u8; 4], dst: [u8; 4], port: u16) -> i64 {
     ctl[12..16].copy_from_slice(&IP_PKTINFO.to_ne_bytes());
     ctl[20..24].copy_from_slice(&src);
     let mut to = sin(dst, port);
-    let mut iov = IoVec { iov_base: b"s".as_ptr(), iov_len: 1 };
+    let mut iov = IoVec {
+        iov_base: b"s".as_ptr(),
+        iov_len: 1,
+    };
     let mut m = MsgHdr::with_addr(&mut to, &mut iov, 1);
     m.msg_control = ctl.as_mut_ptr();
     m.msg_controllen = 32;
@@ -433,7 +476,7 @@ fn send_spec(fd: i32, src: [u8; 4], dst: [u8; 4], port: u16) -> i64 {
 /// Source addresses must be local (Linux ip_route_output_key_hash_rcu):
 /// IP_PKTINFO spec_dst and bound addresses that were deleted
 fn test_src_spoof() {
-    use super::nl::{addr, Nl};
+    use super::nl::{Nl, addr};
     let mut t = T::new(b"UDP_SRC_SPOOF");
     let (a, _) = udp_lo();
     let (b, pb) = udp_lo();
@@ -451,7 +494,11 @@ fn test_src_spoof() {
     let mut nl = Nl::open();
     let x = [10, 9, 9, 9];
     if let Some(nl) = nl.as_mut() {
-        t.eq(b"add addr", addr(nl, true, 1, x, 32, 0x400 | 0x200) as i64, 0);
+        t.eq(
+            b"add addr",
+            addr(nl, true, 1, x, 32, 0x400 | 0x200) as i64,
+            0,
+        );
         let c = udp();
         t.eq(b"bind", bind(c, x, 0), 0);
         t.eq(b"send bound", send_to(c, b"y", LO, pb, 0), 1);

@@ -7,10 +7,10 @@
 //! - Test signalfd poll
 //! - Test signalfd mask update
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_gettid, sys_poll, sys_read, sys_rt_sigprocmask, sys_tgkill, sys_getpid,
-    PollFd, POLLIN, SFD_NONBLOCK, SIG_BLOCK, SIGUSR1,
+    POLLIN, PollFd, SFD_NONBLOCK, SIG_BLOCK, SIGUSR1, sys_close, sys_getpid, sys_gettid, sys_poll,
+    sys_read, sys_rt_sigprocmask, sys_tgkill,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -33,7 +33,12 @@ fn test_signalfd_create() {
     // Block SIGUSR1 first (signalfd requires signals to be blocked)
     let mask: u64 = 1 << (SIGUSR1 - 1);
     let mut old_mask: u64 = 0;
-    let ret = sys_rt_sigprocmask(SIG_BLOCK, &mask as *const u64 as u64, &mut old_mask as *mut u64 as u64, 8);
+    let ret = sys_rt_sigprocmask(
+        SIG_BLOCK,
+        &mask as *const u64 as u64,
+        &mut old_mask as *mut u64 as u64,
+        8,
+    );
     if ret != 0 {
         print(b"SIGNALFD_CREATE:FAIL: sigprocmask returned ");
         print_num(ret);

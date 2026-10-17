@@ -10,7 +10,7 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_mkdir, sys_mount, sys_open, sys_read, sys_rmdir, sys_write, O_RDONLY, O_RDWR,
+    O_RDONLY, O_RDWR, sys_close, sys_mkdir, sys_mount, sys_open, sys_read, sys_rmdir, sys_write,
 };
 
 /// Run all cgroup tests
@@ -48,13 +48,7 @@ fn test_mount_cgroupfs() {
     // Mount cgroup2 filesystem
     let source = b"none\0";
     let fstype = b"cgroup2\0";
-    let ret = sys_mount(
-        source.as_ptr(),
-        cgroup_path.as_ptr(),
-        fstype.as_ptr(),
-        0,
-        0,
-    );
+    let ret = sys_mount(source.as_ptr(), cgroup_path.as_ptr(), fstype.as_ptr(), 0, 0);
     if ret < 0 && ret != -16 {
         // -16 is EBUSY (already mounted)
         print(b"ERROR: mount cgroup2 failed: ");

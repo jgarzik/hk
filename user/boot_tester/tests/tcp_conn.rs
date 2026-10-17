@@ -3,8 +3,8 @@
 //! refused and unanswered connects on eth0.
 
 use hk_syscall::{
-    sys_exit, sys_fork, sys_listen, sys_nanosleep, sys_setsockopt, sys_shutdown, sys_socket,
-    Timespec, AF_INET, SHUT_WR, SOCK_NONBLOCK, SOCK_STREAM,
+    AF_INET, SHUT_WR, SOCK_NONBLOCK, SOCK_STREAM, Timespec, sys_exit, sys_fork, sys_listen,
+    sys_nanosleep, sys_setsockopt, sys_shutdown, sys_socket,
 };
 
 use super::sk::*;
@@ -142,7 +142,11 @@ fn test_linger0() {
     connect(c, LO, p);
     let s = accept(l);
     let lg = [1i32, 0];
-    t.eq(b"setsockopt", sys_setsockopt(s, SOL_SOCKET, SO_LINGER, lg.as_ptr() as *const u8, 8), 0);
+    t.eq(
+        b"setsockopt",
+        sys_setsockopt(s, SOL_SOCKET, SO_LINGER, lg.as_ptr() as *const u8, 8),
+        0,
+    );
     close(s);
     let mut b = [0u8; 4];
     t.eq(b"reset", recv(c, &mut b, 0), ECONNRESET);

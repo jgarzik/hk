@@ -4,8 +4,8 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_dup3, sys_exit, sys_fork, sys_fstat, sys_getpid, sys_pipe, sys_read, sys_wait4,
-    sys_write, Stat,
+    Stat, sys_close, sys_dup3, sys_exit, sys_fork, sys_fstat, sys_getpid, sys_pipe, sys_read,
+    sys_wait4, sys_write,
 };
 
 const EBADF: i64 = -9;
@@ -80,7 +80,11 @@ fn test_stdout_pipe() {
     let mut buf = [0u8; 16];
     let mut len = 0usize;
     loop {
-        let n = sys_read(p[0] as u64, buf[len..].as_mut_ptr(), (buf.len() - len) as u64);
+        let n = sys_read(
+            p[0] as u64,
+            buf[len..].as_mut_ptr(),
+            (buf.len() - len) as u64,
+        );
         if n <= 0 {
             break;
         }
@@ -89,7 +93,11 @@ fn test_stdout_pipe() {
     sys_close(p[0] as u64);
     let mut st = 0;
     sys_wait4(pid, &mut st, 0, 0);
-    verdict(b"STDIO_STDOUT_PIPE", st == 0 && &buf[..len] == b"to-pipe", len as i64);
+    verdict(
+        b"STDIO_STDOUT_PIPE",
+        st == 0 && &buf[..len] == b"to-pipe",
+        len as i64,
+    );
 }
 
 /// read(0) after dup2(pipe, 0) returns the pipe's data

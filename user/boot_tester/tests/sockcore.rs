@@ -6,10 +6,10 @@
 //! with SO_ERROR.
 
 use hk_syscall::{
-    sys_accept, sys_bind, sys_close, sys_connect, sys_exit, sys_fork, sys_fstat, sys_getpeername,
-    sys_getsockname, sys_getsockopt, sys_listen, sys_lseek, sys_pipe, sys_readlink, sys_recvfrom,
-    sys_recvmsg, sys_sendmsg, sys_sendto, sys_setresuid, sys_setsockopt, sys_socket,
-    sys_socketpair, sys_wait4, SockAddrIn, Stat, AF_INET, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM,
+    AF_INET, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, SockAddrIn, Stat, sys_accept, sys_bind,
+    sys_close, sys_connect, sys_exit, sys_fork, sys_fstat, sys_getpeername, sys_getsockname,
+    sys_getsockopt, sys_listen, sys_lseek, sys_pipe, sys_readlink, sys_recvfrom, sys_recvmsg,
+    sys_sendmsg, sys_sendto, sys_setresuid, sys_setsockopt, sys_socket, sys_socketpair, sys_wait4,
 };
 
 use super::sk::*;
@@ -114,15 +114,39 @@ fn fmt_socket(b: &mut [u8], ino: u64) -> usize {
 /// socket() argument errors (Linux __sock_create / inet_create)
 fn test_create_errors() {
     let mut t = T::new(b"SOCKCORE_CREATE_ERRORS");
-    t.eq(b"bad flags", sys_socket(AF_INET, SOCK_DGRAM | 0x100000, 0), EINVAL);
+    t.eq(
+        b"bad flags",
+        sys_socket(AF_INET, SOCK_DGRAM | 0x100000, 0),
+        EINVAL,
+    );
     t.eq(b"type >= SOCK_MAX", sys_socket(AF_INET, 11, 0), EINVAL);
-    t.eq(b"family 9999", sys_socket(9999, SOCK_DGRAM, 0), EAFNOSUPPORT);
-    t.eq(b"stream/udp", sys_socket(AF_INET, SOCK_STREAM, 17), EPROTONOSUPPORT);
-    t.eq(b"dgram/tcp", sys_socket(AF_INET, SOCK_DGRAM, 6), EPROTONOSUPPORT);
+    t.eq(
+        b"family 9999",
+        sys_socket(9999, SOCK_DGRAM, 0),
+        EAFNOSUPPORT,
+    );
+    t.eq(
+        b"stream/udp",
+        sys_socket(AF_INET, SOCK_STREAM, 17),
+        EPROTONOSUPPORT,
+    );
+    t.eq(
+        b"dgram/tcp",
+        sys_socket(AF_INET, SOCK_DGRAM, 6),
+        EPROTONOSUPPORT,
+    );
     t.eq(b"seqpacket", sys_socket(AF_INET, 5, 0), ESOCKTNOSUPPORT);
     let mut sv = [-1i32; 2];
-    t.eq(b"socketpair inet", sys_socketpair(AF_INET, SOCK_STREAM, 0, &mut sv), EOPNOTSUPP);
-    t.eq(b"socketpair EFAULT", sys_socketpair(AF_INET, SOCK_DGRAM, 0, BAD as *mut [i32; 2]), EFAULT);
+    t.eq(
+        b"socketpair inet",
+        sys_socketpair(AF_INET, SOCK_STREAM, 0, &mut sv),
+        EOPNOTSUPP,
+    );
+    t.eq(
+        b"socketpair EFAULT",
+        sys_socketpair(AF_INET, SOCK_DGRAM, 0, BAD as *mut [i32; 2]),
+        EFAULT,
+    );
     t.done();
 }
 
@@ -134,13 +158,25 @@ fn test_not_socket() {
     let mut a = sin(ANY, 0);
     let mut len = 16u32;
     let ap = &mut a as *mut SockAddrIn as *mut u8;
-    t.eq(b"getsockname pipe", sys_getsockname(p[0], ap, &mut len), ENOTSOCK);
+    t.eq(
+        b"getsockname pipe",
+        sys_getsockname(p[0], ap, &mut len),
+        ENOTSOCK,
+    );
     t.eq(b"bind pipe", bind(p[0], LO, 0), ENOTSOCK);
-    t.eq(b"getsockname badfd", sys_getsockname(999, ap, &mut len), EBADF);
+    t.eq(
+        b"getsockname badfd",
+        sys_getsockname(999, ap, &mut len),
+        EBADF,
+    );
     let fd = udp();
     t.eq(b"lseek", sys_lseek(fd, 0, 0), ESPIPE);
     t.eq(b"listen udp", sys_listen(fd, 1), EOPNOTSUPP);
-    t.eq(b"accept udp", sys_accept(fd, core::ptr::null_mut(), core::ptr::null_mut()), EOPNOTSUPP);
+    t.eq(
+        b"accept udp",
+        sys_accept(fd, core::ptr::null_mut(), core::ptr::null_mut()),
+        EOPNOTSUPP,
+    );
     close(fd);
     close(p[0]);
     close(p[1]);
@@ -155,26 +191,72 @@ fn test_efault() {
     let mut len = 16u32;
     t.eq(b"bind", sys_bind(fd, b, 16), EFAULT);
     t.eq(b"connect", sys_connect(fd, b, 16), EFAULT);
-    t.eq(b"sendto buf", sys_sendto(fd, b, 8, 0, sa(&sin(LO, port)), 16), EFAULT);
-    t.eq(b"sendto addr", sys_sendto(fd, b"x".as_ptr(), 1, 0, b, 16), EFAULT);
-    t.eq(b"getsockname addr", sys_getsockname(fd, b, &mut len), EFAULT);
-    t.eq(b"getsockname len", sys_getsockname(fd, b, BAD as *mut u32), EFAULT);
+    t.eq(
+        b"sendto buf",
+        sys_sendto(fd, b, 8, 0, sa(&sin(LO, port)), 16),
+        EFAULT,
+    );
+    t.eq(
+        b"sendto addr",
+        sys_sendto(fd, b"x".as_ptr(), 1, 0, b, 16),
+        EFAULT,
+    );
+    t.eq(
+        b"getsockname addr",
+        sys_getsockname(fd, b, &mut len),
+        EFAULT,
+    );
+    t.eq(
+        b"getsockname len",
+        sys_getsockname(fd, b, BAD as *mut u32),
+        EFAULT,
+    );
     // Unconnected: getname fails before the user length is read
-    t.eq(b"getpeername len", sys_getpeername(fd, b, BAD as *mut u32), ENOTCONN);
+    t.eq(
+        b"getpeername len",
+        sys_getpeername(fd, b, BAD as *mut u32),
+        ENOTCONN,
+    );
     let v = 1i32;
-    t.eq(b"setsockopt", sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, b, 4), EFAULT);
+    t.eq(
+        b"setsockopt",
+        sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, b, 4),
+        EFAULT,
+    );
     let mut l4 = 4u32;
-    t.eq(b"getsockopt val", sys_getsockopt(fd, SOL_SOCKET, SO_TYPE, b, &mut l4), EFAULT);
-    t.eq(b"getsockopt len", sys_getsockopt(fd, SOL_SOCKET, SO_TYPE, &v as *const i32 as *mut u8, BAD as *mut u32), EFAULT);
+    t.eq(
+        b"getsockopt val",
+        sys_getsockopt(fd, SOL_SOCKET, SO_TYPE, b, &mut l4),
+        EFAULT,
+    );
+    t.eq(
+        b"getsockopt len",
+        sys_getsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_TYPE,
+            &v as *const i32 as *mut u8,
+            BAD as *mut u32,
+        ),
+        EFAULT,
+    );
     t.eq(b"sendmsg", sys_sendmsg(fd, BAD as *const _, 0), EFAULT);
     t.eq(b"recvmsg", sys_recvmsg(fd, BAD as *mut _, 0), EFAULT);
     // A fault copying the datagram out consumes it (Linux udp_recvmsg)
     send_to(fd, b"lost", LO, port, 0);
     // (an unmapped address inside user space: access_ok passes)
     let hole = 0x4000_0000_0000u64 as *mut u8;
-    t.eq(b"recvfrom buf", sys_recvfrom(fd, hole, 8, 0, core::ptr::null_mut(), core::ptr::null_mut()), EFAULT);
+    t.eq(
+        b"recvfrom buf",
+        sys_recvfrom(fd, hole, 8, 0, core::ptr::null_mut(), core::ptr::null_mut()),
+        EFAULT,
+    );
     let mut buf = [0u8; 8];
-    t.eq(b"datagram consumed", recv(fd, &mut buf, MSG_DONTWAIT), EAGAIN);
+    t.eq(
+        b"datagram consumed",
+        recv(fd, &mut buf, MSG_DONTWAIT),
+        EAGAIN,
+    );
     close(fd);
     t.done();
 }
@@ -194,7 +276,11 @@ fn test_names() {
     let mut short = [0xffu8; 16];
     let mut l = 4u32;
     let r = sys_getsockname(fd, short.as_mut_ptr(), &mut l);
-    t.ok(b"short addrlen", r == 0 && l == 16 && short[4] == 0xff && short[0] == 2, l as i64);
+    t.ok(
+        b"short addrlen",
+        r == 0 && l == 16 && short[4] == 0xff && short[0] == 2,
+        l as i64,
+    );
     close(fd);
     t.done();
 }
@@ -345,8 +431,16 @@ fn test_nonblock_refused() {
     if r == EINPROGRESS {
         let (pr, ev) = poll1(fd, 4 /* POLLOUT */, 5000);
         t.ok(b"poll", pr == 1 && ev & 4 != 0, ev as i64);
-        t.eq(b"SO_ERROR", getint(fd, SOL_SOCKET, SO_ERROR).1 as i64, -ECONNREFUSED);
-        t.eq(b"SO_ERROR cleared", getint(fd, SOL_SOCKET, SO_ERROR).1 as i64, 0);
+        t.eq(
+            b"SO_ERROR",
+            getint(fd, SOL_SOCKET, SO_ERROR).1 as i64,
+            -ECONNREFUSED,
+        );
+        t.eq(
+            b"SO_ERROR cleared",
+            getint(fd, SOL_SOCKET, SO_ERROR).1 as i64,
+            0,
+        );
     }
     close(fd);
     let b = tcp();

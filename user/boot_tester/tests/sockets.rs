@@ -3,12 +3,10 @@
 //! Tests for the network socket syscalls.
 
 use hk_syscall::{
-    sys_close, sys_socket, sys_bind, sys_listen, sys_shutdown,
-    sys_getsockname, sys_socketpair, sys_sendmsg, sys_sendto, sys_recvfrom,
-    sys_setsockopt, sys_getsockopt,
-    sys_fork, sys_wait4, sys_exit, sys_nanosleep,
-    SockAddrIn, MsgHdr, IoVec, Timespec, AF_INET, SOCK_STREAM, SOCK_DGRAM, SOCK_NONBLOCK,
-    SHUT_RD, SHUT_WR, SHUT_RDWR, htons, htonl, make_ipv4,
+    AF_INET, IoVec, MsgHdr, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM,
+    SockAddrIn, Timespec, htonl, htons, make_ipv4, sys_bind, sys_close, sys_exit, sys_fork,
+    sys_getsockname, sys_getsockopt, sys_listen, sys_nanosleep, sys_recvfrom, sys_sendmsg,
+    sys_sendto, sys_setsockopt, sys_shutdown, sys_socket, sys_socketpair, sys_wait4,
 };
 
 /// Socket level constants
@@ -41,7 +39,7 @@ struct Linger {
     l_onoff: i32,
     l_linger: i32,
 }
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 
 /// Run all socket tests
 pub fn run_tests() {
@@ -455,11 +453,7 @@ fn test_udp_loopback() {
     }
 
     // Bind server socket to loopback address
-    let server_addr = SockAddrIn::new(
-        AF_INET as u16,
-        htons(PORT),
-        htonl(make_ipv4(127, 0, 0, 1)),
-    );
+    let server_addr = SockAddrIn::new(AF_INET as u16, htons(PORT), htonl(make_ipv4(127, 0, 0, 1)));
     let ret = sys_bind(
         server_fd as i32,
         &server_addr as *const SockAddrIn as *const u8,
@@ -489,11 +483,8 @@ fn test_udp_loopback() {
         }
 
         // Destination address
-        let dest_addr = SockAddrIn::new(
-            AF_INET as u16,
-            htons(PORT),
-            htonl(make_ipv4(127, 0, 0, 1)),
-        );
+        let dest_addr =
+            SockAddrIn::new(AF_INET as u16, htons(PORT), htonl(make_ipv4(127, 0, 0, 1)));
 
         // Send data to server
         let msg = b"Hello UDP";
@@ -535,7 +526,10 @@ fn test_udp_loopback() {
         // Parent process - server
 
         // Brief delay to let child start
-        let delay = Timespec { tv_sec: 0, tv_nsec: 10_000_000 }; // 10ms
+        let delay = Timespec {
+            tv_sec: 0,
+            tv_nsec: 10_000_000,
+        }; // 10ms
         sys_nanosleep(&delay, core::ptr::null_mut());
 
         // Receive data from client
@@ -855,7 +849,10 @@ fn test_sockopt_linger() {
     }
 
     // Set SO_LINGER with l_onoff=1, l_linger=5
-    let set_linger = Linger { l_onoff: 1, l_linger: 5 };
+    let set_linger = Linger {
+        l_onoff: 1,
+        l_linger: 5,
+    };
     let ret1 = sys_setsockopt(
         fd as i32,
         SOL_SOCKET,
@@ -873,7 +870,10 @@ fn test_sockopt_linger() {
     }
 
     // Get SO_LINGER and verify values
-    let mut get_linger = Linger { l_onoff: 0, l_linger: 0 };
+    let mut get_linger = Linger {
+        l_onoff: 0,
+        l_linger: 0,
+    };
     let mut optlen: u32 = core::mem::size_of::<Linger>() as u32;
     let ret2 = sys_getsockopt(
         fd as i32,
@@ -974,9 +974,7 @@ fn test_tcp_keepalive_options() {
 
     sys_close(fd as u64);
 
-    if ret1 == 0 && ret2 == 0 && ret3 == 0
-        && get_idle == 60 && get_intvl == 10 && get_cnt == 5
-    {
+    if ret1 == 0 && ret2 == 0 && ret3 == 0 && get_idle == 60 && get_intvl == 10 && get_cnt == 5 {
         println(b"TCP_KEEPALIVE:OK");
     } else {
         println(b"TCP_KEEPALIVE:FAIL");

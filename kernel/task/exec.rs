@@ -39,6 +39,7 @@ pub const ENOENT: i32 = 2; // No such file or directory
 pub const EACCES: i32 = 13; // Permission denied
 pub const ENOEXEC: i32 = 8; // Exec format error
 pub const ENOMEM: i32 = 12; // Out of memory
+pub const EIO: i32 = 5; // I/O error
 pub const EFAULT: i32 = 14; // Bad address
 pub const E2BIG: i32 = 7; // Argument list too long
 
@@ -195,18 +196,18 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
 
     for i in 0..stack_pages {
         let va = stack_bottom + (i as u64 * PAGE_SIZE);
-        let frame = frame_alloc.alloc_frame().ok_or(ENOMEM)?;
+        let frame = user_frame()?;
         unsafe {
             ::core::ptr::write_bytes(crate::arch::phys_to_virt(frame), 0, PAGE_SIZE as usize);
         }
-        page_table
-            .map_with_alloc(
-                va,
-                frame,
-                PageFlags::READ | PageFlags::WRITE | PageFlags::USER,
-                frame_alloc,
-            )
-            .map_err(|_| ENOMEM)?;
+        let flags = PageFlags::READ | PageFlags::WRITE | PageFlags::USER;
+        if page_table
+            .map_with_alloc(va, frame, flags, frame_alloc)
+            .is_err()
+        {
+            crate::FRAME_ALLOCATOR.free(frame);
+            return Err(ENOMEM);
+        }
     }
 
     // Everything must fit in the mapped stack, with room to run
@@ -351,7 +352,7 @@ pub fn image_vmas(
 /// Returns the end address of the highest loaded segment (for setting brk).
 fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
     elf: &ElfExecutable,
-    elf_data: &[u8],
+    image: &FileImage,
     page_table: &mut ArchPageTable,
     frame_alloc: &mut FA,
     base_addr: u64,
@@ -388,7 +389,7 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
             let mapped = page_table.translate(va).map(|p| p & !(PAGE_SIZE - 1));
             let frame = match mapped {
                 Some(f) => f,
-                None => frame_alloc.alloc_frame().ok_or(ENOMEM)?,
+                None => user_frame()?,
             };
 
             // Zero a new frame first (for BSS and partial pages)
@@ -403,14 +404,22 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
             }
 
             // File bytes for this page, bounds-checked against the page,
-            // the segment and the file (elf::ElfSegment::page_fill)
-            if let Some((dst, src, len)) = segment.page_fill(base_addr, va, elf_data.len()) {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        elf_data.as_ptr().add(src),
-                        crate::arch::phys_to_virt(frame).add(dst),
-                        len,
-                    );
+            // the segment and the file (elf::ElfSegment::page_fill), read
+            // straight into the frame (Linux maps the file instead)
+            let size = usize::try_from(image.size).unwrap_or(usize::MAX);
+            if let Some((dst, src, len)) = segment.page_fill(base_addr, va, size) {
+                // SAFETY: our frame, reached through the direct map
+                let page = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        crate::arch::phys_to_virt(frame),
+                        PAGE_SIZE as usize,
+                    )
+                };
+                if let Err(e) = image.read_into(&mut page[dst..dst + len], src as u64) {
+                    if mapped.is_none() {
+                        crate::FRAME_ALLOCATOR.free(frame);
+                    }
+                    return Err(e);
                 }
             }
 
@@ -428,11 +437,14 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
                 );
             }
 
-            // Map the page
-            if mapped.is_none() {
-                page_table
+            // Map the page (once mapped, the address space frees it)
+            if mapped.is_none()
+                && page_table
                     .map_with_alloc(va, frame, flags, frame_alloc)
-                    .map_err(|_| ENOMEM)?;
+                    .is_err()
+            {
+                crate::FRAME_ALLOCATOR.free(frame);
+                return Err(ENOMEM);
             }
 
             va += PAGE_SIZE;
@@ -443,15 +455,20 @@ fn load_elf_segments<FA: FrameAlloc<PhysAddr = u64>>(
 }
 
 /// Apply ELF relocations for PIE binaries
-fn apply_relocations(elf: &ElfExecutable, base_addr: u64, page_table: &ArchPageTable) {
-    for reloc in &elf.relocations {
+fn apply_relocations(
+    elf: &ElfExecutable,
+    image: &FileImage,
+    base_addr: u64,
+    page_table: &ArchPageTable,
+) {
+    elf.for_each_relocation(image, &mut |reloc| {
         // The 8-byte store must stay inside one user page of the image:
         // an unaligned or wrapping offset from a crafted file is skipped
         let Some(target_vaddr) = base_addr.checked_add(reloc.offset) else {
-            continue;
+            return;
         };
         if !target_vaddr.is_multiple_of(8) || target_vaddr >= crate::mm::TASK_SIZE {
-            continue;
+            return;
         }
         let value = (base_addr as i64).wrapping_add(reloc.addend) as u64;
 
@@ -468,35 +485,55 @@ fn apply_relocations(elf: &ElfExecutable, base_addr: u64, page_table: &ArchPageT
                 }
             }
         }
+    });
+}
+
+/// The executable being loaded, read in place (Linux bprm->file and
+/// elf_read): never copied whole into memory
+struct FileImage<'a> {
+    file: &'a File,
+    /// Size when exec opened it (segments past it read as zeros)
+    size: u64,
+}
+
+impl FileImage<'_> {
+    fn new(file: &File) -> Result<FileImage<'_>, i32> {
+        let size = file.get_inode().ok_or(ENOENT)?.get_size();
+        if size == 0 {
+            return Err(ENOEXEC); // Empty file can't be executable
+        }
+        Ok(FileImage { file, size })
+    }
+
+    /// Fill `buf` from offset `off`; the bytes read (fewer at the end
+    /// of the file)
+    fn read_into(&self, buf: &mut [u8], off: u64) -> Result<usize, i32> {
+        let mut done = 0;
+        while done < buf.len() {
+            let n = self
+                .file
+                .pread(&mut buf[done..], off + done as u64)
+                .map_err(|_| EIO)?;
+            if n == 0 {
+                break;
+            }
+            done += n;
+        }
+        Ok(done)
     }
 }
 
-/// Read entire file contents into a Vec
-fn read_file_contents(file: &File) -> Result<Vec<u8>, i32> {
-    let inode = file.get_inode().ok_or(ENOENT)?;
-    let file_size = inode.get_size() as usize;
-
-    if file_size == 0 {
-        return Err(ENOEXEC); // Empty file can't be executable
+impl crate::elf::ElfSource for FileImage<'_> {
+    fn read_at(&self, off: u64, len: usize) -> Option<Vec<u8>> {
+        let mut v = alloc::vec![0u8; len];
+        (self.read_into(&mut v, off).ok()? == len).then_some(v)
     }
+}
 
-    let mut data = alloc::vec![0u8; file_size];
-    let mut total_read = 0;
-
-    while total_read < file_size {
-        let n = file.read(&mut data[total_read..]).map_err(|_| ENOENT)?;
-        if n == 0 {
-            break; // EOF
-        }
-        total_read += n;
-    }
-
-    if total_read < file_size {
-        // Didn't read full file - truncate
-        data.truncate(total_read);
-    }
-
-    Ok(data)
+/// A frame for the new image's user memory: stops at the kernel's
+/// reserve like any user page (`mm::fault::alloc_user`), ENOMEM then
+fn user_frame() -> Result<u64, i32> {
+    crate::mm::fault::alloc_user().ok_or(ENOMEM)
 }
 
 /// Execute a new program, replacing the current process image
@@ -533,14 +570,14 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         Err(e) => return -e,
     };
 
-    // Read the entire file into memory
-    let elf_data = match read_file_contents(&file) {
-        Ok(d) => d,
+    // The file is read where needed: headers now, segments as they load
+    let image = match FileImage::new(&file) {
+        Ok(i) => i,
         Err(e) => return -e,
     };
 
     // Parse ELF
-    let elf = match ElfExecutable::parse(&elf_data) {
+    let elf = match ElfExecutable::parse(&image) {
         Ok(e) => e,
         Err(e) => return -e.errno(),
     };
@@ -583,14 +620,14 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
 
     // Load ELF segments and get the end address for brk initialization
     let segments_end =
-        match load_elf_segments(&elf, &elf_data, &mut new_page_table, frame_alloc, base_addr) {
+        match load_elf_segments(&elf, &image, &mut new_page_table, frame_alloc, base_addr) {
             Ok(end) => end,
             Err(e) => return -e,
         };
 
     // Apply relocations for PIE
     if elf.is_pie {
-        apply_relocations(&elf, base_addr, &new_page_table);
+        apply_relocations(&elf, &image, base_addr, &new_page_table);
     }
 
     // Set up user stack with argv, envp and the auxiliary vector
@@ -640,7 +677,6 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     // exec_replace_image never returns: free everything owned here first
     // (the file image alone is megabytes of heap)
     drop(elf);
-    drop(elf_data);
     drop(file);
     drop(argv);
     drop(envp);

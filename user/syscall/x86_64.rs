@@ -8,7 +8,10 @@
 //! - Return value in RAX
 //! - RCX and R11 are clobbered by the syscall instruction
 
-use crate::types::{CloneArgs, FdSet, IoVec, MqAttr, PollFd, RLimit, SigInfo, SigEvent, Timespec, Timeval, Timex, UtsName};
+use crate::types::{
+    CloneArgs, FdSet, IoVec, MqAttr, PollFd, RLimit, SigEvent, SigInfo, Timespec, Timeval, Timex,
+    UtsName,
+};
 
 // ============================================================================
 // Syscall helper macros
@@ -489,13 +492,33 @@ pub fn sys_pwritev(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64) -> i64 
 #[inline(always)]
 pub fn sys_preadv2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
     // Linux ABI: (fd, vec, vlen, pos_l, pos_h, flags), like glibc's LO_HI_LONG
-    unsafe { syscall6!(SYS_PREADV2, fd, iov, iovcnt, offset, (offset as u64) >> 32, flags) }
+    unsafe {
+        syscall6!(
+            SYS_PREADV2,
+            fd,
+            iov,
+            iovcnt,
+            offset,
+            (offset as u64) >> 32,
+            flags
+        )
+    }
 }
 
 #[inline(always)]
 pub fn sys_pwritev2(fd: i32, iov: *const IoVec, iovcnt: i32, offset: i64, flags: i32) -> i64 {
     // Linux ABI: (fd, vec, vlen, pos_l, pos_h, flags), like glibc's LO_HI_LONG
-    unsafe { syscall6!(SYS_PWRITEV2, fd, iov, iovcnt, offset, (offset as u64) >> 32, flags) }
+    unsafe {
+        syscall6!(
+            SYS_PWRITEV2,
+            fd,
+            iov,
+            iovcnt,
+            offset,
+            (offset as u64) >> 32,
+            flags
+        )
+    }
 }
 
 /// Legacy getdents (struct linux_dirent; x86-64 only)
@@ -654,7 +677,13 @@ pub fn sys_utimensat(dirfd: i32, pathname: *const u8, times: *const Timespec, fl
 // --- Filesystem Operations ---
 
 #[inline(always)]
-pub fn sys_mount(source: *const u8, target: *const u8, fstype: *const u8, flags: u64, data: u64) -> i64 {
+pub fn sys_mount(
+    source: *const u8,
+    target: *const u8,
+    fstype: *const u8,
+    flags: u64,
+    data: u64,
+) -> i64 {
     unsafe { syscall5!(SYS_MOUNT, source, target, fstype, flags, data) }
 }
 
@@ -739,8 +768,23 @@ pub fn sys_setsid() -> i64 {
 }
 
 #[inline(always)]
-pub fn sys_clone(flags: u64, child_stack: u64, parent_tidptr: u64, child_tidptr: u64, tls: u64) -> i64 {
-    unsafe { syscall5!(SYS_CLONE, flags, child_stack, parent_tidptr, child_tidptr, tls) }
+pub fn sys_clone(
+    flags: u64,
+    child_stack: u64,
+    parent_tidptr: u64,
+    child_tidptr: u64,
+    tls: u64,
+) -> i64 {
+    unsafe {
+        syscall5!(
+            SYS_CLONE,
+            flags,
+            child_stack,
+            parent_tidptr,
+            child_tidptr,
+            tls
+        )
+    }
 }
 
 #[inline(always)]
@@ -867,7 +911,12 @@ pub fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> i64 {
 }
 
 #[inline(always)]
-pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: *const Timespec, rem: *mut Timespec) -> i64 {
+pub fn sys_clock_nanosleep(
+    clockid: i32,
+    flags: i32,
+    req: *const Timespec,
+    rem: *mut Timespec,
+) -> i64 {
     unsafe { syscall4!(SYS_CLOCK_NANOSLEEP, clockid, flags, req, rem) }
 }
 
@@ -911,7 +960,12 @@ pub fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
 }
 
 #[inline(always)]
-pub fn sys_timerfd_settime(fd: i32, flags: i32, new_value: *const ITimerSpec, old_value: *mut ITimerSpec) -> i64 {
+pub fn sys_timerfd_settime(
+    fd: i32,
+    flags: i32,
+    new_value: *const ITimerSpec,
+    old_value: *mut ITimerSpec,
+) -> i64 {
     unsafe { syscall4!(SYS_TIMERFD_SETTIME, fd, flags, new_value, old_value) }
 }
 
@@ -995,7 +1049,17 @@ pub fn sys_epoll_pwait(
     sigmask: *const u64,
     sigsetsize: usize,
 ) -> i64 {
-    unsafe { syscall6!(SYS_EPOLL_PWAIT, epfd, events, maxevents, timeout, sigmask, sigsetsize) }
+    unsafe {
+        syscall6!(
+            SYS_EPOLL_PWAIT,
+            epfd,
+            events,
+            maxevents,
+            timeout,
+            sigmask,
+            sigsetsize
+        )
+    }
 }
 
 /// epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize) - wait with timespec timeout
@@ -1008,7 +1072,17 @@ pub fn sys_epoll_pwait2(
     sigmask: *const u64,
     sigsetsize: usize,
 ) -> i64 {
-    unsafe { syscall6!(SYS_EPOLL_PWAIT2, epfd, events, maxevents, timeout, sigmask, sigsetsize) }
+    unsafe {
+        syscall6!(
+            SYS_EPOLL_PWAIT2,
+            epfd,
+            events,
+            maxevents,
+            timeout,
+            sigmask,
+            sigsetsize
+        )
+    }
 }
 
 // --- POSIX Timers ---
@@ -1021,7 +1095,12 @@ pub fn sys_timer_create(clockid: i32, sevp: *const SigEvent, timerid: *mut i32) 
 
 /// timer_settime(timerid, flags, new_value, old_value)
 #[inline(always)]
-pub fn sys_timer_settime(timerid: i32, flags: i32, new_value: *const ITimerSpec, old_value: *mut ITimerSpec) -> i64 {
+pub fn sys_timer_settime(
+    timerid: i32,
+    flags: i32,
+    new_value: *const ITimerSpec,
+    old_value: *mut ITimerSpec,
+) -> i64 {
     unsafe { syscall4!(SYS_TIMER_SETTIME, timerid, flags, new_value, old_value) }
 }
 
@@ -1065,13 +1144,25 @@ pub fn sys_mq_unlink(name: *const u8) -> i64 {
 
 /// mq_timedsend(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)
 #[inline(always)]
-pub fn sys_mq_timedsend(mqdes: i32, msg: *const u8, len: usize, prio: u32, timeout: *const Timespec) -> i64 {
+pub fn sys_mq_timedsend(
+    mqdes: i32,
+    msg: *const u8,
+    len: usize,
+    prio: u32,
+    timeout: *const Timespec,
+) -> i64 {
     unsafe { syscall5!(SYS_MQ_TIMEDSEND, mqdes, msg, len, prio, timeout) }
 }
 
 /// mq_timedreceive(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout)
 #[inline(always)]
-pub fn sys_mq_timedreceive(mqdes: i32, msg: *mut u8, len: usize, prio: *mut u32, timeout: *const Timespec) -> i64 {
+pub fn sys_mq_timedreceive(
+    mqdes: i32,
+    msg: *mut u8,
+    len: usize,
+    prio: *mut u32,
+    timeout: *const Timespec,
+) -> i64 {
     unsafe { syscall5!(SYS_MQ_TIMEDRECEIVE, mqdes, msg, len, prio, timeout) }
 }
 
@@ -1179,18 +1270,47 @@ pub fn sys_poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i64 {
 }
 
 #[inline(always)]
-pub fn sys_ppoll(fds: *mut PollFd, nfds: u32, tmo_p: *const Timespec, sigmask: u64, sigsetsize: u64) -> i64 {
+pub fn sys_ppoll(
+    fds: *mut PollFd,
+    nfds: u32,
+    tmo_p: *const Timespec,
+    sigmask: u64,
+    sigsetsize: u64,
+) -> i64 {
     unsafe { syscall5!(SYS_PPOLL, fds, nfds, tmo_p, sigmask, sigsetsize) }
 }
 
 #[inline(always)]
-pub fn sys_select(nfds: i32, readfds: *mut FdSet, writefds: *mut FdSet, exceptfds: *mut FdSet, timeout: *mut Timeval) -> i64 {
+pub fn sys_select(
+    nfds: i32,
+    readfds: *mut FdSet,
+    writefds: *mut FdSet,
+    exceptfds: *mut FdSet,
+    timeout: *mut Timeval,
+) -> i64 {
     unsafe { syscall5!(SYS_SELECT, nfds, readfds, writefds, exceptfds, timeout) }
 }
 
 #[inline(always)]
-pub fn sys_pselect6(nfds: i32, readfds: *mut FdSet, writefds: *mut FdSet, exceptfds: *mut FdSet, timeout: *const Timespec, sigmask: u64) -> i64 {
-    unsafe { syscall6!(SYS_PSELECT6, nfds, readfds, writefds, exceptfds, timeout, sigmask) }
+pub fn sys_pselect6(
+    nfds: i32,
+    readfds: *mut FdSet,
+    writefds: *mut FdSet,
+    exceptfds: *mut FdSet,
+    timeout: *const Timespec,
+    sigmask: u64,
+) -> i64 {
+    unsafe {
+        syscall6!(
+            SYS_PSELECT6,
+            nfds,
+            readfds,
+            writefds,
+            exceptfds,
+            timeout,
+            sigmask
+        )
+    }
 }
 
 // --- Memory Management ---
@@ -1472,7 +1592,12 @@ pub fn sys_setrlimit(resource: u32, rlim: *const RLimit) -> i64 {
 }
 
 #[inline(always)]
-pub fn sys_prlimit64(pid: i32, resource: u32, new_rlim: *const RLimit, old_rlim: *mut RLimit) -> i64 {
+pub fn sys_prlimit64(
+    pid: i32,
+    resource: u32,
+    new_rlim: *const RLimit,
+    old_rlim: *mut RLimit,
+) -> i64 {
     unsafe { syscall4!(SYS_PRLIMIT64, pid, resource, new_rlim, old_rlim) }
 }
 
@@ -1543,12 +1668,26 @@ pub fn sys_getpeername(fd: i32, addr: *mut u8, addrlen: *mut u32) -> i64 {
 }
 
 #[inline(always)]
-pub fn sys_sendto(fd: i32, buf: *const u8, len: usize, flags: i32, dest_addr: *const u8, addrlen: u32) -> i64 {
+pub fn sys_sendto(
+    fd: i32,
+    buf: *const u8,
+    len: usize,
+    flags: i32,
+    dest_addr: *const u8,
+    addrlen: u32,
+) -> i64 {
     unsafe { syscall6!(SYS_SENDTO, fd, buf, len, flags, dest_addr, addrlen) }
 }
 
 #[inline(always)]
-pub fn sys_recvfrom(fd: i32, buf: *mut u8, len: usize, flags: i32, src_addr: *mut u8, addrlen: *mut u32) -> i64 {
+pub fn sys_recvfrom(
+    fd: i32,
+    buf: *mut u8,
+    len: usize,
+    flags: i32,
+    src_addr: *mut u8,
+    addrlen: *mut u32,
+) -> i64 {
     unsafe { syscall6!(SYS_RECVFROM, fd, buf, len, flags, src_addr, addrlen) }
 }
 
@@ -1583,7 +1722,13 @@ pub fn sys_sendmmsg(fd: i32, msgvec: *mut super::MMsgHdr, vlen: u32, flags: i32)
 }
 
 #[inline(always)]
-pub fn sys_recvmmsg(fd: i32, msgvec: *mut super::MMsgHdr, vlen: u32, flags: i32, timeout: *const Timespec) -> i64 {
+pub fn sys_recvmmsg(
+    fd: i32,
+    msgvec: *mut super::MMsgHdr,
+    vlen: u32,
+    flags: i32,
+    timeout: *const Timespec,
+) -> i64 {
     unsafe { syscall5!(SYS_RECVMMSG, fd, msgvec, vlen, flags, timeout) }
 }
 
@@ -1622,7 +1767,12 @@ pub fn sys_semop(semid: i32, sops: *const super::Sembuf, nsops: usize) -> i64 {
 }
 
 #[inline(always)]
-pub fn sys_semtimedop(semid: i32, sops: *const super::Sembuf, nsops: usize, timeout: *const Timespec) -> i64 {
+pub fn sys_semtimedop(
+    semid: i32,
+    sops: *const super::Sembuf,
+    nsops: usize,
+    timeout: *const Timespec,
+) -> i64 {
     unsafe { syscall4!(SYS_SEMTIMEDOP, semid, sops, nsops, timeout) }
 }
 
@@ -1656,7 +1806,14 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, buf: u64) -> i64 {
 // --- Futex ---
 
 #[inline(always)]
-pub fn sys_futex(uaddr: *mut u32, op: u32, val: u32, timeout: *const Timespec, uaddr2: *mut u32, val3: u32) -> i64 {
+pub fn sys_futex(
+    uaddr: *mut u32,
+    op: u32,
+    val: u32,
+    timeout: *const Timespec,
+    uaddr2: *mut u32,
+    val3: u32,
+) -> i64 {
     unsafe { syscall6!(SYS_FUTEX, uaddr, op, val, timeout, uaddr2, val3) }
 }
 
@@ -1666,7 +1823,11 @@ pub fn sys_set_robust_list(head: *const super::RobustListHead, len: usize) -> i6
 }
 
 #[inline(always)]
-pub fn sys_get_robust_list(pid: i32, head_ptr: *mut *const super::RobustListHead, len_ptr: *mut usize) -> i64 {
+pub fn sys_get_robust_list(
+    pid: i32,
+    head_ptr: *mut *const super::RobustListHead,
+    len_ptr: *mut usize,
+) -> i64 {
     unsafe { syscall3!(SYS_GET_ROBUST_LIST, pid, head_ptr, len_ptr) }
 }
 
@@ -1692,7 +1853,16 @@ pub fn sys_futex_waitv(
     timeout: *const Timespec,
     clockid: i32,
 ) -> i64 {
-    unsafe { syscall5!(SYS_FUTEX_WAITV, waiters, nr_futexes, flags, timeout, clockid) }
+    unsafe {
+        syscall5!(
+            SYS_FUTEX_WAITV,
+            waiters,
+            nr_futexes,
+            flags,
+            timeout,
+            clockid
+        )
+    }
 }
 
 // --- TLS ---
@@ -1715,7 +1885,14 @@ pub fn sys_sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> 
 }
 
 #[inline(always)]
-pub fn sys_splice(fd_in: i32, off_in: *mut i64, fd_out: i32, off_out: *mut i64, len: usize, flags: u32) -> i64 {
+pub fn sys_splice(
+    fd_in: i32,
+    off_in: *mut i64,
+    fd_out: i32,
+    off_out: *mut i64,
+    len: usize,
+    flags: u32,
+) -> i64 {
     unsafe { syscall6!(SYS_SPLICE, fd_in, off_in, fd_out, off_out, len, flags) }
 }
 
@@ -1740,8 +1917,25 @@ pub fn sys_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i64 {
 }
 
 #[inline(always)]
-pub fn sys_copy_file_range(fd_in: i32, off_in: *mut u64, fd_out: i32, off_out: *mut u64, len: usize, flags: u32) -> i64 {
-    unsafe { syscall6!(SYS_COPY_FILE_RANGE, fd_in, off_in, fd_out, off_out, len, flags) }
+pub fn sys_copy_file_range(
+    fd_in: i32,
+    off_in: *mut u64,
+    fd_out: i32,
+    off_out: *mut u64,
+    len: usize,
+    flags: u32,
+) -> i64 {
+    unsafe {
+        syscall6!(
+            SYS_COPY_FILE_RANGE,
+            fd_in,
+            off_in,
+            fd_out,
+            off_out,
+            len,
+            flags
+        )
+    }
 }
 
 // --- Filesystem Statistics ---
@@ -1757,19 +1951,37 @@ pub fn sys_fstatfs(fd: i32, buf: *mut super::LinuxStatFs) -> i64 {
 }
 
 #[inline(always)]
-pub fn sys_statx(dirfd: i32, pathname: *const u8, flags: i32, mask: u32, buf: *mut super::Statx) -> i64 {
+pub fn sys_statx(
+    dirfd: i32,
+    pathname: *const u8,
+    flags: i32,
+    mask: u32,
+    buf: *mut super::Statx,
+) -> i64 {
     unsafe { syscall5!(SYS_STATX, dirfd, pathname, flags, mask, buf) }
 }
 
 // --- Extended Attributes ---
 
 #[inline(always)]
-pub fn sys_setxattr(path: *const u8, name: *const u8, value: *const u8, size: usize, flags: i32) -> i64 {
+pub fn sys_setxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: i32,
+) -> i64 {
     unsafe { syscall5!(SYS_SETXATTR, path, name, value, size, flags) }
 }
 
 #[inline(always)]
-pub fn sys_lsetxattr(path: *const u8, name: *const u8, value: *const u8, size: usize, flags: i32) -> i64 {
+pub fn sys_lsetxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: i32,
+) -> i64 {
     unsafe { syscall5!(SYS_LSETXATTR, path, name, value, size, flags) }
 }
 
@@ -2188,7 +2400,17 @@ pub fn sys_io_uring_enter(
     argp: u64,
     argsz: usize,
 ) -> i64 {
-    unsafe { syscall6!(SYS_IO_URING_ENTER, fd, to_submit, min_complete, flags, argp, argsz) }
+    unsafe {
+        syscall6!(
+            SYS_IO_URING_ENTER,
+            fd,
+            to_submit,
+            min_complete,
+            flags,
+            argp,
+            argsz
+        )
+    }
 }
 
 /// io_uring_register(fd, opcode, arg, nr_args) - register resources with io_uring
@@ -2251,7 +2473,15 @@ pub fn sys_request_key(
     callout_info: *const u8,
     dest_keyring: i32,
 ) -> i64 {
-    unsafe { syscall4!(SYS_REQUEST_KEY, key_type, description, callout_info, dest_keyring) }
+    unsafe {
+        syscall4!(
+            SYS_REQUEST_KEY,
+            key_type,
+            description,
+            callout_info,
+            dest_keyring
+        )
+    }
 }
 
 /// keyctl(cmd, arg2, arg3, arg4, arg5) - key management operations
@@ -2323,7 +2553,17 @@ pub fn sys_process_vm_readv(
     riovcnt: u64,
     flags: u64,
 ) -> i64 {
-    unsafe { syscall6!(SYS_PROCESS_VM_READV, pid, local_iov, liovcnt, remote_iov, riovcnt, flags) }
+    unsafe {
+        syscall6!(
+            SYS_PROCESS_VM_READV,
+            pid,
+            local_iov,
+            liovcnt,
+            remote_iov,
+            riovcnt,
+            flags
+        )
+    }
 }
 
 /// process_vm_writev - Write to another process's memory
@@ -2347,7 +2587,17 @@ pub fn sys_process_vm_writev(
     riovcnt: u64,
     flags: u64,
 ) -> i64 {
-    unsafe { syscall6!(SYS_PROCESS_VM_WRITEV, pid, local_iov, liovcnt, remote_iov, riovcnt, flags) }
+    unsafe {
+        syscall6!(
+            SYS_PROCESS_VM_WRITEV,
+            pid,
+            local_iov,
+            liovcnt,
+            remote_iov,
+            riovcnt,
+            flags
+        )
+    }
 }
 
 // ============================================================================

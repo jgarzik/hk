@@ -7,12 +7,9 @@
 //! - Test: capset() - drop a capability
 //! - Test: capset() - verify dropped capability can't be restored
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_capget, sys_capset,
-    CapUserHeader, CapUserData,
-    _LINUX_CAPABILITY_VERSION_3,
-    CAP_SYS_ADMIN,
+    _LINUX_CAPABILITY_VERSION_3, CAP_SYS_ADMIN, CapUserData, CapUserHeader, sys_capget, sys_capset,
 };
 
 /// Run all capabilities tests

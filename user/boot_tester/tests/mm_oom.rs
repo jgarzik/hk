@@ -19,10 +19,10 @@
 use super::helpers::{host_mode, print, print_num, println, skip};
 use super::mm_life::meminfo;
 use hk_syscall::{
-    sys_brk, sys_close, sys_exit, sys_fork, sys_mlock, sys_mmap, sys_mremap, sys_munmap,
-    sys_nanosleep, sys_open, sys_read, sys_setresuid, sys_setrlimit, sys_wait4, RLimit, Timespec,
-    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_MAYMOVE, O_RDONLY, PROT_READ, PROT_WRITE,
-    RLIMIT_AS, RLIMIT_MEMLOCK,
+    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_MAYMOVE, O_RDONLY, PROT_READ,
+    PROT_WRITE, RLIMIT_AS, RLIMIT_MEMLOCK, RLimit, Timespec, sys_brk, sys_close, sys_exit,
+    sys_fork, sys_mlock, sys_mmap, sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_read,
+    sys_setresuid, sys_setrlimit, sys_wait4,
 };
 
 const MAP_NORESERVE: u32 = 0x4000;
@@ -49,7 +49,11 @@ fn mlock_hog() -> u64 {
     if p < 0 {
         return 2;
     }
-    if sys_mlock(p as u64, len) == -11 { 0x80 } else { 3 }
+    if sys_mlock(p as u64, len) == -11 {
+        0x80
+    } else {
+        3
+    }
 }
 
 fn report(name: &[u8], ok: bool, detail: i64) {
@@ -138,7 +142,10 @@ fn rlimit_as_child() -> u64 {
     if used == 0 {
         return 1;
     }
-    let lim = RLimit { rlim_cur: used + 16 * MB, rlim_max: used + 16 * MB };
+    let lim = RLimit {
+        rlim_cur: used + 16 * MB,
+        rlim_max: used + 16 * MB,
+    };
     if sys_setrlimit(RLIMIT_AS, &lim) != 0 {
         return 2;
     }
@@ -167,11 +174,21 @@ fn rlimit_as_child() -> u64 {
 /// Child: RLIMIT_MEMLOCK 64KB, no privileges, 16KB mlocked; growing
 /// the locked mapping to 128KB is EAGAIN, moved or in place
 fn rlimit_memlock_child() -> u64 {
-    let lim = RLimit { rlim_cur: 64 * 1024, rlim_max: 64 * 1024 };
+    let lim = RLimit {
+        rlim_cur: 64 * 1024,
+        rlim_max: 64 * 1024,
+    };
     if sys_setrlimit(RLIMIT_MEMLOCK, &lim) != 0 || sys_setresuid(65534, 65534, 65534) != 0 {
         return 1;
     }
-    let p = sys_mmap(0, 4 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let p = sys_mmap(
+        0,
+        4 * PAGE,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if p < 0 || sys_mlock(p as u64, 4 * PAGE) != 0 {
         return 2;
     }
@@ -221,7 +238,10 @@ fn touch_all(share: u32) -> u64 {
 }
 
 fn settle() {
-    let ts = Timespec { tv_sec: 0, tv_nsec: 20_000_000 };
+    let ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 20_000_000,
+    };
     sys_nanosleep(&ts, core::ptr::null_mut());
 }
 

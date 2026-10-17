@@ -68,12 +68,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::helpers::{host_mode, print, print_num, println};
 use super::mm_life::meminfo;
 use hk_syscall::{
-    sys_close, sys_exit, sys_fork, sys_ftruncate, sys_madvise, sys_mmap, sys_mprotect,
-    sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pipe, sys_pread64, sys_process_vm_readv, sys_process_vm_writev, sys_pwrite64,
-    sys_read, sys_sched_yield, sys_setresuid, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_unlink,
-    sys_wait4, sys_write, IoVec, Timespec, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT,
-    MADV_DONTFORK, MADV_DONTNEED, MADV_REMOVE, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_PRIVATE,
-    MAP_SHARED, MREMAP_MAYMOVE, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE,
+    IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, IoVec, MADV_DONTFORK, MADV_DONTNEED, MADV_REMOVE,
+    MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_MAYMOVE, O_CREAT, O_RDONLY,
+    O_RDWR, O_TRUNC, PROT_READ, PROT_WRITE, Timespec, sys_close, sys_exit, sys_fork, sys_ftruncate,
+    sys_madvise, sys_mmap, sys_mprotect, sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pipe,
+    sys_pread64, sys_process_vm_readv, sys_process_vm_writev, sys_pwrite64, sys_read,
+    sys_sched_yield, sys_setresuid, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_unlink,
+    sys_wait4, sys_write,
 };
 
 const MADV_HUGEPAGE: i32 = 14;
@@ -229,7 +230,9 @@ fn one_page(name: &[u8], flags: u32, f: fn(u64) -> i64) {
 }
 
 fn shared_anon() {
-    one_page(b"FORK_SHARED_ANON", MAP_SHARED, |p| exchange(p + 8, true, nop));
+    one_page(b"FORK_SHARED_ANON", MAP_SHARED, |p| {
+        exchange(p + 8, true, nop)
+    });
 }
 
 fn shared_anon_late() {
@@ -425,7 +428,11 @@ fn shmem_dontunmap() {
             return 1000 + q;
         }
         let q = q as u64;
-        let mut code = if get(q) == BEFORE && get(p) == BEFORE { 0 } else { 1 };
+        let mut code = if get(q) == BEFORE && get(p) == BEFORE {
+            0
+        } else {
+            1
+        };
         put(q + 8, CHILD);
         if code == 0 && get(p + 8) != CHILD {
             code = 2;
@@ -505,11 +512,15 @@ fn shmem_beyond_size() {
 }
 
 fn private_cow() {
-    one_page(b"FORK_PRIVATE_COW", MAP_PRIVATE, |p| exchange(p + 8, false, nop));
+    one_page(b"FORK_PRIVATE_COW", MAP_PRIVATE, |p| {
+        exchange(p + 8, false, nop)
+    });
 }
 
 fn mprotect_cow() {
-    one_page(b"FORK_MPROTECT_COW", MAP_PRIVATE, |p| exchange(p + 8, false, ro_rw));
+    one_page(b"FORK_MPROTECT_COW", MAP_PRIVATE, |p| {
+        exchange(p + 8, false, ro_rw)
+    });
 }
 
 fn rdonly_cow() {
@@ -552,8 +563,14 @@ fn remote_write_cow() {
             sys_exit(if get(p + 8) == CHILD { 0 } else { 1 });
         }
         let v = CHILD;
-        let local = IoVec { iov_base: (&v as *const u64).cast(), iov_len: 8 };
-        let remote = IoVec { iov_base: (p + 8) as *const u8, iov_len: 8 };
+        let local = IoVec {
+            iov_base: (&v as *const u64).cast(),
+            iov_len: 8,
+        };
+        let remote = IoVec {
+            iov_base: (p + 8) as *const u8,
+            iov_len: 8,
+        };
         let n = sys_process_vm_writev(pid as i32, &local, 1, &remote, 1, 0);
         send(from_parent);
         let r = reap(pid);
@@ -588,7 +605,10 @@ fn parked_child(prot: u32, flags: u32) -> (i64, u64, u64) {
 
 fn remote_write_perm() {
     let v = CHILD;
-    let local = IoVec { iov_base: (&v as *const u64).cast(), iov_len: 8 };
+    let local = IoVec {
+        iov_base: (&v as *const u64).cast(),
+        iov_len: 8,
+    };
     // Another user's process: EPERM
     let (pid, p, rel) = parked_child(RW, MAP_PRIVATE);
     let w = sys_fork();
@@ -596,7 +616,10 @@ fn remote_write_perm() {
         if sys_setresuid(65534, 65534, 65534) != 0 {
             sys_exit(9);
         }
-        let remote = IoVec { iov_base: p as *const u8, iov_len: 8 };
+        let remote = IoVec {
+            iov_base: p as *const u8,
+            iov_len: 8,
+        };
         let n = sys_process_vm_writev(pid as i32, &local, 1, &remote, 1, 0);
         sys_exit(if n == -1 { 0 } else { 1 });
     }
@@ -605,16 +628,25 @@ fn remote_write_perm() {
     sys_close(rel);
     let r2 = reap(pid);
     sys_munmap(p, PAGE);
-    report(b"REMOTE_WRITE_PERM", if r == 0 && r2 == 0 { 0 } else { r * 100 + r2 });
+    report(
+        b"REMOTE_WRITE_PERM",
+        if r == 0 && r2 == 0 { 0 } else { r * 100 + r2 },
+    );
     // A read-only shared mapping: EFAULT
     let (pid, p, rel) = parked_child(PROT_READ, MAP_SHARED);
-    let remote = IoVec { iov_base: p as *const u8, iov_len: 8 };
+    let remote = IoVec {
+        iov_base: p as *const u8,
+        iov_len: 8,
+    };
     let n = sys_process_vm_writev(pid as i32, &local, 1, &remote, 1, 0);
     send(rel);
     sys_close(rel);
     let r2 = reap(pid);
     sys_munmap(p, PAGE);
-    report(b"REMOTE_WRITE_RDONLY", if n == -14 && r2 == 0 { 0 } else { 1000 - n });
+    report(
+        b"REMOTE_WRITE_RDONLY",
+        if n == -14 && r2 == 0 { 0 } else { 1000 - n },
+    );
 }
 
 fn remote_bounds() {
@@ -626,9 +658,15 @@ fn remote_bounds() {
     // Mapped here only after the fork: unmapped in the child
     let hole = map(PAGE, MAP_PRIVATE);
     let mut buf = [0u8; 16];
-    let local = IoVec { iov_base: buf.as_mut_ptr(), iov_len: 16 };
+    let local = IoVec {
+        iov_base: buf.as_mut_ptr(),
+        iov_len: 16,
+    };
     let rw = |addr: u64, write: bool| -> i64 {
-        let remote = IoVec { iov_base: addr as *const u8, iov_len: 16 };
+        let remote = IoVec {
+            iov_base: addr as *const u8,
+            iov_len: 16,
+        };
         if write {
             sys_process_vm_writev(pid as i32, &local, 1, &remote, 1, 0)
         } else {
@@ -661,14 +699,23 @@ fn remote_bounds() {
         sys_exit(if ok { 0 } else { 1 });
     }
     let mut got = [0u8; 16];
-    let lg = IoVec { iov_base: got.as_mut_ptr(), iov_len: 16 };
-    let rem = IoVec { iov_base: (q + PAGE - 8) as *const u8, iov_len: 16 };
+    let lg = IoVec {
+        iov_base: got.as_mut_ptr(),
+        iov_len: 16,
+    };
+    let rem = IoVec {
+        iov_base: (q + PAGE - 8) as *const u8,
+        iov_len: 16,
+    };
     let n = sys_process_vm_readv(pid2 as i32, &lg, 1, &rem, 1, 0);
     if code == 0 && (n != 16 || (0..16).any(|i| got[i] != i as u8 + 1)) {
         code = 10;
     }
     let put16: [u8; 16] = core::array::from_fn(|i| 0x40 + i as u8);
-    let lp = IoVec { iov_base: put16.as_ptr(), iov_len: 16 };
+    let lp = IoVec {
+        iov_base: put16.as_ptr(),
+        iov_len: 16,
+    };
     if code == 0 && sys_process_vm_writev(pid2 as i32, &lp, 1, &rem, 1, 0) != 16 {
         code = 11;
     }
@@ -828,7 +875,10 @@ fn shm_nattch_fork() {
 
 /// Let exited tasks' CPUs switch away
 fn settle() {
-    let ts = Timespec { tv_sec: 0, tv_nsec: 20_000_000 };
+    let ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 20_000_000,
+    };
     sys_nanosleep(&ts, core::ptr::null_mut());
 }
 
@@ -1067,7 +1117,12 @@ extern "C" fn writer(idx: u64) -> ! {
 
 /// Start a thread running `f(arg)` on `stack_top`; its tid word `ctid`
 /// is cleared (and woken) when it exits. The tid, or -errno.
-unsafe fn spawn_thread(stack_top: u64, f: extern "C" fn(u64) -> !, arg: u64, ctid: *mut u32) -> i64 {
+unsafe fn spawn_thread(
+    stack_top: u64,
+    f: extern "C" fn(u64) -> !,
+    arg: u64,
+    ctid: *mut u32,
+) -> i64 {
     let ret: i64;
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -1246,7 +1301,11 @@ fn mprotect_race() {
     let ctid = unsafe { &raw mut CTIDS[0] } as *mut u32;
     let top = unsafe { (&raw mut STACKS[0] as *mut u8).add(16384) } as u64;
     unsafe { core::ptr::write_volatile(ctid, 1) };
-    let mut code = if unsafe { spawn_thread(top, reader, 0, ctid) } > 0 { 0 } else { -2 };
+    let mut code = if unsafe { spawn_thread(top, reader, 0, ctid) } > 0 {
+        0
+    } else {
+        -2
+    };
     for round in 0..20 {
         if code != 0 {
             break;

@@ -7,20 +7,15 @@
 //! - SysV semaphores (semget, semop, semctl)
 //! - SysV message queues (msgget, msgsnd, msgrcv, msgctl)
 
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_clock_gettime,
-    sys_close, sys_open, sys_pipe, sys_poll, sys_read, sys_select, sys_write,
-    sys_sendfile, sys_splice, sys_tee, sys_vmsplice,
-    sys_shmget, sys_shmat, sys_shmdt, sys_shmctl,
-    sys_semget, sys_semop, sys_semctl, sys_semtimedop,
-    sys_msgget, sys_msgsnd, sys_msgrcv, sys_msgctl,
-    FdSet, IoVec, PollFd, Timeval, Sembuf, Timespec,
-    POLLIN, POLLNVAL, POLLOUT,
-    IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, Semid64Ds,
-    GETVAL, SETVAL, GETALL, SETALL,
-    O_RDONLY,
+    FdSet, GETALL, GETVAL, IPC_CREAT, IPC_PRIVATE, IPC_RMID, IPC_STAT, IoVec, O_RDONLY, POLLIN,
+    POLLNVAL, POLLOUT, PollFd, SETALL, SETVAL, Sembuf, Semid64Ds, Timespec, Timeval,
+    sys_clock_gettime, sys_close, sys_msgctl, sys_msgget, sys_msgrcv, sys_msgsnd, sys_open,
+    sys_pipe, sys_poll, sys_read, sys_select, sys_semctl, sys_semget, sys_semop, sys_semtimedop,
+    sys_sendfile, sys_shmat, sys_shmctl, sys_shmdt, sys_shmget, sys_splice, sys_tee, sys_vmsplice,
+    sys_write,
 };
-use super::helpers::{print, println, print_num};
 
 /// Run all IPC tests
 pub fn run_tests() {
@@ -70,7 +65,6 @@ pub fn run_tests() {
 
 /// Test basic pipe creation
 fn test_pipe_basic() {
-
     let mut pipefd: [i32; 2] = [0, 0];
     let ret = sys_pipe(pipefd.as_mut_ptr());
 
@@ -94,7 +88,6 @@ fn test_pipe_basic() {
 
 /// Test pipe read/write
 fn test_pipe_read_write() {
-
     let mut pipefd: [i32; 2] = [0, 0];
     let ret = sys_pipe(pipefd.as_mut_ptr());
     if ret != 0 {
@@ -136,8 +129,8 @@ fn test_pipe_read_write() {
     }
 
     // Verify data matches
-    let matches = buf[0] == b'h' && buf[1] == b'e' && buf[2] == b'l'
-                  && buf[3] == b'l' && buf[4] == b'o';
+    let matches =
+        buf[0] == b'h' && buf[1] == b'e' && buf[2] == b'l' && buf[3] == b'l' && buf[4] == b'o';
 
     sys_close(read_fd as u64);
     sys_close(write_fd as u64);
@@ -151,7 +144,6 @@ fn test_pipe_read_write() {
 
 /// Test poll with data ready
 fn test_poll_data_ready() {
-
     let mut pipefd: [i32; 2] = [0, 0];
     if sys_pipe(pipefd.as_mut_ptr()) != 0 {
         println(b"pipe() failed");
@@ -188,7 +180,6 @@ fn test_poll_data_ready() {
 
 /// Test poll with no data (should timeout)
 fn test_poll_no_data() {
-
     let mut pipefd: [i32; 2] = [0, 0];
     if sys_pipe(pipefd.as_mut_ptr()) != 0 {
         println(b"pipe() failed");
@@ -222,7 +213,6 @@ fn test_poll_no_data() {
 
 /// Test poll with invalid fd
 fn test_poll_invalid_fd() {
-
     // Poll a clearly invalid fd
     let mut fds = [PollFd::new(9999, POLLIN)];
     let ret = sys_poll(fds.as_mut_ptr(), 1, 0);
@@ -242,7 +232,6 @@ fn test_poll_invalid_fd() {
 
 /// Test poll for write readiness on pipe
 fn test_poll_write_ready() {
-
     let mut pipefd: [i32; 2] = [0, 0];
     if sys_pipe(pipefd.as_mut_ptr()) != 0 {
         println(b"pipe() failed");
@@ -275,7 +264,6 @@ fn test_poll_write_ready() {
 
 /// Test select with data ready
 fn test_select_data_ready() {
-
     let mut pipefd: [i32; 2] = [0, 0];
     if sys_pipe(pipefd.as_mut_ptr()) != 0 {
         println(b"pipe() failed");
@@ -296,9 +284,18 @@ fn test_select_data_ready() {
     readfds.set(read_fd);
 
     // Timeout 0 (immediate)
-    let mut tv = Timeval { tv_sec: 0, tv_usec: 0 };
+    let mut tv = Timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
 
-    let ret = sys_select(read_fd + 1, &mut readfds, core::ptr::null_mut(), core::ptr::null_mut(), &mut tv);
+    let ret = sys_select(
+        read_fd + 1,
+        &mut readfds,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        &mut tv,
+    );
 
     print(b"select() returned ");
     print_num(ret);
@@ -318,7 +315,6 @@ fn test_select_data_ready() {
 
 /// Test select with no data
 fn test_select_no_data() {
-
     let mut pipefd: [i32; 2] = [0, 0];
     if sys_pipe(pipefd.as_mut_ptr()) != 0 {
         println(b"pipe() failed");
@@ -335,9 +331,18 @@ fn test_select_no_data() {
     readfds.set(read_fd);
 
     // Timeout 0 (immediate)
-    let mut tv = Timeval { tv_sec: 0, tv_usec: 0 };
+    let mut tv = Timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
 
-    let ret = sys_select(read_fd + 1, &mut readfds, core::ptr::null_mut(), core::ptr::null_mut(), &mut tv);
+    let ret = sys_select(
+        read_fd + 1,
+        &mut readfds,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        &mut tv,
+    );
 
     print(b"select() returned ");
     print_num(ret);
@@ -591,7 +596,10 @@ fn test_semtimedop_timeout() {
     // Try to decrement (which would block) with a very short timeout
     // -1 means "decrement by 1" - this will block because value is 0
     let sop = Sembuf::new(0, -1, 0);
-    let timeout = Timespec { tv_sec: 0, tv_nsec: 1_000_000 }; // 1ms timeout
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    }; // 1ms timeout
 
     let ret = sys_semtimedop(semid as i32, &sop, 1, &timeout);
 
@@ -762,9 +770,12 @@ fn test_splice_pipe_to_pipe() {
 
     // Splice from source to destination
     let spliced = sys_splice(
-        src_pipe[0], core::ptr::null_mut(),
-        dst_pipe[1], core::ptr::null_mut(),
-        msg.len(), 0,
+        src_pipe[0],
+        core::ptr::null_mut(),
+        dst_pipe[1],
+        core::ptr::null_mut(),
+        msg.len(),
+        0,
     );
 
     print(b"splice(p2p) returned ");
@@ -794,9 +805,12 @@ fn test_splice_pipe_to_pipe() {
 fn test_splice_invalid_no_pipe() {
     // splice with invalid fd should fail
     let ret = sys_splice(
-        9999, core::ptr::null_mut(),
-        9998, core::ptr::null_mut(),
-        100, 0,
+        9999,
+        core::ptr::null_mut(),
+        9998,
+        core::ptr::null_mut(),
+        100,
+        0,
     );
 
     print(b"splice(no pipe) returned ");
@@ -1075,7 +1089,10 @@ fn test_semctl_all_efault() {
 
 /// Monotonic time in milliseconds
 fn mono_ms() -> i64 {
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     sys_clock_gettime(1, &mut ts); // CLOCK_MONOTONIC
     ts.tv_sec * 1000 + ts.tv_nsec / 1_000_000
 }
@@ -1098,7 +1115,10 @@ fn test_poll_empty_timeout() {
 
 /// Test: select(0, NULL, NULL, NULL, 30ms) is a plain sleep returning 0
 fn test_select_empty_timeout() {
-    let mut tv = Timeval { tv_sec: 0, tv_usec: 30_000 };
+    let mut tv = Timeval {
+        tv_sec: 0,
+        tv_usec: 30_000,
+    };
     let null = core::ptr::null_mut();
     let t0 = mono_ms();
     let ret = sys_select(0, null, null, null, &mut tv);

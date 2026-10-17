@@ -11,12 +11,12 @@
 //! - futex_waitv tests (error cases and basic operation)
 
 use super::helpers::{print, print_num, println};
-use hk_syscall::{
-    sys_futex, sys_futex_waitv, sys_get_robust_list, sys_set_robust_list,
-    FutexWaitv, RobustListHead, FUTEX2_PRIVATE, FUTEX2_SIZE_U32,
-    FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, CLOCK_MONOTONIC,
-};
 use core::ptr;
+use hk_syscall::{
+    CLOCK_MONOTONIC, FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, FUTEX2_PRIVATE, FUTEX2_SIZE_U32,
+    FutexWaitv, RobustListHead, sys_futex, sys_futex_waitv, sys_get_robust_list,
+    sys_set_robust_list,
+};
 
 /// Run all futex tests
 pub fn run_tests() {
@@ -41,10 +41,10 @@ fn test_futex_wake_no_waiters() {
     let ret = sys_futex(
         &mut futex_val as *mut u32,
         FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
-        1,                    // wake up to 1 waiter
-        ptr::null(),          // no timeout
-        ptr::null_mut(),      // no uaddr2
-        0,                    // no val3
+        1,               // wake up to 1 waiter
+        ptr::null(),     // no timeout
+        ptr::null_mut(), // no uaddr2
+        0,               // no val3
     );
 
     if ret == 0 {
@@ -61,10 +61,10 @@ fn test_futex_wait_wrong_value() {
     let ret = sys_futex(
         &mut futex_val as *mut u32,
         FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
-        0,                    // expected value (different from actual)
-        ptr::null(),          // no timeout
-        ptr::null_mut(),      // no uaddr2
-        0,                    // no val3
+        0,               // expected value (different from actual)
+        ptr::null(),     // no timeout
+        ptr::null_mut(), // no uaddr2
+        0,               // no val3
     );
 
     if ret == -11 {
@@ -163,9 +163,9 @@ fn test_futex_waitv_invalid_flags() {
 
     let ret = sys_futex_waitv(
         waitv.as_ptr(),
-        1,                   // nr_futexes
-        1,                   // flags (non-zero = invalid)
-        ptr::null(),         // no timeout
+        1,           // nr_futexes
+        1,           // flags (non-zero = invalid)
+        ptr::null(), // no timeout
         CLOCK_MONOTONIC,
     );
 
@@ -189,7 +189,7 @@ fn test_futex_waitv_invalid_count_zero() {
 
     let ret = sys_futex_waitv(
         waitv.as_ptr(),
-        0,                   // nr_futexes = 0 (invalid)
+        0, // nr_futexes = 0 (invalid)
         0,
         ptr::null(),
         CLOCK_MONOTONIC,
@@ -215,7 +215,7 @@ fn test_futex_waitv_invalid_count_too_large() {
 
     let ret = sys_futex_waitv(
         waitv.as_ptr(),
-        129,                 // nr_futexes > 128 (invalid)
+        129, // nr_futexes > 128 (invalid)
         0,
         ptr::null(),
         CLOCK_MONOTONIC,
@@ -233,7 +233,7 @@ fn test_futex_waitv_invalid_count_too_large() {
 /// Test: futex_waitv with null waiters should return -EINVAL (-22)
 fn test_futex_waitv_null_waiters() {
     let ret = sys_futex_waitv(
-        ptr::null(),         // null waiters (invalid)
+        ptr::null(), // null waiters (invalid)
         1,
         0,
         ptr::null(),
@@ -257,16 +257,10 @@ fn test_futex_waitv_reserved_nonzero() {
         val: 0,
         uaddr: &futex_val as *const u32 as u64,
         flags: FUTEX2_SIZE_U32 | FUTEX2_PRIVATE,
-        __reserved: 1,  // non-zero (invalid)
+        __reserved: 1, // non-zero (invalid)
     }];
 
-    let ret = sys_futex_waitv(
-        waitv.as_ptr(),
-        1,
-        0,
-        ptr::null(),
-        CLOCK_MONOTONIC,
-    );
+    let ret = sys_futex_waitv(waitv.as_ptr(), 1, 0, ptr::null(), CLOCK_MONOTONIC);
 
     if ret == -22 {
         // EINVAL
@@ -279,20 +273,14 @@ fn test_futex_waitv_reserved_nonzero() {
 
 /// Test: futex_waitv with wrong value should return -EAGAIN (-11)
 fn test_futex_waitv_wrong_value() {
-    let futex_val: u32 = 42;  // actual value
+    let futex_val: u32 = 42; // actual value
     let waitv = [FutexWaitv::new(
         &futex_val as *const u32 as u64,
-        0,                   // expected value (different from actual)
+        0, // expected value (different from actual)
         FUTEX2_SIZE_U32 | FUTEX2_PRIVATE,
     )];
 
-    let ret = sys_futex_waitv(
-        waitv.as_ptr(),
-        1,
-        0,
-        ptr::null(),
-        CLOCK_MONOTONIC,
-    );
+    let ret = sys_futex_waitv(waitv.as_ptr(), 1, 0, ptr::null(), CLOCK_MONOTONIC);
 
     if ret == -11 {
         // EAGAIN
@@ -310,16 +298,10 @@ fn test_futex_waitv_invalid_size() {
     let waitv = [FutexWaitv::new(
         &futex_val as *const u32 as u64,
         0,
-        0x03 | FUTEX2_PRIVATE,  // SIZE_U64 = 0x03
+        0x03 | FUTEX2_PRIVATE, // SIZE_U64 = 0x03
     )];
 
-    let ret = sys_futex_waitv(
-        waitv.as_ptr(),
-        1,
-        0,
-        ptr::null(),
-        CLOCK_MONOTONIC,
-    );
+    let ret = sys_futex_waitv(waitv.as_ptr(), 1, 0, ptr::null(), CLOCK_MONOTONIC);
 
     if ret == -22 {
         // EINVAL

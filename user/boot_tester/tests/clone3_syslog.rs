@@ -5,12 +5,10 @@
 //! - Test: syslog() - kernel logging operations
 //! - Test: clone3() - modern extensible clone (basic validation only)
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_personality, sys_syslog,
-    SYSLOG_ACTION_OPEN, SYSLOG_ACTION_CLOSE, SYSLOG_ACTION_SIZE_BUFFER,
-    SYSLOG_ACTION_CONSOLE_LEVEL,
-    PER_LINUX, PERSONALITY_QUERY,
+    PER_LINUX, PERSONALITY_QUERY, SYSLOG_ACTION_CLOSE, SYSLOG_ACTION_CONSOLE_LEVEL,
+    SYSLOG_ACTION_OPEN, SYSLOG_ACTION_SIZE_BUFFER, sys_personality, sys_syslog,
 };
 
 /// Run all clone3/personality/syslog tests

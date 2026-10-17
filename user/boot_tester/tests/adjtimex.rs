@@ -6,10 +6,9 @@
 //! - Test adjtimex setting maxerror/esterror
 //! - Test adjtimex returns EINVAL for invalid tick
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_adjtimex, Timex, ADJ_MAXERROR, ADJ_ESTERROR, ADJ_TICK,
-    TIME_ERROR, STA_UNSYNC,
+    ADJ_ESTERROR, ADJ_MAXERROR, ADJ_TICK, STA_UNSYNC, TIME_ERROR, Timex, sys_adjtimex,
 };
 
 /// Run all adjtimex tests
@@ -65,7 +64,7 @@ fn test_adjtimex_set_errors() {
     let mut txc = Timex::default();
     txc.modes = ADJ_MAXERROR | ADJ_ESTERROR;
     txc.maxerror = 100000; // 0.1 sec
-    txc.esterror = 50000;  // 0.05 sec
+    txc.esterror = 50000; // 0.05 sec
 
     let ret = sys_adjtimex(&mut txc);
 

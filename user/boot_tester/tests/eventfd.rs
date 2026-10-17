@@ -8,10 +8,10 @@
 //! - Test eventfd nonblock
 //! - Test eventfd poll
 
-use super::helpers::{print, println, print_num};
+use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_read, sys_write, sys_eventfd2, sys_poll,
-    EFD_SEMAPHORE, EFD_NONBLOCK, PollFd, POLLIN,
+    EFD_NONBLOCK, EFD_SEMAPHORE, POLLIN, PollFd, sys_close, sys_eventfd2, sys_poll, sys_read,
+    sys_write,
 };
 
 /// Run all eventfd tests

@@ -15,11 +15,12 @@
 //! - Test 62: fchmodat2() with invalid flags
 //! - Test 63: chroot() - change root directory
 
-use super::helpers::{host_mode, print, println, print_num};
+use super::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
-    sys_chmod, sys_chown, sys_chroot, sys_close, sys_exit, sys_fork, sys_wait4, sys_fchmod, sys_fchmodat2, sys_fchown, sys_lchown,
+    O_CREAT, O_RDWR, O_WRONLY, Stat, Timespec, UTIME_NOW, UTIME_OMIT, sys_chmod, sys_chown,
+    sys_chroot, sys_close, sys_exit, sys_fchmod, sys_fchmodat2, sys_fchown, sys_fork, sys_lchown,
     sys_lstat, sys_mkdir, sys_open, sys_stat, sys_symlink, sys_umask, sys_unlink, sys_utimensat,
-    Stat, Timespec, O_CREAT, O_RDWR, O_WRONLY, UTIME_NOW, UTIME_OMIT,
+    sys_wait4,
 };
 
 /// Run all permission tests
@@ -41,7 +42,6 @@ pub fn run_tests() {
 
 /// Test 51: chmod() - change file permissions by path
 fn test_chmod() {
-
     let chmod_test_file = b"/chmod_test_file\0";
     // Create file with 0644 permissions using O_CREAT
     let fd = sys_open(chmod_test_file.as_ptr(), O_CREAT | O_RDWR, 0o644);
@@ -80,7 +80,6 @@ fn test_chmod() {
 
 /// Test 52: fchmod() - change file permissions by fd
 fn test_fchmod() {
-
     let fchmod_test_file = b"/fchmod_test_file\0";
     // Create file with 0644 permissions
     let fd = sys_open(fchmod_test_file.as_ptr(), O_CREAT | O_RDWR, 0o644);
@@ -118,7 +117,6 @@ fn test_fchmod() {
 
 /// Test 53: fchmod() on invalid fd should fail with EBADF
 fn test_fchmod_ebadf() {
-
     let ret = sys_fchmod(999, 0o755);
     if ret == -9 {
         // EBADF
@@ -131,7 +129,6 @@ fn test_fchmod_ebadf() {
 
 /// Test 54: chown() - change file ownership by path
 fn test_chown() {
-
     let chown_test_file = b"/chown_test_file\0";
     // Create test file
     let fd = sys_open(chown_test_file.as_ptr(), O_CREAT | O_WRONLY, 0o644);
@@ -165,7 +162,6 @@ fn test_chown() {
 
 /// Test 55: fchown() - change file ownership by fd
 fn test_fchown() {
-
     let fchown_test_file = b"/fchown_test_file\0";
     let fd = sys_open(fchown_test_file.as_ptr(), O_CREAT | O_RDWR, 0o644);
     if fd >= 0 {
@@ -197,7 +193,6 @@ fn test_fchown() {
 
 /// Test 56: fchown() on invalid fd should fail with EBADF
 fn test_fchown_ebadf() {
-
     let ret = sys_fchown(999, 1000, 1000);
     if ret == -9 {
         // EBADF
@@ -210,7 +205,6 @@ fn test_fchown_ebadf() {
 
 /// Test 57: lchown() - change symlink ownership (not target)
 fn test_lchown() {
-
     let lchown_target = b"/lchown_target\0";
     let lchown_link = b"/lchown_link\0";
 
@@ -251,7 +245,6 @@ fn test_lchown() {
 
 /// Test 58: chown() with -1 to keep existing value
 fn test_chown_minus1() {
-
     let chown_minus1_file = b"/chown_minus1_test\0";
     let fd = sys_open(chown_minus1_file.as_ptr(), O_CREAT | O_WRONLY, 0o644);
     if fd >= 0 {
@@ -286,7 +279,6 @@ fn test_chown_minus1() {
 
 /// Test 59: umask() - set file creation mask
 fn test_umask() {
-
     // Get the current umask (default should be 0o022)
     let old_mask = sys_umask(0o077);
     if old_mask < 0 {
@@ -306,7 +298,6 @@ fn test_umask() {
 
 /// Test 60: utimensat() - update file timestamps
 fn test_utimensat() {
-
     // Create a test file
     let utimensat_file = b"/utimensat_test.txt\0";
     let fd = sys_open(utimensat_file.as_ptr(), O_CREAT | O_WRONLY, 0o644);
@@ -318,8 +309,14 @@ fn test_utimensat() {
 
         // Test 1: Set specific timestamps
         let times: [Timespec; 2] = [
-            Timespec { tv_sec: 1000, tv_nsec: 0 },       // atime
-            Timespec { tv_sec: 2000, tv_nsec: 500000 },  // mtime
+            Timespec {
+                tv_sec: 1000,
+                tv_nsec: 0,
+            }, // atime
+            Timespec {
+                tv_sec: 2000,
+                tv_nsec: 500000,
+            }, // mtime
         ];
         let ret = sys_utimensat(-100, utimensat_file.as_ptr(), times.as_ptr(), 0);
         if ret < 0 {
@@ -328,8 +325,14 @@ fn test_utimensat() {
         } else {
             // Test 2: Use UTIME_NOW for atime, UTIME_OMIT for mtime
             let times_now: [Timespec; 2] = [
-                Timespec { tv_sec: 0, tv_nsec: UTIME_NOW },   // atime = now
-                Timespec { tv_sec: 0, tv_nsec: UTIME_OMIT },  // mtime = unchanged
+                Timespec {
+                    tv_sec: 0,
+                    tv_nsec: UTIME_NOW,
+                }, // atime = now
+                Timespec {
+                    tv_sec: 0,
+                    tv_nsec: UTIME_OMIT,
+                }, // mtime = unchanged
             ];
             let ret2 = sys_utimensat(-100, utimensat_file.as_ptr(), times_now.as_ptr(), 0);
             if ret2 < 0 {

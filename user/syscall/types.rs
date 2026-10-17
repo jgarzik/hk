@@ -45,7 +45,11 @@ pub struct PollFd {
 
 impl PollFd {
     pub const fn new(fd: i32, events: i16) -> Self {
-        Self { fd, events, revents: 0 }
+        Self {
+            fd,
+            events,
+            revents: 0,
+        }
     }
 }
 
@@ -441,7 +445,10 @@ pub struct RLimit {
 impl RLimit {
     /// Create a new RLimit
     pub const fn new(cur: u64, max: u64) -> Self {
-        Self { rlim_cur: cur, rlim_max: max }
+        Self {
+            rlim_cur: cur,
+            rlim_max: max,
+        }
     }
 }
 
@@ -753,7 +760,11 @@ pub struct Sembuf {
 impl Sembuf {
     /// Create a new semaphore operation buffer
     pub const fn new(sem_num: u16, sem_op: i16, sem_flg: i16) -> Self {
-        Self { sem_num, sem_op, sem_flg }
+        Self {
+            sem_num,
+            sem_op,
+            sem_flg,
+        }
     }
 }
 
@@ -925,10 +936,21 @@ pub struct ITimerSpec {
 
 impl ITimerSpec {
     /// Create a new itimerspec
-    pub const fn new(value_sec: i64, value_nsec: i64, interval_sec: i64, interval_nsec: i64) -> Self {
+    pub const fn new(
+        value_sec: i64,
+        value_nsec: i64,
+        interval_sec: i64,
+        interval_nsec: i64,
+    ) -> Self {
         Self {
-            it_value: Timespec { tv_sec: value_sec, tv_nsec: value_nsec },
-            it_interval: Timespec { tv_sec: interval_sec, tv_nsec: interval_nsec },
+            it_value: Timespec {
+                tv_sec: value_sec,
+                tv_nsec: value_nsec,
+            },
+            it_interval: Timespec {
+                tv_sec: interval_sec,
+                tv_nsec: interval_nsec,
+            },
         }
     }
 
@@ -1511,9 +1533,18 @@ pub const IN_CLOSE: u32 = IN_CLOSE_WRITE | IN_CLOSE_NOWRITE;
 /// Move (both from and to)
 pub const IN_MOVE: u32 = IN_MOVED_FROM | IN_MOVED_TO;
 /// All events user can watch for
-pub const IN_ALL_EVENTS: u32 = IN_ACCESS | IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE
-    | IN_CLOSE_NOWRITE | IN_OPEN | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE
-    | IN_CREATE | IN_DELETE_SELF | IN_MOVE_SELF;
+pub const IN_ALL_EVENTS: u32 = IN_ACCESS
+    | IN_MODIFY
+    | IN_ATTRIB
+    | IN_CLOSE_WRITE
+    | IN_CLOSE_NOWRITE
+    | IN_OPEN
+    | IN_MOVED_FROM
+    | IN_MOVED_TO
+    | IN_DELETE
+    | IN_CREATE
+    | IN_DELETE_SELF
+    | IN_MOVE_SELF;
 
 // Events sent by the kernel
 /// Backing fs was unmounted
@@ -2196,7 +2227,12 @@ pub const SECCOMP_DATA_ARGS_OFFSET: u32 = 16;
 /// Helper: Create a BPF instruction
 #[inline(always)]
 pub const fn bpf_stmt(code: u16, k: u32) -> SockFilter {
-    SockFilter { code, jt: 0, jf: 0, k }
+    SockFilter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
 }
 
 /// Helper: Create a BPF jump instruction

@@ -2,8 +2,8 @@
 //!
 //! Tests for comparing kernel resources between processes.
 
-use super::helpers::{print, print_num, println, host_mode};
-use hk_syscall::{sys_getpid, sys_kcmp, KCMP_FILE, KCMP_FILES, KCMP_FS, KCMP_SIGHAND, KCMP_VM};
+use super::helpers::{host_mode, print, print_num, println};
+use hk_syscall::{KCMP_FILE, KCMP_FILES, KCMP_FS, KCMP_SIGHAND, KCMP_VM, sys_getpid, sys_kcmp};
 
 const ESRCH: i64 = -3;
 const EBADF: i64 = -9;

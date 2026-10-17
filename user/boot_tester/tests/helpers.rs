@@ -3,8 +3,8 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use hk_syscall::{
-    sys_close, sys_ioctl, sys_mkdir, sys_mount, sys_socket, sys_uname, sys_write, UtsName, AF_INET,
-    SOCK_DGRAM,
+    AF_INET, SOCK_DGRAM, UtsName, sys_close, sys_ioctl, sys_mkdir, sys_mount, sys_socket,
+    sys_uname, sys_write,
 };
 
 pub const STDOUT: u64 = 1;
@@ -22,9 +22,21 @@ pub fn init_host_mode() {
 /// Linux leaves pseudo-filesystems to init; hk mounts /proc and /dev itself
 pub fn host_setup() {
     sys_mkdir(b"/proc\0".as_ptr(), 0o555);
-    sys_mount(b"proc\0".as_ptr(), b"/proc\0".as_ptr(), b"proc\0".as_ptr(), 0, 0);
+    sys_mount(
+        b"proc\0".as_ptr(),
+        b"/proc\0".as_ptr(),
+        b"proc\0".as_ptr(),
+        0,
+        0,
+    );
     sys_mkdir(b"/dev\0".as_ptr(), 0o755);
-    sys_mount(b"devtmpfs\0".as_ptr(), b"/dev\0".as_ptr(), b"devtmpfs\0".as_ptr(), 0, 0);
+    sys_mount(
+        b"devtmpfs\0".as_ptr(),
+        b"/dev\0".as_ptr(),
+        b"devtmpfs\0".as_ptr(),
+        0,
+        0,
+    );
     sys_mkdir(b"/tmp\0".as_ptr(), 0o1777);
 }
 
@@ -122,4 +134,3 @@ pub fn starts_with(slice: &[u8], prefix: &[u8]) -> bool {
     }
     true
 }
-

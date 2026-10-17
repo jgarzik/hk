@@ -6,7 +6,7 @@
 //! These tests focus on error handling and permission checks.
 
 use super::helpers::{print, println};
-use hk_syscall::{sys_swapon, sys_swapoff};
+use hk_syscall::{sys_swapoff, sys_swapon};
 
 #[allow(dead_code)]
 const EPERM: i64 = -1;
@@ -57,7 +57,7 @@ fn test_swapoff_einval() {
 fn test_swapon_invalid_header() {
     print(b"  swapon invalid header: ");
     // Create a file with invalid swap header
-    use hk_syscall::{sys_close, sys_open, sys_write, O_CREAT, O_WRONLY};
+    use hk_syscall::{O_CREAT, O_WRONLY, sys_close, sys_open, sys_write};
 
     let path = b"/tmp/invalid_swap\0";
 

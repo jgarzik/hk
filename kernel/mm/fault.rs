@@ -118,7 +118,7 @@ fn find_area(map: &mut MmStruct, addr: u64, access: Access) -> Result<Area, VmFa
 /// A frame for user data, unless free memory is down to the reserve
 /// kept for the kernel (Linux: user allocations stop at the min
 /// watermark; page tables, stacks and DMA buffers may still dip below)
-pub(super) fn alloc_user() -> Option<u64> {
+pub(crate) fn alloc_user() -> Option<u64> {
     if FRAME_ALLOCATOR.below_reserve() {
         return None;
     }

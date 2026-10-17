@@ -4,9 +4,8 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_execve, sys_exit, sys_fork, sys_fstatat, sys_getitimer, sys_rt_sigprocmask,
-    sys_rt_sigtimedwait, sys_setitimer, sys_wait4, ITimerVal, Stat, Timespec, Timeval,
-    ITIMER_REAL,
+    ITIMER_REAL, ITimerVal, Stat, Timespec, Timeval, sys_execve, sys_exit, sys_fork, sys_fstatat,
+    sys_getitimer, sys_rt_sigprocmask, sys_rt_sigtimedwait, sys_setitimer, sys_wait4,
 };
 
 const AT_FDCWD: i32 = -100;
@@ -59,7 +58,11 @@ fn test_exec_mode(name: &[u8], mode: &'static [u8]) {
             core::ptr::null(),
         ];
         let envp: [*const u8; 2] = [b"HK=1\0".as_ptr(), core::ptr::null()];
-        sys_execve(b"/bin/boot_tester2\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        sys_execve(
+            b"/bin/boot_tester2\0".as_ptr(),
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
         sys_exit(99);
     });
     report(name, st == 0, (st >> 8) as i64);
@@ -136,7 +139,10 @@ fn test_tls_switch() {
     fn run(block: u64) -> ! {
         set_tls(block);
         let want = tls_word();
-        let ts = Timespec { tv_sec: 0, tv_nsec: 2_000_000 };
+        let ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: 2_000_000,
+        };
         for _ in 0..30 {
             hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
             if tls_word() != want {
@@ -172,9 +178,16 @@ fn test_newfstatat() {
 /// Block SIGALRM, then wait up to 2s for it; true if it arrived
 fn alrm_arrives() -> bool {
     let set: u64 = 1 << (SIGALRM - 1);
-    let ts = Timespec { tv_sec: 2, tv_nsec: 0 };
-    sys_rt_sigtimedwait(&set as *const u64 as u64, 0, &ts as *const Timespec as u64, 8)
-        == SIGALRM as i64
+    let ts = Timespec {
+        tv_sec: 2,
+        tv_nsec: 0,
+    };
+    sys_rt_sigtimedwait(
+        &set as *const u64 as u64,
+        0,
+        &ts as *const Timespec as u64,
+        8,
+    ) == SIGALRM as i64
 }
 
 fn block_alrm(how: i32) {
@@ -186,8 +199,14 @@ fn block_alrm(how: i32) {
 /// time left; disarming reads back as zero
 fn test_itimer_real() {
     block_alrm(SIG_BLOCK);
-    let tv = |s, us| Timeval { tv_sec: s, tv_usec: us };
-    let it = ITimerVal { it_interval: tv(0, 0), it_value: tv(0, 200_000) };
+    let tv = |s, us| Timeval {
+        tv_sec: s,
+        tv_usec: us,
+    };
+    let it = ITimerVal {
+        it_interval: tv(0, 0),
+        it_value: tv(0, 200_000),
+    };
     let r = sys_setitimer(ITIMER_REAL, &it, core::ptr::null_mut());
     let mut cur = ITimerVal::default();
     sys_getitimer(ITIMER_REAL, &mut cur);

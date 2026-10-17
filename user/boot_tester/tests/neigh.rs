@@ -5,8 +5,8 @@
 
 use super::helpers::skip;
 use super::nl::{
-    each_msg, msleep, net_setup_eth0, rxbuf, Msg, Nl, Req, AF_INET, NLM_F_CREATE, NLM_F_EXCL,
-    RTM_GETNEIGH, RTM_NEWNEIGH,
+    AF_INET, Msg, NLM_F_CREATE, NLM_F_EXCL, Nl, RTM_GETNEIGH, RTM_NEWNEIGH, Req, each_msg, msleep,
+    net_setup_eth0, rxbuf,
 };
 use super::sk::*;
 use super::sysctl::read_file;
@@ -115,7 +115,11 @@ fn test_gateway(idx: u32) {
     let n = read_file(b"/proc/net/arp\0", &mut buf);
     t.ok(b"read", n > 0, n);
     let text = &buf[..n.max(0) as usize];
-    t.ok(b"header", text.starts_with(b"IP address       HW type     Flags"), 0);
+    t.ok(
+        b"header",
+        text.starts_with(b"IP address       HW type     Flags"),
+        0,
+    );
     let line = arp_line(text, b"10.0.2.2");
     t.ok(b"line", line.is_some(), 0);
     if let Some(l) = line {
@@ -176,9 +180,17 @@ fn test_admin(idx: u32) {
     t.eq(b"no create", add(&mut nl, idx, 0, true, true), ENOENT);
     t.eq(b"add", add(&mut nl, idx, ce, true, true), 0);
     t.eq(b"excl", add(&mut nl, idx, ce, true, true), EEXIST);
-    t.eq(b"replace", add(&mut nl, idx, NLM_F_CREATE | NLM_F_REPLACE, true, true), 0);
+    t.eq(
+        b"replace",
+        add(&mut nl, idx, NLM_F_CREATE | NLM_F_REPLACE, true, true),
+        0,
+    );
     let st = neigh_state(&mut nl, idx, ip);
-    t.ok(b"permanent", st == Some((NUD_PERMANENT, Some(mac))), st.map_or(-1, |s| s.0 as i64));
+    t.ok(
+        b"permanent",
+        st == Some((NUD_PERMANENT, Some(mac))),
+        st.map_or(-1, |s| s.0 as i64),
+    );
     // A single-entry RTM_GETNEIGH
     let mut r = Req::new(RTM_GETNEIGH, 0, &ndmsg(AF_INET, idx, 0));
     r.attr(NDA_DST, &ip);
@@ -197,7 +209,11 @@ fn test_admin(idx: u32) {
     let mut abuf = [0u8; 2048];
     let n = read_file(b"/proc/net/arp\0", &mut abuf);
     let line = arp_line(&abuf[..n.max(0) as usize], b"10.0.2.99");
-    t.ok(b"proc perm", line.is_some_and(|l| contains(l, b"0x6 ") && contains(l, b"02:00:00:00:00:99")), 0);
+    t.ok(
+        b"proc perm",
+        line.is_some_and(|l| contains(l, b"0x6 ") && contains(l, b"02:00:00:00:00:99")),
+        0,
+    );
     let del = |nl: &mut Nl| -> i64 {
         let mut r = Req::new(RTM_DELNEIGH, 0, &ndmsg(AF_INET, idx, 0));
         r.attr(NDA_DST, &ip);

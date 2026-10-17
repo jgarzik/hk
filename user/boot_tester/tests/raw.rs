@@ -4,8 +4,8 @@
 //! (duplicates tolerated, overlaps dropped).
 
 use hk_syscall::{
-    sys_exit, sys_fork, sys_getsockopt, sys_setresuid, sys_setsockopt, sys_socket, sys_wait4,
-    AF_INET, SOCK_RAW,
+    AF_INET, SOCK_RAW, sys_exit, sys_fork, sys_getsockopt, sys_setresuid, sys_setsockopt,
+    sys_socket, sys_wait4,
 };
 
 use super::icmp::recv_wait;
@@ -47,7 +47,9 @@ fn csum(d: &[u8]) -> u16 {
 /// An IPv4 header for `proto`, `len` bytes of payload, fragment field
 /// `fo`, id `id`, 127.0.0.1 -> 127.0.0.1 (kernel fills length/checksum)
 fn iphdr(out: &mut [u8], proto: u8, id: u16, fo: u16) {
-    out[..20].copy_from_slice(&[0x45, 0, 0, 0, 0, 0, 0, 0, 64, proto, 0, 0, 127, 0, 0, 1, 127, 0, 0, 1]);
+    out[..20].copy_from_slice(&[
+        0x45, 0, 0, 0, 0, 0, 0, 0, 64, proto, 0, 0, 127, 0, 0, 1, 127, 0, 0, 1,
+    ]);
     out[4..6].copy_from_slice(&id.to_be_bytes());
     out[6..8].copy_from_slice(&fo.to_be_bytes());
 }
@@ -64,17 +66,29 @@ fn test_create() {
     t.eq(b"hdrincl off", getint(fd, SOL_IP, IP_HDRINCL).1 as i64, 0);
     close(fd);
     let r = raw(IPPROTO_RAW);
-    t.eq(b"IPPROTO_RAW hdrincl", getint(r, SOL_IP, IP_HDRINCL).1 as i64, 1);
+    t.eq(
+        b"IPPROTO_RAW hdrincl",
+        getint(r, SOL_IP, IP_HDRINCL).1 as i64,
+        1,
+    );
     close(r);
     let u = udp();
-    t.eq(b"udp hdrincl", setint(u, SOL_IP, IP_HDRINCL, 1), ENOPROTOOPT);
+    t.eq(
+        b"udp hdrincl",
+        setint(u, SOL_IP, IP_HDRINCL, 1),
+        ENOPROTOOPT,
+    );
     close(u);
     let pid = sys_fork();
     if pid == 0 {
         if sys_setresuid(65534, 65534, 65534) != 0 {
             sys_exit(90);
         }
-        sys_exit(if raw(IPPROTO_ICMP) as i64 == EPERM { 0 } else { 1 });
+        sys_exit(if raw(IPPROTO_ICMP) as i64 == EPERM {
+            0
+        } else {
+            1
+        });
     }
     let mut st = 0;
     sys_wait4(pid, &mut st, 0, 0);
@@ -128,11 +142,23 @@ fn test_icmp_filter() {
     let mut t = T::new(b"RAW_ICMP_FILTER");
     let fd = raw(IPPROTO_ICMP);
     let mask: u32 = !1; // only echo replies (type 0)
-    let r = sys_setsockopt(fd, SOL_RAW, ICMP_FILTER, &mask as *const u32 as *const u8, 4);
+    let r = sys_setsockopt(
+        fd,
+        SOL_RAW,
+        ICMP_FILTER,
+        &mask as *const u32 as *const u8,
+        4,
+    );
     t.eq(b"set", r, 0);
     let mut got: u32 = 0;
     let mut len = 4u32;
-    let r = sys_getsockopt(fd, SOL_RAW, ICMP_FILTER, &mut got as *mut u32 as *mut u8, &mut len);
+    let r = sys_getsockopt(
+        fd,
+        SOL_RAW,
+        ICMP_FILTER,
+        &mut got as *mut u32 as *mut u8,
+        &mut len,
+    );
     t.ok(b"get", r == 0 && got == mask && len == 4, got as i64);
     t.eq(b"unknown", setint(fd, SOL_RAW, 2, 0), ENOPROTOOPT);
     let mut req = [0u8; 32];
@@ -163,7 +189,11 @@ fn test_hdrincl() {
     t.eq(b"send", send_to(fd, &pkt[..33], LO, 0, 0), 33);
     let mut buf = [0u8; 16];
     let (n, ip, sp) = recv_from(u, &mut buf, 0);
-    t.ok(b"udp got it", n == 5 && &buf[..5] == b"hello" && ip == LO && sp == 4321, n);
+    t.ok(
+        b"udp got it",
+        n == 5 && &buf[..5] == b"hello" && ip == LO && sp == 4321,
+        n,
+    );
     // IP options (four NOPs) are skipped on receive
     let mut opt = [0u8; 64];
     opt[..20].copy_from_slice(&pkt[..20]);

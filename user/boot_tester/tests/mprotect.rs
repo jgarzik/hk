@@ -43,12 +43,13 @@
 //!   MREMAP_DONTUNMAP alone moves the pages and leaves the old range
 //!   mapped and empty; a shrink may unmap a tail crossing VMAs
 
-use super::fault_signals::{fault_seen, install, reset, run_fault, After, MAGIC1, MAGIC2};
+use super::fault_signals::{After, MAGIC1, MAGIC2, fault_seen, install, reset, run_fault};
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_exit, sys_fork, sys_madvise, sys_open, sys_mincore, sys_mmap, sys_mprotect, sys_mremap, sys_munmap,
-    sys_pipe, sys_read, sys_wait4, sys_write, MAP_ANONYMOUS, MAP_PRIVATE, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, O_RDONLY, PROT_NONE, PROT_READ,
-    PROT_WRITE, SIGSEGV,
+    MAP_ANONYMOUS, MAP_PRIVATE, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, O_RDONLY,
+    PROT_NONE, PROT_READ, PROT_WRITE, SIGSEGV, sys_close, sys_exit, sys_fork, sys_madvise,
+    sys_mincore, sys_mmap, sys_mprotect, sys_mremap, sys_munmap, sys_open, sys_pipe, sys_read,
+    sys_wait4, sys_write,
 };
 
 const PAGE: u64 = 4096;
@@ -95,7 +96,10 @@ fn mremap_edges() {
     let dfix = MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP;
     let mut code = if sys_mremap(p, 2 * PAGE, 3 * PAGE, 0, 0) != ENOMEM {
         1
-    } else if !matches!(sys_mremap(p, 2 * PAGE, 1 << 62, MREMAP_MAYMOVE, 0), EINVAL | ENOMEM) {
+    } else if !matches!(
+        sys_mremap(p, 2 * PAGE, 1 << 62, MREMAP_MAYMOVE, 0),
+        EINVAL | ENOMEM
+    ) {
         // EINVAL in mainline (check_mremap_params), ENOMEM before
         3
     } else if sys_mremap(p, 2 * PAGE, 2 * PAGE, dfix, p + PAGE) != EINVAL {
@@ -119,7 +123,13 @@ fn mremap_edges() {
     }
     if code == 0 {
         // MREMAP_DONTUNMAP alone: the old range stays, empty
-        let q = sys_mremap(p + 2 * PAGE, 2 * PAGE, 2 * PAGE, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, 0);
+        let q = sys_mremap(
+            p + 2 * PAGE,
+            2 * PAGE,
+            2 * PAGE,
+            MREMAP_MAYMOVE | MREMAP_DONTUNMAP,
+            0,
+        );
         if q < 0 || q as u64 == p + 2 * PAGE {
             code = 8;
         } else if !moved_intact(q as u64, p + 2 * PAGE, 2 * PAGE) || get(p + 2 * PAGE) != 0 {
@@ -149,7 +159,10 @@ fn mremap_shrink_across() -> i64 {
         10
     } else if sys_mremap(p, 4 * PAGE, PAGE, 0, 0) != p as i64 {
         11
-    } else if !intact(p, PAGE, 0, 0) || maps_perm(p + PAGE).is_some() || maps_perm(p + 3 * PAGE).is_some() {
+    } else if !intact(p, PAGE, 0, 0)
+        || maps_perm(p + PAGE).is_some()
+        || maps_perm(p + 3 * PAGE).is_some()
+    {
         13
     } else {
         0
@@ -202,8 +215,16 @@ fn agrees(addr: u64, perm: &[u8; 4]) -> bool {
         return false;
     }
     let (r, w) = (addr + 16, addr + 24);
-    let read_ok = if perm[0] == b'r' { load(r) == Ok(0) } else { load(r) == Err((SEGV_ACCERR, r)) };
-    let write_ok = if perm[1] == b'w' { store(w).is_ok() } else { store(w) == Err((SEGV_ACCERR, w)) };
+    let read_ok = if perm[0] == b'r' {
+        load(r) == Ok(0)
+    } else {
+        load(r) == Err((SEGV_ACCERR, r))
+    };
+    let write_ok = if perm[1] == b'w' {
+        store(w).is_ok()
+    } else {
+        store(w) == Err((SEGV_ACCERR, w))
+    };
     read_ok && write_ok
 }
 
@@ -232,7 +253,10 @@ fn protnone_reuse() {
             for a in (q..q + 4 * LEN).step_by(PAGE as usize) {
                 put(a, !pattern(a));
             }
-            if !(q..q + 4 * LEN).step_by(PAGE as usize).all(|a| get(a) == !pattern(a)) {
+            if !(q..q + 4 * LEN)
+                .step_by(PAGE as usize)
+                .all(|a| get(a) == !pattern(a))
+            {
                 code = 4;
             }
             sys_munmap(q, 4 * LEN);
@@ -537,7 +561,9 @@ fn protnone_thp() {
         2
     } else if !denied(base) || !denied(base + HUGE / 2) || !denied(one + 0x80) {
         3
-    } else if load(base + HUGE) != Ok(pattern(base + HUGE)) || load(one + PAGE) != Ok(pattern(one + PAGE)) {
+    } else if load(base + HUGE) != Ok(pattern(base + HUGE))
+        || load(one + PAGE) != Ok(pattern(one + PAGE))
+    {
         4
     } else if sys_mprotect(base, 2 * HUGE, RW) != 0 {
         5

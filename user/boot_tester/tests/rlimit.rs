@@ -2,13 +2,12 @@
 //!
 //! Tests for getrlimit, setrlimit, and prlimit64 syscalls.
 
-use super::helpers::{print, println, print_num};
-use hk_syscall::{
-    sys_getrlimit, sys_setrlimit, sys_prlimit64,
-    RLimit, RLIMIT_NOFILE, RLIMIT_MEMLOCK, RLIMIT_STACK,
-    RLIM_NLIMITS, RLIM_INFINITY,
-};
+use super::helpers::{print, print_num, println};
 use core::ptr;
+use hk_syscall::{
+    RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_MEMLOCK, RLIMIT_NOFILE, RLIMIT_STACK, RLimit,
+    sys_getrlimit, sys_prlimit64, sys_setrlimit,
+};
 
 /// Run all rlimit tests
 pub fn run_tests() {
@@ -28,7 +27,10 @@ pub fn run_tests() {
 
 /// Test: Basic getrlimit for RLIMIT_NOFILE
 fn test_getrlimit_basic() {
-    let mut rlim = RLimit { rlim_cur: 0, rlim_max: 0 };
+    let mut rlim = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     let ret = sys_getrlimit(RLIMIT_NOFILE, &mut rlim);
 
     if ret != 0 {
@@ -50,7 +52,10 @@ fn test_getrlimit_basic() {
 
 /// Test: getrlimit for all 16 resources should succeed
 fn test_getrlimit_all_resources() {
-    let mut rlim = RLimit { rlim_cur: 0, rlim_max: 0 };
+    let mut rlim = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
 
     for resource in 0..RLIM_NLIMITS {
         let ret = sys_getrlimit(resource, &mut rlim);
@@ -69,12 +74,16 @@ fn test_getrlimit_all_resources() {
 
 /// Test: getrlimit with invalid resource returns EINVAL
 fn test_getrlimit_einval() {
-    let mut rlim = RLimit { rlim_cur: 0, rlim_max: 0 };
+    let mut rlim = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
 
     // Resource 100 is way out of range
     let ret = sys_getrlimit(100, &mut rlim);
 
-    if ret == -22 { // EINVAL
+    if ret == -22 {
+        // EINVAL
         println(b"GETRLIMIT_EINVAL:OK");
     } else {
         print(b"GETRLIMIT_EINVAL:FAIL expected -22, got ");
@@ -85,7 +94,10 @@ fn test_getrlimit_einval() {
 
 /// Test: setrlimit can lower the soft limit
 fn test_setrlimit_lower_soft() {
-    let mut rlim = RLimit { rlim_cur: 0, rlim_max: 0 };
+    let mut rlim = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
 
     // Get current limits
     let ret = sys_getrlimit(RLIMIT_NOFILE, &mut rlim);
@@ -103,7 +115,10 @@ fn test_setrlimit_lower_soft() {
         rlim.rlim_cur
     };
 
-    let new_rlim = RLimit { rlim_cur: new_soft, rlim_max: rlim.rlim_max };
+    let new_rlim = RLimit {
+        rlim_cur: new_soft,
+        rlim_max: rlim.rlim_max,
+    };
     let ret = sys_setrlimit(RLIMIT_NOFILE, &new_rlim);
 
     if ret != 0 {
@@ -114,7 +129,10 @@ fn test_setrlimit_lower_soft() {
     }
 
     // Verify it took effect
-    let mut verify = RLimit { rlim_cur: 0, rlim_max: 0 };
+    let mut verify = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     sys_getrlimit(RLIMIT_NOFILE, &mut verify);
 
     if verify.rlim_cur == new_soft {
@@ -130,7 +148,10 @@ fn test_setrlimit_lower_soft() {
 
 /// Test: setrlimit can raise soft limit to hard limit
 fn test_setrlimit_raise_to_hard() {
-    let mut rlim = RLimit { rlim_cur: 0, rlim_max: 0 };
+    let mut rlim = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
 
     // Get current limits
     let ret = sys_getrlimit(RLIMIT_NOFILE, &mut rlim);
@@ -144,7 +165,10 @@ fn test_setrlimit_raise_to_hard() {
     let original_soft = rlim.rlim_cur;
 
     // Try to raise soft to hard (should always succeed)
-    let new_rlim = RLimit { rlim_cur: rlim.rlim_max, rlim_max: rlim.rlim_max };
+    let new_rlim = RLimit {
+        rlim_cur: rlim.rlim_max,
+        rlim_max: rlim.rlim_max,
+    };
     let ret = sys_setrlimit(RLIMIT_NOFILE, &new_rlim);
 
     if ret != 0 {
@@ -155,7 +179,10 @@ fn test_setrlimit_raise_to_hard() {
     }
 
     // Restore original
-    let restore = RLimit { rlim_cur: original_soft, rlim_max: rlim.rlim_max };
+    let restore = RLimit {
+        rlim_cur: original_soft,
+        rlim_max: rlim.rlim_max,
+    };
     sys_setrlimit(RLIMIT_NOFILE, &restore);
 
     println(b"SETRLIMIT_RAISE:OK");
@@ -163,10 +190,14 @@ fn test_setrlimit_raise_to_hard() {
 
 /// Test: setrlimit with cur > max returns EINVAL
 fn test_setrlimit_einval_cur_gt_max() {
-    let new_rlim = RLimit { rlim_cur: 2000, rlim_max: 1000 };
+    let new_rlim = RLimit {
+        rlim_cur: 2000,
+        rlim_max: 1000,
+    };
     let ret = sys_setrlimit(RLIMIT_NOFILE, &new_rlim);
 
-    if ret == -22 { // EINVAL
+    if ret == -22 {
+        // EINVAL
         println(b"SETRLIMIT_EINVAL:OK");
     } else {
         print(b"SETRLIMIT_EINVAL:FAIL expected -22, got ");
@@ -177,7 +208,10 @@ fn test_setrlimit_einval_cur_gt_max() {
 
 /// Test: prlimit64 with only old_rlim (get only)
 fn test_prlimit64_get_only() {
-    let mut old_rlim = RLimit { rlim_cur: 0, rlim_max: 0 };
+    let mut old_rlim = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
 
     // pid=0 means current process, new_rlim=NULL means get only
     let ret = sys_prlimit64(0, RLIMIT_STACK, ptr::null(), &mut old_rlim);
@@ -202,12 +236,22 @@ fn test_prlimit64_get_only() {
 /// Test: prlimit64 with only new_rlim (set only)
 fn test_prlimit64_set_only() {
     // First get current limits
-    let mut old_rlim = RLimit { rlim_cur: 0, rlim_max: 0 };
+    let mut old_rlim = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     sys_prlimit64(0, RLIMIT_MEMLOCK, ptr::null(), &mut old_rlim);
 
     // Set new limits (lower soft by 1 if possible)
-    let new_soft = if old_rlim.rlim_cur > 0 { old_rlim.rlim_cur - 1 } else { old_rlim.rlim_cur };
-    let new_rlim = RLimit { rlim_cur: new_soft, rlim_max: old_rlim.rlim_max };
+    let new_soft = if old_rlim.rlim_cur > 0 {
+        old_rlim.rlim_cur - 1
+    } else {
+        old_rlim.rlim_cur
+    };
+    let new_rlim = RLimit {
+        rlim_cur: new_soft,
+        rlim_max: old_rlim.rlim_max,
+    };
 
     // Set only (old_rlim = NULL)
     let ret = sys_prlimit64(0, RLIMIT_MEMLOCK, &new_rlim, ptr::null_mut());
@@ -222,7 +266,10 @@ fn test_prlimit64_set_only() {
     }
 
     // Verify
-    let mut verify = RLimit { rlim_cur: 0, rlim_max: 0 };
+    let mut verify = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     sys_prlimit64(0, RLIMIT_MEMLOCK, ptr::null(), &mut verify);
 
     if verify.rlim_cur == new_soft {
@@ -239,13 +286,26 @@ fn test_prlimit64_set_only() {
 /// Test: prlimit64 with both new and old (get and set atomically)
 fn test_prlimit64_get_and_set() {
     // First get current limits
-    let mut orig_rlim = RLimit { rlim_cur: 0, rlim_max: 0 };
+    let mut orig_rlim = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     sys_prlimit64(0, RLIMIT_NOFILE, ptr::null(), &mut orig_rlim);
 
     // Set new and get old atomically
-    let new_soft = if orig_rlim.rlim_cur > 1 { orig_rlim.rlim_cur - 1 } else { orig_rlim.rlim_cur };
-    let new_rlim = RLimit { rlim_cur: new_soft, rlim_max: orig_rlim.rlim_max };
-    let mut old_rlim = RLimit { rlim_cur: 0, rlim_max: 0 };
+    let new_soft = if orig_rlim.rlim_cur > 1 {
+        orig_rlim.rlim_cur - 1
+    } else {
+        orig_rlim.rlim_cur
+    };
+    let new_rlim = RLimit {
+        rlim_cur: new_soft,
+        rlim_max: orig_rlim.rlim_max,
+    };
+    let mut old_rlim = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
 
     let ret = sys_prlimit64(0, RLIMIT_NOFILE, &new_rlim, &mut old_rlim);
 
@@ -272,8 +332,14 @@ fn test_prlimit64_get_and_set() {
 
 /// Test: prlimit64 with pid=0 targets current process
 fn test_prlimit64_self_pid_zero() {
-    let mut rlim0 = RLimit { rlim_cur: 0, rlim_max: 0 };
-    let mut rlim1 = RLimit { rlim_cur: 0, rlim_max: 0 };
+    let mut rlim0 = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let mut rlim1 = RLimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
 
     // Get with pid=0
     let ret0 = sys_prlimit64(0, RLIMIT_NOFILE, ptr::null(), &mut rlim0);

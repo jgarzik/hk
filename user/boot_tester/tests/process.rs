@@ -6,24 +6,23 @@
 //! - clone, fork, vfork
 //! - waitid, execve
 
-use super::helpers::{print, println, print_num};
-use hk_syscall::{
-    sys_brk, sys_prctl, sys_clock_getres, sys_clock_nanosleep, sys_clone, sys_execve, sys_exit, sys_fork,
-    sys_getcpu, sys_getegid, sys_geteuid, sys_getgid, sys_getpgid, sys_getpid, sys_getppid,
-    sys_getpriority, sys_getresgid, sys_getresuid, sys_getrusage, sys_getsid, sys_gettid,
-    sys_getuid, sys_ioprio_get, sys_ioprio_set, sys_nanosleep, sys_sched_getaffinity,
-    sys_sched_getparam, sys_sched_getscheduler, sys_sched_rr_get_interval, sys_sched_setaffinity,
-    sys_set_tid_address, sys_setfsgid, sys_setfsuid,
-    sys_setgid, sys_setpriority, sys_setregid, sys_setresgid, sys_setresuid, sys_setreuid,
-    sys_setsid, sys_setuid, sys_sysinfo, sys_vfork, sys_wait4, sys_waitid, ioprio_prio_value,
-    SchedParam, SigInfo, Timespec, CLOCK_MONOTONIC, CLOCK_REALTIME, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, CLONE_VM,
-    IOPRIO_CLASS_BE,
-    IOPRIO_WHO_PROCESS, P_ALL, P_PID, PRIO_PROCESS, SCHED_NORMAL, WEXITED,
-};
+use super::helpers::{print, print_num, println};
 #[cfg(target_arch = "x86_64")]
 use hk_syscall::sys_time;
 #[cfg(target_arch = "x86_64")]
-use hk_syscall::{sys_arch_prctl, ARCH_SET_FS, ARCH_GET_FS};
+use hk_syscall::{ARCH_GET_FS, ARCH_SET_FS, sys_arch_prctl};
+use hk_syscall::{
+    CLOCK_MONOTONIC, CLOCK_REALTIME, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, CLONE_VM,
+    IOPRIO_CLASS_BE, IOPRIO_WHO_PROCESS, P_ALL, P_PID, PRIO_PROCESS, SCHED_NORMAL, SchedParam,
+    SigInfo, Timespec, WEXITED, ioprio_prio_value, sys_brk, sys_clock_getres, sys_clock_nanosleep,
+    sys_clone, sys_execve, sys_exit, sys_fork, sys_getcpu, sys_getegid, sys_geteuid, sys_getgid,
+    sys_getpgid, sys_getpid, sys_getppid, sys_getpriority, sys_getresgid, sys_getresuid,
+    sys_getrusage, sys_getsid, sys_gettid, sys_getuid, sys_ioprio_get, sys_ioprio_set,
+    sys_nanosleep, sys_prctl, sys_sched_getaffinity, sys_sched_getparam, sys_sched_getscheduler,
+    sys_sched_rr_get_interval, sys_sched_setaffinity, sys_set_tid_address, sys_setfsgid,
+    sys_setfsuid, sys_setgid, sys_setpriority, sys_setregid, sys_setresgid, sys_setresuid,
+    sys_setreuid, sys_setsid, sys_setuid, sys_sysinfo, sys_vfork, sys_wait4, sys_waitid,
+};
 
 /// Run all process tests
 pub fn run_tests() {
@@ -362,7 +361,6 @@ fn test_clone_settid() {
 
 /// Test 16: fork() - process creation with separate address space
 fn test_fork() {
-
     let fork_ret = sys_fork();
     if fork_ret < 0 {
         print(b"fork() failed: ");
@@ -401,7 +399,6 @@ fn test_fork() {
 
 /// Test 17: fork() memory isolation
 fn test_fork_memory_isolation() {
-
     static mut FORK_TEST_VAR: i32 = 100;
     let fork_test_var_ptr = core::ptr::addr_of_mut!(FORK_TEST_VAR);
 
@@ -437,7 +434,6 @@ fn test_fork_memory_isolation() {
 
 /// Test 18: vfork() - process creation with shared address space until exec/exit
 fn test_vfork() {
-
     let vfork_ret = sys_vfork();
     if vfork_ret < 0 {
         print(b"vfork() failed: ");
@@ -469,7 +465,6 @@ fn test_vfork() {
 
 /// Test 19: waitid() - alternative wait interface
 fn test_waitid() {
-
     let fork_ret3 = sys_fork();
     if fork_ret3 < 0 {
         print(b"fork() failed: ");
@@ -539,7 +534,6 @@ fn test_waitid() {
 
 /// Test 20: waitid with P_ALL - wait for any child
 fn test_waitid_pall() {
-
     let fork_ret4 = sys_fork();
     if fork_ret4 < 0 {
         print(b"fork() failed: ");
@@ -596,19 +590,26 @@ fn test_waitid_wnowait() {
     let mut st = 0i32;
     let reaped = sys_wait4(pid, &mut st, 0, 0);
     let ok = pid > 0 && peek == 0 && seen == (pid as i32, 21) && reaped == pid && st == 21 << 8;
-    println(if ok { b"WAITID_WNOWAIT:OK" } else { b"WAITID_WNOWAIT:FAIL" });
+    println(if ok {
+        b"WAITID_WNOWAIT:OK"
+    } else {
+        b"WAITID_WNOWAIT:FAIL"
+    });
 }
 
 /// wait4 takes no waitid-only flags: WNOWAIT is EINVAL
 fn test_wait4_wnowait_einval() {
     const WNOWAIT: i32 = 0x0100_0000;
     let r = sys_wait4(-1, core::ptr::null_mut(), WNOWAIT, 0);
-    println(if r == -22 { b"WAIT4_WNOWAIT_EINVAL:OK" } else { b"WAIT4_WNOWAIT_EINVAL:FAIL" });
+    println(if r == -22 {
+        b"WAIT4_WNOWAIT_EINVAL:OK"
+    } else {
+        b"WAIT4_WNOWAIT_EINVAL:FAIL"
+    });
 }
 
 /// Test 21: execve() - execute a new program
 fn test_execve() {
-
     let fork_ret5 = sys_fork();
     if fork_ret5 < 0 {
         print(b"fork() failed: ");
@@ -707,7 +708,10 @@ fn test_getegid() {
 
 /// Test 26: clock_getres syscall
 fn test_clock_getres() {
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
 
     // Test CLOCK_REALTIME
     let ret = sys_clock_getres(CLOCK_REALTIME, &mut ts);
@@ -1329,8 +1333,7 @@ fn test_sysinfo() {
 
     // Test 1: Read uptime
     let uptime = i64::from_ne_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3],
-        buffer[4], buffer[5], buffer[6], buffer[7],
+        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
     ]);
     if uptime < 0 {
         println(b"SYSINFO:FAIL uptime");
@@ -1379,8 +1382,7 @@ fn test_getrusage() {
 
     // Verify ru_utime.tv_sec (i64 at offset 0) is >= 0
     let utime_sec = i64::from_ne_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3],
-        buffer[4], buffer[5], buffer[6], buffer[7],
+        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
     ]);
     if utime_sec < 0 {
         println(b"GETRUSAGE:FAIL utime");
@@ -1433,20 +1435,19 @@ fn test_getrusage_times() {
 
     // Extract utime.tv_sec, utime.tv_usec, stime.tv_sec, stime.tv_usec
     let utime_sec = i64::from_ne_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3],
-        buffer[4], buffer[5], buffer[6], buffer[7],
+        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
     ]);
     let utime_usec = i64::from_ne_bytes([
-        buffer[8], buffer[9], buffer[10], buffer[11],
-        buffer[12], buffer[13], buffer[14], buffer[15],
+        buffer[8], buffer[9], buffer[10], buffer[11], buffer[12], buffer[13], buffer[14],
+        buffer[15],
     ]);
     let stime_sec = i64::from_ne_bytes([
-        buffer[16], buffer[17], buffer[18], buffer[19],
-        buffer[20], buffer[21], buffer[22], buffer[23],
+        buffer[16], buffer[17], buffer[18], buffer[19], buffer[20], buffer[21], buffer[22],
+        buffer[23],
     ]);
     let stime_usec = i64::from_ne_bytes([
-        buffer[24], buffer[25], buffer[26], buffer[27],
-        buffer[28], buffer[29], buffer[30], buffer[31],
+        buffer[24], buffer[25], buffer[26], buffer[27], buffer[28], buffer[29], buffer[30],
+        buffer[31],
     ]);
 
     // Calculate total time in microseconds
@@ -1584,7 +1585,10 @@ fn test_sched_setaffinity() {
 /// Test 50: sched_rr_get_interval syscall - get round-robin time quantum
 #[inline(never)]
 fn test_sched_rr_get_interval() {
-    let mut ts = Timespec { tv_sec: -1, tv_nsec: -1 };
+    let mut ts = Timespec {
+        tv_sec: -1,
+        tv_nsec: -1,
+    };
 
     // Get interval for current process (should return 0 for SCHED_NORMAL)
     let ret = sys_sched_rr_get_interval(0, &mut ts);

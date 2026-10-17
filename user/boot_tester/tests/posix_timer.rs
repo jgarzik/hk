@@ -12,8 +12,8 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_timer_create, sys_timer_delete, sys_timer_getoverrun, sys_timer_gettime,
-    sys_timer_settime, ITimerSpec, Timespec, CLOCK_MONOTONIC, CLOCK_REALTIME,
+    CLOCK_MONOTONIC, CLOCK_REALTIME, ITimerSpec, Timespec, sys_timer_create, sys_timer_delete,
+    sys_timer_getoverrun, sys_timer_gettime, sys_timer_settime,
 };
 
 /// Run all POSIX timer tests
@@ -95,8 +95,14 @@ fn test_timer_settime_and_gettime() {
 
     // Set a 1-second one-shot timer
     let new_value = ITimerSpec {
-        it_value: Timespec { tv_sec: 1, tv_nsec: 0 },
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: Timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
     };
     let mut old_value = ITimerSpec::default();
 
@@ -141,8 +147,14 @@ fn test_timer_disarm() {
 
     // First arm the timer
     let arm_value = ITimerSpec {
-        it_value: Timespec { tv_sec: 10, tv_nsec: 0 },
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: Timespec {
+            tv_sec: 10,
+            tv_nsec: 0,
+        },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
     };
     let arm_ret = sys_timer_settime(timerid, 0, &arm_value, core::ptr::null_mut());
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
@@ -156,8 +168,14 @@ fn test_timer_disarm() {
 
     // Now disarm it
     let disarm_value = ITimerSpec {
-        it_value: Timespec { tv_sec: 0, tv_nsec: 0 },
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
     };
     let mut old_value = ITimerSpec::default();
     let ret = sys_timer_settime(timerid, 0, &disarm_value, &mut old_value);
@@ -204,8 +222,14 @@ fn test_timer_delete() {
 
     // Set a timer
     let new_value = ITimerSpec {
-        it_value: Timespec { tv_sec: 10, tv_nsec: 0 },
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: Timespec {
+            tv_sec: 10,
+            tv_nsec: 0,
+        },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
     };
     sys_timer_settime(timerid, 0, &new_value, core::ptr::null_mut());
 
@@ -300,15 +324,27 @@ fn test_timer_settime_old_value() {
 
     // First arm the timer for 5 seconds
     let first_value = ITimerSpec {
-        it_value: Timespec { tv_sec: 5, tv_nsec: 0 },
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: Timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
     };
     sys_timer_settime(timerid, 0, &first_value, core::ptr::null_mut());
 
     // Re-arm for 10 seconds and capture old value
     let second_value = ITimerSpec {
-        it_value: Timespec { tv_sec: 10, tv_nsec: 0 },
-        it_interval: Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: Timespec {
+            tv_sec: 10,
+            tv_nsec: 0,
+        },
+        it_interval: Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
     };
     let mut old_value = ITimerSpec::default();
     let ret = sys_timer_settime(timerid, 0, &second_value, &mut old_value);
