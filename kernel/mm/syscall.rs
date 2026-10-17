@@ -375,6 +375,8 @@ pub(crate) fn munmap_locked(mm: &mut super::MmStruct, pgd: u64, start: u64, end:
     for vma in &removed {
         super::memory::zap_range(pgd, vma.start.max(start), vma.end.min(end));
     }
+    #[cfg(feature = "mmcheck")]
+    super::check::verify(mm, pgd, "munmap");
     removed
 }
 
@@ -1065,6 +1067,8 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     // range is flushed before the lock is dropped, also on an error.
     let r = mprotect_vmas(&mut mm_guard, pgd, start, end, prot);
     crate::arch::paging::flush_tlb_range(start, end);
+    #[cfg(feature = "mmcheck")]
+    super::check::verify(&mm_guard, pgd, "mprotect");
     drop(mm_guard);
     match r {
         Ok(()) => 0,
@@ -1550,6 +1554,8 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         );
         old_len = new_len_aligned;
         if !moves {
+            #[cfg(feature = "mmcheck")]
+            super::check::verify(&mm_guard, pgd, "mremap shrink");
             drop(mm_guard);
             drop(gone);
             return old_addr as i64;
@@ -1584,6 +1590,8 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
             && let Some(new_end) = new_end.filter(|&e| e <= super::TASK_SIZE)
             && mm_guard.try_expand_vma(vma_idx, new_end)
         {
+            #[cfg(feature = "mmcheck")]
+            super::check::verify(&mm_guard, pgd, "mremap expand");
             return old_addr as i64;
         }
         if !may_move {
@@ -1614,6 +1622,8 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     if let Err(e) = move_mapping(&mut mm_guard, pgd, from, to, dontunmap, &mut gone) {
         return e.sysret();
     }
+    #[cfg(feature = "mmcheck")]
+    super::check::verify(&mm_guard, pgd, "mremap move");
     drop(mm_guard);
     drop(gone);
     target as i64

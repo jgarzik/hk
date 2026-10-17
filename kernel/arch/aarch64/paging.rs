@@ -348,6 +348,31 @@ pub fn free_user(l0_phys: u64, put: &mut dyn FnMut(Leaf)) {
     }
 }
 
+/// Each user leaf under the TTBR0 root `l0_phys` that maps a page, in
+/// address order: `f(va, entry, huge)` for a 4KB entry (protnone
+/// included) or a 2MB block (debug check, `mm::check`; mm lock held)
+#[cfg(feature = "mmcheck")]
+pub fn walk_user(l0_phys: u64, f: &mut dyn FnMut(u64, u64, bool)) {
+    walk_level(l0_phys, 0, 0, f);
+}
+
+/// Walk the table at `phys` (`level` 0 = L0 .. 3 = L3) mapping from `base`
+#[cfg(feature = "mmcheck")]
+fn walk_level(phys: u64, level: u32, base: u64, f: &mut dyn FnMut(u64, u64, bool)) {
+    let table = phys_to_virt_table_const(phys);
+    for i in 0..ENTRIES_PER_TABLE {
+        // SAFETY: a live table of the locked mm
+        let e = unsafe { *(*table).entry(i) };
+        let va = base + ((i as u64) << (39 - 9 * level));
+        match level {
+            3 if pte_present(e.0) => f(va, e.0, false),
+            2 if e.is_block() => f(va, e.0, true),
+            0..=2 if e.is_table() => walk_level(e.addr(), level + 1, va, f),
+            _ => {}
+        }
+    }
+}
+
 /// Release the table at `phys` (`level` 1, 2 or 3) and everything below
 fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
     let table = phys_to_virt_table_const(phys);

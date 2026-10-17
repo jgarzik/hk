@@ -203,5 +203,11 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   the entries (pages, protnone, swap) moved into it with their frame
   references, and the old range's TLB flushed. Shrinking unmaps the
   tail like munmap.
+- **Debug check (feature `mmcheck`, in `make check LOCKDEP=1`).** After
+  each mprotect, munmap (and what is built on it) and mremap, still
+  under the mm lock, `mm::check::verify` walks the user page tables:
+  the VMAs must be sorted and disjoint, and every entry mapping a page
+  (protnone included) must lie in a VMA allowing at least what the
+  entry allows; a violation prints `MMCHECK:FAIL`.
 - `/proc/meminfo` reports MemTotal and MemFree from the frame allocator
   (exact free count).

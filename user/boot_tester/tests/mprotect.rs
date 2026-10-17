@@ -27,6 +27,9 @@
 //!   intact once read-write again
 //! - PROTNONE_MREMAP: a PROT_NONE range moved by mremap faults at its
 //!   new address and keeps its data
+//! - PROTNONE_REUSE: after munmap of a written PROT_NONE range its
+//!   address faults (SEGV_MAPERR) and fresh memory filled afterwards
+//!   (possibly its old frames) keeps its own data
 //! - MAPS_MATCH_MPROTECT: after PROT_NONE and PROT_READ on two pages
 //!   inside a read-write mapping, /proc/self/maps shows ---p, r--p and
 //!   rw-p where loads and stores fault or work accordingly
@@ -75,6 +78,7 @@ pub fn run_tests() {
     protnone_writeonly();
     protnone_thp();
     protnone_mremap();
+    protnone_reuse();
     maps_match_mprotect();
     maps_match_mremap();
     mremap_edges();
@@ -201,6 +205,40 @@ fn agrees(addr: u64, perm: &[u8; 4]) -> bool {
     let read_ok = if perm[0] == b'r' { load(r) == Ok(0) } else { load(r) == Err((SEGV_ACCERR, r)) };
     let write_ok = if perm[1] == b'w' { store(w).is_ok() } else { store(w) == Err((SEGV_ACCERR, w)) };
     read_ok && write_ok
+}
+
+fn protnone_reuse() {
+    const NAME: &[u8] = b"PROTNONE_REUSE";
+    const LEN: u64 = 64 * PAGE;
+    let p = sys_mmap(0, LEN, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p < 0 {
+        return report(NAME, -1);
+    }
+    let p = p as u64;
+    fill(p, LEN);
+    let mut code = if sys_mprotect(p, LEN, PROT_NONE) != 0 || sys_munmap(p, LEN) != 0 {
+        1
+    } else if load(p + 5 * PAGE) != Err((1, p + 5 * PAGE)) {
+        2
+    } else {
+        0
+    };
+    if code == 0 {
+        let q = sys_mmap(0, 4 * LEN, RW, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if q < 0 {
+            code = 3;
+        } else {
+            let q = q as u64;
+            for a in (q..q + 4 * LEN).step_by(PAGE as usize) {
+                put(a, !pattern(a));
+            }
+            if !(q..q + 4 * LEN).step_by(PAGE as usize).all(|a| get(a) == !pattern(a)) {
+                code = 4;
+            }
+            sys_munmap(q, 4 * LEN);
+        }
+    }
+    report(NAME, code);
 }
 
 fn maps_match_mprotect() {

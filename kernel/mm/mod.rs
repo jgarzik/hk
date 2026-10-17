@@ -14,6 +14,8 @@ use crate::sync::spin::Mutex;
 use crate::task::Tid;
 
 pub mod anon_vma;
+#[cfg(feature = "mmcheck")]
+pub mod check;
 pub mod fault;
 pub mod huge_page;
 pub mod lru;

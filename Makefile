@@ -13,7 +13,8 @@ VFAT_IMAGE = target/vfat.img
 VFAT_SIZE_KB = 1024
 
 # LOCKDEP=1: build with lockdep-lite (spin-lock tracking, lock order and
-# sleep-in-atomic reports as LOCKDEP:FAIL), e.g. make check LOCKDEP=1
+# sleep-in-atomic reports as LOCKDEP:FAIL) and the VMA/PTE agreement
+# check (MMCHECK:FAIL), e.g. make check LOCKDEP=1
 KERNEL_FEATURES = $(if $(LOCKDEP),--features lockdep)
 
 # Machine-specific ISO configuration
