@@ -157,9 +157,40 @@ pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
     Some(unsafe { table.add(((va >> 12) & 511) as usize) })
 }
 
-/// A leaf entry maps a page
+/// A leaf entry maps a page: valid, or protnone (Linux pte_present)
 pub fn pte_present(pte: u64) -> bool {
-    pte & 1 != 0
+    pte & 1 != 0 || pte_protnone(pte)
+}
+
+/// Software bit of a PROT_NONE entry (Linux PTE_PROT_NONE): invalid to
+/// the MMU, so every access faults, but it keeps its frame (and the
+/// frame reference) for a later mprotect to restore
+pub const PTE_PROTNONE: u64 = 1 << 58;
+
+/// A protnone leaf entry (never a swap entry: those carry the marker)
+pub fn pte_protnone(pte: u64) -> bool {
+    pte & (1 | PTE_PROTNONE | crate::mm::SwapEntry::SWAP_MARKER) == PTE_PROTNONE
+}
+
+/// `pte` with the protection `prot` (PROT_*; Linux pte_modify): none
+/// at all makes it protnone (invalid); it is writable only if `prot`
+/// asks for it and it is not a copy-on-write share. Frame and memory
+/// attributes are kept: only permissions change, which needs no
+/// break-before-make.
+pub fn pte_modify(pte: u64, prot: u32) -> u64 {
+    use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE};
+    let keep = pte & !(1 | AP_RDONLY | PXN | UXN | PTE_PROTNONE);
+    if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
+        return keep | PTE_PROTNONE | AP_RDONLY | PXN | UXN;
+    }
+    let mut e = keep | 1;
+    if prot & PROT_WRITE == 0 || pte & PAGE_COW != 0 {
+        e |= AP_RDONLY;
+    }
+    if prot & PROT_EXEC == 0 {
+        e |= PXN | UXN;
+    }
+    e
 }
 
 // ============================================================================
@@ -324,7 +355,7 @@ fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
         // SAFETY: a detached table frame owned by the caller
         let e = unsafe { *(*table).entry(i) };
         match level {
-            3 if e.0 & 0b11 == DESC_PAGE => put(Leaf::Page(e.addr())),
+            3 if pte_present(e.0) => put(Leaf::Page(e.addr())),
             3 if e.0 != 0 => put(Leaf::Swap(e.0)),
             // 1GB user blocks are never created
             1 if e.is_table() => free_level(e.addr(), 2, put),
@@ -406,12 +437,6 @@ impl PageTableEntry {
     #[inline]
     pub fn set_block(&mut self, phys_addr: u64, attrs: u64) {
         self.0 = (phys_addr & ADDR_MASK) | attrs | DESC_BLOCK;
-    }
-
-    /// Get the attributes/flags from the entry
-    #[inline]
-    pub fn attrs(&self) -> u64 {
-        self.0 & !ADDR_MASK
     }
 
     /// Clear the entry
@@ -779,109 +804,6 @@ impl Aarch64PageTable {
             flush_tlb(va);
 
             Some(phys)
-        }
-    }
-
-    /// Update the protection flags on an already-mapped page
-    ///
-    /// This modifies the page table entry for the given virtual address
-    /// to have new protection flags, without changing the physical mapping.
-    ///
-    /// # Arguments
-    /// * `l0_phys` - Physical address of the L0 table
-    /// * `va` - Virtual address of the page to modify
-    /// * `writable` - Whether the page should be writable
-    /// * `executable` - Whether the page should be executable
-    ///
-    /// # Returns
-    /// `true` if the page was found and updated, `false` if not mapped
-    pub fn update_page_protection(l0_phys: u64, va: u64, writable: bool, executable: bool) -> bool {
-        let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
-
-        unsafe {
-            let l0 = phys_to_virt_table(l0_phys);
-
-            let l0_entry = (*l0).entry(l0_idx);
-            if !l0_entry.is_valid() || !l0_entry.is_table() {
-                return false;
-            }
-            let l1 = phys_to_virt_table(l0_entry.addr());
-
-            let l1_entry = (*l1).entry(l1_idx);
-            if !l1_entry.is_valid() {
-                return false;
-            }
-            // 1GB block pages not supported for protection update
-            if l1_entry.is_block() {
-                return false;
-            }
-            let l2 = phys_to_virt_table(l1_entry.addr());
-
-            let l2_entry = (*l2).entry(l2_idx);
-            if !l2_entry.is_valid() {
-                return false;
-            }
-            // 2MB block pages not supported for protection update
-            if l2_entry.is_block() {
-                return false;
-            }
-            let l3 = phys_to_virt_table(l2_entry.addr());
-
-            let l3_entry = (*l3).entry_mut(l3_idx);
-            if !l3_entry.is_valid() {
-                return false;
-            }
-
-            // Get current entry, preserve address
-            let phys = l3_entry.addr();
-
-            // Build new attributes, preserving AF, SH, ATTR_IDX
-            let mut attrs = l3_entry.0 & (AF | SH_INNER | 0b11100); // Preserve AF, SH, ATTR_IDX
-
-            // Set access permissions
-            // For user pages: AP_EL0_RW (writable) or AP_EL0_RO (read-only)
-            // We detect if this is a user page by checking if AP[1] was set (EL0 access)
-            let was_user = (l3_entry.0 & AP_EL0_RW) != 0 || (l3_entry.0 & AP_EL0_RO) != 0;
-
-            // A copy-on-write share stays read-only until its write
-            // fault (Linux can_change_pte_writable)
-            let cow = l3_entry.0 & PAGE_COW;
-            attrs |= cow;
-
-            if was_user {
-                if writable && cow == 0 {
-                    attrs |= AP_EL0_RW;
-                } else {
-                    attrs |= AP_EL0_RO;
-                }
-            } else {
-                // Kernel page
-                if writable {
-                    attrs |= AP_EL1_RW;
-                } else {
-                    attrs |= AP_EL1_RO;
-                }
-            }
-
-            // Set execute permissions
-            if !executable {
-                attrs |= PXN | UXN;
-            }
-
-            // Write back the updated entry
-            l3_entry.set_page(phys, attrs);
-
-            // Clean data cache and flush TLB
-            let entry_addr = l3_entry as *mut PageTableEntry as u64;
-            asm!(
-                "dc cvau, {}",
-                "dsb ish",
-                in(reg) entry_addr,
-                options(nostack)
-            );
-            flush_tlb(va);
-
-            true
         }
     }
 
@@ -1400,41 +1322,5 @@ impl Aarch64PageTable {
         unsafe { asm!("dsb ishst", "isb", options(nostack)) };
         crate::FRAME_ALLOCATOR.split_huge(base);
         Ok(base)
-    }
-
-    /// Check if a virtual address is mapped as a 2MB huge page
-    ///
-    /// # Arguments
-    /// * `l0_phys` - Physical address of the L0 (root) table
-    /// * `va` - Virtual address to check
-    ///
-    /// # Returns
-    /// Some((phys_addr, attrs)) if mapped as huge page, None otherwise
-    /// The phys_addr is the 2MB-aligned base address of the huge page
-    pub fn is_huge_page_mapped(l0_phys: u64, va: u64) -> Option<(u64, u64)> {
-        let (l0_idx, l1_idx, l2_idx, _l3_idx) = page_indices(va);
-
-        unsafe {
-            let l0 = phys_to_virt_table_const(l0_phys);
-
-            let l0_entry = (*l0).entry(l0_idx);
-            if !l0_entry.is_valid() || !l0_entry.is_table() {
-                return None;
-            }
-            let l1 = phys_to_virt_table_const(l0_entry.addr());
-
-            let l1_entry = (*l1).entry(l1_idx);
-            if !l1_entry.is_valid() || l1_entry.is_block() {
-                return None;
-            }
-            let l2 = phys_to_virt_table_const(l1_entry.addr());
-
-            let l2_entry = (*l2).entry(l2_idx);
-            if !l2_entry.is_valid() || !l2_entry.is_block() {
-                return None;
-            }
-
-            Some((l2_entry.addr(), l2_entry.attrs()))
-        }
     }
 }

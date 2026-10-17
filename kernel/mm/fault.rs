@@ -186,6 +186,16 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
     }
     let ptep = leaf(pgd, addr)?;
     let pte = get_pte(ptep);
+    if paging::pte_protnone(pte) {
+        // Only mprotect makes protnone entries, with the VMA (which
+        // allows this access): restore it, read-only, and retry (a
+        // write then goes through do_wp_page; write implies read)
+        let prot = (area.prot & !PROT_WRITE) | PROT_READ;
+        if set_pte(ptep, pte, paging::pte_modify(pte, prot)) {
+            paging::flush_tlb(addr);
+        }
+        return Ok(());
+    }
     if paging::pte_present(pte) {
         if access == Access::Write && !paging::pte_write(pte) {
             return do_wp_page(ptep, pte, addr, &area);
@@ -526,7 +536,7 @@ pub fn unshare_for_write(
         return Ok(()); // not mapped, or a 2MB page (never shared)
     };
     let pte = get_pte(ptep);
-    if !paging::pte_present(pte) || paging::pte_write(pte) {
+    if !paging::pte_present(pte) || paging::pte_protnone(pte) || paging::pte_write(pte) {
         return Ok(());
     }
     let page = addr & !(PAGE_SIZE - 1);

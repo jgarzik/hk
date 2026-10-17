@@ -43,7 +43,7 @@ impl SwapEntry {
     /// Marker bits to identify a swap PTE (bits 59-63 = 0, bit 0 = 0)
     /// We use bits 59-62 as a "swap marker" to distinguish from other non-present PTEs
     /// Value 0b0001 in bits 59-62 indicates swap entry
-    const SWAP_MARKER: u64 = 0x1 << 59;
+    pub const SWAP_MARKER: u64 = 0x1 << 59;
     const SWAP_MARKER_MASK: u64 = 0xF << 59;
 
     /// Create a new swap entry

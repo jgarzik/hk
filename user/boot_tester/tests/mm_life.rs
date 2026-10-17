@@ -4,9 +4,9 @@
 use super::helpers::{host_mode, print, print_num, println};
 use hk_syscall::{
     sys_clone, sys_close, sys_execve, sys_exit, sys_fork, sys_kill, sys_mincore, sys_mmap,
-    sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pread64, sys_read, sys_sched_yield,
+    sys_mprotect, sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_pread64, sys_read, sys_sched_yield,
     sys_vfork, sys_wait4, sys_waitid, SigInfo, Timespec, CLONE_SIGHAND, CLONE_VM, MAP_ANONYMOUS,
-    MAP_FIXED, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE, O_RDONLY, PROT_READ, PROT_WRITE, P_PID,
+    MAP_FIXED, MAP_PRIVATE, MREMAP_FIXED, MREMAP_MAYMOVE, O_RDONLY, PROT_NONE, PROT_READ, PROT_WRITE, P_PID,
     WEXITED,
 };
 
@@ -27,6 +27,8 @@ pub fn run_tests() {
     leak(b"MM_LIFE_THREADS", 500, thread);
     leak(b"MM_LIFE_MMAP_CYCLE", 1000, mmap_cycle);
     leak(b"MM_LIFE_EXEC_CHAIN", 10, exec_chain);
+    leak(b"MM_LIFE_PROTNONE_MUNMAP", 200, protnone_munmap);
+    leak(b"MM_LIFE_PROTNONE_EXIT", 200, protnone_exit);
     maps_after_exit();
     munmap_partial();
     map_fixed_replace();
@@ -169,6 +171,33 @@ fn settle() {
 fn reap_ok(pid: i64) -> bool {
     let mut st = 0i32;
     pid > 0 && sys_wait4(pid, &mut st, 0, 0) == pid && st == 0
+}
+
+/// 64 pages written, then made PROT_NONE: their address
+fn protnone_pages() -> Option<u64> {
+    let len = 64 * PAGE;
+    let p = sys_mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p < 0 {
+        return None;
+    }
+    for a in (p as u64..p as u64 + len).step_by(PAGE as usize) {
+        unsafe { core::ptr::write_volatile(a as *mut u8, 1) };
+    }
+    (sys_mprotect(p as u64, len, PROT_NONE) == 0).then_some(p as u64)
+}
+
+/// munmap of a PROT_NONE range gives its pages back
+fn protnone_munmap() -> bool {
+    protnone_pages().is_some_and(|p| sys_munmap(p, 64 * PAGE) == 0)
+}
+
+/// So does exit
+fn protnone_exit() -> bool {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_exit(if protnone_pages().is_some() { 0 } else { 1 });
+    }
+    reap_ok(pid)
 }
 
 /// A child that touches some memory (stack, a fresh page) and exits

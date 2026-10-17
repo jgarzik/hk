@@ -90,6 +90,64 @@ pub(super) fn exit_mmap(mm: &Mm) {
     drop(vmas);
 }
 
+/// Release the pages of [start, end) in the tables rooted at `pgd`
+/// (Linux zap_page_range), mm lock held: each 4KB entry (a page,
+/// protnone included, or a swap slot) is cleared, and its TLB entry
+/// flushed before the page is released; a 2MB page wholly inside goes
+/// whole, one partly inside is split first. Empty tables are kept.
+pub fn zap_range(pgd: u64, start: u64, end: u64) {
+    const GB: u64 = 1 << 30;
+    let mut addr = start;
+    while addr < end {
+        let Some(pmd) = paging::pmd_ptr(pgd, addr) else {
+            addr = ((addr | (GB - 1)) + 1).min(end);
+            continue;
+        };
+        let base = addr & !(HUGE_PAGE_SIZE - 1);
+        let next = (base + HUGE_PAGE_SIZE).min(end);
+        if paging::pmd_huge(entry(pmd).load(Ordering::Acquire)) {
+            if addr == base && next == base + HUGE_PAGE_SIZE {
+                if let Some(phys) = ArchPageTable::unmap_huge_page(pgd, base) {
+                    put_huge(phys);
+                }
+                addr = next;
+                continue;
+            }
+            // Out of memory: the 2MB page stays mapped (BUGS.md)
+            let _ = ArchPageTable::split_huge_page(pgd, base, &mut &FRAME_ALLOCATOR);
+        }
+        if entry(pmd).load(Ordering::Acquire) != 0 {
+            for a in (addr..next).step_by(PAGE_SIZE as usize) {
+                zap_pte(pgd, a);
+            }
+        }
+        addr = next;
+    }
+}
+
+/// A page is mapped at `addr` (protnone included), mm lock held
+pub fn resident(pgd: u64, addr: u64) -> bool {
+    match paging::pte_ptr(pgd, addr) {
+        Some(p) => paging::pte_present(entry(p).load(Ordering::Acquire)),
+        None => paging::pmd_ptr(pgd, addr)
+            .is_some_and(|p| paging::pmd_huge(entry(p).load(Ordering::Acquire))),
+    }
+}
+
+/// Clear the 4KB entry for `addr` and release what it held
+fn zap_pte(pgd: u64, addr: u64) {
+    let Some(p) = paging::pte_ptr(pgd, addr) else {
+        return;
+    };
+    let pte = entry(p).swap(0, Ordering::AcqRel);
+    if paging::pte_present(pte) {
+        paging::flush_tlb(addr);
+        put_page(paging::pte_addr(pte));
+    } else if SwapEntry::is_swap_pte(pte) {
+        super::free_swap_entry(SwapEntry::from_pte(pte));
+    }
+}
+
 /// The page table entry at `p`, as an atomic
 fn entry(p: *mut u64) -> &'static AtomicU64 {
     // SAFETY: `p` points into a live page table

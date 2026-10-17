@@ -108,14 +108,11 @@ fn check_vma_for_page(
     // Walk pages in VMA to find one mapping our frame
     let mut addr = vma_start;
     while addr < vma_end {
-        if let Some(phys) = translate_addr(pt_root, addr) {
-            let phys_page = phys & !0xFFF;
-            if phys_page == frame_phys {
-                return Some(PteMapping {
-                    vaddr: addr,
-                    pt_root,
-                });
-            }
+        if maps(pt_root, addr, frame_phys) {
+            return Some(PteMapping {
+                vaddr: addr,
+                pt_root,
+            });
         }
         addr += 4096;
     }
@@ -212,6 +209,20 @@ fn translate_addr(pt_root: u64, vaddr: u64) -> Option<u64> {
 #[cfg(target_arch = "aarch64")]
 fn translate_addr(pt_root: u64, vaddr: u64) -> Option<u64> {
     crate::arch::aarch64::paging::Aarch64PageTable::translate_with_root(pt_root, vaddr)
+}
+
+/// The entry for `vaddr` maps `frame`: a 4KB entry (protnone
+/// included: its frame stays mapped), or a 2MB page
+fn maps(pt_root: u64, vaddr: u64, frame: u64) -> bool {
+    use crate::arch::paging::{pte_addr, pte_present, pte_ptr};
+    match pte_ptr(pt_root, vaddr) {
+        Some(p) => {
+            // SAFETY: a live table recorded in an anon_vma chain
+            let pte = unsafe { core::ptr::read_volatile(p) };
+            pte_present(pte) && pte_addr(pte) == frame
+        }
+        None => translate_addr(pt_root, vaddr).is_some_and(|p| p & !0xFFF == frame),
+    }
 }
 
 /// The present leaf PTE for `vaddr` if it maps `expected_phys`

@@ -177,15 +177,31 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   switches the task to it, then drops its user reference on the old one,
   which is torn down only if no vfork parent or other thread uses it.
 - **munmap / MAP_FIXED / brk shrink / shmdt** split VMAs at the range
-  edges and release the pages inside; empty page-table pages are kept
-  until exit (reused by later mappings at the same addresses).
+  edges and release what the entries inside hold (`memory::zap_range`:
+  pages, protnone ones included, and swap slots); empty page-table
+  pages are kept until exit (reused by later mappings at the same
+  addresses).
+- **mprotect (Linux change_protection)** changes the VMAs and rewrites
+  the PTEs already mapped in the range (`pte_modify`), then flushes the
+  range's TLB. With no access left (PROT_NONE) an entry becomes
+  protnone: not present to the MMU (x86: PRESENT clear, software bit
+  10; arm64: VALID clear, software bit 58), so every access faults
+  (SIGSEGV with SEGV_ACCERR, from the VMA), but it keeps its frame and
+  frame reference: fork shares it copy-on-write, munmap/exit free it,
+  the rmap finds it, remote access (ptrace, process_vm_*) is refused
+  (by the VMA, and the entry does not translate), mincore reports it
+  resident, and a later mprotect restores
+  access with the data intact. A 2MB page partly inside the range, or
+  made PROT_NONE, is split first, before anything changes (ENOMEM
+  leaves the mapping as it was). A private page becomes writable only
+  if no one else maps it (else at its write fault, copied).
 - **mremap move (Linux move_page_tables)** allocates first: the old
   range's 2MB pages are split and the new range's page tables
   allocated before any VMA or entry changes (ENOMEM then leaves the
   old mapping intact); then, under the same mm lock hold, the old VMA
   (split at the old range's edges) is retired, the new one inserted,
-  the entries (pages, swap) moved into it with their frame references,
-  and the old range's TLB flushed. Shrinking unmaps the tail like
-  munmap.
+  the entries (pages, protnone, swap) moved into it with their frame
+  references, and the old range's TLB flushed. Shrinking unmaps the
+  tail like munmap.
 - `/proc/meminfo` reports MemTotal and MemFree from the frame allocator
   (exact free count).

@@ -19,6 +19,7 @@ pub mod huge_page;
 pub mod lru;
 pub mod memory;
 pub mod mempolicy;
+pub mod mprotect;
 pub mod mremap;
 pub mod page;
 pub mod page_cache;

@@ -97,9 +97,39 @@ pub fn pte_ptr(root: u64, va: u64) -> Option<*mut u64> {
     )
 }
 
-/// A leaf entry maps a page
+/// A leaf entry maps a page: present, or protnone (Linux pte_present)
 pub fn pte_present(pte: u64) -> bool {
-    pte & PAGE_PRESENT != 0
+    pte & PAGE_PRESENT != 0 || pte_protnone(pte)
+}
+
+/// Software bit of a PROT_NONE entry (Linux _PAGE_PROTNONE): not
+/// present to the MMU, so every user access faults, but it keeps its
+/// frame (and the frame reference) for a later mprotect to restore
+pub const PAGE_PROTNONE: u64 = 1 << 10;
+
+/// A protnone leaf entry (never a swap entry: those carry the marker)
+pub fn pte_protnone(pte: u64) -> bool {
+    pte & (PAGE_PRESENT | PAGE_PROTNONE | crate::mm::SwapEntry::SWAP_MARKER) == PAGE_PROTNONE
+}
+
+/// `pte` with the protection `prot` (PROT_*; Linux pte_modify): none
+/// at all makes it protnone; it is writable only if `prot` asks for it
+/// and it is not a copy-on-write share. Frame, accessed/dirty and cache
+/// bits are kept.
+pub fn pte_modify(pte: u64, prot: u32) -> u64 {
+    use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE};
+    let keep = pte & !(PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE | PAGE_PROTNONE);
+    if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
+        return keep | PAGE_PROTNONE | PAGE_NO_EXECUTE;
+    }
+    let mut e = keep | PAGE_PRESENT;
+    if prot & PROT_WRITE != 0 && pte & PAGE_COW == 0 {
+        e |= PAGE_WRITABLE;
+    }
+    if prot & PROT_EXEC == 0 {
+        e |= PAGE_NO_EXECUTE;
+    }
+    e
 }
 
 // ============================================================================
@@ -266,7 +296,7 @@ fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
         // SAFETY: a detached table frame owned by the caller
         let e = unsafe { *(*table).entry(i) };
         match level {
-            1 if e.is_present() => put(Leaf::Page(e.addr())),
+            1 if pte_present(e.0) => put(Leaf::Page(e.addr())),
             1 if e.0 != 0 => put(Leaf::Swap(e.0)),
             // 1GB user pages are never created
             3 if e.is_present() && !e.is_huge() => free_level(e.addr(), 2, put),
@@ -857,91 +887,6 @@ impl X86_64PageTable {
         }
     }
 
-    /// Update the protection flags on an already-mapped page
-    ///
-    /// This modifies the page table entry for the given virtual address
-    /// to have new protection flags, without changing the physical mapping.
-    ///
-    /// # Arguments
-    /// * `pml4_phys` - Physical address of the PML4 table
-    /// * `va` - Virtual address of the page to modify
-    /// * `writable` - Whether the page should be writable
-    /// * `executable` - Whether the page should be executable
-    ///
-    /// # Returns
-    /// `true` if the page was found and updated, `false` if not mapped
-    pub fn update_page_protection(
-        pml4_phys: u64,
-        va: u64,
-        writable: bool,
-        executable: bool,
-    ) -> bool {
-        let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
-
-        unsafe {
-            let pml4 = phys_to_virt_table(pml4_phys);
-
-            let pml4_entry = (*pml4).entry(pml4_idx);
-            if !pml4_entry.is_present() {
-                return false;
-            }
-            let pdpt = phys_to_virt_table(pml4_entry.addr());
-
-            let pdpt_entry = (*pdpt).entry(pdpt_idx);
-            if !pdpt_entry.is_present() {
-                return false;
-            }
-            // 1GB huge pages not supported for protection update
-            if pdpt_entry.is_huge() {
-                return false;
-            }
-            let pd = phys_to_virt_table(pdpt_entry.addr());
-
-            let pd_entry = (*pd).entry(pd_idx);
-            if !pd_entry.is_present() {
-                return false;
-            }
-            // 2MB huge pages not supported for protection update
-            if pd_entry.is_huge() {
-                return false;
-            }
-            let pt = phys_to_virt_table(pd_entry.addr());
-
-            let pt_entry = (*pt).entry_mut(pt_idx);
-            if !pt_entry.is_present() {
-                return false;
-            }
-
-            // Get current entry, preserve address and base flags
-            let phys = pt_entry.addr();
-            let mut flags = pt_entry.flags();
-
-            // Update writable flag; a copy-on-write share stays
-            // read-only until its write fault (Linux
-            // can_change_pte_writable)
-            if writable && flags & PAGE_COW == 0 {
-                flags |= PAGE_WRITABLE;
-            } else {
-                flags &= !PAGE_WRITABLE;
-            }
-
-            // Update executable flag (NX bit - inverted logic)
-            if executable {
-                flags &= !PAGE_NO_EXECUTE;
-            } else {
-                flags |= PAGE_NO_EXECUTE;
-            }
-
-            // Write back the updated entry
-            pt_entry.set(phys, flags);
-
-            // Flush TLB for this address
-            Self::flush_tlb(va);
-
-            true
-        }
-    }
-
     /// Update protection flags for a 2MB huge page
     ///
     /// # Arguments
@@ -1281,41 +1226,5 @@ impl X86_64PageTable {
         pmd.store(pt_phys | USER_TABLE, Ordering::Release);
         crate::FRAME_ALLOCATOR.split_huge(base);
         Ok(base)
-    }
-
-    /// Check if a virtual address is mapped as a 2MB huge page
-    ///
-    /// # Arguments
-    /// * `pml4_phys` - Physical address of the PML4 table
-    /// * `va` - Virtual address to check
-    ///
-    /// # Returns
-    /// Some((phys_addr, flags)) if mapped as huge page, None otherwise
-    /// The phys_addr is the 2MB-aligned base address of the huge page
-    pub fn is_huge_page_mapped(pml4_phys: u64, va: u64) -> Option<(u64, u64)> {
-        let (pml4_idx, pdpt_idx, pd_idx, _pt_idx) = page_indices(va);
-
-        unsafe {
-            let pml4 = phys_to_virt_table_const(pml4_phys);
-
-            let pml4_entry = (*pml4).entry(pml4_idx);
-            if !pml4_entry.is_present() {
-                return None;
-            }
-            let pdpt = phys_to_virt_table_const(pml4_entry.addr());
-
-            let pdpt_entry = (*pdpt).entry(pdpt_idx);
-            if !pdpt_entry.is_present() || pdpt_entry.is_huge() {
-                return None;
-            }
-            let pd = phys_to_virt_table_const(pdpt_entry.addr());
-
-            let pd_entry = (*pd).entry(pd_idx);
-            if !pd_entry.is_present() || !pd_entry.is_huge() {
-                return None;
-            }
-
-            Some((pd_entry.addr(), pd_entry.flags()))
-        }
     }
 }

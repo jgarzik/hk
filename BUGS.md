@@ -81,7 +81,6 @@ Address spaces are reference counted and torn down like Linux
   mappings); truncating a ramfs file does not unmap its shared pages
   (they keep the old data instead of raising SIGBUS); MAP_PRIVATE file
   pages are copied at fault, not shared until written.
-- mprotect(PROT_NONE) leaves already-present pages readable.
 - MADV_REMOVE of a file mapping is EOPNOTSUPP (no filesystem punches
   holes); shmdt needs the address an attachment starts at (Linux also
   finds a piece moved by mremap); SHM_EXEC is ignored.
@@ -89,8 +88,9 @@ Address spaces are reference counted and torn down like Linux
   writable VMA: POKE into read-only text fails with EIO (Linux
   FOLL_FORCE writes a private copy, e.g. for breakpoints), and a page
   not yet faulted in is not faulted (EIO / short write).
-- A 2MB page whose split fails keeps its protection under a partial
-  mprotect; shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
+- munmap or MADV_DONTNEED of part of a 2MB page that cannot be split
+  (out of memory) leaves the whole page mapped (Linux preallocates the
+  page table); shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
   range, and an address that SHM_RND rounds to 0 is EPERM (Linux picks
   an address).
 - No vm.max_map_count: the number of VMAs (new mappings, splits by a
