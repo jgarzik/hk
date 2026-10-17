@@ -6,7 +6,8 @@
 //! sorted and do not overlap, and every user leaf entry that maps a
 //! page (protnone included) lies in a VMA that allows at least what the
 //! entry allows (writable entry: PROT_WRITE; executable: PROT_EXEC; an
-//! accessible entry: some access). A violation prints `MMCHECK:FAIL`
+//! accessible entry: some access) and is never executable by the
+//! kernel (arm64 PXN). A violation prints `MMCHECK:FAIL`
 //! (once per boot), which fails `make check`.
 
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +39,8 @@ fn excess(entry: u64, prot: u32) -> Option<&'static str> {
         Some("writable entry in a VMA without PROT_WRITE")
     } else if paging::pte_exec(entry) && prot & PROT_EXEC == 0 {
         Some("executable entry in a VMA without PROT_EXEC")
+    } else if paging::pte_kexec(entry) {
+        Some("user entry executable by the kernel")
     } else {
         None
     }

@@ -193,14 +193,40 @@ pub fn pte_modify(pte: u64, prot: u32) -> u64 {
     if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
         return keep | PTE_PROTNONE | AP_RDONLY | PXN | UXN;
     }
-    let mut e = keep | 1;
+    let mut e = keep | 1 | PXN;
     if prot & PROT_WRITE == 0 || pte & PAGE_COW != 0 {
         e |= AP_RDONLY;
     }
     if prot & PROT_EXEC == 0 {
-        e |= PXN | UXN;
+        e |= UXN;
     }
     e
+}
+
+/// The user leaf `pte` is executable by the kernel (EL1): never for a
+/// valid entry built here, every user leaf carries PXN (`mm::check`)
+#[cfg(feature = "mmcheck")]
+pub fn pte_kexec(pte: u64) -> bool {
+    pte & 1 != 0 && pte & PXN == 0
+}
+
+/// Leaf attributes for `flags` (Linux PAGE_*): a user page is never
+/// executable at EL1 (PXN, as Linux sets on every user mapping), a
+/// kernel page never at EL0 (UXN)
+fn leaf_attrs(flags: PageFlags) -> u64 {
+    let user = flags.contains(PageFlags::USER);
+    let mut attrs = AF | SH_INNER | ATTR_IDX_NORMAL;
+    attrs |= match (user, flags.contains(PageFlags::WRITE)) {
+        (true, true) => AP_EL0_RW,
+        (true, false) => AP_EL0_RO,
+        (false, true) => AP_EL1_RW,
+        (false, false) => AP_EL1_RO,
+    };
+    attrs |= if user { PXN } else { UXN };
+    if !flags.contains(PageFlags::EXECUTE) {
+        attrs |= PXN | UXN;
+    }
+    attrs
 }
 
 // ============================================================================
@@ -291,8 +317,10 @@ pub fn mk_pte(phys: u64, prot: u32) -> u64 {
     } else {
         AP_EL0_RO
     };
+    // Never executable at EL1 (Linux sets PXN on every user mapping)
+    pte |= PXN;
     if prot & crate::mm::PROT_EXEC == 0 {
-        pte |= PXN | UXN;
+        pte |= UXN;
     }
     pte
 }
@@ -660,24 +688,7 @@ impl Aarch64PageTable {
         flags: PageFlags,
         frame_alloc: &mut FA,
     ) -> Result<(), MapError> {
-        // Convert generic flags to AArch64 page attributes
-        let mut attrs = AF | SH_INNER | ATTR_IDX_NORMAL;
-
-        if flags.contains(PageFlags::USER) {
-            if flags.contains(PageFlags::WRITE) {
-                attrs |= AP_EL0_RW;
-            } else {
-                attrs |= AP_EL0_RO;
-            }
-        } else if flags.contains(PageFlags::WRITE) {
-            attrs |= AP_EL1_RW;
-        } else {
-            attrs |= AP_EL1_RO;
-        }
-
-        if !flags.contains(PageFlags::EXECUTE) {
-            attrs |= PXN | UXN;
-        }
+        let attrs = leaf_attrs(flags);
 
         let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
 
@@ -894,28 +905,22 @@ impl Aarch64PageTable {
             // Get current entry, preserve address
             let phys = l2_entry.addr();
 
-            // Build new attributes, preserving AF, SH, ATTR_IDX
-            let mut attrs = l2_entry.0 & (AF | SH_INNER | 0b11100); // Preserve AF, SH, ATTR_IDX
-
-            // Detect if user page
-            let was_user = (l2_entry.0 & AP_EL0_RW) != 0 || (l2_entry.0 & AP_EL0_RO) != 0;
-
-            if was_user {
-                if writable {
-                    attrs |= AP_EL0_RW;
-                } else {
-                    attrs |= AP_EL0_RO;
-                }
-            } else if writable {
-                attrs |= AP_EL1_RW;
-            } else {
-                attrs |= AP_EL1_RO;
+            // Only the permissions change: AP[2:1] (EL0 access, bit 6,
+            // is kept) and the execute-never bits
+            let user = l2_entry.0 & AP_EL0_RW != 0;
+            let mut flags = PageFlags::READ;
+            if user {
+                flags |= PageFlags::USER;
             }
-
-            // Set execute permissions
-            if !executable {
-                attrs |= PXN | UXN;
+            if writable {
+                flags |= PageFlags::WRITE;
             }
+            if executable {
+                flags |= PageFlags::EXECUTE;
+            }
+            let keep = l2_entry.0 & !(ADDR_MASK | 0b11 | AP_EL0_RO | PXN | UXN);
+            let perm = AP_EL0_RO | PXN | UXN;
+            let attrs = keep | (leaf_attrs(flags) & perm);
 
             // Write back the updated entry as a block descriptor
             l2_entry.set_block(phys, attrs);
@@ -1040,24 +1045,7 @@ impl PageTable for Aarch64PageTable {
     type PhysAddr = u64;
 
     fn map(&mut self, va: Self::VirtAddr, pa: Self::PhysAddr, flags: PageFlags) {
-        // Convert flags to AArch64 attributes
-        let mut attrs = AF | SH_INNER | ATTR_IDX_NORMAL;
-
-        if flags.contains(PageFlags::USER) {
-            if flags.contains(PageFlags::WRITE) {
-                attrs |= AP_EL0_RW;
-            } else {
-                attrs |= AP_EL0_RO;
-            }
-        } else if flags.contains(PageFlags::WRITE) {
-            attrs |= AP_EL1_RW;
-        } else {
-            attrs |= AP_EL1_RO;
-        }
-
-        if !flags.contains(PageFlags::EXECUTE) {
-            attrs |= PXN | UXN;
-        }
+        let attrs = leaf_attrs(flags);
 
         let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
 
@@ -1189,24 +1177,7 @@ impl Aarch64PageTable {
             return Err(MapError::InvalidAddress);
         }
 
-        // Convert generic flags to AArch64 block attributes
-        let mut attrs = AF | SH_INNER | ATTR_IDX_NORMAL;
-
-        if flags.contains(PageFlags::USER) {
-            if flags.contains(PageFlags::WRITE) {
-                attrs |= AP_EL0_RW;
-            } else {
-                attrs |= AP_EL0_RO;
-            }
-        } else if flags.contains(PageFlags::WRITE) {
-            attrs |= AP_EL1_RW;
-        } else {
-            attrs |= AP_EL1_RO;
-        }
-
-        if !flags.contains(PageFlags::EXECUTE) {
-            attrs |= PXN | UXN;
-        }
+        let attrs = leaf_attrs(flags);
 
         let (l0_idx, l1_idx, l2_idx, _l3_idx) = page_indices(va);
 

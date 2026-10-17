@@ -51,7 +51,9 @@ Linux: `Documentation/arch/arm64/memory.rst`.
 | `ffff800200000000 - ffff80023fffffff` | 1 GB | device window: physical 0-1 GB as Device-nGnRnE (`io_va`) |
 
 - **TTBR0** holds only user mappings; kernel threads run with an empty
-  table (Linux `reserved_pg_dir`). **TTBR1** is the kernel table, built
+  table (Linux `reserved_pg_dir`). Every user leaf has PXN (never
+  executable at EL1, as Linux sets on all user mappings; x86 relies on
+  SMEP) and UXN unless PROT_EXEC; kernel leaves have UXN. **TTBR1** is the kernel table, built
   once by `kmap::init` and never switched per process.
 - **Kernel image**: QEMU loads the ELF at physical 0x40100000 and
   enters at the physical entry point with the MMU off. `boot.S` is
@@ -230,6 +232,7 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   under the mm lock, `mm::check::verify` walks the user page tables:
   the VMAs must be sorted and disjoint, and every entry mapping a page
   (protnone included) must lie in a VMA allowing at least what the
-  entry allows; a violation prints `MMCHECK:FAIL`.
+  entry allows, and none may be executable by the kernel (arm64 PXN);
+  a violation prints `MMCHECK:FAIL`.
 - `/proc/meminfo` reports MemTotal and MemFree from the frame allocator
   (exact free count).

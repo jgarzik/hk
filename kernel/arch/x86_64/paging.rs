@@ -249,6 +249,14 @@ pub fn pte_exec(pte: u64) -> bool {
     pte & PAGE_NO_EXECUTE == 0
 }
 
+/// The user leaf `pte` is executable by the kernel: never, SMEP
+/// (enabled at boot when the CPU has it) faults any supervisor fetch
+/// from a user page (Linux has the same exposure on CPUs without it)
+#[cfg(feature = "mmcheck")]
+pub fn pte_kexec(_pte: u64) -> bool {
+    false
+}
+
 /// The entry is a copy-on-write share (written only after a copy)
 pub fn pte_cow(pte: u64) -> bool {
     pte & PAGE_COW != 0
