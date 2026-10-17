@@ -69,6 +69,7 @@ pub mod process;
 pub mod process_vm;
 pub mod procfs_access;
 pub mod raw;
+pub mod rename2;
 pub mod rlimit;
 pub mod signalfd;
 pub mod signals;
@@ -131,6 +132,7 @@ pub fn run_all_tests() {
     file_io::run_tests();
     bigio::run_tests();
     fs_ops::run_tests();
+    rename2::run_tests();
     permissions::run_tests();
     dac::run_tests();
     sync::run_tests();

@@ -231,6 +231,7 @@ pub const SYS_FTRUNCATE: u64 = 77;
 pub const SYS_GETDENTS: u64 = 78;
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_RENAME: u64 = 82;
+pub const SYS_RENAMEAT2: u64 = 316;
 pub const SYS_MKDIR: u64 = 83;
 pub const SYS_RMDIR: u64 = 84;
 pub const SYS_LINK: u64 = 86;
@@ -594,6 +595,18 @@ pub fn sys_unlink(pathname: *const u8) -> i64 {
 #[inline(always)]
 pub fn sys_rename(oldpath: *const u8, newpath: *const u8) -> i64 {
     unsafe { syscall2!(SYS_RENAME, oldpath, newpath) }
+}
+
+/// renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+#[inline(always)]
+pub fn sys_renameat2(
+    olddirfd: i32,
+    oldpath: *const u8,
+    newdirfd: i32,
+    newpath: *const u8,
+    flags: u32,
+) -> i64 {
+    unsafe { syscall5!(SYS_RENAMEAT2, olddirfd, oldpath, newdirfd, newpath, flags) }
 }
 
 #[inline(always)]

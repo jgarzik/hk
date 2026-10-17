@@ -757,8 +757,9 @@ impl InodeOps for RamfsInodeOps {
         let noreplace = flags & RENAME_NOREPLACE != 0;
         let exchange = flags & RENAME_EXCHANGE != 0;
 
-        // NOREPLACE and EXCHANGE are mutually exclusive
-        if noreplace && exchange {
+        // No whiteouts (Linux simple_rename); NOREPLACE and EXCHANGE are
+        // mutually exclusive
+        if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0 || (noreplace && exchange) {
             return Err(KernelError::InvalidArgument);
         }
 

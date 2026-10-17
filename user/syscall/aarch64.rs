@@ -196,6 +196,7 @@ pub const SYS_UNLINKAT: u64 = 35;
 pub const SYS_SYMLINKAT: u64 = 36;
 pub const SYS_LINKAT: u64 = 37;
 pub const SYS_RENAMEAT: u64 = 38;
+pub const SYS_RENAMEAT2: u64 = 276;
 pub const SYS_FTRUNCATE: u64 = 46;
 pub const SYS_FCHMODAT: u64 = 53;
 pub const SYS_FCHOWNAT: u64 = 54;
@@ -1174,6 +1175,18 @@ pub fn sys_utimensat(dirfd: i32, pathname: *const u8, times: *const Timespec, fl
 #[inline(always)]
 pub fn sys_renameat(olddirfd: i32, oldpath: *const u8, newdirfd: i32, newpath: *const u8) -> i64 {
     unsafe { syscall4!(SYS_RENAMEAT, olddirfd, oldpath, newdirfd, newpath) }
+}
+
+/// renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+#[inline(always)]
+pub fn sys_renameat2(
+    olddirfd: i32,
+    oldpath: *const u8,
+    newdirfd: i32,
+    newpath: *const u8,
+    flags: u32,
+) -> i64 {
+    unsafe { syscall5!(SYS_RENAMEAT2, olddirfd, oldpath, newdirfd, newpath, flags) }
 }
 
 /// rename(oldpath, newpath) - compatibility wrapper

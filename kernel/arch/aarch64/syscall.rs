@@ -28,6 +28,7 @@ pub const SYS_UNLINKAT: u64 = 35;
 pub const SYS_SYMLINKAT: u64 = 36;
 pub const SYS_LINKAT: u64 = 37;
 pub const SYS_RENAMEAT: u64 = 38;
+pub const SYS_RENAMEAT2: u64 = 276;
 pub const SYS_UMOUNT2: u64 = 39;
 pub const SYS_MOUNT: u64 = 40;
 /// pivot_root(new_root, put_old)
@@ -574,6 +575,7 @@ pub fn aarch64_syscall_dispatch(
         sys_readv,
         sys_removexattr,
         sys_renameat,
+        sys_renameat2,
         // Extended attributes
         sys_setxattr,
         sys_statfs,
@@ -647,6 +649,7 @@ pub fn aarch64_syscall_dispatch(
         SYS_LINKAT => sys_linkat(arg0 as i32, arg1, arg2 as i32, arg3, arg4 as i32) as u64,
         SYS_READLINKAT => sys_readlinkat(arg0 as i32, arg1, arg2, arg3) as u64,
         SYS_RENAMEAT => sys_renameat(arg0 as i32, arg1, arg2 as i32, arg3) as u64,
+        SYS_RENAMEAT2 => sys_renameat2(arg0 as i32, arg1, arg2 as i32, arg3, arg4 as u32) as u64,
         SYS_MOUNT => sys_mount(arg0, arg1, arg2, arg3, arg4) as u64,
         SYS_UMOUNT2 => sys_umount2(arg0, arg1 as i32) as u64,
         SYS_PIVOT_ROOT => sys_pivot_root(arg0, arg1) as u64,

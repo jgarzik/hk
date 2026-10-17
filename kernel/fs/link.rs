@@ -338,6 +338,20 @@ pub fn sys_unlinkat(dirfd: i32, pathname_ptr: u64, flags: i32) -> i64 {
 // rename, renameat, renameat2 syscalls
 // =============================================================================
 
+/// renameat2 flags (Linux include/uapi/linux/fs.h)
+pub const RENAME_NOREPLACE: u32 = 1 << 0;
+pub const RENAME_EXCHANGE: u32 = 1 << 1;
+pub const RENAME_WHITEOUT: u32 = 1 << 2;
+
+/// Flag check of renameat2, before anything else (Linux
+/// filename_renameat2): unknown flags, and EXCHANGE with NOREPLACE or
+/// WHITEOUT, are EINVAL. Whether a file system takes a flag (no hk file
+/// system makes whiteouts) is up to its rename.
+fn rename_flags_ok(flags: u32) -> bool {
+    flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) == 0
+        && !(flags & (RENAME_NOREPLACE | RENAME_WHITEOUT) != 0 && flags & RENAME_EXCHANGE != 0)
+}
+
 /// sys_rename - rename a file
 ///
 /// # Arguments
@@ -382,6 +396,10 @@ pub fn sys_renameat2(
     newpath_ptr: u64,
     flags: u32,
 ) -> i64 {
+    if !rename_flags_ok(flags) {
+        return KernelError::InvalidArgument.sysret();
+    }
+
     // Read oldpath from user space
     let oldpath = match strncpy_from_user::<Uaccess>(oldpath_ptr, PATH_MAX) {
         Ok(p) => p,
@@ -468,13 +486,21 @@ type Side<'a> = (&'a Arc<Dentry>, &'a Arc<Inode>, &'a str);
 /// may_delete of the target, and write permission on a directory that
 /// changes parent (its ".." is rewritten)
 fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
-    const RENAME_EXCHANGE: u32 = 2;
     let (op, odir, oname) = old;
     let (np, ndir, nname) = new;
     let src = lookup_one(op, oname)?;
     let sinode = src.get_inode().ok_or(KernelError::NotFound)?;
     let dinode = lookup_one(np, nname).ok().and_then(|d| d.get_inode());
     let is_dir = sinode.mode().is_dir();
+
+    // The target must exist for EXCHANGE and must not for NOREPLACE
+    // (Linux __start_renaming)
+    if flags & RENAME_EXCHANGE != 0 && dinode.is_none() {
+        return Err(KernelError::NotFound);
+    }
+    if flags & RENAME_NOREPLACE != 0 && dinode.is_some() {
+        return Err(KernelError::AlreadyExists);
+    }
 
     // Moving a directory into its own subtree
     if is_dir && is_subdir(np, &src) {
