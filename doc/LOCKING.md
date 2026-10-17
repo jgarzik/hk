@@ -754,7 +754,10 @@ pub struct BitmapFrameAllocator {
   mprotect, munmap, mremap and madvise: it only reads, and takes no
   lock. madvise holds the mm lock over its whole VMA walk (splits,
   flag changes and zaps), and MADV_REMOVE punches the shared object's
-  holes only after dropping it.
+  holes only after dropping it. msync drops the mm lock around each
+  writeback (`fsync` sleeps; it holds a reference on the file) and
+  looks the next VMA up again after it (Linux msync); mincore copies
+  each chunk of its vector out with the mm lock dropped.
 - TLB after a PTE loses permission or its page: flushed before the mm
   lock is released and before the old frame can be freed or written
   through by another process: fork write-protects the parent's private

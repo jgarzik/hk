@@ -195,6 +195,22 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   made PROT_NONE, is split first, before anything changes (ENOMEM
   leaves the mapping as it was). A private page becomes writable only
   if no one else maps it (else at its write fault, copied).
+- **Range arguments (Linux semantics, errno for errno).** madvise,
+  mlock/munlock, mprotect and msync walk the VMAs of their range in
+  turn: a VMA that refuses the operation stops it with its error, the
+  VMAs before it keeping the change; a hole is ENOMEM (after the rest
+  for madvise and msync, which go on past it; at the hole for mlock,
+  munlock, mprotect and MS_ASYNC-only msync). madvise flag advice and
+  mlock split VMAs at the range edges (locked_vm counts exactly the
+  pages locked); undoing the change merges them again. munmap needs
+  its range inside user space (EINVAL), mincore too (ENOMEM; it copies
+  out one chunk of at most a VMA and PAGE_SIZE pages at a time, so a
+  hole stops it after the chunks before). A rounded length that wraps
+  is EINVAL (madvise, munmap, mlock), ENOMEM (mprotect, msync) or a
+  no-op (a length that wraps to 0 in mlock/munlock and msync), as in
+  Linux. brk refuses (keeps the break) a break that wraps when
+  rounded, lies past TASK_SIZE or RLIMIT_DATA, comes within a page of
+  the next mapping, or shrinks a heap no longer mapped.
 - **mremap move (Linux move_page_tables)** allocates first: the old
   range's 2MB pages are split and the new range's page tables
   allocated before any VMA or entry changes (ENOMEM then leaves the
@@ -204,7 +220,7 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   references, and the old range's TLB flushed. Shrinking unmaps the
   tail like munmap.
 - **Debug check (feature `mmcheck`, in `make check LOCKDEP=1`).** After
-  each mprotect, munmap (and what is built on it) and mremap, still
+  each mprotect, munmap (and what is built on it), mremap and madvise, still
   under the mm lock, `mm::check::verify` walks the user page tables:
   the VMAs must be sorted and disjoint, and every entry mapping a page
   (protnone included) must lie in a VMA allowing at least what the
