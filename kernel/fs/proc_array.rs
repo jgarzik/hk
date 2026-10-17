@@ -401,7 +401,7 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
     // The access decision and the mm it covers, as one (Linux holds
     // exec_update_lock across do_task_stat)
     let guard = crate::signal::ExecUpdateRead::lock(s.tid);
-    let permitted = crate::task::ptrace::may_read_proc(pid);
+    let permitted = crate::task::ptrace::may_read_task(s.tid);
     let v = task_vm(s.tid);
     drop(guard);
     let (ign, cgt) = ign_cgt(&s);

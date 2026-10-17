@@ -883,6 +883,18 @@ pub fn may_read_proc(pid: crate::task::Pid) -> bool {
     may_access(|t| t.tgid == pid, true)
 }
 
+/// [`may_read_proc`] for task `tid` itself (tids are never reused): a
+/// caller that resolved a pid once checks the very task it then uses
+pub fn may_read_task(tid: Tid) -> bool {
+    let me = percpu::current_pid();
+    let own = TASK_TABLE
+        .lock()
+        .tasks
+        .iter()
+        .any(|t| t.tid == tid && t.tgid == me);
+    own || may_access(|t| t.tid == tid, true)
+}
+
 /// Linux __ptrace_may_access for the first task `pick` selects: the
 /// caller's ids (fsuid/fsgid with `fscreds`, else the real ones) must
 /// equal all of the target's real, effective and saved ids, or the

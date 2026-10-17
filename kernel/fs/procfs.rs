@@ -923,8 +923,10 @@ fn mm_access(pid: Pid) -> Result<Option<Arc<crate::mm::Mm>>, KernelError> {
     };
     // The check and the mm it covers under the process's
     // exec_update_lock: no exec of it switches mm or dumpability between
+    // exec_update_lock; check and mm both of that one task, so a pid
+    // reused meanwhile cannot split them
     let _g = crate::signal::ExecUpdateRead::lock(tid);
-    if !crate::task::ptrace::may_read_proc(pid) {
+    if !crate::task::ptrace::may_read_task(tid) {
         return Err(KernelError::PermissionDenied);
     }
     Ok(crate::mm::get_task_mm(tid))
@@ -1020,13 +1022,11 @@ fn pid_file_pid(inode: &Inode) -> Option<Pid> {
 /// /proc/<pid>/exe: the executable's path (ENOENT for kernel threads,
 /// EACCES without ptrace-read access, Linux proc_fd_access_allowed)
 fn exe_link(pid: Pid) -> Result<String, KernelError> {
-    // No exec_update_lock (Linux proc_exe_link): an exec resolving
-    // /proc/self/exe (busybox re-execs itself) holds its own
-    if !crate::task::ptrace::may_read_proc(pid) {
-        return Err(KernelError::PermissionDenied);
-    }
-    let tid = get_tid_for_pid(pid).ok_or(KernelError::NotFound)?;
-    let mm = crate::mm::get_task_mm(tid).ok_or(KernelError::NotFound)?;
+    // Through mm_access, so the check and the image it reveals are one
+    // (exec_update_lock read). An exec resolving /proc/self/exe (busybox
+    // re-execs itself) holds only cred_guard while it walks paths: it
+    // takes exec_update for writing later, in exec_replace_image
+    let mm = mm_access(pid)?.ok_or(KernelError::NotFound)?;
     let exe = mm.lock().exe().ok_or(KernelError::NotFound)?;
     Ok(exe)
 }
