@@ -42,6 +42,7 @@ pub const ENOMEM: i32 = 12; // Out of memory
 pub const EIO: i32 = 5; // I/O error
 pub const EFAULT: i32 = 14; // Bad address
 pub const E2BIG: i32 = 7; // Argument list too long
+pub const ESRCH: i32 = 3; // No such process
 
 /// Maximum path length (matching Linux PATH_MAX)
 const PATH_MAX: usize = 4096;
@@ -148,7 +149,7 @@ fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64)
     const AT_HWCAP2: u64 = 26;
     const AT_EXECFN: u64 = 31;
     let c = crate::task::current_cred();
-    let secure = c.uid != c.euid || c.gid != c.egid;
+    let secure = secureexec(&c);
     [
         (AT_HWCAP, crate::arch::elf_hwcap()),
         (AT_PAGESZ, PAGE_SIZE),
@@ -517,6 +518,43 @@ fn user_frame() -> Result<u64, i32> {
     crate::mm::fault::alloc_user().ok_or(ENOMEM)
 }
 
+/// The new image runs with privileges its caller lacks (Linux
+/// bprm->secureexec, AT_SECURE): hk exec keeps the credentials (no
+/// set-id or file capabilities yet, BUGS.md), so this is effective ids
+/// differing from the real ones
+fn secureexec(c: &crate::task::Cred) -> bool {
+    c.uid != c.euid || c.gid != c.egid
+}
+
+/// Name and dumpability of the new image (Linux begin_new_exec): comm
+/// is the file name's last component (at most 15 bytes); the task is
+/// non-dumpable (suid_dumpable 0) for a secure exec or an image the
+/// caller may not read (would_dump: BINPRM_FLAGS_ENFORCE_NONDUMP, so an
+/// execute-only binary cannot be read through ptrace or /proc), else
+/// dumpable. Done before the point of no return: if the task cannot be
+/// updated the exec fails (ESRCH) instead of keeping a stale state.
+fn exec_identity(tid: super::Tid, path: &[u8], file: &File) -> Result<(), i32> {
+    use super::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_USER};
+    let base = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+    let mut name = [0u8; 16];
+    let n = base.len().min(15);
+    name[..n].copy_from_slice(&base[..n]);
+    let readable = file
+        .get_inode()
+        .is_some_and(|i| crate::fs::dac::permission(&i, crate::fs::MAY_READ).is_ok());
+    let c = crate::task::current_cred();
+    let dumpable = if readable && !secureexec(&c) {
+        SUID_DUMP_USER
+    } else {
+        SUID_DUMP_DISABLE
+    };
+    let mut table = percpu::TASK_TABLE.lock();
+    let t = table.tasks.iter_mut().find(|t| t.tid == tid).ok_or(ESRCH)?;
+    t.prctl.name = name;
+    t.prctl.dumpable = dumpable;
+    Ok(())
+}
+
 /// Execute a new program, replacing the current process image
 ///
 /// This is the core of execve. It:
@@ -628,6 +666,10 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
             Ok(r) => r,
             Err(e) => return -e,
         };
+
+    if let Err(e) = exec_identity(percpu::current_tid(), pathname, &file) {
+        return -e;
+    }
 
     // Now we need to update the current task and switch to the new address space
     // This is the point of no return

@@ -1379,17 +1379,19 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         signal_state: crate::signal::TaskSignalState::new(),
         tif_sigpending: core::sync::atomic::AtomicBool::new(false),
         robust_list: 0,
-        // prctl state: inherit no_new_privs from parent, reset others
+        // prctl state: the name and dumpability are inherited (Linux
+        // copies comm with the task and dumpability with the mm: a child
+        // of a non-dumpable process holds the same secrets)
         prctl: crate::task::PrctlState {
-            name: [0u8; 16],                                 // Child gets empty name
-            dumpable: crate::task::dumpable::SUID_DUMP_USER, // Reset to default
-            no_new_privs: parent_prctl.no_new_privs,         // Inherited (irreversible)
-            timer_slack_ns: parent_prctl.timer_slack_ns,     // Inherited
-            keep_caps: false,                                // Reset on fork
-            child_subreaper: false,                          // Not inherited
+            name: parent_prctl.name,
+            dumpable: parent_prctl.dumpable,
+            no_new_privs: parent_prctl.no_new_privs, // Inherited (irreversible)
+            timer_slack_ns: parent_prctl.timer_slack_ns, // Inherited
+            keep_caps: false,                        // Reset on fork
+            child_subreaper: false,                  // Not inherited
             #[cfg(target_arch = "x86_64")]
             tsc_mode: parent_prctl.tsc_mode, // Inherited
-            thp_disable: parent_prctl.thp_disable,           // Inherited
+            thp_disable: parent_prctl.thp_disable,   // Inherited
         },
         // Process personality (inherited from parent)
         personality: parent_personality,

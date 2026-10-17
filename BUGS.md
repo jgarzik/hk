@@ -107,6 +107,19 @@ Address spaces are reference counted and torn down like Linux
   across a shootdown would deadlock (doc/LOCKING.md, Cross-CPU Calls);
   none is today, and user tasks still run on CPU 0 only.
 
+## exec ignores set-user-ID / set-group-ID bits and file capabilities
+
+**Location**: `kernel/task/exec.rs` (`do_execve`)
+
+Linux execve of a file with S_ISUID / S_ISGID (on a mount without
+nosuid, without no_new_privs or a ptracer in the way) sets the
+effective (and saved) uid / gid to the file's owner, and file
+capabilities (security.capability) raise the permitted set
+(bprm_fill_uid, cap_bprm_creds_from_file). hk exec keeps the caller's
+credentials unchanged, so set-id programs run unprivileged. Its
+AT_SECURE and dumpability already follow from the credentials
+(`secureexec`), so they stay right once set-id exec exists.
+
 ## No dynamically linked executables
 
 **Location**: `kernel/task/exec.rs` (`do_execve`)
