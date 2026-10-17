@@ -612,160 +612,136 @@ pub fn sys_mlock2(addr: u64, len: u64, flags: i32) -> i64 {
     do_mlock(addr, len, vm_flags)
 }
 
-/// Common implementation for mlock/mlock2
+/// Common implementation for mlock/mlock2 (Linux do_mlock): the range
+/// is widened to whole pages (a length that wraps doing so locks
+/// nothing), checked against RLIMIT_MEMLOCK (ENOMEM; pages already
+/// locked in it do not count again), locked VMA part by VMA part, then
+/// faulted in unless MLOCK_ONFAULT
 fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
-    // Zero length is a no-op (success)
-    if len == 0 {
-        return 0;
-    }
-
-    // Permission check
     if !can_do_mlock() {
         return KernelError::NotPermitted.sysret();
     }
-
-    // Page-align the range
-    let start_aligned = start & !(PAGE_SIZE - 1);
-    let end_unaligned = start.saturating_add(len);
-    let end_aligned = (end_unaligned + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let len_aligned = end_aligned - start_aligned;
-
-    // Get current task's mm
-    let tid = current_tid();
-    let mm = match get_task_mm(tid) {
-        Some(mm) => mm,
-        None => return KernelError::OutOfMemory.sysret(),
+    let (start, len) = lock_range(start, len);
+    let Some(mm) = get_task_mm(current_tid()) else {
+        return KernelError::OutOfMemory.sysret();
     };
-
-    let mut mm_guard = mm.lock();
-
-    // Find all VMAs in range and set VM_LOCKED flag
-    // Following Linux behavior: lock portions that exist, succeed even if
-    // some of the range has no VMA
-
-    // First pass: calculate total pages to add to locked_vm
-    let mut pages_to_add: u64 = 0;
-    for vma in mm_guard.iter() {
-        // Check for overlap
-        if vma.end <= start_aligned || vma.start >= end_aligned {
-            continue; // No overlap
-        }
-
-        // Calculate pages being locked in this VMA
-        let vma_start = vma.start.max(start_aligned);
-        let vma_end = vma.end.min(end_aligned);
-        let pages = (vma_end - vma_start) / PAGE_SIZE;
-
-        // Only count if not already locked
-        if vma.flags & VM_LOCKED == 0 {
-            pages_to_add += pages;
-        }
+    let mut map = mm.lock();
+    let r = if memlock_room(&map, start, len) {
+        mlock_vmas(&mut map, start, len, vm_flags)
+    } else {
+        Err(KernelError::OutOfMemory)
+    };
+    drop(map);
+    if let Err(e) = r {
+        return e.sysret();
     }
-
-    // Check RLIMIT_MEMLOCK before committing (CAP_IPC_LOCK bypasses limit)
-    if !crate::task::capable(crate::task::CAP_IPC_LOCK) {
-        let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK);
-        if limit != crate::rlimit::RLIM_INFINITY {
-            let current_bytes = mm_guard.locked_vm() * PAGE_SIZE;
-            let requested_bytes = pages_to_add * PAGE_SIZE;
-            if current_bytes.saturating_add(requested_bytes) > limit {
-                return KernelError::WouldBlock.sysret();
-            }
-        }
-    }
-
-    // Second pass: update VMA flags now that we've passed the limit check
-    // Collect indices of modified VMAs for merging
-    let mut modified_indices: Vec<usize> = Vec::new();
-    for (idx, vma) in mm_guard.iter_mut().enumerate() {
-        // Check for overlap
-        if vma.end <= start_aligned || vma.start >= end_aligned {
-            continue; // No overlap
-        }
-
-        // Set the lock flags (clear old lock flags first, then set new ones)
-        vma.flags = (vma.flags & !VM_LOCKED_MASK) | vm_flags;
-        modified_indices.push(idx);
-    }
-
-    // Update locked_vm counter after the loop
-    mm_guard.add_locked_vm(pages_to_add);
-
-    // Try to merge modified VMAs with adjacent VMAs (VMA merging optimization)
-    // Process in reverse order to maintain valid indices after removals
-    for &idx in modified_indices.iter().rev() {
-        mm_guard.merge_adjacent(idx);
-    }
-
-    // Release lock before populating (to avoid holding lock during page faults)
-    drop(mm_guard);
-
-    // If not MLOCK_ONFAULT, populate pages now; out of memory is EAGAIN
-    // (Linux __mlock_posix_error_return)
-    if vm_flags & VM_LOCKONFAULT == 0 && !populate_range(start_aligned, len_aligned) {
+    // Out of memory faulting the pages in is EAGAIN (Linux
+    // __mlock_posix_error_return)
+    if vm_flags & VM_LOCKONFAULT == 0 && !populate_range(start, len) {
         return KernelError::WouldBlock.sysret();
     }
-
     0
 }
 
-/// munlock syscall - Unlock pages
-///
-/// Unlocks the pages in the specified address range, allowing them to be
-/// swapped out again (when swap is implemented).
-///
-/// # Arguments
-/// * `addr` - Start address of the memory range
-/// * `len` - Length of the memory range in bytes
+/// [start, start + len) widened to whole pages, as Linux computes it:
+/// the length rounded up after adding the start's offset in its page,
+/// both wrapping
+fn lock_range(start: u64, len: u64) -> (u64, u64) {
+    let len = len.wrapping_add(start & (PAGE_SIZE - 1));
+    let len = len.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    (start & !(PAGE_SIZE - 1), len)
+}
+
+/// Locking `len` more bytes at `start` fits RLIMIT_MEMLOCK (Linux
+/// do_mlock): the whole length counts, less the pages of the range
+/// already locked; CAP_IPC_LOCK has no limit
+fn memlock_room(mm: &super::MmStruct, start: u64, len: u64) -> bool {
+    let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_MEMLOCK) / PAGE_SIZE;
+    let locked = len / PAGE_SIZE + mm.locked_vm();
+    if locked <= limit || crate::task::capable(crate::task::CAP_IPC_LOCK) {
+        return true;
+    }
+    locked - locked_in(mm, start, len) <= limit
+}
+
+/// Pages of [start, start + len) in locked VMAs (Linux
+/// count_mm_mlocked_page_nr)
+fn locked_in(mm: &super::MmStruct, start: u64, len: u64) -> u64 {
+    let end = start.saturating_add(len);
+    mm.iter()
+        .filter(|v| v.is_locked() && v.end > start && v.start < end)
+        .map(|v| (v.end.min(end) - v.start.max(start)) / PAGE_SIZE)
+        .sum()
+}
+
+/// Give the VMAs of [start, start + len) the lock flags `vm_flags`
+/// (VM_LOCKED, VM_LOCKONFAULT or none; Linux apply_vma_lock_flags),
+/// part by part from `start`: a range that wraps is EINVAL, a hole is
+/// ENOMEM, the VMAs before it keeping their new flags
+fn mlock_vmas(
+    mm: &mut super::MmStruct,
+    start: u64,
+    len: u64,
+    vm_flags: u32,
+) -> Result<(), KernelError> {
+    let end = start.wrapping_add(len);
+    if end < start {
+        return Err(KernelError::InvalidArgument);
+    }
+    let mut addr = start;
+    while addr < end {
+        let i = mm.find_vma_index(addr).ok_or(KernelError::OutOfMemory)?;
+        let e = mm.get_vma(i).map_or(end, |v| v.end.min(end));
+        mlock_fixup(mm, i, addr, e, vm_flags);
+        addr = e;
+    }
+    Ok(())
+}
+
+/// [start, end) of the VMA at `idx` takes the lock flags `vm_flags`
+/// (Linux mlock_fixup): split off at the range edges, locked_vm
+/// counted, and merged with its neighbours. No change: no split.
+fn mlock_fixup(mm: &mut super::MmStruct, idx: usize, start: u64, end: u64, vm_flags: u32) {
+    let Some(old) = mm.get_vma(idx).map(|v| v.flags) else {
+        return;
+    };
+    let new = (old & !VM_LOCKED_MASK) | vm_flags;
+    if new == old {
+        return;
+    }
+    mm.split_at(start);
+    mm.split_at(end);
+    let Some(i) = mm.find_vma_exact(start) else {
+        return;
+    };
+    if let Some(v) = mm.get_vma_mut(i) {
+        v.flags = new;
+    }
+    let pages = (end - start) / PAGE_SIZE;
+    match (old & VM_LOCKED != 0, new & VM_LOCKED != 0) {
+        (false, true) => mm.add_locked_vm(pages),
+        (true, false) => mm.sub_locked_vm(pages),
+        _ => {}
+    }
+    mm.merge_adjacent(i);
+}
+
+/// munlock syscall - Unlock pages (Linux munlock): the range as mlock
+/// computes it, unlocked VMA part by VMA part (EINVAL if it wraps,
+/// ENOMEM at a hole)
 ///
 /// # Returns
 /// 0 on success, negative errno on failure
 pub fn sys_munlock(addr: u64, len: u64) -> i64 {
-    // Zero length is a no-op
-    if len == 0 {
+    let (start, len) = lock_range(addr, len);
+    let Some(mm) = get_task_mm(current_tid()) else {
         return 0;
-    }
-
-    // Page-align the range
-    let start_aligned = addr & !(PAGE_SIZE - 1);
-    let end_unaligned = addr.saturating_add(len);
-    let end_aligned = (end_unaligned + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
-    let tid = current_tid();
-    let mm = match get_task_mm(tid) {
-        Some(mm) => mm,
-        None => return 0, // No mm, nothing to unlock
     };
-
-    let mut mm_guard = mm.lock();
-
-    // Accumulate pages to subtract (can't modify locked_vm during iteration)
-    let mut pages_to_subtract: u64 = 0;
-
-    for vma in mm_guard.iter_mut() {
-        // Check for overlap
-        if vma.end <= start_aligned || vma.start >= end_aligned {
-            continue; // No overlap
-        }
-
-        // Calculate pages being unlocked in this VMA
-        let vma_start = vma.start.max(start_aligned);
-        let vma_end = vma.end.min(end_aligned);
-        let pages = (vma_end - vma_start) / PAGE_SIZE;
-
-        // Only decrement if was locked
-        if vma.flags & VM_LOCKED != 0 {
-            pages_to_subtract += pages;
-        }
-
-        // Clear lock flags
-        vma.flags &= !VM_LOCKED_MASK;
+    let r = mlock_vmas(&mut mm.lock(), start, len, 0);
+    match r {
+        Ok(()) => 0,
+        Err(e) => e.sysret(),
     }
-
-    // Update locked_vm counter after iteration
-    mm_guard.sub_locked_vm(pages_to_subtract);
-
-    0
 }
 
 /// mlockall syscall - Lock all current and/or future mappings

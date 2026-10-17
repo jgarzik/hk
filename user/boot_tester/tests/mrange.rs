@@ -26,11 +26,24 @@
 //! - MADV_SHARED: MADV_REMOVE over [shared][private] punches the shared
 //!   page, then fails EINVAL; MADV_FREE is EINVAL on shared memory and
 //!   stops there
+//! - MLOCK_ARGS: mlock/munlock widen the range to whole pages (a length
+//!   that wraps doing so is a no-op), a range that wraps is EINVAL, a
+//!   start past top or in a hole ENOMEM with nothing locked; length 0
+//!   locks nothing, but an unaligned start with length 0 locks its page
+//! - MLOCK_SPLIT: locking or unlocking part of a VMA splits it there
+//!   (maps lines; MADV_COLD is EINVAL exactly on the locked pages), and
+//!   the parts merge again once unlocked; mlock2 MLOCK_ONFAULT too
+//! - MLOCK_HOLES: a range running into a hole locks (unlocks) the VMAs
+//!   before it, then returns ENOMEM
+//! - MLOCK_LIMIT: without CAP_IPC_LOCK, RLIMIT_MEMLOCK counts the pages
+//!   locked: relocking costs nothing, unlocking one page of a locked VMA
+//!   gives back exactly one page (ENOMEM past the limit)
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     sys_close, sys_exit, sys_fork, sys_madvise, sys_mincore, sys_mlock, sys_mmap, sys_mprotect,
-    sys_munlock, sys_munmap, sys_open, sys_read, sys_wait4, MADV_COLD, MADV_DODUMP, MADV_DOFORK,
+    sys_mlock2, sys_munlock, sys_munmap, sys_open, sys_read, sys_setrlimit, sys_wait4, RLimit,
+    MLOCK_ONFAULT, RLIMIT_MEMLOCK, MADV_COLD, MADV_DODUMP, MADV_DOFORK,
     MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED, MADV_FREE, MADV_KEEPONFORK, MADV_NORMAL,
     MADV_PAGEOUT, MADV_RANDOM, MADV_REMOVE, MADV_WILLNEED, MADV_WIPEONFORK, MAP_ANONYMOUS,
     MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, MAP_SHARED, O_RDONLY, PROT_NONE, PROT_READ,
@@ -51,6 +64,10 @@ pub fn run_tests() {
     madv_split();
     madv_locked();
     madv_shared();
+    mlock_args();
+    mlock_split();
+    mlock_holes();
+    mlock_limit();
 }
 
 // ============================================================================
@@ -460,6 +477,171 @@ fn madv_shared_on(s: u64) -> i64 {
     }
     if madv(s + P, P, MADV_FREE as i64) != 0 {
         return 5;
+    }
+    0
+}
+
+// ============================================================================
+// mlock / munlock
+// ============================================================================
+
+/// The page at `p` is locked: MADV_COLD refuses locked memory
+fn locked(p: u64) -> bool {
+    madv(p, P, MADV_COLD as i64) == EINVAL
+}
+
+/// The pages of [a, a + n pages) locked as `want` says, page by page
+fn locks(a: u64, want: &[bool]) -> bool {
+    want.iter().enumerate().all(|(i, &w)| locked(a + i as u64 * P) == w)
+}
+
+fn mlock(a: u64, len: u64, _: i64) -> i64 {
+    sys_mlock(a, len)
+}
+
+fn munlock(a: u64, len: u64, _: i64) -> i64 {
+    sys_munlock(a, len)
+}
+
+fn mlock_args() {
+    const NAME: &[u8] = b"MLOCK_ARGS";
+    let Some(a) = area(4) else {
+        return report(NAME, -1);
+    };
+    let t = top();
+    let hi = t + (1 << 28);
+    let cases = [
+        (a, 0, 0, 0),
+        (a, u64::MAX, 0, 0),
+        (a + 1, u64::MAX, 0, 0),
+        (a, u64::MAX - 2 * P, 0, EINVAL),
+        (a, LAST - a + P, 0, EINVAL),
+        (LAST, P, 0, EINVAL),
+        (t, P, 0, ENOMEM),
+        (hi, P, 0, ENOMEM),
+        (t - P, 2 * P, 0, ENOMEM),
+        (a - P, 2 * P, 0, ENOMEM),
+        (a - P, P, 0, ENOMEM),
+    ];
+    let mut code = table(NAME, &cases, mlock);
+    if code == 0 && (!locks(a, &[false; 4]) || vmas(a, a + 4 * P) != 1) {
+        code = 100;
+    }
+    if code == 0 {
+        code = table(NAME, &cases, munlock);
+    }
+    // An unaligned start with length 0 still covers its page
+    if code == 0 && (sys_mlock(a + 1, 0) != 0 || !locks(a, &[true, false, false, false])) {
+        code = 101;
+    }
+    if code == 0 && (sys_munlock(a + 2, 0) != 0 || !locks(a, &[false; 4]) || vmas(a, a + 4 * P) != 1) {
+        code = 102;
+    }
+    sys_munmap(a, 4 * P);
+    report(NAME, code);
+}
+
+fn mlock_split() {
+    const NAME: &[u8] = b"MLOCK_SPLIT";
+    let Some(a) = area(4) else {
+        return report(NAME, -1);
+    };
+    let code = mlock_split_on(a);
+    sys_munmap(a, 4 * P);
+    report(NAME, code);
+}
+
+fn mlock_split_on(a: u64) -> i64 {
+    let lines = || vmas(a, a + 4 * P);
+    if sys_mlock(a + P, 2 * P) != 0 || lines() != 3 || !locks(a, &[false, true, true, false]) {
+        return 1;
+    }
+    if sys_munlock(a + P, P) != 0 || lines() != 3 || !locks(a, &[false, false, true, false]) {
+        return 2;
+    }
+    if sys_mlock2(a, P, MLOCK_ONFAULT) != 0 || lines() != 4 || !locks(a, &[true, false, true, false]) {
+        return 3;
+    }
+    if sys_mlock(a + 2 * P + 8, 2 * P - 8) != 0 || lines() != 3 || !locks(a, &[true, false, true, true]) {
+        return 4;
+    }
+    if sys_munlock(a, 4 * P) != 0 || lines() != 1 || !locks(a, &[false; 4]) {
+        return 5;
+    }
+    if !intact(a, 4 * P) {
+        return 6;
+    }
+    0
+}
+
+fn mlock_holes() {
+    const NAME: &[u8] = b"MLOCK_HOLES";
+    let Some(a) = area(4) else {
+        return report(NAME, -1);
+    };
+    let Some(b) = area(5) else {
+        sys_munmap(a, 4 * P);
+        return report(NAME, -1);
+    };
+    sys_munmap(b + 2 * P, P);
+    let code = mlock_holes_on(a, b);
+    sys_munmap(a, 4 * P);
+    sys_munmap(b, 5 * P);
+    report(NAME, code);
+}
+
+/// `a`: four pages, one VMA; `b`: [b, b + 2P) hole [b + 3P, b + 5P)
+fn mlock_holes_on(a: u64, b: u64) -> i64 {
+    if sys_mlock(a, 5 * P) != ENOMEM || !locks(a, &[true; 4]) || vmas(a, a + 4 * P) != 1 {
+        return 1;
+    }
+    if sys_munlock(a, 5 * P) != ENOMEM || !locks(a, &[false; 4]) {
+        return 2;
+    }
+    let both = [true, true, false, false];
+    if sys_mlock(b, 5 * P) != ENOMEM || !locks(b, &both) || !locks(b + 3 * P, &[false; 2]) {
+        return 3;
+    }
+    if sys_munlock(b, 5 * P) != ENOMEM || !locks(b, &[false; 2]) {
+        return 4;
+    }
+    if sys_mlock(b + P, 3 * P) != ENOMEM || !locks(b, &[false, true]) || !locks(b + 3 * P, &[false; 2]) {
+        return 5;
+    }
+    if vmas(b, b + 5 * P) != 3 {
+        return 6;
+    }
+    0
+}
+
+fn mlock_limit() {
+    const NAME: &[u8] = b"MLOCK_LIMIT";
+    let code = child(&|| mlock_limit_child() == 0);
+    report(NAME, code);
+}
+
+/// In a child: no capabilities, RLIMIT_MEMLOCK four pages
+fn mlock_limit_child() -> i64 {
+    let (Some(a), Some(b), Some(c)) = (area(4), area(1), area(3)) else {
+        return 1;
+    };
+    let lim = RLimit { rlim_cur: 4 * P, rlim_max: 4 * P };
+    if !super::netlink::drop_caps() || sys_setrlimit(RLIMIT_MEMLOCK, &lim) != 0 {
+        return 2;
+    }
+    if sys_mlock(a, 4 * P) != 0 || sys_mlock(a, 4 * P) != 0 {
+        return 3;
+    }
+    if sys_mlock(b, P) != ENOMEM || locked(b) {
+        return 4;
+    }
+    // One page of the four given back: exactly one more fits
+    if sys_munlock(a + P, P) != 0 || sys_mlock(b, P) != 0 || sys_mlock(a + P, P) != ENOMEM {
+        return 5;
+    }
+    sys_munmap(a, 4 * P);
+    if sys_mlock(c, 3 * P) != 0 || sys_mlock(b, P) != 0 || sys_mlock(a, P) >= 0 {
+        return 6;
     }
     0
 }
