@@ -465,14 +465,18 @@ fn decode_vfat_file_id(file_id: FileId) -> Option<(u8, u8, u32)> {
 // Block Device I/O
 // ============================================================================
 
-/// Fill a new block device page cache frame from the device
+/// Fill a new block device page cache frame from the device; on a read
+/// error the page is dropped from the cache, not left there as data
 fn read_frame(bdev: &BlockDevice, page_offset: u64, frame: u64) -> Result<(), KernelError> {
-    bdev_rw_frame(
-        bdev,
-        BioOp::Read,
-        page_offset * (PAGE_SIZE as u64 / 512),
-        frame,
-    )
+    let sector = page_offset * (PAGE_SIZE as u64 / 512);
+    let r = bdev_rw_frame(bdev, BioOp::Read, sector, frame);
+    if r.is_err() {
+        let id = FileId::from_blkdev(bdev.dev_id().major, bdev.dev_id().minor);
+        PAGE_CACHE
+            .lock()
+            .discard_page(id, page_offset, &mut FrameAllocRef(&FRAME_ALLOCATOR));
+    }
+    r
 }
 
 /// Read bytes from block device via page cache

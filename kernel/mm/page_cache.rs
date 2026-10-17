@@ -900,6 +900,31 @@ impl PageCache {
             .clone()
     }
 
+    /// Drop page `page_offset` of `file_id` after its read from the
+    /// device failed, so it is never served as data (Linux leaves such a
+    /// folio !uptodate). Only if nobody else holds it; otherwise it stays
+    /// zero-filled (new pages are zeroed).
+    pub fn discard_page<FA: FrameAlloc<PhysAddr = u64>>(
+        &mut self,
+        file_id: FileId,
+        page_offset: u64,
+        frame_alloc: &mut FA,
+    ) {
+        let Some(space) = self.address_spaces.get(&file_id) else {
+            return;
+        };
+        let Some(page) = space.find_page(page_offset) else {
+            return;
+        };
+        if space.is_unevictable() || !page.try_claim_for_eviction() {
+            return;
+        }
+        space.remove_page(page_offset);
+        self.fifo_queue.retain(|e| !Arc::ptr_eq(&e.page, &page));
+        frame_alloc.free_frame(page.frame);
+        self.current_pages.fetch_sub(1, Ordering::Relaxed);
+    }
+
     /// Look up a page in the cache (increments refcount if found)
     pub fn find_get_page(&self, file_id: FileId, page_offset: u64) -> Option<Arc<CachedPage>> {
         let addr_space = self.address_spaces.get(&file_id)?;
