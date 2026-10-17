@@ -36,6 +36,7 @@ pub mod stat;
 // Filesystem implementations
 pub mod cgroupfs;
 pub mod cpio;
+mod proc_array;
 pub mod procfs;
 pub mod ramfs;
 pub mod vfat;

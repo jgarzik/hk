@@ -18,7 +18,7 @@ type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
 use super::percpu;
 use crate::elf::ElfExecutable;
 use crate::fs::{File, kernel_open_exec};
-use crate::mm::{ELF_ET_DYN_BASE, STACK_TOP};
+use crate::mm::{ELF_ET_DYN_BASE, MmLayout, STACK_TOP};
 
 /// Page size constant
 const PAGE_SIZE: u64 = 4096;
@@ -178,14 +178,15 @@ fn auxv(info: &ExecInfo, random: u64, execfn: u64, platform: u64) -> [(u64, u64)
 /// the auxiliary vector, envp, argv and argc at the 16-byte aligned
 /// initial stack pointer.
 ///
-/// Returns (initial SP, lowest mapped stack address).
+/// Returns (where argv, envp and the SP went, lowest mapped stack
+/// address).
 fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
     page_table: &mut ArchPageTable,
     frame_alloc: &mut FA,
     argv: &[Vec<u8>],
     envp: &[Vec<u8>],
     info: &ExecInfo,
-) -> Result<(u64, u64), i32> {
+) -> Result<(MmLayout, u64), i32> {
     // Calculate stack pages based on RLIMIT_STACK
     let stack_limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_STACK);
     let stack_pages = if stack_limit == crate::rlimit::RLIM_INFINITY {
@@ -224,16 +225,20 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
         top: STACK_TOP - 8, // NULL end marker (Linux)
     };
     let execfn = w.push_str(info.execfn)?;
+    // argv then envp strings, back to back (Linux arg_start..env_end)
+    let env_end = w.top;
     let mut envp_addrs = Vec::with_capacity(envp.len());
     for e in envp.iter().rev() {
         envp_addrs.push(w.push_str(e)?);
     }
     envp_addrs.reverse();
+    let env_start = w.top;
     let mut argv_addrs = Vec::with_capacity(argv.len());
     for a in argv.iter().rev() {
         argv_addrs.push(w.push_str(a)?);
     }
     argv_addrs.reverse();
+    let arg_start = w.top;
     let platform = w.push_str(crate::arch::ELF_PLATFORM)?;
     let mut rnd = [0u8; 16];
     let _ = crate::random::get_random_bytes(&mut rnd, 0);
@@ -265,7 +270,15 @@ fn setup_user_stack<FA: FrameAlloc<PhysAddr = u64>>(
         va += PAGE_SIZE;
     }
 
-    Ok((sp, stack_bottom))
+    let area = MmLayout {
+        arg_start,
+        arg_end: env_start,
+        env_start,
+        env_end,
+        start_stack: sp,
+        ..MmLayout::default()
+    };
+    Ok((area, stack_bottom))
 }
 
 /// Every PT_LOAD segment and the entry point must land in mappable
@@ -300,6 +313,37 @@ fn check_segments(elf: &ElfExecutable, base: u64) -> Result<(), i32> {
         return Err(ENOMEM);
     }
     Ok(())
+}
+
+/// Code and data bounds of an image loaded `base` higher (Linux
+/// load_elf_binary): code spans the executable segments' file bytes;
+/// data runs from the highest segment start to the highest file end
+pub fn image_layout(elf: &ElfExecutable, base: u64) -> MmLayout {
+    let mut l = MmLayout {
+        start_code: u64::MAX,
+        ..MmLayout::default()
+    };
+    for seg in &elf.segments {
+        let end = seg.vaddr + seg.file_size as u64;
+        if seg.flags.execute {
+            l.start_code = l.start_code.min(seg.vaddr);
+            l.end_code = l.end_code.max(end);
+        }
+        l.start_data = l.start_data.max(seg.vaddr);
+        l.end_data = l.end_data.max(end);
+    }
+    if l.start_code == u64::MAX {
+        l.start_code = 0;
+    }
+    for x in [
+        &mut l.start_code,
+        &mut l.end_code,
+        &mut l.start_data,
+        &mut l.end_data,
+    ] {
+        *x += base;
+    }
+    l
 }
 
 /// VMAs of a freshly loaded image: one private anonymous VMA per
@@ -661,11 +705,12 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         phnum: elf.phnum,
         execfn: pathname,
     };
-    let (user_sp, stack_bottom) =
+    let (args, stack_bottom) =
         match setup_user_stack(&mut new_page_table, frame_alloc, &argv, &envp, &info) {
             Ok(r) => r,
             Err(e) => return -e,
         };
+    let user_sp = args.start_stack;
 
     if let Err(e) = exec_identity(percpu::current_tid(), pathname, &file) {
         return -e;
@@ -692,6 +737,14 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         let mut m = mm.lock();
         m.set_brk(start_brk);
         m.set_exe(file.dentry.full_path());
+        let code = image_layout(&elf, base_addr);
+        m.set_args(MmLayout {
+            start_code: code.start_code,
+            end_code: code.end_code,
+            start_data: code.start_data,
+            end_data: code.end_data,
+            ..args
+        });
         for vma in image_vmas(mm.arc(), &elf, base_addr, stack_bottom) {
             m.insert_vma(vma);
         }

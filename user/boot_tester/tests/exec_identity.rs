@@ -68,8 +68,8 @@ fn copy(from: &[u8], to: &[u8], mode: u32) -> bool {
 }
 
 /// As uid 1000, run `prog` in a child (a descendant, so Linux's Yama
-/// allows the attach), then read its maps and attach to it: exit 0 if
-/// both work, 1 if both are refused, else 2
+/// allows the attach), then open its maps and environ and attach to it:
+/// exit 0 if all work, 1 if all are refused, else 2
 fn probe_exec(prog: &'static [u8]) -> ! {
     static mut PROG: &[u8] = b"";
     unsafe { PROG = prog };
@@ -91,11 +91,15 @@ fn probe_exec(prog: &'static [u8]) -> ! {
     }
     let mut b = [0u8; 1];
     let r = sys_read(p[0] as u64, b.as_mut_ptr(), 1);
-    let path = proc_path(pid, b"maps");
-    let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
-    if fd >= 0 {
-        sys_close(fd as u64);
-    }
+    let opens = |what: &[u8]| {
+        let fd = sys_open(proc_path(pid, what).as_ptr(), O_RDONLY, 0);
+        if fd >= 0 {
+            sys_close(fd as u64);
+        }
+        fd >= 0
+    };
+    let maps = opens(b"maps");
+    let environ = opens(b"environ");
     let at = sys_ptrace(PTRACE_ATTACH, pid, 0, 0);
     if at == 0 {
         sys_ptrace(PTRACE_DETACH, pid, 0, 0);
@@ -103,9 +107,9 @@ fn probe_exec(prog: &'static [u8]) -> ! {
     sys_kill(pid, SIGKILL);
     let mut st = 0;
     sys_wait4(pid, &mut st, 0, 0);
-    let code = match (r == 1, fd >= 0, at == 0) {
-        (true, true, true) => 0,
-        (true, false, false) => 1,
+    let code = match (r == 1, maps, environ, at == 0) {
+        (true, true, true, true) => 0,
+        (true, false, false, false) => 1,
         _ => 2,
     };
     sys_exit(code);

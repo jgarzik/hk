@@ -146,6 +146,40 @@ pub fn resident(pgd: u64, addr: u64) -> bool {
     }
 }
 
+/// (resident, swapped) 4KB pages of [start, end), mm lock held (Linux
+/// MM_*PAGES and MM_SWAPENTS, counted from the tables): a 2MB page
+/// counts its part inside; a 1GB range without tables is skipped whole
+pub fn count_ptes(pgd: u64, start: u64, end: u64) -> (u64, u64) {
+    const GB: u64 = 1 << 30;
+    let (mut rss, mut swap) = (0, 0);
+    let mut addr = start;
+    while addr < end {
+        let Some(pmd) = paging::pmd_ptr(pgd, addr) else {
+            addr = ((addr | (GB - 1)) + 1).min(end);
+            continue;
+        };
+        let next = ((addr | (HUGE_PAGE_SIZE - 1)) + 1).min(end);
+        let e = entry(pmd).load(Ordering::Acquire);
+        if paging::pmd_huge(e) {
+            rss += (next - addr) / PAGE_SIZE;
+        } else if e != 0 {
+            for a in (addr..next).step_by(PAGE_SIZE as usize) {
+                let Some(p) = paging::pte_ptr(pgd, a) else {
+                    continue;
+                };
+                let pte = entry(p).load(Ordering::Acquire);
+                if paging::pte_present(pte) {
+                    rss += 1;
+                } else if SwapEntry::is_swap_pte(pte) {
+                    swap += 1;
+                }
+            }
+        }
+        addr = next;
+    }
+    (rss, swap)
+}
+
 /// Clear the 4KB entry for `addr`; what it held goes to `tlb`
 fn zap_pte(tlb: &mut Gather, addr: u64) {
     let Some(p) = paging::pte_ptr(tlb.mm().pgd(), addr) else {

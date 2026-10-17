@@ -363,6 +363,13 @@ impl InodeOps for ProcfsInodeOps {
         {
             return Err(KernelError::PermissionDenied);
         }
+        // The owner follows the task's identity and dumpability (Linux
+        // pid_revalidate -> pid_update_inode)
+        if let Some(pid) = pid_file_pid(inode) {
+            let (uid, gid) = dump_owner(pid);
+            inode.set_uid(uid);
+            inode.set_gid(gid);
+        }
         let Some(ctl) = sysctl_of(inode) else {
             return crate::fs::dac::generic_permission(cred, inode, mask);
         };
@@ -598,13 +605,14 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
             Ok(inode)
         }
         name if pid_file(name).is_some() => {
-            let (off, generator) = pid_file(name).ok_or(KernelError::NotFound)?;
+            let (off, mode, generator) = pid_file(name).ok_or(KernelError::NotFound)?;
             let sb = dir.superblock().ok_or(KernelError::Io)?;
+            let (uid, gid) = dump_owner(pid);
             let inode = Arc::new(Inode::new(
                 pid_ino(pid, off),
-                InodeMode::regular(0o444), // r--r--r--
-                0,
-                0,
+                InodeMode::regular(mode),
+                uid,
+                gid,
                 0,
                 current_time(),
                 Arc::downgrade(&sb),
@@ -899,7 +907,7 @@ pub enum PidGen {
     /// Private content of the address space: open needs ptrace-read
     /// access and pins the mm it reads from (Linux proc_mem_open: an
     /// mm_count reference)
-    Mm(fn(&crate::mm::MmStruct) -> Vec<u8>),
+    Mm(fn(&crate::mm::Mm, &crate::mm::MmStruct) -> Vec<u8>),
 }
 
 /// The address space a /proc/<pid>/ file reads, if the caller may
@@ -950,22 +958,70 @@ fn pid_content(file: Option<&File>, pid: Pid, g: PidGen) -> Result<Vec<u8>, Kern
             let Some(m) = users else {
                 return Ok(Vec::new());
             };
-            let out = f(&m.lock());
+            let out = f(&m, &m.lock());
             Ok(out)
         }
     }
 }
 
-const PID_FILES: &[(&str, u64, PidGen)] = &[
-    ("cgroup", 102, PidGen::Pub(gen_cgroup_content)),
-    ("maps", 103, PidGen::Mm(gen_maps)),
+/// Generated files in /proc/<pid>/: name, inode offset, mode (Linux
+/// fs/proc/base.c tgid_base_stuff), generator
+const PID_FILES: &[(&str, u64, u16, PidGen)] = &[
+    ("cgroup", 102, 0o444, PidGen::Pub(gen_cgroup_content)),
+    ("maps", 103, 0o444, PidGen::Mm(gen_maps)),
+    (
+        "status",
+        105,
+        0o444,
+        PidGen::Pub(super::proc_array::gen_status),
+    ),
+    ("stat", 106, 0o444, PidGen::Pub(super::proc_array::gen_stat)),
+    (
+        "cmdline",
+        107,
+        0o444,
+        PidGen::Pub(super::proc_array::gen_cmdline),
+    ),
+    (
+        "environ",
+        108,
+        0o400,
+        PidGen::Mm(super::proc_array::gen_environ),
+    ),
 ];
 
-fn pid_file(name: &str) -> Option<(u64, PidGen)> {
+fn pid_file(name: &str) -> Option<(u64, u16, PidGen)> {
     PID_FILES
         .iter()
-        .find(|(n, _, _)| *n == name)
-        .map(|&(_, off, g)| (off, g))
+        .find(|(n, _, _, _)| *n == name)
+        .map(|&(_, off, mode, g)| (off, mode, g))
+}
+
+/// Owner of a /proc/<pid>/ file (Linux task_dump_owner): the task's
+/// euid/egid while it is dumpable, else root, so a non-dumpable task's
+/// mode-0400 files are root's
+fn dump_owner(pid: Pid) -> (u32, u32) {
+    use crate::task::percpu::TASK_TABLE;
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .find(|t| t.tgid == pid)
+        .filter(|t| t.prctl.dumpable == crate::task::dumpable::SUID_DUMP_USER)
+        .map_or((0, 0), |t| (t.cred.euid, t.cred.egid))
+}
+
+/// The process a per-process file belongs to
+fn pid_file_pid(inode: &Inode) -> Option<Pid> {
+    let private = inode.get_private()?;
+    let wrapper = private
+        .as_ref()
+        .as_any()
+        .downcast_ref::<ProcfsInodeWrapper>()?;
+    match &*wrapper.0.read() {
+        ProcfsInodeData::PidFile { pid, .. } => Some(*pid),
+        _ => None,
+    }
 }
 
 /// /proc/<pid>/exe: the executable's path (ENOENT for kernel threads,
@@ -977,7 +1033,7 @@ fn exe_link(pid: Pid) -> Result<String, KernelError> {
 }
 
 /// /proc/<pid>/maps: one line per VMA (Linux show_map_vma)
-fn gen_maps(mm: &crate::mm::MmStruct) -> Vec<u8> {
+fn gen_maps(_: &crate::mm::Mm, mm: &crate::mm::MmStruct) -> Vec<u8> {
     use crate::mm::{PROT_EXEC, PROT_READ, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
     use alloc::fmt::Write;
     let mut out = String::new();
@@ -1390,7 +1446,7 @@ fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), Kernel
     }) {
         return Ok(());
     }
-    for (name, off, _) in PID_FILES {
+    for (name, off, _, _) in PID_FILES {
         let more = ctx.emit(DirEntry {
             ino: pid_ino(pid, *off),
             file_type: FileType::Regular,

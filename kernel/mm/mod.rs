@@ -137,6 +137,25 @@ pub struct MmStruct {
     def_flags: u32,
     /// Path of the executable (Linux mm->exe_file), for /proc/<pid>/exe
     exe: Option<alloc::string::String>,
+    /// Where exec put the image, arguments and environment
+    args: MmLayout,
+}
+
+/// Where exec put the image and the initial stack (Linux mm->start_code
+/// .. env_end, start_stack): /proc/<pid>/cmdline, environ, stat and
+/// status read it
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MmLayout {
+    pub start_code: u64,
+    pub end_code: u64,
+    pub start_data: u64,
+    pub end_data: u64,
+    pub arg_start: u64,
+    pub arg_end: u64,
+    pub env_start: u64,
+    pub env_end: u64,
+    /// Initial stack pointer (argc)
+    pub start_stack: u64,
 }
 
 impl MmStruct {
@@ -151,7 +170,18 @@ impl MmStruct {
             total_vm: 0,
             def_flags: 0,
             exe: None,
+            args: MmLayout::default(),
         }
+    }
+
+    /// Layout of the image, its arguments and environment
+    pub fn args(&self) -> MmLayout {
+        self.args
+    }
+
+    /// Record them at exec
+    pub fn set_args(&mut self, a: MmLayout) {
+        self.args = a;
     }
 
     /// Executable path (/proc/<pid>/exe)
@@ -771,6 +801,7 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
         map.brk = guard.brk;
         map.total_vm = guard.total_vm;
         map.exe = guard.exe.clone();
+        map.args = guard.args;
         for vma in guard.iter() {
             if vma.flags & VM_DONTCOPY != 0 {
                 map.total_vm -= vma.size() / PAGE_SIZE;

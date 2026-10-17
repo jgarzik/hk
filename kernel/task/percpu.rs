@@ -837,8 +837,12 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         signal_state: crate::signal::TaskSignalState::new(),
         tif_sigpending: core::sync::atomic::AtomicBool::new(false),
         robust_list: 0,
-        // prctl state
-        prctl: crate::task::PrctlState::default(),
+        // prctl state; comm after the init binary, /bin/init (Linux
+        // names init after the file it execs)
+        prctl: crate::task::PrctlState {
+            name: *b"init\0\0\0\0\0\0\0\0\0\0\0\0",
+            ..crate::task::PrctlState::default()
+        },
         // Process personality (execution domain)
         personality: 0,
         // NUMA memory policy (user processes start with default)
@@ -1765,7 +1769,8 @@ pub fn exit_current(status: Option<i32>) -> ! {
     rq.dead.push(dead);
 
     let next_tid = rq.dequeue_next();
-    let (next_kstack, next_mm, next_task) = switch_info(next_tid);
+    // The exiting task is a zombie already (never marked)
+    let (next_kstack, next_mm, next_task) = switch_info(0, false, next_tid);
 
     // Get next task's context
     let next_ctx = match rq.get_context(next_tid) {
@@ -1803,8 +1808,31 @@ pub fn exit_current(status: Option<i32>) -> ! {
 /// The address space stays alive until the switch: `tid` is not running
 /// (it is on this run queue, which the caller holds), so it cannot drop
 /// its reference (exit, exec) meanwhile.
-fn switch_info(tid: Tid) -> (u64, *const crate::mm::Mm, CurrentTask) {
-    let table = TASK_TABLE.lock();
+///
+/// It also records, for /proc, that `cur` stops running (sleeping if
+/// `cur_sleeps`, else runnable) and `tid` runs: the sleep state itself
+/// lives in the run queue, which no other CPU may lock.
+fn switch_info(cur: Tid, cur_sleeps: bool, tid: Tid) -> (u64, *const crate::mm::Mm, CurrentTask) {
+    let mut table = TASK_TABLE.lock();
+    let mark = |t: &mut KernelTask, s: TaskState| {
+        if matches!(
+            t.state,
+            TaskState::Ready | TaskState::Running | TaskState::Sleeping
+        ) {
+            t.state = s;
+        }
+    };
+    let out = if cur_sleeps {
+        TaskState::Sleeping
+    } else {
+        TaskState::Ready
+    };
+    if let Some(t) = table.tasks.iter_mut().find(|t| t.tid == cur) {
+        mark(t, out);
+    }
+    if let Some(t) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        mark(t, TaskState::Running);
+    }
     table
         .tasks
         .iter()
@@ -1862,7 +1890,10 @@ fn context_switch_locked(
     cur: Tid,
     next: Tid,
 ) {
-    let (next_kstack, next_mm, next_task) = switch_info(next);
+    let cur_sleeps = rq
+        .entry_mut(cur)
+        .is_some_and(|e| e.state != SleepState::Running);
+    let (next_kstack, next_mm, next_task) = switch_info(cur, cur_sleeps, next);
     let (Some(curr_ctx), Some(next_ctx)) = (rq.get_context_mut(cur), rq.get_context(next)) else {
         return;
     };
@@ -3108,7 +3139,8 @@ pub fn try_schedule() {
     let mut rq = sched.lock.lock();
     sched.drain_wakes(&mut rq);
     let next = rq.dequeue_next();
-    let (next_kstack, next_mm, next_task) = switch_info(next);
+    // No current task: tid 0 is never in TASK_TABLE
+    let (next_kstack, next_mm, next_task) = switch_info(0, false, next);
     let Some(next_ctx) = rq.get_context(next) else {
         return;
     };
