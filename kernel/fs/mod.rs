@@ -229,3 +229,38 @@ pub fn unlock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) {
         }
     }
 }
+
+/// The non-directories of `a` and `b`, each once, lowest address first
+/// (Linux lock_two_nondirectories order)
+fn nondirs<'a>(
+    a: Option<&'a Arc<Inode>>,
+    b: Option<&'a Arc<Inode>>,
+) -> [Option<&'a Arc<Inode>>; 2] {
+    let nd = |i: Option<&'a Arc<Inode>>| i.filter(|i| !i.mode().is_dir());
+    let (a, b) = (nd(a), nd(b));
+    match (a, b) {
+        (Some(x), Some(y)) if Arc::ptr_eq(x, y) => [Some(x), None],
+        (Some(x), Some(y)) if Arc::as_ptr(y) < Arc::as_ptr(x) => [Some(y), Some(x)],
+        _ => [a, b],
+    }
+}
+
+/// Lock the inodes whose link count a rename changes, inside the parents'
+/// locks (Linux vfs_rename -> lock_two_nondirectories): the non-directory
+/// source and target, by address. Directories are skipped: they have no
+/// hard links to race with.
+pub fn lock_two_nondirs(a: Option<&Arc<Inode>>, b: Option<&Arc<Inode>>) {
+    for i in nondirs(a, b).into_iter().flatten() {
+        i.inode_lock();
+    }
+}
+
+/// Release lock_two_nondirs()
+///
+/// # Safety
+/// Must pair with lock_two_nondirs() on the same inodes by this thread.
+pub unsafe fn unlock_two_nondirs(a: Option<&Arc<Inode>>, b: Option<&Arc<Inode>>) {
+    for i in nondirs(a, b).into_iter().flatten().rev() {
+        unsafe { i.inode_unlock() };
+    }
+}

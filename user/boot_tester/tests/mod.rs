@@ -40,6 +40,7 @@ pub mod ipc;
 pub mod kcmp;
 pub mod keys;
 pub mod layout;
+pub mod linkat;
 pub mod mempolicy;
 pub mod mm_life;
 pub mod mm_oom;
@@ -133,6 +134,7 @@ pub fn run_all_tests() {
     bigio::run_tests();
     fs_ops::run_tests();
     rename2::run_tests();
+    linkat::run_tests();
     permissions::run_tests();
     dac::run_tests();
     sync::run_tests();

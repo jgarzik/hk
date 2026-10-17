@@ -97,7 +97,7 @@
 - [x] mkdirat
 - [x] rmdir (x86-64 only, legacy; use unlinkat with AT_REMOVEDIR)
 - [x] link (x86-64 only, legacy; use linkat)
-- [x] linkat
+- [x] linkat (AT_SYMLINK_FOLLOW; AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH)
 - [x] unlink (x86-64 only, legacy; use unlinkat)
 - [x] unlinkat
 - [x] rename (x86-64 only, legacy; use renameat2)

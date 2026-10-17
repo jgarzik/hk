@@ -9,7 +9,7 @@ use crate::arch::Uaccess;
 use crate::fs::path::{create_entry, delete_entry};
 use crate::fs::{
     Dentry, Inode, KernelError, LookupFlags, MAY_WRITE, Path, dac, is_subdir, lock_rename,
-    lookup_one, lookup_path_at, unlock_rename,
+    lock_two_nondirs, lookup_one, lookup_path_at, unlock_rename, unlock_two_nondirs,
 };
 use crate::uaccess::{UaccessArch, copy_to_user, strncpy_from_user};
 
@@ -190,6 +190,67 @@ pub fn sys_link(oldpath_ptr: u64, newpath_ptr: u64) -> i64 {
     sys_linkat(AT_FDCWD, oldpath_ptr, AT_FDCWD, newpath_ptr, 0)
 }
 
+/// vfs_link's part under the source inode's lock, itself inside the new
+/// parent's: an inode with no links left is not linked again (ENOENT),
+/// and no unlink can drop its last link between that check and the link
+/// (Linux vfs_link: inode_lock(inode), i_nlink == 0 -> ENOENT)
+fn link_locked(dir: &Arc<Inode>, name: &str, inode: &Arc<Inode>) -> Result<(), KernelError> {
+    inode.inode_lock();
+    let r = if inode.get_nlink() == 0 {
+        Err(KernelError::NotFound)
+    } else {
+        dir.i_op.link(dir, name, inode)
+    };
+    unsafe { inode.inode_unlock() };
+    r
+}
+
+/// linkat flags
+const AT_SYMLINK_FOLLOW: i32 = 0x400;
+const AT_EMPTY_PATH: i32 = 0x1000;
+
+/// The dentry linkat links to (Linux filename_linkat lookup): an empty
+/// path with AT_EMPTY_PATH names `dirfd` itself, which takes
+/// CAP_DAC_READ_SEARCH (else ENOENT), so a descriptor passed to an
+/// unprivileged process cannot be linked back into the tree; the final
+/// symlink is followed only with AT_SYMLINK_FOLLOW
+fn link_source(dirfd: i32, path_ptr: u64, flags: i32) -> Result<Arc<Dentry>, KernelError> {
+    let path =
+        strncpy_from_user::<Uaccess>(path_ptr, PATH_MAX).map_err(|_| KernelError::BadAddress)?;
+    if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 || !crate::task::capable(crate::task::CAP_DAC_READ_SEARCH) {
+            return Err(KernelError::NotFound);
+        }
+        if dirfd == AT_FDCWD {
+            return crate::task::percpu::current_cwd()
+                .map(|p| p.dentry.clone())
+                .ok_or(KernelError::NotFound);
+        }
+        let file = current_fd_table()
+            .lock()
+            .get(dirfd)
+            .ok_or(KernelError::BadFd)?;
+        return Ok(file.dentry.clone());
+    }
+    let start: Option<Path> = if path.starts_with('/') {
+        None
+    } else if dirfd == AT_FDCWD {
+        crate::task::percpu::current_cwd()
+    } else {
+        let file = current_fd_table()
+            .lock()
+            .get(dirfd)
+            .ok_or(KernelError::BadFd)?;
+        if !file.is_dir() {
+            return Err(KernelError::NotDirectory);
+        }
+        Path::from_dentry(file.dentry.clone())
+    };
+    let mut lf = LookupFlags::open();
+    lf.follow = flags & AT_SYMLINK_FOLLOW != 0;
+    lookup_path_at(start, &path, lf)
+}
+
 /// sys_linkat - create a hard link relative to directory fds
 ///
 /// # Arguments
@@ -197,7 +258,8 @@ pub fn sys_link(oldpath_ptr: u64, newpath_ptr: u64) -> i64 {
 /// * `oldpath_ptr` - User pointer to existing path
 /// * `newdirfd` - Directory fd for newpath, or AT_FDCWD
 /// * `newpath_ptr` - User pointer to new path
-/// * `flags` - AT_SYMLINK_FOLLOW to follow symlinks in oldpath
+/// * `flags` - AT_SYMLINK_FOLLOW to follow a final symlink in oldpath,
+///   AT_EMPTY_PATH to link `olddirfd` itself
 ///
 /// # Returns
 /// 0 on success, negative errno on error
@@ -208,48 +270,20 @@ pub fn sys_linkat(
     newpath_ptr: u64,
     flags: i32,
 ) -> i64 {
-    // Read oldpath from user space
-    let oldpath = match strncpy_from_user::<Uaccess>(oldpath_ptr, PATH_MAX) {
-        Ok(p) => p,
-        Err(_) => return KernelError::BadAddress.sysret(),
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return KernelError::InvalidArgument.sysret();
+    }
+    let old_dentry = match link_source(olddirfd, oldpath_ptr, flags) {
+        Ok(d) => d,
+        Err(e) => return e.sysret(),
     };
-
-    // Read newpath from user space
     let newpath = match strncpy_from_user::<Uaccess>(newpath_ptr, PATH_MAX) {
         Ok(p) => p,
         Err(_) => return KernelError::BadAddress.sysret(),
     };
-
-    if oldpath.is_empty() || newpath.is_empty() {
+    if newpath.is_empty() {
         return KernelError::NotFound.sysret();
     }
-
-    // AT_SYMLINK_FOLLOW (0x400) means follow symlinks in oldpath
-    let follow = flags & 0x400 != 0;
-
-    // Look up the target file
-    let old_start: Option<Path> = if oldpath.starts_with('/') {
-        None
-    } else if olddirfd == AT_FDCWD {
-        crate::task::percpu::current_cwd()
-    } else {
-        let file = match current_fd_table().lock().get(olddirfd) {
-            Some(f) => f,
-            None => return KernelError::BadFd.sysret(),
-        };
-        if !file.is_dir() {
-            return KernelError::NotDirectory.sysret();
-        }
-        Path::from_dentry(file.dentry.clone())
-    };
-
-    let mut lookup_flags = LookupFlags::open();
-    lookup_flags.follow = follow;
-
-    let old_dentry = match lookup_path_at(old_start, &oldpath, lookup_flags) {
-        Ok(d) => d,
-        Err(e) => return e.sysret(),
-    };
     let Some(old_inode) = old_dentry.get_inode() else {
         return KernelError::NotFound.sysret();
     };
@@ -258,6 +292,9 @@ pub fn sys_linkat(
         Ok(p) => p,
         Err(e) => return e,
     };
+    // TODO(V1 path + mounts): Linux is EXDEV when the two paths are on
+    // different vfsmounts, even of one superblock; comparing superblocks
+    // is the same until bind mounts exist
     if old_dentry.superblock().map(|s| s.dev_id) != parent.superblock().map(|s| s.dev_id) {
         return KernelError::CrossDevice.sysret();
     }
@@ -268,7 +305,7 @@ pub fn sys_linkat(
         if old_inode.mode().is_dir() {
             return Err(KernelError::NotPermitted);
         }
-        dir.i_op.link(dir, &name, &old_inode)?;
+        link_locked(dir, &name, &old_inode)?;
         Ok(old_inode.clone())
     });
     match r {
@@ -546,7 +583,12 @@ fn rename_locked(old: Side, new: Side, flags: u32) -> Result<(), KernelError> {
         }
     }
 
-    odir.i_op.rename(odir, oname, ndir, nname, flags)?;
+    // The link counts that change, under their inodes' locks (Linux
+    // lock_two_nondirectories)
+    lock_two_nondirs(Some(&sinode), dinode.as_ref());
+    let r = odir.i_op.rename(odir, oname, ndir, nname, flags);
+    unsafe { unlock_two_nondirs(Some(&sinode), dinode.as_ref()) };
+    r?;
     // New lookups re-create both dentries
     op.remove_child(oname);
     np.remove_child(nname);

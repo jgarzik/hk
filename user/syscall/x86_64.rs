@@ -235,6 +235,7 @@ pub const SYS_RENAMEAT2: u64 = 316;
 pub const SYS_MKDIR: u64 = 83;
 pub const SYS_RMDIR: u64 = 84;
 pub const SYS_LINK: u64 = 86;
+pub const SYS_LINKAT: u64 = 265;
 pub const SYS_UNLINK: u64 = 87;
 pub const SYS_SYMLINK: u64 = 88;
 pub const SYS_READLINK: u64 = 89;
@@ -585,6 +586,18 @@ pub fn sys_readlink(pathname: *const u8, buf: *mut u8, bufsiz: u64) -> i64 {
 #[inline(always)]
 pub fn sys_link(oldpath: *const u8, newpath: *const u8) -> i64 {
     unsafe { syscall2!(SYS_LINK, oldpath, newpath) }
+}
+
+/// linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+#[inline(always)]
+pub fn sys_linkat(
+    olddirfd: i32,
+    oldpath: *const u8,
+    newdirfd: i32,
+    newpath: *const u8,
+    flags: i32,
+) -> i64 {
+    unsafe { syscall5!(SYS_LINKAT, olddirfd, oldpath, newdirfd, newpath, flags) }
 }
 
 #[inline(always)]
