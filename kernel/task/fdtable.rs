@@ -116,7 +116,9 @@ pub fn exec_task_fd(tid: Tid) {
     drop(old);
 }
 
-/// Give `tid` a private copy of its table (Linux unshare_fd); the copy
+/// Give `tid` a private copy of its table (Linux unshare_fd): the new
+/// table is installed and returned, while tasks still sharing the old
+/// one through CLONE_FILES keep it.
 pub fn unshare_task_fd(tid: Tid) -> Option<Arc<Files>> {
     let old = get_task_fd(tid)?;
     let new = Arc::new(Files::new(old.lock().deep_clone()));
