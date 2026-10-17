@@ -3064,23 +3064,35 @@ pub fn set_current_fsgid(fsgid: crate::task::Gid) {
 /// * `mm` - The new address space (its top-level table is loaded)
 /// * `entry_point` - The entry point address in the new program
 /// * `user_sp` - The initial user stack pointer
-pub fn exec_replace_image(mm: crate::mm::MmRef, entry_point: u64, user_sp: u64) -> ! {
+pub fn exec_replace_image(
+    mm: crate::mm::MmRef,
+    entry_point: u64,
+    user_sp: u64,
+    ident: crate::task::exec::ExecIdentity,
+    guard: crate::signal::CredGuard,
+) -> ! {
     let tid = current_tid();
     let new = mm.arc().clone();
 
-    let old = {
+    // The new mm, name and dumpability together (Linux exec_mmap, then
+    // __set_task_comm and set_dumpable), under cred_guard_mutex and
+    // exec_update_lock
+    let old = guard.exec_update(|| {
         let mut table = TASK_TABLE.lock();
         let task = table.tasks.iter_mut().find(|t| t.tid == tid);
         let task = task.expect("exec: current task not in the task table");
         task.page_table = ArchPageTable::new(new.pgd());
+        task.prctl.name = ident.name;
+        task.prctl.dumpable = ident.dumpable;
         task.mm.replace(mm)
-    };
+    });
 
     // Leave the old tables before releasing them: their frames may be
     // reused at once by another CPU
     crate::mm::tlb::switch_mm(Some(&new));
     drop(new);
     drop(old);
+    drop(guard);
 
     // Get kernel stack for syscall/interrupt return
     let kstack_top = {

@@ -913,28 +913,21 @@ pub enum PidGen {
 /// The address space a /proc/<pid>/ file reads, if the caller may
 /// (Linux mm_access): EACCES without ptrace-read access
 ///
-/// The mm is taken first and the check is repeated around it: if the
-/// task exec'd in between (new mm, maybe new credentials), the access
-/// is decided again for the new image, so the result is never an mm
-/// the check did not cover (hk has no exec lock; Linux holds
-/// exec_update_lock across mm_access)
+/// Decided and taken under the process's exec_update_lock (read), which
+/// exec holds for writing while it installs the new mm and
+/// dumpability, so the result is never an mm the check did not cover
+/// (Linux mm_access)
 fn mm_access(pid: Pid) -> Result<Option<Arc<crate::mm::Mm>>, KernelError> {
-    let task_mm = || get_tid_for_pid(pid).and_then(crate::mm::get_task_mm);
-    loop {
-        let mm = task_mm();
-        if !crate::task::ptrace::may_read_proc(pid) {
-            return Err(KernelError::PermissionDenied);
-        }
-        let now = task_mm();
-        let same = match (&mm, &now) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            (None, None) => true,
-            _ => false,
-        };
-        if same {
-            return Ok(mm);
-        }
+    let Some(tid) = get_tid_for_pid(pid) else {
+        return Ok(None);
+    };
+    // The check and the mm it covers under the process's
+    // exec_update_lock: no exec of it switches mm or dumpability between
+    let _g = crate::signal::ExecUpdateRead::lock(tid);
+    if !crate::task::ptrace::may_read_proc(pid) {
+        return Err(KernelError::PermissionDenied);
     }
+    Ok(crate::mm::get_task_mm(tid))
 }
 
 /// Content of a per-process file for this open file (or, with none,
@@ -1027,7 +1020,13 @@ fn pid_file_pid(inode: &Inode) -> Option<Pid> {
 /// /proc/<pid>/exe: the executable's path (ENOENT for kernel threads,
 /// EACCES without ptrace-read access, Linux proc_fd_access_allowed)
 fn exe_link(pid: Pid) -> Result<String, KernelError> {
-    let mm = mm_access(pid)?.ok_or(KernelError::NotFound)?;
+    // No exec_update_lock (Linux proc_exe_link): an exec resolving
+    // /proc/self/exe (busybox re-execs itself) holds its own
+    if !crate::task::ptrace::may_read_proc(pid) {
+        return Err(KernelError::PermissionDenied);
+    }
+    let tid = get_tid_for_pid(pid).ok_or(KernelError::NotFound)?;
+    let mm = crate::mm::get_task_mm(tid).ok_or(KernelError::NotFound)?;
     let exe = mm.lock().exe().ok_or(KernelError::NotFound)?;
     Ok(exe)
 }

@@ -398,8 +398,12 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
     let Some(s) = snap(pid) else {
         return Vec::new();
     };
+    // The access decision and the mm it covers, as one (Linux holds
+    // exec_update_lock across do_task_stat)
+    let guard = crate::signal::ExecUpdateRead::lock(s.tid);
     let permitted = crate::task::ptrace::may_read_proc(pid);
     let v = task_vm(s.tid);
+    drop(guard);
     let (ign, cgt) = ign_cgt(&s);
     let ticks = |ns: u64| ns / NS_PER_TICK;
     let rt = s.policy == crate::task::SCHED_FIFO || s.policy == crate::task::SCHED_RR;

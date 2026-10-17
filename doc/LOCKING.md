@@ -208,6 +208,12 @@ To prevent deadlocks, locks must be acquired in a consistent order. The global
 lock ordering from outermost to innermost is:
 
 ```
+SignalStruct.cred_guard (sync::Mutex; Linux cred_guard_mutex; exec,
+                         ptrace attach; outermost)
+    ↓
+SignalStruct.exec_update (sync::RwSem; Linux exec_update_lock; write:
+                          exec installing the new mm; read: mm_access)
+    ↓
 VFS locks (detailed order):
     File.f_pos_lock (sync::Mutex; read/write/lseek/getdents by position)
         ↓
@@ -562,6 +568,33 @@ Following Linux's `kernel/cred.c` pattern (see `include/linux/cred.h`):
 - Per-CPU `CurrentTask.cred` provides fast syscall access (no lock needed)
 - `Task.cred` in TASK_TABLE ensures credentials persist across context switches
 - Without TASK_TABLE persistence, credentials would be lost when switching away
+
+#### Exec vs. Credential Checks (Linux cred_guard_mutex, exec_update_lock)
+
+Two per-thread-group sleeping locks in `SignalStruct`, thread context
+only, never IRQ-reachable, outermost (nothing is held when either is
+taken, except `cred_guard` around `exec_update`):
+
+- `cred_guard` (`sync::Mutex<()>`, via `signal::CredGuard`): exec
+  (`do_execve`) holds it from its first credential check (RLIMIT_NPROC)
+  through loading the image (path walk, file reads, the new mm's
+  mmap_lock, the fd table, TASK_TABLE) until the new image is in
+  place; an error return drops it with nothing changed. PTRACE_ATTACH /
+  PTRACE_SEIZE hold the target's around the access decision and the
+  attach.
+- `exec_update` (`sync::RwSem`): `exec_replace_image` holds it for
+  writing, inside `cred_guard`, while it installs the new mm, name and
+  dumpability under TASK_TABLE; process_vm_readv/writev (`access_mm`),
+  the /proc mm_access paths (maps, environ; the stat fields gated by
+  access) hold it for reading (`signal::ExecUpdateRead`) around the
+  access decision and taking the mm.
+
+So no check sees the old dumpability with the new mm or the reverse (a
+non-dumpable process that execs a readable binary is not attachable or
+readable while its old memory is still mapped). As in Linux the split
+lets exec walk paths while holding `cred_guard`: /proc/<pid>/exe
+(followed when busybox re-execs itself) takes neither lock. Order:
+`cred_guard` -> `exec_update` -> every other lock.
 
 #### Deferred State Updates
 

@@ -57,15 +57,10 @@ pub fn sys_process_vm_readv(
         None => return KernelError::NoProcess.sysret(),
     };
 
-    // Permission check
-    if !check_process_vm_permission(target_tid) {
-        return KernelError::NotPermitted.sysret();
-    }
-
-    // Get target's mm and page table root
-    let (target_mm, page_table_root) = match get_target_mm_and_pt(target_tid) {
-        Some(x) => x,
-        None => return KernelError::NoProcess.sysret(),
+    // Permission check and the mm it covers (Linux mm_access)
+    let (target_mm, page_table_root) = match access_mm(target_tid) {
+        Ok(x) => x,
+        Err(e) => return e.sysret(),
     };
 
     // Copy iovec arrays from user space
@@ -202,15 +197,10 @@ pub fn sys_process_vm_writev(
         None => return KernelError::NoProcess.sysret(),
     };
 
-    // Permission check
-    if !check_process_vm_permission(target_tid) {
-        return KernelError::NotPermitted.sysret();
-    }
-
-    // Get target's mm and page table root
-    let (target_mm, _) = match get_target_mm_and_pt(target_tid) {
-        Some(x) => x,
-        None => return KernelError::NoProcess.sysret(),
+    // Permission check and the mm it covers (Linux mm_access)
+    let (target_mm, _) = match access_mm(target_tid) {
+        Ok(x) => x,
+        Err(e) => return e.sysret(),
     };
 
     // Copy iovec arrays from user space
@@ -318,6 +308,17 @@ fn find_task_by_pid(pid: Pid) -> Option<Tid> {
 /// the ptrace rules with the real ids
 fn check_process_vm_permission(target_tid: Tid) -> bool {
     target_tid == current_tid() || crate::task::ptrace::may_access(|t| t.tid == target_tid, false)
+}
+
+/// The target's address space if the caller may access it (Linux
+/// mm_access): decided and taken under its cred_guard_mutex, so an exec
+/// cannot swap in a new mm or dumpability in between
+fn access_mm(target_tid: Tid) -> Result<(crate::mm::MmRef, u64), KernelError> {
+    let _g = crate::signal::ExecUpdateRead::lock(target_tid);
+    if !check_process_vm_permission(target_tid) {
+        return Err(KernelError::NotPermitted);
+    }
+    get_target_mm_and_pt(target_tid).ok_or(KernelError::NoProcess)
 }
 
 /// Get target's MmStruct and page table root physical address

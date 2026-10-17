@@ -37,6 +37,48 @@ pub fn run_tests() {
     }
     sys_unlink(XONLY.as_ptr());
     sys_unlink(READ.as_ptr());
+    // A failed exec changes neither; a good one makes it dumpable (1)
+    if write_bad_elf() {
+        report(b"EXEC_BAD_KEEPS_IDENTITY", in_child(fail_then_exec), 1);
+    } else {
+        report(b"EXEC_BAD_ELF_WRITE", 1 << 8, 0);
+    }
+    sys_unlink(BAD.as_ptr());
+}
+
+const BAD: &[u8] = b"/tmp/bt2_bad_elf\0";
+
+/// An executable file with an ELF magic and nothing valid after it
+fn write_bad_elf() -> bool {
+    let fd = sys_open(BAD.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 0o755);
+    if fd < 0 {
+        return false;
+    }
+    let mut img = [0u8; 128];
+    img[..4].copy_from_slice(b"\x7fELF");
+    let ok = sys_write(fd as u64, img.as_ptr(), img.len() as u64) == 128;
+    sys_close(fd as u64);
+    ok
+}
+
+/// Non-dumpable and named hk_keep: an exec that fails (ENOEXEC) must
+/// leave both, then a good exec reports its dumpability (1); exit 2/3
+/// if the failed exec changed the dumpability or the name
+fn fail_then_exec() -> ! {
+    sys_prctl(PR_SET_NAME, b"hk_keep\0".as_ptr() as u64, 0, 0, 0);
+    sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+    let argv: [*const u8; 2] = [BAD.as_ptr(), core::ptr::null()];
+    let envp: [*const u8; 1] = [core::ptr::null()];
+    let r = sys_execve(BAD.as_ptr(), argv.as_ptr(), envp.as_ptr());
+    if r != -8 || sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) != 0 {
+        sys_exit(2);
+    }
+    let mut name = [0u8; 16];
+    sys_prctl(PR_GET_NAME, name.as_mut_ptr() as u64, 0, 0, 0);
+    if name[..8] != *b"hk_keep\0" {
+        sys_exit(3);
+    }
+    exec(b"dumpable\0");
 }
 
 const XONLY: &[u8] = b"/tmp/bt2_xonly\0";

@@ -42,7 +42,6 @@ pub const ENOMEM: i32 = 12; // Out of memory
 pub const EIO: i32 = 5; // I/O error
 pub const EFAULT: i32 = 14; // Bad address
 pub const E2BIG: i32 = 7; // Argument list too long
-pub const ESRCH: i32 = 3; // No such process
 
 /// Maximum path length (matching Linux PATH_MAX)
 const PATH_MAX: usize = 4096;
@@ -570,14 +569,20 @@ fn secureexec(c: &crate::task::Cred) -> bool {
     c.uid != c.euid || c.gid != c.egid
 }
 
-/// Name and dumpability of the new image (Linux begin_new_exec): comm
-/// is the file name's last component (at most 15 bytes); the task is
-/// non-dumpable (suid_dumpable 0) for a secure exec or an image the
-/// caller may not read (would_dump: BINPRM_FLAGS_ENFORCE_NONDUMP, so an
-/// execute-only binary cannot be read through ptrace or /proc), else
-/// dumpable. Done before the point of no return: if the task cannot be
-/// updated the exec fails (ESRCH) instead of keeping a stale state.
-fn exec_identity(tid: super::Tid, path: &[u8], file: &File) -> Result<(), i32> {
+/// Name and dumpability a new image gets (Linux begin_new_exec sets
+/// them after exec_mmap, under cred_guard_mutex)
+pub struct ExecIdentity {
+    pub name: [u8; 16],
+    pub dumpable: u8,
+}
+
+/// The new image's identity, decided before the point of no return and
+/// applied by `exec_replace_image` with the new mm: comm is the file
+/// name's last component (at most 15 bytes); the task is non-dumpable
+/// (suid_dumpable 0) for a secure exec or an image the caller may not
+/// read (would_dump: BINPRM_FLAGS_ENFORCE_NONDUMP, so an execute-only
+/// binary cannot be read through ptrace or /proc), else dumpable
+fn exec_identity(path: &[u8], file: &File) -> ExecIdentity {
     use super::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_USER};
     let base = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
     let mut name = [0u8; 16];
@@ -592,11 +597,7 @@ fn exec_identity(tid: super::Tid, path: &[u8], file: &File) -> Result<(), i32> {
     } else {
         SUID_DUMP_DISABLE
     };
-    let mut table = percpu::TASK_TABLE.lock();
-    let t = table.tasks.iter_mut().find(|t| t.tid == tid).ok_or(ESRCH)?;
-    t.prctl.name = name;
-    t.prctl.dumpable = dumpable;
-    Ok(())
+    ExecIdentity { name, dumpable }
 }
 
 /// Execute a new program, replacing the current process image
@@ -617,6 +618,11 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     envp: Vec<Vec<u8>>,
     frame_alloc: &mut FA,
 ) -> i32 {
+    // Linux prepare_bprm_creds: the thread group's cred_guard_mutex from
+    // the first credential check until the new image is in place, so
+    // ptrace attach and mm_access never see the new mm with the old
+    // dumpability or the reverse; dropped on every error return
+    let guard = crate::signal::CredGuard::lock(percpu::current_tid());
     if let Err(e) = crate::task::nproc_exec_check() {
         return -e;
     }
@@ -712,9 +718,7 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
         };
     let user_sp = args.start_stack;
 
-    if let Err(e) = exec_identity(percpu::current_tid(), pathname, &file) {
-        return -e;
-    }
+    let ident = exec_identity(pathname, &file);
 
     // Now we need to update the current task and switch to the new address space
     // This is the point of no return
@@ -759,7 +763,7 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     drop(path);
 
     // Switch to the new address space and jump to user mode
-    percpu::exec_replace_image(mm, entry_point, user_sp);
+    percpu::exec_replace_image(mm, entry_point, user_sp, ident, guard);
 }
 
 /// sys_execve - execute a program
