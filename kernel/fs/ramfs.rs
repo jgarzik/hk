@@ -1466,7 +1466,9 @@ impl SuperOps for RamfsSuperOps {
 pub static RAMFS_SUPER_OPS: RamfsSuperOps = RamfsSuperOps;
 
 /// Mount function for ramfs
-fn ramfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError> {
+pub(crate) fn ramfs_mount(
+    fs_type: &'static FileSystemType,
+) -> Result<Arc<SuperBlock>, KernelError> {
     // Create superblock
     let sb = SuperBlock::new(fs_type, &RAMFS_SUPER_OPS, 0);
 

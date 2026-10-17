@@ -53,6 +53,12 @@ impl DevId {
         ((self.major as u32) << 20) | (self.minor as u32 & 0xFFFFF)
     }
 
+    /// Encode as a user dev_t (st_rdev; Linux new_encode_dev)
+    pub const fn to_user(&self) -> u64 {
+        let (ma, mi) = (self.major as u64, self.minor as u64);
+        (mi & 0xff) | (ma << 8) | ((mi & !0xff) << 12)
+    }
+
     /// Decode a user dev_t (Linux new_decode_dev / huge_decode_dev)
     pub const fn from_user(dev: u64) -> Self {
         Self {

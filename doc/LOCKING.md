@@ -270,8 +270,8 @@ Address space: Mm lock (mmap_lock) → AnonVma, LRU  ← never nested with TASK_
 Memory allocator locks (FRAME_ALLOCATOR, heap)  ← NOT IRQ-safe
 
 Block locks (3.10 Block Device Subsystem):
-    Disk.open_mutex (sleeping) → BLKDEV_REGISTRY, MAJORS; I/O sleeps
-    under open_mutex only
+    Disk.open_mutex (sleeping) → devtmpfs root i_rwsem → BLKDEV_REGISTRY,
+    MAJORS; I/O sleeps under open_mutex only
     blk-mq software queue, hardware queue (IrqSpinlock leaves; the
     hardware queue also from the driver ISR, under IRQ_TABLE)
     Completion.done (IrqSpinlock) → wait queue head → run-queue lock
@@ -2104,8 +2104,8 @@ IRQ-safe.
 
 #### Block Device Subsystem
 
-**Location:** `kernel/storage/` (`blkdev.rs`, `blk_mq.rs`, `genhd.rs`),
-`kernel/completion.rs`
+**Location:** `kernel/storage/` (`blkdev.rs`, `blk_mq.rs`, `genhd.rs`,
+`part/`), `kernel/fs/devtmpfs.rs`, `kernel/completion.rs`
 
 Linux model (block/bio.c, blk-mq.c, genhd.c): a bio is submitted from
 thread context, the driver completes it from its interrupt handler and
@@ -2114,13 +2114,14 @@ thread context, the driver completes it from its interrupt handler and
 
 | Lock | Type | IRQ class | Order |
 |------|------|-----------|-------|
-| `Disk.open_mutex` | `sync::Mutex` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock: block device open/release; I/O, `BLKDEV_REGISTRY` and `MAJORS` may be taken under it |
+| `Disk.open_mutex` | `sync::Mutex` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock: block device open/release, partition scans (and rescans, BLKRRPART); I/O, `BLKDEV_REGISTRY`, `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
 | `BLKDEV_REGISTRY` | spin `RwLock` (dev_t -> block device; global like Linux's bdev map) | thread only | leaf |
 | `MAJORS` | spin `Mutex` (block majors, register_blkdev) | thread only | leaf |
 | blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) | leaf: never taken with the hardware queue lock held |
 | blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list and the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock) | thread (dispatch) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep; taken under `IRQ_TABLE` in the ISR |
 | `Completion.done` | `IrqSpinlock<u32>` | any context | -> its wait queue head -> run-queue lock (the wakeup is issued under it, Linux complete()) |
 | `RamDisk.pages` | spin `Mutex` | thread only (bio-based driver) | leaf |
+| devtmpfs `PENDING` | spin `Mutex` (nodes queued before VFS init) | thread only | leaf (holds the devtmpfs root read under it) |
 
 Rules:
 
@@ -2132,9 +2133,14 @@ Rules:
   once `Completion::wait` returns the waker no longer touches the
   waiter's stack.
 - **Polled completion before scheduling:** a `submit_bio_wait` before
-  scheduling runs (boot-time I/O) reaps the hardware queues itself
+  scheduling runs (boot partition scan) reaps the hardware queues itself
   (`BlkMq::poll`, the same path as the ISR, serialized by the hardware
   queue lock).
+- **devtmpfs nodes under `open_mutex`:** Linux hands node updates to
+  devtmpfsd; hk creates/removes them in the caller (probe, rescan), under
+  the devtmpfs root's `i_rwsem`. No path holding a directory `i_rwsem`
+  takes `open_mutex` (a block device is opened after the path walk), so
+  `open_mutex -> i_rwsem` cannot invert.
 - **Synchronous I/O sleeps:** `submit_bio_wait` and the `bdev_rw*`
   helpers (vfat's block device pages, swap) are never called under a
   spinlock. The page cache never writes a page back under `PAGE_CACHE`
@@ -2624,8 +2630,8 @@ interrupt-safety invariant:
 | `RTNL` and every network `spin::Mutex`/`RwLock` | kernel/net/ | `sync::Mutex` / `Mutex` / `RwLock` | Configuration, sockets, tables, queues (3.10) |
 | Driver queue locks (e1000 / virtio-net `rx`, `tx`) | kernel/net/driver/ | `Mutex` | Rings: NAPI poll, xmit, open/stop |
 | `Softnet.backlog` | kernel/net/core/dev.rs | `Mutex` | `netif_rx` (lo), softnet |
-| `BLKDEV_REGISTRY`, `MAJORS`, `RamDisk.pages` | kernel/storage/ | `RwLock` / `Mutex` | Block device lookup, majors, RAM disk pages (3.10) |
-| `Disk.open_mutex` | kernel/storage/blkdev.rs | sleeping `sync::Mutex` | Block device open/release |
+| `BLKDEV_REGISTRY`, `MAJORS`, `RamDisk.pages`, devtmpfs `PENDING` | kernel/storage/, kernel/fs/devtmpfs.rs | `RwLock` / `Mutex` | Block device lookup, majors, RAM disk pages, early device nodes (3.10) |
+| `Disk.open_mutex` | kernel/storage/blkdev.rs | sleeping `sync::Mutex` | Block device open/release, partition scans |
 | Sleeping locks (`sync::Mutex`, `RwSem`) | kernel/sync/ | sleeping | Never in IRQ or atomic context (`might_sleep`) |
 
 With `make check LOCKDEP=1` (1.5) every tracked spin lock taken in an

@@ -55,9 +55,9 @@ pub fn run_tests() {
     // ========================================
     // Part 4: VFAT mount and normalized tests
     // ========================================
-    // Linux host run has no /dev/sd0 VFAT image
+    // Linux host run has no USB VFAT image
     if host_mode() {
-        skip(b"VFAT", b"no /dev/sd0 on host");
+        skip(b"VFAT", b"no USB disk (/dev/sda) on host");
         return;
     }
     if !mount_vfat() {
@@ -451,14 +451,14 @@ fn test_mount_umount() {
 // VFAT mount/unmount helpers
 // ============================================================================
 
-/// Mount VFAT from /dev/sd0 at /vfat_test
+/// Mount VFAT from /dev/sda (the USB disk) at /vfat_test
 /// Returns true on success, false on failure
 fn mount_vfat() -> bool {
-    let source = b"/dev/sd0\0";
+    let source = b"/dev/sda\0";
     let target = b"/vfat_test\0";
     let fstype = b"vfat\0";
 
-    print(b"Mounting /dev/sd0 at /vfat_test... ");
+    print(b"Mounting /dev/sda at /vfat_test... ");
     let ret = sys_mount(source.as_ptr(), target.as_ptr(), fstype.as_ptr(), 0, 0);
     if ret == 0 {
         println(b"OK");

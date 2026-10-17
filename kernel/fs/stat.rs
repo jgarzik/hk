@@ -22,7 +22,7 @@ fn fill_stat(inode: &Inode) -> Stat {
 
     // Get rdev for device files (char/block device major/minor)
     let st_rdev = if attr.mode.is_device() {
-        attr.rdev.encode() as u64
+        attr.rdev.to_user()
     } else {
         0
     };
@@ -500,7 +500,7 @@ fn fill_statx(inode: &Inode, _mask: u32) -> Statx {
     let st_dev = inode.superblock().map(|sb| sb.dev_id).unwrap_or(0);
 
     let st_rdev = if attr.mode.is_device() {
-        attr.rdev.encode() as u64
+        attr.rdev.to_user()
     } else {
         0
     };

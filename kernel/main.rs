@@ -902,9 +902,9 @@ fn kmain() -> ! {
     bus_manager.enumerate_all(&mut frame_alloc);
 
     // SCSI disk (sda) from a USB MSC device, if present
-    let scsi_disk_created = bus_manager
-        .find_device::<UsbMscDeviceHandle>()
-        .is_some_and(|h| crate::storage::create_scsi_disk(h.scsi_host(), 0, 0).is_ok());
+    if let Some(handle) = bus_manager.find_device::<UsbMscDeviceHandle>() {
+        let _ = crate::storage::create_scsi_disk(handle.scsi_host(), 0, 0);
+    }
 
     // ========================================================================
     // Phase 5: VFS Initialization
@@ -927,13 +927,6 @@ fn kmain() -> ! {
             printkln!("ERR: initramfs: {:?}", e);
             CurrentArch::halt_loop();
         }
-    }
-
-    // Create /dev/sd0 device node if SCSI disk was created
-    if scsi_disk_created {
-        let dev_dentry = fs::lookup_path("/dev").expect("/dev must exist");
-        let rdev = crate::storage::DevId::new(crate::storage::major::SCSI_DISK, 0);
-        let _ = fs::ramfs::ramfs_create_blkdev(&dev_dentry, "sd0", rdev, 0o660);
     }
 
     // ========================================================================
@@ -1204,10 +1197,7 @@ const DEFAULT_RAMDISK_SIZE_MB: u64 = 8;
 fn init_vfs_core() {
     use crate::chardev::DevId;
     use crate::storage::create_ramdisk;
-    use crate::storage::major;
-    use fs::{
-        PROCFS_TYPE, RAMFS_TYPE, do_mount, init_fs_registry, ramfs_create_blkdev, ramfs_create_dir,
-    };
+    use fs::{PROCFS_TYPE, RAMFS_TYPE, do_mount, init_fs_registry, ramfs_create_dir};
 
     init_fs_registry();
 
@@ -1242,56 +1232,27 @@ fn init_vfs_core() {
     // Register TTY character devices (serial, etc.)
     crate::tty::init_tty_chardevs();
 
-    // Create character device nodes in /dev
+    // Device nodes: in devtmpfs, and the console's in the root's /dev
+    // (opened for init before anything mounts devtmpfs; Linux needs
+    // /dev/console in the initramfs)
+    fs::devtmpfs::init();
     use crate::chardev::major as chardev_major;
-
-    // /dev/null (major 1, minor 3)
-    let _ = fs::ramfs_create_chrdev(
-        &dev_dentry,
-        "null",
-        DevId::new(chardev_major::MEM, 3),
-        0o666,
-    );
-
-    // /dev/zero (major 1, minor 5)
-    let _ = fs::ramfs_create_chrdev(
-        &dev_dentry,
-        "zero",
-        DevId::new(chardev_major::MEM, 5),
-        0o666,
-    );
-
-    // /dev/ttyS0 (major 4, minor 64) - only create if TTY is registered
+    let mut nodes = alloc::vec![
+        ("null", DevId::new(chardev_major::MEM, 3), 0o666),
+        ("zero", DevId::new(chardev_major::MEM, 5), 0o666),
+        ("tty", DevId::new(chardev_major::TTYAUX, 0), 0o666),
+        ("console", DevId::new(chardev_major::TTYAUX, 1), 0o666),
+    ];
     if crate::chardev::get_chardev(DevId::new(chardev_major::TTYS, 64)).is_some() {
-        let _ = fs::ramfs_create_chrdev(
-            &dev_dentry,
-            "ttyS0",
-            DevId::new(chardev_major::TTYS, 64),
-            0o666,
-        );
+        nodes.push(("ttyS0", DevId::new(chardev_major::TTYS, 64), 0o666));
+    }
+    for (name, dev, mode) in nodes {
+        let _ = fs::ramfs_create_chrdev(&dev_dentry, name, dev, mode);
+        fs::devtmpfs::device_add(name, dev, false, mode);
     }
 
-    // /dev/tty (major 5, minor 0) - controlling terminal
-    let _ = fs::ramfs_create_chrdev(
-        &dev_dentry,
-        "tty",
-        DevId::new(chardev_major::TTYAUX, 0),
-        0o666,
-    );
-
-    // /dev/console (major 5, minor 1) - kernel console
-    let _ = fs::ramfs_create_chrdev(
-        &dev_dentry,
-        "console",
-        DevId::new(chardev_major::TTYAUX, 1),
-        0o666,
-    );
-
-    // Create RAM disk rd0 (8MB)
-    if let Ok(_bdev) = create_ramdisk(0, DEFAULT_RAMDISK_SIZE_MB) {
-        let rdev = DevId::new(major::RAMDISK, 0);
-        let _ = ramfs_create_blkdev(&dev_dentry, "rd0", rdev, 0o660);
-    }
+    // RAM disk rd0 (8MB)
+    let _ = create_ramdisk(0, DEFAULT_RAMDISK_SIZE_MB);
 
     printkln!("VFS: ok");
 }
@@ -1309,12 +1270,10 @@ fn init_vfs_core() {
 #[cfg(target_arch = "x86_64")]
 pub fn init_vfat_ramdisk(
     root_dentry: &alloc::sync::Arc<fs::Dentry>,
-    dev_dentry: &alloc::sync::Arc<fs::Dentry>,
+    _dev_dentry: &alloc::sync::Arc<fs::Dentry>,
 ) {
-    use crate::chardev::DevId;
     use crate::storage::create_ramdisk_from_data;
-    use crate::storage::major;
-    use fs::{ramfs_create_blkdev, ramfs_create_dir};
+    use fs::ramfs_create_dir;
 
     // Look for vfat module loaded by bootloader
     let vfat_data = match unsafe { multiboot2::find_module(MULTIBOOT2_INFO, "vfat") } {
@@ -1322,11 +1281,8 @@ pub fn init_vfat_ramdisk(
         None => return,
     };
 
-    // Create ramdisk rd1 from the vfat image data
-    if create_ramdisk_from_data(1, vfat_data).is_ok() {
-        let rdev = DevId::new(major::RAMDISK, 1);
-        let _ = ramfs_create_blkdev(dev_dentry, "rd1", rdev, 0o660);
-    }
+    // Ramdisk rd1 from the vfat image data (node in devtmpfs)
+    let _ = create_ramdisk_from_data(1, vfat_data);
 
     // Create /vfat_test mount point (userspace init will mount here)
     let _ = ramfs_create_dir(root_dentry, "vfat_test");

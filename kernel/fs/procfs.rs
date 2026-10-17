@@ -1939,6 +1939,12 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
             children.insert(String::from("mounts"), mounts_inode);
             children.insert(String::from("meminfo"), meminfo_inode);
             children.insert(String::from("net"), net_dir_inode);
+            let parts = mk_inode(
+                &sb,
+                InodeMode::regular(0o444),
+                ProcfsInodeData::new_file(crate::storage::genhd::proc_partitions),
+            );
+            children.insert(String::from("partitions"), parts);
         }
     }
 
