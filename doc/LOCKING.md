@@ -101,8 +101,6 @@ are **NOT** accessed from interrupt context.
 - Global task table (TASK_TABLE)
 - Page cache
 - File descriptor tables
-- Frame allocator (thread context only)
-- Heap allocator (thread context only)
 
 **CRITICAL CONSTRAINT:** Never acquire a `Mutex` from interrupt context. If you
 need to access the data from an interrupt handler, use `IrqSpinlock` instead or
@@ -267,8 +265,10 @@ Global subsystem locks (TASK_TABLE, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-s
     ↓
 Address space: Mm lock (mmap_lock) → AnonVma, LRU  ← never nested with TASK_TABLE (3.2)
     ↓
-Memory allocator locks: heap, then per-CPU page list (IRQs off) →
-    Zone.lock (IrqSpinlock leaf; 3.2 Frame Allocator)
+Memory allocator locks (Linux: ... → slab → pcp → zone->lock):
+    slab per-CPU array (IRQs off) → KmemCache.list_lock (IrqSpinlock)
+    → per-CPU page list (IRQs off) → Zone.lock (IrqSpinlock leaf);
+    3.2 Heap Allocator, Frame Allocator
 
 Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem → BLKDEV_REGISTRY,
@@ -1011,23 +1011,29 @@ layout in `doc/MEMORY.md`
   (the fault path, see Address Spaces);
   never contains a kernel mapping.
 
-#### Heap Allocator
+#### Heap Allocator (boot arena, slab)
 
-**Location:** `kernel/heap.rs`
+**Location:** `kernel/heap.rs` (global allocator, boot arena),
+`kernel/mm/slab.rs` (Linux mm/slab.c array caches, SLUB-style lists)
 
-```rust
-pub struct HeapAllocator {
-    inner: IrqSpinlock<HeapAllocatorInner>,
-}
-```
-
-- Single `IrqSpinlock` protects the free list (fixed-size heap, never
-  grows, so it takes no other lock): an allocation in interrupt context
-  cannot deadlock against an interrupted allocator
-- Policy is still **no allocation in IRQ context** (failure handling and
-  latency); IRQ paths reserve capacity up front (e.g. `netif_napi_add`)
-- Implements `GlobalAlloc` trait
-- Used by Rust's `alloc` crate for `Box`, `Vec`, `String`, etc.
+- Before the page allocator is up, allocations come from a static boot
+  arena (first-fit list under an `IrqSpinlock` leaf); afterwards from
+  kmalloc caches. A block goes back to whichever gave it.
+- Each `KmemCache` has a per-CPU object array, used by its CPU with
+  interrupts off (no lock), and `list_lock` (`IrqSpinlock`) over its
+  partial and empty slab lists. Order: per-CPU array → `list_lock` →
+  page allocator (per-CPU page list, `Zone.lock`); empty slabs are
+  given back to the page allocator after `list_lock` is dropped, and a
+  new slab is allocated with no `list_lock` held. A CPU without per-CPU
+  data yet uses `list_lock` directly.
+- All IRQ-safe (an allocation in interrupt context cannot deadlock),
+  but the policy is still **no allocation in IRQ context**; IRQ paths
+  reserve capacity up front (e.g. `netif_napi_add`)
+- kmalloc above 8KB (or aligned above 4KB) takes pages directly from
+  the page allocator. Heap pages are GFP_KERNEL (to the min watermark)
+  in thread context, GFP_ATOMIC only in interrupt context; user data
+  stops at low, leaving low - min to kernel objects (a failed heap
+  allocation is fatal in Rust).
 
 #### Page Cache
 
@@ -1088,9 +1094,8 @@ takes PAGE_CACHE -> FRAME_ALLOCATOR (`IrqSpinlock`, leaf) to free its
 pages. The page cache never holds inode references, so the last inode
 reference is never dropped with PAGE_CACHE held. Unevictable (ramfs)
 pages are kept off the eviction FIFO and are refused at the low
-watermark (`FrameAlloc::reserve_low`: the zone's free count, an atomic,
-and the heap's free-byte count, read under its leaf lock while
-PAGE_CACHE is held).
+watermark (`FrameAlloc::reserve_low`: the zone's free count, an atomic
+read while PAGE_CACHE is held).
 
 ### 3.3 Virtual File System (VFS)
 

@@ -283,9 +283,8 @@ pub trait FrameAlloc {
         None
     }
 
-    /// Memory is down to the low watermark (or the kernel heap to its
-    /// reserve): callers adding unevictable user data (ramfs pages)
-    /// must fail instead
+    /// Memory is down to the low watermark: callers adding unevictable
+    /// user data (ramfs pages) must fail instead
     fn reserve_low(&self) -> bool {
         false
     }

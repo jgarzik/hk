@@ -673,10 +673,11 @@ fn do_splice_pipe_to_file(
 /// Allocate a page for pipe buffer
 fn allocate_pipe_page() -> Option<Arc<CachedPage>> {
     use crate::FRAME_ALLOCATOR;
-    use crate::mm::page_cache::FileId;
 
-    let frame = FRAME_ALLOCATOR.alloc()?;
-    let page = Arc::new(CachedPage::new(frame, FileId::anonymous(), 0));
+    // User data (Linux GFP_HIGHUSER | __GFP_ACCOUNT): stops at the low
+    // watermark like the user pages it was copied from
+    let frame = FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::HIGHUSER_MOVABLE)?;
+    let page = Arc::new(CachedPage::new_owned(frame));
     Some(page)
 }
 

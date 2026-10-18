@@ -480,8 +480,10 @@ static PERCPU_SCHEDS: [PerCpuScheduler; MAX_CPUS] = [const { PerCpuScheduler::ne
 pub type KernelTask = Task<CurrentArch, ArchPageTable>;
 
 pub struct GlobalTaskTable {
-    /// All tasks in the system
-    pub tasks: Vec<Task<CurrentArch, ArchPageTable>>,
+    /// All tasks in the system, each its own allocation (Linux
+    /// task_struct_cachep): growing the table moves pointers, never
+    /// tasks, and needs no large contiguous block
+    pub tasks: Vec<alloc::boxed::Box<Task<CurrentArch, ArchPageTable>>>,
     next_tid: Tid,
     next_pid: u64,
 }
@@ -668,7 +670,7 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
         ptrace_options: 0,
     };
 
-    TASK_TABLE.lock().tasks.push(task);
+    TASK_TABLE.lock().tasks.push(alloc::boxed::Box::new(task));
 
     let sched = get_percpu_sched(cpu_id);
     let mut rq = sched.lock.lock();
@@ -866,7 +868,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
     // Add to global table
     {
         let mut table = TASK_TABLE.lock();
-        table.tasks.push(task);
+        table.tasks.push(alloc::boxed::Box::new(task));
         // Reserve tid+1 for next task
         if table.next_tid <= config.tid {
             table.next_tid = config.tid + 1;
@@ -1439,7 +1441,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Add to global task table
     {
         let mut table = TASK_TABLE.lock();
-        table.tasks.push(child_task);
+        table.tasks.push(alloc::boxed::Box::new(child_task));
     }
 
     // Handle filesystem context (CLONE_FS)

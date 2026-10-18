@@ -16,6 +16,10 @@
 //!   every touch also costs page tables: those stop at the same
 //!   watermark as user pages, the kernel keeps its reserve (MemFree at
 //!   least vm.min_free_kbytes afterwards) and the next fork works
+//! - OOM_PIPE_RESERVE (hk only: Linux would OOM-kill): kernel objects
+//!   driven by a user, pipes full of data, until memory runs out: pipe
+//!   pages stop at the low watermark, so at that point MemFree is still
+//!   at least vm.min_free_kbytes, nothing panics, and it all comes back
 //! - OOM_MLOCK_EAGAIN (hk only: Linux would OOM-kill instead): mlock of
 //!   more memory than there is fails with EAGAIN, and the memory comes
 //!   back when the process exits
@@ -24,9 +28,9 @@ use super::helpers::{host_mode, print, print_num, println, skip};
 use super::mm_life::meminfo;
 use hk_syscall::{
     MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_MAYMOVE, O_RDONLY, PROT_READ,
-    PROT_WRITE, RLIMIT_AS, RLIMIT_MEMLOCK, RLimit, Timespec, sys_brk, sys_close, sys_exit,
-    sys_fork, sys_mlock, sys_mmap, sys_mremap, sys_munmap, sys_nanosleep, sys_open, sys_read,
-    sys_setresuid, sys_setrlimit, sys_wait4,
+    O_NONBLOCK, PROT_WRITE, RLIMIT_AS, RLIMIT_MEMLOCK, RLIMIT_NOFILE, RLimit, Timespec, sys_brk,
+    sys_close, sys_exit, sys_fork, sys_mlock, sys_mmap, sys_mremap, sys_munmap, sys_nanosleep,
+    sys_open, sys_pipe2, sys_read, sys_setresuid, sys_setrlimit, sys_wait4, sys_write,
 };
 
 const MAP_NORESERVE: u32 = 0x4000;
@@ -42,6 +46,7 @@ pub fn run_tests() {
     fault_kill(b"OOM_FAULT_KILL", hog);
     fault_kill(b"OOM_SHARED_KILL", hog_shared);
     fault_kill(b"OOM_SPARSE_KILL", hog_sparse);
+    fault_kill(b"OOM_PIPE_RESERVE", pipe_hog);
     fault_kill(b"OOM_MLOCK_EAGAIN", mlock_hog);
 }
 
@@ -243,6 +248,53 @@ fn hog_sparse() -> u64 {
         a += STEP;
     }
     3
+}
+
+static PIPE_DATA: [u8; 65536] = [0x5a; 65536];
+
+/// Child: fill pipes (64KB each) until writes come up short; exit 0x80
+/// if free memory then is still at least min_free_kbytes
+fn pipe_hog() -> u64 {
+    let lim = RLimit {
+        rlim_cur: 65536,
+        rlim_max: 65536,
+    };
+    if sys_setrlimit(RLIMIT_NOFILE, &lim) != 0 {
+        return 2;
+    }
+    // Fault in what the check below uses (stack, the readers) first:
+    // a page fault at exhaustion would kill the child before it looks
+    let min = read_int(b"/proc/sys/vm/min_free_kbytes\0");
+    meminfo(b"MemFree:");
+    let mut full = false;
+    for _ in 0..32000 {
+        let mut fds = [0i32; 2];
+        if sys_pipe2(fds.as_mut_ptr(), O_NONBLOCK) < 0 {
+            full = true;
+            break;
+        }
+        let n = PIPE_DATA.len() as u64;
+        if sys_write(fds[1] as u64, PIPE_DATA.as_ptr(), n) < n as i64 {
+            full = true;
+            break;
+        }
+    }
+    if !full {
+        return 4;
+    }
+    let free = meminfo(b"MemFree:");
+    print(b"OOM_PIPE_RESERVE: MemFree at exhaustion ");
+    print_num(free);
+    println(b" kB");
+    if min <= 0 || free < min {
+        print(b"OOM_PIPE_RESERVE: MemFree ");
+        print_num(free);
+        print(b" kB at exhaustion, min_free_kbytes ");
+        print_num(min);
+        println(b"");
+        return 5;
+    }
+    0x80
 }
 
 /// An integer file such as /proc/sys/vm/min_free_kbytes (-1 if none)

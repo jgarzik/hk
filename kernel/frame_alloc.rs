@@ -85,6 +85,18 @@ impl FrameAllocator {
         self.zone.alloc_pages(0, gfp).map(phys)
     }
 
+    /// Allocate 2^order contiguous frames (count 1 on the first)
+    pub fn alloc_pages(&self, order: u32, gfp: Gfp) -> Option<u64> {
+        self.zone.alloc_pages(order, gfp).map(phys)
+    }
+
+    /// Free what `alloc_pages(order)` returned
+    pub fn free_pages(&self, frame: u64, order: u32) {
+        if let Some(p) = self.ours(frame) {
+            self.zone.free_pages(p, order);
+        }
+    }
+
     /// Allocate a kernel frame
     pub fn alloc(&self) -> Option<u64> {
         self.alloc_gfp(Gfp::KERNEL)
@@ -270,7 +282,7 @@ impl FrameAlloc for FrameAllocRef<'_> {
     }
 
     fn reserve_low(&self) -> bool {
-        self.0.low() || crate::heap_low()
+        self.0.low()
     }
 
     fn alloc_frame(&mut self) -> Option<Self::PhysAddr> {

@@ -94,14 +94,12 @@ use crate::arch::ArchBusOps;
 use crate::arch::{
     AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps,
     MemoryLayoutOps, PerCpuOps, PowerOps, SmpOps, TimekeeperOps, TimerCallbackOps, VfsInitOps,
-    phys_to_virt, virt_to_phys,
+    phys_to_virt,
 };
 use crate::arch::{SchedArch, SyscallOps, UserModeOps};
 
 // Page table type alias (used by ELF loading)
 type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
-
-use heap::HeapAllocator;
 
 use crate::dma::{DirectDmaOps, dma_init};
 use crate::mm::page_cache::{FileId, NULL_AOPS, PAGE_SIZE as PC_PAGE_SIZE, PageCache};
@@ -111,141 +109,10 @@ use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
 
 use crate::sync::spin::Mutex;
 
-// Memory layout constants - x86_64
-// The heap starts at 4MB or above the multiboot2 modules and info (GRUB
-// places them right after the kernel image), whichever is higher, and
-// ends at 18MB where the frame allocator starts (`x86_64_heap`)
-#[cfg(target_arch = "x86_64")]
-const KERNEL_HEAP_START: usize = 0x400000; // 4MB
-#[cfg(target_arch = "x86_64")]
-const KERNEL_HEAP_SIZE: usize = 0xE00000; // 14MB (up to 18MB where frame allocator starts)
-
-/// The kernel image in physical memory (start and end symbols in kernel.ld)
-fn kernel_range() -> heap::BootRange {
-    unsafe extern "C" {
-        static __kernel_start: u8;
-        static __kernel_end: u8;
-    }
-    heap::BootRange {
-        name: "kernel image",
-        start: virt_to_phys(&raw const __kernel_start as u64) as usize,
-        end: virt_to_phys(&raw const __kernel_end as u64) as usize,
-    }
-}
-
-/// Boot data the x86 heap must avoid: kernel image, multiboot info and
-/// modules (up to 7; more panics rather than going unchecked)
-#[cfg(target_arch = "x86_64")]
-fn x86_64_boot_ranges(multiboot_info: u64) -> [heap::BootRange; 8] {
-    let none = heap::BootRange {
-        name: "",
-        start: 0,
-        end: 0,
-    };
-    let mut busy = [none; 8];
-    busy[0] = kernel_range();
-    let mut n = 1;
-    let mut add = |name, start: u64, end: u64| {
-        assert!(n < busy.len(), "too many multiboot modules");
-        busy[n] = heap::BootRange {
-            name,
-            start: start as usize,
-            end: end as usize,
-        };
-        n += 1;
-    };
-    unsafe { multiboot2::boot_ranges(multiboot_info, &mut add) };
-    busy
-}
-
-/// x86 heap (start, size): never over the boot modules, which are read
-/// after the heap is in use (a fixed 4MB start broke once kernel +
-/// initramfs + vfat image passed 4MB); ends where frames start
-#[cfg(target_arch = "x86_64")]
-fn x86_64_heap(multiboot_info: u64) -> (usize, usize) {
-    const MIN: usize = 0x400000;
-    let end = KERNEL_HEAP_START + KERNEL_HEAP_SIZE;
-    let busy = x86_64_boot_ranges(multiboot_info);
-    // Above all boot data: the heap runs to a fixed end, so a gap
-    // below a module could not hold it anyway
-    let top = busy.iter().map(|r| r.end).max().unwrap_or(0);
-    let start = heap::place(KERNEL_HEAP_START.max(top), MIN, 4096, &busy);
-    assert!(
-        start + MIN <= end,
-        "boot modules leave no room for the heap"
-    );
-    for r in &busy {
-        heap::check(start, end, r);
-    }
-    (start, end - start)
-}
-
-// Memory layout constants - aarch64
-// QEMU virt loads the kernel at 0x40100000 with the DTB below it; the
-// heap goes at the first 2MB boundary past the kernel image that also
-// misses the DTB and any initrd (`aarch64_heap`)
-#[cfg(target_arch = "aarch64")]
-const KERNEL_HEAP_SIZE: usize = 0x0100_0000; // 16MB
-
-/// Boot data the aarch64 heap must avoid: kernel image, DTB, initrd
-#[cfg(target_arch = "aarch64")]
-fn aarch64_boot_ranges(dtb: u64) -> [heap::BootRange; 3] {
-    let none = heap::BootRange {
-        name: "",
-        start: 0,
-        end: 0,
-    };
-    let fdt = match arch::aarch64::dtb::total_size(dtb) {
-        Some(n) => heap::BootRange {
-            name: "DTB",
-            start: dtb as usize,
-            end: dtb as usize + n,
-        },
-        None => none,
-    };
-    let initrd = match arch::aarch64::dtb::extract_initramfs(dtb) {
-        Some(i) => heap::BootRange {
-            name: "initrd",
-            start: i.start as usize,
-            end: i.end as usize,
-        },
-        None => none,
-    };
-    [kernel_range(), fdt, initrd]
-}
-
-/// aarch64 heap (start, size) computed from the linked kernel end, so
-/// kernel growth can never silently run into it
-#[cfg(target_arch = "aarch64")]
-fn aarch64_heap(dtb: u64) -> (usize, usize) {
-    let busy = aarch64_boot_ranges(dtb);
-    let start = heap::place(busy[0].end, KERNEL_HEAP_SIZE, 0x20_0000, &busy);
-    let end = start + KERNEL_HEAP_SIZE;
-    for r in &busy {
-        heap::check(start, end, r);
-    }
-    (start, KERNEL_HEAP_SIZE)
-}
-
-/// Physical [start, end) of the heap, reserved in memblock
-static HEAP_RANGE: Mutex<(u64, u64)> = Mutex::new((0, 0));
-
-/// Kernel heap allocator (host unit tests use the std allocator)
+/// Kernel heap: boot arena, then slab (host unit tests use the std
+/// allocator)
 #[cfg_attr(not(test), global_allocator)]
-static ALLOCATOR: HeapAllocator = HeapAllocator::new();
-
-/// The kernel heap is down to the 2MB kept for the kernel when user
-/// data grows (ramfs pages also cost heap: cache indexes)
-#[cfg(not(test))]
-pub fn heap_low() -> bool {
-    const HEAP_RESERVE: usize = 2 * 1024 * 1024;
-    ALLOCATOR.free_bytes() < HEAP_RESERVE
-}
-
-#[cfg(test)]
-pub fn heap_low() -> bool {
-    false
-}
+static ALLOCATOR: heap::KernelAlloc = heap::KernelAlloc::new();
 
 /// Global page cache (1024 evictable pages = 4MB max)
 static PAGE_CACHE: Mutex<PageCache> = Mutex::new(PageCache::new(1024));
@@ -312,13 +179,6 @@ pub extern "C" fn _start(multiboot_info: u64) -> ! {
         cmdline::parse_cmdline(cmdline);
     }
 
-    // Initialize heap allocator
-    let (heap_start, heap_size) = x86_64_heap(multiboot_info);
-    *HEAP_RANGE.lock() = (heap_start as u64, (heap_start + heap_size) as u64);
-    unsafe {
-        ALLOCATOR.init(phys_to_virt(heap_start as u64) as usize, heap_size);
-    }
-
     // Initialize architecture-specific code (GDT, IDT, PIC, PIT)
     CurrentArch::early_init();
 
@@ -359,13 +219,6 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
 
     // Initialize architecture (CPU features, RTC, etc.)
     CurrentArch::early_init();
-
-    // Initialize heap allocator
-    let (heap_start, heap_size) = aarch64_heap(unsafe { DTB_PTR });
-    *HEAP_RANGE.lock() = (heap_start as u64, (heap_start + heap_size) as u64);
-    unsafe {
-        ALLOCATOR.init(phys_to_virt(heap_start as u64) as usize, heap_size);
-    }
 
     // Final kernel page tables (linear map of all RAM, which goes to
     // memblock)
@@ -732,8 +585,6 @@ fn kmain() -> ! {
     // Firmware memory map and boot reservations (multiboot2 on x86,
     // DTB on arm), then every free range goes to the frame allocator
     CurrentArch::memblock_init();
-    let (heap_start, heap_end) = *HEAP_RANGE.lock();
-    mm::memblock::reserve(heap_start, heap_end - heap_start);
     discover_boot_framebuffer();
     let (lo, hi) = mm::memblock::MEMBLOCK.lock().span();
     mm::page::vmemmap_init();
@@ -742,6 +593,8 @@ fn kmain() -> ! {
         .lock()
         .for_each_free(|start, end| FRAME_ALLOCATOR.free_range(start, end));
     FRAME_ALLOCATOR.init_done();
+    printkln!("MEM: boot arena {} kB in use", ALLOCATOR.arena_used() >> 10);
+    ALLOCATOR.slab_ready();
     printkln!("MEM: {} MB", FRAME_ALLOCATOR.stats().total_bytes >> 20);
 
     // Initialize DMA subsystem (uses frame allocator)

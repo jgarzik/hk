@@ -122,8 +122,16 @@ fn tolerance_kb() -> i64 {
     }
 }
 
-/// Run `f` `n` times after a warm-up; MemFree must come back to (near)
-/// where it was. `f` returns false on a failed step.
+/// Free memory not counting the kernel heap: MemFree + Slab. These
+/// tests check that user memory (pages, page tables) comes back; kernel
+/// object leaks show in Slab and are tracked by the Slab tests (hk: the
+/// known per-pid procfs dentry and zombie-thread leaks, BUGS.md)
+fn user_free() -> i64 {
+    meminfo(b"MemFree:") + meminfo(b"Slab:").max(0)
+}
+
+/// Run `f` `n` times after a warm-up; free memory must come back to
+/// (near) where it was. `f` returns false on a failed step.
 fn leak(name: &[u8], n: u32, f: fn() -> bool) {
     for _ in 0..(n / 10).max(2) {
         if !f() {
@@ -132,7 +140,7 @@ fn leak(name: &[u8], n: u32, f: fn() -> bool) {
         }
     }
     settle();
-    let before = meminfo(b"MemFree:");
+    let before = user_free();
     for i in 0..n {
         if !f() {
             report(name, false, -2 - i as i64);
@@ -143,7 +151,7 @@ fn leak(name: &[u8], n: u32, f: fn() -> bool) {
     let mut after = 0;
     for _ in 0..50 {
         settle();
-        after = meminfo(b"MemFree:");
+        after = user_free();
         if before - after <= tolerance_kb() {
             break;
         }
@@ -152,7 +160,7 @@ fn leak(name: &[u8], n: u32, f: fn() -> bool) {
     let ok = before > 0 && after > 0 && lost <= tolerance_kb();
     if !ok {
         print(name);
-        print(b": MemFree before ");
+        print(b": MemFree+Slab before ");
         print_num(before);
         print(b" kB, after ");
         print_num(after);

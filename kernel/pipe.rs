@@ -400,13 +400,14 @@ impl PipeInner {
 /// Creates an anonymous CachedPage for holding pipe data.
 fn allocate_pipe_page() -> Option<Arc<CachedPage>> {
     use crate::FRAME_ALLOCATOR;
-    use crate::mm::page_cache::FileId;
 
     // Allocate a physical frame
-    let frame = FRAME_ALLOCATOR.alloc()?;
+    // User data (Linux GFP_HIGHUSER | __GFP_ACCOUNT): stops at the low
+    // watermark like the user pages it was copied from
+    let frame = FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::HIGHUSER_MOVABLE)?;
 
     // Create an anonymous CachedPage (file_id 0, offset 0)
-    let page = Arc::new(CachedPage::new(frame, FileId::anonymous(), 0));
+    let page = Arc::new(CachedPage::new_owned(frame));
 
     Some(page)
 }

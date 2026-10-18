@@ -1647,13 +1647,13 @@ fn gen_version() -> Vec<u8> {
 /// Generate /proc/meminfo content (Linux meminfo_proc_show subset:
 /// 16-column labels, values in kB). Free memory is the frame
 /// allocator's exact count; hk has no reclaimable caches counted yet,
-/// so MemAvailable equals MemFree. Slab is the kernel heap in use.
+/// so MemAvailable equals MemFree. Slab is the slab caches' pages.
 fn gen_meminfo() -> Vec<u8> {
     use alloc::fmt::Write;
     let fa = &crate::FRAME_ALLOCATOR;
     let total = fa.stats().total_bytes >> 10;
     let free = (fa.free_frames() as u64 * 4096) >> 10;
-    let slab = (crate::ALLOCATOR.used_bytes() as u64) >> 10;
+    let slab = (crate::mm::slab::slab_bytes() as u64) >> 10;
     let mut out = String::new();
     for (label, kb) in [
         ("MemTotal:", total),

@@ -278,41 +278,39 @@ parallel). Next occurrence: capture the Message line.
 
 ramfs (the root filesystem and every ramfs mount) is bounded only by
 memory, for every user: writes fail with ENOSPC once free frames reach
-the low watermark (min_free_kbytes formula) or the kernel heap is
-down to 2MB, and the memory comes back when the last link and the last
+the low watermark (min_free_kbytes formula), and the memory comes back when the last link and the last
 open reference of a file are gone (or on truncate). Linux's rootfs is a
 tmpfs limited to half of RAM by default; tmpfs with `size=`/`nr_inodes=`
 limits (and per-user accounting) comes with the filesystem chunk.
 Reads of holes need a zeroed page each and can fail with ENOMEM when
 memory is at the low watermark (Linux maps the shared zero page).
 
-## The kernel heap is a fixed 16MB region
+## Kernel heap (slab) gaps
 
-**Location**: `kernel/main.rs` (`x86_64_heap`, `aarch64_heap`), `kernel/heap.rs`
+**Location**: `kernel/mm/slab.rs`, `kernel/heap.rs`
 
-The heap is one fixed range placed at boot and reserved in memblock:
-on x86 from above the kernel image and multiboot modules/info up to
-18MB (~14MB minus the boot data); on aarch64 16MB at the first 2MB
-boundary past the kernel image, DTB and DTB initrd. Both arches panic
-at boot if the heap would overlap the kernel image or boot data. The
-heap never grows
-and does not draw on the frame allocator, so heap-heavy workloads hit
-allocation failure long before RAM runs out; to be fixed with the
-allocator redesign (heap backed by frames, slab caches). By the time the
-boot tests reach the network stress test only a few MB are free on x86:
-every TCP TIME_WAIT entry keeps a full control block (about 2 KB) for
-60 s, so a burst of a thousand short connections can starve a later 2 MB
-allocation (busybox exec); the stress test bounds its connections.
+The heap is the slab allocator over the page allocator, so it grows
+with RAM; what is missing: no shrinker (caches give back empty slabs
+beyond two each, but nothing asks them under pressure), no
+/proc/slabinfo, no slab merging, poisoning or red zones. Every TCP
+TIME_WAIT entry keeps a full control block (about 2 KB) for 60 s.
 
-exec no longer copies the binary into memory (it needed a 2.1MB
-contiguous heap block for busybox, which the fragmented heap could not
-always give: x86 `make check LOCKDEP=1` panicked "memory allocation of
-2124608 bytes failed"): `kernel/task/exec.rs` reads the ELF headers in
-bounded pieces and each PT_LOAD page straight into its user frame
-(reserve-checked like any user page). The segments are still copied at
-exec, not mapped from the page cache like Linux binfmt_elf. Each new pid that opens `/proc/self/...`
-also keeps ~1.6-2.9KB of heap after exit (suspected: procfs dentries of
-dead pids never freed; unconfirmed).
+Heap allocations cannot fail gracefully (Rust's global allocator): one
+the page allocator cannot meet panics. The heap goes down to the min
+watermark while user data stops at low, so only kernel objects can get
+there (no memcg or OOM killer bounds what a process pins in pipes,
+sockets or fds); a large contiguous kmalloc can fail first (over 4MB
+always, no vmalloc; above low - min, about 700KB at 512MB, once free
+memory is near the low watermark).
+
+exec copies the PT_LOAD segments page by page at exec (not mapped from
+the page cache like Linux binfmt_elf). Kernel object leaks now cost
+free memory (the heap is no longer a separate region): each fork+exec
+keeps two dentries and two inodes plus ~900 bytes of kmalloc (~1.3KB;
+suspected: procfs entries of dead pids, fixed with the dcache work);
+each exited non-leader thread keeps its zombie task (~1KB). The MM_LIFE
+tests count MemFree + Slab so they check user memory only; these leaks
+are listed here instead.
 
 ## Unconfirmed: Arc<T> field corruption in the USB mass-storage driver
 

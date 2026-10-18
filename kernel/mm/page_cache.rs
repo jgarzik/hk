@@ -15,7 +15,6 @@
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -264,6 +263,18 @@ pub struct CachedPage {
     /// Similar to Linux's PG_locked bit / folio_lock().
     /// Must be held when reading from or writing to the page frame.
     locked: AtomicBool,
+
+    /// The page owns its frame (anonymous pipe pages): freed with the
+    /// last `Arc` of it. Page-cache pages are freed by the cache.
+    owns_frame: bool,
+}
+
+impl Drop for CachedPage {
+    fn drop(&mut self) {
+        if self.owns_frame {
+            crate::FRAME_ALLOCATOR.free(self.frame);
+        }
+    }
 }
 
 impl CachedPage {
@@ -277,7 +288,16 @@ impl CachedPage {
             dirty: AtomicBool::new(false),
             writeback: AtomicBool::new(false),
             locked: AtomicBool::new(false),
+            owns_frame: false,
         }
+    }
+
+    /// An anonymous page owning `frame` (pipe buffers): the frame is
+    /// freed when the last reference to the page goes
+    pub fn new_owned(frame: u64) -> Self {
+        let mut p = Self::new(frame, FileId::anonymous(), 0);
+        p.owns_frame = true;
+        p
     }
 
     /// Create a new cached page marked as dirty (initially unlocked)
@@ -290,6 +310,7 @@ impl CachedPage {
             dirty: AtomicBool::new(true),
             writeback: AtomicBool::new(false),
             locked: AtomicBool::new(false),
+            owns_frame: false,
         }
     }
 
@@ -619,10 +640,10 @@ impl AddressSpace {
         self.inner.write().pages.remove(&page_offset)
     }
 
-    /// Remove and return all pages
-    fn take_pages(&self) -> Vec<Arc<CachedPage>> {
-        let pages = core::mem::take(&mut self.inner.write().pages);
-        pages.into_values().collect()
+    /// Remove and return all pages (the index itself: freeing a file
+    /// must not need a large allocation when memory is short)
+    fn take_pages(&self) -> BTreeMap<u64, Arc<CachedPage>> {
+        core::mem::take(&mut self.inner.write().pages)
     }
 
     /// Number of cached pages
@@ -1130,11 +1151,11 @@ impl PageCache {
     fn free_unevictable<FA: FrameAlloc<PhysAddr = u64>>(
         &self,
         space: &AddressSpace,
-        pages: Vec<Arc<CachedPage>>,
+        pages: BTreeMap<u64, Arc<CachedPage>>,
         frame_alloc: &mut FA,
     ) -> usize {
         let n = pages.len();
-        for p in pages {
+        for p in pages.into_values() {
             frame_alloc.put_frame(p.frame);
         }
         self.account(Some(space), n, false);
@@ -1307,26 +1328,12 @@ impl PageCache {
             None => return 0,
         };
 
-        // Collect page offsets to remove (those >= from_page_offset)
-        let pages_to_remove: alloc::vec::Vec<u64> = {
-            let inner = addr_space.inner.read();
-            inner
-                .pages
-                .keys()
-                .filter(|&&offset| offset >= from_page_offset)
-                .cloned()
-                .collect()
-        };
-
-        if pages_to_remove.is_empty() {
+        // Detach the pages at and past the offset (no allocation sized
+        // by the file: truncation must work when memory is short)
+        let removed = addr_space.inner.write().pages.split_off(&from_page_offset);
+        if removed.is_empty() {
             return 0;
         }
-
-        // Remove pages from address space
-        let removed: Vec<Arc<CachedPage>> = pages_to_remove
-            .iter()
-            .filter_map(|&offset| addr_space.remove_page(offset))
-            .collect();
         if addr_space.is_unevictable() {
             return self.free_unevictable(&addr_space, removed, frame_alloc);
         }

@@ -35,9 +35,11 @@ Linux: `Documentation/arch/x86/x86_64/mm.rst`.
   the kernel table (no low mappings). The AP trampoline (copied to
   physical 0x8000) enables paging on the boot table (identity map plus
   the kernel half) and `ap_entry` switches to the kernel table.
-- **Kernel memory**: the heap is a fixed physical range after the boot
-  modules, used through the direct map; kernel stacks and DMA buffers
-  are physically contiguous frame runs, also through the direct map.
+- **Kernel memory**: the heap is the slab allocator (`mm/slab.rs`,
+  kmalloc caches 8 B-8 KB, pages above) over the page allocator,
+  through the direct map (a 256 KB boot arena in the image serves boot
+  until the page allocator is up); kernel stacks and DMA buffers are
+  physically contiguous frame runs, also through the direct map.
 
 ## arm64 (4KB granule, 48-bit virtual)
 
@@ -142,11 +144,12 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   back, or a write-protected page made writable (copied first if still
   shared copy-on-write). Unresolved: SIGSEGV or SIGBUS for a user
   access, EFAULT for a kernel uaccess.
-- Out of memory: pages for user data and user page tables stop at the
-  zone's low watermark (vm.min_free_kbytes, Linux's formula,
-  `mm/page_alloc.rs`); kernel allocations go on to min, `__GFP_HIGH`
-  ones (the kernel heap) to half of it, atomic ones a quarter lower
-  (Linux would reclaim between low and min; hk has no reclaim yet). mlock that cannot fault its range in fails with EAGAIN. A user fault that finds no memory kills its process
+- Out of memory: pages for user data (pipe buffers included) and user
+  page tables stop at the zone's low watermark (vm.min_free_kbytes,
+  Linux's formula, `mm/page_alloc.rs`); kernel allocations, the heap
+  included, go on to min; `__GFP_HIGH` ones to half of it, atomic ones
+  (the heap in interrupt context) a quarter lower (Linux would reclaim
+  between low and min; hk has no reclaim yet). mlock that cannot fault its range in fails with EAGAIN. A user fault that finds no memory kills its process
   with SIGKILL, logged as `Out of memory: Killed process <pid> (<comm>)`
   (Linux pagefault_out_of_memory; hk has no OOM killer choosing another
   victim, and never retries the fault in a loop); a kernel uaccess that
