@@ -440,6 +440,13 @@ impl UserModeOps for Aarch64Arch {
                 // The image's code was synced to the instruction caches
                 // when exec loaded it (paging::sync_page)
 
+                // Mask every exception first: exec runs with interrupts
+                // on, and an IRQ taken between the ELR_EL1/SPSR_EL1
+                // writes and ERET overwrote them with its own return
+                // (EL1, here): ERET then entered EL0 at a kernel
+                // address. ERET restores DAIF from SPSR (all clear).
+                "msr daifset, #0xf",
+
                 // Set up user stack pointer (SP_EL0)
                 "msr sp_el0, {user_stack}",
 
