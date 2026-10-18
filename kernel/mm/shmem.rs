@@ -11,11 +11,11 @@
 //! mapping one another; the pages go with the last VMA (`Arc`). Its size
 //! is fixed at creation; a page past it is SIGBUS.
 //!
-//! The page index is a radix tree like a page table (Linux uses the
-//! page cache's xarray): four levels of 512-entry nodes, each node a
-//! frame of user memory, allocated as pages are touched. Nothing is
-//! taken from the kernel heap: what a process can make the kernel hold
-//! for it stops at the low watermark like its pages.
+//! The page index is an [`XArray`] (Linux uses the page cache's
+//! xarray) whose nodes are frames of user memory, allocated as pages
+//! are touched. Nothing is taken from the kernel heap: what a process
+//! can make the kernel hold for it stops at the low watermark like its
+//! pages.
 //!
 //! Locking: `Shmem.root` is a spin lock taken by the fault path under
 //! the mm lock (mm lock -> Shmem.root) and by MADV_REMOVE with no lock
@@ -25,93 +25,25 @@
 use alloc::sync::Arc;
 
 use super::fault::VmFault;
+use super::xarray::XArray;
 use crate::FRAME_ALLOCATOR;
 use crate::arch::phys_to_virt;
 use crate::sync::spin::Mutex;
-
-/// Index bits per tree level (512 entries a node)
-const BITS: u32 = 9;
-
-/// Tree levels below the root: 4 levels index 2^36 pages, more than a
-/// mapping can hold (TASK_SIZE / 4KB)
-const LEVELS: u32 = 4;
 
 /// The pages of a shared anonymous object, by page index
 pub struct Shmem {
     /// Size in pages, fixed at creation (Linux i_size of the shmem file)
     size: u64,
-    /// Root node of the index (a frame; 0 until the first page)
-    root: Mutex<u64>,
-}
-
-/// Entry `i` (mod 512) of the node frame `node`
-fn slot(node: u64, i: u64) -> &'static mut u64 {
-    // SAFETY: a node frame owned by the object, through the direct map;
-    // used under its lock (or by its drop)
-    unsafe { &mut *(phys_to_virt(node) as *mut u64).add((i & 511) as usize) }
+    /// The pages by index
+    root: Mutex<XArray>,
 }
 
 /// A zeroed frame of user memory
-fn zeroed() -> Result<u64, VmFault> {
-    let f = super::fault::alloc_user().ok_or(VmFault::Oom)?;
+fn zeroed() -> Option<u64> {
+    let f = super::fault::alloc_user()?;
     // SAFETY: a fresh frame, reached through the direct map
     unsafe { core::ptr::write_bytes(phys_to_virt(f), 0, 4096) };
-    Ok(f)
-}
-
-/// The leaf entry of page `idx` under `root`, creating missing nodes
-fn walk(root: &mut u64, idx: u64) -> Result<&'static mut u64, VmFault> {
-    if *root == 0 {
-        *root = zeroed()?;
-    }
-    let mut node = *root;
-    for level in (1..LEVELS).rev() {
-        let e = slot(node, idx >> (BITS * level));
-        if *e == 0 {
-            *e = zeroed()?;
-        }
-        node = *e;
-    }
-    Ok(slot(node, idx))
-}
-
-/// Visit the pages of node `node` at `level` (0: a leaf) whose indexes
-/// fall in [from, to); `base` is the node's first index. Empty subtrees
-/// are skipped.
-fn each_page(node: u64, level: u32, base: u64, from: u64, to: u64, f: &mut dyn FnMut(&mut u64)) {
-    let span = 1u64 << (BITS * level);
-    for i in 0..512u64 {
-        let lo = base + i * span;
-        if lo >= to || lo + span <= from {
-            continue;
-        }
-        let e = slot(node, i);
-        if *e == 0 {
-            continue;
-        }
-        if level == 0 {
-            f(e);
-        } else {
-            each_page(*e, level - 1, lo, from, to, f);
-        }
-    }
-}
-
-/// Free node `node` at `level` and everything below it, dropping the
-/// object's reference on each page
-fn free_node(node: u64, level: u32) {
-    for i in 0..512 {
-        let e = *slot(node, i);
-        if e == 0 {
-            continue;
-        }
-        if level == 0 {
-            FRAME_ALLOCATOR.decref(e);
-        } else {
-            free_node(e, level - 1);
-        }
-    }
-    FRAME_ALLOCATOR.free(node);
+    Some(f)
 }
 
 impl Shmem {
@@ -119,7 +51,7 @@ impl Shmem {
     pub fn new(size: u64) -> Arc<Self> {
         Arc::new(Self {
             size,
-            root: Mutex::new(0),
+            root: Mutex::new(XArray::new()),
         })
     }
 
@@ -132,14 +64,18 @@ impl Shmem {
             return Err(VmFault::Bus);
         }
         let mut root = self.root.lock();
-        let e = walk(&mut root, idx)?;
-        if *e == 0 {
-            *e = zeroed()?;
+        let mut page = root.load(idx);
+        if page == 0 {
+            page = zeroed().ok_or(VmFault::Oom)?;
+            if root.store(idx, page, &mut zeroed).is_none() {
+                FRAME_ALLOCATOR.free(page);
+                return Err(VmFault::Oom);
+            }
         }
         // The object holds a reference until `root` is unlocked
-        let held = FRAME_ALLOCATOR.incref(*e);
+        let held = FRAME_ALLOCATOR.incref(page);
         debug_assert!(held);
-        Ok(*e)
+        Ok(page)
     }
 
     /// Clear the pages at indexes [from, to) (MADV_REMOVE, Linux
@@ -151,11 +87,7 @@ impl Shmem {
         if from >= to {
             return;
         }
-        let root = self.root.lock();
-        if *root == 0 {
-            return;
-        }
-        each_page(*root, LEVELS - 1, 0, from, to, &mut |e| {
+        self.root.lock().for_each(from, to, &mut |_, e| {
             if FRAME_ALLOCATOR.refcount(*e) <= 1 {
                 FRAME_ALLOCATOR.decref(core::mem::take(e));
             } else {
@@ -168,9 +100,8 @@ impl Shmem {
 
 impl Drop for Shmem {
     fn drop(&mut self) {
-        let root = *self.root.get_mut();
-        if root != 0 {
-            free_node(root, LEVELS - 1);
-        }
+        self.root.get_mut().destroy(&mut |page| {
+            FRAME_ALLOCATOR.decref(page);
+        });
     }
 }

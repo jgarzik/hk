@@ -183,7 +183,7 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   MADV_DONTNEED keeps the data (MADV_REMOVE clears it for every
   mapping: a page mapped elsewhere is zeroed in place, others freed).
   Its size is fixed at mmap (a page past it, after mremap grew the
-  mapping, is SIGBUS, as on Linux); its pages and its index (a 4-level
+  mapping, is SIGBUS, as on Linux); its pages and its index (an `mm::xarray`, a 4-level
   radix tree of 512-entry nodes, like a page table) are user memory
   from frames, none from the kernel heap (they stop at the kernel's
   reserve; a fault out of memory kills the process). The object holds

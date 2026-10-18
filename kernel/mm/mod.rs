@@ -45,6 +45,7 @@ pub mod syscall;
 pub mod tlb;
 pub mod vma;
 pub mod writeback;
+pub mod xarray;
 
 pub use swap::{
     SWAP_FLAG_DISCARD, SWAP_FLAG_PREFER, alloc_swap_entry, free_swap_entry, get_swap_info,
