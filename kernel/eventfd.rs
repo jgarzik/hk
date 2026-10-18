@@ -25,7 +25,6 @@
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
@@ -76,32 +75,15 @@ pub struct Eventfd {
     inner: IrqSpinlock<EventfdInner>,
     /// Wait queue for blocking readers/writers
     wait_queue: WaitQueue,
-    /// Unique ID for this eventfd
-    id: u64,
 }
-
-/// Global counter for eventfd IDs
-static NEXT_EVENTFD_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Global eventfd registry (maps ID -> weak ref)
-static EVENTFD_REGISTRY: IrqSpinlock<alloc::vec::Vec<(u64, Weak<Eventfd>)>> =
-    IrqSpinlock::new(alloc::vec::Vec::new());
 
 impl Eventfd {
     /// Create a new eventfd
     pub fn new(initval: u64, flags: i32) -> Arc<Self> {
-        let id = NEXT_EVENTFD_ID.fetch_add(1, Ordering::Relaxed);
-        let eventfd = Arc::new(Self {
+        Arc::new(Self {
             inner: IrqSpinlock::new(EventfdInner::new(initval, flags)),
             wait_queue: WaitQueue::new(),
-            id,
-        });
-
-        // Register in global registry
-        let weak = Arc::downgrade(&eventfd);
-        EVENTFD_REGISTRY.lock().push((id, weak));
-
-        eventfd
+        })
     }
 
     /// Read the eventfd (returns counter value)
@@ -204,13 +186,6 @@ impl Eventfd {
 
         events
     }
-
-    /// Release the eventfd (unregister)
-    fn release(&self) {
-        // Remove from registry
-        let mut registry = EVENTFD_REGISTRY.lock();
-        registry.retain(|(id, _)| *id != self.id);
-    }
 }
 
 /// File operations for eventfd
@@ -259,12 +234,6 @@ impl FileOps for EventfdFileOps {
             return POLLERR;
         };
         eventfd.poll(pt)
-    }
-
-    fn release(&self, file: &File) -> Result<(), KernelError> {
-        let eventfd = file.private_ref::<Eventfd>().ok_or(KernelError::BadFd)?;
-        eventfd.release();
-        Ok(())
     }
 }
 

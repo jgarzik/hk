@@ -33,7 +33,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
@@ -217,25 +217,15 @@ pub struct Inotify {
     inner: IrqSpinlock<InotifyInner>,
     /// Wait queue for blocking readers
     wait_queue: WaitQueue,
-    /// Unique ID for this instance
-    id: u64,
 }
-
-/// Global counter for inotify IDs
-static NEXT_INOTIFY_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Global cookie counter for rename event pairing
 static NEXT_RENAME_COOKIE: AtomicI32 = AtomicI32::new(1);
 
-/// Global inotify registry for event dispatch
-static INOTIFY_REGISTRY: IrqSpinlock<Vec<(u64, Weak<Inotify>)>> = IrqSpinlock::new(Vec::new());
-
 impl Inotify {
     /// Create a new inotify instance
     pub fn new() -> Arc<Self> {
-        let id = NEXT_INOTIFY_ID.fetch_add(1, Ordering::Relaxed);
-
-        let inotify = Arc::new(Self {
+        Arc::new(Self {
             inner: IrqSpinlock::new(InotifyInner {
                 next_wd: 1,
                 watches: BTreeMap::new(),
@@ -243,14 +233,7 @@ impl Inotify {
                 next_cookie: 0,
             }),
             wait_queue: WaitQueue::new(),
-            id,
-        });
-
-        // Register in global registry
-        let weak = Arc::downgrade(&inotify);
-        INOTIFY_REGISTRY.lock().push((id, weak));
-
-        inotify
+        })
     }
 
     /// Add a watch on a path
@@ -462,28 +445,6 @@ impl Inotify {
         let inner = self.inner.lock();
         inner.events.iter().map(|e| e.serialized_size()).sum()
     }
-
-    /// Release the inotify instance
-    fn release(&self) {
-        let mut registry = INOTIFY_REGISTRY.lock();
-        registry.retain(|(id, _)| *id != self.id);
-    }
-}
-
-impl Default for Inotify {
-    fn default() -> Self {
-        // Note: This creates an unregistered instance - use Inotify::new() instead
-        Self {
-            inner: IrqSpinlock::new(InotifyInner {
-                next_wd: 1,
-                watches: BTreeMap::new(),
-                events: Vec::new(),
-                next_cookie: 0,
-            }),
-            wait_queue: WaitQueue::new(),
-            id: 0,
-        }
-    }
 }
 
 // =============================================================================
@@ -515,12 +476,6 @@ impl FileOps for InotifyFileOps {
             return crate::poll::POLLERR;
         };
         inotify.poll(pt)
-    }
-
-    fn release(&self, file: &File) -> Result<(), KernelError> {
-        let inotify = file.private_ref::<Inotify>().ok_or(KernelError::BadFd)?;
-        inotify.release();
-        Ok(())
     }
 }
 

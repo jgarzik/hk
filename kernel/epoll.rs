@@ -30,7 +30,6 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::fs::KernelError;
@@ -127,31 +126,15 @@ pub struct Eventpoll {
     inner: IrqSpinlock<EventpollInner>,
     /// Wait queue for epoll_wait() callers
     wq: WaitQueue,
-    /// Unique ID for this epoll instance
-    id: u64,
 }
-
-/// Global counter for epoll IDs
-static NEXT_EPOLL_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Global epoll registry (maps ID -> weak ref)
-static EPOLL_REGISTRY: IrqSpinlock<Vec<(u64, Weak<Eventpoll>)>> = IrqSpinlock::new(Vec::new());
 
 impl Eventpoll {
     /// Create a new epoll instance
     pub fn new() -> Arc<Self> {
-        let id = NEXT_EPOLL_ID.fetch_add(1, Ordering::Relaxed);
-        let ep = Arc::new(Self {
+        Arc::new(Self {
             inner: IrqSpinlock::new(EventpollInner::new()),
             wq: WaitQueue::new(),
-            id,
-        });
-
-        // Register in global registry
-        let weak = Arc::downgrade(&ep);
-        EPOLL_REGISTRY.lock().push((id, weak));
-
-        ep
+        })
     }
 
     /// Add a file descriptor to this epoll (EPOLL_CTL_ADD)
@@ -325,13 +308,6 @@ impl Eventpoll {
 
         0
     }
-
-    /// Release the epoll (unregister)
-    fn release(&self) {
-        // Remove from registry
-        let mut registry = EPOLL_REGISTRY.lock();
-        registry.retain(|(id, _)| *id != self.id);
-    }
 }
 
 /// File operations for epoll fd
@@ -359,12 +335,6 @@ impl FileOps for EpollFileOps {
             return crate::poll::POLLERR;
         };
         ep.poll(pt)
-    }
-
-    fn release(&self, file: &File) -> Result<(), KernelError> {
-        let ep = file.private_ref::<Eventpoll>().ok_or(KernelError::BadFd)?;
-        ep.release();
-        Ok(())
     }
 }
 

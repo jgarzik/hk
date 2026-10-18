@@ -42,7 +42,7 @@
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::AtomicU32;
 
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::fs::KernelError;
@@ -441,9 +441,6 @@ pub struct IoUring {
     /// Wait queue for blocking waits
     wq: WaitQueue,
 
-    /// Unique ID
-    id: u64,
-
     /// Ring sizes (immutable after creation, used for mmap)
     #[allow(dead_code)] // Used for mmap in future
     sq_entries: u32,
@@ -455,36 +452,21 @@ pub struct IoUring {
     sqes_size: usize,
 }
 
-/// Global counter for io_uring IDs
-static NEXT_IOURING_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Global io_uring registry
-static IOURING_REGISTRY: IrqSpinlock<Vec<(u64, Weak<IoUring>)>> = IrqSpinlock::new(Vec::new());
-
 impl IoUring {
     /// Create a new io_uring instance
     pub fn new(sq_entries: u32, cq_entries: u32) -> Arc<Self> {
-        let id = NEXT_IOURING_ID.fetch_add(1, Ordering::Relaxed);
-
         // Calculate memory sizes
         let rings_size = Self::calc_rings_size(sq_entries, cq_entries);
         let sqes_size = (sq_entries as usize) * core::mem::size_of::<IoUringSqe>();
 
-        let ring = Arc::new(Self {
+        Arc::new(Self {
             inner: IrqSpinlock::new(IoUringInner::new(sq_entries, cq_entries)),
             wq: WaitQueue::new(),
-            id,
             sq_entries,
             cq_entries,
             rings_size,
             sqes_size,
-        });
-
-        // Register in global registry
-        let weak = Arc::downgrade(&ring);
-        IOURING_REGISTRY.lock().push((id, weak));
-
-        ring
+        })
     }
 
     /// Calculate total ring buffer size
@@ -868,12 +850,6 @@ impl IoUring {
             IORING_OFF_SQES => Some(self.sqes_size),
             _ => None,
         }
-    }
-
-    /// Release the io_uring instance
-    fn release(&self) {
-        let mut registry = IOURING_REGISTRY.lock();
-        registry.retain(|(id, _)| *id != self.id);
     }
 
     // =========================================================================
@@ -1275,12 +1251,6 @@ impl FileOps for IoUringFileOps {
         } else {
             0
         }
-    }
-
-    fn release(&self, file: &File) -> Result<(), KernelError> {
-        let ring = file.private_ref::<IoUring>().ok_or(KernelError::BadFd)?;
-        ring.release();
-        Ok(())
     }
 }
 
