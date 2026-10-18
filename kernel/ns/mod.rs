@@ -33,10 +33,7 @@ use spin::Lazy;
 
 use crate::task::Tid;
 pub use cgroup::{CgroupNamespace, INIT_CGROUP_NS};
-pub use pid::{
-    INIT_PID_NS, PidNamespace, find_task_by_pid_ns, register_task_pids, task_pid_nr,
-    task_pid_nr_ns, unregister_task_pids,
-};
+pub use pid::{INIT_PID_NS, PidNamespace};
 pub use user::{INIT_USER_NS, UidGidExtent, UidGidMap, UserNamespace};
 pub use uts::{__NEW_UTS_LEN, INIT_UTS_NS, NewUtsname, UTS_FIELD_SIZE, UtsNamespace};
 
@@ -486,17 +483,6 @@ pub fn current_mnt_ns() -> Arc<MntNamespace> {
     get_task_ns(tid)
         .map(|ns| ns.mnt_ns.clone())
         .unwrap_or_else(|| INIT_MNT_NS.clone())
-}
-
-/// Get current task's PID namespace
-///
-/// Returns the PID namespace for the calling task, or the init
-/// namespace if no namespace context is set.
-pub fn current_pid_ns() -> Arc<PidNamespace> {
-    let tid = crate::task::percpu::current_tid();
-    get_task_ns(tid)
-        .map(|ns| ns.pid_ns.clone())
-        .unwrap_or_else(|| INIT_PID_NS.clone())
 }
 
 /// Get current task's user namespace

@@ -1722,9 +1722,6 @@ tasks can share the same `NsProxy` (e.g., threads created without CLONE_NEW* fla
 |----------|------|---------|
 | `TASK_NS` | `Mutex<BTreeMap<Tid, Arc<NsProxy>>>` | Global TID→NsProxy mapping |
 | `UtsNamespace.name` | `RwLock<NewUtsname>` | Per-namespace UTS data |
-| `PidNamespace.next_pid` | `Mutex<u32>` | PID allocation within namespace |
-| `PidNamespace.pid_map` | `RwLock<BTreeMap<u32, Tid>>` | PID→TID mapping |
-| `PidNamespace.tid_map` | `RwLock<BTreeMap<Tid, u32>>` | TID→PID mapping |
 | `UserNamespace.uid_map.extents` | `RwLock<Vec<UidGidExtent>>` | UID mapping extents |
 | `UserNamespace.gid_map.extents` | `RwLock<Vec<UidGidExtent>>` | GID mapping extents |
 
