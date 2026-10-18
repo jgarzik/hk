@@ -14,6 +14,7 @@ Linux: `Documentation/arch/x86/x86_64/mm.rst`.
 | `0000000000000000 - 00007fffffffefff` | 128 TB | user space (`TASK_SIZE`) |
 | `ffff888000000000 - ...` | RAM | direct map of all RAM (`PAGE_OFFSET`) |
 | `ffffc90000000000 - ffffc9003fffffff` | 1 GB | vmalloc/ioremap window (`VMALLOC_START`) |
+| `ffffea0000000000 - ...` | 1/64 of RAM | struct page array (`VMEMMAP_START`) |
 | `ffffffff80000000 - ...` | image | kernel image (`__START_KERNEL_map`, -2 GB) |
 
 - **Kernel image**: GRUB loads it at physical 1 MB; it is linked at
@@ -49,6 +50,7 @@ Linux: `Documentation/arch/arm64/memory.rst`.
 | `ffff800040100000 - ...` | image | kernel image (`KIMAGE_OFFSET` + phys) |
 | `ffff800100000000 - ffff80013fffffff` | 1 GB | vmalloc/ioremap window |
 | `ffff800200000000 - ffff80023fffffff` | 1 GB | device window: physical 0-1 GB as Device-nGnRnE (`io_va`) |
+| `fffffc0000000000 - ...` | 1/64 of RAM | struct page array (`VMEMMAP_START`) |
 
 - **TTBR0** holds only user mappings; kernel threads run with an empty
   table (Linux `reserved_pg_dir`). Every user leaf has PXN (never
@@ -99,6 +101,13 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   early allocations (top down below the direct-map end). Every free
   range (memory minus reserved) is then handed to the frame allocator
   once; MemTotal counts those pages (Linux totalram_pages).
+- **struct page** (`mm/page.rs`, Linux SPARSEMEM_VMEMMAP): every pfn
+  of a 128 MB section holding RAM has a 64-byte `Page` at
+  `VMEMMAP_START + pfn * 64`, in frames memblock gives at boot (4 KB
+  mappings; sections without RAM are not backed, `pfn_valid` checks a
+  section bitmap). Pages memblock kept start `PG_RESERVED` and are
+  never freed. Flags, map count, mapping (an anonymous page's AnonVma,
+  which it holds a reference on) and list links live there.
 
 ## User address space (both arches)
 

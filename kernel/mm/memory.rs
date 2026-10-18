@@ -14,7 +14,7 @@ use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd, take_huge_pmd};
 use super::{Mm, PAGE_SIZE, SwapEntry, Vma};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{Leaf, paging};
-use crate::mm::page::page_descriptor;
+use crate::mm::page::phys_to_page;
 
 const ENOMEM: i32 = 12;
 
@@ -28,7 +28,7 @@ pub fn put_page(phys: u64) {
     let fa = &crate::FRAME_ALLOCATOR;
     if fa.refcount(phys) <= 1 {
         release_desc(phys);
-    } else if let Some(pg) = page_descriptor(phys)
+    } else if let Some(pg) = phys_to_page(phys)
         && pg.is_anon()
         && pg.mapcount() > 0
     {
@@ -49,7 +49,7 @@ pub fn put_huge(phys: u64) {
 /// Forget a page's rmap and LRU state: it is about to be freed
 fn release_desc(phys: u64) {
     super::lru::lru_remove(phys);
-    if let Some(pg) = page_descriptor(phys) {
+    if let Some(pg) = phys_to_page(phys) {
         pg.clear_mapping();
         pg.mapcount.store(0, Ordering::Relaxed);
     }
@@ -282,7 +282,7 @@ fn copy_pte(dst: u64, src: u64, addr: u64, cow: bool) -> Result<bool, i32> {
         FRAME_ALLOCATOR.incref(paging::pte_addr(pte));
         // One more mapping of an anonymous page (Linux page_dup_rmap);
         // both mm's anon_vma chains hold the VMA (dup_mm)
-        if let Some(pg) = page_descriptor(paging::pte_addr(pte))
+        if let Some(pg) = phys_to_page(paging::pte_addr(pte))
             && pg.is_anon()
         {
             pg.inc_mapcount();

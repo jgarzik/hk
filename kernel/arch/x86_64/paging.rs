@@ -40,6 +40,10 @@ pub const KERNEL_MAP: u64 = 0xFFFF_FFFF_8000_0000;
 /// vmalloc/ioremap window (Linux: VMALLOC_START)
 pub const VMALLOC_START: u64 = 0xFFFF_C900_0000_0000;
 
+/// Virtual memory map: the struct page array, indexed by pfn (Linux
+/// VMEMMAP_START)
+pub const VMEMMAP_START: u64 = 0xFFFF_EA00_0000_0000;
+
 /// End of user space (Linux: TASK_SIZE_MAX, one guard page below the
 /// non-canonical hole)
 pub const TASK_SIZE: u64 = 0x0000_7FFF_FFFF_F000;

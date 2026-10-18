@@ -795,6 +795,14 @@ pub trait MemoryLayoutOps {
     /// (kernel image, boot modules, DTB, initrd, firmware-reserved
     /// ranges)
     fn memblock_init();
+
+    /// Map the kernel page `va` to RAM at `pa` (writable, never
+    /// executable; the vmemmap); missing tables come from `table`, the
+    /// physical address of a zeroed frame
+    ///
+    /// # Safety
+    /// Boot CPU, before SMP; `va` is unmapped and not in use.
+    unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64);
 }
 
 /// Exception and interrupt controller initialization

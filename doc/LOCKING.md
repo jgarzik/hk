@@ -729,6 +729,23 @@ pub struct BitmapFrameAllocator {
   allocator). `FRAME_ALLOCATOR` may be taken under it (handing the
   free ranges over); nothing else is.
 
+#### struct page (vmemmap)
+
+**Location:** `kernel/mm/page.rs`
+
+- The memory map is built on the boot CPU before SMP and never changes
+  afterwards: `pfn_valid` / `phys_to_page` read the section bitmap
+  lock-free (Acquire, after the Release that published a section).
+- Fields are atomics. Flags, map count and mapping are updated
+  lock-free by their users (fault, fork, unmap); the list links belong
+  to whoever owns the page's list (frame allocator, later slab/LRU) and
+  are touched only under that owner's lock.
+- An anonymous page's mapping holds an AnonVma reference. A freed
+  page's struct page is reset (and that reference dropped) under the
+  frame allocator lock, before the frame can be handed out again;
+  dropping it frees at most an AnonVma (heap memory), which takes no
+  frame allocator lock.
+
 #### Address Spaces (Mm: mm_users / mm_count, mmap_lock)
 
 **Location:** `kernel/mm/mod.rs` (`Mm`, `MmRef`), `kernel/mm/memory.rs`
@@ -765,7 +782,7 @@ pub struct BitmapFrameAllocator {
   the parent's other threads may be faulting, splits 2MB pages and takes
   frame references). munmap / MAP_FIXED / brk shrink / shmdt
   zap pages under it (`munmap_locked`). Order: mm lock → AnonVma lock,
-  `LRU`, page descriptors, swap slots → `FRAME_ALLOCATOR`; nothing taken
+  `LRU`, swap slots → `FRAME_ALLOCATOR`; nothing taken
   under those leaf locks takes an mm lock (the swap rmap walk uses the
   roots recorded in AnonVma chains, not the task table or mm locks).
   `TASK_TABLE` is never held while taking an mm lock.

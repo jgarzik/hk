@@ -235,8 +235,7 @@ static HEAP_RANGE: Mutex<(u64, u64)> = Mutex::new((0, 0));
 static ALLOCATOR: HeapAllocator = HeapAllocator::new();
 
 /// The kernel heap is down to the 2MB kept for the kernel when user
-/// data grows (ramfs pages also cost heap: page descriptors and cache
-/// indexes)
+/// data grows (ramfs pages also cost heap: cache indexes)
 #[cfg(not(test))]
 pub fn heap_low() -> bool {
     const HEAP_RESERVE: usize = 2 * 1024 * 1024;
@@ -738,6 +737,7 @@ fn kmain() -> ! {
     mm::memblock::reserve(heap_start, heap_end - heap_start);
     discover_boot_framebuffer();
     let (lo, hi) = mm::memblock::MEMBLOCK.lock().span();
+    mm::page::vmemmap_init();
     FRAME_ALLOCATOR.init(lo, hi - lo);
     mm::memblock::MEMBLOCK
         .lock()

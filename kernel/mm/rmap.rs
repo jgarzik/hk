@@ -12,9 +12,8 @@
 //!
 //! ## Locking Order
 //!
-//! 1. PAGE_DESCRIPTORS (read)
-//! 2. AnonVma lock
-//! 3. Page table access (no lock, but we flush TLB)
+//! 1. AnonVma lock
+//! 2. Page table access (no lock, but we flush TLB)
 //!
 //! Chains name the address space by its top-level table; exit_mmap and
 //! munmap drop an address space's chains before freeing its tables. A
@@ -31,7 +30,7 @@ use alloc::vec::Vec;
 use crate::mm::Mm;
 
 use crate::mm::anon_vma::{AnonVma, AnonVmaChain};
-use crate::mm::page::{PG_ANON, page_descriptor};
+use crate::mm::page::{PG_ANON, phys_to_page};
 use crate::mm::swap_entry::SwapEntry;
 
 use core::sync::atomic::Ordering;
@@ -72,7 +71,7 @@ pub fn rmap_walk(frame_phys: u64) -> Vec<PteMapping> {
     let mut results = Vec::new();
 
     // Get page descriptor
-    let page = match page_descriptor(frame_phys) {
+    let page = match phys_to_page(frame_phys) {
         Some(p) => p,
         None => return results,
     };
@@ -166,7 +165,7 @@ pub fn try_to_unmap(frame_phys: u64, swap_entry: SwapEntry) -> usize {
         if replace_pte_with_swap(&mapping, frame_phys, swap_entry).is_ok() {
             unmapped += 1;
             // Decrement mapcount
-            if let Some(page) = page_descriptor(frame_phys) {
+            if let Some(page) = phys_to_page(frame_phys) {
                 page.dec_mapcount();
             }
         }
@@ -187,7 +186,7 @@ pub fn try_to_unmap_clear(frame_phys: u64) -> usize {
     for mapping in mappings {
         if clear_pte(&mapping, frame_phys).is_ok() {
             unmapped += 1;
-            if let Some(page) = page_descriptor(frame_phys) {
+            if let Some(page) = phys_to_page(frame_phys) {
                 page.dec_mapcount();
             }
         }
@@ -277,7 +276,7 @@ fn set_mapped(m: &PteMapping, expected_phys: u64, new: u64) -> Result<(), ()> {
 /// * `anon_vma` - The VMA's anon_vma for reverse mapping
 /// * `vaddr` - Virtual address (stored in page->index for debugging)
 pub fn page_add_anon_rmap(frame_phys: u64, anon_vma: &Arc<AnonVma>, vaddr: u64) {
-    if let Some(page) = page_descriptor(frame_phys) {
+    if let Some(page) = phys_to_page(frame_phys) {
         page.set_flag(PG_ANON);
         page.set_anon_mapping(anon_vma);
         page.index.store(vaddr, Ordering::Relaxed);
@@ -289,7 +288,7 @@ pub fn page_add_anon_rmap(frame_phys: u64, anon_vma: &Arc<AnonVma>, vaddr: u64) 
 ///
 /// Clears the page descriptor's mapping and flags.
 pub fn page_remove_rmap(frame_phys: u64) {
-    if let Some(page) = page_descriptor(frame_phys) {
+    if let Some(page) = phys_to_page(frame_phys) {
         let old_mapcount = page.dec_mapcount();
         if old_mapcount == 0 {
             // Last mapping removed

@@ -24,7 +24,7 @@ use core::sync::atomic::Ordering;
 
 use crate::sync::spin::Mutex;
 
-use crate::mm::page::{PG_ACTIVE, PG_LRU, page_descriptor};
+use crate::mm::page::{PG_ACTIVE, PG_LRU, phys_to_page};
 
 // ============================================================================
 // LRU Lists
@@ -56,7 +56,7 @@ impl LruLists {
     /// The page starts on inactive and can be promoted on second access.
     pub fn add_new(&mut self, frame: u64) {
         // Update page descriptor flags
-        if let Some(page) = page_descriptor(frame) {
+        if let Some(page) = phys_to_page(frame) {
             page.set_flag(PG_LRU);
             page.clear_flag(PG_ACTIVE);
         }
@@ -75,7 +75,7 @@ impl LruLists {
             self.active.push_back(frame);
 
             // Update page descriptor
-            if let Some(page) = page_descriptor(frame) {
+            if let Some(page) = phys_to_page(frame) {
                 page.set_flag(PG_ACTIVE);
             }
             return;
@@ -93,7 +93,7 @@ impl LruLists {
     /// Called when a page is freed or swapped out.
     pub fn remove(&mut self, frame: u64) {
         // Update page descriptor
-        if let Some(page) = page_descriptor(frame) {
+        if let Some(page) = phys_to_page(frame) {
             page.clear_flag(PG_LRU | PG_ACTIVE);
         }
 
@@ -122,7 +122,7 @@ impl LruLists {
         let frame = self.inactive.pop_front()?;
 
         // Update page descriptor
-        if let Some(page) = page_descriptor(frame) {
+        if let Some(page) = phys_to_page(frame) {
             page.clear_flag(PG_LRU | PG_ACTIVE);
         }
 
@@ -140,7 +140,7 @@ impl LruLists {
         for _ in 0..demote_count {
             if let Some(frame) = self.active.pop_front() {
                 // Update page descriptor
-                if let Some(page) = page_descriptor(frame) {
+                if let Some(page) = phys_to_page(frame) {
                     page.clear_flag(PG_ACTIVE);
                 }
                 self.inactive.push_back(frame);
@@ -196,12 +196,10 @@ pub static LRU: Mutex<LruLists> = Mutex::new(LruLists::new());
 
 /// Add a new page to LRU (convenience wrapper)
 #[inline]
-pub fn lru_add_new(frame: u64) {
-    // Membership is tracked by PG_LRU: without a page descriptor the page
-    // could never be taken off again (and the lists would only grow)
-    if page_descriptor(frame).is_some() {
-        LRU.lock().add_new(frame);
-    }
+pub fn lru_add_new(_frame: u64) {
+    // Not yet: these lists find a page by linear search, so taking each
+    // freed page off them would be quadratic in resident memory. Pages
+    // join the LRU once the lists are intrusive (struct page links).
 }
 
 /// Mark page as accessed (convenience wrapper)
@@ -213,7 +211,7 @@ pub fn lru_mark_accessed(frame: u64) {
 /// Remove page from LRU (convenience wrapper)
 #[inline]
 pub fn lru_remove(frame: u64) {
-    if page_descriptor(frame).is_some_and(|p| p.flags.load(Ordering::Relaxed) & PG_LRU != 0) {
+    if phys_to_page(frame).is_some_and(|p| p.flags.load(Ordering::Relaxed) & PG_LRU != 0) {
         LRU.lock().remove(frame);
     }
 }

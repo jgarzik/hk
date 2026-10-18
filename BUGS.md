@@ -60,11 +60,11 @@ SO_PEEK_OFF is EOPNOTSUPP.
 Address spaces are reference counted and torn down like Linux
 (doc/MEMORY.md, Address space lifetime); what is still missing:
 
-- Page descriptors are never initialized (`init_page_descriptors` has
-  no caller), so rmap, the LRU lists and swap-out are inert. Before
-  enabling them: `set_anon_mapping` stores an AnonVma pointer without
-  taking a reference while `clear_mapping` drops one, swap-out frees a
-  frame even when the rmap walk missed a mapping, swap slots carry no
+- Every frame has a struct page (vmemmap) and anonymous pages join the
+  rmap (each holds an AnonVma reference), but the LRU lists stay empty
+  (`lru_add_new` is a no-op: removal is a linear search) and nothing
+  calls swap-out, so reclaim is inert. Before enabling swap-out:
+  swap-out frees a frame even when the rmap walk missed a mapping, swap slots carry no
   reference counts (`free_swap_entry` frees at once), the swap cache is
   never filled (`swap_cache_add` has no caller) and freeing a slot does
   not drop a swap-cache entry (Linux SWAP_HAS_CACHE), and munmap leaks

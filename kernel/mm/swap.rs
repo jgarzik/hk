@@ -747,7 +747,7 @@ pub fn swap_available() -> bool {
 /// - `None` if no pages could be swapped out
 pub fn try_to_swap_out() -> Option<SwapEntry> {
     use crate::mm::lru::LRU;
-    use crate::mm::page::page_descriptor;
+    use crate::mm::page::phys_to_page;
     use crate::mm::rmap::try_to_unmap;
 
     if !swap_available() {
@@ -761,7 +761,7 @@ pub fn try_to_swap_out() -> Option<SwapEntry> {
         let frame = lru.get_victim()?;
 
         // Check page descriptor
-        let page = match page_descriptor(frame) {
+        let page = match phys_to_page(frame) {
             Some(p) => p,
             None => {
                 lru.pop_victim(); // Remove invalid entry
@@ -822,7 +822,7 @@ pub fn try_to_swap_out() -> Option<SwapEntry> {
         }
 
         // Clear page descriptor
-        if let Some(page) = page_descriptor(frame) {
+        if let Some(page) = phys_to_page(frame) {
             page.clear_mapping();
         }
 

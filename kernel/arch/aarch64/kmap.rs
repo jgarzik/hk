@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::paging::{
     AF, AP_EL1_RO, AP_EL1_RW, ATTR_IDX_DEVICE, ATTR_IDX_NORMAL, IO_BASE, IO_SIZE, KIMAGE_OFFSET,
-    PAGE_OFFSET, PAGE_SIZE, PXN, RawPageTable, SH_INNER, UXN, phys_to_virt_table,
+    PAGE_OFFSET, PAGE_SIZE, PXN, RawPageTable, SH_INNER, UXN, VMEMMAP_START, phys_to_virt_table,
 };
 
 /// Page-table pages for the boot-built kernel tables
@@ -195,6 +195,8 @@ pub unsafe fn init(dtb: u64) {
         DIRECT_END.store(end, Ordering::Relaxed);
         map_image(root);
         map_io(root);
+        // vmemmap's top-level entry (filled by `map_page`)
+        next(root, idx(VMEMMAP_START, 39));
         // Table writes must reach memory before the walker uses them
         asm!("dsb ishst", options(nostack));
         // The switch runs from the identity map (TTBR0), so no TTBR1
@@ -205,6 +207,29 @@ pub unsafe fn init(dtb: u64) {
         f(swapper_phys(), reserved_phys());
     }
     drop_idmap();
+}
+
+/// Map the kernel page `va` to `pa` (normal memory, writable, never
+/// executable) in TTBR1; missing tables come from `table` (the
+/// physical address of a zeroed frame)
+///
+/// # Safety
+/// Boot CPU, before SMP; `va` is unmapped and not in use.
+pub unsafe fn map_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+    unsafe {
+        let mut t = &raw mut SWAPPER;
+        for shift in [39, 30, 21] {
+            let e = (*t).entry_mut(idx(va, shift));
+            if !e.is_valid() {
+                e.set_table(table());
+            }
+            t = phys_to_virt_table(e.addr());
+        }
+        let attrs = AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL1_RW | PXN | UXN;
+        (*t).entry_mut(idx(va, 12)).set_page(pa, attrs);
+        // The walker sees the entry before the first access
+        asm!("dsb ishst", "isb", options(nostack));
+    }
 }
 
 /// Leave the boot identity map on this CPU (APs, after reaching the

@@ -795,6 +795,10 @@ impl MemoryLayoutOps for Aarch64Arch {
         }
         dtb::for_each_firmware_reserved(dtb, |base, size| mb.reserve(base, size));
     }
+
+    unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+        unsafe { kmap::map_page(va, pa, table) }
+    }
 }
 
 impl ExceptionOps for Aarch64Arch {

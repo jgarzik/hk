@@ -149,6 +149,10 @@ impl BitmapFrameAllocator {
         let first = start.saturating_sub(inner.base).div_ceil(FRAME_SIZE as u64) as usize;
         let last = (end.saturating_sub(inner.base) / FRAME_SIZE as u64) as usize;
         for f in first..last.min(inner.total_frames) {
+            let pa = inner.base + (f * FRAME_SIZE) as u64;
+            if let Some(pg) = crate::mm::page::phys_to_page(pa) {
+                pg.clear_flag(crate::mm::page::PG_RESERVED);
+            }
             inner.set_free(f, true);
             inner.managed += 1;
         }
@@ -196,6 +200,7 @@ impl BitmapFrameAllocator {
             return;
         };
         if frame_idx < inner.total_frames {
+            release(frame);
             inner.set_free(frame_idx, true);
             inner.refcounts[frame_idx] = 0;
 
@@ -237,6 +242,7 @@ impl BitmapFrameAllocator {
 
             if inner.refcounts[frame_idx] == 0 {
                 // Frame is no longer referenced, free it
+                release(frame);
                 inner.set_free(frame_idx, true);
 
                 // Update hint
@@ -379,6 +385,7 @@ impl BitmapFrameAllocator {
         let word_start = frame_idx / 64;
 
         // Mark all 512 frames as free (set all 8 words to all 1s)
+        release(frame);
         for w in 0..WORDS_PER_HUGE_PAGE {
             inner.set_word(word_start + w, !0u64);
         }
@@ -452,6 +459,7 @@ impl BitmapFrameAllocator {
             const WORDS_PER_HUGE_PAGE: usize = FRAMES_PER_HUGE_PAGE / 64;
             let word_start = frame_idx / 64;
 
+            release(frame);
             for w in 0..WORDS_PER_HUGE_PAGE {
                 inner.set_word(word_start + w, !0u64);
             }
@@ -675,6 +683,16 @@ impl FrameAlloc for FrameAllocRef<'_> {
 
     fn put_frame(&mut self, frame: Self::PhysAddr) {
         self.0.decref(frame);
+    }
+}
+
+/// A frame is being freed: reset its struct page (a reallocated frame
+/// starts clean) and drop the anon_vma reference it held. Under the
+/// allocator lock (`IrqSpinlock`): the release frees at most an AnonVma
+/// (heap), which never takes the frame allocator.
+fn release(frame: u64) {
+    if let Some(pg) = crate::mm::page::phys_to_page(frame) {
+        crate::mm::page::put_mapping(pg.free_prepare());
     }
 }
 

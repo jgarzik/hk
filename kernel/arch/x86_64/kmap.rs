@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::paging::{
     KERNEL_MAP, PAGE_HUGE, PAGE_NO_EXECUTE, PAGE_OFFSET, PAGE_PRESENT, PAGE_SIZE, PAGE_WRITABLE,
-    RawPageTable, VMALLOC_START, phys_to_virt_table,
+    RawPageTable, VMALLOC_START, VMEMMAP_START, phys_to_virt_table,
 };
 use crate::multiboot2;
 
@@ -203,9 +203,36 @@ pub unsafe fn init(mbi: u64) {
         let pml4 = &raw mut SWAPPER;
         map_direct(pml4, &ram[..n]);
         map_image(pml4);
-        // vmalloc/ioremap PDPT: present before any address space copies
+        // vmalloc/ioremap and vmemmap PDPTs: present before any address
+        // space copies the kernel half
         next(pml4, idx(VMALLOC_START, 39));
+        next(pml4, idx(VMEMMAP_START, 39));
         core::arch::asm!("mov cr3, {}", in(reg) swapper_phys(), options(nostack));
+    }
+}
+
+/// Map the kernel page `va` to `pa` (writable, never executable) below
+/// a top-level entry `init` created; missing lower tables come from
+/// `table` (the physical address of a zeroed frame)
+///
+/// # Safety
+/// Boot CPU, before SMP; `va` is unmapped and not in use.
+pub unsafe fn map_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+    unsafe {
+        let mut t = &raw mut SWAPPER;
+        assert!(
+            (*t).entry(idx(va, 39)).is_present(),
+            "kmap: no top-level entry"
+        );
+        for shift in [39, 30, 21] {
+            let e = (*t).entry_mut(idx(va, shift));
+            if !e.is_present() {
+                e.set(table(), PAGE_PRESENT | PAGE_WRITABLE);
+            }
+            t = phys_to_virt_table(e.addr());
+        }
+        let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE;
+        (*t).entry_mut(idx(va, 12)).set(pa, flags);
     }
 }
 

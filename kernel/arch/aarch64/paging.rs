@@ -47,6 +47,10 @@ pub const IO_BASE: u64 = 0xFFFF_8002_0000_0000;
 /// Size of the device window
 pub const IO_SIZE: u64 = 1 << 30;
 
+/// Virtual memory map: the struct page array, indexed by pfn (Linux
+/// arm64 48-bit VMEMMAP_START)
+pub const VMEMMAP_START: u64 = 0xFFFF_FC00_0000_0000;
+
 /// End of user space: all of TTBR0 (48-bit)
 pub const TASK_SIZE: u64 = 1 << 48;
 

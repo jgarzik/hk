@@ -426,6 +426,10 @@ impl MemoryLayoutOps for X86_64Arch {
             crate::multiboot2::boot_ranges(mbi, |_, s, e| mb.reserve(s, e.saturating_sub(s)))
         };
     }
+
+    unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+        unsafe { kmap::map_page(va, pa, table) }
+    }
 }
 
 impl ExceptionOps for X86_64Arch {
