@@ -159,7 +159,7 @@ pub struct UserTaskConfig {
 const PAGE_SIZE: u64 = 4096;
 
 /// Sleep state of a task (Linux TASK_RUNNING / TASK_INTERRUPTIBLE /
-/// TASK_UNINTERRUPTIBLE)
+/// TASK_UNINTERRUPTIBLE / TASK_KILLABLE)
 ///
 /// This is the scheduling source of truth for sleeping, kept in the owning
 /// CPU's run queue (IRQ-safe lock) so wakers in IRQ context can use it.
@@ -172,6 +172,9 @@ pub enum SleepState {
     Interruptible,
     /// Sleeping; woken only by explicit wakeups / timeouts
     Uninterruptible,
+    /// Sleeping; woken by explicit wakeups / timeouts and by SIGKILL
+    /// only (Linux TASK_KILLABLE)
+    Killable,
 }
 
 /// Which sleepers a wakeup may wake
@@ -181,6 +184,22 @@ pub enum WakeMode {
     Any,
     /// Signal wakeup: wakes only `SleepState::Interruptible` sleepers
     Interruptible,
+    /// Fatal signal (SIGKILL) wakeup: wakes `Interruptible` and
+    /// `Killable` sleepers
+    Fatal,
+}
+
+impl WakeMode {
+    /// One wakeup standing for both `self` and `other`: it wakes every
+    /// sleeper either would (Any > Fatal > Interruptible)
+    pub fn merge(self, other: WakeMode) -> WakeMode {
+        use WakeMode::*;
+        match (self, other) {
+            (Any, _) | (_, Any) => Any,
+            (Fatal, _) | (_, Fatal) => Fatal,
+            _ => Interruptible,
+        }
+    }
 }
 
 /// Per-thread kernel context and scheduling state (owned by one CPU's rq)
@@ -349,8 +368,9 @@ impl CpuRunQueue {
             Some(e) => match (e.state, mode) {
                 (SleepState::Running, _) => false,
                 (SleepState::Interruptible, _) => true,
-                (SleepState::Uninterruptible, WakeMode::Any) => true,
-                (SleepState::Uninterruptible, WakeMode::Interruptible) => false,
+                (SleepState::Uninterruptible | SleepState::Killable, WakeMode::Any) => true,
+                (SleepState::Killable, WakeMode::Fatal) => true,
+                (SleepState::Uninterruptible, _) | (SleepState::Killable, _) => false,
             },
             None => false,
         };
@@ -437,13 +457,12 @@ impl PerCpuScheduler {
     }
 
     /// Post a remote wakeup without allocating: a task already listed
-    /// keeps one entry (`Any` wins over `Interruptible`)
+    /// keeps one entry, with the mode that wakes the most sleepers (a
+    /// merged SIGKILL must still wake a `Killable` sleeper)
     fn post_wake(&self, tid: Tid, mode: WakeMode) {
         let mut list = self.wake_list.lock();
         if let Some(e) = list.iter_mut().find(|e| e.0 == tid) {
-            if mode == WakeMode::Any {
-                e.1 = WakeMode::Any;
-            }
+            e.1 = e.1.merge(mode);
             return;
         }
         debug_assert!(list.len() < list.capacity(), "wake_list would allocate");

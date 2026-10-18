@@ -136,10 +136,15 @@ user page faults, blocking pipe/socket I/O).
 
 - `Mutex<T>`: owner tid recorded (debug builds catch recursive locking
   and foreign unlocks); `unlock` wakes one waiter, which retries.
-- `RwSem`: `down_read`/`up_read` (shared), `down_write`/`up_write`
-  (exclusive); writer preference: once a writer waits, new readers wait
-  behind it. Its count word is a short `spin::Mutex` leaf never held
-  across a sleep; release wakes all waiters (mixed conditions).
+- `RwSem<T>` (typed; `RwSem<()>` guards what its owner says):
+  `read`/`write` guards, `read_killable`/`write_killable` (Linux
+  down_*_killable: a `Killable` sleep, woken by wakeups and SIGKILL
+  only, that gives up with EINTR once SIGKILL is pending), `try_read`/
+  `try_write`, and the raw `down_read`/`up_read`, `down_write`/
+  `up_write` pairs; writer preference: once a writer waits, new readers
+  wait behind it (a killable writer that gives up wakes them). Its
+  count word is a short `spin::Mutex` leaf never held across a sleep;
+  release wakes all waiters (mixed conditions).
 - Rules: thread context only; never taken in IRQ context or while any
   spinlock is held (`might_sleep` asserts a zero preempt count in debug
   builds; `IrqSpinlock` raises it). Sleeping locks order ABOVE every
@@ -476,7 +481,9 @@ schedule()  // returns at once if a       try_wake: state != Running →
 ```
 
 `WakeMode::Interruptible` (signals) wakes only `Interruptible` sleepers;
-`WakeMode::Any` (wait queues, timeouts) wakes both. `schedule_timeout(t)`
+`WakeMode::Fatal` (SIGKILL) also wakes `Killable` ones (Linux
+TASK_KILLABLE); `WakeMode::Any` (wait queues, timeouts) wakes every
+sleeper. `schedule_timeout(t)`
 adds a sleep-queue entry; whichever of wakeup and timeout comes first ends
 the sleep and the entry is removed afterwards. Spurious wakeups are allowed:
 every sleeper re-checks its condition.

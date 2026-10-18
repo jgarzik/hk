@@ -794,6 +794,17 @@ pub fn exit_task_signal(tid: Tid) {
 // Signal Sending
 // =============================================================================
 
+/// SIGKILL is pending for the current task (Linux
+/// fatal_signal_pending): killable sleeps end on it
+pub fn fatal_signal_pending() -> bool {
+    let tid = crate::task::percpu::current_tid();
+    let table = TASK_TABLE.lock();
+    table.tasks.iter().find(|t| t.tid == tid).is_some_and(|t| {
+        let s = &t.signal_state;
+        s.pending.signal.contains(SIGKILL) || s.shared_pending.lock().signal.contains(SIGKILL)
+    })
+}
+
 /// Check if a task has pending signals (fast path)
 pub fn has_pending_signals(tid: Tid) -> bool {
     let table = TASK_TABLE.lock();
@@ -868,7 +879,13 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
     crate::signalfd::wake_signalfds_for_signal(tid, sig);
 
     if deliverable {
-        crate::task::percpu::wake_up_tid(tid, crate::task::percpu::WakeMode::Interruptible);
+        use crate::task::percpu::WakeMode;
+        let mode = if sig == SIGKILL {
+            WakeMode::Fatal
+        } else {
+            WakeMode::Interruptible
+        };
+        crate::task::percpu::wake_up_tid(tid, mode);
     }
 
     0
@@ -1120,7 +1137,7 @@ impl SignalStruct {
         Self {
             rlim: IrqSpinlock::new(default_rlimits()),
             cred_guard: crate::sync::Mutex::new(()),
-            exec_update: crate::sync::RwSem::new(),
+            exec_update: crate::sync::RwSem::new(()),
         }
     }
 
@@ -1172,7 +1189,7 @@ impl SignalStruct {
         Arc::new(Self {
             rlim: IrqSpinlock::new(new_rlim),
             cred_guard: crate::sync::Mutex::new(()),
-            exec_update: crate::sync::RwSem::new(),
+            exec_update: crate::sync::RwSem::new(()),
         })
     }
 }

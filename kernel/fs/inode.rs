@@ -482,7 +482,7 @@ impl Inode {
             sb,
             i_op,
             lock: RwLock::new(()),
-            i_rwsem: RwSem::new(),
+            i_rwsem: RwSem::new(()),
             private: RwLock::new(None),
         }
     }
@@ -517,7 +517,7 @@ impl Inode {
             sb,
             i_op,
             lock: RwLock::new(()),
-            i_rwsem: RwSem::new(),
+            i_rwsem: RwSem::new(()),
             private: RwLock::new(None),
         }
     }

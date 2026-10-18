@@ -198,9 +198,9 @@ RTNL, `TcpSock.rd` and the unix socket `bindlock`/`iolock`. Linux
 rw_semaphores/mutexes still modeled as `spin` locks include the mmap
 lock (`Mm::lock`), the mount namespace/topology locks (namespace_sem,
 `Mount` RwLocks), `s_umount` (absent) and pipe locks: their holders must
-not sleep (`make check LOCKDEP=1` reports one that does). There are no
-`_killable`/`_interruptible`/`try` variants of the sleeping locks yet
-(no callers need them).
+not sleep (`make check LOCKDEP=1` reports one that does). `RwSem` has
+`_killable` and `try` variants; `Mutex` has neither, and there are
+no `_interruptible` variants.
 
 ## Mount flag gaps
 

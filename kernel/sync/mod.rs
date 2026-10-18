@@ -14,7 +14,7 @@ mod rwsem;
 pub mod spin;
 
 pub use mutex::{Mutex, MutexGuard};
-pub use rwsem::RwSem;
+pub use rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 
 use core::sync::atomic::Ordering;
 
