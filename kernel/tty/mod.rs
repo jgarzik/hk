@@ -236,8 +236,6 @@ impl InputBuffer {
 
 /// TTY internal state (protected by mutex)
 struct TtyState {
-    /// Terminal settings
-    termios: Termios,
     /// Window size
     winsize: Winsize,
     /// Session ID that owns this TTY
@@ -249,7 +247,6 @@ struct TtyState {
 impl TtyState {
     const fn new() -> Self {
         Self {
-            termios: Termios::new(),
             winsize: Winsize::default_console(),
             session: None,
             foreground_pgrp: None,
@@ -264,7 +261,7 @@ impl TtyState {
 pub struct Tty {
     /// Device name (e.g., "ttyS0", "ttyUSB0")
     name: &'static str,
-    /// Terminal settings (legacy field - use state instead for new code)
+    /// Terminal settings
     pub termios: Mutex<Termios>,
     /// Line discipline
     ldisc: &'static dyn LineDiscipline,
@@ -272,7 +269,7 @@ pub struct Tty {
     driver: &'static dyn TtyDriver,
     /// Input buffer (from hardware)
     input: Mutex<InputBuffer>,
-    /// TTY state (termios, winsize, session info)
+    /// TTY state (winsize, session info)
     state: Mutex<TtyState>,
 }
 
@@ -320,8 +317,6 @@ impl Tty {
     /// Set the termios structure
     pub fn set_termios(&self, termios: Termios) {
         *self.termios.lock() = termios;
-        // Also update the state copy
-        self.state.lock().termios = termios;
     }
 
     /// Get the window size
