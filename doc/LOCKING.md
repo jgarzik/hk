@@ -20,6 +20,7 @@ locking strategies used in the hk kernel.
    - [Futex Subsystem](#38-futex-subsystem)
    - [TTY and Console Subsystem](#39-tty-and-console-subsystem)
    - [Device Drivers](#310-device-drivers)
+   - [Other Subsystem Locks](#311-other-subsystem-locks)
 4. [Deadlock Prevention](#4-deadlock-prevention)
 5. [Lock-Free Patterns](#5-lock-free-patterns)
 6. [Preemption Control](#6-preemption-control)
@@ -150,9 +151,11 @@ user page faults, blocking pipe/socket I/O).
   builds; `IrqSpinlock` raises it). Sleeping locks order ABOVE every
   spinlock: a spinlock may be taken under them, never the reverse.
 
-**Used for:** `Inode.i_rwsem` (`RwSem`), `SuperBlock.s_vfs_rename_mutex`,
-`File.f_pos_lock`, RTNL (Linux rtnl_mutex), `TcpSock.rd`,
-`UnixSock.bindlock`, `UnixSock.iolock` and `Disk.open_mutex` (`Mutex`).
+**Used for:** `RwSem`: `Inode.i_rwsem`, `SignalStruct.exec_update`,
+the mmap_lock (`Mm.map`), `AnonVma.chain`; `Mutex`:
+`SuperBlock.s_vfs_rename_mutex`, `File.f_pos_lock`,
+`SignalStruct.cred_guard`, RTNL (Linux rtnl_mutex), `TcpSock.rd`,
+`UnixSock.bindlock`, `UnixSock.iolock`, `Disk.open_mutex` and `SWAPON`.
 
 ### 1.5 Lockdep-lite (`sync::lockdep`, feature `lockdep`)
 
@@ -239,24 +242,9 @@ VFS locks (detailed order):
         ↓
 Filesystem-internal locks (ramfs children/data, procfs data)
     ↓
-Namespace locks:
-    TASK_NS (Mutex)  ← Global TID→NsProxy mapping
-        ↓
-    UtsNamespace.name (RwLock)  ← Per-namespace UTS data
-    ↓
-Signal locks:
-    TASK_SIGHAND (Mutex)  ← Global TID→SigHand mapping
-        ↓
-    TASK_SIGNAL_STATE (Mutex)  ← Per-task blocked/pending
-        ↓
-    SigHand.action (IrqSpinlock)  ← Signal handler table
-    ↓
-Futex locks:
-    TASK_ROBUST_LIST (Mutex)  ← Per-task robust list heads
-        ↓
-    FutexHashBucket.waiters (IrqSpinlock)  ← Per-bucket waiter list
-    ↓
-Filesystem context locks (TASK_FS)
+Leaves taken with no task lock held (their Arc is cloned out of the
+Task under TASK_TABLE first): UtsNamespace.name (RwLock), FsStruct.inner
+(Mutex), FutexHashBucket.waiters (IrqSpinlock; wakeups after unlocking)
     ↓
 Per-CPU scheduler locks (IrqSpinlock)  ← IRQ-safe, can hold while acquiring below
     ↓
@@ -267,7 +255,12 @@ Global subsystem locks (TASK_TABLE, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-s
     `Files` -> TASK_TABLE (descriptor allocation reads RLIMIT_NOFILE
     under the table lock; kcmp clones the tables out of TASK_TABLE and
     locks them after dropping it); no user memory is accessed under any
-    of them
+    of them. A task's namespaces, signal handlers and signal state,
+    robust-list head, fs context and TLS base are fields of its `Task`,
+    read or changed under TASK_TABLE (3.1.1); under it only leaves:
+    TaskSignalState.shared_pending (Mutex) → SigHand.action
+    (IrqSpinlock); SignalStruct.rlim (IrqSpinlock leaf, also under
+    `Files`); NPROC; wait queue heads
     ↓
 Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
     copy may fault) → page lock (PG_locked, sleeping; Linux folio_lock)
@@ -369,8 +362,9 @@ Other CPUs cannot cause deadlock because:
   priority refresh)
 - No CPU takes a run-queue lock while holding TASK_TABLE (wakeups that need
   a task's CPU look it up under TASK_TABLE, drop it, then wake)
-- Leaf IrqSpinlocks (a wait queue head, a signal's pending set) may be
-  taken under TASK_TABLE: they take nothing that leads back to it
+- Leaves may be taken under TASK_TABLE (a wait queue head,
+  `TaskSignalState.shared_pending` (spin Mutex) -> `SigHand.action`,
+  `SignalStruct.rlim`): they take nothing that leads back to it
 - TASK_TABLE is NEVER acquired from interrupt context (see Section 7.4)
 - Nothing is released under TASK_TABLE (3.1.1 rule 4): a release could
   sleep, and `schedule()` takes TASK_TABLE
@@ -480,7 +474,7 @@ pub needs_reschedule: AtomicBool, // Reschedule request flag
 #### Sleep / Wakeup Protocol (Linux set_current_state / try_to_wake_up)
 
 Each run-queue entry (`KernelThreadContext`) carries the scheduling truth:
-`state: SleepState {Running, Interruptible, Uninterruptible}` and `queued`
+`state: SleepState {Running, Interruptible, Killable, Uninterruptible}` and `queued`
 (present in the priority queue; prevents double enqueue).
 
 ```text
@@ -735,7 +729,7 @@ wait status word (`code << 8` or the killing signal).
 ```rust
 pub struct Zone {
     lock: IrqSpinlock<FreeArea>,   // zone->lock: buddy free lists
-    pcp: [PcpCell; NR_CPUS],       // per_cpu_pages, one per CPU
+    pcp: [Pcp; NR_CPUS],           // per_cpu_pages, one per CPU
     ...
 }
 ```
@@ -1213,7 +1207,7 @@ layout in `doc/MEMORY.md`
 
 #### Page Cache
 
-**Location:** `core/page_cache.rs`, `kernel/main.rs`
+**Location:** `kernel/mm/page_cache.rs`, `kernel/main.rs` (`PAGE_CACHE`)
 
 ```rust
 static PAGE_CACHE: Mutex<PageCache> = Mutex::new(PageCache::new(1024));
@@ -1267,7 +1261,8 @@ free a frame a mapping still uses.
 
 **Freeing ramfs pages (Linux evict_inode):** dropping a ramfs inode's
 `RamfsInodeData` (no directory entry, open file, mapping or dentry left)
-takes PAGE_CACHE -> FRAME_ALLOCATOR (`IrqSpinlock`, leaf) to free its
+takes PAGE_CACHE -> FRAME_ALLOCATOR (its `Pcp.lock` -> `Zone.lock`
+IrqSpinlocks) to free its
 pages. The page cache never holds inode references, so the last inode
 reference is never dropped with PAGE_CACHE held. Unevictable (ramfs)
 pages are kept off the eviction FIFO and are refused at the low
@@ -1276,7 +1271,7 @@ read while PAGE_CACHE is held).
 
 ### 3.3 Virtual File System (VFS)
 
-**Location:** `fs/` crate
+**Location:** `kernel/fs/`
 
 The VFS uses fine-grained locking with `RwLock` for concurrent read access.
 **All VFS locks are NOT IRQ-safe** and must only be accessed from thread context.
@@ -1367,7 +1362,7 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 2. parent Mount.children (write for add/remove child)
 3. Mount.parent (write for set/clear)
 4. Mount.mountpoint (write for set/clear)
-5. Dentry.flags (write for mounted flag)
+5. Dentry.d_lock (DentryInner.flags: write for the mounted flag)
 ```
 
 **Lock Order for Path Traversal (follow_mount):**
@@ -1375,7 +1370,7 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 1. MntNamespace.root (read)
 2. Mount.children (read)
 3. child.mountpoint (read)
-4. Dentry.inode (read)
+4. Dentry.d_lock (DentryInner.inode: read)
 ```
 
 #### VFS Locking Notes
@@ -1713,52 +1708,51 @@ tasks can share the same `NsProxy` (e.g., threads created without CLONE_NEW* fla
 
 | Variable | Type | Purpose |
 |----------|------|---------|
-| `TASK_NS` | `Mutex<BTreeMap<Tid, Arc<NsProxy>>>` | Global TID→NsProxy mapping |
+| `Task.nsproxy` | `Option<Arc<NsProxy>>` under TASK_TABLE | The task's namespaces |
 | `UtsNamespace.name` | `RwLock<NewUtsname>` | Per-namespace UTS data |
+| `MntNamespace.root` | `RwLock<Option<Arc<Mount>>>` | Mount tree root (3.3) |
 | `UserNamespace.uid_map.extents` | `RwLock<Vec<UidGidExtent>>` | UID mapping extents |
 | `UserNamespace.gid_map.extents` | `RwLock<Vec<UidGidExtent>>` | GID mapping extents |
 
+`PidNamespace` and `CgroupNamespace` are immutable after creation (no
+lock).
+
 #### Locking Rules
 
-1. **TASK_NS is a global Mutex** - Protects the task→namespace mapping, similar
-   to `TASK_FS` for filesystem context.
+1. **The NsProxy is a Task field** - `get_task_ns` clones the `Arc<NsProxy>`
+   out under TASK_TABLE; `init_task_ns` / `exit_task_ns` swap it under
+   TASK_TABLE and drop the old one after unlocking (a network
+   namespace's teardown takes RTNL; nothing is released under
+   TASK_TABLE).
 
 2. **Per-namespace data uses RwLock** - UTS name data is read-heavy (uname is
    called frequently) but rarely written (sethostname/setdomainname are rare).
+   It is taken with no task lock held (after the clone out).
 
-3. **Acquire TASK_NS before TASK_TABLE** - This prevents deadlock with the
-   scheduler. `copy_namespaces()` is called in `do_clone()` before acquiring
-   any scheduler locks.
-
-4. **Namespace operations happen before page table copy** - In clone/fork,
-   namespace setup happens early for clean error handling (can fail on OOM).
+3. **clone/unshare** - `copy_namespaces()` takes TASK_TABLE twice, one hold
+   after the other (read the parent's, install the child's), never with
+   a namespace lock held; it runs early in `do_clone()` (can fail on OOM).
 
 #### Lock Order for Namespace Operations
 
 ```
-1. TASK_NS (acquire for lookup/insert)
-   ↓
-2. UtsNamespace.name (acquire for read/write of hostname)
-   ↓
-3. TASK_FS (if also accessing filesystem context)
-   ↓
-4. Per-CPU scheduler (IrqSpinlock)
-   ↓
-5. TASK_TABLE (for task state updates)
+TASK_TABLE (clone the Arc<NsProxy> out, release)
+    then, with nothing held: UtsNamespace.name / MntNamespace.root /
+    UidGidMap.extents (leaves)
 ```
 
 #### Syscall Patterns
 
 **uname(2):** Read path - acquires `UtsNamespace.name` read lock briefly:
 ```rust
-let uts_ns = current_uts_ns();  // TASK_NS lookup
+let uts_ns = current_uts_ns();  // cloned out under TASK_TABLE
 let tmp: NewUtsname = *uts_ns.name.read();  // RwLock read
 // Copy to userspace
 ```
 
 **sethostname(2)/setdomainname(2):** Write path - acquires exclusive lock:
 ```rust
-let uts_ns = current_uts_ns();  // TASK_NS lookup
+let uts_ns = current_uts_ns();  // cloned out under TASK_TABLE
 {
     let mut guard = uts_ns.name.write();  // RwLock write
     guard.nodename = new_name;
@@ -1768,14 +1762,15 @@ let uts_ns = current_uts_ns();  // TASK_NS lookup
 #### Reference Counting
 
 `NsProxy` and individual namespaces use `Arc` for reference counting:
-- Tasks share `Arc<NsProxy>` via the `TASK_NS` table
+- Tasks share `Arc<NsProxy>` through `Task.nsproxy`
 - Clone without CLONE_NEW* flags: child shares parent's `Arc<NsProxy>`
 - Clone with CLONE_NEW* flags: new `NsProxy` created with new namespace(s)
-- Exit: removes entry from `TASK_NS`, Arc refcount drops
+- Exit: `exit_task_ns` takes it out of the Task; the Arc drops after
+  TASK_TABLE is released
 
 ### 3.5 Timekeeping
 
-**Location:** `core/time.rs`
+**Location:** `kernel/time.rs`
 
 The timekeeper uses a **seqlock** pattern for lock-free reads with consistent
 snapshots. Writers (`update` from the CPU 0 timer tick, `set_realtime` from
@@ -1985,11 +1980,12 @@ state patterns.
 
 | Variable | Type | Purpose |
 |----------|------|---------|
-| `TASK_SIGHAND` | `Mutex<BTreeMap<Tid, Arc<SigHand>>>` | Global TID→SigHand mapping |
-| `TASK_SIGNAL_STATE` | `Mutex<BTreeMap<Tid, TaskSignalState>>` | Per-task blocked/pending |
-| `TASK_TIF_SIGPENDING` | `Mutex<BTreeMap<Tid, bool>>` | Per-task pending flag |
+| `Task.sighand` | `Option<Arc<SigHand>>` under TASK_TABLE | The task's handler table |
+| `Task.signal_state` | `TaskSignalState` under TASK_TABLE | Blocked mask, private pending set |
+| `Task.tif_sigpending` | `AtomicBool`, recomputed under TASK_TABLE | Pending-signal flag (Linux TIF_SIGPENDING) |
+| `TaskSignalState.shared_pending` | `Arc<spin::Mutex<SigPending>>` | Thread-group pending set |
 | `SigHand.action` | `IrqSpinlock<[SigAction; 65]>` | Signal handler table |
-| `TaskSignalState.shared_pending` | `Arc<Mutex<SigPending>>` | Thread group pending |
+| `SignalStruct.rlim` | `IrqSpinlock<[RLimit; N]>` | Resource limits (leaf) |
 
 #### Why SigHand.action Uses IrqSpinlock
 
@@ -2006,28 +2002,27 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 
 #### Locking Rules
 
-1. **TASK_SIGHAND/TASK_SIGNAL_STATE are global Mutexes** - Protects task→signal
-   mappings, similar to `TASK_FS` for filesystem context. Only accessed from
-   syscall (process) context.
+1. **Per-task signal state is a Task field** - `get_task_sighand` clones
+   the `Arc<SigHand>` out under TASK_TABLE; `with_task_signal_state` runs
+   its closure under TASK_TABLE (no sleeping, no user memory, nothing
+   released in it).
 
 2. **SigHand.action uses IrqSpinlock** - Can be safely accessed from synchronous
-   exception handlers (page faults, etc.) and process context.
+   exception handlers (page faults, etc.) and process context; a leaf.
 
-3. **Acquire TASK_SIGHAND before SigHand.action** - Look up the signal handler
-   struct first, then acquire its internal lock.
+3. **shared_pending before action** - Dequeueing takes
+   `shared_pending` and then reads the action (`get_action`) under it.
 
 4. **Never hold IrqSpinlock while acquiring Mutex** - Would violate lock ordering.
 
 #### Lock Order for Signal Operations
 
 ```
-1. TASK_SIGHAND (acquire for lookup/insert)
+1. TASK_TABLE (Task.signal_state, Task.sighand)
    ↓
-2. TASK_SIGNAL_STATE (acquire for blocked mask/pending)
+2. TaskSignalState.shared_pending (spin Mutex, thread-group pending)
    ↓
-3. SigHand.action (IrqSpinlock, for handler table)
-   ↓
-4. TaskSignalState.shared_pending (Mutex, for thread group pending)
+3. SigHand.action (IrqSpinlock, handler table; leaf)
 ```
 
 #### Clone Integration (CLONE_SIGHAND)
@@ -2058,7 +2053,7 @@ child.shared_pending = parent.shared_pending.clone();  // Same Arc<Mutex<SigPend
 
 **rt_sigaction(2):** Get/set signal handlers:
 ```rust
-let sighand = get_task_sighand(tid)?;  // TASK_SIGHAND lookup
+let sighand = get_task_sighand(tid)?;  // cloned out under TASK_TABLE
 let actions = sighand.action.lock();    // IrqSpinlock
 let old = actions[sig].clone();
 actions[sig] = new_action;
@@ -2066,7 +2061,7 @@ actions[sig] = new_action;
 
 **rt_sigprocmask(2):** Modify blocked mask:
 ```rust
-with_task_signal_state(tid, |state| {   // TASK_SIGNAL_STATE lookup
+with_task_signal_state(tid, |state| {   // under TASK_TABLE
     state.blocked = new_mask;
     state.recalc_sigpending();
 });
@@ -2118,10 +2113,10 @@ de_thread, exit_group does not.
 #### Reference Counting
 
 `SigHand` uses `Arc` for reference counting:
-- Tasks share `Arc<SigHand>` via the `TASK_SIGHAND` table
+- Tasks share `Arc<SigHand>` through `Task.sighand`
 - Clone with CLONE_SIGHAND: child shares parent's `Arc<SigHand>`
 - Clone without CLONE_SIGHAND: new `Arc<SigHand>` with deep-cloned handlers
-- Exit: removes entry from `TASK_SIGHAND`, Arc refcount drops
+- Exit: the Arc drops with the task's entry
 
 ### 3.8 Futex Subsystem
 
@@ -2137,15 +2132,14 @@ primitives. It uses a hash bucket design similar to Linux's `futex_queues`.
 | `FUTEX_HASH_TABLE` | `[FutexHashBucket; 256]` | Hash buckets for waiters |
 | `FutexHashBucket.waiters` | `IrqSpinlock<Vec<FutexQ>>` | Per-bucket waiter list |
 | `FutexHashBucket.waiter_count` | `AtomicU32` | Fast-path check for waiters |
-| `TASK_ROBUST_LIST` | `Mutex<BTreeMap<Tid, u64>>` | Per-task robust list heads |
+| `Task.robust_list` | `u64` under TASK_TABLE | Per-task robust list head |
 
 #### Why IrqSpinlock for Bucket Waiters
 
-Futex operations may be called from signal context (e.g., during signal delivery
-or cleanup). Using `IrqSpinlock` ensures:
-1. Interrupts are disabled during bucket access
-2. No deadlock if signal handler tries to access same bucket
-3. Memory barrier semantics for race prevention with userspace
+Futex operations run in syscall context only; the bucket lock is an
+`IrqSpinlock` because wakers dequeue under it and then use the IRQ-safe
+wake path, and so that a timer or IPI on the same CPU never spins on a
+holder it interrupted. It is a leaf.
 
 #### Memory Barrier Pattern (Linux-style)
 
@@ -2197,7 +2191,7 @@ Robust futexes are cleaned up during task exit via `exit_robust_list()`:
 
 #### Key Rules
 
-1. **Bucket lock is IRQ-safe** - Safe from signal handlers
+1. **Bucket lock is IRQ-safe** - Interrupts off while held (a leaf)
 2. **Memory barriers before userspace access** - Prevents lost wakeups
 3. **Bucket lock is a leaf** - wakeups are issued after dropping it
 4. **Multi-bucket operations use address ordering** - Prevents deadlock
@@ -2403,7 +2397,7 @@ syscall then runs `netif_rx_flush_local()` at a point where it holds no
 locks (Linux runs pending softirqs at `local_bh_enable()` after
 `dev_queue_xmit`), so loopback data is normally queued at the peer before
 `sendto()` returns. A received packet's namespace is its device's
-(`skb.net()`), never `current_net_ns()`; a socket's is `Socket.net`.
+(`skb.net()`), never `current_net_ns()`; a socket's is `Sock.net`.
 
 Today all device IRQs are routed to CPU 0 (PIC / GIC IROUTER) and user
 tasks run only on CPU 0, so in practice protocol work for eth0 and lo runs
@@ -2599,6 +2593,41 @@ see plan 3a).
 4. **Completion callbacks are IRQ-safe** - bio `end_io` runs in hardirq: only
    atomics, `Completion::complete` and wakeups; skb completion takes no lock
 
+### 3.11 Other Subsystem Locks
+
+Thread context only unless the class says IRQ; each is a leaf (nothing
+else is taken under it) unless an order is given. "spin" is the
+`sync::spin` Mutex/RwLock (not IRQ-safe).
+
+| Lock | Location | Class | Protects / order |
+|------|----------|-------|------------------|
+| `VFORK_COMPLETION` | task/percpu.rs | spin Mutex | vfork done flags (Tid-keyed) |
+| `TASK_POSIX_TIMERS` | posix_timer.rs | spin Mutex | per-process POSIX timer tables (Tid-keyed) |
+| `POSIX_TIMER_REGISTRY` | posix_timer.rs | IrqSpinlock | timer id -> owner, read by the expiry callback (ktimerd) |
+| `PosixTimer.inner` | posix_timer.rs | IrqSpinlock | one timer's state; -> kernel `TIMERS` (`timer_del` on drop) |
+| `Eventfd.inner`, `Eventpoll.inner`, `Inotify.inner`, `Fanotify.inner`, `IoUring.inner`, `Pidfd.inner`, `Signalfd.inner`, `Timerfd.inner` | eventfd.rs, epoll.rs, inotify.rs, fanotify.rs, io_uring.rs, pidfd.rs, signalfd.rs, timerfd.rs | IrqSpinlock | per-object state of the anon-inode files; their wait queues are woken after unlocking (pidfd: under it -> wait queue head) |
+| `SIGNALFD_REGISTRY`, `PIDFD_REGISTRY`, `TIMERFD_REGISTRY` | signalfd.rs, pidfd.rs, timerfd.rs | IrqSpinlock | live instances for signal, exit and expiry notification; registry -> the instance's `inner` |
+| `Workqueue.inner` | workqueue.rs | IrqSpinlock | pending and delayed work lists (`SYSTEM_WQ`, `BDI_WORKQUEUE`); a work item's own `spin::Mutex<Work>` is taken and dropped before it |
+| `BDI_REGISTRY`, `BdiWriteback.dirty_inodes`, `BdiWriteback.dwork` | mm/writeback.rs | spin | per-device writeback state |
+| `DIRTY_ADDRESS_SPACES` | mm/page_cache.rs | spin Mutex | files with dirty pages (sync) |
+| `TASK_CGROUP`, `CSS_SET_CACHE`, `CgroupRoot.{root_cgrp, controllers}`, `Cgroup.{parent, children, ancestors, subsys, tasks}`, `CssSet.subsys`, `CgroupSubsysState.private`, `IoState.devices` | cgroup/ | spin (RwLock; `CSS_SET_CACHE` Mutex) | cgroup hierarchy and membership; parent before child; never under TASK_TABLE (clone reads `TASK_CGROUP` after it, exit detaches after it) |
+| `IpcIds.inner`, `KernIpcPerm.lock`, `MsgQueue.{messages, receivers, senders}`, `MsgReceiver.result`, `SemArray.pending`, `SemUndoList.undos`, `MQ_REGISTRY`, `MqQueue.{messages, flags, notify}` | ipc/ | spin | SysV and POSIX IPC objects; `IpcIds.inner` -> the object's lock |
+| `KEY_DATABASE`, `TASK_KEYRINGS`, `USER_KEYRINGS`, `Key.payload`, `Key.keyring_keys` | keys/ | spin RwLock | key registry and keyrings (lookups clone the `Arc<Key>` out) |
+| `FILE_LOCKS` (flock), `POSIX_LOCKS` | fs/flock.rs, fs/posix_lock.rs | spin Mutex | file lock tables; waiters sleep with them dropped |
+| `FS_TYPES`, `CHARDEV_REGISTRY` | fs/superblock.rs, chardev.rs | spin | filesystem types, character device registry |
+| `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock) |
+| `SuperBlock.{root, private}`, `DentryCache.root` | fs/superblock.rs, fs/dentry.rs | spin RwLock | superblock root and private data, the dcache root |
+| `RamfsInodeData.xattrs`, `RamfsSbData.sb` | fs/ramfs.rs | spin | ramfs xattrs and superblock back-pointer (under VFS locks) |
+| `Pipe.inner` | pipe.rs | spin Mutex | pipe buffer and state (holders never sleep; BUGS.md) |
+| `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
+| `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
+| `SimpleGfxDevice.state`, `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device state and registry |
+| `UsbMscDevice.state` | usb/msc.rs | spin | USB mass-storage device state |
+| `INTX_MAP` | arch/aarch64/pci_irq.rs | spin Mutex | PCI INTx routing from the device tree (boot) |
+| `CMDLINE_CONSOLE`, `CRNG` | cmdline.rs, random.rs | spin Mutex | console= choice, CRNG state |
+| `NUMA_TOPOLOGY` | numa.rs | IrqSpinlock | NUMA node table |
+| `BpfHashMap.data`, `BpfArrayMap.data` | bpf/map.rs | IrqSpinlock | BPF map contents |
+
 ---
 
 ## 4. Deadlock Prevention
@@ -2634,8 +2663,11 @@ never block readers. Readers simply retry if they detect a concurrent write.
 
 ### 4.6 Short Critical Sections
 
-Locks are held for the minimum time necessary. No memory allocations, I/O,
-or other potentially-blocking operations are performed under IrqSpinlock.
+Locks are held for the minimum time necessary. Nothing that sleeps (I/O,
+sleeping locks, user copies that may fault) runs under any spinlock.
+Allocations under an IrqSpinlock are allowed in thread context (the heap
+and frame allocator locks are IrqSpinlocks themselves), never in
+interrupt context (7.2).
 
 ### 4.7 No Non-IRQ-Safe Locks in Interrupt Context
 
@@ -2681,7 +2713,7 @@ pub fn advance_pos(&self, n: u64) -> u64 {
 
 ### 5.3 Seqlock for Time
 
-As described in Section 3.4, time reads are lock-free using the seqlock pattern.
+As described in Section 3.5, time reads are lock-free using the seqlock pattern.
 
 ### 5.4 Atomic Types vs Struct-Level Locks
 
@@ -2741,7 +2773,7 @@ The following patterns are CORRECT uses of atomics in hk:
 | `TimeKeeper` | seq, cycle_base, mono_base_ns, etc. | Seqlock pattern - all read together with seq validation |
 | `Inode` | mode, uid, gid, size, nlink | Each field updated independently by different operations |
 | `File` | pos | File position modified independently (concurrent reads OK) |
-| `Socket` | flags, error, eof | Independent flags with Mutex-protected data buffers |
+| `Sock` | flags, error, shutdown, buffer sizes | Independent flags; protocol data under the socket lock |
 | `CachedPage` | refcount, dirty, writeback, locked | Linux page cache pattern - flags + refcount |
 | `MsgQueue` | stime, rtime, cbytes, qnum, etc. | Different syscalls update different subsets |
 
@@ -2831,7 +2863,7 @@ percpu::preempt_enable();   // preempt_count--
   but IRQ paths must not depend on allocating)
 - **TASK_TABLE access** (uses Mutex)
 - **VFS operations** (use RwLock)
-- **printk** (uses Mutex, consider try_lock for exceptions)
+- **Sleeping on anything** (printk is safe: its locks are IrqSpinlocks, 3.6)
 - **Any Mutex or RwLock acquisition**
 
 ### 7.3 Deferring Work
@@ -2848,24 +2880,22 @@ Example: the CPU 0 tick notices an expired software timer and wakes
 `needs_reschedule` flag set by the tick is currently unused for preemption
 (hk is non-preemptive, see 3.1).
 
-### 7.4 Complete List of Locks Never Acquired from Interrupt Context
+### 7.4 Locks Never Acquired from Interrupt Context
 
 The following locks are NEVER acquired from interrupt handlers (timer ISR,
-exceptions, etc.). This table serves as the authoritative reference for the
-interrupt-safety invariant:
+exceptions, etc.). With the locks of 3.11 (all thread context only) and
+every `spin::Mutex`/`RwLock` and sleeping lock elsewhere in this document,
+this is the interrupt-safety invariant:
 
 | Lock | Location | Type | Reason |
 |------|----------|------|--------|
 | `TASK_TABLE` | kernel/task/percpu.rs | `Mutex` | Global task registry |
-| `TASK_SIGHAND` | kernel/signal/mod.rs | `Mutex` | Signal handler mapping |
-| `TASK_SIGNAL_STATE` | kernel/signal/mod.rs | `Mutex` | Per-task signal state |
-| `TASK_FS` | kernel/fs/context.rs | `Mutex` | Filesystem context |
-| `TASK_NS` | kernel/ns/mod.rs | `Mutex` | Namespace context |
-| `TASK_TLS` | kernel/task/tls.rs | `Mutex` | TLS base addresses |
+| `TaskSignalState.shared_pending` | kernel/signal/mod.rs | `Mutex` | Thread-group pending signals (under TASK_TABLE) |
+| `FsStruct.inner` | kernel/fs/fsstruct.rs | `Mutex` | Root, cwd, umask (leaf) |
 | `NPROC` | kernel/task/mod.rs | `Mutex` | RLIMIT_NPROC tasks per real uid (leaf: may be taken under TASK_TABLE, takes no lock) |
 | `MEMBLOCK` | kernel/mm/memblock.rs | `Mutex` | Boot memory map (boot CPU, before SMP) |
 | `ACCT_FILE` | kernel/acct.rs | `Mutex` | Process accounting file (leaf: cloned out, the record written and an old file released with no lock held) |
-| `PAGE_CACHE` | core/page_cache.rs | `Mutex` | Page cache lookup |
+| `PAGE_CACHE` | kernel/mm/page_cache.rs (static in kernel/main.rs) | `Mutex` | Page cache lookup |
 | All VFS locks | kernel/fs/*.rs | `RwLock` | Inodes, dentries, mounts |
 | Descriptor tables (`Files`) | kernel/task/fdtable.rs | `Mutex` | Per-task fd tables |
 | `RTNL` and every network `spin::Mutex`/`RwLock` | kernel/net/ | `sync::Mutex` / `Mutex` / `RwLock` | Configuration, sockets, tables, queues (3.10) |
@@ -2884,17 +2914,17 @@ CAN be safely acquired from interrupt context. See Section 3.6.
 **Invariant**: Code running with interrupts enabled that acquires any of these
 locks will never be interrupted by an ISR that also tries to acquire the same lock.
 
-**Why this is safe**: ISRs in hk only perform these operations:
-- Read/write atomics (tick counts, flags, `needs_reschedule`)
-- Acquire `IrqSpinlock` (per-CPU scheduler run queue)
-- Call `wake_sleepers()` which only touches per-CPU run queue
+**Why this is safe**: ISRs in hk only perform the operations of 7.1:
+atomics, and IrqSpinlocks (run queues and `wake_list`s, wait queue heads,
+`IRQ_TABLE`, the blk-mq hardware queue, `Completion.done`,
+`Softnet.poll_list`, the cross-CPU call queues, printk)
 
 ISRs NEVER perform:
 - Memory allocation (`alloc`, `Box`, `Vec` growth): wakeups, NAPI scheduling
   and run-queue enqueues use reserved capacity (7.1)
 - Task table operations - would acquire TASK_TABLE Mutex
 - VFS operations - would acquire RwLock
-- printk - would acquire OUTPUT_LOCK Mutex (potential deadlock)
+- Any `spin::Mutex`/`RwLock` or sleeping lock (printk's are IrqSpinlocks)
 
 ### 7.5 Syscalls and Faults Run With Interrupts On
 
@@ -2991,7 +3021,7 @@ Features present in Linux but not yet implemented in hk:
 | Softirqs/Tasklets | Deferred interrupt work | Not implemented | ISRs must be minimal |
 | NAPI | Network interrupt mitigation | NAPI-like: per-CPU `softnet/N` kthreads poll drivers | Receive processing in thread context |
 | Threaded IRQs | IRQ handlers in thread context | Not implemented | All IRQs run in interrupt context |
-| lockdep | Runtime deadlock detection | Not implemented | Manual ordering verification |
+| lockdep | Runtime deadlock detection | Lockdep-lite (1.5): spin-lock order and sleep-in-atomic checks, `make check LOCKDEP=1` | No sleeping-lock order graph, no IRQ-state classes per lock |
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
 | Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
 | Lazy TLB, PCID, global pages | kernel threads keep the last user mm; PCID tags; PGE | Kernel threads load the kernel table; every CR3 write flushes all | More flushes on context switch (x86) |
@@ -3006,8 +3036,9 @@ Features present in Linux but not yet implemented in hk:
    a per-CPU `softnet/N` kthread that polls the device; protocol processing
    never runs in interrupt context (see 3.10 Network Subsystem).
 
-3. **No lockdep**: Lock ordering must be verified manually via code review.
-   Consider adding compile-time lock ordering enforcement in the future.
+3. **Lockdep-lite only**: spin-lock order inversions and sleeping in
+   atomic context are reported at run time (1.5); sleeping-lock order is
+   still verified by review.
 
 4. **No RCU**: Read-heavy data structures use RwLock, which has higher overhead
    than RCU for read-mostly workloads.

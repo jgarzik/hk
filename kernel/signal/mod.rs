@@ -11,8 +11,9 @@
 //!
 //! - `SigHand.action` uses `IrqSpinlock` because signal handlers may be queried
 //!   from interrupt context (page faults, timer interrupts)
-//! - `TASK_SIGHAND` and `TASK_SIGNAL_STATE` use `Mutex` as they are only
-//!   accessed from process context
+//! - A task's handler table (`Task.sighand`) and signal state
+//!   (`Task.signal_state`) live in its Task, under TASK_TABLE; the
+//!   thread-group pending set is a `spin::Mutex`, taken under it
 //!
 //! See doc/LOCKING.md for full lock ordering.
 
