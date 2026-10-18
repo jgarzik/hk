@@ -108,6 +108,13 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   section bitmap). Pages memblock kept start `PG_RESERVED` and are
   never freed. Flags, map count, mapping (an anonymous page's AnonVma,
   which it holds a reference on) and list links live there.
+- **Page allocator** (`mm/page_alloc.rs`, Linux buddy allocator): one
+  zone over all RAM; free blocks of 2^0..2^10 pages on per-order lists
+  in struct page, merged with their buddy on free; order-0 pages pass
+  through per-CPU lists (batch = managed/1024 capped, /4, rounded to
+  2^n-1; high = 4 batches). Reference counts are struct page atomics;
+  2 MB huge pages are compound pages counted on the head. MemFree
+  counts the per-CPU lists too (Linux's NR_FREE_PAGES does not).
 
 ## User address space (both arches)
 

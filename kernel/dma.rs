@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
 
 use crate::arch::{phys_to_virt, virt_to_phys};
-use crate::frame_alloc::{BitmapFrameAllocator, FRAME_SIZE};
+use crate::frame_alloc::{FRAME_SIZE, FrameAllocator};
 
 /// DMA address type - what devices see
 ///
@@ -268,12 +268,12 @@ pub trait DmaOps: Send + Sync {
 /// for x86 QEMU without vIOMMU.
 pub struct DirectDmaOps {
     /// Reference to frame allocator
-    frame_alloc: &'static BitmapFrameAllocator,
+    frame_alloc: &'static FrameAllocator,
 }
 
 impl DirectDmaOps {
     /// Create a new direct DMA ops instance
-    pub const fn new(frame_alloc: &'static BitmapFrameAllocator) -> Self {
+    pub const fn new(frame_alloc: &'static FrameAllocator) -> Self {
         Self { frame_alloc }
     }
 

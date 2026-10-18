@@ -267,7 +267,8 @@ Global subsystem locks (TASK_TABLE, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-s
     ↓
 Address space: Mm lock (mmap_lock) → AnonVma, LRU  ← never nested with TASK_TABLE (3.2)
     ↓
-Memory allocator locks (FRAME_ALLOCATOR, heap)  ← NOT IRQ-safe
+Memory allocator locks: heap, then per-CPU page list (IRQs off) →
+    Zone.lock (IrqSpinlock leaf; 3.2 Frame Allocator)
 
 Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem → BLKDEV_REGISTRY,
@@ -700,24 +701,36 @@ wait status word (`code << 8` or the killing signal).
 
 ### 3.2 Memory Management
 
-#### Frame Allocator
+#### Frame Allocator (buddy + per-CPU lists)
 
-**Location:** `kernel/frame_alloc.rs`
+**Location:** `kernel/mm/page_alloc.rs` (Linux mm/page_alloc.c), API in
+`kernel/frame_alloc.rs`
 
 ```rust
-pub struct BitmapFrameAllocator {
-    inner: IrqSpinlock<BitmapFrameAllocatorInner>,
+pub struct Zone {
+    lock: IrqSpinlock<FreeArea>,   // zone->lock: buddy free lists
+    pcp: [PcpCell; NR_CPUS],       // per_cpu_pages, one per CPU
+    ...
 }
 ```
 
-- Single `IrqSpinlock` protects the bitmap, refcounts and allocation
-  state (page-fault paths allocate with interrupts enabled; a leaf lock,
-  takes no other lock)
-- Policy: no frame allocation in interrupt context
-- Thread-safe via `&self` methods (`alloc()`, `free()`)
-- Frame reference counts are u16 and saturate: a saturated count is
-  sticky (never decremented, the frame never freed), so more than 65535
-  mappings of one page leak it instead of freeing it while mapped
+- Order (Linux): per-CPU list (interrupts off) → `Zone.lock`
+  (`IrqSpinlock`, leaf). A CPU uses only its own list, with
+  `local_irq_save` held across the access (the kernel is not preemptive,
+  so it stays on the CPU); a refill or drain takes `Zone.lock` under it.
+  A CPU without per-CPU data yet (coming up, or the boot CPU early)
+  never touches a per-CPU list: it allocates and frees under `Zone.lock`.
+  Other CPUs read only a list's atomic page count (statistics).
+- Both are IRQ-safe: allocating or freeing in interrupt context cannot
+  deadlock against an interrupted allocator (policy is still no
+  allocation in IRQ context).
+- Reference counts are atomics in struct page (`get`/`put`, no lock);
+  the put that reaches zero frees. A count that reaches `u32::MAX`
+  saturates and stays (the page leaks rather than being freed while
+  uncounted references remain).
+- Freeing resets each struct page and releases its mapping (an
+  AnonVma reference) before any allocator lock is taken; nothing else
+  is called under the allocator's locks.
 
 #### Boot Memory (memblock)
 
@@ -741,10 +754,8 @@ pub struct BitmapFrameAllocator {
   to whoever owns the page's list (frame allocator, later slab/LRU) and
   are touched only under that owner's lock.
 - An anonymous page's mapping holds an AnonVma reference. A freed
-  page's struct page is reset (and that reference dropped) under the
-  frame allocator lock, before the frame can be handed out again;
-  dropping it frees at most an AnonVma (heap memory), which takes no
-  frame allocator lock.
+  page's struct page is reset (and that reference dropped) before the
+  page goes back to the allocator's lists, with no allocator lock held.
 
 #### Address Spaces (Mm: mm_users / mm_count, mmap_lock)
 
@@ -2615,7 +2626,7 @@ percpu::preempt_enable();   // preempt_count--
 
 ### 7.2 What CANNOT Run in Interrupt Context
 
-- **Memory allocation** (frame allocator is a Mutex; the heap is IRQ-safe
+- **Memory allocation** (the frame allocator and the heap are IRQ-safe,
   but IRQ paths must not depend on allocating)
 - **TASK_TABLE access** (uses Mutex)
 - **VFS operations** (use RwLock)
@@ -2651,7 +2662,6 @@ interrupt-safety invariant:
 | `TASK_NS` | kernel/ns/mod.rs | `Mutex` | Namespace context |
 | `TASK_TLS` | kernel/task/tls.rs | `Mutex` | TLS base addresses |
 | `NPROC` | kernel/task/mod.rs | `Mutex` | RLIMIT_NPROC tasks per real uid (leaf: may be taken under TASK_TABLE, takes no lock) |
-| `FRAME_ALLOCATOR` | kernel/frame_alloc.rs | `Mutex` | Physical frame allocation |
 | `MEMBLOCK` | kernel/mm/memblock.rs | `Mutex` | Boot memory map (boot CPU, before SMP) |
 | `PAGE_CACHE` | core/page_cache.rs | `Mutex` | Page cache lookup |
 | All VFS locks | kernel/fs/*.rs | `RwLock` | Inodes, dentries, mounts |

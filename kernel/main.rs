@@ -251,8 +251,7 @@ pub fn heap_low() -> bool {
 static PAGE_CACHE: Mutex<PageCache> = Mutex::new(PageCache::new(1024));
 
 /// Global frame allocator
-static FRAME_ALLOCATOR: frame_alloc::BitmapFrameAllocator =
-    frame_alloc::BitmapFrameAllocator::new();
+static FRAME_ALLOCATOR: frame_alloc::FrameAllocator = frame_alloc::FrameAllocator::new();
 
 /// Global DMA operations (direct mapping backend)
 static DIRECT_DMA_OPS: DirectDmaOps = DirectDmaOps::new(&FRAME_ALLOCATOR);
@@ -742,6 +741,7 @@ fn kmain() -> ! {
     mm::memblock::MEMBLOCK
         .lock()
         .for_each_free(|start, end| FRAME_ALLOCATOR.free_range(start, end));
+    FRAME_ALLOCATOR.init_done();
     printkln!("MEM: {} MB", FRAME_ALLOCATOR.stats().total_bytes >> 20);
 
     // Initialize DMA subsystem (uses frame allocator)
