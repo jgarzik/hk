@@ -15,8 +15,7 @@
 //! page cache's xarray): four levels of 512-entry nodes, each node a
 //! frame of user memory, allocated as pages are touched. Nothing is
 //! taken from the kernel heap: what a process can make the kernel hold
-//! for it stops at the reserve like its pages (Linux: user allocations
-//! stop at the min watermark).
+//! for it stops at the low watermark like its pages.
 //!
 //! Locking: `Shmem.root` is a spin lock taken by the fault path under
 //! the mm lock (mm lock -> Shmem.root) and by MADV_REMOVE with no lock
@@ -127,7 +126,7 @@ impl Shmem {
     /// The page at index `idx` (Linux shmem_get_folio), zeroed on first
     /// use, with a reference taken for the caller's PTE. Past the size
     /// (a mapping grown by mremap) is SIGBUS, like Linux; pages and index
-    /// nodes come from user memory, which stops at the kernel's reserve.
+    /// nodes come from user memory, which stops at the low watermark.
     pub fn get_page(&self, idx: u64) -> Result<u64, VmFault> {
         if idx >= self.size {
             return Err(VmFault::Bus);

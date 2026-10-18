@@ -143,8 +143,10 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   shared copy-on-write). Unresolved: SIGSEGV or SIGBUS for a user
   access, EFAULT for a kernel uaccess.
 - Out of memory: pages for user data and user page tables stop at the
-  reserve kept for the kernel (1/32 of RAM, at least 4MB; Linux min
-  watermark). mlock that cannot fault its range in fails with EAGAIN. A user fault that finds no memory kills its process
+  zone's low watermark (vm.min_free_kbytes, Linux's formula,
+  `mm/page_alloc.rs`); kernel allocations go on to min, `__GFP_HIGH`
+  ones (the kernel heap) to half of it, atomic ones a quarter lower
+  (Linux would reclaim between low and min; hk has no reclaim yet). mlock that cannot fault its range in fails with EAGAIN. A user fault that finds no memory kills its process
   with SIGKILL, logged as `Out of memory: Killed process <pid> (<comm>)`
   (Linux pagefault_out_of_memory; hk has no OOM killer choosing another
   victim, and never retries the fault in a loop); a kernel uaccess that

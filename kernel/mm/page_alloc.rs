@@ -92,6 +92,44 @@ impl Gfp {
 }
 
 // ============================================================================
+// Watermarks
+// ============================================================================
+
+/// Zone watermarks (Linux enum zone_watermarks)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wmark {
+    Min = 0,
+    Low = 1,
+    High = 2,
+}
+
+/// Linux min_free_kbytes for `managed` pages: sqrt(lowmem kB * 16),
+/// clamped to [128, 262144] (init_per_zone_wmark_min)
+pub fn min_free_kbytes(managed: usize) -> usize {
+    let kb = managed * 4 * 16;
+    kb.isqrt().clamp(128, 262_144)
+}
+
+/// The watermark an allocation must leave free, in pages (Linux
+/// gfp_to_alloc_flags + __zone_watermark_ok): user data stops at the low
+/// watermark (hk has no reclaim yet: the kernel keeps low - min for its
+/// own allocations), kernel allocations at min, __GFP_HIGH ones at half
+/// of it, atomic (non-sleeping, __GFP_HIGH) ones a quarter lower still
+fn alloc_mark(wmark: &[AtomicUsize; 3], gfp: Gfp) -> usize {
+    if gfp.user() {
+        return wmark[Wmark::Low as usize].load(Ordering::Relaxed);
+    }
+    let mut min = wmark[Wmark::Min as usize].load(Ordering::Relaxed);
+    if gfp.has(Gfp::HIGH) {
+        min -= min / 2;
+        if !gfp.has(Gfp::RECLAIM) {
+            min -= min / 4;
+        }
+    }
+    min
+}
+
+// ============================================================================
 // Per-CPU page lists
 // ============================================================================
 
@@ -156,6 +194,10 @@ pub struct Zone {
     /// Check every pfn against the memory map's sections (the vmemmap
     /// backs only sections with RAM; host tests back the whole span)
     sections: core::sync::atomic::AtomicBool,
+    /// Watermarks in pages (Wmark order)
+    wmark: [AtomicUsize; 3],
+    /// vm.min_free_kbytes the watermarks come from
+    min_kb: AtomicUsize,
     /// Per-CPU list refill/drain size and limit
     batch: AtomicUsize,
     high: AtomicUsize,
@@ -176,6 +218,8 @@ impl Zone {
             managed: AtomicUsize::new(0),
             bad: AtomicUsize::new(0),
             sections: core::sync::atomic::AtomicBool::new(false),
+            wmark: [const { AtomicUsize::new(0) }; 3],
+            min_kb: AtomicUsize::new(0),
             batch: AtomicUsize::new(1),
             high: AtomicUsize::new(0),
             pcp: [const {
@@ -397,7 +441,7 @@ impl Zone {
     /// Allocate 2^order pages; refcount 1 on the first (every page with
     /// `__GFP_COMP`: tails point at the head)
     pub fn alloc_pages(&self, order: u32, gfp: Gfp) -> Option<u64> {
-        if order > MAX_ORDER {
+        if order > MAX_ORDER || !self.watermark_ok(order, gfp) {
             return None;
         }
         loop {
@@ -605,6 +649,56 @@ impl Zone {
         let batch = (1usize << (usize::BITS - 1 - x.leading_zeros())) - 1;
         self.batch.store(batch, Ordering::Relaxed);
         self.high.store(4 * batch, Ordering::Relaxed);
+    }
+
+    /// Set the watermarks from min_free_kbytes (Linux
+    /// __setup_per_zone_wmarks): min = min_free_kbytes in pages; low and
+    /// high add max(min / 4, managed * watermark_scale_factor / 10000)
+    /// once and twice (scale factor 10)
+    ///
+    /// Called once every boot memory range is in the zone (the base is
+    /// the final managed count), and again when vm.min_free_kbytes is
+    /// written (`kb`; None = the formula)
+    pub fn setup_wmarks(&self, kb: Option<usize>) {
+        let managed = self.managed();
+        let kb = kb.unwrap_or_else(|| min_free_kbytes(managed));
+        self.min_kb.store(kb, Ordering::Relaxed);
+        let min = kb / 4;
+        let step = (min / 4).max(managed * 10 / 10_000);
+        for (w, v) in self.wmark.iter().zip([min, min + step, min + 2 * step]) {
+            w.store(v, Ordering::Relaxed);
+        }
+    }
+
+    /// Drop the watermarks (tests that exhaust a zone)
+    #[cfg(test)]
+    pub fn clear_wmarks(&self) {
+        self.wmark
+            .iter()
+            .for_each(|w| w.store(0, Ordering::Relaxed));
+    }
+
+    /// vm.min_free_kbytes
+    pub fn min_free_kb(&self) -> usize {
+        self.min_kb.load(Ordering::Relaxed)
+    }
+
+    /// A watermark, in pages
+    pub fn wmark(&self, w: Wmark) -> usize {
+        self.wmark[w as usize].load(Ordering::Relaxed)
+    }
+
+    /// Taking 2^order pages leaves the zone above the allocation's
+    /// watermark (Linux zone_watermark_ok; free pages on per-CPU lists
+    /// are not counted, as in Linux)
+    pub fn watermark_ok(&self, order: u32, gfp: Gfp) -> bool {
+        let free = self.nr_free() as isize - (1isize << order) + 1;
+        free > alloc_mark(&self.wmark, gfp) as isize
+    }
+
+    /// Free memory is at or below a watermark
+    pub fn below(&self, w: Wmark) -> bool {
+        self.nr_free() <= self.wmark(w)
     }
 
     /// Pages handed to the zone at boot
@@ -832,6 +926,48 @@ mod tests {
         t.z.free_pages(5000, 0);
         t.z.free_pages(1023, 1);
         assert_eq!(t.z.free_pages_all(), 1016);
+    }
+
+    #[test]
+    fn min_free_kbytes_formula() {
+        // Linux values: 512MB -> 2896 kB (sqrt(524288 * 16)), clamps
+        assert_eq!(min_free_kbytes(131072), 2896);
+        assert_eq!(min_free_kbytes(16), 128);
+        assert_eq!(min_free_kbytes(1 << 40), 262_144);
+    }
+
+    #[test]
+    fn watermarks_order_user_kernel_atomic() {
+        let t = zone(0, 16384);
+        t.z.free_range(0, 16384);
+        t.z.setup_wmarks(None);
+        let (min, low, high) = (
+            t.z.wmark(Wmark::Min),
+            t.z.wmark(Wmark::Low),
+            t.z.wmark(Wmark::High),
+        );
+        assert!(min > 0 && min < low && low < high);
+        // Drain to just above low: user allocations stop first
+        let mut held = Vec::new();
+        while t.z.nr_free() > low + 1 {
+            held.push(t.z.alloc_pages(0, Gfp::KERNEL).unwrap());
+        }
+        let mut user = 0;
+        while t.z.alloc_pages(0, Gfp::HIGHUSER_MOVABLE).is_some() {
+            user += 1;
+        }
+        assert!(user < 64, "{user}");
+        let mut kernel = 0;
+        while t.z.alloc_pages(0, Gfp::KERNEL).is_some() {
+            kernel += 1;
+        }
+        assert!(t.z.nr_free() <= min + 1 && kernel > 0);
+        assert!(t.z.alloc_pages(0, Gfp::KERNEL.with(Gfp::HIGH)).is_some());
+        while t.z.alloc_pages(0, Gfp::KERNEL.with(Gfp::HIGH)).is_some() {}
+        assert!(t.z.alloc_pages(0, Gfp::ATOMIC).is_some());
+        while t.z.alloc_pages(0, Gfp::ATOMIC).is_some() {}
+        assert!(t.z.nr_free() > 0);
+        assert!(t.z.below(Wmark::Min));
     }
 
     #[test]

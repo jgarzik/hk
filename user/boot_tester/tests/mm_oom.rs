@@ -12,6 +12,10 @@
 //!   than the machine has is killed by SIGKILL; the kernel and the test
 //!   runner survive, its memory comes back and the next fork works
 //! - OOM_SHARED_KILL (hk only): the same with shared anonymous memory
+//! - OOM_SPARSE_KILL (hk only): the same touching one page per 2MB, so
+//!   every touch also costs page tables: those stop at the same
+//!   watermark as user pages, the kernel keeps its reserve (MemFree at
+//!   least vm.min_free_kbytes afterwards) and the next fork works
 //! - OOM_MLOCK_EAGAIN (hk only: Linux would OOM-kill instead): mlock of
 //!   more memory than there is fails with EAGAIN, and the memory comes
 //!   back when the process exits
@@ -37,6 +41,7 @@ pub fn run_tests() {
     rlimit_memlock();
     fault_kill(b"OOM_FAULT_KILL", hog);
     fault_kill(b"OOM_SHARED_KILL", hog_shared);
+    fault_kill(b"OOM_SPARSE_KILL", hog_sparse);
     fault_kill(b"OOM_MLOCK_EAGAIN", mlock_hog);
 }
 
@@ -222,6 +227,43 @@ fn hog_shared() -> u64 {
     touch_all(MAP_SHARED)
 }
 
+/// Child: one page per 2MB of a mapping far larger than RAM's worth of
+/// page tables
+fn hog_sparse() -> u64 {
+    const LEN: u64 = 512 << 30;
+    const STEP: u64 = 2 * MB;
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+    let p = sys_mmap(0, LEN, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if p < 0 {
+        return 2;
+    }
+    let mut a = p as u64;
+    while a < p as u64 + LEN {
+        unsafe { core::ptr::write_volatile(a as *mut u8, 1) };
+        a += STEP;
+    }
+    3
+}
+
+/// An integer file such as /proc/sys/vm/min_free_kbytes (-1 if none)
+fn read_int(path: &[u8]) -> i64 {
+    let mut buf = [0u8; 32];
+    let fd = sys_open(path.as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return -1;
+    }
+    let n = sys_read(fd as u64, buf.as_mut_ptr(), buf.len() as u64);
+    sys_close(fd as u64);
+    let mut v = -1i64;
+    for &b in &buf[..n.max(0) as usize] {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        v = v.max(0) * 10 + (b - b'0') as i64;
+    }
+    v
+}
+
 fn touch_all(share: u32) -> u64 {
     let len = (meminfo(b"MemTotal:").max(0) as u64 * 1024 * 2) & !(PAGE - 1);
     let flags = share | MAP_ANONYMOUS | MAP_NORESERVE;
@@ -275,6 +317,18 @@ fn fault_kill(name: &[u8], f: fn() -> u64) {
         print_num(after);
         println(b" kB");
         report(name, false, -2);
+        return;
+    }
+    // The kernel kept its reserve
+    let min = read_int(b"/proc/sys/vm/min_free_kbytes\0");
+    if min <= 0 || after < min {
+        print(name);
+        print(b": MemFree ");
+        print_num(after);
+        print(b" kB, min_free_kbytes ");
+        print_num(min);
+        println(b"");
+        report(name, false, -4);
         return;
     }
     let again = in_child(|| 0);

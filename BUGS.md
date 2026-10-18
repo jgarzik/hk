@@ -278,13 +278,13 @@ parallel). Next occurrence: capture the Message line.
 
 ramfs (the root filesystem and every ramfs mount) is bounded only by
 memory, for every user: writes fail with ENOSPC once free frames reach
-the kernel's reserve (1/32 of RAM, at least 4MB) or the kernel heap is
+the low watermark (min_free_kbytes formula) or the kernel heap is
 down to 2MB, and the memory comes back when the last link and the last
 open reference of a file are gone (or on truncate). Linux's rootfs is a
 tmpfs limited to half of RAM by default; tmpfs with `size=`/`nr_inodes=`
 limits (and per-user accounting) comes with the filesystem chunk.
 Reads of holes need a zeroed page each and can fail with ENOMEM when
-memory is at the reserve (Linux maps the shared zero page).
+memory is at the low watermark (Linux maps the shared zero page).
 
 ## The kernel heap is a fixed 16MB region
 

@@ -52,7 +52,7 @@ pub fn read(ctl: &Ctl) -> Vec<u8> {
 
 /// All tables, mounted under /proc/sys
 pub fn tables() -> &'static [&'static [Ctl]] {
-    static TABLES: &[&[Ctl]] = &[crate::net::sysctl::CTLS];
+    static TABLES: &[&[Ctl]] = &[crate::net::sysctl::CTLS, crate::frame_alloc::VM_CTLS];
     TABLES
 }
 
@@ -110,7 +110,11 @@ pub fn write(ctl: &Ctl, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
 /// too). `mask` holds MAY_READ / MAY_WRITE / MAY_EXEC bits.
 pub fn permission(ctl: &Ctl, c: &crate::task::Cred, mask: u32) -> Result<(), KernelError> {
     let m = ctl.mode as u32;
-    let bits = if c.euid == 0 || c.cap_effective.has(crate::task::CAP_NET_ADMIN) {
+    // Linux test_perm: root gets the owner bits; CAP_NET_ADMIN counts
+    // as root only for the network namespace's own files
+    // (net_ctl_permissions), never for vm/ and the rest
+    let net_admin = ctl.path.starts_with("net/") && c.cap_effective.has(crate::task::CAP_NET_ADMIN);
+    let bits = if c.euid == 0 || net_admin {
         m >> 6
     } else if c.egid == 0 {
         m >> 3

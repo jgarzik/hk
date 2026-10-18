@@ -1011,7 +1011,7 @@ impl PageCache {
         unevictable: bool,
         a_ops: &'static dyn AddressSpaceOps,
     ) -> Result<Arc<CachedPage>, KernelError> {
-        // Unevictable pages (ramfs) never take the kernel's reserve
+        // Unevictable pages (ramfs) stop at the low watermark
         if unevictable && frame_alloc.reserve_low() {
             return Err(KernelError::NoSpace);
         }
@@ -1171,7 +1171,7 @@ impl PageCache {
         unevictable: bool,
         a_ops: &'static dyn AddressSpaceOps,
     ) -> Result<Arc<CachedPage>, KernelError> {
-        // Unevictable pages (ramfs) never take the kernel's reserve
+        // Unevictable pages (ramfs) stop at the low watermark
         if unevictable && frame_alloc.reserve_low() {
             return Err(KernelError::NoSpace);
         }

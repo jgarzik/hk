@@ -9,7 +9,7 @@
 //! zone lock an `IrqSpinlock` leaf).
 
 use crate::arch::FrameAlloc;
-use crate::mm::page_alloc::{Gfp, Zone};
+use crate::mm::page_alloc::{Gfp, Wmark, Zone};
 
 /// Page/frame size (4KB)
 pub const FRAME_SIZE: usize = 4096;
@@ -55,8 +55,10 @@ impl FrameAllocator {
             .free_range(start.div_ceil(FRAME_SIZE as u64), pfn(end));
     }
 
-    /// Boot is done handing out free memory: size the per-CPU lists
+    /// Boot is done handing out free memory: set the watermarks and
+    /// size the per-CPU lists
     pub fn init_done(&self) {
+        self.zone.setup_wmarks(None);
         self.zone.setup_pcp();
     }
 
@@ -192,16 +194,25 @@ impl FrameAllocator {
         self.zone.free_pages_all()
     }
 
-    /// Frames kept back from user data (page-cache pages that cannot be
-    /// evicted) so page tables, stacks and DMA buffers still get memory
-    /// when ramfs files fill RAM: 1/32 of memory, at least 4MB
-    pub fn reserve_frames(&self) -> usize {
-        (self.zone.managed() / 32).max(1024)
+    /// Free memory is down to the low watermark, where user data
+    /// (anonymous pages, unevictable page cache) stops
+    pub fn low(&self) -> bool {
+        self.zone.below(Wmark::Low)
     }
 
-    /// Free memory is down to the reserve (watermark-lite)
-    pub fn below_reserve(&self) -> bool {
-        self.zone.nr_free() <= self.reserve_frames()
+    /// A watermark, in frames
+    pub fn wmark(&self, w: Wmark) -> usize {
+        self.zone.wmark(w)
+    }
+
+    /// vm.min_free_kbytes
+    pub fn min_free_kbytes(&self) -> usize {
+        self.zone.min_free_kb()
+    }
+
+    /// Set vm.min_free_kbytes and the watermarks from it
+    pub fn set_min_free_kbytes(&self, kb: usize) {
+        self.zone.setup_wmarks(Some(kb));
     }
 
     /// Total (managed) and free memory
@@ -259,7 +270,7 @@ impl FrameAlloc for FrameAllocRef<'_> {
     }
 
     fn reserve_low(&self) -> bool {
-        self.0.below_reserve() || crate::heap_low()
+        self.0.low() || crate::heap_low()
     }
 
     fn alloc_frame(&mut self) -> Option<Self::PhysAddr> {
@@ -274,6 +285,19 @@ impl FrameAlloc for FrameAllocRef<'_> {
         self.0.decref(frame);
     }
 }
+
+/// /proc/sys/vm files of the page allocator
+pub static VM_CTLS: &[crate::sysctl::Ctl] = &[crate::sysctl::Ctl {
+    path: "vm/min_free_kbytes",
+    mode: 0o644,
+    show: || alloc::vec![crate::FRAME_ALLOCATOR.min_free_kbytes() as i64],
+    store: |v| {
+        crate::sysctl::range(v[0], 0, i32::MAX as i64)?;
+        crate::FRAME_ALLOCATOR.set_min_free_kbytes(v[0] as usize);
+        Ok(())
+    },
+    text: None,
+}];
 
 #[cfg(test)]
 mod tests {
@@ -291,6 +315,7 @@ mod tests {
         a.init_at(base, BASE, (n * FRAME_SIZE) as u64);
         a.free_range(pa(1), pa(n));
         a.init_done();
+        a.zone.clear_wmarks();
         (a, map)
     }
 

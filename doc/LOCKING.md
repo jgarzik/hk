@@ -724,6 +724,9 @@ pub struct Zone {
 - Both are IRQ-safe: allocating or freeing in interrupt context cannot
   deadlock against an interrupted allocator (policy is still no
   allocation in IRQ context).
+- Watermarks (min/low/high, from min_free_kbytes) are set once at boot
+  and checked lock-free against the zone's free count (an atomic
+  written under `Zone.lock`), as Linux zone_watermark_ok.
 - Reference counts are atomics in struct page (`get`/`put`, no lock);
   the put that reaches zero frees. A count that reaches `u32::MAX`
   saturates and stays (the page leaks rather than being freed while
@@ -1084,10 +1087,10 @@ free a frame a mapping still uses.
 takes PAGE_CACHE -> FRAME_ALLOCATOR (`IrqSpinlock`, leaf) to free its
 pages. The page cache never holds inode references, so the last inode
 reference is never dropped with PAGE_CACHE held. Unevictable (ramfs)
-pages are kept off the eviction FIFO and are refused below the memory
-reserve (`FrameAlloc::reserve_low`: the frame allocator's exact free
-count and the heap's free-byte count, both read under their own leaf
-locks while PAGE_CACHE is held).
+pages are kept off the eviction FIFO and are refused at the low
+watermark (`FrameAlloc::reserve_low`: the zone's free count, an atomic,
+and the heap's free-byte count, read under its leaf lock while
+PAGE_CACHE is held).
 
 ### 3.3 Virtual File System (VFS)
 

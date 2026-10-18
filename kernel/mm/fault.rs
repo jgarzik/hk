@@ -23,6 +23,7 @@ use super::{Mm, MmStruct, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE, SwapEntry
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{CurrentArch, PageFlags, SchedArch, paging, phys_to_virt};
 use crate::fs::File;
+use crate::mm::page_alloc::Gfp;
 use crate::task::percpu::{increment_maj_flt, increment_min_flt};
 
 type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
@@ -116,14 +117,11 @@ fn find_area(map: &mut MmStruct, addr: u64, access: Access) -> Result<Area, VmFa
     })
 }
 
-/// A frame for user data, unless free memory is down to the reserve
-/// kept for the kernel (Linux: user allocations stop at the min
-/// watermark; page tables, stacks and DMA buffers may still dip below)
+/// A frame for user data: none once free memory is down to the low
+/// watermark (the kernel's allocations may go on to min; see
+/// `page_alloc::alloc_mark`)
 pub(crate) fn alloc_user() -> Option<u64> {
-    if FRAME_ALLOCATOR.below_reserve() {
-        return None;
-    }
-    FRAME_ALLOCATOR.alloc()
+    FRAME_ALLOCATOR.alloc_gfp(Gfp::HIGHUSER_MOVABLE)
 }
 
 /// Install `new` in the leaf entry at `ptep` if it still holds `old`
@@ -304,7 +302,7 @@ fn huge_fault(mm: &Mm, addr: u64, area: &Area, access: Access) -> Option<Result<
 /// to fall back to a 4KB page
 fn do_huge_anon(pgd: u64, addr: u64, area: &Area) -> bool {
     let base = addr & !(HUGE_PAGE_SIZE - 1);
-    if base < area.start || base + HUGE_PAGE_SIZE > area.end || FRAME_ALLOCATOR.below_reserve() {
+    if base < area.start || base + HUGE_PAGE_SIZE > area.end {
         return false;
     }
     let Some(frame) = FRAME_ALLOCATOR.alloc_huge() else {
