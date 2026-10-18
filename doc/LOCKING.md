@@ -2864,6 +2864,7 @@ interrupt-safety invariant:
 | `TASK_TLS` | kernel/task/tls.rs | `Mutex` | TLS base addresses |
 | `NPROC` | kernel/task/mod.rs | `Mutex` | RLIMIT_NPROC tasks per real uid (leaf: may be taken under TASK_TABLE, takes no lock) |
 | `MEMBLOCK` | kernel/mm/memblock.rs | `Mutex` | Boot memory map (boot CPU, before SMP) |
+| `ACCT_FILE` | kernel/acct.rs | `Mutex` | Process accounting file (leaf: cloned out, the record written and an old file released with no lock held) |
 | `PAGE_CACHE` | core/page_cache.rs | `Mutex` | Page cache lookup |
 | All VFS locks | kernel/fs/*.rs | `RwLock` | Inodes, dentries, mounts |
 | Descriptor tables (`Files`) | kernel/task/fdtable.rs | `Mutex` | Per-task fd tables |

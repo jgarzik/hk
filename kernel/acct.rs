@@ -15,12 +15,11 @@
 //! Uses Linux acct_v3 format (64 bytes per record).
 //! Records are written when processes exit (group leader exits).
 
-use alloc::string::String;
 use alloc::sync::Arc;
 
-use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::File;
+use crate::sync::spin::Mutex;
 use crate::task::CAP_SYS_PACCT;
 use crate::task::Pid;
 use crate::task::Tid;
@@ -154,17 +153,17 @@ fn encode_elapsed_float(elapsed_ns: u64) -> u32 {
 // Accounting State
 // =============================================================================
 
-/// Accounting state
-struct AcctState {
-    /// File to write accounting records to
-    file: Arc<File>,
-    /// Path to accounting file (for reference)
-    #[allow(dead_code)]
-    path: String,
-}
+/// The accounting file (Linux acct->file). A leaf spin lock, thread
+/// context only: users clone the file out and write with no lock held
+/// (the write sleeps), and a replaced file is released after unlocking.
+static ACCT_FILE: Mutex<Option<Arc<File>>> = Mutex::new(None);
 
-/// Global accounting state
-static ACCT_STATE: IrqSpinlock<Option<AcctState>> = IrqSpinlock::new(None);
+/// Install `file` (None: accounting off); the old file is released
+/// with no lock held
+fn set_acct_file(file: Option<Arc<File>>) {
+    let old = core::mem::replace(&mut *ACCT_FILE.lock(), file);
+    drop(old);
+}
 
 // =============================================================================
 // Syscall Implementation
@@ -184,8 +183,7 @@ pub fn sys_acct(filename_ptr: u64) -> i64 {
 
     // If filename_ptr == 0, disable accounting
     if filename_ptr == 0 {
-        let mut state = ACCT_STATE.lock();
-        *state = None;
+        set_acct_file(None);
         return 0;
     }
 
@@ -202,12 +200,7 @@ pub fn sys_acct(filename_ptr: u64) -> i64 {
         Err(e) => return e,
     };
 
-    // Enable accounting
-    let mut state = ACCT_STATE.lock();
-    *state = Some(AcctState {
-        file,
-        path: filename,
-    });
+    set_acct_file(Some(file));
 
     0
 }
@@ -263,11 +256,9 @@ fn open_acct_file(path: &str) -> Result<Arc<File>, i64> {
 /// This should be called from mark_zombie() when a process exits.
 /// It's best-effort - failures are silently ignored to not block the exit path.
 pub fn write_acct_record(tid: Tid, pid: Pid, exit_status: i32) {
-    // Check if accounting is enabled
-    let state = ACCT_STATE.lock();
-    let state = match state.as_ref() {
-        Some(s) => s,
-        None => return, // Accounting not enabled
+    // Accounting enabled? (the file is used with no lock held)
+    let Some(file) = ACCT_FILE.lock().clone() else {
+        return;
     };
 
     // Get task information
@@ -323,7 +314,7 @@ pub fn write_acct_record(tid: Tid, pid: Pid, exit_status: i32) {
     };
 
     // Write to file (best-effort, ignore errors)
-    let _ = write_record_to_file(&state.file, &record);
+    let _ = write_record_to_file(&file, &record);
 }
 
 /// Task information gathered for accounting
@@ -409,14 +400,4 @@ fn write_record_to_file(file: &File, record: &AcctV3) -> Result<(), KernelError>
     file.f_op.write(file, bytes)?;
 
     Ok(())
-}
-
-// =============================================================================
-// Public API for integration
-// =============================================================================
-
-/// Check if accounting is enabled
-#[allow(dead_code)]
-pub fn is_enabled() -> bool {
-    ACCT_STATE.lock().is_some()
 }
