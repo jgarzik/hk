@@ -48,6 +48,7 @@ pub mod mempolicy;
 pub mod mm_life;
 pub mod mm_oom;
 pub mod mmap;
+pub mod mmlock;
 pub mod mountflags;
 pub mod mprotect;
 pub mod mqueue;
@@ -195,6 +196,7 @@ pub fn run_all_tests() {
     io_uring::run_tests();
     tcp::run_tests();
     isolated(b"MEMCORE", memcore::run_tests);
+    isolated(b"MMLOCK", mmlock::run_tests);
     netlink::run_tests();
     netdev_ioctl::run_tests();
     netdev::run_tests();
