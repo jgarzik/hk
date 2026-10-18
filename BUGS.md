@@ -589,10 +589,8 @@ From the fix-batch-1 /code-review (unverified). Tag = when to fix.
 3. **init is killable by SIG_DFL signals** (next batch).
    `kernel/signal/mod.rs:892`: no SIGNAL_UNKILLABLE check on the new
    fatal-on-arrival path; kill(1, SIGTERM) by root ends the system.
-4. **drain_all on every failed allocation** (P4, with reclaim).
-   `kernel/mm/page_alloc.rs:462`: the opportunistic order-9 THP try
-   drains every CPU's pcp on each fault once fragmented. Skip for
-   opportunistic/high-order gfp; rate-limit like pcpu_drain_mutex.
+4. Fixed in P4: only thread-context allocations drain the per-CPU
+   lists (the THP try is `Gfp::TRANSHUGE_LIGHT`), one drain at a time.
 5. **memblock MAX_REGIONS = 128 drops RAM silently** (next batch).
    `kernel/mm/memblock.rs:66`.
 6. **kmap direct_pages re-parses the multiboot map per 2MB chunk**

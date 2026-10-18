@@ -29,7 +29,7 @@
 //! leaked. Every pfn from outside is checked against the zone and the
 //! memory map's sections before its struct page is touched.
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::cpumask::NR_CPUS;
@@ -77,6 +77,10 @@ impl Gfp {
     pub const USER: Gfp = Gfp(Gfp::KERNEL.0 | Gfp::HARDWALL.0);
     /// User page data (anonymous memory, page cache)
     pub const HIGHUSER_MOVABLE: Gfp = Gfp(Gfp::USER.0 | Gfp::MOVABLE.0);
+    /// An opportunistic huge page for user data (Linux
+    /// GFP_TRANSHUGE_LIGHT): never drains or reclaims, the fault falls
+    /// back to 4KB pages
+    pub const TRANSHUGE_LIGHT: Gfp = Gfp(Gfp::HARDWALL.0 | Gfp::MOVABLE.0 | Gfp::NOWARN.0);
 
     pub const fn has(self, f: Gfp) -> bool {
         self.0 & f.0 == f.0
@@ -159,6 +163,21 @@ std::thread_local! {
     pub static TEST_CPU: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
+/// In an interrupt handler: allocations there never drain or reclaim,
+/// whatever their flags (an IRQ-context caller must pass `Gfp::ATOMIC`;
+/// one that passes `Gfp::RECLAIM` is a bug, caught in debug builds)
+fn in_interrupt() -> bool {
+    #[cfg(not(test))]
+    {
+        use crate::arch::{CurrentArch, PerCpuOps};
+        let irq = CurrentArch::interrupt_depth() > 0;
+        debug_assert!(!irq, "Gfp::RECLAIM allocation in interrupt context");
+        irq
+    }
+    #[cfg(test)]
+    false
+}
+
 /// This CPU; None before its per-CPU data exists (a CPU coming up, or
 /// the boot CPU early), when per-CPU caches must not be used: the
 /// caller takes the shared slow path instead. Host tests play CPU 0
@@ -214,6 +233,8 @@ pub struct Zone {
     batch: AtomicUsize,
     high: AtomicUsize,
     pcp: [Pcp; NR_CPUS],
+    /// A drain of every CPU's list is running (Linux pcpu_drain_mutex)
+    draining: AtomicBool,
 }
 
 impl Zone {
@@ -235,6 +256,7 @@ impl Zone {
             batch: AtomicUsize::new(1),
             high: AtomicUsize::new(0),
             pcp: [const { Pcp::new() }; NR_CPUS],
+            draining: AtomicBool::new(false),
         }
     }
 
@@ -432,7 +454,21 @@ impl Zone {
     /// drain_all_pages, which drains each CPU's list under its pcp->lock
     /// from the calling CPU): pages there are invisible to watermarks
     /// and buddy merging. One list lock at a time.
-    pub fn drain_all(&self) {
+    ///
+    /// One drain at a time (Linux pcpu_drain_mutex, taken with trylock):
+    /// a caller that finds one running returns at once, never waits
+    /// (it may hold spinlocks, or have interrupted the drainer); false
+    /// then.
+    pub fn drain_all(&self) -> bool {
+        if self.draining.swap(true, Ordering::Acquire) {
+            return false;
+        }
+        self.drain_lists();
+        self.draining.store(false, Ordering::Release);
+        true
+    }
+
+    fn drain_lists(&self) {
         for p in &self.pcp {
             if p.count.load(Ordering::Relaxed) == 0 {
                 continue;
@@ -450,18 +486,29 @@ impl Zone {
     // ------------------------------------------------------------------
 
     /// Allocate 2^order pages; refcount 1 on the first (every page with
-    /// `__GFP_COMP`: tails point at the head). On failure the per-CPU
-    /// lists are drained and the allocation tried once more (Linux
-    /// __alloc_pages_slowpath; draining never sleeps here, so every
-    /// context gets it).
+    /// `__GFP_COMP`: tails point at the head). On failure an allocation
+    /// from thread context (`Gfp::RECLAIM`) drains the per-CPU lists and
+    /// tries once more (Linux __alloc_pages_slowpath); atomic and
+    /// opportunistic ones (a huge page the fault can do without) fail
+    /// at once.
     pub fn alloc_pages(&self, order: u32, gfp: Gfp) -> Option<u64> {
         if order > MAX_ORDER {
             return None;
         }
-        self.try_alloc(order, gfp).or_else(|| {
-            self.drain_all();
-            self.try_alloc(order, gfp)
-        })
+        self.try_alloc(order, gfp)
+            .or_else(|| self.slowpath(order, gfp))
+    }
+
+    /// The allocation failed its first attempt (Linux
+    /// __alloc_pages_slowpath)
+    fn slowpath(&self, order: u32, gfp: Gfp) -> Option<u64> {
+        if !gfp.has(Gfp::RECLAIM) || in_interrupt() {
+            return None;
+        }
+        // A drain already running elsewhere is making progress: retry
+        // once either way
+        self.drain_all();
+        self.try_alloc(order, gfp)
     }
 
     /// One allocation attempt from the per-CPU and buddy lists (Linux
@@ -969,6 +1016,45 @@ mod tests {
         got.into_iter().for_each(|p| t.z.free_pages(p, 0));
         t.z.drain_all();
         assert!(t.z.alloc_pages(5, Gfp::KERNEL).is_some());
+    }
+
+    /// A drain that finds one running returns at once (never waits)
+    #[test]
+    fn nested_drain_returns_at_once() {
+        let t = zone(0, 64);
+        t.z.free_range(0, 64);
+        t.z.draining.store(true, Ordering::Relaxed);
+        assert!(!t.z.drain_all());
+        t.z.draining.store(false, Ordering::Relaxed);
+        assert!(t.z.drain_all());
+        assert!(!t.z.draining.load(Ordering::Relaxed));
+    }
+
+    /// Atomic and opportunistic allocations (a huge-page try on every
+    /// fault) fail without draining other CPUs' lists
+    #[test]
+    fn nowait_alloc_does_not_drain() {
+        let t = zone(0, 64);
+        t.z.free_range(0, 64);
+        t.z.batch.store(8, Ordering::Relaxed);
+        t.z.high.store(32, Ordering::Relaxed);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                TEST_CPU.with(|c| c.set(1));
+                let v: Vec<_> = (0..64)
+                    .map_while(|_| t.z.alloc_pages(0, Gfp::KERNEL))
+                    .collect();
+                v.into_iter().for_each(|p| t.z.free_pages(p, 0));
+            });
+        });
+        let parked = t.z.pcp[1].count.load(Ordering::Relaxed);
+        assert!(parked > 0);
+        while t.z.alloc_pages(0, Gfp::NOWAIT).is_some() {}
+        assert!(t.z.alloc_pages(0, Gfp::TRANSHUGE_LIGHT).is_none());
+        assert_eq!(t.z.pcp[1].count.load(Ordering::Relaxed), parked);
+        // A thread-context allocation drains it
+        assert!(t.z.alloc_pages(0, Gfp::KERNEL).is_some());
+        assert_eq!(t.z.pcp[1].count.load(Ordering::Relaxed), 0);
     }
 
     #[test]

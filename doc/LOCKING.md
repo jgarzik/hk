@@ -734,12 +734,20 @@ pub struct Zone {
   CPU; Linux pcp->lock) → `Zone.lock` (`IrqSpinlock`, leaf). A CPU
   allocates and frees through its own list under its lock (the kernel
   is not preemptive, so it stays on the CPU); a refill or a past-`high`
-  drain takes `Zone.lock` under it. An allocation that fails drains
-  every CPU's list (`drain_all`, Linux drain_all_pages, which also
-  drains remote lists under their pcp->lock from the calling CPU) and
-  tries once more: it takes each list's lock in turn, never two at
-  once, so CPUs draining each other cannot deadlock, and needs no IPI
-  (it may run under any lock and in interrupt context). A CPU without
+  drain takes `Zone.lock` under it. A thread-context allocation
+  (`Gfp::RECLAIM`) that fails drains every CPU's list (`drain_all`,
+  Linux drain_all_pages, which also drains remote lists under their
+  pcp->lock from the calling CPU) and tries once more; atomic and
+  opportunistic ones (`Gfp::TRANSHUGE_LIGHT`, the fault's huge-page
+  try) fail at once. A drain takes each list's lock in turn, never two
+  at once, so CPUs draining each other cannot deadlock, and needs no
+  IPI (it may run under any lock). One drain runs at a time
+  (`Zone.draining`, an atomic flag; Linux pcpu_drain_mutex, which
+  hk takes like a trylock): a caller that finds one running never
+  waits (it may hold a spinlock, or have interrupted the drainer) and
+  just retries its allocation. Allocations in interrupt context never
+  drain (debug builds assert they do not pass `Gfp::RECLAIM`). A CPU
+  without
   per-CPU data yet (coming up, or the boot CPU early) never touches a
   per-CPU list: it allocates and frees under `Zone.lock`. A list's page
   count is an atomic beside its lock (statistics read it lock-free).

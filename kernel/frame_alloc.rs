@@ -138,9 +138,10 @@ impl FrameAllocator {
             .map(phys)
     }
 
-    /// Allocate a 2MB huge page for user data
+    /// Allocate a 2MB huge page for user data, if one is free at once
+    /// (no drain: the fault falls back to 4KB pages)
     pub fn alloc_huge(&self) -> Option<u64> {
-        self.alloc_huge_gfp(Gfp::HIGHUSER_MOVABLE)
+        self.alloc_huge_gfp(Gfp::TRANSHUGE_LIGHT)
     }
 
     /// Free a 2MB huge page whatever its count
