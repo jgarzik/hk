@@ -41,6 +41,7 @@
 - [x] setrlimit
 - [x] prlimit64
 - [x] getrusage
+- [x] times (children's times not tracked: 0)
 
 2. File descriptors & basic I/O
 

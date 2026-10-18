@@ -230,6 +230,42 @@ pub fn put_rusage_times<A: crate::uaccess::UaccessArch>(
     crate::uaccess::put_user::<A, Rusage>(usage_ptr, usage).map_err(|_| KernelError::BadAddress)
 }
 
+/// struct tms (Linux include/uapi/linux/times.h), in clock ticks
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Tms {
+    tms_utime: i64,
+    tms_stime: i64,
+    tms_cutime: i64,
+    tms_cstime: i64,
+}
+
+/// Nanoseconds to clock ticks (USER_HZ = 100)
+fn ns_to_clock_t(ns: u64) -> i64 {
+    (ns / 10_000_000) as i64
+}
+
+/// times(2) (Linux kernel/sys.c sys_times): the process's user and
+/// system time into `buf` (if not NULL; children's times are not
+/// tracked: 0), and the clock ticks since boot (Linux jiffies in
+/// USER_HZ units; hk's scheduler tick is 10 ms, one USER_HZ tick, and
+/// counts from 0 where Linux starts 5 minutes before the wrap)
+pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: u64) -> i64 {
+    use crate::task::percpu;
+    if buf != 0 {
+        let (utime, stime) = percpu::get_process_times(percpu::current_pid());
+        let t = Tms {
+            tms_utime: ns_to_clock_t(utime),
+            tms_stime: ns_to_clock_t(stime),
+            ..Tms::default()
+        };
+        if crate::uaccess::put_user::<A, Tms>(buf, t).is_err() {
+            return KernelError::BadAddress.sysret();
+        }
+    }
+    percpu::get_ticks() as i64
+}
+
 /// sys_getrusage - get resource usage
 ///
 /// Returns resource usage statistics for the specified target.

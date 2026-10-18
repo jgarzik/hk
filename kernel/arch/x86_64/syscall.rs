@@ -521,6 +521,8 @@ pub const SYS_BPF: u64 = 321;
 pub const SYS_GETCPU: u64 = 309;
 /// getrusage(who, usage)
 pub const SYS_GETRUSAGE: u64 = 98;
+/// times(buf) - process times in clock ticks
+pub const SYS_TIMES: u64 = 100;
 /// sysinfo(info)
 pub const SYS_SYSINFO: u64 = 99;
 /// getrandom(buf, buflen, flags)
@@ -1967,6 +1969,7 @@ pub fn x86_64_syscall_dispatch(
             use crate::task::syscall::sys_sysinfo;
             sys_sysinfo::<Uaccess>(arg0) as u64
         }
+        SYS_TIMES => crate::task::syscall::sys_times::<crate::arch::Uaccess>(arg0) as u64,
         SYS_GETRUSAGE => {
             use crate::arch::Uaccess;
             use crate::task::syscall::sys_getrusage;

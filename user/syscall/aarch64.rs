@@ -356,6 +356,7 @@ pub const SYS_MREMAP: u64 = 216;
 
 // System information syscalls
 pub const SYS_GETRUSAGE: u64 = 165;
+pub const SYS_TIMES: u64 = 153;
 pub const SYS_SYSINFO: u64 = 179;
 pub const SYS_GETRANDOM: u64 = 278;
 
@@ -1771,6 +1772,12 @@ pub fn sys_sysinfo(info: *mut u8) -> i64 {
 
 /// getrusage(who, usage) - get resource usage
 #[inline(always)]
+/// times(2): clock ticks since boot; fills `buf` (struct tms) if not
+/// null
+pub fn sys_times(buf: *mut u8) -> i64 {
+    unsafe { syscall1!(SYS_TIMES, buf) }
+}
+
 pub fn sys_getrusage(who: i32, usage: *mut u8) -> i64 {
     unsafe { syscall2!(SYS_GETRUSAGE, who, usage) }
 }

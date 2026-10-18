@@ -2,6 +2,7 @@
 //!
 //! Tests:
 //! - Test 70: uname() - get system identification
+//! - TIMES_BASIC: times() - clock ticks and process times
 //! - Test 71: sethostname() - set hostname
 //! - Test 72: setdomainname() - set domain name
 //! - Test 73: sethostname() EINVAL - too long name
@@ -14,7 +15,7 @@
 use super::helpers::{host_mode, print, print_cstr, print_num, println, starts_with};
 use hk_syscall::{
     Timespec, UtsName, sys_clock_gettime, sys_clock_settime, sys_setdomainname, sys_sethostname,
-    sys_uname,
+    sys_times, sys_uname,
 };
 #[cfg(target_arch = "x86_64")]
 use hk_syscall::{Timeval, sys_gettimeofday, sys_settimeofday};
@@ -26,6 +27,7 @@ const CLOCK_MONOTONIC: i32 = 1;
 /// Run all sysinfo tests
 pub fn run_tests() {
     test_uname();
+    test_times();
     test_sethostname();
     test_setdomainname();
     test_sethostname_einval();
@@ -276,5 +278,22 @@ fn test_settimeofday_invalid_usec() {
     } else {
         print(b"SETTIMEOFDAY_INVALID_USEC:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
+    }
+}
+
+/// times(): ticks since boot (monotone), the process's times in `buf`,
+/// EFAULT for a bad buffer
+fn test_times() {
+    let mut tms = [0i64; 4];
+    let a = sys_times(core::ptr::null_mut());
+    let b = sys_times(tms.as_mut_ptr() as *mut u8);
+    let bad = sys_times(8 as *mut u8);
+    print(b"TIMES_BASIC");
+    if b >= a && tms.iter().all(|&t| t >= 0) && bad == -14 {
+        println(b":OK");
+    } else {
+        print(b":FAIL got ");
+        print_num(bad);
+        println(b"");
     }
 }

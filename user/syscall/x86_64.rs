@@ -247,6 +247,7 @@ pub const SYS_LCHOWN: u64 = 94;
 pub const SYS_UMASK: u64 = 95;
 pub const SYS_GETRLIMIT: u64 = 97;
 pub const SYS_GETRUSAGE: u64 = 98;
+pub const SYS_TIMES: u64 = 100;
 pub const SYS_SYSINFO: u64 = 99;
 pub const SYS_GETUID: u64 = 102;
 pub const SYS_GETGID: u64 = 104;
@@ -1555,6 +1556,12 @@ pub fn sys_sysinfo(info: *mut u8) -> i64 {
 }
 
 #[inline(always)]
+/// times(2): clock ticks since boot; fills `buf` (struct tms) if not
+/// null
+pub fn sys_times(buf: *mut u8) -> i64 {
+    unsafe { syscall1!(SYS_TIMES, buf) }
+}
+
 pub fn sys_getrusage(who: i32, usage: *mut u8) -> i64 {
     unsafe { syscall2!(SYS_GETRUSAGE, who, usage) }
 }
