@@ -38,6 +38,8 @@ pub mod icmp;
 pub mod inotify;
 pub mod io_uring;
 #[cfg(target_arch = "x86_64")]
+pub mod gs_sel;
+#[cfg(target_arch = "x86_64")]
 pub mod ioport;
 pub mod ipc;
 pub mod kcmp;
@@ -235,4 +237,6 @@ pub fn run_all_tests() {
     isolated(b"BUSYBOX", busybox::run_tests);
     #[cfg(target_arch = "x86_64")]
     ioport::run_tests();
+    #[cfg(target_arch = "x86_64")]
+    gs_sel::run_tests();
 }

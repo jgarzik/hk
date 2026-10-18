@@ -614,7 +614,7 @@ impl PerCpuOps for Aarch64Arch {
     fn get_current_task() -> CurrentTask {
         percpu::try_current_cpu()
             .map(|p| p.current_task)
-            .unwrap_or_default()
+            .unwrap_or_else(crate::task::percpu::no_percpu_task)
     }
 
     #[inline]

@@ -859,6 +859,11 @@ unsafe extern "C" fn syscall_entry() {
         "push r8",
         "push r9",
 
+        // Kernel GS base back before any Rust code (a user `mov gs`
+        // replaced it; percpu::restore_kernel_gs). The frame holds every
+        // register it clobbers.
+        "call {kgs}",
+
         // Save RCX (user RIP), R11 (user RFLAGS), user RSP, and callee-saved regs
         // for clone()/fork(). The child needs to inherit ALL parent registers.
         // Stack layout at this point (from top):
@@ -1066,6 +1071,7 @@ unsafe extern "C" fn syscall_entry() {
         save_syscall_caller_saved = sym super::percpu::save_syscall_caller_saved,
         update_frame = sym super::percpu::update_syscall_return_frame,
         fill_iret = sym super::percpu::fill_iret_frame,
+        kgs = sym super::percpu::restore_kernel_gs,
     );
 }
 

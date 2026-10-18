@@ -234,6 +234,7 @@ impl PerCpu {
 
     /// Initialize the PerCpu structure
     pub fn init(&mut self, cpu_id: u32, apic_id: u32, is_bsp: bool, kernel_stack_top: u64) {
+        set_tsc_aux(cpu_id);
         self.self_ptr = self as *mut PerCpu;
         self.cpu_id = cpu_id;
         self.apic_id = apic_id;
@@ -322,8 +323,12 @@ pub fn init_bsp(apic_id: u8, kernel_stack_top: u64) {
     let percpu = get_percpu(0);
     percpu.init(0, apic_id as u32, true, kernel_stack_top);
 
+    // The boot context runs as root until the first task (Linux init_task)
+    percpu.current_task = CurrentTask::boot();
+
     // Set GS base to point to our per-CPU data
     set_gs_base(percpu as *mut PerCpu as u64);
+    crate::task::percpu::PERCPU_UP.store(true, Ordering::Release);
 
     // Mark BSP as online
     percpu.set_online();
@@ -354,6 +359,52 @@ pub fn init_ap(apic_id: u8, kernel_stack_top: u64) -> u32 {
 /// Get the number of online CPUs
 pub fn online_cpu_count() -> u32 {
     CPU_COUNT.load(Ordering::Acquire)
+}
+
+/// IA32_TSC_AUX: this CPU's index (Linux keeps cpu | node << 12 there for
+/// RDTSCP/RDPID getcpu); read back by `restore_kernel_gs`
+const MSR_TSC_AUX: u32 = 0xC0000103;
+
+/// Record this CPU's index in TSC_AUX (user code cannot write it)
+fn set_tsc_aux(cpu_id: u32) {
+    // SAFETY: TSC_AUX exists (RDTSCP checked at boot)
+    unsafe {
+        ::core::arch::asm!(
+            "wrmsr",
+            in("ecx") MSR_TSC_AUX,
+            in("eax") cpu_id,
+            in("edx") 0u32,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Reload GS base with this CPU's per-CPU pointer, found from TSC_AUX
+/// (entry stubs, registers saved; clobbers rax, rcx, rdx and flags).
+///
+/// hk does not use SWAPGS yet: the kernel's per-CPU pointer is the live
+/// GS base, and a user `mov gs, sel` replaces it with the descriptor's
+/// base (0). Every kernel entry (syscall and every IDT stub, from user
+/// or kernel mode: an NMI or fault may land before another entry's
+/// restore) puts it back before any Rust code runs and before
+/// interrupts are enabled; it is idempotent.
+#[unsafe(naked)]
+pub unsafe extern "C" fn restore_kernel_gs() {
+    core::arch::naked_asm!(
+        "rdtscp",
+        "mov eax, ecx",
+        "imul rax, rax, {size}",
+        "lea rcx, [rip + {array}]",
+        "add rax, rcx",
+        "mov rdx, rax",
+        "shr rdx, 32",
+        "mov ecx, {msr}",
+        "wrmsr",
+        "ret",
+        size = const core::mem::size_of::<PerCpu>(),
+        array = sym PERCPU_ARRAY,
+        msr = const 0xC0000101u32,
+    );
 }
 
 /// Set the GS base register (MSR 0xC0000101)
@@ -844,7 +895,7 @@ impl PerCpuOps for X86_64Arch {
     fn get_current_task() -> CurrentTask {
         try_current_cpu()
             .map(|percpu| percpu.current_task)
-            .unwrap_or_default()
+            .unwrap_or_else(crate::task::percpu::no_percpu_task)
     }
 
     #[inline]

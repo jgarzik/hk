@@ -298,6 +298,9 @@ unsafe extern "C" fn exception_common() {
         // Stack now: [rax, rbx, rcx, rdx, rsi, rdi, rbp, r8-r14, r15, error_code, rip, cs, rflags, rsp, ss]
         // This matches TrapFrame layout!
 
+        // Kernel GS base, whatever the origin (keeps r15, the vector)
+        "call {}",
+
         // Call Rust handler with (frame pointer, vector number)
         "mov rdi, rsp",      // First arg: trap frame pointer
         "mov rsi, r15",      // Second arg: vector number (in R15)
@@ -331,6 +334,7 @@ unsafe extern "C" fn exception_common() {
         "add rsp, 8",
 
         "iretq",
+        sym super::percpu::restore_kernel_gs,
         sym handle_exception,
     );
 }
@@ -715,6 +719,7 @@ macro_rules! irq_handler {
                 "push r13",
                 "push r14",
                 "push r15",
+                "call {}",          // kernel GS base (every entry)
 
                 "mov rdi, {}",      // IRQ number
                 "call {}",
@@ -736,6 +741,7 @@ macro_rules! irq_handler {
                 "pop rax",
                 "add rsp, 8",       // Skip error code
                 "iretq",
+                sym super::percpu::restore_kernel_gs,
                 const $irq,
                 sym handle_irq,
             );
@@ -781,6 +787,7 @@ unsafe extern "C" fn lapic_timer_handler() {
         "push r13",
         "push r14",
         "push r15",
+        "call {}",          // kernel GS base (every entry)
 
         // Pass trap frame pointer as argument
         "mov rdi, rsp",
@@ -804,6 +811,7 @@ unsafe extern "C" fn lapic_timer_handler() {
         "pop rax",
         "add rsp, 8",       // Skip error code
         "iretq",
+        sym super::percpu::restore_kernel_gs,
         sym handle_lapic_timer,
     );
 }
@@ -835,6 +843,7 @@ macro_rules! ipi_handler {
                 "push r13",
                 "push r14",
                 "push r15",
+                "call {}",          // kernel GS base (every entry)
                 "call {}",
                 "pop r15",
                 "pop r14",
@@ -853,6 +862,7 @@ macro_rules! ipi_handler {
                 "pop rax",
                 "add rsp, 8",
                 "iretq",
+                sym super::percpu::restore_kernel_gs,
                 sym $handler,
             );
         }

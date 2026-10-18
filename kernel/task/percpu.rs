@@ -523,6 +523,21 @@ pub static TASK_TABLE: Mutex<GlobalTaskTable> = Mutex::new(GlobalTaskTable::new(
 /// Scheduling enabled flag
 pub static SCHEDULING_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// The boot CPU has per-CPU data (`init_bsp`); from then on every CPU
+/// running kernel code has its own
+pub static PERCPU_UP: AtomicBool = AtomicBool::new(false);
+
+/// The current task of a CPU without per-CPU data: early boot (one CPU,
+/// no user code yet) is the boot context, root like Linux init_task;
+/// after `init_bsp` it is a bug or a corrupted per-CPU pointer, so fail
+/// closed instead of guessing credentials
+pub fn no_percpu_task() -> CurrentTask {
+    if PERCPU_UP.load(Ordering::Acquire) {
+        panic!("current task: no per-CPU data");
+    }
+    CurrentTask::boot()
+}
+
 /// Timer tick counter (global)
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -1967,7 +1982,7 @@ fn switch_info(cur: Tid, cur_sleeps: bool, tid: Tid) -> (u64, *const crate::mm::
         .unwrap_or((
             0,
             core::ptr::null(),
-            CurrentTask::from_parts(tid, 0, 0, 0, 0, Cred::ROOT),
+            CurrentTask::from_parts(tid, 0, 0, 0, 0, Cred::NOBODY),
         ))
 }
 

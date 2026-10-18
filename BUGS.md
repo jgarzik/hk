@@ -22,6 +22,18 @@ pid == tid. hk draws pids and tids from separate counters, so e.g.
 TIDs say 3. Anything comparing those values (pthread joins, tgkill to a
 returned pid, `/proc/<pid>/task`) can disagree with Linux.
 
+## x86: no SWAPGS, user GS base not preserved (T0)
+
+**Location**: `kernel/arch/x86_64/percpu.rs` (`restore_kernel_gs`),
+`syscall.rs`, `interrupts.rs`
+
+The kernel's per-CPU pointer is the live GS base. Every entry from user
+mode reloads it from TSC_AUX (the CPU index) before any Rust code, so a
+user `mov gs, sel` cannot redirect the kernel (stopgap). User code then
+runs with the kernel's GS base, not its own (Linux SWAPGS keeps the user
+base; ARCH_SET_GS / FSGSBASE are absent). The syscall entry stack is one
+global, not per CPU. Fix: SWAPGS plus per-CPU GDT/TSS.
+
 ## Raw user-memory access in the pre-VFS minimal write
 
 **Location**: `kernel/arch/x86_64/syscall.rs`

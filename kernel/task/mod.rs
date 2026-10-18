@@ -183,6 +183,25 @@ impl Cred {
         cap_ambient: CAP_EMPTY_SET, // Ambient starts empty even for root
     };
 
+    /// No privileges at all (overflow uid/gid 65534, no capabilities,
+    /// empty bounding set): what a context without a task gets, so a
+    /// missing task never runs privileged
+    pub const NOBODY: Self = Self {
+        uid: 65534,
+        gid: 65534,
+        suid: 65534,
+        sgid: 65534,
+        euid: 65534,
+        egid: 65534,
+        fsuid: 65534,
+        fsgid: 65534,
+        cap_inheritable: CAP_EMPTY_SET,
+        cap_permitted: CAP_EMPTY_SET,
+        cap_effective: CAP_EMPTY_SET,
+        cap_bset: CAP_EMPTY_SET,
+        cap_ambient: CAP_EMPTY_SET,
+    };
+
     /// Create credentials for a specific user/group
     ///
     /// Sets all credential fields (uid, suid, euid, fsuid) to the same value.
@@ -251,7 +270,7 @@ pub fn current_cred_arc() -> Arc<Cred> {
         .iter()
         .find(|t| t.tid == tid)
         .map(|t| t.cred.clone())
-        .unwrap_or_else(|| Arc::new(Cred::ROOT))
+        .unwrap_or_else(|| Arc::new(Cred::NOBODY))
 }
 
 /// Prepare a new credential set by cloning current credentials
@@ -351,15 +370,26 @@ pub struct CurrentTask {
 }
 
 impl CurrentTask {
-    /// Create a new CurrentTask with default values (tid=0, pid=0, root credentials)
+    /// No task (tid 0) with no privileges (`Cred::NOBODY`): a CPU's
+    /// state until it switches to a task
     pub const fn new() -> Self {
+        Self::with_cred(Cred::NOBODY)
+    }
+
+    /// The boot CPU's context before the first task (Linux init_task:
+    /// root): kernel-internal setup of the VFS and devices
+    pub const fn boot() -> Self {
+        Self::with_cred(Cred::ROOT)
+    }
+
+    const fn with_cred(cred: Cred) -> Self {
         Self {
             tid: 0,
             pid: 0,
             ppid: 0,
             pgid: 0,
             sid: 0,
-            cred: Cred::ROOT,
+            cred,
             seccomp_mode: 0, // SECCOMP_MODE_DISABLED
             exiting: false,
         }

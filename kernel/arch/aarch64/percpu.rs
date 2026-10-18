@@ -300,8 +300,12 @@ pub fn init_bsp(mpidr: u64, kernel_stack_top: u64) {
     let percpu = get_percpu(0);
     percpu.init(0, mpidr, true, kernel_stack_top);
 
+    // The boot context runs as root until the first task (Linux init_task)
+    percpu.current_task = CurrentTask::boot();
+
     // Set TPIDR_EL1 to point to our per-CPU data
     set_tpidr_el1(percpu as *mut PerCpu as u64);
+    crate::task::percpu::PERCPU_UP.store(true, Ordering::Release);
 
     // Mark BSP as online
     percpu.set_online();

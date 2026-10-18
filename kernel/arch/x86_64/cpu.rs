@@ -93,6 +93,11 @@ pub fn check_cpu_features() {
     if edx & (1 << 20) == 0 {
         panic!("CPU does not support NX bit");
     }
+    // RDTSCP: kernel entry finds its per-CPU data through TSC_AUX
+    // (percpu::restore_kernel_gs)
+    if edx & (1 << 27) == 0 {
+        panic!("CPU does not support RDTSCP");
+    }
 
     // Check SSE2 support (leaf 1, edx bit 26)
     let (_, _, _, edx) = cpuid(0x1, 0);
