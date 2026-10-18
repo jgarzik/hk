@@ -14,9 +14,34 @@ use super::nl::{
     RTM_NEWADDR, RTM_NEWROUTE, Req, addr as nl_addr, ifaddr, net_setup_eth0, rtmsg,
 };
 use hk_syscall::{
-    O_CLOEXEC, POLLIN, PollFd, SIGKILL, sys_close, sys_dup3, sys_execve, sys_exit, sys_fork,
-    sys_kill, sys_pipe2, sys_poll, sys_read, sys_wait4, sys_write,
+    O_CLOEXEC, POLLIN, PollFd, SIG_IGN, SIGKILL, SIGPIPE, sys_close, sys_dup3, sys_execve,
+    sys_exit, sys_fork, sys_kill, sys_pipe2, sys_poll, sys_read, sys_rt_sigaction, sys_wait4,
+    sys_write,
 };
+
+/// struct sigaction (kernel layout)
+#[repr(C)]
+#[derive(Default)]
+struct SigAction {
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    mask: u64,
+}
+
+/// Write `buf` to `fd` with SIGPIPE ignored: a child that exits before
+/// reading its input (EPIPE) must not kill the test process
+fn write_nopipe(fd: i32, buf: &[u8]) {
+    let ign = SigAction {
+        handler: SIG_IGN,
+        ..Default::default()
+    };
+    let mut old = SigAction::default();
+    let (a, o) = (&ign as *const _ as u64, &mut old as *mut _ as u64);
+    sys_rt_sigaction(SIGPIPE, a, o, 8);
+    sys_write(fd as u64, buf.as_ptr(), buf.len() as u64);
+    sys_rt_sigaction(SIGPIPE, o, 0, 8);
+}
 
 /// Captured output size
 const OUT_MAX: usize = 8192;
@@ -107,7 +132,7 @@ pub fn spawn(args: &[&[u8]], stdin: &[u8]) -> Option<Child> {
     sys_close(inp[0] as u64);
     // Small inputs fit the pipe buffer: write all, then EOF
     if pid > 0 && !stdin.is_empty() {
-        sys_write(inp[1] as u64, stdin.as_ptr(), stdin.len() as u64);
+        write_nopipe(inp[1], stdin);
     }
     sys_close(inp[1] as u64);
     if pid < 0 {
@@ -429,7 +454,8 @@ fn test_nc_lo() {
         println(b":FAIL spawn");
         return;
     };
-    // Retry until the server listens
+    // Start the client once the server listens (then retry a little)
+    let listening = wait_listen(5577);
     let mut client = bb_input(&[b"nc\0", b"127.0.0.1\0", b"5577\0"], b"over lo\n", 10_000);
     for _ in 0..20 {
         if client.ok() {
@@ -439,5 +465,33 @@ fn test_nc_lo() {
         client = bb_input(&[b"nc\0", b"127.0.0.1\0", b"5577\0"], b"over lo\n", 10_000);
     }
     let s = finish(server, 10_000);
-    report(N, client.ok() && s.ok() && s.output() == b"over lo\n", &s);
+    report(
+        N,
+        listening && client.ok() && s.ok() && s.output() == b"over lo\n",
+        &s,
+    );
+}
+
+/// A TCP socket listens on `port` (/proc/net/tcp or tcp6: local
+/// address `*:PORT`, state 0A; busybox nc listens on IPv6 where it
+/// can), waiting up to 5 s
+fn wait_listen(port: u16) -> bool {
+    let hex = |v: u16, i: usize| b"0123456789ABCDEF"[((v >> (12 - 4 * i)) & 0xf) as usize];
+    let want = [b':', hex(port, 0), hex(port, 1), hex(port, 2), hex(port, 3)];
+    let listens = |l: &[u8]| {
+        let mut f = l.split(|&c| c == b' ').filter(|t| !t.is_empty());
+        let (local, st) = (f.nth(1), f.nth(1));
+        local.is_some_and(|a| a.ends_with(&want)) && st == Some(b"0A")
+    };
+    for _ in 0..50 {
+        for path in [&b"/proc/net/tcp\0"[..], b"/proc/net/tcp6\0"] {
+            let mut b = [0u8; 4096];
+            let n = super::helpers::read_file(path, &mut b);
+            if b[..n.max(0) as usize].split(|&c| c == b'\n').any(listens) {
+                return true;
+            }
+        }
+        super::nl::msleep(100);
+    }
+    false
 }
