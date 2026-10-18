@@ -74,10 +74,10 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   blocks: an identity map of the kernel's RAM gigabyte in TTBR0; in
   TTBR1 the first RAM gigabyte, the image and the device window), then
   jumps to the linked address. W^X as on x86.
-- **Linear map**: the DTB `/memory` range, 1 GB blocks where possible,
-  2 MB otherwise; built after the heap exists (the DTB parser needs
-  it), then TTBR1 is switched from the identity map
-  (`__replace_ttbr1`, Linux `cpu_replace_ttbr1`).
+- **Linear map**: every range of every DTB `/memory` node (they also
+  go to memblock), 1 GB blocks where possible, 2 MB otherwise; then
+  TTBR1 is switched from the identity map (`__replace_ttbr1`, Linux
+  `cpu_replace_ttbr1`).
 - **Device window**: an early fixmap for QEMU virt's fixed devices
   (GIC, PL011, PL031) and PCI MMIO below 1 GB; `ioremap` returns
   window addresses for that range and maps anything else (PCI ECAM)
@@ -86,6 +86,19 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   boot data's physical address; it enables the MMU with the kernel
   TTBR1 and the identity map, jumps high, and `ap_rust_entry` drops the
   identity map.
+
+## Physical memory (both arches)
+
+- **memblock** (`mm/memblock.rs`, Linux mm/memblock.c): at boot the
+  arch reports every firmware RAM range the direct map covers
+  (`MemoryLayoutOps::memblock_init`: multiboot2 available ranges on
+  x86, every DTB `/memory` reg on arm64) and reserves what is in use:
+  the kernel image, boot modules and multiboot info, the DTB, the
+  initrd, the FDT reservation block and `/reserved-memory` (arm64), the
+  first 1 MB (x86: BIOS data, AP trampoline), the boot framebuffer and
+  early allocations (top down below the direct-map end). Every free
+  range (memory minus reserved) is then handed to the frame allocator
+  once; MemTotal counts those pages (Linux totalram_pages).
 
 ## User address space (both arches)
 

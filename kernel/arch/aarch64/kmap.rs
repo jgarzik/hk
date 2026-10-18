@@ -68,6 +68,12 @@ pub fn kimage_va(pa: u64) -> u64 {
     pa + KIMAGE_OFFSET
 }
 
+/// The kernel image in physical memory, as [start, end)
+pub fn image_range() -> (u64, u64) {
+    let start = pa_symbol(&raw const __kernel_start as u64);
+    (start, pa_symbol(&raw const __kernel_end as u64))
+}
+
 /// Physical address of the TTBR1 root
 pub fn swapper_phys() -> u64 {
     pa_symbol(&raw const SWAPPER as u64)
@@ -109,8 +115,9 @@ fn idx(va: u64, shift: u32) -> usize {
 }
 
 /// Linear-map RAM [base, base + size): 1GB blocks where a whole
-/// gigabyte is RAM, else 2MB blocks (normal memory, never executable)
-unsafe fn map_linear(root: *mut RawPageTable, base: u64, size: u64) {
+/// gigabyte is RAM, else 2MB blocks (normal memory, never executable);
+/// returns the end of the mapping
+unsafe fn map_linear(root: *mut RawPageTable, base: u64, size: u64) -> u64 {
     let attrs = AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL1_RW | PXN | UXN;
     let (start, end) = (base & !(SZ_2M - 1), (base + size).next_multiple_of(SZ_2M));
     let mut p = start;
@@ -128,7 +135,7 @@ unsafe fn map_linear(root: *mut RawPageTable, base: u64, size: u64) {
             }
         }
     }
-    DIRECT_END.store(end, Ordering::Relaxed);
+    end
 }
 
 /// Map the kernel image with 4KB pages: text read-only executable,
@@ -169,16 +176,23 @@ unsafe fn map_io(root: *mut RawPageTable) {
 }
 
 /// Build the final TTBR1 tables and switch to them (TTBR0 gets the
-/// empty table). Runs on the BSP after the heap is up, on the boot
-/// tables.
+/// empty table): every RAM range of the DTB goes to memblock and into
+/// the linear map. Runs on the BSP, on the boot tables.
 ///
 /// # Safety
 /// Once, on the BSP, before SMP and before any user address space.
 pub unsafe fn init(dtb: u64) {
-    let (base, size) = super::dtb::memory(dtb).unwrap_or(DEFAULT_RAM);
+    use crate::mm::memblock;
+    if !super::dtb::for_each_memory(dtb, memblock::add) {
+        memblock::add(DEFAULT_RAM.0, DEFAULT_RAM.1);
+    }
     unsafe {
         let root = &raw mut SWAPPER;
-        map_linear(root, base, size);
+        let mut end = 0;
+        for r in memblock::MEMBLOCK.lock().memory.ranges() {
+            end = end.max(map_linear(root, r.base, r.size()));
+        }
+        DIRECT_END.store(end, Ordering::Relaxed);
         map_image(root);
         map_io(root);
         // Table writes must reach memory before the walker uses them

@@ -23,6 +23,7 @@ pub mod gather;
 pub mod huge_page;
 pub mod lru;
 pub mod madvise;
+pub mod memblock;
 pub mod memory;
 pub mod mempolicy;
 pub mod mprotect;

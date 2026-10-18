@@ -780,23 +780,20 @@ impl SchedArch for Aarch64Arch {
 // ============================================================================
 
 impl MemoryLayoutOps for Aarch64Arch {
-    fn get_frame_alloc_region() -> (u64, u64) {
-        // Frames run from the heap end (placed past the kernel image,
-        // `aarch64_heap`) to the end of the linear-mapped RAM
-        let base = crate::HEAP_END.load(core::sync::atomic::Ordering::Relaxed) as u64;
-        let end = kmap::direct_end();
-        assert!(base != 0 && base < end, "no RAM for frames");
-        (base, end - base)
-    }
-
-    fn for_each_reserved(f: &mut dyn FnMut(u64, u64)) {
+    fn memblock_init() {
+        // RAM was added by `kmap::init` (it linear-maps every range)
         let dtb = unsafe { crate::DTB_PTR };
+        let mut mb = crate::mm::memblock::MEMBLOCK.lock();
+        mb.set_limit(kmap::direct_end());
+        let (start, end) = kmap::image_range();
+        mb.reserve(start, end - start);
         if let Some(n) = dtb::total_size(dtb) {
-            f(dtb, dtb + n as u64);
+            mb.reserve(dtb, n as u64);
         }
         if let Some(i) = dtb::extract_initramfs(dtb) {
-            f(i.start, i.end);
+            mb.reserve(i.start, i.end.saturating_sub(i.start));
         }
+        dtb::for_each_firmware_reserved(dtb, |base, size| mb.reserve(base, size));
     }
 }
 

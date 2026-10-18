@@ -57,6 +57,12 @@ pub fn pa_symbol(va: u64) -> u64 {
     va - KERNEL_MAP
 }
 
+/// The kernel image in physical memory, as [start, end)
+pub fn image_range() -> (u64, u64) {
+    let start = pa_symbol(&raw const __kernel_start as u64);
+    (start, pa_symbol(&raw const __kernel_end as u64))
+}
+
 /// Physical address of the kernel top-level table
 pub fn swapper_phys() -> u64 {
     pa_symbol(&raw const SWAPPER as u64)
@@ -107,7 +113,11 @@ fn ram_ranges(mbi: u64, out: &mut [(u64, u64); 32]) -> usize {
     unsafe {
         multiboot2::for_each_region(mbi, |base, len, kind| {
             if matches!(kind, 1 | 3 | 4) && n < out.len() {
-                out[n] = (base, base + len);
+                out[n] = (
+                    base,
+                    base.saturating_add(len)
+                        .min(crate::mm::memblock::PHYS_LIMIT),
+                );
                 n += 1;
             }
         });

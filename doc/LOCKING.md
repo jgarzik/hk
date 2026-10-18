@@ -719,6 +719,16 @@ pub struct BitmapFrameAllocator {
   sticky (never decremented, the frame never freed), so more than 65535
   mappings of one page leak it instead of freeing it while mapped
 
+#### Boot Memory (memblock)
+
+**Location:** `kernel/mm/memblock.rs`
+
+- `MEMBLOCK` (`spin::Mutex`, leaf): RAM and reserved ranges, used only
+  on the boot CPU before SMP, in thread context (the arch fills it,
+  early allocations take from it, the free ranges go to the frame
+  allocator). `FRAME_ALLOCATOR` may be taken under it (handing the
+  free ranges over); nothing else is.
+
 #### Address Spaces (Mm: mm_users / mm_count, mmap_lock)
 
 **Location:** `kernel/mm/mod.rs` (`Mm`, `MmRef`), `kernel/mm/memory.rs`
@@ -2625,6 +2635,7 @@ interrupt-safety invariant:
 | `TASK_TLS` | kernel/task/tls.rs | `Mutex` | TLS base addresses |
 | `NPROC` | kernel/task/mod.rs | `Mutex` | RLIMIT_NPROC tasks per real uid (leaf: may be taken under TASK_TABLE, takes no lock) |
 | `FRAME_ALLOCATOR` | kernel/frame_alloc.rs | `Mutex` | Physical frame allocation |
+| `MEMBLOCK` | kernel/mm/memblock.rs | `Mutex` | Boot memory map (boot CPU, before SMP) |
 | `PAGE_CACHE` | core/page_cache.rs | `Mutex` | Page cache lookup |
 | All VFS locks | kernel/fs/*.rs | `RwLock` | Inodes, dentries, mounts |
 | Descriptor tables (`Files`) | kernel/task/fdtable.rs | `Mutex` | Per-task fd tables |

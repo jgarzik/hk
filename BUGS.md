@@ -290,12 +290,12 @@ memory is at the reserve (Linux maps the shared zero page).
 
 **Location**: `kernel/main.rs` (`x86_64_heap`, `aarch64_heap`), `kernel/heap.rs`
 
-The heap is one fixed range placed at boot: on x86 from above the
-kernel image and multiboot modules/info up to 18MB (where the frame
-allocator starts, so ~14MB minus the boot data); on aarch64 16MB at the
-first 2MB boundary past the kernel image, DTB and DTB initrd, with the
-frame allocator starting at its end. Both arches panic at boot if the
-heap would overlap the kernel image or boot data. The heap never grows
+The heap is one fixed range placed at boot and reserved in memblock:
+on x86 from above the kernel image and multiboot modules/info up to
+18MB (~14MB minus the boot data); on aarch64 16MB at the first 2MB
+boundary past the kernel image, DTB and DTB initrd. Both arches panic
+at boot if the heap would overlap the kernel image or boot data. The
+heap never grows
 and does not draw on the frame allocator, so heap-heavy workloads hit
 allocation failure long before RAM runs out; to be fixed with the
 allocator redesign (heap backed by frames, slab caches). By the time the

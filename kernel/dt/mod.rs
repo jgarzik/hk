@@ -277,6 +277,31 @@ impl<'a> Node<'a> {
         }
     }
 
+    /// `#address-cells` and `#size-cells` this node gives its children
+    /// (defaults 2 and 1, devicetree spec 2.3.5)
+    pub fn cells(&self) -> (usize, usize) {
+        let get = |n, d| {
+            self.property(n)
+                .and_then(|p| p.as_u32())
+                .map_or(d, |v| v as usize)
+        };
+        (get("#address-cells", 2), get("#size-cells", 1))
+    }
+
+    /// Every (address, size) pair of `reg`, with the parent's cell counts
+    /// (each 1 or 2)
+    pub fn regs(&self, cells: (usize, usize)) -> impl Iterator<Item = (u64, u64)> + 'a {
+        let (ac, sc) = cells;
+        let data = self.property("reg").map_or(&[][..], |p| p.data());
+        let step = (ac + sc) * 4;
+        let ok = (1..=2).contains(&ac) && (1..=2).contains(&sc);
+        let n = if ok { data.len() / step } else { 0 };
+        (0..n).map(move |i| {
+            let at = i * step;
+            (read_cells(data, at, ac), read_cells(data, at + ac * 4, sc))
+        })
+    }
+
     /// Get the interrupts property
     pub fn interrupts(&self) -> Option<Vec<u32>> {
         let prop = self.property("interrupts")?;
@@ -551,6 +576,15 @@ fn skip_node(data: &[u8], info: &FdtInfo, mut offset: usize) -> usize {
         }
     }
     offset
+}
+
+/// A 1- or 2-cell big-endian number at `offset`
+fn read_cells(data: &[u8], offset: usize, cells: usize) -> u64 {
+    if cells == 2 {
+        read_be64(data, offset)
+    } else {
+        read_be32(data, offset) as u64
+    }
 }
 
 /// Read a big-endian u32

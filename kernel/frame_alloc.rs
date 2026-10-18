@@ -43,8 +43,8 @@ struct BitmapFrameAllocatorInner {
     next_free: usize,
     /// Free frames (set bits in `bitmap`), kept exact by `set_free`
     free: usize,
-    /// Leading frames holding `bitmap` and `refcounts` (never free)
-    meta: usize,
+    /// Frames handed to the allocator at boot (Linux managed pages)
+    managed: usize,
 }
 
 impl BitmapFrameAllocatorInner {
@@ -62,9 +62,8 @@ impl BitmapFrameAllocatorInner {
         }
     }
 
-    /// Index of the managed frame at `frame`; None for any address the
-    /// allocator does not hand out (outside the region, unaligned, or a
-    /// metadata frame), so a stray free or refcount op is a no-op
+    /// Index of the frame at `frame`; None for any address outside the
+    /// span or unaligned, so a stray free or refcount op is a no-op
     /// instead of an out-of-bounds write
     fn index(&self, frame: u64) -> Option<usize> {
         let off = frame.checked_sub(self.base)?;
@@ -72,7 +71,7 @@ impl BitmapFrameAllocatorInner {
             return None;
         }
         let idx = usize::try_from(off / FRAME_SIZE as u64).ok()?;
-        (idx >= self.meta && idx < self.total_frames).then_some(idx)
+        (idx < self.total_frames).then_some(idx)
     }
 
     /// Index of a huge page head: 2MB-aligned (physically) and wholly
@@ -101,19 +100,18 @@ impl BitmapFrameAllocator {
                 total_frames: 0,
                 next_free: 0,
                 free: 0,
-                meta: 0,
+                managed: 0,
             }),
         }
     }
 
-    /// Initialize with a memory region (all of it, however large)
-    ///
-    /// The region from `base` to `base + size` will be available for
-    /// allocation, except its first frames, which hold the bitmap and
-    /// the reference counts (used through the direct map)
+    /// Initialize over the physical span [base, base + size), every
+    /// frame in use; `free_range` then hands it the free RAM (memblock).
+    /// The bitmap and the reference counts come from memblock.
     pub fn init(&self, base: u64, size: u64) {
-        let p = crate::arch::phys_to_virt(base);
-        unsafe { self.init_at(base, size, p) };
+        let bytes = Self::meta_bytes((size / FRAME_SIZE as u64) as usize) as u64;
+        let meta = crate::mm::memblock::alloc(bytes.next_multiple_of(FRAME_SIZE as u64), 4096);
+        unsafe { self.init_at(base, size, crate::arch::phys_to_virt(meta)) };
     }
 
     /// Metadata bytes for `n` frames: bitmap words, then u16 refcounts
@@ -121,38 +119,38 @@ impl BitmapFrameAllocator {
         n.div_ceil(64) * 8 + n * 2
     }
 
-    /// Bytes at the start of a `size`-byte region that `init` overwrites
-    /// with metadata (callers check no boot data lives there)
-    pub fn meta_size(size: u64) -> u64 {
-        Self::meta_bytes((size / FRAME_SIZE as u64) as usize).next_multiple_of(FRAME_SIZE) as u64
-    }
-
-    /// `init` with the metadata at kernel address `p` (the first frames
-    /// of the region; host tests pass their own buffer)
+    /// `init` with the metadata at kernel address `p` (host tests pass
+    /// their own buffer)
     ///
     /// # Safety
-    /// `p` must be writable for `meta_bytes(size / FRAME_SIZE)` rounded
-    /// up to a frame, 8-byte aligned, and used for nothing else.
+    /// `p` must be writable for `meta_bytes(size / FRAME_SIZE)` bytes,
+    /// 8-byte aligned, and used for nothing else.
     unsafe fn init_at(&self, base: u64, size: u64, p: *mut u8) {
         let n = (size / FRAME_SIZE as u64) as usize;
         let words = n.div_ceil(64);
-        let meta = Self::meta_bytes(n).div_ceil(FRAME_SIZE);
-        assert!(meta < n, "frame region too small");
         let mut inner = self.inner.lock();
         unsafe {
-            core::ptr::write_bytes(p, 0, meta * FRAME_SIZE);
+            core::ptr::write_bytes(p, 0, Self::meta_bytes(n));
             inner.bitmap = core::slice::from_raw_parts_mut(p as *mut u64, words);
             inner.refcounts = core::slice::from_raw_parts_mut(p.add(words * 8) as *mut u16, n);
         }
-        // Metadata frames and the bits past `n` in the last word stay 0
-        // (used): never handed out
+        // Every bit 0 (used), including those past `n` in the last word
         inner.base = base;
         inner.total_frames = n;
-        inner.meta = meta;
-        inner.next_free = meta;
+        inner.next_free = 0;
         inner.free = 0;
-        for f in meta..n {
+        inner.managed = 0;
+    }
+
+    /// Hand the free RAM [start, end) to the allocator (boot, from
+    /// memblock); frames outside the span are ignored
+    pub fn free_range(&self, start: u64, end: u64) {
+        let mut inner = self.inner.lock();
+        let first = start.saturating_sub(inner.base).div_ceil(FRAME_SIZE as u64) as usize;
+        let last = (end.saturating_sub(inner.base) / FRAME_SIZE as u64) as usize;
+        for f in first..last.min(inner.total_frames) {
             inner.set_free(f, true);
+            inner.managed += 1;
         }
     }
 
@@ -265,7 +263,8 @@ impl BitmapFrameAllocator {
         }
     }
 
-    /// Mark a range of frames as used (e.g., for kernel memory)
+    /// Mark a range of frames as used
+    #[cfg(test)]
     pub fn mark_used(&self, phys_start: u64, size: u64) {
         let mut inner = self.inner.lock();
 
@@ -570,7 +569,7 @@ impl BitmapFrameAllocator {
     pub fn stats(&self) -> MemoryStats {
         let inner = self.inner.lock();
 
-        let total_bytes = (inner.total_frames as u64) * (FRAME_SIZE as u64);
+        let total_bytes = (inner.managed as u64) * (FRAME_SIZE as u64);
 
         // Count free frames by counting set bits in bitmap
         let mut free_frames = 0usize;
@@ -637,7 +636,7 @@ impl BitmapFrameAllocator {
     /// evicted) so page tables, stacks and DMA buffers still get memory
     /// when ramfs files fill RAM: 1/32 of memory, at least 4MB
     pub fn reserve_frames(&self) -> usize {
-        (self.inner.lock().total_frames / 32).max(1024)
+        (self.inner.lock().managed / 32).max(1024)
     }
 
     /// Free memory is down to the reserve (watermark-lite)
@@ -704,6 +703,8 @@ mod tests {
         let bytes = BitmapFrameAllocator::meta_bytes(n).next_multiple_of(FRAME_SIZE);
         let mut buf = vec![0u64; bytes / 8];
         unsafe { a.init_at(BASE, (n * FRAME_SIZE) as u64, buf.as_mut_ptr() as *mut u8) };
+        // Frame 0 stays in use, like boot memory memblock reserved
+        a.free_range(pa(1), pa(n));
         (a, buf)
     }
 
@@ -725,9 +726,9 @@ mod tests {
     }
 
     #[test]
-    fn metadata_frames_are_never_handed_out() {
+    fn unfreed_frames_are_never_handed_out() {
         let (a, _b) = fa(1000);
-        let meta = a.inner.lock().meta;
+        let meta = 1usize;
         assert!(meta >= 1);
         assert_eq!(a.free_frames(), 1000 - meta);
         let mut got = Vec::new();
@@ -736,8 +737,6 @@ mod tests {
             got.push(f);
         }
         assert_eq!(got.len(), 1000 - meta);
-        // Freeing a metadata frame is a no-op
-        a.free(pa(0));
         assert_eq!(a.alloc(), None);
     }
 
@@ -750,7 +749,7 @@ mod tests {
             assert!(f < pa(70));
             n += 1;
         }
-        assert_eq!(n, 70 - a.inner.lock().meta);
+        assert_eq!(n, 70 - 1usize);
         assert_eq!(a.stats().free_bytes, 0);
     }
 
@@ -783,7 +782,7 @@ mod tests {
     #[test]
     fn boundary_frames_round_trip() {
         let (a, _b) = fa(256);
-        let meta = a.inner.lock().meta;
+        let meta = 1usize;
         a.mark_used(pa(meta), (256 - meta) as u64 * FRAME_SIZE as u64);
         assert_eq!(a.free_frames(), 0);
         a.free(pa(255));
@@ -810,7 +809,7 @@ mod tests {
     #[test]
     fn contig_alloc_at_the_end() {
         let (a, _b) = fa(64);
-        let meta = a.inner.lock().meta;
+        let meta = 1usize;
         a.mark_used(pa(meta), (60 - meta) as u64 * FRAME_SIZE as u64);
         // Frames 60..63 free: a run of 4 ends exactly at the region end
         assert_eq!(a.alloc_contig(4), Some(pa(60)));

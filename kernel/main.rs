@@ -183,14 +183,9 @@ fn x86_64_heap(multiboot_info: u64) -> (usize, usize) {
 // Memory layout constants - aarch64
 // QEMU virt loads the kernel at 0x40100000 with the DTB below it; the
 // heap goes at the first 2MB boundary past the kernel image that also
-// misses the DTB and any initrd (`aarch64_heap`); the frame allocator
-// starts at the heap end (`HEAP_END`)
+// misses the DTB and any initrd (`aarch64_heap`)
 #[cfg(target_arch = "aarch64")]
 const KERNEL_HEAP_SIZE: usize = 0x0100_0000; // 16MB
-
-/// End of the heap: the aarch64 frame allocator starts here
-#[cfg(target_arch = "aarch64")]
-pub static HEAP_END: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Boot data the aarch64 heap must avoid: kernel image, DTB, initrd
 #[cfg(target_arch = "aarch64")]
@@ -229,9 +224,11 @@ fn aarch64_heap(dtb: u64) -> (usize, usize) {
     for r in &busy {
         heap::check(start, end, r);
     }
-    HEAP_END.store(end, core::sync::atomic::Ordering::Relaxed);
     (start, KERNEL_HEAP_SIZE)
 }
+
+/// Physical [start, end) of the heap, reserved in memblock
+static HEAP_RANGE: Mutex<(u64, u64)> = Mutex::new((0, 0));
 
 /// Kernel heap allocator (host unit tests use the std allocator)
 #[cfg_attr(not(test), global_allocator)]
@@ -319,6 +316,7 @@ pub extern "C" fn _start(multiboot_info: u64) -> ! {
 
     // Initialize heap allocator
     let (heap_start, heap_size) = x86_64_heap(multiboot_info);
+    *HEAP_RANGE.lock() = (heap_start as u64, (heap_start + heap_size) as u64);
     unsafe {
         ALLOCATOR.init(phys_to_virt(heap_start as u64) as usize, heap_size);
     }
@@ -366,12 +364,13 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
 
     // Initialize heap allocator
     let (heap_start, heap_size) = aarch64_heap(unsafe { DTB_PTR });
+    *HEAP_RANGE.lock() = (heap_start as u64, (heap_start + heap_size) as u64);
     unsafe {
         ALLOCATOR.init(phys_to_virt(heap_start as u64) as usize, heap_size);
     }
 
-    // Final kernel page tables (linear map of all RAM; parsing the DTB
-    // needs the heap)
+    // Final kernel page tables (linear map of all RAM, which goes to
+    // memblock)
     unsafe { crate::arch::aarch64::kmap::init(DTB_PTR) };
 
     // Extract and parse kernel command line from DTB /chosen/bootargs
@@ -645,8 +644,7 @@ where
 ///
 /// Falls back to single-node topology if no NUMA info is available.
 fn init_numa_topology() {
-    let (_alloc_base, alloc_size) = CurrentArch::get_frame_alloc_region();
-    let total_pages = alloc_size / 4096;
+    let total_pages = mm::memblock::MEMBLOCK.lock().memory.total() / 4096;
     let nr_cpus = 1; // Will be updated when SMP is initialized
 
     #[cfg(target_arch = "x86_64")]
@@ -719,8 +717,8 @@ fn discover_boot_framebuffer() {
             info.pitch
         );
 
-        // Reserve framebuffer memory so frame allocator doesn't use it
-        FRAME_ALLOCATOR.mark_used(info.phys_addr, info.size);
+        // Keep it from the frame allocator (when it is in RAM)
+        mm::memblock::reserve(info.phys_addr, info.size);
 
         // Store for later use by graphics subsystem
         BOOT_FRAMEBUFFER.call_once(|| info);
@@ -733,22 +731,18 @@ fn kmain() -> ! {
     // Phase 1: Memory Subsystem
     // ========================================================================
 
-    // Get memory layout from arch (multiboot2 on x86, DTB/hardcoded on arm)
-    let (alloc_base, alloc_size) = CurrentArch::get_frame_alloc_region();
-    printkln!("MEM: {} MB", alloc_size / (1024 * 1024));
-
-    // Initialize frame allocator; its metadata overwrites the start of
-    // the region, which must hold no boot data
-    let meta_end = alloc_base + frame_alloc::BitmapFrameAllocator::meta_size(alloc_size);
-    CurrentArch::for_each_reserved(&mut |start, end| {
-        assert!(
-            end <= alloc_base || start >= meta_end,
-            "boot data {start:#x}-{end:#x} under frame metadata"
-        );
-    });
-    FRAME_ALLOCATOR.init(alloc_base, alloc_size);
-    FRAME_ALLOCATOR.mark_used(0, alloc_base);
-    CurrentArch::for_each_reserved(&mut |start, end| FRAME_ALLOCATOR.mark_used(start, end - start));
+    // Firmware memory map and boot reservations (multiboot2 on x86,
+    // DTB on arm), then every free range goes to the frame allocator
+    CurrentArch::memblock_init();
+    let (heap_start, heap_end) = *HEAP_RANGE.lock();
+    mm::memblock::reserve(heap_start, heap_end - heap_start);
+    discover_boot_framebuffer();
+    let (lo, hi) = mm::memblock::MEMBLOCK.lock().span();
+    FRAME_ALLOCATOR.init(lo, hi - lo);
+    mm::memblock::MEMBLOCK
+        .lock()
+        .for_each_free(|start, end| FRAME_ALLOCATOR.free_range(start, end));
+    printkln!("MEM: {} MB", FRAME_ALLOCATOR.stats().total_bytes >> 20);
 
     // Initialize DMA subsystem (uses frame allocator)
     dma_init(&DIRECT_DMA_OPS);
@@ -765,13 +759,6 @@ fn kmain() -> ! {
     // Initialize NUMA topology from firmware (ACPI SRAT on x86, DTB numa-node-id on arm)
     // This must happen after ioremap_init but before SMP init
     init_numa_topology();
-
-    // ========================================================================
-    // Phase 1c: Graphics Framebuffer Discovery
-    // ========================================================================
-    // Discover boot framebuffer from firmware (multiboot2 on x86, DTB on arm)
-    // This must happen after ioremap_init but before we heavily use the frame allocator
-    discover_boot_framebuffer();
 
     // ========================================================================
     // Phase 2: Exception/Interrupt Subsystem

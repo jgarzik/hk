@@ -787,21 +787,14 @@ pub trait ArchBusOps {
 
 /// Memory layout and region discovery operations
 ///
-/// Abstracts how each architecture discovers its memory layout for
-/// frame allocation. On x86_64 this uses multiboot2 memory maps,
-/// on aarch64 this uses hardcoded constants (or DTB in the future).
-#[allow(dead_code)]
+/// How each architecture reports physical memory (Linux setup_arch:
+/// e820__memblock_setup on x86, arm64_memblock_init on arm64)
 pub trait MemoryLayoutOps {
-    /// Get the frame allocator base address and size
-    ///
-    /// Returns (base, size) where base is the physical address to start
-    /// frame allocation from, and size is the total bytes available.
-    fn get_frame_alloc_region() -> (u64, u64);
-
-    /// Boot data inside the frame allocator region that must never be
-    /// handed out (e.g. an initrd the firmware placed there), as
-    /// (start, end) ranges
-    fn for_each_reserved(_f: &mut dyn FnMut(u64, u64)) {}
+    /// Add every firmware RAM range the kernel can reach through the
+    /// direct map to memblock and reserve what boot already uses there
+    /// (kernel image, boot modules, DTB, initrd, firmware-reserved
+    /// ranges)
+    fn memblock_init();
 }
 
 /// Exception and interrupt controller initialization
