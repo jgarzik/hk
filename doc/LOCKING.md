@@ -270,7 +270,8 @@ Global subsystem locks (TASK_TABLE, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-s
     of them
     ↓
 Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
-    copy may fault) → page_table_lock → PTE lock (spin) → AnonVma, LRU
+    copy may fault) → AnonVma.chain (sleeping RwSem, Linux
+    anon_vma->rwsem) → page_table_lock → PTE lock (spin)
     ← never nested with TASK_TABLE (3.2)
     ↓
 Memory allocator locks (Linux: ... → slab → pcp → zone->lock):
@@ -789,9 +790,11 @@ pub struct Zone {
   lock-free by their users (fault, fork, unmap); the list links belong
   to whoever owns the page's list (frame allocator, later slab/LRU) and
   are touched only under that owner's lock.
-- An anonymous page's mapping holds an AnonVma reference. A freed
-  page's struct page is reset (and that reference dropped) before the
-  page goes back to the allocator's lists, with no allocator lock held.
+- An anonymous page's mapping holds an AnonVma reference until the
+  page is freed (unmapping only drops the map count), so whoever holds
+  a page reference can read its mapping. A freed page's struct page is
+  reset (and that reference dropped) before the page goes back to the
+  allocator's lists, with no allocator lock held.
 
 #### Address Spaces (Mm: mm_users / mm_count, mmap_lock)
 
@@ -836,11 +839,20 @@ pub struct Zone {
   write-protects the parent's private PTEs with a compare-and-swap, since
   the parent's other threads may be faulting, splits 2MB pages and takes
   frame references). munmap / MAP_FIXED / brk shrink / shmdt
-  zap pages under it (`munmap_locked`). Order: mm lock → AnonVma lock,
-  `LRU`, swap slots → `FRAME_ALLOCATOR`; nothing taken
-  under those leaf locks takes an mm lock (the swap rmap walk uses the
-  roots recorded in AnonVma chains, not the task table or mm locks).
-  `TASK_TABLE` is never held while taking an mm lock.
+  zap pages under it (`munmap_locked`). `TASK_TABLE` is never held
+  while taking an mm lock.
+- Reverse-map chains (`mm::anon_vma`, Linux anon_vma->rwsem):
+  `AnonVma.chain` is a sleeping `RwSem` (thread context only, never
+  under a spinlock). `MmStruct` updates a VMA's entry under it for
+  writing on every change of an anonymous VMA (insert, split, merge,
+  grow, shrink, removal, an mlock change, exit), always with the mm
+  lock held for writing (mm lock -> AnonVma.chain). The reverse map
+  holds it for reading across its page-table accesses: exit and munmap
+  unlink a VMA before freeing its tables, so a walk never reaches a
+  freed table. Under it: the page_table_lock and PTE locks, the TLB
+  flush of a changed entry, `FRAME_ALLOCATOR`; nothing under it takes
+  an mm lock (a walk names address spaces by the `Weak<Mm>` and table
+  root in each entry, never through the task table).
 - Shared anonymous memory (`mm::shmem::Shmem`, Linux shmem): its page
   index `Shmem.root` is a `spin::Mutex` taken by the fault path under
   the mm lock (mm lock -> Shmem.root) and by MADV_REMOVE after the mm

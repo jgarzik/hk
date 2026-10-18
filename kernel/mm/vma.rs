@@ -231,6 +231,10 @@ pub struct Vma {
     /// Set for private anonymous mappings (MAP_ANONYMOUS | MAP_PRIVATE).
     /// Shared between parent and child on fork for COW pages.
     pub anon_vma: Option<Arc<AnonVma>>,
+    /// Page index of `start` for anonymous pages (Linux vm_pgoff of an
+    /// anonymous VMA): `start / 4KB` when created, kept by mremap,
+    /// advanced by a split, lowered when a stack grows down
+    pub pgoff: u64,
     /// Per-VMA NUMA memory policy (set by mbind)
     ///
     /// If None, the task's default mempolicy is used.
@@ -253,6 +257,7 @@ impl Vma {
             file: None,
             offset: 0,
             anon_vma: None,
+            pgoff: start / PAGE_SIZE,
             mempolicy: None,
             shmem: None,
             shm: None,
@@ -276,6 +281,7 @@ impl Vma {
             file: Some(file),
             offset,
             anon_vma: None,
+            pgoff: start / PAGE_SIZE,
             mempolicy: None,
             shmem: None,
             shm: None,
@@ -295,6 +301,7 @@ impl Vma {
             file: None,
             offset: 0,
             anon_vma: Some(anon_vma),
+            pgoff: start / PAGE_SIZE,
             mempolicy: None,
             shmem: None,
             shm: None,
@@ -305,6 +312,13 @@ impl Vma {
     #[inline]
     pub fn contains(&self, addr: u64) -> bool {
         addr >= self.start && addr < self.end
+    }
+
+    /// The linear page index of `addr` (Linux linear_page_index): what
+    /// an anonymous page faulted there records in `Page.index`
+    #[inline]
+    pub fn index_of(&self, addr: u64) -> u64 {
+        self.pgoff + (addr - self.start) / PAGE_SIZE
     }
 
     /// Size of mapping in bytes
@@ -397,7 +411,8 @@ impl Vma {
         match (&self.anon_vma, &other.anon_vma) {
             (None, None) => {}
             (Some(av1), Some(av2)) => {
-                if !Arc::ptr_eq(av1, av2) {
+                // Same family, its pages at contiguous indexes
+                if !Arc::ptr_eq(av1, av2) || self.pgoff + self.size() / PAGE_SIZE != other.pgoff {
                     return false;
                 }
             }

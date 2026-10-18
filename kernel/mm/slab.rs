@@ -755,7 +755,7 @@ pub mod tests {
         assert_eq!(large_order(8193, 8), 2);
         assert_eq!(large_order(100, 16384), 2);
         assert_eq!(large_order(2 << 20, 4096), 9);
-        assert!(fits(100, 120, 8));
+        assert!(fits(100, 110, 8));
         assert!(!fits(100, 200, 8));
         assert!(fits(9000, 16000, 8));
         assert!(!fits(8000, 9000, 8));

@@ -188,7 +188,7 @@ fn write_page(mm: &Mm, vma: &Vma, addr: u64, buf: &[u8]) -> Result<usize, Kernel
         return Ok(write_frame(mm, addr, buf, false).unwrap_or(0));
     }
     for _ in 0..COW_TRIES {
-        crate::mm::fault::unshare_for_write(mm, addr, vma.anon_vma.clone())
+        crate::mm::fault::unshare_for_write(mm, addr, vma.anon_vma.clone(), vma.index_of(addr))
             .map_err(|_| KernelError::OutOfMemory)?;
         match write_frame(mm, addr, buf, true) {
             Some(n) => return Ok(n),

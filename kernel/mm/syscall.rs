@@ -203,9 +203,7 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         // reverse mapping); shared ones get a shared object for their
         // pages (Linux shmem_zero_setup)
         if is_private {
-            let anon_vma = AnonVma::new();
-            anon_vma.add_vma(Arc::downgrade(&mm), mm.pgd(), map_addr, map_addr + length);
-            v.set_anon_vma(anon_vma);
+            v.set_anon_vma(AnonVma::new());
         } else {
             v.shmem = Some(super::shmem::Shmem::new(length / PAGE_SIZE));
         }
@@ -359,22 +357,12 @@ pub(crate) fn munmap_locked(
     start: u64,
     end: u64,
 ) -> Vec<Vma> {
-    let pgd = owner.pgd();
     let removed = mm.remove_range(start, end);
     for vma in &removed {
         let pages = vma.size() / PAGE_SIZE;
         mm.sub_total_vm(pages);
         if vma.is_locked() {
             mm.sub_locked_vm(pages);
-        }
-        // Drop the address space's rmap chain once no VMA uses it
-        if let Some(av) = &vma.anon_vma {
-            let used = mm
-                .iter()
-                .any(|v| v.anon_vma.as_ref().is_some_and(|a| Arc::ptr_eq(a, av)));
-            if !used {
-                av.remove_root(pgd);
-            }
         }
     }
     // One gather for all the VMAs: one flush, then the pages go
@@ -384,7 +372,7 @@ pub(crate) fn munmap_locked(
     }
     drop(tlb);
     #[cfg(feature = "mmcheck")]
-    super::check::verify(mm, pgd, "munmap");
+    super::check::verify(mm, owner.pgd(), "munmap");
     removed
 }
 
@@ -464,17 +452,16 @@ fn brk_fits(mm: &super::MmStruct, old: u64, new: u64) -> bool {
 fn brk_grow(mm: &mut super::MmStruct, old: u64, new: u64) {
     match mm.find_vma_index(old - 1) {
         Some(i) if mm.get_vma(i).is_some_and(|v| v.end == old && is_heap(v)) => {
-            if let Some(v) = mm.get_vma_mut(i) {
-                v.end = new;
-            }
+            mm.set_end(i, new);
             mm.merge_adjacent(i);
         }
         _ => {
-            let heap = Vma::new(
+            let heap = Vma::new_anon(
                 old,
                 new,
                 PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS,
+                AnonVma::new(),
             );
             let i = mm.insert_vma(heap);
             mm.merge_adjacent(i);
@@ -722,9 +709,7 @@ fn mlock_fixup(mm: &mut super::MmStruct, idx: usize, start: u64, end: u64, vm_fl
     let Some(i) = mm.find_vma_exact(start) else {
         return;
     };
-    if let Some(v) = mm.get_vma_mut(i) {
-        v.flags = new;
-    }
+    mm.set_flags(i, new);
     let pages = (end - start) / PAGE_SIZE;
     match (old & VM_LOCKED != 0, new & VM_LOCKED != 0) {
         (false, true) => mm.add_locked_vm(pages),
@@ -845,14 +830,18 @@ pub fn sys_mlockall(flags: i32) -> i64 {
 
         // Second pass: update VMA flags and collect ranges to populate
         let mut ranges_to_populate: Vec<(u64, u64)> = Vec::new();
-        for vma in mm_guard.iter_mut() {
+        for i in 0..mm_guard.iter().count() {
+            let Some(vma) = mm_guard.get_vma(i) else {
+                break;
+            };
             // Collect range for population if not ONFAULT
             if vm_flags & VM_LOCKONFAULT == 0 {
                 ranges_to_populate.push((vma.start, vma.end - vma.start));
             }
 
             // Set the lock flags
-            vma.flags = (vma.flags & !VM_LOCKED_MASK) | vm_flags;
+            let flags = (vma.flags & !VM_LOCKED_MASK) | vm_flags;
+            mm_guard.set_flags(i, flags);
         }
 
         // Update locked_vm counter after iteration
@@ -891,8 +880,10 @@ pub fn sys_munlockall() -> i64 {
     mm_guard.set_def_flags(0);
 
     // Clear VM_LOCKED on all VMAs
-    for vma in mm_guard.iter_mut() {
-        vma.flags &= !VM_LOCKED_MASK;
+    for i in 0..mm_guard.iter().count() {
+        if let Some(f) = mm_guard.get_vma(i).map(|v| v.flags) {
+            mm_guard.set_flags(i, f & !VM_LOCKED_MASK);
+        }
     }
 
     // Reset locked_vm counter
@@ -1389,12 +1380,13 @@ fn move_vma_out(mm: &mut super::MmStruct, old_addr: u64, dontunmap: bool, gone: 
         // Kept with its backing (Linux): anonymous memory refaults zero
         // pages, a file or shared object its own pages; no longer locked
         // (dontunmap_complete)
-        let Some(vma) = mm.get_vma_mut(idx) else {
+        let Some(vma) = mm.get_vma(idx) else {
             return;
         };
         let locked = vma.is_locked();
         let pages = vma.size() / PAGE_SIZE;
-        vma.flags &= !VM_LOCKED_MASK;
+        let flags = vma.flags & !VM_LOCKED_MASK;
+        mm.set_flags(idx, flags);
         if locked {
             mm.sub_locked_vm(pages);
         }

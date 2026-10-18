@@ -148,6 +148,23 @@ pub struct MmStruct {
     exe: Option<alloc::string::String>,
     /// Where exec put the image, arguments and environment
     args: MmLayout,
+    /// The address space these VMAs belong to and its top-level table,
+    /// for the reverse-map chains of anonymous VMAs (set when the `Mm`
+    /// is built; none in host tests)
+    owner: Weak<Mm>,
+    pgd: u64,
+}
+
+/// A VMA's reverse-map chain entry in the address space `owner`/`pgd`
+fn avc_of(owner: &Weak<Mm>, pgd: u64, v: &Vma) -> anon_vma::Avc {
+    anon_vma::Avc {
+        mm: owner.clone(),
+        pgd,
+        start: v.start,
+        end: v.end,
+        pgoff: v.pgoff,
+        locked: v.flags & VM_LOCKED_MASK != 0,
+    }
 }
 
 /// Where exec put the image and the initial stack (Linux mm->start_code
@@ -180,7 +197,58 @@ impl MmStruct {
             def_flags: 0,
             exe: None,
             args: MmLayout::default(),
+            owner: Weak::new(),
+            pgd: 0,
         }
+    }
+
+    /// Tie the VMAs to their address space (before any is inserted)
+    fn set_owner(&mut self, owner: &Weak<Mm>, pgd: u64) {
+        debug_assert!(self.vmas.is_empty());
+        self.owner = owner.clone();
+        self.pgd = pgd;
+    }
+
+    // ------------------------------------------------------------------
+    // Reverse-map chains: every change of a VMA with an anon_vma updates
+    // its entry (anon_vma lock under the mmap_lock held for writing)
+    // ------------------------------------------------------------------
+
+    /// Add the chain entry of `v`
+    fn link(&self, v: &Vma) {
+        if let Some(av) = &v.anon_vma {
+            av.link(avc_of(&self.owner, self.pgd, v));
+        }
+    }
+
+    /// Drop the chain entry of `v`
+    fn unlink(&self, v: &Vma) {
+        if let Some(av) = &v.anon_vma {
+            av.unlink(self.pgd, v.start);
+        }
+    }
+
+    /// Refresh the entry of the VMA at `idx`, which started at `old_start`
+    fn relink(&self, idx: usize, old_start: u64) {
+        let v = &self.vmas[idx];
+        if let Some(av) = &v.anon_vma {
+            let new = avc_of(&self.owner, self.pgd, v);
+            av.update(self.pgd, old_start, |c| *c = new);
+        }
+    }
+
+    /// Set the flags of the VMA at `idx` (mlock state included)
+    pub fn set_flags(&mut self, idx: usize, flags: u32) {
+        let start = self.vmas[idx].start;
+        self.vmas[idx].flags = flags;
+        self.relink(idx, start);
+    }
+
+    /// Move the end of the VMA at `idx` (brk)
+    pub fn set_end(&mut self, idx: usize, end: u64) {
+        let start = self.vmas[idx].start;
+        self.vmas[idx].end = end;
+        self.relink(idx, start);
     }
 
     /// Layout of the image, its arguments and environment
@@ -249,6 +317,7 @@ impl MmStruct {
             .iter()
             .position(|v| v.start > vma.start)
             .unwrap_or(self.vmas.len());
+        self.link(&vma);
         self.vmas.insert(pos, alloc::boxed::Box::new(vma));
         pos
     }
@@ -271,7 +340,13 @@ impl MmStruct {
             .into_iter()
             .partition(|v| v.start >= start && v.end <= end);
         self.vmas = kept;
-        removed.into_iter().map(|v| *v).collect()
+        removed
+            .into_iter()
+            .map(|v| {
+                self.unlink(&v);
+                *v
+            })
+            .collect()
     }
 
     /// Find a free virtual address range of the given size
@@ -304,13 +379,17 @@ impl MmStruct {
         self.vmas.iter().map(|v| &**v)
     }
 
-    /// Remove every VMA, resetting the VM counters (exit_mmap)
+    /// Remove every VMA, resetting the VM counters (exit_mmap): each
+    /// leaves its reverse-map chain before the page tables go
     pub fn take_vmas(&mut self) -> Vec<Vma> {
         self.total_vm = 0;
         self.locked_vm = 0;
         core::mem::take(&mut self.vmas)
             .into_iter()
-            .map(|v| *v)
+            .map(|v| {
+                self.unlink(&v);
+                *v
+            })
             .collect()
     }
 
@@ -427,10 +506,15 @@ impl MmStruct {
 
         let grow_pages = (vma.start - address) >> 12;
 
-        // Update VMA
+        // Update VMA: its pages keep their index (Linux expand_downwards
+        // lowers vm_pgoff)
+        let old_start = vma.start;
         vma.start = address;
+        vma.pgoff -= grow_pages;
+        let locked = vma.is_locked();
+        self.relink(vma_idx, old_start);
         self.total_vm = self.total_vm.saturating_add(grow_pages);
-        if vma.is_locked() {
+        if locked {
             self.locked_vm = self.locked_vm.saturating_add(grow_pages);
         }
 
@@ -493,7 +577,7 @@ impl MmStruct {
 
         // Perform expansion
         let old_end = self.vmas[vma_idx].end;
-        self.vmas[vma_idx].end = new_end;
+        self.set_end(vma_idx, new_end);
 
         // Update total_vm accounting
         let grow_pages = (new_end - old_end) >> 12;
@@ -514,6 +598,7 @@ impl MmStruct {
         }
 
         let vma = *self.vmas.remove(vma_idx);
+        self.unlink(&vma);
         let pages = vma.size() >> 12;
         self.total_vm = self.total_vm.saturating_sub(pages);
         if vma.is_locked() {
@@ -558,6 +643,7 @@ impl MmStruct {
         // Clone VMA for the second half
         let mut new_vma = alloc::boxed::Box::new((**vma).clone());
         new_vma.start = split_addr;
+        new_vma.pgoff += (split_addr - vma.start) / PAGE_SIZE;
 
         // Adjust the offset into the backing file or shared object
         if new_vma.file.is_some() || new_vma.shmem.is_some() {
@@ -565,10 +651,11 @@ impl MmStruct {
         }
 
         // Truncate original VMA to end at split point
-        self.vmas[vma_idx].end = split_addr;
+        self.set_end(vma_idx, split_addr);
 
         // Insert new VMA after the original
         // (VMA list remains sorted since new_vma.start > vmas[vma_idx].start)
+        self.link(&new_vma);
         self.vmas.insert(vma_idx + 1, new_vma);
 
         Some(vma_idx + 1)
@@ -587,10 +674,11 @@ impl MmStruct {
             return false;
         }
         if self.vmas[idx].can_merge_with(&self.vmas[idx + 1]) {
-            // Extend first VMA to cover second
-            self.vmas[idx].end = self.vmas[idx + 1].end;
             // Remove second VMA (no accounting change - same total memory)
-            self.vmas.remove(idx + 1);
+            let next = self.vmas.remove(idx + 1);
+            self.unlink(&next);
+            // Extend first VMA to cover second
+            self.set_end(idx, next.end);
             return true;
         }
         false
@@ -605,10 +693,11 @@ impl MmStruct {
             return false;
         }
         if self.vmas[idx - 1].can_merge_with(&self.vmas[idx]) {
-            // Extend previous VMA to cover this one
-            self.vmas[idx - 1].end = self.vmas[idx].end;
             // Remove this VMA (no accounting change - same total memory)
-            self.vmas.remove(idx);
+            let cur = self.vmas.remove(idx);
+            self.unlink(&cur);
+            // Extend previous VMA to cover this one
+            self.set_end(idx - 1, cur.end);
             return true;
         }
         false
@@ -734,15 +823,11 @@ pub struct MmRef(Arc<Mm>);
 
 impl MmRef {
     /// A new address space rooted at the fresh table `pgd`, with one user
-    pub fn new(pgd: u64, map: MmStruct) -> Self {
-        MmRef(Arc::new(Mm {
-            users: AtomicUsize::new(1),
-            pgd,
-            map: RwSem::new(map),
-            page_table_lock: Mutex::new(()),
-            dumpable: AtomicU8::new(crate::task::dumpable::SUID_DUMP_USER),
-            ctx: tlb::MmContext::new(),
-        }))
+    pub fn new(pgd: u64, mut map: MmStruct) -> Self {
+        Self::new_cyclic(pgd, |me| {
+            map.set_owner(me, pgd);
+            map
+        })
     }
 
     /// A new address space rooted at `pgd`, with one user, whose VMAs
@@ -862,6 +947,7 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
     let mut res = Ok(());
     let child = MmRef::new_cyclic(pgd, |me| {
         let mut map = MmStruct::new(guard.mmap_base);
+        map.set_owner(me, pgd);
         map.start_brk = guard.start_brk;
         map.brk = guard.brk;
         map.total_vm = guard.total_vm;
@@ -877,9 +963,9 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
             if v.flags & VM_WIPEONFORK != 0 {
                 v.anon_vma = v.anon_vma.as_ref().map(|_| anon_vma::AnonVma::new());
             }
-            if let Some(av) = &v.anon_vma {
-                av.add_vma(me.clone(), pgd, v.start, v.end);
-            }
+            // In the chain before its pages are copied (Linux
+            // anon_vma_fork before copy_page_range)
+            map.link(&v);
             if v.flags & VM_WIPEONFORK == 0 {
                 res = memory::copy_page_range(pgd, parent, &v).map(|wp| {
                     if wp {
@@ -939,6 +1025,53 @@ mod tests {
         let gone = m.remove_range(0x11000, 0x12000);
         assert_eq!(gone.len(), 1);
         assert_eq!(spans(&m), [(0x10000, 0x11000), (0x12000, 0x20000)]);
+    }
+
+    /// The chain entries (start, end, pgoff, locked) of an AnonVma
+    fn chain(av: &anon_vma::AnonVma) -> Vec<(u64, u64, u64, bool)> {
+        let mut v: Vec<_> = av
+            .read()
+            .iter()
+            .map(|c| (c.start, c.end, c.pgoff, c.locked))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Every VMA change keeps the reverse-map chain in step: split,
+    /// lock, merge, partial unmap, exit
+    #[test]
+    fn chain_follows_vma_changes() {
+        let mut m = MmStruct::new(0x7000_0000);
+        m.set_owner(&Weak::new(), 7);
+        let av = anon_vma::AnonVma::new();
+        let rw = PROT_READ | PROT_WRITE;
+        let flags = MAP_PRIVATE | MAP_ANONYMOUS;
+        m.insert_vma(Vma::new_anon(0x10000, 0x20000, rw, flags, av.clone()));
+        assert_eq!(chain(&av), [(0x10000, 0x20000, 0x10, false)]);
+        let i = m.split_vma(0, 0x18000).unwrap();
+        m.set_flags(i, flags | VM_LOCKED);
+        assert_eq!(
+            chain(&av),
+            [
+                (0x10000, 0x18000, 0x10, false),
+                (0x18000, 0x20000, 0x18, true)
+            ]
+        );
+        m.set_flags(i, flags);
+        m.merge_adjacent(0);
+        assert_eq!(chain(&av), [(0x10000, 0x20000, 0x10, false)]);
+        let gone = m.remove_range(0x12000, 0x13000);
+        assert_eq!(gone.len(), 1);
+        assert_eq!(
+            chain(&av),
+            [
+                (0x10000, 0x12000, 0x10, false),
+                (0x13000, 0x20000, 0x13, false)
+            ]
+        );
+        m.take_vmas();
+        assert!(av.is_empty());
     }
 
     #[test]

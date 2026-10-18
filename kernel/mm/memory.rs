@@ -22,37 +22,17 @@ const ENOMEM: i32 = 12;
 const COPY_RETRIES: usize = 16;
 
 /// Drop one mapping's reference to the 4KB user page `phys` (Linux
-/// zap_present_pte: rmap removal + put). The last reference frees it;
-/// its descriptor state goes first so a reallocated frame starts clean.
+/// zap_present_pte: rmap removal + put). The last reference frees it
+/// (the allocator resets its struct page, the mapping released).
 pub fn put_page(phys: u64) {
-    let fa = &crate::FRAME_ALLOCATOR;
-    if fa.refcount(phys) <= 1 {
-        release_desc(phys);
-    } else if let Some(pg) = phys_to_page(phys)
-        && pg.is_anon()
-        && pg.mapcount() > 0
-    {
-        pg.dec_mapcount();
-    }
-    fa.decref(phys);
+    super::rmap::page_remove_rmap(phys);
+    crate::FRAME_ALLOCATOR.decref(phys);
 }
 
 /// Drop one mapping's reference to the 2MB user page at `phys`
 pub fn put_huge(phys: u64) {
-    let fa = &crate::FRAME_ALLOCATOR;
-    if fa.refcount_huge(phys) <= 1 {
-        release_desc(phys);
-    }
-    fa.decref_huge(phys);
-}
-
-/// Forget a page's rmap and LRU state: it is about to be freed
-fn release_desc(phys: u64) {
-    super::lru::lru_remove(phys);
-    if let Some(pg) = phys_to_page(phys) {
-        pg.clear_mapping();
-        pg.mapcount.store(0, Ordering::Relaxed);
-    }
+    super::rmap::page_remove_rmap(phys);
+    crate::FRAME_ALLOCATOR.decref_huge(phys);
 }
 
 /// Release one user mapping (after its TLB flush: `Gather`)
@@ -78,12 +58,10 @@ pub(super) fn zap_leaf(leaf: Leaf) {
 /// flushed (paging-structure caches included) before anything is
 /// freed (Linux tlb_gather_mmu_fullmm).
 pub(super) fn exit_mmap(mm: &Mm) {
+    // Out of their reverse-map chains first (Linux free_pgtables
+    // unlinks each VMA): a walk holding a chain never meets the tables
+    // freed below
     let vmas: Vec<_> = mm.mmap_write().take_vmas();
-    for vma in &vmas {
-        if let Some(av) = &vma.anon_vma {
-            av.remove_root(mm.pgd());
-        }
-    }
     let mut tlb = Gather::new_full(mm);
     tlb.free_tables(paging::detach_user(mm.pgd()));
     drop(tlb);

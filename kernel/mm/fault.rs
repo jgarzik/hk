@@ -61,12 +61,19 @@ struct Area {
     anon: bool,
     thp: bool,
     offset: u64,
+    /// Anonymous page index of `start` (Linux vm_pgoff)
+    pgoff: u64,
     file: Option<Arc<File>>,
     anon_vma: Option<Arc<AnonVma>>,
     shmem: Option<Arc<Shmem>>,
 }
 
 impl Area {
+    /// Linear page index of `addr` (Linux linear_page_index)
+    fn index(&self, addr: u64) -> u64 {
+        self.pgoff + (addr - self.start) / PAGE_SIZE
+    }
+
     /// Byte offset of the page at `addr` in the mapped object
     fn pgoff(&self, addr: u64) -> u64 {
         self.offset + (addr & !(PAGE_SIZE - 1)) - self.start
@@ -106,6 +113,7 @@ fn find_area(map: &MmStruct, addr: u64, access: Access) -> Result<Area, VmFault>
         anon: vma.is_anonymous(),
         thp: vma.is_thp_eligible(),
         offset: vma.offset,
+        pgoff: vma.pgoff,
         file: vma.file.clone(),
         anon_vma: vma.anon_vma.clone(),
         shmem: vma.shmem.clone(),
@@ -151,7 +159,7 @@ fn get_pte(ptep: *mut u64) -> u64 {
 /// A new anonymous page at `addr` joins the rmap and LRU
 fn add_anon(phys: u64, area: &Area, addr: u64) {
     if let Some(av) = &area.anon_vma {
-        super::rmap::page_add_anon_rmap(phys, av, addr & !(PAGE_SIZE - 1));
+        super::rmap::page_add_anon_rmap(phys, av, area.index(addr));
     }
     super::lru::lru_add_new(phys);
 }
@@ -482,8 +490,7 @@ fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Resu
     if area.anon_private() {
         add_anon(new, area, addr);
     }
-    super::rmap::page_remove_rmap(old);
-    FRAME_ALLOCATOR.decref(old);
+    super::memory::put_page(old);
     increment_min_flt();
     Ok(())
 }
@@ -528,6 +535,7 @@ pub fn unshare_for_write(
     mm: &Mm,
     addr: u64,
     anon_vma: Option<Arc<AnonVma>>,
+    index: u64,
 ) -> Result<(), VmFault> {
     // Never a kernel-half address (shared kernel tables)
     if addr >= super::TASK_SIZE {
@@ -549,6 +557,7 @@ pub fn unshare_for_write(
         anon: anon_vma.is_some(),
         thp: false,
         offset: 0,
+        pgoff: index,
         file: None,
         anon_vma,
         shmem: None,

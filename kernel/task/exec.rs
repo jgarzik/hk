@@ -349,22 +349,19 @@ pub fn image_layout(elf: &ElfExecutable, base: u64) -> MmLayout {
 /// VMAs of a freshly loaded image: one private anonymous VMA per
 /// PT_LOAD segment (pages already populated) and the stack
 /// (growsdown), so mprotect/munmap/brk and /proc/<pid>/maps see them
-pub fn image_vmas(
-    mm: &alloc::sync::Arc<crate::mm::Mm>,
-    elf: &ElfExecutable,
-    base: u64,
-    stack_bottom: u64,
-) -> Vec<crate::mm::Vma> {
+pub fn image_vmas(elf: &ElfExecutable, base: u64, stack_bottom: u64) -> Vec<crate::mm::Vma> {
     use crate::mm::{
         MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, VM_GROWSDOWN, Vma,
         anon_vma::AnonVma,
     };
     let anon = |start: u64, end: u64, prot: u32| {
-        let mut v = Vma::new(start, end, prot, MAP_PRIVATE | MAP_ANONYMOUS);
-        let av = AnonVma::new();
-        av.add_vma(alloc::sync::Arc::downgrade(mm), mm.pgd(), start, end);
-        v.set_anon_vma(av);
-        v
+        Vma::new_anon(
+            start,
+            end,
+            prot,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            AnonVma::new(),
+        )
     };
     let mut vmas: Vec<Vma> = Vec::new();
     let mut prev_end = 0;
@@ -796,7 +793,7 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
             end_data: code.end_data,
             ..args
         });
-        for vma in image_vmas(mm.arc(), &elf, base_addr, stack_bottom) {
+        for vma in image_vmas(&elf, base_addr, stack_bottom) {
             m.insert_vma(vma);
         }
     }

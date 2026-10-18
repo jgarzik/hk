@@ -302,8 +302,7 @@ fn update_flags(
     mm.split_at(start);
     mm.split_at(end);
     let idx = mm.find_vma_exact(start).ok_or(KernelError::WouldBlock)?;
-    let vma = mm.get_vma_mut(idx).ok_or(KernelError::WouldBlock)?;
-    vma.flags = flags;
+    mm.set_flags(idx, flags);
     mm.merge_adjacent(idx);
     Ok(())
 }

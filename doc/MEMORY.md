@@ -176,6 +176,15 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   holds its own on each of its pages, splitting a 2MB page gives each 4KB frame the head's count.
   Unmapping drops the reference and the last one frees the frame. Frames
   outside the allocator (MMIO) have no count and are never freed.
+- **Reverse map (Linux anon_vma).** Every private anonymous VMA (mmap,
+  brk, the image and stack) has an AnonVma, shared by fork's copies and
+  the pieces of a split, whose chain lists each VMA with its range and
+  page offset (`pgoff`, Linux vm_pgoff: `start / 4KB` at creation, kept
+  by mremap, lowered when a stack grows). An anonymous page records its
+  AnonVma and linear index (`pgoff + (addr - start) / 4KB`), so the
+  reverse map finds its address in each VMA of the chain directly; its
+  map count counts the PTEs mapping it. Pages exec copies the image
+  into are not on the reverse map.
 - **Shared anonymous memory.** A MAP_SHARED|MAP_ANONYMOUS mapping gets a
   `Shmem` object (Linux shmem_zero_setup) holding its pages by index:
   every VMA mapping it (fork's copies, split pieces, mremap) faults the
