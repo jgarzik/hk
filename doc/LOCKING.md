@@ -842,11 +842,10 @@ pub struct Zone {
   reading and may run at once: they change entries under the
   page-table locks (Page-table locks below). Under the mm lock:
   page-table and page allocation (`FRAME_ALLOCATOR`), a shared object's
-  `Shmem.root`, rmap/LRU. It drops the lock only to read data that may
-  sleep or needs a lock ordered above it (a file page: `pread`, or
-  PAGE_CACHE for a ramfs page; a swap slot), then looks the VMA up
-  again and installs the PTE only if the VMA is unchanged (else it
-  drops the page and the access retries). A PTE is set with a
+  `Shmem.root`, rmap/LRU, and the reads that may sleep (a file page:
+  `pread` or the page cache for a ramfs page; a swap slot), as in Linux
+  (the mm lock is a sleeping lock, so nothing it waits for can need
+  it, and the VMA cannot change meanwhile). A PTE is set with a
   compare-and-swap against the value the fault read (Linux pte_same)
   under its PTE lock, the loser dropping its page. No user memory is
   accessed under the mm lock (a fault there would deadlock: a waiting
@@ -1119,8 +1118,9 @@ may exceed its limit by an eighth, then allocation fails (ENOMEM). Dirty pages a
 call `writepage` with no spinlock held (it does block I/O and sleeps).
 
 **Mapped ramfs pages (Linux filemap_fault):** a MAP_SHARED fault on a
-ramfs file (`InodeOps::map_page`) takes PAGE_CACHE with no other lock
-held and, still under it, a frame reference for the PTE
+ramfs file (`InodeOps::map_page`) takes PAGE_CACHE with no spinlock
+held (the mmap_lock held for reading: mmap_lock -> PAGE_CACHE) and,
+still under it, a frame reference for the PTE
 (PAGE_CACHE -> FRAME_ALLOCATOR), so truncate or inode eviction, which
 drop only the cache's own reference (`FrameAlloc::put_frame`), cannot
 free a frame a mapping still uses.
@@ -1480,7 +1480,14 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
   page faults) happen under `f_pos_lock` and, for writes, `i_rwsem`
   (held across all chunks, which keeps a large O_APPEND write
   contiguous); the fault path takes neither lock, and both are sleeping
-  locks, so a fault may sleep.
+  locks, so a fault may sleep. Order `i_rwsem` -> mmap_lock: the fault
+  path never takes `i_rwsem`. The write's user copy runs with page
+  faults disabled (`uaccess::copy_from_user_atomic`, Linux
+  generic_perform_write): a missing page is faulted in first
+  (`fault_in_readable`, with `i_rwsem` but no spinlock or page lock
+  held) and the copy retried, so the copy itself never nests a fault
+  (and the mmap_lock) under the locks taken for it (later the page
+  lock).
 - Order: `f_pos_lock` -> file `i_rwsem` -> page cache / page locks ->
   fs-internal locks. A file's `i_rwsem` is taken under a directory's
   only by link, unlink and rename (above), never the reverse: no
@@ -2802,7 +2809,6 @@ Features present in Linux but not yet implemented in hk:
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
 | Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
 | Lazy TLB, PCID, global pages | kernel threads keep the last user mm; PCID tags; PGE | Kernel threads load the kernel table; every CR3 write flushes all | More flushes on context switch (x86) |
-| mmap_lock across faults | `mmap_read_lock` + PTE lock in the fault path | Same, except that the mmap_lock is dropped while reading a file page or swap slot (the VMA is revalidated after) | A swap-in can race munmap of its range (swap is inert) |
 | PTE locks | `spinlock_t` in the page-table page (ptdesc) | A lock word in the table's struct page, waiters poll the call-function queue | IPIs answered while spinning with interrupts off |
 
 ### Implications

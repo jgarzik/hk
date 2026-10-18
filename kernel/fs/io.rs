@@ -7,7 +7,7 @@ use alloc::vec;
 use crate::arch::Uaccess;
 use crate::fs::file::WRITE_CHUNK;
 use crate::fs::{File, KernelError, RwFlags};
-use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
+use crate::uaccess::{UaccessArch, copy_from_user_atomic, copy_to_user};
 
 use super::iov::IoVec;
 use super::syscall::{MAX_RW_COUNT, current_fd_table};
@@ -61,10 +61,13 @@ impl<'a> Cursor<'a> {
         Ok(())
     }
 
-    /// Fill `buf` from the user segments
+    /// Fill `buf` from the user segments. A file write copies under
+    /// i_rwsem: page faults are disabled for the copy and missing pages
+    /// faulted in first (`copy_from_user_atomic`, Linux
+    /// generic_perform_write)
     fn copy_in(&mut self, buf: &mut [u8]) -> Result<(), KernelError> {
         self.step(buf.len(), &mut |a, n, at| {
-            copy_from_user::<Uaccess>(&mut buf[at..at + n], a, n)
+            copy_from_user_atomic::<Uaccess>(&mut buf[at..at + n], a, n)
                 .map(|_| ())
                 .map_err(|_| ())
         })
