@@ -218,6 +218,31 @@ with EBUSY can see a spurious EROFS. Not done: mount data/options
 strings are ignored; mounts are not user-namespace aware (plain
 capable()).
 
+## Fatal signals and exit_group end one thread
+
+**Location**: `kernel/signal/mod.rs` syscall_exit_signal_work,
+`kernel/task/proc.rs` do_exit, `kernel/arch/*/syscall.rs` (exit_group)
+
+A signal whose default action terminates (SIGKILL included) ends only
+the thread it is delivered to, and exit_group is exit: the other
+threads of the process keep running (Linux do_group_exit /
+zap_other_threads kills them all). kill(pid, ...) reaches the leader
+only, and wait4 reaps the leader while siblings still run (Linux
+waits for the whole group). The boot tests kill each thread of a
+process explicitly. Fix in the next batch.
+
+## No signal delivery on return from an interrupt (P7)
+
+**Location**: `kernel/arch/x86_64/interrupts.rs`,
+`kernel/arch/aarch64/exceptions.rs` (IRQ return paths)
+
+Pending signals are delivered on the way out of a syscall or a fault
+only; an interrupt that arrives in user mode returns without the
+signal/reschedule work check (Linux exit_to_user_mode_loop), so a
+CPU-bound user task never takes SIGKILL or SIGSTOP. With SMP user
+scheduling (P7) this needs the IRQ-return work check plus a kick IPI
+(Linux signal_wake_up -> kick_process).
+
 ## Global init is not protected from default-action signals
 
 **Location**: `kernel/signal/mod.rs` send_signal
@@ -261,8 +286,11 @@ always infinite, promote_secondaries is off.
 Seen once (2026-10-18, during the FD_LEAK group right after
 RLIMIT_NPROC): QEMU itself died with SIGSEGV ("the monitored command
 dumped core"), the guest printed nothing unusual. Not reproduced in 3
-reruns of the same commit. Next occurrence: keep the core file and see
-whether a virtio request from the guest triggers it.
+reruns of the same commit. Seen again (2026-10-18, P3 gate) at the same
+point, right after RLIMIT_NPROC_CHURN; 4 reruns passed. apport keeps no
+core for the packaged QEMU: set core_pattern (or run QEMU under gdb) to
+capture one and see whether a virtio request from the guest triggers
+it.
 
 ## Rare arm64 kernel instruction abort in the fault-signal tests
 
