@@ -412,7 +412,9 @@ impl Vma {
             (None, None) => {}
             (Some(av1), Some(av2)) => {
                 // Same family, its pages at contiguous indexes
-                if !Arc::ptr_eq(av1, av2) || self.pgoff + self.size() / PAGE_SIZE != other.pgoff {
+                if !Arc::ptr_eq(av1, av2)
+                    || self.pgoff.checked_add(self.size() / PAGE_SIZE) != Some(other.pgoff)
+                {
                     return false;
                 }
             }

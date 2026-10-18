@@ -506,11 +506,15 @@ impl MmStruct {
 
         let grow_pages = (vma.start - address) >> 12;
 
-        // Update VMA: its pages keep their index (Linux expand_downwards
-        // lowers vm_pgoff)
+        // Its pages keep their index (Linux expand_downwards lowers
+        // vm_pgoff): a VMA moved up by mremap keeps a small pgoff and
+        // cannot grow below index 0 (Linux: grow <= vm_pgoff, ENOMEM)
+        let Some(pgoff) = vma.pgoff.checked_sub(grow_pages) else {
+            return Err(12); // ENOMEM: the access is SIGSEGV
+        };
         let old_start = vma.start;
         vma.start = address;
-        vma.pgoff -= grow_pages;
+        vma.pgoff = pgoff;
         let locked = vma.is_locked();
         self.relink(vma_idx, old_start);
         self.total_vm = self.total_vm.saturating_add(grow_pages);
@@ -643,7 +647,11 @@ impl MmStruct {
         // Clone VMA for the second half
         let mut new_vma = alloc::boxed::Box::new((**vma).clone());
         new_vma.start = split_addr;
-        new_vma.pgoff += (split_addr - vma.start) / PAGE_SIZE;
+        // Bounded: pgoff + pages fits (pgoff <= TASK_SIZE / 4KB at
+        // creation and only ever lowered by growth)
+        new_vma.pgoff = vma
+            .pgoff
+            .checked_add((split_addr - vma.start) / PAGE_SIZE)?;
 
         // Adjust the offset into the backing file or shared object
         if new_vma.file.is_some() || new_vma.shmem.is_some() {
