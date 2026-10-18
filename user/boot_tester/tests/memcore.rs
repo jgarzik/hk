@@ -8,9 +8,10 @@
 //!   about that much MemFree, and it all comes back when the child exits
 //!   (within 8MB on hk, 32MB on Linux)
 //! - MEM_SLAB_TIME_WAIT: 2000 connections closed into TIME_WAIT are all
-//!   listed in /proc/net/tcp; on hk each entry costs at most 704 bytes
-//!   of Slab with its table and timer entries (a compact timewait
-//!   entry, not a whole control block: that was over 1.3KB;
+//!   listed in /proc/net/tcp; on hk each entry costs at most 1KB of
+//!   Slab with its table and timer entries (about 600 bytes, 860 with
+//!   LOCKDEP's lock tracking: a compact timewait entry, not a whole
+//!   control block, which was over 1.3KB;
 //!   Linux's tw_sock slab varies with its other caches, so there only
 //!   the entries are checked)
 
@@ -213,5 +214,5 @@ fn slab_time_wait() {
         report(b"MEM_SLAB_TIME_WAIT", true, 0);
         return;
     }
-    report(b"MEM_SLAB_TIME_WAIT", grew * 1024 <= N * 704, grew);
+    report(b"MEM_SLAB_TIME_WAIT", grew * 1024 <= N * 1024, grew);
 }

@@ -260,6 +260,16 @@ RTM_GETRULE dumps nothing (Linux lists its three default IPv4 rules; there
 is no rule engine: lookups are local then main), address lifetimes are
 always infinite, promote_secondaries is off.
 
+## Rare QEMU crash in the arm64 boot test
+
+**Location**: unknown (host QEMU 8.2.2 TCG, `make check-arm`)
+
+Seen once (2026-10-18, during the FD_LEAK group right after
+RLIMIT_NPROC): QEMU itself died with SIGSEGV ("the monitored command
+dumped core"), the guest printed nothing unusual. Not reproduced in 3
+reruns of the same commit. Next occurrence: keep the core file and see
+whether a virtio request from the guest triggers it.
+
 ## Rare arm64 kernel instruction abort in the fault-signal tests
 
 **Location**: unknown (CPU 0, right after `FAULT_SEGV_ACCERR`, i.e. while
