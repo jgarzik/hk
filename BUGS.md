@@ -308,21 +308,51 @@ RTM_GETRULE dumps nothing (Linux lists its three default IPv4 rules; there
 is no rule engine: lookups are local then main), address lifetimes are
 always infinite, promote_secondaries is off.
 
-## Rare QEMU crash in the arm64 boot test
+## Relative timeouts measured on CLOCK_REALTIME
 
-**Location**: unknown (host QEMU 8.2.2 TCG, `make check-arm`)
+**Location**: `kernel/ipc/sem.rs` (semtimedop), `kernel/io_uring.rs`
+(IORING_OP_TIMEOUT), `kernel/time.rs` (`current_ticks`, used by the
+ARP conflict rate limit)
 
-Seen once (2026-10-18, during the FD_LEAK group right after
-RLIMIT_NPROC): QEMU itself died with SIGSEGV ("the monitored command
-dumped core"), the guest printed nothing unusual. Not reproduced in 3
-reruns of the same commit. Seen again (2026-10-18, P3 gate) at the same
-point, right after RLIMIT_NPROC_CHURN; 4 reruns passed. Seen a third
-time (2026-10-18, P4 gate of 85b7666) right after
-RLIMIT_NPROC_SETUID_EXEC; the rerun passed. Always this spot: likely
-guest-triggered. apport keeps no
-core for the packaged QEMU: set core_pattern (or run QEMU under gdb) to
-capture one and see whether a virtio request from the guest triggers
-it.
+These compute deadlines from `TIMEKEEPER.current_time()` (wall clock),
+so clock_settime/settimeofday stretches or cuts them short (a backward
+step of N s adds N s to every pending wait). Linux measures them on
+CLOCK_MONOTONIC (semtimedop: `ktime_get()` + timeout; io_uring: relative
+and, by default, absolute timeouts are CLOCK_MONOTONIC, CLOCK_REALTIME
+only with IORING_TIMEOUT_REALTIME). `current_ticks` says "monotonic" but
+reads the wall clock. Found while root-causing the clock_settime hang
+(fixed: TimeKeeper.lock); not the cause of it.
+
+## Rare QEMU crash in the arm64 boot test (host CPU suspected)
+
+**Location**: host, not hk (QEMU 8.2.2 TCG on this Core Ultra 9 285K,
+microcode 0x11b, `make check-arm`)
+
+Six qemu-system-aarch64 deaths on 2026-10-18 (kernel log: 03:59,
+08:23, 10:04, 14:18, 15:05, 18:08), all in the guest stage-1 page
+table walk, five at the same instruction: `mov (%rax),%r10` in
+arm_ldq_ptw (target/arm/ptw.c:671, `qatomic_read(host)` of a
+descriptor), the sixth a store to `env` in S1_ptw_translate
+(ptw.c:576). The faults reported for that one load differ: "segfault
+at 0", "segfault at fffffffe" (error 4) and three "general protection
+fault" (a non-canonical address). The one core dump (apport,
+/var/crash, 03:59) shows rax = 0x76fde8416008, a valid pointer into
+the mapped guest RAM (the descriptor there, 0x40617003, is a valid
+table entry) while the kernel saw the access at address 0, and siginfo
+si_addr is 0. A load cannot fault at an address other than the one
+its register holds, so the CPU computed a wrong address for it. The
+three segfaults with a CPU named all ran on CPU 5; CPUs 5 and 2 are
+the 7.2 GHz favored cores, and they lead the host's segfault count
+since 2026-09 (28 and 21 of ~140, any program; cc1, make and valgrind
+also crashed). The guest's part: hk's fork/exit churn (RLIMIT_NPROC,
+FD_LEAK) makes QEMU walk page tables hardest.
+
+Not seen in ~3 h of check-arm loops (5 to 9 QEMUs at once, all under
+gdb, ~100 boots plus ~90 churn-only runs, some pinned to CPUs 5, 2 or
+12) after 19:30, when the host stopped logging segfaults altogether.
+Nothing in hk can avoid it. Next: check the BIOS for Intel default
+power/turbo settings and current microcode, stress-test CPUs 2 and 5,
+or keep gate QEMUs off them (taskset) and see whether the crash stops.
 
 ## Rare arm64 kernel instruction abort in the fault-signal tests
 
