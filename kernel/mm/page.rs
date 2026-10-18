@@ -91,7 +91,8 @@ pub struct Page {
     pub private: AtomicU64,
     /// Slab: objects in use
     pub inuse: AtomicU32,
-    _pad: u32,
+    /// Page-table page: its split PTE lock (Linux ptdesc ptl; `mm::ptl`)
+    pub ptl: AtomicU32,
 }
 
 const _: () = assert!(core::mem::size_of::<Page>() == 64);
@@ -110,7 +111,7 @@ impl Page {
             prev: AtomicU64::new(0),
             private: AtomicU64::new(0),
             inuse: AtomicU32::new(0),
-            _pad: 0,
+            ptl: AtomicU32::new(0),
         }
     }
 

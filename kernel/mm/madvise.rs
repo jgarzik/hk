@@ -21,6 +21,7 @@ use super::{
     Vma, get_task_mm,
 };
 use crate::error::KernelError;
+use crate::sync::{RwSemReadGuard, RwSemWriteGuard};
 use crate::task::percpu::current_tid;
 
 /// A hole to punch in a shared object once the mm lock is dropped
@@ -41,13 +42,18 @@ pub fn sys_madvise(start: u64, len: u64, advice: i32) -> i64 {
         return KernelError::OutOfMemory.sysret();
     };
     let mut punch = Vec::new();
-    let mut map = match mm.mmap_write_killable() {
+    let map = if needs_write(advice) {
+        mm.mmap_write_killable().map(Map::W)
+    } else {
+        mm.mmap_read_killable().map(Map::R)
+    };
+    let mut map = match map {
         Ok(m) => m,
         Err(e) => return e.sysret(),
     };
     let r = walk(&mut map, &mm, start, end, advice, &mut punch);
     #[cfg(feature = "mmcheck")]
-    super::check::verify(&map, mm.pgd(), "madvise");
+    super::check::verify(map.get(), mm.pgd(), "madvise");
     drop(map);
     // MADV_REMOVE frees the shared object's pages after the zap, also
     // for the VMAs done before an error (Linux punches VMA by VMA)
@@ -58,6 +64,31 @@ pub fn sys_madvise(start: u64, len: u64, advice: i32) -> i64 {
         Ok(()) => 0,
         Err(e) => e.sysret(),
     }
+}
+
+/// The mmap_lock as madvise holds it
+enum Map<'a> {
+    R(RwSemReadGuard<'a, MmStruct>),
+    W(RwSemWriteGuard<'a, MmStruct>),
+}
+
+impl Map<'_> {
+    fn get(&self) -> &MmStruct {
+        match self {
+            Map::R(m) => m,
+            Map::W(m) => m,
+        }
+    }
+}
+
+/// Advice that changes VMAs needs the mmap_lock for writing; advice that
+/// only zaps or hints reads it (Linux madvise_need_mmap_write): zaps
+/// change entries under the page-table locks, faults may run alongside
+fn needs_write(advice: i32) -> bool {
+    !matches!(
+        advice,
+        MADV_WILLNEED | MADV_DONTNEED | MADV_FREE | MADV_REMOVE | MADV_COLD | MADV_PAGEOUT
+    )
 }
 
 /// Advice values Linux accepts (madvise_behavior_valid), less those hk
@@ -106,7 +137,7 @@ fn check_range(start: u64, len: u64) -> Result<Option<u64>, KernelError> {
 /// madvise_walk_vmas). The walk goes by address, as a VMA may be split
 /// or merged under it.
 fn walk(
-    mm: &mut MmStruct,
+    map: &mut Map,
     owner: &Mm,
     start: u64,
     end: u64,
@@ -116,6 +147,7 @@ fn walk(
     let mut addr = start;
     let mut unmapped = false;
     loop {
+        let mm = map.get();
         let (vs, ve) = match mm.next_vma(addr).and_then(|i| mm.get_vma(i)) {
             Some(v) => (v.start, v.end),
             None => return Err(KernelError::OutOfMemory),
@@ -128,7 +160,7 @@ fn walk(
             }
         }
         let e = ve.min(end);
-        vma_advise(mm, owner, addr, e, advice, punch)?;
+        vma_advise(map, owner, addr, e, advice, punch)?;
         if e >= end {
             break;
         }
@@ -144,13 +176,14 @@ fn walk(
 /// Apply `advice` to [start, end), inside one VMA (Linux
 /// madvise_vma_behavior)
 fn vma_advise(
-    mm: &mut MmStruct,
+    map: &mut Map,
     owner: &Mm,
     start: u64,
     end: u64,
     advice: i32,
     punch: &mut Vec<Punch>,
 ) -> Result<(), KernelError> {
+    let mm = map.get();
     let idx = mm.find_vma_index(start).ok_or(KernelError::OutOfMemory)?;
     let vma = mm.get_vma(idx).ok_or(KernelError::OutOfMemory)?;
     match advice {
@@ -160,7 +193,10 @@ fn vma_advise(
         MADV_REMOVE => remove(vma, owner, start, end, punch),
         _ => {
             let flags = new_flags(vma, advice)?;
-            update_flags(mm, idx, start, end, flags)
+            match map {
+                Map::W(mm) => update_flags(mm, idx, start, end, flags),
+                Map::R(_) => unreachable!("VMA change under a read hold"),
+            }
         }
     }
 }
@@ -187,7 +223,8 @@ fn dontneed(vma: &Vma, owner: &Mm, start: u64, end: u64, advice: i32) -> Result<
     if vma.is_locked() || (advice == MADV_FREE && !is_anon(vma)) {
         return Err(KernelError::InvalidArgument);
     }
-    // Zapped under the mm lock: no fault or fork works on these PTEs
+    // Under the mm lock held for reading: a racing fault may map a page
+    // again (the page-table locks order it before or after the zap)
     super::memory::zap_range(&mut super::gather::Gather::new(owner), start, end);
     Ok(())
 }

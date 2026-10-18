@@ -269,7 +269,8 @@ Global subsystem locks (TASK_TABLE, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-s
     of them
     ↓
 Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
-    copy may fault) → AnonVma, LRU  ← never nested with TASK_TABLE (3.2)
+    copy may fault) → page_table_lock → PTE lock (spin) → AnonVma, LRU
+    ← never nested with TASK_TABLE (3.2)
     ↓
 Memory allocator locks (Linux: ... → slab → pcp → zone->lock):
     slab per-CPU array (IRQs off) → KmemCache.list_lock (IrqSpinlock)
@@ -832,34 +833,55 @@ pub struct Zone {
   (EINVAL) or IPC_RMID sees it; destroy is idempotent, so namespace
   totals are given back exactly once.
 - The page-fault path (`kernel/mm/fault.rs`, `handle_mm_fault`, shared by
-  both arches) holds the mm lock from the VMA lookup through the PTE
-  update (Linux: mmap_lock for read + the page table lock), so a fault
-  cannot race fork's copy, munmap or mprotect of its range: every user
-  PTE writer holds the mm lock (fault, fork's `copy_page_range`,
-  munmap/brk `munmap_locked`, mprotect, MADV_DONTNEED/REMOVE, mremap's
-  shrink and move (`mremap::move_prep`, `move_ptes`), a remote write's
-  `unshare_for_write`),
-  so no entry is read, released and written back around another's
-  change. Under it:
+  both arches) holds the mm lock for reading from the VMA lookup through
+  the PTE update (Linux lock_mm_and_find_vma: a stack that must grow
+  first takes it for writing, grows, and the fault starts over), so a
+  fault cannot race fork's copy, munmap, mprotect or mremap of its
+  range, which hold it for writing. Faults, MADV_DONTNEED/FREE/REMOVE
+  and remote access (ptrace PEEK/POKE, process_vm_*) hold it for
+  reading and may run at once: they change entries under the
+  page-table locks (Page-table locks below). Under the mm lock:
   page-table and page allocation (`FRAME_ALLOCATOR`), a shared object's
-  `Shmem.root`, rmap/LRU; nothing that sleeps. It drops the lock only
-  to read data that may sleep or needs a lock ordered above it (a file
-  page: `pread`, or PAGE_CACHE for a ramfs page; a swap slot), then
-  looks the VMA up again and installs the PTE only if the VMA is
-  unchanged (else it drops the page and the access retries). Racing
-  faults on one page are safe: a missing table is installed with a
-  compare-and-swap (`pte_alloc`; the loser frees its frame) and a PTE is
-  set with a compare-and-swap against the value the fault read (Linux
-  pte_same), the loser dropping its page. No user memory is accessed
-  under the mm lock (a fault there would deadlock). The debug VMA/PTE
-  check (`mm::check::verify`, feature `mmcheck`) runs under it after
-  mprotect, munmap, mremap and madvise: it only reads, and takes no
-  lock. madvise holds the mm lock over its whole VMA walk (splits,
-  flag changes and zaps), and MADV_REMOVE punches the shared object's
-  holes only after dropping it. msync drops the mm lock around each
-  writeback (`fsync` sleeps; it holds a reference on the file) and
-  looks the next VMA up again after it (Linux msync); mincore copies
-  each chunk of its vector out with the mm lock dropped.
+  `Shmem.root`, rmap/LRU. It drops the lock only to read data that may
+  sleep or needs a lock ordered above it (a file page: `pread`, or
+  PAGE_CACHE for a ramfs page; a swap slot), then looks the VMA up
+  again and installs the PTE only if the VMA is unchanged (else it
+  drops the page and the access retries). A PTE is set with a
+  compare-and-swap against the value the fault read (Linux pte_same)
+  under its PTE lock, the loser dropping its page. No user memory is
+  accessed under the mm lock (a fault there would deadlock: a waiting
+  writer blocks new readers). The debug VMA/PTE check
+  (`mm::check::verify`, feature `mmcheck`) runs under it after mprotect,
+  munmap, mremap and madvise: it only reads, and takes no lock. madvise
+  holds the mm lock over its whole VMA walk (for writing when the
+  advice changes VMAs, else for reading), and MADV_REMOVE punches the
+  shared object's holes only after dropping it. msync drops the mm lock
+  around each writeback (`fsync` sleeps; it holds a reference on the
+  file) and looks the next VMA up again after it (Linux msync); mincore
+  copies each chunk of its vector out with the mm lock dropped.
+- Page-table locks (`kernel/mm/ptl.rs`; Linux page_table_lock and split
+  PTE locks): `Mm.page_table_lock` (`spin::Mutex<()>`, not IRQ-safe)
+  covers table-structure changes: a missing table installed
+  (`ptl::pte_alloc`), a 2MB entry mapped (`do_huge_anon`), split
+  (`split_huge_pmd`) or cleared (`take_huge_pmd`). The PTE lock of each
+  PTE table page (a word in its struct page, `Page.ptl`; one lockdep
+  class) covers a table's 4KB entries: a fault from reading the entry
+  to its last change (copy-on-write break-before-make included),
+  `zap_range` (each table it clears), a remote write's
+  `unshare_for_write`, and remote copies through a frame
+  (`remote::with_frame`, so a racing zap cannot free it meanwhile).
+  Holders of the mm lock for writing exclude every other software
+  writer and skip them except in shared code; the MMU still sets
+  accessed/dirty bits, so entries change by compare-and-swap. Tables
+  are never freed while the address space is live, so an entry pointer
+  needs no lock. Order: mm lock -> page_table_lock -> PTE lock ->
+  `FRAME_ALLOCATOR` (pages and tables are allocated, and the TLB is
+  flushed, under them); never in interrupt context; no sleeping under
+  them. Both are spun on, maybe with interrupts off (a syscall or
+  fault), while the holder may flush this CPU's TLB, so a waiter polls
+  this CPU's call queue as it spins (`sync::spin::lock_with`,
+  `smp::poll_queue`). Deviation: Linux waiters spin with interrupts on
+  and answer the IPI.
 - TLB after a PTE loses permission or its page: flushed before the mm
   lock is released and before the old frame can be freed or written
   through by another process, always in the address space that changed
@@ -2780,7 +2802,8 @@ Features present in Linux but not yet implemented in hk:
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
 | Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
 | Lazy TLB, PCID, global pages | kernel threads keep the last user mm; PCID tags; PGE | Kernel threads load the kernel table; every CR3 write flushes all | More flushes on context switch (x86) |
-| mmap_lock across faults | `mmap_read_lock` + PTE lock in the fault path | The mmap_lock is taken for writing across the fault, except while reading a file page or swap slot (the VMA is revalidated after) | Faults in one address space are serialized; a swap-in can race munmap of its range (swap is inert) |
+| mmap_lock across faults | `mmap_read_lock` + PTE lock in the fault path | Same, except that the mmap_lock is dropped while reading a file page or swap slot (the VMA is revalidated after) | A swap-in can race munmap of its range (swap is inert) |
+| PTE locks | `spinlock_t` in the page-table page (ptdesc) | A lock word in the table's struct page, waiters poll the call-function queue | IPIs answered while spinning with interrupts off |
 
 ### Implications
 

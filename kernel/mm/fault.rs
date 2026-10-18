@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::anon_vma::AnonVma;
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
+use super::ptl::pte_lock;
 use super::shmem::Shmem;
 use super::tlb::flush_tlb_page;
 use super::{Mm, MmStruct, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE, SwapEntry};
@@ -87,16 +88,12 @@ fn access_ok(prot: u32, access: Access) -> bool {
     }
 }
 
-/// Find the VMA of `addr` (growing a stack down to it, Linux
-/// expand_stack) and check the access
-fn find_area(map: &mut MmStruct, addr: u64, access: Access) -> Result<Area, VmFault> {
-    let idx = match map.find_vma_index(addr) {
-        Some(i) => i,
-        None => {
-            let i = map.find_expandable_vma(addr).ok_or(VmFault::Segv)?;
-            map.expand_downwards(i, addr).map_err(|_| VmFault::Segv)?;
-            i
-        }
+/// Find the VMA of `addr` and check the access; `Retry` if a stack
+/// must first grow down to it (needs the mmap_lock for writing)
+fn find_area(map: &MmStruct, addr: u64, access: Access) -> Result<Area, VmFault> {
+    let Some(idx) = map.find_vma_index(addr) else {
+        map.find_expandable_vma(addr).ok_or(VmFault::Segv)?;
+        return Err(VmFault::Retry);
     };
     let vma = map.get_vma(idx).ok_or(VmFault::Segv)?;
     if !access_ok(vma.prot, access) {
@@ -176,20 +173,48 @@ pub fn handle_mm_fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault
     }
 }
 
-fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
+/// Grow the stack VMA below `addr` down to it (Linux expand_stack),
+/// with the mmap_lock held for writing
+fn grow_stack(mm: &Mm, addr: u64) -> Result<(), VmFault> {
     let mut map = mm.mmap_write();
-    let area = find_area(&mut map, addr, access)?;
-    let pgd = mm.pgd();
+    if map.find_vma_index(addr).is_some() {
+        return Ok(()); // grown meanwhile
+    }
+    let i = map.find_expandable_vma(addr).ok_or(VmFault::Segv)?;
+    map.expand_downwards(i, addr).map_err(|_| VmFault::Segv)
+}
+
+/// The fault's VMA, the mmap_lock held for reading (Linux
+/// lock_mm_and_find_vma: a stack to grow takes it for writing first)
+fn lock_area(mm: &Mm, addr: u64, access: Access) -> Result<(MmRead<'_>, Area), VmFault> {
+    loop {
+        let map = mm.mmap_read();
+        match find_area(&map, addr, access) {
+            Ok(area) => return Ok((map, area)),
+            Err(VmFault::Retry) => {
+                drop(map);
+                grow_stack(mm, addr)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+type MmRead<'a> = crate::sync::RwSemReadGuard<'a, MmStruct>;
+
+fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
+    let (map, area) = lock_area(mm, addr, access)?;
     if let Some(r) = huge_fault(mm, addr, &area, access) {
         return r;
     }
-    let ptep = leaf(pgd, addr)?;
+    let ptep = leaf(mm, addr)?;
     let pte = get_pte(ptep);
     if paging::pte_protnone(pte) {
         // Only mprotect makes protnone entries, with the VMA (which
         // allows this access): restore it, read-only, and retry (a
         // write then goes through do_wp_page; write implies read)
         let prot = (area.prot & !PROT_WRITE) | PROT_READ;
+        let _l = pte_lock(ptep);
         if set_pte(ptep, pte, paging::pte_modify(pte, prot)) {
             flush_tlb_page(mm, addr);
         }
@@ -210,8 +235,8 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
         // Read (or looked up in the swap cache) unlocked
         drop(map);
         let (page, cached) = swap_page(SwapEntry::from_pte(pte), &area)?;
-        let map = mm.mmap_write();
-        let ptep = match same_area(&map, addr, &area).then(|| leaf(pgd, addr)) {
+        let map = mm.mmap_read();
+        let ptep = match same_area(&map, addr, &area).then(|| leaf(mm, addr)) {
             Some(Ok(p)) => p,
             r => {
                 super::memory::put_page(page);
@@ -228,13 +253,13 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
     // A file page: read (or looked up in the page cache) unlocked
     drop(map);
     let page = fault_page(addr, &area)?;
-    let map = mm.mmap_write();
+    let map = mm.mmap_read();
     if !same_area(&map, addr, &area) {
         // Unmapped or changed meanwhile: the access is retried
         super::memory::put_page(page);
         return Ok(());
     }
-    let ptep = match leaf(pgd, addr) {
+    let ptep = match leaf(mm, addr) {
         Ok(p) => p,
         Err(e) => {
             super::memory::put_page(page);
@@ -245,10 +270,10 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
 }
 
 /// The leaf entry for `addr`, allocating missing tables
-fn leaf(pgd: u64, addr: u64) -> Result<*mut u64, VmFault> {
-    paging::pte_alloc(pgd, addr).ok_or_else(|| {
+fn leaf(mm: &Mm, addr: u64) -> Result<*mut u64, VmFault> {
+    super::ptl::pte_alloc(mm, addr).ok_or_else(|| {
         // A huge page mapped there: the access is retried
-        match paging::pmd_ptr(pgd, addr).map(get_pte) {
+        match paging::pmd_ptr(mm.pgd(), addr).map(get_pte) {
             Some(pmd) if paging::pmd_huge(pmd) => VmFault::Retry,
             _ => VmFault::Oom,
         }
@@ -279,8 +304,9 @@ fn huge_fault(mm: &Mm, addr: u64, area: &Area, access: Access) -> Option<Result<
     let pmd = get_pte(paging::pmd_ptr(mm.pgd(), addr)?);
     if paging::pmd_huge(pmd) {
         if access == Access::Write && !paging::pte_write(pmd) {
-            // Write-protected huge page: split, then fault on the 4KB page
-            if split_huge_pmd(mm, addr).is_none() {
+            // Write-protected huge page: split, then fault on the 4KB
+            // page; a racing fault may have split (or unmapped) it first
+            if split_huge_pmd(mm, addr).is_none() && still_huge(mm, addr) {
                 return Some(Err(VmFault::Oom));
             }
             return None;
@@ -292,15 +318,20 @@ fn huge_fault(mm: &Mm, addr: u64, area: &Area, access: Access) -> Option<Result<
         return Some(Ok(()));
     }
     if pmd == 0 && area.thp {
-        return do_huge_anon(mm.pgd(), addr, area).then_some(Ok(()));
+        return do_huge_anon(mm, addr, area).then_some(Ok(()));
     }
     None
+}
+
+/// A 2MB page still maps `addr`
+fn still_huge(mm: &Mm, addr: u64) -> bool {
+    paging::pmd_ptr(mm.pgd(), addr).is_some_and(|p| paging::pmd_huge(get_pte(p)))
 }
 
 /// Map a zeroed 2MB page for a THP-eligible area if it covers the whole
 /// aligned 2MB around `addr` (Linux do_huge_pmd_anonymous_page); false
 /// to fall back to a 4KB page
-fn do_huge_anon(pgd: u64, addr: u64, area: &Area) -> bool {
+fn do_huge_anon(mm: &Mm, addr: u64, area: &Area) -> bool {
     let base = addr & !(HUGE_PAGE_SIZE - 1);
     if base < area.start || base + HUGE_PAGE_SIZE > area.end {
         return false;
@@ -321,7 +352,8 @@ fn do_huge_anon(pgd: u64, addr: u64, area: &Area) -> bool {
         flags |= PageFlags::EXECUTE;
     }
     // Fails if a racing fault installed a table or a page first
-    if ArchPageTable::map_huge_page(pgd, base, frame, flags, &mut &FRAME_ALLOCATOR).is_err() {
+    let _l = super::ptl::pt_lock(mm);
+    if ArchPageTable::map_huge_page(mm.pgd(), base, frame, flags, &mut &FRAME_ALLOCATOR).is_err() {
         FRAME_ALLOCATOR.free_huge(frame);
         return false;
     }
@@ -399,6 +431,7 @@ fn do_fault(
     addr: u64,
     area: &Area,
 ) -> Result<(), VmFault> {
+    let _l = pte_lock(ptep);
     if !set_pte(ptep, old, paging::mk_pte(page, area.prot)) {
         // A racing fault mapped the page first
         super::memory::put_page(page);
@@ -445,6 +478,7 @@ fn do_swap_page(
     if cached && !area.shared {
         entry = paging::pte_mkcow(entry);
     }
+    let _l = pte_lock(ptep);
     if !set_pte(ptep, pte, entry) {
         super::memory::put_page(page);
         return Ok(());
@@ -465,6 +499,10 @@ fn do_swap_page(
 /// is made writable in place; a private page still shared (fork's
 /// copy-on-write) is copied first
 fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Result<(), VmFault> {
+    let _l = pte_lock(ptep);
+    if get_pte(ptep) != pte {
+        return Ok(()); // changed meanwhile: the access is retried
+    }
     let old = paging::pte_addr(pte);
     if area.shared || FRAME_ALLOCATOR.refcount(old) <= 1 {
         if set_pte(ptep, pte, paging::pte_mkwrite(pte)) {

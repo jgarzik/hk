@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::KernelError;
+use crate::sync::spin::Mutex;
 use crate::sync::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 
 use crate::task::Tid;
@@ -32,6 +33,7 @@ pub mod mremap;
 pub mod page;
 pub mod page_alloc;
 pub mod page_cache;
+pub mod ptl;
 pub mod remote;
 pub mod rmap;
 pub mod shmem;
@@ -649,6 +651,8 @@ pub struct Mm {
     /// The VMA tree and accounting under the mmap_lock (Linux
     /// mm->mmap_lock, a sleeping rw_semaphore)
     map: RwSem<MmStruct>,
+    /// Page-table structure changes (Linux mm->page_table_lock, `ptl`)
+    page_table_lock: Mutex<()>,
     /// TLB state: where it is loaded, flush generation, ASID
     ctx: tlb::MmContext,
 }
@@ -686,6 +690,11 @@ impl Mm {
         self.map.write_killable()
     }
 
+    /// The page_table_lock (taken through `ptl::pt_lock`)
+    pub(crate) fn page_table_lock(&self) -> &Mutex<()> {
+        &self.page_table_lock
+    }
+
     /// TLB state (Linux mm->context)
     pub fn context(&self) -> &tlb::MmContext {
         &self.ctx
@@ -715,6 +724,7 @@ impl MmRef {
             users: AtomicUsize::new(1),
             pgd,
             map: RwSem::new(map),
+            page_table_lock: Mutex::new(()),
             ctx: tlb::MmContext::new(),
         }))
     }
@@ -726,6 +736,7 @@ impl MmRef {
             users: AtomicUsize::new(1),
             pgd,
             map: RwSem::new(build(me)),
+            page_table_lock: Mutex::new(()),
             ctx: tlb::MmContext::new(),
         }))
     }

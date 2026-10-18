@@ -93,7 +93,9 @@ pub(super) fn exit_mmap(mm: &Mm) {
 }
 
 /// Clear the entries of [start, end) of the gather's address space
-/// (Linux zap_page_range / unmap_page_range), mm lock held: each 4KB
+/// (Linux zap_page_range / unmap_page_range), mm lock held (for reading
+/// is enough: 2MB entries change under the page_table_lock, 4KB ones
+/// under their table's PTE lock): each 4KB
 /// entry (a page, protnone included, or a swap slot) is cleared, a 2MB
 /// page wholly inside goes whole, one partly inside is split first. The
 /// pages go to `tlb`, released only after its TLB flush (a swap slot
@@ -128,7 +130,9 @@ pub fn zap_range(tlb: &mut Gather, start: u64, end: u64) {
             // Out of memory: the 2MB page stays mapped (BUGS.md)
             let _ = split_huge_pmd(mm, base);
         }
-        if entry(pmd).load(Ordering::Acquire) != 0 {
+        // A table stays once installed: lock it for its entries
+        if let Some(p) = paging::pte_ptr(pgd, addr) {
+            let _l = super::ptl::pte_lock(p);
             for a in (addr..next).step_by(PAGE_SIZE as usize) {
                 zap_pte(tlb, a);
             }

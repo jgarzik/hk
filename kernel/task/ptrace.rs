@@ -548,7 +548,7 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64) -> i64 {
     }
 
     // Get target's mm and page table
-    let (target_mm, page_table_root) = match get_target_mm_and_pt(target_tid) {
+    let (target_mm, _) = match get_target_mm_and_pt(target_tid) {
         Some(x) => x,
         None => return -ESRCH,
     };
@@ -556,7 +556,7 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64) -> i64 {
     // Lock mm and read from tracee
     let mm_guard = target_mm.mmap_read();
     let mut buf = [0u8; 8];
-    match crate::mm::remote::access_remote_vm_read(&mm_guard, page_table_root, addr, &mut buf) {
+    match crate::mm::remote::access_remote_vm_read(&target_mm, &mm_guard, addr, &mut buf) {
         Ok(8) => {
             // Return the word value
             i64::from_ne_bytes(buf)
@@ -583,8 +583,8 @@ fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
         None => return -ESRCH,
     };
 
-    // Lock mm and write to tracee (PTE changes: a private copy)
-    let mm_guard = target_mm.mmap_write();
+    // Lock mm and write to tracee
+    let mm_guard = target_mm.mmap_read();
     let buf = data.to_ne_bytes();
     match crate::mm::remote::access_remote_vm_write(&target_mm, &mm_guard, addr, &buf) {
         Ok(8) => 0,

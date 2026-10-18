@@ -123,8 +123,9 @@ fn pmd_entry(p: *mut u64) -> &'static core::sync::atomic::AtomicU64 {
 }
 
 /// Split the 2MB page mapping `va` in `mm` into 512 4KB entries (Linux
-/// __split_huge_pmd_locked), mm lock held. The page table is allocated
-/// first, so a failure (ENOMEM) changes nothing. Then break before
+/// __split_huge_pmd_locked), mm lock held; takes the page_table_lock
+/// (a racing fault may split or map at the same time). The page table
+/// is allocated first, so a failure (ENOMEM) changes nothing. Then break before
 /// make (Linux pmdp_invalidate): the 2MB entry is cleared and flushed
 /// on every CPU before the table replaces it, so no CPU caches a 2MB
 /// and a 4KB translation of one address at once (ARM ARM D8.16, Intel
@@ -137,14 +138,16 @@ pub fn split_huge_pmd(mm: &super::Mm, va: u64) -> Option<u64> {
     use crate::arch::paging;
     use core::sync::atomic::Ordering;
     let pmdp = paging::pmd_ptr(mm.pgd(), va)?;
-    let old = pmd_entry(pmdp).load(Ordering::Acquire);
-    if !paging::pmd_huge(old) {
+    if !paging::pmd_huge(pmd_entry(pmdp).load(Ordering::Acquire)) {
         return None;
     }
     let pt = crate::FRAME_ALLOCATOR.alloc()?;
-    if pmd_entry(pmdp)
-        .compare_exchange(old, 0, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
+    let _l = super::ptl::pt_lock(mm);
+    let old = pmd_entry(pmdp).load(Ordering::Acquire);
+    if !paging::pmd_huge(old)
+        || pmd_entry(pmdp)
+            .compare_exchange(old, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
     {
         crate::FRAME_ALLOCATOR.free(pt);
         return None;
@@ -160,12 +163,13 @@ pub fn split_huge_pmd(mm: &super::Mm, va: u64) -> Option<u64> {
 }
 
 /// Clear the 2MB page entry for `base` in `mm` (Linux zap_huge_pmd), mm
-/// lock held; the caller flushes it (`Gather`) before releasing the
+/// lock held, under the page_table_lock; the caller flushes it (`Gather`) before releasing the
 /// returned frame, which still holds the mapping's reference.
 pub fn take_huge_pmd(mm: &super::Mm, base: u64) -> Option<u64> {
     use crate::arch::paging;
     use core::sync::atomic::Ordering;
     let pmd = pmd_entry(paging::pmd_ptr(mm.pgd(), base)?);
+    let _l = super::ptl::pt_lock(mm);
     let old = pmd.load(Ordering::Acquire);
     if !paging::pmd_huge(old)
         || pmd

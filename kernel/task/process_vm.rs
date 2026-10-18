@@ -58,7 +58,7 @@ pub fn sys_process_vm_readv(
     };
 
     // Permission check and the mm it covers (Linux mm_access)
-    let (target_mm, page_table_root) = match access_mm(target_tid) {
+    let (target_mm, _) = match access_mm(target_tid) {
         Ok(x) => x,
         Err(e) => return e.sysret(),
     };
@@ -112,8 +112,8 @@ pub fn sys_process_vm_readv(
             // Read from remote into kernel buffer
             let mut buf = alloc::vec![0u8; to_transfer];
             let bytes_read = match access_remote_vm_read(
+                &target_mm,
                 &target_mm.mmap_read(),
-                page_table_root,
                 remote_addr,
                 &mut buf,
             ) {
@@ -261,20 +261,17 @@ pub fn sys_process_vm_writev(
             }
 
             // Write to remote
-            let bytes_written = match access_remote_vm_write(
-                &target_mm,
-                &target_mm.mmap_write(),
-                remote_addr,
-                &buf,
-            ) {
-                Ok(n) => n,
-                Err(_) => {
-                    if total_bytes > 0 {
-                        return total_bytes;
+            let bytes_written =
+                match access_remote_vm_write(&target_mm, &target_mm.mmap_read(), remote_addr, &buf)
+                {
+                    Ok(n) => n,
+                    Err(_) => {
+                        if total_bytes > 0 {
+                            return total_bytes;
+                        }
+                        return KernelError::BadAddress.sysret();
                     }
-                    return KernelError::BadAddress.sysret();
-                }
-            };
+                };
 
             if bytes_written == 0 {
                 if total_bytes > 0 {

@@ -466,7 +466,7 @@ pub fn gen_stat(pid: Pid) -> Vec<u8> {
 fn read_remote(mm: &Mm, m: &MmStruct, start: u64, end: u64) -> Vec<u8> {
     let len = end.saturating_sub(start).min(ARGS_MAX) as usize;
     let mut buf = alloc::vec![0u8; len];
-    let n = crate::mm::remote::access_remote_vm_read(m, mm.pgd(), start, &mut buf).unwrap_or(0);
+    let n = crate::mm::remote::access_remote_vm_read(mm, m, start, &mut buf).unwrap_or(0);
     buf.truncate(n);
     buf
 }
