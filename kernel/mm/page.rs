@@ -351,21 +351,22 @@ fn zeroed_frame() -> u64 {
     pa
 }
 
-/// Sections holding RAM, ascending (at most 64 distinct runs of them)
-fn ram_sections(out: &mut [u64; 256]) -> usize {
-    let mut n = 0;
-    for r in crate::mm::memblock::MEMBLOCK.lock().memory.ranges() {
+/// The first section after `after` (from 0 for None) that holds RAM of
+/// the sorted `ranges` (Linux for_each_present_section_nr)
+fn next_section(ranges: &[crate::mm::memblock::Range], after: Option<u64>) -> Option<u64> {
+    let from = after.map_or(0, |s| s + 1);
+    ranges.iter().find_map(|r| {
         let first = (r.base >> PAGE_SHIFT) / SECTION_PFNS;
         let last = (r.end >> PAGE_SHIFT).min(MAX_PFN).div_ceil(SECTION_PFNS);
-        for sec in first..last {
-            if n == 0 || out[n - 1] != sec {
-                assert!(n < out.len(), "vmemmap: too many memory sections");
-                out[n] = sec;
-                n += 1;
-            }
-        }
-    }
-    n
+        let sec = first.max(from);
+        (sec < last).then_some(sec)
+    })
+}
+
+/// The next RAM section of memblock after `after` (the lock is dropped
+/// before the caller allocates from memblock)
+fn next_ram_section(after: Option<u64>) -> Option<u64> {
+    next_section(crate::mm::memblock::MEMBLOCK.lock().memory.ranges(), after)
 }
 
 /// Map and initialize the struct pages of every section holding RAM
@@ -374,10 +375,10 @@ fn ram_sections(out: &mut [u64; 256]) -> usize {
 /// and before memblock's free ranges are handed out.
 pub fn vmemmap_init() {
     use crate::arch::{CurrentArch, MemoryLayoutOps};
-    let mut secs = [0u64; 256];
-    let n = ram_sections(&mut secs);
     let per_frame = 4096 / core::mem::size_of::<Page>();
-    for &sec in &secs[..n] {
+    let mut cur = None;
+    while let Some(sec) = next_ram_section(cur) {
+        cur = Some(sec);
         let va = crate::arch::paging::VMEMMAP_START + sec * SECTION_PFNS * 64;
         for off in (0..SECTION_PFNS * 64).step_by(4096) {
             let pa = crate::mm::memblock::alloc(4096, 4096);
@@ -401,6 +402,37 @@ pub fn vmemmap_init() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every RAM section is visited once, ascending, however many there
+    /// are (40GB: 320 sections; a fixed 256-entry list panicked)
+    #[test]
+    fn sections_of_large_memory() {
+        use crate::mm::memblock::Range;
+        const GB: u64 = 1 << 30;
+        let ranges = [
+            Range {
+                base: 0x1000,
+                end: 0x9f000,
+            },
+            Range {
+                base: 1 << 20,
+                end: 3 * GB,
+            },
+            Range {
+                base: 4 * GB,
+                end: 41 * GB + 4096,
+            },
+        ];
+        let mut secs = Vec::new();
+        let mut cur = None;
+        while let Some(s) = next_section(&ranges, cur) {
+            secs.push(s);
+            cur = Some(s);
+        }
+        // 0..24 (3GB), 32..328 (4GB..41GB) and the page past 41GB
+        let want: Vec<u64> = (0..24).chain(32..329).collect();
+        assert_eq!(secs, want);
+    }
 
     #[test]
     fn test_page_descriptor_flags() {

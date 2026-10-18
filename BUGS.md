@@ -254,6 +254,17 @@ never enters the Traced state and every request that needs a stopped
 tracee (GETREGS, SETREGS, PEEK/POKE*, CONT, ...) fails with ESRCH. The
 TLS_PTRACE_RANGE boot test runs on Linux only.
 
+## Tracees never stop
+
+**Location**: `kernel/task/ptrace.rs` (ptrace_stop, ptrace_report_syscall),
+`kernel/signal/mod.rs` (stop signals)
+
+Nothing calls `ptrace_stop`: no signal-delivery stop, no syscall stop,
+and SIGSTOP is ignored (stop/continue are not implemented), so a tracee
+never enters the Traced state and every request that needs a stopped
+tracee (GETREGS, SETREGS, PEEK/POKE*, CONT, ...) fails with ESRCH. The
+TLS_PTRACE_RANGE boot test runs on Linux only.
+
 ## Global init is not protected from default-action signals
 
 **Location**: `kernel/signal/mod.rs` send_signal
@@ -516,13 +527,11 @@ From the P1 /code-review (unverified unless noted). Tag = phase that fixes it.
 
 ## P2 review findings (open)
 From the P2 /code-review (unverified). Tag = when to fix.
-1. **>256 memory sections panics boot** (next batch; >= ~32GB RAM).
-   `kernel/mm/page.rs:361` ram_sections fills a fixed 256-entry array
-   of 128MB sections and asserts.
-2. **x86 direct map keeps only 31 regions** (next batch; real UEFI HW).
-   `kernel/arch/x86_64/mod.rs:411`: memblock takes every available
-   region but kmap::ram_ranges caps at 31, so RAM in a dropped region
-   below direct_end is handed out unmapped and faults on first use.
+1. Fixed in fix batch 1: vmemmap_init walks the RAM sections one by
+   one (no fixed list).
+2. Fixed in fix batch 1: the x86 direct map reads every multiboot
+   region in place (no 31-entry copy); RAM past the page-table pool's
+   reach (48GB) is dropped from memblock as before.
 3. **No pcp drain on allocation failure** (next batch).
    `kernel/mm/page_alloc.rs:443`: pages on other CPUs' pcp lists are
    invisible to watermarks and merging; Linux drain_all_pages in the
