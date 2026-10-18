@@ -162,20 +162,29 @@ export QEMU_CPU
 # hk boot test NIC (see run-qemu.sh): virtio (default) or e1000
 export NIC
 
+# NO_KVM=1: force TCG on x86 (CI's conditions)
+export NO_KVM
+
+# Serial logs, per tree (so worktrees and parallel boots don't collide)
+QEMU_LOG_DIR ?= $(CURDIR)/target/qemu
+export QEMU_LOG_DIR
+SERIAL_LOG = $(QEMU_LOG_DIR)/serial.log
+SERIAL_LOG_ARM = $(QEMU_LOG_DIR)/serial_arm.log
+
 check: iso disk-image
-	@rm -f /tmp/qemu_serial.log
+	@rm -f $(SERIAL_LOG)
 	@echo "Running boot test ($(BOOT_TEST_TIMEOUT) second timeout)..."
 	@./run-qemu.sh -t -T $(BOOT_TEST_TIMEOUT)
-	@if [ ! -f /tmp/qemu_serial.log ]; then \
+	@if [ ! -f $(SERIAL_LOG) ]; then \
 		echo "Boot test FAILED - QEMU did not create serial log"; \
 		exit 1; \
-	elif ! grep -q "Powering off" /tmp/qemu_serial.log; then \
+	elif ! grep -q "Powering off" $(SERIAL_LOG); then \
 		echo "Boot test FAILED - 'Powering off' not found in serial log:"; \
-		cat /tmp/qemu_serial.log; \
+		cat $(SERIAL_LOG); \
 		exit 1; \
-	elif grep -q "FAIL" /tmp/qemu_serial.log; then \
+	elif grep -q "FAIL" $(SERIAL_LOG); then \
 		echo "Boot test FAILED - test failures detected:"; \
-		grep "FAIL" /tmp/qemu_serial.log; \
+		grep "FAIL" $(SERIAL_LOG); \
 		exit 1; \
 	else \
 		echo "Boot test PASSED"; \
@@ -204,26 +213,27 @@ run-arm: build-arm vfat-image disk-image
 	./run-qemu.sh --arch arm
 
 check-arm: build-arm vfat-image disk-image
-	@rm -f /tmp/qemu_serial_arm.log
+	@rm -f $(SERIAL_LOG_ARM)
 	@echo "Running ARM boot test ($(BOOT_TEST_TIMEOUT) second timeout)..."
 	@./run-qemu.sh --arch arm -t -T $(BOOT_TEST_TIMEOUT)
-	@if [ ! -f /tmp/qemu_serial_arm.log ]; then \
+	@if [ ! -f $(SERIAL_LOG_ARM) ]; then \
 		echo "ARM Boot test FAILED - QEMU did not create serial log"; \
 		exit 1; \
-	elif ! grep -qE "(Powering off|System shutdown via PSCI)" /tmp/qemu_serial_arm.log; then \
+	elif ! grep -qE "(Powering off|System shutdown via PSCI)" $(SERIAL_LOG_ARM); then \
 		echo "ARM Boot test FAILED - shutdown message not found in serial log:"; \
-		cat /tmp/qemu_serial_arm.log; \
+		cat $(SERIAL_LOG_ARM); \
 		exit 1; \
-	elif grep -q "FAIL" /tmp/qemu_serial_arm.log; then \
+	elif grep -q "FAIL" $(SERIAL_LOG_ARM); then \
 		echo "ARM Boot test FAILED - test failures detected:"; \
-		grep "FAIL" /tmp/qemu_serial_arm.log; \
+		grep "FAIL" $(SERIAL_LOG_ARM); \
 		exit 1; \
 	else \
 		echo "ARM Boot test PASSED"; \
 	fi
 
 # Differential test: boot_tester as init on a real Linux kernel (native arch)
-LINUX_TEST_TIMEOUT ?= 120
+# Bounds hangs only; emulated aarch64 Linux takes ~150s, more in parallel
+LINUX_TEST_TIMEOUT ?= 300
 check-linux: disk-image
 	./tools/linux-boot-tester.sh -T $(LINUX_TEST_TIMEOUT)
 

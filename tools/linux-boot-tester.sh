@@ -10,10 +10,13 @@
 #
 # Usage: tools/linux-boot-tester.sh [-a x86_64|aarch64] [-T timeout_seconds]
 # Env:   LINUX_KERNEL=/path/to/vmlinuz  use this kernel instead of Ubuntu's
+#        NO_KVM=1          force TCG even if /dev/kvm works (as on CI)
+#        QEMU_LOG_DIR      serial log directory (default target/qemu)
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+TOP=$PWD
 
 TIMEOUT=120
 ARCH=$(uname -m)
@@ -45,8 +48,9 @@ esac
 . tools/fetch-deb.sh
 
 WORK=target/linux-test-$ARCH
-SERIAL_LOG=/tmp/qemu_serial_linux.log
-mkdir -p "$WORK"
+QEMU_LOG_DIR=${QEMU_LOG_DIR:-$TOP/target/qemu}
+SERIAL_LOG=$QEMU_LOG_DIR/serial_linux_$ARCH.log
+mkdir -p "$WORK" "$QEMU_LOG_DIR"
 
 # Kernel: Ubuntu generic, fetched once per version
 if [ -z "${LINUX_KERNEL:-}" ]; then
@@ -104,7 +108,7 @@ echo -n "Hello from ramfs!" > "$ROOT/test.txt"
 (cd "$ROOT" && find . | cpio -o -H newc --quiet) > "$WORK/initramfs.cpio"
 
 KVM=()
-if [ -w /dev/kvm ] && $NATIVE && [ "$ARCH" = x86_64 ]; then
+if [ -w /dev/kvm ] && $NATIVE && [ "$ARCH" = x86_64 ] && [ "${NO_KVM:-}" != 1 ]; then
     KVM=(-enable-kvm)
     QEMU_MACHINE=(-cpu host)
 fi

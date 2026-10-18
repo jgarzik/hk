@@ -17,12 +17,17 @@
 #                uaccess helpers.
 #   NIC          Network card: virtio (default, modern virtio-net-pci) or
 #                e1000, e.g. make check NIC=e1000
+#   NO_KVM=1     Force TCG on x86 even if /dev/kvm works (as on CI)
+#   QEMU_LOG_DIR Serial log directory (default: target/qemu in this tree)
 #
-# Serial output:
-#   x86: /tmp/qemu_serial.log (or /tmp/qemu_usb_serial.log with -u)
-#   arm: /tmp/qemu_serial_arm.log
+# Serial output (in $QEMU_LOG_DIR):
+#   x86: serial.log (USB serial: usb_serial.log, the console with -u)
+#   arm: serial_arm.log
 
 set -e
+
+QEMU_LOG_DIR=${QEMU_LOG_DIR:-$(cd "$(dirname "$0")" && pwd)/target/qemu}
+mkdir -p "$QEMU_LOG_DIR"
 
 # Shared network options
 . "$(dirname "$0")/tools/qemu-net.sh"
@@ -101,8 +106,8 @@ fi
 setup_x86_config() {
     QEMU_BIN="qemu-system-x86_64"
     ISO="target/hk-x86_64.iso"
-    SERIAL_LOG="/tmp/qemu_serial.log"
-    USB_SERIAL_LOG="/tmp/qemu_usb_serial.log"
+    SERIAL_LOG="$QEMU_LOG_DIR/serial.log"
+    USB_SERIAL_LOG="$QEMU_LOG_DIR/usb_serial.log"
 
     # Check if ISO exists
     if [ ! -f "$ISO" ]; then
@@ -113,8 +118,8 @@ setup_x86_config() {
 
     # Base QEMU arguments
     # Use KVM if available for proper CPU feature support (invtsc)
-    # Fall back to TCG (software emulation) if KVM not available
-    if [ -w /dev/kvm ]; then
+    # Fall back to TCG (software emulation) if KVM not available or NO_KVM=1
+    if [ -w /dev/kvm ] && [ "${NO_KVM:-}" != 1 ]; then
         QEMU_ARGS=(
             -enable-kvm
             -cpu "${QEMU_CPU:-host}"
@@ -156,11 +161,12 @@ setup_x86_config() {
         )
     fi
 
-    # Add USB mass storage device if vfat.img exists
+    # USB mass storage (make vfat-image); snapshot=on like the virtio
+    # disk: every boot sees it pristine, and x86 and arm boots can share it
     VFAT_IMG="target/vfat.img"
     if [ -f "$VFAT_IMG" ]; then
         QEMU_ARGS+=(
-            -drive id=usbdisk,if=none,format=raw,file="$VFAT_IMG"
+            -drive id=usbdisk,if=none,format=raw,file="$VFAT_IMG",snapshot=on
             -device usb-storage,drive=usbdisk,bus=xhci.0
         )
     fi
@@ -177,7 +183,7 @@ setup_arm_config() {
     QEMU_BIN="qemu-system-aarch64"
     KERNEL="target/aarch64-unknown-none/release/kernel"
     INITRAMFS="user/initramfs-aarch64.cpio"
-    SERIAL_LOG="/tmp/qemu_serial_arm.log"
+    SERIAL_LOG="$QEMU_LOG_DIR/serial_arm.log"
 
     # Check if kernel exists
     if [ ! -f "$KERNEL" ]; then
@@ -221,11 +227,11 @@ setup_arm_config() {
     # Add xHCI USB controller
     QEMU_ARGS+=(-device qemu-xhci,id=xhci)
 
-    # Add USB mass storage device if vfat.img exists
+    # USB mass storage (make vfat-image), snapshot=on as on x86
     VFAT_IMG="target/vfat.img"
     if [ -f "$VFAT_IMG" ]; then
         QEMU_ARGS+=(
-            -drive id=usbdisk,if=none,format=raw,file="$VFAT_IMG"
+            -drive id=usbdisk,if=none,format=raw,file="$VFAT_IMG",snapshot=on
             -device usb-storage,drive=usbdisk,bus=xhci.0
         )
     fi

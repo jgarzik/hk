@@ -114,9 +114,18 @@ package).
 ```bash
 make check          # Build x86-64 + boot test (SUCCESS criteria)
 make check-arm      # Build aarch64 + boot test (SUCCESS criteria)
+make check-linux    # boot_tester on real Linux (native arch)
+make check-linux-arm # Same, aarch64 Linux (emulated on x86)
 make clippy         # Linting for x86-64
 make clippy-arm     # Linting for aarch64
 ```
+
+The serial logs of all boots go to `QEMU_LOG_DIR` (default
+`target/qemu/` of the tree), so worktrees and parallel boots never share
+a log: `serial.log` (x86-64), `serial_arm.log` (aarch64),
+`usb_serial.log` (x86-64 USB serial), `serial_linux_<arch>.log`
+(`check-linux*`). `NO_KVM=1` (e.g. `NO_KVM=1 make check`) runs x86
+under TCG, as CI does.
 
 ## Running in QEMU
 
@@ -144,11 +153,12 @@ make run-arm        # aarch64
 
 The default QEMU setup:
 - Memory: 512MB
-- Serial output: logged to `/tmp/qemu_serial.log` (x86-64) or `/tmp/qemu_serial_arm.log` (aarch64)
+- Serial output: logged to `target/qemu/serial.log` (x86-64) or `target/qemu/serial_arm.log` (aarch64); `QEMU_LOG_DIR` overrides the directory
 - Display: `-nographic` (console mode)
 - x86-64: Boots from ISO with GRUB
 - aarch64: Direct kernel boot with device tree
-- CPU: x86-64 `-cpu host` under KVM, `-cpu max` under TCG (SMAP/SMEP);
+- CPU: x86-64 `-cpu host` under KVM, `-cpu max` under TCG (SMAP/SMEP;
+  `NO_KVM=1` forces TCG, as on CI);
   aarch64 `-cpu neoverse-n1` (PAN). SMAP/PAN make any kernel access to
   user memory outside `kernel/uaccess.rs` fault, so the boot tests catch
   it. Override with `QEMU_CPU`, e.g. `make check QEMU_CPU=qemu64` or
