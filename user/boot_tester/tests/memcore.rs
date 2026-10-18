@@ -8,7 +8,8 @@
 //!   about that much MemFree, and it all comes back when the child exits
 //!   (within 8MB on hk, 32MB on Linux)
 //! - MEM_SLAB_TIME_WAIT: 2000 connections closed into TIME_WAIT are all
-//!   listed in /proc/net/tcp; on hk each entry costs at most 1KB of
+//!   listed in /proc/net/tcp (those not yet expired, if closing them
+//!   outlasted TIME_WAIT); on hk each entry costs at most 1KB of
 //!   Slab with its table and timer entries (about 600 bytes, 860 with
 //!   LOCKDEP's lock tracking: a compact timewait entry, not a whole
 //!   control block, which was over 1.3KB;
@@ -17,7 +18,7 @@
 
 use super::helpers::{host_mode, print, print_num, println};
 use super::mm_life::meminfo;
-use super::sk::{bind, close, connect, port, tcp};
+use super::sk::{bind, close, connect, now_ms, port, tcp};
 use super::sysctl::{read_file, write_file};
 use super::tcp_xfer::accept;
 use hk_syscall::{
@@ -140,13 +141,18 @@ fn touch_free() {
     );
 }
 
-/// TIME_WAIT lines (state 06) of /proc/net/tcp
-fn time_wait_count() -> i64 {
+/// TIME_WAIT lines (state 06) of /proc/net/tcp whose local port is in
+/// `ports`: only this test's entries (older tests' expire meanwhile)
+fn time_wait_count(ports: core::ops::Range<u16>) -> i64 {
     let fd = sys_open(b"/proc/net/tcp\0".as_ptr(), O_RDONLY, 0);
     if fd < 0 {
         return -1;
     }
-    let mut buf = [0u8; 4096];
+    // One read for the whole table (~150 bytes a line): the file is
+    // generated per read, so between small reads entries expiring at
+    // its head shift the text and lines are skipped
+    static mut BUF: [u8; 1 << 19] = [0; 1 << 19];
+    let buf = unsafe { &mut *(&raw mut BUF) };
     let mut line = [0u8; 64];
     let (mut ll, mut n) = (0usize, 0i64);
     loop {
@@ -156,10 +162,7 @@ fn time_wait_count() -> i64 {
         }
         for &b in &buf[..r as usize] {
             if b == b'\n' {
-                // "  sl  local_address rem_address   st": the state
-                // follows the second address
-                let l = &line[..ll];
-                if l.windows(4).any(|w| w == b" 06 ") {
+                if tw_port(&line[..ll]).is_some_and(|p| ports.contains(&p)) {
                     n += 1;
                 }
                 ll = 0;
@@ -171,6 +174,18 @@ fn time_wait_count() -> i64 {
     }
     sys_close(fd as u64);
     n
+}
+
+/// Local port of a TIME_WAIT line: "  sl: AAAAAAAA:PPPP AAAAAAAA:PPPP 06 ..."
+fn tw_port(l: &[u8]) -> Option<u16> {
+    let mut f = l.split(|&b| b == b' ').filter(|f| !f.is_empty());
+    let (_sl, local, _rem, st) = (f.next()?, f.next()?, f.next()?, f.next()?);
+    if st != b"06" || local.len() != 13 {
+        return None;
+    }
+    local[9..].iter().try_fold(0u16, |v, &c| {
+        Some(v * 16 + (c as char).to_digit(16)? as u16)
+    })
 }
 
 /// A listener on 127.0.0.1, any port
@@ -199,6 +214,9 @@ fn cycle(l: i32, p: u16, cp: u16) -> bool {
     s >= 0
 }
 
+/// TIME_WAIT duration (Linux TCP_TIMEWAIT_LEN, hk TIMEWAIT_LEN)
+const TW_MS: u64 = 60_000;
+
 fn slab_time_wait() {
     const N: i64 = 2000;
     const BASE: u16 = 20000;
@@ -214,9 +232,14 @@ fn slab_time_wait() {
         cycle(l, p, BASE - 100 + i);
     }
     sleep_ms(100);
-    let tw0 = time_wait_count();
     let before = meminfo(b"Slab:");
+    // When each batch of 100 began closing: on a loaded TCG host the
+    // loop can outlast TIME_WAIT (60 s), and the oldest entries expire
+    let mut batch = [0u64; (N / 100) as usize];
     for i in 0..N {
+        if i % 100 == 0 {
+            batch[(i / 100) as usize] = now_ms();
+        }
         if !cycle(l, p, BASE + i as u16) {
             report(b"MEM_SLAB_TIME_WAIT", false, -1000 - i);
             close(l);
@@ -224,15 +247,18 @@ fn slab_time_wait() {
         }
     }
     sleep_ms(200);
-    let tw = time_wait_count() - tw0;
+    let tw = time_wait_count(BASE..BASE + N as u16);
     let grew = meminfo(b"Slab:") - before;
+    // Batches begun less than TIME_WAIT (minus slack) ago are all listed
+    let t = now_ms();
+    let live = 100 * batch.iter().filter(|&&b| t - b < TW_MS - 5000).count() as i64;
     close(l);
     print(b"MEM_SLAB_TIME_WAIT: ");
     print_num(tw);
     print(b" entries, Slab +");
     print_num(grew);
     println(b" kB");
-    if tw < N {
+    if tw < live {
         report(b"MEM_SLAB_TIME_WAIT", false, tw);
         return;
     }
