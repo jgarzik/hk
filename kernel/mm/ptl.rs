@@ -8,16 +8,17 @@
 //! - `Mm.page_table_lock` ([`pt_lock`]): the table structure -- a missing
 //!   table installed ([`pte_alloc`]), a 2MB entry mapped, split or
 //!   cleared (Linux pmd_lock without split PMD locks).
-//! - the PTE lock ([`pte_lock`]) of each PTE table page, a lock word in
-//!   its struct page (`Page.ptl`, Linux ptdesc ptl): every change of a
-//!   4KB entry under a read hold, from reading the entry to the last
-//!   change that depends on it (break-before-make included).
+//! - the PTE lock ([`pte_lock`], [`table_lock`]) of each PTE table
+//!   page, a lock word in its struct page (`Page.ptl`, Linux ptdesc
+//!   ptl): every software change of a 4KB entry, whatever the mmap_lock
+//!   mode, from reading the entry to the last change that depends on it
+//!   (break-before-make included). Range operations take it once per
+//!   table (`pagewalk::walk_pte_range`).
 //!
-//! A writer holding the mmap_lock for writing (mmap, munmap, mprotect,
-//! mremap, fork's copy) excludes every other software writer; it takes
-//! the locks where it shares code with the readers (`zap_range`). The
-//! MMU still sets accessed/dirty bits, so entries change by
-//! compare-and-swap. Tables are freed only with the mmap_lock held for
+//! Under the PTE lock the MMU still sets accessed/dirty bits, so
+//! entries change by compare-and-swap, retried only for those bits.
+//! Only fork (parent, then child) and mremap (old table, then new)
+//! nest two PTE locks, under the mmap_lock held for writing. Tables are freed only with the mmap_lock held for
 //! writing (munmap, mremap: `memory::free_pgtables`), after their
 //! VMAs left the reverse-map chains, so a pointer to an entry stays
 //! valid under any mmap_lock hold, or the AnonVma lock of a VMA there.
@@ -50,7 +51,12 @@ fn class() -> &'static core::panic::Location<'static> {
 /// pte_offset_map_lock); the entry must lie in a live user table
 #[track_caller]
 pub fn pte_lock(ptep: *mut u64) -> PteLock {
-    let table = virt_to_phys(ptep as u64 & !0xfff);
+    table_lock(virt_to_phys(ptep as u64 & !0xfff))
+}
+
+/// Lock the PTE table frame `table` (a live user table)
+#[track_caller]
+pub fn table_lock(table: u64) -> PteLock {
     let page: &'static Page = phys_to_page(table).expect("page table outside RAM");
     let word = &page.ptl;
     #[cfg(feature = "lockdep")]

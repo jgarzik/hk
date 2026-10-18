@@ -646,12 +646,9 @@ cf0ce50); push both together.
 
 ## P4 review findings (open)
 From the P4 /code-review (unverified unless noted). Tag = when to fix.
-1. **try_to_unmap overwrites a PTE mid-mremap: use-after-free** (P7
-   blocker; needs concurrency). `kernel/mm/rmap.rs:93`: the CAS loop
-   installs the swap entry over whatever the PTE holds; move_ptes
-   (`mremap.rs:104`) moves entries without the PTE lock, and
-   MREMAP_DONTUNMAP keeps the old VMA in the chain. Give up when the
-   PTE no longer maps `phys`; move_ptes under the PTE locks.
+1. Fixed in C1: try_to_unmap gives up on a PTE that no longer maps
+   its page, and move_ptes moves entries under both tables' PTE locks
+   (every software PTE write is under its table's PTE lock).
 2. **swapoff makes PROT_NONE swap pages readable** (next batch;
    confirmed by reading). `kernel/mm/fault.rs:503` unuse_pte →
    mk_pte(page, 0) is PRESENT|USER on x86. Use a protnone PTE
@@ -674,6 +671,5 @@ From the P4 /code-review (unverified unless noted). Tag = when to fix.
    `kernel/mm/swap_state.rs:186`: sleep instead.
 8. **One AnonVma per fork family, Vec chain** (P7).
    `kernel/mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
-9. **Four copies of the page-range walk** (next batch).
-   `kernel/mm/memory.rs:263`, madvise, copy_page_range,
-   change_protection; use mremap.rs `walk`.
+9. Fixed in C1: one page-range walker (`mm::pagewalk`), one PTE lock
+   per table, for every range operation.

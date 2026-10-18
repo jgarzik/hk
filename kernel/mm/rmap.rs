@@ -86,14 +86,11 @@ pub fn try_to_unmap(phys: u64, e: crate::mm::SwapEntry) -> bool {
         if avc.locked || !crate::mm::swap::swap_duplicate(e) {
             return false;
         }
-        // SAFETY: as in `rmap_walk`; only the MMU changes a present
-        // entry under its PTE lock (accessed/dirty bits)
+        // SAFETY: as in `rmap_walk`
         let p = unsafe { AtomicU64::from_ptr(ptep) };
-        let mut cur = pte;
-        while let Err(now) =
-            p.compare_exchange(cur, e.to_pte(), Ordering::AcqRel, Ordering::Acquire)
-        {
-            cur = now;
+        if !unmap_one(p, pte, phys, e) {
+            crate::mm::swap::swap_free(e);
+            return true;
         }
         crate::mm::tlb::flush_tlb_page(mm, addr);
         page_remove_rmap(phys);
@@ -101,4 +98,27 @@ pub fn try_to_unmap(phys: u64, e: crate::mm::SwapEntry) -> bool {
         true
     });
     phys_to_page(phys).is_some_and(|p| p.mapcount() == 0)
+}
+
+/// Swap the entry `p` (last seen as `pte`) from mapping `phys` to the
+/// swap entry `e`, its PTE lock held. Only the MMU changes it meanwhile
+/// (accessed/dirty bits): retry with those; false if it no longer maps
+/// `phys` (P4 #1: never overwrite what some other writer stored)
+fn unmap_one(
+    p: &core::sync::atomic::AtomicU64,
+    pte: u64,
+    phys: u64,
+    e: crate::mm::SwapEntry,
+) -> bool {
+    use crate::arch::paging;
+    let mut cur = pte;
+    loop {
+        if !paging::pte_present(cur) || paging::pte_addr(cur) != phys {
+            return false;
+        }
+        match p.compare_exchange(cur, e.to_pte(), Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => cur = now,
+        }
+    }
 }

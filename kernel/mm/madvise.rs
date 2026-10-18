@@ -11,6 +11,7 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::shmem::Shmem;
 use super::{
@@ -227,53 +228,53 @@ fn lru_ok(vma: &Vma) -> Result<(), KernelError> {
 /// table's PTE lock, then reclaimed with no spinlock held (the swap
 /// writes sleep). Without swap, PAGEOUT leaves anonymous memory alone.
 fn cold_or_pageout(vma: &Vma, owner: &Mm, start: u64, end: u64, pageout: bool) {
-    use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
-    use crate::arch::paging;
     if vma.anon_vma.is_none() || (pageout && super::swap::swap_totals().0 == 0) {
         return;
     }
     super::lru::lru_add_drain_all();
-    let pgd = owner.pgd();
-    let mut pages = Vec::new();
-    let mut addr = start;
-    while addr < end {
-        let next = ((addr | (HUGE_PAGE_SIZE - 1)) + 1).min(end);
-        let Some(pmd) = paging::pmd_ptr(pgd, addr) else {
-            addr = ((addr | ((1 << 30) - 1)) + 1).min(end);
-            continue;
-        };
-        // SAFETY: a live 2MB-level entry of the locked mm
-        let pmdval = unsafe { core::ptr::read_volatile(pmd) };
-        if paging::pmd_huge(pmdval) {
-            let _ = split_huge_pmd(owner, addr);
-        }
-        if let Some(p) = paging::pte_ptr(pgd, addr) {
-            let _l = super::ptl::pte_lock(p);
-            for a in (addr..next).step_by(PAGE_SIZE as usize) {
-                let Some(phys) = own_page(pgd, a) else {
-                    continue;
-                };
-                if !pageout {
-                    super::lru::deactivate(phys);
-                } else if super::lru::isolate(phys) {
-                    pages.push(phys);
-                }
-            }
-        }
-        addr = next;
-    }
-    if !pages.is_empty() {
-        super::vmscan::reclaim_pages(pages);
+    let mut w = Cold {
+        mm: owner,
+        pageout,
+        pages: Vec::new(),
+    };
+    let _ = super::pagewalk::walk_pte_range(owner.pgd(), start, end, &mut w);
+    if !w.pages.is_empty() {
+        super::vmscan::reclaim_pages(w.pages);
     }
 }
 
-/// The anonymous page mapped at `addr`, if no other PTE maps it (Linux
+/// `cold_or_pageout`'s walk: the pages to reclaim
+struct Cold<'a> {
+    mm: &'a Mm,
+    pageout: bool,
+    pages: Vec<u64>,
+}
+
+impl super::pagewalk::PteWalk for Cold<'_> {
+    type Err = core::convert::Infallible;
+
+    fn huge(&mut self, _: &AtomicU64, addr: u64, _: u64) -> Result<bool, Self::Err> {
+        let _ = super::huge_page::split_huge_pmd(self.mm, addr);
+        Ok(false)
+    }
+
+    fn pte(&mut self, e: &AtomicU64, _: u64) -> Result<(), Self::Err> {
+        if let Some(phys) = own_page(e) {
+            if !self.pageout {
+                super::lru::deactivate(phys);
+            } else if super::lru::isolate(phys) {
+                self.pages.push(phys);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The anonymous page the entry `e` maps, if no other PTE maps it (Linux
 /// skips shared folios: folio_maybe_mapped_shared), PTE lock held
-fn own_page(pgd: u64, addr: u64) -> Option<u64> {
+fn own_page(e: &AtomicU64) -> Option<u64> {
     use crate::arch::paging;
-    let p = paging::pte_ptr(pgd, addr)?;
-    // SAFETY: a live entry under its PTE lock
-    let pte = unsafe { core::ptr::read_volatile(p) };
+    let pte = e.load(Ordering::Acquire);
     if !paging::pte_present(pte) {
         return None;
     }

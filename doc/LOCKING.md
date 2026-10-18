@@ -915,14 +915,28 @@ pub struct Zone {
   (`ptl::pte_alloc`), a 2MB entry mapped (`do_huge_anon`), split
   (`split_huge_pmd`) or cleared (`take_huge_pmd`). The PTE lock of each
   PTE table page (a word in its struct page, `Page.ptl`; one lockdep
-  class) covers a table's 4KB entries: a fault from reading the entry
-  to its last change (copy-on-write break-before-make included),
-  `zap_range` (each table it clears), a remote write's
-  `unshare_for_write`, and remote copies through a frame
+  class) covers a table's 4KB entries. One rule, whatever mm lock
+  mode: **every software write of a 4KB entry is made under its
+  table's PTE lock** (a fault from reading the entry to its last
+  change, copy-on-write break-before-make included; a remote write's
+  `unshare_for_write`; the reverse map's `try_to_unmap`; swapoff's
+  `unuse_pte`); remote copies through a frame hold it too
   (`remote::with_frame`, so a racing zap cannot free it meanwhile).
-  Holders of the mm lock for writing exclude every other software
-  writer and skip them except in shared code; the MMU still sets
-  accessed/dirty bits, so entries change by compare-and-swap. Tables
+  Range operations go through the one walker, `pagewalk::walk_pte_range`
+  (Linux walk_page_range): it takes each PTE table's lock once for all
+  of the table's entries in the range, and hands 2MB entries to a
+  callback with no PTE lock held (splits take the page_table_lock):
+  zap_range, fork's copy_page_range, mprotect's change_protection,
+  mremap's move_prep / move_ptes, MADV_COLD / MADV_PAGEOUT, swapoff's
+  scan, the RSS count and the mmcheck pass. Under the PTE lock only
+  the MMU still changes an entry (accessed/dirty bits): a
+  compare-and-swap is used only against that, and a writer whose CAS
+  fails retries only while the entry still maps what it expects
+  (`try_to_unmap` gives up when it no longer maps its page). Two PTE
+  locks are nested (same lockdep class) only by fork (parent's table,
+  then the child's) and mremap's `move_ptes` (the old table, then each
+  new one; Linux move_ptes), both with the mmap_lock held for writing,
+  so no other path holds two and the pair cannot invert. Tables
   are freed while the address space is live only with the mm lock held
   for writing (munmap, mremap: `memory::free_pgtables`, Linux
   free_pgtables), after the VMAs of their range left the reverse-map

@@ -11,25 +11,13 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
-use super::{Mm, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE};
+use super::pagewalk::{PteWalk, walk_pte_range};
+use super::{Mm, PROT_EXEC, PROT_READ, PROT_WRITE};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{CurrentArch, SchedArch, paging};
 use crate::error::KernelError;
 
 type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
-
-const GB: u64 = 1 << 30;
-
-/// The page table entry at `p`, as an atomic
-fn entry(p: *mut u64) -> &'static AtomicU64 {
-    // SAFETY: `p` points into a live page table of the locked mm
-    unsafe { AtomicU64::from_ptr(p) }
-}
-
-/// The first address of the next 1GB (no 2MB-level table for `addr`)
-fn next_gb(addr: u64) -> u64 {
-    (addr | (GB - 1)) + 1
-}
 
 /// `prot` grants no access at all
 fn prot_none(prot: u32) -> bool {
@@ -42,49 +30,51 @@ fn prot_none(prot: u32) -> bool {
 /// changes, mm lock held: ENOMEM leaves the mapping as it was (a split
 /// page maps the same memory).
 pub fn split_huge(mm: &Mm, start: u64, end: u64, prot: u32) -> Result<(), KernelError> {
-    let mut addr = start & !(HUGE_PAGE_SIZE - 1);
-    while addr < end {
-        let Some(pmd) = paging::pmd_ptr(mm.pgd(), addr) else {
-            addr = next_gb(addr);
-            continue;
-        };
-        let whole = addr >= start && addr + HUGE_PAGE_SIZE <= end;
-        if paging::pmd_huge(entry(pmd).load(Ordering::Acquire)) && (!whole || prot_none(prot)) {
-            split_huge_pmd(mm, addr).ok_or(KernelError::OutOfMemory)?;
+    struct Split<'a>(&'a Mm, u32);
+    impl PteWalk for Split<'_> {
+        type Err = KernelError;
+        const PTES: bool = false;
+        fn huge(&mut self, _: &AtomicU64, addr: u64, end: u64) -> Result<bool, KernelError> {
+            let base = addr & !(HUGE_PAGE_SIZE - 1);
+            if addr != base || end != base + HUGE_PAGE_SIZE || prot_none(self.1) {
+                split_huge_pmd(self.0, addr).ok_or(KernelError::OutOfMemory)?;
+            }
+            Ok(true)
         }
-        addr += HUGE_PAGE_SIZE;
     }
-    Ok(())
+    walk_pte_range(mm.pgd(), start, end, &mut Split(mm, prot))
 }
 
 /// Give the mapped pages of [start, end), part of one VMA, the
 /// protection `prot` (Linux change_protection), mm lock held, after
 /// `split_huge`: a 2MB page left whole is changed in place, every
-/// mapped 4KB entry rewritten. The caller flushes the TLB of the range.
+/// mapped 4KB entry rewritten under its table's PTE lock. The caller
+/// flushes the TLB of the range.
 pub fn change_protection(pgd: u64, start: u64, end: u64, prot: u32, shared: bool) {
-    let mut addr = start;
-    while addr < end {
-        let Some(pmd) = paging::pmd_ptr(pgd, addr) else {
-            addr = next_gb(addr).min(end);
-            continue;
-        };
-        let next = ((addr | (HUGE_PAGE_SIZE - 1)) + 1).min(end);
-        let pmdval = entry(pmd).load(Ordering::Acquire);
-        if paging::pmd_huge(pmdval) {
+    struct Change {
+        pgd: u64,
+        prot: u32,
+        shared: bool,
+    }
+    impl PteWalk for Change {
+        type Err = core::convert::Infallible;
+        fn huge(&mut self, pmd: &AtomicU64, addr: u64, _: u64) -> Result<bool, Self::Err> {
             // Wholly inside and accessible (`split_huge`); never shared
+            let pmdval = pmd.load(Ordering::Acquire);
             let base = addr & !(HUGE_PAGE_SIZE - 1);
-            let (w, x) = (prot & PROT_WRITE != 0, prot & PROT_EXEC != 0);
+            let (w, x) = (self.prot & PROT_WRITE != 0, self.prot & PROT_EXEC != 0);
             if x && !paging::pte_exec(pmdval) {
                 sync_huge(paging::pte_addr(pmdval) & !(HUGE_PAGE_SIZE - 1));
             }
-            ArchPageTable::update_huge_page_protection(pgd, base, w, x);
-        } else if pmdval != 0 {
-            for a in (addr..next).step_by(PAGE_SIZE as usize) {
-                change_pte(pgd, a, prot, shared);
-            }
+            ArchPageTable::update_huge_page_protection(self.pgd, base, w, x);
+            Ok(true)
         }
-        addr = next;
+        fn pte(&mut self, e: &AtomicU64, _: u64) -> Result<(), Self::Err> {
+            change_pte(e, self.prot, self.shared);
+            Ok(())
+        }
     }
+    let _ = walk_pte_range(pgd, start, end, &mut Change { pgd, prot, shared });
 }
 
 /// A 2MB page at `phys` becomes executable: instruction caches see its
@@ -94,15 +84,12 @@ pub(super) fn sync_huge(phys: u64) {
     paging::sync_icache(phys, HUGE_PAGE_SIZE as usize);
 }
 
-/// Rewrite the entry of the page at `addr` for `prot` if it maps one. A
+/// Rewrite the entry `pte` for `prot` if it maps a page, its PTE lock
+/// held. A
 /// private page becomes writable only if no one else maps it (Linux
 /// can_change_pte_writable); one still shared is copied at its write
 /// fault.
-fn change_pte(pgd: u64, addr: u64, prot: u32, shared: bool) {
-    let Some(p) = paging::pte_ptr(pgd, addr) else {
-        return;
-    };
-    let pte = entry(p);
+fn change_pte(pte: &AtomicU64, prot: u32, shared: bool) {
     let old = pte.load(Ordering::Acquire);
     if !paging::pte_present(old) {
         return; // none, or a swap entry: the fault uses the VMA's prot
@@ -111,9 +98,6 @@ fn change_pte(pgd: u64, addr: u64, prot: u32, shared: bool) {
         // Becomes executable: instruction caches see its data
         paging::sync_page(paging::pte_addr(old), true);
     }
-    // Every other writer holds the mm lock: only a hardware
-    // accessed/dirty update races, and each sets its bit once, so the
-    // update ends after a few attempts
     let write = shared || FRAME_ALLOCATOR.refcount(paging::pte_addr(old)) <= 1;
     // Write implies read (x86, arm64): a page left read-only keeps it
     let prot = if write || prot & PROT_WRITE == 0 {
@@ -121,15 +105,15 @@ fn change_pte(pgd: u64, addr: u64, prot: u32, shared: bool) {
     } else {
         (prot & !PROT_WRITE) | PROT_READ
     };
+    // Under the PTE lock only the MMU changes the entry (accessed /
+    // dirty bits, each set once): the update ends after a few attempts
     let mut cur = old;
-    loop {
-        if !paging::pte_present(cur) {
-            return;
-        }
-        let new = paging::pte_modify(cur, prot);
-        match pte.compare_exchange(cur, new, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return,
-            Err(now) => cur = now,
-        }
+    while let Err(now) = pte.compare_exchange(
+        cur,
+        paging::pte_modify(cur, prot),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        cur = now;
     }
 }

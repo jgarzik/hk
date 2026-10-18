@@ -10,7 +10,7 @@
 //! kernel (arm64 PXN). A violation prints `MMCHECK:FAIL`
 //! (once per boot), which fails `make check`.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::{MmStruct, PROT_EXEC, PROT_READ, PROT_WRITE};
 use crate::arch::paging;
@@ -58,18 +58,48 @@ pub fn verify(map: &MmStruct, pgd: u64, op: &str) {
         prev_end = v.end;
     }
     // Leaves come in address order: one pass over the VMAs
-    let mut vmas = map.iter().peekable();
-    paging::walk_user(pgd, &mut |va, entry, _huge| {
-        while vmas.peek().is_some_and(|v| v.end <= va) {
-            vmas.next();
+    let mut c = Leaves {
+        vmas: map.iter().peekable(),
+        op,
+    };
+    let _ = super::pagewalk::walk_pte_range(pgd, 0, super::TASK_SIZE, &mut c);
+}
+
+/// `verify`'s walk over every user leaf that maps a page
+struct Leaves<'a, I: Iterator<Item = &'a super::Vma>> {
+    vmas: core::iter::Peekable<I>,
+    op: &'a str,
+}
+
+impl<'a, I: Iterator<Item = &'a super::Vma>> Leaves<'a, I> {
+    fn leaf(&mut self, va: u64, entry: u64) {
+        while self.vmas.peek().is_some_and(|v| v.end <= va) {
+            self.vmas.next();
         }
-        match vmas.peek() {
+        match self.vmas.peek() {
             Some(v) if v.start <= va => {
                 if let Some(what) = excess(entry, v.prot) {
-                    fail(op, what, va, entry);
+                    fail(self.op, what, va, entry);
                 }
             }
-            _ => fail(op, "page mapped outside every VMA", va, entry),
+            _ => fail(self.op, "page mapped outside every VMA", va, entry),
         }
-    });
+    }
+}
+
+impl<'a, I: Iterator<Item = &'a super::Vma>> super::pagewalk::PteWalk for Leaves<'a, I> {
+    type Err = core::convert::Infallible;
+
+    fn huge(&mut self, pmd: &AtomicU64, addr: u64, _: u64) -> Result<bool, Self::Err> {
+        self.leaf(addr, pmd.load(Ordering::Acquire));
+        Ok(true)
+    }
+
+    fn pte(&mut self, e: &AtomicU64, addr: u64) -> Result<(), Self::Err> {
+        let entry = e.load(Ordering::Acquire);
+        if paging::pte_present(entry) {
+            self.leaf(addr, entry);
+        }
+        Ok(())
+    }
 }

@@ -357,36 +357,6 @@ impl UserTables {
     }
 }
 
-/// Each user leaf under `pml4_phys` that maps a page, in address order:
-/// `f(va, entry, huge)` for a 4KB entry (protnone included) or a 2MB
-/// page (debug check, `mm::check`; mm lock held)
-#[cfg(feature = "mmcheck")]
-pub fn walk_user(pml4_phys: u64, f: &mut dyn FnMut(u64, u64, bool)) {
-    walk_level(pml4_phys, 4, 0, f);
-}
-
-/// Walk the table at `phys` (`level` 4 = PML4 .. 1 = PT) mapping from `base`
-#[cfg(feature = "mmcheck")]
-fn walk_level(phys: u64, level: u32, base: u64, f: &mut dyn FnMut(u64, u64, bool)) {
-    let table = phys_to_virt_table_const(phys);
-    let n = if level == 4 {
-        KERNEL_PML4_START
-    } else {
-        ENTRIES_PER_TABLE
-    };
-    for i in 0..n {
-        // SAFETY: a live table of the locked mm
-        let e = unsafe { *(*table).entry(i) };
-        let va = base + ((i as u64) << (12 + 9 * (level - 1)));
-        match level {
-            1 if pte_present(e.0) => f(va, e.0, false),
-            2 if e.is_present() && e.is_huge() => f(va, e.0, true),
-            2..=4 if e.is_present() && !e.is_huge() => walk_level(e.addr(), level - 1, va, f),
-            _ => {}
-        }
-    }
-}
-
 /// Release the table at `phys` and everything below it; `level` 3 is a
 /// PDPT, 2 a PD, 1 a PT
 fn free_level(phys: u64, level: u32, put: &mut dyn FnMut(Leaf)) {
