@@ -132,6 +132,13 @@ pub(crate) fn alloc_user() -> Option<u64> {
     FRAME_ALLOCATOR.alloc_gfp(Gfp::HIGHUSER_MOVABLE)
 }
 
+/// A frame for user data, reclaiming (swapping pages out) below the low
+/// watermark down to min: only with no spinlock held (a fault holding
+/// the mmap_lock for reading)
+pub(crate) fn alloc_user_reclaim() -> Option<u64> {
+    FRAME_ALLOCATOR.alloc_gfp(Gfp::HIGHUSER_RECLAIM)
+}
+
 /// Install `new` in the leaf entry at `ptep` if it still holds `old`
 fn set_pte(ptep: *mut u64, old: u64, new: u64) -> bool {
     // SAFETY: `ptep` points into a live page table of the faulting mm
@@ -253,15 +260,23 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
     r
 }
 
-/// The leaf entry for `addr`, allocating missing tables
+/// The leaf entry for `addr`, allocating missing tables; out of memory,
+/// pages are reclaimed (with no spinlock held: the tables are allocated
+/// under the page_table_lock) and the allocation tried again while that
+/// frees some
 fn leaf(mm: &Mm, addr: u64) -> Result<*mut u64, VmFault> {
-    super::ptl::pte_alloc(mm, addr).ok_or_else(|| {
-        // A huge page mapped there: the access is retried
-        match paging::pmd_ptr(mm.pgd(), addr).map(get_pte) {
-            Some(pmd) if paging::pmd_huge(pmd) => VmFault::Retry,
-            _ => VmFault::Oom,
+    loop {
+        if let Some(p) = super::ptl::pte_alloc(mm, addr) {
+            return Ok(p);
         }
-    })
+        // A huge page mapped there: the access is retried
+        if paging::pmd_ptr(mm.pgd(), addr).is_some_and(|p| paging::pmd_huge(get_pte(p))) {
+            return Err(VmFault::Retry);
+        }
+        if super::vmscan::try_to_free_pages(super::vmscan::SWAP_CLUSTER_MAX) == 0 {
+            return Err(VmFault::Oom);
+        }
+    }
 }
 
 /// A fault in a 2MB region: None to continue at the 4KB level
@@ -344,7 +359,7 @@ fn fault_page(addr: u64, area: &Area) -> Result<u64, VmFault> {
     {
         return r;
     }
-    let frame = alloc_user().ok_or(VmFault::Oom)?;
+    let frame = alloc_user_reclaim().ok_or(VmFault::Oom)?;
     // SAFETY: a fresh frame, reached through the direct map
     let buf = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(frame), PAGE_SIZE as usize) };
     buf.fill(0);
@@ -453,11 +468,12 @@ fn map_swap_page(
         return Ok(());
     }
     super::swap::swap_free(SwapEntry::from_pte(pte));
-    // Exclusive: no other swap PTE, and no reference but ours once the
-    // cache lets go (Linux do_swap_page exclusive + folio_free_swap)
-    let exclusive = access == Access::Write
-        && super::swap_state::try_free_swap(page)
-        && FRAME_ALLOCATOR.refcount(page) == 1;
+    // The cache lets the page go on a write, or when swap runs short
+    // (Linux should_try_to_free_swap: vm_swap_full), if no other swap
+    // PTE needs the slot; exclusive: then no reference but ours
+    let write = access == Access::Write;
+    let freed = (write || super::swap::swap_full()) && super::swap_state::try_free_swap(page);
+    let exclusive = write && freed && FRAME_ALLOCATOR.refcount(page) == 1;
     let mut entry = paging::mk_pte(page, area.prot);
     if !exclusive && !area.shared {
         entry = paging::pte_mkcow(entry);
@@ -491,6 +507,32 @@ pub fn unuse_pte(mm: &Mm, vma: &super::Vma, addr: u64) -> Result<(), VmFault> {
 /// is made writable in place; a private page still shared (fork's
 /// copy-on-write) is copied first
 fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Result<(), VmFault> {
+    let mut spare = None;
+    loop {
+        match wp_locked(mm, ptep, pte, addr, area, &mut spare) {
+            // Out of memory under the PTE lock: reclaim without it
+            // (Linux wp_page_copy allocates before taking it)
+            Err(VmFault::Retry) => spare = Some(alloc_user_reclaim().ok_or(VmFault::Oom)?),
+            r => {
+                if let Some(p) = spare {
+                    FRAME_ALLOCATOR.free(p);
+                }
+                return r;
+            }
+        }
+    }
+}
+
+/// `do_wp_page` under the PTE lock; the copy's page comes from `spare`
+/// if there is one, else `Retry` asks for one when none is free at once
+fn wp_locked(
+    mm: &Mm,
+    ptep: *mut u64,
+    pte: u64,
+    addr: u64,
+    area: &Area,
+    spare: &mut Option<u64>,
+) -> Result<(), VmFault> {
     let _l = pte_lock(ptep);
     if get_pte(ptep) != pte {
         return Ok(()); // changed meanwhile: the access is retried
@@ -506,7 +548,7 @@ fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Resu
         }
         return Ok(());
     }
-    let new = alloc_user().ok_or(VmFault::Oom)?;
+    let new = spare.take().or_else(alloc_user).ok_or(VmFault::Retry)?;
     // SAFETY: both frames are reached through the direct map; `old`
     // stays mapped (and referenced) until the PTE is switched
     unsafe {

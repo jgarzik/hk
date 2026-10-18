@@ -66,7 +66,11 @@ Address spaces are reference counted and torn down like Linux
   off the LRU (never reclaimed whole; a split puts their 4KB pages on
   it). Pages exec copies the image into are not on the reverse map
   (never swapped). Swap files go through the inode's readpage /
-  writepage, a page at a time.
+  writepage, a page at a time. Only page faults (and swapoff) reclaim:
+  heap, pipe-buffer and page-cache allocations never do (they run
+  under spinlocks or cannot sleep), so with anonymous memory filling
+  RAM they fail at the low watermark until kswapd (P6) keeps free
+  memory above it.
 - SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
   IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
   by id still work there).
@@ -341,8 +345,9 @@ merging, poisoning or red zones.
 
 Heap allocations cannot fail gracefully (Rust's global allocator): one
 the page allocator cannot meet panics. The heap goes down to the min
-watermark while user data stops at low, so only kernel objects can get
-there (no memcg or OOM killer bounds what a process pins in pipes,
+watermark while user data stops at low (also after direct reclaim:
+user allocations stop at low until the OOM killer (P6); then Linux's
+min), so only kernel objects can get there (no memcg or OOM killer bounds what a process pins in pipes,
 sockets or fds); a large contiguous kmalloc can fail first (over 4MB
 always, no vmalloc; above low - min, about 700KB at 512MB, once free
 memory is near the low watermark).

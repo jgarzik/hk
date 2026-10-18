@@ -66,6 +66,11 @@ impl Gfp {
     pub const MOVABLE: Gfp = Gfp(1 << 5);
     /// Failure is expected; do not report it
     pub const NOWARN: Gfp = Gfp(1 << 6);
+    /// The caller holds no spinlock and may sleep in direct reclaim
+    /// (Linux __GFP_DIRECT_RECLAIM in its own sense: hk's
+    /// `Gfp::RECLAIM` only means thread context, since kernel heap
+    /// allocations happen under spinlocks)
+    pub const DIRECT: Gfp = Gfp(1 << 7);
 
     /// Kernel allocation from thread context
     pub const KERNEL: Gfp = Gfp::RECLAIM;
@@ -77,6 +82,9 @@ impl Gfp {
     pub const USER: Gfp = Gfp(Gfp::KERNEL.0 | Gfp::HARDWALL.0);
     /// User page data (anonymous memory, page cache)
     pub const HIGHUSER_MOVABLE: Gfp = Gfp(Gfp::USER.0 | Gfp::MOVABLE.0);
+    /// User page data for a caller that may reclaim (a page fault with
+    /// only the mmap_lock held)
+    pub const HIGHUSER_RECLAIM: Gfp = Gfp(Gfp::HIGHUSER_MOVABLE.0 | Gfp::DIRECT.0);
     /// An opportunistic huge page for user data (Linux
     /// GFP_TRANSHUGE_LIGHT): never drains or reclaims, the fault falls
     /// back to 4KB pages
@@ -117,8 +125,10 @@ pub fn min_free_kbytes(managed: usize) -> usize {
 
 /// The watermark an allocation must leave free, in pages (Linux
 /// gfp_to_alloc_flags + __zone_watermark_ok): user data stops at the low
-/// watermark (hk has no reclaim yet: the kernel keeps low - min for its
-/// own allocations), kernel allocations at min, __GFP_HIGH ones at half
+/// watermark, reclaim or not: until the OOM killer (P6) user data
+/// stops at low (then Linux's min), leaving low - min to the kernel,
+/// whose heap cannot fail gracefully. Kernel allocations stop at min,
+/// __GFP_HIGH ones at half
 /// of it, atomic (non-sleeping, __GFP_HIGH) ones a quarter lower still
 fn alloc_mark(wmark: &[AtomicUsize; 3], gfp: Gfp) -> usize {
     if gfp.user() {
@@ -161,6 +171,20 @@ impl Pcp {
 std::thread_local! {
     /// The CPU a host test thread plays
     pub static TEST_CPU: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Rounds of direct reclaim before an allocation fails (Linux
+/// MAX_RECLAIM_RETRIES)
+const MAX_RECLAIM_RETRIES: usize = 16;
+
+/// One pass of direct reclaim (none in host tests): pages freed
+fn direct_reclaim() -> usize {
+    #[cfg(not(test))]
+    {
+        crate::mm::vmscan::try_to_free_pages(crate::mm::vmscan::SWAP_CLUSTER_MAX)
+    }
+    #[cfg(test)]
+    0
 }
 
 /// In an interrupt handler: allocations there never drain or reclaim,
@@ -505,10 +529,27 @@ impl Zone {
         if !gfp.has(Gfp::RECLAIM) || in_interrupt() {
             return None;
         }
-        // A drain already running elsewhere is making progress: retry
-        // once either way
-        self.drain_all();
-        self.try_alloc(order, gfp)
+        if !gfp.has(Gfp::DIRECT) {
+            // A drain already running elsewhere is making progress:
+            // retry once either way
+            self.drain_all();
+            return self.try_alloc(order, gfp);
+        }
+        // Linux order: reclaim, drain, retry; again only while a pass
+        // frees at least the allocation's size (should_reclaim_retry),
+        // at most MAX_RECLAIM_RETRIES times. User data stays above low
+        // (`alloc_mark`): no OOM killer before P6
+        for _ in 0..MAX_RECLAIM_RETRIES {
+            let freed = direct_reclaim();
+            self.drain_all();
+            if let Some(p) = self.try_alloc(order, gfp) {
+                return Some(p);
+            }
+            if freed < 1 << order {
+                break;
+            }
+        }
+        None
     }
 
     /// One allocation attempt from the per-CPU and buddy lists (Linux
@@ -1031,6 +1072,19 @@ mod tests {
         got.into_iter().for_each(|p| t.z.free_pages(p, 0));
         t.z.drain_all();
         assert!(t.z.alloc_pages(5, Gfp::KERNEL).is_some());
+    }
+
+    /// User data stops at low, reclaiming or not; the kernel at min
+    #[test]
+    fn user_marks() {
+        let w = [
+            AtomicUsize::new(10),
+            AtomicUsize::new(20),
+            AtomicUsize::new(30),
+        ];
+        assert_eq!(alloc_mark(&w, Gfp::HIGHUSER_MOVABLE), 20);
+        assert_eq!(alloc_mark(&w, Gfp::HIGHUSER_RECLAIM), 20);
+        assert_eq!(alloc_mark(&w, Gfp::KERNEL), 10);
     }
 
     /// A drain that finds one running returns at once (never waits)

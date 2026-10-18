@@ -503,6 +503,13 @@ fn swapoff(path_ptr: u64) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// Over half of swap is in use (Linux vm_swap_full): a page read back
+/// gives its slot up at once rather than keep a clean copy
+pub fn swap_full() -> bool {
+    let (total, free) = swap_totals();
+    free * 2 < total
+}
+
 /// Swap totals in pages: (total, free) (meminfo, sysinfo)
 pub fn swap_totals() -> (u64, u64) {
     let total = TOTAL_SWAP_PAGES.load(Ordering::Relaxed);

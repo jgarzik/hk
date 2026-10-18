@@ -192,7 +192,7 @@ pub fn read_swap_page(e: SwapEntry) -> Result<u64, VmFault> {
 /// Read `e`, whose slot this task claimed (SWAP_HAS_CACHE), into a new
 /// locked swap-cache page
 fn read_new(e: SwapEntry) -> Result<u64, VmFault> {
-    let Some(phys) = super::fault::alloc_user() else {
+    let Some(phys) = super::fault::alloc_user_reclaim() else {
         swapcache_clear(e);
         return Err(VmFault::Oom);
     };

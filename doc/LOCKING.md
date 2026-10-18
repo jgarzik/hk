@@ -1180,7 +1180,16 @@ layout in `doc/MEMORY.md`
   the page allocator. Heap pages are GFP_KERNEL (to the min watermark)
   in thread context, GFP_ATOMIC only in interrupt context; user data
   stops at low, leaving low - min to kernel objects (a failed heap
-  allocation is fatal in Rust).
+  allocation is fatal in Rust): user allocations stop at low until the
+  OOM killer (P6), even after reclaim; then Linux's min.
+- Direct reclaim (`Gfp::DIRECT`, Linux __GFP_DIRECT_RECLAIM) runs only
+  for callers that hold no spinlock: user page faults (mmap_lock held
+  for reading) and swapoff. hk's `Gfp::RECLAIM` (GFP_KERNEL) means only
+  thread context, since the heap allocates under spin locks; such
+  allocations drain the per-CPU lists but never reclaim. A fault whose
+  page table cannot be allocated (under the page_table_lock) reclaims
+  after dropping it and retries. Reclaim allocates only without
+  `DIRECT`, so it never recurses.
 
 #### Page Cache
 

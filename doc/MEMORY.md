@@ -149,8 +149,14 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   page tables stop at the zone's low watermark (vm.min_free_kbytes,
   Linux's formula, `mm/page_alloc.rs`); kernel allocations, the heap
   included, go on to min; `__GFP_HIGH` ones to half of it, atomic ones
-  (the heap in interrupt context) a quarter lower (Linux would reclaim
-  between low and min; hk has no reclaim yet). mlock that cannot fault its range in fails with EAGAIN. A user fault that finds no memory kills its process
+  (the heap in interrupt context) a quarter lower. A fault that finds
+  free memory at low reclaims (direct reclaim: swaps the oldest
+  anonymous pages out, `mm/vmscan.rs`), with no spinlock held, then
+  drains the per-CPU lists and retries while reclaim frees pages. User
+  allocations stop at low until the OOM killer (P6); then Linux's min.
+  A page read
+  back from swap keeps its slot as a clean copy, unless swap is over
+  half full (Linux vm_swap_full). mlock that cannot fault its range in fails with EAGAIN. A user fault that finds no memory kills its process
   with SIGKILL, logged as `Out of memory: Killed process <pid> (<comm>)`
   (Linux pagefault_out_of_memory; hk has no OOM killer choosing another
   victim, and never retries the fault in a loop); a kernel uaccess that
