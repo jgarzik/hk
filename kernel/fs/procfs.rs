@@ -1009,7 +1009,10 @@ fn dump_owner(pid: Pid) -> (u32, u32) {
         .tasks
         .iter()
         .find(|t| t.tgid == pid)
-        .filter(|t| t.prctl.dumpable == crate::task::dumpable::SUID_DUMP_USER)
+        .filter(|t| {
+            t.mm.as_ref()
+                .is_none_or(|m| m.dumpable() == crate::task::dumpable::SUID_DUMP_USER)
+        })
         .map_or((0, 0), |t| (t.cred.euid, t.cred.egid))
 }
 

@@ -909,9 +909,9 @@ pub fn may_access(pick: impl Fn(&percpu::KernelTask) -> bool, fscreds: bool) -> 
             .tasks
             .iter()
             .find(|t| pick(t))
-            .map(|t| (*t.cred, t.prctl.dumpable, t.mm.is_some()))
+            .map(|t| (*t.cred, t.mm.as_ref().map(|m| m.dumpable())))
     };
-    let Some((c, dumpable, has_mm)) = target else {
+    let Some((c, dumpable)) = target else {
         return false;
     };
     let cap = capable(CAP_SYS_PTRACE);
@@ -924,5 +924,5 @@ pub fn may_access(pick: impl Fn(&percpu::KernelTask) -> bool, fscreds: bool) -> 
     if !ids && !cap {
         return false;
     }
-    !has_mm || dumpable == SUID_DUMP_USER || cap
+    dumpable.is_none_or(|d| d == SUID_DUMP_USER) || cap
 }

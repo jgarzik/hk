@@ -608,8 +608,6 @@ pub mod dumpable {
 pub struct PrctlState {
     /// Thread/process name (PR_SET_NAME) - 16 bytes max, null-terminated
     pub name: [u8; 16],
-    /// Dumpable flag (PR_SET_DUMPABLE) - controls core dump generation
-    pub dumpable: u8,
     /// No-new-privileges flag (PR_SET_NO_NEW_PRIVS) - irreversible once set
     pub no_new_privs: bool,
     /// Timer slack in nanoseconds (PR_SET_TIMERSLACK)
@@ -633,7 +631,6 @@ impl Default for PrctlState {
     fn default() -> Self {
         Self {
             name: [0u8; 16],
-            dumpable: dumpable::SUID_DUMP_USER,
             no_new_privs: false,
             timer_slack_ns: 50_000, // 50 microseconds default
             keep_caps: false,

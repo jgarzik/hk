@@ -28,13 +28,7 @@ const C: &[u8] = b"/tmp/rn2/c\0";
 
 pub fn run_tests() {
     sys_mkdir(DIR.as_ptr(), 0o755);
-    let r = sys_mount(
-        b"none\0".as_ptr(),
-        DIR.as_ptr(),
-        b"ramfs\0".as_ptr(),
-        0,
-        0,
-    );
+    let r = sys_mount(b"none\0".as_ptr(), DIR.as_ptr(), b"ramfs\0".as_ptr(), 0, 0);
     if r != 0 {
         verdict(b"RENAME2_MOUNT", false, r);
         return;
@@ -86,7 +80,12 @@ fn ino(p: &[u8]) -> i64 {
 /// Unknown flags and EXCHANGE with NOREPLACE or WHITEOUT are EINVAL,
 /// even with a bad path pointer
 fn bad_flags() {
-    let cases = [1u32 << 3, 1 << 31, NOREPLACE | EXCHANGE, WHITEOUT | EXCHANGE];
+    let cases = [
+        1u32 << 3,
+        1 << 31,
+        NOREPLACE | EXCHANGE,
+        WHITEOUT | EXCHANGE,
+    ];
     let mut bad = 0;
     for (i, &f) in cases.iter().enumerate() {
         if rn(A, B, f) != EINVAL {
@@ -142,10 +141,15 @@ fn trap() {
     }
     let before = T.map(ino);
     let (a, c) = (T[1], T[3]);
-    let r = [rn(c, a, EXCHANGE), rn(a, c, EXCHANGE), rn(c, a, 0), rn(a, c, 0)];
+    let r = [
+        rn(c, a, EXCHANGE),
+        rn(a, c, EXCHANGE),
+        rn(c, a, 0),
+        rn(a, c, 0),
+    ];
     let want = [EINVAL, EINVAL, ENOTEMPTY, EINVAL];
-    let parent_ok = ino(b"/tmp/rn2/t/a/b/c/..\0") == before[2]
-        && ino(b"/tmp/rn2/t/a/b/..\0") == before[1];
+    let parent_ok =
+        ino(b"/tmp/rn2/t/a/b/c/..\0") == before[2] && ino(b"/tmp/rn2/t/a/b/..\0") == before[1];
     let intact = T.map(ino) == before && parent_ok;
     let bad = (0..4).find(|&i| r[i] != want[i]);
     let got = bad.map_or(if intact { 0 } else { 99 }, |i| r[i] * 10 - i as i64);

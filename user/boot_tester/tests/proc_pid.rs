@@ -217,7 +217,11 @@ fn spawn_sleeper(uid: Option<u32>) -> i64 {
             b"X=1\0".as_ptr(),
             core::ptr::null(),
         ];
-        sys_execve(b"/bin/boot_tester2\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        sys_execve(
+            b"/bin/boot_tester2\0".as_ptr(),
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
         sys_exit(99);
     }
     let mut b = [0u8; 1];
@@ -282,5 +286,9 @@ fn environ_perm() {
     let cmd = as_uid(UID + 1, b"cmdline\0");
     reap(pid);
     let ok = same == 0 && other == 1 && cmd == 0;
-    verdict(b"PROC_PID_ENVIRON_PERM", ok, (same * 100 + other * 10 + cmd) as i64);
+    verdict(
+        b"PROC_PID_ENVIRON_PERM",
+        ok,
+        (same * 100 + other * 10 + cmd) as i64,
+    );
 }

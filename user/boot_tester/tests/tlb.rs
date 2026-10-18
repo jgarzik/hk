@@ -308,7 +308,11 @@ fn dc_zva() -> i64 {
     }
     unsafe { core::arch::asm!("dc zva, {}", in(reg) a, options(nostack)) };
     let zeroed = (0..bs).step_by(8).all(|off| get(a + off) == 0);
-    if zeroed && get(a + bs) == u64::MAX { 0 } else { 1 }
+    if zeroed && get(a + bs) == u64::MAX {
+        0
+    } else {
+        1
+    }
 }
 
 /// Code written at the start, middle and end of a 2MB-aligned region

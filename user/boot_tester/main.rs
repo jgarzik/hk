@@ -16,7 +16,8 @@ use hk_syscall::{
     sys_getpid, sys_reboot,
 };
 use tests::helpers::{
-    dev_setup, fail_count, host_mode, host_setup, init_host_mode, loopback_up, print, print_num, println,
+    dev_setup, fail_count, host_mode, host_setup, init_host_mode, loopback_up, print, print_num,
+    println,
 };
 
 /// Process entry: the kernel enters with a 16-byte aligned sp and no return

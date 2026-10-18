@@ -607,7 +607,12 @@ taken, except `cred_guard` around `exec_update`):
   access) hold it for reading (`signal::ExecUpdateRead`) around the
   access decision and taking the mm.
 
-So no check sees the old dumpability with the new mm or the reverse (a
+Dumpability is an atomic in the `Mm` (Linux mm->flags MMF_DUMPABLE),
+shared by every task of the address space: read lock-free (under
+TASK_TABLE where the task's mm is looked up), written by
+PR_SET_DUMPABLE, a credential change (`commit_creds`) and exec (on
+the new mm before it is installed). So no check sees the old
+dumpability with the new mm or the reverse (a
 non-dumpable process that execs a readable binary is not attachable or
 readable while its old memory is still mapped). As in Linux the split
 lets exec walk paths while holding `cred_guard`: /proc/<pid>/exe

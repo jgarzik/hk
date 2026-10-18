@@ -60,7 +60,13 @@ fn einval() {
     let b = sys_close_range(0, 10, 1 << 3);
     let c = sys_close_range(11, 10, 0);
     let ok = a == EINVAL && b == EINVAL && c == EINVAL;
-    let got = if a != EINVAL { a } else if b != EINVAL { b } else { c };
+    let got = if a != EINVAL {
+        a
+    } else if b != EINVAL {
+        b
+    } else {
+        c
+    };
     verdict(b"CLOSE_RANGE_EINVAL", ok, got);
 }
 

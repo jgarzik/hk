@@ -6,8 +6,7 @@
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     IoVec, sys_close, sys_exit, sys_fork, sys_kill, sys_pause, sys_pipe2, sys_prctl,
-    sys_process_vm_readv, sys_ptrace, sys_read, sys_setresgid, sys_setresuid, sys_wait4,
-    sys_write,
+    sys_process_vm_readv, sys_ptrace, sys_read, sys_setresgid, sys_setresuid, sys_wait4, sys_write,
 };
 
 const PTRACE_ATTACH: i64 = 16;

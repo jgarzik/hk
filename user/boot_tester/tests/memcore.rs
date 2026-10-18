@@ -65,7 +65,14 @@ fn mem_total() {
 /// Child: touch TOUCH bytes; exit 0 if MemFree dropped by at least 90%
 /// of it meanwhile
 fn toucher(before: i64) -> u64 {
-    let p = sys_mmap(0, TOUCH, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let p = sys_mmap(
+        0,
+        TOUCH,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     if p < 0 {
         return 2;
     }
@@ -111,7 +118,11 @@ fn touch_free() {
         print_num(after);
         println(b" kB");
     }
-    report(b"MEM_TOUCH_FREE", st == 0 && before - after <= slack, st as i64);
+    report(
+        b"MEM_TOUCH_FREE",
+        st == 0 && before - after <= slack,
+        st as i64,
+    );
 }
 
 /// TIME_WAIT lines (state 06) of /proc/net/tcp

@@ -7,7 +7,7 @@ extern crate alloc;
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crate::error::KernelError;
 use crate::sync::spin::Mutex;
@@ -653,6 +653,9 @@ pub struct Mm {
     map: RwSem<MmStruct>,
     /// Page-table structure changes (Linux mm->page_table_lock, `ptl`)
     page_table_lock: Mutex<()>,
+    /// Dumpability (Linux mm->flags MMF_DUMPABLE: `task::dumpable`),
+    /// shared by every task of the address space
+    dumpable: AtomicU8,
     /// TLB state: where it is loaded, flush generation, ASID
     ctx: tlb::MmContext,
 }
@@ -695,6 +698,17 @@ impl Mm {
         &self.page_table_lock
     }
 
+    /// Dumpability (Linux get_dumpable): SUID_DUMP_*
+    pub fn dumpable(&self) -> u8 {
+        self.dumpable.load(Ordering::Relaxed)
+    }
+
+    /// Set the dumpability (Linux set_dumpable): PR_SET_DUMPABLE, exec,
+    /// a credential change; seen by every task of the address space
+    pub fn set_dumpable(&self, v: u8) {
+        self.dumpable.store(v, Ordering::Relaxed);
+    }
+
     /// TLB state (Linux mm->context)
     pub fn context(&self) -> &tlb::MmContext {
         &self.ctx
@@ -725,6 +739,7 @@ impl MmRef {
             pgd,
             map: RwSem::new(map),
             page_table_lock: Mutex::new(()),
+            dumpable: AtomicU8::new(crate::task::dumpable::SUID_DUMP_USER),
             ctx: tlb::MmContext::new(),
         }))
     }
@@ -737,6 +752,7 @@ impl MmRef {
             pgd,
             map: RwSem::new(build(me)),
             page_table_lock: Mutex::new(()),
+            dumpable: AtomicU8::new(crate::task::dumpable::SUID_DUMP_USER),
             ctx: tlb::MmContext::new(),
         }))
     }
@@ -878,6 +894,9 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
         map
     });
     drop(guard);
+    // A fork child's address space holds the same secrets (Linux
+    // dup_mmap copies mm->flags)
+    child.set_dumpable(parent.dumpable());
     // On error `child` goes with its partial copy (outside the lock)
     res.map(|_| child)
 }

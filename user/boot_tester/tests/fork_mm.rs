@@ -1117,7 +1117,7 @@ extern "C" fn writer(idx: u64) -> ! {
 
 /// Start a thread running `f(arg)` on `stack_top`; its tid word `ctid`
 /// is cleared (and woken) when it exits. The tid, or -errno.
-unsafe fn spawn_thread(
+pub(super) unsafe fn spawn_thread(
     stack_top: u64,
     f: extern "C" fn(u64) -> !,
     arg: u64,
@@ -1169,7 +1169,7 @@ unsafe fn spawn_thread(
 }
 
 /// Wait (bounded) for the thread whose tid word is `ctid` to exit
-fn join(ctid: *mut u32) -> bool {
+pub(super) fn join(ctid: *mut u32) -> bool {
     for _ in 0..2_000_000u32 {
         if unsafe { core::ptr::read_volatile(ctid) } == 0 {
             return true;

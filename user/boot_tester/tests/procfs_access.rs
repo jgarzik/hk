@@ -19,6 +19,7 @@ pub fn run_tests() {
     test_root_reads_all();
     in_child(b"PROC_ACCESS_OTHER_UID_DENIED", other_uid_denied);
     test_nondumpable();
+    test_thread_nondumpable();
     test_suid_differs();
     test_maps_after_exec();
 }
@@ -173,6 +174,85 @@ fn test_nondumpable() {
     sys_close(p[0] as u64);
     sys_close(p[1] as u64);
     report(b"PROC_ACCESS_NONDUMPABLE", st == 0, (st >> 8) as i64);
+}
+
+#[repr(C, align(16))]
+struct Stack([u8; 16384]);
+static mut STACK: Stack = Stack([0; 16384]);
+static mut CTID: u32 = 0;
+/// Write end of the thread's "done" pipe
+static mut DONE_FD: u64 = 0;
+
+/// The non-leader thread: the process becomes non-dumpable
+extern "C" fn undump(_: u64) -> ! {
+    sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+    sys_write(unsafe { DONE_FD }, b"2".as_ptr(), 1);
+    sys_exit(0)
+}
+
+/// Whether a uid-NOBODY child can open /proc/<pid>/environ (0: yes,
+/// 1: EACCES, 2: another result)
+fn environ_check(pid: i64) -> i32 {
+    let b = sys_fork();
+    if b == 0 {
+        sys_setuid(NOBODY as u32);
+        let mut buf = [0u8; 64];
+        let r = open_ret(path(&mut buf, pid, b"environ"), O_RDONLY);
+        sys_exit(match r {
+            r if r >= 0 => 0,
+            EACCES => 1,
+            _ => 2,
+        });
+    }
+    let mut st = 0i32;
+    sys_wait4(b, &mut st, 0, 0);
+    (st >> 8) & 0xff
+}
+
+/// Dumpability belongs to the address space (Linux mm->flags): a
+/// non-leader thread's PR_SET_DUMPABLE 0 closes the process's environ
+/// to its own uid, which could open it before
+fn test_thread_nondumpable() {
+    let mut p = [0i32; 2];
+    let mut q = [0i32; 2];
+    sys_pipe2(p.as_mut_ptr(), 0);
+    sys_pipe2(q.as_mut_ptr(), 0);
+    let a = sys_fork();
+    if a == 0 {
+        sys_setuid(NOBODY as u32);
+        sys_prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+        sys_write(p[1] as u64, b"1".as_ptr(), 1);
+        let mut c = [0u8; 1];
+        sys_read(q[0] as u64, c.as_mut_ptr(), 1);
+        unsafe {
+            DONE_FD = p[1] as u64;
+            let top = (&raw mut STACK as *mut u8).add(16384) as u64;
+            CTID = 1;
+            super::fork_mm::spawn_thread(top, undump, 0, &raw mut CTID);
+        }
+        let ts = Timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        sys_nanosleep(&ts, core::ptr::null_mut());
+        sys_exit(0);
+    }
+    let mut c = [0u8; 1];
+    sys_read(p[0] as u64, c.as_mut_ptr(), 1);
+    let before = environ_check(a);
+    sys_write(q[1] as u64, b"g".as_ptr(), 1);
+    sys_read(p[0] as u64, c.as_mut_ptr(), 1);
+    let after = environ_check(a);
+    sys_kill(a, SIGKILL);
+    sys_wait4(a, core::ptr::null_mut(), 0, 0);
+    for fd in [p[0], p[1], q[0], q[1]] {
+        sys_close(fd as u64);
+    }
+    report(
+        b"PROC_ACCESS_THREAD_NONDUMPABLE",
+        before == 0 && after == 1,
+        (before * 10 + after) as i64,
+    );
 }
 
 /// A target whose saved uid differs from the reader's uid (a setuid

@@ -27,8 +27,8 @@
 use super::helpers::{host_mode, print, print_num, println, skip};
 use super::mm_life::meminfo;
 use hk_syscall::{
-    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_MAYMOVE, O_RDONLY, PROT_READ,
-    O_NONBLOCK, PROT_WRITE, RLIMIT_AS, RLIMIT_MEMLOCK, RLIMIT_NOFILE, RLimit, Timespec, sys_brk,
+    MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MREMAP_DONTUNMAP, MREMAP_MAYMOVE, O_NONBLOCK, O_RDONLY,
+    PROT_READ, PROT_WRITE, RLIMIT_AS, RLIMIT_MEMLOCK, RLIMIT_NOFILE, RLimit, Timespec, sys_brk,
     sys_close, sys_exit, sys_fork, sys_mlock, sys_mmap, sys_mremap, sys_munmap, sys_nanosleep,
     sys_open, sys_pipe2, sys_read, sys_setresuid, sys_setrlimit, sys_wait4, sys_write,
 };

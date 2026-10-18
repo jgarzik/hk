@@ -385,12 +385,7 @@ the phase expected to fix it; "next batch" means the next fix batch.
    own mm and `__ptrace_may_access` the thread group. Scenario: a
    non-dumpable uid-1000 process; its second thread gets EPERM from
    `process_vm_readv(getpid())`.
-3. **Dumpability is per task, not per mm** (fix in P3, mm rework).
-   `prctl.dumpable` (`kernel/task/mod.rs`, read at
-   `kernel/task/ptrace.rs:912`, `kernel/fs/procfs.rs` dump_owner); Linux
-   keeps it in mm->flags. Scenario: thread B calls
-   `PR_SET_DUMPABLE 0`; thread A still reads 1 and the process stays
-   attachable/readable via the leader.
+3. Fixed in P3: dumpability lives in the mm (`Mm::dumpable`).
 4. **Context switch scans TASK_TABLE for /proc state** (fix in P7, SMP
    scheduler). `kernel/task/percpu.rs:1815` switch_info does two extra
    linear scans under the global TASK_TABLE lock per switch, only to

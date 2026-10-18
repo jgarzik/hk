@@ -6,9 +6,9 @@
 use super::helpers::{host_mode, print, print_num, println};
 use super::mm_life::meminfo;
 use hk_syscall::{
-    IoUringParams, MqAttr, O_CREAT, O_RDWR, sys_close, sys_epoll_create1, sys_eventfd2,
-    sys_getpid, sys_inotify_init1, sys_io_uring_setup, sys_mq_open, sys_mq_unlink,
-    sys_pidfd_open, sys_pipe2, sys_signalfd4, sys_timerfd_create,
+    IoUringParams, MqAttr, O_CREAT, O_RDWR, sys_close, sys_epoll_create1, sys_eventfd2, sys_getpid,
+    sys_inotify_init1, sys_io_uring_setup, sys_mq_open, sys_mq_unlink, sys_pidfd_open, sys_pipe2,
+    sys_signalfd4, sys_timerfd_create,
 };
 
 const O_CLOEXEC: u32 = 0o2000000;
@@ -17,10 +17,14 @@ pub fn run_tests() {
     leak(b"FD_LEAK_PIPE", 20000, pipe_cycle);
     leak(b"FD_LEAK_EVENTFD", 4000, || fd_cycle(sys_eventfd2(0, 0)));
     leak(b"FD_LEAK_EPOLL", 4000, || fd_cycle(sys_epoll_create1(0)));
-    leak(b"FD_LEAK_TIMERFD", 4000, || fd_cycle(sys_timerfd_create(1, 0)));
+    leak(b"FD_LEAK_TIMERFD", 4000, || {
+        fd_cycle(sys_timerfd_create(1, 0))
+    });
     leak(b"FD_LEAK_SIGNALFD", 4000, signalfd_cycle);
     leak(b"FD_LEAK_INOTIFY", 4000, || fd_cycle(sys_inotify_init1(0)));
-    leak(b"FD_LEAK_PIDFD", 4000, || fd_cycle(sys_pidfd_open(sys_getpid() as i32, 0)));
+    leak(b"FD_LEAK_PIDFD", 4000, || {
+        fd_cycle(sys_pidfd_open(sys_getpid() as i32, 0))
+    });
     leak(b"FD_LEAK_IO_URING", 1000, io_uring_cycle);
     leak(b"FD_LEAK_MQUEUE", 2000, mq_cycle);
 }

@@ -7,10 +7,10 @@
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    AT_FDCWD, CapUserData, CapUserHeader, O_CREAT, O_RDONLY, O_WRONLY, Stat,
-    _LINUX_CAPABILITY_VERSION_3, sys_capget, sys_capset, sys_close, sys_exit, sys_fork,
-    sys_fstat, sys_linkat, sys_lstat, sys_mkdir, sys_mount, sys_open, sys_pread64, sys_pwrite64,
-    sys_rmdir, sys_stat, sys_symlink, sys_umount2, sys_unlink, sys_wait4,
+    _LINUX_CAPABILITY_VERSION_3, AT_FDCWD, CapUserData, CapUserHeader, O_CREAT, O_RDONLY, O_WRONLY,
+    Stat, sys_capget, sys_capset, sys_close, sys_exit, sys_fork, sys_fstat, sys_linkat, sys_lstat,
+    sys_mkdir, sys_mount, sys_open, sys_pread64, sys_pwrite64, sys_rmdir, sys_stat, sys_symlink,
+    sys_umount2, sys_unlink, sys_wait4,
 };
 
 const FOLLOW: i32 = 0x400;
@@ -40,13 +40,7 @@ const NAMES: [&[u8]; 6] = [
 
 pub fn run_tests() {
     sys_mkdir(DIR.as_ptr(), 0o755);
-    let r = sys_mount(
-        b"none\0".as_ptr(),
-        DIR.as_ptr(),
-        b"ramfs\0".as_ptr(),
-        0,
-        0,
-    );
+    let r = sys_mount(b"none\0".as_ptr(), DIR.as_ptr(), b"ramfs\0".as_ptr(), 0, 0);
     if r != 0 {
         verdict(b"LINKAT_MOUNT", false, r);
         return;
@@ -110,7 +104,11 @@ fn bad_flags() {
     let b = link(AT_FDCWD, F, NAMES[0], 1);
     let c = sys_linkat(AT_FDCWD, 1 as *const u8, AT_FDCWD, 1 as *const u8, 0x2);
     let ok = a == EINVAL && b == EINVAL && c == EINVAL && st(NAMES[0], true).0 == ENOENT;
-    verdict(b"LINKAT_EINVAL", ok, if a != EINVAL { a } else { b * 1000 + c });
+    verdict(
+        b"LINKAT_EINVAL",
+        ok,
+        if a != EINVAL { a } else { b * 1000 + c },
+    );
 }
 
 /// Without AT_SYMLINK_FOLLOW the new name is the symlink, with it the
@@ -228,5 +226,9 @@ fn race_unlink() {
     let n = sys_pread64(fd, back.as_mut_ptr(), back.len() as u64, 0);
     sys_close(fd as u64);
     let ok = bad == 0 && s.st_nlink as u64 == names && n == 512 && back == pat;
-    verdict(b"LINKAT_RACE_UNLINK", ok, bad as i64 * 1000 + s.st_nlink as i64 * 10 + names as i64);
+    verdict(
+        b"LINKAT_RACE_UNLINK",
+        ok,
+        bad as i64 * 1000 + s.st_nlink as i64 * 10 + names as i64,
+    );
 }

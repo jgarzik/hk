@@ -12,9 +12,9 @@ use super::helpers::{
     BlkDev, dev_major, dev_minor, find_blkdev, print, print_num, println, read_file,
 };
 use hk_syscall::{
-    O_CREAT, O_RDONLY, O_RDWR, Stat, sys_close, sys_fstat, sys_fsync, sys_ioctl, sys_lseek, sys_mkdir,
-    sys_mount, sys_open, sys_pread64, sys_pwrite64, sys_read, sys_stat, sys_swapoff, sys_swapon,
-    sys_umount2,
+    O_CREAT, O_RDONLY, O_RDWR, Stat, sys_close, sys_fstat, sys_fsync, sys_ioctl, sys_lseek,
+    sys_mkdir, sys_mount, sys_open, sys_pread64, sys_pwrite64, sys_read, sys_stat, sys_swapoff,
+    sys_swapon, sys_umount2,
 };
 
 const BLKROGET: u64 = 0x125e;
@@ -50,7 +50,9 @@ fn verdict(name: &[u8], ok: bool, got: i64) {
 
 /// Pattern byte at offset `off` of vda3
 fn pat(off: u64) -> u8 {
-    let w = ((off / 4) as u32).wrapping_mul(1103515245).wrapping_add(12345);
+    let w = ((off / 4) as u32)
+        .wrapping_mul(1103515245)
+        .wrapping_add(12345);
     w.to_le_bytes()[(off % 4) as usize]
 }
 
@@ -222,7 +224,11 @@ fn pattern_read(p3: &BlkDev) {
         let bad = pat_mismatch(&buf[..len], off);
         print(b"BLK_PATTERN_READ_");
         print_num(i as i64);
-        verdict(b"", n == len as i64 && bad.is_none(), bad.map_or(n, |b| b as i64));
+        verdict(
+            b"",
+            n == len as i64 && bad.is_none(),
+            bad.map_or(n, |b| b as i64),
+        );
     }
     // read() advances the position
     let p = sys_lseek(fd, 4096, SEEK_SET);
@@ -269,14 +275,22 @@ fn eof(p3: &BlkDev) {
     let at_end = sys_pread64(fd, buf.as_mut_ptr(), 4096, s);
     let short = sys_pread64(fd, buf.as_mut_ptr(), 4096, s - 100);
     let short_ok = short == 100 && pat_mismatch(&buf[..100], P3_SIZE - 100).is_none();
-    verdict(b"BLK_EOF_READ", at_end == 0 && short_ok, at_end * 10000 + short);
+    verdict(
+        b"BLK_EOF_READ",
+        at_end == 0 && short_ok,
+        at_end * 10000 + short,
+    );
     let end = sys_lseek(fd, 0, SEEK_END);
     let past = sys_lseek(fd, s + 1, SEEK_SET);
     let n = sys_read(fd as u64, buf.as_mut_ptr(), 4096);
     verdict(b"BLK_EOF_SEEK", end == s && past == EINVAL && n == 0, end);
     let w_end = sys_pwrite64(fd, buf.as_ptr(), 16, s);
     let w_short = sys_pwrite64(fd, buf.as_ptr(), 100, s - 10);
-    verdict(b"BLK_EOF_WRITE", w_end == ENOSPC && w_short == 10, w_end * 1000 + w_short);
+    verdict(
+        b"BLK_EOF_WRITE",
+        w_end == ENOSPC && w_short == 10,
+        w_end * 1000 + w_short,
+    );
     sys_close(fd as u64);
 }
 
@@ -317,7 +331,11 @@ fn vfat(p1: &BlkDev) {
     }
     let mut b = [0u8; 64];
     let n = read_file(b"/mnt/vd1/HKDISK.TXT\0", &mut b);
-    verdict(b"BLK_VFAT_READ", n == 15 && &b[..15] == b"hk virtio disk\n", n);
+    verdict(
+        b"BLK_VFAT_READ",
+        n == 15 && &b[..15] == b"hk virtio disk\n",
+        n,
+    );
     let fd = sys_open(b"/mnt/vd1/NEW.TXT\0".as_ptr(), O_RDWR | O_CREAT, 0o644) as i32;
     let w = sys_pwrite64(fd, b"written".as_ptr(), 7, 0);
     let f = sys_fsync(fd);
@@ -326,7 +344,11 @@ fn vfat(p1: &BlkDev) {
     sys_close(fd as u64);
     let n = read_file(b"/mnt/vd1/NEW.TXT\0", &mut b);
     let ok = fd >= 0 && w == 7 && f == 0 && s == 0 && st.st_size == 7 && &b[..7] == b"written";
-    verdict(b"BLK_VFAT_WRITE", ok && n == 7, if fd < 0 { fd as i64 } else { n });
+    verdict(
+        b"BLK_VFAT_WRITE",
+        ok && n == 7,
+        if fd < 0 { fd as i64 } else { n },
+    );
     let u = sys_umount2(b"/mnt/vd1\0".as_ptr(), 0);
     verdict(b"BLK_VFAT_UMOUNT", u == 0, u);
 }

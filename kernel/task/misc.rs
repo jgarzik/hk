@@ -493,20 +493,20 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             }
             let value = arg2 as u8;
 
-            let mut table = TASK_TABLE.lock();
-            if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-                task.prctl.dumpable = value;
-                0
-            } else {
-                KernelError::NoProcess.sysret()
+            // On the mm, shared by every thread (Linux set_dumpable)
+            match crate::mm::get_task_mm(tid) {
+                Some(mm) => {
+                    mm.set_dumpable(value);
+                    0
+                }
+                None => KernelError::NoProcess.sysret(),
             }
         }
 
         PR_GET_DUMPABLE => {
             // Return dumpable flag value
-            let table = TASK_TABLE.lock();
-            match table.tasks.iter().find(|t| t.tid == tid) {
-                Some(task) => task.prctl.dumpable as i64,
+            match crate::mm::get_task_mm(tid) {
+                Some(mm) => mm.dumpable() as i64,
                 None => KernelError::NoProcess.sysret(),
             }
         }

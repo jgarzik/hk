@@ -232,7 +232,11 @@ fn comm_check() -> ! {
     const PR_GET_NAME: i32 = 16;
     let mut name = [0u8; 16];
     sys_prctl(PR_GET_NAME, name.as_mut_ptr() as u64, 0, 0, 0);
-    sys_exit(if cstr_is(name.as_ptr() as u64, b"boot_tester2") { 0 } else { 1 });
+    sys_exit(if cstr_is(name.as_ptr() as u64, b"boot_tester2") {
+        0
+    } else {
+        1
+    });
 }
 
 extern "C" fn rust_start(sp: *const u64) -> ! {
