@@ -136,7 +136,9 @@ impl Shmem {
         if *e == 0 {
             *e = zeroed()?;
         }
-        FRAME_ALLOCATOR.incref(*e);
+        // The object holds a reference until `root` is unlocked
+        let held = FRAME_ALLOCATOR.incref(*e);
+        debug_assert!(held);
         Ok(*e)
     }
 

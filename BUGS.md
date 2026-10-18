@@ -254,17 +254,6 @@ never enters the Traced state and every request that needs a stopped
 tracee (GETREGS, SETREGS, PEEK/POKE*, CONT, ...) fails with ESRCH. The
 TLS_PTRACE_RANGE boot test runs on Linux only.
 
-## Tracees never stop
-
-**Location**: `kernel/task/ptrace.rs` (ptrace_stop, ptrace_report_syscall),
-`kernel/signal/mod.rs` (stop signals)
-
-Nothing calls `ptrace_stop`: no signal-delivery stop, no syscall stop,
-and SIGSTOP is ignored (stop/continue are not implemented), so a tracee
-never enters the Traced state and every request that needs a stopped
-tracee (GETREGS, SETREGS, PEEK/POKE*, CONT, ...) fails with ESRCH. The
-TLS_PTRACE_RANGE boot test runs on Linux only.
-
 ## Global init is not protected from default-action signals
 
 **Location**: `kernel/signal/mod.rs` send_signal
@@ -532,20 +521,14 @@ From the P2 /code-review (unverified). Tag = when to fix.
 2. Fixed in fix batch 1: the x86 direct map reads every multiboot
    region in place (no 31-entry copy); RAM past the page-table pool's
    reach (48GB) is dropped from memblock as before.
-3. **No pcp drain on allocation failure** (next batch).
-   `kernel/mm/page_alloc.rs:443`: pages on other CPUs' pcp lists are
-   invisible to watermarks and merging; Linux drain_all_pages in the
-   slow path. Kernel-heap allocations then panic with memory free.
-4. **Page refcount get() can resurrect a freed page** (next batch).
-   `kernel/mm/page_alloc.rs:547`: the CAS retry rechecks only
-   u32::MAX, not 0, so get racing the final put takes 0→1 on a page
-   already on a pcp list (use-after-free). Use get_unless_zero.
+3. Fixed in fix batch 1: a failed allocation drains every CPU's list
+   (`Zone::drain_all`, under each list's own lock) and retries once.
+4. Fixed in fix batch 1: `Zone::get` is get_page_unless_zero.
 5. **pcp_free drains the hot end** (next batch).
    `kernel/mm/page_alloc.rs:425`: freed page pushed at head, drain
    pops from head; Linux returns the cold tail.
-6. **free_pages_all aliases &mut Pcp** (next batch; Rust UB).
-   `kernel/mm/page_alloc.rs:720`: reads Pcp.count through the
-   UnsafeCell while its CPU may hold &mut; move count out of the cell.
+6. Fixed in fix batch 1: the per-CPU list is an IrqSpinlock with its
+   count beside it (no UnsafeCell aliasing).
 7. **arm64 /reserved-memory no-map regions are linear-mapped**
    (next batch; real HW). `kernel/arch/aarch64/dtb.rs:175`: Linux
    memblock_mark_nomap removes them (speculative access to secure

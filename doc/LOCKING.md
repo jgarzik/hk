@@ -275,7 +275,8 @@ Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
     ↓
 Memory allocator locks (Linux: ... → slab → pcp → zone->lock):
     slab per-CPU array (IRQs off) → KmemCache.list_lock (IrqSpinlock)
-    → per-CPU page list (IRQs off) → Zone.lock (IrqSpinlock leaf);
+    → per-CPU page list lock (IrqSpinlock, one at a time) → Zone.lock
+    (IrqSpinlock leaf);
     3.2 Heap Allocator, Frame Allocator
 
 Block locks (3.10 Block Device Subsystem):
@@ -729,13 +730,19 @@ pub struct Zone {
 }
 ```
 
-- Order (Linux): per-CPU list (interrupts off) → `Zone.lock`
-  (`IrqSpinlock`, leaf). A CPU uses only its own list, with
-  `local_irq_save` held across the access (the kernel is not preemptive,
-  so it stays on the CPU); a refill or drain takes `Zone.lock` under it.
-  A CPU without per-CPU data yet (coming up, or the boot CPU early)
-  never touches a per-CPU list: it allocates and frees under `Zone.lock`.
-  Other CPUs read only a list's atomic page count (statistics).
+- Order (Linux): per-CPU list lock (`Pcp.lock`, `IrqSpinlock`, one per
+  CPU; Linux pcp->lock) → `Zone.lock` (`IrqSpinlock`, leaf). A CPU
+  allocates and frees through its own list under its lock (the kernel
+  is not preemptive, so it stays on the CPU); a refill or a past-`high`
+  drain takes `Zone.lock` under it. An allocation that fails drains
+  every CPU's list (`drain_all`, Linux drain_all_pages, which also
+  drains remote lists under their pcp->lock from the calling CPU) and
+  tries once more: it takes each list's lock in turn, never two at
+  once, so CPUs draining each other cannot deadlock, and needs no IPI
+  (it may run under any lock and in interrupt context). A CPU without
+  per-CPU data yet (coming up, or the boot CPU early) never touches a
+  per-CPU list: it allocates and frees under `Zone.lock`. A list's page
+  count is an atomic beside its lock (statistics read it lock-free).
 - Both are IRQ-safe: allocating or freeing in interrupt context cannot
   deadlock against an interrupted allocator (policy is still no
   allocation in IRQ context).
@@ -743,7 +750,10 @@ pub struct Zone {
   and checked lock-free against the zone's free count (an atomic
   written under `Zone.lock`), as Linux zone_watermark_ok.
 - Reference counts are atomics in struct page (`get`/`put`, no lock);
-  the put that reaches zero frees. A count that reaches `u32::MAX`
+  the put that reaches zero frees. `get` never takes a count from zero
+  (Linux get_page_unless_zero): a racing final put wins, and the
+  caller sees the page as gone (fork re-reads the PTE, a swap-cache
+  hit reads the slot). A count that reaches `u32::MAX`
   saturates and stays (the page leaks rather than being freed while
   uncounted references remain).
 - Freeing resets each struct page and releases its mapping (an

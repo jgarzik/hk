@@ -286,7 +286,11 @@ fn copy_pte(dst: u64, src: u64, addr: u64, cow: bool) -> Result<bool, i32> {
                 continue;
             }
         }
-        FRAME_ALLOCATOR.incref(paging::pte_addr(pte));
+        // The entry holds a reference: a page freed meanwhile means it
+        // changed under us (read it again)
+        if !FRAME_ALLOCATOR.incref(paging::pte_addr(pte)) {
+            continue;
+        }
         // One more mapping of an anonymous page (Linux page_dup_rmap);
         // both mm's anon_vma chains hold the VMA (dup_mm)
         if let Some(pg) = phys_to_page(paging::pte_addr(pte))

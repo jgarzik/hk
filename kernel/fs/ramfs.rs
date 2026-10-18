@@ -537,8 +537,9 @@ impl InodeOps for RamfsInodeOps {
             )
             .map_err(page_err)?;
         // Taken before the cache lock goes: truncate cannot free the
-        // frame under the new mapping
-        FRAME_ALLOCATOR.incref(page.frame);
+        // frame under the new mapping (the cache holds one meanwhile)
+        let held = FRAME_ALLOCATOR.incref(page.frame);
+        debug_assert!(held);
         page.mark_dirty();
         Ok(page.frame)
     }

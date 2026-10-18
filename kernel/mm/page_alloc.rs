@@ -8,11 +8,13 @@
 //! only this CPU's list, with interrupts off, and move `batch` pages to
 //! or from the buddy lists when it runs empty or past `high`.
 //!
-//! Locking: a per-CPU list is used only by its CPU, with interrupts
-//! disabled (`local_irq_save`); `Zone.lock` (`IrqSpinlock`, leaf) guards
-//! the buddy lists and is taken under it (Linux order: pcp -> zone->lock).
-//! Both are IRQ-safe, so pages may be freed or allocated in interrupt
-//! context. Nothing is freed back into another subsystem under either:
+//! Locking: each per-CPU list has its own lock (`IrqSpinlock`; Linux
+//! pcp->lock), taken by its CPU for every use and by another CPU only to
+//! drain the list when an allocation fails (Linux drain_all_pages);
+//! `Zone.lock` (`IrqSpinlock`, leaf) guards the buddy lists and is taken
+//! under it (Linux order: pcp -> zone->lock). No CPU holds two per-CPU
+//! list locks at once. Both are IRQ-safe, so pages may be freed or
+//! allocated in interrupt context. Nothing is freed back into another subsystem under either:
 //! a page's struct page is reset (`free_prepare`) and its mapping
 //! released before any allocator lock is taken.
 //!
@@ -21,16 +23,15 @@
 //! (`__GFP_COMP`, 2MB huge pages) count on the head; tails point to it.
 //!
 //! Frees are checked (Linux bad_page): freeing a reserved page, a page
-//! on a free list or an unreferenced one (a double free), and taking a
-//! reference on a free page, are reported and refused, so a page is
-//! never on a free list twice; an allocated block found referenced is
+//! on a free list or an unreferenced one (a double free), are reported
+//! and refused, so a page is never on a free list twice; a reference
+//! is never taken on a free page (`get` fails: get_page_unless_zero); an allocated block found referenced is
 //! leaked. Every pfn from outside is checked against the zone and the
 //! memory map's sections before its struct page is touched.
 
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::arch::{IrqSpinlock, local_irq_restore, local_irq_save};
+use crate::arch::IrqSpinlock;
 use crate::cpumask::NR_CPUS;
 use crate::mm::page::{PG_BUDDY, PG_HEAD, PG_RESERVED, PG_TAIL, Page, put_mapping};
 
@@ -136,21 +137,32 @@ fn alloc_mark(wmark: &[AtomicUsize; 3], gfp: Gfp) -> usize {
 /// One CPU's order-0 page list (Linux per_cpu_pages)
 struct Pcp {
     /// First page (pfn + 1, 0 = empty), linked through `Page.next`
-    head: u64,
-    /// Pages on the list (read by other CPUs for statistics)
+    /// (under `lock`)
+    lock: IrqSpinlock<u64>,
+    /// Pages on the list (written under `lock`, read lock-free for
+    /// statistics and to skip empty lists when draining)
     count: AtomicUsize,
 }
 
-/// A Pcp used only by its own CPU with interrupts off
-struct PcpCell(UnsafeCell<Pcp>);
+impl Pcp {
+    const fn new() -> Self {
+        Self {
+            lock: IrqSpinlock::new(0),
+            count: AtomicUsize::new(0),
+        }
+    }
+}
 
-// SAFETY: each cell is touched only by its CPU with interrupts disabled
-// (`Zone::pcp`); other CPUs read only the atomic `count`
-unsafe impl Sync for PcpCell {}
+#[cfg(test)]
+std::thread_local! {
+    /// The CPU a host test thread plays
+    pub static TEST_CPU: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
 
 /// This CPU; None before its per-CPU data exists (a CPU coming up, or
 /// the boot CPU early), when per-CPU caches must not be used: the
-/// caller takes the shared slow path instead. Host tests are CPU 0.
+/// caller takes the shared slow path instead. Host tests play CPU 0
+/// unless they set `TEST_CPU`.
 pub fn this_cpu() -> Option<usize> {
     #[cfg(not(test))]
     {
@@ -158,7 +170,7 @@ pub fn this_cpu() -> Option<usize> {
         CurrentArch::try_current_cpu_id().map(|c| c as usize)
     }
     #[cfg(test)]
-    Some(0)
+    Some(TEST_CPU.with(|c| c.get()))
 }
 
 // ============================================================================
@@ -201,7 +213,7 @@ pub struct Zone {
     /// Per-CPU list refill/drain size and limit
     batch: AtomicUsize,
     high: AtomicUsize,
-    pcp: [PcpCell; NR_CPUS],
+    pcp: [Pcp; NR_CPUS],
 }
 
 impl Zone {
@@ -222,12 +234,7 @@ impl Zone {
             min_kb: AtomicUsize::new(0),
             batch: AtomicUsize::new(1),
             high: AtomicUsize::new(0),
-            pcp: [const {
-                PcpCell(UnsafeCell::new(Pcp {
-                    head: 0,
-                    count: AtomicUsize::new(0),
-                }))
-            }; NR_CPUS],
+            pcp: [const { Pcp::new() }; NR_CPUS],
         }
     }
 
@@ -365,24 +372,19 @@ impl Zone {
     // ------------------------------------------------------------------
 
     /// This CPU's list (None: no per-CPU data yet)
-    ///
-    /// # Safety
-    /// Interrupts are off until the returned borrow ends.
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn pcp(&self) -> Option<&mut Pcp> {
-        // SAFETY: only this CPU uses its cell, and interrupts are off
-        this_cpu().map(|c| unsafe { &mut *self.pcp[c].0.get() })
+    fn pcp(&self) -> Option<&Pcp> {
+        this_cpu().map(|c| &self.pcp[c])
     }
 
-    fn pcp_push(&self, p: &mut Pcp, pfn: u64) {
-        self.page(pfn).next.store(p.head, Ordering::Relaxed);
-        p.head = pfn + 1;
+    fn pcp_push(&self, p: &Pcp, head: &mut u64, pfn: u64) {
+        self.page(pfn).next.store(*head, Ordering::Relaxed);
+        *head = pfn + 1;
         p.count.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn pcp_pop(&self, p: &mut Pcp) -> Option<u64> {
-        let pfn = p.head.checked_sub(1)?;
-        p.head = self.page(pfn).next.load(Ordering::Relaxed);
+    fn pcp_pop(&self, p: &Pcp, head: &mut u64) -> Option<u64> {
+        let pfn = head.checked_sub(1)?;
+        *head = self.page(pfn).next.load(Ordering::Relaxed);
         p.count.fetch_sub(1, Ordering::Relaxed);
         Some(pfn)
     }
@@ -390,48 +392,57 @@ impl Zone {
     /// Order-0 page from this CPU's list, refilled with `batch` pages
     /// from the buddy lists when empty (Linux rmqueue_pcplist)
     fn pcp_alloc(&self) -> Option<u64> {
-        let flags = local_irq_save();
-        // SAFETY: interrupts are off
-        let Some(p) = (unsafe { self.pcp() }) else {
-            let got = self.take(&mut self.lock.lock(), 0);
-            local_irq_restore(flags);
-            return got;
+        let Some(p) = self.pcp() else {
+            return self.take(&mut self.lock.lock(), 0);
         };
-        if p.head == 0 {
+        let mut head = p.lock.lock();
+        if *head == 0 {
             let mut fa = self.lock.lock();
             for _ in 0..self.batch.load(Ordering::Relaxed) {
                 match self.take(&mut fa, 0) {
-                    Some(pfn) => self.pcp_push(p, pfn),
+                    Some(pfn) => self.pcp_push(p, &mut head, pfn),
                     None => break,
                 }
             }
         }
-        let got = self.pcp_pop(p);
-        local_irq_restore(flags);
-        got
+        self.pcp_pop(p, &mut head)
     }
 
     /// Order-0 page onto this CPU's list; past `high`, `batch` pages go
     /// back to the buddy lists (Linux free_unref_page)
     fn pcp_free(&self, pfn: u64) {
-        let flags = local_irq_save();
-        // SAFETY: interrupts are off
-        let Some(p) = (unsafe { self.pcp() }) else {
+        let Some(p) = self.pcp() else {
             self.free_one(&mut self.lock.lock(), pfn, 0);
-            local_irq_restore(flags);
             return;
         };
-        self.pcp_push(p, pfn);
+        let mut head = p.lock.lock();
+        self.pcp_push(p, &mut head, pfn);
         if p.count.load(Ordering::Relaxed) > self.high.load(Ordering::Relaxed) {
             let mut fa = self.lock.lock();
             for _ in 0..self.batch.load(Ordering::Relaxed) {
-                match self.pcp_pop(p) {
+                match self.pcp_pop(p, &mut head) {
                     Some(pfn) => self.free_one(&mut fa, pfn, 0),
                     None => break,
                 }
             }
         }
-        local_irq_restore(flags);
+    }
+
+    /// Give every CPU's list back to the buddy lists (Linux
+    /// drain_all_pages, which drains each CPU's list under its pcp->lock
+    /// from the calling CPU): pages there are invisible to watermarks
+    /// and buddy merging. One list lock at a time.
+    pub fn drain_all(&self) {
+        for p in &self.pcp {
+            if p.count.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            let mut head = p.lock.lock();
+            let mut fa = self.lock.lock();
+            while let Some(pfn) = self.pcp_pop(p, &mut head) {
+                self.free_one(&mut fa, pfn, 0);
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -439,9 +450,24 @@ impl Zone {
     // ------------------------------------------------------------------
 
     /// Allocate 2^order pages; refcount 1 on the first (every page with
-    /// `__GFP_COMP`: tails point at the head)
+    /// `__GFP_COMP`: tails point at the head). On failure the per-CPU
+    /// lists are drained and the allocation tried once more (Linux
+    /// __alloc_pages_slowpath; draining never sleeps here, so every
+    /// context gets it).
     pub fn alloc_pages(&self, order: u32, gfp: Gfp) -> Option<u64> {
-        if order > MAX_ORDER || !self.watermark_ok(order, gfp) {
+        if order > MAX_ORDER {
+            return None;
+        }
+        self.try_alloc(order, gfp).or_else(|| {
+            self.drain_all();
+            self.try_alloc(order, gfp)
+        })
+    }
+
+    /// One allocation attempt from the per-CPU and buddy lists (Linux
+    /// get_page_from_freelist)
+    fn try_alloc(&self, order: u32, gfp: Gfp) -> Option<u64> {
+        if !self.watermark_ok(order, gfp) {
             return None;
         }
         loop {
@@ -535,18 +561,20 @@ impl Zone {
     // Reference counts
     // ------------------------------------------------------------------
 
-    /// Take a reference; a saturated count stays saturated, and a free
-    /// page (count 0) is not resurrected
-    pub fn get(&self, pfn: u64) {
+    /// Take a reference unless the page is free (Linux
+    /// get_page_unless_zero): false, and no reference, if its count is
+    /// (or drops to) 0 meanwhile; a saturated count stays saturated
+    pub fn get(&self, pfn: u64) -> bool {
         let rc = &self.page(pfn).refcount;
         let mut c = rc.load(Ordering::Relaxed);
-        if c == 0 {
-            self.bad_page(pfn, "reference to a free page");
-            return;
-        }
-        while c != u32::MAX {
+        loop {
+            match c {
+                0 => return false,
+                u32::MAX => return true,
+                _ => {}
+            }
             match rc.compare_exchange_weak(c, c + 1, Ordering::AcqRel, Ordering::Relaxed) {
-                Ok(_) => return,
+                Ok(_) => return true,
                 Err(cur) => c = cur,
             }
         }
@@ -716,8 +744,7 @@ impl Zone {
         let pcp: usize = self
             .pcp
             .iter()
-            // SAFETY: only the atomic count is read
-            .map(|c| unsafe { &(*c.0.get()).count }.load(Ordering::Relaxed))
+            .map(|p| p.count.load(Ordering::Relaxed))
             .sum();
         self.nr_free() + pcp
     }
@@ -859,8 +886,7 @@ mod tests {
         t.z.free_range(0, 16);
         let p = t.z.alloc_pages(0, Gfp::KERNEL).unwrap();
         t.z.page(p).refcount.store(u32::MAX - 1, Ordering::Relaxed);
-        t.z.get(p);
-        t.z.get(p);
+        assert!(t.z.get(p) && t.z.get(p));
         assert_eq!(t.z.count(p), u32::MAX);
         assert!(!t.z.put(p));
         assert_eq!(t.z.count(p), u32::MAX);
@@ -868,6 +894,81 @@ mod tests {
         let q = t.z.alloc_pages(0, Gfp::KERNEL).unwrap();
         assert!(t.z.put(q));
         assert!(!t.z.put(q));
+    }
+
+    /// A reference taken while another CPU drops the last one either
+    /// lands first (the page lives on) or is refused: a page freed to a
+    /// free list never comes back with a count (Linux
+    /// get_page_unless_zero)
+    #[test]
+    fn get_never_revives_a_freed_page() {
+        use core::sync::atomic::AtomicBool;
+        const ROUNDS: u64 = 200_000;
+        let t = zone(0, 64);
+        t.z.free_range(0, 64);
+        let (go, done, page) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+        let freed = AtomicBool::new(false);
+        let mut revived = 0;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for r in 1..=ROUNDS {
+                    while go.load(Ordering::Acquire) != r {
+                        core::hint::spin_loop();
+                    }
+                    let p = page.load(Ordering::Relaxed);
+                    freed.store(t.z.put(p), Ordering::Relaxed);
+                    done.store(r, Ordering::Release);
+                }
+            });
+            for r in 1..=ROUNDS {
+                let p = t.z.alloc_pages(0, Gfp::KERNEL).unwrap();
+                page.store(p, Ordering::Relaxed);
+                go.store(r, Ordering::Release);
+                let got = t.z.get(p);
+                while done.load(Ordering::Acquire) != r {
+                    core::hint::spin_loop();
+                }
+                if !freed.load(Ordering::Relaxed) {
+                    assert!(got && t.z.put(p));
+                } else if t.z.count(p) != 0 {
+                    revived += 1;
+                    t.z.page(p).refcount.store(0, Ordering::Relaxed);
+                }
+            }
+        });
+        assert_eq!(revived, 0);
+    }
+
+    /// Pages another CPU freed to its list are not lost to an
+    /// allocation that finds the buddy lists empty: the lists are
+    /// drained and it is tried again (Linux drain_all_pages)
+    #[test]
+    fn failed_alloc_drains_other_cpus() {
+        let t = zone(0, 64);
+        t.z.free_range(0, 64);
+        t.z.batch.store(8, Ordering::Relaxed);
+        t.z.high.store(32, Ordering::Relaxed);
+        let mut got = Vec::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                TEST_CPU.with(|c| c.set(1));
+                let mut v = Vec::new();
+                while let Some(p) = t.z.alloc_pages(0, Gfp::KERNEL) {
+                    v.push(p);
+                }
+                assert_eq!(v.len(), 64);
+                v.into_iter().for_each(|p| t.z.free_pages(p, 0));
+            });
+        });
+        assert!(t.z.free_pages_all() - t.z.nr_free() > 0);
+        while let Some(p) = t.z.alloc_pages(0, Gfp::KERNEL) {
+            got.push(p);
+        }
+        assert_eq!(got.len(), 64);
+        // A large block forms again once the pages come back
+        got.into_iter().for_each(|p| t.z.free_pages(p, 0));
+        t.z.drain_all();
+        assert!(t.z.alloc_pages(5, Gfp::KERNEL).is_some());
     }
 
     #[test]
@@ -880,14 +981,14 @@ mod tests {
         let free = t.z.free_pages_all();
         t.z.free_pages(p, 0);
         assert!(!t.z.put(p));
-        t.z.get(p);
-        assert_eq!(t.z.nr_bad(), 2);
+        assert!(!t.z.get(p));
+        assert_eq!(t.z.nr_bad(), 1);
         assert_eq!(t.z.free_pages_all(), free);
         // A page inside a free buddy block too
         let q = t.z.alloc_pages(3, Gfp::KERNEL).unwrap();
         t.z.free_pages(q, 3);
         t.z.free_pages(q, 3);
-        assert_eq!(t.z.nr_bad(), 3);
+        assert_eq!(t.z.nr_bad(), 2);
         assert_eq!(t.z.free_pages_all(), free);
         // Every page still comes out exactly once
         let mut got = Vec::new();

@@ -402,8 +402,11 @@ fn do_fault(
 /// the swap-cache page if there is one (true), else a new page read
 /// from the slot. May sleep (the mm lock held for reading).
 fn swap_page(entry: SwapEntry, area: &Area) -> Result<(u64, bool), VmFault> {
-    if let Some(cached) = super::swap_cache_lookup(entry) {
-        FRAME_ALLOCATOR.incref(cached.frame);
+    // A swap-cache page being freed meanwhile is not taken (read the
+    // slot instead)
+    if let Some(cached) = super::swap_cache_lookup(entry)
+        && FRAME_ALLOCATOR.incref(cached.frame)
+    {
         return Ok((cached.frame, true));
     }
     let frame = alloc_user().ok_or(VmFault::Oom)?;

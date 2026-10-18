@@ -109,11 +109,11 @@ impl FrameAllocator {
         }
     }
 
-    /// Take a reference (sharing the frame)
-    pub fn incref(&self, frame: u64) {
-        if let Some(p) = self.ours(frame) {
-            self.zone.get(p);
-        }
+    /// Take a reference (sharing the frame) unless it is free (Linux
+    /// get_page_unless_zero); true for frames the allocator does not
+    /// manage (nothing to count)
+    pub fn incref(&self, frame: u64) -> bool {
+        self.ours(frame).is_none_or(|p| self.zone.get(p))
     }
 
     /// Drop a reference; true if that freed the frame
@@ -158,11 +158,9 @@ impl FrameAllocator {
         }
     }
 
-    /// Take a reference on a huge page
-    pub fn incref_huge(&self, frame: u64) {
-        if let Some(p) = self.huge(frame) {
-            self.zone.get(p);
-        }
+    /// Take a reference on a huge page unless it is free
+    pub fn incref_huge(&self, frame: u64) -> bool {
+        self.huge(frame).is_some_and(|p| self.zone.get(p))
     }
 
     /// Drop a reference on a huge page; true if that freed it
