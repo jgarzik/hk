@@ -43,6 +43,7 @@ pub mod kcmp;
 pub mod keys;
 pub mod layout;
 pub mod linkat;
+pub mod memcore;
 pub mod mempolicy;
 pub mod mm_life;
 pub mod mm_oom;
@@ -193,6 +194,7 @@ pub fn run_all_tests() {
     adjtimex::run_tests();
     io_uring::run_tests();
     tcp::run_tests();
+    isolated(b"MEMCORE", memcore::run_tests);
     netlink::run_tests();
     netdev_ioctl::run_tests();
     netdev::run_tests();
