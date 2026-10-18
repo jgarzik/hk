@@ -1938,6 +1938,12 @@ fn procfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, Ker
             children.insert(String::from("version"), version_inode);
             children.insert(String::from("mounts"), mounts_inode);
             children.insert(String::from("meminfo"), meminfo_inode);
+            let slabinfo = mk_inode(
+                &sb,
+                InodeMode::regular(0o400),
+                ProcfsInodeData::new_file(crate::mm::slab::slabinfo),
+            );
+            children.insert(String::from("slabinfo"), slabinfo);
             children.insert(String::from("net"), net_dir_inode);
             let parts = mk_inode(
                 &sb,

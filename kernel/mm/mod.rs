@@ -121,8 +121,10 @@ pub const STACK_GUARD_GAP: u64 = 256 * 1024;
 ///
 /// Manages the virtual memory areas (VMAs) for a task's address space.
 pub struct MmStruct {
-    /// List of VMAs, sorted by start address
-    vmas: Vec<Vma>,
+    /// List of VMAs, sorted by start address; each its own allocation
+    /// (Linux vm_area_cachep: the VMA slab cache)
+    #[allow(clippy::vec_box)]
+    vmas: Vec<alloc::boxed::Box<Vma>>,
     /// Top of the mmap region: allocations grow down from here
     mmap_base: u64,
     /// Initial program break (page-aligned end of loaded segments)
@@ -220,12 +222,18 @@ impl MmStruct {
 
     /// Find VMA containing the given address
     pub fn find_vma(&self, addr: u64) -> Option<&Vma> {
-        self.vmas.iter().find(|vma| vma.contains(addr))
+        self.vmas
+            .iter()
+            .find(|vma| vma.contains(addr))
+            .map(|v| &**v)
     }
 
     /// Find VMA containing the given address (mutable reference)
     pub fn find_vma_mut(&mut self, addr: u64) -> Option<&mut Vma> {
-        self.vmas.iter_mut().find(|vma| vma.contains(addr))
+        self.vmas
+            .iter_mut()
+            .find(|vma| vma.contains(addr))
+            .map(|v| &mut **v)
     }
 
     /// Insert a VMA, maintaining sorted order by start address
@@ -237,7 +245,7 @@ impl MmStruct {
             .iter()
             .position(|v| v.start > vma.start)
             .unwrap_or(self.vmas.len());
-        self.vmas.insert(pos, vma);
+        self.vmas.insert(pos, alloc::boxed::Box::new(vma));
         pos
     }
 
@@ -259,7 +267,7 @@ impl MmStruct {
             .into_iter()
             .partition(|v| v.start >= start && v.end <= end);
         self.vmas = kept;
-        removed
+        removed.into_iter().map(|v| *v).collect()
     }
 
     /// Find a free virtual address range of the given size
@@ -289,7 +297,7 @@ impl MmStruct {
 
     /// Get iterator over all VMAs
     pub fn iter(&self) -> impl Iterator<Item = &Vma> {
-        self.vmas.iter()
+        self.vmas.iter().map(|v| &**v)
     }
 
     /// Remove every VMA, resetting the VM counters (exit_mmap)
@@ -297,6 +305,9 @@ impl MmStruct {
         self.total_vm = 0;
         self.locked_vm = 0;
         core::mem::take(&mut self.vmas)
+            .into_iter()
+            .map(|v| *v)
+            .collect()
     }
 
     // ========================================================================
@@ -354,7 +365,7 @@ impl MmStruct {
 
     /// Get mutable iterator over all VMAs
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Vma> {
-        self.vmas.iter_mut()
+        self.vmas.iter_mut().map(|v| &mut **v)
     }
 
     // ========================================================================
@@ -498,7 +509,7 @@ impl MmStruct {
             return None;
         }
 
-        let vma = self.vmas.remove(vma_idx);
+        let vma = *self.vmas.remove(vma_idx);
         let pages = vma.size() >> 12;
         self.total_vm = self.total_vm.saturating_sub(pages);
         if vma.is_locked() {
@@ -510,12 +521,12 @@ impl MmStruct {
 
     /// Get a reference to a VMA by index
     pub fn get_vma(&self, vma_idx: usize) -> Option<&Vma> {
-        self.vmas.get(vma_idx)
+        self.vmas.get(vma_idx).map(|v| &**v)
     }
 
     /// Get a mutable reference to a VMA by index
     pub fn get_vma_mut(&mut self, vma_idx: usize) -> Option<&mut Vma> {
-        self.vmas.get_mut(vma_idx)
+        self.vmas.get_mut(vma_idx).map(|v| &mut **v)
     }
 
     // ========================================================================
@@ -541,7 +552,7 @@ impl MmStruct {
         }
 
         // Clone VMA for the second half
-        let mut new_vma = vma.clone();
+        let mut new_vma = alloc::boxed::Box::new((**vma).clone());
         new_vma.start = split_addr;
 
         // Adjust the offset into the backing file or shared object
@@ -825,7 +836,7 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
                     }
                 });
             }
-            map.vmas.push(v);
+            map.vmas.push(alloc::boxed::Box::new(v));
             if res.is_err() {
                 break;
             }

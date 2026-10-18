@@ -291,8 +291,8 @@ memory is at the low watermark (Linux maps the shared zero page).
 
 The heap is the slab allocator over the page allocator, so it grows
 with RAM; what is missing: no shrinker (caches give back empty slabs
-beyond two each, but nothing asks them under pressure), no
-/proc/slabinfo, no slab merging, poisoning or red zones. Every TCP
+beyond two each, but nothing asks them under pressure), no slab
+merging, poisoning or red zones. Every TCP
 TIME_WAIT entry keeps a full control block (about 2 KB) for 60 s.
 
 Heap allocations cannot fail gracefully (Rust's global allocator): one

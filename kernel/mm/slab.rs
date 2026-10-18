@@ -59,6 +59,8 @@ struct Lists {
     partial: usize,
     empty: usize,
     nr_empty: usize,
+    /// Objects out of their slabs (in use, or in a per-CPU array)
+    active: usize,
 }
 
 /// A cache of equally sized objects (Linux struct kmem_cache)
@@ -66,6 +68,8 @@ pub struct KmemCache {
     pub name: &'static str,
     /// Object stride (size rounded up to the alignment)
     size: usize,
+    /// The layout it was made for (named caches match it exactly)
+    obj: (usize, usize),
     /// Slab order and objects per slab
     order: u32,
     objs: usize,
@@ -111,6 +115,7 @@ impl KmemCache {
         align: usize,
         src: &'static dyn SlabPages,
     ) -> Self {
+        let obj = (size, align);
         let a = if align < 8 { 8 } else { align };
         let size = (if size < 8 { 8 } else { size }).next_multiple_of(a);
         let order = slab_order(size);
@@ -118,6 +123,7 @@ impl KmemCache {
         Self {
             name,
             size,
+            obj,
             order,
             objs: (4096 << order) / size,
             limit,
@@ -133,6 +139,7 @@ impl KmemCache {
                 partial: 0,
                 empty: 0,
                 nr_empty: 0,
+                active: 0,
             }),
             nr_slabs: AtomicUsize::new(0),
         }
@@ -200,6 +207,7 @@ impl KmemCache {
         // the next free object
         let next = unsafe { *(obj as *const usize) };
         pg.private.store(next as u64, Ordering::Relaxed);
+        l.active += 1;
         let inuse = pg.inuse.fetch_add(1, Ordering::Relaxed) as usize + 1;
         if inuse == 1 {
             self.unlink(&mut l.empty, base);
@@ -220,6 +228,7 @@ impl KmemCache {
         // SAFETY: the object is free again; its first word links the list
         unsafe { *(obj as *mut usize) = pg.private.load(Ordering::Relaxed) as usize };
         pg.private.store(obj as u64, Ordering::Relaxed);
+        l.active -= 1;
         let inuse = pg.inuse.fetch_sub(1, Ordering::Relaxed) as usize - 1;
         if inuse + 1 < self.objs {
             if inuse == 0 {
@@ -499,8 +508,55 @@ fn large_order(size: usize, align: usize) -> u32 {
     pages.next_power_of_two().trailing_zeros()
 }
 
-/// The cache that serves `layout` (exact-size named caches first)
+// ============================================================================
+// Named caches
+// ============================================================================
+
+/// Layout of an `Arc<T>` allocation: std's repr(C) ArcInner { strong,
+/// weak, data }
+const fn arc_layout(size: usize, align: usize) -> (usize, usize) {
+    let a = if align > 8 { align } else { 8 };
+    (
+        (16usize.next_multiple_of(align) + size).next_multiple_of(a),
+        a,
+    )
+}
+
+const fn arc_of<T>() -> (usize, usize) {
+    arc_layout(core::mem::size_of::<T>(), core::mem::align_of::<T>())
+}
+
+const fn box_of<T>() -> (usize, usize) {
+    (core::mem::size_of::<T>(), core::mem::align_of::<T>())
+}
+
+macro_rules! named_cache {
+    ($name:literal, $layout:expr) => {
+        KmemCache::new($name, $layout.0, $layout.1, &KERNEL_PAGES)
+    };
+}
+
+/// VMAs (`Box<Vma>`; Linux vm_area_cachep)
+pub static VMA_CACHE: KmemCache = named_cache!("vm_area_struct", box_of::<crate::mm::Vma>());
+/// Dentries (`Arc<Dentry>`; Linux dentry_cache)
+pub static DENTRY_CACHE: KmemCache = named_cache!("dentry", arc_of::<crate::fs::dentry::Dentry>());
+/// Inodes (`Arc<Inode>`; Linux inode_cache)
+pub static INODE_CACHE: KmemCache =
+    named_cache!("inode_cache", arc_of::<crate::fs::inode::Inode>());
+
+/// Object types with a cache of their own. Rust allocates through the
+/// global allocator with only a layout, so these caches serve every
+/// allocation of exactly their type's layout (another type of the same
+/// size and alignment shares it, like Linux slab merging); keeps them
+/// out of the kmalloc caches and counted per type.
+static NAMED: [&KmemCache; 3] = [&VMA_CACHE, &DENTRY_CACHE, &INODE_CACHE];
+
+/// The cache that serves a layout: a named cache of exactly that
+/// layout, else the kmalloc class
 fn cache_for(size: usize, align: usize) -> Option<&'static KmemCache> {
+    if let Some(c) = NAMED.iter().find(|c| c.obj == (size, align)) {
+        return Some(c);
+    }
     kmalloc_index(size, align).map(|i| &KMALLOC[i])
 }
 
@@ -539,8 +595,41 @@ pub fn fits(old: usize, new: usize, align: usize) -> bool {
 
 /// Bytes of slab pages (meminfo Slab; large kmallocs are page
 /// allocations, as in Linux)
+/// /proc/slabinfo (Linux slabinfo 2.1 format; active objects include
+/// those cached in per-CPU arrays, as Linux SLAB counted them)
+pub fn slabinfo() -> alloc::vec::Vec<u8> {
+    use core::fmt::Write;
+    let mut out = alloc::string::String::from(
+        "slabinfo - version: 2.1\n# name            <active_objs> <num_objs> <objsize> \
+         <objperslab> <pagesperslab> : tunables <limit> <batchcount> <sharedfactor> \
+         : slabdata <active_slabs> <num_slabs> <sharedavail>\n",
+    );
+    for c in NAMED.iter().copied().chain(KMALLOC.iter()) {
+        let active = c.list_lock.lock().active;
+        let slabs = c.nr_slabs.load(Ordering::Relaxed);
+        let _ = writeln!(
+            out,
+            "{:<17} {:>6} {:>6} {:>6} {:>4} {:>4} : tunables {:>4} {:>4} {:>4} : slabdata {:>6} {:>6} {:>6}",
+            c.name,
+            active,
+            slabs * c.objs,
+            c.size,
+            c.objs,
+            1 << c.order,
+            c.limit,
+            c.batch,
+            0,
+            slabs,
+            slabs,
+            0
+        );
+    }
+    out.into_bytes()
+}
+
 pub fn slab_bytes() -> usize {
     KMALLOC.iter().map(KmemCache::bytes).sum::<usize>()
+        + NAMED.iter().map(|c| c.bytes()).sum::<usize>()
 }
 
 const _: () = assert!(SIZES[SIZES.len() - 1] == KMALLOC_MAX);
@@ -670,6 +759,19 @@ pub mod tests {
         assert!(!fits(100, 200, 8));
         assert!(fits(9000, 16000, 8));
         assert!(!fits(8000, 9000, 8));
+    }
+
+    #[test]
+    fn named_caches_take_their_exact_layout() {
+        #[repr(align(64))]
+        #[allow(dead_code)]
+        struct Odd([u8; 200]);
+        assert_eq!(arc_of::<Odd>(), (320, 64));
+        assert_eq!(arc_of::<u8>(), (24, 8));
+        let (s, a) = box_of::<crate::mm::Vma>();
+        assert!(core::ptr::eq(cache_for(s, a).unwrap(), &VMA_CACHE));
+        let (s, a) = arc_of::<crate::fs::dentry::Dentry>();
+        assert!(core::ptr::eq(cache_for(s, a).unwrap(), &DENTRY_CACHE));
     }
 
     #[test]

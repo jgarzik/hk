@@ -36,7 +36,8 @@ Linux: `Documentation/arch/x86/x86_64/mm.rst`.
   physical 0x8000) enables paging on the boot table (identity map plus
   the kernel half) and `ap_entry` switches to the kernel table.
 - **Kernel memory**: the heap is the slab allocator (`mm/slab.rs`,
-  kmalloc caches 8 B-8 KB, pages above) over the page allocator,
+  kmalloc caches 8 B-8 KB, pages above; named caches for VMAs,
+  dentries and inodes, chosen by exact layout) over the page allocator,
   through the direct map (a 256 KB boot arena in the image serves boot
   until the page allocator is up); kernel stacks and DMA buffers are
   physically contiguous frame runs, also through the direct map.
