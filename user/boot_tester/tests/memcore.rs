@@ -91,9 +91,24 @@ fn toucher(before: i64) -> u64 {
     0
 }
 
+/// MemFree once it stops moving (within 1MB over 100ms, at most 3 s):
+/// frees an earlier test left in flight (Linux swap-cache and
+/// writeback, per-CPU lists) land before the baseline is taken
+fn settled_free() -> i64 {
+    let mut last = meminfo(b"MemFree:");
+    for _ in 0..30 {
+        sleep_ms(100);
+        let now = meminfo(b"MemFree:");
+        if (now - last).abs() < 1024 {
+            return now;
+        }
+        last = now;
+    }
+    last
+}
+
 fn touch_free() {
-    sleep_ms(20);
-    let before = meminfo(b"MemFree:");
+    let before = settled_free();
     let pid = sys_fork();
     if pid == 0 {
         sys_exit(toucher(before));
