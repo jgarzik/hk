@@ -1609,3 +1609,11 @@ fn oow_acks_rate_limited() {
     assert!(out.segs.is_empty());
     assert_eq!(p.a.state, TcpState::Established);
 }
+
+#[test]
+fn time_wait_entry_is_compact() {
+    let cb = core::mem::size_of::<super::cb::TcpCb>();
+    let tw = core::mem::size_of::<super::timewait::TimeWait>();
+    // kmalloc-256 with Arc's counts
+    assert!(tw + 16 <= 256, "TimeWait {tw} B vs TcpCb {cb} B");
+}

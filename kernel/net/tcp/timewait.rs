@@ -8,6 +8,9 @@
 //! ACK, dies on an acceptable RST, and after 2MSL leaves the tables. A
 //! new SYN beyond its RCV.NXT or with a newer timestamp ends it early so
 //! the tuple can be reused (Linux tcp_timewait_state_process TCP_TW_SYN).
+//! The entry keeps a compact `TwCb` (no queues, no congestion or RTT
+//! state), from which each segment or timer event rebuilds a control
+//! block for the call.
 //!
 //! Locking: `inner` is a `crate::sync::spin::Mutex` leaf like `TcpSock.cb` (thread
 //! context only; table and timer locks may be taken under it).
@@ -16,7 +19,7 @@ use alloc::sync::{Arc, Weak};
 
 use crate::sync::spin::Mutex;
 
-use super::cb::{Out, SegIn, TcpCb};
+use super::cb::{Out, SegIn, TwCb};
 use super::output::Tuple;
 use super::timer::{self, Expire, Slot};
 use crate::net::NetNamespace;
@@ -30,7 +33,7 @@ pub struct TimeWait {
     net: Arc<NetNamespace>,
     params: IpParams,
     oif: u32,
-    inner: Mutex<(TcpCb, Slot)>,
+    inner: Mutex<(TwCb, Slot)>,
     me: Weak<TimeWait>,
 }
 
@@ -42,7 +45,7 @@ impl TimeWait {
         bind: BindInfo,
         params: IpParams,
         oif: u32,
-        cb: TcpCb,
+        cb: TwCb,
     ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             tuple,
@@ -80,7 +83,9 @@ impl TimeWait {
                 self.net.tcp.tw_unhash(self);
                 return false;
             }
-            g.0.input(s, now, &mut out);
+            let mut cb = g.0.cb(super::cfg(&self.net));
+            cb.input(s, now, &mut out);
+            g.0 = TwCb::from_cb(&cb);
             self.post(&mut g, &out);
             // Transmitted under the entry lock, in order
             self.send(&out);
@@ -88,7 +93,7 @@ impl TimeWait {
         true
     }
 
-    fn post(self: &Arc<Self>, g: &mut (TcpCb, Slot), out: &Out) {
+    fn post(self: &Arc<Self>, g: &mut (TwCb, Slot), out: &Out) {
         let want = if out.done { None } else { g.0.next_timer() };
         timer::rearm(&mut g.1, want, self.me.clone() as Weak<dyn Expire>);
         if out.done {
@@ -109,7 +114,9 @@ impl Expire for TimeWait {
         {
             let mut g = self.inner.lock();
             timer::fired(&mut g.1, id);
-            g.0.on_timer(now, &mut out);
+            let mut cb = g.0.cb(super::cfg(&self.net));
+            cb.on_timer(now, &mut out);
+            g.0 = TwCb::from_cb(&cb);
             self.post(&mut g, &out);
             self.send(&out);
         }

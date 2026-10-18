@@ -301,6 +301,134 @@ pub(super) fn copy_out(q: &VecDeque<u8>, skip: usize, buf: &mut [u8]) {
     }
 }
 
+/// The state a TIME_WAIT entry keeps instead of a whole control block
+/// (Linux tcp_timewait_sock: about a quarter of the size, no queues).
+/// A segment or the timer is handled by a control block rebuilt from it
+/// for the call (`cb`, then `from_cb`), so TIME_WAIT behaves exactly as
+/// the full control block's input and timer code define it (TIME_WAIT
+/// ACKs at once: no delayed-ACK state is kept).
+#[derive(Clone, Debug)]
+pub struct TwCb {
+    state: TcpState,
+    iss: u32,
+    snd_una: u32,
+    snd_nxt: u32,
+    snd_max: u32,
+    snd_wnd: u32,
+    max_wnd: u32,
+    snd_wl1: u32,
+    snd_wl2: u32,
+    sndq_seq: u32,
+    fin_queued: bool,
+    irs: u32,
+    pub rcv_nxt: u32,
+    rcv_adv: u32,
+    rcv_wup: u32,
+    rcv_cap: usize,
+    snd_wscale: u8,
+    rcv_wscale: u8,
+    ts_ok: bool,
+    ts_off: u32,
+    pub ts_recent: u32,
+    ts_stamp: u64,
+    clock: u64,
+    mss: u32,
+    adv_mss: u32,
+    tmr: Option<(Tmr, u64)>,
+    wait_at: Option<u64>,
+    last_oow: Option<u64>,
+}
+
+impl TwCb {
+    /// Capture a control block in TIME_WAIT (its queues stay behind)
+    pub fn from_cb(c: &TcpCb) -> Self {
+        Self {
+            state: c.state,
+            iss: c.iss,
+            snd_una: c.snd_una,
+            snd_nxt: c.snd_nxt,
+            snd_max: c.snd_max,
+            snd_wnd: c.snd_wnd,
+            max_wnd: c.max_wnd,
+            snd_wl1: c.snd_wl1,
+            snd_wl2: c.snd_wl2,
+            sndq_seq: c.data_end(),
+            fin_queued: c.fin_queued,
+            irs: c.irs,
+            rcv_nxt: c.rcv_nxt,
+            rcv_adv: c.rcv_adv,
+            rcv_wup: c.rcv_wup,
+            rcv_cap: c.rcv_cap,
+            snd_wscale: c.snd_wscale,
+            rcv_wscale: c.rcv_wscale,
+            ts_ok: c.ts_ok,
+            ts_off: c.ts_off,
+            ts_recent: c.ts_recent,
+            ts_stamp: c.ts_stamp,
+            clock: c.clock,
+            mss: c.mss,
+            adv_mss: c.adv_mss,
+            tmr: c.tmr,
+            wait_at: c.wait_at,
+            last_oow: c.last_oow,
+        }
+    }
+
+    /// A control block in this state, empty queues, with the
+    /// namespace's current settings
+    pub fn cb(&self, cfg: Cfg) -> TcpCb {
+        let mut t = TcpCb::new(cfg);
+        t.state = self.state;
+        t.iss = self.iss;
+        t.snd_una = self.snd_una;
+        t.snd_nxt = self.snd_nxt;
+        t.snd_max = self.snd_max;
+        t.snd_wnd = self.snd_wnd;
+        t.max_wnd = self.max_wnd;
+        t.snd_wl1 = self.snd_wl1;
+        t.snd_wl2 = self.snd_wl2;
+        t.sndq_seq = self.sndq_seq;
+        t.fin_queued = self.fin_queued;
+        t.irs = self.irs;
+        t.rcv_nxt = self.rcv_nxt;
+        t.rcv_adv = self.rcv_adv;
+        t.rcv_wup = self.rcv_wup;
+        t.rcv_cap = self.rcv_cap;
+        t.snd_wscale = self.snd_wscale;
+        t.rcv_wscale = self.rcv_wscale;
+        t.ts_ok = self.ts_ok;
+        t.ts_off = self.ts_off;
+        t.ts_recent = self.ts_recent;
+        t.ts_stamp = self.ts_stamp;
+        t.clock = self.clock;
+        t.mss = self.mss;
+        t.adv_mss = self.adv_mss;
+        t.tmr = self.tmr;
+        t.wait_at = self.wait_at;
+        t.last_oow = self.last_oow;
+        t
+    }
+
+    /// When the next timer is due
+    pub fn next_timer(&self) -> Option<u64> {
+        [self.tmr.map(|t| t.1), self.wait_at]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// A SYN that may reuse the tuple (Linux TCP_TW_SYN): beyond
+    /// RCV.NXT, or with a newer timestamp
+    pub fn tw_syn_ok(&self, s: &SegIn) -> bool {
+        s.has(flags::SYN)
+            && !s.has(flags::ACK | flags::RST)
+            && (after(s.seq, self.rcv_nxt)
+                || (self.ts_ok
+                    && s.ts
+                        .is_some_and(|(v, _)| (v.wrapping_sub(self.ts_recent) as i32) > 0)))
+    }
+}
+
 /// What the retransmission timer is running for
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tmr {
@@ -976,49 +1104,10 @@ impl TcpCb {
         out.wake = true;
     }
 
-    /// The TIME_WAIT part of this control block, without queues: what a
-    /// timewait entry keeps (Linux tcp_timewait_sock)
-    pub fn tw_clone(&self) -> TcpCb {
-        let mut t = TcpCb::new(self.cfg);
-        t.state = TcpState::TimeWait;
-        t.iss = self.iss;
-        t.snd_una = self.snd_una;
-        t.snd_nxt = self.snd_nxt;
-        t.snd_max = self.snd_max;
-        t.snd_wnd = self.snd_wnd;
-        t.max_wnd = self.max_wnd;
-        t.snd_wl1 = self.snd_wl1;
-        t.snd_wl2 = self.snd_wl2;
-        t.sndq_seq = self.data_end();
-        t.fin_queued = self.fin_queued;
-        t.irs = self.irs;
-        t.rcv_nxt = self.rcv_nxt;
-        t.rcv_adv = self.rcv_adv;
-        t.rcv_wup = self.rcv_wup;
-        t.rcv_cap = self.rcv_cap;
-        t.snd_wscale = self.snd_wscale;
-        t.rcv_wscale = self.rcv_wscale;
-        t.ts_ok = self.ts_ok;
-        t.ts_off = self.ts_off;
-        t.ts_recent = self.ts_recent;
-        t.ts_stamp = self.ts_stamp;
-        t.clock = self.clock;
-        t.mss = self.mss;
-        t.adv_mss = self.adv_mss;
-        t.wait_at = self.wait_at;
-        t
-    }
-
-    /// A SYN may reopen this TIME_WAIT tuple (Linux
-    /// tcp_timewait_state_process TCP_TW_SYN): beyond RCV.NXT, or with a
-    /// newer timestamp
-    pub fn tw_syn_ok(&self, s: &SegIn) -> bool {
-        s.has(flags::SYN)
-            && !s.has(flags::ACK | flags::RST)
-            && (after(s.seq, self.rcv_nxt)
-                || (self.ts_ok
-                    && s.ts
-                        .is_some_and(|(v, _)| (v.wrapping_sub(self.ts_recent) as i32) > 0)))
+    /// The TIME_WAIT part of this control block: what a timewait
+    /// entry keeps (Linux tcp_timewait_sock)
+    pub fn tw_clone(&self) -> TwCb {
+        TwCb::from_cb(self)
     }
 
     /// The socket's side after handing TIME_WAIT over: CLOSED, readable
