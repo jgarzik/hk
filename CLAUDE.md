@@ -10,7 +10,7 @@ hk: stable-Rust (no nightly) no_std SMP kernel, x86-64 + aarch64, Linux syscall 
 
 ## Build / verify
 - Makefile targets only (bare cargo lacks `--target`). `user/`, `tools/` are separate workspaces; setup: `DEVELOPMENT.md`.
-- Done = `make test check check-arm check-linux check-linux-arm clippy clippy-arm fmt-check` all pass, clippy warning-free. `check*` pass = shutdown msg, no `FAIL` in `target/qemu/serial{,_arm}.log` (`QEMU_LOG_DIR`, per tree).
+- Done = `make gate` prints GATE-OK: `fmt-check clippy clippy-arm test` (warning-free), then `check check-arm check-linux check-linux-arm` in parallel. `check*` pass = shutdown msg, no `FAIL` in `target/qemu/serial{,_arm}.log` (`QEMU_LOG_DIR`, per tree). `check-linux*` PASS is cached by input hash; `LINUX_NOCACHE=1` reruns.
 - `check-linux*` run the same `user/boot_tester` as init on real Linux: tests must pass on BOTH; Linux defines expected behavior. Host-only branches: `host_mode()`/`skip()` in `tests/helpers.rs`.
 
 ## Rules

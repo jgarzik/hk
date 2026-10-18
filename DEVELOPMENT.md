@@ -112,13 +112,23 @@ package).
 ### Full Build + Test (Recommended)
 
 ```bash
-make check          # Build x86-64 + boot test (SUCCESS criteria)
-make check-arm      # Build aarch64 + boot test (SUCCESS criteria)
+make gate           # The per-commit gate (SUCCESS criteria: GATE-OK)
+
+# Its parts, one at a time
+make check          # Build x86-64 + boot test
+make check-arm      # Build aarch64 + boot test
 make check-linux    # boot_tester on real Linux (native arch)
 make check-linux-arm # Same, aarch64 Linux (emulated on x86)
 make clippy         # Linting for x86-64
 make clippy-arm     # Linting for aarch64
 ```
+
+`make gate` (`tools/gate.sh`) runs `fmt-check`, `clippy` and `clippy-arm`
+(`-D warnings`) and `test`, stopping at the first failure, then builds
+everything the boots need, then runs `check`, `check-arm`, `check-linux`
+and `check-linux-arm` in parallel (`NOBUILD=1`: boot what is built). It
+prints one line per boot and `GATE-OK` or `GATE-FAILED`; each step's
+output is in `target/qemu/gate/<step>.out`.
 
 The serial logs of all boots go to `QEMU_LOG_DIR` (default
 `target/qemu/` of the tree), so worktrees and parallel boots never share
@@ -126,6 +136,20 @@ a log: `serial.log` (x86-64), `serial_arm.log` (aarch64),
 `usb_serial.log` (x86-64 USB serial), `serial_linux_<arch>.log`
 (`check-linux*`). `NO_KVM=1` (e.g. `NO_KVM=1 make check`) runs x86
 under TCG, as CI does.
+
+`check-linux*` results do not depend on `kernel/`, so a PASS is cached
+in `~/.cache/hk-linux-check/<arch>/<hash>` (`LINUX_CACHE_DIR`), shared by
+all worktrees; a rerun with the same hash prints `check-linux: cached
+PASS (<arch> <hash>)` and skips the boot. The hash covers the tracked
+and untracked files of `user/`, `Makefile`, `rust-toolchain.toml`,
+`tools/{linux-boot-tester,mkdisk,busybox-root,fetch-deb,qemu-net}.sh`
+and `tools/netpeer/`; the Linux kernel and its config, the initramfs
+tree (paths, modes, link targets, contents), the versions of the tools
+`mkdisk.sh` uses (the image's FAT timestamps differ per build); the
+QEMU version, machine, KVM use, network and disk options, the timeout
+and the host kernel release (`target/linux-test-<arch>/cache-key` shows
+the input). `LINUX_NOCACHE=1` boots anyway; the cache is off when `CI`
+is set.
 
 ## Running in QEMU
 

@@ -70,7 +70,7 @@ jobs:
           if-no-files-found: ignore
 
       # Differential run of boot_tester on Ubuntu's Linux kernel (TCG here,
-      # hence the long timeout).
+      # hence the long timeout). CI is set, so the PASS cache is off.
       - name: Boot test on Linux (x86-64)
         id: linux_x86
         run: make check-linux LINUX_TEST_TIMEOUT=300

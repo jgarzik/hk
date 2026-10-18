@@ -25,7 +25,7 @@ KERNEL_FEATURES = $(if $(LOCKDEP),--features lockdep)
 MACHINE ?=
 
 .PHONY: all build debug user iso iso-debug run run-debug test check clean info help vfat-image disk-image
-.PHONY: build-arm run-arm check-arm check-linux check-linux-arm user-arm clippy clippy-arm fmt list-machines
+.PHONY: build-arm run-arm check-arm check-linux check-linux-arm user-arm clippy clippy-arm fmt list-machines gate
 
 # Default: build everything (kernel, user binaries, ISO)
 all: iso
@@ -55,6 +55,7 @@ help:
 	@echo "  make check-arm - Boot ARM64 kernel, verify tests pass"
 	@echo "  make check-linux - Run boot tests on a real Linux kernel (native arch)"
 	@echo "  make check-linux-arm - Same, aarch64 Linux (emulated on x86 hosts)"
+	@echo "  make gate     - Full per-commit gate, the four boots in parallel"
 	@echo ""
 	@echo "  make clippy   - Run clippy linter (x86-64)"
 	@echo "  make clippy-arm - Run clippy linter (aarch64)"
@@ -162,8 +163,9 @@ export QEMU_CPU
 # hk boot test NIC (see run-qemu.sh): virtio (default) or e1000
 export NIC
 
-# NO_KVM=1: force TCG on x86 (CI's conditions)
-export NO_KVM
+# NO_KVM=1: force TCG on x86 (CI's conditions); LINUX_NOCACHE=1: boot
+# check-linux* even if the PASS is cached (tools/linux-boot-tester.sh)
+export NO_KVM LINUX_NOCACHE
 
 # Serial logs, per tree (so worktrees and parallel boots don't collide)
 QEMU_LOG_DIR ?= $(CURDIR)/target/qemu
@@ -171,7 +173,11 @@ export QEMU_LOG_DIR
 SERIAL_LOG = $(QEMU_LOG_DIR)/serial.log
 SERIAL_LOG_ARM = $(QEMU_LOG_DIR)/serial_arm.log
 
-check: iso disk-image
+# NOBUILD=1: boot what is already built (make gate builds first, then
+# boots in parallel; rebuilding would race)
+nobuild = $(if $(NOBUILD),,$(1))
+
+check: $(call nobuild,iso disk-image)
 	@rm -f $(SERIAL_LOG)
 	@echo "Running boot test ($(BOOT_TEST_TIMEOUT) second timeout)..."
 	@./run-qemu.sh -t -T $(BOOT_TEST_TIMEOUT)
@@ -212,7 +218,7 @@ build-arm: user-arm
 run-arm: build-arm vfat-image disk-image
 	./run-qemu.sh --arch arm
 
-check-arm: build-arm vfat-image disk-image
+check-arm: $(call nobuild,build-arm vfat-image disk-image)
 	@rm -f $(SERIAL_LOG_ARM)
 	@echo "Running ARM boot test ($(BOOT_TEST_TIMEOUT) second timeout)..."
 	@./run-qemu.sh --arch arm -t -T $(BOOT_TEST_TIMEOUT)
@@ -234,11 +240,11 @@ check-arm: build-arm vfat-image disk-image
 # Differential test: boot_tester as init on a real Linux kernel (native arch)
 # Bounds hangs only; emulated aarch64 Linux takes ~150s, more in parallel
 LINUX_TEST_TIMEOUT ?= 300
-check-linux: disk-image
+check-linux: $(call nobuild,disk-image)
 	./tools/linux-boot-tester.sh -T $(LINUX_TEST_TIMEOUT)
 
 # Same, aarch64 Linux emulated on any host (for local iteration on x86)
-check-linux-arm: disk-image
+check-linux-arm: $(call nobuild,disk-image)
 	./tools/linux-boot-tester.sh -a aarch64 -T $(LINUX_TEST_TIMEOUT)
 
 info-arm: build-arm
@@ -268,3 +274,7 @@ fmt:
 # Check formatting without modifying
 fmt-check:
 	cargo fmt --check
+
+# The full per-commit gate (tools/gate.sh)
+gate:
+	@tools/gate.sh

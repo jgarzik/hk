@@ -8,9 +8,14 @@
 # cached under target/linux-kernel/. Defaults to the native architecture;
 # `-a` selects the other one (emulated; kernel fetched from Ubuntu ports).
 #
+# A PASS is cached (see linux_cache_key): a rerun with the same inputs
+# skips the boot. The cache is shared by all worktrees and off on CI.
+#
 # Usage: tools/linux-boot-tester.sh [-a x86_64|aarch64] [-T timeout_seconds]
 # Env:   LINUX_KERNEL=/path/to/vmlinuz  use this kernel instead of Ubuntu's
 #        NO_KVM=1          force TCG even if /dev/kvm works (as on CI)
+#        LINUX_NOCACHE=1   boot even if this PASS is cached
+#        LINUX_CACHE_DIR   cache (default ~/.cache/hk-linux-check)
 #        QEMU_LOG_DIR      serial log directory (default target/qemu)
 
 set -euo pipefail
@@ -126,8 +131,41 @@ fi
 . tools/qemu-net.sh
 qemu_net_args virtio
 
-echo "Booting boot_tester on Linux (${TIMEOUT}s timeout)..."
+# Hash of everything that decides the result, hk's kernel/ excluded:
+# the sources (user/ workspace, these scripts, Makefile, toolchain pin),
+# what gets booted (kernel, its config, initramfs tree; the disk image by
+# mkdisk.sh and its tools, as its FAT timestamps differ per build) and
+# how (QEMU version, machine/KVM, network, timeout, host kernel)
+linux_cache_key() {
+    local f files
+    files=$(git ls-files -co --exclude-standard -- user Makefile rust-toolchain.toml \
+        tools/linux-boot-tester.sh tools/mkdisk.sh tools/busybox-root.sh \
+        tools/fetch-deb.sh tools/qemu-net.sh tools/netpeer | LC_ALL=C sort -u) || return 1
+    {
+        echo "$ARCH $TIMEOUT ${KVM[*]} ${QEMU_MACHINE[*]} ${DISK[*]}" &&
+            echo "${QEMU_NET[*]//"$TOP"/}" &&
+            "$QEMU_BIN" --version &&
+            uname -r &&
+            for f in $files; do [ ! -f "$f" ] || sha256sum "$f" || return 1; done &&
+            sha256sum "$LINUX_KERNEL" ${CONFIG:+"$CONFIG"} &&
+            dpkg-query -W fdisk dosfstools mtools util-linux perl &&
+            (cd "$ROOT" && find . -printf '%p %y %m %l\n' | LC_ALL=C sort &&
+                find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum)
+    } > "$WORK/cache-key" || return 1
+    sha256sum < "$WORK/cache-key" | cut -c1-32
+}
+
 rm -f "$SERIAL_LOG"
+CACHE=
+if [ -z "${CI:-}" ] && KEY=$(linux_cache_key); then
+    CACHE=${LINUX_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/hk-linux-check}/$ARCH/$KEY
+    if [ -f "$CACHE" ] && [ "${LINUX_NOCACHE:-}" != 1 ]; then
+        echo "check-linux: cached PASS ($ARCH $KEY)"
+        exit 0
+    fi
+fi
+
+echo "Booting boot_tester on Linux (${TIMEOUT}s timeout)..."
 timeout "$TIMEOUT" "$QEMU_BIN" "${KVM[@]}" "${QEMU_MACHINE[@]}" \
     -m 512M -smp 4 -nographic -no-reboot -monitor none "${QEMU_NET[@]}" "${DISK[@]}" \
     -kernel "$LINUX_KERNEL" -initrd "$WORK/initramfs.cpio" \
@@ -147,3 +185,8 @@ if [ "$FAILS" != 0 ]; then
     exit 1
 fi
 echo "Linux boot test PASSED"
+if [ -n "$CACHE" ]; then
+    mkdir -p "${CACHE%/*}"
+    grep -ac ':OK' "$SERIAL_LOG" > "$CACHE.$$"
+    mv "$CACHE.$$" "$CACHE"
+fi
