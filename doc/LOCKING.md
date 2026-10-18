@@ -235,7 +235,7 @@ VFS locks (detailed order):
         ↓
     Dentry.d_lock (single d_lock like Linux; short, never held across i_rwsem)
         ↓
-    Inode.{lock, private}
+    Inode.private
         ↓
 Filesystem-internal locks (ramfs children/data, procfs data)
     ↓
@@ -1296,7 +1296,6 @@ the last reference.
 ```rust
 pub struct Inode {
     pub size: AtomicU64,                           // Lock-free size updates
-    pub lock: RwLock<()>,                          // Metadata protection
     i_rwsem: RwSem,                                // Dir ops, file write/truncate
     pub private: RwLock<Option<Arc<dyn InodeData>>>, // FS-specific data
 }
@@ -1628,37 +1627,17 @@ to stay locked between calls. The call holds the file's `f_pos_lock`
 
 #### Inode Timestamp Locking (Linux i_rwsem Pattern)
 
-**Location:** `fs/inode.rs`, `fs/syscall.rs`
+**Location:** `fs/inode.rs` (`InodeTime`), `fs/perm.rs` (utimes)
 
-Inode timestamps (`atime`, `mtime`, `ctime`) use `Cell<Timespec>` internally. Since
-`Cell` is not thread-safe, callers **must hold `inode.lock`** before accessing
-timestamps. This follows Linux's pattern where callers provide serialization via
-`i_rwsem`.
+Each timestamp (`atime`, `mtime`, `ctime`) is a pair of atomics (seconds,
+nanoseconds), like Linux's `i_*time_sec` / `i_*time_nsec` fields:
 
-**Locking Requirements:**
-- **Reads** (stat/getattr): Hold `inode.lock` in read mode
-- **Writes** (utimensat, utimes, utime): Hold `inode.lock` in write mode
-
-**Implementation Pattern:**
-```rust
-// Reading timestamps (e.g., in getattr):
-let _guard = inode.lock.read();
-let atime = inode.atime();
-let mtime = inode.mtime();
-let ctime = inode.ctime();
-
-// Writing timestamps (e.g., in sys_utimensat):
-{
-    let _guard = inode.lock.write();
-    inode.set_atime(new_atime);
-    inode.set_mtime(new_mtime);
-    inode.set_ctime(now);
-}
-```
-
-**Why not atomics?** Timespec is a struct with two fields (sec, nsec). Converting
-to atomics would complicate the API and still require paired loads/stores for
-consistency. The struct-level locking pattern matches Linux's approach.
+- **Reads** (getattr/stat) are lock-free (Linux `inode_get_mtime` in
+  `generic_fillattr`). A read racing a write may pair the new seconds with
+  the old nanoseconds, as on Linux.
+- **Writes** hold `i_rwsem` exclusive (Linux `notify_change` under
+  `inode_lock`): utimensat/utimes/utime take it after `want_write` and the
+  permission check, then set atime, mtime and ctime.
 
 #### Wait Queues (kernel/waitqueue.rs)
 

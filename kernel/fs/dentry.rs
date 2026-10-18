@@ -192,32 +192,29 @@ impl Dentry {
     }
 
     /// Get the full path from root to this dentry
+    ///
+    /// Each parent is held by its Arc while its name is read.
     pub fn full_path(&self) -> String {
         let mut components = Vec::new();
-        let mut current = Some(self as *const Dentry);
-
-        // Walk up to root
-        while let Some(ptr) = current {
-            // Safety: we're just reading the name, not storing the pointer
-            let dentry = unsafe { &*ptr };
-            if !dentry.name.is_empty() {
-                components.push(dentry.name.clone());
-            }
-            current = dentry.get_parent().map(|p| Arc::as_ptr(&p));
+        if !self.name.is_empty() {
+            components.push(self.name.clone());
         }
-
-        // Build path from root to leaf
-        components.reverse();
+        let mut cur = self.get_parent();
+        while let Some(d) = cur {
+            if !d.name.is_empty() {
+                components.push(d.name.clone());
+            }
+            cur = d.get_parent();
+        }
         if components.is_empty() {
-            String::from("/")
-        } else {
-            let mut path = String::new();
-            for comp in components {
-                path.push('/');
-                path.push_str(&comp);
-            }
-            path
+            return String::from("/");
         }
+        let mut path = String::new();
+        for comp in components.iter().rev() {
+            path.push('/');
+            path.push_str(comp);
+        }
+        path
     }
 
     /// Iterate over children (for readdir)
@@ -236,10 +233,6 @@ impl Dentry {
         self.d_lock.read().children.len()
     }
 }
-
-// Dentry is Send + Sync because all interior mutability is through a single lock
-unsafe impl Send for Dentry {}
-unsafe impl Sync for Dentry {}
 
 /// Global dentry cache
 /// For now, this is simple - dentries are cached implicitly via Arc references.
