@@ -762,7 +762,9 @@ pub struct Zone {
   allocation in IRQ context).
 - Watermarks (min/low/high, from min_free_kbytes) are set once at boot
   and checked lock-free against the zone's free count (an atomic
-  written under `Zone.lock`), as Linux zone_watermark_ok.
+  written under `Zone.lock`) plus this CPU's list count (its atomic;
+  a refill only moves pages between the two), as Linux
+  zone_watermark_ok.
 - Reference counts are atomics in struct page (`get`/`put`, no lock);
   the put that reaches zero frees. `get` never takes a count from zero
   (Linux get_page_unless_zero): a racing final put wins, and the

@@ -820,10 +820,13 @@ impl Zone {
     }
 
     /// Taking 2^order pages leaves the zone above the allocation's
-    /// watermark (Linux zone_watermark_ok; free pages on per-CPU lists
-    /// are not counted, as in Linux)
+    /// watermark (Linux zone_watermark_ok): the buddy lists' free pages
+    /// and this CPU's list (an order-0 refill moves `batch` pages there
+    /// at once; not counting them failed the next 30 allocations, each
+    /// then reclaiming); other CPUs' lists are not counted, as in Linux
     pub fn watermark_ok(&self, order: u32, gfp: Gfp) -> bool {
-        let free = self.nr_free() as isize - (1isize << order) + 1;
+        let local = self.pcp().map_or(0, |p| p.count.load(Ordering::Relaxed));
+        let free = (self.nr_free() + local) as isize - (1isize << order) + 1;
         free > alloc_mark(&self.wmark, gfp) as isize
     }
 
@@ -1085,6 +1088,24 @@ mod tests {
         assert_eq!(alloc_mark(&w, Gfp::HIGHUSER_MOVABLE), 20);
         assert_eq!(alloc_mark(&w, Gfp::HIGHUSER_RECLAIM), 20);
         assert_eq!(alloc_mark(&w, Gfp::KERNEL), 10);
+    }
+
+    /// Pages a refill moved to this CPU's list still count toward its
+    /// watermark: the allocations after a refill do not fail
+    #[test]
+    fn local_list_counts_toward_watermark() {
+        let t = zone(0, 64);
+        t.z.free_range(0, 64);
+        t.z.batch.store(8, Ordering::Relaxed);
+        t.z.high.store(32, Ordering::Relaxed);
+        t.z.wmark
+            .iter()
+            .for_each(|w| w.store(50, Ordering::Relaxed));
+        // 64 free, mark 50: 14 pages may go, whatever the refills did
+        let got = (0..20)
+            .filter_map(|_| t.z.alloc_pages(0, Gfp::NOWAIT))
+            .count();
+        assert_eq!(got, 14);
     }
 
     /// A drain that finds one running returns at once (never waits)

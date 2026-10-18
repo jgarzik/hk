@@ -263,9 +263,9 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
 /// The leaf entry for `addr`, allocating missing tables; out of memory,
 /// pages are reclaimed (with no spinlock held: the tables are allocated
 /// under the page_table_lock) and the allocation tried again while that
-/// frees some
+/// frees some, a bounded number of times
 fn leaf(mm: &Mm, addr: u64) -> Result<*mut u64, VmFault> {
-    loop {
+    for _ in 0..16 {
         if let Some(p) = super::ptl::pte_alloc(mm, addr) {
             return Ok(p);
         }
@@ -277,6 +277,7 @@ fn leaf(mm: &Mm, addr: u64) -> Result<*mut u64, VmFault> {
             return Err(VmFault::Oom);
         }
     }
+    Err(VmFault::Oom)
 }
 
 /// A fault in a 2MB region: None to continue at the 4KB level
