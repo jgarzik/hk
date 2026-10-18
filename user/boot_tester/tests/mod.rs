@@ -32,6 +32,7 @@ pub mod frag;
 pub mod fs_common;
 pub mod fs_ops;
 pub mod futex;
+pub mod group_exit;
 pub mod helpers;
 pub mod icmp;
 pub mod inotify;
@@ -198,6 +199,7 @@ pub fn run_all_tests() {
     tcp::run_tests();
     isolated(b"MEMCORE", memcore::run_tests);
     isolated(b"MMLOCK", mmlock::run_tests);
+    group_exit::run_tests();
     netlink::run_tests();
     netdev_ioctl::run_tests();
     netdev::run_tests();

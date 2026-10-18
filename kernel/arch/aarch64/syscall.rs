@@ -911,7 +911,8 @@ pub fn aarch64_syscall_dispatch(
         SYS_MQ_GETSETATTR => crate::ipc::sys_mq_getsetattr(arg0 as i32, arg1, arg2) as u64,
 
         // Process lifecycle
-        SYS_EXIT | SYS_EXIT_GROUP => sys_exit(arg0 as i32),
+        SYS_EXIT => sys_exit(arg0 as i32),
+        SYS_EXIT_GROUP => crate::task::proc::sys_exit_group(arg0 as i32),
         SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32, arg4) as u64,
         // arm64 selects CONFIG_CLONE_BACKWARDS (kernel/fork.c): the raw
         // order is (flags, newsp, parent_tidptr, tls, child_tidptr).

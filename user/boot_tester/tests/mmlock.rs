@@ -257,8 +257,7 @@ fn test_shootdown_blocked_reader() {
     sys_close(p[0] as u64);
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
-    // EOF ends the reader if it outlived the fault (hk kills one thread
-    // per fatal signal, BUGS.md)
+    // The reader died with the process (SIGSEGV kills the group)
     sys_close(p[1] as u64);
     report(
         b"TLB_SHOOTDOWN_BLOCKED_READER",
@@ -321,17 +320,13 @@ fn test_kill_mmap_storm() {
     }
     let mut tids = [0i64; 3];
     sys_read(p[0] as u64, tids.as_mut_ptr() as *mut u8, 24);
+    let started = tids.iter().all(|&t| t > 0);
     sys_close(p[0] as u64);
     sys_close(p[1] as u64);
     sleep_ms(100);
+    // Every thread dies (Linux zap_other_threads), wait4 only reaps the
+    // process once all are gone
     sys_kill(pid, SIGKILL);
-    // hk delivers a fatal signal to one thread only (BUGS.md): the
-    // others are killed one by one (on Linux already gone: ESRCH)
-    for t in tids {
-        if t > 0 {
-            sys_tgkill(pid, t, SIGKILL);
-        }
-    }
     let t0 = mono_ms();
     let mut st = 0i32;
     let mut r = 0;
@@ -348,7 +343,7 @@ fn test_kill_mmap_storm() {
     }
     report(
         b"MMLOCK_KILL",
-        r == pid && st & 0x7f == SIGKILL as i32,
+        started && r == pid && st & 0x7f == SIGKILL as i32,
         st as i64,
     );
 }

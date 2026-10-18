@@ -494,22 +494,16 @@ fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Resu
 /// thread, logged like oom_kill_process), so the fault is never retried
 /// in a loop and the kernel keeps its reserve. Interrupts enabled.
 pub fn pagefault_out_of_memory() -> ! {
-    use crate::signal::{SIGKILL, send_signal};
+    use crate::signal::SIGKILL;
     use crate::task::percpu::{TASK_TABLE, current_tid};
 
     let tid = current_tid();
-    let (pid, name, threads) = {
+    let (pid, name) = {
         let table = TASK_TABLE.lock();
         let me = table.tasks.iter().find(|t| t.tid == tid);
         let pid = me.map_or(0, |t| t.pid);
         let name = me.map_or([0; 16], |t| t.prctl.name);
-        let threads: alloc::vec::Vec<_> = table
-            .tasks
-            .iter()
-            .filter(|t| t.pid == pid && t.tid != tid)
-            .map(|t| t.tid)
-            .collect();
-        (pid, name, threads)
+        (pid, name)
     };
     let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
     let exe = super::get_task_mm(tid).and_then(|mm| mm.mmap_read().exe());
@@ -521,10 +515,7 @@ pub fn pagefault_out_of_memory() -> ! {
             .unwrap_or("?"),
     };
     crate::printkln!("Out of memory: Killed process {} ({})", pid, comm);
-    for t in threads {
-        send_signal(t, SIGKILL);
-    }
-    crate::task::proc::do_exit(SIGKILL as i32)
+    crate::signal::do_group_exit(SIGKILL as i32)
 }
 
 /// Before a write into another process's private page by the kernel

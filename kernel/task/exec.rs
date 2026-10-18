@@ -42,6 +42,7 @@ pub const ENOMEM: i32 = 12; // Out of memory
 pub const EIO: i32 = 5; // I/O error
 pub const EFAULT: i32 = 14; // Bad address
 pub const E2BIG: i32 = 7; // Argument list too long
+pub const EAGAIN: i32 = 11; // Try again
 
 /// Maximum path length (matching Linux PATH_MAX)
 const PATH_MAX: usize = 4096;
@@ -600,6 +601,46 @@ fn exec_identity(path: &[u8], file: &File) -> ExecIdentity {
     ExecIdentity { name, dumpable }
 }
 
+/// End the other threads of the caller's group and wait until they
+/// have exited (Linux de_thread); a non-leader caller then takes the
+/// leader's place. EAGAIN if the group is exiting, or a fatal signal
+/// arrives meanwhile (the caller then dies on its way out). Threads
+/// running user code end at their next syscall or fault (P7: IRQ
+/// return).
+fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
+    use crate::task::percpu::{SleepState, schedule};
+    use crate::waitqueue::WaitEntry;
+
+    let tgid = percpu::current_pid();
+    let Some(sig) = crate::signal::get_task_signal_struct(tid) else {
+        return Ok(());
+    };
+    if percpu::group_others(tgid, tid) {
+        if !sig.start_exec(tid) {
+            return Err(EAGAIN);
+        }
+        crate::signal::zap_group_others(tgid, tid);
+        let wq = &crate::task::proc::CHILD_EXIT_WQ;
+        let mut w = WaitEntry::new();
+        let r = loop {
+            wq.prepare_to_wait(&mut w, SleepState::Killable);
+            if !percpu::group_others(tgid, tid) {
+                break Ok(());
+            }
+            if crate::signal::fatal_signal_pending() {
+                break Err(EAGAIN);
+            }
+            schedule();
+        };
+        wq.finish_wait(&w);
+        sig.end_exec(tid);
+        r?;
+    }
+    // Released after TASK_TABLE: the old leader and exited threads
+    drop(percpu::take_leadership(tgid, tid));
+    Ok(())
+}
+
 /// Execute a new program, replacing the current process image
 ///
 /// This is the core of execve. It:
@@ -720,10 +761,16 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
 
     let ident = exec_identity(pathname, &file);
 
+    let tid = percpu::current_tid();
+
+    // The other threads end before the new image starts (Linux
+    // begin_new_exec -> de_thread)
+    if let Err(e) = de_thread(tid) {
+        return -e;
+    }
+
     // Now we need to update the current task and switch to the new address space
     // This is the point of no return
-
-    let tid = percpu::current_tid();
 
     // Private fd table without the close-on-exec descriptors
     crate::task::fdtable::exec_task_fd(tid);

@@ -681,6 +681,7 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
         iopl_emul: 0,
         nproc_exceeded: false,
         exiting: false,
+        leader: true,
         // Ptrace state (kernel threads are not traced)
         ptrace: 0,
         ptracer_tid: None,
@@ -876,6 +877,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         iopl_emul: 0,
         nproc_exceeded: false,
         exiting: false,
+        leader: true,
         // Ptrace state (not traced initially)
         ptrace: 0,
         ptracer_tid: None,
@@ -1006,15 +1008,18 @@ pub fn reap_zombie_child_times(
 ) -> Option<(Pid, i32, u64, u64)> {
     let mut table = TASK_TABLE.lock();
 
-    // Find a zombie child matching the criteria
-    let zombie_idx = table.tasks.iter().position(|t| {
+    // Find a zombie child matching the criteria: a thread-group leader
+    // (threads are never waited for) whose other threads are all gone
+    // (Linux delay_group_leader)
+    let zombie_idx = (0..table.tasks.len()).find(|&i| {
+        let t = &table.tasks[i];
         // Must be a child of the parent
-        if t.ppid != parent_pid {
+        if t.ppid != parent_pid || !t.leader {
             return false;
         }
 
         // Must be a zombie
-        if !matches!(t.state, TaskState::Zombie(_)) {
+        if !matches!(t.state, TaskState::Zombie(_)) || group_alive(&table, t) {
             return false;
         }
 
@@ -1041,7 +1046,7 @@ pub fn reap_zombie_child_times(
     {
         let t = &table.tasks[idx];
         if let TaskState::Zombie(status) = t.state {
-            return Some((t.pid, status, t.utime, t.stime));
+            return Some((t.pid, group_status(t, status), t.utime, t.stime));
         }
     }
 
@@ -1053,8 +1058,76 @@ pub fn reap_zombie_child_times(
         crate::task::nproc_uncharge(task.cred.uid);
     }
     match task.state {
-        TaskState::Zombie(status) => Some((task.pid, status, task.utime, task.stime)),
+        TaskState::Zombie(status) => Some((
+            task.pid,
+            group_status(&task, status),
+            task.utime,
+            task.stime,
+        )),
         _ => None,
+    }
+}
+
+/// A thread of group `tgid` other than `tid` has not exited yet
+pub fn group_others(tgid: Pid, tid: Tid) -> bool {
+    let table = TASK_TABLE.lock();
+    table
+        .tasks
+        .iter()
+        .any(|u| u.tgid == tgid && u.tid != tid && !matches!(u.state, TaskState::Zombie(_)))
+}
+
+/// After de_thread: `tid` is the only thread of `tgid` left running and
+/// becomes its leader, taking the old leader's place (Linux de_thread:
+/// its parent, exit signal and start time); the exited threads are
+/// removed from the table and returned, to be released by the caller
+/// after TASK_TABLE
+pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<alloc::boxed::Box<KernelTask>> {
+    let mut table = TASK_TABLE.lock();
+    let Some(li) = table.tasks.iter().position(|t| t.tgid == tgid && t.leader) else {
+        return Vec::new();
+    };
+    if table.tasks[li].tid == tid {
+        return Vec::new();
+    }
+    let (ppid, real_parent, exit_signal, start) = {
+        let l = &table.tasks[li];
+        (l.ppid, l.real_parent_tid, l.exit_signal, l.start_time)
+    };
+    if let Some(me) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        me.leader = true;
+        me.ppid = ppid;
+        me.real_parent_tid = real_parent;
+        me.exit_signal = exit_signal;
+        me.start_time = start;
+    }
+    let mut gone = Vec::new();
+    let mut i = 0;
+    while i < table.tasks.len() {
+        let t = &table.tasks[i];
+        if t.tgid == tgid && t.tid != tid && matches!(t.state, TaskState::Zombie(_)) {
+            gone.push(table.tasks.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    gone
+}
+
+/// A thread of `t`'s group other than `t` has not exited yet
+fn group_alive(table: &GlobalTaskTable, t: &KernelTask) -> bool {
+    table
+        .tasks
+        .iter()
+        .any(|u| u.tgid == t.tgid && u.tid != t.tid && !matches!(u.state, TaskState::Zombie(_)))
+}
+
+/// The wait status a zombie leader reports (Linux wait_task_zombie):
+/// the group's exit status after a group exit, else its own
+fn group_status(t: &KernelTask, own: i32) -> i32 {
+    match t.signal.as_ref().map(|s| s.group_exit()) {
+        Some(crate::signal::GroupExit::Exit(code)) => code,
+        _ => own,
     }
 }
 
@@ -1070,8 +1143,8 @@ pub fn has_children(parent_pid: Pid, target_pid: i64, wflags: i32) -> bool {
     let table = TASK_TABLE.lock();
 
     table.tasks.iter().any(|t| {
-        // Must be a child of the parent
-        if t.ppid != parent_pid {
+        // Must be a child of the parent (a thread-group leader)
+        if t.ppid != parent_pid || !t.leader {
             return false;
         }
 
@@ -1436,6 +1509,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         // Copied like the rest of task->flags (Linux dup_task_struct)
         nproc_exceeded: parent_nproc_exceeded,
         exiting: false,
+        leader: config.flags & CLONE_THREAD == 0,
         // Ptrace state: inherited if CLONE_PTRACE is set and parent is traced
         // CLONE_UNTRACED prevents forced inheritance even when tracer requests it
         ptrace: if config.flags & CLONE_UNTRACED != 0 {
@@ -1512,6 +1586,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         config.flags & CLONE_THREAD != 0,
         config.flags & CLONE_CLEAR_SIGHAND != 0,
     );
+    if config.flags & CLONE_THREAD != 0 {
+        crate::signal::zap_new_thread(current_tid, child_tid);
+    }
 
     // Handle I/O context (CLONE_IO)
     // If CLONE_IO is set, child shares parent's I/O context (ioprio changes affect both)

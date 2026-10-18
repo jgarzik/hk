@@ -855,6 +855,7 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
         // sleeping so their arrival wakes us, then restore the mask
         let saved = with_task_signal_state(tid, |st| {
             let old = st.blocked;
+            st.real_blocked = old;
             st.blocked = old.subtract(&mask);
             st.recalc_sigpending();
             old
@@ -864,6 +865,7 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
         if let Some(old) = saved {
             with_task_signal_state(tid, |st| {
                 st.blocked = old;
+                st.real_blocked = SigSet::EMPTY;
                 st.recalc_sigpending();
             });
         }

@@ -1080,6 +1080,12 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// execve rechecks (Linux PF_NPROC_EXCEEDED)
     pub nproc_exceeded: bool,
 
+    /// Thread-group leader (Linux thread_group_leader): created without
+    /// CLONE_THREAD, or the thread whose exec ended the others
+    /// (de_thread). Only leaders are waited for; a leader keeps its
+    /// SignalStruct as a zombie, for the group's exit status.
+    pub leader: bool,
+
     /// Set at the start of exit (Linux PF_EXITING): what the task still
     /// releases (its files) does not wait on its behalf, e.g. no
     /// SO_LINGER wait in TCP close

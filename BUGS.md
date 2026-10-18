@@ -218,18 +218,25 @@ with EBUSY can see a spurious EROFS. Not done: mount data/options
 strings are ignored; mounts are not user-namespace aware (plain
 capable()).
 
-## Fatal signals and exit_group end one thread
+## Thread-group exit gaps
 
-**Location**: `kernel/signal/mod.rs` syscall_exit_signal_work,
-`kernel/task/proc.rs` do_exit, `kernel/arch/*/syscall.rs` (exit_group)
+**Location**: `kernel/signal/mod.rs` (group exit), `kernel/task/exec.rs`
+de_thread
 
-A signal whose default action terminates (SIGKILL included) ends only
-the thread it is delivered to, and exit_group is exit: the other
-threads of the process keep running (Linux do_group_exit /
-zap_other_threads kills them all). kill(pid, ...) reaches the leader
-only, and wait4 reaps the leader while siblings still run (Linux
-waits for the whole group). The boot tests kill each thread of a
-process explicitly. Fix in the next batch.
+exit_group, fatal signals, delay_group_leader and de_thread follow
+Linux; what is left:
+
+- A sibling blocked uninterruptibly on its group's cred_guard (a second
+  exec, or ptrace attach) while another thread's exec waits in
+  de_thread never wakes: both wait (Linux takes cred_guard_mutex
+  interruptibly there).
+- After an exec from a non-leader thread the new image keeps that
+  thread's tid (Linux gives it the leader's pid; hk's pids and tids
+  differ anyway, see above).
+- Process-directed signals go to one thread's private queue (the
+  leader, or a live thread once it has exited), not the shared queue
+  with Linux's thread choice at delivery; a pidfd polls readable when
+  the leader exits, not when the whole group is gone.
 
 ## No signal delivery on return from an interrupt (P7)
 
@@ -239,8 +246,10 @@ process explicitly. Fix in the next batch.
 Pending signals are delivered on the way out of a syscall or a fault
 only; an interrupt that arrives in user mode returns without the
 signal/reschedule work check (Linux exit_to_user_mode_loop), so a
-CPU-bound user task never takes SIGKILL or SIGSTOP. With SMP user
-scheduling (P7) this needs the IRQ-return work check plus a kick IPI
+CPU-bound user task never takes SIGKILL or SIGSTOP: a thread spinning
+in user mode outlives its group's exit_group or fatal signal until its
+next syscall or fault, delaying the reap (and an exec's de_thread).
+With SMP user scheduling (P7) this needs the IRQ-return work check plus a kick IPI
 (Linux signal_wake_up -> kick_process).
 
 ## Tracees never stop

@@ -1989,6 +1989,32 @@ test it via `waitqueue::signal_pending()` and return `-ERESTARTSYS`/
 `-ERESTARTNOHAND`. `syscall_exit_signal_work` (arch syscall exit) delivers
 the signal and restarts or fails the syscall per SA_RESTART.
 
+#### Thread-Group Exit (Linux do_group_exit, zap_other_threads, de_thread)
+
+No new lock. `SignalStruct.group_exit` (an `AtomicU64`, changed only by
+compare-and-swap) holds the group's state: running, exiting with a wait
+status (Linux SIGNAL_GROUP_EXIT + group_exit_code), or a thread's exec
+ending the others (group_exec_task). The first exit_group or fatal
+signal wins the swap; a fatal signal also overrides an exec's
+de_thread, exit_group does not.
+
+- `zap_threads` queues SIGKILL in each live thread's private pending
+  set and sets its TIF_SIGPENDING under TASK_TABLE, collects the tids,
+  drops TASK_TABLE, then wakes each (`WakeMode::Fatal`: interruptible
+  and killable sleeps), as `send_signal` does (TASK_TABLE is never held
+  across a wakeup: rq -> TASK_TABLE order).
+- A thread cloned into a group whose state is set gets SIGKILL after
+  `clone_task_signal` set up its signal state (`zap_new_thread`): the
+  state is set before a zap takes TASK_TABLE, so either the zap saw the
+  new thread or the clone sees the state.
+- The zombie leader keeps its `SignalStruct` until reaped (the group's
+  status); the reaper reads it under TASK_TABLE and releases the Task
+  after dropping it.
+- de_thread (exec) holds cred_guard (sleeping, outermost) while it waits
+  for the other threads on CHILD_EXIT_WQ (killable); it holds no
+  spinlock. The old leader and exited threads are removed under
+  TASK_TABLE and released after it.
+
 #### Reference Counting
 
 `SigHand` uses `Arc` for reference counting:

@@ -1615,7 +1615,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_EXECVEAT => sys_execveat(arg0 as i32, arg1, arg2, arg3, arg4 as i32) as u64,
         SYS_WAIT4 => sys_wait4(arg0 as i64, arg1, arg2 as i32, arg3) as u64,
         SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32, arg4) as u64,
-        SYS_EXIT_GROUP => sys_exit(arg0 as i32), // For single-threaded, same as _exit
+        SYS_EXIT_GROUP => crate::task::proc::sys_exit_group(arg0 as i32),
 
         // Personality (execution domain)
         SYS_PERSONALITY => {
