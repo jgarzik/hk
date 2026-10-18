@@ -123,12 +123,15 @@ pub fn zap_range(tlb: &mut Gather, start: u64, end: u64) {
             if addr == base && next == base + HUGE_PAGE_SIZE {
                 if let Some(phys) = take_huge_pmd(mm, base) {
                     tlb.remove_huge(base, phys);
+                    addr = next;
+                    continue;
                 }
-                addr = next;
-                continue;
+                // Split (or zapped) under us: clear the 4KB entries
+                // (Linux zap_pmd_range falls back to zap_pte_range)
+            } else {
+                // Out of memory: the 2MB page stays mapped (BUGS.md)
+                let _ = split_huge_pmd(mm, base);
             }
-            // Out of memory: the 2MB page stays mapped (BUGS.md)
-            let _ = split_huge_pmd(mm, base);
         }
         // A table stays once installed: lock it for its entries
         if let Some(p) = paging::pte_ptr(pgd, addr) {

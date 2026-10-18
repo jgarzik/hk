@@ -543,9 +543,8 @@ From the P3 /code-review (unverified). Tag = when to fix.
 1. Fixed in fix batch 1: procfs (and other files without Linux
    f_op->mmap) can no longer be mapped (ENODEV; EIO for
    proc_dir_entry files).
-2. **MADV_DONTNEED skips a 2MB range racing a THP split** (next
-   batch; regression). `kernel/mm/memory.rs:124`: take_huge_pmd →
-   None `continue`s instead of falling through to the 4KB path.
+2. Fixed in fix batch 1: zap_range falls back to the 4KB entries when
+   take_huge_pmd loses to a split.
 3. **Non-canonical fs_base crashes the kernel** (next batch; user-
    triggerable). `kernel/arch/x86_64/ptrace.rs:164` SETREGS,
    arch_prctl(ARCH_SET_FS), CLONE_SETTLS: wrmsr FS_BASE #GPs in

@@ -35,6 +35,7 @@ pub fn run_tests() {
     test_kill_mmap_storm();
     test_remote_cow_race();
     test_regs_survive();
+    test_thp_zap_split();
 }
 
 fn report(name: &[u8], ok: bool, v: i64) {
@@ -753,4 +754,80 @@ fn test_regs_survive() {
         ok && bad == 0 && sigs > 0,
         (bad * 100 + sigs.min(99)) as i64 * if ok { 1 } else { -1 },
     );
+}
+
+// ---------------------------------------------------------------------
+// MADV_DONTNEED of a 2MB page racing its split
+// ---------------------------------------------------------------------
+
+const MADV_HUGEPAGE: i32 = 14;
+const HUGE: u64 = 2 << 20;
+static THP_BASE: AtomicU64 = AtomicU64::new(0);
+static THP_GO: AtomicU64 = AtomicU64::new(0);
+static THP_STOP: AtomicU64 = AtomicU64::new(0);
+
+/// On each go, drop one 4KB page of the 2MB region (a split of its
+/// huge page) while the main thread drops the whole region
+extern "C" fn thp_splitter(_: u64) -> ! {
+    let mut seen = 0;
+    while THP_STOP.load(Ordering::Relaxed) == 0 {
+        let go = THP_GO.load(Ordering::Acquire);
+        if go == seen {
+            // hk does not preempt user mode (and keeps a process on one
+            // CPU until P7): let the main thread run
+            sys_sched_yield();
+            continue;
+        }
+        seen = go;
+        let base = THP_BASE.load(Ordering::Relaxed);
+        sys_madvise(base + (go % 511 + 1) * PAGE, PAGE, MADV_DONTNEED);
+    }
+    sys_exit(0)
+}
+
+/// One round: a 2MB-aligned THP region filled, then dropped whole
+/// while the splitter drops one page of it: every page reads zero
+/// after (a zap that lost the race to a split must still clear the
+/// 4KB entries). The number of nonzero pages.
+fn thp_round(round: u64) -> u64 {
+    let raw = map(2 * HUGE, RW);
+    if raw == 0 {
+        return 1;
+    }
+    let base = (raw + HUGE - 1) & !(HUGE - 1);
+    sys_madvise(base, HUGE, MADV_HUGEPAGE);
+    for i in 0..HUGE / PAGE {
+        put(base + i * PAGE, round | 1);
+    }
+    THP_BASE.store(base, Ordering::Relaxed);
+    THP_GO.store(round, Ordering::Release);
+    sys_madvise(base, HUGE, MADV_DONTNEED);
+    let bad = (0..HUGE / PAGE).filter(|i| get(base + i * PAGE) != 0).count() as u64;
+    // The splitter may still be in its madvise: wait before unmapping
+    for _ in 0..4 {
+        sys_sched_yield();
+    }
+    sys_munmap(raw, 2 * HUGE);
+    bad
+}
+
+/// MADV_DONTNEED of a whole 2MB page racing its split by another
+/// thread's MADV_DONTNEED of one 4KB page of it (Linux zap_pmd_range:
+/// a pmd split under it falls back to the PTE level). The threads only
+/// overlap with SMP user scheduling (P7); until then it checks the
+/// sequential cases.
+fn test_thp_zap_split() {
+    THP_STOP.store(0, Ordering::Relaxed);
+    THP_GO.store(0, Ordering::Relaxed);
+    let mut ok = start(0, thp_splitter, 0) > 0;
+    let mut bad = 0;
+    let t0 = mono_ms();
+    let mut round = 1;
+    while round <= 400 && mono_ms() - t0 < 8000 {
+        bad += thp_round(round);
+        round += 1;
+    }
+    THP_STOP.store(1, Ordering::Relaxed);
+    ok &= wait_thread(0);
+    report(b"MM_THP_ZAP_SPLIT", ok && bad == 0, bad as i64);
 }
