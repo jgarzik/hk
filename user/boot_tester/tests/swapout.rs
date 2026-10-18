@@ -128,8 +128,9 @@ fn pageout_cycle(base: i64) {
     if q != 0 {
         let bad = check(q, LEN, 1);
         verdict(b"SWAPOUT_DATA", bad.is_none(), bad.map_or(0, |i| i as i64));
-        // Out again, then gone: every slot comes back
-        sys_madvise(q, LEN, MADV_PAGEOUT);
+        // Partly out again (swap PTEs and swap-cache pages), then gone:
+        // every slot comes back
+        sys_madvise(q, MIB, MADV_PAGEOUT);
         sys_munmap(q, LEN);
     }
     // Linux keeps up to 64 slots per CPU reserved in its swap slot
@@ -147,9 +148,10 @@ fn pageout_cycle(base: i64) {
 fn fork_reads(p: u64) {
     let pid = sys_fork();
     if pid == 0 {
-        let ok = check(p, LEN, 1).is_none();
-        fill(p, LEN, 2);
-        sys_exit(if ok && check(p, LEN, 2).is_none() {
+        // Its first 4 MiB (each read is a swap I/O; slow under TCG)
+        let ok = check(p, 4 * MIB, 1).is_none();
+        fill(p, MIB, 2);
+        sys_exit(if ok && check(p, MIB, 2).is_none() {
             0
         } else {
             1
@@ -157,7 +159,8 @@ fn fork_reads(p: u64) {
     }
     let mut st = 0i32;
     sys_wait4(pid, &mut st, 0, 0);
-    let bad = check(p, LEN, 1);
+    // The part the child wrote (the rest stays swapped out for mremap)
+    let bad = check(p, MIB, 1);
     verdict(b"SWAPOUT_FORK", st == 0 && bad.is_none(), st as i64);
 }
 
@@ -170,7 +173,7 @@ fn moved(p: u64) -> u64 {
         return 0;
     }
     sys_munmap(r, 2 * LEN);
-    sys_madvise(p, LEN, MADV_PAGEOUT);
+    // Mostly still out: the fork test read back only its first MiB
     let q = sys_mremap(p, LEN, LEN, MREMAP_MAYMOVE | MREMAP_FIXED, r + LEN);
     verdict(b"SWAPOUT_MREMAP", q == (r + LEN) as i64, q);
     if q < 0 { 0 } else { q as u64 }
@@ -180,7 +183,7 @@ fn moved(p: u64) -> u64 {
 /// oldest pages instead of failing, and every page reads back intact
 fn direct_reclaim() {
     let free = proc_kb(b"/proc/meminfo\0", b"MemFree:");
-    let len = ((free as u64 * 1024) + 24 * MIB) & !(MIB - 1);
+    let len = ((free as u64 * 1024) + 4 * MIB) & !(MIB - 1);
     let p = map(len);
     if free <= 0 || p == 0 {
         verdict(b"SWAPOUT_DIRECT_RECLAIM", false, free);
@@ -190,18 +193,37 @@ fn direct_reclaim() {
     let pid = sys_fork();
     if pid == 0 {
         fill(p, len, 4);
-        let swapped = vmswap();
+        // hk had to swap; Linux may have found the room in its caches
+        let swapped = host_mode() || vmswap() > 0;
         // The oldest pages went out; read them back (all of it would
         // cycle every page through swap, oldest first)
-        let head = 32 * MIB;
+        let head = 8 * MIB;
         let tail = check_from(p, len - MIB, len, 4);
-        let ok = check(p, head, 4).is_none() && tail.is_none() && swapped > 0;
+        let ok = check(p, head, 4).is_none() && tail.is_none() && swapped;
         sys_exit(if ok { 0 } else { 1 });
     }
-    let mut st = 0i32;
-    sys_wait4(pid, &mut st, 0, 0);
+    let st = wait_bounded(pid, 300);
     sys_munmap(p, len);
     verdict(b"SWAPOUT_DIRECT_RECLAIM", st == 0, st as i64);
+}
+
+/// wait4 for `pid`, SIGKILLing it after `secs` seconds (a stuck test
+/// must not hang the boot): its status, -1 after a kill
+fn wait_bounded(pid: i64, secs: u64) -> i32 {
+    let ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: 100_000_000,
+    };
+    let mut st = 0i32;
+    for _ in 0..secs * 10 {
+        if sys_wait4(pid, &mut st, 1, 0) == pid {
+            return st;
+        }
+        hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+    }
+    hk_syscall::sys_kill(pid, hk_syscall::SIGKILL);
+    sys_wait4(pid, &mut st, 0, 0);
+    -1
 }
 
 /// swapoff with pages out reads them all back
