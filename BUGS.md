@@ -439,3 +439,42 @@ the phase expected to fix it; "next batch" means the next fix batch.
     write check on a directory changing parent match vfs_rename,
     including EXCHANGE; linkat's missing may_linkat is
     fs.protected_hardlinks, whose kernel default is 0.
+
+## P1 review findings (open)
+From the P1 /code-review (unverified unless noted). Tag = phase that fixes it.
+1. **Failed-read pages never discarded** (P5; confirmed by reading).
+   `kernel/mm/page_cache.rs:919` discard_page needs refcount 0, but
+   find_or_create_page returns refcount 1 and vfat read_bytes /
+   write_bytes never put it, so f795e7a's discard is a no-op: after an
+   I/O error the zero page is served as FAT/dir data.
+2. **No uptodate/page lock on block-device pages** (P5).
+   `kernel/fs/vfat.rs:518` inserts the page before the bio read; a
+   concurrent reader copies zeros, a concurrent partial write is
+   overwritten when the DMA lands. Linux: folio locked + !uptodate
+   until read completes.
+3. **BLKRRPART/umount don't invalidate the bdev page cache** (P5).
+   `kernel/storage/genhd.rs:118`: cache keyed by (major, minor); a
+   re-created partition reusing a minor inherits stale and dirty
+   pages, which write back at old offsets.
+4. **logical_block_size ignored** (next batch).
+   `kernel/storage/blkdev.rs:572`: partition scan and RMW issue 512B
+   bios; a 4Kn disk shows no partitions and 512B pread gives EIO.
+5. **parts_held uses Arc::strong_count** (next batch).
+   `kernel/storage/genhd.rs:107`: transient clones (writeback,
+   readpage) give spurious EBUSY; mount doesn't take open_mutex, so a
+   mount can race drop_bdevs and get a dead device.
+6. **Disk removal without open_mutex** (next batch).
+   `kernel/storage/sd.rs:374` del_gendisk → drop_bdevs unlocked: races
+   BlockDevice::open (opener of a removed partition) and BLKRRPART
+   rescans (stale registry entries / /dev nodes).
+7. **Segment limits** (next batch). `kernel/storage/blkdev.rs:674`
+   max_io assumes PAGE/seg per page; bdev_rw_frame ignores
+   max_segments: SIZE_MAX < 4096 without SEG_MAX overflows SEG_MAX /
+   MAX_SEGS → EIO.
+8. **blk-mq run() locks every CPU's sw queue per bio** (P7).
+   `kernel/storage/blk_mq.rs:136`: O(MAX_CPUS) IRQ-off lock pairs and
+   cacheline bounces per submit; use a per-hctx pending bitmap (Linux
+   ctx_map).
+9. **Write path copies** (P5). `kernel/storage/blkdev.rs:749`:
+   writes take `&mut [u8]` (to_vec + bounce copy per page); unaligned
+   bdev_rw_bytes allocates a request-sized temp buffer.
