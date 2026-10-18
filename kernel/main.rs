@@ -93,8 +93,7 @@ type CurrentArch = crate::arch::aarch64::Aarch64Arch;
 use crate::arch::ArchBusOps;
 use crate::arch::{
     AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps,
-    MemoryLayoutOps, PerCpuOps, PowerOps, SmpOps, TimekeeperOps, TimerCallbackOps, VfsInitOps,
-    phys_to_virt,
+    MemoryLayoutOps, PerCpuOps, PowerOps, SmpOps, TimekeeperOps, VfsInitOps, phys_to_virt,
 };
 use crate::arch::{SchedArch, SyscallOps, UserModeOps};
 
@@ -670,11 +669,6 @@ fn kmain() -> ! {
                     crate::random::init();
                 }
 
-                // Set up timer preemption callback
-                unsafe {
-                    CurrentArch::set_timer_preempt_callback(task::percpu::maybe_preempt);
-                }
-
                 // Enable APs to start their timers and participate in scheduling
                 CurrentArch::enable_ap_scheduling();
 
@@ -686,10 +680,6 @@ fn kmain() -> ! {
     } else {
         printkln!("SMP: Platform discovery failed (ACPI/device tree)");
     }
-
-    // Initialize platform drivers (legacy registry)
-    let mut driver_registry = crate::bus::DriverRegistry::new();
-    crate::bus::register_drivers(&mut driver_registry);
 
     // Initialize network subsystem (sets up loopback, static IP config)
     crate::net::init();

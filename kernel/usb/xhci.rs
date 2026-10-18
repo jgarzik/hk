@@ -17,11 +17,10 @@ use crate::sync::spin::Mutex;
 
 use crate::arch::{CurrentArch, FrameAlloc, IoremapOps, phys_to_virt};
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
-use crate::bus::driver::{Device, Driver, DriverError};
-use crate::bus::pci::{self, PciDevice};
+use crate::bus::driver::{Device, DriverError};
+use crate::bus::pci::PciDevice;
 use crate::dma::{DmaDirection, dma_map_single, dma_unmap_single};
 use crate::downcast_bus_device;
-use crate::dt::registry::DeviceInfo;
 use crate::printkln;
 
 use super::context::{InputContext, OutputDeviceContext, endpoint_to_dci};
@@ -220,44 +219,6 @@ fn clear_usb_host() {
         controller.shutdown();
     }
     *guard = None;
-}
-
-/// xHCI driver that registers with the driver subsystem (legacy Driver trait)
-pub struct XhciDriver;
-
-impl Driver for XhciDriver {
-    fn compatible(&self) -> &'static [&'static str] {
-        &["pci:class:0c:03:30"]
-    }
-
-    fn probe(&self, _dev: &DeviceInfo) -> Result<Box<dyn Device>, DriverError> {
-        // Find xHCI PCI device
-        let pci_devs = pci::find_xhci_controllers();
-        if pci_devs.is_empty() {
-            return Err(DriverError::Unsupported);
-        }
-
-        let pci_dev = &pci_devs[0];
-
-        // Get BAR0 for MMIO
-        let mmio_base = pci_dev.bar_address(0).ok_or(DriverError::MissingResource)?;
-
-        // Enable memory space and bus mastering
-        pci_dev.enable_memory_space();
-        pci_dev.enable_bus_master();
-
-        printkln!(
-            "xHCI: Probing device at {:02x}:{:02x}.{}, BAR0=0x{:x}",
-            pci_dev.bus,
-            pci_dev.device,
-            pci_dev.function,
-            mmio_base
-        );
-
-        // Create controller (will be initialized later when we have frame allocator)
-        let controller = XhciController::new(mmio_base, pci_dev.clone());
-        Ok(Box::new(controller))
-    }
 }
 
 // ============================================================================

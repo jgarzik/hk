@@ -3233,32 +3233,6 @@ pub fn exec_replace_image(
     }
 }
 
-/// Check if preemption is needed and perform context switch
-///
-/// Called after returning from timer interrupt.
-pub fn maybe_preempt() {
-    if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
-        return;
-    }
-
-    // Get and clear reschedule flag atomically
-    let needs_reschedule = CurrentArch::clear_needs_reschedule();
-
-    if !needs_reschedule {
-        return;
-    }
-
-    // Check interrupt depth
-    if CurrentArch::interrupt_depth() > 0 {
-        // Still in interrupt, defer by setting the flag again
-        CurrentArch::set_needs_reschedule(true);
-        return;
-    }
-
-    // Try to schedule
-    try_schedule();
-}
-
 /// Try to schedule a task on the current CPU
 ///
 /// With a current task this is `yield_now()`. Without one (an AP still on

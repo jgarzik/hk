@@ -38,7 +38,7 @@ pub fn usb_trace_enabled() -> bool {
 pub use xhci::{usb_bulk_in, usb_bulk_out, usb_configure_endpoints};
 
 // Re-export USB serial driver for registration
-pub use serial::{UsbSerial, UsbSerialBusDriver, UsbSerialDriver};
+pub use serial::{UsbSerial, UsbSerialBusDriver};
 
 use alloc::vec::Vec;
 

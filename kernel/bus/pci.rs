@@ -13,11 +13,10 @@ use core::any::Any;
 use spin::Once;
 
 use crate::dma::{DmaConfig, DmaDevice};
-use crate::dt::registry::DeviceInfo;
 use crate::printkln;
 
 use super::bus::{Bus, BusContext, BusDevice, BusDriver};
-use super::driver::{Device, Driver, DriverError};
+use super::driver::{Device, DriverError};
 
 /// PCI configuration address port (x86 port I/O)
 #[cfg(target_arch = "x86_64")]
@@ -872,14 +871,6 @@ pub fn enumerate_bus() -> Vec<PciDevice> {
     devices
 }
 
-/// Find all xHCI controllers on the PCI bus
-pub fn find_xhci_controllers() -> Vec<PciDevice> {
-    enumerate_bus()
-        .into_iter()
-        .filter(|dev| dev.is_xhci())
-        .collect()
-}
-
 // ============================================================================
 // PCI Bus Implementation (Bus/Driver Model)
 // ============================================================================
@@ -1088,92 +1079,6 @@ impl Bus for PciBus {
 
         printkln!("PCI: Device {} removed successfully", bus_id);
         Ok(())
-    }
-}
-
-/// PCI Host Controller driver
-pub struct PciHostDriver;
-
-impl Driver for PciHostDriver {
-    fn compatible(&self) -> &'static [&'static str] {
-        &["pci-host-ecam-generic", "pci-host"]
-    }
-
-    fn probe(&self, dev: &DeviceInfo) -> Result<Box<dyn Device>, DriverError> {
-        // Initialize PCI config access if not already done
-        if !is_initialized() {
-            #[cfg(target_arch = "x86_64")]
-            {
-                // x86: Use port I/O by default
-                let _ = dev; // Unused on x86
-                init_port_io();
-                printkln!("PCI: Using port I/O config access");
-            }
-
-            #[cfg(target_arch = "aarch64")]
-            {
-                use crate::arch::{CurrentArch, IoremapOps};
-                // ARM: Use ECAM, get base from device info or use QEMU virt default
-                let ecam_phys = dev.base_addr.unwrap_or(0x40_1000_0000);
-                let ecam_size = 0x10_0000u64; // 1MB for bus 0
-                let ecam_virt = CurrentArch::ioremap(ecam_phys, ecam_size)
-                    .expect("PCI: Failed to ioremap ECAM region");
-                unsafe {
-                    init_ecam(ecam_virt);
-                }
-                printkln!(
-                    "PCI: Using ECAM config access at phys {:#x} -> virt {:p}",
-                    ecam_phys,
-                    ecam_virt
-                );
-            }
-        }
-
-        Ok(Box::new(PciHostController::new()))
-    }
-}
-
-/// PCI Host Controller device instance
-pub struct PciHostController {
-    /// Discovered devices (cached)
-    devices: Vec<PciDevice>,
-}
-
-impl PciHostController {
-    /// Create a new PCI host controller and enumerate devices
-    pub fn new() -> Self {
-        let devices = enumerate_bus();
-        Self { devices }
-    }
-
-    /// Get all discovered devices
-    pub fn devices(&self) -> &[PciDevice] {
-        &self.devices
-    }
-
-    /// Find a device by class/subclass/prog_if
-    pub fn find_by_class(&self, class: u8, subclass: u8, prog_if: u8) -> Option<&PciDevice> {
-        self.devices.iter().find(|dev| {
-            dev.header.class_code == class
-                && dev.header.subclass == subclass
-                && dev.header.prog_if == prog_if
-        })
-    }
-}
-
-impl Default for PciHostController {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Device for PciHostController {
-    fn name(&self) -> &str {
-        "pci-host"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

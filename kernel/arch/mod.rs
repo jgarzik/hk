@@ -764,23 +764,6 @@ pub trait SyscallOps {
     fn syscall_dispatcher() -> Self::SyscallHandler;
 }
 
-/// Timer preemption callback setup
-///
-/// Allows the kernel to register a callback that is invoked from
-/// the timer interrupt handler to check for preemption.
-#[allow(dead_code)]
-pub trait TimerCallbackOps {
-    /// Set the timer preemption callback
-    ///
-    /// # Safety
-    /// Must be called once during kernel initialization before
-    /// interrupts are enabled.
-    ///
-    /// # Arguments
-    /// * `callback` - Function to call from timer interrupt
-    unsafe fn set_timer_preempt_callback(callback: fn());
-}
-
 /// Architecture-specific bus and driver initialization
 ///
 /// Called after the bus manager is created to register platform-specific

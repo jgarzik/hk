@@ -216,7 +216,7 @@ impl SchedArch for X86_64Arch {
 use crate::arch::{
     AcpiInfo, AcpiOps, ArchBusOps, CpuInfo, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps,
     IoremapOps, LocalTimerOps, MemoryLayoutOps, PowerInfo, PowerOps, SmpOps, SyscallOps,
-    TimekeeperOps, TimerCallbackOps, VfsInitOps,
+    TimekeeperOps, VfsInitOps,
 };
 
 impl HaltOps for X86_64Arch {
@@ -383,14 +383,6 @@ impl SyscallOps for X86_64Arch {
     }
 }
 
-impl TimerCallbackOps for X86_64Arch {
-    unsafe fn set_timer_preempt_callback(callback: fn()) {
-        unsafe {
-            set_timer_preempt_callback(callback);
-        }
-    }
-}
-
 impl ArchBusOps for X86_64Arch {
     fn arch_bus_init(bus_manager: &mut crate::bus::BusManager) {
         arch_init(bus_manager);
@@ -496,23 +488,6 @@ pub fn early_init() {
 
     // Enable timer interrupt
     pic::enable_irq(0);
-}
-
-/// Timer preemption check callback
-///
-/// This is called from the LAPIC timer handler when it's safe to preempt.
-/// The kernel sets this during initialization to point to its scheduler's
-/// preemption function.
-static mut TIMER_PREEMPT_CALLBACK: Option<fn()> = None;
-
-/// Set the timer preemption callback
-///
-/// # Safety
-/// Must be called once during kernel initialization, before interrupts are enabled.
-pub unsafe fn set_timer_preempt_callback(callback: fn()) {
-    unsafe {
-        TIMER_PREEMPT_CALLBACK = Some(callback);
-    }
 }
 
 /// Architecture-specific bus/driver initialization

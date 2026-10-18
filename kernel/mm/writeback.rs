@@ -298,25 +298,8 @@ pub fn wait_on_writeback(file_id: FileId) {
 }
 
 // ============================================================================
-// Global Writeback (Legacy/Fallback)
+// sync(2)
 // ============================================================================
-
-/// Perform periodic writeback for all dirty files
-///
-/// This is a fallback for files not tracked by a per-device BDI.
-/// Called from do_device_writeback or sync_all.
-#[allow(dead_code)]
-fn do_periodic_writeback() {
-    // Quick check - any dirty files?
-    let has_dirty = !DIRTY_ADDRESS_SPACES.lock().is_empty();
-    if !has_dirty {
-        return;
-    }
-
-    // Perform background writeback
-    let mut wbc = WritebackControl::for_kupdate(WRITEBACK_BATCH_SIZE);
-    writeback_all(&mut wbc);
-}
 
 /// Force immediate writeback of all dirty pages (for sync syscall)
 pub fn sync_all() -> Result<usize, i32> {
@@ -395,11 +378,6 @@ impl BdiWriteback {
         if was_empty {
             self.wakeup_delayed();
         }
-    }
-
-    /// Remove a file from the dirty list
-    pub fn mark_clean(&self, file_id: FileId) {
-        self.dirty_inodes.lock().remove(&file_id);
     }
 
     /// Schedule periodic writeback (delayed)
@@ -496,14 +474,4 @@ pub fn bdi_unregister(dev_id: DevId) {
 /// Get the BdiWriteback for a device
 pub fn get_bdi(dev_id: DevId) -> Option<Arc<BdiWriteback>> {
     BDI_REGISTRY.read().get(&dev_id).cloned()
-}
-
-/// Wake all BDIs for sync
-///
-/// Called by sync() to flush all devices immediately.
-pub fn wakeup_all_bdis() {
-    let bdis: Vec<Arc<BdiWriteback>> = BDI_REGISTRY.read().values().cloned().collect();
-    for bdi in bdis {
-        bdi.wakeup();
-    }
 }

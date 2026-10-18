@@ -16,27 +16,12 @@ use alloc::boxed::Box;
 use core::any::Any;
 
 use crate::bus::bus::{BusContext, BusDevice, BusDriver};
-use crate::bus::driver::{Device, Driver, DriverError};
+use crate::bus::driver::{Device, DriverError};
 use crate::console::{ConsoleDriver, ConsolePriority, register_console};
 use crate::downcast_bus_device;
-use crate::dt::registry::DeviceInfo;
 use crate::printkln;
 
 use super::{SetupPacket, UsbDevice, UsbSpeed, cdc_subclass, class};
-
-/// USB Serial driver
-pub struct UsbSerialDriver;
-
-impl Driver for UsbSerialDriver {
-    fn compatible(&self) -> &'static [&'static str] {
-        &["usb:class:02:02:00", "usb:class:02:02:01"]
-    }
-
-    fn probe(&self, _dev: &DeviceInfo) -> Result<Box<dyn Device>, DriverError> {
-        // This would be called from the USB subsystem when a CDC-ACM device is found
-        Err(DriverError::Unsupported)
-    }
-}
 
 // ============================================================================
 // USB Serial Bus Driver (Bus/Driver Model)

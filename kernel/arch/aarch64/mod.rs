@@ -38,8 +38,7 @@ use core::arch::asm;
 use crate::arch::{
     AcpiInfo, AcpiOps, Arch, ArchBusOps, ContextOps, CpuInfo, CpuOps, EarlyArchInit, ExceptionOps,
     FrameAlloc, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps, MemoryLayoutOps, PerCpuOps,
-    PowerInfo, PowerOps, SchedArch, SmpOps, SyscallOps, TimekeeperOps, TimerCallbackOps,
-    UserModeOps, VfsInitOps,
+    PowerInfo, PowerOps, SchedArch, SmpOps, SyscallOps, TimekeeperOps, UserModeOps, VfsInitOps,
 };
 use crate::task::{CurrentTask, Tid};
 
@@ -368,20 +367,6 @@ impl SyscallOps for Aarch64Arch {
         // Note: This function isn't used on aarch64 - syscall dispatch happens
         // directly in handle_el0_sync() via syscall::aarch64_syscall_dispatch()
         |_nr, _a0, _a1, _a2, _a3, _a4, _a5| 0
-    }
-}
-
-// ============================================================================
-// TimerCallbackOps trait implementation
-// ============================================================================
-
-static mut TIMER_PREEMPT_CALLBACK: Option<fn()> = None;
-
-impl TimerCallbackOps for Aarch64Arch {
-    unsafe fn set_timer_preempt_callback(callback: fn()) {
-        unsafe {
-            TIMER_PREEMPT_CALLBACK = Some(callback);
-        }
     }
 }
 
