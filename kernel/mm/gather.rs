@@ -65,6 +65,9 @@ pub struct Gather<'a> {
     n: usize,
     /// Detached page tables to free after the flush (exit)
     tables: Option<paging::UserTables>,
+    /// Emptied page-table frames unlinked by munmap, freed after the
+    /// flush (Linux tlb_remove_table)
+    table_frames: alloc::vec::Vec<u64>,
 }
 
 impl<'a> Gather<'a> {
@@ -78,6 +81,7 @@ impl<'a> Gather<'a> {
             batch: [Leaf::Page(0); BATCH],
             n: 0,
             tables: None,
+            table_frames: alloc::vec::Vec::new(),
         }
     }
 
@@ -115,6 +119,15 @@ impl<'a> Gather<'a> {
         self.tables = Some(t);
     }
 
+    /// The empty page table `phys` mapping [va, va + size) was unlinked
+    /// from its parent: free it after the flush, which then covers the
+    /// paging-structure caches (Linux pte_free_tlb / pmd_free_tlb)
+    pub fn remove_table(&mut self, va: u64, size: u64, phys: u64) {
+        self.freed_tables = true;
+        self.range.add(va, size, PMD_SHIFT);
+        self.table_frames.push(phys);
+    }
+
     fn push(&mut self, leaf: Leaf) {
         if self.n == BATCH {
             self.flush();
@@ -136,6 +149,9 @@ impl<'a> Gather<'a> {
             super::memory::zap_leaf(leaf);
         }
         self.n = 0;
+        for t in self.table_frames.drain(..) {
+            crate::FRAME_ALLOCATOR.free(t);
+        }
         if let Some(t) = self.tables.take() {
             t.free(&mut super::memory::zap_leaf);
         }

@@ -182,6 +182,13 @@ pub fn pmd_ptr(root: u64, va: u64) -> Option<*mut u64> {
     Some(entry_atomic(table, va >> 21).as_ptr())
 }
 
+/// The next-level table a PML4, PDPT or PD entry points to (not a
+/// huge page)
+pub fn table_of(e: u64) -> Option<u64> {
+    let e = PageTableEntry(e);
+    (e.is_present() && !e.is_huge()).then(|| e.addr())
+}
+
 /// A 2MB-level entry maps a huge page
 pub fn pmd_huge(pmd: u64) -> bool {
     pmd & (PAGE_PRESENT | PAGE_HUGE) == PAGE_PRESENT | PAGE_HUGE

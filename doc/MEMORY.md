@@ -238,9 +238,11 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
 - **munmap / MAP_FIXED / brk shrink / shmdt** split VMAs at the range
   edges and release what the entries inside hold (`memory::zap_range`:
   pages, protnone ones included, and swap slots), the pages only after
-  one TLB flush of the range (`mm::gather::Gather`, Linux mmu_gather); empty page-table
-  pages are kept until exit (reused by later mappings at the same
-  addresses).
+  one TLB flush of the range (`mm::gather::Gather`, Linux mmu_gather);
+  then the page tables whose whole span lies in the gap between the
+  neighbouring VMAs are unlinked and freed after the same flush
+  (`memory::free_pgtables`, Linux free_pgtables; mremap does it for the
+  range it moved away from).
 - **mprotect (Linux change_protection)** changes the VMAs and rewrites
   the PTEs already mapped in the range (`pte_modify`), then flushes the
   range's TLB. With no access left (PROT_NONE) an entry becomes

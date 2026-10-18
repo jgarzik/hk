@@ -280,6 +280,11 @@ pub fn pmd_ptr(root: u64, va: u64) -> Option<*mut u64> {
     Some(entry_atomic(table, va >> 21).as_ptr())
 }
 
+/// The next-level table an L0-L2 entry points to (not a block)
+pub fn table_of(e: u64) -> Option<u64> {
+    (e & 0b11 == DESC_TABLE).then_some(e & ADDR_MASK)
+}
+
 /// A 2MB-level entry maps a huge page (block)
 pub fn pmd_huge(pmd: u64) -> bool {
     pmd & 0b11 == DESC_BLOCK

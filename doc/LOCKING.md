@@ -912,8 +912,12 @@ pub struct Zone {
   Holders of the mm lock for writing exclude every other software
   writer and skip them except in shared code; the MMU still sets
   accessed/dirty bits, so entries change by compare-and-swap. Tables
-  are never freed while the address space is live, so an entry pointer
-  needs no lock. Order: mm lock -> page_table_lock -> PTE lock ->
+  are freed while the address space is live only with the mm lock held
+  for writing (munmap, mremap: `memory::free_pgtables`, Linux
+  free_pgtables), after the VMAs of their range left the reverse-map
+  chains, and only once empty and outside every remaining VMA's span:
+  an entry pointer stays valid under any mm lock hold, or under the
+  AnonVma.chain lock of a VMA it lies in (the reverse map). Order: mm lock -> page_table_lock -> PTE lock ->
   `FRAME_ALLOCATOR` (pages and tables are allocated, and the TLB is
   flushed, under them); never in interrupt context; no sleeping under
   them. A holder may flush other CPUs' TLBs: their waiters spin with

@@ -365,11 +365,14 @@ pub(crate) fn munmap_locked(
             mm.sub_locked_vm(pages);
         }
     }
-    // One gather for all the VMAs: one flush, then the pages go
+    // One gather for all the VMAs: one flush, then the pages and the
+    // page tables no VMA needs any more go (Linux unmap_region)
     let mut tlb = super::gather::Gather::new(owner);
     for vma in &removed {
         super::memory::zap_range(&mut tlb, vma.start.max(start), vma.end.min(end));
     }
+    let (floor, ceiling) = mm.gap_around(start, end);
+    super::memory::free_pgtables(&mut tlb, start, end, floor, ceiling);
     drop(tlb);
     #[cfg(feature = "mmcheck")]
     super::check::verify(mm, owner.pgd(), "munmap");
@@ -1434,6 +1437,12 @@ fn move_mapping(
     mm.add_total_vm(new_len / PAGE_SIZE);
     mm.merge_adjacent(idx);
     super::mremap::move_ptes(owner, old_addr, new_addr, old_len);
+    if !dontunmap {
+        // The old range's tables, now empty (Linux move_vma unmaps it)
+        let (floor, ceiling) = mm.gap_around(old_addr, old_addr + old_len);
+        let mut tlb = super::gather::Gather::new(owner);
+        super::memory::free_pgtables(&mut tlb, old_addr, old_addr + old_len, floor, ceiling);
+    }
     Ok(())
 }
 

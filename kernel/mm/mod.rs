@@ -367,6 +367,25 @@ impl MmStruct {
         top.checked_sub(size).filter(|&a| a >= MMAP_MIN_ADDR)
     }
 
+    /// The free gap holding [start, end): the end of the VMA below it
+    /// (0 if none) and the start of the one above (the page-table
+    /// ceiling if none), the bounds of `memory::free_pgtables`
+    pub fn gap_around(&self, start: u64, end: u64) -> (u64, u64) {
+        let floor = self
+            .vmas
+            .iter()
+            .filter(|v| v.end <= start)
+            .map(|v| v.end)
+            .max()
+            .unwrap_or(0);
+        let ceiling = self
+            .vmas
+            .iter()
+            .find(|v| v.start >= end)
+            .map_or_else(memory::pgtables_ceiling, |v| v.start);
+        (floor, ceiling)
+    }
+
     /// Check if the given range overlaps any existing VMA
     pub fn overlaps(&self, start: u64, end: u64) -> bool {
         self.vmas

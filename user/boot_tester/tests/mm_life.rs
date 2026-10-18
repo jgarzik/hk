@@ -26,6 +26,7 @@ pub fn run_tests() {
     leak(b"MM_LIFE_VFORK_EXEC", 500, vfork_exec);
     leak(b"MM_LIFE_THREADS", 500, thread);
     leak(b"MM_LIFE_MMAP_CYCLE", 1000, mmap_cycle);
+    leak(b"MM_LIFE_PGTABLE_MUNMAP", 400, pgtable_cycle);
     leak(b"MM_LIFE_EXEC_CHAIN", 10, exec_chain);
     leak(b"MM_LIFE_PROTNONE_MUNMAP", 200, protnone_munmap);
     leak(b"MM_LIFE_PROTNONE_EXIT", 200, protnone_exit);
@@ -333,6 +334,32 @@ fn mmap_cycle() -> bool {
         unsafe { core::ptr::write_volatile((p as u64 + off) as *mut u8, 0x5a) };
     }
     sys_munmap(p as u64, len) == 0
+}
+
+/// One page touched in a 1GB region never used before, then unmapped:
+/// munmap frees the page tables it needed (Linux free_pgtables), so
+/// sparse mappings do not pile up tables
+fn pgtable_cycle() -> bool {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    // A load and a store: no read-modify-write (outline atomics would
+    // need getauxval on arm64); one thread runs this
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let gb = NEXT.load(Ordering::Relaxed);
+    NEXT.store(gb + 1, Ordering::Relaxed);
+    let addr = (1u64 << 40) + gb * (1 << 30);
+    let p = sys_mmap(
+        addr,
+        PAGE,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+        -1,
+        0,
+    );
+    if p != addr as i64 {
+        return false;
+    }
+    unsafe { core::ptr::write_volatile(addr as *mut u8, 0x5a) };
+    sys_munmap(addr, PAGE) == 0
 }
 
 /// A /proc/<pid>/maps fd held across the target's exit reads as empty

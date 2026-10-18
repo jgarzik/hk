@@ -99,7 +99,6 @@ Address spaces are reference counted and torn down like Linux
   populates it).
 - Exited non-leader threads stay in the task table as zombies (Linux
   reaps them at once); their kernel stacks and memory are freed.
-- munmap keeps page-table pages that become empty (freed at exit).
 
 ## exec ignores set-user-ID / set-group-ID bits and file capabilities
 

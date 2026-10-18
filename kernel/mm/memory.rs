@@ -77,7 +77,8 @@ pub(super) fn exit_mmap(mm: &Mm) {
 /// entry (a page, protnone included, or a swap slot) is cleared, a 2MB
 /// page wholly inside goes whole, one partly inside is split first. The
 /// pages go to `tlb`, released only after its TLB flush (a swap slot
-/// at once: no CPU caches a swap entry). Empty tables are kept. Only
+/// at once: no CPU caches a swap entry). Tables stay (munmap frees
+/// them, `free_pgtables`). Only
 /// user addresses: callers pass ranges inside VMAs, a range past
 /// TASK_SIZE is a bug (clamped).
 pub fn zap_range(tlb: &mut Gather, start: u64, end: u64) {
@@ -120,6 +121,75 @@ pub fn zap_range(tlb: &mut Gather, start: u64, end: u64) {
         }
         addr = next;
     }
+}
+
+/// Free the page tables of [start, end) that no VMA needs any more
+/// (Linux free_pgtables / free_pgd_range), mm lock held for writing,
+/// after the range was zapped and its VMAs left their reverse-map
+/// chains: a table is freed when the whole span it maps lies in
+/// [floor, ceiling) (the gap between the neighbouring VMAs) and it is
+/// empty. Its parent entry is cleared at once; the frame goes to `tlb`,
+/// freed after the flush that drops the paging-structure caches. The
+/// top-level table stays.
+pub fn free_pgtables(tlb: &mut Gather, start: u64, end: u64, floor: u64, ceiling: u64) {
+    if start < end {
+        let r = PtRange {
+            start,
+            end,
+            floor,
+            ceiling,
+        };
+        free_level(tlb, tlb.mm().pgd(), 3, 0, &r);
+    }
+}
+
+/// The range `free_pgtables` works on
+struct PtRange {
+    start: u64,
+    end: u64,
+    floor: u64,
+    ceiling: u64,
+}
+
+/// The entries of the table `table` at `level` (3: top level, 1: the
+/// 2MB level) whose spans meet [r.start, r.end), `base` being the
+/// table's first address: each child table is freed bottom-up
+fn free_level(tlb: &mut Gather, table: u64, level: u32, base: u64, r: &PtRange) {
+    let span = 1u64 << (12 + 9 * level);
+    let first = (r.start.max(base) - base) / span;
+    let last = ((r.end - 1).min(base + 512 * span - 1) - base) / span;
+    for i in first..=last {
+        let lo = base + i * span;
+        let e = entry(table_slot(table, i));
+        let Some(child) = paging::table_of(e.load(Ordering::Acquire)) else {
+            continue;
+        };
+        if level > 1 {
+            free_level(tlb, child, level - 1, lo, r);
+        }
+        if lo >= r.floor && lo + span <= r.ceiling && table_empty(child) {
+            e.store(0, Ordering::Release);
+            tlb.remove_table(lo, span, child);
+        }
+    }
+}
+
+/// Slot `i` of the table frame `table`
+fn table_slot(table: u64, i: u64) -> *mut u64 {
+    // SAFETY: a live table frame of the locked mm, through the direct map
+    unsafe { (crate::arch::phys_to_virt(table) as *mut u64).add(i as usize) }
+}
+
+/// Every entry of the table frame `table` is empty
+fn table_empty(table: u64) -> bool {
+    (0..512).all(|i| entry(table_slot(table, i)).load(Ordering::Acquire) == 0)
+}
+
+/// One past the last user address a top-level entry can map: the
+/// ceiling of the page tables above the last VMA (Linux
+/// USER_PGTABLES_CEILING)
+pub fn pgtables_ceiling() -> u64 {
+    super::TASK_SIZE.next_multiple_of(1 << 39)
 }
 
 /// A page is mapped at `addr` (protnone included), mm lock held

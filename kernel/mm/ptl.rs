@@ -17,8 +17,10 @@
 //! mremap, fork's copy) excludes every other software writer; it takes
 //! the locks where it shares code with the readers (`zap_range`). The
 //! MMU still sets accessed/dirty bits, so entries change by
-//! compare-and-swap. Tables are never freed while the address space is
-//! live, so a pointer to an entry stays valid without a lock.
+//! compare-and-swap. Tables are freed only with the mmap_lock held for
+//! writing (munmap, mremap: `memory::free_pgtables`), after their
+//! VMAs left the reverse-map chains, so a pointer to an entry stays
+//! valid under any mmap_lock hold, or the AnonVma lock of a VMA there.
 //!
 //! Order: mmap_lock -> page_table_lock -> PTE lock -> allocator (page
 //! tables and pages are allocated under them), never the reverse; no
