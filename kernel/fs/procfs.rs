@@ -1705,7 +1705,7 @@ fn gen_meminfo() -> Vec<u8> {
 /// Format: device mountpoint fstype options dump pass
 /// Example: none / ramfs rw 0 0
 fn gen_mounts() -> Vec<u8> {
-    use super::mount::current_mnt_ns;
+    use crate::ns::current_mnt_ns;
     use alloc::fmt::Write;
 
     let mut output = String::new();

@@ -58,7 +58,7 @@ impl FsStruct {
 
     /// Create a new FsStruct initialized to the filesystem root
     pub fn new_root() -> Option<Arc<Self>> {
-        let mnt_ns = super::mount::current_mnt_ns();
+        let mnt_ns = crate::ns::current_mnt_ns();
         let root_dentry = mnt_ns.get_root_dentry()?;
         let root_mnt = mnt_ns.get_root()?;
         let root_path = Path::new(root_mnt.clone(), root_dentry.clone());

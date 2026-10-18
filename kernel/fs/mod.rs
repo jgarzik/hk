@@ -42,9 +42,6 @@ pub mod procfs;
 pub mod ramfs;
 pub mod vfat;
 
-// Legacy VFS (kept for compatibility)
-pub mod vfs;
-
 // Re-exports for convenience
 pub use crate::error::KernelError;
 pub use blkdev_ops::BLOCK_FILE_OPS;
@@ -55,10 +52,7 @@ pub use dentry::{DCACHE, Dentry, DentryCache, is_subdir};
 pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, RwFlags, flags, seek};
 pub use fsstruct::{FsStruct, clone_task_fs, exit_task_fs, get_task_fs, init_task_fs};
 pub use inode::{DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, Uid};
-pub use mount::{
-    Mount, MountNamespace, current_mnt_ns, do_mount, do_umount, follow_mount, init_mnt_ns,
-    mount_at_path, umount_flags,
-};
+pub use mount::{Mount, do_mount, do_umount, follow_mount, mount_at_path, umount_flags};
 pub use path::{LookupFlags, lookup_one, lookup_path, lookup_path_at, lookup_path_flags};
 pub use path_ref::Path;
 pub use procfs::{
@@ -74,22 +68,6 @@ pub use superblock::{
     SuperBlock, SuperOps, find_filesystem, init_fs_registry, register_filesystem,
 };
 pub use vfat::{VFAT_FILE_OPS, VFAT_TYPE};
-pub use vfs::{FileMetadata, FileSystem, Vfs};
-
-/// Filesystem error types (extending the original KernelError)
-impl KernelError {
-    /// Operation not supported
-    pub const fn not_supported() -> Self {
-        KernelError::OperationNotSupported
-    }
-}
-
-// Add additional error variants
-impl From<&str> for KernelError {
-    fn from(_: &str) -> Self {
-        KernelError::Io
-    }
-}
 
 use alloc::sync::Arc;
 

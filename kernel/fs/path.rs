@@ -12,8 +12,9 @@ use super::KernelError;
 use super::dac::{MAY_EXEC, cred, permission_as};
 use super::dentry::Dentry;
 use super::inode::Inode;
-use super::mount::{current_mnt_ns, follow_mount};
+use super::mount::follow_mount;
 use super::path_ref::Path;
+use crate::ns::current_mnt_ns;
 use crate::task::Cred;
 
 /// Maximum number of symlinks to follow (prevent infinite loops)

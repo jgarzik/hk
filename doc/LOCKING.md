@@ -221,7 +221,7 @@ SignalStruct.exec_update (sync::RwSem; Linux exec_update_lock; write:
 VFS locks (detailed order):
     File.f_pos_lock (sync::Mutex; read/write/lseek/getdents by position)
         ↓
-    MOUNT_NS.root
+    MntNamespace.root
         ↓
     Mount.{children, parent, mountpoint}
         ↓
@@ -1272,7 +1272,6 @@ The VFS uses fine-grained locking with `RwLock` for concurrent read access.
 | Variable | Type | Purpose |
 |----------|------|---------|
 | `DCACHE` | `DentryCache` (contains `RwLock`) | Dentry cache root |
-| `MOUNT_NS` | `MountNamespace` (contains `RwLock`) | Mount namespace root |
 
 #### Descriptor Tables (Linux files_struct)
 
@@ -1332,7 +1331,7 @@ Linux `vfsmount.mnt_count` pattern:
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `MOUNT_NS.root` | `RwLock<Option<Arc<Mount>>>` | Global mount tree root |
+| `MntNamespace.root` (`ns/mod.rs`) | `RwLock<Option<Arc<Mount>>>` | Root of the namespace's mount tree (one per mount namespace) |
 | `Mount.mountpoint` | `RwLock<Option<Arc<Dentry>>>` | Where this fs is mounted |
 | `Mount.parent` | `RwLock<Option<Weak<Mount>>>` | Parent mount reference |
 | `Mount.children` | `RwLock<Vec<Arc<Mount>>>` | Child mounts |
@@ -1351,7 +1350,7 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 
 **Lock Order for Mount Operations:**
 ```
-1. MOUNT_NS.root (read/write)
+1. MntNamespace.root (read/write)
 2. parent Mount.children (write for add/remove child)
 3. Mount.parent (write for set/clear)
 4. Mount.mountpoint (write for set/clear)
@@ -1360,7 +1359,7 @@ Each open `File` holds a reference to its mount via the `mnt` field:
 
 **Lock Order for Path Traversal (follow_mount):**
 ```
-1. MOUNT_NS.root (read)
+1. MntNamespace.root (read)
 2. Mount.children (read)
 3. child.mountpoint (read)
 4. Dentry.inode (read)

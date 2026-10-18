@@ -105,7 +105,7 @@ fn remount(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> 
 
 /// Mount whose root `target` is (Linux path_mounted), else EINVAL
 fn mount_at(target: &Arc<super::Dentry>) -> Result<Arc<super::mount::Mount>, KernelError> {
-    super::mount::current_mnt_ns()
+    crate::ns::current_mnt_ns()
         .find_mount_at(target)
         .ok_or(KernelError::InvalidArgument)
 }
@@ -238,7 +238,7 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
     }
 
     // Find the mount at this path
-    let mount = match super::mount::current_mnt_ns().find_mount_at(&target_dentry) {
+    let mount = match crate::ns::current_mnt_ns().find_mount_at(&target_dentry) {
         Some(m) => m,
         None => return KernelError::InvalidArgument.sysret(), // Not a mount point
     };
@@ -292,7 +292,7 @@ pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     };
 
     // 4. Verify new_root is a mount point
-    let mnt_ns = super::mount::current_mnt_ns();
+    let mnt_ns = crate::ns::current_mnt_ns();
     let new_mnt = match mnt_ns.find_mount_at(&new_root_dentry) {
         Some(m) => m,
         None => return KernelError::InvalidArgument.sysret(), // Not a mount point

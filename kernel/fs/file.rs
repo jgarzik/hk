@@ -21,7 +21,8 @@ use crate::sync;
 use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{FileType, Inode, InodeId};
-use super::mount::{Mount, current_mnt_ns};
+use super::mount::Mount;
+use crate::ns::current_mnt_ns;
 use crate::poll::{
     DEFAULT_POLLMASK, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable,
 };

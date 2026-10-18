@@ -16,11 +16,6 @@ use super::superblock::{FileSystemType, SuperBlock};
 
 use crate::storage::get_blkdev;
 
-/// A mount point in the namespace
-///
-/// This struct mirrors Linux's `struct vfsmount`. The reference count
-/// (`mnt_count`) tracks users of this mount - each open file that references
-/// this mount holds a reference via `mntget()`.
 /// Ignore set-user/group-ID bits on exec (Linux MNT_NOSUID)
 pub const MNT_NOSUID: u32 = 0x1;
 /// No access to device nodes (Linux MNT_NODEV)
@@ -28,6 +23,11 @@ pub const MNT_NODEV: u32 = 0x2;
 /// No program execution (Linux MNT_NOEXEC)
 pub const MNT_NOEXEC: u32 = 0x4;
 
+/// A mount point in the namespace
+///
+/// This struct mirrors Linux's `struct vfsmount`. The reference count
+/// (`mnt_count`) tracks users of this mount - each open file that references
+/// this mount holds a reference via `mntget()`.
 pub struct Mount {
     /// The mounted filesystem's superblock
     pub sb: Arc<SuperBlock>,
@@ -242,138 +242,6 @@ impl Mount {
 unsafe impl Send for Mount {}
 unsafe impl Sync for Mount {}
 
-/// Mount namespace - the global mount tree
-pub struct MountNamespace {
-    /// Root mount of the namespace
-    root: RwLock<Option<Arc<Mount>>>,
-}
-
-impl MountNamespace {
-    /// Create a new empty namespace
-    pub const fn new() -> Self {
-        Self {
-            root: RwLock::new(None),
-        }
-    }
-
-    /// Find which mount a dentry belongs to
-    ///
-    /// Given a dentry, returns the mount whose filesystem contains it.
-    /// This walks up the mount tree to find the appropriate mount.
-    pub fn find_mount_for(&self, dentry: &Arc<Dentry>) -> Option<Arc<Mount>> {
-        let root = self.get_root()?;
-
-        // Check if dentry belongs to root mount's filesystem
-        if let Some(dentry_sb) = dentry.superblock() {
-            // First check root mount
-            if dentry_sb.dev_id == root.sb.dev_id {
-                return Some(root.clone());
-            }
-
-            // Check children recursively
-            self.find_mount_for_recursive(&root, dentry_sb.dev_id)
-        } else {
-            // Fall back to root mount
-            Some(root)
-        }
-    }
-
-    fn find_mount_for_recursive(&self, mount: &Arc<Mount>, dev_id: u64) -> Option<Arc<Mount>> {
-        for child in mount.children.read().iter() {
-            if child.sb.dev_id == dev_id {
-                return Some(child.clone());
-            }
-            if let Some(found) = self.find_mount_for_recursive(child, dev_id) {
-                return Some(found);
-            }
-        }
-        None
-    }
-
-    /// Set the root mount
-    pub fn set_root(&self, mount: Arc<Mount>) {
-        *self.root.write() = Some(mount);
-    }
-
-    /// Get the root mount
-    pub fn get_root(&self) -> Option<Arc<Mount>> {
-        self.root.read().clone()
-    }
-
-    /// Get the root dentry
-    pub fn get_root_dentry(&self) -> Option<Arc<Dentry>> {
-        self.get_root().map(|m| m.root.clone())
-    }
-
-    /// Find mount whose root dentry matches the given dentry
-    ///
-    /// This is used by umount to find the mount at a given path.
-    pub fn find_mount_at(&self, dentry: &Arc<Dentry>) -> Option<Arc<Mount>> {
-        let root = self.get_root()?;
-
-        // Check if this is the root mount
-        if Arc::ptr_eq(&root.root, dentry) {
-            return Some(root);
-        }
-
-        // Check if dentry matches root mount's root by inode
-        if let (Some(root_ino), Some(d_ino)) = (root.root.get_inode(), dentry.get_inode())
-            && root_ino.ino == d_ino.ino
-            && root.root.superblock().map(|s| s.dev_id) == dentry.superblock().map(|s| s.dev_id)
-        {
-            return Some(root);
-        }
-
-        // Search children recursively
-        self.find_mount_recursive(&root, dentry)
-    }
-
-    fn find_mount_recursive(&self, mount: &Arc<Mount>, dentry: &Arc<Dentry>) -> Option<Arc<Mount>> {
-        for child in mount.children.read().iter() {
-            // Check if child's root dentry matches the target
-            if Arc::ptr_eq(&child.root, dentry) {
-                return Some(child.clone());
-            }
-
-            // Also check by inode number + device ID
-            if let (Some(child_ino), Some(d_ino)) = (child.root.get_inode(), dentry.get_inode())
-                && child_ino.ino == d_ino.ino
-                && child.root.superblock().map(|s| s.dev_id)
-                    == dentry.superblock().map(|s| s.dev_id)
-            {
-                return Some(child.clone());
-            }
-
-            // Recurse into child's children
-            if let Some(found) = self.find_mount_recursive(child, dentry) {
-                return Some(found);
-            }
-        }
-        None
-    }
-}
-
-impl Default for MountNamespace {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Get the current task's mount namespace
-///
-/// Uses the namespace from the current task's nsproxy.
-/// Falls back to init mount namespace if no task context.
-pub fn current_mnt_ns() -> Arc<crate::ns::MntNamespace> {
-    crate::ns::current_mnt_ns()
-}
-
-/// Get the init mount namespace
-///
-/// Use for early boot before task context is set up.
-pub fn init_mnt_ns() -> Arc<crate::ns::MntNamespace> {
-    crate::ns::init_mnt_ns()
-}
-
 /// Mount a filesystem at a path
 ///
 /// If path is None or "/", this becomes the root mount.
@@ -402,7 +270,7 @@ pub fn attach(
         sb.make_rdonly()?;
     }
     let mount = Mount::new(sb, root, mnt_flags);
-    let mnt_ns = current_mnt_ns();
+    let mnt_ns = crate::ns::current_mnt_ns();
     if let Some(mp) = mountpoint {
         mount.set_mountpoint(mp.clone());
         // For simplicity, add to the root mount's children
@@ -536,7 +404,7 @@ pub fn do_umount(mount: Arc<Mount>, flags: i32) -> Result<(), KernelError> {
 
 /// MNT_* flags of the mount `dentry` belongs to (0 if none)
 pub fn mnt_flags_of(dentry: &Arc<Dentry>) -> u32 {
-    current_mnt_ns()
+    crate::ns::current_mnt_ns()
         .find_mount_for_dentry(dentry)
         .map_or(0, |m| m.flags())
 }
@@ -548,7 +416,7 @@ pub fn follow_mount(dentry: &Arc<Dentry>) -> Arc<Dentry> {
     }
 
     // Find the mount at this dentry using current namespace
-    let mnt_ns = current_mnt_ns();
+    let mnt_ns = crate::ns::current_mnt_ns();
     if let Some(root_mount) = mnt_ns.get_root() {
         // Check children for a mount at this dentry
         let children = root_mount.children.read();

@@ -759,7 +759,7 @@ fn kmain() -> ! {
     // Phase 6: Initramfs Unpacking
     // ========================================================================
     let initramfs_data = CurrentArch::get_initramfs();
-    let root_dentry = fs::init_mnt_ns()
+    let root_dentry = crate::ns::init_mnt_ns()
         .get_root_dentry()
         .expect("VFS root not initialized");
     match fs::unpack_cpio(initramfs_data, &root_dentry) {
