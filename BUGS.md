@@ -576,11 +576,11 @@ From the P3 /code-review (unverified). Tag = when to fix.
 
 ## Fix batch 1 review findings (open)
 From the fix-batch-1 /code-review (unverified). Tag = when to fix.
-1. **THP zap loses to a hardware Dirty-bit update** (P4, first).
-   `kernel/mm/memory.rs:124` / `huge_page.rs:174` take_huge_pmd's
-   single CAS fails when the CPU sets D concurrently; the PMD stays
-   huge and mapped after munmap/DONTNEED (stale access, frame leak).
-   Swap the PMD, or loop while still huge.
+1. Fixed in P4: take_huge_pmd and split_huge_pmd clear the 2MB entry
+   with an exchange under the page_table_lock (a hardware
+   accessed/dirty update no longer fails them). No boot test: the race
+   needs a user thread writing on another CPU, and user tasks share
+   CPU 0 until P7.
 2. **Fatal signal to a zombie/exiting thread starts a group exit**
    (next batch). `kernel/signal/mod.rs:999` group_kill: tgkill of an
    exited worker kills the live process (Linux ESRCH); a kill -9
