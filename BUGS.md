@@ -60,10 +60,13 @@ SO_PEEK_OFF is EOPNOTSUPP.
 Address spaces are reference counted and torn down like Linux
 (doc/MEMORY.md, Address space lifetime); what is still missing:
 
-- Anonymous pages join the rmap and the LRU, swap slots are counted
-  and the swap cache works (swap-in, fork, munmap, swapoff), but
-  nothing writes pages out yet, so reclaim is inert. 2MB pages stay off
-  the LRU (never reclaimed whole; a split puts their 4KB pages on it).
+- Reclaim (P4) swaps out private anonymous pages only, for
+  MADV_PAGEOUT: no accessed-bit aging (pages are reclaimed oldest
+  first), synchronous writes, no kswapd, no file pages; 2MB pages stay
+  off the LRU (never reclaimed whole; a split puts their 4KB pages on
+  it). Pages exec copies the image into are not on the reverse map
+  (never swapped). Swap files go through the inode's readpage /
+  writepage, a page at a time.
 - SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
   IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
   by id still work there).

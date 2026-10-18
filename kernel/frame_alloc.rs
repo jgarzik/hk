@@ -109,6 +109,13 @@ impl FrameAllocator {
         }
     }
 
+    /// Free a frame its owner froze to count 0 (reclaim)
+    pub fn free_frozen(&self, frame: u64) {
+        if let Some(p) = self.ours(frame) {
+            self.zone.free_frozen(p);
+        }
+    }
+
     /// Take a reference (sharing the frame) unless it is free (Linux
     /// get_page_unless_zero); true for frames the allocator does not
     /// manage (nothing to count)

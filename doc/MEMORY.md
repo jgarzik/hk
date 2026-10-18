@@ -294,5 +294,16 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   (protnone included) must lie in a VMA allowing at least what the
   entry allows, and none may be executable by the kernel (arm64 PXN);
   a violation prints `MMCHECK:FAIL`.
+- **Swap (Linux mm/vmscan.c, swapfile.c, swap_state.c).** Private
+  anonymous pages sit on the LRU (`mm/lru.rs`). Reclaim
+  (`mm/vmscan.rs`; MADV_PAGEOUT, and the allocator's slow path) gives a
+  page a swap slot and a place in the device's swap cache, replaces
+  every PTE mapping it by the swap entry through the reverse map,
+  writes it out and frees it; a page still mapped somewhere, or busy,
+  stays. A slot counts its swap PTEs and its cache page; fork shares
+  slots, munmap and exit give them back, a fault reads the page into
+  the swap cache and maps it (writable at once only on a write fault
+  that leaves no one else needing the slot), swapoff reads every page
+  back.
 - `/proc/meminfo` reports MemTotal and MemFree from the frame allocator
   (exact free count).

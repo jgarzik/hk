@@ -575,6 +575,16 @@ impl Zone {
         self.release(pfn, order);
     }
 
+    /// Free an order-0 page whose count its owner froze to 0 (Linux
+    /// free_unref_page after folio_ref_freeze: reclaim)
+    pub fn free_frozen(&self, pfn: u64) {
+        if !self.valid(pfn) || self.page(pfn).refcount.load(Ordering::Acquire) != 0 {
+            self.bad_page(pfn, "freeing a referenced frozen page");
+            return;
+        }
+        self.release(pfn, 0);
+    }
+
     /// Reset an unreferenced block's struct pages and put it on a free
     /// list
     fn release(&self, pfn: u64, order: u32) {

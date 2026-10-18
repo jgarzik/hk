@@ -44,6 +44,7 @@ pub mod swap_state;
 pub mod syscall;
 pub mod tlb;
 pub mod vma;
+pub mod vmscan;
 pub mod writeback;
 pub mod xarray;
 

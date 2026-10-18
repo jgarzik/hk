@@ -188,7 +188,11 @@ fn vma_advise(
     let vma = mm.get_vma(idx).ok_or(KernelError::OutOfMemory)?;
     match advice {
         MADV_WILLNEED => Ok(()),
-        MADV_COLD | MADV_PAGEOUT => lru_ok(vma),
+        MADV_COLD | MADV_PAGEOUT => {
+            lru_ok(vma)?;
+            cold_or_pageout(vma, owner, start, end, advice == MADV_PAGEOUT);
+            Ok(())
+        }
         MADV_DONTNEED | MADV_FREE => dontneed(vma, owner, start, end, advice),
         MADV_REMOVE => remove(vma, owner, start, end, punch),
         _ => {
@@ -208,12 +212,75 @@ fn is_anon(vma: &Vma) -> bool {
 }
 
 /// MADV_COLD / MADV_PAGEOUT: refused on locked memory (Linux
-/// can_madv_lru_vma); otherwise a hint without effect (no reclaim)
+/// can_madv_lru_vma)
 fn lru_ok(vma: &Vma) -> Result<(), KernelError> {
     if vma.is_locked() {
         return Err(KernelError::InvalidArgument);
     }
     Ok(())
+}
+
+/// MADV_COLD (deactivate) or MADV_PAGEOUT (reclaim) the anonymous pages
+/// of [start, end) that this mapping alone maps (Linux
+/// madvise_cold_or_pageout_pte_range), mm lock held for reading: 2MB
+/// pages are split first, the pages taken off the LRU under each
+/// table's PTE lock, then reclaimed with no spinlock held (the swap
+/// writes sleep). Without swap, PAGEOUT leaves anonymous memory alone.
+fn cold_or_pageout(vma: &Vma, owner: &Mm, start: u64, end: u64, pageout: bool) {
+    use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
+    use crate::arch::paging;
+    if vma.anon_vma.is_none() || (pageout && super::swap::swap_totals().0 == 0) {
+        return;
+    }
+    super::lru::lru_add_drain_all();
+    let pgd = owner.pgd();
+    let mut pages = Vec::new();
+    let mut addr = start;
+    while addr < end {
+        let next = ((addr | (HUGE_PAGE_SIZE - 1)) + 1).min(end);
+        let Some(pmd) = paging::pmd_ptr(pgd, addr) else {
+            addr = ((addr | ((1 << 30) - 1)) + 1).min(end);
+            continue;
+        };
+        // SAFETY: a live 2MB-level entry of the locked mm
+        let pmdval = unsafe { core::ptr::read_volatile(pmd) };
+        if paging::pmd_huge(pmdval) {
+            let _ = split_huge_pmd(owner, addr);
+        }
+        if let Some(p) = paging::pte_ptr(pgd, addr) {
+            let _l = super::ptl::pte_lock(p);
+            for a in (addr..next).step_by(PAGE_SIZE as usize) {
+                let Some(phys) = own_page(pgd, a) else {
+                    continue;
+                };
+                if !pageout {
+                    super::lru::deactivate(phys);
+                } else if super::lru::isolate(phys) {
+                    pages.push(phys);
+                }
+            }
+        }
+        addr = next;
+    }
+    if !pages.is_empty() {
+        super::vmscan::reclaim_pages(pages);
+    }
+}
+
+/// The anonymous page mapped at `addr`, if no other PTE maps it (Linux
+/// skips shared folios: folio_maybe_mapped_shared), PTE lock held
+fn own_page(pgd: u64, addr: u64) -> Option<u64> {
+    use crate::arch::paging;
+    let p = paging::pte_ptr(pgd, addr)?;
+    // SAFETY: a live entry under its PTE lock
+    let pte = unsafe { core::ptr::read_volatile(p) };
+    if !paging::pte_present(pte) {
+        return None;
+    }
+    let phys = paging::pte_addr(pte);
+    super::page::phys_to_page(phys)
+        .filter(|pg| pg.is_anon() && pg.mapcount() == 1)
+        .map(|_| phys)
 }
 
 /// MADV_DONTNEED / MADV_FREE (Linux madvise_dontneed_free): not on

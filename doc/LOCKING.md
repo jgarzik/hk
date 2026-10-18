@@ -1008,6 +1008,18 @@ pub struct Zone {
   reached 0 is left for `page_freed`, which takes the lock and unlinks
   it. Reclaim never takes an mmap_lock while holding it.
 
+#### Reclaim (kernel/mm/vmscan.rs; Linux mm/vmscan.c)
+
+- `shrink_folio_list` works on pages it isolated (each with a
+  reference) and holds no lock between pages. Per page: page lock by
+  trylock (never waits), then swap cache add (cache lock, then slot
+  counts), the reverse map (AnonVma.chain for reading -> PTE lock ->
+  slot counts, TLB flush), the swap write with only the page lock
+  held (block I/O sleeps), and the delete with its count frozen under
+  the cache lock. It never takes an mmap_lock (callers may hold one for
+  reading: MADV_PAGEOUT, a fault's direct reclaim), and holds no
+  spinlock across I/O or a sleeping lock.
+
 #### TLB Flushing (kernel/mm/tlb.rs; arch/{x86_64,aarch64}/tlb.rs)
 
 No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
