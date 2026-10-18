@@ -131,6 +131,13 @@ pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
         return Err(-3); // ESRCH - not stopped
     }
 
+    // A non-canonical RIP would fault on the return to user mode in ring
+    // 0 (SYSRET with the user stack loaded): refused (EIO). Linux takes
+    // it and returns through IRET, which delivers SIGSEGV.
+    if regs.rip >= 0x0000_8000_0000_0000 {
+        return Err(-5);
+    }
+
     // Update trap frame with new register values
     let tf = &mut task.trap_frame;
     tf.r15 = regs.r15;
