@@ -366,8 +366,8 @@ fn update_flags(
     if mm.get_vma(idx).is_some_and(|v| v.flags == flags) {
         return Ok(());
     }
-    mm.split_at(start);
-    mm.split_at(end);
+    mm.split_at_checked(start)?;
+    mm.split_at_checked(end)?;
     let idx = mm.find_vma_exact(start).ok_or(KernelError::WouldBlock)?;
     mm.set_flags(idx, flags);
     mm.merge_adjacent(idx);

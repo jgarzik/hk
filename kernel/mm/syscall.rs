@@ -147,6 +147,10 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         Err(e) => return e.sysret(),
     };
 
+    if !mm_guard.may_map() {
+        return KernelError::OutOfMemory.sysret();
+    }
+
     // Determine mapping address
     let map_addr = if is_fixed || is_fixed_noreplace {
         // MAP_FIXED or MAP_FIXED_NOREPLACE: use exact address
@@ -161,6 +165,9 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
             return KernelError::AlreadyExists.sysret();
         }
         // MAP_FIXED: unmap whatever was there (dropped after unlocking)
+        if is_fixed && !mm_guard.may_unmap(addr, addr + length) {
+            return KernelError::OutOfMemory.sysret();
+        }
         if is_fixed {
             replaced = munmap_locked(&mut mm_guard, &mm, addr, addr + length);
         }
@@ -334,6 +341,9 @@ pub fn sys_munmap(addr: u64, length: u64) -> i64 {
         Ok(m) => m,
         Err(e) => return e.sysret(),
     };
+    if !mm_guard.may_unmap(addr, end) {
+        return KernelError::OutOfMemory.sysret();
+    }
     let removed = munmap_locked(&mut mm_guard, &mm, addr, end);
     drop(mm_guard);
     // The VMAs may hold the last reference to a mapped file
@@ -412,7 +422,7 @@ pub fn sys_brk(brk: u64) -> i64 {
         drop(removed);
         return brk as i64;
     }
-    if !brk_fits(&map, old, new) {
+    if !brk_fits(&map, old, new) || !map.may_map() {
         return cur as i64;
     }
     brk_grow(&mut map, old, new);
@@ -1073,10 +1083,10 @@ fn mprotect_fixup(
     let vma = mm.get_vma(idx).ok_or(KernelError::OutOfMemory)?;
     prot_allowed(vma, prot)?;
     if addr > vma.start {
-        idx = mm.split_vma(idx, addr).ok_or(KernelError::OutOfMemory)?;
+        idx = mm.split_checked(idx, addr)?;
     }
-    if mm.get_vma(idx).is_some_and(|v| end < v.end) && mm.split_vma(idx, end).is_none() {
-        return Err(KernelError::OutOfMemory);
+    if mm.get_vma(idx).is_some_and(|v| end < v.end) {
+        mm.split_checked(idx, end)?;
     }
     let vma = mm.get_vma_mut(idx).ok_or(KernelError::OutOfMemory)?;
     vma.prot = prot;
@@ -1280,6 +1290,11 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
     // mremap_to shrinks before it moves): the VMA is split there, so no
     // VMA loses pages it still maps
     let mut old_len = old_len;
+    if new_len_aligned < old_len
+        && !mm_guard.may_unmap(old_addr + new_len_aligned, old_addr + old_len)
+    {
+        return KernelError::OutOfMemory.sysret();
+    }
     if new_len_aligned < old_len {
         gone = munmap_locked(
             &mut mm_guard,
@@ -1337,6 +1352,12 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
         return old_addr as i64;
     }
 
+    // A move may add up to three VMAs (Linux move_vma: refused within
+    // 3 of vm.max_map_count)
+    if mm_guard.map_count() + 3 >= super::MAX_MAP_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return KernelError::OutOfMemory.sysret();
+    }
     // Move: MREMAP_FIXED unmaps its target first, in this same mm lock
     // hold; else a free range is found
     let target = if fixed {

@@ -45,6 +45,7 @@ pub mod keys;
 pub mod layout;
 pub mod linkat;
 pub mod memcore;
+pub mod mapcount;
 pub mod mempolicy;
 pub mod mm_life;
 pub mod mm_oom;
@@ -201,6 +202,7 @@ pub fn run_all_tests() {
     tcp::run_tests();
     isolated(b"MEMCORE", memcore::run_tests);
     isolated(b"MMLOCK", mmlock::run_tests);
+    isolated(b"MAPCOUNT", mapcount::run_tests);
     group_exit::run_tests();
     netlink::run_tests();
     netdev_ioctl::run_tests();

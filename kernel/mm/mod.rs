@@ -111,6 +111,27 @@ pub fn mmap_base() -> u64 {
     (STACK_TOP - gap) & !0xFFF
 }
 
+/// vm.max_map_count: most VMAs an address space may have (Linux
+/// sysctl_max_map_count, DEFAULT_MAX_MAP_COUNT 65530)
+pub static MAX_MAP_COUNT: AtomicUsize = AtomicUsize::new(65530);
+
+fn max_map_count() -> usize {
+    MAX_MAP_COUNT.load(Ordering::Relaxed)
+}
+
+/// /proc/sys/vm files of the address-space code
+pub static MM_CTLS: &[crate::sysctl::Ctl] = &[crate::sysctl::Ctl {
+    path: "vm/max_map_count",
+    mode: 0o644,
+    show: || alloc::vec![max_map_count() as i64],
+    store: |v| {
+        crate::sysctl::range(v[0], 0, i32::MAX as i64)?;
+        MAX_MAP_COUNT.store(v[0] as usize, Ordering::Relaxed);
+        Ok(())
+    },
+    text: None,
+}];
+
 /// Stack guard gap (256KB like Linux default)
 /// Prevents growsdown VMAs from expanding too close to adjacent VMAs
 pub const STACK_GUARD_GAP: u64 = 256 * 1024;
@@ -284,6 +305,43 @@ impl MmStruct {
     /// Update the current program break
     pub fn update_brk(&mut self, new_brk: u64) {
         self.brk = new_brk;
+    }
+
+    /// VMAs in the address space (Linux mm->map_count)
+    pub fn map_count(&self) -> usize {
+        self.vmas.len()
+    }
+
+    /// Room for another mapping (Linux do_mmap, do_brk_flags: ENOMEM
+    /// once map_count exceeds vm.max_map_count)
+    pub fn may_map(&self) -> bool {
+        self.map_count() <= max_map_count()
+    }
+
+    /// Unmapping [start, end) may split a VMA in two (Linux
+    /// vms_gather_munmap_vmas: refused once map_count reaches
+    /// vm.max_map_count, a hole inside one VMA being the only unmap
+    /// that adds one)
+    pub fn may_unmap(&self, start: u64, end: u64) -> bool {
+        self.map_count() < max_map_count()
+            || !self.vmas.iter().any(|v| v.start < start && end < v.end)
+    }
+
+    /// Split the VMA at `idx` at `at` like `split_vma`, refused with
+    /// ENOMEM at vm.max_map_count (Linux split_vma: mprotect, madvise)
+    pub fn split_checked(&mut self, idx: usize, at: u64) -> Result<usize, KernelError> {
+        if self.map_count() >= max_map_count() {
+            return Err(KernelError::OutOfMemory);
+        }
+        self.split_vma(idx, at).ok_or(KernelError::OutOfMemory)
+    }
+
+    /// `split_at` refused at vm.max_map_count
+    pub fn split_at_checked(&mut self, addr: u64) -> Result<(), KernelError> {
+        match self.find_vma_index(addr) {
+            Some(i) if self.vmas[i].start < addr => self.split_checked(i, addr).map(|_| ()),
+            _ => Ok(()),
+        }
     }
 
     /// Find VMA containing the given address

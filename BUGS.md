@@ -91,10 +91,10 @@ Address spaces are reference counted and torn down like Linux
   page table); shmat checks RLIMIT_AS before SHM_REMAP unmaps the old
   range, and an address that SHM_RND rounds to 0 is EPERM (Linux picks
   an address).
-- No vm.max_map_count: the number of VMAs (new mappings, splits by a
-  partial mprotect or munmap) is not limited (Linux: 65530, then
-  ENOMEM). A locked mapping grown by mremap is not faulted in (Linux
-  populates it).
+- vm.max_map_count is enforced for mmap, brk, munmap and MAP_FIXED
+  holes, mprotect, madvise and mremap, not for the splits of mlock
+  (Linux mlock_fixup fails with ENOMEM there). A locked mapping grown
+  by mremap is not faulted in (Linux populates it).
 - Exited non-leader threads stay in the task table as zombies (Linux
   reaps them at once); their kernel stacks and memory are freed.
 

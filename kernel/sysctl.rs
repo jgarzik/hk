@@ -52,7 +52,11 @@ pub fn read(ctl: &Ctl) -> Vec<u8> {
 
 /// All tables, mounted under /proc/sys
 pub fn tables() -> &'static [&'static [Ctl]] {
-    static TABLES: &[&[Ctl]] = &[crate::net::sysctl::CTLS, crate::frame_alloc::VM_CTLS];
+    static TABLES: &[&[Ctl]] = &[
+        crate::net::sysctl::CTLS,
+        crate::frame_alloc::VM_CTLS,
+        crate::mm::MM_CTLS,
+    ];
     TABLES
 }
 
