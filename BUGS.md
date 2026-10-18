@@ -601,3 +601,37 @@ From the fix-batch-1 /code-review (unverified). Tag = when to fix.
    `kernel/task/percpu.rs:1118` vs `:1072`.
 Note: d8a7e8d's GROUP_EXEC_THREAD can hang on its own (fixed by
 cf0ce50); push both together.
+
+## P4 review findings (open)
+From the P4 /code-review (unverified unless noted). Tag = when to fix.
+1. **try_to_unmap overwrites a PTE mid-mremap: use-after-free** (P7
+   blocker; needs concurrency). `kernel/mm/rmap.rs:93`: the CAS loop
+   installs the swap entry over whatever the PTE holds; move_ptes
+   (`mremap.rs:104`) moves entries without the PTE lock, and
+   MREMAP_DONTUNMAP keeps the old VMA in the chain. Give up when the
+   PTE no longer maps `phys`; move_ptes under the PTE locks.
+2. **swapoff makes PROT_NONE swap pages readable** (next batch;
+   confirmed by reading). `kernel/mm/fault.rs:503` unuse_pte →
+   mk_pte(page, 0) is PRESENT|USER on x86. Use a protnone PTE
+   (Linux vm_page_prot).
+3. **Slot allocated after swapoff's final scan** (P7 blocker).
+   `kernel/mm/swap.rs:181`: alloc_slot doesn't recheck SWP_WRITEOK
+   under SwapInfo.map; swap PTEs of a removed type livelock faults or
+   read a later device's slots.
+4. **Swap file size not capped by i_size** (next batch).
+   `kernel/mm/swap.rs:455`: header last_page sizes a heap Vec (8GB →
+   panic) and slots past EOF.
+5. **LRU batch refs defeat exclusivity checks** (next batch).
+   `kernel/mm/fault.rs:477` / `:545`: refcount==1 tests fail while a
+   page sits in the per-CPU add batch → needless COW copies after
+   swap-in. Linux drains and rechecks (wp_can_reuse_anon_folio).
+6. **alloc_slot linear scan under SwapInfo.map; two Vecs + sort per
+   reclaimed page** (P6). `kernel/mm/swap.rs:184`: cluster/free-hint
+   allocator, cached sorted device list.
+7. **read_swap_page busy-yields on SWAP_HAS_CACHE** (P6).
+   `kernel/mm/swap_state.rs:186`: sleep instead.
+8. **One AnonVma per fork family, Vec chain** (P7).
+   `kernel/mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
+9. **Four copies of the page-range walk** (next batch).
+   `kernel/mm/memory.rs:263`, madvise, copy_page_range,
+   change_protection; use mremap.rs `walk`.
