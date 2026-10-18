@@ -15,7 +15,7 @@
 //! Waiting (for a call to finish, or for a slot reused before its last
 //! call finished) never blocks this CPU's own queue: the wait loop runs
 //! the calls queued here (`poll`), so two CPUs calling each other, or
-//! a sender whose interrupts are off (a syscall), make progress. Calls
+//! a sender whose interrupts are off, make progress. Calls
 //! must not be made from interrupt context or with an IrqSpinlock held
 //! (a target spinning on that lock with interrupts off would never
 //! answer: doc/LOCKING.md, Cross-CPU Calls).
@@ -148,13 +148,6 @@ fn csd_wait(csd: &Csd, me: u32) {
         poll(me);
         core::hint::spin_loop();
     }
-}
-
-/// Spinning for a lock with interrupts possibly off: run this CPU's
-/// queued calls, so a holder flushing this CPU does not wait forever
-/// (`Mm::lock`)
-pub fn poll_queue() {
-    poll(this_cpu());
 }
 
 /// Run the calls queued for this CPU now, with interrupts off (the IPI

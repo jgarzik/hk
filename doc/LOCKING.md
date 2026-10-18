@@ -877,11 +877,10 @@ pub struct Zone {
   needs no lock. Order: mm lock -> page_table_lock -> PTE lock ->
   `FRAME_ALLOCATOR` (pages and tables are allocated, and the TLB is
   flushed, under them); never in interrupt context; no sleeping under
-  them. Both are spun on, maybe with interrupts off (a syscall or
-  fault), while the holder may flush this CPU's TLB, so a waiter polls
-  this CPU's call queue as it spins (`sync::spin::lock_with`,
-  `smp::poll_queue`). Deviation: Linux waiters spin with interrupts on
-  and answer the IPI.
+  them. A holder may flush other CPUs' TLBs: their waiters spin with
+  interrupts on (syscalls and faults run with them on, 7.5) and answer
+  the IPI, as in Linux. Deviation: the PTE lock is a bare lock word in
+  the table's struct page (Linux: a `spinlock_t` in the ptdesc).
 - TLB after a PTE loses permission or its page: flushed before the mm
   lock is released and before the old frame can be freed or written
   through by another process, always in the address space that changed
@@ -2850,7 +2849,7 @@ Features present in Linux but not yet implemented in hk:
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
 | Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
 | Lazy TLB, PCID, global pages | kernel threads keep the last user mm; PCID tags; PGE | Kernel threads load the kernel table; every CR3 write flushes all | More flushes on context switch (x86) |
-| PTE locks | `spinlock_t` in the page-table page (ptdesc) | A lock word in the table's struct page, waiters poll the call-function queue | IPIs answered while spinning with interrupts off |
+| PTE locks | `spinlock_t` in the page-table page (ptdesc) | A lock word in the table's struct page (lockdep-tracked as one class) | No owner or fairness (test-and-set) |
 
 ### Implications
 

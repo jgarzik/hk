@@ -23,9 +23,8 @@
 //! Order: mmap_lock -> page_table_lock -> PTE lock -> allocator (page
 //! tables and pages are allocated under them), never the reverse; no
 //! lock is taken in interrupt context. A holder may flush the TLB
-//! (x86: IPIs), so a waiter that may have interrupts off polls this
-//! CPU's call queue while it spins (deviation: Linux waiters spin with
-//! interrupts on and answer IPIs; doc/LOCKING.md, Page-table locks).
+//! (x86: IPIs): waiters spin with interrupts on (syscalls and faults
+//! run with them on) and answer the IPI, as in Linux.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -64,7 +63,6 @@ pub fn pte_lock(ptep: *mut u64) -> PteLock {
         .is_err()
     {
         while word.load(Ordering::Relaxed) != 0 {
-            crate::smp::poll_queue();
             core::hint::spin_loop();
         }
     }
@@ -82,7 +80,7 @@ impl Drop for PteLock {
 /// `mm`'s page_table_lock (Linux mm->page_table_lock)
 #[track_caller]
 pub fn pt_lock(mm: &Mm) -> crate::sync::spin::MutexGuard<'_, ()> {
-    crate::sync::spin::lock_with(mm.page_table_lock(), crate::smp::poll_queue)
+    mm.page_table_lock().lock()
 }
 
 /// The 4KB entry for `addr` in `mm`, installing missing tables under
