@@ -304,7 +304,10 @@ Seen once (2026-10-18, during the FD_LEAK group right after
 RLIMIT_NPROC): QEMU itself died with SIGSEGV ("the monitored command
 dumped core"), the guest printed nothing unusual. Not reproduced in 3
 reruns of the same commit. Seen again (2026-10-18, P3 gate) at the same
-point, right after RLIMIT_NPROC_CHURN; 4 reruns passed. apport keeps no
+point, right after RLIMIT_NPROC_CHURN; 4 reruns passed. Seen a third
+time (2026-10-18, P4 gate of 85b7666) right after
+RLIMIT_NPROC_SETUID_EXEC; the rerun passed. Always this spot: likely
+guest-triggered. apport keeps no
 core for the packaged QEMU: set core_pattern (or run QEMU under gdb) to
 capture one and see whether a virtio request from the guest triggers
 it.
