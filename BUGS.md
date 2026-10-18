@@ -483,9 +483,8 @@ the phase expected to fix it; "next batch" means the next fix batch.
    record Running/Ready/Sleeping; a woken task shows S until it runs.
    Fix: per-task atomic run state shared with the rq entry, read by
    /proc.
-5. **doc/LOCKING.md:596 is wrong**: /proc/<pid>/exe goes through
-   mm_access (since eb8c6b6) and takes `exec_update` for reading, not
-   "neither lock" (next batch).
+5. Fixed in C1: doc/LOCKING.md says /proc/<pid>/exe takes
+   `exec_update` for reading (mm_access).
 6. **linkat AT_EMPTY_PATH capability check only for empty paths**
    (next batch). `kernel/fs/link.rs:220`: Linux 6.8 do_linkat returns
    ENOENT for AT_EMPTY_PATH without CAP_DAC_READ_SEARCH whatever the

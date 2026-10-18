@@ -621,7 +621,9 @@ dumpability with the new mm or the reverse (a
 non-dumpable process that execs a readable binary is not attachable or
 readable while its old memory is still mapped). As in Linux the split
 lets exec walk paths while holding `cred_guard`: /proc/<pid>/exe
-(followed when busybox re-execs itself) takes neither lock. Order:
+(followed when busybox re-execs itself) goes through mm_access, so it
+takes `exec_update` for reading but not `cred_guard`; the exec takes
+`exec_update` for writing only later, in `exec_replace_image`. Order:
 `cred_guard` -> `exec_update` -> every other lock.
 
 #### Deferred State Updates
