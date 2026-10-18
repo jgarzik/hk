@@ -166,8 +166,9 @@ tracked wrappers, and the kernel reports, once each, as `LOCKDEP:FAIL`
 - **Sleeping in atomic context:** `sync::might_sleep()` (sleeping locks,
   `schedule`/`yield_now`, wait queues, `Sock::wait`, user copies via
   `might_fault`, skipped while page faults are disabled) with a tracked
-  spin lock held, a nonzero preempt count (any `IrqSpinlock`) or in an
-  interrupt handler. Without the feature it is the old debug-build
+  spin lock held, a nonzero preempt count (any `IrqSpinlock`), in an
+  interrupt handler, or with interrupts disabled (syscalls and faults
+  run with them on, 7.5). Without the feature it is the old debug-build
   preempt-count assertion.
 - **Lock order:** a lock's class is the source location of its `new()`
   (`#[track_caller]`, like Linux's static lock_class_key: all `TcpSock.cb`
@@ -1011,13 +1012,17 @@ a remote wakeup was posted (`wake_up_task`).
   context or with an IrqSpinlock held (reported as `LOCKDEP:FAIL
   smp_call_function_many in atomic context`); never with a lock held
   that another CPU may spin on with interrupts off (TASK_TABLE: taken
-  under run-queue locks), as that CPU cannot answer. A call may be made
-  with interrupts off (x86 and arm64 syscalls run with them off): every
-  wait polls this CPU's own queue with interrupts off (`poll`), so two
-  CPUs calling each other, or a caller with interrupts off, make
-  progress. No CPU may spin-wait with interrupts off for a condition
-  another CPU sets only after its call returns, unless it polls its
-  queue.
+  under run-queue locks), as that CPU cannot answer. Syscalls and faults
+  run with interrupts on (7.5), so a target answers at once; a call may
+  still be made with interrupts off: every wait polls this CPU's own
+  queue with interrupts off (`poll`), so two CPUs calling each other,
+  or a caller with interrupts off, make progress. No CPU may spin-wait
+  with interrupts off for a condition another CPU sets only after its
+  call returns, unless it polls its queue.
+- The CFD row assumption holds with interrupts on: a CPU makes one call
+  at a time because callers are thread context (never interrupt
+  handlers, `check_context`) and the kernel is not preemptive, so no
+  other task's call on this CPU can start before this one returns.
 
 #### Kernel Page Tables (kernel half)
 
@@ -2745,6 +2750,42 @@ ISRs NEVER perform:
 - Task table operations - would acquire TASK_TABLE Mutex
 - VFS operations - would acquire RwLock
 - printk - would acquire OUTPUT_LOCK Mutex (potential deadlock)
+
+### 7.5 Syscalls and Faults Run With Interrupts On
+
+The syscall entry (x86 `syscall_entry` after saving the user state;
+arm64 `handle_el0_sync` for SVC), user-mode faults and kernel faults on
+user addresses from a context with interrupts on (x86 after reading
+CR2, arm64 after FAR; Linux do_user_addr_fault / el0_da / el1_abort)
+run with interrupts enabled, as in Linux; the entry/exit code
+around them (per-CPU user-register block, the global x86 entry stack,
+ELR/SPSR_EL1, a fork child's first return: `clone_child_entry` enables
+them for the child-TID write and disables them again) keeps them off.
+The kernel stays cooperative: an interrupt never switches tasks in
+kernel mode (the handlers only set flags, wake, and run cross-CPU
+calls), so code between explicit schedule points still runs
+uninterrupted by other tasks. What this changes, and why it holds:
+
+- Per-CPU data and the current task: a task stays on its CPU (no
+  preemption, no migration), so per-CPU reads stay valid; state an
+  interrupt handler also touches is atomic or taken with interrupts
+  off (`IrqSpinlock`, `local_irq_save`: per-CPU page lists, slab arrays,
+  TLB state, cross-CPU queues); the per-CPU user-register block and
+  `CurrentTask` are written only by thread context.
+- Preempt-free sections: unchanged (no preemption); `IrqSpinlock`
+  still raises the preempt count and masks interrupts.
+- `spin::Mutex`/`RwLock` holders now take interrupts: such a lock must
+  never be taken in an interrupt handler (7.4; `LOCKDEP=1` reports one),
+  exactly as for kernel threads, which always ran with interrupts on.
+- Sleeping with interrupts off is now a bug: `might_sleep` reports it
+  under `LOCKDEP=1` (1.5).
+- Interrupt handlers nest on the interrupted task's kernel stack (no
+  separate IRQ stacks, unlike Linux): handlers stay shallow.
+- IRQ toggles (`cli`/`sti`, `msr daifset/daifclr`, `local_irq_*`) are
+  compiler barriers (no `nomem`), so no memory access moves across
+  them.
+- Cross-CPU calls: a CPU in a long syscall answers IPIs at once, and
+  spinning waiters (page-table locks) have interrupts on.
 
 ---
 

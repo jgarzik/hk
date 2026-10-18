@@ -56,14 +56,14 @@ impl CpuOps for X86_64Arch {
     #[inline]
     fn enable_interrupts() {
         unsafe {
-            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("sti", options(nostack, preserves_flags));
         }
     }
 
     #[inline]
     fn disable_interrupts() {
         unsafe {
-            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("cli", options(nostack, preserves_flags));
         }
     }
 
@@ -80,7 +80,7 @@ impl CpuOps for X86_64Arch {
         // HLT completes, preventing the race where an interrupt fires between
         // STI and HLT leaving the CPU spinning.
         unsafe {
-            core::arch::asm!("sti", "hlt", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("sti", "hlt", options(nostack, preserves_flags));
         }
     }
 }
@@ -223,7 +223,7 @@ impl HaltOps for X86_64Arch {
     fn halt_loop() -> ! {
         unsafe {
             // Disable interrupts first to prevent waking from halt
-            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("cli", options(nostack, preserves_flags));
         }
         loop {
             unsafe {

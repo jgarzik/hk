@@ -177,6 +177,9 @@ pub extern "C" fn clone_child_entry() -> ! {
         // First, release the scheduler lock that was held during context switch
         // (the switch loaded the child's address space: mm::tlb::switch_mm)
         "call {finish_switch}",
+        // Interrupts on, as in any syscall (Linux ret_from_fork): the
+        // child-TID write may fault and sleep
+        "sti",
 
         // Write child TID if CLONE_CHILD_SETTID was used (for fork)
         "call {write_child_tid}",
@@ -205,6 +208,8 @@ pub extern "C" fn clone_child_entry() -> ! {
         //   rax, rbx, rcx, rdx, rsi, rdi, rbp, r8-r15,
         //   error_code, rip, cs, rflags, rsp, ss
 
+        // Off for the return (IRETQ loads the user RFLAGS)
+        "cli",
         // Restore general purpose registers from TrapFrame
         "pop rax",     // Will be 0 (child return value)
         "pop rbx",

@@ -139,6 +139,9 @@ pub extern "C" fn clone_child_entry() -> ! {
         // First, release the scheduler lock that was held during context switch
         // (the switch loaded the child's TTBR0: mm::tlb::switch_mm)
         "bl {finish_switch}",
+        // IRQs on, as in any syscall (Linux ret_from_fork): the
+        // child-TID write may fault and sleep
+        "msr daifclr, #2",
 
         // Write child TID if CLONE_CHILD_SETTID was used (for fork)
         "bl {write_child_tid}",
@@ -149,6 +152,8 @@ pub extern "C" fn clone_child_entry() -> ! {
         // X0 now contains the TLS value (or 0 if not set)
         // TPIDR_EL0 is the user TLS pointer register
         "msr tpidr_el0, x0",
+        // IRQs off for the return: ELR/SPSR_EL1 are loaded below
+        "msr daifset, #2",
 
         // SP points to the TrapFrame we prepared on the child's kernel stack
         // TrapFrame layout (Aarch64TrapFrame, 0x320 bytes):

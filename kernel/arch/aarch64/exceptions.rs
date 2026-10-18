@@ -62,6 +62,12 @@ extern "C" fn handle_el1_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             // on TTBR0 addresses), unless page faults are disabled (a
             // spinlock is held)
             if far >> 48 == 0 {
+                // FAR is read: IRQs back on if the faulting context had
+                // them (SPSR.I clear; Linux el1_abort), so a fault that
+                // sleeps does not hold them off
+                if frame.spsr & (1 << 7) == 0 {
+                    super::cpu::enable_interrupts();
+                }
                 let resolve = !crate::uaccess::pagefault_disabled();
                 if resolve && fault_access(iss, false).is_some_and(|a| mm_fault(far, a).is_ok()) {
                     return;
@@ -167,6 +173,10 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
                 percpu.syscall_user_regs = frame.x;
                 percpu.syscall_orig_x0 = frame.x[0];
             }
+            // The user state is saved: run the syscall with IRQs
+            // unmasked (Linux el0_svc). The kernel is not preemptive, so
+            // an interrupt never switches tasks here (doc/LOCKING.md 7)
+            super::cpu::enable_interrupts();
             // Syscall number in x8, arguments in x0-x5, return value in x0
             let result = super::syscall::aarch64_syscall_dispatch(
                 frame.x[8], // syscall number
@@ -178,6 +188,7 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
                 frame.x[5], // arg5
             );
             frame.x[0] = result;
+            super::cpu::disable_interrupts();
 
             // Update frame from percpu if signal delivery modified the context
             // This is needed because do_signal() modifies percpu, not the frame
@@ -199,6 +210,8 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
                 asm!("mrs {}, far_el1", out(reg) far, options(nostack, nomem));
             }
 
+            // FAR is read: IRQs on for the fault (Linux el0_da)
+            super::cpu::enable_interrupts();
             // A kernel (TTBR1) address is never resolved: its table
             // indices would alias a user address in TTBR0
             let res = match fault_access(iss, false) {
@@ -214,6 +227,7 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             unsafe {
                 asm!("mrs {}, far_el1", out(reg) far, options(nostack, nomem));
             }
+            super::cpu::enable_interrupts();
             let res = match fault_access(iss, true) {
                 Some(a) if far < super::paging::TASK_SIZE => mm_fault(far, a),
                 _ => Err(VmFault::Segv),

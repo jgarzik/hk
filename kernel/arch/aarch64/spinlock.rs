@@ -189,7 +189,7 @@ fn save_and_disable_irq() -> u64 {
             options(nomem, nostack, preserves_flags)
         );
         // Disable IRQ (set bit 7 of DAIF via daifset, #2 = IRQ bit)
-        core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+        core::arch::asm!("msr daifset, #2", options(nostack, preserves_flags));
     }
     daif
 }
@@ -204,7 +204,7 @@ fn restore_irq(saved_daif: u64) {
         core::arch::asm!(
             "msr daif, {}",
             in(reg) saved_daif,
-            options(nomem, nostack, preserves_flags)
+            options(nostack, preserves_flags)
         );
     }
 }
@@ -217,6 +217,25 @@ fn save_and_disable_irq() -> u64 {
 
 #[cfg(test)]
 fn restore_irq(_saved_daif: u64) {}
+
+/// Interrupts are masked on this CPU (Linux irqs_disabled; lockdep's
+/// might_sleep check)
+#[cfg(not(test))]
+#[inline]
+#[allow(dead_code)]
+pub fn irqs_disabled() -> bool {
+    let daif: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack, preserves_flags));
+    }
+    daif & (1 << 7) != 0
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn irqs_disabled() -> bool {
+    false
+}
 
 /// Saved interrupt state of this CPU (Linux local_irq_save flags)
 #[must_use]

@@ -100,11 +100,6 @@ Address spaces are reference counted and torn down like Linux
 - Exited non-leader threads stay in the task table as zombies (Linux
   reaps them at once); their kernel stacks and memory are freed.
 - munmap keeps page-table pages that become empty (freed at exit).
-- x86 and arm64 syscalls run with interrupts off, so a CPU in a long
-  syscall answers a TLB shootdown IPI only when it sleeps or returns: the shooting CPU
-  waits meanwhile. Spinning with interrupts off on another lock held
-  across a shootdown would deadlock (doc/LOCKING.md, Cross-CPU Calls);
-  none is today, and user tasks still run on CPU 0 only.
 
 ## exec ignores set-user-ID / set-group-ID bits and file capabilities
 

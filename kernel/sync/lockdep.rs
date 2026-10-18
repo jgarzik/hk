@@ -5,7 +5,7 @@
 //! boot tests fail on it):
 //! - sleeping in atomic context: `might_sleep()` (sleeping locks,
 //!   `schedule`, wait queues, socket waits, user copies) with a tracked
-//!   spin lock held or a raised preempt count;
+//!   spin lock held, a raised preempt count or interrupts disabled;
 //! - lock order: classes (the source location of a lock's `new()`, like
 //!   Linux's static lock_class_key) form A -> B edges when B is taken
 //!   while A is held; taking B under A after A was seen under B reports
@@ -298,7 +298,11 @@ mod imp {
             return;
         };
         let pc = crate::arch::preempt_count();
-        if c.busy || (c.depth == 0 && pc == 0 && c.irq == 0) {
+        // Syscalls and faults run with interrupts on: sleeping with them
+        // off (and no spinlock owning them) is a bug (Linux might_sleep's
+        // irqs_disabled check)
+        let irqs_off = crate::arch::irqs_disabled();
+        if c.busy || (c.depth == 0 && pc == 0 && c.irq == 0 && !irqs_off) {
             return;
         }
         let at = Location::caller();
@@ -312,11 +316,12 @@ mod imp {
         report(c, || {
             crate::printkln!(
                 "LOCKDEP:FAIL sleeping function called from atomic context at {} \
-                 (spin locks held: {}, preempt count {}, irq {}, tid {})",
+                 (spin locks held: {}, preempt count {}, irq {}, irqs off {}, tid {})",
                 at,
                 depth,
                 pc,
                 irq,
+                irqs_off,
                 crate::task::percpu::current_tid()
             );
             for h in held[..depth].iter().flatten() {

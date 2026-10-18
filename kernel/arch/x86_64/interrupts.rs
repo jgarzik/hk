@@ -198,7 +198,7 @@ pub fn init_idt() {
 #[inline]
 pub fn enable() {
     unsafe {
-        ::core::arch::asm!("sti", options(nomem, nostack));
+        ::core::arch::asm!("sti", options(nostack));
     }
 }
 
@@ -386,7 +386,7 @@ fn user_fault(frame: &mut X86_64TrapFrame, sig: u32, info: KSigInfo) {
 extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 {
     // Disable interrupts
     unsafe {
-        ::core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        ::core::arch::asm!("cli", options(nostack, preserves_flags));
     }
 
     // Read CR2 for page faults
@@ -397,6 +397,12 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
 
     // Page faults: demand paging, copy-on-write, swap-in (kernel/mm/fault.rs)
     if vector == 14 {
+        // CR2 is read: interrupts back on if the faulting context had
+        // them (Linux do_user_addr_fault), so a fault that sleeps (the
+        // mmap_lock, file I/O) does not hold them off
+        if frame.rflags & 0x200 != 0 {
+            enable();
+        }
         let Err(err) = handle_page_fault(frame, cr2) else {
             return 1; // resolved: retry the access
         };

@@ -695,8 +695,9 @@ const MSR_SFMASK: u32 = 0xC000_0084; // RFLAGS mask for syscall
 /// EFER.SCE - Syscall Enable bit
 const EFER_SCE: u64 = 1 << 0;
 
-/// RFLAGS bits to clear on syscall entry
-const SYSCALL_FLAG_MASK: u64 = 0x4700; // Clear TF, DF, IF, AC
+/// RFLAGS bits to clear on syscall entry: TF, DF, IF, AC (interrupts
+/// stay off only until the entry has saved the user state)
+const SYSCALL_FLAG_MASK: u64 = 0x4700;
 
 /// Initialize syscall/sysret mechanism
 pub fn init() {
@@ -906,6 +907,11 @@ unsafe extern "C" fn syscall_entry() {
         "mov r9, [rsp + 16]",    // saved R10
         "call {save_syscall_caller_saved}",
 
+        // The user state is saved: run the syscall with interrupts on
+        // (Linux do_syscall_64). The kernel is not preemptive, so an
+        // interrupt never switches tasks here (doc/LOCKING.md 7)
+        "sti",
+
         // Now set up arguments for C handler
         // syscall_handler(num, arg0, arg1, arg2, arg3, arg4, arg5)
         // C ABI: rdi, rsi, rdx, rcx, r8, r9, [stack]
@@ -933,6 +939,10 @@ unsafe extern "C" fn syscall_entry() {
 
         // Call the handler (returns result in RAX)
         "call {handler}",
+
+        // Interrupts off from here to SYSRET/IRETQ: the exit path writes
+        // the global entry stack and per-CPU user state
+        "cli",
 
         // Remove arg5 from stack
         "add rsp, 8",
