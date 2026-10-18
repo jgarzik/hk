@@ -537,3 +537,31 @@ From the P2 /code-review (unverified). Tag = when to fix.
    GS_BASE per call (use a gs-relative load); `kernel/mm/page.rs:389`
    vmemmap uses 4KB PTEs and one memblock alloc per page (Linux: 2MB
    PMD per section).
+
+## P3 review findings (open)
+From the P3 /code-review (unverified). Tag = when to fix.
+1. **mmap of procfs files deadlocks on mmap_lock** (next batch, first;
+   regression from a9b9323). `kernel/mm/fault.rs:238`: the fault holds
+   mmap_read across File::pread; procfs readers re-take the same mm's
+   mmap_lock, so a queued writer deadlocks both. Linux: procfs has no
+   mmap (ENODEV); or drop the lock around pread.
+2. **MADV_DONTNEED skips a 2MB range racing a THP split** (next
+   batch; regression). `kernel/mm/memory.rs:124`: take_huge_pmd →
+   None `continue`s instead of falling through to the 4KB path.
+3. **Non-canonical fs_base crashes the kernel** (next batch; user-
+   triggerable). `kernel/arch/x86_64/ptrace.rs:164` SETREGS,
+   arch_prctl(ARCH_SET_FS), CLONE_SETTLS: wrmsr FS_BASE #GPs in
+   ring 0. Linux: EIO (putreg) / EPERM (arch_prctl).
+4. **Remote write gives up after 16 COW tries** (next batch).
+   `kernel/mm/remote.rs:176`: spurious EFAULT; break COW and write
+   under one PTE-lock hold, or loop until fatal_signal_pending.
+5. **populate_pages not killable** (next batch).
+   `kernel/mm/syscall.rs:569`: mlock/MAP_POPULATE ignore SIGKILL.
+6. **fatal_signal_pending scans TASK_TABLE** (P7).
+   `kernel/signal/mod.rs:800`: global lock + O(tasks) per killable
+   wake; use a per-task flag.
+7. **Minor** (next batch): `kernel/uaccess.rs:244` fault_in_writeable
+   unused and duplicates populate_pages; `kernel/fs/io.rs:70`
+   copy_in always uses the atomic+fault-in copy (only i_rwsem writers
+   need it); `kernel/task/misc.rs:244` USER_HZ duplicated, times()
+   assumes TICK_MS == 10.
