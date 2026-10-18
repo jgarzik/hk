@@ -112,10 +112,16 @@ ln -sf boot_tester "$ROOT/bin/init"
 echo -n "Hello from ramfs!" > "$ROOT/test.txt"
 (cd "$ROOT" && find . | cpio -o -H newc --quiet) > "$WORK/initramfs.cpio"
 
+# KVM whenever the host can run this arch natively (x86_64 on x86_64,
+# aarch64 on an arm64 host such as CI's ubuntu-24.04-arm if it exposes
+# /dev/kvm); TCG otherwise
 KVM=()
-if [ -w /dev/kvm ] && $NATIVE && [ "$ARCH" = x86_64 ] && [ "${NO_KVM:-}" != 1 ]; then
-    KVM=(-enable-kvm)
-    QEMU_MACHINE=(-cpu host)
+if [ -w /dev/kvm ] && $NATIVE && [ "${NO_KVM:-}" != 1 ]; then
+    KVM=(-accel kvm)
+    case $ARCH in
+        x86_64) QEMU_MACHINE=(-cpu host) ;;
+        aarch64) QEMU_MACHINE=(-machine virt,gic-version=host -cpu host) ;;
+    esac
 fi
 
 # The virtio test disk, attached like run-qemu.sh does (make disk-image)
@@ -165,7 +171,7 @@ if [ -z "${CI:-}" ] && KEY=$(linux_cache_key); then
     fi
 fi
 
-echo "Booting boot_tester on Linux (${TIMEOUT}s timeout)..."
+echo "Booting boot_tester on Linux ($([ ${#KVM[@]} = 0 ] && echo TCG || echo KVM), ${TIMEOUT}s timeout)..."
 timeout "$TIMEOUT" "$QEMU_BIN" "${KVM[@]}" "${QEMU_MACHINE[@]}" \
     -m 512M -smp 4 -nographic -no-reboot -monitor none "${QEMU_NET[@]}" "${DISK[@]}" \
     -kernel "$LINUX_KERNEL" -initrd "$WORK/initramfs.cpio" \

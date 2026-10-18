@@ -10,14 +10,15 @@
 #   -u           USB serial console mode (x86 only, for make check-usb)
 #
 # Environment:
-#   QEMU_CPU     Override the -cpu model (x86 default: host under KVM,
-#                max under TCG; arm default: neoverse-n1), e.g. QEMU_CPU=qemu64.
+#   QEMU_CPU     Override the -cpu model (default: host under KVM; under
+#                TCG max on x86, neoverse-n1 on arm), e.g. QEMU_CPU=qemu64.
 #                The defaults have SMAP/SMEP (x86) and PAN (arm), so boot
 #                tests catch kernel accesses to user memory that bypass the
 #                uaccess helpers.
 #   NIC          Network card: virtio (default, modern virtio-net-pci) or
 #                e1000, e.g. make check NIC=e1000
-#   NO_KVM=1     Force TCG on x86 even if /dev/kvm works (as on CI)
+#   NO_KVM=1     Force TCG even if /dev/kvm works (KVM: x86 on x86, arm
+#                on an arm64 host)
 #   QEMU_LOG_DIR Serial log directory (default: target/qemu in this tree)
 #
 # Serial output (in $QEMU_LOG_DIR):
@@ -205,11 +206,18 @@ setup_arm_config() {
         USB_CONSOLE=false
     fi
 
+    # KVM on an arm64 host with a usable /dev/kvm (host CPU and GIC);
+    # TCG otherwise: neoverse-n1 (ARMv8.2) has PAN, the arm64 analogue
+    # of SMAP
+    if [ "$(uname -m)" = aarch64 ] && [ -w /dev/kvm ] && [ "${NO_KVM:-}" != 1 ]; then
+        ARM_MACHINE=(-accel kvm -machine virt,gic-version=host -cpu "${QEMU_CPU:-host}")
+    else
+        ARM_MACHINE=(-machine virt,gic-version=3 -cpu "${QEMU_CPU:-neoverse-n1}")
+    fi
+
     # Base QEMU arguments
     QEMU_ARGS=(
-        -machine virt,gic-version=3
-        # neoverse-n1 (ARMv8.2) has PAN, the arm64 analogue of SMAP
-        -cpu "${QEMU_CPU:-neoverse-n1}"
+        "${ARM_MACHINE[@]}"
         -smp 4
         -m 512M
         -kernel "$KERNEL"
