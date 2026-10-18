@@ -2344,6 +2344,15 @@ impl FileOps for VfatFileOps {
         self
     }
 
+    /// Regular files map their data (Linux generic_file_mmap);
+    /// directories have no mmap
+    fn mmap(&self, file: &File) -> Result<(), KernelError> {
+        match file.get_inode() {
+            Some(i) if i.mode().is_dir() => Err(KernelError::NoDevice),
+            _ => Ok(()),
+        }
+    }
+
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;
         let inode_data = get_inode_data(&inode)?;

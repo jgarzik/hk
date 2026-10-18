@@ -540,11 +540,9 @@ From the P2 /code-review (unverified). Tag = when to fix.
 
 ## P3 review findings (open)
 From the P3 /code-review (unverified). Tag = when to fix.
-1. **mmap of procfs files deadlocks on mmap_lock** (next batch, first;
-   regression from a9b9323). `kernel/mm/fault.rs:238`: the fault holds
-   mmap_read across File::pread; procfs readers re-take the same mm's
-   mmap_lock, so a queued writer deadlocks both. Linux: procfs has no
-   mmap (ENODEV); or drop the lock around pread.
+1. Fixed in fix batch 1: procfs (and other files without Linux
+   f_op->mmap) can no longer be mapped (ENODEV; EIO for
+   proc_dir_entry files).
 2. **MADV_DONTNEED skips a 2MB range racing a THP split** (next
    batch; regression). `kernel/mm/memory.rs:124`: take_huge_pmd →
    None `continue`s instead of falling through to the 4KB path.

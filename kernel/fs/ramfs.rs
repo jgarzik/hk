@@ -1064,6 +1064,15 @@ impl FileOps for RamfsFileOps {
         self
     }
 
+    /// Regular files map their data (Linux generic_file_mmap);
+    /// directories have no mmap
+    fn mmap(&self, file: &File) -> Result<(), KernelError> {
+        match file.get_inode() {
+            Some(i) if i.mode().is_dir() => Err(KernelError::NoDevice),
+            _ => Ok(()),
+        }
+    }
+
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
         use crate::frame_alloc::FrameAllocRef;
         use crate::{FRAME_ALLOCATOR, PAGE_CACHE};

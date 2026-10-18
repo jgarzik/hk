@@ -851,7 +851,11 @@ pub struct Zone {
   `Shmem.root`, rmap/LRU, and the reads that may sleep (a file page:
   `pread` or the page cache for a ramfs page; a swap slot), as in Linux
   (the mm lock is a sleeping lock, so nothing it waits for can need
-  it, and the VMA cannot change meanwhile). A PTE is set with a
+  it, and the VMA cannot change meanwhile). Only files whose
+  `FileOps::mmap` accepts the mapping get there (ramfs, vfat, block
+  and some character devices; Linux f_op->mmap): procfs, whose
+  readers take an mm lock, pipes, sockets and anon-inode files cannot
+  be mapped (ENODEV/EIO). A PTE is set with a
   compare-and-swap against the value the fault read (Linux pte_same)
   under its PTE lock, the loser dropping its page. No user memory is
   accessed under the mm lock (a fault there would deadlock: a waiting

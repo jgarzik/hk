@@ -1174,6 +1174,26 @@ impl FileOps for ProcfsFileOps {
         self
     }
 
+    /// No procfs file maps (its readers may take the mmap_lock a fault
+    /// holds): proc_dir_entry files fail in pde_mmap (EIO), per-process
+    /// and sysctl files have no mmap (ENODEV)
+    fn mmap(&self, file: &File) -> Result<(), KernelError> {
+        let pde = file
+            .get_inode()
+            .and_then(|i| i.get_private())
+            .is_some_and(|p| {
+                p.as_ref()
+                    .as_any()
+                    .downcast_ref::<ProcfsInodeWrapper>()
+                    .is_some_and(|w| matches!(&*w.0.read(), ProcfsInodeData::File { .. }))
+            });
+        Err(if pde {
+            KernelError::Io
+        } else {
+            KernelError::NoDevice
+        })
+    }
+
     /// Private per-process files check ptrace-read access at open
     /// (Linux proc_mem_open, proc_fd_permission); maps keeps the address
     /// space it was opened on, so a later setuid exec cannot leak

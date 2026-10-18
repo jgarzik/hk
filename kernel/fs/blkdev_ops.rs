@@ -124,6 +124,11 @@ impl FileOps for BlockFileOps {
         self
     }
 
+    /// The device's page cache maps (Linux blkdev_mmap)
+    fn mmap(&self, _file: &File) -> Result<(), KernelError> {
+        Ok(())
+    }
+
     /// Bind the file to its block device (Linux blkdev_open)
     fn open(&self, file: &File) -> Result<(), KernelError> {
         let inode = file.get_inode().ok_or(KernelError::BadFd)?;

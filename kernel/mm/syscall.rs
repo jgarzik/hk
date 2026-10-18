@@ -127,7 +127,8 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
         None
     };
     if let Some(f) = &file
-        && let Err(e) = file_prot_ok(f, prot, is_shared, KernelError::NotPermitted)
+        && let Err(e) =
+            file_prot_ok(f, prot, is_shared, KernelError::NotPermitted).and_then(|_| f.f_op.mmap(f))
     {
         return e.sysret();
     }

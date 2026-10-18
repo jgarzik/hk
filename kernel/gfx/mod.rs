@@ -206,6 +206,10 @@ impl CharDevice for GfxCharDevice {
         &self.name
     }
 
+    fn mmap_ok(&self) -> bool {
+        true
+    }
+
     fn read(&self, _buf: &mut [u8]) -> Result<usize, DeviceError> {
         // DRM devices don't support read
         Err(DeviceError::NotSupported)

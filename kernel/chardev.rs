@@ -157,6 +157,11 @@ pub trait CharDevice: Send + Sync {
     /// Write bytes to the device
     fn write(&self, buf: &[u8]) -> Result<usize, DeviceError>;
 
+    /// The device can be mapped (Linux: its fops have mmap)
+    fn mmap_ok(&self) -> bool {
+        false
+    }
+
     /// Device-specific control operations
     fn ioctl(&self, _cmd: u32, _arg: u64) -> Result<i64, DeviceError> {
         Err(DeviceError::NotTty)
@@ -270,6 +275,11 @@ pub struct ZeroCharDevice;
 impl CharDevice for ZeroCharDevice {
     fn name(&self) -> &str {
         "zero"
+    }
+
+    /// Linux mmap_zero: private zero pages
+    fn mmap_ok(&self) -> bool {
+        true
     }
 
     fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError> {

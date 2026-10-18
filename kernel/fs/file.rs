@@ -229,6 +229,12 @@ pub trait FileOps: Send + Sync {
         Err(KernelError::NotDirectory)
     }
 
+    /// May the file be mapped (Linux: f_op->mmap exists and accepts
+    /// it)? Default: no mmap, ENODEV from mmap(2)
+    fn mmap(&self, _file: &File) -> Result<(), KernelError> {
+        Err(KernelError::NoDevice)
+    }
+
     /// Sync file data to backing store
     fn fsync(&self, _file: &File) -> Result<(), KernelError> {
         Ok(())
@@ -759,6 +765,14 @@ impl CharDevFileOps {
 impl FileOps for CharDevFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
         self
+    }
+
+    fn mmap(&self, file: &File) -> Result<(), KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        match get_chardev(inode.rdev) {
+            Some(d) if d.mmap_ok() => Ok(()),
+            _ => Err(KernelError::NoDevice),
+        }
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
