@@ -248,6 +248,11 @@ pub fn write_tpidr_el0(value: u64) {
     }
 }
 
+/// TPIDR_EL0 takes any value (Linux copy_thread, tls_set)
+pub fn tpidr_ok(_val: u64) -> bool {
+    true
+}
+
 /// Read the TPIDR_EL0 register (user TLS pointer)
 #[inline]
 pub fn read_tpidr_el0() -> u64 {

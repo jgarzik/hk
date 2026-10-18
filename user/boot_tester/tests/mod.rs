@@ -98,6 +98,7 @@ pub mod tcp_xfer;
 pub mod timerfd;
 pub mod timing;
 pub mod tlb;
+pub mod tls;
 pub mod tty;
 pub mod uaccess;
 pub mod udp;
@@ -221,6 +222,7 @@ pub fn run_all_tests() {
     posix_lock::run_tests();
     fcntl_owner::run_tests();
     prctl_extra::run_tests();
+    tls::run_tests();
     poll::run_tests();
     timing::run_tests();
     uaccess::run_tests();

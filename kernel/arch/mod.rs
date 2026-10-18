@@ -120,6 +120,13 @@ pub use x86_64::percpu::read_fs_base as read_user_tls;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::percpu::read_tpidr_el0 as read_user_tls;
 
+// A value the user TLS register may take
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::percpu::fs_base_ok as user_tls_ok;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::percpu::tpidr_ok as user_tls_ok;
+
 // ELF auxv hardware capabilities and platform string
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::cpu::{ELF_PLATFORM, elf_hwcap};

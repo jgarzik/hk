@@ -1176,6 +1176,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         return Err(11); // EAGAIN - resource temporarily unavailable
     }
 
+    // A TLS base the register cannot take (Linux copy_thread ->
+    // set_new_tls -> do_arch_prctl_64)
+    if config.flags & CLONE_SETTLS != 0 && !crate::arch::user_tls_ok(config.tls) {
+        return Err(1); // EPERM
+    }
+
     // Helper macro to handle early returns with NPROC cleanup
     // If we incremented the process count and then fail, we must decrement it
 

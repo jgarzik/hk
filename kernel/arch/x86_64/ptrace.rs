@@ -137,6 +137,11 @@ pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
     if regs.rip >= 0x0000_8000_0000_0000 {
         return Err(-5);
     }
+    // Linux putreg: a base at or above TASK_SIZE_MAX is EIO (the user
+    // GS base is not kept, but checked all the same)
+    if !super::percpu::fs_base_ok(regs.fs_base) || !super::percpu::fs_base_ok(regs.gs_base) {
+        return Err(-5);
+    }
 
     // Update trap frame with new register values
     let tf = &mut task.trap_frame;
@@ -159,10 +164,7 @@ pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
     tf.rflags = sanitize_rflags(regs.eflags);
     tf.rsp = regs.rsp;
 
-    // Update TLS base if changed
-    if regs.fs_base != 0 {
-        task.tls_base = regs.fs_base;
-    }
+    task.tls_base = regs.fs_base;
 
     Ok(())
 }

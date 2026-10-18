@@ -779,6 +779,9 @@ pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
     match code {
         ARCH_SET_FS => {
             // Set FS base - user TLS pointer
+            if !crate::arch::user_tls_ok(addr) {
+                return KernelError::NotPermitted.sysret();
+            }
             set_task_tls(tid, addr);
             write_fs_base(addr);
             0

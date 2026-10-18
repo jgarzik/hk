@@ -243,6 +243,17 @@ CPU-bound user task never takes SIGKILL or SIGSTOP. With SMP user
 scheduling (P7) this needs the IRQ-return work check plus a kick IPI
 (Linux signal_wake_up -> kick_process).
 
+## Tracees never stop
+
+**Location**: `kernel/task/ptrace.rs` (ptrace_stop, ptrace_report_syscall),
+`kernel/signal/mod.rs` (stop signals)
+
+Nothing calls `ptrace_stop`: no signal-delivery stop, no syscall stop,
+and SIGSTOP is ignored (stop/continue are not implemented), so a tracee
+never enters the Traced state and every request that needs a stopped
+tracee (GETREGS, SETREGS, PEEK/POKE*, CONT, ...) fails with ESRCH. The
+TLS_PTRACE_RANGE boot test runs on Linux only.
+
 ## Global init is not protected from default-action signals
 
 **Location**: `kernel/signal/mod.rs` send_signal
@@ -545,10 +556,9 @@ From the P3 /code-review (unverified). Tag = when to fix.
    proc_dir_entry files).
 2. Fixed in fix batch 1: zap_range falls back to the 4KB entries when
    take_huge_pmd loses to a split.
-3. **Non-canonical fs_base crashes the kernel** (next batch; user-
-   triggerable). `kernel/arch/x86_64/ptrace.rs:164` SETREGS,
-   arch_prctl(ARCH_SET_FS), CLONE_SETTLS: wrmsr FS_BASE #GPs in
-   ring 0. Linux: EIO (putreg) / EPERM (arch_prctl).
+3. Fixed in fix batch 1: x86 FS/GS bases at or above TASK_SIZE_MAX
+   are refused (arch_prctl and CLONE_SETTLS EPERM, SETREGS EIO); arm64
+   TPIDR_EL0 takes any value (Linux too).
 4. **Remote write gives up after 16 COW tries** (next batch).
    `kernel/mm/remote.rs:176`: spurious EFAULT; break COW and write
    under one PTE-lock hold, or loop until fatal_signal_pending.

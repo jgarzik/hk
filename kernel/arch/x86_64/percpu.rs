@@ -397,7 +397,14 @@ pub const MSR_FS_BASE: u32 = 0xC0000100;
 /// Set the FS base register (user TLS pointer)
 ///
 /// This is used for user-space thread-local storage. The FS segment
-/// register's base address is set via this MSR on x86_64.
+/// register's base address is set via this MSR on x86_64. `addr` must
+/// pass `fs_base_ok` (a non-canonical base #GPs the WRMSR).
+/// A user FS/GS base must lie below TASK_SIZE_MAX (Linux
+/// do_arch_prctl_64, putreg)
+pub fn fs_base_ok(addr: u64) -> bool {
+    addr < crate::arch::x86_64::paging::TASK_SIZE
+}
+
 pub fn write_fs_base(addr: u64) {
     unsafe {
         ::core::arch::asm!(
