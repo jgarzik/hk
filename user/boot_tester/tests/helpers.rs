@@ -235,3 +235,54 @@ pub fn starts_with(slice: &[u8], prefix: &[u8]) -> bool {
     }
     true
 }
+
+/// A kB field of a /proc file (e.g. b"SwapFree:" of /proc/meminfo,
+/// b"VmSwap:" of /proc/self/status), -1 if missing
+pub fn proc_kb(path: &[u8], key: &[u8]) -> i64 {
+    let mut buf = [0u8; 4096];
+    let n = read_file(path, &mut buf);
+    if n <= 0 {
+        return -1;
+    }
+    let Some(l) = buf[..n as usize]
+        .split(|&c| c == b'\n')
+        .find(|l| l.starts_with(key))
+    else {
+        return -1;
+    };
+    let v = l[key.len()..]
+        .iter()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .fold(0i64, |n, &c| n * 10 + (c - b'0') as i64);
+    v
+}
+
+/// swapon(2) of a NUL-terminated path, no flags
+pub fn swap_on(path: &[u8]) -> i64 {
+    hk_syscall::sys_swapon(path.as_ptr(), 0)
+}
+
+/// swapoff(2) of a NUL-terminated path
+pub fn swap_off(path: &[u8]) -> i64 {
+    hk_syscall::sys_swapoff(path.as_ptr())
+}
+
+/// SwapFree comes within `tol` kB of `want` kB, waiting up to 2 s for
+/// writeback and deferred frees (Linux frees swap-cache slots after
+/// async writeback); the last value seen
+pub fn freeswap_within(want: i64, tol: i64) -> Result<i64, i64> {
+    let ts = hk_syscall::Timespec {
+        tv_sec: 0,
+        tv_nsec: 10_000_000,
+    };
+    let mut got = -1;
+    for _ in 0..200 {
+        got = proc_kb(b"/proc/meminfo\0", b"SwapFree:");
+        if (got - want).abs() <= tol {
+            return Ok(got);
+        }
+        hk_syscall::sys_nanosleep(&ts, core::ptr::null_mut());
+    }
+    Err(got)
+}

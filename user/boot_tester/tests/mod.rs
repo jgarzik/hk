@@ -88,6 +88,7 @@ pub mod sockopts;
 pub mod startup;
 pub mod stdio;
 pub mod swap;
+pub mod swapout;
 pub mod sync;
 pub mod sysctl;
 pub mod sysinfo;
@@ -194,6 +195,7 @@ pub fn run_all_tests() {
     pidfd::run_tests();
     swap::run_tests();
     isolated(b"BLK", blk::run_tests);
+    isolated(b"SWAPOUT", swapout::run_tests);
     adjtimex::run_tests();
     io_uring::run_tests();
     tcp::run_tests();
