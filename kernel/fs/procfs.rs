@@ -1681,6 +1681,8 @@ fn gen_meminfo() -> Vec<u8> {
     let total = fa.stats().total_bytes >> 10;
     let free = (fa.free_frames() as u64 * 4096) >> 10;
     let slab = (crate::mm::slab::slab_bytes() as u64) >> 10;
+    let (swap_total, swap_free) = crate::mm::swap::swap_totals();
+    let swap_cached = crate::mm::swap_state::total_cached();
     let mut out = String::new();
     for (label, kb) in [
         ("MemTotal:", total),
@@ -1688,9 +1690,9 @@ fn gen_meminfo() -> Vec<u8> {
         ("MemAvailable:", free),
         ("Buffers:", 0),
         ("Cached:", 0),
-        ("SwapCached:", 0),
-        ("SwapTotal:", 0),
-        ("SwapFree:", 0),
+        ("SwapCached:", swap_cached * 4),
+        ("SwapTotal:", swap_total * 4),
+        ("SwapFree:", swap_free * 4),
         ("Slab:", slab),
     ] {
         let _ = writeln!(out, "{label:<16}{kb:>8} kB");

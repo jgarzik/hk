@@ -294,6 +294,37 @@ impl Default for Page {
     }
 }
 
+// ============================================================================
+// Page lock (Linux folio_lock: PG_locked, hashed wait queues)
+// ============================================================================
+
+/// Lock the page at `phys` (Linux folio_lock), sleeping while another
+/// task holds it. A sleeping lock: thread context, no spinlock held;
+/// order: mmap_lock -> page lock -> AnonVma lock -> PTE lock. The
+/// caller holds a reference on the page.
+pub fn lock_page(phys: u64) {
+    let Some(pg) = phys_to_page(phys) else {
+        return;
+    };
+    while !pg.try_lock() {
+        crate::waitqueue::page_wait_queue(phys).wait_event(|| !pg.is_locked());
+    }
+}
+
+/// Unlock the page at `phys` and wake its waiters (Linux folio_unlock)
+pub fn unlock_page(phys: u64) {
+    if let Some(pg) = phys_to_page(phys) {
+        pg.unlock();
+        crate::waitqueue::page_wait_queue(phys).wake_all();
+    }
+}
+
+/// Lock the page at `phys` if no one holds it (Linux folio_trylock):
+/// never sleeps, so it may be taken under a spinlock
+pub fn trylock_page(phys: u64) -> bool {
+    phys_to_page(phys).is_some_and(|pg| pg.try_lock())
+}
+
 /// Release a mapping word taken off a page: an anon_vma reference
 pub fn put_mapping(word: u64) {
     if word & 1 != 0 && word & !1 != 0 {

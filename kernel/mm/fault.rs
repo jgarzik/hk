@@ -105,7 +105,12 @@ fn find_area(map: &MmStruct, addr: u64, access: Access) -> Result<Area, VmFault>
     if !access_ok(vma.prot, access) {
         return Err(VmFault::Segv);
     }
-    Ok(Area {
+    Ok(area_of(vma))
+}
+
+/// What a fault needs of `vma`
+fn area_of(vma: &super::Vma) -> Area {
+    Area {
         start: vma.start,
         end: vma.end,
         prot: vma.prot,
@@ -117,7 +122,7 @@ fn find_area(map: &MmStruct, addr: u64, access: Access) -> Result<Area, VmFault>
         file: vma.file.clone(),
         anon_vma: vma.anon_vma.clone(),
         shmem: vma.shmem.clone(),
-    })
+    }
 }
 
 /// A frame for user data: none once free memory is down to the low
@@ -240,8 +245,7 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
     // the mm lock held for reading (Linux holds it across the I/O; the
     // VMA cannot change meanwhile)
     if SwapEntry::is_swap_pte(pte) {
-        let (page, cached) = swap_page(SwapEntry::from_pte(pte), &area)?;
-        return do_swap_page(mm, ptep, pte, page, cached, addr, &area);
+        return do_swap_page(mm, ptep, pte, addr, &area, access);
     }
     let page = fault_page(addr, &area)?;
     let r = do_fault(mm, ptep, pte, page, addr, &area);
@@ -406,56 +410,80 @@ fn do_fault(
     Ok(())
 }
 
-/// The page for swap entry `entry`, with a reference for the PTE:
-/// the swap-cache page if there is one (true), else a new page read
-/// from the slot. May sleep (the mm lock held for reading).
-fn swap_page(entry: SwapEntry, area: &Area) -> Result<(u64, bool), VmFault> {
-    // A swap-cache page being freed meanwhile is not taken (read the
-    // slot instead)
-    if let Some(cached) = super::swap_cache_lookup(entry)
-        && FRAME_ALLOCATOR.incref(cached.frame)
-    {
-        return Ok((cached.frame, true));
-    }
-    let frame = alloc_user().ok_or(VmFault::Oom)?;
-    if super::swap_read_page(entry, frame).is_err() {
-        FRAME_ALLOCATOR.free(frame);
-        return Err(VmFault::Bus);
-    }
-    paging::sync_page(frame, area.prot & PROT_EXEC != 0);
-    Ok((frame, false))
-}
-
-/// Map a page read back from swap (Linux do_swap_page) where the entry
-/// held the swap PTE `pte`, mm lock held. A swap-cache page may be
-/// mapped by others too: it is mapped copy-on-write in a private VMA.
+/// Map the page of the swap PTE `pte` at `ptep` (Linux do_swap_page),
+/// mm lock held for reading: the swap-cache page, or one read from the
+/// slot into the cache (may sleep). The PTE takes the slot's place: a
+/// write fault on a page no one else needs keeps it writable and drops
+/// it from the swap cache (the slot is freed); otherwise it is mapped
+/// read-only and copy-on-write, still in the cache (a clean copy of the
+/// slot), and a later write fault decides.
 fn do_swap_page(
     mm: &Mm,
     ptep: *mut u64,
     pte: u64,
-    page: u64,
-    cached: bool,
     addr: u64,
     area: &Area,
+    access: Access,
 ) -> Result<(), VmFault> {
-    let mut entry = paging::mk_pte(page, area.prot);
-    if cached && !area.shared {
-        entry = paging::pte_mkcow(entry);
-    }
+    let e = SwapEntry::from_pte(pte);
+    let page = match super::swap_state::read_swap_page(e) {
+        Err(VmFault::Retry) => return Ok(()),
+        r => r?,
+    };
+    paging::sync_page(page, area.prot & PROT_EXEC != 0);
+    let r = map_swap_page(mm, ptep, pte, page, addr, area, access);
+    super::page::unlock_page(page);
+    r
+}
+
+/// The locked swap-cache page `page`, with a reference that becomes the
+/// PTE's, replaces the swap PTE `pte` if the entry still holds it
+fn map_swap_page(
+    mm: &Mm,
+    ptep: *mut u64,
+    pte: u64,
+    page: u64,
+    addr: u64,
+    area: &Area,
+    access: Access,
+) -> Result<(), VmFault> {
     let _l = pte_lock(ptep);
-    if !set_pte(ptep, pte, entry) {
-        super::memory::put_page(page);
+    if get_pte(ptep) != pte {
+        FRAME_ALLOCATOR.decref(page);
         return Ok(());
     }
-    flush_tlb_page(mm, addr);
-    if !cached {
-        super::free_swap_entry(SwapEntry::from_pte(pte));
-        if area.anon_private() {
-            add_anon(page, area, addr);
-        }
+    super::swap::swap_free(SwapEntry::from_pte(pte));
+    // Exclusive: no other swap PTE, and no reference but ours once the
+    // cache lets go (Linux do_swap_page exclusive + folio_free_swap)
+    let exclusive = access == Access::Write
+        && super::swap_state::try_free_swap(page)
+        && FRAME_ALLOCATOR.refcount(page) == 1;
+    let mut entry = paging::mk_pte(page, area.prot);
+    if !exclusive && !area.shared {
+        entry = paging::pte_mkcow(entry);
     }
+    let ok = set_pte(ptep, pte, entry);
+    debug_assert!(ok, "swap PTE changed under its PTE lock");
+    if let Some(av) = &area.anon_vma {
+        super::rmap::page_add_anon_rmap(page, av, area.index(addr));
+    }
+    flush_tlb_page(mm, addr);
     increment_maj_flt();
     Ok(())
+}
+
+/// swapoff: fault in the swap PTE at `addr` of `vma` (Linux
+/// unuse_pte), mm lock held for reading
+pub fn unuse_pte(mm: &Mm, vma: &super::Vma, addr: u64) -> Result<(), VmFault> {
+    let area = area_of(vma);
+    let Some(ptep) = paging::pte_ptr(mm.pgd(), addr) else {
+        return Ok(());
+    };
+    let pte = get_pte(ptep);
+    if !SwapEntry::is_swap_pte(pte) {
+        return Ok(());
+    }
+    do_swap_page(mm, ptep, pte, addr, &area, Access::Read)
 }
 
 /// A write to a present read-only page of a writable VMA (Linux
@@ -468,6 +496,9 @@ fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Resu
         return Ok(()); // changed meanwhile: the access is retried
     }
     let old = paging::pte_addr(pte);
+    if !area.shared && FRAME_ALLOCATOR.refcount(old) > 1 {
+        reuse_swap_page(old);
+    }
     if area.shared || FRAME_ALLOCATOR.refcount(old) <= 1 {
         if set_pte(ptep, pte, paging::pte_mkwrite(pte)) {
             flush_tlb_page(mm, addr);
@@ -493,6 +524,17 @@ fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Resu
     super::memory::put_page(old);
     increment_min_flt();
     Ok(())
+}
+
+/// A write fault on a swap-cache page: drop it from the cache if no
+/// swap PTE needs its slot (Linux wp_can_reuse_anon_folio), so the
+/// page may be reused in place. PTE lock held: trylock only.
+fn reuse_swap_page(phys: u64) {
+    let cached = super::page::phys_to_page(phys).is_some_and(|p| p.is_swapcache());
+    if cached && super::page::trylock_page(phys) {
+        super::swap_state::try_free_swap(phys);
+        super::page::unlock_page(phys);
+    }
 }
 
 /// A user-mode fault found no memory (Linux pagefault_out_of_memory).

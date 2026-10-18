@@ -47,15 +47,8 @@ pub mod vma;
 pub mod writeback;
 pub mod xarray;
 
-pub use swap::{
-    SWAP_FLAG_DISCARD, SWAP_FLAG_PREFER, alloc_swap_entry, free_swap_entry, get_swap_info,
-    memory_pressure, should_swap_out, swap_available, swap_read_page, swap_write_page, sys_swapoff,
-    sys_swapon,
-};
+pub use swap::{SWAP_FLAG_DISCARD, SWAP_FLAG_PREFER, sys_swapoff, sys_swapon};
 pub use swap_entry::SwapEntry;
-pub use swap_state::{
-    is_swap_file_id, swap_cache_add, swap_cache_del, swap_cache_lookup, swap_file_id,
-};
 
 pub use vma::*;
 

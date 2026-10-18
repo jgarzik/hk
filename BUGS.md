@@ -63,16 +63,9 @@ Address spaces are reference counted and torn down like Linux
 - Every frame has a struct page (vmemmap) and anonymous pages join the
   rmap (each holds an AnonVma reference), but the LRU lists stay empty
   (`lru_add_new` is a no-op: removal is a linear search) and nothing
-  calls swap-out, so reclaim is inert. Before enabling swap-out:
-  swap-out frees a frame even when the rmap walk missed a mapping, swap slots carry no
-  reference counts (`free_swap_entry` frees at once), the swap cache is
-  never filled (`swap_cache_add` has no caller) and freeing a slot does
-  not drop a swap-cache entry (Linux SWAP_HAS_CACHE), and munmap leaks
-  the slots of swap PTEs (exit frees them).
-- fork fails with ENOMEM on a swap PTE (`memory::swap_pte_unsupported`,
-  unreachable while swap-out is inert): copying one needs counted swap
-  slots safe against a racing swap-in (Linux swap_duplicate under
-  si->lock); to be done with the reclaim work.
+  calls swap-out, so reclaim is inert. Swap slots are counted and the
+  swap cache works (swap-in, fork, munmap, swapoff), unused until
+  swap-out exists.
 - SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
   IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
   by id still work there).

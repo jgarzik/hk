@@ -29,6 +29,15 @@ pub fn put_page(phys: u64) {
     crate::FRAME_ALLOCATOR.decref(phys);
 }
 
+/// Release the 4KB page a zapped PTE mapped, after the TLB flush (Linux
+/// free_pages_and_swap_cache): a swap-cache page no one maps any more
+/// leaves the cache when no swap PTE needs its slot either
+fn zap_page(phys: u64) {
+    super::rmap::page_remove_rmap(phys);
+    super::swap_state::free_swap_cache(phys);
+    crate::FRAME_ALLOCATOR.decref(phys);
+}
+
 /// Drop one mapping's reference to the 2MB user page at `phys`
 pub fn put_huge(phys: u64) {
     super::rmap::page_remove_rmap(phys);
@@ -39,10 +48,10 @@ pub fn put_huge(phys: u64) {
 pub(super) fn zap_leaf(leaf: Leaf) {
     use super::SwapEntry;
     match leaf {
-        Leaf::Page(p) => put_page(p),
+        Leaf::Page(p) => zap_page(p),
         Leaf::Huge(p) => put_huge(p),
         Leaf::Swap(pte) if SwapEntry::is_swap_pte(pte) => {
-            super::free_swap_entry(SwapEntry::from_pte(pte))
+            super::swap::free_swap_and_cache(SwapEntry::from_pte(pte))
         }
         Leaf::Swap(_) => {}
     }
@@ -244,8 +253,32 @@ fn zap_pte(tlb: &mut Gather, addr: u64) {
     if paging::pte_present(pte) {
         tlb.remove_page(addr, paging::pte_addr(pte));
     } else if SwapEntry::is_swap_pte(pte) {
-        super::free_swap_entry(SwapEntry::from_pte(pte));
+        super::swap::free_swap_and_cache(SwapEntry::from_pte(pte));
     }
+}
+
+/// The first address in [addr, end) whose 4KB entry is a swap entry of
+/// device `ty`, mm lock held (swapoff); 1GB ranges without tables and
+/// 2MB pages are skipped
+pub fn next_swap_pte(pgd: u64, mut addr: u64, end: u64, ty: u8) -> Option<u64> {
+    const GB: u64 = 1 << 30;
+    while addr < end {
+        let Some(pmd) = paging::pmd_ptr(pgd, addr) else {
+            addr = (addr | (GB - 1)) + 1;
+            continue;
+        };
+        let next = ((addr | (HUGE_PAGE_SIZE - 1)) + 1).min(end);
+        if paging::table_of(entry(pmd).load(Ordering::Acquire)).is_some() {
+            for a in (addr..next).step_by(PAGE_SIZE as usize) {
+                let pte = paging::pte_ptr(pgd, a).map_or(0, |p| entry(p).load(Ordering::Acquire));
+                if SwapEntry::is_swap_pte(pte) && SwapEntry::from_pte(pte).swap_type() == ty {
+                    return Some(a);
+                }
+            }
+        }
+        addr = next;
+    }
+    None
 }
 
 /// The page table entry at `p`, as an atomic
@@ -257,8 +290,9 @@ fn entry(p: *mut u64) -> &'static AtomicU64 {
 /// Copy the page tables of the parent's `vma` from the address space
 /// `src` into the child's tables at `dst` (Linux copy_page_range), under
 /// the parent's mm lock. A shared mapping keeps sharing its pages; a private
-/// one shares them copy-on-write, read-only in both; a swap PTE fails
-/// the copy (ENOMEM, see `swap_pte_unsupported`). A 2MB page is split first so that its 4KB
+/// one shares them copy-on-write, read-only in both; a swap PTE is
+/// copied with another slot reference (`swap::swap_duplicate`). Each
+/// table is copied under the parent's PTE lock. A 2MB page is split first so that its 4KB
 /// pages are copied one by one. Returns whether a parent PTE lost write
 /// permission (its TLB needs a flush).
 pub fn copy_page_range(dst: u64, src_mm: &Mm, vma: &Vma) -> Result<bool, i32> {
@@ -278,7 +312,10 @@ pub fn copy_page_range(dst: u64, src_mm: &Mm, vma: &Vma) -> Result<bool, i32> {
         if paging::pmd_huge(entry(pmd).load(Ordering::Acquire)) {
             split_huge_pmd(src_mm, addr).ok_or(ENOMEM)?;
         }
-        if entry(pmd).load(Ordering::Acquire) != 0 {
+        if let Some(p) = paging::pte_ptr(src, addr) {
+            // The parent's PTE lock: the reverse map (reclaim) changes
+            // its entries without the mmap_lock (Linux copy_pte_range)
+            let _l = super::ptl::pte_lock(p);
             for a in (addr..next).step_by(PAGE_SIZE as usize) {
                 wp |= copy_pte(dst, src, a, cow)?;
             }
@@ -286,19 +323,6 @@ pub fn copy_page_range(dst: u64, src_mm: &Mm, vma: &Vma) -> Result<bool, i32> {
         addr = next;
     }
     Ok(wp)
-}
-
-/// fork met a swap PTE. Unreachable while swap-out is inert (page
-/// descriptors are never initialized, BUGS.md): copying one needs swap
-/// slot reference counting that is safe against a racing swap-in, left
-/// for when reclaim is enabled. Until then fork fails with ENOMEM.
-fn swap_pte_unsupported() -> i32 {
-    use core::sync::atomic::AtomicBool;
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        crate::printkln!("fork: swap PTE not copied, fork fails (ENOMEM)");
-    }
-    ENOMEM
 }
 
 /// Copy the PTE for `addr` (Linux copy_present_pte); true if the
@@ -320,7 +344,13 @@ fn copy_pte(dst: u64, src: u64, addr: u64, cow: bool) -> Result<bool, i32> {
         let pte = entry(sp).load(Ordering::Acquire);
         if !paging::pte_present(pte) {
             if SwapEntry::is_swap_pte(pte) {
-                return Err(swap_pte_unsupported());
+                // The child's PTE references the slot too (Linux
+                // copy_nonpresent_pte: swap_duplicate); a full count is
+                // ENOMEM (Linux would chain a count continuation)
+                if !super::swap::swap_duplicate(SwapEntry::from_pte(pte)) {
+                    return Err(ENOMEM);
+                }
+                entry(dp).store(pte, Ordering::Release);
             }
             return Ok(false);
         }

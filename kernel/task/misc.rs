@@ -172,6 +172,7 @@ pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
     // Get memory statistics from frame allocator
     let mem_stats = FRAME_ALLOCATOR.stats();
 
+    let (swap_total, swap_free) = crate::mm::swap::swap_totals();
     // Get process count from scheduler
     let procs = super::percpu::task_count() as u16;
 
@@ -183,8 +184,8 @@ pub fn sys_sysinfo<A: crate::uaccess::UaccessArch>(info_ptr: u64) -> i64 {
         freeram: mem_stats.free_bytes,
         sharedram: 0,
         bufferram: 0,
-        totalswap: 0,
-        freeswap: 0,
+        totalswap: swap_total * 4096,
+        freeswap: swap_free * 4096,
         procs,
         pad: 0,
         _pad2: 0,

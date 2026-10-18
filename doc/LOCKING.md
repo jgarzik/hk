@@ -270,8 +270,11 @@ Global subsystem locks (TASK_TABLE, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-s
     of them
     ↓
 Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
-    copy may fault) → AnonVma.chain (sleeping RwSem, Linux
-    anon_vma->rwsem) → page_table_lock → PTE lock (spin)
+    copy may fault) → page lock (PG_locked, sleeping; Linux folio_lock)
+    → AnonVma.chain (sleeping RwSem, Linux anon_vma->rwsem)
+    → page_table_lock → PTE lock (spin)
+    → SwapInfo.map (spin, Linux si->lock) | swap cache (IrqSpinlock,
+      Linux i_pages; never nested with SwapInfo.map)
     ← never nested with TASK_TABLE (3.2)
     ↓
 Memory allocator locks (Linux: ... → slab → pcp → zone->lock):
@@ -955,6 +958,33 @@ pub struct Zone {
   (another thread still in `exit_current`) has it loaded until it
   switches away, so the flush reaches it (arm64 broadcast; x86 see TLB
   Flushing).
+
+#### Swap (kernel/mm/swap.rs, swap_state.rs; Linux mm/swapfile.c, swap_state.c)
+
+- `SwapInfo.map` (`spin::Mutex`, Linux si->lock): a device's slot
+  counts (swap PTEs + SWAP_HAS_CACHE) and allocation hint. Thread
+  context only; a leaf taken under the PTE lock (fork's swap_duplicate,
+  zap's free_swap_and_cache, swap-in's swap_free), never with a swap
+  cache lock held.
+- `SwapInfo.cache` (`IrqSpinlock<XArray>`, Linux i_pages xa_lock_irq):
+  the swap cache of a device, page by slot. A leaf: under it only the
+  allocator (index nodes, never sleeping). A lookup takes its page
+  reference under it (get_page_unless_zero); reclaim deletes a page
+  from it by freezing its count (expected -> 0) under it, so no lookup
+  revives a page being freed. Slot counts change after it is dropped.
+- Page lock (`page::lock_page`, PG_locked + the hashed page wait
+  queues; sleeping): held while a page enters or leaves the swap cache
+  and across its swap read (a racing fault waits for the read), and by
+  reclaim from unmap to free (trylock: reclaim never sleeps on it).
+  Order: mmap_lock -> page lock -> AnonVma.chain -> PTE lock; under a
+  spinlock only `trylock_page` (zap, a write fault's swap-cache reuse).
+  I/O happens under the page lock, never under a spinlock.
+- `SWAP_INFO` (spin `RwLock`, read mostly): the devices; `SWAPON`
+  (sleeping `Mutex`, Linux swapon_mutex) serializes swapon/swapoff.
+  swapoff (`try_to_unuse`) clears SWP_WRITEOK, then walks every address
+  space (collected under `TASK_TABLE`, which is dropped before any mm
+  lock) with its mmap_lock held for reading, faulting the device's swap
+  PTEs in.
 
 #### TLB Flushing (kernel/mm/tlb.rs; arch/{x86_64,aarch64}/tlb.rs)
 

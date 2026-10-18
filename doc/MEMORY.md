@@ -212,8 +212,8 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   visible both ways); a private one shares them copy-on-write (both
   PTEs read-only and marked COW, also for pages read-only at fork, so a
   later mprotect(PROT_WRITE) cannot make the shared page writable). A
-  2MB page is split into 4KB PTEs in the parent first; a swap PTE fails
-  the fork (ENOMEM; unreachable while swap-out is inert). MADV_DONTFORK VMAs are left out of the
+  2MB page is split into 4KB PTEs in the parent first; a swap PTE is
+  copied, its slot counting one more reference (Linux swap_duplicate). MADV_DONTFORK VMAs are left out of the
   child, MADV_WIPEONFORK ones start empty there, and memory locks
   (VM_LOCKED, locked_vm, MCL_FUTURE) are not inherited.
 - **Page-table updates (break-before-make).** An entry that maps a
