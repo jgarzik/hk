@@ -1,305 +1,285 @@
-//! LRU page lists for page reclaim
+//! LRU lists of reclaimable pages (Linux mm/swap.c, the lruvec)
 //!
-//! Maintains separate lists for active and inactive pages following Linux's
-//! two-list LRU design:
+//! One lruvec (one node, no memory cgroups) with Linux's lists:
+//! inactive and active anonymous pages (file pages join with the page
+//! cache, P5). A page on a list has `PG_LRU` (and `PG_ACTIVE` on an
+//! active list) and is linked through its struct page (`next`/`prev`,
+//! pfn + 1), owned by the list while `PG_LRU` is set. New pages go to
+//! the head; reclaim takes from the tail (the oldest).
 //!
-//! - **Inactive list**: Pages that haven't been accessed recently. These are
-//!   candidates for eviction during memory pressure.
+//! A page reaches the lists through a per-CPU batch (Linux
+//! cpu_fbatches.lru_add): the batch holds a reference on each page, and
+//! a full batch moves to the lists under one lock hold. The lists hold
+//! no reference: a page freed while on a list leaves it on its way to
+//! the allocator (`page_freed`). Reclaim isolates pages it takes a
+//! reference on (get_page_unless_zero), so it never takes a page being
+//! freed.
 //!
-//! - **Active list**: Pages that have been accessed at least twice recently.
-//!   These are protected from immediate eviction.
-//!
-//! Pages start on the inactive list when first allocated. On a second access
-//! (when already on inactive), they are promoted to the active list. When
-//! the active list grows too large or we need victims, pages are demoted
-//! from active back to inactive.
-//!
-//! This implements a "second chance" algorithm: a page must be accessed
-//! twice before being protected from eviction.
+//! Locking: `Lruvec.lock` (Linux lruvec->lru_lock) is an `IrqSpinlock`
+//! (pages are freed in any context); a batch's lock (`IrqSpinlock`, one
+//! per CPU) is never held with it. Neither is held while a page
+//! reference is dropped. Order: PTE lock -> batch lock | lru_lock;
+//! nothing is taken under lru_lock.
 
-extern crate alloc;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-use alloc::collections::VecDeque;
-use core::sync::atomic::Ordering;
+use crate::FRAME_ALLOCATOR;
+use crate::arch::IrqSpinlock;
+use crate::cpumask::NR_CPUS;
+use crate::mm::page::{PG_ACTIVE, PG_LRU, Page, pfn_to_page, phys_to_page};
 
-use crate::sync::spin::Mutex;
-
-use crate::mm::page::{PG_ACTIVE, PG_LRU, phys_to_page};
-
-// ============================================================================
-// LRU Lists
-// ============================================================================
-
-/// LRU lists for page reclaim
-///
-/// Uses VecDeque for O(1) push/pop at both ends.
-/// We store physical frame addresses (page-aligned).
-pub struct LruLists {
-    /// Recently accessed pages (second chance protection)
-    active: VecDeque<u64>,
-    /// Candidates for eviction
-    inactive: VecDeque<u64>,
+/// The lists (Linux enum lru_list)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lru {
+    InactiveAnon = 0,
+    ActiveAnon = 1,
 }
 
-impl LruLists {
-    /// Create empty LRU lists
-    const fn new() -> Self {
-        Self {
-            active: VecDeque::new(),
-            inactive: VecDeque::new(),
-        }
+const NR_LRU: usize = 2;
+
+/// List heads and tails, pfn + 1 (0: empty)
+struct Lists {
+    head: [u64; NR_LRU],
+    tail: [u64; NR_LRU],
+}
+
+/// The pages of the machine, by recency (Linux struct lruvec)
+pub struct Lruvec {
+    lock: IrqSpinlock<Lists>,
+    /// Pages on each list (written under `lock`)
+    nr: [AtomicUsize; NR_LRU],
+}
+
+/// The one lruvec
+pub static LRUVEC: Lruvec = Lruvec {
+    lock: IrqSpinlock::new(Lists {
+        head: [0; NR_LRU],
+        tail: [0; NR_LRU],
+    }),
+    nr: [const { AtomicUsize::new(0) }; NR_LRU],
+};
+
+fn page(pfn: u64) -> &'static Page {
+    pfn_to_page(pfn)
+}
+
+fn list_of(pg: &Page) -> Lru {
+    if pg.is_active() {
+        Lru::ActiveAnon
+    } else {
+        Lru::InactiveAnon
     }
+}
 
-    /// Add a new page to the inactive list (at the back)
-    ///
-    /// Called when a page is first allocated for user space.
-    /// The page starts on inactive and can be promoted on second access.
-    pub fn add_new(&mut self, frame: u64) {
-        // Update page descriptor flags
-        if let Some(page) = phys_to_page(frame) {
-            page.set_flag(PG_LRU);
-            page.clear_flag(PG_ACTIVE);
-        }
-        self.inactive.push_back(frame);
-    }
-
-    /// Mark a page as accessed
-    ///
-    /// If on inactive list: promote to active list (second access)
-    /// If on active list: move to back (refresh position)
-    /// If not on any list: do nothing
-    pub fn mark_accessed(&mut self, frame: u64) {
-        // Check if on inactive list - if so, promote to active
-        if let Some(pos) = self.inactive.iter().position(|&f| f == frame) {
-            self.inactive.remove(pos);
-            self.active.push_back(frame);
-
-            // Update page descriptor
-            if let Some(page) = phys_to_page(frame) {
-                page.set_flag(PG_ACTIVE);
+impl Lruvec {
+    /// Link `pfn` at the head (or tail) of list `l` (Linux
+    /// lruvec_add_folio), lock held
+    fn add(&self, ls: &mut Lists, pfn: u64, l: Lru, tail: bool) {
+        let pg = page(pfn);
+        let i = l as usize;
+        if tail {
+            pg.next.store(0, Ordering::Relaxed);
+            pg.prev.store(ls.tail[i], Ordering::Relaxed);
+            match ls.tail[i] {
+                0 => ls.head[i] = pfn + 1,
+                t => page(t - 1).next.store(pfn + 1, Ordering::Relaxed),
             }
-            return;
+            ls.tail[i] = pfn + 1;
+        } else {
+            pg.prev.store(0, Ordering::Relaxed);
+            pg.next.store(ls.head[i], Ordering::Relaxed);
+            match ls.head[i] {
+                0 => ls.tail[i] = pfn + 1,
+                h => page(h - 1).prev.store(pfn + 1, Ordering::Relaxed),
+            }
+            ls.head[i] = pfn + 1;
         }
-
-        // Check if on active list - if so, refresh position
-        if let Some(pos) = self.active.iter().position(|&f| f == frame) {
-            self.active.remove(pos);
-            self.active.push_back(frame);
+        pg.set_flag(PG_LRU);
+        if l == Lru::ActiveAnon {
+            pg.set_flag(PG_ACTIVE);
+        } else {
+            pg.clear_flag(PG_ACTIVE);
         }
+        self.nr[i].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Remove a page from LRU lists
-    ///
-    /// Called when a page is freed or swapped out.
-    pub fn remove(&mut self, frame: u64) {
-        // Update page descriptor
-        if let Some(page) = phys_to_page(frame) {
-            page.clear_flag(PG_LRU | PG_ACTIVE);
+    /// Unlink `pfn` from its list (Linux lruvec_del_folio), lock held
+    fn del(&self, ls: &mut Lists, pfn: u64) {
+        let pg = page(pfn);
+        let i = list_of(pg) as usize;
+        let (next, prev) = (
+            pg.next.load(Ordering::Relaxed),
+            pg.prev.load(Ordering::Relaxed),
+        );
+        match prev {
+            0 => ls.head[i] = next,
+            p => page(p - 1).next.store(next, Ordering::Relaxed),
         }
-
-        // Remove from whichever list it's on
-        self.inactive.retain(|&f| f != frame);
-        self.active.retain(|&f| f != frame);
+        match next {
+            0 => ls.tail[i] = prev,
+            n => page(n - 1).prev.store(prev, Ordering::Relaxed),
+        }
+        pg.next.store(0, Ordering::Relaxed);
+        pg.prev.store(0, Ordering::Relaxed);
+        pg.clear_flag(PG_LRU | PG_ACTIVE);
+        self.nr[i].fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Get the next victim for eviction
-    ///
-    /// Returns the frame at the front of the inactive list.
-    /// If inactive is empty, demotes pages from active to inactive first.
-    /// Returns None if both lists are empty.
-    pub fn get_victim(&mut self) -> Option<u64> {
-        // If inactive is empty, try to demote from active
-        if self.inactive.is_empty() && !self.active.is_empty() {
-            self.demote_active();
-        }
-        self.inactive.front().copied()
+    /// Pages on list `l`
+    pub fn len(&self, l: Lru) -> usize {
+        self.nr[l as usize].load(Ordering::Relaxed)
     }
+}
 
-    /// Remove and return the front of inactive list
-    ///
-    /// Called after successfully swapping out a victim.
-    pub fn pop_victim(&mut self) -> Option<u64> {
-        let frame = self.inactive.pop_front()?;
+// ============================================================================
+// Per-CPU add batches (Linux folio_batch, cpu_fbatches)
+// ============================================================================
 
-        // Update page descriptor
-        if let Some(page) = phys_to_page(frame) {
-            page.clear_flag(PG_LRU | PG_ACTIVE);
-        }
+/// Pages a batch holds (Linux PAGEVEC_SIZE)
+const BATCH: usize = 15;
 
-        Some(frame)
-    }
+struct Batch {
+    n: usize,
+    pfn: [u64; BATCH],
+}
 
-    /// Demote pages from active to inactive list
-    ///
-    /// Moves pages from the front of active to the back of inactive.
-    /// This is called when we need more victims but inactive is empty.
-    fn demote_active(&mut self) {
-        // Demote up to 1/4 of active list or at least 1 page
-        let demote_count = (self.active.len() / 4).max(1);
+static BATCHES: [IrqSpinlock<Batch>; NR_CPUS] = [const {
+    IrqSpinlock::new(Batch {
+        n: 0,
+        pfn: [0; BATCH],
+    })
+}; NR_CPUS];
 
-        for _ in 0..demote_count {
-            if let Some(frame) = self.active.pop_front() {
-                // Update page descriptor
-                if let Some(page) = phys_to_page(frame) {
-                    page.clear_flag(PG_ACTIVE);
-                }
-                self.inactive.push_back(frame);
+/// Move pages to the head of the inactive list, then drop the batch's
+/// references (after the lock)
+fn add_all(pfns: &[u64]) {
+    {
+        let mut ls = LRUVEC.lock.lock();
+        for &pfn in pfns {
+            // Never freed meanwhile (the batch holds a reference); one
+            // already on a list (added twice) stays where it is
+            if !page(pfn).is_on_lru() {
+                LRUVEC.add(&mut ls, pfn, Lru::InactiveAnon, false);
             }
         }
     }
-
-    /// Get count of pages on active list
-    pub fn active_count(&self) -> usize {
-        self.active.len()
+    for &pfn in pfns {
+        FRAME_ALLOCATOR.decref(pfn << 12);
     }
+}
 
-    /// Get count of pages on inactive list
-    pub fn inactive_count(&self) -> usize {
-        self.inactive.len()
+/// A new anonymous page goes on the LRU (Linux folio_add_lru), through
+/// this CPU's batch; huge pages stay off (not reclaimed whole)
+pub fn lru_add(phys: u64) {
+    let Some(pg) = phys_to_page(phys) else {
+        return;
+    };
+    if pg.is_on_lru() || pg.flags.load(Ordering::Relaxed) & crate::mm::page::PG_HEAD != 0 {
+        return;
     }
-
-    /// Get total count of pages on LRU lists
-    pub fn total_count(&self) -> usize {
-        self.active.len() + self.inactive.len()
+    if !FRAME_ALLOCATOR.incref(phys) {
+        return;
     }
-
-    /// Check if a frame is on the LRU lists
-    pub fn contains(&self, frame: u64) -> bool {
-        self.inactive.contains(&frame) || self.active.contains(&frame)
+    let pfn = phys >> 12;
+    let Some(cpu) = crate::mm::page_alloc::this_cpu() else {
+        add_all(&[pfn]);
+        return;
+    };
+    let full = {
+        let mut b = BATCHES[cpu].lock();
+        let n = b.n;
+        b.pfn[n] = pfn;
+        b.n += 1;
+        (b.n == BATCH).then(|| take(&mut b))
+    };
+    if let Some((pfns, n)) = full {
+        add_all(&pfns[..n]);
     }
+}
 
-    /// Rebalance lists if active is too large
-    ///
-    /// Linux tries to keep active list around half the size of inactive.
-    /// This helps ensure we always have enough eviction candidates.
-    pub fn rebalance(&mut self) {
-        // If active is more than 2x inactive, demote some
-        if self.active.len() > self.inactive.len() * 2 && !self.active.is_empty() {
-            self.demote_active();
+fn take(b: &mut Batch) -> ([u64; BATCH], usize) {
+    let n = core::mem::take(&mut b.n);
+    (b.pfn, n)
+}
+
+/// Move CPU `cpu`'s batch to the lists (Linux lru_add_drain_cpu)
+fn drain_cpu(cpu: usize) {
+    let (pfns, n) = take(&mut BATCHES[cpu].lock());
+    add_all(&pfns[..n]);
+}
+
+/// Move every CPU's batch to the lists (Linux lru_add_drain_all, which
+/// asks each CPU; hk drains them from here under their locks): reclaim
+/// and MADV_PAGEOUT see every page
+pub fn lru_add_drain_all() {
+    for cpu in 0..NR_CPUS {
+        drain_cpu(cpu);
+    }
+}
+
+// ============================================================================
+// Isolation and putback (reclaim)
+// ============================================================================
+
+/// The page at `pfn` is being freed (its count reached 0): off its
+/// list (Linux __page_cache_release), before the allocator reuses its
+/// links
+pub fn page_freed(pfn: u64) {
+    if page(pfn).is_on_lru() {
+        let mut ls = LRUVEC.lock.lock();
+        // Isolation clears PG_LRU under the lock: test it again
+        if page(pfn).is_on_lru() {
+            LRUVEC.del(&mut ls, pfn);
         }
     }
 }
 
-// ============================================================================
-// Global LRU
-// ============================================================================
-
-/// Global LRU lists for anonymous page reclaim
-///
-/// Protected by a mutex. Lock ordering: LRU lock should be acquired
-/// before page descriptor locks and frame allocator lock.
-pub static LRU: Mutex<LruLists> = Mutex::new(LruLists::new());
-
-// ============================================================================
-// Convenience functions
-// ============================================================================
-
-/// Add a new page to LRU (convenience wrapper)
-#[inline]
-pub fn lru_add_new(_frame: u64) {
-    // Not yet: these lists find a page by linear search, so taking each
-    // freed page off them would be quadratic in resident memory. Pages
-    // join the LRU once the lists are intrusive (struct page links).
+/// Take the page at `phys` off the LRU for reclaim, with a reference
+/// (Linux folio_isolate_lru); false if not on a list (or being freed)
+pub fn isolate(phys: u64) -> bool {
+    let pfn = phys >> 12;
+    if !phys_to_page(phys).is_some_and(|p| p.is_on_lru()) {
+        return false;
+    }
+    let mut ls = LRUVEC.lock.lock();
+    if !page(pfn).is_on_lru() || !FRAME_ALLOCATOR.incref(phys) {
+        return false;
+    }
+    LRUVEC.del(&mut ls, pfn);
+    true
 }
 
-/// Mark page as accessed (convenience wrapper)
-#[inline]
-pub fn lru_mark_accessed(frame: u64) {
-    LRU.lock().mark_accessed(frame);
-}
-
-/// Remove page from LRU (convenience wrapper)
-#[inline]
-pub fn lru_remove(frame: u64) {
-    if phys_to_page(frame).is_some_and(|p| p.flags.load(Ordering::Relaxed) & PG_LRU != 0) {
-        LRU.lock().remove(frame);
+/// Up to `nr` pages from the tail of list `l`, each with a reference
+/// (Linux isolate_lru_folios): pages being freed are skipped
+pub fn isolate_tail(l: Lru, nr: usize, out: &mut alloc::vec::Vec<u64>) {
+    let mut ls = LRUVEC.lock.lock();
+    let mut cur = ls.tail[l as usize];
+    let mut scanned = 0;
+    while cur != 0 && out.len() < nr && scanned < 4 * nr {
+        let pfn = cur - 1;
+        cur = page(pfn).prev.load(Ordering::Relaxed);
+        scanned += 1;
+        if FRAME_ALLOCATOR.incref(pfn << 12) {
+            LRUVEC.del(&mut ls, pfn);
+            out.push(pfn << 12);
+        }
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lru_add_and_get_victim() {
-        let mut lru = LruLists::new();
-
-        // Add some pages
-        lru.inactive.push_back(0x1000);
-        lru.inactive.push_back(0x2000);
-        lru.inactive.push_back(0x3000);
-
-        // First victim should be first added
-        assert_eq!(lru.get_victim(), Some(0x1000));
-
-        // Pop it
-        assert_eq!(lru.pop_victim(), Some(0x1000));
-
-        // Next victim
-        assert_eq!(lru.get_victim(), Some(0x2000));
+/// Return an isolated page to list `l` (head; the tail with `tail`) and
+/// drop the isolation reference (Linux folio_putback_lru)
+pub fn putback(phys: u64, l: Lru, tail: bool) {
+    {
+        let mut ls = LRUVEC.lock.lock();
+        LRUVEC.add(&mut ls, phys >> 12, l, tail);
     }
+    FRAME_ALLOCATOR.decref(phys);
+}
 
-    #[test]
-    fn test_lru_promote_on_access() {
-        let mut lru = LruLists::new();
-
-        // Add page to inactive
-        lru.inactive.push_back(0x1000);
-        assert_eq!(lru.inactive.len(), 1);
-        assert_eq!(lru.active.len(), 0);
-
-        // Mark accessed - should promote
-        lru.mark_accessed(0x1000);
-        assert_eq!(lru.inactive.len(), 0);
-        assert_eq!(lru.active.len(), 1);
-    }
-
-    #[test]
-    fn test_lru_demote_when_inactive_empty() {
-        let mut lru = LruLists::new();
-
-        // Add pages directly to active
-        lru.active.push_back(0x1000);
-        lru.active.push_back(0x2000);
-        lru.active.push_back(0x3000);
-        lru.active.push_back(0x4000);
-
-        assert!(lru.inactive.is_empty());
-
-        // Get victim should demote from active
-        let victim = lru.get_victim();
-        assert!(victim.is_some());
-        assert!(!lru.inactive.is_empty());
-    }
-
-    #[test]
-    fn test_lru_remove() {
-        let mut lru = LruLists::new();
-
-        lru.inactive.push_back(0x1000);
-        lru.active.push_back(0x2000);
-
-        lru.remove(0x1000);
-        assert!(!lru.inactive.contains(&0x1000));
-
-        lru.remove(0x2000);
-        assert!(!lru.active.contains(&0x2000));
-    }
-
-    #[test]
-    fn test_lru_counts() {
-        let mut lru = LruLists::new();
-
-        lru.inactive.push_back(0x1000);
-        lru.inactive.push_back(0x2000);
-        lru.active.push_back(0x3000);
-
-        assert_eq!(lru.inactive_count(), 2);
-        assert_eq!(lru.active_count(), 1);
-        assert_eq!(lru.total_count(), 3);
+/// Move an LRU page to the tail of the inactive list, next for reclaim
+/// (Linux folio_deactivate, MADV_COLD)
+pub fn deactivate(phys: u64) {
+    if isolate(phys) {
+        putback(phys, Lru::InactiveAnon, true);
     }
 }

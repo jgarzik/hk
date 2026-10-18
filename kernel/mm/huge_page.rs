@@ -154,7 +154,36 @@ pub fn split_huge_pmd(mm: &super::Mm, va: u64) -> Option<u64> {
     let base = paging::split_table(pt, old);
     paging::pmd_populate(pmdp, pt);
     crate::FRAME_ALLOCATOR.split_huge(base);
+    split_rmap(base);
     Some(base)
+}
+
+/// The 512 pages of a split anonymous 2MB page each take the head's
+/// mapping (an AnonVma reference each), their own index and one
+/// mapping, and join the LRU (Linux __split_huge_page_tail,
+/// lru_add_split_folio)
+fn split_rmap(base: u64) {
+    use crate::mm::page::phys_to_page;
+    use core::sync::atomic::Ordering;
+    let Some(head) = phys_to_page(base) else {
+        return;
+    };
+    let Some(av) = head.get_anon_vma() else {
+        return;
+    };
+    let index = head.index.load(Ordering::Relaxed);
+    let maps = head.mapcount();
+    for i in 0..PAGES_PER_HUGE_PAGE as u64 {
+        let phys = base + i * PAGE_SIZE;
+        if let Some(pg) = phys_to_page(phys)
+            && i > 0
+        {
+            pg.set_anon_mapping(&av);
+            pg.index.store(index + i, Ordering::Relaxed);
+            pg.mapcount.store(maps, Ordering::Relaxed);
+        }
+        crate::mm::lru::lru_add(phys);
+    }
 }
 
 /// Clear the 2MB page entry for `base` in `mm` (Linux zap_huge_pmd), mm

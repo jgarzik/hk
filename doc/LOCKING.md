@@ -274,7 +274,9 @@ Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
     → AnonVma.chain (sleeping RwSem, Linux anon_vma->rwsem)
     → page_table_lock → PTE lock (spin)
     → SwapInfo.map (spin, Linux si->lock) | swap cache (IrqSpinlock,
-      Linux i_pages; never nested with SwapInfo.map)
+      Linux i_pages; never nested with SwapInfo.map) | LRU add batch
+      (IrqSpinlock, per CPU) | Lruvec.lock (IrqSpinlock, Linux lru_lock;
+      never nested with the others)
     ← never nested with TASK_TABLE (3.2)
     ↓
 Memory allocator locks (Linux: ... → slab → pcp → zone->lock):
@@ -985,6 +987,26 @@ pub struct Zone {
   space (collected under `TASK_TABLE`, which is dropped before any mm
   lock) with its mmap_lock held for reading, faulting the device's swap
   PTEs in.
+
+#### LRU (kernel/mm/lru.rs; Linux mm/swap.c lruvec)
+
+- `Lruvec.lock` (`IrqSpinlock`, Linux lruvec->lru_lock): the LRU lists,
+  linked through struct page (`next`/`prev`, owned by the list while
+  PG_LRU is set). IRQ-safe because a page leaves its list when it is
+  freed (`lru::page_freed`, from the allocator's release with no
+  allocator lock held), and pages are freed in any context. A leaf:
+  nothing is taken under it but page reference atomics; no reference is
+  dropped under it (a drop may free the page and take it again).
+- Per-CPU add batches (`IrqSpinlock`, one per CPU; Linux cpu_fbatches):
+  a batch holds a reference on each page; a full batch is taken out
+  under its lock, then added under `Lruvec.lock` (never both held), then
+  its references dropped. `lru_add_drain_all` drains every CPU's batch
+  from the caller under each batch's lock (Linux asks each CPU through
+  a work item).
+- Isolation (reclaim) takes a page off a list under `Lruvec.lock` only
+  if it can take a reference (get_page_unless_zero): a page whose count
+  reached 0 is left for `page_freed`, which takes the lock and unlinks
+  it. Reclaim never takes an mmap_lock while holding it.
 
 #### TLB Flushing (kernel/mm/tlb.rs; arch/{x86_64,aarch64}/tlb.rs)
 

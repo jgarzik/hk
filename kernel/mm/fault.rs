@@ -166,7 +166,7 @@ fn add_anon(phys: u64, area: &Area, addr: u64) {
     if let Some(av) = &area.anon_vma {
         super::rmap::page_add_anon_rmap(phys, av, area.index(addr));
     }
-    super::lru::lru_add_new(phys);
+    super::lru::lru_add(phys);
 }
 
 /// Resolve a fault at `addr` of the address space `mm` (the current

@@ -60,12 +60,10 @@ SO_PEEK_OFF is EOPNOTSUPP.
 Address spaces are reference counted and torn down like Linux
 (doc/MEMORY.md, Address space lifetime); what is still missing:
 
-- Every frame has a struct page (vmemmap) and anonymous pages join the
-  rmap (each holds an AnonVma reference), but the LRU lists stay empty
-  (`lru_add_new` is a no-op: removal is a linear search) and nothing
-  calls swap-out, so reclaim is inert. Swap slots are counted and the
-  swap cache works (swap-in, fork, munmap, swapoff), unused until
-  swap-out exists.
+- Anonymous pages join the rmap and the LRU, swap slots are counted
+  and the swap cache works (swap-in, fork, munmap, swapoff), but
+  nothing writes pages out yet, so reclaim is inert. 2MB pages stay off
+  the LRU (never reclaimed whole; a split puts their 4KB pages on it).
 - SysV shm: IPC_RMID removes the id at once (Linux keeps it, as
   IPC_PRIVATE with SHM_DEST, until the last detach: IPC_STAT and shmat
   by id still work there).

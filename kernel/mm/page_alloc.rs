@@ -578,8 +578,13 @@ impl Zone {
     /// Reset an unreferenced block's struct pages and put it on a free
     /// list
     fn release(&self, pfn: u64, order: u32) {
-        // No allocator lock is held yet: a released mapping may free an
-        // AnonVma (slab)
+        // No allocator lock is held yet: a page leaves the LRU (Linux
+        // __page_cache_release), a released mapping may free an AnonVma
+        // (slab)
+        #[cfg(not(test))]
+        if order == 0 && self.sections.load(Ordering::Relaxed) {
+            crate::mm::lru::page_freed(pfn);
+        }
         for i in 0..1u64 << order {
             let pg = self.page(pfn + i);
             pg.refcount.store(0, Ordering::Relaxed);

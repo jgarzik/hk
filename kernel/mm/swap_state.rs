@@ -210,7 +210,7 @@ fn read_new(e: SwapEntry) -> Result<u64, VmFault> {
         FRAME_ALLOCATOR.decref(phys);
         return Err(VmFault::Bus);
     }
-    super::lru::lru_add_new(phys);
+    super::lru::lru_add(phys);
     Ok(phys)
 }
 
