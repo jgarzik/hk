@@ -485,3 +485,38 @@ From the P1 /code-review (unverified unless noted). Tag = phase that fixes it.
 9. **Write path copies** (P5). `kernel/storage/blkdev.rs:749`:
    writes take `&mut [u8]` (to_vec + bounce copy per page); unaligned
    bdev_rw_bytes allocates a request-sized temp buffer.
+
+## P2 review findings (open)
+From the P2 /code-review (unverified). Tag = when to fix.
+1. **>256 memory sections panics boot** (next batch; >= ~32GB RAM).
+   `kernel/mm/page.rs:361` ram_sections fills a fixed 256-entry array
+   of 128MB sections and asserts.
+2. **x86 direct map keeps only 31 regions** (next batch; real UEFI HW).
+   `kernel/arch/x86_64/mod.rs:411`: memblock takes every available
+   region but kmap::ram_ranges caps at 31, so RAM in a dropped region
+   below direct_end is handed out unmapped and faults on first use.
+3. **No pcp drain on allocation failure** (next batch).
+   `kernel/mm/page_alloc.rs:443`: pages on other CPUs' pcp lists are
+   invisible to watermarks and merging; Linux drain_all_pages in the
+   slow path. Kernel-heap allocations then panic with memory free.
+4. **Page refcount get() can resurrect a freed page** (next batch).
+   `kernel/mm/page_alloc.rs:547`: the CAS retry rechecks only
+   u32::MAX, not 0, so get racing the final put takes 0→1 on a page
+   already on a pcp list (use-after-free). Use get_unless_zero.
+5. **pcp_free drains the hot end** (next batch).
+   `kernel/mm/page_alloc.rs:425`: freed page pushed at head, drain
+   pops from head; Linux returns the cold tail.
+6. **free_pages_all aliases &mut Pcp** (next batch; Rust UB).
+   `kernel/mm/page_alloc.rs:720`: reads Pcp.count through the
+   UnsafeCell while its CPU may hold &mut; move count out of the cell.
+7. **arm64 /reserved-memory no-map regions are linear-mapped**
+   (next batch; real HW). `kernel/arch/aarch64/dtb.rs:175`: Linux
+   memblock_mark_nomap removes them (speculative access to secure
+   carve-outs).
+8. **Allocator fast-path costs** (P7, with SMP tuning):
+   `kernel/heap.rs:262` every free takes the global arena IrqSpinlock
+   and an AcqRel swap (compare against the static arena bounds
+   instead); `kernel/mm/page_alloc.rs:154` this_cpu() does RDMSR
+   GS_BASE per call (use a gs-relative load); `kernel/mm/page.rs:389`
+   vmemmap uses 4KB PTEs and one memblock alloc per page (Linux: 2MB
+   PMD per section).
