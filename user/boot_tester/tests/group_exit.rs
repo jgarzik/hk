@@ -107,12 +107,14 @@ fn send_tids(p: &Pipes, tids: [i64; 2]) {
 }
 
 /// In the parent: the child's thread ids, the child's ends closed
+/// (Our write ends go first: a child whose exec ends the thread that
+/// would send the tids leaves only EOF to read.)
 fn parent_side(p: &Pipes) -> [i64; 2] {
     let mut tids = [0i64; 2];
-    sys_read(p.tids[0] as u64, tids.as_mut_ptr() as *mut u8, 16);
     sys_close(p.hold[1] as u64);
-    sys_close(p.tids[0] as u64);
     sys_close(p.tids[1] as u64);
+    sys_read(p.tids[0] as u64, tids.as_mut_ptr() as *mut u8, 16);
+    sys_close(p.tids[0] as u64);
     tids
 }
 
