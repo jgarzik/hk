@@ -78,7 +78,7 @@ pub(super) fn zap_leaf(leaf: Leaf) {
 /// flushed (paging-structure caches included) before anything is
 /// freed (Linux tlb_gather_mmu_fullmm).
 pub(super) fn exit_mmap(mm: &Mm) {
-    let vmas: Vec<_> = mm.lock().take_vmas();
+    let vmas: Vec<_> = mm.mmap_write().take_vmas();
     for vma in &vmas {
         if let Some(av) = &vma.anon_vma {
             av.remove_root(mm.pgd());

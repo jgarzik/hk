@@ -80,9 +80,9 @@ pub fn sys_process_vm_readv(
         }
     }
 
-    // The target mm (hk's mmap_lock, a spin lock) is locked per remote
-    // access only, never across the local user copy (which can fault
-    // and sleep, and takes our own mm lock if it does)
+    // The target mmap_lock is held per remote access only, never across
+    // the local user copy (which can fault and sleep, and takes our own
+    // mmap_lock if it does)
 
     // Transfer data: remote -> local
     let mut total_bytes = 0i64;
@@ -112,7 +112,7 @@ pub fn sys_process_vm_readv(
             // Read from remote into kernel buffer
             let mut buf = alloc::vec![0u8; to_transfer];
             let bytes_read = match access_remote_vm_read(
-                &target_mm.lock(),
+                &target_mm.mmap_read(),
                 page_table_root,
                 remote_addr,
                 &mut buf,
@@ -220,9 +220,9 @@ pub fn sys_process_vm_writev(
         }
     }
 
-    // The target mm (hk's mmap_lock, a spin lock) is locked per remote
-    // access only, never across the local user copy (which can fault
-    // and sleep, and takes our own mm lock if it does)
+    // The target mmap_lock is held per remote access only, never across
+    // the local user copy (which can fault and sleep, and takes our own
+    // mmap_lock if it does)
 
     // Transfer data: local -> remote
     let mut total_bytes = 0i64;
@@ -261,16 +261,20 @@ pub fn sys_process_vm_writev(
             }
 
             // Write to remote
-            let bytes_written =
-                match access_remote_vm_write(&target_mm, &target_mm.lock(), remote_addr, &buf) {
-                    Ok(n) => n,
-                    Err(_) => {
-                        if total_bytes > 0 {
-                            return total_bytes;
-                        }
-                        return KernelError::BadAddress.sysret();
+            let bytes_written = match access_remote_vm_write(
+                &target_mm,
+                &target_mm.mmap_write(),
+                remote_addr,
+                &buf,
+            ) {
+                Ok(n) => n,
+                Err(_) => {
+                    if total_bytes > 0 {
+                        return total_bytes;
                     }
-                };
+                    return KernelError::BadAddress.sysret();
+                }
+            };
 
             if bytes_written == 0 {
                 if total_bytes > 0 {

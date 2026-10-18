@@ -9,7 +9,8 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::sync::spin::Mutex;
+use crate::error::KernelError;
+use crate::sync::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 
 use crate::task::Tid;
 
@@ -645,8 +646,9 @@ pub struct Mm {
     users: AtomicUsize,
     /// Physical address of the top-level table (owned; never changes)
     pgd: u64,
-    /// The VMA tree and accounting; this spin lock is hk's mmap_lock
-    map: Mutex<MmStruct>,
+    /// The VMA tree and accounting under the mmap_lock (Linux
+    /// mm->mmap_lock, a sleeping rw_semaphore)
+    map: RwSem<MmStruct>,
     /// TLB state: where it is loaded, flush generation, ASID
     ctx: tlb::MmContext,
 }
@@ -657,14 +659,31 @@ impl Mm {
         self.pgd
     }
 
-    /// Lock the VMA tree (mmap_lock). Linux's mmap_lock sleeps, so its
-    /// waiters never block IPIs; this one is spun on, maybe with
-    /// interrupts off (a syscall), while its holder may be flushing this
-    /// CPU's TLB: the wait answers this CPU's cross-CPU calls
-    /// (doc/LOCKING.md, Cross-CPU Calls)
+    /// The mmap_lock for reading (Linux mmap_read_lock): faults,
+    /// mincore, /proc maps, MADV_DONTNEED and other VMA lookups
     #[track_caller]
-    pub fn lock(&self) -> crate::sync::spin::MutexGuard<'_, MmStruct> {
-        crate::sync::spin::lock_with(&self.map, crate::smp::poll_queue)
+    pub fn mmap_read(&self) -> RwSemReadGuard<'_, MmStruct> {
+        self.map.read()
+    }
+
+    /// The mmap_lock for writing (Linux mmap_write_lock): VMA changes
+    #[track_caller]
+    pub fn mmap_write(&self) -> RwSemWriteGuard<'_, MmStruct> {
+        self.map.write()
+    }
+
+    /// `mmap_read`, or EINTR once SIGKILL is pending (Linux
+    /// mmap_read_lock_killable)
+    #[track_caller]
+    pub fn mmap_read_killable(&self) -> Result<RwSemReadGuard<'_, MmStruct>, KernelError> {
+        self.map.read_killable()
+    }
+
+    /// `mmap_write`, or EINTR once SIGKILL is pending (Linux
+    /// mmap_write_lock_killable)
+    #[track_caller]
+    pub fn mmap_write_killable(&self) -> Result<RwSemWriteGuard<'_, MmStruct>, KernelError> {
+        self.map.write_killable()
     }
 
     /// TLB state (Linux mm->context)
@@ -695,7 +714,7 @@ impl MmRef {
         MmRef(Arc::new(Mm {
             users: AtomicUsize::new(1),
             pgd,
-            map: Mutex::new(map),
+            map: RwSem::new(map),
             ctx: tlb::MmContext::new(),
         }))
     }
@@ -706,7 +725,7 @@ impl MmRef {
         MmRef(Arc::new_cyclic(|me| Mm {
             users: AtomicUsize::new(1),
             pgd,
-            map: Mutex::new(build(me)),
+            map: RwSem::new(build(me)),
             ctx: tlb::MmContext::new(),
         }))
     }
@@ -807,7 +826,11 @@ pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
 /// inherited (VM_LOCKED cleared, locked_vm and MCL_FUTURE reset). On
 /// error the partial copy is torn down with the child mm.
 pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
-    let guard = parent.lock();
+    let Ok(guard) = parent.mmap_write_killable() else {
+        // The child mm was never built: its table is ours to free
+        crate::FRAME_ALLOCATOR.free(pgd);
+        return Err(KernelError::Interrupted.errno());
+    };
     let mut res = Ok(());
     let child = MmRef::new_cyclic(pgd, |me| {
         let mut map = MmStruct::new(guard.mmap_base);

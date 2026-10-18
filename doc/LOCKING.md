@@ -268,7 +268,8 @@ Global subsystem locks (TASK_TABLE, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-s
     locks them after dropping it); no user memory is accessed under any
     of them
     ↓
-Address space: Mm lock (mmap_lock) → AnonVma, LRU  ← never nested with TASK_TABLE (3.2)
+Address space: mmap_lock (sleeping RwSem; under i_rwsem: a write's user
+    copy may fault) → AnonVma, LRU  ← never nested with TASK_TABLE (3.2)
     ↓
 Memory allocator locks (Linux: ... → slab → pcp → zone->lock):
     slab per-CPU array (IRQs off) → KmemCache.list_lock (IrqSpinlock)
@@ -796,8 +797,16 @@ pub struct Zone {
   CLEARTID writes that still need the mappings, Linux mm_release before
   exit_mm). A task becomes a zombie only after that, so a reaping parent
   never drops a task that still uses its mm.
-- The mm lock (`Mm::lock`, a `spin::Mutex`) is hk's mmap_lock: it guards
-  the VMA tree and VM counters. `dup_mm` holds the parent's mm lock while
+- The mmap_lock (`Mm.map`, a sleeping `RwSem<MmStruct>`, Linux
+  mm->mmap_lock; "the mm lock" below) guards the VMA tree and VM
+  counters. Taken through `Mm::mmap_read` / `mmap_write` and their
+  `_killable` forms (the syscalls that change mappings and the /proc
+  readers give up with EINTR on SIGKILL, as in Linux). Thread context
+  only, never under a spinlock (sleeping locks order above all of
+  them). Readers: /proc (maps, cmdline, environ, status figures),
+  mincore, msync, populate, remote reads (ptrace PEEK,
+  process_vm_readv), `segv_code`; every other user, the fault path
+  included, takes it for writing. `dup_mm` holds the parent's mm lock while
   it copies VMAs and page tables (`memory::copy_page_range`: it
   write-protects the parent's private PTEs with a compare-and-swap, since
   the parent's other threads may be faulting, splits 2MB pages and takes
@@ -941,12 +950,11 @@ No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
   held.
 - Who may flush: thread context, never under an IrqSpinlock or a lock
   another CPU spins on with interrupts off (Cross-CPU Calls). User
-  flushes run under the mm lock, so the mm lock's waiters poll their
-  call queue (`Mm::lock` spins with `sync::spin::lock_with`, answering
-  calls: Linux's mmap_lock sleeps instead) and nothing above the mm lock
-  in section 2 is held across a flush (callers hold at most the mm lock
-  and the VFS / IPC locks taken before it, none of which is spun on with
-  interrupts off). arm64 flushes never wait on another CPU's software.
+  flushes run under the mm lock, whose waiters sleep (as in Linux), and
+  nothing above the mm lock in section 2 is held across a flush
+  (callers hold at most the mm lock and the VFS / IPC locks taken
+  before it, none of which is spun on with interrupts off). arm64
+  flushes never wait on another CPU's software.
 
 #### Cross-CPU Calls (kernel/smp.rs; arch/{x86_64,aarch64}/ipi.rs)
 
@@ -2772,7 +2780,7 @@ Features present in Linux but not yet implemented in hk:
 | RCU | Read-Copy-Update | Not implemented | Use RwLock instead |
 | Per-CPU variables | `DEFINE_PER_CPU` | Manual per-CPU arrays | Less convenient API |
 | Lazy TLB, PCID, global pages | kernel threads keep the last user mm; PCID tags; PGE | Kernel threads load the kernel table; every CR3 write flushes all | More flushes on context switch (x86) |
-| mmap_lock across faults | `mmap_read_lock` + PTE lock in the fault path | The mm lock (a spinlock: exclusive, not shared) is held across the fault, except while reading a file page or swap slot (the VMA is revalidated after) | Faults in one address space are serialized; a swap-in can race munmap of its range (swap is inert) |
+| mmap_lock across faults | `mmap_read_lock` + PTE lock in the fault path | The mmap_lock is taken for writing across the fault, except while reading a file page or swap slot (the VMA is revalidated after) | Faults in one address space are serialized; a swap-in can race munmap of its range (swap is inert) |
 
 ### Implications
 

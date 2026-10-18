@@ -235,7 +235,7 @@ fn vm_stat(mm: &Mm, m: &MmStruct) -> VmStat {
 /// The figures of task `tid`'s address space, if it has a live one
 fn task_vm(tid: Tid) -> Option<VmStat> {
     let mm = crate::mm::get_task_mm_users(tid)?;
-    let m = mm.lock();
+    let m = mm.mmap_read_killable().ok()?;
     Some(vm_stat(&mm, &m))
 }
 
@@ -481,7 +481,9 @@ pub fn gen_cmdline(pid: Pid) -> Vec<u8> {
     let Some(mm) = crate::mm::get_task_mm_users(tid) else {
         return Vec::new();
     };
-    let m = mm.lock();
+    let Ok(m) = mm.mmap_read_killable() else {
+        return Vec::new();
+    };
     let a = m.args();
     if a.arg_start >= a.arg_end {
         return Vec::new();

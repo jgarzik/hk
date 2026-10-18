@@ -338,7 +338,9 @@ fn do_shmat(shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i32> {
     }
     let mm = get_task_mm(tid).ok_or(KernelError::OutOfMemory.errno())?;
     let mut replaced = Vec::new();
-    let mut mm_guard = mm.lock();
+    let mut mm_guard = mm
+        .mmap_write_killable()
+        .map_err(|_| KernelError::Interrupted.errno())?;
     // RLIMIT_AS, as for any mapping (Linux may_expand_vm)
     let limit = crate::rlimit::rlimit(crate::rlimit::RLIMIT_AS);
     if limit != crate::rlimit::RLIM_INFINITY
@@ -407,7 +409,9 @@ fn do_shmdt(shmaddr: u64) -> Result<i32, i32> {
     let einval = KernelError::InvalidArgument.errno();
     let mm = get_task_mm(current_tid()).ok_or(einval)?;
     let gone = {
-        let mut map = mm.lock();
+        let mut map = mm
+            .mmap_write_killable()
+            .map_err(|_| KernelError::Interrupted.errno())?;
         let first = map.find_vma(shmaddr).ok_or(einval)?;
         let att = first
             .shm

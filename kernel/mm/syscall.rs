@@ -141,7 +141,10 @@ pub fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: 
     // Mappings replaced by MAP_FIXED: declared first so that they are
     // dropped after the lock on every return
     let mut replaced = Vec::new();
-    let mut mm_guard = mm.lock();
+    let mut mm_guard = match mm.mmap_write_killable() {
+        Ok(m) => m,
+        Err(e) => return e.sysret(),
+    };
 
     // Determine mapping address
     let map_addr = if is_fixed || is_fixed_noreplace {
@@ -328,7 +331,10 @@ pub fn sys_munmap(addr: u64, length: u64) -> i64 {
         None => return 0, // No mm, nothing to unmap
     };
 
-    let mut mm_guard = mm.lock();
+    let mut mm_guard = match mm.mmap_write_killable() {
+        Ok(m) => m,
+        Err(e) => return e.sysret(),
+    };
     let removed = munmap_locked(&mut mm_guard, &mm, addr, end);
     drop(mm_guard);
     // The VMAs may hold the last reference to a mapped file
@@ -391,7 +397,9 @@ pub fn sys_brk(brk: u64) -> i64 {
     let Some(mm) = get_task_mm(current_tid()) else {
         return 0;
     };
-    let mut map = mm.lock();
+    let Ok(mut map) = mm.mmap_write_killable() else {
+        return KernelError::Interrupted.sysret();
+    };
     let cur = map.get_brk();
     if brk < map.get_start_brk() || !data_ok(&map, brk) {
         return cur as i64;
@@ -520,7 +528,7 @@ fn populate_range(start: u64, len: u64) -> bool {
     let end = start.saturating_add(len).min(TASK_SIZE);
     let mut addr = start & !(PAGE_SIZE - 1);
     while addr < end {
-        let Some((vs, ve, access)) = populate_vma(&mm.lock(), addr, end) else {
+        let Some((vs, ve, access)) = populate_vma(&mm.mmap_read(), addr, end) else {
             break;
         };
         let from = addr.max(vs);
@@ -621,7 +629,10 @@ fn do_mlock(start: u64, len: u64, vm_flags: u32) -> i64 {
     let Some(mm) = get_task_mm(current_tid()) else {
         return KernelError::OutOfMemory.sysret();
     };
-    let mut map = mm.lock();
+    let mut map = match mm.mmap_write_killable() {
+        Ok(m) => m,
+        Err(e) => return e.sysret(),
+    };
     let r = if memlock_room(&map, start, len) {
         mlock_vmas(&mut map, start, len, vm_flags)
     } else {
@@ -733,7 +744,11 @@ pub fn sys_munlock(addr: u64, len: u64) -> i64 {
     let Some(mm) = get_task_mm(current_tid()) else {
         return 0;
     };
-    let r = mlock_vmas(&mut mm.lock(), start, len, 0);
+    let mut map = match mm.mmap_write_killable() {
+        Ok(m) => m,
+        Err(e) => return e.sysret(),
+    };
+    let r = mlock_vmas(&mut map, start, len, 0);
     match r {
         Ok(()) => 0,
         Err(e) => e.sysret(),
@@ -773,7 +788,10 @@ pub fn sys_mlockall(flags: i32) -> i64 {
         None => return KernelError::OutOfMemory.sysret(),
     };
 
-    let mut mm_guard = mm.lock();
+    let mut mm_guard = match mm.mmap_write_killable() {
+        Ok(m) => m,
+        Err(e) => return e.sysret(),
+    };
 
     // Clear old def_flags
     mm_guard.set_def_flags(0);
@@ -863,7 +881,10 @@ pub fn sys_munlockall() -> i64 {
         None => return 0, // No mm, nothing to unlock
     };
 
-    let mut mm_guard = mm.lock();
+    let mut mm_guard = match mm.mmap_write_killable() {
+        Ok(m) => m,
+        Err(e) => return e.sysret(),
+    };
 
     // Clear def_flags (undo MCL_FUTURE)
     mm_guard.set_def_flags(0);
@@ -916,7 +937,10 @@ pub fn sys_mprotect(addr: u64, len: u64, prot: u32) -> i64 {
     let Some(mm) = get_task_mm(current_tid()) else {
         return KernelError::InvalidArgument.sysret();
     };
-    let mut map = mm.lock();
+    let mut map = match mm.mmap_write_killable() {
+        Ok(m) => m,
+        Err(e) => return e.sysret(),
+    };
     let start = match mprotect_start(&map, addr, end, grows) {
         Ok(s) => s,
         Err(e) => return e.sysret(),
@@ -1110,7 +1134,7 @@ fn msync_vmas(mm: &super::Mm, mut start: u64, end: u64, flags: i32) -> Result<()
     let mut unmapped = false;
     while start < end {
         let file = {
-            let map = mm.lock();
+            let map = mm.mmap_read();
             let vma = map
                 .next_vma(start)
                 .and_then(|i| map.get_vma(i))
@@ -1237,7 +1261,10 @@ pub fn sys_mremap(old_addr: u64, old_len: u64, new_len: u64, flags: u32, new_add
 
     // VMAs unmapped or moved away: dropped after the lock on every return
     let mut gone: Vec<Vma> = Vec::new();
-    let mut mm_guard = mm.lock();
+    let mut mm_guard = match mm.mmap_write_killable() {
+        Ok(m) => m,
+        Err(e) => return e.sysret(),
+    };
 
     // The VMA containing old_addr must cover the old range (it may
     // start before old_addr: only the moves split it, Linux
@@ -1485,7 +1512,7 @@ fn mincore_chunk(
     pages: u64,
     buf: &mut [u8],
 ) -> Result<usize, KernelError> {
-    let map = mm.lock();
+    let map = mm.mmap_read_killable()?;
     let vma = map.find_vma(addr).ok_or(KernelError::OutOfMemory)?;
     let end = vma.end.min(addr + pages * PAGE_SIZE);
     let n = ((end - addr) / PAGE_SIZE) as usize;

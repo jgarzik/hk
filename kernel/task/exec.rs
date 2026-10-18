@@ -738,7 +738,7 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
 
     // The new image's VMAs
     {
-        let mut m = mm.lock();
+        let mut m = mm.mmap_write();
         m.set_brk(start_brk);
         m.set_exe(file.dentry.full_path());
         let code = image_layout(&elf, base_addr);

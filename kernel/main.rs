@@ -969,7 +969,7 @@ fn kmain() -> ! {
     // Initialize brk for the init task (tid=2)
     // This must be done after create_user_task which creates a default mm
     if let Some(mm) = mm::get_task_mm(2) {
-        let mut m = mm.lock();
+        let mut m = mm.mmap_write();
         m.set_brk(start_brk);
         m.set_exe(alloc::string::String::from("/bin/init"));
         m.set_args(task::exec::image_layout(&elf, base_addr));

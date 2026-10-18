@@ -177,7 +177,7 @@ pub fn handle_mm_fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault
 }
 
 fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
-    let mut map = mm.lock();
+    let mut map = mm.mmap_write();
     let area = find_area(&mut map, addr, access)?;
     let pgd = mm.pgd();
     if let Some(r) = huge_fault(mm, addr, &area, access) {
@@ -210,7 +210,7 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
         // Read (or looked up in the swap cache) unlocked
         drop(map);
         let (page, cached) = swap_page(SwapEntry::from_pte(pte), &area)?;
-        let map = mm.lock();
+        let map = mm.mmap_write();
         let ptep = match same_area(&map, addr, &area).then(|| leaf(pgd, addr)) {
             Some(Ok(p)) => p,
             r => {
@@ -228,7 +228,7 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
     // A file page: read (or looked up in the page cache) unlocked
     drop(map);
     let page = fault_page(addr, &area)?;
-    let map = mm.lock();
+    let map = mm.mmap_write();
     if !same_area(&map, addr, &area) {
         // Unmapped or changed meanwhile: the access is retried
         super::memory::put_page(page);
@@ -518,7 +518,7 @@ pub fn pagefault_out_of_memory() -> ! {
         (pid, name, threads)
     };
     let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-    let exe = super::get_task_mm(tid).and_then(|mm| mm.lock().exe());
+    let exe = super::get_task_mm(tid).and_then(|mm| mm.mmap_read().exe());
     let comm = match core::str::from_utf8(&name[..len]) {
         Ok(n) if !n.is_empty() => n,
         _ => exe

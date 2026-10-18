@@ -959,7 +959,8 @@ fn pid_content(file: Option<&File>, pid: Pid, g: PidGen) -> Result<Vec<u8>, Kern
             let Some(m) = users else {
                 return Ok(Vec::new());
             };
-            let out = f(&m, &m.lock());
+            let g = m.mmap_read_killable()?;
+            let out = f(&m, &g);
             Ok(out)
         }
     }
@@ -1033,7 +1034,10 @@ fn exe_link(pid: Pid) -> Result<String, KernelError> {
     // re-execs itself) holds only cred_guard while it walks paths: it
     // takes exec_update for writing later, in exec_replace_image
     let mm = mm_access(pid)?.ok_or(KernelError::NotFound)?;
-    let exe = mm.lock().exe().ok_or(KernelError::NotFound)?;
+    let exe = mm
+        .mmap_read_killable()?
+        .exe()
+        .ok_or(KernelError::NotFound)?;
     Ok(exe)
 }
 

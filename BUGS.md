@@ -101,8 +101,7 @@ Address spaces are reference counted and torn down like Linux
   reaps them at once); their kernel stacks and memory are freed.
 - munmap keeps page-table pages that become empty (freed at exit).
 - x86 and arm64 syscalls run with interrupts off, so a CPU in a long
-  syscall answers a TLB shootdown IPI only when it sleeps, returns or
-  spins on the mm lock (which polls its call queue): the shooting CPU
+  syscall answers a TLB shootdown IPI only when it sleeps or returns: the shooting CPU
   waits meanwhile. Spinning with interrupts off on another lock held
   across a shootdown would deadlock (doc/LOCKING.md, Cross-CPU Calls);
   none is today, and user tasks still run on CPU 0 only.
@@ -193,10 +192,10 @@ chmod/chown do not update ctime; ETXTBSY is not enforced.
 
 **Location**: `kernel/sync` (Mutex, RwSem), various
 
-Sleeping locks so far: `i_rwsem`, `s_vfs_rename_mutex`, `f_pos_lock`,
-RTNL, `TcpSock.rd` and the unix socket `bindlock`/`iolock`. Linux
-rw_semaphores/mutexes still modeled as `spin` locks include the mmap
-lock (`Mm::lock`), the mount namespace/topology locks (namespace_sem,
+Sleeping locks so far: `i_rwsem`, the mmap_lock, `s_vfs_rename_mutex`,
+`f_pos_lock`, RTNL, `TcpSock.rd` and the unix socket `bindlock`/`iolock`.
+Linux rw_semaphores/mutexes still modeled as `spin` locks include the
+mount namespace/topology locks (namespace_sem,
 `Mount` RwLocks), `s_umount` (absent) and pipe locks: their holders must
 not sleep (`make check LOCKDEP=1` reports one that does). `RwSem` has
 `_killable` and `try` variants; `Mutex` has neither, and there are

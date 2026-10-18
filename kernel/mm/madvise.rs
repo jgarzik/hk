@@ -41,7 +41,10 @@ pub fn sys_madvise(start: u64, len: u64, advice: i32) -> i64 {
         return KernelError::OutOfMemory.sysret();
     };
     let mut punch = Vec::new();
-    let mut map = mm.lock();
+    let mut map = match mm.mmap_write_killable() {
+        Ok(m) => m,
+        Err(e) => return e.sysret(),
+    };
     let r = walk(&mut map, &mm, start, end, advice, &mut punch);
     #[cfg(feature = "mmcheck")]
     super::check::verify(&map, mm.pgd(), "madvise");
