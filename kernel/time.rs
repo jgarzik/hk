@@ -19,6 +19,8 @@
 
 use ::core::sync::atomic::{AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
+use crate::arch::IrqSpinlock;
+
 /// Filesystem timestamp (seconds + nanoseconds since Unix epoch)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Timespec {
@@ -118,6 +120,13 @@ pub static NTP_STATE: NtpState = NtpState::new();
 /// - Writers increment seq to odd before updating, even after
 /// - Readers check seq before and after reading; retry if odd or changed
 pub struct TimeKeeper {
+    /// Serializes writers (Linux timekeeper_lock, raw_spin_lock_irqsave):
+    /// IRQs stay off for the whole odd-`seq` window, so the tick on this
+    /// CPU never spins on a write it interrupted, and two writers (the
+    /// CPU 0 tick, clock_settime) never interleave their `seq` bumps.
+    /// Leaf: nothing is taken under it; readers never take it
+    lock: IrqSpinlock<()>,
+
     /// Seqlock sequence counter (odd = write in progress)
     seq: AtomicU32,
 
@@ -158,6 +167,7 @@ impl TimeKeeper {
     /// Create a new uninitialized timekeeper
     pub const fn new() -> Self {
         Self {
+            lock: IrqSpinlock::new(()),
             seq: AtomicU32::new(0),
             cycle_base: AtomicU64::new(0),
             mono_base_ns: AtomicU64::new(0),
@@ -206,6 +216,7 @@ impl TimeKeeper {
         let realtime_offset = rtc_time_secs * 1_000_000_000;
 
         // Begin write sequence
+        let _g = self.lock.lock();
         self.seq.fetch_add(1, Ordering::Release);
 
         self.cycle_base.store(now_cycles, Ordering::Relaxed);
@@ -236,6 +247,7 @@ impl TimeKeeper {
         }
 
         // Begin write (make seq odd)
+        let _g = self.lock.lock();
         self.seq.fetch_add(1, Ordering::Relaxed);
         ::core::sync::atomic::fence(Ordering::Release);
 
@@ -332,6 +344,7 @@ impl TimeKeeper {
         let read_tsc = self.get_read_cycles();
 
         // Begin write (make seq odd)
+        let _g = self.lock.lock();
         self.seq.fetch_add(1, Ordering::Relaxed);
         ::core::sync::atomic::fence(Ordering::Release);
 

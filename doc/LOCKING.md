@@ -306,6 +306,10 @@ Network locks (3.10 Network Subsystem has the full order):
     and wait queues (IrqSpinlocks). No socket is released under a
     network lock or under `Files`/TASK_TABLE (3.3, 3.1.1).
 
+Timekeeping (3.5):
+    TimeKeeper.lock (IrqSpinlock leaf; writers only: the CPU 0 tick,
+    clock_settime, init; readers are lockless seqlock retries)
+
 Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
     OUTPUT_LOCK (IrqSpinlock, held for entire message)
         ↓
@@ -1785,10 +1789,18 @@ let uts_ns = current_uts_ns();  // TASK_NS lookup
 **Location:** `core/time.rs`
 
 The timekeeper uses a **seqlock** pattern for lock-free reads with consistent
-snapshots.
+snapshots. Writers (`update` from the CPU 0 timer tick, `set_realtime` from
+clock_settime/settimeofday, `init`) hold `TimeKeeper.lock`, an IrqSpinlock
+leaf, across the whole odd-`seq` window (Linux `timekeeper_lock`,
+`raw_spin_lock_irqsave` around `write_seqcount_begin/end`). IRQs off there is
+required: a tick on the writer's CPU reads the clock (`check_timers`) and
+would spin forever on the odd `seq` of the write it interrupted. The lock also
+keeps two writers from interleaving their `seq` bumps (which would let
+readers accept a torn snapshot). Nothing is taken under it.
 
 ```rust
 pub struct TimeKeeper {
+    lock: IrqSpinlock<()>,       // Serializes writers, IRQs off (leaf)
     seq: AtomicU32,              // Sequence counter (odd = write in progress)
     cycle_base: AtomicU64,
     mono_base_ns: AtomicU64,
