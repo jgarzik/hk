@@ -573,3 +573,32 @@ From the P3 /code-review (unverified). Tag = when to fix.
    copy_in always uses the atomic+fault-in copy (only i_rwsem writers
    need it); `kernel/task/misc.rs:244` USER_HZ duplicated, times()
    assumes TICK_MS == 10.
+
+## Fix batch 1 review findings (open)
+From the fix-batch-1 /code-review (unverified). Tag = when to fix.
+1. **THP zap loses to a hardware Dirty-bit update** (P4, first).
+   `kernel/mm/memory.rs:124` / `huge_page.rs:174` take_huge_pmd's
+   single CAS fails when the CPU sets D concurrently; the PMD stays
+   huge and mapped after munmap/DONTNEED (stale access, frame leak).
+   Swap the PMD, or loop while still huge.
+2. **Fatal signal to a zombie/exiting thread starts a group exit**
+   (next batch). `kernel/signal/mod.rs:999` group_kill: tgkill of an
+   exited worker kills the live process (Linux ESRCH); a kill -9
+   after all threads exited overwrites the reaped exit status.
+   Linux wants_signal skips PF_EXITING.
+3. **init is killable by SIG_DFL signals** (next batch).
+   `kernel/signal/mod.rs:892`: no SIGNAL_UNKILLABLE check on the new
+   fatal-on-arrival path; kill(1, SIGTERM) by root ends the system.
+4. **drain_all on every failed allocation** (P4, with reclaim).
+   `kernel/mm/page_alloc.rs:462`: the opportunistic order-9 THP try
+   drains every CPU's pcp on each fault once fragmented. Skip for
+   opportunistic/high-order gfp; rate-limit like pcpu_drain_mutex.
+5. **memblock MAX_REGIONS = 128 drops RAM silently** (next batch).
+   `kernel/mm/memblock.rs:66`.
+6. **kmap direct_pages re-parses the multiboot map per 2MB chunk**
+   (next batch). `kernel/arch/x86_64/kmap.rs:152`: O(regions × pages)
+   at boot.
+7. **group_alive duplicates group_others** (next batch).
+   `kernel/task/percpu.rs:1118` vs `:1072`.
+Note: d8a7e8d's GROUP_EXEC_THREAD can hang on its own (fixed by
+cf0ce50); push both together.
