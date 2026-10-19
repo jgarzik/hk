@@ -597,23 +597,27 @@ impl CgroupRoot {
 /// Global unified cgroup hierarchy root
 pub static CGROUP_ROOT: Lazy<Arc<CgroupRoot>> = Lazy::new(|| Arc::new(CgroupRoot::new()));
 
-/// Task-to-cgroup mapping
-/// Maps TID -> Arc<Cgroup>
-pub static TASK_CGROUP: RwLock<BTreeMap<Pid, Arc<Cgroup>>> = RwLock::new(BTreeMap::new());
-
-/// Get the cgroup for a task
-pub fn get_task_cgroup(pid: Pid) -> Option<Arc<Cgroup>> {
-    TASK_CGROUP.read().get(&pid).cloned()
+/// Task `tid` (its cgroup is `Task.cgroup`, Linux task->cgroups)
+fn task(tid: Pid) -> Option<crate::task::percpu::TaskRef> {
+    crate::task::percpu::TASK_TABLE.lock().task(tid)
 }
 
-/// Set the cgroup for a task
-pub fn set_task_cgroup(pid: Pid, cgroup: Arc<Cgroup>) {
-    TASK_CGROUP.write().insert(pid, cgroup);
+/// Get the cgroup for a task
+pub fn get_task_cgroup(tid: Pid) -> Option<Arc<Cgroup>> {
+    task(tid).and_then(|t| t.cgroup.lock().clone())
+}
+
+/// Set the cgroup for a task (the old one is dropped after its lock)
+pub fn set_task_cgroup(tid: Pid, cgroup: Arc<Cgroup>) {
+    if let Some(t) = task(tid) {
+        let old = t.cgroup.lock().replace(cgroup);
+        drop(old);
+    }
 }
 
 /// Remove cgroup mapping for a task
-pub fn remove_task_cgroup(pid: Pid) -> Option<Arc<Cgroup>> {
-    TASK_CGROUP.write().remove(&pid)
+pub fn remove_task_cgroup(tid: Pid) -> Option<Arc<Cgroup>> {
+    task(tid).and_then(|t| t.cgroup.lock().take())
 }
 
 /// Initialize the cgroup subsystem

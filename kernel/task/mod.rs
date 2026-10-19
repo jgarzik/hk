@@ -876,6 +876,18 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// task itself; read at every syscall entry
     pub seccomp_mode: AtomicU8,
 
+    /// Keyring references (Linux cred->thread_keyring etc.): spin lock,
+    /// thread context; the key database is taken under it
+    pub keyrings: crate::sync::spin::Mutex<crate::keys::keyring::TaskKeyrings>,
+    /// Its cgroup (Linux task->cgroups): spin leaf, thread context
+    pub cgroup: crate::sync::spin::Mutex<Option<Arc<crate::cgroup::Cgroup>>>,
+    /// Files `defer_fput` still has to drop while an outer frame of this
+    /// task drains (Linux task_work fput); only the task itself uses it
+    pub fput_defer: crate::sync::spin::Mutex<Option<Vec<Arc<crate::fs::File>>>>,
+    /// The vforking parent's completion until this task execs or exits
+    /// (Linux vfork_done): set by the parent before the task runs, taken
+    /// once by the task
+    pub vfork_done: AtomicPtr<crate::completion::Completion>,
     /// Credentials (Linux task->cred): read lock-free by the task, under
     /// TASK_TABLE by others; replaced only by the task (commit_creds)
     /// under TASK_TABLE
@@ -1210,6 +1222,10 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             sid: AtomicU64::new(ids.sid),
             tls: AtomicU64::new(0),
             seccomp_mode: AtomicU8::new(ids.seccomp_mode),
+            keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
+            cgroup: crate::sync::spin::Mutex::new(None),
+            fput_defer: crate::sync::spin::Mutex::new(None),
+            vfork_done: AtomicPtr::new(core::ptr::null_mut()),
             cred: TaskCred::new(cred),
             mm: OwnCell::new(mm),
             files: OwnCell::new(None),
@@ -1243,6 +1259,10 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             sid: AtomicU64::new(0),
             tls: AtomicU64::new(0),
             seccomp_mode: AtomicU8::new(0),
+            keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
+            cgroup: crate::sync::spin::Mutex::new(None),
+            fput_defer: crate::sync::spin::Mutex::new(None),
+            vfork_done: AtomicPtr::new(core::ptr::null_mut()),
             cred: TaskCred::boot(),
             mm: OwnCell::new(None),
             files: OwnCell::new(None),

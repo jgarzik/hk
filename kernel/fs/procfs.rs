@@ -1091,7 +1091,6 @@ fn gen_maps(_: &crate::mm::Mm, mm: &crate::mm::MmStruct) -> Vec<u8> {
 
 /// Get the cgroup path for a task (virtualized to its namespace)
 fn get_task_cgroup_path(pid: Pid) -> String {
-    use crate::cgroup::TASK_CGROUP;
     use crate::ns::INIT_CGROUP_NS;
     use crate::task::percpu::TASK_TABLE;
 
@@ -1106,7 +1105,7 @@ fn get_task_cgroup_path(pid: Pid) -> String {
         let table = TASK_TABLE.lock();
         if let Some(task) = table.get(tid) {
             // Try to get from TASK_CGROUP mapping
-            TASK_CGROUP.read().get(&task.task.tid).cloned()
+            task.task.cgroup.lock().clone()
         } else {
             None
         }

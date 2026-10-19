@@ -1235,6 +1235,9 @@ pub struct SignalStruct {
     /// group_exec_task): 0, GROUP_EXIT | wait status, or GROUP_EXEC |
     /// the exec'ing tid. Changed by compare-and-swap only, no lock.
     group_exit: AtomicU64,
+    /// POSIX timers and ITIMER_REAL (Linux signal->posix_timers,
+    /// real_timer): spin leaf, thread context only
+    pub posix_timers: Mutex<crate::posix_timer::PosixTimerRegistry>,
 }
 
 const GROUP_EXIT: u64 = 1 << 63;
@@ -1320,6 +1323,7 @@ impl SignalStruct {
             cred_guard: crate::sync::Mutex::new(()),
             exec_update: crate::sync::RwSem::new(()),
             group_exit: AtomicU64::new(0),
+            posix_timers: Mutex::new(crate::posix_timer::PosixTimerRegistry::new()),
         }
     }
 
@@ -1423,6 +1427,8 @@ impl SignalStruct {
             cred_guard: crate::sync::Mutex::new(()),
             exec_update: crate::sync::RwSem::new(()),
             group_exit: AtomicU64::new(0),
+            // Timers are not inherited (Linux copy_signal)
+            posix_timers: Mutex::new(crate::posix_timer::PosixTimerRegistry::new()),
         })
     }
 }

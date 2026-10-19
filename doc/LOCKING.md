@@ -2454,7 +2454,7 @@ do not rely on that.
 | `UnixSock.rq` | `spin::Mutex<RxQueue>` | thread only | receive queue (Linux sk_receive_queue.lock), under `st`; a listener's queue holds embryo connections |
 | `UnixTable.st` (per netns), `unix::BSD` (global, by inode) | `spin::RwLock` | thread only | all sockets + abstract names (per type) / filesystem bindings; after `bindlock`, before `UnixSock.addr` (published under them); lookups return `Arc`s, no socket lock under them |
 | `UnixSock.addr`, `UnixSock.peercred`, `UnixSock.relay` | `spin::RwLock` / `spin::Mutex` | thread only | leaves (Linux u->addr, sk_peer_lock, peer_wait.lock for peer_wake relays); `relay` also guards the registered sockets' `peer_wake` atomics |
-| `unix::scm::INFLIGHT`, `unix::scm::DEFERRED` | `spin::Mutex` | thread only | leaves: per-user in-flight file counts (charged under the receiver's `st`), files awaiting `defer_fput` by task (each task drains its own, like Linux task_work fput; an entry marks the task draining, so nested releases queue instead of recursing) |
+| `unix::scm::INFLIGHT`, `Task.fput_defer` | `spin::Mutex` | thread only | leaves: per-user in-flight file counts (charged under the receiver's `st`); the current task's files awaiting `defer_fput` (each task drains its own, like Linux task_work fput; `Some` marks the task draining, so nested releases queue instead of recursing; only the task itself takes it) |
 | `UnixSock` `state`/`dead`/`wmem`/`backlog`/`peer_wake` | atomics | thread only | |
 | `NetDevice.net` | `spin::RwLock<Weak<NetNamespace>>` | thread only | read per received packet; written at registration under the namespace's `devices` write lock (order `devices` -> `NetDevice.net`) |
 | driver `netdev` / `Napi.poller` (`spin::Once<Weak<..>>`) | set once at probe, before the IRQ is registered and the NAPI added | read lock-free by polls (thread) | ISRs never read them (they use the driver struct passed as IRQ data) |
@@ -2601,8 +2601,8 @@ else is taken under it) unless an order is given. "spin" is the
 
 | Lock | Location | Class | Protects / order |
 |------|----------|-------|------------------|
-| `VFORK_COMPLETION` | task/percpu.rs | spin Mutex | vfork done flags (Tid-keyed) |
-| `TASK_POSIX_TIMERS` | posix_timer.rs | spin Mutex | per-process POSIX timer tables (Tid-keyed) |
+| `Task.vfork_done` | task/mod.rs | atomic pointer | the vforking parent's on-stack `Completion` (Linux vfork_done): set before the child runs, taken once by the child at exec/exit, which completes it; the parent waits uninterruptibly so the completion outlives that use |
+| `SignalStruct.posix_timers` | signal/mod.rs, posix_timer.rs | spin Mutex | the thread group's POSIX timers and ITIMER_REAL (Linux signal->posix_timers); leaf, thread context; deleted at the group's last exit (`exit_itimers`, timers stopped after the lock) or with the SignalStruct |
 | `POSIX_TIMER_REGISTRY` | posix_timer.rs | IrqSpinlock | timer id -> owner, read by the expiry callback (ktimerd) |
 | `PosixTimer.inner` | posix_timer.rs | IrqSpinlock | one timer's state; -> kernel `TIMERS` (`timer_del` on drop) |
 | `Eventfd.inner`, `Eventpoll.inner`, `Inotify.inner`, `Fanotify.inner`, `IoUring.inner`, `Pidfd.inner`, `Signalfd.inner`, `Timerfd.inner` | eventfd.rs, epoll.rs, inotify.rs, fanotify.rs, io_uring.rs, pidfd.rs, signalfd.rs, timerfd.rs | IrqSpinlock | per-object state of the anon-inode files; their wait queues are woken after unlocking (pidfd: under it -> wait queue head) |
@@ -2610,9 +2610,9 @@ else is taken under it) unless an order is given. "spin" is the
 | `Workqueue.inner` | workqueue.rs | IrqSpinlock | pending and delayed work lists (`SYSTEM_WQ`, `BDI_WORKQUEUE`); a work item's own `spin::Mutex<Work>` is taken and dropped before it |
 | `BDI_REGISTRY`, `BdiWriteback.dirty_inodes`, `BdiWriteback.dwork` | mm/writeback.rs | spin | per-device writeback state |
 | `DIRTY_ADDRESS_SPACES` | mm/page_cache.rs | spin Mutex | files with dirty pages (sync) |
-| `TASK_CGROUP`, `CSS_SET_CACHE`, `CgroupRoot.{root_cgrp, controllers}`, `Cgroup.{parent, children, ancestors, subsys, tasks}`, `CssSet.subsys`, `CgroupSubsysState.private`, `IoState.devices` | cgroup/ | spin (RwLock; `CSS_SET_CACHE` Mutex) | cgroup hierarchy and membership; parent before child; never under TASK_TABLE (clone reads `TASK_CGROUP` after it, exit detaches after it) |
+| `Task.cgroup`, `CSS_SET_CACHE`, `CgroupRoot.{root_cgrp, controllers}`, `Cgroup.{parent, children, ancestors, subsys, tasks}`, `CssSet.subsys`, `CgroupSubsysState.private`, `IoState.devices` | cgroup/ | spin (RwLock; `CSS_SET_CACHE`, `Task.cgroup` Mutex) | cgroup hierarchy and membership (`Task.cgroup`: the task's cgroup, a leaf reached through a `TaskRef` cloned out of TASK_TABLE, Linux task->cgroups); parent before child; never under TASK_TABLE |
 | `IpcIds.inner`, `KernIpcPerm.lock`, `MsgQueue.{messages, receivers, senders}`, `MsgReceiver.result`, `SemArray.pending`, `SemUndoList.undos`, `MQ_REGISTRY`, `MqQueue.{messages, flags, notify}` | ipc/ | spin | SysV and POSIX IPC objects; `IpcIds.inner` -> the object's lock |
-| `KEY_DATABASE`, `TASK_KEYRINGS`, `USER_KEYRINGS`, `Key.payload`, `Key.keyring_keys` | keys/ | spin RwLock | key registry and keyrings (lookups clone the `Arc<Key>` out) |
+| `Task.keyrings` → `KEY_DATABASE`, `USER_KEYRINGS`, `Key.payload`, `Key.keyring_keys` | keys/ | spin (RwLock; `Task.keyrings` Mutex) | a task's thread/process/session keyring references (`Task.keyrings`, reached through a `TaskRef` cloned out of TASK_TABLE; creating a keyring registers it under it), key registry and keyrings (lookups clone the `Arc<Key>` out) |
 | `FILE_LOCKS` (flock), `POSIX_LOCKS` | fs/flock.rs, fs/posix_lock.rs | spin Mutex | file lock tables; waiters sleep with them dropped |
 | `FS_TYPES`, `CHARDEV_REGISTRY` | fs/superblock.rs, chardev.rs | spin | filesystem types, character device registry |
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock) |

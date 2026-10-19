@@ -21,13 +21,6 @@ use crate::sync::spin::Mutex;
 use crate::task::sched::{PriorityRunQueue, SleepEntry};
 use crate::task::{Cred, PRIORITY_IDLE, Pid, Priority, Task, TaskKind, TaskState, Tid};
 
-/// Vfork completion state
-///
-/// When CLONE_VFORK is used, the parent must wait until the child calls
-/// exec() or _exit(). This table maps child TID -> completion flag.
-/// When the child completes, the flag is set to true and the parent wakes.
-static VFORK_COMPLETION: Mutex<BTreeMap<Tid, bool>> = Mutex::new(BTreeMap::new());
-
 /// Clear the child TID and wake futex waiters
 ///
 /// Called when a task exits if CLONE_CHILD_CLEARTID was set during clone.
@@ -65,46 +58,19 @@ fn do_clear_child_tid(tid: Tid) {
     }
 }
 
-/// Register a vfork child for completion tracking
-///
-/// Called from do_clone when CLONE_VFORK is set.
-fn register_vfork_child(child_tid: Tid) {
-    VFORK_COMPLETION.lock().insert(child_tid, false);
-}
-
-/// Wait for vfork child to complete (exec or exit)
-///
-/// Called by parent after creating vfork child.
-/// Uses busy-wait with yield to avoid blocking other tasks.
-fn wait_for_vfork(child_tid: Tid) {
-    loop {
-        {
-            let table = VFORK_COMPLETION.lock();
-            if let Some(&completed) = table.get(&child_tid) {
-                if completed {
-                    break;
-                }
-            } else {
-                // Child entry removed (shouldn't happen), stop waiting
-                break;
-            }
-        }
-
-        // Yield to let child run
-        yield_now();
-    }
-
-    // Clean up the entry
-    VFORK_COMPLETION.lock().remove(&child_tid);
-}
-
-/// Signal vfork completion (called by child on exec or exit)
-///
-/// This wakes the parent that was blocked in wait_for_vfork().
-pub fn signal_vfork_done(tid: Tid) {
-    let mut table = VFORK_COMPLETION.lock();
-    if let Some(completed) = table.get_mut(&tid) {
-        *completed = true;
+/// Signal vfork completion (Linux complete_vfork_done; the child, on
+/// exec or exit): wakes the parent sleeping in `do_clone` on the
+/// completion on its stack. The pointer is taken once, so the parent's
+/// completion is touched at most once and only while it waits.
+pub fn signal_vfork_done() {
+    let p = current()
+        .vfork_done
+        .swap(core::ptr::null_mut(), Ordering::AcqRel);
+    // SAFETY: set by the vforking parent, which waits (uninterruptibly)
+    // until this completes it; `Completion` does not touch itself once
+    // the waiter can return
+    if let Some(c) = unsafe { p.as_ref() } {
+        c.complete();
     }
 }
 
@@ -1479,7 +1445,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // This is checked before allocating resources so we fail early if over limit
     let parent_cgroup = {
         let tid = current_tid();
-        crate::cgroup::TASK_CGROUP.read().get(&tid).cloned()
+        crate::cgroup::get_task_cgroup(tid)
     };
     if let Some(ref cgroup) = parent_cgroup
         && !crate::cgroup::pids_can_fork(cgroup)
@@ -1868,10 +1834,15 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         child_pid
     };
 
-    // CLONE_VFORK: the completion must exist before the child can run
-    // (it may exec or exit at once on another CPU)
+    // CLONE_VFORK: the completion must be in place before the child can
+    // run (it may exec or exit at once on another CPU; Linux
+    // p->vfork_done)
+    let vfork = crate::completion::Completion::new();
     if config.flags & CLONE_VFORK != 0 {
-        register_vfork_child(child_tid);
+        child_task.vfork_done.store(
+            &vfork as *const crate::completion::Completion as *mut _,
+            Ordering::Release,
+        );
     }
 
     // The child exists now: its charge is released with it; the parent
@@ -1894,9 +1865,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         rq.enqueue_task(child_tid);
     }
 
-    // CLONE_VFORK: parent blocks until child exec()s or _exit()s
+    // CLONE_VFORK: parent sleeps until the child exec()s or _exit()s
+    // (Linux wait_for_vfork_done; uninterruptible here, so the
+    // completion on this stack outlives the child's use of it)
     if config.flags & CLONE_VFORK != 0 {
-        wait_for_vfork(child_tid);
+        vfork.wait();
     }
 
     // Handle CLONE_PIDFD: create a pidfd for the child and write it to parent's address space
@@ -2011,6 +1984,14 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // Clean up seccomp state for exiting task
         crate::seccomp::exit_seccomp(tid);
 
+        // The group's last thread deletes its timers (Linux exit_itimers
+        // when group_dead)
+        if !group_others(current_pid(), tid)
+            && let Some(sig) = crate::signal::get_task_signal_struct(tid)
+        {
+            crate::posix_timer::exit_itimers(&sig);
+        }
+
         // Clean up signal state for exiting task
         crate::signal::exit_task_signal(tid);
 
@@ -2029,7 +2010,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
 
         // Signal vfork completion if parent is waiting
         // This must be done after CLEARTID but before we switch away
-        signal_vfork_done(tid);
+        signal_vfork_done();
     }
 
     // Leave the address space (Linux exit_mm, after mm_release above has
