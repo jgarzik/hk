@@ -1338,7 +1338,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
 }
 
 /// Mark a task as zombie with exit status
-pub fn mark_zombie(tid: Tid, status: i32) {
+pub fn mark_zombie(tid: Tid, status: i32, group_dead: bool) {
     let pid: Option<Pid>;
     {
         let mut table = TASKLIST.write();
@@ -1358,7 +1358,7 @@ pub fn mark_zombie(tid: Tid, status: i32) {
     // The process's pidfds once its last thread is gone (Linux
     // do_notify_pidfd; after TASKLIST)
     if let Some(p) = pid
-        && !group_others(p, tid)
+        && group_dead
     {
         crate::pidfd::notify_process_exit(p, status);
     }
@@ -2255,6 +2255,7 @@ fn release_thread(tid: Tid) {
 /// runs on its resources.
 pub fn exit_current(status: Option<i32>) -> ! {
     let tid = current_tid();
+    let mut group_dead = true;
 
     // Release the task's resources first, without the rq lock: these paths
     // take sleeping-context locks and may wake other tasks (futex CLEARTID,
@@ -2263,11 +2264,16 @@ pub fn exit_current(status: Option<i32>) -> ! {
         // Linux exit_signals sets PF_EXITING first
         set_exiting();
 
+        // Exactly one thread, the one taking the group's live count to
+        // zero, does the group-level exit work (Linux do_exit:
+        // group_dead = atomic_dec_and_test(&signal->live))
+        group_dead = crate::signal::get_task_signal_struct(tid).is_none_or(|s| s.thread_exiting());
+
         // The group's last thread writes the accounting record while the
-        // task still has its mm, files and identity (Linux do_exit:
-        // acct_process when group_dead, before exit_mm/exit_files)
+        // task still has its mm, files and identity (Linux acct_process
+        // when group_dead, before exit_mm/exit_files)
         if let Some(st) = status
-            && !group_others(current_pid(), tid)
+            && group_dead
         {
             crate::acct::write_acct_record(tid, current_pid(), st);
         }
@@ -2305,9 +2311,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
 
         // The group's last thread deletes its timers (Linux exit_itimers
         // when group_dead)
-        if !group_others(current_pid(), tid)
-            && let Some(sig) = crate::signal::get_task_signal_struct(tid)
-        {
+        if group_dead && let Some(sig) = crate::signal::get_task_signal_struct(tid) {
             crate::posix_timer::exit_itimers(&sig);
         }
 
@@ -2344,7 +2348,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
         forget_original_parent();
     }
     if let Some(st) = status {
-        mark_zombie(tid, st);
+        mark_zombie(tid, st, group_dead);
         release_thread(tid);
     }
 

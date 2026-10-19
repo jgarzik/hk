@@ -22,7 +22,7 @@ pub mod syscall;
 use crate::sync::spin::Mutex;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::task::{Pid, Tid};
@@ -905,6 +905,7 @@ fn sig_ignored(state: &TaskSignalState, sighand: Option<&Arc<SigHand>>, sig: u32
 ///
 /// Returns 0 on success, negative errno on error.
 pub fn send_signal(tid: Tid, sig: u32) -> i32 {
+    check_send_context();
     if sig == 0 {
         // Signal 0 is null signal - just check if task exists
         let table = TASKLIST.read();
@@ -966,6 +967,20 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
     }
 
     0
+}
+
+/// Signals are sent from thread context only: Task.sig and the shared
+/// pending set are non-IRQ spin locks (an interrupt handler that must
+/// signal defers to a thread). Reported once as SIGNAL:FAIL otherwise.
+fn check_send_context() {
+    use crate::arch::{CurrentArch, PerCpuOps};
+    if CurrentArch::interrupt_depth() > 0 {
+        static REPORTED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            crate::printkln!("SIGNAL:FAIL send_signal from interrupt context");
+        }
+    }
 }
 
 /// Send signal to a process (any thread in the thread group)
@@ -1297,6 +1312,10 @@ pub struct SignalStruct {
     /// POSIX timers and ITIMER_REAL (Linux signal->posix_timers,
     /// real_timer): spin leaf, thread context only
     pub posix_timers: Mutex<crate::posix_timer::PosixTimerRegistry>,
+    /// Threads not yet exiting (Linux signal->live): +1 at each
+    /// CLONE_THREAD, -1 when a thread starts its exit; the thread that
+    /// takes it to 0 is the group's last (group_dead)
+    live: AtomicU32,
 }
 
 const GROUP_EXIT: u64 = 1 << 63;
@@ -1383,7 +1402,19 @@ impl SignalStruct {
             exec_update: crate::sync::RwSem::new(()),
             group_exit: AtomicU64::new(0),
             posix_timers: Mutex::new(crate::posix_timer::PosixTimerRegistry::new()),
+            live: AtomicU32::new(1),
         }
+    }
+
+    /// A thread joins the group (CLONE_THREAD)
+    pub fn thread_added(&self) {
+        self.live.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A thread starts its exit; true if it was the group's last live
+    /// one (Linux do_exit: group_dead = atomic_dec_and_test(&live))
+    pub fn thread_exiting(&self) -> bool {
+        self.live.fetch_sub(1, Ordering::AcqRel) == 1
     }
 
     /// The group's exit state
@@ -1488,6 +1519,7 @@ impl SignalStruct {
             group_exit: AtomicU64::new(0),
             // Timers are not inherited (Linux copy_signal)
             posix_timers: Mutex::new(crate::posix_timer::PosixTimerRegistry::new()),
+            live: AtomicU32::new(1),
         })
     }
 }
@@ -1518,8 +1550,14 @@ fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool)
     let parent_signal = get_task_signal_struct(parent_tid);
 
     let child_signal = if share_signal {
-        // CLONE_THREAD: share the same SignalStruct
-        parent_signal.unwrap_or_else(|| Arc::new(SignalStruct::new()))
+        // CLONE_THREAD: share the same SignalStruct, one more live thread
+        match parent_signal {
+            Some(s) => {
+                s.thread_added();
+                s
+            }
+            None => Arc::new(SignalStruct::new()),
+        }
     } else {
         // Fork: deep clone
         parent_signal

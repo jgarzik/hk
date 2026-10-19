@@ -116,6 +116,20 @@ extern "C" fn handle_el1_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
 /// Handle IRQ from EL1 (kernel mode)
 #[unsafe(no_mangle)]
 extern "C" fn handle_el1_irq(_frame: &mut Aarch64TrapFrame) {
+    // In an interrupt handler from here to the end (in_atomic(), the
+    // signal-context check)
+    let depth = super::percpu::try_current_cpu().map(|p| &p.interrupt_depth);
+    if let Some(d) = depth {
+        d.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    irq_dispatch();
+    if let Some(d) = depth {
+        d.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Acknowledge, handle and end one interrupt
+fn irq_dispatch() {
     // Read interrupt ID from GIC
     let intid = super::gic::acknowledge_interrupt();
 

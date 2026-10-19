@@ -2051,8 +2051,13 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    TASKLIST's read lock) and runs its closure under `Task.sig` (no
    sleeping, no user memory, no TASKLIST, nothing released in it).
    Deviation: Linux siglock is IRQ-safe and per thread group; hk's is
-   per task, thread context only (no interrupt handler sends a
-   signal).
+   per task, thread context only. Audit (T0): no interrupt handler
+   sends a signal (the tty receive path is not driven from the UART
+   IRQ, no SIGIO/SIGURG generation, POSIX timer/itimer expiry runs in
+   ktimerd, no tick-based SIGXCPU/SIGPROF, fault signals are sent by
+   the faulting task with interrupts on). `send_signal` reports
+   `SIGNAL:FAIL` if called with a nonzero interrupt depth (arm64 IRQ
+   entry now counts the depth too).
 
 2. **SigHand.action uses IrqSpinlock** - Can be safely accessed from synchronous
    exception handlers (page faults, etc.) and process context; a leaf.
