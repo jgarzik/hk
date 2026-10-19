@@ -253,7 +253,8 @@ fn open_acct_file(path: &str) -> Result<Arc<File>, i64> {
 
 /// Write accounting record for an exiting process
 ///
-/// This should be called from mark_zombie() when a process exits.
+/// Called by a process's last exiting thread before it releases its
+/// mm and files (Linux acct_process from do_exit).
 /// It's best-effort - failures are silently ignored to not block the exit path.
 pub fn write_acct_record(tid: Tid, pid: Pid, exit_status: i32) {
     // Accounting enabled? (the file is used with no lock held)

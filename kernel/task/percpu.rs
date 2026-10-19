@@ -1357,13 +1357,10 @@ pub fn mark_zombie(tid: Tid, status: i32) {
 
     // The process's pidfds once its last thread is gone (Linux
     // do_notify_pidfd; after TASKLIST)
-    if let Some(p) = pid {
-        if !group_others(p, tid) {
-            crate::pidfd::notify_process_exit(p, status);
-        }
-
-        // Write accounting record if process accounting is enabled
-        crate::acct::write_acct_record(tid, p, status);
+    if let Some(p) = pid
+        && !group_others(p, tid)
+    {
+        crate::pidfd::notify_process_exit(p, status);
     }
 }
 
@@ -2265,6 +2262,15 @@ pub fn exit_current(status: Option<i32>) -> ! {
     if tid != 0 {
         // Linux exit_signals sets PF_EXITING first
         set_exiting();
+
+        // The group's last thread writes the accounting record while the
+        // task still has its mm, files and identity (Linux do_exit:
+        // acct_process when group_dead, before exit_mm/exit_files)
+        if let Some(st) = status
+            && !group_others(current_pid(), tid)
+        {
+            crate::acct::write_acct_record(tid, current_pid(), st);
+        }
 
         // A non-leader thread is released at exit (Linux autoreaps it):
         // its RLIMIT_NPROC charge goes now; a process's when it is reaped
