@@ -273,7 +273,7 @@ pub fn prepare_creds() -> Cred {
 /// Commit new credentials to current task
 ///
 /// Like Linux's `commit_creds()`: the task's credential pointer is
-/// replaced under TASK_TABLE (others read it under the lock; the task
+/// replaced under TASKLIST (others read it under the lock; the task
 /// itself without). The new credentials take effect immediately.
 pub fn commit_creds(new: Arc<Cred>) {
     let old = current_cred().uid;
@@ -290,9 +290,9 @@ pub fn commit_creds(new: Arc<Cred>) {
 pub fn nproc_exec_check() -> Result<(), i32> {
     let tid = percpu::current_tid();
     let uid = current_cred().uid;
-    // rlimit() takes TASK_TABLE: decide before locking it
+    // rlimit() takes TASKLIST: decide before locking it
     let over = nproc_overlimit(nproc_count(uid));
-    let table = percpu::TASK_TABLE.lock();
+    let table = percpu::TASKLIST.read();
     let Some(t) = table.get(tid) else {
         return Ok(());
     };
@@ -831,15 +831,15 @@ pub mod tif {
 /// Three kinds of fields:
 /// - fixed at creation: `tid`, `pid`, `kind`, `kstack_top`;
 /// - hot counters and flags: atomics written by the task itself (or
-///   its creator before it first runs) or under TASK_TABLE, and read
+///   its creator before it first runs) or under TASKLIST, and read
 ///   lock-free by anyone (accounting, `flags`, `thread_flags`, `cpu`,
 ///   `ppid`/`pgid`/`sid`, `seccomp_mode`);
 /// - `cred`, `mm`, `files`: owner fields (Linux current->cred/mm/files),
 ///   read by the task itself without a lock and by others under
-///   TASK_TABLE, changed by the task (or its creator before it runs)
-///   under TASK_TABLE;
+///   TASKLIST, changed by the task (or its creator before it runs)
+///   under TASKLIST;
 /// - everything else ([`TaskInner`]), read and written only under
-///   TASK_TABLE, through the table's views (`GlobalTaskTable::get` etc.).
+///   TASKLIST, through the table's views (`GlobalTaskTable::get` etc.).
 pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
     /// Thread ID: the root number of its `thread_pid`; changes only when
     /// a non-leader execs and takes its leader's (exchange_tids)
@@ -864,11 +864,11 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// the run queue's)
     pub sleeping: AtomicBool,
 
-    /// Parent process ID (0 for init/orphans; written under TASK_TABLE)
+    /// Parent process ID (0 for init/orphans; written under TASKLIST)
     pub ppid: AtomicU64,
-    /// Process group ID (written under TASK_TABLE)
+    /// Process group ID (written under TASKLIST)
     pub pgid: AtomicU64,
-    /// Session ID (written under TASK_TABLE)
+    /// Session ID (written under TASKLIST)
     pub sid: AtomicU64,
     /// User TLS register (x86-64 FS base, arm64 TPIDR_EL0), saved at
     /// switch-out and loaded at switch-in; set by the task itself or its
@@ -891,8 +891,8 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// once by the task
     pub vfork_done: AtomicPtr<crate::completion::Completion>,
     /// Credentials (Linux task->cred): read lock-free by the task, under
-    /// TASK_TABLE by others; replaced only by the task (commit_creds)
-    /// under TASK_TABLE
+    /// TASKLIST by others; replaced only by the task (commit_creds)
+    /// under TASKLIST
     cred: TaskCred,
     /// Address space, one mm_users reference (shared when CLONE_VM)
     mm: OwnCell<Option<crate::mm::MmRef>>,
@@ -917,12 +917,14 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Major page faults (swap-in required - I/O needed)
     pub maj_flt: AtomicU64,
 
-    /// The rest, under TASK_TABLE (None only for the boot task, which
+    /// Its place in the task list (Linux task->tasks; under TASKLIST)
+    pub tasks_link: crate::list::Link,
+    /// The rest, under TASKLIST (None only for the boot task, which
     /// is never in the table)
     inner: TableCell<Option<TaskInner<A, PT>>>,
 }
 
-/// The fields of a [`Task`] read and written under TASK_TABLE
+/// The fields of a [`Task`] read and written under TASKLIST
 pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
     /// Its process identifier (Linux thread_pid; None for the idle
     /// tasks, tid 0)
@@ -1064,7 +1066,7 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     pub ptrace_options: u32,
 }
 
-/// Data owned by the TASK_TABLE lock (Rust-for-Linux LockedBy): only
+/// Data owned by the TASKLIST lock (Rust-for-Linux LockedBy): only
 /// `GlobalTaskTable`'s views reach it, with the table locked
 pub struct TableCell<T>(UnsafeCell<T>);
 
@@ -1077,14 +1079,14 @@ impl<T> TableCell<T> {
     }
 
     /// # Safety
-    /// TASK_TABLE is held, and no `&mut` to this cell's data exists.
+    /// TASKLIST is held, and no `&mut` to this cell's data exists.
     pub unsafe fn get(&self) -> &T {
         // SAFETY: see above
         unsafe { &*self.0.get() }
     }
 
     /// # Safety
-    /// TASK_TABLE is held mutably by the caller, and no other reference
+    /// TASKLIST is held mutably by the caller, and no other reference
     /// to this cell's data exists.
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn get_mut(&self) -> &mut T {
@@ -1103,8 +1105,8 @@ pub struct TaskIds {
 }
 
 /// An owner field (Linux current->mm, ->files): the owning task reads it
-/// without a lock; others read it under TASK_TABLE; it changes only
-/// under TASK_TABLE, by the owner or before the task first runs
+/// without a lock; others read it under TASKLIST; it changes only
+/// under TASKLIST, by the owner or before the task first runs
 pub struct OwnCell<T>(UnsafeCell<T>);
 
 // SAFETY: see the access rules above (enforced by `Task`'s unsafe API)
@@ -1116,15 +1118,15 @@ impl<T> OwnCell<T> {
     }
 
     /// # Safety
-    /// The caller owns the task, or holds TASK_TABLE.
+    /// The caller owns the task, or holds TASKLIST.
     unsafe fn get(&self) -> &T {
         // SAFETY: no writer runs meanwhile: writers are the owner (not
-        // reading now, or this is it) under TASK_TABLE
+        // reading now, or this is it) under TASKLIST
         unsafe { &*self.0.get() }
     }
 
     /// # Safety
-    /// TASK_TABLE is held, and the caller owns the task or it has not
+    /// TASKLIST is held, and the caller owns the task or it has not
     /// run yet; no reference from `get` is live.
     unsafe fn replace(&self, v: T) -> T {
         // SAFETY: see above
@@ -1242,6 +1244,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
             maj_flt: AtomicU64::new(0),
+            tasks_link: crate::list::Link::new(),
             inner: TableCell::new(Some(inner)),
         }
     }
@@ -1279,6 +1282,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
             maj_flt: AtomicU64::new(0),
+            tasks_link: crate::list::Link::new(),
             inner: TableCell::new(None),
         }
     }
@@ -1289,7 +1293,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
         self.tid.load(Ordering::Relaxed)
     }
 
-    /// Take over thread ID `tid` (exec's exchange_tids, TASK_TABLE and
+    /// Take over thread ID `tid` (exec's exchange_tids, TASKLIST and
     /// the run-queue entry re-keyed by the caller)
     pub fn set_tid(&self, tid: Tid) {
         self.tid.store(tid, Ordering::Relaxed);
@@ -1320,7 +1324,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     /// The task's credentials, copied
     ///
     /// # Safety
-    /// The caller is the task itself, or holds TASK_TABLE.
+    /// The caller is the task itself, or holds TASKLIST.
     pub unsafe fn cred(&self) -> Cred {
         // SAFETY: see above
         unsafe { self.cred.get() }
@@ -1336,10 +1340,10 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     }
 
     /// Install new credentials, returning the old ones (dropped by the
-    /// caller after TASK_TABLE)
+    /// caller after TASKLIST)
     ///
     /// # Safety
-    /// The caller holds TASK_TABLE and is the task itself, or the task
+    /// The caller holds TASKLIST and is the task itself, or the task
     /// has not run yet.
     pub unsafe fn set_cred(&self, new: Arc<Cred>) -> Option<Arc<Cred>> {
         // SAFETY: see above
@@ -1829,7 +1833,7 @@ pub fn nproc_move(old: Uid, new: Uid) {
 fn flag_nproc_exceeded(new: Uid) {
     let over = new != 0 && nproc_overlimit(nproc_count(new));
     let tid = percpu::current_tid();
-    let table = percpu::TASK_TABLE.lock();
+    let table = percpu::TASKLIST.read();
     if let Some(t) = table.get(tid) {
         if over {
             t.task.set_flag(crate::task::pf::NPROC_EXCEEDED);
@@ -1943,18 +1947,18 @@ impl Clone for IoContext {
 }
 
 // =============================================================================
-// Task I/O context accessors - uses Task.io_context field via TASK_TABLE
+// Task I/O context accessors - uses Task.io_context field via TASKLIST
 // =============================================================================
 
 /// Get the I/O context for a task
 pub fn get_task_io_context(tid: Tid) -> Option<Arc<IoContext>> {
-    let table = percpu::TASK_TABLE.lock();
+    let table = percpu::TASKLIST.read();
     table.get(tid).and_then(|t| t.io_context.clone())
 }
 
 /// Set the I/O context for a task
 pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
-    let mut table = percpu::TASK_TABLE.lock();
+    let mut table = percpu::TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
         task.io_context = Some(ctx);
     }
@@ -1963,7 +1967,7 @@ pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
 /// Remove the I/O context for a task (on exit)
 pub fn remove_task_io_context(tid: Tid) {
     let _old = {
-        let mut table = percpu::TASK_TABLE.lock();
+        let mut table = percpu::TASKLIST.write();
         table.get_mut(tid).and_then(|mut t| t.io_context.take())
     };
 }
@@ -2012,7 +2016,7 @@ pub const IOPRIO_WHO_USER: i32 = 3;
 
 /// The TLS pointer of task `tid` (None if unset)
 pub fn get_task_tls(tid: Tid) -> Option<u64> {
-    let table = percpu::TASK_TABLE.lock();
+    let table = percpu::TASKLIST.read();
     table
         .get(tid)
         .map(|t| t.task.tls.load(Ordering::Relaxed))
@@ -2022,7 +2026,7 @@ pub fn get_task_tls(tid: Tid) -> Option<u64> {
 /// Set the TLS pointer of task `tid` (the task itself, or ptrace on a
 /// stopped tracee)
 pub fn set_task_tls(tid: Tid, tls: u64) {
-    if let Some(t) = percpu::TASK_TABLE.lock().get(tid) {
+    if let Some(t) = percpu::TASKLIST.read().get(tid) {
         t.task.tls.store(tls, Ordering::Relaxed);
     }
 }
@@ -2036,7 +2040,7 @@ pub fn set_task_tls(tid: Tid, tls: u64) {
 
 /// Get the clear_child_tid pointer for a task
 pub fn get_clear_child_tid(tid: Tid) -> Option<u64> {
-    let table = percpu::TASK_TABLE.lock();
+    let table = percpu::TASKLIST.read();
     table
         .get(tid)
         .map(|t| t.clear_child_tid)
@@ -2045,7 +2049,7 @@ pub fn get_clear_child_tid(tid: Tid) -> Option<u64> {
 
 /// Set the clear_child_tid pointer for a task
 pub fn set_clear_child_tid(tid: Tid, addr: u64) {
-    let mut table = percpu::TASK_TABLE.lock();
+    let mut table = percpu::TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
         task.clear_child_tid = addr;
     }
@@ -2060,7 +2064,7 @@ pub fn set_clear_child_tid(tid: Tid, addr: u64) {
 
 /// Get and remove the set_child_tid pointer for a task (one-time use)
 pub fn get_set_child_tid(tid: Tid) -> Option<u64> {
-    let mut table = percpu::TASK_TABLE.lock();
+    let mut table = percpu::TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
         let addr = task.set_child_tid;
         if addr != 0 {
@@ -2074,7 +2078,7 @@ pub fn get_set_child_tid(tid: Tid) -> Option<u64> {
 /// Set the set_child_tid pointer for a task
 pub fn set_set_child_tid(tid: Tid, addr: u64) {
     if addr != 0 {
-        let mut table = percpu::TASK_TABLE.lock();
+        let mut table = percpu::TASKLIST.write();
         if let Some(mut task) = table.get_mut(tid) {
             task.set_child_tid = addr;
         }

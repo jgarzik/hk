@@ -15,7 +15,7 @@ use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::error::KernelError;
-use crate::task::percpu::TASK_TABLE;
+use crate::task::percpu::TASKLIST;
 
 // KCMP comparison types
 /// Compare file descriptors
@@ -149,7 +149,7 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
     }
 
     // Look up both tasks and extract the resources we need
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
 
     let task1 = match table.find(|t| t.task.pid == pid1) {
         Some(t) => t,
@@ -164,7 +164,7 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
     match kcmp_type {
         KCMP_FILE => {
             // Compare specific file descriptors; the tables are locked
-            // after TASK_TABLE is dropped (order: fd table -> TASK_TABLE)
+            // after TASKLIST is dropped (order: fd table -> TASKLIST)
             let (files1, files2) = (task1.files().cloned(), task2.files().cloned());
             drop(table);
             let ptr1 = match &files1 {

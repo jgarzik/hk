@@ -1,7 +1,7 @@
 //! Per-task file descriptor tables (Linux files_struct)
 //!
 //! Each task points at a `Files` table, shared by CLONE_FILES or copied
-//! by fork. `Task.files` is reached through TASK_TABLE; the table has
+//! by fork. `Task.files` is reached through TASKLIST; the table has
 //! its own lock.
 //!
 //! ## Locking
@@ -13,14 +13,14 @@
 //! and `FilesGuard` drops them after unlocking (Linux
 //! file_close_fd_locked, then filp_close/fput after spin_unlock).
 //! Likewise a task's last reference to its table is dropped after
-//! TASK_TABLE is released, never under it.
+//! TASKLIST is released, never under it.
 
 use crate::sync::spin::{Mutex, MutexGuard};
 use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
-use super::percpu::TASK_TABLE;
+use super::percpu::TASKLIST;
 use super::{FdTable, Tid};
 use crate::fs::File;
 
@@ -63,11 +63,11 @@ impl Drop for FilesGuard<'_> {
     }
 }
 
-/// Point `tid` at `files`; the table it had is dropped after TASK_TABLE
+/// Point `tid` at `files`; the table it had is dropped after TASKLIST
 /// is released
 pub fn init_task_fd(tid: Tid, files: Arc<Files>) {
     let old = {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         table
             .get_mut(tid)
             .and_then(|mut t| t.set_files(Some(files)))
@@ -82,16 +82,16 @@ pub fn get_task_fd(tid: Tid) -> Option<Arc<Files>> {
     if me.tid() == tid {
         return me.files();
     }
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     table.get(tid).and_then(|t| t.files().cloned())
 }
 
 /// Exit (Linux exit_files): drop the task's reference; the last one
-/// closes every descriptor, after TASK_TABLE is released (releasing a
-/// socket can sleep and the scheduler takes TASK_TABLE)
+/// closes every descriptor, after TASKLIST is released (releasing a
+/// socket can sleep and the scheduler takes TASKLIST)
 pub fn exit_task_fd(tid: Tid) {
     let files = {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         table.get_mut(tid).and_then(|mut t| t.set_files(None))
     };
     drop(files);

@@ -59,7 +59,7 @@ struct UserKeyrings {
 
 /// Task `tid` (its keyrings are `Task.keyrings`, Linux cred keyrings)
 fn task(tid: u64) -> Option<crate::task::percpu::TaskRef> {
-    crate::task::percpu::TASK_TABLE.lock().task(tid)
+    crate::task::percpu::TASKLIST.read().task(tid)
 }
 
 /// The keyrings of task `tid`

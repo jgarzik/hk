@@ -599,7 +599,7 @@ pub static CGROUP_ROOT: Lazy<Arc<CgroupRoot>> = Lazy::new(|| Arc::new(CgroupRoot
 
 /// Task `tid` (its cgroup is `Task.cgroup`, Linux task->cgroups)
 fn task(tid: Pid) -> Option<crate::task::percpu::TaskRef> {
-    crate::task::percpu::TASK_TABLE.lock().task(tid)
+    crate::task::percpu::TASKLIST.read().task(tid)
 }
 
 /// Get the cgroup for a task

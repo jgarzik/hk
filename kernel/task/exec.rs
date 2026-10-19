@@ -633,7 +633,7 @@ fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
         sig.end_exec(tid);
         r?;
     }
-    // Released after TASK_TABLE: the old leader and exited threads
+    // Released after TASKLIST: the old leader and exited threads
     drop(percpu::take_leadership(tgid, tid));
     Ok(())
 }

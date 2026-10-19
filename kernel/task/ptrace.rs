@@ -11,7 +11,7 @@
 //! needed for basic debugging and tracing.
 
 use crate::signal::{self, SIGKILL, SIGSTOP, SIGTRAP};
-use crate::task::percpu::{self, TASK_TABLE};
+use crate::task::percpu::{self, TASKLIST};
 use crate::task::{CAP_SYS_PTRACE, Pid, TaskState, Tid, capable};
 use crate::uaccess::{copy_from_user, copy_to_user};
 
@@ -188,7 +188,7 @@ fn ptrace_may_access(target_tid: Tid) -> bool {
 fn ptrace_check_attach(target_tid: Tid) -> Result<(), i64> {
     let caller_tid = percpu::current_tid();
 
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     let target = table.get(target_tid).ok_or(-ESRCH)?;
 
     // Check if we are the tracer
@@ -206,19 +206,19 @@ fn ptrace_check_attach(target_tid: Tid) -> Result<(), i64> {
 
 /// Find a task by PID (thread group leader)
 fn find_task_by_pid(pid: Pid) -> Option<Tid> {
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     table.find(|t| t.task.pid == pid).map(|t| t.task.tid())
 }
 
 /// Check if a task is being traced
 pub fn is_traced(tid: Tid) -> bool {
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     table.get(tid).map(|t| t.ptrace != 0).unwrap_or(false)
 }
 
 /// Check if syscall tracing is active for a task
 pub fn has_syscall_trace(tid: Tid) -> bool {
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     table
         .get(tid)
         .map(|t| t.ptrace & PT_SYSCALL_TRACE != 0)
@@ -227,7 +227,7 @@ pub fn has_syscall_trace(tid: Tid) -> bool {
 
 /// Check if single-step is active for a task
 pub fn has_singlestep(tid: Tid) -> bool {
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     table
         .get(tid)
         .map(|t| t.ptrace & PT_SINGLESTEP != 0)
@@ -244,7 +244,7 @@ pub fn has_singlestep(tid: Tid) -> bool {
 fn ptrace_traceme() -> i64 {
     let tid = percpu::current_tid();
 
-    let mut table = TASK_TABLE.lock();
+    let mut table = TASKLIST.write();
     let mut task = match table.get_mut(tid) {
         Some(t) => t,
         None => return -ESRCH,
@@ -292,7 +292,7 @@ fn ptrace_attach(target_pid: Pid) -> i64 {
     }
 
     {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         let mut target = match table.get_mut(target_tid) {
             Some(t) => t,
             None => return -ESRCH,
@@ -349,7 +349,7 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
     }
 
     {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         let mut target = match table.get_mut(target_tid) {
             Some(t) => t,
             None => return -ESRCH,
@@ -390,7 +390,7 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> i64 {
     }
 
     {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         let mut target = match table.get_mut(target_tid) {
             Some(t) => t,
             None => return -ESRCH,
@@ -437,7 +437,7 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
     }
 
     {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         let mut target = match table.get_mut(target_tid) {
             Some(t) => t,
             None => return -ESRCH,
@@ -492,7 +492,7 @@ fn ptrace_kill(target_pid: Pid) -> i64 {
     // Verify we are the tracer
     let caller_tid = percpu::current_tid();
     {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         let target = match table.get(target_tid) {
             Some(t) => t,
             None => return -ESRCH,
@@ -601,7 +601,7 @@ fn ptrace_setoptions(target_pid: Pid, options: u32) -> i64 {
     }
 
     {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         let mut target = match table.get_mut(target_tid) {
             Some(t) => t,
             None => return -ESRCH,
@@ -630,7 +630,7 @@ fn ptrace_geteventmsg(target_pid: Pid, data: u64) -> i64 {
     }
 
     let message = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         table.get(target_tid).map(|t| t.ptrace_message).unwrap_or(0)
     };
 
@@ -740,7 +740,7 @@ pub fn ptrace_stop(sig: u32) {
 
     // Set task state to Traced and wake tracer
     {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         let tracer_tid = if let Some(mut task) = table.get_mut(tid) {
             task.state = TaskState::Traced(sig as i32);
             task.ptracer_tid
@@ -775,7 +775,7 @@ pub fn ptrace_report_syscall(entry: bool) {
 
     // Get options to check for TRACESYSGOOD
     let options = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         table.get(tid).map(|t| t.ptrace_options).unwrap_or(0)
     };
 
@@ -788,7 +788,7 @@ pub fn ptrace_report_syscall(entry: bool) {
 
     // Store whether this is entry or exit in ptrace_message
     {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         if let Some(mut task) = table.get_mut(tid) {
             task.ptrace_message = if entry { 1 } else { 2 };
         }
@@ -864,8 +864,8 @@ pub fn may_read_proc(pid: crate::task::Pid) -> bool {
 /// caller that resolved a pid once checks the very task it then uses
 pub fn may_read_task(tid: Tid) -> bool {
     let me = percpu::current_pid();
-    let own = TASK_TABLE
-        .lock()
+    let own = TASKLIST
+        .read()
         .iter()
         .any(|t| t.task.tid() == tid && t.task.pid == me);
     own || may_access(|t| t.task.tid() == tid, true)
@@ -880,7 +880,7 @@ pub fn may_access(pick: impl Fn(&percpu::TaskView<'_>) -> bool, fscreds: bool) -
     use crate::task::dumpable::SUID_DUMP_USER;
     let me = percpu::current_cred();
     let target = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         table
             .find(|t| pick(t))
             .map(|t| (t.cred(), t.mm().map(|m| m.dumpable())))

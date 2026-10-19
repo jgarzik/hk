@@ -4,7 +4,7 @@
 //! for ptrace operations.
 
 use crate::task::Tid;
-use crate::task::percpu::TASK_TABLE;
+use crate::task::percpu::TASKLIST;
 
 // =============================================================================
 // User register structure (matches Linux struct user_pt_regs)
@@ -37,7 +37,7 @@ pub struct UserPtRegs {
 /// The tracee must be in Traced state. This reads from the task's saved
 /// user context (percpu state from syscall entry or trap frame).
 pub fn get_user_regs(tid: Tid) -> Result<UserPtRegs, i32> {
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     let task = table.get(tid).ok_or(-3i32)?; // ESRCH
 
     // Check task is in traced state
@@ -63,7 +63,7 @@ pub fn get_user_regs(tid: Tid) -> Result<UserPtRegs, i32> {
 /// The tracee must be in Traced state. This updates the task's saved
 /// user context so the registers take effect when it resumes.
 pub fn set_user_regs(tid: Tid, regs: &UserPtRegs) -> Result<(), i32> {
-    let mut table = TASK_TABLE.lock();
+    let mut table = TASKLIST.write();
     let mut task = table.get_mut(tid).ok_or(-3i32)?; // ESRCH
 
     // Check task is in traced state
@@ -109,7 +109,7 @@ const PSTATE_SS: u64 = 1 << 21;
 ///
 /// The CPU will generate a software step exception after one instruction.
 pub fn enable_single_step(tid: Tid) {
-    let mut table = TASK_TABLE.lock();
+    let mut table = TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
         // Set SS bit in SPSR (will be loaded into PSTATE on exception return)
         task.trap_frame.spsr |= PSTATE_SS;
@@ -123,7 +123,7 @@ pub fn enable_single_step(tid: Tid) {
 ///
 /// Clears the SS bit in PSTATE.
 pub fn disable_single_step(tid: Tid) {
-    let mut table = TASK_TABLE.lock();
+    let mut table = TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
         task.trap_frame.spsr &= !PSTATE_SS;
     }

@@ -12,7 +12,7 @@
 //! - `SigHand.action` uses `IrqSpinlock` because signal handlers may be queried
 //!   from interrupt context (page faults, timer interrupts)
 //! - A task's handler table (`Task.sighand`) and signal state
-//!   (`Task.signal_state`) live in its Task, under TASK_TABLE; the
+//!   (`Task.signal_state`) live in its Task, under TASKLIST; the
 //!   thread-group pending set is a `spin::Mutex`, taken under it
 //!
 //! See doc/LOCKING.md for full lock ordering.
@@ -659,10 +659,10 @@ impl Default for TaskSignalState {
 }
 
 // =============================================================================
-// Task signal accessors - uses Task struct fields directly via TASK_TABLE
+// Task signal accessors - uses Task struct fields directly via TASKLIST
 // =============================================================================
 
-use crate::task::percpu::TASK_TABLE;
+use crate::task::percpu::TASKLIST;
 
 // =============================================================================
 // Task Signal APIs
@@ -673,7 +673,7 @@ use crate::task::percpu::TASK_TABLE;
 /// Called when creating a new process (init, fork without CLONE_SIGHAND).
 /// Also initializes the SignalStruct (which contains rlimits).
 pub fn init_task_signal(tid: Tid, sighand: Arc<SigHand>) {
-    let mut table = TASK_TABLE.lock();
+    let mut table = TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
         task.sighand = Some(sighand);
         task.signal_state = TaskSignalState::new();
@@ -684,7 +684,7 @@ pub fn init_task_signal(tid: Tid, sighand: Arc<SigHand>) {
 
 /// Get a task's signal handlers
 pub fn get_task_sighand(tid: Tid) -> Option<Arc<SigHand>> {
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     table.get(tid).and_then(|t| t.sighand.clone())
 }
 
@@ -697,7 +697,7 @@ pub fn with_task_signal_state<F, R>(tid: Tid, f: F) -> Option<R>
 where
     F: FnOnce(&mut TaskSignalState) -> R,
 {
-    let mut table = TASK_TABLE.lock();
+    let mut table = TASKLIST.write();
     table.get_mut(tid).map(|mut t| {
         let r = f(&mut t.signal_state);
         t.signal_state.recalc_sigpending();
@@ -724,7 +724,7 @@ pub fn clone_task_signal(
 ) {
     // Get parent's sighand and signal_state
     let (parent_sighand, parent_state) = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         let parent = table.get(parent_tid);
         (
             parent.and_then(|p| p.sighand.clone()),
@@ -772,7 +772,7 @@ pub fn clone_task_signal(
 
     // Update child task
     {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         if let Some(mut child) = table.get_mut(child_tid) {
             child.sighand = Some(child_sighand);
             child.signal_state = child_state;
@@ -787,9 +787,9 @@ pub fn clone_task_signal(
 
 /// Clean up signal state on task exit
 pub fn exit_task_signal(tid: Tid) {
-    // Released after TASK_TABLE (nothing is released under it)
+    // Released after TASKLIST (nothing is released under it)
     let _old = {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         table.get_mut(tid).map(|mut task| {
             task.signal_state = TaskSignalState::new();
             task.task.set_sigpending(false);
@@ -818,7 +818,7 @@ pub fn fatal_signal_pending() -> bool {
         return false;
     }
     let tid = me.tid();
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     table.get(tid).is_some_and(|t| {
         let s = &t.signal_state;
         s.pending.signal.contains(SIGKILL) || s.shared_pending.lock().signal.contains(SIGKILL)
@@ -832,7 +832,7 @@ pub fn has_pending_signals(tid: Tid) -> bool {
     if me.tid() == tid {
         return me.sigpending();
     }
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     table.get(tid).map(|t| t.task.sigpending()).unwrap_or(false)
 }
 
@@ -862,13 +862,13 @@ fn sig_ignored(state: &TaskSignalState, sighand: Option<&Arc<SigHand>>, sig: u32
 /// Queues the signal and, if it is deliverable, wakes the task from an
 /// interruptible sleep (Linux signal_wake_up) so the blocked syscall can
 /// return -ERESTART*/-EINTR and the signal is delivered on the way out.
-/// Process context only (takes TASK_TABLE).
+/// Process context only (takes TASKLIST).
 ///
 /// Returns 0 on success, negative errno on error.
 pub fn send_signal(tid: Tid, sig: u32) -> i32 {
     if sig == 0 {
         // Signal 0 is null signal - just check if task exists
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         return if table.iter().any(|t| t.task.tid() == tid) {
             0
         } else {
@@ -883,8 +883,8 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
     // Kernel threads ignore every signal (Linux ignore_signals in
     // kthreadd): they are processes now (pid == tid), reachable by
     // kill(-1) and kill(pid)
-    let kthread = TASK_TABLE
-        .lock()
+    let kthread = TASKLIST
+        .read()
         .get(tid)
         .map(|t| t.task.has_flag(crate::task::pf::KTHREAD));
     match kthread {
@@ -935,7 +935,7 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
 /// has exited (Linux complete_signal picks a thread that wants it).
 pub fn send_signal_to_process(pid: Pid, sig: u32) -> i32 {
     let tid = {
-        let table = crate::task::percpu::TASK_TABLE.lock();
+        let table = crate::task::percpu::TASKLIST.read();
         let live = |t: &crate::task::percpu::TaskView<'_>| {
             t.task.pid == pid
                 && !t.task.has_flag(crate::task::pf::EXITING)
@@ -961,7 +961,7 @@ pub fn send_signal_to_process(pid: Pid, sig: u32) -> i32 {
 ///
 /// Returns 0 on success, negative errno on error.
 pub fn send_signal_to_pgrp(pgid: Pid, sig: u32) -> i32 {
-    use crate::task::percpu::TASK_TABLE;
+    use crate::task::percpu::TASKLIST;
 
     if sig == 0 || sig > 64 {
         return -22; // EINVAL
@@ -969,7 +969,7 @@ pub fn send_signal_to_pgrp(pgid: Pid, sig: u32) -> i32 {
 
     // Find all processes in this process group
     let tids: alloc::vec::Vec<Tid> = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         table
             .iter()
             .filter(|t| t.task.pgid() == pgid)
@@ -1018,7 +1018,7 @@ fn fatal(sighand: Option<&Arc<SigHand>>, sig: u32) -> bool {
 /// sees anything but SIGKILL first)
 fn group_kill(tid: Tid, sig: u32) {
     let found = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         table
             .get(tid)
             .map(|t| (t.task.pid, t.ptrace != 0, group_signal(&table, t.task.pid)))
@@ -1050,12 +1050,12 @@ fn group_signal(
 
 /// SIGKILL every thread of `tgid` that has not started exiting, but
 /// `except` (Linux zap_other_threads): queued privately, then woken
-/// from interruptible and killable sleeps once TASK_TABLE is dropped.
+/// from interruptible and killable sleeps once TASKLIST is dropped.
 /// A thread running user code dies at its next syscall or fault (IRQ
 /// return does no signal work yet, P7).
 fn zap_threads(tgid: Pid, except: Option<Tid>) {
     let tids: alloc::vec::Vec<Tid> = {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         table
             .iter_mut()
             .filter(|t| {
@@ -1080,7 +1080,7 @@ pub fn zap_group_others(tgid: Pid, tid: Tid) {
     zap_threads(tgid, Some(tid));
 }
 
-/// Queue SIGKILL for `t` (TASK_TABLE held)
+/// Queue SIGKILL for `t` (TASKLIST held)
 fn sigkill_task(t: &mut crate::task::percpu::TaskViewMut<'_>) {
     t.signal_state.pending.add(SIGKILL);
     t.signal_state.sigpending = true;
@@ -1093,7 +1093,7 @@ fn sigkill_task(t: &mut crate::task::percpu::TaskViewMut<'_>) {
 /// before saw it or is seen here.
 pub fn zap_new_thread(parent: Tid, child: Tid) {
     let dying = get_task_signal_struct(parent).is_some_and(|s| s.group_exit() != GroupExit::None);
-    if dying && let Some(mut t) = TASK_TABLE.lock().get_mut(child) {
+    if dying && let Some(mut t) = TASKLIST.write().get_mut(child) {
         sigkill_task(&mut t);
     }
 }
@@ -1466,7 +1466,7 @@ impl Default for SignalStruct {
 
 /// Get a task's signal struct
 pub fn get_task_signal_struct(tid: Tid) -> Option<Arc<SignalStruct>> {
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     table.get(tid).and_then(|t| t.signal.clone())
 }
 
@@ -1488,7 +1488,7 @@ fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool)
             .unwrap_or_else(|| Arc::new(SignalStruct::new()))
     };
 
-    let mut table = TASK_TABLE.lock();
+    let mut table = TASKLIST.write();
     if let Some(mut child) = table.get_mut(child_tid) {
         child.signal = Some(child_signal);
     }

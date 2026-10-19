@@ -2,7 +2,7 @@
 //! proc_pid_status / do_task_stat, fs/proc/base.c proc_pid_cmdline_read
 //! / environ_read)
 //!
-//! Locking: the task's fields are copied under TASK_TABLE, which is
+//! Locking: the task's fields are copied under TASKLIST, which is
 //! dropped before anything else is taken; then, one at a time and never
 //! nested, the address space's mmap_lock (VM sizes, page counts and the
 //! remote reads of cmdline/environ), the sighand action lock, the shared
@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 
 use crate::mm::{Mm, MmLayout, MmStruct, PROT_EXEC, PROT_WRITE, VM_GROWSDOWN, VM_SHARED};
-use crate::task::percpu::TASK_TABLE;
+use crate::task::percpu::TASKLIST;
 use crate::task::{Cred, Pid, TaskKind, TaskState, Tid};
 
 /// Linux PF_KTHREAD / PF_EXITING (stat field 9)
@@ -26,7 +26,7 @@ const NS_PER_TICK: u64 = 10_000_000;
 /// but exec caps the strings at 128 KiB)
 const ARGS_MAX: u64 = 128 * 1024;
 
-/// What /proc reads of a task, copied under TASK_TABLE
+/// What /proc reads of a task, copied under TASKLIST
 struct Snap {
     pid: Pid,
     tid: Tid,
@@ -66,9 +66,9 @@ struct Snap {
     files: Option<Arc<crate::task::fdtable::Files>>,
 }
 
-/// Copy process `pid` (its first task, the leader) out of TASK_TABLE
+/// Copy process `pid` (its first task, the leader) out of TASKLIST
 fn snap(pid: Pid) -> Option<Snap> {
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     let t = table.find(|t| t.task.pid == pid)?;
     let threads = table.iter().filter(|x| x.task.pid == pid).count() as u64;
     let tracer = t

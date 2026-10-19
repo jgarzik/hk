@@ -281,7 +281,7 @@ pub fn sys_times<A: crate::uaccess::UaccessArch>(buf: u64) -> i64 {
 /// * -EFAULT if copy to user fails
 ///
 /// # Locking
-/// Acquires TASK_TABLE lock to read task CPU times.
+/// Acquires TASKLIST lock to read task CPU times.
 ///
 /// # Implementation Notes
 /// Returns utime and stime for the current task/process. Other fields
@@ -431,7 +431,7 @@ use crate::task::prctl_ops::{PR_GET_TSC, PR_SET_TSC, PR_TSC_ENABLE, PR_TSC_SIGSE
 pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 {
     use crate::arch::Uaccess;
     use crate::task::dumpable::{SUID_DUMP_DISABLE, SUID_DUMP_USER};
-    use crate::task::percpu::{TASK_TABLE, current_tid};
+    use crate::task::percpu::{TASKLIST, current_tid};
     use crate::uaccess::{get_user, put_user};
 
     let tid = current_tid();
@@ -447,7 +447,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                 return KernelError::InvalidArgument.sysret();
             }
 
-            let mut table = TASK_TABLE.lock();
+            let mut table = TASKLIST.write();
             if let Some(mut task) = table.get_mut(tid) {
                 task.pdeath_signal = sig;
                 0
@@ -460,7 +460,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             // Get current parent death signal
             // arg2 is pointer to int where result is stored
             let sig = {
-                let table = TASK_TABLE.lock();
+                let table = TASKLIST.read();
                 match table.get(tid) {
                     Some(task) => task.pdeath_signal,
                     None => return KernelError::NoProcess.sysret(),
@@ -494,7 +494,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             name[15] = 0;
 
             // Update task's prctl state
-            let mut table = TASK_TABLE.lock();
+            let mut table = TASKLIST.write();
             if let Some(mut task) = table.get_mut(tid) {
                 task.prctl.name = name;
                 0
@@ -506,7 +506,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
         PR_GET_NAME => {
             // Get thread name and write to user buffer
             let name = {
-                let table = TASK_TABLE.lock();
+                let table = TASKLIST.read();
                 match table.get(tid) {
                     Some(task) => task.prctl.name,
                     None => return KernelError::NoProcess.sysret(),
@@ -555,7 +555,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                 return KernelError::InvalidArgument.sysret();
             }
 
-            let mut table = TASK_TABLE.lock();
+            let mut table = TASKLIST.write();
             if let Some(mut task) = table.get_mut(tid) {
                 task.prctl.no_new_privs = true;
                 0
@@ -566,7 +566,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
 
         PR_GET_NO_NEW_PRIVS => {
             // Return no_new_privs flag (0 or 1)
-            let table = TASK_TABLE.lock();
+            let table = TASKLIST.read();
             match table.get(tid) {
                 Some(task) => {
                     if task.prctl.no_new_privs {
@@ -584,7 +584,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             // arg2 of 0 resets to default (50,000 ns)
             let slack = if arg2 == 0 { 50_000 } else { arg2 };
 
-            let mut table = TASK_TABLE.lock();
+            let mut table = TASKLIST.write();
             if let Some(mut task) = table.get_mut(tid) {
                 task.prctl.timer_slack_ns = slack;
                 0
@@ -595,7 +595,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
 
         PR_GET_TIMERSLACK => {
             // Return timer slack in nanoseconds
-            let table = TASK_TABLE.lock();
+            let table = TASKLIST.read();
             match table.get(tid) {
                 Some(task) => task.prctl.timer_slack_ns as i64,
                 None => KernelError::NoProcess.sysret(),
@@ -620,7 +620,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                 return KernelError::InvalidArgument.sysret();
             }
 
-            let mut table = TASK_TABLE.lock();
+            let mut table = TASKLIST.write();
             if let Some(mut task) = table.get_mut(tid) {
                 task.prctl.keep_caps = arg2 != 0;
                 0
@@ -631,7 +631,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
 
         PR_GET_KEEPCAPS => {
             // Return keep capabilities flag (0 or 1)
-            let table = TASK_TABLE.lock();
+            let table = TASKLIST.read();
             match table.get(tid) {
                 Some(task) => {
                     if task.prctl.keep_caps {
@@ -647,7 +647,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
         PR_SET_CHILD_SUBREAPER => {
             // Set child subreaper flag
             // arg2: non-zero to set, zero to clear
-            let mut table = TASK_TABLE.lock();
+            let mut table = TASKLIST.write();
             if let Some(mut task) = table.get_mut(tid) {
                 task.prctl.child_subreaper = arg2 != 0;
                 0
@@ -660,7 +660,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             // Get child subreaper flag
             // Returns value via pointer (arg2 = int*)
             let is_subreaper = {
-                let table = TASK_TABLE.lock();
+                let table = TASKLIST.read();
                 match table.get(tid) {
                     Some(task) => task.prctl.child_subreaper,
                     None => return KernelError::NoProcess.sysret(),
@@ -680,7 +680,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             // Get TSC mode (x86-64 only)
             // arg2 = pointer to int for result
             let tsc_mode = {
-                let table = TASK_TABLE.lock();
+                let table = TASKLIST.read();
                 match table.get(tid) {
                     Some(task) => task.prctl.tsc_mode,
                     None => return KernelError::NoProcess.sysret(),
@@ -702,7 +702,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
                 return KernelError::InvalidArgument.sysret();
             }
 
-            let mut table = TASK_TABLE.lock();
+            let mut table = TASKLIST.write();
             if let Some(mut task) = table.get_mut(tid) {
                 task.prctl.tsc_mode = mode as u8;
                 // Note: Actually enabling TSC faulting requires CR4.TSD manipulation
@@ -715,7 +715,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
 
         PR_SET_THP_DISABLE => {
             // Disable transparent huge pages for this process
-            let mut table = TASK_TABLE.lock();
+            let mut table = TASKLIST.write();
             if let Some(mut task) = table.get_mut(tid) {
                 task.prctl.thp_disable = arg2 != 0;
                 0
@@ -726,7 +726,7 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
 
         PR_GET_THP_DISABLE => {
             // Get THP disable flag (returns 0 or 1)
-            let table = TASK_TABLE.lock();
+            let table = TASKLIST.read();
             match table.get(tid) {
                 Some(task) => {
                     if task.prctl.thp_disable {
@@ -1205,7 +1205,7 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
 
     // Check if process exists
     {
-        let table = super::percpu::TASK_TABLE.lock();
+        let table = super::percpu::TASKLIST.read();
         if !table.iter().any(|t| t.task.pid == target_pid) {
             return KernelError::NoProcess.sysret();
         }
@@ -1296,7 +1296,7 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i6
 
     // Check if process still exists
     {
-        let table = super::percpu::TASK_TABLE.lock();
+        let table = super::percpu::TASKLIST.read();
         if !table.iter().any(|t| t.task.pid == target_pid) {
             return KernelError::NoProcess.sysret();
         }
@@ -1399,7 +1399,7 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
 
 /// Find a task by PID (returns TID of the main thread)
 fn find_task_by_pid(pid: super::Pid) -> Option<super::Tid> {
-    let table = super::percpu::TASK_TABLE.lock();
+    let table = super::percpu::TASKLIST.read();
     table.find(|t| t.task.pid == pid).map(|t| t.task.tid())
 }
 
@@ -1419,7 +1419,7 @@ fn check_pidfd_getfd_permission(target_tid: super::Tid) -> bool {
 
     // Get target credentials from task table
     let target_euid = {
-        let table = super::percpu::TASK_TABLE.lock();
+        let table = super::percpu::TASKLIST.read();
         table.get(target_tid).map(|t| t.cred().euid)
     };
 

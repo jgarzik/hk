@@ -240,7 +240,7 @@ pub fn try_to_unuse(si: &Arc<SwapInfo>) -> Result<(), KernelError> {
 fn all_mms() -> Vec<Arc<super::Mm>> {
     let mut v: Vec<Arc<super::Mm>> = Vec::new();
     {
-        let table = crate::task::percpu::TASK_TABLE.lock();
+        let table = crate::task::percpu::TASKLIST.read();
         for mm in table.iter().filter_map(|t| t.mm_ref()) {
             if !v.iter().any(|m| Arc::ptr_eq(m, mm.arc())) {
                 v.push(mm.arc().clone());

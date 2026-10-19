@@ -337,9 +337,9 @@ struct TaskInfo {
 
 /// Get task information for accounting
 fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
-    use crate::task::percpu::TASK_TABLE;
+    use crate::task::percpu::TASKLIST;
 
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     let task = table.get(tid)?;
 
     // Get command name from prctl state

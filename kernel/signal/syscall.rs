@@ -172,7 +172,7 @@ pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oset_ptr: u64, sigsetsize: u64
     let tid = current_tid();
 
     // User memory is read before and written after the signal state is
-    // locked (TASK_TABLE: no user access under a spinlock), like Linux
+    // locked (TASKLIST: no user access under a spinlock), like Linux
     let new_set = if set_ptr != 0 {
         match get_user::<Uaccess, u64>(set_ptr) {
             Ok(v) => Some(SigSet::from_bits(v)),
@@ -270,7 +270,7 @@ pub fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
 /// 0 if permitted, -1 (EPERM) if denied, -3 (ESRCH) if target not found
 fn check_kill_permission(target_pid: u64, sig: u32) -> i32 {
     use crate::signal::SIGCONT;
-    use crate::task::percpu::{TASK_TABLE, current_sid, current_tid};
+    use crate::task::percpu::{TASKLIST, current_sid, current_tid};
     use crate::task::{CAP_KILL, capable, current_cred};
 
     let caller_tid = current_tid();
@@ -278,7 +278,7 @@ fn check_kill_permission(target_pid: u64, sig: u32) -> i32 {
 
     // Get target task info
     let target_info = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         // Find the thread group leader for this pid
         table
             .find(|t| t.task.pid == target_pid)
@@ -292,7 +292,7 @@ fn check_kill_permission(target_pid: u64, sig: u32) -> i32 {
 
     // Get caller's tgid
     let caller_tgid = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         table.get(caller_tid).map(|t| t.task.pid).unwrap_or(0)
     };
 
@@ -379,8 +379,8 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
         let pgid = (-pid) as u64;
         // Signal 0 is a validity check - check if pgrp exists
         if sig == 0 {
-            use crate::task::percpu::TASK_TABLE;
-            let table = TASK_TABLE.lock();
+            use crate::task::percpu::TASKLIST;
+            let table = TASKLIST.read();
             let exists = table.iter().any(|t| t.task.pgid() == pgid);
             return if exists { 0 } else { -3 }; // ESRCH if pgrp doesn't exist
         }
@@ -398,7 +398,7 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
 /// # Returns
 /// 0 on success, negative errno on error
 pub fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> i64 {
-    use crate::task::percpu::TASK_TABLE;
+    use crate::task::percpu::TASKLIST;
 
     if sig > 64 || tid <= 0 || tgid <= 0 {
         return -22; // EINVAL
@@ -406,7 +406,7 @@ pub fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> i64 {
 
     // Verify tid belongs to tgid (thread group validation)
     let valid = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         table
             .get(tid as u64)
             .map(|t| t.task.pid == tgid as u64)
@@ -486,7 +486,7 @@ pub fn sys_rt_sigqueueinfo(pid: i64, sig: u32, uinfo: u64) -> i64 {
 /// * -ESRCH: No such process/thread
 /// * -EFAULT: Bad uinfo pointer
 pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
-    use crate::task::percpu::TASK_TABLE;
+    use crate::task::percpu::TASKLIST;
 
     // Validate arguments
     if tid <= 0 || tgid <= 0 {
@@ -512,7 +512,7 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
 
     // Verify tid belongs to tgid (thread group validation)
     let valid = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         table
             .get(tid as u64)
             .map(|t| t.task.pid == tgid as u64)

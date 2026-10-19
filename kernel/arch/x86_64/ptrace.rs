@@ -4,7 +4,7 @@
 //! for ptrace operations.
 
 use crate::task::Tid;
-use crate::task::percpu::TASK_TABLE;
+use crate::task::percpu::TASKLIST;
 
 // =============================================================================
 // User register structure (matches Linux struct user_regs_struct)
@@ -70,7 +70,7 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
     // This is a simplified approach - full implementation would need to
     // handle the case where the task is stopped mid-syscall.
 
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     let task = table.get(tid).ok_or(-3i32)?; // ESRCH
 
     // Check task is in traced state
@@ -123,7 +123,7 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
 /// The tracee must be in Traced state. This updates the task's saved
 /// user context so the registers take effect when it resumes.
 pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
-    let mut table = TASK_TABLE.lock();
+    let mut table = TASKLIST.write();
     let mut task = table.get_mut(tid).ok_or(-3i32)?; // ESRCH
 
     // Check task is in traced state
@@ -195,7 +195,7 @@ const RFLAGS_TF: u64 = 0x100;
 /// Sets the TF (Trap Flag) in RFLAGS so the CPU generates a debug exception
 /// after executing one instruction.
 pub fn enable_single_step(tid: Tid) {
-    let mut table = TASK_TABLE.lock();
+    let mut table = TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
         task.trap_frame.rflags |= RFLAGS_TF;
     }
@@ -205,7 +205,7 @@ pub fn enable_single_step(tid: Tid) {
 ///
 /// Clears the TF (Trap Flag) in RFLAGS.
 pub fn disable_single_step(tid: Tid) {
-    let mut table = TASK_TABLE.lock();
+    let mut table = TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
         task.trap_frame.rflags &= !RFLAGS_TF;
     }

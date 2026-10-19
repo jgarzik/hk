@@ -68,7 +68,7 @@ pub fn sys_getcpu<A: crate::uaccess::UaccessArch>(cpu: u32, cpup: u64, nodep: u6
 /// * Negative errno on error (-ESRCH, -EINVAL)
 ///
 /// # Locking
-/// Acquires TASK_TABLE lock briefly to read priority.
+/// Acquires TASKLIST lock briefly to read priority.
 pub fn sys_getpriority(which: i32, who: u64, caller_pid: Pid) -> i64 {
     use super::{PRIO_PGRP, PRIO_PROCESS, PRIO_USER, priority_to_nice};
 
@@ -106,7 +106,7 @@ pub fn sys_getpriority(which: i32, who: u64, caller_pid: Pid) -> i64 {
 /// * Negative errno on error (-ESRCH, -EINVAL, -EACCES, -EPERM)
 ///
 /// # Locking
-/// Acquires TASK_TABLE lock briefly to modify priority.
+/// Acquires TASKLIST lock briefly to modify priority.
 ///
 /// # Permission Model
 /// - Root (euid=0): Can set any priority for any process
@@ -169,7 +169,7 @@ pub fn sys_setpriority(
 /// * Negative errno on error
 ///
 /// # Locking
-/// Acquires TASK_TABLE lock briefly to read policy.
+/// Acquires TASKLIST lock briefly to read policy.
 pub fn sys_sched_getscheduler(pid: i64, caller_pid: Pid) -> i64 {
     // pid < 0 is invalid
     if pid < 0 {
@@ -205,7 +205,7 @@ pub fn sys_sched_getscheduler(pid: i64, caller_pid: Pid) -> i64 {
 /// - Non-root: Can only set SCHED_NORMAL/BATCH/IDLE (not RT policies)
 ///
 /// # Locking
-/// Acquires TASK_TABLE lock to modify policy.
+/// Acquires TASKLIST lock to modify policy.
 pub fn sys_sched_setscheduler<A: crate::uaccess::UaccessArch>(
     pid: i64,
     policy: i32,
@@ -270,7 +270,7 @@ pub fn sys_sched_setscheduler<A: crate::uaccess::UaccessArch>(
 /// * Negative errno on error
 ///
 /// # Locking
-/// Acquires TASK_TABLE lock briefly to read parameters.
+/// Acquires TASKLIST lock briefly to read parameters.
 pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
     pid: i64,
     param_ptr: u64,
@@ -333,7 +333,7 @@ pub fn sys_sched_getparam<A: crate::uaccess::UaccessArch>(
 /// - Non-root: Can only set parameters for non-RT policies
 ///
 /// # Locking
-/// Acquires TASK_TABLE lock to modify parameters.
+/// Acquires TASKLIST lock to modify parameters.
 pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
     pid: i64,
     param_ptr: u64,
@@ -399,7 +399,7 @@ pub fn sys_sched_setparam<A: crate::uaccess::UaccessArch>(
 /// * Negative errno on error
 ///
 /// # Locking
-/// Acquires TASK_TABLE lock briefly to read affinity mask.
+/// Acquires TASKLIST lock briefly to read affinity mask.
 pub fn sys_sched_getaffinity<A: crate::uaccess::UaccessArch>(
     pid: i64,
     cpusetsize: u64,
@@ -467,7 +467,7 @@ fn cpumask_size() -> usize {
 /// - Setting another process's affinity requires CAP_SYS_NICE (or root)
 ///
 /// # Locking
-/// Acquires TASK_TABLE lock to modify affinity mask.
+/// Acquires TASKLIST lock to modify affinity mask.
 pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
     pid: i64,
     cpusetsize: u64,
@@ -528,7 +528,7 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
 /// * Negative errno on error
 ///
 /// # Locking
-/// Acquires TASK_TABLE lock briefly to read policy.
+/// Acquires TASKLIST lock briefly to read policy.
 pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(
     pid: i64,
     tp_ptr: u64,

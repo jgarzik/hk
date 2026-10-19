@@ -150,7 +150,7 @@ pub fn check_syscall(
 ///
 /// Uses a two-level check for performance:
 /// 1. Fast path: Check per-CPU cached seccomp_mode (no lock required)
-/// 2. Slow path: Only if seccomp is enabled, lock TASK_TABLE to get filter
+/// 2. Slow path: Only if seccomp is enabled, lock TASKLIST to get filter
 #[allow(clippy::too_many_arguments)]
 fn check_syscall_impl(
     nr: u64,
@@ -171,11 +171,11 @@ fn check_syscall_impl(
         return None;
     }
 
-    // Slow path: seccomp is enabled, need to get filter from TASK_TABLE
-    use crate::task::percpu::TASK_TABLE;
+    // Slow path: seccomp is enabled, need to get filter from TASKLIST
+    use crate::task::percpu::TASKLIST;
 
     let filter = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         // No task found -> allow (shouldn't happen)
         let task = table.get(me.tid())?;
         task.seccomp_filter.clone()

@@ -284,10 +284,10 @@ fn futex_bucket(key: &FutexKey) -> &'static FutexHashBucket {
 }
 
 // =============================================================================
-// Robust Futex Support - uses Task.robust_list field via TASK_TABLE
+// Robust Futex Support - uses Task.robust_list field via TASKLIST
 // =============================================================================
 
-use crate::task::percpu::TASK_TABLE;
+use crate::task::percpu::TASKLIST;
 
 /// Robust list head structure (matches Linux ABI)
 #[repr(C)]
@@ -378,13 +378,13 @@ fn read_user_timeout(timeout_ptr: u64) -> Result<Option<u64>, i32> {
 
 /// Get current task's TID, PID, and priority
 fn get_current_task_info() -> (Tid, u64, Priority) {
-    use crate::task::percpu::{TASK_TABLE, current_pid, current_tid};
+    use crate::task::percpu::{TASKLIST, current_pid, current_tid};
 
     let tid = current_tid();
     let pid = current_pid();
 
     let priority = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         table.get(tid).map(|t| t.priority).unwrap_or(128)
     };
 
@@ -727,7 +727,7 @@ pub fn sys_set_robust_list(head: u64, len: u64) -> i32 {
 
     let tid = crate::task::percpu::current_tid();
 
-    let mut table = TASK_TABLE.lock();
+    let mut table = TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
         task.robust_list = head;
     }
@@ -759,8 +759,8 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
         pid as Tid
     };
 
-    let head = TASK_TABLE
-        .lock()
+    let head = TASKLIST
+        .read()
         .get(target_tid)
         .map(|t| t.robust_list)
         .unwrap_or(0);
@@ -790,7 +790,7 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
 pub fn exit_robust_list(tid: Tid, pid: u64) {
     // Get and remove robust list for this task
     let head_addr = {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         if let Some(mut task) = table.get_mut(tid) {
             let addr = task.robust_list;
             task.robust_list = 0;

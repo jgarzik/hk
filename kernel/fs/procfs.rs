@@ -41,8 +41,8 @@ fn current_time() -> Timespec {
 ///
 /// Looks up the PID in the global task table.
 fn task_exists(pid: Pid) -> bool {
-    use crate::task::percpu::TASK_TABLE;
-    let table = TASK_TABLE.lock();
+    use crate::task::percpu::TASKLIST;
+    let table = TASKLIST.read();
     table.iter().any(|t| t.task.pid == pid)
 }
 
@@ -56,8 +56,8 @@ pub fn task_exists_pub(pid: Pid) -> bool {
 /// Looks up the PID in the global task table and returns the TID.
 /// Returns None if no task with the given PID exists.
 pub fn get_tid_for_pid(pid: Pid) -> Option<crate::task::Tid> {
-    use crate::task::percpu::TASK_TABLE;
-    let table = TASK_TABLE.lock();
+    use crate::task::percpu::TASKLIST;
+    let table = TASKLIST.read();
     table.find(|t| t.task.pid == pid).map(|t| t.task.tid())
 }
 
@@ -530,8 +530,8 @@ impl InodeOps for ProcfsInodeOps {
 /// Create a /proc/<pid> directory inode
 /// The live threads (tids) of process `pid`
 fn group_threads(pid: Pid) -> alloc::vec::Vec<crate::task::Tid> {
-    use crate::task::percpu::TASK_TABLE;
-    let table = TASK_TABLE.lock();
+    use crate::task::percpu::TASKLIST;
+    let table = TASKLIST.read();
     table
         .iter()
         .filter(|t| t.task.pid == pid && !matches!(t.state, crate::task::TaskState::Zombie(_)))
@@ -1054,8 +1054,8 @@ fn pid_file(name: &str) -> Option<(u64, u16, PidGen)> {
 /// euid/egid while it is dumpable, else root, so a non-dumpable task's
 /// mode-0400 files are root's
 fn dump_owner(pid: Pid) -> (u32, u32) {
-    use crate::task::percpu::TASK_TABLE;
-    let table = TASK_TABLE.lock();
+    use crate::task::percpu::TASKLIST;
+    let table = TASKLIST.read();
     table
         .find(|t| t.task.pid == pid)
         .filter(|t| {
@@ -1143,7 +1143,7 @@ fn gen_maps(_: &crate::mm::Mm, mm: &crate::mm::MmStruct) -> Vec<u8> {
 /// Get the cgroup path for a task (virtualized to its namespace)
 fn get_task_cgroup_path(pid: Pid) -> String {
     use crate::ns::INIT_CGROUP_NS;
-    use crate::task::percpu::TASK_TABLE;
+    use crate::task::percpu::TASKLIST;
 
     // Get the task's TID to look up its cgroup namespace
     let tid = match get_tid_for_pid(pid) {
@@ -1153,7 +1153,7 @@ fn get_task_cgroup_path(pid: Pid) -> String {
 
     // Get the task's cgroup
     let task_cgroup = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         if let Some(task) = table.get(tid) {
             // Try to get from TASK_CGROUP mapping
             task.task.cgroup.lock().clone()
@@ -1172,7 +1172,7 @@ fn get_task_cgroup_path(pid: Pid) -> String {
 
     // Get the task's cgroup namespace
     let cgroup_ns = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         if let Some(task) = table.get(tid) {
             if let Some(ref nsproxy) = task.nsproxy {
                 nsproxy.cgroup_ns.clone()
@@ -1493,11 +1493,11 @@ const PID_POS: u64 = 256;
 /// Emit PID directory entries for /proc readdir; a PID's position is
 /// PID_POS + pid (Linux proc_pid_readdir), stable while others exit
 fn readdir_emit_pids(proc_ino: u64, ctx: &mut DirContext) -> Result<(), KernelError> {
-    use crate::task::percpu::TASK_TABLE;
+    use crate::task::percpu::TASKLIST;
 
     // Collect PIDs first to release lock quickly (sorted, unique)
     let pids: alloc::collections::BTreeSet<Pid> = {
-        let table = TASK_TABLE.lock();
+        let table = TASKLIST.read();
         table
             .iter()
             .map(|t| t.task.pid)

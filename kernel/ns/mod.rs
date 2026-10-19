@@ -14,12 +14,12 @@
 //!
 //! ## Locking
 //!
-//! - `TASK_TABLE`: Protects task struct access (including nsproxy field)
+//! - `TASKLIST`: Protects task struct access (including nsproxy field)
 //! - Per-namespace data: `crate::sync::spin::RwLock` (read-heavy)
 //!
 //! ## Lock Ordering
 //!
-//! VFS locks → Namespace locks → Filesystem context → Per-CPU scheduler → TASK_TABLE
+//! VFS locks → Namespace locks → Filesystem context → Per-CPU scheduler → TASKLIST
 
 pub mod cgroup;
 pub mod net;
@@ -380,17 +380,17 @@ pub static INIT_NSPROXY: Lazy<Arc<NsProxy>> = Lazy::new(|| Arc::new(NsProxy::new
 // ============================================================================
 
 // =============================================================================
-// Task NS accessors - uses Task.nsproxy field directly via TASK_TABLE
+// Task NS accessors - uses Task.nsproxy field directly via TASKLIST
 // =============================================================================
 
-use crate::task::percpu::TASK_TABLE;
+use crate::task::percpu::TASKLIST;
 
 /// Initialize nsproxy for a new task
 ///
 /// Called when creating a new task to set up its namespace context.
 pub fn init_task_ns(tid: Tid, nsproxy: Arc<NsProxy>) {
     let old = {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         table
             .get_mut(tid)
             .and_then(|mut t| t.nsproxy.replace(nsproxy))
@@ -402,7 +402,7 @@ pub fn init_task_ns(tid: Tid, nsproxy: Arc<NsProxy>) {
 ///
 /// Returns a cloned Arc (increments refcount).
 pub fn get_task_ns(tid: Tid) -> Option<Arc<NsProxy>> {
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     table.get(tid).and_then(|t| t.nsproxy.clone())
 }
 
@@ -410,11 +410,11 @@ pub fn get_task_ns(tid: Tid) -> Option<Arc<NsProxy>> {
 ///
 /// This decrements the Arc refcount. If this was the last reference
 /// (no other tasks sharing this NsProxy), the NsProxy is dropped,
-/// which in turn drops the namespace references (after TASK_TABLE is
+/// which in turn drops the namespace references (after TASKLIST is
 /// released: a network namespace's teardown takes RTNL).
 pub fn exit_task_ns(tid: Tid) {
     let ns = {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         table.get_mut(tid).and_then(|mut t| t.nsproxy.take())
     };
     drop(ns);

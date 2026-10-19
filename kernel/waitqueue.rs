@@ -13,7 +13,7 @@
 //!   take scheduler ticks and return the ticks left.
 //! - Wakers (`wake_one`/`wake_all`) may run in any context, including IRQ
 //!   handlers: the queue lock is an `IrqSpinlock`, the task wakeup only
-//!   takes run-queue locks (never TASK_TABLE), and nothing on the wake
+//!   takes run-queue locks (never TASKLIST), and nothing on the wake
 //!   path allocates.
 //!
 //! ## Usage

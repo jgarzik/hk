@@ -51,6 +51,10 @@ pub struct Pid {
     pub level: u32,
     /// Its number at each level, root first
     numbers: Box<[UPid]>,
+    /// The task it names (Linux pid->tasks[PIDTYPE_PID]): a
+    /// `*const KernelTask` set and cleared under TASKLIST's write lock
+    /// while the task is in the task list
+    task: AtomicPtr<()>,
 }
 
 impl Pid {
@@ -63,6 +67,17 @@ impl Pid {
     pub fn nr_in(&self, ns: &PidNamespace) -> Option<u32> {
         let u = self.numbers.get(ns.level as usize)?;
         core::ptr::eq(Arc::as_ptr(&u.ns), ns).then_some(u.nr)
+    }
+
+    /// The task it names (null if none: not yet attached, or released)
+    pub fn task(&self) -> *const () {
+        self.task.load(Ordering::Acquire)
+    }
+
+    /// Attach (non-null) or detach (null) its task; TASKLIST held for
+    /// writing
+    pub fn set_task(&self, t: *const ()) {
+        self.task.store(t as *mut (), Ordering::Release);
     }
 
     /// The namespace it was created in
@@ -227,6 +242,7 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Option<Arc<
     let pid = Arc::new(Pid {
         level: numbers.len() as u32 - 1,
         numbers: numbers.into_boxed_slice(),
+        task: AtomicPtr::new(core::ptr::null_mut()),
     });
     let _g = PIDMAP_LOCK.lock();
     for u in pid.numbers.iter() {

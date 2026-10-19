@@ -133,15 +133,15 @@ impl FsStruct {
 // =============================================================================
 
 // =============================================================================
-// Task FS accessors - uses Task.fs field directly via TASK_TABLE
+// Task FS accessors - uses Task.fs field directly via TASKLIST
 // =============================================================================
 
-use crate::task::percpu::TASK_TABLE;
+use crate::task::percpu::TASKLIST;
 
 /// Initialize filesystem context for a new task
 pub fn init_task_fs(tid: Tid, fs: Arc<FsStruct>) {
     let old = {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         table.get_mut(tid).and_then(|mut t| t.fs.replace(fs))
     };
     drop(old);
@@ -149,7 +149,7 @@ pub fn init_task_fs(tid: Tid, fs: Arc<FsStruct>) {
 
 /// Get the FsStruct for a task (returns cloned Arc)
 pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
-    let table = TASK_TABLE.lock();
+    let table = TASKLIST.read();
     table.get(tid).and_then(|t| t.fs.clone())
 }
 
@@ -158,10 +158,10 @@ pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
 /// This decrements the Arc refcount. If this was the last reference
 /// (no other tasks sharing this FsStruct), the FsStruct is dropped,
 /// which in turn drops the Path references to pwd and root (after
-/// TASK_TABLE is released: nothing is released under it).
+/// TASKLIST is released: nothing is released under it).
 pub fn exit_task_fs(tid: Tid) {
     let fs = {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         table.get_mut(tid).and_then(|mut t| t.fs.take())
     };
     drop(fs);
