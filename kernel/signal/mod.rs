@@ -20,6 +20,7 @@
 pub mod syscall;
 
 use crate::sync::spin::Mutex;
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -447,15 +448,22 @@ impl SigPending {
 /// handlers. Protected by IrqSpinlock because signal handlers may be queried
 /// from interrupt context (e.g., page faults generating SIGSEGV).
 pub struct SigHand {
-    /// Signal actions indexed by signal number (index 0 unused, 1-64 valid)
-    action: IrqSpinlock<[SigAction; 65]>,
+    /// Signal actions indexed by signal number (index 0 unused, 1-64
+    /// valid), built in the heap: a 65-entry array moved through fork's
+    /// stack frames used ~9 KB of the 16 KB kernel stack
+    action: IrqSpinlock<Box<[SigAction]>>,
+}
+
+/// A handler table with every action at its default
+fn default_actions() -> Box<[SigAction]> {
+    alloc::vec![SigAction::new(); 65].into_boxed_slice()
 }
 
 impl SigHand {
     /// Create a new signal handler table with all defaults
     pub fn new() -> Self {
         Self {
-            action: IrqSpinlock::new(core::array::from_fn(|_| SigAction::new())),
+            action: IrqSpinlock::new(default_actions()),
         }
     }
 
@@ -490,13 +498,11 @@ impl SigHand {
     ///
     /// Creates a new SigHand with copies of all signal actions.
     pub fn deep_clone(self: &Arc<Self>) -> Arc<Self> {
-        let actions = self.action.lock();
-        let mut new_actions: [SigAction; 65] = core::array::from_fn(|_| SigAction::new());
-        for i in 0..65 {
-            new_actions[i] = actions[i].clone();
-        }
+        // Allocated before the lock is taken: SigHand.action stays a leaf
+        let mut actions = default_actions();
+        actions.clone_from_slice(&self.action.lock());
         Arc::new(Self {
-            action: IrqSpinlock::new(new_actions),
+            action: IrqSpinlock::new(actions),
         })
     }
 

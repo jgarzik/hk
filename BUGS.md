@@ -354,22 +354,27 @@ Nothing in hk can avoid it. Next: check the BIOS for Intel default
 power/turbo settings and current microcode, stress-test CPUs 2 and 5,
 or keep gate QEMUs off them (taskset) and see whether the crash stops.
 
-## arm check-arm stalls or QEMU dies right after MOUNT_UMOUNT_TEST_PASSED (next batch)
+## Kernel stacks have no guard page; interrupts run on the task stack
 
-**Location**: unknown; `user/boot_tester/tests/fs_ops.rs` Part 4
-(`mount_vfat`), `kernel/usb/` (xHCI, mass storage), `kernel/fs/vfat.rs`
+**Location**: `kernel/task/percpu.rs` (kernel stacks from the direct
+map), `kernel/arch/aarch64/vectors.S`, `kernel/arch/x86_64/` (IRQ entry)
 
-3× in C1 gating (2026-10-19, check-arm in `make gate`, 4 boots in
-parallel): twice QEMU died 88-98 s into the boot (the host kernel
-logged a qemu-system-aarch64 segfault / general protection fault at
-the same time, 00:25 and 01:24 UTC), once the boot hung until the
-600 s timeout with no host fault. Each time the last guest line was
-MOUNT_UMOUNT_TEST_PASSED. The next test is `mount_vfat`: it mounts the
-USB mass-storage disk (`/dev/sda`, xHCI + usb-storage) as vfat at
-/vfat_test, then runs the normalized VFAT file tests. The same spot in
-all three points at the guest (USB/SCSI I/O or the vfat mount) rather
-than random host noise; compare the QEMU crash entry above. Not
-reproduced in 6 looped gates and 4 check-arm runs of the same commit.
+A 16 KB kernel stack is contiguous direct-map memory with nothing
+mapped-out below it, and an interrupt pushes its trap frame (0x320
+bytes on arm64, with the FP/SIMD registers) and handler frames onto
+whatever task stack it lands on. A path that runs too deep therefore
+overwrites the page below the stack silently, and only when an IRQ
+arrives at the deepest point. That was the arm check-arm stall: fork's
+`clone_task_signal` kept a 9 KB frame (65-entry signal action arrays
+moved by value), fork left 472 bytes, a timer IRQ there wrote into the
+slab page below, and a later kmalloc panicked on the broken free list
+(the boot then sat at "System halted" until the 600 s timeout). Fixed by
+building the action table in the heap; `check_stack_usage` (Linux
+CONFIG_DEBUG_STACK_USAGE) now prints STACK:FAIL when an exiting task
+left less than 4 KB, which catches a deep path deterministically, but
+only for tasks that exit. Linux has vmap'ed stacks with guard pages
+(CONFIG_VMAP_STACK) and, on arm64, per-CPU IRQ stacks. The rare
+instruction abort below may be an earlier overflow of this kind.
 
 ## Rare arm64 kernel instruction abort in the fault-signal tests
 

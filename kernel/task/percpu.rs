@@ -233,10 +233,37 @@ pub struct DeadTask {
     task: Option<TaskRef>,
 }
 
+/// Stack an exiting task must have left untouched: room for an
+/// interrupt (trap frame with the FP/SIMD registers, handler, tick work)
+/// on top of the deepest syscall path
+const STACK_MIN_LEFT: usize = 4096;
+
+/// Linux CONFIG_DEBUG_STACK_USAGE check_stack_usage: kernel stacks start
+/// zeroed, so the untouched bottom shows how deep the task ever went.
+/// There is no guard page: a path that leaves too little room lets the
+/// next interrupt write into the page below the stack. Reported once.
+fn check_stack_usage(base: u64, size: usize) {
+    // SAFETY: the dead task's stack, still owned and no longer in use
+    let words = unsafe { core::slice::from_raw_parts(base as *const u64, size / 8) };
+    let left = words.iter().position(|&w| w != 0).unwrap_or(words.len()) * 8;
+    if left < STACK_MIN_LEFT {
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            printkln!(
+                "STACK:FAIL kernel stack nearly overflowed: {} of {} bytes left (need {})",
+                left,
+                size,
+                STACK_MIN_LEFT
+            );
+        }
+    }
+}
+
 impl Drop for DeadTask {
     fn drop(&mut self) {
         let (base, size) = self.stack;
         if size != 0 {
+            check_stack_usage(base, size);
             let phys = crate::arch::virt_to_phys(base);
             for off in (0..size as u64).step_by(PAGE_SIZE as usize) {
                 crate::FRAME_ALLOCATOR.free(phys + off);

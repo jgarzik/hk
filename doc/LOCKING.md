@@ -1984,7 +1984,7 @@ state patterns.
 | `Task.signal_state` | `TaskSignalState` under TASK_TABLE | Blocked mask, private pending set |
 | `Task.tif_sigpending` | `AtomicBool`, recomputed under TASK_TABLE | Pending-signal flag (Linux TIF_SIGPENDING) |
 | `TaskSignalState.shared_pending` | `Arc<spin::Mutex<SigPending>>` | Thread-group pending set |
-| `SigHand.action` | `IrqSpinlock<[SigAction; 65]>` | Signal handler table |
+| `SigHand.action` | `IrqSpinlock<Box<[SigAction]>>` (65 entries) | Signal handler table |
 | `SignalStruct.rlim` | `IrqSpinlock<[RLimit; N]>` | Resource limits (leaf) |
 
 #### Why SigHand.action Uses IrqSpinlock
