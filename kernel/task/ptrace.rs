@@ -205,7 +205,7 @@ fn ptrace_check_attach(target_tid: Tid) -> Result<(), i64> {
 /// Find a task by PID (thread group leader)
 fn find_task_by_pid(pid: Pid) -> Option<Tid> {
     let table = TASKLIST.read();
-    table.find(|t| t.task.pid == pid).map(|t| t.task.tid())
+    table.get(pid).map(|t| t.task.tid())
 }
 
 /// Check if a task is being traced

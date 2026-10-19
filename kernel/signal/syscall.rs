@@ -281,7 +281,7 @@ fn check_kill_permission(target_pid: u64, sig: u32) -> i32 {
         let table = TASKLIST.read();
         // Find the thread group leader for this pid
         table
-            .find(|t| t.task.pid == target_pid)
+            .get(target_pid)
             .map(|t| (t.task.pid, t.task.sid(), t.cred_arc()))
     };
 

@@ -27,17 +27,13 @@
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
 use crate::poll::{POLLHUP, POLLIN, POLLRDNORM, PollTable};
 use crate::task::Pid;
-use crate::waitqueue::WaitQueue;
 
 /// Pidfd flags (from Linux uapi)
 pub mod pidfd_flags {
@@ -45,105 +41,41 @@ pub mod pidfd_flags {
     pub const PIDFD_NONBLOCK: u32 = 0o4000; // O_NONBLOCK
 }
 
-/// Internal pidfd state
-struct PidfdInner {
-    /// The process ID this pidfd refers to
-    pid: Pid,
-    /// Whether the process has exited
-    exited: bool,
-    /// Exit status (valid only if exited is true)
-    exit_status: i32,
-}
-
-impl PidfdInner {
-    fn new(pid: Pid) -> Self {
-        Self {
-            pid,
-            exited: false,
-            exit_status: 0,
-        }
-    }
-}
-
-/// Pidfd structure
+/// A pidfd (Linux: the file's private data is the struct pid): a
+/// reference to the process's leader `Pid`, so a recycled number never
+/// names another process
 pub struct Pidfd {
-    /// Inner state protected by IRQ spinlock
-    inner: IrqSpinlock<PidfdInner>,
-    /// Wait queue for poll/blocking operations
-    wait_queue: WaitQueue,
-    /// Unique ID for this pidfd (for registry)
-    id: u64,
+    pid: Arc<crate::task::pid::Pid>,
 }
-
-/// Global counter for pidfd IDs
-static NEXT_PIDFD_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Global pidfd registry (maps ID -> weak ref)
-/// Used to notify pidfds when processes exit
-static PIDFD_REGISTRY: IrqSpinlock<Vec<(u64, Weak<Pidfd>)>> = IrqSpinlock::new(Vec::new());
 
 impl Pidfd {
-    /// Create a new pidfd for the given process
-    pub fn new(pid: Pid) -> Arc<Self> {
-        let id = NEXT_PIDFD_ID.fetch_add(1, Ordering::Relaxed);
-        let pidfd = Arc::new(Self {
-            inner: IrqSpinlock::new(PidfdInner::new(pid)),
-            wait_queue: WaitQueue::new(),
-            id,
-        });
-
-        // Register in global registry
-        let weak = Arc::downgrade(&pidfd);
-        PIDFD_REGISTRY.lock().push((id, weak));
-
-        pidfd
-    }
-
-    /// Get the PID this pidfd refers to
+    /// The process's pid
     pub fn pid(&self) -> Pid {
-        self.inner.lock().pid
+        self.pid.nr() as Pid
     }
 
-    /// Check if the process has exited
+    /// Its `Pid`
+    pub fn pid_ref(&self) -> &Arc<crate::task::pid::Pid> {
+        &self.pid
+    }
+
     pub fn is_exited(&self) -> bool {
-        self.inner.lock().exited
+        self.pid.exited().is_some()
     }
 
-    /// Mark the process as exited with the given status
-    /// Called from mark_zombie() when process exits
-    pub fn notify_exit(&self, status: i32) {
-        {
-            let mut inner = self.inner.lock();
-            inner.exited = true;
-            inner.exit_status = status;
-        }
-        // Wake all waiters
-        self.wait_queue.wake_all();
-    }
-
-    /// Poll for process exit
     pub fn poll(&self, pt: Option<&mut PollTable>) -> u16 {
         if let Some(poll_table) = pt {
-            poll_table.poll_wait(&self.wait_queue);
+            poll_table.poll_wait(&self.pid.wait_pidfd);
         }
-
-        let inner = self.inner.lock();
-        if inner.exited {
+        if self.is_exited() {
             // Process has exited - return readable + hangup
             POLLIN | POLLRDNORM | POLLHUP
         } else {
             0
         }
     }
-
-    /// Release the pidfd (unregister from global registry)
-    fn release(&self) {
-        let mut registry = PIDFD_REGISTRY.lock();
-        registry.retain(|(id, _)| *id != self.id);
-    }
 }
 
-/// File operations for pidfd
 pub struct PidfdFileOps;
 
 static PIDFD_FOPS: PidfdFileOps = PidfdFileOps;
@@ -170,9 +102,7 @@ impl FileOps for PidfdFileOps {
         pidfd.poll(pt)
     }
 
-    fn release(&self, file: &File) -> Result<(), KernelError> {
-        let pidfd = file.private_ref::<Pidfd>().ok_or(KernelError::BadFd)?;
-        pidfd.release();
+    fn release(&self, _file: &File) -> Result<(), KernelError> {
         Ok(())
     }
 }
@@ -186,7 +116,10 @@ impl FileOps for PidfdFileOps {
 /// # Returns
 /// Arc<File> for the new pidfd
 pub fn create_pidfd(pid: Pid, file_flags: u32) -> Result<Arc<File>, KernelError> {
-    let pidfd = Pidfd::new(pid);
+    let nr = u32::try_from(pid).map_err(|_| KernelError::NoProcess)?;
+    let pid =
+        crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr).ok_or(KernelError::NoProcess)?;
+    let pidfd = Arc::new(Pidfd { pid });
 
     // Create dummy dentry for pidfd
     let dentry = create_pidfd_dentry()?;
@@ -222,14 +155,12 @@ fn create_pidfd_dentry() -> Result<Arc<Dentry>, KernelError> {
 /// Notify all pidfds for the given PID that the process has exited
 ///
 /// Called from mark_zombie() when a process transitions to zombie state.
+/// Process `pid` has exited with wait `status` (its last thread): its
+/// pidfds become readable
 pub fn notify_process_exit(pid: Pid, status: i32) {
-    let registry = PIDFD_REGISTRY.lock();
-    for (_, weak) in registry.iter() {
-        if let Some(pidfd) = weak.upgrade()
-            && pidfd.pid() == pid
-        {
-            pidfd.notify_exit(status);
-        }
+    let Ok(nr) = u32::try_from(pid) else { return };
+    if let Some(p) = crate::task::pid::find_pid(&crate::ns::INIT_PID_NS, nr) {
+        p.set_exited(status);
     }
 }
 
@@ -245,6 +176,18 @@ pub fn get_pidfd(file: &File) -> Option<Arc<Pidfd>> {
 /// Returns the PID if the file is a pidfd, None otherwise.
 pub fn get_pidfd_pid(file: &File) -> Option<Pid> {
     get_pidfd(file).map(|pidfd| pidfd.pid())
+}
+
+/// The pid of a pidfd's process while it is still in the task list
+/// (not yet reaped): EBADF for another file, ESRCH once it is gone, so
+/// a number reused later never reaches another process
+pub fn pidfd_live_pid(file: &File) -> Result<Pid, KernelError> {
+    let pidfd = get_pidfd(file).ok_or(KernelError::BadFd)?;
+    let _list = crate::task::percpu::TASKLIST.read();
+    if pidfd.pid.task().is_null() {
+        return Err(KernelError::NoProcess);
+    }
+    Ok(pidfd.pid())
 }
 
 /// Check if a file is a pidfd

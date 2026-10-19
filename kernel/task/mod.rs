@@ -922,6 +922,9 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Its place in its real parent's `children` (Linux sibling; under
     /// TASKLIST)
     pub sibling: crate::list::Link,
+    /// Its place in its group leader's `threads` (Linux thread_node;
+    /// under TASKLIST)
+    pub thread_node: crate::list::Link,
     /// The rest, under TASKLIST (None only for the boot task, which
     /// is never in the table)
     inner: TableCell<Option<TaskInner<A, PT>>>,
@@ -1072,6 +1075,11 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     /// leaders are)
     pub in_children: bool,
 
+    /// A leader's thread group, itself included (Linux
+    /// signal->thread_head; links `thread_node`), one strong reference
+    /// each, until a thread leaves the task list (under TASKLIST)
+    pub threads: crate::list::ArcList<ThreadNode<A, PT>>,
+
     /// Message for PTRACE_GETEVENTMSG (child PID, exec old TID, exit code, etc.)
     pub ptrace_message: u64,
 
@@ -1123,6 +1131,26 @@ unsafe impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAdd
         // SAFETY: `l` is the `sibling` of a live task
         unsafe {
             (l as *const u8).sub(core::mem::offset_of!(Task<A, PT>, sibling)) as *const Task<A, PT>
+        }
+    }
+}
+
+/// The adapter of `Task.thread_node` (thread groups)
+pub struct ThreadNode<A, PT>(core::marker::PhantomData<(A, PT)>);
+
+// SAFETY: offset_of! gives `thread_node`'s place in the task
+unsafe impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>>
+    crate::list::Adapter for ThreadNode<A, PT>
+{
+    type Item = Task<A, PT>;
+    fn link(t: &Task<A, PT>) -> &crate::list::Link {
+        &t.thread_node
+    }
+    unsafe fn item(l: *const crate::list::Link) -> *const Task<A, PT> {
+        // SAFETY: `l` is the `thread_node` of a live task
+        unsafe {
+            (l as *const u8).sub(core::mem::offset_of!(Task<A, PT>, thread_node))
+                as *const Task<A, PT>
         }
     }
 }
@@ -1278,6 +1306,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             maj_flt: AtomicU64::new(0),
             tasks_link: crate::list::Link::new(),
             sibling: crate::list::Link::new(),
+            thread_node: crate::list::Link::new(),
             inner: TableCell::new(Some(inner)),
         }
     }
@@ -1317,6 +1346,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             maj_flt: AtomicU64::new(0),
             tasks_link: crate::list::Link::new(),
             sibling: crate::list::Link::new(),
+            thread_node: crate::list::Link::new(),
             inner: TableCell::new(None),
         }
     }

@@ -1206,7 +1206,7 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
     // Check if process exists
     {
         let table = super::percpu::TASKLIST.read();
-        if !table.iter().any(|t| t.task.pid == target_pid) {
+        if !table.get(target_pid).is_some() {
             return KernelError::NoProcess.sysret();
         }
     }
@@ -1288,19 +1288,11 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i6
         }
     };
 
-    // Validate it's a pidfd and get target PID
-    let target_pid = match crate::pidfd::get_pidfd_pid(&file) {
-        Some(pid) => pid,
-        None => return KernelError::BadFd.sysret(), // not a pidfd
+    // A pidfd whose process is still there
+    let target_pid = match crate::pidfd::pidfd_live_pid(&file) {
+        Ok(pid) => pid,
+        Err(e) => return e.sysret(),
     };
-
-    // Check if process still exists
-    {
-        let table = super::percpu::TASKLIST.read();
-        if !table.iter().any(|t| t.task.pid == target_pid) {
-            return KernelError::NoProcess.sysret();
-        }
-    }
 
     // Signal 0 is a null signal - just check if process exists
     if sig == 0 {
@@ -1352,10 +1344,10 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
         }
     };
 
-    // Verify it's actually a pidfd and get the target PID
-    let target_pid = match crate::pidfd::get_pidfd_pid(&pidfd_file) {
-        Some(pid) => pid,
-        None => return KernelError::BadFd.sysret(), // not a pidfd
+    // A pidfd whose process is still there
+    let target_pid = match crate::pidfd::pidfd_live_pid(&pidfd_file) {
+        Ok(pid) => pid,
+        Err(e) => return e.sysret(),
     };
 
     // Find the target task by PID and check permissions
@@ -1400,7 +1392,7 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
 /// Find a task by PID (returns TID of the main thread)
 fn find_task_by_pid(pid: super::Pid) -> Option<super::Tid> {
     let table = super::percpu::TASKLIST.read();
-    table.find(|t| t.task.pid == pid).map(|t| t.task.tid())
+    table.get(pid).map(|t| t.task.tid())
 }
 
 /// Check permission for pidfd_getfd

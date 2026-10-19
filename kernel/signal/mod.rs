@@ -937,14 +937,17 @@ pub fn send_signal_to_process(pid: Pid, sig: u32) -> i32 {
     let tid = {
         let table = crate::task::percpu::TASKLIST.read();
         let live = |t: &crate::task::percpu::TaskView<'_>| {
-            t.task.pid == pid
-                && !t.task.has_flag(crate::task::pf::EXITING)
+            !t.task.has_flag(crate::task::pf::EXITING)
                 && !matches!(t.state, crate::task::TaskState::Zombie(_))
         };
-        let leader = table.find(|t| t.task.pid == pid && t.leader);
+        let leader = table.get(pid);
         match leader {
             Some(l) if live(&l) => Some(l.task.tid()),
-            _ => table.find(live).or(leader).map(|t| t.task.tid()),
+            _ => table
+                .threads(pid)
+                .find(live)
+                .or(leader)
+                .map(|t| t.task.tid()),
         }
     };
 
@@ -1038,14 +1041,9 @@ fn group_signal(
     tgid: Pid,
 ) -> Option<Arc<SignalStruct>> {
     table
-        .find(|t| t.task.pid == tgid && t.leader)
+        .get(tgid)
         .and_then(|t| t.signal.clone())
-        .or_else(|| {
-            table
-                .iter()
-                .filter(|t| t.task.pid == tgid)
-                .find_map(|t| t.signal.clone())
-        })
+        .or_else(|| table.threads(tgid).find_map(|t| t.signal.clone()))
 }
 
 /// SIGKILL every thread of `tgid` that has not started exiting, but
@@ -1056,19 +1054,21 @@ fn group_signal(
 fn zap_threads(tgid: Pid, except: Option<Tid>) {
     let tids: alloc::vec::Vec<Tid> = {
         let mut table = TASKLIST.write();
-        table
-            .iter_mut()
+        let tids: alloc::vec::Vec<Tid> = table
+            .threads(tgid)
             .filter(|t| {
-                t.task.pid == tgid
-                    && Some(t.task.tid()) != except
+                Some(t.task.tid()) != except
                     && !t.task.has_flag(crate::task::pf::EXITING)
                     && !matches!(t.state, crate::task::TaskState::Zombie(_))
             })
-            .map(|mut t| {
-                sigkill_task(&mut t);
-                t.task.tid()
-            })
-            .collect()
+            .map(|t| t.task.tid())
+            .collect();
+        for &t in &tids {
+            if let Some(mut v) = table.get_mut(t) {
+                sigkill_task(&mut v);
+            }
+        }
+        tids
     };
     for t in tids {
         crate::task::percpu::wake_up_tid(t, crate::task::percpu::WakeMode::Fatal);

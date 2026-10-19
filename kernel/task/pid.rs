@@ -19,7 +19,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use crate::ns::PidNamespace;
 use crate::sync::spin::Mutex;
@@ -55,7 +55,15 @@ pub struct Pid {
     /// `*const KernelTask` set and cleared under TASKLIST's write lock
     /// while the task is in the task list
     task: AtomicPtr<()>,
+    /// pidfd pollers of the process this pid leads (Linux wait_pidfd)
+    pub wait_pidfd: crate::waitqueue::WaitQueue,
+    /// The process's wait status once all its threads have exited;
+    /// ALIVE before
+    exit: AtomicI64,
 }
+
+/// `Pid.exit` of a process that still runs
+const ALIVE: i64 = i64::MIN;
 
 impl Pid {
     /// The global number (root namespace): the tid
@@ -67,6 +75,19 @@ impl Pid {
     pub fn nr_in(&self, ns: &PidNamespace) -> Option<u32> {
         let u = self.numbers.get(ns.level as usize)?;
         core::ptr::eq(Arc::as_ptr(&u.ns), ns).then_some(u.nr)
+    }
+
+    /// The process it leads has exited: its wait status
+    pub fn exited(&self) -> Option<i32> {
+        let v = self.exit.load(Ordering::Acquire);
+        (v != ALIVE).then_some(v as i32)
+    }
+
+    /// Its process has exited with `status` (the last thread's exit):
+    /// pidfd pollers wake (Linux do_notify_pidfd)
+    pub fn set_exited(&self, status: i32) {
+        self.exit.store(status as i64, Ordering::Release);
+        self.wait_pidfd.wake_all();
     }
 
     /// The task it names (null if none: not yet attached, or released)
@@ -243,6 +264,8 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Option<Arc<
         level: numbers.len() as u32 - 1,
         numbers: numbers.into_boxed_slice(),
         task: AtomicPtr::new(core::ptr::null_mut()),
+        wait_pidfd: crate::waitqueue::WaitQueue::new(),
+        exit: AtomicI64::new(ALIVE),
     });
     let _g = PIDMAP_LOCK.lock();
     for u in pid.numbers.iter() {

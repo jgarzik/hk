@@ -782,7 +782,8 @@ impl GlobalTaskTable {
         zombie
     }
 
-    /// Add a task (fork, kernel thread creation); it has a pid
+    /// Add a task (fork, kernel thread creation); it has a pid. It joins
+    /// its group leader's threads (a new process leads its own).
     pub fn insert(&mut self, task: TaskRef) {
         // SAFETY: the list is locked for writing
         if let Some(inner) = unsafe { task.inner().get() }
@@ -790,7 +791,35 @@ impl GlobalTaskTable {
         {
             p.set_task(Arc::as_ptr(&task) as *const ());
         }
-        self.tasks.push_back(task);
+        self.tasks.push_back(task.clone());
+        let leader = if task.tid() == task.pid {
+            Some(task.clone())
+        } else {
+            self.task(task.pid)
+        };
+        if let Some(l) = leader {
+            // SAFETY: in this list; no view is live
+            unsafe { self.inner_mut_of(&l) }.threads.push_back(task);
+        }
+    }
+
+    /// The threads of process `pid` (its leader's thread group)
+    pub fn threads(&self, pid: Pid) -> impl Iterator<Item = TaskView<'_>> {
+        self.get(pid)
+            .map(|l| l.fields().threads.iter().map(view))
+            .into_iter()
+            .flatten()
+    }
+
+    /// Take `t` off its leader's thread group
+    fn unlink_thread(&mut self, t: &KernelTask) {
+        let Some(l) = self.task(t.pid) else { return };
+        // SAFETY: in this list; no view is live; `t` is in its leader's
+        // group (every task in the list is)
+        let li = unsafe { self.inner_mut_of(&l) };
+        if li.threads.iter().any(|x| core::ptr::eq(x, t)) {
+            drop(unsafe { li.threads.remove(t) });
+        }
     }
 
     /// Remove task `tid`; the caller drops it after unlocking (nothing
@@ -798,6 +827,7 @@ impl GlobalTaskTable {
     pub fn remove(&mut self, tid: Tid) -> Option<TaskRef> {
         let t = task_ref(self.lookup(tid)?);
         self.unlink_child(&t);
+        self.unlink_thread(&t);
         // SAFETY: the list is locked for writing, so no view exists
         if let Some(inner) = unsafe { t.inner().get() }
             && let Some(p) = &inner.thread_pid
@@ -1047,6 +1077,7 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
         real_parent: None,
         children: crate::list::ArcList::new(),
         in_children: false,
+        threads: crate::list::ArcList::new(),
         ptrace_message: 0,
         ptrace_options: 0,
     };
@@ -1242,6 +1273,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         real_parent: None,
         children: crate::list::ArcList::new(),
         in_children: false,
+        threads: crate::list::ArcList::new(),
         ptrace_message: 0,
         ptrace_options: 0,
     };
@@ -1325,9 +1357,12 @@ pub fn mark_zombie(tid: Tid, status: i32) {
     // This must be done after releasing TASKLIST lock to avoid lock ordering issues
     crate::cgroup::detach_task(tid);
 
-    // Notify any pidfds watching this process (after releasing TASKLIST lock)
+    // The process's pidfds once its last thread is gone (Linux
+    // do_notify_pidfd; after TASKLIST)
     if let Some(p) = pid {
-        crate::pidfd::notify_process_exit(p, status);
+        if !group_others(p, tid) {
+            crate::pidfd::notify_process_exit(p, status);
+        }
 
         // Write accounting record if process accounting is enabled
         crate::acct::write_acct_record(tid, p, status);
@@ -1428,9 +1463,9 @@ pub fn reap_zombie_child_times(
 /// A thread of group `tgid` other than `tid` has not exited yet
 pub fn group_others(tgid: Pid, tid: Tid) -> bool {
     let table = TASKLIST.read();
-    table.iter().any(|u| {
-        u.task.pid == tgid && u.task.tid() != tid && !matches!(u.state, TaskState::Zombie(_))
-    })
+    table
+        .threads(tgid)
+        .any(|u| u.task.tid() != tid && !matches!(u.state, TaskState::Zombie(_)))
 }
 
 /// After de_thread: `tid` is the only thread of `tgid` left running and
@@ -1454,13 +1489,25 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
         l.cred().uid,
     );
     let gone: Vec<Tid> = table
-        .iter()
-        .filter(|t| {
-            t.task.pid == tgid && t.task.tid() != tid && matches!(t.state, TaskState::Zombie(_))
-        })
+        .threads(tgid)
+        .filter(|t| t.task.tid() != tid && matches!(t.state, TaskState::Zombie(_)))
         .map(|t| t.task.tid())
         .collect();
-    let gone: Vec<TaskRef> = gone.into_iter().filter_map(|t| table.remove(t)).collect();
+    // The thread group moves to the caller: it is the only live thread
+    // (Linux de_thread leaves only the exec'ing thread); the old list's
+    // references go after TASKLIST
+    let mut old_threads = crate::list::ArcList::new();
+    if let Some(l) = table.task(ltid) {
+        // SAFETY: in the list; no view is live
+        let li = unsafe { table.inner_mut_of(&l) };
+        core::mem::swap(&mut li.threads, &mut old_threads);
+    }
+    let mut dead: Vec<TaskRef> = Vec::new();
+    while let Some(t) = old_threads.pop_front() {
+        dead.push(t);
+    }
+    let mut gone: Vec<TaskRef> = gone.into_iter().filter_map(|t| table.remove(t)).collect();
+    gone.extend(dead);
     let Some(me) = table.task(tid) else {
         return gone;
     };
@@ -1490,8 +1537,12 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     me.set_tid(ltid);
     // The new leader takes the old one's place among its parent's
     // children (tracer and parent links are task references: nothing
-    // else names the old tid)
+    // else names the old tid) and leads the group
     table.link_child(&me);
+    // SAFETY: in the list; no view is live
+    unsafe { table.inner_mut_of(&me) }
+        .threads
+        .push_back(me.clone());
     let sig = table.get(ltid).and_then(|t| t.signal.clone());
     if let Some(mut m) = table.get_mut(ltid) {
         m.leader = true;
@@ -1522,11 +1573,9 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
 
 /// A thread of `t`'s group other than `t` has not exited yet
 fn group_alive(table: &GlobalTaskTable, t: &TaskView<'_>) -> bool {
-    table.iter().any(|u| {
-        u.task.pid == t.task.pid
-            && u.task.tid() != t.task.tid()
-            && !matches!(u.state, TaskState::Zombie(_))
-    })
+    table
+        .threads(t.task.pid)
+        .any(|u| u.task.tid() != t.task.tid() && !matches!(u.state, TaskState::Zombie(_)))
 }
 
 /// The wait status a zombie leader reports (Linux wait_task_zombie):
@@ -1899,6 +1948,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         },
         children: crate::list::ArcList::new(),
         in_children: false,
+        threads: crate::list::ArcList::new(),
         ptrace_message: 0,
         ptrace_options: 0,
     };
@@ -2162,7 +2212,8 @@ fn forget_original_parent() {
         !t.task.has_flag(crate::task::pf::EXITING) && !matches!(t.state, TaskState::Zombie(_))
     };
     let mut reaper = table
-        .find(|t| t.task.pid == me.pid && !core::ptr::eq(t.task, &*me) && live(t))
+        .threads(me.pid)
+        .find(|t| !core::ptr::eq(t.task, &*me) && live(t))
         .map(|t| task_ref(t.task));
     if reaper.is_none() {
         let mut p = table.get(me.tid()).and_then(|t| t.real_parent.clone());
@@ -2890,7 +2941,7 @@ pub fn current_cred() -> crate::task::Cred {
 /// Returns None if the process is not found.
 pub fn lookup_task_pgid(pid: Pid) -> Option<Pid> {
     let table = TASKLIST.read();
-    table.find(|t| t.task.pid == pid).map(|t| t.task.pgid())
+    table.get(pid).map(|t| t.task.pgid())
 }
 
 /// True if some task is in process group `pgid`
@@ -2903,7 +2954,7 @@ pub fn pgrp_exists(pgid: Pid) -> bool {
 /// Returns None if the process is not found.
 pub fn lookup_task_sid(pid: Pid) -> Option<Pid> {
     let table = TASKLIST.read();
-    table.find(|t| t.task.pid == pid).map(|t| t.task.sid())
+    table.get(pid).map(|t| t.task.sid())
 }
 
 /// Look up a task's priority by PID
@@ -2911,7 +2962,7 @@ pub fn lookup_task_sid(pid: Pid) -> Option<Pid> {
 /// Returns None if the process is not found.
 pub fn lookup_task_priority(pid: Pid) -> Option<Priority> {
     let table = TASKLIST.read();
-    table.find(|t| t.task.pid == pid).map(|t| t.priority)
+    table.get(pid).map(|t| t.priority)
 }
 
 /// Look up a task's scheduling policy by PID
@@ -2920,7 +2971,7 @@ pub fn lookup_task_priority(pid: Pid) -> Option<Priority> {
 /// The returned policy includes SCHED_RESET_ON_FORK flag if set.
 pub fn lookup_task_policy(pid: Pid) -> Option<i32> {
     let table = TASKLIST.read();
-    table.find(|t| t.task.pid == pid).map(|t| {
+    table.get(pid).map(|t| {
         let mut policy = t.policy;
         if t.reset_on_fork {
             policy |= crate::task::SCHED_RESET_ON_FORK;
@@ -2935,7 +2986,7 @@ pub fn lookup_task_policy(pid: Pid) -> Option<i32> {
 /// For SCHED_NORMAL tasks, returns 0.
 pub fn lookup_task_rt_priority(pid: Pid) -> Option<i32> {
     let table = TASKLIST.read();
-    table.find(|t| t.task.pid == pid).map(|t| t.rt_priority)
+    table.get(pid).map(|t| t.rt_priority)
 }
 
 /// Get a task's CPU time statistics by TID
@@ -2955,7 +3006,7 @@ pub fn get_process_times(pid: Pid) -> (u64, u64) {
     let table = TASKLIST.read();
     let mut utime = 0u64;
     let mut stime = 0u64;
-    for task in table.iter().filter(|t| t.task.pid == pid) {
+    for task in table.threads(pid) {
         let (u, s) = task.task.times();
         utime = utime.saturating_add(u);
         stime = stime.saturating_add(s);
@@ -2985,7 +3036,7 @@ fn account_current(kernel: bool) {
 /// Returns None if the process is not found.
 pub fn lookup_task_cpus_allowed(pid: Pid) -> Option<crate::cpumask::CpuSet> {
     let table = TASKLIST.read();
-    table.find(|t| t.task.pid == pid).map(|t| t.cpus_allowed)
+    table.get(pid).map(|t| t.cpus_allowed)
 }
 
 /// Set a task's scheduling policy and priority by PID
@@ -3034,7 +3085,7 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
     }
 
     let mut table = TASKLIST.write();
-    match table.find_mut(|t| t.task.pid == pid) {
+    match table.get_mut(pid) {
         Some(mut task) => {
             task.policy = base_policy;
             task.rt_priority = rt_priority;
@@ -3081,7 +3132,7 @@ pub fn set_task_cpus_allowed(pid: Pid, mask: crate::cpumask::CpuSet) -> Result<(
     }
 
     let mut table = TASKLIST.write();
-    match table.find_mut(|t| t.task.pid == pid) {
+    match table.get_mut(pid) {
         Some(mut task) => {
             task.cpus_allowed = mask;
             Ok(())
@@ -3106,7 +3157,7 @@ pub fn task_count() -> usize {
 /// - ESRCH (3): Process not found
 pub fn set_task_priority(pid: Pid, priority: Priority) -> Result<(), i32> {
     let mut table = TASKLIST.write();
-    match table.find_mut(|t| t.task.pid == pid) {
+    match table.get_mut(pid) {
         Some(mut task) => {
             task.priority = priority;
             Ok(())
@@ -3125,7 +3176,7 @@ pub fn set_task_priority(pid: Pid, priority: Priority) -> Result<(), i32> {
 pub fn set_task_pgid(target_pid: Pid, new_pgid: Pid, caller_sid: Pid) -> Result<(), i32> {
     let mut table = TASKLIST.write();
 
-    let (tid, pid, sid) = match table.find(|t| t.task.pid == target_pid) {
+    let (tid, pid, sid) = match table.get(target_pid) {
         Some(t) => (t.task.tid(), t.task.pid, t.task.sid()),
         None => return Err(3), // ESRCH
     };
@@ -3168,7 +3219,7 @@ pub fn create_session(caller_pid: Pid, caller_pgid: Pid) -> Result<Pid, i32> {
     let mut table = TASKLIST.write();
 
     // Find the calling process
-    let task = match table.find_mut(|t| t.task.pid == caller_pid) {
+    let task = match table.get_mut(caller_pid) {
         Some(t) => t,
         None => return Err(3), // ESRCH
     };

@@ -43,7 +43,7 @@ fn current_time() -> Timespec {
 fn task_exists(pid: Pid) -> bool {
     use crate::task::percpu::TASKLIST;
     let table = TASKLIST.read();
-    table.iter().any(|t| t.task.pid == pid)
+    table.get(pid).is_some()
 }
 
 /// Public version of task_exists for use by setns
@@ -58,7 +58,7 @@ pub fn task_exists_pub(pid: Pid) -> bool {
 pub fn get_tid_for_pid(pid: Pid) -> Option<crate::task::Tid> {
     use crate::task::percpu::TASKLIST;
     let table = TASKLIST.read();
-    table.find(|t| t.task.pid == pid).map(|t| t.task.tid())
+    table.get(pid).map(|t| t.task.tid())
 }
 
 /// Inode number for per-PID directories
@@ -533,8 +533,8 @@ fn group_threads(pid: Pid) -> alloc::vec::Vec<crate::task::Tid> {
     use crate::task::percpu::TASKLIST;
     let table = TASKLIST.read();
     table
-        .iter()
-        .filter(|t| t.task.pid == pid && !matches!(t.state, crate::task::TaskState::Zombie(_)))
+        .threads(pid)
+        .filter(|t| !matches!(t.state, crate::task::TaskState::Zombie(_)))
         .map(|t| t.task.tid())
         .collect()
 }
@@ -1057,7 +1057,7 @@ fn dump_owner(pid: Pid) -> (u32, u32) {
     use crate::task::percpu::TASKLIST;
     let table = TASKLIST.read();
     table
-        .find(|t| t.task.pid == pid)
+        .get(pid)
         .filter(|t| {
             t.mm()
                 .is_none_or(|m| m.dumpable() == crate::task::dumpable::SUID_DUMP_USER)

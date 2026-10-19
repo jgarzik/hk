@@ -301,7 +301,7 @@ pub fn sys_process_vm_writev(
 /// Find a task by PID (returns TID of the main thread)
 fn find_task_by_pid(pid: Pid) -> Option<Tid> {
     let table = TASKLIST.read();
-    table.find(|t| t.task.pid == pid).map(|t| t.task.tid())
+    table.get(pid).map(|t| t.task.tid())
 }
 
 /// May the caller access the target's memory (Linux process_vm_rw_core

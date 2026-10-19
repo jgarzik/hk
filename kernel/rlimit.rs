@@ -198,7 +198,7 @@ pub fn rlimit_max(resource: u32) -> u64 {
 /// Searches the task table for a task with the given PID.
 fn find_task_by_pid(pid: u64) -> Option<Tid> {
     let table = crate::task::percpu::TASKLIST.read();
-    table.find(|t| t.task.pid == pid).map(|t| t.task.tid())
+    table.get(pid).map(|t| t.task.tid())
 }
 
 /// sys_getrlimit - get resource limits

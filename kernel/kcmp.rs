@@ -151,12 +151,12 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
     // Look up both tasks and extract the resources we need
     let table = TASKLIST.read();
 
-    let task1 = match table.find(|t| t.task.pid == pid1) {
+    let task1 = match table.get(pid1) {
         Some(t) => t,
         None => return KernelError::NoProcess.sysret(),
     };
 
-    let task2 = match table.find(|t| t.task.pid == pid2) {
+    let task2 = match table.get(pid2) {
         Some(t) => t,
         None => return KernelError::NoProcess.sysret(),
     };

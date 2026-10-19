@@ -581,6 +581,12 @@ reap. An exiting task first hands its children to another live thread
 of its group, else the nearest child subreaper, else init
 (`forget_original_parent`, `reparent`); an exited non-leader thread
 leaves the task list at once (Linux release_task), unless traced.
+A group leader's `threads` (intrusive `ArcList`, link
+`Task.thread_node`, the leader included; Linux signal->thread_head)
+lists its group: joined at insert, left at removal, handed to the
+exec'ing thread when it takes the leader's place. A process is found
+by its pid as its leader's tid (`get(pid)`); its threads through
+`threads(pid)`.
 
 A `Task` has four kinds of fields: fixed at creation (`tid`, `pid`,
 `kind`, `kstack_top`); hot atomics written by the task itself (or its
