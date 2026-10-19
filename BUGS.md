@@ -746,3 +746,8 @@ Found during T0 (2026-10-19). Tag = when to fix.
    SCHEDULING_ENABLED fallbacks; 20 GFP from context/reclaim;
    21 try_* user-sized allocations; tests e-h. Also: an acct test with
    N threads exiting at once (one record) was not written.
+9. **MM_LIFE_EXEC_CHAIN intermittent on arm64 CI** (next batch). One
+   GitHub `check-arm` run (TCG, NIC=e1000) reported
+   `MM_LIFE_EXEC_CHAIN:FAIL -2`: both warmup chains passed, then the
+   first measured one's child (busybox `env` x40 then `true`, i.e. 41
+   execs in one process) exited nonzero. A failed exec, not a leak.
