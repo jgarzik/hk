@@ -1828,12 +1828,17 @@ loop {
     let cycle_base = self.cycle_base.load(Ordering::Relaxed);
     // ...
 
-    let seq2 = self.seq.load(Ordering::Acquire);
+    fence(Ordering::Acquire);         // smp_rmb (read_seqcount_retry)
+    let seq2 = self.seq.load(Ordering::Relaxed);
     if seq1 != seq2 { continue; }  // Data changed, retry
 
     return computed_time;
 }
 ```
+
+Writers (`write_begin`/`write_end`, under `TimeKeeper.lock`): `seq += 1`
+then `fence(Release)` (smp_wmb) before the field stores, and
+`fence(Release)` then `seq += 1` after them (Linux write_seqcount_*).
 
 ### 3.6 Kernel Logging (printk)
 

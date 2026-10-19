@@ -217,7 +217,7 @@ impl TimeKeeper {
 
         // Begin write sequence
         let _g = self.lock.lock();
-        self.seq.fetch_add(1, Ordering::Release);
+        self.write_begin();
 
         self.cycle_base.store(now_cycles, Ordering::Relaxed);
         self.mono_base_ns.store(0, Ordering::Relaxed);
@@ -228,8 +228,20 @@ impl TimeKeeper {
         self.tsc_freq_hz.store(tsc_freq_hz, Ordering::Relaxed);
         self.initialized.store(1, Ordering::Relaxed);
 
-        // End write sequence
-        self.seq.fetch_add(1, Ordering::Release);
+        self.write_end();
+    }
+
+    /// Linux write_seqcount_begin: `seq` odd, then smp_wmb so no field
+    /// store is seen before it (caller holds `lock`, IRQs off)
+    fn write_begin(&self) {
+        self.seq.fetch_add(1, Ordering::Relaxed);
+        ::core::sync::atomic::fence(Ordering::Release);
+    }
+
+    /// Linux write_seqcount_end: smp_wmb, then `seq` even again
+    fn write_end(&self) {
+        ::core::sync::atomic::fence(Ordering::Release);
+        self.seq.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Check if the timekeeper has been initialized
@@ -246,10 +258,8 @@ impl TimeKeeper {
             return;
         }
 
-        // Begin write (make seq odd)
         let _g = self.lock.lock();
-        self.seq.fetch_add(1, Ordering::Relaxed);
-        ::core::sync::atomic::fence(Ordering::Release);
+        self.write_begin();
 
         let now_cycles = read_tsc();
         let cycle_base = self.cycle_base.load(Ordering::Relaxed);
@@ -264,9 +274,7 @@ impl TimeKeeper {
         self.mono_base_ns
             .store(mono_base.wrapping_add(delta_ns), Ordering::Relaxed);
 
-        // End write (make seq even)
-        ::core::sync::atomic::fence(Ordering::Release);
-        self.seq.fetch_add(1, Ordering::Relaxed);
+        self.write_end();
     }
 
     /// Read time for a given clock (seqlock reader)
@@ -297,8 +305,10 @@ impl TimeKeeper {
             // Read current TSC
             let now_cycles = read_tsc();
 
-            // Check sequence didn't change
-            let seq2 = self.seq.load(Ordering::Acquire);
+            // Check sequence didn't change (Linux read_seqcount_retry:
+            // smp_rmb orders the field loads before the second seq load)
+            ::core::sync::atomic::fence(Ordering::Acquire);
+            let seq2 = self.seq.load(Ordering::Relaxed);
             if seq1 != seq2 {
                 ::core::hint::spin_loop();
                 continue;
@@ -343,10 +353,8 @@ impl TimeKeeper {
 
         let read_tsc = self.get_read_cycles();
 
-        // Begin write (make seq odd)
         let _g = self.lock.lock();
-        self.seq.fetch_add(1, Ordering::Relaxed);
-        ::core::sync::atomic::fence(Ordering::Release);
+        self.write_begin();
 
         // Read current monotonic time
         let now_cycles = read_tsc();
@@ -368,9 +376,7 @@ impl TimeKeeper {
         self.realtime_offset_ns
             .store(new_offset as i64, Ordering::Relaxed);
 
-        // End write (make seq even)
-        ::core::sync::atomic::fence(Ordering::Release);
-        self.seq.fetch_add(1, Ordering::Relaxed);
+        self.write_end();
 
         true
     }
