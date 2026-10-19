@@ -354,6 +354,23 @@ Nothing in hk can avoid it. Next: check the BIOS for Intel default
 power/turbo settings and current microcode, stress-test CPUs 2 and 5,
 or keep gate QEMUs off them (taskset) and see whether the crash stops.
 
+## arm check-arm stalls or QEMU dies right after MOUNT_UMOUNT_TEST_PASSED (next batch)
+
+**Location**: unknown; `user/boot_tester/tests/fs_ops.rs` Part 4
+(`mount_vfat`), `kernel/usb/` (xHCI, mass storage), `kernel/fs/vfat.rs`
+
+3× in C1 gating (2026-10-19, check-arm in `make gate`, 4 boots in
+parallel): twice QEMU died 88-98 s into the boot (the host kernel
+logged a qemu-system-aarch64 segfault / general protection fault at
+the same time, 00:25 and 01:24 UTC), once the boot hung until the
+600 s timeout with no host fault. Each time the last guest line was
+MOUNT_UMOUNT_TEST_PASSED. The next test is `mount_vfat`: it mounts the
+USB mass-storage disk (`/dev/sda`, xHCI + usb-storage) as vfat at
+/vfat_test, then runs the normalized VFAT file tests. The same spot in
+all three points at the guest (USB/SCSI I/O or the vfat mount) rather
+than random host noise; compare the QEMU crash entry above. Not
+reproduced in 6 looped gates and 4 check-arm runs of the same commit.
+
 ## Rare arm64 kernel instruction abort in the fault-signal tests
 
 **Location**: unknown (CPU 0, right after `FAULT_SEGV_ACCERR`, i.e. while
