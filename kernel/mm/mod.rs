@@ -976,10 +976,13 @@ use crate::task::percpu::TASK_TABLE;
 /// itself holds the user reference, so it stays mapped while the task
 /// uses it)
 pub fn get_task_mm(tid: Tid) -> Option<Arc<Mm>> {
+    // The current task's own, lock-free (Linux current->mm)
+    let me = crate::task::percpu::current();
+    if me.tid == tid {
+        return me.mm();
+    }
     let table = TASK_TABLE.lock();
-    table
-        .get(tid)
-        .and_then(|t| t.mm.as_ref().map(|m| m.arc().clone()))
+    table.get(tid).and_then(|t| t.mm().map(|m| m.arc().clone()))
 }
 
 /// A user reference to task `tid`'s address space (Linux get_task_mm),
@@ -996,7 +999,7 @@ pub fn get_task_mm_users(tid: Tid) -> Option<MmRef> {
 pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
     let mm = {
         let mut table = TASK_TABLE.lock();
-        table.get_mut(tid).and_then(|mut t| t.mm.take())
+        table.get_mut(tid).and_then(|mut t| t.set_mm(None))
     }?;
     let keep = mm.arc().clone();
     drop(mm);

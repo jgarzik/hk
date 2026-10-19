@@ -40,7 +40,7 @@ use crate::arch::{
     FrameAlloc, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps, MemoryLayoutOps, PerCpuOps,
     PowerInfo, PowerOps, SchedArch, SmpOps, SyscallOps, TimekeeperOps, UserModeOps, VfsInitOps,
 };
-use crate::task::{CurrentTask, Tid};
+use crate::task::Tid;
 
 /// AArch64 trap frame for saving/restoring CPU state on exception entry
 ///
@@ -542,20 +542,17 @@ impl PerCpuOps for Aarch64Arch {
     }
 
     #[inline]
-    fn current_tid() -> Tid {
-        percpu::try_current_cpu()
-            .map(|p| p.current_tid.load(core::sync::atomic::Ordering::Relaxed) as Tid)
-            .unwrap_or(0)
+    fn current_task_ptr() -> usize {
+        match percpu::try_current_cpu() {
+            Some(p) => p.curr.load(core::sync::atomic::Ordering::Relaxed),
+            None => crate::task::percpu::no_percpu_task(),
+        }
     }
 
     #[inline]
-    fn set_current_tid(tid: Tid) {
-        if percpu::try_current_cpu().is_some() {
-            unsafe {
-                percpu::current_cpu_mut()
-                    .current_tid
-                    .store(tid as u32, core::sync::atomic::Ordering::Relaxed);
-            }
+    fn set_current_task_ptr(t: usize) {
+        if let Some(p) = percpu::try_current_cpu() {
+            p.curr.store(t, core::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -598,25 +595,6 @@ impl PerCpuOps for Aarch64Arch {
                     .load(core::sync::atomic::Ordering::Relaxed)
             })
             .unwrap_or(0)
-    }
-
-    #[inline]
-    fn get_current_task() -> CurrentTask {
-        percpu::try_current_cpu()
-            .map(|p| p.current_task)
-            .unwrap_or_else(crate::task::percpu::no_percpu_task)
-    }
-
-    #[inline]
-    fn set_current_task(task: &CurrentTask) {
-        if percpu::try_current_cpu().is_some() {
-            unsafe {
-                percpu::current_cpu_mut().current_task.set(
-                    task.tid, task.pid, task.ppid, task.pgid, task.sid, task.cred,
-                );
-                percpu::current_cpu_mut().current_task.exiting = task.exiting;
-            }
-        }
     }
 
     #[inline]

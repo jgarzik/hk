@@ -151,12 +151,12 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
     // Look up both tasks and extract the resources we need
     let table = TASK_TABLE.lock();
 
-    let task1 = match table.find(|t| t.pid == pid1) {
+    let task1 = match table.find(|t| t.task.pid == pid1) {
         Some(t) => t,
         None => return KernelError::NoProcess.sysret(),
     };
 
-    let task2 = match table.find(|t| t.pid == pid2) {
+    let task2 = match table.find(|t| t.task.pid == pid2) {
         Some(t) => t,
         None => return KernelError::NoProcess.sysret(),
     };
@@ -165,7 +165,7 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
         KCMP_FILE => {
             // Compare specific file descriptors; the tables are locked
             // after TASK_TABLE is dropped (order: fd table -> TASK_TABLE)
-            let (files1, files2) = (task1.files.clone(), task2.files.clone());
+            let (files1, files2) = (task1.files().cloned(), task2.files().cloned());
             drop(table);
             let ptr1 = match &files1 {
                 Some(files) => {
@@ -194,13 +194,13 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
 
         KCMP_VM => {
             // Compare memory address spaces
-            let vm = |t: &Option<crate::mm::MmRef>| t.as_ref().map(|m| m.arc().clone());
-            compare_arc_option(&vm(&task1.mm), &vm(&task2.mm), KCMP_VM)
+            let vm = |t: Option<&crate::mm::MmRef>| t.map(|m| m.arc().clone());
+            compare_arc_option(&vm(task1.mm()), &vm(task2.mm()), KCMP_VM)
         }
 
         KCMP_FILES => {
             // Compare file descriptor tables
-            compare_arc_option(&task1.files, &task2.files, KCMP_FILES)
+            compare_arc_option(&task1.files().cloned(), &task2.files().cloned(), KCMP_FILES)
         }
 
         KCMP_FS => {

@@ -548,15 +548,17 @@ all task structs. This is simpler than Linux's per-task locks (`alloc_lock`,
 | Variable | Type | Purpose |
 |----------|------|---------|
 | `TASK_TABLE` | `Mutex<GlobalTaskTable>` | All tasks, `BTreeMap<Tid, TaskRef>` (`TaskRef = Arc<Task>`) |
-| Per-CPU `CurrentTask` | Copy struct in PerCpu | Cached task info (no lock) |
-| `Task.cred` | `Arc<Cred>` | Reference-counted credentials |
+| Per-CPU `curr` | `*const Task` in PerCpu | The running task (no lock) |
+| `Task.cred` | `Arc<Cred>` (raw) | Reference-counted credentials |
 
-A `Task` has three kinds of fields: fixed at creation (`tid`, `kind`,
-`kstack_top`); hot atomics written by the task itself (or its creator
-before it first runs) and read lock-free by anyone (`flags` = Linux
-PF_*, `thread_flags` = TIF_*, `cpu`, `start_time`, utime/stime and the
-other counters); and the rest, `TaskInner`, in a `TableCell` that only
-the locked table's views reach (`GlobalTaskTable::get`/`iter` read it,
+A `Task` has four kinds of fields: fixed at creation (`tid`, `pid`,
+`kind`, `kstack_top`); hot atomics written by the task itself (or its
+creator before it first runs) or under TASK_TABLE, and read lock-free
+by anyone (`flags` = Linux PF_*, `thread_flags` = TIF_*, `cpu`,
+`start_time`, `ppid`/`pgid`/`sid`, `seccomp_mode`, `tls`, utime/stime
+and the other counters); owner fields (`cred`, `mm`, `files`, below);
+and the rest, `TaskInner`, in a `TableCell` that only the locked
+table's views reach (`GlobalTaskTable::get`/`iter` read it,
 `get_mut`/`iter_mut` write it with the table borrowed mutably; Linux
 LockedBy). A `TaskRef` cloned out of the table keeps the task alive but
 reads only its fixed and atomic fields without the lock.
@@ -575,8 +577,8 @@ reads only its fixed and atomic fields without the lock.
    down a network namespace (RTNL, a sleeping lock). `Arc<Cred>` is the
    exception: replacing it under the lock (commit_creds) frees only
    memory.
-5. **PF_EXITING** - `exit_current` sets `Task.exiting` (and the per-CPU
-   `CurrentTask.exiting`) before releasing anything; release paths read
+5. **PF_EXITING** - `exit_current` sets `pf::EXITING` in `Task.flags`
+   before releasing anything; release paths read
    it lock-free via `current_exiting()` (TCP close skips its SO_LINGER
    wait, Linux inet_release).
 
@@ -584,29 +586,19 @@ reads only its fixed and atomic fields without the lock.
 
 Following Linux's `kernel/cred.c` pattern (see `include/linux/cred.h`):
 
-1. **Reference-counted** - `Task.cred: Arc<Cred>` provides reference counting
-2. **Copy-on-write** - Credential modifications use prepare/commit pattern
-3. **Dual storage** - `Task.cred` in TASK_TABLE for persistence,
-   `CurrentTask.cred` copied into per-CPU struct for fast syscall access
+1. **Reference-counted** - `Task.cred` holds an `Arc<Cred>` (as a raw
+   pointer; the boot task points at a static root `Cred`)
+2. **Copy-on-write** - modifications use prepare/commit
+3. **Owner rule** - the task reads its own credentials lock-free
+   (`current().cred()`, Linux current_cred); other tasks read them under
+   TASK_TABLE; only the task itself replaces them (`commit_creds`, under
+   TASK_TABLE), so a lock-free owner read never races a writer
 
 **Credential APIs (like Linux):**
 - `prepare_creds()` - Clone current credentials, return mutable copy
-- `commit_creds(new)` - Update Task.cred in TASK_TABLE AND CurrentTask.cred
+- `commit_creds(new)` - swap `Task.cred` under TASK_TABLE; the old
+  `Arc<Cred>` is dropped after the lock (it only frees memory)
 - `copy_creds(flags, parent)` - For fork/clone: share Arc (CLONE_THREAD) or deep copy
-
-**Credential Flow:**
-1. Syscall calls `prepare_creds()` to get mutable copy of current credentials
-2. Syscall modifies the credentials (e.g., `new.euid = target_uid`)
-3. Syscall calls `commit_creds(Arc::new(modified))` to persist changes
-4. `commit_creds()` updates both per-CPU cache (immediate visibility) and
-   TASK_TABLE (persistence across context switch)
-5. On context switch, scheduler loads `Task.cred` from TASK_TABLE into
-   the new task's per-CPU `CurrentTask.cred`
-
-**Why dual storage?**
-- Per-CPU `CurrentTask.cred` provides fast syscall access (no lock needed)
-- `Task.cred` in TASK_TABLE ensures credentials persist across context switches
-- Without TASK_TABLE persistence, credentials would be lost when switching away
 
 #### Exec vs. Credential Checks (Linux cred_guard_mutex, exec_update_lock)
 
@@ -657,43 +649,26 @@ is sufficient while all task modifications are by the current task itself.
 
 #### Per-CPU Current Task Access (Lock-Free)
 
-Each CPU maintains its own `PerCpu` structure accessed via the GS segment register
-(x86-64) or SP_EL0 (aarch64). This provides lock-free access to the current task:
+Each CPU's per-CPU data (GS base on x86-64, TPIDR_EL1 on aarch64) holds
+`curr`, a pointer to the running `Task` (Linux `current`), set by the
+scheduler at every switch with the run-queue lock held. The run queue
+holds the task's `TaskRef` (its entry, then `DeadTask` until the next
+task frees it), so the pointer stays valid while the task runs.
+`task::percpu::current()` returns a `!Send` `Cur` handle; 0 means the
+boot task `INIT_TASK` (Linux init_task: tid 0, root, never in
+TASK_TABLE), so current is never missing. Read lock-free through it:
+`tid`, `pid`, the hot atomics (`ppid`/`pgid`/`sid`, `seccomp_mode`,
+`flags`, `thread_flags`, accounting, `tls`) and the owner fields
+`cred`, `mm`, `files` (Linux current->cred/mm/files: only the task
+itself changes them, or its creator before it first runs, under
+TASK_TABLE; other tasks read them under TASK_TABLE). `get_task_fd`,
+`get_task_mm` and `has_pending_signals` take this lock-free path for
+the current task (fget, the page-fault mm lookup, `signal_pending`).
 
-**x86-64 Pattern:**
-```rust
-// kernel/arch/x86_64/percpu.rs
-pub fn current_tid() -> Tid {
-    // Read GS:offset directly - no lock needed
-    try_current_cpu()
-        .map(|percpu| percpu.current_tid.load(Ordering::Relaxed))
-        .unwrap_or(0)
-}
-```
-
-**Why no lock is needed:**
-1. Each CPU only accesses its own PerCpu structure
-2. GS base is set once during CPU init and never changes
-3. `current_tid` is only modified during context switch (with IrqSpinlock held)
-4. Reads are always consistent (atomic load)
-
-**CurrentTask is a COPY, not a reference:**
-
-The `PerCpu.current_task` field contains a COPY of task metadata (tid, pid, cred),
-not a pointer to the Task in TASK_TABLE. This provides:
-- Fast syscall access without locking TASK_TABLE
-- Consistent snapshot during syscall execution
-- Updates happen at controlled points (context switch, commit_creds)
-
-**Update Points:**
-1. Context switch: Scheduler copies from Task in TASK_TABLE to PerCpu
-2. `commit_creds()`: Updates both PerCpu cache AND Task in TASK_TABLE
-3. `setpgid()`/`setsid()`: Updates both locations
-
-**Linux Comparison:**
-Linux uses a `current_task` per-CPU variable pointing directly to `task_struct`.
-hk uses a copied snapshot for simpler lifetime management in Rust (no raw pointers
-to task_struct across CPU boundaries).
+The context switch takes no TASK_TABLE: `make_current` reads the next
+task's kernel stack, address space and TLS from its run-queue entry (it
+is not running, so its owner fields are stable) and records /proc's
+run state in `Task.sleeping`.
 
 ### 3.1.2 Comparison with Linux task_struct Locking
 
@@ -2978,7 +2953,7 @@ uninterrupted by other tasks. What this changes, and why it holds:
   interrupt handler also touches is atomic or taken with interrupts
   off (`IrqSpinlock`, `local_irq_save`: per-CPU page lists, slab arrays,
   TLB state, cross-CPU queues); the per-CPU user-register block and
-  `CurrentTask` are written only by thread context.
+  `curr` are written only by thread context.
 - Preempt-free sections: unchanged (no preemption); `IrqSpinlock`
   still raises the preempt count and masks interrupts.
 - `spin::Mutex`/`RwLock` holders now take interrupts: such a lock must

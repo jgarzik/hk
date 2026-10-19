@@ -769,13 +769,8 @@ use crate::arch::x86_64::percpu::{
 /// Returns 0 on success, negative errno on error.
 #[cfg(target_arch = "x86_64")]
 pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
-    use crate::CurrentArch;
-    use crate::arch::PerCpuOps;
     use crate::arch::Uaccess;
-    use crate::task::{get_task_tls, set_task_tls};
     use crate::uaccess::put_user;
-
-    let tid = CurrentArch::current_tid();
 
     match code {
         ARCH_SET_FS => {
@@ -783,14 +778,16 @@ pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
             if !crate::arch::user_tls_ok(addr) {
                 return KernelError::NotPermitted.sysret();
             }
-            set_task_tls(tid, addr);
+            super::percpu::current()
+                .tls
+                .store(addr, core::sync::atomic::Ordering::Relaxed);
             write_fs_base(addr);
             0
         }
         ARCH_GET_FS => {
             // Get FS base - return via user pointer
-            // First try our stored value, fall back to reading the register
-            let tls = get_task_tls(tid).unwrap_or_else(read_fs_base);
+            // The live register (user code may have changed it)
+            let tls = read_fs_base();
 
             // Write to user address
             if put_user::<Uaccess, u64>(addr, tls).is_err() {
@@ -1209,7 +1206,7 @@ pub fn sys_pidfd_open(pid: i64, flags: u32) -> i64 {
     // Check if process exists
     {
         let table = super::percpu::TASK_TABLE.lock();
-        if !table.iter().any(|t| t.pid == target_pid) {
+        if !table.iter().any(|t| t.task.pid == target_pid) {
             return KernelError::NoProcess.sysret();
         }
     }
@@ -1300,7 +1297,7 @@ pub fn sys_pidfd_send_signal(pidfd: i32, sig: i32, _info: u64, flags: u32) -> i6
     // Check if process still exists
     {
         let table = super::percpu::TASK_TABLE.lock();
-        if !table.iter().any(|t| t.pid == target_pid) {
+        if !table.iter().any(|t| t.task.pid == target_pid) {
             return KernelError::NoProcess.sysret();
         }
     }
@@ -1403,7 +1400,7 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
 /// Find a task by PID (returns TID of the main thread)
 fn find_task_by_pid(pid: super::Pid) -> Option<super::Tid> {
     let table = super::percpu::TASK_TABLE.lock();
-    table.find(|t| t.pid == pid).map(|t| t.task.tid)
+    table.find(|t| t.task.pid == pid).map(|t| t.task.tid)
 }
 
 /// Check permission for pidfd_getfd
@@ -1423,7 +1420,7 @@ fn check_pidfd_getfd_permission(target_tid: super::Tid) -> bool {
     // Get target credentials from task table
     let target_euid = {
         let table = super::percpu::TASK_TABLE.lock();
-        table.get(target_tid).map(|t| t.cred.euid)
+        table.get(target_tid).map(|t| t.cred().euid)
     };
 
     // Same effective UID check

@@ -629,11 +629,9 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
 ///
 /// Returns the caller's thread ID.
 pub fn sys_set_tid_address(tidptr: u64) -> i64 {
-    use crate::CurrentArch;
-    use crate::arch::PerCpuOps;
     use crate::task::set_clear_child_tid;
 
-    let tid = CurrentArch::current_tid();
+    let tid = super::percpu::current_tid();
     set_clear_child_tid(tid, tidptr);
     tid as i64
 }

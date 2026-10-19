@@ -100,7 +100,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64};
 
 use crate::arch::{Arch, PageTable};
 use crate::fs::FsStruct;
@@ -247,25 +247,10 @@ impl Default for Cred {
 // Credential APIs (Linux kernel/cred.c pattern)
 // =============================================================================
 
-/// Get the current task's credentials from per-CPU cache
-///
-/// Like Linux's `current_cred()` - fast path for syscalls.
-/// Returns a copy since CurrentTask.cred is a Copy type.
+/// The current task's credentials, copied (Linux current_cred: read
+/// lock-free, only the task itself replaces them)
 pub fn current_cred() -> Cred {
     percpu::current_cred()
-}
-
-/// Get the current task's credentials from TASK_TABLE (authoritative source)
-///
-/// This fetches the Arc<Cred> from the actual Task struct.
-/// Used when the per-CPU cache might be stale or for reference counting.
-pub fn current_cred_arc() -> Arc<Cred> {
-    let tid = percpu::current_tid();
-    let table = percpu::TASK_TABLE.lock();
-    table
-        .get(tid)
-        .map(|t| t.cred.clone())
-        .unwrap_or_else(|| Arc::new(Cred::NOBODY))
 }
 
 /// Prepare a new credential set by cloning current credentials
@@ -286,11 +271,9 @@ pub fn prepare_creds() -> Cred {
 
 /// Commit new credentials to current task
 ///
-/// Like Linux's `commit_creds()` - atomically updates both:
-/// 1. Task.cred in TASK_TABLE (persistent storage)
-/// 2. CurrentTask.cred in per-CPU cache (fast access)
-///
-/// The new credentials take effect immediately.
+/// Like Linux's `commit_creds()`: the task's credential pointer is
+/// replaced under TASK_TABLE (others read it under the lock; the task
+/// itself without). The new credentials take effect immediately.
 pub fn commit_creds(new: Arc<Cred>) {
     let old = current_cred().uid;
     if old != new.uid {
@@ -335,96 +318,6 @@ pub fn copy_creds(clone_flags: u64, parent_cred: &Arc<Cred>) -> Arc<Cred> {
     } else {
         // Fork: deep copy credentials (child gets independent copy)
         Arc::new(**parent_cred)
-    }
-}
-
-/// Per-CPU current task state (arch-neutral)
-///
-/// This struct holds per-task state that needs to be quickly accessible
-/// during syscalls and other kernel operations. It is embedded in
-/// arch-specific per-CPU structures (e.g., x86_64 PerCpu).
-#[derive(Debug, Clone, Copy)]
-pub struct CurrentTask {
-    /// Thread ID of the currently running task
-    pub tid: Tid,
-    /// Process ID of the currently running task
-    pub pid: Pid,
-    /// Parent process ID
-    pub ppid: Pid,
-    /// Process group ID
-    pub pgid: Pid,
-    /// Session ID
-    pub sid: Pid,
-    /// Credentials of the currently running task
-    pub cred: Cred,
-    /// Seccomp mode (cached for fast syscall-entry check)
-    /// 0=DISABLED, 1=STRICT, 2=FILTER
-    pub seccomp_mode: u8,
-    /// The task is exiting (Linux PF_EXITING)
-    pub exiting: bool,
-}
-
-impl CurrentTask {
-    /// No task (tid 0) with no privileges (`Cred::NOBODY`): a CPU's
-    /// state until it switches to a task
-    pub const fn new() -> Self {
-        Self::with_cred(Cred::NOBODY)
-    }
-
-    /// The boot CPU's context before the first task (Linux init_task:
-    /// root): kernel-internal setup of the VFS and devices
-    pub const fn boot() -> Self {
-        Self::with_cred(Cred::ROOT)
-    }
-
-    const fn with_cred(cred: Cred) -> Self {
-        Self {
-            tid: 0,
-            pid: 0,
-            ppid: 0,
-            pgid: 0,
-            sid: 0,
-            cred,
-            seccomp_mode: 0, // SECCOMP_MODE_DISABLED
-            exiting: false,
-        }
-    }
-
-    /// Update the current task state
-    pub fn set(&mut self, tid: Tid, pid: Pid, ppid: Pid, pgid: Pid, sid: Pid, cred: Cred) {
-        self.tid = tid;
-        self.pid = pid;
-        self.ppid = ppid;
-        self.pgid = pgid;
-        self.sid = sid;
-        self.cred = cred;
-    }
-
-    /// Create a new CurrentTask from individual parts
-    pub const fn from_parts(
-        tid: Tid,
-        pid: Pid,
-        ppid: Pid,
-        pgid: Pid,
-        sid: Pid,
-        cred: Cred,
-    ) -> Self {
-        Self {
-            tid,
-            pid,
-            ppid,
-            pgid,
-            sid,
-            cred,
-            seccomp_mode: 0, // SECCOMP_MODE_DISABLED
-            exiting: false,
-        }
-    }
-}
-
-impl Default for CurrentTask {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -935,15 +828,22 @@ pub mod tif {
 /// [`TaskRef`]: the task table, run queues and lookups hold references
 ///
 /// Three kinds of fields:
-/// - fixed at creation: `tid`, `kind`, `kstack_top`;
+/// - fixed at creation: `tid`, `pid`, `kind`, `kstack_top`;
 /// - hot counters and flags: atomics written by the task itself (or
-///   its creator before it first runs) and read lock-free by anyone
-///   (accounting, `flags`, `thread_flags`, `cpu`);
+///   its creator before it first runs) or under TASK_TABLE, and read
+///   lock-free by anyone (accounting, `flags`, `thread_flags`, `cpu`,
+///   `ppid`/`pgid`/`sid`, `seccomp_mode`);
+/// - `cred`, `mm`, `files`: owner fields (Linux current->cred/mm/files),
+///   read by the task itself without a lock and by others under
+///   TASK_TABLE, changed by the task (or its creator before it runs)
+///   under TASK_TABLE;
 /// - everything else ([`TaskInner`]), read and written only under
 ///   TASK_TABLE, through the table's views (`GlobalTaskTable::get` etc.).
 pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
     /// Thread ID
     pub tid: Tid,
+    /// Process (thread-group) ID: the leader's tid (Linux tgid)
+    pub pid: Pid,
     /// Kind of task
     pub kind: TaskKind,
     /// Kernel stack top
@@ -958,6 +858,32 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub thread_flags: AtomicU32,
     /// CPU whose run queue owns this task (tasks never migrate)
     pub cpu: AtomicU32,
+    /// Sleeping, as of its last switch out (/proc state; the truth is
+    /// the run queue's)
+    pub sleeping: AtomicBool,
+
+    /// Parent process ID (0 for init/orphans; written under TASK_TABLE)
+    pub ppid: AtomicU64,
+    /// Process group ID (written under TASK_TABLE)
+    pub pgid: AtomicU64,
+    /// Session ID (written under TASK_TABLE)
+    pub sid: AtomicU64,
+    /// User TLS register (x86-64 FS base, arm64 TPIDR_EL0), saved at
+    /// switch-out and loaded at switch-in; set by the task itself or its
+    /// creator (CLONE_SETTLS)
+    pub tls: AtomicU64,
+    /// Seccomp mode (0 = DISABLED, 1 = STRICT, 2 = FILTER), set by the
+    /// task itself; read at every syscall entry
+    pub seccomp_mode: AtomicU8,
+
+    /// Credentials (Linux task->cred): read lock-free by the task, under
+    /// TASK_TABLE by others; replaced only by the task (commit_creds)
+    /// under TASK_TABLE
+    cred: TaskCred,
+    /// Address space, one mm_users reference (shared when CLONE_VM)
+    mm: OwnCell<Option<crate::mm::MmRef>>,
+    /// File descriptor table (shared when CLONE_FILES)
+    files: OwnCell<Option<Arc<fdtable::Files>>>,
 
     /// User CPU time consumed (nanoseconds)
     pub utime: AtomicU64,
@@ -977,24 +903,13 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Major page faults (swap-in required - I/O needed)
     pub maj_flt: AtomicU64,
 
-    /// The rest, under TASK_TABLE
-    inner: TableCell<TaskInner<A, PT>>,
+    /// The rest, under TASK_TABLE (None only for the boot task, which
+    /// is never in the table)
+    inner: TableCell<Option<TaskInner<A, PT>>>,
 }
 
 /// The fields of a [`Task`] read and written under TASK_TABLE
 pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
-    /// Process ID
-    pub pid: Pid,
-    /// Thread Group ID (equals pid for thread group leader)
-    /// For CLONE_THREAD: inherited from parent; otherwise: equals pid
-    pub tgid: Pid,
-    /// Parent process ID (0 for init/orphans)
-    pub ppid: Pid,
-    /// Process group ID
-    pub pgid: Pid,
-    /// Session ID
-    pub sid: Pid,
-
     // =========================================================================
     // Exit handling (like Linux task_struct exit fields)
     // =========================================================================
@@ -1008,10 +923,6 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     // =========================================================================
     // Credentials (like Linux task_struct->cred)
     // =========================================================================
-    /// Task credentials - reference-counted, immutable after commit
-    /// Following Linux pattern: prepare_creds() -> modify -> commit_creds()
-    pub cred: Arc<Cred>,
-
     /// Current state
     pub state: TaskState,
     /// Scheduling priority (higher = more important)
@@ -1032,11 +943,6 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     // =========================================================================
     // TLS and thread-exit fields (Linux: embedded in task_struct/thread_struct)
     // =========================================================================
-    /// Thread-local storage base address
-    /// - x86_64: FS base (set via MSR_FS_BASE or arch_prctl ARCH_SET_FS)
-    /// - aarch64: TPIDR_EL0 value
-    pub tls_base: u64,
-
     /// Address to clear and futex-wake on thread exit (set_tid_address syscall)
     /// Used by pthread library for thread cleanup notification.
     pub clear_child_tid: u64,
@@ -1048,12 +954,6 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     // =========================================================================
     // Shared resources (Arc for clone-sharing, like Linux pointers)
     // =========================================================================
-    /// Address space, one mm_users reference (shared when CLONE_VM)
-    pub mm: Option<crate::mm::MmRef>,
-
-    /// File descriptor table (shared when CLONE_FILES)
-    pub files: Option<Arc<fdtable::Files>>,
-
     /// Filesystem context (shared when CLONE_FS)
     pub fs: Option<Arc<FsStruct>>,
 
@@ -1104,9 +1004,6 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     // =========================================================================
     // Seccomp state (sandboxing)
     // =========================================================================
-    /// Seccomp mode: 0=DISABLED, 1=STRICT, 2=FILTER
-    pub seccomp_mode: u8,
-
     /// Seccomp filter chain (head, reference counted)
     /// Filters are chained: when a new filter is installed, it points to the previous.
     /// On syscall entry, filters are run in order (newest first), and the most
@@ -1179,13 +1076,118 @@ impl<T> TableCell<T> {
     }
 }
 
+/// The ids a new task starts with
+pub struct TaskIds {
+    pub pid: Pid,
+    pub ppid: Pid,
+    pub pgid: Pid,
+    pub sid: Pid,
+    pub seccomp_mode: u8,
+}
+
+/// An owner field (Linux current->mm, ->files): the owning task reads it
+/// without a lock; others read it under TASK_TABLE; it changes only
+/// under TASK_TABLE, by the owner or before the task first runs
+pub struct OwnCell<T>(UnsafeCell<T>);
+
+// SAFETY: see the access rules above (enforced by `Task`'s unsafe API)
+unsafe impl<T: Send> Sync for OwnCell<T> {}
+
+impl<T> OwnCell<T> {
+    pub const fn new(v: T) -> Self {
+        Self(UnsafeCell::new(v))
+    }
+
+    /// # Safety
+    /// The caller owns the task, or holds TASK_TABLE.
+    unsafe fn get(&self) -> &T {
+        // SAFETY: no writer runs meanwhile: writers are the owner (not
+        // reading now, or this is it) under TASK_TABLE
+        unsafe { &*self.0.get() }
+    }
+
+    /// # Safety
+    /// TASK_TABLE is held, and the caller owns the task or it has not
+    /// run yet; no reference from `get` is live.
+    unsafe fn replace(&self, v: T) -> T {
+        // SAFETY: see above
+        unsafe { core::mem::replace(&mut *self.0.get(), v) }
+    }
+}
+
+/// The credentials of the boot task (no allocation)
+static INIT_CRED: Cred = Cred::ROOT;
+
+/// A task's credentials pointer: an `Arc<Cred>` turned raw, or the boot
+/// task's static `INIT_CRED`; same rules as [`OwnCell`]
+struct TaskCred(AtomicPtr<Cred>);
+
+impl TaskCred {
+    fn new(c: Arc<Cred>) -> Self {
+        Self(AtomicPtr::new(Arc::into_raw(c) as *mut Cred))
+    }
+
+    const fn boot() -> Self {
+        Self(AtomicPtr::new(&INIT_CRED as *const Cred as *mut Cred))
+    }
+
+    fn is_static(p: *const Cred) -> bool {
+        core::ptr::eq(p, &INIT_CRED)
+    }
+
+    /// # Safety
+    /// As [`OwnCell::get`].
+    unsafe fn get(&self) -> Cred {
+        // SAFETY: the pointer is live (see above)
+        unsafe { *self.0.load(Ordering::Acquire) }
+    }
+
+    /// # Safety
+    /// As [`OwnCell::get`].
+    unsafe fn arc(&self) -> Arc<Cred> {
+        let p = self.0.load(Ordering::Acquire);
+        if Self::is_static(p) {
+            return Arc::new(INIT_CRED);
+        }
+        // SAFETY: `p` came from Arc::into_raw and holds a count
+        unsafe {
+            Arc::increment_strong_count(p);
+            Arc::from_raw(p)
+        }
+    }
+
+    /// # Safety
+    /// As [`OwnCell::replace`].
+    unsafe fn replace(&self, new: Arc<Cred>) -> Option<Arc<Cred>> {
+        let old = self
+            .0
+            .swap(Arc::into_raw(new) as *mut Cred, Ordering::AcqRel);
+        // SAFETY: from Arc::into_raw unless static
+        (!Self::is_static(old)).then(|| unsafe { Arc::from_raw(old) })
+    }
+}
+
+impl Drop for TaskCred {
+    fn drop(&mut self) {
+        let p = *self.0.get_mut();
+        if !Self::is_static(p) {
+            // SAFETY: the task's own count
+            drop(unsafe { Arc::from_raw(p) });
+        }
+    }
+}
+
 impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {
     /// A task with its locked fields (not yet in the table)
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tid: Tid,
+        ids: TaskIds,
         kind: TaskKind,
         kstack_top: A::VirtAddr,
         cpu: u32,
+        cred: Arc<Cred>,
+        mm: Option<crate::mm::MmRef>,
         inner: TaskInner<A, PT>,
     ) -> Self {
         let now = crate::time::monotonic_ns();
@@ -1195,12 +1197,22 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
         };
         Self {
             tid,
+            pid: ids.pid,
             kind,
             kstack_top,
             start_time: AtomicU64::new(now),
             flags: AtomicU32::new(flags),
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(cpu),
+            sleeping: AtomicBool::new(false),
+            ppid: AtomicU64::new(ids.ppid),
+            pgid: AtomicU64::new(ids.pgid),
+            sid: AtomicU64::new(ids.sid),
+            tls: AtomicU64::new(0),
+            seccomp_mode: AtomicU8::new(ids.seccomp_mode),
+            cred: TaskCred::new(cred),
+            mm: OwnCell::new(mm),
+            files: OwnCell::new(None),
             utime: AtomicU64::new(0),
             stime: AtomicU64::new(0),
             last_run_ns: AtomicU64::new(now),
@@ -1209,13 +1221,131 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             nivcsw: AtomicU64::new(0),
             min_flt: AtomicU64::new(0),
             maj_flt: AtomicU64::new(0),
-            inner: TableCell::new(inner),
+            inner: TableCell::new(Some(inner)),
         }
     }
 
-    /// The locked fields (see [`TableCell`])
-    pub fn inner(&self) -> &TableCell<TaskInner<A, PT>> {
+    /// The boot task (Linux init_task): current on every CPU until its
+    /// first switch, root, never in the task table
+    pub const fn boot(kstack_top: A::VirtAddr) -> Self {
+        Self {
+            tid: 0,
+            pid: 0,
+            kind: TaskKind::KernelThread,
+            kstack_top,
+            start_time: AtomicU64::new(0),
+            flags: AtomicU32::new(pf::KTHREAD),
+            thread_flags: AtomicU32::new(0),
+            cpu: AtomicU32::new(0),
+            sleeping: AtomicBool::new(false),
+            ppid: AtomicU64::new(0),
+            pgid: AtomicU64::new(0),
+            sid: AtomicU64::new(0),
+            tls: AtomicU64::new(0),
+            seccomp_mode: AtomicU8::new(0),
+            cred: TaskCred::boot(),
+            mm: OwnCell::new(None),
+            files: OwnCell::new(None),
+            utime: AtomicU64::new(0),
+            stime: AtomicU64::new(0),
+            last_run_ns: AtomicU64::new(0),
+            in_kernel: AtomicBool::new(true),
+            nvcsw: AtomicU64::new(0),
+            nivcsw: AtomicU64::new(0),
+            min_flt: AtomicU64::new(0),
+            maj_flt: AtomicU64::new(0),
+            inner: TableCell::new(None),
+        }
+    }
+
+    /// The locked fields (see [`TableCell`]); None for the boot task
+    pub fn inner(&self) -> &TableCell<Option<TaskInner<A, PT>>> {
         &self.inner
+    }
+
+    pub fn ppid(&self) -> Pid {
+        self.ppid.load(Ordering::Relaxed)
+    }
+
+    pub fn pgid(&self) -> Pid {
+        self.pgid.load(Ordering::Relaxed)
+    }
+
+    pub fn sid(&self) -> Pid {
+        self.sid.load(Ordering::Relaxed)
+    }
+
+    /// Seccomp mode (syscall entry)
+    pub fn seccomp_mode(&self) -> u8 {
+        self.seccomp_mode.load(Ordering::Relaxed)
+    }
+
+    /// The task's credentials, copied
+    ///
+    /// # Safety
+    /// The caller is the task itself, or holds TASK_TABLE.
+    pub unsafe fn cred(&self) -> Cred {
+        // SAFETY: see above
+        unsafe { self.cred.get() }
+    }
+
+    /// A reference to the task's credentials
+    ///
+    /// # Safety
+    /// As [`Task::cred`].
+    pub unsafe fn cred_arc(&self) -> Arc<Cred> {
+        // SAFETY: see above
+        unsafe { self.cred.arc() }
+    }
+
+    /// Install new credentials, returning the old ones (dropped by the
+    /// caller after TASK_TABLE)
+    ///
+    /// # Safety
+    /// The caller holds TASK_TABLE and is the task itself, or the task
+    /// has not run yet.
+    pub unsafe fn set_cred(&self, new: Arc<Cred>) -> Option<Arc<Cred>> {
+        // SAFETY: see above
+        unsafe { self.cred.replace(new) }
+    }
+
+    /// The address space
+    ///
+    /// # Safety
+    /// As [`Task::cred`].
+    pub unsafe fn mm(&self) -> &Option<crate::mm::MmRef> {
+        // SAFETY: see above
+        unsafe { self.mm.get() }
+    }
+
+    /// Replace the address space, returning the old one
+    ///
+    /// # Safety
+    /// As [`Task::set_cred`].
+    pub unsafe fn set_mm(&self, mm: Option<crate::mm::MmRef>) -> Option<crate::mm::MmRef> {
+        // SAFETY: see above
+        unsafe { self.mm.replace(mm) }
+    }
+
+    /// The descriptor table
+    ///
+    /// # Safety
+    /// As [`Task::cred`].
+    pub unsafe fn files(&self) -> &Option<Arc<fdtable::Files>> {
+        // SAFETY: see above
+        unsafe { self.files.get() }
+    }
+
+    /// Replace the descriptor table, returning the old one
+    ///
+    /// # Safety
+    /// As [`Task::set_cred`].
+    pub unsafe fn set_files(
+        &self,
+        files: Option<Arc<fdtable::Files>>,
+    ) -> Option<Arc<fdtable::Files>> {
+        // SAFETY: see above
+        unsafe { self.files.replace(files) }
     }
 
     /// Linux PF_* test
@@ -1839,32 +1969,24 @@ pub const IOPRIO_WHO_USER: i32 = 3;
 // Per-task Thread-Local Storage (TLS) pointer
 // =============================================================================
 //
-// TLS is stored directly in the Task struct (tls_base field), following the
-// Linux pattern where it's stored in task_struct->thread.fsbase.
-//
-// Access pattern (Linux-compatible):
-// - TASK_TABLE.lock() for short critical section
-// - Direct field access (O(1) once task is found)
+// `Task.tls` (Linux thread.fsbase / thread.uw.tp_value): written by the
+// task itself (arch_prctl, the switch-out save) or its creator, read at
+// switch-in.
 
-/// Get the TLS pointer for a task
+/// The TLS pointer of task `tid` (None if unset)
 pub fn get_task_tls(tid: Tid) -> Option<u64> {
     let table = percpu::TASK_TABLE.lock();
-    table.get(tid).map(|t| t.tls_base).filter(|&v| v != 0)
+    table
+        .get(tid)
+        .map(|t| t.task.tls.load(Ordering::Relaxed))
+        .filter(|&v| v != 0)
 }
 
-/// Set the TLS pointer for a task
+/// Set the TLS pointer of task `tid` (the task itself, or ptrace on a
+/// stopped tracee)
 pub fn set_task_tls(tid: Tid, tls: u64) {
-    let mut table = percpu::TASK_TABLE.lock();
-    if let Some(mut task) = table.get_mut(tid) {
-        task.tls_base = tls;
-    }
-}
-
-/// Remove the TLS pointer for a task (on exit)
-pub fn remove_task_tls(tid: Tid) {
-    let mut table = percpu::TASK_TABLE.lock();
-    if let Some(mut task) = table.get_mut(tid) {
-        task.tls_base = 0;
+    if let Some(t) = percpu::TASK_TABLE.lock().get(tid) {
+        t.task.tls.store(tls, Ordering::Relaxed);
     }
 }
 

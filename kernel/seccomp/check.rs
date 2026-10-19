@@ -162,19 +162,12 @@ fn check_syscall_impl(
     arg4: u64,
     arg5: u64,
 ) -> Option<u64> {
-    use crate::arch::PerCpuOps;
-
-    // Fast path: check per-CPU cached seccomp_mode (no lock needed!)
-    // This follows Linux's approach of checking TIF_SECCOMP flag.
-    #[cfg(target_arch = "x86_64")]
-    type CurrentArch = crate::arch::x86_64::X86_64Arch;
-    #[cfg(target_arch = "aarch64")]
-    type CurrentArch = crate::arch::aarch64::Aarch64Arch;
-
-    let current_task = CurrentArch::get_current_task();
+    // Fast path: the current task's mode, lock-free (Linux TIF_SECCOMP)
+    let me = crate::task::percpu::current();
+    let mode = me.seccomp_mode();
 
     // Most tasks have seccomp disabled - fast return
-    if current_task.seccomp_mode == SECCOMP_MODE_DISABLED {
+    if mode == SECCOMP_MODE_DISABLED {
         return None;
     }
 
@@ -184,14 +177,13 @@ fn check_syscall_impl(
     let filter = {
         let table = TASK_TABLE.lock();
         // No task found -> allow (shouldn't happen)
-        let task = table.get(current_task.tid)?;
+        let task = table.get(me.tid)?;
         task.seccomp_filter.clone()
     };
 
     // Run the check
     let args = [arg0, arg1, arg2, arg3, arg4, arg5];
-    check_syscall(current_task.seccomp_mode, filter.as_ref(), nr, ip, args)
-        .map(|errno| errno as u64)
+    check_syscall(mode, filter.as_ref(), nr, ip, args).map(|errno| errno as u64)
 }
 
 #[cfg(target_arch = "x86_64")]

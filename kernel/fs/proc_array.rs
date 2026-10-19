@@ -69,22 +69,32 @@ struct Snap {
 /// Copy process `pid` (its first task, the leader) out of TASK_TABLE
 fn snap(pid: Pid) -> Option<Snap> {
     let table = TASK_TABLE.lock();
-    let t = table.find(|t| t.tgid == pid)?;
-    let threads = table.iter().filter(|x| x.tgid == pid).count() as u64;
+    let t = table.find(|t| t.task.pid == pid)?;
+    let threads = table.iter().filter(|x| x.task.pid == pid).count() as u64;
     let tracer = t
         .ptracer_tid
         .and_then(|tr| table.get(tr))
-        .map_or(0, |x| x.tgid);
+        .map_or(0, |x| x.task.pid);
     Some(Snap {
         pid,
         tid: t.task.tid,
-        tgid: t.tgid,
-        ppid: t.ppid,
-        pgid: t.pgid,
-        sid: t.sid,
+        tgid: t.task.pid,
+        ppid: t.task.ppid(),
+        pgid: t.task.pgid(),
+        sid: t.task.sid(),
         comm: t.prctl.name,
-        state: t.state,
-        cred: *t.cred,
+        state: match t.state {
+            // The run state as of its last switch (Linux task_state)
+            TaskState::Ready | TaskState::Running | TaskState::Sleeping => {
+                if t.task.sleeping.load(core::sync::atomic::Ordering::Relaxed) {
+                    TaskState::Sleeping
+                } else {
+                    TaskState::Running
+                }
+            }
+            s => s,
+        },
+        cred: t.cred(),
         kthread: matches!(t.task.kind, TaskKind::KernelThread),
         exiting: t.task.has_flag(crate::task::pf::EXITING),
         utime: t.task.utime.load(core::sync::atomic::Ordering::Relaxed),
@@ -104,14 +114,14 @@ fn snap(pid: Pid) -> Option<Snap> {
         threads,
         tracer,
         no_new_privs: t.prctl.no_new_privs,
-        seccomp: t.seccomp_mode,
+        seccomp: t.task.seccomp_mode(),
         blocked: t.signal_state.blocked.0,
         pending: t.signal_state.pending.signal.0,
         shared: Some(t.signal_state.shared_pending.clone()),
         sighand: t.sighand.clone(),
         signal: t.signal.clone(),
         fs: t.fs.clone(),
-        files: t.files.clone(),
+        files: t.files().cloned(),
     })
 }
 

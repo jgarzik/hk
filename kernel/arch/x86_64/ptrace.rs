@@ -107,7 +107,7 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
         eflags: tf.rflags,
         rsp: tf.rsp,
         ss: 0x2b, // User stack segment
-        fs_base: task.tls_base,
+        fs_base: task.task.tls.load(core::sync::atomic::Ordering::Relaxed),
         gs_base: 0,
         ds: 0x2b,
         es: 0x2b,
@@ -164,7 +164,9 @@ pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
     tf.rflags = sanitize_rflags(regs.eflags);
     tf.rsp = regs.rsp;
 
-    task.tls_base = regs.fs_base;
+    task.task
+        .tls
+        .store(regs.fs_base, core::sync::atomic::Ordering::Relaxed);
 
     Ok(())
 }

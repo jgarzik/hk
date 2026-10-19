@@ -10,7 +10,6 @@
 //! save/restore TPIDR_EL0 in Rust before calling the pure-asm switch.
 
 use super::percpu::write_tpidr_el0;
-use crate::task::{Tid, get_task_tls};
 
 // External assembly functions from switch_to.S
 unsafe extern "C" {
@@ -242,18 +241,15 @@ pub extern "C" fn clone_child_entry() -> ! {
 /// - `new_kstack` should be the new kernel stack top (informational on aarch64)
 /// - the next task's TTBR0 is loaded (`mm::tlb::switch_mm`)
 /// - Interrupts should be disabled during the switch
-/// - `next_tid` must be the TID of the task we're switching to
+/// - `next_tls` is the next task's user TLS register value
 pub unsafe fn context_switch(
     old_ctx: *mut Aarch64TaskContext,
     new_ctx: *const Aarch64TaskContext,
     new_kstack: u64,
-    next_tid: Tid,
+    next_tls: u64,
 ) {
-    // Load next task's TLS (TPIDR_EL0) before switching
-    if next_tid != 0 {
-        let tls = get_task_tls(next_tid).unwrap_or(0);
-        write_tpidr_el0(tls);
-    }
+    // Load next task's user TLS register (TPIDR_EL0)
+    write_tpidr_el0(next_tls);
 
     unsafe {
         __switch_to_asm(old_ctx, new_ctx, new_kstack);
@@ -271,13 +267,10 @@ pub unsafe fn context_switch(
 pub unsafe fn context_switch_first(
     new_ctx: *const Aarch64TaskContext,
     new_kstack: u64,
-    next_tid: Tid,
+    next_tls: u64,
 ) -> ! {
-    // Load next task's TLS (TPIDR_EL0) - no prev task to save
-    if next_tid != 0 {
-        let tls = get_task_tls(next_tid).unwrap_or(0);
-        write_tpidr_el0(tls);
-    }
+    // Load next task's user TLS register (TPIDR_EL0)
+    write_tpidr_el0(next_tls);
 
     unsafe {
         __switch_to_asm_first(new_ctx, new_kstack);

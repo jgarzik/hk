@@ -806,7 +806,12 @@ pub fn exit_task_signal(tid: Tid) {
 /// SIGKILL is pending for the current task (Linux
 /// fatal_signal_pending): killable sleeps end on it
 pub fn fatal_signal_pending() -> bool {
-    let tid = crate::task::percpu::current_tid();
+    let me = crate::task::percpu::current();
+    // SIGKILL cannot be blocked: pending, it sets TIF_SIGPENDING
+    if !me.sigpending() {
+        return false;
+    }
+    let tid = me.tid;
     let table = TASK_TABLE.lock();
     table.get(tid).is_some_and(|t| {
         let s = &t.signal_state;
@@ -816,6 +821,11 @@ pub fn fatal_signal_pending() -> bool {
 
 /// Check if a task has pending signals (fast path)
 pub fn has_pending_signals(tid: Tid) -> bool {
+    // The current task's TIF_SIGPENDING, lock-free
+    let me = crate::task::percpu::current();
+    if me.tid == tid {
+        return me.sigpending();
+    }
     let table = TASK_TABLE.lock();
     table.get(tid).map(|t| t.task.sigpending()).unwrap_or(false)
 }
@@ -908,11 +918,11 @@ pub fn send_signal_to_process(pid: Pid, sig: u32) -> i32 {
     let tid = {
         let table = crate::task::percpu::TASK_TABLE.lock();
         let live = |t: &crate::task::percpu::TaskView<'_>| {
-            t.pid == pid
+            t.task.pid == pid
                 && !t.task.has_flag(crate::task::pf::EXITING)
                 && !matches!(t.state, crate::task::TaskState::Zombie(_))
         };
-        let leader = table.find(|t| t.pid == pid && t.leader);
+        let leader = table.find(|t| t.task.pid == pid && t.leader);
         match leader {
             Some(l) if live(&l) => Some(l.task.tid),
             _ => table.find(live).or(leader).map(|t| t.task.tid),
@@ -943,7 +953,7 @@ pub fn send_signal_to_pgrp(pgid: Pid, sig: u32) -> i32 {
         let table = TASK_TABLE.lock();
         table
             .iter()
-            .filter(|t| t.pgid == pgid)
+            .filter(|t| t.task.pgid() == pgid)
             .map(|t| t.task.tid)
             .collect()
     };
@@ -992,7 +1002,7 @@ fn group_kill(tid: Tid, sig: u32) {
         let table = TASK_TABLE.lock();
         table
             .get(tid)
-            .map(|t| (t.tgid, t.ptrace != 0, group_signal(&table, t.tgid)))
+            .map(|t| (t.task.pid, t.ptrace != 0, group_signal(&table, t.task.pid)))
     };
     let Some((tgid, traced, Some(s))) = found else {
         return;
@@ -1009,12 +1019,12 @@ fn group_signal(
     tgid: Pid,
 ) -> Option<Arc<SignalStruct>> {
     table
-        .find(|t| t.tgid == tgid && t.leader)
+        .find(|t| t.task.pid == tgid && t.leader)
         .and_then(|t| t.signal.clone())
         .or_else(|| {
             table
                 .iter()
-                .filter(|t| t.tgid == tgid)
+                .filter(|t| t.task.pid == tgid)
                 .find_map(|t| t.signal.clone())
         })
 }
@@ -1030,7 +1040,7 @@ fn zap_threads(tgid: Pid, except: Option<Tid>) {
         table
             .iter_mut()
             .filter(|t| {
-                t.tgid == tgid
+                t.task.pid == tgid
                     && Some(t.task.tid) != except
                     && !t.task.has_flag(crate::task::pf::EXITING)
                     && !matches!(t.state, crate::task::TaskState::Zombie(_))

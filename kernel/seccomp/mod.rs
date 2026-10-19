@@ -172,7 +172,9 @@ pub fn exit_seccomp(tid: Tid) {
     let _old = {
         let mut table = TASK_TABLE.lock();
         table.get_mut(tid).and_then(|mut task| {
-            task.seccomp_mode = SECCOMP_MODE_DISABLED;
+            task.task
+                .seccomp_mode
+                .store(SECCOMP_MODE_DISABLED, core::sync::atomic::Ordering::Relaxed);
             task.seccomp_filter.take()
         })
     };

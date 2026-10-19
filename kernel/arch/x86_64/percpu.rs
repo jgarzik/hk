@@ -3,8 +3,7 @@
 //! This module provides per-CPU data storage accessed via the GS segment.
 //! Each CPU has its own `PerCpu` structure containing CPU-local state.
 
-use crate::task::CurrentTask;
-use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Per-CPU data slots (logical CPU ids are below this)
 pub const MAX_CPUS: usize = crate::cpumask::NR_CPUS;
@@ -36,8 +35,9 @@ pub struct PerCpu {
     /// Timer tick count for this CPU
     pub ticks: AtomicU64,
 
-    /// Currently running task TID (0 = none/idle)
-    pub current_tid: AtomicU32,
+    /// The running task (`*const KernelTask`; 0: the boot task,
+    /// `task::percpu::INIT_TASK`), set by the scheduler at each switch
+    pub curr: AtomicUsize,
 
     /// Flag set by timer interrupt to request reschedule
     pub needs_reschedule: AtomicBool,
@@ -54,9 +54,6 @@ pub struct PerCpu {
     ///
     /// Preemption is only allowed when this reaches 0 and need_resched is set.
     pub preempt_count: AtomicU32,
-
-    /// Current task state including credentials (arch-neutral)
-    pub current_task: CurrentTask,
 
     /// Saved user RIP from syscall entry (RCX register)
     /// Used by clone() to set up child's return address
@@ -203,11 +200,10 @@ impl PerCpu {
             is_online: AtomicBool::new(false),
             kernel_stack_top: 0,
             ticks: AtomicU64::new(0),
-            current_tid: AtomicU32::new(0),
+            curr: AtomicUsize::new(0),
             needs_reschedule: AtomicBool::new(false),
             interrupt_depth: AtomicU32::new(0),
             preempt_count: AtomicU32::new(0),
-            current_task: CurrentTask::new(),
             syscall_user_rip: 0,
             syscall_user_rflags: 0,
             syscall_user_rsp: 0,
@@ -241,11 +237,10 @@ impl PerCpu {
         self.is_bsp = is_bsp;
         self.kernel_stack_top = kernel_stack_top;
         self.ticks.store(0, Ordering::Relaxed);
-        self.current_tid.store(0, Ordering::Relaxed);
+        self.curr.store(0, Ordering::Relaxed);
         self.needs_reschedule.store(false, Ordering::Relaxed);
         self.interrupt_depth.store(0, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
-        self.current_task = CurrentTask::new();
         self.syscall_user_rip = 0;
         self.syscall_user_rflags = 0;
         self.syscall_user_rsp = 0;
@@ -322,9 +317,6 @@ pub fn init_bsp(apic_id: u8, kernel_stack_top: u64) {
 
     let percpu = get_percpu(0);
     percpu.init(0, apic_id as u32, true, kernel_stack_top);
-
-    // The boot context runs as root until the first task (Linux init_task)
-    percpu.current_task = CurrentTask::boot();
 
     // Set GS base to point to our per-CPU data
     set_gs_base(percpu as *mut PerCpu as u64);
@@ -829,7 +821,6 @@ pub fn store_user_regs_to_trapframe(f: &mut super::X86_64TrapFrame) {
 // ============================================================================
 
 use crate::arch::PerCpuOps;
-use crate::task::Tid;
 
 use super::X86_64Arch;
 
@@ -840,20 +831,17 @@ impl PerCpuOps for X86_64Arch {
     }
 
     #[inline]
-    fn current_tid() -> Tid {
-        try_current_cpu()
-            .map(|percpu| percpu.current_tid.load(Ordering::Relaxed) as Tid)
-            .unwrap_or(0)
+    fn current_task_ptr() -> usize {
+        match try_current_cpu() {
+            Some(p) => p.curr.load(Ordering::Relaxed),
+            None => crate::task::percpu::no_percpu_task(),
+        }
     }
 
     #[inline]
-    fn set_current_tid(tid: Tid) {
-        if try_current_cpu().is_some() {
-            unsafe {
-                current_cpu_mut()
-                    .current_tid
-                    .store(tid as u32, Ordering::Relaxed);
-            }
+    fn set_current_task_ptr(t: usize) {
+        if let Some(p) = try_current_cpu() {
+            p.curr.store(t, Ordering::Relaxed);
         }
     }
 
@@ -887,25 +875,6 @@ impl PerCpuOps for X86_64Arch {
         try_current_cpu()
             .map(|percpu| percpu.interrupt_depth.load(Ordering::Relaxed))
             .unwrap_or(0)
-    }
-
-    #[inline]
-    fn get_current_task() -> CurrentTask {
-        try_current_cpu()
-            .map(|percpu| percpu.current_task)
-            .unwrap_or_else(crate::task::percpu::no_percpu_task)
-    }
-
-    #[inline]
-    fn set_current_task(task: &CurrentTask) {
-        if try_current_cpu().is_some() {
-            unsafe {
-                current_cpu_mut().current_task.set(
-                    task.tid, task.pid, task.ppid, task.pgid, task.sid, task.cred,
-                );
-                current_cpu_mut().current_task.exiting = task.exiting;
-            }
-        }
     }
 
     #[inline]

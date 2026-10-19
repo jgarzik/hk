@@ -31,8 +31,6 @@ extern crate alloc;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 
-use crate::task::{CurrentTask, Tid};
-
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 
@@ -318,13 +316,13 @@ pub trait PerCpuOps {
     /// Returns None if per-CPU data is not yet initialized (early boot).
     fn try_current_cpu_id() -> Option<u32>;
 
-    /// Get the current thread ID from per-CPU data
-    ///
-    /// Returns 0 if no task is running or per-CPU not initialized.
-    fn current_tid() -> Tid;
+    /// The running task (`*const KernelTask`), 0 for the boot task
+    /// (before the first switch, or before per-CPU data exists)
+    fn current_task_ptr() -> usize;
 
-    /// Set the current thread ID in per-CPU data
-    fn set_current_tid(tid: Tid);
+    /// Record the task this CPU switches to (the scheduler, with the
+    /// run-queue lock held; the run queue keeps it alive)
+    fn set_current_task_ptr(p: usize);
 
     /// Check if reschedule is needed on this CPU
     fn needs_reschedule() -> bool;
@@ -337,12 +335,6 @@ pub trait PerCpuOps {
 
     /// Get the interrupt nesting depth
     fn interrupt_depth() -> u32;
-
-    /// Get the current task context (credentials, pid, etc.)
-    fn get_current_task() -> CurrentTask;
-
-    /// Set the current task context
-    fn set_current_task(task: &CurrentTask);
 
     /// Get saved syscall user RIP (return address for clone/fork)
     fn get_syscall_user_rip() -> u64;
@@ -433,7 +425,7 @@ pub trait ContextOps: Sized {
         old_ctx: *mut Self::TaskContext,
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        next_tid: Tid,
+        next_tls: u64,
     );
 
     /// Switch to a task without saving current context
@@ -446,7 +438,7 @@ pub trait ContextOps: Sized {
     unsafe fn context_switch_first(
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        next_tid: Tid,
+        next_tls: u64,
     ) -> !;
 }
 

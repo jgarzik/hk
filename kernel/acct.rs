@@ -351,7 +351,7 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
     comm[..name_len].copy_from_slice(&name_bytes[..name_len]);
 
     // Get credentials - Arc<Cred> can be dereferenced directly
-    let cred = &*task.cred;
+    let cred = &task.cred();
     let (uid, euid, gid) = (cred.uid, cred.euid, cred.gid);
 
     // Calculate elapsed time using task.start_time (monotonic ns since boot)
@@ -377,7 +377,7 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
         uid,
         euid,
         gid,
-        ppid: task.ppid,
+        ppid: task.task.ppid(),
         tty: 0, // TODO: Get controlling terminal
         start_time,
         elapsed_ns,

@@ -43,7 +43,7 @@ fn current_time() -> Timespec {
 fn task_exists(pid: Pid) -> bool {
     use crate::task::percpu::TASK_TABLE;
     let table = TASK_TABLE.lock();
-    table.iter().any(|t| t.pid == pid)
+    table.iter().any(|t| t.task.pid == pid)
 }
 
 /// Public version of task_exists for use by setns
@@ -58,7 +58,7 @@ pub fn task_exists_pub(pid: Pid) -> bool {
 pub fn get_tid_for_pid(pid: Pid) -> Option<crate::task::Tid> {
     use crate::task::percpu::TASK_TABLE;
     let table = TASK_TABLE.lock();
-    table.find(|t| t.pid == pid).map(|t| t.task.tid)
+    table.find(|t| t.task.pid == pid).map(|t| t.task.tid)
 }
 
 /// Inode number for per-PID directories
@@ -1006,12 +1006,12 @@ fn dump_owner(pid: Pid) -> (u32, u32) {
     use crate::task::percpu::TASK_TABLE;
     let table = TASK_TABLE.lock();
     table
-        .find(|t| t.tgid == pid)
+        .find(|t| t.task.pid == pid)
         .filter(|t| {
-            t.mm.as_ref()
+            t.mm()
                 .is_none_or(|m| m.dumpable() == crate::task::dumpable::SUID_DUMP_USER)
         })
-        .map_or((0, 0), |t| (t.cred.euid, t.cred.egid))
+        .map_or((0, 0), |t| (t.cred().euid, t.cred().egid))
 }
 
 /// The process a per-process file belongs to
@@ -1434,7 +1434,11 @@ fn readdir_emit_pids(proc_ino: u64, ctx: &mut DirContext) -> Result<(), KernelEr
     // Collect PIDs first to release lock quickly (sorted, unique)
     let pids: alloc::collections::BTreeSet<Pid> = {
         let table = TASK_TABLE.lock();
-        table.iter().map(|t| t.pid).filter(|&p| p != 0).collect()
+        table
+            .iter()
+            .map(|t| t.task.pid)
+            .filter(|&p| p != 0)
+            .collect()
     };
 
     for pid in pids {

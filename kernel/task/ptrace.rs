@@ -207,7 +207,7 @@ fn ptrace_check_attach(target_tid: Tid) -> Result<(), i64> {
 /// Find a task by PID (thread group leader)
 fn find_task_by_pid(pid: Pid) -> Option<Tid> {
     let table = TASK_TABLE.lock();
-    table.find(|t| t.pid == pid).map(|t| t.task.tid)
+    table.find(|t| t.task.pid == pid).map(|t| t.task.tid)
 }
 
 /// Check if a task is being traced
@@ -256,7 +256,7 @@ fn ptrace_traceme() -> i64 {
     }
 
     // Set up tracing - parent becomes tracer
-    let ppid = task.ppid;
+    let ppid = task.task.ppid();
     task.ptrace = PT_PTRACED;
     task.ptracer_tid = Some(ppid);
     task.real_parent_tid = ppid;
@@ -857,7 +857,7 @@ pub fn may_read_proc(pid: crate::task::Pid) -> bool {
     if pid == percpu::current_pid() {
         return true;
     }
-    may_access(|t| t.tgid == pid, true)
+    may_access(|t| t.task.pid == pid, true)
 }
 
 /// [`may_read_proc`] for task `tid` itself (tids are never reused): a
@@ -867,7 +867,7 @@ pub fn may_read_task(tid: Tid) -> bool {
     let own = TASK_TABLE
         .lock()
         .iter()
-        .any(|t| t.task.tid == tid && t.tgid == me);
+        .any(|t| t.task.tid == tid && t.task.pid == me);
     own || may_access(|t| t.task.tid == tid, true)
 }
 
@@ -883,7 +883,7 @@ pub fn may_access(pick: impl Fn(&percpu::TaskView<'_>) -> bool, fscreds: bool) -
         let table = TASK_TABLE.lock();
         table
             .find(|t| pick(t))
-            .map(|t| (*t.cred, t.mm.as_ref().map(|m| m.dumpable())))
+            .map(|t| (t.cred(), t.mm().map(|m| m.dumpable())))
     };
     let Some((c, dumpable)) = target else {
         return false;

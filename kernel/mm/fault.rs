@@ -593,7 +593,7 @@ pub fn pagefault_out_of_memory() -> ! {
     let (pid, name) = {
         let table = TASK_TABLE.lock();
         let me = table.get(tid);
-        let pid = me.map_or(0, |t| t.pid);
+        let pid = me.map_or(0, |t| t.task.pid);
         let name = me.map_or([0; 16], |t| t.prctl.name);
         (pid, name)
     };
