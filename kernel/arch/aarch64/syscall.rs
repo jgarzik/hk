@@ -694,12 +694,8 @@ pub fn aarch64_syscall_dispatch(
 
         // System information
         SYS_GETCPU => {
-            use crate::arch::{PerCpuOps, Uaccess};
-            crate::task::syscall::sys_getcpu::<Uaccess>(
-                crate::arch::CurrentArch::try_current_cpu_id().unwrap_or(0),
-                arg0,
-                arg1,
-            ) as u64
+            use crate::arch::Uaccess;
+            crate::task::syscall::sys_getcpu::<Uaccess>(crate::cpu::this_id(), arg0, arg1) as u64
         }
 
         // Sync operations

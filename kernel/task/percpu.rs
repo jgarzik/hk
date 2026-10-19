@@ -14,6 +14,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::arch::{ContextOps, CpuOps, FrameAlloc, IrqSpinlock, PerCpuOps, SchedArch, UserModeOps};
+use crate::cpu::PerCpu;
 use crate::printkln;
 use crate::sync::spin::Mutex;
 use crate::task::sched::{PriorityRunQueue, SleepEntry};
@@ -489,7 +490,7 @@ impl Default for PerCpuScheduler {
 /// Global per-CPU scheduler array
 ///
 /// Each CPU accesses its own entry by CPU ID.
-static PERCPU_SCHEDS: [PerCpuScheduler; MAX_CPUS] = [const { PerCpuScheduler::new() }; MAX_CPUS];
+static PERCPU_SCHEDS: PerCpu<PerCpuScheduler> = crate::percpu![PerCpuScheduler::new()];
 
 /// Global task table (for looking up tasks by TID)
 ///
@@ -543,12 +544,12 @@ static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Get the per-CPU scheduler for a given CPU
 fn get_percpu_sched(cpu_id: u32) -> &'static PerCpuScheduler {
-    &PERCPU_SCHEDS[cpu_id as usize]
+    PERCPU_SCHEDS.get(cpu_id)
 }
 
 /// Get the per-CPU scheduler for the current CPU
 pub fn current_percpu_sched() -> Option<&'static PerCpuScheduler> {
-    CurrentArch::try_current_cpu_id().map(|cpu_id| &PERCPU_SCHEDS[cpu_id as usize])
+    crate::cpu::try_this_id().map(|cpu_id| PERCPU_SCHEDS.get(cpu_id))
 }
 
 /// Idle task entry function - runs when no other work is available
@@ -768,8 +769,8 @@ pub fn create_kthread_task(
 /// Give every online AP a scheduler (idle task); each AP switches into it
 /// from its boot idle loop via `try_schedule()`
 pub fn init_ap_schedulers<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) {
-    let bsp = CurrentArch::try_current_cpu_id().unwrap_or(0);
-    for cpu in 0..MAX_CPUS as u32 {
+    let bsp = crate::cpu::this_id();
+    for (cpu, _) in PERCPU_SCHEDS.for_each_possible() {
         if cpu != bsp
             && CurrentArch::cpu_online(cpu)
             && let Err(e) = create_idle_task(cpu, frame_alloc)
@@ -781,7 +782,9 @@ pub fn init_ap_schedulers<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) 
 
 /// Whether `cpu` runs a scheduler (can own tasks)
 pub fn cpu_has_scheduler(cpu: u32) -> bool {
-    (cpu as usize) < MAX_CPUS && get_percpu_sched(cpu).initialized.load(Ordering::Acquire)
+    PERCPU_SCHEDS
+        .try_get(cpu)
+        .is_some_and(|s| s.initialized.load(Ordering::Acquire))
 }
 
 /// Initialize the global scheduler with idle task for BSP
@@ -789,7 +792,7 @@ pub fn cpu_has_scheduler(cpu: u32) -> bool {
 /// Must be called with a frame allocator to create the BSP's idle task.
 pub fn init<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) {
     // Initialize BSP's per-CPU scheduler
-    let cpu_id = CurrentArch::try_current_cpu_id().unwrap_or(0);
+    let cpu_id = crate::cpu::this_id();
 
     printkln!("Per-CPU scheduler initialized for CPU {}", cpu_id);
 
@@ -816,7 +819,7 @@ pub fn enable() {
 /// # Arguments
 /// * `config` - User task configuration (pid, tid, ppid, pgid, sid, priority, stacks, page table)
 pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
-    let cpu_id = CurrentArch::try_current_cpu_id().unwrap_or(0);
+    let cpu_id = crate::cpu::this_id();
     // The first address space owns the boot-built tables
     let mm = crate::mm::mm_alloc(config.page_table.root_table_phys());
 
@@ -1274,7 +1277,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // If we incremented the process count and then fail, we must decrement it
 
     // Get current CPU ID
-    let cpu_id = CurrentArch::try_current_cpu_id().unwrap_or(0);
+    let cpu_id = crate::cpu::this_id();
 
     // Get parent task info
     let current_tid = current_tid();
@@ -2141,14 +2144,13 @@ pub fn schedule_timeout(timeout: u64) -> u64 {
 /// or tick (no cross-CPU rq locking). Returns true if a local sleeper was
 /// woken or a remote wakeup was posted.
 pub fn wake_up_task(tid: Tid, cpu: u32, mode: WakeMode) -> bool {
-    if cpu as usize >= MAX_CPUS {
+    let Some(target) = PERCPU_SCHEDS.try_get(cpu) else {
         return false;
-    }
-    let target = get_percpu_sched(cpu);
+    };
     if !target.initialized.load(Ordering::Acquire) {
         return false;
     }
-    if CurrentArch::try_current_cpu_id() == Some(cpu) {
+    if crate::cpu::try_this_id() == Some(cpu) {
         let mut rq = target.lock.lock();
         rq.try_wake(tid, mode)
     } else {
@@ -2171,11 +2173,6 @@ pub fn wake_up_tid(tid: Tid, mode: WakeMode) -> bool {
         }
     };
     wake_up_task(tid, cpu, mode)
-}
-
-/// CPU of the current task (tasks never migrate)
-pub fn current_cpu() -> u32 {
-    CurrentArch::try_current_cpu_id().unwrap_or(0)
 }
 
 /// Scheduler tick period (both arches program a 10 ms local timer)
@@ -2201,7 +2198,7 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
 /// their own scheduler work (remote wakeups, expired sleepers).
 pub fn scheduler_tick() {
     crate::sync::lockdep::irq_enter();
-    if CurrentArch::try_current_cpu_id() == Some(0) {
+    if crate::cpu::try_this_id() == Some(0) {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
         // Wake ktimerd if a software timer expired
         crate::timer::check_timers();

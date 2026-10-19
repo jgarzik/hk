@@ -383,7 +383,7 @@ The scheduler uses a per-CPU locking model to minimize contention.
 
 | Variable | Type | Purpose |
 |----------|------|---------|
-| `PERCPU_SCHEDS` | `[PerCpuScheduler; MAX_CPUS]` | Per-CPU scheduler array |
+| `PERCPU_SCHEDS` | `PerCpu<PerCpuScheduler>` | Per-CPU scheduler array |
 | `TASK_TABLE` | `Mutex<GlobalTaskTable>` | Global task registry |
 | `SCHEDULING_ENABLED` | `AtomicBool` | Global scheduling enable flag |
 | `TICK_COUNT` | `AtomicU64` | Global tick counter (jiffies, TICK_MS = 10 ms); advanced only by CPU 0's tick, which also runs `check_timers()`; every CPU's tick runs its own `wake_sleepers()` |

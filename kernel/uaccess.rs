@@ -22,35 +22,26 @@ extern crate alloc;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::arch::{CurrentArch, PerCpuOps};
+use crate::cpu::PerCpu;
 
 /// Per-CPU page-fault-disable depth (Linux pagefault_disable)
-static PF_DISABLE: [AtomicU32; <CurrentArch as PerCpuOps>::MAX_CPUS] =
-    [const { AtomicU32::new(0) }; <CurrentArch as PerCpuOps>::MAX_CPUS];
-
-fn pf_slot() -> Option<&'static AtomicU32> {
-    PF_DISABLE.get(CurrentArch::try_current_cpu_id()? as usize)
-}
+static PF_DISABLE: PerCpu<AtomicU32> = crate::percpu![AtomicU32::new(0)];
 
 /// Linux pagefault_disable: until `pagefault_enable`, a user access that
 /// faults is not resolved (no sleeping fault-in) but fails at once
 /// (EFAULT through the copy's fixup). For user reads under a spinlock
 /// (futex values); the caller stays on this CPU (it holds a spinlock).
 pub fn pagefault_disable() {
-    if let Some(s) = pf_slot() {
-        s.fetch_add(1, Ordering::Relaxed);
-    }
+    PF_DISABLE.this().fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn pagefault_enable() {
-    if let Some(s) = pf_slot() {
-        s.fetch_sub(1, Ordering::Relaxed);
-    }
+    PF_DISABLE.this().fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Faults on user addresses must not be resolved here
 pub fn pagefault_disabled() -> bool {
-    pf_slot().is_some_and(|s| s.load(Ordering::Relaxed) != 0)
+    PF_DISABLE.this().load(Ordering::Relaxed) != 0
 }
 
 /// Linux might_fault: a user access may sleep resolving a fault, unless

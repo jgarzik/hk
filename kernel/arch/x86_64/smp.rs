@@ -299,11 +299,11 @@ pub extern "C" fn ap_entry(_cpu_id: u32, apic_id: u32) -> ! {
         ::core::arch::asm!("mov {}, rsp", out(reg) kernel_stack);
     }
 
+    // Per-CPU data first: everything after it may use cpu::this_id()
+    let cpu_id = percpu::init_ap(apic_id as u8, kernel_stack);
+
     // Same FP/SIMD setup as the BSP (CR4.OSXSAVE/XCR0 are per CPU)
     super::fpu::init_cpu(false);
-
-    // Initialize per-CPU data for this AP
-    let cpu_id = percpu::init_ap(apic_id as u8, kernel_stack);
 
     // Enable local APIC for this AP
     let lapic = super::lapic::LocalApic::get();

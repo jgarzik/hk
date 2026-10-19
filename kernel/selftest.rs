@@ -75,7 +75,7 @@ fn selftest_thread(_arg: usize) {
     check("delayed_work_delay", ran >= t0 + 5, ran.saturating_sub(t0));
 
     // 4. kthread park/unpark/stop with the child on another CPU
-    let other = if crate::task::percpu::current_cpu() == 0 && cpu_has_scheduler(1) {
+    let other = if crate::cpu::this_id() == 0 && cpu_has_scheduler(1) {
         1
     } else {
         0
@@ -164,15 +164,13 @@ fn selftest_thread(_arg: usize) {
 /// Calls each stress thread makes to every other CPU
 const IPI_ROUNDS: u64 = 300;
 /// Calls run on each CPU by the stress test
-static IPI_RECV: [AtomicU64; crate::cpumask::NR_CPUS] =
-    [const { AtomicU64::new(0) }; crate::cpumask::NR_CPUS];
+static IPI_RECV: crate::cpu::PerCpu<AtomicU64> = crate::percpu![AtomicU64::new(0)];
 /// Stress threads finished
 static IPI_DONE: AtomicU64 = AtomicU64::new(0);
 
 /// One stress call: count it on the CPU running it
 fn ipi_count(_info: usize) {
-    let cpu = crate::task::percpu::current_cpu() as usize;
-    IPI_RECV[cpu].fetch_add(1, Ordering::Relaxed);
+    IPI_RECV.this().fetch_add(1, Ordering::Relaxed);
 }
 
 /// A stress thread (one per CPU, all at once): rounds of calls to every
@@ -205,7 +203,7 @@ fn ipi_stress() -> Result<(), (&'static str, u64)> {
     if n < 2 {
         return Ok(());
     }
-    for c in &IPI_RECV {
+    for (_, c) in IPI_RECV.for_each_possible() {
         c.store(0, Ordering::Relaxed);
     }
     IPI_DONE.store(0, Ordering::Relaxed);
@@ -226,7 +224,7 @@ fn ipi_stress() -> Result<(), (&'static str, u64)> {
     }
     let want = (n - 1) * IPI_ROUNDS + n;
     for cpu in cpus.iter() {
-        let got = IPI_RECV[cpu as usize].load(Ordering::Relaxed);
+        let got = IPI_RECV.get(cpu).load(Ordering::Relaxed);
         if got != want {
             return Err(("ipi_stress_count", got));
         }
@@ -286,7 +284,7 @@ fn canary_wait(phase: u64) -> bool {
 fn tlb_canary() -> Result<(), (&'static str, u64)> {
     const OLD: u64 = 0x01d0_1d01_d01d_0001;
     const NEW: u64 = 0x0ee0_0ee0_0ee0_0002;
-    let me = crate::task::percpu::current_cpu();
+    let me = crate::cpu::this_id();
     let Some(other) = crate::smp::active_cpus().iter().find(|&c| c != me) else {
         return Ok(());
     };

@@ -23,6 +23,7 @@
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering, fence};
 
 use crate::arch::{CurrentArch, PerCpuOps, local_irq_restore, local_irq_save};
+use crate::cpu::{PerCpu, this_id};
 use crate::cpumask::{CpuMask, CpuSet, NR_CPUS};
 
 /// One call (Linux call_single_data)
@@ -54,18 +55,12 @@ impl Csd {
 static CFD: [[Csd; NR_CPUS]; NR_CPUS] = [const { [const { Csd::new() }; NR_CPUS] }; NR_CPUS];
 
 /// Per-CPU queue of calls to run there (Linux call_single_queue)
-static QUEUE: [AtomicPtr<Csd>; NR_CPUS] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; NR_CPUS];
+static QUEUE: PerCpu<AtomicPtr<Csd>> = crate::percpu![AtomicPtr::new(core::ptr::null_mut())];
 
 /// CPUs that take call-function IPIs (Linux cpu_active_mask): set by
 /// each CPU once it services interrupts. One global mask: every sender
 /// needs every CPU's state, and it changes once per CPU at boot.
 static ACTIVE: CpuMask = CpuMask::new();
-
-/// This CPU's id (0 before per-CPU data exists: only the boot CPU runs)
-fn this_cpu() -> u32 {
-    CurrentArch::try_current_cpu_id().unwrap_or(0)
-}
 
 /// This CPU now services call-function IPIs (its interrupt controller
 /// is up and interrupts are enabled)
@@ -87,7 +82,7 @@ pub fn active_cpus() -> CpuSet {
 /// finished it. Thread context only; interrupts may be off.
 pub fn smp_call_function_many(mask: &CpuSet, func: fn(usize), info: usize, wait: bool) {
     check_context();
-    let me = this_cpu();
+    let me = this_id();
     let mut targets = mask.and(&ACTIVE.snapshot());
     targets.clear(me);
     let row = &CFD[me as usize];
@@ -98,7 +93,7 @@ pub fn smp_call_function_many(mask: &CpuSet, func: fn(usize), info: usize, wait:
         csd.func.store(func as usize, Ordering::Relaxed);
         csd.info.store(info, Ordering::Relaxed);
         csd.locked.store(true, Ordering::Relaxed);
-        if enqueue(&QUEUE[cpu as usize], csd) {
+        if enqueue(QUEUE.get(cpu), csd) {
             crate::arch::ipi::send_call_function(cpu);
         }
     }
@@ -122,7 +117,7 @@ pub fn on_each_cpu(func: fn(usize), info: usize) {
 /// Ask `cpu` to reschedule (Linux smp_send_reschedule): wakes it from
 /// idle to pick up a remote wakeup. Any context.
 pub fn smp_send_reschedule(cpu: u32) {
-    if cpu != this_cpu() && ACTIVE.test(cpu) {
+    if cpu != this_id() && ACTIVE.test(cpu) {
         crate::arch::ipi::send_reschedule(cpu);
     }
 }
@@ -153,7 +148,7 @@ fn csd_wait(csd: &Csd, me: u32) {
 /// Run the calls queued for this CPU now, with interrupts off (the IPI
 /// handler may otherwise run calls concurrently on this CPU)
 fn poll(me: u32) {
-    if !QUEUE[me as usize].load(Ordering::Relaxed).is_null() {
+    if !QUEUE.get(me).load(Ordering::Relaxed).is_null() {
         let irq = local_irq_save();
         run_queue(me);
         local_irq_restore(irq);
@@ -163,7 +158,7 @@ fn poll(me: u32) {
 /// Call-function IPI handler (interrupts off, arch IPI entry): run the
 /// calls queued for this CPU (Linux generic_smp_call_function_interrupt)
 pub fn call_function_interrupt() {
-    run_queue(this_cpu());
+    run_queue(this_id());
 }
 
 /// Reschedule IPI handler: the woken task is picked at this CPU's next
@@ -175,7 +170,7 @@ pub fn reschedule_interrupt() {
 /// Take every call queued for `me` and run them in queue order
 fn run_queue(me: u32) {
     // Acquire: pairs with the senders' Release pushes
-    let mut list = QUEUE[me as usize].swap(core::ptr::null_mut(), Ordering::Acquire);
+    let mut list = QUEUE.get(me).swap(core::ptr::null_mut(), Ordering::Acquire);
     // LIFO to FIFO (Linux llist_reverse_order)
     let mut fifo: *mut Csd = core::ptr::null_mut();
     while !list.is_null() {

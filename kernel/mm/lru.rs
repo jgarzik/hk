@@ -25,7 +25,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::FRAME_ALLOCATOR;
 use crate::arch::IrqSpinlock;
-use crate::cpumask::NR_CPUS;
+use crate::cpu::PerCpu;
 use crate::mm::page::{PG_ACTIVE, PG_LRU, Page, pfn_to_page, phys_to_page};
 
 /// The lists (Linux enum lru_list)
@@ -143,12 +143,10 @@ struct Batch {
     pfn: [u64; BATCH],
 }
 
-static BATCHES: [IrqSpinlock<Batch>; NR_CPUS] = [const {
-    IrqSpinlock::new(Batch {
-        n: 0,
-        pfn: [0; BATCH],
-    })
-}; NR_CPUS];
+static BATCHES: PerCpu<IrqSpinlock<Batch>> = crate::percpu![IrqSpinlock::new(Batch {
+    n: 0,
+    pfn: [0; BATCH],
+})];
 
 /// Move pages to the head of the inactive list, then drop the batch's
 /// references (after the lock)
@@ -186,7 +184,7 @@ pub fn lru_add(phys: u64) {
         return;
     };
     let full = {
-        let mut b = BATCHES[cpu].lock();
+        let mut b = BATCHES.get(cpu as u32).lock();
         let n = b.n;
         b.pfn[n] = pfn;
         b.n += 1;
@@ -202,9 +200,9 @@ fn take(b: &mut Batch) -> ([u64; BATCH], usize) {
     (b.pfn, n)
 }
 
-/// Move CPU `cpu`'s batch to the lists (Linux lru_add_drain_cpu)
-fn drain_cpu(cpu: usize) {
-    let (pfns, n) = take(&mut BATCHES[cpu].lock());
+/// Move one CPU's batch to the lists (Linux lru_add_drain_cpu)
+fn drain_cpu(b: &IrqSpinlock<Batch>) {
+    let (pfns, n) = take(&mut b.lock());
     add_all(&pfns[..n]);
 }
 
@@ -212,8 +210,8 @@ fn drain_cpu(cpu: usize) {
 /// asks each CPU; hk drains them from here under their locks): reclaim
 /// and MADV_PAGEOUT see every page
 pub fn lru_add_drain_all() {
-    for cpu in 0..NR_CPUS {
-        drain_cpu(cpu);
+    for (_, b) in BATCHES.for_each_possible() {
+        drain_cpu(b);
     }
 }
 

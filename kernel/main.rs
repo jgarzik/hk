@@ -15,6 +15,7 @@ pub mod bus;
 pub mod chardev;
 pub mod completion;
 pub mod console;
+pub mod cpu;
 pub mod cpumask;
 pub mod dma;
 pub mod elf;
@@ -93,7 +94,7 @@ type CurrentArch = crate::arch::aarch64::Aarch64Arch;
 use crate::arch::ArchBusOps;
 use crate::arch::{
     AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps,
-    MemoryLayoutOps, PerCpuOps, PowerOps, SmpOps, TimekeeperOps, VfsInitOps, phys_to_virt,
+    MemoryLayoutOps, PowerOps, SmpOps, TimekeeperOps, VfsInitOps, phys_to_virt,
 };
 use crate::arch::{SchedArch, SyscallOps, UserModeOps};
 
@@ -674,7 +675,7 @@ fn kmain() -> ! {
 
                 // This CPU answers IPIs once it takes interrupts (its
                 // first task enables them)
-                smp::set_active(task::percpu::current_cpu());
+                smp::set_active(crate::cpu::this_id());
             }
         }
     } else {
@@ -1134,7 +1135,7 @@ fn panic(info: &PanicInfo) -> ! {
     printkln!("========================================");
 
     // Print CPU ID if available
-    if let Some(cpu_id) = CurrentArch::try_current_cpu_id() {
+    if let Some(cpu_id) = crate::cpu::try_this_id() {
         printkln!("CPU: {}", cpu_id);
     }
 

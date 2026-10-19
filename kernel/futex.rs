@@ -143,7 +143,7 @@ impl FutexQ {
             tid,
             priority,
             bitset,
-            cpu: crate::task::percpu::current_cpu(),
+            cpu: crate::cpu::this_id(),
         }
     }
 }

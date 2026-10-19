@@ -126,7 +126,7 @@ impl BlkMq {
 
     /// Queue a bio from thread context and run its hardware queue
     pub fn submit(&self, bio: Box<Bio>) {
-        let cpu = crate::task::percpu::current_cpu() as usize % self.ctxs.len();
+        let cpu = crate::cpu::this_id() as usize % self.ctxs.len();
         self.ctxs[cpu].lock().push(bio);
         self.run(self.map(cpu));
     }

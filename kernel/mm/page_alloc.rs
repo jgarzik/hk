@@ -209,8 +209,7 @@ fn in_interrupt() -> bool {
 pub fn this_cpu() -> Option<usize> {
     #[cfg(not(test))]
     {
-        use crate::arch::{CurrentArch, PerCpuOps};
-        CurrentArch::try_current_cpu_id().map(|c| c as usize)
+        crate::cpu::try_this_id().map(|c| c as usize)
     }
     #[cfg(test)]
     Some(TEST_CPU.with(|c| c.get()))

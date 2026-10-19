@@ -42,11 +42,11 @@ mod imp {
     use core::panic::Location;
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    use crate::arch::{CurrentArch, IrqSpinlock, PerCpuOps};
+    use crate::arch::IrqSpinlock;
+    use crate::cpu::PerCpu;
 
     type Loc = &'static Location<'static>;
 
-    const MAX_CPUS: usize = <CurrentArch as PerCpuOps>::MAX_CPUS;
     /// Held tracked locks per CPU
     const DEPTH: usize = 48;
     /// Order edges (open addressing)
@@ -70,19 +70,17 @@ mod imp {
         irq: u32,
     }
 
-    struct PerCpu(UnsafeCell<Cpu>);
+    struct Slot(UnsafeCell<Cpu>);
     // SAFETY: each CPU touches only its own slot, with no tracked lock
     // taken in interrupt context (reported otherwise)
-    unsafe impl Sync for PerCpu {}
+    unsafe impl Sync for Slot {}
 
-    static CPUS: [PerCpu; MAX_CPUS] = [const {
-        PerCpu(UnsafeCell::new(Cpu {
-            held: [None; DEPTH],
-            depth: 0,
-            busy: false,
-            irq: 0,
-        }))
-    }; MAX_CPUS];
+    static CPUS: PerCpu<Slot> = crate::percpu![Slot(UnsafeCell::new(Cpu {
+        held: [None; DEPTH],
+        depth: 0,
+        busy: false,
+        irq: 0,
+    }))];
 
     #[derive(Clone, Copy)]
     struct Edge {
@@ -111,9 +109,8 @@ mod imp {
     static NREPORTS: AtomicU32 = AtomicU32::new(0);
 
     fn cpu() -> Option<&'static mut Cpu> {
-        let id = CurrentArch::try_current_cpu_id()? as usize;
-        // SAFETY: see PerCpu
-        CPUS.get(id).map(|c| unsafe { &mut *c.0.get() })
+        // SAFETY: see Slot
+        Some(unsafe { &mut *CPUS.this().0.get() })
     }
 
     fn key(l: Loc) -> u64 {

@@ -40,8 +40,8 @@ use crate::arch::IrqSpinlock;
 use crate::error::KernelError;
 use crate::task::Tid;
 use crate::task::percpu::{
-    MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current_cpu, current_tid, schedule,
-    schedule_timeout, set_current_state, wake_up_task,
+    MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current_tid, schedule, schedule_timeout,
+    set_current_state, wake_up_task,
 };
 
 /// Source of unique wait entry ids
@@ -129,7 +129,7 @@ impl WaitQueue {
         head.push(WaitQueueEntry {
             id: entry.id,
             tid: current_tid(),
-            cpu: current_cpu(),
+            cpu: crate::cpu::this_id(),
             autoremove,
         });
     }
