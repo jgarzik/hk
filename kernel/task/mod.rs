@@ -878,6 +878,11 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// task itself; read at every syscall entry
     pub seccomp_mode: AtomicU8,
 
+    /// Its signal state (blocked mask, private pending set, altstack;
+    /// Linux siglock's per-task part): spin Mutex, thread context only
+    /// (no interrupt handler sends signals), under TASKLIST when both
+    /// are taken; the shared pending set's lock nests inside
+    pub sig: crate::sync::spin::Mutex<TaskSignalState>,
     /// Keyring references (Linux cred->thread_keyring etc.): spin lock,
     /// thread context; the key database is taken under it
     pub keyrings: crate::sync::spin::Mutex<crate::keys::keyring::TaskKeyrings>,
@@ -1000,9 +1005,6 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     // =========================================================================
     // Per-task signal state (not shared)
     // =========================================================================
-    /// Per-task signal state (blocked signals, pending signals)
-    pub signal_state: TaskSignalState,
-
     /// Robust futex list head address
     pub robust_list: u64,
 
@@ -1289,6 +1291,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             sid: AtomicU64::new(ids.sid),
             tls: AtomicU64::new(0),
             seccomp_mode: AtomicU8::new(ids.seccomp_mode),
+            sig: crate::sync::spin::Mutex::new(TaskSignalState::new()),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),
@@ -1329,6 +1332,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             sid: AtomicU64::new(0),
             tls: AtomicU64::new(0),
             seccomp_mode: AtomicU8::new(0),
+            sig: crate::sync::spin::Mutex::new(TaskSignalState::boot()),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
             cgroup: crate::sync::spin::Mutex::new(None),
             fput_defer: crate::sync::spin::Mutex::new(None),

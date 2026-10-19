@@ -307,6 +307,12 @@ Network locks (3.10 Network Subsystem has the full order):
     and wait queues (IrqSpinlocks). No socket is released under a
     network lock or under `Files`/TASKLIST (3.3, 3.1.1).
 
+Tasks (3.1.1, 3.7): TASKLIST (spin RwLock, thread context) → Task.sig
+    (spin Mutex, per task) → TaskSignalState.shared_pending (spin Mutex)
+    → SigHand.action (IrqSpinlock leaf); Task.keyrings, Task.cgroup,
+    Task.fput_defer, SignalStruct.posix_timers: per-task leaves reached
+    through a TaskRef, never under TASKLIST
+
 Pids (3.1.1): PIDMAP_LOCK (spin leaf, thread context; hash chains)
 
 Timekeeping (3.5):
@@ -2018,9 +2024,9 @@ state patterns.
 | Variable | Type | Purpose |
 |----------|------|---------|
 | `Task.sighand` | `Option<Arc<SigHand>>` under TASKLIST | The task's handler table |
-| `Task.signal_state` | `TaskSignalState` under TASKLIST | Blocked mask, private pending set |
-| `Task.tif_sigpending` | `AtomicBool`, recomputed under TASKLIST | Pending-signal flag (Linux TIF_SIGPENDING) |
-| `TaskSignalState.shared_pending` | `Arc<spin::Mutex<SigPending>>` | Thread-group pending set |
+| `Task.sig` | `spin::Mutex<TaskSignalState>` (per task) | Blocked mask, private pending set, altstack (Linux siglock's per-task part) |
+| `Task.thread_flags` TIF_SIGPENDING | atomic, recomputed under `Task.sig` | Pending-signal flag |
+| `TaskSignalState.shared_pending` | `SharedPending` (`Arc<spin::Mutex<SigPending>>`) | Thread-group pending set |
 | `SigHand.action` | `IrqSpinlock<Box<[SigAction]>>` (65 entries) | Signal handler table |
 | `SignalStruct.rlim` | `IrqSpinlock<[RLimit; N]>` | Resource limits (leaf) |
 
@@ -2039,10 +2045,14 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 
 #### Locking Rules
 
-1. **Per-task signal state is a Task field** - `get_task_sighand` clones
-   the `Arc<SigHand>` out under TASKLIST; `with_task_signal_state` runs
-   its closure under TASKLIST (no sleeping, no user memory, nothing
-   released in it).
+1. **Per-task signal state has its own lock** - `get_task_sighand`
+   clones the `Arc<SigHand>` out under TASKLIST; `with_task_signal_state`
+   finds the task (the current one without TASKLIST, another under
+   TASKLIST's read lock) and runs its closure under `Task.sig` (no
+   sleeping, no user memory, no TASKLIST, nothing released in it).
+   Deviation: Linux siglock is IRQ-safe and per thread group; hk's is
+   per task, thread context only (no interrupt handler sends a
+   signal).
 
 2. **SigHand.action uses IrqSpinlock** - Can be safely accessed from synchronous
    exception handlers (page faults, etc.) and process context; a leaf.
@@ -2055,11 +2065,13 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
 #### Lock Order for Signal Operations
 
 ```
-1. TASKLIST (Task.signal_state, Task.sighand)
+1. TASKLIST (Task.sighand; read lock to find a task)
    ↓
-2. TaskSignalState.shared_pending (spin Mutex, thread-group pending)
+2. Task.sig (spin Mutex, per task)
    ↓
-3. SigHand.action (IrqSpinlock, handler table; leaf)
+3. TaskSignalState.shared_pending (spin Mutex, thread-group pending)
+   ↓
+4. SigHand.action (IrqSpinlock, handler table; leaf)
 ```
 
 #### Clone Integration (CLONE_SIGHAND)

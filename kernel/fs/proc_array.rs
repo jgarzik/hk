@@ -59,7 +59,7 @@ struct Snap {
     seccomp: u8,
     blocked: u64,
     pending: u64,
-    shared: Option<Arc<crate::sync::spin::Mutex<crate::signal::SigPending>>>,
+    shared: Option<crate::signal::SharedPending>,
     sighand: Option<Arc<crate::signal::SigHand>>,
     signal: Option<Arc<crate::signal::SignalStruct>>,
     fs: Option<Arc<super::FsStruct>>,
@@ -72,6 +72,7 @@ fn snap(pid: Pid) -> Option<Snap> {
     let t = table.get(pid)?;
     let threads = table.threads(pid).count() as u64;
     let tracer = t.tracer().map_or(0, |x| x.pid);
+    let sig = t.task.sig.lock().clone();
     Some(Snap {
         pid,
         tid: t.task.tid(),
@@ -112,9 +113,9 @@ fn snap(pid: Pid) -> Option<Snap> {
         tracer,
         no_new_privs: t.prctl.no_new_privs,
         seccomp: t.task.seccomp_mode(),
-        blocked: t.signal_state.blocked.0,
-        pending: t.signal_state.pending.signal.0,
-        shared: Some(t.signal_state.shared_pending.clone()),
+        blocked: sig.blocked.0,
+        pending: sig.pending.signal.0,
+        shared: Some(sig.shared_pending.clone()),
         sighand: t.sighand.clone(),
         signal: t.signal.clone(),
         fs: t.fs.clone(),

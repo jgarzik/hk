@@ -397,7 +397,7 @@ pub struct SigPending {
 
 impl SigPending {
     /// Create empty pending set
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             signal: SigSet::EMPTY,
         }
@@ -611,7 +611,7 @@ pub struct TaskSignalState {
     /// Pending signals for this task (private)
     pub pending: SigPending,
     /// Shared pending signals (for thread group)
-    pub shared_pending: Arc<Mutex<SigPending>>,
+    pub shared_pending: SharedPending,
     /// Flag indicating signals need processing
     pub sigpending: bool,
     /// Alternate signal stack
@@ -621,14 +621,51 @@ pub struct TaskSignalState {
     pub real_blocked: SigSet,
 }
 
+/// A thread group's shared pending set (Linux signal->shared_pending):
+/// shared by CLONE_THREAD; none for the boot task, which reads as empty
+#[derive(Clone)]
+pub struct SharedPending(Option<Arc<Mutex<SigPending>>>);
+
+/// What the boot task's (absent) shared set reads as
+static NO_SHARED: Mutex<SigPending> = Mutex::new(SigPending::new());
+
+impl SharedPending {
+    pub fn new() -> Self {
+        Self(Some(Arc::new(Mutex::new(SigPending::new()))))
+    }
+
+    pub fn lock(&self) -> crate::sync::spin::MutexGuard<'_, SigPending> {
+        self.0.as_deref().unwrap_or(&NO_SHARED).lock()
+    }
+}
+
+impl Default for SharedPending {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TaskSignalState {
+    /// The boot task's (const: no shared set)
+    pub const fn boot() -> Self {
+        Self {
+            blocked: SigSet::EMPTY,
+            saved_sigmask: None,
+            pending: SigPending::new(),
+            shared_pending: SharedPending(None),
+            sigpending: false,
+            altstack: AltStack::new(),
+            real_blocked: SigSet::EMPTY,
+        }
+    }
+
     /// Create new task signal state
     pub fn new() -> Self {
         Self {
             blocked: SigSet::EMPTY,
             saved_sigmask: None,
             pending: SigPending::new(),
-            shared_pending: Arc::new(Mutex::new(SigPending::new())),
+            shared_pending: SharedPending::new(),
             sigpending: false,
             altstack: AltStack::new(),
             real_blocked: SigSet::EMPTY,
@@ -676,7 +713,7 @@ pub fn init_task_signal(tid: Tid, sighand: Arc<SigHand>) {
     let mut table = TASKLIST.write();
     if let Some(mut task) = table.get_mut(tid) {
         task.sighand = Some(sighand);
-        task.signal_state = TaskSignalState::new();
+        *task.task.sig.lock() = TaskSignalState::new();
         task.task.set_sigpending(false);
         task.signal = Some(Arc::new(SignalStruct::new()));
     }
@@ -697,13 +734,19 @@ pub fn with_task_signal_state<F, R>(tid: Tid, f: F) -> Option<R>
 where
     F: FnOnce(&mut TaskSignalState) -> R,
 {
-    let mut table = TASKLIST.write();
-    table.get_mut(tid).map(|mut t| {
-        let r = f(&mut t.signal_state);
-        t.signal_state.recalc_sigpending();
-        t.task.set_sigpending(t.signal_state.sigpending);
-        r
-    })
+    // The current task's own state needs no TASKLIST: it cannot leave
+    // the task list while it runs
+    let me = crate::task::percpu::current();
+    let t = if me.tid() == tid && tid != 0 {
+        crate::task::percpu::task_ref(&me)
+    } else {
+        TASKLIST.read().task(tid)?
+    };
+    let mut s = t.sig.lock();
+    let r = f(&mut s);
+    s.recalc_sigpending();
+    t.set_sigpending(s.sigpending);
+    Some(r)
 }
 
 /// Clone signal state for fork/clone
@@ -728,7 +771,7 @@ pub fn clone_task_signal(
         let parent = table.get(parent_tid);
         (
             parent.and_then(|p| p.sighand.clone()),
-            parent.map(|p| p.signal_state.clone()),
+            parent.map(|p| p.task.sig.lock().clone()),
         )
     };
 
@@ -760,7 +803,7 @@ pub fn clone_task_signal(
                 // CLONE_THREAD: share thread-group pending
                 parent_state.shared_pending.clone()
             } else {
-                Arc::new(Mutex::new(SigPending::new()))
+                SharedPending::new()
             },
             sigpending: false,
             altstack: AltStack::new(), // Child starts with no altstack
@@ -775,7 +818,7 @@ pub fn clone_task_signal(
         let mut table = TASKLIST.write();
         if let Some(mut child) = table.get_mut(child_tid) {
             child.sighand = Some(child_sighand);
-            child.signal_state = child_state;
+            *child.task.sig.lock() = child_state;
             child.task.set_sigpending(false);
         }
     }
@@ -791,7 +834,7 @@ pub fn exit_task_signal(tid: Tid) {
     let _old = {
         let mut table = TASKLIST.write();
         table.get_mut(tid).map(|mut task| {
-            task.signal_state = TaskSignalState::new();
+            let old = core::mem::take(&mut *task.task.sig.lock());
             task.task.set_sigpending(false);
             // A zombie leader keeps the group's SignalStruct (its exit
             // status; Linux frees signal_struct with the reaped leader)
@@ -800,7 +843,7 @@ pub fn exit_task_signal(tid: Tid) {
             } else {
                 task.signal.take()
             };
-            (task.sighand.take(), signal)
+            (task.sighand.take(), signal, old)
         })
     };
 }
@@ -817,12 +860,8 @@ pub fn fatal_signal_pending() -> bool {
     if !me.sigpending() {
         return false;
     }
-    let tid = me.tid();
-    let table = TASKLIST.read();
-    table.get(tid).is_some_and(|t| {
-        let s = &t.signal_state;
-        s.pending.signal.contains(SIGKILL) || s.shared_pending.lock().signal.contains(SIGKILL)
-    })
+    let s = me.sig.lock();
+    s.pending.signal.contains(SIGKILL) || s.shared_pending.lock().signal.contains(SIGKILL)
 }
 
 /// Check if a task has pending signals (fast path)
@@ -1082,8 +1121,9 @@ pub fn zap_group_others(tgid: Pid, tid: Tid) {
 
 /// Queue SIGKILL for `t` (TASKLIST held)
 fn sigkill_task(t: &mut crate::task::percpu::TaskViewMut<'_>) {
-    t.signal_state.pending.add(SIGKILL);
-    t.signal_state.sigpending = true;
+    let mut s = t.task.sig.lock();
+    s.pending.add(SIGKILL);
+    s.sigpending = true;
     t.task.set_sigpending(true);
 }
 

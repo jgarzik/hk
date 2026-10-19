@@ -1052,7 +1052,6 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
         io_context: None,
         sysvsem: None,
         // Per-task signal state
-        signal_state: crate::signal::TaskSignalState::new(),
         robust_list: 0,
         // prctl state
         prctl: {
@@ -1249,7 +1248,6 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         io_context: None,
         sysvsem: None,
         // Per-task signal state
-        signal_state: crate::signal::TaskSignalState::new(),
         robust_list: 0,
         // prctl state; comm after the init binary, /bin/init (Linux
         // names init after the file it execs)
@@ -1893,7 +1891,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         io_context: None,
         sysvsem: None,
         // Per-task signal state (always per-task, not shared)
-        signal_state: crate::signal::TaskSignalState::new(),
         robust_list: 0,
         // prctl state: the name is inherited (dumpability lives in the
         // mm: shared with CLONE_VM, copied by dup_mm)
