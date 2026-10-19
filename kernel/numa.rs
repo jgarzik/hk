@@ -9,12 +9,10 @@
 //! as having a single NUMA node (node 0) containing all CPUs and memory.
 
 use crate::arch::IrqSpinlock;
+use crate::cpumask::NR_CPUS;
 
 /// Maximum number of NUMA nodes supported
 pub const MAX_NUMA_NODES: usize = 64;
-
-/// Maximum number of CPUs supported for NUMA mapping
-pub const MAX_CPUS: usize = 256;
 
 /// Distance value for same-node access (local)
 pub const LOCAL_DISTANCE: u8 = 10;
@@ -80,7 +78,7 @@ pub struct NumaTopology {
     /// Per-node information (None if node not present)
     pub nodes: [Option<NumaNode>; MAX_NUMA_NODES],
     /// CPU to node mapping
-    pub cpu_to_node: [u8; MAX_CPUS],
+    pub cpu_to_node: [u8; NR_CPUS],
     /// Distance matrix between nodes (node_distance[from][to])
     pub distance: [[u8; MAX_NUMA_NODES]; MAX_NUMA_NODES],
     /// Bitmask of online nodes
@@ -101,7 +99,7 @@ impl NumaTopology {
         Self {
             nr_nodes: 0,
             nodes: [None; MAX_NUMA_NODES],
-            cpu_to_node: [0; MAX_CPUS],
+            cpu_to_node: [0; NR_CPUS],
             distance: [[0; MAX_NUMA_NODES]; MAX_NUMA_NODES],
             node_online_mask: 0,
             initialized: false,
@@ -143,7 +141,7 @@ impl NumaTopology {
 
         // Update CPU-to-node mapping based on node's cpu_mask
         for cpu in 0..64u32 {
-            if node.has_cpu(cpu) && (cpu as usize) < MAX_CPUS {
+            if node.has_cpu(cpu) && (cpu as usize) < NR_CPUS {
                 self.cpu_to_node[cpu as usize] = node_id as u8;
             }
         }
@@ -177,7 +175,7 @@ impl NumaTopology {
 
     /// Get the NUMA node for a given CPU
     pub fn cpu_to_node(&self, cpu: u32) -> u32 {
-        if (cpu as usize) < MAX_CPUS {
+        if (cpu as usize) < NR_CPUS {
             self.cpu_to_node[cpu as usize] as u32
         } else {
             0 // Default to node 0
@@ -234,7 +232,7 @@ impl NumaTopology {
 
     /// Assign a CPU to a specific node
     pub fn assign_cpu_to_node(&mut self, cpu: u32, node: u32) {
-        if (cpu as usize) < MAX_CPUS && (node as usize) < MAX_NUMA_NODES {
+        if (cpu as usize) < NR_CPUS && (node as usize) < MAX_NUMA_NODES {
             self.cpu_to_node[cpu as usize] = node as u8;
 
             // Also update the node's cpu_mask if node exists

@@ -513,18 +513,6 @@ pub struct SchedParam {
     pub sched_priority: i32,
 }
 
-/// Maximum number of CPUs supported
-pub const MAX_CPUS: usize = 64;
-
-/// CPU affinity mask type
-///
-/// A 64-bit mask where bit N indicates CPU N is allowed.
-/// For simplicity, we support up to 64 CPUs (matches single u64).
-pub type CpuMask = u64;
-
-/// Default CPU affinity mask (all CPUs allowed)
-pub const CPU_MASK_ALL: CpuMask = !0u64;
-
 /// Check if a scheduling policy is real-time
 pub fn is_rt_policy(policy: i32) -> bool {
     let p = policy & !SCHED_RESET_ON_FORK;
@@ -996,7 +984,7 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Reset scheduling policy on fork (SCHED_RESET_ON_FORK was set)
     pub reset_on_fork: bool,
     /// CPU affinity mask (bit N = CPU N is allowed)
-    pub cpus_allowed: CpuMask,
+    pub cpus_allowed: crate::cpumask::CpuSet,
     /// CPU whose run queue owns this task (tasks never migrate)
     pub cpu: u32,
     /// Page table for this task

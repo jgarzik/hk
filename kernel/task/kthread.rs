@@ -39,8 +39,6 @@ use crate::waitqueue::WaitQueue;
 
 /// Kernel thread control block (Linux struct kthread)
 pub struct KThread {
-    /// Thread name (also the task comm)
-    pub name: &'static str,
     /// Task id (set before the thread first runs)
     tid: AtomicU32,
     /// CPU the thread is bound to
@@ -83,7 +81,7 @@ pub fn current_kthread() -> Option<Arc<KThread>> {
 /// `cpu`: bind to that CPU, or `None` to pick one round-robin among CPUs
 /// that run a scheduler. Returns the control block for stop/park.
 pub fn kthread_run(
-    name: &'static str,
+    name: &str,
     func: fn(usize),
     arg: usize,
     cpu: Option<u32>,
@@ -93,7 +91,7 @@ pub fn kthread_run(
 
 /// [`kthread_run`] with an explicit scheduling priority
 pub fn kthread_run_prio(
-    name: &'static str,
+    name: &str,
     func: fn(usize),
     arg: usize,
     cpu: Option<u32>,
@@ -105,7 +103,6 @@ pub fn kthread_run_prio(
         None => pick_cpu(),
     };
     let k = Arc::new(KThread {
-        name,
         tid: AtomicU32::new(0),
         cpu,
         func,
@@ -128,7 +125,7 @@ pub fn kthread_run_prio(
 /// CPU for an unbound thread: round-robin over the APs (CPU 0 runs all
 /// user tasks, and scheduling is cooperative), CPU 0 if there are none
 fn pick_cpu() -> u32 {
-    let ncpu = crate::task::percpu::MAX_SCHED_CPUS as u32;
+    let ncpu = crate::cpu::nr_cpu_ids();
     for _ in 0..ncpu {
         let c = NEXT_CPU.load(Ordering::Relaxed) % ncpu;
         NEXT_CPU.store(c + 1, Ordering::Relaxed);

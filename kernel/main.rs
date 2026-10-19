@@ -651,6 +651,7 @@ fn kmain() -> ! {
                 CurrentArch::set_bsp_cpu_id(&mut acpi_info, bsp_id);
 
                 let online = CurrentArch::smp_init(&acpi_info, &mut frame_alloc);
+                smp::init(online as u32);
 
                 // Calibrate and start local timer (10ms interval)
                 let ticks_per_ms = CurrentArch::calibrate_and_start_timer(

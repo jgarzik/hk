@@ -49,7 +49,7 @@ use crate::net::device::NetDevice;
 use crate::net::ethernet::{self, PktType};
 use crate::net::skb::SkBuff;
 use crate::task::kthread::KThread;
-use crate::task::percpu::{MAX_SCHED_CPUS, cpu_has_scheduler};
+use crate::task::percpu::cpu_has_scheduler;
 use crate::waitqueue::WaitQueue;
 
 /// Default NAPI weight (Linux NAPI_POLL_WEIGHT)
@@ -323,40 +323,17 @@ fn this_softnet() -> &'static Softnet {
     SOFTNET.this()
 }
 
-/// Thread names (kthread names are &'static str), one per possible CPU
-const SOFTNET_NAMES: [&str; 16] = [
-    "softnet/0",
-    "softnet/1",
-    "softnet/2",
-    "softnet/3",
-    "softnet/4",
-    "softnet/5",
-    "softnet/6",
-    "softnet/7",
-    "softnet/8",
-    "softnet/9",
-    "softnet/10",
-    "softnet/11",
-    "softnet/12",
-    "softnet/13",
-    "softnet/14",
-    "softnet/15",
-];
-const _: () = assert!(
-    SOFTNET_NAMES.len() >= MAX_SCHED_CPUS,
-    "a softnet name per CPU"
-);
-
 /// Start one `softnet/N` thread per CPU that runs a scheduler (after
 /// scheduling is enabled). Work queued earlier (IRQs during boot) is
 /// picked up on the threads' first pass.
 pub fn softnet_init() {
     let mut started = 0;
-    for (cpu, name) in SOFTNET_NAMES.iter().enumerate().take(MAX_SCHED_CPUS) {
+    for cpu in 0..crate::cpu::nr_cpu_ids() as usize {
         if !cpu_has_scheduler(cpu as u32) {
             continue;
         }
-        match crate::task::kthread::kthread_run(name, softnet_thread, cpu, Some(cpu as u32)) {
+        let name = alloc::format!("softnet/{cpu}");
+        match crate::task::kthread::kthread_run(&name, softnet_thread, cpu, Some(cpu as u32)) {
             Ok(k) => {
                 SOFTNET_THREADS.lock().push(k);
                 started += 1;

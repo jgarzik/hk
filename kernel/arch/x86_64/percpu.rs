@@ -6,8 +6,8 @@
 use crate::task::CurrentTask;
 use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-/// Maximum number of CPUs supported
-pub const MAX_CPUS: usize = 16;
+/// Per-CPU data slots (logical CPU ids are below this)
+pub const MAX_CPUS: usize = crate::cpumask::NR_CPUS;
 
 /// Per-CPU data structure
 ///
@@ -834,8 +834,6 @@ use crate::task::Tid;
 use super::X86_64Arch;
 
 impl PerCpuOps for X86_64Arch {
-    const MAX_CPUS: usize = MAX_CPUS;
-
     #[inline]
     fn try_current_cpu_id() -> Option<u32> {
         try_current_cpu().map(|percpu| percpu.cpu_id)

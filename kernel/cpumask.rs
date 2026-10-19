@@ -1,15 +1,17 @@
 //! CPU masks (Linux include/linux/cpumask.h)
 //!
 //! [`CpuMask`] is a shared, atomically updated set of logical CPU ids
-//! (an mm's cpumask, the active CPUs); [`CpuSet`] is a plain snapshot
-//! of one, to iterate or pass to `smp::smp_call_function_many`.
+//! (an mm's cpumask, the active CPUs); [`CpuSet`] is a plain set: a
+//! snapshot of one, a task's allowed CPUs (`sched_setaffinity`), or the
+//! targets of `smp::smp_call_function_many`.
 
+use alloc::string::String;
+use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arch::{CurrentArch, PerCpuOps};
-
-/// Logical CPU ids are below this
-pub const NR_CPUS: usize = <CurrentArch as PerCpuOps>::MAX_CPUS;
+/// Logical CPU ids are below this (Linux CONFIG_NR_CPUS); the CPUs found
+/// at boot are `cpu::nr_cpu_ids()`
+pub const NR_CPUS: usize = 256;
 
 const WORDS: usize = NR_CPUS.div_ceil(64);
 
@@ -64,6 +66,82 @@ impl Default for CpuMask {
 }
 
 impl CpuSet {
+    /// Every possible CPU (Linux CPU_MASK_ALL)
+    pub fn all() -> Self {
+        Self::first(NR_CPUS as u32)
+    }
+
+    /// Only `cpu`
+    pub fn one(cpu: u32) -> Self {
+        let mut s = CpuSet::default();
+        s.set(cpu);
+        s
+    }
+
+    /// From the words of a user `unsigned long` bitmap (bit n of word
+    /// n/64 is CPU n); bits past NR_CPUS are dropped
+    pub fn from_words(words: &[u64]) -> Self {
+        let mut s = CpuSet::default();
+        for (d, w) in s.0.iter_mut().zip(words) {
+            *d = *w;
+        }
+        s
+    }
+
+    /// As user bitmap words
+    pub fn words(&self) -> &[u64; WORDS] {
+        &self.0
+    }
+
+    /// Number of CPUs in the set
+    pub fn count(&self) -> u32 {
+        self.0.iter().map(|w| w.count_ones()).sum()
+    }
+
+    /// The first `nbits` bits as Linux "%*pb": hex, a comma between
+    /// 32-bit groups, most significant first
+    pub fn fmt_hex(&self, nbits: u32) -> String {
+        let nbits = nbits.clamp(1, NR_CPUS as u32);
+        let digits = nbits.div_ceil(4);
+        let mut out = String::new();
+        for d in (0..digits).rev() {
+            let mut nib = ((self.0[(d / 16) as usize] >> ((d % 16) * 4)) & 0xf) as u32;
+            if (d + 1) * 4 > nbits {
+                nib &= (1 << (nbits - d * 4)) - 1;
+            }
+            let _ = write!(out, "{nib:x}");
+            if d > 0 && d % 8 == 0 {
+                out.push(',');
+            }
+        }
+        out
+    }
+
+    /// Linux "%*pbl": the set as a range list ("0-3,5")
+    pub fn fmt_list(&self) -> String {
+        let mut out = String::new();
+        let mut cpu = 0u32;
+        while (cpu as usize) < NR_CPUS {
+            if !self.test(cpu) {
+                cpu += 1;
+                continue;
+            }
+            let lo = cpu;
+            while (cpu as usize) < NR_CPUS && self.test(cpu) {
+                cpu += 1;
+            }
+            if !out.is_empty() {
+                out.push(',');
+            }
+            if cpu - 1 == lo {
+                let _ = write!(out, "{lo}");
+            } else {
+                let _ = write!(out, "{}-{}", lo, cpu - 1);
+            }
+        }
+        out
+    }
+
     /// Every CPU below `n`
     pub fn first(n: u32) -> Self {
         let mut s = CpuSet::default();
@@ -131,5 +209,19 @@ mod tests {
         assert!(a.and(&b).test(2));
         assert!(!CpuSet::default().iter().any(|_| true));
         assert!(CpuSet::default().is_empty());
+    }
+
+    #[test]
+    fn words_and_format() {
+        let mut s = CpuSet::from_words(&[0b1011, 1]);
+        assert_eq!(s.count(), 4);
+        assert!(s.test(64));
+        assert_eq!(s.fmt_list(), "0-1,3,64");
+        assert_eq!(s.fmt_hex(4), "b");
+        assert_eq!(s.fmt_hex(36), "0,0000000b");
+        assert_eq!(s.fmt_hex(72), "01,00000000,0000000b");
+        s.clear(64);
+        assert_eq!(CpuSet::one(3).words()[0], 8);
+        assert_eq!(CpuSet::all().count(), NR_CPUS as u32);
     }
 }

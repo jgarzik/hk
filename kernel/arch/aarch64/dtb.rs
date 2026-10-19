@@ -446,7 +446,7 @@ pub fn init_numa_topology(dtb_ptr: u64) -> Result<bool, &'static str> {
                 && let Some(node_id) = numa_prop.as_u32()
             {
                 let node_id = node_id as usize;
-                if node_id < MAX_NUMA_NODES && (cpu_id as usize) < crate::numa::MAX_CPUS {
+                if node_id < MAX_NUMA_NODES && (cpu_id as usize) < crate::cpumask::NR_CPUS {
                     found_numa = true;
                     topology.cpu_to_node[cpu_id as usize] = node_id as u8;
 

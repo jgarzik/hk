@@ -49,7 +49,7 @@ struct Snap {
     nice: i32,
     policy: i32,
     rt_priority: i32,
-    cpus: u64,
+    cpus: crate::cpumask::CpuSet,
     cpu: u32,
     exit_signal: i32,
     exit_code: i32,
@@ -239,56 +239,6 @@ fn task_vm(tid: Tid) -> Option<VmStat> {
     Some(vm_stat(&mm, &m))
 }
 
-/// "%*pb": the mask as hex, 32-bit groups comma-separated
-fn mask_hex(mask: u64, nbits: u32) -> String {
-    let mask = if nbits >= 64 {
-        mask
-    } else {
-        mask & ((1u64 << nbits) - 1)
-    };
-    let digits = nbits.div_ceil(4).max(1) as usize;
-    let hex = alloc::format!("{:0width$x}", mask, width = digits);
-    let mut out = String::new();
-    let first = hex.len() % 8;
-    for (i, c) in hex.chars().enumerate() {
-        if i > 0 && (i + 8 - first) % 8 == 0 {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// "%*pbl": the mask as a range list ("0-3,5")
-fn mask_list(mask: u64) -> String {
-    let mut out = String::new();
-    let mut cpu = 0;
-    while cpu < 64 {
-        if mask & (1 << cpu) == 0 {
-            cpu += 1;
-            continue;
-        }
-        let lo = cpu;
-        while cpu < 64 && mask & (1 << cpu) != 0 {
-            cpu += 1;
-        }
-        if !out.is_empty() {
-            out.push(',');
-        }
-        if cpu - 1 == lo {
-            let _ = write!(out, "{lo}");
-        } else {
-            let _ = write!(out, "{}-{}", lo, cpu - 1);
-        }
-    }
-    out
-}
-
-/// Number of possible CPUs (Linux nr_cpu_ids)
-fn nr_cpu_ids() -> u32 {
-    crate::smp::active_cpus().iter().last().map_or(1, |c| c + 1)
-}
-
 /// /proc/<pid>/status (Linux proc_pid_status)
 pub fn gen_status(pid: Pid) -> Vec<u8> {
     let Some(s) = snap(pid) else {
@@ -328,14 +278,10 @@ pub fn gen_status(pid: Pid) -> Vec<u8> {
     let _ = writeln!(o, "Seccomp:\t{}\nSeccomp_filters:\t0", s.seccomp);
     let _ = writeln!(o, "Speculation_Store_Bypass:\tunknown");
     let _ = writeln!(o, "SpeculationIndirectBranch:\tunknown");
-    let n = nr_cpu_ids();
-    let cpus = if n >= 64 {
-        s.cpus
-    } else {
-        s.cpus & ((1u64 << n) - 1)
-    };
-    let _ = writeln!(o, "Cpus_allowed:\t{}", mask_hex(cpus, n));
-    let _ = writeln!(o, "Cpus_allowed_list:\t{}", mask_list(cpus));
+    let n = crate::cpu::nr_cpu_ids();
+    let cpus = s.cpus.and(&crate::cpumask::CpuSet::first(n));
+    let _ = writeln!(o, "Cpus_allowed:\t{}", cpus.fmt_hex(n));
+    let _ = writeln!(o, "Cpus_allowed_list:\t{}", cpus.fmt_list());
     let _ = writeln!(o, "Mems_allowed:\t1\nMems_allowed_list:\t0");
     let _ = writeln!(o, "voluntary_ctxt_switches:\t{}", s.nvcsw);
     let _ = writeln!(o, "nonvoluntary_ctxt_switches:\t{}", s.nivcsw);

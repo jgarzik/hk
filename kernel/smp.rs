@@ -23,8 +23,11 @@
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering, fence};
 
 use crate::arch::{CurrentArch, PerCpuOps, local_irq_restore, local_irq_save};
-use crate::cpu::{PerCpu, this_id};
-use crate::cpumask::{CpuMask, CpuSet, NR_CPUS};
+use alloc::boxed::Box;
+use spin::Once;
+
+use crate::cpu::{PerCpu, nr_cpu_ids, this_id};
+use crate::cpumask::{CpuMask, CpuSet};
 
 /// One call (Linux call_single_data)
 struct Csd {
@@ -49,10 +52,11 @@ impl Csd {
     }
 }
 
-/// Per sender CPU, one call slot per target CPU (Linux per-CPU cfd_data).
-/// A CPU sends from thread context only and the kernel is not
-/// preemptive, so its row is used by one call at a time.
-static CFD: [[Csd; NR_CPUS]; NR_CPUS] = [const { [const { Csd::new() }; NR_CPUS] }; NR_CPUS];
+/// Per sender CPU, one call slot per target CPU (Linux per-CPU cfd_data),
+/// `nr_cpu_ids` of them, allocated at bring-up (`init`). A CPU sends from
+/// thread context only and the kernel is not preemptive, so its row is
+/// used by one call at a time.
+static CFD: PerCpu<Once<Box<[Csd]>>> = crate::percpu![Once::new()];
 
 /// Per-CPU queue of calls to run there (Linux call_single_queue)
 static QUEUE: PerCpu<AtomicPtr<Csd>> = crate::percpu![AtomicPtr::new(core::ptr::null_mut())];
@@ -61,6 +65,17 @@ static QUEUE: PerCpu<AtomicPtr<Csd>> = crate::percpu![AtomicPtr::new(core::ptr::
 /// each CPU once it services interrupts. One global mask: every sender
 /// needs every CPU's state, and it changes once per CPU at boot.
 static ACTIVE: CpuMask = CpuMask::new();
+
+/// SMP bring-up found `n` CPUs (ids 0..n): record them (nr_cpu_ids) and
+/// give each its call slots, before any of them is active
+pub fn init(n: u32) {
+    crate::cpu::set_nr_cpu_ids(n);
+    let n = nr_cpu_ids();
+    for cpu in 0..n {
+        CFD.get(cpu)
+            .call_once(|| (0..n).map(|_| Csd::new()).collect());
+    }
+}
 
 /// This CPU now services call-function IPIs (its interrupt controller
 /// is up and interrupts are enabled)
@@ -85,7 +100,11 @@ pub fn smp_call_function_many(mask: &CpuSet, func: fn(usize), info: usize, wait:
     let me = this_id();
     let mut targets = mask.and(&ACTIVE.snapshot());
     targets.clear(me);
-    let row = &CFD[me as usize];
+    if targets.is_empty() {
+        return;
+    }
+    // Every active CPU was brought up by `init`
+    let row = CFD.get(me).get().expect("smp: no call slots");
     for cpu in targets.iter() {
         let csd = &row[cpu as usize];
         // The slot's last (async) call must be done before reuse
@@ -174,7 +193,7 @@ fn run_queue(me: u32) {
     // LIFO to FIFO (Linux llist_reverse_order)
     let mut fifo: *mut Csd = core::ptr::null_mut();
     while !list.is_null() {
-        // SAFETY: a slot in CFD (static), queued and owned by us until
+        // SAFETY: a slot in CFD (never freed), queued and owned by us until
         // `locked` is cleared
         let csd = unsafe { &*list };
         list = csd.next.load(Ordering::Relaxed);

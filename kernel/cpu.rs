@@ -7,8 +7,25 @@
 //! between scheduling points; IRQ-reachable slots still need their own
 //! IRQ discipline, and cross-CPU reads their own barriers.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::arch::{CurrentArch, PerCpuOps};
 use crate::cpumask::NR_CPUS;
+
+/// CPUs found at boot (Linux nr_cpu_ids): logical ids are below it
+static NR_CPU_IDS: AtomicU32 = AtomicU32::new(1);
+
+/// Number of possible CPUs: every CPU brought up at boot (hk has no
+/// hotplug), 1 until SMP bring-up is done
+#[inline]
+pub fn nr_cpu_ids() -> u32 {
+    NR_CPU_IDS.load(Ordering::Relaxed)
+}
+
+/// Record the CPUs found at boot (`smp::init`, once)
+pub fn set_nr_cpu_ids(n: u32) {
+    NR_CPU_IDS.store(n.clamp(1, NR_CPUS as u32), Ordering::Relaxed);
+}
 
 /// The calling CPU's logical id (Linux smp_processor_id); 0 before
 /// per-CPU data exists, when only the boot CPU runs

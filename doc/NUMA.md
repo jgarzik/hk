@@ -28,7 +28,7 @@ pub struct NumaNode {
 pub struct NumaTopology {
     pub nr_nodes: usize,
     pub nodes: [Option<NumaNode>; MAX_NUMA_NODES],
-    pub cpu_to_node: [u8; MAX_CPUS],
+    pub cpu_to_node: [u8; NR_CPUS],
     pub distance: [[u8; MAX_NUMA_NODES]; MAX_NUMA_NODES],
     pub node_online_mask: u64,
     pub initialized: bool,
@@ -209,7 +209,7 @@ For Phase 4-5 testing:
 ```rust
 // kernel/numa.rs
 pub const MAX_NUMA_NODES: usize = 64;
-pub const MAX_CPUS: usize = 256;
+pub const NR_CPUS: usize = 256; // crate::cpumask::NR_CPUS
 pub const LOCAL_DISTANCE: u8 = 10;
 pub const REMOTE_DISTANCE: u8 = 20;
 pub const MAX_DISTANCE: u8 = 255;

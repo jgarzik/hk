@@ -313,9 +313,6 @@ pub trait FrameAlloc {
 /// On x86-64, this is accessed via the GS segment. On aarch64, via TPIDR_EL1.
 #[allow(dead_code)]
 pub trait PerCpuOps {
-    /// Maximum number of CPUs supported by this architecture
-    const MAX_CPUS: usize;
-
     /// Try to get the current CPU ID
     ///
     /// Returns None if per-CPU data is not yet initialized (early boot).

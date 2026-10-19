@@ -119,12 +119,6 @@ type CurrentArch = crate::arch::aarch64::Aarch64Arch;
 // Re-export the architecture's TaskContext type for convenience
 type TaskContext = <CurrentArch as ContextOps>::TaskContext;
 
-// Get MAX_CPUS from the architecture
-const MAX_CPUS: usize = <CurrentArch as PerCpuOps>::MAX_CPUS;
-
-/// Number of per-CPU scheduler slots (logical CPU ids are below this)
-pub const MAX_SCHED_CPUS: usize = MAX_CPUS;
-
 /// Size of kernel stack per thread (16KB)
 pub const KERNEL_STACK_SIZE: usize = 16 * 1024;
 
@@ -654,7 +648,7 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
         },
         rt_priority: 0,
         reset_on_fork: false,
-        cpus_allowed: 1 << cpu_id,
+        cpus_allowed: crate::cpumask::CpuSet::one(cpu_id),
         cpu: cpu_id,
         page_table: ArchPageTable::kernel_identity(),
         trap_frame: Default::default(),
@@ -853,7 +847,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<(), &'static str> {
         policy: crate::task::SCHED_NORMAL,
         rt_priority: 0,
         reset_on_fork: false,
-        cpus_allowed: crate::task::CPU_MASK_ALL,
+        cpus_allowed: crate::cpumask::CpuSet::all(),
         cpu: cpu_id,
         page_table: config.page_table,
         trap_frame: Default::default(),
@@ -2667,7 +2661,7 @@ pub fn account_task_resume(tid: Tid, now: u64) {
 /// Look up a task's CPU affinity mask by PID
 ///
 /// Returns None if the process is not found.
-pub fn lookup_task_cpus_allowed(pid: Pid) -> Option<crate::task::CpuMask> {
+pub fn lookup_task_cpus_allowed(pid: Pid) -> Option<crate::cpumask::CpuSet> {
     let table = TASK_TABLE.lock();
     table
         .tasks
@@ -2761,9 +2755,10 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
 /// # Locking
 /// Acquires TASK_TABLE lock. Migration to new CPU set takes effect on next
 /// schedule.
-pub fn set_task_cpus_allowed(pid: Pid, mask: crate::task::CpuMask) -> Result<(), i32> {
-    // Mask must have at least one CPU allowed
-    if mask == 0 {
+pub fn set_task_cpus_allowed(pid: Pid, mask: crate::cpumask::CpuSet) -> Result<(), i32> {
+    // At least one CPU the task can run on (Linux __sched_setaffinity:
+    // the mask and cpu_active_mask intersect)
+    if mask.and(&crate::smp::active_cpus()).is_empty() {
         return Err(22); // EINVAL
     }
 

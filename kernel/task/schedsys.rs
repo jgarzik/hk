@@ -413,40 +413,37 @@ pub fn sys_sched_getaffinity<A: crate::uaccess::UaccessArch>(
         return KernelError::InvalidArgument.sysret();
     }
 
-    // cpusetsize must be at least 8 bytes (sizeof u64)
-    if cpusetsize < 8 {
+    // Room for nr_cpu_ids bits, in whole longs (Linux)
+    if cpusetsize.saturating_mul(8) < crate::cpu::nr_cpu_ids() as u64
+        || !cpusetsize.is_multiple_of(8)
+    {
         return KernelError::InvalidArgument.sysret();
-    }
-
-    // Validate mask_ptr
-    if mask_ptr == 0 {
-        return KernelError::BadAddress.sysret();
     }
 
     let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
 
-    // Get the CPU affinity mask
+    // The allowed CPUs that are up (Linux: & cpu_active_mask)
     let mask = match super::percpu::lookup_task_cpus_allowed(target_pid) {
-        Some(m) => m,
+        Some(m) => m.and(&crate::smp::active_cpus()),
         None => return KernelError::NoProcess.sysret(),
     };
 
-    // We only support 64 CPUs (single u64), but Linux allows larger buffers
-    // Return up to cpusetsize bytes, zero-padded
-    let write_size = cpusetsize.min(8) as usize;
-
-    if !A::access_ok(mask_ptr, write_size) {
+    // min(len, cpumask_size()) bytes
+    let len = (cpusetsize as usize).min(cpumask_size());
+    let mut bytes = alloc::vec::Vec::with_capacity(len);
+    for w in mask.words() {
+        bytes.extend_from_slice(&w.to_ne_bytes());
+    }
+    if copy_to_user::<A>(mask_ptr, &bytes[..len]).is_err() {
         return KernelError::BadAddress.sysret();
     }
+    len as i64
+}
 
-    // Convert mask to bytes and copy
-    let mask_bytes = mask.to_ne_bytes();
-    if copy_to_user::<A>(mask_ptr, &mask_bytes[..write_size]).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Return the size of the kernel cpu_set_t (8 bytes for u64)
-    8
+/// Bytes of a kernel cpumask: nr_cpu_ids bits in whole longs (Linux
+/// cpumask_size)
+fn cpumask_size() -> usize {
+    (crate::cpu::nr_cpu_ids() as usize).div_ceil(64) * 8
 }
 
 /// sys_sched_setaffinity - set CPU affinity mask
@@ -485,30 +482,20 @@ pub fn sys_sched_setaffinity<A: crate::uaccess::UaccessArch>(
         return KernelError::InvalidArgument.sysret();
     }
 
-    // cpusetsize must be at least 8 bytes (sizeof u64)
-    if cpusetsize < 8 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Validate mask_ptr
-    if mask_ptr == 0 {
+    // Up to cpumask_size() bytes; a shorter mask is zero-extended
+    // (Linux get_user_cpu_mask)
+    let len = (cpusetsize as usize).min(cpumask_size());
+    let mut bytes = alloc::vec![0u8; cpumask_size()];
+    if copy_from_user::<A>(&mut bytes[..len], mask_ptr, len).is_err() {
         return KernelError::BadAddress.sysret();
     }
-    if !A::access_ok(mask_ptr, 8) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Read the mask from user space
-    let mut mask_bytes = [0u8; 8];
-    if copy_from_user::<A>(&mut mask_bytes, mask_ptr, 8).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-    let mask = u64::from_ne_bytes(mask_bytes);
-
-    // Empty mask is invalid
-    if mask == 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
+    let words: alloc::vec::Vec<u64> = bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_ne_bytes(*c))
+        .collect();
+    let mask = crate::cpumask::CpuSet::from_words(&words);
 
     let target_pid = if pid == 0 { caller_pid } else { pid as u64 };
 

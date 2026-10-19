@@ -26,8 +26,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::CurrentArch;
-use crate::arch::{IrqSpinlock, PerCpuOps};
+use crate::arch::IrqSpinlock;
 
 use super::blkdev::{Bio, BioList, bio_endio};
 use crate::error::KernelError;
@@ -100,7 +99,7 @@ pub struct BlkMq {
 impl BlkMq {
     /// One hardware queue per element of `ops`
     pub fn new(ops: Vec<Box<dyn MqOps>>) -> Self {
-        let n = <CurrentArch as PerCpuOps>::MAX_CPUS;
+        let n = crate::cpu::nr_cpu_ids() as usize;
         Self {
             ctxs: (0..n).map(|_| IrqSpinlock::new(BioList::new())).collect(),
             hctxs: ops

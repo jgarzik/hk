@@ -536,8 +536,6 @@ impl UserModeOps for Aarch64Arch {
 // ============================================================================
 
 impl PerCpuOps for Aarch64Arch {
-    const MAX_CPUS: usize = percpu::MAX_CPUS;
-
     #[inline]
     fn try_current_cpu_id() -> Option<u32> {
         percpu::try_current_cpu().map(|p| p.cpu_id)

@@ -1117,8 +1117,10 @@ a remote wakeup was posted (`wake_up_task`).
   IrqSpinlock would also work but would make every sender of a many-CPU
   shootdown contend on each target's lock with interrupts off. Only the
   push onto an empty queue raises the IPI.
-- `CFD[sender][target]` (per sending CPU): the sender's call slots, one
-  per target (Linux cfd_data). A CPU makes one call at a time (thread
+- `CFD` (`PerCpu<Once<Box<[Csd]>>>`, per sending CPU): the sender's
+  call slots, one per target CPU (`nr_cpu_ids` of them, allocated by
+  `smp::init` at bring-up before any CPU is active, never freed; Linux
+  cfd_data). A CPU makes one call at a time (thread
   context, kernel not preemptive); a slot's `locked` flag (set by the
   sender, cleared with Release by the target after `func` returned) is
   waited for before the slot is reused and, with `wait`, before return.

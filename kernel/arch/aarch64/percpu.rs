@@ -7,8 +7,8 @@ use crate::task::CurrentTask;
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-/// Maximum number of CPUs supported
-pub const MAX_CPUS: usize = 16;
+/// Per-CPU data slots (logical CPU ids are below this)
+pub const MAX_CPUS: usize = crate::cpumask::NR_CPUS;
 
 /// Per-CPU data structure
 ///
