@@ -1349,6 +1349,18 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     }
     me.set_tid(ltid);
     table.insert(me.clone());
+    // Raw tids naming the caller now name it by its new tid: tracees'
+    // tracer, children's real parent (Linux needs none of this: its
+    // links are task pointers)
+    for mut t in table.iter_mut() {
+        if t.ptracer_tid == Some(tid) {
+            t.ptracer_tid = Some(ltid);
+        }
+        if t.real_parent_tid == tid {
+            t.real_parent_tid = ltid;
+        }
+    }
+    let sig = table.get(ltid).and_then(|t| t.signal.clone());
     if let Some(mut m) = table.get_mut(ltid) {
         m.leader = true;
         m.task
@@ -1359,6 +1371,11 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
         m.task.start_time.store(start, Ordering::Relaxed);
     }
     drop(table);
+    // The group's timers owned by the caller follow (after TASK_TABLE:
+    // their locks are leaves taken under nothing)
+    if let Some(sig) = sig {
+        crate::posix_timer::retarget(&sig, tid, ltid);
+    }
     // Its run-queue entry follows (after TASK_TABLE: rq -> TASK_TABLE)
     let sched = get_percpu_sched(me.cpu());
     let mut rq = sched.lock.lock();

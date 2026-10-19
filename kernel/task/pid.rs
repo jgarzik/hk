@@ -3,7 +3,8 @@
 //! A [`Pid`] is one number per pid namespace level, from the root
 //! namespace down to the one the task was created in (`numbers[0]` is
 //! the global number, the task's tid). Numbers come from a bitmap per
-//! namespace, handed out cyclically like Linux alloc_pidmap; a 4 KB page
+//! namespace, handed out cyclically like Linux alloc_pidmap (up to
+//! PID_MAX_LIMIT before wrapping); a 4 KB page
 //! of the bitmap (32768 ids) is allocated on first use, outside every
 //! lock, and installed with compare-and-swap, and bits are set and
 //! cleared atomically, so allocation takes no lock.
@@ -25,10 +26,10 @@ use crate::sync::spin::Mutex;
 
 /// Ids per bitmap page (Linux BITS_PER_PAGE)
 const PER_PAGE: u32 = 4096 * 8;
-/// Linux PID_MAX_DEFAULT and PIDS_PER_CPU_DEFAULT
-const PID_MAX_DEFAULT: u32 = 0x8000;
-const PIDS_PER_CPU: u32 = 1024;
-/// Linux PID_MAX_LIMIT (64-bit)
+/// Linux PID_MAX_LIMIT (64-bit): numbers are handed out up to it before
+/// they wrap, so a freed number is not reused soon (raw tids still name
+/// tasks in places: ptrace and parent links until the tasklist
+/// conversion)
 const PID_MAX_LIMIT: u32 = 4 * 1024 * 1024;
 /// After a wrap, numbers restart above these (Linux RESERVED_PIDS)
 const RESERVED_PIDS: u32 = 300;
@@ -82,8 +83,7 @@ pub struct PidMap {
 
 impl PidMap {
     pub fn new() -> Self {
-        let cpus = crate::cpu::nr_cpu_ids();
-        let max = PID_MAX_DEFAULT.max(PIDS_PER_CPU * cpus).min(PID_MAX_LIMIT);
+        let max = PID_MAX_LIMIT;
         let pages = (0..max.div_ceil(PER_PAGE))
             .map(|_| AtomicPtr::new(core::ptr::null_mut()))
             .collect();

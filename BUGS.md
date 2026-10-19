@@ -718,3 +718,9 @@ Found during T0 (2026-10-19). Tag = when to fix.
 5. **`virt_to_phys(p & !0xfff)` duplicated** (next batch) in
    `Move::ptes`, `PteRange::at` and `ptl::pte_lock`: add one
    `ptl::table_of_ptep()`.
+6. **BUSYBOX_NC_LO flaky on the Linux reference** (next batch): 1 of 5
+   x86 `check-linux` runs reported `BUSYBOX_NC_LO:FAIL status=0`
+   (nc over loopback; timing). Make the test wait for the listener.
+7. **No ptrace exec stop** (P9): a traced task's execve does not stop
+   with SIGTRAP / PTRACE_EVENT_EXEC (`kernel/task/exec.rs`), so a
+   tracer cannot observe a non-leader exec's tid change.

@@ -137,8 +137,9 @@ pub struct PosixTimer {
     timer_id: TimerT,
     /// Clock ID (CLOCK_REALTIME or CLOCK_MONOTONIC)
     clockid: i32,
-    /// Owning task's TID (for signal delivery)
-    owner_tid: Tid,
+    /// Owning task's TID (for signal delivery; retargeted when a
+    /// non-leader exec takes the leader's tid)
+    owner_tid: AtomicU64,
     /// Notification settings
     sigevent: SigEvent,
     /// Inner state protected by IRQ spinlock
@@ -161,7 +162,7 @@ impl PosixTimer {
         let timer = Arc::new(Self {
             timer_id,
             clockid,
-            owner_tid,
+            owner_tid: AtomicU64::new(owner_tid),
             sigevent,
             inner: IrqSpinlock::new(PosixTimerInner::new()),
             global_id,
@@ -301,7 +302,7 @@ impl PosixTimer {
         if should_signal {
             let sig = self.sigevent.sigev_signo as u32;
             if sig > 0 && sig <= 64 {
-                send_signal(self.owner_tid, sig);
+                send_signal(self.owner_tid.load(Ordering::Relaxed), sig);
             }
         }
     }
@@ -495,6 +496,21 @@ pub fn delete_posix_timer(tid: Tid, timer_id: TimerT) -> Result<(), i32> {
             Ok(())
         }
         None => Err(-22), // EINVAL - timer not found
+    }
+}
+
+/// A non-leader exec took tid `new` from `old` (exchange_tids): the
+/// group's timers owned by `old` now signal `new`
+pub fn retarget(sig: &crate::signal::SignalStruct, old: Tid, new: Tid) {
+    for t in sig.posix_timers.lock().timers.values() {
+        let _ = t
+            .owner_tid
+            .compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    for e in POSIX_TIMER_REGISTRY.lock().iter_mut() {
+        if e.1 == old {
+            e.1 = new;
+        }
     }
 }
 
