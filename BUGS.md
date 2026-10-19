@@ -724,3 +724,25 @@ Found during T0 (2026-10-19). Tag = when to fix.
 7. **No ptrace exec stop** (P9): a traced task's execve does not stop
    with SIGTRAP / PTRACE_EVENT_EXEC (`kernel/task/exec.rs`), so a
    tracer cannot observe a non-leader exec's tid change.
+8. **T0 resume point** (T0 next). Design: ~/.claude/plans/
+   t0-foundation-design.md (commit numbers below are its §3).
+   Done and on `updates`: 1 PerCpu/this_id; 2 cpumask/NR_CPUS=256/CFD;
+   3 spin locks raise preempt_count, real might_sleep; 4 task map +
+   hot atomics; 5 per-CPU current/INIT_TASK; 6 side maps folded, vfork
+   Completion; 7 struct Pid/pidmap/hash, leader pid==tid,
+   exchange_tids; 8 TASKLIST rwlock, parent/tracer/children/thread
+   lists as task refs, reparenting, per-task Task.sig; 14 kernel/
+   list.rs (pulled forward for 8). Not done: alloc_lock (TaskRes still
+   under TASKLIST); PGID/SID pid_links (kill_pgrp/setpgid still scan);
+   9 per-CPU GDT/TSS/IST; 10 swapgs (replaces the TSC_AUX GS
+   stopgap; handle entries before per-CPU init); 11/12 pt_regs single
+   home (x86/arm64); 13 exit_to_user_mode, slice tick, kick IPI, tests
+   a-c (mask all DAIF on every arm64 return to user, incl. clone child
+   entry); kernel stack guard pages (VMAP_STACK-style, overflow on a
+   separate stack, "kernel stack overflow" panic); 15 sched entity/
+   ttwu(&Task); 16 intrusive WaitQueue + FutexQ (wakeups still by raw
+   tid: waitqueue, futex, poll, mqueue, signalfd, sem/msg); 17 per-CPU
+   timer wheel; 18 hrtimer-lite + deadline waits; 19 yield polls and
+   SCHEDULING_ENABLED fallbacks; 20 GFP from context/reclaim;
+   21 try_* user-sized allocations; tests e-h. Also: an acct test with
+   N threads exiting at once (one record) was not written.
