@@ -919,6 +919,9 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
 
     /// Its place in the task list (Linux task->tasks; under TASKLIST)
     pub tasks_link: crate::list::Link,
+    /// Its place in its real parent's `children` (Linux sibling; under
+    /// TASKLIST)
+    pub sibling: crate::list::Link,
     /// The rest, under TASKLIST (None only for the boot task, which
     /// is never in the table)
     inner: TableCell<Option<TaskInner<A, PT>>>,
@@ -1051,13 +1054,23 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     /// 0 = not traced, non-zero = traced with flags
     pub ptrace: u32,
 
-    /// Current ptrace parent (tracer) TID
-    /// Only valid when ptrace != 0
-    pub ptracer_tid: Option<Tid>,
+    /// The tracer (Linux task->parent while traced): a task reference,
+    /// so a recycled number never names it (under TASKLIST)
+    pub ptracer: Option<alloc::sync::Weak<Task<A, PT>>>,
 
-    /// Real parent TID (preserved for detach restoration)
-    /// When ptracing, parent may be changed to tracer; real_parent stays original
-    pub real_parent_tid: Tid,
+    /// The real parent (Linux real_parent): the task whose `children`
+    /// list holds this one; None for init and kernel threads. Weak:
+    /// exit reparents children first (under TASKLIST)
+    pub real_parent: Option<alloc::sync::Weak<Task<A, PT>>>,
+
+    /// Its children (Linux children; their `sibling` links): the thread
+    /// group leaders it created, one strong reference each, until reaped
+    /// or reparented (under TASKLIST)
+    pub children: crate::list::ArcList<Sibling<A, PT>>,
+
+    /// On its real parent's `children` (a group leader; Linux: only
+    /// leaders are)
+    pub in_children: bool,
 
     /// Message for PTRACE_GETEVENTMSG (child PID, exec old TID, exit code, etc.)
     pub ptrace_message: u64,
@@ -1092,6 +1105,25 @@ impl<T> TableCell<T> {
     pub unsafe fn get_mut(&self) -> &mut T {
         // SAFETY: see above
         unsafe { &mut *self.0.get() }
+    }
+}
+
+/// The adapter of `Task.sibling` (children lists)
+pub struct Sibling<A, PT>(core::marker::PhantomData<(A, PT)>);
+
+// SAFETY: offset_of! gives `sibling`'s place in the task
+unsafe impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>>
+    crate::list::Adapter for Sibling<A, PT>
+{
+    type Item = Task<A, PT>;
+    fn link(t: &Task<A, PT>) -> &crate::list::Link {
+        &t.sibling
+    }
+    unsafe fn item(l: *const crate::list::Link) -> *const Task<A, PT> {
+        // SAFETY: `l` is the `sibling` of a live task
+        unsafe {
+            (l as *const u8).sub(core::mem::offset_of!(Task<A, PT>, sibling)) as *const Task<A, PT>
+        }
     }
 }
 
@@ -1245,6 +1277,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             min_flt: AtomicU64::new(0),
             maj_flt: AtomicU64::new(0),
             tasks_link: crate::list::Link::new(),
+            sibling: crate::list::Link::new(),
             inner: TableCell::new(Some(inner)),
         }
     }
@@ -1283,6 +1316,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             min_flt: AtomicU64::new(0),
             maj_flt: AtomicU64::new(0),
             tasks_link: crate::list::Link::new(),
+            sibling: crate::list::Link::new(),
             inner: TableCell::new(None),
         }
     }

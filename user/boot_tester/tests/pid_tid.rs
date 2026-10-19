@@ -5,13 +5,15 @@
 //! - a thread's tid, as clone returns it and CLONE_PARENT_SETTID stores
 //!   it, names /proc/self/task/<tid>;
 //! - a non-leader thread that execs keeps the pid and becomes its tid
-//!   (de_thread's exchange_tids).
+//!   (de_thread's exchange_tids);
+//! - an orphan goes to the nearest child subreaper, which waits for it
+//!   (forget_original_parent).
 
 use super::fork_mm::{join, spawn_thread_ptid};
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
-    sys_close, sys_dup3, sys_execve, sys_exit, sys_faccessat, sys_fork, sys_getpid, sys_gettid,
-    sys_pipe2, sys_read, sys_wait4, sys_write,
+    sys_close, sys_dup3, sys_execve, sys_exit, sys_faccessat, sys_fork, sys_getpid, sys_getppid,
+    sys_gettid, sys_pipe2, sys_prctl, sys_read, sys_wait4, sys_write,
 };
 
 const AT_FDCWD: i32 = -100;
@@ -21,6 +23,7 @@ pub fn run_tests() {
     fork_ids();
     thread_ids();
     exec_thread();
+    reparent();
 }
 
 fn report(name: &[u8], ok: bool, v: i64) {
@@ -163,5 +166,49 @@ fn exec_thread() {
         b"PID_TID_EXEC_THREAD",
         n == 16 && ids[0] == pid && ids[1] == pid && w == pid,
         ids[1] - pid,
+    );
+}
+
+/// A child forks a grandchild and exits: the grandchild's parent is now
+/// this (subreaper) process, which can wait for it
+fn reparent() {
+    const PR_SET_CHILD_SUBREAPER: i32 = 36;
+    let me = sys_getpid();
+    sys_prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+    let mut p = [0i32; 2];
+    let mut go = [0i32; 2];
+    sys_pipe2(p.as_mut_ptr(), 0);
+    sys_pipe2(go.as_mut_ptr(), 0);
+    let child = sys_fork();
+    if child == 0 {
+        let gc = sys_fork();
+        if gc == 0 {
+            // Wait until the middle process is gone, then report
+            let mut c = [0u8; 1];
+            sys_read(go[0] as u64, c.as_mut_ptr(), 1);
+            let v = [sys_getppid()];
+            sys_write(p[1] as u64, v.as_ptr() as *const u8, 8);
+            sys_exit(7);
+        }
+        let v = [gc];
+        sys_write(p[1] as u64, v.as_ptr() as *const u8, 8);
+        sys_exit(0);
+    }
+    let mut gc = [0i64; 1];
+    sys_read(p[0] as u64, gc.as_mut_ptr() as *mut u8, 8);
+    let mut st = 0;
+    sys_wait4(child, &mut st, 0, 0);
+    sys_write(go[1] as u64, b"g".as_ptr(), 1);
+    let mut ppid = [0i64; 1];
+    let n = sys_read(p[0] as u64, ppid.as_mut_ptr() as *mut u8, 8);
+    let w = sys_wait4(gc[0], &mut st, 0, 0);
+    sys_prctl(PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0);
+    for fd in [p[0], p[1], go[0], go[1]] {
+        sys_close(fd as u64);
+    }
+    report(
+        b"PID_TID_REPARENT",
+        n == 8 && ppid[0] == me && w == gc[0] && (st >> 8) & 0xff == 7,
+        ppid[0],
     );
 }

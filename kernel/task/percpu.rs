@@ -620,6 +620,27 @@ macro_rules! owner_reads {
 owner_reads!(TaskView);
 owner_reads!(TaskViewMut);
 
+/// Tracer links of a task, read under TASKLIST (the views borrow it)
+macro_rules! tracer_reads {
+    ($t:ident) => {
+        impl<'a> $t<'a> {
+            /// Its tracer, if it is traced and the tracer lives
+            pub fn tracer(&self) -> Option<TaskRef> {
+                self.ptracer.as_ref().and_then(|w| w.upgrade())
+            }
+
+            /// Traced by `t` (pointer identity: never a recycled number)
+            pub fn traced_by(&self, t: &KernelTask) -> bool {
+                self.ptracer
+                    .as_ref()
+                    .is_some_and(|w| core::ptr::eq(w.as_ptr(), t))
+            }
+        }
+    };
+}
+tracer_reads!(TaskView);
+tracer_reads!(TaskViewMut);
+
 impl TaskViewMut<'_> {
     /// Install credentials; the old ones go after TASKLIST. Only the
     /// task itself (commit_creds), or its creator before it runs.
@@ -697,6 +718,70 @@ impl GlobalTaskTable {
         self.iter_mut().find(|t| f(t))
     }
 
+    /// The locked fields of a task in the list, writable
+    ///
+    /// # Safety
+    /// `t` is in this list, and no view of it is live.
+    unsafe fn inner_mut_of<'a>(&'a mut self, t: &'a KernelTask) -> &'a mut KernelTaskInner {
+        // SAFETY: see above; the list is locked for writing
+        unsafe { t.inner().get_mut() }
+            .as_mut()
+            .expect("task table: boot task")
+    }
+
+    /// Put `child` (a group leader in this list) on its real parent's
+    /// `children` (Linux list_add_tail(&p->sibling, &parent->children))
+    pub fn link_child(&mut self, child: &TaskRef) {
+        // SAFETY: in this list; no view is live (we hold &mut self)
+        let ci = unsafe { self.inner_mut_of(child) };
+        let Some(parent) = ci.real_parent.as_ref().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        if ci.in_children {
+            return;
+        }
+        ci.in_children = true;
+        // SAFETY: the parent is alive and in this list (it is unlinked
+        // only after its children were reparented)
+        let pi = unsafe { self.inner_mut_of(&parent) };
+        pi.children.push_back(child.clone());
+    }
+
+    /// Take `child` off its real parent's `children`
+    fn unlink_child(&mut self, child: &KernelTask) {
+        // SAFETY: in this list; no view is live
+        let ci = unsafe { self.inner_mut_of(child) };
+        if !core::mem::take(&mut ci.in_children) {
+            return;
+        }
+        let Some(parent) = ci.real_parent.as_ref().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        // SAFETY: as in link_child; the child is on its list
+        let pi = unsafe { self.inner_mut_of(&parent) };
+        drop(unsafe { pi.children.remove(child) });
+    }
+
+    /// Move every child of `task` to `reaper` (Linux forget_original_parent
+    /// + reparent_leader); true if one was a zombie
+    pub fn reparent(&mut self, task: &KernelTask, reaper: &TaskRef) -> bool {
+        let mut zombie = false;
+        loop {
+            // SAFETY: in this list; no view is live
+            let Some(child) = (unsafe { self.inner_mut_of(task) }).children.pop_front() else {
+                break;
+            };
+            // SAFETY: as above, a different task
+            let ci = unsafe { self.inner_mut_of(&child) };
+            ci.in_children = false;
+            ci.real_parent = Some(Arc::downgrade(reaper));
+            zombie |= matches!(ci.state, TaskState::Zombie(_));
+            child.ppid.store(reaper.pid, Ordering::Relaxed);
+            self.link_child(&child);
+        }
+        zombie
+    }
+
     /// Add a task (fork, kernel thread creation); it has a pid
     pub fn insert(&mut self, task: TaskRef) {
         // SAFETY: the list is locked for writing
@@ -712,6 +797,7 @@ impl GlobalTaskTable {
     /// is released under TASKLIST)
     pub fn remove(&mut self, tid: Tid) -> Option<TaskRef> {
         let t = task_ref(self.lookup(tid)?);
+        self.unlink_child(&t);
         // SAFETY: the list is locked for writing, so no view exists
         if let Some(inner) = unsafe { t.inner().get() }
             && let Some(p) = &inner.thread_pid
@@ -957,8 +1043,10 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
         leader: true,
         // Ptrace state (kernel threads are not traced)
         ptrace: 0,
-        ptracer_tid: None,
-        real_parent_tid: 0,
+        ptracer: None,
+        real_parent: None,
+        children: crate::list::ArcList::new(),
+        in_children: false,
         ptrace_message: 0,
         ptrace_options: 0,
     };
@@ -1150,8 +1238,10 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         leader: true,
         // Ptrace state (not traced initially)
         ptrace: 0,
-        ptracer_tid: None,
-        real_parent_tid: config.ppid,
+        ptracer: None,
+        real_parent: None,
+        children: crate::list::ArcList::new(),
+        in_children: false,
         ptrace_message: 0,
         ptrace_options: 0,
     };
@@ -1357,9 +1447,8 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
     if ltid == tid {
         return Vec::new();
     }
-    let (ppid, real_parent, exit_signal, start, uid) = (
+    let (ppid, exit_signal, start, uid) = (
         l.task.ppid(),
-        l.real_parent_tid,
         l.exit_signal,
         l.task.start_time(),
         l.cred().uid,
@@ -1372,7 +1461,7 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
         .map(|t| t.task.tid())
         .collect();
     let gone: Vec<TaskRef> = gone.into_iter().filter_map(|t| table.remove(t)).collect();
-    let Some(me) = table.remove(tid) else {
+    let Some(me) = table.task(tid) else {
         return gone;
     };
     // exchange_tids: the caller takes the leader's tid and pid (Linux
@@ -1383,6 +1472,15 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
         let (mi, li) = unsafe { (me.inner().get_mut(), l.inner().get_mut()) };
         if let (Some(mi), Some(li)) = (mi.as_mut(), li.as_mut()) {
             core::mem::swap(&mut mi.thread_pid, &mut li.thread_pid);
+            // The pid hash names the caller by its new number
+            if let Some(p) = &mi.thread_pid {
+                p.set_task(Arc::as_ptr(&me) as *const ());
+            }
+            if let Some(p) = &li.thread_pid {
+                p.set_task(core::ptr::null());
+            }
+            // Its real parent is the old leader's (threads share it)
+            mi.real_parent = li.real_parent.clone();
         }
         l.set_tid(tid);
         // The old leader's RLIMIT_NPROC charge goes with it; the caller
@@ -1390,25 +1488,16 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
         crate::task::nproc_uncharge(uid);
     }
     me.set_tid(ltid);
-    table.insert(me.clone());
-    // Raw tids naming the caller now name it by its new tid: tracees'
-    // tracer, children's real parent (Linux needs none of this: its
-    // links are task pointers)
-    for mut t in table.iter_mut() {
-        if t.ptracer_tid == Some(tid) {
-            t.ptracer_tid = Some(ltid);
-        }
-        if t.real_parent_tid == tid {
-            t.real_parent_tid = ltid;
-        }
-    }
+    // The new leader takes the old one's place among its parent's
+    // children (tracer and parent links are task references: nothing
+    // else names the old tid)
+    table.link_child(&me);
     let sig = table.get(ltid).and_then(|t| t.signal.clone());
     if let Some(mut m) = table.get_mut(ltid) {
         m.leader = true;
         m.task
             .ppid
             .store(ppid, core::sync::atomic::Ordering::Relaxed);
-        m.real_parent_tid = real_parent;
         m.exit_signal = exit_signal;
         m.task.start_time.store(start, Ordering::Relaxed);
     }
@@ -1597,8 +1686,9 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_seccomp_mode,
         parent_seccomp_filter,
         parent_ptrace,
-        parent_ptracer_tid,
+        parent_ptracer,
         parent_pid_ns,
+        parent_real_parent,
     ) = {
         let table = TASKLIST.read();
         let parent = table.get(current_tid).ok_or(3)?; // ESRCH - no such process
@@ -1620,11 +1710,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.task.seccomp_mode(),
             parent.seccomp_filter.clone(),
             parent.ptrace,
-            parent.ptracer_tid,
+            parent.ptracer.clone(),
             parent
                 .nsproxy
                 .as_ref()
                 .map_or_else(|| crate::ns::INIT_PID_NS.clone(), |n| n.pid_ns.clone()),
+            parent.real_parent.clone(),
         )
     };
 
@@ -1792,14 +1883,22 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             // Normal case: child is not traced initially
             0
         },
-        ptracer_tid: if config.flags & CLONE_UNTRACED != 0 {
+        ptracer: if config.flags & CLONE_UNTRACED != 0 {
             None
-        } else if config.flags & CLONE_PTRACE != 0 && parent_ptracer_tid.is_some() {
-            parent_ptracer_tid
+        } else if config.flags & CLONE_PTRACE != 0 {
+            parent_ptracer
         } else {
             None
         },
-        real_parent_tid: child_ppid,
+        // CLONE_PARENT/CLONE_THREAD: the caller's real parent (Linux
+        // copy_process)
+        real_parent: if config.flags & (CLONE_PARENT | CLONE_THREAD) != 0 {
+            parent_real_parent
+        } else {
+            Some(Arc::downgrade(&task_ref(&current())))
+        },
+        children: crate::list::ArcList::new(),
+        in_children: false,
         ptrace_message: 0,
         ptrace_options: 0,
     };
@@ -1827,6 +1926,11 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     {
         let mut table = TASKLIST.write();
         table.insert(child_task.clone());
+        // A new process joins its real parent's children (Linux: only
+        // group leaders are on children lists)
+        if config.flags & CLONE_THREAD == 0 {
+            table.link_child(&child_task);
+        }
     }
 
     // Handle filesystem context (CLONE_FS)
@@ -2045,6 +2149,55 @@ pub fn current_exiting() -> bool {
     current().has_flag(crate::task::pf::EXITING)
 }
 
+/// Hand the current task's children to a new parent before it dies
+/// (Linux forget_original_parent): another live thread of its group,
+/// else the nearest PR_SET_CHILD_SUBREAPER ancestor, else init
+fn forget_original_parent() {
+    let me = task_ref(&current());
+    let mut table = TASKLIST.write();
+    if table.get(me.tid()).is_none_or(|t| t.children.is_empty()) {
+        return;
+    }
+    let live = |t: &TaskView<'_>| {
+        !t.task.has_flag(crate::task::pf::EXITING) && !matches!(t.state, TaskState::Zombie(_))
+    };
+    let mut reaper = table
+        .find(|t| t.task.pid == me.pid && !core::ptr::eq(t.task, &*me) && live(t))
+        .map(|t| task_ref(t.task));
+    if reaper.is_none() {
+        let mut p = table.get(me.tid()).and_then(|t| t.real_parent.clone());
+        while let Some(t) = p.and_then(|w| w.upgrade()) {
+            let Some(v) = table.get(t.tid()) else { break };
+            if v.prctl.child_subreaper && live(&v) {
+                reaper = Some(t.clone());
+                break;
+            }
+            p = v.real_parent.clone();
+        }
+    }
+    let Some(reaper) = reaper.or_else(|| table.task(1)) else {
+        return;
+    };
+    if !Arc::ptr_eq(&reaper, &me) {
+        table.reparent(&me, &reaper);
+    }
+}
+
+/// An exited non-leader thread leaves the task list at once (Linux
+/// release_task for an autoreaped thread); its run queue keeps it
+/// until it has switched away for good
+fn release_thread(tid: Tid) {
+    let gone = {
+        let mut table = TASKLIST.write();
+        match table.get(tid) {
+            // A traced thread stays for its tracer's wait
+            Some(t) if !t.leader && t.ptrace == 0 => table.remove(tid),
+            _ => None,
+        }
+    };
+    drop(gone);
+}
+
 /// Exit the current task and switch to another
 ///
 /// This function never returns. The current task is removed from the
@@ -2133,8 +2286,12 @@ pub fn exit_current(status: Option<i32>) -> ! {
     } else {
         None
     };
+    if tid != 0 {
+        forget_original_parent();
+    }
     if let Some(st) = status {
         mark_zombie(tid, st);
+        release_thread(tid);
     }
 
     // Let a parent sleeping in wait4/waitid re-check for zombies

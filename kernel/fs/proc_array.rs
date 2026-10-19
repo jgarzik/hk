@@ -71,10 +71,7 @@ fn snap(pid: Pid) -> Option<Snap> {
     let table = TASKLIST.read();
     let t = table.find(|t| t.task.pid == pid)?;
     let threads = table.iter().filter(|x| x.task.pid == pid).count() as u64;
-    let tracer = t
-        .ptracer_tid
-        .and_then(|tr| table.get(tr))
-        .map_or(0, |x| x.task.pid);
+    let tracer = t.tracer().map_or(0, |x| x.pid);
     Some(Snap {
         pid,
         tid: t.task.tid(),

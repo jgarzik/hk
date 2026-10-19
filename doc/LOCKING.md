@@ -571,6 +571,17 @@ under TASKLIST, then re-keys its run-queue entry under the rq lock
 after releasing TASKLIST (rq -> TASKLIST order). The idle tasks
 are tid 0 and, like the boot task, not in TASKLIST.
 
+**Relations** (under TASKLIST's write lock to change, read lock to
+walk): `real_parent` and `ptracer` are task references (`Weak`), never
+numbers, so a recycled tid cannot inherit a parent or tracer link. A
+group leader is on its real parent's `children` (intrusive `ArcList`,
+link `Task.sibling`, one strong reference each; Linux only lists
+leaders); `link_child` at fork and exec's leader change, unlinked at
+reap. An exiting task first hands its children to another live thread
+of its group, else the nearest child subreaper, else init
+(`forget_original_parent`, `reparent`); an exited non-leader thread
+leaves the task list at once (Linux release_task), unless traced.
+
 A `Task` has four kinds of fields: fixed at creation (`tid`, `pid`,
 `kind`, `kstack_top`); hot atomics written by the task itself (or its
 creator before it first runs) or under TASKLIST, and read lock-free

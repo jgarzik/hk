@@ -186,13 +186,11 @@ fn ptrace_may_access(target_tid: Tid) -> bool {
 ///
 /// Most ptrace operations require the tracee to be in a ptrace-stop.
 fn ptrace_check_attach(target_tid: Tid) -> Result<(), i64> {
-    let caller_tid = percpu::current_tid();
-
     let table = TASKLIST.read();
     let target = table.get(target_tid).ok_or(-ESRCH)?;
 
     // Check if we are the tracer
-    if target.ptracer_tid != Some(caller_tid) {
+    if !target.traced_by(&percpu::current()) {
         return Err(-ESRCH);
     }
 
@@ -256,10 +254,8 @@ fn ptrace_traceme() -> i64 {
     }
 
     // Set up tracing - parent becomes tracer
-    let ppid = task.task.ppid();
     task.ptrace = PT_PTRACED;
-    task.ptracer_tid = Some(ppid);
-    task.real_parent_tid = ppid;
+    task.ptracer = task.real_parent.clone();
 
     0
 }
@@ -305,8 +301,9 @@ fn ptrace_attach(target_pid: Pid) -> i64 {
 
         // Set up tracing
         target.ptrace = PT_PTRACED;
-        target.ptracer_tid = Some(caller_tid);
-        // real_parent_tid is already set correctly
+        target.ptracer = Some(alloc::sync::Arc::downgrade(&percpu::task_ref(
+            &percpu::current(),
+        )));
     }
 
     // Send SIGSTOP to the target to stop it
@@ -362,7 +359,9 @@ fn ptrace_seize(target_pid: Pid, options: u32) -> i64 {
 
         // Set up tracing with SEIZED flag
         target.ptrace = PT_PTRACED | PT_SEIZED;
-        target.ptracer_tid = Some(caller_tid);
+        target.ptracer = Some(alloc::sync::Arc::downgrade(&percpu::task_ref(
+            &percpu::current(),
+        )));
         target.ptrace_options = options;
     }
 
@@ -398,7 +397,7 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> i64 {
 
         // Clear tracing state
         target.ptrace = 0;
-        target.ptracer_tid = None;
+        target.ptracer = None;
         target.ptrace_options = 0;
 
         // Change state from Traced to Ready (this wakes the task)
@@ -490,7 +489,6 @@ fn ptrace_kill(target_pid: Pid) -> i64 {
     };
 
     // Verify we are the tracer
-    let caller_tid = percpu::current_tid();
     {
         let table = TASKLIST.read();
         let target = match table.get(target_tid) {
@@ -498,7 +496,7 @@ fn ptrace_kill(target_pid: Pid) -> i64 {
             None => return -ESRCH,
         };
 
-        if target.ptracer_tid != Some(caller_tid) {
+        if !target.traced_by(&percpu::current()) {
             return -ESRCH;
         }
     }
@@ -743,7 +741,7 @@ pub fn ptrace_stop(sig: u32) {
         let mut table = TASKLIST.write();
         let tracer_tid = if let Some(mut task) = table.get_mut(tid) {
             task.state = TaskState::Traced(sig as i32);
-            task.ptracer_tid
+            task.tracer().map(|t| t.tid())
         } else {
             None
         };
