@@ -125,8 +125,7 @@ fn tolerance_kb() -> i64 {
 
 /// Free memory not counting the kernel heap: MemFree + Slab. These
 /// tests check that user memory (pages, page tables) comes back; kernel
-/// object leaks show in Slab and are tracked by the Slab tests (hk: the
-/// known per-pid procfs dentry and zombie-thread leaks, BUGS.md)
+/// object leaks show in Slab and are tracked by the Slab tests
 fn user_free() -> i64 {
     meminfo(b"MemFree:") + meminfo(b"Slab:").max(0)
 }

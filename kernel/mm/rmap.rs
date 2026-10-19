@@ -103,7 +103,7 @@ pub fn try_to_unmap(phys: u64, e: crate::mm::SwapEntry) -> bool {
 /// Swap the entry `p` (last seen as `pte`) from mapping `phys` to the
 /// swap entry `e`, its PTE lock held. Only the MMU changes it meanwhile
 /// (accessed/dirty bits): retry with those; false if it no longer maps
-/// `phys` (P4 #1: never overwrite what some other writer stored)
+/// `phys` (never overwrite what some other writer stored)
 fn unmap_one(
     p: &core::sync::atomic::AtomicU64,
     pte: u64,

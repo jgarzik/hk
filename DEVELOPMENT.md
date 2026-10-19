@@ -126,7 +126,8 @@ make clippy-arm     # Linting for aarch64
 `make gate` (`tools/gate.sh`) runs `fmt-check`, `clippy` and `clippy-arm`
 (`-D warnings`) and `test`, stopping at the first failure, then builds
 everything the boots need, then runs `check`, `check-arm`, `check-linux`
-and `check-linux-arm` in parallel (`NOBUILD=1`: boot what is built). It
+and `check-linux-arm` in parallel (`NOBUILD=1`: boot what is built; on
+an arm64 host `check-linux` is aarch64, so `check-linux-arm` is skipped). It
 prints one line per boot and `GATE-OK` or `GATE-FAILED`; each step's
 output is in `target/qemu/gate/<step>.out`.
 
@@ -176,14 +177,15 @@ make run-arm        # aarch64
 ### QEMU Configuration
 
 The default QEMU setup:
-- Memory: 512MB
+- Memory: 512MB, 4 CPUs (`-smp 4`)
 - Serial output: logged to `target/qemu/serial.log` (x86-64) or `target/qemu/serial_arm.log` (aarch64); `QEMU_LOG_DIR` overrides the directory
 - Display: `-nographic` (console mode)
 - x86-64: Boots from ISO with GRUB
 - aarch64: Direct kernel boot with device tree
 - CPU: x86-64 `-cpu host` under KVM, `-cpu max` under TCG (SMAP/SMEP;
   `NO_KVM=1` forces TCG, as on CI);
-  aarch64 `-cpu neoverse-n1` (PAN). SMAP/PAN make any kernel access to
+  aarch64 `-cpu neoverse-n1` (PAN) under TCG, `-cpu host` under KVM on
+  arm64 hosts. SMAP/PAN make any kernel access to
   user memory outside `kernel/uaccess.rs` fault, so the boot tests catch
   it. Override with `QEMU_CPU`, e.g. `make check QEMU_CPU=qemu64` or
   `make check-arm QEMU_CPU=cortex-a72` (no SMAP/PAN).
@@ -217,7 +219,7 @@ A successful boot shows all tests passing and ends with `BOOT_COMPLETE`.
 Some kernel modules have unit tests that run on the host:
 
 ```bash
-cargo test -p hk-kernel --target x86_64-unknown-linux-gnu
+make test           # cargo test -p hk-kernel (host target)
 ```
 
 Note: Most testing is done via boot tests since bare-metal kernel code requires QEMU.
@@ -251,17 +253,21 @@ hk/
 │   ├── fs/              # VFS + filesystem implementations
 │   ├── signal/          # Signal handling
 │   ├── bus/             # Bus drivers (PCI, etc.)
-│   ├── storage/         # Block device drivers
+│   ├── storage/         # Block layer (blk-mq, partitions, SCSI disk)
+│   ├── virtio/          # virtio PCI transport, virtqueues, virtio-blk
+│   ├── net/             # Networking (sockets, IPv4, TCP/UDP, netlink, NIC drivers)
 │   ├── usb/             # USB stack (xHCI, hub, devices)
 │   ├── tty/             # TTY subsystem
 │   ├── ns/              # Namespaces
 │   ├── dt/              # Device tree parsing
 │   └── *.rs             # Core kernel modules (console, heap, frame_alloc, etc.)
-├── user/                # Userspace test binaries
-│   ├── boot_tester.rs   # Main test harness
+├── user/                # Userspace test binaries (separate workspace)
+│   ├── boot_tester/     # Test harness (main.rs, boot_tester2.rs)
+│   │   └── tests/       # Test modules (mmap.rs, process.rs, etc.)
 │   ├── syscall/         # Syscall wrappers (x86_64.rs, aarch64.rs)
-│   └── tests/           # Test modules (mmap.rs, process.rs, etc.)
-├── boot/                # GRUB configuration (x86-64)
+│   └── rootfs/          # /etc files for the initramfs
+├── tools/               # gate, disk image, busybox, Linux reference scripts
+├── boot/                # GRUB configuration (x86-64; machines/ per MACHINE=)
 ├── doc/                 # Documentation
 └── target/              # Build output
 ```
@@ -291,6 +297,7 @@ After a full build:
 target/x86_64-unknown-none/release/kernel    # Kernel binary (ELF)
 target/hk-x86_64.iso                         # Bootable ISO image
 target/disk.img                              # virtio-blk test disk (both arches)
+target/vfat.img                              # FAT32 USB mass-storage image (both arches)
 user/initramfs-x86_64.cpio                   # Userspace CPIO archive
 
 # aarch64
@@ -300,6 +307,7 @@ user/initramfs-aarch64.cpio                  # Userspace CPIO archive
 # Userspace binaries
 user/target/x86_64-unknown-linux-gnu/release/boot_tester
 user/target/aarch64-unknown-linux-gnu/release/boot_tester
+user/target-host/<arch>-unknown-linux-gnu/release/boot_tester  # check-linux* build
 ```
 
 ## Cleaning

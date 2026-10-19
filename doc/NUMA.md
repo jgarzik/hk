@@ -96,30 +96,21 @@ pub mempolicy: Option<TaskMempolicy>,  // Per-VMA policy from mbind
 
 **Required Changes:**
 
-1. **`kernel/frame_alloc.rs`** - Per-node allocation regions
+1. **`kernel/mm/page_alloc.rs`** - Per-node zones. Today one buddy
+   zone (with per-CPU page lists) covers all RAM, behind the
+   `FrameAllocator` API in `kernel/frame_alloc.rs` (`alloc_gfp`,
+   `alloc_pages`, ...). Split it into one zone per node (Linux
+   pg_data_t), with per-CPU lists per zone, and add node-aware entry
+   points:
    ```rust
-   pub struct BitmapFrameAllocator {
-       nodes: [NodeAllocator; MAX_NUMA_NODES],
-       nr_nodes: usize,
-   }
+   // Allocate from specific node
+   pub fn alloc_node(&self, node: u32, order: u32, gfp: Gfp) -> Option<u64>;
 
-   struct NodeAllocator {
-       bitmap: Box<[u64]>,
-       base_pfn: u64,
-       nr_frames: usize,
-       next_free: usize,
-   }
+   // Allocate with fallback (try preferred, then others by distance)
+   pub fn alloc_prefer(&self, preferred: u32, order: u32, gfp: Gfp) -> Option<u64>;
 
-   impl BitmapFrameAllocator {
-       // Allocate from specific node
-       pub fn alloc_node(&mut self, node: u32) -> Option<u64>;
-
-       // Allocate with fallback (try preferred, then others by distance)
-       pub fn alloc_prefer(&mut self, preferred: u32) -> Option<u64>;
-
-       // Allocate respecting policy
-       pub fn alloc_policy(&mut self, policy: &TaskMempolicy) -> Option<u64>;
-   }
+   // Allocate respecting policy
+   pub fn alloc_policy(&self, policy: &TaskMempolicy, order: u32, gfp: Gfp) -> Option<u64>;
    ```
 
 2. **Policy-Aware Allocation Logic:**
@@ -138,7 +129,8 @@ pub mempolicy: Option<TaskMempolicy>,  // Per-VMA policy from mbind
 
 5. **Initialization:**
    - `kernel/arch/*/mod.rs` - Initialize per-node regions from topology
-   - Use `NumaNode.start_pfn` / `end_pfn` to partition frame allocator
+   - Use `NumaNode.start_pfn` / `end_pfn` to partition the memblock
+     free ranges among the node zones
 
 ### Phase 5: Page Migration
 
@@ -174,8 +166,9 @@ pub mempolicy: Option<TaskMempolicy>,  // Per-VMA policy from mbind
 
 3. **Page-to-Node Tracking:**
    - Need way to determine which NUMA node a physical page belongs to
-   - Could use per-node frame allocator ranges for lookup
-   - Or add node_id to page metadata if we have struct page equivalent
+   - Could use per-node zone pfn ranges for lookup
+   - Or record the node in struct page (`kernel/mm/page.rs`, e.g. in
+     `flags`, as Linux does)
 
 4. **Locking Considerations:**
    - Page migration requires holding mm lock
@@ -187,9 +180,12 @@ pub mempolicy: Option<TaskMempolicy>,  // Per-VMA policy from mbind
 ## Testing
 
 Boot tester tests exist in `user/boot_tester/tests/mempolicy.rs`:
-- `test_get_mempolicy_basic`
-- `test_set_mempolicy_bind`
-- `test_mbind_basic`
+- `test_get_mempolicy_default`
+- `test_set_mempolicy_default`
+- `test_set_mempolicy_local`
+- `test_set_mempolicy_bind_node0`
+- `test_mbind_anonymous`
+- `test_get_mempolicy_nodemask`
 - `test_migrate_pages_self`
 - `test_migrate_pages_null_masks`
 - `test_move_pages_query`
