@@ -68,7 +68,7 @@ fn set_seccomp_strict() -> i64 {
 
     {
         let mut table = TASK_TABLE.lock();
-        let task = match table.tasks.iter_mut().find(|t| t.tid == tid) {
+        let mut task = match table.get_mut(tid) {
             Some(t) => t,
             None => return KernelError::NoProcess.sysret(),
         };
@@ -100,7 +100,7 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, _tsync: bool) -> i64 {
     // Get current task's existing filter and check no_new_privs
     let (existing_filter, has_no_new_privs, is_privileged) = {
         let table = TASK_TABLE.lock();
-        let task = match table.tasks.iter().find(|t| t.tid == tid) {
+        let task = match table.get(tid) {
             Some(t) => t,
             None => return KernelError::NoProcess.sysret(),
         };
@@ -126,7 +126,7 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, _tsync: bool) -> i64 {
     // Update task's seccomp state
     {
         let mut table = TASK_TABLE.lock();
-        let task = match table.tasks.iter_mut().find(|t| t.tid == tid) {
+        let mut task = match table.get_mut(tid) {
             Some(t) => t,
             None => return KernelError::NoProcess.sysret(),
         };
@@ -167,7 +167,7 @@ pub fn prctl_get_seccomp() -> i64 {
     let tid = crate::task::percpu::current_tid();
 
     let table = TASK_TABLE.lock();
-    match table.tasks.iter().find(|t| t.tid == tid) {
+    match table.get(tid) {
         Some(task) => task.seccomp_mode as i64,
         None => SECCOMP_MODE_DISABLED as i64,
     }

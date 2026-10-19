@@ -392,10 +392,8 @@ pub fn init_task_ns(tid: Tid, nsproxy: Arc<NsProxy>) {
     let old = {
         let mut table = TASK_TABLE.lock();
         table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.nsproxy.replace(nsproxy))
+            .get_mut(tid)
+            .and_then(|mut t| t.nsproxy.replace(nsproxy))
     };
     drop(old);
 }
@@ -405,11 +403,7 @@ pub fn init_task_ns(tid: Tid, nsproxy: Arc<NsProxy>) {
 /// Returns a cloned Arc (increments refcount).
 pub fn get_task_ns(tid: Tid) -> Option<Arc<NsProxy>> {
     let table = TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .and_then(|t| t.nsproxy.clone())
+    table.get(tid).and_then(|t| t.nsproxy.clone())
 }
 
 /// Remove nsproxy when task exits
@@ -421,11 +415,7 @@ pub fn get_task_ns(tid: Tid) -> Option<Arc<NsProxy>> {
 pub fn exit_task_ns(tid: Tid) {
     let ns = {
         let mut table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.nsproxy.take())
+        table.get_mut(tid).and_then(|mut t| t.nsproxy.take())
     };
     drop(ns);
 }

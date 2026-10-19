@@ -99,12 +99,12 @@ pub mod wait_options {
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicBool;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
 use crate::arch::{Arch, PageTable};
 use crate::fs::FsStruct;
 use crate::ipc::sem::SemUndoList;
-use crate::mm::page_cache::CachedPage;
 use crate::ns::NsProxy;
 use crate::seccomp::SeccompFilter;
 use crate::signal::{SigHand, SignalStruct, TaskSignalState};
@@ -122,9 +122,6 @@ pub type Uid = u32;
 
 /// Group ID type (Linux-compatible)
 pub type Gid = u32;
-
-/// Magic value to detect corrupted/freed Task structs ("TASKMAGI" in ASCII)
-pub const TASK_MAGIC: u64 = 0x5441534B_4D414749;
 
 /// Task credentials (Linux-compatible model)
 ///
@@ -266,9 +263,7 @@ pub fn current_cred_arc() -> Arc<Cred> {
     let tid = percpu::current_tid();
     let table = percpu::TASK_TABLE.lock();
     table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
+        .get(tid)
         .map(|t| t.cred.clone())
         .unwrap_or_else(|| Arc::new(Cred::NOBODY))
 }
@@ -313,14 +308,14 @@ pub fn nproc_exec_check() -> Result<(), i32> {
     let uid = current_cred().uid;
     // rlimit() takes TASK_TABLE: decide before locking it
     let over = nproc_overlimit(nproc_count(uid));
-    let mut table = percpu::TASK_TABLE.lock();
-    let Some(t) = table.tasks.iter_mut().find(|t| t.tid == tid) else {
+    let table = percpu::TASK_TABLE.lock();
+    let Some(t) = table.get(tid) else {
         return Ok(());
     };
-    if t.nproc_exceeded && over {
+    if t.task.has_flag(crate::task::pf::NPROC_EXCEEDED) && over {
         return Err(11); // EAGAIN
     }
-    t.nproc_exceeded = false;
+    t.task.clear_flag(crate::task::pf::NPROC_EXCEEDED);
     Ok(())
 }
 
@@ -914,14 +909,82 @@ impl<F> Default for FdTable<F> {
     }
 }
 
-/// A task (thread or process)
+/// Task flags (Linux PF_*, `Task.flags`): set by the task itself (or
+/// its creator before it runs), read lock-free by anyone
+pub mod pf {
+    /// Exiting (Linux PF_EXITING): what the task still releases (its
+    /// files) does not wait on its behalf, e.g. no SO_LINGER wait in
+    /// TCP close
+    pub const EXITING: u32 = 0x0000_0004;
+    /// A real-uid change left the task over RLIMIT_NPROC: its next
+    /// execve rechecks (Linux PF_NPROC_EXCEEDED)
+    pub const NPROC_EXCEEDED: u32 = 0x0000_1000;
+    /// Kernel thread (Linux PF_KTHREAD)
+    pub const KTHREAD: u32 = 0x0020_0000;
+}
+
+/// Thread flags (Linux TIF_*, `Task.thread_flags`): work to do on the way
+/// back to user mode, set by anyone, consumed by the task
+pub mod tif {
+    /// A signal is deliverable under the blocked mask (Linux
+    /// TIF_SIGPENDING)
+    pub const SIGPENDING: u32 = 1 << 0;
+}
+
+/// A task (thread or process; Linux task_struct), shared as
+/// [`TaskRef`]: the task table, run queues and lookups hold references
+///
+/// Three kinds of fields:
+/// - fixed at creation: `tid`, `kind`, `kstack_top`;
+/// - hot counters and flags: atomics written by the task itself (or
+///   its creator before it first runs) and read lock-free by anyone
+///   (accounting, `flags`, `thread_flags`, `cpu`);
+/// - everything else ([`TaskInner`]), read and written only under
+///   TASK_TABLE, through the table's views (`GlobalTaskTable::get` etc.).
 pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
-    /// Magic number for validation (must be TASK_MAGIC)
-    pub magic: u64,
-    /// Process ID
-    pub pid: Pid,
     /// Thread ID
     pub tid: Tid,
+    /// Kind of task
+    pub kind: TaskKind,
+    /// Kernel stack top
+    pub kstack_top: A::VirtAddr,
+    /// Task start time (monotonic clock, nanoseconds since boot; a
+    /// de_thread successor takes its leader's)
+    pub start_time: AtomicU64,
+
+    /// Linux PF_* ([`pf`])
+    pub flags: AtomicU32,
+    /// Linux TIF_* ([`tif`])
+    pub thread_flags: AtomicU32,
+    /// CPU whose run queue owns this task (tasks never migrate)
+    pub cpu: AtomicU32,
+
+    /// User CPU time consumed (nanoseconds)
+    pub utime: AtomicU64,
+    /// System CPU time consumed (nanoseconds)
+    pub stime: AtomicU64,
+    /// When the task last started running or crossed the user/kernel
+    /// boundary (for the utime/stime split)
+    pub last_run_ns: AtomicU64,
+    /// In kernel mode (for the utime/stime split)
+    pub in_kernel: AtomicBool,
+    /// Voluntary context switches (task yielded or slept)
+    pub nvcsw: AtomicU64,
+    /// Involuntary context switches (preempted by scheduler)
+    pub nivcsw: AtomicU64,
+    /// Minor page faults (demand paging, COW - no I/O required)
+    pub min_flt: AtomicU64,
+    /// Major page faults (swap-in required - I/O needed)
+    pub maj_flt: AtomicU64,
+
+    /// The rest, under TASK_TABLE
+    inner: TableCell<TaskInner<A, PT>>,
+}
+
+/// The fields of a [`Task`] read and written under TASK_TABLE
+pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
+    /// Process ID
+    pub pid: Pid,
     /// Thread Group ID (equals pid for thread group leader)
     /// For CLONE_THREAD: inherited from parent; otherwise: equals pid
     pub tgid: Pid,
@@ -943,36 +1006,12 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub pdeath_signal: i32,
 
     // =========================================================================
-    // Process accounting (like Linux task_struct timing/accounting fields)
-    // =========================================================================
-    /// User CPU time consumed (nanoseconds)
-    pub utime: u64,
-    /// System CPU time consumed (nanoseconds)
-    pub stime: u64,
-    /// Task start time (monotonic clock, nanoseconds since boot)
-    pub start_time: u64,
-    /// Timestamp when task last started running (for CPU time tracking)
-    pub last_run_ns: u64,
-    /// Whether task is currently in kernel mode (for utime/stime split)
-    pub in_kernel: bool,
-    /// Voluntary context switches (task yielded or slept)
-    pub nvcsw: u64,
-    /// Involuntary context switches (preempted by scheduler)
-    pub nivcsw: u64,
-    /// Minor page faults (demand paging, COW - no I/O required)
-    pub min_flt: u64,
-    /// Major page faults (swap-in required - I/O needed)
-    pub maj_flt: u64,
-
-    // =========================================================================
     // Credentials (like Linux task_struct->cred)
     // =========================================================================
     /// Task credentials - reference-counted, immutable after commit
     /// Following Linux pattern: prepare_creds() -> modify -> commit_creds()
     pub cred: Arc<Cred>,
 
-    /// Kind of task
-    pub kind: TaskKind,
     /// Current state
     pub state: TaskState,
     /// Scheduling priority (higher = more important)
@@ -985,18 +1024,10 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub reset_on_fork: bool,
     /// CPU affinity mask (bit N = CPU N is allowed)
     pub cpus_allowed: crate::cpumask::CpuSet,
-    /// CPU whose run queue owns this task (tasks never migrate)
-    pub cpu: u32,
     /// Page table for this task
     pub page_table: PT,
     /// Saved CPU state
     pub trap_frame: A::TrapFrame,
-    /// Kernel stack top
-    pub kstack_top: A::VirtAddr,
-    /// User stack top (if user process)
-    pub user_stack_top: Option<A::VirtAddr>,
-    /// Cached pages this task is using (for refcount management on exit)
-    pub cached_pages: Vec<Arc<CachedPage>>,
 
     // =========================================================================
     // TLS and thread-exit fields (Linux: embedded in task_struct/thread_struct)
@@ -1047,9 +1078,6 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Per-task signal state (blocked signals, pending signals)
     pub signal_state: TaskSignalState,
 
-    /// TIF_SIGPENDING flag (fast check at syscall return)
-    pub tif_sigpending: AtomicBool,
-
     /// Robust futex list head address
     pub robust_list: u64,
 
@@ -1094,20 +1122,11 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     #[cfg(target_arch = "x86_64")]
     pub iopl_emul: u8,
 
-    /// A real-uid change left this task over RLIMIT_NPROC: its next
-    /// execve rechecks (Linux PF_NPROC_EXCEEDED)
-    pub nproc_exceeded: bool,
-
     /// Thread-group leader (Linux thread_group_leader): created without
     /// CLONE_THREAD, or the thread whose exec ended the others
     /// (de_thread). Only leaders are waited for; a leader keeps its
     /// SignalStruct as a zombie, for the group's exit status.
     pub leader: bool,
-
-    /// Set at the start of exit (Linux PF_EXITING): what the task still
-    /// releases (its files) does not wait on its behalf, e.g. no
-    /// SO_LINGER wait in TCP close
-    pub exiting: bool,
 
     // =========================================================================
     // Ptrace state (like Linux task_struct ptrace fields)
@@ -1131,20 +1150,136 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub ptrace_options: u32,
 }
 
+/// Data owned by the TASK_TABLE lock (Rust-for-Linux LockedBy): only
+/// `GlobalTaskTable`'s views reach it, with the table locked
+pub struct TableCell<T>(UnsafeCell<T>);
+
+// SAFETY: every access goes through a view of the locked table
+unsafe impl<T: Send> Sync for TableCell<T> {}
+
+impl<T> TableCell<T> {
+    pub const fn new(v: T) -> Self {
+        Self(UnsafeCell::new(v))
+    }
+
+    /// # Safety
+    /// TASK_TABLE is held, and no `&mut` to this cell's data exists.
+    pub unsafe fn get(&self) -> &T {
+        // SAFETY: see above
+        unsafe { &*self.0.get() }
+    }
+
+    /// # Safety
+    /// TASK_TABLE is held mutably by the caller, and no other reference
+    /// to this cell's data exists.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn get_mut(&self) -> &mut T {
+        // SAFETY: see above
+        unsafe { &mut *self.0.get() }
+    }
+}
+
 impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {
-    /// Release all cached page references held by this task
-    ///
-    /// Should be called when the task exits to decrement refcounts
-    /// on cached pages, making them eligible for eviction.
-    pub fn release_cached_pages(&mut self) {
-        for page in self.cached_pages.drain(..) {
-            page.put();
+    /// A task with its locked fields (not yet in the table)
+    pub fn new(
+        tid: Tid,
+        kind: TaskKind,
+        kstack_top: A::VirtAddr,
+        cpu: u32,
+        inner: TaskInner<A, PT>,
+    ) -> Self {
+        let now = crate::time::monotonic_ns();
+        let flags = match kind {
+            TaskKind::KernelThread => pf::KTHREAD,
+            TaskKind::UserProcess => 0,
+        };
+        Self {
+            tid,
+            kind,
+            kstack_top,
+            start_time: AtomicU64::new(now),
+            flags: AtomicU32::new(flags),
+            thread_flags: AtomicU32::new(0),
+            cpu: AtomicU32::new(cpu),
+            utime: AtomicU64::new(0),
+            stime: AtomicU64::new(0),
+            last_run_ns: AtomicU64::new(now),
+            in_kernel: AtomicBool::new(kind == TaskKind::KernelThread),
+            nvcsw: AtomicU64::new(0),
+            nivcsw: AtomicU64::new(0),
+            min_flt: AtomicU64::new(0),
+            maj_flt: AtomicU64::new(0),
+            inner: TableCell::new(inner),
         }
     }
 
-    /// Add a cached page reference to this task
-    pub fn add_cached_page(&mut self, page: Arc<CachedPage>) {
-        self.cached_pages.push(page);
+    /// The locked fields (see [`TableCell`])
+    pub fn inner(&self) -> &TableCell<TaskInner<A, PT>> {
+        &self.inner
+    }
+
+    /// Linux PF_* test
+    pub fn has_flag(&self, f: u32) -> bool {
+        self.flags.load(Ordering::Acquire) & f != 0
+    }
+
+    pub fn set_flag(&self, f: u32) {
+        self.flags.fetch_or(f, Ordering::AcqRel);
+    }
+
+    pub fn clear_flag(&self, f: u32) {
+        self.flags.fetch_and(!f, Ordering::AcqRel);
+    }
+
+    /// The task's CPU (its run queue)
+    pub fn cpu(&self) -> u32 {
+        self.cpu.load(Ordering::Acquire)
+    }
+
+    /// TIF_SIGPENDING (fast check before sleeping and at syscall return)
+    pub fn sigpending(&self) -> bool {
+        self.thread_flags.load(Ordering::Acquire) & tif::SIGPENDING != 0
+    }
+
+    pub fn set_sigpending(&self, on: bool) {
+        if on {
+            self.thread_flags
+                .fetch_or(tif::SIGPENDING, Ordering::Release);
+        } else {
+            self.thread_flags
+                .fetch_and(!tif::SIGPENDING, Ordering::Release);
+        }
+    }
+
+    /// Charge the time since the last boundary to user or system time
+    /// and start a new interval in `kernel` mode (the task itself: the
+    /// only writer, so plain loads and stores suffice)
+    pub fn account(&self, now: u64, kernel: bool) {
+        let delta = now.saturating_sub(self.last_run_ns.load(Ordering::Relaxed));
+        let t = if self.in_kernel.load(Ordering::Relaxed) {
+            &self.stime
+        } else {
+            &self.utime
+        };
+        t.store(
+            t.load(Ordering::Relaxed).saturating_add(delta),
+            Ordering::Relaxed,
+        );
+        self.last_run_ns.store(now, Ordering::Relaxed);
+        self.in_kernel.store(kernel, Ordering::Relaxed);
+    }
+
+    /// Start time (monotonic ns)
+    pub fn start_time(&self) -> u64 {
+        self.start_time.load(Ordering::Relaxed)
+    }
+
+    /// (utime, stime) in nanoseconds
+    pub fn times(&self) -> (u64, u64) {
+        (
+            self.utime.load(Ordering::Relaxed),
+            self.stime.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -1527,9 +1662,13 @@ pub fn nproc_move(old: Uid, new: Uid) {
 fn flag_nproc_exceeded(new: Uid) {
     let over = new != 0 && nproc_overlimit(nproc_count(new));
     let tid = percpu::current_tid();
-    let mut table = percpu::TASK_TABLE.lock();
-    if let Some(t) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        t.nproc_exceeded = over;
+    let table = percpu::TASK_TABLE.lock();
+    if let Some(t) = table.get(tid) {
+        if over {
+            t.task.set_flag(crate::task::pf::NPROC_EXCEEDED);
+        } else {
+            t.task.clear_flag(crate::task::pf::NPROC_EXCEEDED);
+        }
     }
 }
 
@@ -1643,17 +1782,13 @@ impl Clone for IoContext {
 /// Get the I/O context for a task
 pub fn get_task_io_context(tid: Tid) -> Option<Arc<IoContext>> {
     let table = percpu::TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .and_then(|t| t.io_context.clone())
+    table.get(tid).and_then(|t| t.io_context.clone())
 }
 
 /// Set the I/O context for a task
 pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
     let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    if let Some(mut task) = table.get_mut(tid) {
         task.io_context = Some(ctx);
     }
 }
@@ -1662,11 +1797,7 @@ pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
 pub fn remove_task_io_context(tid: Tid) {
     let _old = {
         let mut table = percpu::TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.io_context.take())
+        table.get_mut(tid).and_then(|mut t| t.io_context.take())
     };
 }
 
@@ -1718,18 +1849,13 @@ pub const IOPRIO_WHO_USER: i32 = 3;
 /// Get the TLS pointer for a task
 pub fn get_task_tls(tid: Tid) -> Option<u64> {
     let table = percpu::TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .map(|t| t.tls_base)
-        .filter(|&v| v != 0)
+    table.get(tid).map(|t| t.tls_base).filter(|&v| v != 0)
 }
 
 /// Set the TLS pointer for a task
 pub fn set_task_tls(tid: Tid, tls: u64) {
     let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    if let Some(mut task) = table.get_mut(tid) {
         task.tls_base = tls;
     }
 }
@@ -1737,7 +1863,7 @@ pub fn set_task_tls(tid: Tid, tls: u64) {
 /// Remove the TLS pointer for a task (on exit)
 pub fn remove_task_tls(tid: Tid) {
     let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    if let Some(mut task) = table.get_mut(tid) {
         task.tls_base = 0;
     }
 }
@@ -1753,9 +1879,7 @@ pub fn remove_task_tls(tid: Tid) {
 pub fn get_clear_child_tid(tid: Tid) -> Option<u64> {
     let table = percpu::TASK_TABLE.lock();
     table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
+        .get(tid)
         .map(|t| t.clear_child_tid)
         .filter(|&v| v != 0)
 }
@@ -1763,7 +1887,7 @@ pub fn get_clear_child_tid(tid: Tid) -> Option<u64> {
 /// Set the clear_child_tid pointer for a task
 pub fn set_clear_child_tid(tid: Tid, addr: u64) {
     let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    if let Some(mut task) = table.get_mut(tid) {
         task.clear_child_tid = addr;
     }
 }
@@ -1778,7 +1902,7 @@ pub fn set_clear_child_tid(tid: Tid, addr: u64) {
 /// Get and remove the set_child_tid pointer for a task (one-time use)
 pub fn get_set_child_tid(tid: Tid) -> Option<u64> {
     let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    if let Some(mut task) = table.get_mut(tid) {
         let addr = task.set_child_tid;
         if addr != 0 {
             task.set_child_tid = 0; // Consume (one-time use)
@@ -1792,7 +1916,7 @@ pub fn get_set_child_tid(tid: Tid) -> Option<u64> {
 pub fn set_set_child_tid(tid: Tid, addr: u64) {
     if addr != 0 {
         let mut table = percpu::TASK_TABLE.lock();
-        if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        if let Some(mut task) = table.get_mut(tid) {
             task.set_child_tid = addr;
         }
     }

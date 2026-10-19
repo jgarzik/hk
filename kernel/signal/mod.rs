@@ -21,7 +21,7 @@ pub mod syscall;
 
 use crate::sync::spin::Mutex;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::task::{Pid, Tid};
@@ -668,10 +668,10 @@ use crate::task::percpu::TASK_TABLE;
 /// Also initializes the SignalStruct (which contains rlimits).
 pub fn init_task_signal(tid: Tid, sighand: Arc<SigHand>) {
     let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    if let Some(mut task) = table.get_mut(tid) {
         task.sighand = Some(sighand);
         task.signal_state = TaskSignalState::new();
-        task.tif_sigpending = AtomicBool::new(false);
+        task.task.set_sigpending(false);
         task.signal = Some(Arc::new(SignalStruct::new()));
     }
 }
@@ -679,11 +679,7 @@ pub fn init_task_signal(tid: Tid, sighand: Arc<SigHand>) {
 /// Get a task's signal handlers
 pub fn get_task_sighand(tid: Tid) -> Option<Arc<SigHand>> {
     let table = TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .and_then(|t| t.sighand.clone())
+    table.get(tid).and_then(|t| t.sighand.clone())
 }
 
 /// Access a task's signal state for modification
@@ -696,11 +692,10 @@ where
     F: FnOnce(&mut TaskSignalState) -> R,
 {
     let mut table = TASK_TABLE.lock();
-    table.tasks.iter_mut().find(|t| t.tid == tid).map(|t| {
+    table.get_mut(tid).map(|mut t| {
         let r = f(&mut t.signal_state);
         t.signal_state.recalc_sigpending();
-        t.tif_sigpending
-            .store(t.signal_state.sigpending, Ordering::Release);
+        t.task.set_sigpending(t.signal_state.sigpending);
         r
     })
 }
@@ -724,7 +719,7 @@ pub fn clone_task_signal(
     // Get parent's sighand and signal_state
     let (parent_sighand, parent_state) = {
         let table = TASK_TABLE.lock();
-        let parent = table.tasks.iter().find(|t| t.tid == parent_tid);
+        let parent = table.get(parent_tid);
         (
             parent.and_then(|p| p.sighand.clone()),
             parent.map(|p| p.signal_state.clone()),
@@ -772,10 +767,10 @@ pub fn clone_task_signal(
     // Update child task
     {
         let mut table = TASK_TABLE.lock();
-        if let Some(child) = table.tasks.iter_mut().find(|t| t.tid == child_tid) {
+        if let Some(mut child) = table.get_mut(child_tid) {
             child.sighand = Some(child_sighand);
             child.signal_state = child_state;
-            child.tif_sigpending = AtomicBool::new(false);
+            child.task.set_sigpending(false);
         }
     }
 
@@ -789,9 +784,9 @@ pub fn exit_task_signal(tid: Tid) {
     // Released after TASK_TABLE (nothing is released under it)
     let _old = {
         let mut table = TASK_TABLE.lock();
-        table.tasks.iter_mut().find(|t| t.tid == tid).map(|task| {
+        table.get_mut(tid).map(|mut task| {
             task.signal_state = TaskSignalState::new();
-            task.tif_sigpending = AtomicBool::new(false);
+            task.task.set_sigpending(false);
             // A zombie leader keeps the group's SignalStruct (its exit
             // status; Linux frees signal_struct with the reaped leader)
             let signal = if task.leader {
@@ -813,7 +808,7 @@ pub fn exit_task_signal(tid: Tid) {
 pub fn fatal_signal_pending() -> bool {
     let tid = crate::task::percpu::current_tid();
     let table = TASK_TABLE.lock();
-    table.tasks.iter().find(|t| t.tid == tid).is_some_and(|t| {
+    table.get(tid).is_some_and(|t| {
         let s = &t.signal_state;
         s.pending.signal.contains(SIGKILL) || s.shared_pending.lock().signal.contains(SIGKILL)
     })
@@ -822,12 +817,7 @@ pub fn fatal_signal_pending() -> bool {
 /// Check if a task has pending signals (fast path)
 pub fn has_pending_signals(tid: Tid) -> bool {
     let table = TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .map(|t| t.tif_sigpending.load(Ordering::Acquire))
-        .unwrap_or(false)
+    table.get(tid).map(|t| t.task.sigpending()).unwrap_or(false)
 }
 
 /// Whether `sig` would be discarded on arrival (Linux sig_ignored): its
@@ -863,7 +853,7 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
     if sig == 0 {
         // Signal 0 is null signal - just check if task exists
         let table = TASK_TABLE.lock();
-        return if table.tasks.iter().any(|t| t.tid == tid) {
+        return if table.iter().any(|t| t.task.tid == tid) {
             0
         } else {
             -3 // ESRCH
@@ -917,14 +907,15 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
 pub fn send_signal_to_process(pid: Pid, sig: u32) -> i32 {
     let tid = {
         let table = crate::task::percpu::TASK_TABLE.lock();
-        let live = |t: &&alloc::boxed::Box<crate::task::percpu::KernelTask>| {
-            t.pid == pid && !t.exiting && !matches!(t.state, crate::task::TaskState::Zombie(_))
+        let live = |t: &crate::task::percpu::TaskView<'_>| {
+            t.pid == pid
+                && !t.task.has_flag(crate::task::pf::EXITING)
+                && !matches!(t.state, crate::task::TaskState::Zombie(_))
         };
-        let mut group = table.tasks.iter();
-        let leader = group.clone().find(|t| t.pid == pid && t.leader);
+        let leader = table.find(|t| t.pid == pid && t.leader);
         match leader {
-            Some(l) if live(&l) => Some(l.tid),
-            _ => group.find(live).or(leader).map(|t| t.tid),
+            Some(l) if live(&l) => Some(l.task.tid),
+            _ => table.find(live).or(leader).map(|t| t.task.tid),
         }
     };
 
@@ -951,10 +942,9 @@ pub fn send_signal_to_pgrp(pgid: Pid, sig: u32) -> i32 {
     let tids: alloc::vec::Vec<Tid> = {
         let table = TASK_TABLE.lock();
         table
-            .tasks
             .iter()
             .filter(|t| t.pgid == pgid)
-            .map(|t| t.tid)
+            .map(|t| t.task.tid)
             .collect()
     };
 
@@ -1001,10 +991,8 @@ fn group_kill(tid: Tid, sig: u32) {
     let found = {
         let table = TASK_TABLE.lock();
         table
-            .tasks
-            .iter()
-            .find(|t| t.tid == tid)
-            .map(|t| (t.tgid, t.ptrace != 0, group_signal(&table.tasks, t.tgid)))
+            .get(tid)
+            .map(|t| (t.tgid, t.ptrace != 0, group_signal(&table, t.tgid)))
     };
     let Some((tgid, traced, Some(s))) = found else {
         return;
@@ -1017,15 +1005,18 @@ fn group_kill(tid: Tid, sig: u32) {
 /// The SignalStruct of thread group `tgid` (its leader keeps it until
 /// reaped; a thread's after a de_thread in progress)
 fn group_signal(
-    tasks: &[alloc::boxed::Box<crate::task::percpu::KernelTask>],
+    table: &crate::task::percpu::GlobalTaskTable,
     tgid: Pid,
 ) -> Option<Arc<SignalStruct>> {
-    let mut group = tasks.iter().filter(|t| t.tgid == tgid);
-    group
-        .clone()
-        .find(|t| t.leader)
+    table
+        .find(|t| t.tgid == tgid && t.leader)
         .and_then(|t| t.signal.clone())
-        .or_else(|| group.find_map(|t| t.signal.clone()))
+        .or_else(|| {
+            table
+                .iter()
+                .filter(|t| t.tgid == tgid)
+                .find_map(|t| t.signal.clone())
+        })
 }
 
 /// SIGKILL every thread of `tgid` that has not started exiting, but
@@ -1037,17 +1028,16 @@ fn zap_threads(tgid: Pid, except: Option<Tid>) {
     let tids: alloc::vec::Vec<Tid> = {
         let mut table = TASK_TABLE.lock();
         table
-            .tasks
             .iter_mut()
             .filter(|t| {
                 t.tgid == tgid
-                    && Some(t.tid) != except
-                    && !t.exiting
+                    && Some(t.task.tid) != except
+                    && !t.task.has_flag(crate::task::pf::EXITING)
                     && !matches!(t.state, crate::task::TaskState::Zombie(_))
             })
-            .map(|t| {
-                sigkill_task(t);
-                t.tid
+            .map(|mut t| {
+                sigkill_task(&mut t);
+                t.task.tid
             })
             .collect()
     };
@@ -1062,10 +1052,10 @@ pub fn zap_group_others(tgid: Pid, tid: Tid) {
 }
 
 /// Queue SIGKILL for `t` (TASK_TABLE held)
-fn sigkill_task(t: &mut crate::task::percpu::KernelTask) {
+fn sigkill_task(t: &mut crate::task::percpu::TaskViewMut<'_>) {
     t.signal_state.pending.add(SIGKILL);
     t.signal_state.sigpending = true;
-    t.tif_sigpending.store(true, Ordering::Release);
+    t.task.set_sigpending(true);
 }
 
 /// A thread just cloned into `parent`'s group dies with it if the group
@@ -1074,8 +1064,8 @@ fn sigkill_task(t: &mut crate::task::percpu::KernelTask) {
 /// before saw it or is seen here.
 pub fn zap_new_thread(parent: Tid, child: Tid) {
     let dying = get_task_signal_struct(parent).is_some_and(|s| s.group_exit() != GroupExit::None);
-    if dying && let Some(t) = TASK_TABLE.lock().tasks.iter_mut().find(|t| t.tid == child) {
-        sigkill_task(t);
+    if dying && let Some(mut t) = TASK_TABLE.lock().get_mut(child) {
+        sigkill_task(&mut t);
     }
 }
 
@@ -1442,11 +1432,7 @@ impl Default for SignalStruct {
 /// Get a task's signal struct
 pub fn get_task_signal_struct(tid: Tid) -> Option<Arc<SignalStruct>> {
     let table = TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .and_then(|t| t.signal.clone())
+    table.get(tid).and_then(|t| t.signal.clone())
 }
 
 /// Clone signal struct for fork/clone
@@ -1468,7 +1454,7 @@ fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool)
     };
 
     let mut table = TASK_TABLE.lock();
-    if let Some(child) = table.tasks.iter_mut().find(|t| t.tid == child_tid) {
+    if let Some(mut child) = table.get_mut(child_tid) {
         child.signal = Some(child_signal);
     }
 }

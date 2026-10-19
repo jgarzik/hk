@@ -43,7 +43,7 @@ fn current_time() -> Timespec {
 fn task_exists(pid: Pid) -> bool {
     use crate::task::percpu::TASK_TABLE;
     let table = TASK_TABLE.lock();
-    table.tasks.iter().any(|t| t.pid == pid)
+    table.iter().any(|t| t.pid == pid)
 }
 
 /// Public version of task_exists for use by setns
@@ -58,7 +58,7 @@ pub fn task_exists_pub(pid: Pid) -> bool {
 pub fn get_tid_for_pid(pid: Pid) -> Option<crate::task::Tid> {
     use crate::task::percpu::TASK_TABLE;
     let table = TASK_TABLE.lock();
-    table.tasks.iter().find(|t| t.pid == pid).map(|t| t.tid)
+    table.find(|t| t.pid == pid).map(|t| t.task.tid)
 }
 
 /// Inode number for per-PID directories
@@ -1006,8 +1006,6 @@ fn dump_owner(pid: Pid) -> (u32, u32) {
     use crate::task::percpu::TASK_TABLE;
     let table = TASK_TABLE.lock();
     table
-        .tasks
-        .iter()
         .find(|t| t.tgid == pid)
         .filter(|t| {
             t.mm.as_ref()
@@ -1106,9 +1104,9 @@ fn get_task_cgroup_path(pid: Pid) -> String {
     // Get the task's cgroup
     let task_cgroup = {
         let table = TASK_TABLE.lock();
-        if let Some(task) = table.tasks.iter().find(|t| t.tid == tid) {
+        if let Some(task) = table.get(tid) {
             // Try to get from TASK_CGROUP mapping
-            TASK_CGROUP.read().get(&task.tid).cloned()
+            TASK_CGROUP.read().get(&task.task.tid).cloned()
         } else {
             None
         }
@@ -1125,7 +1123,7 @@ fn get_task_cgroup_path(pid: Pid) -> String {
     // Get the task's cgroup namespace
     let cgroup_ns = {
         let table = TASK_TABLE.lock();
-        if let Some(task) = table.tasks.iter().find(|t| t.tid == tid) {
+        if let Some(task) = table.get(tid) {
             if let Some(ref nsproxy) = task.nsproxy {
                 nsproxy.cgroup_ns.clone()
             } else {
@@ -1436,12 +1434,7 @@ fn readdir_emit_pids(proc_ino: u64, ctx: &mut DirContext) -> Result<(), KernelEr
     // Collect PIDs first to release lock quickly (sorted, unique)
     let pids: alloc::collections::BTreeSet<Pid> = {
         let table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter()
-            .map(|t| t.pid)
-            .filter(|&p| p != 0)
-            .collect()
+        table.iter().map(|t| t.pid).filter(|&p| p != 0).collect()
     };
 
     for pid in pids {

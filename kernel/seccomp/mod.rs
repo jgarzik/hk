@@ -171,13 +171,9 @@ pub fn exit_seccomp(tid: Tid) {
     // The filter is released after TASK_TABLE
     let _old = {
         let mut table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|task| {
-                task.seccomp_mode = SECCOMP_MODE_DISABLED;
-                task.seccomp_filter.take()
-            })
+        table.get_mut(tid).and_then(|mut task| {
+            task.seccomp_mode = SECCOMP_MODE_DISABLED;
+            task.seccomp_filter.take()
+        })
     };
 }

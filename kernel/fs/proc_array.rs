@@ -69,15 +69,15 @@ struct Snap {
 /// Copy process `pid` (its first task, the leader) out of TASK_TABLE
 fn snap(pid: Pid) -> Option<Snap> {
     let table = TASK_TABLE.lock();
-    let t = table.tasks.iter().find(|t| t.tgid == pid)?;
-    let threads = table.tasks.iter().filter(|x| x.tgid == pid).count() as u64;
+    let t = table.find(|t| t.tgid == pid)?;
+    let threads = table.iter().filter(|x| x.tgid == pid).count() as u64;
     let tracer = t
         .ptracer_tid
-        .and_then(|tr| table.tasks.iter().find(|x| x.tid == tr))
+        .and_then(|tr| table.get(tr))
         .map_or(0, |x| x.tgid);
     Some(Snap {
         pid,
-        tid: t.tid,
+        tid: t.task.tid,
         tgid: t.tgid,
         ppid: t.ppid,
         pgid: t.pgid,
@@ -85,20 +85,20 @@ fn snap(pid: Pid) -> Option<Snap> {
         comm: t.prctl.name,
         state: t.state,
         cred: *t.cred,
-        kthread: matches!(t.kind, TaskKind::KernelThread),
-        exiting: t.exiting,
-        utime: t.utime,
-        stime: t.stime,
-        start: t.start_time,
-        nvcsw: t.nvcsw,
-        nivcsw: t.nivcsw,
-        min_flt: t.min_flt,
-        maj_flt: t.maj_flt,
+        kthread: matches!(t.task.kind, TaskKind::KernelThread),
+        exiting: t.task.has_flag(crate::task::pf::EXITING),
+        utime: t.task.utime.load(core::sync::atomic::Ordering::Relaxed),
+        stime: t.task.stime.load(core::sync::atomic::Ordering::Relaxed),
+        start: t.task.start_time(),
+        nvcsw: t.task.nvcsw.load(core::sync::atomic::Ordering::Relaxed),
+        nivcsw: t.task.nivcsw.load(core::sync::atomic::Ordering::Relaxed),
+        min_flt: t.task.min_flt.load(core::sync::atomic::Ordering::Relaxed),
+        maj_flt: t.task.maj_flt.load(core::sync::atomic::Ordering::Relaxed),
         nice: crate::task::priority_to_nice(t.priority),
         policy: t.policy,
         rt_priority: t.rt_priority,
         cpus: t.cpus_allowed,
-        cpu: t.cpu,
+        cpu: t.task.cpu.load(core::sync::atomic::Ordering::Relaxed),
         exit_signal: t.exit_signal,
         exit_code: t.exit_code,
         threads,

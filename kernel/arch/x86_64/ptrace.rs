@@ -71,7 +71,7 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
     // handle the case where the task is stopped mid-syscall.
 
     let table = TASK_TABLE.lock();
-    let task = table.tasks.iter().find(|t| t.tid == tid).ok_or(-3i32)?; // ESRCH
+    let task = table.get(tid).ok_or(-3i32)?; // ESRCH
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
@@ -124,7 +124,7 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
 /// user context so the registers take effect when it resumes.
 pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
     let mut table = TASK_TABLE.lock();
-    let task = table.tasks.iter_mut().find(|t| t.tid == tid).ok_or(-3i32)?; // ESRCH
+    let mut task = table.get_mut(tid).ok_or(-3i32)?; // ESRCH
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
@@ -194,7 +194,7 @@ const RFLAGS_TF: u64 = 0x100;
 /// after executing one instruction.
 pub fn enable_single_step(tid: Tid) {
     let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    if let Some(mut task) = table.get_mut(tid) {
         task.trap_frame.rflags |= RFLAGS_TF;
     }
 }
@@ -204,7 +204,7 @@ pub fn enable_single_step(tid: Tid) {
 /// Clears the TF (Trap Flag) in RFLAGS.
 pub fn disable_single_step(tid: Tid) {
     let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    if let Some(mut task) = table.get_mut(tid) {
         task.trap_frame.rflags &= !RFLAGS_TF;
     }
 }

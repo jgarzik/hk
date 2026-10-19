@@ -301,14 +301,15 @@ pub fn sys_process_vm_writev(
 /// Find a task by PID (returns TID of the main thread)
 fn find_task_by_pid(pid: Pid) -> Option<Tid> {
     let table = TASK_TABLE.lock();
-    table.tasks.iter().find(|t| t.pid == pid).map(|t| t.tid)
+    table.find(|t| t.pid == pid).map(|t| t.task.tid)
 }
 
 /// May the caller access the target's memory (Linux process_vm_rw_core
 /// -> mm_access, PTRACE_MODE_ATTACH_REALCREDS): its own process, else
 /// the ptrace rules with the real ids
 fn check_process_vm_permission(target_tid: Tid) -> bool {
-    target_tid == current_tid() || crate::task::ptrace::may_access(|t| t.tid == target_tid, false)
+    target_tid == current_tid()
+        || crate::task::ptrace::may_access(|t| t.task.tid == target_tid, false)
 }
 
 /// The target's address space if the caller may access it (Linux

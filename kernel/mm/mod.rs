@@ -978,9 +978,7 @@ use crate::task::percpu::TASK_TABLE;
 pub fn get_task_mm(tid: Tid) -> Option<Arc<Mm>> {
     let table = TASK_TABLE.lock();
     table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
+        .get(tid)
         .and_then(|t| t.mm.as_ref().map(|m| m.arc().clone()))
 }
 
@@ -998,11 +996,7 @@ pub fn get_task_mm_users(tid: Tid) -> Option<MmRef> {
 pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
     let mm = {
         let mut table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.mm.take())
+        table.get_mut(tid).and_then(|mut t| t.mm.take())
     }?;
     let keep = mm.arc().clone();
     drop(mm);

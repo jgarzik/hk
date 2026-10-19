@@ -157,10 +157,9 @@ extern "C" fn kthread_entry() -> ! {
 /// has switched away)
 fn kthread_exit() -> ! {
     let tid = current_tid();
-    crate::task::percpu::TASK_TABLE
-        .lock()
-        .tasks
-        .retain(|t| t.tid != tid);
+    // Dropped after TASK_TABLE (nothing is released under it)
+    let me = crate::task::percpu::TASK_TABLE.lock().remove(tid);
+    drop(me);
     crate::task::percpu::exit_current(None)
 }
 

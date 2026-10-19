@@ -340,7 +340,7 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
     use crate::task::percpu::TASK_TABLE;
 
     let table = TASK_TABLE.lock();
-    let task = table.tasks.iter().find(|t| t.tid == tid)?;
+    let task = table.get(tid)?;
 
     // Get command name from prctl state
     let mut comm = [0u8; 16];
@@ -356,7 +356,7 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
 
     // Calculate elapsed time using task.start_time (monotonic ns since boot)
     let now_ns = crate::time::monotonic_ns();
-    let elapsed_ns = now_ns.saturating_sub(task.start_time);
+    let elapsed_ns = now_ns.saturating_sub(task.task.start_time());
 
     // Get start time as Unix timestamp (seconds since epoch)
     // Convert from monotonic start_time to wall clock using TIMEKEEPER
@@ -367,9 +367,9 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
     let mono_ns = mono_ts.to_nanos() as u64;
     // Calculate the realtime offset and apply it to start_time
     let realtime_start_ns = if realtime_ns >= mono_ns {
-        task.start_time.saturating_add(realtime_ns - mono_ns)
+        task.task.start_time().saturating_add(realtime_ns - mono_ns)
     } else {
-        task.start_time.saturating_sub(mono_ns - realtime_ns)
+        task.task.start_time().saturating_sub(mono_ns - realtime_ns)
     };
     let start_time = (realtime_start_ns / 1_000_000_000) as u32;
 
@@ -381,10 +381,16 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
         tty: 0, // TODO: Get controlling terminal
         start_time,
         elapsed_ns,
-        utime_ns: task.utime,
-        stime_ns: task.stime,
-        minflt: task.min_flt,
-        majflt: task.maj_flt,
+        utime_ns: task.task.utime.load(core::sync::atomic::Ordering::Relaxed),
+        stime_ns: task.task.stime.load(core::sync::atomic::Ordering::Relaxed),
+        minflt: task
+            .task
+            .min_flt
+            .load(core::sync::atomic::Ordering::Relaxed),
+        majflt: task
+            .task
+            .maj_flt
+            .load(core::sync::atomic::Ordering::Relaxed),
         comm,
         did_fork: pid != tid as Pid, // Simple heuristic: different PID/TID means forked
         did_exec: task.prctl.name[0] != 0, // Has a name means exec'd

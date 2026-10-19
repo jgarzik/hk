@@ -547,9 +547,19 @@ all task structs. This is simpler than Linux's per-task locks (`alloc_lock`,
 
 | Variable | Type | Purpose |
 |----------|------|---------|
-| `TASK_TABLE` | `Mutex<GlobalTaskTable>` | All tasks in system |
+| `TASK_TABLE` | `Mutex<GlobalTaskTable>` | All tasks, `BTreeMap<Tid, TaskRef>` (`TaskRef = Arc<Task>`) |
 | Per-CPU `CurrentTask` | Copy struct in PerCpu | Cached task info (no lock) |
 | `Task.cred` | `Arc<Cred>` | Reference-counted credentials |
+
+A `Task` has three kinds of fields: fixed at creation (`tid`, `kind`,
+`kstack_top`); hot atomics written by the task itself (or its creator
+before it first runs) and read lock-free by anyone (`flags` = Linux
+PF_*, `thread_flags` = TIF_*, `cpu`, `start_time`, utime/stime and the
+other counters); and the rest, `TaskInner`, in a `TableCell` that only
+the locked table's views reach (`GlobalTaskTable::get`/`iter` read it,
+`get_mut`/`iter_mut` write it with the table borrowed mutably; Linux
+LockedBy). A `TaskRef` cloned out of the table keeps the task alive but
+reads only its fixed and atomic fields without the lock.
 
 #### Locking Rules
 

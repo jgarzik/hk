@@ -385,12 +385,7 @@ fn get_current_task_info() -> (Tid, u64, Priority) {
 
     let priority = {
         let table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter()
-            .find(|t| t.tid == tid)
-            .map(|t| t.priority)
-            .unwrap_or(128)
+        table.get(tid).map(|t| t.priority).unwrap_or(128)
     };
 
     (tid, pid, priority)
@@ -733,7 +728,7 @@ pub fn sys_set_robust_list(head: u64, len: u64) -> i32 {
     let tid = crate::task::percpu::current_tid();
 
     let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    if let Some(mut task) = table.get_mut(tid) {
         task.robust_list = head;
     }
 
@@ -766,9 +761,7 @@ pub fn sys_get_robust_list(pid: i32, head_ptr: u64, len_ptr: u64) -> i32 {
 
     let head = TASK_TABLE
         .lock()
-        .tasks
-        .iter()
-        .find(|t| t.tid == target_tid)
+        .get(target_tid)
         .map(|t| t.robust_list)
         .unwrap_or(0);
 
@@ -798,7 +791,7 @@ pub fn exit_robust_list(tid: Tid, pid: u64) {
     // Get and remove robust list for this task
     let head_addr = {
         let mut table = TASK_TABLE.lock();
-        if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        if let Some(mut task) = table.get_mut(tid) {
             let addr = task.robust_list;
             task.robust_list = 0;
             if addr != 0 { Some(addr) } else { None }

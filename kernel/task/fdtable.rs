@@ -68,11 +68,7 @@ impl Drop for FilesGuard<'_> {
 pub fn init_task_fd(tid: Tid, files: Arc<Files>) {
     let old = {
         let mut table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.files.replace(files))
+        table.get_mut(tid).and_then(|mut t| t.files.replace(files))
     };
     drop(old);
 }
@@ -80,11 +76,7 @@ pub fn init_task_fd(tid: Tid, files: Arc<Files>) {
 /// The descriptor table of `tid`
 pub fn get_task_fd(tid: Tid) -> Option<Arc<Files>> {
     let table = TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .and_then(|t| t.files.clone())
+    table.get(tid).and_then(|t| t.files.clone())
 }
 
 /// Exit (Linux exit_files): drop the task's reference; the last one
@@ -93,11 +85,7 @@ pub fn get_task_fd(tid: Tid) -> Option<Arc<Files>> {
 pub fn exit_task_fd(tid: Tid) {
     let files = {
         let mut table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.files.take())
+        table.get_mut(tid).and_then(|mut t| t.files.take())
     };
     drop(files);
 }

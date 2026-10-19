@@ -142,11 +142,7 @@ use crate::task::percpu::TASK_TABLE;
 pub fn init_task_fs(tid: Tid, fs: Arc<FsStruct>) {
     let old = {
         let mut table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.fs.replace(fs))
+        table.get_mut(tid).and_then(|mut t| t.fs.replace(fs))
     };
     drop(old);
 }
@@ -154,11 +150,7 @@ pub fn init_task_fs(tid: Tid, fs: Arc<FsStruct>) {
 /// Get the FsStruct for a task (returns cloned Arc)
 pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
     let table = TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .and_then(|t| t.fs.clone())
+    table.get(tid).and_then(|t| t.fs.clone())
 }
 
 /// Remove filesystem context when task exits
@@ -170,11 +162,7 @@ pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
 pub fn exit_task_fs(tid: Tid) {
     let fs = {
         let mut table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.fs.take())
+        table.get_mut(tid).and_then(|mut t| t.fs.take())
     };
     drop(fs);
 }

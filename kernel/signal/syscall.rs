@@ -281,8 +281,6 @@ fn check_kill_permission(target_pid: u64, sig: u32) -> i32 {
         let table = TASK_TABLE.lock();
         // Find the thread group leader for this pid
         table
-            .tasks
-            .iter()
             .find(|t| t.pid == target_pid)
             .map(|t| (t.tgid, t.sid, t.cred.clone()))
     };
@@ -295,12 +293,7 @@ fn check_kill_permission(target_pid: u64, sig: u32) -> i32 {
     // Get caller's tgid
     let caller_tgid = {
         let table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter()
-            .find(|t| t.tid == caller_tid)
-            .map(|t| t.tgid)
-            .unwrap_or(0)
+        table.get(caller_tid).map(|t| t.tgid).unwrap_or(0)
     };
 
     // Same thread group - always allowed
@@ -388,7 +381,7 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
         if sig == 0 {
             use crate::task::percpu::TASK_TABLE;
             let table = TASK_TABLE.lock();
-            let exists = table.tasks.iter().any(|t| t.pgid == pgid);
+            let exists = table.iter().any(|t| t.pgid == pgid);
             return if exists { 0 } else { -3 }; // ESRCH if pgrp doesn't exist
         }
         send_signal_to_pgrp(pgid, sig) as i64
@@ -415,9 +408,7 @@ pub fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> i64 {
     let valid = {
         let table = TASK_TABLE.lock();
         table
-            .tasks
-            .iter()
-            .find(|t| t.tid == tid as u64)
+            .get(tid as u64)
             .map(|t| t.tgid == tgid as u64)
             .unwrap_or(false)
     };
@@ -523,9 +514,7 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
     let valid = {
         let table = TASK_TABLE.lock();
         table
-            .tasks
-            .iter()
-            .find(|t| t.tid == tid as u64)
+            .get(tid as u64)
             .map(|t| t.tgid == tgid as u64)
             .unwrap_or(false)
     };
