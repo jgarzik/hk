@@ -6,8 +6,9 @@
 - [x] clone (Linux thread/process creation)
 - [x] clone3
 - [x] execve
-- [x] execveat
+- [x] execveat (x86-64 only for now; not dispatched on aarch64: ENOSYS)
 - [x] _exit
+- [x] set_tid_address
 - [x] exit_group
 - [x] wait4
 - [x] waitid
@@ -34,6 +35,8 @@
 - [x] sched_rr_get_interval
 - [x] getpriority
 - [x] setpriority
+- [x] ioprio_get
+- [x] ioprio_set
 
 1.4 Process resource limits & usage
 
@@ -53,11 +56,11 @@
 - [x] openat
 - [x] close
 - [x] close_range (CLOSE_RANGE_UNSHARE, CLOSE_RANGE_CLOEXEC)
-- [x] creat (x86-64 only, legacy; use openat with O_CREAT)
-- [x] dup
+- [ ] creat (x86-64 only, legacy; use openat with O_CREAT)
+- [x] dup (x86-64 only for now; not dispatched on aarch64: ENOSYS)
 - [x] dup2 (x86-64 only, legacy; use dup3)
 - [x] dup3
-- [x] fcntl (F_DUPFD, F_GETFD, F_SETFD, F_GETFL, F_SETFL, F_GETLK, F_SETLK, F_SETLKW)
+- [x] fcntl (F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL, F_GETLK, F_SETLK, F_SETLKW, F_GETOWN, F_SETOWN, F_GETSIG, F_SETSIG)
 
 2.2 Read/write + position
 
@@ -77,7 +80,7 @@
 
 2.3 Special I/O helpers
 
-- [x] sendfile (x86-64 only, legacy)
+- [x] sendfile
 - [x] splice
 - [x] tee
 - [x] vmsplice
@@ -87,7 +90,7 @@
 - [x] fsync
 - [x] fdatasync
 - [x] syncfs
-- [x] sync_file_range (x86-64) / sync_file_range2 (aarch64; different arg order)
+- [ ] sync_file_range (x86-64) / sync_file_range2 (aarch64; different arg order)
 - [x] flock (advisory file locking)
 - [x] fallocate (file space manipulation)
 
@@ -114,7 +117,7 @@
   regular files for now)
 - [x] chdir
 - [x] fchdir
-- [x] getcwd
+- [x] getcwd (x86-64 only for now; not dispatched on aarch64: ENOSYS)
 - [x] chroot
 
 3.2 Stat & attributes
@@ -125,8 +128,8 @@ New kernels mostly use statx; older ones use stat/lstat/fstat.
 - [x] lstat (x86-64 only, legacy; use fstatat/statx)
 - [x] fstat (x86-64 and arm64: __NR3264_fstat 80)
 - [x] newfstatat (fstatat on aarch64)
-- [x] statfs (x86-64 only, legacy)
-- [x] fstatfs (x86-64 only, legacy)
+- [x] statfs
+- [x] fstatfs
 - [x] statx (modern richer interface)
 
 Permissions and ownership:
@@ -207,6 +210,7 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 - [x] rt_sigtimedwait
 - [x] rt_sigqueueinfo
 - [x] rt_sigsuspend
+- [x] rt_sigreturn
 - [x] rt_tgsigqueueinfo
 - [x] sigaltstack
 - [x] signalfd (x86-64 only, legacy; use signalfd4)
@@ -219,8 +223,8 @@ Linux has an "old" and a "rt_*" (real-time) signal set; modern userspace uses th
 6.1 Basic time
 
 - [x] time (x86-64 only, legacy; use clock_gettime)
-- [x] gettimeofday
-- [x] settimeofday
+- [x] gettimeofday (x86-64 only for now; not dispatched on aarch64: ENOSYS)
+- [x] settimeofday (x86-64 only for now; not dispatched on aarch64: ENOSYS)
 - [x] adjtimex (NTP)
 - [x] clock_gettime
 - [x] clock_settime
@@ -485,8 +489,8 @@ goes down later.
 
 10.4 Misc security / sandboxing
 
-- [x] seccomp (SECCOMP_SET_MODE_STRICT, SECCOMP_SET_MODE_FILTER with eBPF support)
-- [x] prctl (PR_SET/GET_NAME, PR_SET/GET_DUMPABLE, PR_SET/GET_NO_NEW_PRIVS, PR_SET/GET_TIMERSLACK, PR_SET/GET_SECCOMP, PR_SET/GET_KEEPCAPS, PR_SET/GET_CHILD_SUBREAPER, PR_SET/GET_THP_DISABLE, PR_SET/GET_TSC [x86-64])
+- [x] seccomp (SECCOMP_SET_MODE_STRICT, SECCOMP_SET_MODE_FILTER (classic BPF, run as eBPF), SECCOMP_GET_ACTION_AVAIL)
+- [x] prctl (PR_SET/GET_NAME, PR_SET/GET_PDEATHSIG, PR_SET/GET_DUMPABLE, PR_SET/GET_NO_NEW_PRIVS, PR_SET/GET_TIMERSLACK, PR_SET/GET_SECCOMP, PR_SET/GET_KEEPCAPS, PR_SET/GET_CHILD_SUBREAPER, PR_SET/GET_THP_DISABLE, PR_SET/GET_TSC [x86-64])
 - [x] mlock / mlockall (already listed under memory)
 
 11. Namespaces, containers, mounts, cgroups
@@ -528,7 +532,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 
 13. Debugging, perf, BPF
 
-- [x] ptrace (TRACEME, ATTACH, SEIZE, DETACH, PEEKDATA, POKEDATA, GETREGS, SETREGS, CONT, SYSCALL, SINGLESTEP, KILL, SETOPTIONS, GETEVENTMSG)
+- [x] ptrace (TRACEME, ATTACH, SEIZE, DETACH, PEEKTEXT/PEEKDATA, POKETEXT/POKEDATA, GETREGS, SETREGS, CONT, SYSCALL, SINGLESTEP, KILL, SETOPTIONS, GETEVENTMSG)
 - [x] perf_event_open (stub, returns -EOPNOTSUPP)
 - [x] bpf (BPF_MAP_CREATE, BPF_MAP_LOOKUP/UPDATE/DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, BPF_PROG_LOAD, BPF_OBJ_GET_INFO_BY_FD; map types: HASH, ARRAY; program type: SOCKET_FILTER)
 - [x] membarrier
@@ -551,8 +555,8 @@ Misc utilities that don't fit elsewhere:
 - [x] readahead
 - [x] alarm (x86-64 only, legacy; ITIMER_REAL in seconds)
 - [x] pause (x86-64 only, legacy; use sigsuspend/ppoll)
-- [x] getpgrp (x86-64 only, legacy; use getpgid(0))
-- [x] ustat (x86-64 only, legacy; deprecated filesystem syscall)
+- [ ] getpgrp (x86-64 only, legacy; use getpgid(0))
+- [ ] ustat (x86-64 only, legacy; deprecated filesystem syscall)
 
 15. "Probably later" / niche syscalls
 
