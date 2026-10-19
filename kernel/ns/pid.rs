@@ -2,9 +2,9 @@
 //!
 //! PID namespaces isolate process IDs (Linux: each namespace numbers its
 //! tasks from 1, and a task has a PID in its own namespace and every
-//! ancestor). Only the namespace hierarchy exists so far: tasks are
-//! numbered by the global pid/tid counters (BUGS.md), so a child
-//! namespace does not renumber its tasks yet.
+//! ancestor). Each namespace has its number bitmap (`task::pid`), and a
+//! task gets a number in each level of its parent's namespace chain;
+//! syscalls still report the root number (BUGS.md).
 
 use alloc::sync::Arc;
 use spin::Lazy;
@@ -19,6 +19,9 @@ pub struct PidNamespace {
 
     /// Parent namespace (None for init_pid_ns)
     pub parent: Option<Arc<PidNamespace>>,
+
+    /// Its numbers (Linux pid_namespace->pidmap)
+    pub map: crate::task::pid::PidMap,
 }
 
 impl PidNamespace {
@@ -27,6 +30,7 @@ impl PidNamespace {
         Arc::new(Self {
             level: 0,
             parent: None,
+            map: crate::task::pid::PidMap::new(),
         })
     }
 
@@ -40,6 +44,7 @@ impl PidNamespace {
         Ok(Arc::new(Self {
             level: parent.level + 1,
             parent: Some(parent.clone()),
+            map: crate::task::pid::PidMap::new(),
         }))
     }
 }

@@ -817,7 +817,7 @@ pub fn fatal_signal_pending() -> bool {
     if !me.sigpending() {
         return false;
     }
-    let tid = me.tid;
+    let tid = me.tid();
     let table = TASK_TABLE.lock();
     table.get(tid).is_some_and(|t| {
         let s = &t.signal_state;
@@ -829,7 +829,7 @@ pub fn fatal_signal_pending() -> bool {
 pub fn has_pending_signals(tid: Tid) -> bool {
     // The current task's TIF_SIGPENDING, lock-free
     let me = crate::task::percpu::current();
-    if me.tid == tid {
+    if me.tid() == tid {
         return me.sigpending();
     }
     let table = TASK_TABLE.lock();
@@ -869,7 +869,7 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
     if sig == 0 {
         // Signal 0 is null signal - just check if task exists
         let table = TASK_TABLE.lock();
-        return if table.iter().any(|t| t.task.tid == tid) {
+        return if table.iter().any(|t| t.task.tid() == tid) {
             0
         } else {
             -3 // ESRCH
@@ -878,6 +878,19 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
 
     if sig > 64 {
         return -22; // EINVAL
+    }
+
+    // Kernel threads ignore every signal (Linux ignore_signals in
+    // kthreadd): they are processes now (pid == tid), reachable by
+    // kill(-1) and kill(pid)
+    let kthread = TASK_TABLE
+        .lock()
+        .get(tid)
+        .map(|t| t.task.has_flag(crate::task::pf::KTHREAD));
+    match kthread {
+        None => return -3, // ESRCH
+        Some(true) => return 0,
+        Some(false) => {}
     }
 
     // Queue unless ignored; note whether it is deliverable now
@@ -930,8 +943,8 @@ pub fn send_signal_to_process(pid: Pid, sig: u32) -> i32 {
         };
         let leader = table.find(|t| t.task.pid == pid && t.leader);
         match leader {
-            Some(l) if live(&l) => Some(l.task.tid),
-            _ => table.find(live).or(leader).map(|t| t.task.tid),
+            Some(l) if live(&l) => Some(l.task.tid()),
+            _ => table.find(live).or(leader).map(|t| t.task.tid()),
         }
     };
 
@@ -960,7 +973,7 @@ pub fn send_signal_to_pgrp(pgid: Pid, sig: u32) -> i32 {
         table
             .iter()
             .filter(|t| t.task.pgid() == pgid)
-            .map(|t| t.task.tid)
+            .map(|t| t.task.tid())
             .collect()
     };
 
@@ -1047,13 +1060,13 @@ fn zap_threads(tgid: Pid, except: Option<Tid>) {
             .iter_mut()
             .filter(|t| {
                 t.task.pid == tgid
-                    && Some(t.task.tid) != except
+                    && Some(t.task.tid()) != except
                     && !t.task.has_flag(crate::task::pf::EXITING)
                     && !matches!(t.state, crate::task::TaskState::Zombie(_))
             })
             .map(|mut t| {
                 sigkill_task(&mut t);
-                t.task.tid
+                t.task.tid()
             })
             .collect()
     };

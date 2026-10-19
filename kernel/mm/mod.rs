@@ -978,7 +978,7 @@ use crate::task::percpu::TASK_TABLE;
 pub fn get_task_mm(tid: Tid) -> Option<Arc<Mm>> {
     // The current task's own, lock-free (Linux current->mm)
     let me = crate::task::percpu::current();
-    if me.tid == tid {
+    if me.tid() == tid {
         return me.mm();
     }
     let table = TASK_TABLE.lock();

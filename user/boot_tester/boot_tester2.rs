@@ -247,6 +247,13 @@ extern "C" fn rust_start(sp: *const u64) -> ! {
         b"exe" => exe_check(),
         b"comm" => comm_check(),
         b"dumpable" => sys_exit(sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) as u64),
+        b"ids" => {
+            // getpid and gettid, to fd 3 (exec from a thread: both are
+            // the old leader's pid)
+            let ids = [sys_getpid(), hk_syscall::sys_gettid()];
+            sys_write(3, ids.as_ptr() as *const u8, 16);
+            sys_exit(0);
+        }
         b"sleep" => {
             sys_write(3, b"r".as_ptr(), 1);
             loop {

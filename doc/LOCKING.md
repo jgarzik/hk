@@ -306,6 +306,8 @@ Network locks (3.10 Network Subsystem has the full order):
     and wait queues (IrqSpinlocks). No socket is released under a
     network lock or under `Files`/TASK_TABLE (3.3, 3.1.1).
 
+Pids (3.1.1): PIDMAP_LOCK (spin leaf, thread context; hash chains)
+
 Timekeeping (3.5):
     TimeKeeper.lock (IrqSpinlock leaf; writers only: the CPU 0 tick,
     clock_settime, init; readers are lockless seqlock retries)
@@ -550,6 +552,22 @@ all task structs. This is simpler than Linux's per-task locks (`alloc_lock`,
 | `TASK_TABLE` | `Mutex<GlobalTaskTable>` | All tasks, `BTreeMap<Tid, TaskRef>` (`TaskRef = Arc<Task>`) |
 | Per-CPU `curr` | `*const Task` in PerCpu | The running task (no lock) |
 | `Task.cred` | `Arc<Cred>` (raw) | Reference-counted credentials |
+
+**Pids** (`kernel/task/pid.rs`, Linux 4.14 pidmap): a `Pid` holds one
+number per pid-namespace level. Numbers come from a lock-free bitmap
+per namespace (pages allocated outside any lock, installed by
+compare-and-swap; bits set and cleared atomically). `PIDMAP_LOCK`
+(spin leaf, thread context only, nothing allocates under it) protects
+the global hash chains of every live `Pid`'s numbers: `alloc_pid`
+links them, `find_pid` walks them (taking a strong reference only
+while the `Pid` lives: the hash holds weak ones), and the last drop of
+a `Pid` unlinks them. It is taken under nothing but may be taken
+under TASK_TABLE (a reaped task's `Pid` is dropped after TASK_TABLE).
+A process's pid is its leader's tid; an exec from a non-leader takes
+the leader's tid and `Pid` (`take_leadership`, Linux exchange_tids)
+under TASK_TABLE, then re-keys its run-queue entry under the rq lock
+after releasing TASK_TABLE (rq -> TASK_TABLE order). The idle tasks
+are tid 0 and, like the boot task, not in TASK_TABLE.
 
 A `Task` has four kinds of fields: fixed at creation (`tid`, `pid`,
 `kind`, `kstack_top`); hot atomics written by the task itself (or its

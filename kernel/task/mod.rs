@@ -7,6 +7,7 @@ pub mod kthread;
 pub mod misc;
 pub mod percpu;
 pub mod pgrp;
+pub mod pid;
 pub mod proc;
 pub mod process_vm;
 pub mod ptrace;
@@ -840,8 +841,9 @@ pub mod tif {
 /// - everything else ([`TaskInner`]), read and written only under
 ///   TASK_TABLE, through the table's views (`GlobalTaskTable::get` etc.).
 pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
-    /// Thread ID
-    pub tid: Tid,
+    /// Thread ID: the root number of its `thread_pid`; changes only when
+    /// a non-leader execs and takes its leader's (exchange_tids)
+    tid: AtomicU64,
     /// Process (thread-group) ID: the leader's tid (Linux tgid)
     pub pid: Pid,
     /// Kind of task
@@ -922,6 +924,9 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
 
 /// The fields of a [`Task`] read and written under TASK_TABLE
 pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
+    /// Its process identifier (Linux thread_pid; None for the idle
+    /// tasks, tid 0)
+    pub thread_pid: Option<Arc<pid::Pid>>,
     // =========================================================================
     // Exit handling (like Linux task_struct exit fields)
     // =========================================================================
@@ -1208,7 +1213,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             TaskKind::UserProcess => 0,
         };
         Self {
-            tid,
+            tid: AtomicU64::new(tid),
             pid: ids.pid,
             kind,
             kstack_top,
@@ -1245,7 +1250,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     /// first switch, root, never in the task table
     pub const fn boot(kstack_top: A::VirtAddr) -> Self {
         Self {
-            tid: 0,
+            tid: AtomicU64::new(0),
             pid: 0,
             kind: TaskKind::KernelThread,
             kstack_top,
@@ -1276,6 +1281,18 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             maj_flt: AtomicU64::new(0),
             inner: TableCell::new(None),
         }
+    }
+
+    /// Thread ID (Linux task_pid_nr)
+    #[inline]
+    pub fn tid(&self) -> Tid {
+        self.tid.load(Ordering::Relaxed)
+    }
+
+    /// Take over thread ID `tid` (exec's exchange_tids, TASK_TABLE and
+    /// the run-queue entry re-keyed by the caller)
+    pub fn set_tid(&self, tid: Tid) {
+        self.tid.store(tid, Ordering::Relaxed);
     }
 
     /// The locked fields (see [`TableCell`]); None for the boot task

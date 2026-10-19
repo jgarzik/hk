@@ -40,7 +40,6 @@ use crate::arch::{
     FrameAlloc, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps, MemoryLayoutOps, PerCpuOps,
     PowerInfo, PowerOps, SchedArch, SmpOps, SyscallOps, TimekeeperOps, UserModeOps, VfsInitOps,
 };
-use crate::task::Tid;
 
 /// AArch64 trap frame for saving/restoring CPU state on exception entry
 ///
@@ -666,20 +665,20 @@ impl ContextOps for Aarch64Arch {
         old_ctx: *mut Self::TaskContext,
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        next_tid: Tid,
+        next_tls: u64,
     ) {
         unsafe {
-            context::context_switch(old_ctx, new_ctx, new_kstack, next_tid);
+            context::context_switch(old_ctx, new_ctx, new_kstack, next_tls);
         }
     }
 
     unsafe fn context_switch_first(
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        next_tid: Tid,
+        next_tls: u64,
     ) -> ! {
         unsafe {
-            context::context_switch_first(new_ctx, new_kstack, next_tid);
+            context::context_switch_first(new_ctx, new_kstack, next_tls);
         }
     }
 }

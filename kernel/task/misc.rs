@@ -1400,7 +1400,7 @@ pub fn sys_pidfd_getfd(pidfd: i32, targetfd: i32, flags: u32) -> i64 {
 /// Find a task by PID (returns TID of the main thread)
 fn find_task_by_pid(pid: super::Pid) -> Option<super::Tid> {
     let table = super::percpu::TASK_TABLE.lock();
-    table.find(|t| t.task.pid == pid).map(|t| t.task.tid)
+    table.find(|t| t.task.pid == pid).map(|t| t.task.tid())
 }
 
 /// Check permission for pidfd_getfd

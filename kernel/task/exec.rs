@@ -770,7 +770,7 @@ pub fn do_execve<FA: FrameAlloc<PhysAddr = u64>>(
     // This is the point of no return
 
     // Private fd table without the close-on-exec descriptors
-    crate::task::fdtable::exec_task_fd(tid);
+    crate::task::fdtable::exec_task_fd(percpu::current_tid());
 
     // Signal vfork completion if parent is waiting
     // Must be done before we switch address spaces since parent may be blocked

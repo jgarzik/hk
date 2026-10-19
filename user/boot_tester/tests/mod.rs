@@ -68,6 +68,7 @@ pub mod nonblock;
 pub mod nproc;
 pub mod packet;
 pub mod permissions;
+pub mod pid_tid;
 pub mod pidfd;
 pub mod poll;
 pub mod posix_lock;
@@ -206,6 +207,7 @@ pub fn run_all_tests() {
     isolated(b"MMLOCK", mmlock::run_tests);
     isolated(b"MAPCOUNT", mapcount::run_tests);
     group_exit::run_tests();
+    pid_tid::run_tests();
     netlink::run_tests();
     netdev_ioctl::run_tests();
     netdev::run_tests();

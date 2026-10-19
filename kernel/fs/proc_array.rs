@@ -77,7 +77,7 @@ fn snap(pid: Pid) -> Option<Snap> {
         .map_or(0, |x| x.task.pid);
     Some(Snap {
         pid,
-        tid: t.task.tid,
+        tid: t.task.tid(),
         tgid: t.task.pid,
         ppid: t.task.ppid(),
         pgid: t.task.pgid(),

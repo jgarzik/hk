@@ -179,7 +179,7 @@ fn ptrace_may_access(target_tid: Tid) -> bool {
     if target_tid == 1 && !capable(CAP_SYS_PTRACE) {
         return false;
     }
-    may_access(|t| t.task.tid == target_tid, false)
+    may_access(|t| t.task.tid() == target_tid, false)
 }
 
 /// Check if tracee is stopped and caller is its tracer.
@@ -207,7 +207,7 @@ fn ptrace_check_attach(target_tid: Tid) -> Result<(), i64> {
 /// Find a task by PID (thread group leader)
 fn find_task_by_pid(pid: Pid) -> Option<Tid> {
     let table = TASK_TABLE.lock();
-    table.find(|t| t.task.pid == pid).map(|t| t.task.tid)
+    table.find(|t| t.task.pid == pid).map(|t| t.task.tid())
 }
 
 /// Check if a task is being traced
@@ -867,8 +867,8 @@ pub fn may_read_task(tid: Tid) -> bool {
     let own = TASK_TABLE
         .lock()
         .iter()
-        .any(|t| t.task.tid == tid && t.task.pid == me);
-    own || may_access(|t| t.task.tid == tid, true)
+        .any(|t| t.task.tid() == tid && t.task.pid == me);
+    own || may_access(|t| t.task.tid() == tid, true)
 }
 
 /// Linux __ptrace_may_access for the first task `pick` selects: the

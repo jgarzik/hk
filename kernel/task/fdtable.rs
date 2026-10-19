@@ -79,7 +79,7 @@ pub fn init_task_fd(tid: Tid, files: Arc<Files>) {
 /// current->files)
 pub fn get_task_fd(tid: Tid) -> Option<Arc<Files>> {
     let me = super::percpu::current();
-    if me.tid == tid {
+    if me.tid() == tid {
         return me.files();
     }
     let table = TASK_TABLE.lock();

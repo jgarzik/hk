@@ -940,14 +940,12 @@ fn kmain() -> ! {
     // This must be done before creating the user task
     task::percpu::init(&mut frame_alloc);
 
-    // Register user task with scheduler (pid=1, tid=2)
-    // Note: idle task has tid=1, pid=0 (kernel swapper convention)
-    // Init process: ppid=0 (no parent), pgid=sid=0 like Linux's init_task
-    // (init/init_task.c); init calls setsid() itself if it wants a session
+    // Register init with the scheduler: pid 1 (the idle tasks are tid 0,
+    // Linux swapper). ppid=0 (no parent), pgid=sid=0 like Linux's
+    // init_task (init/init_task.c); init calls setsid() itself if it
+    // wants a session
 
-    task::percpu::create_user_task(task::percpu::UserTaskConfig {
-        pid: 1,  // init process (PID 1)
-        tid: 2,  // tid=2 since idle task has tid=1
+    let init_tid = task::percpu::create_user_task(task::percpu::UserTaskConfig {
         ppid: 0, // init has no parent
         pgid: 0, // inherited from init_task, not a group leader
         sid: 0,  // not a session leader until setsid()
@@ -958,9 +956,9 @@ fn kmain() -> ! {
     })
     .expect("Failed to create user task");
 
-    // Initialize brk for the init task (tid=2)
+    // Initialize brk for the init task
     // This must be done after create_user_task which creates a default mm
-    if let Some(mm) = mm::get_task_mm(2) {
+    if let Some(mm) = mm::get_task_mm(init_tid) {
         let mut m = mm.mmap_write();
         m.set_brk(start_brk);
         m.set_exe(alloc::string::String::from("/bin/init"));
@@ -1008,7 +1006,7 @@ fn kmain() -> ! {
     }
 
     // Load init's address space (its task holds the mm reference)
-    match mm::get_task_mm(2) {
+    match mm::get_task_mm(init_tid) {
         Some(mm) => mm::tlb::switch_mm(Some(&mm)),
         None => panic!("init has no address space"),
     }

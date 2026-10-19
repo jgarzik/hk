@@ -58,7 +58,7 @@ pub fn task_exists_pub(pid: Pid) -> bool {
 pub fn get_tid_for_pid(pid: Pid) -> Option<crate::task::Tid> {
     use crate::task::percpu::TASK_TABLE;
     let table = TASK_TABLE.lock();
-    table.find(|t| t.task.pid == pid).map(|t| t.task.tid)
+    table.find(|t| t.task.pid == pid).map(|t| t.task.tid())
 }
 
 /// Inode number for per-PID directories
@@ -166,6 +166,9 @@ pub enum ProcfsInodeData {
     ///
     /// Can be opened and passed to setns(2) to join a namespace.
     NamespaceFile { pid: Pid, ns_type: NamespaceType },
+    /// Thread directory (/proc/<pid>/task): one entry per thread, each
+    /// a view of the process directory (per-thread files are a subset)
+    PidTaskDirectory { pid: Pid },
     /// Per-PID fd directory (/proc/<pid>/fd)
     ///
     /// Contains symlinks to open file descriptors.
@@ -280,6 +283,7 @@ impl ProcfsInodeData {
             | Self::PidNsDirectory { pid }
             | Self::NamespaceFile { pid, .. }
             | Self::PidFdDirectory { pid }
+            | Self::PidTaskDirectory { pid }
             | Self::PidFdinfoDirectory { pid }
             | Self::FdSymlink { pid, .. }
             | Self::FdinfoFile { pid, .. }
@@ -305,6 +309,7 @@ impl ProcfsInodeData {
                 | Self::PidDirectory { .. }
                 | Self::PidNsDirectory { .. }
                 | Self::PidFdDirectory { .. }
+                | Self::PidTaskDirectory { .. }
                 | Self::PidFdinfoDirectory { .. }
         )
     }
@@ -430,6 +435,18 @@ impl InodeOps for ProcfsInodeOps {
                 // Handle /proc/<pid>/fd/* lookups
                 lookup_pid_fd_entry(dir, *pid, name)
             }
+            ProcfsInodeData::PidTaskDirectory { pid } => {
+                let tid: crate::task::Tid = name.parse().map_err(|_| KernelError::NotFound)?;
+                if group_threads(*pid).contains(&tid) {
+                    Ok(create_dir_inode(
+                        dir,
+                        pid_ino(tid, 0),
+                        ProcfsInodeData::new_pid_dir(*pid),
+                    ))
+                } else {
+                    Err(KernelError::NotFound)
+                }
+            }
             ProcfsInodeData::PidFdinfoDirectory { pid } => {
                 // Handle /proc/<pid>/fdinfo/* lookups
                 lookup_pid_fdinfo_entry(dir, *pid, name)
@@ -480,6 +497,7 @@ impl InodeOps for ProcfsInodeOps {
             }
             ProcfsInodeData::Directory { .. }
             | ProcfsInodeData::PidDirectory { .. }
+            | ProcfsInodeData::PidTaskDirectory { .. }
             | ProcfsInodeData::PidNsDirectory { .. }
             | ProcfsInodeData::PidFdDirectory { .. }
             | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
@@ -510,6 +528,34 @@ impl InodeOps for ProcfsInodeOps {
 // ============================================================================
 
 /// Create a /proc/<pid> directory inode
+/// The live threads (tids) of process `pid`
+fn group_threads(pid: Pid) -> alloc::vec::Vec<crate::task::Tid> {
+    use crate::task::percpu::TASK_TABLE;
+    let table = TASK_TABLE.lock();
+    table
+        .iter()
+        .filter(|t| t.task.pid == pid && !matches!(t.state, crate::task::TaskState::Zombie(_)))
+        .map(|t| t.task.tid())
+        .collect()
+}
+
+/// A procfs directory inode (r-xr-xr-x, root) with `data`
+fn create_dir_inode(parent: &Inode, ino: u64, data: ProcfsInodeData) -> Arc<Inode> {
+    let sb = parent.superblock().expect("superblock dropped");
+    let inode = Arc::new(Inode::new(
+        ino,
+        InodeMode::directory(0o555),
+        0,
+        0,
+        0,
+        current_time(),
+        Arc::downgrade(&sb),
+        &PROCFS_INODE_OPS,
+    ));
+    inode.set_private(Arc::new(ProcfsInodeWrapper(RwLock::new(data))));
+    inode
+}
+
 fn create_pid_dir_inode(parent: &Inode, pid: Pid) -> Arc<Inode> {
     let sb = parent.superblock().expect("superblock dropped");
     let inode = Arc::new(Inode::new(
@@ -572,6 +618,11 @@ fn lookup_pid_entry(dir: &Inode, pid: Pid, name: &str) -> Result<Arc<Inode>, Ker
             ))));
             Ok(inode)
         }
+        "task" => Ok(create_dir_inode(
+            dir,
+            pid_ino(pid, 105),
+            ProcfsInodeData::PidTaskDirectory { pid },
+        )),
         "fdinfo" => {
             // Create /proc/<pid>/fdinfo directory
             let sb = dir.superblock().ok_or(KernelError::Io)?;
@@ -1243,6 +1294,7 @@ impl FileOps for ProcfsFileOps {
             }
             ProcfsInodeData::Directory { .. }
             | ProcfsInodeData::PidDirectory { .. }
+            | ProcfsInodeData::PidTaskDirectory { .. }
             | ProcfsInodeData::PidNsDirectory { .. }
             | ProcfsInodeData::PidFdDirectory { .. }
             | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
@@ -1285,6 +1337,7 @@ impl FileOps for ProcfsFileOps {
             }
             ProcfsInodeData::Directory { .. }
             | ProcfsInodeData::PidDirectory { .. }
+            | ProcfsInodeData::PidTaskDirectory { .. }
             | ProcfsInodeData::PidNsDirectory { .. }
             | ProcfsInodeData::PidFdDirectory { .. }
             | ProcfsInodeData::PidFdinfoDirectory { .. } => return Err(KernelError::IsDirectory),
@@ -1401,6 +1454,18 @@ impl FileOps for ProcfsFileOps {
                 // Emit /proc/<pid>/fd/* entries
                 readdir_emit_fd_entries(*pid, ctx)?;
             }
+            ProcfsInodeData::PidTaskDirectory { pid } => {
+                for tid in group_threads(*pid) {
+                    let e = DirEntry {
+                        ino: pid_ino(tid, 0),
+                        file_type: FileType::Directory,
+                        name: Vec::from(alloc::format!("{tid}").as_bytes()),
+                    };
+                    if !ctx.emit(e) {
+                        break;
+                    }
+                }
+            }
             ProcfsInodeData::PidFdinfoDirectory { pid } => {
                 // Emit /proc/<pid>/fdinfo/* entries
                 readdir_emit_fdinfo_entries(*pid, ctx)?;
@@ -1477,6 +1542,14 @@ fn readdir_emit_pid_entries(pid: Pid, ctx: &mut DirContext) -> Result<(), Kernel
     });
 
     if !should_continue {
+        return Ok(());
+    }
+
+    if !ctx.emit(DirEntry {
+        ino: pid_ino(pid, 105),
+        file_type: FileType::Directory,
+        name: Vec::from(&b"task"[..]),
+    }) {
         return Ok(());
     }
 

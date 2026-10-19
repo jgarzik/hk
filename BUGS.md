@@ -694,3 +694,27 @@ From the P4 /code-review (unverified unless noted). Tag = when to fix.
    `kernel/mm/anon_vma.rs:85`: O(N×VMAs) under one family write lock.
 9. Fixed in C1: one page-range walker (`mm::pagewalk`), one PTE lock
    per table, for every range operation.
+
+## T0 findings (open)
+Found during T0 (2026-10-19). Tag = when to fix.
+1. **Syscalls report root-namespace pids** (P9). Tasks now get a
+   number in every level of their pid namespace chain
+   (`kernel/task/pid.rs`), but getpid/gettid/kill/wait//proc use the
+   root number; a CLONE_NEWPID child is not pid 1 in its namespace.
+   Use `Pid::nr_in(caller's ns)` at the syscall boundary.
+2. **f_pos_lock taken for pipes and other streams, uninterruptibly**
+   (next batch). `kernel/fs/file.rs` `File::pos_lock`: Linux takes it
+   only for FMODE_ATOMIC_POS files (regular files, directories), never
+   for FMODE_STREAM. Two tasks reading one pipe through a shared open
+   file serialize, and one blocked on the lock cannot be killed (a
+   de_thread waiting for it hangs).
+3. **CLOCK_SETTIME_STORM ignores the sched_getaffinity result** (next
+   batch). The test assumes an 8-byte mask (EINVAL past 64 CPUs),
+   stays pinned, and drifts CLOCK_REALTIME. Fix the test if touched.
+4. **mremap Prep allocates page tables under the old PTE lock** (next
+   batch). It uses CAS-only `paging::pte_alloc` there, skipping
+   page_table_lock; allocate before taking the PTE lock (Linux
+   move_page_tables).
+5. **`virt_to_phys(p & !0xfff)` duplicated** (next batch) in
+   `Move::ptes`, `PteRange::at` and `ptl::pte_lock`: add one
+   `ptl::table_of_ptep()`.
