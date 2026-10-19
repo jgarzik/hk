@@ -1906,6 +1906,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // The rq lock stays held across the switch, as for any switch: the
     // next task releases it (its own guard, or finish_context_switch),
     // and only then frees our stack (`rq.dead`)
+    check_switch_atomic();
     core::mem::forget(rq);
 
     // Switch to next task - never returns
@@ -2004,6 +2005,7 @@ fn context_switch_locked(
     cur: Tid,
     next: Tid,
 ) {
+    check_switch_atomic();
     let cur_sleeps = rq
         .entry_mut(cur)
         .is_some_and(|e| e.state != SleepState::Running);
@@ -2032,6 +2034,24 @@ fn context_switch_locked(
     let dead = core::mem::take(&mut rq.dead);
     drop(rq);
     drop(dead);
+}
+
+/// Linux schedule_debug ("scheduling while atomic"): a task switches
+/// out holding only its rq lock, so the preempt count it leaves behind
+/// is exactly that lock's; any other spin lock would stay held (and the
+/// count raised) while another task runs. Reported once.
+fn check_switch_atomic() {
+    let pc = crate::arch::preempt_count();
+    if pc != 1 {
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            printkln!(
+                "SCHED:FAIL scheduling while atomic: preempt count {} (tid {})",
+                pc,
+                current_tid()
+            );
+        }
+    }
 }
 
 /// This CPU's scheduler, if initialized

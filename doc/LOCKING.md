@@ -95,7 +95,9 @@ are **NOT** accessed from interrupt context.
 **Properties:**
 - Blocking (spins until lock acquired)
 - Does NOT disable interrupts
-- Does NOT track preempt_count
+- Raises `preempt_count` while held (Linux spin_lock's
+  preempt_disable): `preempt_count() == 0` with interrupts on means no
+  spin lock of any kind is held, which `might_sleep` checks (6.3)
 - Suitable for longer critical sections in thread context
 
 **Use cases:**
@@ -115,6 +117,7 @@ or one exclusive writer.
 **Properties:**
 - Multiple readers OR single writer
 - Does NOT disable interrupts
+- Raises `preempt_count` while held, like `Mutex` (1.2)
 - Reader-writer fairness depends on implementation
 
 **Use cases:**
@@ -161,10 +164,14 @@ the mmap_lock (`Mm.map`), `AnonVma.chain`; `Mutex`:
 
 Kernel code takes `crate::sync::spin::{Mutex, RwLock}` (never the `spin`
 crate's types directly; `printk` and lockdep itself are the exceptions).
-In a normal build these are re-exports of `spin`'s types (zero cost).
-Built with `make check LOCKDEP=1` (cargo feature `lockdep`) they are
-tracked wrappers, and the kernel reports, once each, as `LOCKDEP:FAIL`
-(so the boot test fails):
+These wrap `spin`'s types and raise the preempt count while held (1.2).
+Every build checks `might_sleep` against the preempt count, interrupt
+state and interrupt depth, and reports the first violation as
+`MIGHT_SLEEP:FAIL`; a context switch with any lock held besides the
+run-queue lock is reported as `SCHED:FAIL scheduling while atomic`
+(Linux schedule_debug). Built with `make check LOCKDEP=1` (cargo feature
+`lockdep`) the wrappers are also tracked, and the kernel reports, once
+each, as `LOCKDEP:FAIL` (so the boot test fails):
 
 - **Sleeping in atomic context:** `sync::might_sleep()` (sleeping locks,
   `schedule`/`yield_now`, wait queues, `Sock::wait`, user copies via
@@ -501,9 +508,8 @@ never switches tasks, in kernel or user mode; switches happen only in
 `schedule()`, `yield_now()`, `exit_current()` and AP startup. Therefore a
 `spin::Mutex`/`RwLock` holder is never involuntarily preempted, and the only
 same-CPU hazard is an IRQ handler taking a lock the interrupted code holds
-(hence the IRQ rules). A `PreemptSpinlock` is not needed today; if
-preemption is ever added it must honor `preempt_count`, and `spin::Mutex`
-would then need a preempt-disabling wrapper.
+(hence the IRQ rules). Every spin lock raises `preempt_count` (6.3), so a
+preemption point added later can honor it.
 
 **RCU hook:** `PerCpuScheduler.nr_switches` counts context switches per CPU;
 since kernel code cannot be preempted, a change in a CPU's counter (or the
@@ -2825,15 +2831,22 @@ pub fn preempt_count() -> u32;
 
 ### 6.3 Automatic Preemption Tracking
 
-`IrqSpinlock` automatically manages preempt_count:
+Every spin lock manages preempt_count (Linux spin_lock): `IrqSpinlock`
+and the `sync::spin` `Mutex`/`RwLock` wrappers alike.
 
 ```rust
 // On lock():
-percpu::preempt_disable();  // preempt_count++
+percpu::preempt_disable();  // preempt_count++ (IrqSpinlock: after cli)
 
 // On unlock/drop():
-percpu::preempt_enable();   // preempt_count--
+percpu::preempt_enable();   // preempt_count-- (after the release)
 ```
+
+So `sync::in_atomic()` (preempt count nonzero, interrupts off, or an
+interrupt handler running) is exact: such a context must not sleep
+(`might_sleep` reports `MIGHT_SLEEP:FAIL`). A task switches out
+holding only its run-queue lock (preempt count exactly 1; anything else
+is `SCHED:FAIL scheduling while atomic`).
 
 ---
 

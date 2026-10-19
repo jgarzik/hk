@@ -74,7 +74,7 @@ pub use x86_64::barrier;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::irq;
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::percpu::preempt_count;
+pub use x86_64::percpu::{preempt_count, preempt_disable, preempt_enable};
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
 pub use x86_64::spinlock::{
@@ -85,7 +85,7 @@ pub use x86_64::spinlock::{
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::irq;
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::percpu::preempt_count;
+pub use aarch64::percpu::{preempt_count, preempt_disable, preempt_enable};
 #[cfg(target_arch = "aarch64")]
 #[allow(unused_imports)]
 pub use aarch64::spinlock::{
