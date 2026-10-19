@@ -33,6 +33,12 @@ pub fn sys_exit(status: i32) -> u64 {
     do_exit((status & 0xff) << 8)
 }
 
+/// sys_exit_group - terminate every thread of the process (Linux
+/// do_group_exit)
+pub fn sys_exit_group(status: i32) -> u64 {
+    crate::signal::do_group_exit((status & 0xff) << 8)
+}
+
 /// Terminate the current task with a Linux wait status word
 ///
 /// `(code << 8)` for a normal exit, the signal number (| 0x80 if a core was
@@ -623,11 +629,9 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
 ///
 /// Returns the caller's thread ID.
 pub fn sys_set_tid_address(tidptr: u64) -> i64 {
-    use crate::CurrentArch;
-    use crate::arch::PerCpuOps;
     use crate::task::set_clear_child_tid;
 
-    let tid = CurrentArch::current_tid();
+    let tid = super::percpu::current_tid();
     set_clear_child_tid(tid, tidptr);
     tid as i64
 }

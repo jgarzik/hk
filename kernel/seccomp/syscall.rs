@@ -3,7 +3,7 @@
 //! This module implements the seccomp(2) syscall and prctl(2) integration.
 
 use crate::error::KernelError;
-use crate::task::percpu::{TASK_TABLE, update_current_seccomp_mode};
+use crate::task::percpu::TASKLIST;
 
 use super::filter::create_filter_from_user;
 use super::{
@@ -67,22 +67,21 @@ fn set_seccomp_strict() -> i64 {
     let tid = crate::task::percpu::current_tid();
 
     {
-        let mut table = TASK_TABLE.lock();
-        let task = match table.tasks.iter_mut().find(|t| t.tid == tid) {
+        let mut table = TASKLIST.write();
+        let task = match table.get_mut(tid) {
             Some(t) => t,
             None => return KernelError::NoProcess.sysret(),
         };
 
         // Can only enable seccomp, not change modes once enabled
-        if task.seccomp_mode != SECCOMP_MODE_DISABLED {
+        if task.task.seccomp_mode() != SECCOMP_MODE_DISABLED {
             return KernelError::InvalidArgument.sysret();
         }
 
-        task.seccomp_mode = SECCOMP_MODE_STRICT;
+        task.task
+            .seccomp_mode
+            .store(SECCOMP_MODE_STRICT, core::sync::atomic::Ordering::Relaxed);
     }
-
-    // Update per-CPU cached seccomp_mode for fast syscall-entry check
-    update_current_seccomp_mode(SECCOMP_MODE_STRICT);
 
     0
 }
@@ -99,8 +98,8 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, _tsync: bool) -> i64 {
 
     // Get current task's existing filter and check no_new_privs
     let (existing_filter, has_no_new_privs, is_privileged) = {
-        let table = TASK_TABLE.lock();
-        let task = match table.tasks.iter().find(|t| t.tid == tid) {
+        let table = TASKLIST.read();
+        let task = match table.get(tid) {
             Some(t) => t,
             None => return KernelError::NoProcess.sysret(),
         };
@@ -108,7 +107,7 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, _tsync: bool) -> i64 {
         (
             task.seccomp_filter.clone(),
             task.prctl.no_new_privs,
-            task.cred.euid == 0, // Root is privileged
+            task.cred().euid == 0, // Root is privileged
         )
     };
 
@@ -125,18 +124,19 @@ fn set_seccomp_filter(fprog_ptr: u64, log: bool, _tsync: bool) -> i64 {
 
     // Update task's seccomp state
     {
-        let mut table = TASK_TABLE.lock();
-        let task = match table.tasks.iter_mut().find(|t| t.tid == tid) {
+        let mut table = TASKLIST.write();
+        let mut task = match table.get_mut(tid) {
             Some(t) => t,
             None => return KernelError::NoProcess.sysret(),
         };
 
-        task.seccomp_mode = SECCOMP_MODE_FILTER;
+        // Filter first: syscall entry reads the mode lock-free, then
+        // the filter under TASKLIST
         task.seccomp_filter = Some(new_filter);
+        task.task
+            .seccomp_mode
+            .store(SECCOMP_MODE_FILTER, core::sync::atomic::Ordering::Release);
     }
-
-    // Update per-CPU cached seccomp_mode for fast syscall-entry check
-    update_current_seccomp_mode(SECCOMP_MODE_FILTER);
 
     // TODO: If tsync, sync across all threads in thread group
 
@@ -166,9 +166,9 @@ fn get_action_avail(action: u64) -> i64 {
 pub fn prctl_get_seccomp() -> i64 {
     let tid = crate::task::percpu::current_tid();
 
-    let table = TASK_TABLE.lock();
-    match table.tasks.iter().find(|t| t.tid == tid) {
-        Some(task) => task.seccomp_mode as i64,
+    let table = TASKLIST.read();
+    match table.get(tid) {
+        Some(task) => task.task.seccomp_mode() as i64,
         None => SECCOMP_MODE_DISABLED as i64,
     }
 }

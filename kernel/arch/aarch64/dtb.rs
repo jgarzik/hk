@@ -146,16 +146,57 @@ pub fn blob(dtb: u64) -> Option<&'static [u8]> {
     Some(unsafe { core::slice::from_raw_parts(p, size) })
 }
 
-/// First RAM range of the /memory node(s), as physical (base, size)
-pub fn memory(dtb_ptr: u64) -> Option<(u64, u64)> {
-    let dt = DeviceTree::from_fdt(blob(dtb_ptr)?).ok()?;
-    let root = dt.find_node("/")?;
-    root.children()
-        .filter(|c| c.name() == "memory" || c.name().starts_with("memory@"))
-        .find_map(|c| match c.reg()? {
-            (Some(base), Some(size)) => Some((base, size)),
-            _ => None,
-        })
+/// Call `f(base, size)` for every RAM range of every /memory node
+/// (each `reg` pair); false if the DTB has none
+pub fn for_each_memory(dtb_ptr: u64, mut f: impl FnMut(u64, u64)) -> bool {
+    let Some(dt) = blob(dtb_ptr).and_then(|b| DeviceTree::from_fdt(b).ok()) else {
+        return false;
+    };
+    let Some(root) = dt.find_node("/") else {
+        return false;
+    };
+    let cells = root.cells();
+    let mut any = false;
+    let disabled =
+        |c: &crate::dt::Node| c.property("status").and_then(|p| p.as_str()) == Some("disabled");
+    for c in root.children() {
+        if (c.name() == "memory" || c.name().starts_with("memory@")) && !disabled(&c) {
+            for (base, size) in c.regs(cells).filter(|&(_, size)| size != 0) {
+                f(base, size);
+                any = true;
+            }
+        }
+    }
+    any
+}
+
+/// Call `f(base, size)` for every range the firmware keeps for itself:
+/// the FDT memory reservation block and each /reserved-memory child
+/// (Linux early_init_fdt_scan_reserved_mem; `no-map` ranges are only
+/// reserved, they stay in the linear map)
+pub fn for_each_firmware_reserved(dtb_ptr: u64, mut f: impl FnMut(u64, u64)) {
+    let Some(b) = blob(dtb_ptr) else {
+        return;
+    };
+    let be64 = |o: usize| u64::from_be_bytes(b[o..o + 8].try_into().unwrap_or([0; 8]));
+    let mut off = u32::from_be_bytes([b[16], b[17], b[18], b[19]]) as usize;
+    while off + 16 <= b.len() {
+        let (base, size) = (be64(off), be64(off + 8));
+        if base == 0 && size == 0 {
+            break;
+        }
+        f(base, size);
+        off += 16;
+    }
+    let Ok(dt) = DeviceTree::from_fdt(b) else {
+        return;
+    };
+    if let Some(rm) = dt.find_node("/reserved-memory") {
+        let cells = rm.cells();
+        for c in rm.children() {
+            c.regs(cells).for_each(|(base, size)| f(base, size));
+        }
+    }
 }
 
 /// Initramfs location from DTB
@@ -405,7 +446,7 @@ pub fn init_numa_topology(dtb_ptr: u64) -> Result<bool, &'static str> {
                 && let Some(node_id) = numa_prop.as_u32()
             {
                 let node_id = node_id as usize;
-                if node_id < MAX_NUMA_NODES && (cpu_id as usize) < crate::numa::MAX_CPUS {
+                if node_id < MAX_NUMA_NODES && (cpu_id as usize) < crate::cpumask::NR_CPUS {
                     found_numa = true;
                     topology.cpu_to_node[cpu_id as usize] = node_id as u8;
 

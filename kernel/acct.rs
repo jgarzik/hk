@@ -15,12 +15,11 @@
 //! Uses Linux acct_v3 format (64 bytes per record).
 //! Records are written when processes exit (group leader exits).
 
-use alloc::string::String;
 use alloc::sync::Arc;
 
-use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::file::File;
+use crate::sync::spin::Mutex;
 use crate::task::CAP_SYS_PACCT;
 use crate::task::Pid;
 use crate::task::Tid;
@@ -154,17 +153,17 @@ fn encode_elapsed_float(elapsed_ns: u64) -> u32 {
 // Accounting State
 // =============================================================================
 
-/// Accounting state
-struct AcctState {
-    /// File to write accounting records to
-    file: Arc<File>,
-    /// Path to accounting file (for reference)
-    #[allow(dead_code)]
-    path: String,
-}
+/// The accounting file (Linux acct->file). A leaf spin lock, thread
+/// context only: users clone the file out and write with no lock held
+/// (the write sleeps), and a replaced file is released after unlocking.
+static ACCT_FILE: Mutex<Option<Arc<File>>> = Mutex::new(None);
 
-/// Global accounting state
-static ACCT_STATE: IrqSpinlock<Option<AcctState>> = IrqSpinlock::new(None);
+/// Install `file` (None: accounting off); the old file is released
+/// with no lock held
+fn set_acct_file(file: Option<Arc<File>>) {
+    let old = core::mem::replace(&mut *ACCT_FILE.lock(), file);
+    drop(old);
+}
 
 // =============================================================================
 // Syscall Implementation
@@ -184,8 +183,7 @@ pub fn sys_acct(filename_ptr: u64) -> i64 {
 
     // If filename_ptr == 0, disable accounting
     if filename_ptr == 0 {
-        let mut state = ACCT_STATE.lock();
-        *state = None;
+        set_acct_file(None);
         return 0;
     }
 
@@ -202,12 +200,7 @@ pub fn sys_acct(filename_ptr: u64) -> i64 {
         Err(e) => return e,
     };
 
-    // Enable accounting
-    let mut state = ACCT_STATE.lock();
-    *state = Some(AcctState {
-        file,
-        path: filename,
-    });
+    set_acct_file(Some(file));
 
     0
 }
@@ -260,14 +253,13 @@ fn open_acct_file(path: &str) -> Result<Arc<File>, i64> {
 
 /// Write accounting record for an exiting process
 ///
-/// This should be called from mark_zombie() when a process exits.
+/// Called by a process's last exiting thread before it releases its
+/// mm and files (Linux acct_process from do_exit).
 /// It's best-effort - failures are silently ignored to not block the exit path.
 pub fn write_acct_record(tid: Tid, pid: Pid, exit_status: i32) {
-    // Check if accounting is enabled
-    let state = ACCT_STATE.lock();
-    let state = match state.as_ref() {
-        Some(s) => s,
-        None => return, // Accounting not enabled
+    // Accounting enabled? (the file is used with no lock held)
+    let Some(file) = ACCT_FILE.lock().clone() else {
+        return;
     };
 
     // Get task information
@@ -323,7 +315,7 @@ pub fn write_acct_record(tid: Tid, pid: Pid, exit_status: i32) {
     };
 
     // Write to file (best-effort, ignore errors)
-    let _ = write_record_to_file(&state.file, &record);
+    let _ = write_record_to_file(&file, &record);
 }
 
 /// Task information gathered for accounting
@@ -346,10 +338,10 @@ struct TaskInfo {
 
 /// Get task information for accounting
 fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
-    use crate::task::percpu::TASK_TABLE;
+    use crate::task::percpu::TASKLIST;
 
-    let table = TASK_TABLE.lock();
-    let task = table.tasks.iter().find(|t| t.tid == tid)?;
+    let table = TASKLIST.read();
+    let task = table.get(tid)?;
 
     // Get command name from prctl state
     let mut comm = [0u8; 16];
@@ -360,12 +352,12 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
     comm[..name_len].copy_from_slice(&name_bytes[..name_len]);
 
     // Get credentials - Arc<Cred> can be dereferenced directly
-    let cred = &*task.cred;
+    let cred = &task.cred();
     let (uid, euid, gid) = (cred.uid, cred.euid, cred.gid);
 
     // Calculate elapsed time using task.start_time (monotonic ns since boot)
     let now_ns = crate::time::monotonic_ns();
-    let elapsed_ns = now_ns.saturating_sub(task.start_time);
+    let elapsed_ns = now_ns.saturating_sub(task.task.start_time());
 
     // Get start time as Unix timestamp (seconds since epoch)
     // Convert from monotonic start_time to wall clock using TIMEKEEPER
@@ -376,9 +368,9 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
     let mono_ns = mono_ts.to_nanos() as u64;
     // Calculate the realtime offset and apply it to start_time
     let realtime_start_ns = if realtime_ns >= mono_ns {
-        task.start_time.saturating_add(realtime_ns - mono_ns)
+        task.task.start_time().saturating_add(realtime_ns - mono_ns)
     } else {
-        task.start_time.saturating_sub(mono_ns - realtime_ns)
+        task.task.start_time().saturating_sub(mono_ns - realtime_ns)
     };
     let start_time = (realtime_start_ns / 1_000_000_000) as u32;
 
@@ -386,14 +378,20 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
         uid,
         euid,
         gid,
-        ppid: task.ppid,
+        ppid: task.task.ppid(),
         tty: 0, // TODO: Get controlling terminal
         start_time,
         elapsed_ns,
-        utime_ns: task.utime,
-        stime_ns: task.stime,
-        minflt: task.min_flt,
-        majflt: task.maj_flt,
+        utime_ns: task.task.utime.load(core::sync::atomic::Ordering::Relaxed),
+        stime_ns: task.task.stime.load(core::sync::atomic::Ordering::Relaxed),
+        minflt: task
+            .task
+            .min_flt
+            .load(core::sync::atomic::Ordering::Relaxed),
+        majflt: task
+            .task
+            .maj_flt
+            .load(core::sync::atomic::Ordering::Relaxed),
         comm,
         did_fork: pid != tid as Pid, // Simple heuristic: different PID/TID means forked
         did_exec: task.prctl.name[0] != 0, // Has a name means exec'd
@@ -409,14 +407,4 @@ fn write_record_to_file(file: &File, record: &AcctV3) -> Result<(), KernelError>
     file.f_op.write(file, bytes)?;
 
     Ok(())
-}
-
-// =============================================================================
-// Public API for integration
-// =============================================================================
-
-/// Check if accounting is enabled
-#[allow(dead_code)]
-pub fn is_enabled() -> bool {
-    ACCT_STATE.lock().is_some()
 }

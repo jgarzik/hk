@@ -53,6 +53,12 @@ impl DevId {
         ((self.major as u32) << 20) | (self.minor as u32 & 0xFFFFF)
     }
 
+    /// Encode as a user dev_t (st_rdev; Linux new_encode_dev)
+    pub const fn to_user(&self) -> u64 {
+        let (ma, mi) = (self.major as u64, self.minor as u64);
+        (mi & 0xff) | (ma << 8) | ((mi & !0xff) << 12)
+    }
+
     /// Decode a user dev_t (Linux new_decode_dev / huge_decode_dev)
     pub const fn from_user(dev: u64) -> Self {
         Self {
@@ -150,6 +156,11 @@ pub trait CharDevice: Send + Sync {
 
     /// Write bytes to the device
     fn write(&self, buf: &[u8]) -> Result<usize, DeviceError>;
+
+    /// The device can be mapped (Linux: its fops have mmap)
+    fn mmap_ok(&self) -> bool {
+        false
+    }
 
     /// Device-specific control operations
     fn ioctl(&self, _cmd: u32, _arg: u64) -> Result<i64, DeviceError> {
@@ -264,6 +275,11 @@ pub struct ZeroCharDevice;
 impl CharDevice for ZeroCharDevice {
     fn name(&self) -> &str {
         "zero"
+    }
+
+    /// Linux mmap_zero: private zero pages
+    fn mmap_ok(&self) -> bool {
+        true
     }
 
     fn read(&self, buf: &mut [u8]) -> Result<usize, DeviceError> {

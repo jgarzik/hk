@@ -198,7 +198,7 @@ pub fn init_idt() {
 #[inline]
 pub fn enable() {
     unsafe {
-        ::core::arch::asm!("sti", options(nomem, nostack));
+        ::core::arch::asm!("sti", options(nostack));
     }
 }
 
@@ -298,6 +298,9 @@ unsafe extern "C" fn exception_common() {
         // Stack now: [rax, rbx, rcx, rdx, rsi, rdi, rbp, r8-r14, r15, error_code, rip, cs, rflags, rsp, ss]
         // This matches TrapFrame layout!
 
+        // Kernel GS base, whatever the origin (keeps r15, the vector)
+        "call {}",
+
         // Call Rust handler with (frame pointer, vector number)
         "mov rdi, rsp",      // First arg: trap frame pointer
         "mov rsi, r15",      // Second arg: vector number (in R15)
@@ -331,6 +334,7 @@ unsafe extern "C" fn exception_common() {
         "add rsp, 8",
 
         "iretq",
+        sym super::percpu::restore_kernel_gs,
         sym handle_exception,
     );
 }
@@ -386,7 +390,7 @@ fn user_fault(frame: &mut X86_64TrapFrame, sig: u32, info: KSigInfo) {
 extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 {
     // Disable interrupts
     unsafe {
-        ::core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        ::core::arch::asm!("cli", options(nostack, preserves_flags));
     }
 
     // Read CR2 for page faults
@@ -397,6 +401,12 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
 
     // Page faults: demand paging, copy-on-write, swap-in (kernel/mm/fault.rs)
     if vector == 14 {
+        // CR2 is read: interrupts back on if the faulting context had
+        // them (Linux do_user_addr_fault), so a fault that sleeps (the
+        // mmap_lock, file I/O) does not hold them off
+        if frame.rflags & 0x200 != 0 {
+            enable();
+        }
         let Err(err) = handle_page_fault(frame, cr2) else {
             return 1; // resolved: retry the access
         };
@@ -709,6 +719,7 @@ macro_rules! irq_handler {
                 "push r13",
                 "push r14",
                 "push r15",
+                "call {}",          // kernel GS base (every entry)
 
                 "mov rdi, {}",      // IRQ number
                 "call {}",
@@ -730,6 +741,7 @@ macro_rules! irq_handler {
                 "pop rax",
                 "add rsp, 8",       // Skip error code
                 "iretq",
+                sym super::percpu::restore_kernel_gs,
                 const $irq,
                 sym handle_irq,
             );
@@ -775,6 +787,7 @@ unsafe extern "C" fn lapic_timer_handler() {
         "push r13",
         "push r14",
         "push r15",
+        "call {}",          // kernel GS base (every entry)
 
         // Pass trap frame pointer as argument
         "mov rdi, rsp",
@@ -798,6 +811,7 @@ unsafe extern "C" fn lapic_timer_handler() {
         "pop rax",
         "add rsp, 8",       // Skip error code
         "iretq",
+        sym super::percpu::restore_kernel_gs,
         sym handle_lapic_timer,
     );
 }
@@ -829,6 +843,7 @@ macro_rules! ipi_handler {
                 "push r13",
                 "push r14",
                 "push r15",
+                "call {}",          // kernel GS base (every entry)
                 "call {}",
                 "pop r15",
                 "pop r14",
@@ -847,6 +862,7 @@ macro_rules! ipi_handler {
                 "pop rax",
                 "add rsp, 8",
                 "iretq",
+                sym super::percpu::restore_kernel_gs,
                 sym $handler,
             );
         }

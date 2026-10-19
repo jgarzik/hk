@@ -25,7 +25,6 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-use crate::dma::DmaAddr;
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{EtherType, PktType};
 use crate::net::ipv4::Ipv4Addr;
@@ -61,23 +60,9 @@ pub struct SkBuff {
     /// IP protocol number (set by IP layer)
     pub ip_protocol: u8,
 
-    // Header offsets (from data pointer)
-    /// Transport header offset
-    pub transport_header: usize,
-    /// Network header offset
-    pub network_header: usize,
-    /// MAC header offset (usually 0)
-    pub mac_header: usize,
-
     // Device reference
     /// Source/destination device
     pub dev: Option<Arc<NetDevice>>,
-
-    // DMA address (for zero-copy with device)
-    pub dma_addr: Option<DmaAddr>,
-
-    // Checksum state
-    pub ip_summed: ChecksumState,
 
     // IP addresses (set by IP layer for routing)
     pub saddr: Option<Ipv4Addr>,
@@ -99,20 +84,6 @@ pub struct SkBuff {
     mac: *mut u8,
     /// Start of the IP header of a received packet (null until marked)
     nh: *mut u8,
-}
-
-/// Checksum state for hardware offload
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ChecksumState {
-    /// No checksum computed
-    #[default]
-    None,
-    /// Checksum verified by hardware
-    Unnecessary,
-    /// Partial checksum computed by hardware
-    Partial,
-    /// Complete checksum computed by hardware
-    Complete,
 }
 
 // SkBuff contains raw pointers but manages its own memory
@@ -151,12 +122,7 @@ impl SkBuff {
             alloc_size: total_size,
             protocol: EtherType::Unknown(0),
             ip_protocol: 0,
-            transport_header: 0,
-            network_header: 0,
-            mac_header: 0,
             dev: None,
-            dma_addr: None,
-            ip_summed: ChecksumState::None,
             saddr: None,
             daddr: None,
             pkt_type: PktType::Host,
@@ -337,10 +303,6 @@ impl SkBuff {
         }
         self.protocol = EtherType::Unknown(0);
         self.ip_protocol = 0;
-        self.transport_header = 0;
-        self.network_header = 0;
-        self.mac_header = 0;
-        self.ip_summed = ChecksumState::None;
         self.saddr = None;
         self.daddr = None;
         self.pkt_type = PktType::Host;
@@ -348,43 +310,6 @@ impl SkBuff {
         self.owner = 0;
         self.mac = core::ptr::null_mut();
         self.nh = core::ptr::null_mut();
-    }
-
-    // Header offset helpers
-
-    /// Set the network header position (current data offset)
-    pub fn set_network_header(&mut self) {
-        self.network_header = 0;
-    }
-
-    /// Set the network header position with offset from data
-    pub fn set_network_header_offset(&mut self, offset: usize) {
-        self.network_header = offset;
-    }
-
-    /// Set the transport header position
-    pub fn set_transport_header(&mut self, offset: usize) {
-        self.transport_header = offset;
-    }
-
-    /// Set the MAC header position
-    pub fn set_mac_header(&mut self) {
-        self.mac_header = 0;
-    }
-
-    /// Get network header as slice
-    pub fn network_header(&self) -> &[u8] {
-        &self.data()[self.network_header..]
-    }
-
-    /// Get transport header as slice
-    pub fn transport_header(&self) -> &[u8] {
-        &self.data()[self.transport_header..]
-    }
-
-    /// Get MAC header as slice
-    pub fn mac_header(&self) -> &[u8] {
-        &self.data()[self.mac_header..]
     }
 
     /// Record the current data pointer as the start of the MAC header

@@ -1,7 +1,7 @@
 //! Per-task file descriptor tables (Linux files_struct)
 //!
 //! Each task points at a `Files` table, shared by CLONE_FILES or copied
-//! by fork. `Task.files` is reached through TASK_TABLE; the table has
+//! by fork. `Task.files` is reached through TASKLIST; the table has
 //! its own lock.
 //!
 //! ## Locking
@@ -13,14 +13,14 @@
 //! and `FilesGuard` drops them after unlocking (Linux
 //! file_close_fd_locked, then filp_close/fput after spin_unlock).
 //! Likewise a task's last reference to its table is dropped after
-//! TASK_TABLE is released, never under it.
+//! TASKLIST is released, never under it.
 
 use crate::sync::spin::{Mutex, MutexGuard};
 use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
-use super::percpu::TASK_TABLE;
+use super::percpu::TASKLIST;
 use super::{FdTable, Tid};
 use crate::fs::File;
 
@@ -63,41 +63,36 @@ impl Drop for FilesGuard<'_> {
     }
 }
 
-/// Point `tid` at `files`; the table it had is dropped after TASK_TABLE
+/// Point `tid` at `files`; the table it had is dropped after TASKLIST
 /// is released
 pub fn init_task_fd(tid: Tid, files: Arc<Files>) {
     let old = {
-        let mut table = TASK_TABLE.lock();
+        let mut table = TASKLIST.write();
         table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.files.replace(files))
+            .get_mut(tid)
+            .and_then(|mut t| t.set_files(Some(files)))
     };
     drop(old);
 }
 
-/// The descriptor table of `tid`
+/// The descriptor table of `tid` (lock-free for the current task, Linux
+/// current->files)
 pub fn get_task_fd(tid: Tid) -> Option<Arc<Files>> {
-    let table = TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .and_then(|t| t.files.clone())
+    let me = super::percpu::current();
+    if me.tid() == tid {
+        return me.files();
+    }
+    let table = TASKLIST.read();
+    table.get(tid).and_then(|t| t.files().cloned())
 }
 
 /// Exit (Linux exit_files): drop the task's reference; the last one
-/// closes every descriptor, after TASK_TABLE is released (releasing a
-/// socket can sleep and the scheduler takes TASK_TABLE)
+/// closes every descriptor, after TASKLIST is released (releasing a
+/// socket can sleep and the scheduler takes TASKLIST)
 pub fn exit_task_fd(tid: Tid) {
     let files = {
-        let mut table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.files.take())
+        let mut table = TASKLIST.write();
+        table.get_mut(tid).and_then(|mut t| t.set_files(None))
     };
     drop(files);
 }
@@ -114,6 +109,17 @@ pub fn exec_task_fd(tid: Tid) {
     let new = Arc::new(Files::new(old.lock().exec_copy()));
     init_task_fd(tid, new);
     drop(old);
+}
+
+/// Give `tid` a private copy of its table (Linux unshare_fd): the new
+/// table is installed and returned, while tasks still sharing the old
+/// one through CLONE_FILES keep it.
+pub fn unshare_task_fd(tid: Tid) -> Option<Arc<Files>> {
+    let old = get_task_fd(tid)?;
+    let new = Arc::new(Files::new(old.lock().deep_clone()));
+    init_task_fd(tid, new.clone());
+    drop(old);
+    Some(new)
 }
 
 /// Clone the table for fork/clone: shared with CLONE_FILES (`share`),

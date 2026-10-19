@@ -31,8 +31,9 @@
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use super::Mm;
-use crate::arch::{CurrentArch, PerCpuOps, local_irq_restore, local_irq_save, paging};
-use crate::cpumask::{CpuMask, NR_CPUS};
+use crate::arch::{CurrentArch, local_irq_restore, local_irq_save, paging};
+use crate::cpu::{PerCpu, this_id};
+use crate::cpumask::CpuMask;
 
 use crate::arch::tlb as arch;
 pub use crate::arch::tlb::ArchCtx;
@@ -98,20 +99,13 @@ pub struct TlbState {
 }
 
 /// Per-CPU TLB state: each CPU's own, no cross-CPU traffic
-static TLB_STATE: [TlbState; NR_CPUS] = [const {
-    TlbState {
-        loaded_mm: AtomicUsize::new(0),
-        loaded_gen: AtomicU64::new(0),
-    }
-}; NR_CPUS];
-
-/// This CPU's id (0 before per-CPU data exists: only the boot CPU runs)
-fn this_cpu() -> u32 {
-    CurrentArch::try_current_cpu_id().unwrap_or(0)
-}
+static TLB_STATE: PerCpu<TlbState> = crate::percpu![TlbState {
+    loaded_mm: AtomicUsize::new(0),
+    loaded_gen: AtomicU64::new(0),
+}];
 
 fn this_state() -> &'static TlbState {
-    &TLB_STATE[this_cpu() as usize]
+    TLB_STATE.this()
 }
 
 /// A flush request (Linux flush_tlb_info)
@@ -147,7 +141,7 @@ pub fn flush_tlb_mm_range(mm: &Mm, start: u64, end: u64, stride_shift: u32, free
         freed_tables,
         new_gen,
     };
-    let cpu = this_cpu();
+    let cpu = this_id();
     let irq = local_irq_save();
     if ctx.cpumask.test(cpu) {
         flush_func(&info);
@@ -258,7 +252,7 @@ pub fn switch_mm(next: Option<&Mm>) {
 }
 
 fn switch_mm_irqs_off(next: Option<&Mm>) {
-    let cpu = this_cpu();
+    let cpu = this_id();
     let st = this_state();
     let next_ptr = next.map_or(0, |m| m as *const Mm as usize);
     let prev = st.loaded_mm.load(Ordering::Relaxed);

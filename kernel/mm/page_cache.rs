@@ -15,7 +15,6 @@
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -186,61 +185,6 @@ impl AddressSpaceOps for NullAddressSpaceOps {
 /// Global null address space ops instance
 pub static NULL_AOPS: NullAddressSpaceOps = NullAddressSpaceOps;
 
-/// Block device address space operations for disk-backed filesystems.
-///
-/// Used by filesystems like VFAT that store data on block devices.
-/// This implementation looks up the block device from the global registry
-/// using the major/minor encoded in the FileId.
-pub struct BlkdevAddressSpaceOps;
-
-impl AddressSpaceOps for BlkdevAddressSpaceOps {
-    fn readpage(&self, file_id: FileId, page_offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-        use crate::storage::{BLKDEV_REGISTRY, DevId};
-
-        // Extract major/minor from FileId
-        // Format: 0x8000_0000_0000_0000 | (major << 20) | minor
-        let encoded = file_id.0 & 0x7FFF_FFFF_FFFF_FFFF;
-        let major = ((encoded >> 20) & 0xFFFF) as u16;
-        let minor = (encoded & 0xFFFFF) as u16;
-
-        // Look up the block device
-        let dev_id = DevId { major, minor };
-        let bdev = BLKDEV_REGISTRY.read().get(dev_id).ok_or(-5i32)?; // EIO if device not found
-
-        // Read the page from the block device
-        bdev.disk
-            .queue
-            .driver()
-            .readpage(&bdev.disk, buf, page_offset);
-
-        Ok(buf.len())
-    }
-
-    fn writepage(&self, file_id: FileId, page_offset: u64, buf: &[u8]) -> Result<usize, i32> {
-        use crate::storage::{BLKDEV_REGISTRY, DevId};
-
-        // Extract major/minor from FileId
-        let encoded = file_id.0 & 0x7FFF_FFFF_FFFF_FFFF;
-        let major = ((encoded >> 20) & 0xFFFF) as u16;
-        let minor = (encoded & 0xFFFFF) as u16;
-
-        // Look up the block device
-        let dev_id = DevId { major, minor };
-        let bdev = BLKDEV_REGISTRY.read().get(dev_id).ok_or(-5i32)?; // EIO if device not found
-
-        // Write the page to the block device
-        bdev.disk
-            .queue
-            .driver()
-            .writepage(&bdev.disk, buf, page_offset);
-
-        Ok(buf.len())
-    }
-}
-
-/// Global block device address space ops instance
-pub static BLKDEV_AOPS: BlkdevAddressSpaceOps = BlkdevAddressSpaceOps;
-
 /// A single cached page
 ///
 /// Each page has its own lock (similar to Linux's PG_locked) for synchronizing
@@ -271,6 +215,18 @@ pub struct CachedPage {
     /// Similar to Linux's PG_locked bit / folio_lock().
     /// Must be held when reading from or writing to the page frame.
     locked: AtomicBool,
+
+    /// The page owns its frame (anonymous pipe pages): freed with the
+    /// last `Arc` of it. Page-cache pages are freed by the cache.
+    owns_frame: bool,
+}
+
+impl Drop for CachedPage {
+    fn drop(&mut self) {
+        if self.owns_frame {
+            crate::FRAME_ALLOCATOR.free(self.frame);
+        }
+    }
 }
 
 impl CachedPage {
@@ -284,7 +240,16 @@ impl CachedPage {
             dirty: AtomicBool::new(false),
             writeback: AtomicBool::new(false),
             locked: AtomicBool::new(false),
+            owns_frame: false,
         }
+    }
+
+    /// An anonymous page owning `frame` (pipe buffers): the frame is
+    /// freed when the last reference to the page goes
+    pub fn new_owned(frame: u64) -> Self {
+        let mut p = Self::new(frame, FileId::anonymous(), 0);
+        p.owns_frame = true;
+        p
     }
 
     /// Create a new cached page marked as dirty (initially unlocked)
@@ -297,6 +262,7 @@ impl CachedPage {
             dirty: AtomicBool::new(true),
             writeback: AtomicBool::new(false),
             locked: AtomicBool::new(false),
+            owns_frame: false,
         }
     }
 
@@ -626,10 +592,10 @@ impl AddressSpace {
         self.inner.write().pages.remove(&page_offset)
     }
 
-    /// Remove and return all pages
-    fn take_pages(&self) -> Vec<Arc<CachedPage>> {
-        let pages = core::mem::take(&mut self.inner.write().pages);
-        pages.into_values().collect()
+    /// Remove and return all pages (the index itself: freeing a file
+    /// must not need a large allocation when memory is short)
+    fn take_pages(&self) -> BTreeMap<u64, Arc<CachedPage>> {
+        core::mem::take(&mut self.inner.write().pages)
     }
 
     /// Number of cached pages
@@ -832,6 +798,25 @@ impl PageCache {
         }
     }
 
+    /// Evict a page if the cache is full (Linux would reclaim). Dirty
+    /// pages cannot be written back here (PAGE_CACHE is a spinlock and
+    /// writepage sleeps), so with every evictable page dirty the cache
+    /// may exceed `max_pages` by an eighth until the flusher cleans
+    /// some; past that, ENOMEM. Unevictable (ramfs) pages do not count.
+    fn make_room<FA: FrameAlloc<PhysAddr = u64>>(
+        &mut self,
+        frame_alloc: &mut FA,
+    ) -> Result<(), KernelError> {
+        if self.evictable_pages() < self.max_pages || self.evict_one(frame_alloc).is_ok() {
+            return Ok(());
+        }
+        if self.evictable_pages() < self.max_pages + self.max_pages / 8 {
+            Ok(())
+        } else {
+            Err(KernelError::OutOfMemory)
+        }
+    }
+
     /// Cached pages that count against `max_pages`
     fn evictable_pages(&self) -> usize {
         let all = self.current_pages.load(Ordering::Relaxed);
@@ -886,6 +871,31 @@ impl PageCache {
                 ))
             })
             .clone()
+    }
+
+    /// Drop page `page_offset` of `file_id` after its read from the
+    /// device failed, so it is never served as data (Linux leaves such a
+    /// folio !uptodate). Only if nobody else holds it; otherwise it stays
+    /// zero-filled (new pages are zeroed).
+    pub fn discard_page<FA: FrameAlloc<PhysAddr = u64>>(
+        &mut self,
+        file_id: FileId,
+        page_offset: u64,
+        frame_alloc: &mut FA,
+    ) {
+        let Some(space) = self.address_spaces.get(&file_id) else {
+            return;
+        };
+        let Some(page) = space.find_page(page_offset) else {
+            return;
+        };
+        if space.is_unevictable() || !page.try_claim_for_eviction() {
+            return;
+        }
+        space.remove_page(page_offset);
+        self.fifo_queue.retain(|e| !Arc::ptr_eq(&e.page, &page));
+        frame_alloc.free_frame(page.frame);
+        self.current_pages.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Look up a page in the cache (increments refcount if found)
@@ -974,14 +984,11 @@ impl PageCache {
         unevictable: bool,
         a_ops: &'static dyn AddressSpaceOps,
     ) -> Result<Arc<CachedPage>, KernelError> {
-        // Unevictable pages (ramfs) never take the kernel's reserve
+        // Unevictable pages (ramfs) stop at the low watermark
         if unevictable && frame_alloc.reserve_low() {
             return Err(KernelError::NoSpace);
         }
-        // Check if we need to evict
-        if self.evictable_pages() >= self.max_pages {
-            self.evict_one(frame_alloc)?;
-        }
+        self.make_room(frame_alloc)?;
 
         // Allocate frame
         let frame = frame_alloc.alloc_frame().ok_or(KernelError::OutOfMemory)?;
@@ -1037,22 +1044,13 @@ impl PageCache {
     ///
     /// Finds the oldest evictable page and frees it.
     ///
-    /// A page is evictable if:
-    /// - refcount == 0 (not currently in use), AND
-    /// - page is clean, OR the address space supports writeback
-    ///
-    /// Dirty pages in non-writeback address spaces (e.g., ramfs) are
-    /// NEVER evicted to prevent data loss.
-    ///
-    /// For dirty pages with writeback enabled, calls `a_ops.writepage()`
-    /// to flush the page to backing store before evicting.
+    /// A page is evictable if it is clean, not in use (refcount 0) and
+    /// its address space is evictable (ramfs pages never are).
     ///
     /// ## Locking Context
     ///
-    /// - Called with PAGE_CACHE lock held (self)
-    /// - Acquires per-page lock during writeback
-    /// - `a_ops.writepage()` is called with PAGE_CACHE held but this is safe
-    ///   because a_ops must not acquire PAGE_CACHE (would deadlock)
+    /// Called with PAGE_CACHE held: dirty pages are skipped, never
+    /// written back here (writepage sleeps on block I/O).
     ///
     /// Uses compare-and-swap to atomically claim pages for eviction,
     /// preventing races with concurrent get() operations.
@@ -1075,75 +1073,17 @@ impl PageCache {
                     continue;
                 }
 
-                // Check dirty status and get address space info
-                let (can_evict, needs_writeback, a_ops) = if entry.page.is_dirty() {
-                    // Dirty page: only evict if writeback is possible
-                    if let Some(addr_space) = self.address_spaces.get(&entry.key.file_id) {
-                        if addr_space.can_writeback() {
-                            (true, true, Some(addr_space.a_ops))
-                        } else {
-                            // Dirty page without writeback = never evict
-                            (false, false, None)
-                        }
-                    } else {
-                        (false, false, None)
-                    }
-                } else {
-                    // Clean page: always evictable, no writeback needed
-                    (true, false, None)
-                };
-
-                if !can_evict {
-                    // Cannot evict dirty page without writeback, move to back
+                // Dirty pages are never written back here: writepage
+                // does block I/O, which sleeps, and PAGE_CACHE is a
+                // spinlock. The flusher and fsync clean them (no
+                // PAGE_CACHE held); until then they stay.
+                if entry.page.is_dirty() || !entry.page.try_claim_for_eviction() {
                     self.fifo_queue.push_back(entry);
                     attempts += 1;
                     continue;
                 }
 
-                // Try to atomically claim the page for eviction
-                // This uses CAS to prevent race with concurrent get()
-                if !entry.page.try_claim_for_eviction() {
-                    // Page is in use, move to back of queue
-                    self.fifo_queue.push_back(entry);
-                    attempts += 1;
-                    continue;
-                }
-
-                // Perform writeback if needed
-                if needs_writeback && let Some(a_ops) = a_ops {
-                    // Lock the page for I/O
-                    entry.page.lock();
-
-                    // Copy page content to temporary buffer
-                    let mut buf = [0u8; PAGE_SIZE];
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            crate::arch::phys_to_virt(entry.page.frame) as *const u8,
-                            buf.as_mut_ptr(),
-                            PAGE_SIZE,
-                        );
-                    }
-
-                    // Call filesystem writepage
-                    // Note: a_ops must not acquire PAGE_CACHE (would deadlock)
-                    let result = a_ops.writepage(entry.key.file_id, entry.key.page_offset, &buf);
-
-                    entry.page.unlock();
-
-                    if result.is_err() {
-                        // Writeback failed, put page back in queue
-                        // Reset the claim (allow future attempts)
-                        entry.page.unclaim_eviction();
-                        self.fifo_queue.push_back(entry);
-                        attempts += 1;
-                        continue;
-                    }
-
-                    // Mark page clean after successful writeback
-                    entry.page.mark_clean();
-                }
-
-                // Successfully claimed and (if needed) written back - evict
+                // Successfully claimed - evict
                 if let Some(addr_space) = self.address_spaces.get(&entry.key.file_id) {
                     addr_space.remove_page(entry.key.page_offset);
                 }
@@ -1163,11 +1103,11 @@ impl PageCache {
     fn free_unevictable<FA: FrameAlloc<PhysAddr = u64>>(
         &self,
         space: &AddressSpace,
-        pages: Vec<Arc<CachedPage>>,
+        pages: BTreeMap<u64, Arc<CachedPage>>,
         frame_alloc: &mut FA,
     ) -> usize {
         let n = pages.len();
-        for p in pages {
+        for p in pages.into_values() {
             frame_alloc.put_frame(p.frame);
         }
         self.account(Some(space), n, false);
@@ -1204,14 +1144,11 @@ impl PageCache {
         unevictable: bool,
         a_ops: &'static dyn AddressSpaceOps,
     ) -> Result<Arc<CachedPage>, KernelError> {
-        // Unevictable pages (ramfs) never take the kernel's reserve
+        // Unevictable pages (ramfs) stop at the low watermark
         if unevictable && frame_alloc.reserve_low() {
             return Err(KernelError::NoSpace);
         }
-        // Check if we need to evict
-        if self.evictable_pages() >= self.max_pages {
-            self.evict_one(frame_alloc)?;
-        }
+        self.make_room(frame_alloc)?;
 
         // Allocate frame
         let frame = frame_alloc.alloc_frame().ok_or(KernelError::OutOfMemory)?;
@@ -1343,26 +1280,12 @@ impl PageCache {
             None => return 0,
         };
 
-        // Collect page offsets to remove (those >= from_page_offset)
-        let pages_to_remove: alloc::vec::Vec<u64> = {
-            let inner = addr_space.inner.read();
-            inner
-                .pages
-                .keys()
-                .filter(|&&offset| offset >= from_page_offset)
-                .cloned()
-                .collect()
-        };
-
-        if pages_to_remove.is_empty() {
+        // Detach the pages at and past the offset (no allocation sized
+        // by the file: truncation must work when memory is short)
+        let removed = addr_space.inner.write().pages.split_off(&from_page_offset);
+        if removed.is_empty() {
             return 0;
         }
-
-        // Remove pages from address space
-        let removed: Vec<Arc<CachedPage>> = pages_to_remove
-            .iter()
-            .filter_map(|&offset| addr_space.remove_page(offset))
-            .collect();
         if addr_space.is_unevictable() {
             return self.free_unevictable(&addr_space, removed, frame_alloc);
         }

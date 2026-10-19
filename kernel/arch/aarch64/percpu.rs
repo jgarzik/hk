@@ -3,12 +3,11 @@
 //! This module provides per-CPU data storage accessed via the TPIDR_EL1 register.
 //! Each CPU has its own `PerCpu` structure containing CPU-local state.
 
-use crate::task::CurrentTask;
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-/// Maximum number of CPUs supported
-pub const MAX_CPUS: usize = 16;
+/// Per-CPU data slots (logical CPU ids are below this)
+pub const MAX_CPUS: usize = crate::cpumask::NR_CPUS;
 
 /// Per-CPU data structure
 ///
@@ -37,8 +36,9 @@ pub struct PerCpu {
     /// Timer tick count for this CPU
     pub ticks: AtomicU64,
 
-    /// Currently running task TID (0 = none/idle)
-    pub current_tid: AtomicU32,
+    /// The running task (`*const KernelTask`; 0: the boot task,
+    /// `task::percpu::INIT_TASK`), set by the scheduler at each switch
+    pub curr: AtomicUsize,
 
     /// Flag set by timer interrupt to request reschedule
     pub needs_reschedule: AtomicBool,
@@ -48,9 +48,6 @@ pub struct PerCpu {
 
     /// Preemption count - tracks nested critical sections
     pub preempt_count: AtomicU32,
-
-    /// Current task state including credentials
-    pub current_task: CurrentTask,
 
     /// Saved user ELR from syscall entry
     pub syscall_user_elr: u64,
@@ -156,11 +153,10 @@ impl PerCpu {
             is_online: AtomicBool::new(false),
             kernel_stack_top: 0,
             ticks: AtomicU64::new(0),
-            current_tid: AtomicU32::new(0),
+            curr: AtomicUsize::new(0),
             needs_reschedule: AtomicBool::new(false),
             interrupt_depth: AtomicU32::new(0),
             preempt_count: AtomicU32::new(0),
-            current_task: CurrentTask::new(),
             syscall_user_elr: 0,
             syscall_user_spsr: 0,
             syscall_user_sp: 0,
@@ -179,15 +175,10 @@ impl PerCpu {
         self.is_bsp = is_bsp;
         self.kernel_stack_top = kernel_stack_top;
         self.ticks.store(0, Ordering::Relaxed);
-        self.current_tid.store(0, Ordering::Relaxed);
+        self.curr.store(0, Ordering::Relaxed);
         self.needs_reschedule.store(false, Ordering::Relaxed);
         self.interrupt_depth.store(0, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
-        // Note: For APs, current_task was already zeroed in uninit()
-        // Only BSP needs to reinitialize it here
-        if is_bsp {
-            self.current_task = CurrentTask::new();
-        }
         self.syscall_user_elr = 0;
         self.syscall_user_spsr = 0;
         self.syscall_user_sp = 0;
@@ -248,6 +239,11 @@ pub fn write_tpidr_el0(value: u64) {
     }
 }
 
+/// TPIDR_EL0 takes any value (Linux copy_thread, tls_set)
+pub fn tpidr_ok(_val: u64) -> bool {
+    true
+}
+
 /// Read the TPIDR_EL0 register (user TLS pointer)
 #[inline]
 pub fn read_tpidr_el0() -> u64 {
@@ -297,6 +293,7 @@ pub fn init_bsp(mpidr: u64, kernel_stack_top: u64) {
 
     // Set TPIDR_EL1 to point to our per-CPU data
     set_tpidr_el1(percpu as *mut PerCpu as u64);
+    crate::task::percpu::PERCPU_UP.store(true, Ordering::Release);
 
     // Mark BSP as online
     percpu.set_online();

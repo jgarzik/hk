@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 
 use crate::frame_alloc::FrameAllocRef;
 use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
+use crate::storage::blkdev::{BioOp, bdev_rw_frame, bdev_rw_page};
 use crate::storage::{BlockDevice, DevId, get_blkdev};
 use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
 
@@ -50,12 +51,7 @@ impl AddressSpaceOps for VfatAddressSpaceOps {
         let (major, minor) = file_id.to_blkdev().ok_or(-5)?; // EIO if not blkdev
         let bdev = get_blkdev(DevId::new(major, minor)).ok_or(-5)?;
 
-        // Read from block device (new slice-based API)
-        bdev.disk
-            .queue
-            .driver()
-            .readpage(&bdev.disk, buf, page_offset);
-
+        bdev_rw_page(&bdev, BioOp::Read, page_offset, buf).map_err(|_| -5)?;
         Ok(PAGE_SIZE)
     }
 
@@ -64,12 +60,8 @@ impl AddressSpaceOps for VfatAddressSpaceOps {
         let (major, minor) = file_id.to_blkdev().ok_or(-5)?; // EIO if not blkdev
         let bdev = get_blkdev(DevId::new(major, minor)).ok_or(-5)?;
 
-        // Write to block device (new slice-based API)
-        bdev.disk
-            .queue
-            .driver()
-            .writepage(&bdev.disk, buf, page_offset);
-
+        let mut tmp = buf.to_vec();
+        bdev_rw_page(&bdev, BioOp::Write, page_offset, &mut tmp).map_err(|_| -5)?;
         Ok(PAGE_SIZE)
     }
 }
@@ -168,7 +160,7 @@ impl VfatFileAddressSpaceOps {
         let data_start_sector = fat_start_sector + (fat_sectors * num_fats);
 
         Ok(VfatSbData {
-            bdev: Arc::new(BlockDevice::new(bdev.disk.clone())), // Temporary Arc, just for data
+            bdev: bdev.clone(),
             bytes_per_sector,
             sectors_per_cluster,
             fat_start_sector,
@@ -473,6 +465,20 @@ fn decode_vfat_file_id(file_id: FileId) -> Option<(u8, u8, u32)> {
 // Block Device I/O
 // ============================================================================
 
+/// Fill a new block device page cache frame from the device; on a read
+/// error the page is dropped from the cache, not left there as data
+fn read_frame(bdev: &BlockDevice, page_offset: u64, frame: u64) -> Result<(), KernelError> {
+    let sector = page_offset * (PAGE_SIZE as u64 / 512);
+    let r = bdev_rw_frame(bdev, BioOp::Read, sector, frame);
+    if r.is_err() {
+        let id = FileId::from_blkdev(bdev.dev_id().major, bdev.dev_id().minor);
+        PAGE_CACHE
+            .lock()
+            .discard_page(id, page_offset, &mut FrameAllocRef(&FRAME_ALLOCATOR));
+    }
+    r
+}
+
 /// Read bytes from block device via page cache
 fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), KernelError> {
     let file_id = FileId::from_blkdev(bdev.dev_id().major, bdev.dev_id().minor);
@@ -509,13 +515,7 @@ fn read_bytes(bdev: &BlockDevice, offset: u64, buf: &mut [u8]) -> Result<(), Ker
 
         // Read from block device AFTER releasing the lock
         if needs_read {
-            let page_buf = unsafe {
-                core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(frame), PAGE_SIZE)
-            };
-            bdev.disk
-                .queue
-                .driver()
-                .readpage(&bdev.disk, page_buf, page_offset);
+            read_frame(bdev, page_offset, frame)?;
         }
 
         // Copy data from page to buffer
@@ -577,13 +577,7 @@ fn write_bytes(bdev: &BlockDevice, offset: u64, buf: &[u8]) -> Result<(), Kernel
 
         // If this is a partial page write and the page is new, read existing data first
         if needs_read && (offset_in_page != 0 || chunk_size != PAGE_SIZE) {
-            let page_buf = unsafe {
-                core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(page.frame), PAGE_SIZE)
-            };
-            bdev.disk
-                .queue
-                .driver()
-                .readpage(&bdev.disk, page_buf, page_offset);
+            read_frame(bdev, page_offset, page.frame)?;
         }
 
         // Write data to page
@@ -2230,8 +2224,9 @@ impl InodeOps for VfatInodeOps {
         new_name: &str,
         flags: u32,
     ) -> Result<(), KernelError> {
-        // RENAME_EXCHANGE not supported for FAT
-        if flags != 0 {
+        // The VFS has checked RENAME_NOREPLACE; RENAME_EXCHANGE (Linux
+        // vfat_rename_exchange) is not supported yet, whiteouts never
+        if flags & !super::link::RENAME_NOREPLACE != 0 {
             return Err(KernelError::InvalidArgument);
         }
 
@@ -2347,6 +2342,15 @@ pub struct VfatFileOps;
 impl FileOps for VfatFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
         self
+    }
+
+    /// Regular files map their data (Linux generic_file_mmap);
+    /// directories have no mmap
+    fn mmap(&self, file: &File) -> Result<(), KernelError> {
+        match file.get_inode() {
+            Some(i) if i.mode().is_dir() => Err(KernelError::NoDevice),
+            _ => Ok(()),
+        }
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {

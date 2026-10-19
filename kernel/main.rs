@@ -13,7 +13,9 @@ extern crate alloc;
 pub mod acct;
 pub mod bus;
 pub mod chardev;
+pub mod completion;
 pub mod console;
+pub mod cpu;
 pub mod cpumask;
 pub mod dma;
 pub mod elf;
@@ -24,6 +26,7 @@ pub mod futex;
 pub mod inotify;
 pub mod io_uring;
 pub mod kcmp;
+pub mod list;
 pub mod pidfd;
 pub mod pipe;
 pub mod poll;
@@ -92,15 +95,12 @@ type CurrentArch = crate::arch::aarch64::Aarch64Arch;
 use crate::arch::ArchBusOps;
 use crate::arch::{
     AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps,
-    MemoryLayoutOps, PerCpuOps, PowerOps, SmpOps, TimekeeperOps, TimerCallbackOps, VfsInitOps,
-    phys_to_virt, virt_to_phys,
+    MemoryLayoutOps, PowerOps, SmpOps, TimekeeperOps, VfsInitOps, phys_to_virt,
 };
 use crate::arch::{SchedArch, SyscallOps, UserModeOps};
 
 // Page table type alias (used by ELF loading)
 type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
-
-use heap::HeapAllocator;
 
 use crate::dma::{DirectDmaOps, dma_init};
 use crate::mm::page_cache::{FileId, NULL_AOPS, PAGE_SIZE as PC_PAGE_SIZE, PageCache};
@@ -110,152 +110,16 @@ use fs::inode::AsAny; // Trait needed for .as_any() on dyn InodeData
 
 use crate::sync::spin::Mutex;
 
-// Memory layout constants - x86_64
-// The heap starts at 4MB or above the multiboot2 modules and info (GRUB
-// places them right after the kernel image), whichever is higher, and
-// ends at 18MB where the frame allocator starts (`x86_64_heap`)
-#[cfg(target_arch = "x86_64")]
-const KERNEL_HEAP_START: usize = 0x400000; // 4MB
-#[cfg(target_arch = "x86_64")]
-const KERNEL_HEAP_SIZE: usize = 0xE00000; // 14MB (up to 18MB where frame allocator starts)
-
-/// The kernel image in physical memory (start and end symbols in kernel.ld)
-fn kernel_range() -> heap::BootRange {
-    unsafe extern "C" {
-        static __kernel_start: u8;
-        static __kernel_end: u8;
-    }
-    heap::BootRange {
-        name: "kernel image",
-        start: virt_to_phys(&raw const __kernel_start as u64) as usize,
-        end: virt_to_phys(&raw const __kernel_end as u64) as usize,
-    }
-}
-
-/// Boot data the x86 heap must avoid: kernel image, multiboot info and
-/// modules (up to 7; more panics rather than going unchecked)
-#[cfg(target_arch = "x86_64")]
-fn x86_64_boot_ranges(multiboot_info: u64) -> [heap::BootRange; 8] {
-    let none = heap::BootRange {
-        name: "",
-        start: 0,
-        end: 0,
-    };
-    let mut busy = [none; 8];
-    busy[0] = kernel_range();
-    let mut n = 1;
-    let mut add = |name, start: u64, end: u64| {
-        assert!(n < busy.len(), "too many multiboot modules");
-        busy[n] = heap::BootRange {
-            name,
-            start: start as usize,
-            end: end as usize,
-        };
-        n += 1;
-    };
-    unsafe { multiboot2::boot_ranges(multiboot_info, &mut add) };
-    busy
-}
-
-/// x86 heap (start, size): never over the boot modules, which are read
-/// after the heap is in use (a fixed 4MB start broke once kernel +
-/// initramfs + vfat image passed 4MB); ends where frames start
-#[cfg(target_arch = "x86_64")]
-fn x86_64_heap(multiboot_info: u64) -> (usize, usize) {
-    const MIN: usize = 0x400000;
-    let end = KERNEL_HEAP_START + KERNEL_HEAP_SIZE;
-    let busy = x86_64_boot_ranges(multiboot_info);
-    // Above all boot data: the heap runs to a fixed end, so a gap
-    // below a module could not hold it anyway
-    let top = busy.iter().map(|r| r.end).max().unwrap_or(0);
-    let start = heap::place(KERNEL_HEAP_START.max(top), MIN, 4096, &busy);
-    assert!(
-        start + MIN <= end,
-        "boot modules leave no room for the heap"
-    );
-    for r in &busy {
-        heap::check(start, end, r);
-    }
-    (start, end - start)
-}
-
-// Memory layout constants - aarch64
-// QEMU virt loads the kernel at 0x40100000 with the DTB below it; the
-// heap goes at the first 2MB boundary past the kernel image that also
-// misses the DTB and any initrd (`aarch64_heap`); the frame allocator
-// starts at the heap end (`HEAP_END`)
-#[cfg(target_arch = "aarch64")]
-const KERNEL_HEAP_SIZE: usize = 0x0100_0000; // 16MB
-
-/// End of the heap: the aarch64 frame allocator starts here
-#[cfg(target_arch = "aarch64")]
-pub static HEAP_END: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// Boot data the aarch64 heap must avoid: kernel image, DTB, initrd
-#[cfg(target_arch = "aarch64")]
-fn aarch64_boot_ranges(dtb: u64) -> [heap::BootRange; 3] {
-    let none = heap::BootRange {
-        name: "",
-        start: 0,
-        end: 0,
-    };
-    let fdt = match arch::aarch64::dtb::total_size(dtb) {
-        Some(n) => heap::BootRange {
-            name: "DTB",
-            start: dtb as usize,
-            end: dtb as usize + n,
-        },
-        None => none,
-    };
-    let initrd = match arch::aarch64::dtb::extract_initramfs(dtb) {
-        Some(i) => heap::BootRange {
-            name: "initrd",
-            start: i.start as usize,
-            end: i.end as usize,
-        },
-        None => none,
-    };
-    [kernel_range(), fdt, initrd]
-}
-
-/// aarch64 heap (start, size) computed from the linked kernel end, so
-/// kernel growth can never silently run into it
-#[cfg(target_arch = "aarch64")]
-fn aarch64_heap(dtb: u64) -> (usize, usize) {
-    let busy = aarch64_boot_ranges(dtb);
-    let start = heap::place(busy[0].end, KERNEL_HEAP_SIZE, 0x20_0000, &busy);
-    let end = start + KERNEL_HEAP_SIZE;
-    for r in &busy {
-        heap::check(start, end, r);
-    }
-    HEAP_END.store(end, core::sync::atomic::Ordering::Relaxed);
-    (start, KERNEL_HEAP_SIZE)
-}
-
-/// Kernel heap allocator (host unit tests use the std allocator)
+/// Kernel heap: boot arena, then slab (host unit tests use the std
+/// allocator)
 #[cfg_attr(not(test), global_allocator)]
-static ALLOCATOR: HeapAllocator = HeapAllocator::new();
-
-/// The kernel heap is down to the 2MB kept for the kernel when user
-/// data grows (ramfs pages also cost heap: page descriptors and cache
-/// indexes)
-#[cfg(not(test))]
-pub fn heap_low() -> bool {
-    const HEAP_RESERVE: usize = 2 * 1024 * 1024;
-    ALLOCATOR.free_bytes() < HEAP_RESERVE
-}
-
-#[cfg(test)]
-pub fn heap_low() -> bool {
-    false
-}
+static ALLOCATOR: heap::KernelAlloc = heap::KernelAlloc::new();
 
 /// Global page cache (1024 evictable pages = 4MB max)
 static PAGE_CACHE: Mutex<PageCache> = Mutex::new(PageCache::new(1024));
 
 /// Global frame allocator
-static FRAME_ALLOCATOR: frame_alloc::BitmapFrameAllocator =
-    frame_alloc::BitmapFrameAllocator::new();
+static FRAME_ALLOCATOR: frame_alloc::FrameAllocator = frame_alloc::FrameAllocator::new();
 
 /// Global DMA operations (direct mapping backend)
 static DIRECT_DMA_OPS: DirectDmaOps = DirectDmaOps::new(&FRAME_ALLOCATOR);
@@ -316,12 +180,6 @@ pub extern "C" fn _start(multiboot_info: u64) -> ! {
         cmdline::parse_cmdline(cmdline);
     }
 
-    // Initialize heap allocator
-    let (heap_start, heap_size) = x86_64_heap(multiboot_info);
-    unsafe {
-        ALLOCATOR.init(phys_to_virt(heap_start as u64) as usize, heap_size);
-    }
-
     // Initialize architecture-specific code (GDT, IDT, PIC, PIT)
     CurrentArch::early_init();
 
@@ -363,14 +221,8 @@ pub extern "C" fn _start_rust(dtb_ptr: u64) -> ! {
     // Initialize architecture (CPU features, RTC, etc.)
     CurrentArch::early_init();
 
-    // Initialize heap allocator
-    let (heap_start, heap_size) = aarch64_heap(unsafe { DTB_PTR });
-    unsafe {
-        ALLOCATOR.init(phys_to_virt(heap_start as u64) as usize, heap_size);
-    }
-
-    // Final kernel page tables (linear map of all RAM; parsing the DTB
-    // needs the heap)
+    // Final kernel page tables (linear map of all RAM, which goes to
+    // memblock)
     unsafe { crate::arch::aarch64::kmap::init(DTB_PTR) };
 
     // Extract and parse kernel command line from DTB /chosen/bootargs
@@ -644,8 +496,7 @@ where
 ///
 /// Falls back to single-node topology if no NUMA info is available.
 fn init_numa_topology() {
-    let (_alloc_base, alloc_size) = CurrentArch::get_frame_alloc_region();
-    let total_pages = alloc_size / 4096;
+    let total_pages = mm::memblock::MEMBLOCK.lock().memory.total() / 4096;
     let nr_cpus = 1; // Will be updated when SMP is initialized
 
     #[cfg(target_arch = "x86_64")]
@@ -718,8 +569,8 @@ fn discover_boot_framebuffer() {
             info.pitch
         );
 
-        // Reserve framebuffer memory so frame allocator doesn't use it
-        FRAME_ALLOCATOR.mark_used(info.phys_addr, info.size);
+        // Keep it from the frame allocator (when it is in RAM)
+        mm::memblock::reserve(info.phys_addr, info.size);
 
         // Store for later use by graphics subsystem
         BOOT_FRAMEBUFFER.call_once(|| info);
@@ -732,22 +583,20 @@ fn kmain() -> ! {
     // Phase 1: Memory Subsystem
     // ========================================================================
 
-    // Get memory layout from arch (multiboot2 on x86, DTB/hardcoded on arm)
-    let (alloc_base, alloc_size) = CurrentArch::get_frame_alloc_region();
-    printkln!("MEM: {} MB", alloc_size / (1024 * 1024));
-
-    // Initialize frame allocator; its metadata overwrites the start of
-    // the region, which must hold no boot data
-    let meta_end = alloc_base + frame_alloc::BitmapFrameAllocator::meta_size(alloc_size);
-    CurrentArch::for_each_reserved(&mut |start, end| {
-        assert!(
-            end <= alloc_base || start >= meta_end,
-            "boot data {start:#x}-{end:#x} under frame metadata"
-        );
-    });
-    FRAME_ALLOCATOR.init(alloc_base, alloc_size);
-    FRAME_ALLOCATOR.mark_used(0, alloc_base);
-    CurrentArch::for_each_reserved(&mut |start, end| FRAME_ALLOCATOR.mark_used(start, end - start));
+    // Firmware memory map and boot reservations (multiboot2 on x86,
+    // DTB on arm), then every free range goes to the frame allocator
+    CurrentArch::memblock_init();
+    discover_boot_framebuffer();
+    let (lo, hi) = mm::memblock::MEMBLOCK.lock().span();
+    mm::page::vmemmap_init();
+    FRAME_ALLOCATOR.init(lo, hi - lo);
+    mm::memblock::MEMBLOCK
+        .lock()
+        .for_each_free(|start, end| FRAME_ALLOCATOR.free_range(start, end));
+    FRAME_ALLOCATOR.init_done();
+    printkln!("MEM: boot arena {} kB in use", ALLOCATOR.arena_used() >> 10);
+    ALLOCATOR.slab_ready();
+    printkln!("MEM: {} MB", FRAME_ALLOCATOR.stats().total_bytes >> 20);
 
     // Initialize DMA subsystem (uses frame allocator)
     dma_init(&DIRECT_DMA_OPS);
@@ -764,13 +613,6 @@ fn kmain() -> ! {
     // Initialize NUMA topology from firmware (ACPI SRAT on x86, DTB numa-node-id on arm)
     // This must happen after ioremap_init but before SMP init
     init_numa_topology();
-
-    // ========================================================================
-    // Phase 1c: Graphics Framebuffer Discovery
-    // ========================================================================
-    // Discover boot framebuffer from firmware (multiboot2 on x86, DTB on arm)
-    // This must happen after ioremap_init but before we heavily use the frame allocator
-    discover_boot_framebuffer();
 
     // ========================================================================
     // Phase 2: Exception/Interrupt Subsystem
@@ -810,6 +652,7 @@ fn kmain() -> ! {
                 CurrentArch::set_bsp_cpu_id(&mut acpi_info, bsp_id);
 
                 let online = CurrentArch::smp_init(&acpi_info, &mut frame_alloc);
+                smp::init(online as u32);
 
                 // Calibrate and start local timer (10ms interval)
                 let ticks_per_ms = CurrentArch::calibrate_and_start_timer(
@@ -829,26 +672,17 @@ fn kmain() -> ! {
                     crate::random::init();
                 }
 
-                // Set up timer preemption callback
-                unsafe {
-                    CurrentArch::set_timer_preempt_callback(task::percpu::maybe_preempt);
-                }
-
                 // Enable APs to start their timers and participate in scheduling
                 CurrentArch::enable_ap_scheduling();
 
                 // This CPU answers IPIs once it takes interrupts (its
                 // first task enables them)
-                smp::set_active(task::percpu::current_cpu());
+                smp::set_active(crate::cpu::this_id());
             }
         }
     } else {
         printkln!("SMP: Platform discovery failed (ACPI/device tree)");
     }
-
-    // Initialize platform drivers (legacy registry)
-    let mut driver_registry = crate::bus::DriverRegistry::new();
-    crate::bus::register_drivers(&mut driver_registry);
 
     // Initialize network subsystem (sets up loopback, static IP config)
     crate::net::init();
@@ -890,6 +724,7 @@ fn kmain() -> ! {
     bus_manager.register_driver("pci", Box::new(E1000PciDriver));
     bus_manager.register_driver("pci", Box::new(crate::virtio::VirtioPciDriver));
     crate::virtio::register_driver(&crate::net::driver::virtio_net::VIRTIO_NET);
+    crate::virtio::register_driver(&crate::virtio::blk::VIRTIO_BLK);
 
     // Register USB drivers (queued until USB bus is created by xHCI)
     bus_manager.register_driver("usb", Box::new(UsbSerialBusDriver));
@@ -900,19 +735,10 @@ fn kmain() -> ! {
     // PCI enumerate → xHCI matched → USB bus created → USB-Serial/USB-MSC matched
     bus_manager.enumerate_all(&mut frame_alloc);
 
-    // Create SCSI disk from USB MSC device if present
-    let scsi_disk_created = if let Some(handle) = bus_manager.find_device::<UsbMscDeviceHandle>() {
-        let scsi_host = handle.scsi_host();
-        match crate::storage::create_scsi_disk(scsi_host, 0, 0, 0) {
-            Ok(bdev) => {
-                ::core::mem::forget(bdev);
-                true
-            }
-            Err(_) => false,
-        }
-    } else {
-        false
-    };
+    // SCSI disk (sda) from a USB MSC device, if present
+    if let Some(handle) = bus_manager.find_device::<UsbMscDeviceHandle>() {
+        let _ = crate::storage::create_scsi_disk(handle.scsi_host(), 0, 0);
+    }
 
     // ========================================================================
     // Phase 5: VFS Initialization
@@ -926,7 +752,7 @@ fn kmain() -> ! {
     // Phase 6: Initramfs Unpacking
     // ========================================================================
     let initramfs_data = CurrentArch::get_initramfs();
-    let root_dentry = fs::init_mnt_ns()
+    let root_dentry = crate::ns::init_mnt_ns()
         .get_root_dentry()
         .expect("VFS root not initialized");
     match fs::unpack_cpio(initramfs_data, &root_dentry) {
@@ -935,13 +761,6 @@ fn kmain() -> ! {
             printkln!("ERR: initramfs: {:?}", e);
             CurrentArch::halt_loop();
         }
-    }
-
-    // Create /dev/sd0 device node if SCSI disk was created
-    if scsi_disk_created {
-        let dev_dentry = fs::lookup_path("/dev").expect("/dev must exist");
-        let rdev = crate::storage::DevId::new(crate::storage::major::SCSI_DISK, 0);
-        let _ = fs::ramfs::ramfs_create_blkdev(&dev_dentry, "sd0", rdev, 0o660);
     }
 
     // ========================================================================
@@ -1122,14 +941,12 @@ fn kmain() -> ! {
     // This must be done before creating the user task
     task::percpu::init(&mut frame_alloc);
 
-    // Register user task with scheduler (pid=1, tid=2)
-    // Note: idle task has tid=1, pid=0 (kernel swapper convention)
-    // Init process: ppid=0 (no parent), pgid=sid=0 like Linux's init_task
-    // (init/init_task.c); init calls setsid() itself if it wants a session
+    // Register init with the scheduler: pid 1 (the idle tasks are tid 0,
+    // Linux swapper). ppid=0 (no parent), pgid=sid=0 like Linux's
+    // init_task (init/init_task.c); init calls setsid() itself if it
+    // wants a session
 
-    task::percpu::create_user_task(task::percpu::UserTaskConfig {
-        pid: 1,  // init process (PID 1)
-        tid: 2,  // tid=2 since idle task has tid=1
+    let init_tid = task::percpu::create_user_task(task::percpu::UserTaskConfig {
         ppid: 0, // init has no parent
         pgid: 0, // inherited from init_task, not a group leader
         sid: 0,  // not a session leader until setsid()
@@ -1140,14 +957,15 @@ fn kmain() -> ! {
     })
     .expect("Failed to create user task");
 
-    // Initialize brk for the init task (tid=2)
+    // Initialize brk for the init task
     // This must be done after create_user_task which creates a default mm
-    if let Some(mm) = mm::get_task_mm(2) {
-        let mut m = mm.lock();
+    if let Some(mm) = mm::get_task_mm(init_tid) {
+        let mut m = mm.mmap_write();
         m.set_brk(start_brk);
         m.set_exe(alloc::string::String::from("/bin/init"));
+        m.set_args(task::exec::image_layout(&elf, base_addr));
         let stack_bottom = USER_STACK_TOP - USER_STACK_PAGES as u64 * PAGE_SIZE;
-        for vma in task::exec::image_vmas(&mm, &elf, base_addr, stack_bottom) {
+        for vma in task::exec::image_vmas(&elf, base_addr, stack_bottom) {
             m.insert_vma(vma);
         }
     }
@@ -1163,10 +981,6 @@ fn kmain() -> ! {
     crate::workqueue::init();
     crate::net::start_threads();
     crate::selftest::start();
-
-    // Set per-CPU current task state
-    // tid=2, pid=1, ppid=0, pgid=1, sid=1 (init process)
-    task::percpu::set_current_task(2, 1, 0, 0, 0, task::Cred::ROOT);
 
     // stdin/stdout/stderr of init: /dev/console (Linux kernel_init)
     fs::open::console_on_rootfs();
@@ -1193,7 +1007,7 @@ fn kmain() -> ! {
     }
 
     // Load init's address space (its task holds the mm reference)
-    match mm::get_task_mm(2) {
+    match mm::get_task_mm(init_tid) {
         Some(mm) => mm::tlb::switch_mm(Some(&mm)),
         None => panic!("init has no address space"),
     }
@@ -1211,10 +1025,7 @@ const DEFAULT_RAMDISK_SIZE_MB: u64 = 8;
 fn init_vfs_core() {
     use crate::chardev::DevId;
     use crate::storage::create_ramdisk;
-    use crate::storage::major;
-    use fs::{
-        PROCFS_TYPE, RAMFS_TYPE, do_mount, init_fs_registry, ramfs_create_blkdev, ramfs_create_dir,
-    };
+    use fs::{PROCFS_TYPE, RAMFS_TYPE, do_mount, init_fs_registry, ramfs_create_dir};
 
     init_fs_registry();
 
@@ -1249,56 +1060,27 @@ fn init_vfs_core() {
     // Register TTY character devices (serial, etc.)
     crate::tty::init_tty_chardevs();
 
-    // Create character device nodes in /dev
+    // Device nodes: in devtmpfs, and the console's in the root's /dev
+    // (opened for init before anything mounts devtmpfs; Linux needs
+    // /dev/console in the initramfs)
+    fs::devtmpfs::init();
     use crate::chardev::major as chardev_major;
-
-    // /dev/null (major 1, minor 3)
-    let _ = fs::ramfs_create_chrdev(
-        &dev_dentry,
-        "null",
-        DevId::new(chardev_major::MEM, 3),
-        0o666,
-    );
-
-    // /dev/zero (major 1, minor 5)
-    let _ = fs::ramfs_create_chrdev(
-        &dev_dentry,
-        "zero",
-        DevId::new(chardev_major::MEM, 5),
-        0o666,
-    );
-
-    // /dev/ttyS0 (major 4, minor 64) - only create if TTY is registered
+    let mut nodes = alloc::vec![
+        ("null", DevId::new(chardev_major::MEM, 3), 0o666),
+        ("zero", DevId::new(chardev_major::MEM, 5), 0o666),
+        ("tty", DevId::new(chardev_major::TTYAUX, 0), 0o666),
+        ("console", DevId::new(chardev_major::TTYAUX, 1), 0o666),
+    ];
     if crate::chardev::get_chardev(DevId::new(chardev_major::TTYS, 64)).is_some() {
-        let _ = fs::ramfs_create_chrdev(
-            &dev_dentry,
-            "ttyS0",
-            DevId::new(chardev_major::TTYS, 64),
-            0o666,
-        );
+        nodes.push(("ttyS0", DevId::new(chardev_major::TTYS, 64), 0o666));
+    }
+    for (name, dev, mode) in nodes {
+        let _ = fs::ramfs_create_chrdev(&dev_dentry, name, dev, mode);
+        fs::devtmpfs::device_add(name, dev, false, mode);
     }
 
-    // /dev/tty (major 5, minor 0) - controlling terminal
-    let _ = fs::ramfs_create_chrdev(
-        &dev_dentry,
-        "tty",
-        DevId::new(chardev_major::TTYAUX, 0),
-        0o666,
-    );
-
-    // /dev/console (major 5, minor 1) - kernel console
-    let _ = fs::ramfs_create_chrdev(
-        &dev_dentry,
-        "console",
-        DevId::new(chardev_major::TTYAUX, 1),
-        0o666,
-    );
-
-    // Create RAM disk rd0 (8MB)
-    if let Ok(_bdev) = create_ramdisk(0, DEFAULT_RAMDISK_SIZE_MB) {
-        let rdev = DevId::new(major::RAMDISK, 0);
-        let _ = ramfs_create_blkdev(&dev_dentry, "rd0", rdev, 0o660);
-    }
+    // RAM disk rd0 (8MB)
+    let _ = create_ramdisk(0, DEFAULT_RAMDISK_SIZE_MB);
 
     printkln!("VFS: ok");
 }
@@ -1316,12 +1098,10 @@ fn init_vfs_core() {
 #[cfg(target_arch = "x86_64")]
 pub fn init_vfat_ramdisk(
     root_dentry: &alloc::sync::Arc<fs::Dentry>,
-    dev_dentry: &alloc::sync::Arc<fs::Dentry>,
+    _dev_dentry: &alloc::sync::Arc<fs::Dentry>,
 ) {
-    use crate::chardev::DevId;
     use crate::storage::create_ramdisk_from_data;
-    use crate::storage::major;
-    use fs::{ramfs_create_blkdev, ramfs_create_dir};
+    use fs::ramfs_create_dir;
 
     // Look for vfat module loaded by bootloader
     let vfat_data = match unsafe { multiboot2::find_module(MULTIBOOT2_INFO, "vfat") } {
@@ -1329,11 +1109,8 @@ pub fn init_vfat_ramdisk(
         None => return,
     };
 
-    // Create ramdisk rd1 from the vfat image data
-    if create_ramdisk_from_data(1, vfat_data).is_ok() {
-        let rdev = DevId::new(major::RAMDISK, 1);
-        let _ = ramfs_create_blkdev(dev_dentry, "rd1", rdev, 0o660);
-    }
+    // Ramdisk rd1 from the vfat image data (node in devtmpfs)
+    let _ = create_ramdisk_from_data(1, vfat_data);
 
     // Create /vfat_test mount point (userspace init will mount here)
     let _ = ramfs_create_dir(root_dentry, "vfat_test");
@@ -1354,7 +1131,7 @@ fn panic(info: &PanicInfo) -> ! {
     printkln!("========================================");
 
     // Print CPU ID if available
-    if let Some(cpu_id) = CurrentArch::try_current_cpu_id() {
+    if let Some(cpu_id) = crate::cpu::try_this_id() {
         printkln!("CPU: {}", cpu_id);
     }
 

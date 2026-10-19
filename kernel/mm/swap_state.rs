@@ -1,186 +1,304 @@
-//! Swap cache - caches swap pages in memory
+//! The swap cache (Linux mm/swap_state.c)
 //!
-//! Provides a cache layer for swap pages to avoid redundant disk I/O when a
-//! page is swapped in and might be needed again (e.g., copy-on-write scenarios).
+//! A page being written to a swap slot, or read back from one, sits in
+//! its device's swap cache (`SwapInfo.cache`, an xarray by slot) with
+//! `PG_SWAPCACHE` set and the entry in `Page.private`; the cache holds
+//! a page reference and the slot's SWAP_HAS_CACHE count. Every swap PTE
+//! of the slot then finds that one page: tasks sharing a slot after
+//! fork share the page again, and a page reclaimed while still clean
+//! needs no second write.
 //!
-//! Uses the PageCache infrastructure with a special FileId prefix (0xC) to
-//! distinguish swap entries from regular file pages.
-//!
-//! ## Design
-//!
-//! Each swap entry maps to a unique FileId:
-//! - Prefix: 0xC000_0000_0000_0000 (bits 60-63 = 0xC)
-//! - Lower bits: swap entry raw value (type + offset)
-//!
-//! This allows using the existing PageCache without modification while
-//! ensuring swap pages are distinguishable from file-backed pages.
+//! Locking: the cache's `IrqSpinlock` (Linux i_pages xa_lock_irq) is a
+//! leaf over the xarray; under it only the allocator is taken (index
+//! nodes). A lookup takes its page reference under it with
+//! get_page_unless_zero, so it never revives a page reclaim froze
+//! (refcount 0) to delete it. Adding and deleting a page happen with the
+//! page locked (`page::lock_page`); the slot count (`SwapInfo.map`) is
+//! updated after the cache lock is dropped, never under it.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
-use crate::PAGE_CACHE;
-use crate::mm::page_cache::{CachedPage, FileId, NULL_AOPS, PAGE_SIZE};
-use crate::mm::swap_entry::SwapEntry;
+use super::fault::VmFault;
+use super::page::{PG_SWAPCACHE, lock_page, phys_to_page, trylock_page, unlock_page};
+use super::swap::{
+    SwapInfo, get_swap_info, swap_count, swap_read_page, swapcache_clear, swapcache_prepare,
+};
+use super::swap_entry::SwapEntry;
+use crate::FRAME_ALLOCATOR;
+use crate::error::KernelError;
 
-/// Swap cache FileId prefix - distinguishes swap entries from regular files
-///
-/// Uses nibble 0xC in the high 4 bits (bits 60-63).
-/// This doesn't conflict with:
-/// - Regular file IDs (path hash, typically < 0x8000_0000_0000_0000)
-/// - Block device IDs (0x8000_0000_0000_0000 prefix)
-const SWAP_FILEID_PREFIX: u64 = 0xC000_0000_0000_0000;
-
-/// Mask for the prefix nibble
-const SWAP_FILEID_MASK: u64 = 0xF000_0000_0000_0000;
-
-/// Convert a swap entry to a FileId for page cache lookup
-///
-/// # Arguments
-/// * `entry` - The swap entry to convert
-///
-/// # Returns
-/// A FileId encoding the swap entry for page cache operations
-#[inline]
-pub fn swap_file_id(entry: SwapEntry) -> FileId {
-    FileId(SWAP_FILEID_PREFIX | entry.raw())
+/// The swap-cache page of `e`, with a reference (Linux
+/// swap_cache_get_folio)
+pub fn lookup(e: SwapEntry) -> Option<u64> {
+    let si = get_swap_info(e.swap_type())?;
+    let cache = si.cache.lock();
+    let page = cache.load(e.offset());
+    (page != 0 && FRAME_ALLOCATOR.incref(page)).then_some(page)
 }
 
-/// Check if a FileId represents a swap entry
-///
-/// # Arguments
-/// * `file_id` - The FileId to check
-///
-/// # Returns
-/// true if this FileId was created from a swap entry
-#[inline]
-pub fn is_swap_file_id(file_id: FileId) -> bool {
-    (file_id.0 & SWAP_FILEID_MASK) == SWAP_FILEID_PREFIX
+/// The page holds `e` in the swap cache
+fn holds(phys: u64, e: SwapEntry) -> bool {
+    phys_to_page(phys)
+        .is_some_and(|pg| pg.is_swapcache() && pg.private.load(Ordering::Relaxed) == e.raw())
 }
 
-/// Extract the SwapEntry from a swap FileId
-///
-/// # Safety
-/// Caller must ensure `is_swap_file_id(file_id)` is true
-#[inline]
-pub fn file_id_to_swap_entry(file_id: FileId) -> SwapEntry {
-    SwapEntry::from_raw(file_id.0 & !SWAP_FILEID_MASK)
+/// Put the locked page `phys` in the swap cache for `e`, whose slot
+/// already counts SWAP_HAS_CACHE (Linux add_to_swap_cache); the cache
+/// takes a page reference. False if out of memory for index nodes.
+pub fn add(e: SwapEntry, phys: u64) -> bool {
+    let (Some(si), Some(pg)) = (get_swap_info(e.swap_type()), phys_to_page(phys)) else {
+        return false;
+    };
+    if !FRAME_ALLOCATOR.incref(phys) {
+        return false;
+    }
+    pg.private.store(e.raw(), Ordering::Relaxed);
+    pg.set_flag(PG_SWAPCACHE);
+    let stored = si
+        .cache
+        .lock()
+        .store(e.offset(), phys, &mut || FRAME_ALLOCATOR.alloc());
+    debug_assert!(stored.is_none_or(|old| old == 0));
+    if stored.is_none() {
+        unhash(pg);
+        FRAME_ALLOCATOR.decref(phys);
+        return false;
+    }
+    si.cached.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
-/// Look up a page in the swap cache
-///
-/// Checks if the page for the given swap entry is already cached in memory.
-/// If found, the page's reference count is incremented.
-///
-/// # Arguments
-/// * `entry` - The swap entry to look up
-///
-/// # Returns
-/// Some(page) if found in cache, None if the page must be read from swap
-pub fn swap_cache_lookup(entry: SwapEntry) -> Option<Arc<CachedPage>> {
-    let file_id = swap_file_id(entry);
-    PAGE_CACHE.lock().find_get_page(file_id, 0) // offset=0 since each swap entry is unique
+fn unhash(pg: &super::page::Page) {
+    pg.clear_flag(PG_SWAPCACHE);
+    pg.private.store(0, Ordering::Relaxed);
 }
 
-/// Add a page to the swap cache after swap-in
-///
-/// Called after reading a page from swap to cache it in memory.
-/// This allows subsequent accesses to find the page without re-reading.
-///
-/// # Arguments
-/// * `entry` - The swap entry this page came from
-/// * `frame_phys` - Physical address of the frame containing the page
-///
-/// # Note
-/// This creates a new CachedPage in the page cache. The page is marked
-/// as clean since it matches the on-disk copy.
-#[allow(dead_code)]
-pub fn swap_cache_add(entry: SwapEntry, frame_phys: u64) {
-    let file_id = swap_file_id(entry);
-
-    // Create address space for this swap entry if needed
-    // Swap pages are:
-    // - can_writeback = true (we can write back to swap device)
-    // - unevictable = false (swap cache pages CAN be evicted)
-    let mut cache = PAGE_CACHE.lock();
-
-    // Get or create address space
-    let addr_space = cache.get_or_create_address_space(
-        file_id,
-        PAGE_SIZE as u64, // Each swap entry = 1 page
-        true,             // can_writeback
-        false,            // not unevictable
-        &NULL_AOPS,       // Use null ops (writeback handled specially for swap)
-    );
-
-    // Create and insert the cached page
-    let page = Arc::new(CachedPage::new(frame_phys, file_id, 0));
-    addr_space.insert_page(0, page);
+/// Take the locked page `phys` out of the swap cache of `e` (Linux
+/// delete_from_swap_cache): its SWAP_HAS_CACHE count and the cache's
+/// page reference go
+pub fn delete(e: SwapEntry, phys: u64) {
+    if let Some(si) = get_swap_info(e.swap_type()) {
+        let old = si.cache.lock().erase(e.offset());
+        debug_assert_eq!(old, phys);
+        si.cached.fetch_sub(1, Ordering::Relaxed);
+    }
+    if let Some(pg) = phys_to_page(phys) {
+        unhash(pg);
+    }
+    swapcache_clear(e);
+    FRAME_ALLOCATOR.decref(phys);
 }
 
-/// Remove a page from the swap cache when swap slot is freed
-///
-/// Called when a swap entry is freed to clean up any cached copy.
-/// The physical frame is NOT freed here - caller is responsible.
-///
-/// # Arguments
-/// * `entry` - The swap entry being freed
-#[allow(dead_code)]
-pub fn swap_cache_del(entry: SwapEntry) {
-    let file_id = swap_file_id(entry);
+/// Delete the locked page `phys`, with `expected` references (the
+/// cache's included) and no other, from the swap cache, leaving it
+/// unreferenced (Linux __remove_mapping: folio_ref_freeze under the
+/// cache lock, so no lookup can take a reference meanwhile). The caller
+/// frees the frozen page. False if someone else holds a reference.
+pub fn delete_frozen(e: SwapEntry, phys: u64, expected: u32) -> bool {
+    let (Some(si), Some(pg)) = (get_swap_info(e.swap_type()), phys_to_page(phys)) else {
+        return false;
+    };
+    {
+        let mut cache = si.cache.lock();
+        if pg
+            .refcount
+            .compare_exchange(expected, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        cache.erase(e.offset());
+    }
+    si.cached.fetch_sub(1, Ordering::Relaxed);
+    unhash(pg);
+    swapcache_clear(e);
+    true
+}
 
-    let cache = PAGE_CACHE.lock();
-    if let Some(addr_space) = cache.get_address_space(file_id) {
-        addr_space.remove_page(0);
+/// The swap entry of a swap-cache page
+pub fn entry_of(phys: u64) -> Option<SwapEntry> {
+    let pg = phys_to_page(phys)?;
+    pg.is_swapcache()
+        .then(|| SwapEntry::from_raw(pg.private.load(Ordering::Relaxed)))
+}
+
+/// Drop the locked page `phys` from the swap cache if no swap PTE needs
+/// its slot any more (Linux folio_free_swap): true if it was
+pub fn try_free_swap(phys: u64) -> bool {
+    match entry_of(phys) {
+        Some(e) if swap_count(e) == 0 => {
+            delete(e, phys);
+            true
+        }
+        _ => false,
     }
 }
 
-/// Check if a swap entry has a cached page
-///
-/// # Arguments
-/// * `entry` - The swap entry to check
-///
-/// # Returns
-/// true if the page is in the swap cache
-#[allow(dead_code)]
-pub fn swap_cache_has(entry: SwapEntry) -> bool {
-    let file_id = swap_file_id(entry);
-    let cache = PAGE_CACHE.lock();
-    if let Some(addr_space) = cache.get_address_space(file_id) {
-        addr_space.find_page(0).is_some()
-    } else {
-        false
+/// A page whose last mapping went (zap after the TLB flush, Linux
+/// free_swap_cache): drop it from the swap cache if nothing else needs
+/// it there. Never sleeps (trylock).
+pub fn free_swap_cache(phys: u64) {
+    let unmapped = phys_to_page(phys).is_some_and(|pg| pg.is_swapcache() && pg.mapcount() == 0);
+    if unmapped && trylock_page(phys) {
+        try_free_swap(phys);
+        unlock_page(phys);
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_swap_file_id() {
-        let entry = SwapEntry::new(3, 1000);
-        let file_id = swap_file_id(entry);
-
-        // Should have swap prefix
-        assert!(is_swap_file_id(file_id));
-
-        // Should preserve swap entry data
-        let recovered = file_id_to_swap_entry(file_id);
-        assert_eq!(recovered.swap_type(), 3);
-        assert_eq!(recovered.offset(), 1000);
+/// The last swap PTE of `e` went and its slot still has a cache page:
+/// drop the page if it is unmapped (Linux __try_to_reclaim_swap with
+/// TTRS_UNMAPPED). Never sleeps.
+pub fn try_reclaim_swap(e: SwapEntry) {
+    let Some(phys) = lookup(e) else {
+        return;
+    };
+    if trylock_page(phys) {
+        let unmapped = phys_to_page(phys).is_some_and(|pg| pg.mapcount() == 0);
+        if unmapped && holds(phys, e) {
+            try_free_swap(phys);
+        }
+        unlock_page(phys);
     }
+    FRAME_ALLOCATOR.decref(phys);
+}
 
-    #[test]
-    fn test_non_swap_file_id() {
-        // Regular file ID
-        let file_id = FileId::new(0x1234567890ABCDEF);
-        assert!(!is_swap_file_id(file_id));
-
-        // Block device ID
-        let blkdev_id = FileId::from_blkdev(8, 0);
-        assert!(!is_swap_file_id(blkdev_id));
+/// The page of swap entry `e` for a fault (Linux do_swap_page +
+/// swapin), locked and with a reference: the swap-cache page if there
+/// is one, else a new page read from the slot into the cache. Sleeps
+/// (page lock, I/O): mmap_lock held for reading, no spinlock. `Retry`
+/// if the slot was freed meanwhile (the PTE changed).
+pub fn read_swap_page(e: SwapEntry) -> Result<u64, VmFault> {
+    loop {
+        if let Some(phys) = lookup(e) {
+            lock_page(phys);
+            if holds(phys, e) {
+                return Ok(phys);
+            }
+            unlock_page(phys);
+            FRAME_ALLOCATOR.decref(phys);
+            continue;
+        }
+        match swapcache_prepare(e) {
+            Ok(()) => return read_new(e),
+            // Another task is reading it in: its page shows up
+            Err(true) => crate::task::percpu::yield_now(),
+            Err(false) => return Err(VmFault::Retry),
+        }
     }
+}
+
+/// Read `e`, whose slot this task claimed (SWAP_HAS_CACHE), into a new
+/// locked swap-cache page
+fn read_new(e: SwapEntry) -> Result<u64, VmFault> {
+    let Some(phys) = super::fault::alloc_user_reclaim() else {
+        swapcache_clear(e);
+        return Err(VmFault::Oom);
+    };
+    let locked = trylock_page(phys);
+    debug_assert!(locked);
+    if !add(e, phys) {
+        unlock_page(phys);
+        FRAME_ALLOCATOR.decref(phys);
+        swapcache_clear(e);
+        return Err(VmFault::Oom);
+    }
+    if swap_read_page(e, phys).is_err() {
+        delete(e, phys);
+        unlock_page(phys);
+        FRAME_ALLOCATOR.decref(phys);
+        return Err(VmFault::Bus);
+    }
+    super::lru::lru_add(phys);
+    Ok(phys)
+}
+
+/// swapoff: bring every page of `si` back into memory (Linux
+/// try_to_unuse): every swap PTE of the device in every address space
+/// is faulted in, then the cache pages left are dropped. ENOMEM if a
+/// page cannot be read, EINTR on SIGKILL.
+pub fn try_to_unuse(si: &Arc<SwapInfo>) -> Result<(), KernelError> {
+    for _ in 0..16 {
+        for mm in all_mms() {
+            if let Some(mm) = super::mmget_not_zero(&mm) {
+                unuse_mm(&mm, si.swap_type)?;
+            }
+        }
+        drop_cache(si);
+        if si.inuse.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+        if crate::signal::fatal_signal_pending() {
+            return Err(KernelError::Interrupted);
+        }
+    }
+    Err(KernelError::OutOfMemory)
+}
+
+/// Every live address space (mm_count references)
+fn all_mms() -> Vec<Arc<super::Mm>> {
+    let mut v: Vec<Arc<super::Mm>> = Vec::new();
+    {
+        let table = crate::task::percpu::TASKLIST.read();
+        for mm in table.iter().filter_map(|t| t.mm_ref()) {
+            if !v.iter().any(|m| Arc::ptr_eq(m, mm.arc())) {
+                v.push(mm.arc().clone());
+            }
+        }
+    }
+    v
+}
+
+/// Fault in the swap PTEs of type `ty` in `mm`
+fn unuse_mm(mm: &super::Mm, ty: u8) -> Result<(), KernelError> {
+    let map = mm.mmap_read_killable()?;
+    for vma in map.iter().filter(|v| v.anon_vma.is_some()) {
+        let mut addr = vma.start;
+        while addr < vma.end {
+            match super::memory::next_swap_pte(mm.pgd(), addr, vma.end, ty) {
+                Some(a) => {
+                    super::fault::unuse_pte(mm, vma, a).map_err(|_| KernelError::OutOfMemory)?;
+                    addr = a + super::PAGE_SIZE;
+                }
+                None => break,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Drop the cache pages of `si` no swap PTE needs (swapoff)
+fn drop_cache(si: &SwapInfo) {
+    let mut pages = Vec::new();
+    si.cache
+        .lock()
+        .for_each(0, si.max, &mut |off, _| pages.push(off));
+    for off in pages {
+        let e = SwapEntry::new(si.swap_type, off);
+        if let Some(phys) = lookup(e) {
+            lock_page(phys);
+            if holds(phys, e) {
+                try_free_swap(phys);
+            }
+            unlock_page(phys);
+            FRAME_ALLOCATOR.decref(phys);
+        }
+    }
+}
+
+/// Free the cache's index of a device swapoff emptied
+pub fn destroy_cache(si: &SwapInfo) {
+    // Empty by now (every slot free): only index nodes are left
+    si.cache.lock().destroy(&mut |_| {});
+}
+
+/// Pages in every swap cache (meminfo SwapCached)
+pub fn total_cached() -> u64 {
+    super::swap::SWAP_INFO
+        .read()
+        .iter()
+        .flatten()
+        .map(|si| si.cached.load(Ordering::Relaxed))
+        .sum()
 }

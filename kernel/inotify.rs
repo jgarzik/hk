@@ -29,12 +29,11 @@
 //! - Multiple watches per inotify instance
 //! - Watch descriptors (wd) are unique per instance
 
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
@@ -218,25 +217,15 @@ pub struct Inotify {
     inner: IrqSpinlock<InotifyInner>,
     /// Wait queue for blocking readers
     wait_queue: WaitQueue,
-    /// Unique ID for this instance
-    id: u64,
 }
-
-/// Global counter for inotify IDs
-static NEXT_INOTIFY_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Global cookie counter for rename event pairing
 static NEXT_RENAME_COOKIE: AtomicI32 = AtomicI32::new(1);
 
-/// Global inotify registry for event dispatch
-static INOTIFY_REGISTRY: IrqSpinlock<Vec<(u64, Weak<Inotify>)>> = IrqSpinlock::new(Vec::new());
-
 impl Inotify {
     /// Create a new inotify instance
     pub fn new() -> Arc<Self> {
-        let id = NEXT_INOTIFY_ID.fetch_add(1, Ordering::Relaxed);
-
-        let inotify = Arc::new(Self {
+        Arc::new(Self {
             inner: IrqSpinlock::new(InotifyInner {
                 next_wd: 1,
                 watches: BTreeMap::new(),
@@ -244,14 +233,7 @@ impl Inotify {
                 next_cookie: 0,
             }),
             wait_queue: WaitQueue::new(),
-            id,
-        });
-
-        // Register in global registry
-        let weak = Arc::downgrade(&inotify);
-        INOTIFY_REGISTRY.lock().push((id, weak));
-
-        inotify
+        })
     }
 
     /// Add a watch on a path
@@ -463,28 +445,6 @@ impl Inotify {
         let inner = self.inner.lock();
         inner.events.iter().map(|e| e.serialized_size()).sum()
     }
-
-    /// Release the inotify instance
-    fn release(&self) {
-        let mut registry = INOTIFY_REGISTRY.lock();
-        registry.retain(|(id, _)| *id != self.id);
-    }
-}
-
-impl Default for Inotify {
-    fn default() -> Self {
-        // Note: This creates an unregistered instance - use Inotify::new() instead
-        Self {
-            inner: IrqSpinlock::new(InotifyInner {
-                next_wd: 1,
-                watches: BTreeMap::new(),
-                events: Vec::new(),
-                next_cookie: 0,
-            }),
-            wait_queue: WaitQueue::new(),
-            id: 0,
-        }
-    }
 }
 
 // =============================================================================
@@ -492,16 +452,9 @@ impl Default for Inotify {
 // =============================================================================
 
 /// File operations for inotify
-pub struct InotifyFileOps {
-    inotify: Arc<Inotify>,
-}
+pub struct InotifyFileOps;
 
-impl InotifyFileOps {
-    /// Create file ops for an inotify instance
-    pub fn new(inotify: Arc<Inotify>) -> Self {
-        Self { inotify }
-    }
-}
+static INOTIFY_FOPS: InotifyFileOps = InotifyFileOps;
 
 impl FileOps for InotifyFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -509,21 +462,20 @@ impl FileOps for InotifyFileOps {
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let inotify = file.private_ref::<Inotify>().ok_or(KernelError::BadFd)?;
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        self.inotify.read(buf, nonblock)
+        inotify.read(buf, nonblock)
     }
 
     fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
-        self.inotify.poll(pt)
-    }
-
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
-        self.inotify.release();
-        Ok(())
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(inotify) = file.private_ref::<Inotify>() else {
+            return crate::poll::POLLERR;
+        };
+        inotify.poll(pt)
     }
 }
 
@@ -541,9 +493,6 @@ impl FileOps for InotifyFileOps {
 pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, KernelError> {
     let inotify = Inotify::new();
 
-    // Create file operations
-    let ops: &'static dyn FileOps = Box::leak(Box::new(InotifyFileOps::new(inotify)));
-
     // Create dummy dentry for inotify
     let dentry = create_inotify_dentry()?;
 
@@ -553,7 +502,7 @@ pub fn create_inotify(in_flags: i32) -> Result<Arc<File>, KernelError> {
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file = Arc::new(File::new(dentry, file_flags, ops));
+    let file = Arc::new(File::new_anon(dentry, file_flags, &INOTIFY_FOPS, inotify));
     Ok(file)
 }
 
@@ -577,10 +526,7 @@ fn create_inotify_dentry() -> Result<Arc<Dentry>, KernelError> {
 
 /// Get the Inotify from a File
 pub fn get_inotify(file: &File) -> Option<Arc<Inotify>> {
-    file.f_op
-        .as_any()
-        .downcast_ref::<InotifyFileOps>()
-        .map(|ops| Arc::clone(&ops.inotify))
+    file.private_arc::<Inotify>()
 }
 
 /// Generate a unique cookie for rename event pairing

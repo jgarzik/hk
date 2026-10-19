@@ -26,12 +26,10 @@
 //! - One-shot mode (EPOLLONESHOT) for single notification
 //! - Can monitor pipes, sockets, eventfd, timerfd, and other pollable fds
 
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::fs::KernelError;
@@ -128,31 +126,15 @@ pub struct Eventpoll {
     inner: IrqSpinlock<EventpollInner>,
     /// Wait queue for epoll_wait() callers
     wq: WaitQueue,
-    /// Unique ID for this epoll instance
-    id: u64,
 }
-
-/// Global counter for epoll IDs
-static NEXT_EPOLL_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Global epoll registry (maps ID -> weak ref)
-static EPOLL_REGISTRY: IrqSpinlock<Vec<(u64, Weak<Eventpoll>)>> = IrqSpinlock::new(Vec::new());
 
 impl Eventpoll {
     /// Create a new epoll instance
     pub fn new() -> Arc<Self> {
-        let id = NEXT_EPOLL_ID.fetch_add(1, Ordering::Relaxed);
-        let ep = Arc::new(Self {
+        Arc::new(Self {
             inner: IrqSpinlock::new(EventpollInner::new()),
             wq: WaitQueue::new(),
-            id,
-        });
-
-        // Register in global registry
-        let weak = Arc::downgrade(&ep);
-        EPOLL_REGISTRY.lock().push((id, weak));
-
-        ep
+        })
     }
 
     /// Add a file descriptor to this epoll (EPOLL_CTL_ADD)
@@ -326,26 +308,12 @@ impl Eventpoll {
 
         0
     }
-
-    /// Release the epoll (unregister)
-    fn release(&self) {
-        // Remove from registry
-        let mut registry = EPOLL_REGISTRY.lock();
-        registry.retain(|(id, _)| *id != self.id);
-    }
 }
 
 /// File operations for epoll fd
-pub struct EpollFileOps {
-    ep: Arc<Eventpoll>,
-}
+pub struct EpollFileOps;
 
-impl EpollFileOps {
-    /// Create file ops for an epoll instance
-    pub fn new(ep: Arc<Eventpoll>) -> Self {
-        Self { ep }
-    }
-}
+static EPOLL_FOPS: EpollFileOps = EpollFileOps;
 
 impl FileOps for EpollFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -362,13 +330,11 @@ impl FileOps for EpollFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
-        self.ep.poll(pt)
-    }
-
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
-        self.ep.release();
-        Ok(())
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(ep) = file.private_ref::<Eventpoll>() else {
+            return crate::poll::POLLERR;
+        };
+        ep.poll(pt)
     }
 }
 
@@ -382,9 +348,6 @@ impl FileOps for EpollFileOps {
 pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
     let ep = Eventpoll::new();
 
-    // Create file operations
-    let ops: &'static dyn FileOps = Box::leak(Box::new(EpollFileOps::new(ep)));
-
     // Create dummy dentry for epoll
     let dentry = create_epoll_dentry()?;
 
@@ -394,7 +357,7 @@ pub fn create_epoll_file(eflags: i32) -> Result<Arc<File>, KernelError> {
         file_flags |= flags::O_CLOEXEC;
     }
 
-    let file = Arc::new(File::new(dentry, file_flags, ops));
+    let file = Arc::new(File::new_anon(dentry, file_flags, &EPOLL_FOPS, ep));
     Ok(file)
 }
 
@@ -418,10 +381,7 @@ fn create_epoll_dentry() -> Result<Arc<Dentry>, KernelError> {
 
 /// Get the Eventpoll from a File (for syscall implementations)
 pub fn get_eventpoll(file: &File) -> Option<Arc<Eventpoll>> {
-    file.f_op
-        .as_any()
-        .downcast_ref::<EpollFileOps>()
-        .map(|ops| Arc::clone(&ops.ep))
+    file.private_arc::<Eventpoll>()
 }
 
 // ============================================================================

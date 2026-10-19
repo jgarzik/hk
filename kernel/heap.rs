@@ -1,10 +1,11 @@
-//! Kernel heap allocator
+//! Kernel heap: the global allocator
 //!
-//! Simple linked-list allocator for the kernel heap.
-//!
-//! Uses IrqSpinlock instead of crate::sync::spin::Mutex to prevent deadlocks
-//! when page fault handlers (e.g., COW) need to allocate memory
-//! while interrupts are enabled.
+//! Before the page allocator exists, allocations come from a small
+//! static boot arena (a first-fit linked-list allocator in the kernel
+//! image's bss); from then on from the slab allocator (`mm::slab`
+//! kmalloc). Memory is freed to whichever gave it (the arena by
+//! address). The arena's lock is an `IrqSpinlock` leaf, like the slab
+//! locks, so the heap is IRQ-safe.
 
 use crate::arch::IrqSpinlock;
 use ::core::alloc::{GlobalAlloc, Layout};
@@ -86,9 +87,10 @@ impl HeapAllocator {
         inner.free_bytes = size;
     }
 
-    /// Bytes in free blocks (fragmentation not considered)
-    pub fn free_bytes(&self) -> usize {
-        self.inner.lock().free_bytes
+    /// Bytes allocated (block headers and alignment included)
+    pub fn used_bytes(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.heap_end - inner.heap_start - inner.free_bytes
     }
 }
 
@@ -185,44 +187,107 @@ unsafe impl GlobalAlloc for HeapAllocator {
 
 unsafe impl Sync for HeapAllocator {}
 
-impl Default for HeapAllocator {
+impl HeapAllocator {
+    /// The block came from this arena
+    fn contains(&self, p: *mut u8) -> bool {
+        let inner = self.inner.lock();
+        (inner.heap_start..inner.heap_end).contains(&(p as usize))
+    }
+}
+
+/// Boot arena size: what boot allocates before the page allocator is up
+/// (cmdline, early device tree and console state), with ample margin
+const ARENA_SIZE: usize = 256 * 1024;
+
+#[repr(C, align(4096))]
+struct ArenaBuf(core::cell::UnsafeCell<[u8; ARENA_SIZE]>);
+
+// SAFETY: handed to the arena allocator once, which serializes access
+unsafe impl Sync for ArenaBuf {}
+
+static ARENA_BUF: ArenaBuf = ArenaBuf(core::cell::UnsafeCell::new([0; ARENA_SIZE]));
+
+/// The global allocator: boot arena, then slab
+pub struct KernelAlloc {
+    arena: HeapAllocator,
+    /// Set once the page allocator is up (Release; read Acquire)
+    slab: core::sync::atomic::AtomicBool,
+    once: core::sync::atomic::AtomicBool,
+}
+
+impl KernelAlloc {
+    pub const fn new() -> Self {
+        Self {
+            arena: HeapAllocator::new(),
+            slab: core::sync::atomic::AtomicBool::new(false),
+            once: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn arena(&self) -> &HeapAllocator {
+        use core::sync::atomic::Ordering;
+        if !self.once.swap(true, Ordering::AcqRel) {
+            // SAFETY: the buffer is used by this arena only
+            unsafe { self.arena.init(ARENA_BUF.0.get() as usize, ARENA_SIZE) };
+        }
+        &self.arena
+    }
+
+    /// The page allocator is up: new allocations come from slab
+    pub fn slab_ready(&self) {
+        self.slab.store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Bytes still allocated from the boot arena
+    pub fn arena_used(&self) -> usize {
+        self.arena().used_bytes()
+    }
+}
+
+impl Default for KernelAlloc {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Boot-time memory the heap must never cover (kernel image, boot
-/// modules, DTB, initrd): the kernel reads it after the heap is live
-#[derive(Clone, Copy)]
-pub struct BootRange {
-    pub name: &'static str,
-    pub start: usize,
-    pub end: usize,
-}
+unsafe impl GlobalAlloc for KernelAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if self.slab.load(core::sync::atomic::Ordering::Acquire) {
+            crate::mm::slab::kmalloc(layout.size(), layout.align())
+        } else {
+            unsafe { self.arena().alloc(layout) }
+        }
+    }
 
-impl BootRange {
-    fn hits(&self, start: usize, end: usize) -> bool {
-        self.start < self.end && self.start < end && start < self.end
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if self.arena().contains(ptr) {
+            unsafe { self.arena.dealloc(ptr, layout) };
+        } else {
+            crate::mm::slab::kfree(ptr, layout.size(), layout.align());
+        }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new: usize) -> *mut u8 {
+        let slab = !self.arena().contains(ptr);
+        if slab && crate::mm::slab::fits(layout.size(), new, layout.align()) {
+            return ptr;
+        }
+        // SAFETY: as GlobalAlloc::realloc requires of the caller
+        unsafe {
+            let new_layout = Layout::from_size_align_unchecked(new, layout.align());
+            let p = self.alloc(new_layout);
+            if !p.is_null() {
+                core::ptr::copy_nonoverlapping(ptr, p, layout.size().min(new));
+                self.dealloc(ptr, layout);
+            }
+            p
+        }
     }
 }
 
-/// Lowest `align`-aligned (power of two) start >= `lo` whose
-/// `size` bytes miss every busy range
-pub fn place(lo: usize, size: usize, align: usize, busy: &[BootRange]) -> usize {
-    let mut start = round_up(lo, align);
-    while let Some(r) = busy.iter().find(|r| r.hits(start, start + size)) {
-        start = round_up(r.end, align);
-    }
-    start
-}
-
-/// Boot assertion: a heap over boot data corrupts it silently, so stop
-pub fn check(start: usize, end: usize, r: &BootRange) {
-    if r.hits(start, end) {
-        panic!(
-            "heap {:#x}-{:#x} overlaps {} {:#x}-{:#x}",
-            start, end, r.name, r.start, r.end
-        );
+impl Default for HeapAllocator {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -258,31 +323,5 @@ mod tests {
         let p = unsafe { h.alloc(big) };
         assert!(!p.is_null());
         unsafe { h.dealloc(p, big) };
-    }
-
-    #[test]
-    fn place_skips_busy() {
-        let r = |start, end| BootRange {
-            name: "x",
-            start,
-            end,
-        };
-        let busy = [r(0x100, 0x2000), r(0x5000, 0x6001), r(0x9000, 0x9000)];
-        assert_eq!(place(0, 0x1000, 0x1000, &busy), 0x2000);
-        assert_eq!(place(0, 0x4000, 0x1000, &busy), 0x7000);
-        // empty ranges never block
-        assert_eq!(place(0x8000, 0x2000, 0x1000, &busy), 0x8000);
-        check(0x2000, 0x5000, &busy[1]);
-    }
-
-    #[test]
-    #[should_panic(expected = "overlaps")]
-    fn check_panics() {
-        let r = BootRange {
-            name: "initrd",
-            start: 0x1000,
-            end: 0x2000,
-        };
-        check(0x1fff, 0x3000, &r);
     }
 }

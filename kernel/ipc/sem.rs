@@ -855,15 +855,15 @@ impl Default for SemUndoList {
 }
 
 // =============================================================================
-// Task SemUndo accessors - uses Task.sysvsem field directly via TASK_TABLE
+// Task SemUndo accessors - uses Task.sysvsem field directly via TASKLIST
 // =============================================================================
 
-use crate::task::percpu::TASK_TABLE;
+use crate::task::percpu::TASKLIST;
 
 /// Get the undo list for a task, creating if necessary
 pub fn get_or_create_undo_list(tid: Tid) -> Arc<SemUndoList> {
-    let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    let mut table = TASKLIST.write();
+    if let Some(mut task) = table.get_mut(tid) {
         if task.sysvsem.is_none() {
             task.sysvsem = Some(Arc::new(SemUndoList::new()));
         }
@@ -876,12 +876,8 @@ pub fn get_or_create_undo_list(tid: Tid) -> Arc<SemUndoList> {
 
 /// Get the undo list for a task (if it exists)
 pub fn get_undo_list(tid: Tid) -> Option<Arc<SemUndoList>> {
-    let table = TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .and_then(|t| t.sysvsem.clone())
+    let table = TASKLIST.read();
+    table.get(tid).and_then(|t| t.sysvsem.clone())
 }
 
 /// Clone semaphore undo list for a new task
@@ -893,8 +889,8 @@ pub fn clone_task_semundo(parent_tid: Tid, child_tid: Tid, share: bool) {
         // CLONE_SYSVSEM: share the same undo list
         let parent_undo = get_undo_list(parent_tid);
         if let Some(undo) = parent_undo {
-            let mut table = TASK_TABLE.lock();
-            if let Some(child) = table.tasks.iter_mut().find(|t| t.tid == child_tid) {
+            let mut table = TASKLIST.write();
+            if let Some(mut child) = table.get_mut(child_tid) {
                 child.sysvsem = Some(undo);
             }
         }
@@ -912,8 +908,8 @@ pub fn clone_task_semundo(parent_tid: Tid, child_tid: Tid, share: bool) {
 pub fn exit_sem(tid: Tid) {
     // Remove this task's undo list reference
     let undo_list = {
-        let mut table = TASK_TABLE.lock();
-        if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        let mut table = TASKLIST.write();
+        if let Some(mut task) = table.get_mut(tid) {
             task.sysvsem.take()
         } else {
             None

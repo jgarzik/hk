@@ -8,11 +8,12 @@
 //!   back to Running, so `schedule()` returns at once: no lost wakeups.
 //! - `wait_event*` wrap the loop; the `_interruptible` variants return
 //!   `Err(KernelError::RestartSys)` when a signal is pending (the syscall
-//!   exit path turns that into a restart or -EINTR), `_timeout` variants
+//!   exit path turns that into a restart or -EINTR), `_killable` returns
+//!   `Err(KernelError::Interrupted)` on SIGKILL only, `_timeout` variants
 //!   take scheduler ticks and return the ticks left.
 //! - Wakers (`wake_one`/`wake_all`) may run in any context, including IRQ
 //!   handlers: the queue lock is an `IrqSpinlock`, the task wakeup only
-//!   takes run-queue locks (never TASK_TABLE), and nothing on the wake
+//!   takes run-queue locks (never TASKLIST), and nothing on the wake
 //!   path allocates.
 //!
 //! ## Usage
@@ -39,8 +40,8 @@ use crate::arch::IrqSpinlock;
 use crate::error::KernelError;
 use crate::task::Tid;
 use crate::task::percpu::{
-    MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current_cpu, current_tid, schedule,
-    schedule_timeout, set_current_state, wake_up_task,
+    MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current_tid, schedule, schedule_timeout,
+    set_current_state, wake_up_task,
 };
 
 /// Source of unique wait entry ids
@@ -128,7 +129,7 @@ impl WaitQueue {
         head.push(WaitQueueEntry {
             id: entry.id,
             tid: current_tid(),
-            cpu: current_cpu(),
+            cpu: crate::cpu::this_id(),
             autoremove,
         });
     }
@@ -173,6 +174,29 @@ impl WaitQueue {
     pub fn wait_event_interruptible<F: FnMut() -> bool>(&self, cond: F) -> Result<(), KernelError> {
         self.wait_event_interruptible_timeout(cond, MAX_SCHEDULE_TIMEOUT)
             .map(|_| ())
+    }
+
+    /// Sleep until `cond()` is true or SIGKILL is pending (Linux
+    /// wait_event_killable). Returns `Err(KernelError::Interrupted)` on
+    /// a fatal signal; other signals do not end the wait.
+    pub fn wait_event_killable<F: FnMut() -> bool>(&self, mut cond: F) -> Result<(), KernelError> {
+        crate::sync::might_sleep();
+        if cond() {
+            return Ok(());
+        }
+        let mut w = WaitEntry::new();
+        let result = loop {
+            self.prepare_to_wait(&mut w, SleepState::Killable);
+            if cond() {
+                break Ok(());
+            }
+            if crate::signal::fatal_signal_pending() {
+                break Err(KernelError::Interrupted);
+            }
+            schedule();
+        };
+        self.finish_wait(&w);
+        result
     }
 
     /// Sleep (uninterruptibly) until `cond()` is true or `timeout` ticks

@@ -221,8 +221,7 @@ fn rollover_flush() {
 pub fn load_mm(root: u64, ctx: Option<&ArchCtx>) {
     let asid = match ctx {
         Some(c) => {
-            use crate::arch::PerCpuOps;
-            let cpu = super::Aarch64Arch::try_current_cpu_id().unwrap_or(0);
+            let cpu = crate::cpu::this_id();
             let (asid, flush) = ASIDS.switch(cpu, &c.id);
             if flush {
                 rollover_flush();

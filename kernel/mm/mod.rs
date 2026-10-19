@@ -7,9 +7,11 @@ extern crate alloc;
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
+use crate::error::KernelError;
 use crate::sync::spin::Mutex;
+use crate::sync::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 
 use crate::task::Tid;
 
@@ -23,32 +25,32 @@ pub mod gather;
 pub mod huge_page;
 pub mod lru;
 pub mod madvise;
+pub mod memblock;
 pub mod memory;
 pub mod mempolicy;
 pub mod mprotect;
 pub mod mremap;
 pub mod page;
+pub mod page_alloc;
 pub mod page_cache;
+pub mod pagewalk;
+pub mod ptl;
 pub mod remote;
 pub mod rmap;
 pub mod shmem;
+pub mod slab;
 pub mod swap;
 pub mod swap_entry;
 pub mod swap_state;
 pub mod syscall;
 pub mod tlb;
 pub mod vma;
+pub mod vmscan;
 pub mod writeback;
+pub mod xarray;
 
-pub use swap::{
-    SWAP_FLAG_DISCARD, SWAP_FLAG_PREFER, alloc_swap_entry, free_swap_entry, get_swap_info,
-    memory_pressure, should_swap_out, swap_available, swap_read_page, swap_write_page, sys_swapoff,
-    sys_swapon,
-};
+pub use swap::{SWAP_FLAG_DISCARD, SWAP_FLAG_PREFER, sys_swapoff, sys_swapon};
 pub use swap_entry::SwapEntry;
-pub use swap_state::{
-    is_swap_file_id, swap_cache_add, swap_cache_del, swap_cache_lookup, swap_file_id,
-};
 
 pub use vma::*;
 
@@ -110,6 +112,27 @@ pub fn mmap_base() -> u64 {
     (STACK_TOP - gap) & !0xFFF
 }
 
+/// vm.max_map_count: most VMAs an address space may have (Linux
+/// sysctl_max_map_count, DEFAULT_MAX_MAP_COUNT 65530)
+pub static MAX_MAP_COUNT: AtomicUsize = AtomicUsize::new(65530);
+
+fn max_map_count() -> usize {
+    MAX_MAP_COUNT.load(Ordering::Relaxed)
+}
+
+/// /proc/sys/vm files of the address-space code
+pub static MM_CTLS: &[crate::sysctl::Ctl] = &[crate::sysctl::Ctl {
+    path: "vm/max_map_count",
+    mode: 0o644,
+    show: || alloc::vec![max_map_count() as i64],
+    store: |v| {
+        crate::sysctl::range(v[0], 0, i32::MAX as i64)?;
+        MAX_MAP_COUNT.store(v[0] as usize, Ordering::Relaxed);
+        Ok(())
+    },
+    text: None,
+}];
+
 /// Stack guard gap (256KB like Linux default)
 /// Prevents growsdown VMAs from expanding too close to adjacent VMAs
 pub const STACK_GUARD_GAP: u64 = 256 * 1024;
@@ -118,8 +141,10 @@ pub const STACK_GUARD_GAP: u64 = 256 * 1024;
 ///
 /// Manages the virtual memory areas (VMAs) for a task's address space.
 pub struct MmStruct {
-    /// List of VMAs, sorted by start address
-    vmas: Vec<Vma>,
+    /// List of VMAs, sorted by start address; each its own allocation
+    /// (Linux vm_area_cachep: the VMA slab cache)
+    #[allow(clippy::vec_box)]
+    vmas: Vec<alloc::boxed::Box<Vma>>,
     /// Top of the mmap region: allocations grow down from here
     mmap_base: u64,
     /// Initial program break (page-aligned end of loaded segments)
@@ -137,6 +162,42 @@ pub struct MmStruct {
     def_flags: u32,
     /// Path of the executable (Linux mm->exe_file), for /proc/<pid>/exe
     exe: Option<alloc::string::String>,
+    /// Where exec put the image, arguments and environment
+    args: MmLayout,
+    /// The address space these VMAs belong to and its top-level table,
+    /// for the reverse-map chains of anonymous VMAs (set when the `Mm`
+    /// is built; none in host tests)
+    owner: Weak<Mm>,
+    pgd: u64,
+}
+
+/// A VMA's reverse-map chain entry in the address space `owner`/`pgd`
+fn avc_of(owner: &Weak<Mm>, pgd: u64, v: &Vma) -> anon_vma::Avc {
+    anon_vma::Avc {
+        mm: owner.clone(),
+        pgd,
+        start: v.start,
+        end: v.end,
+        pgoff: v.pgoff,
+        locked: v.flags & VM_LOCKED_MASK != 0,
+    }
+}
+
+/// Where exec put the image and the initial stack (Linux mm->start_code
+/// .. env_end, start_stack): /proc/<pid>/cmdline, environ, stat and
+/// status read it
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MmLayout {
+    pub start_code: u64,
+    pub end_code: u64,
+    pub start_data: u64,
+    pub end_data: u64,
+    pub arg_start: u64,
+    pub arg_end: u64,
+    pub env_start: u64,
+    pub env_end: u64,
+    /// Initial stack pointer (argc)
+    pub start_stack: u64,
 }
 
 impl MmStruct {
@@ -151,7 +212,69 @@ impl MmStruct {
             total_vm: 0,
             def_flags: 0,
             exe: None,
+            args: MmLayout::default(),
+            owner: Weak::new(),
+            pgd: 0,
         }
+    }
+
+    /// Tie the VMAs to their address space (before any is inserted)
+    fn set_owner(&mut self, owner: &Weak<Mm>, pgd: u64) {
+        debug_assert!(self.vmas.is_empty());
+        self.owner = owner.clone();
+        self.pgd = pgd;
+    }
+
+    // ------------------------------------------------------------------
+    // Reverse-map chains: every change of a VMA with an anon_vma updates
+    // its entry (anon_vma lock under the mmap_lock held for writing)
+    // ------------------------------------------------------------------
+
+    /// Add the chain entry of `v`
+    fn link(&self, v: &Vma) {
+        if let Some(av) = &v.anon_vma {
+            av.link(avc_of(&self.owner, self.pgd, v));
+        }
+    }
+
+    /// Drop the chain entry of `v`
+    fn unlink(&self, v: &Vma) {
+        if let Some(av) = &v.anon_vma {
+            av.unlink(self.pgd, v.start);
+        }
+    }
+
+    /// Refresh the entry of the VMA at `idx`, which started at `old_start`
+    fn relink(&self, idx: usize, old_start: u64) {
+        let v = &self.vmas[idx];
+        if let Some(av) = &v.anon_vma {
+            let new = avc_of(&self.owner, self.pgd, v);
+            av.update(self.pgd, old_start, |c| *c = new);
+        }
+    }
+
+    /// Set the flags of the VMA at `idx` (mlock state included)
+    pub fn set_flags(&mut self, idx: usize, flags: u32) {
+        let start = self.vmas[idx].start;
+        self.vmas[idx].flags = flags;
+        self.relink(idx, start);
+    }
+
+    /// Move the end of the VMA at `idx` (brk)
+    pub fn set_end(&mut self, idx: usize, end: u64) {
+        let start = self.vmas[idx].start;
+        self.vmas[idx].end = end;
+        self.relink(idx, start);
+    }
+
+    /// Layout of the image, its arguments and environment
+    pub fn args(&self) -> MmLayout {
+        self.args
+    }
+
+    /// Record them at exec
+    pub fn set_args(&mut self, a: MmLayout) {
+        self.args = a;
     }
 
     /// Executable path (/proc/<pid>/exe)
@@ -185,14 +308,57 @@ impl MmStruct {
         self.brk = new_brk;
     }
 
+    /// VMAs in the address space (Linux mm->map_count)
+    pub fn map_count(&self) -> usize {
+        self.vmas.len()
+    }
+
+    /// Room for another mapping (Linux do_mmap, do_brk_flags: ENOMEM
+    /// once map_count exceeds vm.max_map_count)
+    pub fn may_map(&self) -> bool {
+        self.map_count() <= max_map_count()
+    }
+
+    /// Unmapping [start, end) may split a VMA in two (Linux
+    /// vms_gather_munmap_vmas: refused once map_count reaches
+    /// vm.max_map_count, a hole inside one VMA being the only unmap
+    /// that adds one)
+    pub fn may_unmap(&self, start: u64, end: u64) -> bool {
+        self.map_count() < max_map_count()
+            || !self.vmas.iter().any(|v| v.start < start && end < v.end)
+    }
+
+    /// Split the VMA at `idx` at `at` like `split_vma`, refused with
+    /// ENOMEM at vm.max_map_count (Linux split_vma: mprotect, madvise)
+    pub fn split_checked(&mut self, idx: usize, at: u64) -> Result<usize, KernelError> {
+        if self.map_count() >= max_map_count() {
+            return Err(KernelError::OutOfMemory);
+        }
+        self.split_vma(idx, at).ok_or(KernelError::OutOfMemory)
+    }
+
+    /// `split_at` refused at vm.max_map_count
+    pub fn split_at_checked(&mut self, addr: u64) -> Result<(), KernelError> {
+        match self.find_vma_index(addr) {
+            Some(i) if self.vmas[i].start < addr => self.split_checked(i, addr).map(|_| ()),
+            _ => Ok(()),
+        }
+    }
+
     /// Find VMA containing the given address
     pub fn find_vma(&self, addr: u64) -> Option<&Vma> {
-        self.vmas.iter().find(|vma| vma.contains(addr))
+        self.vmas
+            .iter()
+            .find(|vma| vma.contains(addr))
+            .map(|v| &**v)
     }
 
     /// Find VMA containing the given address (mutable reference)
     pub fn find_vma_mut(&mut self, addr: u64) -> Option<&mut Vma> {
-        self.vmas.iter_mut().find(|vma| vma.contains(addr))
+        self.vmas
+            .iter_mut()
+            .find(|vma| vma.contains(addr))
+            .map(|v| &mut **v)
     }
 
     /// Insert a VMA, maintaining sorted order by start address
@@ -204,7 +370,8 @@ impl MmStruct {
             .iter()
             .position(|v| v.start > vma.start)
             .unwrap_or(self.vmas.len());
-        self.vmas.insert(pos, vma);
+        self.link(&vma);
+        self.vmas.insert(pos, alloc::boxed::Box::new(vma));
         pos
     }
 
@@ -227,6 +394,12 @@ impl MmStruct {
             .partition(|v| v.start >= start && v.end <= end);
         self.vmas = kept;
         removed
+            .into_iter()
+            .map(|v| {
+                self.unlink(&v);
+                *v
+            })
+            .collect()
     }
 
     /// Find a free virtual address range of the given size
@@ -247,6 +420,25 @@ impl MmStruct {
         top.checked_sub(size).filter(|&a| a >= MMAP_MIN_ADDR)
     }
 
+    /// The free gap holding [start, end): the end of the VMA below it
+    /// (0 if none) and the start of the one above (the page-table
+    /// ceiling if none), the bounds of `memory::free_pgtables`
+    pub fn gap_around(&self, start: u64, end: u64) -> (u64, u64) {
+        let floor = self
+            .vmas
+            .iter()
+            .filter(|v| v.end <= start)
+            .map(|v| v.end)
+            .max()
+            .unwrap_or(0);
+        let ceiling = self
+            .vmas
+            .iter()
+            .find(|v| v.start >= end)
+            .map_or_else(memory::pgtables_ceiling, |v| v.start);
+        (floor, ceiling)
+    }
+
     /// Check if the given range overlaps any existing VMA
     pub fn overlaps(&self, start: u64, end: u64) -> bool {
         self.vmas
@@ -256,14 +448,21 @@ impl MmStruct {
 
     /// Get iterator over all VMAs
     pub fn iter(&self) -> impl Iterator<Item = &Vma> {
-        self.vmas.iter()
+        self.vmas.iter().map(|v| &**v)
     }
 
-    /// Remove every VMA, resetting the VM counters (exit_mmap)
+    /// Remove every VMA, resetting the VM counters (exit_mmap): each
+    /// leaves its reverse-map chain before the page tables go
     pub fn take_vmas(&mut self) -> Vec<Vma> {
         self.total_vm = 0;
         self.locked_vm = 0;
         core::mem::take(&mut self.vmas)
+            .into_iter()
+            .map(|v| {
+                self.unlink(&v);
+                *v
+            })
+            .collect()
     }
 
     // ========================================================================
@@ -321,7 +520,7 @@ impl MmStruct {
 
     /// Get mutable iterator over all VMAs
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Vma> {
-        self.vmas.iter_mut()
+        self.vmas.iter_mut().map(|v| &mut **v)
     }
 
     // ========================================================================
@@ -379,10 +578,19 @@ impl MmStruct {
 
         let grow_pages = (vma.start - address) >> 12;
 
-        // Update VMA
+        // Its pages keep their index (Linux expand_downwards lowers
+        // vm_pgoff): a VMA moved up by mremap keeps a small pgoff and
+        // cannot grow below index 0 (Linux: grow <= vm_pgoff, ENOMEM)
+        let Some(pgoff) = vma.pgoff.checked_sub(grow_pages) else {
+            return Err(12); // ENOMEM: the access is SIGSEGV
+        };
+        let old_start = vma.start;
         vma.start = address;
+        vma.pgoff = pgoff;
+        let locked = vma.is_locked();
+        self.relink(vma_idx, old_start);
         self.total_vm = self.total_vm.saturating_add(grow_pages);
-        if vma.is_locked() {
+        if locked {
             self.locked_vm = self.locked_vm.saturating_add(grow_pages);
         }
 
@@ -445,7 +653,7 @@ impl MmStruct {
 
         // Perform expansion
         let old_end = self.vmas[vma_idx].end;
-        self.vmas[vma_idx].end = new_end;
+        self.set_end(vma_idx, new_end);
 
         // Update total_vm accounting
         let grow_pages = (new_end - old_end) >> 12;
@@ -465,7 +673,8 @@ impl MmStruct {
             return None;
         }
 
-        let vma = self.vmas.remove(vma_idx);
+        let vma = *self.vmas.remove(vma_idx);
+        self.unlink(&vma);
         let pages = vma.size() >> 12;
         self.total_vm = self.total_vm.saturating_sub(pages);
         if vma.is_locked() {
@@ -477,12 +686,12 @@ impl MmStruct {
 
     /// Get a reference to a VMA by index
     pub fn get_vma(&self, vma_idx: usize) -> Option<&Vma> {
-        self.vmas.get(vma_idx)
+        self.vmas.get(vma_idx).map(|v| &**v)
     }
 
     /// Get a mutable reference to a VMA by index
     pub fn get_vma_mut(&mut self, vma_idx: usize) -> Option<&mut Vma> {
-        self.vmas.get_mut(vma_idx)
+        self.vmas.get_mut(vma_idx).map(|v| &mut **v)
     }
 
     // ========================================================================
@@ -508,8 +717,13 @@ impl MmStruct {
         }
 
         // Clone VMA for the second half
-        let mut new_vma = vma.clone();
+        let mut new_vma = alloc::boxed::Box::new((**vma).clone());
         new_vma.start = split_addr;
+        // Bounded: pgoff + pages fits (pgoff <= TASK_SIZE / 4KB at
+        // creation and only ever lowered by growth)
+        new_vma.pgoff = vma
+            .pgoff
+            .checked_add((split_addr - vma.start) / PAGE_SIZE)?;
 
         // Adjust the offset into the backing file or shared object
         if new_vma.file.is_some() || new_vma.shmem.is_some() {
@@ -517,10 +731,11 @@ impl MmStruct {
         }
 
         // Truncate original VMA to end at split point
-        self.vmas[vma_idx].end = split_addr;
+        self.set_end(vma_idx, split_addr);
 
         // Insert new VMA after the original
         // (VMA list remains sorted since new_vma.start > vmas[vma_idx].start)
+        self.link(&new_vma);
         self.vmas.insert(vma_idx + 1, new_vma);
 
         Some(vma_idx + 1)
@@ -539,10 +754,11 @@ impl MmStruct {
             return false;
         }
         if self.vmas[idx].can_merge_with(&self.vmas[idx + 1]) {
-            // Extend first VMA to cover second
-            self.vmas[idx].end = self.vmas[idx + 1].end;
             // Remove second VMA (no accounting change - same total memory)
-            self.vmas.remove(idx + 1);
+            let next = self.vmas.remove(idx + 1);
+            self.unlink(&next);
+            // Extend first VMA to cover second
+            self.set_end(idx, next.end);
             return true;
         }
         false
@@ -557,10 +773,11 @@ impl MmStruct {
             return false;
         }
         if self.vmas[idx - 1].can_merge_with(&self.vmas[idx]) {
-            // Extend previous VMA to cover this one
-            self.vmas[idx - 1].end = self.vmas[idx].end;
             // Remove this VMA (no accounting change - same total memory)
-            self.vmas.remove(idx);
+            let cur = self.vmas.remove(idx);
+            self.unlink(&cur);
+            // Extend previous VMA to cover this one
+            self.set_end(idx - 1, cur.end);
             return true;
         }
         false
@@ -601,8 +818,14 @@ pub struct Mm {
     users: AtomicUsize,
     /// Physical address of the top-level table (owned; never changes)
     pgd: u64,
-    /// The VMA tree and accounting; this spin lock is hk's mmap_lock
-    map: Mutex<MmStruct>,
+    /// The VMA tree and accounting under the mmap_lock (Linux
+    /// mm->mmap_lock, a sleeping rw_semaphore)
+    map: RwSem<MmStruct>,
+    /// Page-table structure changes (Linux mm->page_table_lock, `ptl`)
+    page_table_lock: Mutex<()>,
+    /// Dumpability (Linux mm->flags MMF_DUMPABLE: `task::dumpable`),
+    /// shared by every task of the address space
+    dumpable: AtomicU8,
     /// TLB state: where it is loaded, flush generation, ASID
     ctx: tlb::MmContext,
 }
@@ -613,14 +836,47 @@ impl Mm {
         self.pgd
     }
 
-    /// Lock the VMA tree (mmap_lock). Linux's mmap_lock sleeps, so its
-    /// waiters never block IPIs; this one is spun on, maybe with
-    /// interrupts off (a syscall), while its holder may be flushing this
-    /// CPU's TLB: the wait answers this CPU's cross-CPU calls
-    /// (doc/LOCKING.md, Cross-CPU Calls)
+    /// The mmap_lock for reading (Linux mmap_read_lock): faults,
+    /// mincore, /proc maps, MADV_DONTNEED and other VMA lookups
     #[track_caller]
-    pub fn lock(&self) -> crate::sync::spin::MutexGuard<'_, MmStruct> {
-        crate::sync::spin::lock_with(&self.map, crate::smp::poll_queue)
+    pub fn mmap_read(&self) -> RwSemReadGuard<'_, MmStruct> {
+        self.map.read()
+    }
+
+    /// The mmap_lock for writing (Linux mmap_write_lock): VMA changes
+    #[track_caller]
+    pub fn mmap_write(&self) -> RwSemWriteGuard<'_, MmStruct> {
+        self.map.write()
+    }
+
+    /// `mmap_read`, or EINTR once SIGKILL is pending (Linux
+    /// mmap_read_lock_killable)
+    #[track_caller]
+    pub fn mmap_read_killable(&self) -> Result<RwSemReadGuard<'_, MmStruct>, KernelError> {
+        self.map.read_killable()
+    }
+
+    /// `mmap_write`, or EINTR once SIGKILL is pending (Linux
+    /// mmap_write_lock_killable)
+    #[track_caller]
+    pub fn mmap_write_killable(&self) -> Result<RwSemWriteGuard<'_, MmStruct>, KernelError> {
+        self.map.write_killable()
+    }
+
+    /// The page_table_lock (taken through `ptl::pt_lock`)
+    pub(crate) fn page_table_lock(&self) -> &Mutex<()> {
+        &self.page_table_lock
+    }
+
+    /// Dumpability (Linux get_dumpable): SUID_DUMP_*
+    pub fn dumpable(&self) -> u8 {
+        self.dumpable.load(Ordering::Relaxed)
+    }
+
+    /// Set the dumpability (Linux set_dumpable): PR_SET_DUMPABLE, exec,
+    /// a credential change; seen by every task of the address space
+    pub fn set_dumpable(&self, v: u8) {
+        self.dumpable.store(v, Ordering::Relaxed);
     }
 
     /// TLB state (Linux mm->context)
@@ -647,13 +903,11 @@ pub struct MmRef(Arc<Mm>);
 
 impl MmRef {
     /// A new address space rooted at the fresh table `pgd`, with one user
-    pub fn new(pgd: u64, map: MmStruct) -> Self {
-        MmRef(Arc::new(Mm {
-            users: AtomicUsize::new(1),
-            pgd,
-            map: Mutex::new(map),
-            ctx: tlb::MmContext::new(),
-        }))
+    pub fn new(pgd: u64, mut map: MmStruct) -> Self {
+        Self::new_cyclic(pgd, |me| {
+            map.set_owner(me, pgd);
+            map
+        })
     }
 
     /// A new address space rooted at `pgd`, with one user, whose VMAs
@@ -662,7 +916,9 @@ impl MmRef {
         MmRef(Arc::new_cyclic(|me| Mm {
             users: AtomicUsize::new(1),
             pgd,
-            map: Mutex::new(build(me)),
+            map: RwSem::new(build(me)),
+            page_table_lock: Mutex::new(()),
+            dumpable: AtomicU8::new(crate::task::dumpable::SUID_DUMP_USER),
             ctx: tlb::MmContext::new(),
         }))
     }
@@ -714,18 +970,19 @@ pub fn mmget_not_zero(mm: &Arc<Mm>) -> Option<MmRef> {
     None
 }
 
-use crate::task::percpu::TASK_TABLE;
+use crate::task::percpu::TASKLIST;
 
 /// The address space of task `tid` (an mm_count reference; the task
 /// itself holds the user reference, so it stays mapped while the task
 /// uses it)
 pub fn get_task_mm(tid: Tid) -> Option<Arc<Mm>> {
-    let table = TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .and_then(|t| t.mm.as_ref().map(|m| m.arc().clone()))
+    // The current task's own, lock-free (Linux current->mm)
+    let me = crate::task::percpu::current();
+    if me.tid() == tid {
+        return me.mm();
+    }
+    let table = TASKLIST.read();
+    table.get(tid).and_then(|t| t.mm().map(|m| m.arc().clone()))
 }
 
 /// A user reference to task `tid`'s address space (Linux get_task_mm),
@@ -741,12 +998,8 @@ pub fn get_task_mm_users(tid: Tid) -> Option<MmRef> {
 /// loaded on this CPU, until the task has switched away.
 pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
     let mm = {
-        let mut table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.mm.take())
+        let mut table = TASKLIST.write();
+        table.get_mut(tid).and_then(|mut t| t.set_mm(None))
     }?;
     let keep = mm.arc().clone();
     drop(mm);
@@ -763,14 +1016,20 @@ pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
 /// inherited (VM_LOCKED cleared, locked_vm and MCL_FUTURE reset). On
 /// error the partial copy is torn down with the child mm.
 pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
-    let guard = parent.lock();
+    let Ok(guard) = parent.mmap_write_killable() else {
+        // The child mm was never built: its table is ours to free
+        crate::FRAME_ALLOCATOR.free(pgd);
+        return Err(KernelError::Interrupted.errno());
+    };
     let mut res = Ok(());
     let child = MmRef::new_cyclic(pgd, |me| {
         let mut map = MmStruct::new(guard.mmap_base);
+        map.set_owner(me, pgd);
         map.start_brk = guard.start_brk;
         map.brk = guard.brk;
         map.total_vm = guard.total_vm;
         map.exe = guard.exe.clone();
+        map.args = guard.args;
         for vma in guard.iter() {
             if vma.flags & VM_DONTCOPY != 0 {
                 map.total_vm -= vma.size() / PAGE_SIZE;
@@ -781,9 +1040,9 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
             if v.flags & VM_WIPEONFORK != 0 {
                 v.anon_vma = v.anon_vma.as_ref().map(|_| anon_vma::AnonVma::new());
             }
-            if let Some(av) = &v.anon_vma {
-                av.add_vma(me.clone(), pgd, v.start, v.end);
-            }
+            // In the chain before its pages are copied (Linux
+            // anon_vma_fork before copy_page_range)
+            map.link(&v);
             if v.flags & VM_WIPEONFORK == 0 {
                 res = memory::copy_page_range(pgd, parent, &v).map(|wp| {
                     if wp {
@@ -791,7 +1050,7 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
                     }
                 });
             }
-            map.vmas.push(v);
+            map.vmas.push(alloc::boxed::Box::new(v));
             if res.is_err() {
                 break;
             }
@@ -799,6 +1058,9 @@ pub fn dup_mm(parent: &MmRef, pgd: u64) -> Result<MmRef, i32> {
         map
     });
     drop(guard);
+    // A fork child's address space holds the same secrets (Linux
+    // dup_mmap copies mm->flags)
+    child.set_dumpable(parent.dumpable());
     // On error `child` goes with its partial copy (outside the lock)
     res.map(|_| child)
 }
@@ -840,6 +1102,53 @@ mod tests {
         let gone = m.remove_range(0x11000, 0x12000);
         assert_eq!(gone.len(), 1);
         assert_eq!(spans(&m), [(0x10000, 0x11000), (0x12000, 0x20000)]);
+    }
+
+    /// The chain entries (start, end, pgoff, locked) of an AnonVma
+    fn chain(av: &anon_vma::AnonVma) -> Vec<(u64, u64, u64, bool)> {
+        let mut v: Vec<_> = av
+            .read()
+            .iter()
+            .map(|c| (c.start, c.end, c.pgoff, c.locked))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Every VMA change keeps the reverse-map chain in step: split,
+    /// lock, merge, partial unmap, exit
+    #[test]
+    fn chain_follows_vma_changes() {
+        let mut m = MmStruct::new(0x7000_0000);
+        m.set_owner(&Weak::new(), 7);
+        let av = anon_vma::AnonVma::new();
+        let rw = PROT_READ | PROT_WRITE;
+        let flags = MAP_PRIVATE | MAP_ANONYMOUS;
+        m.insert_vma(Vma::new_anon(0x10000, 0x20000, rw, flags, av.clone()));
+        assert_eq!(chain(&av), [(0x10000, 0x20000, 0x10, false)]);
+        let i = m.split_vma(0, 0x18000).unwrap();
+        m.set_flags(i, flags | VM_LOCKED);
+        assert_eq!(
+            chain(&av),
+            [
+                (0x10000, 0x18000, 0x10, false),
+                (0x18000, 0x20000, 0x18, true)
+            ]
+        );
+        m.set_flags(i, flags);
+        m.merge_adjacent(0);
+        assert_eq!(chain(&av), [(0x10000, 0x20000, 0x10, false)]);
+        let gone = m.remove_range(0x12000, 0x13000);
+        assert_eq!(gone.len(), 1);
+        assert_eq!(
+            chain(&av),
+            [
+                (0x10000, 0x12000, 0x10, false),
+                (0x13000, 0x20000, 0x13, false)
+            ]
+        );
+        m.take_vmas();
+        assert!(av.is_empty());
     }
 
     #[test]

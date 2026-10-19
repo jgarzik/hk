@@ -123,8 +123,9 @@ fn pmd_entry(p: *mut u64) -> &'static core::sync::atomic::AtomicU64 {
 }
 
 /// Split the 2MB page mapping `va` in `mm` into 512 4KB entries (Linux
-/// __split_huge_pmd_locked), mm lock held. The page table is allocated
-/// first, so a failure (ENOMEM) changes nothing. Then break before
+/// __split_huge_pmd_locked), mm lock held; takes the page_table_lock
+/// (a racing fault may split or map at the same time). The page table
+/// is allocated first, so a failure (ENOMEM) changes nothing. Then break before
 /// make (Linux pmdp_invalidate): the 2MB entry is cleared and flushed
 /// on every CPU before the table replaces it, so no CPU caches a 2MB
 /// and a 4KB translation of one address at once (ARM ARM D8.16, Intel
@@ -137,44 +138,79 @@ pub fn split_huge_pmd(mm: &super::Mm, va: u64) -> Option<u64> {
     use crate::arch::paging;
     use core::sync::atomic::Ordering;
     let pmdp = paging::pmd_ptr(mm.pgd(), va)?;
-    let old = pmd_entry(pmdp).load(Ordering::Acquire);
-    if !paging::pmd_huge(old) {
+    if !paging::pmd_huge(pmd_entry(pmdp).load(Ordering::Acquire)) {
         return None;
     }
     let pt = crate::FRAME_ALLOCATOR.alloc()?;
-    if pmd_entry(pmdp)
-        .compare_exchange(old, 0, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    let _l = super::ptl::pt_lock(mm);
+    let Some(old) = clear_huge(pmd_entry(pmdp)) else {
         crate::FRAME_ALLOCATOR.free(pt);
         return None;
-    }
+    };
     // All levels (Linux flush_pmd_tlb_range): a table replaces the block
     flush_huge(mm, va);
     // The hardware may have set accessed/dirty until the clear: `old`
-    // is the value cleared (the compare-and-swap succeeded on it)
+    // is the value cleared
     let base = paging::split_table(pt, old);
     paging::pmd_populate(pmdp, pt);
     crate::FRAME_ALLOCATOR.split_huge(base);
+    split_rmap(base);
     Some(base)
 }
 
+/// The 512 pages of a split anonymous 2MB page each take the head's
+/// mapping (an AnonVma reference each), their own index and one
+/// mapping, and join the LRU (Linux __split_huge_page_tail,
+/// lru_add_split_folio)
+fn split_rmap(base: u64) {
+    use crate::mm::page::phys_to_page;
+    use core::sync::atomic::Ordering;
+    let Some(head) = phys_to_page(base) else {
+        return;
+    };
+    let Some(av) = head.get_anon_vma() else {
+        return;
+    };
+    let index = head.index.load(Ordering::Relaxed);
+    let maps = head.mapcount();
+    for i in 0..PAGES_PER_HUGE_PAGE as u64 {
+        let phys = base + i * PAGE_SIZE;
+        if let Some(pg) = phys_to_page(phys)
+            && i > 0
+        {
+            pg.set_anon_mapping(&av);
+            pg.index.store(index + i, Ordering::Relaxed);
+            pg.mapcount.store(maps, Ordering::Relaxed);
+        }
+        crate::mm::lru::lru_add(phys);
+    }
+}
+
 /// Clear the 2MB page entry for `base` in `mm` (Linux zap_huge_pmd), mm
-/// lock held; the caller flushes it (`Gather`) before releasing the
+/// lock held, under the page_table_lock; the caller flushes it (`Gather`) before releasing the
 /// returned frame, which still holds the mapping's reference.
 pub fn take_huge_pmd(mm: &super::Mm, base: u64) -> Option<u64> {
     use crate::arch::paging;
-    use core::sync::atomic::Ordering;
     let pmd = pmd_entry(paging::pmd_ptr(mm.pgd(), base)?);
-    let old = pmd.load(Ordering::Acquire);
-    if !paging::pmd_huge(old)
-        || pmd
-            .compare_exchange(old, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
+    let _l = super::ptl::pt_lock(mm);
+    let old = clear_huge(pmd)?;
+    Some(paging::pte_addr(old) & !HUGE_PAGE_MASK)
+}
+
+/// Clear a 2MB page entry, page_table_lock held (Linux
+/// pmdp_huge_get_and_clear): the value cleared, None if it maps no 2MB
+/// page. An exchange, not a compare-and-swap: the MMU may set the
+/// accessed/dirty bits at any time, but only software turns a 2MB entry
+/// into something else, and every software writer of one holds the
+/// page_table_lock or the mmap_lock for writing (excluding the caller).
+fn clear_huge(pmd: &core::sync::atomic::AtomicU64) -> Option<u64> {
+    use core::sync::atomic::Ordering;
+    if !crate::arch::paging::pmd_huge(pmd.load(Ordering::Acquire)) {
         return None;
     }
-    Some(paging::pte_addr(old) & !HUGE_PAGE_MASK)
+    let old = pmd.swap(0, Ordering::AcqRel);
+    debug_assert!(crate::arch::paging::pmd_huge(old));
+    Some(old)
 }
 
 /// Flush the 2MB page translation at `va` of `mm`, paging-structure

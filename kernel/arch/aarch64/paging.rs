@@ -47,6 +47,10 @@ pub const IO_BASE: u64 = 0xFFFF_8002_0000_0000;
 /// Size of the device window
 pub const IO_SIZE: u64 = 1 << 30;
 
+/// Virtual memory map: the struct page array, indexed by pfn (Linux
+/// arm64 48-bit VMEMMAP_START)
+pub const VMEMMAP_START: u64 = 0xFFFF_FC00_0000_0000;
+
 /// End of user space: all of TTBR0 (48-bit)
 pub const TASK_SIZE: u64 = 1 << 48;
 
@@ -276,6 +280,11 @@ pub fn pmd_ptr(root: u64, va: u64) -> Option<*mut u64> {
     Some(entry_atomic(table, va >> 21).as_ptr())
 }
 
+/// The next-level table an L0-L2 entry points to (not a block)
+pub fn table_of(e: u64) -> Option<u64> {
+    (e & 0b11 == DESC_TABLE).then_some(e & ADDR_MASK)
+}
+
 /// A 2MB-level entry maps a huge page (block)
 pub fn pmd_huge(pmd: u64) -> bool {
     pmd & 0b11 == DESC_BLOCK
@@ -284,7 +293,7 @@ pub fn pmd_huge(pmd: u64) -> bool {
 /// Pointer to the 4KB leaf (L3) entry for `va`, allocating the missing
 /// tables (Linux pte_alloc). A table is installed with a compare and
 /// swap, so racing faults share one. None if out of memory (down to
-/// the kernel's reserve) or a block maps `va`.
+/// the low watermark) or a block maps `va`.
 pub fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
     if !user_va(va) {
         return None;
@@ -294,12 +303,10 @@ pub fn pte_alloc(root: u64, va: u64) -> Option<*mut u64> {
         let slot = entry_atomic(table, va >> shift);
         let mut e = slot.load(Ordering::Acquire);
         if e & 0b11 == DESC_INVALID {
-            // User page tables stop at the kernel's reserve, like
-            // user pages (Linux GFP_PGTABLE_USER at the min watermark)
-            if crate::FRAME_ALLOCATOR.below_reserve() {
-                return None;
-            }
-            let new = crate::FRAME_ALLOCATOR.alloc()?;
+            // User page tables stop at the low watermark like the
+            // user pages they map: a process touching sparse addresses
+            // cannot drain the kernel's reserve with tables
+            let new = crate::FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::USER)?;
             // SAFETY: a fresh frame, reached through the linear map
             unsafe { core::ptr::write_bytes(phys_to_virt(new), 0, PAGE_SIZE as usize) };
             let ent = new | DESC_TABLE;
@@ -448,31 +455,6 @@ impl UserTables {
     pub fn free(self, put: &mut dyn FnMut(Leaf)) {
         for t in self.0 {
             free_level(t, 1, put);
-        }
-    }
-}
-
-/// Each user leaf under the TTBR0 root `l0_phys` that maps a page, in
-/// address order: `f(va, entry, huge)` for a 4KB entry (protnone
-/// included) or a 2MB block (debug check, `mm::check`; mm lock held)
-#[cfg(feature = "mmcheck")]
-pub fn walk_user(l0_phys: u64, f: &mut dyn FnMut(u64, u64, bool)) {
-    walk_level(l0_phys, 0, 0, f);
-}
-
-/// Walk the table at `phys` (`level` 0 = L0 .. 3 = L3) mapping from `base`
-#[cfg(feature = "mmcheck")]
-fn walk_level(phys: u64, level: u32, base: u64, f: &mut dyn FnMut(u64, u64, bool)) {
-    let table = phys_to_virt_table_const(phys);
-    for i in 0..ENTRIES_PER_TABLE {
-        // SAFETY: a live table of the locked mm
-        let e = unsafe { *(*table).entry(i) };
-        let va = base + ((i as u64) << (39 - 9 * level));
-        match level {
-            3 if pte_present(e.0) => f(va, e.0, false),
-            2 if e.is_block() => f(va, e.0, true),
-            0..=2 if e.is_table() => walk_level(e.addr(), level + 1, va, f),
-            _ => {}
         }
     }
 }

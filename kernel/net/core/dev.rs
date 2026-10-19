@@ -44,11 +44,12 @@ use crate::sync::spin::{Mutex, RwLock};
 use spin::Once;
 
 use crate::arch::IrqSpinlock;
+use crate::cpu::PerCpu;
 use crate::net::device::NetDevice;
 use crate::net::ethernet::{self, PktType};
 use crate::net::skb::SkBuff;
 use crate::task::kthread::KThread;
-use crate::task::percpu::{MAX_SCHED_CPUS, cpu_has_scheduler, current_cpu};
+use crate::task::percpu::cpu_has_scheduler;
 use crate::waitqueue::WaitQueue;
 
 /// Default NAPI weight (Linux NAPI_POLL_WEIGHT)
@@ -196,7 +197,7 @@ pub fn netif_napi_add(napi: &Arc<Napi>, poller: Weak<dyn NapiPoll>) {
     };
     // Each Napi is on at most one poll list at a time: with this capacity
     // the ISR's push never allocates
-    for sd in SOFTNET.iter() {
+    for (_, sd) in SOFTNET.for_each_possible() {
         let mut q = sd.poll_list.lock();
         let extra = n.saturating_sub(q.len());
         q.reserve(extra);
@@ -296,11 +297,12 @@ impl Softnet {
     fn has_work(&self) -> bool {
         let napi = !self.poll_list.lock().is_empty();
         let backlog = !self.backlog.lock().is_empty();
-        napi || backlog || (core::ptr::eq(self, &SOFTNET[0]) && TIMER_DUE.load(Ordering::Acquire))
+        napi || backlog
+            || (core::ptr::eq(self, SOFTNET.get(0)) && TIMER_DUE.load(Ordering::Acquire))
     }
 }
 
-static SOFTNET: [Softnet; MAX_SCHED_CPUS] = [const { Softnet::new() }; MAX_SCHED_CPUS];
+static SOFTNET: PerCpu<Softnet> = crate::percpu![Softnet::new()];
 
 /// Protocol timers are due (run by softnet/0; decision 1: timers only
 /// flag and wake, protocol work stays in softnet)
@@ -310,7 +312,7 @@ static TIMER_DUE: AtomicBool = AtomicBool::new(false);
 /// callback on ktimerd; thread context)
 pub fn raise_timer() {
     TIMER_DUE.store(true, Ordering::Release);
-    SOFTNET[0].wq.wake_all();
+    SOFTNET.get(0).wq.wake_all();
 }
 
 /// Softnet threads, by CPU
@@ -318,44 +320,20 @@ static SOFTNET_THREADS: Mutex<Vec<Arc<KThread>>> = Mutex::new(Vec::new());
 static SOFTNET_STARTED: AtomicU32 = AtomicU32::new(0);
 
 fn this_softnet() -> &'static Softnet {
-    let cpu = current_cpu() as usize;
-    &SOFTNET[cpu.min(MAX_SCHED_CPUS - 1)]
+    SOFTNET.this()
 }
-
-/// Thread names (kthread names are &'static str), one per possible CPU
-const SOFTNET_NAMES: [&str; 16] = [
-    "softnet/0",
-    "softnet/1",
-    "softnet/2",
-    "softnet/3",
-    "softnet/4",
-    "softnet/5",
-    "softnet/6",
-    "softnet/7",
-    "softnet/8",
-    "softnet/9",
-    "softnet/10",
-    "softnet/11",
-    "softnet/12",
-    "softnet/13",
-    "softnet/14",
-    "softnet/15",
-];
-const _: () = assert!(
-    SOFTNET_NAMES.len() >= MAX_SCHED_CPUS,
-    "a softnet name per CPU"
-);
 
 /// Start one `softnet/N` thread per CPU that runs a scheduler (after
 /// scheduling is enabled). Work queued earlier (IRQs during boot) is
 /// picked up on the threads' first pass.
 pub fn softnet_init() {
     let mut started = 0;
-    for (cpu, name) in SOFTNET_NAMES.iter().enumerate().take(MAX_SCHED_CPUS) {
+    for cpu in 0..crate::cpu::nr_cpu_ids() as usize {
         if !cpu_has_scheduler(cpu as u32) {
             continue;
         }
-        match crate::task::kthread::kthread_run(name, softnet_thread, cpu, Some(cpu as u32)) {
+        let name = alloc::format!("softnet/{cpu}");
+        match crate::task::kthread::kthread_run(&name, softnet_thread, cpu, Some(cpu as u32)) {
             Ok(k) => {
                 SOFTNET_THREADS.lock().push(k);
                 started += 1;
@@ -369,7 +347,7 @@ pub fn softnet_init() {
 
 /// Body of `softnet/N` (Linux net_rx_action + ksoftirqd)
 fn softnet_thread(cpu: usize) {
-    let sd = &SOFTNET[cpu];
+    let sd = SOFTNET.get(cpu as u32);
     loop {
         sd.wq.wait_event(|| sd.has_work());
         let mut budget = NETDEV_BUDGET;
@@ -544,7 +522,7 @@ pub fn dev_queue_xmit(skb: Box<SkBuff>) -> Result<(), crate::error::KernelError>
 /// Per-CPU softnet statistics: (processed, dropped, time_squeeze), for
 /// `/proc/net/softnet_stat`-style reporting
 pub fn softnet_stats(cpu: usize) -> Option<(u64, u64, u64)> {
-    let sd = SOFTNET.get(cpu)?;
+    let sd = SOFTNET.try_get(u32::try_from(cpu).ok()?)?;
     Some((
         sd.processed.load(Ordering::Relaxed),
         sd.dropped.load(Ordering::Relaxed),

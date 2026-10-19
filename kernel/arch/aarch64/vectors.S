@@ -299,6 +299,9 @@ el1_sync_handler:
 
     // Call Rust handler: handle_el1_sync(frame: *mut TrapFrame, esr: u64)
     bl      handle_el1_sync
+    // The handler may have unmasked IRQs (a fault): masked again before
+    // ELR/SPSR_EL1 are restored
+    msr     daifset, #2
 
     RESTORE_CONTEXT
     eret
@@ -338,7 +341,10 @@ el0_sync_handler:
     mrs     x1, esr_el1
 
     // Call Rust handler: handle_el0_sync(frame: *mut TrapFrame, esr: u64)
+    // (syscalls and faults run with IRQs unmasked)
     bl      handle_el0_sync
+    // Masked again before ELR/SPSR_EL1 are restored
+    msr     daifset, #2
 
     // Memory barrier before returning to user mode to ensure all
     // kernel memory updates are visible.

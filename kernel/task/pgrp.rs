@@ -91,13 +91,7 @@ pub fn sys_setpgid(
 
     // Call the scheduler function to update the task
     match super::percpu::set_task_pgid(target_pid, new_pgid, caller_sid) {
-        Ok(()) => {
-            // Update per-CPU cached value if we changed our own PGID
-            if target_pid == caller_pid {
-                super::percpu::update_current_pgid_sid(new_pgid, caller_sid);
-            }
-            0
-        }
+        Ok(()) => 0,
         Err(errno) => -(errno as i64),
     }
 }
@@ -115,11 +109,7 @@ pub fn sys_setpgid(
 /// - -EPERM if already a process group leader
 pub fn sys_setsid(caller_pid: Pid, caller_pgid: Pid) -> i64 {
     match super::percpu::create_session(caller_pid, caller_pgid) {
-        Ok(new_sid) => {
-            // Update per-CPU cached values (pgid = sid = pid for new session leader)
-            super::percpu::update_current_pgid_sid(new_sid, new_sid);
-            new_sid as i64
-        }
+        Ok(new_sid) => new_sid as i64,
         Err(errno) => -(errno as i64),
     }
 }

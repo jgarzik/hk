@@ -38,10 +38,8 @@ use core::arch::asm;
 use crate::arch::{
     AcpiInfo, AcpiOps, Arch, ArchBusOps, ContextOps, CpuInfo, CpuOps, EarlyArchInit, ExceptionOps,
     FrameAlloc, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps, MemoryLayoutOps, PerCpuOps,
-    PowerInfo, PowerOps, SchedArch, SmpOps, SyscallOps, TimekeeperOps, TimerCallbackOps,
-    UserModeOps, VfsInitOps,
+    PowerInfo, PowerOps, SchedArch, SmpOps, SyscallOps, TimekeeperOps, UserModeOps, VfsInitOps,
 };
-use crate::task::{CurrentTask, Tid};
 
 /// AArch64 trap frame for saving/restoring CPU state on exception entry
 ///
@@ -372,20 +370,6 @@ impl SyscallOps for Aarch64Arch {
 }
 
 // ============================================================================
-// TimerCallbackOps trait implementation
-// ============================================================================
-
-static mut TIMER_PREEMPT_CALLBACK: Option<fn()> = None;
-
-impl TimerCallbackOps for Aarch64Arch {
-    unsafe fn set_timer_preempt_callback(callback: fn()) {
-        unsafe {
-            TIMER_PREEMPT_CALLBACK = Some(callback);
-        }
-    }
-}
-
-// ============================================================================
 // ArchBusOps trait implementation
 // ============================================================================
 
@@ -439,6 +423,13 @@ impl UserModeOps for Aarch64Arch {
             asm!(
                 // The image's code was synced to the instruction caches
                 // when exec loaded it (paging::sync_page)
+
+                // Mask every exception first: exec runs with interrupts
+                // on, and an IRQ taken between the ELR_EL1/SPSR_EL1
+                // writes and ERET overwrote them with its own return
+                // (EL1, here): ERET then entered EL0 at a kernel
+                // address. ERET restores DAIF from SPSR (all clear).
+                "msr daifset, #0xf",
 
                 // Set up user stack pointer (SP_EL0)
                 "msr sp_el0, {user_stack}",
@@ -544,28 +535,23 @@ impl UserModeOps for Aarch64Arch {
 // ============================================================================
 
 impl PerCpuOps for Aarch64Arch {
-    const MAX_CPUS: usize = percpu::MAX_CPUS;
-
     #[inline]
     fn try_current_cpu_id() -> Option<u32> {
         percpu::try_current_cpu().map(|p| p.cpu_id)
     }
 
     #[inline]
-    fn current_tid() -> Tid {
-        percpu::try_current_cpu()
-            .map(|p| p.current_tid.load(core::sync::atomic::Ordering::Relaxed) as Tid)
-            .unwrap_or(0)
+    fn current_task_ptr() -> usize {
+        match percpu::try_current_cpu() {
+            Some(p) => p.curr.load(core::sync::atomic::Ordering::Relaxed),
+            None => crate::task::percpu::no_percpu_task(),
+        }
     }
 
     #[inline]
-    fn set_current_tid(tid: Tid) {
-        if percpu::try_current_cpu().is_some() {
-            unsafe {
-                percpu::current_cpu_mut()
-                    .current_tid
-                    .store(tid as u32, core::sync::atomic::Ordering::Relaxed);
-            }
+    fn set_current_task_ptr(t: usize) {
+        if let Some(p) = percpu::try_current_cpu() {
+            p.curr.store(t, core::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -608,25 +594,6 @@ impl PerCpuOps for Aarch64Arch {
                     .load(core::sync::atomic::Ordering::Relaxed)
             })
             .unwrap_or(0)
-    }
-
-    #[inline]
-    fn get_current_task() -> CurrentTask {
-        percpu::try_current_cpu()
-            .map(|p| p.current_task)
-            .unwrap_or_default()
-    }
-
-    #[inline]
-    fn set_current_task(task: &CurrentTask) {
-        if percpu::try_current_cpu().is_some() {
-            unsafe {
-                percpu::current_cpu_mut().current_task.set(
-                    task.tid, task.pid, task.ppid, task.pgid, task.sid, task.cred,
-                );
-                percpu::current_cpu_mut().current_task.exiting = task.exiting;
-            }
-        }
     }
 
     #[inline]
@@ -698,20 +665,20 @@ impl ContextOps for Aarch64Arch {
         old_ctx: *mut Self::TaskContext,
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        next_tid: Tid,
+        next_tls: u64,
     ) {
         unsafe {
-            context::context_switch(old_ctx, new_ctx, new_kstack, next_tid);
+            context::context_switch(old_ctx, new_ctx, new_kstack, next_tls);
         }
     }
 
     unsafe fn context_switch_first(
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        next_tid: Tid,
+        next_tls: u64,
     ) -> ! {
         unsafe {
-            context::context_switch_first(new_ctx, new_kstack, next_tid);
+            context::context_switch_first(new_ctx, new_kstack, next_tls);
         }
     }
 }
@@ -780,23 +747,24 @@ impl SchedArch for Aarch64Arch {
 // ============================================================================
 
 impl MemoryLayoutOps for Aarch64Arch {
-    fn get_frame_alloc_region() -> (u64, u64) {
-        // Frames run from the heap end (placed past the kernel image,
-        // `aarch64_heap`) to the end of the linear-mapped RAM
-        let base = crate::HEAP_END.load(core::sync::atomic::Ordering::Relaxed) as u64;
-        let end = kmap::direct_end();
-        assert!(base != 0 && base < end, "no RAM for frames");
-        (base, end - base)
-    }
-
-    fn for_each_reserved(f: &mut dyn FnMut(u64, u64)) {
+    fn memblock_init() {
+        // RAM was added by `kmap::init` (it linear-maps every range)
         let dtb = unsafe { crate::DTB_PTR };
+        let mut mb = crate::mm::memblock::MEMBLOCK.lock();
+        mb.set_limit(kmap::direct_end());
+        let (start, end) = kmap::image_range();
+        mb.reserve(start, end - start);
         if let Some(n) = dtb::total_size(dtb) {
-            f(dtb, dtb + n as u64);
+            mb.reserve(dtb, n as u64);
         }
         if let Some(i) = dtb::extract_initramfs(dtb) {
-            f(i.start, i.end);
+            mb.reserve(i.start, i.end.saturating_sub(i.start));
         }
+        dtb::for_each_firmware_reserved(dtb, |base, size| mb.reserve(base, size));
+    }
+
+    unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+        unsafe { kmap::map_page(va, pa, table) }
     }
 }
 

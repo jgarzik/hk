@@ -4,7 +4,7 @@
 //! for ptrace operations.
 
 use crate::task::Tid;
-use crate::task::percpu::TASK_TABLE;
+use crate::task::percpu::TASKLIST;
 
 // =============================================================================
 // User register structure (matches Linux struct user_regs_struct)
@@ -70,8 +70,8 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
     // This is a simplified approach - full implementation would need to
     // handle the case where the task is stopped mid-syscall.
 
-    let table = TASK_TABLE.lock();
-    let task = table.tasks.iter().find(|t| t.tid == tid).ok_or(-3i32)?; // ESRCH
+    let table = TASKLIST.read();
+    let task = table.get(tid).ok_or(-3i32)?; // ESRCH
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
@@ -107,7 +107,7 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
         eflags: tf.rflags,
         rsp: tf.rsp,
         ss: 0x2b, // User stack segment
-        fs_base: task.tls_base,
+        fs_base: task.task.tls.load(core::sync::atomic::Ordering::Relaxed),
         gs_base: 0,
         ds: 0x2b,
         es: 0x2b,
@@ -123,12 +123,24 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
 /// The tracee must be in Traced state. This updates the task's saved
 /// user context so the registers take effect when it resumes.
 pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
-    let mut table = TASK_TABLE.lock();
-    let task = table.tasks.iter_mut().find(|t| t.tid == tid).ok_or(-3i32)?; // ESRCH
+    let mut table = TASKLIST.write();
+    let mut task = table.get_mut(tid).ok_or(-3i32)?; // ESRCH
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
         return Err(-3); // ESRCH - not stopped
+    }
+
+    // A non-canonical RIP would fault on the return to user mode in ring
+    // 0 (SYSRET with the user stack loaded): refused (EIO). Linux takes
+    // it and returns through IRET, which delivers SIGSEGV.
+    if regs.rip >= 0x0000_8000_0000_0000 {
+        return Err(-5);
+    }
+    // Linux putreg: a base at or above TASK_SIZE_MAX is EIO (the user
+    // GS base is not kept, but checked all the same)
+    if !super::percpu::fs_base_ok(regs.fs_base) || !super::percpu::fs_base_ok(regs.gs_base) {
+        return Err(-5);
     }
 
     // Update trap frame with new register values
@@ -152,10 +164,9 @@ pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
     tf.rflags = sanitize_rflags(regs.eflags);
     tf.rsp = regs.rsp;
 
-    // Update TLS base if changed
-    if regs.fs_base != 0 {
-        task.tls_base = regs.fs_base;
-    }
+    task.task
+        .tls
+        .store(regs.fs_base, core::sync::atomic::Ordering::Relaxed);
 
     Ok(())
 }
@@ -184,8 +195,8 @@ const RFLAGS_TF: u64 = 0x100;
 /// Sets the TF (Trap Flag) in RFLAGS so the CPU generates a debug exception
 /// after executing one instruction.
 pub fn enable_single_step(tid: Tid) {
-    let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    let mut table = TASKLIST.write();
+    if let Some(mut task) = table.get_mut(tid) {
         task.trap_frame.rflags |= RFLAGS_TF;
     }
 }
@@ -194,8 +205,8 @@ pub fn enable_single_step(tid: Tid) {
 ///
 /// Clears the TF (Trap Flag) in RFLAGS.
 pub fn disable_single_step(tid: Tid) {
-    let mut table = TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    let mut table = TASKLIST.write();
+    if let Some(mut task) = table.get_mut(tid) {
         task.trap_frame.rflags &= !RFLAGS_TF;
     }
 }

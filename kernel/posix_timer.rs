@@ -137,8 +137,9 @@ pub struct PosixTimer {
     timer_id: TimerT,
     /// Clock ID (CLOCK_REALTIME or CLOCK_MONOTONIC)
     clockid: i32,
-    /// Owning task's TID (for signal delivery)
-    owner_tid: Tid,
+    /// Owning task's TID (for signal delivery; retargeted when a
+    /// non-leader exec takes the leader's tid)
+    owner_tid: AtomicU64,
     /// Notification settings
     sigevent: SigEvent,
     /// Inner state protected by IRQ spinlock
@@ -161,7 +162,7 @@ impl PosixTimer {
         let timer = Arc::new(Self {
             timer_id,
             clockid,
-            owner_tid,
+            owner_tid: AtomicU64::new(owner_tid),
             sigevent,
             inner: IrqSpinlock::new(PosixTimerInner::new()),
             global_id,
@@ -301,7 +302,7 @@ impl PosixTimer {
         if should_signal {
             let sig = self.sigevent.sigev_signo as u32;
             if sig > 0 && sig <= 64 {
-                send_signal(self.owner_tid, sig);
+                send_signal(self.owner_tid.load(Ordering::Relaxed), sig);
             }
         }
     }
@@ -396,6 +397,16 @@ impl PosixTimerRegistry {
     }
 }
 
+/// A group's timers that were not deleted at its last exit (two last
+/// threads raced) stop with its SignalStruct
+impl Drop for PosixTimerRegistry {
+    fn drop(&mut self) {
+        for (_, t) in core::mem::take(&mut self.timers) {
+            t.delete();
+        }
+    }
+}
+
 impl Default for PosixTimerRegistry {
     fn default() -> Self {
         Self::new()
@@ -403,21 +414,14 @@ impl Default for PosixTimerRegistry {
 }
 
 // =============================================================================
-// Per-task POSIX timer storage
+// Per-process POSIX timer storage (Linux signal->posix_timers)
 // =============================================================================
 
-use crate::sync::spin::Mutex;
-
-/// Global table mapping TID -> PosixTimerRegistry
-static TASK_POSIX_TIMERS: Mutex<BTreeMap<Tid, PosixTimerRegistry>> = Mutex::new(BTreeMap::new());
-
-/// Get or create a task's timer registry
-fn get_or_create_registry(tid: Tid) -> &'static Mutex<BTreeMap<Tid, PosixTimerRegistry>> {
-    // Ensure the task has a registry entry
-    let mut table = TASK_POSIX_TIMERS.lock();
-    table.entry(tid).or_default();
-    drop(table);
-    &TASK_POSIX_TIMERS
+/// The timers of task `tid`'s thread group (its SignalStruct's)
+fn with_timers<R>(tid: Tid, f: impl FnOnce(&mut PosixTimerRegistry) -> R) -> Option<R> {
+    let sig = crate::signal::get_task_signal_struct(tid)?;
+    let r = f(&mut sig.posix_timers.lock());
+    Some(r)
 }
 
 /// Create a new POSIX timer for a task
@@ -455,12 +459,12 @@ pub fn create_posix_timer(
     // Allocate timer ID and create timer
     let timer_id;
     {
-        let table = get_or_create_registry(tid);
-        let mut table_guard = table.lock();
-        let registry = table_guard.entry(tid).or_default();
-        timer_id = registry.alloc_id();
-        let timer = PosixTimer::new(timer_id, clockid, tid, sev);
-        registry.add(timer);
+        timer_id = with_timers(tid, |registry| {
+            let id = registry.alloc_id();
+            registry.add(PosixTimer::new(id, clockid, tid, sev));
+            id
+        })
+        .ok_or(-11)?; // EAGAIN: no thread group
     }
 
     Ok(timer_id)
@@ -468,8 +472,7 @@ pub fn create_posix_timer(
 
 /// Get a POSIX timer by ID
 pub fn get_posix_timer(tid: Tid, timer_id: TimerT) -> Option<Arc<PosixTimer>> {
-    let table = TASK_POSIX_TIMERS.lock();
-    table.get(&tid).and_then(|reg| reg.get(timer_id))
+    with_timers(tid, |reg| reg.get(timer_id)).flatten()
 }
 
 /// A timer_create timer of `tid` (negative ids are internal: ITIMER_REAL)
@@ -485,10 +488,7 @@ fn user_timer(tid: Tid, timer_id: TimerT) -> Option<Arc<PosixTimer>> {
 /// # Returns
 /// 0 on success, negative errno on error
 pub fn delete_posix_timer(tid: Tid, timer_id: TimerT) -> Result<(), i32> {
-    let timer = {
-        let mut table = TASK_POSIX_TIMERS.lock();
-        table.get_mut(&tid).and_then(|reg| reg.remove(timer_id))
-    };
+    let timer = with_timers(tid, |reg| reg.remove(timer_id)).flatten();
 
     match timer {
         Some(t) => {
@@ -499,21 +499,28 @@ pub fn delete_posix_timer(tid: Tid, timer_id: TimerT) -> Result<(), i32> {
     }
 }
 
-/// Clean up all POSIX timers for a task (on exit)
-pub fn exit_posix_timers(tid: Tid) {
-    let timers = {
-        let mut table = TASK_POSIX_TIMERS.lock();
-        table.remove(&tid)
-    };
-
-    if let Some(mut registry) = timers {
-        // Delete all timers
-        let ids: Vec<_> = registry.timers.keys().cloned().collect();
-        for id in ids {
-            if let Some(timer) = registry.remove(id) {
-                timer.delete();
-            }
+/// A non-leader exec took tid `new` from `old` (exchange_tids): the
+/// group's timers owned by `old` now signal `new`
+pub fn retarget(sig: &crate::signal::SignalStruct, old: Tid, new: Tid) {
+    for t in sig.posix_timers.lock().timers.values() {
+        let _ = t
+            .owner_tid
+            .compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    for e in POSIX_TIMER_REGISTRY.lock().iter_mut() {
+        if e.1 == old {
+            e.1 = new;
         }
+    }
+}
+
+/// Delete every timer of the thread group (Linux exit_itimers: its last
+/// thread is exiting)
+pub fn exit_itimers(sig: &crate::signal::SignalStruct) {
+    let timers = core::mem::take(&mut sig.posix_timers.lock().timers);
+    // Deleted after the lock (timer_del waits out a running callback)
+    for (_, t) in timers {
+        t.delete();
     }
 }
 
@@ -707,14 +714,15 @@ struct ITimerVal {
 /// The current task's ITIMER_REAL timer, created on first use
 fn itimer_real() -> Arc<PosixTimer> {
     let tid = current_tid();
-    let mut table = TASK_POSIX_TIMERS.lock();
-    let reg = table.entry(tid).or_default();
-    if let Some(t) = reg.get(ITIMER_REAL_ID) {
-        return t;
-    }
-    let t = PosixTimer::new(ITIMER_REAL_ID, 1, tid, SigEvent::default());
-    reg.add(Arc::clone(&t));
-    t
+    with_timers(tid, |reg| {
+        if let Some(t) = reg.get(ITIMER_REAL_ID) {
+            return t;
+        }
+        let t = PosixTimer::new(ITIMER_REAL_ID, 1, tid, SigEvent::default());
+        reg.add(Arc::clone(&t));
+        t
+    })
+    .unwrap_or_else(|| PosixTimer::new(ITIMER_REAL_ID, 1, tid, SigEvent::default()))
 }
 
 /// timeval -> timespec; None if invalid (negative, usec >= 1e6)

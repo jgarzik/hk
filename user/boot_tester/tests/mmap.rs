@@ -10,13 +10,13 @@
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     MADV_COLD, MADV_DONTNEED, MADV_KEEPONFORK, MADV_NORMAL, MADV_PAGEOUT, MADV_RANDOM,
-    MADV_WILLNEED, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE,
+    MADV_WILLNEED, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED,
     MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NONBLOCK, MAP_POPULATE, MAP_PRIVATE,
     MAP_SHARED, MAP_STACK, MCL_CURRENT, MCL_ONFAULT, MLOCK_ONFAULT, MREMAP_FIXED, MREMAP_MAYMOVE,
-    MS_ASYNC, MS_SYNC, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, Timespec, UtsName,
-    sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_madvise, sys_mincore, sys_mlock,
+    MS_ASYNC, MS_SYNC, O_DIRECTORY, PROT_GROWSDOWN, PROT_GROWSUP, PROT_READ, PROT_WRITE, Timespec,
+    UtsName, sys_clock_gettime, sys_close, sys_exit, sys_fork, sys_madvise, sys_mincore, sys_mlock,
     sys_mlock2, sys_mlockall, sys_mmap, sys_mprotect, sys_mremap, sys_msync, sys_munlock,
-    sys_munlockall, sys_munmap, sys_open, sys_read, sys_uname, sys_wait4, sys_write,
+    sys_munlockall, sys_munmap, sys_open, sys_pipe2, sys_read, sys_uname, sys_wait4, sys_write,
 };
 
 /// Run all mmap tests
@@ -42,6 +42,7 @@ pub fn run_tests() {
     // MAP_GROWSDOWN tests
     test_mmap_growsdown_basic();
     test_mmap_growsdown_expand();
+    test_growsdown_moved_pgoff();
     // PROT_GROWSDOWN/PROT_GROWSUP tests
     test_mprotect_growsdown();
     test_mprotect_growsup_fails();
@@ -63,6 +64,7 @@ pub fn run_tests() {
     test_mmap_fixed_noreplace_collision();
     // MAP_NORESERVE test
     test_mmap_noreserve();
+    test_mmap_nodev();
     // msync tests
     test_msync_basic();
     test_msync_invalid_flags();
@@ -834,6 +836,48 @@ fn test_mmap_growsdown_expand() {
     // Unmap expanded region (start at the lower address)
     sys_munmap((ptr as u64).wrapping_sub(4096), 8192);
     println(b"MMAP_GROWSDOWN_EXPAND:OK");
+}
+
+/// A growsdown VMA mremap moved up keeps its page offset (Linux
+/// vm_pgoff): it grows down by at most that many pages (Linux
+/// expand_downwards: grow <= vm_pgoff), beyond is SIGSEGV
+fn test_growsdown_moved_pgoff() {
+    const LOW: u64 = 0x10_0000; // pgoff 256
+    const HIGH: u64 = 0x7000_0000_0000;
+    let pid = sys_fork();
+    if pid == 0 {
+        let p = sys_mmap(
+            LOW,
+            4096,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN | MAP_FIXED,
+            -1,
+            0,
+        );
+        // Faulted before the move: Linux re-bases the pgoff of a VMA
+        // with no pages yet (copy_vma)
+        if p == LOW as i64 {
+            unsafe { core::ptr::write_volatile(LOW as *mut u8, 1) };
+        }
+        let m = sys_mremap(LOW, 4096, 4096, MREMAP_MAYMOVE | MREMAP_FIXED, HIGH);
+        if p != LOW as i64 || m != HIGH as i64 {
+            sys_exit(1);
+        }
+        // One page down: fine
+        unsafe { core::ptr::write_volatile((HIGH - 4096) as *mut u8, 1) };
+        // 512 pages below: more than its 256 pages of offset
+        unsafe { core::ptr::write_volatile((HIGH - (2 << 20)) as *mut u8, 1) };
+        sys_exit(2);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st & 0x7f == 11 {
+        println(b"MMAP_GROWSDOWN_MOVED_PGOFF:OK");
+    } else {
+        print(b"MMAP_GROWSDOWN_MOVED_PGOFF:FAIL status=");
+        print_num(st as i64);
+        println(b"");
+    }
 }
 
 // ============================================================================
@@ -2367,4 +2411,46 @@ fn test_uaccess_cow_child() {
         println(b"");
     }
     sys_munmap(base, 4096);
+}
+
+/// Files without mmap (Linux do_mmap: no f_op->mmap, ENODEV; procfs
+/// proc_dir_entry files: pde_mmap, EIO). A procfs mapping would fault
+/// in through readers that take the mmap_lock the fault holds.
+fn test_mmap_nodev() {
+    let files: [(&[u8], u32, i64); 4] = [
+        (b"/proc/self/maps\0", 0, -19),
+        (b"/proc/sys/vm/min_free_kbytes\0", 0, -19),
+        (b"/proc/version\0", 0, -5),
+        (b"/tmp\0", O_DIRECTORY, -19),
+    ];
+    let mut bad = 0;
+    for (path, flags, want) in files {
+        let fd = sys_open(path.as_ptr(), flags, 0);
+        let r = sys_mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd as i32, 0);
+        sys_close(fd as u64);
+        if r != want {
+            print(b"MMAP_NODEV: ");
+            print(&path[..path.len() - 1]);
+            print(b" got ");
+            print_num(r);
+            println(b"");
+            bad += 1;
+        }
+    }
+    let mut p = [0i32; 2];
+    sys_pipe2(p.as_mut_ptr(), 0);
+    let r = sys_mmap(0, 4096, PROT_READ, MAP_PRIVATE, p[0], 0);
+    sys_close(p[0] as u64);
+    sys_close(p[1] as u64);
+    if r != -19 {
+        print(b"MMAP_NODEV: pipe got ");
+        print_num(r);
+        println(b"");
+        bad += 1;
+    }
+    println(if bad == 0 {
+        b"MMAP_NODEV:OK"
+    } else {
+        b"MMAP_NODEV:FAIL"
+    });
 }

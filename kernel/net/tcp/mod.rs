@@ -157,7 +157,7 @@ pub fn create() -> Arc<dyn ProtoOps> {
 }
 
 /// Connection knobs from the namespace's sysctls
-fn cfg(net: &NetNamespace) -> Cfg {
+pub(super) fn cfg(net: &NetNamespace) -> Cfg {
     let s = &net.sysctl;
     let secs = |v: &core::sync::atomic::AtomicI32| v.load(Ordering::Relaxed).max(1) as u64 * 1000;
     Cfg {

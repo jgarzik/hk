@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::paging::{
     AF, AP_EL1_RO, AP_EL1_RW, ATTR_IDX_DEVICE, ATTR_IDX_NORMAL, IO_BASE, IO_SIZE, KIMAGE_OFFSET,
-    PAGE_OFFSET, PAGE_SIZE, PXN, RawPageTable, SH_INNER, UXN, phys_to_virt_table,
+    PAGE_OFFSET, PAGE_SIZE, PXN, RawPageTable, SH_INNER, UXN, VMEMMAP_START, phys_to_virt_table,
 };
 
 /// Page-table pages for the boot-built kernel tables
@@ -68,6 +68,12 @@ pub fn kimage_va(pa: u64) -> u64 {
     pa + KIMAGE_OFFSET
 }
 
+/// The kernel image in physical memory, as [start, end)
+pub fn image_range() -> (u64, u64) {
+    let start = pa_symbol(&raw const __kernel_start as u64);
+    (start, pa_symbol(&raw const __kernel_end as u64))
+}
+
 /// Physical address of the TTBR1 root
 pub fn swapper_phys() -> u64 {
     pa_symbol(&raw const SWAPPER as u64)
@@ -109,8 +115,9 @@ fn idx(va: u64, shift: u32) -> usize {
 }
 
 /// Linear-map RAM [base, base + size): 1GB blocks where a whole
-/// gigabyte is RAM, else 2MB blocks (normal memory, never executable)
-unsafe fn map_linear(root: *mut RawPageTable, base: u64, size: u64) {
+/// gigabyte is RAM, else 2MB blocks (normal memory, never executable);
+/// returns the end of the mapping
+unsafe fn map_linear(root: *mut RawPageTable, base: u64, size: u64) -> u64 {
     let attrs = AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL1_RW | PXN | UXN;
     let (start, end) = (base & !(SZ_2M - 1), (base + size).next_multiple_of(SZ_2M));
     let mut p = start;
@@ -128,7 +135,7 @@ unsafe fn map_linear(root: *mut RawPageTable, base: u64, size: u64) {
             }
         }
     }
-    DIRECT_END.store(end, Ordering::Relaxed);
+    end
 }
 
 /// Map the kernel image with 4KB pages: text read-only executable,
@@ -169,18 +176,27 @@ unsafe fn map_io(root: *mut RawPageTable) {
 }
 
 /// Build the final TTBR1 tables and switch to them (TTBR0 gets the
-/// empty table). Runs on the BSP after the heap is up, on the boot
-/// tables.
+/// empty table): every RAM range of the DTB goes to memblock and into
+/// the linear map. Runs on the BSP, on the boot tables.
 ///
 /// # Safety
 /// Once, on the BSP, before SMP and before any user address space.
 pub unsafe fn init(dtb: u64) {
-    let (base, size) = super::dtb::memory(dtb).unwrap_or(DEFAULT_RAM);
+    use crate::mm::memblock;
+    if !super::dtb::for_each_memory(dtb, memblock::add) {
+        memblock::add(DEFAULT_RAM.0, DEFAULT_RAM.1);
+    }
     unsafe {
         let root = &raw mut SWAPPER;
-        map_linear(root, base, size);
+        let mut end = 0;
+        for r in memblock::MEMBLOCK.lock().memory.ranges() {
+            end = end.max(map_linear(root, r.base, r.size()));
+        }
+        DIRECT_END.store(end, Ordering::Relaxed);
         map_image(root);
         map_io(root);
+        // vmemmap's top-level entry (filled by `map_page`)
+        next(root, idx(VMEMMAP_START, 39));
         // Table writes must reach memory before the walker uses them
         asm!("dsb ishst", options(nostack));
         // The switch runs from the identity map (TTBR0), so no TTBR1
@@ -191,6 +207,29 @@ pub unsafe fn init(dtb: u64) {
         f(swapper_phys(), reserved_phys());
     }
     drop_idmap();
+}
+
+/// Map the kernel page `va` to `pa` (normal memory, writable, never
+/// executable) in TTBR1; missing tables come from `table` (the
+/// physical address of a zeroed frame)
+///
+/// # Safety
+/// Boot CPU, before SMP; `va` is unmapped and not in use.
+pub unsafe fn map_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+    unsafe {
+        let mut t = &raw mut SWAPPER;
+        for shift in [39, 30, 21] {
+            let e = (*t).entry_mut(idx(va, shift));
+            if !e.is_valid() {
+                e.set_table(table());
+            }
+            t = phys_to_virt_table(e.addr());
+        }
+        let attrs = AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL1_RW | PXN | UXN;
+        (*t).entry_mut(idx(va, 12)).set_page(pa, attrs);
+        // The walker sees the entry before the first access
+        asm!("dsb ishst", "isb", options(nostack));
+    }
 }
 
 /// Leave the boot identity map on this CPU (APs, after reaching the

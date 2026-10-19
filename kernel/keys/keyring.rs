@@ -35,8 +35,15 @@ pub struct TaskKeyrings {
     pub session_keyring: Option<KeySerial>,
 }
 
-/// Global map of task keyrings indexed by TID
-static TASK_KEYRINGS: RwLock<BTreeMap<u64, TaskKeyrings>> = RwLock::new(BTreeMap::new());
+impl TaskKeyrings {
+    pub const fn new() -> Self {
+        Self {
+            thread_keyring: None,
+            process_keyring: None,
+            session_keyring: None,
+        }
+    }
+}
 
 /// Per-user keyring tracking
 static USER_KEYRINGS: RwLock<BTreeMap<u32, UserKeyrings>> = RwLock::new(BTreeMap::new());
@@ -50,20 +57,23 @@ struct UserKeyrings {
     user_session_keyring: Option<KeySerial>,
 }
 
-/// Get or create the keyrings for a task
+/// Task `tid` (its keyrings are `Task.keyrings`, Linux cred keyrings)
+fn task(tid: u64) -> Option<crate::task::percpu::TaskRef> {
+    crate::task::percpu::TASKLIST.read().task(tid)
+}
+
+/// The keyrings of task `tid`
 pub fn get_task_keyrings(tid: u64) -> TaskKeyrings {
-    let keyrings = TASK_KEYRINGS.read();
-    keyrings.get(&tid).cloned().unwrap_or_default()
+    task(tid)
+        .map(|t| t.keyrings.lock().clone())
+        .unwrap_or_default()
 }
 
-/// Set the keyrings for a task
+/// Set the keyrings of task `tid`
 pub fn set_task_keyrings(tid: u64, keyrings: TaskKeyrings) {
-    TASK_KEYRINGS.write().insert(tid, keyrings);
-}
-
-/// Remove keyrings when a task exits
-pub fn remove_task_keyrings(tid: u64) {
-    TASK_KEYRINGS.write().remove(&tid);
+    if let Some(t) = task(tid) {
+        *t.keyrings.lock() = keyrings;
+    }
 }
 
 /// Create a new keyring with the given description
@@ -93,8 +103,8 @@ pub fn resolve_special_keyring(
 ) -> Result<Arc<Key>, i64> {
     match special_id {
         KEY_SPEC_THREAD_KEYRING => {
-            let mut all_keyrings = TASK_KEYRINGS.write();
-            let keyrings = all_keyrings.entry(tid).or_default();
+            let t = task(tid).ok_or(KernelError::NoKey.sysret())?;
+            let mut keyrings = t.keyrings.lock();
 
             if let Some(serial) = keyrings.thread_keyring
                 && let Some(key) = lookup_key(serial)
@@ -112,8 +122,8 @@ pub fn resolve_special_keyring(
         }
 
         KEY_SPEC_PROCESS_KEYRING => {
-            let mut all_keyrings = TASK_KEYRINGS.write();
-            let keyrings = all_keyrings.entry(tid).or_default();
+            let t = task(tid).ok_or(KernelError::NoKey.sysret())?;
+            let mut keyrings = t.keyrings.lock();
 
             if let Some(serial) = keyrings.process_keyring
                 && let Some(key) = lookup_key(serial)
@@ -131,8 +141,8 @@ pub fn resolve_special_keyring(
         }
 
         KEY_SPEC_SESSION_KEYRING => {
-            let mut all_keyrings = TASK_KEYRINGS.write();
-            let keyrings = all_keyrings.entry(tid).or_default();
+            let t = task(tid).ok_or(KernelError::NoKey.sysret())?;
+            let mut keyrings = t.keyrings.lock();
 
             if let Some(serial) = keyrings.session_keyring
                 && let Some(key) = lookup_key(serial)

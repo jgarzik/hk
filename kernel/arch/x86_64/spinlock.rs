@@ -186,7 +186,6 @@ fn save_and_disable_irq() -> bool {
             "pop {0}",
             "cli",
             out(reg) flags,
-            options(nomem)
         );
     }
     // IF (Interrupt Flag) is bit 9
@@ -201,7 +200,7 @@ fn save_and_disable_irq() -> bool {
 fn restore_irq(was_enabled: bool) {
     if was_enabled {
         unsafe {
-            ::core::arch::asm!("sti", options(nomem, nostack));
+            ::core::arch::asm!("sti", options(nostack));
         }
     }
 }
@@ -214,6 +213,25 @@ fn save_and_disable_irq() -> bool {
 
 #[cfg(test)]
 fn restore_irq(_was_enabled: bool) {}
+
+/// Interrupts are masked on this CPU (Linux irqs_disabled; lockdep's
+/// might_sleep check)
+#[cfg(not(test))]
+#[inline]
+#[allow(dead_code)]
+pub fn irqs_disabled() -> bool {
+    let flags: u64;
+    unsafe {
+        ::core::arch::asm!("pushfq", "pop {0}", out(reg) flags, options(nomem, preserves_flags));
+    }
+    flags & 0x200 == 0
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn irqs_disabled() -> bool {
+    false
+}
 
 /// Saved interrupt state of this CPU (Linux local_irq_save flags)
 #[must_use]

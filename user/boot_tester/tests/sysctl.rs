@@ -3,8 +3,9 @@
 //! permissions (non-root cannot open for writing).
 
 use hk_syscall::{
-    O_RDONLY, O_WRONLY, sys_close, sys_exit, sys_fork, sys_open, sys_read, sys_setresuid,
-    sys_wait4, sys_write,
+    _LINUX_CAPABILITY_VERSION_3, CapUserData, CapUserHeader, O_RDONLY, O_WRONLY, PR_SET_KEEPCAPS,
+    sys_capget, sys_capset, sys_close, sys_exit, sys_fork, sys_open, sys_prctl, sys_read,
+    sys_setresuid, sys_wait4, sys_write,
 };
 
 use super::sk::*;
@@ -15,6 +16,7 @@ pub fn run_tests() {
     test_port_range();
     test_validation();
     test_perm();
+    test_perm_net_admin();
     test_proc_net_udp();
 }
 
@@ -160,6 +162,48 @@ fn test_perm() {
         if !reads(PORTS, b"32768\t60999\n") {
             sys_exit(2);
         }
+        sys_exit(0);
+    }
+    let mut st = 0;
+    sys_wait4(pid, &mut st, 0, 0);
+    t.eq(b"child", st as i64, 0);
+    t.done();
+}
+
+/// Non-root with only CAP_NET_ADMIN may write network sysctls, not vm
+/// ones such as min_free_kbytes (Linux net_ctl_permissions vs
+/// test_perm)
+fn test_perm_net_admin() {
+    const MIN_FREE: &[u8] = b"/proc/sys/vm/min_free_kbytes\0";
+    const CAP_NET_ADMIN: u32 = 12;
+    let mut t = T::new(b"SYSCTL_PERM_NET_ADMIN");
+    let pid = sys_fork();
+    if pid == 0 {
+        if sys_prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0 || sys_setresuid(65534, 65534, 65534) != 0 {
+            sys_exit(90);
+        }
+        let mut h = CapUserHeader {
+            version: _LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut d: [CapUserData; 2] = unsafe { core::mem::zeroed() };
+        if sys_capget(&mut h, d.as_mut_ptr()) != 0 {
+            sys_exit(91);
+        }
+        d[0].effective = 1 << CAP_NET_ADMIN;
+        d[1].effective = 0;
+        if sys_capset(&h, d.as_ptr()) != 0 {
+            sys_exit(92);
+        }
+        let w = sys_open(MIN_FREE.as_ptr(), O_WRONLY, 0);
+        if w != EACCES {
+            sys_exit(1);
+        }
+        let w = sys_open(PORTS.as_ptr(), O_WRONLY, 0);
+        if w < 0 {
+            sys_exit(2);
+        }
+        sys_close(w as u64);
         sys_exit(0);
     }
     let mut st = 0;

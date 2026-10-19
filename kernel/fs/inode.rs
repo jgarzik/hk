@@ -6,8 +6,7 @@
 use alloc::sync::{Arc, Weak};
 
 use crate::sync::spin::RwLock;
-use ::core::cell::Cell;
-use ::core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::sync::RwSem;
 
@@ -287,11 +286,8 @@ pub trait InodeOps: Send + Sync {
 
     /// Get file size (may be dynamically computed for procfs)
     ///
-    /// Acquires inode.lock in read mode to safely read timestamps
-    /// (Linux i_rwsem pattern - caller provides serialization).
+    /// Timestamps are read lock-free (Linux generic_fillattr).
     fn getattr(&self, inode: &Inode) -> InodeAttr {
-        // Acquire read lock for timestamp access (Linux i_rwsem pattern)
-        let _guard = inode.lock.read();
         InodeAttr {
             ino: inode.ino,
             mode: inode.mode(),
@@ -395,6 +391,35 @@ pub trait AsAny: Send + Sync {
     fn as_any(&self) -> &dyn core::any::Any;
 }
 
+/// One inode timestamp (Linux i_{a,m,c}time_sec / _nsec): two atomics,
+/// read lock-free; a reader racing a writer can see the new seconds with
+/// the old nanoseconds, as on Linux
+struct InodeTime {
+    sec: AtomicI64,
+    nsec: AtomicU32,
+}
+
+impl InodeTime {
+    fn new(t: Timespec) -> Self {
+        Self {
+            sec: AtomicI64::new(t.sec),
+            nsec: AtomicU32::new(t.nsec),
+        }
+    }
+
+    fn get(&self) -> Timespec {
+        Timespec {
+            sec: self.sec.load(Ordering::Relaxed),
+            nsec: self.nsec.load(Ordering::Relaxed),
+        }
+    }
+
+    fn set(&self, t: Timespec) {
+        self.sec.store(t.sec, Ordering::Relaxed);
+        self.nsec.store(t.nsec, Ordering::Relaxed);
+    }
+}
+
 /// The inode structure - represents a file object
 pub struct Inode {
     /// Inode number (unique within filesystem)
@@ -419,24 +444,20 @@ pub struct Inode {
     /// For non-device files, this is DevId::null()
     pub rdev: DevId,
 
-    /// Last access time - Cell for interior mutability (utimensat)
-    atime: Cell<Timespec>,
+    /// Last access time
+    atime: InodeTime,
 
-    /// Last modification time - Cell for interior mutability (utimensat)
-    mtime: Cell<Timespec>,
+    /// Last modification time
+    mtime: InodeTime,
 
-    /// Last status change time - Cell for interior mutability (utimensat)
-    ctime: Cell<Timespec>,
+    /// Last status change time
+    ctime: InodeTime,
 
     /// Pointer back to superblock
     pub sb: Weak<SuperBlock>,
 
     /// Inode operations (filesystem-specific)
     pub i_op: &'static dyn InodeOps,
-
-    /// Per-inode lock for metadata protection
-    /// Lock ordering: parent inode lock before child inode lock
-    pub lock: RwLock<()>,
 
     /// Directory operation semaphore (like Linux i_rwsem)
     ///
@@ -476,13 +497,12 @@ impl Inode {
             size: AtomicU64::new(size),
             nlink: AtomicU32::new(1),
             rdev: DevId::null(),
-            atime: Cell::new(mtime),
-            mtime: Cell::new(mtime),
-            ctime: Cell::new(mtime),
+            atime: InodeTime::new(mtime),
+            mtime: InodeTime::new(mtime),
+            ctime: InodeTime::new(mtime),
             sb,
             i_op,
-            lock: RwLock::new(()),
-            i_rwsem: RwSem::new(),
+            i_rwsem: RwSem::new(()),
             private: RwLock::new(None),
         }
     }
@@ -511,13 +531,12 @@ impl Inode {
             size: AtomicU64::new(0),
             nlink: AtomicU32::new(1),
             rdev,
-            atime: Cell::new(mtime),
-            mtime: Cell::new(mtime),
-            ctime: Cell::new(mtime),
+            atime: InodeTime::new(mtime),
+            mtime: InodeTime::new(mtime),
+            ctime: InodeTime::new(mtime),
             sb,
             i_op,
-            lock: RwLock::new(()),
-            i_rwsem: RwSem::new(),
+            i_rwsem: RwSem::new(()),
             private: RwLock::new(None),
         }
     }
@@ -572,46 +591,33 @@ impl Inode {
     }
 
     /// Get last access time
-    ///
-    /// # Locking
-    /// Caller must hold `inode.lock` in read mode before calling this method.
-    /// This follows Linux's i_rwsem pattern where callers provide serialization.
+    /// (lock-free, like Linux inode_get_*time)
     pub fn atime(&self) -> Timespec {
         self.atime.get()
     }
 
     /// Get last modification time
-    ///
-    /// # Locking
-    /// Caller must hold `inode.lock` in read mode before calling this method.
-    /// This follows Linux's i_rwsem pattern where callers provide serialization.
+    /// (lock-free, like Linux inode_get_*time)
     pub fn mtime(&self) -> Timespec {
         self.mtime.get()
     }
 
     /// Get last status change time
-    ///
-    /// # Locking
-    /// Caller must hold `inode.lock` in read mode before calling this method.
-    /// This follows Linux's i_rwsem pattern where callers provide serialization.
+    /// (lock-free, like Linux inode_get_*time)
     pub fn ctime(&self) -> Timespec {
         self.ctime.get()
     }
 
     /// Set last access time (for utimensat)
     ///
-    /// # Locking
-    /// Caller must hold `inode.lock` in write mode before calling this method.
-    /// This follows Linux's i_rwsem pattern where callers provide serialization.
+    /// Writers hold `i_rwsem` exclusive (Linux notify_change / inode_set_*time)
     pub fn set_atime(&self, time: Timespec) {
         self.atime.set(time);
     }
 
     /// Set last modification time (for utimensat)
     ///
-    /// # Locking
-    /// Caller must hold `inode.lock` in write mode before calling this method.
-    /// This follows Linux's i_rwsem pattern where callers provide serialization.
+    /// Writers hold `i_rwsem` exclusive (Linux notify_change / inode_set_*time)
     pub fn set_mtime(&self, time: Timespec) {
         self.mtime.set(time);
     }
@@ -620,9 +626,7 @@ impl Inode {
     ///
     /// Note: ctime is automatically updated by the kernel, not directly settable by user.
     ///
-    /// # Locking
-    /// Caller must hold `inode.lock` in write mode before calling this method.
-    /// This follows Linux's i_rwsem pattern where callers provide serialization.
+    /// Writers hold `i_rwsem` exclusive (Linux notify_change / inode_set_*time)
     pub fn set_ctime(&self, time: Timespec) {
         self.ctime.set(time);
     }
@@ -707,10 +711,6 @@ impl Inode {
         unsafe { self.i_rwsem.up_read() };
     }
 }
-
-// Inode is Send + Sync because all interior mutability is through atomic or lock
-unsafe impl Send for Inode {}
-unsafe impl Sync for Inode {}
 
 /// Null inode ops - returns errors for all operations
 pub struct NullInodeOps;

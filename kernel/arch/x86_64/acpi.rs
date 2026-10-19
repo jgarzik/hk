@@ -577,7 +577,8 @@ pub fn init_numa_topology() -> Result<bool, &'static str> {
 
 /// Parse SRAT table and populate NUMA topology
 fn parse_srat_mapped(srat_phys: u64) -> Result<(), &'static str> {
-    use crate::numa::{MAX_CPUS, MAX_NUMA_NODES, NUMA_TOPOLOGY, NumaNode};
+    use crate::cpumask::NR_CPUS as MAX_CPUS;
+    use crate::numa::{MAX_NUMA_NODES, NUMA_TOPOLOGY, NumaNode};
 
     unsafe {
         // Map the SRAT

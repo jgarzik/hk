@@ -56,14 +56,14 @@ impl CpuOps for X86_64Arch {
     #[inline]
     fn enable_interrupts() {
         unsafe {
-            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("sti", options(nostack, preserves_flags));
         }
     }
 
     #[inline]
     fn disable_interrupts() {
         unsafe {
-            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("cli", options(nostack, preserves_flags));
         }
     }
 
@@ -80,7 +80,7 @@ impl CpuOps for X86_64Arch {
         // HLT completes, preventing the race where an interrupt fires between
         // STI and HLT leaving the CPU spinning.
         unsafe {
-            core::arch::asm!("sti", "hlt", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("sti", "hlt", options(nostack, preserves_flags));
         }
     }
 }
@@ -216,14 +216,14 @@ impl SchedArch for X86_64Arch {
 use crate::arch::{
     AcpiInfo, AcpiOps, ArchBusOps, CpuInfo, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps,
     IoremapOps, LocalTimerOps, MemoryLayoutOps, PowerInfo, PowerOps, SmpOps, SyscallOps,
-    TimekeeperOps, TimerCallbackOps, VfsInitOps,
+    TimekeeperOps, VfsInitOps,
 };
 
 impl HaltOps for X86_64Arch {
     fn halt_loop() -> ! {
         unsafe {
             // Disable interrupts first to prevent waking from halt
-            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("cli", options(nostack, preserves_flags));
         }
         loop {
             unsafe {
@@ -383,14 +383,6 @@ impl SyscallOps for X86_64Arch {
     }
 }
 
-impl TimerCallbackOps for X86_64Arch {
-    unsafe fn set_timer_preempt_callback(callback: fn()) {
-        unsafe {
-            set_timer_preempt_callback(callback);
-        }
-    }
-}
-
 impl ArchBusOps for X86_64Arch {
     fn arch_bus_init(bus_manager: &mut crate::bus::BusManager) {
         arch_init(bus_manager);
@@ -401,26 +393,34 @@ impl ArchBusOps for X86_64Arch {
 // Kernel Init Unification Trait Implementations
 // ============================================================================
 
-// Frames start above the boot-time heap (`x86_64_heap` in main.rs)
-const FRAME_ALLOC_BASE: u64 = 0x1200000; // 18MB
-
 impl MemoryLayoutOps for X86_64Arch {
-    fn get_frame_alloc_region() -> (u64, u64) {
+    fn memblock_init() {
+        use crate::mm::memblock;
         let mbi = unsafe { crate::MULTIBOOT2_INFO };
-        let (start, end) =
-            unsafe { crate::multiboot2::find_largest_region_above(mbi, FRAME_ALLOC_BASE) };
+        unsafe {
+            crate::multiboot2::for_each_region(mbi, |base, len, kind| {
+                if kind == crate::multiboot2::MEMORY_AVAILABLE {
+                    memblock::add(base, len);
+                }
+            });
+        }
         // Frames are used through the direct map
-        let end = end.min(kmap::direct_end());
-        assert!(
-            start >= FRAME_ALLOC_BASE && end > start,
-            "no RAM for frames"
-        );
-        (start, end - start)
+        let end = kmap::direct_end();
+        let mut mb = memblock::MEMBLOCK.lock();
+        mb.remove(end, u64::MAX);
+        mb.set_limit(end);
+        // The first 1MB: BIOS data, EBDA, the AP trampoline (Linux
+        // reserves it all, arch/x86/realmode)
+        mb.reserve(0, 1 << 20);
+        let (start, end) = kmap::image_range();
+        mb.reserve(start, end - start);
+        unsafe {
+            crate::multiboot2::boot_ranges(mbi, |_, s, e| mb.reserve(s, e.saturating_sub(s)))
+        };
     }
 
-    fn for_each_reserved(f: &mut dyn FnMut(u64, u64)) {
-        let mbi = unsafe { crate::MULTIBOOT2_INFO };
-        unsafe { crate::multiboot2::boot_ranges(mbi, |_, start, end| f(start, end)) };
+    unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+        unsafe { kmap::map_page(va, pa, table) }
     }
 }
 
@@ -488,23 +488,6 @@ pub fn early_init() {
 
     // Enable timer interrupt
     pic::enable_irq(0);
-}
-
-/// Timer preemption check callback
-///
-/// This is called from the LAPIC timer handler when it's safe to preempt.
-/// The kernel sets this during initialization to point to its scheduler's
-/// preemption function.
-static mut TIMER_PREEMPT_CALLBACK: Option<fn()> = None;
-
-/// Set the timer preemption callback
-///
-/// # Safety
-/// Must be called once during kernel initialization, before interrupts are enabled.
-pub unsafe fn set_timer_preempt_callback(callback: fn()) {
-    unsafe {
-        TIMER_PREEMPT_CALLBACK = Some(callback);
-    }
 }
 
 /// Architecture-specific bus/driver initialization

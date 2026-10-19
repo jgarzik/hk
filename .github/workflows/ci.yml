@@ -49,7 +49,7 @@ jobs:
       - name: Install packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 grub-pc-bin grub-common xorriso mtools dosfstools cpio
+          sudo apt-get install -y qemu-system-x86 grub-pc-bin grub-common xorriso mtools dosfstools fdisk cpio
 
       - name: Install Rust toolchain
         run: rustup toolchain install
@@ -66,11 +66,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: qemu-serial-x86
-          path: /tmp/qemu_serial.log
+          path: target/qemu/serial.log
           if-no-files-found: ignore
 
       # Differential run of boot_tester on Ubuntu's Linux kernel (TCG here,
-      # hence the long timeout).
+      # hence the long timeout). CI is set, so the PASS cache is off.
       - name: Boot test on Linux (x86-64)
         id: linux_x86
         run: make check-linux LINUX_TEST_TIMEOUT=300
@@ -80,7 +80,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: qemu-serial-linux-x86
-          path: /tmp/qemu_serial_linux.log
+          path: target/qemu/serial_linux_x86_64.log
           if-no-files-found: ignore
 
   boot-arm:
@@ -93,7 +93,7 @@ jobs:
       - name: Install packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc binutils qemu-system-arm mtools dosfstools cpio
+          sudo apt-get install -y gcc binutils qemu-system-arm mtools dosfstools fdisk cpio
 
       - name: Install rustup (if missing)
         run: |
@@ -105,11 +105,23 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install
 
+      # Native arm64: KVM if the runner has /dev/kvm (made usable for the
+      # runner user; run-qemu.sh and linux-boot-tester.sh pick it up),
+      # else TCG, which needs about 10 min per hk boot here, hence 900 s
+      - name: Enable KVM if present
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+          ls -l /dev/kvm || echo "no /dev/kvm: QEMU uses TCG"
+
       - name: Boot test aarch64
-        run: make check-arm
+        run: make check-arm BOOT_TEST_TIMEOUT=900
 
       - name: Boot test aarch64 (e1000 NIC)
-        run: make check-arm NIC=e1000
+        run: make check-arm NIC=e1000 BOOT_TEST_TIMEOUT=900
 
       # After check-arm: the aarch64 kernel include_bytes!()s the initramfs
       - name: Unit tests (host arm64)
@@ -120,19 +132,20 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: qemu-serial-arm
-          path: /tmp/qemu_serial_arm.log
+          path: target/qemu/serial_arm.log
           if-no-files-found: ignore
 
       # Differential run on Ubuntu's arm64 Linux kernel (kernel .deb comes
-      # from apt-get download; apt lists were updated above).
+      # from apt-get download; apt lists were updated above). KVM or TCG
+      # as above; under TCG the suite needs over 300 s here.
       - name: Boot test on Linux (aarch64)
         id: linux_arm
-        run: make check-linux LINUX_TEST_TIMEOUT=300
+        run: make check-linux LINUX_TEST_TIMEOUT=600
 
       - name: Upload Linux serial log
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: qemu-serial-linux-arm
-          path: /tmp/qemu_serial_linux.log
+          path: target/qemu/serial_linux_aarch64.log
           if-no-files-found: ignore

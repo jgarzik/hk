@@ -160,7 +160,7 @@ pub const MAX_ERRNO: u32 = 4095;
 // =============================================================================
 
 use crate::task::Tid;
-use crate::task::percpu::TASK_TABLE;
+use crate::task::percpu::TASKLIST;
 
 /// Clean up seccomp state when a task exits
 ///
@@ -168,16 +168,14 @@ use crate::task::percpu::TASK_TABLE;
 /// for the Task to be reaped). This follows the pattern used by other
 /// subsystems like namespaces and signal handling.
 pub fn exit_seccomp(tid: Tid) {
-    // The filter is released after TASK_TABLE
+    // The filter is released after TASKLIST
     let _old = {
-        let mut table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|task| {
-                task.seccomp_mode = SECCOMP_MODE_DISABLED;
-                task.seccomp_filter.take()
-            })
+        let mut table = TASKLIST.write();
+        table.get_mut(tid).and_then(|mut task| {
+            task.task
+                .seccomp_mode
+                .store(SECCOMP_MODE_DISABLED, core::sync::atomic::Ordering::Relaxed);
+            task.seccomp_filter.take()
+        })
     };
 }

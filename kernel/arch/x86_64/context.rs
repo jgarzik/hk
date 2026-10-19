@@ -13,7 +13,6 @@
 
 use super::fpu::{self, FpuArea};
 use super::percpu::write_fs_base;
-use crate::task::{Tid, get_task_tls};
 
 // External assembly functions from switch_to.S
 unsafe extern "C" {
@@ -177,6 +176,9 @@ pub extern "C" fn clone_child_entry() -> ! {
         // First, release the scheduler lock that was held during context switch
         // (the switch loaded the child's address space: mm::tlb::switch_mm)
         "call {finish_switch}",
+        // Interrupts on, as in any syscall (Linux ret_from_fork): the
+        // child-TID write may fault and sleep
+        "sti",
 
         // Write child TID if CLONE_CHILD_SETTID was used (for fork)
         "call {write_child_tid}",
@@ -205,6 +207,8 @@ pub extern "C" fn clone_child_entry() -> ! {
         //   rax, rbx, rcx, rdx, rsi, rdi, rbp, r8-r15,
         //   error_code, rip, cs, rflags, rsp, ss
 
+        // Off for the return (IRETQ loads the user RFLAGS)
+        "cli",
         // Restore general purpose registers from TrapFrame
         "pop rax",     // Will be 0 (child return value)
         "pop rbx",
@@ -302,18 +306,15 @@ impl TaskContext {
 /// * `old_ctx` - Where to save the current task's context
 /// * `new_ctx` - The context to restore
 /// * `new_kstack` - New kernel stack top (for TSS.RSP0)
-/// * `next_tid` - TID of the task we're switching to (for TLS lookup)
+/// * `next_tls` - its user TLS register value
 pub unsafe fn context_switch(
     old_ctx: *mut TaskContext,
     new_ctx: *const TaskContext,
     new_kstack: u64,
-    next_tid: Tid,
+    next_tls: u64,
 ) {
-    // Load next task's TLS (FS base) before switching
-    if next_tid != 0 {
-        let tls = get_task_tls(next_tid).unwrap_or(0);
-        write_fs_base(tls);
-    }
+    // Load next task's user TLS register (FS base)
+    write_fs_base(next_tls);
 
     // The external assembly function uses a stack-based context.
     // It saves/restores callee-saved registers via push/pop on the stack,
@@ -345,12 +346,9 @@ pub unsafe fn context_switch(
 ///
 /// # Safety
 /// Same requirements as context_switch, except old_ctx is not used.
-pub unsafe fn context_switch_first(new_ctx: *const TaskContext, new_kstack: u64, next_tid: Tid) {
-    // Load next task's TLS (FS base) - no prev task to save
-    if next_tid != 0 {
-        let tls = get_task_tls(next_tid).unwrap_or(0);
-        write_fs_base(tls);
-    }
+pub unsafe fn context_switch_first(new_ctx: *const TaskContext, new_kstack: u64, next_tls: u64) {
+    // Load next task's user TLS register (FS base)
+    write_fs_base(next_tls);
 
     // The external assembly function handles:
     // - Loading next task's RSP
@@ -389,20 +387,20 @@ impl ContextOps for X86_64Arch {
         old_ctx: *mut Self::TaskContext,
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        next_tid: Tid,
+        next_tls: u64,
     ) {
         unsafe {
-            context_switch(old_ctx, new_ctx, new_kstack, next_tid);
+            context_switch(old_ctx, new_ctx, new_kstack, next_tls);
         }
     }
 
     unsafe fn context_switch_first(
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        next_tid: Tid,
+        next_tls: u64,
     ) -> ! {
         unsafe {
-            context_switch_first(new_ctx, new_kstack, next_tid);
+            context_switch_first(new_ctx, new_kstack, next_tls);
             // The above never returns, but we need to satisfy the type system
             core::hint::unreachable_unchecked()
         }

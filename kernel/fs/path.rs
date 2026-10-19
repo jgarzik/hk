@@ -12,8 +12,9 @@ use super::KernelError;
 use super::dac::{MAY_EXEC, cred, permission_as};
 use super::dentry::Dentry;
 use super::inode::Inode;
-use super::mount::{current_mnt_ns, follow_mount};
+use super::mount::follow_mount;
 use super::path_ref::Path;
+use crate::ns::current_mnt_ns;
 use crate::task::Cred;
 
 /// Maximum number of symlinks to follow (prevent infinite loops)
@@ -224,7 +225,8 @@ pub fn create_entry(
 
 /// Remove entry `name` from directory `parent` (Linux vfs_unlink /
 /// vfs_rmdir) under the parent's lock: may_delete (write+search, sticky
-/// rule, type vs `isdir`), then the file system's unlink or rmdir
+/// rule, type vs `isdir`), then the file system's unlink or rmdir with
+/// the victim's lock held too
 pub fn delete_entry(parent: &Arc<Dentry>, name: &str, isdir: bool) -> Result<(), KernelError> {
     let dir = parent.get_inode().ok_or(KernelError::NotFound)?;
     let _w = super::dac::want_write(&dir)?;
@@ -234,11 +236,16 @@ pub fn delete_entry(parent: &Arc<Dentry>, name: &str, isdir: bool) -> Result<(),
         let victim = lookup_one(parent, name)?;
         let inode = victim.get_inode().ok_or(KernelError::NotFound)?;
         super::dac::may_delete(&c, &dir, &inode, isdir)?;
-        if isdir {
-            dir.i_op.rmdir(&dir, name)?;
+        // The victim's lock, inside the parent's (Linux vfs_unlink /
+        // vfs_rmdir): its link count never drops under a link of it
+        inode.inode_lock();
+        let r = if isdir {
+            dir.i_op.rmdir(&dir, name)
         } else {
-            dir.i_op.unlink(&dir, name)?;
-        }
+            dir.i_op.unlink(&dir, name)
+        };
+        unsafe { inode.inode_unlock() };
+        r?;
         parent.remove_child(name);
         Ok(())
     })();

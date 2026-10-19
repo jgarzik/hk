@@ -22,35 +22,26 @@ extern crate alloc;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::arch::{CurrentArch, PerCpuOps};
+use crate::cpu::PerCpu;
 
 /// Per-CPU page-fault-disable depth (Linux pagefault_disable)
-static PF_DISABLE: [AtomicU32; <CurrentArch as PerCpuOps>::MAX_CPUS] =
-    [const { AtomicU32::new(0) }; <CurrentArch as PerCpuOps>::MAX_CPUS];
-
-fn pf_slot() -> Option<&'static AtomicU32> {
-    PF_DISABLE.get(CurrentArch::try_current_cpu_id()? as usize)
-}
+static PF_DISABLE: PerCpu<AtomicU32> = crate::percpu![AtomicU32::new(0)];
 
 /// Linux pagefault_disable: until `pagefault_enable`, a user access that
 /// faults is not resolved (no sleeping fault-in) but fails at once
 /// (EFAULT through the copy's fixup). For user reads under a spinlock
 /// (futex values); the caller stays on this CPU (it holds a spinlock).
 pub fn pagefault_disable() {
-    if let Some(s) = pf_slot() {
-        s.fetch_add(1, Ordering::Relaxed);
-    }
+    PF_DISABLE.this().fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn pagefault_enable() {
-    if let Some(s) = pf_slot() {
-        s.fetch_sub(1, Ordering::Relaxed);
-    }
+    PF_DISABLE.this().fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Faults on user addresses must not be resolved here
 pub fn pagefault_disabled() -> bool {
-    pf_slot().is_some_and(|s| s.load(Ordering::Relaxed) != 0)
+    PF_DISABLE.this().load(Ordering::Relaxed) != 0
 }
 
 /// Linux might_fault: a user access may sleep resolving a fault, unless
@@ -218,6 +209,70 @@ pub fn copy_from_user<A: UaccessArch>(
         return Err(UaccessError::Fault);
     }
     Ok(0)
+}
+
+/// Linux fault_in_readable: fault in every page of [addr, addr + len)
+/// for reading (one byte read per page, faults resolved as usual).
+/// Returns the bytes from the first page that could not be faulted in
+/// to the end (0: all present). Call with no spinlock and no mmap_lock
+/// held; i_rwsem may be held (i_rwsem -> mmap_lock).
+pub fn fault_in_readable<A: UaccessArch>(addr: u64, len: usize) -> usize {
+    let end = addr.saturating_add(len as u64);
+    let mut a = addr;
+    while a < end {
+        if get_user::<A, u8>(a).is_err() {
+            return (end - a) as usize;
+        }
+        a = (a & !0xfff) + 0x1000;
+    }
+    0
+}
+
+/// Linux fault_in_safe_writeable: fault in every page of [addr, addr +
+/// len) for writing through the fault path (no write to user memory:
+/// copy-on-write broken, missing pages mapped). Returns the bytes not
+/// faulted in, as `fault_in_readable`; same locking rules.
+pub fn fault_in_writeable<A: UaccessArch>(addr: u64, len: usize) -> usize {
+    use crate::mm::fault::{Access, handle_mm_fault};
+    let end = addr.saturating_add(len as u64);
+    if !A::access_ok(addr, len) {
+        return len;
+    }
+    let mm = crate::mm::get_task_mm(crate::task::percpu::current_tid());
+    let mut a = addr;
+    while a < end {
+        let page = a & !0xfff;
+        if mm
+            .as_ref()
+            .is_none_or(|m| handle_mm_fault(m, page, Access::Write).is_err())
+        {
+            return (end - a) as usize;
+        }
+        a = page + 0x1000;
+    }
+    0
+}
+
+/// `copy_from_user` for a copy made under a lock that a fault must not
+/// nest under (Linux generic_perform_write: i_rwsem, later the page
+/// lock): the copy runs with page faults disabled; a missing page is
+/// faulted in (`fault_in_readable`) and the copy retried, EFAULT if it
+/// cannot be
+#[track_caller]
+pub fn copy_from_user_atomic<A: UaccessArch>(
+    to: &mut [u8],
+    from: u64,
+    len: usize,
+) -> UaccessResult<usize> {
+    loop {
+        pagefault_disable();
+        let r = copy_from_user::<A>(to, from, len);
+        pagefault_enable();
+        match r {
+            Err(UaccessError::Fault) if fault_in_readable::<A>(from, len) == 0 => continue,
+            r => return r,
+        }
+    }
 }
 
 /// Write a single value to user space

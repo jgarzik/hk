@@ -158,6 +158,7 @@ pub const SYS_READ: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_OPEN: u64 = 2;
 pub const SYS_CLOSE: u64 = 3;
+pub const SYS_CLOSE_RANGE: u64 = 436;
 pub const SYS_STAT: u64 = 4;
 pub const SYS_LSTAT: u64 = 6;
 pub const SYS_POLL: u64 = 7;
@@ -230,9 +231,11 @@ pub const SYS_FTRUNCATE: u64 = 77;
 pub const SYS_GETDENTS: u64 = 78;
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_RENAME: u64 = 82;
+pub const SYS_RENAMEAT2: u64 = 316;
 pub const SYS_MKDIR: u64 = 83;
 pub const SYS_RMDIR: u64 = 84;
 pub const SYS_LINK: u64 = 86;
+pub const SYS_LINKAT: u64 = 265;
 pub const SYS_UNLINK: u64 = 87;
 pub const SYS_SYMLINK: u64 = 88;
 pub const SYS_READLINK: u64 = 89;
@@ -244,6 +247,7 @@ pub const SYS_LCHOWN: u64 = 94;
 pub const SYS_UMASK: u64 = 95;
 pub const SYS_GETRLIMIT: u64 = 97;
 pub const SYS_GETRUSAGE: u64 = 98;
+pub const SYS_TIMES: u64 = 100;
 pub const SYS_SYSINFO: u64 = 99;
 pub const SYS_GETUID: u64 = 102;
 pub const SYS_GETGID: u64 = 104;
@@ -444,6 +448,12 @@ pub fn sys_close(fd: u64) -> i64 {
     unsafe { syscall1!(SYS_CLOSE, fd) }
 }
 
+/// close_range(fd, max_fd, flags)
+#[inline(always)]
+pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> i64 {
+    unsafe { syscall3!(SYS_CLOSE_RANGE, fd as u64, max_fd as u64, flags as u64) }
+}
+
 #[inline(always)]
 pub fn sys_dup2(oldfd: i32, newfd: i32) -> i64 {
     unsafe { syscall2!(SYS_DUP2, oldfd, newfd) }
@@ -579,6 +589,18 @@ pub fn sys_link(oldpath: *const u8, newpath: *const u8) -> i64 {
     unsafe { syscall2!(SYS_LINK, oldpath, newpath) }
 }
 
+/// linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+#[inline(always)]
+pub fn sys_linkat(
+    olddirfd: i32,
+    oldpath: *const u8,
+    newdirfd: i32,
+    newpath: *const u8,
+    flags: i32,
+) -> i64 {
+    unsafe { syscall5!(SYS_LINKAT, olddirfd, oldpath, newdirfd, newpath, flags) }
+}
+
 #[inline(always)]
 pub fn sys_unlink(pathname: *const u8) -> i64 {
     unsafe { syscall1!(SYS_UNLINK, pathname) }
@@ -587,6 +609,18 @@ pub fn sys_unlink(pathname: *const u8) -> i64 {
 #[inline(always)]
 pub fn sys_rename(oldpath: *const u8, newpath: *const u8) -> i64 {
     unsafe { syscall2!(SYS_RENAME, oldpath, newpath) }
+}
+
+/// renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+#[inline(always)]
+pub fn sys_renameat2(
+    olddirfd: i32,
+    oldpath: *const u8,
+    newdirfd: i32,
+    newpath: *const u8,
+    flags: u32,
+) -> i64 {
+    unsafe { syscall5!(SYS_RENAMEAT2, olddirfd, oldpath, newdirfd, newpath, flags) }
 }
 
 #[inline(always)]
@@ -1205,6 +1239,12 @@ pub fn sys_sigaltstack(ss: u64, oss: u64) -> i64 {
     unsafe { syscall2!(SYS_SIGALTSTACK, ss, oss) }
 }
 
+/// ptrace(request, pid, addr, data)
+#[inline(always)]
+pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
+    unsafe { syscall4!(101u64, request, pid, addr, data) }
+}
+
 #[inline(always)]
 pub fn sys_kill(pid: i64, sig: u32) -> i64 {
     unsafe { syscall2!(SYS_KILL, pid, sig) }
@@ -1516,6 +1556,12 @@ pub fn sys_sysinfo(info: *mut u8) -> i64 {
 }
 
 #[inline(always)]
+/// times(2): clock ticks since boot; fills `buf` (struct tms) if not
+/// null
+pub fn sys_times(buf: *mut u8) -> i64 {
+    unsafe { syscall1!(SYS_TIMES, buf) }
+}
+
 pub fn sys_getrusage(who: i32, usage: *mut u8) -> i64 {
     unsafe { syscall2!(SYS_GETRUSAGE, who, usage) }
 }

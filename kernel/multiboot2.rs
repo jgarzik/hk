@@ -63,12 +63,18 @@ impl Iterator for Tags {
         if self.cur >= self.end {
             return None;
         }
-        let tag = self.cur as *const TagHeader;
-        let (kind, size) = unsafe { ((*tag).tag_type, (*tag).size) };
-        if kind == TAG_END {
+        // A tag must hold its header and end inside the info structure
+        // (a short or overlong size ends the walk)
+        let room = self.end as usize - self.cur as usize;
+        if room < 8 {
             return None;
         }
-        self.cur = unsafe { self.cur.add(size.next_multiple_of(8) as usize) };
+        let tag = self.cur as *const TagHeader;
+        let (kind, size) = unsafe { ((*tag).tag_type, (*tag).size as usize) };
+        if kind == TAG_END || size < 8 || size > room {
+            return None;
+        }
+        self.cur = unsafe { self.cur.add(size.next_multiple_of(8).min(room)) };
         Some(tag)
     }
 }
@@ -82,7 +88,9 @@ unsafe fn tags(info: u64) -> Tags {
         return Tags { cur: p, end: p };
     }
     let base = phys_to_virt(info) as *const u8;
-    let total = unsafe { (*(base as *const Multiboot2Info)).total_size };
+    // At least the fixed header, at most 1MB (a bogus size would walk
+    // far past the structure)
+    let total = unsafe { (*(base as *const Multiboot2Info)).total_size }.clamp(8, 1 << 20);
     Tags {
         cur: unsafe { base.add(8) },
         end: unsafe { base.add(total as usize) },
@@ -109,11 +117,21 @@ pub unsafe fn for_each_region(info: u64, mut f: impl FnMut(u64, u64, u32)) {
         return;
     };
     unsafe {
+        // Step by the tag's entry_size (GRUB, Linux), which must cover
+        // the entry read; every entry lies inside the tag
+        let len = (*tag).size as usize;
+        let want = core::mem::size_of::<MemoryMapEntry>();
+        if len < 16 {
+            return;
+        }
         let mt = tag as *const MemoryMapTag;
         let step = (*mt).entry_size as usize;
-        let end = (tag as *const u8).add((*tag).size as usize);
+        if step < want {
+            return;
+        }
+        let end = (tag as *const u8).add(len);
         let mut p = (tag as *const u8).add(16);
-        while p < end {
+        while (end as usize).saturating_sub(p as usize) >= want {
             let e = core::ptr::read_unaligned(p as *const MemoryMapEntry);
             f(e.base_addr, e.length, e.mem_type);
             p = p.add(step);
@@ -130,31 +148,17 @@ pub unsafe fn get_cmdline(info: u64) -> Option<&'static str> {
     unsafe { cstr((tag as *const u8).add(8), (*tag).size as usize - 8) }
 }
 
-/// Find the largest usable memory region above a given address,
-/// as physical (start, end); (0, 0) if none
-///
-/// # Safety
-/// `info` is the physical address of a valid multiboot2 info structure.
-pub unsafe fn find_largest_region_above(info: u64, min_addr: u64) -> (u64, u64) {
-    let mut best = (0, 0);
-    unsafe {
-        for_each_region(info, |base, len, kind| {
-            let (start, end) = (base.max(min_addr), base + len);
-            if kind == MEMORY_AVAILABLE && end > start && end - start > best.1 - best.0 {
-                best = (start, end);
-            }
-        });
-    }
-    best
-}
-
 /// Module tag fields: (physical start, physical end, cmdline)
 unsafe fn module(tag: *const TagHeader) -> (u64, u64, Option<&'static str>) {
     unsafe {
         let p = tag as *const u8;
+        let size = (*tag).size as usize;
+        if size < 16 {
+            return (0, 0, None);
+        }
         let start = *(p.add(8) as *const u32) as u64;
         let end = *(p.add(12) as *const u32) as u64;
-        (start, end, cstr(p.add(16), (*tag).size as usize - 16))
+        (start, end, cstr(p.add(16), size - 16))
     }
 }
 
@@ -172,7 +176,9 @@ pub unsafe fn boot_ranges(info: u64, mut f: impl FnMut(&'static str, u64, u64)) 
         f("multiboot info", info, info + total as u64);
         for tag in tags(info).filter(|&t| (*t).tag_type == TAG_MODULE) {
             let (start, end, _) = module(tag);
-            f("multiboot module", start, end);
+            if start < end {
+                f("multiboot module", start, end);
+            }
         }
     }
 }
@@ -187,7 +193,7 @@ pub unsafe fn find_module(info: u64, name: &str) -> Option<&'static [u8]> {
     unsafe {
         for tag in tags(info).filter(|&t| (*t).tag_type == TAG_MODULE) {
             let (start, end, cmdline) = module(tag);
-            if cmdline.is_some_and(|c| c.contains(name)) {
+            if start < end && cmdline.is_some_and(|c| c.contains(name)) {
                 let p = phys_to_virt(start) as *const u8;
                 return Some(core::slice::from_raw_parts(p, (end - start) as usize));
             }

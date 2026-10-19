@@ -196,11 +196,13 @@ pub const SYS_UNLINKAT: u64 = 35;
 pub const SYS_SYMLINKAT: u64 = 36;
 pub const SYS_LINKAT: u64 = 37;
 pub const SYS_RENAMEAT: u64 = 38;
+pub const SYS_RENAMEAT2: u64 = 276;
 pub const SYS_FTRUNCATE: u64 = 46;
 pub const SYS_FCHMODAT: u64 = 53;
 pub const SYS_FCHOWNAT: u64 = 54;
 pub const SYS_OPENAT: u64 = 56;
 pub const SYS_CLOSE: u64 = 57;
+pub const SYS_CLOSE_RANGE: u64 = 436;
 pub const SYS_GETDENTS64: u64 = 61;
 pub const SYS_LSEEK: u64 = 62;
 pub const SYS_READ: u64 = 63;
@@ -354,6 +356,7 @@ pub const SYS_MREMAP: u64 = 216;
 
 // System information syscalls
 pub const SYS_GETRUSAGE: u64 = 165;
+pub const SYS_TIMES: u64 = 153;
 pub const SYS_SYSINFO: u64 = 179;
 pub const SYS_GETRANDOM: u64 = 278;
 
@@ -493,6 +496,12 @@ pub fn sys_open(path: *const u8, flags: u32, mode: u32) -> i64 {
 #[inline(always)]
 pub fn sys_close(fd: u64) -> i64 {
     unsafe { syscall1!(SYS_CLOSE, fd) }
+}
+
+/// close_range(fd, max_fd, flags)
+#[inline(always)]
+pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> i64 {
+    unsafe { syscall3!(SYS_CLOSE_RANGE, fd as u64, max_fd as u64, flags as u64) }
 }
 
 /// getpid()
@@ -1169,6 +1178,18 @@ pub fn sys_renameat(olddirfd: i32, oldpath: *const u8, newdirfd: i32, newpath: *
     unsafe { syscall4!(SYS_RENAMEAT, olddirfd, oldpath, newdirfd, newpath) }
 }
 
+/// renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+#[inline(always)]
+pub fn sys_renameat2(
+    olddirfd: i32,
+    oldpath: *const u8,
+    newdirfd: i32,
+    newpath: *const u8,
+    flags: u32,
+) -> i64 {
+    unsafe { syscall5!(SYS_RENAMEAT2, olddirfd, oldpath, newdirfd, newpath, flags) }
+}
+
 /// rename(oldpath, newpath) - compatibility wrapper
 pub fn sys_rename(oldpath: *const u8, newpath: *const u8) -> i64 {
     sys_renameat(AT_FDCWD, oldpath, AT_FDCWD, newpath)
@@ -1328,6 +1349,12 @@ pub fn sys_rt_sigtimedwait(set: u64, info: u64, ts: u64, sigsetsize: u64) -> i64
 #[inline(always)]
 pub fn sys_sigaltstack(ss: u64, oss: u64) -> i64 {
     unsafe { syscall2!(SYS_SIGALTSTACK, ss, oss) }
+}
+
+/// ptrace(request, pid, addr, data)
+#[inline(always)]
+pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
+    unsafe { syscall4!(117u64, request, pid, addr, data) }
 }
 
 /// kill(pid, sig) - send signal to process
@@ -1745,6 +1772,12 @@ pub fn sys_sysinfo(info: *mut u8) -> i64 {
 
 /// getrusage(who, usage) - get resource usage
 #[inline(always)]
+/// times(2): clock ticks since boot; fills `buf` (struct tms) if not
+/// null
+pub fn sys_times(buf: *mut u8) -> i64 {
+    unsafe { syscall1!(SYS_TIMES, buf) }
+}
+
 pub fn sys_getrusage(who: i32, usage: *mut u8) -> i64 {
     unsafe { syscall2!(SYS_GETRUSAGE, who, usage) }
 }

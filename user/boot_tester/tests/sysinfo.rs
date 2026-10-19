@@ -2,19 +2,22 @@
 //!
 //! Tests:
 //! - Test 70: uname() - get system identification
+//! - TIMES_BASIC: times() - clock ticks and process times
 //! - Test 71: sethostname() - set hostname
 //! - Test 72: setdomainname() - set domain name
 //! - Test 73: sethostname() EINVAL - too long name
 //! - Test 74: clock_settime() - set realtime clock
 //! - Test 75: clock_settime() EINVAL - cannot set CLOCK_MONOTONIC
 //! - Test 76: clock_settime() EINVAL - invalid nsec value
+//! - CLOCK_SETTIME_STORM: clock_settime() racing the timer tick on CPU 0
 //! - Test 77: settimeofday() - set time (x86_64 only)
 //! - Test 78: settimeofday() EINVAL - invalid usec (x86_64 only)
 
+use super::sk::T;
 use super::helpers::{host_mode, print, print_cstr, print_num, println, starts_with};
 use hk_syscall::{
-    Timespec, UtsName, sys_clock_gettime, sys_clock_settime, sys_setdomainname, sys_sethostname,
-    sys_uname,
+    Timespec, UtsName, sys_clock_gettime, sys_clock_settime, sys_sched_getaffinity,
+    sys_sched_setaffinity, sys_setdomainname, sys_sethostname, sys_times, sys_uname,
 };
 #[cfg(target_arch = "x86_64")]
 use hk_syscall::{Timeval, sys_gettimeofday, sys_settimeofday};
@@ -26,12 +29,14 @@ const CLOCK_MONOTONIC: i32 = 1;
 /// Run all sysinfo tests
 pub fn run_tests() {
     test_uname();
+    test_times();
     test_sethostname();
     test_setdomainname();
     test_sethostname_einval();
     test_clock_settime_basic();
     test_clock_settime_monotonic_fails();
     test_clock_settime_invalid_nsec();
+    test_clock_settime_storm();
     #[cfg(target_arch = "x86_64")]
     {
         test_settimeofday_basic();
@@ -213,6 +218,50 @@ fn test_clock_settime_invalid_nsec() {
     }
 }
 
+fn clock_ns(clock: i32) -> i64 {
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    sys_clock_gettime(clock, &mut ts);
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+/// clock_settime() in a loop on CPU 0 for 1 s (monotonic): every call
+/// races the timer tick that updates the timekeeper there. Linux takes
+/// timekeeper_lock with IRQs off around each update; an unserialized
+/// writer interrupted mid-update leaves the clock seqcount odd and the
+/// tick spins on it forever. CLOCK_MONOTONIC must never go backwards
+fn test_clock_settime_storm() {
+    let mut t = T::new(b"CLOCK_SETTIME_STORM");
+    let mut mask: u64 = 0;
+    sys_sched_getaffinity(0, 8, &mut mask);
+    t.eq(b"pin cpu0", sys_sched_setaffinity(0, 8, &1u64), 0);
+    let start = clock_ns(CLOCK_MONOTONIC);
+    let mut prev = start;
+    let mut n = 0i64;
+    while prev - start < 1_000_000_000 {
+        let mut ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        sys_clock_gettime(CLOCK_REALTIME, &mut ts);
+        let r = sys_clock_settime(CLOCK_REALTIME, &ts);
+        if !t.eq(b"settime", r, 0) {
+            break;
+        }
+        let now = clock_ns(CLOCK_MONOTONIC);
+        if !t.ok(b"monotonic backwards", now >= prev, now - prev) {
+            break;
+        }
+        prev = now;
+        n += 1;
+    }
+    t.ok(b"iterations", n > 0, n);
+    sys_sched_setaffinity(0, 8, &mask);
+    t.done();
+}
+
 /// Test 77: settimeofday() - set time (x86_64 only)
 #[cfg(target_arch = "x86_64")]
 fn test_settimeofday_basic() {
@@ -276,5 +325,22 @@ fn test_settimeofday_invalid_usec() {
     } else {
         print(b"SETTIMEOFDAY_INVALID_USEC:FAIL: expected -22 (EINVAL), got ");
         print_num(ret);
+    }
+}
+
+/// times(): ticks since boot (monotone), the process's times in `buf`,
+/// EFAULT for a bad buffer
+fn test_times() {
+    let mut tms = [0i64; 4];
+    let a = sys_times(core::ptr::null_mut());
+    let b = sys_times(tms.as_mut_ptr() as *mut u8);
+    let bad = sys_times(8 as *mut u8);
+    print(b"TIMES_BASIC");
+    if b >= a && tms.iter().all(|&t| t >= 0) && bad == -14 {
+        println(b":OK");
+    } else {
+        print(b":FAIL got ");
+        print_num(bad);
+        println(b"");
     }
 }

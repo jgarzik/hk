@@ -23,7 +23,6 @@
 //! - Linux kernel ipc/mqueue.c
 //! - POSIX.1-2017 mq_overview(7)
 
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -382,10 +381,20 @@ impl MqQueue {
     }
 }
 
-/// File operations for message queue
-pub struct MqFileOps {
+/// A message queue descriptor's private data
+pub struct MqFile {
     queue: Arc<MqQueue>,
     access_mode: i32,
+}
+
+/// File operations for message queue
+pub struct MqFileOps;
+
+static MQ_FOPS: MqFileOps = MqFileOps;
+
+/// The queue behind a message queue file
+fn mq_of(file: &File) -> Option<&MqFile> {
+    file.private_ref::<MqFile>()
 }
 
 impl FileOps for MqFileOps {
@@ -393,51 +402,57 @@ impl FileOps for MqFileOps {
         self
     }
 
-    fn read(&self, _file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        if self.access_mode == O_WRONLY {
+    fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let mq = mq_of(file).ok_or(KernelError::BadFd)?;
+        if mq.access_mode == O_WRONLY {
             return Err(KernelError::PermissionDenied);
         }
 
-        match self.queue.receive(buf, false, None) {
+        match mq.queue.receive(buf, false, None) {
             Ok((len, _prio)) => Ok(len),
             Err(_) => Err(KernelError::Io),
         }
     }
 
-    fn write(&self, _file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        if self.access_mode == O_RDONLY {
+    fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+        let mq = mq_of(file).ok_or(KernelError::BadFd)?;
+        if mq.access_mode == O_RDONLY {
             return Err(KernelError::PermissionDenied);
         }
 
         // Write with priority 0 (default)
-        match self.queue.send(buf, 0, false, None) {
+        match mq.queue.send(buf, 0, false, None) {
             Ok(()) => Ok(buf.len()),
             Err(_) => Err(KernelError::Io),
         }
     }
 
-    fn poll(&self, _file: &File, table: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, table: Option<&mut PollTable>) -> u16 {
+        let Some(mq) = mq_of(file) else {
+            return crate::poll::POLLERR;
+        };
         if let Some(pt) = table {
-            pt.poll_wait(&self.queue.waitq_recv);
-            pt.poll_wait(&self.queue.waitq_send);
+            pt.poll_wait(&mq.queue.waitq_recv);
+            pt.poll_wait(&mq.queue.waitq_send);
         }
-        let msgs = self.queue.messages.lock();
+        let msgs = mq.queue.messages.lock();
         let mut events = 0u16;
 
         if !msgs.is_empty() {
             events |= POLLIN | POLLRDNORM;
         }
-        if (msgs.len() as i64) < self.queue.maxmsg {
+        if (msgs.len() as i64) < mq.queue.maxmsg {
             events |= POLLOUT | POLLWRNORM;
         }
 
         events
     }
 
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        let mq = mq_of(file).ok_or(KernelError::BadFd)?;
         // Clear notification if we own it
         let current_pid = crate::task::percpu::current_pid();
-        let mut notify = self.queue.notify.lock();
+        let mut notify = mq.queue.notify.lock();
         if let Some(ref n) = *notify
             && n.owner_pid == current_pid
         {
@@ -470,12 +485,6 @@ fn get_nofile_limit() -> u64 {
 }
 
 fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<Arc<File>, i64> {
-    // Create file operations (leak to get 'static lifetime)
-    let ops: &'static dyn FileOps = Box::leak(Box::new(MqFileOps {
-        queue: queue.clone(),
-        access_mode,
-    }));
-
     // Create anonymous inode
     let mode = InodeMode::regular(0o644);
     let inode = Arc::new(Inode::new(
@@ -502,7 +511,8 @@ fn create_mq_file(queue: Arc<MqQueue>, access_mode: i32, oflag: i32) -> Result<A
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file = Arc::new(File::new(dentry, file_flags, ops));
+    let private = Arc::new(MqFile { queue, access_mode });
+    let file = Arc::new(File::new_anon(dentry, file_flags, &MQ_FOPS, private));
     Ok(file)
 }
 
@@ -697,7 +707,7 @@ pub fn sys_mq_timedsend(
     };
 
     // Get MqFileOps from file
-    let mq_ops = match file.f_op.as_any().downcast_ref::<MqFileOps>() {
+    let mq_ops = match mq_of(&file) {
         Some(ops) => ops,
         None => return KernelError::BadFd.sysret(),
     };
@@ -754,7 +764,7 @@ pub fn sys_mq_timedreceive(
     };
 
     // Get MqFileOps from file
-    let mq_ops = match file.f_op.as_any().downcast_ref::<MqFileOps>() {
+    let mq_ops = match mq_of(&file) {
         Some(ops) => ops,
         None => return KernelError::BadFd.sysret(),
     };
@@ -814,7 +824,7 @@ pub fn sys_mq_notify(mqdes: i32, sevp_ptr: u64) -> i64 {
     };
 
     // Get MqFileOps from file
-    let mq_ops = match file.f_op.as_any().downcast_ref::<MqFileOps>() {
+    let mq_ops = match mq_of(&file) {
         Some(ops) => ops,
         None => return KernelError::BadFd.sysret(),
     };
@@ -885,7 +895,7 @@ pub fn sys_mq_getsetattr(mqdes: i32, newattr_ptr: u64, oldattr_ptr: u64) -> i64 
     };
 
     // Get MqFileOps from file
-    let mq_ops = match file.f_op.as_any().downcast_ref::<MqFileOps>() {
+    let mq_ops = match mq_of(&file) {
         Some(ops) => ops,
         None => return KernelError::BadFd.sysret(),
     };

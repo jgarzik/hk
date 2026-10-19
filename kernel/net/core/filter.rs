@@ -324,7 +324,7 @@ fn anc(c: &Ctx, k: u32, a: u32, x: u32) -> u32 {
         ad::IFINDEX => c.ifindex,
         ad::MARK => c.mark,
         ad::HATYPE => c.hatype as u32,
-        ad::CPU => crate::task::percpu::current_cpu(),
+        ad::CPU => crate::cpu::this_id(),
         ad::ALU_XOR_X => a ^ x,
         ad::RANDOM => crate::random::get_random_u32(),
         // No netlink attributes, queues, hashes or VLAN tags here

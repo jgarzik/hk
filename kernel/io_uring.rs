@@ -39,11 +39,10 @@
 //! - Optional kernel-side polling (SQPOLL)
 //! - Registered buffers and files for performance
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::AtomicU32;
 
 use crate::arch::{IrqSpinlock, Uaccess};
 use crate::fs::KernelError;
@@ -442,9 +441,6 @@ pub struct IoUring {
     /// Wait queue for blocking waits
     wq: WaitQueue,
 
-    /// Unique ID
-    id: u64,
-
     /// Ring sizes (immutable after creation, used for mmap)
     #[allow(dead_code)] // Used for mmap in future
     sq_entries: u32,
@@ -456,36 +452,21 @@ pub struct IoUring {
     sqes_size: usize,
 }
 
-/// Global counter for io_uring IDs
-static NEXT_IOURING_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Global io_uring registry
-static IOURING_REGISTRY: IrqSpinlock<Vec<(u64, Weak<IoUring>)>> = IrqSpinlock::new(Vec::new());
-
 impl IoUring {
     /// Create a new io_uring instance
     pub fn new(sq_entries: u32, cq_entries: u32) -> Arc<Self> {
-        let id = NEXT_IOURING_ID.fetch_add(1, Ordering::Relaxed);
-
         // Calculate memory sizes
         let rings_size = Self::calc_rings_size(sq_entries, cq_entries);
         let sqes_size = (sq_entries as usize) * core::mem::size_of::<IoUringSqe>();
 
-        let ring = Arc::new(Self {
+        Arc::new(Self {
             inner: IrqSpinlock::new(IoUringInner::new(sq_entries, cq_entries)),
             wq: WaitQueue::new(),
-            id,
             sq_entries,
             cq_entries,
             rings_size,
             sqes_size,
-        });
-
-        // Register in global registry
-        let weak = Arc::downgrade(&ring);
-        IOURING_REGISTRY.lock().push((id, weak));
-
-        ring
+        })
     }
 
     /// Calculate total ring buffer size
@@ -871,12 +852,6 @@ impl IoUring {
         }
     }
 
-    /// Release the io_uring instance
-    fn release(&self) {
-        let mut registry = IOURING_REGISTRY.lock();
-        registry.retain(|(id, _)| *id != self.id);
-    }
-
     // =========================================================================
     // Phase 4: Resource registration
     // =========================================================================
@@ -1242,15 +1217,9 @@ impl IoUring {
 // ============================================================================
 
 /// File operations for io_uring file descriptor
-pub struct IoUringFileOps {
-    ring: Arc<IoUring>,
-}
+pub struct IoUringFileOps;
 
-impl IoUringFileOps {
-    pub fn new(ring: Arc<IoUring>) -> Self {
-        Self { ring }
-    }
-}
+static IO_URING_FOPS: IoUringFileOps = IoUringFileOps;
 
 impl FileOps for IoUringFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -1267,38 +1236,31 @@ impl FileOps for IoUringFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(ring) = file.private_ref::<IoUring>() else {
+            return crate::poll::POLLERR;
+        };
         if let Some(poll_table) = pt {
-            poll_table.poll_wait(&self.ring.wq);
+            poll_table.poll_wait(&ring.wq);
         }
 
         // Check if CQEs are available
-        let inner = self.ring.inner.lock();
+        let inner = ring.inner.lock();
         if inner.cq_tail > 0 {
             crate::poll::POLLIN | crate::poll::POLLRDNORM
         } else {
             0
         }
     }
-
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
-        self.ring.release();
-        Ok(())
-    }
 }
 
 /// Get the IoUring from a File
 pub fn get_io_uring(file: &File) -> Option<Arc<IoUring>> {
-    file.f_op
-        .as_any()
-        .downcast_ref::<IoUringFileOps>()
-        .map(|ops| Arc::clone(&ops.ring))
+    file.private_arc::<IoUring>()
 }
 
 /// Create an io_uring file
 fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, KernelError> {
-    let ops: &'static dyn FileOps = Box::leak(Box::new(IoUringFileOps::new(ring)));
-
     // Create dummy dentry
     let mode = InodeMode::regular(0o600);
     let inode = Arc::new(Inode::new(
@@ -1313,7 +1275,7 @@ fn create_io_uring_file(ring: Arc<IoUring>) -> Result<Arc<File>, KernelError> {
     ));
 
     let dentry = Arc::new(Dentry::new_anonymous(String::from("io_uring"), Some(inode)));
-    let file = Arc::new(File::new(dentry, flags::O_RDWR, ops));
+    let file = Arc::new(File::new_anon(dentry, flags::O_RDWR, &IO_URING_FOPS, ring));
 
     Ok(file)
 }

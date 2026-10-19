@@ -1117,12 +1117,30 @@ extern "C" fn writer(idx: u64) -> ! {
 
 /// Start a thread running `f(arg)` on `stack_top`; its tid word `ctid`
 /// is cleared (and woken) when it exits. The tid, or -errno.
-unsafe fn spawn_thread(
+pub(super) unsafe fn spawn_thread(
     stack_top: u64,
     f: extern "C" fn(u64) -> !,
     arg: u64,
     ctid: *mut u32,
 ) -> i64 {
+    unsafe { spawn_thread_ptid(stack_top, f, arg, ctid, core::ptr::null_mut()) }
+}
+
+/// [`spawn_thread`], with the tid also stored at `ptid` in the caller's
+/// memory (CLONE_PARENT_SETTID) unless it is null
+pub(super) unsafe fn spawn_thread_ptid(
+    stack_top: u64,
+    f: extern "C" fn(u64) -> !,
+    arg: u64,
+    ctid: *mut u32,
+    ptid: *mut u32,
+) -> i64 {
+    const CLONE_PARENT_SETTID: u64 = 0x10_0000;
+    let flags = if ptid.is_null() {
+        CLONE_THREAD_FLAGS
+    } else {
+        CLONE_THREAD_FLAGS | CLONE_PARENT_SETTID
+    };
     let ret: i64;
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -1135,9 +1153,9 @@ unsafe fn spawn_thread(
             "ud2",
             "2:",
             inlateout("rax") 56i64 => ret,
-            in("rdi") CLONE_THREAD_FLAGS,
+            in("rdi") flags,
             in("rsi") stack_top,
-            in("rdx") 0u64,
+            in("rdx") ptid,
             in("r10") ctid,
             in("r8") 0u64,
             in("r12") arg,
@@ -1155,9 +1173,9 @@ unsafe fn spawn_thread(
             "blr x10",
             "brk #0",
             "2:",
-            inlateout("x0") CLONE_THREAD_FLAGS as i64 => ret,
+            inlateout("x0") flags as i64 => ret,
             in("x1") stack_top,
-            in("x2") 0u64,
+            in("x2") ptid,
             in("x3") 0u64,
             in("x4") ctid,
             in("x8") 220u64,
@@ -1169,7 +1187,7 @@ unsafe fn spawn_thread(
 }
 
 /// Wait (bounded) for the thread whose tid word is `ctid` to exit
-fn join(ctid: *mut u32) -> bool {
+pub(super) fn join(ctid: *mut u32) -> bool {
     for _ in 0..2_000_000u32 {
         if unsafe { core::ptr::read_volatile(ctid) } == 0 {
             return true;

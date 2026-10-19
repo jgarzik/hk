@@ -28,6 +28,7 @@ pub const SYS_UNLINKAT: u64 = 35;
 pub const SYS_SYMLINKAT: u64 = 36;
 pub const SYS_LINKAT: u64 = 37;
 pub const SYS_RENAMEAT: u64 = 38;
+pub const SYS_RENAMEAT2: u64 = 276;
 pub const SYS_UMOUNT2: u64 = 39;
 pub const SYS_MOUNT: u64 = 40;
 /// pivot_root(new_root, put_old)
@@ -49,6 +50,7 @@ pub const SYS_FCHMODAT2: u64 = 452;
 pub const SYS_FCHOWN: u64 = 55;
 pub const SYS_OPENAT: u64 = 56;
 pub const SYS_CLOSE: u64 = 57;
+pub const SYS_CLOSE_RANGE: u64 = 436;
 pub const SYS_GETDENTS64: u64 = 61;
 pub const SYS_LSEEK: u64 = 62;
 pub const SYS_READ: u64 = 63;
@@ -353,6 +355,8 @@ pub const SYS_BPF: u64 = 280;
 // System information
 /// getrusage(who, usage)
 pub const SYS_GETRUSAGE: u64 = 165;
+/// times(buf) - process times in clock ticks
+pub const SYS_TIMES: u64 = 153;
 /// sysinfo(info)
 pub const SYS_SYSINFO: u64 = 179;
 /// getrandom(buf, buflen, flags)
@@ -524,6 +528,7 @@ pub fn aarch64_syscall_dispatch(
         sys_chdir,
         sys_chroot,
         sys_close,
+        sys_close_range,
         sys_dup3,
         sys_faccessat,
         sys_faccessat2,
@@ -572,6 +577,7 @@ pub fn aarch64_syscall_dispatch(
         sys_readv,
         sys_removexattr,
         sys_renameat,
+        sys_renameat2,
         // Extended attributes
         sys_setxattr,
         sys_statfs,
@@ -627,6 +633,7 @@ pub fn aarch64_syscall_dispatch(
         }
         SYS_OPENAT => sys_openat(arg0 as i32, arg1, arg2 as u32, arg3 as u32) as u64,
         SYS_CLOSE => sys_close(arg0 as i32) as u64,
+        SYS_CLOSE_RANGE => sys_close_range(arg0 as u32, arg1 as u32, arg2 as u32) as u64,
         SYS_LSEEK => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32) as u64,
         SYS_FTRUNCATE => sys_ftruncate(arg0 as i32, arg1 as i64) as u64,
         SYS_DUP3 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as u32) as u64,
@@ -644,6 +651,7 @@ pub fn aarch64_syscall_dispatch(
         SYS_LINKAT => sys_linkat(arg0 as i32, arg1, arg2 as i32, arg3, arg4 as i32) as u64,
         SYS_READLINKAT => sys_readlinkat(arg0 as i32, arg1, arg2, arg3) as u64,
         SYS_RENAMEAT => sys_renameat(arg0 as i32, arg1, arg2 as i32, arg3) as u64,
+        SYS_RENAMEAT2 => sys_renameat2(arg0 as i32, arg1, arg2 as i32, arg3, arg4 as u32) as u64,
         SYS_MOUNT => sys_mount(arg0, arg1, arg2, arg3, arg4) as u64,
         SYS_UMOUNT2 => sys_umount2(arg0, arg1 as i32) as u64,
         SYS_PIVOT_ROOT => sys_pivot_root(arg0, arg1) as u64,
@@ -686,12 +694,8 @@ pub fn aarch64_syscall_dispatch(
 
         // System information
         SYS_GETCPU => {
-            use crate::arch::{PerCpuOps, Uaccess};
-            crate::task::syscall::sys_getcpu::<Uaccess>(
-                crate::arch::CurrentArch::try_current_cpu_id().unwrap_or(0),
-                arg0,
-                arg1,
-            ) as u64
+            use crate::arch::Uaccess;
+            crate::task::syscall::sys_getcpu::<Uaccess>(crate::cpu::this_id(), arg0, arg1) as u64
         }
 
         // Sync operations
@@ -903,7 +907,8 @@ pub fn aarch64_syscall_dispatch(
         SYS_MQ_GETSETATTR => crate::ipc::sys_mq_getsetattr(arg0 as i32, arg1, arg2) as u64,
 
         // Process lifecycle
-        SYS_EXIT | SYS_EXIT_GROUP => sys_exit(arg0 as i32),
+        SYS_EXIT => sys_exit(arg0 as i32),
+        SYS_EXIT_GROUP => crate::task::proc::sys_exit_group(arg0 as i32),
         SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32, arg4) as u64,
         // arm64 selects CONFIG_CLONE_BACKWARDS (kernel/fork.c): the raw
         // order is (flags, newsp, parent_tidptr, tls, child_tidptr).
@@ -1137,6 +1142,7 @@ pub fn aarch64_syscall_dispatch(
             use crate::task::syscall::sys_sysinfo;
             sys_sysinfo::<Uaccess>(arg0) as u64
         }
+        SYS_TIMES => crate::task::syscall::sys_times::<crate::arch::Uaccess>(arg0) as u64,
         SYS_GETRUSAGE => {
             use crate::arch::Uaccess;
             use crate::task::syscall::sys_getrusage;

@@ -3,9 +3,13 @@
 //! Provides infrastructure for accessing another process's virtual memory,
 //! used by process_vm_readv/process_vm_writev syscalls.
 
+use core::sync::atomic::Ordering;
+
+use crate::arch::paging;
 use crate::error::KernelError;
+use crate::mm::ptl::{pt_lock, pte_lock};
 use crate::mm::vma::{PROT_READ, PROT_WRITE};
-use crate::mm::{MmStruct, Vma};
+use crate::mm::{Mm, MmStruct, Vma};
 
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::paging::{X86_64PageTable, phys_to_virt};
@@ -63,16 +67,16 @@ fn short(done: usize, e: KernelError) -> Result<usize, KernelError> {
 /// page, each in a readable VMA of the user half
 ///
 /// # Arguments
-/// * `mm` - The target process's memory descriptor (locked)
-/// * `page_table_root` - Physical address of the target's page table root
+/// * `target` - The target process's address space
+/// * `mm` - Its VMAs (`target`'s mmap_lock held, for reading is enough)
 /// * `remote_addr` - Virtual address in the target's address space
 /// * `buf` - Kernel buffer to read into
 ///
 /// # Returns
 /// Number of bytes read, or error
 pub fn access_remote_vm_read(
+    target: &Mm,
     mm: &MmStruct,
-    page_table_root: u64,
     remote_addr: u64,
     buf: &mut [u8],
 ) -> Result<usize, KernelError> {
@@ -86,7 +90,7 @@ pub fn access_remote_vm_read(
             return short(done, e);
         }
         let chunk = page_chunk(addr, buf.len() - done);
-        let n = read_pages(page_table_root, addr, &mut buf[done..done + chunk])?;
+        let n = read_pages(target, addr, &mut buf[done..done + chunk])?;
         if n == 0 {
             // Not faulted in
             return short(done, KernelError::BadAddress);
@@ -102,19 +106,18 @@ pub fn access_remote_vm_read(
 ///
 /// # Arguments
 /// * `target` - The target process's address space
-/// * `mm` - Its VMAs (`target` locked)
+/// * `mm` - Its VMAs (`target`'s mmap_lock held, for reading is enough)
 /// * `remote_addr` - Virtual address in the target's address space
 /// * `buf` - Kernel buffer to write from
 ///
 /// # Returns
 /// Number of bytes written, or error
 pub fn access_remote_vm_write(
-    target: &crate::mm::Mm,
+    target: &Mm,
     mm: &MmStruct,
     remote_addr: u64,
     buf: &[u8],
 ) -> Result<usize, KernelError> {
-    let page_table_root = target.pgd();
     if remote_addr.checked_add(buf.len() as u64).is_none() {
         return Err(KernelError::BadAddress);
     }
@@ -125,88 +128,125 @@ pub fn access_remote_vm_write(
             Ok(v) => v,
             Err(e) => return short(done, e),
         };
-        // A private page still shared copy-on-write (fork) gets its own
-        // copy first: the write must not reach the other process
-        if !vma.is_shared()
-            && crate::mm::fault::unshare_for_write(target, addr, vma.anon_vma.clone()).is_err()
-        {
-            return short(done, KernelError::OutOfMemory);
-        }
-        if !translate_with_root(page_table_root, addr).is_some_and(ordinary) {
-            return short(done, KernelError::BadAddress);
-        }
         let chunk = page_chunk(addr, buf.len() - done);
-        let n = write_pages(page_table_root, addr, &buf[done..done + chunk])?;
-        if n == 0 {
-            return short(done, KernelError::BadAddress);
-        }
+        let n = match write_page(target, vma, addr, &buf[done..done + chunk]) {
+            Ok(0) => return short(done, KernelError::BadAddress),
+            Ok(n) => n,
+            Err(e) => return short(done, e),
+        };
         done += n;
     }
     Ok(done)
 }
 
-/// Read from pages using page table translation
-fn read_pages(page_table_root: u64, start_addr: u64, buf: &mut [u8]) -> Result<usize, KernelError> {
-    let mut total = 0usize;
-    let mut addr = start_addr;
-    let mut remaining = buf.len();
-
-    while remaining > 0 {
-        // Translate virtual to physical
-        let phys = match translate_with_root(page_table_root, addr) {
-            Some(p) => p,
-            None => return Ok(total), // Page not mapped
-        };
-
-        // Calculate bytes to read from this page
-        let page_offset = (addr & (PAGE_SIZE - 1)) as usize;
-        let page_remaining = (PAGE_SIZE as usize) - page_offset;
-        let to_copy = remaining.min(page_remaining);
-
-        // Copy from physical memory
-        unsafe {
-            let src = phys_to_virt(phys);
-            core::ptr::copy_nonoverlapping(src, buf[total..].as_mut_ptr(), to_copy);
+/// Run `f` on the physical address `addr` maps to in `mm` (None if
+/// unmapped), with the page-table lock of its entry held, so a racing
+/// zap (MADV_DONTNEED) or copy-on-write break cannot free the frame
+/// while `f` copies through it
+fn with_frame<R>(mm: &Mm, addr: u64, f: impl FnOnce(u64) -> R) -> Option<R> {
+    let pgd = mm.pgd();
+    loop {
+        if let Some(p) = paging::pte_ptr(pgd, addr) {
+            let _l = pte_lock(p);
+            return translate_with_root(pgd, addr).map(f);
         }
-
-        total += to_copy;
-        addr += to_copy as u64;
-        remaining -= to_copy;
+        // No 4KB table: a 2MB page or nothing, both stable under the
+        // page_table_lock unless a split installed a table meanwhile
+        let _l = pt_lock(mm);
+        if paging::pte_ptr(pgd, addr).is_none() {
+            return translate_with_root(pgd, addr).map(f);
+        }
     }
-
-    Ok(total)
 }
 
-/// Write to pages using page table translation
-fn write_pages(page_table_root: u64, start_addr: u64, buf: &[u8]) -> Result<usize, KernelError> {
-    let mut total = 0usize;
-    let mut addr = start_addr;
-    let mut remaining = buf.len();
+/// Copy the start of page `addr` into `buf` (within one page); the
+/// bytes read, 0 if not mapped
+fn read_pages(mm: &Mm, addr: u64, buf: &mut [u8]) -> Result<usize, KernelError> {
+    let n = buf.len();
+    Ok(with_frame(mm, addr, |phys| {
+        // SAFETY: a mapped frame, kept by the held page-table lock
+        unsafe { core::ptr::copy_nonoverlapping(phys_to_virt(phys), buf.as_mut_ptr(), n) };
+        n
+    })
+    .unwrap_or(0))
+}
 
-    while remaining > 0 {
-        // Translate virtual to physical
-        let phys = match translate_with_root(page_table_root, addr) {
-            Some(p) => p,
-            None => return Ok(total), // Page not mapped
-        };
+/// Tries at a private page before giving up (each lost to a racing
+/// zap or fault that left a page the write may not reach)
+const COW_TRIES: u32 = 16;
 
-        // Calculate bytes to write to this page
-        let page_offset = (addr & (PAGE_SIZE - 1)) as usize;
-        let page_remaining = (PAGE_SIZE as usize) - page_offset;
-        let to_copy = remaining.min(page_remaining);
-
-        // Copy to physical memory
-        unsafe {
-            let dst = phys_to_virt(phys);
-            core::ptr::copy_nonoverlapping(buf[total..].as_ptr(), dst, to_copy);
-        }
-        // It may be code (ptrace POKETEXT; Linux flush_ptrace_access)
-        crate::arch::paging::sync_icache(phys, to_copy);
-
-        total += to_copy;
-        addr += to_copy as u64;
-        remaining -= to_copy;
+/// Write `buf` to page `addr` (within one page) of `vma` in `mm`; the
+/// bytes written, 0 if no ordinary frame maps it. A private page still
+/// shared copy-on-write gets its own copy first, and the write happens
+/// only if, under the PTE lock that keeps the frame, the entry still
+/// maps a page this mapping alone owns (Linux can_follow_write_pte,
+/// after CVE-2016-5195): a racing MADV_DONTNEED or fault may have put
+/// another page there, which is never written through; the copy is
+/// then broken again.
+fn write_page(mm: &Mm, vma: &Vma, addr: u64, buf: &[u8]) -> Result<usize, KernelError> {
+    if vma.is_shared() {
+        return Ok(write_frame(mm, addr, buf, false).unwrap_or(0));
     }
+    for _ in 0..COW_TRIES {
+        crate::mm::fault::unshare_for_write(mm, addr, vma.anon_vma.clone(), vma.index_of(addr))
+            .map_err(|_| KernelError::OutOfMemory)?;
+        match write_frame(mm, addr, buf, true) {
+            Some(n) => return Ok(n),
+            None if paging::pte_ptr(mm.pgd(), addr).is_none_or(|p| !present(p)) => return Ok(0),
+            None => {}
+        }
+    }
+    Err(KernelError::BadAddress)
+}
 
-    Ok(total)
+/// The entry at `p` maps a page
+fn present(p: *mut u64) -> bool {
+    // SAFETY: `p` points into a live table of the locked mm
+    paging::pte_present(
+        unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }.load(Ordering::Acquire),
+    )
+}
+
+/// A private 4KB entry `pte` maps a page this mapping alone owns:
+/// writable, or neither copy-on-write nor referenced elsewhere
+fn exclusive(pte: u64) -> bool {
+    paging::pte_present(pte)
+        && !paging::pte_protnone(pte)
+        && (paging::pte_write(pte)
+            || (!paging::pte_cow(pte)
+                && crate::FRAME_ALLOCATOR.refcount(paging::pte_addr(pte)) == 1))
+}
+
+/// Copy `buf` to page `addr` if an ordinary frame maps it, under the
+/// entry's page-table lock; with `private`, only if the 4KB entry is
+/// `exclusive` (a 2MB page is never shared). Some(bytes written, 0 if
+/// unmapped or not ordinary); None if a private entry is not exclusive.
+fn write_frame(mm: &Mm, addr: u64, buf: &[u8], private: bool) -> Option<usize> {
+    let pgd = mm.pgd();
+    if private && let Some(p) = paging::pte_ptr(pgd, addr) {
+        let _l = pte_lock(p);
+        // SAFETY: `p` points into a live table; its lock is held
+        let pte = unsafe { core::sync::atomic::AtomicU64::from_ptr(p) }.load(Ordering::Acquire);
+        if !paging::pte_present(pte) {
+            return Some(0);
+        }
+        if !exclusive(pte) {
+            return None;
+        }
+        return Some(translate_with_root(pgd, addr).map_or(0, |phys| copy_to_frame(phys, buf)));
+    }
+    Some(with_frame(mm, addr, |phys| copy_to_frame(phys, buf)).unwrap_or(0))
+}
+
+/// Copy `buf` into the frame at `phys` (an ordinary frame only)
+fn copy_to_frame(phys: u64, buf: &[u8]) -> usize {
+    if !ordinary(phys) {
+        return 0;
+    }
+    let n = buf.len();
+    // SAFETY: a mapped frame, kept by the held page-table lock
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), phys_to_virt(phys), n) };
+    // It may be code (ptrace POKETEXT; Linux flush_ptrace_access)
+    crate::arch::paging::sync_icache(phys, n);
+    n
 }

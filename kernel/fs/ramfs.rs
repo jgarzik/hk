@@ -537,8 +537,9 @@ impl InodeOps for RamfsInodeOps {
             )
             .map_err(page_err)?;
         // Taken before the cache lock goes: truncate cannot free the
-        // frame under the new mapping
-        FRAME_ALLOCATOR.incref(page.frame);
+        // frame under the new mapping (the cache holds one meanwhile)
+        let held = FRAME_ALLOCATOR.incref(page.frame);
+        debug_assert!(held);
         page.mark_dirty();
         Ok(page.frame)
     }
@@ -757,8 +758,9 @@ impl InodeOps for RamfsInodeOps {
         let noreplace = flags & RENAME_NOREPLACE != 0;
         let exchange = flags & RENAME_EXCHANGE != 0;
 
-        // NOREPLACE and EXCHANGE are mutually exclusive
-        if noreplace && exchange {
+        // No whiteouts (Linux simple_rename); NOREPLACE and EXCHANGE are
+        // mutually exclusive
+        if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0 || (noreplace && exchange) {
             return Err(KernelError::InvalidArgument);
         }
 
@@ -1061,6 +1063,15 @@ pub struct RamfsFileOps;
 impl FileOps for RamfsFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
         self
+    }
+
+    /// Regular files map their data (Linux generic_file_mmap);
+    /// directories have no mmap
+    fn mmap(&self, file: &File) -> Result<(), KernelError> {
+        match file.get_inode() {
+            Some(i) if i.mode().is_dir() => Err(KernelError::NoDevice),
+            _ => Ok(()),
+        }
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
@@ -1465,7 +1476,9 @@ impl SuperOps for RamfsSuperOps {
 pub static RAMFS_SUPER_OPS: RamfsSuperOps = RamfsSuperOps;
 
 /// Mount function for ramfs
-fn ramfs_mount(fs_type: &'static FileSystemType) -> Result<Arc<SuperBlock>, KernelError> {
+pub(crate) fn ramfs_mount(
+    fs_type: &'static FileSystemType,
+) -> Result<Arc<SuperBlock>, KernelError> {
     // Create superblock
     let sb = SuperBlock::new(fs_type, &RAMFS_SUPER_OPS, 0);
 

@@ -41,6 +41,7 @@
 - [x] setrlimit
 - [x] prlimit64
 - [x] getrusage
+- [x] times (children's times not tracked: 0)
 
 2. File descriptors & basic I/O
 
@@ -51,6 +52,7 @@
 - [x] open (x86-64 only, legacy; use openat)
 - [x] openat
 - [x] close
+- [x] close_range (CLOSE_RANGE_UNSHARE, CLOSE_RANGE_CLOEXEC)
 - [x] creat (x86-64 only, legacy; use openat with O_CREAT)
 - [x] dup
 - [x] dup2 (x86-64 only, legacy; use dup3)
@@ -80,7 +82,7 @@
 - [x] tee
 - [x] vmsplice
 - [x] copy_file_range
-- [x] ioctl (FIONBIO, FIOASYNC, FIOCLEX, FIONCLEX, FIONREAD, TIOCGWINSZ, terminal/tty, virtio-blk, xHCI USB; sockets: FIONREAD/SIOCINQ, SIOCOUTQ, FIOSETOWN/SIOCSPGRP, FIOGETOWN/SIOCGPGRP, SIOCGIFCONF, SIOCGIFINDEX, SIOCGIFNAME, SIOC[GS]IFFLAGS, SIOC[GS]IFADDR, SIOC[GS]IFNETMASK, SIOC[GS]IFBRDADDR, SIOCGIFHWADDR, SIOC[GS]IFMTU, SIOCADDRT, SIOCDELRT)
+- [x] ioctl (FIONBIO, FIOASYNC, FIOCLEX, FIONCLEX, FIONREAD, TIOCGWINSZ, terminal/tty, xHCI USB; block devices: BLKGETSIZE, BLKGETSIZE64, BLKSSZGET, BLKPBSZGET, BLKBSZGET, BLKBSZSET, BLKROGET, BLKRRPART, BLKFLSBUF; sockets: FIONREAD/SIOCINQ, SIOCOUTQ, FIOSETOWN/SIOCSPGRP, FIOGETOWN/SIOCGPGRP, SIOCGIFCONF, SIOCGIFINDEX, SIOCGIFNAME, SIOC[GS]IFFLAGS, SIOC[GS]IFADDR, SIOC[GS]IFNETMASK, SIOC[GS]IFBRDADDR, SIOCGIFHWADDR, SIOC[GS]IFMTU, SIOCADDRT, SIOCDELRT)
 - [x] sync
 - [x] fsync
 - [x] fdatasync
@@ -96,12 +98,13 @@
 - [x] mkdirat
 - [x] rmdir (x86-64 only, legacy; use unlinkat with AT_REMOVEDIR)
 - [x] link (x86-64 only, legacy; use linkat)
-- [x] linkat
+- [x] linkat (AT_SYMLINK_FOLLOW; AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH)
 - [x] unlink (x86-64 only, legacy; use unlinkat)
 - [x] unlinkat
 - [x] rename (x86-64 only, legacy; use renameat2)
-- [x] renameat (x86-64 only, legacy; use renameat2)
-- [x] renameat2
+- [x] renameat (legacy; use renameat2; arm64 keeps it, number 38)
+- [x] renameat2 (RENAME_NOREPLACE, RENAME_EXCHANGE; RENAME_WHITEOUT is
+  EINVAL: no file system makes whiteouts yet; vfat lacks EXCHANGE)
 - [x] symlink (x86-64 only, legacy; use symlinkat)
 - [x] symlinkat
 - [x] readlink (x86-64 only, legacy; use readlinkat)

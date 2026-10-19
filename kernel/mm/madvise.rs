@@ -11,6 +11,7 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::shmem::Shmem;
 use super::{
@@ -21,6 +22,7 @@ use super::{
     Vma, get_task_mm,
 };
 use crate::error::KernelError;
+use crate::sync::{RwSemReadGuard, RwSemWriteGuard};
 use crate::task::percpu::current_tid;
 
 /// A hole to punch in a shared object once the mm lock is dropped
@@ -41,10 +43,18 @@ pub fn sys_madvise(start: u64, len: u64, advice: i32) -> i64 {
         return KernelError::OutOfMemory.sysret();
     };
     let mut punch = Vec::new();
-    let mut map = mm.lock();
+    let map = if needs_write(advice) {
+        mm.mmap_write_killable().map(Map::W)
+    } else {
+        mm.mmap_read_killable().map(Map::R)
+    };
+    let mut map = match map {
+        Ok(m) => m,
+        Err(e) => return e.sysret(),
+    };
     let r = walk(&mut map, &mm, start, end, advice, &mut punch);
     #[cfg(feature = "mmcheck")]
-    super::check::verify(&map, mm.pgd(), "madvise");
+    super::check::verify(map.get(), mm.pgd(), "madvise");
     drop(map);
     // MADV_REMOVE frees the shared object's pages after the zap, also
     // for the VMAs done before an error (Linux punches VMA by VMA)
@@ -55,6 +65,31 @@ pub fn sys_madvise(start: u64, len: u64, advice: i32) -> i64 {
         Ok(()) => 0,
         Err(e) => e.sysret(),
     }
+}
+
+/// The mmap_lock as madvise holds it
+enum Map<'a> {
+    R(RwSemReadGuard<'a, MmStruct>),
+    W(RwSemWriteGuard<'a, MmStruct>),
+}
+
+impl Map<'_> {
+    fn get(&self) -> &MmStruct {
+        match self {
+            Map::R(m) => m,
+            Map::W(m) => m,
+        }
+    }
+}
+
+/// Advice that changes VMAs needs the mmap_lock for writing; advice that
+/// only zaps or hints reads it (Linux madvise_need_mmap_write): zaps
+/// change entries under the page-table locks, faults may run alongside
+fn needs_write(advice: i32) -> bool {
+    !matches!(
+        advice,
+        MADV_WILLNEED | MADV_DONTNEED | MADV_FREE | MADV_REMOVE | MADV_COLD | MADV_PAGEOUT
+    )
 }
 
 /// Advice values Linux accepts (madvise_behavior_valid), less those hk
@@ -103,7 +138,7 @@ fn check_range(start: u64, len: u64) -> Result<Option<u64>, KernelError> {
 /// madvise_walk_vmas). The walk goes by address, as a VMA may be split
 /// or merged under it.
 fn walk(
-    mm: &mut MmStruct,
+    map: &mut Map,
     owner: &Mm,
     start: u64,
     end: u64,
@@ -113,6 +148,7 @@ fn walk(
     let mut addr = start;
     let mut unmapped = false;
     loop {
+        let mm = map.get();
         let (vs, ve) = match mm.next_vma(addr).and_then(|i| mm.get_vma(i)) {
             Some(v) => (v.start, v.end),
             None => return Err(KernelError::OutOfMemory),
@@ -125,7 +161,7 @@ fn walk(
             }
         }
         let e = ve.min(end);
-        vma_advise(mm, owner, addr, e, advice, punch)?;
+        vma_advise(map, owner, addr, e, advice, punch)?;
         if e >= end {
             break;
         }
@@ -141,23 +177,31 @@ fn walk(
 /// Apply `advice` to [start, end), inside one VMA (Linux
 /// madvise_vma_behavior)
 fn vma_advise(
-    mm: &mut MmStruct,
+    map: &mut Map,
     owner: &Mm,
     start: u64,
     end: u64,
     advice: i32,
     punch: &mut Vec<Punch>,
 ) -> Result<(), KernelError> {
+    let mm = map.get();
     let idx = mm.find_vma_index(start).ok_or(KernelError::OutOfMemory)?;
     let vma = mm.get_vma(idx).ok_or(KernelError::OutOfMemory)?;
     match advice {
         MADV_WILLNEED => Ok(()),
-        MADV_COLD | MADV_PAGEOUT => lru_ok(vma),
+        MADV_COLD | MADV_PAGEOUT => {
+            lru_ok(vma)?;
+            cold_or_pageout(vma, owner, start, end, advice == MADV_PAGEOUT);
+            Ok(())
+        }
         MADV_DONTNEED | MADV_FREE => dontneed(vma, owner, start, end, advice),
         MADV_REMOVE => remove(vma, owner, start, end, punch),
         _ => {
             let flags = new_flags(vma, advice)?;
-            update_flags(mm, idx, start, end, flags)
+            match map {
+                Map::W(mm) => update_flags(mm, idx, start, end, flags),
+                Map::R(_) => unreachable!("VMA change under a read hold"),
+            }
         }
     }
 }
@@ -169,12 +213,75 @@ fn is_anon(vma: &Vma) -> bool {
 }
 
 /// MADV_COLD / MADV_PAGEOUT: refused on locked memory (Linux
-/// can_madv_lru_vma); otherwise a hint without effect (no reclaim)
+/// can_madv_lru_vma)
 fn lru_ok(vma: &Vma) -> Result<(), KernelError> {
     if vma.is_locked() {
         return Err(KernelError::InvalidArgument);
     }
     Ok(())
+}
+
+/// MADV_COLD (deactivate) or MADV_PAGEOUT (reclaim) the anonymous pages
+/// of [start, end) that this mapping alone maps (Linux
+/// madvise_cold_or_pageout_pte_range), mm lock held for reading: 2MB
+/// pages are split first, the pages taken off the LRU under each
+/// table's PTE lock, then reclaimed with no spinlock held (the swap
+/// writes sleep). Without swap, PAGEOUT leaves anonymous memory alone.
+fn cold_or_pageout(vma: &Vma, owner: &Mm, start: u64, end: u64, pageout: bool) {
+    if vma.anon_vma.is_none() || (pageout && super::swap::swap_totals().0 == 0) {
+        return;
+    }
+    super::lru::lru_add_drain_all();
+    let mut w = Cold {
+        mm: owner,
+        pageout,
+        pages: Vec::new(),
+    };
+    let _ = super::pagewalk::walk_pte_range(owner.pgd(), start, end, &mut w);
+    if !w.pages.is_empty() {
+        super::vmscan::reclaim_pages(w.pages);
+    }
+}
+
+/// `cold_or_pageout`'s walk: the pages to reclaim
+struct Cold<'a> {
+    mm: &'a Mm,
+    pageout: bool,
+    pages: Vec<u64>,
+}
+
+impl super::pagewalk::PteWalk for Cold<'_> {
+    type Err = core::convert::Infallible;
+
+    fn huge(&mut self, _: &AtomicU64, addr: u64, _: u64) -> Result<bool, Self::Err> {
+        let _ = super::huge_page::split_huge_pmd(self.mm, addr);
+        Ok(false)
+    }
+
+    fn pte(&mut self, e: &AtomicU64, _: u64) -> Result<(), Self::Err> {
+        if let Some(phys) = own_page(e) {
+            if !self.pageout {
+                super::lru::deactivate(phys);
+            } else if super::lru::isolate(phys) {
+                self.pages.push(phys);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The anonymous page the entry `e` maps, if no other PTE maps it (Linux
+/// skips shared folios: folio_maybe_mapped_shared), PTE lock held
+fn own_page(e: &AtomicU64) -> Option<u64> {
+    use crate::arch::paging;
+    let pte = e.load(Ordering::Acquire);
+    if !paging::pte_present(pte) {
+        return None;
+    }
+    let phys = paging::pte_addr(pte);
+    super::page::phys_to_page(phys)
+        .filter(|pg| pg.is_anon() && pg.mapcount() == 1)
+        .map(|_| phys)
 }
 
 /// MADV_DONTNEED / MADV_FREE (Linux madvise_dontneed_free): not on
@@ -184,7 +291,8 @@ fn dontneed(vma: &Vma, owner: &Mm, start: u64, end: u64, advice: i32) -> Result<
     if vma.is_locked() || (advice == MADV_FREE && !is_anon(vma)) {
         return Err(KernelError::InvalidArgument);
     }
-    // Zapped under the mm lock: no fault or fork works on these PTEs
+    // Under the mm lock held for reading: a racing fault may map a page
+    // again (the page-table locks order it before or after the zap)
     super::memory::zap_range(&mut super::gather::Gather::new(owner), start, end);
     Ok(())
 }
@@ -259,11 +367,10 @@ fn update_flags(
     if mm.get_vma(idx).is_some_and(|v| v.flags == flags) {
         return Ok(());
     }
-    mm.split_at(start);
-    mm.split_at(end);
+    mm.split_at_checked(start)?;
+    mm.split_at_checked(end)?;
     let idx = mm.find_vma_exact(start).ok_or(KernelError::WouldBlock)?;
-    let vma = mm.get_vma_mut(idx).ok_or(KernelError::WouldBlock)?;
-    vma.flags = flags;
+    mm.set_flags(idx, flags);
     mm.merge_adjacent(idx);
     Ok(())
 }

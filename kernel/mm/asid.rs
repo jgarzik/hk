@@ -71,11 +71,8 @@ impl AsidAlloc {
         }
     }
 
-    /// Set the ASID width (boot, before any address space runs). A
-    /// rollover keeps one ASID per CPU, so there must be more ASIDs
-    /// than CPUs (plus ASID 0)
+    /// Set the ASID width (boot, before any address space runs)
     pub fn set_bits(&self, bits: u32) {
-        assert!(1usize << bits > NR_CPUS + 1, "too few ASIDs for the CPUs");
         self.bits.store(bits as u64, Ordering::Relaxed);
         self.generation.store(1 << bits, Ordering::Relaxed);
     }
@@ -158,6 +155,12 @@ impl AsidAlloc {
     /// Rollover (Linux flush_context): restart the bitmap with the ASIDs
     /// each CPU runs (or kept reserved), and have every CPU flush
     fn flush_context(&self, inner: &mut Inner) {
+        // A rollover keeps one ASID per CPU, so there must be more ASIDs
+        // than CPUs (plus ASID 0)
+        assert!(
+            self.count() > crate::cpu::nr_cpu_ids() as usize + 1,
+            "too few ASIDs for the CPUs"
+        );
         inner.map.fill(0);
         for c in 0..NR_CPUS {
             let mut asid = self.active[c].swap(0, Ordering::Relaxed);

@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::paging::{
     KERNEL_MAP, PAGE_HUGE, PAGE_NO_EXECUTE, PAGE_OFFSET, PAGE_PRESENT, PAGE_SIZE, PAGE_WRITABLE,
-    RawPageTable, VMALLOC_START, phys_to_virt_table,
+    RawPageTable, VMALLOC_START, VMEMMAP_START, phys_to_virt_table,
 };
 use crate::multiboot2;
 
@@ -55,6 +55,12 @@ unsafe extern "C" {
 /// Physical address of a kernel image symbol (Linux: __pa_symbol)
 pub fn pa_symbol(va: u64) -> u64 {
     va - KERNEL_MAP
+}
+
+/// The kernel image in physical memory, as [start, end)
+pub fn image_range() -> (u64, u64) {
+    let start = pa_symbol(&raw const __kernel_start as u64);
+    (start, pa_symbol(&raw const __kernel_end as u64))
 }
 
 /// Physical address of the kernel top-level table
@@ -99,57 +105,88 @@ fn gbpages() -> bool {
     r.edx & (1 << 26) != 0
 }
 
-/// RAM ranges for the direct map: available, ACPI and NVS memory plus
-/// the first 1MB (BIOS data, VGA text buffer, AP trampoline)
-fn ram_ranges(mbi: u64, out: &mut [(u64, u64); 32]) -> usize {
-    out[0] = (0, 1 << 20);
-    let mut n = 1;
-    unsafe {
-        multiboot2::for_each_region(mbi, |base, len, kind| {
-            if matches!(kind, 1 | 3 | 4) && n < out.len() {
-                out[n] = (base, base + len);
-                n += 1;
-            }
-        });
+/// Physical RAM for the direct map: [start, end) ranges, any order
+trait RamMap {
+    fn each(&self, f: &mut dyn FnMut(u64, u64));
+
+    /// Some range overlaps [start, end)
+    fn hits(&self, start: u64, end: u64) -> bool {
+        let mut hit = false;
+        self.each(&mut |s, e| hit |= s < end && start < e);
+        hit
     }
-    n
+
+    /// End of the highest range
+    fn top(&self) -> u64 {
+        let mut top = 0;
+        self.each(&mut |_, e| top = top.max(e));
+        top
+    }
 }
 
-fn hits(r: &[(u64, u64)], start: u64, end: u64) -> bool {
-    r.iter().any(|&(s, e)| s < end && start < e)
+/// The boot memory map: available, ACPI and NVS memory plus the first
+/// 1MB (BIOS data, VGA text buffer, AP trampoline). Read in place, as
+/// many regions as firmware reports (no copy to a fixed array).
+struct BootRam(u64);
+
+impl RamMap for BootRam {
+    fn each(&self, f: &mut dyn FnMut(u64, u64)) {
+        f(0, 1 << 20);
+        unsafe {
+            multiboot2::for_each_region(self.0, |base, len, kind| {
+                if matches!(kind, 1 | 3 | 4) {
+                    let end = base.saturating_add(len);
+                    f(base, end.min(crate::mm::memblock::PHYS_LIMIT));
+                }
+            });
+        }
+    }
 }
 
-/// Direct map every 2MB chunk that holds RAM, with 1GB pages where a
-/// whole gigabyte is RAM and the CPU allows it
-unsafe fn map_direct(pml4: *mut RawPageTable, ram: &[(u64, u64)]) {
-    let top = ram.iter().map(|r| r.1).max().unwrap_or(0);
-    // Each gigabyte may need a PD; keep a reserve for image and vmalloc
-    let cap = ((POOL_PAGES as u64 - 16) * SZ_1G).min(top.next_multiple_of(SZ_2M));
-    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE;
-    let gb = gbpages();
-    let mut end = 0;
+/// The large pages of the direct map below `cap`, ascending, as
+/// (phys, 1GB page?): every 2MB chunk that holds RAM, a whole gigabyte
+/// of RAM as one 1GB page where `gb`
+fn direct_pages(ram: &dyn RamMap, gb: bool, cap: u64, mut page: impl FnMut(u64, bool)) {
     let mut base = 0;
     while base < cap {
-        let va = PAGE_OFFSET + base;
-        unsafe {
-            let pdpt = next(pml4, idx(va, 39));
-            let whole = (0..512).all(|i| hits(ram, base + i * SZ_2M, base + (i + 1) * SZ_2M));
-            if gb && whole && base + SZ_1G <= cap {
-                (*pdpt).entry_mut(idx(va, 30)).set(base, flags | PAGE_HUGE);
-                end = base + SZ_1G;
-            } else {
-                let pd = next(pdpt, idx(va, 30));
-                for i in 0..512u64 {
-                    let p = base + i * SZ_2M;
-                    if p < cap && hits(ram, p, p + SZ_2M) {
-                        (*pd).entry_mut(i as usize).set(p, flags | PAGE_HUGE);
-                        end = p + SZ_2M;
-                    }
+        let whole = (0..512).all(|i| ram.hits(base + i * SZ_2M, base + (i + 1) * SZ_2M));
+        if gb && whole && base + SZ_1G <= cap {
+            page(base, true);
+        } else {
+            for i in 0..512u64 {
+                let p = base + i * SZ_2M;
+                if p < cap && ram.hits(p, p + SZ_2M) {
+                    page(p, false);
                 }
             }
         }
         base += SZ_1G;
     }
+}
+
+/// Direct map every 2MB chunk that holds RAM, with 1GB pages where a
+/// whole gigabyte is RAM and the CPU allows it. Past the page-table
+/// pool's reach nothing is mapped, and memblock drops that RAM
+/// (`direct_end`).
+unsafe fn map_direct(pml4: *mut RawPageTable, ram: &dyn RamMap) {
+    // Each gigabyte may need a PD; keep a reserve for image and vmalloc
+    let cap = ((POOL_PAGES as u64 - 16) * SZ_1G).min(ram.top().next_multiple_of(SZ_2M));
+    let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE;
+    let mut end = 0;
+    direct_pages(ram, gbpages(), cap, |p, huge_gb| {
+        let va = PAGE_OFFSET + p;
+        unsafe {
+            let pdpt = next(pml4, idx(va, 39));
+            if huge_gb {
+                (*pdpt).entry_mut(idx(va, 30)).set(p, flags | PAGE_HUGE);
+                end = p + SZ_1G;
+            } else {
+                let pd = next(pdpt, idx(va, 30));
+                (*pd).entry_mut(idx(va, 21)).set(p, flags | PAGE_HUGE);
+                end = p + SZ_2M;
+            }
+        }
+    });
     DIRECT_END.store(end, Ordering::Relaxed);
 }
 
@@ -187,15 +224,40 @@ unsafe fn map_image(pml4: *mut RawPageTable) {
 /// # Safety
 /// Once, on the BSP, before anything uses the direct map past 4GB.
 pub unsafe fn init(mbi: u64) {
-    let mut ram = [(0u64, 0u64); 32];
-    let n = ram_ranges(mbi, &mut ram);
     unsafe {
         let pml4 = &raw mut SWAPPER;
-        map_direct(pml4, &ram[..n]);
+        map_direct(pml4, &BootRam(mbi));
         map_image(pml4);
-        // vmalloc/ioremap PDPT: present before any address space copies
+        // vmalloc/ioremap and vmemmap PDPTs: present before any address
+        // space copies the kernel half
         next(pml4, idx(VMALLOC_START, 39));
+        next(pml4, idx(VMEMMAP_START, 39));
         core::arch::asm!("mov cr3, {}", in(reg) swapper_phys(), options(nostack));
+    }
+}
+
+/// Map the kernel page `va` to `pa` (writable, never executable) below
+/// a top-level entry `init` created; missing lower tables come from
+/// `table` (the physical address of a zeroed frame)
+///
+/// # Safety
+/// Boot CPU, before SMP; `va` is unmapped and not in use.
+pub unsafe fn map_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64) {
+    unsafe {
+        let mut t = &raw mut SWAPPER;
+        assert!(
+            (*t).entry(idx(va, 39)).is_present(),
+            "kmap: no top-level entry"
+        );
+        for shift in [39, 30, 21] {
+            let e = (*t).entry_mut(idx(va, shift));
+            if !e.is_present() {
+                e.set(table(), PAGE_PRESENT | PAGE_WRITABLE);
+            }
+            t = phys_to_virt_table(e.addr());
+        }
+        let flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE;
+        (*t).entry_mut(idx(va, 12)).set(pa, flags);
     }
 }
 
@@ -212,4 +274,50 @@ pub fn trampoline_pgd() -> u64 {
         }
     }
     phys
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RAM in a slice of ranges
+    struct Ranges<'a>(&'a [(u64, u64)]);
+
+    impl RamMap for Ranges<'_> {
+        fn each(&self, f: &mut dyn FnMut(u64, u64)) {
+            self.0.iter().for_each(|&(s, e)| f(s, e));
+        }
+    }
+
+    /// Every region is mapped however many the firmware reports (UEFI
+    /// maps have hundreds; the direct map once kept only 31): each
+    /// 2MB chunk with RAM, nothing else
+    #[test]
+    fn direct_map_covers_every_region() {
+        let ram: Vec<(u64, u64)> = (0..100u64)
+            .map(|i| (i * 8 * SZ_2M + 4096, i * 8 * SZ_2M + 3 * SZ_2M))
+            .collect();
+        let r = Ranges(&ram);
+        let cap = r.top().next_multiple_of(SZ_2M);
+        let mut pages = Vec::new();
+        direct_pages(&r, true, cap, |p, gb| pages.push((p, gb)));
+        let want: Vec<(u64, bool)> = (0..100u64)
+            .flat_map(|i| (0..3).map(move |k| ((i * 8 + k) * SZ_2M, false)))
+            .collect();
+        assert_eq!(pages, want);
+    }
+
+    /// A whole gigabyte of RAM is one 1GB page when the CPU has them
+    #[test]
+    fn direct_map_gb_pages() {
+        let ram = [(0, 2 * SZ_1G + SZ_2M)];
+        let r = Ranges(&ram);
+        let cap = r.top().next_multiple_of(SZ_2M);
+        let mut pages = Vec::new();
+        direct_pages(&r, true, cap, |p, gb| pages.push((p, gb)));
+        assert_eq!(pages, [(0, true), (SZ_1G, true), (2 * SZ_1G, false)]);
+        pages.clear();
+        direct_pages(&r, false, cap, |p, gb| pages.push((p, gb)));
+        assert_eq!(pages.len(), 1025);
+    }
 }

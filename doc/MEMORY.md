@@ -14,6 +14,7 @@ Linux: `Documentation/arch/x86/x86_64/mm.rst`.
 | `0000000000000000 - 00007fffffffefff` | 128 TB | user space (`TASK_SIZE`) |
 | `ffff888000000000 - ...` | RAM | direct map of all RAM (`PAGE_OFFSET`) |
 | `ffffc90000000000 - ffffc9003fffffff` | 1 GB | vmalloc/ioremap window (`VMALLOC_START`) |
+| `ffffea0000000000 - ...` | 1/64 of RAM | struct page array (`VMEMMAP_START`) |
 | `ffffffff80000000 - ...` | image | kernel image (`__START_KERNEL_map`, -2 GB) |
 
 - **Kernel image**: GRUB loads it at physical 1 MB; it is linked at
@@ -34,9 +35,12 @@ Linux: `Documentation/arch/x86/x86_64/mm.rst`.
   the kernel table (no low mappings). The AP trampoline (copied to
   physical 0x8000) enables paging on the boot table (identity map plus
   the kernel half) and `ap_entry` switches to the kernel table.
-- **Kernel memory**: the heap is a fixed physical range after the boot
-  modules, used through the direct map; kernel stacks and DMA buffers
-  are physically contiguous frame runs, also through the direct map.
+- **Kernel memory**: the heap is the slab allocator (`mm/slab.rs`,
+  kmalloc caches 8 B-8 KB, pages above; named caches for VMAs,
+  dentries and inodes, chosen by exact layout) over the page allocator,
+  through the direct map (a 256 KB boot arena in the image serves boot
+  until the page allocator is up); kernel stacks and DMA buffers are
+  physically contiguous frame runs, also through the direct map.
 
 ## arm64 (4KB granule, 48-bit virtual)
 
@@ -49,6 +53,7 @@ Linux: `Documentation/arch/arm64/memory.rst`.
 | `ffff800040100000 - ...` | image | kernel image (`KIMAGE_OFFSET` + phys) |
 | `ffff800100000000 - ffff80013fffffff` | 1 GB | vmalloc/ioremap window |
 | `ffff800200000000 - ffff80023fffffff` | 1 GB | device window: physical 0-1 GB as Device-nGnRnE (`io_va`) |
+| `fffffc0000000000 - ...` | 1/64 of RAM | struct page array (`VMEMMAP_START`) |
 
 - **TTBR0** holds only user mappings; kernel threads run with an empty
   table (Linux `reserved_pg_dir`). Every user leaf has PXN (never
@@ -74,10 +79,10 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   blocks: an identity map of the kernel's RAM gigabyte in TTBR0; in
   TTBR1 the first RAM gigabyte, the image and the device window), then
   jumps to the linked address. W^X as on x86.
-- **Linear map**: the DTB `/memory` range, 1 GB blocks where possible,
-  2 MB otherwise; built after the heap exists (the DTB parser needs
-  it), then TTBR1 is switched from the identity map
-  (`__replace_ttbr1`, Linux `cpu_replace_ttbr1`).
+- **Linear map**: every range of every DTB `/memory` node (they also
+  go to memblock), 1 GB blocks where possible, 2 MB otherwise; then
+  TTBR1 is switched from the identity map (`__replace_ttbr1`, Linux
+  `cpu_replace_ttbr1`).
 - **Device window**: an early fixmap for QEMU virt's fixed devices
   (GIC, PL011, PL031) and PCI MMIO below 1 GB; `ioremap` returns
   window addresses for that range and maps anything else (PCI ECAM)
@@ -86,6 +91,33 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   boot data's physical address; it enables the MMU with the kernel
   TTBR1 and the identity map, jumps high, and `ap_rust_entry` drops the
   identity map.
+
+## Physical memory (both arches)
+
+- **memblock** (`mm/memblock.rs`, Linux mm/memblock.c): at boot the
+  arch reports every firmware RAM range the direct map covers
+  (`MemoryLayoutOps::memblock_init`: multiboot2 available ranges on
+  x86, every DTB `/memory` reg on arm64) and reserves what is in use:
+  the kernel image, boot modules and multiboot info, the DTB, the
+  initrd, the FDT reservation block and `/reserved-memory` (arm64), the
+  first 1 MB (x86: BIOS data, AP trampoline), the boot framebuffer and
+  early allocations (top down below the direct-map end). Every free
+  range (memory minus reserved) is then handed to the frame allocator
+  once; MemTotal counts those pages (Linux totalram_pages).
+- **struct page** (`mm/page.rs`, Linux SPARSEMEM_VMEMMAP): every pfn
+  of a 128 MB section holding RAM has a 64-byte `Page` at
+  `VMEMMAP_START + pfn * 64`, in frames memblock gives at boot (4 KB
+  mappings; sections without RAM are not backed, `pfn_valid` checks a
+  section bitmap). Pages memblock kept start `PG_RESERVED` and are
+  never freed. Flags, map count, mapping (an anonymous page's AnonVma,
+  which it holds a reference on) and list links live there.
+- **Page allocator** (`mm/page_alloc.rs`, Linux buddy allocator): one
+  zone over all RAM; free blocks of 2^0..2^10 pages on per-order lists
+  in struct page, merged with their buddy on free; order-0 pages pass
+  through per-CPU lists (batch = managed/1024 capped, /4, rounded to
+  2^n-1; high = 4 batches). Reference counts are struct page atomics;
+  2 MB huge pages are compound pages counted on the head. MemFree
+  counts the per-CPU lists too (Linux's NR_FREE_PAGES does not).
 
 ## User address space (both arches)
 
@@ -113,9 +145,18 @@ Linux: `Documentation/arch/arm64/memory.rst`.
   back, or a write-protected page made writable (copied first if still
   shared copy-on-write). Unresolved: SIGSEGV or SIGBUS for a user
   access, EFAULT for a kernel uaccess.
-- Out of memory: pages for user data and user page tables stop at the
-  reserve kept for the kernel (1/32 of RAM, at least 4MB; Linux min
-  watermark). mlock that cannot fault its range in fails with EAGAIN. A user fault that finds no memory kills its process
+- Out of memory: pages for user data (pipe buffers included) and user
+  page tables stop at the zone's low watermark (vm.min_free_kbytes,
+  Linux's formula, `mm/page_alloc.rs`); kernel allocations, the heap
+  included, go on to min; `__GFP_HIGH` ones to half of it, atomic ones
+  (the heap in interrupt context) a quarter lower. A fault that finds
+  free memory at low reclaims (direct reclaim: swaps the oldest
+  anonymous pages out, `mm/vmscan.rs`), with no spinlock held, then
+  drains the per-CPU lists and retries while reclaim frees pages. User
+  allocations stop at low until the OOM killer (P6); then Linux's min.
+  A page read
+  back from swap keeps its slot as a clean copy, unless swap is over
+  half full (Linux vm_swap_full). mlock that cannot fault its range in fails with EAGAIN. A user fault that finds no memory kills its process
   with SIGKILL, logged as `Out of memory: Killed process <pid> (<comm>)`
   (Linux pagefault_out_of_memory; hk has no OOM killer choosing another
   victim, and never retries the fault in a loop); a kernel uaccess that
@@ -141,6 +182,15 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   holds its own on each of its pages, splitting a 2MB page gives each 4KB frame the head's count.
   Unmapping drops the reference and the last one frees the frame. Frames
   outside the allocator (MMIO) have no count and are never freed.
+- **Reverse map (Linux anon_vma).** Every private anonymous VMA (mmap,
+  brk, the image and stack) has an AnonVma, shared by fork's copies and
+  the pieces of a split, whose chain lists each VMA with its range and
+  page offset (`pgoff`, Linux vm_pgoff: `start / 4KB` at creation, kept
+  by mremap, lowered when a stack grows). An anonymous page records its
+  AnonVma and linear index (`pgoff + (addr - start) / 4KB`), so the
+  reverse map finds its address in each VMA of the chain directly; its
+  map count counts the PTEs mapping it. Pages exec copies the image
+  into are not on the reverse map.
 - **Shared anonymous memory.** A MAP_SHARED|MAP_ANONYMOUS mapping gets a
   `Shmem` object (Linux shmem_zero_setup) holding its pages by index:
   every VMA mapping it (fork's copies, split pieces, mremap) faults the
@@ -148,7 +198,7 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   MADV_DONTNEED keeps the data (MADV_REMOVE clears it for every
   mapping: a page mapped elsewhere is zeroed in place, others freed).
   Its size is fixed at mmap (a page past it, after mremap grew the
-  mapping, is SIGBUS, as on Linux); its pages and its index (a 4-level
+  mapping, is SIGBUS, as on Linux); its pages and its index (an `mm::xarray`, a 4-level
   radix tree of 512-entry nodes, like a page table) are user memory
   from frames, none from the kernel heap (they stop at the kernel's
   reserve; a fault out of memory kills the process). The object holds
@@ -168,8 +218,8 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   visible both ways); a private one shares them copy-on-write (both
   PTEs read-only and marked COW, also for pages read-only at fork, so a
   later mprotect(PROT_WRITE) cannot make the shared page writable). A
-  2MB page is split into 4KB PTEs in the parent first; a swap PTE fails
-  the fork (ENOMEM; unreachable while swap-out is inert). MADV_DONTFORK VMAs are left out of the
+  2MB page is split into 4KB PTEs in the parent first; a swap PTE is
+  copied, its slot counting one more reference (Linux swap_duplicate). MADV_DONTFORK VMAs are left out of the
   child, MADV_WIPEONFORK ones start empty there, and memory locks
   (VM_LOCKED, locked_vm, MCL_FUTURE) are not inherited.
 - **Page-table updates (break-before-make).** An entry that maps a
@@ -194,9 +244,11 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
 - **munmap / MAP_FIXED / brk shrink / shmdt** split VMAs at the range
   edges and release what the entries inside hold (`memory::zap_range`:
   pages, protnone ones included, and swap slots), the pages only after
-  one TLB flush of the range (`mm::gather::Gather`, Linux mmu_gather); empty page-table
-  pages are kept until exit (reused by later mappings at the same
-  addresses).
+  one TLB flush of the range (`mm::gather::Gather`, Linux mmu_gather);
+  then the page tables whose whole span lies in the gap between the
+  neighbouring VMAs are unlinked and freed after the same flush
+  (`memory::free_pgtables`, Linux free_pgtables; mremap does it for the
+  range it moved away from).
 - **mprotect (Linux change_protection)** changes the VMAs and rewrites
   the PTEs already mapped in the range (`pte_modify`), then flushes the
   range's TLB. With no access left (PROT_NONE) an entry becomes
@@ -248,5 +300,16 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   (protnone included) must lie in a VMA allowing at least what the
   entry allows, and none may be executable by the kernel (arm64 PXN);
   a violation prints `MMCHECK:FAIL`.
+- **Swap (Linux mm/vmscan.c, swapfile.c, swap_state.c).** Private
+  anonymous pages sit on the LRU (`mm/lru.rs`). Reclaim
+  (`mm/vmscan.rs`; MADV_PAGEOUT, and the allocator's slow path) gives a
+  page a swap slot and a place in the device's swap cache, replaces
+  every PTE mapping it by the swap entry through the reverse map,
+  writes it out and frees it; a page still mapped somewhere, or busy,
+  stays. A slot counts its swap PTEs and its cache page; fork shares
+  slots, munmap and exit give them back, a fault reads the page into
+  the swap cache and maps it (writable at once only on a write fault
+  that leaves no one else needing the slot), swapoff reads every page
+  back.
 - `/proc/meminfo` reports MemTotal and MemFree from the frame allocator
   (exact free count).

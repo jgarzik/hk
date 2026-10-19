@@ -36,12 +36,11 @@ pub mod stat;
 // Filesystem implementations
 pub mod cgroupfs;
 pub mod cpio;
+pub mod devtmpfs;
+mod proc_array;
 pub mod procfs;
 pub mod ramfs;
 pub mod vfat;
-
-// Legacy VFS (kept for compatibility)
-pub mod vfs;
 
 // Re-exports for convenience
 pub use crate::error::KernelError;
@@ -53,10 +52,7 @@ pub use dentry::{DCACHE, Dentry, DentryCache, is_subdir};
 pub use file::{CHAR_FILE_OPS, DirContext, DirEntry, File, FileOps, RwFlags, flags, seek};
 pub use fsstruct::{FsStruct, clone_task_fs, exit_task_fs, get_task_fs, init_task_fs};
 pub use inode::{DevId, DeviceType, FileType, Gid, Inode, InodeAttr, InodeMode, InodeOps, Uid};
-pub use mount::{
-    Mount, MountNamespace, current_mnt_ns, do_mount, do_umount, follow_mount, init_mnt_ns,
-    mount_at_path, umount_flags,
-};
+pub use mount::{Mount, do_mount, do_umount, follow_mount, mount_at_path, umount_flags};
 pub use path::{LookupFlags, lookup_one, lookup_path, lookup_path_at, lookup_path_flags};
 pub use path_ref::Path;
 pub use procfs::{
@@ -72,22 +68,6 @@ pub use superblock::{
     SuperBlock, SuperOps, find_filesystem, init_fs_registry, register_filesystem,
 };
 pub use vfat::{VFAT_FILE_OPS, VFAT_TYPE};
-pub use vfs::{FileMetadata, FileSystem, Vfs};
-
-/// Filesystem error types (extending the original KernelError)
-impl KernelError {
-    /// Operation not supported
-    pub const fn not_supported() -> Self {
-        KernelError::OperationNotSupported
-    }
-}
-
-// Add additional error variants
-impl From<&str> for KernelError {
-    fn from(_: &str) -> Self {
-        KernelError::Io
-    }
-}
 
 use alloc::sync::Arc;
 
@@ -227,5 +207,40 @@ pub fn unlock_rename(p1: &Arc<Dentry>, p2: &Arc<Dentry>) {
                 sb.s_vfs_rename_mutex.unlock_raw();
             }
         }
+    }
+}
+
+/// The non-directories of `a` and `b`, each once, lowest address first
+/// (Linux lock_two_nondirectories order)
+fn nondirs<'a>(
+    a: Option<&'a Arc<Inode>>,
+    b: Option<&'a Arc<Inode>>,
+) -> [Option<&'a Arc<Inode>>; 2] {
+    let nd = |i: Option<&'a Arc<Inode>>| i.filter(|i| !i.mode().is_dir());
+    let (a, b) = (nd(a), nd(b));
+    match (a, b) {
+        (Some(x), Some(y)) if Arc::ptr_eq(x, y) => [Some(x), None],
+        (Some(x), Some(y)) if Arc::as_ptr(y) < Arc::as_ptr(x) => [Some(y), Some(x)],
+        _ => [a, b],
+    }
+}
+
+/// Lock the inodes whose link count a rename changes, inside the parents'
+/// locks (Linux vfs_rename -> lock_two_nondirectories): the non-directory
+/// source and target, by address. Directories are skipped: they have no
+/// hard links to race with.
+pub fn lock_two_nondirs(a: Option<&Arc<Inode>>, b: Option<&Arc<Inode>>) {
+    for i in nondirs(a, b).into_iter().flatten() {
+        i.inode_lock();
+    }
+}
+
+/// Release lock_two_nondirs()
+///
+/// # Safety
+/// Must pair with lock_two_nondirs() on the same inodes by this thread.
+pub unsafe fn unlock_two_nondirs(a: Option<&Arc<Inode>>, b: Option<&Arc<Inode>>) {
+    for i in nondirs(a, b).into_iter().flatten().rev() {
+        unsafe { i.inode_unlock() };
     }
 }

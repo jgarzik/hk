@@ -7,6 +7,7 @@ pub mod kthread;
 pub mod misc;
 pub mod percpu;
 pub mod pgrp;
+pub mod pid;
 pub mod proc;
 pub mod process_vm;
 pub mod ptrace;
@@ -99,12 +100,12 @@ pub mod wait_options {
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicBool;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64};
 
 use crate::arch::{Arch, PageTable};
 use crate::fs::FsStruct;
 use crate::ipc::sem::SemUndoList;
-use crate::mm::page_cache::CachedPage;
 use crate::ns::NsProxy;
 use crate::seccomp::SeccompFilter;
 use crate::signal::{SigHand, SignalStruct, TaskSignalState};
@@ -122,9 +123,6 @@ pub type Uid = u32;
 
 /// Group ID type (Linux-compatible)
 pub type Gid = u32;
-
-/// Magic value to detect corrupted/freed Task structs ("TASKMAGI" in ASCII)
-pub const TASK_MAGIC: u64 = 0x5441534B_4D414749;
 
 /// Task credentials (Linux-compatible model)
 ///
@@ -183,6 +181,25 @@ impl Cred {
         cap_ambient: CAP_EMPTY_SET, // Ambient starts empty even for root
     };
 
+    /// No privileges at all (overflow uid/gid 65534, no capabilities,
+    /// empty bounding set): what a context without a task gets, so a
+    /// missing task never runs privileged
+    pub const NOBODY: Self = Self {
+        uid: 65534,
+        gid: 65534,
+        suid: 65534,
+        sgid: 65534,
+        euid: 65534,
+        egid: 65534,
+        fsuid: 65534,
+        fsgid: 65534,
+        cap_inheritable: CAP_EMPTY_SET,
+        cap_permitted: CAP_EMPTY_SET,
+        cap_effective: CAP_EMPTY_SET,
+        cap_bset: CAP_EMPTY_SET,
+        cap_ambient: CAP_EMPTY_SET,
+    };
+
     /// Create credentials for a specific user/group
     ///
     /// Sets all credential fields (uid, suid, euid, fsuid) to the same value.
@@ -231,27 +248,10 @@ impl Default for Cred {
 // Credential APIs (Linux kernel/cred.c pattern)
 // =============================================================================
 
-/// Get the current task's credentials from per-CPU cache
-///
-/// Like Linux's `current_cred()` - fast path for syscalls.
-/// Returns a copy since CurrentTask.cred is a Copy type.
+/// The current task's credentials, copied (Linux current_cred: read
+/// lock-free, only the task itself replaces them)
 pub fn current_cred() -> Cred {
     percpu::current_cred()
-}
-
-/// Get the current task's credentials from TASK_TABLE (authoritative source)
-///
-/// This fetches the Arc<Cred> from the actual Task struct.
-/// Used when the per-CPU cache might be stale or for reference counting.
-pub fn current_cred_arc() -> Arc<Cred> {
-    let tid = percpu::current_tid();
-    let table = percpu::TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .map(|t| t.cred.clone())
-        .unwrap_or_else(|| Arc::new(Cred::ROOT))
 }
 
 /// Prepare a new credential set by cloning current credentials
@@ -272,11 +272,9 @@ pub fn prepare_creds() -> Cred {
 
 /// Commit new credentials to current task
 ///
-/// Like Linux's `commit_creds()` - atomically updates both:
-/// 1. Task.cred in TASK_TABLE (persistent storage)
-/// 2. CurrentTask.cred in per-CPU cache (fast access)
-///
-/// The new credentials take effect immediately.
+/// Like Linux's `commit_creds()`: the task's credential pointer is
+/// replaced under TASKLIST (others read it under the lock; the task
+/// itself without). The new credentials take effect immediately.
 pub fn commit_creds(new: Arc<Cred>) {
     let old = current_cred().uid;
     if old != new.uid {
@@ -292,16 +290,16 @@ pub fn commit_creds(new: Arc<Cred>) {
 pub fn nproc_exec_check() -> Result<(), i32> {
     let tid = percpu::current_tid();
     let uid = current_cred().uid;
-    // rlimit() takes TASK_TABLE: decide before locking it
+    // rlimit() takes TASKLIST: decide before locking it
     let over = nproc_overlimit(nproc_count(uid));
-    let mut table = percpu::TASK_TABLE.lock();
-    let Some(t) = table.tasks.iter_mut().find(|t| t.tid == tid) else {
+    let table = percpu::TASKLIST.read();
+    let Some(t) = table.get(tid) else {
         return Ok(());
     };
-    if t.nproc_exceeded && over {
+    if t.task.has_flag(crate::task::pf::NPROC_EXCEEDED) && over {
         return Err(11); // EAGAIN
     }
-    t.nproc_exceeded = false;
+    t.task.clear_flag(crate::task::pf::NPROC_EXCEEDED);
     Ok(())
 }
 
@@ -321,85 +319,6 @@ pub fn copy_creds(clone_flags: u64, parent_cred: &Arc<Cred>) -> Arc<Cred> {
     } else {
         // Fork: deep copy credentials (child gets independent copy)
         Arc::new(**parent_cred)
-    }
-}
-
-/// Per-CPU current task state (arch-neutral)
-///
-/// This struct holds per-task state that needs to be quickly accessible
-/// during syscalls and other kernel operations. It is embedded in
-/// arch-specific per-CPU structures (e.g., x86_64 PerCpu).
-#[derive(Debug, Clone, Copy)]
-pub struct CurrentTask {
-    /// Thread ID of the currently running task
-    pub tid: Tid,
-    /// Process ID of the currently running task
-    pub pid: Pid,
-    /// Parent process ID
-    pub ppid: Pid,
-    /// Process group ID
-    pub pgid: Pid,
-    /// Session ID
-    pub sid: Pid,
-    /// Credentials of the currently running task
-    pub cred: Cred,
-    /// Seccomp mode (cached for fast syscall-entry check)
-    /// 0=DISABLED, 1=STRICT, 2=FILTER
-    pub seccomp_mode: u8,
-    /// The task is exiting (Linux PF_EXITING)
-    pub exiting: bool,
-}
-
-impl CurrentTask {
-    /// Create a new CurrentTask with default values (tid=0, pid=0, root credentials)
-    pub const fn new() -> Self {
-        Self {
-            tid: 0,
-            pid: 0,
-            ppid: 0,
-            pgid: 0,
-            sid: 0,
-            cred: Cred::ROOT,
-            seccomp_mode: 0, // SECCOMP_MODE_DISABLED
-            exiting: false,
-        }
-    }
-
-    /// Update the current task state
-    pub fn set(&mut self, tid: Tid, pid: Pid, ppid: Pid, pgid: Pid, sid: Pid, cred: Cred) {
-        self.tid = tid;
-        self.pid = pid;
-        self.ppid = ppid;
-        self.pgid = pgid;
-        self.sid = sid;
-        self.cred = cred;
-    }
-
-    /// Create a new CurrentTask from individual parts
-    pub const fn from_parts(
-        tid: Tid,
-        pid: Pid,
-        ppid: Pid,
-        pgid: Pid,
-        sid: Pid,
-        cred: Cred,
-    ) -> Self {
-        Self {
-            tid,
-            pid,
-            ppid,
-            pgid,
-            sid,
-            cred,
-            seccomp_mode: 0, // SECCOMP_MODE_DISABLED
-            exiting: false,
-        }
-    }
-}
-
-impl Default for CurrentTask {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -482,18 +401,6 @@ pub struct SchedParam {
     /// Scheduling priority (1-99 for SCHED_FIFO/RR, 0 for SCHED_NORMAL)
     pub sched_priority: i32,
 }
-
-/// Maximum number of CPUs supported
-pub const MAX_CPUS: usize = 64;
-
-/// CPU affinity mask type
-///
-/// A 64-bit mask where bit N indicates CPU N is allowed.
-/// For simplicity, we support up to 64 CPUs (matches single u64).
-pub type CpuMask = u64;
-
-/// Default CPU affinity mask (all CPUs allowed)
-pub const CPU_MASK_ALL: CpuMask = !0u64;
 
 /// Check if a scheduling policy is real-time
 pub fn is_rt_policy(policy: i32) -> bool {
@@ -608,8 +515,6 @@ pub mod dumpable {
 pub struct PrctlState {
     /// Thread/process name (PR_SET_NAME) - 16 bytes max, null-terminated
     pub name: [u8; 16],
-    /// Dumpable flag (PR_SET_DUMPABLE) - controls core dump generation
-    pub dumpable: u8,
     /// No-new-privileges flag (PR_SET_NO_NEW_PRIVS) - irreversible once set
     pub no_new_privs: bool,
     /// Timer slack in nanoseconds (PR_SET_TIMERSLACK)
@@ -633,7 +538,6 @@ impl Default for PrctlState {
     fn default() -> Self {
         Self {
             name: [0u8; 16],
-            dumpable: dumpable::SUID_DUMP_USER,
             no_new_privs: false,
             timer_slack_ns: 50_000, // 50 microseconds default
             keep_caps: false,
@@ -867,6 +771,26 @@ impl<F> FdTable<F> {
         t
     }
 
+    /// Detach the open descriptors in `lo..=hi` (Linux __range_close):
+    /// only the open ones are visited, however wide the range
+    pub fn close_range(&mut self, lo: Fd, hi: Fd) {
+        let mut mid = self.files.split_off(&lo);
+        let mut flags = self.fd_flags.split_off(&lo);
+        if let Some(next) = hi.checked_add(1) {
+            self.files.append(&mut mid.split_off(&next));
+            self.fd_flags.append(&mut flags.split_off(&next));
+        }
+        self.dead.extend(mid.into_values());
+    }
+
+    /// Set FD_CLOEXEC on the open descriptors in `lo..=hi` (Linux
+    /// __range_cloexec)
+    pub fn cloexec_range(&mut self, lo: Fd, hi: Fd) {
+        for &fd in self.files.range(lo..=hi).map(|(fd, _)| fd) {
+            *self.fd_flags.entry(fd).or_insert(0) |= FD_CLOEXEC;
+        }
+    }
+
     /// Get the number of open file descriptors
     pub fn count(&self) -> usize {
         self.files.len()
@@ -879,24 +803,143 @@ impl<F> Default for FdTable<F> {
     }
 }
 
-/// A task (thread or process)
-pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
-    /// Magic number for validation (must be TASK_MAGIC)
-    pub magic: u64,
-    /// Process ID
-    pub pid: Pid,
-    /// Thread ID
-    pub tid: Tid,
-    /// Thread Group ID (equals pid for thread group leader)
-    /// For CLONE_THREAD: inherited from parent; otherwise: equals pid
-    pub tgid: Pid,
-    /// Parent process ID (0 for init/orphans)
-    pub ppid: Pid,
-    /// Process group ID
-    pub pgid: Pid,
-    /// Session ID
-    pub sid: Pid,
+/// Task flags (Linux PF_*, `Task.flags`): set by the task itself (or
+/// its creator before it runs), read lock-free by anyone
+pub mod pf {
+    /// Exiting (Linux PF_EXITING): what the task still releases (its
+    /// files) does not wait on its behalf, e.g. no SO_LINGER wait in
+    /// TCP close
+    pub const EXITING: u32 = 0x0000_0004;
+    /// A real-uid change left the task over RLIMIT_NPROC: its next
+    /// execve rechecks (Linux PF_NPROC_EXCEEDED)
+    pub const NPROC_EXCEEDED: u32 = 0x0000_1000;
+    /// Kernel thread (Linux PF_KTHREAD)
+    pub const KTHREAD: u32 = 0x0020_0000;
+}
 
+/// Thread flags (Linux TIF_*, `Task.thread_flags`): work to do on the way
+/// back to user mode, set by anyone, consumed by the task
+pub mod tif {
+    /// A signal is deliverable under the blocked mask (Linux
+    /// TIF_SIGPENDING)
+    pub const SIGPENDING: u32 = 1 << 0;
+}
+
+/// A task (thread or process; Linux task_struct), shared as
+/// [`TaskRef`]: the task table, run queues and lookups hold references
+///
+/// Three kinds of fields:
+/// - fixed at creation: `tid`, `pid`, `kind`, `kstack_top`;
+/// - hot counters and flags: atomics written by the task itself (or
+///   its creator before it first runs) or under TASKLIST, and read
+///   lock-free by anyone (accounting, `flags`, `thread_flags`, `cpu`,
+///   `ppid`/`pgid`/`sid`, `seccomp_mode`);
+/// - `cred`, `mm`, `files`: owner fields (Linux current->cred/mm/files),
+///   read by the task itself without a lock and by others under
+///   TASKLIST, changed by the task (or its creator before it runs)
+///   under TASKLIST;
+/// - everything else ([`TaskInner`]), read and written only under
+///   TASKLIST, through the table's views (`GlobalTaskTable::get` etc.).
+pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
+    /// Thread ID: the root number of its `thread_pid`; changes only when
+    /// a non-leader execs and takes its leader's (exchange_tids)
+    tid: AtomicU64,
+    /// Process (thread-group) ID: the leader's tid (Linux tgid)
+    pub pid: Pid,
+    /// Kind of task
+    pub kind: TaskKind,
+    /// Kernel stack top
+    pub kstack_top: A::VirtAddr,
+    /// Task start time (monotonic clock, nanoseconds since boot; a
+    /// de_thread successor takes its leader's)
+    pub start_time: AtomicU64,
+
+    /// Linux PF_* ([`pf`])
+    pub flags: AtomicU32,
+    /// Linux TIF_* ([`tif`])
+    pub thread_flags: AtomicU32,
+    /// CPU whose run queue owns this task (tasks never migrate)
+    pub cpu: AtomicU32,
+    /// Sleeping, as of its last switch out (/proc state; the truth is
+    /// the run queue's)
+    pub sleeping: AtomicBool,
+
+    /// Parent process ID (0 for init/orphans; written under TASKLIST)
+    pub ppid: AtomicU64,
+    /// Process group ID (written under TASKLIST)
+    pub pgid: AtomicU64,
+    /// Session ID (written under TASKLIST)
+    pub sid: AtomicU64,
+    /// User TLS register (x86-64 FS base, arm64 TPIDR_EL0), saved at
+    /// switch-out and loaded at switch-in; set by the task itself or its
+    /// creator (CLONE_SETTLS)
+    pub tls: AtomicU64,
+    /// Seccomp mode (0 = DISABLED, 1 = STRICT, 2 = FILTER), set by the
+    /// task itself; read at every syscall entry
+    pub seccomp_mode: AtomicU8,
+
+    /// Its signal state (blocked mask, private pending set, altstack;
+    /// Linux siglock's per-task part): spin Mutex, thread context only
+    /// (no interrupt handler sends signals), under TASKLIST when both
+    /// are taken; the shared pending set's lock nests inside
+    pub sig: crate::sync::spin::Mutex<TaskSignalState>,
+    /// Keyring references (Linux cred->thread_keyring etc.): spin lock,
+    /// thread context; the key database is taken under it
+    pub keyrings: crate::sync::spin::Mutex<crate::keys::keyring::TaskKeyrings>,
+    /// Its cgroup (Linux task->cgroups): spin leaf, thread context
+    pub cgroup: crate::sync::spin::Mutex<Option<Arc<crate::cgroup::Cgroup>>>,
+    /// Files `defer_fput` still has to drop while an outer frame of this
+    /// task drains (Linux task_work fput); only the task itself uses it
+    pub fput_defer: crate::sync::spin::Mutex<Option<Vec<Arc<crate::fs::File>>>>,
+    /// The vforking parent's completion until this task execs or exits
+    /// (Linux vfork_done): set by the parent before the task runs, taken
+    /// once by the task
+    pub vfork_done: AtomicPtr<crate::completion::Completion>,
+    /// Credentials (Linux task->cred): read lock-free by the task, under
+    /// TASKLIST by others; replaced only by the task (commit_creds)
+    /// under TASKLIST
+    cred: TaskCred,
+    /// Address space, one mm_users reference (shared when CLONE_VM)
+    mm: OwnCell<Option<crate::mm::MmRef>>,
+    /// File descriptor table (shared when CLONE_FILES)
+    files: OwnCell<Option<Arc<fdtable::Files>>>,
+
+    /// User CPU time consumed (nanoseconds)
+    pub utime: AtomicU64,
+    /// System CPU time consumed (nanoseconds)
+    pub stime: AtomicU64,
+    /// When the task last started running or crossed the user/kernel
+    /// boundary (for the utime/stime split)
+    pub last_run_ns: AtomicU64,
+    /// In kernel mode (for the utime/stime split)
+    pub in_kernel: AtomicBool,
+    /// Voluntary context switches (task yielded or slept)
+    pub nvcsw: AtomicU64,
+    /// Involuntary context switches (preempted by scheduler)
+    pub nivcsw: AtomicU64,
+    /// Minor page faults (demand paging, COW - no I/O required)
+    pub min_flt: AtomicU64,
+    /// Major page faults (swap-in required - I/O needed)
+    pub maj_flt: AtomicU64,
+
+    /// Its place in the task list (Linux task->tasks; under TASKLIST)
+    pub tasks_link: crate::list::Link,
+    /// Its place in its real parent's `children` (Linux sibling; under
+    /// TASKLIST)
+    pub sibling: crate::list::Link,
+    /// Its place in its group leader's `threads` (Linux thread_node;
+    /// under TASKLIST)
+    pub thread_node: crate::list::Link,
+    /// The rest, under TASKLIST (None only for the boot task, which
+    /// is never in the table)
+    inner: TableCell<Option<TaskInner<A, PT>>>,
+}
+
+/// The fields of a [`Task`] read and written under TASKLIST
+pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> {
+    /// Its process identifier (Linux thread_pid; None for the idle
+    /// tasks, tid 0)
+    pub thread_pid: Option<Arc<pid::Pid>>,
     // =========================================================================
     // Exit handling (like Linux task_struct exit fields)
     // =========================================================================
@@ -908,36 +951,8 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub pdeath_signal: i32,
 
     // =========================================================================
-    // Process accounting (like Linux task_struct timing/accounting fields)
-    // =========================================================================
-    /// User CPU time consumed (nanoseconds)
-    pub utime: u64,
-    /// System CPU time consumed (nanoseconds)
-    pub stime: u64,
-    /// Task start time (monotonic clock, nanoseconds since boot)
-    pub start_time: u64,
-    /// Timestamp when task last started running (for CPU time tracking)
-    pub last_run_ns: u64,
-    /// Whether task is currently in kernel mode (for utime/stime split)
-    pub in_kernel: bool,
-    /// Voluntary context switches (task yielded or slept)
-    pub nvcsw: u64,
-    /// Involuntary context switches (preempted by scheduler)
-    pub nivcsw: u64,
-    /// Minor page faults (demand paging, COW - no I/O required)
-    pub min_flt: u64,
-    /// Major page faults (swap-in required - I/O needed)
-    pub maj_flt: u64,
-
-    // =========================================================================
     // Credentials (like Linux task_struct->cred)
     // =========================================================================
-    /// Task credentials - reference-counted, immutable after commit
-    /// Following Linux pattern: prepare_creds() -> modify -> commit_creds()
-    pub cred: Arc<Cred>,
-
-    /// Kind of task
-    pub kind: TaskKind,
     /// Current state
     pub state: TaskState,
     /// Scheduling priority (higher = more important)
@@ -949,28 +964,15 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Reset scheduling policy on fork (SCHED_RESET_ON_FORK was set)
     pub reset_on_fork: bool,
     /// CPU affinity mask (bit N = CPU N is allowed)
-    pub cpus_allowed: CpuMask,
-    /// CPU whose run queue owns this task (tasks never migrate)
-    pub cpu: u32,
+    pub cpus_allowed: crate::cpumask::CpuSet,
     /// Page table for this task
     pub page_table: PT,
     /// Saved CPU state
     pub trap_frame: A::TrapFrame,
-    /// Kernel stack top
-    pub kstack_top: A::VirtAddr,
-    /// User stack top (if user process)
-    pub user_stack_top: Option<A::VirtAddr>,
-    /// Cached pages this task is using (for refcount management on exit)
-    pub cached_pages: Vec<Arc<CachedPage>>,
 
     // =========================================================================
     // TLS and thread-exit fields (Linux: embedded in task_struct/thread_struct)
     // =========================================================================
-    /// Thread-local storage base address
-    /// - x86_64: FS base (set via MSR_FS_BASE or arch_prctl ARCH_SET_FS)
-    /// - aarch64: TPIDR_EL0 value
-    pub tls_base: u64,
-
     /// Address to clear and futex-wake on thread exit (set_tid_address syscall)
     /// Used by pthread library for thread cleanup notification.
     pub clear_child_tid: u64,
@@ -982,12 +984,6 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     // =========================================================================
     // Shared resources (Arc for clone-sharing, like Linux pointers)
     // =========================================================================
-    /// Address space, one mm_users reference (shared when CLONE_VM)
-    pub mm: Option<crate::mm::MmRef>,
-
-    /// File descriptor table (shared when CLONE_FILES)
-    pub files: Option<Arc<fdtable::Files>>,
-
     /// Filesystem context (shared when CLONE_FS)
     pub fs: Option<Arc<FsStruct>>,
 
@@ -1009,12 +1005,6 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     // =========================================================================
     // Per-task signal state (not shared)
     // =========================================================================
-    /// Per-task signal state (blocked signals, pending signals)
-    pub signal_state: TaskSignalState,
-
-    /// TIF_SIGPENDING flag (fast check at syscall return)
-    pub tif_sigpending: AtomicBool,
-
     /// Robust futex list head address
     pub robust_list: u64,
 
@@ -1041,9 +1031,6 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     // =========================================================================
     // Seccomp state (sandboxing)
     // =========================================================================
-    /// Seccomp mode: 0=DISABLED, 1=STRICT, 2=FILTER
-    pub seccomp_mode: u8,
-
     /// Seccomp filter chain (head, reference counted)
     /// Filters are chained: when a new filter is installed, it points to the previous.
     /// On syscall entry, filters are run in order (newest first), and the most
@@ -1059,14 +1046,11 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     #[cfg(target_arch = "x86_64")]
     pub iopl_emul: u8,
 
-    /// A real-uid change left this task over RLIMIT_NPROC: its next
-    /// execve rechecks (Linux PF_NPROC_EXCEEDED)
-    pub nproc_exceeded: bool,
-
-    /// Set at the start of exit (Linux PF_EXITING): what the task still
-    /// releases (its files) does not wait on its behalf, e.g. no
-    /// SO_LINGER wait in TCP close
-    pub exiting: bool,
+    /// Thread-group leader (Linux thread_group_leader): created without
+    /// CLONE_THREAD, or the thread whose exec ended the others
+    /// (de_thread). Only leaders are waited for; a leader keeps its
+    /// SignalStruct as a zombie, for the group's exit status.
+    pub leader: bool,
 
     // =========================================================================
     // Ptrace state (like Linux task_struct ptrace fields)
@@ -1075,13 +1059,28 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// 0 = not traced, non-zero = traced with flags
     pub ptrace: u32,
 
-    /// Current ptrace parent (tracer) TID
-    /// Only valid when ptrace != 0
-    pub ptracer_tid: Option<Tid>,
+    /// The tracer (Linux task->parent while traced): a task reference,
+    /// so a recycled number never names it (under TASKLIST)
+    pub ptracer: Option<alloc::sync::Weak<Task<A, PT>>>,
 
-    /// Real parent TID (preserved for detach restoration)
-    /// When ptracing, parent may be changed to tracer; real_parent stays original
-    pub real_parent_tid: Tid,
+    /// The real parent (Linux real_parent): the task whose `children`
+    /// list holds this one; None for init and kernel threads. Weak:
+    /// exit reparents children first (under TASKLIST)
+    pub real_parent: Option<alloc::sync::Weak<Task<A, PT>>>,
+
+    /// Its children (Linux children; their `sibling` links): the thread
+    /// group leaders it created, one strong reference each, until reaped
+    /// or reparented (under TASKLIST)
+    pub children: crate::list::ArcList<Sibling<A, PT>>,
+
+    /// On its real parent's `children` (a group leader; Linux: only
+    /// leaders are)
+    pub in_children: bool,
+
+    /// A leader's thread group, itself included (Linux
+    /// signal->thread_head; links `thread_node`), one strong reference
+    /// each, until a thread leaves the task list (under TASKLIST)
+    pub threads: crate::list::ArcList<ThreadNode<A, PT>>,
 
     /// Message for PTRACE_GETEVENTMSG (child PID, exec old TID, exit code, etc.)
     pub ptrace_message: u64,
@@ -1090,20 +1089,436 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub ptrace_options: u32,
 }
 
-impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {
-    /// Release all cached page references held by this task
-    ///
-    /// Should be called when the task exits to decrement refcounts
-    /// on cached pages, making them eligible for eviction.
-    pub fn release_cached_pages(&mut self) {
-        for page in self.cached_pages.drain(..) {
-            page.put();
+/// Data owned by the TASKLIST lock (Rust-for-Linux LockedBy): only
+/// `GlobalTaskTable`'s views reach it, with the table locked
+pub struct TableCell<T>(UnsafeCell<T>);
+
+// SAFETY: every access goes through a view of the locked table
+unsafe impl<T: Send> Sync for TableCell<T> {}
+
+impl<T> TableCell<T> {
+    pub const fn new(v: T) -> Self {
+        Self(UnsafeCell::new(v))
+    }
+
+    /// # Safety
+    /// TASKLIST is held, and no `&mut` to this cell's data exists.
+    pub unsafe fn get(&self) -> &T {
+        // SAFETY: see above
+        unsafe { &*self.0.get() }
+    }
+
+    /// # Safety
+    /// TASKLIST is held mutably by the caller, and no other reference
+    /// to this cell's data exists.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn get_mut(&self) -> &mut T {
+        // SAFETY: see above
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+/// The adapter of `Task.sibling` (children lists)
+pub struct Sibling<A, PT>(core::marker::PhantomData<(A, PT)>);
+
+// SAFETY: offset_of! gives `sibling`'s place in the task
+unsafe impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>>
+    crate::list::Adapter for Sibling<A, PT>
+{
+    type Item = Task<A, PT>;
+    fn link(t: &Task<A, PT>) -> &crate::list::Link {
+        &t.sibling
+    }
+    unsafe fn item(l: *const crate::list::Link) -> *const Task<A, PT> {
+        // SAFETY: `l` is the `sibling` of a live task
+        unsafe {
+            (l as *const u8).sub(core::mem::offset_of!(Task<A, PT>, sibling)) as *const Task<A, PT>
+        }
+    }
+}
+
+/// The adapter of `Task.thread_node` (thread groups)
+pub struct ThreadNode<A, PT>(core::marker::PhantomData<(A, PT)>);
+
+// SAFETY: offset_of! gives `thread_node`'s place in the task
+unsafe impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>>
+    crate::list::Adapter for ThreadNode<A, PT>
+{
+    type Item = Task<A, PT>;
+    fn link(t: &Task<A, PT>) -> &crate::list::Link {
+        &t.thread_node
+    }
+    unsafe fn item(l: *const crate::list::Link) -> *const Task<A, PT> {
+        // SAFETY: `l` is the `thread_node` of a live task
+        unsafe {
+            (l as *const u8).sub(core::mem::offset_of!(Task<A, PT>, thread_node))
+                as *const Task<A, PT>
+        }
+    }
+}
+
+/// The ids a new task starts with
+pub struct TaskIds {
+    pub pid: Pid,
+    pub ppid: Pid,
+    pub pgid: Pid,
+    pub sid: Pid,
+    pub seccomp_mode: u8,
+}
+
+/// An owner field (Linux current->mm, ->files): the owning task reads it
+/// without a lock; others read it under TASKLIST; it changes only
+/// under TASKLIST, by the owner or before the task first runs
+pub struct OwnCell<T>(UnsafeCell<T>);
+
+// SAFETY: see the access rules above (enforced by `Task`'s unsafe API)
+unsafe impl<T: Send> Sync for OwnCell<T> {}
+
+impl<T> OwnCell<T> {
+    pub const fn new(v: T) -> Self {
+        Self(UnsafeCell::new(v))
+    }
+
+    /// # Safety
+    /// The caller owns the task, or holds TASKLIST.
+    unsafe fn get(&self) -> &T {
+        // SAFETY: no writer runs meanwhile: writers are the owner (not
+        // reading now, or this is it) under TASKLIST
+        unsafe { &*self.0.get() }
+    }
+
+    /// # Safety
+    /// TASKLIST is held, and the caller owns the task or it has not
+    /// run yet; no reference from `get` is live.
+    unsafe fn replace(&self, v: T) -> T {
+        // SAFETY: see above
+        unsafe { core::mem::replace(&mut *self.0.get(), v) }
+    }
+}
+
+/// The credentials of the boot task (no allocation)
+static INIT_CRED: Cred = Cred::ROOT;
+
+/// A task's credentials pointer: an `Arc<Cred>` turned raw, or the boot
+/// task's static `INIT_CRED`; same rules as [`OwnCell`]
+struct TaskCred(AtomicPtr<Cred>);
+
+impl TaskCred {
+    fn new(c: Arc<Cred>) -> Self {
+        Self(AtomicPtr::new(Arc::into_raw(c) as *mut Cred))
+    }
+
+    const fn boot() -> Self {
+        Self(AtomicPtr::new(&INIT_CRED as *const Cred as *mut Cred))
+    }
+
+    fn is_static(p: *const Cred) -> bool {
+        core::ptr::eq(p, &INIT_CRED)
+    }
+
+    /// # Safety
+    /// As [`OwnCell::get`].
+    unsafe fn get(&self) -> Cred {
+        // SAFETY: the pointer is live (see above)
+        unsafe { *self.0.load(Ordering::Acquire) }
+    }
+
+    /// # Safety
+    /// As [`OwnCell::get`].
+    unsafe fn arc(&self) -> Arc<Cred> {
+        let p = self.0.load(Ordering::Acquire);
+        if Self::is_static(p) {
+            return Arc::new(INIT_CRED);
+        }
+        // SAFETY: `p` came from Arc::into_raw and holds a count
+        unsafe {
+            Arc::increment_strong_count(p);
+            Arc::from_raw(p)
         }
     }
 
-    /// Add a cached page reference to this task
-    pub fn add_cached_page(&mut self, page: Arc<CachedPage>) {
-        self.cached_pages.push(page);
+    /// # Safety
+    /// As [`OwnCell::replace`].
+    unsafe fn replace(&self, new: Arc<Cred>) -> Option<Arc<Cred>> {
+        let old = self
+            .0
+            .swap(Arc::into_raw(new) as *mut Cred, Ordering::AcqRel);
+        // SAFETY: from Arc::into_raw unless static
+        (!Self::is_static(old)).then(|| unsafe { Arc::from_raw(old) })
+    }
+}
+
+impl Drop for TaskCred {
+    fn drop(&mut self) {
+        let p = *self.0.get_mut();
+        if !Self::is_static(p) {
+            // SAFETY: the task's own count
+            drop(unsafe { Arc::from_raw(p) });
+        }
+    }
+}
+
+impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Task<A, PT> {
+    /// A task with its locked fields (not yet in the table)
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tid: Tid,
+        ids: TaskIds,
+        kind: TaskKind,
+        kstack_top: A::VirtAddr,
+        cpu: u32,
+        cred: Arc<Cred>,
+        mm: Option<crate::mm::MmRef>,
+        inner: TaskInner<A, PT>,
+    ) -> Self {
+        let now = crate::time::monotonic_ns();
+        let flags = match kind {
+            TaskKind::KernelThread => pf::KTHREAD,
+            TaskKind::UserProcess => 0,
+        };
+        Self {
+            tid: AtomicU64::new(tid),
+            pid: ids.pid,
+            kind,
+            kstack_top,
+            start_time: AtomicU64::new(now),
+            flags: AtomicU32::new(flags),
+            thread_flags: AtomicU32::new(0),
+            cpu: AtomicU32::new(cpu),
+            sleeping: AtomicBool::new(false),
+            ppid: AtomicU64::new(ids.ppid),
+            pgid: AtomicU64::new(ids.pgid),
+            sid: AtomicU64::new(ids.sid),
+            tls: AtomicU64::new(0),
+            seccomp_mode: AtomicU8::new(ids.seccomp_mode),
+            sig: crate::sync::spin::Mutex::new(TaskSignalState::new()),
+            keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
+            cgroup: crate::sync::spin::Mutex::new(None),
+            fput_defer: crate::sync::spin::Mutex::new(None),
+            vfork_done: AtomicPtr::new(core::ptr::null_mut()),
+            cred: TaskCred::new(cred),
+            mm: OwnCell::new(mm),
+            files: OwnCell::new(None),
+            utime: AtomicU64::new(0),
+            stime: AtomicU64::new(0),
+            last_run_ns: AtomicU64::new(now),
+            in_kernel: AtomicBool::new(kind == TaskKind::KernelThread),
+            nvcsw: AtomicU64::new(0),
+            nivcsw: AtomicU64::new(0),
+            min_flt: AtomicU64::new(0),
+            maj_flt: AtomicU64::new(0),
+            tasks_link: crate::list::Link::new(),
+            sibling: crate::list::Link::new(),
+            thread_node: crate::list::Link::new(),
+            inner: TableCell::new(Some(inner)),
+        }
+    }
+
+    /// The boot task (Linux init_task): current on every CPU until its
+    /// first switch, root, never in the task table
+    pub const fn boot(kstack_top: A::VirtAddr) -> Self {
+        Self {
+            tid: AtomicU64::new(0),
+            pid: 0,
+            kind: TaskKind::KernelThread,
+            kstack_top,
+            start_time: AtomicU64::new(0),
+            flags: AtomicU32::new(pf::KTHREAD),
+            thread_flags: AtomicU32::new(0),
+            cpu: AtomicU32::new(0),
+            sleeping: AtomicBool::new(false),
+            ppid: AtomicU64::new(0),
+            pgid: AtomicU64::new(0),
+            sid: AtomicU64::new(0),
+            tls: AtomicU64::new(0),
+            seccomp_mode: AtomicU8::new(0),
+            sig: crate::sync::spin::Mutex::new(TaskSignalState::boot()),
+            keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
+            cgroup: crate::sync::spin::Mutex::new(None),
+            fput_defer: crate::sync::spin::Mutex::new(None),
+            vfork_done: AtomicPtr::new(core::ptr::null_mut()),
+            cred: TaskCred::boot(),
+            mm: OwnCell::new(None),
+            files: OwnCell::new(None),
+            utime: AtomicU64::new(0),
+            stime: AtomicU64::new(0),
+            last_run_ns: AtomicU64::new(0),
+            in_kernel: AtomicBool::new(true),
+            nvcsw: AtomicU64::new(0),
+            nivcsw: AtomicU64::new(0),
+            min_flt: AtomicU64::new(0),
+            maj_flt: AtomicU64::new(0),
+            tasks_link: crate::list::Link::new(),
+            sibling: crate::list::Link::new(),
+            thread_node: crate::list::Link::new(),
+            inner: TableCell::new(None),
+        }
+    }
+
+    /// Thread ID (Linux task_pid_nr)
+    #[inline]
+    pub fn tid(&self) -> Tid {
+        self.tid.load(Ordering::Relaxed)
+    }
+
+    /// Take over thread ID `tid` (exec's exchange_tids, TASKLIST and
+    /// the run-queue entry re-keyed by the caller)
+    pub fn set_tid(&self, tid: Tid) {
+        self.tid.store(tid, Ordering::Relaxed);
+    }
+
+    /// The locked fields (see [`TableCell`]); None for the boot task
+    pub fn inner(&self) -> &TableCell<Option<TaskInner<A, PT>>> {
+        &self.inner
+    }
+
+    pub fn ppid(&self) -> Pid {
+        self.ppid.load(Ordering::Relaxed)
+    }
+
+    pub fn pgid(&self) -> Pid {
+        self.pgid.load(Ordering::Relaxed)
+    }
+
+    pub fn sid(&self) -> Pid {
+        self.sid.load(Ordering::Relaxed)
+    }
+
+    /// Seccomp mode (syscall entry)
+    pub fn seccomp_mode(&self) -> u8 {
+        self.seccomp_mode.load(Ordering::Relaxed)
+    }
+
+    /// The task's credentials, copied
+    ///
+    /// # Safety
+    /// The caller is the task itself, or holds TASKLIST.
+    pub unsafe fn cred(&self) -> Cred {
+        // SAFETY: see above
+        unsafe { self.cred.get() }
+    }
+
+    /// A reference to the task's credentials
+    ///
+    /// # Safety
+    /// As [`Task::cred`].
+    pub unsafe fn cred_arc(&self) -> Arc<Cred> {
+        // SAFETY: see above
+        unsafe { self.cred.arc() }
+    }
+
+    /// Install new credentials, returning the old ones (dropped by the
+    /// caller after TASKLIST)
+    ///
+    /// # Safety
+    /// The caller holds TASKLIST and is the task itself, or the task
+    /// has not run yet.
+    pub unsafe fn set_cred(&self, new: Arc<Cred>) -> Option<Arc<Cred>> {
+        // SAFETY: see above
+        unsafe { self.cred.replace(new) }
+    }
+
+    /// The address space
+    ///
+    /// # Safety
+    /// As [`Task::cred`].
+    pub unsafe fn mm(&self) -> &Option<crate::mm::MmRef> {
+        // SAFETY: see above
+        unsafe { self.mm.get() }
+    }
+
+    /// Replace the address space, returning the old one
+    ///
+    /// # Safety
+    /// As [`Task::set_cred`].
+    pub unsafe fn set_mm(&self, mm: Option<crate::mm::MmRef>) -> Option<crate::mm::MmRef> {
+        // SAFETY: see above
+        unsafe { self.mm.replace(mm) }
+    }
+
+    /// The descriptor table
+    ///
+    /// # Safety
+    /// As [`Task::cred`].
+    pub unsafe fn files(&self) -> &Option<Arc<fdtable::Files>> {
+        // SAFETY: see above
+        unsafe { self.files.get() }
+    }
+
+    /// Replace the descriptor table, returning the old one
+    ///
+    /// # Safety
+    /// As [`Task::set_cred`].
+    pub unsafe fn set_files(
+        &self,
+        files: Option<Arc<fdtable::Files>>,
+    ) -> Option<Arc<fdtable::Files>> {
+        // SAFETY: see above
+        unsafe { self.files.replace(files) }
+    }
+
+    /// Linux PF_* test
+    pub fn has_flag(&self, f: u32) -> bool {
+        self.flags.load(Ordering::Acquire) & f != 0
+    }
+
+    pub fn set_flag(&self, f: u32) {
+        self.flags.fetch_or(f, Ordering::AcqRel);
+    }
+
+    pub fn clear_flag(&self, f: u32) {
+        self.flags.fetch_and(!f, Ordering::AcqRel);
+    }
+
+    /// The task's CPU (its run queue)
+    pub fn cpu(&self) -> u32 {
+        self.cpu.load(Ordering::Acquire)
+    }
+
+    /// TIF_SIGPENDING (fast check before sleeping and at syscall return)
+    pub fn sigpending(&self) -> bool {
+        self.thread_flags.load(Ordering::Acquire) & tif::SIGPENDING != 0
+    }
+
+    pub fn set_sigpending(&self, on: bool) {
+        if on {
+            self.thread_flags
+                .fetch_or(tif::SIGPENDING, Ordering::Release);
+        } else {
+            self.thread_flags
+                .fetch_and(!tif::SIGPENDING, Ordering::Release);
+        }
+    }
+
+    /// Charge the time since the last boundary to user or system time
+    /// and start a new interval in `kernel` mode (the task itself: the
+    /// only writer, so plain loads and stores suffice)
+    pub fn account(&self, now: u64, kernel: bool) {
+        let delta = now.saturating_sub(self.last_run_ns.load(Ordering::Relaxed));
+        let t = if self.in_kernel.load(Ordering::Relaxed) {
+            &self.stime
+        } else {
+            &self.utime
+        };
+        t.store(
+            t.load(Ordering::Relaxed).saturating_add(delta),
+            Ordering::Relaxed,
+        );
+        self.last_run_ns.store(now, Ordering::Relaxed);
+        self.in_kernel.store(kernel, Ordering::Relaxed);
+    }
+
+    /// Start time (monotonic ns)
+    pub fn start_time(&self) -> u64 {
+        self.start_time.load(Ordering::Relaxed)
+    }
+
+    /// (utime, stime) in nanoseconds
+    pub fn times(&self) -> (u64, u64) {
+        (
+            self.utime.load(Ordering::Relaxed),
+            self.stime.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -1486,9 +1901,13 @@ pub fn nproc_move(old: Uid, new: Uid) {
 fn flag_nproc_exceeded(new: Uid) {
     let over = new != 0 && nproc_overlimit(nproc_count(new));
     let tid = percpu::current_tid();
-    let mut table = percpu::TASK_TABLE.lock();
-    if let Some(t) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        t.nproc_exceeded = over;
+    let table = percpu::TASKLIST.read();
+    if let Some(t) = table.get(tid) {
+        if over {
+            t.task.set_flag(crate::task::pf::NPROC_EXCEEDED);
+        } else {
+            t.task.clear_flag(crate::task::pf::NPROC_EXCEEDED);
+        }
     }
 }
 
@@ -1596,23 +2015,19 @@ impl Clone for IoContext {
 }
 
 // =============================================================================
-// Task I/O context accessors - uses Task.io_context field via TASK_TABLE
+// Task I/O context accessors - uses Task.io_context field via TASKLIST
 // =============================================================================
 
 /// Get the I/O context for a task
 pub fn get_task_io_context(tid: Tid) -> Option<Arc<IoContext>> {
-    let table = percpu::TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .and_then(|t| t.io_context.clone())
+    let table = percpu::TASKLIST.read();
+    table.get(tid).and_then(|t| t.io_context.clone())
 }
 
 /// Set the I/O context for a task
 pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
-    let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    let mut table = percpu::TASKLIST.write();
+    if let Some(mut task) = table.get_mut(tid) {
         task.io_context = Some(ctx);
     }
 }
@@ -1620,12 +2035,8 @@ pub fn set_task_io_context(tid: Tid, ctx: Arc<IoContext>) {
 /// Remove the I/O context for a task (on exit)
 pub fn remove_task_io_context(tid: Tid) {
     let _old = {
-        let mut table = percpu::TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.io_context.take())
+        let mut table = percpu::TASKLIST.write();
+        table.get_mut(tid).and_then(|mut t| t.io_context.take())
     };
 }
 
@@ -1667,37 +2078,24 @@ pub const IOPRIO_WHO_USER: i32 = 3;
 // Per-task Thread-Local Storage (TLS) pointer
 // =============================================================================
 //
-// TLS is stored directly in the Task struct (tls_base field), following the
-// Linux pattern where it's stored in task_struct->thread.fsbase.
-//
-// Access pattern (Linux-compatible):
-// - TASK_TABLE.lock() for short critical section
-// - Direct field access (O(1) once task is found)
+// `Task.tls` (Linux thread.fsbase / thread.uw.tp_value): written by the
+// task itself (arch_prctl, the switch-out save) or its creator, read at
+// switch-in.
 
-/// Get the TLS pointer for a task
+/// The TLS pointer of task `tid` (None if unset)
 pub fn get_task_tls(tid: Tid) -> Option<u64> {
-    let table = percpu::TASK_TABLE.lock();
+    let table = percpu::TASKLIST.read();
     table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .map(|t| t.tls_base)
+        .get(tid)
+        .map(|t| t.task.tls.load(Ordering::Relaxed))
         .filter(|&v| v != 0)
 }
 
-/// Set the TLS pointer for a task
+/// Set the TLS pointer of task `tid` (the task itself, or ptrace on a
+/// stopped tracee)
 pub fn set_task_tls(tid: Tid, tls: u64) {
-    let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.tls_base = tls;
-    }
-}
-
-/// Remove the TLS pointer for a task (on exit)
-pub fn remove_task_tls(tid: Tid) {
-    let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
-        task.tls_base = 0;
+    if let Some(t) = percpu::TASKLIST.read().get(tid) {
+        t.task.tls.store(tls, Ordering::Relaxed);
     }
 }
 
@@ -1710,19 +2108,17 @@ pub fn remove_task_tls(tid: Tid) {
 
 /// Get the clear_child_tid pointer for a task
 pub fn get_clear_child_tid(tid: Tid) -> Option<u64> {
-    let table = percpu::TASK_TABLE.lock();
+    let table = percpu::TASKLIST.read();
     table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
+        .get(tid)
         .map(|t| t.clear_child_tid)
         .filter(|&v| v != 0)
 }
 
 /// Set the clear_child_tid pointer for a task
 pub fn set_clear_child_tid(tid: Tid, addr: u64) {
-    let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    let mut table = percpu::TASKLIST.write();
+    if let Some(mut task) = table.get_mut(tid) {
         task.clear_child_tid = addr;
     }
 }
@@ -1736,8 +2132,8 @@ pub fn set_clear_child_tid(tid: Tid, addr: u64) {
 
 /// Get and remove the set_child_tid pointer for a task (one-time use)
 pub fn get_set_child_tid(tid: Tid) -> Option<u64> {
-    let mut table = percpu::TASK_TABLE.lock();
-    if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+    let mut table = percpu::TASKLIST.write();
+    if let Some(mut task) = table.get_mut(tid) {
         let addr = task.set_child_tid;
         if addr != 0 {
             task.set_child_tid = 0; // Consume (one-time use)
@@ -1750,8 +2146,8 @@ pub fn get_set_child_tid(tid: Tid) -> Option<u64> {
 /// Set the set_child_tid pointer for a task
 pub fn set_set_child_tid(tid: Tid, addr: u64) {
     if addr != 0 {
-        let mut table = percpu::TASK_TABLE.lock();
-        if let Some(task) = table.tasks.iter_mut().find(|t| t.tid == tid) {
+        let mut table = percpu::TASKLIST.write();
+        if let Some(mut task) = table.get_mut(tid) {
             task.set_child_tid = addr;
         }
     }

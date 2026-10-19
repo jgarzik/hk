@@ -5,7 +5,7 @@
 //! boot tests fail on it):
 //! - sleeping in atomic context: `might_sleep()` (sleeping locks,
 //!   `schedule`, wait queues, socket waits, user copies) with a tracked
-//!   spin lock held or a raised preempt count;
+//!   spin lock held, a raised preempt count or interrupts disabled;
 //! - lock order: classes (the source location of a lock's `new()`, like
 //!   Linux's static lock_class_key) form A -> B edges when B is taken
 //!   while A is held; taking B under A after A was seen under B reports
@@ -42,11 +42,11 @@ mod imp {
     use core::panic::Location;
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    use crate::arch::{CurrentArch, IrqSpinlock, PerCpuOps};
+    use crate::arch::IrqSpinlock;
+    use crate::cpu::PerCpu;
 
     type Loc = &'static Location<'static>;
 
-    const MAX_CPUS: usize = <CurrentArch as PerCpuOps>::MAX_CPUS;
     /// Held tracked locks per CPU
     const DEPTH: usize = 48;
     /// Order edges (open addressing)
@@ -70,19 +70,17 @@ mod imp {
         irq: u32,
     }
 
-    struct PerCpu(UnsafeCell<Cpu>);
+    struct Slot(UnsafeCell<Cpu>);
     // SAFETY: each CPU touches only its own slot, with no tracked lock
     // taken in interrupt context (reported otherwise)
-    unsafe impl Sync for PerCpu {}
+    unsafe impl Sync for Slot {}
 
-    static CPUS: [PerCpu; MAX_CPUS] = [const {
-        PerCpu(UnsafeCell::new(Cpu {
-            held: [None; DEPTH],
-            depth: 0,
-            busy: false,
-            irq: 0,
-        }))
-    }; MAX_CPUS];
+    static CPUS: PerCpu<Slot> = crate::percpu![Slot(UnsafeCell::new(Cpu {
+        held: [None; DEPTH],
+        depth: 0,
+        busy: false,
+        irq: 0,
+    }))];
 
     #[derive(Clone, Copy)]
     struct Edge {
@@ -111,9 +109,8 @@ mod imp {
     static NREPORTS: AtomicU32 = AtomicU32::new(0);
 
     fn cpu() -> Option<&'static mut Cpu> {
-        let id = CurrentArch::try_current_cpu_id()? as usize;
-        // SAFETY: see PerCpu
-        CPUS.get(id).map(|c| unsafe { &mut *c.0.get() })
+        // SAFETY: see Slot
+        Some(unsafe { &mut *CPUS.this().0.get() })
     }
 
     fn key(l: Loc) -> u64 {
@@ -298,7 +295,11 @@ mod imp {
             return;
         };
         let pc = crate::arch::preempt_count();
-        if c.busy || (c.depth == 0 && pc == 0 && c.irq == 0) {
+        // Syscalls and faults run with interrupts on: sleeping with them
+        // off (and no spinlock owning them) is a bug (Linux might_sleep's
+        // irqs_disabled check)
+        let irqs_off = crate::arch::irqs_disabled();
+        if c.busy || (c.depth == 0 && pc == 0 && c.irq == 0 && !irqs_off) {
             return;
         }
         let at = Location::caller();
@@ -312,11 +313,12 @@ mod imp {
         report(c, || {
             crate::printkln!(
                 "LOCKDEP:FAIL sleeping function called from atomic context at {} \
-                 (spin locks held: {}, preempt count {}, irq {}, tid {})",
+                 (spin locks held: {}, preempt count {}, irq {}, irqs off {}, tid {})",
                 at,
                 depth,
                 pc,
                 irq,
+                irqs_off,
                 crate::task::percpu::current_tid()
             );
             for h in held[..depth].iter().flatten() {

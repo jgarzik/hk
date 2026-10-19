@@ -6,23 +6,26 @@
 //! VM_FAULT_OOM). Page tables are read and changed through the
 //! `arch::paging` PTE helpers (`pte_alloc`, `mk_pte`, `pte_mkwrite`, ...).
 //!
-//! The VMA is looked up under the mm lock, which is dropped before
-//! pages are allocated or read (doc/LOCKING.md, Address Spaces): a PTE
-//! is installed with a compare and swap against the value the fault
-//! saw, so a racing fault on the same page wins once and the loser
-//! drops its page (Linux pte_same under the page table lock).
+//! The fault holds the mmap_lock for reading from the VMA lookup to the
+//! PTE update, I/O included (doc/LOCKING.md, Address Spaces): a PTE is
+//! installed under its table's PTE lock with a compare and swap against
+//! the value the fault saw, so a racing fault on the same page wins once
+//! and the loser drops its page (Linux pte_same under the page table
+//! lock).
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::anon_vma::AnonVma;
 use super::huge_page::{HUGE_PAGE_SIZE, split_huge_pmd};
+use super::ptl::pte_lock;
 use super::shmem::Shmem;
 use super::tlb::flush_tlb_page;
 use super::{Mm, MmStruct, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE, SwapEntry};
 use crate::FRAME_ALLOCATOR;
 use crate::arch::{CurrentArch, PageFlags, SchedArch, paging, phys_to_virt};
 use crate::fs::File;
+use crate::mm::page_alloc::Gfp;
 use crate::task::percpu::{increment_maj_flt, increment_min_flt};
 
 type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
@@ -54,18 +57,23 @@ struct Area {
     start: u64,
     end: u64,
     prot: u32,
-    /// The VMA's flags (MAP_*/VM_*), to recognize it after the lock drop
-    flags: u32,
     shared: bool,
     anon: bool,
     thp: bool,
     offset: u64,
+    /// Anonymous page index of `start` (Linux vm_pgoff)
+    pgoff: u64,
     file: Option<Arc<File>>,
     anon_vma: Option<Arc<AnonVma>>,
     shmem: Option<Arc<Shmem>>,
 }
 
 impl Area {
+    /// Linear page index of `addr` (Linux linear_page_index)
+    fn index(&self, addr: u64) -> u64 {
+        self.pgoff + (addr - self.start) / PAGE_SIZE
+    }
+
     /// Byte offset of the page at `addr` in the mapped object
     fn pgoff(&self, addr: u64) -> u64 {
         self.offset + (addr & !(PAGE_SIZE - 1)) - self.start
@@ -86,44 +94,49 @@ fn access_ok(prot: u32, access: Access) -> bool {
     }
 }
 
-/// Find the VMA of `addr` (growing a stack down to it, Linux
-/// expand_stack) and check the access
-fn find_area(map: &mut MmStruct, addr: u64, access: Access) -> Result<Area, VmFault> {
-    let idx = match map.find_vma_index(addr) {
-        Some(i) => i,
-        None => {
-            let i = map.find_expandable_vma(addr).ok_or(VmFault::Segv)?;
-            map.expand_downwards(i, addr).map_err(|_| VmFault::Segv)?;
-            i
-        }
+/// Find the VMA of `addr` and check the access; `Retry` if a stack
+/// must first grow down to it (needs the mmap_lock for writing)
+fn find_area(map: &MmStruct, addr: u64, access: Access) -> Result<Area, VmFault> {
+    let Some(idx) = map.find_vma_index(addr) else {
+        map.find_expandable_vma(addr).ok_or(VmFault::Segv)?;
+        return Err(VmFault::Retry);
     };
     let vma = map.get_vma(idx).ok_or(VmFault::Segv)?;
     if !access_ok(vma.prot, access) {
         return Err(VmFault::Segv);
     }
-    Ok(Area {
+    Ok(area_of(vma))
+}
+
+/// What a fault needs of `vma`
+fn area_of(vma: &super::Vma) -> Area {
+    Area {
         start: vma.start,
         end: vma.end,
         prot: vma.prot,
-        flags: vma.flags,
         shared: vma.is_shared(),
         anon: vma.is_anonymous(),
         thp: vma.is_thp_eligible(),
         offset: vma.offset,
+        pgoff: vma.pgoff,
         file: vma.file.clone(),
         anon_vma: vma.anon_vma.clone(),
         shmem: vma.shmem.clone(),
-    })
+    }
 }
 
-/// A frame for user data, unless free memory is down to the reserve
-/// kept for the kernel (Linux: user allocations stop at the min
-/// watermark; page tables, stacks and DMA buffers may still dip below)
+/// A frame for user data: none once free memory is down to the low
+/// watermark (the kernel's allocations may go on to min; see
+/// `page_alloc::alloc_mark`)
 pub(crate) fn alloc_user() -> Option<u64> {
-    if FRAME_ALLOCATOR.below_reserve() {
-        return None;
-    }
-    FRAME_ALLOCATOR.alloc()
+    FRAME_ALLOCATOR.alloc_gfp(Gfp::HIGHUSER_MOVABLE)
+}
+
+/// A frame for user data, reclaiming (swapping pages out) below the low
+/// watermark down to min: only with no spinlock held (a fault holding
+/// the mmap_lock for reading)
+pub(crate) fn alloc_user_reclaim() -> Option<u64> {
+    FRAME_ALLOCATOR.alloc_gfp(Gfp::HIGHUSER_RECLAIM)
 }
 
 /// Install `new` in the leaf entry at `ptep` if it still holds `old`
@@ -158,19 +171,18 @@ fn get_pte(ptep: *mut u64) -> u64 {
 /// A new anonymous page at `addr` joins the rmap and LRU
 fn add_anon(phys: u64, area: &Area, addr: u64) {
     if let Some(av) = &area.anon_vma {
-        super::rmap::page_add_anon_rmap(phys, av, addr & !(PAGE_SIZE - 1));
+        super::rmap::page_add_anon_rmap(phys, av, area.index(addr));
     }
-    super::lru::lru_add_new(phys);
+    super::lru::lru_add(phys);
 }
 
 /// Resolve a fault at `addr` of the address space `mm` (the current
 /// task's, or one it is pinned to).
 ///
-/// The mm lock (hk's mmap_lock) is held from the VMA lookup through the
-/// PTE update, so a fault cannot race fork's copy or munmap of the range
-/// (Linux: mmap_lock for read + the page table lock). It is dropped only
-/// to read data that may sleep (a file page, a swap slot); the VMA is
-/// then looked up again and the PTE installed only if both are as before.
+/// The mmap_lock is held for reading from the VMA lookup through the
+/// PTE update, reads of a file page or swap slot included, so a fault
+/// cannot race fork's copy, munmap or mprotect of the range (Linux:
+/// mmap_lock for read + the page table lock).
 pub fn handle_mm_fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
     match fault(mm, addr, access) {
         Err(VmFault::Retry) => Ok(()),
@@ -178,20 +190,48 @@ pub fn handle_mm_fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault
     }
 }
 
+/// Grow the stack VMA below `addr` down to it (Linux expand_stack),
+/// with the mmap_lock held for writing
+fn grow_stack(mm: &Mm, addr: u64) -> Result<(), VmFault> {
+    let mut map = mm.mmap_write();
+    if map.find_vma_index(addr).is_some() {
+        return Ok(()); // grown meanwhile
+    }
+    let i = map.find_expandable_vma(addr).ok_or(VmFault::Segv)?;
+    map.expand_downwards(i, addr).map_err(|_| VmFault::Segv)
+}
+
+/// The fault's VMA, the mmap_lock held for reading (Linux
+/// lock_mm_and_find_vma: a stack to grow takes it for writing first)
+fn lock_area(mm: &Mm, addr: u64, access: Access) -> Result<(MmRead<'_>, Area), VmFault> {
+    loop {
+        let map = mm.mmap_read();
+        match find_area(&map, addr, access) {
+            Ok(area) => return Ok((map, area)),
+            Err(VmFault::Retry) => {
+                drop(map);
+                grow_stack(mm, addr)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+type MmRead<'a> = crate::sync::RwSemReadGuard<'a, MmStruct>;
+
 fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
-    let mut map = mm.lock();
-    let area = find_area(&mut map, addr, access)?;
-    let pgd = mm.pgd();
+    let (map, area) = lock_area(mm, addr, access)?;
     if let Some(r) = huge_fault(mm, addr, &area, access) {
         return r;
     }
-    let ptep = leaf(pgd, addr)?;
+    let ptep = leaf(mm, addr)?;
     let pte = get_pte(ptep);
     if paging::pte_protnone(pte) {
         // Only mprotect makes protnone entries, with the VMA (which
         // allows this access): restore it, read-only, and retry (a
         // write then goes through do_wp_page; write implies read)
         let prot = (area.prot & !PROT_WRITE) | PROT_READ;
+        let _l = pte_lock(ptep);
         if set_pte(ptep, pte, paging::pte_modify(pte, prot)) {
             flush_tlb_page(mm, addr);
         }
@@ -208,72 +248,36 @@ fn fault(mm: &Mm, addr: u64, access: Access) -> Result<(), VmFault> {
         flush_tlb_page(mm, addr);
         return Ok(());
     }
+    // A swap slot, a file page or a new page: the reads may sleep, with
+    // the mm lock held for reading (Linux holds it across the I/O; the
+    // VMA cannot change meanwhile)
     if SwapEntry::is_swap_pte(pte) {
-        // Read (or looked up in the swap cache) unlocked
-        drop(map);
-        let (page, cached) = swap_page(SwapEntry::from_pte(pte), &area)?;
-        let map = mm.lock();
-        let ptep = match same_area(&map, addr, &area).then(|| leaf(pgd, addr)) {
-            Some(Ok(p)) => p,
-            r => {
-                super::memory::put_page(page);
-                return r.map_or(Ok(()), |e| e.map(|_| ()));
-            }
-        };
-        return do_swap_page(mm, ptep, pte, page, cached, addr, &area);
+        return do_swap_page(mm, ptep, pte, addr, &area, access);
     }
-    if area.file.is_none() || area.shmem.is_some() {
-        // Anonymous memory: nothing sleeps
-        let page = fault_page(addr, &area)?;
-        return do_fault(mm, ptep, pte, page, addr, &area);
-    }
-    // A file page: read (or looked up in the page cache) unlocked
-    drop(map);
     let page = fault_page(addr, &area)?;
-    let map = mm.lock();
-    if !same_area(&map, addr, &area) {
-        // Unmapped or changed meanwhile: the access is retried
-        super::memory::put_page(page);
-        return Ok(());
-    }
-    let ptep = match leaf(pgd, addr) {
-        Ok(p) => p,
-        Err(e) => {
-            super::memory::put_page(page);
-            return Err(e);
-        }
-    };
-    do_fault(mm, ptep, pte, page, addr, &area)
+    let r = do_fault(mm, ptep, pte, page, addr, &area);
+    drop(map);
+    r
 }
 
-/// The leaf entry for `addr`, allocating missing tables
-fn leaf(pgd: u64, addr: u64) -> Result<*mut u64, VmFault> {
-    paging::pte_alloc(pgd, addr).ok_or_else(|| {
+/// The leaf entry for `addr`, allocating missing tables; out of memory,
+/// pages are reclaimed (with no spinlock held: the tables are allocated
+/// under the page_table_lock) and the allocation tried again while that
+/// frees some, a bounded number of times
+fn leaf(mm: &Mm, addr: u64) -> Result<*mut u64, VmFault> {
+    for _ in 0..16 {
+        if let Some(p) = super::ptl::pte_alloc(mm, addr) {
+            return Ok(p);
+        }
         // A huge page mapped there: the access is retried
-        match paging::pmd_ptr(pgd, addr).map(get_pte) {
-            Some(pmd) if paging::pmd_huge(pmd) => VmFault::Retry,
-            _ => VmFault::Oom,
+        if paging::pmd_ptr(mm.pgd(), addr).is_some_and(|p| paging::pmd_huge(get_pte(p))) {
+            return Err(VmFault::Retry);
         }
-    })
-}
-
-/// `addr` is still in the VMA a fault looked up (after the mm lock was
-/// dropped), or one identical to it: same range, protection, flags
-/// (shared or private), offset and file. A page fetched for a shared
-/// mapping must never land in a private one (or the reverse).
-fn same_area(map: &MmStruct, addr: u64, area: &Area) -> bool {
-    map.find_vma(addr).is_some_and(|v| {
-        v.start == area.start
-            && v.end == area.end
-            && v.prot == area.prot
-            && v.flags == area.flags
-            && v.offset == area.offset
-            && match (&v.file, &area.file) {
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                (None, None) => true,
-                _ => false,
-            }
-    })
+        if super::vmscan::try_to_free_pages(super::vmscan::SWAP_CLUSTER_MAX) == 0 {
+            return Err(VmFault::Oom);
+        }
+    }
+    Err(VmFault::Oom)
 }
 
 /// A fault in a 2MB region: None to continue at the 4KB level
@@ -281,8 +285,9 @@ fn huge_fault(mm: &Mm, addr: u64, area: &Area, access: Access) -> Option<Result<
     let pmd = get_pte(paging::pmd_ptr(mm.pgd(), addr)?);
     if paging::pmd_huge(pmd) {
         if access == Access::Write && !paging::pte_write(pmd) {
-            // Write-protected huge page: split, then fault on the 4KB page
-            if split_huge_pmd(mm, addr).is_none() {
+            // Write-protected huge page: split, then fault on the 4KB
+            // page; a racing fault may have split (or unmapped) it first
+            if split_huge_pmd(mm, addr).is_none() && still_huge(mm, addr) {
                 return Some(Err(VmFault::Oom));
             }
             return None;
@@ -294,17 +299,22 @@ fn huge_fault(mm: &Mm, addr: u64, area: &Area, access: Access) -> Option<Result<
         return Some(Ok(()));
     }
     if pmd == 0 && area.thp {
-        return do_huge_anon(mm.pgd(), addr, area).then_some(Ok(()));
+        return do_huge_anon(mm, addr, area).then_some(Ok(()));
     }
     None
+}
+
+/// A 2MB page still maps `addr`
+fn still_huge(mm: &Mm, addr: u64) -> bool {
+    paging::pmd_ptr(mm.pgd(), addr).is_some_and(|p| paging::pmd_huge(get_pte(p)))
 }
 
 /// Map a zeroed 2MB page for a THP-eligible area if it covers the whole
 /// aligned 2MB around `addr` (Linux do_huge_pmd_anonymous_page); false
 /// to fall back to a 4KB page
-fn do_huge_anon(pgd: u64, addr: u64, area: &Area) -> bool {
+fn do_huge_anon(mm: &Mm, addr: u64, area: &Area) -> bool {
     let base = addr & !(HUGE_PAGE_SIZE - 1);
-    if base < area.start || base + HUGE_PAGE_SIZE > area.end || FRAME_ALLOCATOR.below_reserve() {
+    if base < area.start || base + HUGE_PAGE_SIZE > area.end {
         return false;
     }
     let Some(frame) = FRAME_ALLOCATOR.alloc_huge() else {
@@ -323,7 +333,8 @@ fn do_huge_anon(pgd: u64, addr: u64, area: &Area) -> bool {
         flags |= PageFlags::EXECUTE;
     }
     // Fails if a racing fault installed a table or a page first
-    if ArchPageTable::map_huge_page(pgd, base, frame, flags, &mut &FRAME_ALLOCATOR).is_err() {
+    let _l = super::ptl::pt_lock(mm);
+    if ArchPageTable::map_huge_page(mm.pgd(), base, frame, flags, &mut &FRAME_ALLOCATOR).is_err() {
         FRAME_ALLOCATOR.free_huge(frame);
         return false;
     }
@@ -349,7 +360,7 @@ fn fault_page(addr: u64, area: &Area) -> Result<u64, VmFault> {
     {
         return r;
     }
-    let frame = alloc_user().ok_or(VmFault::Oom)?;
+    let frame = alloc_user_reclaim().ok_or(VmFault::Oom)?;
     // SAFETY: a fresh frame, reached through the direct map
     let buf = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(frame), PAGE_SIZE as usize) };
     buf.fill(0);
@@ -401,6 +412,7 @@ fn do_fault(
     addr: u64,
     area: &Area,
 ) -> Result<(), VmFault> {
+    let _l = pte_lock(ptep);
     if !set_pte(ptep, old, paging::mk_pte(page, area.prot)) {
         // A racing fault mapped the page first
         super::memory::put_page(page);
@@ -414,52 +426,81 @@ fn do_fault(
     Ok(())
 }
 
-/// The page for swap entry `entry`, with a reference for the PTE:
-/// the swap-cache page if there is one (true), else a new page read
-/// from the slot. May sleep: called without the mm lock.
-fn swap_page(entry: SwapEntry, area: &Area) -> Result<(u64, bool), VmFault> {
-    if let Some(cached) = super::swap_cache_lookup(entry) {
-        FRAME_ALLOCATOR.incref(cached.frame);
-        return Ok((cached.frame, true));
-    }
-    let frame = alloc_user().ok_or(VmFault::Oom)?;
-    if super::swap_read_page(entry, frame).is_err() {
-        FRAME_ALLOCATOR.free(frame);
-        return Err(VmFault::Bus);
-    }
-    paging::sync_page(frame, area.prot & PROT_EXEC != 0);
-    Ok((frame, false))
-}
-
-/// Map a page read back from swap (Linux do_swap_page) where the entry
-/// held the swap PTE `pte`, mm lock held. A swap-cache page may be
-/// mapped by others too: it is mapped copy-on-write in a private VMA.
+/// Map the page of the swap PTE `pte` at `ptep` (Linux do_swap_page),
+/// mm lock held for reading: the swap-cache page, or one read from the
+/// slot into the cache (may sleep). The PTE takes the slot's place: a
+/// write fault on a page no one else needs keeps it writable and drops
+/// it from the swap cache (the slot is freed); otherwise it is mapped
+/// read-only and copy-on-write, still in the cache (a clean copy of the
+/// slot), and a later write fault decides.
 fn do_swap_page(
     mm: &Mm,
     ptep: *mut u64,
     pte: u64,
-    page: u64,
-    cached: bool,
     addr: u64,
     area: &Area,
+    access: Access,
 ) -> Result<(), VmFault> {
-    let mut entry = paging::mk_pte(page, area.prot);
-    if cached && !area.shared {
-        entry = paging::pte_mkcow(entry);
-    }
-    if !set_pte(ptep, pte, entry) {
-        super::memory::put_page(page);
+    let e = SwapEntry::from_pte(pte);
+    let page = match super::swap_state::read_swap_page(e) {
+        Err(VmFault::Retry) => return Ok(()),
+        r => r?,
+    };
+    paging::sync_page(page, area.prot & PROT_EXEC != 0);
+    let r = map_swap_page(mm, ptep, pte, page, addr, area, access);
+    super::page::unlock_page(page);
+    r
+}
+
+/// The locked swap-cache page `page`, with a reference that becomes the
+/// PTE's, replaces the swap PTE `pte` if the entry still holds it
+fn map_swap_page(
+    mm: &Mm,
+    ptep: *mut u64,
+    pte: u64,
+    page: u64,
+    addr: u64,
+    area: &Area,
+    access: Access,
+) -> Result<(), VmFault> {
+    let _l = pte_lock(ptep);
+    if get_pte(ptep) != pte {
+        FRAME_ALLOCATOR.decref(page);
         return Ok(());
     }
-    flush_tlb_page(mm, addr);
-    if !cached {
-        super::free_swap_entry(SwapEntry::from_pte(pte));
-        if area.anon_private() {
-            add_anon(page, area, addr);
-        }
+    super::swap::swap_free(SwapEntry::from_pte(pte));
+    // The cache lets the page go on a write, or when swap runs short
+    // (Linux should_try_to_free_swap: vm_swap_full), if no other swap
+    // PTE needs the slot; exclusive: then no reference but ours
+    let write = access == Access::Write;
+    let freed = (write || super::swap::swap_full()) && super::swap_state::try_free_swap(page);
+    let exclusive = write && freed && FRAME_ALLOCATOR.refcount(page) == 1;
+    let mut entry = paging::mk_pte(page, area.prot);
+    if !exclusive && !area.shared {
+        entry = paging::pte_mkcow(entry);
     }
+    let ok = set_pte(ptep, pte, entry);
+    debug_assert!(ok, "swap PTE changed under its PTE lock");
+    if let Some(av) = &area.anon_vma {
+        super::rmap::page_add_anon_rmap(page, av, area.index(addr));
+    }
+    flush_tlb_page(mm, addr);
     increment_maj_flt();
     Ok(())
+}
+
+/// swapoff: fault in the swap PTE at `addr` of `vma` (Linux
+/// unuse_pte), mm lock held for reading
+pub fn unuse_pte(mm: &Mm, vma: &super::Vma, addr: u64) -> Result<(), VmFault> {
+    let area = area_of(vma);
+    let Some(ptep) = paging::pte_ptr(mm.pgd(), addr) else {
+        return Ok(());
+    };
+    let pte = get_pte(ptep);
+    if !SwapEntry::is_swap_pte(pte) {
+        return Ok(());
+    }
+    do_swap_page(mm, ptep, pte, addr, &area, Access::Read)
 }
 
 /// A write to a present read-only page of a writable VMA (Linux
@@ -467,7 +508,40 @@ fn do_swap_page(
 /// is made writable in place; a private page still shared (fork's
 /// copy-on-write) is copied first
 fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Result<(), VmFault> {
+    let mut spare = None;
+    loop {
+        match wp_locked(mm, ptep, pte, addr, area, &mut spare) {
+            // Out of memory under the PTE lock: reclaim without it
+            // (Linux wp_page_copy allocates before taking it)
+            Err(VmFault::Retry) => spare = Some(alloc_user_reclaim().ok_or(VmFault::Oom)?),
+            r => {
+                if let Some(p) = spare {
+                    FRAME_ALLOCATOR.free(p);
+                }
+                return r;
+            }
+        }
+    }
+}
+
+/// `do_wp_page` under the PTE lock; the copy's page comes from `spare`
+/// if there is one, else `Retry` asks for one when none is free at once
+fn wp_locked(
+    mm: &Mm,
+    ptep: *mut u64,
+    pte: u64,
+    addr: u64,
+    area: &Area,
+    spare: &mut Option<u64>,
+) -> Result<(), VmFault> {
+    let _l = pte_lock(ptep);
+    if get_pte(ptep) != pte {
+        return Ok(()); // changed meanwhile: the access is retried
+    }
     let old = paging::pte_addr(pte);
+    if !area.shared && FRAME_ALLOCATOR.refcount(old) > 1 {
+        reuse_swap_page(old);
+    }
     if area.shared || FRAME_ALLOCATOR.refcount(old) <= 1 {
         if set_pte(ptep, pte, paging::pte_mkwrite(pte)) {
             flush_tlb_page(mm, addr);
@@ -475,7 +549,7 @@ fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Resu
         }
         return Ok(());
     }
-    let new = alloc_user().ok_or(VmFault::Oom)?;
+    let new = spare.take().or_else(alloc_user).ok_or(VmFault::Retry)?;
     // SAFETY: both frames are reached through the direct map; `old`
     // stays mapped (and referenced) until the PTE is switched
     unsafe {
@@ -490,10 +564,20 @@ fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Resu
     if area.anon_private() {
         add_anon(new, area, addr);
     }
-    super::rmap::page_remove_rmap(old);
-    FRAME_ALLOCATOR.decref(old);
+    super::memory::put_page(old);
     increment_min_flt();
     Ok(())
+}
+
+/// A write fault on a swap-cache page: drop it from the cache if no
+/// swap PTE needs its slot (Linux wp_can_reuse_anon_folio), so the
+/// page may be reused in place. PTE lock held: trylock only.
+fn reuse_swap_page(phys: u64) {
+    let cached = super::page::phys_to_page(phys).is_some_and(|p| p.is_swapcache());
+    if cached && super::page::trylock_page(phys) {
+        super::swap_state::try_free_swap(phys);
+        super::page::unlock_page(phys);
+    }
 }
 
 /// A user-mode fault found no memory (Linux pagefault_out_of_memory).
@@ -502,25 +586,19 @@ fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Resu
 /// thread, logged like oom_kill_process), so the fault is never retried
 /// in a loop and the kernel keeps its reserve. Interrupts enabled.
 pub fn pagefault_out_of_memory() -> ! {
-    use crate::signal::{SIGKILL, send_signal};
-    use crate::task::percpu::{TASK_TABLE, current_tid};
+    use crate::signal::SIGKILL;
+    use crate::task::percpu::{TASKLIST, current_tid};
 
     let tid = current_tid();
-    let (pid, name, threads) = {
-        let table = TASK_TABLE.lock();
-        let me = table.tasks.iter().find(|t| t.tid == tid);
-        let pid = me.map_or(0, |t| t.pid);
+    let (pid, name) = {
+        let table = TASKLIST.read();
+        let me = table.get(tid);
+        let pid = me.map_or(0, |t| t.task.pid);
         let name = me.map_or([0; 16], |t| t.prctl.name);
-        let threads: alloc::vec::Vec<_> = table
-            .tasks
-            .iter()
-            .filter(|t| t.pid == pid && t.tid != tid)
-            .map(|t| t.tid)
-            .collect();
-        (pid, name, threads)
+        (pid, name)
     };
     let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-    let exe = super::get_task_mm(tid).and_then(|mm| mm.lock().exe());
+    let exe = super::get_task_mm(tid).and_then(|mm| mm.mmap_read().exe());
     let comm = match core::str::from_utf8(&name[..len]) {
         Ok(n) if !n.is_empty() => n,
         _ => exe
@@ -529,10 +607,7 @@ pub fn pagefault_out_of_memory() -> ! {
             .unwrap_or("?"),
     };
     crate::printkln!("Out of memory: Killed process {} ({})", pid, comm);
-    for t in threads {
-        send_signal(t, SIGKILL);
-    }
-    crate::task::proc::do_exit(SIGKILL as i32)
+    crate::signal::do_group_exit(SIGKILL as i32)
 }
 
 /// Before a write into another process's private page by the kernel
@@ -545,6 +620,7 @@ pub fn unshare_for_write(
     mm: &Mm,
     addr: u64,
     anon_vma: Option<Arc<AnonVma>>,
+    index: u64,
 ) -> Result<(), VmFault> {
     // Never a kernel-half address (shared kernel tables)
     if addr >= super::TASK_SIZE {
@@ -562,11 +638,11 @@ pub fn unshare_for_write(
         start: page,
         end: page + PAGE_SIZE,
         prot: PROT_READ | PROT_WRITE,
-        flags: 0,
         shared: false,
         anon: anon_vma.is_some(),
         thp: false,
         offset: 0,
+        pgoff: index,
         file: None,
         anon_vma,
         shmem: None,

@@ -175,30 +175,27 @@ impl Drop for FpList {
     }
 }
 
-/// Files a task's running `defer_fput` still has to drop, by task (an
-/// entry exists while that task drains)
-static DEFERRED: Mutex<BTreeMap<crate::task::Tid, Vec<Arc<File>>>> = Mutex::new(BTreeMap::new());
-
 /// Drop `files` with no lock held (Linux defers fput to task work, run
 /// by the same task before it returns to user space). A drop that
 /// releases a socket whose queue holds files lands here again in the
-/// same task: those are queued on the task's entry and dropped by the
-/// outer frame's loop, so chains of sockets in flight never recurse.
-/// Each task drains its own files (a sleeping release, e.g. SO_LINGER,
-/// delays only the task that dropped it). Callers hold no locks.
+/// same task: those are queued on the task's `fput_defer` list and
+/// dropped by the outer frame's loop, so chains of sockets in flight
+/// never recurse. Each task drains its own files (a sleeping release,
+/// e.g. SO_LINGER, delays only the task that dropped it). Callers hold
+/// no locks.
 pub fn defer_fput(files: Vec<Arc<File>>) {
     if files.is_empty() {
         return;
     }
-    let tid = crate::task::percpu::current_tid();
+    let me = crate::task::percpu::current();
     {
-        let mut d = DEFERRED.lock();
-        if let Some(q) = d.get_mut(&tid) {
+        let mut d = me.fput_defer.lock();
+        if let Some(q) = d.as_mut() {
             // An outer frame of this task is draining: it takes them
             q.extend(files);
             return;
         }
-        d.insert(tid, Vec::new());
+        *d = Some(Vec::new());
     }
     let mut pending = files;
     loop {
@@ -206,10 +203,10 @@ pub fn defer_fput(files: Vec<Arc<File>>) {
             drop(f);
         }
         let more = {
-            let mut d = DEFERRED.lock();
-            let q = d.get_mut(&tid).map(core::mem::take).unwrap_or_default();
+            let mut d = me.fput_defer.lock();
+            let q = d.as_mut().map(core::mem::take).unwrap_or_default();
             if q.is_empty() {
-                d.remove(&tid);
+                *d = None;
             }
             q
         };

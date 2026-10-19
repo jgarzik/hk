@@ -56,6 +56,8 @@ pub const SYS_SELECT: u64 = 23;
 pub const SYS_PSELECT6: u64 = 270;
 /// close(fd)
 pub const SYS_CLOSE: u64 = 3;
+/// close_range(fd, max_fd, flags)
+pub const SYS_CLOSE_RANGE: u64 = 436;
 /// stat(pathname, statbuf)
 pub const SYS_STAT: u64 = 4;
 /// fstat(fd, statbuf)
@@ -519,6 +521,8 @@ pub const SYS_BPF: u64 = 321;
 pub const SYS_GETCPU: u64 = 309;
 /// getrusage(who, usage)
 pub const SYS_GETRUSAGE: u64 = 98;
+/// times(buf) - process times in clock ticks
+pub const SYS_TIMES: u64 = 100;
 /// sysinfo(info)
 pub const SYS_SYSINFO: u64 = 99;
 /// getrandom(buf, buflen, flags)
@@ -693,8 +697,9 @@ const MSR_SFMASK: u32 = 0xC000_0084; // RFLAGS mask for syscall
 /// EFER.SCE - Syscall Enable bit
 const EFER_SCE: u64 = 1 << 0;
 
-/// RFLAGS bits to clear on syscall entry
-const SYSCALL_FLAG_MASK: u64 = 0x4700; // Clear TF, DF, IF, AC
+/// RFLAGS bits to clear on syscall entry: TF, DF, IF, AC (interrupts
+/// stay off only until the entry has saved the user state)
+const SYSCALL_FLAG_MASK: u64 = 0x4700;
 
 /// Initialize syscall/sysret mechanism
 pub fn init() {
@@ -854,6 +859,11 @@ unsafe extern "C" fn syscall_entry() {
         "push r8",
         "push r9",
 
+        // Kernel GS base back before any Rust code (a user `mov gs`
+        // replaced it; percpu::restore_kernel_gs). The frame holds every
+        // register it clobbers.
+        "call {kgs}",
+
         // Save RCX (user RIP), R11 (user RFLAGS), user RSP, and callee-saved regs
         // for clone()/fork(). The child needs to inherit ALL parent registers.
         // Stack layout at this point (from top):
@@ -904,6 +914,11 @@ unsafe extern "C" fn syscall_entry() {
         "mov r9, [rsp + 16]",    // saved R10
         "call {save_syscall_caller_saved}",
 
+        // The user state is saved: run the syscall with interrupts on
+        // (Linux do_syscall_64). The kernel is not preemptive, so an
+        // interrupt never switches tasks here (doc/LOCKING.md 7)
+        "sti",
+
         // Now set up arguments for C handler
         // syscall_handler(num, arg0, arg1, arg2, arg3, arg4, arg5)
         // C ABI: rdi, rsi, rdx, rcx, r8, r9, [stack]
@@ -931,6 +946,10 @@ unsafe extern "C" fn syscall_entry() {
 
         // Call the handler (returns result in RAX)
         "call {handler}",
+
+        // Interrupts off from here to SYSRET/IRETQ: the exit path writes
+        // the global entry stack and per-CPU user state
+        "cli",
 
         // Remove arg5 from stack
         "add rsp, 8",
@@ -1052,6 +1071,7 @@ unsafe extern "C" fn syscall_entry() {
         save_syscall_caller_saved = sym super::percpu::save_syscall_caller_saved,
         update_frame = sym super::percpu::update_syscall_return_frame,
         fill_iret = sym super::percpu::fill_iret_frame,
+        kgs = sym super::percpu::restore_kernel_gs,
     );
 }
 
@@ -1237,6 +1257,7 @@ pub fn x86_64_syscall_dispatch(
         sys_chown,
         sys_chroot,
         sys_close,
+        sys_close_range,
         sys_dup,
         sys_dup2,
         sys_dup3,
@@ -1374,6 +1395,7 @@ pub fn x86_64_syscall_dispatch(
         }
         SYS_OPEN => sys_open(arg0, arg1 as u32, arg2 as u32) as u64,
         SYS_CLOSE => sys_close(arg0 as i32) as u64,
+        SYS_CLOSE_RANGE => sys_close_range(arg0 as u32, arg1 as u32, arg2 as u32) as u64,
         SYS_LSEEK => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32) as u64,
         SYS_MMAP => {
             crate::mm::syscall::sys_mmap(arg0, arg1, arg2 as u32, arg3 as u32, arg4 as i32, arg5)
@@ -1599,7 +1621,7 @@ pub fn x86_64_syscall_dispatch(
         SYS_EXECVEAT => sys_execveat(arg0 as i32, arg1, arg2, arg3, arg4 as i32) as u64,
         SYS_WAIT4 => sys_wait4(arg0 as i64, arg1, arg2 as i32, arg3) as u64,
         SYS_WAITID => sys_waitid(arg0 as i32, arg1, arg2, arg3 as i32, arg4) as u64,
-        SYS_EXIT_GROUP => sys_exit(arg0 as i32), // For single-threaded, same as _exit
+        SYS_EXIT_GROUP => crate::task::proc::sys_exit_group(arg0 as i32),
 
         // Personality (execution domain)
         SYS_PERSONALITY => {
@@ -1941,18 +1963,15 @@ pub fn x86_64_syscall_dispatch(
 
         // System information
         SYS_GETCPU => {
-            use crate::arch::{PerCpuOps, Uaccess};
-            crate::task::syscall::sys_getcpu::<Uaccess>(
-                crate::arch::CurrentArch::try_current_cpu_id().unwrap_or(0),
-                arg0,
-                arg1,
-            ) as u64
+            use crate::arch::Uaccess;
+            crate::task::syscall::sys_getcpu::<Uaccess>(crate::cpu::this_id(), arg0, arg1) as u64
         }
         SYS_SYSINFO => {
             use crate::arch::Uaccess;
             use crate::task::syscall::sys_sysinfo;
             sys_sysinfo::<Uaccess>(arg0) as u64
         }
+        SYS_TIMES => crate::task::syscall::sys_times::<crate::arch::Uaccess>(arg0) as u64,
         SYS_GETRUSAGE => {
             use crate::arch::Uaccess;
             use crate::task::syscall::sys_getrusage;

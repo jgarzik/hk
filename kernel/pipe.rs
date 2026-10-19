@@ -35,7 +35,6 @@
 //! - Linux fs/pipe.c
 
 use crate::sync::spin::Mutex;
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -401,13 +400,14 @@ impl PipeInner {
 /// Creates an anonymous CachedPage for holding pipe data.
 fn allocate_pipe_page() -> Option<Arc<CachedPage>> {
     use crate::FRAME_ALLOCATOR;
-    use crate::mm::page_cache::FileId;
 
     // Allocate a physical frame
-    let frame = FRAME_ALLOCATOR.alloc()?;
+    // User data (Linux GFP_HIGHUSER | __GFP_ACCOUNT): stops at the low
+    // watermark like the user pages it was copied from
+    let frame = FRAME_ALLOCATOR.alloc_gfp(crate::mm::page_alloc::Gfp::HIGHUSER_MOVABLE)?;
 
     // Create an anonymous CachedPage (file_id 0, offset 0)
-    let page = Arc::new(CachedPage::new(frame, FileId::anonymous(), 0));
+    let page = Arc::new(CachedPage::new_owned(frame));
 
     Some(page)
 }
@@ -517,18 +517,11 @@ impl Drop for PipeReadEnd {
     }
 }
 
-/// File operations for pipe read end
-pub struct PipeReadFileOps {
-    /// The underlying pipe (public for splice module access)
-    pub pipe: Arc<Pipe>,
-}
+/// File operations for pipe read end (the pipe is the file's private
+/// data, like Linux file->private_data = pipe)
+pub struct PipeReadFileOps;
 
-impl PipeReadFileOps {
-    /// Create file ops for pipe read end
-    pub fn new(pipe: Arc<Pipe>) -> Self {
-        Self { pipe }
-    }
-}
+static PIPE_READ_FOPS: PipeReadFileOps = PipeReadFileOps;
 
 impl FileOps for PipeReadFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -536,22 +529,23 @@ impl FileOps for PipeReadFileOps {
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let pipe = pipe_of(file)?;
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
 
         loop {
             // Try to read
             {
-                let mut inner = self.pipe.inner.lock();
+                let mut inner = pipe.inner.lock();
                 if !inner.is_empty() {
                     let n = inner.read(buf);
                     // Wake writers - there's now space
-                    self.pipe.wait_queue.wake_all();
+                    pipe.wait_queue.wake_all();
                     return Ok(n);
                 }
             }
 
             // Buffer is empty
-            if !self.pipe.has_writers() {
+            if !pipe.has_writers() {
                 // EOF - no more writers
                 return Ok(0);
             }
@@ -561,7 +555,6 @@ impl FileOps for PipeReadFileOps {
             }
 
             // Block until data or EOF; a signal ends the wait (-ERESTARTSYS)
-            let pipe = &self.pipe;
             pipe.wait_queue.wait_event_interruptible(|| {
                 !pipe.inner.lock().is_empty() || !pipe.has_writers()
             })?;
@@ -573,14 +566,17 @@ impl FileOps for PipeReadFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(pipe) = file.private_ref::<Pipe>() else {
+            return POLLERR;
+        };
         // Register on wait queue if poll table provided
         if let Some(poll_table) = pt {
-            poll_table.poll_wait(&self.pipe.wait_queue);
+            poll_table.poll_wait(&pipe.wait_queue);
         }
 
         let mut mask = 0u16;
-        let inner = self.pipe.inner.lock();
+        let inner = pipe.inner.lock();
 
         // Check if data available
         if !inner.is_empty() {
@@ -588,7 +584,7 @@ impl FileOps for PipeReadFileOps {
         }
 
         // Check if write end closed (EOF)
-        if !self.pipe.has_writers() {
+        if !pipe.has_writers() {
             if inner.is_empty() {
                 mask |= POLLHUP;
             } else {
@@ -600,9 +596,10 @@ impl FileOps for PipeReadFileOps {
         mask
     }
 
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        let pipe = pipe_of(file)?;
         // Decrement reader count when file is closed
-        self.pipe.remove_reader();
+        pipe.remove_reader();
         Ok(())
     }
 
@@ -612,12 +609,13 @@ impl FileOps for PipeReadFileOps {
         buf: &mut [u8],
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
+        let pipe = pipe_of(file)?;
         if flags.nowait {
             // Check if data is available without blocking
-            let inner = self.pipe.inner.lock();
+            let inner = pipe.inner.lock();
             if inner.is_empty() {
                 // No data available
-                if !self.pipe.has_writers() {
+                if !pipe.has_writers() {
                     return Ok(0); // EOF - write end closed
                 }
                 return Err(KernelError::WouldBlock);
@@ -660,17 +658,9 @@ impl Drop for PipeWriteEnd {
 }
 
 /// File operations for pipe write end
-pub struct PipeWriteFileOps {
-    /// The underlying pipe (public for splice module access)
-    pub pipe: Arc<Pipe>,
-}
+pub struct PipeWriteFileOps;
 
-impl PipeWriteFileOps {
-    /// Create file ops for pipe write end
-    pub fn new(pipe: Arc<Pipe>) -> Self {
-        Self { pipe }
-    }
-}
+static PIPE_WRITE_FOPS: PipeWriteFileOps = PipeWriteFileOps;
 
 impl FileOps for PipeWriteFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -687,6 +677,7 @@ impl FileOps for PipeWriteFileOps {
     /// written so far if any. Writes of at most PIPE_BUF bytes are never
     /// split (any free slot takes them whole).
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
+        let pipe = pipe_of(file)?;
         if buf.is_empty() {
             return Ok(0);
         }
@@ -696,7 +687,7 @@ impl FileOps for PipeWriteFileOps {
 
         loop {
             // Check for EPIPE (no readers)
-            if !self.pipe.has_readers() {
+            if !pipe.has_readers() {
                 // Send SIGPIPE to calling thread
                 use crate::signal::{SIGPIPE, send_signal};
                 use crate::task::percpu::current_tid;
@@ -710,7 +701,7 @@ impl FileOps for PipeWriteFileOps {
 
             // Try to write
             {
-                let mut inner = self.pipe.inner.lock();
+                let mut inner = pipe.inner.lock();
                 if !inner.is_full() {
                     let n = inner.write(&buf[done..]);
                     if n == 0 {
@@ -724,7 +715,7 @@ impl FileOps for PipeWriteFileOps {
                     }
                     done += n;
                     // Wake readers - there's data available
-                    self.pipe.wait_queue.wake_all();
+                    pipe.wait_queue.wake_all();
                 }
             }
             if done == buf.len() {
@@ -740,7 +731,6 @@ impl FileOps for PipeWriteFileOps {
             }
 
             // Block until space or no readers; a signal ends the wait
-            let pipe = &self.pipe;
             let r = pipe
                 .wait_queue
                 .wait_event_interruptible(|| !pipe.inner.lock().is_full() || !pipe.has_readers());
@@ -752,14 +742,17 @@ impl FileOps for PipeWriteFileOps {
         }
     }
 
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(pipe) = file.private_ref::<Pipe>() else {
+            return POLLERR;
+        };
         // Register on wait queue if poll table provided
         if let Some(poll_table) = pt {
-            poll_table.poll_wait(&self.pipe.wait_queue);
+            poll_table.poll_wait(&pipe.wait_queue);
         }
 
         let mut mask = 0u16;
-        let inner = self.pipe.inner.lock();
+        let inner = pipe.inner.lock();
 
         // Check if space available
         if !inner.is_full() {
@@ -767,16 +760,17 @@ impl FileOps for PipeWriteFileOps {
         }
 
         // Check if read end closed (EPIPE)
-        if !self.pipe.has_readers() {
+        if !pipe.has_readers() {
             mask |= POLLERR;
         }
 
         mask
     }
 
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        let pipe = pipe_of(file)?;
         // Decrement writer count when file is closed
-        self.pipe.remove_writer();
+        pipe.remove_writer();
         Ok(())
     }
 
@@ -786,9 +780,10 @@ impl FileOps for PipeWriteFileOps {
         buf: &[u8],
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
+        let pipe = pipe_of(file)?;
         if flags.nowait {
             // Check for no readers (EPIPE)
-            if !self.pipe.has_readers() {
+            if !pipe.has_readers() {
                 // Send SIGPIPE to calling thread
                 use crate::signal::{SIGPIPE, send_signal};
                 use crate::task::percpu::current_tid;
@@ -796,7 +791,7 @@ impl FileOps for PipeWriteFileOps {
                 return Err(KernelError::BrokenPipe);
             }
             // Check if buffer has space without blocking
-            let inner = self.pipe.inner.lock();
+            let inner = pipe.inner.lock();
             if inner.is_full() {
                 return Err(KernelError::WouldBlock);
             }
@@ -812,16 +807,16 @@ impl FileOps for PipeWriteFileOps {
 
 use crate::fs::dentry::Dentry;
 
+/// The pipe behind a pipe file
+pub fn pipe_of(file: &File) -> Result<&Pipe, KernelError> {
+    file.private_ref::<Pipe>().ok_or(KernelError::BadFd)
+}
+
 /// Create a pipe and return (read_file, write_file)
 ///
 /// The returned files should be added to the process's fd table.
 pub fn create_pipe(pipe_flags: u32) -> Result<(Arc<File>, Arc<File>), KernelError> {
     let pipe = Pipe::new();
-
-    // Create file operations (these hold Arc refs to pipe)
-    let read_ops: &'static dyn FileOps =
-        Box::leak(Box::new(PipeReadFileOps::new(Arc::clone(&pipe))));
-    let write_ops: &'static dyn FileOps = Box::leak(Box::new(PipeWriteFileOps::new(pipe)));
 
     // We need a dummy dentry for pipe files
     // Pipes don't have a filesystem path, but File requires a dentry
@@ -831,8 +826,18 @@ pub fn create_pipe(pipe_flags: u32) -> Result<(Arc<File>, Arc<File>), KernelErro
     let read_flags = flags::O_RDONLY | (pipe_flags & flags::O_NONBLOCK);
     let write_flags = flags::O_WRONLY | (pipe_flags & flags::O_NONBLOCK);
 
-    let read_file = Arc::new(File::new(Arc::clone(&dummy_dentry), read_flags, read_ops));
-    let write_file = Arc::new(File::new(dummy_dentry, write_flags, write_ops));
+    let read_file = Arc::new(File::new_anon(
+        Arc::clone(&dummy_dentry),
+        read_flags,
+        &PIPE_READ_FOPS,
+        pipe.clone(),
+    ));
+    let write_file = Arc::new(File::new_anon(
+        dummy_dentry,
+        write_flags,
+        &PIPE_WRITE_FOPS,
+        pipe,
+    ));
 
     Ok((read_file, write_file))
 }

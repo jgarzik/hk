@@ -27,12 +27,10 @@
 //! - Support for permission events (blocking operations pending user decision)
 //! - Multiple marks per fanotify instance
 
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
@@ -311,8 +309,6 @@ pub struct Fanotify {
     inner: IrqSpinlock<FanotifyInner>,
     /// Wait queue for blocking readers
     wait_queue: WaitQueue,
-    /// Unique ID for this instance
-    id: u64,
     /// Init flags
     init_flags: u32,
     /// Event file flags (O_RDONLY, O_RDWR, etc.)
@@ -320,18 +316,10 @@ pub struct Fanotify {
     event_f_flags: u32,
 }
 
-/// Global counter for fanotify IDs
-static NEXT_FANOTIFY_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Global fanotify registry for event dispatch
-static FANOTIFY_REGISTRY: IrqSpinlock<Vec<(u64, Weak<Fanotify>)>> = IrqSpinlock::new(Vec::new());
-
 impl Fanotify {
     /// Create a new fanotify instance
     pub fn new(init_flags: u32, event_f_flags: u32) -> Arc<Self> {
-        let id = NEXT_FANOTIFY_ID.fetch_add(1, Ordering::Relaxed);
-
-        let fanotify = Arc::new(Self {
+        Arc::new(Self {
             inner: IrqSpinlock::new(FanotifyInner {
                 inode_marks: BTreeMap::new(),
                 mount_marks: BTreeMap::new(),
@@ -339,16 +327,9 @@ impl Fanotify {
                 events: Vec::new(),
             }),
             wait_queue: WaitQueue::new(),
-            id,
             init_flags,
             event_f_flags,
-        });
-
-        // Register in global registry
-        let weak = Arc::downgrade(&fanotify);
-        FANOTIFY_REGISTRY.lock().push((id, weak));
-
-        fanotify
+        })
     }
 
     /// Add or update a mark
@@ -533,12 +514,6 @@ impl Fanotify {
         inner.events.iter().map(|e| e.serialized_size()).sum()
     }
 
-    /// Release the fanotify instance
-    fn release(&self) {
-        let mut registry = FANOTIFY_REGISTRY.lock();
-        registry.retain(|(id, _)| *id != self.id);
-    }
-
     /// Get init flags
     pub fn get_init_flags(&self) -> u32 {
         self.init_flags
@@ -550,16 +525,9 @@ impl Fanotify {
 // =============================================================================
 
 /// File operations for fanotify
-pub struct FanotifyFileOps {
-    fanotify: Arc<Fanotify>,
-}
+pub struct FanotifyFileOps;
 
-impl FanotifyFileOps {
-    /// Create file ops for a fanotify instance
-    pub fn new(fanotify: Arc<Fanotify>) -> Self {
-        Self { fanotify }
-    }
-}
+static FANOTIFY_FOPS: FanotifyFileOps = FanotifyFileOps;
 
 impl FileOps for FanotifyFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
@@ -567,8 +535,9 @@ impl FileOps for FanotifyFileOps {
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
+        let fanotify = file.private_ref::<Fanotify>().ok_or(KernelError::BadFd)?;
         let nonblock = file.get_flags() & flags::O_NONBLOCK != 0;
-        self.fanotify.read(buf, nonblock)
+        fanotify.read(buf, nonblock)
     }
 
     fn write(&self, _file: &File, _buf: &[u8]) -> Result<usize, KernelError> {
@@ -576,13 +545,11 @@ impl FileOps for FanotifyFileOps {
         Err(KernelError::InvalidArgument)
     }
 
-    fn poll(&self, _file: &File, pt: Option<&mut PollTable>) -> u16 {
-        self.fanotify.poll(pt)
-    }
-
-    fn release(&self, _file: &File) -> Result<(), KernelError> {
-        self.fanotify.release();
-        Ok(())
+    fn poll(&self, file: &File, pt: Option<&mut PollTable>) -> u16 {
+        let Some(fanotify) = file.private_ref::<Fanotify>() else {
+            return crate::poll::POLLERR;
+        };
+        fanotify.poll(pt)
     }
 }
 
@@ -594,9 +561,6 @@ impl FileOps for FanotifyFileOps {
 pub fn create_fanotify(init_flags: u32, event_f_flags: u32) -> Result<Arc<File>, KernelError> {
     let fanotify = Fanotify::new(init_flags, event_f_flags);
 
-    // Create file operations
-    let ops: &'static dyn FileOps = Box::leak(Box::new(FanotifyFileOps::new(fanotify)));
-
     // Create dummy dentry for fanotify
     let dentry = create_fanotify_dentry()?;
 
@@ -606,7 +570,7 @@ pub fn create_fanotify(init_flags: u32, event_f_flags: u32) -> Result<Arc<File>,
         file_flags |= flags::O_NONBLOCK;
     }
 
-    let file = Arc::new(File::new(dentry, file_flags, ops));
+    let file = Arc::new(File::new_anon(dentry, file_flags, &FANOTIFY_FOPS, fanotify));
     Ok(file)
 }
 
@@ -630,10 +594,7 @@ fn create_fanotify_dentry() -> Result<Arc<Dentry>, KernelError> {
 
 /// Get the Fanotify from a File
 pub fn get_fanotify(file: &File) -> Option<Arc<Fanotify>> {
-    file.f_op
-        .as_any()
-        .downcast_ref::<FanotifyFileOps>()
-        .map(|ops| Arc::clone(&ops.fanotify))
+    file.private_arc::<Fanotify>()
 }
 
 // =============================================================================

@@ -11,7 +11,6 @@ use alloc::vec;
 
 use crate::arch::Uaccess;
 use crate::fs::{KernelError, LookupFlags, Path, is_subdir, lookup_path_flags};
-use crate::storage::get_blkdev;
 use crate::uaccess::{UaccessArch, copy_to_user, put_user, strncpy_from_user};
 
 use super::syscall::{PATH_MAX, current_fd_table};
@@ -106,7 +105,7 @@ fn remount(m: &Arc<super::mount::Mount>, flags: u64) -> Result<(), KernelError> 
 
 /// Mount whose root `target` is (Linux path_mounted), else EINVAL
 fn mount_at(target: &Arc<super::Dentry>) -> Result<Arc<super::mount::Mount>, KernelError> {
-    super::mount::current_mnt_ns()
+    crate::ns::current_mnt_ns()
         .find_mount_at(target)
         .ok_or(KernelError::InvalidArgument)
 }
@@ -239,7 +238,7 @@ pub fn sys_umount2(target_ptr: u64, flags: i32) -> i64 {
     }
 
     // Find the mount at this path
-    let mount = match super::mount::current_mnt_ns().find_mount_at(&target_dentry) {
+    let mount = match crate::ns::current_mnt_ns().find_mount_at(&target_dentry) {
         Some(m) => m,
         None => return KernelError::InvalidArgument.sysret(), // Not a mount point
     };
@@ -293,7 +292,7 @@ pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
     };
 
     // 4. Verify new_root is a mount point
-    let mnt_ns = super::mount::current_mnt_ns();
+    let mnt_ns = crate::ns::current_mnt_ns();
     let new_mnt = match mnt_ns.find_mount_at(&new_root_dentry) {
         Some(m) => m,
         None => return KernelError::InvalidArgument.sysret(), // Not a mount point
@@ -337,19 +336,6 @@ pub fn sys_pivot_root(new_root_ptr: u64, put_old_ptr: u64) -> i64 {
 
     0
 }
-
-// ============================================================================
-// Block device ioctl constants (Linux ABI)
-// ============================================================================
-
-/// BLKGETSIZE64 - get device size in bytes (returns u64)
-const BLKGETSIZE64: u32 = 0x80081272;
-
-/// BLKBSZGET - get block size (returns i32)
-const BLKBSZGET: u32 = 0x80041270;
-
-/// BLKFLSBUF - flush buffer cache
-const BLKFLSBUF: u32 = 0x1261;
 
 /// sys_ioctl - device control
 ///
@@ -455,48 +441,11 @@ pub fn sys_ioctl(fd: i32, cmd: u32, arg: u64) -> i64 {
         None => return KernelError::BadFd.sysret(),
     };
 
-    // Block device ioctls
+    // Block devices answer through their file (Linux blkdev_ioctl)
     if inode.mode().is_blkdev() {
-        // Get the block device from rdev
-        let bdev = match get_blkdev(inode.rdev) {
-            Some(b) => b,
-            None => return KernelError::NoDeviceOrAddress.sysret(),
-        };
-
-        match cmd {
-            BLKGETSIZE64 => {
-                // Return device size in bytes
-                let size = bdev.capacity();
-                if arg != 0 {
-                    // Write size to userspace pointer
-                    if !Uaccess::access_ok(arg, core::mem::size_of::<u64>()) {
-                        return KernelError::BadAddress.sysret();
-                    }
-                    if put_user::<Uaccess, u64>(arg, size).is_err() {
-                        return KernelError::BadAddress.sysret();
-                    }
-                }
-                0
-            }
-            BLKBSZGET => {
-                // Return block size (always 512 for now)
-                let block_size: i32 = bdev.block_size() as i32;
-                if arg != 0 {
-                    if !Uaccess::access_ok(arg, core::mem::size_of::<i32>()) {
-                        return KernelError::BadAddress.sysret();
-                    }
-                    if put_user::<Uaccess, i32>(arg, block_size).is_err() {
-                        return KernelError::BadAddress.sysret();
-                    }
-                }
-                0
-            }
-            BLKFLSBUF => {
-                // Flush buffer cache - for RAM disk this is a no-op
-                // (page cache IS the storage)
-                0
-            }
-            _ => KernelError::NotTty.sysret(),
+        match file.ops().ioctl(&file, cmd, arg) {
+            Ok(v) => v,
+            Err(e) => e.sysret(),
         }
     } else if inode.mode().is_chrdev() {
         // Character device ioctls - route to CharDevice::ioctl()

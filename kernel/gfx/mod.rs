@@ -117,17 +117,18 @@ pub trait GfxDriver: Send + Sync {
     /// Get driver capabilities
     fn get_cap(&self, cap: u64) -> Result<u64, GfxError>;
 
-    /// Get mode resources (connectors, crtcs, encoders, framebuffers)
-    fn get_resources(&self) -> &mode::GfxModeResources;
+    /// Get mode resources (connectors, crtcs, encoders, framebuffers):
+    /// a snapshot, as the driver state may change under its lock
+    fn get_resources(&self) -> mode::GfxModeResources;
 
-    /// Get connector info by ID
-    fn get_connector(&self, id: u32) -> Result<&mode::GfxConnector, GfxError>;
+    /// Get connector info by ID (a snapshot)
+    fn get_connector(&self, id: u32) -> Result<mode::GfxConnector, GfxError>;
 
-    /// Get encoder info by ID
-    fn get_encoder(&self, id: u32) -> Result<&mode::GfxEncoder, GfxError>;
+    /// Get encoder info by ID (a snapshot)
+    fn get_encoder(&self, id: u32) -> Result<mode::GfxEncoder, GfxError>;
 
-    /// Get CRTC info by ID
-    fn get_crtc(&self, id: u32) -> Result<&mode::GfxCrtc, GfxError>;
+    /// Get CRTC info by ID (a snapshot)
+    fn get_crtc(&self, id: u32) -> Result<mode::GfxCrtc, GfxError>;
 
     /// Set CRTC mode and framebuffer
     fn set_crtc(
@@ -203,6 +204,10 @@ impl GfxCharDevice {
 impl CharDevice for GfxCharDevice {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn mmap_ok(&self) -> bool {
+        true
     }
 
     fn read(&self, _buf: &mut [u8]) -> Result<usize, DeviceError> {

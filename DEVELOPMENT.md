@@ -13,8 +13,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # QEMU for x86-64 and aarch64 emulation
 sudo apt install qemu-system-x86 qemu-system-arm
 
-# Build tools for userspace and ISO creation
-sudo apt install build-essential cpio grub-pc-bin grub-common mtools xorriso
+# Build tools for userspace, the ISO and the test disk images
+sudo apt install build-essential cpio grub-pc-bin grub-common mtools xorriso dosfstools fdisk
 
 # Cross-compiler for aarch64 userspace
 sudo apt install gcc-aarch64-linux-gnu
@@ -97,14 +97,59 @@ the Ubuntu archive/ports with the InRelease signature and hashes
 checked) and cached under `target/busybox/`; the first build needs
 network access and current apt lists (`sudo apt-get update`).
 
+The boot tests (hk and `make check-linux*`) attach `target/disk.img` as
+a virtio-blk disk (`-drive ...,snapshot=on`: every boot sees it
+pristine; modern-only device with two queues). `make disk-image` builds
+it rootless with `tools/mkdisk.sh` (sfdisk, mkfs.vfat, mcopy, mkswap,
+perl): 128 MiB GPT with vda1 32 MiB vfat (`HKDISK`, `HKDISK.TXT`), vda2
+64 MiB swap, vda3 16 MiB pattern (32-bit LE word i = i * 1103515245 +
+12345), the rest unallocated. The `check*` targets build it as needed.
+`make check-linux*` also checks that the Linux kernel has the drivers
+the tests need built in (`CONFIG_VIRTIO_BLK`, `EFI_PARTITION`,
+`DEVTMPFS`, `VFAT_FS`, `NLS_CODEPAGE_437` =y, from its linux-buildinfo
+package).
+
 ### Full Build + Test (Recommended)
 
 ```bash
-make check          # Build x86-64 + boot test (SUCCESS criteria)
-make check-arm      # Build aarch64 + boot test (SUCCESS criteria)
+make gate           # The per-commit gate (SUCCESS criteria: GATE-OK)
+
+# Its parts, one at a time
+make check          # Build x86-64 + boot test
+make check-arm      # Build aarch64 + boot test
+make check-linux    # boot_tester on real Linux (native arch)
+make check-linux-arm # Same, aarch64 Linux (emulated on x86)
 make clippy         # Linting for x86-64
 make clippy-arm     # Linting for aarch64
 ```
+
+`make gate` (`tools/gate.sh`) runs `fmt-check`, `clippy` and `clippy-arm`
+(`-D warnings`) and `test`, stopping at the first failure, then builds
+everything the boots need, then runs `check`, `check-arm`, `check-linux`
+and `check-linux-arm` in parallel (`NOBUILD=1`: boot what is built). It
+prints one line per boot and `GATE-OK` or `GATE-FAILED`; each step's
+output is in `target/qemu/gate/<step>.out`.
+
+The serial logs of all boots go to `QEMU_LOG_DIR` (default
+`target/qemu/` of the tree), so worktrees and parallel boots never share
+a log: `serial.log` (x86-64), `serial_arm.log` (aarch64),
+`usb_serial.log` (x86-64 USB serial), `serial_linux_<arch>.log`
+(`check-linux*`). `NO_KVM=1` (e.g. `NO_KVM=1 make check`) runs x86
+under TCG, as CI does.
+
+`check-linux*` results do not depend on `kernel/`, so a PASS is cached
+in `~/.cache/hk-linux-check/<arch>/<hash>` (`LINUX_CACHE_DIR`), shared by
+all worktrees; a rerun with the same hash prints `check-linux: cached
+PASS (<arch> <hash>)` and skips the boot. The hash covers the tracked
+and untracked files of `user/`, `Makefile`, `rust-toolchain.toml`,
+`tools/{linux-boot-tester,mkdisk,busybox-root,fetch-deb,qemu-net}.sh`
+and `tools/netpeer/`; the Linux kernel and its config, the initramfs
+tree (paths, modes, link targets, contents), the versions of the tools
+`mkdisk.sh` uses (the image's FAT timestamps differ per build); the
+QEMU version, machine, KVM use, network and disk options, the timeout
+and the host kernel release (`target/linux-test-<arch>/cache-key` shows
+the input). `LINUX_NOCACHE=1` boots anyway; the cache is off when `CI`
+is set.
 
 ## Running in QEMU
 
@@ -132,11 +177,12 @@ make run-arm        # aarch64
 
 The default QEMU setup:
 - Memory: 512MB
-- Serial output: logged to `/tmp/qemu_serial.log` (x86-64) or `/tmp/qemu_serial_arm.log` (aarch64)
+- Serial output: logged to `target/qemu/serial.log` (x86-64) or `target/qemu/serial_arm.log` (aarch64); `QEMU_LOG_DIR` overrides the directory
 - Display: `-nographic` (console mode)
 - x86-64: Boots from ISO with GRUB
 - aarch64: Direct kernel boot with device tree
-- CPU: x86-64 `-cpu host` under KVM, `-cpu max` under TCG (SMAP/SMEP);
+- CPU: x86-64 `-cpu host` under KVM, `-cpu max` under TCG (SMAP/SMEP;
+  `NO_KVM=1` forces TCG, as on CI);
   aarch64 `-cpu neoverse-n1` (PAN). SMAP/PAN make any kernel access to
   user memory outside `kernel/uaccess.rs` fault, so the boot tests catch
   it. Override with `QEMU_CPU`, e.g. `make check QEMU_CPU=qemu64` or
@@ -244,6 +290,7 @@ After a full build:
 # x86-64
 target/x86_64-unknown-none/release/kernel    # Kernel binary (ELF)
 target/hk-x86_64.iso                         # Bootable ISO image
+target/disk.img                              # virtio-blk test disk (both arches)
 user/initramfs-x86_64.cpio                   # Userspace CPIO archive
 
 # aarch64

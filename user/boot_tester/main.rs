@@ -16,7 +16,8 @@ use hk_syscall::{
     sys_getpid, sys_reboot,
 };
 use tests::helpers::{
-    fail_count, host_mode, host_setup, init_host_mode, loopback_up, print, print_num, println,
+    dev_setup, fail_count, host_mode, host_setup, init_host_mode, loopback_up, print, print_num,
+    println,
 };
 
 /// Process entry: the kernel enters with a 16-byte aligned sp and no return
@@ -55,6 +56,7 @@ extern "C" fn rust_start() -> ! {
         println(b"(host mode: running on a non-hk kernel)");
         host_setup();
     }
+    dev_setup();
     loopback_up();
     println(b"");
 

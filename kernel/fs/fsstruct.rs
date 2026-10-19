@@ -58,7 +58,7 @@ impl FsStruct {
 
     /// Create a new FsStruct initialized to the filesystem root
     pub fn new_root() -> Option<Arc<Self>> {
-        let mnt_ns = super::mount::current_mnt_ns();
+        let mnt_ns = crate::ns::current_mnt_ns();
         let root_dentry = mnt_ns.get_root_dentry()?;
         let root_mnt = mnt_ns.get_root()?;
         let root_path = Path::new(root_mnt.clone(), root_dentry.clone());
@@ -133,32 +133,24 @@ impl FsStruct {
 // =============================================================================
 
 // =============================================================================
-// Task FS accessors - uses Task.fs field directly via TASK_TABLE
+// Task FS accessors - uses Task.fs field directly via TASKLIST
 // =============================================================================
 
-use crate::task::percpu::TASK_TABLE;
+use crate::task::percpu::TASKLIST;
 
 /// Initialize filesystem context for a new task
 pub fn init_task_fs(tid: Tid, fs: Arc<FsStruct>) {
     let old = {
-        let mut table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.fs.replace(fs))
+        let mut table = TASKLIST.write();
+        table.get_mut(tid).and_then(|mut t| t.fs.replace(fs))
     };
     drop(old);
 }
 
 /// Get the FsStruct for a task (returns cloned Arc)
 pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
-    let table = TASK_TABLE.lock();
-    table
-        .tasks
-        .iter()
-        .find(|t| t.tid == tid)
-        .and_then(|t| t.fs.clone())
+    let table = TASKLIST.read();
+    table.get(tid).and_then(|t| t.fs.clone())
 }
 
 /// Remove filesystem context when task exits
@@ -166,15 +158,11 @@ pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
 /// This decrements the Arc refcount. If this was the last reference
 /// (no other tasks sharing this FsStruct), the FsStruct is dropped,
 /// which in turn drops the Path references to pwd and root (after
-/// TASK_TABLE is released: nothing is released under it).
+/// TASKLIST is released: nothing is released under it).
 pub fn exit_task_fs(tid: Tid) {
     let fs = {
-        let mut table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter_mut()
-            .find(|t| t.tid == tid)
-            .and_then(|t| t.fs.take())
+        let mut table = TASKLIST.write();
+        table.get_mut(tid).and_then(|mut t| t.fs.take())
     };
     drop(fs);
 }

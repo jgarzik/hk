@@ -31,8 +31,6 @@ extern crate alloc;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 
-use crate::task::{CurrentTask, Tid};
-
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 
@@ -74,17 +72,23 @@ pub use x86_64::barrier;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::irq;
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::percpu::preempt_count;
+pub use x86_64::percpu::{preempt_count, preempt_disable, preempt_enable};
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::spinlock::{IrqSpinlock, IrqSpinlockGuard, local_irq_restore, local_irq_save};
+#[allow(unused_imports)]
+pub use x86_64::spinlock::{
+    IrqSpinlock, IrqSpinlockGuard, irqs_disabled, local_irq_restore, local_irq_save,
+};
 
 /// Device IRQ registration (shareable handlers, PCI INTx routing)
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::irq;
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::percpu::preempt_count;
+pub use aarch64::percpu::{preempt_count, preempt_disable, preempt_enable};
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::spinlock::{IrqSpinlock, IrqSpinlockGuard, local_irq_restore, local_irq_save};
+#[allow(unused_imports)]
+pub use aarch64::spinlock::{
+    IrqSpinlock, IrqSpinlockGuard, irqs_disabled, local_irq_restore, local_irq_save,
+};
 
 // Ptrace architecture-specific support
 #[cfg(target_arch = "x86_64")]
@@ -113,6 +117,13 @@ pub use x86_64::percpu::read_fs_base as read_user_tls;
 
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::percpu::read_tpidr_el0 as read_user_tls;
+
+// A value the user TLS register may take
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::percpu::fs_base_ok as user_tls_ok;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::percpu::tpidr_ok as user_tls_ok;
 
 // ELF auxv hardware capabilities and platform string
 #[cfg(target_arch = "x86_64")]
@@ -283,8 +294,8 @@ pub trait FrameAlloc {
         None
     }
 
-    /// Memory is down to the reserve kept for the kernel: callers adding
-    /// unevictable user data (ramfs pages) must fail instead
+    /// Memory is down to the low watermark: callers adding unevictable
+    /// user data (ramfs pages) must fail instead
     fn reserve_low(&self) -> bool {
         false
     }
@@ -300,21 +311,18 @@ pub trait FrameAlloc {
 /// On x86-64, this is accessed via the GS segment. On aarch64, via TPIDR_EL1.
 #[allow(dead_code)]
 pub trait PerCpuOps {
-    /// Maximum number of CPUs supported by this architecture
-    const MAX_CPUS: usize;
-
     /// Try to get the current CPU ID
     ///
     /// Returns None if per-CPU data is not yet initialized (early boot).
     fn try_current_cpu_id() -> Option<u32>;
 
-    /// Get the current thread ID from per-CPU data
-    ///
-    /// Returns 0 if no task is running or per-CPU not initialized.
-    fn current_tid() -> Tid;
+    /// The running task (`*const KernelTask`), 0 for the boot task
+    /// (before the first switch, or before per-CPU data exists)
+    fn current_task_ptr() -> usize;
 
-    /// Set the current thread ID in per-CPU data
-    fn set_current_tid(tid: Tid);
+    /// Record the task this CPU switches to (the scheduler, with the
+    /// run-queue lock held; the run queue keeps it alive)
+    fn set_current_task_ptr(p: usize);
 
     /// Check if reschedule is needed on this CPU
     fn needs_reschedule() -> bool;
@@ -327,12 +335,6 @@ pub trait PerCpuOps {
 
     /// Get the interrupt nesting depth
     fn interrupt_depth() -> u32;
-
-    /// Get the current task context (credentials, pid, etc.)
-    fn get_current_task() -> CurrentTask;
-
-    /// Set the current task context
-    fn set_current_task(task: &CurrentTask);
 
     /// Get saved syscall user RIP (return address for clone/fork)
     fn get_syscall_user_rip() -> u64;
@@ -423,7 +425,7 @@ pub trait ContextOps: Sized {
         old_ctx: *mut Self::TaskContext,
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        next_tid: Tid,
+        next_tls: u64,
     );
 
     /// Switch to a task without saving current context
@@ -436,7 +438,7 @@ pub trait ContextOps: Sized {
     unsafe fn context_switch_first(
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
-        next_tid: Tid,
+        next_tls: u64,
     ) -> !;
 }
 
@@ -751,23 +753,6 @@ pub trait SyscallOps {
     fn syscall_dispatcher() -> Self::SyscallHandler;
 }
 
-/// Timer preemption callback setup
-///
-/// Allows the kernel to register a callback that is invoked from
-/// the timer interrupt handler to check for preemption.
-#[allow(dead_code)]
-pub trait TimerCallbackOps {
-    /// Set the timer preemption callback
-    ///
-    /// # Safety
-    /// Must be called once during kernel initialization before
-    /// interrupts are enabled.
-    ///
-    /// # Arguments
-    /// * `callback` - Function to call from timer interrupt
-    unsafe fn set_timer_preempt_callback(callback: fn());
-}
-
 /// Architecture-specific bus and driver initialization
 ///
 /// Called after the bus manager is created to register platform-specific
@@ -787,21 +772,22 @@ pub trait ArchBusOps {
 
 /// Memory layout and region discovery operations
 ///
-/// Abstracts how each architecture discovers its memory layout for
-/// frame allocation. On x86_64 this uses multiboot2 memory maps,
-/// on aarch64 this uses hardcoded constants (or DTB in the future).
-#[allow(dead_code)]
+/// How each architecture reports physical memory (Linux setup_arch:
+/// e820__memblock_setup on x86, arm64_memblock_init on arm64)
 pub trait MemoryLayoutOps {
-    /// Get the frame allocator base address and size
-    ///
-    /// Returns (base, size) where base is the physical address to start
-    /// frame allocation from, and size is the total bytes available.
-    fn get_frame_alloc_region() -> (u64, u64);
+    /// Add every firmware RAM range the kernel can reach through the
+    /// direct map to memblock and reserve what boot already uses there
+    /// (kernel image, boot modules, DTB, initrd, firmware-reserved
+    /// ranges)
+    fn memblock_init();
 
-    /// Boot data inside the frame allocator region that must never be
-    /// handed out (e.g. an initrd the firmware placed there), as
-    /// (start, end) ranges
-    fn for_each_reserved(_f: &mut dyn FnMut(u64, u64)) {}
+    /// Map the kernel page `va` to RAM at `pa` (writable, never
+    /// executable; the vmemmap); missing tables come from `table`, the
+    /// physical address of a zeroed frame
+    ///
+    /// # Safety
+    /// Boot CPU, before SMP; `va` is unmapped and not in use.
+    unsafe fn map_kernel_page(va: u64, pa: u64, table: &mut dyn FnMut() -> u64);
 }
 
 /// Exception and interrupt controller initialization

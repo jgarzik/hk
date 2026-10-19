@@ -11,8 +11,8 @@ use crate::arch::Uaccess;
 use crate::error::KernelError;
 use crate::fs::iov::IoVec;
 use crate::mm::remote::{access_remote_vm_read, access_remote_vm_write};
-use crate::task::percpu::{TASK_TABLE, current_cred, current_tid};
-use crate::task::{CAP_SYS_PTRACE, Pid, Tid, capable};
+use crate::task::percpu::{TASKLIST, current_tid};
+use crate::task::{Pid, Tid};
 use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 
 /// Maximum number of iovec entries (same as IOV_MAX)
@@ -57,15 +57,10 @@ pub fn sys_process_vm_readv(
         None => return KernelError::NoProcess.sysret(),
     };
 
-    // Permission check
-    if !check_process_vm_permission(target_tid) {
-        return KernelError::NotPermitted.sysret();
-    }
-
-    // Get target's mm and page table root
-    let (target_mm, page_table_root) = match get_target_mm_and_pt(target_tid) {
-        Some(x) => x,
-        None => return KernelError::NoProcess.sysret(),
+    // Permission check and the mm it covers (Linux mm_access)
+    let (target_mm, _) = match access_mm(target_tid) {
+        Ok(x) => x,
+        Err(e) => return e.sysret(),
     };
 
     // Copy iovec arrays from user space
@@ -85,9 +80,9 @@ pub fn sys_process_vm_readv(
         }
     }
 
-    // The target mm (hk's mmap_lock, a spin lock) is locked per remote
-    // access only, never across the local user copy (which can fault
-    // and sleep, and takes our own mm lock if it does)
+    // The target mmap_lock is held per remote access only, never across
+    // the local user copy (which can fault and sleep, and takes our own
+    // mmap_lock if it does)
 
     // Transfer data: remote -> local
     let mut total_bytes = 0i64;
@@ -117,8 +112,8 @@ pub fn sys_process_vm_readv(
             // Read from remote into kernel buffer
             let mut buf = alloc::vec![0u8; to_transfer];
             let bytes_read = match access_remote_vm_read(
-                &target_mm.lock(),
-                page_table_root,
+                &target_mm,
+                &target_mm.mmap_read(),
                 remote_addr,
                 &mut buf,
             ) {
@@ -202,15 +197,10 @@ pub fn sys_process_vm_writev(
         None => return KernelError::NoProcess.sysret(),
     };
 
-    // Permission check
-    if !check_process_vm_permission(target_tid) {
-        return KernelError::NotPermitted.sysret();
-    }
-
-    // Get target's mm and page table root
-    let (target_mm, _) = match get_target_mm_and_pt(target_tid) {
-        Some(x) => x,
-        None => return KernelError::NoProcess.sysret(),
+    // Permission check and the mm it covers (Linux mm_access)
+    let (target_mm, _) = match access_mm(target_tid) {
+        Ok(x) => x,
+        Err(e) => return e.sysret(),
     };
 
     // Copy iovec arrays from user space
@@ -230,9 +220,9 @@ pub fn sys_process_vm_writev(
         }
     }
 
-    // The target mm (hk's mmap_lock, a spin lock) is locked per remote
-    // access only, never across the local user copy (which can fault
-    // and sleep, and takes our own mm lock if it does)
+    // The target mmap_lock is held per remote access only, never across
+    // the local user copy (which can fault and sleep, and takes our own
+    // mmap_lock if it does)
 
     // Transfer data: local -> remote
     let mut total_bytes = 0i64;
@@ -272,7 +262,8 @@ pub fn sys_process_vm_writev(
 
             // Write to remote
             let bytes_written =
-                match access_remote_vm_write(&target_mm, &target_mm.lock(), remote_addr, &buf) {
+                match access_remote_vm_write(&target_mm, &target_mm.mmap_read(), remote_addr, &buf)
+                {
                     Ok(n) => n,
                     Err(_) => {
                         if total_bytes > 0 {
@@ -309,44 +300,27 @@ pub fn sys_process_vm_writev(
 
 /// Find a task by PID (returns TID of the main thread)
 fn find_task_by_pid(pid: Pid) -> Option<Tid> {
-    let table = TASK_TABLE.lock();
-    table.tasks.iter().find(|t| t.pid == pid).map(|t| t.tid)
+    let table = TASKLIST.read();
+    table.get(pid).map(|t| t.task.tid())
 }
 
-/// Check permission for process_vm access
-///
-/// Allows access if:
-/// - Caller has CAP_SYS_PTRACE capability, OR
-/// - Caller and target have the same effective UID
+/// May the caller access the target's memory (Linux process_vm_rw_core
+/// -> mm_access, PTRACE_MODE_ATTACH_REALCREDS): its own process, else
+/// the ptrace rules with the real ids
 fn check_process_vm_permission(target_tid: Tid) -> bool {
-    // CAP_SYS_PTRACE bypasses all checks
-    if capable(CAP_SYS_PTRACE) {
-        return true;
+    target_tid == current_tid()
+        || crate::task::ptrace::may_access(|t| t.task.tid() == target_tid, false)
+}
+
+/// The target's address space if the caller may access it (Linux
+/// mm_access): decided and taken under its cred_guard_mutex, so an exec
+/// cannot swap in a new mm or dumpability in between
+fn access_mm(target_tid: Tid) -> Result<(crate::mm::MmRef, u64), KernelError> {
+    let _g = crate::signal::ExecUpdateRead::lock(target_tid);
+    if !check_process_vm_permission(target_tid) {
+        return Err(KernelError::NotPermitted);
     }
-
-    // Same process always allowed
-    if target_tid == current_tid() {
-        return true;
-    }
-
-    // Get caller credentials
-    let caller_cred = current_cred();
-
-    // Get target credentials
-    let target_euid = {
-        let table = TASK_TABLE.lock();
-        table
-            .tasks
-            .iter()
-            .find(|t| t.tid == target_tid)
-            .map(|t| t.cred.euid)
-    };
-
-    // Same effective UID check
-    match target_euid {
-        Some(euid) => caller_cred.euid == euid,
-        None => false,
-    }
+    get_target_mm_and_pt(target_tid).ok_or(KernelError::NoProcess)
 }
 
 /// Get target's MmStruct and page table root physical address

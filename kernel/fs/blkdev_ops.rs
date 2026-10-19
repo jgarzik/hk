@@ -1,136 +1,121 @@
-//! Block Device File Operations
+//! Block device files (Linux block/fops.c, block/ioctl.c)
 //!
-//! Implements FileOps for block special files, routing read/write
-//! through the page cache and block layer.
-//!
-//! ## Data Flow
-//!
-//! ```text
-//! User buffer <-> BlockFileOps <-> Page Cache <-> BlockDevice
-//! ```
-//!
-//! For RAM disk, the page cache IS the storage (zero-copy).
+//! Reads and writes are synchronous bios through kernel bounce buffers
+//! (no page cache in front of block devices yet); a partial sector is
+//! read, patched and rewritten. fsync flushes the disk's write cache.
+//! The open file holds its block device (`File.private`), counted as an
+//! opener (BLKRRPART, BLKBSZGET's initial value).
 
 use alloc::sync::Arc;
 
-use core::cmp::min;
+use crate::arch::Uaccess;
+use crate::error::KernelError;
+use crate::storage::blkdev::{
+    BioOp, BlockDevice, SECTOR_SHIFT, bdev_rw_bytes, blkdev_issue_flush, get_blkdev,
+};
+use crate::storage::genhd;
+use crate::uaccess::{get_user, put_user};
 
-use crate::frame_alloc::FrameAllocRef;
-use crate::mm::page_cache::{AddressSpaceOps, FileId, PAGE_SIZE};
-use crate::storage::{BlockDevice, get_blkdev};
-use crate::{FRAME_ALLOCATOR, PAGE_CACHE};
+use super::file::{File, FileOps, seek};
 
-// ============================================================================
-// Block Device Address Space Operations
-// ============================================================================
+/// Block device ioctls (Linux include/uapi/linux/fs.h)
+pub mod ioc {
+    pub const BLKROGET: u32 = 0x125e;
+    pub const BLKRRPART: u32 = 0x125f;
+    pub const BLKGETSIZE: u32 = 0x1260;
+    pub const BLKFLSBUF: u32 = 0x1261;
+    pub const BLKSSZGET: u32 = 0x1268;
+    pub const BLKBSZGET: u32 = 0x8008_1270;
+    pub const BLKBSZSET: u32 = 0x4008_1271;
+    pub const BLKGETSIZE64: u32 = 0x8008_1272;
+    pub const BLKPBSZGET: u32 = 0x127b;
+}
 
-/// Block device address space operations.
-///
-/// Implements page I/O for block devices. For RAM disk (can_writeback=false),
-/// writepage is never called since dirty pages are permanent storage.
-///
-/// ## Locking Context
-///
-/// - Called with per-page lock held (CachedPage.locked)
-/// - PAGE_CACHE mutex is NOT held - must not be acquired
-/// - May acquire block device queue locks for actual I/O
-pub struct BlkdevAddressSpaceOps;
+/// Block device file operations
+pub struct BlockFileOps;
 
-impl AddressSpaceOps for BlkdevAddressSpaceOps {
-    fn readpage(&self, _file_id: FileId, _page_offset: u64, buf: &mut [u8]) -> Result<usize, i32> {
-        // For ramdisk: new pages start as zeros
-        // For real disk: this would submit a read bio to the block device
-        //
-        // Currently we only have ramdisk, so just zero the buffer.
-        // When we add real block devices (AHCI, NVMe), this will:
-        // 1. Get the BlockDevice from file_id
-        // 2. Create a bio for the read
-        // 3. Submit to the device and wait for completion
-        buf.fill(0);
-        Ok(buf.len())
+/// Static block file ops instance
+pub static BLOCK_FILE_OPS: BlockFileOps = BlockFileOps;
+
+fn bdev(file: &File) -> Result<Arc<BlockDevice>, KernelError> {
+    file.private_arc::<BlockDevice>()
+        .ok_or(KernelError::NoDeviceOrAddress)
+}
+
+/// Read at `pos`: short at the end, 0 past it (Linux blkdev_read_iter)
+fn read_at(file: &File, buf: &mut [u8], pos: u64) -> Result<usize, KernelError> {
+    let b = bdev(file)?;
+    let size = b.capacity();
+    if pos >= size || buf.is_empty() {
+        return Ok(0);
     }
+    let n = buf.len().min((size - pos) as usize);
+    bdev_rw_bytes(&b, BioOp::Read, pos, &mut buf[..n])?;
+    Ok(n)
+}
 
-    fn writepage(&self, _file_id: FileId, _page_offset: u64, buf: &[u8]) -> Result<usize, i32> {
-        // For ramdisk: can_writeback=false, so this is never called
-        // For real disk: this would submit a write bio to the block device
-        //
-        // Currently we only have ramdisk which uses can_writeback=false.
-        // When we add real block devices, this will:
-        // 1. Get the BlockDevice from file_id
-        // 2. Create a bio for the write
-        // 3. Submit to the device and wait for completion
-        Ok(buf.len())
+/// Write at `pos`: EPERM if read-only, ENOSPC at or past the end, short
+/// at it (Linux blkdev_write_iter)
+fn write_at(file: &File, buf: &[u8], pos: u64) -> Result<usize, KernelError> {
+    let b = bdev(file)?;
+    if b.ro() {
+        return Err(KernelError::NotPermitted);
+    }
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let size = b.capacity();
+    if pos >= size {
+        return Err(KernelError::NoSpace);
+    }
+    let n = buf.len().min((size - pos) as usize);
+    let mut tmp = alloc::vec::Vec::from(&buf[..n]);
+    bdev_rw_bytes(&b, BioOp::Write, pos, &mut tmp)?;
+    Ok(n)
+}
+
+fn put_int(arg: u64, v: i32) -> Result<i64, KernelError> {
+    put_user::<Uaccess, i32>(arg, v).map_err(|_| KernelError::BadAddress)?;
+    Ok(0)
+}
+
+fn put_u64(arg: u64, v: u64) -> Result<i64, KernelError> {
+    put_user::<Uaccess, u64>(arg, v).map_err(|_| KernelError::BadAddress)?;
+    Ok(0)
+}
+
+fn need_admin() -> Result<(), KernelError> {
+    if crate::task::capable(crate::task::CAP_SYS_ADMIN) {
+        Ok(())
+    } else {
+        Err(KernelError::PermissionDenied)
     }
 }
 
-/// Global block device address space ops instance
-pub static BLKDEV_AOPS: BlkdevAddressSpaceOps = BlkdevAddressSpaceOps;
-
-use super::file::{File, FileOps, seek};
-use crate::error::KernelError;
-
-/// Block device file operations
-///
-/// Implements FileOps for block special files, routing I/O through
-/// the page cache for caching and the block layer for actual I/O.
-pub struct BlockFileOps;
-
-impl BlockFileOps {
-    /// Get the BlockDevice from a file's inode rdev
-    fn get_bdev(file: &File) -> Result<Arc<BlockDevice>, KernelError> {
-        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
-        get_blkdev(inode.rdev).ok_or(KernelError::NotFound)
-    }
-
-    /// Get FileId for a block device's page cache
-    fn file_id_for_bdev(bdev: &BlockDevice) -> FileId {
-        let dev_id = bdev.dev_id();
-        FileId::from_blkdev(dev_id.major, dev_id.minor)
-    }
-
-    /// Get or allocate a page from the page cache for a block device
-    ///
-    /// Returns the page frame address. The page is guaranteed to be
-    /// in the cache after this call.
-    ///
-    /// Uses `find_or_create_page()` to atomically find or create the page,
-    /// preventing the TOCTOU race that could occur with separate lookup and add.
-    fn get_page(bdev: &BlockDevice, page_offset: u64) -> Result<u64, KernelError> {
-        let file_id = Self::file_id_for_bdev(bdev);
-        let capacity = bdev.capacity();
-
-        // Atomically find or create the page (single lock acquisition)
-        let mut cache = PAGE_CACHE.lock();
-        let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-        // For RAM disk with can_writeback = false, dirty pages are never evicted
-        // This makes the page cache the actual storage
-        let can_writeback = false; // RAM disk: page cache IS the storage
-        let unevictable = false; // Block device pages can still be evicted if clean
-
-        let (page, _is_new) = cache.find_or_create_page(
-            file_id,
-            page_offset,
-            capacity,
-            &mut frame_alloc,
-            can_writeback,
-            unevictable,
-            &BLKDEV_AOPS,
-        )?;
-
-        Ok(page.frame)
-    }
-
-    /// Mark a page as dirty in the cache
-    fn mark_page_dirty(bdev: &BlockDevice, page_offset: u64) {
-        let file_id = Self::file_id_for_bdev(bdev);
-
-        let cache = PAGE_CACHE.lock();
-        if let Some(page) = cache.find_get_page(file_id, page_offset) {
-            page.mark_dirty();
-            // Decrement the refcount we just added with find_get_page
-            cache.put_page(&page);
+/// Linux blkdev_common_ioctl / blkdev_ioctl subset
+fn blkdev_ioctl(b: &BlockDevice, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+    match cmd {
+        ioc::BLKROGET => put_int(arg, b.ro() as i32),
+        ioc::BLKSSZGET => put_int(arg, b.logical_block_size() as i32),
+        ioc::BLKPBSZGET => put_int(arg, b.physical_block_size() as i32),
+        ioc::BLKBSZGET => put_int(arg, b.block_size() as i32),
+        ioc::BLKGETSIZE => put_u64(arg, b.nr_sects()),
+        ioc::BLKGETSIZE64 => put_u64(arg, b.nr_sects() << SECTOR_SHIFT),
+        ioc::BLKBSZSET => {
+            need_admin()?;
+            if arg == 0 {
+                return Err(KernelError::InvalidArgument);
+            }
+            let n = get_user::<Uaccess, i32>(arg).map_err(|_| KernelError::BadAddress)?;
+            b.set_block_size(n).map(|_| 0)
         }
+        ioc::BLKRRPART => {
+            need_admin()?;
+            genhd::rescan(b).map(|_| 0)
+        }
+        // No buffer cache to write back or drop yet
+        ioc::BLKFLSBUF => need_admin().map(|_| 0),
+        _ => Err(KernelError::NotTty),
     }
 }
 
@@ -139,233 +124,73 @@ impl FileOps for BlockFileOps {
         self
     }
 
+    /// The device's page cache maps (Linux blkdev_mmap)
+    fn mmap(&self, _file: &File) -> Result<(), KernelError> {
+        Ok(())
+    }
+
+    /// Bind the file to its block device (Linux blkdev_open)
+    fn open(&self, file: &File) -> Result<(), KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        let b = get_blkdev(inode.rdev).ok_or(KernelError::NoDeviceOrAddress)?;
+        b.open()?;
+        file.private.call_once(|| b);
+        Ok(())
+    }
+
+    fn release(&self, file: &File) -> Result<(), KernelError> {
+        if let Some(b) = file.private_arc::<BlockDevice>() {
+            b.release();
+        }
+        Ok(())
+    }
+
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {
-        let bdev = Self::get_bdev(file)?;
-        let pos = file.get_pos();
-        let capacity = bdev.capacity();
-
-        // EOF check
-        if pos >= capacity {
-            return Ok(0);
-        }
-
-        let available = (capacity - pos) as usize;
-        let to_read = min(buf.len(), available);
-
-        if to_read == 0 {
-            return Ok(0);
-        }
-
-        let mut bytes_read = 0;
-
-        while bytes_read < to_read {
-            let current_pos = pos + bytes_read as u64;
-            let page_offset = current_pos / PAGE_SIZE as u64;
-            let offset_in_page = (current_pos % PAGE_SIZE as u64) as usize;
-            let chunk_size = min(PAGE_SIZE - offset_in_page, to_read - bytes_read);
-
-            // Get the page from cache (allocates if needed)
-            let frame = Self::get_page(&bdev, page_offset)?;
-
-            // Copy data from page to user buffer
-            unsafe {
-                let src = (crate::arch::phys_to_virt(frame) as *const u8).add(offset_in_page);
-                core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
-            }
-
-            bytes_read += chunk_size;
-        }
-
-        // Advance file position
-        file.advance_pos(bytes_read as u64);
-
-        Ok(bytes_read)
+        let n = read_at(file, buf, file.get_pos())?;
+        file.advance_pos(n as u64);
+        Ok(n)
     }
 
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize, KernelError> {
-        let bdev = Self::get_bdev(file)?;
-        let pos = file.get_pos();
-        let capacity = bdev.capacity();
-
-        // Cannot write past end of block device
-        if pos >= capacity {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        let available = (capacity - pos) as usize;
-        let to_write = min(buf.len(), available);
-
-        if to_write == 0 {
-            return Ok(0);
-        }
-
-        let mut bytes_written = 0;
-
-        while bytes_written < to_write {
-            let current_pos = pos + bytes_written as u64;
-            let page_offset = current_pos / PAGE_SIZE as u64;
-            let offset_in_page = (current_pos % PAGE_SIZE as u64) as usize;
-            let chunk_size = min(PAGE_SIZE - offset_in_page, to_write - bytes_written);
-
-            // Get the page from cache (allocates if needed)
-            let frame = Self::get_page(&bdev, page_offset)?;
-
-            // Copy data from user buffer to page
-            unsafe {
-                let dst = crate::arch::phys_to_virt(frame).add(offset_in_page);
-                core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
-            }
-
-            // Mark page as dirty
-            Self::mark_page_dirty(&bdev, page_offset);
-
-            bytes_written += chunk_size;
-        }
-
-        // Advance file position
-        file.advance_pos(bytes_written as u64);
-
-        Ok(bytes_written)
+        let n = write_at(file, buf, file.get_pos())?;
+        file.advance_pos(n as u64);
+        Ok(n)
     }
 
     fn pread(&self, file: &File, buf: &mut [u8], offset: u64) -> Result<usize, KernelError> {
-        let bdev = Self::get_bdev(file)?;
-        let pos = offset;
-        let capacity = bdev.capacity();
-
-        // EOF check
-        if pos >= capacity {
-            return Ok(0);
-        }
-
-        let available = (capacity - pos) as usize;
-        let to_read = min(buf.len(), available);
-
-        if to_read == 0 {
-            return Ok(0);
-        }
-
-        let mut bytes_read = 0;
-
-        while bytes_read < to_read {
-            let current_pos = pos + bytes_read as u64;
-            let page_offset = current_pos / PAGE_SIZE as u64;
-            let offset_in_page = (current_pos % PAGE_SIZE as u64) as usize;
-            let chunk_size = min(PAGE_SIZE - offset_in_page, to_read - bytes_read);
-
-            // Get the page from cache (allocates if needed)
-            let frame = Self::get_page(&bdev, page_offset)?;
-
-            // Copy data from page to user buffer
-            unsafe {
-                let src = (crate::arch::phys_to_virt(frame) as *const u8).add(offset_in_page);
-                core::ptr::copy_nonoverlapping(src, buf[bytes_read..].as_mut_ptr(), chunk_size);
-            }
-
-            bytes_read += chunk_size;
-        }
-
-        // NOTE: Unlike read(), we do NOT advance file position
-        Ok(bytes_read)
+        read_at(file, buf, offset)
     }
 
     fn pwrite(&self, file: &File, buf: &[u8], offset: u64) -> Result<usize, KernelError> {
-        let bdev = Self::get_bdev(file)?;
-        let pos = offset;
-        let capacity = bdev.capacity();
-
-        // Cannot write past end of block device
-        if pos >= capacity {
-            return Err(KernelError::InvalidArgument);
-        }
-
-        let available = (capacity - pos) as usize;
-        let to_write = min(buf.len(), available);
-
-        if to_write == 0 {
-            return Ok(0);
-        }
-
-        let mut bytes_written = 0;
-
-        while bytes_written < to_write {
-            let current_pos = pos + bytes_written as u64;
-            let page_offset = current_pos / PAGE_SIZE as u64;
-            let offset_in_page = (current_pos % PAGE_SIZE as u64) as usize;
-            let chunk_size = min(PAGE_SIZE - offset_in_page, to_write - bytes_written);
-
-            // Get the page from cache (allocates if needed)
-            let frame = Self::get_page(&bdev, page_offset)?;
-
-            // Copy data from user buffer to page
-            unsafe {
-                let dst = crate::arch::phys_to_virt(frame).add(offset_in_page);
-                core::ptr::copy_nonoverlapping(buf[bytes_written..].as_ptr(), dst, chunk_size);
-            }
-
-            // Mark page as dirty
-            Self::mark_page_dirty(&bdev, page_offset);
-
-            bytes_written += chunk_size;
-        }
-
-        // NOTE: Unlike write(), we do NOT advance file position
-        Ok(bytes_written)
+        write_at(file, buf, offset)
     }
 
+    /// Positions within the device only (Linux fixed_size_llseek)
     fn llseek(&self, file: &File, offset: i64, whence: i32) -> Result<u64, KernelError> {
-        let bdev = Self::get_bdev(file)?;
-        let capacity = bdev.capacity();
-
-        let new_pos = match whence {
-            seek::SEEK_SET => {
-                if offset < 0 {
-                    return Err(KernelError::InvalidArgument);
-                }
-                offset as u64
-            }
-            seek::SEEK_CUR => {
-                let cur = file.get_pos();
-                if offset < 0 {
-                    cur.checked_sub((-offset) as u64)
-                        .ok_or(KernelError::InvalidArgument)?
-                } else {
-                    cur.saturating_add(offset as u64)
-                }
-            }
-            seek::SEEK_END => {
-                if offset > 0 {
-                    capacity.saturating_add(offset as u64)
-                } else {
-                    capacity
-                        .checked_sub((-offset) as u64)
-                        .ok_or(KernelError::InvalidArgument)?
-                }
-            }
+        let size = bdev(file)?.capacity() as i64;
+        if whence == seek::SEEK_CUR && offset == 0 {
+            return Ok(file.get_pos());
+        }
+        let base = match whence {
+            seek::SEEK_SET => 0,
+            seek::SEEK_CUR => file.get_pos() as i64,
+            seek::SEEK_END => size,
             _ => return Err(KernelError::InvalidArgument),
         };
-
-        file.set_pos(new_pos);
-        Ok(new_pos)
+        let pos = base
+            .checked_add(offset)
+            .filter(|p| (0..=size).contains(p))
+            .ok_or(KernelError::InvalidArgument)?;
+        file.set_pos(pos as u64);
+        Ok(pos as u64)
     }
 
+    /// Data is written through; make it durable (Linux blkdev_fsync)
     fn fsync(&self, file: &File) -> Result<(), KernelError> {
-        use crate::mm::writeback::{WritebackControl, do_writepages_for_file, wait_on_writeback};
+        blkdev_issue_flush(&*bdev(file)?)
+    }
 
-        let bdev = Self::get_bdev(file)?;
-        let file_id = Self::file_id_for_bdev(&bdev);
-
-        // Write all dirty pages using the writeback module
-        // (proper writeback flag tracking and async I/O support)
-        let mut wbc = WritebackControl::for_fsync();
-        do_writepages_for_file(file_id, &mut wbc).map_err(|_| KernelError::Io)?;
-
-        // Wait for all writeback to complete
-        wait_on_writeback(file_id);
-
-        Ok(())
+    fn ioctl(&self, file: &File, cmd: u32, arg: u64) -> Result<i64, KernelError> {
+        blkdev_ioctl(&*bdev(file)?, cmd, arg)
     }
 }
-
-/// Static block file ops instance
-pub static BLOCK_FILE_OPS: BlockFileOps = BlockFileOps;

@@ -3,11 +3,10 @@
 //! This module provides per-CPU data storage accessed via the GS segment.
 //! Each CPU has its own `PerCpu` structure containing CPU-local state.
 
-use crate::task::CurrentTask;
-use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-/// Maximum number of CPUs supported
-pub const MAX_CPUS: usize = 16;
+/// Per-CPU data slots (logical CPU ids are below this)
+pub const MAX_CPUS: usize = crate::cpumask::NR_CPUS;
 
 /// Per-CPU data structure
 ///
@@ -36,8 +35,9 @@ pub struct PerCpu {
     /// Timer tick count for this CPU
     pub ticks: AtomicU64,
 
-    /// Currently running task TID (0 = none/idle)
-    pub current_tid: AtomicU32,
+    /// The running task (`*const KernelTask`; 0: the boot task,
+    /// `task::percpu::INIT_TASK`), set by the scheduler at each switch
+    pub curr: AtomicUsize,
 
     /// Flag set by timer interrupt to request reschedule
     pub needs_reschedule: AtomicBool,
@@ -54,9 +54,6 @@ pub struct PerCpu {
     ///
     /// Preemption is only allowed when this reaches 0 and need_resched is set.
     pub preempt_count: AtomicU32,
-
-    /// Current task state including credentials (arch-neutral)
-    pub current_task: CurrentTask,
 
     /// Saved user RIP from syscall entry (RCX register)
     /// Used by clone() to set up child's return address
@@ -203,11 +200,10 @@ impl PerCpu {
             is_online: AtomicBool::new(false),
             kernel_stack_top: 0,
             ticks: AtomicU64::new(0),
-            current_tid: AtomicU32::new(0),
+            curr: AtomicUsize::new(0),
             needs_reschedule: AtomicBool::new(false),
             interrupt_depth: AtomicU32::new(0),
             preempt_count: AtomicU32::new(0),
-            current_task: CurrentTask::new(),
             syscall_user_rip: 0,
             syscall_user_rflags: 0,
             syscall_user_rsp: 0,
@@ -234,17 +230,17 @@ impl PerCpu {
 
     /// Initialize the PerCpu structure
     pub fn init(&mut self, cpu_id: u32, apic_id: u32, is_bsp: bool, kernel_stack_top: u64) {
+        set_tsc_aux(cpu_id);
         self.self_ptr = self as *mut PerCpu;
         self.cpu_id = cpu_id;
         self.apic_id = apic_id;
         self.is_bsp = is_bsp;
         self.kernel_stack_top = kernel_stack_top;
         self.ticks.store(0, Ordering::Relaxed);
-        self.current_tid.store(0, Ordering::Relaxed);
+        self.curr.store(0, Ordering::Relaxed);
         self.needs_reschedule.store(false, Ordering::Relaxed);
         self.interrupt_depth.store(0, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
-        self.current_task = CurrentTask::new();
         self.syscall_user_rip = 0;
         self.syscall_user_rflags = 0;
         self.syscall_user_rsp = 0;
@@ -324,6 +320,7 @@ pub fn init_bsp(apic_id: u8, kernel_stack_top: u64) {
 
     // Set GS base to point to our per-CPU data
     set_gs_base(percpu as *mut PerCpu as u64);
+    crate::task::percpu::PERCPU_UP.store(true, Ordering::Release);
 
     // Mark BSP as online
     percpu.set_online();
@@ -354,6 +351,52 @@ pub fn init_ap(apic_id: u8, kernel_stack_top: u64) -> u32 {
 /// Get the number of online CPUs
 pub fn online_cpu_count() -> u32 {
     CPU_COUNT.load(Ordering::Acquire)
+}
+
+/// IA32_TSC_AUX: this CPU's index (Linux keeps cpu | node << 12 there for
+/// RDTSCP/RDPID getcpu); read back by `restore_kernel_gs`
+const MSR_TSC_AUX: u32 = 0xC0000103;
+
+/// Record this CPU's index in TSC_AUX (user code cannot write it)
+fn set_tsc_aux(cpu_id: u32) {
+    // SAFETY: TSC_AUX exists (RDTSCP checked at boot)
+    unsafe {
+        ::core::arch::asm!(
+            "wrmsr",
+            in("ecx") MSR_TSC_AUX,
+            in("eax") cpu_id,
+            in("edx") 0u32,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Reload GS base with this CPU's per-CPU pointer, found from TSC_AUX
+/// (entry stubs, registers saved; clobbers rax, rcx, rdx and flags).
+///
+/// hk does not use SWAPGS yet: the kernel's per-CPU pointer is the live
+/// GS base, and a user `mov gs, sel` replaces it with the descriptor's
+/// base (0). Every kernel entry (syscall and every IDT stub, from user
+/// or kernel mode: an NMI or fault may land before another entry's
+/// restore) puts it back before any Rust code runs and before
+/// interrupts are enabled; it is idempotent.
+#[unsafe(naked)]
+pub unsafe extern "C" fn restore_kernel_gs() {
+    core::arch::naked_asm!(
+        "rdtscp",
+        "mov eax, ecx",
+        "imul rax, rax, {size}",
+        "lea rcx, [rip + {array}]",
+        "add rax, rcx",
+        "mov rdx, rax",
+        "shr rdx, 32",
+        "mov ecx, {msr}",
+        "wrmsr",
+        "ret",
+        size = const core::mem::size_of::<PerCpu>(),
+        array = sym PERCPU_ARRAY,
+        msr = const 0xC0000101u32,
+    );
 }
 
 /// Set the GS base register (MSR 0xC0000101)
@@ -397,7 +440,14 @@ pub const MSR_FS_BASE: u32 = 0xC0000100;
 /// Set the FS base register (user TLS pointer)
 ///
 /// This is used for user-space thread-local storage. The FS segment
-/// register's base address is set via this MSR on x86_64.
+/// register's base address is set via this MSR on x86_64. `addr` must
+/// pass `fs_base_ok` (a non-canonical base #GPs the WRMSR).
+/// A user FS/GS base must lie below TASK_SIZE_MAX (Linux
+/// do_arch_prctl_64, putreg)
+pub fn fs_base_ok(addr: u64) -> bool {
+    addr < crate::arch::x86_64::paging::TASK_SIZE
+}
+
 pub fn write_fs_base(addr: u64) {
     unsafe {
         ::core::arch::asm!(
@@ -771,33 +821,27 @@ pub fn store_user_regs_to_trapframe(f: &mut super::X86_64TrapFrame) {
 // ============================================================================
 
 use crate::arch::PerCpuOps;
-use crate::task::Tid;
 
 use super::X86_64Arch;
 
 impl PerCpuOps for X86_64Arch {
-    const MAX_CPUS: usize = MAX_CPUS;
-
     #[inline]
     fn try_current_cpu_id() -> Option<u32> {
         try_current_cpu().map(|percpu| percpu.cpu_id)
     }
 
     #[inline]
-    fn current_tid() -> Tid {
-        try_current_cpu()
-            .map(|percpu| percpu.current_tid.load(Ordering::Relaxed) as Tid)
-            .unwrap_or(0)
+    fn current_task_ptr() -> usize {
+        match try_current_cpu() {
+            Some(p) => p.curr.load(Ordering::Relaxed),
+            None => crate::task::percpu::no_percpu_task(),
+        }
     }
 
     #[inline]
-    fn set_current_tid(tid: Tid) {
-        if try_current_cpu().is_some() {
-            unsafe {
-                current_cpu_mut()
-                    .current_tid
-                    .store(tid as u32, Ordering::Relaxed);
-            }
+    fn set_current_task_ptr(t: usize) {
+        if let Some(p) = try_current_cpu() {
+            p.curr.store(t, Ordering::Relaxed);
         }
     }
 
@@ -831,25 +875,6 @@ impl PerCpuOps for X86_64Arch {
         try_current_cpu()
             .map(|percpu| percpu.interrupt_depth.load(Ordering::Relaxed))
             .unwrap_or(0)
-    }
-
-    #[inline]
-    fn get_current_task() -> CurrentTask {
-        try_current_cpu()
-            .map(|percpu| percpu.current_task)
-            .unwrap_or_default()
-    }
-
-    #[inline]
-    fn set_current_task(task: &CurrentTask) {
-        if try_current_cpu().is_some() {
-            unsafe {
-                current_cpu_mut().current_task.set(
-                    task.tid, task.pid, task.ppid, task.pgid, task.sid, task.cred,
-                );
-                current_cpu_mut().current_task.exiting = task.exiting;
-            }
-        }
     }
 
     #[inline]

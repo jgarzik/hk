@@ -262,3 +262,37 @@ pub fn sys_close(fd: i32) -> i64 {
         KernelError::BadFd.sysret()
     }
 }
+
+/// close_range(2) flags
+pub const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+pub const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+
+/// close_range(fd, max_fd, flags) (Linux fs/file.c): close, or with
+/// CLOSE_RANGE_CLOEXEC mark close-on-exec, the open descriptors in
+/// fd..=max_fd; CLOSE_RANGE_UNSHARE first gives the caller a private
+/// table, so threads sharing the old one keep their descriptors
+pub fn sys_close_range(fd: u32, max_fd: u32, flags: u32) -> i64 {
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || fd > max_fd {
+        return KernelError::InvalidArgument.sysret();
+    }
+    let files = if flags & CLOSE_RANGE_UNSHARE != 0 {
+        match crate::task::fdtable::unshare_task_fd(crate::task::percpu::current_tid()) {
+            Some(f) => f,
+            None => return KernelError::BadFd.sysret(),
+        }
+    } else {
+        current_fd_table()
+    };
+    // Descriptors are i32: nothing is open above i32::MAX
+    let Ok(lo) = i32::try_from(fd) else {
+        return 0;
+    };
+    let hi = i32::try_from(max_fd).unwrap_or(i32::MAX);
+    let mut t = files.lock();
+    if flags & CLOSE_RANGE_CLOEXEC != 0 {
+        t.cloexec_range(lo, hi);
+    } else {
+        t.close_range(lo, hi);
+    }
+    0
+}

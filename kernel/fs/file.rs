@@ -21,7 +21,8 @@ use crate::sync;
 use super::KernelError;
 use super::dentry::Dentry;
 use super::inode::{FileType, Inode, InodeId};
-use super::mount::{Mount, current_mnt_ns};
+use super::mount::Mount;
+use crate::ns::current_mnt_ns;
 use crate::poll::{
     DEFAULT_POLLMASK, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, PollTable,
 };
@@ -229,6 +230,12 @@ pub trait FileOps: Send + Sync {
         Err(KernelError::NotDirectory)
     }
 
+    /// May the file be mapped (Linux: f_op->mmap exists and accepts
+    /// it)? Default: no mmap, ENODEV from mmap(2)
+    fn mmap(&self, _file: &File) -> Result<(), KernelError> {
+        Err(KernelError::NoDevice)
+    }
+
     /// Sync file data to backing store
     fn fsync(&self, _file: &File) -> Result<(), KernelError> {
         Ok(())
@@ -401,6 +408,30 @@ impl File {
             f_cred: crate::task::current_cred(),
             private: spin::Once::new(),
         }
+    }
+
+    /// An anonymous-inode file whose shared state lives in `private`
+    /// (Linux anon_inode_getfile priv): the ops stay static, and the
+    /// state goes with the last reference to the file
+    pub fn new_anon(
+        dentry: Arc<Dentry>,
+        flags: u32,
+        f_op: &'static dyn FileOps,
+        private: Arc<dyn core::any::Any + Send + Sync>,
+    ) -> Self {
+        let f = Self::new(dentry, flags, f_op);
+        f.private.call_once(|| private);
+        f
+    }
+
+    /// The per-open state, if it is a `T`
+    pub fn private_ref<T: core::any::Any>(&self) -> Option<&T> {
+        self.private.get()?.downcast_ref::<T>()
+    }
+
+    /// A reference to the per-open state, if it is a `T`
+    pub fn private_arc<T: core::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.private.get()?.clone().downcast::<T>().ok()
     }
 
     /// Get the inode for this file
@@ -735,6 +766,14 @@ impl CharDevFileOps {
 impl FileOps for CharDevFileOps {
     fn as_any(&self) -> &dyn core::any::Any {
         self
+    }
+
+    fn mmap(&self, file: &File) -> Result<(), KernelError> {
+        let inode = file.get_inode().ok_or(KernelError::BadFd)?;
+        match get_chardev(inode.rdev) {
+            Some(d) if d.mmap_ok() => Ok(()),
+            _ => Err(KernelError::NoDevice),
+        }
     }
 
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize, KernelError> {

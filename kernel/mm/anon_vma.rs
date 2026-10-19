@@ -1,24 +1,29 @@
-//! Anonymous VMA tracking for reverse mapping
+//! Anonymous VMA chains for the reverse map (Linux mm/rmap.c anon_vma)
 //!
-//! When a process forks, both parent and child map the same anonymous pages
-//! (with copy-on-write semantics). The anon_vma structure tracks all VMAs
-//! that share these pages, enabling efficient reverse mapping lookups when
-//! we need to swap out a page.
+//! Every private anonymous VMA has an [`AnonVma`]; fork's copies of it
+//! and the pieces of a split share it. Its chain lists each VMA that
+//! may map its pages ([`Avc`], Linux anon_vma_chain): the address space,
+//! the VMA's range and its page offset `pgoff` (Linux vm_pgoff). An
+//! anonymous page records its AnonVma (`Page.mapping`, holding a
+//! reference until the page is freed) and its linear index
+//! (`Page.index` = pgoff + (address - start) / 4KB at fault time,
+//! Linux linear_page_index); a VMA that maps it has it at
+//! `start + (index - pgoff) * 4KB`, so the reverse map finds each
+//! mapping without searching (Linux vma_address). mremap moves a VMA
+//! with its pgoff, so its pages keep their index.
 //!
-//! ## Design (following Linux's anon_vma)
+//! Locking (Linux anon_vma->rwsem): the chain is a sleeping `RwSem`.
+//! Every change of a VMA that has one (insert, split, merge, grow,
+//! shrink, removal, an mlock change) updates its entry under the
+//! write lock, from `MmStruct` with the mmap_lock held for writing
+//! (mmap_lock -> anon_vma lock). The reverse map reads it, holding it
+//! across its page-table accesses: unmapping a VMA, and exit, unlink
+//! it (write lock) before freeing its page tables, so a walk never
+//! reaches a freed table. Order: mmap_lock -> anon_vma lock -> PTE lock.
 //!
-//! - Each private anonymous VMA gets an associated `AnonVma` when created
-//! - On fork, the child's VMA links to the parent's `AnonVma`
-//! - The `AnonVma` maintains a list of all VMAs that may contain mappings
-//!   to pages from the original allocation
-//! - When swapping out a page, we use the page's `AnonVma` to find all VMAs
-//!   that might map it, then walk each VMA's page table to find the PTE
-//!
-//! ## Differences from Linux
-//!
-//! Linux uses a more complex anon_vma_chain system with interval trees for
-//! scalability with many forks. We use a simpler linear list which is
-//! sufficient for our use case and easier to understand.
+//! Deviation from Linux: one AnonVma per family of VMAs (fork shares
+//! the parent's instead of chaining a child one under it), and the chain
+//! is a vector, not an interval tree.
 
 extern crate alloc;
 
@@ -27,253 +32,137 @@ use alloc::vec::Vec;
 
 use super::Mm;
 
-use crate::sync::spin::Mutex;
+/// The chain's lock: a sleeping RwSem; host tests, which cannot
+/// schedule, use a spinning one with the same interface
+#[cfg(not(test))]
+type ChainLock = crate::sync::RwSem<Vec<Avc>>;
+#[cfg(test)]
+type ChainLock = crate::sync::spin::RwLock<Vec<Avc>>;
 
-// ============================================================================
-// AnonVma
-// ============================================================================
-
-/// Anonymous VMA container
-///
-/// Links all VMAs that may share anonymous pages from a common ancestor.
-/// Used for reverse mapping during swap-out.
-pub struct AnonVma {
-    /// Lock protecting the VMA list
-    inner: Mutex<AnonVmaInner>,
-}
-
-struct AnonVmaInner {
-    /// List of VMAs sharing this anon_vma
-    /// Each entry identifies a VMA by (root, vma_start, vma_end)
-    vmas: Vec<AnonVmaChain>,
-}
-
-/// Links a VMA to its anon_vma
-///
-/// We store the address space's top-level table and the VMA range rather
-/// than pointers to avoid lifetime issues. The entries of an address
-/// space are removed before its tables are freed (exit_mmap, munmap).
+/// One VMA that may map pages of an AnonVma (Linux anon_vma_chain)
 #[derive(Clone, Debug)]
-pub struct AnonVmaChain {
-    /// The address space holding the VMA (an mm_count reference only
-    /// when upgraded: a chain never keeps an address space alive), for
-    /// the TLB flush of an entry rmap changes
+pub struct Avc {
+    /// The address space (an mm_count reference only when upgraded: a
+    /// chain never keeps an address space alive)
     pub mm: Weak<Mm>,
-    /// Top-level page table of the address space holding the VMA
-    pub root: u64,
-    /// VMA start address (used to locate VMA in task's mm)
-    pub vma_start: u64,
-    /// VMA end address
-    pub vma_end: u64,
+    /// Its top-level table: names the address space in the chain
+    pub pgd: u64,
+    /// The VMA's range
+    pub start: u64,
+    pub end: u64,
+    /// Page index of `start` (Linux vm_pgoff)
+    pub pgoff: u64,
+    /// The VMA is memory-locked (VM_LOCKED): its pages are not reclaimed
+    pub locked: bool,
+}
+
+impl Avc {
+    /// The address of page `index` in this VMA, if it lies there
+    pub fn address(&self, index: u64) -> Option<u64> {
+        let off = index.checked_sub(self.pgoff)?;
+        let addr = self.start.checked_add(off.checked_mul(4096)?)?;
+        (addr < self.end).then_some(addr)
+    }
+}
+
+/// The reverse map of a family of anonymous VMAs (Linux struct anon_vma)
+pub struct AnonVma {
+    chain: ChainLock,
 }
 
 impl AnonVma {
-    /// Create a new empty anon_vma
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(AnonVmaInner { vmas: Vec::new() }),
-        })
+        Arc::new(Self::default())
     }
 
-    /// Register a VMA with this anon_vma
-    ///
-    /// Called when:
-    /// - A new anonymous VMA is created (mmap with MAP_ANONYMOUS|MAP_PRIVATE)
-    /// - A VMA is inherited during fork
-    ///
-    /// # Arguments
-    /// * `mm` - The address space
-    /// * `root` - Its top-level page table
-    /// * `vma_start` - Start address of the VMA
-    /// * `vma_end` - End address of the VMA
-    pub fn add_vma(&self, mm: Weak<Mm>, root: u64, vma_start: u64, vma_end: u64) {
-        let mut inner = self.inner.lock();
+    /// Add a VMA's entry (Linux anon_vma_chain_link)
+    pub fn link(&self, avc: Avc) {
+        self.chain.write().push(avc);
+    }
 
-        // Don't add duplicates
-        let dup = inner
-            .vmas
-            .iter()
-            .any(|c| c.root == root && c.vma_start == vma_start && c.vma_end == vma_end);
-        if !dup {
-            inner.vmas.push(AnonVmaChain {
-                mm,
-                root,
-                vma_start,
-                vma_end,
-            });
+    /// Drop the entry of the VMA at `start` of the address space `pgd`
+    /// (Linux unlink_anon_vmas)
+    pub fn unlink(&self, pgd: u64, start: u64) {
+        self.chain
+            .write()
+            .retain(|c| !(c.pgd == pgd && c.start == start));
+    }
+
+    /// Change the entry of the VMA at `start` of `pgd` (a VMA split,
+    /// merged, grown or relocked)
+    pub fn update(&self, pgd: u64, start: u64, f: impl FnOnce(&mut Avc)) {
+        let mut chain = self.chain.write();
+        if let Some(c) = chain.iter_mut().find(|c| c.pgd == pgd && c.start == start) {
+            f(c);
         }
     }
 
-    /// Unregister a VMA from this anon_vma
-    ///
-    /// Called when:
-    /// - VMA is unmapped (munmap)
-    /// - Task exits
-    /// - VMA is replaced (mremap with MREMAP_FIXED)
-    ///
-    /// # Arguments
-    /// * `root` - Top-level page table of the address space
-    /// * `vma_start` - Start address of the VMA
-    pub fn remove_vma(&self, root: u64, vma_start: u64) {
-        let mut inner = self.inner.lock();
-        inner
-            .vmas
-            .retain(|c| !(c.root == root && c.vma_start == vma_start));
+    /// The chain, for a reverse-map walk (Linux anon_vma_lock_read)
+    pub fn read(&self) -> impl core::ops::Deref<Target = Vec<Avc>> + '_ {
+        self.chain.read()
     }
 
-    /// Drop every entry of the address space rooted at `root` (its
-    /// mappings are going away)
-    pub fn remove_root(&self, root: u64) {
-        self.inner.lock().vmas.retain(|c| c.root != root);
+    /// Entries in the chain
+    pub fn len(&self) -> usize {
+        self.chain.read().len()
     }
 
-    /// Update VMA bounds (e.g., after mremap resize)
-    ///
-    /// # Arguments
-    /// * `root` - Top-level page table of the address space
-    /// * `old_start` - Original start address
-    /// * `new_start` - New start address
-    /// * `new_end` - New end address
-    pub fn update_vma(&self, root: u64, old_start: u64, new_start: u64, new_end: u64) {
-        let mut inner = self.inner.lock();
-        for chain in inner.vmas.iter_mut() {
-            if chain.root == root && chain.vma_start == old_start {
-                chain.vma_start = new_start;
-                chain.vma_end = new_end;
-                break;
-            }
-        }
-    }
-
-    /// Get all VMAs registered with this anon_vma
-    ///
-    /// Returns a clone of the VMA list for iteration during rmap_walk.
-    /// The clone allows releasing the lock during the potentially slow
-    /// page table walks.
-    pub fn get_vmas(&self) -> Vec<AnonVmaChain> {
-        self.inner.lock().vmas.clone()
-    }
-
-    /// Check if any VMAs remain
-    ///
-    /// Returns true if no VMAs are registered (anon_vma can be dropped).
+    /// No VMA left
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().vmas.is_empty()
-    }
-
-    /// Get the number of VMAs registered
-    pub fn vma_count(&self) -> usize {
-        self.inner.lock().vmas.len()
-    }
-
-    /// Check if a specific VMA is registered
-    pub fn contains_vma(&self, root: u64, vma_start: u64) -> bool {
-        let inner = self.inner.lock();
-        inner
-            .vmas
-            .iter()
-            .any(|c| c.root == root && c.vma_start == vma_start)
+        self.len() == 0
     }
 }
 
 impl Default for AnonVma {
+    #[track_caller]
     fn default() -> Self {
         Self {
-            inner: Mutex::new(AnonVmaInner { vmas: Vec::new() }),
+            chain: ChainLock::new(Vec::new()),
         }
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_anon_vma_remove_root() {
-        let av = AnonVma::new();
-        av.add_vma(Weak::new(), 0x1000, 0x10000, 0x20000);
-        av.add_vma(Weak::new(), 0x1000, 0x30000, 0x40000);
-        av.add_vma(Weak::new(), 0x2000, 0x10000, 0x20000);
-        av.remove_root(0x1000);
-        assert_eq!(av.vma_count(), 1);
-        assert!(av.contains_vma(0x2000, 0x10000));
+    fn avc(pgd: u64, start: u64, end: u64, pgoff: u64) -> Avc {
+        Avc {
+            mm: Weak::new(),
+            pgd,
+            start,
+            end,
+            pgoff,
+            locked: false,
+        }
     }
 
     #[test]
-    fn test_anon_vma_new() {
+    fn address_of_an_index() {
+        // A VMA moved by mremap from 0x10000 to 0x50000 keeps pgoff 0x10
+        let c = avc(1, 0x50000, 0x52000, 0x10);
+        assert_eq!(c.address(0x10), Some(0x50000));
+        assert_eq!(c.address(0x11), Some(0x51000));
+        assert_eq!(c.address(0x12), None);
+        assert_eq!(c.address(0xf), None);
+        assert_eq!(c.address(u64::MAX), None);
+    }
+
+    #[test]
+    fn link_update_unlink() {
         let av = AnonVma::new();
+        av.link(avc(1, 0x10000, 0x20000, 0x10));
+        av.link(avc(2, 0x10000, 0x20000, 0x10));
+        // Split at 0x18000
+        av.update(1, 0x10000, |c| c.end = 0x18000);
+        av.link(avc(1, 0x18000, 0x20000, 0x18));
+        assert_eq!(av.len(), 3);
+        assert!(av.read().iter().any(|c| c.pgd == 1 && c.end == 0x18000));
+        av.unlink(1, 0x10000);
+        av.unlink(1, 0x18000);
+        assert_eq!(av.len(), 1);
+        assert_eq!(av.read()[0].pgd, 2);
+        av.unlink(2, 0x10000);
         assert!(av.is_empty());
-        assert_eq!(av.vma_count(), 0);
-    }
-
-    #[test]
-    fn test_anon_vma_add_remove() {
-        let av = AnonVma::new();
-
-        // Add a VMA
-        av.add_vma(Weak::new(), 1, 0x1000, 0x2000);
-        assert!(!av.is_empty());
-        assert_eq!(av.vma_count(), 1);
-        assert!(av.contains_vma(1, 0x1000));
-
-        // Add another
-        av.add_vma(Weak::new(), 2, 0x3000, 0x4000);
-        assert_eq!(av.vma_count(), 2);
-
-        // Remove first
-        av.remove_vma(1, 0x1000);
-        assert_eq!(av.vma_count(), 1);
-        assert!(!av.contains_vma(1, 0x1000));
-        assert!(av.contains_vma(2, 0x3000));
-
-        // Remove second
-        av.remove_vma(2, 0x3000);
-        assert!(av.is_empty());
-    }
-
-    #[test]
-    fn test_anon_vma_no_duplicates() {
-        let av = AnonVma::new();
-
-        av.add_vma(Weak::new(), 1, 0x1000, 0x2000);
-        av.add_vma(Weak::new(), 1, 0x1000, 0x2000); // Duplicate
-        av.add_vma(Weak::new(), 1, 0x1000, 0x2000); // Duplicate
-
-        assert_eq!(av.vma_count(), 1);
-    }
-
-    #[test]
-    fn test_anon_vma_get_vmas() {
-        let av = AnonVma::new();
-
-        av.add_vma(Weak::new(), 1, 0x1000, 0x2000);
-        av.add_vma(Weak::new(), 2, 0x3000, 0x4000);
-
-        let vmas = av.get_vmas();
-        assert_eq!(vmas.len(), 2);
-
-        assert!(vmas.iter().any(|c| c.root == 1 && c.vma_start == 0x1000));
-        assert!(vmas.iter().any(|c| c.root == 2 && c.vma_start == 0x3000));
-    }
-
-    #[test]
-    fn test_anon_vma_update() {
-        let av = AnonVma::new();
-
-        av.add_vma(Weak::new(), 1, 0x1000, 0x2000);
-
-        // Simulate mremap that moves the VMA
-        av.update_vma(1, 0x1000, 0x5000, 0x6000);
-
-        assert!(!av.contains_vma(1, 0x1000));
-        assert!(av.contains_vma(1, 0x5000));
-
-        let vmas = av.get_vmas();
-        assert_eq!(vmas[0].vma_start, 0x5000);
-        assert_eq!(vmas[0].vma_end, 0x6000);
     }
 }

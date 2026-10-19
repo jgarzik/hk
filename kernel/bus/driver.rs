@@ -1,9 +1,6 @@
 //! Device driver traits
 
-use alloc::{boxed::Box, vec::Vec};
 use core::any::Any;
-
-use crate::dt::registry::DeviceInfo;
 
 /// Driver error
 #[derive(Debug)]
@@ -43,15 +40,6 @@ pub trait Device: Send + Sync {
     }
 }
 
-/// Device driver that can match and probe devices from device tree
-pub trait Driver: Send + Sync {
-    /// Compatible strings this driver handles
-    fn compatible(&self) -> &'static [&'static str];
-
-    /// Probe and initialize a device
-    fn probe(&self, dev: &DeviceInfo) -> Result<Box<dyn Device>, DriverError>;
-}
-
 /// Interrupt controller device trait
 pub trait InterruptController: Device {
     /// Enable an IRQ
@@ -71,49 +59,4 @@ pub trait Timer: Device {
 
     /// Get the current tick count
     fn ticks(&self) -> u64;
-}
-
-/// Driver registry for matching drivers to device tree nodes
-pub struct DriverRegistry {
-    drivers: Vec<Box<dyn Driver>>,
-}
-
-impl DriverRegistry {
-    /// Create a new empty driver registry
-    pub fn new() -> Self {
-        Self {
-            drivers: Vec::new(),
-        }
-    }
-
-    /// Register a driver
-    pub fn register(&mut self, driver: Box<dyn Driver>) {
-        self.drivers.push(driver);
-    }
-
-    /// Find a driver that matches the given compatible string
-    pub fn find_driver(&self, compatible: &str) -> Option<&dyn Driver> {
-        for driver in &self.drivers {
-            for compat in driver.compatible() {
-                if *compat == compatible {
-                    return Some(driver.as_ref());
-                }
-            }
-        }
-        None
-    }
-
-    /// Probe a device using the appropriate driver
-    pub fn probe(&self, dev: &DeviceInfo) -> Result<Box<dyn Device>, DriverError> {
-        if let Some(driver) = self.find_driver(&dev.compatible) {
-            return driver.probe(dev);
-        }
-        Err(DriverError::Unsupported)
-    }
-}
-
-impl Default for DriverRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
 }
