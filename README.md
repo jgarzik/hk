@@ -17,11 +17,11 @@ Multi-threaded, multi-core:  Designed for modern 64-bit multi-core processors.
 
 Initially targeting x86-64 and aarch64.
 
-### Device tree
+### Hardware discovery
 
-The kernel uses a device tree to describe the hardware components of the
-system. This allows for a flexible and extensible way to manage hardware
-resources.
+arm64 discovers hardware from the device tree; x86-64 boots via multiboot2
+(GRUB) and uses ACPI (MADT) for CPUs and APICs. Devices on both are found
+by PCI enumeration.
 
 ### Linux compatible
 
@@ -33,11 +33,23 @@ Uses the Linux syscall ABI for each respective architecture.
 * eBPF even more widely used
 * Policy cut-off for legacy hardware:  Require >= 2021 ?  Open to debate.
 
-### Building etc
+## Status
+
+Boots SMP on x86-64 and arm64 under QEMU. Working today: a scheduler with
+per-CPU run queues; memory management with a buddy/slab allocator, TLB
+shootdown, copy-on-write, shared memory, LRU reclaim and swap; a
+VFS with ramfs, vfat, procfs, devtmpfs and cgroupfs; a block layer
+(virtio-blk, GPT partitions); networking (virtio-net, e1000, IPv4, TCP,
+UDP, ICMP, AF_UNIX, AF_PACKET, netlink); and Ubuntu's static busybox as
+userland. The boot tester runs the same tests on hk and on a real Linux
+kernel, which defines the expected behavior.
+
+## Building etc
 
 Run `make check` or `make check-arm`.  Run `make help` for more info.
 
-Requires qemu, dosfstools, and iso tools.
+Requires Rust (stable), qemu, GRUB and xorriso (ISO), dosfstools, mtools
+and an aarch64 cross-compiler; see DEVELOPMENT.md for the full list.
 
 ## Naming
 

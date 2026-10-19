@@ -312,4 +312,5 @@ reference rules are in `doc/LOCKING.md` (Address Spaces).
   that leaves no one else needing the slot), swapoff reads every page
   back.
 - `/proc/meminfo` reports MemTotal and MemFree from the frame allocator
-  (exact free count).
+  (exact free count; MemAvailable equals MemFree), the swap totals and
+  swap cache, and the slab caches' pages (Slab).
