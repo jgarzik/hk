@@ -3,21 +3,26 @@
 //! Sets up the Global Descriptor Table and Task State Segment
 //! for x86-64 long mode operation. Also verifies CPU features
 //! and initializes FPU/SSE.
+//!
+//! Every CPU has its own GDT and TSS (Linux per-CPU gdt_page and
+//! cpu_tss_rw): the TSS holds this CPU's RSP0 (the kernel stack an
+//! interrupt from user mode switches to) and its IST stacks, and a
+//! TSS is marked busy by `ltr` in the GDT that names it.
 
+use ::core::cell::UnsafeCell;
 use ::core::mem::size_of;
-use ::core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
-/// Saved kernel GDT pointer (set by BSP for APs to use)
-static KERNEL_GDT_LIMIT: AtomicU16 = AtomicU16::new(0);
-static KERNEL_GDT_BASE: AtomicU64 = AtomicU64::new(0);
+use crate::cpu::PerCpu;
 
-/// Saved kernel IDT pointer (set by BSP for APs to use)
-static KERNEL_IDT_LIMIT: AtomicU16 = AtomicU16::new(0);
-static KERNEL_IDT_BASE: AtomicU64 = AtomicU64::new(0);
-
-/// IST indices (1-based as used in IDT)
+/// IST indices (1-based as used in IDT): the exceptions that must not
+/// run on the interrupted stack (it may be the one that overflowed, or
+/// not yet the kernel's: Linux DOUBLE_FAULT_STACK, NMI_STACK, MCE_STACK)
 pub const IST_DOUBLE_FAULT: u8 = 1;
 pub const IST_NMI: u8 = 2;
+pub const IST_MCE: u8 = 3;
+
+/// IST stacks per CPU (one per index above)
+const IST_COUNT: usize = 3;
 
 /// Execute CPUID instruction
 ///
@@ -199,48 +204,49 @@ struct Gdt {
     tss_high: u64,
 }
 
-/// GDT pointer for LGDT instruction
-#[repr(C, packed)]
-struct GdtPointer {
-    limit: u16,
-    base: u64,
+impl Gdt {
+    const fn new() -> Self {
+        Self {
+            null: 0,
+            kernel_code: KERNEL_CODE,
+            kernel_data: KERNEL_DATA,
+            user_data: USER_DATA,
+            user_code: USER_CODE,
+            tss_low: 0,
+            tss_high: 0,
+        }
+    }
 }
 
-/// Static GDT - initialized at runtime
-static mut GDT: Gdt = Gdt {
-    null: 0,
-    kernel_code: KERNEL_CODE,
-    kernel_data: KERNEL_DATA,
-    user_data: USER_DATA,
-    user_code: USER_CODE,
-    tss_low: 0,  // Set at runtime
-    tss_high: 0, // Set at runtime
-};
+/// One CPU's descriptor tables
+struct CpuTables {
+    gdt: Gdt,
+    tss: TaskStateSegment,
+}
 
-/// Static TSS
-static mut TSS: TaskStateSegment = TaskStateSegment::new();
+/// The descriptor tables of one CPU, written only by that CPU (its own
+/// RSP0) or by the boot CPU before that CPU starts (IST stacks)
+struct TablesCell(UnsafeCell<CpuTables>);
 
-/// Kernel stack size (16KB, matches Linux x86-64 THREAD_SIZE)
-pub const KERNEL_STACK_SIZE: usize = 16384;
+// SAFETY: see TablesCell
+unsafe impl Sync for TablesCell {}
 
-/// Kernel stack for interrupts
-#[repr(C, align(16))]
-struct KernelStack([u8; KERNEL_STACK_SIZE]);
+static TABLES: PerCpu<TablesCell> = crate::percpu![TablesCell(UnsafeCell::new(CpuTables {
+    gdt: Gdt::new(),
+    tss: TaskStateSegment::new(),
+}))];
 
-static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_SIZE]);
-
-/// IST stack size (4KB each)
-const IST_STACK_SIZE: usize = 4096;
+/// Size of each IST stack (16KB: the double-fault handler reports a
+/// kernel stack overflow and panics on it)
+pub const IST_STACK_SIZE: usize = 16384;
 
 /// IST stack type
 #[repr(C, align(16))]
 struct IstStack([u8; IST_STACK_SIZE]);
 
-/// Double fault stack (IST1)
-static mut DOUBLE_FAULT_STACK: IstStack = IstStack([0; IST_STACK_SIZE]);
-
-/// NMI stack (IST2)
-static mut NMI_STACK: IstStack = IstStack([0; IST_STACK_SIZE]);
+/// The boot CPU's IST stacks (it sets up its tables before the frame
+/// allocator exists; the APs get theirs from `alloc_ist`)
+static mut BOOT_IST: [IstStack; IST_COUNT] = [const { IstStack([0; IST_STACK_SIZE]) }; IST_COUNT];
 
 /// Create a TSS descriptor (128 bits split into two 64-bit entries)
 fn create_tss_descriptor(tss_addr: u64) -> (u64, u64) {
@@ -266,63 +272,49 @@ fn create_tss_descriptor(tss_addr: u64) -> (u64, u64) {
     (low, high)
 }
 
-/// Initialize the GDT and load it
-pub fn init_gdt() {
-    unsafe {
-        // Set up kernel stack in TSS
-        let stack_top = (&raw const KERNEL_STACK)
-            .cast::<u8>()
-            .add(KERNEL_STACK_SIZE) as u64;
-        TSS.privilege_stack_table[0] = stack_top; // RSP0 for syscalls/interrupts
+/// CPU `cpu`'s tables
+fn tables(cpu: u32) -> *mut CpuTables {
+    TABLES.get(cpu).0.get()
+}
 
-        // Set up IST stacks for critical exceptions
-        let df_stack_top = (&raw const DOUBLE_FAULT_STACK)
-            .cast::<u8>()
-            .add(IST_STACK_SIZE) as u64;
-        let nmi_stack_top = (&raw const NMI_STACK).cast::<u8>().add(IST_STACK_SIZE) as u64;
-        TSS.interrupt_stack_table[0] = df_stack_top; // IST1 for double fault
-        TSS.interrupt_stack_table[1] = nmi_stack_top; // IST2 for NMI
+/// Give CPU `cpu` its IST stacks (tops of `IST_COUNT` stacks)
+fn set_ist(cpu: u32, tops: [u64; IST_COUNT]) {
+    // SAFETY: `cpu` is not running yet (or is the caller, at boot)
+    let tss = unsafe { &mut (*tables(cpu)).tss };
+    let mut ist = tss.interrupt_stack_table;
+    ist[..IST_COUNT].copy_from_slice(&tops);
+    tss.interrupt_stack_table = ist;
+}
 
-        // Create TSS descriptor
-        let tss_addr = &raw const TSS as u64;
-        let (tss_low, tss_high) = create_tss_descriptor(tss_addr);
-        GDT.tss_low = tss_low;
-        GDT.tss_high = tss_high;
-
-        // Load GDT
-        let gdt_ptr = GdtPointer {
-            limit: (size_of::<Gdt>() - 1) as u16,
-            base: &raw const GDT as u64,
+/// Allocate the IST stacks of AP `cpu` before it starts (Linux
+/// cpu_entry_area exception stacks); false if out of memory
+pub fn alloc_ist<F: crate::arch::FrameAlloc<PhysAddr = u64>>(cpu: u32, fa: &mut F) -> bool {
+    let pages = IST_STACK_SIZE / 4096;
+    let mut tops = [0u64; IST_COUNT];
+    for t in tops.iter_mut() {
+        let Some(phys) = fa.alloc_contig(pages) else {
+            return false;
         };
+        let base = super::paging::phys_to_virt(phys);
+        unsafe { core::ptr::write_bytes(base, 0, IST_STACK_SIZE) };
+        *t = base as u64 + IST_STACK_SIZE as u64;
+    }
+    set_ist(cpu, tops);
+    true
+}
 
-        ::core::arch::asm!(
-            "lgdt [{}]",
-            in(reg) &gdt_ptr,
-            options(nostack)
-        );
-
-        // Reload segment registers
-        // CS requires a far jump, others can use mov
-        ::core::arch::asm!(
-            // Push new CS and return address, then retfq
-            "push {cs}",
-            "lea {tmp}, [rip + 2f]",
-            "push {tmp}",
-            "retfq",
-            "2:",
-            // Reload data segments
-            "mov ds, {ds:x}",
-            "mov es, {ds:x}",
-            "mov fs, {ds:x}",
-            "mov gs, {ds:x}",
-            "mov ss, {ds:x}",
-            cs = in(reg) KERNEL_CODE_SELECTOR as u64,
-            ds = in(reg) KERNEL_DATA_SELECTOR as u32,
-            tmp = lateout(reg) _,
-            options(preserves_flags)
-        );
-
-        // Load TSS
+/// Load CPU `cpu`'s GDT and TSS on this CPU (Linux cpu_init:
+/// load_direct_gdt, load_TR_desc): its TSS descriptor in its own GDT,
+/// CS/SS/DS/ES reloaded (FS and GS keep their bases: GS is the
+/// per-CPU base), then `ltr`
+pub fn load_tables(cpu: u32) {
+    let t = tables(cpu);
+    unsafe {
+        let tss_addr = &raw const (*t).tss as u64;
+        let (tss_low, tss_high) = create_tss_descriptor(tss_addr);
+        (*t).gdt.tss_low = tss_low;
+        (*t).gdt.tss_high = tss_high;
+        load_gdt_raw((size_of::<Gdt>() - 1) as u16, &raw const (*t).gdt as u64);
         ::core::arch::asm!(
             "ltr {0:x}",
             in(reg) TSS_SELECTOR,
@@ -331,63 +323,46 @@ pub fn init_gdt() {
     }
 }
 
-/// Set the kernel stack pointer in TSS (for context switches)
-///
-/// Called from switch_to.S assembly during context switch.
+/// Initialize the boot CPU's GDT and TSS (early boot, before per-CPU
+/// data: CPU 0's tables) and clear the data segment registers
+pub fn init_gdt() {
+    let tops = core::array::from_fn(|i| unsafe {
+        (&raw const BOOT_IST[i]).cast::<u8>().add(IST_STACK_SIZE) as u64
+    });
+    set_ist(0, tops);
+    load_tables(0);
+    // FS and GS hold the kernel data selector (their bases are set by
+    // MSR later: GS is the per-CPU base, FS the user TLS)
+    unsafe {
+        ::core::arch::asm!(
+            "mov fs, {ds:x}",
+            "mov gs, {ds:x}",
+            ds = in(reg) KERNEL_DATA_SELECTOR as u32,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Set this CPU's RSP0 in its TSS (the kernel stack an interrupt from
+/// user mode switches to); called from switch_to.S at every context
+/// switch. A kernel thread (`stack_top == 0`) never runs in user mode
+/// and leaves it alone.
 #[unsafe(no_mangle)]
-///
-/// The TSS is global (shared by all CPUs) and only CPU 0 runs user tasks;
-/// kernel threads never enter user mode and switch with `stack_top == 0`,
-/// which leaves RSP0 alone (a switch on an AP must not clobber CPU 0's).
 pub extern "C" fn set_kernel_stack(stack_top: u64) {
     if stack_top == 0 {
         return;
     }
+    // SAFETY: this CPU's own TSS
     unsafe {
-        TSS.privilege_stack_table[0] = stack_top;
+        (*tables(crate::cpu::this_id())).tss.privilege_stack_table[0] = stack_top;
     }
-}
-
-/// Get current kernel stack pointer from TSS
-pub fn get_kernel_stack() -> u64 {
-    unsafe { TSS.privilege_stack_table[0] }
-}
-
-/// Get the current GDT pointer (limit and base)
-pub fn get_gdt_ptr() -> (u16, u64) {
-    #[repr(C, packed)]
-    struct GdtPtr {
-        limit: u16,
-        base: u64,
-    }
-
-    let mut ptr = GdtPtr { limit: 0, base: 0 };
-    unsafe {
-        ::core::arch::asm!("sgdt [{}]", in(reg) &mut ptr, options(nostack));
-    }
-    (ptr.limit, ptr.base)
-}
-
-/// Get the current IDT pointer (limit and base)
-pub fn get_idt_ptr() -> (u16, u64) {
-    #[repr(C, packed)]
-    struct IdtPtr {
-        limit: u16,
-        base: u64,
-    }
-
-    let mut ptr = IdtPtr { limit: 0, base: 0 };
-    unsafe {
-        ::core::arch::asm!("sidt [{}]", in(reg) &mut ptr, options(nostack));
-    }
-    (ptr.limit, ptr.base)
 }
 
 /// Load a GDT from raw pointer values
 ///
 /// # Safety
 /// The GDT must be valid and properly formatted.
-pub unsafe fn load_gdt_raw(limit: u16, base: u64) {
+unsafe fn load_gdt_raw(limit: u16, base: u64) {
     #[repr(C, packed)]
     struct GdtPtr {
         limit: u16,
@@ -417,79 +392,6 @@ pub unsafe fn load_gdt_raw(limit: u16, base: u64) {
             tmp = lateout(reg) _,
             options(preserves_flags)
         );
-    }
-}
-
-/// Load an IDT from raw pointer values
-///
-/// # Safety
-/// The IDT must be valid and properly formatted.
-pub unsafe fn load_idt_raw(limit: u16, base: u64) {
-    #[repr(C, packed)]
-    struct IdtPtr {
-        limit: u16,
-        base: u64,
-    }
-
-    let ptr = IdtPtr { limit, base };
-    unsafe {
-        ::core::arch::asm!(
-            "lidt [{}]",
-            in(reg) &ptr,
-            options(nostack)
-        );
-    }
-}
-
-/// Save the kernel's GDT pointer for APs to use
-/// Should be called by BSP after GDT is set up
-pub fn save_kernel_gdt_for_aps() {
-    let (limit, base) = get_gdt_ptr();
-    KERNEL_GDT_LIMIT.store(limit, Ordering::SeqCst);
-    KERNEL_GDT_BASE.store(base, Ordering::SeqCst);
-}
-
-/// Save the kernel's IDT pointer for APs to use
-/// Should be called by BSP after IDT is set up
-pub fn save_kernel_idt_for_aps() {
-    let (limit, base) = get_idt_ptr();
-    KERNEL_IDT_LIMIT.store(limit, Ordering::SeqCst);
-    KERNEL_IDT_BASE.store(base, Ordering::SeqCst);
-}
-
-/// Reload the kernel's GDT on the current CPU
-/// Used by APs after they've initialized with the trampoline's minimal GDT
-pub fn reload_gdt() {
-    let limit = KERNEL_GDT_LIMIT.load(Ordering::SeqCst);
-    let base = KERNEL_GDT_BASE.load(Ordering::SeqCst);
-    if limit == 0 || base == 0 {
-        // GDT not saved yet, use current (for BSP)
-        let (limit, base) = get_gdt_ptr();
-        unsafe {
-            load_gdt_raw(limit, base);
-        }
-    } else {
-        unsafe {
-            load_gdt_raw(limit, base);
-        }
-    }
-}
-
-/// Reload the kernel's IDT on the current CPU
-/// Used by APs after startup
-pub fn reload_idt() {
-    let limit = KERNEL_IDT_LIMIT.load(Ordering::SeqCst);
-    let base = KERNEL_IDT_BASE.load(Ordering::SeqCst);
-    if limit == 0 || base == 0 {
-        // IDT not saved yet, use current (for BSP)
-        let (limit, base) = get_idt_ptr();
-        unsafe {
-            load_idt_raw(limit, base);
-        }
-    } else {
-        unsafe {
-            load_idt_raw(limit, base);
-        }
     }
 }
 

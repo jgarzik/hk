@@ -145,7 +145,12 @@ pub fn init_idt() {
         // 15 is reserved
         IDT[16].set_handler(exception_handler_16 as *const () as u64, GATE_TRAP);
         IDT[17].set_handler(exception_handler_17 as *const () as u64, GATE_TRAP);
-        IDT[18].set_handler(exception_handler_18 as *const () as u64, GATE_TRAP);
+        // Machine check: its own IST stack too
+        IDT[18].set_handler_with_ist(
+            exception_handler_18 as *const () as u64,
+            GATE_TRAP,
+            super::cpu::IST_MCE,
+        );
         IDT[19].set_handler(exception_handler_19 as *const () as u64, GATE_TRAP);
         IDT[20].set_handler(exception_handler_20 as *const () as u64, GATE_TRAP);
         IDT[21].set_handler(exception_handler_21 as *const () as u64, GATE_TRAP);
@@ -179,13 +184,17 @@ pub fn init_idt() {
             .set_handler(call_function_ipi as *const () as u64, GATE_INTERRUPT);
         IDT[RESCHEDULE_VECTOR as usize]
             .set_handler(reschedule_ipi as *const () as u64, GATE_INTERRUPT);
+    }
+    load_idt();
+}
 
-        // Load IDT
-        let idt_ptr = IdtPointer {
-            limit: (size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
-            base: (&raw const IDT) as *const _ as u64,
-        };
-
+/// Load the IDT (shared by every CPU) on this CPU
+pub fn load_idt() {
+    let idt_ptr = IdtPointer {
+        limit: (size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
+        base: (&raw const IDT) as *const _ as u64,
+    };
+    unsafe {
         ::core::arch::asm!(
             "lidt [{}]",
             in(reg) &idt_ptr,

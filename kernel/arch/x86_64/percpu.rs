@@ -29,9 +29,6 @@ pub struct PerCpu {
     /// Has this CPU completed initialization?
     pub is_online: AtomicBool,
 
-    /// Kernel stack top for this CPU
-    pub kernel_stack_top: u64,
-
     /// Timer tick count for this CPU
     pub ticks: AtomicU64,
 
@@ -198,7 +195,6 @@ impl PerCpu {
             apic_id: 0,
             is_bsp: false,
             is_online: AtomicBool::new(false),
-            kernel_stack_top: 0,
             ticks: AtomicU64::new(0),
             curr: AtomicUsize::new(0),
             needs_reschedule: AtomicBool::new(false),
@@ -229,13 +225,12 @@ impl PerCpu {
     }
 
     /// Initialize the PerCpu structure
-    pub fn init(&mut self, cpu_id: u32, apic_id: u32, is_bsp: bool, kernel_stack_top: u64) {
+    pub fn init(&mut self, cpu_id: u32, apic_id: u32, is_bsp: bool) {
         set_tsc_aux(cpu_id);
         self.self_ptr = self as *mut PerCpu;
         self.cpu_id = cpu_id;
         self.apic_id = apic_id;
         self.is_bsp = is_bsp;
-        self.kernel_stack_top = kernel_stack_top;
         self.ticks.store(0, Ordering::Relaxed);
         self.curr.store(0, Ordering::Relaxed);
         self.needs_reschedule.store(false, Ordering::Relaxed);
@@ -312,11 +307,11 @@ pub fn try_current_cpu() -> Option<&'static PerCpu> {
 /// Initialize per-CPU data for the BSP (CPU 0)
 ///
 /// This must be called early in boot, before any per-CPU access.
-pub fn init_bsp(apic_id: u8, kernel_stack_top: u64) {
+pub fn init_bsp(apic_id: u8) {
     BSP_APIC_ID.store(apic_id as u32, Ordering::SeqCst);
 
     let percpu = get_percpu(0);
-    percpu.init(0, apic_id as u32, true, kernel_stack_top);
+    percpu.init(0, apic_id as u32, true);
 
     // Set GS base to point to our per-CPU data
     set_gs_base(percpu as *mut PerCpu as u64);
@@ -331,13 +326,13 @@ pub fn init_bsp(apic_id: u8, kernel_stack_top: u64) {
 ///
 /// Called by the AP after it has set up its GDT and stack.
 /// Returns the CPU ID assigned to this AP.
-pub fn init_ap(apic_id: u8, kernel_stack_top: u64) -> u32 {
+pub fn init_ap(apic_id: u8) -> u32 {
     // Atomically claim the next CPU ID
     let cpu_id = CPU_COUNT.fetch_add(1, Ordering::SeqCst);
     assert!((cpu_id as usize) < MAX_CPUS, "Too many CPUs");
 
     let percpu = get_percpu(cpu_id);
-    percpu.init(cpu_id, apic_id as u32, false, kernel_stack_top);
+    percpu.init(cpu_id, apic_id as u32, false);
 
     // Set GS base to point to our per-CPU data
     set_gs_base(percpu as *mut PerCpu as u64);
