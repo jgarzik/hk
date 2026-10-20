@@ -121,7 +121,16 @@ make check-linux    # boot_tester on real Linux (native arch)
 make check-linux-arm # Same, aarch64 Linux (emulated on x86)
 make clippy         # Linting for x86-64
 make clippy-arm     # Linting for aarch64
+
+make check-stress   # Flake sweep: 10 check + 10 check-arm boots, 3 at a time
 ```
+
+`make check-stress` (`tools/stress.sh`, run at the end of a phase)
+builds once, then repeats the hk boot tests: `STRESS_N` boots (10) of
+each arch in `STRESS_ARCHS` ("x86 arm"), at most `STRESS_JOBS` (3)
+at a time, each with its own serial log in `target/qemu/stress/`. It
+prints the failed boots with their `FAIL` lines and `STRESS-OK` or
+`STRESS-FAILED`; make variables pass through (`NO_KVM=1`, `LOCKDEP=1`).
 
 `make gate` (`tools/gate.sh`) runs `fmt-check`, `clippy` and `clippy-arm`
 (`-D warnings`) and `test`, stopping at the first failure, then builds

@@ -25,7 +25,7 @@ KERNEL_FEATURES = $(if $(LOCKDEP),--features lockdep)
 MACHINE ?=
 
 .PHONY: all build debug user iso iso-debug run run-debug test check clean info help vfat-image disk-image
-.PHONY: build-arm run-arm check-arm check-linux check-linux-arm user-arm clippy clippy-arm fmt list-machines gate
+.PHONY: build-arm run-arm check-arm check-linux check-linux-arm user-arm clippy clippy-arm fmt list-machines gate check-stress
 
 # Default: build everything (kernel, user binaries, ISO)
 all: iso
@@ -56,6 +56,8 @@ help:
 	@echo "  make check-linux - Run boot tests on a real Linux kernel (native arch)"
 	@echo "  make check-linux-arm - Same, aarch64 Linux (emulated on x86 hosts)"
 	@echo "  make gate     - Full per-commit gate, the four boots in parallel"
+	@echo "  make check-stress - Flake sweep: repeated check/check-arm boots"
+	@echo "                  (STRESS_N=10 per arch, STRESS_JOBS=3 at a time)"
 	@echo ""
 	@echo "  make clippy   - Run clippy linter (x86-64)"
 	@echo "  make clippy-arm - Run clippy linter (aarch64)"
@@ -278,3 +280,8 @@ fmt-check:
 # The full per-commit gate (tools/gate.sh)
 gate:
 	@tools/gate.sh
+
+# Phase-end flake sweep (tools/stress.sh): STRESS_N boots per arch
+# (STRESS_ARCHS), STRESS_JOBS at a time
+check-stress:
+	@tools/stress.sh
