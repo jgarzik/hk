@@ -5,6 +5,8 @@
 pub mod acct;
 pub mod adjtimex;
 pub mod append;
+#[cfg(target_arch = "x86_64")]
+pub mod arch_gs;
 pub mod bigio;
 pub mod blk;
 pub mod bpf;
@@ -241,4 +243,6 @@ pub fn run_all_tests() {
     ioport::run_tests();
     #[cfg(target_arch = "x86_64")]
     gs_sel::run_tests();
+    #[cfg(target_arch = "x86_64")]
+    arch_gs::run_tests();
 }

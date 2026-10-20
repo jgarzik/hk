@@ -644,6 +644,7 @@ impl ContextOps for Aarch64Arch {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         next_tls: u64,
+        _next_gs: u64,
     ) {
         unsafe {
             context::context_switch(old_ctx, new_ctx, new_kstack, next_tls);
@@ -654,6 +655,7 @@ impl ContextOps for Aarch64Arch {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         next_tls: u64,
+        _next_gs: u64,
     ) -> ! {
         unsafe {
             context::context_switch_first(new_ctx, new_kstack, next_tls);

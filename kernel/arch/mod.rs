@@ -121,6 +121,14 @@ pub use aarch64::percpu::read_tpidr_el0 as read_user_tls;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::percpu::fs_base_ok as user_tls_ok;
 
+// The current task's user GS base (x86-64 MSR_KERNEL_GS_BASE while in
+// the kernel; arm64 has none: 0, writes ignored)
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::percpu::{read_user_gsbase, write_user_gsbase};
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::percpu::{read_user_gsbase, write_user_gsbase};
+
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::percpu::tpidr_ok as user_tls_ok;
 
@@ -421,7 +429,9 @@ pub trait ContextOps: Sized {
     /// Switch from current task to a new task, saving current context
     ///
     /// Handles TLS save/restore in Rust before calling assembly, following
-    /// the Linux kernel pattern (tls_thread_switch before cpu_switch_to).
+    /// the Linux kernel pattern (tls_thread_switch before cpu_switch_to):
+    /// `next_tls` is the next task's user TLS register, `next_gs` its
+    /// user GS base (x86-64; ignored on arm64).
     ///
     /// # Safety
     /// - `old_ctx` must point to valid, writable memory
@@ -432,6 +442,7 @@ pub trait ContextOps: Sized {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         next_tls: u64,
+        next_gs: u64,
     );
 
     /// Switch to a task without saving current context
@@ -445,6 +456,7 @@ pub trait ContextOps: Sized {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         next_tls: u64,
+        next_gs: u64,
     ) -> !;
 }
 

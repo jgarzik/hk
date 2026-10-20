@@ -2010,6 +2010,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             .tls
             .store(crate::arch::read_user_tls(), Ordering::Relaxed);
     }
+    // ... and its user GS base (Linux copy_thread: gsbase)
+    child_task
+        .gsbase
+        .store(crate::arch::read_user_gsbase(), Ordering::Relaxed);
 
     // Handle CLONE_PARENT_SETTID: write child TID to parent's address space
     if config.flags & CLONE_PARENT_SETTID != 0 && config.parent_tidptr != 0 {
@@ -2335,7 +2339,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     rq.dead.push(dead);
 
     let next_tid = rq.dequeue_next();
-    let (Some(next_ctx), Some((next_kstack, next_mm, next_tls))) =
+    let (Some(next_ctx), Some((next_kstack, next_mm, (next_tls, next_gs)))) =
         (rq.get_context(next_tid), make_current(&rq, next_tid))
     else {
         // No context available, fall back to halt loop
@@ -2357,7 +2361,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // Switch to next task - never returns
     unsafe {
         switch_mm(next_mm);
-        CurrentArch::context_switch_first(next_ctx, next_kstack, next_tls);
+        CurrentArch::context_switch_first(next_ctx, next_kstack, next_tls, next_gs);
     }
 }
 
@@ -2365,13 +2369,13 @@ pub fn exit_current(status: Option<i32>) -> ! {
 /// `curr` points at it and /proc sees it running. Returns its kernel
 /// stack for user entry (0 for kernel threads, which never return to
 /// user mode), its address space (null for none) and its user TLS
-/// register.
+/// register and GS base.
 ///
 /// The caller holds the rq lock and `next` is not running, so nothing
 /// changes its address space meanwhile (only the task itself does, or
 /// its creator before it first runs), and the run queue's reference
 /// keeps it alive until it has switched away for good.
-fn make_current(rq: &CpuRunQueue, next: Tid) -> Option<(u64, *const crate::mm::Mm, u64)> {
+fn make_current(rq: &CpuRunQueue, next: Tid) -> Option<(u64, *const crate::mm::Mm, (u64, u64))> {
     let t = rq.entry(next)?.task.as_ref()?;
     t.sleeping.store(false, Ordering::Relaxed);
     let kstack = if matches!(t.kind, TaskKind::KernelThread) {
@@ -2384,7 +2388,11 @@ fn make_current(rq: &CpuRunQueue, next: Tid) -> Option<(u64, *const crate::mm::M
         .as_ref()
         .map_or(core::ptr::null(), |m| Arc::as_ptr(m.arc()));
     CurrentArch::set_current_task_ptr(Arc::as_ptr(t) as usize);
-    Some((kstack, mm, t.tls.load(Ordering::Relaxed)))
+    let tls = (
+        t.tls.load(Ordering::Relaxed),
+        t.gsbase.load(Ordering::Relaxed),
+    );
+    Some((kstack, mm, tls))
 }
 
 /// Load the address space of the task switched to (`make_current`)
@@ -2414,17 +2422,19 @@ fn context_switch_locked(
         .entry(cur)
         .is_some_and(|e| e.state != SleepState::Running);
     me.sleeping.store(sleeps, Ordering::Relaxed);
-    // Save the outgoing task's user TLS register (user code may have
-    // changed it without a syscall, e.g. msr tpidr_el0); the arch switch
-    // loads `next`'s
+    // Save the outgoing task's user TLS register and GS base (user code
+    // may have changed them without a syscall, e.g. msr tpidr_el0, mov
+    // gs); the arch switch loads `next`'s
     if !me.is_kthread() {
         me.tls
             .store(crate::arch::read_user_tls(), Ordering::Relaxed);
+        me.gsbase
+            .store(crate::arch::read_user_gsbase(), Ordering::Relaxed);
     }
     if rq.get_context(next).is_none() || rq.get_context(cur).is_none() {
         return;
     }
-    let Some((next_kstack, next_mm, next_tls)) = make_current(&rq, next) else {
+    let Some((next_kstack, next_mm, (next_tls, next_gs))) = make_current(&rq, next) else {
         return;
     };
     let (Some(curr_ctx), Some(next_ctx)) = (rq.get_context_mut(cur), rq.get_context(next)) else {
@@ -2436,7 +2446,7 @@ fn context_switch_locked(
     let saved = CurrentArch::save_syscall_user_state();
     unsafe {
         switch_mm(next_mm);
-        CurrentArch::context_switch(curr_ctx, next_ctx, next_kstack, next_tls);
+        CurrentArch::context_switch(curr_ctx, next_ctx, next_kstack, next_tls, next_gs);
     }
     // Back on `cur` (the rq lock is held again; `rq` releases it)
     CurrentArch::restore_syscall_user_state(&saved);
@@ -3497,6 +3507,11 @@ pub fn exec_replace_image(
         task.set_mm(Some(mm))
     });
 
+    // The new image starts with no user GS base (Linux start_thread:
+    // load_gs_index(0), gsbase 0)
+    current().gsbase.store(0, Ordering::Relaxed);
+    crate::arch::write_user_gsbase(0);
+
     // Leave the old tables before releasing them: their frames may be
     // reused at once by another CPU
     crate::mm::tlb::switch_mm(Some(&new));
@@ -3533,7 +3548,7 @@ pub fn try_schedule() {
     let Some(next_ctx) = rq.get_context(next) else {
         return;
     };
-    let Some((next_kstack, next_mm, next_tls)) = make_current(&rq, next) else {
+    let Some((next_kstack, next_mm, (next_tls, next_gs))) = make_current(&rq, next) else {
         return;
     };
     rq.current = Some(next);
@@ -3544,7 +3559,7 @@ pub fn try_schedule() {
     core::mem::forget(rq); // context_switch_first never returns
     unsafe {
         switch_mm(next_mm);
-        CurrentArch::context_switch_first(next_ctx, next_kstack, next_tls);
+        CurrentArch::context_switch_first(next_ctx, next_kstack, next_tls, next_gs);
     }
 }
 

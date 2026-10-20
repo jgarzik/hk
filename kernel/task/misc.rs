@@ -761,8 +761,8 @@ use crate::arch::x86_64::percpu::{
 /// Supported operations:
 /// - ARCH_SET_FS (0x1002): Set FS base address (user TLS pointer)
 /// - ARCH_GET_FS (0x1003): Get FS base address
-/// - ARCH_SET_GS (0x1001): Not supported (GS is kernel per-CPU)
-/// - ARCH_GET_GS (0x1004): Not supported
+/// - ARCH_SET_GS (0x1001): Set the user GS base
+/// - ARCH_GET_GS (0x1004): Get the user GS base
 /// - ARCH_GET_CPUID (0x1011): Returns 1 (CPUID enabled; no faulting support)
 /// - ARCH_SET_CPUID (0x1012): -ENODEV (CPUID faulting not supported)
 ///
@@ -800,9 +800,27 @@ pub fn sys_arch_prctl(code: i32, addr: u64) -> i64 {
         // (arch/x86/kernel/process.c get_cpuid_mode/set_cpuid_mode).
         ARCH_GET_CPUID => 1,
         ARCH_SET_CPUID => KernelError::NoDevice.sysret(),
-        ARCH_SET_GS | ARCH_GET_GS => {
-            // GS base is used by kernel for per-CPU data, not available to user
-            KernelError::InvalidArgument.sysret()
+        ARCH_SET_GS => {
+            // The user GS base (the kernel's per-CPU base is swapped in
+            // on entry): null selector, then the base, like Linux
+            // do_arch_prctl_64
+            if !crate::arch::user_tls_ok(addr) {
+                return KernelError::NotPermitted.sysret();
+            }
+            crate::arch::x86_64::percpu::load_user_gs_null();
+            crate::arch::write_user_gsbase(addr);
+            super::percpu::current()
+                .gsbase
+                .store(addr, core::sync::atomic::Ordering::Relaxed);
+            0
+        }
+        ARCH_GET_GS => {
+            // The live user base (`mov gs` may have changed it)
+            let gs = crate::arch::read_user_gsbase();
+            if put_user::<Uaccess, u64>(addr, gs).is_err() {
+                return KernelError::BadAddress.sysret();
+            }
+            0
         }
         _ => KernelError::InvalidArgument.sysret(),
     }

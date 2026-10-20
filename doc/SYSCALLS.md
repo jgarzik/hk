@@ -543,7 +543,7 @@ There are very few direct "cgroup_*" syscalls; the cgroup v1/v2 APIs are primari
 
 14. Thread-local, arch-specific, misc
 
-- [x] arch_prctl (x86-64 only; TLS, FS/GS base, ARCH_GET/SET_CPUID [no CPUID faulting: SET → ENODEV])
+- [x] arch_prctl (x86-64 only; TLS, FS/GS base [ARCH_SET/GET_GS: the user GS base, swapgs], ARCH_GET/SET_CPUID [no CPUID faulting: SET → ENODEV])
 - [x] iopl (x86-64 only; I/O port privilege level)
 - [x] ioperm (x86-64 only; returns ENOSYS - requires TSS I/O bitmap)
 - [ ] modify_ldt (x86-64 only; LDT manipulation)

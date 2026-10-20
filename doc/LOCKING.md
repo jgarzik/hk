@@ -697,7 +697,8 @@ is sufficient while all task modifications are by the current task itself.
 
 #### Per-CPU Current Task Access (Lock-Free)
 
-Each CPU's per-CPU data (GS base on x86-64, TPIDR_EL1 on aarch64) holds
+Each CPU's per-CPU data (GS base on x86-64, swapped in by `swapgs` on
+every entry from user mode; TPIDR_EL1 on aarch64) holds
 `curr`, a pointer to the running `Task` (Linux `current`), set by the
 scheduler at every switch with the run-queue lock held. The run queue
 holds the task's `TaskRef` (its entry, then `DeadTask` until the next
@@ -3019,9 +3020,13 @@ arm64 `handle_el0_sync` for SVC), user-mode faults and kernel faults on
 user addresses from a context with interrupts on (x86 after reading
 CR2, arm64 after FAR; Linux do_user_addr_fault / el0_da / el1_abort)
 run with interrupts enabled, as in Linux; the entry/exit code
-around them (per-CPU user-register block, the global x86 entry stack,
-ELR/SPSR_EL1, a fork child's first return: `clone_child_entry` enables
-them for the child-TID write and disables them again) keeps them off.
+around them (per-CPU user-register block, x86 `swapgs` and the switch
+to the per-CPU top_of_stack, ELR/SPSR_EL1, a fork child's first
+return: `clone_child_entry` enables them for the child-TID write and
+disables them again) keeps them off. Every x86 IDT vector is an
+interrupt gate, so no interrupt lands between an entry from user mode
+and its `swapgs` (NMI, #DF and #MC use paranoid entry: they read
+MSR_GS_BASE).
 The kernel stays cooperative: an interrupt never switches tasks in
 kernel mode (the handlers only set flags, wake, and run cross-CPU
 calls), so code between explicit schedule points still runs

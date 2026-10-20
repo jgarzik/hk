@@ -251,6 +251,14 @@ pub fn tpidr_ok(_val: u64) -> bool {
     true
 }
 
+/// No user GS base on arm64 (x86-64 `read_user_gsbase`)
+pub fn read_user_gsbase() -> u64 {
+    0
+}
+
+/// No user GS base on arm64 (x86-64 `write_user_gsbase`)
+pub fn write_user_gsbase(_addr: u64) {}
+
 /// Read the TPIDR_EL0 register (user TLS pointer)
 #[inline]
 pub fn read_tpidr_el0() -> u64 {

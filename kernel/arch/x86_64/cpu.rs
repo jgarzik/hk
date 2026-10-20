@@ -98,8 +98,7 @@ pub fn check_cpu_features() {
     if edx & (1 << 20) == 0 {
         panic!("CPU does not support NX bit");
     }
-    // RDTSCP: kernel entry finds its per-CPU data through TSC_AUX
-    // (percpu::restore_kernel_gs)
+    // RDTSCP: TSC_AUX holds the CPU index (user getcpu via RDTSCP/RDPID)
     if edx & (1 << 27) == 0 {
         panic!("CPU does not support RDTSCP");
     }
@@ -343,18 +342,20 @@ pub fn init_gdt() {
     }
 }
 
-/// Set this CPU's RSP0 in its TSS (the kernel stack an interrupt from
-/// user mode switches to); called from switch_to.S at every context
-/// switch. A kernel thread (`stack_top == 0`) never runs in user mode
-/// and leaves it alone.
+/// Set the kernel stack an entry from user mode switches to on this
+/// CPU: RSP0 in its TSS (interrupts, exceptions) and the per-CPU
+/// top_of_stack (`syscall_entry`); called from switch_to.S at every
+/// context switch. A kernel thread (`stack_top == 0`) never runs in
+/// user mode and leaves both alone.
 #[unsafe(no_mangle)]
 pub extern "C" fn set_kernel_stack(stack_top: u64) {
     if stack_top == 0 {
         return;
     }
-    // SAFETY: this CPU's own TSS
+    // SAFETY: this CPU's own TSS and per-CPU data
     unsafe {
         (*tables(crate::cpu::this_id())).tss.privilege_stack_table[0] = stack_top;
+        super::percpu::current_cpu_mut().top_of_stack = stack_top;
     }
 }
 

@@ -764,31 +764,6 @@ unsafe fn rdmsr(msr: u32) -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
-/// Kernel stack pointer for syscall entry
-/// This is loaded when switching from user to kernel mode
-static mut SYSCALL_KERNEL_STACK: u64 = 0;
-
-/// Set the kernel stack pointer used by syscall entry
-///
-/// Called from switch_to.S assembly during initial context switch.
-#[unsafe(no_mangle)]
-///
-/// Global like the TSS: `stack == 0` (kernel threads) leaves it alone.
-pub extern "C" fn set_syscall_kernel_stack(stack: u64) {
-    if stack == 0 {
-        return;
-    }
-    unsafe {
-        SYSCALL_KERNEL_STACK = stack;
-    }
-}
-
-/// Get the current syscall kernel stack value (for debugging)
-#[allow(dead_code)]
-pub fn get_syscall_kernel_stack() -> u64 {
-    unsafe { SYSCALL_KERNEL_STACK }
-}
-
 /// Syscall entry point
 ///
 /// On entry (from user mode):
@@ -810,11 +785,11 @@ pub fn get_syscall_kernel_stack() -> u64 {
 ///   [user RSP]  <- bottom of our frame
 ///
 /// Must:
-/// 1. Switch to kernel stack
+/// 1. swapgs (kernel GS base) and switch to this CPU's top_of_stack
 /// 2. Save user state
 /// 3. Call syscall handler
 /// 4. Restore user state
-/// 5. Switch back to user stack
+/// 5. Switch back to user stack, swapgs (user GS base)
 /// 6. sysret back to user
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
@@ -829,13 +804,15 @@ unsafe extern "C" fn syscall_entry() {
         // Linux syscall ABI: all registers preserved except RAX (retval), RCX, R11
         // This means we MUST save/restore RDI, RSI, RDX, R10, R8, R9, and callee-saved regs
 
-        // Switch to kernel stack, saving user RSP
-        "xchg rsp, [rip + {kstack}]",
-        // Now RSP = kernel stack, [kstack] = user RSP
+        // Kernel GS base, then this task's kernel stack (Linux
+        // entry_SYSCALL_64); interrupts stay off until the user state
+        // is saved
+        "swapgs",
+        "mov gs:[{user_rsp}], rsp",
+        "mov rsp, gs:[{top}]",
 
         // Build our stack frame. We'll restore everything on exit.
-        // Save user RSP (currently in kstack variable)
-        "push [rip + {kstack}]",
+        "push gs:[{user_rsp}]",
 
         // Save syscall-clobbered registers
         "push rcx",        // User RIP
@@ -858,11 +835,6 @@ unsafe extern "C" fn syscall_entry() {
         "push r10",
         "push r8",
         "push r9",
-
-        // Kernel GS base back before any Rust code (a user `mov gs`
-        // replaced it; percpu::restore_kernel_gs). The frame holds every
-        // register it clobbers.
-        "call {kgs}",
 
         // Save RCX (user RIP), R11 (user RFLAGS), user RSP, and callee-saved regs
         // for clone()/fork(). The child needs to inherit ALL parent registers.
@@ -947,8 +919,8 @@ unsafe extern "C" fn syscall_entry() {
         // Call the handler (returns result in RAX)
         "call {handler}",
 
-        // Interrupts off from here to SYSRET/IRETQ: the exit path writes
-        // the global entry stack and per-CPU user state
+        // Interrupts off from here to SYSRET/IRETQ: the exit path reads
+        // the per-CPU user state and swaps the GS base back
         "cli",
 
         // Remove arg5 from stack
@@ -996,28 +968,8 @@ unsafe extern "C" fn syscall_entry() {
         "pop rdi",
         "pop rax",   // Restore return value from saved slot
 
-        // Restore callee-saved registers (except R15 which we'll use as scratch)
-        // We need to save SYSCALL_KERNEL_STACK before clobbering any user regs
-        //
-        // Current stack layout:
-        // [RSP + 0] = r15
-        // [RSP + 8] = r14
-        // [RSP + 16] = r13
-        // [RSP + 24] = r12
-        // [RSP + 32] = rbp
-        // [RSP + 40] = rbx
-        // [RSP + 48] = r11 (user RFLAGS)
-        // [RSP + 56] = rcx (user RIP)
-        // [RSP + 64] = user_rsp
-        //
-        // After all pops (r15-rbx, r11, rcx, user_rsp), RSP will be at current+72
-        // Save that for next syscall entry
-
-        "lea r15, [rsp + 72]",             // Calculate final kernel RSP
-        "mov [rip + {kstack}], r15",       // Save it for next syscall entry
-
-        // Now restore callee-saved registers
-        "pop r15",                         // Now safe - we've saved kstack
+        // Restore callee-saved registers
+        "pop r15",
         "pop r14",
         "pop r13",
         "pop r12",
@@ -1032,9 +984,10 @@ unsafe extern "C" fn syscall_entry() {
         // [RSP] = user_rsp
         "pop rsp",         // Load user RSP directly into RSP
 
-        // Return to user mode
+        // Return to user mode with the user GS base
         // RAX = return value, RCX = user RIP, R11 = user RFLAGS
         // All other registers have been properly restored
+        "swapgs",
         "sysretq",
 
         // IRETQ exit. Frame layout as above, F = frame base:
@@ -1045,9 +998,6 @@ unsafe extern "C" fn syscall_entry() {
         "sub rsp, 56",
         "mov rdi, rsp",
         "call {fill_iret}",
-        // F = rsp + 56; the empty kernel stack starts at F + 128
-        "lea rax, [rsp + 184]",
-        "mov [rip + {kstack}], rax",
         "mov r9, [rsp + 56]",
         "mov r8, [rsp + 64]",
         "mov r10, [rsp + 72]",
@@ -1063,15 +1013,16 @@ unsafe extern "C" fn syscall_entry() {
         "mov rbx, [rsp + 152]",
         "mov rcx, [rsp + 40]",
         "mov r11, [rsp + 48]",
+        "swapgs",
         "iretq",
 
         handler = sym x86_64_syscall_dispatch,
-        kstack = sym SYSCALL_KERNEL_STACK,
+        user_rsp = const core::mem::offset_of!(super::percpu::PerCpu, user_rsp),
+        top = const core::mem::offset_of!(super::percpu::PerCpu, top_of_stack),
         save_syscall_state = sym super::percpu::save_syscall_state,
         save_syscall_caller_saved = sym super::percpu::save_syscall_caller_saved,
         update_frame = sym super::percpu::update_syscall_return_frame,
         fill_iret = sym super::percpu::fill_iret_frame,
-        kgs = sym super::percpu::restore_kernel_gs,
     );
 }
 
@@ -1083,7 +1034,7 @@ unsafe extern "C" fn syscall_entry() {
 /// # Arguments
 /// * `entry` - User mode entry point (RIP)
 /// * `user_stack` - User mode stack pointer (RSP)
-/// * `kernel_stack` - Kernel stack pointer to save in TSS for syscall return
+/// * `kernel_stack` - The task's kernel stack top (TSS.RSP0, top_of_stack)
 ///
 /// # Safety
 /// The caller must ensure:
@@ -1101,19 +1052,13 @@ pub unsafe extern "C" fn jump_to_user_iret(
         // Save all input registers - they will be clobbered by function calls
         "push rdi",        // entry
         "push rsi",        // user_stack
-        "push rdx",        // kernel_stack (twice: keeps the stack layout)
-        "push rdx",
+        "push rdx",        // kernel_stack (three pushes: the call is aligned)
 
-        // Set kernel stack in TSS for interrupt return path
+        // Kernel stack of entries from user mode
         "mov rdi, rdx",
         "call {set_kstack}",
 
-        // Set kernel stack for syscall entry
-        "mov rdi, [rsp]",  // kernel_stack is at top of our saved regs
-        "call {set_syscall_kstack}",
-
         // Restore all input registers
-        "pop rdx",
         "pop rdx",
         "pop rsi",
         "pop rdi",
@@ -1155,11 +1100,11 @@ pub unsafe extern "C" fn jump_to_user_iret(
         "xor r14, r14",
         "xor r15, r15",
 
-        // Return to user mode
+        // Return to user mode with the user GS base
+        "swapgs",
         "iretq",
 
         set_kstack = sym super::cpu::set_kernel_stack,
-        set_syscall_kstack = sym set_syscall_kernel_stack,
         user_cs = const USER_CODE_SELECTOR as u64,
         user_ss = const USER_DATA_SELECTOR as u64,
     );

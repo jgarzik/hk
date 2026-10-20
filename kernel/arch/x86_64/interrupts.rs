@@ -19,12 +19,13 @@ pub const LAPIC_TIMER_VECTOR: u8 = 0x40;
 /// Number of IDT entries (256 interrupt vectors)
 const IDT_ENTRIES: usize = 256;
 
-/// IDT gate types
+/// IDT gate types: every vector is an interrupt gate (interrupts off on
+/// entry, Linux idt.c), so nothing interrupts an entry stub before its
+/// `swapgs`; the handlers turn them back on where they may
 const GATE_INTERRUPT: u8 = 0x8E; // Present, DPL=0, 64-bit interrupt gate
-const GATE_TRAP: u8 = 0x8F; // Present, DPL=0, 64-bit trap gate
-/// Present, DPL=3, 64-bit trap gate: reachable by `int3`/`into` from user
-/// mode (Linux: X86_TRAP_BP and X86_TRAP_OF are system gates)
-const GATE_TRAP_USER: u8 = 0xEF;
+/// Present, DPL=3, 64-bit interrupt gate: reachable by `int3`/`into` from
+/// user mode (Linux: X86_TRAP_BP and X86_TRAP_OF are system gates)
+const GATE_INT_USER: u8 = 0xEE;
 
 /// IDT entry (16 bytes in 64-bit mode)
 #[derive(Clone, Copy)]
@@ -117,43 +118,43 @@ const EXCEPTION_NAMES: [&str; 32] = [
 pub fn init_idt() {
     unsafe {
         // Set up exception handlers (vectors 0-31)
-        IDT[0].set_handler(exception_handler_0 as *const () as u64, GATE_TRAP);
-        IDT[1].set_handler(exception_handler_1 as *const () as u64, GATE_TRAP);
+        IDT[0].set_handler(exception_handler_0 as *const () as u64, GATE_INTERRUPT);
+        IDT[1].set_handler(exception_handler_1 as *const () as u64, GATE_INTERRUPT);
         // NMI uses IST2 for safety
         IDT[2].set_handler_with_ist(
             exception_handler_2 as *const () as u64,
             GATE_INTERRUPT,
             super::cpu::IST_NMI,
         );
-        IDT[3].set_handler(exception_handler_3 as *const () as u64, GATE_TRAP_USER);
-        IDT[4].set_handler(exception_handler_4 as *const () as u64, GATE_TRAP_USER);
-        IDT[5].set_handler(exception_handler_5 as *const () as u64, GATE_TRAP);
-        IDT[6].set_handler(exception_handler_6 as *const () as u64, GATE_TRAP);
-        IDT[7].set_handler(exception_handler_7 as *const () as u64, GATE_TRAP);
+        IDT[3].set_handler(exception_handler_3 as *const () as u64, GATE_INT_USER);
+        IDT[4].set_handler(exception_handler_4 as *const () as u64, GATE_INT_USER);
+        IDT[5].set_handler(exception_handler_5 as *const () as u64, GATE_INTERRUPT);
+        IDT[6].set_handler(exception_handler_6 as *const () as u64, GATE_INTERRUPT);
+        IDT[7].set_handler(exception_handler_7 as *const () as u64, GATE_INTERRUPT);
         // Double fault uses IST1 to avoid stack issues
         IDT[8].set_handler_with_ist(
             exception_handler_8 as *const () as u64,
-            GATE_TRAP,
+            GATE_INTERRUPT,
             super::cpu::IST_DOUBLE_FAULT,
         );
-        IDT[9].set_handler(exception_handler_9 as *const () as u64, GATE_TRAP);
-        IDT[10].set_handler(exception_handler_10 as *const () as u64, GATE_TRAP);
-        IDT[11].set_handler(exception_handler_11 as *const () as u64, GATE_TRAP);
-        IDT[12].set_handler(exception_handler_12 as *const () as u64, GATE_TRAP);
-        IDT[13].set_handler(exception_handler_13 as *const () as u64, GATE_TRAP);
-        IDT[14].set_handler(exception_handler_14 as *const () as u64, GATE_TRAP);
+        IDT[9].set_handler(exception_handler_9 as *const () as u64, GATE_INTERRUPT);
+        IDT[10].set_handler(exception_handler_10 as *const () as u64, GATE_INTERRUPT);
+        IDT[11].set_handler(exception_handler_11 as *const () as u64, GATE_INTERRUPT);
+        IDT[12].set_handler(exception_handler_12 as *const () as u64, GATE_INTERRUPT);
+        IDT[13].set_handler(exception_handler_13 as *const () as u64, GATE_INTERRUPT);
+        IDT[14].set_handler(exception_handler_14 as *const () as u64, GATE_INTERRUPT);
         // 15 is reserved
-        IDT[16].set_handler(exception_handler_16 as *const () as u64, GATE_TRAP);
-        IDT[17].set_handler(exception_handler_17 as *const () as u64, GATE_TRAP);
+        IDT[16].set_handler(exception_handler_16 as *const () as u64, GATE_INTERRUPT);
+        IDT[17].set_handler(exception_handler_17 as *const () as u64, GATE_INTERRUPT);
         // Machine check: its own IST stack too
         IDT[18].set_handler_with_ist(
             exception_handler_18 as *const () as u64,
-            GATE_TRAP,
+            GATE_INTERRUPT,
             super::cpu::IST_MCE,
         );
-        IDT[19].set_handler(exception_handler_19 as *const () as u64, GATE_TRAP);
-        IDT[20].set_handler(exception_handler_20 as *const () as u64, GATE_TRAP);
-        IDT[21].set_handler(exception_handler_21 as *const () as u64, GATE_TRAP);
+        IDT[19].set_handler(exception_handler_19 as *const () as u64, GATE_INTERRUPT);
+        IDT[20].set_handler(exception_handler_20 as *const () as u64, GATE_INTERRUPT);
+        IDT[21].set_handler(exception_handler_21 as *const () as u64, GATE_INTERRUPT);
 
         // Set up IRQ handlers (vectors 32-47, after PIC remapping)
         // Master PIC: IRQs 0-7 -> vectors 32-39
@@ -249,16 +250,37 @@ macro_rules! exception_handler_with_error {
     };
 }
 
+/// An exception stub of the paranoid kind (NMI, #DF, #MC): these may
+/// arrive between `syscall`/`swapgs` and the entry's own `swapgs`, so
+/// the saved CS does not tell which GS base is live (`paranoid_common`)
+macro_rules! paranoid_handler {
+    ($name:ident, $vector:expr, $error:expr) => {
+        #[unsafe(naked)]
+        unsafe extern "C" fn $name() {
+            core::arch::naked_asm!(
+                ".if {err} == 0",
+                "push 0",          // Dummy error code
+                ".endif",
+                "push {vec}",      // Vector number
+                "jmp {common}",
+                err = const $error as u64,
+                vec = const $vector as u64,
+                common = sym paranoid_common,
+            );
+        }
+    };
+}
+
 // Define exception handlers
 exception_handler_no_error!(exception_handler_0, 0); // Divide Error
 exception_handler_no_error!(exception_handler_1, 1); // Debug
-exception_handler_no_error!(exception_handler_2, 2); // NMI
+paranoid_handler!(exception_handler_2, 2, 0); // NMI
 exception_handler_no_error!(exception_handler_3, 3); // Breakpoint
 exception_handler_no_error!(exception_handler_4, 4); // Overflow
 exception_handler_no_error!(exception_handler_5, 5); // Bound Range
 exception_handler_no_error!(exception_handler_6, 6); // Invalid Opcode
 exception_handler_no_error!(exception_handler_7, 7); // Device Not Available
-exception_handler_with_error!(exception_handler_8, 8); // Double Fault
+paranoid_handler!(exception_handler_8, 8, 1); // Double Fault
 exception_handler_no_error!(exception_handler_9, 9); // Coprocessor Segment Overrun
 exception_handler_with_error!(exception_handler_10, 10); // Invalid TSS
 exception_handler_with_error!(exception_handler_11, 11); // Segment Not Present
@@ -267,7 +289,7 @@ exception_handler_with_error!(exception_handler_13, 13); // General Protection F
 exception_handler_with_error!(exception_handler_14, 14); // Page Fault
 exception_handler_no_error!(exception_handler_16, 16); // x87 FPU Error
 exception_handler_with_error!(exception_handler_17, 17); // Alignment Check
-exception_handler_no_error!(exception_handler_18, 18); // Machine Check
+paranoid_handler!(exception_handler_18, 18, 0); // Machine Check
 exception_handler_no_error!(exception_handler_19, 19); // SIMD FP Exception
 exception_handler_no_error!(exception_handler_20, 20); // Virtualization Exception
 exception_handler_with_error!(exception_handler_21, 21); // Control Protection
@@ -278,6 +300,12 @@ exception_handler_with_error!(exception_handler_21, 21); // Control Protection
 unsafe extern "C" fn exception_common() {
     core::arch::naked_asm!(
         // Stack from CPU/stub: [vector, error_code, RIP, CS, RFLAGS, RSP, SS]
+
+        // From user mode (CS RPL 3): the kernel GS base first
+        "test byte ptr [rsp + 24], 3",
+        "jz 3f",
+        "swapgs",
+        "3:",
 
         // We need to preserve ALL registers while extracting the vector number.
         // The vector was pushed by the stub and we need to extract it.
@@ -307,20 +335,15 @@ unsafe extern "C" fn exception_common() {
         // Stack now: [rax, rbx, rcx, rdx, rsi, rdi, rbp, r8-r14, r15, error_code, rip, cs, rflags, rsp, ss]
         // This matches TrapFrame layout!
 
-        // Kernel GS base, whatever the origin (keeps r15, the vector)
-        "call {}",
-
         // Call Rust handler with (frame pointer, vector number)
         "mov rdi, rsp",      // First arg: trap frame pointer
         "mov rsi, r15",      // Second arg: vector number (in R15)
         "call {}",
 
-        // Check return value - if non-zero, fault was handled
-        "test rax, rax",
-        "jnz 1f",
-
-        // Fault not handled - fatal handler will loop forever
-        "1:",
+        // The handler may have turned interrupts on: off for the return
+        // (an interrupt between the swapgs and the iretq below would
+        // run with the user GS base)
+        "cli",
 
         // Restore all registers
         "pop rax",
@@ -342,9 +365,76 @@ unsafe extern "C" fn exception_common() {
         // Skip error code
         "add rsp, 8",
 
+        // Back to user mode: the user GS base
+        "test byte ptr [rsp + 8], 3",
+        "jz 4f",
+        "swapgs",
+        "4:",
         "iretq",
-        sym super::percpu::restore_kernel_gs,
         sym handle_exception,
+    );
+}
+
+/// Common paranoid exception handler (NMI, #DF, #MC; Linux
+/// paranoid_entry): the live GS base is the kernel's if MSR_GS_BASE
+/// holds a kernel (negative) address, else swap and swap back on exit.
+/// Stack on entry as for `exception_common`.
+#[unsafe(naked)]
+unsafe extern "C" fn paranoid_common() {
+    core::arch::naked_asm!(
+        "xchg r15, [rsp]",   // R15 = vector, [rsp] = r15
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+
+        // EBX = 1: swapped (callee-saved across the handler)
+        "mov ecx, {gs_base}",
+        "rdmsr",
+        "xor ebx, ebx",
+        "test edx, edx",
+        "js 1f",
+        "swapgs",
+        "mov ebx, 1",
+        "1:",
+
+        "mov rdi, rsp",
+        "mov rsi, r15",
+        "call {handler}",
+
+        "test ebx, ebx",
+        "jz 2f",
+        "swapgs",
+        "2:",
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop rbp",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "add rsp, 8",
+        "iretq",
+        gs_base = const super::percpu::MSR_GS_BASE,
+        handler = sym handle_exception,
     );
 }
 
@@ -727,6 +817,10 @@ macro_rules! irq_handler {
         #[unsafe(naked)]
         unsafe extern "C" fn $name() {
             core::arch::naked_asm!(
+                "test byte ptr [rsp + 8], 3", // from user: kernel GS base
+                "jz 1f",
+                "swapgs",
+                "1:",
                 "push 0",           // Dummy error code
                 "push rax",
                 "push rbx",
@@ -743,7 +837,6 @@ macro_rules! irq_handler {
                 "push r13",
                 "push r14",
                 "push r15",
-                "call {}",          // kernel GS base (every entry)
 
                 "mov rdi, {}",      // IRQ number
                 "call {}",
@@ -764,8 +857,11 @@ macro_rules! irq_handler {
                 "pop rbx",
                 "pop rax",
                 "add rsp, 8",       // Skip error code
+                "test byte ptr [rsp + 8], 3", // to user: user GS base
+                "jz 2f",
+                "swapgs",
+                "2:",
                 "iretq",
-                sym super::percpu::restore_kernel_gs,
                 const $irq,
                 sym handle_irq,
             );
@@ -794,6 +890,11 @@ irq_handler!(irq_handler_15, 15); // Secondary ATA
 #[unsafe(naked)]
 unsafe extern "C" fn lapic_timer_handler() {
     core::arch::naked_asm!(
+        // From user mode: the kernel GS base first
+        "test byte ptr [rsp + 8], 3",
+        "jz 1f",
+        "swapgs",
+        "1:",
         // Save all registers (same as other interrupt handlers)
         "push 0",           // Dummy error code for uniform stack layout
         "push rax",
@@ -811,7 +912,6 @@ unsafe extern "C" fn lapic_timer_handler() {
         "push r13",
         "push r14",
         "push r15",
-        "call {}",          // kernel GS base (every entry)
 
         // Pass trap frame pointer as argument
         "mov rdi, rsp",
@@ -834,8 +934,11 @@ unsafe extern "C" fn lapic_timer_handler() {
         "pop rbx",
         "pop rax",
         "add rsp, 8",       // Skip error code
+        "test byte ptr [rsp + 8], 3", // to user: user GS base
+        "jz 2f",
+        "swapgs",
+        "2:",
         "iretq",
-        sym super::percpu::restore_kernel_gs,
         sym handle_lapic_timer,
     );
 }
@@ -851,6 +954,10 @@ macro_rules! ipi_handler {
         #[unsafe(naked)]
         unsafe extern "C" fn $name() {
             core::arch::naked_asm!(
+                "test byte ptr [rsp + 8], 3", // from user: kernel GS base
+                "jz 1f",
+                "swapgs",
+                "1:",
                 "push 0",
                 "push rax",
                 "push rbx",
@@ -867,7 +974,6 @@ macro_rules! ipi_handler {
                 "push r13",
                 "push r14",
                 "push r15",
-                "call {}",          // kernel GS base (every entry)
                 "call {}",
                 "pop r15",
                 "pop r14",
@@ -885,8 +991,11 @@ macro_rules! ipi_handler {
                 "pop rbx",
                 "pop rax",
                 "add rsp, 8",
+                "test byte ptr [rsp + 8], 3", // to user: user GS base
+                "jz 2f",
+                "swapgs",
+                "2:",
                 "iretq",
-                sym super::percpu::restore_kernel_gs,
                 sym $handler,
             );
         }

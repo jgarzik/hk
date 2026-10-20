@@ -11,18 +11,6 @@ chrooted process can still reach everything. `..` at the chroot root is
 not clamped either. Boot test `CHROOT` only verifies confinement on a
 Linux host (`user/boot_tester/tests/permissions.rs`).
 
-## x86: no SWAPGS, user GS base not preserved (T0)
-
-**Location**: `kernel/arch/x86_64/percpu.rs` (`restore_kernel_gs`),
-`syscall.rs`, `interrupts.rs`
-
-The kernel's per-CPU pointer is the live GS base. Every entry from user
-mode reloads it from TSC_AUX (the CPU index) before any Rust code, so a
-user `mov gs, sel` cannot redirect the kernel (stopgap). User code then
-runs with the kernel's GS base, not its own (Linux SWAPGS keeps the user
-base; ARCH_SET_GS / FSGSBASE are absent). The syscall entry stack is one
-global, not per CPU. Fix: SWAPGS plus per-CPU GDT/TSS.
-
 ## Network stack gaps (later phases of the network chunk)
 
 **Location**: `kernel/net/`
@@ -613,18 +601,15 @@ Found during T0 (2026-10-19). Tag = when to fix.
 7. **T0 resume point** (T0 next). Design: ~/.claude/plans/
    t0-foundation-design.md (commit numbers below are its §3).
    Remaining: alloc_lock (TaskRes is under TASKLIST); PGID/SID
-   pid_links (kill_pgrp/setpgid scan); 9 per-CPU GDT/TSS/IST; 10 swapgs
-   (replaces the TSC_AUX GS stopgap; handle entries before per-CPU
-   init); 11/12 pt_regs single home (x86/arm64); 13 exit_to_user_mode,
-   slice tick, kick IPI, tests a-c (mask all DAIF on every arm64 return
-   to user, incl. clone child entry); kernel stack guard pages
-   (VMAP_STACK-style, overflow on a separate stack, "kernel stack
-   overflow" panic); 15 sched entity/ttwu(&Task); 16 intrusive
+   pid_links (kill_pgrp/setpgid scan); 11/12 pt_regs single home
+   (x86/arm64); 13 exit_to_user_mode, slice tick, kick IPI, tests a-c
+   (mask all DAIF on every arm64 return to user, incl. clone child
+   entry); 15 sched entity/ttwu(&Task); 16 intrusive
    WaitQueue + FutexQ (wakeups by raw tid: waitqueue, futex, poll,
    mqueue, signalfd, sem/msg); 17 per-CPU timer wheel; 18 hrtimer-lite
    + deadline waits; 19 yield polls and SCHEDULING_ENABLED fallbacks;
    20 GFP from context/reclaim; 21 try_* user-sized allocations; tests
-   e-h; an acct test with N threads exiting at once (one record).
+   f-h; an acct test with N threads exiting at once (one record).
 8. **MM_LIFE_EXEC_CHAIN intermittent on arm64 CI** (next batch). One
    GitHub `check-arm` run (TCG, NIC=e1000) reported
    `MM_LIFE_EXEC_CHAIN:FAIL -2`: both warmup chains passed, then the

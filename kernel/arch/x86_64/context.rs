@@ -12,7 +12,7 @@
 //! save/restore FS base in Rust before calling the pure-asm switch.
 
 use super::fpu::{self, FpuArea};
-use super::percpu::write_fs_base;
+use super::percpu::{write_fs_base, write_user_gsbase};
 
 // External assembly functions from switch_to.S
 unsafe extern "C" {
@@ -229,7 +229,9 @@ pub extern "C" fn clone_child_entry() -> ! {
         // Skip error_code
         "add rsp, 8",
 
-        // IRETQ will pop: rip, cs, rflags, rsp, ss
+        // IRETQ will pop: rip, cs, rflags, rsp, ss; the child's GS base
+        // (the switch loaded it) goes live
+        "swapgs",
         "iretq",
 
         finish_switch = sym finish_context_switch,
@@ -307,14 +309,17 @@ impl TaskContext {
 /// * `new_ctx` - The context to restore
 /// * `new_kstack` - New kernel stack top (for TSS.RSP0)
 /// * `next_tls` - its user TLS register value
+/// * `next_gs` - its user GS base (swapped in on its return to user)
 pub unsafe fn context_switch(
     old_ctx: *mut TaskContext,
     new_ctx: *const TaskContext,
     new_kstack: u64,
     next_tls: u64,
+    next_gs: u64,
 ) {
-    // Load next task's user TLS register (FS base)
+    // Load next task's user TLS register (FS base) and GS base
     write_fs_base(next_tls);
+    write_user_gsbase(next_gs);
 
     // The external assembly function uses a stack-based context.
     // It saves/restores callee-saved registers via push/pop on the stack,
@@ -346,14 +351,19 @@ pub unsafe fn context_switch(
 ///
 /// # Safety
 /// Same requirements as context_switch, except old_ctx is not used.
-pub unsafe fn context_switch_first(new_ctx: *const TaskContext, new_kstack: u64, next_tls: u64) {
-    // Load next task's user TLS register (FS base)
+pub unsafe fn context_switch_first(
+    new_ctx: *const TaskContext,
+    new_kstack: u64,
+    next_tls: u64,
+    next_gs: u64,
+) {
+    // Load next task's user TLS register (FS base) and GS base
     write_fs_base(next_tls);
+    write_user_gsbase(next_gs);
 
     // The external assembly function handles:
     // - Loading next task's RSP
-    // - Updating TSS.RSP0
-    // - Updating SYSCALL_KERNEL_STACK
+    // - Setting the kernel stack of entries from user mode
     // - Restoring callee-saved registers from the new stack
     unsafe {
         let next_sp = (*new_ctx).rsp;
@@ -388,9 +398,10 @@ impl ContextOps for X86_64Arch {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         next_tls: u64,
+        next_gs: u64,
     ) {
         unsafe {
-            context_switch(old_ctx, new_ctx, new_kstack, next_tls);
+            context_switch(old_ctx, new_ctx, new_kstack, next_tls, next_gs);
         }
     }
 
@@ -398,9 +409,10 @@ impl ContextOps for X86_64Arch {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         next_tls: u64,
+        next_gs: u64,
     ) -> ! {
         unsafe {
-            context_switch_first(new_ctx, new_kstack, next_tls);
+            context_switch_first(new_ctx, new_kstack, next_tls, next_gs);
             // The above never returns, but we need to satisfy the type system
             core::hint::unreachable_unchecked()
         }

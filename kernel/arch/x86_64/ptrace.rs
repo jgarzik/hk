@@ -108,7 +108,7 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
         rsp: tf.rsp,
         ss: 0x2b, // User stack segment
         fs_base: task.task.tls.load(core::sync::atomic::Ordering::Relaxed),
-        gs_base: 0,
+        gs_base: task.task.gsbase.load(core::sync::atomic::Ordering::Relaxed),
         ds: 0x2b,
         es: 0x2b,
         fs: 0,
@@ -137,8 +137,7 @@ pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
     if regs.rip >= 0x0000_8000_0000_0000 {
         return Err(-5);
     }
-    // Linux putreg: a base at or above TASK_SIZE_MAX is EIO (the user
-    // GS base is not kept, but checked all the same)
+    // Linux putreg: a base at or above TASK_SIZE_MAX is EIO
     if !super::percpu::fs_base_ok(regs.fs_base) || !super::percpu::fs_base_ok(regs.gs_base) {
         return Err(-5);
     }
@@ -167,6 +166,9 @@ pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
     task.task
         .tls
         .store(regs.fs_base, core::sync::atomic::Ordering::Relaxed);
+    task.task
+        .gsbase
+        .store(regs.gs_base, core::sync::atomic::Ordering::Relaxed);
 
     Ok(())
 }

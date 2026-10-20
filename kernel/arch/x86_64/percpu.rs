@@ -2,6 +2,16 @@
 //!
 //! This module provides per-CPU data storage accessed via the GS segment.
 //! Each CPU has its own `PerCpu` structure containing CPU-local state.
+//!
+//! GS follows Linux's SWAPGS model: in the kernel MSR_GS_BASE holds this
+//! CPU's `PerCpu` and MSR_KERNEL_GS_BASE the user's GS base; every entry
+//! from user mode (syscall, IDT stubs when the saved CS is a user
+//! selector) runs `swapgs` first and every return to user mode runs it
+//! last, so user code has its own GS base (`mov gs`, ARCH_SET_GS) and
+//! can never redirect the kernel's. NMI, #DF and #MC may arrive in the
+//! instructions around those swaps: their (paranoid) entries read
+//! MSR_GS_BASE instead (a kernel address is negative; a user one is
+//! below TASK_SIZE).
 
 use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -16,6 +26,15 @@ pub const MAX_CPUS: usize = crate::cpumask::NR_CPUS;
 pub struct PerCpu {
     /// Self-pointer for GS:0 access
     pub self_ptr: *mut PerCpu,
+
+    /// Top of the current task's kernel stack: `syscall_entry` switches
+    /// to it (Linux cpu_current_top_of_stack); set with TSS.RSP0 at
+    /// every switch to a user task
+    pub top_of_stack: u64,
+
+    /// The user RSP while `syscall_entry` switches stacks (Linux
+    /// cpu_tss_rw.x86_tss.sp2 scratch)
+    pub user_rsp: u64,
 
     /// Logical CPU ID (0 = BSP, 1+ = APs)
     pub cpu_id: u32,
@@ -191,6 +210,8 @@ impl PerCpu {
     const fn uninit() -> Self {
         Self {
             self_ptr: core::ptr::null_mut(),
+            top_of_stack: 0,
+            user_rsp: 0,
             cpu_id: 0,
             apic_id: 0,
             is_bsp: false,
@@ -293,15 +314,16 @@ pub unsafe fn current_cpu_mut() -> &'static mut PerCpu {
     }
 }
 
-/// Try to get current CPU data (returns None if GS not set up)
+/// Try to get current CPU data (None before the boot CPU's per-CPU
+/// data exists): a load of gs:0, valid on every CPU running kernel code
+/// once `init_bsp` ran (an AP sets its GS base first thing, `init_ap`)
 #[inline]
 pub fn try_current_cpu() -> Option<&'static PerCpu> {
-    // Read GS base via MSR
-    let gs_base = read_gs_base();
-    if gs_base == 0 {
+    if !crate::task::percpu::PERCPU_UP.load(Ordering::Relaxed) {
         return None;
     }
-    unsafe { Some(&*(gs_base as *const PerCpu)) }
+    // SAFETY: GS base is this CPU's PerCpu (see above)
+    unsafe { Some(current_cpu_mut()) }
 }
 
 /// Initialize per-CPU data for the BSP (CPU 0)
@@ -313,8 +335,9 @@ pub fn init_bsp(apic_id: u8) {
     let percpu = get_percpu(0);
     percpu.init(0, apic_id as u32, true);
 
-    // Set GS base to point to our per-CPU data
+    // Set GS base to point to our per-CPU data; no user GS base yet
     set_gs_base(percpu as *mut PerCpu as u64);
+    write_user_gsbase(0);
     crate::task::percpu::PERCPU_UP.store(true, Ordering::Release);
 
     // Mark BSP as online
@@ -334,8 +357,9 @@ pub fn init_ap(apic_id: u8) -> u32 {
     let percpu = get_percpu(cpu_id);
     percpu.init(cpu_id, apic_id as u32, false);
 
-    // Set GS base to point to our per-CPU data
+    // Set GS base to point to our per-CPU data; no user GS base yet
     set_gs_base(percpu as *mut PerCpu as u64);
+    write_user_gsbase(0);
 
     // Mark as online
     percpu.set_online();
@@ -349,7 +373,7 @@ pub fn online_cpu_count() -> u32 {
 }
 
 /// IA32_TSC_AUX: this CPU's index (Linux keeps cpu | node << 12 there for
-/// RDTSCP/RDPID getcpu); read back by `restore_kernel_gs`
+/// RDTSCP/RDPID getcpu)
 const MSR_TSC_AUX: u32 = 0xC0000103;
 
 /// Record this CPU's index in TSC_AUX (user code cannot write it)
@@ -366,63 +390,76 @@ fn set_tsc_aux(cpu_id: u32) {
     }
 }
 
-/// Reload GS base with this CPU's per-CPU pointer, found from TSC_AUX
-/// (entry stubs, registers saved; clobbers rax, rcx, rdx and flags).
-///
-/// hk does not use SWAPGS yet: the kernel's per-CPU pointer is the live
-/// GS base, and a user `mov gs, sel` replaces it with the descriptor's
-/// base (0). Every kernel entry (syscall and every IDT stub, from user
-/// or kernel mode: an NMI or fault may land before another entry's
-/// restore) puts it back before any Rust code runs and before
-/// interrupts are enabled; it is idempotent.
-#[unsafe(naked)]
-pub unsafe extern "C" fn restore_kernel_gs() {
-    core::arch::naked_asm!(
-        "rdtscp",
-        "mov eax, ecx",
-        "imul rax, rax, {size}",
-        "lea rcx, [rip + {array}]",
-        "add rax, rcx",
-        "mov rdx, rax",
-        "shr rdx, 32",
-        "mov ecx, {msr}",
-        "wrmsr",
-        "ret",
-        size = const core::mem::size_of::<PerCpu>(),
-        array = sym PERCPU_ARRAY,
-        msr = const 0xC0000101u32,
-    );
-}
+/// MSR_GS_BASE: the live GS base (in the kernel: this CPU's PerCpu)
+pub const MSR_GS_BASE: u32 = 0xC0000101;
+/// MSR_KERNEL_GS_BASE: the base `swapgs` exchanges it with (in the
+/// kernel: the user's GS base)
+const MSR_KERNEL_GS_BASE: u32 = 0xC0000102;
 
-/// Set the GS base register (MSR 0xC0000101)
-pub fn set_gs_base(addr: u64) {
-    const MSR_GS_BASE: u32 = 0xC0000101;
+/// Write an MSR
+fn wrmsr(msr: u32, v: u64) {
+    // SAFETY: the base MSRs above take any canonical value
     unsafe {
         ::core::arch::asm!(
             "wrmsr",
-            in("ecx") MSR_GS_BASE,
-            in("eax") addr as u32,
-            in("edx") (addr >> 32) as u32,
+            in("ecx") msr,
+            in("eax") v as u32,
+            in("edx") (v >> 32) as u32,
             options(nostack, preserves_flags)
         );
     }
 }
 
-/// Read the GS base register
-pub fn read_gs_base() -> u64 {
-    const MSR_GS_BASE: u32 = 0xC0000101;
-    let low: u32;
-    let high: u32;
+/// Read an MSR
+fn rdmsr(msr: u32) -> u64 {
+    let (low, high): (u32, u32);
+    // SAFETY: reading the base MSRs above
     unsafe {
         ::core::arch::asm!(
             "rdmsr",
-            in("ecx") MSR_GS_BASE,
+            in("ecx") msr,
             out("eax") low,
             out("edx") high,
             options(nostack, preserves_flags)
         );
     }
     ((high as u64) << 32) | (low as u64)
+}
+
+/// Set the GS base register (this CPU's per-CPU pointer)
+pub fn set_gs_base(addr: u64) {
+    wrmsr(MSR_GS_BASE, addr);
+}
+
+/// The current task's user GS base, while in the kernel (Linux
+/// x86_gsbase_read_cpu_inactive)
+pub fn read_user_gsbase() -> u64 {
+    rdmsr(MSR_KERNEL_GS_BASE)
+}
+
+/// Set the user GS base the next return to user mode swaps in (Linux
+/// x86_gsbase_write_cpu_inactive); `addr` passed `fs_base_ok`
+pub fn write_user_gsbase(addr: u64) {
+    wrmsr(MSR_KERNEL_GS_BASE, addr);
+}
+
+/// Load the null selector into the user's GS (Linux load_gs_index(0)):
+/// the selector load acts on the live GS, so it runs between two
+/// `swapgs`, with interrupts off. It may change the user base, which
+/// the caller sets next.
+pub fn load_user_gs_null() {
+    let irq = crate::arch::local_irq_save();
+    // SAFETY: interrupts off; the second swapgs restores the kernel GS
+    unsafe {
+        ::core::arch::asm!(
+            "swapgs",
+            "mov gs, {0:x}",
+            "swapgs",
+            in(reg) 0u32,
+            options(nostack, preserves_flags)
+        );
+    }
+    crate::arch::local_irq_restore(irq);
 }
 
 // ============================================================================
