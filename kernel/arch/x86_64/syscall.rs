@@ -8,7 +8,7 @@
 //! The SYS_* constants are x86-64 Linux ABI specific. Other architectures
 //! (e.g., aarch64) have different syscall numbers.
 
-use super::cpu::{KERNEL_CODE_SELECTOR, USER_CODE_SELECTOR, USER_DATA_SELECTOR};
+use super::cpu::{KERNEL_CODE_SELECTOR, USER_DATA_SELECTOR};
 
 // =============================================================================
 // Linux x86-64 syscall numbers
@@ -447,7 +447,6 @@ pub const SYS_RT_SIGACTION: u64 = 13;
 /// rt_sigprocmask(how, set, oset, sigsetsize)
 pub const SYS_RT_SIGPROCMASK: u64 = 14;
 /// rt_sigreturn() - return from signal handler
-#[allow(dead_code)] // Infrastructure for future signal delivery
 pub const SYS_RT_SIGRETURN: u64 = 15;
 /// kill(pid, sig)
 pub const SYS_KILL: u64 = 62;
@@ -718,7 +717,7 @@ pub fn init() {
     let star = ((KERNEL_CODE_SELECTOR as u64) << 32) | (((USER_DATA_SELECTOR as u64) - 8) << 48);
 
     // LSTAR: target RIP for syscall
-    let lstar = syscall_entry as *const () as u64;
+    let lstar = super::entry::syscall_entry as *const () as u64;
 
     // SFMASK: flags to clear on syscall
     let sfmask = SYSCALL_FLAG_MASK;
@@ -764,352 +763,6 @@ unsafe fn rdmsr(msr: u32) -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
-/// Syscall entry point
-///
-/// On entry (from user mode):
-/// - RCX = user RIP (return address)
-/// - R11 = user RFLAGS
-/// - RSP = user stack pointer
-/// - RAX = syscall number
-/// - RDI, RSI, RDX, R10, R8, R9 = arguments
-///
-/// Stack frame layout (growing down, top of stack first):
-///   [callee-saved r15 placeholder] <- pushed for consistency
-///   [r14]
-///   [r13]
-///   [r12]
-///   [rbp]
-///   [rbx]
-///   [user r11/RFLAGS]
-///   [user rcx/RIP]
-///   [user RSP]  <- bottom of our frame
-///
-/// Must:
-/// 1. swapgs (kernel GS base) and switch to this CPU's top_of_stack
-/// 2. Save user state
-/// 3. Call syscall handler
-/// 4. Restore user state
-/// 5. Switch back to user stack, swapgs (user GS base)
-/// 6. sysret back to user
-#[unsafe(naked)]
-unsafe extern "C" fn syscall_entry() {
-    core::arch::naked_asm!(
-        // On entry from user mode via syscall instruction:
-        // RCX = user RIP (saved by syscall instruction)
-        // R11 = user RFLAGS (saved by syscall instruction)
-        // RSP = user stack (syscall doesn't switch stacks!)
-        // RAX = syscall number
-        // RDI = arg0, RSI = arg1, RDX = arg2, R10 = arg3, R8 = arg4, R9 = arg5
-        //
-        // Linux syscall ABI: all registers preserved except RAX (retval), RCX, R11
-        // This means we MUST save/restore RDI, RSI, RDX, R10, R8, R9, and callee-saved regs
-
-        // Kernel GS base, then this task's kernel stack (Linux
-        // entry_SYSCALL_64); interrupts stay off until the user state
-        // is saved
-        "swapgs",
-        "mov gs:[{user_rsp}], rsp",
-        "mov rsp, gs:[{top}]",
-
-        // Build our stack frame. We'll restore everything on exit.
-        "push gs:[{user_rsp}]",
-
-        // Save syscall-clobbered registers
-        "push rcx",        // User RIP
-        "push r11",        // User RFLAGS
-
-        // Save callee-saved registers (C ABI requires we preserve these)
-        "push rbx",
-        "push rbp",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-
-        // Save caller-saved registers that syscall ABI says we must preserve
-        // Save RAX (syscall number) as part of the frame - return value will go here
-        "push rax",
-        "push rdi",
-        "push rsi",
-        "push rdx",
-        "push r10",
-        "push r8",
-        "push r9",
-
-        // Save RCX (user RIP), R11 (user RFLAGS), user RSP, and callee-saved regs
-        // for clone()/fork(). The child needs to inherit ALL parent registers.
-        // Stack layout at this point (from top):
-        //   RSP+0:   r9
-        //   RSP+8:   r8
-        //   RSP+16:  r10
-        //   RSP+24:  rdx
-        //   RSP+32:  rsi
-        //   RSP+40:  rdi
-        //   RSP+48:  rax (syscall num / return value slot)
-        //   RSP+56:  r15
-        //   RSP+64:  r14
-        //   RSP+72:  r13
-        //   RSP+80:  r12
-        //   RSP+88:  rbp
-        //   RSP+96:  rbx
-        //   RSP+104: r11 (user RFLAGS)
-        //   RSP+112: rcx (user RIP)
-        //   RSP+120: user_rsp
-        //
-        // save_syscall_state(rip, rflags, rsp, rbx, rbp, r12, r13, r14, r15)
-        // ABI: rdi, rsi, rdx, rcx, r8, r9, [stack+0], [stack+8], [stack+16]
-        //
-        // First 6 args in registers, last 3 on stack
-        // Push stack args in reverse order (r15, r14, r13)
-        "push [rsp + 56]",       // r15 -> stack arg 3 (at rsp+0 after 3 pushes)
-        "push [rsp + 72]",       // r14 -> stack arg 2 (offset +8 due to push)
-        "push [rsp + 88]",       // r13 -> stack arg 1 (offset +16 due to 2 pushes)
-        // Now set up register args
-        "mov rdi, [rsp + 136]",  // rcx (user RIP) -> rdi (offset: 112 + 24)
-        "mov rsi, [rsp + 128]",  // r11 (user RFLAGS) -> rsi (offset: 104 + 24)
-        "mov rdx, [rsp + 144]",  // user_rsp -> rdx (offset: 120 + 24)
-        "mov rcx, [rsp + 120]",  // rbx -> rcx (offset: 96 + 24)
-        "mov r8, [rsp + 112]",   // rbp -> r8 (offset: 88 + 24)
-        "mov r9, [rsp + 104]",   // r12 -> r9 (offset: 80 + 24)
-        "call {save_syscall_state}",
-        // Remove stack args
-        "add rsp, 24",
-
-        // Save caller-saved registers for fork() (Linux ABI preserves these across syscalls)
-        // save_syscall_caller_saved(rdi, rsi, rdx, r8, r9, r10)
-        // Stack layout: [r9, r8, r10, rdx, rsi, rdi, rax, ...]
-        "mov rdi, [rsp + 40]",   // saved RDI
-        "mov rsi, [rsp + 32]",   // saved RSI
-        "mov rdx, [rsp + 24]",   // saved RDX
-        "mov rcx, [rsp + 8]",    // saved R8
-        "mov r8, [rsp + 0]",     // saved R9
-        "mov r9, [rsp + 16]",    // saved R10
-        "call {save_syscall_caller_saved}",
-
-        // The user state is saved: run the syscall with interrupts on
-        // (Linux do_syscall_64). The kernel is not preemptive, so an
-        // interrupt never switches tasks here (doc/LOCKING.md 7)
-        "sti",
-
-        // Now set up arguments for C handler
-        // syscall_handler(num, arg0, arg1, arg2, arg3, arg4, arg5)
-        // C ABI: rdi, rsi, rdx, rcx, r8, r9, [stack]
-        //
-        // Stack values (offsets after save_syscall_state call):
-        // [RSP + 0] = saved R9 (arg5)
-        // [RSP + 8] = saved R8 (arg4)
-        // [RSP + 16] = saved R10 (arg3)
-        // [RSP + 24] = saved RDX (arg2)
-        // [RSP + 32] = saved RSI (arg1)
-        // [RSP + 40] = saved RDI (arg0)
-        // [RSP + 48] = saved RAX (syscall num)
-
-        // Push arg5 for 7th parameter
-        "push [rsp + 0]",  // Push saved R9 (arg5) for 7th param
-
-        // Do the shuffle carefully using stack values (offsets +8 due to push above)
-        "mov r15, [rsp + 48]",  // arg0 (saved RDI) -> r15 (temp)
-        "mov r9, [rsp + 16]",   // arg4 (saved R8) -> r9
-        "mov r8, [rsp + 24]",   // arg3 (saved R10) -> r8
-        "mov rcx, [rsp + 32]",  // arg2 (saved RDX) -> rcx
-        "mov rdx, [rsp + 40]",  // arg1 (saved RSI) -> rdx
-        "mov rsi, r15",         // arg0 (temp) -> rsi
-        "mov rdi, [rsp + 56]",  // syscall num (saved RAX) -> rdi
-
-        // Call the handler (returns result in RAX)
-        "call {handler}",
-
-        // Interrupts off from here to SYSRET/IRETQ: the exit path reads
-        // the per-CPU user state and swaps the GS base back
-        "cli",
-
-        // Remove arg5 from stack
-        "add rsp, 8",
-
-        // IMPORTANT: Write return value (RAX) back to the saved RAX slot in the frame
-        // This ensures it survives context switches (following Linux pt_regs model)
-        //
-        // Stack layout after add rsp, 8 (removing arg5):
-        // [RSP + 0]  = r9
-        // [RSP + 8]  = r8
-        // [RSP + 16] = r10
-        // [RSP + 24] = rdx
-        // [RSP + 32] = rsi
-        // [RSP + 40] = rdi
-        // [RSP + 48] = rax (return value slot)
-        // [RSP + 56] = r15
-        // [RSP + 64] = r14
-        // [RSP + 72] = r13
-        // [RSP + 80] = r12
-        // [RSP + 88] = rbp
-        // [RSP + 96] = rbx
-        // [RSP + 104] = r11 (user RFLAGS)
-        // [RSP + 112] = rcx (user RIP)
-        // [RSP + 120] = user_rsp
-        "mov [rsp + 48], rax",
-
-        // Update stack frame from percpu if signal delivery modified the context
-        // Pass RSP as the frame base pointer
-        "mov rdi, rsp",
-        "call {update_frame}",
-        // Non-zero: rt_sigreturn restored a full user context; leave through
-        // IRETQ, which (unlike SYSRET) restores RCX and R11 too
-        "test rax, rax",
-        "jnz 5f",
-
-        // Restore caller-saved registers (in reverse order of pushes)
-        // Push order was: rax, rdi, rsi, rdx, r10, r8, r9
-        // So pop order is: r9, r8, r10, rdx, rsi, rdi, rax
-        "pop r9",
-        "pop r8",
-        "pop r10",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-        "pop rax",   // Restore return value from saved slot
-
-        // Restore callee-saved registers
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbp",
-        "pop rbx",
-
-        // Restore user RFLAGS and RIP for sysretq
-        "pop r11",         // User RFLAGS
-        "pop rcx",         // User RIP
-
-        // Switch to user stack
-        // [RSP] = user_rsp
-        "pop rsp",         // Load user RSP directly into RSP
-
-        // Return to user mode with the user GS base
-        // RAX = return value, RCX = user RIP, R11 = user RFLAGS
-        // All other registers have been properly restored
-        "swapgs",
-        "sysretq",
-
-        // IRETQ exit. Frame layout as above, F = frame base:
-        //   F+0 r9, F+8 r8, F+16 r10, F+24 rdx, F+32 rsi, F+40 rdi, F+48 rax,
-        //   F+56 r15 .. F+96 rbx, F+104..F+128 rflags/rip/user rsp
-        // Below it: IRET frame (rip, cs, rflags, rsp, ss) + user rcx, r11
-        "5:",
-        "sub rsp, 56",
-        "mov rdi, rsp",
-        "call {fill_iret}",
-        "mov r9, [rsp + 56]",
-        "mov r8, [rsp + 64]",
-        "mov r10, [rsp + 72]",
-        "mov rdx, [rsp + 80]",
-        "mov rsi, [rsp + 88]",
-        "mov rdi, [rsp + 96]",
-        "mov rax, [rsp + 104]",
-        "mov r15, [rsp + 112]",
-        "mov r14, [rsp + 120]",
-        "mov r13, [rsp + 128]",
-        "mov r12, [rsp + 136]",
-        "mov rbp, [rsp + 144]",
-        "mov rbx, [rsp + 152]",
-        "mov rcx, [rsp + 40]",
-        "mov r11, [rsp + 48]",
-        "swapgs",
-        "iretq",
-
-        handler = sym x86_64_syscall_dispatch,
-        user_rsp = const core::mem::offset_of!(super::percpu::PerCpu, user_rsp),
-        top = const core::mem::offset_of!(super::percpu::PerCpu, top_of_stack),
-        save_syscall_state = sym super::percpu::save_syscall_state,
-        save_syscall_caller_saved = sym super::percpu::save_syscall_caller_saved,
-        update_frame = sym super::percpu::update_syscall_return_frame,
-        fill_iret = sym super::percpu::fill_iret_frame,
-    );
-}
-
-/// Jump to user mode using IRETQ
-///
-/// This function sets up the stack for iretq and enters ring 3.
-/// It never returns.
-///
-/// # Arguments
-/// * `entry` - User mode entry point (RIP)
-/// * `user_stack` - User mode stack pointer (RSP)
-/// * `kernel_stack` - The task's kernel stack top (TSS.RSP0, top_of_stack)
-///
-/// # Safety
-/// The caller must ensure:
-/// * the task's address space is loaded (`mm::tlb::switch_mm`)
-/// * `entry` points to valid user-mode code
-/// * `user_stack` points to valid user-mode stack
-/// * `kernel_stack` points to valid kernel stack
-#[unsafe(naked)]
-pub unsafe extern "C" fn jump_to_user_iret(
-    entry: u64,        // rdi
-    user_stack: u64,   // rsi
-    kernel_stack: u64, // rdx
-) -> ! {
-    core::arch::naked_asm!(
-        // Save all input registers - they will be clobbered by function calls
-        "push rdi",        // entry
-        "push rsi",        // user_stack
-        "push rdx",        // kernel_stack (three pushes: the call is aligned)
-
-        // Kernel stack of entries from user mode
-        "mov rdi, rdx",
-        "call {set_kstack}",
-
-        // Restore all input registers
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-
-        // Build IRET frame on current stack
-        // Stack layout for iretq (pushed in reverse order):
-        //   SS     (offset +32)
-        //   RSP    (offset +24)
-        //   RFLAGS (offset +16)
-        //   CS     (offset +8)
-        //   RIP    (offset +0)
-
-        // Push SS (user data selector, ring 3)
-        "push {user_ss}",
-        // Push RSP (user stack)
-        "push rsi",
-        // Push RFLAGS (IF=1 for interrupts, bit 1 reserved must be 1)
-        "push 0x202",
-        // Push CS (user code selector, ring 3)
-        "push {user_cs}",
-        // Push RIP (entry point)
-        "push rdi",
-
-        // Clear all general-purpose registers for security
-        // (don't leak kernel data to user mode)
-        "xor rax, rax",
-        "xor rbx, rbx",
-        "xor rcx, rcx",
-        "xor rdx, rdx",
-        "xor rdi, rdi",
-        "xor rsi, rsi",
-        "xor rbp, rbp",
-        "xor r8, r8",
-        "xor r9, r9",
-        "xor r10, r10",
-        "xor r11, r11",
-        "xor r12, r12",
-        "xor r13, r13",
-        "xor r14, r14",
-        "xor r15, r15",
-
-        // Return to user mode with the user GS base
-        "swapgs",
-        "iretq",
-
-        set_kstack = sym super::cpu::set_kernel_stack,
-        user_cs = const USER_CODE_SELECTOR as u64,
-        user_ss = const USER_DATA_SELECTOR as u64,
-    );
-}
-
 // =============================================================================
 // x86-64 syscall dispatcher
 // =============================================================================
@@ -1119,8 +772,9 @@ pub unsafe extern "C" fn jump_to_user_iret(
 /// This function dispatches syscalls based on Linux x86-64 syscall numbers.
 /// It calls generic handlers in vfs_syscall, time_syscall, and sched_syscall.
 ///
-/// Called by `syscall_entry` (C ABI)
-pub extern "C" fn x86_64_syscall_dispatch(
+/// Called by `entry::do_syscall_64`, which stores the result in the
+/// frame and does the signal work of the return
+pub fn x86_64_syscall_dispatch(
     num: u64,
     arg0: u64,
     arg1: u64,
@@ -1244,11 +898,6 @@ pub extern "C" fn x86_64_syscall_dispatch(
 
     // Account for entering kernel mode
     percpu::account_syscall_enter();
-
-    // Remember the syscall number for -ERESTART* restarts
-    unsafe {
-        crate::arch::x86_64::percpu::current_cpu_mut().syscall_nr = num;
-    }
 
     // Check seccomp policy before executing syscall
     // Note: ip is not available here, pass 0 for now
@@ -1977,11 +1626,6 @@ pub extern "C" fn x86_64_syscall_dispatch(
 
         _ => (-38i64) as u64, // ENOSYS
     };
-
-    // Deliver pending signals / apply -ERESTART* rules before returning to
-    // user space (may redirect the return context to a handler or back up
-    // over the syscall instruction)
-    let result = crate::signal::syscall_exit_signal_work(result, num != SYS_RT_SIGRETURN);
 
     // Account for exiting kernel mode
     percpu::account_syscall_exit();

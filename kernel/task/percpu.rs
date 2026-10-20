@@ -933,6 +933,21 @@ pub fn current() -> Cur {
     }
 }
 
+/// The user registers of task `t` while it is in the kernel (Linux
+/// task_pt_regs): the entry frame at the top of its kernel stack
+pub fn task_pt_regs(t: &KernelTask) -> *mut <CurrentArch as crate::arch::Arch>::TrapFrame {
+    let size = core::mem::size_of::<<CurrentArch as crate::arch::Arch>::TrapFrame>() as u64;
+    (t.kstack_top - size) as *mut _
+}
+
+/// The current task's user registers (Linux current_pt_regs); only for a
+/// task that entered from user mode (not kernel threads)
+#[allow(clippy::mut_from_ref)]
+pub fn current_pt_regs() -> &'static mut <CurrentArch as crate::arch::Arch>::TrapFrame {
+    // SAFETY: the running task's own frame, on its own kernel stack
+    unsafe { &mut *task_pt_regs(&current()) }
+}
+
 /// Timer tick counter (global)
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -1787,13 +1802,12 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         config.child_stack
     };
 
-    // Build child's TrapFrame on the child's kernel stack, below the arch's
-    // reserve for the inherited FP/SIMD state (filled here, loaded by
-    // clone_child_entry before it returns to user mode)
-    // This will be restored by clone_child_entry via IRETQ
+    // Build child's TrapFrame at the top of the child's kernel stack (its
+    // pt_regs), the inherited FP/SIMD state below it if the arch keeps
+    // that apart (loaded by clone_child_entry before it returns to user
+    // mode)
     let trapframe_size = core::mem::size_of::<<CurrentArch as Arch>::TrapFrame>() as u64;
-    let trapframe_ptr = kstack_top - CurrentArch::CLONE_FPU_RESERVE - trapframe_size;
-    CurrentArch::clone_child_fpu(kstack_top);
+    let trapframe_ptr = kstack_top - trapframe_size;
 
     // Use architecture-specific TrapFrame construction
     let child_trapframe =
@@ -1805,9 +1819,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         core::ptr::write(tf_ptr, child_trapframe);
     }
 
-    // Create TaskContext pointing to clone_child_entry
-    // RSP points to the TrapFrame we just placed
-    let context = CurrentArch::new_clone_child_context(trapframe_ptr);
+    // Create TaskContext pointing to clone_child_entry, its frame below
+    // the TrapFrame and the saved FP state
+    let frame_top = CurrentArch::clone_child_fpu(trapframe_ptr);
+    let context = CurrentArch::new_clone_child_context(frame_top);
     let thread_ctx =
         KernelThreadContext::new(context, stack_base, KERNEL_STACK_SIZE, child_priority);
 

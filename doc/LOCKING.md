@@ -458,13 +458,19 @@ pub needs_reschedule: AtomicBool, // Reschedule request flag
 5. **Timer ISR only touches local CPU** - `wake_sleepers()` drains the local
    `wake_list` and wakes expired sleepers of the local sleep queue only.
 
-6. **Per-CPU syscall user state belongs to the current task** - the
+6. **User registers belong to the task** - x86-64: every entry from
+   user mode builds a `PtRegs` (Linux pt_regs) at the top of the task's
+   kernel stack (entry.rs); it is the task's only copy of its user
+   registers while it is in the kernel (`current_pt_regs`,
+   `task_pt_regs`), so a switch has nothing to save, and signal frames,
+   fork, exec and ptrace read and write it there with no lock (the task
+   itself, or a stopped tracee under TASKLIST). arm64: the
    `syscall_user_*` block in per-CPU data is saved on the outgoing task's
    kernel stack across every `context_switch` and restored when it runs
-   again, so a task that slept inside a syscall returns (and builds signal
-   frames) with its own registers. A user fault that delivers a signal
-   (`force_sig_fault`) loads the block from the fault's trap frame and
-   copies it back afterwards; the task is not inside a syscall then.
+   again, so a task that slept inside a syscall returns (and builds
+   signal frames) with its own registers; a user fault that delivers a
+   signal (`force_sig_fault`) loads the block from the fault's trap frame
+   and copies it back afterwards.
 
 7. **User FP/SIMD state is saved eagerly, per task, never lazily** - no
    lock is involved; the state always lives with the task it belongs to:
@@ -472,8 +478,8 @@ pub needs_reschedule: AtomicBool, // Reschedule request flag
      task's user FP state stays in the registers while it is in the kernel.
      `context_switch` XSAVEs (or FXSAVEs) it into an area on the outgoing
      task's kernel stack and XRSTORs it when that task runs again; a fork
-     child gets the parent's state in a reserve above its trap frame
-     (`SchedArch::CLONE_FPU_RESERVE`), loaded by `clone_child_entry`.
+     child gets the parent's state just below its pt_regs
+     (`SchedArch::clone_child_fpu`), loaded by `ret_from_fork`.
    - aarch64: the kernel uses NEON, so every exception entry (EL0 and EL1)
      saves q0-q31/FPCR/FPSR in its trap frame and restores them on exit;
      the EL0 frame (per-CPU `user_frame`, saved with the syscall block of

@@ -691,9 +691,9 @@ impl SchedArch for Aarch64Arch {
     type SchedPageTable = Aarch64PageTable;
 
     // The child's TrapFrame carries the inherited FP/SIMD registers
-    const CLONE_FPU_RESERVE: u64 = 0;
-
-    fn clone_child_fpu(_kstack_top: u64) {}
+    fn clone_child_fpu(regs: u64) -> u64 {
+        regs
+    }
 
     fn clone_child_trapframe(
         parent_rip: u64,

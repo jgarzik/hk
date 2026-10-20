@@ -230,8 +230,8 @@ const USER_SS: u16 = 0x1b; // RPL=3, index=3
 /// it), then the `RtSigFrame` placed so the handler starts as if called
 /// (RSP + 8 is 16-byte aligned; `pretcode` is its "return address").
 ///
-/// On success the handler runs with the initial FP state, and the per-CPU
-/// user-register block is redirected to it:
+/// On success the handler runs with the initial FP state, and the task's
+/// pt_regs are redirected to it:
 /// - RIP = handler, RSP = frame, RDI = signo, RSI = &info, RDX = &uc
 ///
 /// Returns Ok(()) on success, Err(errno) on failure.
@@ -242,18 +242,12 @@ pub fn setup_rt_frame(
     info: &KSigInfo,
 ) -> Result<(), i32> {
     use super::fpu;
-    use super::percpu;
 
-    // Get saved user state from percpu
-    let user_rip = percpu::get_syscall_user_rip();
-    let user_rflags = percpu::get_syscall_user_rflags();
-    let user_rsp = percpu::get_syscall_user_rsp();
-    let (rbx, rbp, r12, r13, r14, r15) = percpu::get_syscall_user_callee_saved();
-    let (rdi, rsi, rdx, r8, r9, r10) = percpu::get_syscall_user_caller_saved();
-    let (rax, rcx, r11) = {
-        let p = unsafe { percpu::current_cpu_mut() };
-        (p.syscall_user_rax, p.syscall_user_rcx, p.syscall_user_r11)
-    };
+    // The interrupted user context: the task's pt_regs
+    let regs = crate::task::percpu::current_pt_regs();
+    let user_rip = regs.rip;
+    let user_rflags = regs.rflags;
+    let user_rsp = regs.rsp;
 
     // Get handler address
     let handler = match action.handler {
@@ -302,21 +296,21 @@ pub fn setup_rt_frame(
 
     // Build SigContext from saved registers
     let sigctx = SigContext {
-        r8,
-        r9,
-        r10,
-        r11,
-        r12,
-        r13,
-        r14,
-        r15,
-        rdi,
-        rsi,
-        rbp,
-        rbx,
-        rdx,
-        rax,
-        rcx,
+        r8: regs.r8,
+        r9: regs.r9,
+        r10: regs.r10,
+        r11: regs.r11,
+        r12: regs.r12,
+        r13: regs.r13,
+        r14: regs.r14,
+        r15: regs.r15,
+        rdi: regs.rdi,
+        rsi: regs.rsi,
+        rbp: regs.rbp,
+        rbx: regs.rbx,
+        rdx: regs.rdx,
+        rax: regs.rax,
+        rcx: regs.rcx,
         rsp: user_rsp,
         rip: user_rip,
         eflags: user_rflags,
@@ -386,24 +380,21 @@ pub fn setup_rt_frame(
     // The handler starts with a clean FP state (Linux fpu__clear_user_states)
     fpu::load_init_state();
 
-    // Update percpu saved state to redirect execution to handler
-    unsafe {
-        let percpu_mut = percpu::current_cpu_mut();
-        percpu_mut.syscall_user_rsp = frame_addr;
-        percpu_mut.syscall_user_rip = handler;
-        percpu_mut.syscall_user_rflags = user_rflags & !HANDLER_CLEAR_EFLAGS;
-        percpu_mut.syscall_user_rdi = sig as u64;
-        percpu_mut.syscall_user_rsi = info_addr;
-        percpu_mut.syscall_user_rdx = uc_addr;
-        // RAX = 0 for handlers without SA_SIGINFO (Linux: regs->ax = 0)
-        percpu_mut.syscall_user_rax = 0;
-        // Clear other argument registers for security
-        percpu_mut.syscall_user_r8 = 0;
-        percpu_mut.syscall_user_r9 = 0;
-        percpu_mut.syscall_user_r10 = 0;
-        // Signal that the return context was modified
-        percpu_mut.signal_context_modified = true;
-    }
+    // Redirect the return to user mode to the handler (Linux
+    // __setup_rt_frame); RCX no longer equals RIP, so it goes through
+    // IRET with every register
+    regs.rsp = frame_addr;
+    regs.rip = handler;
+    regs.rflags = user_rflags & !HANDLER_CLEAR_EFLAGS;
+    regs.rdi = sig as u64;
+    regs.rsi = info_addr;
+    regs.rdx = uc_addr;
+    // RAX = 0 for handlers without SA_SIGINFO (Linux: regs->ax = 0)
+    regs.rax = 0;
+    // Clear other argument registers for security
+    regs.r8 = 0;
+    regs.r9 = 0;
+    regs.r10 = 0;
 
     Ok(())
 }
@@ -444,13 +435,13 @@ fn restore_sigframe_fpu(fpstate: u64) -> bool {
 /// This function:
 /// 1. Reads the UContext from user stack
 /// 2. Restores the FP state and the blocked signal mask
-/// 3. Restores all saved registers to percpu; the syscall returns through
-///    IRETQ so RCX/R11 are restored too
+/// 3. Restores all saved registers to the task's pt_regs; the syscall
+///    returns through IRETQ so RCX/R11 are restored too
 ///
 /// Returns the value that should be in RAX (usually -EINTR for interrupted syscall),
 /// or error code if restore fails.
 pub fn sys_rt_sigreturn() -> i64 {
-    use super::percpu;
+    let regs = crate::task::percpu::current_pt_regs();
 
     // When the signal handler returns (via `ret`), the restorer's return address
     // (pretcode) has been popped from the stack, so RSP has moved up by 8 bytes.
@@ -458,7 +449,8 @@ pub fn sys_rt_sigreturn() -> i64 {
     // This matches Linux: frame = (struct rt_sigframe __user *)(regs->sp - sizeof(long))
     // User-controlled: never let the arithmetic wrap (badframe instead)
     let uc_offset = core::mem::offset_of!(RtSigFrame, uc);
-    let Some(uc_addr) = percpu::get_syscall_user_rsp()
+    let Some(uc_addr) = regs
+        .rsp
         .checked_sub(8)
         .and_then(|frame| frame.checked_add(uc_offset as u64))
     else {
@@ -493,33 +485,30 @@ pub fn sys_rt_sigreturn() -> i64 {
         state.recalc_sigpending();
     });
 
-    // Restore all registers from sigcontext to percpu
-    unsafe {
-        let percpu_mut = percpu::current_cpu_mut();
-        percpu_mut.syscall_user_rip = sc.rip;
-        // Only the user-modifiable flags come from the frame (no IOPL etc.)
-        percpu_mut.syscall_user_rflags =
-            (percpu_mut.syscall_user_rflags & !FIX_EFLAGS) | (sc.eflags & FIX_EFLAGS);
-        percpu_mut.syscall_user_rsp = sc.rsp;
-        percpu_mut.syscall_user_rbx = sc.rbx;
-        percpu_mut.syscall_user_rbp = sc.rbp;
-        percpu_mut.syscall_user_r12 = sc.r12;
-        percpu_mut.syscall_user_r13 = sc.r13;
-        percpu_mut.syscall_user_r14 = sc.r14;
-        percpu_mut.syscall_user_r15 = sc.r15;
-        percpu_mut.syscall_user_rdi = sc.rdi;
-        percpu_mut.syscall_user_rsi = sc.rsi;
-        percpu_mut.syscall_user_rdx = sc.rdx;
-        percpu_mut.syscall_user_r8 = sc.r8;
-        percpu_mut.syscall_user_r9 = sc.r9;
-        percpu_mut.syscall_user_r10 = sc.r10;
-        percpu_mut.syscall_user_rax = sc.rax;
-        percpu_mut.syscall_user_rcx = sc.rcx;
-        percpu_mut.syscall_user_r11 = sc.r11;
-        // Signal that the return context was modified; return via IRETQ
-        percpu_mut.signal_context_modified = true;
-        percpu_mut.syscall_full_restore = true;
-    }
+    // Restore all registers from sigcontext to pt_regs (Linux
+    // restore_sigcontext); the syscall returns through IRET unless the
+    // frame happens to fit SYSRET
+    regs.rip = sc.rip;
+    // Only the user-modifiable flags come from the frame (no IOPL etc.)
+    regs.rflags = (regs.rflags & !FIX_EFLAGS) | (sc.eflags & FIX_EFLAGS);
+    regs.rsp = sc.rsp;
+    regs.rbx = sc.rbx;
+    regs.rbp = sc.rbp;
+    regs.r12 = sc.r12;
+    regs.r13 = sc.r13;
+    regs.r14 = sc.r14;
+    regs.r15 = sc.r15;
+    regs.rdi = sc.rdi;
+    regs.rsi = sc.rsi;
+    regs.rdx = sc.rdx;
+    regs.r8 = sc.r8;
+    regs.r9 = sc.r9;
+    regs.r10 = sc.r10;
+    regs.rax = sc.rax;
+    regs.rcx = sc.rcx;
+    regs.r11 = sc.r11;
+    // No syscall to restart from here on (Linux: regs->orig_ax = -1)
+    regs.orig_rax = u64::MAX;
 
     // Return RAX from saved context
     // This allows signal handler to modify the return value

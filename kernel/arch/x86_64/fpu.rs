@@ -8,9 +8,9 @@
 //! - `context_switch` saves the outgoing task's registers into an area on its
 //!   own kernel stack and reloads them when that task is switched back in
 //!   (eager save/restore, no lazy #NM trapping).
-//! - fork/clone saves the parent's registers at the top of the child's
-//!   kernel stack ([`CLONE_FPU_RESERVE`]); the child loads them in
-//!   `clone_child_entry` before its first return to user mode.
+//! - fork/clone saves the parent's registers just below the child's
+//!   pt_regs (`save_for_clone_child`); the child loads them in
+//!   `ret_from_fork` before its first return to user mode.
 //! - execve and the first entry to user mode load the initial state.
 //! - signal delivery writes the registers to the user signal frame (Linux
 //!   fpstate layout, `_fpx_sw_bytes` + FP_XSTATE_MAGIC2 when XSAVE is used)
@@ -26,10 +26,6 @@ use super::cpu::cpuid;
 
 /// Bytes reserved for one save area (XSAVE x87|SSE|AVX needs 832)
 pub const FPU_AREA_SIZE: usize = 1024;
-
-/// Bytes reserved at the top of a clone child's kernel stack for the
-/// inherited FP state (above its trap frame); see `clone_child_entry`
-pub const CLONE_FPU_RESERVE: u64 = FPU_AREA_SIZE as u64;
 
 /// XCR0 feature bits
 const XFEATURE_X87: u64 = 1 << 0;
@@ -268,20 +264,14 @@ pub fn load_init_state() {
     restore(&INIT_AREA);
 }
 
-/// `clone_child_entry` helper: load the FP state the parent saved at `area`
-///
-/// # Safety
-/// `area` must point to an `FpuArea` written by [`save`].
-pub unsafe extern "C" fn restore_from_raw(area: *const FpuArea) {
-    unsafe { restore_raw(area) };
-}
-
-/// Save the current (parent) FP state at the top of a clone child's kernel
-/// stack (`kstack_top - CLONE_FPU_RESERVE`)
-pub fn save_for_clone_child(kstack_top: u64) {
-    let area = (kstack_top - CLONE_FPU_RESERVE) as *mut FpuArea;
-    // Kernel stack top is page aligned, so the area is 64-byte aligned
-    unsafe { save(&mut *area) };
+/// Save the current (parent) FP state for a clone child, just below its
+/// pt_regs at `regs` (64-byte aligned, as XSAVE wants); returns the area,
+/// where the child's first switch frame ends (`ret_from_fork` loads it)
+pub fn save_for_clone_child(regs: u64) -> u64 {
+    let area = (regs - FPU_AREA_SIZE as u64) & !63;
+    // SAFETY: the child's kernel stack, not running yet
+    unsafe { save(&mut *(area as *mut FpuArea)) };
+    area
 }
 
 /// Build the signal-frame image of the current FP state in `area`: the
