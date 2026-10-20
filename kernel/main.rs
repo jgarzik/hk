@@ -97,7 +97,7 @@ use crate::arch::{
     AcpiOps, CpuOps, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps,
     MemoryLayoutOps, PowerOps, SmpOps, TimekeeperOps, VfsInitOps, phys_to_virt,
 };
-use crate::arch::{SchedArch, SyscallOps, UserModeOps};
+use crate::arch::{SchedArch, UserModeOps};
 
 // Page table type alias (used by ELF loading)
 type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
@@ -782,9 +782,6 @@ fn kmain() -> ! {
     if let Some(minor) = gfx::simplegfx::init_simplegfx() {
         printkln!("gfx: SimpleDRM device registered as card{}", minor);
     }
-
-    // Register syscall handler
-    CurrentArch::set_syscall_handler(CurrentArch::syscall_dispatcher());
 
     // Load /bin/init from ramfs via VFS
     let init_dentry = match fs::lookup_path("/bin/init") {

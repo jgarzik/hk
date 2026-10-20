@@ -23,13 +23,6 @@ runs with the kernel's GS base, not its own (Linux SWAPGS keeps the user
 base; ARCH_SET_GS / FSGSBASE are absent). The syscall entry stack is one
 global, not per CPU. Fix: SWAPGS plus per-CPU GDT/TSS.
 
-## Raw user-memory access in the pre-VFS minimal write
-
-**Location**: `kernel/arch/x86_64/syscall.rs` (default minimal handler)
-
-The early minimal `write` (used only before the VFS handler is
-registered) reads the user buffer raw, not through the uaccess helpers.
-
 ## Network stack gaps (later phases of the network chunk)
 
 **Location**: `kernel/net/`

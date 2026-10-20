@@ -1065,7 +1065,7 @@ unsafe extern "C" fn syscall_entry() {
         "mov r11, [rsp + 48]",
         "iretq",
 
-        handler = sym syscall_handler,
+        handler = sym x86_64_syscall_dispatch,
         kstack = sym SYSCALL_KERNEL_STACK,
         save_syscall_state = sym super::percpu::save_syscall_state,
         save_syscall_caller_saved = sym super::percpu::save_syscall_caller_saved,
@@ -1073,71 +1073,6 @@ unsafe extern "C" fn syscall_entry() {
         fill_iret = sym super::percpu::fill_iret_frame,
         kgs = sym super::percpu::restore_kernel_gs,
     );
-}
-
-/// Syscall handler callback type
-pub type SyscallHandler = fn(u64, u64, u64, u64, u64, u64, u64) -> u64;
-
-/// Global syscall handler - set by kernel
-static mut SYSCALL_HANDLER_CALLBACK: Option<SyscallHandler> = None;
-
-/// Set the syscall handler callback
-pub fn set_syscall_handler(handler: SyscallHandler) {
-    unsafe {
-        SYSCALL_HANDLER_CALLBACK = Some(handler);
-    }
-}
-
-/// Syscall handler (called from assembly)
-extern "C" fn syscall_handler(
-    num: u64,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    arg3: u64,
-    arg4: u64,
-    arg5: u64,
-) -> u64 {
-    // If kernel has registered a handler, use it
-    if let Some(handler) = unsafe { SYSCALL_HANDLER_CALLBACK } {
-        return handler(num, arg0, arg1, arg2, arg3, arg4, arg5);
-    }
-
-    // Default minimal handler (before VFS is initialized)
-    const SYS_WRITE: u64 = 1;
-    const SYS_EXIT: u64 = 60;
-
-    match num {
-        SYS_WRITE => {
-            // write(fd, buf, count) -> count
-            let fd = arg0;
-            let buf = arg1 as *const u8;
-            let count = arg2 as usize;
-
-            if fd == 1 || fd == 2 {
-                // stdout/stderr -> serial console
-                for i in 0..count {
-                    let byte = unsafe { *buf.add(i) };
-                    super::io::outb(0x3F8, byte);
-                }
-                count as u64
-            } else {
-                (-9i64) as u64 // EBADF
-            }
-        }
-        SYS_EXIT => {
-            // exit(status)
-            loop {
-                unsafe {
-                    ::core::arch::asm!("hlt");
-                }
-            }
-        }
-        _ => {
-            // Unknown syscall
-            (-38i64) as u64 // ENOSYS
-        }
-    }
 }
 
 /// Jump to user mode using IRETQ
@@ -1239,9 +1174,8 @@ pub unsafe extern "C" fn jump_to_user_iret(
 /// This function dispatches syscalls based on Linux x86-64 syscall numbers.
 /// It calls generic handlers in vfs_syscall, time_syscall, and sched_syscall.
 ///
-/// This is the arch-specific entry point that should be registered with
-/// `set_syscall_handler()`.
-pub fn x86_64_syscall_dispatch(
+/// Called by `syscall_entry` (C ABI)
+pub extern "C" fn x86_64_syscall_dispatch(
     num: u64,
     arg0: u64,
     arg1: u64,

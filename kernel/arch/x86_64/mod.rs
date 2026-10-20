@@ -215,8 +215,8 @@ impl SchedArch for X86_64Arch {
 
 use crate::arch::{
     AcpiInfo, AcpiOps, ArchBusOps, CpuInfo, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps,
-    IoremapOps, LocalTimerOps, MemoryLayoutOps, PowerInfo, PowerOps, SmpOps, SyscallOps,
-    TimekeeperOps, VfsInitOps,
+    IoremapOps, LocalTimerOps, MemoryLayoutOps, PowerInfo, PowerOps, SmpOps, TimekeeperOps,
+    VfsInitOps,
 };
 
 impl HaltOps for X86_64Arch {
@@ -368,18 +368,6 @@ impl TimekeeperOps for X86_64Arch {
 impl PowerOps for X86_64Arch {
     fn power_init(info: &PowerInfo) {
         power::init(info.pm1a_cnt_blk, info.pm1b_cnt_blk, info.slp_typa);
-    }
-}
-
-impl SyscallOps for X86_64Arch {
-    type SyscallHandler = syscall::SyscallHandler;
-
-    fn set_syscall_handler(handler: Self::SyscallHandler) {
-        syscall::set_syscall_handler(handler);
-    }
-
-    fn syscall_dispatcher() -> Self::SyscallHandler {
-        syscall::x86_64_syscall_dispatch
     }
 }
 

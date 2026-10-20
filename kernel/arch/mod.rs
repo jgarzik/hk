@@ -23,7 +23,6 @@
 //! - [`LocalTimerOps`] - Per-CPU timer operations
 //! - [`TimekeeperOps`] - Clock source and RTC operations
 //! - [`PowerOps`] - Power management (shutdown, reboot)
-//! - [`SyscallOps`] - Syscall handler registration
 //! - [`HardwareAccess`] - Driver I/O abstraction (port I/O vs MMIO)
 
 extern crate alloc;
@@ -732,25 +731,6 @@ pub trait PowerOps {
     /// # Arguments
     /// * `info` - Power management info from ACPI/device tree
     fn power_init(info: &PowerInfo);
-}
-
-/// Syscall mechanism operations
-///
-/// Abstracts the syscall entry/exit mechanism. On x86-64 this is
-/// the SYSCALL/SYSRET instructions, on ARM64 it's SVC.
-#[allow(dead_code)]
-pub trait SyscallOps {
-    /// Syscall handler function type
-    type SyscallHandler: Copy;
-
-    /// Register the syscall handler
-    ///
-    /// # Arguments
-    /// * `handler` - Function to call on syscall entry
-    fn set_syscall_handler(handler: Self::SyscallHandler);
-
-    /// Get the default syscall dispatcher function
-    fn syscall_dispatcher() -> Self::SyscallHandler;
 }
 
 /// Architecture-specific bus and driver initialization

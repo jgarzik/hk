@@ -38,7 +38,7 @@ use core::arch::asm;
 use crate::arch::{
     AcpiInfo, AcpiOps, Arch, ArchBusOps, ContextOps, CpuInfo, CpuOps, EarlyArchInit, ExceptionOps,
     FrameAlloc, HaltOps, InitramfsOps, IoremapOps, LocalTimerOps, MemoryLayoutOps, PerCpuOps,
-    PowerInfo, PowerOps, SchedArch, SmpOps, SyscallOps, TimekeeperOps, UserModeOps, VfsInitOps,
+    PowerInfo, PowerOps, SchedArch, SmpOps, TimekeeperOps, UserModeOps, VfsInitOps,
 };
 
 /// AArch64 trap frame for saving/restoring CPU state on exception entry
@@ -344,28 +344,6 @@ impl TimekeeperOps for Aarch64Arch {
 impl PowerOps for Aarch64Arch {
     fn power_init(_info: &PowerInfo) {
         // PSCI doesn't need explicit init
-    }
-}
-
-// ============================================================================
-// SyscallOps trait implementation (stub for now)
-// ============================================================================
-
-/// Syscall handler function type for aarch64
-pub type SyscallHandler = fn(u64, u64, u64, u64, u64, u64, u64) -> u64;
-
-impl SyscallOps for Aarch64Arch {
-    type SyscallHandler = SyscallHandler;
-
-    fn set_syscall_handler(_handler: Self::SyscallHandler) {
-        // No-op: aarch64 syscalls are handled via exception vectors (SVC instruction)
-        // installed in exceptions::init(). The actual dispatch is in exceptions.rs.
-    }
-
-    fn syscall_dispatcher() -> Self::SyscallHandler {
-        // Note: This function isn't used on aarch64 - syscall dispatch happens
-        // directly in handle_el0_sync() via syscall::aarch64_syscall_dispatch()
-        |_nr, _a0, _a1, _a2, _a3, _a4, _a5| 0
     }
 }
 
