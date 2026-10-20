@@ -14,6 +14,7 @@ Linux: `Documentation/arch/x86/x86_64/mm.rst`.
 | `0000000000000000 - 00007fffffffefff` | 128 TB | user space (`TASK_SIZE`) |
 | `ffff888000000000 - ...` | RAM | direct map of all RAM (`PAGE_OFFSET`) |
 | `ffffc90000000000 - ffffc9003fffffff` | 1 GB | vmalloc/ioremap window (`VMALLOC_START`) |
+| `ffffc90040000000 - ffffc9005fffffff` | 512 MB | kernel stacks, 64 KB slots (`VMSTACK_START`) |
 | `ffffea0000000000 - ...` | 1/64 of RAM | struct page array (`VMEMMAP_START`) |
 | `ffffffff80000000 - ...` | image | kernel image (`__START_KERNEL_map`, -2 GB) |
 
@@ -39,8 +40,13 @@ Linux: `Documentation/arch/x86/x86_64/mm.rst`.
   kmalloc caches 8 B-8 KB, pages above; named caches for VMAs,
   dentries and inodes, chosen by exact layout) over the page allocator,
   through the direct map (a 256 KB boot arena in the image serves boot
-  until the page allocator is up); kernel stacks and DMA buffers are
-  physically contiguous frame runs, also through the direct map.
+  until the page allocator is up); DMA buffers are physically
+  contiguous frame runs, also through the direct map. Kernel stacks
+  (`mm/vmstack.rs`, Linux VMAP_STACK) are 16 KB of single pages at the
+  start of a 64 KB slot of their own area, the rest of the slot
+  unmapped: an overflow faults in that gap (a double fault, on its IST
+  stack) and panics with "kernel stack overflow". They are not in the
+  direct map, so no DMA from the stack.
 
 ## arm64 (4KB granule, 48-bit virtual)
 
@@ -52,9 +58,14 @@ Linux: `Documentation/arch/arm64/memory.rst`.
 | `ffff000000000000 - ...` | RAM | linear map of RAM (`PAGE_OFFSET` + phys) |
 | `ffff800040100000 - ...` | image | kernel image (`KIMAGE_OFFSET` + phys) |
 | `ffff800100000000 - ffff80013fffffff` | 1 GB | vmalloc/ioremap window |
+| `ffff800140000000 - ffff80015fffffff` | 512 MB | kernel stacks, 64 KB slots (`VMSTACK_START`) |
 | `ffff800200000000 - ffff80023fffffff` | 1 GB | device window: physical 0-1 GB as Device-nGnRnE (`io_va`) |
 | `fffffc0000000000 - ...` | 1/64 of RAM | struct page array (`VMEMMAP_START`) |
 
+- **Kernel stacks**: as on x86 (`mm/vmstack.rs`). Every EL1 stack is
+  at most 32 KB at a 64 KB-aligned base (the BSP boot stack too), so
+  the exception entry finds an overflow by bit 15 of SP (Linux
+  kernel_ventry) and continues on this CPU's overflow stack to panic.
 - **TTBR0** holds only user mappings; kernel threads run with an empty
   table (Linux `reserved_pg_dir`). Every user leaf has PXN (never
   executable at EL1, as Linux sets on all user mappings; x86 relies on

@@ -37,6 +37,9 @@ const MMIO_FLAGS: u64 =
 /// Intermediate page table flags
 const INTERMEDIATE_FLAGS: u64 = PAGE_PRESENT | PAGE_WRITABLE;
 
+/// Kernel RAM page flags (vmap): present, writable, no-execute
+const RAM_FLAGS: u64 = PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE;
+
 /// ioremap error types
 #[derive(Debug, Clone, Copy)]
 pub enum IoremapError {
@@ -50,6 +53,13 @@ pub enum IoremapError {
 
 /// Global ioremap allocator
 static IOREMAP: Mutex<IoremapAllocator> = Mutex::new(IoremapAllocator::new());
+
+/// Serializes adding lower tables to the vmalloc area (ioremap window
+/// and kernel stacks), shared by every address space (Linux
+/// init_mm.page_table_lock): two mappings in one new table must not
+/// both create it. Spin leaf, thread context; frames are allocated
+/// under it.
+static KTABLES: Mutex<()> = Mutex::new(());
 
 /// Bitmap-based virtual address allocator for ioremap region
 struct IoremapAllocator {
@@ -291,9 +301,29 @@ pub fn iounmap(virt_addr: *mut u8, size: u64) {
     IOREMAP.lock().free(aligned_virt, num_pages);
 }
 
+/// Map the RAM page `pa` at the kernel address `va` in the vmalloc
+/// area (Linux vmap_pages_range): writable, never executable. No TLB
+/// flush: `va` was not present (x86 caches no not-present entry), and
+/// whoever unmapped it flushed it before handing it out again.
+pub fn vmap_page(va: u64, pa: u64) -> Result<(), IoremapError> {
+    map_page(swapper_phys(), va, pa, RAM_FLAGS)
+}
+
+/// Unmap the vmalloc-area page at `va`, returning the RAM page it
+/// mapped. The caller flushes the TLBs before `va` is mapped again.
+pub fn vunmap_page(va: u64) -> Option<u64> {
+    unmap_page(swapper_phys(), va)
+}
+
 /// Map a single 4KB MMIO page
 fn map_mmio_page(cr3: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
+    map_page(cr3, va, pa, MMIO_FLAGS)
+}
+
+/// Map a single 4KB page in the vmalloc area with `flags`
+fn map_page(cr3: u64, va: u64, pa: u64, flags: u64) -> Result<(), IoremapError> {
     let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
+    let _tables = KTABLES.lock();
 
     unsafe {
         // The window's PML4 entry is preallocated (kmap::init)
@@ -303,7 +333,7 @@ fn map_mmio_page(cr3: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
         let pdpt = phys_to_virt_table(pml4_entry.addr());
         let pd = table(&mut *(*pdpt).entry_mut(pdpt_idx))?;
         let pt = table(&mut *(*pd).entry_mut(pd_idx))?;
-        (*pt).entry_mut(pt_idx).set(pa, MMIO_FLAGS);
+        (*pt).entry_mut(pt_idx).set(pa, flags);
     }
 
     Ok(())
@@ -319,8 +349,9 @@ unsafe fn table(
     Ok(phys_to_virt_table(e.addr()))
 }
 
-/// Unmap a single page (clear PTE, don't free intermediate tables)
-fn unmap_page(cr3: u64, va: u64) {
+/// Unmap a single page (clear PTE, don't free intermediate tables);
+/// the page it mapped, if any
+fn unmap_page(cr3: u64, va: u64) -> Option<u64> {
     let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(va);
 
     unsafe {
@@ -328,25 +359,27 @@ fn unmap_page(cr3: u64, va: u64) {
 
         let pml4_entry = (*pml4).entry(pml4_idx);
         if !pml4_entry.is_present() {
-            return;
+            return None;
         }
         let pdpt = phys_to_virt_table(pml4_entry.addr());
 
         let pdpt_entry = (*pdpt).entry(pdpt_idx);
         if !pdpt_entry.is_present() {
-            return;
+            return None;
         }
         let pd = phys_to_virt_table(pdpt_entry.addr());
 
         let pd_entry = (*pd).entry(pd_idx);
         if !pd_entry.is_present() {
-            return;
+            return None;
         }
         let pt = phys_to_virt_table(pd_entry.addr());
 
         // Clear the page table entry
         let pt_entry = (*pt).entry_mut(pt_idx);
+        let pa = pt_entry.is_present().then(|| pt_entry.addr());
         pt_entry.clear();
+        pa
     }
 }
 

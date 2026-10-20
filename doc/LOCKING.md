@@ -286,6 +286,11 @@ Memory allocator locks (Linux: ... → slab → pcp → zone->lock):
     (IrqSpinlock leaf);
     3.2 Heap Allocator, Frame Allocator
 
+Kernel mappings (3.2 Kernel Page Tables): vmstack FLUSH (sleeping,
+    thread context; held across the stack area's TLB flush) → IOREMAP,
+    vmstack SLOTS (spin leaves; no mapping or flush under them); KTABLES
+    (spin, thread context) → frame allocator
+
 Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem → BLKDEV_REGISTRY,
     MAJORS; I/O sleeps under open_mutex only
@@ -1198,14 +1203,28 @@ layout in `doc/MEMORY.md`
   table). Linux: `preallocate_vmalloc_pages`, swapper_pg_dir.
 - Direct-map and image entries are immutable after boot: read without a
   lock (page walks, `phys_to_virt`/`virt_to_phys` are pure arithmetic).
-- The ioremap window's lower tables are shared by every address space
-  and changed only under `IOREMAP` (`spin::Mutex`, not IRQ-safe, never
-  taken in IRQ context). Under it `FRAME_ALLOCATOR` is taken for new
-  table frames; `IOREMAP` is a leaf otherwise (Linux: `vmap_area_lock`
-  + `init_mm.page_table_lock`).
+- The vmalloc area (ioremap window, kernel stack area) has lower tables
+  shared by every address space. Its virtual ranges are handed out
+  under `IOREMAP` (ioremap) and `vmstack::SLOTS` (stacks), both
+  `spin::Mutex` leaves, thread context only; a mapping adds missing
+  tables under `KTABLES` (`spin::Mutex` leaf, thread context, one per
+  arch in ioremap.rs; `FRAME_ALLOCATOR` is taken under it for table
+  frames). Linux: `vmap_area_lock` + `init_mm.page_table_lock`. A PTE
+  of a range one owns is set or cleared without a lock.
 - TLB: iounmap clears the entries and flushes every CPU
   (`flush_tlb_kernel_range`, with `IOREMAP` not held) before the range
   is freed; arm64 broadcasts, x86 sends IPIs.
+- Kernel stacks (`mm::vmstack`, Linux VMAP_STACK): 16KB of single
+  pages at the start of a 64KB slot, the rest unmapped (the guard gap
+  the next stack's overflow faults in). `free` (from `DeadTask::drop`,
+  possibly with interrupts off) unmaps and frees the pages with a
+  local flush and marks the slot dirty under `SLOTS`; `alloc` (thread
+  context) flushes the whole area on every CPU once 64 slots are dirty,
+  with `SLOTS` not held, before any of them is reused (Linux lazy
+  vmap purge). Flushers are serialized by `FLUSH` (sleeping
+  `sync::Mutex`), so one cleaning a slot set from its snapshot cannot
+  clean a slot freed again after another's flush. `SLOTS` is never
+  taken in an interrupt handler.
 - User half: per address space, changed by its tasks under the mm lock
   (the fault path, see Address Spaces);
   never contains a kernel mapping.
@@ -2384,6 +2403,12 @@ context. `dma_alloc_coherent` allocates frames (thread context only).
 | `USB_CONTROLLER` | `Mutex<Option<XhciController>>` | Global xHCI controller access |
 | `XHCI_IRQ_STATE.*` | `AtomicU64`, `AtomicBool` | ISR state (lock-free) |
 | `USB_OUTPUT_ACTIVE` | `AtomicBool` | Console recursion guard |
+| `BOUNCE` (usb/serial.rs) | `Mutex<[u8; 256]>` | USB serial console DMA buffer: `try_lock` only (a busy buffer drops the output), held across the bulk transfer, so it orders before `USB_CONTROLLER` |
+
+DMA buffers never live on a kernel stack (stacks are not in the linear
+map, `mm::vmstack`; `DirectDmaOps` panics on one): the mass-storage
+CBW/CSW and the INQUIRY/READ CAPACITY data are heap buffers, the
+console's output goes through `BOUNCE`.
 
 **ISR Pattern:** The xHCI ISR sets `interrupt_pending` atomic but does NOT acquire
 `USB_CONTROLLER` mutex. This avoids IRQ-context deadlock since the mutex is not

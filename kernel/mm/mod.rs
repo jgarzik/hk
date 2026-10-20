@@ -46,6 +46,7 @@ pub mod syscall;
 pub mod tlb;
 pub mod vma;
 pub mod vmscan;
+pub mod vmstack;
 pub mod writeback;
 pub mod xarray;
 

@@ -83,8 +83,9 @@ type CurrentArch = crate::arch::aarch64::Aarch64Arch;
 // Re-export the architecture's TaskContext type for convenience
 type TaskContext = <CurrentArch as ContextOps>::TaskContext;
 
-/// Size of kernel stack per thread (16KB)
-pub const KERNEL_STACK_SIZE: usize = 16 * 1024;
+/// Size of kernel stack per thread (16KB, with a guard gap below it:
+/// `mm::vmstack`)
+pub const KERNEL_STACK_SIZE: usize = crate::mm::vmstack::THREAD_SIZE;
 
 // Re-export the architecture's page table type for convenience
 type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
@@ -109,9 +110,6 @@ pub struct UserTaskConfig {
     /// Page table for the process
     pub page_table: ArchPageTable,
 }
-
-/// Page size
-const PAGE_SIZE: u64 = 4096;
 
 /// Sleep state of a task (Linux TASK_RUNNING / TASK_INTERRUPTIBLE /
 /// TASK_UNINTERRUPTIBLE / TASK_KILLABLE)
@@ -161,7 +159,7 @@ impl WakeMode {
 pub struct KernelThreadContext {
     /// Context for switching (callee-saved registers)
     pub context: TaskContext,
-    /// Base address of the kernel stack (direct map)
+    /// Base address of the kernel stack (`mm::vmstack`)
     pub stack_base: u64,
     /// Its size in bytes, freed when the task is dead; 0 if not owned
     pub stack_size: usize,
@@ -220,7 +218,7 @@ pub struct CpuRunQueue {
 /// What an exited task still holds while its CPU runs on its stack and
 /// its page tables: freed by the next task (`DeadTask::drop`)
 pub struct DeadTask {
-    /// Kernel stack (direct-map address) and size; size 0 = not owned
+    /// Kernel stack (`mm::vmstack` base) and size; size 0 = not owned
     stack: (u64, usize),
     /// mm_count reference on the address space it last ran in (mmdrop)
     mm: Option<alloc::sync::Arc<crate::mm::Mm>>,
@@ -235,8 +233,8 @@ const STACK_MIN_LEFT: usize = 4096;
 
 /// Linux CONFIG_DEBUG_STACK_USAGE check_stack_usage: kernel stacks start
 /// zeroed, so the untouched bottom shows how deep the task ever went.
-/// There is no guard page: a path that leaves too little room lets the
-/// next interrupt write into the page below the stack. Reported once.
+/// An overflow faults in the guard gap below the stack (a "kernel stack
+/// overflow" panic); this reports a path that came close. Reported once.
 fn check_stack_usage(base: u64, size: usize) {
     // SAFETY: the dead task's stack, still owned and no longer in use
     let words = unsafe { core::slice::from_raw_parts(base as *const u64, size / 8) };
@@ -259,10 +257,7 @@ impl Drop for DeadTask {
         let (base, size) = self.stack;
         if size != 0 {
             check_stack_usage(base, size);
-            let phys = crate::arch::virt_to_phys(base);
-            for off in (0..size as u64).step_by(PAGE_SIZE as usize) {
-                crate::FRAME_ALLOCATOR.free(phys + off);
-            }
+            crate::mm::vmstack::free(base);
         }
         // mmdrop: the last reference frees the top-level table
         drop(self.mm.take());
@@ -974,25 +969,19 @@ fn idle_task_entry() -> ! {
     }
 }
 
-/// Size of idle task stack (8KB - smaller than regular threads)
-const IDLE_STACK_SIZE: usize = 8 * 1024;
-
 /// Create a kernel task (pid 0, kernel page table) owned by `cpu_id`
 ///
-/// `entry` runs on a fresh stack of `stack_size` bytes with the rq lock
+/// `entry` runs on a fresh kernel stack with the rq lock
 /// released (`finish_context_switch`) but interrupts still disabled; it must
 /// enable them. A kernel thread is its own process (pid == tid, Linux);
 /// an `idle` task is tid 0, outside TASKLIST (Linux swapper/N).
-#[allow(clippy::too_many_arguments)]
-fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
+fn create_kernel_task(
     cpu_id: u32,
     name: &str,
     entry: usize,
     priority: Priority,
-    stack_size: usize,
     start_asleep: bool,
     idle: bool,
-    frame_alloc: &mut FA,
 ) -> Result<Tid, &'static str> {
     let thread_pid = if idle {
         None
@@ -1005,20 +994,11 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
     let tid = thread_pid.as_ref().map_or(0, |p| p.nr() as Tid);
     let pid = tid;
 
-    // Allocate the kernel stack (physically contiguous: it is used
-    // through the direct map)
-    let stack_pages = stack_size / PAGE_SIZE as usize;
-    let stack_base = frame_alloc
-        .alloc_contig(stack_pages)
-        .ok_or("Out of memory for kernel thread stack")?;
-    let stack_base = crate::arch::phys_to_virt(stack_base) as u64;
-    unsafe {
-        core::ptr::write_bytes(stack_base as *mut u8, 0, stack_size);
-    }
-    let stack_top = stack_base + stack_size as u64;
+    let stack_base = crate::mm::vmstack::alloc().ok_or("Out of memory for kernel thread stack")?;
+    let stack_top = stack_base + KERNEL_STACK_SIZE as u64;
 
     let context = TaskContext::new_kernel_thread(entry, stack_top);
-    let mut thread_ctx = KernelThreadContext::new(context, stack_base, stack_size, priority);
+    let mut thread_ctx = KernelThreadContext::new(context, stack_base, KERNEL_STACK_SIZE, priority);
     if start_asleep {
         // Not runnable until wake_up_task (lets the creator finish setup)
         thread_ctx.state = SleepState::Uninterruptible;
@@ -1117,19 +1097,14 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
 ///
 /// The idle task is always runnable at PRIORITY_IDLE (0). The CPU may enter
 /// the scheduler only once this is done, so `initialized` is set last.
-fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
-    cpu_id: u32,
-    frame_alloc: &mut FA,
-) -> Result<Tid, &'static str> {
+fn create_idle_task(cpu_id: u32) -> Result<Tid, &'static str> {
     let tid = create_kernel_task(
         cpu_id,
         "swapper",
         idle_task_entry as *const () as usize,
         PRIORITY_IDLE,
-        IDLE_STACK_SIZE,
         false,
         true,
-        frame_alloc,
     )?;
     let sched = get_percpu_sched(cpu_id);
     sched.lock.lock().idle_tid = Some(tid);
@@ -1149,27 +1124,17 @@ pub fn create_kthread_task(
     if !get_percpu_sched(cpu_id).initialized.load(Ordering::Acquire) {
         return Err("CPU has no scheduler");
     }
-    let mut fa = crate::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
-    create_kernel_task(
-        cpu_id,
-        name,
-        entry,
-        priority,
-        KERNEL_STACK_SIZE,
-        true,
-        false,
-        &mut fa,
-    )
+    create_kernel_task(cpu_id, name, entry, priority, true, false)
 }
 
 /// Give every online AP a scheduler (idle task); each AP switches into it
 /// from its boot idle loop via `try_schedule()`
-pub fn init_ap_schedulers<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) {
+pub fn init_ap_schedulers() {
     let bsp = crate::cpu::this_id();
     for (cpu, _) in PERCPU_SCHEDS.for_each_possible() {
         if cpu != bsp
             && CurrentArch::cpu_online(cpu)
-            && let Err(e) = create_idle_task(cpu, frame_alloc)
+            && let Err(e) = create_idle_task(cpu)
         {
             printkln!("SCHED: no scheduler for CPU {}: {}", cpu, e);
         }
@@ -1184,16 +1149,14 @@ pub fn cpu_has_scheduler(cpu: u32) -> bool {
 }
 
 /// Initialize the global scheduler with idle task for BSP
-///
-/// Must be called with a frame allocator to create the BSP's idle task.
-pub fn init<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) {
+pub fn init() {
     // Initialize BSP's per-CPU scheduler
     let cpu_id = crate::cpu::this_id();
 
     printkln!("Per-CPU scheduler initialized for CPU {}", cpu_id);
 
     // Create idle task for BSP
-    match create_idle_task(cpu_id, frame_alloc) {
+    match create_idle_task(cpu_id) {
         Ok(_tid) => {}
         Err(e) => panic!("Failed to create BSP idle task: {}", e),
     }
@@ -1811,14 +1774,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     };
     let child_pt = ArchPageTable::new(child_mm.as_ref().map_or(parent_pt_phys, |m| m.pgd()));
 
-    // Allocate kernel stack for child (16KB = 4 pages, physically
-    // contiguous: separately allocated frames need not be adjacent)
-    let stack_pages = KERNEL_STACK_SIZE / PAGE_SIZE as usize;
-    let stack_base = frame_alloc.alloc_contig(stack_pages).ok_or(12)?; // ENOMEM
-    let stack_base = crate::arch::phys_to_virt(stack_base) as u64;
-    unsafe {
-        core::ptr::write_bytes(stack_base as *mut u8, 0, KERNEL_STACK_SIZE);
-    }
+    // The child's kernel stack (zeroed, guard gap below)
+    let stack_base = crate::mm::vmstack::alloc().ok_or(12)?; // ENOMEM
     let kstack_top = stack_base + KERNEL_STACK_SIZE as u64;
 
     // Determine child's user stack pointer

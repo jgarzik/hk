@@ -113,6 +113,20 @@ extern "C" fn handle_el1_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
     }
 }
 
+/// A kernel stack overflowed (vectors.S `el1_stack_overflow`, on this
+/// CPU's overflow stack): `sp` is where the exception frame would have
+/// gone (Linux handle_bad_stack)
+#[unsafe(no_mangle)]
+extern "C" fn handle_stack_overflow(sp: u64, elr: u64, far: u64) -> ! {
+    panic!(
+        "kernel stack overflow: SP={:#x} ELR={:#x} FAR={:#x} (tid {})",
+        sp,
+        elr,
+        far,
+        crate::task::percpu::current_tid()
+    );
+}
+
 /// Handle IRQ from EL1 (kernel mode)
 #[unsafe(no_mangle)]
 extern "C" fn handle_el1_irq(_frame: &mut Aarch64TrapFrame) {

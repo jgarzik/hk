@@ -485,6 +485,21 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
         return 1;
     }
 
+    // A kernel stack overflow: a fault in the guard gap below a stack.
+    // With RSP itself there the page fault could not push its frame
+    // either, so it became a double fault, running on its IST stack
+    // (Linux exc_double_fault, handle_stack_overflow)
+    let guard = |a| crate::mm::vmstack::in_guard(a);
+    if matches!(vector, 8 | 14) && (guard(cr2) || guard(frame.rsp)) {
+        panic!(
+            "kernel stack overflow: RIP={:#x} RSP={:#x} CR2={:#x} (tid {})",
+            frame.rip,
+            frame.rsp,
+            cr2,
+            crate::task::percpu::current_tid()
+        );
+    }
+
     // Cast to u8 for the rest of the handler
     let vector = vector as u8;
 

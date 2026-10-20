@@ -142,6 +142,13 @@ pub use aarch64::paging::{self, phys_to_virt, virt_to_phys};
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::tlb;
 
+// Kernel pages in the vmalloc area (mm::vmstack)
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::ioremap::{vmap_page, vunmap_page};
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::ioremap::{vmap_page, vunmap_page};
+
 // TLB self-test hook (kselftest, LOCKDEP builds)
 #[cfg(all(feature = "lockdep", target_arch = "x86_64"))]
 pub use x86_64::ioremap::retarget as ioremap_retarget;

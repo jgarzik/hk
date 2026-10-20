@@ -277,8 +277,16 @@ impl DirectDmaOps {
         Self { frame_alloc }
     }
 
-    /// Convert a CPU (direct-map or kernel image) address to physical
+    /// Convert a CPU (direct-map or kernel image) address to physical.
+    /// A kernel stack is neither (`mm::vmstack`): DMA buffers come from
+    /// the heap or the frame allocator (Linux: no DMA from the stack
+    /// with VMAP_STACK)
     fn cpu_to_phys(&self, cpu_addr: *const u8) -> u64 {
+        assert!(
+            !crate::mm::vmstack::contains(cpu_addr as u64),
+            "DMA from a kernel stack: {:p}",
+            cpu_addr
+        );
         virt_to_phys(cpu_addr as u64)
     }
 

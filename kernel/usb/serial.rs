@@ -303,10 +303,23 @@ impl ConsoleDriver for UsbSerialConsole {
             return;
         }
 
-        // Send data via USB bulk OUT transfer (ignore errors - console is best-effort)
-        let _ = usb_bulk_out(self.slot_id, self.bulk_out_ep, data);
+        // The controller DMAs the data, and printk's may be on a kernel
+        // stack: send it through a static buffer. Busy (another CPU, or
+        // a printk nested in this one): dropped, the console is
+        // best-effort like the transfer itself.
+        let Some(mut buf) = BOUNCE.try_lock() else {
+            return;
+        };
+        for chunk in data.chunks(buf.len()) {
+            buf[..chunk.len()].copy_from_slice(chunk);
+            let _ = usb_bulk_out(self.slot_id, self.bulk_out_ep, &buf[..chunk.len()]);
+        }
     }
 }
+
+/// The USB serial console's DMA buffer (spin leaf, try_lock only; held
+/// across the transfer, which takes `USB_CONTROLLER`)
+static BOUNCE: crate::sync::spin::Mutex<[u8; 256]> = crate::sync::spin::Mutex::new([0; 256]);
 
 /// Register a USB serial device as a console
 ///

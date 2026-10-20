@@ -305,21 +305,18 @@ Nothing in hk can avoid it. Next: check the BIOS for Intel default
 power/turbo settings and current microcode, stress-test CPUs 2 and 5,
 or keep gate QEMUs off them (taskset) and see whether the crash stops.
 
-## Kernel stacks have no guard page; interrupts run on the task stack
+## Interrupts run on the task stack (no IRQ stacks)
 
-**Location**: `kernel/task/percpu.rs` (kernel stacks from the direct
-map), `kernel/arch/aarch64/vectors.S`, `kernel/arch/x86_64/` (IRQ entry)
+**Location**: `kernel/arch/aarch64/vectors.S`, `kernel/arch/x86_64/`
+(IRQ entry)
 
-A 16 KB kernel stack is contiguous direct-map memory with nothing
-mapped-out below it, and an interrupt pushes its trap frame (0x320
-bytes on arm64, with the FP/SIMD registers) and handler frames onto
-whatever task stack it lands on. A path that runs too deep therefore
-overwrites the page below the stack silently, and only when an IRQ
-arrives at the deepest point. `check_stack_usage` (Linux
-CONFIG_DEBUG_STACK_USAGE, STACK:FAIL under 4 KB left) catches a deep
-path only for tasks that exit. Linux has vmap'ed stacks with guard pages
-(CONFIG_VMAP_STACK) and, on arm64, per-CPU IRQ stacks. The rare
-instruction abort below may be an earlier overflow of this kind.
+An interrupt pushes its trap frame (0x320 bytes on arm64, with the
+FP/SIMD registers) and handler frames onto whatever 16 KB task stack
+it lands on, so the deepest syscall path plus the deepest interrupt
+must fit in one stack. An overflow now faults in the guard gap below
+the stack ("kernel stack overflow" panic, `mm::vmstack`) instead of
+corrupting memory. Linux has per-CPU IRQ stacks (x86 hardirq_stack,
+arm64 irq_stack).
 
 ## Rare arm64 kernel instruction abort in the fault-signal tests
 

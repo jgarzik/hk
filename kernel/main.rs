@@ -909,22 +909,9 @@ fn kmain() -> ! {
         }
     };
 
-    // Allocate kernel stack for PID 1 (init process)
-    let kernel_stack = {
-        use crate::arch::FrameAlloc;
-        const INIT_KERNEL_STACK_SIZE: usize = 16 * 1024;
-        const FRAME_SIZE: usize = 4096;
-        let stack_pages = INIT_KERNEL_STACK_SIZE / FRAME_SIZE;
-        let stack_base = phys_to_virt(
-            frame_alloc
-                .alloc_contig(stack_pages)
-                .expect("Failed to allocate kernel stack for init"),
-        );
-        unsafe {
-            ::core::ptr::write_bytes(stack_base, 0, INIT_KERNEL_STACK_SIZE);
-        }
-        stack_base as u64 + INIT_KERNEL_STACK_SIZE as u64
-    };
+    // Kernel stack for PID 1 (init process)
+    let kernel_stack = mm::vmstack::alloc().expect("Failed to allocate kernel stack for init")
+        + task::percpu::KERNEL_STACK_SIZE as u64;
 
     printkln!("KERNEL_READY");
 
@@ -936,7 +923,7 @@ fn kmain() -> ! {
 
     // Initialize the per-CPU scheduler with idle task
     // This must be done before creating the user task
-    task::percpu::init(&mut frame_alloc);
+    task::percpu::init();
 
     // Register init with the scheduler: pid 1 (the idle tasks are tid 0,
     // Linux swapper). ppid=0 (no parent), pgid=sid=0 like Linux's
@@ -973,7 +960,7 @@ fn kmain() -> ! {
     // Schedulers for the APs, then the kernel threads: timer callbacks
     // (ktimerd), the system workqueue worker, the per-CPU network softnet
     // threads and the boot self-test
-    task::percpu::init_ap_schedulers(&mut frame_alloc);
+    task::percpu::init_ap_schedulers();
     crate::timer::start_ktimerd();
     crate::workqueue::init();
     crate::net::start_threads();

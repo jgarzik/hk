@@ -14,8 +14,9 @@ use crate::sync::spin::Mutex;
 use core::arch::asm;
 
 use super::paging::{
-    AF, AP_EL1_RW, ATTR_IDX_DEVICE, IO_BASE, IO_SIZE, PAGE_SIZE, PXN, PageTableEntry, SH_INNER,
-    UXN, VMALLOC_START, io_va, phys_to_virt, phys_to_virt_table, phys_to_virt_table_const,
+    AF, AP_EL1_RW, ATTR_IDX_DEVICE, ATTR_IDX_NORMAL, IO_BASE, IO_SIZE, PAGE_SIZE, PXN,
+    PageTableEntry, SH_INNER, UXN, VMALLOC_START, io_va, phys_to_virt, phys_to_virt_table,
+    phys_to_virt_table_const,
 };
 
 /// ioremap window base (the vmalloc area, TTBR1)
@@ -36,6 +37,10 @@ const BITMAP_SIZE: usize = IOREMAP_PAGES.div_ceil(64);
 /// Device memory page attributes
 const DEVICE_PAGE_ATTRS: u64 = AF | SH_INNER | ATTR_IDX_DEVICE | AP_EL1_RW | PXN | UXN;
 
+/// Kernel RAM page attributes (vmap): normal memory, writable, never
+/// executable
+const RAM_PAGE_ATTRS: u64 = AF | SH_INNER | ATTR_IDX_NORMAL | AP_EL1_RW | PXN | UXN;
+
 /// ioremap error types
 #[derive(Debug, Clone, Copy)]
 pub enum IoremapError {
@@ -49,6 +54,13 @@ pub enum IoremapError {
 
 /// Global ioremap allocator
 static IOREMAP: Mutex<IoremapAllocator> = Mutex::new(IoremapAllocator::new());
+
+/// Serializes adding lower tables to the vmalloc area (ioremap window
+/// and kernel stacks), shared by every address space (Linux
+/// init_mm.page_table_lock): two mappings in one new table must not
+/// both create it. Spin leaf, thread context; frames are allocated
+/// under it.
+static KTABLES: Mutex<()> = Mutex::new(());
 
 /// Bitmap-based virtual address allocator for ioremap region
 struct IoremapAllocator {
@@ -280,9 +292,29 @@ pub fn iounmap(virt_addr: *mut u8, size: u64) {
     IOREMAP.lock().free(aligned_virt, num_pages);
 }
 
+/// Map the RAM page `pa` at the kernel address `va` (Linux
+/// vmap_pages_range): writable, never executable. No TLB flush: `va`
+/// was invalid, and whoever unmapped it flushed it before handing it
+/// out again; the barrier in the mapping makes the entry visible.
+pub fn vmap_page(va: u64, pa: u64) -> Result<(), IoremapError> {
+    map_page(super::kmap::swapper_phys(), va, pa, RAM_PAGE_ATTRS)
+}
+
+/// Unmap the kernel page at `va`, returning the RAM page it mapped.
+/// The caller flushes the TLBs before `va` is mapped again.
+pub fn vunmap_page(va: u64) -> Option<u64> {
+    unmap_page(super::kmap::swapper_phys(), va)
+}
+
 /// Map a single 4KB page with device memory attributes
 fn map_device_page(l0_phys: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
+    map_page(l0_phys, va, pa, DEVICE_PAGE_ATTRS)
+}
+
+/// Map a single 4KB page with `attrs`
+fn map_page(l0_phys: u64, va: u64, pa: u64, attrs: u64) -> Result<(), IoremapError> {
     let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
+    let _tables = KTABLES.lock();
 
     unsafe {
         let l0 = phys_to_virt_table(l0_phys);
@@ -317,9 +349,9 @@ fn map_device_page(l0_phys: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
         }
         let l3 = phys_to_virt_table(l2_entry.addr());
 
-        // Set L3 page entry with device attributes
+        // Set the L3 page entry
         let l3_entry = (*l3).entry_mut(l3_idx);
-        l3_entry.set_page(pa, DEVICE_PAGE_ATTRS);
+        l3_entry.set_page(pa, attrs);
 
         // Data cache clean to ensure MMU sees the new entry
         let entry_addr = l3_entry as *mut PageTableEntry as u64;
@@ -334,8 +366,8 @@ fn map_device_page(l0_phys: u64, va: u64, pa: u64) -> Result<(), IoremapError> {
     Ok(())
 }
 
-/// Unmap a single page (clear PTE)
-fn unmap_page(l0_phys: u64, va: u64) {
+/// Unmap a single page (clear PTE); the page it mapped, if any
+fn unmap_page(l0_phys: u64, va: u64) -> Option<u64> {
     let (l0_idx, l1_idx, l2_idx, l3_idx) = page_indices(va);
 
     unsafe {
@@ -343,24 +375,25 @@ fn unmap_page(l0_phys: u64, va: u64) {
 
         let l0_entry = (*l0).entry(l0_idx);
         if !l0_entry.is_valid() || !l0_entry.is_table() {
-            return;
+            return None;
         }
         let l1 = phys_to_virt_table_const(l0_entry.addr());
 
         let l1_entry = (*l1).entry(l1_idx);
         if !l1_entry.is_valid() || !l1_entry.is_table() {
-            return;
+            return None;
         }
         let l2 = phys_to_virt_table_const(l1_entry.addr());
 
         let l2_entry = (*l2).entry(l2_idx);
         if !l2_entry.is_valid() || !l2_entry.is_table() {
-            return;
+            return None;
         }
         let l3 = phys_to_virt_table(l2_entry.addr());
 
         // Clear the L3 entry
         let l3_entry = (*l3).entry_mut(l3_idx);
+        let pa = l3_entry.is_valid().then(|| l3_entry.addr());
         l3_entry.clear();
 
         // Data cache clean
@@ -371,6 +404,7 @@ fn unmap_page(l0_phys: u64, va: u64) {
             in(reg) entry_addr,
             options(nostack)
         );
+        pa
     }
 }
 

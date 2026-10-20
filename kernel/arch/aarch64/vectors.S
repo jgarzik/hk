@@ -26,6 +26,24 @@
 .section .text.vectors
 .balign 0x800
 
+/*
+ * Entry from EL1: allocate the trap frame and check that SP is still on
+ * the kernel stack (Linux kernel_ventry with VMAP_STACK). Every EL1
+ * stack is at most 32KB at a 64KB-aligned base (mm::vmstack slots, the
+ * BSP boot stack), so SP has bit 15 clear while on it; an overflow into
+ * the guard gap below sets it. Without a free register, x0 is kept as
+ * SP+x0-SP (Linux's trick); on overflow the handler gets the bad SP.
+ */
+.macro KERNEL_ENTRY handler
+    sub     sp, sp, #TRAP_FRAME_SIZE
+    add     sp, sp, x0              // sp' = sp + x0
+    sub     x0, sp, x0              // x0' = sp' - x0 = sp
+    tbnz    x0, #15, el1_stack_overflow
+    sub     x0, sp, x0              // x0'' = sp' - x0' = x0
+    sub     sp, sp, x0              // sp'' = sp' - x0 = sp
+    b       \handler
+.endm
+
 .global exception_vectors
 exception_vectors:
 
@@ -34,11 +52,11 @@ exception_vectors:
 // ============================================================================
 .balign 0x80
 el1t_sync:
-    b       el1_sync_handler
+    b       unhandled_exception     // EL1 never runs on SP_EL0
 
 .balign 0x80
 el1t_irq:
-    b       el1_irq_handler
+    b       unhandled_exception
 
 .balign 0x80
 el1t_fiq:
@@ -53,11 +71,11 @@ el1t_serror:
 // ============================================================================
 .balign 0x80
 el1h_sync:
-    b       el1_sync_handler
+    KERNEL_ENTRY el1_sync_handler
 
 .balign 0x80
 el1h_irq:
-    b       el1_irq_handler
+    KERNEL_ENTRY el1_irq_handler
 
 .balign 0x80
 el1h_fiq:
@@ -145,8 +163,10 @@ el0_32_serror:
  * Parameter: use_sp_el0 - if 1, save SP_EL0 (user stack), else save SP_EL1 (kernel stack)
  */
 .macro SAVE_CONTEXT use_sp_el0=0
-    // Allocate space for the trap frame
+    // Allocate space for the trap frame (KERNEL_ENTRY did for EL1)
+.if \use_sp_el0
     sub     sp, sp, #TRAP_FRAME_SIZE
+.endif
 
     // Save x0-x29 (30 registers)
     stp     x0, x1, [sp, #0x00]
@@ -375,6 +395,25 @@ el0_irq_handler:
 
     RESTORE_CONTEXT 1   // use_sp_el0=1: restore user stack pointer
     eret
+
+/*
+ * Kernel stack overflow (KERNEL_ENTRY): x0 holds the SP that left the
+ * stack. Continue on this CPU's overflow stack (per-CPU data offset 8,
+ * percpu::PerCpu::overflow_stack) and panic; with no per-CPU data or
+ * overflow stack yet, hang. TPIDRRO_EL0 is scratch (the system dies).
+ */
+el1_stack_overflow:
+    msr     tpidrro_el0, x0
+    mrs     x0, tpidr_el1
+    cbz     x0, unhandled_exception
+    ldr     x0, [x0, #8]
+    cbz     x0, unhandled_exception
+    mov     sp, x0
+    mrs     x0, tpidrro_el0
+    mrs     x1, elr_el1
+    mrs     x2, far_el1
+    bl      handle_stack_overflow
+    b       unhandled_exception
 
 /*
  * Unhandled exception - just hang

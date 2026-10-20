@@ -18,6 +18,10 @@ pub struct PerCpu {
     /// Self-pointer for TPIDR_EL1 access
     pub self_ptr: *mut PerCpu,
 
+    /// Top of this CPU's overflow stack (vectors.S `el1_stack_overflow`
+    /// loads it at offset 8), 0 until `smp::init`
+    pub overflow_stack: u64,
+
     /// Logical CPU ID (0 = BSP, 1+ = APs)
     pub cpu_id: u32,
 
@@ -138,6 +142,8 @@ pub fn syscall_restart() -> u64 {
     p.syscall_orig_x0
 }
 
+const _: () = assert!(core::mem::offset_of!(PerCpu, overflow_stack) == 8);
+
 // Safety: PerCpu is only accessed by its owning CPU
 unsafe impl Send for PerCpu {}
 unsafe impl Sync for PerCpu {}
@@ -147,6 +153,7 @@ impl PerCpu {
     pub const fn uninit() -> Self {
         Self {
             self_ptr: core::ptr::null_mut(),
+            overflow_stack: 0,
             cpu_id: 0,
             mpidr: 0,
             is_bsp: false,

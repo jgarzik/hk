@@ -6,6 +6,7 @@
 //! 0000000000000000 - 00007fffffffefff  user space (TASK_SIZE)
 //! ffff888000000000 - ...               direct map of RAM (PAGE_OFFSET)
 //! ffffc90000000000 - ffffc9003fffffff  vmalloc/ioremap window
+//! ffffc90040000000 - ffffc9005fffffff  kernel stacks (mm::vmstack)
 //! ffffffff80000000 - ...               kernel image (__START_KERNEL_map)
 //! ```
 //!
