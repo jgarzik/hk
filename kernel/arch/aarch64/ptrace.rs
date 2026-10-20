@@ -34,8 +34,8 @@ pub struct UserPtRegs {
 
 /// Get all general-purpose registers from a stopped tracee.
 ///
-/// The tracee must be in Traced state. This reads from the task's saved
-/// user context (percpu state from syscall entry or trap frame).
+/// The tracee must be in Traced state. This reads its user registers
+/// from its pt_regs (the entry frame at the top of its kernel stack).
 pub fn get_user_regs(tid: Tid) -> Result<UserPtRegs, i32> {
     let table = TASKLIST.read();
     let task = table.get(tid).ok_or(-3i32)?; // ESRCH
@@ -45,8 +45,9 @@ pub fn get_user_regs(tid: Tid) -> Result<UserPtRegs, i32> {
         return Err(-3); // ESRCH - not stopped
     }
 
-    // Get registers from trap frame
-    let tf = &task.trap_frame;
+    // Its pt_regs: the frame at the top of its kernel stack
+    // SAFETY: the tracee is stopped (TASKLIST held): its frame is stable
+    let tf = unsafe { &*crate::task::percpu::task_pt_regs(task.task) };
 
     let regs = UserPtRegs {
         regs: tf.x,
@@ -60,19 +61,20 @@ pub fn get_user_regs(tid: Tid) -> Result<UserPtRegs, i32> {
 
 /// Set all general-purpose registers for a stopped tracee.
 ///
-/// The tracee must be in Traced state. This updates the task's saved
-/// user context so the registers take effect when it resumes.
+/// The tracee must be in Traced state. This updates its pt_regs so the
+/// registers take effect when it resumes.
 pub fn set_user_regs(tid: Tid, regs: &UserPtRegs) -> Result<(), i32> {
-    let mut table = TASKLIST.write();
-    let mut task = table.get_mut(tid).ok_or(-3i32)?; // ESRCH
+    let table = TASKLIST.read();
+    let task = table.get(tid).ok_or(-3i32)?; // ESRCH
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
         return Err(-3); // ESRCH - not stopped
     }
 
-    // Update trap frame with new register values
-    let tf = &mut task.trap_frame;
+    // Update its pt_regs with the new register values
+    // SAFETY: as in get_user_regs
+    let tf = unsafe { &mut *crate::task::percpu::task_pt_regs(task.task) };
     tf.x = regs.regs;
     tf.sp = regs.sp;
     tf.elr = regs.pc;
@@ -109,10 +111,11 @@ const PSTATE_SS: u64 = 1 << 21;
 ///
 /// The CPU will generate a software step exception after one instruction.
 pub fn enable_single_step(tid: Tid) {
-    let mut table = TASKLIST.write();
-    if let Some(mut task) = table.get_mut(tid) {
+    let table = TASKLIST.read();
+    if let Some(task) = table.get(tid) {
         // Set SS bit in SPSR (will be loaded into PSTATE on exception return)
-        task.trap_frame.spsr |= PSTATE_SS;
+        // SAFETY: as in get_user_regs
+        unsafe { (*crate::task::percpu::task_pt_regs(task.task)).spsr |= PSTATE_SS };
     }
 
     // TODO: Also need to set MDSCR_EL1.SS globally or per-task
@@ -123,8 +126,9 @@ pub fn enable_single_step(tid: Tid) {
 ///
 /// Clears the SS bit in PSTATE.
 pub fn disable_single_step(tid: Tid) {
-    let mut table = TASKLIST.write();
-    if let Some(mut task) = table.get_mut(tid) {
-        task.trap_frame.spsr &= !PSTATE_SS;
+    let table = TASKLIST.read();
+    if let Some(task) = table.get(tid) {
+        // SAFETY: as in get_user_regs
+        unsafe { (*crate::task::percpu::task_pt_regs(task.task)).spsr &= !PSTATE_SS };
     }
 }

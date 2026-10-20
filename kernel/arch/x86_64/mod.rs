@@ -121,6 +121,41 @@ pub struct PtRegs {
 
 const _: () = assert!(core::mem::size_of::<PtRegs>() == 21 * 8);
 
+impl crate::arch::UserRegs for PtRegs {
+    fn ip(&self) -> u64 {
+        self.rip
+    }
+
+    fn sp(&self) -> u64 {
+        self.rsp
+    }
+
+    fn set_sp(&mut self, sp: u64) {
+        self.rsp = sp;
+    }
+
+    fn ret(&self) -> u64 {
+        self.rax
+    }
+
+    fn set_ret(&mut self, v: u64) {
+        self.rax = v;
+    }
+
+    fn in_syscall(&self) -> bool {
+        (self.orig_rax as i64) >= 0
+    }
+
+    fn forget_syscall(&mut self) {}
+
+    /// RIP back over the 2-byte `syscall`, the number back in RAX (Linux
+    /// regs->ax = regs->orig_ax; regs->ip -= 2)
+    fn restart_syscall(&mut self) {
+        self.rip = self.rip.wrapping_sub(2);
+        self.rax = self.orig_rax;
+    }
+}
+
 impl PtRegs {
     /// A frame for entering user mode
     pub fn new_user(entry: u64, user_stack: u64) -> Self {
@@ -165,19 +200,6 @@ impl SchedArch for X86_64Arch {
 
     fn clone_child_fpu(regs: u64) -> u64 {
         fpu::save_for_clone_child(regs)
-    }
-
-    fn clone_child_trapframe(
-        _parent_rip: u64,
-        _parent_rflags: u64,
-        child_rsp: u64,
-    ) -> Self::TrapFrame {
-        // Every register of the parent's syscall (Linux copy_thread:
-        // *childregs = *current_pt_regs()), returning 0 on its own stack
-        let mut regs = crate::task::percpu::current_pt_regs().clone();
-        regs.rax = 0;
-        regs.rsp = child_rsp;
-        regs
     }
 }
 

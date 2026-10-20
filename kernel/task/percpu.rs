@@ -13,7 +13,9 @@ use ::core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::arch::{ContextOps, CpuOps, FrameAlloc, IrqSpinlock, PerCpuOps, SchedArch, UserModeOps};
+use crate::arch::{
+    ContextOps, CpuOps, FrameAlloc, IrqSpinlock, PerCpuOps, SchedArch, UserModeOps, UserRegs,
+};
 use crate::cpu::PerCpu;
 use crate::printkln;
 use crate::sync::spin::RwLock;
@@ -1035,7 +1037,6 @@ fn create_kernel_task(
         reset_on_fork: false,
         cpus_allowed: crate::cpumask::CpuSet::one(cpu_id),
         page_table: ArchPageTable::kernel_identity(),
-        trap_frame: Default::default(),
         // TLS fields (not used for idle task)
         clear_child_tid: 0,
         set_child_tid: 0,
@@ -1214,7 +1215,6 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         reset_on_fork: false,
         cpus_allowed: crate::cpumask::CpuSet::all(),
         page_table: config.page_table,
-        trap_frame: Default::default(),
         // TLS fields (initialized to 0, set by syscalls)
         clear_child_tid: 0,
         set_child_tid: 0,
@@ -1597,14 +1597,8 @@ pub fn has_children(parent_pid: Pid, target_pid: i64, wflags: i32) -> bool {
 pub struct CloneConfig {
     /// Clone flags (CLONE_VM, CLONE_THREAD, etc.)
     pub flags: u64,
-    /// Child's user stack top (required for CLONE_VM, 0 for fork)
+    /// Child's user stack top (required for CLONE_VM, 0: the parent's)
     pub child_stack: u64,
-    /// Parent's syscall return address (user RIP)
-    pub parent_rip: u64,
-    /// Parent's RFLAGS
-    pub parent_rflags: u64,
-    /// Parent's user stack pointer (for fork when child_stack == 0)
-    pub parent_rsp: u64,
     /// User address to store parent TID (CLONE_PARENT_SETTID)
     pub parent_tidptr: u64,
     /// User address to store child TID (CLONE_CHILD_SETTID/CLEARTID)
@@ -1793,15 +1787,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     let stack_base = crate::mm::vmstack::alloc().ok_or(12)?; // ENOMEM
     let kstack_top = stack_base + KERNEL_STACK_SIZE as u64;
 
-    // Determine child's user stack pointer
-    // For fork (child_stack == 0): inherit parent's stack
-    // For clone with explicit stack: use provided stack
-    let child_user_rsp = if config.child_stack == 0 {
-        config.parent_rsp
-    } else {
-        config.child_stack
-    };
-
     // Build child's TrapFrame at the top of the child's kernel stack (its
     // pt_regs), the inherited FP/SIMD state below it if the arch keeps
     // that apart (loaded by clone_child_entry before it returns to user
@@ -1809,9 +1794,14 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     let trapframe_size = core::mem::size_of::<<CurrentArch as Arch>::TrapFrame>() as u64;
     let trapframe_ptr = kstack_top - trapframe_size;
 
-    // Use architecture-specific TrapFrame construction
-    let child_trapframe =
-        CurrentArch::clone_child_trapframe(config.parent_rip, config.parent_rflags, child_user_rsp);
+    // Every user register of the parent's syscall (Linux copy_thread:
+    // *childregs = *current_pt_regs()), returning 0, on its own stack
+    // unless it shares the parent's (fork: child_stack 0)
+    let mut child_trapframe = current_pt_regs().clone();
+    child_trapframe.set_ret(0);
+    if config.child_stack != 0 {
+        child_trapframe.set_sp(config.child_stack);
+    }
 
     // Copy TrapFrame to child's kernel stack
     unsafe {
@@ -1848,7 +1838,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         reset_on_fork: false, // Never inherited - child must set explicitly
         cpus_allowed: parent_cpus_allowed, // Inherit CPU affinity from parent
         page_table: child_pt,
-        trap_frame: Default::default(), // Not used - we have TrapFrame on stack
         // TLS fields - will be set based on clone flags below
         clear_child_tid: 0,
         set_child_tid: 0,
@@ -2423,8 +2412,8 @@ unsafe fn switch_mm(mm: *const crate::mm::Mm) {
 ///
 /// The lock stays held across the switch and is released by whichever task
 /// runs next (its own guard drop, or `finish_context_switch` for a new
-/// task). The per-CPU syscall user-register block belongs to `cur` and is
-/// kept on its kernel stack until it runs again.
+/// task). `cur`'s user registers stay in its pt_regs, on its own kernel
+/// stack.
 fn context_switch_locked(
     sched: &PerCpuScheduler,
     mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>,
@@ -2458,13 +2447,11 @@ fn context_switch_locked(
     rq.current = Some(next);
     sched.nr_switches.fetch_add(1, Ordering::Relaxed);
 
-    let saved = CurrentArch::save_syscall_user_state();
     unsafe {
         switch_mm(next_mm);
         CurrentArch::context_switch(curr_ctx, next_ctx, next_kstack, next_tls, next_gs);
     }
     // Back on `cur` (the rq lock is held again; `rq` releases it)
-    CurrentArch::restore_syscall_user_state(&saved);
     let dead = core::mem::take(&mut rq.dead);
     drop(rq);
     drop(dead);
@@ -2716,22 +2703,8 @@ pub fn finish_context_switch() {
     drop(dead);
 }
 
-/// Get the current task's TLS value
-///
-/// This is called from clone_child_entry to load the child's TLS register
-/// before returning to user mode.
-///
-/// Returns 0 if no TLS is set for this task.
-#[unsafe(no_mangle)]
-pub extern "C" fn get_current_task_tls() -> u64 {
-    let tid = current_tid();
-    if tid == 0 {
-        return 0;
-    }
-    current().tls.load(Ordering::Relaxed)
-}
-
-/// Write the child TID for CLONE_CHILD_SETTID (called from clone_child_entry)
+/// Write the child TID for CLONE_CHILD_SETTID (from the fork child's
+/// first return: clone_child_entry / ret_from_fork)
 ///
 /// This is called in the child's context after its page table is loaded,
 /// specifically for fork (non-CLONE_VM) where we couldn't write at clone time.

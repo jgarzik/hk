@@ -115,9 +115,8 @@ extern "C" fn do_syscall_64(regs: &mut PtRegs) -> bool {
     // Deliver pending signals / apply -ERESTART* rules before returning
     // to user space (they may redirect the frame to a handler or back
     // up over the syscall instruction; rt_sigreturn restored a whole
-    // user context and is not restarted)
-    let restartable = nr != super::syscall::SYS_RT_SIGRETURN;
-    crate::signal::syscall_exit_signal_work(regs.rax, restartable);
+    // user context, orig_ax -1, and is not restarted)
+    crate::signal::do_signal(regs);
     // SAFETY: back to user mode next, with the frame as it is now
     unsafe { core::arch::asm!("cli", options(nostack)) };
     sysret_ok(regs)

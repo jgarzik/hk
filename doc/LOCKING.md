@@ -458,19 +458,15 @@ pub needs_reschedule: AtomicBool, // Reschedule request flag
 5. **Timer ISR only touches local CPU** - `wake_sleepers()` drains the local
    `wake_list` and wakes expired sleepers of the local sleep queue only.
 
-6. **User registers belong to the task** - x86-64: every entry from
-   user mode builds a `PtRegs` (Linux pt_regs) at the top of the task's
-   kernel stack (entry.rs); it is the task's only copy of its user
-   registers while it is in the kernel (`current_pt_regs`,
-   `task_pt_regs`), so a switch has nothing to save, and signal frames,
-   fork, exec and ptrace read and write it there with no lock (the task
-   itself, or a stopped tracee under TASKLIST). arm64: the
-   `syscall_user_*` block in per-CPU data is saved on the outgoing task's
-   kernel stack across every `context_switch` and restored when it runs
-   again, so a task that slept inside a syscall returns (and builds
-   signal frames) with its own registers; a user fault that delivers a
-   signal (`force_sig_fault`) loads the block from the fault's trap frame
-   and copies it back afterwards.
+6. **User registers belong to the task** - every entry from user mode
+   builds the arch's `PtRegs` (Linux pt_regs: x86 entry.rs, arm64
+   vectors.S with orig_x0/syscallno) at the top of the task's kernel
+   stack; it is the task's only copy of its user registers while it is
+   in the kernel (`current_pt_regs`, `task_pt_regs`), so a switch has
+   nothing to save, and signal frames (`do_signal`, `force_sig_fault`),
+   fork (`do_clone` copies it), exec (`jump_to_user` rebuilds it) and
+   ptrace read and write it there with no lock: the task itself, or a
+   stopped tracee under TASKLIST.
 
 7. **User FP/SIMD state is saved eagerly, per task, never lazily** - no
    lock is involved; the state always lives with the task it belongs to:
@@ -482,8 +478,8 @@ pub needs_reschedule: AtomicBool, // Reschedule request flag
      (`SchedArch::clone_child_fpu`), loaded by `ret_from_fork`.
    - aarch64: the kernel uses NEON, so every exception entry (EL0 and EL1)
      saves q0-q31/FPCR/FPSR in its trap frame and restores them on exit;
-     the EL0 frame (per-CPU `user_frame`, saved with the syscall block of
-     rule 6) holds the user FP state. `__switch_to_asm` preserves d8-d15.
+     the EL0 frame (the task's pt_regs, rule 6) holds the user FP state.
+     `__switch_to_asm` preserves d8-d15.
    Signal frames, fork and execve read/write the state in these places;
    nothing may use user FP registers between a context switch's save and
    the task's next return to user mode except through them.
@@ -2161,8 +2157,8 @@ wake_up_tid(tid, WakeMode::Interruptible) // signal_wake_up
 `with_task_signal_state` recomputes `tif_sigpending` after every access, so it
 means "a signal is deliverable under the current mask"; interruptible sleeps
 test it via `waitqueue::signal_pending()` and return `-ERESTARTSYS`/
-`-ERESTARTNOHAND`. `syscall_exit_signal_work` (arch syscall exit) delivers
-the signal and restarts or fails the syscall per SA_RESTART.
+`-ERESTARTNOHAND`. `do_signal(regs)` (arch syscall exit) delivers the
+signal and restarts or fails the syscall per SA_RESTART.
 
 #### Thread-Group Exit (Linux do_group_exit, zap_other_threads, de_thread)
 
@@ -3026,8 +3022,8 @@ arm64 `handle_el0_sync` for SVC), user-mode faults and kernel faults on
 user addresses from a context with interrupts on (x86 after reading
 CR2, arm64 after FAR; Linux do_user_addr_fault / el0_da / el1_abort)
 run with interrupts enabled, as in Linux; the entry/exit code
-around them (per-CPU user-register block, x86 `swapgs` and the switch
-to the per-CPU top_of_stack, ELR/SPSR_EL1, a fork child's first
+around them (building and restoring pt_regs, x86 `swapgs` and the
+switch to the per-CPU top_of_stack, ELR/SPSR_EL1, a fork child's first
 return: `clone_child_entry` enables them for the child-TID write and
 disables them again) keeps them off. Every x86 IDT vector is an
 interrupt gate, so no interrupt lands between an entry from user mode
@@ -3042,8 +3038,8 @@ uninterrupted by other tasks. What this changes, and why it holds:
   preemption, no migration), so per-CPU reads stay valid; state an
   interrupt handler also touches is atomic or taken with interrupts
   off (`IrqSpinlock`, `local_irq_save`: per-CPU page lists, slab arrays,
-  TLB state, cross-CPU queues); the per-CPU user-register block and
-  `curr` are written only by thread context.
+  TLB state, cross-CPU queues); `curr` is written only by thread
+  context.
 - Preempt-free sections: unchanged (no preemption); `IrqSpinlock`
   still raises the preempt count and masks interrupts.
 - `spin::Mutex`/`RwLock` holders now take interrupts: such a lock must

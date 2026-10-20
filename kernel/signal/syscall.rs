@@ -11,7 +11,7 @@
 //!
 //! Note: rt_sigreturn (15) is implemented in arch-specific signal.rs files
 
-use crate::arch::{CurrentArch, PerCpuOps, Uaccess};
+use crate::arch::Uaccess;
 use crate::error::KernelError;
 use crate::signal::{
     SIGKILL, SIGSTOP, SigAction, SigSet, UNMASKABLE_SIGNALS, get_task_sighand, send_signal,
@@ -947,7 +947,10 @@ pub fn sys_sigaltstack(ss_ptr: u64, oss_ptr: u64) -> i64 {
     let tid = current_tid();
 
     // Get current user stack pointer to check if on signal stack
-    let user_sp = CurrentArch::get_syscall_user_rsp();
+    let user_sp = {
+        use crate::arch::UserRegs;
+        crate::task::percpu::current_pt_regs().sp()
+    };
 
     // Read the new stack before locking the signal state (Linux
     // copy_from_user, then do_sigaltstack, then copy_to_user)

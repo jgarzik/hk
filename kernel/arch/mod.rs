@@ -96,6 +96,13 @@ pub use x86_64::ptrace;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::ptrace;
 
+// The user registers of an entry (Linux struct pt_regs)
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::PtRegs;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::Aarch64TrapFrame as PtRegs;
+
 // Signal frame setup (setup_rt_frame) / rt_sigreturn
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::signal;
@@ -185,10 +192,36 @@ bitflags! {
     }
 }
 
+/// The user registers of a task in the kernel (Linux struct pt_regs and
+/// its accessors: instruction_pointer, user_stack_pointer,
+/// regs_return_value, syscall_get_nr): every entry from user mode builds
+/// one at the top of the task's kernel stack
+/// (`task::percpu::current_pt_regs`)
+pub trait UserRegs {
+    /// The user PC
+    fn ip(&self) -> u64;
+    /// The user stack pointer
+    fn sp(&self) -> u64;
+    fn set_sp(&mut self, sp: u64);
+    /// The syscall return register (x86 RAX, arm64 x0)
+    fn ret(&self) -> u64;
+    fn set_ret(&mut self, v: u64);
+    /// The frame is a syscall's (one that may still be restarted)
+    fn in_syscall(&self) -> bool;
+    /// No restart from here on (Linux forget_syscall; x86 keeps orig_ax,
+    /// as Linux does: its restart leaves the syscall number in RAX, never
+    /// an -ERESTART* code)
+    fn forget_syscall(&mut self);
+    /// Re-execute the syscall on return (Linux: the PC back over the
+    /// syscall instruction, its number or first argument back in the
+    /// return register)
+    fn restart_syscall(&mut self);
+}
+
 /// Architecture abstraction trait
 pub trait Arch {
-    /// Trap frame type for saving/restoring CPU state
-    type TrapFrame: Default + Clone;
+    /// Trap frame type for saving/restoring CPU state (Linux pt_regs)
+    type TrapFrame: Default + Clone + UserRegs;
     /// Virtual address type
     type VirtAddr: Copy + Eq;
     /// Physical address type
@@ -350,36 +383,8 @@ pub trait PerCpuOps {
     /// Get the interrupt nesting depth
     fn interrupt_depth() -> u32;
 
-    /// Get saved syscall user RIP (return address for clone/fork)
-    fn get_syscall_user_rip() -> u64;
-
-    /// Get saved syscall user RFLAGS
-    fn get_syscall_user_rflags() -> u64;
-
-    /// Get saved syscall user RSP (stack pointer for fork)
-    fn get_syscall_user_rsp() -> u64;
-
     /// Whether logical CPU `cpu` has been brought online
     fn cpu_online(cpu: u32) -> bool;
-
-    /// Per-CPU syscall user-register block (see `save_syscall_user_state`)
-    type SyscallUserState: Copy;
-
-    /// Capture this CPU's syscall user-register block. The block belongs to
-    /// the current task; the scheduler keeps it on the task's kernel stack
-    /// across context switches.
-    fn save_syscall_user_state() -> Self::SyscallUserState;
-
-    /// Restore a block captured by `save_syscall_user_state`
-    fn restore_syscall_user_state(state: &Self::SyscallUserState);
-
-    /// Record the syscall return value in the user-register block (so a
-    /// signal frame saves it)
-    fn set_syscall_return(val: u64);
-
-    /// Make the current syscall re-execute on return to user (restart after
-    /// -ERESTART*). Returns the value the return register must hold.
-    fn syscall_restart() -> u64;
 }
 
 /// CPU control operations
@@ -493,22 +498,6 @@ pub trait UserModeOps {
 pub trait SchedArch: Arch + PerCpuOps + CpuOps + ContextOps + UserModeOps {
     /// The page table type for this architecture
     type SchedPageTable: PageTable<PhysAddr = u64, VirtAddr = u64>;
-
-    /// Build a child TrapFrame for clone/fork
-    ///
-    /// Creates the trap frame that will be placed on the child's kernel stack.
-    /// When the child is scheduled, it will restore this frame and return to
-    /// user mode with a return value of 0.
-    ///
-    /// # Arguments
-    /// * `parent_rip` - Parent's user return address
-    /// * `parent_rflags` - Parent's user flags
-    /// * `child_rsp` - Child's user stack pointer
-    fn clone_child_trapframe(
-        parent_rip: u64,
-        parent_rflags: u64,
-        child_rsp: u64,
-    ) -> Self::TrapFrame;
 
     /// Save the calling task's user FP/SIMD state for a clone child whose
     /// TrapFrame (at the top of its kernel stack) is at `regs`; returns

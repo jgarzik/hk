@@ -971,8 +971,6 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     pub cpus_allowed: crate::cpumask::CpuSet,
     /// Page table for this task
     pub page_table: PT,
-    /// Saved CPU state
-    pub trap_frame: A::TrapFrame,
 
     // =========================================================================
     // TLS and thread-exit fields (Linux: embedded in task_struct/thread_struct)

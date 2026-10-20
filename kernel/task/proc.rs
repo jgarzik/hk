@@ -58,14 +58,12 @@ pub fn do_exit(wait_status: i32) -> ! {
 /// * `_child_tidptr` - Where to store child TID (if CLONE_CHILD_SETTID)
 /// * `_tls` - TLS pointer for child (if CLONE_SETTLS)
 ///
-/// Note: Parent's RIP, RFLAGS, and RSP are retrieved from per-CPU data,
-/// which is set at syscall entry.
+/// The child gets a copy of the caller's user registers (its pt_regs).
 ///
 /// # Returns
 /// * > 0: Child TID (to parent)
 /// * 0: Child returns 0 (handled via TrapFrame)
 /// * < 0: Error code
-#[cfg(target_arch = "x86_64")]
 pub fn sys_clone(
     flags: u64,
     child_stack: u64,
@@ -73,18 +71,6 @@ pub fn sys_clone(
     child_tidptr: u64,
     tls: u64,
 ) -> i64 {
-    use super::percpu::CloneConfig;
-    use crate::FRAME_ALLOCATOR;
-    use crate::arch::x86_64::percpu::{
-        get_syscall_user_rflags, get_syscall_user_rip, get_syscall_user_rsp,
-    };
-    use crate::frame_alloc::FrameAllocRef;
-
-    // Get parent's return address, flags, and stack from per-CPU data
-    let parent_rip = get_syscall_user_rip();
-    let parent_rflags = get_syscall_user_rflags();
-    let parent_rsp = get_syscall_user_rsp();
-
     // Legacy clone() only takes the low 32 flag bits (kernel/fork.c:
     // lower_32_bits(clone_flags)); higher flags such as CLONE_CLEAR_SIGHAND
     // are only reachable through clone3().
@@ -93,74 +79,22 @@ pub fn sys_clone(
     // Extract exit_signal from low 8 bits of flags (CSIGNAL mask = 0xff)
     let exit_signal = (flags & 0xff) as i32;
 
-    let config = CloneConfig {
+    clone(super::percpu::CloneConfig {
         flags: flags & !0xff, // Remove signal bits from flags
         child_stack,
-        parent_rip,
-        parent_rflags,
-        parent_rsp,
         parent_tidptr,
         child_tidptr,
         tls,
         pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
         exit_signal,
         cgroup_fd: -1, // CLONE_INTO_CGROUP only supported via clone3
-    };
-
-    // Get frame allocator
-    let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-    match super::percpu::do_clone(config, &mut frame_alloc) {
-        Ok(child_tid) => child_tid as i64,
-        Err(errno) => -(errno as i64),
-    }
+    })
 }
 
-/// sys_clone for aarch64 - create a new thread/process
-#[cfg(target_arch = "aarch64")]
-pub fn sys_clone(
-    flags: u64,
-    child_stack: u64,
-    parent_tidptr: u64,
-    child_tidptr: u64,
-    tls: u64,
-) -> i64 {
-    use super::percpu::CloneConfig;
-    use crate::FRAME_ALLOCATOR;
-    use crate::arch::PerCpuOps;
-    use crate::arch::aarch64::Aarch64Arch;
-    use crate::frame_alloc::FrameAllocRef;
-
-    // Get parent's return address, flags, and stack from per-CPU data
-    let parent_rip = Aarch64Arch::get_syscall_user_rip();
-    let parent_rflags = Aarch64Arch::get_syscall_user_rflags();
-    let parent_rsp = Aarch64Arch::get_syscall_user_rsp();
-
-    // Legacy clone() only takes the low 32 flag bits (kernel/fork.c:
-    // lower_32_bits(clone_flags)); higher flags such as CLONE_CLEAR_SIGHAND
-    // are only reachable through clone3().
-    let flags = flags & 0xffff_ffff;
-
-    // Extract exit_signal from low 8 bits of flags (CSIGNAL mask = 0xff)
-    let exit_signal = (flags & 0xff) as i32;
-
-    let config = CloneConfig {
-        flags: flags & !0xff, // Remove signal bits from flags
-        child_stack,
-        parent_rip,
-        parent_rflags,
-        parent_rsp,
-        parent_tidptr,
-        child_tidptr,
-        tls,
-        pidfd_ptr: 0, // CLONE_PIDFD only supported via clone3
-        exit_signal,
-        cgroup_fd: -1, // CLONE_INTO_CGROUP only supported via clone3
-    };
-
-    // Get frame allocator
-    let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
+/// Create the task described by `config` (do_clone with the global
+/// frame allocator): the child's tid, or -errno
+fn clone(config: super::percpu::CloneConfig) -> i64 {
+    let mut frame_alloc = crate::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
     match super::percpu::do_clone(config, &mut frame_alloc) {
         Ok(child_tid) => child_tid as i64,
         Err(errno) => -(errno as i64),
@@ -176,80 +110,18 @@ pub fn sys_clone(
 /// * > 0: Child PID (to parent)
 /// * 0: Child returns 0
 /// * < 0: Error code
-#[cfg(target_arch = "x86_64")]
 pub fn sys_fork() -> i64 {
-    use super::percpu::CloneConfig;
-    use crate::FRAME_ALLOCATOR;
-    use crate::arch::x86_64::percpu::{
-        get_syscall_user_rflags, get_syscall_user_rip, get_syscall_user_rsp,
-    };
-    use crate::frame_alloc::FrameAllocRef;
-
-    // Get parent's return address, flags, and stack from per-CPU data
-    let parent_rip = get_syscall_user_rip();
-    let parent_rflags = get_syscall_user_rflags();
-    let parent_rsp = get_syscall_user_rsp();
-
     // fork() is clone() with no CLONE_* flags and child_stack = 0 (inherit parent stack)
-    let config = CloneConfig {
+    clone(super::percpu::CloneConfig {
         flags: 0,       // No sharing flags = fork semantics
         child_stack: 0, // 0 = inherit parent's stack pointer
-        parent_rip,
-        parent_rflags,
-        parent_rsp,
         parent_tidptr: 0,
         child_tidptr: 0,
         tls: 0,
         pidfd_ptr: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // fork sends SIGCHLD on exit
         cgroup_fd: -1,
-    };
-
-    // Get frame allocator
-    let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-    match super::percpu::do_clone(config, &mut frame_alloc) {
-        Ok(child_pid) => child_pid as i64,
-        Err(errno) => -(errno as i64),
-    }
-}
-
-/// sys_fork for aarch64 - create a new process (classic fork)
-#[cfg(target_arch = "aarch64")]
-pub fn sys_fork() -> i64 {
-    use super::percpu::CloneConfig;
-    use crate::FRAME_ALLOCATOR;
-    use crate::arch::PerCpuOps;
-    use crate::arch::aarch64::Aarch64Arch;
-    use crate::frame_alloc::FrameAllocRef;
-
-    // Get parent's return address, flags, and stack from per-CPU data
-    let parent_rip = Aarch64Arch::get_syscall_user_rip();
-    let parent_rflags = Aarch64Arch::get_syscall_user_rflags();
-    let parent_rsp = Aarch64Arch::get_syscall_user_rsp();
-
-    // fork() is clone() with no CLONE_* flags and child_stack = 0 (inherit parent stack)
-    let config = CloneConfig {
-        flags: 0,       // No sharing flags = fork semantics
-        child_stack: 0, // 0 = inherit parent's stack pointer
-        parent_rip,
-        parent_rflags,
-        parent_rsp,
-        parent_tidptr: 0,
-        child_tidptr: 0,
-        tls: 0,
-        pidfd_ptr: 0,
-        exit_signal: crate::signal::SIGCHLD as i32, // fork sends SIGCHLD on exit
-        cgroup_fd: -1,
-    };
-
-    // Get frame allocator
-    let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-    match super::percpu::do_clone(config, &mut frame_alloc) {
-        Ok(child_pid) => child_pid as i64,
-        Err(errno) => -(errno as i64),
-    }
+    })
 }
 
 /// sys_vfork - create a child process and block until it exec()s or _exit()s
@@ -270,84 +142,22 @@ pub fn sys_fork() -> i64 {
 /// * > 0: Child PID (to parent, after child exits/execs)
 /// * 0: Child returns 0
 /// * < 0: Error code
-#[cfg(target_arch = "x86_64")]
 pub fn sys_vfork() -> i64 {
-    use super::percpu::CloneConfig;
-    use crate::FRAME_ALLOCATOR;
-    use crate::arch::x86_64::percpu::{
-        get_syscall_user_rflags, get_syscall_user_rip, get_syscall_user_rsp,
-    };
-    use crate::frame_alloc::FrameAllocRef;
+    use crate::arch::UserRegs;
     use crate::task::clone_flags::{CLONE_VFORK, CLONE_VM};
-
-    // Get parent's return address, flags, and stack from per-CPU data
-    let parent_rip = get_syscall_user_rip();
-    let parent_rflags = get_syscall_user_rflags();
-    let parent_rsp = get_syscall_user_rsp();
 
     // vfork() = clone(CLONE_VM | CLONE_VFORK, parent_stack)
     // Child shares address space and parent blocks until child exec()s or _exit()s
-    let config = CloneConfig {
+    clone(super::percpu::CloneConfig {
         flags: CLONE_VM | CLONE_VFORK,
-        child_stack: parent_rsp, // Use parent's stack (required for CLONE_VM)
-        parent_rip,
-        parent_rflags,
-        parent_rsp,
+        child_stack: super::percpu::current_pt_regs().sp(), // the parent's (CLONE_VM needs one)
         parent_tidptr: 0,
         child_tidptr: 0,
         tls: 0,
         pidfd_ptr: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // vfork sends SIGCHLD on exit
         cgroup_fd: -1,
-    };
-
-    // Get frame allocator
-    let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-    match super::percpu::do_clone(config, &mut frame_alloc) {
-        Ok(child_pid) => child_pid as i64,
-        Err(errno) => -(errno as i64),
-    }
-}
-
-/// sys_vfork for aarch64 - create a child process and block until it exec()s or _exit()s
-#[cfg(target_arch = "aarch64")]
-pub fn sys_vfork() -> i64 {
-    use super::percpu::CloneConfig;
-    use crate::FRAME_ALLOCATOR;
-    use crate::arch::PerCpuOps;
-    use crate::arch::aarch64::Aarch64Arch;
-    use crate::frame_alloc::FrameAllocRef;
-    use crate::task::clone_flags::{CLONE_VFORK, CLONE_VM};
-
-    // Get parent's return address, flags, and stack from per-CPU data
-    let parent_rip = Aarch64Arch::get_syscall_user_rip();
-    let parent_rflags = Aarch64Arch::get_syscall_user_rflags();
-    let parent_rsp = Aarch64Arch::get_syscall_user_rsp();
-
-    // vfork() = clone(CLONE_VM | CLONE_VFORK, parent_stack)
-    // Child shares address space and parent blocks until child exec()s or _exit()s
-    let config = CloneConfig {
-        flags: CLONE_VM | CLONE_VFORK,
-        child_stack: parent_rsp, // Use parent's stack (required for CLONE_VM)
-        parent_rip,
-        parent_rflags,
-        parent_rsp,
-        parent_tidptr: 0,
-        child_tidptr: 0,
-        tls: 0,
-        pidfd_ptr: 0,
-        exit_signal: crate::signal::SIGCHLD as i32, // vfork sends SIGCHLD on exit
-        cgroup_fd: -1,
-    };
-
-    // Get frame allocator
-    let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-    match super::percpu::do_clone(config, &mut frame_alloc) {
-        Ok(child_pid) => child_pid as i64,
-        Err(errno) => -(errno as i64),
-    }
+    })
 }
 
 /// sys_wait4 - wait for child process state change
@@ -697,15 +507,9 @@ const CSIGNAL: u64 = 0x000000ff;
 /// * > 0: Child PID/TID (to parent)
 /// * 0: Child returns 0
 /// * < 0: Error code
-#[cfg(target_arch = "x86_64")]
 pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
     use super::percpu::CloneConfig;
-    use crate::FRAME_ALLOCATOR;
     use crate::arch::Uaccess;
-    use crate::arch::x86_64::percpu::{
-        get_syscall_user_rflags, get_syscall_user_rip, get_syscall_user_rsp,
-    };
-    use crate::frame_alloc::FrameAllocRef;
     use crate::uaccess::{UaccessArch, copy_from_user};
 
     // Validate size - must be at least VER0 and not too large
@@ -765,11 +569,6 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         return KernelError::InvalidArgument.sysret();
     }
 
-    // Get parent's return address, flags, and stack from per-CPU data
-    let parent_rip = get_syscall_user_rip();
-    let parent_rflags = get_syscall_user_rflags();
-    let parent_rsp = get_syscall_user_rsp();
-
     // Calculate actual child stack pointer
     // clone3 provides stack base and size; we need to compute the stack top
     let child_stack = if args.stack != 0 {
@@ -779,130 +578,14 @@ pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
         0 // Inherit parent stack (for fork-like behavior)
     };
 
-    let config = CloneConfig {
+    clone(CloneConfig {
         flags: args.flags,
         child_stack,
-        parent_rip,
-        parent_rflags,
-        parent_rsp,
         parent_tidptr: args.parent_tid,
         child_tidptr: args.child_tid,
         tls: args.tls,
         pidfd_ptr: args.pidfd,
         exit_signal: args.exit_signal as i32,
         cgroup_fd,
-    };
-
-    // Get frame allocator
-    let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-    match super::percpu::do_clone(config, &mut frame_alloc) {
-        Ok(child_tid) => child_tid as i64,
-        Err(errno) => -(errno as i64),
-    }
-}
-
-/// sys_clone3 for aarch64 - create a new process with extended arguments
-#[cfg(target_arch = "aarch64")]
-pub fn sys_clone3(uargs: u64, size: u64) -> i64 {
-    use super::percpu::CloneConfig;
-    use crate::FRAME_ALLOCATOR;
-    use crate::arch::PerCpuOps;
-    use crate::arch::Uaccess;
-    use crate::arch::aarch64::Aarch64Arch;
-    use crate::frame_alloc::FrameAllocRef;
-    use crate::uaccess::{UaccessArch, copy_from_user};
-
-    // Validate size - must be at least VER0 and not too large
-    if size < CLONE_ARGS_SIZE_VER0 as u64 || size > 4096 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Validate user pointer
-    if !Uaccess::access_ok(uargs, size as usize) {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Copy clone_args from userspace (zero-fill any missing fields)
-    let mut args = CloneArgs::default();
-    let copy_size = core::cmp::min(size as usize, core::mem::size_of::<CloneArgs>());
-    let args_bytes = unsafe {
-        core::slice::from_raw_parts_mut(&mut args as *mut CloneArgs as *mut u8, copy_size)
-    };
-    if copy_from_user::<Uaccess>(args_bytes, uargs, copy_size).is_err() {
-        return KernelError::BadAddress.sysret();
-    }
-
-    // Validate clone3-specific constraints
-
-    // exit_signal must be valid (only low 8 bits used, must be valid signal or 0)
-    if (args.exit_signal & !CSIGNAL) != 0 || args.exit_signal > 64 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // CLONE_INTO_CGROUP requires cgroup fd and VER2 size
-    let cgroup_fd = if (args.flags & CLONE_INTO_CGROUP) != 0 {
-        if size < CLONE_ARGS_SIZE_VER2 as u64 {
-            return KernelError::InvalidArgument.sysret();
-        }
-        args.cgroup as i32
-    } else {
-        -1
-    };
-
-    // set_tid feature not supported
-    if args.set_tid != 0 || args.set_tid_size != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Validate stack - if stack is provided, stack_size must also be provided
-    if args.stack != 0 && args.stack_size == 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-    if args.stack == 0 && args.stack_size != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // CLONE_THREAD or CLONE_PARENT cannot have exit_signal
-    let clone_thread = super::clone_flags::CLONE_THREAD;
-    let clone_parent = super::clone_flags::CLONE_PARENT;
-    if (args.flags & (clone_thread | clone_parent)) != 0 && args.exit_signal != 0 {
-        return KernelError::InvalidArgument.sysret();
-    }
-
-    // Get parent's return address, flags, and stack from per-CPU data
-    let parent_rip = Aarch64Arch::get_syscall_user_rip();
-    let parent_rflags = Aarch64Arch::get_syscall_user_rflags();
-    let parent_rsp = Aarch64Arch::get_syscall_user_rsp();
-
-    // Calculate actual child stack pointer
-    // clone3 provides stack base and size; we need to compute the stack top
-    let child_stack = if args.stack != 0 {
-        // Stack grows down, so stack top = stack + stack_size
-        args.stack.wrapping_add(args.stack_size)
-    } else {
-        0 // Inherit parent stack (for fork-like behavior)
-    };
-
-    let config = CloneConfig {
-        flags: args.flags,
-        child_stack,
-        parent_rip,
-        parent_rflags,
-        parent_rsp,
-        parent_tidptr: args.parent_tid,
-        child_tidptr: args.child_tid,
-        tls: args.tls,
-        pidfd_ptr: args.pidfd,
-        exit_signal: args.exit_signal as i32,
-        cgroup_fd,
-    };
-
-    // Get frame allocator
-    let mut frame_alloc = FrameAllocRef(&FRAME_ALLOCATOR);
-
-    match super::percpu::do_clone(config, &mut frame_alloc) {
-        Ok(child_tid) => child_tid as i64,
-        Err(errno) => -(errno as i64),
-    }
+    })
 }

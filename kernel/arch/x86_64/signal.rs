@@ -240,11 +240,11 @@ pub fn setup_rt_frame(
     action: &SigAction,
     blocked: SigSet,
     info: &KSigInfo,
+    regs: &mut super::PtRegs,
 ) -> Result<(), i32> {
     use super::fpu;
 
-    // The interrupted user context: the task's pt_regs
-    let regs = crate::task::percpu::current_pt_regs();
+    // The interrupted user context (the task's pt_regs)
     let user_rip = regs.rip;
     let user_rflags = regs.rflags;
     let user_rsp = regs.rsp;

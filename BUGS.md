@@ -601,10 +601,8 @@ Found during T0 (2026-10-19). Tag = when to fix.
 7. **T0 resume point** (T0 next). Design: ~/.claude/plans/
    t0-foundation-design.md (commit numbers below are its §3).
    Remaining: alloc_lock (TaskRes is under TASKLIST); PGID/SID
-   pid_links (kill_pgrp/setpgid scan); 11/12 pt_regs single home
-   (x86/arm64); 13 exit_to_user_mode, slice tick, kick IPI, tests a-c
-   (mask all DAIF on every arm64 return to user, incl. clone child
-   entry); 15 sched entity/ttwu(&Task); 16 intrusive
+   pid_links (kill_pgrp/setpgid scan); 13 exit_to_user_mode, slice
+   tick, kick IPI, tests a-c; 15 sched entity/ttwu(&Task); 16 intrusive
    WaitQueue + FutexQ (wakeups by raw tid: waitqueue, futex, poll,
    mqueue, signalfd, sem/msg); 17 per-CPU timer wheel; 18 hrtimer-lite
    + deadline waits; 19 yield polls and SCHEDULING_ENABLED fallbacks;

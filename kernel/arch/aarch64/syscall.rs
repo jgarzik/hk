@@ -617,7 +617,7 @@ pub fn aarch64_syscall_dispatch(
         return result;
     }
 
-    let result = match num {
+    match num {
         // I/O syscalls
         SYS_READ => sys_read(arg0 as i32, arg1, arg2) as u64,
         SYS_WRITE => sys_write(arg0 as i32, arg1, arg2) as u64,
@@ -1306,10 +1306,5 @@ pub fn aarch64_syscall_dispatch(
             printkln!("SYSCALL: unimplemented syscall {} on aarch64", num);
             (-38i64) as u64 // -ENOSYS
         }
-    };
-
-    // Deliver pending signals / apply -ERESTART* rules before returning to
-    // user space (may redirect the return context to a handler or back up
-    // over the svc)
-    crate::signal::syscall_exit_signal_work(result, num != SYS_RT_SIGRETURN)
+    }
 }

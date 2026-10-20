@@ -225,17 +225,13 @@ const SS_DISABLE: i32 = 2;
 /// DIT, TCO. Mode (EL0t), DAIF and everything else are forced to 0.
 const PSTATE_USER_MASK: u64 = 0xF000_0000 | (1 << 12) | (3 << 10) | (1 << 24) | (1 << 25);
 
-fn user_frame() -> Option<&'static mut Aarch64TrapFrame> {
-    super::percpu::current_user_frame()
-}
-
 /// Set up signal frame on user stack
 ///
 /// This function:
 /// 1. Calculates frame location on user stack (Linux get_sigframe)
 /// 2. Builds siginfo and ucontext (with the FP/SIMD record) from saved registers
 /// 3. Writes frame to user memory
-/// 4. Updates percpu saved state to redirect to handler
+/// 4. Redirects the task's pt_regs (`regs`) to the handler
 ///
 /// On aarch64:
 /// - x0 = signal number
@@ -251,14 +247,13 @@ pub fn setup_rt_frame(
     action: &SigAction,
     blocked: SigSet,
     info: &KSigInfo,
+    regs: &mut Aarch64TrapFrame,
 ) -> Result<(), i32> {
-    use super::percpu;
-
-    // Get saved user state from percpu
-    let user_elr = percpu::get_syscall_user_elr();
-    let user_spsr = percpu::get_syscall_user_spsr();
-    let user_sp = percpu::get_syscall_user_sp();
-    let user_regs = percpu::get_syscall_user_regs();
+    // The interrupted user context (the task's pt_regs)
+    let user_elr = regs.elr;
+    let user_spsr = regs.spsr;
+    let user_sp = regs.sp;
+    let user_regs = regs.x;
 
     // Get handler address
     let handler = match action.handler {
@@ -298,17 +293,14 @@ pub fn setup_rt_frame(
 
     // __reserved: the FP/SIMD record of the interrupted code, an
     // esr_context for faults, then the terminating null record
-    let fpsimd = match user_frame() {
-        Some(tf) => FpsimdContext {
-            head: CtxHead {
-                magic: FPSIMD_MAGIC,
-                size: FPSIMD_SIZE as u32,
-            },
-            fpsr: tf.fpsr,
-            fpcr: tf.fpcr,
-            vregs: tf.v,
+    let fpsimd = FpsimdContext {
+        head: CtxHead {
+            magic: FPSIMD_MAGIC,
+            size: FPSIMD_SIZE as u32,
         },
-        None => return Err(-14),
+        fpsr: regs.fpsr,
+        fpcr: regs.fpcr,
+        vregs: regs.v,
     };
     let reserved_addr = frame_addr + RESERVED_OFFSET as u64;
     let mut end = reserved_addr + FPSIMD_SIZE as u64;
@@ -380,25 +372,17 @@ pub fn setup_rt_frame(
     let info_addr = frame_addr + core::mem::offset_of!(RtSigFrame, info) as u64;
     let uc_addr = frame_addr + core::mem::offset_of!(RtSigFrame, uc) as u64;
 
-    // Update percpu saved state to redirect execution to handler
-    unsafe {
-        let percpu_mut = percpu::current_cpu_mut();
-        percpu_mut.syscall_user_sp = frame_addr;
-        percpu_mut.syscall_user_elr = handler;
-        percpu_mut.syscall_user_regs[0] = sig as u64; // x0 = signal number
-        percpu_mut.syscall_user_regs[1] = info_addr; // x1 = &siginfo
-        percpu_mut.syscall_user_regs[2] = uc_addr; // x2 = &ucontext
-        percpu_mut.syscall_user_regs[29] = record_addr; // x29 = frame record
-        percpu_mut.syscall_user_regs[30] = restorer; // x30 (LR) = restorer
-        // Clear other argument registers for security
-        percpu_mut.syscall_user_regs[3] = 0;
-        percpu_mut.syscall_user_regs[4] = 0;
-        percpu_mut.syscall_user_regs[5] = 0;
-        percpu_mut.syscall_user_regs[6] = 0;
-        percpu_mut.syscall_user_regs[7] = 0;
-        // Signal that the return context was modified
-        percpu_mut.signal_context_modified = true;
-    }
+    // Redirect the return to user mode to the handler (Linux
+    // setup_return)
+    regs.sp = frame_addr;
+    regs.elr = handler;
+    regs.x[0] = sig as u64; // x0 = signal number
+    regs.x[1] = info_addr; // x1 = &siginfo
+    regs.x[2] = uc_addr; // x2 = &ucontext
+    regs.x[29] = record_addr; // x29 = frame record
+    regs.x[30] = restorer; // x30 (LR) = restorer
+    // Clear other argument registers for security
+    regs.x[3..8].fill(0);
 
     Ok(())
 }
@@ -448,16 +432,16 @@ fn parse_reserved(addr: u64) -> Option<FpsimdContext> {
 /// This function:
 /// 1. Reads the UContext from user stack
 /// 2. Restores blocked signal mask
-/// 3. Restores all saved registers to percpu, the FP/SIMD record to the
-///    task's trap frame
+/// 3. Restores all saved registers and the FP/SIMD record to the task's
+///    pt_regs
 ///
 /// Returns the value that should be in x0 (return value),
 /// or error code if restore fails.
 pub fn sys_rt_sigreturn() -> i64 {
-    use super::percpu;
+    let tf = crate::task::percpu::current_pt_regs();
 
     // The current SP points to the signal frame
-    let frame_addr = percpu::get_syscall_user_sp();
+    let frame_addr = tf.sp;
     if !frame_addr.is_multiple_of(SIGNAL_FRAME_ALIGN) {
         return crate::signal::sigreturn_badframe();
     }
@@ -482,9 +466,6 @@ pub fn sys_rt_sigreturn() -> i64 {
     let Some(fpsimd) = parse_reserved(frame_addr + RESERVED_OFFSET as u64) else {
         return crate::signal::sigreturn_badframe();
     };
-    let Some(tf) = user_frame() else {
-        return crate::signal::sigreturn_badframe();
-    };
 
     // Restore blocked signal mask
     let tid = crate::task::percpu::current_tid();
@@ -493,22 +474,18 @@ pub fn sys_rt_sigreturn() -> i64 {
         state.recalc_sigpending();
     });
 
-    // FP/SIMD state goes back into the trap frame the syscall returns through
+    // Everything goes back into the pt_regs the syscall returns through
+    // (Linux restore_sigframe)
     tf.fpsr = fpsimd.fpsr;
     tf.fpcr = fpsimd.fpcr;
     tf.v = fpsimd.vregs;
-
-    // Restore all registers from sigcontext to percpu
-    unsafe {
-        let percpu_mut = percpu::current_cpu_mut();
-        percpu_mut.syscall_user_elr = sc.pc;
-        // Return to EL0t only, with interrupts unmasked
-        percpu_mut.syscall_user_spsr = sc.pstate & PSTATE_USER_MASK;
-        percpu_mut.syscall_user_sp = sc.sp;
-        percpu_mut.syscall_user_regs = sc.regs;
-        // Signal that the return context was modified
-        percpu_mut.signal_context_modified = true;
-    }
+    tf.elr = sc.pc;
+    // Return to EL0t only, with interrupts unmasked
+    tf.spsr = sc.pstate & PSTATE_USER_MASK;
+    tf.sp = sc.sp;
+    tf.x = sc.regs;
+    // No syscall to restart from here on (Linux forget_syscall)
+    tf.syscallno = super::NO_SYSCALL;
 
     // Return x0 from saved context
     sc.regs[0] as i64

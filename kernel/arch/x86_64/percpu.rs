@@ -417,25 +417,6 @@ pub fn preempt_count() -> u32 {
         .unwrap_or(0)
 }
 
-/// Nothing to keep across a switch: the user registers are in pt_regs
-#[derive(Clone, Copy)]
-pub struct NoUserState;
-
-/// The current syscall's user RIP (its pt_regs)
-pub fn get_syscall_user_rip() -> u64 {
-    crate::task::percpu::current_pt_regs().rip
-}
-
-/// The current syscall's user RFLAGS (its pt_regs)
-pub fn get_syscall_user_rflags() -> u64 {
-    crate::task::percpu::current_pt_regs().rflags
-}
-
-/// The current syscall's user RSP (its pt_regs)
-pub fn get_syscall_user_rsp() -> u64 {
-    crate::task::percpu::current_pt_regs().rsp
-}
-
 // ============================================================================
 // PerCpuOps trait implementation
 // ============================================================================
@@ -497,47 +478,7 @@ impl PerCpuOps for X86_64Arch {
             .unwrap_or(0)
     }
 
-    // The user registers of the current syscall are its pt_regs at the
-    // top of the kernel stack (entry.rs): nothing per CPU to keep
-
-    #[inline]
-    fn get_syscall_user_rip() -> u64 {
-        get_syscall_user_rip()
-    }
-
-    #[inline]
-    fn get_syscall_user_rflags() -> u64 {
-        get_syscall_user_rflags()
-    }
-
-    #[inline]
-    fn get_syscall_user_rsp() -> u64 {
-        get_syscall_user_rsp()
-    }
-
     fn cpu_online(cpu: u32) -> bool {
         (cpu as usize) < MAX_CPUS && get_percpu(cpu).is_online.load(Ordering::Acquire)
-    }
-
-    type SyscallUserState = NoUserState;
-
-    fn save_syscall_user_state() -> NoUserState {
-        NoUserState
-    }
-
-    fn restore_syscall_user_state(_state: &NoUserState) {}
-
-    fn set_syscall_return(val: u64) {
-        crate::task::percpu::current_pt_regs().rax = val;
-    }
-
-    /// Re-execute the current syscall on return to user (-ERESTART* with
-    /// no handler, or SA_RESTART): RIP back over the 2-byte `syscall`,
-    /// the number back in RAX (Linux regs->ax = regs->orig_ax; ip -= 2)
-    fn syscall_restart() -> u64 {
-        let regs = crate::task::percpu::current_pt_regs();
-        regs.rip = regs.rip.wrapping_sub(2);
-        regs.rax = regs.orig_rax;
-        regs.rax
     }
 }

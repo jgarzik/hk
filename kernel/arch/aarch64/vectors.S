@@ -130,7 +130,8 @@ el0_32_serror:
 
 /*
  * Size of an Aarch64TrapFrame: x0-x30, sp, elr, spsr (0x110 bytes), then
- * the FP/SIMD state: fpsr, fpcr (0x110), q0-q31 (0x120..0x320).
+ * the FP/SIMD state: fpsr, fpcr (0x110), q0-q31 (0x120..0x320), then
+ * orig_x0 and syscallno (0x320, 0x328: written by the Rust handlers).
  *
  * The kernel is compiled with NEON (aarch64-unknown-none), so every
  * exception saves the full FP/SIMD state: on entry from EL0 this is the
@@ -138,7 +139,7 @@ el0_32_serror:
  * like pt_regs: signal frames, fork and execve read/write it here), on
  * entry from EL1 it is the interrupted kernel code's.
  */
-.set TRAP_FRAME_SIZE, 0x320
+.set TRAP_FRAME_SIZE, 0x330
 .set TF_FPSR, 0x110
 .set TF_FPCR, 0x114
 .set TF_V, 0x120
@@ -363,23 +364,7 @@ el0_sync_handler:
     // Call Rust handler: handle_el0_sync(frame: *mut TrapFrame, esr: u64)
     // (syscalls and faults run with IRQs unmasked)
     bl      handle_el0_sync
-    // Masked again before ELR/SPSR_EL1 are restored
-    msr     daifset, #2
-
-    // Memory barrier before returning to user mode to ensure all
-    // kernel memory updates are visible.
-    // This is critical for ARM memory ordering correctness.
-    dsb     ish
-
-    // TLB invalidate for address 0 to act as a stronger barrier.
-    // Linux does this for ARM64_WORKAROUND_SPECULATIVE_UNPRIV_LOAD.
-    // This ensures any speculative loads from user space see correct data.
-    tlbi    vale1, xzr
-    dsb     nsh
-    isb
-
-    RESTORE_CONTEXT 1   // use_sp_el0=1: restore user stack pointer
-    eret
+    b       ret_to_user
 
 /*
  * EL0 IRQ handler (user mode)
@@ -392,6 +377,31 @@ el0_irq_handler:
 
     // Call Rust handler: handle_el0_irq(frame: *mut TrapFrame)
     bl      handle_el0_irq
+    b       ret_to_user
+
+/*
+ * Return to EL0 through the trap frame at sp, the task's pt_regs at the
+ * top of its kernel stack (Linux ret_to_user): every exception from EL0,
+ * a fork child's first return and a new program image (jump_to_user)
+ * leave here. All of DAIF is masked before ELR/SPSR_EL1 are restored
+ * (an exception taken in between would overwrite them); ERET restores
+ * DAIF from SPSR.
+ */
+.global ret_to_user
+ret_to_user:
+    msr     daifset, #0xf
+
+    // Memory barrier before returning to user mode to ensure all
+    // kernel memory updates are visible.
+    // This is critical for ARM memory ordering correctness.
+    dsb     ish
+
+    // TLB invalidate for address 0 to act as a stronger barrier.
+    // Linux does this for ARM64_WORKAROUND_SPECULATIVE_UNPRIV_LOAD.
+    // This ensures any speculative loads from user space see correct data.
+    tlbi    vale1, xzr
+    dsb     nsh
+    isb
 
     RESTORE_CONTEXT 1   // use_sp_el0=1: restore user stack pointer
     eret

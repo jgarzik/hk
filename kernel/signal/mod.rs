@@ -24,7 +24,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::arch::IrqSpinlock;
+use crate::arch::{IrqSpinlock, PtRegs, UserRegs};
 use crate::task::{Pid, Tid};
 
 // =============================================================================
@@ -1576,12 +1576,13 @@ fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool)
 // Signal Delivery Entry Point
 // =============================================================================
 
-/// Signal work on syscall exit (Linux arch_do_signal_or_restart)
+/// Signal work on the way back to user mode (Linux
+/// arch_do_signal_or_restart), on the task's user registers `regs`
 ///
-/// `result` is the syscall's return value; `restartable` is false for
-/// rt_sigreturn (its "result" is restored user state). Delivers pending
-/// signals (handler frame, default action or ignore) and applies the
-/// restart rules for the kernel-internal codes:
+/// Delivers pending signals (handler frame, default action or ignore).
+/// If `regs` is a syscall's (`in_syscall`; not rt_sigreturn's, which
+/// restored a whole user context), its return value gets the restart
+/// rules for the kernel-internal codes, once (`forget_syscall`):
 ///
 /// | result         | handler runs                     | no handler |
 /// |----------------|----------------------------------|------------|
@@ -1591,13 +1592,12 @@ fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool)
 ///
 /// "Restart" backs the user PC up over the syscall instruction and restores
 /// the syscall's first register, so the syscall runs again (after the
-/// handler, if any). Returns the value for the user return register.
+/// handler, if any).
 ///
 /// If a syscall left a temporary mask in place (`saved_sigmask`, e.g.
 /// rt_sigsuspend), signals are dequeued under it and the saved mask goes
 /// into the signal frame; with no frame it is restored here.
-pub fn syscall_exit_signal_work(result: u64, restartable: bool) -> u64 {
-    use crate::arch::{CurrentArch, PerCpuOps};
+pub fn do_signal(regs: &mut PtRegs) {
     use crate::error::KernelError;
 
     const ERESTARTSYS: i64 = KernelError::RestartSys.sysret();
@@ -1606,11 +1606,9 @@ pub fn syscall_exit_signal_work(result: u64, restartable: bool) -> u64 {
     const EINTR: u64 = KernelError::Interrupted.sysret() as u64;
 
     let tid = crate::task::percpu::current_tid();
-    let err = result as i64;
-    let restart = restartable && matches!(err, ERESTARTSYS | ERESTARTNOINTR | ERESTARTNOHAND);
-
-    // The signal frame saves the user return register
-    CurrentArch::set_syscall_return(result);
+    let err = regs.ret() as i64;
+    let restart = regs.in_syscall() && matches!(err, ERESTARTSYS | ERESTARTNOINTR | ERESTARTNOHAND);
+    regs.forget_syscall();
 
     while has_pending_signals(tid) {
         // A dying group comes before any handler (Linux get_signal)
@@ -1632,19 +1630,17 @@ pub fn syscall_exit_signal_work(result: u64, restartable: bool) -> u64 {
                 _ => continue,
             },
             SigHandler::Handler(_) => {
-                let mut ret = result;
                 if restart {
                     let restart_now = err == ERESTARTNOINTR
                         || (err == ERESTARTSYS && action.flags & sa_flags::SA_RESTART != 0);
-                    ret = if restart_now {
-                        CurrentArch::syscall_restart()
+                    if restart_now {
+                        regs.restart_syscall();
                     } else {
-                        CurrentArch::set_syscall_return(EINTR);
-                        EINTR
-                    };
+                        regs.set_ret(EINTR);
+                    }
                 }
-                if deliver_to_handler(tid, sig, &action, &KSigInfo::default()) {
-                    return ret;
+                if deliver_to_handler(tid, sig, &action, &KSigInfo::default(), regs) {
+                    return;
                 }
                 // Frame setup failed: SIGSEGV was forced; deliver it
                 continue;
@@ -1655,9 +1651,8 @@ pub fn syscall_exit_signal_work(result: u64, restartable: bool) -> u64 {
     // No handler ran
     restore_saved_sigmask(tid);
     if restart {
-        return CurrentArch::syscall_restart();
+        regs.restart_syscall();
     }
-    result
 }
 
 /// Restore and clear `saved_sigmask` if a syscall left one in place
@@ -1670,8 +1665,15 @@ fn restore_saved_sigmask(tid: Tid) {
     });
 }
 
-/// Set up the handler frame for `sig`; false if that failed (SIGSEGV forced)
-fn deliver_to_handler(tid: Tid, sig: u32, action: &SigAction, info: &KSigInfo) -> bool {
+/// Set up the handler frame for `sig` on `regs`; false if that failed
+/// (SIGSEGV forced)
+fn deliver_to_handler(
+    tid: Tid,
+    sig: u32,
+    action: &SigAction,
+    info: &KSigInfo,
+    regs: &mut PtRegs,
+) -> bool {
     use crate::arch::signal;
 
     // Mask to save in the frame (restored by rt_sigreturn): the
@@ -1680,7 +1682,7 @@ fn deliver_to_handler(tid: Tid, sig: u32, action: &SigAction, info: &KSigInfo) -
         with_task_signal_state(tid, |state| state.saved_sigmask.unwrap_or(state.blocked))
             .unwrap_or(SigSet::EMPTY);
 
-    match signal::setup_rt_frame(sig, action, frame_mask, info) {
+    match signal::setup_rt_frame(sig, action, frame_mask, info, regs) {
         Ok(()) => {
             // Block action.mask and the signal itself (unless SA_NODEFER)
             with_task_signal_state(tid, |state| {
@@ -1721,17 +1723,17 @@ pub fn force_sigsegv(tid: Tid) {
 ///
 /// Linux force_sig_fault semantics, delivered at once (the faulting
 /// instruction must not run again first):
-/// - a handler that is not blocked: its frame is set up now, from the
-///   per-CPU user-register block, which the arch fault path loaded from the
-///   trap frame and copies back to it afterwards (handler entry). If the
-///   frame cannot be written the task dies by SIGSEGV (force_sigsegv).
+/// - a handler that is not blocked: its frame is set up now, on `regs`
+///   (the fault's user registers, the task's pt_regs), which the return
+///   to user mode then enters. If the frame cannot be written the task
+///   dies by SIGSEGV (force_sigsegv).
 /// - blocked or ignored: the action is reset to SIG_DFL and the signal
 ///   unblocked (force_sig_info_to_task); the default action of every
 ///   synchronous fault signal (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP) kills
 ///   the task, as does SIG_DFL.
 ///
 /// Process context (the faulting task), interrupts enabled.
-pub fn force_sig_fault(sig: u32, info: KSigInfo) {
+pub fn force_sig_fault(sig: u32, info: KSigInfo, regs: &mut PtRegs) {
     let do_exit = do_group_exit;
 
     let tid = crate::task::percpu::current_tid();
@@ -1745,7 +1747,7 @@ pub fn force_sig_fault(sig: u32, info: KSigInfo) {
     if let SigHandler::Handler(_) = action.handler
         && !blocked
     {
-        if deliver_to_handler(tid, sig, &action, &info) {
+        if deliver_to_handler(tid, sig, &action, &info, regs) {
             return;
         }
         // No room for the frame: SIGSEGV was reset to SIG_DFL and queued

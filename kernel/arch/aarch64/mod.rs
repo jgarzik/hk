@@ -42,12 +42,15 @@ use crate::arch::{
 };
 
 /// AArch64 trap frame for saving/restoring CPU state on exception entry
+/// (Linux struct pt_regs, with the FP/SIMD state Linux keeps in
+/// thread.uw.fpsimd_state)
 ///
 /// This captures all general-purpose registers, exception state and the
 /// FP/SIMD registers (the kernel uses NEON, so every exception saves them).
 /// Layout matches the order we push/pop in exception vectors (vectors.S
 /// TRAP_FRAME_SIZE / TF_*). For an exception from EL0 this is the task's
-/// user state, at the top of its kernel stack.
+/// user state, at the top of its kernel stack (`current_pt_regs`): its
+/// only copy while the task is in the kernel.
 #[repr(C)]
 #[derive(Clone, Default)]
 pub struct Aarch64TrapFrame {
@@ -65,10 +68,57 @@ pub struct Aarch64TrapFrame {
     pub fpcr: u32,
     /// SIMD/FP registers V0-V31
     pub v: [u128; 32],
+    /// x0 of a syscall at entry (x0 then holds the return value; Linux
+    /// orig_x0, for the restart)
+    pub orig_x0: u64,
+    /// The syscall number of a syscall frame, else `NO_SYSCALL` (Linux
+    /// syscallno)
+    pub syscallno: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<Aarch64TrapFrame>() == 0x320);
+/// `syscallno` of a frame that is not a syscall's (Linux NO_SYSCALL)
+pub const NO_SYSCALL: u64 = u64::MAX;
+
+const _: () = assert!(core::mem::size_of::<Aarch64TrapFrame>() == 0x330);
 const _: () = assert!(core::mem::offset_of!(Aarch64TrapFrame, v) == 0x120);
+const _: () = assert!(core::mem::offset_of!(Aarch64TrapFrame, syscallno) == 0x328);
+
+impl crate::arch::UserRegs for Aarch64TrapFrame {
+    fn ip(&self) -> u64 {
+        self.elr
+    }
+
+    fn sp(&self) -> u64 {
+        self.sp
+    }
+
+    fn set_sp(&mut self, sp: u64) {
+        self.sp = sp;
+    }
+
+    fn ret(&self) -> u64 {
+        self.x[0]
+    }
+
+    fn set_ret(&mut self, v: u64) {
+        self.x[0] = v;
+    }
+
+    fn in_syscall(&self) -> bool {
+        self.syscallno != NO_SYSCALL
+    }
+
+    fn forget_syscall(&mut self) {
+        self.syscallno = NO_SYSCALL;
+    }
+
+    /// ELR back over the `svc`, x0 back to its value at entry (x8 still
+    /// holds the number; Linux regs[0] = orig_x0, pc -= 4)
+    fn restart_syscall(&mut self) {
+        self.elr = self.elr.wrapping_sub(4);
+        self.x[0] = self.orig_x0;
+    }
+}
 
 // Re-export TaskContext from context module
 pub use context::Aarch64TaskContext;
@@ -89,6 +139,7 @@ impl Arch for Aarch64Arch {
             elr: entry,
             sp: user_stack_top,
             spsr: 0,
+            syscallno: NO_SYSCALL,
             ..Default::default()
         }
     }
@@ -376,132 +427,25 @@ impl ArchBusOps for Aarch64Arch {
 
 impl UserModeOps for Aarch64Arch {
     unsafe fn jump_to_user(entry: u64, user_stack: u64, kernel_stack: u64) -> ! {
-        // Enter user mode via ERET (the task's TTBR0 is loaded:
-        // mm::tlb::switch_mm)
-        //
-        // This sets up the CPU state to return to EL0 (user mode):
-        // - SP_EL0: User stack pointer
-        // - ELR_EL1: Entry point (return address for ERET)
-        // - SPSR_EL1: Saved processor state - EL0t with interrupts enabled
-        //
-        // SPSR_EL1 format for EL0t:
-        // - bits [3:0] = 0b0000 (EL0t - user mode, use SP_EL0)
-        // - bits [9:6] = 0 (DAIF clear - all interrupts enabled)
-        // - All other bits = 0
-
-        // Save kernel stack to per-CPU data for exception handlers
-        // This is critical for execve: the new process needs to use
-        // the correct kernel stack when it traps back into the kernel.
-        unsafe {
-            let percpu = percpu::current_cpu_mut();
-            percpu.kernel_stack_top = kernel_stack;
-        }
-
+        // Enter user mode at `entry` (the task's TTBR0 is loaded:
+        // mm::tlb::switch_mm): every register, FP/SIMD included, zero,
+        // FPCR/FPSR default, EL0t with interrupts enabled (Linux
+        // start_thread), in the pt_regs at the top of its kernel stack,
+        // left through vectors.S ret_to_user. The image's code was synced
+        // to the instruction caches when exec loaded it
+        // (paging::sync_page).
+        let regs = (kernel_stack - core::mem::size_of::<Aarch64TrapFrame>() as u64)
+            as *mut Aarch64TrapFrame;
+        // SAFETY: the top of this task's kernel stack, below the caller's
+        // frames only if the caller runs on another stack (init)
+        unsafe { regs.write(Self::user_entry_frame(entry, user_stack)) };
         unsafe {
             asm!(
-                // The image's code was synced to the instruction caches
-                // when exec loaded it (paging::sync_page)
-
-                // Mask every exception first: exec runs with interrupts
-                // on, and an IRQ taken between the ELR_EL1/SPSR_EL1
-                // writes and ERET overwrote them with its own return
-                // (EL1, here): ERET then entered EL0 at a kernel
-                // address. ERET restores DAIF from SPSR (all clear).
+                // Exec runs with interrupts on: masked for the return
                 "msr daifset, #0xf",
-
-                // Set up user stack pointer (SP_EL0)
-                "msr sp_el0, {user_stack}",
-
-                // Set up kernel stack pointer (SP_EL1 = current SP)
-                // This is critical: when exceptions from EL0 occur, the CPU
-                // switches to SP_EL1. We must set it to the task's kernel stack.
-                "mov sp, {kernel_stack}",
-
-                // Set up return address for ERET
-                "msr elr_el1, {entry}",
-
-                // Set up SPSR_EL1 for return to EL0t (user mode)
-                // 0x0 = EL0t with all interrupts enabled
-                // Use xzr (zero register) instead of an output register
-                "msr spsr_el1, xzr",
-
-                // Clear all general-purpose registers for security
-                // (don't leak kernel data to user mode)
-                "mov x0, #0",
-                "mov x1, #0",
-                "mov x2, #0",
-                "mov x3, #0",
-                "mov x4, #0",
-                "mov x5, #0",
-                "mov x6, #0",
-                "mov x7, #0",
-                "mov x8, #0",
-                "mov x9, #0",
-                "mov x10, #0",
-                "mov x11, #0",
-                "mov x12, #0",
-                "mov x13, #0",
-                "mov x14, #0",
-                "mov x15, #0",
-                "mov x16, #0",
-                "mov x17, #0",
-                "mov x18, #0",
-                "mov x19, #0",
-                "mov x20, #0",
-                "mov x21, #0",
-                "mov x22, #0",
-                "mov x23, #0",
-                "mov x24, #0",
-                "mov x25, #0",
-                "mov x26, #0",
-                "mov x27, #0",
-                "mov x28, #0",
-                "mov x29, #0", // FP
-                "mov x30, #0", // LR
-
-                // A new program image starts with zeroed FP/SIMD registers
-                // and the default FPCR/FPSR (no kernel data leaks either)
-                "msr fpcr, xzr",
-                "msr fpsr, xzr",
-                "movi v0.2d, #0",
-                "movi v1.2d, #0",
-                "movi v2.2d, #0",
-                "movi v3.2d, #0",
-                "movi v4.2d, #0",
-                "movi v5.2d, #0",
-                "movi v6.2d, #0",
-                "movi v7.2d, #0",
-                "movi v8.2d, #0",
-                "movi v9.2d, #0",
-                "movi v10.2d, #0",
-                "movi v11.2d, #0",
-                "movi v12.2d, #0",
-                "movi v13.2d, #0",
-                "movi v14.2d, #0",
-                "movi v15.2d, #0",
-                "movi v16.2d, #0",
-                "movi v17.2d, #0",
-                "movi v18.2d, #0",
-                "movi v19.2d, #0",
-                "movi v20.2d, #0",
-                "movi v21.2d, #0",
-                "movi v22.2d, #0",
-                "movi v23.2d, #0",
-                "movi v24.2d, #0",
-                "movi v25.2d, #0",
-                "movi v26.2d, #0",
-                "movi v27.2d, #0",
-                "movi v28.2d, #0",
-                "movi v29.2d, #0",
-                "movi v30.2d, #0",
-                "movi v31.2d, #0",
-
-                // Return to user mode
-                "eret",
-
-                user_stack = in(reg) user_stack,
-                kernel_stack = in(reg) kernel_stack,
-                entry = in(reg) entry,
+                "mov sp, {regs}",
+                "b ret_to_user",
+                regs = in(reg) regs,
                 options(noreturn)
             );
         }
@@ -574,50 +518,11 @@ impl PerCpuOps for Aarch64Arch {
             .unwrap_or(0)
     }
 
-    #[inline]
-    fn get_syscall_user_rip() -> u64 {
-        percpu::try_current_cpu()
-            .map(|p| p.syscall_user_elr)
-            .unwrap_or(0)
-    }
-
-    #[inline]
-    fn get_syscall_user_rflags() -> u64 {
-        percpu::try_current_cpu()
-            .map(|p| p.syscall_user_spsr)
-            .unwrap_or(0)
-    }
-
-    #[inline]
-    fn get_syscall_user_rsp() -> u64 {
-        percpu::try_current_cpu()
-            .map(|p| p.syscall_user_sp)
-            .unwrap_or(0)
-    }
-
     fn cpu_online(cpu: u32) -> bool {
         (cpu as usize) < percpu::MAX_CPUS
             && percpu::get_percpu(cpu)
                 .is_online
                 .load(core::sync::atomic::Ordering::Acquire)
-    }
-
-    type SyscallUserState = percpu::SyscallUserState;
-
-    fn save_syscall_user_state() -> percpu::SyscallUserState {
-        percpu::save_syscall_user_state()
-    }
-
-    fn restore_syscall_user_state(state: &percpu::SyscallUserState) {
-        percpu::restore_syscall_user_state(state)
-    }
-
-    fn set_syscall_return(val: u64) {
-        unsafe { percpu::current_cpu_mut().syscall_user_regs[0] = val };
-    }
-
-    fn syscall_restart() -> u64 {
-        percpu::syscall_restart()
     }
 }
 
@@ -670,20 +575,6 @@ impl ContextOps for Aarch64Arch {
 pub use paging::Aarch64PageTable;
 
 // ============================================================================
-// Aarch64Arch inherent methods
-// ============================================================================
-
-impl Aarch64Arch {
-    /// Get the saved user GPRs from syscall entry (for fork/clone)
-    #[inline]
-    fn get_syscall_user_regs() -> [u64; 31] {
-        percpu::try_current_cpu()
-            .map(|p| p.syscall_user_regs)
-            .unwrap_or([0; 31])
-    }
-}
-
-// ============================================================================
 // SchedArch trait implementation
 // ============================================================================
 
@@ -693,32 +584,6 @@ impl SchedArch for Aarch64Arch {
     // The child's TrapFrame carries the inherited FP/SIMD registers
     fn clone_child_fpu(regs: u64) -> u64 {
         regs
-    }
-
-    fn clone_child_trapframe(
-        parent_rip: u64,
-        parent_rflags: u64,
-        child_rsp: u64,
-    ) -> Self::TrapFrame {
-        // Get parent's saved GPRs from syscall entry
-        let mut regs = Self::get_syscall_user_regs();
-        // Child returns 0 from fork/clone (x0 is the return value)
-        regs[0] = 0;
-
-        let mut tf = Aarch64TrapFrame {
-            x: regs,             // All parent GPRs (with x0 = 0 for child)
-            elr: parent_rip,     // Return address
-            spsr: parent_rflags, // Saved PSTATE
-            sp: child_rsp,       // Child's stack pointer
-            ..Default::default()
-        };
-        // The child inherits the parent's FP/SIMD registers
-        if let Some(parent) = percpu::current_user_frame() {
-            tf.fpsr = parent.fpsr;
-            tf.fpcr = parent.fpcr;
-            tf.v = parent.v;
-        }
-        tf
     }
 }
 

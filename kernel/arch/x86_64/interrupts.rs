@@ -330,8 +330,7 @@ fn math_error_code(vector: u64) -> i32 {
 /// context in `frame`: the task's pt_regs (an entry from user mode), so
 /// a handler's frame is set up there and IRETQ enters it
 fn user_fault(frame: &mut PtRegs, sig: u32, info: KSigInfo) {
-    debug_assert!(core::ptr::eq(frame, crate::task::percpu::current_pt_regs()));
-    crate::signal::force_sig_fault(sig, info);
+    crate::signal::force_sig_fault(sig, info, frame);
 }
 
 /// Rust exception handler (interrupts off: interrupt gates); it returns
