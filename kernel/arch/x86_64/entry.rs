@@ -227,6 +227,10 @@ unsafe extern "C" fn idt_common() {
         "jz 1f",
         "swapgs",
         "1:",
+        // Interrupt gates leave DF and AC as the interrupted code had
+        // them (user `std`/`stac`): forward string instructions, SMAP in
+        // force (Linux error_entry: cld, ASM_CLAC)
+        "cld",
         "push rsi",
         "push rdx",
         "push rcx",
@@ -241,12 +245,17 @@ unsafe extern "C" fn idt_common() {
         "push r13",
         "push r14",
         "push r15",
+        "cmp byte ptr [rip + {smap}], 0",
+        "je 2f",
+        "clac",
+        "2:",
         "mov esi, edi",
         "mov rdi, rsp",
         "sub rsp, 8",
         "call {dispatch}",
         "add rsp, 8",
         "jmp {ret}",
+        smap = sym super::uaccess::SMAP_ON,
         dispatch = sym super::interrupts::idt_dispatch,
         ret = sym irq_return,
     );
@@ -260,6 +269,7 @@ unsafe extern "C" fn idt_common() {
 #[unsafe(naked)]
 unsafe extern "C" fn paranoid_common() {
     core::arch::naked_asm!(
+        "cld",
         "push rsi",
         "push rdx",
         "push rcx",
@@ -282,6 +292,10 @@ unsafe extern "C" fn paranoid_common() {
         "swapgs",
         "mov ebx, 1",
         "1:",
+        "cmp byte ptr [rip + {smap}], 0",
+        "je 3f",
+        "clac",
+        "3:",
         "mov esi, edi",
         "mov rdi, rsp",
         "sub rsp, 8",
@@ -309,6 +323,7 @@ unsafe extern "C" fn paranoid_common() {
         "add rsp, 8",
         "iretq",
         gs_base = const super::percpu::MSR_GS_BASE,
+        smap = sym super::uaccess::SMAP_ON,
         dispatch = sym super::interrupts::idt_dispatch,
     );
 }

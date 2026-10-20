@@ -696,9 +696,11 @@ const MSR_SFMASK: u32 = 0xC000_0084; // RFLAGS mask for syscall
 /// EFER.SCE - Syscall Enable bit
 const EFER_SCE: u64 = 1 << 0;
 
-/// RFLAGS bits to clear on syscall entry: TF, DF, IF, AC (interrupts
-/// stay off only until the entry has saved the user state)
-const SYSCALL_FLAG_MASK: u64 = 0x4700;
+/// RFLAGS bits to clear on syscall entry (Linux syscall_init): the
+/// arithmetic flags, TF, IF (on again once the entry has saved the user
+/// state), DF (string instructions run forward), IOPL, NT, RF, AC (SMAP
+/// stays in force) and ID
+const SYSCALL_FLAG_MASK: u64 = 0x25_7fd5;
 
 /// Initialize syscall/sysret mechanism
 pub fn init() {

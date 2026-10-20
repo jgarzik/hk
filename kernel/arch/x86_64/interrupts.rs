@@ -394,9 +394,16 @@ fn handle_exception(frame: &mut PtRegs, vector: u64) {
         // Kernel mode fault - fall through to fatal handler
     }
 
+    // An NMI in user mode is not the task's doing: nothing to deliver
+    // (hk has no NMI sources it handles; Linux exc_nmi)
+    if vector == 2 {
+        return;
+    }
+
     // Any other exception raised by user code (#DE, #UD, #GP, ...) is the
-    // task's fault, not the kernel's: signal it instead of halting
-    if frame.cs & 3 == 3 && vector != 14 {
+    // task's fault, not the kernel's: signal it instead of halting. #DF
+    // and #MC are never a task's: they halt below (paranoid, IST stack)
+    if frame.cs & 3 == 3 && !matches!(vector, 8 | 14 | 18) {
         use crate::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
         // Linux arch/x86/kernel/traps.c: signal, si_code, si_addr
         let rip = frame.rip;

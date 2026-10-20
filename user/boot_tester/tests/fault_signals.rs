@@ -15,6 +15,9 @@
 //! - FAULT_BLOCKED_KILL: fault with SIGSEGV blocked (handler installed) kills
 //!   the task with SIGSEGV
 //! - FAULT_IGNORED_KILL: fault with SIGSEGV ignored kills the task
+//! - DF_ENTRY (x86): a breakpoint trap taken with DF set (`std`) delivers
+//!   an intact signal frame (the kernel's string copies must run forward:
+//!   entries clear DF) and sigreturn gives DF back
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -478,4 +481,52 @@ pub fn run_tests() {
     in_child(b"FAULT_SIGTRAP", sigtrap);
     expect_killed(b"FAULT_BLOCKED_KILL", prep_blocked);
     expect_killed(b"FAULT_IGNORED_KILL", prep_ignored);
+    #[cfg(target_arch = "x86_64")]
+    df_entry();
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn trap_handler(_sig: i32) {}
+
+/// DF_ENTRY: `std; int3` in a child with a SIGTRAP handler; the child
+/// gets past the trap with its registers and DF intact
+#[cfg(target_arch = "x86_64")]
+fn df_entry() {
+    let pid = sys_fork();
+    if pid == 0 {
+        let action: [u64; 4] = [
+            trap_handler as *const () as u64,
+            SA_RESTORER,
+            super::signals::restorer_addr(),
+            0,
+        ];
+        if sys_rt_sigaction(SIGTRAP, action.as_ptr() as u64, 0, 8) != 0 {
+            sys_exit(100);
+        }
+        let (flags, kept): (u64, u64);
+        // SAFETY: DF set only around the trap
+        unsafe {
+            core::arch::asm!(
+                "mov {k}, 0x1234",
+                "std",
+                "int3",
+                "pushfq",
+                "pop {f}",
+                "cld",
+                f = out(reg) flags,
+                k = out(reg) kept,
+            );
+        }
+        let ok = flags & 0x400 != 0 && kept == 0x1234;
+        sys_exit(if ok { 0 } else { 1 });
+    }
+    let mut status: i32 = 0;
+    let r = sys_wait4(pid, &mut status, 0, 0);
+    if r == pid && status == 0 {
+        println(b"DF_ENTRY:OK");
+    } else {
+        print(b"DF_ENTRY:FAIL status ");
+        print_num(status as i64);
+        println(b"");
+    }
 }
