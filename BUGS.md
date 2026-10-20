@@ -567,9 +567,6 @@ From the fix-batch-1 /code-review (unverified). Tag = when to fix.
    fatal-on-arrival path; kill(1, SIGTERM) by root ends the system.
 3. **memblock MAX_REGIONS = 128 drops RAM silently** (next batch).
    `kernel/mm/memblock.rs:66`.
-4. **kmap direct_pages re-parses the multiboot map per 2MB chunk**
-   (next batch). `kernel/arch/x86_64/kmap.rs:149` (`RamMap::hits`):
-   O(regions × pages) at boot.
 5. **group_alive duplicates group_others** (next batch).
    `kernel/task/percpu.rs:1570` vs `:1459`.
 
