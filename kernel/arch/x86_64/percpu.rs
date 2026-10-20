@@ -55,9 +55,6 @@ pub struct PerCpu {
     /// `task::percpu::INIT_TASK`), set by the scheduler at each switch
     pub curr: AtomicUsize,
 
-    /// Flag set by timer interrupt to request reschedule
-    pub needs_reschedule: AtomicBool,
-
     /// Nesting depth of interrupt handlers (to avoid rescheduling in nested interrupts)
     pub interrupt_depth: AtomicU32,
 
@@ -85,7 +82,6 @@ impl PerCpu {
             is_online: AtomicBool::new(false),
             ticks: AtomicU64::new(0),
             curr: AtomicUsize::new(0),
-            needs_reschedule: AtomicBool::new(false),
             interrupt_depth: AtomicU32::new(0),
             preempt_count: AtomicU32::new(0),
         }
@@ -100,7 +96,6 @@ impl PerCpu {
         self.is_bsp = is_bsp;
         self.ticks.store(0, Ordering::Relaxed);
         self.curr.store(0, Ordering::Relaxed);
-        self.needs_reschedule.store(false, Ordering::Relaxed);
         self.interrupt_depth.store(0, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
         // Don't set is_online yet - that happens after full init
@@ -446,29 +441,8 @@ impl PerCpuOps for X86_64Arch {
         }
     }
 
-    #[inline]
-    fn needs_reschedule() -> bool {
-        try_current_cpu()
-            .map(|percpu| percpu.needs_reschedule.load(Ordering::Relaxed))
-            .unwrap_or(false)
-    }
-
-    #[inline]
-    fn clear_needs_reschedule() -> bool {
-        try_current_cpu()
-            .map(|percpu| percpu.needs_reschedule.swap(false, Ordering::Relaxed))
-            .unwrap_or(false)
-    }
-
-    #[inline]
-    fn set_needs_reschedule(val: bool) {
-        if try_current_cpu().is_some() {
-            unsafe {
-                current_cpu_mut()
-                    .needs_reschedule
-                    .store(val, Ordering::Relaxed);
-            }
-        }
+    fn current_task_ptr_of(cpu: u32) -> usize {
+        get_percpu(cpu).curr.load(Ordering::Relaxed)
     }
 
     #[inline]

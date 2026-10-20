@@ -112,13 +112,11 @@ extern "C" fn do_syscall_64(regs: &mut PtRegs) -> bool {
     regs.rax = super::syscall::x86_64_syscall_dispatch(
         nr, regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9,
     );
-    // Deliver pending signals / apply -ERESTART* rules before returning
-    // to user space (they may redirect the frame to a handler or back
-    // up over the syscall instruction; rt_sigreturn restored a whole
-    // user context, orig_ax -1, and is not restarted)
-    crate::signal::do_signal(regs);
-    // SAFETY: back to user mode next, with the frame as it is now
-    unsafe { core::arch::asm!("cli", options(nostack)) };
+    // Signals, -ERESTART* rules, rescheduling before returning to user
+    // space (they may redirect the frame to a handler or back up over
+    // the syscall instruction; rt_sigreturn restored a whole user
+    // context, orig_ax -1, and is not restarted); interrupts off after
+    crate::entry::syscall_exit_to_user_mode(regs);
     sysret_ok(regs)
 }
 
@@ -402,6 +400,10 @@ pub unsafe fn enter_user(entry: u64, sp: u64, kstack_top: u64) -> ! {
     super::cpu::set_kernel_stack(kstack_top);
     // A new program image starts with the initial FP/SIMD state
     super::fpu::load_init_state();
+    // Its return to user mode (a signal may be pending, the slice used up)
+    // SAFETY: the frame above, this task's
+    unsafe { core::arch::asm!("cli", options(nostack)) };
+    crate::entry::exit_to_user_mode(unsafe { &mut *regs });
     // SAFETY: the frame above; nothing below it is used again
     unsafe {
         core::arch::asm!(

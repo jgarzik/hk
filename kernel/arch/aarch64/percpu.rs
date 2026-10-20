@@ -44,9 +44,6 @@ pub struct PerCpu {
     /// `task::percpu::INIT_TASK`), set by the scheduler at each switch
     pub curr: AtomicUsize,
 
-    /// Flag set by timer interrupt to request reschedule
-    pub needs_reschedule: AtomicBool,
-
     /// Nesting depth of interrupt handlers
     pub interrupt_depth: AtomicU32,
 
@@ -73,7 +70,6 @@ impl PerCpu {
             kernel_stack_top: 0,
             ticks: AtomicU64::new(0),
             curr: AtomicUsize::new(0),
-            needs_reschedule: AtomicBool::new(false),
             interrupt_depth: AtomicU32::new(0),
             preempt_count: AtomicU32::new(0),
         }
@@ -88,7 +84,6 @@ impl PerCpu {
         self.kernel_stack_top = kernel_stack_top;
         self.ticks.store(0, Ordering::Relaxed);
         self.curr.store(0, Ordering::Relaxed);
-        self.needs_reschedule.store(false, Ordering::Relaxed);
         self.interrupt_depth.store(0, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
     }
@@ -176,16 +171,6 @@ pub fn read_tpidr_el0() -> u64 {
 pub fn get_percpu(cpu_id: u32) -> &'static mut PerCpu {
     assert!((cpu_id as usize) < MAX_CPUS, "CPU ID out of range");
     unsafe { &mut PERCPU_ARRAY[cpu_id as usize] }
-}
-
-/// Get a mutable reference to the current CPU's per-CPU data
-///
-/// # Safety
-/// The TPIDR_EL1 must have been set up correctly.
-#[inline]
-pub unsafe fn current_cpu_mut() -> &'static mut PerCpu {
-    let ptr = read_tpidr_el1() as *mut PerCpu;
-    unsafe { &mut *ptr }
 }
 
 /// Try to get current CPU data (returns None if TPIDR_EL1 not set up)

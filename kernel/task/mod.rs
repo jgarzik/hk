@@ -823,6 +823,11 @@ pub mod tif {
     /// A signal is deliverable under the blocked mask (Linux
     /// TIF_SIGPENDING)
     pub const SIGPENDING: u32 = 1 << 0;
+    /// Give up the CPU on the way back to user mode: the slice is used up
+    /// or a reschedule IPI arrived (Linux TIF_NEED_RESCHED)
+    pub const NEED_RESCHED: u32 = 1 << 1;
+    /// Work queued for the return to user mode (Linux TIF_NOTIFY_RESUME)
+    pub const NOTIFY_RESUME: u32 = 1 << 2;
 }
 
 /// A task (thread or process; Linux task_struct), shared as
@@ -1486,12 +1491,20 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
 
     pub fn set_sigpending(&self, on: bool) {
         if on {
-            self.thread_flags
-                .fetch_or(tif::SIGPENDING, Ordering::Release);
+            self.set_tif(tif::SIGPENDING);
         } else {
-            self.thread_flags
-                .fetch_and(!tif::SIGPENDING, Ordering::Release);
+            self.clear_tif(tif::SIGPENDING);
         }
+    }
+
+    /// Set Linux TIF_* flags `f` (anyone: the tick, an IPI, a signal)
+    pub fn set_tif(&self, f: u32) {
+        self.thread_flags.fetch_or(f, Ordering::Release);
+    }
+
+    /// Clear TIF_* flags `f`
+    pub fn clear_tif(&self, f: u32) {
+        self.thread_flags.fetch_and(!f, Ordering::Release);
     }
 
     /// Charge the time since the last boundary to user or system time

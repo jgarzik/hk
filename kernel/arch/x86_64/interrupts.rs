@@ -287,6 +287,13 @@ pub extern "C" fn idt_dispatch(regs: &mut PtRegs, vector: u64) {
         v if v == RESCHEDULE_VECTOR as u64 => handle_reschedule(),
         _ => {}
     }
+    // Back to user mode: its pending work first (Linux
+    // irqentry_exit_to_user_mode); not for NMI, #DF, #MC (paranoid)
+    if regs.cs & 3 == 3 && !matches!(vector, 2 | 8 | 18) {
+        // SAFETY: interrupts off for the exit work's checks
+        unsafe { ::core::arch::asm!("cli", options(nostack)) };
+        crate::entry::exit_to_user_mode(regs);
+    }
 }
 
 /// si_code for a user x87 (#MF) or SIMD (#XM) floating-point exception
@@ -733,13 +740,7 @@ fn handle_lapic_timer() {
     lapic::eoi();
 
     // Decrement interrupt depth
-    let prev_depth = percpu.interrupt_depth.fetch_sub(1, Ordering::Relaxed);
-
-    // Only set reschedule flag if we're returning to depth 0 (not nested)
-    // The actual preemption will happen after IRETQ when the idle loop checks it
-    if prev_depth == 1 {
-        percpu.needs_reschedule.store(true, Ordering::Release);
-    }
+    percpu.interrupt_depth.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Timer tick counter

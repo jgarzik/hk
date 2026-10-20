@@ -439,6 +439,11 @@ impl UserModeOps for Aarch64Arch {
         // SAFETY: the top of this task's kernel stack, below the caller's
         // frames only if the caller runs on another stack (init)
         unsafe { regs.write(Self::user_entry_frame(entry, user_stack)) };
+        // Its return to user mode (a signal may be pending, the slice
+        // used up), with IRQs masked
+        cpu::disable_interrupts();
+        // SAFETY: the frame above, this task's
+        crate::entry::exit_to_user_mode(unsafe { &mut *regs });
         unsafe {
             asm!(
                 // Exec runs with interrupts on: masked for the return
@@ -477,35 +482,10 @@ impl PerCpuOps for Aarch64Arch {
         }
     }
 
-    #[inline]
-    fn needs_reschedule() -> bool {
-        percpu::try_current_cpu()
-            .map(|p| {
-                p.needs_reschedule
-                    .load(core::sync::atomic::Ordering::Relaxed)
-            })
-            .unwrap_or(false)
-    }
-
-    #[inline]
-    fn clear_needs_reschedule() -> bool {
-        percpu::try_current_cpu()
-            .map(|p| {
-                p.needs_reschedule
-                    .swap(false, core::sync::atomic::Ordering::Relaxed)
-            })
-            .unwrap_or(false)
-    }
-
-    #[inline]
-    fn set_needs_reschedule(val: bool) {
-        if percpu::try_current_cpu().is_some() {
-            unsafe {
-                percpu::current_cpu_mut()
-                    .needs_reschedule
-                    .store(val, core::sync::atomic::Ordering::Relaxed);
-            }
-        }
+    fn current_task_ptr_of(cpu: u32) -> usize {
+        percpu::get_percpu(cpu)
+            .curr
+            .load(core::sync::atomic::Ordering::Relaxed)
     }
 
     #[inline]

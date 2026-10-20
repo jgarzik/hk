@@ -19,6 +19,7 @@ pub mod cpu;
 pub mod cpumask;
 pub mod dma;
 pub mod elf;
+pub mod entry;
 pub mod epoll;
 pub mod eventfd;
 pub mod fanotify;

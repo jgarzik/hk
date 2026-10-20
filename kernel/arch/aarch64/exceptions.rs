@@ -208,12 +208,12 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
                 frame.x[5], // arg5
             );
             frame.x[0] = result;
-            // Deliver pending signals / apply -ERESTART* rules before
-            // returning to user space (they may redirect the frame to a
-            // handler or back up over the svc; rt_sigreturn restored a
-            // whole user context and forgot the syscall)
-            crate::signal::do_signal(frame);
-            super::cpu::disable_interrupts();
+            // Signals, -ERESTART* rules, rescheduling before returning to
+            // user space (they may redirect the frame to a handler or
+            // back up over the svc; rt_sigreturn restored a whole user
+            // context and forgot the syscall); IRQs masked after
+            crate::entry::syscall_exit_to_user_mode(frame);
+            return;
         }
         EC_DABORT_LOWER => {
             let far: u64;
@@ -286,6 +286,10 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             user_fault(frame, crate::signal::SIGILL, info);
         }
     }
+    // Back to user mode: its pending work first (Linux
+    // exit_to_user_mode); the syscall returned above
+    super::cpu::disable_interrupts();
+    crate::entry::exit_to_user_mode(frame);
 }
 
 /// The access of a data or instruction abort to resolve (Linux
@@ -364,6 +368,8 @@ fn user_fault(frame: &mut Aarch64TrapFrame, sig: u32, info: KSigInfo) {
 #[unsafe(no_mangle)]
 extern "C" fn handle_el0_irq(frame: &mut Aarch64TrapFrame) {
     frame.syscallno = super::NO_SYSCALL;
-    // For now, handle same as EL1 IRQ
     handle_el1_irq(frame);
+    // Back to user mode: its pending work first (Linux
+    // irqentry_exit_to_user_mode)
+    crate::entry::exit_to_user_mode(frame);
 }

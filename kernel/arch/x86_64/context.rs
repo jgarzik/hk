@@ -177,20 +177,21 @@ pub extern "C" fn clone_child_entry() -> ! {
     );
 }
 
-/// The C part of `clone_child_entry` (Linux schedule_tail): release the
-/// rq lock held across the switch, load the inherited FP state at `fpu`,
-/// write the child TID (CLONE_CHILD_SETTID, may fault and sleep:
-/// interrupts on, as in any syscall); returns the child's pt_regs, with
-/// interrupts off
+/// The C part of `clone_child_entry` (Linux schedule_tail, then
+/// syscall_exit_to_user_mode): release the rq lock held across the
+/// switch, load the inherited FP state at `fpu`, write the child TID
+/// (CLONE_CHILD_SETTID, may fault and sleep: interrupts on, as in any
+/// syscall), the work of a syscall's return; returns the child's
+/// pt_regs, with interrupts off
 extern "C" fn ret_from_fork(fpu: *const FpuArea) -> *mut super::PtRegs {
     crate::task::percpu::finish_context_switch();
     // SAFETY: the area the parent saved (fpu::save_for_clone_child)
     unsafe { fpu::restore_raw(fpu) };
     super::interrupts::enable();
     crate::task::percpu::write_child_tid_if_needed();
-    // SAFETY: back to user mode next
-    unsafe { core::arch::asm!("cli", options(nostack)) };
-    crate::task::percpu::current_pt_regs()
+    let regs = crate::task::percpu::current_pt_regs();
+    crate::entry::syscall_exit_to_user_mode(regs);
+    regs
 }
 
 impl TaskContext {

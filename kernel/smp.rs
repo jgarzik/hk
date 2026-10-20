@@ -180,10 +180,12 @@ pub fn call_function_interrupt() {
     run_queue(this_id());
 }
 
-/// Reschedule IPI handler: the woken task is picked at this CPU's next
-/// scheduling point (the idle loop's, right after this interrupt)
+/// Reschedule IPI handler (Linux scheduler_ipi): the woken task is
+/// picked at this CPU's next scheduling point (the idle loop's, right
+/// after this interrupt), or the running task's return to user mode
+/// (TIF_NEED_RESCHED; a kick_process for a signal also lands here)
 pub fn reschedule_interrupt() {
-    CurrentArch::set_needs_reschedule(true);
+    crate::task::percpu::current().set_tif(crate::task::tif::NEED_RESCHED);
 }
 
 /// Take every call queued for `me` and run them in queue order

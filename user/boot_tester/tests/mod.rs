@@ -75,6 +75,7 @@ pub mod pidfd;
 pub mod poll;
 pub mod posix_lock;
 pub mod posix_timer;
+pub mod preempt;
 pub mod prctl;
 pub mod prctl_extra;
 pub mod proc_pid;
@@ -156,6 +157,7 @@ pub fn run_all_tests() {
     sysinfo::run_tests();
     signals::run_tests();
     fpu::run_tests();
+    preempt::run_tests();
     fault_signals::run_tests();
     ipc::run_tests();
     mmap::run_tests();

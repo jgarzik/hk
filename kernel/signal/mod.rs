@@ -963,10 +963,20 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
         } else {
             WakeMode::Interruptible
         };
-        crate::task::percpu::wake_up_tid(tid, mode);
+        signal_wake_up(tid, mode);
     }
 
     0
+}
+
+/// A signal for `tid` is deliverable (Linux signal_wake_up_state): wake
+/// it from a sleep `mode` ends, else, if it runs on another CPU, kick it
+/// into the kernel so its return to user mode delivers the signal
+/// (kick_process). Process context, TASKLIST not held.
+fn signal_wake_up(tid: Tid, mode: crate::task::percpu::WakeMode) {
+    if !crate::task::percpu::wake_up_tid(tid, mode) {
+        crate::task::percpu::kick_process(tid);
+    }
 }
 
 /// Signals are sent from thread context only: Task.sig and the shared
@@ -1103,8 +1113,8 @@ fn group_signal(
 /// SIGKILL every thread of `tgid` that has not started exiting, but
 /// `except` (Linux zap_other_threads): queued privately, then woken
 /// from interruptible and killable sleeps once TASKLIST is dropped.
-/// A thread running user code dies at its next syscall or fault (IRQ
-/// return does no signal work yet, P7).
+/// A thread running user code dies on its next return to user mode (a
+/// tick or a kick IPI interrupts it: `entry::exit_to_user_mode`).
 fn zap_threads(tgid: Pid, except: Option<Tid>) {
     let tids: alloc::vec::Vec<Tid> = {
         let mut table = TASKLIST.write();
@@ -1125,7 +1135,7 @@ fn zap_threads(tgid: Pid, except: Option<Tid>) {
         tids
     };
     for t in tids {
-        crate::task::percpu::wake_up_tid(t, crate::task::percpu::WakeMode::Fatal);
+        signal_wake_up(t, crate::task::percpu::WakeMode::Fatal);
     }
 }
 

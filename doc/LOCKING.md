@@ -423,8 +423,12 @@ Each `PerCpu` (per-CPU data) contains:
 ```rust
 pub interrupt_depth: AtomicU32,   // Nesting depth of interrupts
 pub preempt_count: AtomicU32,     // Preemption disable count
-pub needs_reschedule: AtomicBool, // Reschedule request flag
 ```
+
+Each `Task` carries `thread_flags` (Linux TIF_*): TIF_NEED_RESCHED is
+set by the tick (the slice is one tick) and the reschedule IPI, from
+interrupt context, atomically, on the CPU's current task; it is acted on
+only at that task's return to user mode (`entry::exit_to_user_mode`).
 
 #### Locking Rules
 
@@ -519,13 +523,20 @@ adds a sleep-queue entry; whichever of wakeup and timeout comes first ends
 the sleep and the entry is removed afterwards. Spurious wakeups are allowed:
 every sleeper re-checks its condition.
 
-**Preemption model:** hk is non-preemptive (cooperative). The timer tick
-never switches tasks, in kernel or user mode; switches happen only in
-`schedule()`, `yield_now()`, `exit_current()` and AP startup. Therefore a
+**Preemption model:** kernel code is non-preemptive. Switches happen only
+in `schedule()`, `yield_now()`, `exit_current()`, AP startup, and on the
+way back to user mode (`entry::exit_to_user_mode`, Linux
+exit_to_user_mode_loop): there, with no lock held (preempt count 0,
+checked as ENTRY:FAIL) and interrupts on, a task flagged
+TIF_NEED_RESCHED yields (`preempt_schedule_user`; round robin within a
+priority, one-tick slices) and a pending signal is delivered, so a task
+spinning in user mode is preempted and killable. Therefore a
 `spin::Mutex`/`RwLock` holder is never involuntarily preempted, and the only
 same-CPU hazard is an IRQ handler taking a lock the interrupted code holds
 (hence the IRQ rules). Every spin lock raises `preempt_count` (6.3), so a
-preemption point added later can honor it.
+preemption point added later can honor it. A signal for a task running
+on another CPU kicks it (`kick_process`: the reschedule IPI), so its
+return to user mode delivers the signal.
 
 **RCU hook:** `PerCpuScheduler.nr_switches` counts context switches per CPU;
 since kernel code cannot be preempted, a change in a CPU's counter (or the
@@ -2966,8 +2977,8 @@ If interrupt context needs to trigger something that requires non-IRQ-safe locks
 
 Example: the CPU 0 tick notices an expired software timer and wakes
 `ktimerd`, which runs the callback (posix timers send signals there). The
-`needs_reschedule` flag set by the tick is currently unused for preemption
-(hk is non-preemptive, see 3.1).
+tick's TIF_NEED_RESCHED is only acted on when the task returns to user
+mode (3.1).
 
 ### 7.4 Locks Never Acquired from Interrupt Context
 
@@ -3031,7 +3042,8 @@ and its `swapgs` (NMI, #DF and #MC use paranoid entry: they read
 MSR_GS_BASE).
 The kernel stays cooperative: an interrupt never switches tasks in
 kernel mode (the handlers only set flags, wake, and run cross-CPU
-calls), so code between explicit schedule points still runs
+calls; an interrupt from user mode may switch on its way back, with
+nothing held), so code between explicit schedule points still runs
 uninterrupted by other tasks. What this changes, and why it holds:
 
 - Per-CPU data and the current task: a task stays on its CPU (no

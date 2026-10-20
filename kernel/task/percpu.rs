@@ -2505,6 +2505,8 @@ pub fn set_current_state(state: SleepState) {
 pub fn schedule() {
     crate::sync::might_sleep();
     let Some(sched) = this_sched() else { return };
+    // This is the rescheduling a pending NEED_RESCHED asked for
+    current().clear_tif(crate::task::tif::NEED_RESCHED);
     let mut rq = sched.lock.lock();
     sched.drain_wakes(&mut rq);
     let Some(cur) = rq.current else { return };
@@ -2597,6 +2599,22 @@ pub fn wake_up_task(tid: Tid, cpu: u32, mode: WakeMode) -> bool {
     }
 }
 
+/// Make a task running on another CPU notice new work flags (a signal)
+/// soon: a reschedule IPI interrupts it, and its return to user mode
+/// runs the work (Linux kick_process). Nothing to do for a task on this
+/// CPU (it is the caller, or not running) or not running at all.
+/// Process context only (takes TASKLIST; the caller must not hold it).
+pub fn kick_process(tid: Tid) {
+    let Some(t) = TASKLIST.read().task(tid) else {
+        return;
+    };
+    let cpu = t.cpu();
+    let running = CurrentArch::current_task_ptr_of(cpu) == Arc::as_ptr(&t) as usize;
+    if running && crate::cpu::try_this_id() != Some(cpu) {
+        crate::smp::smp_send_reschedule(cpu);
+    }
+}
+
 /// Wake task `tid`, looking up its CPU (process context only: takes
 /// TASKLIST; the caller must not hold it)
 pub fn wake_up_tid(tid: Tid, mode: WakeMode) -> bool {
@@ -2630,7 +2648,10 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
 /// Every CPU's local timer fires every TICK_MS, so only CPU 0 advances the
 /// global tick count (jiffies) and checks software timers; previously each
 /// CPU advanced it, making time run ~Ncpu times too fast. All CPUs then do
-/// their own scheduler work (remote wakeups, expired sleepers).
+/// their own scheduler work (remote wakeups, expired sleepers), and the
+/// running task's slice (one tick, round robin within a priority) is used
+/// up: TIF_NEED_RESCHED, acted on at its next return to user mode
+/// (`entry::exit_to_user_mode`; Linux scheduler_tick -> resched_curr).
 pub fn scheduler_tick() {
     crate::sync::lockdep::irq_enter();
     if crate::cpu::try_this_id() == Some(0) {
@@ -2639,6 +2660,7 @@ pub fn scheduler_tick() {
         crate::timer::check_timers();
     }
     wake_sleepers();
+    current().set_tif(crate::task::tif::NEED_RESCHED);
     crate::sync::lockdep::irq_exit();
 }
 
@@ -2773,11 +2795,30 @@ pub fn wake_sleepers() {
 /// The current thread stays runnable and goes to the back of its priority
 /// queue; another runnable thread (if any) gets to run.
 pub fn yield_now() {
+    yield_cpu();
+}
+
+/// Give up the CPU on the way back to user mode, the slice used up
+/// (TIF_NEED_RESCHED; Linux schedule() in exit_to_user_mode_loop): like
+/// `yield_now`, an involuntary switch if another task runs
+pub fn preempt_schedule_user() {
+    if yield_cpu() {
+        current().nivcsw.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `yield_now`; true if another task ran meanwhile
+fn yield_cpu() -> bool {
     crate::sync::might_sleep();
-    let Some(sched) = this_sched() else { return };
+    let Some(sched) = this_sched() else {
+        return false;
+    };
+    current().clear_tif(crate::task::tif::NEED_RESCHED);
     let mut rq = sched.lock.lock();
     sched.drain_wakes(&mut rq);
-    let Some(cur) = rq.current else { return };
+    let Some(cur) = rq.current else {
+        return false;
+    };
 
     // Refresh the cached priority (rq -> TASKLIST order); the idle
     // task (tid 0, not in the table) keeps its own
@@ -2791,7 +2832,7 @@ pub fn yield_now() {
             e.queued = true;
             (changed, priority)
         }
-        None => return,
+        None => return false,
     };
     if changed {
         rq.reserve_prio(priority);
@@ -2800,9 +2841,10 @@ pub fn yield_now() {
 
     let next = rq.dequeue_next();
     if next == cur {
-        return;
+        return false;
     }
     context_switch_locked(sched, rq, cur, next);
+    true
 }
 
 /// Get the current task's process ID

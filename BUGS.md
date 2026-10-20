@@ -191,20 +191,6 @@ de_thread
   with Linux's thread choice at delivery; a pidfd polls readable when
   the leader exits, not when the whole group is gone.
 
-## No signal delivery on return from an interrupt (P7)
-
-**Location**: `kernel/arch/x86_64/interrupts.rs`,
-`kernel/arch/aarch64/exceptions.rs` (IRQ return paths)
-
-Pending signals are delivered on the way out of a syscall or a fault
-only; an interrupt that arrives in user mode returns without the
-signal/reschedule work check (Linux exit_to_user_mode_loop), so a
-CPU-bound user task never takes SIGKILL or SIGSTOP: a thread spinning
-in user mode outlives its group's exit_group or fatal signal until its
-next syscall or fault, delaying the reap (and an exec's de_thread).
-With SMP user scheduling (P7) this needs the IRQ-return work check plus a kick IPI
-(Linux signal_wake_up -> kick_process).
-
 ## Tracees never stop
 
 **Location**: `kernel/task/ptrace.rs` (ptrace_stop, ptrace_report_syscall),
@@ -601,10 +587,9 @@ Found during T0 (2026-10-19). Tag = when to fix.
 7. **T0 resume point** (T0 next). Design: ~/.claude/plans/
    t0-foundation-design.md (commit numbers below are its §3).
    Remaining: alloc_lock (TaskRes is under TASKLIST); PGID/SID
-   pid_links (kill_pgrp/setpgid scan); 13 exit_to_user_mode, slice
-   tick, kick IPI, tests a-c; 15 sched entity/ttwu(&Task); 16 intrusive
-   WaitQueue + FutexQ (wakeups by raw tid: waitqueue, futex, poll,
-   mqueue, signalfd, sem/msg); 17 per-CPU timer wheel; 18 hrtimer-lite
+   pid_links (kill_pgrp/setpgid scan); 15 sched entity/ttwu(&Task);
+   16 intrusive WaitQueue + FutexQ (wakeups by raw tid: waitqueue,
+   futex, poll, mqueue, signalfd, sem/msg); 17 per-CPU timer wheel; 18 hrtimer-lite
    + deadline waits; 19 yield polls and SCHEDULING_ENABLED fallbacks;
    20 GFP from context/reclaim; 21 try_* user-sized allocations; tests
    f-h; an acct test with N threads exiting at once (one record).

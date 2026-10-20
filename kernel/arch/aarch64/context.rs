@@ -142,11 +142,21 @@ pub extern "C" fn clone_child_entry() -> ! {
         // child-TID write may fault and sleep
         "msr daifclr, #2",
         "bl {write_child_tid}",
+        // The work of a syscall's return, on the child's pt_regs (SP)
+        "mov x0, sp",
+        "bl {exit_work}",
         // Out through the child's pt_regs (ret_to_user masks DAIF)
         "b ret_to_user",
         finish_switch = sym finish_context_switch,
         write_child_tid = sym crate::task::percpu::write_child_tid_if_needed,
+        exit_work = sym ret_from_fork,
     );
+}
+
+/// A fork child's first return to user mode: the work of a syscall's
+/// return (Linux ret_from_fork -> syscall_exit_to_user_mode)
+extern "C" fn ret_from_fork(regs: &mut super::Aarch64TrapFrame) {
+    crate::entry::syscall_exit_to_user_mode(regs);
 }
 
 /// Switch from the current task context to a new task context

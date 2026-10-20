@@ -371,14 +371,9 @@ pub trait PerCpuOps {
     /// run-queue lock held; the run queue keeps it alive)
     fn set_current_task_ptr(p: usize);
 
-    /// Check if reschedule is needed on this CPU
-    fn needs_reschedule() -> bool;
-
-    /// Clear the reschedule flag, returning its previous value
-    fn clear_needs_reschedule() -> bool;
-
-    /// Set the reschedule flag
-    fn set_needs_reschedule(val: bool);
+    /// The task running on CPU `cpu` (`*const KernelTask`, 0 for its
+    /// boot task): a racy snapshot (Linux task_curr)
+    fn current_task_ptr_of(cpu: u32) -> usize;
 
     /// Get the interrupt nesting depth
     fn interrupt_depth() -> u32;
@@ -489,10 +484,8 @@ pub trait UserModeOps {
 ///
 /// # Example
 /// ```ignore
-/// fn schedule<A: SchedArch>() {
-///     if A::needs_reschedule() {
-///         // ... perform context switch using A::context_switch()
-///     }
+/// fn switch<A: SchedArch>(old: *mut A::TaskContext, new: *const A::TaskContext) {
+///     unsafe { A::context_switch(old, new, 0, 0, 0) };
 /// }
 /// ```
 pub trait SchedArch: Arch + PerCpuOps + CpuOps + ContextOps + UserModeOps {
