@@ -18,6 +18,9 @@
 //! - DF_ENTRY (x86): a breakpoint trap taken with DF set (`std`) delivers
 //!   an intact signal frame (the kernel's string copies must run forward:
 //!   entries clear DF) and sigreturn gives DF back
+//! - BAD_IRET (x86): rt_sigreturn to a non-canonical RIP (Linux takes
+//!   it; the return's IRET faults in kernel mode with the user GS base
+//!   live) kills the task with SIGSEGV, the kernel survives
 
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
@@ -483,6 +486,49 @@ pub fn run_tests() {
     expect_killed(b"FAULT_IGNORED_KILL", prep_ignored);
     #[cfg(target_arch = "x86_64")]
     df_entry();
+    #[cfg(target_arch = "x86_64")]
+    bad_iret();
+}
+
+/// x86 ucontext: uc_mcontext.rip (uc_flags, uc_link, uc_stack, then
+/// gregs r8 .. rsp, rip)
+#[cfg(target_arch = "x86_64")]
+const UC_RIP: usize = 40 + 16 * 8;
+
+/// SIGUSR1 handler: return to a non-canonical RIP
+#[cfg(target_arch = "x86_64")]
+extern "C" fn bad_rip_handler(_sig: i32, _info: *const u8, uc: *mut u8) {
+    // SAFETY: the kernel's ucontext for this handler
+    unsafe { (uc.add(UC_RIP) as *mut u64).write_volatile(0x8000_0000_0000_0000) };
+}
+
+/// BAD_IRET: a sigreturn to a non-canonical RIP dies of SIGSEGV
+#[cfg(target_arch = "x86_64")]
+fn bad_iret() {
+    use hk_syscall::{SIGUSR1, sys_getpid, sys_kill};
+    let pid = sys_fork();
+    if pid == 0 {
+        let action: [u64; 4] = [
+            bad_rip_handler as *const () as u64,
+            SA_SIGINFO | SA_RESTORER,
+            super::signals::restorer_addr(),
+            0,
+        ];
+        if sys_rt_sigaction(SIGUSR1, action.as_ptr() as u64, 0, 8) != 0 {
+            sys_exit(100);
+        }
+        sys_kill(sys_getpid(), SIGUSR1);
+        sys_exit(1); // not reached: the sigreturn goes to the bad RIP
+    }
+    let mut status: i32 = 0;
+    let r = sys_wait4(pid, &mut status, 0, 0);
+    if r == pid && status & 0x7f == SIGSEGV as i32 {
+        println(b"BAD_IRET:OK");
+    } else {
+        print(b"BAD_IRET:FAIL status ");
+        print_num(status as i64);
+        println(b"");
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

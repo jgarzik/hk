@@ -149,10 +149,17 @@ impl crate::arch::UserRegs for PtRegs {
     fn forget_syscall(&mut self) {}
 
     /// RIP back over the 2-byte `syscall`, the number back in RAX (Linux
-    /// regs->ax = regs->orig_ax; regs->ip -= 2)
+    /// regs->ax = regs->orig_ax; regs->ip -= 2). A RIP the 2 bytes do not
+    /// fit below (only a debugger could have put one there) is left alone
+    /// and the syscall fails with EINTR: the result stays a user address.
     fn restart_syscall(&mut self) {
-        self.rip = self.rip.wrapping_sub(2);
-        self.rax = self.orig_rax;
+        match self.rip.checked_sub(2) {
+            Some(ip) if ip < paging::TASK_SIZE => {
+                self.rip = ip;
+                self.rax = self.orig_rax;
+            }
+            _ => self.rax = crate::error::KernelError::Interrupted.sysret() as u64,
+        }
     }
 }
 

@@ -247,6 +247,24 @@ unsafe extern "C" fn idt_common() {
         "je 2f",
         "clac",
         "2:",
+        // A fault on the return to user mode's iretq (Linux error_entry,
+        // .Lbad_iret): taken in ring 0 after its swapgs, so the user GS
+        // base is live although the saved CS is the kernel's. Back to
+        // the kernel GS base, and the fault becomes the user's, on the
+        // frame iretq was loading (fixup_bad_iret)
+        "test byte ptr [rsp + {cs}], 3",
+        "jnz 3f",
+        "lea rax, [rip + hk_irq_return_iret]",
+        "cmp [rsp + {ip}], rax",
+        "jne 3f",
+        "swapgs",
+        "mov r12d, edi",
+        "mov rdi, rsp",
+        "sub rsp, 8",
+        "call {fixup}",
+        "mov rsp, rax",
+        "mov edi, r12d",
+        "3:",
         "mov esi, edi",
         "mov rdi, rsp",
         "sub rsp, 8",
@@ -254,9 +272,36 @@ unsafe extern "C" fn idt_common() {
         "add rsp, 8",
         "jmp {ret}",
         smap = sym super::uaccess::SMAP_ON,
+        cs = const core::mem::offset_of!(PtRegs, cs),
+        ip = const core::mem::offset_of!(PtRegs, rip),
+        fixup = sym fixup_bad_iret,
         dispatch = sym super::interrupts::idt_dispatch,
         ret = sym irq_return,
     );
+}
+
+/// A fault on `irq_return`'s iretq to user mode (Linux fixup_bad_iret):
+/// `bad` is the fault's frame, whose registers are the user's (restored
+/// already) and whose saved RSP points at the IRET frame being loaded.
+/// Build the task's pt_regs from both -- the user's registers and IRET
+/// frame, the fault's error code -- so the fault is handled as one
+/// taken in user mode (#GP: SIGSEGV); returns them. The two frames
+/// overlap at the top of the kernel stack: read all, then write.
+extern "C" fn fixup_bad_iret(bad: &PtRegs) -> *mut PtRegs {
+    // SAFETY: the IRET frame on this kernel stack, under `bad`'s RSP
+    let user = unsafe { (bad.rsp as *const [u64; 5]).read() };
+    let regs = PtRegs {
+        rip: user[0],
+        cs: user[1],
+        rflags: user[2],
+        rsp: user[3],
+        ss: user[4],
+        ..bad.clone()
+    };
+    let dst = crate::task::percpu::task_pt_regs(&crate::task::percpu::current());
+    // SAFETY: the current task's pt_regs slot, nothing else lives there
+    unsafe { dst.write(regs) };
+    dst
 }
 
 /// Paranoid IDT entry (NMI, #DF, #MC; Linux paranoid_entry): these may
@@ -352,6 +397,9 @@ pub unsafe extern "C" fn irq_return() {
         "pop rdi",
         "add rsp, 8",
         "swapgs",
+        // The one IRET to user mode: idt_common recognizes a fault here
+        ".global hk_irq_return_iret",
+        "hk_irq_return_iret:",
         "iretq",
         "1:",
         "pop r15",

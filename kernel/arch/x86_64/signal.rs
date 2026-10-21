@@ -473,8 +473,10 @@ pub fn sys_rt_sigreturn() -> i64 {
     let uc: UContext = unsafe { core::ptr::read(uc_bytes.as_ptr() as *const UContext) };
     let sc = &uc.uc_mcontext;
 
-    // A non-canonical RIP would fault on the return to user mode itself
-    if sc.rip >= USER_ADDR_LIMIT || !restore_sigframe_fpu(sc.fpstate) {
+    // Any RIP is taken, as by Linux restore_sigcontext: a non-canonical
+    // one makes the return's IRET fault, which entry.rs turns into the
+    // task's #GP (SIGSEGV; fixup_bad_iret)
+    if !restore_sigframe_fpu(sc.fpstate) {
         return crate::signal::sigreturn_badframe();
     }
 
