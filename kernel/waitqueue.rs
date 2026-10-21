@@ -2,19 +2,25 @@
 //!
 //! Linux-style wait queues (include/linux/wait.h, kernel/sched/wait.c):
 //!
-//! - A sleeper registers on the queue and sets its sleep state *before*
-//!   re-checking its condition (`prepare_to_wait`), then calls `schedule()`.
-//!   A wakeup that lands between the check and `schedule()` flips the state
-//!   back to Running, so `schedule()` returns at once: no lost wakeups.
+//! - A sleeper links a [`WaitEntry`] pinned on its stack into the queue
+//!   and sets its sleep state *before* re-checking its condition
+//!   (`prepare_to_wait`), then calls `schedule()`. A wakeup that lands
+//!   between the check and `schedule()` flips the state back to Running,
+//!   so `schedule()` returns at once: no lost wakeups.
 //! - `wait_event*` wrap the loop; the `_interruptible` variants return
 //!   `Err(KernelError::RestartSys)` when a signal is pending (the syscall
 //!   exit path turns that into a restart or -EINTR), `_killable` returns
 //!   `Err(KernelError::Interrupted)` on SIGKILL only, `_timeout` variants
-//!   take scheduler ticks and return the ticks left.
+//!   take scheduler ticks and return the ticks left, `_exclusive` waits
+//!   are woken one at a time.
 //! - Wakers (`wake_one`/`wake_all`) may run in any context, including IRQ
 //!   handlers: the queue lock is an `IrqSpinlock`, the task wakeup only
 //!   takes the task's pi_lock and a run-queue lock (never TASKLIST), and
-//!   nothing on the wake path allocates.
+//!   nothing on the wake path allocates. `wake_one` is Linux wake_up:
+//!   every non-exclusive waiter and one exclusive waiter.
+//! - An entry may carry its own wake function (poll and epoll use one,
+//!   Linux pollwake): it runs under the queue lock instead of the
+//!   default task wakeup.
 //!
 //! ## Usage
 //!
@@ -24,54 +30,132 @@
 //! WQ.wait_event_interruptible(|| data_ready())?;
 //! // waker: make the condition true first, then
 //! WQ.wake_all();
+//! // open-coded
+//! let w = core::pin::pin!(WaitEntry::new());
+//! loop {
+//!     WQ.prepare_to_wait(w.as_ref(), SleepState::Interruptible);
+//!     if data_ready() { break; }
+//!     schedule();
+//! }
+//! WQ.finish_wait(w.as_ref());
 //! ```
+//!
+//! ## Lifetime
+//!
+//! An entry is linked only while pinned; it records the queue it is on,
+//! and dropping it unlinks it (under that queue's lock), so no exit path
+//! (a signal, an error, a panic unwinding) leaves a stale entry behind.
+//! The queue must outlive its entries (they live on a waiter's stack, or
+//! in a poll table that holds the file owning the queue). A waker that
+//! removes an entry clears its queue pointer last (Release): once a
+//! waiter sees it clear (Acquire) the waker no longer touches the entry.
 //!
 //! ## Lock Ordering
 //!
 //! The queue's IrqSpinlock is taken before the task's pi_lock and the
 //! run-queue lock (wakeups are issued under it, like Linux); nothing
-//! else nests inside it. Never call a `wait*` function while holding a
+//! else nests inside it, but what an entry's wake function takes (an
+//! IrqSpinlock leaf). Never call a `wait*` function while holding a
 //! spinlock, and never wake while holding this CPU's run-queue lock.
 
-use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::marker::PhantomPinned;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::error::KernelError;
+use crate::list::{Link, List};
 use crate::task::percpu::{
-    KernelTask, MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current, current_tid, schedule,
-    schedule_timeout, set_current_state, try_to_wake_up,
+    KernelTask, MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current, current_tid, schedule_timeout,
+    set_current_state, try_to_wake_up,
 };
 
-/// Source of unique wait entry ids
-static NEXT_WAIT_ID: AtomicU64 = AtomicU64::new(1);
+/// Woken one at a time (Linux WQ_FLAG_EXCLUSIVE): appended, and a
+/// `wake_one` stops after waking one
+pub const WQ_EXCLUSIVE: u8 = 1;
+/// Unlinked by the waker that woke it (Linux autoremove_wake_function)
+pub const WQ_AUTOREMOVE: u8 = 2;
 
-/// An entry in the wait queue
-#[derive(Debug)]
-struct WaitQueueEntry {
-    /// Unique id (identifies the registration for removal)
-    id: u64,
-    /// Waiting task (it removes the entry before it can go away)
-    task: *const KernelTask,
-    /// Remove the entry when it is woken (autoremove_wake_function); poll
-    /// registrations stay until the poll ends
-    autoremove: bool,
-}
+/// An entry's wake function (Linux wait_queue_func_t): called under the
+/// queue lock with the wake mode and key; true if it woke its waiter
+pub type WakeFn = fn(&WaitEntry, WakeMode, usize) -> bool;
 
 /// A task's registration on one wait queue (Linux `wait_queue_entry`)
 ///
-/// Create with [`WaitEntry::new`], pass to `prepare_to_wait` in the wait
-/// loop and to `finish_wait` when done.
-#[derive(Debug, Default)]
+/// Pin it (on the stack: `pin!(WaitEntry::new())`) before linking it.
 pub struct WaitEntry {
-    id: u64,
+    link: Link,
+    /// The waiting task (the entry is unlinked before it can go away)
+    task: *const KernelTask,
+    /// WQ_EXCLUSIVE | WQ_AUTOREMOVE
+    flags: AtomicU8,
+    /// Called by wakers instead of waking `task`
+    func: Option<WakeFn>,
+    /// The wake function's data
+    pub private: usize,
+    /// The queue it is on (null: none); written under that queue's lock
+    wq: AtomicPtr<WaitQueue>,
+    _pin: PhantomPinned,
 }
 
+// SAFETY: the links and `task` are only followed under the owning
+// queue's lock (see the module docs)
+unsafe impl Sync for WaitEntry {}
+unsafe impl Send for WaitEntry {}
+
+crate::adapter!(EntryAdapter, WaitEntry, link);
+
 impl WaitEntry {
-    /// A fresh (unregistered) entry
-    pub const fn new() -> Self {
-        Self { id: 0 }
+    /// An entry for the current task (unlinked)
+    pub fn new() -> Self {
+        Self::with_func(None, 0)
     }
+
+    /// An entry whose wakeups call `func` (with `private` as its data)
+    pub fn with_func(func: Option<WakeFn>, private: usize) -> Self {
+        Self {
+            link: Link::new(),
+            task: &*current() as *const KernelTask,
+            flags: AtomicU8::new(0),
+            func,
+            private,
+            wq: AtomicPtr::new(core::ptr::null_mut()),
+            _pin: PhantomPinned,
+        }
+    }
+
+    /// The waiting task
+    pub fn task(&self) -> &KernelTask {
+        // SAFETY: the task outlives its entries (they are unlinked first)
+        unsafe { &*self.task }
+    }
+
+    /// Linked on a queue (Linux !list_empty_careful)
+    pub fn is_queued(&self) -> bool {
+        !self.wq.load(Ordering::Acquire).is_null()
+    }
+}
+
+impl Default for WaitEntry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for WaitEntry {
+    fn drop(&mut self) {
+        let wq = self.wq.load(Ordering::Acquire);
+        // SAFETY: the queue outlives its entries (module docs)
+        if let Some(wq) = unsafe { wq.as_ref() } {
+            // SAFETY: pinned until now, and this is its last use
+            wq.remove_wait_queue(unsafe { Pin::new_unchecked(&*self) });
+        }
+    }
+}
+
+/// Wake `e`'s task (Linux default_wake_function)
+fn default_wake(e: &WaitEntry, mode: WakeMode, _key: usize) -> bool {
+    try_to_wake_up(e.task(), mode)
 }
 
 /// A wait queue for blocking synchronization
@@ -79,13 +163,9 @@ impl WaitEntry {
 /// Tasks can wait on this queue and be woken by other tasks or IRQ
 /// handlers.
 pub struct WaitQueue {
-    /// Waiters (FIFO)
-    head: IrqSpinlock<Vec<WaitQueueEntry>>,
+    /// Waiters: non-exclusive ones first, exclusive ones FIFO
+    head: IrqSpinlock<List<EntryAdapter>>,
 }
-
-// Safety: WaitQueue uses internal synchronization via IrqSpinlock
-unsafe impl Send for WaitQueue {}
-unsafe impl Sync for WaitQueue {}
 
 /// True if the current task has a deliverable signal pending
 pub fn signal_pending() -> bool {
@@ -96,72 +176,92 @@ impl WaitQueue {
     /// Create a new empty wait queue
     pub const fn new() -> Self {
         Self {
-            head: IrqSpinlock::new(Vec::new()),
+            head: IrqSpinlock::new(List::new()),
         }
     }
 
-    /// Register the current task (if not registered) and set its state
+    /// Link `w` unless it is linked (head lock held)
+    fn link(&self, list: &mut List<EntryAdapter>, w: Pin<&WaitEntry>, flags: u8) {
+        if w.is_queued() {
+            return;
+        }
+        w.flags.store(flags, Ordering::Relaxed);
+        let p = &*w as *const WaitEntry;
+        // SAFETY: pinned, on no list, unlinked before it goes (Drop)
+        unsafe {
+            if flags & WQ_EXCLUSIVE != 0 {
+                list.push_back(p);
+            } else {
+                list.push_front(p);
+            }
+        }
+        w.wq.store(self as *const Self as *mut Self, Ordering::Release);
+    }
+
+    /// Register `w` (if not registered) and set the current task's state
     ///
     /// Linux `prepare_to_wait`: call at the top of every wait-loop
     /// iteration, then re-check the condition, then `schedule()`.
-    pub fn prepare_to_wait(&self, entry: &mut WaitEntry, state: SleepState) {
-        self.add_entry(entry, true);
+    pub fn prepare_to_wait(&self, w: Pin<&WaitEntry>, state: SleepState) {
+        let mut list = self.head.lock();
+        self.link(&mut list, w, WQ_AUTOREMOVE);
         set_current_state(state);
     }
 
-    /// Register the current task without autoremove (poll/select): the
-    /// entry stays queued across wakeups until `remove_entry`.
-    pub fn add_poll_entry(&self, entry: &mut WaitEntry) {
-        self.add_entry(entry, false);
+    /// `prepare_to_wait` for an exclusive waiter (Linux
+    /// prepare_to_wait_exclusive)
+    pub fn prepare_to_wait_exclusive(&self, w: Pin<&WaitEntry>, state: SleepState) {
+        let mut list = self.head.lock();
+        self.link(&mut list, w, WQ_AUTOREMOVE | WQ_EXCLUSIVE);
+        set_current_state(state);
     }
 
-    fn add_entry(&self, entry: &mut WaitEntry, autoremove: bool) {
-        let mut head = self.head.lock();
-        if entry.id != 0 && head.iter().any(|e| e.id == entry.id) {
-            return;
-        }
-        if entry.id == 0 {
-            entry.id = NEXT_WAIT_ID.fetch_add(1, Ordering::Relaxed);
-        }
-        head.push(WaitQueueEntry {
-            id: entry.id,
-            task: &*current() as *const KernelTask,
-            autoremove,
-        });
+    /// Register `w` until `remove_wait_queue` (Linux add_wait_queue: poll
+    /// and epoll; every wakeup calls its function)
+    pub fn add_wait_queue(&self, w: Pin<&WaitEntry>) {
+        let mut list = self.head.lock();
+        self.link(&mut list, w, 0);
     }
 
-    /// Remove a registration (no-op if a wakeup already removed it)
-    pub fn remove_entry(&self, entry: &WaitEntry) {
-        if entry.id == 0 {
-            return;
-        }
-        let mut head = self.head.lock();
-        if let Some(pos) = head.iter().position(|e| e.id == entry.id) {
-            head.remove(pos);
+    /// Unlink `w` if it is on this queue (Linux remove_wait_queue)
+    pub fn remove_wait_queue(&self, w: Pin<&WaitEntry>) {
+        let mut list = self.head.lock();
+        if core::ptr::eq(w.wq.load(Ordering::Relaxed), self) {
+            // SAFETY: on this list (its queue pointer says so)
+            unsafe { list.remove(&*w) };
+            w.wq.store(core::ptr::null_mut(), Ordering::Release);
         }
     }
 
     /// End a wait: back to Running and unregister (Linux `finish_wait`)
-    pub fn finish_wait(&self, entry: &WaitEntry) {
+    pub fn finish_wait(&self, w: Pin<&WaitEntry>) {
         set_current_state(SleepState::Running);
-        self.remove_entry(entry);
+        if w.is_queued() {
+            self.remove_wait_queue(w);
+        }
     }
 
     /// Sleep (uninterruptibly) until `cond()` is true
-    pub fn wait_event<F: FnMut() -> bool>(&self, mut cond: F) {
-        crate::sync::might_sleep();
-        if cond() {
-            return;
-        }
-        let mut w = WaitEntry::new();
-        loop {
-            self.prepare_to_wait(&mut w, SleepState::Uninterruptible);
-            if cond() {
-                break;
-            }
-            schedule();
-        }
-        self.finish_wait(&w);
+    pub fn wait_event<F: FnMut() -> bool>(&self, cond: F) {
+        let r = self.wait_common(
+            cond,
+            MAX_SCHEDULE_TIMEOUT,
+            SleepState::Uninterruptible,
+            false,
+        );
+        debug_assert!(r.is_ok());
+    }
+
+    /// `wait_event` as an exclusive waiter: one `wake_one` wakes one
+    /// such waiter (a lock or a completion handed to one task)
+    pub fn wait_event_exclusive<F: FnMut() -> bool>(&self, cond: F) {
+        let r = self.wait_common(
+            cond,
+            MAX_SCHEDULE_TIMEOUT,
+            SleepState::Uninterruptible,
+            true,
+        );
+        debug_assert!(r.is_ok());
     }
 
     /// Sleep until `cond()` is true or a signal is pending
@@ -175,31 +275,16 @@ impl WaitQueue {
     /// Sleep until `cond()` is true or SIGKILL is pending (Linux
     /// wait_event_killable). Returns `Err(KernelError::Interrupted)` on
     /// a fatal signal; other signals do not end the wait.
-    pub fn wait_event_killable<F: FnMut() -> bool>(&self, mut cond: F) -> Result<(), KernelError> {
-        crate::sync::might_sleep();
-        if cond() {
-            return Ok(());
-        }
-        let mut w = WaitEntry::new();
-        let result = loop {
-            self.prepare_to_wait(&mut w, SleepState::Killable);
-            if cond() {
-                break Ok(());
-            }
-            if crate::signal::fatal_signal_pending() {
-                break Err(KernelError::Interrupted);
-            }
-            schedule();
-        };
-        self.finish_wait(&w);
-        result
+    pub fn wait_event_killable<F: FnMut() -> bool>(&self, cond: F) -> Result<(), KernelError> {
+        self.wait_common(cond, MAX_SCHEDULE_TIMEOUT, SleepState::Killable, false)
+            .map(|_| ())
     }
 
     /// Sleep (uninterruptibly) until `cond()` is true or `timeout` ticks
     /// pass. Returns 0 if the timeout elapsed with `cond()` false, else the
     /// ticks left (at least 1), like Linux `wait_event_timeout`.
     pub fn wait_event_timeout<F: FnMut() -> bool>(&self, cond: F, timeout: u64) -> u64 {
-        match self.wait_common(cond, timeout, SleepState::Uninterruptible) {
+        match self.wait_common(cond, timeout, SleepState::Uninterruptible, false) {
             Ok(left) => left,
             Err(_) => unreachable!("uninterruptible wait interrupted"),
         }
@@ -215,7 +300,7 @@ impl WaitQueue {
         cond: F,
         timeout: u64,
     ) -> Result<u64, KernelError> {
-        self.wait_common(cond, timeout, SleepState::Interruptible)
+        self.wait_common(cond, timeout, SleepState::Interruptible, false)
     }
 
     /// Sleep until `cond()` is true, a signal, or the CLOCK_MONOTONIC
@@ -244,25 +329,38 @@ impl WaitQueue {
         }
     }
 
+    /// The wait loop (Linux ___wait_event); the entry is unlinked on
+    /// every way out (finish_wait, else its Drop)
     fn wait_common<F: FnMut() -> bool>(
         &self,
         mut cond: F,
         timeout: u64,
         state: SleepState,
+        exclusive: bool,
     ) -> Result<u64, KernelError> {
         crate::sync::might_sleep();
         if cond() {
             return Ok(timeout.max(1));
         }
-        let mut w = WaitEntry::new();
+        let w = core::pin::pin!(WaitEntry::new());
+        let prepare = |w: Pin<&WaitEntry>| {
+            if exclusive {
+                self.prepare_to_wait_exclusive(w, state)
+            } else {
+                self.prepare_to_wait(w, state)
+            }
+        };
         let mut left = timeout;
         let result = loop {
-            self.prepare_to_wait(&mut w, state);
+            prepare(w.as_ref());
             if cond() {
                 break Ok(left.max(1));
             }
-            if state == SleepState::Interruptible && signal_pending() {
-                break Err(KernelError::RestartSys);
+            if interrupted(state) {
+                break Err(match state {
+                    SleepState::Killable => KernelError::Interrupted,
+                    _ => KernelError::RestartSys,
+                });
             }
             if left == 0 {
                 break Ok(0);
@@ -270,44 +368,58 @@ impl WaitQueue {
             left = schedule_timeout(left);
             if left == 0 {
                 // Timed out: one last look (Linux __wait_event_timeout)
-                self.prepare_to_wait(&mut w, state);
+                prepare(w.as_ref());
                 break Ok(if cond() { 1 } else { 0 });
             }
         };
-        self.finish_wait(&w);
+        self.finish_wait(w.as_ref());
         result
     }
 
-    /// Wake up to `nr` waiters (`usize::MAX` = all) under the head lock
-    /// without allocating (Linux __wake_up_common: try_to_wake_up runs
-    /// under wq_head->lock), so IRQ handlers may wake. Order: head ->
-    /// pi_lock -> run-queue lock.
-    fn wake_nr(&self, nr: usize) -> usize {
-        let mut head = self.head.lock();
-        let mut woken = 0;
-        let mut i = 0;
-        while i < head.len() && woken < nr {
-            let (task, auto) = (head[i].task, head[i].autoremove);
-            if auto {
-                head.remove(i);
-            } else {
-                i += 1;
+    /// Wake waiters (Linux __wake_up_common) under the head lock without
+    /// allocating, so IRQ handlers may wake: every non-exclusive entry
+    /// and up to `nr_exclusive` exclusive ones whose wake succeeded.
+    /// Order: head -> pi_lock -> run-queue lock. Returns the waiters
+    /// woken.
+    fn wake_common(&self, mode: WakeMode, nr_exclusive: usize, key: usize) -> usize {
+        let mut list = self.head.lock();
+        let (mut woken, mut excl) = (0, nr_exclusive);
+        let mut cur = list.front();
+        while let Some(p) = cur {
+            // SAFETY: on the list; its next is read before it may go
+            cur = unsafe { list.next(p) };
+            // SAFETY: linked entries are live (module docs)
+            let e = unsafe { &*p };
+            let flags = e.flags.load(Ordering::Relaxed);
+            if !e.func.unwrap_or(default_wake)(e, mode, key) {
+                continue;
             }
-            // SAFETY: a queued waiter is alive (see `task`)
-            try_to_wake_up(unsafe { &*task }, WakeMode::Any);
             woken += 1;
+            if flags & WQ_AUTOREMOVE != 0 {
+                // SAFETY: on this list
+                unsafe { list.remove(p) };
+                // Last touch: the waiter may return once it sees this
+                e.wq.store(core::ptr::null_mut(), Ordering::Release);
+            }
+            if flags & WQ_EXCLUSIVE != 0 {
+                excl -= 1;
+                if excl == 0 {
+                    break;
+                }
+            }
         }
         woken
     }
 
-    /// Wake one waiter (FIFO). Returns true if a task was woken.
+    /// Wake every non-exclusive waiter and one exclusive waiter (Linux
+    /// wake_up). Returns true if a task was woken.
     pub fn wake_one(&self) -> bool {
-        self.wake_nr(1) != 0
+        self.wake_common(WakeMode::Any, 1, 0) != 0
     }
 
     /// Wake all waiters. Returns the number of waiters woken.
     pub fn wake_all(&self) -> usize {
-        self.wake_nr(usize::MAX)
+        self.wake_common(WakeMode::Any, usize::MAX, 0)
     }
 
     /// Check if the wait queue is empty
@@ -318,6 +430,15 @@ impl WaitQueue {
     /// Get the number of waiters
     pub fn len(&self) -> usize {
         self.head.lock().len()
+    }
+}
+
+/// A pending signal ends a sleep in `state` (Linux signal_pending_state)
+fn interrupted(state: SleepState) -> bool {
+    match state {
+        SleepState::Interruptible => signal_pending(),
+        SleepState::Killable => crate::signal::fatal_signal_pending(),
+        _ => false,
     }
 }
 

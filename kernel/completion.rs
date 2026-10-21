@@ -69,7 +69,7 @@ impl Completion {
     /// Sleep (uninterruptibly) until completed, then consume it (thread
     /// context, no spinlock held)
     pub fn wait(&self) {
-        self.wait.wait_event(|| self.try_wait());
+        self.wait.wait_event_exclusive(|| self.try_wait());
     }
 }
 

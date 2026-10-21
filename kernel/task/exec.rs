@@ -618,9 +618,9 @@ fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
         }
         crate::signal::zap_group_others(tgid, tid);
         let wq = &crate::task::proc::CHILD_EXIT_WQ;
-        let mut w = WaitEntry::new();
+        let w = core::pin::pin!(WaitEntry::new());
         let r = loop {
-            wq.prepare_to_wait(&mut w, SleepState::Killable);
+            wq.prepare_to_wait(w.as_ref(), SleepState::Killable);
             if !percpu::group_others(tgid, tid) {
                 break Ok(());
             }
@@ -629,7 +629,7 @@ fn de_thread(tid: crate::task::Tid) -> Result<(), i32> {
             }
             schedule();
         };
-        wq.finish_wait(&w);
+        wq.finish_wait(w.as_ref());
         sig.end_exec(tid);
         r?;
     }

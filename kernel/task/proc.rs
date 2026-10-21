@@ -198,9 +198,9 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, _rusage: u64) -> i64 {
     use crate::waitqueue::{WaitEntry, signal_pending};
 
     // Sleep on CHILD_EXIT_WQ until a matching child is a zombie
-    let mut w = WaitEntry::new();
+    let w = core::pin::pin!(WaitEntry::new());
     let result = loop {
-        CHILD_EXIT_WQ.prepare_to_wait(&mut w, SleepState::Interruptible);
+        CHILD_EXIT_WQ.prepare_to_wait(w.as_ref(), SleepState::Interruptible);
 
         if let Some((child_pid, wait_status)) =
             super::percpu::reap_zombie_child(current_pid, pid, options)
@@ -230,7 +230,7 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, _rusage: u64) -> i64 {
         }
         schedule();
     };
-    CHILD_EXIT_WQ.finish_wait(&w);
+    CHILD_EXIT_WQ.finish_wait(w.as_ref());
     result
 }
 
@@ -353,9 +353,9 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
     use crate::waitqueue::{WaitEntry, signal_pending};
 
     // Sleep on CHILD_EXIT_WQ until a matching child is a zombie
-    let mut w = WaitEntry::new();
+    let w = core::pin::pin!(WaitEntry::new());
     let result = loop {
-        CHILD_EXIT_WQ.prepare_to_wait(&mut w, SleepState::Interruptible);
+        CHILD_EXIT_WQ.prepare_to_wait(w.as_ref(), SleepState::Interruptible);
 
         // Reap a zombie child (with WNOWAIT, only report it)
         if let Some((child_pid, wait_status, utime, stime)) =
@@ -423,7 +423,7 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
         }
         schedule();
     };
-    CHILD_EXIT_WQ.finish_wait(&w);
+    CHILD_EXIT_WQ.finish_wait(w.as_ref());
     result
 }
 

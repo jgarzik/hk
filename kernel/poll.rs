@@ -29,11 +29,15 @@
 //! - `./select-poll.md` - Implementation guide
 //! - `./external-linux/fs/select.c` - Linux implementation
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::fs::File;
 use crate::task::Tid;
+use crate::task::percpu::{WakeMode, try_to_wake_up};
 use crate::waitqueue::{WaitEntry, WaitQueue};
 
 // =============================================================================
@@ -171,16 +175,29 @@ impl Default for FdSet {
 /// Per-syscall poll context (like Linux poll_wqueues)
 ///
 /// Holds the polling task's registrations on the wait queues of the polled
-/// files (non-autoremove entries: every wakeup wakes the poller until the
+/// files (entries pinned on the heap, Linux poll_table_entry, whose wake
+/// function `pollwake` flags the context and wakes the poller, until the
 /// poll ends) and references to those files, which keep the wait queues
 /// alive. Dropping the context removes all registrations.
 pub struct PollContext {
     /// Task ID of the polling task
     pub task: Tid,
+    /// Set by any registration's wakeup (Linux poll_wqueues.triggered);
+    /// boxed: the entries point at it
+    triggered: Box<AtomicBool>,
     /// Registered (wait queue, entry) pairs
-    entries: Vec<(*const WaitQueue, WaitEntry)>,
+    entries: Vec<(*const WaitQueue, Pin<Box<WaitEntry>>)>,
     /// Files whose wait queues we registered on (keeps them alive)
     files: Vec<Arc<File>>,
+}
+
+/// A poll registration's wakeup (Linux pollwake): flag the context,
+/// wake the poller (under the queue's lock; the flag outlives the
+/// entry, which the context unlinks before it goes)
+fn pollwake(e: &WaitEntry, mode: WakeMode, _key: usize) -> bool {
+    // SAFETY: `private` is the context's `triggered` (see above)
+    unsafe { &*(e.private as *const AtomicBool) }.store(true, Ordering::Release);
+    try_to_wake_up(e.task(), mode)
 }
 
 impl PollContext {
@@ -188,9 +205,20 @@ impl PollContext {
     pub fn new(tid: Tid) -> Self {
         Self {
             task: tid,
+            triggered: Box::new(AtomicBool::new(false)),
             entries: Vec::new(),
             files: Vec::new(),
         }
+    }
+
+    /// A registration was woken since the last `clear_triggered`
+    pub fn triggered(&self) -> bool {
+        self.triggered.load(Ordering::Acquire)
+    }
+
+    /// Forget past wakeups (before a new scan)
+    pub fn clear_triggered(&self) {
+        self.triggered.store(false, Ordering::Release);
     }
 
     /// Keep `file` alive for the lifetime of this context (call before
@@ -204,8 +232,9 @@ impl PollContext {
         if self.entries.iter().any(|(q, _)| core::ptr::eq(*q, wq)) {
             return;
         }
-        let mut entry = WaitEntry::new();
-        wq.add_poll_entry(&mut entry);
+        let flag = &*self.triggered as *const AtomicBool as usize;
+        let entry = Box::pin(WaitEntry::with_func(Some(pollwake), flag));
+        wq.add_wait_queue(entry.as_ref());
         self.entries.push((wq as *const WaitQueue, entry));
     }
 
@@ -220,7 +249,7 @@ impl Drop for PollContext {
         for (wq, entry) in self.entries.drain(..) {
             // Safety: the wait queues belong to files in `self.files`,
             // which are still alive (dropped after this loop)
-            unsafe { (*wq).remove_entry(&entry) };
+            unsafe { (*wq).remove_wait_queue(entry.as_ref()) };
         }
         self.files.clear();
     }

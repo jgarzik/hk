@@ -34,10 +34,14 @@
 //! ```
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::cell::UnsafeCell;
+use core::marker::PhantomPinned;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
-use crate::arch::IrqSpinlock;
 use crate::error::KernelError;
+use crate::list::{Link, List};
+use crate::sync::spin::Mutex as SpinMutex;
 use crate::task::Tid;
 use crate::task::percpu::{KernelTask, WakeQ};
 use crate::uaccess::{get_user, put_user};
@@ -122,38 +126,115 @@ impl FutexKey {
 // Futex Queue Entry
 // =============================================================================
 
-/// Entry representing a task waiting on a futex
+/// A task waiting on a futex (Linux futex_q), pinned on the waiter's
+/// stack and linked into its key's hash bucket
+///
+/// `lock_ptr` names the bucket the entry is on: set under that bucket's
+/// lock (a requeue moves it under both buckets' locks), cleared by the
+/// waker that dequeues it, as its last touch of the entry (Release), so
+/// a waiter that sees it null (Acquire) was woken and may return. A
+/// waiter that gives up (signal, timeout) dequeues itself wherever a
+/// requeue put it (`unqueue`, Linux futex_unqueue); dropping the entry
+/// does the same.
 pub struct FutexQ {
-    /// Key identifying which futex this waiter is blocked on
-    pub key: FutexKey,
-    /// The waiting task, a counted reference: a requeue moves the entry
-    /// to another bucket where its waiter does not look for it, so it
-    /// may outlive the wait (a later wake of it is spurious, not a use
-    /// after free)
-    task: crate::task::percpu::TaskRef,
+    link: Link,
+    /// Key of the futex it waits on (a requeue changes it, under the
+    /// bucket locks; read under the lock of the bucket it is on)
+    key: UnsafeCell<FutexKey>,
+    /// The waiting task (alive while the entry is queued)
+    task: *const KernelTask,
     /// Bitset for selective wake (FUTEX_WAIT_BITSET/FUTEX_WAKE_BITSET)
-    pub bitset: u32,
+    bitset: u32,
+    /// The bucket it is on; null once dequeued
+    lock_ptr: AtomicPtr<FutexHashBucket>,
+    _pin: PhantomPinned,
 }
 
+// SAFETY: the fields shared with wakers are used under the bucket lock
+// or through atomics (see above)
+unsafe impl Sync for FutexQ {}
+unsafe impl Send for FutexQ {}
+
+crate::adapter!(QAdapter, FutexQ, link);
+
 impl FutexQ {
-    /// Create a new futex queue entry for the current task
+    /// An entry for the current task (not queued)
     pub fn new(key: FutexKey, bitset: u32) -> Self {
         Self {
-            key,
-            task: crate::task::percpu::task_ref(&crate::task::percpu::current()),
+            link: Link::new(),
+            key: UnsafeCell::new(key),
+            task: &*crate::task::percpu::current() as *const KernelTask,
             bitset,
+            lock_ptr: AtomicPtr::new(core::ptr::null_mut()),
+            _pin: PhantomPinned,
         }
     }
 
-    /// Queued by `task`
-    fn is(&self, task: *const KernelTask, key: &FutexKey) -> bool {
-        core::ptr::eq(&*self.task, task) && self.key == *key
+    /// Its key (under the lock of the bucket it is on)
+    fn key(&self) -> FutexKey {
+        // SAFETY: changed only under that lock (requeue)
+        unsafe { *self.key.get() }
     }
 
-    /// Dequeued for a wakeup: queue its task (bucket lock held)
-    fn wake(self, wq: &mut WakeQ) {
-        wq.add(&self.task);
+    /// Still on a bucket (no waker dequeued it)
+    fn queued(&self) -> bool {
+        !self.lock_ptr.load(Ordering::Acquire).is_null()
     }
+
+    /// Link it on `b` (its lock held: `list`; Linux futex_queue)
+    fn queue(self: Pin<&Self>, b: &FutexHashBucket, list: &mut List<QAdapter>) {
+        // SAFETY: pinned until it is unlinked (unqueue or a waker,
+        // and Drop)
+        unsafe { list.push_back(&*self) };
+        self.lock_ptr.store(
+            b as *const FutexHashBucket as *mut FutexHashBucket,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Take it off its bucket unless a waker did (Linux futex_unqueue):
+    /// true if it was still queued. A requeue may move it meanwhile:
+    /// the bucket is re-read under its lock.
+    fn unqueue(&self) -> bool {
+        loop {
+            let b = self.lock_ptr.load(Ordering::Acquire);
+            // SAFETY: buckets are static
+            let Some(bucket) = (unsafe { b.as_ref() }) else {
+                return false;
+            };
+            let mut list = bucket.waiters.lock();
+            if self.lock_ptr.load(Ordering::Relaxed) != b {
+                continue;
+            }
+            // SAFETY: on this bucket (lock_ptr, under its lock)
+            unsafe { list.remove(self) };
+            bucket.dec_waiters();
+            self.lock_ptr
+                .store(core::ptr::null_mut(), Ordering::Relaxed);
+            return true;
+        }
+    }
+}
+
+impl Drop for FutexQ {
+    fn drop(&mut self) {
+        self.unqueue();
+    }
+}
+
+/// Dequeue `q` from `b` for a wakeup (Linux futex_wake_mark): its task
+/// goes on `wq` (a reference: the waiter may return at once), then
+/// `lock_ptr` is cleared, the last touch of `q`
+///
+/// # Safety
+/// `q` is on `b`, whose lock the caller holds (`list`).
+unsafe fn wake_mark(b: &FutexHashBucket, list: &mut List<QAdapter>, q: &FutexQ, wq: &mut WakeQ) {
+    // SAFETY: see above
+    unsafe { list.remove(q) };
+    b.dec_waiters();
+    // SAFETY: the waiter is alive while its entry is queued
+    wq.add(unsafe { &*q.task });
+    q.lock_ptr.store(core::ptr::null_mut(), Ordering::Release);
 }
 
 /// Why a futex sleep ended
@@ -213,14 +294,15 @@ fn futex_sleep<F: Fn() -> bool>(queued: F, deadline_ns: Option<u64>, realtime: b
 // Futex Hash Bucket
 // =============================================================================
 
-/// Hash bucket containing futex waiters
+/// Hash bucket containing futex waiters (Linux futex_hash_bucket)
 ///
-/// Uses IrqSpinlock for IRQ-safety (can be called from signal context).
-/// The waiter_count provides a fast-path check to avoid lock acquisition
-/// when there are no waiters.
+/// The waiter list is under a plain spin lock (futexes are used from
+/// syscalls only; Linux hb->lock); wakeups go through a WakeQ after it
+/// is dropped. The waiter_count provides a fast-path check to avoid
+/// lock acquisition when there are no waiters.
 pub struct FutexHashBucket {
-    /// Waiters list protected by IrqSpinlock
-    waiters: IrqSpinlock<Vec<FutexQ>>,
+    /// Queued entries (FIFO)
+    waiters: SpinMutex<List<QAdapter>>,
     /// Waiter count for fast-path optimization
     waiter_count: AtomicU32,
 }
@@ -235,7 +317,7 @@ impl FutexHashBucket {
     /// Create a new empty hash bucket
     pub const fn new() -> Self {
         Self {
-            waiters: IrqSpinlock::new(Vec::new()),
+            waiters: SpinMutex::new(List::new()),
             waiter_count: AtomicU32::new(0),
         }
     }
@@ -374,23 +456,25 @@ fn read_user_timeout(timeout_ptr: u64) -> Result<Option<u64>, i32> {
 }
 
 // =============================================================================
-// Current Task Info
-// =============================================================================
-
-/// The current task (for its queue entries) and its process ID
-fn get_current_task_info() -> (*const KernelTask, u64) {
-    let me = crate::task::percpu::current();
-    (&*me as *const KernelTask, me.pid)
-}
-
-// =============================================================================
 // Core Futex Operations
 // =============================================================================
+
+/// The futex key of `uaddr` for the current process
+fn make_key(uaddr: u64, is_private: bool) -> FutexKey {
+    if is_private {
+        FutexKey::private(uaddr, crate::task::percpu::current_pid())
+    } else {
+        // For shared futexes, we'd need physical address lookup
+        // For now, treat as private with pid=0
+        FutexKey::shared(uaddr)
+    }
+}
 
 /// Wait on a futex
 ///
 /// Blocks the current task until woken or the timeout expires.
 /// Returns immediately with -EAGAIN if the value at uaddr doesn't match expected.
+/// A waiter requeued to another futex keeps sleeping there.
 ///
 /// # Arguments
 /// * `uaddr` - User address of the futex (must be 4-byte aligned)
@@ -424,18 +508,7 @@ pub fn futex_wait(
         return KernelError::WouldBlock.to_errno_neg();
     }
 
-    // Get current task info
-    let (me, pid) = get_current_task_info();
-
-    // Create futex key
-    let key = if is_private {
-        FutexKey::private(uaddr, pid)
-    } else {
-        // For shared futexes, we'd need physical address lookup
-        // For now, treat as private with pid=0
-        FutexKey::shared(uaddr)
-    };
-
+    let key = make_key(uaddr, is_private);
     let bucket = futex_bucket(&key);
 
     // Fault the word in (a real EFAULT is reported here); it is read
@@ -444,56 +517,15 @@ pub fn futex_wait(
         return e;
     }
 
-    // CRITICAL: Increment waiter count BEFORE checking value
-    // This provides the memory barrier ordering with the waker
-    bucket.inc_waiters();
-
-    // Memory barrier: ensures waiter count visible before value read
-    core::sync::atomic::fence(Ordering::SeqCst);
-
-    // Lock bucket and check value
-    let should_wait = {
-        let mut waiters = bucket.waiters.lock();
-
-        // Read futex value
-        let current_val = match get_value_locked(uaddr) {
-            Ok(v) => v,
-            Err(e) => {
-                bucket.dec_waiters();
-                return e;
-            }
-        };
-
-        // If value changed, don't wait
-        if current_val != expected {
-            bucket.dec_waiters();
-            return KernelError::WouldBlock.to_errno_neg();
-        }
-
-        // Value matches - enqueue ourselves
-        waiters.push(FutexQ::new(key, bitset));
-        true
-    };
-
-    if !should_wait {
-        return KernelError::WouldBlock.to_errno_neg();
+    let q = core::pin::pin!(FutexQ::new(key, bitset));
+    if let Err(e) = queue_if(bucket, q.as_ref(), uaddr, expected) {
+        return e;
     }
 
-    let still_queued = || bucket.waiters.lock().iter().any(|q| q.is(me, &key));
-    let why = futex_sleep(still_queued, deadline_ns, realtime);
+    let why = futex_sleep(|| q.queued(), deadline_ns, realtime);
 
     // Dequeue ourselves unless a waker already did
-    let dequeued_self = {
-        let mut waiters = bucket.waiters.lock();
-        if let Some(pos) = waiters.iter().position(|q| q.is(me, &key)) {
-            waiters.remove(pos);
-            bucket.dec_waiters();
-            true
-        } else {
-            false
-        }
-    };
-    if !dequeued_self {
+    if !q.unqueue() {
         return 0; // woken by futex_wake (possibly racing a signal/timeout)
     }
     match why {
@@ -504,6 +536,30 @@ pub fn futex_wait(
         FutexSleep::Signal if deadline_ns.is_none() => KernelError::RestartSys.to_errno_neg(),
         FutexSleep::Signal => KernelError::Interrupted.to_errno_neg(),
     }
+}
+
+/// Queue `q` on `bucket` if the futex word still holds `expected`
+/// (Linux futex_wait_setup): the waiter count is raised before the
+/// word is read, pairing with the waker's barrier (no lost wakeup)
+fn queue_if(
+    bucket: &FutexHashBucket,
+    q: Pin<&FutexQ>,
+    uaddr: u64,
+    expected: u32,
+) -> Result<(), i32> {
+    bucket.inc_waiters();
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let mut list = bucket.waiters.lock();
+    let r = match get_value_locked(uaddr) {
+        Ok(v) if v == expected => Ok(()),
+        Ok(_) => Err(KernelError::WouldBlock.to_errno_neg()),
+        Err(e) => Err(e),
+    };
+    match r {
+        Ok(()) => q.queue(bucket, &mut list),
+        Err(_) => bucket.dec_waiters(),
+    }
+    r
 }
 
 /// Wake waiters on a futex
@@ -527,15 +583,7 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i
         return KernelError::InvalidArgument.to_errno_neg();
     }
 
-    // Get current PID for private futex key
-    let pid = crate::task::percpu::current_pid();
-
-    let key = if is_private {
-        FutexKey::private(uaddr, pid)
-    } else {
-        FutexKey::shared(uaddr)
-    };
-
+    let key = make_key(uaddr, is_private);
     let bucket = futex_bucket(&key);
 
     // Memory barrier paired with futex_wait's barrier
@@ -546,22 +594,22 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i
         return 0;
     }
 
-    // Collect waiters to wake
     let mut woken = 0i32;
     let mut to_wake = WakeQ::new();
-
     {
-        let mut waiters = bucket.waiters.lock();
-
-        let mut i = 0;
-        while i < waiters.len() && woken < num_wake {
-            if waiters[i].key == key && (waiters[i].bitset & bitset) != 0 {
-                let q = waiters.remove(i);
-                bucket.dec_waiters();
-                q.wake(&mut to_wake);
+        let mut list = bucket.waiters.lock();
+        let mut cur = list.front();
+        while let Some(p) = cur
+            && woken < num_wake
+        {
+            // SAFETY: on the list; its next is read before it may go
+            cur = unsafe { list.next(p) };
+            // SAFETY: queued entries are live
+            let q = unsafe { &*p };
+            if q.key() == key && q.bitset & bitset != 0 {
+                // SAFETY: on this bucket, locked
+                unsafe { wake_mark(bucket, &mut list, q, &mut to_wake) };
                 woken += 1;
-            } else {
-                i += 1;
             }
         }
     }
@@ -575,7 +623,7 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i
 /// Requeue waiters from one futex to another
 ///
 /// Wakes up to nr_wake waiters on uaddr, then moves up to nr_requeue
-/// waiters from uaddr to uaddr2.
+/// waiters from uaddr to uaddr2 (they keep sleeping, now on uaddr2).
 ///
 /// # Arguments
 /// * `uaddr` - Source futex address
@@ -599,28 +647,10 @@ pub fn futex_requeue(
         return KernelError::InvalidArgument.to_errno_neg();
     }
 
-    let pid = crate::task::percpu::current_pid();
-
-    let key1 = if is_private {
-        FutexKey::private(uaddr, pid)
-    } else {
-        FutexKey::shared(uaddr)
-    };
-
-    let key2 = if is_private {
-        FutexKey::private(uaddr2, pid)
-    } else {
-        FutexKey::shared(uaddr2)
-    };
-
-    let bucket1 = futex_bucket(&key1);
-    let bucket2 = futex_bucket(&key2);
-    let same_bucket = core::ptr::eq(bucket1, bucket2);
-
-    let mut to_wake = WakeQ::new();
-    let mut to_requeue: Vec<FutexQ> = Vec::new();
-    let mut woken = 0i32;
-    let mut requeued = 0i32;
+    let key1 = make_key(uaddr, is_private);
+    let key2 = make_key(uaddr2, is_private);
+    let b1 = futex_bucket(&key1);
+    let b2 = futex_bucket(&key2);
 
     // CMP_REQUEUE: fault the word in before locking
     if cmpval.is_some()
@@ -629,69 +659,111 @@ pub fn futex_requeue(
         return e;
     }
 
-    // Phase 1: Extract waiters to wake and requeue from bucket1
-    {
-        let mut waiters = bucket1.waiters.lock();
-
-        // If CMP_REQUEUE, check expected value while holding lock
-        if let Some(expected) = cmpval {
-            let current = match get_value_locked(uaddr) {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            if current != expected {
-                return KernelError::WouldBlock.to_errno_neg();
-            }
-        }
-
-        let mut i = 0;
-        while i < waiters.len() {
-            if waiters[i].key == key1 {
-                if woken < nr_wake {
-                    // Wake this waiter
-                    let q = waiters.remove(i);
-                    bucket1.dec_waiters();
-                    q.wake(&mut to_wake);
-                    woken += 1;
-                } else if requeued < nr_requeue {
-                    // Mark for requeue
-                    let mut q = waiters.remove(i);
-                    bucket1.dec_waiters();
-                    q.key = key2;
-                    to_requeue.push(q);
-                    requeued += 1;
-                } else {
-                    break;
-                }
-            } else {
-                i += 1;
-            }
-        }
-    }
-
-    // Phase 2: Add requeued waiters to bucket2
-    if !to_requeue.is_empty() {
-        if same_bucket {
-            // Same bucket - just re-add with new key
-            let mut waiters = bucket1.waiters.lock();
-            for q in to_requeue {
-                waiters.push(q);
-                bucket1.inc_waiters();
-            }
+    // Both buckets locked, in address order (Linux double_lock_hb), so a
+    // requeued entry is always on the bucket its lock_ptr names
+    let mut to_wake = WakeQ::new();
+    let r = if core::ptr::eq(b1, b2) {
+        let mut l = b1.waiters.lock();
+        let op = Requeue {
+            key1,
+            key2,
+            nr_wake,
+            nr_requeue,
+            cmp: cmpval.map(|v| (uaddr, v)),
+        };
+        op.run(b1, &mut l, b2, None, &mut to_wake)
+    } else {
+        let (first, second) = if (b1 as *const FutexHashBucket) < (b2 as *const _) {
+            (b1, b2)
         } else {
-            // Different bucket
-            let mut waiters = bucket2.waiters.lock();
-            for q in to_requeue {
-                waiters.push(q);
-                bucket2.inc_waiters();
+            (b2, b1)
+        };
+        let mut g1 = first.waiters.lock();
+        let mut g2 = second.waiters.lock();
+        let (l1, l2) = if core::ptr::eq(first, b1) {
+            (&mut *g1, &mut *g2)
+        } else {
+            (&mut *g2, &mut *g1)
+        };
+        let op = Requeue {
+            key1,
+            key2,
+            nr_wake,
+            nr_requeue,
+            cmp: cmpval.map(|v| (uaddr, v)),
+        };
+        op.run(b1, l1, b2, Some(l2), &mut to_wake)
+    };
+
+    // Wake collected tasks (bucket locks dropped)
+    to_wake.wake_up();
+    r
+}
+
+/// One requeue under the bucket locks (Linux futex_requeue's loop)
+struct Requeue {
+    key1: FutexKey,
+    key2: FutexKey,
+    nr_wake: i32,
+    nr_requeue: i32,
+    /// CMP_REQUEUE: (uaddr, expected value)
+    cmp: Option<(u64, u32)>,
+}
+
+impl Requeue {
+    /// `l2` is None when both keys hash to `b1`
+    fn run(
+        &self,
+        b1: &FutexHashBucket,
+        l1: &mut List<QAdapter>,
+        b2: &FutexHashBucket,
+        mut l2: Option<&mut List<QAdapter>>,
+        wq: &mut WakeQ,
+    ) -> i32 {
+        if let Some((uaddr, expected)) = self.cmp {
+            match get_value_locked(uaddr) {
+                Ok(v) if v == expected => {}
+                Ok(_) => return KernelError::WouldBlock.to_errno_neg(),
+                Err(e) => return e,
             }
         }
+        let (mut woken, mut requeued) = (0i32, 0i32);
+        let mut cur = l1.front();
+        while let Some(p) = cur {
+            // SAFETY: on the list; its next is read before it may move
+            cur = unsafe { l1.next(p) };
+            // SAFETY: queued entries are live
+            let q = unsafe { &*p };
+            if q.key() != self.key1 {
+                continue;
+            }
+            if woken < self.nr_wake {
+                // SAFETY: on b1, locked
+                unsafe { wake_mark(b1, l1, q, wq) };
+                woken += 1;
+            } else if requeued < self.nr_requeue {
+                // SAFETY: both buckets are locked (Linux requeue_futex)
+                unsafe { *q.key.get() = self.key2 };
+                if let Some(l2) = l2.as_deref_mut() {
+                    // SAFETY: on b1; moved to b2, both locked
+                    unsafe {
+                        l1.remove(q);
+                        l2.push_back(q);
+                    }
+                    b1.dec_waiters();
+                    b2.inc_waiters();
+                    q.lock_ptr.store(
+                        b2 as *const FutexHashBucket as *mut FutexHashBucket,
+                        Ordering::Release,
+                    );
+                }
+                requeued += 1;
+            } else {
+                break;
+            }
+        }
+        woken + requeued
     }
-
-    // Phase 3: Wake collected tasks
-    to_wake.wake_up();
-
-    woken + requeued
 }
 
 // =============================================================================
@@ -1004,10 +1076,6 @@ struct FutexWaitvEntry {
     uaddr: u64,
     /// Is this a private futex?
     is_private: bool,
-    /// Futex key (computed during setup)
-    key: FutexKey,
-    /// Was this entry woken?
-    woken: bool,
 }
 
 /// Linux futex_waitv syscall entry point
@@ -1121,21 +1189,21 @@ pub fn sys_futex_waitv(
             val: val as u32,
             uaddr,
             is_private,
-            key: FutexKey { ptr: 0, pid: 0 },
-            woken: false,
         });
     }
 
     // Call the main wait logic
-    futex_wait_multiple(&mut entries, timeout_ns, use_realtime)
+    futex_wait_multiple(&entries, timeout_ns, use_realtime)
 }
 
 /// Wait on multiple futexes - returns index of woken futex or error
 ///
-/// This implements the full Linux futex_waitv semantics with proper
-/// spurious wakeup handling via retry loop.
+/// Linux futex_wait_multiple: queue an entry on every futex whose word
+/// still holds its value, sleep until a waker dequeues one (or a signal
+/// or the deadline), then dequeue the rest. The entries live in one
+/// boxed slice, never moved while queued (dropping it dequeues them).
 fn futex_wait_multiple(
-    entries: &mut [FutexWaitvEntry],
+    entries: &[FutexWaitvEntry],
     timeout_ns: Option<u64>,
     use_realtime: bool,
 ) -> i32 {
@@ -1146,123 +1214,44 @@ fn futex_wait_multiple(
         return KernelError::WouldBlock.to_errno_neg();
     }
 
-    let (me, pid) = get_current_task_info();
+    // Fault every word in (a real EFAULT is reported here); they are
+    // read again under the bucket locks with faults disabled
+    for entry in entries {
+        if let Err(e) = read_user_u32(entry.uaddr) {
+            return e;
+        }
+    }
 
-    // Retry loop for spurious wakeups (following Linux pattern)
     loop {
-        // Phase 1: Compute futex keys for all entries
-        for entry in entries.iter_mut() {
-            entry.key = if entry.is_private {
-                FutexKey::private(entry.uaddr, pid)
-            } else {
-                FutexKey::shared(entry.uaddr)
-            };
-            entry.woken = false;
-        }
+        let qs: alloc::boxed::Box<[FutexQ]> = entries
+            .iter()
+            .map(|e| {
+                FutexQ::new(
+                    make_key(e.uaddr, e.is_private),
+                    futex_op::FUTEX_BITSET_MATCH_ANY,
+                )
+            })
+            .collect();
+        // SAFETY: the slice is not moved until dropped (Drop dequeues)
+        let pinned = |i: usize| unsafe { Pin::new_unchecked(&qs[i]) };
 
-        // Fault every word in (a real EFAULT is reported here); they are
-        // read again under the bucket locks with faults disabled
-        for entry in entries.iter() {
-            if let Err(e) = read_user_u32(entry.uaddr) {
-                return e;
+        // Queue on each futex in turn; a value mismatch or fault drops
+        // `qs`, dequeuing those already queued
+        for (i, e) in entries.iter().enumerate() {
+            let bucket = futex_bucket(&qs[i].key());
+            if let Err(err) = queue_if(bucket, pinned(i), e.uaddr, e.val) {
+                return err;
             }
         }
 
-        // Phase 2: Atomically check values and enqueue on all futexes
-        // First, increment waiter counts for all buckets
-        for entry in entries.iter() {
-            let bucket = futex_bucket(&entry.key);
-            bucket.inc_waiters();
-        }
+        let why = futex_sleep(|| qs.iter().all(|q| q.queued()), timeout_ns, use_realtime);
 
-        // Memory barrier: ensures waiter counts visible before value reads
-        core::sync::atomic::fence(Ordering::SeqCst);
-
-        // Check values and enqueue
-        let mut value_mismatch = false;
-        let mut enqueued_count = 0usize;
-
-        for entry in entries.iter() {
-            let bucket = futex_bucket(&entry.key);
-            let mut waiters = bucket.waiters.lock();
-
-            // Read futex value (faulted in before; EAGAIN if it is gone)
-            let current_val = match get_value_locked(entry.uaddr) {
-                Ok(v) => v,
-                Err(err) => {
-                    // Cleanup: unqueue all enqueued entries and decrement waiter counts
-                    drop(waiters);
-                    for (j, e) in entries.iter().enumerate() {
-                        let b = futex_bucket(&e.key);
-                        if j < enqueued_count {
-                            let mut w = b.waiters.lock();
-                            if let Some(pos) = w.iter().position(|q| q.is(me, &e.key)) {
-                                w.remove(pos);
-                            }
-                        }
-                        b.dec_waiters();
-                    }
-                    return err;
-                }
-            };
-
-            // If value doesn't match, we'll return EAGAIN after cleanup
-            if current_val != entry.val {
-                value_mismatch = true;
-                drop(waiters);
-                break;
-            }
-
-            // Value matches - enqueue ourselves
-            waiters.push(FutexQ::new(entry.key, futex_op::FUTEX_BITSET_MATCH_ANY));
-            enqueued_count += 1;
-        }
-
-        if value_mismatch {
-            // Cleanup: unqueue all enqueued entries and decrement waiter counts
-            for (j, e) in entries.iter().enumerate() {
-                let b = futex_bucket(&e.key);
-                if j < enqueued_count {
-                    let mut w = b.waiters.lock();
-                    if let Some(pos) = w.iter().position(|q| q.is(me, &e.key)) {
-                        w.remove(pos);
-                    }
-                }
-                b.dec_waiters();
-            }
-            return KernelError::WouldBlock.to_errno_neg(); // Same as -EWOULDBLOCK
-        }
-
-        // All values match and we're enqueued on all futexes: sleep until a
-        // waker dequeues us from any of them, a signal, or the deadline
-        let why = {
-            let entries_ref: &[FutexWaitvEntry] = entries;
-            let queued_all = || {
-                entries_ref.iter().all(|e| {
-                    futex_bucket(&e.key)
-                        .waiters
-                        .lock()
-                        .iter()
-                        .any(|q| q.is(me, &e.key))
-                })
-            };
-            futex_sleep(queued_all, timeout_ns, use_realtime)
-        };
-
-        // Dequeue from the futexes nobody woke us from
+        // Dequeue from the futexes nobody woke us from; the first one a
+        // waker dequeued is the result
         let mut woken_index: i32 = -1;
-        for (i, entry) in entries.iter_mut().enumerate() {
-            let bucket = futex_bucket(&entry.key);
-            let mut waiters = bucket.waiters.lock();
-            if let Some(pos) = waiters.iter().position(|q| q.is(me, &entry.key)) {
-                waiters.remove(pos);
-                bucket.dec_waiters();
-            } else {
-                // A waker dequeued us (and already dropped the count)
-                entry.woken = true;
-                if woken_index < 0 {
-                    woken_index = i as i32;
-                }
+        for (i, q) in qs.iter().enumerate() {
+            if !q.unqueue() && woken_index < 0 {
+                woken_index = i as i32;
             }
         }
 
@@ -1274,8 +1263,5 @@ fn futex_wait_multiple(
             FutexSleep::Signal => return KernelError::RestartSys.to_errno_neg(),
             FutexSleep::Woken => {}
         }
-
-        // Spurious wakeup - retry the entire operation
-        // (This follows Linux's futex_wait_multiple pattern)
     }
 }

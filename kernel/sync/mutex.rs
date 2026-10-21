@@ -66,7 +66,7 @@ impl<T> Mutex<T> {
         while !self.try_raw(me) {
             if can_sleep() {
                 self.wq
-                    .wait_event(|| self.owner.load(Ordering::Acquire) == UNLOCKED);
+                    .wait_event_exclusive(|| self.owner.load(Ordering::Acquire) == UNLOCKED);
             } else {
                 core::hint::spin_loop();
             }

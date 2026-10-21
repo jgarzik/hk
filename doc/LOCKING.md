@@ -252,7 +252,7 @@ Filesystem-internal locks (ramfs children/data, procfs data)
     ↓
 Leaves taken with no task lock held (their Arc is cloned out of the
 Task under TASKLIST first): UtsNamespace.name (RwLock), FsStruct.inner
-(Mutex), FutexHashBucket.waiters (IrqSpinlock; wakeups through a WakeQ
+(Mutex), FutexHashBucket.waiters (spin Mutex; wakeups through a WakeQ
 after unlocking)
     ↓
 Global subsystem locks (TASKLIST, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-safe;
@@ -1769,19 +1769,38 @@ nanoseconds), like Linux's `i_*time_sec` / `i_*time_nsec` fields:
 Linux-style wait queues (`include/linux/wait.h`, `kernel/sched/wait.c`).
 
 ```rust
-pub struct WaitQueue { head: IrqSpinlock<Vec<WaitQueueEntry>> } // -> pi_lock -> rq lock
+pub struct WaitQueue { head: IrqSpinlock<List<WaitEntry>> } // -> pi_lock -> rq lock
 
 // Sleeper side (process context, no spinlocks held)
 wq.wait_event(|| cond);                                  // uninterruptible
+wq.wait_event_exclusive(|| cond);                        // woken one at a time
 wq.wait_event_interruptible(|| cond)?;                   // Err(RestartSys) on signal
+wq.wait_event_killable(|| cond)?;                        // Err(Interrupted) on SIGKILL
 wq.wait_event_timeout(|| cond, ticks) -> u64;            // 0 = timed out
 wq.wait_event_interruptible_timeout(|| cond, ticks)?;    // Ok(left) / Err
-// open-coded: prepare_to_wait(&mut WaitEntry, state); check; schedule(); finish_wait
-// poll/select: add_poll_entry/remove_entry (non-autoremove registrations)
+// open-coded: let w = pin!(WaitEntry::new());
+//   prepare_to_wait(w.as_ref(), state); check; schedule(); finish_wait(w.as_ref())
+// poll/epoll: add_wait_queue/remove_wait_queue (entries with a wake function)
 
 // Waker side (any context, including IRQ handlers)
 wq.wake_one(); wq.wake_all();
 ```
+
+- **Entries are intrusive** (Linux wait_queue_entry): a `WaitEntry` is
+  pinned on the waiter's stack (a poll table pins its entries on the
+  heap), links into the queue's list, and records the queue it is on
+  (`wq`, written under the head lock). Dropping an entry unlinks it
+  under that lock, so every way out of a wait (signal, error, panic)
+  leaves nothing behind; the queue outlives its entries. A waker that
+  removes an entry clears its `wq` last (Release); `finish_wait` sees
+  it clear (Acquire) and skips the lock, and the waker no longer
+  touches the entry (Linux list_del_init_careful).
+- **Wakeup** (Linux __wake_up_common): `wake_one` wakes every
+  non-exclusive entry and the first exclusive one whose wake succeeds
+  (`wake_up`); `wake_all` wakes all. An entry's wake function (poll's
+  `pollwake`, flagging its table) replaces the default task wakeup and
+  runs under the head lock; autoremove entries are unlinked once woken.
+  `sync::Mutex` and `Completion` wait exclusively.
 
 - **IRQ class:** the head lock is an `IrqSpinlock`; like Linux
   `__wake_up_common`, tasks are woken under it (`try_to_wake_up`: the
@@ -1790,13 +1809,14 @@ wq.wake_one(); wq.wake_all();
   else nests inside it. Wakers never take `TASKLIST` and never allocate
   (no waiter list is collected; run queues are intrusive), so `wake_*`
   is safe from IRQ handlers. An entry names its task by pointer: the
-  sleeper unregisters before it can go away. Registration (`prepare_to_wait`) pushes under the head lock
-  in thread context only.
+  sleeper unregisters before it can go away. Registration
+  (`prepare_to_wait`) links under the head lock in thread context only.
 - **No lost wakeups:** the sleeper registers and sets its state before
   re-checking the condition (see 3.1 Sleep / Wakeup Protocol). Wakers must
   make the condition true before calling `wake_*`.
 - **Autoremove:** a woken entry is removed by the waker; `finish_wait`
-  removes it otherwise. Poll entries stay until the poll ends.
+  (or the entry's drop) removes it otherwise. Poll entries stay until
+  the poll ends.
 - `wait_event_interruptible_deadline` takes a CLOCK_MONOTONIC deadline.
   Wakers of queues shared by waiters with different conditions (SysV
   sem/msg, mqueue, sockets) use `wake_all`: a `wake_one` could pick a
@@ -2262,16 +2282,17 @@ primitives. It uses a hash bucket design similar to Linux's `futex_queues`.
 | Variable | Type | Purpose |
 |----------|------|---------|
 | `FUTEX_HASH_TABLE` | `[FutexHashBucket; 256]` | Hash buckets for waiters |
-| `FutexHashBucket.waiters` | `IrqSpinlock<Vec<FutexQ>>` | Per-bucket waiter list |
+| `FutexHashBucket.waiters` | `sync::spin::Mutex<List<FutexQ>>` | Per-bucket waiter list (intrusive; entries pinned on the waiters' stacks) |
 | `FutexHashBucket.waiter_count` | `AtomicU32` | Fast-path check for waiters |
 | `Task.robust_list` | `u64` under TASKLIST | Per-task robust list head |
 
-#### Why IrqSpinlock for Bucket Waiters
+#### Why a Plain Spin Lock for Bucket Waiters
 
-Futex operations run in syscall context only; the bucket lock is an
-`IrqSpinlock` because wakers dequeue under it and then use the IRQ-safe
-wake path, and so that a timer or IPI on the same CPU never spins on a
-holder it interrupted. It is a leaf.
+Futex operations run in thread context only (syscalls, task exit); the
+bucket lock is a `sync::spin::Mutex` (Linux hb->lock, a spinlock_t):
+no interrupt handler takes it, and wakeups are issued after it is
+dropped (WakeQ). It is a leaf but for a requeue, which nests two
+buckets in address order.
 
 #### Memory Barrier Pattern (Linux-style)
 
@@ -2300,17 +2321,24 @@ Neither thread can miss the other's update.
 #### Lock Ordering
 
 ```
-FutexHashBucket.waiters (IrqSpinlock): leaf. Wakers dequeue FutexQ entries
-under it into a WakeQ (a reference to each task, Linux wake_q_add), drop
-it, then wake them (`WakeQ::wake_up` -> try_to_wake_up; no TASKLIST).
-A waiter that sees itself dequeued may return at once: the WakeQ's
-reference keeps its task alive for the wakeup.
+FutexHashBucket.waiters (spin Mutex): leaf (two in address order for a
+requeue). Wakers dequeue FutexQ entries under it into a WakeQ (a
+reference to each task, Linux wake_q_add), drop it, then wake them
+(`WakeQ::wake_up` -> try_to_wake_up; no TASKLIST).
 ```
 
-Waiters sleep with the Sleep / Wakeup Protocol (section 3.1): state set to
-Interruptible, then "still queued?" re-checked under the bucket lock, then
-`schedule_timeout`. A waker that dequeued the entry is the wake; signal or
-timeout dequeue the entry themselves.
+A `FutexQ` (Linux futex_q) is pinned on the waiter's stack and linked
+into its bucket. Its `lock_ptr` names the bucket it is on: set under
+that bucket's lock, moved by a requeue under both buckets' locks,
+cleared by the waker that dequeues it as its last touch of the entry
+(Release). The waiter sleeps (Sleep / Wakeup Protocol, 3.1) until it
+sees `lock_ptr` clear (Acquire), a signal or its deadline; then
+`unqueue` (Linux futex_unqueue) locks the bucket `lock_ptr` names,
+re-checks it under that lock (a requeue may have moved the entry:
+retry) and unlinks the entry; finding it clear means a waker dequeued
+it (the wait succeeded). The entry's drop unqueues it too. So a
+requeued waiter keeps sleeping on the new futex, and no bucket ever
+holds an entry whose waiter returned.
 
 For `futex_requeue()` with two different buckets:
 - Lock buckets in address order (lower pointer address first)
@@ -2326,7 +2354,7 @@ Robust futexes are cleaned up during task exit via `exit_robust_list()`:
 
 #### Key Rules
 
-1. **Bucket lock is IRQ-safe** - Interrupts off while held (a leaf)
+1. **Bucket lock is a plain spin lock** - thread context only (a leaf)
 2. **Memory barriers before userspace access** - Prevents lost wakeups
 3. **Bucket lock is a leaf** - wakeups are issued after dropping it
 4. **Multi-bucket operations use address ordering** - Prevents deadlock

@@ -34,6 +34,7 @@ pub mod frag;
 pub mod fs_common;
 pub mod fs_ops;
 pub mod futex;
+pub mod futex_requeue;
 pub mod group_exit;
 pub mod helpers;
 pub mod icmp;
@@ -187,6 +188,7 @@ pub fn run_all_tests() {
     sockopts::run_tests();
     nonblock::run_tests();
     futex::run_tests();
+    futex_requeue::run_tests();
     timerfd::run_tests();
     posix_timer::run_tests();
     xattr::run_tests();

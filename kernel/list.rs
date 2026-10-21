@@ -181,6 +181,18 @@ impl<A: Adapter> List<A> {
         (!self.head.is_null()).then(|| unsafe { A::item(self.head) })
     }
 
+    /// The item after `item` (Linux list_next_entry), read before
+    /// `item` is removed when walking and unlinking
+    ///
+    /// # Safety
+    /// `item` is on this list.
+    pub unsafe fn next(&self, item: *const A::Item) -> Option<*const A::Item> {
+        // SAFETY: `item` is a live entry of this list
+        let n = unsafe { (*Self::lk(item)).next.load(Relaxed) };
+        // SAFETY: a non-null next is an entry's link
+        (!n.is_null()).then(|| unsafe { A::item(n) })
+    }
+
     /// Remove and return the first item (Linux list_first_entry +
     /// list_del)
     pub fn pop_front(&mut self) -> Option<*const A::Item> {
