@@ -190,9 +190,9 @@ check: $(call nobuild,iso disk-image)
 		echo "Boot test FAILED - 'Powering off' not found in serial log:"; \
 		cat $(SERIAL_LOG); \
 		exit 1; \
-	elif grep -q "FAIL" $(SERIAL_LOG); then \
-		echo "Boot test FAILED - test failures detected:"; \
-		grep "FAIL" $(SERIAL_LOG); \
+	elif grep -qE "FAIL|KERNEL PANIC" $(SERIAL_LOG); then \
+		echo "Boot test FAILED - test failures or a panic detected:"; \
+		grep -E "FAIL|KERNEL PANIC" $(SERIAL_LOG); \
 		exit 1; \
 	else \
 		echo "Boot test PASSED"; \
@@ -231,9 +231,9 @@ check-arm: $(call nobuild,build-arm vfat-image disk-image)
 		echo "ARM Boot test FAILED - shutdown message not found in serial log:"; \
 		cat $(SERIAL_LOG_ARM); \
 		exit 1; \
-	elif grep -q "FAIL" $(SERIAL_LOG_ARM); then \
-		echo "ARM Boot test FAILED - test failures detected:"; \
-		grep "FAIL" $(SERIAL_LOG_ARM); \
+	elif grep -qE "FAIL|KERNEL PANIC" $(SERIAL_LOG_ARM); then \
+		echo "ARM Boot test FAILED - test failures or a panic detected:"; \
+		grep -E "FAIL|KERNEL PANIC" $(SERIAL_LOG_ARM); \
 		exit 1; \
 	else \
 		echo "ARM Boot test PASSED"; \
