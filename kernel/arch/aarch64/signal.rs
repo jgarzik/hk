@@ -221,9 +221,17 @@ pub const fn signal_frame_size() -> usize {
 /// SS_DISABLE flag for stack_t
 const SS_DISABLE: i32 = 2;
 
-/// PSTATE bits user code may set through rt_sigreturn: NZCV, SSBS, BTYPE,
-/// DIT, TCO. Mode (EL0t), DAIF and everything else are forced to 0.
-const PSTATE_USER_MASK: u64 = 0xF000_0000 | (1 << 12) | (3 << 10) | (1 << 24) | (1 << 25);
+/// PSTATE bits user code may set through rt_sigreturn (Linux
+/// valid_native_regs): NZCV, SS (single step), SSBS, BTYPE, DIT, TCO.
+/// Mode (EL0t), DAIF and everything else are forced to 0.
+const PSTATE_USER_MASK: u64 =
+    0xF000_0000 | PSTATE_SS | (1 << 12) | PSTATE_BTYPE | (1 << 24) | (1 << 25);
+
+/// PSTATE.SS: software step pending
+const PSTATE_SS: u64 = 1 << 21;
+
+/// PSTATE.BTYPE: the branch type of the last indirect branch (BTI)
+const PSTATE_BTYPE: u64 = 3 << 10;
 
 /// Set up signal frame on user stack
 ///
@@ -376,6 +384,9 @@ pub fn setup_rt_frame(
     // setup_return)
     regs.sp = frame_addr;
     regs.elr = handler;
+    // The handler is not entered by an indirect branch (Linux
+    // setup_return clears BTYPE)
+    regs.spsr &= !PSTATE_BTYPE;
     regs.x[0] = sig as u64; // x0 = signal number
     regs.x[1] = info_addr; // x1 = &siginfo
     regs.x[2] = uc_addr; // x2 = &ucontext
