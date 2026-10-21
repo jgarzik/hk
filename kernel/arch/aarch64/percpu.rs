@@ -18,6 +18,10 @@ pub struct PerCpu {
     /// Self-pointer for TPIDR_EL1 access
     pub self_ptr: *mut PerCpu,
 
+    /// Top of this CPU's overflow stack (vectors.S `el1_stack_overflow`
+    /// loads it at offset 8), 0 until `smp::init`
+    pub overflow_stack: u64,
+
     /// Logical CPU ID (0 = BSP, 1+ = APs)
     pub cpu_id: u32,
 
@@ -40,103 +44,14 @@ pub struct PerCpu {
     /// `task::percpu::INIT_TASK`), set by the scheduler at each switch
     pub curr: AtomicUsize,
 
-    /// Flag set by timer interrupt to request reschedule
-    pub needs_reschedule: AtomicBool,
-
     /// Nesting depth of interrupt handlers
     pub interrupt_depth: AtomicU32,
 
     /// Preemption count - tracks nested critical sections
     pub preempt_count: AtomicU32,
-
-    /// Saved user ELR from syscall entry
-    pub syscall_user_elr: u64,
-
-    /// Saved user SPSR from syscall entry
-    pub syscall_user_spsr: u64,
-
-    /// Saved user SP from syscall entry
-    pub syscall_user_sp: u64,
-
-    /// Saved user GPRs x0-x30 from syscall entry (for fork/clone)
-    pub syscall_user_regs: [u64; 31],
-
-    /// Original x0 of the syscall in progress (x0 is overwritten by the
-    /// return value; needed to restart the syscall after -ERESTART*)
-    pub syscall_orig_x0: u64,
-
-    /// Flag set when signal delivery modifies the return context
-    /// When true, the syscall return path should update the stack frame from percpu
-    pub signal_context_modified: bool,
-
-    /// Trap frame of the current task's last entry from EL0 (top of its
-    /// kernel stack): holds its user FP/SIMD state while it is in the kernel
-    pub user_frame: *mut super::Aarch64TrapFrame,
 }
 
-/// Snapshot of the per-CPU syscall user-register block
-///
-/// The block describes the *current task's* syscall, but lives in per-CPU
-/// data; the scheduler saves it on the outgoing task's kernel stack around
-/// every context switch so a task that slept inside a syscall still returns
-/// (and builds signal frames) with its own registers.
-#[derive(Clone, Copy)]
-pub struct SyscallUserState {
-    elr: u64,
-    spsr: u64,
-    sp: u64,
-    regs: [u64; 31],
-    orig_x0: u64,
-    modified: bool,
-    user_frame: *mut super::Aarch64TrapFrame,
-}
-
-/// Capture the syscall user-register block of this CPU
-pub fn save_syscall_user_state() -> SyscallUserState {
-    let p = unsafe { current_cpu_mut() };
-    SyscallUserState {
-        elr: p.syscall_user_elr,
-        spsr: p.syscall_user_spsr,
-        sp: p.syscall_user_sp,
-        regs: p.syscall_user_regs,
-        orig_x0: p.syscall_orig_x0,
-        modified: p.signal_context_modified,
-        user_frame: p.user_frame,
-    }
-}
-
-/// Restore a block captured by [`save_syscall_user_state`]
-pub fn restore_syscall_user_state(s: &SyscallUserState) {
-    let p = unsafe { current_cpu_mut() };
-    p.syscall_user_elr = s.elr;
-    p.syscall_user_spsr = s.spsr;
-    p.syscall_user_sp = s.sp;
-    p.syscall_user_regs = s.regs;
-    p.syscall_orig_x0 = s.orig_x0;
-    p.signal_context_modified = s.modified;
-    p.user_frame = s.user_frame;
-}
-
-/// The current task's user trap frame (see `PerCpu::user_frame`)
-///
-/// # Safety
-/// Only meaningful in process context of a task that entered from EL0.
-pub fn current_user_frame() -> Option<&'static mut super::Aarch64TrapFrame> {
-    let p = try_current_cpu()?;
-    unsafe { p.user_frame.as_mut() }
-}
-
-/// Arrange for the current syscall to be re-executed on return to user
-/// (-ERESTART* with no handler, or SA_RESTART): back ELR up over the `svc`
-/// and restore the original x0 (x8 still holds the syscall number). Returns
-/// the value x0 must hold on return.
-pub fn syscall_restart() -> u64 {
-    let p = unsafe { current_cpu_mut() };
-    p.syscall_user_elr = p.syscall_user_elr.wrapping_sub(4);
-    p.syscall_user_regs[0] = p.syscall_orig_x0;
-    p.signal_context_modified = true;
-    p.syscall_orig_x0
-}
+const _: () = assert!(core::mem::offset_of!(PerCpu, overflow_stack) == 8);
 
 // Safety: PerCpu is only accessed by its owning CPU
 unsafe impl Send for PerCpu {}
@@ -147,6 +62,7 @@ impl PerCpu {
     pub const fn uninit() -> Self {
         Self {
             self_ptr: core::ptr::null_mut(),
+            overflow_stack: 0,
             cpu_id: 0,
             mpidr: 0,
             is_bsp: false,
@@ -154,16 +70,8 @@ impl PerCpu {
             kernel_stack_top: 0,
             ticks: AtomicU64::new(0),
             curr: AtomicUsize::new(0),
-            needs_reschedule: AtomicBool::new(false),
             interrupt_depth: AtomicU32::new(0),
             preempt_count: AtomicU32::new(0),
-            syscall_user_elr: 0,
-            syscall_user_spsr: 0,
-            syscall_user_sp: 0,
-            syscall_user_regs: [0; 31],
-            syscall_orig_x0: 0,
-            signal_context_modified: false,
-            user_frame: core::ptr::null_mut(),
         }
     }
 
@@ -176,15 +84,8 @@ impl PerCpu {
         self.kernel_stack_top = kernel_stack_top;
         self.ticks.store(0, Ordering::Relaxed);
         self.curr.store(0, Ordering::Relaxed);
-        self.needs_reschedule.store(false, Ordering::Relaxed);
         self.interrupt_depth.store(0, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
-        self.syscall_user_elr = 0;
-        self.syscall_user_spsr = 0;
-        self.syscall_user_sp = 0;
-        self.syscall_user_regs = [0; 31];
-        self.signal_context_modified = false;
-        self.user_frame = core::ptr::null_mut();
     }
 
     /// Mark this CPU as online
@@ -244,6 +145,14 @@ pub fn tpidr_ok(_val: u64) -> bool {
     true
 }
 
+/// No user GS base on arm64 (x86-64 `read_user_gsbase`)
+pub fn read_user_gsbase() -> u64 {
+    0
+}
+
+/// No user GS base on arm64 (x86-64 `write_user_gsbase`)
+pub fn write_user_gsbase(_addr: u64) {}
+
 /// Read the TPIDR_EL0 register (user TLS pointer)
 #[inline]
 pub fn read_tpidr_el0() -> u64 {
@@ -262,16 +171,6 @@ pub fn read_tpidr_el0() -> u64 {
 pub fn get_percpu(cpu_id: u32) -> &'static mut PerCpu {
     assert!((cpu_id as usize) < MAX_CPUS, "CPU ID out of range");
     unsafe { &mut PERCPU_ARRAY[cpu_id as usize] }
-}
-
-/// Get a mutable reference to the current CPU's per-CPU data
-///
-/// # Safety
-/// The TPIDR_EL1 must have been set up correctly.
-#[inline]
-pub unsafe fn current_cpu_mut() -> &'static mut PerCpu {
-    let ptr = read_tpidr_el1() as *mut PerCpu;
-    unsafe { &mut *ptr }
 }
 
 /// Try to get current CPU data (returns None if TPIDR_EL1 not set up)
@@ -380,40 +279,4 @@ pub fn preempt_count() -> u32 {
     try_current_cpu()
         .map(|percpu| percpu.preempt_count.load(Ordering::Relaxed))
         .unwrap_or(0)
-}
-
-// ============================================================================
-// Syscall user state accessors (for signal handling)
-// ============================================================================
-
-/// Get saved syscall user ELR (return address/PC)
-#[inline]
-pub fn get_syscall_user_elr() -> u64 {
-    try_current_cpu()
-        .map(|percpu| percpu.syscall_user_elr)
-        .unwrap_or(0)
-}
-
-/// Get saved syscall user SPSR (processor state)
-#[inline]
-pub fn get_syscall_user_spsr() -> u64 {
-    try_current_cpu()
-        .map(|percpu| percpu.syscall_user_spsr)
-        .unwrap_or(0)
-}
-
-/// Get saved syscall user SP (stack pointer)
-#[inline]
-pub fn get_syscall_user_sp() -> u64 {
-    try_current_cpu()
-        .map(|percpu| percpu.syscall_user_sp)
-        .unwrap_or(0)
-}
-
-/// Get saved syscall user registers (x0-x30)
-#[inline]
-pub fn get_syscall_user_regs() -> [u64; 31] {
-    try_current_cpu()
-        .map(|percpu| percpu.syscall_user_regs)
-        .unwrap_or([0; 31])
 }

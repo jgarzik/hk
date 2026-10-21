@@ -52,17 +52,12 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
 
     // Initialize BSP per-CPU data
     // Note: percpu uses u8 APIC ID for xAPIC compatibility
-    let bsp_stack = cpu::get_kernel_stack();
-    percpu::init_bsp(bsp_apic_id as u8, bsp_stack);
+    percpu::init_bsp(bsp_apic_id as u8);
     printkln!("SMP_CPU_ONLINE: cpu=0 apic={}", bsp_apic_id);
 
     // Enable LAPIC on BSP; legacy PIC interrupts are delivered to it
     lapic.enable();
     lapic.enable_pic_virtual_wire();
-
-    // Save kernel's GDT and IDT for APs to use
-    cpu::save_kernel_gdt_for_aps();
-    cpu::save_kernel_idt_for_aps();
 
     // APs enable paging on the trampoline table (low identity map +
     // kernel half), then switch to the kernel table in ap_entry
@@ -97,6 +92,11 @@ pub fn init<F: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F)
             continue;
         }
         let stack_top = stack_base + AP_STACK_SIZE as u64;
+        // Its IST stacks, in its TSS before it loads it
+        if !cpu::alloc_ist(cpu_id, frame_alloc) {
+            printkln!("SMP: Failed to allocate IST stacks for CPU {}", cpu_id);
+            continue;
+        }
 
         // Set up trampoline data for this AP
         unsafe {
@@ -281,26 +281,20 @@ pub fn enable_ap_scheduling() {
 /// This is called directly from assembly with the CPU in a partially
 /// initialized state.
 #[unsafe(no_mangle)]
-pub extern "C" fn ap_entry(_cpu_id: u32, apic_id: u32) -> ! {
+pub extern "C" fn ap_entry(boot_cpu_id: u32, apic_id: u32) -> ! {
     // Leave the trampoline table (with its low identity map)
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) super::kmap::swapper_phys(), options(nostack));
     }
 
-    // Load the kernel's GDT (AP is using trampoline's minimal GDT)
-    cpu::reload_gdt();
+    // Its own GDT and TSS (the AP runs on the trampoline's minimal
+    // GDT), then the shared IDT
+    cpu::load_tables(boot_cpu_id);
+    super::interrupts::load_idt();
 
-    // Load the kernel's IDT
-    cpu::reload_idt();
-
-    // Get the stack top from our current RSP (set by trampoline)
-    let kernel_stack: u64;
-    unsafe {
-        ::core::arch::asm!("mov {}, rsp", out(reg) kernel_stack);
-    }
-
-    // Per-CPU data first: everything after it may use cpu::this_id()
-    let cpu_id = percpu::init_ap(apic_id as u8, kernel_stack);
+    // Per-CPU data next: everything after it may use cpu::this_id()
+    let cpu_id = percpu::init_ap(apic_id as u8);
+    debug_assert_eq!(cpu_id, boot_cpu_id);
 
     // Same FP/SIMD setup as the BSP (CR4.OSXSAVE/XCR0 are per CPU)
     super::fpu::init_cpu(false);

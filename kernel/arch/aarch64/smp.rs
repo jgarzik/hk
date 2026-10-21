@@ -5,16 +5,12 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::kmap::pa_symbol;
-use super::paging::phys_to_virt;
 use super::{cpu, exceptions, gic, percpu, power, timer};
 use crate::arch::{AcpiInfo, FrameAlloc};
 use crate::printkln;
 
 /// Stack size per AP (16KB)
-const AP_STACK_SIZE: usize = 16 * 1024;
-
-/// Page size
-const PAGE_SIZE: usize = 4096;
+const AP_STACK_SIZE: usize = crate::mm::vmstack::THREAD_SIZE;
 
 /// Data passed to AP during startup
 ///
@@ -65,7 +61,7 @@ unsafe extern "C" {
 }
 
 /// Initialize SMP - bring up all APs
-pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut FA) -> usize {
+pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, _frame_alloc: &mut FA) -> usize {
     let bsp_mpidr = cpu::read_mpidr();
     let bsp_cpu_id = (bsp_mpidr & 0xFF) as u32;
 
@@ -79,6 +75,7 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F
 
     // Initialize BSP per-CPU data
     percpu::init_bsp(bsp_mpidr, bsp_stack_top);
+    set_overflow_stack(0);
 
     // Test PSCI is working
     let psci_ver = power::psci_version();
@@ -103,16 +100,15 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F
             break;
         }
 
-        // Allocate stack for this AP
-        let stack_base = match allocate_ap_stack(frame_alloc) {
-            Some(base) => base,
-            None => {
-                printkln!(
-                    "SMP: Failed to allocate stack for CPU {}",
-                    cpu_info.hw_cpu_id
-                );
-                continue;
-            }
+        // Allocate stack for this AP (aligned like every EL1 stack:
+        // vectors.S KERNEL_ENTRY), and its overflow stack
+        let Some(stack_base) = crate::mm::vmstack::alloc().filter(|_| set_overflow_stack(cpu_id))
+        else {
+            printkln!(
+                "SMP: Failed to allocate stack for CPU {}",
+                cpu_info.hw_cpu_id
+            );
+            continue;
         };
         let stack_top = stack_base + AP_STACK_SIZE as u64;
 
@@ -169,13 +165,15 @@ pub fn init<FA: FrameAlloc<PhysAddr = u64>>(acpi: &AcpiInfo, frame_alloc: &mut F
     total
 }
 
-/// Allocate stack for an AP (physically contiguous, through the linear
-/// map); its virtual base
-fn allocate_ap_stack<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) -> Option<u64> {
-    let phys = frame_alloc.alloc_contig(AP_STACK_SIZE / PAGE_SIZE)?;
-    let base = phys_to_virt(phys);
-    unsafe { core::ptr::write_bytes(base, 0, AP_STACK_SIZE) };
-    Some(base as u64)
+/// Give CPU `cpu` (not running yet, or the caller) the stack a kernel
+/// stack overflow continues on (vectors.S `el1_stack_overflow`); false
+/// if out of memory
+fn set_overflow_stack(cpu: u32) -> bool {
+    let Some(base) = crate::mm::vmstack::alloc() else {
+        return false;
+    };
+    percpu::get_percpu(cpu).overflow_stack = base + crate::mm::vmstack::THREAD_SIZE as u64;
+    true
 }
 
 /// Wait for an AP to signal ready using spin loop

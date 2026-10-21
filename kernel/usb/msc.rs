@@ -240,11 +240,13 @@ impl UsbMscDevice {
         let bulk_out = self.bulk_out_ep & 0x0F;
         let bulk_in = self.bulk_in_ep & 0x0F;
 
-        // Phase 1: Send CBW
+        // Phase 1: Send CBW (CBW and CSW buffers on the heap: the
+        // controller DMAs them, never from a kernel stack; Linux
+        // us->iobuf)
         let cbw = Cbw::new(tag, data_len, direction, lun, cdb);
-        let cbw_bytes = cbw.as_bytes();
+        let cbw_bytes = Box::new(cbw.as_bytes());
 
-        usb_bulk_out(slot_id, bulk_out, &cbw_bytes).map_err(usb_to_scsi_error)?;
+        usb_bulk_out(slot_id, bulk_out, &cbw_bytes[..]).map_err(usb_to_scsi_error)?;
 
         // Phase 2: Data transfer (if any)
         let mut transferred = 0usize;
@@ -262,8 +264,8 @@ impl UsbMscDevice {
         }
 
         // Phase 3: Receive CSW
-        let mut csw_bytes = [0u8; Csw::SIZE];
-        usb_bulk_in(slot_id, bulk_in, &mut csw_bytes).map_err(usb_to_scsi_error)?;
+        let mut csw_bytes = Box::new([0u8; Csw::SIZE]);
+        usb_bulk_in(slot_id, bulk_in, &mut csw_bytes[..]).map_err(usb_to_scsi_error)?;
 
         let csw = Csw::from_bytes(&csw_bytes);
 

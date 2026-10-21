@@ -127,108 +127,36 @@ extern "C" fn kernel_thread_exit(_status: i64) {
     }
 }
 
-/// Entry point for cloned threads/processes
+/// Entry point for cloned threads/processes (Linux ret_from_fork)
 ///
-/// This function is the initial "return" target when switching to a new
-/// clone/fork child. The child's kernel stack has a TrapFrame at the top.
-/// We restore the trap frame and ERET to user mode.
+/// The initial "return" target of a clone/fork child's first switch: SP
+/// is its pt_regs (a copy of the parent's syscall frame, x0 = 0, the
+/// FP/SIMD state included) at the top of its kernel stack. The switch
+/// loaded its address space and TLS register.
 #[unsafe(naked)]
 pub extern "C" fn clone_child_entry() -> ! {
     core::arch::naked_asm!(
-        // First, release the scheduler lock that was held during context switch
-        // (the switch loaded the child's TTBR0: mm::tlb::switch_mm)
+        // Release the scheduler lock held across the switch
         "bl {finish_switch}",
         // IRQs on, as in any syscall (Linux ret_from_fork): the
         // child-TID write may fault and sleep
         "msr daifclr, #2",
-
-        // Write child TID if CLONE_CHILD_SETTID was used (for fork)
         "bl {write_child_tid}",
-
-        // Get and load the child's TLS (TPIDR_EL0)
-        // This handles CLONE_SETTLS - if no TLS was set, get_tls returns 0
-        "bl {get_tls}",
-        // X0 now contains the TLS value (or 0 if not set)
-        // TPIDR_EL0 is the user TLS pointer register
-        "msr tpidr_el0, x0",
-        // IRQs off for the return: ELR/SPSR_EL1 are loaded below
-        "msr daifset, #2",
-
-        // SP points to the TrapFrame we prepared on the child's kernel stack
-        // TrapFrame layout (Aarch64TrapFrame, 0x320 bytes):
-        //   sp+0x000: x0-x30 (31 * 8 = 248 bytes)
-        //   sp+0x0f8: sp
-        //   sp+0x100: elr
-        //   sp+0x108: spsr
-        //   sp+0x110: fpsr, sp+0x114: fpcr
-        //   sp+0x120: q0-q31 (inherited from the parent)
-
-        "ldp q0, q1, [sp, #0x120]",
-        "ldp q2, q3, [sp, #0x140]",
-        "ldp q4, q5, [sp, #0x160]",
-        "ldp q6, q7, [sp, #0x180]",
-        "ldp q8, q9, [sp, #0x1a0]",
-        "ldp q10, q11, [sp, #0x1c0]",
-        "ldp q12, q13, [sp, #0x1e0]",
-        "ldp q14, q15, [sp, #0x200]",
-        "ldp q16, q17, [sp, #0x220]",
-        "ldp q18, q19, [sp, #0x240]",
-        "ldp q20, q21, [sp, #0x260]",
-        "ldp q22, q23, [sp, #0x280]",
-        "ldp q24, q25, [sp, #0x2a0]",
-        "ldp q26, q27, [sp, #0x2c0]",
-        "ldp q28, q29, [sp, #0x2e0]",
-        "ldp q30, q31, [sp, #0x300]",
-        "ldr w0, [sp, #0x110]",
-        "msr fpsr, x0",
-        "ldr w0, [sp, #0x114]",
-        "msr fpcr, x0",
-
-        // Restore SPSR_EL1
-        "ldr x0, [sp, #0x108]",
-        "msr spsr_el1, x0",
-
-        // Restore ELR_EL1
-        "ldr x0, [sp, #0x100]",
-        "msr elr_el1, x0",
-
-        // Restore SP_EL0 (user stack - not the kernel stack!)
-        // Note: TrapFrame.sp is SP_EL0 for user exceptions
-        "ldr x0, [sp, #0xf8]",
-        "msr sp_el0, x0",
-
-        // Restore x30 (LR)
-        "ldr x30, [sp, #0xf0]",
-
-        // Restore x1-x29 (x0 last since we're using it as scratch)
-        "ldp x28, x29, [sp, #0xe0]",
-        "ldp x26, x27, [sp, #0xd0]",
-        "ldp x24, x25, [sp, #0xc0]",
-        "ldp x22, x23, [sp, #0xb0]",
-        "ldp x20, x21, [sp, #0xa0]",
-        "ldp x18, x19, [sp, #0x90]",
-        "ldp x16, x17, [sp, #0x80]",
-        "ldp x14, x15, [sp, #0x70]",
-        "ldp x12, x13, [sp, #0x60]",
-        "ldp x10, x11, [sp, #0x50]",
-        "ldp x8, x9, [sp, #0x40]",
-        "ldp x6, x7, [sp, #0x30]",
-        "ldp x4, x5, [sp, #0x20]",
-        "ldp x2, x3, [sp, #0x10]",
-        // x0 will be 0 (child return value from fork/clone)
-        // x1 is restored here too
-        "ldp x0, x1, [sp, #0x00]",
-
-        // Deallocate frame (but we won't return to kernel, so this just cleans up)
-        "add sp, sp, #0x320",
-
-        // Return to user mode
-        "eret",
-
+        // The work of a syscall's return, on the child's pt_regs (SP)
+        "mov x0, sp",
+        "bl {exit_work}",
+        // Out through the child's pt_regs (ret_to_user masks DAIF)
+        "b ret_to_user",
         finish_switch = sym finish_context_switch,
         write_child_tid = sym crate::task::percpu::write_child_tid_if_needed,
-        get_tls = sym crate::task::percpu::get_current_task_tls,
+        exit_work = sym ret_from_fork,
     );
+}
+
+/// A fork child's first return to user mode: the work of a syscall's
+/// return (Linux ret_from_fork -> syscall_exit_to_user_mode)
+extern "C" fn ret_from_fork(regs: &mut super::Aarch64TrapFrame) {
+    crate::entry::syscall_exit_to_user_mode(regs);
 }
 
 /// Switch from the current task context to a new task context

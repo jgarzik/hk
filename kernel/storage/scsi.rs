@@ -3,6 +3,7 @@
 //! Provides SCSI command structures, CDB builders, and the ScsiHost trait
 //! that transport drivers (SAT, USB Mass Storage) implement.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 /// SCSI operation codes
@@ -363,9 +364,10 @@ pub fn test_unit_ready(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiRes
     Ok(())
 }
 
-/// Execute INQUIRY and return response data
+/// Execute INQUIRY and return response data (read into the heap: the
+/// transport may DMA it, never from a kernel stack)
 pub fn inquiry(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiResult<InquiryData> {
-    let mut data = InquiryData {
+    let mut data = Box::new(InquiryData {
         peripheral: 0,
         rmb: 0,
         version: 0,
@@ -375,37 +377,38 @@ pub fn inquiry(host: &Arc<dyn ScsiHost>, target: u8, lun: u8) -> ScsiResult<Inqu
         vendor: [0; 8],
         product: [0; 16],
         revision: [0; 4],
-    };
+    });
 
     let cmd = ScsiCommand::read(
         Cdb::inquiry(36),
-        &mut data as *mut InquiryData as *mut u8,
+        &mut *data as *mut InquiryData as *mut u8,
         36,
         5000,
     );
 
     host.execute(target, lun, &cmd)?;
-    Ok(data)
+    Ok(*data)
 }
 
-/// Execute READ CAPACITY(10) and return capacity data
+/// Execute READ CAPACITY(10) and return capacity data (heap buffer, as
+/// for `inquiry`)
 pub fn read_capacity(
     host: &Arc<dyn ScsiHost>,
     target: u8,
     lun: u8,
 ) -> ScsiResult<ReadCapacityData> {
-    let mut data = ReadCapacityData {
+    let mut data = Box::new(ReadCapacityData {
         last_lba: [0; 4],
         block_length: [0; 4],
-    };
+    });
 
     let cmd = ScsiCommand::read(
         Cdb::read_capacity_10(),
-        &mut data as *mut ReadCapacityData as *mut u8,
+        &mut *data as *mut ReadCapacityData as *mut u8,
         8,
         5000,
     );
 
     host.execute(target, lun, &cmd)?;
-    Ok(data)
+    Ok(*data)
 }

@@ -2,6 +2,16 @@
 //!
 //! This module provides per-CPU data storage accessed via the GS segment.
 //! Each CPU has its own `PerCpu` structure containing CPU-local state.
+//!
+//! GS follows Linux's SWAPGS model: in the kernel MSR_GS_BASE holds this
+//! CPU's `PerCpu` and MSR_KERNEL_GS_BASE the user's GS base; every entry
+//! from user mode (syscall, IDT stubs when the saved CS is a user
+//! selector) runs `swapgs` first and every return to user mode runs it
+//! last, so user code has its own GS base (`mov gs`, ARCH_SET_GS) and
+//! can never redirect the kernel's. NMI, #DF and #MC may arrive in the
+//! instructions around those swaps: their (paranoid) entries read
+//! MSR_GS_BASE instead (a kernel address is negative; a user one is
+//! below TASK_SIZE).
 
 use ::core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -17,6 +27,15 @@ pub struct PerCpu {
     /// Self-pointer for GS:0 access
     pub self_ptr: *mut PerCpu,
 
+    /// Top of the current task's kernel stack: `syscall_entry` switches
+    /// to it (Linux cpu_current_top_of_stack); set with TSS.RSP0 at
+    /// every switch to a user task
+    pub top_of_stack: u64,
+
+    /// The user RSP while `syscall_entry` switches stacks (Linux
+    /// cpu_tss_rw.x86_tss.sp2 scratch)
+    pub user_rsp: u64,
+
     /// Logical CPU ID (0 = BSP, 1+ = APs)
     pub cpu_id: u32,
 
@@ -29,18 +48,12 @@ pub struct PerCpu {
     /// Has this CPU completed initialization?
     pub is_online: AtomicBool,
 
-    /// Kernel stack top for this CPU
-    pub kernel_stack_top: u64,
-
     /// Timer tick count for this CPU
     pub ticks: AtomicU64,
 
     /// The running task (`*const KernelTask`; 0: the boot task,
     /// `task::percpu::INIT_TASK`), set by the scheduler at each switch
     pub curr: AtomicUsize,
-
-    /// Flag set by timer interrupt to request reschedule
-    pub needs_reschedule: AtomicBool,
 
     /// Nesting depth of interrupt handlers (to avoid rescheduling in nested interrupts)
     pub interrupt_depth: AtomicU32,
@@ -54,139 +67,6 @@ pub struct PerCpu {
     ///
     /// Preemption is only allowed when this reaches 0 and need_resched is set.
     pub preempt_count: AtomicU32,
-
-    /// Saved user RIP from syscall entry (RCX register)
-    /// Used by clone() to set up child's return address
-    pub syscall_user_rip: u64,
-
-    /// Saved user RFLAGS from syscall entry (R11 register)
-    /// Used by clone() to set up child's flags
-    pub syscall_user_rflags: u64,
-
-    /// Saved user RSP from syscall entry
-    /// Used by fork() to inherit parent's stack pointer
-    pub syscall_user_rsp: u64,
-
-    /// Saved callee-saved registers from syscall entry
-    /// Used by fork() so child inherits parent's register state
-    pub syscall_user_rbx: u64,
-    pub syscall_user_rbp: u64,
-    pub syscall_user_r12: u64,
-    pub syscall_user_r13: u64,
-    pub syscall_user_r14: u64,
-    pub syscall_user_r15: u64,
-
-    /// Saved caller-saved/argument registers from syscall entry
-    /// Linux ABI preserves these across syscalls, so fork() child must inherit them
-    pub syscall_user_rdi: u64,
-    pub syscall_user_rsi: u64,
-    pub syscall_user_rdx: u64,
-    pub syscall_user_r8: u64,
-    pub syscall_user_r9: u64,
-    pub syscall_user_r10: u64,
-
-    /// Syscall return value (user RAX), recorded before signal delivery so the
-    /// signal frame saves it and rt_sigreturn returns it to the interrupted code
-    pub syscall_user_rax: u64,
-
-    /// User RCX/R11. On syscall entry they equal RIP/RFLAGS (the `syscall`
-    /// instruction overwrote them); after a fault or rt_sigreturn they are
-    /// real values, returned to user mode by the IRETQ exit path
-    pub syscall_user_rcx: u64,
-    pub syscall_user_r11: u64,
-
-    /// Set by rt_sigreturn: return to user mode with IRETQ restoring every
-    /// register (SYSRET would clobber RCX/R11)
-    pub syscall_full_restore: bool,
-
-    /// Syscall number of the syscall in progress (for -ERESTART* restarts)
-    pub syscall_nr: u64,
-
-    /// Flag set when signal delivery modifies the return context
-    /// When true, the syscall return path should update the stack frame from percpu
-    pub signal_context_modified: bool,
-}
-
-/// Snapshot of the per-CPU syscall user-register block
-///
-/// The block describes the *current task's* syscall, but lives in per-CPU
-/// data; the scheduler saves it on the outgoing task's kernel stack around
-/// every context switch so a task that slept inside a syscall still returns
-/// (and builds signal frames) with its own registers.
-#[derive(Clone, Copy)]
-pub struct SyscallUserState {
-    regs: [u64; 19],
-    modified: bool,
-    full_restore: bool,
-}
-
-/// Capture the syscall user-register block of this CPU
-pub fn save_syscall_user_state() -> SyscallUserState {
-    let p = unsafe { current_cpu_mut() };
-    SyscallUserState {
-        regs: [
-            p.syscall_user_rip,
-            p.syscall_user_rflags,
-            p.syscall_user_rsp,
-            p.syscall_user_rbx,
-            p.syscall_user_rbp,
-            p.syscall_user_r12,
-            p.syscall_user_r13,
-            p.syscall_user_r14,
-            p.syscall_user_r15,
-            p.syscall_user_rdi,
-            p.syscall_user_rsi,
-            p.syscall_user_rdx,
-            p.syscall_user_r8,
-            p.syscall_user_r9,
-            p.syscall_user_r10,
-            p.syscall_user_rax,
-            p.syscall_nr,
-            p.syscall_user_rcx,
-            p.syscall_user_r11,
-        ],
-        modified: p.signal_context_modified,
-        full_restore: p.syscall_full_restore,
-    }
-}
-
-/// Restore a block captured by [`save_syscall_user_state`]
-pub fn restore_syscall_user_state(s: &SyscallUserState) {
-    let p = unsafe { current_cpu_mut() };
-    let r = &s.regs;
-    p.syscall_user_rip = r[0];
-    p.syscall_user_rflags = r[1];
-    p.syscall_user_rsp = r[2];
-    p.syscall_user_rbx = r[3];
-    p.syscall_user_rbp = r[4];
-    p.syscall_user_r12 = r[5];
-    p.syscall_user_r13 = r[6];
-    p.syscall_user_r14 = r[7];
-    p.syscall_user_r15 = r[8];
-    p.syscall_user_rdi = r[9];
-    p.syscall_user_rsi = r[10];
-    p.syscall_user_rdx = r[11];
-    p.syscall_user_r8 = r[12];
-    p.syscall_user_r9 = r[13];
-    p.syscall_user_r10 = r[14];
-    p.syscall_user_rax = r[15];
-    p.syscall_nr = r[16];
-    p.syscall_user_rcx = r[17];
-    p.syscall_user_r11 = r[18];
-    p.signal_context_modified = s.modified;
-    p.syscall_full_restore = s.full_restore;
-}
-
-/// Arrange for the current syscall to be re-executed on return to user
-/// (-ERESTART* with no handler, or SA_RESTART): back RIP up over the 2-byte
-/// `syscall` instruction and put the syscall number back in RAX. Returns the
-/// value the syscall must "return" (RAX).
-pub fn syscall_restart() -> u64 {
-    let p = unsafe { current_cpu_mut() };
-    p.syscall_user_rip = p.syscall_user_rip.wrapping_sub(2);
-    p.syscall_user_rax = p.syscall_nr;
-    p.signal_context_modified = true;
-    p.syscall_nr
 }
 
 impl PerCpu {
@@ -194,63 +74,30 @@ impl PerCpu {
     const fn uninit() -> Self {
         Self {
             self_ptr: core::ptr::null_mut(),
+            top_of_stack: 0,
+            user_rsp: 0,
             cpu_id: 0,
             apic_id: 0,
             is_bsp: false,
             is_online: AtomicBool::new(false),
-            kernel_stack_top: 0,
             ticks: AtomicU64::new(0),
             curr: AtomicUsize::new(0),
-            needs_reschedule: AtomicBool::new(false),
             interrupt_depth: AtomicU32::new(0),
             preempt_count: AtomicU32::new(0),
-            syscall_user_rip: 0,
-            syscall_user_rflags: 0,
-            syscall_user_rsp: 0,
-            syscall_user_rbx: 0,
-            syscall_user_rbp: 0,
-            syscall_user_r12: 0,
-            syscall_user_r13: 0,
-            syscall_user_r14: 0,
-            syscall_user_r15: 0,
-            syscall_user_rdi: 0,
-            syscall_user_rsi: 0,
-            syscall_user_rdx: 0,
-            syscall_user_r8: 0,
-            syscall_user_r9: 0,
-            syscall_user_r10: 0,
-            syscall_user_rax: 0,
-            syscall_user_rcx: 0,
-            syscall_user_r11: 0,
-            syscall_full_restore: false,
-            syscall_nr: 0,
-            signal_context_modified: false,
         }
     }
 
     /// Initialize the PerCpu structure
-    pub fn init(&mut self, cpu_id: u32, apic_id: u32, is_bsp: bool, kernel_stack_top: u64) {
+    pub fn init(&mut self, cpu_id: u32, apic_id: u32, is_bsp: bool) {
         set_tsc_aux(cpu_id);
         self.self_ptr = self as *mut PerCpu;
         self.cpu_id = cpu_id;
         self.apic_id = apic_id;
         self.is_bsp = is_bsp;
-        self.kernel_stack_top = kernel_stack_top;
         self.ticks.store(0, Ordering::Relaxed);
         self.curr.store(0, Ordering::Relaxed);
-        self.needs_reschedule.store(false, Ordering::Relaxed);
         self.interrupt_depth.store(0, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
-        self.syscall_user_rip = 0;
-        self.syscall_user_rflags = 0;
-        self.syscall_user_rsp = 0;
-        self.syscall_user_rbx = 0;
-        self.syscall_user_rbp = 0;
-        self.syscall_user_r12 = 0;
-        self.syscall_user_r13 = 0;
-        self.syscall_user_r14 = 0;
-        self.syscall_user_r15 = 0;
-        self.signal_context_modified = false;
         // Don't set is_online yet - that happens after full init
     }
 
@@ -298,28 +145,30 @@ pub unsafe fn current_cpu_mut() -> &'static mut PerCpu {
     }
 }
 
-/// Try to get current CPU data (returns None if GS not set up)
+/// Try to get current CPU data (None before the boot CPU's per-CPU
+/// data exists): a load of gs:0, valid on every CPU running kernel code
+/// once `init_bsp` ran (an AP sets its GS base first thing, `init_ap`)
 #[inline]
 pub fn try_current_cpu() -> Option<&'static PerCpu> {
-    // Read GS base via MSR
-    let gs_base = read_gs_base();
-    if gs_base == 0 {
+    if !crate::task::percpu::PERCPU_UP.load(Ordering::Relaxed) {
         return None;
     }
-    unsafe { Some(&*(gs_base as *const PerCpu)) }
+    // SAFETY: GS base is this CPU's PerCpu (see above)
+    unsafe { Some(current_cpu_mut()) }
 }
 
 /// Initialize per-CPU data for the BSP (CPU 0)
 ///
 /// This must be called early in boot, before any per-CPU access.
-pub fn init_bsp(apic_id: u8, kernel_stack_top: u64) {
+pub fn init_bsp(apic_id: u8) {
     BSP_APIC_ID.store(apic_id as u32, Ordering::SeqCst);
 
     let percpu = get_percpu(0);
-    percpu.init(0, apic_id as u32, true, kernel_stack_top);
+    percpu.init(0, apic_id as u32, true);
 
-    // Set GS base to point to our per-CPU data
+    // Set GS base to point to our per-CPU data; no user GS base yet
     set_gs_base(percpu as *mut PerCpu as u64);
+    write_user_gsbase(0);
     crate::task::percpu::PERCPU_UP.store(true, Ordering::Release);
 
     // Mark BSP as online
@@ -331,16 +180,17 @@ pub fn init_bsp(apic_id: u8, kernel_stack_top: u64) {
 ///
 /// Called by the AP after it has set up its GDT and stack.
 /// Returns the CPU ID assigned to this AP.
-pub fn init_ap(apic_id: u8, kernel_stack_top: u64) -> u32 {
+pub fn init_ap(apic_id: u8) -> u32 {
     // Atomically claim the next CPU ID
     let cpu_id = CPU_COUNT.fetch_add(1, Ordering::SeqCst);
     assert!((cpu_id as usize) < MAX_CPUS, "Too many CPUs");
 
     let percpu = get_percpu(cpu_id);
-    percpu.init(cpu_id, apic_id as u32, false, kernel_stack_top);
+    percpu.init(cpu_id, apic_id as u32, false);
 
-    // Set GS base to point to our per-CPU data
+    // Set GS base to point to our per-CPU data; no user GS base yet
     set_gs_base(percpu as *mut PerCpu as u64);
+    write_user_gsbase(0);
 
     // Mark as online
     percpu.set_online();
@@ -354,7 +204,7 @@ pub fn online_cpu_count() -> u32 {
 }
 
 /// IA32_TSC_AUX: this CPU's index (Linux keeps cpu | node << 12 there for
-/// RDTSCP/RDPID getcpu); read back by `restore_kernel_gs`
+/// RDTSCP/RDPID getcpu)
 const MSR_TSC_AUX: u32 = 0xC0000103;
 
 /// Record this CPU's index in TSC_AUX (user code cannot write it)
@@ -371,63 +221,76 @@ fn set_tsc_aux(cpu_id: u32) {
     }
 }
 
-/// Reload GS base with this CPU's per-CPU pointer, found from TSC_AUX
-/// (entry stubs, registers saved; clobbers rax, rcx, rdx and flags).
-///
-/// hk does not use SWAPGS yet: the kernel's per-CPU pointer is the live
-/// GS base, and a user `mov gs, sel` replaces it with the descriptor's
-/// base (0). Every kernel entry (syscall and every IDT stub, from user
-/// or kernel mode: an NMI or fault may land before another entry's
-/// restore) puts it back before any Rust code runs and before
-/// interrupts are enabled; it is idempotent.
-#[unsafe(naked)]
-pub unsafe extern "C" fn restore_kernel_gs() {
-    core::arch::naked_asm!(
-        "rdtscp",
-        "mov eax, ecx",
-        "imul rax, rax, {size}",
-        "lea rcx, [rip + {array}]",
-        "add rax, rcx",
-        "mov rdx, rax",
-        "shr rdx, 32",
-        "mov ecx, {msr}",
-        "wrmsr",
-        "ret",
-        size = const core::mem::size_of::<PerCpu>(),
-        array = sym PERCPU_ARRAY,
-        msr = const 0xC0000101u32,
-    );
-}
+/// MSR_GS_BASE: the live GS base (in the kernel: this CPU's PerCpu)
+pub const MSR_GS_BASE: u32 = 0xC0000101;
+/// MSR_KERNEL_GS_BASE: the base `swapgs` exchanges it with (in the
+/// kernel: the user's GS base)
+const MSR_KERNEL_GS_BASE: u32 = 0xC0000102;
 
-/// Set the GS base register (MSR 0xC0000101)
-pub fn set_gs_base(addr: u64) {
-    const MSR_GS_BASE: u32 = 0xC0000101;
+/// Write an MSR
+fn wrmsr(msr: u32, v: u64) {
+    // SAFETY: the base MSRs above take any canonical value
     unsafe {
         ::core::arch::asm!(
             "wrmsr",
-            in("ecx") MSR_GS_BASE,
-            in("eax") addr as u32,
-            in("edx") (addr >> 32) as u32,
+            in("ecx") msr,
+            in("eax") v as u32,
+            in("edx") (v >> 32) as u32,
             options(nostack, preserves_flags)
         );
     }
 }
 
-/// Read the GS base register
-pub fn read_gs_base() -> u64 {
-    const MSR_GS_BASE: u32 = 0xC0000101;
-    let low: u32;
-    let high: u32;
+/// Read an MSR
+fn rdmsr(msr: u32) -> u64 {
+    let (low, high): (u32, u32);
+    // SAFETY: reading the base MSRs above
     unsafe {
         ::core::arch::asm!(
             "rdmsr",
-            in("ecx") MSR_GS_BASE,
+            in("ecx") msr,
             out("eax") low,
             out("edx") high,
             options(nostack, preserves_flags)
         );
     }
     ((high as u64) << 32) | (low as u64)
+}
+
+/// Set the GS base register (this CPU's per-CPU pointer)
+pub fn set_gs_base(addr: u64) {
+    wrmsr(MSR_GS_BASE, addr);
+}
+
+/// The current task's user GS base, while in the kernel (Linux
+/// x86_gsbase_read_cpu_inactive)
+pub fn read_user_gsbase() -> u64 {
+    rdmsr(MSR_KERNEL_GS_BASE)
+}
+
+/// Set the user GS base the next return to user mode swaps in (Linux
+/// x86_gsbase_write_cpu_inactive); `addr` passed `fs_base_ok`
+pub fn write_user_gsbase(addr: u64) {
+    wrmsr(MSR_KERNEL_GS_BASE, addr);
+}
+
+/// Load the null selector into the user's GS (Linux load_gs_index(0)):
+/// the selector load acts on the live GS, so it runs between two
+/// `swapgs`, with interrupts off. It may change the user base, which
+/// the caller sets next.
+pub fn load_user_gs_null() {
+    let irq = crate::arch::local_irq_save();
+    // SAFETY: interrupts off; the second swapgs restores the kernel GS
+    unsafe {
+        ::core::arch::asm!(
+            "swapgs",
+            "mov gs, {0:x}",
+            "swapgs",
+            in(reg) 0u32,
+            options(nostack, preserves_flags)
+        );
+    }
+    crate::arch::local_irq_restore(irq);
 }
 
 // ============================================================================
@@ -549,273 +412,6 @@ pub fn preempt_count() -> u32 {
         .unwrap_or(0)
 }
 
-/// Save syscall entry state (user RIP, RFLAGS, RSP, and callee-saved regs) for clone()/fork()
-///
-/// Called from syscall entry before dispatching. Stores the user's
-/// return address (RCX), flags (R11), stack pointer, and all callee-saved
-/// registers in per-CPU data so clone()/fork() can use them to set up
-/// the child's TrapFrame.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-pub fn save_syscall_state(
-    user_rip: u64,
-    user_rflags: u64,
-    user_rsp: u64,
-    user_rbx: u64,
-    user_rbp: u64,
-    user_r12: u64,
-    user_r13: u64,
-    user_r14: u64,
-    user_r15: u64,
-) {
-    if let Some(_percpu) = try_current_cpu() {
-        unsafe {
-            let percpu_mut = current_cpu_mut();
-            percpu_mut.syscall_user_rip = user_rip;
-            percpu_mut.syscall_user_rflags = user_rflags;
-            // `syscall` put RIP/RFLAGS in RCX/R11
-            percpu_mut.syscall_user_rcx = user_rip;
-            percpu_mut.syscall_user_r11 = user_rflags;
-            percpu_mut.syscall_user_rsp = user_rsp;
-            percpu_mut.syscall_user_rbx = user_rbx;
-            percpu_mut.syscall_user_rbp = user_rbp;
-            percpu_mut.syscall_user_r12 = user_r12;
-            percpu_mut.syscall_user_r13 = user_r13;
-            percpu_mut.syscall_user_r14 = user_r14;
-            percpu_mut.syscall_user_r15 = user_r15;
-        }
-    }
-}
-
-/// Get saved syscall user RIP
-#[inline]
-pub fn get_syscall_user_rip() -> u64 {
-    try_current_cpu()
-        .map(|percpu| percpu.syscall_user_rip)
-        .unwrap_or(0)
-}
-
-/// Get saved syscall user RFLAGS
-#[inline]
-pub fn get_syscall_user_rflags() -> u64 {
-    try_current_cpu()
-        .map(|percpu| percpu.syscall_user_rflags)
-        .unwrap_or(0)
-}
-
-/// Get saved syscall user RSP (stack pointer)
-#[inline]
-pub fn get_syscall_user_rsp() -> u64 {
-    try_current_cpu()
-        .map(|percpu| percpu.syscall_user_rsp)
-        .unwrap_or(0)
-}
-
-/// Get saved syscall user callee-saved registers
-/// Returns (rbx, rbp, r12, r13, r14, r15)
-#[inline]
-pub fn get_syscall_user_callee_saved() -> (u64, u64, u64, u64, u64, u64) {
-    try_current_cpu()
-        .map(|percpu| {
-            (
-                percpu.syscall_user_rbx,
-                percpu.syscall_user_rbp,
-                percpu.syscall_user_r12,
-                percpu.syscall_user_r13,
-                percpu.syscall_user_r14,
-                percpu.syscall_user_r15,
-            )
-        })
-        .unwrap_or((0, 0, 0, 0, 0, 0))
-}
-
-/// Save caller-saved/argument registers for fork()
-///
-/// Linux syscall ABI preserves these across syscalls, so the child
-/// must inherit the parent's values. Called from syscall entry.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-pub fn save_syscall_caller_saved(
-    user_rdi: u64,
-    user_rsi: u64,
-    user_rdx: u64,
-    user_r8: u64,
-    user_r9: u64,
-    user_r10: u64,
-) {
-    if let Some(_percpu) = try_current_cpu() {
-        unsafe {
-            let percpu_mut = current_cpu_mut();
-            percpu_mut.syscall_user_rdi = user_rdi;
-            percpu_mut.syscall_user_rsi = user_rsi;
-            percpu_mut.syscall_user_rdx = user_rdx;
-            percpu_mut.syscall_user_r8 = user_r8;
-            percpu_mut.syscall_user_r9 = user_r9;
-            percpu_mut.syscall_user_r10 = user_r10;
-        }
-    }
-}
-
-/// Get saved syscall user caller-saved registers
-/// Returns (rdi, rsi, rdx, r8, r9, r10)
-#[inline]
-pub fn get_syscall_user_caller_saved() -> (u64, u64, u64, u64, u64, u64) {
-    try_current_cpu()
-        .map(|percpu| {
-            (
-                percpu.syscall_user_rdi,
-                percpu.syscall_user_rsi,
-                percpu.syscall_user_rdx,
-                percpu.syscall_user_r8,
-                percpu.syscall_user_r9,
-                percpu.syscall_user_r10,
-            )
-        })
-        .unwrap_or((0, 0, 0, 0, 0, 0))
-}
-
-/// Update syscall return frame from percpu saved state
-///
-/// Called from syscall exit path to apply any modifications made by
-/// signal delivery (setup_rt_frame) to the stack frame that will be
-/// restored on return to userspace.
-///
-/// Only updates the frame if signal_context_modified is set, indicating
-/// that signal delivery has redirected execution to a handler.
-///
-/// Stack frame layout (passed as frame_base):
-///   frame_base+0:  r9
-///   frame_base+8:  r8
-///   frame_base+16: r10
-///   frame_base+24: rdx
-///   frame_base+32: rsi
-///   frame_base+40: rdi
-///   frame_base+48: rax (return value)
-///   frame_base+56: r15
-///   frame_base+64: r14
-///   frame_base+72: r13
-///   frame_base+80: r12
-///   frame_base+88: rbp
-///   frame_base+96: rbx
-///   frame_base+104: r11 (user RFLAGS)
-///   frame_base+112: rcx (user RIP)
-///   frame_base+120: user_rsp
-///
-/// Returns 1 if the syscall must return through IRETQ with every register
-/// (incl. RCX/R11) taken from the per-CPU block (see [`fill_iret_frame`]),
-/// 0 for the normal SYSRET exit.
-#[inline]
-pub extern "C" fn update_syscall_return_frame(frame_base: *mut u64) -> u64 {
-    if let Some(_percpu) = try_current_cpu() {
-        unsafe {
-            let percpu_mut = current_cpu_mut();
-            // Only update if signal delivery modified the context
-            if !percpu_mut.signal_context_modified {
-                return 0;
-            }
-            // Clear the flag
-            percpu_mut.signal_context_modified = false;
-
-            // Update RIP (stored in RCX slot for sysretq)
-            *frame_base.add(14) = percpu_mut.syscall_user_rip; // offset 112
-            // Update RFLAGS (stored in R11 slot for sysretq)
-            *frame_base.add(13) = percpu_mut.syscall_user_rflags; // offset 104
-            // Update RSP
-            *frame_base.add(15) = percpu_mut.syscall_user_rsp; // offset 120
-            // Update argument registers (for signal handler args)
-            *frame_base.add(5) = percpu_mut.syscall_user_rdi; // offset 40
-            *frame_base.add(4) = percpu_mut.syscall_user_rsi; // offset 32
-            *frame_base.add(3) = percpu_mut.syscall_user_rdx; // offset 24
-            *frame_base.add(1) = percpu_mut.syscall_user_r8; // offset 8
-            *frame_base.add(0) = percpu_mut.syscall_user_r9; // offset 0
-            *frame_base.add(2) = percpu_mut.syscall_user_r10; // offset 16
-            // Update callee-saved registers (needed for rt_sigreturn context restore)
-            *frame_base.add(12) = percpu_mut.syscall_user_rbx; // offset 96
-            *frame_base.add(11) = percpu_mut.syscall_user_rbp; // offset 88
-            *frame_base.add(10) = percpu_mut.syscall_user_r12; // offset 80
-            *frame_base.add(9) = percpu_mut.syscall_user_r13; // offset 72
-            *frame_base.add(8) = percpu_mut.syscall_user_r14; // offset 64
-            *frame_base.add(7) = percpu_mut.syscall_user_r15; // offset 56
-            if core::mem::take(&mut percpu_mut.syscall_full_restore) {
-                return 1;
-            }
-        }
-    }
-    0
-}
-
-/// IRETQ exit of a syscall (after rt_sigreturn): fill `out` with the IRET
-/// frame (RIP, CS, RFLAGS, RSP, SS) followed by the user RCX and R11
-pub extern "C" fn fill_iret_frame(out: *mut u64) {
-    let p = unsafe { current_cpu_mut() };
-    let vals = [
-        p.syscall_user_rip,
-        super::cpu::USER_CODE_SELECTOR as u64,
-        p.syscall_user_rflags,
-        p.syscall_user_rsp,
-        super::cpu::USER_DATA_SELECTOR as u64,
-        p.syscall_user_rcx,
-        p.syscall_user_r11,
-    ];
-    for (i, v) in vals.iter().enumerate() {
-        unsafe { *out.add(i) = *v };
-    }
-}
-
-/// Load the per-CPU user-register block from the trap frame of a user
-/// fault, so signal delivery builds its frame from the faulting context
-pub fn load_user_regs_from_trapframe(f: &super::X86_64TrapFrame) {
-    let p = unsafe { current_cpu_mut() };
-    p.syscall_user_rip = f.rip;
-    p.syscall_user_rflags = f.rflags;
-    p.syscall_user_rsp = f.rsp;
-    p.syscall_user_rax = f.rax;
-    p.syscall_user_rbx = f.rbx;
-    p.syscall_user_rcx = f.rcx;
-    p.syscall_user_rdx = f.rdx;
-    p.syscall_user_rsi = f.rsi;
-    p.syscall_user_rdi = f.rdi;
-    p.syscall_user_rbp = f.rbp;
-    p.syscall_user_r8 = f.r8;
-    p.syscall_user_r9 = f.r9;
-    p.syscall_user_r10 = f.r10;
-    p.syscall_user_r11 = f.r11;
-    p.syscall_user_r12 = f.r12;
-    p.syscall_user_r13 = f.r13;
-    p.syscall_user_r14 = f.r14;
-    p.syscall_user_r15 = f.r15;
-    p.signal_context_modified = false;
-    p.syscall_full_restore = false;
-}
-
-/// Write back a user context changed by signal delivery into the trap
-/// frame the fault returns through (IRETQ restores every register)
-pub fn store_user_regs_to_trapframe(f: &mut super::X86_64TrapFrame) {
-    let p = unsafe { current_cpu_mut() };
-    if !core::mem::take(&mut p.signal_context_modified) {
-        return;
-    }
-    p.syscall_full_restore = false;
-    f.rip = p.syscall_user_rip;
-    f.rflags = p.syscall_user_rflags;
-    f.rsp = p.syscall_user_rsp;
-    f.rax = p.syscall_user_rax;
-    f.rbx = p.syscall_user_rbx;
-    f.rcx = p.syscall_user_rcx;
-    f.rdx = p.syscall_user_rdx;
-    f.rsi = p.syscall_user_rsi;
-    f.rdi = p.syscall_user_rdi;
-    f.rbp = p.syscall_user_rbp;
-    f.r8 = p.syscall_user_r8;
-    f.r9 = p.syscall_user_r9;
-    f.r10 = p.syscall_user_r10;
-    f.r11 = p.syscall_user_r11;
-    f.r12 = p.syscall_user_r12;
-    f.r13 = p.syscall_user_r13;
-    f.r14 = p.syscall_user_r14;
-    f.r15 = p.syscall_user_r15;
-}
-
 // ============================================================================
 // PerCpuOps trait implementation
 // ============================================================================
@@ -845,29 +441,8 @@ impl PerCpuOps for X86_64Arch {
         }
     }
 
-    #[inline]
-    fn needs_reschedule() -> bool {
-        try_current_cpu()
-            .map(|percpu| percpu.needs_reschedule.load(Ordering::Relaxed))
-            .unwrap_or(false)
-    }
-
-    #[inline]
-    fn clear_needs_reschedule() -> bool {
-        try_current_cpu()
-            .map(|percpu| percpu.needs_reschedule.swap(false, Ordering::Relaxed))
-            .unwrap_or(false)
-    }
-
-    #[inline]
-    fn set_needs_reschedule(val: bool) {
-        if try_current_cpu().is_some() {
-            unsafe {
-                current_cpu_mut()
-                    .needs_reschedule
-                    .store(val, Ordering::Relaxed);
-            }
-        }
+    fn current_task_ptr_of(cpu: u32) -> usize {
+        get_percpu(cpu).curr.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -877,40 +452,7 @@ impl PerCpuOps for X86_64Arch {
             .unwrap_or(0)
     }
 
-    #[inline]
-    fn get_syscall_user_rip() -> u64 {
-        get_syscall_user_rip()
-    }
-
-    #[inline]
-    fn get_syscall_user_rflags() -> u64 {
-        get_syscall_user_rflags()
-    }
-
-    #[inline]
-    fn get_syscall_user_rsp() -> u64 {
-        get_syscall_user_rsp()
-    }
-
     fn cpu_online(cpu: u32) -> bool {
         (cpu as usize) < MAX_CPUS && get_percpu(cpu).is_online.load(Ordering::Acquire)
-    }
-
-    type SyscallUserState = SyscallUserState;
-
-    fn save_syscall_user_state() -> SyscallUserState {
-        save_syscall_user_state()
-    }
-
-    fn restore_syscall_user_state(state: &SyscallUserState) {
-        restore_syscall_user_state(state)
-    }
-
-    fn set_syscall_return(val: u64) {
-        unsafe { current_cpu_mut().syscall_user_rax = val };
-    }
-
-    fn syscall_restart() -> u64 {
-        syscall_restart()
     }
 }

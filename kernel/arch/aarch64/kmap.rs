@@ -7,6 +7,7 @@
 //! ffff000000000000 - ...               linear map of RAM (PAGE_OFFSET)
 //! ffff800040100000 - ...               kernel image (KIMAGE_OFFSET + phys)
 //! ffff800100000000 - ffff80013fffffff  vmalloc/ioremap window
+//! ffff800140000000 - ffff80015fffffff  kernel stacks (mm::vmstack)
 //! ffff800200000000 - ffff80023fffffff  device window (physical 0-1GB)
 //! ```
 //!

@@ -5,8 +5,9 @@
 use ::core::mem::size_of;
 use ::core::sync::atomic::Ordering;
 
-use super::X86_64TrapFrame;
+use super::PtRegs;
 use super::cpu::KERNEL_CODE_SELECTOR;
+use super::entry;
 use super::lapic;
 use super::pic;
 use crate::mm::fault::{Access, VmFault};
@@ -19,12 +20,13 @@ pub const LAPIC_TIMER_VECTOR: u8 = 0x40;
 /// Number of IDT entries (256 interrupt vectors)
 const IDT_ENTRIES: usize = 256;
 
-/// IDT gate types
+/// IDT gate types: every vector is an interrupt gate (interrupts off on
+/// entry, Linux idt.c), so nothing interrupts an entry stub before its
+/// `swapgs`; the handlers turn them back on where they may
 const GATE_INTERRUPT: u8 = 0x8E; // Present, DPL=0, 64-bit interrupt gate
-const GATE_TRAP: u8 = 0x8F; // Present, DPL=0, 64-bit trap gate
-/// Present, DPL=3, 64-bit trap gate: reachable by `int3`/`into` from user
-/// mode (Linux: X86_TRAP_BP and X86_TRAP_OF are system gates)
-const GATE_TRAP_USER: u8 = 0xEF;
+/// Present, DPL=3, 64-bit interrupt gate: reachable by `int3`/`into` from
+/// user mode (Linux: X86_TRAP_BP and X86_TRAP_OF are system gates)
+const GATE_INT_USER: u8 = 0xEE;
 
 /// IDT entry (16 bytes in 64-bit mode)
 #[derive(Clone, Copy)]
@@ -117,75 +119,140 @@ const EXCEPTION_NAMES: [&str; 32] = [
 pub fn init_idt() {
     unsafe {
         // Set up exception handlers (vectors 0-31)
-        IDT[0].set_handler(exception_handler_0 as *const () as u64, GATE_TRAP);
-        IDT[1].set_handler(exception_handler_1 as *const () as u64, GATE_TRAP);
+        IDT[0].set_handler(
+            entry::exception_handler_0 as *const () as u64,
+            GATE_INTERRUPT,
+        );
+        IDT[1].set_handler(
+            entry::exception_handler_1 as *const () as u64,
+            GATE_INTERRUPT,
+        );
         // NMI uses IST2 for safety
         IDT[2].set_handler_with_ist(
-            exception_handler_2 as *const () as u64,
+            entry::exception_handler_2 as *const () as u64,
             GATE_INTERRUPT,
             super::cpu::IST_NMI,
         );
-        IDT[3].set_handler(exception_handler_3 as *const () as u64, GATE_TRAP_USER);
-        IDT[4].set_handler(exception_handler_4 as *const () as u64, GATE_TRAP_USER);
-        IDT[5].set_handler(exception_handler_5 as *const () as u64, GATE_TRAP);
-        IDT[6].set_handler(exception_handler_6 as *const () as u64, GATE_TRAP);
-        IDT[7].set_handler(exception_handler_7 as *const () as u64, GATE_TRAP);
+        IDT[3].set_handler(
+            entry::exception_handler_3 as *const () as u64,
+            GATE_INT_USER,
+        );
+        IDT[4].set_handler(
+            entry::exception_handler_4 as *const () as u64,
+            GATE_INT_USER,
+        );
+        IDT[5].set_handler(
+            entry::exception_handler_5 as *const () as u64,
+            GATE_INTERRUPT,
+        );
+        IDT[6].set_handler(
+            entry::exception_handler_6 as *const () as u64,
+            GATE_INTERRUPT,
+        );
+        IDT[7].set_handler(
+            entry::exception_handler_7 as *const () as u64,
+            GATE_INTERRUPT,
+        );
         // Double fault uses IST1 to avoid stack issues
         IDT[8].set_handler_with_ist(
-            exception_handler_8 as *const () as u64,
-            GATE_TRAP,
+            entry::exception_handler_8 as *const () as u64,
+            GATE_INTERRUPT,
             super::cpu::IST_DOUBLE_FAULT,
         );
-        IDT[9].set_handler(exception_handler_9 as *const () as u64, GATE_TRAP);
-        IDT[10].set_handler(exception_handler_10 as *const () as u64, GATE_TRAP);
-        IDT[11].set_handler(exception_handler_11 as *const () as u64, GATE_TRAP);
-        IDT[12].set_handler(exception_handler_12 as *const () as u64, GATE_TRAP);
-        IDT[13].set_handler(exception_handler_13 as *const () as u64, GATE_TRAP);
-        IDT[14].set_handler(exception_handler_14 as *const () as u64, GATE_TRAP);
+        IDT[9].set_handler(
+            entry::exception_handler_9 as *const () as u64,
+            GATE_INTERRUPT,
+        );
+        IDT[10].set_handler(
+            entry::exception_handler_10 as *const () as u64,
+            GATE_INTERRUPT,
+        );
+        IDT[11].set_handler(
+            entry::exception_handler_11 as *const () as u64,
+            GATE_INTERRUPT,
+        );
+        IDT[12].set_handler(
+            entry::exception_handler_12 as *const () as u64,
+            GATE_INTERRUPT,
+        );
+        IDT[13].set_handler(
+            entry::exception_handler_13 as *const () as u64,
+            GATE_INTERRUPT,
+        );
+        IDT[14].set_handler(
+            entry::exception_handler_14 as *const () as u64,
+            GATE_INTERRUPT,
+        );
         // 15 is reserved
-        IDT[16].set_handler(exception_handler_16 as *const () as u64, GATE_TRAP);
-        IDT[17].set_handler(exception_handler_17 as *const () as u64, GATE_TRAP);
-        IDT[18].set_handler(exception_handler_18 as *const () as u64, GATE_TRAP);
-        IDT[19].set_handler(exception_handler_19 as *const () as u64, GATE_TRAP);
-        IDT[20].set_handler(exception_handler_20 as *const () as u64, GATE_TRAP);
-        IDT[21].set_handler(exception_handler_21 as *const () as u64, GATE_TRAP);
+        IDT[16].set_handler(
+            entry::exception_handler_16 as *const () as u64,
+            GATE_INTERRUPT,
+        );
+        IDT[17].set_handler(
+            entry::exception_handler_17 as *const () as u64,
+            GATE_INTERRUPT,
+        );
+        // Machine check: its own IST stack too
+        IDT[18].set_handler_with_ist(
+            entry::exception_handler_18 as *const () as u64,
+            GATE_INTERRUPT,
+            super::cpu::IST_MCE,
+        );
+        IDT[19].set_handler(
+            entry::exception_handler_19 as *const () as u64,
+            GATE_INTERRUPT,
+        );
+        IDT[20].set_handler(
+            entry::exception_handler_20 as *const () as u64,
+            GATE_INTERRUPT,
+        );
+        IDT[21].set_handler(
+            entry::exception_handler_21 as *const () as u64,
+            GATE_INTERRUPT,
+        );
 
         // Set up IRQ handlers (vectors 32-47, after PIC remapping)
         // Master PIC: IRQs 0-7 -> vectors 32-39
-        IDT[32].set_handler(irq_handler_0 as *const () as u64, GATE_INTERRUPT); // Timer
-        IDT[33].set_handler(irq_handler_1 as *const () as u64, GATE_INTERRUPT); // Keyboard
-        IDT[34].set_handler(irq_handler_2 as *const () as u64, GATE_INTERRUPT); // Cascade
-        IDT[35].set_handler(irq_handler_3 as *const () as u64, GATE_INTERRUPT); // COM2
-        IDT[36].set_handler(irq_handler_4 as *const () as u64, GATE_INTERRUPT); // COM1
-        IDT[37].set_handler(irq_handler_5 as *const () as u64, GATE_INTERRUPT); // LPT2
-        IDT[38].set_handler(irq_handler_6 as *const () as u64, GATE_INTERRUPT); // Floppy
-        IDT[39].set_handler(irq_handler_7 as *const () as u64, GATE_INTERRUPT); // LPT1/Spurious
+        IDT[32].set_handler(entry::irq_handler_0 as *const () as u64, GATE_INTERRUPT); // Timer
+        IDT[33].set_handler(entry::irq_handler_1 as *const () as u64, GATE_INTERRUPT); // Keyboard
+        IDT[34].set_handler(entry::irq_handler_2 as *const () as u64, GATE_INTERRUPT); // Cascade
+        IDT[35].set_handler(entry::irq_handler_3 as *const () as u64, GATE_INTERRUPT); // COM2
+        IDT[36].set_handler(entry::irq_handler_4 as *const () as u64, GATE_INTERRUPT); // COM1
+        IDT[37].set_handler(entry::irq_handler_5 as *const () as u64, GATE_INTERRUPT); // LPT2
+        IDT[38].set_handler(entry::irq_handler_6 as *const () as u64, GATE_INTERRUPT); // Floppy
+        IDT[39].set_handler(entry::irq_handler_7 as *const () as u64, GATE_INTERRUPT); // LPT1/Spurious
         // Slave PIC: IRQs 8-15 -> vectors 40-47
-        IDT[40].set_handler(irq_handler_8 as *const () as u64, GATE_INTERRUPT); // RTC
-        IDT[41].set_handler(irq_handler_9 as *const () as u64, GATE_INTERRUPT); // ACPI/PCI
-        IDT[42].set_handler(irq_handler_10 as *const () as u64, GATE_INTERRUPT); // PCI
-        IDT[43].set_handler(irq_handler_11 as *const () as u64, GATE_INTERRUPT); // PCI
-        IDT[44].set_handler(irq_handler_12 as *const () as u64, GATE_INTERRUPT); // PS/2 Mouse
-        IDT[45].set_handler(irq_handler_13 as *const () as u64, GATE_INTERRUPT); // FPU
-        IDT[46].set_handler(irq_handler_14 as *const () as u64, GATE_INTERRUPT); // Primary ATA
-        IDT[47].set_handler(irq_handler_15 as *const () as u64, GATE_INTERRUPT); // Secondary ATA
+        IDT[40].set_handler(entry::irq_handler_8 as *const () as u64, GATE_INTERRUPT); // RTC
+        IDT[41].set_handler(entry::irq_handler_9 as *const () as u64, GATE_INTERRUPT); // ACPI/PCI
+        IDT[42].set_handler(entry::irq_handler_10 as *const () as u64, GATE_INTERRUPT); // PCI
+        IDT[43].set_handler(entry::irq_handler_11 as *const () as u64, GATE_INTERRUPT); // PCI
+        IDT[44].set_handler(entry::irq_handler_12 as *const () as u64, GATE_INTERRUPT); // PS/2 Mouse
+        IDT[45].set_handler(entry::irq_handler_13 as *const () as u64, GATE_INTERRUPT); // FPU
+        IDT[46].set_handler(entry::irq_handler_14 as *const () as u64, GATE_INTERRUPT); // Primary ATA
+        IDT[47].set_handler(entry::irq_handler_15 as *const () as u64, GATE_INTERRUPT); // Secondary ATA
 
         // LAPIC timer interrupt (vector 0x40)
-        IDT[LAPIC_TIMER_VECTOR as usize]
-            .set_handler(lapic_timer_handler as *const () as u64, GATE_INTERRUPT);
+        IDT[LAPIC_TIMER_VECTOR as usize].set_handler(
+            entry::lapic_timer_handler as *const () as u64,
+            GATE_INTERRUPT,
+        );
 
         // IPIs (mm::tlb shootdown, smp calls, remote wakeups)
         IDT[CALL_FUNCTION_VECTOR as usize]
-            .set_handler(call_function_ipi as *const () as u64, GATE_INTERRUPT);
+            .set_handler(entry::call_function_ipi as *const () as u64, GATE_INTERRUPT);
         IDT[RESCHEDULE_VECTOR as usize]
-            .set_handler(reschedule_ipi as *const () as u64, GATE_INTERRUPT);
+            .set_handler(entry::reschedule_ipi as *const () as u64, GATE_INTERRUPT);
+    }
+    load_idt();
+}
 
-        // Load IDT
-        let idt_ptr = IdtPointer {
-            limit: (size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
-            base: (&raw const IDT) as *const _ as u64,
-        };
-
+/// Load the IDT (shared by every CPU) on this CPU
+pub fn load_idt() {
+    let idt_ptr = IdtPointer {
+        limit: (size_of::<[IdtEntry; IDT_ENTRIES]>() - 1) as u16,
+        base: (&raw const IDT) as *const _ as u64,
+    };
+    unsafe {
         ::core::arch::asm!(
             "lidt [{}]",
             in(reg) &idt_ptr,
@@ -202,141 +269,31 @@ pub fn enable() {
     }
 }
 
-// Exception handler stubs
-// For no-error exceptions: CPU pushes [RIP, CS, RFLAGS, RSP, SS]
-// For error exceptions: CPU pushes [error_code, RIP, CS, RFLAGS, RSP, SS]
-// We push dummy error code for no-error exceptions to unify handling
-
-macro_rules! exception_handler_no_error {
-    ($name:ident, $vector:expr) => {
-        #[unsafe(naked)]
-        unsafe extern "C" fn $name() {
-            // CPU pushed: [RIP, CS, RFLAGS, RSP, SS]
-            // We push dummy error code and vector number
-            core::arch::naked_asm!(
-                "push 0",          // Dummy error code
-                "push {}",         // Vector number
-                "jmp {}",
-                const $vector as u64,
-                sym exception_common,
-            );
-        }
-    };
+/// Exceptions whose entry carries an error code from the CPU (in
+/// orig_ax): #DF, #TS, #NP, #SS, #GP, #PF, #AC, #CP
+fn has_error_code(vector: u64) -> bool {
+    matches!(vector, 8 | 10..=14 | 17 | 21)
 }
 
-macro_rules! exception_handler_with_error {
-    ($name:ident, $vector:expr) => {
-        #[unsafe(naked)]
-        unsafe extern "C" fn $name() {
-            // CPU pushed: [error_code, RIP, CS, RFLAGS, RSP, SS]
-            // We push vector number
-            core::arch::naked_asm!(
-                "push {}",         // Vector number
-                "jmp {}",
-                const $vector as u64,
-                sym exception_common,
-            );
-        }
-    };
-}
-
-// Define exception handlers
-exception_handler_no_error!(exception_handler_0, 0); // Divide Error
-exception_handler_no_error!(exception_handler_1, 1); // Debug
-exception_handler_no_error!(exception_handler_2, 2); // NMI
-exception_handler_no_error!(exception_handler_3, 3); // Breakpoint
-exception_handler_no_error!(exception_handler_4, 4); // Overflow
-exception_handler_no_error!(exception_handler_5, 5); // Bound Range
-exception_handler_no_error!(exception_handler_6, 6); // Invalid Opcode
-exception_handler_no_error!(exception_handler_7, 7); // Device Not Available
-exception_handler_with_error!(exception_handler_8, 8); // Double Fault
-exception_handler_no_error!(exception_handler_9, 9); // Coprocessor Segment Overrun
-exception_handler_with_error!(exception_handler_10, 10); // Invalid TSS
-exception_handler_with_error!(exception_handler_11, 11); // Segment Not Present
-exception_handler_with_error!(exception_handler_12, 12); // Stack Segment Fault
-exception_handler_with_error!(exception_handler_13, 13); // General Protection Fault
-exception_handler_with_error!(exception_handler_14, 14); // Page Fault
-exception_handler_no_error!(exception_handler_16, 16); // x87 FPU Error
-exception_handler_with_error!(exception_handler_17, 17); // Alignment Check
-exception_handler_no_error!(exception_handler_18, 18); // Machine Check
-exception_handler_no_error!(exception_handler_19, 19); // SIMD FP Exception
-exception_handler_no_error!(exception_handler_20, 20); // Virtualization Exception
-exception_handler_with_error!(exception_handler_21, 21); // Control Protection
-
-/// Common exception handler
-/// Stack on entry: [vector, error_code, RIP, CS, RFLAGS, RSP, SS]
-#[unsafe(naked)]
-unsafe extern "C" fn exception_common() {
-    core::arch::naked_asm!(
-        // Stack from CPU/stub: [vector, error_code, RIP, CS, RFLAGS, RSP, SS]
-
-        // We need to preserve ALL registers while extracting the vector number.
-        // The vector was pushed by the stub and we need to extract it.
-
-        // Use xchg to atomically swap vector with r15, preserving r15's original value
-        "xchg r15, [rsp]",   // Now R15=vector, [rsp]=user_r15
-
-        // Stack is now: [user_r15, error_code, RIP, CS, RFLAGS, RSP, SS]
-        // R15 holds the vector number
-
-        // Save all remaining GPRs
-        "push r14",
-        "push r13",
-        "push r12",
-        "push r11",
-        "push r10",
-        "push r9",
-        "push r8",
-        "push rbp",
-        "push rdi",
-        "push rsi",
-        "push rdx",
-        "push rcx",
-        "push rbx",
-        "push rax",
-
-        // Stack now: [rax, rbx, rcx, rdx, rsi, rdi, rbp, r8-r14, r15, error_code, rip, cs, rflags, rsp, ss]
-        // This matches TrapFrame layout!
-
-        // Kernel GS base, whatever the origin (keeps r15, the vector)
-        "call {}",
-
-        // Call Rust handler with (frame pointer, vector number)
-        "mov rdi, rsp",      // First arg: trap frame pointer
-        "mov rsi, r15",      // Second arg: vector number (in R15)
-        "call {}",
-
-        // Check return value - if non-zero, fault was handled
-        "test rax, rax",
-        "jnz 1f",
-
-        // Fault not handled - fatal handler will loop forever
-        "1:",
-
-        // Restore all registers
-        "pop rax",
-        "pop rbx",
-        "pop rcx",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-        "pop rbp",
-        "pop r8",
-        "pop r9",
-        "pop r10",
-        "pop r11",
-        "pop r12",
-        "pop r13",
-        "pop r14",
-        "pop r15",
-
-        // Skip error code
-        "add rsp, 8",
-
-        "iretq",
-        sym super::percpu::restore_kernel_gs,
-        sym handle_exception,
-    );
+/// Every IDT vector lands here from `entry::idt_common` (or
+/// `paranoid_common`), with the frame at `regs` (Linux idtentry
+/// handlers, sysvec_*, common_interrupt)
+pub extern "C" fn idt_dispatch(regs: &mut PtRegs, vector: u64) {
+    match vector {
+        0..=31 => handle_exception(regs, vector),
+        32..=47 => handle_irq(vector - 32),
+        v if v == LAPIC_TIMER_VECTOR as u64 => handle_lapic_timer(),
+        v if v == CALL_FUNCTION_VECTOR as u64 => handle_call_function(),
+        v if v == RESCHEDULE_VECTOR as u64 => handle_reschedule(),
+        _ => {}
+    }
+    // Back to user mode: its pending work first (Linux
+    // irqentry_exit_to_user_mode); not for NMI, #DF, #MC (paranoid)
+    if regs.cs & 3 == 3 && !matches!(vector, 2 | 8 | 18) {
+        // SAFETY: interrupts off for the exit work's checks
+        unsafe { ::core::arch::asm!("cli", options(nostack)) };
+        crate::entry::exit_to_user_mode(regs);
+    }
 }
 
 /// si_code for a user x87 (#MF) or SIMD (#XM) floating-point exception
@@ -377,21 +334,23 @@ fn math_error_code(vector: u64) -> i32 {
 }
 
 /// Deliver a synchronous fault signal (force_sig_fault) for the user
-/// context in `frame`: if a handler runs, IRETQ enters it with every
-/// register taken from the (redirected) per-CPU user-register block
-fn user_fault(frame: &mut X86_64TrapFrame, sig: u32, info: KSigInfo) {
-    super::percpu::load_user_regs_from_trapframe(frame);
-    crate::signal::force_sig_fault(sig, info);
-    super::percpu::store_user_regs_to_trapframe(frame);
+/// context in `frame`: the task's pt_regs (an entry from user mode), so
+/// a handler's frame is set up there and IRETQ enters it
+fn user_fault(frame: &mut PtRegs, sig: u32, info: KSigInfo) {
+    crate::signal::force_sig_fault(sig, info, frame);
 }
 
-/// Rust exception handler
-/// Returns 1 if the exception was handled and execution can resume, 0 otherwise
-extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 {
-    // Disable interrupts
-    unsafe {
-        ::core::arch::asm!("cli", options(nostack, preserves_flags));
-    }
+/// Rust exception handler (interrupts off: interrupt gates); it returns
+/// when execution can resume, else halts
+fn handle_exception(frame: &mut PtRegs, vector: u64) {
+    // The error code leaves orig_ax, which says "no syscall" from now on
+    // (Linux idtentry)
+    let error_code = if has_error_code(vector) {
+        frame.orig_rax
+    } else {
+        0
+    };
+    frame.orig_rax = u64::MAX;
 
     // Read CR2 for page faults
     let cr2: u64;
@@ -407,13 +366,13 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
         if frame.rflags & 0x200 != 0 {
             enable();
         }
-        let Err(err) = handle_page_fault(frame, cr2) else {
-            return 1; // resolved: retry the access
+        let Err(err) = handle_page_fault(error_code, cr2) else {
+            return; // resolved: retry the access
         };
         // Error code bit 2: user mode access
-        if frame.error_code & 4 != 0 {
+        if error_code & 4 != 0 {
             // Error code bit 3: reserved bit violation
-            let bus = frame.error_code & 8 != 0 || err == VmFault::Bus;
+            let bus = error_code & 8 != 0 || err == VmFault::Bus;
             enable();
             if err == VmFault::Oom {
                 crate::mm::fault::pagefault_out_of_memory();
@@ -427,24 +386,31 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
                 code,
                 addr: cr2,
                 trapno: 14,
-                error: frame.error_code,
+                error: error_code,
             };
             user_fault(frame, sig, info);
-            return 1;
+            return;
         }
         // Kernel-mode fault inside a user-copy routine (out of memory
         // included, Linux kernelmode_fixup_or_oops): resume at its
         // fixup, which reports the uncopied bytes (-> EFAULT)
         if let Some(fixup) = super::uaccess::uaccess_fixup(frame.rip) {
             frame.rip = fixup;
-            return 1;
+            return;
         }
         // Kernel mode fault - fall through to fatal handler
     }
 
+    // An NMI in user mode is not the task's doing: nothing to deliver
+    // (hk has no NMI sources it handles; Linux exc_nmi)
+    if vector == 2 {
+        return;
+    }
+
     // Any other exception raised by user code (#DE, #UD, #GP, ...) is the
-    // task's fault, not the kernel's: signal it instead of halting
-    if frame.cs & 3 == 3 && vector != 14 {
+    // task's fault, not the kernel's: signal it instead of halting. #DF
+    // and #MC are never a task's: they halt below (paranoid, IST stack)
+    if frame.cs & 3 == 3 && !matches!(vector, 8 | 14 | 18) {
         use crate::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
         // Linux arch/x86/kernel/traps.c: signal, si_code, si_addr
         let rip = frame.rip;
@@ -458,7 +424,7 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
                 // #MF, #XM: code from the unmasked exception flags
                 let code = math_error_code(vector);
                 if code == 0 {
-                    return 1; // spurious (Linux: no signal)
+                    return; // spurious (Linux: no signal)
                 }
                 (SIGFPE, code, rip)
             }
@@ -470,10 +436,25 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
             code,
             addr,
             trapno: vector,
-            error: frame.error_code,
+            error: error_code,
         };
         user_fault(frame, sig, info);
-        return 1;
+        return;
+    }
+
+    // A kernel stack overflow: a fault in the guard gap below a stack.
+    // With RSP itself there the page fault could not push its frame
+    // either, so it became a double fault, running on its IST stack
+    // (Linux exc_double_fault, handle_stack_overflow)
+    let guard = |a| crate::mm::vmstack::in_guard(a);
+    if matches!(vector, 8 | 14) && (guard(cr2) || guard(frame.rsp)) {
+        panic!(
+            "kernel stack overflow: RIP={:#x} RSP={:#x} CR2={:#x} (tid {})",
+            frame.rip,
+            frame.rsp,
+            cr2,
+            crate::task::percpu::current_tid()
+        );
     }
 
     // Cast to u8 for the rest of the handler
@@ -552,7 +533,7 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
     print_hex(frame.ss);
     serial_print(b"\r\n");
     serial_print(b"  Error Code: 0x");
-    print_hex(frame.error_code);
+    print_hex(error_code);
     serial_print(b"\r\n");
 
     // Print CR2 for page faults
@@ -563,25 +544,25 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
 
         // Decode page fault error code
         serial_print(b"  Page Fault: ");
-        if frame.error_code & 1 == 0 {
+        if error_code & 1 == 0 {
             serial_print(b"non-present ");
         } else {
             serial_print(b"protection ");
         }
-        if frame.error_code & 2 != 0 {
+        if error_code & 2 != 0 {
             serial_print(b"write ");
         } else {
             serial_print(b"read ");
         }
-        if frame.error_code & 4 != 0 {
+        if error_code & 4 != 0 {
             serial_print(b"user ");
         } else {
             serial_print(b"kernel ");
         }
-        if frame.error_code & 8 != 0 {
+        if error_code & 8 != 0 {
             serial_print(b"reserved-bit ");
         }
-        if frame.error_code & 16 != 0 {
+        if error_code & 16 != 0 {
             serial_print(b"instruction-fetch ");
         }
         serial_print(b"\r\n");
@@ -643,8 +624,7 @@ extern "C" fn handle_exception(frame: &mut X86_64TrapFrame, vector: u64) -> u64 
 /// one (copy_to_user etc.) is resolved like a user access, unless page
 /// faults are disabled (a spinlock is held: the copy's fixup reports
 /// EFAULT). Kernel-half addresses are never resolved.
-fn handle_page_fault(frame: &X86_64TrapFrame, addr: u64) -> Result<(), VmFault> {
-    let ec = frame.error_code;
+fn handle_page_fault(ec: u64, addr: u64) -> Result<(), VmFault> {
     let user = ec & 4 != 0;
     if addr >= crate::arch::x86_64::paging::TASK_SIZE || (!user && pagefault_disabled()) {
         return Err(VmFault::Segv);
@@ -697,180 +677,10 @@ fn print_dec(mut val: u64) {
     }
 }
 
-// IRQ handlers
-macro_rules! irq_handler {
-    ($name:ident, $irq:expr) => {
-        #[unsafe(naked)]
-        unsafe extern "C" fn $name() {
-            core::arch::naked_asm!(
-                "push 0",           // Dummy error code
-                "push rax",
-                "push rbx",
-                "push rcx",
-                "push rdx",
-                "push rsi",
-                "push rdi",
-                "push rbp",
-                "push r8",
-                "push r9",
-                "push r10",
-                "push r11",
-                "push r12",
-                "push r13",
-                "push r14",
-                "push r15",
-                "call {}",          // kernel GS base (every entry)
-
-                "mov rdi, {}",      // IRQ number
-                "call {}",
-
-                "pop r15",
-                "pop r14",
-                "pop r13",
-                "pop r12",
-                "pop r11",
-                "pop r10",
-                "pop r9",
-                "pop r8",
-                "pop rbp",
-                "pop rdi",
-                "pop rsi",
-                "pop rdx",
-                "pop rcx",
-                "pop rbx",
-                "pop rax",
-                "add rsp, 8",       // Skip error code
-                "iretq",
-                sym super::percpu::restore_kernel_gs,
-                const $irq,
-                sym handle_irq,
-            );
-        }
-    };
-}
-
-irq_handler!(irq_handler_0, 0); // Timer (PIT)
-irq_handler!(irq_handler_1, 1); // Keyboard
-irq_handler!(irq_handler_2, 2); // Cascade
-irq_handler!(irq_handler_3, 3); // COM2
-irq_handler!(irq_handler_4, 4); // COM1
-irq_handler!(irq_handler_5, 5); // LPT2
-irq_handler!(irq_handler_6, 6); // Floppy
-irq_handler!(irq_handler_7, 7); // LPT1/Spurious
-irq_handler!(irq_handler_8, 8); // RTC
-irq_handler!(irq_handler_9, 9); // ACPI/PCI
-irq_handler!(irq_handler_10, 10); // PCI
-irq_handler!(irq_handler_11, 11); // PCI
-irq_handler!(irq_handler_12, 12); // PS/2 Mouse
-irq_handler!(irq_handler_13, 13); // FPU
-irq_handler!(irq_handler_14, 14); // Primary ATA
-irq_handler!(irq_handler_15, 15); // Secondary ATA
-
-/// LAPIC timer interrupt handler stub
-#[unsafe(naked)]
-unsafe extern "C" fn lapic_timer_handler() {
-    core::arch::naked_asm!(
-        // Save all registers (same as other interrupt handlers)
-        "push 0",           // Dummy error code for uniform stack layout
-        "push rax",
-        "push rbx",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push rbp",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "call {}",          // kernel GS base (every entry)
-
-        // Pass trap frame pointer as argument
-        "mov rdi, rsp",
-        "call {}",
-
-        // Restore registers
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rbp",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rbx",
-        "pop rax",
-        "add rsp, 8",       // Skip error code
-        "iretq",
-        sym super::percpu::restore_kernel_gs,
-        sym handle_lapic_timer,
-    );
-}
-
 /// Call-function IPI vector (Linux CALL_FUNCTION_VECTOR)
 pub const CALL_FUNCTION_VECTOR: u8 = 0xfc;
 /// Reschedule IPI vector (Linux RESCHEDULE_VECTOR)
 pub const RESCHEDULE_VECTOR: u8 = 0xfd;
-
-/// An IPI entry stub: saves the registers, calls `$handler`
-macro_rules! ipi_handler {
-    ($name:ident, $handler:path) => {
-        #[unsafe(naked)]
-        unsafe extern "C" fn $name() {
-            core::arch::naked_asm!(
-                "push 0",
-                "push rax",
-                "push rbx",
-                "push rcx",
-                "push rdx",
-                "push rsi",
-                "push rdi",
-                "push rbp",
-                "push r8",
-                "push r9",
-                "push r10",
-                "push r11",
-                "push r12",
-                "push r13",
-                "push r14",
-                "push r15",
-                "call {}",          // kernel GS base (every entry)
-                "call {}",
-                "pop r15",
-                "pop r14",
-                "pop r13",
-                "pop r12",
-                "pop r11",
-                "pop r10",
-                "pop r9",
-                "pop r8",
-                "pop rbp",
-                "pop rdi",
-                "pop rsi",
-                "pop rdx",
-                "pop rcx",
-                "pop rbx",
-                "pop rax",
-                "add rsp, 8",
-                "iretq",
-                sym super::percpu::restore_kernel_gs,
-                sym $handler,
-            );
-        }
-    };
-}
-
-ipi_handler!(call_function_ipi, handle_call_function);
-ipi_handler!(reschedule_ipi, handle_reschedule);
 
 /// Run `f` as an interrupt handler: interrupt depth and lockdep's
 /// interrupt context account for it
@@ -889,19 +699,19 @@ fn in_irq(f: fn()) {
 
 /// Call-function IPI (Linux sysvec_call_function): EOI first, so a call
 /// queued while this one runs raises the vector again
-extern "C" fn handle_call_function() {
+fn handle_call_function() {
     lapic::eoi();
     in_irq(crate::smp::call_function_interrupt);
 }
 
 /// Reschedule IPI (Linux sysvec_reschedule_ipi)
-extern "C" fn handle_reschedule() {
+fn handle_reschedule() {
     lapic::eoi();
     in_irq(crate::smp::reschedule_interrupt);
 }
 
-/// Rust LAPIC timer handler
-extern "C" fn handle_lapic_timer(_frame: &X86_64TrapFrame) {
+/// LAPIC timer interrupt
+fn handle_lapic_timer() {
     // Track interrupt nesting depth
     let percpu = match super::percpu::try_current_cpu() {
         Some(p) => p,
@@ -930,20 +740,14 @@ extern "C" fn handle_lapic_timer(_frame: &X86_64TrapFrame) {
     lapic::eoi();
 
     // Decrement interrupt depth
-    let prev_depth = percpu.interrupt_depth.fetch_sub(1, Ordering::Relaxed);
-
-    // Only set reschedule flag if we're returning to depth 0 (not nested)
-    // The actual preemption will happen after IRETQ when the idle loop checks it
-    if prev_depth == 1 {
-        percpu.needs_reschedule.store(true, Ordering::Release);
-    }
+    percpu.interrupt_depth.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Timer tick counter
 static mut TIMER_TICKS: u64 = 0;
 
-/// Rust IRQ handler
-extern "C" fn handle_irq(irq: u64) {
+/// Legacy PIC interrupt `irq` (0-15)
+fn handle_irq(irq: u64) {
     let irq = irq as u8;
 
     match irq {

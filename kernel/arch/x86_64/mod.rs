@@ -17,6 +17,7 @@ pub mod barrier;
 pub mod context;
 pub mod cpu;
 pub mod drivers;
+pub mod entry;
 pub mod fpu;
 pub mod interrupts;
 pub mod io;
@@ -85,30 +86,32 @@ impl CpuOps for X86_64Arch {
     }
 }
 
-/// x86-64 trap frame - saved CPU state during interrupts/syscalls
+/// The user (or interrupted kernel) registers of an entry (Linux struct
+/// pt_regs, exact layout: `user_regs_struct` starts with it). Every
+/// entry builds one (entry.rs); for an entry from user mode it is at
+/// the top of the task's kernel stack (`task::percpu::current_pt_regs`).
 #[derive(Debug, Clone, Default)]
 #[repr(C)]
-pub struct X86_64TrapFrame {
-    // General purpose registers (pushed by software; `exception_common`
-    // pushes r15 first, so rax is at the lowest address)
-    pub rax: u64,
+pub struct PtRegs {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub rbp: u64,
     pub rbx: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rax: u64,
     pub rcx: u64,
     pub rdx: u64,
     pub rsi: u64,
     pub rdi: u64,
-    pub rbp: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-
-    // Pushed by CPU on interrupt/exception
-    pub error_code: u64,
+    /// The syscall number of a syscall, the error code of an exception
+    /// (until its handler takes it), else -1 (Linux orig_ax)
+    pub orig_rax: u64,
+    // Pushed by the CPU (by `syscall_entry` for a syscall)
     pub rip: u64,
     pub cs: u64,
     pub rflags: u64,
@@ -116,8 +119,52 @@ pub struct X86_64TrapFrame {
     pub ss: u64,
 }
 
-impl X86_64TrapFrame {
-    /// Create a new trap frame for entering user mode
+const _: () = assert!(core::mem::size_of::<PtRegs>() == 21 * 8);
+
+impl crate::arch::UserRegs for PtRegs {
+    fn ip(&self) -> u64 {
+        self.rip
+    }
+
+    fn sp(&self) -> u64 {
+        self.rsp
+    }
+
+    fn set_sp(&mut self, sp: u64) {
+        self.rsp = sp;
+    }
+
+    fn ret(&self) -> u64 {
+        self.rax
+    }
+
+    fn set_ret(&mut self, v: u64) {
+        self.rax = v;
+    }
+
+    fn in_syscall(&self) -> bool {
+        (self.orig_rax as i64) >= 0
+    }
+
+    fn forget_syscall(&mut self) {}
+
+    /// RIP back over the 2-byte `syscall`, the number back in RAX (Linux
+    /// regs->ax = regs->orig_ax; regs->ip -= 2). A RIP the 2 bytes do not
+    /// fit below (only a debugger could have put one there) is left alone
+    /// and the syscall fails with EINTR: the result stays a user address.
+    fn restart_syscall(&mut self) {
+        match self.rip.checked_sub(2) {
+            Some(ip) if ip < paging::TASK_SIZE => {
+                self.rip = ip;
+                self.rax = self.orig_rax;
+            }
+            _ => self.rax = crate::error::KernelError::Interrupted.sysret() as u64,
+        }
+    }
+}
+
+impl PtRegs {
+    /// A frame for entering user mode
     pub fn new_user(entry: u64, user_stack: u64) -> Self {
         Self {
             rip: entry,
@@ -125,18 +172,19 @@ impl X86_64TrapFrame {
             cs: cpu::USER_CODE_SELECTOR as u64,
             ss: cpu::USER_DATA_SELECTOR as u64,
             rflags: 0x202, // IF (interrupt enable) + reserved bit 1
+            orig_rax: u64::MAX,
             ..Default::default()
         }
     }
 }
 
 impl Arch for X86_64Arch {
-    type TrapFrame = X86_64TrapFrame;
+    type TrapFrame = PtRegs;
     type VirtAddr = u64;
     type PhysAddr = u64;
 
     fn user_entry_frame(entry: Self::VirtAddr, user_stack_top: Self::VirtAddr) -> Self::TrapFrame {
-        X86_64TrapFrame::new_user(entry, user_stack_top)
+        PtRegs::new_user(entry, user_stack_top)
     }
 }
 
@@ -146,11 +194,7 @@ impl Arch for X86_64Arch {
 
 impl UserModeOps for X86_64Arch {
     unsafe fn jump_to_user(entry: u64, user_stack: u64, kernel_stack: u64) -> ! {
-        // A new program image starts with the initial FP/SIMD state
-        fpu::load_init_state();
-        unsafe {
-            syscall::jump_to_user_iret(entry, user_stack, kernel_stack);
-        }
+        unsafe { entry::enter_user(entry, user_stack, kernel_stack) }
     }
 }
 
@@ -161,51 +205,8 @@ impl UserModeOps for X86_64Arch {
 impl SchedArch for X86_64Arch {
     type SchedPageTable = paging::X86_64PageTable;
 
-    const CLONE_FPU_RESERVE: u64 = fpu::CLONE_FPU_RESERVE;
-
-    fn clone_child_fpu(kstack_top: u64) {
-        fpu::save_for_clone_child(kstack_top);
-    }
-
-    fn clone_child_trapframe(
-        parent_rip: u64,
-        parent_rflags: u64,
-        child_rsp: u64,
-    ) -> Self::TrapFrame {
-        // Get parent's callee-saved registers from per-CPU storage
-        // These were saved during syscall entry
-        let (rbx, rbp, r12, r13, r14, r15) = percpu::get_syscall_user_callee_saved();
-
-        // Get parent's caller-saved/argument registers
-        // Linux ABI preserves these across syscalls, so child must inherit them
-        let (rdi, rsi, rdx, r8, r9, r10) = percpu::get_syscall_user_caller_saved();
-
-        X86_64TrapFrame {
-            // Callee-saved registers - inherit from parent
-            r15,
-            r14,
-            r13,
-            r12,
-            r11: parent_rflags, // Restore user RFLAGS (SYSRET convention)
-            r10,                // Inherit from parent (Linux ABI preserves)
-            r9,                 // Inherit from parent (Linux ABI preserves)
-            r8,                 // Inherit from parent (Linux ABI preserves)
-            rbp,
-            rdi,             // Inherit from parent (Linux ABI preserves)
-            rsi,             // Inherit from parent (Linux ABI preserves)
-            rdx,             // Inherit from parent (Linux ABI preserves)
-            rcx: parent_rip, // User return address (SYSRET convention)
-            rbx,
-            rax: 0, // Child returns 0 from fork/clone
-
-            // IRET frame
-            error_code: 0,
-            rip: parent_rip,
-            cs: cpu::USER_CODE_SELECTOR as u64,
-            rflags: parent_rflags,
-            rsp: child_rsp, // Child's user stack
-            ss: cpu::USER_DATA_SELECTOR as u64,
-        }
+    fn clone_child_fpu(regs: u64) -> u64 {
+        fpu::save_for_clone_child(regs)
     }
 }
 
@@ -215,8 +216,8 @@ impl SchedArch for X86_64Arch {
 
 use crate::arch::{
     AcpiInfo, AcpiOps, ArchBusOps, CpuInfo, EarlyArchInit, ExceptionOps, HaltOps, InitramfsOps,
-    IoremapOps, LocalTimerOps, MemoryLayoutOps, PowerInfo, PowerOps, SmpOps, SyscallOps,
-    TimekeeperOps, VfsInitOps,
+    IoremapOps, LocalTimerOps, MemoryLayoutOps, PowerInfo, PowerOps, SmpOps, TimekeeperOps,
+    VfsInitOps,
 };
 
 impl HaltOps for X86_64Arch {
@@ -368,18 +369,6 @@ impl TimekeeperOps for X86_64Arch {
 impl PowerOps for X86_64Arch {
     fn power_init(info: &PowerInfo) {
         power::init(info.pm1a_cnt_blk, info.pm1b_cnt_blk, info.slp_typa);
-    }
-}
-
-impl SyscallOps for X86_64Arch {
-    type SyscallHandler = syscall::SyscallHandler;
-
-    fn set_syscall_handler(handler: Self::SyscallHandler) {
-        syscall::set_syscall_handler(handler);
-    }
-
-    fn syscall_dispatcher() -> Self::SyscallHandler {
-        syscall::x86_64_syscall_dispatch
     }
 }
 

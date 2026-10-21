@@ -40,6 +40,9 @@ pub const KERNEL_MAP: u64 = 0xFFFF_FFFF_8000_0000;
 /// vmalloc/ioremap window (Linux: VMALLOC_START)
 pub const VMALLOC_START: u64 = 0xFFFF_C900_0000_0000;
 
+/// Kernel stacks (`mm::vmstack`): the vmalloc area's second gigabyte
+pub const VMSTACK_START: u64 = VMALLOC_START + (1 << 30);
+
 /// Virtual memory map: the struct page array, indexed by pfn (Linux
 /// VMEMMAP_START)
 pub const VMEMMAP_START: u64 = 0xFFFF_EA00_0000_0000;

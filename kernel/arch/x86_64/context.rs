@@ -12,7 +12,7 @@
 //! save/restore FS base in Rust before calling the pure-asm switch.
 
 use super::fpu::{self, FpuArea};
-use super::percpu::write_fs_base;
+use super::percpu::{write_fs_base, write_user_gsbase};
 
 // External assembly functions from switch_to.S
 unsafe extern "C" {
@@ -157,100 +157,55 @@ extern "C" fn kernel_thread_exit(_status: i64) {
     }
 }
 
-/// Entry point for cloned threads/processes
+/// Entry point for cloned threads/processes (Linux ret_from_fork)
 ///
-/// This function is the initial "return" target when switching to a new
-/// clone/fork child. The child's kernel stack has a TrapFrame at the top.
-/// We restore the trap frame and iretq to user mode.
-///
-/// When we arrive here via context_switch:
-/// - RSP points to a location where we placed a TrapFrame
-/// - We need to release the scheduler lock
-/// - The switch already loaded the child's address space (CR3)
-/// - Load the child's TLS (FS base) if CLONE_SETTLS was used
-/// - Restore all registers from TrapFrame
-/// - IRETQ to user mode with RAX=0 (child return value)
+/// The initial "return" target of a clone/fork child's first switch. Its
+/// pt_regs (the parent's syscall frame, RAX = 0) are at the top of its
+/// kernel stack, the FP/SIMD state the parent saved just below them; the
+/// switch frame ended at that state, so RSP points to it. The switch
+/// already loaded the child's address space, TLS and GS base.
 #[unsafe(naked)]
 pub extern "C" fn clone_child_entry() -> ! {
     core::arch::naked_asm!(
-        // First, release the scheduler lock that was held during context switch
-        // (the switch loaded the child's address space: mm::tlb::switch_mm)
-        "call {finish_switch}",
-        // Interrupts on, as in any syscall (Linux ret_from_fork): the
-        // child-TID write may fault and sleep
-        "sti",
-
-        // Write child TID if CLONE_CHILD_SETTID was used (for fork)
-        "call {write_child_tid}",
-
-        // Get and load the child's TLS (FS base)
-        // This handles CLONE_SETTLS - if no TLS was set, get_tls returns 0
-        "call {get_tls}",
-        // RAX now contains the TLS value (or 0 if not set)
-        "test rax, rax",
-        "jz 1f",                  // Skip wrmsr if TLS is 0
-        // Write to MSR_FS_BASE (0xC0000100)
-        // wrmsr expects: ECX = MSR number, EDX:EAX = value
-        "mov rdx, rax",
-        "shr rdx, 32",            // High 32 bits in EDX
-        "mov ecx, 0xC0000100",    // MSR_FS_BASE
-        "wrmsr",
-        "1:",
-
-        // Load the FP/SIMD state the parent saved above the TrapFrame
-        // (fpu::save_for_clone_child)
-        "lea rdi, [rsp + {tf_size}]",
-        "call {fpu_restore}",
-
-        // RSP points to the TrapFrame we prepared on the child's kernel stack
-        // TrapFrame layout:
-        //   rax, rbx, rcx, rdx, rsi, rdi, rbp, r8-r15,
-        //   error_code, rip, cs, rflags, rsp, ss
-
-        // Off for the return (IRETQ loads the user RFLAGS)
-        "cli",
-        // Restore general purpose registers from TrapFrame
-        "pop rax",     // Will be 0 (child return value)
-        "pop rbx",
-        "pop rcx",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-        "pop rbp",
-        "pop r8",
-        "pop r9",
-        "pop r10",
-        "pop r11",
-        "pop r12",
-        "pop r13",
-        "pop r14",
-        "pop r15",
-
-        // Skip error_code
-        "add rsp, 8",
-
-        // IRETQ will pop: rip, cs, rflags, rsp, ss
-        "iretq",
-
-        finish_switch = sym finish_context_switch,
-        write_child_tid = sym crate::task::percpu::write_child_tid_if_needed,
-        get_tls = sym crate::task::percpu::get_current_task_tls,
-        fpu_restore = sym super::fpu::restore_from_raw,
-        tf_size = const core::mem::size_of::<super::X86_64TrapFrame>(),
+        "mov rdi, rsp",
+        "call {tail}",
+        // RAX = the child's pt_regs: leave through IRET
+        "mov rsp, rax",
+        "jmp {ret}",
+        tail = sym ret_from_fork,
+        ret = sym super::entry::irq_return,
     );
+}
+
+/// The C part of `clone_child_entry` (Linux schedule_tail, then
+/// syscall_exit_to_user_mode): release the rq lock held across the
+/// switch, load the inherited FP state at `fpu`, write the child TID
+/// (CLONE_CHILD_SETTID, may fault and sleep: interrupts on, as in any
+/// syscall), the work of a syscall's return; returns the child's
+/// pt_regs, with interrupts off
+extern "C" fn ret_from_fork(fpu: *const FpuArea) -> *mut super::PtRegs {
+    crate::task::percpu::finish_context_switch();
+    // SAFETY: the area the parent saved (fpu::save_for_clone_child)
+    unsafe { fpu::restore_raw(fpu) };
+    super::interrupts::enable();
+    crate::task::percpu::write_child_tid_if_needed();
+    let regs = crate::task::percpu::current_pt_regs();
+    crate::entry::syscall_exit_to_user_mode(regs);
+    regs
 }
 
 impl TaskContext {
     /// Create a new context for a clone/fork child
     ///
     /// # Arguments
-    /// * `kstack_with_trapframe` - Kernel stack pointer where TrapFrame is stored
+    /// * `kstack_with_trapframe` - Where the child's first switch frame
+    ///   ends: its saved FP state (below its pt_regs)
     ///
     /// When context_switch restores this context, it will jump to clone_child_entry
-    /// which will restore the TrapFrame and iretq to user mode.
+    /// which returns to user mode through the child's pt_regs.
     ///
     /// Stack layout after setup (growing down):
-    ///   [kstack_with_trapframe]      = TrapFrame (already placed by caller)
+    ///   [kstack_with_trapframe]      = FP state (already saved by caller)
     ///   [kstack_with_trapframe - 8]  = clone_child_entry (return address)
     ///   [kstack_with_trapframe - 16] = rbp (0)
     ///   [kstack_with_trapframe - 24] = rbx (0)
@@ -260,7 +215,7 @@ impl TaskContext {
     ///   [kstack_with_trapframe - 56] = r15 (0)  <-- RSP points here
     ///
     /// After context switch pops 6 registers and `ret`:
-    /// RSP will point to kstack_with_trapframe (the TrapFrame)
+    /// RSP will point to kstack_with_trapframe (the FP state)
     pub fn new_clone_child(kstack_with_trapframe: u64) -> Self {
         // Build the stack frame that __switch_to_asm expects
         unsafe {
@@ -307,14 +262,17 @@ impl TaskContext {
 /// * `new_ctx` - The context to restore
 /// * `new_kstack` - New kernel stack top (for TSS.RSP0)
 /// * `next_tls` - its user TLS register value
+/// * `next_gs` - its user GS base (swapped in on its return to user)
 pub unsafe fn context_switch(
     old_ctx: *mut TaskContext,
     new_ctx: *const TaskContext,
     new_kstack: u64,
     next_tls: u64,
+    next_gs: u64,
 ) {
-    // Load next task's user TLS register (FS base)
+    // Load next task's user TLS register (FS base) and GS base
     write_fs_base(next_tls);
+    write_user_gsbase(next_gs);
 
     // The external assembly function uses a stack-based context.
     // It saves/restores callee-saved registers via push/pop on the stack,
@@ -346,14 +304,19 @@ pub unsafe fn context_switch(
 ///
 /// # Safety
 /// Same requirements as context_switch, except old_ctx is not used.
-pub unsafe fn context_switch_first(new_ctx: *const TaskContext, new_kstack: u64, next_tls: u64) {
-    // Load next task's user TLS register (FS base)
+pub unsafe fn context_switch_first(
+    new_ctx: *const TaskContext,
+    new_kstack: u64,
+    next_tls: u64,
+    next_gs: u64,
+) {
+    // Load next task's user TLS register (FS base) and GS base
     write_fs_base(next_tls);
+    write_user_gsbase(next_gs);
 
     // The external assembly function handles:
     // - Loading next task's RSP
-    // - Updating TSS.RSP0
-    // - Updating SYSCALL_KERNEL_STACK
+    // - Setting the kernel stack of entries from user mode
     // - Restoring callee-saved registers from the new stack
     unsafe {
         let next_sp = (*new_ctx).rsp;
@@ -388,9 +351,10 @@ impl ContextOps for X86_64Arch {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         next_tls: u64,
+        next_gs: u64,
     ) {
         unsafe {
-            context_switch(old_ctx, new_ctx, new_kstack, next_tls);
+            context_switch(old_ctx, new_ctx, new_kstack, next_tls, next_gs);
         }
     }
 
@@ -398,9 +362,10 @@ impl ContextOps for X86_64Arch {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         next_tls: u64,
+        next_gs: u64,
     ) -> ! {
         unsafe {
-            context_switch_first(new_ctx, new_kstack, next_tls);
+            context_switch_first(new_ctx, new_kstack, next_tls, next_gs);
             // The above never returns, but we need to satisfy the type system
             core::hint::unreachable_unchecked()
         }

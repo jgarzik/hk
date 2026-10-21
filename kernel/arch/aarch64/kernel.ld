@@ -49,7 +49,8 @@ SECTIONS
         *(.data .data.*)
     }
 
-    .bss ALIGN(4K) : AT(ADDR(.bss) - KIMAGE_OFFSET) {
+    /* 64KB: the BSP boot stack in it is aligned like every EL1 stack */
+    .bss ALIGN(64K) : AT(ADDR(.bss) - KIMAGE_OFFSET) {
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)

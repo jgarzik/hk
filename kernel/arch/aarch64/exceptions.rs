@@ -113,6 +113,20 @@ extern "C" fn handle_el1_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
     }
 }
 
+/// A kernel stack overflowed (vectors.S `el1_stack_overflow`, on this
+/// CPU's overflow stack): `sp` is where the exception frame would have
+/// gone (Linux handle_bad_stack)
+#[unsafe(no_mangle)]
+extern "C" fn handle_stack_overflow(sp: u64, elr: u64, far: u64) -> ! {
+    panic!(
+        "kernel stack overflow: SP={:#x} ELR={:#x} FAR={:#x} (tid {})",
+        sp,
+        elr,
+        far,
+        crate::task::percpu::current_tid()
+    );
+}
+
 /// Handle IRQ from EL1 (kernel mode)
 #[unsafe(no_mangle)]
 extern "C" fn handle_el1_irq(_frame: &mut Aarch64TrapFrame) {
@@ -170,23 +184,15 @@ fn irq_dispatch() {
 extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
     let ec = (esr >> 26) & 0x3F;
     let iss = esr & 0x1FFFFFF;
-    set_user_frame(frame);
+    // Not a syscall frame unless it is one (Linux el0t_64_sync)
+    frame.syscallno = super::NO_SYSCALL;
 
     match ec {
         EC_SVC64 => {
-            // System call
-            // Store user context for clone/fork before dispatch
-            // Safety: we're in the syscall handler, single-threaded access to our per-CPU data
-            // and TPIDR_EL1 has been set up during boot
-            if super::percpu::try_current_cpu().is_some() {
-                let percpu = unsafe { super::percpu::current_cpu_mut() };
-                percpu.syscall_user_elr = frame.elr;
-                percpu.syscall_user_spsr = frame.spsr;
-                percpu.syscall_user_sp = frame.sp;
-                // Save all GPRs for fork/clone (child needs to inherit parent's registers)
-                percpu.syscall_user_regs = frame.x;
-                percpu.syscall_orig_x0 = frame.x[0];
-            }
+            // System call: its number and first argument, for the
+            // restart (Linux el0_svc_common)
+            frame.orig_x0 = frame.x[0];
+            frame.syscallno = frame.x[8];
             // The user state is saved: run the syscall with IRQs
             // unmasked (Linux el0_svc). The kernel is not preemptive, so
             // an interrupt never switches tasks here (doc/LOCKING.md 7)
@@ -202,21 +208,12 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
                 frame.x[5], // arg5
             );
             frame.x[0] = result;
-            super::cpu::disable_interrupts();
-
-            // Update frame from percpu if signal delivery modified the context
-            // This is needed because do_signal() modifies percpu, not the frame
-            // Only update if the flag is set to avoid corrupting registers on normal syscalls
-            if super::percpu::try_current_cpu().is_some() {
-                let percpu = unsafe { super::percpu::current_cpu_mut() };
-                if percpu.signal_context_modified {
-                    percpu.signal_context_modified = false;
-                    frame.elr = percpu.syscall_user_elr;
-                    frame.spsr = percpu.syscall_user_spsr;
-                    frame.sp = percpu.syscall_user_sp;
-                    frame.x = percpu.syscall_user_regs;
-                }
-            }
+            // Signals, -ERESTART* rules, rescheduling before returning to
+            // user space (they may redirect the frame to a handler or
+            // back up over the svc; rt_sigreturn restored a whole user
+            // context and forgot the syscall); IRQs masked after
+            crate::entry::syscall_exit_to_user_mode(frame);
+            return;
         }
         EC_DABORT_LOWER => {
             let far: u64;
@@ -289,6 +286,10 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             user_fault(frame, crate::signal::SIGILL, info);
         }
     }
+    // Back to user mode: its pending work first (Linux
+    // exit_to_user_mode); the syscall returned above
+    super::cpu::disable_interrupts();
+    crate::entry::exit_to_user_mode(frame);
 }
 
 /// The access of a data or instruction abort to resolve (Linux
@@ -356,40 +357,19 @@ fn user_abort(
 }
 
 /// Deliver a synchronous fault signal (force_sig_fault) for the user
-/// context in `frame`: a handler runs when this exception returns
+/// context in `frame`, the task's pt_regs: a handler runs when this
+/// exception returns
 fn user_fault(frame: &mut Aarch64TrapFrame, sig: u32, info: KSigInfo) {
-    use super::percpu;
-
     super::cpu::enable_interrupts();
-    let p = unsafe { percpu::current_cpu_mut() };
-    p.syscall_user_elr = frame.elr;
-    p.syscall_user_spsr = frame.spsr;
-    p.syscall_user_sp = frame.sp;
-    p.syscall_user_regs = frame.x;
-    p.signal_context_modified = false;
-
-    crate::signal::force_sig_fault(sig, info);
-
-    let p = unsafe { percpu::current_cpu_mut() };
-    if core::mem::take(&mut p.signal_context_modified) {
-        frame.elr = p.syscall_user_elr;
-        frame.spsr = p.syscall_user_spsr;
-        frame.sp = p.syscall_user_sp;
-        frame.x = p.syscall_user_regs;
-    }
-}
-
-/// Record the trap frame of an entry from EL0 as the current task's user frame
-fn set_user_frame(frame: &mut Aarch64TrapFrame) {
-    if super::percpu::try_current_cpu().is_some() {
-        unsafe { super::percpu::current_cpu_mut() }.user_frame = frame;
-    }
+    crate::signal::force_sig_fault(sig, info, frame);
 }
 
 /// Handle IRQ from EL0 (user mode)
 #[unsafe(no_mangle)]
 extern "C" fn handle_el0_irq(frame: &mut Aarch64TrapFrame) {
-    set_user_frame(frame);
-    // For now, handle same as EL1 IRQ
+    frame.syscallno = super::NO_SYSCALL;
     handle_el1_irq(frame);
+    // Back to user mode: its pending work first (Linux
+    // irqentry_exit_to_user_mode)
+    crate::entry::exit_to_user_mode(frame);
 }

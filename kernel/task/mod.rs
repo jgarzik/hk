@@ -823,6 +823,11 @@ pub mod tif {
     /// A signal is deliverable under the blocked mask (Linux
     /// TIF_SIGPENDING)
     pub const SIGPENDING: u32 = 1 << 0;
+    /// Give up the CPU on the way back to user mode: the slice is used up
+    /// or a reschedule IPI arrived (Linux TIF_NEED_RESCHED)
+    pub const NEED_RESCHED: u32 = 1 << 1;
+    /// Work queued for the return to user mode (Linux TIF_NOTIFY_RESUME)
+    pub const NOTIFY_RESUME: u32 = 1 << 2;
 }
 
 /// A task (thread or process; Linux task_struct), shared as
@@ -874,6 +879,10 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// switch-out and loaded at switch-in; set by the task itself or its
     /// creator (CLONE_SETTLS)
     pub tls: AtomicU64,
+    /// User GS base (x86-64 ARCH_SET_GS, `mov gs`; Linux
+    /// thread.gsbase; 0 on arm64), saved at switch-out and loaded at
+    /// switch-in like `tls`; inherited by a fork child, 0 after exec
+    pub gsbase: AtomicU64,
     /// Seccomp mode (0 = DISABLED, 1 = STRICT, 2 = FILTER), set by the
     /// task itself; read at every syscall entry
     pub seccomp_mode: AtomicU8,
@@ -967,8 +976,6 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     pub cpus_allowed: crate::cpumask::CpuSet,
     /// Page table for this task
     pub page_table: PT,
-    /// Saved CPU state
-    pub trap_frame: A::TrapFrame,
 
     // =========================================================================
     // TLS and thread-exit fields (Linux: embedded in task_struct/thread_struct)
@@ -1290,6 +1297,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             pgid: AtomicU64::new(ids.pgid),
             sid: AtomicU64::new(ids.sid),
             tls: AtomicU64::new(0),
+            gsbase: AtomicU64::new(0),
             seccomp_mode: AtomicU8::new(ids.seccomp_mode),
             sig: crate::sync::spin::Mutex::new(TaskSignalState::new()),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
@@ -1331,6 +1339,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             pgid: AtomicU64::new(0),
             sid: AtomicU64::new(0),
             tls: AtomicU64::new(0),
+            gsbase: AtomicU64::new(0),
             seccomp_mode: AtomicU8::new(0),
             sig: crate::sync::spin::Mutex::new(TaskSignalState::boot()),
             keyrings: crate::sync::spin::Mutex::new(crate::keys::keyring::TaskKeyrings::new()),
@@ -1482,12 +1491,20 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
 
     pub fn set_sigpending(&self, on: bool) {
         if on {
-            self.thread_flags
-                .fetch_or(tif::SIGPENDING, Ordering::Release);
+            self.set_tif(tif::SIGPENDING);
         } else {
-            self.thread_flags
-                .fetch_and(!tif::SIGPENDING, Ordering::Release);
+            self.clear_tif(tif::SIGPENDING);
         }
+    }
+
+    /// Set Linux TIF_* flags `f` (anyone: the tick, an IPI, a signal)
+    pub fn set_tif(&self, f: u32) {
+        self.thread_flags.fetch_or(f, Ordering::Release);
+    }
+
+    /// Clear TIF_* flags `f`
+    pub fn clear_tif(&self, f: u32) {
+        self.thread_flags.fetch_and(!f, Ordering::Release);
     }
 
     /// Charge the time since the last boundary to user or system time

@@ -135,6 +135,10 @@ pub fn cpu_has_smep() -> bool {
     ebx & CPUID_SMEP != 0
 }
 
+/// SMAP is on: `clac` exists, and the IDT entries clear AC with it
+/// (entry.rs)
+pub static SMAP_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Enable SMAP if supported
 ///
 /// Should be called during early kernel initialization.
@@ -142,6 +146,7 @@ pub fn cpu_has_smep() -> bool {
 /// `user_access_begin()`/`user_access_end()` will cause a page fault.
 pub fn enable_smap() {
     if cpu_has_smap() {
+        SMAP_ON.store(true, core::sync::atomic::Ordering::Relaxed);
         let mut cr4: u64;
         unsafe {
             ::core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));

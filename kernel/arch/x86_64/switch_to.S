@@ -20,17 +20,16 @@
  * Arguments (System V AMD64 ABI):
  *   %rdi - Pointer to prev task's saved RSP location
  *   %rsi - next task's saved RSP value
- *   %rdx - new kernel stack top (for TSS.RSP0 and SYSCALL_KERNEL_STACK)
+ *   %rdx - new kernel stack top (TSS.RSP0 and per-CPU top_of_stack)
  *
  * The scheduler has already loaded the next task's address space
  * (mm::tlb::switch_mm). This function:
  *   1. Saves callee-saved registers on current stack
  *   2. Saves current RSP to *prev_sp_ptr
  *   3. Loads next task's RSP
- *   4. Updates TSS.RSP0 for interrupt handling
- *   5. Updates SYSCALL_KERNEL_STACK for syscall entry
- *   6. Restores callee-saved registers from new stack
- *   7. Returns (to the new task's saved return address)
+ *   4. Sets the kernel stack of entries from user mode (set_kernel_stack)
+ *   5. Restores callee-saved registers from new stack
+ *   6. Returns (to the new task's saved return address)
  */
 __switch_to_asm:
     /* Save callee-saved registers on current stack */
@@ -47,16 +46,9 @@ __switch_to_asm:
     /* Load next task's RSP */
     movq    %rsi, %rsp
 
-    /* Save new_kstack in a callee-saved register for use across calls */
-    movq    %rdx, %r12
-
-    /* Update TSS.RSP0 for interrupt handling */
-    movq    %r12, %rdi
+    /* Kernel stack of entries from user mode (TSS.RSP0, top_of_stack) */
+    movq    %rdx, %rdi
     call    set_kernel_stack
-
-    /* Update SYSCALL_KERNEL_STACK for syscall entry */
-    movq    %r12, %rdi
-    call    set_syscall_kernel_stack
 
     /* Restore callee-saved registers from new stack */
     popq    %r15
@@ -72,29 +64,21 @@ __switch_to_asm:
  *
  * Arguments:
  *   %rdi - next task's saved RSP value
- *   %rsi - new kernel stack top (for TSS.RSP0 and SYSCALL_KERNEL_STACK)
+ *   %rsi - new kernel stack top (TSS.RSP0 and per-CPU top_of_stack)
  *
  * Used for initial switch to first task or when switching from exiting task.
  * Does NOT save current context (no prev task to save).
  *
- * IMPORTANT: We must NOT push to the stack after loading next_sp, as that
- * would corrupt the saved register frame. Use a callee-saved register (r12)
- * to preserve new_kstack across calls.
+ * IMPORTANT: nothing is pushed onto the new stack after loading next_sp
+ * (a call uses the space below the saved register frame only).
  */
 __switch_to_asm_first:
     /* Load next task's RSP */
     movq    %rdi, %rsp
 
-    /* Save new_kstack in a callee-saved register (restored later anyway) */
-    movq    %rsi, %r12
-
-    /* Update TSS.RSP0 */
-    movq    %r12, %rdi
+    /* Kernel stack of entries from user mode (TSS.RSP0, top_of_stack) */
+    movq    %rsi, %rdi
     call    set_kernel_stack
-
-    /* Update SYSCALL_KERNEL_STACK (for syscall entry) */
-    movq    %r12, %rdi
-    call    set_syscall_kernel_stack
 
     /* Restore callee-saved registers from new stack */
     popq    %r15

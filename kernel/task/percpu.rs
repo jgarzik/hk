@@ -13,7 +13,9 @@ use ::core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::arch::{ContextOps, CpuOps, FrameAlloc, IrqSpinlock, PerCpuOps, SchedArch, UserModeOps};
+use crate::arch::{
+    ContextOps, CpuOps, FrameAlloc, IrqSpinlock, PerCpuOps, SchedArch, UserModeOps, UserRegs,
+};
 use crate::cpu::PerCpu;
 use crate::printkln;
 use crate::sync::spin::RwLock;
@@ -83,8 +85,9 @@ type CurrentArch = crate::arch::aarch64::Aarch64Arch;
 // Re-export the architecture's TaskContext type for convenience
 type TaskContext = <CurrentArch as ContextOps>::TaskContext;
 
-/// Size of kernel stack per thread (16KB)
-pub const KERNEL_STACK_SIZE: usize = 16 * 1024;
+/// Size of kernel stack per thread (16KB, with a guard gap below it:
+/// `mm::vmstack`)
+pub const KERNEL_STACK_SIZE: usize = crate::mm::vmstack::THREAD_SIZE;
 
 // Re-export the architecture's page table type for convenience
 type ArchPageTable = <CurrentArch as SchedArch>::SchedPageTable;
@@ -109,9 +112,6 @@ pub struct UserTaskConfig {
     /// Page table for the process
     pub page_table: ArchPageTable,
 }
-
-/// Page size
-const PAGE_SIZE: u64 = 4096;
 
 /// Sleep state of a task (Linux TASK_RUNNING / TASK_INTERRUPTIBLE /
 /// TASK_UNINTERRUPTIBLE / TASK_KILLABLE)
@@ -161,7 +161,7 @@ impl WakeMode {
 pub struct KernelThreadContext {
     /// Context for switching (callee-saved registers)
     pub context: TaskContext,
-    /// Base address of the kernel stack (direct map)
+    /// Base address of the kernel stack (`mm::vmstack`)
     pub stack_base: u64,
     /// Its size in bytes, freed when the task is dead; 0 if not owned
     pub stack_size: usize,
@@ -220,7 +220,7 @@ pub struct CpuRunQueue {
 /// What an exited task still holds while its CPU runs on its stack and
 /// its page tables: freed by the next task (`DeadTask::drop`)
 pub struct DeadTask {
-    /// Kernel stack (direct-map address) and size; size 0 = not owned
+    /// Kernel stack (`mm::vmstack` base) and size; size 0 = not owned
     stack: (u64, usize),
     /// mm_count reference on the address space it last ran in (mmdrop)
     mm: Option<alloc::sync::Arc<crate::mm::Mm>>,
@@ -235,8 +235,8 @@ const STACK_MIN_LEFT: usize = 4096;
 
 /// Linux CONFIG_DEBUG_STACK_USAGE check_stack_usage: kernel stacks start
 /// zeroed, so the untouched bottom shows how deep the task ever went.
-/// There is no guard page: a path that leaves too little room lets the
-/// next interrupt write into the page below the stack. Reported once.
+/// An overflow faults in the guard gap below the stack (a "kernel stack
+/// overflow" panic); this reports a path that came close. Reported once.
 fn check_stack_usage(base: u64, size: usize) {
     // SAFETY: the dead task's stack, still owned and no longer in use
     let words = unsafe { core::slice::from_raw_parts(base as *const u64, size / 8) };
@@ -259,10 +259,7 @@ impl Drop for DeadTask {
         let (base, size) = self.stack;
         if size != 0 {
             check_stack_usage(base, size);
-            let phys = crate::arch::virt_to_phys(base);
-            for off in (0..size as u64).step_by(PAGE_SIZE as usize) {
-                crate::FRAME_ALLOCATOR.free(phys + off);
-            }
+            crate::mm::vmstack::free(base);
         }
         // mmdrop: the last reference frees the top-level table
         drop(self.mm.take());
@@ -938,6 +935,21 @@ pub fn current() -> Cur {
     }
 }
 
+/// The user registers of task `t` while it is in the kernel (Linux
+/// task_pt_regs): the entry frame at the top of its kernel stack
+pub fn task_pt_regs(t: &KernelTask) -> *mut <CurrentArch as crate::arch::Arch>::TrapFrame {
+    let size = core::mem::size_of::<<CurrentArch as crate::arch::Arch>::TrapFrame>() as u64;
+    (t.kstack_top - size) as *mut _
+}
+
+/// The current task's user registers (Linux current_pt_regs); only for a
+/// task that entered from user mode (not kernel threads)
+#[allow(clippy::mut_from_ref)]
+pub fn current_pt_regs() -> &'static mut <CurrentArch as crate::arch::Arch>::TrapFrame {
+    // SAFETY: the running task's own frame, on its own kernel stack
+    unsafe { &mut *task_pt_regs(&current()) }
+}
+
 /// Timer tick counter (global)
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -974,25 +986,19 @@ fn idle_task_entry() -> ! {
     }
 }
 
-/// Size of idle task stack (8KB - smaller than regular threads)
-const IDLE_STACK_SIZE: usize = 8 * 1024;
-
 /// Create a kernel task (pid 0, kernel page table) owned by `cpu_id`
 ///
-/// `entry` runs on a fresh stack of `stack_size` bytes with the rq lock
+/// `entry` runs on a fresh kernel stack with the rq lock
 /// released (`finish_context_switch`) but interrupts still disabled; it must
 /// enable them. A kernel thread is its own process (pid == tid, Linux);
 /// an `idle` task is tid 0, outside TASKLIST (Linux swapper/N).
-#[allow(clippy::too_many_arguments)]
-fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
+fn create_kernel_task(
     cpu_id: u32,
     name: &str,
     entry: usize,
     priority: Priority,
-    stack_size: usize,
     start_asleep: bool,
     idle: bool,
-    frame_alloc: &mut FA,
 ) -> Result<Tid, &'static str> {
     let thread_pid = if idle {
         None
@@ -1005,20 +1011,11 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
     let tid = thread_pid.as_ref().map_or(0, |p| p.nr() as Tid);
     let pid = tid;
 
-    // Allocate the kernel stack (physically contiguous: it is used
-    // through the direct map)
-    let stack_pages = stack_size / PAGE_SIZE as usize;
-    let stack_base = frame_alloc
-        .alloc_contig(stack_pages)
-        .ok_or("Out of memory for kernel thread stack")?;
-    let stack_base = crate::arch::phys_to_virt(stack_base) as u64;
-    unsafe {
-        core::ptr::write_bytes(stack_base as *mut u8, 0, stack_size);
-    }
-    let stack_top = stack_base + stack_size as u64;
+    let stack_base = crate::mm::vmstack::alloc().ok_or("Out of memory for kernel thread stack")?;
+    let stack_top = stack_base + KERNEL_STACK_SIZE as u64;
 
     let context = TaskContext::new_kernel_thread(entry, stack_top);
-    let mut thread_ctx = KernelThreadContext::new(context, stack_base, stack_size, priority);
+    let mut thread_ctx = KernelThreadContext::new(context, stack_base, KERNEL_STACK_SIZE, priority);
     if start_asleep {
         // Not runnable until wake_up_task (lets the creator finish setup)
         thread_ctx.state = SleepState::Uninterruptible;
@@ -1040,7 +1037,6 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
         reset_on_fork: false,
         cpus_allowed: crate::cpumask::CpuSet::one(cpu_id),
         page_table: ArchPageTable::kernel_identity(),
-        trap_frame: Default::default(),
         // TLS fields (not used for idle task)
         clear_child_tid: 0,
         set_child_tid: 0,
@@ -1117,19 +1113,14 @@ fn create_kernel_task<FA: FrameAlloc<PhysAddr = u64>>(
 ///
 /// The idle task is always runnable at PRIORITY_IDLE (0). The CPU may enter
 /// the scheduler only once this is done, so `initialized` is set last.
-fn create_idle_task<FA: FrameAlloc<PhysAddr = u64>>(
-    cpu_id: u32,
-    frame_alloc: &mut FA,
-) -> Result<Tid, &'static str> {
+fn create_idle_task(cpu_id: u32) -> Result<Tid, &'static str> {
     let tid = create_kernel_task(
         cpu_id,
         "swapper",
         idle_task_entry as *const () as usize,
         PRIORITY_IDLE,
-        IDLE_STACK_SIZE,
         false,
         true,
-        frame_alloc,
     )?;
     let sched = get_percpu_sched(cpu_id);
     sched.lock.lock().idle_tid = Some(tid);
@@ -1149,27 +1140,17 @@ pub fn create_kthread_task(
     if !get_percpu_sched(cpu_id).initialized.load(Ordering::Acquire) {
         return Err("CPU has no scheduler");
     }
-    let mut fa = crate::frame_alloc::FrameAllocRef(&crate::FRAME_ALLOCATOR);
-    create_kernel_task(
-        cpu_id,
-        name,
-        entry,
-        priority,
-        KERNEL_STACK_SIZE,
-        true,
-        false,
-        &mut fa,
-    )
+    create_kernel_task(cpu_id, name, entry, priority, true, false)
 }
 
 /// Give every online AP a scheduler (idle task); each AP switches into it
 /// from its boot idle loop via `try_schedule()`
-pub fn init_ap_schedulers<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) {
+pub fn init_ap_schedulers() {
     let bsp = crate::cpu::this_id();
     for (cpu, _) in PERCPU_SCHEDS.for_each_possible() {
         if cpu != bsp
             && CurrentArch::cpu_online(cpu)
-            && let Err(e) = create_idle_task(cpu, frame_alloc)
+            && let Err(e) = create_idle_task(cpu)
         {
             printkln!("SCHED: no scheduler for CPU {}: {}", cpu, e);
         }
@@ -1184,16 +1165,14 @@ pub fn cpu_has_scheduler(cpu: u32) -> bool {
 }
 
 /// Initialize the global scheduler with idle task for BSP
-///
-/// Must be called with a frame allocator to create the BSP's idle task.
-pub fn init<FA: FrameAlloc<PhysAddr = u64>>(frame_alloc: &mut FA) {
+pub fn init() {
     // Initialize BSP's per-CPU scheduler
     let cpu_id = crate::cpu::this_id();
 
     printkln!("Per-CPU scheduler initialized for CPU {}", cpu_id);
 
     // Create idle task for BSP
-    match create_idle_task(cpu_id, frame_alloc) {
+    match create_idle_task(cpu_id) {
         Ok(_tid) => {}
         Err(e) => panic!("Failed to create BSP idle task: {}", e),
     }
@@ -1236,7 +1215,6 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         reset_on_fork: false,
         cpus_allowed: crate::cpumask::CpuSet::all(),
         page_table: config.page_table,
-        trap_frame: Default::default(),
         // TLS fields (initialized to 0, set by syscalls)
         clear_child_tid: 0,
         set_child_tid: 0,
@@ -1619,14 +1597,8 @@ pub fn has_children(parent_pid: Pid, target_pid: i64, wflags: i32) -> bool {
 pub struct CloneConfig {
     /// Clone flags (CLONE_VM, CLONE_THREAD, etc.)
     pub flags: u64,
-    /// Child's user stack top (required for CLONE_VM, 0 for fork)
+    /// Child's user stack top (required for CLONE_VM, 0: the parent's)
     pub child_stack: u64,
-    /// Parent's syscall return address (user RIP)
-    pub parent_rip: u64,
-    /// Parent's RFLAGS
-    pub parent_rflags: u64,
-    /// Parent's user stack pointer (for fork when child_stack == 0)
-    pub parent_rsp: u64,
     /// User address to store parent TID (CLONE_PARENT_SETTID)
     pub parent_tidptr: u64,
     /// User address to store child TID (CLONE_CHILD_SETTID/CLEARTID)
@@ -1811,36 +1783,25 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     };
     let child_pt = ArchPageTable::new(child_mm.as_ref().map_or(parent_pt_phys, |m| m.pgd()));
 
-    // Allocate kernel stack for child (16KB = 4 pages, physically
-    // contiguous: separately allocated frames need not be adjacent)
-    let stack_pages = KERNEL_STACK_SIZE / PAGE_SIZE as usize;
-    let stack_base = frame_alloc.alloc_contig(stack_pages).ok_or(12)?; // ENOMEM
-    let stack_base = crate::arch::phys_to_virt(stack_base) as u64;
-    unsafe {
-        core::ptr::write_bytes(stack_base as *mut u8, 0, KERNEL_STACK_SIZE);
-    }
+    // The child's kernel stack (zeroed, guard gap below)
+    let stack_base = crate::mm::vmstack::alloc().ok_or(12)?; // ENOMEM
     let kstack_top = stack_base + KERNEL_STACK_SIZE as u64;
 
-    // Determine child's user stack pointer
-    // For fork (child_stack == 0): inherit parent's stack
-    // For clone with explicit stack: use provided stack
-    let child_user_rsp = if config.child_stack == 0 {
-        config.parent_rsp
-    } else {
-        config.child_stack
-    };
-
-    // Build child's TrapFrame on the child's kernel stack, below the arch's
-    // reserve for the inherited FP/SIMD state (filled here, loaded by
-    // clone_child_entry before it returns to user mode)
-    // This will be restored by clone_child_entry via IRETQ
+    // Build child's TrapFrame at the top of the child's kernel stack (its
+    // pt_regs), the inherited FP/SIMD state below it if the arch keeps
+    // that apart (loaded by clone_child_entry before it returns to user
+    // mode)
     let trapframe_size = core::mem::size_of::<<CurrentArch as Arch>::TrapFrame>() as u64;
-    let trapframe_ptr = kstack_top - CurrentArch::CLONE_FPU_RESERVE - trapframe_size;
-    CurrentArch::clone_child_fpu(kstack_top);
+    let trapframe_ptr = kstack_top - trapframe_size;
 
-    // Use architecture-specific TrapFrame construction
-    let child_trapframe =
-        CurrentArch::clone_child_trapframe(config.parent_rip, config.parent_rflags, child_user_rsp);
+    // Every user register of the parent's syscall (Linux copy_thread:
+    // *childregs = *current_pt_regs()), returning 0, on its own stack
+    // unless it shares the parent's (fork: child_stack 0)
+    let mut child_trapframe = current_pt_regs().clone();
+    child_trapframe.set_ret(0);
+    if config.child_stack != 0 {
+        child_trapframe.set_sp(config.child_stack);
+    }
 
     // Copy TrapFrame to child's kernel stack
     unsafe {
@@ -1848,9 +1809,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         core::ptr::write(tf_ptr, child_trapframe);
     }
 
-    // Create TaskContext pointing to clone_child_entry
-    // RSP points to the TrapFrame we just placed
-    let context = CurrentArch::new_clone_child_context(trapframe_ptr);
+    // Create TaskContext pointing to clone_child_entry, its frame below
+    // the TrapFrame and the saved FP state
+    let frame_top = CurrentArch::clone_child_fpu(trapframe_ptr);
+    let context = CurrentArch::new_clone_child_context(frame_top);
     let thread_ctx =
         KernelThreadContext::new(context, stack_base, KERNEL_STACK_SIZE, child_priority);
 
@@ -1876,7 +1838,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         reset_on_fork: false, // Never inherited - child must set explicitly
         cpus_allowed: parent_cpus_allowed, // Inherit CPU affinity from parent
         page_table: child_pt,
-        trap_frame: Default::default(), // Not used - we have TrapFrame on stack
         // TLS fields - will be set based on clone flags below
         clear_child_tid: 0,
         set_child_tid: 0,
@@ -2053,6 +2014,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             .tls
             .store(crate::arch::read_user_tls(), Ordering::Relaxed);
     }
+    // ... and its user GS base (Linux copy_thread: gsbase)
+    child_task
+        .gsbase
+        .store(crate::arch::read_user_gsbase(), Ordering::Relaxed);
 
     // Handle CLONE_PARENT_SETTID: write child TID to parent's address space
     if config.flags & CLONE_PARENT_SETTID != 0 && config.parent_tidptr != 0 {
@@ -2378,7 +2343,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     rq.dead.push(dead);
 
     let next_tid = rq.dequeue_next();
-    let (Some(next_ctx), Some((next_kstack, next_mm, next_tls))) =
+    let (Some(next_ctx), Some((next_kstack, next_mm, (next_tls, next_gs)))) =
         (rq.get_context(next_tid), make_current(&rq, next_tid))
     else {
         // No context available, fall back to halt loop
@@ -2400,7 +2365,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // Switch to next task - never returns
     unsafe {
         switch_mm(next_mm);
-        CurrentArch::context_switch_first(next_ctx, next_kstack, next_tls);
+        CurrentArch::context_switch_first(next_ctx, next_kstack, next_tls, next_gs);
     }
 }
 
@@ -2408,13 +2373,13 @@ pub fn exit_current(status: Option<i32>) -> ! {
 /// `curr` points at it and /proc sees it running. Returns its kernel
 /// stack for user entry (0 for kernel threads, which never return to
 /// user mode), its address space (null for none) and its user TLS
-/// register.
+/// register and GS base.
 ///
 /// The caller holds the rq lock and `next` is not running, so nothing
 /// changes its address space meanwhile (only the task itself does, or
 /// its creator before it first runs), and the run queue's reference
 /// keeps it alive until it has switched away for good.
-fn make_current(rq: &CpuRunQueue, next: Tid) -> Option<(u64, *const crate::mm::Mm, u64)> {
+fn make_current(rq: &CpuRunQueue, next: Tid) -> Option<(u64, *const crate::mm::Mm, (u64, u64))> {
     let t = rq.entry(next)?.task.as_ref()?;
     t.sleeping.store(false, Ordering::Relaxed);
     let kstack = if matches!(t.kind, TaskKind::KernelThread) {
@@ -2427,7 +2392,11 @@ fn make_current(rq: &CpuRunQueue, next: Tid) -> Option<(u64, *const crate::mm::M
         .as_ref()
         .map_or(core::ptr::null(), |m| Arc::as_ptr(m.arc()));
     CurrentArch::set_current_task_ptr(Arc::as_ptr(t) as usize);
-    Some((kstack, mm, t.tls.load(Ordering::Relaxed)))
+    let tls = (
+        t.tls.load(Ordering::Relaxed),
+        t.gsbase.load(Ordering::Relaxed),
+    );
+    Some((kstack, mm, tls))
 }
 
 /// Load the address space of the task switched to (`make_current`)
@@ -2443,8 +2412,8 @@ unsafe fn switch_mm(mm: *const crate::mm::Mm) {
 ///
 /// The lock stays held across the switch and is released by whichever task
 /// runs next (its own guard drop, or `finish_context_switch` for a new
-/// task). The per-CPU syscall user-register block belongs to `cur` and is
-/// kept on its kernel stack until it runs again.
+/// task). `cur`'s user registers stay in its pt_regs, on its own kernel
+/// stack.
 fn context_switch_locked(
     sched: &PerCpuScheduler,
     mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>,
@@ -2457,17 +2426,19 @@ fn context_switch_locked(
         .entry(cur)
         .is_some_and(|e| e.state != SleepState::Running);
     me.sleeping.store(sleeps, Ordering::Relaxed);
-    // Save the outgoing task's user TLS register (user code may have
-    // changed it without a syscall, e.g. msr tpidr_el0); the arch switch
-    // loads `next`'s
+    // Save the outgoing task's user TLS register and GS base (user code
+    // may have changed them without a syscall, e.g. msr tpidr_el0, mov
+    // gs); the arch switch loads `next`'s
     if !me.is_kthread() {
         me.tls
             .store(crate::arch::read_user_tls(), Ordering::Relaxed);
+        me.gsbase
+            .store(crate::arch::read_user_gsbase(), Ordering::Relaxed);
     }
     if rq.get_context(next).is_none() || rq.get_context(cur).is_none() {
         return;
     }
-    let Some((next_kstack, next_mm, next_tls)) = make_current(&rq, next) else {
+    let Some((next_kstack, next_mm, (next_tls, next_gs))) = make_current(&rq, next) else {
         return;
     };
     let (Some(curr_ctx), Some(next_ctx)) = (rq.get_context_mut(cur), rq.get_context(next)) else {
@@ -2476,13 +2447,11 @@ fn context_switch_locked(
     rq.current = Some(next);
     sched.nr_switches.fetch_add(1, Ordering::Relaxed);
 
-    let saved = CurrentArch::save_syscall_user_state();
     unsafe {
         switch_mm(next_mm);
-        CurrentArch::context_switch(curr_ctx, next_ctx, next_kstack, next_tls);
+        CurrentArch::context_switch(curr_ctx, next_ctx, next_kstack, next_tls, next_gs);
     }
     // Back on `cur` (the rq lock is held again; `rq` releases it)
-    CurrentArch::restore_syscall_user_state(&saved);
     let dead = core::mem::take(&mut rq.dead);
     drop(rq);
     drop(dead);
@@ -2536,6 +2505,8 @@ pub fn set_current_state(state: SleepState) {
 pub fn schedule() {
     crate::sync::might_sleep();
     let Some(sched) = this_sched() else { return };
+    // This is the rescheduling a pending NEED_RESCHED asked for
+    current().clear_tif(crate::task::tif::NEED_RESCHED);
     let mut rq = sched.lock.lock();
     sched.drain_wakes(&mut rq);
     let Some(cur) = rq.current else { return };
@@ -2628,6 +2599,22 @@ pub fn wake_up_task(tid: Tid, cpu: u32, mode: WakeMode) -> bool {
     }
 }
 
+/// Make a task running on another CPU notice new work flags (a signal)
+/// soon: a reschedule IPI interrupts it, and its return to user mode
+/// runs the work (Linux kick_process). Nothing to do for a task on this
+/// CPU (it is the caller, or not running) or not running at all.
+/// Process context only (takes TASKLIST; the caller must not hold it).
+pub fn kick_process(tid: Tid) {
+    let Some(t) = TASKLIST.read().task(tid) else {
+        return;
+    };
+    let cpu = t.cpu();
+    let running = CurrentArch::current_task_ptr_of(cpu) == Arc::as_ptr(&t) as usize;
+    if running && crate::cpu::try_this_id() != Some(cpu) {
+        crate::smp::smp_send_reschedule(cpu);
+    }
+}
+
 /// Wake task `tid`, looking up its CPU (process context only: takes
 /// TASKLIST; the caller must not hold it)
 pub fn wake_up_tid(tid: Tid, mode: WakeMode) -> bool {
@@ -2661,7 +2648,10 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
 /// Every CPU's local timer fires every TICK_MS, so only CPU 0 advances the
 /// global tick count (jiffies) and checks software timers; previously each
 /// CPU advanced it, making time run ~Ncpu times too fast. All CPUs then do
-/// their own scheduler work (remote wakeups, expired sleepers).
+/// their own scheduler work (remote wakeups, expired sleepers), and the
+/// running task's slice (one tick, round robin within a priority) is used
+/// up: TIF_NEED_RESCHED, acted on at its next return to user mode
+/// (`entry::exit_to_user_mode`; Linux scheduler_tick -> resched_curr).
 pub fn scheduler_tick() {
     crate::sync::lockdep::irq_enter();
     if crate::cpu::try_this_id() == Some(0) {
@@ -2670,6 +2660,7 @@ pub fn scheduler_tick() {
         crate::timer::check_timers();
     }
     wake_sleepers();
+    current().set_tif(crate::task::tif::NEED_RESCHED);
     crate::sync::lockdep::irq_exit();
 }
 
@@ -2734,22 +2725,8 @@ pub fn finish_context_switch() {
     drop(dead);
 }
 
-/// Get the current task's TLS value
-///
-/// This is called from clone_child_entry to load the child's TLS register
-/// before returning to user mode.
-///
-/// Returns 0 if no TLS is set for this task.
-#[unsafe(no_mangle)]
-pub extern "C" fn get_current_task_tls() -> u64 {
-    let tid = current_tid();
-    if tid == 0 {
-        return 0;
-    }
-    current().tls.load(Ordering::Relaxed)
-}
-
-/// Write the child TID for CLONE_CHILD_SETTID (called from clone_child_entry)
+/// Write the child TID for CLONE_CHILD_SETTID (from the fork child's
+/// first return: clone_child_entry / ret_from_fork)
 ///
 /// This is called in the child's context after its page table is loaded,
 /// specifically for fork (non-CLONE_VM) where we couldn't write at clone time.
@@ -2818,11 +2795,30 @@ pub fn wake_sleepers() {
 /// The current thread stays runnable and goes to the back of its priority
 /// queue; another runnable thread (if any) gets to run.
 pub fn yield_now() {
+    yield_cpu();
+}
+
+/// Give up the CPU on the way back to user mode, the slice used up
+/// (TIF_NEED_RESCHED; Linux schedule() in exit_to_user_mode_loop): like
+/// `yield_now`, an involuntary switch if another task runs
+pub fn preempt_schedule_user() {
+    if yield_cpu() {
+        current().nivcsw.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `yield_now`; true if another task ran meanwhile
+fn yield_cpu() -> bool {
     crate::sync::might_sleep();
-    let Some(sched) = this_sched() else { return };
+    let Some(sched) = this_sched() else {
+        return false;
+    };
+    current().clear_tif(crate::task::tif::NEED_RESCHED);
     let mut rq = sched.lock.lock();
     sched.drain_wakes(&mut rq);
-    let Some(cur) = rq.current else { return };
+    let Some(cur) = rq.current else {
+        return false;
+    };
 
     // Refresh the cached priority (rq -> TASKLIST order); the idle
     // task (tid 0, not in the table) keeps its own
@@ -2836,7 +2832,7 @@ pub fn yield_now() {
             e.queued = true;
             (changed, priority)
         }
-        None => return,
+        None => return false,
     };
     if changed {
         rq.reserve_prio(priority);
@@ -2845,9 +2841,10 @@ pub fn yield_now() {
 
     let next = rq.dequeue_next();
     if next == cur {
-        return;
+        return false;
     }
     context_switch_locked(sched, rq, cur, next);
+    true
 }
 
 /// Get the current task's process ID
@@ -3540,6 +3537,11 @@ pub fn exec_replace_image(
         task.set_mm(Some(mm))
     });
 
+    // The new image starts with no user GS base (Linux start_thread:
+    // load_gs_index(0), gsbase 0)
+    current().gsbase.store(0, Ordering::Relaxed);
+    crate::arch::write_user_gsbase(0);
+
     // Leave the old tables before releasing them: their frames may be
     // reused at once by another CPU
     crate::mm::tlb::switch_mm(Some(&new));
@@ -3576,7 +3578,7 @@ pub fn try_schedule() {
     let Some(next_ctx) = rq.get_context(next) else {
         return;
     };
-    let Some((next_kstack, next_mm, next_tls)) = make_current(&rq, next) else {
+    let Some((next_kstack, next_mm, (next_tls, next_gs))) = make_current(&rq, next) else {
         return;
     };
     rq.current = Some(next);
@@ -3587,7 +3589,7 @@ pub fn try_schedule() {
     core::mem::forget(rq); // context_switch_first never returns
     unsafe {
         switch_mm(next_mm);
-        CurrentArch::context_switch_first(next_ctx, next_kstack, next_tls);
+        CurrentArch::context_switch_first(next_ctx, next_kstack, next_tls, next_gs);
     }
 }
 

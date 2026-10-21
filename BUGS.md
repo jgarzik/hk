@@ -11,25 +11,6 @@ chrooted process can still reach everything. `..` at the chroot root is
 not clamped either. Boot test `CHROOT` only verifies confinement on a
 Linux host (`user/boot_tester/tests/permissions.rs`).
 
-## x86: no SWAPGS, user GS base not preserved (T0)
-
-**Location**: `kernel/arch/x86_64/percpu.rs` (`restore_kernel_gs`),
-`syscall.rs`, `interrupts.rs`
-
-The kernel's per-CPU pointer is the live GS base. Every entry from user
-mode reloads it from TSC_AUX (the CPU index) before any Rust code, so a
-user `mov gs, sel` cannot redirect the kernel (stopgap). User code then
-runs with the kernel's GS base, not its own (Linux SWAPGS keeps the user
-base; ARCH_SET_GS / FSGSBASE are absent). The syscall entry stack is one
-global, not per CPU. Fix: SWAPGS plus per-CPU GDT/TSS.
-
-## Raw user-memory access in the pre-VFS minimal write
-
-**Location**: `kernel/arch/x86_64/syscall.rs` (default minimal handler)
-
-The early minimal `write` (used only before the VFS handler is
-registered) reads the user buffer raw, not through the uaccess helpers.
-
 ## Network stack gaps (later phases of the network chunk)
 
 **Location**: `kernel/net/`
@@ -210,20 +191,6 @@ de_thread
   with Linux's thread choice at delivery; a pidfd polls readable when
   the leader exits, not when the whole group is gone.
 
-## No signal delivery on return from an interrupt (P7)
-
-**Location**: `kernel/arch/x86_64/interrupts.rs`,
-`kernel/arch/aarch64/exceptions.rs` (IRQ return paths)
-
-Pending signals are delivered on the way out of a syscall or a fault
-only; an interrupt that arrives in user mode returns without the
-signal/reschedule work check (Linux exit_to_user_mode_loop), so a
-CPU-bound user task never takes SIGKILL or SIGSTOP: a thread spinning
-in user mode outlives its group's exit_group or fatal signal until its
-next syscall or fault, delaying the reap (and an exec's de_thread).
-With SMP user scheduling (P7) this needs the IRQ-return work check plus a kick IPI
-(Linux signal_wake_up -> kick_process).
-
 ## Tracees never stop
 
 **Location**: `kernel/task/ptrace.rs` (ptrace_stop, ptrace_report_syscall),
@@ -312,21 +279,18 @@ Nothing in hk can avoid it. Next: check the BIOS for Intel default
 power/turbo settings and current microcode, stress-test CPUs 2 and 5,
 or keep gate QEMUs off them (taskset) and see whether the crash stops.
 
-## Kernel stacks have no guard page; interrupts run on the task stack
+## Interrupts run on the task stack (no IRQ stacks)
 
-**Location**: `kernel/task/percpu.rs` (kernel stacks from the direct
-map), `kernel/arch/aarch64/vectors.S`, `kernel/arch/x86_64/` (IRQ entry)
+**Location**: `kernel/arch/aarch64/vectors.S`, `kernel/arch/x86_64/`
+(IRQ entry)
 
-A 16 KB kernel stack is contiguous direct-map memory with nothing
-mapped-out below it, and an interrupt pushes its trap frame (0x320
-bytes on arm64, with the FP/SIMD registers) and handler frames onto
-whatever task stack it lands on. A path that runs too deep therefore
-overwrites the page below the stack silently, and only when an IRQ
-arrives at the deepest point. `check_stack_usage` (Linux
-CONFIG_DEBUG_STACK_USAGE, STACK:FAIL under 4 KB left) catches a deep
-path only for tasks that exit. Linux has vmap'ed stacks with guard pages
-(CONFIG_VMAP_STACK) and, on arm64, per-CPU IRQ stacks. The rare
-instruction abort below may be an earlier overflow of this kind.
+An interrupt pushes its trap frame (0x320 bytes on arm64, with the
+FP/SIMD registers) and handler frames onto whatever 16 KB task stack
+it lands on, so the deepest syscall path plus the deepest interrupt
+must fit in one stack. An overflow now faults in the guard gap below
+the stack ("kernel stack overflow" panic, `mm::vmstack`) instead of
+corrupting memory. Linux has per-CPU IRQ stacks (x86 hardirq_stack,
+arm64 irq_stack).
 
 ## Rare arm64 kernel instruction abort in the fault-signal tests
 
@@ -567,9 +531,6 @@ From the fix-batch-1 /code-review (unverified). Tag = when to fix.
    fatal-on-arrival path; kill(1, SIGTERM) by root ends the system.
 3. **memblock MAX_REGIONS = 128 drops RAM silently** (next batch).
    `kernel/mm/memblock.rs:66`.
-4. **kmap direct_pages re-parses the multiboot map per 2MB chunk**
-   (next batch). `kernel/arch/x86_64/kmap.rs:149` (`RamMap::hits`):
-   O(regions × pages) at boot.
 5. **group_alive duplicates group_others** (next batch).
    `kernel/task/percpu.rs:1570` vs `:1459`.
 
@@ -626,18 +587,12 @@ Found during T0 (2026-10-19). Tag = when to fix.
 7. **T0 resume point** (T0 next). Design: ~/.claude/plans/
    t0-foundation-design.md (commit numbers below are its §3).
    Remaining: alloc_lock (TaskRes is under TASKLIST); PGID/SID
-   pid_links (kill_pgrp/setpgid scan); 9 per-CPU GDT/TSS/IST; 10 swapgs
-   (replaces the TSC_AUX GS stopgap; handle entries before per-CPU
-   init); 11/12 pt_regs single home (x86/arm64); 13 exit_to_user_mode,
-   slice tick, kick IPI, tests a-c (mask all DAIF on every arm64 return
-   to user, incl. clone child entry); kernel stack guard pages
-   (VMAP_STACK-style, overflow on a separate stack, "kernel stack
-   overflow" panic); 15 sched entity/ttwu(&Task); 16 intrusive
-   WaitQueue + FutexQ (wakeups by raw tid: waitqueue, futex, poll,
-   mqueue, signalfd, sem/msg); 17 per-CPU timer wheel; 18 hrtimer-lite
+   pid_links (kill_pgrp/setpgid scan); 15 sched entity/ttwu(&Task);
+   16 intrusive WaitQueue + FutexQ (wakeups by raw tid: waitqueue,
+   futex, poll, mqueue, signalfd, sem/msg); 17 per-CPU timer wheel; 18 hrtimer-lite
    + deadline waits; 19 yield polls and SCHEDULING_ENABLED fallbacks;
    20 GFP from context/reclaim; 21 try_* user-sized allocations; tests
-   e-h; an acct test with N threads exiting at once (one record).
+   f-h; an acct test with N threads exiting at once (one record).
 8. **MM_LIFE_EXEC_CHAIN intermittent on arm64 CI** (next batch). One
    GitHub `check-arm` run (TCG, NIC=e1000) reported
    `MM_LIFE_EXEC_CHAIN:FAIL -2`: both warmup chains passed, then the
@@ -648,3 +603,20 @@ Found during T0 (2026-10-19). Tag = when to fix.
    (23, 17, 281, 169, 170) but have no arm in
    `kernel/arch/aarch64/syscall.rs`, so they return ENOSYS. Add them
    with boot tests.
+10. **Network test flakes seen in the phase A sweep** (I). Once each:
+   `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64, 1 of 10
+   `check-stress` boots: poll reported POLLOUT for a nonblocking
+   connect to a just-closed loopback port, but no ECONNREFUSED was
+   pending); `NET_STRESS_TRUNC_RACE:FAIL reader status got 256` on the
+   x86 Linux reference (a reader hit its 2 s receive timeout under host
+   load).
+11. **Syscall exit takes the signal lock every time** (D):
+   `entry::syscall_exit_to_user_mode` runs `do_signal` unconditionally
+   (for -ERESTART* codes and `saved_sigmask` with nothing pending), and
+   its no-signal path (`restore_saved_sigmask`) locks Task.sig. Linux
+   only enters with TIF_SIGPENDING/TIF_NOTIFY_SIGNAL; a
+   TIF_RESTORE_SIGMASK-style flag would allow a lock-free early out.
+12. **arm64 overflow check misses a frame over 32 KB** (next batch):
+   vectors.S KERNEL_ENTRY tests bit 15 of SP only, so an SP that jumped
+   more than 32 KB below a stack base (one huge frame) lands where the
+   bit is clear and is not caught (the guard gap still faults).

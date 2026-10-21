@@ -53,23 +53,9 @@ pub struct UserRegsStruct {
 
 /// Get all general-purpose registers from a stopped tracee.
 ///
-/// The tracee must be in Traced state. This reads from the task's saved
-/// user context (percpu state from syscall entry or trap frame).
+/// The tracee must be in Traced state. This reads its user registers
+/// from its pt_regs (the entry frame at the top of its kernel stack).
 pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
-    // For a stopped tracee, the registers are saved in percpu when it entered
-    // the kernel (via syscall or trap). We need to find where they're stored.
-    //
-    // When a task is stopped for ptrace, its registers are in one of:
-    // 1. The percpu syscall_user_* fields (if it stopped during a syscall)
-    // 2. The trap frame on its kernel stack (if it stopped due to a trap/signal)
-    //
-    // For simplicity, we'll look at the percpu state for the current CPU
-    // if the task is on it, otherwise we'll need to access saved state.
-
-    // For now, we'll get registers from the task table's trap_frame
-    // This is a simplified approach - full implementation would need to
-    // handle the case where the task is stopped mid-syscall.
-
     let table = TASKLIST.read();
     let task = table.get(tid).ok_or(-3i32)?; // ESRCH
 
@@ -78,13 +64,10 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
         return Err(-3); // ESRCH - not stopped
     }
 
-    // Get registers from trap frame
-    // Note: The trap frame doesn't have all registers. For a full implementation,
-    // we'd need to save more state on syscall entry.
-    let tf = &task.trap_frame;
+    // Its pt_regs: the frame at the top of its kernel stack
+    // SAFETY: the tracee is stopped (TASKLIST held): its frame is stable
+    let tf = unsafe { &*crate::task::percpu::task_pt_regs(task.task) };
 
-    // Build UserRegsStruct from what we have
-    // Many values are 0 because trap_frame doesn't store them
     let regs = UserRegsStruct {
         r15: tf.r15,
         r14: tf.r14,
@@ -101,14 +84,14 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
         rdx: tf.rdx,
         rsi: tf.rsi,
         rdi: tf.rdi,
-        orig_rax: tf.rax, // We don't track orig_rax separately yet
+        orig_rax: tf.orig_rax,
         rip: tf.rip,
-        cs: 0x33, // User code segment
+        cs: tf.cs,
         eflags: tf.rflags,
         rsp: tf.rsp,
-        ss: 0x2b, // User stack segment
+        ss: tf.ss,
         fs_base: task.task.tls.load(core::sync::atomic::Ordering::Relaxed),
-        gs_base: 0,
+        gs_base: task.task.gsbase.load(core::sync::atomic::Ordering::Relaxed),
         ds: 0x2b,
         es: 0x2b,
         fs: 0,
@@ -120,11 +103,11 @@ pub fn get_user_regs(tid: Tid) -> Result<UserRegsStruct, i32> {
 
 /// Set all general-purpose registers for a stopped tracee.
 ///
-/// The tracee must be in Traced state. This updates the task's saved
-/// user context so the registers take effect when it resumes.
+/// The tracee must be in Traced state. This updates its pt_regs so the
+/// registers take effect when it resumes.
 pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
-    let mut table = TASKLIST.write();
-    let mut task = table.get_mut(tid).ok_or(-3i32)?; // ESRCH
+    let table = TASKLIST.read();
+    let task = table.get(tid).ok_or(-3i32)?; // ESRCH
 
     // Check task is in traced state
     if !matches!(task.state, crate::task::TaskState::Traced(_)) {
@@ -137,14 +120,14 @@ pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
     if regs.rip >= 0x0000_8000_0000_0000 {
         return Err(-5);
     }
-    // Linux putreg: a base at or above TASK_SIZE_MAX is EIO (the user
-    // GS base is not kept, but checked all the same)
+    // Linux putreg: a base at or above TASK_SIZE_MAX is EIO
     if !super::percpu::fs_base_ok(regs.fs_base) || !super::percpu::fs_base_ok(regs.gs_base) {
         return Err(-5);
     }
 
-    // Update trap frame with new register values
-    let tf = &mut task.trap_frame;
+    // Update its pt_regs with the new register values
+    // SAFETY: as in get_user_regs
+    let tf = unsafe { &mut *crate::task::percpu::task_pt_regs(task.task) };
     tf.r15 = regs.r15;
     tf.r14 = regs.r14;
     tf.r13 = regs.r13;
@@ -167,6 +150,9 @@ pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
     task.task
         .tls
         .store(regs.fs_base, core::sync::atomic::Ordering::Relaxed);
+    task.task
+        .gsbase
+        .store(regs.gs_base, core::sync::atomic::Ordering::Relaxed);
 
     Ok(())
 }
@@ -195,9 +181,10 @@ const RFLAGS_TF: u64 = 0x100;
 /// Sets the TF (Trap Flag) in RFLAGS so the CPU generates a debug exception
 /// after executing one instruction.
 pub fn enable_single_step(tid: Tid) {
-    let mut table = TASKLIST.write();
-    if let Some(mut task) = table.get_mut(tid) {
-        task.trap_frame.rflags |= RFLAGS_TF;
+    let table = TASKLIST.read();
+    if let Some(task) = table.get(tid) {
+        // SAFETY: as in get_user_regs
+        unsafe { (*crate::task::percpu::task_pt_regs(task.task)).rflags |= RFLAGS_TF };
     }
 }
 
@@ -205,8 +192,9 @@ pub fn enable_single_step(tid: Tid) {
 ///
 /// Clears the TF (Trap Flag) in RFLAGS.
 pub fn disable_single_step(tid: Tid) {
-    let mut table = TASKLIST.write();
-    if let Some(mut task) = table.get_mut(tid) {
-        task.trap_frame.rflags &= !RFLAGS_TF;
+    let table = TASKLIST.read();
+    if let Some(task) = table.get(tid) {
+        // SAFETY: as in get_user_regs
+        unsafe { (*crate::task::percpu::task_pt_regs(task.task)).rflags &= !RFLAGS_TF };
     }
 }

@@ -273,7 +273,9 @@ boot_lin_l1:
 boot_k_l1:
     .skip 4096
 
-.balign 16                  /* 16-byte (AAPCS64 SP); .align N is 2^N on arm */
+/* 64KB-aligned like every EL1 stack (vectors.S KERNEL_ENTRY: SP has
+ * bit 15 clear while on a stack); .align N is 2^N on arm */
+.balign 65536
 __stack_bottom:
     .skip 32768                 /* 32KB stack for BSP */
 .global __stack_top

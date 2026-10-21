@@ -6,6 +6,7 @@
 //! 0000000000000000 - 00007fffffffefff  user space (TASK_SIZE)
 //! ffff888000000000 - ...               direct map of RAM (PAGE_OFFSET)
 //! ffffc90000000000 - ffffc9003fffffff  vmalloc/ioremap window
+//! ffffc90040000000 - ffffc9005fffffff  kernel stacks (mm::vmstack)
 //! ffffffff80000000 - ...               kernel image (__START_KERNEL_map)
 //! ```
 //!
@@ -109,11 +110,20 @@ fn gbpages() -> bool {
 trait RamMap {
     fn each(&self, f: &mut dyn FnMut(u64, u64));
 
-    /// Some range overlaps [start, end)
-    fn hits(&self, start: u64, end: u64) -> bool {
-        let mut hit = false;
-        self.each(&mut |s, e| hit |= s < end && start < e);
-        hit
+    /// The 2MB chunks of the gigabyte at `base` some range overlaps,
+    /// as a 512-bit set (bit i: [base + i * 2MB, base + (i + 1) * 2MB));
+    /// one pass over the ranges per gigabyte
+    fn chunks(&self, base: u64) -> [u64; 8] {
+        let mut set = [0u64; 8];
+        self.each(&mut |s, e| {
+            let (s, e) = (s.max(base), e.min(base + SZ_1G));
+            if s < e {
+                for i in (s - base) / SZ_2M..(e - base).div_ceil(SZ_2M) {
+                    set[i as usize / 64] |= 1 << (i % 64);
+                }
+            }
+        });
+        set
     }
 
     /// End of the highest range
@@ -149,13 +159,13 @@ impl RamMap for BootRam {
 fn direct_pages(ram: &dyn RamMap, gb: bool, cap: u64, mut page: impl FnMut(u64, bool)) {
     let mut base = 0;
     while base < cap {
-        let whole = (0..512).all(|i| ram.hits(base + i * SZ_2M, base + (i + 1) * SZ_2M));
-        if gb && whole && base + SZ_1G <= cap {
+        let set = ram.chunks(base);
+        if gb && set.iter().all(|&w| w == u64::MAX) && base + SZ_1G <= cap {
             page(base, true);
         } else {
             for i in 0..512u64 {
                 let p = base + i * SZ_2M;
-                if p < cap && ram.hits(p, p + SZ_2M) {
+                if p < cap && set[i as usize / 64] & (1 << (i % 64)) != 0 {
                     page(p, false);
                 }
             }

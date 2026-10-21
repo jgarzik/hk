@@ -122,7 +122,17 @@ fn main() {
             panic!("Failed to assemble switch_to.S for aarch64");
         }
 
-        // Link the object files (linker script is already in .cargo/config.toml)
+        // The linker script, once: a .cargo/config.toml further up (this
+        // tree is a git worktree inside an older checkout) may pass it
+        // already, and lld runs a script given twice twice (every
+        // section symbol then lands at the image start)
+        let flags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+        if !flags.split('\x1f').any(|f| f.contains("kernel.ld")) {
+            let ld = Path::new(&manifest_dir).join("arch/aarch64/kernel.ld");
+            println!("cargo:rustc-link-arg=-T{}", ld.display());
+        }
+
+        // Link the object files
         println!("cargo:rustc-link-arg={}", boot_o.display());
         println!("cargo:rustc-link-arg={}", vectors_o.display());
         println!("cargo:rustc-link-arg={}", switch_to_o.display());

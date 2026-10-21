@@ -23,7 +23,6 @@
 //! - [`LocalTimerOps`] - Per-CPU timer operations
 //! - [`TimekeeperOps`] - Clock source and RTC operations
 //! - [`PowerOps`] - Power management (shutdown, reboot)
-//! - [`SyscallOps`] - Syscall handler registration
 //! - [`HardwareAccess`] - Driver I/O abstraction (port I/O vs MMIO)
 
 extern crate alloc;
@@ -97,6 +96,13 @@ pub use x86_64::ptrace;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::ptrace;
 
+// The user registers of an entry (Linux struct pt_regs)
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::PtRegs;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::Aarch64TrapFrame as PtRegs;
+
 // Signal frame setup (setup_rt_frame) / rt_sigreturn
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::signal;
@@ -122,6 +128,14 @@ pub use aarch64::percpu::read_tpidr_el0 as read_user_tls;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::percpu::fs_base_ok as user_tls_ok;
 
+// The current task's user GS base (x86-64 MSR_KERNEL_GS_BASE while in
+// the kernel; arm64 has none: 0, writes ignored)
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::percpu::{read_user_gsbase, write_user_gsbase};
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::percpu::{read_user_gsbase, write_user_gsbase};
+
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::percpu::tpidr_ok as user_tls_ok;
 
@@ -142,6 +156,13 @@ pub use aarch64::paging::{self, phys_to_virt, virt_to_phys};
 // TLB primitives behind mm::tlb
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::tlb;
+
+// Kernel pages in the vmalloc area (mm::vmstack)
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::ioremap::{vmap_page, vunmap_page};
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::ioremap::{vmap_page, vunmap_page};
 
 // TLB self-test hook (kselftest, LOCKDEP builds)
 #[cfg(all(feature = "lockdep", target_arch = "x86_64"))]
@@ -171,10 +192,36 @@ bitflags! {
     }
 }
 
+/// The user registers of a task in the kernel (Linux struct pt_regs and
+/// its accessors: instruction_pointer, user_stack_pointer,
+/// regs_return_value, syscall_get_nr): every entry from user mode builds
+/// one at the top of the task's kernel stack
+/// (`task::percpu::current_pt_regs`)
+pub trait UserRegs {
+    /// The user PC
+    fn ip(&self) -> u64;
+    /// The user stack pointer
+    fn sp(&self) -> u64;
+    fn set_sp(&mut self, sp: u64);
+    /// The syscall return register (x86 RAX, arm64 x0)
+    fn ret(&self) -> u64;
+    fn set_ret(&mut self, v: u64);
+    /// The frame is a syscall's (one that may still be restarted)
+    fn in_syscall(&self) -> bool;
+    /// No restart from here on (Linux forget_syscall; x86 keeps orig_ax,
+    /// as Linux does: its restart leaves the syscall number in RAX, never
+    /// an -ERESTART* code)
+    fn forget_syscall(&mut self);
+    /// Re-execute the syscall on return (Linux: the PC back over the
+    /// syscall instruction, its number or first argument back in the
+    /// return register)
+    fn restart_syscall(&mut self);
+}
+
 /// Architecture abstraction trait
 pub trait Arch {
-    /// Trap frame type for saving/restoring CPU state
-    type TrapFrame: Default + Clone;
+    /// Trap frame type for saving/restoring CPU state (Linux pt_regs)
+    type TrapFrame: Default + Clone + UserRegs;
     /// Virtual address type
     type VirtAddr: Copy + Eq;
     /// Physical address type
@@ -324,48 +371,15 @@ pub trait PerCpuOps {
     /// run-queue lock held; the run queue keeps it alive)
     fn set_current_task_ptr(p: usize);
 
-    /// Check if reschedule is needed on this CPU
-    fn needs_reschedule() -> bool;
-
-    /// Clear the reschedule flag, returning its previous value
-    fn clear_needs_reschedule() -> bool;
-
-    /// Set the reschedule flag
-    fn set_needs_reschedule(val: bool);
+    /// The task running on CPU `cpu` (`*const KernelTask`, 0 for its
+    /// boot task): a racy snapshot (Linux task_curr)
+    fn current_task_ptr_of(cpu: u32) -> usize;
 
     /// Get the interrupt nesting depth
     fn interrupt_depth() -> u32;
 
-    /// Get saved syscall user RIP (return address for clone/fork)
-    fn get_syscall_user_rip() -> u64;
-
-    /// Get saved syscall user RFLAGS
-    fn get_syscall_user_rflags() -> u64;
-
-    /// Get saved syscall user RSP (stack pointer for fork)
-    fn get_syscall_user_rsp() -> u64;
-
     /// Whether logical CPU `cpu` has been brought online
     fn cpu_online(cpu: u32) -> bool;
-
-    /// Per-CPU syscall user-register block (see `save_syscall_user_state`)
-    type SyscallUserState: Copy;
-
-    /// Capture this CPU's syscall user-register block. The block belongs to
-    /// the current task; the scheduler keeps it on the task's kernel stack
-    /// across context switches.
-    fn save_syscall_user_state() -> Self::SyscallUserState;
-
-    /// Restore a block captured by `save_syscall_user_state`
-    fn restore_syscall_user_state(state: &Self::SyscallUserState);
-
-    /// Record the syscall return value in the user-register block (so a
-    /// signal frame saves it)
-    fn set_syscall_return(val: u64);
-
-    /// Make the current syscall re-execute on return to user (restart after
-    /// -ERESTART*). Returns the value the return register must hold.
-    fn syscall_restart() -> u64;
 }
 
 /// CPU control operations
@@ -415,7 +429,9 @@ pub trait ContextOps: Sized {
     /// Switch from current task to a new task, saving current context
     ///
     /// Handles TLS save/restore in Rust before calling assembly, following
-    /// the Linux kernel pattern (tls_thread_switch before cpu_switch_to).
+    /// the Linux kernel pattern (tls_thread_switch before cpu_switch_to):
+    /// `next_tls` is the next task's user TLS register, `next_gs` its
+    /// user GS base (x86-64; ignored on arm64).
     ///
     /// # Safety
     /// - `old_ctx` must point to valid, writable memory
@@ -426,6 +442,7 @@ pub trait ContextOps: Sized {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         next_tls: u64,
+        next_gs: u64,
     );
 
     /// Switch to a task without saving current context
@@ -439,6 +456,7 @@ pub trait ContextOps: Sized {
         new_ctx: *const Self::TaskContext,
         new_kstack: u64,
         next_tls: u64,
+        next_gs: u64,
     ) -> !;
 }
 
@@ -466,40 +484,19 @@ pub trait UserModeOps {
 ///
 /// # Example
 /// ```ignore
-/// fn schedule<A: SchedArch>() {
-///     if A::needs_reschedule() {
-///         // ... perform context switch using A::context_switch()
-///     }
+/// fn switch<A: SchedArch>(old: *mut A::TaskContext, new: *const A::TaskContext) {
+///     unsafe { A::context_switch(old, new, 0, 0, 0) };
 /// }
 /// ```
 pub trait SchedArch: Arch + PerCpuOps + CpuOps + ContextOps + UserModeOps {
     /// The page table type for this architecture
     type SchedPageTable: PageTable<PhysAddr = u64, VirtAddr = u64>;
 
-    /// Build a child TrapFrame for clone/fork
-    ///
-    /// Creates the trap frame that will be placed on the child's kernel stack.
-    /// When the child is scheduled, it will restore this frame and return to
-    /// user mode with a return value of 0.
-    ///
-    /// # Arguments
-    /// * `parent_rip` - Parent's user return address
-    /// * `parent_rflags` - Parent's user flags
-    /// * `child_rsp` - Child's user stack pointer
-    fn clone_child_trapframe(
-        parent_rip: u64,
-        parent_rflags: u64,
-        child_rsp: u64,
-    ) -> Self::TrapFrame;
-
-    /// Bytes reserved at the top of a clone child's kernel stack, above its
-    /// TrapFrame, for the user FP/SIMD state it inherits (0 when the
-    /// TrapFrame itself carries the FP state)
-    const CLONE_FPU_RESERVE: u64;
-
-    /// Save the calling task's user FP/SIMD state into the reserve of a
-    /// clone child whose kernel stack top is `kstack_top`
-    fn clone_child_fpu(kstack_top: u64);
+    /// Save the calling task's user FP/SIMD state for a clone child whose
+    /// TrapFrame (at the top of its kernel stack) is at `regs`; returns
+    /// where the child's first switch frame ends (below the saved state,
+    /// or `regs` when the TrapFrame itself carries the FP state)
+    fn clone_child_fpu(regs: u64) -> u64;
 }
 
 // ============================================================================
@@ -732,25 +729,6 @@ pub trait PowerOps {
     /// # Arguments
     /// * `info` - Power management info from ACPI/device tree
     fn power_init(info: &PowerInfo);
-}
-
-/// Syscall mechanism operations
-///
-/// Abstracts the syscall entry/exit mechanism. On x86-64 this is
-/// the SYSCALL/SYSRET instructions, on ARM64 it's SVC.
-#[allow(dead_code)]
-pub trait SyscallOps {
-    /// Syscall handler function type
-    type SyscallHandler: Copy;
-
-    /// Register the syscall handler
-    ///
-    /// # Arguments
-    /// * `handler` - Function to call on syscall entry
-    fn set_syscall_handler(handler: Self::SyscallHandler);
-
-    /// Get the default syscall dispatcher function
-    fn syscall_dispatcher() -> Self::SyscallHandler;
 }
 
 /// Architecture-specific bus and driver initialization
