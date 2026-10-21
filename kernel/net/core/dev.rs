@@ -309,7 +309,7 @@ static SOFTNET: PerCpu<Softnet> = crate::percpu![Softnet::new()];
 static TIMER_DUE: AtomicBool = AtomicBool::new(false);
 
 /// Ask softnet/0 to run the protocol timers (from a `timer::Alarm`
-/// callback on ktimerd; thread context)
+/// callback on ktimers/N; thread context)
 pub fn raise_timer() {
     TIMER_DUE.store(true, Ordering::Release);
     SOFTNET.get(0).wq.wake_all();

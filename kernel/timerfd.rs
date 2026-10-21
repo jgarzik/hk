@@ -26,7 +26,7 @@
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::pin::Pin;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
@@ -36,7 +36,7 @@ use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimesp
 use crate::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::time::{ClockId, TIMEKEEPER};
 use crate::time_syscall::LinuxTimespec;
-use crate::timer::{TimerHandle, timer_add, timer_del};
+use crate::timer::TimerList;
 use crate::waitqueue::WaitQueue;
 
 /// Timerfd create flags
@@ -112,8 +112,6 @@ struct TimerfdInner {
     interval_ns: u64,
     /// Number of expirations since last read
     ticks: u64,
-    /// Handle to the timer in the timer subsystem
-    timer_handle: TimerHandle,
     /// settime flags (TFD_TIMER_ABSTIME, etc.)
     settime_flags: i32,
 }
@@ -125,7 +123,6 @@ impl TimerfdInner {
             expires_ns: 0,
             interval_ns: 0,
             ticks: 0,
-            timer_handle: TimerHandle::NULL,
             settime_flags: 0,
         }
     }
@@ -137,33 +134,27 @@ pub struct Timerfd {
     inner: IrqSpinlock<TimerfdInner>,
     /// Wait queue for blocking reads
     wait_queue: WaitQueue,
-    /// Unique ID for this timerfd (used as timer callback data)
-    id: u64,
+    /// Its expiry timer (SOFT; data: this timerfd, which outlives it:
+    /// dropping the timer waits out its callback)
+    timer: TimerList,
 }
-
-/// Global counter for timerfd IDs
-static NEXT_TIMERFD_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Global timerfd registry (maps ID -> weak ref)
-/// This allows the timer callback to find the timerfd
-static TIMERFD_REGISTRY: IrqSpinlock<alloc::vec::Vec<(u64, Weak<Timerfd>)>> =
-    IrqSpinlock::new(alloc::vec::Vec::new());
 
 impl Timerfd {
     /// Create a new timerfd
     pub fn new(clockid: i32) -> Arc<Self> {
-        let id = NEXT_TIMERFD_ID.fetch_add(1, Ordering::Relaxed);
         let timerfd = Arc::new(Self {
             inner: IrqSpinlock::new(TimerfdInner::new(clockid)),
             wait_queue: WaitQueue::new(),
-            id,
+            timer: TimerList::new(timerfd_fire, 0),
         });
-
-        // Register in global registry
-        let weak = Arc::downgrade(&timerfd);
-        TIMERFD_REGISTRY.lock().push((id, weak));
-
+        timerfd.timer.set_data(Arc::as_ptr(&timerfd) as usize);
         timerfd
+    }
+
+    /// Its timer (pinned: the timerfd lives in an Arc)
+    fn timer(&self) -> Pin<&TimerList> {
+        // SAFETY: an Arc's contents never move
+        unsafe { Pin::new_unchecked(&self.timer) }
     }
 
     /// Get current monotonic time in nanoseconds
@@ -181,16 +172,13 @@ impl Timerfd {
     /// # Returns
     /// Previous timer value
     pub fn settime(self: &Arc<Self>, new_value: &ITimerSpec, flags: i32) -> ITimerSpec {
+        // Cancel the existing timer, waiting out its callback (it takes
+        // `inner`)
+        self.timer.del_timer_sync();
         let mut inner = self.inner.lock();
 
         // Save old value
         let old_value = self.get_current_value_locked(&inner);
-
-        // Cancel existing timer if any
-        if inner.timer_handle.is_valid() {
-            timer_del(inner.timer_handle);
-            inner.timer_handle = TimerHandle::NULL;
-        }
 
         // Reset ticks
         inner.ticks = 0;
@@ -224,9 +212,7 @@ impl Timerfd {
         };
 
         inner.expires_ns = expires_ns;
-
-        // Register timer callback
-        inner.timer_handle = timer_add(expires_ns, inner.interval_ns, timerfd_callback, self.id);
+        self.timer().mod_timer_ns(expires_ns);
 
         old_value
     }
@@ -300,16 +286,29 @@ impl Timerfd {
         }
     }
 
-    /// Called when timer expires (from timer callback)
+    /// Called when timer expires (from timer callback): a periodic
+    /// timer counts every period that passed and re-arms for the next
+    /// (Linux hrtimer_forward_now)
     fn on_expire(&self) {
         {
             let mut inner = self.inner.lock();
-            inner.ticks = inner.ticks.saturating_add(1);
-
-            // For periodic timers, the timer infrastructure handles rescheduling
-            // For one-shot, clear expires_ns
+            if inner.expires_ns == 0 {
+                return;
+            }
             if inner.interval_ns == 0 {
+                inner.ticks = inner.ticks.saturating_add(1);
                 inner.expires_ns = 0;
+            } else {
+                let (missed, next) =
+                    crate::timer::forward(inner.expires_ns, inner.interval_ns, Self::now_ns());
+                inner.ticks = inner.ticks.saturating_add(missed);
+                match next {
+                    Some(n) => {
+                        inner.expires_ns = n;
+                        self.timer().mod_timer_ns(n);
+                    }
+                    None => inner.expires_ns = 0,
+                }
             }
         }
 
@@ -317,47 +316,16 @@ impl Timerfd {
         self.wait_queue.wake_all();
     }
 
-    /// Release the timerfd (cancel timer, unregister)
+    /// Release the timerfd (cancel the timer, waiting out its callback)
     fn release(&self) {
-        // Cancel timer
-        {
-            let mut inner = self.inner.lock();
-            if inner.timer_handle.is_valid() {
-                timer_del(inner.timer_handle);
-                inner.timer_handle = TimerHandle::NULL;
-            }
-        }
-
-        // Remove from registry
-        let mut registry = TIMERFD_REGISTRY.lock();
-        registry.retain(|(id, _)| *id != self.id);
+        self.timer.del_timer_sync();
     }
 }
 
-impl Drop for Timerfd {
-    fn drop(&mut self) {
-        // Cancel timer on drop
-        let inner = self.inner.lock();
-        if inner.timer_handle.is_valid() {
-            timer_del(inner.timer_handle);
-        }
-    }
-}
-
-/// Timer callback - finds the timerfd and calls on_expire
-fn timerfd_callback(data: u64) {
-    // Find timerfd by ID in registry
-    let timerfd_opt = {
-        let registry = TIMERFD_REGISTRY.lock();
-        registry
-            .iter()
-            .find(|(id, _)| *id == data)
-            .and_then(|(_, weak)| weak.upgrade())
-    };
-
-    if let Some(timerfd) = timerfd_opt {
-        timerfd.on_expire();
-    }
+/// The timer of a timerfd expired (`ktimers/N`)
+fn timerfd_fire(t: &TimerList) {
+    // SAFETY: `data` is the timerfd owning `t` (see `Timerfd::timer`)
+    unsafe { &*(t.data() as *const Timerfd) }.on_expire();
 }
 
 /// File operations for timerfd

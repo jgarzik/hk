@@ -180,8 +180,6 @@ pub struct CpuRunQueue {
     /// This CPU's idle task (Linux rq->idle): runs when nothing is
     /// queued; never queued, never asleep
     idle: *const KernelTask,
-    /// Timed sleepers (sorted by wake tick)
-    pub sleep_queue: Vec<SleepEntry>,
     /// The task that exited on this CPU, released once it has switched
     /// away from it (Linux finish_task_switch for TASK_DEAD); one at a
     /// time: the next task takes it before anything else runs
@@ -191,13 +189,6 @@ pub struct CpuRunQueue {
 // SAFETY: the task pointers are owned references (see above), used
 // under the rq lock
 unsafe impl Send for CpuRunQueue {}
-
-/// A timed sleeper (`schedule_timeout`): the task removes its entry
-/// when its sleep ends, so the pointer is live while queued
-pub struct SleepEntry {
-    task: *const KernelTask,
-    wake_tick: u64,
-}
 
 /// What an exited task still holds while its CPU runs on its stack and
 /// its page tables: freed by the next task (`DeadTask::drop`)
@@ -256,7 +247,6 @@ impl CpuRunQueue {
             queue: None,
             curr: core::ptr::null(),
             idle: core::ptr::null(),
-            sleep_queue: Vec::new(),
             dead: None,
         }
     }
@@ -295,17 +285,6 @@ impl CpuRunQueue {
         if self.curr_is_idle() || p.se.prio() > curr.se.prio() {
             curr.set_tif(crate::task::tif::NEED_RESCHED);
         }
-    }
-
-    /// Wake `p`, a task of this run queue, from the rq lock holder
-    /// (timeouts): the waker protocol of `try_to_wake_up`, which may
-    /// run concurrently (both end in `activate`, serialized here)
-    fn wake_locked(&mut self, p: &KernelTask, mode: WakeMode) -> bool {
-        if !mode.wakes(p.se.state()) {
-            return false;
-        }
-        self.activate(p);
-        true
     }
 
     /// The next task to run: the first of the highest priority queued,
@@ -1061,6 +1040,7 @@ fn wake_up_new_task(p: &TaskRef) {
 /// The idle task is always runnable at PRIORITY_IDLE (0). The CPU may enter
 /// the scheduler only once this is done, so `initialized` is set last.
 fn create_idle_task(cpu_id: u32) -> Result<(), &'static str> {
+    crate::timer::init_cpu(cpu_id);
     create_kernel_task(
         cpu_id,
         "swapper",
@@ -2261,8 +2241,6 @@ pub fn exit_current(status: Option<i32>) -> ! {
     } else {
         (0, 0)
     };
-    rq.sleep_queue
-        .retain(|e| !core::ptr::eq(e.task, &*me as *const KernelTask));
     // SAFETY: the run queue's reference to the running task
     let task = Some(unsafe { Arc::from_raw(rq.curr) });
     rq.dead = Some(DeadTask {
@@ -2437,43 +2415,37 @@ pub const MAX_SCHEDULE_TIMEOUT: u64 = u64::MAX;
 ///
 /// The caller sets its state first. Returns the ticks left (0 if the
 /// timeout expired); whichever of wakeup and timeout comes first ends the
-/// sleep and the other is cancelled.
+/// sleep and the other is cancelled. The timeout is a HARD timer on
+/// this stack (Linux process_timeout), deleted before returning.
 pub fn schedule_timeout(timeout: u64) -> u64 {
     if timeout == MAX_SCHEDULE_TIMEOUT {
         schedule();
         return MAX_SCHEDULE_TIMEOUT;
     }
-    let Some(sched) = this_sched() else { return 0 };
-    let expire = get_ticks().saturating_add(timeout);
+    if this_sched().is_none() {
+        return 0;
+    }
     let me = current();
-    let cur = &*me as *const KernelTask;
     if timeout == 0 {
         me.se.set_state(RUNNING);
         return 0;
     }
-    {
-        let mut rq = sched.lock.lock();
-        let pos = rq.sleep_queue.partition_point(|e| e.wake_tick <= expire);
-        rq.sleep_queue.insert(
-            pos,
-            SleepEntry {
-                task: cur,
-                wake_tick: expire,
-            },
-        );
-    }
+    let expire = get_ticks().saturating_add(timeout);
+    let t = core::pin::pin!(crate::timer::TimerList::new(
+        process_timeout,
+        crate::timer::TIMER_HARD
+    ));
+    t.set_data(&*me as *const KernelTask as usize);
+    t.as_ref().mod_timer(expire);
     schedule();
-    {
-        let mut rq = sched.lock.lock();
-        if let Some(pos) = rq
-            .sleep_queue
-            .iter()
-            .position(|e| core::ptr::eq(e.task, cur) && e.wake_tick == expire)
-        {
-            rq.sleep_queue.remove(pos);
-        }
-    }
+    t.del_timer_sync();
     expire.saturating_sub(get_ticks())
+}
+
+/// A `schedule_timeout` sleep timed out (tick interrupt): wake its task
+fn process_timeout(t: &crate::timer::TimerList) {
+    // SAFETY: the sleeper, which deletes the timer before it returns
+    try_to_wake_up(unsafe { &*(t.data() as *const KernelTask) }, WakeMode::Any);
 }
 
 /// Wake `p` if it sleeps in a state `mode` ends (Linux try_to_wake_up)
@@ -2630,20 +2602,20 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
 /// Per-CPU timer tick (IRQ context, every CPU)
 ///
 /// Every CPU's local timer fires every TICK_MS, so only CPU 0 advances the
-/// global tick count (jiffies) and checks software timers; previously each
-/// CPU advanced it, making time run ~Ncpu times too fast. All CPUs then do
-/// their own scheduler work (remote wakeups, expired sleepers), and the
-/// running task's slice (one tick, round robin within a priority) is used
-/// up: TIF_NEED_RESCHED, acted on at its next return to user mode
-/// (`entry::exit_to_user_mode`; Linux scheduler_tick -> resched_curr).
+/// global tick count (jiffies); previously each CPU advanced it, making
+/// time run ~Ncpu times too fast. All CPUs then do their own work
+/// (remote wakeups, their timers: HARD callbacks run here, `ktimers/N`
+/// is woken for SOFT ones), and the running task's slice (one tick,
+/// round robin within a priority) is used up: TIF_NEED_RESCHED, acted
+/// on at its next return to user mode (`entry::exit_to_user_mode`;
+/// Linux scheduler_tick -> resched_curr).
 pub fn scheduler_tick() {
     crate::sync::lockdep::irq_enter();
     if crate::cpu::try_this_id() == Some(0) {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-        // Wake ktimerd if a software timer expired
-        crate::timer::check_timers();
     }
-    wake_sleepers();
+    sched_ipi();
+    crate::timer::run_local();
     current().set_tif(crate::task::tif::NEED_RESCHED);
     crate::sync::lockdep::irq_exit();
 }
@@ -2748,30 +2720,6 @@ pub fn sleep_current_until(wake_tick: u64) {
             return;
         }
         schedule_timeout(wake_tick - now);
-    }
-}
-
-/// Timer-tick scheduler work for this CPU (IRQ context)
-///
-/// Applies remote wakeups and wakes tasks whose sleep timeout expired. Only
-/// touches this CPU's run queue; never takes TASKLIST.
-pub fn wake_sleepers() {
-    let current_tick = get_ticks();
-    let sched = match current_percpu_sched() {
-        Some(s) if s.initialized.load(Ordering::Acquire) => s,
-        _ => return,
-    };
-
-    let mut rq = sched.lock.lock();
-    sched.ttwu_pending(&mut rq);
-    while let Some(entry) = rq.sleep_queue.first() {
-        if entry.wake_tick > current_tick {
-            break; // sorted
-        }
-        let task = entry.task;
-        rq.sleep_queue.remove(0);
-        // SAFETY: the sleeper is alive while its entry is queued
-        rq.wake_locked(unsafe { &*task }, WakeMode::Any);
     }
 }
 

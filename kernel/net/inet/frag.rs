@@ -18,7 +18,7 @@
 //! ## Locking
 //!
 //! `FragTable.st` is a `crate::sync::spin::Mutex` (thread only: softnet and the
-//! reassembly timer on ktimerd), a leaf: completed datagrams and expiry
+//! reassembly timer on ktimers/N), a leaf: completed datagrams and expiry
 //! ICMP errors are handled after it is dropped.
 
 use alloc::collections::BTreeMap;
@@ -324,7 +324,7 @@ fn register(net: &Arc<crate::net::NetNamespace>) {
     }
 }
 
-/// Expiry timer (ktimerd): free timed-out queues, report them
+/// Expiry timer (ktimers/N): free timed-out queues, report them
 fn frag_timer(_: u64) {
     ALARM.fired();
     let nets: Vec<Arc<crate::net::NetNamespace>> = {

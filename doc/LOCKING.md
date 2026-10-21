@@ -324,6 +324,10 @@ Wakeups (3.1; any context, under any of the above):
     list is lock-free (pushed under pi_lock). Nothing else is taken
     under pi_lock or an rq lock: no TASKLIST, no allocation.
 
+Timers (3.3 Timers): owner locks (PosixTimer.inner, Timerfd.inner,
+    Alarm.st) → TimerBase.wheel (IrqSpinlock leaf, per CPU; callbacks
+    run with it dropped)
+
 Timekeeping (3.5):
     TimeKeeper.lock (IrqSpinlock leaf; writers only: the CPU 0 tick,
     clock_settime, init; readers are lockless seqlock retries)
@@ -412,7 +416,7 @@ The scheduler uses a per-CPU locking model to minimize contention.
 | `PERCPU_SCHEDS` | `PerCpu<PerCpuScheduler>` | Per-CPU scheduler array |
 | `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task (Linux tasklist_lock + task list) |
 | `SCHEDULING_ENABLED` | `AtomicBool` | Global scheduling enable flag |
-| `TICK_COUNT` | `AtomicU64` | Global tick counter (jiffies, TICK_MS = 10 ms); advanced only by CPU 0's tick, which also runs `check_timers()`; every CPU's tick runs its own `wake_sleepers()` |
+| `TICK_COUNT` | `AtomicU64` | Global tick counter (jiffies, TICK_MS = 10 ms); advanced only by CPU 0's tick; every CPU's tick applies its remote wakeups (`sched_ipi`) and runs its own timers (`timer::run_local`; Timers, 3.3) |
 
 #### Per-CPU State
 
@@ -469,7 +473,8 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    the arm64 ASID leaf (no TASKLIST: the switch and the wakeup use only
    `Task` atomics). Never call a wakeup (`try_to_wake_up`,
    `WaitQueue::wake*`) while holding this CPU's rq lock (it is not
-   recursive); timeouts the rq lock holder ends use `wake_locked`.
+   recursive); `schedule_timeout`'s HARD timer wakes its sleeper from
+   the tick with no rq lock held.
 
 3. **Context switch happens with lock held** - The lock is released by the
    task switched to (its guard drop, or `finish_context_switch` for a new
@@ -483,8 +488,8 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    preempt count stays balanced (dropping the guard there and releasing
    again in `finish_context_switch` left it at -1).
 
-5. **Timer ISR only touches local CPU** - `wake_sleepers()` drains the local
-   `wake_list` and wakes expired sleepers of the local sleep queue only.
+5. **Timer ISR only touches local CPU** - the tick drains the local
+   `wake_list` and runs the local CPU's timers only.
 
 9. **The idle task is never queued** - `rq.idle` runs when the lists are
    empty. Making a task runnable flags the running task NEED_RESCHED if
@@ -595,7 +600,7 @@ a wakeup/sleep; order: may be taken while holding nothing else) maps tid ->
 control block. `kthread_should_stop/should_park/parkme` and
 `kthread_stop/park/unpark` use atomics + `try_to_wake_up` + the block's
 `ack` WaitQueue. Unbound threads go round-robin to APs (CPU 0 runs the
-cooperative user tasks). Standing threads: `ktimerd` (CPU 0, runs software
+cooperative user tasks). Standing threads: `ktimers/N` (one per CPU, runs its SOFT
 timer callbacks), the system workqueue worker, `softnet/N` (one per CPU,
 network receive; see 3.10), `kselftest` (boot only).
 
@@ -672,7 +677,7 @@ reads only its fixed and atomic fields without the lock.
 
 1. **TASKLIST is NOT IRQ-safe** - Never acquire from interrupt handlers
 2. **IrqSpinlock → TASKLIST is safe** - IRQs disabled prevents ISR from running
-3. **wake_sleepers() caches priority** - `SleepEntry.priority` avoids TASKLIST in ISR
+3. **The tick reads no TASKLIST** - wakeups and timers use `Task` fields only
 4. **Nothing is released under TASKLIST** - a task's shared resources
    (`files`, `fs`, `nsproxy`, `sighand`/`signal`, `seccomp_filter`,
    `io_context`, `mm`, a reaped `Task`) are `take()`n or `replace()`d
@@ -741,7 +746,7 @@ takes `exec_update` for reading but not `cred_guard`; the exec takes
 
 #### Deferred State Updates
 
-`wake_sleepers()` does not update `Task.state: Sleeping → Ready` because:
+Wakeups do not update `Task.state: Sleeping → Ready` because:
 - Run queue membership is the source of truth for runnability
 - Updating would require TASKLIST lock (unsafe in ISR)
 - `TaskState` is only checked for zombie detection in `waitpid()`
@@ -1764,6 +1769,32 @@ nanoseconds), like Linux's `i_*time_sec` / `i_*time_nsec` fields:
   `inode_lock`): utimensat/utimes/utime take it after `want_write` and the
   permission check, then set atime, mtime and ctime.
 
+#### Timers (kernel/timer.rs; Linux kernel/time/timer.c)
+
+A `TimerList` is embedded in its pinned owner and armed in jiffies
+(`mod_timer`) or not before a CLOCK_MONOTONIC instant (`mod_timer_ns`,
+tick granularity, never early). Each CPU has a HARD and a SOFT base
+(`TimerBase`: an IrqSpinlock-protected 64-slot wheel, `running`, a wait
+queue); a timer stays on the base of the CPU that first armed it.
+
+- **HARD** callbacks run in the CPU's tick with interrupts off and only
+  wake tasks (`schedule_timeout`'s on-stack timer, Linux
+  process_timeout). **SOFT** callbacks run in `ktimers/N`, process
+  context (POSIX timers and itimers send signals, timerfd wakes
+  readers, `Alarm`s run the network protocol timers); the tick only
+  wakes the thread.
+- Callbacks run with the base lock dropped and `running` set.
+  `del_timer_sync` detaches and waits for a running callback (spinning
+  for HARD, whose callback runs with interrupts off on another CPU;
+  sleeping on the base's wait queue for SOFT, whose callback may
+  sleep), so the owner may go once it returns; dropping a `TimerList`
+  does that. Never call it from the timer's own callback, nor (SOFT)
+  where sleeping is not allowed; posix timers and timerfd cancel before
+  taking their `inner` lock (their callback takes it) and re-arm under
+  it.
+- Order: owner locks (`PosixTimer.inner`, `Timerfd.inner`, `Alarm.st`)
+  -> `TimerBase.wheel` (leaf).
+
 #### Wait Queues (kernel/waitqueue.rs)
 
 Linux-style wait queues (`include/linux/wait.h`, `kernel/sched/wait.c`).
@@ -1913,7 +1944,7 @@ snapshots. Writers (`update` from the CPU 0 timer tick, `set_realtime` from
 clock_settime/settimeofday, `init`) hold `TimeKeeper.lock`, an IrqSpinlock
 leaf, across the whole odd-`seq` window (Linux `timekeeper_lock`,
 `raw_spin_lock_irqsave` around `write_seqcount_begin/end`). IRQs off there is
-required: a tick on the writer's CPU reads the clock (`check_timers`) and
+required: a tick on the writer's CPU reads the clock (timer expiry) and
 would spin forever on the odd `seq` of the write it interrupted. The lock also
 keeps two writers from interleaving their `seq` bumps (which would let
 readers accept a torn snapshot). Nothing is taken under it.
@@ -2152,7 +2183,7 @@ the signal handler table must use an IRQ-safe lock. The `IrqSpinlock` ensures th
    per task, thread context only. Audit (T0): no interrupt handler
    sends a signal (the tty receive path is not driven from the UART
    IRQ, no SIGIO/SIGURG generation, POSIX timer/itimer expiry runs in
-   ktimerd, no tick-based SIGXCPU/SIGPROF, fault signals are sent by
+   `ktimers/N`, no tick-based SIGXCPU/SIGPROF, fault signals are sent by
    the faulting task with interrupts on). `send_signal` reports
    `SIGNAL:FAIL` if called with a nonzero interrupt depth (arm64 IRQ
    entry now counts the depth too).
@@ -2580,7 +2611,7 @@ do not rely on that.
 | `Softnet.wq` (per CPU) | `WaitQueue` | woken from IRQ | leaf (see Wait Queues) |
 | `Softnet.backlog` (per CPU) | `spin::Mutex<VecDeque<Box<SkBuff>>>` | thread only (`netif_rx`, `softnet/N`, inline flush) | leaf; max 1000 packets, then drop + `rx_dropped` |
 | `Softnet.busy` (per CPU) | `AtomicBool` | thread only | one task processes a CPU's backlog at a time (softnet/N or an inline `netif_rx_flush_local`); a flush that finds it set leaves the packets to the running one |
-| `dev::TIMER_DUE` | `AtomicBool` | thread (ktimerd sets, softnet/0 clears) | protocol timers are due: softnet/0 runs `tcp::timer::run` with no lock held |
+| `dev::TIMER_DUE` | `AtomicBool` | thread (an Alarm callback on `ktimers/N` sets, softnet/0 clears) | protocol timers are due: softnet/0 runs `tcp::timer::run` with no lock held |
 | `Napi.sched`, `Napi.disable` | `AtomicBool` | IRQ + thread | `sched` set by `napi_schedule` (only the setter queues it), cleared by `napi_complete_done` (a SeqCst RMW: a full barrier before the driver re-checks its pending causes, Linux cmpxchg), held by `napi_disable` (driver `stop`, RTNL held, sleeps until a running poll completes) until `napi_enable` (driver `open`); `disable` makes softnet complete an over-budget poll instead of requeueing it |
 | `NetDevice.running` | `AtomicBool` | thread (RTNL writers; NAPI poll readers) | Linux __LINK_STATE_START (`netif_running`): set before the driver's `open`, cleared before its `stop`; polls re-enable device interrupts only while set, checked under the driver's `rx` lock that `stop` takes to mask, so open/close never strand a device masked or leave a stopped one unmasked |
 | `PTYPE_BASE`, `PTYPE_ALL` | `spin::RwLock` (`Vec<..>` / fixed array of taps) | thread only | leaf; handlers copied out, called after unlock. Taps (AF_PACKET) run from `netif_receive_skb` and from `dev_queue_xmit` (PACKET_OUTGOING), i.e. possibly under a caller's socket or neighbour-free transmit path: they take only the AF_PACKET leaves below |
@@ -2591,7 +2622,7 @@ do not rely on that.
 | `TcpSock.rd` | `sync::Mutex<()>` (sleeping) | thread only (recvmsg) | serializes readers across peek -> user copy -> consume, so a faulting copy leaves the data queued (reader half of Linux `lock_sock`); a MSG_TRUNC reader that only discards takes it too; held only for that step, never across a wait; above `cb` |
 | `TcpSock.queue` | `spin::Mutex<Option<Accept>>` | thread only | leaf: a listener's SYN_RECEIVED children and accept queue; taken under the listener's or a child's `cb` |
 | `TimeWait.inner` (`net/tcp/timewait.rs`) | `spin::Mutex` | thread only | a TIME_WAIT entry's queue-less control block + timer slot; same position as `TcpSock.cb` (taken instead of it, never with it): its ACKs/RSTs are transmitted under it, then TCP `TIMERS` / `Alarm.st` as for `cb` |
-| TCP `TIMERS` (`net/tcp/timer.rs`) | `spin::Mutex<BTreeMap>` | thread only | leaf under `cb`/`TimeWait.inner`: (deadline, id) -> weak owner. `rearm` drops it before arming the `timer::Alarm` (so `cb` -> `Alarm.st` -> kernel `TIMERS`, never `TIMERS` -> `Alarm.st`); the Alarm only wakes softnet/0 (`dev::raise_timer`), which takes due entries out and runs each under its owner's lock with `TIMERS` dropped |
+| TCP `TIMERS` (`net/tcp/timer.rs`) | `spin::Mutex<BTreeMap>` | thread only | leaf under `cb`/`TimeWait.inner`: (deadline, id) -> weak owner. `rearm` drops it before arming the `timer::Alarm` (so `cb` -> `Alarm.st` -> timer base, never `TIMERS` -> `Alarm.st`); the Alarm only wakes softnet/0 (`dev::raise_timer`), which takes due entries out and runs each under its owner's lock with `TIMERS` dropped |
 | TCP tables `TcpTables.{bhash, ehash, lhash}` (`net/tcp/table.rs`, per netns) | `spin::RwLock` | thread only | `bhash` -> `ehash` (connect picks a port and inserts its four-tuple atomically); `lhash` -> `Inet.addr` (listener lookup scores candidates' bound address and device); candidates' `Inet.addr` and `Sock` flags are read under `bhash`; never a socket `cb` under a table lock (/proc/net/tcp copies the entries out, drops the table locks, then takes each `cb` / `TimeWait.inner` in turn) |
 | `Sock.errq` (`net/sock.rs`) | `spin::Mutex` | thread only (softnet ICMP error delivery, recvmsg MSG_ERRQUEUE, poll) | leaf: IP_RECVERR queue, bounded by SO_RCVBUF (own charge); the wakeup follows the unlock |
 | `IcmpRate.st` (`net/icmp.rs`, per netns) | `spin::Mutex` | thread only | leaf: global + per-destination (bounded, 256) ICMP error token buckets |
@@ -2607,11 +2638,11 @@ do not rely on that.
 | `NetNamespace` tables (`devices`, `loopback`), `UdpTable.socks` | `spin::RwLock` | thread only | reached only via lookup/insert methods returning owned values / `Arc` (no guard escapes: RCU-ready); the UDP port table reads each candidate's `Inet.addr` under its lock |
 | `Fib.tables` (`net/inet/fib.rs`, per netns) | `spin::RwLock` | thread only | leaf; written only under RTNL; read by input/output routing (softnet, socket syscalls, possibly under `sk_lock`) and dumps; returns `Arc<FibEntry>` clones; notifications are sent after the guard is dropped |
 | `NetDevice.addrs` (IPv4 list; IPv6 later) | `spin::RwLock` | thread only | leaf; written only under RTNL (`inet::ifaddr`), read via snapshots (`inet_addrs()`) |
-| `NeighTable.hash` (`net/core/neigh.rs`; `NetNamespace.arp`, IPv6 ND later) | `spin::RwLock` | thread only (softnet, socket output, ktimerd) | (ifindex, address) -> `Arc<Neighbour>`; lookups drop the guard; GC/flush take each entry's `inner` under the write lock (order hash -> inner) |
+| `NeighTable.hash` (`net/core/neigh.rs`; `NetNamespace.arp`, IPv6 ND later) | `spin::RwLock` | thread only (softnet, socket output, ktimers/N) | (ifindex, address) -> `Arc<Neighbour>`; lookups drop the guard; GC/flush take each entry's `inner` under the write lock (order hash -> inner) |
 | `Neighbour.inner` | `spin::Mutex` | thread only | leaf: NUD state + bounded unresolved queue (unres_qlen_bytes). Never held while transmitting, soliciting, reporting errors or arming the neighbour `Alarm` (the next deadline is read under it, armed after): state changes return actions run after the unlock |
-| neighbour `TABLES` | `spin::Mutex` | thread only | leaf (snapshot of registered tables). One `timer::Alarm` runs all tables' due entries and GC on `ktimerd`, armed with no table lock held |
-| `timer::Alarm.st` (neighbour, IP reassembly) | `spin::Mutex` | thread only | held across `timer_add/timer_del` (-> `TIMERS` IrqSpinlock); otherwise leaf |
-| `FragTable.st` (`net/inet/frag.rs`, per netns) | `spin::Mutex` | thread only (softnet, reassembly timer on ktimerd) | leaf: reassembly queues + memory charge; completed datagrams are delivered and expiry ICMP errors sent after it is dropped. Reassembly `TABLES` (registered namespaces) is a leaf `spin::Mutex` |
+| neighbour `TABLES` | `spin::Mutex` | thread only | leaf (snapshot of registered tables). One `timer::Alarm` runs all tables' due entries and GC on `ktimers/N`, armed with no table lock held |
+| `timer::Alarm.st` (neighbour, IP reassembly, TCP) | `spin::Mutex` | thread only | held across arming its SOFT `TimerList` (-> the timer base's IrqSpinlock); otherwise leaf |
+| `FragTable.st` (`net/inet/frag.rs`, per netns) | `spin::Mutex` | thread only (softnet, reassembly timer on ktimers/N) | leaf: reassembly queues + memory charge; completed datagrams are delivered and expiry ICMP errors sent after it is dropped. Reassembly `TABLES` (registered namespaces) is a leaf `spin::Mutex` |
 | `PmtuCache.m` (`net/inet/route.rs`, per netns) | `spin::Mutex` | thread only | leaf: learned path MTUs, read by `route::output` (possibly under a socket lock), written by ICMP frag-needed handling |
 | `NlTable.socks` (`net/netlink`, per netns) | `spin::RwLock` | thread only | leaf; bound netlink sockets by (protocol, portid); lookups return `Arc` clones. A bind/autobind checks the socket's `bound` and publishes its portid under the write lock (Linux netlink_insert), so concurrent binds of one socket cannot both insert |
 | `NlSock.dump` | `spin::Mutex<Option<Dump>>` | thread only (sender's `sendmsg`, reader's `recvmsg`) | running dump cursor; held while it snapshots devices/FIB/ARP and while its part is queued to `rxq` (keeps parts ordered); readers are woken after it is dropped; never with RTNL |
@@ -2649,7 +2680,7 @@ RTNL (sleeping; configuration)   TcpSock.rd (sleeping) -> TcpSock.cb (listener b
   |                                 -> TCP bhash -> ehash, lhash / UdpTable.socks /
   |                                    PingTable.socks -> Inet.addr
   |                                 -> TcpSock.queue / RxQueue.q
-  |                                 -> TCP TIMERS (leaf); Alarm.st -> kernel TIMERS
+  |                                 -> TCP TIMERS (leaf); Alarm.st -> timer base
   v                                 |
 NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
   the guard before returning)
@@ -2772,10 +2803,10 @@ else is taken under it) unless an order is given. "spin" is the
 |------|----------|-------|------------------|
 | `Task.vfork_done` | task/mod.rs | atomic pointer | the vforking parent's on-stack `Completion` (Linux vfork_done): set before the child runs, taken once by the child at exec/exit, which completes it; the parent waits uninterruptibly so the completion outlives that use |
 | `SignalStruct.posix_timers` | signal/mod.rs, posix_timer.rs | spin Mutex | the thread group's POSIX timers and ITIMER_REAL (Linux signal->posix_timers); leaf, thread context; deleted at the group's last exit (`exit_itimers`, timers stopped after the lock) or with the SignalStruct |
-| `POSIX_TIMER_REGISTRY` | posix_timer.rs | IrqSpinlock | timer id -> owner, read by the expiry callback (ktimerd) |
-| `PosixTimer.inner` | posix_timer.rs | IrqSpinlock | one timer's state; -> kernel `TIMERS` (`timer_del` on drop) |
+| `PosixTimer.inner` | posix_timer.rs | IrqSpinlock | one timer's state; -> its timer's base (re-armed under it); cancelled with `del_timer_sync` before it is taken (settime) or with it dropped (delete) |
+| `TimerBase.wheel` (per CPU, HARD and SOFT) | timer.rs | IrqSpinlock leaf | a 64-slot wheel of `TimerList`s (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the tick, by `ktimers/N` and by arming/deleting code in any context |
 | `Eventfd.inner`, `Eventpoll.inner`, `Inotify.inner`, `Fanotify.inner`, `IoUring.inner`, `Pidfd.inner`, `Signalfd.inner`, `Timerfd.inner` | eventfd.rs, epoll.rs, inotify.rs, fanotify.rs, io_uring.rs, pidfd.rs, signalfd.rs, timerfd.rs | IrqSpinlock | per-object state of the anon-inode files; their wait queues are woken after unlocking (pidfd: under it -> wait queue head) |
-| `SIGNALFD_REGISTRY`, `PIDFD_REGISTRY`, `TIMERFD_REGISTRY` | signalfd.rs, pidfd.rs, timerfd.rs | IrqSpinlock | live instances for signal, exit and expiry notification; registry -> the instance's `inner` |
+| `SIGNALFD_REGISTRY`, `PIDFD_REGISTRY` | signalfd.rs, pidfd.rs | IrqSpinlock | live instances for signal and exit notification; registry -> the instance's `inner` |
 | `Workqueue.inner` | workqueue.rs | IrqSpinlock | pending and delayed work lists (`SYSTEM_WQ`, `BDI_WORKQUEUE`); a work item's own `spin::Mutex<Work>` is taken and dropped before it |
 | `BDI_REGISTRY`, `BdiWriteback.dirty_inodes`, `BdiWriteback.dwork` | mm/writeback.rs | spin | per-device writeback state |
 | `DIRTY_ADDRESS_SPACES` | mm/page_cache.rs | spin Mutex | files with dirty pages (sync) |
@@ -3018,9 +3049,10 @@ is `SCHED:FAIL scheduling while atomic`).
 - `WaitQueue::wake_one/wake_all` and `try_to_wake_up` (IrqSpinlocks
   only, no allocation: wakes run under the head lock; the priority
   lists and remote wake lists are intrusive)
-- `timer::check_timers()` (CPU 0 tick): peeks `TIMERS` (IrqSpinlock) and
-  wakes `ktimerd`; timer callbacks themselves run in `ktimerd`, process
-  context (they may send signals, take Mutexes, allocate)
+- `timer::run_local()` (every CPU's tick): runs the CPU's due HARD timer
+  callbacks (they only wake tasks) and wakes `ktimers/N` when a SOFT one
+  is due; SOFT callbacks run there, in process context (they may send
+  signals, take Mutexes, allocate)
 - `napi_schedule()` (NIC ISRs): `Softnet.poll_list` IrqSpinlock push
   (pre-reserved, no allocation) and a wake of `softnet/N` (allocation-free
   as above); a no-op while the NAPI is scheduled or disabled
@@ -3048,11 +3080,11 @@ If interrupt context needs to trigger something that requires non-IRQ-safe locks
 
 1. Record the event (atomic, or an IrqSpinlock-protected queue)
 2. Wake a kernel thread (`WaitQueue::wake_*` / `try_to_wake_up`, IRQ-safe)
-3. The actual work is done in thread context (`ktimerd`, workqueue
+3. The actual work is done in thread context (`ktimers/N`, workqueue
    workers, `softnet/N` threads for network receive)
 
-Example: the CPU 0 tick notices an expired software timer and wakes
-`ktimerd`, which runs the callback (posix timers send signals there). The
+Example: a CPU's tick notices an expired SOFT timer and wakes
+`ktimers/N`, which runs the callback (posix timers send signals there). The
 tick's TIF_NEED_RESCHED is only acted on when the task returns to user
 mode (3.1).
 
