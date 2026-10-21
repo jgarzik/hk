@@ -974,8 +974,11 @@ pub fn send_signal(tid: Tid, sig: u32) -> i32 {
 /// into the kernel so its return to user mode delivers the signal
 /// (kick_process). Process context, TASKLIST not held.
 fn signal_wake_up(tid: Tid, mode: crate::task::percpu::WakeMode) {
-    if !crate::task::percpu::wake_up_tid(tid, mode) {
-        crate::task::percpu::kick_process(tid);
+    let Some(t) = crate::task::percpu::TASKLIST.read().task(tid) else {
+        return;
+    };
+    if !crate::task::percpu::try_to_wake_up(&t, mode) {
+        crate::task::percpu::kick_process(&t);
     }
 }
 

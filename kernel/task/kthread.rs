@@ -20,7 +20,7 @@
 //!
 //! `KTHREADS` (crate::sync::spin::Mutex, process context only) maps tid -> control
 //! block; it is never held across a wakeup or sleep. Stop/park requests are
-//! atomics plus a direct `wake_up_task`; requesters wait on the control
+//! atomics plus a direct `try_to_wake_up`; requesters wait on the control
 //! block's `WaitQueue` for the thread to acknowledge.
 
 use alloc::sync::Arc;
@@ -31,16 +31,16 @@ use crate::sync::spin::Mutex;
 
 use crate::error::KernelError;
 use crate::task::percpu::{
-    SleepState, WakeMode, cpu_has_scheduler, create_kthread_task, current_tid, schedule,
-    set_current_state, wake_up_task,
+    SleepState, TaskRef, WakeMode, cpu_has_scheduler, create_kthread_task, current_tid, schedule,
+    set_current_state, try_to_wake_up,
 };
 use crate::task::{PRIORITY_NORMAL, Priority, Tid};
 use crate::waitqueue::WaitQueue;
 
 /// Kernel thread control block (Linux struct kthread)
 pub struct KThread {
-    /// Task id (set before the thread first runs)
-    tid: AtomicU32,
+    /// The thread (set before it first runs)
+    task: spin::Once<TaskRef>,
     /// CPU the thread is bound to
     pub cpu: u32,
     func: fn(usize),
@@ -56,11 +56,13 @@ pub struct KThread {
 impl KThread {
     /// Task id of the thread
     pub fn tid(&self) -> Tid {
-        self.tid.load(Ordering::Acquire) as Tid
+        self.task.get().map_or(0, |t| t.tid())
     }
 
     fn wake(&self) {
-        wake_up_task(self.tid(), self.cpu, WakeMode::Any);
+        if let Some(t) = self.task.get() {
+            try_to_wake_up(t, WakeMode::Any);
+        }
     }
 }
 
@@ -103,7 +105,7 @@ pub fn kthread_run_prio(
         None => pick_cpu(),
     };
     let k = Arc::new(KThread {
-        tid: AtomicU32::new(0),
+        task: spin::Once::new(),
         cpu,
         func,
         arg,
@@ -114,9 +116,9 @@ pub fn kthread_run_prio(
         ack: WaitQueue::new(),
     });
     // The task is created asleep: register it before it can look itself up
-    let tid = create_kthread_task(cpu, name, kthread_entry as *const () as usize, priority)
+    let task = create_kthread_task(cpu, name, kthread_entry as *const () as usize, priority)
         .map_err(|_| KernelError::OutOfMemory)?;
-    k.tid.store(tid as u32, Ordering::Release);
+    k.task.call_once(|| task);
     KTHREADS.lock().push(k.clone());
     k.wake();
     Ok(k)

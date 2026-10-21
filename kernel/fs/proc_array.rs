@@ -84,7 +84,7 @@ fn snap(pid: Pid) -> Option<Snap> {
         state: match t.state {
             // The run state as of its last switch (Linux task_state)
             TaskState::Ready | TaskState::Running | TaskState::Sleeping => {
-                if t.task.sleeping.load(core::sync::atomic::Ordering::Relaxed) {
+                if t.task.se.state() != crate::task::percpu::SleepState::Running as u8 {
                     TaskState::Sleeping
                 } else {
                     TaskState::Running
@@ -102,7 +102,7 @@ fn snap(pid: Pid) -> Option<Snap> {
         nivcsw: t.task.nivcsw.load(core::sync::atomic::Ordering::Relaxed),
         min_flt: t.task.min_flt.load(core::sync::atomic::Ordering::Relaxed),
         maj_flt: t.task.maj_flt.load(core::sync::atomic::Ordering::Relaxed),
-        nice: crate::task::priority_to_nice(t.priority),
+        nice: crate::task::priority_to_nice(t.task.se.prio()),
         policy: t.policy,
         rt_priority: t.rt_priority,
         cpus: t.cpus_allowed,

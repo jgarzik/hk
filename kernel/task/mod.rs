@@ -865,9 +865,12 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub thread_flags: AtomicU32,
     /// CPU whose run queue owns this task (tasks never migrate)
     pub cpu: AtomicU32,
-    /// Sleeping, as of its last switch out (/proc state; the truth is
-    /// the run queue's)
-    pub sleeping: AtomicBool,
+    /// Scheduling state: sleep state, run-queue link, priority, switch
+    /// frame (Linux __state, on_rq, sched_entity)
+    pub se: sched::SchedEntity,
+    /// Serializes the task's wakers (Linux pi_lock): IrqSpinlock, taken
+    /// before its CPU's rq lock (`try_to_wake_up`)
+    pub pi_lock: crate::arch::IrqSpinlock<()>,
 
     /// Parent process ID (0 for init/orphans; written under TASKLIST)
     pub ppid: AtomicU64,
@@ -964,8 +967,6 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     // =========================================================================
     /// Current state
     pub state: TaskState,
-    /// Scheduling priority (higher = more important)
-    pub priority: Priority,
     /// Scheduling policy (SCHED_NORMAL, SCHED_FIFO, SCHED_RR, etc.)
     pub policy: i32,
     /// Real-time priority (1-99 for SCHED_FIFO/RR, 0 otherwise)
@@ -1292,7 +1293,8 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             flags: AtomicU32::new(flags),
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(cpu),
-            sleeping: AtomicBool::new(false),
+            se: sched::SchedEntity::new(PRIORITY_NORMAL, 0),
+            pi_lock: crate::arch::IrqSpinlock::new(()),
             ppid: AtomicU64::new(ids.ppid),
             pgid: AtomicU64::new(ids.pgid),
             sid: AtomicU64::new(ids.sid),
@@ -1334,7 +1336,8 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             flags: AtomicU32::new(pf::KTHREAD),
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(0),
-            sleeping: AtomicBool::new(false),
+            se: sched::SchedEntity::new(PRIORITY_NORMAL, 0),
+            pi_lock: crate::arch::IrqSpinlock::new(()),
             ppid: AtomicU64::new(0),
             pgid: AtomicU64::new(0),
             sid: AtomicU64::new(0),
@@ -1500,6 +1503,11 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     /// Set Linux TIF_* flags `f` (anyone: the tick, an IPI, a signal)
     pub fn set_tif(&self, f: u32) {
         self.thread_flags.fetch_or(f, Ordering::Release);
+    }
+
+    /// Any of TIF_* flags `f` is set
+    pub fn has_tif(&self, f: u32) -> bool {
+        self.thread_flags.load(Ordering::Acquire) & f != 0
     }
 
     /// Clear TIF_* flags `f`

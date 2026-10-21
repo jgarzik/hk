@@ -56,19 +56,20 @@ pub unsafe trait Adapter {
 }
 
 /// `adapter!(vis Name, Type, field)`: an [`Adapter`] for `Type.field`
+/// (a nested `a.b` field too)
 #[macro_export]
 macro_rules! adapter {
-    ($vis:vis $name:ident, $t:ty, $field:ident) => {
+    ($vis:vis $name:ident, $t:ty, $($field:ident).+) => {
         $vis struct $name;
         // SAFETY: offset_of! gives the field's place in the item
         unsafe impl $crate::list::Adapter for $name {
             type Item = $t;
             fn link(item: &$t) -> &$crate::list::Link {
-                &item.$field
+                &item.$($field).+
             }
             unsafe fn item(link: *const $crate::list::Link) -> *const $t {
                 // SAFETY: the caller passes a link inside a live item
-                unsafe { (link as *const u8).sub(core::mem::offset_of!($t, $field)) as *const $t }
+                unsafe { (link as *const u8).sub(core::mem::offset_of!($t, $($field).+)) as *const $t }
             }
         }
     };

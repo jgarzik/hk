@@ -13,8 +13,8 @@
 //!   take scheduler ticks and return the ticks left.
 //! - Wakers (`wake_one`/`wake_all`) may run in any context, including IRQ
 //!   handlers: the queue lock is an `IrqSpinlock`, the task wakeup only
-//!   takes run-queue locks (never TASKLIST), and nothing on the wake
-//!   path allocates.
+//!   takes the task's pi_lock and a run-queue lock (never TASKLIST), and
+//!   nothing on the wake path allocates.
 //!
 //! ## Usage
 //!
@@ -28,9 +28,9 @@
 //!
 //! ## Lock Ordering
 //!
-//! The queue's IrqSpinlock is taken before the run-queue lock / remote
-//! `wake_list` (wakeups are issued under it, like Linux); nothing else
-//! nests inside it. Never call a `wait*` function while holding a
+//! The queue's IrqSpinlock is taken before the task's pi_lock and the
+//! run-queue lock (wakeups are issued under it, like Linux); nothing
+//! else nests inside it. Never call a `wait*` function while holding a
 //! spinlock, and never wake while holding this CPU's run-queue lock.
 
 use alloc::vec::Vec;
@@ -38,10 +38,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::error::KernelError;
-use crate::task::Tid;
 use crate::task::percpu::{
-    MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current_tid, schedule, schedule_timeout,
-    set_current_state, wake_up_task,
+    KernelTask, MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current, current_tid, schedule,
+    schedule_timeout, set_current_state, try_to_wake_up,
 };
 
 /// Source of unique wait entry ids
@@ -52,10 +51,8 @@ static NEXT_WAIT_ID: AtomicU64 = AtomicU64::new(1);
 struct WaitQueueEntry {
     /// Unique id (identifies the registration for removal)
     id: u64,
-    /// Waiting task
-    tid: Tid,
-    /// CPU owning the waiting task
-    cpu: u32,
+    /// Waiting task (it removes the entry before it can go away)
+    task: *const KernelTask,
     /// Remove the entry when it is woken (autoremove_wake_function); poll
     /// registrations stay until the poll ends
     autoremove: bool,
@@ -128,8 +125,7 @@ impl WaitQueue {
         }
         head.push(WaitQueueEntry {
             id: entry.id,
-            tid: current_tid(),
-            cpu: crate::cpu::this_id(),
+            task: &*current() as *const KernelTask,
             autoremove,
         });
     }
@@ -285,19 +281,20 @@ impl WaitQueue {
     /// Wake up to `nr` waiters (`usize::MAX` = all) under the head lock
     /// without allocating (Linux __wake_up_common: try_to_wake_up runs
     /// under wq_head->lock), so IRQ handlers may wake. Order: head ->
-    /// run-queue lock / remote `wake_list`.
+    /// pi_lock -> run-queue lock.
     fn wake_nr(&self, nr: usize) -> usize {
         let mut head = self.head.lock();
         let mut woken = 0;
         let mut i = 0;
         while i < head.len() && woken < nr {
-            let (tid, cpu, auto) = (head[i].tid, head[i].cpu, head[i].autoremove);
+            let (task, auto) = (head[i].task, head[i].autoremove);
             if auto {
                 head.remove(i);
             } else {
                 i += 1;
             }
-            wake_up_task(tid, cpu, WakeMode::Any);
+            // SAFETY: a queued waiter is alive (see `task`)
+            try_to_wake_up(unsafe { &*task }, WakeMode::Any);
             woken += 1;
         }
         woken

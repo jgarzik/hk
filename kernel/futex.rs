@@ -38,7 +38,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::error::KernelError;
-use crate::task::{Priority, Tid};
+use crate::task::Tid;
+use crate::task::percpu::{KernelTask, WakeQ};
 use crate::uaccess::{get_user, put_user};
 
 // Architecture-specific uaccess implementation
@@ -125,26 +126,33 @@ impl FutexKey {
 pub struct FutexQ {
     /// Key identifying which futex this waiter is blocked on
     pub key: FutexKey,
-    /// Thread ID of the waiting task
-    pub tid: Tid,
-    /// Task priority (for scheduler re-enqueue)
-    pub priority: Priority,
+    /// The waiting task, a counted reference: a requeue moves the entry
+    /// to another bucket where its waiter does not look for it, so it
+    /// may outlive the wait (a later wake of it is spurious, not a use
+    /// after free)
+    task: crate::task::percpu::TaskRef,
     /// Bitset for selective wake (FUTEX_WAIT_BITSET/FUTEX_WAKE_BITSET)
     pub bitset: u32,
-    /// CPU owning the waiting task (for the wakeup)
-    pub cpu: u32,
 }
 
 impl FutexQ {
-    /// Create a new futex queue entry for a task on the current CPU
-    pub fn new(key: FutexKey, tid: Tid, priority: Priority, bitset: u32) -> Self {
+    /// Create a new futex queue entry for the current task
+    pub fn new(key: FutexKey, bitset: u32) -> Self {
         Self {
             key,
-            tid,
-            priority,
+            task: crate::task::percpu::task_ref(&crate::task::percpu::current()),
             bitset,
-            cpu: crate::cpu::this_id(),
         }
+    }
+
+    /// Queued by `task`
+    fn is(&self, task: *const KernelTask, key: &FutexKey) -> bool {
+        core::ptr::eq(&*self.task, task) && self.key == *key
+    }
+
+    /// Dequeued for a wakeup: queue its task (bucket lock held)
+    fn wake(self, wq: &mut WakeQ) {
+        wq.add(&self.task);
     }
 }
 
@@ -199,13 +207,6 @@ fn futex_sleep<F: Fn() -> bool>(queued: F, deadline_ns: Option<u64>, realtime: b
     };
     set_current_state(SleepState::Running);
     result
-}
-
-/// Wake the tasks dequeued by a futex wake/requeue (bucket locks dropped)
-fn futex_wake_tasks(tasks: &[(Tid, u32)]) {
-    for &(tid, cpu) in tasks {
-        crate::task::percpu::wake_up_task(tid, cpu, crate::task::percpu::WakeMode::Any);
-    }
 }
 
 // =============================================================================
@@ -376,19 +377,10 @@ fn read_user_timeout(timeout_ptr: u64) -> Result<Option<u64>, i32> {
 // Current Task Info
 // =============================================================================
 
-/// Get current task's TID, PID, and priority
-fn get_current_task_info() -> (Tid, u64, Priority) {
-    use crate::task::percpu::{TASKLIST, current_pid, current_tid};
-
-    let tid = current_tid();
-    let pid = current_pid();
-
-    let priority = {
-        let table = TASKLIST.read();
-        table.get(tid).map(|t| t.priority).unwrap_or(128)
-    };
-
-    (tid, pid, priority)
+/// The current task (for its queue entries) and its process ID
+fn get_current_task_info() -> (*const KernelTask, u64) {
+    let me = crate::task::percpu::current();
+    (&*me as *const KernelTask, me.pid)
 }
 
 // =============================================================================
@@ -433,7 +425,7 @@ pub fn futex_wait(
     }
 
     // Get current task info
-    let (tid, pid, priority) = get_current_task_info();
+    let (me, pid) = get_current_task_info();
 
     // Create futex key
     let key = if is_private {
@@ -479,7 +471,7 @@ pub fn futex_wait(
         }
 
         // Value matches - enqueue ourselves
-        waiters.push(FutexQ::new(key, tid, priority, bitset));
+        waiters.push(FutexQ::new(key, bitset));
         true
     };
 
@@ -487,19 +479,13 @@ pub fn futex_wait(
         return KernelError::WouldBlock.to_errno_neg();
     }
 
-    let still_queued = || {
-        bucket
-            .waiters
-            .lock()
-            .iter()
-            .any(|q| q.tid == tid && q.key == key)
-    };
+    let still_queued = || bucket.waiters.lock().iter().any(|q| q.is(me, &key));
     let why = futex_sleep(still_queued, deadline_ns, realtime);
 
     // Dequeue ourselves unless a waker already did
     let dequeued_self = {
         let mut waiters = bucket.waiters.lock();
-        if let Some(pos) = waiters.iter().position(|q| q.tid == tid && q.key == key) {
+        if let Some(pos) = waiters.iter().position(|q| q.is(me, &key)) {
             waiters.remove(pos);
             bucket.dec_waiters();
             true
@@ -562,7 +548,7 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i
 
     // Collect waiters to wake
     let mut woken = 0i32;
-    let mut to_wake: Vec<(Tid, u32)> = Vec::new();
+    let mut to_wake = WakeQ::new();
 
     {
         let mut waiters = bucket.waiters.lock();
@@ -572,7 +558,7 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i
             if waiters[i].key == key && (waiters[i].bitset & bitset) != 0 {
                 let q = waiters.remove(i);
                 bucket.dec_waiters();
-                to_wake.push((q.tid, q.cpu));
+                q.wake(&mut to_wake);
                 woken += 1;
             } else {
                 i += 1;
@@ -581,7 +567,7 @@ pub fn futex_wake(uaddr: u64, num_wake: i32, bitset: u32, is_private: bool) -> i
     }
 
     // Wake tasks outside the bucket lock
-    futex_wake_tasks(&to_wake);
+    to_wake.wake_up();
 
     woken
 }
@@ -631,7 +617,7 @@ pub fn futex_requeue(
     let bucket2 = futex_bucket(&key2);
     let same_bucket = core::ptr::eq(bucket1, bucket2);
 
-    let mut to_wake: Vec<(Tid, u32)> = Vec::new();
+    let mut to_wake = WakeQ::new();
     let mut to_requeue: Vec<FutexQ> = Vec::new();
     let mut woken = 0i32;
     let mut requeued = 0i32;
@@ -665,7 +651,7 @@ pub fn futex_requeue(
                     // Wake this waiter
                     let q = waiters.remove(i);
                     bucket1.dec_waiters();
-                    to_wake.push((q.tid, q.cpu));
+                    q.wake(&mut to_wake);
                     woken += 1;
                 } else if requeued < nr_requeue {
                     // Mark for requeue
@@ -703,7 +689,7 @@ pub fn futex_requeue(
     }
 
     // Phase 3: Wake collected tasks
-    futex_wake_tasks(&to_wake);
+    to_wake.wake_up();
 
     woken + requeued
 }
@@ -1160,7 +1146,7 @@ fn futex_wait_multiple(
         return KernelError::WouldBlock.to_errno_neg();
     }
 
-    let (tid, pid, priority) = get_current_task_info();
+    let (me, pid) = get_current_task_info();
 
     // Retry loop for spurious wakeups (following Linux pattern)
     loop {
@@ -1210,8 +1196,7 @@ fn futex_wait_multiple(
                         let b = futex_bucket(&e.key);
                         if j < enqueued_count {
                             let mut w = b.waiters.lock();
-                            if let Some(pos) = w.iter().position(|q| q.tid == tid && q.key == e.key)
-                            {
+                            if let Some(pos) = w.iter().position(|q| q.is(me, &e.key)) {
                                 w.remove(pos);
                             }
                         }
@@ -1229,12 +1214,7 @@ fn futex_wait_multiple(
             }
 
             // Value matches - enqueue ourselves
-            waiters.push(FutexQ::new(
-                entry.key,
-                tid,
-                priority,
-                futex_op::FUTEX_BITSET_MATCH_ANY,
-            ));
+            waiters.push(FutexQ::new(entry.key, futex_op::FUTEX_BITSET_MATCH_ANY));
             enqueued_count += 1;
         }
 
@@ -1244,7 +1224,7 @@ fn futex_wait_multiple(
                 let b = futex_bucket(&e.key);
                 if j < enqueued_count {
                     let mut w = b.waiters.lock();
-                    if let Some(pos) = w.iter().position(|q| q.tid == tid && q.key == e.key) {
+                    if let Some(pos) = w.iter().position(|q| q.is(me, &e.key)) {
                         w.remove(pos);
                     }
                 }
@@ -1263,7 +1243,7 @@ fn futex_wait_multiple(
                         .waiters
                         .lock()
                         .iter()
-                        .any(|q| q.tid == tid && q.key == e.key)
+                        .any(|q| q.is(me, &e.key))
                 })
             };
             futex_sleep(queued_all, timeout_ns, use_realtime)
@@ -1274,10 +1254,7 @@ fn futex_wait_multiple(
         for (i, entry) in entries.iter_mut().enumerate() {
             let bucket = futex_bucket(&entry.key);
             let mut waiters = bucket.waiters.lock();
-            if let Some(pos) = waiters
-                .iter()
-                .position(|q| q.tid == tid && q.key == entry.key)
-            {
+            if let Some(pos) = waiters.iter().position(|q| q.is(me, &entry.key)) {
                 waiters.remove(pos);
                 bucket.dec_waiters();
             } else {

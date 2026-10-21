@@ -252,11 +252,8 @@ Filesystem-internal locks (ramfs children/data, procfs data)
     ↓
 Leaves taken with no task lock held (their Arc is cloned out of the
 Task under TASKLIST first): UtsNamespace.name (RwLock), FsStruct.inner
-(Mutex), FutexHashBucket.waiters (IrqSpinlock; wakeups after unlocking)
-    ↓
-Per-CPU scheduler locks (IrqSpinlock)  ← IRQ-safe, can hold while acquiring below
-    ↓
-arm64 ASID lock (IrqSpinlock, leaf; switch_mm slow path, 3.2 TLB Flushing)
+(Mutex), FutexHashBucket.waiters (IrqSpinlock; wakeups through a WakeQ
+after unlocking)
     ↓
 Global subsystem locks (TASKLIST, PAGE_CACHE, fd table `Files`)  ← NOT IRQ-safe;
     no file is released under `Files` (3.3, Descriptor Tables); order
@@ -320,6 +317,13 @@ Tasks (3.1.1, 3.7): TASKLIST (spin RwLock, thread context) → Task.sig
 
 Pids (3.1.1): PIDMAP_LOCK (spin leaf, thread context; hash chains)
 
+Wakeups (3.1; any context, under any of the above):
+    WaitQueue head (IrqSpinlock) → Task.pi_lock (IrqSpinlock, per task)
+    → per-CPU rq lock (IrqSpinlock) → arm64 ASID lock (IrqSpinlock
+    leaf; switch_mm slow path, 3.2 TLB Flushing); a remote CPU's wake
+    list is lock-free (pushed under pi_lock). Nothing else is taken
+    under pi_lock or an rq lock: no TASKLIST, no allocation.
+
 Timekeeping (3.5):
     TimeKeeper.lock (IrqSpinlock leaf; writers only: the CPU 0 tick,
     clock_settime, init; readers are lockless seqlock retries)
@@ -354,7 +358,9 @@ Printk locks (ALL IRQ-safe - can be acquired from interrupt context):
 
 ### Why IrqSpinlock → TASKLIST is Safe
 
-The scheduler acquires `IrqSpinlock` then `TASKLIST` because:
+Some IrqSpinlock holders may take `TASKLIST` (the scheduler no longer
+does: the run queue keeps everything a switch or wakeup needs in the
+`Task`, 3.1):
 
 1. `IrqSpinlock` disables interrupts on the local CPU
 2. While interrupts are disabled, no ISR can run on this CPU
@@ -379,10 +385,9 @@ With interrupts disabled after Step 1:
 - Deadlock is impossible from the local CPU
 
 Other CPUs cannot cause deadlock because:
-- They follow the same ordering (run-queue lock → TASKLIST: `switch_info`,
-  priority refresh)
-- No CPU takes a run-queue lock while holding TASKLIST (wakeups that need
-  a task's CPU look it up under TASKLIST, drop it, then wake)
+- Run-queue and pi locks are innermost (nothing but the ASID leaf is
+  taken under them), so holding TASKLIST across a wakeup is allowed,
+  though wakers drop it first where they can
 - Leaves may be taken under TASKLIST (a wait queue head,
   `TaskSignalState.shared_pending` (spin Mutex) -> `SigHand.action`,
   `SignalStruct.rlim`): they take nothing that leads back to it
@@ -414,10 +419,23 @@ The scheduler uses a per-CPU locking model to minimize contention.
 Each `PerCpuScheduler` contains:
 ```rust
 pub struct PerCpuScheduler {
-    pub lock: IrqSpinlock<CpuRunQueue>,  // Protects run queue
+    pub lock: IrqSpinlock<CpuRunQueue>,  // curr, idle, 256 priority lists, dead
+    wake_list: AtomicPtr<()>,            // remote wakeups (lock-free llist)
     pub initialized: AtomicBool,          // Init flag
 }
 ```
+
+Each `Task` carries its scheduling entity (`Task.se`, Linux
+sched_entity + `__state`/`on_rq`): `state` (`SleepState` as an
+atomic), `on_rq` (queued or running), `prio`, the priority-list `link`,
+the saved switch frame, and the wake-list / WakeQ links; plus
+`Task.pi_lock` (IrqSpinlock, Linux pi_lock). The run queue owns one
+reference to each task of its CPU, from its first wakeup (or creation
+asleep) until its final switch away (`DeadTask`; Linux: the task's own
+usage count put in finish_task_switch); its lists and `curr` hold none
+of their own. `prio` is written under TASKLIST (setpriority,
+sched_setscheduler) and read lock-free; a queued task moves at its
+next enqueue.
 
 Each `PerCpu` (per-CPU data) contains:
 ```rust
@@ -432,20 +450,26 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
 
 #### Locking Rules
 
-1. **Each CPU only locks its own run queue** - no CPU ever takes another
-   CPU's `PerCpuScheduler.lock`. A wakeup for a task owned by another CPU is
-   posted to that CPU's `wake_list` (an `IrqSpinlock<Vec<(Tid, WakeMode)>>`,
-   a leaf lock; one merged entry per task, capacity reserved for all the
-   CPU's tasks when one is added, so posting never allocates) and applied
-   by the owner, under its rq lock, at its next
-   `schedule()`/`yield_now()`/tick (Linux ttwu_queue). Tasks never migrate:
-   `Task.cpu` names the owning run queue.
+1. **Each CPU only locks its own run queue** - no CPU takes another
+   CPU's `PerCpuScheduler.lock` (bring-up aside: the BSP installs the
+   APs' idle tasks). A wakeup for a task owned by another CPU is pushed
+   onto that CPU's `wake_list` (a lock-free stack linked through
+   `Task.se.wake_next`, one entry per task via `se.wake_pending`, pushed
+   under the task's pi_lock; nothing allocates) and a reschedule IPI;
+   the owner applies it under its rq lock (`ttwu_pending`: in the IPI,
+   and at every `schedule()`/`yield_now()`/tick; Linux
+   ttwu_queue_wakelist / sched_ttwu_pending). Entries hold no task
+   reference: an exiting task sets Dead under its pi_lock (no new
+   pushes) and drains its CPU's list before its final switch, and tasks
+   never migrate (`Task.cpu` names the owning run queue; migration, P7,
+   must drain the old CPU's list first).
 
 2. **Run queue lock is IRQ-safe** - Timer interrupts cannot cause deadlocks.
-   Lock order: rq lock → `wake_list` (drain) and rq lock → `TASKLIST`
-   (switch info, priority refresh). Never take an rq lock while holding
-   `TASKLIST`, and never call a wakeup (`wake_up_task`, `WaitQueue::wake*`)
-   while holding this CPU's rq lock (it is not recursive).
+   Lock order: pi_lock → rq lock; nothing is taken under the rq lock but
+   the arm64 ASID leaf (no TASKLIST: the switch and the wakeup use only
+   `Task` atomics). Never call a wakeup (`try_to_wake_up`,
+   `WaitQueue::wake*`) while holding this CPU's rq lock (it is not
+   recursive); timeouts the rq lock holder ends use `wake_locked`.
 
 3. **Context switch happens with lock held** - The lock is released by the
    task switched to (its guard drop, or `finish_context_switch` for a new
@@ -461,6 +485,13 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
 
 5. **Timer ISR only touches local CPU** - `wake_sleepers()` drains the local
    `wake_list` and wakes expired sleepers of the local sleep queue only.
+
+9. **The idle task is never queued** - `rq.idle` runs when the lists are
+   empty. Making a task runnable flags the running task NEED_RESCHED if
+   it is the idle task or of lower priority (`check_preempt`, Linux
+   check_preempt_curr); the idle loop halts only after checking that
+   flag with interrupts off, so a wakeup is never left waiting for the
+   next tick.
 
 6. **User registers belong to the task** - every entry from user mode
    builds the arch's `PtRegs` (Linux pt_regs: x86 entry.rs, arm64
@@ -490,8 +521,10 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
 
 8. **Dead tasks are freed by the next task (Linux finish_task_switch)** -
    `exit_current` cannot free the kernel stack it runs on, nor the
-   top-level page table still loaded in CR3/TTBR0. It pushes them as a
-   `DeadTask` (stack, mm_count reference) on its rq's `dead` list, under
+   top-level page table still loaded in CR3/TTBR0. It leaves them as a
+   `DeadTask` (stack, mm_count reference, the run queue's task
+   reference) in its rq's `dead` slot (one: the next task takes it
+   before anything else can exit here), under
    the rq lock held across the switch. The task switched to takes the list
    under the rq lock and frees it after releasing the lock (in
    `context_switch_locked`, or `finish_context_switch` for a new task):
@@ -500,20 +533,31 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
 
 #### Sleep / Wakeup Protocol (Linux set_current_state / try_to_wake_up)
 
-Each run-queue entry (`KernelThreadContext`) carries the scheduling truth:
-`state: SleepState {Running, Interruptible, Killable, Uninterruptible}` and `queued`
-(present in the priority queue; prevents double enqueue).
+The task carries the scheduling truth (`Task.se`): `state: SleepState
+{Running, Interruptible, Killable, Uninterruptible, Dead}` and `on_rq`
+(queued or running).
 
 ```text
 sleeper                                   waker (any CPU, any context)
 -------                                   -----
 register on wait queue                    make condition true
-set_current_state(Interruptible)          wake_up_task(tid, cpu, mode):
-if condition: done                          own CPU:  lock rq, try_wake
-if signal_pending(): -ERESTARTSYS           remote:   push to wake_list
-schedule()  // returns at once if a       try_wake: state != Running →
-            // wakeup already set Running   Running, enqueue unless current
+set_current_state(Interruptible)          try_to_wake_up(&task, mode):
+  (store state, full barrier)               lock task.pi_lock, full barrier
+if condition: done                          state matches mode? else return
+if signal_pending(): -ERESTARTSYS           state = Running
+schedule():                                 on_rq? return (its schedule()
+  lock rq; state Running? return              sees Running)
+  on_rq = false                             own CPU: lock rq, activate
+  state Running? on_rq = true; return       remote: push wake_list + IPI
+  switch                                  activate (under the rq lock):
+                                            on_rq = true, enqueue
 ```
+
+Both `on_rq` and `state` are SeqCst: a waker that still saw `on_rq`
+left `state` Running, which `schedule()` sees after clearing `on_rq`
+(it stays); a waker that saw it cleared queues the task. A wakeup
+racing a sleeper that stayed may leave a stale wake-list entry, applied
+later as a spurious wakeup (allowed: every sleeper re-checks).
 
 `WakeMode::Interruptible` (signals) wakes only `Interruptible` sleepers;
 `WakeMode::Fatal` (SIGKILL) also wakes `Killable` ones (Linux
@@ -549,7 +593,7 @@ CPU being idle) is a quiescent state for a future QSBR RCU.
 (`spin::Mutex<Vec<Arc<KThread>>>`, process context only, never held across
 a wakeup/sleep; order: may be taken while holding nothing else) maps tid ->
 control block. `kthread_should_stop/should_park/parkme` and
-`kthread_stop/park/unpark` use atomics + `wake_up_task` + the block's
+`kthread_stop/park/unpark` use atomics + `try_to_wake_up` + the block's
 `ack` WaitQueue. Unbound threads go round-robin to APs (CPU 0 runs the
 cooperative user tasks). Standing threads: `ktimerd` (CPU 0, runs software
 timer callbacks), the system workqueue worker, `softnet/N` (one per CPU,
@@ -591,8 +635,8 @@ a `Pid` unlinks them. It is taken under nothing but may be taken
 under TASKLIST (a reaped task's `Pid` is dropped after TASKLIST).
 A process's pid is its leader's tid; an exec from a non-leader takes
 the leader's tid and `Pid` (`take_leadership`, Linux exchange_tids)
-under TASKLIST, then re-keys its run-queue entry under the rq lock
-after releasing TASKLIST (rq -> TASKLIST order). The idle tasks
+under TASKLIST (the run queue knows tasks by reference, not by
+number). The idle tasks
 are tid 0 and, like the boot task, not in TASKLIST.
 
 **Relations** (under TASKLIST's write lock to change, read lock to
@@ -714,8 +758,8 @@ Each CPU's per-CPU data (GS base on x86-64, swapped in by `swapgs` on
 every entry from user mode; TPIDR_EL1 on aarch64) holds
 `curr`, a pointer to the running `Task` (Linux `current`), set by the
 scheduler at every switch with the run-queue lock held. The run queue
-holds the task's `TaskRef` (its entry, then `DeadTask` until the next
-task frees it), so the pointer stays valid while the task runs.
+holds a reference to the task (then `DeadTask` until the next task
+frees it), so the pointer stays valid while the task runs.
 `task::percpu::current()` returns a `!Send` `Cur` handle; 0 means the
 boot task `INIT_TASK` (Linux init_task: tid 0, root, never in
 TASKLIST), so current is never missing. Read lock-free through it:
@@ -728,9 +772,9 @@ TASKLIST; other tasks read them under TASKLIST). `get_task_fd`,
 the current task (fget, the page-fault mm lookup, `signal_pending`).
 
 The context switch takes no TASKLIST: `make_current` reads the next
-task's kernel stack, address space and TLS from its run-queue entry (it
-is not running, so its owner fields are stable) and records /proc's
-run state in `Task.sleeping`.
+task's kernel stack, address space and TLS from the task (it is not
+running, so its owner fields are stable); /proc reads the run state
+from `Task.se`.
 
 ### 3.1.2 Comparison with Linux task_struct Locking
 
@@ -1159,7 +1203,8 @@ No lock (Linux kernel/smp.c): `smp_call_function_many(mask, func,
 info, wait)` runs `func(info)` on other CPUs from their call-function
 IPI (x86 vector 0xfc, arm64 SGI 1); `on_each_cpu` adds this CPU;
 `smp_send_reschedule` (x86 0xfd, arm64 SGI 0) wakes a remote CPU after
-a remote wakeup was posted (`wake_up_task`).
+a remote wakeup was queued (`try_to_wake_up`); its handler applies the
+CPU's queued wakeups (`sched_ipi`).
 
 - `QUEUE[cpu]` (per CPU): the calls queued for a CPU, a lock-free list
   (Linux llist). Senders push with a compare-and-swap (Release); only
@@ -1724,7 +1769,7 @@ nanoseconds), like Linux's `i_*time_sec` / `i_*time_nsec` fields:
 Linux-style wait queues (`include/linux/wait.h`, `kernel/sched/wait.c`).
 
 ```rust
-pub struct WaitQueue { head: IrqSpinlock<Vec<WaitQueueEntry>> } // -> rq lock / wake_list
+pub struct WaitQueue { head: IrqSpinlock<Vec<WaitQueueEntry>> } // -> pi_lock -> rq lock
 
 // Sleeper side (process context, no spinlocks held)
 wq.wait_event(|| cond);                                  // uninterruptible
@@ -1739,13 +1784,13 @@ wq.wake_one(); wq.wake_all();
 ```
 
 - **IRQ class:** the head lock is an `IrqSpinlock`; like Linux
-  `__wake_up_common`, tasks are woken under it (`wake_up_task`: this
-  CPU's rq lock or the target's `wake_list`), so the order is head -> rq
-  lock / `wake_list` and nothing else nests inside it. Wakers never take
-  `TASKLIST` and never allocate (no waiter list is collected; the run
-  queues and `wake_list` have capacity reserved in thread context when a
-  task is added or changes priority), so `wake_*` is safe from IRQ
-  handlers. Registration (`prepare_to_wait`) pushes under the head lock
+  `__wake_up_common`, tasks are woken under it (`try_to_wake_up`: the
+  task's pi_lock, then this CPU's rq lock or the target CPU's lock-free
+  wake list), so the order is head -> pi_lock -> rq lock and nothing
+  else nests inside it. Wakers never take `TASKLIST` and never allocate
+  (no waiter list is collected; run queues are intrusive), so `wake_*`
+  is safe from IRQ handlers. An entry names its task by pointer: the
+  sleeper unregisters before it can go away. Registration (`prepare_to_wait`) pushes under the head lock
   in thread context only.
 - **No lost wakeups:** the sleeper registers and sets its state before
   re-checking the condition (see 3.1 Sleep / Wakeup Protocol). Wakers must
@@ -2184,7 +2229,7 @@ de_thread, exit_group does not.
   set and sets its TIF_SIGPENDING under TASKLIST, collects the tids,
   drops TASKLIST, then wakes each (`WakeMode::Fatal`: interruptible
   and killable sleeps), as `send_signal` does (TASKLIST is never held
-  across a wakeup: rq -> TASKLIST order).
+  across a wakeup where it can be dropped first).
 - A thread cloned into a group whose state is set gets SIGKILL after
   `clone_task_signal` set up its signal state (`zap_new_thread`): the
   state is set before a zap takes TASKLIST, so either the zap saw the
@@ -2256,7 +2301,10 @@ Neither thread can miss the other's update.
 
 ```
 FutexHashBucket.waiters (IrqSpinlock): leaf. Wakers dequeue FutexQ entries
-under it, drop it, then wake_up_task(tid, cpu) (no TASKLIST).
+under it into a WakeQ (a reference to each task, Linux wake_q_add), drop
+it, then wake them (`WakeQ::wake_up` -> try_to_wake_up; no TASKLIST).
+A waiter that sees itself dequeued may return at once: the WakeQ's
+reference keeps its task alive for the wakeup.
 ```
 
 Waiters sleep with the Sleep / Wakeup Protocol (section 3.1): state set to
@@ -2590,8 +2638,8 @@ NetDevice.addrs, NetNamespace tables, Fib.tables (RwLocks; lookups drop
    then PacketSock.filter / PacketSock.rxq, each a leaf;
    RTNL -> PacketSock.mclist)
   -> device TX lock (e1000 tx, virtio-net tx)
-  -> Softnet.backlog (lo xmit)           Softnet.poll_list; WaitQueue -> rq /
-                                          wake_list (IrqSpinlocks, innermost)
+  -> Softnet.backlog (lo xmit)           Softnet.poll_list; WaitQueue -> pi_lock
+                                          -> rq (IrqSpinlocks, innermost)
 ```
 
 **AF_UNIX** (`net/unix/`, Linux af_unix.c order). Sockets talk
@@ -2939,9 +2987,9 @@ is `SCHED:FAIL scheduling while atomic`).
 
 - Timer tick updates (atomic only)
 - Wake sleepers (IrqSpinlock only, per-CPU only)
-- `WaitQueue::wake_one/wake_all` and `wake_up_task` (IrqSpinlocks only,
-  no allocation: wakes run under the head lock, run queues and remote
-  `wake_list`s have reserved capacity)
+- `WaitQueue::wake_one/wake_all` and `try_to_wake_up` (IrqSpinlocks
+  only, no allocation: wakes run under the head lock; the priority
+  lists and remote wake lists are intrusive)
 - `timer::check_timers()` (CPU 0 tick): peeks `TIMERS` (IrqSpinlock) and
   wakes `ktimerd`; timer callbacks themselves run in `ktimerd`, process
   context (they may send signals, take Mutexes, allocate)
@@ -2971,7 +3019,7 @@ is `SCHED:FAIL scheduling while atomic`).
 If interrupt context needs to trigger something that requires non-IRQ-safe locks:
 
 1. Record the event (atomic, or an IrqSpinlock-protected queue)
-2. Wake a kernel thread (`WaitQueue::wake_*` / `wake_up_task`, IRQ-safe)
+2. Wake a kernel thread (`WaitQueue::wake_*` / `try_to_wake_up`, IRQ-safe)
 3. The actual work is done in thread context (`ktimerd`, workqueue
    workers, `softnet/N` threads for network receive)
 
@@ -3015,13 +3063,13 @@ CAN be safely acquired from interrupt context. See Section 3.6.
 locks will never be interrupted by an ISR that also tries to acquire the same lock.
 
 **Why this is safe**: ISRs in hk only perform the operations of 7.1:
-atomics, and IrqSpinlocks (run queues and `wake_list`s, wait queue heads,
+atomics, and IrqSpinlocks (run queues and pi locks, wait queue heads,
 `IRQ_TABLE`, the blk-mq hardware queue, `Completion.done`,
 `Softnet.poll_list`, the cross-CPU call queues, printk)
 
 ISRs NEVER perform:
-- Memory allocation (`alloc`, `Box`, `Vec` growth): wakeups, NAPI scheduling
-  and run-queue enqueues use reserved capacity (7.1)
+- Memory allocation (`alloc`, `Box`, `Vec` growth): wakeups and run-queue
+  enqueues are intrusive, NAPI scheduling uses reserved capacity (7.1)
 - Task table operations - would acquire TASKLIST Mutex
 - VFS operations - would acquire RwLock
 - Any `spin::Mutex`/`RwLock` or sleeping lock (printk's are IrqSpinlocks)
