@@ -1903,7 +1903,11 @@ a HARD hrtimer re-armed every TICK_NS.
   `inner` with the list dropped. Absolute realtime hrtimers see the new
   time at the next clock event (at most a tick away).
 - `start` queues and reprograms with interrupts off (no migration or
-  timer interrupt in between). `cancel_sync` waits out a running
+  timer interrupt in between), on the starting CPU's base: it moves the
+  timer there unless its callback is running on the old one (Linux
+  switch_hrtimer_base). `HrTimer.base` changes only under the old base's
+  lock, and every locker rechecks it after locking (`lock_base`, Linux
+  lock_hrtimer_base). `cancel_sync` waits out a running
   callback (spinning for HARD, sleeping on the `ktimers/N` wait queue
   for SOFT); dropping an `HrTimer` does that.
 - `HrBase.q` is a leaf: callbacks run with it dropped, and

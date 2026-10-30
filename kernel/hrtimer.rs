@@ -14,22 +14,27 @@
 //! timer re-armed every TICK_NS, so an interrupt comes at least that
 //! often: a CLOCK_REALTIME timer is compared with the realtime clock at
 //! every interrupt, so a clock step (clock_settime) delays it by at most
-//! a tick (no clock_was_set retrigger). A timer started from another
-//! CPU than its base's does not reprogram that CPU: it fires by that
-//! CPU's next tick at the latest.
+//! a tick (no clock_was_set retrigger). Starting a timer moves it to the
+//! starting CPU's base unless its callback is running (Linux
+//! switch_hrtimer_base), so a task that moved CPUs re-arms its timers
+//! where it runs; a timer started while its callback runs elsewhere stays
+//! there, and does not reprogram that CPU: it fires by that CPU's next
+//! tick at the latest.
 //!
 //! Callbacks run with the base lock dropped and `running` set;
 //! `cancel_sync` waits out a running callback like `del_timer_sync`,
 //! and dropping a timer does that.
 //!
 //! Locking: `HrBase.q` is an IrqSpinlock leaf; callbacks run with no
-//! timer lock held.
+//! timer lock held. A timer's `base` changes only under its old base's
+//! lock, so lockers recheck it once they hold a lock (Linux
+//! lock_hrtimer_base); two base locks are never held together.
 
 use core::marker::PhantomPinned;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-use crate::arch::IrqSpinlock;
+use crate::arch::{IrqSpinlock, IrqSpinlockGuard};
 use crate::cpu::PerCpu;
 use crate::list::{Link, List};
 use crate::task::percpu::TICK_NS;
@@ -145,15 +150,41 @@ impl HrTimer {
         }
     }
 
+    /// Its base, locked: the one `base` names once the lock is held
+    /// (Linux lock_hrtimer_base); None if it was never started
+    fn lock_base(&self) -> Option<(&'static HrBase, IrqSpinlockGuard<'static, HrQueues>)> {
+        loop {
+            // SAFETY: bases are static
+            let base = unsafe { self.base.load(Ordering::Acquire).as_ref() }?;
+            let q = base.q.lock();
+            if core::ptr::eq(self.base.load(Ordering::Acquire), base) {
+                return Some((base, q));
+            }
+        }
+    }
+
     /// (Re)start to fire at `expires` ns on `clock` (Linux
     /// hrtimer_start, absolute mode); true if it was pending
     pub fn start(self: Pin<&Self>, expires: u64, clock: HrClock) -> bool {
         // Interrupts off: no migration or timer interrupt between
         // queueing and programming this CPU's clock event
         let flags = crate::arch::local_irq_save();
-        let base = self.home();
-        let mut q = base.q.lock();
+        self.home();
+        let (mut base, mut q) = self.lock_base().expect("hrtimer: no base");
         let was = q.detach(&self);
+        // Linux switch_hrtimer_base: onto this CPU's base, unless its
+        // callback is running on the old one (cancel_sync waits there)
+        if let Some(cpu) = crate::cpu::try_this_id() {
+            let here = base_of(cpu, self.flags);
+            let me = &*self as *const HrTimer as *mut HrTimer;
+            if !core::ptr::eq(base, here) && base.running.load(Ordering::Acquire) != me {
+                self.base
+                    .store(here as *const HrBase as *mut HrBase, Ordering::Release);
+                drop(q);
+                base = here;
+                q = here.q.lock();
+            }
+        }
         self.expires.store(expires, Ordering::Relaxed);
         self.clock.store(clock as u8, Ordering::Relaxed);
         q.insert(&self);
@@ -169,24 +200,20 @@ impl HrTimer {
     /// Stop it if queued (Linux hrtimer_try_to_cancel without the
     /// running check); true if it was pending
     pub fn cancel(&self) -> bool {
-        // SAFETY: bases are static
-        let Some(base) = (unsafe { self.base.load(Ordering::Acquire).as_ref() }) else {
-            return false;
-        };
-        base.q.lock().detach(self)
+        self.lock_base().is_some_and(|(_, mut q)| q.detach(self))
     }
 
     /// Stop it and wait out a running callback (Linux hrtimer_cancel);
     /// thread context unless HARD, never from its own callback
     pub fn cancel_sync(&self) -> bool {
-        // SAFETY: bases are static
-        let Some(base) = (unsafe { self.base.load(Ordering::Acquire).as_ref() }) else {
-            return false;
-        };
         let me = self as *const HrTimer as *mut HrTimer;
         let mut was = false;
         loop {
-            was |= base.q.lock().detach(self);
+            let Some((base, mut q)) = self.lock_base() else {
+                return was;
+            };
+            was |= q.detach(self);
+            drop(q);
             if base.running.load(Ordering::Acquire) != me {
                 return was;
             }
