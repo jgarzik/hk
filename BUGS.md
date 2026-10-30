@@ -629,14 +629,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
 6. **No ptrace exec stop** (P9): a traced task's execve does not stop
    with SIGTRAP / PTRACE_EVENT_EXEC (`kernel/task/exec.rs`), so a
    tracer cannot observe a non-leader exec's tid change.
-7. **T0 resume point** (T0 next). Design: ~/.claude/plans/
-   t0-foundation-design.md (commit numbers below are its §3).
-   Remaining: 15 sched entity/ttwu(&Task);
-   16 intrusive WaitQueue + FutexQ (wakeups by raw tid: waitqueue,
-   futex, poll, mqueue, signalfd, sem/msg); 17 per-CPU timer wheel; 18 hrtimer-lite
-   + deadline waits; 19 yield polls and SCHEDULING_ENABLED fallbacks;
-   20 GFP from context/reclaim; 21 try_* user-sized allocations; tests
-   f-h; an acct test with N threads exiting at once (one record).
 8. **MM_LIFE_EXEC_CHAIN intermittent on arm64 CI** (next batch). One
    GitHub `check-arm` run (TCG, NIC=e1000) reported
    `MM_LIFE_EXEC_CHAIN:FAIL -2`: both warmup chains passed, then the

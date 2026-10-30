@@ -158,11 +158,15 @@ fn encode_elapsed_float(elapsed_ns: u64) -> u32 {
 /// (the write sleeps), and a replaced file is released after unlocking.
 static ACCT_FILE: Mutex<Option<Arc<File>>> = Mutex::new(None);
 
-/// Install `file` (None: accounting off); the old file is released
-/// with no lock held
+/// Install `file` (None: accounting off). The old file gets a record
+/// for the calling process before it is released, with no lock held
+/// (Linux acct_pin_kill -> do_acct_process(current))
 fn set_acct_file(file: Option<Arc<File>>) {
     let old = core::mem::replace(&mut *ACCT_FILE.lock(), file);
-    drop(old);
+    if let Some(old) = old {
+        let tid = crate::task::percpu::current_tid();
+        write_record(&old, tid, crate::task::percpu::current_pid(), 0);
+    }
 }
 
 // =============================================================================
@@ -238,11 +242,13 @@ fn open_acct_file(path: &str) -> Result<Arc<File>, i64> {
         Some(i) => Some(dac::want_write(&i).map_err(|e| e.sysret())?),
         None => None,
     };
-    let mut file = File::new(
-        dentry,
-        flags::O_WRONLY | flags::O_APPEND,
-        &crate::fs::file::NULL_FILE_OPS,
-    );
+    // The filesystem's file operations, as an open(2) of it gets
+    // (NULL_FILE_OPS made every record write fail)
+    let f_op: &'static dyn crate::fs::FileOps = dentry
+        .superblock()
+        .map(|sb| sb.fs_type.file_ops)
+        .unwrap_or(&crate::fs::ramfs::RAMFS_FILE_OPS);
+    let mut file = File::new(dentry, flags::O_WRONLY | flags::O_APPEND, f_op);
     file.write_access = w;
     Ok(Arc::new(file))
 }
@@ -261,7 +267,11 @@ pub fn write_acct_record(tid: Tid, pid: Pid, exit_status: i32) {
     let Some(file) = ACCT_FILE.lock().clone() else {
         return;
     };
+    write_record(&file, tid, pid, exit_status);
+}
 
+/// Write the record of process `pid` (thread `tid`) to `file`
+fn write_record(file: &File, tid: Tid, pid: Pid, exit_status: i32) {
     // Get task information
     let task_info = match get_task_info(tid, pid) {
         Some(info) => info,
@@ -315,7 +325,7 @@ pub fn write_acct_record(tid: Tid, pid: Pid, exit_status: i32) {
     };
 
     // Write to file (best-effort, ignore errors)
-    let _ = write_record_to_file(&file, &record);
+    let _ = write_record_to_file(file, &record);
 }
 
 /// Task information gathered for accounting
@@ -398,8 +408,9 @@ fn write_record_to_file(file: &File, record: &AcctV3) -> Result<(), KernelError>
     // Get the bytes
     let bytes = record.as_bytes();
 
-    // Write to file
-    file.f_op.write(file, bytes)?;
+    // Through the file's write path (Linux __kernel_write): O_APPEND
+    // places it at the end, the inode lock and size are kept
+    file.write(bytes)?;
 
     Ok(())
 }
