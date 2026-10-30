@@ -879,6 +879,9 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub thread_flags: AtomicU32,
     /// CPU whose run queue owns this task (tasks never migrate)
     pub cpu: AtomicU32,
+    /// Page-fault-disable depth (Linux p->pagefault_disabled), written
+    /// by the task itself (`uaccess::pagefault_disable`)
+    pub pagefault_disabled: AtomicU32,
     /// Scheduling state: sleep state, run-queue link, priority, switch
     /// frame (Linux __state, on_rq, sched_entity)
     pub se: sched::SchedEntity,
@@ -1456,6 +1459,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             flags: AtomicU32::new(flags),
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(cpu),
+            pagefault_disabled: AtomicU32::new(0),
             se: sched::SchedEntity::new(PRIORITY_NORMAL, 0),
             pi_lock: crate::arch::IrqSpinlock::new(()),
             ppid: AtomicU64::new(ids.ppid),
@@ -1507,6 +1511,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             flags: AtomicU32::new(pf::KTHREAD),
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(0),
+            pagefault_disabled: AtomicU32::new(0),
             se: sched::SchedEntity::new(PRIORITY_NORMAL, 0),
             pi_lock: crate::arch::IrqSpinlock::new(()),
             ppid: AtomicU64::new(0),
