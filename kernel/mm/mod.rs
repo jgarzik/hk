@@ -77,9 +77,6 @@ pub const ELF_ET_DYN_BASE: u64 = 0x5555_5555_4000;
 #[cfg(target_arch = "aarch64")]
 pub const ELF_ET_DYN_BASE: u64 = 0xAAAA_AAAA_0000;
 
-/// A fixed mapping at [addr, addr + len): below MMAP_MIN_ADDR is EPERM
-/// without CAP_SYS_RAWIO (Linux security_mmap_addr / cap_mmap_addr),
-/// past TASK_SIZE is ENOMEM
 /// Run `f` with task flag `flag` (PF_MEMALLOC, PF_MEMALLOC_NOIO) set,
 /// restoring it after (Linux memalloc_noreclaim_save / memalloc_noio_save)
 pub fn memalloc_scope<R>(flag: u32, f: impl FnOnce() -> R) -> R {
@@ -93,6 +90,9 @@ pub fn memalloc_scope<R>(flag: u32, f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// A fixed mapping at [addr, addr + len): below MMAP_MIN_ADDR is EPERM
+/// without CAP_SYS_RAWIO (Linux security_mmap_addr / cap_mmap_addr),
+/// past TASK_SIZE is ENOMEM
 pub fn check_fixed(addr: u64, len: u64) -> Result<(), crate::error::KernelError> {
     use crate::error::KernelError;
     if addr < MMAP_MIN_ADDR && !crate::task::capable(crate::task::CAP_SYS_RAWIO) {
