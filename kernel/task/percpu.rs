@@ -408,6 +408,8 @@ pub struct GlobalTaskTable {
 }
 
 crate::adapter!(TasksAdapter, KernelTask, tasks_link);
+crate::adapter!(pub PgrpLink, KernelTask, pgrp_link);
+crate::adapter!(pub SessionLink, KernelTask, session_link);
 
 /// A new reference to a task that lives in an `Arc` (every task but the
 /// boot task does: the table and run queues hold `TaskRef`s)
@@ -656,6 +658,7 @@ impl GlobalTaskTable {
             p.set_task(Arc::as_ptr(&task) as *const ());
         }
         self.tasks.push_back(task.clone());
+        self.attach_pids(&task);
         let leader = if task.tid() == task.pid {
             Some(task.clone())
         } else {
@@ -692,6 +695,7 @@ impl GlobalTaskTable {
         let t = task_ref(self.lookup(tid)?);
         self.unlink_child(&t);
         self.unlink_thread(&t);
+        self.detach_pids(&t);
         // SAFETY: the list is locked for writing, so no view exists
         if let Some(inner) = unsafe { t.inner().get() }
             && let Some(p) = &inner.thread_pid
@@ -701,6 +705,111 @@ impl GlobalTaskTable {
         // SAFETY: found through the hash, so on this list
         drop(unsafe { self.tasks.remove(&t) });
         Some(t)
+    }
+
+    /// The group leaders in process group `pg` (Linux
+    /// do_each_pid_task(pg, PIDTYPE_PGID))
+    pub fn pgrp<'a>(
+        &'a self,
+        pg: &'a crate::task::pid::Pid,
+    ) -> impl Iterator<Item = TaskView<'a>> + 'a {
+        // SAFETY: TASKLIST is held for 'a (we borrow the table); the
+        // list changes only with the table borrowed mutably
+        unsafe { pg.pgrp.get() }.iter().map(view)
+    }
+
+    /// The threads of every process in group `pg` (Linux
+    /// do_each_pid_thread(pg, PIDTYPE_PGID))
+    pub fn pgrp_threads<'a>(
+        &'a self,
+        pg: &'a crate::task::pid::Pid,
+    ) -> impl Iterator<Item = TaskView<'a>> + 'a {
+        self.pgrp(pg).flat_map(move |l| self.threads(l.task.pid))
+    }
+
+    /// A new task joins its creator's process group and session (Linux
+    /// copy_process: under the write lock, so the creator's concurrent
+    /// setpgid or setsid is not missed); the creator is in this list,
+    /// the child not yet
+    pub fn inherit_pids(&mut self, child: &KernelTask, parent: &KernelTask) {
+        // SAFETY: the parent is in this list, locked for writing; no
+        // `&mut` view of it is live
+        let Some(pi) = (unsafe { parent.inner().get() }).as_ref() else {
+            return;
+        };
+        let (pg, s) = (pi.pgrp.clone(), pi.session.clone());
+        child.pgid.store(parent.pgid(), Ordering::Relaxed);
+        child.sid.store(parent.sid(), Ordering::Relaxed);
+        // SAFETY: the child is not in the list yet: nothing else reaches
+        // its locked fields
+        if let Some(ci) = unsafe { child.inner().get_mut() }.as_mut() {
+            ci.pgrp = pg;
+            ci.session = s;
+        }
+    }
+
+    /// Put group leader `t` on its process group's and session's lists
+    /// (Linux attach_pid PIDTYPE_PGID, PIDTYPE_SID)
+    fn attach_pids(&mut self, t: &KernelTask) {
+        // SAFETY: in this list; no view is live
+        let ti = unsafe { self.inner_mut_of(t) };
+        if ti.pids_linked || !ti.leader {
+            return;
+        }
+        let (Some(pg), Some(s)) = (ti.pgrp.as_ref(), ti.session.as_ref()) else {
+            return;
+        };
+        // SAFETY: the table is locked for writing; `t` stays live while
+        // in the table and leaves these lists before it (`remove`)
+        unsafe {
+            pg.pgrp.get_mut().push_back(t);
+            s.session.get_mut().push_back(t);
+        }
+        ti.pids_linked = true;
+    }
+
+    /// Take `t` off its process group's and session's lists (Linux
+    /// detach_pid)
+    fn detach_pids(&mut self, t: &KernelTask) {
+        // SAFETY: in this list; no view is live
+        let ti = unsafe { self.inner_mut_of(t) };
+        if !core::mem::take(&mut ti.pids_linked) {
+            return;
+        }
+        if let (Some(pg), Some(s)) = (ti.pgrp.as_ref(), ti.session.as_ref()) {
+            // SAFETY: the table is locked for writing; linked means on
+            // both lists
+            unsafe {
+                pg.pgrp.get_mut().remove(t);
+                s.session.get_mut().remove(t);
+            }
+        }
+    }
+
+    /// Move process `pid` (every thread; its leader on the lists) to
+    /// group `pg` and, if given, session `s` (Linux change_pid); the
+    /// references it held go to `old`, dropped after TASKLIST
+    fn change_pids(
+        &mut self,
+        pid: Pid,
+        pg: &Arc<crate::task::pid::Pid>,
+        s: Option<&Arc<crate::task::pid::Pid>>,
+        old: &mut Vec<Arc<crate::task::pid::Pid>>,
+    ) {
+        let Some(l) = self.task(pid) else { return };
+        self.detach_pids(&l);
+        let threads: Vec<TaskRef> = self.threads(pid).map(|t| task_ref(t.task)).collect();
+        for t in &threads {
+            // SAFETY: in this list; no view is live
+            let ti = unsafe { self.inner_mut_of(t) };
+            old.extend(ti.pgrp.replace(pg.clone()));
+            t.pgid.store(pg.nr() as Pid, Ordering::Relaxed);
+            if let Some(s) = s {
+                old.extend(ti.session.replace(s.clone()));
+                t.sid.store(s.nr() as Pid, Ordering::Relaxed);
+            }
+        }
+        self.attach_pids(&l);
     }
 
     /// Number of tasks, zombies included
@@ -929,6 +1038,10 @@ fn create_kernel_task(
 
     let task_inner = crate::task::TaskInner {
         thread_pid,
+        // In no process group or session (never signalled by group)
+        pgrp: None,
+        session: None,
+        pids_linked: false,
         exit_code: 0,
         exit_signal: 0, // Kernel threads don't send exit signals
         pdeath_signal: 0,
@@ -1130,6 +1243,10 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
     // Create Task entry
     let task_inner = crate::task::TaskInner {
         thread_pid: Some(thread_pid),
+        // The boot group and session, number 0 (Linux init_struct_pid)
+        pgrp: crate::task::pid::find_pgrp(config.pgid),
+        session: crate::task::pid::find_pgrp(config.sid),
+        pids_linked: false,
         exit_code: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // Default: notify parent with SIGCHLD
         pdeath_signal: 0,
@@ -1434,6 +1551,9 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
         m.exit_signal = exit_signal;
         m.task.start_time.store(start, Ordering::Relaxed);
     }
+    // ... and its place on the group's and session's lists (Linux
+    // de_thread: transfer_pid PIDTYPE_PGID, PIDTYPE_SID)
+    table.attach_pids(&me);
     drop(table);
     // The group's timers owned by the caller follow (after TASKLIST:
     // their locks are leaves taken under nothing)
@@ -1761,6 +1881,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Create child task
     let child_task_inner = crate::task::TaskInner {
         thread_pid: Some(child_thread_pid),
+        // Set from the creator's under TASKLIST (`inherit_pids`)
+        pgrp: None,
+        session: None,
+        pids_linked: false,
         exit_code: 0,
         exit_signal: config.exit_signal, // From clone3 args (SIGCHLD for fork, 0 for threads)
         pdeath_signal: 0,                // Never inherited, must be set explicitly via prctl
@@ -1862,6 +1986,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Add to global task table
     {
         let mut table = TASKLIST.write();
+        table.inherit_pids(&child_task, &current());
         table.insert(child_task.clone());
         // A new process joins its real parent's children (Linux: only
         // group leaders are on children lists)
@@ -2858,14 +2983,23 @@ pub fn increment_maj_flt() {
     current().maj_flt.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Get all TIDs in a process group
+/// Every thread of every process in group `pgid` (its pid links)
 pub fn get_tids_by_pgid(pgid: Pid) -> alloc::vec::Vec<Tid> {
+    let Some(pg) = crate::task::pid::find_pgrp(pgid) else {
+        return alloc::vec::Vec::new();
+    };
     let table = TASKLIST.read();
-    table
-        .iter()
-        .filter(|t| t.task.pgid() == pgid)
-        .map(|t| t.task.tid())
-        .collect()
+    table.pgrp_threads(&pg).map(|t| t.task.tid()).collect()
+}
+
+/// The processes of group `pgid`, by pid (their leaders on its list;
+/// Linux do_each_pid_task PIDTYPE_PGID)
+pub fn pgrp_pids(pgid: Pid) -> alloc::vec::Vec<Pid> {
+    let Some(pg) = crate::task::pid::find_pgrp(pgid) else {
+        return alloc::vec::Vec::new();
+    };
+    let table = TASKLIST.read();
+    table.pgrp(&pg).map(|t| t.task.pid).collect()
 }
 
 /// Get all unique PIDs in the system
@@ -2912,9 +3046,13 @@ pub fn lookup_task_pgid(pid: Pid) -> Option<Pid> {
     table.get(pid).map(|t| t.task.pgid())
 }
 
-/// True if some task is in process group `pgid`
+/// True if some process is in group `pgid`
 pub fn pgrp_exists(pgid: Pid) -> bool {
-    TASKLIST.read().iter().any(|t| t.task.pgid() == pgid)
+    let Some(pg) = crate::task::pid::find_pgrp(pgid) else {
+        return false;
+    };
+    let table = TASKLIST.read();
+    table.pgrp(&pg).next().is_some()
 }
 
 /// Look up a task's session ID by PID
@@ -3134,72 +3272,73 @@ pub fn set_task_priority(pid: Pid, priority: Priority) -> Result<(), i32> {
     }
 }
 
-/// Set a task's process group ID
+/// Move process `target_pid` (every thread) to group `new_pgid`
 ///
 /// Returns Ok(()) on success, Err(errno) on failure.
 /// Error codes:
 /// - ESRCH (3): Process not found
-/// - EPERM (1): Cannot change session leader's PGID
-/// - EINVAL (22): Target PGID doesn't exist in same session
+/// - EPERM (1): a session leader, another session, or no group
+///   `new_pgid` in the caller's session
 pub fn set_task_pgid(target_pid: Pid, new_pgid: Pid, caller_sid: Pid) -> Result<(), i32> {
+    // Found before TASKLIST (the pid hash's lock is not nested in it)
+    let target = crate::task::pid::find_pgrp(new_pgid);
+    let mut old = Vec::new();
     let mut table = TASKLIST.write();
+    let pg = setpgid_target(&table, target_pid, new_pgid, target.as_ref(), caller_sid)?;
+    table.change_pids(target_pid, &pg, None, &mut old);
+    drop(table);
+    drop(old);
+    Ok(())
+}
 
-    let (tid, pid, sid) = match table.get(target_pid) {
-        Some(t) => (t.task.tid(), t.task.pid, t.task.sid()),
-        None => return Err(3), // ESRCH
-    };
-
-    // Cannot change PGID of a session leader (pid == sid), nor move to a
-    // different session
+/// The group process `pid` moves to (Linux sys_setpgid's checks): not
+/// a session leader, in the caller's session; `pgid` is its own pid (a
+/// new group) or a group of that session
+fn setpgid_target(
+    table: &GlobalTaskTable,
+    pid: Pid,
+    pgid: Pid,
+    target: Option<&Arc<crate::task::pid::Pid>>,
+    caller_sid: Pid,
+) -> Result<Arc<crate::task::pid::Pid>, i32> {
+    let l = table.get(pid).ok_or(3)?; // ESRCH
+    let sid = l.task.sid();
     if pid == sid || sid != caller_sid {
         return Err(1); // EPERM
     }
-
-    // A new group (pgid == target_pid), or one that exists in the
-    // same session
-    if new_pgid != target_pid
-        && !table
-            .iter()
-            .any(|t| t.task.pgid() == new_pgid && t.task.sid() == caller_sid)
-    {
-        return Err(1); // EPERM - target PGID doesn't exist in same session
+    if pgid == pid {
+        return l.thread_pid.clone().ok_or(3);
     }
-
-    if let Some(t) = table.get_mut(tid) {
-        t.task
-            .pgid
-            .store(new_pgid, core::sync::atomic::Ordering::Relaxed);
+    let pg = target.ok_or(1)?; // EPERM
+    match table.pgrp(pg).next() {
+        Some(g) if g.task.sid() == caller_sid => Ok(pg.clone()),
+        _ => Err(1), // EPERM: no such group in the caller's session
     }
-    Ok(())
 }
 
 /// Create a new session for the current process
 ///
 /// Returns the new session ID on success, Err(errno) on failure.
 /// Error codes:
-/// - EPERM (1): Process is already a process group leader
-pub fn create_session(caller_pid: Pid, caller_pgid: Pid) -> Result<Pid, i32> {
-    // Cannot create session if already a process group leader
-    if caller_pid == caller_pgid {
-        return Err(1); // EPERM
-    }
-
+/// - EPERM (1): a session leader already, or a process group with the
+///   caller's pid as id exists
+pub fn create_session(caller_pid: Pid) -> Result<Pid, i32> {
+    let mut old = Vec::new();
     let mut table = TASKLIST.write();
-
-    // Find the calling process
-    let task = match table.get_mut(caller_pid) {
-        Some(t) => t,
-        None => return Err(3), // ESRCH
+    let pid = {
+        let l = table.get(caller_pid).ok_or(3)?; // ESRCH
+        let pid = l.thread_pid.clone().ok_or(3)?;
+        // A session leader already, or a process group with the
+        // caller's id exists (Linux ksys_setsid)
+        if l.task.sid() == caller_pid || table.pgrp(&pid).next().is_some() {
+            return Err(1); // EPERM
+        }
+        pid
     };
-
-    // Create new session: pid becomes sid and pgid
-    task.task
-        .sid
-        .store(caller_pid, core::sync::atomic::Ordering::Relaxed);
-    task.task
-        .pgid
-        .store(caller_pid, core::sync::atomic::Ordering::Relaxed);
-
+    // The whole process: pid becomes sid and pgid
+    table.change_pids(caller_pid, &pid, Some(&pid), &mut old);
+    drop(table);
+    drop(old);
     Ok(caller_pid)
 }
 

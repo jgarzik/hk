@@ -323,7 +323,8 @@ Network locks (3.10 Network Subsystem has the full order):
     network lock or under `Files`/TASKLIST (3.3, 3.1.1).
 
 Tasks (3.1.1, 3.7; Linux tasklist_lock → pidmap_lock → task_lock →
-    siglock): TASKLIST (spin RwLock, thread context) → PIDMAP_LOCK
+    siglock): TASKLIST (spin RwLock, thread context; also guards the
+    `Pid.pgrp`/`session` lists, 3.1.1) → PIDMAP_LOCK
     (spin, thread context; hash chains; in practice a leaf) →
     Task.alloc_lock (spin Mutex, per task, thread context, not
     IRQ-safe; Linux task_lock; one task's at a time) → Task.sig (spin
@@ -679,6 +680,27 @@ lists its group: joined at insert, left at removal, handed to the
 exec'ing thread when it takes the leader's place. A process is found
 by its pid as its leader's tid (`get(pid)`); its threads through
 `threads(pid)`.
+
+**Process groups and sessions** (Linux pid->tasks[PIDTYPE_PGID,
+PIDTYPE_SID]): each `Pid` has a `pgrp` and a `session` list (intrusive
+`List`, links `Task.pgrp_link`/`session_link`, no references), changed
+under TASKLIST's write lock and walked under its read lock (through
+`GlobalTaskTable::pgrp`/`pgrp_threads`). Only group leaders are on
+them (`TaskInner.pids_linked`), like Linux: linked when inserted
+(fork), by the new leader at exec's `take_leadership`, and after a
+change; unlinked at `remove` (release or reap; a zombie leader stays,
+as in Linux). Every thread holds a reference to its group's and
+session's `Pid` (`TaskInner.pgrp`/`session`, Linux signal->pids), so
+a `Pid` outlives its group even after its own task is gone; the
+`pgid`/`sid` atomics carry the numbers for lock-free getpgid/getsid.
+setpgid and setsid change every thread of the process in one write
+section (`change_pids`); fork copies the creator's under the same
+write lock that inserts the child. The old `Pid` references are
+dropped after TASKLIST; a group's `Pid` is looked up by number
+(`find_pgrp`, PIDMAP_LOCK) before TASKLIST is taken. Group 0, where
+init starts, is `INIT_STRUCT_PID` (Linux init_struct_pid, never
+hashed). kill(-pgrp), kill(0), tty ISIG, F_SETOWN and PRIO_PGRP /
+IOPRIO_WHO_PGRP walk a group's list, never the whole task list.
 
 A `Task` has five kinds of fields: fixed at creation (`tid`, `pid`,
 `kind`, `kstack_top`); hot atomics written by the task itself (or its

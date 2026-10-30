@@ -752,7 +752,7 @@ pub fn aarch64_syscall_dispatch(
             percpu::current_pgid(),
             percpu::current_sid(),
         ) as u64,
-        SYS_SETSID => sys_setsid(percpu::current_pid(), percpu::current_pgid()) as u64,
+        SYS_SETSID => sys_setsid(percpu::current_pid()) as u64,
 
         // Credentials
         SYS_GETUID => sys_getuid(percpu::current_cred().uid) as u64,

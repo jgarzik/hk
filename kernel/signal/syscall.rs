@@ -14,8 +14,8 @@
 use crate::arch::Uaccess;
 use crate::error::KernelError;
 use crate::signal::{
-    SIGKILL, SIGSTOP, SigAction, SigSet, UNMASKABLE_SIGNALS, get_task_sighand, send_signal,
-    send_signal_to_pgrp, send_signal_to_process, with_task_signal_state,
+    SIGKILL, SIGSTOP, SigAction, SigSet, UNMASKABLE_SIGNALS, get_task_sighand, kill_pgrp,
+    send_signal, send_signal_to_process, with_task_signal_state,
 };
 use crate::task::percpu::{current_pgid, current_tid, get_all_pids};
 use crate::uaccess::{get_user, put_user};
@@ -347,14 +347,8 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
         }
         send_signal_to_process(pid as u64, sig) as i64
     } else if pid == 0 {
-        // Send to all processes in caller's process group
-        let pgid = current_pgid();
-        // Signal 0 is a validity check only
-        if sig == 0 {
-            // Check if our process group exists (it always does)
-            return 0;
-        }
-        send_signal_to_pgrp(pgid, sig) as i64
+        // Every process in the caller's process group, once each
+        kill_pgrp(current_pgid(), sig, |p| check_kill_permission(p, sig)) as i64
     } else if pid == -1 {
         // Send to all processes (except init)
         // Signal 0 is a validity check, don't actually send
@@ -372,16 +366,10 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
         }
         if sent { 0 } else { -3 } // ESRCH if no process was signaled
     } else {
-        // pid < -1: Send to all processes in process group -pid
-        let pgid = (-pid) as u64;
-        // Signal 0 is a validity check - check if pgrp exists
-        if sig == 0 {
-            use crate::task::percpu::TASKLIST;
-            let table = TASKLIST.read();
-            let exists = table.iter().any(|t| t.task.pgid() == pgid);
-            return if exists { 0 } else { -3 }; // ESRCH if pgrp doesn't exist
-        }
-        send_signal_to_pgrp(pgid, sig) as i64
+        // pid < -1: every process in group -pid, once each (signal 0:
+        // does the group exist, may we signal it)
+        let pgid = pid.unsigned_abs();
+        kill_pgrp(pgid, sig, |p| check_kill_permission(p, sig)) as i64
     }
 }
 

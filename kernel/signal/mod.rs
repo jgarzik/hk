@@ -1014,46 +1014,35 @@ pub fn send_signal_to_process(pid: Pid, sig: u32) -> i32 {
     }
 }
 
-/// Send signal to all processes in a process group
+/// Send signal to all processes in a process group, from the kernel
+/// (no permission check: Linux kill_pgrp with SEND_SIG_PRIV)
 ///
 /// This is used by TTY signal generation (SIGINT, SIGTSTP, etc.)
 /// when control characters are received.
 ///
 /// Returns 0 on success, negative errno on error.
 pub fn send_signal_to_pgrp(pgid: Pid, sig: u32) -> i32 {
-    use crate::task::percpu::TASKLIST;
-
     if sig == 0 || sig > 64 {
         return -22; // EINVAL
     }
+    kill_pgrp(pgid, sig, |_| 0)
+}
 
-    // Find all processes in this process group
-    let tids: alloc::vec::Vec<Tid> = {
-        let table = TASKLIST.read();
-        table
-            .iter()
-            .filter(|t| t.task.pgid() == pgid)
-            .map(|t| t.task.tid())
-            .collect()
-    };
-
-    if tids.is_empty() {
-        return -3; // ESRCH - no such process group
+/// `sig` once to each process of group `pgid` (Linux __kill_pgrp_info:
+/// its leader on the group's list, the signal process-directed), after
+/// `check(pid)` allows it; signal 0 only checks. 0 if any process got
+/// it, else the last error (ESRCH for an empty group).
+pub fn kill_pgrp(pgid: Pid, sig: u32, check: impl Fn(Pid) -> i32) -> i32 {
+    let mut ret = -3; // ESRCH
+    let mut ok = false;
+    for pid in crate::task::percpu::pgrp_pids(pgid) {
+        ret = match check(pid) {
+            0 if sig != 0 => send_signal_to_process(pid, sig),
+            e => e,
+        };
+        ok |= ret == 0;
     }
-
-    // Send signal to each process
-    let mut sent = 0;
-    for tid in tids {
-        if send_signal(tid, sig) == 0 {
-            sent += 1;
-        }
-    }
-
-    if sent > 0 {
-        0
-    } else {
-        -3 // ESRCH
-    }
+    if ok { 0 } else { ret }
 }
 
 // =============================================================================

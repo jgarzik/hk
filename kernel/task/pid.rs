@@ -21,8 +21,11 @@ use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
+use crate::list::List;
 use crate::ns::PidNamespace;
 use crate::sync::spin::Mutex;
+use crate::task::TableCell;
+use crate::task::percpu::{PgrpLink, SessionLink};
 
 /// Ids per bitmap page (Linux BITS_PER_PAGE)
 const PER_PAGE: u32 = 4096 * 8;
@@ -55,6 +58,16 @@ pub struct Pid {
     /// `*const KernelTask` set and cleared under TASKLIST's write lock
     /// while the task is in the task list
     task: AtomicPtr<()>,
+    /// The process group whose id this is: its member processes'
+    /// group leaders (Linux pid->tasks[PIDTYPE_PGID]; links
+    /// `Task.pgrp_link`), changed under TASKLIST's write lock and
+    /// walked under its read lock. Every thread of a member holds a
+    /// reference to this `Pid` (`TaskInner.pgrp`), so it outlives its
+    /// group.
+    pub(crate) pgrp: TableCell<List<PgrpLink>>,
+    /// The session whose id this is, likewise (Linux
+    /// pid->tasks[PIDTYPE_SID]; links `Task.session_link`)
+    pub(crate) session: TableCell<List<SessionLink>>,
     /// pidfd pollers of the process this pid leads (Linux wait_pidfd)
     pub wait_pidfd: crate::waitqueue::WaitQueue,
     /// The process's wait status once all its threads have exited;
@@ -264,6 +277,8 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Option<Arc<
         level: numbers.len() as u32 - 1,
         numbers: numbers.into_boxed_slice(),
         task: AtomicPtr::new(core::ptr::null_mut()),
+        pgrp: TableCell::new(List::new()),
+        session: TableCell::new(List::new()),
         wait_pidfd: crate::waitqueue::WaitQueue::new(),
         exit: AtomicI64::new(ALIVE),
     });
@@ -276,6 +291,34 @@ pub fn alloc_pid_nr(ns: &Arc<PidNamespace>, root_nr: Option<u32>) -> Option<Arc<
         b.store(u as *const UPid as *mut UPid, Ordering::Release);
     }
     Some(pid)
+}
+
+/// The process group and session of the boot task, number 0 (Linux
+/// init_struct_pid): never hashed, never freed; init starts in it
+pub static INIT_STRUCT_PID: spin::Lazy<Arc<Pid>> = spin::Lazy::new(|| {
+    Arc::new(Pid {
+        level: 0,
+        numbers: Box::new([UPid {
+            nr: 0,
+            ns: crate::ns::INIT_PID_NS.clone(),
+            next: AtomicPtr::new(core::ptr::null_mut()),
+            pid: AtomicPtr::new(core::ptr::null_mut()),
+        }]),
+        task: AtomicPtr::new(core::ptr::null_mut()),
+        pgrp: TableCell::new(List::new()),
+        session: TableCell::new(List::new()),
+        wait_pidfd: crate::waitqueue::WaitQueue::new(),
+        exit: AtomicI64::new(ALIVE),
+    })
+});
+
+/// The process group (or session) numbered `nr` in the root namespace:
+/// 0 is the boot one (`INIT_STRUCT_PID`)
+pub fn find_pgrp(nr: u64) -> Option<Arc<Pid>> {
+    if nr == 0 {
+        return Some(INIT_STRUCT_PID.clone());
+    }
+    find_pid(&crate::ns::INIT_PID_NS, u32::try_from(nr).ok()?)
 }
 
 /// The live `Pid` numbered `nr` in `ns` (Linux find_pid_ns)

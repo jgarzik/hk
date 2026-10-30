@@ -71,6 +71,7 @@ pub mod nonblock;
 pub mod nproc;
 pub mod packet;
 pub mod permissions;
+pub mod pgrp_links;
 pub mod pid_tid;
 pub mod pidfd;
 pub mod poll;
@@ -219,6 +220,7 @@ pub fn run_all_tests() {
     isolated(b"MAPCOUNT", mapcount::run_tests);
     group_exit::run_tests();
     pid_tid::run_tests();
+    pgrp_links::run_tests();
     netlink::run_tests();
     netdev_ioctl::run_tests();
     netdev::run_tests();

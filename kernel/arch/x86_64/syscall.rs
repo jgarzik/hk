@@ -1069,7 +1069,7 @@ pub fn x86_64_syscall_dispatch(
             percpu::current_pgid(),
             percpu::current_sid(),
         ) as u64,
-        SYS_SETSID => sys_setsid(percpu::current_pid(), percpu::current_pgid()) as u64,
+        SYS_SETSID => sys_setsid(percpu::current_pid()) as u64,
 
         // Credentials (Section 10.1)
         SYS_GETUID => sys_getuid(percpu::current_cred().uid) as u64,

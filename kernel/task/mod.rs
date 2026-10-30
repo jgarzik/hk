@@ -882,9 +882,10 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
 
     /// Parent process ID (0 for init/orphans; written under TASKLIST)
     pub ppid: AtomicU64,
-    /// Process group ID (written under TASKLIST)
+    /// Process group ID: the number of `TaskInner.pgrp` (written with
+    /// it under TASKLIST's write lock, in every thread of the group)
     pub pgid: AtomicU64,
-    /// Session ID (written under TASKLIST)
+    /// Session ID: likewise for `TaskInner.session`
     pub sid: AtomicU64,
     /// User TLS register (x86-64 FS base, arm64 TPIDR_EL0), saved at
     /// switch-out and loaded at switch-in; set by the task itself or its
@@ -966,6 +967,12 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Its place in its group leader's `threads` (Linux thread_node;
     /// under TASKLIST)
     pub thread_node: crate::list::Link,
+    /// A group leader's place on its process group's `Pid.pgrp` (Linux
+    /// pid_links[PIDTYPE_PGID]; under TASKLIST)
+    pub pgrp_link: crate::list::Link,
+    /// A group leader's place on its session's `Pid.session` (Linux
+    /// pid_links[PIDTYPE_SID]; under TASKLIST)
+    pub session_link: crate::list::Link,
     /// The rest, under TASKLIST (None only for the boot task, which
     /// is never in the table)
     inner: TableCell<Option<TaskInner<A, PT>>>,
@@ -976,6 +983,13 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     /// Its process identifier (Linux thread_pid; None for the idle
     /// tasks, tid 0)
     pub thread_pid: Option<Arc<pid::Pid>>,
+    /// Its process group and session (Linux signal->pids[PIDTYPE_PGID,
+    /// PIDTYPE_SID]): the same in every thread of the group, numbered
+    /// by the `pgid`/`sid` atomics; None for kernel threads
+    pub pgrp: Option<Arc<pid::Pid>>,
+    pub session: Option<Arc<pid::Pid>>,
+    /// A group leader on its `pgrp`'s and `session`'s lists
+    pub pids_linked: bool,
     // =========================================================================
     // Exit handling (like Linux task_struct exit fields)
     // =========================================================================
@@ -1469,6 +1483,8 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             tasks_link: crate::list::Link::new(),
             sibling: crate::list::Link::new(),
             thread_node: crate::list::Link::new(),
+            pgrp_link: crate::list::Link::new(),
+            session_link: crate::list::Link::new(),
             inner: TableCell::new(Some(inner)),
         }
     }
@@ -1518,6 +1534,8 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             tasks_link: crate::list::Link::new(),
             sibling: crate::list::Link::new(),
             thread_node: crate::list::Link::new(),
+            pgrp_link: crate::list::Link::new(),
+            session_link: crate::list::Link::new(),
             inner: TableCell::new(None),
         }
     }

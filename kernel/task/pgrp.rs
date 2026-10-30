@@ -106,9 +106,9 @@ pub fn sys_setpgid(
 ///
 /// # Returns
 /// - Session ID (== PID) on success
-/// - -EPERM if already a process group leader
-pub fn sys_setsid(caller_pid: Pid, caller_pgid: Pid) -> i64 {
-    match super::percpu::create_session(caller_pid, caller_pgid) {
+/// - -EPERM if a session leader, or a process group with its id exists
+pub fn sys_setsid(caller_pid: Pid) -> i64 {
+    match super::percpu::create_session(caller_pid) {
         Ok(new_sid) => new_sid as i64,
         Err(errno) => -(errno as i64),
     }

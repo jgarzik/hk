@@ -591,8 +591,7 @@ Found during T0 (2026-10-19). Tag = when to fix.
    tracer cannot observe a non-leader exec's tid change.
 7. **T0 resume point** (T0 next). Design: ~/.claude/plans/
    t0-foundation-design.md (commit numbers below are its §3).
-   Remaining: PGID/SID pid_links (kill_pgrp/setpgid scan); 15 sched
-   entity/ttwu(&Task);
+   Remaining: 15 sched entity/ttwu(&Task);
    16 intrusive WaitQueue + FutexQ (wakeups by raw tid: waitqueue,
    futex, poll, mqueue, signalfd, sem/msg); 17 per-CPU timer wheel; 18 hrtimer-lite
    + deadline waits; 19 yield polls and SCHEDULING_ENABLED fallbacks;
@@ -619,3 +618,11 @@ Found during T0 (2026-10-19). Tag = when to fix.
    vectors.S KERNEL_ENTRY tests bit 15 of SP only, so an SP that jumped
    more than 32 KB below a stack base (one huge frame) lands where the
    bit is clear and is not caught (the guard gap still faults).
+13. **A priority change does not requeue a queued task** (next batch):
+   `set_task_priority` only stores `se.prio`; a queued task stays on
+   its old priority list until it next runs. Raised while a busy task
+   of the new priority yields in a loop, it never runs (strict
+   priority lists), e.g. setpriority(PRIO_PGRP) raising a sibling
+   thread that its leader then spin-joins. Linux set_user_nice
+   dequeues and re-enqueues under the rq lock (cross-CPU: via the
+   owner, tasks never migrate).

@@ -84,7 +84,22 @@ pub fn sys_getpriority(which: i32, who: u64, caller_pid: Pid) -> i64 {
                 None => KernelError::NoProcess.sysret(),
             }
         }
-        PRIO_PGRP | PRIO_USER => {
+        PRIO_PGRP => {
+            // The highest priority of any thread in the group (Linux:
+            // the largest 20 - nice)
+            let pgid = if who == 0 {
+                super::percpu::current_pgid()
+            } else {
+                who
+            };
+            super::percpu::get_tids_by_pgid(pgid)
+                .into_iter()
+                .filter_map(super::percpu::lookup_task_priority)
+                .map(|p| (20 - priority_to_nice(p)) as i64)
+                .max()
+                .unwrap_or(KernelError::NoProcess.sysret())
+        }
+        PRIO_USER => {
             // Not implemented yet - would require task iteration
             KernelError::NoProcess.sysret() // Return ESRCH for now (no matching processes)
         }
@@ -147,7 +162,31 @@ pub fn sys_setpriority(
                 Err(errno) => -(errno as i64),
             }
         }
-        PRIO_PGRP | PRIO_USER => {
+        PRIO_PGRP => {
+            // Every thread of the group (Linux set_one_prio each); the
+            // last error, ESRCH if none
+            let pgid = if who == 0 {
+                super::percpu::current_pgid()
+            } else {
+                who
+            };
+            let mut ret = KernelError::NoProcess.sysret();
+            for tid in super::percpu::get_tids_by_pgid(pgid) {
+                let Some(prio) = super::percpu::lookup_task_priority(tid) else {
+                    continue;
+                };
+                ret = if caller_euid != 0 && niceval < priority_to_nice(prio) {
+                    KernelError::PermissionDenied.sysret()
+                } else {
+                    match super::percpu::set_task_priority(tid, nice_to_priority(niceval)) {
+                        Ok(()) => 0,
+                        Err(errno) => -(errno as i64),
+                    }
+                };
+            }
+            ret
+        }
+        PRIO_USER => {
             // Not implemented yet
             KernelError::NoProcess.sysret()
         }
