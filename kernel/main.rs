@@ -690,6 +690,58 @@ fn kmain() -> ! {
     crate::net::init();
 
     // ========================================================================
+    // Phase 4: The scheduler runs (Linux sched_init, rest_init): the boot
+    // context becomes pid 1 in kernel mode with interrupts on, so driver
+    // probe, VFS setup and the initramfs below may sleep like any task.
+    // Its program is loaded into the address space made here once the
+    // initramfs is unpacked (Linux kernel_init, then run_init_process).
+    // ========================================================================
+    let mut user_pt = match ArchPageTable::new_user(&mut frame_alloc) {
+        Some(pt) => pt,
+        None => {
+            printkln!("ERR: page table alloc");
+            CurrentArch::halt_loop();
+        }
+    };
+    user_pt.copy_kernel_mappings();
+    let init_pgd = user_pt.root_table_phys();
+    let user_stack_top = match allocate_user_stack(&mut user_pt, &mut frame_alloc) {
+        Ok(sp) => sp,
+        Err(e) => {
+            printkln!("ERR: {}", e);
+            CurrentArch::halt_loop();
+        }
+    };
+    // Kernel stack for PID 1 (init process)
+    let kernel_stack = mm::vmstack::alloc().expect("Failed to allocate kernel stack for init")
+        + task::percpu::KERNEL_STACK_SIZE as u64;
+
+    // The per-CPU scheduler with its idle task, then pid 1 (the idle
+    // tasks are tid 0, Linux swapper). ppid=0 (no parent), pgid=sid=0
+    // like Linux's init_task (init/init_task.c); init calls setsid()
+    // itself if it wants a session
+    task::percpu::init();
+    let init_tid = task::percpu::create_user_task(task::percpu::UserTaskConfig {
+        ppid: 0, // init has no parent
+        pgid: 0, // inherited from init_task, not a group leader
+        sid: 0,  // not a session leader until setsid()
+        priority: task::PRIORITY_NORMAL,
+        kstack_top: kernel_stack,
+        user_stack_top,
+        page_table: user_pt,
+    })
+    .expect("Failed to create user task");
+
+    // Schedulers for the APs, then the kernel threads: timer callbacks
+    // (ktimers/N), the system workqueue worker, the per-CPU network
+    // softnet threads. Then interrupts on: pid 1 may sleep from here.
+    task::percpu::init_ap_schedulers();
+    crate::timer::start_ktimers();
+    crate::workqueue::init();
+    crate::net::start_threads();
+    CurrentArch::enable_interrupts();
+
+    // ========================================================================
     // Bus/Driver Model: Layered device discovery
     // ========================================================================
     //
@@ -746,6 +798,11 @@ fn kmain() -> ! {
     // Phase 5: VFS Initialization
     // ========================================================================
     init_vfs_core();
+
+    // pid 1's root and working directory: the VFS exists now
+    if let Some(fs) = crate::fs::FsStruct::new_root() {
+        crate::fs::init_task_fs(init_tid, fs);
+    }
 
     // Architecture-specific VFS extras (e.g., VFAT ramdisk from multiboot2 module on x86)
     CurrentArch::init_vfs_extras();
@@ -858,14 +915,9 @@ fn kmain() -> ! {
     };
     printkln!("ELF: entry=0x{:x}", elf.entry);
 
-    // Create user page table
-    let mut user_pt = match ArchPageTable::new_user(&mut frame_alloc) {
-        Some(pt) => pt,
-        None => {
-            printkln!("ERR: page table alloc");
-            CurrentArch::halt_loop();
-        }
-    };
+    // pid 1's page table, made with its task: kernel mappings added
+    // since then (probe, ioremap) are copied again
+    let mut user_pt = ArchPageTable::new(init_pgd);
     user_pt.copy_kernel_mappings();
 
     // Load ELF segments into user page table using page cache
@@ -902,19 +954,6 @@ fn kmain() -> ! {
     // Page-align to get start_brk
     let start_brk = (highest_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
-    // Allocate user stack
-    let user_stack_top = match allocate_user_stack(&mut user_pt, &mut frame_alloc) {
-        Ok(sp) => sp,
-        Err(e) => {
-            printkln!("ERR: {}", e);
-            CurrentArch::halt_loop();
-        }
-    };
-
-    // Kernel stack for PID 1 (init process)
-    let kernel_stack = mm::vmstack::alloc().expect("Failed to allocate kernel stack for init")
-        + task::percpu::KERNEL_STACK_SIZE as u64;
-
     printkln!("KERNEL_READY");
 
     // Run locking infrastructure self-tests
@@ -922,26 +961,6 @@ fn kmain() -> ! {
 
     // Calculate actual entry point (add base for PIE)
     let entry_point = elf.entry + base_addr;
-
-    // Initialize the per-CPU scheduler with idle task
-    // This must be done before creating the user task
-    task::percpu::init();
-
-    // Register init with the scheduler: pid 1 (the idle tasks are tid 0,
-    // Linux swapper). ppid=0 (no parent), pgid=sid=0 like Linux's
-    // init_task (init/init_task.c); init calls setsid() itself if it
-    // wants a session
-
-    let init_tid = task::percpu::create_user_task(task::percpu::UserTaskConfig {
-        ppid: 0, // init has no parent
-        pgid: 0, // inherited from init_task, not a group leader
-        sid: 0,  // not a session leader until setsid()
-        priority: task::PRIORITY_NORMAL,
-        kstack_top: kernel_stack,
-        user_stack_top,
-        page_table: user_pt,
-    })
-    .expect("Failed to create user task");
 
     // Initialize brk for the init task
     // This must be done after create_user_task which creates a default mm
@@ -956,16 +975,7 @@ fn kmain() -> ! {
         }
     }
 
-    // Enable scheduling
-    task::percpu::enable();
-
-    // Schedulers for the APs, then the kernel threads: timer callbacks
-    // (ktimers/N), the system workqueue worker, the per-CPU network softnet
-    // threads and the boot self-test
-    task::percpu::init_ap_schedulers();
-    crate::timer::start_ktimers();
-    crate::workqueue::init();
-    crate::net::start_threads();
+    // The boot self-test
     crate::selftest::start();
 
     // stdin/stdout/stderr of init: /dev/console (Linux kernel_init)

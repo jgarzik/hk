@@ -135,8 +135,9 @@ fn write(&self) -> RwLockWriteGuard<'_, T>
 ### 1.4 Sleeping locks: sync::Mutex<T>, sync::RwSem (kernel/sync/)
 
 Linux `struct mutex` and `struct rw_semaphore`: a contended lock sleeps
-on the lock's `WaitQueue` instead of spinning (it spins only before
-scheduling is enabled), so the holder may sleep (page locks, block I/O,
+on the lock's `WaitQueue` instead of spinning (only a tid-0 caller, the
+boot context before pid 1 exists or an idle task, spins: neither ever
+meets contention), so the holder may sleep (page locks, block I/O,
 user page faults, blocking pipe/socket I/O).
 
 - `Mutex<T>`: owner tid recorded (debug builds catch recursive locking
@@ -424,7 +425,6 @@ The scheduler uses a per-CPU locking model to minimize contention.
 |----------|------|---------|
 | `PERCPU_SCHEDS` | `PerCpu<PerCpuScheduler>` | Per-CPU scheduler array |
 | `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task (Linux tasklist_lock + task list) |
-| `SCHEDULING_ENABLED` | `AtomicBool` | Global scheduling enable flag |
 | `TICK_COUNT` | `AtomicU64` | Global tick counter (jiffies, TICK_MS = 10 ms); advanced only by CPU 0's tick; every CPU's tick applies its remote wakeups (`sched_ipi`) and runs its own timers (`timer::run_local`; Timers, 3.3) |
 
 #### Per-CPU State
@@ -2632,10 +2632,10 @@ Rules:
   `submit_bio_wait`'s `end_io` hands the bio back and completes last:
   once `Completion::wait` returns the waker no longer touches the
   waiter's stack.
-- **Polled completion before scheduling:** a `submit_bio_wait` before
-  scheduling runs (boot partition scan) reaps the hardware queues itself
-  (`BlkMq::poll`, the same path as the ISR, serialized by the hardware
-  queue lock).
+- **Boot I/O sleeps:** the scheduler runs and interrupts are on before
+  driver probe (main.rs: the boot context is pid 1 by then, Linux
+  kernel_init), so the boot partition scan's `submit_bio_wait` sleeps on
+  its completion like any other.
 - **devtmpfs nodes under `open_mutex`:** Linux hands node updates to
   devtmpfsd; hk creates/removes them in the caller (probe, rescan), under
   the devtmpfs root's `i_rwsem`. No path holding a directory `i_rwsem`

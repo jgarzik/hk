@@ -288,7 +288,7 @@ mod imp {
     /// any `IrqSpinlock` / preemption disable via the preempt count)
     #[track_caller]
     pub fn might_sleep() {
-        if !crate::task::percpu::SCHEDULING_ENABLED.load(Ordering::Acquire) {
+        if !crate::task::percpu::can_sleep() {
             return;
         }
         let Some(c) = cpu() else {

@@ -326,13 +326,6 @@ impl RequestQueue {
             QueueKind::Mq(m) => m.submit(bio),
         }
     }
-
-    /// Reap completions without interrupts (boot, before scheduling)
-    fn poll(&self) {
-        if let QueueKind::Mq(m) = &self.kind {
-            m.poll();
-        }
-    }
 }
 
 // ============================================================================
@@ -598,7 +591,7 @@ fn wait_endio(bio: Box<Bio>) {
 }
 
 /// Submit and sleep until done (Linux submit_bio_wait); returns the bio
-/// (its segments) and the result. Before scheduling runs, polls the queue.
+/// (its segments) and the result.
 pub fn submit_bio_wait(
     bdev: &BlockDevice,
     mut bio: Box<Bio>,
@@ -610,14 +603,7 @@ pub fn submit_bio_wait(
     bio.end_io = Some(wait_endio);
     bio.private = &w as *const Waiter as usize;
     submit_bio(bdev, bio);
-    if crate::task::percpu::SCHEDULING_ENABLED.load(Ordering::Acquire) {
-        w.done.wait();
-    } else {
-        while !w.done.try_wait() {
-            bdev.disk.queue.poll();
-            core::hint::spin_loop();
-        }
-    }
+    w.done.wait();
     let mut bio = unsafe { Box::from_raw(w.bio.load(Ordering::Acquire)) };
     bio.end_io = None;
     let st = bio.status;

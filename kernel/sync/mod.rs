@@ -18,11 +18,10 @@ pub use rwsem::{RwSem, RwSemReadGuard, RwSemWriteGuard};
 
 use core::sync::atomic::Ordering;
 
-use crate::task::percpu::SCHEDULING_ENABLED;
-
-/// True once tasks can sleep
+/// The caller is a task that may sleep (not tid 0: an idle task or the
+/// boot context, which never contend for a sleeping lock)
 fn can_sleep() -> bool {
-    SCHEDULING_ENABLED.load(Ordering::Acquire)
+    crate::task::percpu::can_sleep()
 }
 
 /// Linux might_sleep (CONFIG_DEBUG_ATOMIC_SLEEP): no spin lock may be

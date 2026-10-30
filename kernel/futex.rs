@@ -494,16 +494,9 @@ pub fn futex_wait(
     bitset: u32,
     is_private: bool,
 ) -> i32 {
-    use crate::task::percpu::SCHEDULING_ENABLED;
-
     // Validate bitset (0 is invalid per Linux ABI)
     if bitset == 0 {
         return KernelError::InvalidArgument.to_errno_neg();
-    }
-
-    // Check scheduling is enabled
-    if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
-        return KernelError::WouldBlock.to_errno_neg();
     }
 
     let key = make_key(uaddr, is_private);
@@ -1205,13 +1198,6 @@ fn futex_wait_multiple(
     timeout_ns: Option<u64>,
     use_realtime: bool,
 ) -> i32 {
-    use crate::task::percpu::SCHEDULING_ENABLED;
-
-    // Check scheduling is enabled
-    if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
-        return KernelError::WouldBlock.to_errno_neg();
-    }
-
     // Fault every word in (a real EFAULT is reported here); they are
     // read again under the bucket locks with faults disabled
     for entry in entries {

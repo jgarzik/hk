@@ -247,12 +247,8 @@ pub fn napi_enable(napi: &Napi) {
 
 /// Back off while a poll finishes
 fn napi_wait() {
-    if crate::task::percpu::SCHEDULING_ENABLED.load(Ordering::Acquire) {
-        let ms = crate::time::monotonic_ns() + 1_000_000;
-        let _ = crate::task::percpu::sleep_until_ns(ms, false);
-    } else {
-        core::hint::spin_loop();
-    }
+    let ms = crate::time::monotonic_ns() + 1_000_000;
+    let _ = crate::task::percpu::sleep_until_ns(ms, false);
 }
 
 // ============================================================================

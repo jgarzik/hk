@@ -751,9 +751,6 @@ impl GlobalTaskTable {
 /// interrupt handler, so interrupts stay on)
 pub static TASKLIST: RwLock<GlobalTaskTable> = RwLock::new(GlobalTaskTable::new());
 
-/// Scheduling enabled flag
-pub static SCHEDULING_ENABLED: AtomicBool = AtomicBool::new(false);
-
 /// The boot CPU has per-CPU data (`init_bsp`); from then on every CPU
 /// running kernel code has its own
 pub static PERCPU_UP: AtomicBool = AtomicBool::new(false);
@@ -1105,10 +1102,12 @@ pub fn init() {
     }
 }
 
-/// Enable scheduling globally
-pub fn enable() {
-    SCHEDULING_ENABLED.store(true, Ordering::Release);
-    printkln!("Scheduling enabled");
+/// The caller is a task that may sleep: this CPU's scheduler runs and
+/// it is neither an idle task nor the boot context before pid 1 exists
+/// (both tid 0, which never sleep; Linux: no might_sleep before
+/// SYSTEM_SCHEDULING, and idle never sleeps)
+pub fn can_sleep() -> bool {
+    current_tid() != 0 && this_sched().is_some()
 }
 
 /// Create a user task entry for the init process
@@ -2405,9 +2404,6 @@ fn check_switch_atomic() {
 
 /// This CPU's scheduler, if initialized
 fn this_sched() -> Option<&'static PerCpuScheduler> {
-    if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
-        return None;
-    }
     current_percpu_sched().filter(|s| s.initialized.load(Ordering::Acquire))
 }
 
