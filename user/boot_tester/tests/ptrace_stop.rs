@@ -7,9 +7,15 @@
 //!   the syscall number at the entry stop (getppid becomes getpid)
 //! - PTRACE_STOP_KILL: SIGKILL ends a ptrace stop; wait4 reports the
 //!   kill
+//! - PTRACE_PEEK_DUMPABLE: an unprivileged tracer's PEEKDATA stores the
+//!   word at `data` (the raw syscall returns 0); once the tracee made
+//!   itself non-dumpable it fails with EIO (Linux ptrace_access_vm)
 
 use super::sk::T;
-use hk_syscall::{sys_exit, sys_fork, sys_getpid, sys_getppid, sys_kill, sys_ptrace, sys_wait4};
+use hk_syscall::{
+    sys_exit, sys_fork, sys_getpid, sys_getppid, sys_kill, sys_prctl, sys_ptrace, sys_setresgid,
+    sys_setresuid, sys_wait4,
+};
 
 const PTRACE_TRACEME: i64 = 0;
 const PTRACE_CONT: i64 = 7;
@@ -23,6 +29,7 @@ const SYSGOOD_TRAP: i32 = 0x80 | 5;
 pub fn run_tests() {
     test_syscall_stop();
     test_stop_kill();
+    test_peek_dumpable();
 }
 
 /// A child that stops for its tracer, then makes one getppid: exit 7 if
@@ -99,5 +106,53 @@ fn test_stop_kill() {
     let mut st = 0i32;
     t.eq(b"wait", sys_wait4(pid, &mut st, 0, 0), pid);
     t.eq(b"killed", (st & 0x7f) as i64, SIGKILL as i64);
+    t.done();
+}
+
+/// A word for PEEKDATA to find
+static MAGIC: u64 = 0x1234_5678_9abc_def0;
+
+/// In a uid-1000 tracer: PEEKDATA of a dumpable then a non-dumpable
+/// TRACEME child; exit status: bit 0 dumpable peek wrong, bit 1
+/// non-dumpable peek not EIO
+fn peek_tracer() -> ! {
+    const PTRACE_PEEKDATA: i64 = 2;
+    const PR_SET_DUMPABLE: i32 = 4;
+    sys_setresgid(1000, 1000, 1000);
+    sys_setresuid(1000, 1000, 1000);
+    let mut bad = 0;
+    for dumpable in [1u64, 0] {
+        let pid = sys_fork();
+        if pid == 0 {
+            sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
+            sys_prctl(PR_SET_DUMPABLE, dumpable, 0, 0, 0);
+            sys_kill(sys_getpid(), SIGSTOP);
+            sys_exit(0);
+        }
+        stop_sig(pid);
+        let mut word = 0u64;
+        let r = sys_ptrace(PTRACE_PEEKDATA, pid, &MAGIC as *const u64 as u64, &mut word as *mut u64 as u64);
+        if dumpable == 1 && (r != 0 || word != MAGIC) {
+            bad |= 1;
+        }
+        if dumpable == 0 && r != -5 {
+            bad |= 2;
+        }
+        sys_kill(pid, SIGKILL);
+        let mut st = 0i32;
+        sys_wait4(pid, &mut st, 0, 0);
+    }
+    sys_exit(bad);
+}
+
+fn test_peek_dumpable() {
+    let mut t = T::new(b"PTRACE_PEEK_DUMPABLE");
+    let pid = sys_fork();
+    if pid == 0 {
+        peek_tracer();
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    t.eq(b"tracer status", st as i64, 0);
     t.done();
 }

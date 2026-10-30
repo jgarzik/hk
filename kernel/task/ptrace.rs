@@ -527,6 +527,15 @@ fn ptrace_kill(target_pid: Pid) -> i64 {
 // PTRACE_PEEKDATA / PTRACE_POKEDATA implementation
 // =============================================================================
 
+/// The tracer may read and write the tracee's memory (Linux
+/// ptrace_access_vm): its mm is dumpable, or the tracer has
+/// CAP_SYS_PTRACE. A tracee that became non-dumpable after the attach
+/// (setuid, PR_SET_DUMPABLE) keeps its memory.
+fn may_access_vm(mm: &crate::mm::MmRef) -> bool {
+    use crate::task::dumpable::SUID_DUMP_USER;
+    mm.dumpable() == SUID_DUMP_USER || capable(CAP_SYS_PTRACE)
+}
+
 /// Get target's memory descriptor and page table root
 fn get_target_mm_and_pt(target_tid: Tid) -> Option<(crate::mm::MmRef, u64)> {
     // A user reference: the address space cannot be torn down while we
@@ -537,7 +546,7 @@ fn get_target_mm_and_pt(target_tid: Tid) -> Option<(crate::mm::MmRef, u64)> {
 }
 
 /// Read a word from tracee's memory.
-fn ptrace_peek_data(target_pid: Pid, addr: u64) -> i64 {
+fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
     let target_tid = match find_task_by_pid(target_pid) {
         Some(tid) => tid,
         None => return -ESRCH,
@@ -553,14 +562,25 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64) -> i64 {
         Some(x) => x,
         None => return -ESRCH,
     };
+    if !may_access_vm(&target_mm) {
+        return -EIO;
+    }
 
     // Lock mm and read from tracee
     let mm_guard = target_mm.mmap_read();
     let mut buf = [0u8; 8];
     match crate::mm::remote::access_remote_vm_read(&target_mm, &mm_guard, addr, &mut buf) {
+        // The raw syscall stores the word at `data` and returns 0
+        // (Linux generic_ptrace_peekdata; libc returns the word)
         Ok(8) => {
-            // Return the word value
-            i64::from_ne_bytes(buf)
+            drop(mm_guard);
+            match crate::uaccess::put_user::<crate::arch::Uaccess, u64>(
+                data,
+                u64::from_ne_bytes(buf),
+            ) {
+                Ok(()) => 0,
+                Err(_) => -EFAULT,
+            }
         }
         _ => -EIO,
     }
@@ -583,6 +603,9 @@ fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
         Some(x) => x,
         None => return -ESRCH,
     };
+    if !may_access_vm(&target_mm) {
+        return -EIO;
+    }
 
     // Lock mm and write to tracee
     let mm_guard = target_mm.mmap_read();
@@ -887,7 +910,7 @@ pub fn exit_ptrace() {
 ///
 /// # Returns
 /// 0 on success, or negative error code.
-/// For PEEKDATA/PEEKTEXT, returns the read value on success.
+/// For PEEKDATA/PEEKTEXT, the word goes to `data` (the raw syscall ABI).
 pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
     match request {
         PTRACE_TRACEME => ptrace_traceme(),
@@ -895,7 +918,7 @@ pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
         PTRACE_SEIZE => ptrace_seize(pid as Pid, data as u32),
         PTRACE_DETACH => ptrace_detach(pid as Pid, data as u32),
 
-        PTRACE_PEEKTEXT | PTRACE_PEEKDATA => ptrace_peek_data(pid as Pid, addr),
+        PTRACE_PEEKTEXT | PTRACE_PEEKDATA => ptrace_peek_data(pid as Pid, addr, data),
         PTRACE_POKETEXT | PTRACE_POKEDATA => ptrace_poke_data(pid as Pid, addr, data),
 
         PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP => {
