@@ -1450,6 +1450,14 @@ impl SignalStruct {
         Some(rlim[resource as usize])
     }
 
+    /// Set a limit's soft value with no checks (kernel-internal, Linux
+    /// writing signal->rlim directly: acct lifts RLIMIT_FSIZE around its
+    /// write); the old value
+    pub fn swap_rlimit_cur(&self, resource: u32, cur: u64) -> u64 {
+        let mut rlim = self.rlim.lock();
+        core::mem::replace(&mut rlim[resource as usize].rlim_cur, cur)
+    }
+
     /// Set a resource limit (with permission checks)
     ///
     /// Validates:
