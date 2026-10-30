@@ -422,16 +422,16 @@ pub fn sys_ppoll(fds: u64, nfds: u32, tmo_p: u64, sigmask_ptr: u64, sigsetsize: 
     };
 
     let result = do_poll_internal(fds, nfds, deadline);
-    let result = poll_finish(deadline, tmo_p, PollTs::Timespec, result);
 
     // Restore mask if we changed it, unless interrupted by a signal: then
     // the temporary mask stays in effect for signal delivery and do_signal()
     // restores saved_sigmask (Linux: restore_saved_sigmask_unless()).
+    // Decided before the time left is written back, which may turn the
+    // restart into -EINTR (Linux poll_select_finish, in that order).
     if saved_mask.is_some() {
         restore_poll_sigmask(result);
     }
-
-    result
+    poll_finish(deadline, tmo_p, PollTs::Timespec, result)
 }
 
 // =============================================================================
@@ -532,16 +532,16 @@ pub fn sys_pselect6(
     };
 
     let result = do_select_internal(nfds, readfds, writefds, exceptfds, deadline);
-    let result = poll_finish(deadline, timeout, PollTs::Timespec, result);
 
     // Restore mask if we changed it, unless interrupted by a signal: then
     // the temporary mask stays in effect for signal delivery and do_signal()
     // restores saved_sigmask (Linux: restore_saved_sigmask_unless()).
+    // Decided before the time left is written back, which may turn the
+    // restart into -EINTR (Linux poll_select_finish, in that order).
     if saved_mask.is_some() {
         restore_poll_sigmask(result);
     }
-
-    result
+    poll_finish(deadline, timeout, PollTs::Timespec, result)
 }
 
 /// Internal select implementation (see [`Deadline`])
