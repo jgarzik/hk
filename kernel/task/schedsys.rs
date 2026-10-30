@@ -123,8 +123,9 @@ fn set_one_prio(tid: Pid, niceval: i32, caller_euid: super::Uid, error: i64) -> 
     if c.uid != caller_euid && c.euid != caller_euid && !capable(CAP_SYS_NICE) {
         return KernelError::NotPermitted.sysret();
     }
-    // Linux can_nice: 20 - nice within RLIMIT_NICE
-    let rlim = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NICE);
+    // Linux can_nice: 20 - nice within the target's RLIMIT_NICE
+    let rlim = crate::rlimit::get_task_rlimit(tid, crate::rlimit::RLIMIT_NICE)
+        .map_or(crate::rlimit::RLIM_INFINITY, |r| r.rlim_cur);
     let lower = niceval < priority_to_nice(prio);
     if lower && (20 - niceval) as u64 > rlim && !capable(CAP_SYS_NICE) {
         return KernelError::PermissionDenied.sysret();
