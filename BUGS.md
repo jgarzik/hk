@@ -376,16 +376,19 @@ across net, fs, ipc) cannot be audited yet.
 
 **Location**: unknown (CPU 0 of the x86 guest)
 
-With roughly 10 QEMUs (4 vCPUs each) on the 24-thread host, CPU 0 of a
-guest sometimes runs nothing else for 3-45 s: SOFT timers wait that long
-for `ktimers/0` (TIMERFD_ABSTIME_RT took 2-45 s when timerfd still used
-a SOFT timer), and once a 20 ms nanosleep took 29 s (TIMER_TINY_PERIOD).
-HARD timers and the tick stay on time, and no SOFT callback ran long,
-so some kernel path on CPU 0 does not reach a scheduling point:
-suspected spinning on another vCPU (a lock holder or an IPI target
-descheduled by the host). Never seen with up to ~4 QEMUs at once. Next:
-log long non-scheduling stretches per CPU (a tick-time check of the
-current task's run time in kernel mode) and the IPI/csd waits.
+With several QEMUs (4 vCPUs each) on the 24-thread host, CPU 0 of an hk
+guest sometimes runs nothing else for 1-45 s. SOFT timers wait that
+long for `ktimers/0` (TIMERFD_ABSTIME_RT took 2-45 s while timerfd used
+a SOFT timer), and a 20 ms nanosleep took 1.5-29 s in TIMER_TINY_PERIOD
+(1 ns periodic timers armed). Seen about 5 times in ~60 gated x86 boots
+with 8-12 QEMUs at once, once with 8 (two gate lanes), never in a lone
+gate. The Linux reference runs the same tests in the same runs and
+never stalled, so the cause is in hk, made likely by vCPU preemption.
+HARD timers and the tick stay on time and no SOFT callback ran long, so
+some kernel path on CPU 0 does not reach a scheduling point: suspected
+spinning on another vCPU (a lock holder or an IPI target descheduled by
+the host). Next: log long non-scheduling stretches per CPU (a tick-time
+check of the current task's time in kernel mode) and the IPI/csd waits.
 
 ## Unconfirmed: Arc<T> field corruption in the USB mass-storage driver
 
