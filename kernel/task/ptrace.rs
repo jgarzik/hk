@@ -862,6 +862,14 @@ pub fn ptrace_signal(sig: u32) -> u32 {
 /// ones go on, and PTRACE_O_EXITKILL ones are killed
 pub fn exit_ptrace() {
     let me = percpu::current();
+    // Most tasks trace nothing: look under the read lock first
+    let traces = TASKLIST
+        .read()
+        .iter()
+        .any(|t| t.ptrace != 0 && t.traced_by(&me));
+    if !traces {
+        return;
+    }
     let mut gone = alloc::vec::Vec::new();
     {
         let mut table = TASKLIST.write();

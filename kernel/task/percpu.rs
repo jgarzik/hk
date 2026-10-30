@@ -1580,26 +1580,41 @@ fn group_status(t: &KernelTaskInner, own: i32) -> i32 {
 }
 
 /// A ptrace stop of a task traced by the group `tracer_pid`, matching
-/// `target_pid` (> 0: that tid; -1: any), not yet reported: its tid and
-/// the stop's code. Reported once unless `wnowait` (Linux
-/// wait_task_stopped with ptrace: exit_code cleared).
+/// `target_pid` (wait4's pid: > 0 that tid, -1 any, 0 the caller's
+/// process group, < -1 that group), not yet reported: its tid and the
+/// stop's code. Reported once unless `wnowait` (Linux wait_task_stopped
+/// with ptrace: exit_code cleared). Found under the read lock; the write
+/// lock only to take the code.
 pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(Tid, u32)> {
+    let pgid = current_pgid();
+    let found = |t: &TaskView<'_>| {
+        matches!(t.state, TaskState::Traced(_))
+            && t.ptrace_code != 0
+            && tracee_of(t, tracer_pid)
+            && wait_match(t, target_pid, pgid)
+    };
+    let tid = TASKLIST.read().find(found)?.task.tid();
     let mut table = TASKLIST.write();
-    let tid = table
-        .find(|t| {
-            matches!(t.state, TaskState::Traced(_))
-                && t.ptrace_code != 0
-                && tracee_of(t, tracer_pid)
-                && (target_pid == -1 || t.task.tid() == target_pid as u64)
-        })?
-        .task
-        .tid();
     let mut t = table.get_mut(tid)?;
+    // It may have been resumed or reported meanwhile
+    if !matches!(t.state, TaskState::Traced(_)) || t.ptrace_code == 0 {
+        return None;
+    }
     let code = t.ptrace_code;
     if !wnowait {
         t.ptrace_code = 0;
     }
     Some((tid, code))
+}
+
+/// `t` is what wait4's `target_pid` names (`pgid`: the caller's group)
+fn wait_match(t: &TaskView<'_>, target_pid: i64, pgid: Pid) -> bool {
+    match target_pid {
+        -1 => true,
+        0 => t.task.pgid() == pgid,
+        p if p < -1 => t.task.pgid() == (-p) as u64,
+        p => t.task.tid() == p as u64,
+    }
 }
 
 /// `t` is traced by a thread of group `tracer_pid`
@@ -1610,10 +1625,11 @@ fn tracee_of(t: &TaskView<'_>, tracer_pid: Pid) -> bool {
 /// The group `tracer_pid` traces a task matching `target_pid` (so a
 /// wait for it is not ECHILD)
 pub fn has_tracees(tracer_pid: Pid, target_pid: i64) -> bool {
+    let pgid = current_pgid();
     let table = TASKLIST.read();
-    table.iter().any(|t| {
-        tracee_of(&t, tracer_pid) && (target_pid == -1 || t.task.tid() == target_pid as u64)
-    })
+    table
+        .iter()
+        .any(|t| tracee_of(&t, tracer_pid) && wait_match(&t, target_pid, pgid))
 }
 
 /// Check if a process has any children matching the criteria
