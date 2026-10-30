@@ -39,133 +39,152 @@ pub const MEMBARRIER_CMD_GET_REGISTRATIONS: i32 = 1 << 9;
 /// Flag to target specific CPU
 pub const MEMBARRIER_CMD_FLAG_CPU: u32 = 1 << 0;
 
-// =============================================================================
-// Supported commands bitmask
-// =============================================================================
+/// Internal flags (Linux MEMBARRIER_FLAG_*)
+const FLAG_SYNC_CORE: u32 = 1 << 0;
 
-/// Commands we support in this implementation
-///
-/// We support:
-/// - QUERY: Return supported commands
-/// - GLOBAL: Full memory barrier (via fence)
-/// - PRIVATE_EXPEDITED: Process-local barrier
-/// - REGISTER_PRIVATE_EXPEDITED: Registration (no-op, always allowed)
-/// - GET_REGISTRATIONS: Query registrations
+// Address-space registration state (Linux MEMBARRIER_STATE_*,
+// `Mm::membarrier_state`)
+const STATE_PRIVATE_EXPEDITED_READY: u32 = 1 << 0;
+const STATE_PRIVATE_EXPEDITED: u32 = 1 << 1;
+const STATE_GLOBAL_EXPEDITED_READY: u32 = 1 << 2;
+const STATE_GLOBAL_EXPEDITED: u32 = 1 << 3;
+const STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY: u32 = 1 << 4;
+const STATE_PRIVATE_EXPEDITED_SYNC_CORE: u32 = 1 << 5;
+
+/// Commands answered (Linux MEMBARRIER_CMD_BITMASK without the RSEQ
+/// pair: hk has no rseq, as Linux without CONFIG_RSEQ)
 const SUPPORTED_CMDS: i32 = MEMBARRIER_CMD_GLOBAL
+    | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+    | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
     | MEMBARRIER_CMD_PRIVATE_EXPEDITED
     | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+    | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
     | MEMBARRIER_CMD_GET_REGISTRATIONS;
 
-// =============================================================================
-// Per-process registration state
-// =============================================================================
+const EINVAL: i64 = -22;
+const EPERM: i64 = -1;
 
-// For a full implementation, we'd track per-process registration state.
-// For now, we always allow expedited commands (simpler, slightly less efficient).
-
-// =============================================================================
-// membarrier syscall
-// =============================================================================
-
-/// membarrier(cmd, flags, cpu_id) - memory barrier across threads
+/// membarrier(cmd, flags, cpu_id) (Linux kernel/sched/membarrier.c)
 ///
-/// This system call helps synchronize memory access ordering between threads.
-/// It's primarily used by userspace-RCU implementations.
-///
-/// # Arguments
-/// * `cmd` - Command to execute (MEMBARRIER_CMD_*)
-/// * `flags` - Flags (e.g., MEMBARRIER_CMD_FLAG_CPU)
-/// * `cpu_id` - Target CPU (only used with FLAG_CPU)
-///
-/// # Returns
-/// * For QUERY: bitmask of supported commands
-/// * For other commands: 0 on success, negative errno on error
-///
-/// # Errors
-/// * -EINVAL: Invalid command or flags
-/// * -EPERM: Command requires prior registration
+/// The expedited commands make every other CPU run a full barrier (an
+/// IPI, waited for) before returning. Linux interrupts only the CPUs
+/// running a thread of the target address space (or of a registered
+/// one); hk interrupts every active CPU, which orders a superset.
+/// MEMBARRIER_CMD_GLOBAL is Linux's synchronize_rcu: hk has no RCU, and
+/// the same barrier on every CPU orders every running thread.
 pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> i64 {
-    // Validate flags based on command
-    match cmd {
-        MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ => {
-            // RSEQ allows FLAG_CPU
-            if flags != 0 && flags != MEMBARRIER_CMD_FLAG_CPU {
-                return -22; // EINVAL
-            }
-        }
-        _ => {
-            // Other commands don't accept flags
-            if flags != 0 {
-                return -22; // EINVAL
-            }
-        }
+    let flags_ok = match cmd {
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ => flags == 0 || flags == MEMBARRIER_CMD_FLAG_CPU,
+        _ => flags == 0,
+    };
+    if !flags_ok {
+        return EINVAL;
     }
-
     match cmd {
-        MEMBARRIER_CMD_QUERY => {
-            // Return supported commands
-            SUPPORTED_CMDS as i64
-        }
-
-        MEMBARRIER_CMD_GLOBAL => {
-            // Full memory barrier across all CPUs
-            // In a single-CPU implementation, a fence is sufficient.
-            // For SMP, we'd need to IPI all CPUs.
-            fence(Ordering::SeqCst);
+        MEMBARRIER_CMD_QUERY => SUPPORTED_CMDS as i64,
+        MEMBARRIER_CMD_GLOBAL | MEMBARRIER_CMD_GLOBAL_EXPEDITED => {
+            barrier_others(ipi_mb);
             0
         }
-
-        MEMBARRIER_CMD_GLOBAL_EXPEDITED => {
-            // Expedited global barrier - requires registration, which we don't track
-            // Return -EPERM since no one has registered
-            -1 // EPERM
-        }
-
         MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED => {
-            // Register for global expedited barriers
-            // We don't track this, but return success
-            -22 // EINVAL - not supported
+            register(STATE_GLOBAL_EXPEDITED, STATE_GLOBAL_EXPEDITED_READY)
         }
-
-        MEMBARRIER_CMD_PRIVATE_EXPEDITED => {
-            // Memory barrier for threads in same process
-            // For single-threaded or our simplified model, just fence
-            fence(Ordering::SeqCst);
-            0
-        }
-
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED => private_expedited(0),
         MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED => {
-            // Register for private expedited barriers
-            // Always succeeds (we don't require registration)
-            0
+            register(STATE_PRIVATE_EXPEDITED, STATE_PRIVATE_EXPEDITED_READY)
         }
-
-        MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE => {
-            // Sync core serialization - not implemented
-            -22 // EINVAL
-        }
-
-        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => {
-            // Not implemented
-            -22 // EINVAL
-        }
-
-        MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ => {
-            // RSEQ barriers - not implemented
-            -22 // EINVAL
-        }
-
-        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ => {
-            // Not implemented
-            -22 // EINVAL
-        }
-
-        MEMBARRIER_CMD_GET_REGISTRATIONS => {
-            // Return currently registered commands
-            // We always allow PRIVATE_EXPEDITED
-            MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED as i64
-        }
-
-        _ => -22, // EINVAL
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE => private_expedited(FLAG_SYNC_CORE),
+        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => register(
+            STATE_PRIVATE_EXPEDITED | STATE_PRIVATE_EXPEDITED_SYNC_CORE,
+            STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY,
+        ),
+        MEMBARRIER_CMD_GET_REGISTRATIONS => registrations(),
+        _ => EINVAL,
     }
+}
+
+/// Full barrier, run on each interrupted CPU (Linux ipi_mb)
+fn ipi_mb(_: usize) {
+    fence(Ordering::SeqCst);
+}
+
+/// Full barrier plus instruction-stream serialization (Linux
+/// ipi_sync_core)
+fn ipi_sync_core(_: usize) {
+    fence(Ordering::SeqCst);
+    crate::arch::barrier::sync_core();
+}
+
+/// Run `f` on every other active CPU and wait for all, between full
+/// barriers on this one (Linux guard(mb) around smp_call_function_many)
+fn barrier_others(f: fn(usize)) {
+    fence(Ordering::SeqCst);
+    crate::smp::smp_call_function_many(&crate::smp::active_cpus(), f, 0, true);
+    fence(Ordering::SeqCst);
+}
+
+/// The calling task's address-space registration state; None for a
+/// task without one (kernel threads never call this)
+fn state() -> Option<u32> {
+    let mm = crate::task::percpu::current().mm()?;
+    Some(mm.membarrier_state().load(Ordering::Acquire))
+}
+
+/// Linux membarrier_private_expedited (no FLAG_CPU: only RSEQ takes it)
+fn private_expedited(flags: u32) -> i64 {
+    let ready = if flags == FLAG_SYNC_CORE {
+        STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY
+    } else {
+        STATE_PRIVATE_EXPEDITED_READY
+    };
+    if state().unwrap_or(0) & ready == 0 {
+        return EPERM;
+    }
+    if flags == FLAG_SYNC_CORE {
+        // This CPU too (Linux on_each_cpu_mask): the caller may move and
+        // another thread of the address space take its place here
+        barrier_others(ipi_sync_core);
+        ipi_sync_core(0);
+    } else {
+        barrier_others(ipi_mb);
+    }
+    0
+}
+
+/// Linux membarrier_register_{private,global}_expedited: set `set`,
+/// then `ready` once every CPU would see it (hk interrupts every CPU on
+/// each command, so there is nothing to synchronize first)
+fn register(set: u32, ready: u32) -> i64 {
+    let Some(mm) = crate::task::percpu::current().mm() else {
+        return EINVAL;
+    };
+    mm.membarrier_state()
+        .fetch_or(set | ready, Ordering::AcqRel);
+    0
+}
+
+/// Linux membarrier_get_registrations
+fn registrations() -> i64 {
+    let st = state().unwrap_or(0);
+    let mut mask = 0;
+    for (bits, cmd) in [
+        (
+            STATE_GLOBAL_EXPEDITED | STATE_GLOBAL_EXPEDITED_READY,
+            MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED,
+        ),
+        (
+            STATE_PRIVATE_EXPEDITED | STATE_PRIVATE_EXPEDITED_READY,
+            MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED,
+        ),
+        (
+            STATE_PRIVATE_EXPEDITED_SYNC_CORE | STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY,
+            MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE,
+        ),
+    ] {
+        if st & bits != 0 {
+            mask |= cmd;
+        }
+    }
+    mask as i64
 }
