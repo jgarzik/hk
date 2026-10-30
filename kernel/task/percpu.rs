@@ -3305,10 +3305,15 @@ fn reprio(p: &KernelTask, prio: Priority) {
         // SAFETY: a queued task is on its priority's list of this rq
         unsafe { rq.queue().remove(p, p.se.prio()) };
     }
+    let old = p.se.prio();
     p.se.set_prio(prio);
     if queued {
         rq.enqueue(p);
         rq.check_preempt(p);
+    } else if core::ptr::eq(rq.curr, pp) && prio < old {
+        // The running task dropped: a queued one may now outrank it
+        // (Linux set_user_nice -> resched_curr)
+        p.set_tif(crate::task::tif::NEED_RESCHED);
     }
 }
 
