@@ -1,8 +1,9 @@
 //! Per-task file descriptor tables (Linux files_struct)
 //!
 //! Each task points at a `Files` table, shared by CLONE_FILES or copied
-//! by fork. `Task.files` is reached through TASKLIST; the table has
-//! its own lock.
+//! by fork. `Task.files` is under the task's alloc_lock (Linux
+//! task_lock; lock-free for the task itself); the table has its own
+//! lock.
 //!
 //! ## Locking
 //!
@@ -12,15 +13,15 @@
 //! it detaches (close, dup2 over an open descriptor, a refused install)
 //! and `FilesGuard` drops them after unlocking (Linux
 //! file_close_fd_locked, then filp_close/fput after spin_unlock).
-//! Likewise a task's last reference to its table is dropped after
-//! TASKLIST is released, never under it.
+//! Likewise a task's last reference to its table is dropped after its
+//! alloc_lock is released, never under it.
 
 use crate::sync::spin::{Mutex, MutexGuard};
 use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 
-use super::percpu::TASKLIST;
+use super::percpu::with_task_lock;
 use super::{FdTable, Tid};
 use crate::fs::File;
 
@@ -63,15 +64,11 @@ impl Drop for FilesGuard<'_> {
     }
 }
 
-/// Point `tid` at `files`; the table it had is dropped after TASKLIST
-/// is released
+/// Point `tid` (the task itself, or a child not yet run) at `files`;
+/// the table it had is dropped after its alloc_lock is released
 pub fn init_task_fd(tid: Tid, files: Arc<Files>) {
-    let old = {
-        let mut table = TASKLIST.write();
-        table
-            .get_mut(tid)
-            .and_then(|mut t| t.set_files(Some(files)))
-    };
+    // SAFETY: the task itself or a child not yet run (see above)
+    let old = with_task_lock(tid, |a| unsafe { a.set_files(Some(files)) });
     drop(old);
 }
 
@@ -82,18 +79,15 @@ pub fn get_task_fd(tid: Tid) -> Option<Arc<Files>> {
     if me.tid() == tid {
         return me.files();
     }
-    let table = TASKLIST.read();
-    table.get(tid).and_then(|t| t.files().cloned())
+    with_task_lock(tid, |a| a.files().cloned()).flatten()
 }
 
 /// Exit (Linux exit_files): drop the task's reference; the last one
-/// closes every descriptor, after TASKLIST is released (releasing a
-/// socket can sleep and the scheduler takes TASKLIST)
+/// closes every descriptor, after its alloc_lock is released
+/// (releasing a socket can sleep)
 pub fn exit_task_fd(tid: Tid) {
-    let files = {
-        let mut table = TASKLIST.write();
-        table.get_mut(tid).and_then(|mut t| t.set_files(None))
-    };
+    // SAFETY: the exiting task itself
+    let files = with_task_lock(tid, |a| unsafe { a.set_files(None) }).flatten();
     drop(files);
 }
 

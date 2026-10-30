@@ -606,7 +606,7 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(
 pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
     use super::{
         IOPRIO_CLASS_IDLE, IOPRIO_CLASS_RT, IOPRIO_WHO_PGRP, IOPRIO_WHO_PROCESS, IOPRIO_WHO_USER,
-        get_task_io_context, ioprio_prio_class, ioprio_valid,
+        ioprio_prio_class, ioprio_valid,
     };
 
     let ioprio = ioprio as u16;
@@ -633,17 +633,8 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
             };
 
             // Get or create IoContext for the target
-            let ctx = match get_task_io_context(tid) {
-                Some(ctx) => ctx,
-                None => {
-                    // Create a new context if target exists
-                    if !super::percpu::task_exists(tid) {
-                        return KernelError::NoProcess.sysret();
-                    }
-                    let ctx = alloc::sync::Arc::new(super::IoContext::new());
-                    super::set_task_io_context(tid, ctx.clone());
-                    ctx
-                }
+            let Some(ctx) = super::task_io_context(tid) else {
+                return KernelError::NoProcess.sysret();
             };
 
             ctx.set_ioprio(ioprio);
@@ -663,15 +654,9 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
             }
 
             for tid in tids {
-                let ctx = match get_task_io_context(tid) {
-                    Some(ctx) => ctx,
-                    None => {
-                        let ctx = alloc::sync::Arc::new(super::IoContext::new());
-                        super::set_task_io_context(tid, ctx.clone());
-                        ctx
-                    }
-                };
-                ctx.set_ioprio(ioprio);
+                if let Some(ctx) = super::task_io_context(tid) {
+                    ctx.set_ioprio(ioprio);
+                }
             }
             0
         }

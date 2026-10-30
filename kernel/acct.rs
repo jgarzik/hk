@@ -343,13 +343,8 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
     let table = TASKLIST.read();
     let task = table.get(tid)?;
 
-    // Get command name from prctl state
-    let mut comm = [0u8; 16];
-    // Copy the task name, which is stored as bytes in prctl.name
-    let name_bytes = &task.prctl.name;
-    // Find the null terminator or use full length
-    let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
-    comm[..name_len].copy_from_slice(&name_bytes[..name_len]);
+    // Its name (NUL-terminated, Linux get_task_comm)
+    let comm = task.task.task_lock().comm();
 
     // Get credentials - Arc<Cred> can be dereferenced directly
     let cred = &task.cred();
@@ -394,7 +389,7 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
             .load(core::sync::atomic::Ordering::Relaxed),
         comm,
         did_fork: pid != tid as Pid, // Simple heuristic: different PID/TID means forked
-        did_exec: task.prctl.name[0] != 0, // Has a name means exec'd
+        did_exec: comm[0] != 0,      // Has a name means exec'd
     })
 }
 

@@ -971,7 +971,7 @@ pub fn mmget_not_zero(mm: &Arc<Mm>) -> Option<MmRef> {
     None
 }
 
-use crate::task::percpu::TASKLIST;
+use crate::task::percpu::with_task_lock;
 
 /// The address space of task `tid` (an mm_count reference; the task
 /// itself holds the user reference, so it stays mapped while the task
@@ -982,8 +982,7 @@ pub fn get_task_mm(tid: Tid) -> Option<Arc<Mm>> {
     if me.tid() == tid {
         return me.mm();
     }
-    let table = TASKLIST.read();
-    table.get(tid).and_then(|t| t.mm().map(|m| m.arc().clone()))
+    with_task_lock(tid, |a| a.mm().map(|m| m.arc().clone())).flatten()
 }
 
 /// A user reference to task `tid`'s address space (Linux get_task_mm),
@@ -998,10 +997,8 @@ pub fn get_task_mm_users(tid: Tid) -> Option<MmRef> {
 /// the returned mm_count reference keeps the top-level table, still
 /// loaded on this CPU, until the task has switched away.
 pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
-    let mm = {
-        let mut table = TASKLIST.write();
-        table.get_mut(tid).and_then(|mut t| t.set_mm(None))
-    }?;
+    // SAFETY: the exiting task itself
+    let mm = with_task_lock(tid, |a| unsafe { a.set_mm(None) }).flatten()?;
     let keep = mm.arc().clone();
     drop(mm);
     Some(keep)

@@ -255,8 +255,11 @@ fn all_mms() -> Vec<Arc<super::Mm>> {
     let mut v: Vec<Arc<super::Mm>> = Vec::new();
     {
         let table = crate::task::percpu::TASKLIST.read();
-        for mm in table.iter().filter_map(|t| t.mm_ref()) {
-            if !v.iter().any(|m| Arc::ptr_eq(m, mm.arc())) {
+        for t in table.iter() {
+            let a = t.task.task_lock();
+            if let Some(mm) = a.mm()
+                && !v.iter().any(|m| Arc::ptr_eq(m, mm.arc()))
+            {
                 v.push(mm.arc().clone());
             }
         }

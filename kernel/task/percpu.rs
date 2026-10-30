@@ -433,12 +433,6 @@ impl<'a> TaskView<'a> {
     pub fn fields(&self) -> &'a KernelTaskInner {
         self.inner
     }
-
-    /// Its address space, for the whole borrow of the table
-    pub fn mm_ref(&self) -> Option<&'a crate::mm::MmRef> {
-        // SAFETY: TASKLIST is held for 'a (the view borrows it)
-        unsafe { self.task.mm() }.as_ref()
-    }
 }
 
 impl core::ops::Deref for TaskView<'_> {
@@ -484,7 +478,7 @@ fn view_mut(task: &KernelTask) -> TaskViewMut<'_> {
     TaskViewMut { task, inner }
 }
 
-/// Owner fields of a task, read under TASKLIST (the views borrow it)
+/// Credentials of a task, read under TASKLIST (the views borrow it)
 macro_rules! owner_reads {
     ($t:ident) => {
         impl<'a> $t<'a> {
@@ -498,18 +492,6 @@ macro_rules! owner_reads {
             pub fn cred_arc(&self) -> Arc<Cred> {
                 // SAFETY: as above
                 unsafe { self.task.cred_arc() }
-            }
-
-            /// Its address space
-            pub fn mm(&self) -> Option<&crate::mm::MmRef> {
-                // SAFETY: as above
-                unsafe { self.task.mm() }.as_ref()
-            }
-
-            /// Its descriptor table
-            pub fn files(&self) -> Option<&Arc<crate::task::fdtable::Files>> {
-                // SAFETY: as above
-                unsafe { self.task.files() }.as_ref()
             }
         }
     };
@@ -545,21 +527,6 @@ impl TaskViewMut<'_> {
         // SAFETY: TASKLIST held mutably; callers are the owner or the
         // creator (see above)
         unsafe { self.task.set_cred(c) }
-    }
-
-    /// Install an address space (rules of `set_cred`)
-    pub fn set_mm(&mut self, mm: Option<crate::mm::MmRef>) -> Option<crate::mm::MmRef> {
-        // SAFETY: as above
-        unsafe { self.task.set_mm(mm) }
-    }
-
-    /// Install a descriptor table (rules of `set_cred`)
-    pub fn set_files(
-        &mut self,
-        f: Option<Arc<crate::task::fdtable::Files>>,
-    ) -> Option<Arc<crate::task::fdtable::Files>> {
-        // SAFETY: as above
-        unsafe { self.task.set_files(f) }
     }
 }
 
@@ -751,6 +718,23 @@ impl GlobalTaskTable {
 /// interrupt handler, so interrupts stay on)
 pub static TASKLIST: RwLock<GlobalTaskTable> = RwLock::new(GlobalTaskTable::new());
 
+/// A task's `alloc_lock` held
+pub type KernelTaskLock<'a> = crate::task::TaskLock<'a, CurrentArch, ArchPageTable>;
+
+/// A reference to task `tid` (TASKLIST only for the lookup)
+pub fn find_task(tid: Tid) -> Option<TaskRef> {
+    TASKLIST.read().task(tid)
+}
+
+/// Run `f` with task `tid`'s `alloc_lock` held (Linux task_lock(p));
+/// TASKLIST is taken only to find it. Whatever `f` takes out of the
+/// task is returned, to be dropped after the lock (3.1.1 rule 4).
+pub fn with_task_lock<R>(tid: Tid, f: impl FnOnce(&mut KernelTaskLock<'_>) -> R) -> Option<R> {
+    let t = find_task(tid)?;
+    let r = f(&mut t.task_lock());
+    Some(r)
+}
+
 /// The boot CPU has per-CPU data (`init_bsp`); from then on every CPU
 /// running kernel code has its own
 pub static PERCPU_UP: AtomicBool = AtomicBool::new(false);
@@ -803,10 +787,34 @@ impl Cur {
         unsafe { self.task.mm() }.as_ref().map(|m| m.arc().clone())
     }
 
+    /// Its address space (a user reference)
+    pub fn mm_ref(&self) -> Option<crate::mm::MmRef> {
+        // SAFETY: the task itself
+        unsafe { self.task.mm() }.clone()
+    }
+
     /// Its descriptor table
     pub fn files(&self) -> Option<Arc<crate::task::fdtable::Files>> {
         // SAFETY: the task itself
         unsafe { self.task.files() }.clone()
+    }
+
+    /// Its filesystem context (Linux current->fs)
+    pub fn fs(&self) -> Option<Arc<crate::fs::FsStruct>> {
+        // SAFETY: the task itself
+        unsafe { self.task.fs() }.clone()
+    }
+
+    /// Its namespaces (Linux current->nsproxy)
+    pub fn nsproxy(&self) -> Option<Arc<crate::ns::NsProxy>> {
+        // SAFETY: the task itself
+        unsafe { self.task.nsproxy() }.clone()
+    }
+
+    /// Its name (Linux current->comm)
+    pub fn comm(&self) -> [u8; 16] {
+        // SAFETY: the task itself
+        unsafe { self.task.comm() }
     }
 
     /// The task is a kernel thread or the boot task (no user context)
@@ -938,25 +946,15 @@ fn create_kernel_task(
         clear_child_tid: 0,
         set_child_tid: 0,
         // Shared resources (kernel threads don't have user-space resources)
-        fs: None,
-        nsproxy: None,
         sighand: None,
         signal: None,
-        io_context: None,
         sysvsem: None,
         // Per-task signal state
         robust_list: 0,
         // prctl state
-        prctl: {
-            let mut p = crate::task::PrctlState::default();
-            let n = name.len().min(15);
-            p.name[..n].copy_from_slice(&name.as_bytes()[..n]);
-            p
-        },
+        prctl: crate::task::PrctlState::default(),
         // Process personality (execution domain)
         personality: 0,
-        // NUMA memory policy (kernel threads use default)
-        mempolicy: crate::mm::mempolicy::TaskMempolicy::new(),
         // Seccomp state (kernel threads don't use seccomp)
         seccomp_filter: None,
         // I/O port permissions (x86-64 only, kernel threads don't use I/O ports)
@@ -988,6 +986,7 @@ fn create_kernel_task(
         cpu_id,
         alloc::sync::Arc::new(Cred::ROOT),
         None,
+        crate::task::TaskAlloc::named(name.as_bytes()),
         task_inner,
     );
 
@@ -1144,24 +1143,14 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         clear_child_tid: 0,
         set_child_tid: 0,
         // Shared resources (will be initialized by caller via init_* functions)
-        fs: None,
-        nsproxy: None,
         sighand: None,
         signal: None,
-        io_context: None,
         sysvsem: None,
         // Per-task signal state
         robust_list: 0,
-        // prctl state; comm after the init binary, /bin/init (Linux
-        // names init after the file it execs)
-        prctl: crate::task::PrctlState {
-            name: *b"init\0\0\0\0\0\0\0\0\0\0\0\0",
-            ..crate::task::PrctlState::default()
-        },
+        prctl: crate::task::PrctlState::default(),
         // Process personality (execution domain)
         personality: 0,
-        // NUMA memory policy (user processes start with default)
-        mempolicy: crate::mm::mempolicy::TaskMempolicy::new(),
         // Seccomp state (disabled initially)
         seccomp_filter: None,
         // I/O port permissions (x86-64 only, no I/O port access initially)
@@ -1193,6 +1182,9 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         cpu_id,
         alloc::sync::Arc::new(Cred::ROOT),
         Some(mm),
+        // comm after the init binary, /bin/init (Linux names init after
+        // the file it execs)
+        crate::task::TaskAlloc::named(b"init"),
         task_inner,
     ));
 
@@ -1642,12 +1634,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_cred,
         parent_prctl,
         parent_personality,
-        parent_mempolicy,
         parent_seccomp_mode,
         parent_seccomp_filter,
         parent_ptrace,
         parent_ptracer,
-        parent_pid_ns,
         parent_real_parent,
     ) = {
         let table = TASKLIST.read();
@@ -1666,18 +1656,23 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.cred_arc(),
             parent.prctl.clone(),
             parent.personality,
-            parent.mempolicy,
             parent.task.seccomp_mode(),
             parent.seccomp_filter.clone(),
             parent.ptrace,
             parent.ptracer.clone(),
-            parent
-                .nsproxy
-                .as_ref()
-                .map_or_else(|| crate::ns::INIT_PID_NS.clone(), |n| n.pid_ns.clone()),
             parent.real_parent.clone(),
         )
     };
+    // Its own alloc_lock fields (lock-free but the memory policy)
+    let me = current();
+    let parent_alloc = crate::task::TaskAlloc {
+        comm: me.comm(),
+        mempolicy: me.task_lock().mempolicy(),
+    };
+    let parent_pid_ns = me
+        .nsproxy()
+        .map_or_else(|| crate::ns::INIT_PID_NS.clone(), |n| n.pid_ns.clone());
+    let parent_mm = me.mm_ref();
 
     // Get parent iopl_emul (x86-64 only) - must be done in separate block
     #[cfg(target_arch = "x86_64")]
@@ -1712,10 +1707,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // The child's address space (Linux copy_mm): shared for CLONE_VM,
     // else a copy (dup_mm). Dropped on any error below.
-    let parent_mm = {
-        let table = TASKLIST.read();
-        table.get(current_tid).and_then(|t| t.mm().cloned())
-    };
     let child_mm = match parent_mm {
         None => None,
         Some(pm) if config.flags & CLONE_VM != 0 => Some(pm),
@@ -1783,18 +1774,14 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         clear_child_tid: 0,
         set_child_tid: 0,
         // Shared resources (will be cloned/shared based on clone flags below)
-        fs: None,
-        nsproxy: None,
         sighand: None,
         signal: None,
-        io_context: None,
         sysvsem: None,
         // Per-task signal state (always per-task, not shared)
         robust_list: 0,
         // prctl state: the name is inherited (dumpability lives in the
         // mm: shared with CLONE_VM, copied by dup_mm)
         prctl: crate::task::PrctlState {
-            name: parent_prctl.name,
             no_new_privs: parent_prctl.no_new_privs, // Inherited (irreversible)
             timer_slack_ns: parent_prctl.timer_slack_ns, // Inherited
             keep_caps: false,                        // Reset on fork
@@ -1805,8 +1792,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         },
         // Process personality (inherited from parent)
         personality: parent_personality,
-        // NUMA memory policy (inherited from parent)
-        mempolicy: parent_mempolicy,
         // Seccomp state (inherited from parent)
         // Seccomp filters are reference-counted, so this is cheap
         seccomp_filter: parent_seccomp_filter,
@@ -1863,6 +1848,8 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         cpu_id,
         crate::task::copy_creds(config.flags, &parent_cred),
         child_mm,
+        // The name and memory policy are inherited
+        parent_alloc,
         child_task_inner,
     ));
     if parent_nproc_exceeded {
@@ -3241,7 +3228,8 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
     let old = {
         let mut table = TASKLIST.write();
         table.get_mut(me.tid()).and_then(|mut t| {
-            if ids_changed && let Some(mm) = t.mm() {
+            // SAFETY: the task itself
+            if ids_changed && let Some(mm) = unsafe { me.task.mm() } {
                 // On the mm: every thread sharing it (Linux set_dumpable(
                 // task->mm))
                 mm.set_dumpable(crate::task::dumpable::SUID_DUMP_DISABLE);
@@ -3509,9 +3497,15 @@ pub fn exec_replace_image(
         let task = table.get_mut(tid);
         let mut task = task.expect("exec: current task not in the task table");
         task.page_table = ArchPageTable::new(new.pgd());
-        task.prctl.name = ident.name;
         new.set_dumpable(ident.dumpable);
-        task.set_mm(Some(mm))
+        // The mm and name change as one under task_lock (Linux
+        // exec_mmap, __set_task_comm): a reader sees both or neither
+        let mut a = task.task.task_lock();
+        // SAFETY: the task itself
+        unsafe {
+            a.set_comm(ident.name);
+            a.set_mm(Some(mm))
+        }
     });
 
     // The new image starts with no user GS base (Linux start_thread:

@@ -72,6 +72,11 @@ fn snap(pid: Pid) -> Option<Snap> {
     let t = table.get(pid)?;
     let threads = table.threads(pid).count() as u64;
     let tracer = t.tracer().map_or(0, |x| x.pid);
+    // comm and the resources together, under task_lock
+    let (comm, fs, files) = {
+        let a = t.task.task_lock();
+        (a.comm(), a.fs().cloned(), a.files().cloned())
+    };
     let sig = t.task.sig.lock().clone();
     Some(Snap {
         pid,
@@ -80,7 +85,7 @@ fn snap(pid: Pid) -> Option<Snap> {
         ppid: t.task.ppid(),
         pgid: t.task.pgid(),
         sid: t.task.sid(),
-        comm: t.prctl.name,
+        comm,
         state: match t.state {
             // The run state as of its last switch (Linux task_state)
             TaskState::Ready | TaskState::Running | TaskState::Sleeping => {
@@ -118,8 +123,8 @@ fn snap(pid: Pid) -> Option<Snap> {
         shared: Some(sig.shared_pending.clone()),
         sighand: t.sighand.clone(),
         signal: t.signal.clone(),
-        fs: t.fs.clone(),
-        files: t.files().cloned(),
+        fs,
+        files,
     })
 }
 

@@ -982,7 +982,7 @@ pub fn may_access(pick: impl Fn(&percpu::TaskView<'_>) -> bool, fscreds: bool) -
         let table = TASKLIST.read();
         table
             .find(|t| pick(t))
-            .map(|t| (t.cred(), t.mm().map(|m| m.dumpable())))
+            .map(|t| (t.cred(), t.task.task_lock().mm().map(|m| m.dumpable())))
     };
     let Some((c, dumpable)) = target else {
         return false;
