@@ -440,7 +440,16 @@ impl WaitQueue {
                 break Ok(if cond() { 1 } else { 0 });
             }
         };
+        // A waker that picked this exclusive entry (it is no longer
+        // queued) while it gives up (signal, timeout) passes its wakeup
+        // on, or the next exclusive waiter would sleep with the
+        // condition true (Linux abort_exclusive_wait)
+        let gave_up = !matches!(result, Ok(n) if n > 0);
+        let picked = !w.is_queued();
         self.finish_wait(w.as_ref());
+        if exclusive && gave_up && picked {
+            self.wake_one();
+        }
         result
     }
 

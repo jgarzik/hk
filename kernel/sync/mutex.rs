@@ -8,8 +8,8 @@
 //! `lock_interruptible` and `lock_killable` (Linux
 //! mutex_lock_interruptible/_killable) give up with EINTR when a signal
 //! (any, or SIGKILL) is pending while they would sleep; a waiter that
-//! gives up has seen the mutex held, so its holder's unlock wakes the
-//! next waiter. `try_lock` (Linux mutex_trylock) never sleeps.
+//! gives up after an unlock picked it passes the wakeup on to the next
+//! (`WaitQueue` exclusive waits). `try_lock` (Linux mutex_trylock) never sleeps.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
