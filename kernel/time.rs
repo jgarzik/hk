@@ -267,7 +267,7 @@ impl TimeKeeper {
         let mult = self.mult.load(Ordering::Relaxed);
         let shift = self.shift.load(Ordering::Relaxed);
 
-        let delta_cycles = now_cycles.wrapping_sub(cycle_base);
+        let delta_cycles = cycles_delta(now_cycles, cycle_base);
         let delta_ns = ((delta_cycles as u128 * mult as u128) >> shift) as u64;
 
         self.cycle_base.store(now_cycles, Ordering::Relaxed);
@@ -315,7 +315,7 @@ impl TimeKeeper {
             }
 
             // Calculate current time
-            let delta_cycles = now_cycles.wrapping_sub(cycle_base);
+            let delta_cycles = cycles_delta(now_cycles, cycle_base);
             let delta_ns = ((delta_cycles as u128 * mult as u128) >> shift) as u64;
             let mono_ns = mono_base.wrapping_add(delta_ns);
 
@@ -363,7 +363,7 @@ impl TimeKeeper {
         let mult = self.mult.load(Ordering::Relaxed);
         let shift = self.shift.load(Ordering::Relaxed);
 
-        let delta_cycles = now_cycles.wrapping_sub(cycle_base);
+        let delta_cycles = cycles_delta(now_cycles, cycle_base);
         let delta_ns = ((delta_cycles as u128 * mult as u128) >> shift) as u64;
         let mono_ns = mono_base.wrapping_add(delta_ns);
 
@@ -380,6 +380,14 @@ impl TimeKeeper {
 
         true
     }
+}
+
+/// Counter cycles since `base`; 0 if `now` is behind it, as when another
+/// CPU's counter lags the one that set the base (Linux clocksource_delta:
+/// a negative delta would wrap to centuries)
+fn cycles_delta(now: u64, base: u64) -> u64 {
+    let d = now.wrapping_sub(base);
+    if d & (1 << 63) != 0 { 0 } else { d }
 }
 
 /// Global timekeeper instance

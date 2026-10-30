@@ -378,7 +378,9 @@ impl TimekeeperOps for Aarch64Arch {
     fn read_cycles() -> u64 {
         let count: u64;
         unsafe {
-            asm!("mrs {}, cntpct_el0", out(reg) count);
+            // isb: not before earlier instructions (Linux
+            // arch_timer_read_counter)
+            asm!("isb", "mrs {}, cntpct_el0", out(reg) count);
         }
         count
     }
