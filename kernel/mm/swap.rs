@@ -397,6 +397,12 @@ fn write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
     let si = info_of(entry).ok_or(KernelError::InvalidArgument.sysret())?;
     let off = entry.offset();
     if let Some(ref inode) = si.inode {
+        // Not from direct reclaim (PF_MEMALLOC): the file's writepage may
+        // need filesystem locks the allocating task holds. A page already
+        // in the swap cache of a swap file stays dirty and in memory.
+        if crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC) {
+            return Err(KernelError::WouldBlock.sysret());
+        }
         let mut buf = alloc::vec![0u8; PAGE_SIZE];
         // SAFETY: the caller's frame, reached through the direct map
         unsafe {
