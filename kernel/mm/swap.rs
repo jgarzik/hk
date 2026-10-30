@@ -176,10 +176,25 @@ impl SwapInfo {
         self.flags.load(Ordering::Acquire) & SWP_WRITEOK != 0
     }
 
+    /// Set or clear SWP_WRITEOK under `map` (alloc_slot checks it there)
+    fn set_writeok(&self, on: bool) {
+        let _m = self.map.lock();
+        if on {
+            self.flags.fetch_or(SWP_WRITEOK, Ordering::AcqRel);
+        } else {
+            self.flags.fetch_and(!SWP_WRITEOK, Ordering::AcqRel);
+        }
+    }
+
     /// Take a free slot, its count SWAP_HAS_CACHE (Linux
-    /// scan_swap_map_slots)
+    /// scan_swap_map_slots). None once swapoff has begun: SWP_WRITEOK
+    /// is cleared under `map`, so a slot taken here is counted in
+    /// `inuse` before swapoff's scans start
     fn alloc_slot(&self) -> Option<u64> {
         let mut m = self.map.lock();
+        if !self.writeok() {
+            return None;
+        }
         let from = m.next;
         let off = (from..self.max)
             .chain(1..from)
@@ -535,10 +550,11 @@ fn swapoff(path_ptr: u64) -> Result<(), KernelError> {
     let _g = SWAPON.lock();
     let t = find_swap_by_path(path.as_bytes()).ok_or(KernelError::InvalidArgument)?;
     let si = get_swap_info(t).ok_or(KernelError::InvalidArgument)?;
-    // No new slots from it (Linux del_from_avail_list)
-    si.flags.fetch_and(!SWP_WRITEOK, Ordering::AcqRel);
+    // No new slots from it (Linux del_from_avail_list, under si->lock:
+    // an allocator past get_swap_page's filter rechecks under `map`)
+    si.set_writeok(false);
     if let Err(e) = super::swap_state::try_to_unuse(&si) {
-        si.flags.fetch_or(SWP_WRITEOK, Ordering::AcqRel);
+        si.set_writeok(true);
         return Err(e);
     }
     SWAP_INFO.write()[t as usize] = None;

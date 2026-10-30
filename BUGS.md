@@ -589,10 +589,6 @@ From the P4 /code-review (unverified unless noted). Tag = when to fix.
    confirmed by reading). `kernel/mm/fault.rs:478` map_swap_page (via
    unuse_pte) → mk_pte(page, area.prot) with prot 0 is PRESENT|USER
    on x86. Use a protnone PTE (Linux vm_page_prot).
-2. **Slot allocated after swapoff's final scan** (P7 blocker).
-   `kernel/mm/swap.rs:181`: alloc_slot doesn't recheck SWP_WRITEOK
-   under SwapInfo.map; swap PTEs of a removed type livelock faults or
-   read a later device's slots.
 3. **Swap file size not capped by i_size** (next batch).
    `kernel/mm/swap.rs:455`: header last_page sizes a heap Vec (8GB →
    panic) and slots past EOF (only block devices are capped).

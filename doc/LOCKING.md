@@ -1143,7 +1143,9 @@ pub struct Zone {
 #### Swap (kernel/mm/swap.rs, swap_state.rs; Linux mm/swapfile.c, swap_state.c)
 
 - `SwapInfo.map` (`spin::Mutex`, Linux si->lock): a device's slot
-  counts (swap PTEs + SWAP_HAS_CACHE) and allocation hint. Thread
+  counts (swap PTEs + SWAP_HAS_CACHE) and allocation hint; swapoff
+  clears SWP_WRITEOK under it, and the allocator rechecks it there, so
+  no slot is taken after swapoff's scans begin. Thread
   context only; a leaf taken under the PTE lock (fork's swap_duplicate,
   zap's free_swap_and_cache, swap-in's swap_free), never with a swap
   cache lock held.
