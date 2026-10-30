@@ -2852,10 +2852,10 @@ RTNL and `sk_lock` are never held together. No network lock is held
 while taking a socket lock (lookups return `Arc` handles), and no lock is
 held across `netif_rx_flush_local()` (it delivers, taking socket locks):
 socket calls run it at their end, after every step. It flushes the
-calling CPU's backlog, which is where the task's `lo` transmits went
-because tasks never migrate (`Task.cpu` is fixed); a migrating scheduler
-must record the CPU `netif_rx` used. Missing the flush only delays
-delivery to that CPU's softnet thread. Netlink requests are processed in
+backlog the task's last `lo` transmit went to (`Task.rx_cpu`, written
+by `netif_rx`), which is another CPU's if the task moved during the
+call (a user copy that slept); earlier packets on yet another CPU, and
+any flush that is missed, only wait for that CPU's softnet thread. Netlink requests are processed in
 the sender's `sendmsg` with no lock held on entry; mutating handlers take
 RTNL. Carrier changes (`netif_carrier_on/off`, from a driver's NAPI poll
 or `open()`) send RTM_NEWLINK without RTNL (NlTable.socks -> NlSock.rxq

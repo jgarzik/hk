@@ -882,6 +882,10 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     /// Page-fault-disable depth (Linux p->pagefault_disabled), written
     /// by the task itself (`uaccess::pagefault_disable`)
     pub pagefault_disabled: AtomicU32,
+    /// CPU whose network backlog this task last queued a packet to
+    /// (`netif_rx`; u32::MAX: none), written by the task itself: its
+    /// loopback flush covers that backlog even if it moved since
+    pub rx_cpu: AtomicU32,
     /// Scheduling state: sleep state, run-queue link, priority, switch
     /// frame (Linux __state, on_rq, sched_entity)
     pub se: sched::SchedEntity,
@@ -1460,6 +1464,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(cpu),
             pagefault_disabled: AtomicU32::new(0),
+            rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(PRIORITY_NORMAL, 0),
             pi_lock: crate::arch::IrqSpinlock::new(()),
             ppid: AtomicU64::new(ids.ppid),
@@ -1512,6 +1517,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(0),
             pagefault_disabled: AtomicU32::new(0),
+            rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(PRIORITY_NORMAL, 0),
             pi_lock: crate::arch::IrqSpinlock::new(()),
             ppid: AtomicU64::new(0),
