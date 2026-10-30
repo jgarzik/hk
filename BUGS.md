@@ -190,16 +190,17 @@ de_thread
   with Linux's thread choice at delivery; a pidfd polls readable when
   the leader exits, not when the whole group is gone.
 
-## Tracees never stop
+## ptrace stop gaps
 
-**Location**: `kernel/task/ptrace.rs` (ptrace_stop, ptrace_report_syscall),
-`kernel/signal/mod.rs` (stop signals)
+**Location**: `kernel/task/ptrace.rs`, `kernel/task/exec.rs`,
+`kernel/signal/mod.rs`
 
-Nothing calls `ptrace_stop`: no signal-delivery stop, no syscall stop,
-and SIGSTOP is ignored (stop/continue are not implemented), so a tracee
-never enters the Traced state and every request that needs a stopped
-tracee (GETREGS, SETREGS, PEEK/POKE*, CONT, ...) fails with ESRCH. The
-TLS_PTRACE_RANGE boot test runs on Linux only.
+Signal-delivery and PTRACE_SYSCALL stops work. Missing: exec, fork,
+clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
+PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN, group-stop interaction (SIGSTOP
+to an untraced task is ignored: stop/continue are not implemented),
+waiting on a tracee by process group, and the tracee's exit being
+reported to a tracer that is not its parent.
 
 ## Global init is not protected from default-action signals
 

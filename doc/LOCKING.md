@@ -820,6 +820,17 @@ so the global TASKLIST lock is sufficient.
 The `TaskState` enum in `TASKLIST` is informational (and records
 `Zombie(wait_status)` / `Traced`), not the scheduling source of truth:
 
+**ptrace stops** (`task/ptrace.rs`, Linux ptrace_stop): the tracee
+sets `TaskState::Traced(code)` and `ptrace_code` under the TASKLIST
+write lock, drops it, wakes `CHILD_EXIT_WQ` and signals its tracer, then
+sleeps `Killable` until its TASKLIST state is no longer `Traced` (read
+lock, rechecked after each wakeup) or SIGKILL. The tracer's wait clears
+`ptrace_code` under the write lock; resume, detach and the tracer's exit
+(`exit_ptrace`) set the state and the code to deliver under it, then
+`try_to_wake_up` the tracee with it dropped. The arch register and
+single-step helpers take the TASKLIST read lock themselves, so callers
+never hold it.
+
 **Source of Truth for Scheduling** (owner CPU's rq, IrqSpinlock):
 1. **Runnable**: entry `queued` (in `CpuRunQueue.queue`)
 2. **Current**: `CpuRunQueue.current`

@@ -5,7 +5,7 @@
 
 use super::helpers::{print, print_num, println};
 #[cfg(target_arch = "x86_64")]
-use super::helpers::{host_mode, skip};
+use super::helpers::host_mode;
 use hk_syscall::{sys_clone, sys_exit, sys_wait4};
 
 const SIGCHLD: u64 = 17;
@@ -63,11 +63,6 @@ fn test_set_fs() {
 /// SETREGS with a bad fs_base or gs_base: EIO; a valid one is taken
 #[cfg(target_arch = "x86_64")]
 fn test_ptrace_regs() {
-    if !host_mode() {
-        // hk tracees never stop, so GETREGS/SETREGS always fail ESRCH
-        // (BUGS.md); set_user_regs checks the bases all the same
-        return skip(b"TLS_PTRACE_RANGE", b"no ptrace stops in hk");
-    }
     use hk_syscall::{sys_fork, sys_getpid, sys_kill, sys_ptrace};
     const TRACEME: i64 = 0;
     const GETREGS: i64 = 12;

@@ -832,6 +832,10 @@ pub mod tif {
     /// back on the way out, or into a handler's frame (Linux
     /// TIF_RESTORE_SIGMASK; set and cleared by the task itself)
     pub const RESTORE_SIGMASK: u32 = 1 << 3;
+    /// PTRACE_SYSCALL: stop for the tracer at syscall entry and exit
+    /// (Linux SYSCALL_WORK_SYSCALL_TRACE; set and cleared by the tracer
+    /// while the task is stopped)
+    pub const SYSCALL_TRACE: u32 = 1 << 4;
 }
 
 /// A task (thread or process; Linux task_struct), shared as
@@ -1099,6 +1103,10 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
 
     /// Ptrace options (PTRACE_O_TRACESYSGOOD, etc.)
     pub ptrace_options: u32,
+    /// A ptrace stop's code (Linux exit_code): the stop's signal until
+    /// the tracer's wait reports it (then 0), then the signal the
+    /// tracer's resume leaves to deliver (0: none)
+    pub ptrace_code: u32,
 }
 
 /// Data owned by the TASKLIST lock (Rust-for-Linux LockedBy): only

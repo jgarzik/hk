@@ -62,6 +62,10 @@ pub fn exit_to_user_mode(regs: &mut PtRegs) {
 /// lock: only the thread flags and the result register are read.
 pub fn syscall_exit_to_user_mode(regs: &mut PtRegs) {
     let me = crate::task::percpu::current();
+    if me.has_tif(tif::SYSCALL_TRACE) {
+        // The PTRACE_SYSCALL exit stop (Linux syscall_exit_work)
+        crate::task::ptrace::ptrace_report_syscall(false);
+    }
     if me.has_tif(SIGNAL_WORK) || crate::signal::syscall_restarting(regs) {
         crate::signal::do_signal(regs);
     } else {
@@ -69,6 +73,19 @@ pub fn syscall_exit_to_user_mode(regs: &mut PtRegs) {
     }
     CurrentArch::disable_interrupts();
     exit_to_user_mode(regs);
+}
+
+/// The syscall entry work (Linux syscall_enter_from_user_mode): a
+/// PTRACE_SYSCALL entry stop, after which the tracer may have changed the
+/// syscall number and arguments in `regs`. Returns the number to run;
+/// u64::MAX (the tracer set it) skips the syscall, keeping the return
+/// register as the tracer left it.
+pub fn syscall_enter_from_user_mode(regs: &mut PtRegs) -> u64 {
+    use crate::arch::UserRegs;
+    if crate::task::percpu::current().has_tif(tif::SYSCALL_TRACE) {
+        crate::task::ptrace::ptrace_report_syscall(true);
+    }
+    regs.syscall_nr()
 }
 
 /// Nothing may be held on the way to user mode: no spin lock (each

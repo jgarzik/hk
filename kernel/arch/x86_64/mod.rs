@@ -146,6 +146,10 @@ impl crate::arch::UserRegs for PtRegs {
         (self.orig_rax as i64) >= 0
     }
 
+    fn syscall_nr(&self) -> u64 {
+        self.orig_rax
+    }
+
     fn forget_syscall(&mut self) {}
 
     /// RIP back over the 2-byte `syscall`, the number back in RAX (Linux

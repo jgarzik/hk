@@ -1561,6 +1561,29 @@ fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool)
 // Signal Delivery Entry Point
 // =============================================================================
 
+/// Let the tracer of a traced task see `sig` before it is delivered:
+/// None if the tracer cancelled it, or if it changed it to one now
+/// blocked (queued again, as Linux ptrace_signal does)
+fn traced_signal(tid: Tid, sig: u32, action: SigAction) -> Option<(u32, SigAction)> {
+    if sig == SIGKILL {
+        return Some((sig, action));
+    }
+    let new = crate::task::ptrace::ptrace_signal(sig);
+    if new == sig {
+        return Some((sig, action));
+    }
+    if new == 0 {
+        return None;
+    }
+    let blocked = with_task_signal_state(tid, |state| state.blocked.contains(new)).unwrap_or(false);
+    if blocked {
+        send_signal(tid, new);
+        return None;
+    }
+    let action = get_task_sighand(tid)?.get_action(new).unwrap_or_default();
+    Some((new, action))
+}
+
 /// Signal work on the way back to user mode (Linux
 /// arch_do_signal_or_restart), on the task's user registers `regs`
 ///
@@ -1601,6 +1624,11 @@ pub fn do_signal(regs: &mut PtRegs) {
         }
         let Some((sig, action)) = get_signal_to_deliver(tid) else {
             break;
+        };
+        // A tracee stops for its tracer first (Linux get_signal ->
+        // ptrace_signal), which may cancel or change the signal
+        let Some((sig, action)) = traced_signal(tid, sig, action) else {
+            continue;
         };
         match action.handler {
             SigHandler::Ignore => continue,

@@ -109,6 +109,7 @@ pub mod tcp_xfer;
 pub mod timerfd;
 pub mod timer_accuracy;
 pub mod timer_rt;
+pub mod ptrace_stop;
 pub mod timing;
 pub mod tlb;
 pub mod tls;
@@ -247,6 +248,7 @@ pub fn run_all_tests() {
     timing::run_tests();
     timer_accuracy::run_tests();
     timer_rt::run_tests();
+    ptrace_stop::run_tests();
     uaccess::run_tests();
     isolated(b"BUSYBOX", busybox::run_tests);
     #[cfg(target_arch = "x86_64")]

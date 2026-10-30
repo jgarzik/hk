@@ -202,6 +202,18 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, _rusage: u64) -> i64 {
     let result = loop {
         CHILD_EXIT_WQ.prepare_to_wait(w.as_ref(), SleepState::Interruptible);
 
+        // A tracee's ptrace stop: (code << 8) | 0x7f (Linux
+        // wait_task_stopped)
+        if let Some((tid, code)) = super::percpu::wait_traced(current_pid, pid, false) {
+            if wstatus != 0 {
+                use crate::arch::Uaccess;
+                let st = ((code as i32) << 8) | 0x7f;
+                if crate::uaccess::put_user::<Uaccess, i32>(wstatus, st).is_err() {
+                    break KernelError::BadAddress.sysret();
+                }
+            }
+            break tid as i64;
+        }
         if let Some((child_pid, wait_status)) =
             super::percpu::reap_zombie_child(current_pid, pid, options)
         {
@@ -216,7 +228,9 @@ pub fn sys_wait4(pid: i64, wstatus: u64, options: i32, _rusage: u64) -> i64 {
         }
 
         // No zombie child found - check if we have any children at all
-        if !super::percpu::has_children(current_pid, pid, options) {
+        if !super::percpu::has_children(current_pid, pid, options)
+            && !super::percpu::has_tracees(current_pid, pid)
+        {
             break KernelError::NoChild.sysret();
         }
 
@@ -357,6 +371,26 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
     let result = loop {
         CHILD_EXIT_WQ.prepare_to_wait(w.as_ref(), SleepState::Interruptible);
 
+        // A tracee's ptrace stop (CLD_TRAPPED)
+        let wnowait = options & super::wait_options::WNOWAIT != 0;
+        if let Some((tid, code)) = super::percpu::wait_traced(current_pid, wait_pid, wnowait) {
+            if infop != 0 {
+                let info = SigInfo {
+                    si_signo: SIGCHLD,
+                    si_errno: 0,
+                    si_code: CLD_TRAPPED,
+                    _pad0: 0,
+                    si_pid: tid as i32,
+                    si_uid: 0,
+                    si_status: code as i32,
+                };
+                if put_user::<Uaccess, SigInfo>(infop, info).is_err() {
+                    break KernelError::BadAddress.sysret();
+                }
+            }
+            break 0;
+        }
+
         // Reap a zombie child (with WNOWAIT, only report it)
         if let Some((child_pid, wait_status, utime, stime)) =
             super::percpu::reap_zombie_child_times(current_pid, wait_pid, options)
@@ -394,7 +428,9 @@ pub fn sys_waitid(idtype: i32, id: u64, infop: u64, options: i32, rusage: u64) -
         }
 
         // No zombie child found - check if we have any children at all
-        if !super::percpu::has_children(current_pid, wait_pid, options) {
+        if !super::percpu::has_children(current_pid, wait_pid, options)
+            && !super::percpu::has_tracees(current_pid, wait_pid)
+        {
             break KernelError::NoChild.sysret();
         }
 

@@ -216,6 +216,9 @@ pub trait UserRegs {
     fn set_ret(&mut self, v: u64);
     /// The frame is a syscall's (one that may still be restarted)
     fn in_syscall(&self) -> bool;
+    /// Its syscall number, u64::MAX if none (Linux syscall_get_nr:
+    /// orig_ax / syscallno; a tracer may change it at the entry stop)
+    fn syscall_nr(&self) -> u64;
     /// No restart from here on (Linux forget_syscall; x86 keeps orig_ax,
     /// as Linux does: its restart leaves the syscall number in RAX, never
     /// an -ERESTART* code)

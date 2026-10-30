@@ -108,6 +108,10 @@ impl crate::arch::UserRegs for Aarch64TrapFrame {
         self.syscallno != NO_SYSCALL
     }
 
+    fn syscall_nr(&self) -> u64 {
+        self.syscallno
+    }
+
     fn forget_syscall(&mut self) {
         self.syscallno = NO_SYSCALL;
     }

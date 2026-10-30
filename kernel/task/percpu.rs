@@ -975,6 +975,7 @@ fn create_kernel_task(
         threads: crate::list::ArcList::new(),
         ptrace_message: 0,
         ptrace_options: 0,
+        ptrace_code: 0,
     };
     let task = Task::new(
         tid,
@@ -1177,6 +1178,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         threads: crate::list::ArcList::new(),
         ptrace_message: 0,
         ptrace_options: 0,
+        ptrace_code: 0,
     };
     let task = Arc::new(Task::new(
         tid,
@@ -1464,6 +1466,43 @@ fn group_status(t: &KernelTaskInner, own: i32) -> i32 {
         Some(crate::signal::GroupExit::Exit(code)) => code,
         _ => own,
     }
+}
+
+/// A ptrace stop of a task traced by the group `tracer_pid`, matching
+/// `target_pid` (> 0: that tid; -1: any), not yet reported: its tid and
+/// the stop's code. Reported once unless `wnowait` (Linux
+/// wait_task_stopped with ptrace: exit_code cleared).
+pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(Tid, u32)> {
+    let mut table = TASKLIST.write();
+    let tid = table
+        .find(|t| {
+            matches!(t.state, TaskState::Traced(_))
+                && t.ptrace_code != 0
+                && tracee_of(t, tracer_pid)
+                && (target_pid == -1 || t.task.tid() == target_pid as u64)
+        })?
+        .task
+        .tid();
+    let mut t = table.get_mut(tid)?;
+    let code = t.ptrace_code;
+    if !wnowait {
+        t.ptrace_code = 0;
+    }
+    Some((tid, code))
+}
+
+/// `t` is traced by a thread of group `tracer_pid`
+fn tracee_of(t: &TaskView<'_>, tracer_pid: Pid) -> bool {
+    t.ptrace != 0 && t.tracer().is_some_and(|tr| tr.pid == tracer_pid)
+}
+
+/// The group `tracer_pid` traces a task matching `target_pid` (so a
+/// wait for it is not ECHILD)
+pub fn has_tracees(tracer_pid: Pid, target_pid: i64) -> bool {
+    let table = TASKLIST.read();
+    table.iter().any(|t| {
+        tracee_of(&t, tracer_pid) && (target_pid == -1 || t.task.tid() == target_pid as u64)
+    })
 }
 
 /// Check if a process has any children matching the criteria
@@ -1809,6 +1848,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         threads: crate::list::ArcList::new(),
         ptrace_message: 0,
         ptrace_options: 0,
+        ptrace_code: 0,
     };
     let child_task = Arc::new(Task::new(
         child_tid,
@@ -2211,6 +2251,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     };
     if tid != 0 {
         forget_original_parent();
+        crate::task::ptrace::exit_ptrace();
     }
     if let Some(st) = status {
         mark_zombie(tid, st, group_dead);
