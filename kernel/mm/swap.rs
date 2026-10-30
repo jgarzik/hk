@@ -216,12 +216,12 @@ impl SwapInfo {
         TOTAL_SWAP_USED.fetch_add(n as u64, Ordering::Relaxed);
     }
 
-    /// Swap PTEs referencing slot `off`
     /// SWAP_HAS_CACHE is set on slot `off`
     pub fn has_cache(&self, off: u64) -> bool {
         off < self.max && self.map.lock().count[off as usize] & SWAP_HAS_CACHE != 0
     }
 
+    /// Swap PTEs referencing slot `off`
     pub fn count(&self, off: u64) -> u16 {
         if off >= self.max {
             return 0;
@@ -260,9 +260,18 @@ fn find_swap_by_path(path: &[u8]) -> Option<u8> {
 /// A free slot for a page entering the swap cache, its count
 /// SWAP_HAS_CACHE (Linux folio_alloc_swap): the writable device of
 /// highest priority with room
+///
+/// Direct reclaim (PF_MEMALLOC) takes only block-device areas: a swap
+/// file's pages go out through its filesystem's writepage, which may
+/// need locks the allocating task holds (Linux maps a swap file's
+/// blocks at swapon and bypasses the filesystem)
 pub fn get_swap_page() -> Option<SwapEntry> {
+    let reclaiming = crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC);
     let devs: Vec<Arc<SwapInfo>> = SWAP_INFO.read().iter().flatten().cloned().collect();
-    let mut devs: Vec<_> = devs.into_iter().filter(|s| s.writeok()).collect();
+    let mut devs: Vec<_> = devs
+        .into_iter()
+        .filter(|s| s.writeok() && !(reclaiming && s.inode.is_some()))
+        .collect();
     devs.sort_by_key(|s| core::cmp::Reverse(s.priority));
     devs.iter()
         .find_map(|si| si.alloc_slot().map(|off| SwapEntry::new(si.swap_type, off)))
@@ -539,19 +548,16 @@ pub fn swap_full() -> bool {
     free * 2 < total
 }
 
-/// Swap totals in pages: (total, free) (meminfo, sysinfo)
-/// A swap file (not a block device) is on: its pages go out through
-/// the filesystem's writepage, which may need locks an allocating task
-/// holds, so direct reclaim leaves them alone (Linux writes swap files
-/// to their blocks directly, mapped at swapon)
-pub fn file_swap_active() -> bool {
+/// A swap area on a block device is on (direct reclaim swaps only there)
+pub fn bdev_swap_active() -> bool {
     SWAP_INFO
         .read()
         .iter()
         .flatten()
-        .any(|si| si.inode.is_some())
+        .any(|si| si.bdev.is_some())
 }
 
+/// Swap totals in pages: (total, free) (meminfo, sysinfo)
 pub fn swap_totals() -> (u64, u64) {
     let total = TOTAL_SWAP_PAGES.load(Ordering::Relaxed);
     let used = TOTAL_SWAP_USED.load(Ordering::Relaxed);

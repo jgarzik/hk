@@ -1394,8 +1394,8 @@ layout in `doc/MEMORY.md`
   runs with PF_MEMALLOC_NOIO (Linux memalloc_noio_save). The reverse map
   only tries the AnonVma chain lock under PF_MEMALLOC (Linux rmap_walk
   with try_lock): an allocating task may hold it for writing. Direct
-  reclaim swaps only to block devices: with a swap file on it frees
-  nothing (`swap::file_swap_active`), since the file's writepage may
+  reclaim swaps only to block-device areas (`swap::get_swap_page`
+  skips swap files under PF_MEMALLOC), since a file's writepage may
   need filesystem locks the allocating task holds. A fault
   whose page table cannot be allocated (under the page_table_lock)
   reclaims after dropping it and retries.
