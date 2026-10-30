@@ -81,7 +81,6 @@ pub fn syscall_exit_to_user_mode(regs: &mut PtRegs) {
 /// u64::MAX (the tracer set it) skips the syscall, keeping the return
 /// register as the tracer left it.
 pub fn syscall_enter_from_user_mode(regs: &mut PtRegs) -> u64 {
-    use crate::arch::UserRegs;
     if crate::task::percpu::current().has_tif(tif::SYSCALL_TRACE) {
         crate::task::ptrace::ptrace_report_syscall(true);
     }
