@@ -269,19 +269,25 @@ impl PosixTimer {
                 inner.expires_ns = 0;
             } else {
                 let now = inner.clock.now();
-                let (_, next) = crate::timer::forward(inner.expires_ns, inner.interval_ns, now);
-                // A period under a tick re-arms a tick away at the
-                // soonest: a tiny one would otherwise keep ktimers/N busy
-                // (Linux re-arms when the signal is dequeued instead)
-                let floor = now.saturating_add(TICK_NS);
-                let next = next.map(|n| match inner.interval_ns < TICK_NS {
-                    true => n.max(floor),
-                    false => n,
-                });
+                let (missed, next) =
+                    crate::timer::forward(inner.expires_ns, inner.interval_ns, now);
+                // Periods missed beyond the one this expiry delivers
+                // (Linux: hrtimer_forward's count, into it_overrun)
+                let extra = i32::try_from(missed - 1).unwrap_or(i32::MAX);
+                inner.overrun = inner.overrun.saturating_add(extra);
                 match next {
                     Some(n) => {
+                        // The expiry stays on the period grid, so the
+                        // next forward counts every missed period; a
+                        // period under a tick fires a tick away at the
+                        // soonest, or it would keep ktimers/N busy (Linux
+                        // re-arms when the signal is dequeued instead)
                         inner.expires_ns = n;
-                        self.timer().start(n, inner.clock);
+                        let fire = match inner.interval_ns < TICK_NS {
+                            true => n.max(now.saturating_add(TICK_NS)),
+                            false => n,
+                        };
+                        self.timer().start(fire, inner.clock);
                     }
                     None => {
                         inner.armed = false;
@@ -292,13 +298,6 @@ impl PosixTimer {
 
             // Determine notification action
             should_signal = self.sigevent.sigev_notify == sigev_notify::SIGEV_SIGNAL;
-
-            // Increment overrun count (will be reset on getoverrun)
-            // In Linux, this counts missed deliveries while signal is pending
-            // For simplicity, we just track total expirations
-            if inner.overrun < i32::MAX {
-                inner.overrun = inner.overrun.saturating_add(1);
-            }
         }
 
         // Send signal if configured
