@@ -133,24 +133,27 @@ impl FsStruct {
 // =============================================================================
 
 // =============================================================================
-// Task FS accessors - uses Task.fs field directly via TASKLIST
+// Task FS accessors - Task.fs under its alloc_lock (Linux task_lock)
 // =============================================================================
 
-use crate::task::percpu::TASKLIST;
+use crate::task::percpu::{current, with_task_lock};
 
-/// Initialize filesystem context for a new task
+/// Initialize filesystem context for a new task (the task itself, or
+/// its creator before it runs); the old one is dropped after the lock
 pub fn init_task_fs(tid: Tid, fs: Arc<FsStruct>) {
-    let old = {
-        let mut table = TASKLIST.write();
-        table.get_mut(tid).and_then(|mut t| t.fs.replace(fs))
-    };
+    // SAFETY: the task itself or a child not yet run (see above)
+    let old = with_task_lock(tid, |a| unsafe { a.set_fs(Some(fs)) });
     drop(old);
 }
 
-/// Get the FsStruct for a task (returns cloned Arc)
+/// Get the FsStruct for a task (returns cloned Arc; lock-free for the
+/// current task, Linux current->fs)
 pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
-    let table = TASKLIST.read();
-    table.get(tid).and_then(|t| t.fs.clone())
+    let me = current();
+    if me.tid() == tid {
+        return me.fs();
+    }
+    with_task_lock(tid, |a| a.fs().cloned()).flatten()
 }
 
 /// Remove filesystem context when task exits
@@ -158,12 +161,10 @@ pub fn get_task_fs(tid: Tid) -> Option<Arc<FsStruct>> {
 /// This decrements the Arc refcount. If this was the last reference
 /// (no other tasks sharing this FsStruct), the FsStruct is dropped,
 /// which in turn drops the Path references to pwd and root (after
-/// TASKLIST is released: nothing is released under it).
+/// the task's alloc_lock is released: nothing is released under it).
 pub fn exit_task_fs(tid: Tid) {
-    let fs = {
-        let mut table = TASKLIST.write();
-        table.get_mut(tid).and_then(|mut t| t.fs.take())
-    };
+    // SAFETY: the exiting task itself
+    let fs = with_task_lock(tid, |a| unsafe { a.set_fs(None) }).flatten();
     drop(fs);
 }
 

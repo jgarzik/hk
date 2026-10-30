@@ -23,6 +23,7 @@
 //! - Linux kernel ipc/mqueue.c
 //! - POSIX.1-2017 mq_overview(7)
 
+use crate::hrtimer::HrClock;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -297,10 +298,11 @@ impl MqQueue {
 
             // Wait for space (Linux wq_sleep: ERESTARTSYS, ETIMEDOUT)
             let room = || (self.messages.lock().len() as i64) < self.maxmsg;
-            match self
-                .waitq_send
-                .wait_event_interruptible_deadline(room, deadline)
-            {
+            match self.waitq_send.wait_event_interruptible_deadline(
+                room,
+                deadline,
+                HrClock::Realtime,
+            ) {
                 Ok(true) => {}
                 Ok(false) => return Err(KernelError::TimedOut.sysret()),
                 Err(e) => return Err(e.sysret()),
@@ -337,10 +339,11 @@ impl MqQueue {
 
             // Wait for messages
             let ready = || !self.messages.lock().is_empty();
-            match self
-                .waitq_recv
-                .wait_event_interruptible_deadline(ready, deadline)
-            {
+            match self.waitq_recv.wait_event_interruptible_deadline(
+                ready,
+                deadline,
+                HrClock::Realtime,
+            ) {
                 Ok(true) => {}
                 Ok(false) => return Err(KernelError::TimedOut.sysret()),
                 Err(e) => return Err(e.sysret()),
@@ -664,8 +667,9 @@ pub fn sys_mq_unlink(name_ptr: u64) -> i64 {
     }
 }
 
-/// CLOCK_MONOTONIC deadline for an absolute CLOCK_REALTIME timeout
-/// (`struct timespec *`, 0 = none; EINVAL for a bad tv_nsec, EFAULT)
+/// The absolute CLOCK_REALTIME deadline of a timeout (`struct timespec
+/// *`, 0 = none; EINVAL for a bad tv_nsec, EFAULT), kept on that clock so
+/// it follows clock_settime (Linux do_mq_timedsend: HRTIMER_MODE_ABS)
 fn mq_deadline(abs: u64) -> Result<Option<u64>, KernelError> {
     if abs == 0 {
         return Ok(None);
@@ -675,11 +679,7 @@ fn mq_deadline(abs: u64) -> Result<Option<u64>, KernelError> {
     if !(0..1_000_000_000).contains(&nsec) || sec < 0 {
         return Err(KernelError::InvalidArgument);
     }
-    let want = (sec as i128) * 1_000_000_000 + nsec as i128;
-    let now = crate::time::TIMEKEEPER.current_time();
-    let now = now.sec as i128 * 1_000_000_000 + now.nsec as i128;
-    let rel = (want - now).clamp(0, u64::MAX as i128) as u64;
-    Ok(Some(crate::time::monotonic_ns().saturating_add(rel)))
+    Ok(Some(crate::time::timespec_to_ns(sec, nsec)))
 }
 
 /// mq_timedsend - send a message to a queue

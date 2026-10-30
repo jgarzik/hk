@@ -14,8 +14,8 @@
 use crate::arch::Uaccess;
 use crate::error::KernelError;
 use crate::signal::{
-    SIGKILL, SIGSTOP, SigAction, SigSet, UNMASKABLE_SIGNALS, get_task_sighand, send_signal,
-    send_signal_to_pgrp, send_signal_to_process, with_task_signal_state,
+    SIGKILL, SIGSTOP, SigAction, SigSet, UNMASKABLE_SIGNALS, get_task_sighand, kill_pgrp,
+    send_signal, send_signal_to_process, with_task_signal_state,
 };
 use crate::task::percpu::{current_pgid, current_tid, get_all_pids};
 use crate::uaccess::{get_user, put_user};
@@ -200,9 +200,6 @@ pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oset_ptr: u64, sigsetsize: u64
 
             // Never allow blocking SIGKILL/SIGSTOP
             state.blocked = state.blocked.subtract(&UNMASKABLE_SIGNALS);
-
-            // Recalculate pending flag
-            state.recalc_sigpending();
         }
         Ok(old)
     });
@@ -350,14 +347,8 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
         }
         send_signal_to_process(pid as u64, sig) as i64
     } else if pid == 0 {
-        // Send to all processes in caller's process group
-        let pgid = current_pgid();
-        // Signal 0 is a validity check only
-        if sig == 0 {
-            // Check if our process group exists (it always does)
-            return 0;
-        }
-        send_signal_to_pgrp(pgid, sig) as i64
+        // Every process in the caller's process group, once each
+        kill_pgrp(current_pgid(), sig, |p| check_kill_permission(p, sig)) as i64
     } else if pid == -1 {
         // Send to all processes (except init)
         // Signal 0 is a validity check, don't actually send
@@ -375,16 +366,10 @@ pub fn sys_kill(pid: i64, sig: u32) -> i64 {
         }
         if sent { 0 } else { -3 } // ESRCH if no process was signaled
     } else {
-        // pid < -1: Send to all processes in process group -pid
-        let pgid = (-pid) as u64;
-        // Signal 0 is a validity check - check if pgrp exists
-        if sig == 0 {
-            use crate::task::percpu::TASKLIST;
-            let table = TASKLIST.read();
-            let exists = table.iter().any(|t| t.task.pgid() == pgid);
-            return if exists { 0 } else { -3 }; // ESRCH if pgrp doesn't exist
-        }
-        send_signal_to_pgrp(pgid, sig) as i64
+        // pid < -1: every process in group -pid, once each (signal 0:
+        // does the group exist, may we signal it)
+        let pgid = pid.unsigned_abs();
+        kill_pgrp(pgid, sig, |p| check_kill_permission(p, sig)) as i64
     }
 }
 
@@ -530,8 +515,8 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
 /// rt_sigsuspend(mask, sigsetsize) - wait for signal with temporary mask
 ///
 /// Atomically replaces the signal mask with `mask` and sleeps until a signal
-/// becomes deliverable. The original mask is kept in `saved_sigmask`; the
-/// syscall-return path (`do_signal`) delivers the signal under the temporary
+/// becomes deliverable. The original mask is kept in `saved_sigmask`
+/// (TIF_RESTORE_SIGMASK); the syscall-return path (`do_signal`) delivers the signal under the temporary
 /// mask, stores the original mask in the signal frame (restored by
 /// rt_sigreturn), or restores it directly if no handler runs.
 ///
@@ -554,16 +539,8 @@ pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
         Err(_) => return -14, // EFAULT
     };
 
-    let tid = current_tid();
-
     // Save old mask (restored on return to user) and install the new one
-    let ok = with_task_signal_state(tid, |state| {
-        state.saved_sigmask = Some(state.blocked);
-        // Never block SIGKILL/SIGSTOP
-        state.blocked = new_mask.subtract(&UNMASKABLE_SIGNALS);
-        state.recalc_sigpending();
-    });
-    if ok.is_none() {
+    if crate::signal::set_temp_sigmask(new_mask).is_none() {
         return -3; // ESRCH
     }
 
@@ -846,7 +823,6 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
             let old = st.blocked;
             st.real_blocked = old;
             st.blocked = old.subtract(&mask);
-            st.recalc_sigpending();
             old
         });
         let deadline = timeout_ns.map(|ns| crate::time::monotonic_ns().saturating_add(ns));
@@ -855,7 +831,6 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
             with_task_signal_state(tid, |st| {
                 st.blocked = old;
                 st.real_blocked = SigSet::EMPTY;
-                st.recalc_sigpending();
             });
         }
         sig = dequeue_in(tid, &mask);
@@ -888,7 +863,6 @@ fn dequeue_in(tid: crate::task::Tid, mask: &SigSet) -> Option<u32> {
         let deliverable = state.pending.signal.intersect(mask);
         if let Some(sig) = deliverable.first() {
             state.pending.remove(sig);
-            state.recalc_sigpending();
             return Some(sig);
         }
         let mut shared = state.shared_pending.lock();
@@ -896,7 +870,6 @@ fn dequeue_in(tid: crate::task::Tid, mask: &SigSet) -> Option<u32> {
         if let Some(sig) = deliverable.first() {
             shared.remove(sig);
             drop(shared);
-            state.recalc_sigpending();
             return Some(sig);
         }
         None
@@ -907,24 +880,17 @@ fn dequeue_in(tid: crate::task::Tid, mask: &SigSet) -> Option<u32> {
 /// Sleep interruptibly until a signal is deliverable or the
 /// CLOCK_MONOTONIC `deadline` (ns) passes
 fn sleep_until_signal(deadline: Option<u64>) {
-    use crate::task::percpu::{
-        SleepState, ns_to_ticks, schedule, schedule_timeout, set_current_state,
-    };
+    use crate::hrtimer::{HrClock, schedule_hrtimeout};
+    use crate::task::percpu::{SleepState, set_current_state};
     loop {
         set_current_state(SleepState::Interruptible);
         if crate::waitqueue::signal_pending() {
             break;
         }
-        match deadline {
-            None => schedule(),
-            Some(d) => {
-                let now = crate::time::monotonic_ns();
-                if now >= d {
-                    break;
-                }
-                schedule_timeout(ns_to_ticks(d - now));
-            }
+        if deadline.is_some_and(|d| crate::time::monotonic_ns() >= d) {
+            break;
         }
+        schedule_hrtimeout(deadline, HrClock::Monotonic);
     }
     set_current_state(SleepState::Running);
 }

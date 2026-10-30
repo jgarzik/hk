@@ -26,17 +26,16 @@
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::pin::Pin;
 
 use crate::arch::IrqSpinlock;
 use crate::fs::KernelError;
 use crate::fs::dentry::Dentry;
 use crate::fs::file::{File, FileOps, flags};
 use crate::fs::inode::{Inode, InodeMode, NULL_INODE_OPS, Timespec as InodeTimespec};
+use crate::hrtimer::{HRTIMER_HARD, HrClock, HrTimer};
 use crate::poll::{POLLIN, POLLRDNORM, PollTable};
-use crate::time::{ClockId, TIMEKEEPER};
 use crate::time_syscall::LinuxTimespec;
-use crate::timer::{TimerHandle, timer_add, timer_del};
 use crate::waitqueue::WaitQueue;
 
 /// Timerfd create flags
@@ -51,7 +50,8 @@ pub mod tfd_flags {
 pub mod tfd_timer_flags {
     /// Time value is absolute
     pub const TFD_TIMER_ABSTIME: i32 = 1;
-    /// Cancel timer if clock changes (not implemented)
+    /// A CLOCK_REALTIME absolute timer's read fails with ECANCELED
+    /// once the clock is set
     pub const TFD_TIMER_CANCEL_ON_SET: i32 = 2;
 }
 
@@ -106,16 +106,26 @@ impl ITimerSpec {
 struct TimerfdInner {
     /// Clock ID (CLOCK_REALTIME or CLOCK_MONOTONIC)
     clockid: i32,
-    /// Next expiration time (absolute monotonic ns, 0 if disarmed)
+    /// Next expiration time (absolute ns on `clock`, 0 if disarmed)
     expires_ns: u64,
+    /// The clock `expires_ns` is on: CLOCK_REALTIME only for an
+    /// absolute realtime timer (Linux: relative timers run on
+    /// CLOCK_MONOTONIC)
+    clock: HrClock,
     /// Interval for periodic timers (0 = one-shot)
     interval_ns: u64,
     /// Number of expirations since last read
     ticks: u64,
-    /// Handle to the timer in the timer subsystem
-    timer_handle: TimerHandle,
+    /// A periodic timer expired and waits to be re-armed by a read or
+    /// gettime (Linux ctx->expired)
+    expired: bool,
     /// settime flags (TFD_TIMER_ABSTIME, etc.)
     settime_flags: i32,
+    /// TFD_TIMER_CANCEL_ON_SET armed (on the cancel list)
+    might_cancel: bool,
+    /// The realtime offset when armed; None once the clock was set
+    /// (Linux moffs == KTIME_MAX)
+    moffs: Option<i64>,
 }
 
 impl TimerfdInner {
@@ -123,10 +133,13 @@ impl TimerfdInner {
         Self {
             clockid,
             expires_ns: 0,
+            clock: HrClock::Monotonic,
             interval_ns: 0,
             ticks: 0,
-            timer_handle: TimerHandle::NULL,
+            expired: false,
             settime_flags: 0,
+            might_cancel: false,
+            moffs: Some(0),
         }
     }
 }
@@ -137,39 +150,29 @@ pub struct Timerfd {
     inner: IrqSpinlock<TimerfdInner>,
     /// Wait queue for blocking reads
     wait_queue: WaitQueue,
-    /// Unique ID for this timerfd (used as timer callback data)
-    id: u64,
+    /// Its expiry timer (HARD, like Linux timerfd_tmrproc: the callback
+    /// takes `inner`, an IrqSpinlock, and wakes readers; data: this
+    /// timerfd, which outlives it: dropping the timer waits out its
+    /// callback)
+    timer: HrTimer,
 }
-
-/// Global counter for timerfd IDs
-static NEXT_TIMERFD_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Global timerfd registry (maps ID -> weak ref)
-/// This allows the timer callback to find the timerfd
-static TIMERFD_REGISTRY: IrqSpinlock<alloc::vec::Vec<(u64, Weak<Timerfd>)>> =
-    IrqSpinlock::new(alloc::vec::Vec::new());
 
 impl Timerfd {
     /// Create a new timerfd
     pub fn new(clockid: i32) -> Arc<Self> {
-        let id = NEXT_TIMERFD_ID.fetch_add(1, Ordering::Relaxed);
         let timerfd = Arc::new(Self {
             inner: IrqSpinlock::new(TimerfdInner::new(clockid)),
             wait_queue: WaitQueue::new(),
-            id,
+            timer: HrTimer::new(timerfd_fire, HRTIMER_HARD),
         });
-
-        // Register in global registry
-        let weak = Arc::downgrade(&timerfd);
-        TIMERFD_REGISTRY.lock().push((id, weak));
-
+        timerfd.timer.set_data(Arc::as_ptr(&timerfd) as usize);
         timerfd
     }
 
-    /// Get current monotonic time in nanoseconds
-    fn now_ns() -> u64 {
-        let ts = TIMEKEEPER.read(ClockId::Monotonic, TIMEKEEPER.get_read_cycles());
-        ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
+    /// Its timer (pinned: the timerfd lives in an Arc)
+    fn timer(&self) -> Pin<&HrTimer> {
+        // SAFETY: an Arc's contents never move
+        unsafe { Pin::new_unchecked(&self.timer) }
     }
 
     /// Arm the timer
@@ -181,20 +184,20 @@ impl Timerfd {
     /// # Returns
     /// Previous timer value
     pub fn settime(self: &Arc<Self>, new_value: &ITimerSpec, flags: i32) -> ITimerSpec {
+        // Cancel the existing timer, waiting out its callback (it takes
+        // `inner`)
+        self.timer.cancel_sync();
+        self.setup_cancel(flags);
         let mut inner = self.inner.lock();
 
         // Save old value
         let old_value = self.get_current_value_locked(&inner);
 
-        // Cancel existing timer if any
-        if inner.timer_handle.is_valid() {
-            timer_del(inner.timer_handle);
-            inner.timer_handle = TimerHandle::NULL;
-        }
-
         // Reset ticks
         inner.ticks = 0;
+        inner.expired = false;
         inner.settime_flags = flags;
+        inner.moffs = Some(crate::time::real_offset());
 
         // Check if disarming
         if new_value.is_disarmed() {
@@ -207,33 +210,31 @@ impl Timerfd {
         let value_ns = new_value.value_to_ns();
         inner.interval_ns = new_value.interval_to_ns();
 
-        let expires_ns = if flags & tfd_timer_flags::TFD_TIMER_ABSTIME != 0 {
-            // Absolute time - convert to monotonic if needed
-            if inner.clockid == 0 {
-                // CLOCK_REALTIME - need to convert to monotonic
-                // For simplicity, we assume realtime ~= monotonic + offset
-                // A proper implementation would handle clock jumps
-                value_ns
-            } else {
-                // CLOCK_MONOTONIC - use directly
-                value_ns
-            }
+        let (expires_ns, clock) = if flags & tfd_timer_flags::TFD_TIMER_ABSTIME != 0 {
+            // Absolute, kept on its clock: a realtime one follows
+            // clock_settime
+            (value_ns, clock_of(inner.clockid))
         } else {
             // Relative time (saturates: a huge value never fires)
-            crate::time::deadline_after(Self::now_ns(), value_ns)
+            let now = crate::time::monotonic_ns();
+            (
+                crate::time::deadline_after(now, value_ns),
+                HrClock::Monotonic,
+            )
         };
 
         inner.expires_ns = expires_ns;
-
-        // Register timer callback
-        inner.timer_handle = timer_add(expires_ns, inner.interval_ns, timerfd_callback, self.id);
+        inner.clock = clock;
+        self.timer().start(expires_ns, clock);
 
         old_value
     }
 
     /// Get current timer value
     pub fn gettime(&self) -> ITimerSpec {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        let more = self.restart(&mut inner);
+        inner.ticks = inner.ticks.saturating_add(more);
         self.get_current_value_locked(&inner)
     }
 
@@ -243,9 +244,7 @@ impl Timerfd {
             return ITimerSpec::default();
         }
 
-        let now = Self::now_ns();
-        let remaining = inner.expires_ns.saturating_sub(now);
-
+        let remaining = inner.expires_ns.saturating_sub(inner.clock.now());
         ITimerSpec::from_ns(remaining, inner.interval_ns)
     }
 
@@ -255,34 +254,28 @@ impl Timerfd {
     /// Returns the number of expirations as an 8-byte u64.
     pub fn read(&self, nonblock: bool) -> Result<u64, KernelError> {
         loop {
-            {
-                let mut inner = self.inner.lock();
-                if inner.ticks > 0 {
-                    let count = inner.ticks;
-                    inner.ticks = 0;
-                    return Ok(count);
-                }
-
-                // Timer not armed?
-                if inner.expires_ns == 0 {
-                    if nonblock {
-                        return Err(KernelError::WouldBlock);
-                    }
-                    // Could wait forever, but that's undefined behavior
-                    // For now, return EAGAIN
-                    return Err(KernelError::WouldBlock);
-                }
+            if !nonblock {
+                // Until it expires (Linux waits even while disarmed)
+                self.wait_queue
+                    .wait_event_interruptible(|| self.inner.lock().ticks > 0)?;
             }
-
+            let mut inner = self.inner.lock();
+            // The clock was set: the ticks do not count (Linux
+            // timerfd_canceled)
+            if inner.might_cancel && inner.moffs.is_none() {
+                inner.moffs = Some(crate::time::real_offset());
+                inner.ticks = 0;
+                inner.expired = false;
+                return Err(KernelError::Canceled);
+            }
+            if inner.ticks > 0 {
+                let n = core::mem::take(&mut inner.ticks);
+                return Ok(n.saturating_add(self.restart(&mut inner)));
+            }
             if nonblock {
                 return Err(KernelError::WouldBlock);
             }
-
-            // Wait for the timer to fire or be disarmed (a signal ends the wait)
-            self.wait_queue.wait_event_interruptible(|| {
-                let inner = self.inner.lock();
-                inner.ticks > 0 || inner.expires_ns == 0
-            })?;
+            // Another reader took them
         }
     }
 
@@ -300,16 +293,20 @@ impl Timerfd {
         }
     }
 
-    /// Called when timer expires (from timer callback)
+    /// Called when timer expires (from timer callback): one more tick; a
+    /// periodic timer is re-armed by the next read or gettime (Linux
+    /// timerfd_tmrproc)
     fn on_expire(&self) {
         {
             let mut inner = self.inner.lock();
+            if inner.expires_ns == 0 {
+                return;
+            }
             inner.ticks = inner.ticks.saturating_add(1);
-
-            // For periodic timers, the timer infrastructure handles rescheduling
-            // For one-shot, clear expires_ns
             if inner.interval_ns == 0 {
                 inner.expires_ns = 0;
+            } else {
+                inner.expired = true;
             }
         }
 
@@ -317,47 +314,99 @@ impl Timerfd {
         self.wait_queue.wake_all();
     }
 
-    /// Release the timerfd (cancel timer, unregister)
-    fn release(&self) {
-        // Cancel timer
+    /// Re-arm an expired periodic timer for the first period end after
+    /// now; returns the periods missed beyond the one counted at expiry
+    /// (Linux timerfd_hrtimer_restart). Re-arming here rather than in
+    /// the callback bounds a tiny period to one expiry per read.
+    fn restart(&self, inner: &mut TimerfdInner) -> u64 {
+        if !inner.expired || inner.interval_ns == 0 {
+            return 0;
+        }
+        inner.expired = false;
+        let now = inner.clock.now();
+        let (missed, next) = crate::timer::forward(inner.expires_ns, inner.interval_ns, now);
+        match next {
+            Some(n) => {
+                inner.expires_ns = n;
+                self.timer().start(n, inner.clock);
+            }
+            None => inner.expires_ns = 0,
+        }
+        missed - 1
+    }
+
+    /// Release the timerfd (cancel the timer, waiting out its callback)
+    fn release(self: &Arc<Self>) {
+        self.timer.cancel_sync();
+        self.setup_cancel(0);
+    }
+
+    /// Join or leave the cancel list for `flags` (Linux
+    /// timerfd_setup_cancel): realtime, absolute, CANCEL_ON_SET
+    fn setup_cancel(self: &Arc<Self>, flags: i32) {
+        use tfd_timer_flags::{TFD_TIMER_ABSTIME, TFD_TIMER_CANCEL_ON_SET};
+        let want = flags & TFD_TIMER_ABSTIME != 0
+            && flags & TFD_TIMER_CANCEL_ON_SET != 0
+            && clock_of(self.inner.lock().clockid) == HrClock::Realtime;
+        let mut list = CANCEL_LIST.lock();
+        let mut inner = self.inner.lock();
+        if want == inner.might_cancel {
+            return;
+        }
+        inner.might_cancel = want;
+        drop(inner);
+        let me = Arc::as_ptr(self);
+        list.retain(|w| w.as_ptr() != me);
+        if want {
+            list.push(Arc::downgrade(self));
+        }
+    }
+
+    /// The realtime clock was set (`clock_was_set`)
+    fn clock_was_set(&self, moffs: i64) {
         {
             let mut inner = self.inner.lock();
-            if inner.timer_handle.is_valid() {
-                timer_del(inner.timer_handle);
-                inner.timer_handle = TimerHandle::NULL;
+            if !inner.might_cancel || inner.moffs == Some(moffs) {
+                return;
             }
+            inner.moffs = None;
+            inner.ticks = inner.ticks.saturating_add(1);
         }
-
-        // Remove from registry
-        let mut registry = TIMERFD_REGISTRY.lock();
-        registry.retain(|(id, _)| *id != self.id);
+        self.wait_queue.wake_all();
     }
 }
 
-impl Drop for Timerfd {
-    fn drop(&mut self) {
-        // Cancel timer on drop
-        let inner = self.inner.lock();
-        if inner.timer_handle.is_valid() {
-            timer_del(inner.timer_handle);
-        }
+/// The timer clock of a timerfd clock id
+fn clock_of(clockid: i32) -> HrClock {
+    if clockid == 0 {
+        HrClock::Realtime
+    } else {
+        HrClock::Monotonic
     }
 }
 
-/// Timer callback - finds the timerfd and calls on_expire
-fn timerfd_callback(data: u64) {
-    // Find timerfd by ID in registry
-    let timerfd_opt = {
-        let registry = TIMERFD_REGISTRY.lock();
-        registry
-            .iter()
-            .find(|(id, _)| *id == data)
-            .and_then(|(_, weak)| weak.upgrade())
-    };
+/// Timerfds with TFD_TIMER_CANCEL_ON_SET armed (Linux cancel_list)
+static CANCEL_LIST: crate::sync::spin::Mutex<alloc::vec::Vec<Weak<Timerfd>>> =
+    crate::sync::spin::Mutex::new(alloc::vec::Vec::new());
 
-    if let Some(timerfd) = timerfd_opt {
-        timerfd.on_expire();
+/// CLOCK_REALTIME was set: fail the reads of cancel-on-set timerfds
+/// whose offset changed (Linux timerfd_clock_was_set; thread context)
+pub fn clock_was_set() {
+    let moffs = crate::time::real_offset();
+    let list: alloc::vec::Vec<Arc<Timerfd>> = CANCEL_LIST
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect();
+    for t in list {
+        t.clock_was_set(moffs);
     }
+}
+
+/// The timer of a timerfd expired (timer interrupt)
+fn timerfd_fire(t: &HrTimer) {
+    // SAFETY: `data` is the timerfd owning `t` (see `Timerfd::timer`)
+    unsafe { &*(t.data() as *const Timerfd) }.on_expire();
 }
 
 /// File operations for timerfd
@@ -398,7 +447,7 @@ impl FileOps for TimerfdFileOps {
     }
 
     fn release(&self, file: &File) -> Result<(), KernelError> {
-        let timerfd = file.private_ref::<Timerfd>().ok_or(KernelError::BadFd)?;
+        let timerfd = file.private_arc::<Timerfd>().ok_or(KernelError::BadFd)?;
         timerfd.release();
         Ok(())
     }

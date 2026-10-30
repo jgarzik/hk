@@ -56,19 +56,20 @@ pub unsafe trait Adapter {
 }
 
 /// `adapter!(vis Name, Type, field)`: an [`Adapter`] for `Type.field`
+/// (a nested `a.b` field too)
 #[macro_export]
 macro_rules! adapter {
-    ($vis:vis $name:ident, $t:ty, $field:ident) => {
+    ($vis:vis $name:ident, $t:ty, $($field:ident).+) => {
         $vis struct $name;
         // SAFETY: offset_of! gives the field's place in the item
         unsafe impl $crate::list::Adapter for $name {
             type Item = $t;
             fn link(item: &$t) -> &$crate::list::Link {
-                &item.$field
+                &item.$($field).+
             }
             unsafe fn item(link: *const $crate::list::Link) -> *const $t {
                 // SAFETY: the caller passes a link inside a live item
-                unsafe { (link as *const u8).sub(core::mem::offset_of!($t, $field)) as *const $t }
+                unsafe { (link as *const u8).sub(core::mem::offset_of!($t, $($field).+)) as *const $t }
             }
         }
     };
@@ -150,6 +151,26 @@ impl<A: Adapter> List<A> {
         self.len += 1;
     }
 
+    /// Insert `item` after `at` (Linux list_add(item, at))
+    ///
+    /// # Safety
+    /// `at` is on this list; `item` as for [`List::push_back`].
+    pub unsafe fn insert_after(&mut self, at: *const A::Item, item: *const A::Item) {
+        let (a, l) = (Self::lk(at), Self::lk(item));
+        // SAFETY: `a` is on this list, `l` is a free live link
+        unsafe {
+            let n = (*a).next.load(Relaxed);
+            (*l).prev.store(a, Relaxed);
+            (*l).next.store(n, Relaxed);
+            match n.as_ref() {
+                Some(n) => n.prev.store(l, Relaxed),
+                None => self.tail = l,
+            }
+            (*a).next.store(l, Relaxed);
+        }
+        self.len += 1;
+    }
+
     /// Unlink `item` (Linux list_del)
     ///
     /// # Safety
@@ -178,6 +199,18 @@ impl<A: Adapter> List<A> {
     pub fn front(&self) -> Option<*const A::Item> {
         // SAFETY: a non-null head is an entry's link
         (!self.head.is_null()).then(|| unsafe { A::item(self.head) })
+    }
+
+    /// The item after `item` (Linux list_next_entry), read before
+    /// `item` is removed when walking and unlinking
+    ///
+    /// # Safety
+    /// `item` is on this list.
+    pub unsafe fn next(&self, item: *const A::Item) -> Option<*const A::Item> {
+        // SAFETY: `item` is a live entry of this list
+        let n = unsafe { (*Self::lk(item)).next.load(Relaxed) };
+        // SAFETY: a non-null next is an entry's link
+        (!n.is_null()).then(|| unsafe { A::item(n) })
     }
 
     /// Remove and return the first item (Linux list_first_entry +
@@ -374,5 +407,31 @@ mod tests {
         assert_eq!(l.len(), 1);
         assert_eq!(l.pop_front().map(|p| unsafe { (*p).v }), Some(5));
         assert!(l.is_empty());
+    }
+
+    #[test]
+    fn insert_after_middle_and_tail() {
+        let n = |v| Node {
+            v,
+            link: Link::new(),
+        };
+        let (a, b, c) = (n(1), n(3), n(2));
+        let mut l: List<NodeA> = List::new();
+        unsafe {
+            l.push_back(&a);
+            l.insert_after(&a, &b);
+            l.insert_after(&a, &c);
+        }
+        assert_eq!(l.iter().map(|n| n.v).collect::<Vec<_>>(), [1, 2, 3]);
+        let d = n(4);
+        unsafe { l.insert_after(&b, &d) };
+        assert_eq!(l.len(), 4);
+        unsafe { l.remove(&d) };
+        assert_eq!(l.iter().map(|n| n.v).collect::<Vec<_>>(), [1, 2, 3]);
+        // The tail moved back to `b`
+        let e = n(5);
+        unsafe { l.push_back(&e) };
+        assert_eq!(l.iter().map(|n| n.v).collect::<Vec<_>>(), [1, 2, 3, 5]);
+        while l.pop_front().is_some() {}
     }
 }

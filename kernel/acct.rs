@@ -158,11 +158,15 @@ fn encode_elapsed_float(elapsed_ns: u64) -> u32 {
 /// (the write sleeps), and a replaced file is released after unlocking.
 static ACCT_FILE: Mutex<Option<Arc<File>>> = Mutex::new(None);
 
-/// Install `file` (None: accounting off); the old file is released
-/// with no lock held
+/// Install `file` (None: accounting off). The old file gets a record
+/// for the calling process before it is released, with no lock held
+/// (Linux acct_pin_kill -> do_acct_process(current))
 fn set_acct_file(file: Option<Arc<File>>) {
     let old = core::mem::replace(&mut *ACCT_FILE.lock(), file);
-    drop(old);
+    if let Some(old) = old {
+        let tid = crate::task::percpu::current_tid();
+        write_record(&old, tid, crate::task::percpu::current_pid(), 0);
+    }
 }
 
 // =============================================================================
@@ -238,11 +242,13 @@ fn open_acct_file(path: &str) -> Result<Arc<File>, i64> {
         Some(i) => Some(dac::want_write(&i).map_err(|e| e.sysret())?),
         None => None,
     };
-    let mut file = File::new(
-        dentry,
-        flags::O_WRONLY | flags::O_APPEND,
-        &crate::fs::file::NULL_FILE_OPS,
-    );
+    // The filesystem's file operations, as an open(2) of it gets
+    // (NULL_FILE_OPS made every record write fail)
+    let f_op: &'static dyn crate::fs::FileOps = dentry
+        .superblock()
+        .map(|sb| sb.fs_type.file_ops)
+        .unwrap_or(&crate::fs::ramfs::RAMFS_FILE_OPS);
+    let mut file = File::new(dentry, flags::O_WRONLY | flags::O_APPEND, f_op);
     file.write_access = w;
     Ok(Arc::new(file))
 }
@@ -261,7 +267,11 @@ pub fn write_acct_record(tid: Tid, pid: Pid, exit_status: i32) {
     let Some(file) = ACCT_FILE.lock().clone() else {
         return;
     };
+    write_record(&file, tid, pid, exit_status);
+}
 
+/// Write the record of process `pid` (thread `tid`) to `file`
+fn write_record(file: &File, tid: Tid, pid: Pid, exit_status: i32) {
     // Get task information
     let task_info = match get_task_info(tid, pid) {
         Some(info) => info,
@@ -315,7 +325,18 @@ pub fn write_acct_record(tid: Tid, pid: Pid, exit_status: i32) {
     };
 
     // Write to file (best-effort, ignore errors)
-    let _ = write_record_to_file(&file, &record);
+    // The record is not subject to the process's RLIMIT_FSIZE (no
+    // SIGXFSZ, no lost record): unlimited across the write (Linux
+    // do_acct_process)
+    use crate::rlimit::{RLIM_INFINITY, RLIMIT_FSIZE};
+    let sig = crate::signal::get_task_signal_struct(tid);
+    let old = sig
+        .as_ref()
+        .map(|s| s.swap_rlimit_cur(RLIMIT_FSIZE, RLIM_INFINITY));
+    let _ = write_record_to_file(file, &record);
+    if let (Some(s), Some(o)) = (&sig, old) {
+        s.swap_rlimit_cur(RLIMIT_FSIZE, o);
+    }
 }
 
 /// Task information gathered for accounting
@@ -343,13 +364,8 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
     let table = TASKLIST.read();
     let task = table.get(tid)?;
 
-    // Get command name from prctl state
-    let mut comm = [0u8; 16];
-    // Copy the task name, which is stored as bytes in prctl.name
-    let name_bytes = &task.prctl.name;
-    // Find the null terminator or use full length
-    let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
-    comm[..name_len].copy_from_slice(&name_bytes[..name_len]);
+    // Its name (NUL-terminated, Linux get_task_comm)
+    let comm = task.task.task_lock().comm();
 
     // Get credentials - Arc<Cred> can be dereferenced directly
     let cred = &task.cred();
@@ -394,7 +410,7 @@ fn get_task_info(tid: Tid, pid: Pid) -> Option<TaskInfo> {
             .load(core::sync::atomic::Ordering::Relaxed),
         comm,
         did_fork: pid != tid as Pid, // Simple heuristic: different PID/TID means forked
-        did_exec: task.prctl.name[0] != 0, // Has a name means exec'd
+        did_exec: comm[0] != 0,      // Has a name means exec'd
     })
 }
 
@@ -403,8 +419,9 @@ fn write_record_to_file(file: &File, record: &AcctV3) -> Result<(), KernelError>
     // Get the bytes
     let bytes = record.as_bytes();
 
-    // Write to file
-    file.f_op.write(file, bytes)?;
+    // Through the file's write path (Linux __kernel_write): O_APPEND
+    // places it at the end, the inode lock and size are kept
+    file.write(bytes)?;
 
     Ok(())
 }

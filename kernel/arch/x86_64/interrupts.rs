@@ -716,7 +716,8 @@ fn handle_lapic_timer() {
     let percpu = match super::percpu::try_current_cpu() {
         Some(p) => p,
         None => {
-            // Per-CPU not set up yet, just send EOI and return
+            // Per-CPU not set up yet: re-arm the one-shot timer, EOI
+            lapic::set_next_event(crate::task::percpu::TICK_NS);
             lapic::eoi();
             return;
         }
@@ -733,8 +734,8 @@ fn handle_lapic_timer() {
         crate::time::TIMEKEEPER.update(super::tsc::read_tsc);
     }
 
-    // Global ticks/timers and this CPU's scheduler work
-    crate::task::percpu::scheduler_tick();
+    // Due timers (the scheduler tick among them), the next event
+    crate::hrtimer::interrupt();
 
     // Send EOI to LAPIC (must be done before any potential context switch)
     lapic::eoi();

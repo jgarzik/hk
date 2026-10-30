@@ -482,7 +482,6 @@ pub fn sys_rt_sigreturn() -> i64 {
     let tid = crate::task::percpu::current_tid();
     crate::signal::with_task_signal_state(tid, |state| {
         state.blocked = sigmask;
-        state.recalc_sigpending();
     });
 
     // Everything goes back into the pt_regs the syscall returns through

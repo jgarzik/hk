@@ -117,6 +117,14 @@ pub use x86_64::uapi;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::uapi;
 
+// Program this CPU's next timer interrupt, ns from now (the one-shot
+// clock event device: LAPIC timer count / CNTP_CVAL)
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::lapic::set_next_event as clockevent_next;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::timer::set_next_event as clockevent_next;
+
 // The current task's user TLS register (FS base / TPIDR_EL0)
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::percpu::read_fs_base as read_user_tls;
@@ -208,6 +216,9 @@ pub trait UserRegs {
     fn set_ret(&mut self, v: u64);
     /// The frame is a syscall's (one that may still be restarted)
     fn in_syscall(&self) -> bool;
+    /// Its syscall number, u64::MAX if none (Linux syscall_get_nr:
+    /// orig_ax / syscallno; a tracer may change it at the entry stop)
+    fn syscall_nr(&self) -> u64;
     /// No restart from here on (Linux forget_syscall; x86 keeps orig_ax,
     /// as Linux does: its restart leaves the syscall number in RAX, never
     /// an -ERESTART* code)

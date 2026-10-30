@@ -1059,7 +1059,9 @@ fn dump_owner(pid: Pid) -> (u32, u32) {
     table
         .get(pid)
         .filter(|t| {
-            t.mm()
+            t.task
+                .task_lock()
+                .mm()
                 .is_none_or(|m| m.dumpable() == crate::task::dumpable::SUID_DUMP_USER)
         })
         .map_or((0, 0), |t| (t.cred().euid, t.cred().egid))
@@ -1171,18 +1173,8 @@ fn get_task_cgroup_path(pid: Pid) -> String {
     };
 
     // Get the task's cgroup namespace
-    let cgroup_ns = {
-        let table = TASKLIST.read();
-        if let Some(task) = table.get(tid) {
-            if let Some(ref nsproxy) = task.nsproxy {
-                nsproxy.cgroup_ns.clone()
-            } else {
-                INIT_CGROUP_NS.clone()
-            }
-        } else {
-            INIT_CGROUP_NS.clone()
-        }
-    };
+    let cgroup_ns = crate::ns::get_task_ns(tid)
+        .map_or_else(|| INIT_CGROUP_NS.clone(), |ns| ns.cgroup_ns.clone());
 
     // Translate the cgroup path relative to the namespace root
     cgroup_ns.translate_path(&cgroup)

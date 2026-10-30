@@ -125,18 +125,11 @@ fn area_of(vma: &super::Vma) -> Area {
     }
 }
 
-/// A frame for user data: none once free memory is down to the low
-/// watermark (the kernel's allocations may go on to min; see
-/// `page_alloc::alloc_mark`)
+/// A frame for user data: below the low watermark it reclaims (swaps
+/// pages out) where the caller may sleep, else none (the kernel's
+/// allocations may go on to min; see `page_alloc::alloc_mark`)
 pub(crate) fn alloc_user() -> Option<u64> {
     FRAME_ALLOCATOR.alloc_gfp(Gfp::HIGHUSER_MOVABLE)
-}
-
-/// A frame for user data, reclaiming (swapping pages out) below the low
-/// watermark down to min: only with no spinlock held (a fault holding
-/// the mmap_lock for reading)
-pub(crate) fn alloc_user_reclaim() -> Option<u64> {
-    FRAME_ALLOCATOR.alloc_gfp(Gfp::HIGHUSER_RECLAIM)
 }
 
 /// Install `new` in the leaf entry at `ptep` if it still holds `old`
@@ -360,7 +353,7 @@ fn fault_page(addr: u64, area: &Area) -> Result<u64, VmFault> {
     {
         return r;
     }
-    let frame = alloc_user_reclaim().ok_or(VmFault::Oom)?;
+    let frame = alloc_user().ok_or(VmFault::Oom)?;
     // SAFETY: a fresh frame, reached through the direct map
     let buf = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(frame), PAGE_SIZE as usize) };
     buf.fill(0);
@@ -513,7 +506,7 @@ fn do_wp_page(mm: &Mm, ptep: *mut u64, pte: u64, addr: u64, area: &Area) -> Resu
         match wp_locked(mm, ptep, pte, addr, area, &mut spare) {
             // Out of memory under the PTE lock: reclaim without it
             // (Linux wp_page_copy allocates before taking it)
-            Err(VmFault::Retry) => spare = Some(alloc_user_reclaim().ok_or(VmFault::Oom)?),
+            Err(VmFault::Retry) => spare = Some(alloc_user().ok_or(VmFault::Oom)?),
             r => {
                 if let Some(p) = spare {
                     FRAME_ALLOCATOR.free(p);
@@ -587,16 +580,11 @@ fn reuse_swap_page(phys: u64) {
 /// in a loop and the kernel keeps its reserve. Interrupts enabled.
 pub fn pagefault_out_of_memory() -> ! {
     use crate::signal::SIGKILL;
-    use crate::task::percpu::{TASKLIST, current_tid};
+    use crate::task::percpu::current_tid;
 
     let tid = current_tid();
-    let (pid, name) = {
-        let table = TASKLIST.read();
-        let me = table.get(tid);
-        let pid = me.map_or(0, |t| t.task.pid);
-        let name = me.map_or([0; 16], |t| t.prctl.name);
-        (pid, name)
-    };
+    let me = crate::task::percpu::current();
+    let (pid, name) = (me.pid, me.comm());
     let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
     let exe = super::get_task_mm(tid).and_then(|mm| mm.mmap_read().exe());
     let comm = match core::str::from_utf8(&name[..len]) {

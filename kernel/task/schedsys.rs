@@ -84,11 +84,56 @@ pub fn sys_getpriority(which: i32, who: u64, caller_pid: Pid) -> i64 {
                 None => KernelError::NoProcess.sysret(),
             }
         }
-        PRIO_PGRP | PRIO_USER => {
+        PRIO_PGRP => {
+            // The highest priority of any thread in the group (Linux:
+            // the largest 20 - nice)
+            let pgid = if who == 0 {
+                super::percpu::current_pgid()
+            } else {
+                who
+            };
+            super::percpu::get_tids_by_pgid(pgid)
+                .into_iter()
+                .filter_map(super::percpu::lookup_task_priority)
+                .map(|p| (20 - priority_to_nice(p)) as i64)
+                .max()
+                .unwrap_or(KernelError::NoProcess.sysret())
+        }
+        PRIO_USER => {
             // Not implemented yet - would require task iteration
             KernelError::NoProcess.sysret() // Return ESRCH for now (no matching processes)
         }
         _ => KernelError::InvalidArgument.sysret(),
+    }
+}
+
+/// Set task `tid`'s nice value (Linux set_one_prio): EPERM unless the
+/// caller's euid is its uid or euid or the caller has CAP_SYS_NICE;
+/// EACCES for a lower nice beyond RLIMIT_NICE without CAP_SYS_NICE.
+/// `error` is the result so far: a success turns ESRCH into 0.
+fn set_one_prio(tid: Pid, niceval: i32, caller_euid: super::Uid, error: i64) -> i64 {
+    use super::{CAP_SYS_NICE, capable, nice_to_priority, priority_to_nice};
+    let Some(prio) = super::percpu::lookup_task_priority(tid) else {
+        return error;
+    };
+    let target = super::percpu::TASKLIST.read().get(tid).map(|t| t.cred());
+    let Some(c) = target else {
+        return error;
+    };
+    if c.uid != caller_euid && c.euid != caller_euid && !capable(CAP_SYS_NICE) {
+        return KernelError::NotPermitted.sysret();
+    }
+    // Linux can_nice: 20 - nice within the target's RLIMIT_NICE
+    let rlim = crate::rlimit::get_task_rlimit(tid, crate::rlimit::RLIMIT_NICE)
+        .map_or(crate::rlimit::RLIM_INFINITY, |r| r.rlim_cur);
+    let lower = niceval < priority_to_nice(prio);
+    if lower && (20 - niceval) as u64 > rlim && !capable(CAP_SYS_NICE) {
+        return KernelError::PermissionDenied.sysret();
+    }
+    match super::percpu::set_task_priority(tid, nice_to_priority(niceval)) {
+        Ok(()) if error == KernelError::NoProcess.sysret() => 0,
+        Ok(()) => error,
+        Err(errno) => -(errno as i64),
     }
 }
 
@@ -118,9 +163,7 @@ pub fn sys_setpriority(
     caller_pid: Pid,
     caller_euid: super::Uid,
 ) -> i64 {
-    use super::{
-        PRIO_MAX, PRIO_MIN, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, nice_to_priority, priority_to_nice,
-    };
+    use super::{PRIO_MAX, PRIO_MIN, PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
 
     // Clamp nice value to valid range (Linux does this)
     let niceval = niceval.clamp(PRIO_MIN, PRIO_MAX);
@@ -128,26 +171,28 @@ pub fn sys_setpriority(
     match which {
         PRIO_PROCESS => {
             let target_pid = if who == 0 { caller_pid } else { who };
-
-            // Get current priority to check permissions
-            let current_nice = match super::percpu::lookup_task_priority(target_pid) {
-                Some(priority) => priority_to_nice(priority),
-                None => return KernelError::NoProcess.sysret(),
-            };
-
-            // Permission check: non-root cannot raise priority (lower nice value)
-            if caller_euid != 0 && niceval < current_nice {
-                return KernelError::PermissionDenied.sysret();
-            }
-
-            // Set the new priority
-            let new_priority = nice_to_priority(niceval);
-            match super::percpu::set_task_priority(target_pid, new_priority) {
-                Ok(()) => 0,
-                Err(errno) => -(errno as i64),
-            }
+            set_one_prio(
+                target_pid,
+                niceval,
+                caller_euid,
+                KernelError::NoProcess.sysret(),
+            )
         }
-        PRIO_PGRP | PRIO_USER => {
+        PRIO_PGRP => {
+            // Every thread of the group (Linux set_one_prio each): the
+            // first success clears ESRCH, an error stays
+            let pgid = if who == 0 {
+                super::percpu::current_pgid()
+            } else {
+                who
+            };
+            let mut ret = KernelError::NoProcess.sysret();
+            for tid in super::percpu::get_tids_by_pgid(pgid) {
+                ret = set_one_prio(tid, niceval, caller_euid, ret);
+            }
+            ret
+        }
+        PRIO_USER => {
             // Not implemented yet
             KernelError::NoProcess.sysret()
         }
@@ -606,7 +651,7 @@ pub fn sys_sched_rr_get_interval<A: crate::uaccess::UaccessArch>(
 pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
     use super::{
         IOPRIO_CLASS_IDLE, IOPRIO_CLASS_RT, IOPRIO_WHO_PGRP, IOPRIO_WHO_PROCESS, IOPRIO_WHO_USER,
-        get_task_io_context, ioprio_prio_class, ioprio_valid,
+        ioprio_prio_class, ioprio_valid,
     };
 
     let ioprio = ioprio as u16;
@@ -633,17 +678,8 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
             };
 
             // Get or create IoContext for the target
-            let ctx = match get_task_io_context(tid) {
-                Some(ctx) => ctx,
-                None => {
-                    // Create a new context if target exists
-                    if !super::percpu::task_exists(tid) {
-                        return KernelError::NoProcess.sysret();
-                    }
-                    let ctx = alloc::sync::Arc::new(super::IoContext::new());
-                    super::set_task_io_context(tid, ctx.clone());
-                    ctx
-                }
+            let Some(ctx) = super::task_io_context(tid) else {
+                return KernelError::NoProcess.sysret();
             };
 
             ctx.set_ioprio(ioprio);
@@ -663,15 +699,9 @@ pub fn sys_ioprio_set(which: i32, who: i32, ioprio: i32) -> i64 {
             }
 
             for tid in tids {
-                let ctx = match get_task_io_context(tid) {
-                    Some(ctx) => ctx,
-                    None => {
-                        let ctx = alloc::sync::Arc::new(super::IoContext::new());
-                        super::set_task_io_context(tid, ctx.clone());
-                        ctx
-                    }
-                };
-                ctx.set_ioprio(ioprio);
+                if let Some(ctx) = super::task_io_context(tid) {
+                    ctx.set_ioprio(ioprio);
+                }
             }
             0
         }

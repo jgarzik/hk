@@ -13,7 +13,7 @@
 //!
 //! ## Timers
 //!
-//! One kernel timer (`ktimerd`, thread context) serves all tables: each
+//! One kernel timer (`ktimers/N`, thread context) serves all tables: each
 //! entry keeps its own deadline; the callback runs every table's due
 //! entries and GC, then re-arms for the earliest deadline.
 //!
@@ -24,7 +24,7 @@
 //! table lock. No packet is transmitted, solicited or reported while
 //! `inner` is held: state changes return actions that run after the
 //! unlock. `TABLES` and `TIMER` (`crate::sync::spin::Mutex`) are leaves except that
-//! `TIMER` is held across `timer_add/del` (-> the timer IrqSpinlock).
+//! `TIMER` is held across arming (-> the timer base IrqSpinlock).
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -799,7 +799,7 @@ fn arm(at: u64) {
     ALARM.arm(at.saturating_mul(1_000_000));
 }
 
-/// Timer callback (ktimerd): run every table, re-arm for the earliest
+/// Timer callback (ktimers/N): run every table, re-arm for the earliest
 /// deadline
 fn neigh_timer(_: u64) {
     ALARM.fired();

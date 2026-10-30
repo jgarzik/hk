@@ -48,7 +48,7 @@ use crate::sync::spin::Mutex;
 
 use crate::arch::IrqSpinlock;
 use crate::task::Tid;
-use crate::task::percpu::{SCHEDULING_ENABLED, get_ticks};
+use crate::task::percpu::get_ticks;
 use crate::waitqueue::WaitQueue;
 
 // ============================================================================
@@ -507,8 +507,8 @@ fn worker_thread_fn(arg: usize) {
 ///
 /// Call after the schedulers are up (main.rs, before user space).
 pub fn init() {
-    if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
-        panic!("workqueue::init() called before scheduling enabled");
+    if !crate::task::percpu::cpu_has_scheduler(crate::cpu::this_id()) {
+        panic!("workqueue::init() called before the scheduler runs");
     }
     match SYSTEM_WQ.start(None) {
         Ok(()) => crate::printkln!("Workqueue subsystem initialized"),

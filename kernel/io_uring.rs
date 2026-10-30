@@ -124,6 +124,8 @@ pub const IORING_OP_SYNC_FILE_RANGE: u8 = 8;
 pub const IORING_OP_SENDMSG: u8 = 9;
 pub const IORING_OP_RECVMSG: u8 = 10;
 pub const IORING_OP_TIMEOUT: u8 = 11;
+/// IORING_OP_TIMEOUT on CLOCK_REALTIME (Linux IORING_TIMEOUT_REALTIME)
+pub const IORING_TIMEOUT_REALTIME: u32 = 1 << 3;
 pub const IORING_OP_TIMEOUT_REMOVE: u8 = 12;
 pub const IORING_OP_ACCEPT: u8 = 13;
 pub const IORING_OP_ASYNC_CANCEL: u8 = 14;
@@ -1037,19 +1039,19 @@ impl IoUring {
             .saturating_mul(1_000_000_000)
             .saturating_add(tv_nsec as u64);
 
-        // Get current time in nanoseconds
-        let current_time = crate::time::TIMEKEEPER.current_time();
-        let now_ns = (current_time.sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(current_time.nsec as u64);
-
-        // For absolute time, use as-is; for relative, add current time
+        // On CLOCK_MONOTONIC unless IORING_TIMEOUT_REALTIME (Linux
+        // io_timeout_get_clock); an absolute deadline is on that clock
+        let realtime = sqe.op_flags & IORING_TIMEOUT_REALTIME != 0;
+        let now_ns = if realtime {
+            crate::time::realtime_ns()
+        } else {
+            crate::time::monotonic_ns()
+        };
         let is_abs = (sqe.op_flags & 0x1) != 0; // IORING_TIMEOUT_ABS
         let deadline_ns = if is_abs {
             timeout_ns
         } else {
-            // Get current time and add timeout
-            now_ns.saturating_add(timeout_ns)
+            crate::time::deadline_after(now_ns, timeout_ns)
         };
 
         // If count is 0, this is a pure timeout
@@ -1327,9 +1329,16 @@ fn read_user_iovec(iov_addr: u64, i: usize) -> Result<IoVec, i32> {
     copy_val_from_user::<Uaccess, IoVec>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
 }
 
-/// Copy an `int fds[n]` array from user space
+/// Most registered files (Linux IORING_MAX_FIXED_FILES)
+const IORING_MAX_FIXED_FILES: usize = 1 << 15;
+
+/// Copy an `int fds[n]` array from user space (EMFILE over
+/// IORING_MAX_FIXED_FILES, as Linux io_sqe_files_register)
 fn read_user_fds(arg: u64, n: usize) -> Result<Vec<i32>, KernelError> {
-    let mut fds = alloc::vec![0i32; n];
+    if n > IORING_MAX_FIXED_FILES {
+        return Err(KernelError::ProcessFileLimit);
+    }
+    let mut fds = crate::kmem::try_vec(n, 0i32)?;
     // SAFETY: byte view of the `n` initialized i32 elements of `fds`
     let bytes = unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr() as *mut u8, n * 4) };
     copy_from_user::<Uaccess>(bytes, arg, n * 4).map_err(|_| KernelError::BadAddress)?;

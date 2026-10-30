@@ -79,7 +79,10 @@ pub fn keyctl_update(key_serial: i32, payload_ptr: u64, plen: usize) -> i64 {
         return KernelError::KeyRevoked.sysret();
     }
 
-    // Copy payload from userspace
+    // Copy payload from userspace (at most a page, Linux keyctl_update)
+    if plen > crate::mm::PAGE_SIZE as usize {
+        return KernelError::InvalidArgument.sysret();
+    }
     let payload = if plen > 0 && payload_ptr != 0 {
         let mut buf = vec![0u8; plen];
         if copy_from_user::<Uaccess>(&mut buf, payload_ptr, plen).is_err() {
@@ -444,11 +447,21 @@ pub fn keyctl_read(key_serial: i32, buffer_ptr: u64, buflen: usize) -> i64 {
         };
     }
 
-    // Read into buffer
-    let mut buffer = vec![0u8; buflen];
+    // Read into a buffer no larger than the payload (Linux
+    // keyctl_read_key sizes it by the key)
+    let need = match key.key_type().read(&key, &mut []) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let mut buffer = match crate::kmem::try_vec(buflen.min(need), 0u8) {
+        Ok(b) => b,
+        Err(e) => return e.sysret(),
+    };
     match key.key_type().read(&key, &mut buffer) {
         Ok(actual_len) => {
-            let copy_len = core::cmp::min(actual_len, buflen);
+            // The payload may have grown since it was sized: copy only
+            // what the buffer holds
+            let copy_len = actual_len.min(buffer.len());
             if copy_len > 0 && copy_to_user::<Uaccess>(buffer_ptr, &buffer[..copy_len]).is_err() {
                 return KernelError::BadAddress.sysret();
             }

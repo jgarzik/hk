@@ -139,6 +139,9 @@ pub fn set_user_regs(tid: Tid, regs: &UserRegsStruct) -> Result<(), i32> {
     tf.r9 = regs.r9;
     tf.r8 = regs.r8;
     tf.rax = regs.rax;
+    // The syscall number: a tracer at a syscall-entry stop changes or
+    // (-1) skips the syscall (Linux putreg orig_ax)
+    tf.orig_rax = regs.orig_rax;
     tf.rcx = regs.rcx;
     tf.rdx = regs.rdx;
     tf.rsi = regs.rsi;

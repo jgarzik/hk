@@ -50,7 +50,12 @@ pub fn rmap_walk(
         return true;
     };
     let index = pg.index.load(Ordering::Relaxed);
-    let chain = av.read();
+    // Reclaim (PF_MEMALLOC) only tries: the allocating task may hold
+    // this chain for writing (Linux rmap_walk_anon with rwc->try_lock)
+    let reclaiming = crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC);
+    let Some(chain) = av.read_for(reclaiming) else {
+        return false;
+    };
     for avc in chain.iter() {
         let Some(addr) = avc.address(index) else {
             continue;

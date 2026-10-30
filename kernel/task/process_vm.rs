@@ -18,6 +18,10 @@ use crate::uaccess::{UaccessArch, copy_from_user, copy_to_user};
 /// Maximum number of iovec entries (same as IOV_MAX)
 const IOV_MAX: usize = 1024;
 
+/// Bytes copied per step: the bounce buffer stays small whatever the
+/// iovec lengths (Linux copies page by page)
+const PVM_CHUNK: usize = 64 * 1024;
+
 /// sys_process_vm_readv - Read from another process's memory
 ///
 /// # Arguments
@@ -107,7 +111,7 @@ pub fn sys_process_vm_readv(
                 continue;
             }
 
-            let to_transfer = remote_remaining.min(local_remaining);
+            let to_transfer = remote_remaining.min(local_remaining).min(PVM_CHUNK);
 
             // Read from remote into kernel buffer
             let mut buf = alloc::vec![0u8; to_transfer];
@@ -247,7 +251,7 @@ pub fn sys_process_vm_writev(
                 continue;
             }
 
-            let to_transfer = remote_remaining.min(local_remaining);
+            let to_transfer = remote_remaining.min(local_remaining).min(PVM_CHUNK);
 
             // Read from local user buffer into kernel buffer
             let mut buf = alloc::vec![0u8; to_transfer];

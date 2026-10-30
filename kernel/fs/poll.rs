@@ -9,7 +9,7 @@ use alloc::vec;
 
 use crate::arch::Uaccess;
 use crate::fs::KernelError;
-use crate::signal::{SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
+use crate::signal::SigSet;
 use crate::task::percpu::current_tid;
 
 use super::syscall::current_fd_table;
@@ -18,72 +18,100 @@ use super::syscall::current_fd_table;
 // Signal Mask Helpers for ppoll/pselect6
 // =============================================================================
 
-/// Save current blocked mask and set new mask atomically for ppoll/pselect6
-///
-/// Returns the old mask that should be restored after polling
+/// Install ppoll/pselect6's temporary mask (TIF_RESTORE_SIGMASK);
+/// returns the old one
 fn set_poll_sigmask(new_mask: SigSet) -> Option<SigSet> {
-    let tid = current_tid();
-    with_task_signal_state(tid, |state| {
-        let old = state.blocked;
-        // Save to saved_sigmask for potential signal handler restoration
-        state.saved_sigmask = Some(old);
-        // Set new mask, never allow blocking SIGKILL/SIGSTOP
-        state.blocked = new_mask.subtract(&UNMASKABLE_SIGNALS);
-        state.recalc_sigpending();
-        old
-    })
+    crate::signal::set_temp_sigmask(new_mask)
 }
 
-/// Restore blocked mask after ppoll/pselect6
-fn restore_poll_sigmask(old_mask: SigSet) {
-    let tid = current_tid();
-    with_task_signal_state(tid, |state| {
-        state.blocked = old_mask;
-        state.saved_sigmask = None;
-        state.recalc_sigpending();
-    });
+/// Put the old mask back after ppoll/pselect6, unless a signal
+/// interrupted it (Linux poll_select_finish ->
+/// restore_saved_sigmask_unless)
+fn restore_poll_sigmask(result: i64) {
+    crate::signal::restore_saved_sigmask_unless(result == KernelError::RestartNoHand.sysret());
 }
 
 // =============================================================================
 // Poll sleep helpers
 // =============================================================================
 
-/// Absolute CLOCK_MONOTONIC deadline for a poll timeout in ms (<0 = none)
-fn poll_deadline(timeout_ms: i32) -> Option<u64> {
-    if timeout_ms < 0 {
-        None
-    } else {
-        Some(crate::time::monotonic_ns().saturating_add(timeout_ms as u64 * 1_000_000))
+use crate::time::{Deadline, deadline_ms as poll_deadline};
+
+/// The deadline of a (sec, nsec) timeout; EINVAL if invalid
+fn ts_deadline(sec: i64, nsec: i64) -> Result<Deadline, i64> {
+    crate::time::deadline_ts(sec, nsec).map_err(|e| e.sysret())
+}
+
+/// The user's timeout format
+#[derive(Clone, Copy)]
+enum PollTs {
+    Timeval,
+    Timespec,
+}
+
+/// Write the time left back to the user's timeout (Linux
+/// poll_select_finish): not for a zero timeout; a fault turns a restart
+/// into -EINTR (the restart could not see the time left)
+fn poll_finish(deadline: Deadline, uptr: u64, kind: PollTs, ret: i64) -> i64 {
+    use crate::uaccess::put_user;
+    let Some(end) = deadline.filter(|&d| d != 0 && uptr != 0) else {
+        return ret;
+    };
+    let left = end.saturating_sub(crate::time::monotonic_ns());
+    let (sec, ns) = ((left / 1_000_000_000) as i64, (left % 1_000_000_000) as i64);
+    let sub = match kind {
+        PollTs::Timeval => ns / 1000,
+        PollTs::Timespec => ns,
+    };
+    if put_user::<Uaccess, [i64; 2]>(uptr, [sec, sub]).is_ok() {
+        return ret;
+    }
+    if ret == KernelError::RestartNoHand.sysret() {
+        return KernelError::Interrupted.sysret();
+    }
+    ret
+}
+
+/// Read a user timeout (NULL = forever) as a [`Deadline`]; a timeval's
+/// microseconds carry into seconds like Linux kern_select
+fn read_ts(uptr: u64, kind: PollTs) -> Result<Deadline, i64> {
+    use crate::uaccess::get_user;
+    if uptr == 0 {
+        return Ok(None);
+    }
+    let [sec, sub] =
+        get_user::<Uaccess, [i64; 2]>(uptr).map_err(|_| KernelError::BadAddress.sysret())?;
+    match kind {
+        PollTs::Timespec => ts_deadline(sec, sub),
+        PollTs::Timeval if sub < 0 => Err(KernelError::InvalidArgument.sysret()),
+        PollTs::Timeval => ts_deadline(
+            sec.saturating_add(sub / 1_000_000),
+            (sub % 1_000_000) * 1000,
+        ),
     }
 }
 
 /// Called after a scan (done with the task state set Interruptible) found
 /// nothing ready: sleep until a registered wait queue fires, a signal, or
 /// the deadline. Returns `Some(retval)` when the poll must stop.
-fn poll_sleep(deadline: Option<u64>) -> Option<i64> {
-    use crate::task::percpu::{
-        SleepState, ns_to_ticks, schedule, schedule_timeout, set_current_state,
-    };
+fn poll_sleep(deadline: Deadline) -> Option<i64> {
+    use crate::task::percpu::{SleepState, set_current_state};
     if crate::waitqueue::signal_pending() {
         set_current_state(SleepState::Running);
         return Some(KernelError::RestartNoHand.sysret());
     }
-    match deadline {
-        None => schedule(),
-        Some(d) => {
-            let now = crate::time::monotonic_ns();
-            if now >= d {
-                set_current_state(SleepState::Running);
-                return Some(0);
-            }
-            schedule_timeout(ns_to_ticks(d - now));
-        }
+    if let Some(d) = deadline
+        && crate::time::monotonic_ns() >= d
+    {
+        set_current_state(SleepState::Running);
+        return Some(0);
     }
+    crate::hrtimer::schedule_hrtimeout(deadline, crate::hrtimer::HrClock::Monotonic);
     None
 }
 
 /// Sleep with nothing to poll: until the deadline (`Ok`) or a signal
-fn poll_sleep_only(deadline: Option<u64>) -> i64 {
+fn poll_sleep_only(deadline: Deadline) -> i64 {
     use crate::task::percpu::{SleepState, set_current_state};
     loop {
         set_current_state(SleepState::Interruptible);
@@ -220,7 +248,7 @@ pub fn sys_syncfs(fd: i32) -> i64 {
 /// * -EINVAL if nfds exceeds limit
 /// * -EINTR if interrupted by signal
 pub fn sys_poll(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
-    do_poll_internal(fds, nfds, timeout_ms)
+    do_poll_internal(fds, nfds, poll_deadline(timeout_ms))
 }
 
 /// Internal poll implementation
@@ -228,11 +256,11 @@ pub fn sys_poll(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
 /// # Arguments
 /// * `fds` - Pointer to array of pollfd structures
 /// * `nfds` - Number of fds in the array
-/// * `timeout_ms` - Timeout in milliseconds (-1 = infinite, 0 = immediate)
+/// * `deadline` - None = infinite, Some(0) = immediate, else CLOCK_MONOTONIC ns
 ///
 /// Sleeps on the polled files' wait queues; a deliverable signal ends the
 /// wait with -ERESTARTNOHAND (EINTR once a handler runs).
-fn do_poll_internal(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
+fn do_poll_internal(fds: u64, nfds: u32, deadline: Deadline) -> i64 {
     use crate::poll::{POLLNVAL, PollContext, PollFd, PollTable};
     use crate::task::percpu::{SleepState, set_current_state};
     use crate::uaccess::{copy_from_user, copy_to_user};
@@ -247,10 +275,10 @@ fn do_poll_internal(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
 
     // Empty poll: just sleep for the timeout (or until a signal)
     if nfds == 0 {
-        if timeout_ms == 0 {
+        if deadline == Some(0) {
             return 0;
         }
-        return poll_sleep_only(poll_deadline(timeout_ms));
+        return poll_sleep_only(deadline);
     }
 
     // Copy pollfd array from user space
@@ -267,7 +295,6 @@ fn do_poll_internal(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
 
     // Create poll context (wait queue registrations, dropped at return)
     let mut ctx = PollContext::new(tid);
-    let deadline = poll_deadline(timeout_ms);
     let mut first_pass = true;
     let mut ready_count;
 
@@ -277,7 +304,7 @@ fn do_poll_internal(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
 
         // Register on wait queues during the first scan only
         let mut poll_table = PollTable::new(&mut ctx);
-        if !first_pass || timeout_ms == 0 {
+        if !first_pass || deadline == Some(0) {
             poll_table.disable();
         }
         first_pass = false;
@@ -328,7 +355,7 @@ fn do_poll_internal(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
         drop(table);
 
         // If any fds are ready, or timeout is 0 (immediate), return
-        if ready_count > 0 || timeout_ms == 0 {
+        if ready_count > 0 || deadline == Some(0) {
             set_current_state(SleepState::Running);
             break;
         }
@@ -367,44 +394,11 @@ fn do_poll_internal(fds: u64, nfds: u32, timeout_ms: i32) -> i64 {
 /// # Returns
 /// Same as poll()
 pub fn sys_ppoll(fds: u64, nfds: u32, tmo_p: u64, sigmask_ptr: u64, sigsetsize: u64) -> i64 {
-    use crate::uaccess::{copy_from_user, get_user};
+    use crate::uaccess::get_user;
 
-    // Convert timespec to milliseconds (or -1 for infinite)
-    let timeout_ms = if tmo_p == 0 {
-        -1i32 // Infinite wait
-    } else {
-        // Read timespec from user
-        #[repr(C)]
-        #[derive(Default, Copy, Clone)]
-        struct Timespec {
-            tv_sec: i64,
-            tv_nsec: i64,
-        }
-
-        let mut ts = Timespec::default();
-        let ts_bytes = unsafe {
-            core::slice::from_raw_parts_mut(
-                &mut ts as *mut Timespec as *mut u8,
-                core::mem::size_of::<Timespec>(),
-            )
-        };
-
-        if copy_from_user::<Uaccess>(ts_bytes, tmo_p, core::mem::size_of::<Timespec>()).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
-
-        // Convert to milliseconds (clamped to i32 range)
-        let ms = ts
-            .tv_sec
-            .saturating_mul(1000)
-            .saturating_add(ts.tv_nsec / 1_000_000);
-        if ms > i32::MAX as i64 {
-            i32::MAX
-        } else if ms < 0 {
-            0
-        } else {
-            ms as i32
-        }
+    let deadline = match read_ts(tmo_p, PollTs::Timespec) {
+        Ok(d) => d,
+        Err(e) => return e,
     };
 
     // Handle signal mask atomically
@@ -427,18 +421,17 @@ pub fn sys_ppoll(fds: u64, nfds: u32, tmo_p: u64, sigmask_ptr: u64, sigsetsize: 
         None
     };
 
-    let result = do_poll_internal(fds, nfds, timeout_ms);
+    let result = do_poll_internal(fds, nfds, deadline);
 
     // Restore mask if we changed it, unless interrupted by a signal: then
     // the temporary mask stays in effect for signal delivery and do_signal()
     // restores saved_sigmask (Linux: restore_saved_sigmask_unless()).
-    if let Some(old) = saved_mask
-        && result != KernelError::RestartNoHand.sysret()
-    {
-        restore_poll_sigmask(old);
+    // Decided before the time left is written back, which may turn the
+    // restart into -EINTR (Linux poll_select_finish, in that order).
+    if saved_mask.is_some() {
+        restore_poll_sigmask(result);
     }
-
-    result
+    poll_finish(deadline, tmo_p, PollTs::Timespec, result)
 }
 
 // =============================================================================
@@ -465,47 +458,14 @@ pub fn sys_ppoll(fds: u64, nfds: u32, tmo_p: u64, sigmask_ptr: u64, sigsetsize: 
 /// * -EFAULT if any pointer is invalid
 /// * -EINTR if interrupted by signal
 pub fn sys_select(nfds: i32, readfds: u64, writefds: u64, exceptfds: u64, timeout: u64) -> i64 {
-    use crate::uaccess::copy_from_user;
-
-    // Read timeout if provided and convert to milliseconds
-    let timeout_ms = if timeout != 0 {
-        #[repr(C)]
-        #[derive(Default, Copy, Clone)]
-        struct Timeval {
-            tv_sec: i64,
-            tv_usec: i64,
-        }
-
-        let mut tv = Timeval::default();
-        let tv_bytes = unsafe {
-            core::slice::from_raw_parts_mut(
-                &mut tv as *mut Timeval as *mut u8,
-                core::mem::size_of::<Timeval>(),
-            )
-        };
-
-        if copy_from_user::<Uaccess>(tv_bytes, timeout, core::mem::size_of::<Timeval>()).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
-
-        // Convert to milliseconds
-        let ms = tv
-            .tv_sec
-            .saturating_mul(1000)
-            .saturating_add(tv.tv_usec / 1000);
-        if ms > i32::MAX as i64 {
-            i32::MAX
-        } else if ms < 0 {
-            0
-        } else {
-            ms as i32
-        }
-    } else {
-        -1i32 // Infinite wait
+    let deadline = match read_ts(timeout, PollTs::Timeval) {
+        Ok(d) => d,
+        Err(e) => return e,
     };
 
     // select() doesn't change signal mask, so don't return EINTR for most signals
-    do_select_internal(nfds, readfds, writefds, exceptfds, timeout_ms)
+    let r = do_select_internal(nfds, readfds, writefds, exceptfds, deadline);
+    poll_finish(deadline, timeout, PollTs::Timeval, r)
 }
 
 /// pselect6 - synchronous I/O multiplexing with timespec and signal mask
@@ -531,43 +491,11 @@ pub fn sys_pselect6(
     timeout: u64,
     sigmask: u64,
 ) -> i64 {
-    use crate::uaccess::{copy_from_user, get_user};
+    use crate::uaccess::get_user;
 
-    // Convert timespec to milliseconds
-    let timeout_ms = if timeout != 0 {
-        #[repr(C)]
-        #[derive(Default, Copy, Clone)]
-        struct Timespec {
-            tv_sec: i64,
-            tv_nsec: i64,
-        }
-
-        let mut ts = Timespec::default();
-        let ts_bytes = unsafe {
-            core::slice::from_raw_parts_mut(
-                &mut ts as *mut Timespec as *mut u8,
-                core::mem::size_of::<Timespec>(),
-            )
-        };
-
-        if copy_from_user::<Uaccess>(ts_bytes, timeout, core::mem::size_of::<Timespec>()).is_err() {
-            return KernelError::BadAddress.sysret();
-        }
-
-        // Convert to milliseconds
-        let ms = ts
-            .tv_sec
-            .saturating_mul(1000)
-            .saturating_add(ts.tv_nsec / 1_000_000);
-        if ms > i32::MAX as i64 {
-            i32::MAX
-        } else if ms < 0 {
-            0
-        } else {
-            ms as i32
-        }
-    } else {
-        -1i32 // Infinite wait
+    let deadline = match read_ts(timeout, PollTs::Timespec) {
+        Ok(d) => d,
+        Err(e) => return e,
     };
 
     // Handle signal mask atomically
@@ -603,34 +531,33 @@ pub fn sys_pselect6(
         None
     };
 
-    let result = do_select_internal(nfds, readfds, writefds, exceptfds, timeout_ms);
+    let result = do_select_internal(nfds, readfds, writefds, exceptfds, deadline);
 
     // Restore mask if we changed it, unless interrupted by a signal: then
     // the temporary mask stays in effect for signal delivery and do_signal()
     // restores saved_sigmask (Linux: restore_saved_sigmask_unless()).
-    if let Some(old) = saved_mask
-        && result != KernelError::RestartNoHand.sysret()
-    {
-        restore_poll_sigmask(old);
+    // Decided before the time left is written back, which may turn the
+    // restart into -EINTR (Linux poll_select_finish, in that order).
+    if saved_mask.is_some() {
+        restore_poll_sigmask(result);
     }
-
-    result
+    poll_finish(deadline, timeout, PollTs::Timespec, result)
 }
 
-/// Internal select implementation that takes timeout in milliseconds
+/// Internal select implementation (see [`Deadline`])
 ///
 /// # Arguments
 /// * `nfds` - Highest-numbered fd in any of the sets, plus 1
 /// * `readfds` - Optional pointer to fd_set for read readiness
 /// * `writefds` - Optional pointer to fd_set for write readiness
 /// * `exceptfds` - Optional pointer to fd_set for exceptional conditions
-/// * `timeout_ms` - Timeout in milliseconds (-1 = infinite, 0 = immediate)
+/// * `deadline` - None = infinite, Some(0) = immediate, else CLOCK_MONOTONIC ns
 fn do_select_internal(
     nfds: i32,
     readfds: u64,
     writefds: u64,
     exceptfds: u64,
-    timeout_ms: i32,
+    deadline: Deadline,
 ) -> i64 {
     use crate::poll::{FdSet, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, PollContext, PollTable};
     use crate::task::percpu::{SleepState, set_current_state};
@@ -646,10 +573,10 @@ fn do_select_internal(
 
     // Empty select: just sleep for the timeout (or until a signal)
     if nfds == 0 && readfds == 0 && writefds == 0 && exceptfds == 0 {
-        if timeout_ms == 0 {
+        if deadline == Some(0) {
             return 0;
         }
-        return poll_sleep_only(poll_deadline(timeout_ms));
+        return poll_sleep_only(deadline);
     }
 
     // Calculate how many bytes to copy
@@ -695,7 +622,6 @@ fn do_select_internal(
     let mut out_write;
     let mut out_except;
 
-    let deadline = poll_deadline(timeout_ms);
     let mut first_pass = true;
     let mut ready_count;
 
@@ -704,7 +630,7 @@ fn do_select_internal(
         set_current_state(SleepState::Interruptible);
         // Register on wait queues during the first scan only
         let mut poll_table = PollTable::new(&mut ctx);
-        if !first_pass || timeout_ms == 0 {
+        if !first_pass || deadline == Some(0) {
             poll_table.disable();
         }
         first_pass = false;
@@ -780,7 +706,7 @@ fn do_select_internal(
         drop(table);
 
         // If any fds are ready, or timeout is 0 (immediate), return
-        if ready_count > 0 || timeout_ms == 0 {
+        if ready_count > 0 || deadline == Some(0) {
             set_current_state(SleepState::Running);
             break;
         }

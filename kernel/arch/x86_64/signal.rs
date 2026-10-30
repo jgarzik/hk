@@ -484,7 +484,6 @@ pub fn sys_rt_sigreturn() -> i64 {
     let tid = crate::task::percpu::current_tid();
     crate::signal::with_task_signal_state(tid, |state| {
         state.blocked = uc.uc_sigmask;
-        state.recalc_sigpending();
     });
 
     // Restore all registers from sigcontext to pt_regs (Linux

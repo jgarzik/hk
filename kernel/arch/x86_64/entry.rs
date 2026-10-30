@@ -108,10 +108,12 @@ pub unsafe extern "C" fn syscall_entry() {
 /// off again on return; true if the return may use SYSRET
 extern "C" fn do_syscall_64(regs: &mut PtRegs) -> bool {
     crate::arch::x86_64::interrupts::enable();
-    let nr = regs.orig_rax;
-    regs.rax = super::syscall::x86_64_syscall_dispatch(
-        nr, regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9,
-    );
+    let nr = crate::entry::syscall_enter_from_user_mode(regs);
+    if nr != u64::MAX {
+        regs.rax = super::syscall::x86_64_syscall_dispatch(
+            nr, regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9,
+        );
+    }
     // Signals, -ERESTART* rules, rescheduling before returning to user
     // space (they may redirect the frame to a handler or back up over
     // the syscall instruction; rt_sigreturn restored a whole user

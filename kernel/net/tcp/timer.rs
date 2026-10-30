@@ -15,12 +15,12 @@
 //!
 //! Connections and timewait entries register their earliest deadline in
 //! `TIMERS` (a `crate::sync::spin::Mutex` leaf: deadline-ordered map of weak
-//! handles). One `timer::Alarm` (ktimerd) is armed for the earliest
+//! handles). One `timer::Alarm` (ktimers/N) is armed for the earliest
 //! deadline; it only raises a flag and wakes `softnet/0` (decision 1:
 //! protocol timers run in softnet), which calls [`run`]: due entries are
 //! taken out under `TIMERS`, then each is processed under its own socket
 //! lock with `TIMERS` dropped. Order: socket lock -> `TIMERS` ->
-//! `Alarm.st` -> kernel `TIMERS` (IrqSpinlock).
+//! `Alarm.st` -> the timer base (IrqSpinlock).
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};

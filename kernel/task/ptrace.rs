@@ -399,19 +399,38 @@ fn ptrace_detach(target_pid: Pid, signal: u32) -> i64 {
         target.ptrace = 0;
         target.ptracer = None;
         target.ptrace_options = 0;
-
-        // Change state from Traced to Ready (this wakes the task)
-        if matches!(target.state, TaskState::Traced(_)) {
-            target.state = TaskState::Ready;
-        }
+        target.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
     }
+    crate::arch::ptrace::disable_single_step(target_tid);
 
-    // Inject signal if requested
-    if signal > 0 && signal < 64 {
-        signal::send_signal(target_tid, signal);
-    }
-
+    // Resume it, delivering `signal` (Linux ptrace_detach: exit_code)
+    ptrace_wake(target_tid, resume_sig(signal));
     0
+}
+
+/// A resume's signal argument: the signal to deliver, 0 for none
+fn resume_sig(sig: u32) -> u32 {
+    if sig < 65 { sig } else { 0 }
+}
+
+/// Let a stopped tracee go on with `sig` to deliver (Linux
+/// ptrace_resume: exit_code, wake_up_state(__TASK_TRACED))
+fn ptrace_wake(tid: Tid, sig: u32) {
+    let task = {
+        let mut table = TASKLIST.write();
+        let Some(mut t) = table.get_mut(tid) else {
+            return;
+        };
+        if !matches!(t.state, TaskState::Traced(_)) {
+            return;
+        }
+        t.state = TaskState::Ready;
+        t.ptrace_code = sig;
+        table.task(tid)
+    };
+    if let Some(t) = task {
+        percpu::try_to_wake_up(&t, percpu::WakeMode::Any);
+    }
 }
 
 // =============================================================================
@@ -443,37 +462,34 @@ fn ptrace_resume(target_pid: Pid, request: i64, signal: u32) -> i64 {
         };
 
         // Update ptrace flags based on request
+        use crate::task::tif::SYSCALL_TRACE;
         match request {
             PTRACE_CONT => {
                 target.ptrace &= !(PT_SYSCALL_TRACE | PT_SINGLESTEP);
+                target.task.clear_tif(SYSCALL_TRACE);
             }
             PTRACE_SYSCALL => {
                 target.ptrace |= PT_SYSCALL_TRACE;
                 target.ptrace &= !PT_SINGLESTEP;
+                target.task.set_tif(SYSCALL_TRACE);
             }
             PTRACE_SINGLESTEP => {
                 target.ptrace |= PT_SINGLESTEP;
                 target.ptrace &= !PT_SYSCALL_TRACE;
-                // Architecture-specific single-step setup
-                crate::arch::ptrace::enable_single_step(target_tid);
+                target.task.clear_tif(SYSCALL_TRACE);
             }
             _ => return -EINVAL,
         }
-
-        // Clear singlestep if not single-stepping
-        if request != PTRACE_SINGLESTEP {
-            crate::arch::ptrace::disable_single_step(target_tid);
-        }
-
-        // Change state from Traced to Ready (this wakes the task)
-        target.state = TaskState::Ready;
     }
 
-    // Inject signal if requested
-    if signal > 0 && signal < 64 {
-        signal::send_signal(target_tid, signal);
+    // The trap flag (these take TASKLIST themselves)
+    if request == PTRACE_SINGLESTEP {
+        crate::arch::ptrace::enable_single_step(target_tid);
+    } else {
+        crate::arch::ptrace::disable_single_step(target_tid);
     }
 
+    ptrace_wake(target_tid, resume_sig(signal));
     0
 }
 
@@ -511,6 +527,15 @@ fn ptrace_kill(target_pid: Pid) -> i64 {
 // PTRACE_PEEKDATA / PTRACE_POKEDATA implementation
 // =============================================================================
 
+/// The tracer may read and write the tracee's memory (Linux
+/// ptrace_access_vm): its mm is dumpable, or the tracer has
+/// CAP_SYS_PTRACE. A tracee that became non-dumpable after the attach
+/// (setuid, PR_SET_DUMPABLE) keeps its memory.
+fn may_access_vm(mm: &crate::mm::MmRef) -> bool {
+    use crate::task::dumpable::SUID_DUMP_USER;
+    mm.dumpable() == SUID_DUMP_USER || capable(CAP_SYS_PTRACE)
+}
+
 /// Get target's memory descriptor and page table root
 fn get_target_mm_and_pt(target_tid: Tid) -> Option<(crate::mm::MmRef, u64)> {
     // A user reference: the address space cannot be torn down while we
@@ -521,7 +546,7 @@ fn get_target_mm_and_pt(target_tid: Tid) -> Option<(crate::mm::MmRef, u64)> {
 }
 
 /// Read a word from tracee's memory.
-fn ptrace_peek_data(target_pid: Pid, addr: u64) -> i64 {
+fn ptrace_peek_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
     let target_tid = match find_task_by_pid(target_pid) {
         Some(tid) => tid,
         None => return -ESRCH,
@@ -537,14 +562,25 @@ fn ptrace_peek_data(target_pid: Pid, addr: u64) -> i64 {
         Some(x) => x,
         None => return -ESRCH,
     };
+    if !may_access_vm(&target_mm) {
+        return -EIO;
+    }
 
     // Lock mm and read from tracee
     let mm_guard = target_mm.mmap_read();
     let mut buf = [0u8; 8];
     match crate::mm::remote::access_remote_vm_read(&target_mm, &mm_guard, addr, &mut buf) {
+        // The raw syscall stores the word at `data` and returns 0
+        // (Linux generic_ptrace_peekdata; libc returns the word)
         Ok(8) => {
-            // Return the word value
-            i64::from_ne_bytes(buf)
+            drop(mm_guard);
+            match crate::uaccess::put_user::<crate::arch::Uaccess, u64>(
+                data,
+                u64::from_ne_bytes(buf),
+            ) {
+                Ok(()) => 0,
+                Err(_) => -EFAULT,
+            }
         }
         _ => -EIO,
     }
@@ -567,6 +603,9 @@ fn ptrace_poke_data(target_pid: Pid, addr: u64, data: u64) -> i64 {
         Some(x) => x,
         None => return -ESRCH,
     };
+    if !may_access_vm(&target_mm) {
+        return -EIO;
+    }
 
     // Lock mm and write to tracee
     let mm_guard = target_mm.mmap_read();
@@ -729,70 +768,140 @@ fn ptrace_setregs(target_pid: Pid, data: u64) -> i64 {
 // Ptrace stop handling
 // =============================================================================
 
-/// Enter ptrace stop state.
-///
-/// Called when a traced task should stop (signal delivery, syscall trap, etc.).
-/// This puts the task in Traced state and wakes the tracer.
-pub fn ptrace_stop(sig: u32) {
+/// Stop for the tracer (Linux ptrace_stop): the stop is reported to its
+/// wait with `code`, and the task sleeps until the tracer resumes it,
+/// detaches or exits, or SIGKILL. Returns the signal the tracer left to
+/// deliver (0: none; always 0 when killed).
+pub fn ptrace_stop(code: u32) -> u32 {
+    use percpu::{SleepState, schedule, set_current_state};
     let tid = percpu::current_tid();
-
-    // Set task state to Traced and wake tracer
-    {
+    let tracer = {
         let mut table = TASKLIST.write();
-        let tracer_tid = if let Some(mut task) = table.get_mut(tid) {
-            task.state = TaskState::Traced(sig as i32);
-            task.tracer().map(|t| t.tid())
-        } else {
-            None
+        let Some(mut t) = table.get_mut(tid) else {
+            return 0;
         };
-
-        // Wake up the tracer (if any) so it can collect the stop via wait()
-        if let Some(tracer_tid) = tracer_tid
-            && let Some(mut tracer) = table.get_mut(tracer_tid)
-            && matches!(tracer.state, TaskState::Sleeping)
-        {
-            tracer.state = TaskState::Ready;
+        if t.ptrace == 0 {
+            return code;
         }
+        t.state = TaskState::Traced(code as i32);
+        t.ptrace_code = code;
+        t.tracer()
+    };
+    // The tracer's wait finds the stop; SIGCHLD tells it (Linux
+    // do_notify_parent_cldstop, CLD_TRAPPED)
+    super::proc::CHILD_EXIT_WQ.wake_all();
+    if let Some(tr) = tracer {
+        signal::send_signal_to_process(tr.pid, signal::SIGCHLD);
     }
-
-    // Yield CPU - we're now stopped
-    percpu::yield_now();
+    loop {
+        set_current_state(SleepState::Killable);
+        if !stopped(tid) || signal::fatal_signal_pending() {
+            break;
+        }
+        schedule();
+    }
+    set_current_state(SleepState::Running);
+    let mut table = TASKLIST.write();
+    let Some(mut t) = table.get_mut(tid) else {
+        return 0;
+    };
+    // Killed while stopped: no longer reported, nothing delivered
+    if matches!(t.state, TaskState::Traced(_)) {
+        t.state = TaskState::Ready;
+        t.ptrace_code = 0;
+        return 0;
+    }
+    core::mem::take(&mut t.ptrace_code)
 }
 
-/// Report a syscall entry/exit to tracer.
-///
-/// Called at syscall entry (if PTRACE_SYSCALL is active) to stop and let
-/// the tracer inspect/modify the syscall.
+/// The current task is in a ptrace stop
+fn stopped(tid: Tid) -> bool {
+    let table = TASKLIST.read();
+    table
+        .get(tid)
+        .is_some_and(|t| matches!(t.state, TaskState::Traced(_)))
+}
+
+/// A PTRACE_SYSCALL stop at syscall entry or exit (Linux
+/// ptrace_report_syscall): SIGTRAP, | 0x80 with PTRACE_O_TRACESYSGOOD; a
+/// signal the tracer leaves is sent to the task
 pub fn ptrace_report_syscall(entry: bool) {
     let tid = percpu::current_tid();
-
-    // Check if syscall tracing is active
-    if !has_syscall_trace(tid) {
-        return;
-    }
-
-    // Get options to check for TRACESYSGOOD
     let options = {
-        let table = TASKLIST.read();
-        table.get(tid).map(|t| t.ptrace_options).unwrap_or(0)
+        let mut table = TASKLIST.write();
+        let Some(mut t) = table.get_mut(tid) else {
+            return;
+        };
+        if t.ptrace & PT_SYSCALL_TRACE == 0 {
+            return;
+        }
+        t.ptrace_message = if entry { 1 } else { 2 };
+        t.ptrace_options
     };
-
-    // Signal number is SIGTRAP, optionally with 0x80 bit for TRACESYSGOOD
-    let sig = if options & PTRACE_O_TRACESYSGOOD != 0 {
+    let code = if options & PTRACE_O_TRACESYSGOOD != 0 {
         SIGTRAP | 0x80
     } else {
         SIGTRAP
     };
+    let sig = ptrace_stop(code);
+    if sig != 0 {
+        signal::send_signal(tid, sig);
+    }
+}
 
-    // Store whether this is entry or exit in ptrace_message
+/// A traced task dequeued `sig` (not SIGKILL): the tracer sees it first
+/// (Linux ptrace_signal) and may cancel it (0) or change it
+pub fn ptrace_signal(sig: u32) -> u32 {
+    if !is_traced(percpu::current_tid()) {
+        return sig;
+    }
+    ptrace_stop(sig)
+}
+
+/// The exiting task's tracees are detached (Linux exit_ptrace): stopped
+/// ones go on, and PTRACE_O_EXITKILL ones are killed
+pub fn exit_ptrace() {
+    let me = percpu::current();
+    // Most tasks trace nothing: look under the read lock first
+    let traces = TASKLIST
+        .read()
+        .iter()
+        .any(|t| t.ptrace != 0 && t.traced_by(&me));
+    if !traces {
+        return;
+    }
+    let mut gone = alloc::vec::Vec::new();
     {
         let mut table = TASKLIST.write();
-        if let Some(mut task) = table.get_mut(tid) {
-            task.ptrace_message = if entry { 1 } else { 2 };
+        let tids: alloc::vec::Vec<Tid> = table
+            .iter()
+            .filter(|t| t.ptrace != 0 && t.traced_by(&me))
+            .map(|t| t.task.tid())
+            .collect();
+        for tid in tids {
+            let Some(mut t) = table.get_mut(tid) else {
+                continue;
+            };
+            let kill = t.ptrace_options & PTRACE_O_EXITKILL != 0;
+            t.ptrace = 0;
+            t.ptracer = None;
+            t.ptrace_options = 0;
+            t.task.clear_tif(crate::task::tif::SYSCALL_TRACE);
+            if matches!(t.state, TaskState::Traced(_)) {
+                t.state = TaskState::Ready;
+                t.ptrace_code = 0;
+            }
+            if let Some(task) = table.task(tid) {
+                gone.push((task, kill));
+            }
         }
     }
-
-    ptrace_stop(sig);
+    for (t, kill) in gone {
+        if kill {
+            signal::send_signal(t.tid(), SIGKILL);
+        }
+        percpu::try_to_wake_up(&t, percpu::WakeMode::Any);
+    }
 }
 
 // =============================================================================
@@ -809,7 +918,7 @@ pub fn ptrace_report_syscall(entry: bool) {
 ///
 /// # Returns
 /// 0 on success, or negative error code.
-/// For PEEKDATA/PEEKTEXT, returns the read value on success.
+/// For PEEKDATA/PEEKTEXT, the word goes to `data` (the raw syscall ABI).
 pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
     match request {
         PTRACE_TRACEME => ptrace_traceme(),
@@ -817,7 +926,7 @@ pub fn sys_ptrace(request: i64, pid: i64, addr: u64, data: u64) -> i64 {
         PTRACE_SEIZE => ptrace_seize(pid as Pid, data as u32),
         PTRACE_DETACH => ptrace_detach(pid as Pid, data as u32),
 
-        PTRACE_PEEKTEXT | PTRACE_PEEKDATA => ptrace_peek_data(pid as Pid, addr),
+        PTRACE_PEEKTEXT | PTRACE_PEEKDATA => ptrace_peek_data(pid as Pid, addr, data),
         PTRACE_POKETEXT | PTRACE_POKEDATA => ptrace_poke_data(pid as Pid, addr, data),
 
         PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP => {
@@ -881,7 +990,7 @@ pub fn may_access(pick: impl Fn(&percpu::TaskView<'_>) -> bool, fscreds: bool) -
         let table = TASKLIST.read();
         table
             .find(|t| pick(t))
-            .map(|t| (t.cred(), t.mm().map(|m| m.dumpable())))
+            .map(|t| (t.cred(), t.task.task_lock().mm().map(|m| m.dumpable())))
     };
     let Some((c, dumpable)) = target else {
         return false;

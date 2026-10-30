@@ -77,6 +77,19 @@ pub const ELF_ET_DYN_BASE: u64 = 0x5555_5555_4000;
 #[cfg(target_arch = "aarch64")]
 pub const ELF_ET_DYN_BASE: u64 = 0xAAAA_AAAA_0000;
 
+/// Run `f` with task flag `flag` (PF_MEMALLOC, PF_MEMALLOC_NOIO) set,
+/// restoring it after (Linux memalloc_noreclaim_save / memalloc_noio_save)
+pub fn memalloc_scope<R>(flag: u32, f: impl FnOnce() -> R) -> R {
+    let me = crate::task::percpu::current();
+    let had = me.has_flag(flag);
+    me.set_flag(flag);
+    let r = f();
+    if !had {
+        me.clear_flag(flag);
+    }
+    r
+}
+
 /// A fixed mapping at [addr, addr + len): below MMAP_MIN_ADDR is EPERM
 /// without CAP_SYS_RAWIO (Linux security_mmap_addr / cap_mmap_addr),
 /// past TASK_SIZE is ENOMEM
@@ -971,7 +984,7 @@ pub fn mmget_not_zero(mm: &Arc<Mm>) -> Option<MmRef> {
     None
 }
 
-use crate::task::percpu::TASKLIST;
+use crate::task::percpu::with_task_lock;
 
 /// The address space of task `tid` (an mm_count reference; the task
 /// itself holds the user reference, so it stays mapped while the task
@@ -982,8 +995,7 @@ pub fn get_task_mm(tid: Tid) -> Option<Arc<Mm>> {
     if me.tid() == tid {
         return me.mm();
     }
-    let table = TASKLIST.read();
-    table.get(tid).and_then(|t| t.mm().map(|m| m.arc().clone()))
+    with_task_lock(tid, |a| a.mm().map(|m| m.arc().clone())).flatten()
 }
 
 /// A user reference to task `tid`'s address space (Linux get_task_mm),
@@ -998,10 +1010,8 @@ pub fn get_task_mm_users(tid: Tid) -> Option<MmRef> {
 /// the returned mm_count reference keeps the top-level table, still
 /// loaded on this CPU, until the task has switched away.
 pub fn exit_task_mm(tid: Tid) -> Option<Arc<Mm>> {
-    let mm = {
-        let mut table = TASKLIST.write();
-        table.get_mut(tid).and_then(|mut t| t.set_mm(None))
-    }?;
+    // SAFETY: the exiting task itself
+    let mm = with_task_lock(tid, |a| unsafe { a.set_mm(None) }).flatten()?;
     let keep = mm.arc().clone();
     drop(mm);
     Some(keep)

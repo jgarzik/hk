@@ -322,10 +322,9 @@ impl CachedPage {
     /// locked, the task sleeps on a wait queue until it can acquire the lock.
     /// This is more efficient than spinning and allows other tasks to run.
     ///
-    /// If scheduling is not yet enabled (early boot), falls back to spinning.
+    /// A caller that cannot sleep (tid 0: early boot, idle) spins.
     #[inline]
     pub fn lock(&self) {
-        use crate::task::percpu::SCHEDULING_ENABLED;
         use crate::waitqueue::page_wait_queue;
 
         // Fast path: try to acquire immediately
@@ -337,8 +336,8 @@ impl CachedPage {
             return;
         }
 
-        // Slow path: if scheduling enabled, sleep on wait queue
-        if SCHEDULING_ENABLED.load(Ordering::Acquire) {
+        // Slow path: sleep on the hashed wait queue
+        if crate::task::percpu::can_sleep() {
             // Get the wait queue for this page (hashed by frame address)
             let wq = page_wait_queue(self.frame);
 
@@ -374,19 +373,15 @@ impl CachedPage {
     /// Wakes one waiter if any tasks are sleeping on this page's wait queue.
     #[inline]
     pub fn unlock(&self) {
-        use crate::task::percpu::SCHEDULING_ENABLED;
         use crate::waitqueue::page_wait_queue;
 
         // Release the lock
         self.locked.store(false, Ordering::Release);
 
-        // Wake waiters if scheduling is enabled. The hashed queue is shared
-        // with other pages, so wake all (a single wakeup could go to a waiter
-        // for a different page and be lost)
-        if SCHEDULING_ENABLED.load(Ordering::Acquire) {
-            let wq = page_wait_queue(self.frame);
-            wq.wake_all();
-        }
+        // Wake waiters. The hashed queue is shared with other pages, so
+        // wake all (a single wakeup could go to a waiter for a different
+        // page and be lost)
+        page_wait_queue(self.frame).wake_all();
     }
 
     /// Try to lock the page without waiting.
@@ -439,16 +434,12 @@ impl CachedPage {
     /// This signals that writeback I/O has completed. Wakes any waiters
     /// blocked in `wait_writeback()`.
     pub fn end_writeback(&self) {
-        use crate::task::percpu::SCHEDULING_ENABLED;
         use crate::waitqueue::page_wait_queue;
 
         self.writeback.store(false, Ordering::Release);
 
         // Wake any waiters on this page's wait queue
-        if SCHEDULING_ENABLED.load(Ordering::Acquire) {
-            let wq = page_wait_queue(self.frame);
-            wq.wake_all();
-        }
+        page_wait_queue(self.frame).wake_all();
     }
 
     /// Wait for writeback to complete on this page
@@ -456,7 +447,6 @@ impl CachedPage {
     /// Blocks until the writeback flag is cleared by `end_writeback()`.
     /// Used by fsync to wait for in-flight I/O to complete.
     pub fn wait_writeback(&self) {
-        use crate::task::percpu::SCHEDULING_ENABLED;
         use crate::waitqueue::page_wait_queue;
 
         // Fast path: not in writeback
@@ -465,11 +455,11 @@ impl CachedPage {
         }
 
         // Slow path: wait on page wait queue
-        if SCHEDULING_ENABLED.load(Ordering::Acquire) {
+        if crate::task::percpu::can_sleep() {
             let wq = page_wait_queue(self.frame);
             wq.wait_event(|| !self.is_writeback());
         } else {
-            // Scheduling not enabled - spin
+            // A caller that cannot sleep (tid 0) spins
             while self.is_writeback() {
                 core::hint::spin_loop();
             }

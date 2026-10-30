@@ -26,15 +26,15 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
+use crate::hrtimer::{HrClock, HrTimer};
 use crate::signal::{SIGALRM, send_signal};
 use crate::task::Tid;
-use crate::time::{ClockId, TIMEKEEPER};
+use crate::task::percpu::TICK_NS;
 use crate::time_syscall::CLOCK_REALTIME;
-use crate::timer::{TimerHandle, timer_add, timer_del};
 use crate::timerfd::ITimerSpec;
 
 /// POSIX timer notification types (matches Linux)
@@ -107,12 +107,14 @@ pub type TimerT = i32;
 
 /// Internal POSIX timer state
 struct PosixTimerInner {
-    /// Next expiration time (absolute monotonic ns, 0 if disarmed)
+    /// Next expiration time (absolute ns on `clock`, 0 if disarmed)
     expires_ns: u64,
+    /// The clock `expires_ns` is on: CLOCK_REALTIME only for an
+    /// absolute realtime timer (Linux: relative timers run on
+    /// CLOCK_MONOTONIC)
+    clock: HrClock,
     /// Interval for periodic timers (0 = one-shot)
     interval_ns: u64,
-    /// Handle to the timer in the timer subsystem
-    timer_handle: TimerHandle,
     /// Overrun count (expirations since last signal delivery)
     overrun: i32,
     /// Whether timer is currently armed
@@ -123,8 +125,8 @@ impl PosixTimerInner {
     fn new() -> Self {
         Self {
             expires_ns: 0,
+            clock: HrClock::Monotonic,
             interval_ns: 0,
-            timer_handle: TimerHandle::NULL,
             overrun: 0,
             armed: false,
         }
@@ -144,42 +146,30 @@ pub struct PosixTimer {
     sigevent: SigEvent,
     /// Inner state protected by IRQ spinlock
     inner: IrqSpinlock<PosixTimerInner>,
-    /// Unique global ID for callback lookup
-    global_id: u64,
+    /// Its expiry timer (SOFT: the callback sends a signal; data: this
+    /// timer, which outlives it: dropping it waits out its callback)
+    timer: HrTimer,
 }
-
-/// Global counter for POSIX timer IDs
-static NEXT_POSIX_TIMER_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Global registry mapping global_id -> weak ref to timer
-/// This allows the timer callback to find the timer
-static POSIX_TIMER_REGISTRY: IrqSpinlock<Vec<(u64, Tid, TimerT)>> = IrqSpinlock::new(Vec::new());
 
 impl PosixTimer {
     /// Create a new POSIX timer
     fn new(timer_id: TimerT, clockid: i32, owner_tid: Tid, sigevent: SigEvent) -> Arc<Self> {
-        let global_id = NEXT_POSIX_TIMER_ID.fetch_add(1, Ordering::Relaxed);
         let timer = Arc::new(Self {
             timer_id,
             clockid,
             owner_tid: AtomicU64::new(owner_tid),
             sigevent,
             inner: IrqSpinlock::new(PosixTimerInner::new()),
-            global_id,
+            timer: HrTimer::new(posix_timer_fire, 0),
         });
-
-        // Register in global registry for callback lookup
-        POSIX_TIMER_REGISTRY
-            .lock()
-            .push((global_id, owner_tid, timer_id));
-
+        timer.timer.set_data(Arc::as_ptr(&timer) as usize);
         timer
     }
 
-    /// Get current monotonic time in nanoseconds
-    fn now_ns() -> u64 {
-        let ts = TIMEKEEPER.read(ClockId::Monotonic, TIMEKEEPER.get_read_cycles());
-        ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
+    /// Its timer (pinned: the timer lives in an Arc)
+    fn timer(&self) -> Pin<&HrTimer> {
+        // SAFETY: an Arc's contents never move
+        unsafe { Pin::new_unchecked(&self.timer) }
     }
 
     /// Arm the timer
@@ -191,16 +181,13 @@ impl PosixTimer {
     /// # Returns
     /// Previous timer value
     pub fn settime(self: &Arc<Self>, new_value: &ITimerSpec, flags: i32) -> ITimerSpec {
+        // Cancel the existing timer, waiting out its callback (it takes
+        // `inner`)
+        self.timer.cancel_sync();
         let mut inner = self.inner.lock();
 
         // Save old value
         let old_value = self.get_current_value_locked(&inner);
-
-        // Cancel existing timer if any
-        if inner.timer_handle.is_valid() {
-            timer_del(inner.timer_handle);
-            inner.timer_handle = TimerHandle::NULL;
-        }
 
         // Reset overrun count on re-arm
         inner.overrun = 0;
@@ -217,32 +204,28 @@ impl PosixTimer {
         let value_ns = new_value.value_to_ns();
         inner.interval_ns = new_value.interval_to_ns();
 
-        let expires_ns = if flags & timer_flags::TIMER_ABSTIME != 0 {
-            // Absolute time
-            if self.clockid == CLOCK_REALTIME {
-                // CLOCK_REALTIME - need to convert to monotonic
-                // For simplicity, we assume realtime ~= monotonic + offset
-                // A proper implementation would handle clock jumps
-                value_ns
+        let (expires_ns, clock) = if flags & timer_flags::TIMER_ABSTIME != 0 {
+            // Absolute, kept on its clock: a realtime one follows
+            // clock_settime
+            let clock = if self.clockid == CLOCK_REALTIME {
+                HrClock::Realtime
             } else {
-                // CLOCK_MONOTONIC - use directly
-                value_ns
-            }
+                HrClock::Monotonic
+            };
+            (value_ns, clock)
         } else {
             // Relative time (saturates: a huge value never fires)
-            crate::time::deadline_after(Self::now_ns(), value_ns)
+            let now = crate::time::monotonic_ns();
+            (
+                crate::time::deadline_after(now, value_ns),
+                HrClock::Monotonic,
+            )
         };
 
         inner.expires_ns = expires_ns;
+        inner.clock = clock;
         inner.armed = true;
-
-        // Register timer callback using global_id for lookup
-        inner.timer_handle = timer_add(
-            expires_ns,
-            inner.interval_ns,
-            posix_timer_callback,
-            self.global_id,
-        );
+        self.timer().start(expires_ns, clock);
 
         old_value
     }
@@ -259,8 +242,7 @@ impl PosixTimer {
             return ITimerSpec::default();
         }
 
-        let now = Self::now_ns();
-        let remaining = inner.expires_ns.saturating_sub(now);
+        let remaining = inner.expires_ns.saturating_sub(inner.clock.now());
 
         ITimerSpec::from_ns(remaining, inner.interval_ns)
     }
@@ -277,25 +259,45 @@ impl PosixTimer {
         {
             let mut inner = self.inner.lock();
 
-            // For periodic timers, the timer infrastructure handles rescheduling
-            // For one-shot, mark as disarmed
+            if !inner.armed {
+                return;
+            }
+            // A one-shot timer is done; a periodic one re-arms for the
+            // first period end after now (Linux hrtimer_forward)
             if inner.interval_ns == 0 {
                 inner.armed = false;
                 inner.expires_ns = 0;
             } else {
-                // Update expires_ns for gettime accuracy
-                inner.expires_ns = Self::now_ns() + inner.interval_ns;
+                let now = inner.clock.now();
+                let (missed, next) =
+                    crate::timer::forward(inner.expires_ns, inner.interval_ns, now);
+                // Periods missed beyond the one this expiry delivers
+                // (Linux: hrtimer_forward's count, into it_overrun)
+                let extra = i32::try_from(missed - 1).unwrap_or(i32::MAX);
+                inner.overrun = inner.overrun.saturating_add(extra);
+                match next {
+                    Some(n) => {
+                        // The expiry stays on the period grid, so the
+                        // next forward counts every missed period; a
+                        // period under a tick fires a tick away at the
+                        // soonest, or it would keep ktimers/N busy (Linux
+                        // re-arms when the signal is dequeued instead)
+                        inner.expires_ns = n;
+                        let fire = match inner.interval_ns < TICK_NS {
+                            true => n.max(now.saturating_add(TICK_NS)),
+                            false => n,
+                        };
+                        self.timer().start(fire, inner.clock);
+                    }
+                    None => {
+                        inner.armed = false;
+                        inner.expires_ns = 0;
+                    }
+                }
             }
 
             // Determine notification action
             should_signal = self.sigevent.sigev_notify == sigev_notify::SIGEV_SIGNAL;
-
-            // Increment overrun count (will be reset on getoverrun)
-            // In Linux, this counts missed deliveries while signal is pending
-            // For simplicity, we just track total expirations
-            if inner.overrun < i32::MAX {
-                inner.overrun = inner.overrun.saturating_add(1);
-            }
         }
 
         // Send signal if configured
@@ -307,54 +309,18 @@ impl PosixTimer {
         }
     }
 
-    /// Delete the timer (cancel and cleanup)
+    /// Delete the timer (cancel, waiting out its callback; thread
+    /// context)
     fn delete(&self) {
-        // Cancel timer
-        {
-            let mut inner = self.inner.lock();
-            if inner.timer_handle.is_valid() {
-                timer_del(inner.timer_handle);
-                inner.timer_handle = TimerHandle::NULL;
-            }
-            inner.armed = false;
-        }
-
-        // Remove from global registry
-        let mut registry = POSIX_TIMER_REGISTRY.lock();
-        registry.retain(|(id, _, _)| *id != self.global_id);
+        self.inner.lock().armed = false;
+        self.timer.cancel_sync();
     }
 }
 
-impl Drop for PosixTimer {
-    fn drop(&mut self) {
-        // Cancel timer on drop
-        let inner = self.inner.lock();
-        if inner.timer_handle.is_valid() {
-            timer_del(inner.timer_handle);
-        }
-    }
-}
-
-/// Timer callback - finds the timer and calls on_expire
-fn posix_timer_callback(data: u64) {
-    // Look up timer by global_id in registry
-    let (owner_tid, timer_id) = {
-        let registry = POSIX_TIMER_REGISTRY.lock();
-        registry
-            .iter()
-            .find(|(id, _, _)| *id == data)
-            .map(|(_, tid, tmr_id)| (*tid, *tmr_id))
-    }
-    .unwrap_or((0, -1));
-
-    if owner_tid == 0 {
-        return;
-    }
-
-    // Get the timer from the task's registry
-    if let Some(timer) = get_posix_timer(owner_tid, timer_id) {
-        timer.on_expire();
-    }
+/// A POSIX timer expired (`ktimers/N`)
+fn posix_timer_fire(t: &HrTimer) {
+    // SAFETY: `data` is the PosixTimer owning `t` (see `PosixTimer::timer`)
+    unsafe { &*(t.data() as *const PosixTimer) }.on_expire();
 }
 
 /// Per-process POSIX timer registry
@@ -507,18 +473,13 @@ pub fn retarget(sig: &crate::signal::SignalStruct, old: Tid, new: Tid) {
             .owner_tid
             .compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed);
     }
-    for e in POSIX_TIMER_REGISTRY.lock().iter_mut() {
-        if e.1 == old {
-            e.1 = new;
-        }
-    }
 }
 
 /// Delete every timer of the thread group (Linux exit_itimers: its last
 /// thread is exiting)
 pub fn exit_itimers(sig: &crate::signal::SignalStruct) {
     let timers = core::mem::take(&mut sig.posix_timers.lock().timers);
-    // Deleted after the lock (timer_del waits out a running callback)
+    // Deleted after the lock (cancel_sync waits out a running callback)
     for (_, t) in timers {
         t.delete();
     }

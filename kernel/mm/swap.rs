@@ -216,6 +216,11 @@ impl SwapInfo {
         TOTAL_SWAP_USED.fetch_add(n as u64, Ordering::Relaxed);
     }
 
+    /// SWAP_HAS_CACHE is set on slot `off`
+    pub fn has_cache(&self, off: u64) -> bool {
+        off < self.max && self.map.lock().count[off as usize] & SWAP_HAS_CACHE != 0
+    }
+
     /// Swap PTEs referencing slot `off`
     pub fn count(&self, off: u64) -> u16 {
         if off >= self.max {
@@ -255,9 +260,18 @@ fn find_swap_by_path(path: &[u8]) -> Option<u8> {
 /// A free slot for a page entering the swap cache, its count
 /// SWAP_HAS_CACHE (Linux folio_alloc_swap): the writable device of
 /// highest priority with room
+///
+/// Direct reclaim (PF_MEMALLOC) takes only block-device areas: a swap
+/// file's pages go out through its filesystem's writepage, which may
+/// need locks the allocating task holds (Linux maps a swap file's
+/// blocks at swapon and bypasses the filesystem)
 pub fn get_swap_page() -> Option<SwapEntry> {
+    let reclaiming = crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC);
     let devs: Vec<Arc<SwapInfo>> = SWAP_INFO.read().iter().flatten().cloned().collect();
-    let mut devs: Vec<_> = devs.into_iter().filter(|s| s.writeok()).collect();
+    let mut devs: Vec<_> = devs
+        .into_iter()
+        .filter(|s| s.writeok() && !(reclaiming && s.inode.is_some()))
+        .collect();
     devs.sort_by_key(|s| core::cmp::Reverse(s.priority));
     devs.iter()
         .find_map(|si| si.alloc_slot().map(|off| SwapEntry::new(si.swap_type, off)))
@@ -307,6 +321,20 @@ pub fn swapcache_clear(e: SwapEntry) {
     if let Some(si) = info_of(e) {
         si.update(e.offset(), |c| Some(c & !SWAP_HAS_CACHE));
     }
+    // A reader waiting for the claim to settle looks again
+    swap_wait(e).wake_all();
+}
+
+/// Another task claimed `e` for the swap cache (SWAP_HAS_CACHE) and
+/// has not put its page there yet: `read_swap_page` waits on this
+pub fn swap_wait(e: SwapEntry) -> &'static crate::waitqueue::WaitQueue {
+    // Hashed like the page wait table (Linux folio_waitqueue)
+    crate::waitqueue::page_wait_queue(e.raw() << 12)
+}
+
+/// SWAP_HAS_CACHE is set on `e`
+pub fn swapcache_busy(e: SwapEntry) -> bool {
+    info_of(e).is_some_and(|si| si.has_cache(e.offset()))
 }
 
 /// Swap PTEs referencing `e` (Linux swp_swapcount)
@@ -356,9 +384,25 @@ pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
 
 /// Write the frame at `frame_phys` to slot `entry` (may sleep)
 pub fn swap_write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
+    // Allocations on the way to the device (bio, buffers, the file's
+    // own) must not reclaim through swap I/O again (Linux: swap_writepage
+    // under memalloc_noio / PF_MEMALLOC)
+    super::memalloc_scope(crate::task::pf::MEMALLOC_NOIO, || {
+        write_page(entry, frame_phys)
+    })
+}
+
+/// `swap_write_page` with PF_MEMALLOC_NOIO set
+fn write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
     let si = info_of(entry).ok_or(KernelError::InvalidArgument.sysret())?;
     let off = entry.offset();
     if let Some(ref inode) = si.inode {
+        // Not from direct reclaim (PF_MEMALLOC): the file's writepage may
+        // need filesystem locks the allocating task holds. A page already
+        // in the swap cache of a swap file stays dirty and in memory.
+        if crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC) {
+            return Err(KernelError::WouldBlock.sysret());
+        }
         let mut buf = alloc::vec![0u8; PAGE_SIZE];
         // SAFETY: the caller's frame, reached through the direct map
         unsafe {
@@ -508,6 +552,15 @@ fn swapoff(path_ptr: u64) -> Result<(), KernelError> {
 pub fn swap_full() -> bool {
     let (total, free) = swap_totals();
     free * 2 < total
+}
+
+/// A swap area on a block device is on (direct reclaim swaps only there)
+pub fn bdev_swap_active() -> bool {
+    SWAP_INFO
+        .read()
+        .iter()
+        .flatten()
+        .any(|si| si.bdev.is_some())
 }
 
 /// Swap totals in pages: (total, free) (meminfo, sysinfo)

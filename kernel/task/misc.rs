@@ -493,25 +493,17 @@ pub fn sys_prctl(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> 
             // Ensure null termination
             name[15] = 0;
 
-            // Update task's prctl state
-            let mut table = TASKLIST.write();
-            if let Some(mut task) = table.get_mut(tid) {
-                task.prctl.name = name;
-                0
-            } else {
-                KernelError::NoProcess.sysret()
-            }
+            // Rename the calling thread under its task_lock (Linux
+            // set_task_comm)
+            let me = super::percpu::current();
+            // SAFETY: the task itself
+            unsafe { me.task_lock().set_comm(name) };
+            0
         }
 
         PR_GET_NAME => {
             // Get thread name and write to user buffer
-            let name = {
-                let table = TASKLIST.read();
-                match table.get(tid) {
-                    Some(task) => task.prctl.name,
-                    None => return KernelError::NoProcess.sysret(),
-                }
-            };
+            let name = super::percpu::current().comm();
 
             // Write name to user space (16 bytes)
             for (i, &byte) in name.iter().enumerate() {

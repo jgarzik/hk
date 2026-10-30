@@ -14,7 +14,8 @@
 //!
 //! ## Locking
 //!
-//! - `TASKLIST`: Protects task struct access (including nsproxy field)
+//! - `Task.alloc_lock` (Linux task_lock): the nsproxy field (lock-free
+//!   for the task itself, which alone replaces it)
 //! - Per-namespace data: `crate::sync::spin::RwLock` (read-heavy)
 //!
 //! ## Lock Ordering
@@ -380,43 +381,42 @@ pub static INIT_NSPROXY: Lazy<Arc<NsProxy>> = Lazy::new(|| Arc::new(NsProxy::new
 // ============================================================================
 
 // =============================================================================
-// Task NS accessors - uses Task.nsproxy field directly via TASKLIST
+// Task NS accessors - Task.nsproxy under its alloc_lock (Linux task_lock)
 // =============================================================================
 
-use crate::task::percpu::TASKLIST;
+use crate::task::percpu::{current, with_task_lock};
 
 /// Initialize nsproxy for a new task
 ///
-/// Called when creating a new task to set up its namespace context.
+/// Called when creating a new task to set up its namespace context, or
+/// by the task itself (unshare, setns; Linux switch_task_namespaces).
 pub fn init_task_ns(tid: Tid, nsproxy: Arc<NsProxy>) {
-    let old = {
-        let mut table = TASKLIST.write();
-        table
-            .get_mut(tid)
-            .and_then(|mut t| t.nsproxy.replace(nsproxy))
-    };
+    // SAFETY: the task itself or a child not yet run (see above)
+    let old = with_task_lock(tid, |a| unsafe { a.set_nsproxy(Some(nsproxy)) });
     drop(old);
 }
 
 /// Get the NsProxy for a task
 ///
-/// Returns a cloned Arc (increments refcount).
+/// Returns a cloned Arc (increments refcount); lock-free for the
+/// current task (Linux current->nsproxy).
 pub fn get_task_ns(tid: Tid) -> Option<Arc<NsProxy>> {
-    let table = TASKLIST.read();
-    table.get(tid).and_then(|t| t.nsproxy.clone())
+    let me = current();
+    if me.tid() == tid {
+        return me.nsproxy();
+    }
+    with_task_lock(tid, |a| a.nsproxy().cloned()).flatten()
 }
 
 /// Remove nsproxy when task exits
 ///
 /// This decrements the Arc refcount. If this was the last reference
 /// (no other tasks sharing this NsProxy), the NsProxy is dropped,
-/// which in turn drops the namespace references (after TASKLIST is
-/// released: a network namespace's teardown takes RTNL).
+/// which in turn drops the namespace references (after the task's
+/// alloc_lock is released: a network namespace's teardown takes RTNL).
 pub fn exit_task_ns(tid: Tid) {
-    let ns = {
-        let mut table = TASKLIST.write();
-        table.get_mut(tid).and_then(|mut t| t.nsproxy.take())
-    };
+    // SAFETY: the exiting task itself
+    let ns = with_task_lock(tid, |a| unsafe { a.set_nsproxy(None) }).flatten();
     drop(ns);
 }
 

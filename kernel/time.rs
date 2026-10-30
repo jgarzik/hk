@@ -267,7 +267,7 @@ impl TimeKeeper {
         let mult = self.mult.load(Ordering::Relaxed);
         let shift = self.shift.load(Ordering::Relaxed);
 
-        let delta_cycles = now_cycles.wrapping_sub(cycle_base);
+        let delta_cycles = cycles_delta(now_cycles, cycle_base);
         let delta_ns = ((delta_cycles as u128 * mult as u128) >> shift) as u64;
 
         self.cycle_base.store(now_cycles, Ordering::Relaxed);
@@ -315,7 +315,7 @@ impl TimeKeeper {
             }
 
             // Calculate current time
-            let delta_cycles = now_cycles.wrapping_sub(cycle_base);
+            let delta_cycles = cycles_delta(now_cycles, cycle_base);
             let delta_ns = ((delta_cycles as u128 * mult as u128) >> shift) as u64;
             let mono_ns = mono_base.wrapping_add(delta_ns);
 
@@ -345,9 +345,10 @@ impl TimeKeeper {
     /// * `new_time` - The new wall-clock time to set
     ///
     /// # Returns
-    /// `true` if successful, `false` if timekeeper is not initialized
+    /// `true` if successful, `false` if the timekeeper is not initialized
+    /// or the time is out of range (Linux timespec64_valid_settod)
     pub fn set_realtime(&self, new_time: Timespec) -> bool {
-        if !self.is_initialized() {
+        if !self.is_initialized() || !settod_valid(&new_time) {
             return false;
         }
 
@@ -363,7 +364,7 @@ impl TimeKeeper {
         let mult = self.mult.load(Ordering::Relaxed);
         let shift = self.shift.load(Ordering::Relaxed);
 
-        let delta_cycles = now_cycles.wrapping_sub(cycle_base);
+        let delta_cycles = cycles_delta(now_cycles, cycle_base);
         let delta_ns = ((delta_cycles as u128 * mult as u128) >> shift) as u64;
         let mono_ns = mono_base.wrapping_add(delta_ns);
 
@@ -377,22 +378,54 @@ impl TimeKeeper {
             .store(new_offset as i64, Ordering::Relaxed);
 
         self.write_end();
-
+        drop(_g);
+        clock_was_set();
         true
     }
+
+    /// CLOCK_REALTIME - CLOCK_MONOTONIC, ns
+    pub fn real_offset(&self) -> i64 {
+        self.realtime_offset_ns.load(Ordering::Relaxed)
+    }
+}
+
+/// Counter cycles since `base`; 0 if `now` is behind it, as when another
+/// CPU's counter lags the one that set the base (Linux clocksource_delta:
+/// a negative delta would wrap to centuries)
+fn cycles_delta(now: u64, base: u64) -> u64 {
+    let d = now.wrapping_sub(base);
+    if d & (1 << 63) != 0 { 0 } else { d }
+}
+
+/// Largest settable CLOCK_REALTIME second (Linux TIME_SETTOD_SEC_MAX:
+/// KTIME_SEC_MAX less 30 years of uptime, so realtime ns never overflow)
+pub const TIME_SETTOD_SEC_MAX: i64 = (KTIME_MAX / 1_000_000_000) as i64 - 30 * 365 * 24 * 3600;
+
+/// A wall-clock time that may be set (Linux timespec64_valid_settod)
+pub fn settod_valid(t: &Timespec) -> bool {
+    t.sec >= 0 && t.sec < TIME_SETTOD_SEC_MAX && t.nsec < 1_000_000_000
+}
+
+/// CLOCK_REALTIME was set (Linux clock_was_set; thread context, no
+/// timekeeper lock): absolute realtime hrtimers see the new time at the
+/// next clock event (at most a tick away); cancel-on-set timerfds fail
+/// their next read
+fn clock_was_set() {
+    crate::timerfd::clock_was_set();
+}
+
+/// CLOCK_REALTIME - CLOCK_MONOTONIC now, ns
+pub fn real_offset() -> i64 {
+    TIMEKEEPER.real_offset()
 }
 
 /// Global timekeeper instance
 pub static TIMEKEEPER: TimeKeeper = TimeKeeper::new();
 
-/// Get current monotonic time in milliseconds (simple tick count)
-///
-/// This provides a simple monotonic tick suitable for timeouts and
-/// timestamp comparisons. Returns 0 if timekeeper is not initialized.
+/// CLOCK_MONOTONIC now in milliseconds, for coarse timeouts and
+/// timestamps (0 before the timekeeper runs)
 pub fn current_ticks() -> u64 {
-    let ts = TIMEKEEPER.current_time();
-    // Convert to milliseconds
-    ts.sec as u64 * 1000 + ts.nsec as u64 / 1_000_000
+    monotonic_ns() / 1_000_000
 }
 
 /// Largest time value in ns (Linux KTIME_MAX); deadlines at or beyond it
@@ -416,11 +449,48 @@ pub fn deadline_after(now_ns: u64, delta_ns: u64) -> u64 {
     now_ns.saturating_add(delta_ns).min(KTIME_MAX)
 }
 
+/// A wait's timeout: `None` waits forever, `Some(0)` does not block,
+/// else an absolute CLOCK_MONOTONIC deadline in ns (Linux end_time)
+pub type Deadline = Option<u64>;
+
+/// The deadline of a timeout in ms (<0 = none; poll, epoll_wait)
+pub fn deadline_ms(ms: i32) -> Deadline {
+    match ms {
+        t if t < 0 => None,
+        0 => Some(0),
+        t => Some(deadline_after(monotonic_ns(), t as u64 * 1_000_000)),
+    }
+}
+
+/// The deadline of a relative (sec, nsec) timeout; EINVAL if invalid
+/// (Linux poll_select_set_timeout)
+pub fn deadline_ts(sec: i64, nsec: i64) -> Result<Deadline, crate::error::KernelError> {
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return Err(crate::error::KernelError::InvalidArgument);
+    }
+    if sec == 0 && nsec == 0 {
+        return Ok(Some(0));
+    }
+    Ok(Some(deadline_after(
+        monotonic_ns(),
+        timespec_to_ns(sec, nsec),
+    )))
+}
+
+/// CLOCK_REALTIME now in ns (0 before the epoch)
+pub fn realtime_ns() -> u64 {
+    let ts = TIMEKEEPER.read(ClockId::Realtime, TIMEKEEPER.get_read_cycles());
+    if ts.sec < 0 {
+        return 0;
+    }
+    timespec_to_ns(ts.sec, ts.nsec as i64)
+}
+
 /// Get current monotonic time in nanoseconds
 ///
 /// Returns the current monotonic clock time since boot in nanoseconds.
 /// Suitable for process start times and precise timing measurements.
 pub fn monotonic_ns() -> u64 {
     let ts = TIMEKEEPER.read(ClockId::Monotonic, TIMEKEEPER.get_read_cycles());
-    ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
+    timespec_to_ns(ts.sec, ts.nsec as i64)
 }

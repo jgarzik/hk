@@ -197,17 +197,16 @@ extern "C" fn handle_el0_sync(frame: &mut Aarch64TrapFrame, esr: u64) {
             // unmasked (Linux el0_svc). The kernel is not preemptive, so
             // an interrupt never switches tasks here (doc/LOCKING.md 7)
             super::cpu::enable_interrupts();
-            // Syscall number in x8, arguments in x0-x5, return value in x0
-            let result = super::syscall::aarch64_syscall_dispatch(
-                frame.x[8], // syscall number
-                frame.x[0], // arg0
-                frame.x[1], // arg1
-                frame.x[2], // arg2
-                frame.x[3], // arg3
-                frame.x[4], // arg4
-                frame.x[5], // arg5
-            );
-            frame.x[0] = result;
+            // A PTRACE_SYSCALL entry stop may change the number
+            // (NO_SYSCALL skips it) and the arguments
+            let nr = crate::entry::syscall_enter_from_user_mode(frame);
+            if nr != super::NO_SYSCALL {
+                // Syscall number in x8, arguments in x0-x5, return value
+                // in x0
+                frame.x[0] = super::syscall::aarch64_syscall_dispatch(
+                    nr, frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
+                );
+            }
             // Signals, -ERESTART* rules, rescheduling before returning to
             // user space (they may redirect the frame to a handler or
             // back up over the svc; rt_sigreturn restored a whole user

@@ -9,7 +9,7 @@
 //! - Run queue lock must be held with IRQs disabled
 //! - Context switch happens with the run queue lock held
 
-use ::core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -19,7 +19,7 @@ use crate::arch::{
 use crate::cpu::PerCpu;
 use crate::printkln;
 use crate::sync::spin::RwLock;
-use crate::task::sched::{PriorityRunQueue, SleepEntry};
+use crate::task::sched::PrioQueue;
 use crate::task::{Cred, PRIORITY_IDLE, Pid, Priority, Task, TaskKind, TaskState, Tid};
 
 /// Clear the child TID and wake futex waiters
@@ -114,22 +114,23 @@ pub struct UserTaskConfig {
 }
 
 /// Sleep state of a task (Linux TASK_RUNNING / TASK_INTERRUPTIBLE /
-/// TASK_UNINTERRUPTIBLE / TASK_KILLABLE)
-///
-/// This is the scheduling source of truth for sleeping, kept in the owning
-/// CPU's run queue (IRQ-safe lock) so wakers in IRQ context can use it.
-/// `TaskState` in the task table is informational only.
+/// TASK_UNINTERRUPTIBLE / TASK_KILLABLE / TASK_DEAD), kept in the task
+/// (`Task.se`): set by the task itself before it re-checks its wait
+/// condition, set back to Running by its wakers (`try_to_wake_up`)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum SleepState {
     /// Runnable or running
-    Running,
+    Running = 0,
     /// Sleeping; woken by wakeups and by signals
-    Interruptible,
+    Interruptible = 1,
     /// Sleeping; woken only by explicit wakeups / timeouts
-    Uninterruptible,
+    Uninterruptible = 2,
     /// Sleeping; woken by explicit wakeups / timeouts and by SIGKILL
     /// only (Linux TASK_KILLABLE)
-    Killable,
+    Killable = 3,
+    /// Exited; never woken again (Linux TASK_DEAD)
+    Dead = 4,
 }
 
 /// Which sleepers a wakeup may wake
@@ -145,77 +146,49 @@ pub enum WakeMode {
 }
 
 impl WakeMode {
-    /// One wakeup standing for both `self` and `other`: it wakes every
-    /// sleeper either would (Any > Fatal > Interruptible)
-    pub fn merge(self, other: WakeMode) -> WakeMode {
-        use WakeMode::*;
-        match (self, other) {
-            (Any, _) | (_, Any) => Any,
-            (Fatal, _) | (_, Fatal) => Fatal,
-            _ => Interruptible,
-        }
+    /// A sleeper in `state` (`SleepState` as u8) is one this wakeup ends
+    /// (Linux ttwu_state_match)
+    fn wakes(self, state: u8) -> bool {
+        const I: u8 = SleepState::Interruptible as u8;
+        const U: u8 = SleepState::Uninterruptible as u8;
+        const K: u8 = SleepState::Killable as u8;
+        matches!(
+            (state, self),
+            (I, _) | (U | K, WakeMode::Any) | (K, WakeMode::Fatal)
+        )
     }
 }
 
-/// Per-thread kernel context and scheduling state (owned by one CPU's rq)
-pub struct KernelThreadContext {
-    /// Context for switching (callee-saved registers)
-    pub context: TaskContext,
-    /// Base address of the kernel stack (`mm::vmstack`)
-    pub stack_base: u64,
-    /// Its size in bytes, freed when the task is dead; 0 if not owned
-    pub stack_size: usize,
-    /// Sleep state (see [`SleepState`])
-    pub state: SleepState,
-    /// True while the task sits in the priority run queue (prevents
-    /// double-enqueue; the current task is never queued)
-    pub queued: bool,
-    /// Priority used when (re-)enqueueing; refreshed on yield
-    pub priority: Priority,
-    /// The task (the run queue's reference keeps it alive while it can
-    /// run, and while per-CPU `curr` points at it)
-    pub task: Option<TaskRef>,
-}
+const RUNNING: u8 = SleepState::Running as u8;
+const DEAD: u8 = SleepState::Dead as u8;
 
-impl KernelThreadContext {
-    fn new(context: TaskContext, stack_base: u64, stack_size: usize, priority: Priority) -> Self {
-        Self {
-            context,
-            stack_base,
-            stack_size,
-            state: SleepState::Running,
-            queued: false,
-            priority,
-            task: None,
-        }
-    }
-}
+crate::adapter!(RunAdapter, KernelTask, se.link);
 
-/// Spare run-queue slots per priority beyond the CPU's task count
-const RQ_SLACK: usize = 16;
-
-/// Per-CPU run queue
+/// Per-CPU run queue (Linux struct rq), under `PerCpuScheduler.lock`
 ///
-/// Each CPU has one of these. The run queue is protected by an IRQ-safe
-/// spinlock to prevent deadlocks from timer interrupts. Only the owning CPU
-/// ever takes this lock (cross-CPU wakeups go through `wake_list`).
+/// The run queue owns one reference to each task of its CPU, taken when
+/// the task is first made runnable (or created asleep) and handed to
+/// `dead` at its final switch (Linux: the task's own usage count,
+/// dropped in finish_task_switch for TASK_DEAD); the priority lists
+/// and `curr` hold none of their own.
 pub struct CpuRunQueue {
-    /// Priority-based run queue for this CPU (initialized lazily)
-    pub queue: Option<PriorityRunQueue>,
-    /// Currently running task TID on this CPU (0 = none/idle)
-    pub current: Option<Tid>,
-    /// Thread contexts for tasks on this CPU
-    pub contexts: Vec<(Tid, KernelThreadContext)>,
-    /// Number of tasks owned by this CPU (informational)
-    pub nr_running: usize,
-    /// TID of this CPU's idle task (never migrated, always runnable)
-    pub idle_tid: Option<Tid>,
-    /// Sleep queue for tasks waiting on timer (sorted by wake_tick)
-    pub sleep_queue: Vec<SleepEntry>,
-    /// Tasks that exited on this CPU, released once it has switched
-    /// away from them (Linux finish_task_switch for TASK_DEAD)
-    pub dead: Vec<DeadTask>,
+    /// Runnable tasks but the running one and the idle task (allocated
+    /// with the idle task)
+    queue: Option<alloc::boxed::Box<PrioQueue<RunAdapter>>>,
+    /// The running task (null until this CPU's first switch)
+    curr: *const KernelTask,
+    /// This CPU's idle task (Linux rq->idle): runs when nothing is
+    /// queued; never queued, never asleep
+    idle: *const KernelTask,
+    /// The task that exited on this CPU, released once it has switched
+    /// away from it (Linux finish_task_switch for TASK_DEAD); one at a
+    /// time: the next task takes it before anything else runs
+    dead: Option<DeadTask>,
 }
+
+// SAFETY: the task pointers are owned references (see above), used
+// under the rq lock
+unsafe impl Send for CpuRunQueue {}
 
 /// What an exited task still holds while its CPU runs on its stack and
 /// its page tables: freed by the next task (`DeadTask::drop`)
@@ -263,166 +236,84 @@ impl Drop for DeadTask {
         }
         // mmdrop: the last reference frees the top-level table
         drop(self.mm.take());
+        drop(self.task.take());
     }
 }
 
 impl CpuRunQueue {
-    /// Create an uninitialized run queue
+    /// An empty run queue (no idle task yet)
     pub const fn uninit() -> Self {
         Self {
             queue: None,
-            current: None,
-            contexts: Vec::new(),
-            nr_running: 0,
-            idle_tid: None,
-            sleep_queue: Vec::new(),
-            dead: Vec::new(),
+            curr: core::ptr::null(),
+            idle: core::ptr::null(),
+            dead: None,
         }
     }
 
-    /// Initialize the run queue
-    pub fn init(&mut self) {
-        if self.queue.is_none() {
-            self.queue = Some(PriorityRunQueue::new());
+    fn queue(&mut self) -> &mut PrioQueue<RunAdapter> {
+        self.queue.as_mut().expect("run queue not initialized")
+    }
+
+    /// Put `p` (runnable, neither running nor queued) on its priority's
+    /// list (Linux enqueue_task)
+    fn enqueue(&mut self, p: &KernelTask) {
+        // SAFETY: the rq owns a reference to `p`; it is on no list
+        unsafe { self.queue().push(p, p.se.prio()) };
+    }
+
+    /// Make `p` runnable (Linux ttwu_do_activate): Running, and queued
+    /// unless it still is on the run queue (running, or not yet switched
+    /// out)
+    fn activate(&mut self, p: &KernelTask) {
+        p.se.set_state(RUNNING);
+        if !p.se.on_rq() {
+            p.se.set_on_rq(true);
+            self.enqueue(p);
+            self.check_preempt(p);
         }
     }
 
-    /// Get the run queue, panics if not initialized
-    pub fn queue(&mut self) -> &mut PriorityRunQueue {
-        self.queue.as_mut().expect("Run queue not initialized")
-    }
-
-    /// Scheduling entry for a task owned by this CPU
-    fn entry(&self, tid: Tid) -> Option<&KernelThreadContext> {
-        self.contexts
-            .iter()
-            .find(|(t, _)| *t == tid)
-            .map(|(_, c)| c)
-    }
-
-    /// Scheduling entry for a task owned by this CPU, writable
-    fn entry_mut(&mut self, tid: Tid) -> Option<&mut KernelThreadContext> {
-        self.contexts
-            .iter_mut()
-            .find(|(t, _)| *t == tid)
-            .map(|(_, c)| c)
-    }
-
-    /// Add a new task (not yet runnable; thread context)
-    fn add_task(&mut self, task: &TaskRef, mut ctx: KernelThreadContext) {
-        ctx.task = Some(task.clone());
-        self.contexts.push((task.tid(), ctx));
-        self.nr_running += 1;
-        for p in self.priorities() {
-            self.reserve_prio(p);
-        }
-    }
-
-    /// Priorities this CPU's tasks use (few distinct values)
-    fn priorities(&self) -> Vec<Priority> {
-        let mut v: Vec<Priority> = Vec::new();
-        for (_, c) in &self.contexts {
-            if !v.contains(&c.priority) {
-                v.push(c.priority);
-            }
-        }
-        v
-    }
-
-    /// Room for every task of this CPU (plus slack for stale entries of
-    /// exited tasks) in the queue of `prio`: IRQ-context wakeups enqueue
-    /// without allocating (each task is queued at most once)
-    fn reserve_prio(&mut self, prio: Priority) {
-        let n = self.contexts.len() + RQ_SLACK;
-        self.queue().reserve(prio, n);
-    }
-
-    /// Put `tid` on the priority queue unless it is current or already queued
-    fn enqueue_task(&mut self, tid: Tid) {
-        if self.current == Some(tid) {
+    /// A task made runnable preempts the idle task or a running task of
+    /// lower priority: flag it, so it switches at its next scheduling
+    /// point (Linux check_preempt_curr -> resched_curr)
+    fn check_preempt(&self, p: &KernelTask) {
+        // SAFETY: the running task, kept alive by this run queue
+        let Some(curr) = (unsafe { self.curr.as_ref() }) else {
             return;
-        }
-        let prio = match self.entry_mut(tid) {
-            Some(e) if !e.queued => {
-                e.queued = true;
-                e.priority
-            }
-            _ => return,
         };
-        self.queue().enqueue(tid, prio);
-    }
-
-    /// Wake `tid` if it sleeps in a state `mode` may wake (try_to_wake_up)
-    ///
-    /// Returns true if the task was sleeping and is now runnable. Waking a
-    /// task that has set its state but not yet called `schedule()` just
-    /// flips it back to Running, so its `schedule()` returns immediately.
-    fn try_wake(&mut self, tid: Tid, mode: WakeMode) -> bool {
-        let wake = match self.entry_mut(tid) {
-            Some(e) => match (e.state, mode) {
-                (SleepState::Running, _) => false,
-                (SleepState::Interruptible, _) => true,
-                (SleepState::Uninterruptible | SleepState::Killable, WakeMode::Any) => true,
-                (SleepState::Killable, WakeMode::Fatal) => true,
-                (SleepState::Uninterruptible, _) | (SleepState::Killable, _) => false,
-            },
-            None => false,
-        };
-        if wake {
-            if let Some(e) = self.entry_mut(tid) {
-                e.state = SleepState::Running;
-            }
-            self.enqueue_task(tid);
-        }
-        wake
-    }
-
-    /// Dequeue the next task to run (the idle task is always runnable)
-    fn dequeue_next(&mut self) -> Tid {
-        loop {
-            let tid = self
-                .queue()
-                .dequeue_highest()
-                .expect("Idle task should always be runnable");
-            if let Some(e) = self.entry_mut(tid) {
-                e.queued = false;
-                return tid;
-            }
-            // Stale entry for an exited task: skip it
+        if self.curr_is_idle() || p.se.prio() > curr.se.prio() {
+            curr.set_tif(crate::task::tif::NEED_RESCHED);
         }
     }
 
-    /// Get context pointer for a task
-    pub fn get_context(&self, tid: Tid) -> Option<*const TaskContext> {
-        self.contexts
-            .iter()
-            .find(|(t, _)| *t == tid)
-            .map(|(_, ctx)| &ctx.context as *const TaskContext)
+    /// The next task to run: the first of the highest priority queued,
+    /// else the idle task (Linux pick_next_task)
+    fn pick_next(&mut self) -> *const KernelTask {
+        self.queue().pop().unwrap_or(self.idle)
     }
 
-    /// Get mutable context pointer for a task
-    pub fn get_context_mut(&mut self, tid: Tid) -> Option<*mut TaskContext> {
-        self.contexts
-            .iter_mut()
-            .find(|(t, _)| *t == tid)
-            .map(|(_, ctx)| &mut ctx.context as *mut TaskContext)
+    /// The running task is the idle task
+    fn curr_is_idle(&self) -> bool {
+        core::ptr::eq(self.curr, self.idle)
     }
 }
 
 /// Per-CPU scheduler state (lock + run queue)
 ///
-/// This is accessed via per-CPU data. Each CPU only takes its own `lock`;
-/// other CPUs post wakeups to `wake_list`, which the owner drains under its
-/// rq lock (Linux ttwu_queue / wake_list pattern).
+/// Only the owning CPU takes its rq `lock` (bring-up aside); other CPUs
+/// queue wakeups on `wake_list`, which the owner applies under the lock
+/// (Linux ttwu_queue_wakelist / sched_ttwu_pending).
 pub struct PerCpuScheduler {
     /// IRQ-safe lock protecting the run queue (owner CPU only)
     pub lock: IrqSpinlock<CpuRunQueue>,
-    /// Remote wakeups for tasks owned by this CPU, at most one entry
-    /// per task (`post_wake` merges), with capacity reserved for all of
-    /// them when a task is added: posting never allocates (IRQ
-    /// context). Leaf lock: nothing is acquired while holding it; nests
-    /// inside `lock` when drained.
-    wake_list: IrqSpinlock<Vec<(Tid, WakeMode)>>,
+    /// Remote wakeups (Linux rq->wake_list): a lock-free stack of this
+    /// CPU's tasks linked through `se.wake_next`, at most one entry per
+    /// task (`se.wake_pending`). Entries are pushed under the task's
+    /// pi_lock and hold no reference: an exiting task locks out new
+    /// pushes (Dead under its pi_lock) and drains the list before its
+    /// final switch, and tasks never migrate.
+    wake_list: AtomicPtr<()>,
     /// Whether this CPU's scheduler is initialized
     pub initialized: AtomicBool,
     /// Context switches performed on this CPU (a QSBR RCU would treat a
@@ -435,41 +326,50 @@ impl PerCpuScheduler {
     pub const fn new() -> Self {
         Self {
             lock: IrqSpinlock::new(CpuRunQueue::uninit()),
-            wake_list: IrqSpinlock::new(Vec::new()),
+            wake_list: AtomicPtr::new(core::ptr::null_mut()),
             initialized: AtomicBool::new(false),
             nr_switches: AtomicU64::new(0),
         }
     }
 
-    /// Apply wakeups posted by other CPUs (caller holds `self.lock`);
-    /// the list keeps its capacity
-    fn drain_wakes(&self, rq: &mut CpuRunQueue) {
-        let mut list = self.wake_list.lock();
-        for (tid, mode) in list.drain(..) {
-            rq.try_wake(tid, mode);
+    /// Queue a wakeup of `p` for this CPU (caller holds `p.pi_lock`);
+    /// true if the list was empty (the IPI is the caller's to send)
+    fn queue_wake(&self, p: &KernelTask) -> bool {
+        if p.se.wake_pending.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let new = p as *const KernelTask as *mut ();
+        let mut old = self.wake_list.load(Ordering::Relaxed);
+        loop {
+            p.se.wake_next.store(old, Ordering::Relaxed);
+            // Release: the task's state is visible to the owner's swap
+            match self.wake_list.compare_exchange_weak(
+                old,
+                new,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return old.is_null(),
+                Err(cur) => old = cur,
+            }
         }
     }
 
-    /// Post a remote wakeup without allocating: a task already listed
-    /// keeps one entry, with the mode that wakes the most sleepers (a
-    /// merged SIGKILL must still wake a `Killable` sleeper)
-    fn post_wake(&self, tid: Tid, mode: WakeMode) {
-        let mut list = self.wake_list.lock();
-        if let Some(e) = list.iter_mut().find(|e| e.0 == tid) {
-            e.1 = e.1.merge(mode);
-            return;
-        }
-        debug_assert!(list.len() < list.capacity(), "wake_list would allocate");
-        list.push((tid, mode));
-    }
-
-    /// Room in `wake_list` for each of the CPU's `n` tasks (thread
-    /// context, after adding a task)
-    fn reserve_wakes(&self, n: usize) {
-        let mut list = self.wake_list.lock();
-        if list.capacity() < n + RQ_SLACK {
-            let extra = n + RQ_SLACK - list.len();
-            list.reserve(extra);
+    /// Apply the queued remote wakeups (caller holds `self.lock`; Linux
+    /// sched_ttwu_pending). A task that exited meanwhile is skipped.
+    fn ttwu_pending(&self, rq: &mut CpuRunQueue) {
+        let mut p = self
+            .wake_list
+            .swap(core::ptr::null_mut(), Ordering::Acquire);
+        while !p.is_null() {
+            // SAFETY: a task of this CPU, live until it drains this list
+            // at exit (see `wake_list`)
+            let t = unsafe { &*(p as *const KernelTask) };
+            p = t.se.wake_next.load(Ordering::Relaxed);
+            t.se.wake_pending.store(false, Ordering::Release);
+            if t.se.state() != DEAD {
+                rq.activate(t);
+            }
         }
     }
 }
@@ -508,6 +408,8 @@ pub struct GlobalTaskTable {
 }
 
 crate::adapter!(TasksAdapter, KernelTask, tasks_link);
+crate::adapter!(pub PgrpLink, KernelTask, pgrp_link);
+crate::adapter!(pub SessionLink, KernelTask, session_link);
 
 /// A new reference to a task that lives in an `Arc` (every task but the
 /// boot task does: the table and run queues hold `TaskRef`s)
@@ -532,12 +434,6 @@ impl<'a> TaskView<'a> {
     /// The locked fields, for the whole borrow of the table
     pub fn fields(&self) -> &'a KernelTaskInner {
         self.inner
-    }
-
-    /// Its address space, for the whole borrow of the table
-    pub fn mm_ref(&self) -> Option<&'a crate::mm::MmRef> {
-        // SAFETY: TASKLIST is held for 'a (the view borrows it)
-        unsafe { self.task.mm() }.as_ref()
     }
 }
 
@@ -584,7 +480,7 @@ fn view_mut(task: &KernelTask) -> TaskViewMut<'_> {
     TaskViewMut { task, inner }
 }
 
-/// Owner fields of a task, read under TASKLIST (the views borrow it)
+/// Credentials of a task, read under TASKLIST (the views borrow it)
 macro_rules! owner_reads {
     ($t:ident) => {
         impl<'a> $t<'a> {
@@ -598,18 +494,6 @@ macro_rules! owner_reads {
             pub fn cred_arc(&self) -> Arc<Cred> {
                 // SAFETY: as above
                 unsafe { self.task.cred_arc() }
-            }
-
-            /// Its address space
-            pub fn mm(&self) -> Option<&crate::mm::MmRef> {
-                // SAFETY: as above
-                unsafe { self.task.mm() }.as_ref()
-            }
-
-            /// Its descriptor table
-            pub fn files(&self) -> Option<&Arc<crate::task::fdtable::Files>> {
-                // SAFETY: as above
-                unsafe { self.task.files() }.as_ref()
             }
         }
     };
@@ -645,21 +529,6 @@ impl TaskViewMut<'_> {
         // SAFETY: TASKLIST held mutably; callers are the owner or the
         // creator (see above)
         unsafe { self.task.set_cred(c) }
-    }
-
-    /// Install an address space (rules of `set_cred`)
-    pub fn set_mm(&mut self, mm: Option<crate::mm::MmRef>) -> Option<crate::mm::MmRef> {
-        // SAFETY: as above
-        unsafe { self.task.set_mm(mm) }
-    }
-
-    /// Install a descriptor table (rules of `set_cred`)
-    pub fn set_files(
-        &mut self,
-        f: Option<Arc<crate::task::fdtable::Files>>,
-    ) -> Option<Arc<crate::task::fdtable::Files>> {
-        // SAFETY: as above
-        unsafe { self.task.set_files(f) }
     }
 }
 
@@ -789,6 +658,7 @@ impl GlobalTaskTable {
             p.set_task(Arc::as_ptr(&task) as *const ());
         }
         self.tasks.push_back(task.clone());
+        self.attach_pids(&task);
         let leader = if task.tid() == task.pid {
             Some(task.clone())
         } else {
@@ -825,6 +695,7 @@ impl GlobalTaskTable {
         let t = task_ref(self.lookup(tid)?);
         self.unlink_child(&t);
         self.unlink_thread(&t);
+        self.detach_pids(&t);
         // SAFETY: the list is locked for writing, so no view exists
         if let Some(inner) = unsafe { t.inner().get() }
             && let Some(p) = &inner.thread_pid
@@ -834,6 +705,111 @@ impl GlobalTaskTable {
         // SAFETY: found through the hash, so on this list
         drop(unsafe { self.tasks.remove(&t) });
         Some(t)
+    }
+
+    /// The group leaders in process group `pg` (Linux
+    /// do_each_pid_task(pg, PIDTYPE_PGID))
+    pub fn pgrp<'a>(
+        &'a self,
+        pg: &'a crate::task::pid::Pid,
+    ) -> impl Iterator<Item = TaskView<'a>> + 'a {
+        // SAFETY: TASKLIST is held for 'a (we borrow the table); the
+        // list changes only with the table borrowed mutably
+        unsafe { pg.pgrp.get() }.iter().map(view)
+    }
+
+    /// The threads of every process in group `pg` (Linux
+    /// do_each_pid_thread(pg, PIDTYPE_PGID))
+    pub fn pgrp_threads<'a>(
+        &'a self,
+        pg: &'a crate::task::pid::Pid,
+    ) -> impl Iterator<Item = TaskView<'a>> + 'a {
+        self.pgrp(pg).flat_map(move |l| self.threads(l.task.pid))
+    }
+
+    /// A new task joins its creator's process group and session (Linux
+    /// copy_process: under the write lock, so the creator's concurrent
+    /// setpgid or setsid is not missed); the creator is in this list,
+    /// the child not yet
+    pub fn inherit_pids(&mut self, child: &KernelTask, parent: &KernelTask) {
+        // SAFETY: the parent is in this list, locked for writing; no
+        // `&mut` view of it is live
+        let Some(pi) = (unsafe { parent.inner().get() }).as_ref() else {
+            return;
+        };
+        let (pg, s) = (pi.pgrp.clone(), pi.session.clone());
+        child.pgid.store(parent.pgid(), Ordering::Relaxed);
+        child.sid.store(parent.sid(), Ordering::Relaxed);
+        // SAFETY: the child is not in the list yet: nothing else reaches
+        // its locked fields
+        if let Some(ci) = unsafe { child.inner().get_mut() }.as_mut() {
+            ci.pgrp = pg;
+            ci.session = s;
+        }
+    }
+
+    /// Put group leader `t` on its process group's and session's lists
+    /// (Linux attach_pid PIDTYPE_PGID, PIDTYPE_SID)
+    fn attach_pids(&mut self, t: &KernelTask) {
+        // SAFETY: in this list; no view is live
+        let ti = unsafe { self.inner_mut_of(t) };
+        if ti.pids_linked || !ti.leader {
+            return;
+        }
+        let (Some(pg), Some(s)) = (ti.pgrp.as_ref(), ti.session.as_ref()) else {
+            return;
+        };
+        // SAFETY: the table is locked for writing; `t` stays live while
+        // in the table and leaves these lists before it (`remove`)
+        unsafe {
+            pg.pgrp.get_mut().push_back(t);
+            s.session.get_mut().push_back(t);
+        }
+        ti.pids_linked = true;
+    }
+
+    /// Take `t` off its process group's and session's lists (Linux
+    /// detach_pid)
+    fn detach_pids(&mut self, t: &KernelTask) {
+        // SAFETY: in this list; no view is live
+        let ti = unsafe { self.inner_mut_of(t) };
+        if !core::mem::take(&mut ti.pids_linked) {
+            return;
+        }
+        if let (Some(pg), Some(s)) = (ti.pgrp.as_ref(), ti.session.as_ref()) {
+            // SAFETY: the table is locked for writing; linked means on
+            // both lists
+            unsafe {
+                pg.pgrp.get_mut().remove(t);
+                s.session.get_mut().remove(t);
+            }
+        }
+    }
+
+    /// Move process `pid` (every thread; its leader on the lists) to
+    /// group `pg` and, if given, session `s` (Linux change_pid); the
+    /// references it held go to `old`, dropped after TASKLIST
+    fn change_pids(
+        &mut self,
+        pid: Pid,
+        pg: &Arc<crate::task::pid::Pid>,
+        s: Option<&Arc<crate::task::pid::Pid>>,
+        old: &mut Vec<Arc<crate::task::pid::Pid>>,
+    ) {
+        let Some(l) = self.task(pid) else { return };
+        self.detach_pids(&l);
+        let threads: Vec<TaskRef> = self.threads(pid).map(|t| task_ref(t.task)).collect();
+        for t in &threads {
+            // SAFETY: in this list; no view is live
+            let ti = unsafe { self.inner_mut_of(t) };
+            old.extend(ti.pgrp.replace(pg.clone()));
+            t.pgid.store(pg.nr() as Pid, Ordering::Relaxed);
+            if let Some(s) = s {
+                old.extend(ti.session.replace(s.clone()));
+                t.sid.store(s.nr() as Pid, Ordering::Relaxed);
+            }
+        }
+        self.attach_pids(&l);
     }
 
     /// Number of tasks, zombies included
@@ -851,8 +827,22 @@ impl GlobalTaskTable {
 /// interrupt handler, so interrupts stay on)
 pub static TASKLIST: RwLock<GlobalTaskTable> = RwLock::new(GlobalTaskTable::new());
 
-/// Scheduling enabled flag
-pub static SCHEDULING_ENABLED: AtomicBool = AtomicBool::new(false);
+/// A task's `alloc_lock` held
+pub type KernelTaskLock<'a> = crate::task::TaskLock<'a, CurrentArch, ArchPageTable>;
+
+/// A reference to task `tid` (TASKLIST only for the lookup)
+pub fn find_task(tid: Tid) -> Option<TaskRef> {
+    TASKLIST.read().task(tid)
+}
+
+/// Run `f` with task `tid`'s `alloc_lock` held (Linux task_lock(p));
+/// TASKLIST is taken only to find it. Whatever `f` takes out of the
+/// task is returned, to be dropped after the lock (3.1.1 rule 4).
+pub fn with_task_lock<R>(tid: Tid, f: impl FnOnce(&mut KernelTaskLock<'_>) -> R) -> Option<R> {
+    let t = find_task(tid)?;
+    let r = f(&mut t.task_lock());
+    Some(r)
+}
 
 /// The boot CPU has per-CPU data (`init_bsp`); from then on every CPU
 /// running kernel code has its own
@@ -906,10 +896,34 @@ impl Cur {
         unsafe { self.task.mm() }.as_ref().map(|m| m.arc().clone())
     }
 
+    /// Its address space (a user reference)
+    pub fn mm_ref(&self) -> Option<crate::mm::MmRef> {
+        // SAFETY: the task itself
+        unsafe { self.task.mm() }.clone()
+    }
+
     /// Its descriptor table
     pub fn files(&self) -> Option<Arc<crate::task::fdtable::Files>> {
         // SAFETY: the task itself
         unsafe { self.task.files() }.clone()
+    }
+
+    /// Its filesystem context (Linux current->fs)
+    pub fn fs(&self) -> Option<Arc<crate::fs::FsStruct>> {
+        // SAFETY: the task itself
+        unsafe { self.task.fs() }.clone()
+    }
+
+    /// Its namespaces (Linux current->nsproxy)
+    pub fn nsproxy(&self) -> Option<Arc<crate::ns::NsProxy>> {
+        // SAFETY: the task itself
+        unsafe { self.task.nsproxy() }.clone()
+    }
+
+    /// Its name (Linux current->comm)
+    pub fn comm(&self) -> [u8; 16] {
+        // SAFETY: the task itself
+        unsafe { self.task.comm() }
     }
 
     /// The task is a kernel thread or the boot task (no user context)
@@ -980,8 +994,15 @@ fn idle_task_entry() -> ! {
         // Flush console before halting to ensure all output is sent
         crate::console::console_flush();
 
-        // If we're still running, no other work - halt until interrupt
-        // The STI;HLT pattern ensures we wake on the next interrupt atomically
+        // Halt until an interrupt unless a wakeup made a task runnable
+        // since the yield (it flags the idle task, interrupts off
+        // closes the window; the STI;HLT pattern enables them and halts
+        // atomically)
+        CurrentArch::disable_interrupts();
+        if current().has_tif(crate::task::tif::NEED_RESCHED) {
+            CurrentArch::enable_interrupts();
+            continue;
+        }
         CurrentArch::enable_and_halt();
     }
 }
@@ -990,16 +1011,17 @@ fn idle_task_entry() -> ! {
 ///
 /// `entry` runs on a fresh kernel stack with the rq lock
 /// released (`finish_context_switch`) but interrupts still disabled; it must
-/// enable them. A kernel thread is its own process (pid == tid, Linux);
-/// an `idle` task is tid 0, outside TASKLIST (Linux swapper/N).
+/// enable them. A kernel thread is its own process (pid == tid, Linux),
+/// created asleep (the creator finishes its setup, then wakes it); an
+/// `idle` task is tid 0, outside TASKLIST (Linux swapper/N), and becomes
+/// its CPU's idle task.
 fn create_kernel_task(
     cpu_id: u32,
     name: &str,
     entry: usize,
     priority: Priority,
-    start_asleep: bool,
     idle: bool,
-) -> Result<Tid, &'static str> {
+) -> Result<TaskRef, &'static str> {
     let thread_pid = if idle {
         None
     } else {
@@ -1014,20 +1036,16 @@ fn create_kernel_task(
     let stack_base = crate::mm::vmstack::alloc().ok_or("Out of memory for kernel thread stack")?;
     let stack_top = stack_base + KERNEL_STACK_SIZE as u64;
 
-    let context = TaskContext::new_kernel_thread(entry, stack_top);
-    let mut thread_ctx = KernelThreadContext::new(context, stack_base, KERNEL_STACK_SIZE, priority);
-    if start_asleep {
-        // Not runnable until wake_up_task (lets the creator finish setup)
-        thread_ctx.state = SleepState::Uninterruptible;
-    }
-
     let task_inner = crate::task::TaskInner {
         thread_pid,
+        // In no process group or session (never signalled by group)
+        pgrp: None,
+        session: None,
+        pids_linked: false,
         exit_code: 0,
         exit_signal: 0, // Kernel threads don't send exit signals
         pdeath_signal: 0,
         state: TaskState::Ready,
-        priority,
         policy: if priority == PRIORITY_IDLE {
             crate::task::SCHED_IDLE
         } else {
@@ -1041,25 +1059,15 @@ fn create_kernel_task(
         clear_child_tid: 0,
         set_child_tid: 0,
         // Shared resources (kernel threads don't have user-space resources)
-        fs: None,
-        nsproxy: None,
         sighand: None,
         signal: None,
-        io_context: None,
         sysvsem: None,
         // Per-task signal state
         robust_list: 0,
         // prctl state
-        prctl: {
-            let mut p = crate::task::PrctlState::default();
-            let n = name.len().min(15);
-            p.name[..n].copy_from_slice(&name.as_bytes()[..n]);
-            p
-        },
+        prctl: crate::task::PrctlState::default(),
         // Process personality (execution domain)
         personality: 0,
-        // NUMA memory policy (kernel threads use default)
-        mempolicy: crate::mm::mempolicy::TaskMempolicy::new(),
         // Seccomp state (kernel threads don't use seccomp)
         seccomp_filter: None,
         // I/O port permissions (x86-64 only, kernel threads don't use I/O ports)
@@ -1075,6 +1083,7 @@ fn create_kernel_task(
         threads: crate::list::ArcList::new(),
         ptrace_message: 0,
         ptrace_options: 0,
+        ptrace_code: 0,
     };
     let task = Task::new(
         tid,
@@ -1090,57 +1099,84 @@ fn create_kernel_task(
         cpu_id,
         alloc::sync::Arc::new(Cred::ROOT),
         None,
+        crate::task::TaskAlloc::named(name.as_bytes()),
         task_inner,
     );
 
+    task.se.set_prio(priority);
+    // SAFETY: not on a run queue yet
+    unsafe { *task.se.ctx() = TaskContext::new_kernel_thread(entry, stack_top) };
     let task = Arc::new(task);
-    if !idle {
+    if idle {
+        set_idle(cpu_id, &task);
+    } else {
         TASKLIST.write().insert(task.clone());
+        attach_asleep(&task);
     }
+    Ok(task)
+}
 
-    let sched = get_percpu_sched(cpu_id);
-    let mut rq = sched.lock.lock();
-    rq.init();
-    rq.add_task(&task, thread_ctx);
-    sched.reserve_wakes(rq.contexts.len());
-    if !start_asleep {
-        rq.enqueue_task(tid);
-    }
-    Ok(tid)
+/// Make `idle` the idle task of `cpu`, allocating its priority lists
+/// (bring-up, before the CPU schedules)
+fn set_idle(cpu: u32, idle: &TaskRef) {
+    let q = alloc::boxed::Box::new(PrioQueue::new());
+    idle.se.set_on_rq(true);
+    let mut rq = get_percpu_sched(cpu).lock.lock();
+    rq.queue = Some(q);
+    // The run queue's reference, kept for good
+    rq.idle = Arc::into_raw(idle.clone());
+}
+
+/// Give `p`'s run queue its reference to a task created asleep: it
+/// runs once woken (`try_to_wake_up`)
+fn attach_asleep(p: &TaskRef) {
+    p.se.set_state(SleepState::Uninterruptible as u8);
+    let _ = Arc::into_raw(p.clone());
+}
+
+/// Start a new task: its run queue takes its reference and queues it
+/// (Linux wake_up_new_task; the task is on this CPU)
+fn wake_up_new_task(p: &TaskRef) {
+    let mut rq = get_percpu_sched(p.cpu()).lock.lock();
+    let _ = Arc::into_raw(p.clone());
+    p.se.set_state(RUNNING);
+    p.se.set_on_rq(true);
+    rq.enqueue(p);
+    rq.check_preempt(p);
 }
 
 /// Create the idle task for a specific CPU and mark its scheduler ready
 ///
 /// The idle task is always runnable at PRIORITY_IDLE (0). The CPU may enter
 /// the scheduler only once this is done, so `initialized` is set last.
-fn create_idle_task(cpu_id: u32) -> Result<Tid, &'static str> {
-    let tid = create_kernel_task(
+fn create_idle_task(cpu_id: u32) -> Result<(), &'static str> {
+    crate::timer::init_cpu(cpu_id);
+    create_kernel_task(
         cpu_id,
         "swapper",
         idle_task_entry as *const () as usize,
         PRIORITY_IDLE,
-        false,
         true,
     )?;
-    let sched = get_percpu_sched(cpu_id);
-    sched.lock.lock().idle_tid = Some(tid);
-    sched.initialized.store(true, Ordering::Release);
-    printkln!("IDLE_TASK_CREATED: cpu={} tid={}", cpu_id, tid);
-    Ok(tid)
+    get_percpu_sched(cpu_id)
+        .initialized
+        .store(true, Ordering::Release);
+    printkln!("IDLE_TASK_CREATED: cpu={} tid=0", cpu_id);
+    Ok(())
 }
 
 /// Create a kernel thread on `cpu_id`, asleep (see `task::kthread`; start
-/// it with `wake_up_task`)
+/// it with `try_to_wake_up`)
 pub fn create_kthread_task(
     cpu_id: u32,
     name: &str,
     entry: usize,
     priority: Priority,
-) -> Result<Tid, &'static str> {
+) -> Result<TaskRef, &'static str> {
     if !get_percpu_sched(cpu_id).initialized.load(Ordering::Acquire) {
         return Err("CPU has no scheduler");
     }
-    create_kernel_task(cpu_id, name, entry, priority, true, false)
+    create_kernel_task(cpu_id, name, entry, priority, false)
 }
 
 /// Give every online AP a scheduler (idle task); each AP switches into it
@@ -1178,10 +1214,12 @@ pub fn init() {
     }
 }
 
-/// Enable scheduling globally
-pub fn enable() {
-    SCHEDULING_ENABLED.store(true, Ordering::Release);
-    printkln!("Scheduling enabled");
+/// The caller is a task that may sleep: this CPU's scheduler runs and
+/// it is neither an idle task nor the boot context before pid 1 exists
+/// (both tid 0, which never sleep; Linux: no might_sleep before
+/// SYSTEM_SCHEDULING, and idle never sleeps)
+pub fn can_sleep() -> bool {
+    current_tid() != 0 && this_sched().is_some()
 }
 
 /// Create a user task entry for the init process
@@ -1205,11 +1243,14 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
     // Create Task entry
     let task_inner = crate::task::TaskInner {
         thread_pid: Some(thread_pid),
+        // The boot group and session, number 0 (Linux init_struct_pid)
+        pgrp: crate::task::pid::find_pgrp(config.pgid),
+        session: crate::task::pid::find_pgrp(config.sid),
+        pids_linked: false,
         exit_code: 0,
         exit_signal: crate::signal::SIGCHLD as i32, // Default: notify parent with SIGCHLD
         pdeath_signal: 0,
         state: TaskState::Running, // Will be running immediately
-        priority: config.priority,
         policy: crate::task::SCHED_NORMAL,
         rt_priority: 0,
         reset_on_fork: false,
@@ -1219,24 +1260,14 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         clear_child_tid: 0,
         set_child_tid: 0,
         // Shared resources (will be initialized by caller via init_* functions)
-        fs: None,
-        nsproxy: None,
         sighand: None,
         signal: None,
-        io_context: None,
         sysvsem: None,
         // Per-task signal state
         robust_list: 0,
-        // prctl state; comm after the init binary, /bin/init (Linux
-        // names init after the file it execs)
-        prctl: crate::task::PrctlState {
-            name: *b"init\0\0\0\0\0\0\0\0\0\0\0\0",
-            ..crate::task::PrctlState::default()
-        },
+        prctl: crate::task::PrctlState::default(),
         // Process personality (execution domain)
         personality: 0,
-        // NUMA memory policy (user processes start with default)
-        mempolicy: crate::mm::mempolicy::TaskMempolicy::new(),
         // Seccomp state (disabled initially)
         seccomp_filter: None,
         // I/O port permissions (x86-64 only, no I/O port access initially)
@@ -1252,6 +1283,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         threads: crate::list::ArcList::new(),
         ptrace_message: 0,
         ptrace_options: 0,
+        ptrace_code: 0,
     };
     let task = Arc::new(Task::new(
         tid,
@@ -1267,34 +1299,28 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         cpu_id,
         alloc::sync::Arc::new(Cred::ROOT),
         Some(mm),
+        // comm after the init binary, /bin/init (Linux names init after
+        // the file it execs)
+        crate::task::TaskAlloc::named(b"init"),
         task_inner,
     ));
 
     // Add to global table
     TASKLIST.write().insert(task.clone());
 
-    // Create a kernel context for this task
-    // Initialize with current kernel stack - when the user task makes a syscall,
-    // we save its kernel-mode context here for sleeping/yielding
-    let context = TaskContext::default();
-    // The boot-allocated stack of the first task is never freed
-    let thread_ctx = KernelThreadContext::new(
-        context,
-        config.kstack_top - KERNEL_STACK_SIZE as u64,
-        0,
-        config.priority,
-    );
-
-    // Add to run queue
-    let sched = get_percpu_sched(cpu_id);
+    // The boot-allocated stack of the first task is never freed; its
+    // switch frame is saved at its first switch out
+    task.se.disown_stack();
+    task.se.set_prio(config.priority);
+    task.se.set_state(RUNNING);
+    task.se.set_on_rq(true);
     {
-        let mut rq = sched.lock.lock();
-        rq.add_task(&task, thread_ctx);
-        sched.reserve_wakes(rq.contexts.len());
+        let mut rq = get_percpu_sched(cpu_id).lock.lock();
         // The boot context becomes this task (Linux: init_task's
-        // kernel_init thread execs /sbin/init)
-        rq.current = Some(tid);
-        CurrentArch::set_current_task_ptr(Arc::as_ptr(&task) as usize);
+        // kernel_init thread execs /sbin/init); the run queue takes
+        // its reference
+        rq.curr = Arc::into_raw(task.clone());
+        CurrentArch::set_current_task_ptr(rq.curr as usize);
     }
 
     // Initialize filesystem context for the init task
@@ -1525,22 +1551,15 @@ pub fn take_leadership(tgid: Pid, tid: Tid) -> Vec<TaskRef> {
         m.exit_signal = exit_signal;
         m.task.start_time.store(start, Ordering::Relaxed);
     }
+    // ... and its place on the group's and session's lists (Linux
+    // de_thread: transfer_pid PIDTYPE_PGID, PIDTYPE_SID)
+    table.attach_pids(&me);
     drop(table);
     // The group's timers owned by the caller follow (after TASKLIST:
     // their locks are leaves taken under nothing)
     if let Some(sig) = sig {
         crate::posix_timer::retarget(&sig, tid, ltid);
     }
-    // Its run-queue entry follows (after TASKLIST: rq -> TASKLIST)
-    let sched = get_percpu_sched(me.cpu());
-    let mut rq = sched.lock.lock();
-    if let Some(e) = rq.contexts.iter_mut().find(|(t, _)| *t == tid) {
-        e.0 = ltid;
-    }
-    if rq.current == Some(tid) {
-        rq.current = Some(ltid);
-    }
-    drop(rq);
     gone
 }
 
@@ -1558,6 +1577,60 @@ fn group_status(t: &KernelTaskInner, own: i32) -> i32 {
         Some(crate::signal::GroupExit::Exit(code)) => code,
         _ => own,
     }
+}
+
+/// A ptrace stop of a task traced by the group `tracer_pid`, matching
+/// `target_pid` (wait4's pid: > 0 that tid, -1 any, 0 the caller's
+/// process group, < -1 that group), not yet reported: its tid and the
+/// stop's code. Reported once unless `wnowait` (Linux wait_task_stopped
+/// with ptrace: exit_code cleared). Found under the read lock; the write
+/// lock only to take the code.
+pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(Tid, u32)> {
+    let pgid = current_pgid();
+    let found = |t: &TaskView<'_>| {
+        matches!(t.state, TaskState::Traced(_))
+            && t.ptrace_code != 0
+            && tracee_of(t, tracer_pid)
+            && wait_match(t, target_pid, pgid)
+    };
+    let tid = TASKLIST.read().find(found)?.task.tid();
+    let mut table = TASKLIST.write();
+    // Everything may have changed meanwhile (resumed, reported,
+    // detached, the tid reused): the whole check again
+    if !table.get(tid).is_some_and(|t| found(&t)) {
+        return None;
+    }
+    let mut t = table.get_mut(tid)?;
+    let code = t.ptrace_code;
+    if !wnowait {
+        t.ptrace_code = 0;
+    }
+    Some((tid, code))
+}
+
+/// `t` is what wait4's `target_pid` names (`pgid`: the caller's group)
+fn wait_match(t: &TaskView<'_>, target_pid: i64, pgid: Pid) -> bool {
+    match target_pid {
+        -1 => true,
+        0 => t.task.pgid() == pgid,
+        p if p < -1 => t.task.pgid() == p.unsigned_abs(),
+        p => t.task.tid() == p as u64,
+    }
+}
+
+/// `t` is traced by a thread of group `tracer_pid`
+fn tracee_of(t: &TaskView<'_>, tracer_pid: Pid) -> bool {
+    t.ptrace != 0 && t.tracer().is_some_and(|tr| tr.pid == tracer_pid)
+}
+
+/// The group `tracer_pid` traces a task matching `target_pid` (so a
+/// wait for it is not ECHILD)
+pub fn has_tracees(tracer_pid: Pid, target_pid: i64) -> bool {
+    let pgid = current_pgid();
+    let table = TASKLIST.read();
+    table
+        .iter()
+        .any(|t| tracee_of(&t, tracer_pid) && wait_match(&t, target_pid, pgid))
 }
 
 /// Check if a process has any children matching the criteria
@@ -1698,12 +1771,10 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         parent_cred,
         parent_prctl,
         parent_personality,
-        parent_mempolicy,
         parent_seccomp_mode,
         parent_seccomp_filter,
         parent_ptrace,
         parent_ptracer,
-        parent_pid_ns,
         parent_real_parent,
     ) = {
         let table = TASKLIST.read();
@@ -1713,7 +1784,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.task.ppid(),
             parent.task.pgid(),
             parent.task.sid(),
-            parent.priority,
+            parent.task.se.prio(),
             parent.policy,
             parent.rt_priority,
             parent.reset_on_fork,
@@ -1722,18 +1793,23 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.cred_arc(),
             parent.prctl.clone(),
             parent.personality,
-            parent.mempolicy,
             parent.task.seccomp_mode(),
             parent.seccomp_filter.clone(),
             parent.ptrace,
             parent.ptracer.clone(),
-            parent
-                .nsproxy
-                .as_ref()
-                .map_or_else(|| crate::ns::INIT_PID_NS.clone(), |n| n.pid_ns.clone()),
             parent.real_parent.clone(),
         )
     };
+    // Its own alloc_lock fields (lock-free but the memory policy)
+    let me = current();
+    let parent_alloc = crate::task::TaskAlloc {
+        comm: me.comm(),
+        mempolicy: me.task_lock().mempolicy(),
+    };
+    let parent_pid_ns = me
+        .nsproxy()
+        .map_or_else(|| crate::ns::INIT_PID_NS.clone(), |n| n.pid_ns.clone());
+    let parent_mm = me.mm_ref();
 
     // Get parent iopl_emul (x86-64 only) - must be done in separate block
     #[cfg(target_arch = "x86_64")]
@@ -1768,10 +1844,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
 
     // The child's address space (Linux copy_mm): shared for CLONE_VM,
     // else a copy (dup_mm). Dropped on any error below.
-    let parent_mm = {
-        let table = TASKLIST.read();
-        table.get(current_tid).and_then(|t| t.mm().cloned())
-    };
     let child_mm = match parent_mm {
         None => None,
         Some(pm) if config.flags & CLONE_VM != 0 => Some(pm),
@@ -1813,8 +1885,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // the TrapFrame and the saved FP state
     let frame_top = CurrentArch::clone_child_fpu(trapframe_ptr);
     let context = CurrentArch::new_clone_child_context(frame_top);
-    let thread_ctx =
-        KernelThreadContext::new(context, stack_base, KERNEL_STACK_SIZE, child_priority);
 
     // Determine child's parent PID
     // CLONE_PARENT or CLONE_THREAD: child becomes sibling (same parent as caller)
@@ -1828,11 +1898,14 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Create child task
     let child_task_inner = crate::task::TaskInner {
         thread_pid: Some(child_thread_pid),
+        // Set from the creator's under TASKLIST (`inherit_pids`)
+        pgrp: None,
+        session: None,
+        pids_linked: false,
         exit_code: 0,
         exit_signal: config.exit_signal, // From clone3 args (SIGCHLD for fork, 0 for threads)
         pdeath_signal: 0,                // Never inherited, must be set explicitly via prctl
         state: TaskState::Ready,
-        priority: child_priority,
         policy: child_policy,
         rt_priority: child_rt_priority,
         reset_on_fork: false, // Never inherited - child must set explicitly
@@ -1842,18 +1915,14 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         clear_child_tid: 0,
         set_child_tid: 0,
         // Shared resources (will be cloned/shared based on clone flags below)
-        fs: None,
-        nsproxy: None,
         sighand: None,
         signal: None,
-        io_context: None,
         sysvsem: None,
         // Per-task signal state (always per-task, not shared)
         robust_list: 0,
         // prctl state: the name is inherited (dumpability lives in the
         // mm: shared with CLONE_VM, copied by dup_mm)
         prctl: crate::task::PrctlState {
-            name: parent_prctl.name,
             no_new_privs: parent_prctl.no_new_privs, // Inherited (irreversible)
             timer_slack_ns: parent_prctl.timer_slack_ns, // Inherited
             keep_caps: false,                        // Reset on fork
@@ -1864,8 +1933,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         },
         // Process personality (inherited from parent)
         personality: parent_personality,
-        // NUMA memory policy (inherited from parent)
-        mempolicy: parent_mempolicy,
         // Seccomp state (inherited from parent)
         // Seccomp filters are reference-counted, so this is cheap
         seccomp_filter: parent_seccomp_filter,
@@ -1906,6 +1973,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         threads: crate::list::ArcList::new(),
         ptrace_message: 0,
         ptrace_options: 0,
+        ptrace_code: 0,
     };
     let child_task = Arc::new(Task::new(
         child_tid,
@@ -1921,15 +1989,21 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         cpu_id,
         crate::task::copy_creds(config.flags, &parent_cred),
         child_mm,
+        // The name and memory policy are inherited
+        parent_alloc,
         child_task_inner,
     ));
     if parent_nproc_exceeded {
         child_task.set_flag(crate::task::pf::NPROC_EXCEEDED);
     }
+    child_task.se.set_prio(child_priority);
+    // SAFETY: not on a run queue yet
+    unsafe { *child_task.se.ctx() = context };
 
     // Add to global task table
     {
         let mut table = TASKLIST.write();
+        table.inherit_pids(&child_task, &current());
         table.insert(child_task.clone());
         // A new process joins its real parent's children (Linux: only
         // group leaders are on children lists)
@@ -2082,13 +2156,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
     // Only a fully set up child becomes runnable (Linux: wake_up_new_task
     // at the end of kernel_clone); before this it has no mm, files or
     // signal state to run with
-    let sched = get_percpu_sched(cpu_id);
-    {
-        let mut rq = sched.lock.lock();
-        rq.add_task(&child_task, thread_ctx);
-        sched.reserve_wakes(rq.contexts.len());
-        rq.enqueue_task(child_tid);
-    }
+    wake_up_new_task(&child_task);
 
     // CLONE_VFORK: parent sleeps until the child exec()s or _exit()s
     // (Linux wait_for_vfork_done; uninterruptible here, so the
@@ -2311,6 +2379,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     };
     if tid != 0 {
         forget_original_parent();
+        crate::task::ptrace::exit_ptrace();
     }
     if let Some(st) = status {
         mark_zombie(tid, st, group_dead);
@@ -2320,40 +2389,39 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // Let a parent sleeping in wait4/waitid re-check for zombies
     crate::task::proc::CHILD_EXIT_WQ.wake_all();
 
+    // No wakeup touches the task from here on (Linux TASK_DEAD): new
+    // ones see Dead under its pi_lock, and the remote ones already
+    // queued are drained below
+    let me = current();
+    {
+        let _pi = me.pi_lock.lock();
+        me.se.set_state(DEAD);
+    }
+
     let sched = current_percpu_sched().expect("No scheduler");
     let mut rq = sched.lock.lock();
-    sched.drain_wakes(&mut rq);
+    sched.ttwu_pending(&mut rq);
 
-    // Remove from the run queue (the Task stays in TASKLIST as a zombie);
-    // its stack and mm go once this CPU runs something else
-    let mut dead = DeadTask {
-        stack: (0, 0),
+    // Off the run queue for good; its stack, mm and the run queue's
+    // reference go once this CPU runs something else
+    me.se.set_on_rq(false);
+    let stack = if me.se.owns_stack() {
+        (me.kstack_top - KERNEL_STACK_SIZE as u64, KERNEL_STACK_SIZE)
+    } else {
+        (0, 0)
+    };
+    // SAFETY: the run queue's reference to the running task
+    let task = Some(unsafe { Arc::from_raw(rq.curr) });
+    rq.dead = Some(DeadTask {
+        stack,
         mm: dead_mm,
-        task: None,
-    };
-    if let Some(tid) = rq.current.take() {
-        if let Some(pos) = rq.contexts.iter().position(|(t, _)| *t == tid) {
-            let (_, ctx) = rq.contexts.remove(pos);
-            dead.stack = (ctx.stack_base, ctx.stack_size);
-            dead.task = ctx.task;
-        }
-        rq.sleep_queue.retain(|e| e.tid != tid);
-        rq.nr_running = rq.nr_running.saturating_sub(1);
-    }
-    rq.dead.push(dead);
+        task,
+    });
 
-    let next_tid = rq.dequeue_next();
-    let (Some(next_ctx), Some((next_kstack, next_mm, (next_tls, next_gs)))) =
-        (rq.get_context(next_tid), make_current(&rq, next_tid))
-    else {
-        // No context available, fall back to halt loop
-        drop(rq);
-        loop {
-            CurrentArch::halt();
-        }
-    };
-
-    rq.current = Some(next_tid);
+    let next = rq.pick_next();
+    // SAFETY: a task of this run queue, alive while it holds it
+    let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(unsafe { &*next });
+    rq.curr = next;
     sched.nr_switches.fetch_add(1, Ordering::Relaxed);
 
     // The rq lock stays held across the switch, as for any switch: the
@@ -2365,23 +2433,20 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // Switch to next task - never returns
     unsafe {
         switch_mm(next_mm);
-        CurrentArch::context_switch_first(next_ctx, next_kstack, next_tls, next_gs);
+        CurrentArch::context_switch_first((*next).se.ctx(), next_kstack, next_tls, next_gs);
     }
 }
 
 /// Make `next` (on this run queue) this CPU's current task: per-CPU
-/// `curr` points at it and /proc sees it running. Returns its kernel
-/// stack for user entry (0 for kernel threads, which never return to
-/// user mode), its address space (null for none) and its user TLS
-/// register and GS base.
+/// `curr` points at it. Returns its kernel stack for user entry (0 for
+/// kernel threads, which never return to user mode), its address space
+/// (null for none) and its user TLS register and GS base.
 ///
 /// The caller holds the rq lock and `next` is not running, so nothing
 /// changes its address space meanwhile (only the task itself does, or
 /// its creator before it first runs), and the run queue's reference
 /// keeps it alive until it has switched away for good.
-fn make_current(rq: &CpuRunQueue, next: Tid) -> Option<(u64, *const crate::mm::Mm, (u64, u64))> {
-    let t = rq.entry(next)?.task.as_ref()?;
-    t.sleeping.store(false, Ordering::Relaxed);
+fn make_current(t: &KernelTask) -> (u64, *const crate::mm::Mm, (u64, u64)) {
     let kstack = if matches!(t.kind, TaskKind::KernelThread) {
         0
     } else {
@@ -2391,12 +2456,12 @@ fn make_current(rq: &CpuRunQueue, next: Tid) -> Option<(u64, *const crate::mm::M
     let mm = unsafe { t.mm() }
         .as_ref()
         .map_or(core::ptr::null(), |m| Arc::as_ptr(m.arc()));
-    CurrentArch::set_current_task_ptr(Arc::as_ptr(t) as usize);
+    CurrentArch::set_current_task_ptr(t as *const KernelTask as usize);
     let tls = (
         t.tls.load(Ordering::Relaxed),
         t.gsbase.load(Ordering::Relaxed),
     );
-    Some((kstack, mm, tls))
+    (kstack, mm, tls)
 }
 
 /// Load the address space of the task switched to (`make_current`)
@@ -2408,51 +2473,42 @@ unsafe fn switch_mm(mm: *const crate::mm::Mm) {
     crate::mm::tlb::switch_mm(unsafe { mm.as_ref() });
 }
 
-/// Switch from the current task `cur` to `next` with `rq` held
+/// Switch from the current task `prev` to `next` with `rq` held (Linux
+/// context_switch)
 ///
 /// The lock stays held across the switch and is released by whichever task
 /// runs next (its own guard drop, or `finish_context_switch` for a new
-/// task). `cur`'s user registers stay in its pt_regs, on its own kernel
+/// task). `prev`'s user registers stay in its pt_regs, on its own kernel
 /// stack.
 fn context_switch_locked(
     sched: &PerCpuScheduler,
     mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>,
-    cur: Tid,
-    next: Tid,
+    prev: &KernelTask,
+    next: *const KernelTask,
 ) {
     check_switch_atomic();
-    let me = current();
-    let sleeps = rq
-        .entry(cur)
-        .is_some_and(|e| e.state != SleepState::Running);
-    me.sleeping.store(sleeps, Ordering::Relaxed);
     // Save the outgoing task's user TLS register and GS base (user code
     // may have changed them without a syscall, e.g. msr tpidr_el0, mov
     // gs); the arch switch loads `next`'s
-    if !me.is_kthread() {
-        me.tls
+    if !prev.has_flag(crate::task::pf::KTHREAD) {
+        prev.tls
             .store(crate::arch::read_user_tls(), Ordering::Relaxed);
-        me.gsbase
+        prev.gsbase
             .store(crate::arch::read_user_gsbase(), Ordering::Relaxed);
     }
-    if rq.get_context(next).is_none() || rq.get_context(cur).is_none() {
-        return;
-    }
-    let Some((next_kstack, next_mm, (next_tls, next_gs))) = make_current(&rq, next) else {
-        return;
-    };
-    let (Some(curr_ctx), Some(next_ctx)) = (rq.get_context_mut(cur), rq.get_context(next)) else {
-        return;
-    };
-    rq.current = Some(next);
+    // SAFETY: a task of this run queue, alive while it holds it
+    let n = unsafe { &*next };
+    let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(n);
+    rq.curr = next;
     sched.nr_switches.fetch_add(1, Ordering::Relaxed);
 
+    // SAFETY: both frames are under the rq lock we hold
     unsafe {
         switch_mm(next_mm);
-        CurrentArch::context_switch(curr_ctx, next_ctx, next_kstack, next_tls, next_gs);
+        CurrentArch::context_switch(prev.se.ctx(), n.se.ctx(), next_kstack, next_tls, next_gs);
     }
-    // Back on `cur` (the rq lock is held again; `rq` releases it)
-    let dead = core::mem::take(&mut rq.dead);
+    // Back on `prev` (the rq lock is held again; `rq` releases it)
+    let dead = rq.dead.take();
     drop(rq);
     drop(dead);
 }
@@ -2477,24 +2533,16 @@ fn check_switch_atomic() {
 
 /// This CPU's scheduler, if initialized
 fn this_sched() -> Option<&'static PerCpuScheduler> {
-    if !SCHEDULING_ENABLED.load(Ordering::Acquire) {
-        return None;
-    }
     current_percpu_sched().filter(|s| s.initialized.load(Ordering::Acquire))
 }
 
 /// Set the current task's sleep state (Linux set_current_state)
 ///
-/// Call before re-checking the wait condition; a wakeup arriving after this
-/// point makes the following `schedule()` return immediately.
+/// Call before re-checking the wait condition (a full barrier orders the
+/// two); a wakeup arriving after this point sets it back to Running, so
+/// the following `schedule()` returns immediately.
 pub fn set_current_state(state: SleepState) {
-    let Some(sched) = this_sched() else { return };
-    let mut rq = sched.lock.lock();
-    if let Some(cur) = rq.current
-        && let Some(e) = rq.entry_mut(cur)
-    {
-        e.state = state;
-    }
+    current().se.set_state(state as u8);
 }
 
 /// Give up the CPU until woken, if the current task's state is not Running
@@ -2505,23 +2553,25 @@ pub fn set_current_state(state: SleepState) {
 pub fn schedule() {
     crate::sync::might_sleep();
     let Some(sched) = this_sched() else { return };
+    let me = current();
     // This is the rescheduling a pending NEED_RESCHED asked for
-    current().clear_tif(crate::task::tif::NEED_RESCHED);
+    me.clear_tif(crate::task::tif::NEED_RESCHED);
     let mut rq = sched.lock.lock();
-    sched.drain_wakes(&mut rq);
-    let Some(cur) = rq.current else { return };
-    match rq.entry_mut(cur) {
-        Some(e) if e.state != SleepState::Running => {}
-        _ => return,
-    }
-    let next = rq.dequeue_next();
-    if next == cur {
-        if let Some(e) = rq.entry_mut(cur) {
-            e.state = SleepState::Running;
-        }
+    sched.ttwu_pending(&mut rq);
+    if rq.curr.is_null() || rq.curr_is_idle() || me.se.state() == RUNNING {
         return;
     }
-    context_switch_locked(sched, rq, cur, next);
+    // Leave the run queue (Linux deactivate_task), then look again: a
+    // waker that still saw us on it set Running and did nothing else
+    // (try_to_wake_up), so stay
+    me.se.set_on_rq(false);
+    if me.se.state() == RUNNING {
+        me.se.set_on_rq(true);
+        return;
+    }
+    me.nvcsw.fetch_add(1, Ordering::Relaxed);
+    let next = rq.pick_next();
+    context_switch_locked(sched, rq, &me, next);
 }
 
 /// Timeout value meaning "no timeout" for [`schedule_timeout`]
@@ -2531,71 +2581,160 @@ pub const MAX_SCHEDULE_TIMEOUT: u64 = u64::MAX;
 ///
 /// The caller sets its state first. Returns the ticks left (0 if the
 /// timeout expired); whichever of wakeup and timeout comes first ends the
-/// sleep and the other is cancelled.
+/// sleep and the other is cancelled. The timeout is a HARD timer on
+/// this stack (Linux process_timeout), deleted before returning.
 pub fn schedule_timeout(timeout: u64) -> u64 {
     if timeout == MAX_SCHEDULE_TIMEOUT {
         schedule();
         return MAX_SCHEDULE_TIMEOUT;
     }
-    let Some(sched) = this_sched() else { return 0 };
-    let expire = get_ticks().saturating_add(timeout);
-    let cur = {
-        let mut rq = sched.lock.lock();
-        let Some(cur) = rq.current else { return 0 };
-        if timeout == 0 {
-            if let Some(e) = rq.entry_mut(cur) {
-                e.state = SleepState::Running;
-            }
-            return 0;
-        }
-        let pos = rq.sleep_queue.partition_point(|e| e.wake_tick <= expire);
-        rq.sleep_queue.insert(
-            pos,
-            SleepEntry {
-                tid: cur,
-                wake_tick: expire,
-                priority: 0,
-            },
-        );
-        cur
-    };
-    schedule();
-    {
-        let mut rq = sched.lock.lock();
-        if let Some(pos) = rq
-            .sleep_queue
-            .iter()
-            .position(|e| e.tid == cur && e.wake_tick == expire)
-        {
-            rq.sleep_queue.remove(pos);
-        }
+    if this_sched().is_none() {
+        return 0;
     }
+    let me = current();
+    if timeout == 0 {
+        me.se.set_state(RUNNING);
+        return 0;
+    }
+    let expire = get_ticks().saturating_add(timeout);
+    let t = core::pin::pin!(crate::timer::TimerList::new(
+        process_timeout,
+        crate::timer::TIMER_HARD
+    ));
+    t.set_data(&*me as *const KernelTask as usize);
+    t.as_ref().mod_timer(expire);
+    schedule();
+    t.del_timer_sync();
     expire.saturating_sub(get_ticks())
 }
 
-/// Wake task `tid` owned by `cpu` (Linux try_to_wake_up)
+/// A `schedule_timeout` sleep timed out (tick interrupt): wake its task
+fn process_timeout(t: &crate::timer::TimerList) {
+    // SAFETY: the sleeper, which deletes the timer before it returns
+    try_to_wake_up(unsafe { &*(t.data() as *const KernelTask) }, WakeMode::Any);
+}
+
+/// Wake `p` if it sleeps in a state `mode` ends (Linux try_to_wake_up)
 ///
-/// Safe from any context, including IRQ handlers, but never while holding
-/// this CPU's rq lock. Local wakeups take the own rq lock; remote ones are
-/// posted to the owner's wake list and applied at its next scheduling point
-/// or tick (no cross-CPU rq locking). Returns true if a local sleeper was
-/// woken or a remote wakeup was posted.
-pub fn wake_up_task(tid: Tid, cpu: u32, mode: WakeMode) -> bool {
-    let Some(target) = PERCPU_SCHEDS.try_get(cpu) else {
-        return false;
-    };
-    if !target.initialized.load(Ordering::Acquire) {
+/// Any context, including IRQ handlers, but never with this CPU's rq
+/// lock held. Under `p.pi_lock` (which serializes its wakers): the
+/// state goes back to Running; a task still on its run queue (it has
+/// not switched out yet) is left to see that in `schedule()`; else it
+/// is queued, under the local rq lock, or through its CPU's lock-free
+/// wake list and a reschedule IPI. Returns true if `p` was asleep.
+///
+/// The sleeper sets its state, then checks its condition; the waker
+/// makes the condition true, then reads the state: each side's store
+/// comes before its load (full barriers), so one of them sees the
+/// other's (no lost wakeup).
+pub fn try_to_wake_up(p: &KernelTask, mode: WakeMode) -> bool {
+    let _pi = p.pi_lock.lock();
+    // Order the caller's condition store before the state load (Linux
+    // smp_mb__after_spinlock)
+    core::sync::atomic::fence(Ordering::SeqCst);
+    if !mode.wakes(p.se.state()) {
         return false;
     }
+    p.se.set_state(RUNNING);
+    if p.se.on_rq() {
+        return true;
+    }
+    let cpu = p.cpu();
+    let Some(sched) = PERCPU_SCHEDS.try_get(cpu) else {
+        return false;
+    };
     if crate::cpu::try_this_id() == Some(cpu) {
-        let mut rq = target.lock.lock();
-        rq.try_wake(tid, mode)
-    } else {
-        target.post_wake(tid, mode);
-        // Linux ttwu_queue_wakelist: an idle owner applies it now, not
-        // at its next tick
+        sched.lock.lock().activate(p);
+    } else if sched.queue_wake(p) {
+        // Linux ttwu_queue_wakelist: the owner applies it now, not at
+        // its next scheduling point
         crate::smp::smp_send_reschedule(cpu);
-        true
+    }
+    true
+}
+
+/// Reschedule IPI (any CPU, interrupts off): apply the remote wakeups
+/// queued for this CPU (Linux scheduler_ipi -> sched_ttwu_pending)
+pub fn sched_ipi() {
+    if let Some(sched) = current_percpu_sched()
+        && sched.initialized.load(Ordering::Acquire)
+    {
+        let mut rq = sched.lock.lock();
+        sched.ttwu_pending(&mut rq);
+    }
+}
+
+/// Tasks to wake once the caller's locks are released (Linux
+/// wake_q_head): `add` under a lock takes a reference to the task and
+/// links it through its `se.wake_q`; `wake_up` (or dropping the queue)
+/// wakes them. A task already on some WakeQ is not added again: that
+/// queue's wakeup stands for this one (Linux wake_q_add).
+pub struct WakeQ {
+    first: *mut (),
+    last: *const KernelTask,
+}
+
+/// `se.wake_q` of the last task on a WakeQ (Linux WAKE_Q_TAIL)
+const WAKE_Q_TAIL: *mut () = core::ptr::dangling_mut::<()>();
+
+impl WakeQ {
+    pub const fn new() -> Self {
+        Self {
+            first: WAKE_Q_TAIL,
+            last: core::ptr::null(),
+        }
+    }
+
+    /// Queue `p` for a wakeup (its waiter may return once it sees
+    /// itself dequeued: the reference keeps `p` alive)
+    pub fn add(&mut self, p: &KernelTask) {
+        if p.se
+            .wake_q
+            .compare_exchange(
+                core::ptr::null_mut(),
+                WAKE_Q_TAIL,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let raw = Arc::into_raw(task_ref(p)) as *mut ();
+        // SAFETY: `last` is a task this queue holds a reference to
+        match unsafe { self.last.as_ref() } {
+            Some(l) => l.se.wake_q.store(raw, Ordering::Relaxed),
+            None => self.first = raw,
+        }
+        self.last = raw as *const KernelTask;
+    }
+
+    /// Wake every queued task and drop the queue's references (thread
+    /// context: the last reference may free the task)
+    pub fn wake_up(&mut self) {
+        let mut p = core::mem::replace(&mut self.first, WAKE_Q_TAIL);
+        self.last = core::ptr::null();
+        while p != WAKE_Q_TAIL {
+            // SAFETY: added with Arc::into_raw
+            let t = unsafe { Arc::from_raw(p as *const KernelTask) };
+            p = t.se.wake_q.load(Ordering::Relaxed);
+            // Off the queue before the wakeup, so a later waker can
+            // queue it again (Linux wake_up_q)
+            t.se.wake_q.store(core::ptr::null_mut(), Ordering::Release);
+            try_to_wake_up(&t, WakeMode::Any);
+        }
+    }
+}
+
+impl Default for WakeQ {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for WakeQ {
+    fn drop(&mut self) {
+        self.wake_up();
     }
 }
 
@@ -2603,32 +2742,16 @@ pub fn wake_up_task(tid: Tid, cpu: u32, mode: WakeMode) -> bool {
 /// soon: a reschedule IPI interrupts it, and its return to user mode
 /// runs the work (Linux kick_process). Nothing to do for a task on this
 /// CPU (it is the caller, or not running) or not running at all.
-/// Process context only (takes TASKLIST; the caller must not hold it).
-pub fn kick_process(tid: Tid) {
-    let Some(t) = TASKLIST.read().task(tid) else {
-        return;
-    };
+pub fn kick_process(t: &KernelTask) {
     let cpu = t.cpu();
-    let running = CurrentArch::current_task_ptr_of(cpu) == Arc::as_ptr(&t) as usize;
+    let running = CurrentArch::current_task_ptr_of(cpu) == t as *const KernelTask as usize;
     if running && crate::cpu::try_this_id() != Some(cpu) {
         crate::smp::smp_send_reschedule(cpu);
     }
 }
 
-/// Wake task `tid`, looking up its CPU (process context only: takes
-/// TASKLIST; the caller must not hold it)
-pub fn wake_up_tid(tid: Tid, mode: WakeMode) -> bool {
-    let cpu = {
-        let table = TASKLIST.read();
-        match table.get(tid) {
-            Some(t) => t.task.cpu(),
-            None => return false,
-        }
-    };
-    wake_up_task(tid, cpu, mode)
-}
-
-/// Scheduler tick period (both arches program a 10 ms local timer)
+/// Scheduler tick period (each CPU's tick is a HARD hrtimer re-armed
+/// every TICK_NS: `hrtimer::tick_fire`)
 pub const TICK_MS: u64 = 10;
 /// Scheduler tick period in nanoseconds
 pub const TICK_NS: u64 = TICK_MS * 1_000_000;
@@ -2645,23 +2768,20 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
 
 /// Per-CPU timer tick (IRQ context, every CPU)
 ///
-/// Every CPU's local timer fires every TICK_MS, so only CPU 0 advances the
-/// global tick count (jiffies) and checks software timers; previously each
-/// CPU advanced it, making time run ~Ncpu times too fast. All CPUs then do
-/// their own scheduler work (remote wakeups, expired sleepers), and the
-/// running task's slice (one tick, round robin within a priority) is used
-/// up: TIF_NEED_RESCHED, acted on at its next return to user mode
-/// (`entry::exit_to_user_mode`; Linux scheduler_tick -> resched_curr).
+/// Every CPU's tick hrtimer fires every TICK_MS, so only CPU 0 advances
+/// the global tick count (jiffies). All CPUs then do their own work
+/// (remote wakeups, their timers: HARD callbacks run here, `ktimers/N`
+/// is woken for SOFT ones), and the running task's slice (one tick,
+/// round robin within a priority) is used up: TIF_NEED_RESCHED, acted
+/// on at its next return to user mode (`entry::exit_to_user_mode`;
+/// Linux scheduler_tick -> resched_curr).
 pub fn scheduler_tick() {
-    crate::sync::lockdep::irq_enter();
     if crate::cpu::try_this_id() == Some(0) {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-        // Wake ktimerd if a software timer expired
-        crate::timer::check_timers();
     }
-    wake_sleepers();
+    sched_ipi();
+    crate::timer::run_local();
     current().set_tif(crate::task::tif::NEED_RESCHED);
-    crate::sync::lockdep::irq_exit();
 }
 
 /// Get current tick count
@@ -2669,11 +2789,25 @@ pub fn get_ticks() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
 }
 
-/// Sleep until CLOCK_MONOTONIC reaches `deadline_ns`
+/// Sleep until CLOCK_MONOTONIC reaches `deadline_ns` (see [`sleep_until`])
+pub fn sleep_until_ns(deadline_ns: u64, interruptible: bool) -> Result<(), u64> {
+    sleep_until(
+        deadline_ns,
+        crate::hrtimer::HrClock::Monotonic,
+        interruptible,
+    )
+}
+
+/// Sleep until `clock` reaches `deadline` ns (Linux hrtimer_nanosleep)
 ///
 /// Interruptible sleeps stop early when a signal is pending and return
-/// `Err(ns_left)`. Wakes at tick granularity, never before the deadline.
-pub fn sleep_until_ns(deadline_ns: u64, interruptible: bool) -> Result<(), u64> {
+/// `Err(ns_left)`. ns-precise (an hrtimer), never before the deadline;
+/// an absolute CLOCK_REALTIME deadline follows clock steps.
+pub fn sleep_until(
+    deadline: u64,
+    clock: crate::hrtimer::HrClock,
+    interruptible: bool,
+) -> Result<(), u64> {
     let state = if interruptible {
         SleepState::Interruptible
     } else {
@@ -2681,21 +2815,21 @@ pub fn sleep_until_ns(deadline_ns: u64, interruptible: bool) -> Result<(), u64> 
     };
     loop {
         set_current_state(state);
-        let now = crate::time::monotonic_ns();
-        if now >= deadline_ns {
+        let now = clock.now();
+        if now >= deadline {
             set_current_state(SleepState::Running);
             return Ok(());
         }
         if interruptible && crate::waitqueue::signal_pending() {
             set_current_state(SleepState::Running);
-            return Err(deadline_ns - now);
+            return Err(deadline - now);
         }
         if this_sched().is_none() || current_tid() == 0 {
             set_current_state(SleepState::Running);
             core::hint::spin_loop();
             continue;
         }
-        schedule_timeout(ns_to_ticks(deadline_ns - now).max(1));
+        crate::hrtimer::schedule_hrtimeout(Some(deadline), clock);
     }
 }
 
@@ -2720,8 +2854,8 @@ pub fn finish_context_switch() {
     unsafe {
         sched.lock.force_unlock();
     }
-    // Free what tasks that exited here left (we are off their stacks)
-    let dead = core::mem::take(&mut sched.lock.lock().dead);
+    // Free what a task that exited here left (we are off its stack)
+    let dead = sched.lock.lock().dead.take();
     drop(dead);
 }
 
@@ -2767,35 +2901,20 @@ pub fn sleep_current_until(wake_tick: u64) {
     }
 }
 
-/// Timer-tick scheduler work for this CPU (IRQ context)
-///
-/// Applies remote wakeups and wakes tasks whose sleep timeout expired. Only
-/// touches this CPU's run queue; never takes TASKLIST.
-pub fn wake_sleepers() {
-    let current_tick = get_ticks();
-    let sched = match current_percpu_sched() {
-        Some(s) if s.initialized.load(Ordering::Acquire) => s,
-        _ => return,
-    };
-
-    let mut rq = sched.lock.lock();
-    sched.drain_wakes(&mut rq);
-    while let Some(entry) = rq.sleep_queue.first() {
-        if entry.wake_tick > current_tick {
-            break; // sorted
-        }
-        let tid = entry.tid;
-        rq.sleep_queue.remove(0);
-        rq.try_wake(tid, WakeMode::Any);
-    }
-}
-
 /// Yield the current thread (cooperative scheduling)
 ///
 /// The current thread stays runnable and goes to the back of its priority
 /// queue; another runnable thread (if any) gets to run.
 pub fn yield_now() {
     yield_cpu();
+}
+
+/// A scheduling point in a long kernel loop (Linux cond_resched): yield
+/// only if this task's slice is used up (TIF_NEED_RESCHED)
+pub fn cond_resched() {
+    if current().has_tif(crate::task::tif::NEED_RESCHED) {
+        yield_cpu();
+    }
 }
 
 /// Give up the CPU on the way back to user mode, the slice used up
@@ -2813,37 +2932,24 @@ fn yield_cpu() -> bool {
     let Some(sched) = this_sched() else {
         return false;
     };
-    current().clear_tif(crate::task::tif::NEED_RESCHED);
+    let me = current();
+    me.clear_tif(crate::task::tif::NEED_RESCHED);
     let mut rq = sched.lock.lock();
-    sched.drain_wakes(&mut rq);
-    let Some(cur) = rq.current else {
-        return false;
-    };
-
-    // Refresh the cached priority (rq -> TASKLIST order); the idle
-    // task (tid 0, not in the table) keeps its own
-    let priority = TASKLIST.read().get(cur).map(|t| t.priority);
-    let (changed, priority) = match rq.entry_mut(cur) {
-        Some(e) => {
-            let priority = priority.unwrap_or(e.priority);
-            e.state = SleepState::Running;
-            let changed = e.priority != priority;
-            e.priority = priority;
-            e.queued = true;
-            (changed, priority)
-        }
-        None => return false,
-    };
-    if changed {
-        rq.reserve_prio(priority);
-    }
-    rq.queue().enqueue(cur, priority);
-
-    let next = rq.dequeue_next();
-    if next == cur {
+    sched.ttwu_pending(&mut rq);
+    if rq.curr.is_null() {
         return false;
     }
-    context_switch_locked(sched, rq, cur, next);
+    // Back of its priority's list (at its current priority); the idle
+    // task is never queued
+    me.se.set_state(RUNNING);
+    if !rq.curr_is_idle() {
+        rq.enqueue(&me);
+    }
+    let next = rq.pick_next();
+    if core::ptr::eq(next, &*me) {
+        return false;
+    }
+    context_switch_locked(sched, rq, &me, next);
     true
 }
 
@@ -2894,14 +3000,23 @@ pub fn increment_maj_flt() {
     current().maj_flt.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Get all TIDs in a process group
+/// Every thread of every process in group `pgid` (its pid links)
 pub fn get_tids_by_pgid(pgid: Pid) -> alloc::vec::Vec<Tid> {
+    let Some(pg) = crate::task::pid::find_pgrp(pgid) else {
+        return alloc::vec::Vec::new();
+    };
     let table = TASKLIST.read();
-    table
-        .iter()
-        .filter(|t| t.task.pgid() == pgid)
-        .map(|t| t.task.tid())
-        .collect()
+    table.pgrp_threads(&pg).map(|t| t.task.tid()).collect()
+}
+
+/// The processes of group `pgid`, by pid (their leaders on its list;
+/// Linux do_each_pid_task PIDTYPE_PGID)
+pub fn pgrp_pids(pgid: Pid) -> alloc::vec::Vec<Pid> {
+    let Some(pg) = crate::task::pid::find_pgrp(pgid) else {
+        return alloc::vec::Vec::new();
+    };
+    let table = TASKLIST.read();
+    table.pgrp(&pg).map(|t| t.task.pid).collect()
 }
 
 /// Get all unique PIDs in the system
@@ -2948,9 +3063,13 @@ pub fn lookup_task_pgid(pid: Pid) -> Option<Pid> {
     table.get(pid).map(|t| t.task.pgid())
 }
 
-/// True if some task is in process group `pgid`
+/// True if some process is in group `pgid`
 pub fn pgrp_exists(pgid: Pid) -> bool {
-    TASKLIST.read().iter().any(|t| t.task.pgid() == pgid)
+    let Some(pg) = crate::task::pid::find_pgrp(pgid) else {
+        return false;
+    };
+    let table = TASKLIST.read();
+    table.pgrp(&pg).next().is_some()
 }
 
 /// Look up a task's session ID by PID
@@ -2966,7 +3085,7 @@ pub fn lookup_task_sid(pid: Pid) -> Option<Pid> {
 /// Returns None if the process is not found.
 pub fn lookup_task_priority(pid: Pid) -> Option<Priority> {
     let table = TASKLIST.read();
-    table.get(pid).map(|t| t.priority)
+    table.get(pid).map(|t| t.task.se.prio())
 }
 
 /// Look up a task's scheduling policy by PID
@@ -3101,9 +3220,9 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
             if is_rt_policy(base_policy) {
                 // Map rt_priority 1-99 to internal priority 156-254
                 // (above PRIORITY_NORMAL=128, below PRIORITY_REALTIME=255)
-                task.priority = (155 + rt_priority) as Priority;
+                task.task.se.set_prio((155 + rt_priority) as Priority);
             } else if base_policy == SCHED_IDLE {
-                task.priority = crate::task::PRIORITY_IDLE;
+                task.task.se.set_prio(crate::task::PRIORITY_IDLE);
             }
             // For SCHED_NORMAL/BATCH, keep existing nice-based priority
 
@@ -3160,82 +3279,128 @@ pub fn task_count() -> usize {
 /// Error codes:
 /// - ESRCH (3): Process not found
 pub fn set_task_priority(pid: Pid, priority: Priority) -> Result<(), i32> {
-    let mut table = TASKLIST.write();
-    match table.get_mut(pid) {
-        Some(mut task) => {
-            task.priority = priority;
-            Ok(())
-        }
-        None => Err(3), // ESRCH
+    let task = TASKLIST.read().task(pid).ok_or(3)?; // ESRCH
+    let cpu = task.cpu();
+    if crate::cpu::try_this_id() == Some(cpu) || !cpu_has_scheduler(cpu) {
+        reprio(&task, priority);
+    } else {
+        // Only the owner takes its rq lock: run it there and wait
+        let req = Reprio {
+            task: &*task as *const KernelTask,
+            prio: priority,
+        };
+        let mut mask = crate::cpumask::CpuSet::default();
+        mask.set(cpu);
+        crate::smp::smp_call_function_many(&mask, reprio_ipi, &req as *const Reprio as usize, true);
+    }
+    Ok(())
+}
+
+/// A remote priority change (`set_task_priority`)
+struct Reprio {
+    task: *const KernelTask,
+    prio: Priority,
+}
+
+/// Apply a `Reprio` on the task's CPU (call-function IPI)
+fn reprio_ipi(info: usize) {
+    // SAFETY: the caller waits for this call, holding the task and the
+    // request
+    let r = unsafe { &*(info as *const Reprio) };
+    reprio(unsafe { &*r.task }, r.prio);
+}
+
+/// Give `p` (of this CPU) priority `prio`: a queued task moves to its new
+/// priority's list and may preempt (Linux set_user_nice: dequeue,
+/// change, enqueue under the task's rq lock)
+fn reprio(p: &KernelTask, prio: Priority) {
+    let _pi = p.pi_lock.lock();
+    let mut rq = get_percpu_sched(p.cpu()).lock.lock();
+    let pp = p as *const KernelTask;
+    let queued = p.se.on_rq() && !core::ptr::eq(rq.curr, pp) && !core::ptr::eq(rq.idle, pp);
+    if queued {
+        // SAFETY: a queued task is on its priority's list of this rq
+        unsafe { rq.queue().remove(p, p.se.prio()) };
+    }
+    let old = p.se.prio();
+    p.se.set_prio(prio);
+    if queued {
+        rq.enqueue(p);
+        rq.check_preempt(p);
+    } else if core::ptr::eq(rq.curr, pp) && prio < old {
+        // The running task dropped: a queued one may now outrank it
+        // (Linux set_user_nice -> resched_curr)
+        p.set_tif(crate::task::tif::NEED_RESCHED);
     }
 }
 
-/// Set a task's process group ID
+/// Move process `target_pid` (every thread) to group `new_pgid`
 ///
 /// Returns Ok(()) on success, Err(errno) on failure.
 /// Error codes:
 /// - ESRCH (3): Process not found
-/// - EPERM (1): Cannot change session leader's PGID
-/// - EINVAL (22): Target PGID doesn't exist in same session
+/// - EPERM (1): a session leader, another session, or no group
+///   `new_pgid` in the caller's session
 pub fn set_task_pgid(target_pid: Pid, new_pgid: Pid, caller_sid: Pid) -> Result<(), i32> {
+    // Found before TASKLIST (the pid hash's lock is not nested in it)
+    let target = crate::task::pid::find_pgrp(new_pgid);
+    let mut old = Vec::new();
     let mut table = TASKLIST.write();
+    let pg = setpgid_target(&table, target_pid, new_pgid, target.as_ref(), caller_sid)?;
+    table.change_pids(target_pid, &pg, None, &mut old);
+    drop(table);
+    drop(old);
+    Ok(())
+}
 
-    let (tid, pid, sid) = match table.get(target_pid) {
-        Some(t) => (t.task.tid(), t.task.pid, t.task.sid()),
-        None => return Err(3), // ESRCH
-    };
-
-    // Cannot change PGID of a session leader (pid == sid), nor move to a
-    // different session
+/// The group process `pid` moves to (Linux sys_setpgid's checks): not
+/// a session leader, in the caller's session; `pgid` is its own pid (a
+/// new group) or a group of that session
+fn setpgid_target(
+    table: &GlobalTaskTable,
+    pid: Pid,
+    pgid: Pid,
+    target: Option<&Arc<crate::task::pid::Pid>>,
+    caller_sid: Pid,
+) -> Result<Arc<crate::task::pid::Pid>, i32> {
+    let l = table.get(pid).ok_or(3)?; // ESRCH
+    let sid = l.task.sid();
     if pid == sid || sid != caller_sid {
         return Err(1); // EPERM
     }
-
-    // A new group (pgid == target_pid), or one that exists in the
-    // same session
-    if new_pgid != target_pid
-        && !table
-            .iter()
-            .any(|t| t.task.pgid() == new_pgid && t.task.sid() == caller_sid)
-    {
-        return Err(1); // EPERM - target PGID doesn't exist in same session
+    if pgid == pid {
+        return l.thread_pid.clone().ok_or(3);
     }
-
-    if let Some(t) = table.get_mut(tid) {
-        t.task
-            .pgid
-            .store(new_pgid, core::sync::atomic::Ordering::Relaxed);
+    let pg = target.ok_or(1)?; // EPERM
+    match table.pgrp(pg).next() {
+        Some(g) if g.task.sid() == caller_sid => Ok(pg.clone()),
+        _ => Err(1), // EPERM: no such group in the caller's session
     }
-    Ok(())
 }
 
 /// Create a new session for the current process
 ///
 /// Returns the new session ID on success, Err(errno) on failure.
 /// Error codes:
-/// - EPERM (1): Process is already a process group leader
-pub fn create_session(caller_pid: Pid, caller_pgid: Pid) -> Result<Pid, i32> {
-    // Cannot create session if already a process group leader
-    if caller_pid == caller_pgid {
-        return Err(1); // EPERM
-    }
-
+/// - EPERM (1): a session leader already, or a process group with the
+///   caller's pid as id exists
+pub fn create_session(caller_pid: Pid) -> Result<Pid, i32> {
+    let mut old = Vec::new();
     let mut table = TASKLIST.write();
-
-    // Find the calling process
-    let task = match table.get_mut(caller_pid) {
-        Some(t) => t,
-        None => return Err(3), // ESRCH
+    let pid = {
+        let l = table.get(caller_pid).ok_or(3)?; // ESRCH
+        let pid = l.thread_pid.clone().ok_or(3)?;
+        // A session leader already, or a process group with the
+        // caller's id exists (Linux ksys_setsid)
+        if l.task.sid() == caller_pid || table.pgrp(&pid).next().is_some() {
+            return Err(1); // EPERM
+        }
+        pid
     };
-
-    // Create new session: pid becomes sid and pgid
-    task.task
-        .sid
-        .store(caller_pid, core::sync::atomic::Ordering::Relaxed);
-    task.task
-        .pgid
-        .store(caller_pid, core::sync::atomic::Ordering::Relaxed);
-
+    // The whole process: pid becomes sid and pgid
+    table.change_pids(caller_pid, &pid, Some(&pid), &mut old);
+    drop(table);
+    drop(old);
     Ok(caller_pid)
 }
 
@@ -3264,7 +3429,8 @@ pub fn commit_creds_impl(new: alloc::sync::Arc<Cred>) {
     let old = {
         let mut table = TASKLIST.write();
         table.get_mut(me.tid()).and_then(|mut t| {
-            if ids_changed && let Some(mm) = t.mm() {
+            // SAFETY: the task itself
+            if ids_changed && let Some(mm) = unsafe { me.task.mm() } {
                 // On the mm: every thread sharing it (Linux set_dumpable(
                 // task->mm))
                 mm.set_dumpable(crate::task::dumpable::SUID_DUMP_DISABLE);
@@ -3532,9 +3698,15 @@ pub fn exec_replace_image(
         let task = table.get_mut(tid);
         let mut task = task.expect("exec: current task not in the task table");
         task.page_table = ArchPageTable::new(new.pgd());
-        task.prctl.name = ident.name;
         new.set_dumpable(ident.dumpable);
-        task.set_mm(Some(mm))
+        // The mm and name change as one under task_lock (Linux
+        // exec_mmap, __set_task_comm): a reader sees both or neither
+        let mut a = task.task.task_lock();
+        // SAFETY: the task itself
+        unsafe {
+            a.set_comm(ident.name);
+            a.set_mm(Some(mm))
+        }
     });
 
     // The new image starts with no user GS base (Linux start_thread:
@@ -3573,15 +3745,11 @@ pub fn try_schedule() {
         return;
     }
     let mut rq = sched.lock.lock();
-    sched.drain_wakes(&mut rq);
-    let next = rq.dequeue_next();
-    let Some(next_ctx) = rq.get_context(next) else {
-        return;
-    };
-    let Some((next_kstack, next_mm, (next_tls, next_gs))) = make_current(&rq, next) else {
-        return;
-    };
-    rq.current = Some(next);
+    sched.ttwu_pending(&mut rq);
+    let next = rq.pick_next();
+    // SAFETY: a task of this run queue, alive while it holds it
+    let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(unsafe { &*next });
+    rq.curr = next;
     sched.nr_switches.fetch_add(1, Ordering::Relaxed);
     // Held across the switch like any other: the task switched to
     // releases it (finish_context_switch or its own guard). Dropping it
@@ -3589,7 +3757,7 @@ pub fn try_schedule() {
     core::mem::forget(rq); // context_switch_first never returns
     unsafe {
         switch_mm(next_mm);
-        CurrentArch::context_switch_first(next_ctx, next_kstack, next_tls, next_gs);
+        CurrentArch::context_switch_first((*next).se.ctx(), next_kstack, next_tls, next_gs);
     }
 }
 

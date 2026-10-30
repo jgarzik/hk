@@ -155,11 +155,10 @@ chmod/chown do not update ctime; ETXTBSY is not enforced.
 
 **Location**: `kernel/sync` (Mutex, RwSem), various
 
-Linux rw_semaphores/mutexes modeled as `spin` locks include the mount
-namespace/topology locks (namespace_sem, `Mount` RwLocks), `s_umount`
-(absent) and pipe locks: their holders must not sleep (`make check
-LOCKDEP=1` reports one that does). `Mutex` has no `_killable` or `try`
-variants, and no lock has `_interruptible` variants.
+Linux rw_semaphores modeled as `spin` locks include the mount
+namespace/topology locks (namespace_sem, `Mount` RwLocks) and `s_umount`
+(absent): their holders must not sleep (`make check LOCKDEP=1` reports
+one that does). `RwSem` has no `_interruptible` variants.
 
 ## Mount flag gaps
 
@@ -191,16 +190,17 @@ de_thread
   with Linux's thread choice at delivery; a pidfd polls readable when
   the leader exits, not when the whole group is gone.
 
-## Tracees never stop
+## ptrace stop gaps
 
-**Location**: `kernel/task/ptrace.rs` (ptrace_stop, ptrace_report_syscall),
-`kernel/signal/mod.rs` (stop signals)
+**Location**: `kernel/task/ptrace.rs`, `kernel/task/exec.rs`,
+`kernel/signal/mod.rs`
 
-Nothing calls `ptrace_stop`: no signal-delivery stop, no syscall stop,
-and SIGSTOP is ignored (stop/continue are not implemented), so a tracee
-never enters the Traced state and every request that needs a stopped
-tracee (GETREGS, SETREGS, PEEK/POKE*, CONT, ...) fails with ESRCH. The
-TLS_PTRACE_RANGE boot test runs on Linux only.
+Signal-delivery and PTRACE_SYSCALL stops work. Missing: exec, fork,
+clone and exit event stops (PTRACE_O_TRACEEXEC and friends,
+PTRACE_EVENT_*), PTRACE_INTERRUPT/LISTEN, group-stop interaction (SIGSTOP
+to an untraced task is ignored: stop/continue are not implemented),
+waiting on a tracee by process group, and the tracee's exit being
+reported to a tracer that is not its parent.
 
 ## Global init is not protected from default-action signals
 
@@ -234,19 +234,24 @@ RTM_GETRULE dumps nothing (Linux lists its three default IPv4 rules; there
 is no rule engine: lookups are local then main), address lifetimes are
 always infinite, promote_secondaries is off.
 
-## Relative timeouts measured on CLOCK_REALTIME
+## io_uring has no shared rings
 
-**Location**: `kernel/ipc/sem.rs` (semtimedop), `kernel/io_uring.rs`
-(IORING_OP_TIMEOUT), `kernel/time.rs` (`current_ticks`, used by the
-ARP conflict rate limit)
+**Location**: `kernel/io_uring.rs`
 
-These compute deadlines from `TIMEKEEPER.current_time()` (wall clock),
-so clock_settime/settimeofday stretches or cuts them short (a backward
-step of N s adds N s to every pending wait). Linux measures them on
-CLOCK_MONOTONIC (semtimedop: `ktime_get()` + timeout; io_uring: relative
-and, by default, absolute timeouts are CLOCK_MONOTONIC, CLOCK_REALTIME
-only with IORING_TIMEOUT_REALTIME). `current_ticks` says "monotonic" but
-reads the wall clock.
+io_uring_setup returns ring offsets, but nothing maps the SQ ring, the
+CQ ring or the SQE array (IORING_OFF_SQ_RING/CQ_RING/SQES), so user
+SQEs never reach the kernel and CQEs never reach user space: submit
+works on a kernel-side copy, and `post_cqe` assumes the CQ head is 0.
+Missing on top of that:
+- `io_uring_enter(IORING_ENTER_GETEVENTS)` never blocks (`wait_completions`
+  is a stub) and ignores IORING_ENTER_EXT_ARG
+- IORING_OP_TIMEOUT has no timer (nothing ever completes it), and has
+  no count trigger, TIMEOUT_UPDATE or MULTISHOT
+- IORING_OP_LINK_TIMEOUT returns 0 without arming anything
+- poll ops never complete asynchronously; IOSQE_IO_DRAIN and ASYNC are
+  ignored
+
+The boot tests cover setup and enter return values only.
 
 ## Rare QEMU crash in the arm64 boot test (host CPU suspected)
 
@@ -327,7 +332,11 @@ beyond two each, but nothing asks them under pressure), no slab
 merging, poisoning or red zones.
 
 Heap allocations cannot fail gracefully (Rust's global allocator): one
-the page allocator cannot meet panics. The heap goes down to the min
+the page allocator cannot meet panics. Buffers sized by a syscall
+argument use `kmem::try_vec` (ENOMEM) where the size was unbounded
+(listxattr, keyctl read/update, process_vm, io_uring fixed files, bpf
+array maps); the many sites bounded by a sysctl or a constant still
+allocate infallibly. The heap goes down to the min
 watermark while user data stops at low (also after direct reclaim:
 user allocations stop at low until the OOM killer (P6); then Linux's
 min), so only kernel objects can get there (no memcg or OOM killer bounds what a process pins in pipes,
@@ -341,6 +350,45 @@ memory: each fork+exec keeps two dentries and two inodes plus ~900
 bytes of kmalloc (~1.3KB; suspected: procfs entries of dead pids, for
 the dcache work). The MM_LIFE tests count MemFree + Slab so they check user memory only; these leaks
 are listed here instead.
+
+## BPF map memory is not charged
+
+**Location**: `kernel/bpf/map.rs`
+
+An array map refuses a preallocation over half of free memory, but
+nothing adds maps up: no RLIMIT_MEMLOCK or memcg charge (Linux
+bpf_map_charge_memlock / memcg accounting), so many maps can still use
+up memory.
+
+## Heap allocations in atomic context are not reported
+
+**Location**: `kernel/mm/slab.rs` (`heap_gfp`), `kernel/sync/lockdep.rs`
+
+The heap picks GFP_ATOMIC by itself under a spin lock or with
+interrupts off, so an allocation there takes the atomic reserve
+silently. Linux needs an explicit GFP_ATOMIC and might_alloc reports a
+GFP_KERNEL allocation in atomic context. LOCKDEP has no such report
+(the T0 design's `atomic_alloc()` scope): the global allocator has no
+call site to attribute it to, so the sites (allocations under spin locks
+across net, fs, ipc) cannot be audited yet.
+
+## Multi-second CPU stalls when the host is overcommitted
+
+**Location**: unknown (CPU 0 of the x86 guest)
+
+With several QEMUs (4 vCPUs each) on the 24-thread host, CPU 0 of an hk
+guest sometimes runs nothing else for 1-45 s. SOFT timers wait that
+long for `ktimers/0` (TIMERFD_ABSTIME_RT took 2-45 s while timerfd used
+a SOFT timer), and a 20 ms nanosleep took 1.5-29 s in TIMER_TINY_PERIOD
+(1 ns periodic timers armed). Seen about 5 times in ~60 gated x86 boots
+with 8-12 QEMUs at once, once with 8 (two gate lanes), never in a lone
+gate. The Linux reference runs the same tests in the same runs and
+never stalled, so the cause is in hk, made likely by vCPU preemption.
+HARD timers and the tick stay on time and no SOFT callback ran long, so
+some kernel path on CPU 0 does not reach a scheduling point: suspected
+spinning on another vCPU (a lock holder or an IPI target descheduled by
+the host). Next: log long non-scheduling stretches per CPU (a tick-time
+check of the current task's time in kernel mode) and the IPI/csd waits.
 
 ## Unconfirmed: Arc<T> field corruption in the USB mass-storage driver
 
@@ -584,15 +632,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
 6. **No ptrace exec stop** (P9): a traced task's execve does not stop
    with SIGTRAP / PTRACE_EVENT_EXEC (`kernel/task/exec.rs`), so a
    tracer cannot observe a non-leader exec's tid change.
-7. **T0 resume point** (T0 next). Design: ~/.claude/plans/
-   t0-foundation-design.md (commit numbers below are its §3).
-   Remaining: alloc_lock (TaskRes is under TASKLIST); PGID/SID
-   pid_links (kill_pgrp/setpgid scan); 15 sched entity/ttwu(&Task);
-   16 intrusive WaitQueue + FutexQ (wakeups by raw tid: waitqueue,
-   futex, poll, mqueue, signalfd, sem/msg); 17 per-CPU timer wheel; 18 hrtimer-lite
-   + deadline waits; 19 yield polls and SCHEDULING_ENABLED fallbacks;
-   20 GFP from context/reclaim; 21 try_* user-sized allocations; tests
-   f-h; an acct test with N threads exiting at once (one record).
 8. **MM_LIFE_EXEC_CHAIN intermittent on arm64 CI** (next batch). One
    GitHub `check-arm` run (TCG, NIC=e1000) reported
    `MM_LIFE_EXEC_CHAIN:FAIL -2`: both warmup chains passed, then the
@@ -610,12 +649,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
    pending); `NET_STRESS_TRUNC_RACE:FAIL reader status got 256` on the
    x86 Linux reference (a reader hit its 2 s receive timeout under host
    load).
-11. **Syscall exit takes the signal lock every time** (D):
-   `entry::syscall_exit_to_user_mode` runs `do_signal` unconditionally
-   (for -ERESTART* codes and `saved_sigmask` with nothing pending), and
-   its no-signal path (`restore_saved_sigmask`) locks Task.sig. Linux
-   only enters with TIF_SIGPENDING/TIF_NOTIFY_SIGNAL; a
-   TIF_RESTORE_SIGMASK-style flag would allow a lock-free early out.
 12. **arm64 overflow check misses a frame over 32 KB** (next batch):
    vectors.S KERNEL_ENTRY tests bit 15 of SP only, so an SP that jumped
    more than 32 KB below a stack base (one huge frame) lands where the

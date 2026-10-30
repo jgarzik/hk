@@ -182,17 +182,29 @@ pub fn read_swap_page(e: SwapEntry) -> Result<u64, VmFault> {
         }
         match swapcache_prepare(e) {
             Ok(()) => return read_new(e),
-            // Another task is reading it in: its page shows up
-            Err(true) => crate::task::percpu::yield_now(),
+            // Another task is reading it in: sleep until its page
+            // shows up or its claim goes (Linux: the racer sleeps on
+            // the locked folio)
+            Err(true) => super::swap::swap_wait(e).wait_event(|| settled(e)),
             Err(false) => return Err(VmFault::Retry),
         }
     }
 }
 
+/// A claim on `e` settled: its page is in the swap cache, or nobody
+/// holds SWAP_HAS_CACHE any more
+fn settled(e: SwapEntry) -> bool {
+    if let Some(phys) = lookup(e) {
+        FRAME_ALLOCATOR.decref(phys);
+        return true;
+    }
+    !super::swap::swapcache_busy(e)
+}
+
 /// Read `e`, whose slot this task claimed (SWAP_HAS_CACHE), into a new
 /// locked swap-cache page
 fn read_new(e: SwapEntry) -> Result<u64, VmFault> {
-    let Some(phys) = super::fault::alloc_user_reclaim() else {
+    let Some(phys) = super::fault::alloc_user() else {
         swapcache_clear(e);
         return Err(VmFault::Oom);
     };
@@ -204,6 +216,8 @@ fn read_new(e: SwapEntry) -> Result<u64, VmFault> {
         swapcache_clear(e);
         return Err(VmFault::Oom);
     }
+    // Racers waiting on the claim find the (locked) page now
+    super::swap::swap_wait(e).wake_all();
     if swap_read_page(e, phys).is_err() {
         delete(e, phys);
         unlock_page(phys);
@@ -241,8 +255,11 @@ fn all_mms() -> Vec<Arc<super::Mm>> {
     let mut v: Vec<Arc<super::Mm>> = Vec::new();
     {
         let table = crate::task::percpu::TASKLIST.read();
-        for mm in table.iter().filter_map(|t| t.mm_ref()) {
-            if !v.iter().any(|m| Arc::ptr_eq(m, mm.arc())) {
+        for t in table.iter() {
+            let a = t.task.task_lock();
+            if let Some(mm) = a.mm()
+                && !v.iter().any(|m| Arc::ptr_eq(m, mm.arc()))
+            {
                 v.push(mm.arc().clone());
             }
         }

@@ -247,12 +247,8 @@ pub fn napi_enable(napi: &Napi) {
 
 /// Back off while a poll finishes
 fn napi_wait() {
-    if crate::task::percpu::SCHEDULING_ENABLED.load(Ordering::Acquire) {
-        let ms = crate::time::monotonic_ns() + 1_000_000;
-        let _ = crate::task::percpu::sleep_until_ns(ms, false);
-    } else {
-        core::hint::spin_loop();
-    }
+    let ms = crate::time::monotonic_ns() + 1_000_000;
+    let _ = crate::task::percpu::sleep_until_ns(ms, false);
 }
 
 // ============================================================================
@@ -309,7 +305,7 @@ static SOFTNET: PerCpu<Softnet> = crate::percpu![Softnet::new()];
 static TIMER_DUE: AtomicBool = AtomicBool::new(false);
 
 /// Ask softnet/0 to run the protocol timers (from a `timer::Alarm`
-/// callback on ktimerd; thread context)
+/// callback on ktimers/N; thread context)
 pub fn raise_timer() {
     TIMER_DUE.store(true, Ordering::Release);
     SOFTNET.get(0).wq.wake_all();
@@ -384,8 +380,9 @@ fn softnet_thread(cpu: usize) {
             sd.time_squeeze.fetch_add(1, Ordering::Relaxed);
         }
         if sd.has_work() {
-            // Cooperative scheduler: let other tasks on this CPU run
-            crate::task::percpu::yield_now();
+            // Work left after the budget: a scheduling point (Linux
+            // net_rx_action defers to ksoftirqd, which cond_rescheds)
+            crate::task::percpu::cond_resched();
         }
     }
 }

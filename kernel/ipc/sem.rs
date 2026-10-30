@@ -357,17 +357,19 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
     }
 
     // Parse timeout if provided
-    let deadline_ns: Option<i128> = if timeout_ptr != 0 {
+    // A relative timeout on CLOCK_MONOTONIC (Linux ktime_get() + timeout)
+    let deadline_ns: Option<u64> = if timeout_ptr != 0 {
         let ts: SemTimespec = get_user::<Uaccess, SemTimespec>(timeout_ptr)
             .map_err(|_| KernelError::BadAddress.errno())?;
         // Validate timeout
         if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
             return Err(KernelError::InvalidArgument.errno());
         }
-        let now = TIMEKEEPER.current_time();
-        let now_ns = now.sec as i128 * 1_000_000_000 + now.nsec as i128;
-        let timeout_ns = ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128;
-        Some(now_ns + timeout_ns)
+        let timeout_ns = crate::time::timespec_to_ns(ts.tv_sec, ts.tv_nsec);
+        Some(crate::time::deadline_after(
+            crate::time::monotonic_ns(),
+            timeout_ns,
+        ))
     } else {
         None
     };
@@ -419,12 +421,8 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
                 }
 
                 // Check timeout before blocking
-                if let Some(deadline) = deadline_ns {
-                    let now = TIMEKEEPER.current_time();
-                    let now_ns = now.sec as i128 * 1_000_000_000 + now.nsec as i128;
-                    if now_ns >= deadline {
-                        return Err(KernelError::WouldBlock.errno());
-                    }
+                if deadline_ns.is_some_and(|d| crate::time::monotonic_ns() >= d) {
+                    return Err(KernelError::WouldBlock.errno());
                 }
 
                 // Add to pending queue
@@ -443,17 +441,10 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
 
                 // Sleep until woken, the deadline or a signal (semop is
                 // never restarted: EINTR)
-                let ticks = match deadline_ns {
-                    Some(d) => {
-                        let now = TIMEKEEPER.current_time();
-                        let now_ns = now.sec as i128 * 1_000_000_000 + now.nsec as i128;
-                        crate::task::percpu::ns_to_ticks((d - now_ns).max(0) as u64)
-                    }
-                    None => crate::task::percpu::MAX_SCHEDULE_TIMEOUT,
-                };
-                let r = sem_array.waitq.wait_event_interruptible_timeout(
+                let r = sem_array.waitq.wait_event_interruptible_deadline(
                     || queue.woken.load(Ordering::Acquire),
-                    ticks,
+                    deadline_ns,
+                    crate::hrtimer::HrClock::Monotonic,
                 );
                 if r.is_err() && !queue.woken.load(Ordering::Acquire) {
                     sem_array.pending.lock().retain(|q| !Arc::ptr_eq(q, &queue));
@@ -477,17 +468,13 @@ fn do_semtimedop(semid: i32, sops_ptr: u64, nsops: usize, timeout_ptr: u64) -> R
                 }
 
                 // Check timeout after spurious wakeup or yield
-                if let Some(deadline) = deadline_ns {
-                    let now = TIMEKEEPER.current_time();
-                    let now_ns = now.sec as i128 * 1_000_000_000 + now.nsec as i128;
-                    if now_ns >= deadline {
-                        // Remove from pending queue
-                        {
-                            let mut pending = sem_array.pending.lock();
-                            pending.retain(|q| !Arc::ptr_eq(q, &queue));
-                        }
-                        return Err(KernelError::WouldBlock.errno());
+                if deadline_ns.is_some_and(|d| crate::time::monotonic_ns() >= d) {
+                    // Remove from pending queue
+                    {
+                        let mut pending = sem_array.pending.lock();
+                        pending.retain(|q| !Arc::ptr_eq(q, &queue));
                     }
+                    return Err(KernelError::WouldBlock.errno());
                 }
 
                 // Spurious wakeup or polling iteration, retry

@@ -54,11 +54,14 @@ impl TscClockSource {
         let low: u32;
         let high: u32;
         unsafe {
+            // lfence: not before earlier loads (Linux rdtsc_ordered), so
+            // a timekeeper read never sees a count older than its base
             ::core::arch::asm!(
+                "lfence",
                 "rdtsc",
                 out("eax") low,
                 out("edx") high,
-                options(nomem, nostack, preserves_flags)
+                options(nostack, preserves_flags)
             );
         }
         ((high as u64) << 32) | (low as u64)

@@ -486,6 +486,9 @@ pub const XATTR_NAME_MAX: usize = 255;
 /// Maximum attribute value size (64KB)
 pub const XATTR_SIZE_MAX: usize = 65536;
 
+/// Largest listxattr buffer (Linux XATTR_LIST_MAX)
+pub const XATTR_LIST_MAX: usize = 65536;
+
 /// Helper to convert KernelError to errno for xattr operations
 fn xattr_error_to_errno(e: KernelError) -> i64 {
     match e {
@@ -895,8 +898,11 @@ fn do_listxattr(path_ptr: u64, list_ptr: u64, size: u64, follow_symlinks: bool) 
         return KernelError::BadAddress.sysret();
     }
 
-    // Allocate kernel buffer
-    let mut list = vec![0u8; size as usize];
+    // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer
+    let mut list = match crate::kmem::try_vec(size.min(XATTR_LIST_MAX as u64) as usize, 0u8) {
+        Ok(l) => l,
+        Err(e) => return e.sysret(),
+    };
 
     // Get the list
     match inode.i_op.listxattr(&inode, &mut list) {
@@ -938,8 +944,11 @@ pub fn sys_flistxattr(fd: i32, list_ptr: u64, size: u64) -> i64 {
         return KernelError::BadAddress.sysret();
     }
 
-    // Allocate kernel buffer
-    let mut list = vec![0u8; size as usize];
+    // At most XATTR_LIST_MAX (Linux listxattr), a fallible buffer
+    let mut list = match crate::kmem::try_vec(size.min(XATTR_LIST_MAX as u64) as usize, 0u8) {
+        Ok(l) => l,
+        Err(e) => return e.sysret(),
+    };
 
     // Get the list
     match inode.i_op.listxattr(&inode, &mut list) {

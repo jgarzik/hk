@@ -15,7 +15,7 @@ use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::error::KernelError;
-use crate::task::percpu::TASKLIST;
+use crate::task::percpu::{KernelTask, TASKLIST, task_ref};
 
 // KCMP comparison types
 /// Compare file descriptors
@@ -104,18 +104,41 @@ fn kcmp_ptr(ptr1: u64, ptr2: u64, kcmp_type: i32) -> i64 {
     }
 }
 
-/// Compare two Option<Arc<T>> pointers
-fn compare_arc_option<T>(opt1: &Option<Arc<T>>, opt2: &Option<Arc<T>>, kcmp_type: i32) -> i64 {
-    match (opt1, opt2) {
-        (Some(arc1), Some(arc2)) => {
-            let ptr1 = Arc::as_ptr(arc1) as *const () as u64;
-            let ptr2 = Arc::as_ptr(arc2) as *const () as u64;
-            kcmp_ptr(ptr1, ptr2, kcmp_type)
-        }
+/// The address of an optional shared object
+fn ptr_key<T>(o: Option<&Arc<T>>) -> Option<u64> {
+    o.map(|a| Arc::as_ptr(a) as *const () as u64)
+}
+
+fn arc_key<T>(o: &Option<Arc<T>>) -> Option<u64> {
+    ptr_key(o.as_ref())
+}
+
+/// Compare two optional object addresses
+fn compare_key(k1: Option<u64>, k2: Option<u64>, kcmp_type: i32) -> i64 {
+    match (k1, k2) {
+        (Some(ptr1), Some(ptr2)) => kcmp_ptr(ptr1, ptr2, kcmp_type),
         (None, None) => 0,    // Both None = equal
         (None, Some(_)) => 1, // None < Some
         (Some(_), None) => 2, // Some > None
     }
+}
+
+/// The address of `t`'s task_lock resource of kind `kcmp_type`
+fn lock_key(t: &KernelTask, kcmp_type: i32) -> Option<u64> {
+    let a = t.task_lock();
+    match kcmp_type {
+        KCMP_VM => ptr_key(a.mm().map(|m| m.arc())),
+        KCMP_FILES => ptr_key(a.files()),
+        KCMP_FS => ptr_key(a.fs()),
+        _ => ptr_key(a.io_context()),
+    }
+}
+
+/// The address of the file at descriptor `idx` of `t`
+fn fd_key(t: &KernelTask, idx: u64) -> Option<u64> {
+    let files = t.task_lock().files().cloned()?;
+    let f = files.lock().get(idx as i32)?;
+    Some(Arc::as_ptr(&f) as u64)
 }
 
 /// kcmp syscall implementation
@@ -148,80 +171,47 @@ pub fn sys_kcmp(pid1: u64, pid2: u64, kcmp_type: i32, idx1: u64, idx2: u64) -> i
         return KernelError::OperationNotSupported.sysret();
     }
 
-    // Look up both tasks and extract the resources we need
-    let table = TASKLIST.read();
-
-    let task1 = match table.get(pid1) {
-        Some(t) => t,
-        None => return KernelError::NoProcess.sysret(),
-    };
-
-    let task2 = match table.get(pid2) {
-        Some(t) => t,
-        None => return KernelError::NoProcess.sysret(),
+    // Look up both tasks; the signal handlers and undo lists are read
+    // under TASKLIST, the task_lock resources under each task's lock
+    let (t1, t2, sigs, sems) = {
+        let table = TASKLIST.read();
+        let Some(task1) = table.get(pid1) else {
+            return KernelError::NoProcess.sysret();
+        };
+        let Some(task2) = table.get(pid2) else {
+            return KernelError::NoProcess.sysret();
+        };
+        (
+            task_ref(task1.task),
+            task_ref(task2.task),
+            (arc_key(&task1.sighand), arc_key(&task2.sighand)),
+            (arc_key(&task1.sysvsem), arc_key(&task2.sysvsem)),
+        )
     };
 
     match kcmp_type {
         KCMP_FILE => {
             // Compare specific file descriptors; the tables are locked
-            // after TASKLIST is dropped (order: fd table -> TASKLIST)
-            let (files1, files2) = (task1.files().cloned(), task2.files().cloned());
-            drop(table);
-            let ptr1 = match &files1 {
-                Some(files) => {
-                    let fd_table = files.lock();
-                    match fd_table.get(idx1 as i32) {
-                        Some(f) => Arc::as_ptr(&f) as u64,
-                        None => return KernelError::BadFd.sysret(),
-                    }
-                }
+            // after task_lock is dropped
+            let ptr1 = match fd_key(&t1, idx1) {
+                Some(p) => p,
                 None => return KernelError::BadFd.sysret(),
             };
-
-            let ptr2 = match &files2 {
-                Some(files) => {
-                    let fd_table = files.lock();
-                    match fd_table.get(idx2 as i32) {
-                        Some(f) => Arc::as_ptr(&f) as u64,
-                        None => return KernelError::BadFd.sysret(),
-                    }
-                }
+            let ptr2 = match fd_key(&t2, idx2) {
+                Some(p) => p,
                 None => return KernelError::BadFd.sysret(),
             };
-
             kcmp_ptr(ptr1, ptr2, KCMP_FILE)
         }
 
-        KCMP_VM => {
-            // Compare memory address spaces
-            let vm = |t: Option<&crate::mm::MmRef>| t.map(|m| m.arc().clone());
-            compare_arc_option(&vm(task1.mm()), &vm(task2.mm()), KCMP_VM)
-        }
+        KCMP_SIGHAND => compare_key(sigs.0, sigs.1, KCMP_SIGHAND),
+        KCMP_SYSVSEM => compare_key(sems.0, sems.1, KCMP_SYSVSEM),
 
-        KCMP_FILES => {
-            // Compare file descriptor tables
-            compare_arc_option(&task1.files().cloned(), &task2.files().cloned(), KCMP_FILES)
-        }
-
-        KCMP_FS => {
-            // Compare filesystem context
-            compare_arc_option(&task1.fs, &task2.fs, KCMP_FS)
-        }
-
-        KCMP_SIGHAND => {
-            // Compare signal handlers
-            compare_arc_option(&task1.sighand, &task2.sighand, KCMP_SIGHAND)
-        }
-
-        KCMP_IO => {
-            // Compare I/O context
-            compare_arc_option(&task1.io_context, &task2.io_context, KCMP_IO)
-        }
-
-        KCMP_SYSVSEM => {
-            // Compare SysV semaphore undo lists
-            compare_arc_option(&task1.sysvsem, &task2.sysvsem, KCMP_SYSVSEM)
-        }
+        KCMP_VM | KCMP_FILES | KCMP_FS | KCMP_IO => compare_key(
+            lock_key(&t1, kcmp_type),
+            lock_key(&t2, kcmp_type),
+            kcmp_type,
+        ),
 
         _ => KernelError::InvalidArgument.sysret(),
     }

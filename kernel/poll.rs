@@ -29,8 +29,10 @@
 //! - `./select-poll.md` - Implementation guide
 //! - `./external-linux/fs/select.c` - Linux implementation
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::pin::Pin;
 
 use crate::fs::File;
 use crate::task::Tid;
@@ -171,14 +173,16 @@ impl Default for FdSet {
 /// Per-syscall poll context (like Linux poll_wqueues)
 ///
 /// Holds the polling task's registrations on the wait queues of the polled
-/// files (non-autoremove entries: every wakeup wakes the poller until the
-/// poll ends) and references to those files, which keep the wait queues
-/// alive. Dropping the context removes all registrations.
+/// files (entries pinned on the heap, Linux poll_table_entry, waking the
+/// poller, until the poll ends; the poller sets its sleep state before
+/// each scan, so no wakeup is lost) and references to those files, which
+/// keep the wait queues alive. Dropping the context removes all
+/// registrations.
 pub struct PollContext {
     /// Task ID of the polling task
     pub task: Tid,
     /// Registered (wait queue, entry) pairs
-    entries: Vec<(*const WaitQueue, WaitEntry)>,
+    entries: Vec<(*const WaitQueue, Pin<Box<WaitEntry>>)>,
     /// Files whose wait queues we registered on (keeps them alive)
     files: Vec<Arc<File>>,
 }
@@ -204,8 +208,8 @@ impl PollContext {
         if self.entries.iter().any(|(q, _)| core::ptr::eq(*q, wq)) {
             return;
         }
-        let mut entry = WaitEntry::new();
-        wq.add_poll_entry(&mut entry);
+        let entry = Box::pin(WaitEntry::new());
+        wq.add_wait_queue(entry.as_ref());
         self.entries.push((wq as *const WaitQueue, entry));
     }
 
@@ -220,7 +224,7 @@ impl Drop for PollContext {
         for (wq, entry) in self.entries.drain(..) {
             // Safety: the wait queues belong to files in `self.files`,
             // which are still alive (dropped after this loop)
-            unsafe { (*wq).remove_entry(&entry) };
+            unsafe { (*wq).remove_wait_queue(entry.as_ref()) };
         }
         self.files.clear();
     }

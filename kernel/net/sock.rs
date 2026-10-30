@@ -431,10 +431,9 @@ pub fn wait_on<F: FnMut() -> bool>(
             Err(_) => Err(KernelError::RestartSys),
         };
     }
-    // A CLOCK_MONOTONIC deadline, so tick granularity never ends the
-    // wait early
     let deadline = crate::time::monotonic_ns().saturating_add(timeo);
-    match wq.wait_event_interruptible_deadline(&mut cond, Some(deadline)) {
+    let mono = crate::hrtimer::HrClock::Monotonic;
+    match wq.wait_event_interruptible_deadline(&mut cond, Some(deadline), mono) {
         Ok(true) => Ok(deadline.saturating_sub(crate::time::monotonic_ns()).max(1)),
         Ok(false) => Err(KernelError::WouldBlock),
         Err(_) => Err(KernelError::Interrupted),
