@@ -3262,13 +3262,53 @@ pub fn task_count() -> usize {
 /// Error codes:
 /// - ESRCH (3): Process not found
 pub fn set_task_priority(pid: Pid, priority: Priority) -> Result<(), i32> {
-    let mut table = TASKLIST.write();
-    match table.get_mut(pid) {
-        Some(task) => {
-            task.task.se.set_prio(priority);
-            Ok(())
-        }
-        None => Err(3), // ESRCH
+    let task = TASKLIST.read().task(pid).ok_or(3)?; // ESRCH
+    let cpu = task.cpu();
+    if crate::cpu::try_this_id() == Some(cpu) || !cpu_has_scheduler(cpu) {
+        reprio(&task, priority);
+    } else {
+        // Only the owner takes its rq lock: run it there and wait
+        let req = Reprio {
+            task: &*task as *const KernelTask,
+            prio: priority,
+        };
+        let mut mask = crate::cpumask::CpuSet::default();
+        mask.set(cpu);
+        crate::smp::smp_call_function_many(&mask, reprio_ipi, &req as *const Reprio as usize, true);
+    }
+    Ok(())
+}
+
+/// A remote priority change (`set_task_priority`)
+struct Reprio {
+    task: *const KernelTask,
+    prio: Priority,
+}
+
+/// Apply a `Reprio` on the task's CPU (call-function IPI)
+fn reprio_ipi(info: usize) {
+    // SAFETY: the caller waits for this call, holding the task and the
+    // request
+    let r = unsafe { &*(info as *const Reprio) };
+    reprio(unsafe { &*r.task }, r.prio);
+}
+
+/// Give `p` (of this CPU) priority `prio`: a queued task moves to its new
+/// priority's list and may preempt (Linux set_user_nice: dequeue,
+/// change, enqueue under the task's rq lock)
+fn reprio(p: &KernelTask, prio: Priority) {
+    let _pi = p.pi_lock.lock();
+    let mut rq = get_percpu_sched(p.cpu()).lock.lock();
+    let pp = p as *const KernelTask;
+    let queued = p.se.on_rq() && !core::ptr::eq(rq.curr, pp) && !core::ptr::eq(rq.idle, pp);
+    if queued {
+        // SAFETY: a queued task is on its priority's list of this rq
+        unsafe { rq.queue().remove(p, p.se.prio()) };
+    }
+    p.se.set_prio(prio);
+    if queued {
+        rq.enqueue(p);
+        rq.check_preempt(p);
     }
 }
 
