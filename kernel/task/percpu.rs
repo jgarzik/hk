@@ -9,7 +9,7 @@
 //! - Run queue lock must be held with IRQs disabled
 //! - Context switch happens with the run queue lock held
 
-use ::core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use ::core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -325,6 +325,13 @@ pub struct PerCpuScheduler {
     /// Context switches performed on this CPU (a QSBR RCU would treat a
     /// change as a quiescent state)
     pub nr_switches: AtomicU64,
+    /// The address space of the running task (its `Mm` address, 0 for
+    /// none), set at each switch: membarrier compares it (Linux reads
+    /// rq->curr->mm under RCU); never dereferenced through this
+    pub curr_mm: AtomicUsize,
+    /// That address space's membarrier registrations, cached at each
+    /// switch (Linux rq->membarrier_state)
+    pub membarrier_state: AtomicU32,
 }
 
 impl PerCpuScheduler {
@@ -335,6 +342,8 @@ impl PerCpuScheduler {
             wake_list: AtomicPtr::new(core::ptr::null_mut()),
             initialized: AtomicBool::new(false),
             nr_switches: AtomicU64::new(0),
+            curr_mm: AtomicUsize::new(0),
+            membarrier_state: AtomicU32::new(0),
         }
     }
 
@@ -974,6 +983,12 @@ pub fn current_pt_regs() -> &'static mut <CurrentArch as crate::arch::Arch>::Tra
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Get the per-CPU scheduler for a given CPU
+/// CPU `cpu`'s scheduler, if it exists (membarrier reads its
+/// `curr_mm` and `membarrier_state`)
+pub fn cpu_sched(cpu: u32) -> Option<&'static PerCpuScheduler> {
+    PERCPU_SCHEDS.try_get(cpu)
+}
+
 fn get_percpu_sched(cpu_id: u32) -> &'static PerCpuScheduler {
     PERCPU_SCHEDS.get(cpu_id)
 }
@@ -2463,6 +2478,15 @@ fn make_current(t: &KernelTask) -> (u64, *const crate::mm::Mm, (u64, u64)) {
     let mm = unsafe { t.mm() }
         .as_ref()
         .map_or(core::ptr::null(), |m| Arc::as_ptr(m.arc()));
+    if let Some(s) = current_percpu_sched() {
+        // SAFETY: the task's address space, alive while it runs
+        let st = unsafe { mm.as_ref() }.map_or(0, |m| m.membarrier_state().load(Ordering::Relaxed));
+        s.membarrier_state.store(st, Ordering::Relaxed);
+        // Full barrier: a membarrier caller that misses this CPU's new
+        // address space is ordered before the task's return to user
+        // mode (Linux: the barriers around rq->curr's update)
+        s.curr_mm.store(mm as usize, Ordering::SeqCst);
+    }
     CurrentArch::set_current_task_ptr(t as *const KernelTask as usize);
     // Linux prepare_task
     t.se.set_on_cpu(true);

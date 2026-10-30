@@ -443,6 +443,9 @@ pub struct PerCpuScheduler {
     pub lock: IrqSpinlock<CpuRunQueue>,  // curr, idle, 256 priority lists, dead
     wake_list: AtomicPtr<()>,            // remote wakeups (lock-free llist)
     pub initialized: AtomicBool,          // Init flag
+    pub nr_switches: AtomicU64,           // context switches (QSBR hook)
+    pub curr_mm: AtomicUsize,             // running task's Mm address (membarrier)
+    pub membarrier_state: AtomicU32,      // its membarrier registrations
 }
 ```
 
@@ -2953,6 +2956,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock) |
 | `SuperBlock.{root, private}`, `DentryCache.root` | fs/superblock.rs, fs/dentry.rs | spin RwLock | superblock root and private data, the dcache root |
 | `RamfsInodeData.xattrs`, `RamfsSbData.sb` | fs/ramfs.rs | spin | ramfs xattrs and superblock back-pointer (under VFS locks) |
+| membarrier `IPI_MUTEX` | membarrier.rs | sleeping (`sync::Mutex`, Linux membarrier_ipi_mutex) | serializes the membarrier commands that interrupt other CPUs, so callers cannot multiply the IPIs; held across `smp_call_function_many` (waited) and MEMBARRIER_CMD_GLOBAL's one-tick sleep; nothing else is taken under it. The targets are chosen from each CPU's `PerCpuScheduler.curr_mm` / `membarrier_state` (atomics written at every switch in `make_current`, SeqCst for `curr_mm`; Linux rq->curr->mm and rq->membarrier_state), compared, never dereferenced |
 | `Pipe.inner` | pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation, never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock |
 | `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |

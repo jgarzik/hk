@@ -7,7 +7,13 @@
 //!
 //! Linux reference: kernel/sched/membarrier.c
 
+use alloc::sync::Arc;
 use core::sync::atomic::{Ordering, fence};
+
+use crate::cpumask::CpuSet;
+use crate::mm::Mm;
+use crate::sync::Mutex;
+use crate::task::percpu::PerCpuScheduler;
 
 // =============================================================================
 // membarrier commands (Linux ABI)
@@ -65,14 +71,19 @@ const SUPPORTED_CMDS: i32 = MEMBARRIER_CMD_GLOBAL
 const EINVAL: i64 = -22;
 const EPERM: i64 = -1;
 
+/// Serializes the commands that interrupt other CPUs (Linux
+/// membarrier_ipi_mutex): concurrent callers cannot multiply the IPIs
+static IPI_MUTEX: Mutex<()> = Mutex::new(());
+
 /// membarrier(cmd, flags, cpu_id) (Linux kernel/sched/membarrier.c)
 ///
-/// The expedited commands make every other CPU run a full barrier (an
-/// IPI, waited for) before returning. Linux interrupts only the CPUs
-/// running a thread of the target address space (or of a registered
-/// one); hk interrupts every active CPU, which orders a superset.
-/// MEMBARRIER_CMD_GLOBAL is Linux's synchronize_rcu: hk has no RCU, and
-/// the same barrier on every CPU orders every running thread.
+/// The expedited commands make the CPUs that matter run a full barrier
+/// (an IPI, waited for), as in Linux: PRIVATE the CPUs running the
+/// caller's address space, GLOBAL_EXPEDITED those running a registered
+/// one. MEMBARRIER_CMD_GLOBAL is Linux's synchronize_rcu; hk has no
+/// RCU, so it interrupts every CPU running a user address space and
+/// then sleeps a tick under the mutex, which keeps it as slow as a
+/// grace period and bounds the IPIs any caller can cause.
 pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> i64 {
     let flags_ok = match cmd {
         MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ => flags == 0 || flags == MEMBARRIER_CMD_FLAG_CPU,
@@ -83,8 +94,12 @@ pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> i64 {
     }
     match cmd {
         MEMBARRIER_CMD_QUERY => SUPPORTED_CMDS as i64,
-        MEMBARRIER_CMD_GLOBAL | MEMBARRIER_CMD_GLOBAL_EXPEDITED => {
-            barrier_others(ipi_mb);
+        MEMBARRIER_CMD_GLOBAL => global(),
+        MEMBARRIER_CMD_GLOBAL_EXPEDITED => {
+            let _g = IPI_MUTEX.lock();
+            barrier_cpus(ipi_mb, |s| {
+                s.membarrier_state.load(Ordering::Relaxed) & STATE_GLOBAL_EXPEDITED != 0
+            });
             0
         }
         MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED => {
@@ -116,57 +131,109 @@ fn ipi_sync_core(_: usize) {
     crate::arch::barrier::sync_core();
 }
 
-/// Run `f` on every other active CPU and wait for all, between full
-/// barriers on this one (Linux guard(mb) around smp_call_function_many)
-fn barrier_others(f: fn(usize)) {
+/// Refresh this CPU's cached registrations if it runs address space
+/// `mm` (Linux ipi_sync_rq_state)
+fn ipi_sync_state(mm: usize) {
+    if let Some(s) = crate::task::percpu::current_percpu_sched()
+        && s.curr_mm.load(Ordering::Relaxed) == mm
+    {
+        // SAFETY: the registering caller runs in `mm` and waits for us
+        let st = unsafe { &*(mm as *const Mm) }
+            .membarrier_state()
+            .load(Ordering::Relaxed);
+        s.membarrier_state.store(st, Ordering::Relaxed);
+    }
+}
+
+/// Run `f` on the other active CPUs whose scheduler `pick` selects and
+/// wait for all, between full barriers on this one (Linux guard(mb)
+/// around smp_call_function_many)
+fn barrier_cpus(f: fn(usize), pick: impl Fn(&PerCpuScheduler) -> bool) {
     fence(Ordering::SeqCst);
-    crate::smp::smp_call_function_many(&crate::smp::active_cpus(), f, 0, true);
+    let mut mask = CpuSet::default();
+    for cpu in crate::smp::active_cpus().iter() {
+        if crate::task::percpu::cpu_sched(cpu).is_some_and(&pick) {
+            mask.set(cpu);
+        }
+    }
+    crate::smp::smp_call_function_many(&mask, f, 0, true);
     fence(Ordering::SeqCst);
 }
 
-/// The calling task's address-space registration state; None for a
-/// task without one (kernel threads never call this)
-fn state() -> Option<u32> {
-    let mm = crate::task::percpu::current().mm()?;
-    Some(mm.membarrier_state().load(Ordering::Acquire))
+/// MEMBARRIER_CMD_GLOBAL (see `sys_membarrier`)
+fn global() -> i64 {
+    let _g = IPI_MUTEX.lock();
+    barrier_cpus(ipi_mb, |s| s.curr_mm.load(Ordering::Relaxed) != 0);
+    crate::task::percpu::sleep_current_until(crate::task::percpu::get_ticks() + 1);
+    0
 }
 
 /// Linux membarrier_private_expedited (no FLAG_CPU: only RSEQ takes it)
 fn private_expedited(flags: u32) -> i64 {
+    let Some(mm) = crate::task::percpu::current().mm() else {
+        return EINVAL;
+    };
     let ready = if flags == FLAG_SYNC_CORE {
         STATE_PRIVATE_EXPEDITED_SYNC_CORE_READY
     } else {
         STATE_PRIVATE_EXPEDITED_READY
     };
-    if state().unwrap_or(0) & ready == 0 {
+    if mm.membarrier_state().load(Ordering::Acquire) & ready == 0 {
         return EPERM;
     }
+    // No other thread can run in it (Linux: mm_users == 1)
+    if flags != FLAG_SYNC_CORE && mm.users() == 1 {
+        return 0;
+    }
+    let me = Arc::as_ptr(&mm) as usize;
+    let _g = IPI_MUTEX.lock();
     if flags == FLAG_SYNC_CORE {
         // This CPU too (Linux on_each_cpu_mask): the caller may move and
         // another thread of the address space take its place here
-        barrier_others(ipi_sync_core);
+        barrier_cpus(ipi_sync_core, |s| s.curr_mm.load(Ordering::Relaxed) == me);
         ipi_sync_core(0);
     } else {
-        barrier_others(ipi_mb);
+        barrier_cpus(ipi_mb, |s| s.curr_mm.load(Ordering::Relaxed) == me);
     }
     0
 }
 
-/// Linux membarrier_register_{private,global}_expedited: set `set`,
-/// then `ready` once every CPU would see it (hk interrupts every CPU on
-/// each command, so there is nothing to synchronize first)
+/// Linux membarrier_register_{private,global}_expedited: set the state
+/// bits, update the cached copy of every CPU running the address space
+/// (Linux sync_runqueues_membarrier_state), then mark it ready
 fn register(set: u32, ready: u32) -> i64 {
     let Some(mm) = crate::task::percpu::current().mm() else {
         return EINVAL;
     };
-    mm.membarrier_state()
-        .fetch_or(set | ready, Ordering::AcqRel);
+    let st = mm.membarrier_state();
+    if st.load(Ordering::Acquire) & ready == ready {
+        return 0;
+    }
+    st.fetch_or(set, Ordering::AcqRel);
+    let me = Arc::as_ptr(&mm) as usize;
+    {
+        let _g = IPI_MUTEX.lock();
+        ipi_sync_state(me);
+        fence(Ordering::SeqCst);
+        let mut mask = CpuSet::default();
+        for cpu in crate::smp::active_cpus().iter() {
+            if crate::task::percpu::cpu_sched(cpu)
+                .is_some_and(|s| s.curr_mm.load(Ordering::Relaxed) == me)
+            {
+                mask.set(cpu);
+            }
+        }
+        crate::smp::smp_call_function_many(&mask, ipi_sync_state, me, true);
+    }
+    st.fetch_or(ready, Ordering::AcqRel);
     0
 }
 
 /// Linux membarrier_get_registrations
 fn registrations() -> i64 {
-    let st = state().unwrap_or(0);
+    let st = crate::task::percpu::current()
+        .mm()
+        .map_or(0, |mm| mm.membarrier_state().load(Ordering::Acquire));
     let mut mask = 0;
     for (bits, cmd) in [
         (
