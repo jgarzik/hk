@@ -234,14 +234,24 @@ RTM_GETRULE dumps nothing (Linux lists its three default IPv4 rules; there
 is no rule engine: lookups are local then main), address lifetimes are
 always infinite, promote_secondaries is off.
 
-## io_uring timeouts measured on CLOCK_REALTIME
+## io_uring has no shared rings
 
-**Location**: `kernel/io_uring.rs` (IORING_OP_TIMEOUT)
+**Location**: `kernel/io_uring.rs`
 
-Relative timeouts are computed from `TIMEKEEPER.current_time()` (wall
-clock), so clock_settime stretches or cuts them short. Linux measures
-relative and, by default, absolute timeouts on CLOCK_MONOTONIC
-(CLOCK_REALTIME only with IORING_TIMEOUT_REALTIME).
+io_uring_setup returns ring offsets, but nothing maps the SQ ring, the
+CQ ring or the SQE array (IORING_OFF_SQ_RING/CQ_RING/SQES), so user
+SQEs never reach the kernel and CQEs never reach user space: submit
+works on a kernel-side copy, and `post_cqe` assumes the CQ head is 0.
+Missing on top of that:
+- `io_uring_enter(IORING_ENTER_GETEVENTS)` never blocks (`wait_completions`
+  is a stub) and ignores IORING_ENTER_EXT_ARG
+- IORING_OP_TIMEOUT has no timer (nothing ever completes it), and has
+  no count trigger, TIMEOUT_UPDATE or MULTISHOT
+- IORING_OP_LINK_TIMEOUT returns 0 without arming anything
+- poll ops never complete asynchronously; IOSQE_IO_DRAIN and ASYNC are
+  ignored
+
+The boot tests cover setup and enter return values only.
 
 ## Rare QEMU crash in the arm64 boot test (host CPU suspected)
 
