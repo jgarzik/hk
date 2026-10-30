@@ -605,15 +605,14 @@ impl Default for AltStack {
 pub struct TaskSignalState {
     /// Blocked signal mask
     pub blocked: SigSet,
-    /// Saved signal mask (for restoring after signal handler / SA_RESTART)
-    /// When Some, the blocked mask will be restored after the current syscall
-    pub saved_sigmask: Option<SigSet>,
+    /// The mask before a syscall's temporary one (rt_sigsuspend, ppoll,
+    /// pselect6, epoll_pwait): valid while the task's TIF_RESTORE_SIGMASK
+    /// is set (Linux saved_sigmask)
+    pub saved_sigmask: SigSet,
     /// Pending signals for this task (private)
     pub pending: SigPending,
     /// Shared pending signals (for thread group)
     pub shared_pending: SharedPending,
-    /// Flag indicating signals need processing
-    pub sigpending: bool,
     /// Alternate signal stack
     pub altstack: AltStack,
     /// The mask before sigtimedwait unblocked the awaited signals
@@ -650,10 +649,9 @@ impl TaskSignalState {
     pub const fn boot() -> Self {
         Self {
             blocked: SigSet::EMPTY,
-            saved_sigmask: None,
+            saved_sigmask: SigSet::EMPTY,
             pending: SigPending::new(),
             shared_pending: SharedPending(None),
-            sigpending: false,
             altstack: AltStack::new(),
             real_blocked: SigSet::EMPTY,
         }
@@ -663,10 +661,9 @@ impl TaskSignalState {
     pub fn new() -> Self {
         Self {
             blocked: SigSet::EMPTY,
-            saved_sigmask: None,
+            saved_sigmask: SigSet::EMPTY,
             pending: SigPending::new(),
             shared_pending: SharedPending::new(),
-            sigpending: false,
             altstack: AltStack::new(),
             real_blocked: SigSet::EMPTY,
         }
@@ -681,11 +678,6 @@ impl TaskSignalState {
         // Check shared pending
         let shared = self.shared_pending.lock();
         shared.signal.subtract(&self.blocked).any()
-    }
-
-    /// Recalculate sigpending flag
-    pub fn recalc_sigpending(&mut self) {
-        self.sigpending = self.has_deliverable_signals();
     }
 }
 
@@ -744,8 +736,7 @@ where
     };
     let mut s = t.sig.lock();
     let r = f(&mut s);
-    s.recalc_sigpending();
-    t.set_sigpending(s.sigpending);
+    t.set_sigpending(s.has_deliverable_signals());
     Some(r)
 }
 
@@ -797,15 +788,14 @@ pub fn clone_task_signal(
     let child_state = if let Some(parent_state) = parent_state {
         TaskSignalState {
             blocked: parent_state.blocked, // Inherit blocked mask
-            saved_sigmask: None,           // Child starts with no saved mask
-            pending: SigPending::new(),    // Fresh private pending
+            saved_sigmask: SigSet::EMPTY,
+            pending: SigPending::new(), // Fresh private pending
             shared_pending: if share_pending {
                 // CLONE_THREAD: share thread-group pending
                 parent_state.shared_pending.clone()
             } else {
                 SharedPending::new()
             },
-            sigpending: false,
             altstack: AltStack::new(), // Child starts with no altstack
             real_blocked: SigSet::EMPTY,
         }
@@ -1151,7 +1141,6 @@ pub fn zap_group_others(tgid: Pid, tid: Tid) {
 fn sigkill_task(t: &mut crate::task::percpu::TaskViewMut<'_>) {
     let mut s = t.task.sig.lock();
     s.pending.add(SIGKILL);
-    s.sigpending = true;
     t.task.set_sigpending(true);
 }
 
@@ -1214,29 +1203,12 @@ pub fn get_signal_to_deliver(tid: Tid) -> Option<(u32, SigAction)> {
         // Try private pending first
         if let Some(sig) = state.pending.dequeue(&state.blocked) {
             let action = sighand.get_action(sig).unwrap_or_default();
-            state.recalc_sigpending();
             return Some((sig, action));
         }
 
-        // Check shared pending (thread group signals)
-        let shared_result = {
-            let mut shared = state.shared_pending.lock();
-            if let Some(sig) = shared.dequeue(&state.blocked) {
-                let action = sighand.get_action(sig).unwrap_or_default();
-                Some((sig, action))
-            } else {
-                None
-            }
-        };
-
-        // Now that shared lock is dropped, we can call recalc_sigpending
-        if let Some(result) = shared_result {
-            state.recalc_sigpending();
-            return Some(result);
-        }
-
-        state.recalc_sigpending();
-        None
+        // Then shared pending (thread group signals)
+        let sig = state.shared_pending.lock().dequeue(&state.blocked)?;
+        Some((sig, sighand.get_action(sig).unwrap_or_default()))
     })?
 }
 
@@ -1607,20 +1579,19 @@ fn clone_task_signal_struct(parent_tid: Tid, child_tid: Tid, share_signal: bool)
 /// the syscall's first register, so the syscall runs again (after the
 /// handler, if any).
 ///
-/// If a syscall left a temporary mask in place (`saved_sigmask`, e.g.
-/// rt_sigsuspend), signals are dequeued under it and the saved mask goes
-/// into the signal frame; with no frame it is restored here.
+/// If a syscall left a temporary mask in place (TIF_RESTORE_SIGMASK,
+/// e.g. rt_sigsuspend), signals are dequeued under it and the saved mask
+/// goes into the signal frame; with no frame it is restored here.
 pub fn do_signal(regs: &mut PtRegs) {
     use crate::error::KernelError;
 
     const ERESTARTSYS: i64 = KernelError::RestartSys.sysret();
     const ERESTARTNOINTR: i64 = KernelError::RestartNoIntr.sysret();
-    const ERESTARTNOHAND: i64 = KernelError::RestartNoHand.sysret();
     const EINTR: u64 = KernelError::Interrupted.sysret() as u64;
 
     let tid = crate::task::percpu::current_tid();
     let err = regs.ret() as i64;
-    let restart = regs.in_syscall() && matches!(err, ERESTARTSYS | ERESTARTNOINTR | ERESTARTNOHAND);
+    let restart = syscall_restarting(regs);
     regs.forget_syscall();
 
     while has_pending_signals(tid) {
@@ -1661,21 +1632,73 @@ pub fn do_signal(regs: &mut PtRegs) {
         }
     }
 
-    // No handler ran
-    restore_saved_sigmask(tid);
+    // No handler ran: an -ERESTART* syscall runs again (Linux
+    // arch_do_signal_or_restart)
+    restore_saved_sigmask();
     if restart {
         regs.restart_syscall();
     }
 }
 
-/// Restore and clear `saved_sigmask` if a syscall left one in place
-fn restore_saved_sigmask(tid: Tid) {
-    with_task_signal_state(tid, |state| {
-        if let Some(saved) = state.saved_sigmask.take() {
-            state.blocked = saved;
-            state.recalc_sigpending();
-        }
-    });
+/// The syscall returning on `regs` asks for a restart (-ERESTARTSYS,
+/// -ERESTARTNOINTR, -ERESTARTNOHAND): only `do_signal` may turn that
+/// into a result. A plain register test, no lock.
+pub fn syscall_restarting(regs: &PtRegs) -> bool {
+    use crate::error::KernelError;
+    const FIRST: i64 = KernelError::RestartSys.sysret();
+    const LAST: i64 = KernelError::RestartNoHand.sysret();
+    regs.in_syscall() && (LAST..=FIRST).contains(&(regs.ret() as i64))
+}
+
+/// Install `new` as a temporary mask for the current syscall (Linux
+/// set_user_sigmask after copy-in): the old one goes to `saved_sigmask`
+/// and TIF_RESTORE_SIGMASK, put back on the way out or saved in a
+/// handler's frame. Returns the old mask.
+pub fn set_temp_sigmask(new: SigSet) -> Option<SigSet> {
+    let me = crate::task::percpu::current();
+    let old = with_task_signal_state(me.tid(), |state| {
+        state.saved_sigmask = state.blocked;
+        state.blocked = new.subtract(&UNMASKABLE_SIGNALS);
+        state.saved_sigmask
+    })?;
+    me.set_tif(crate::task::tif::RESTORE_SIGMASK);
+    Some(old)
+}
+
+/// Read a sigset_t from user memory and install it as the syscall's
+/// temporary mask (Linux set_user_sigmask); a null `umask` changes
+/// nothing. Errors: EINVAL (size), EFAULT.
+pub fn set_user_sigmask(umask: u64, sigsetsize: u64) -> Result<(), crate::error::KernelError> {
+    use crate::error::KernelError;
+    if umask == 0 {
+        return Ok(());
+    }
+    if sigsetsize != 8 {
+        return Err(KernelError::InvalidArgument);
+    }
+    let bits = crate::uaccess::get_user::<crate::arch::Uaccess, u64>(umask)
+        .map_err(|_| KernelError::BadAddress)?;
+    set_temp_sigmask(SigSet::from_bits(bits));
+    Ok(())
+}
+
+/// Put back the mask a syscall replaced, if it did (Linux
+/// restore_saved_sigmask): lock-free when TIF_RESTORE_SIGMASK is clear
+pub fn restore_saved_sigmask() {
+    let me = crate::task::percpu::current();
+    if me.test_and_clear_tif(crate::task::tif::RESTORE_SIGMASK) {
+        with_task_signal_state(me.tid(), |state| state.blocked = state.saved_sigmask);
+    }
+}
+
+/// Like [`restore_saved_sigmask`], unless the syscall was `interrupted`
+/// by a signal: then the temporary mask stays for its delivery, and
+/// `do_signal` saves or restores the old one (Linux
+/// restore_saved_sigmask_unless)
+pub fn restore_saved_sigmask_unless(interrupted: bool) {
+    if !interrupted {
+        restore_saved_sigmask();
+    }
 }
 
 /// Set up the handler frame for `sig` on `regs`; false if that failed
@@ -1690,28 +1713,36 @@ fn deliver_to_handler(
     use crate::arch::signal;
 
     // Mask to save in the frame (restored by rt_sigreturn): the
-    // pre-syscall mask if a temporary one is in effect, else current.
-    let frame_mask =
-        with_task_signal_state(tid, |state| state.saved_sigmask.unwrap_or(state.blocked))
-            .unwrap_or(SigSet::EMPTY);
+    // pre-syscall mask if a temporary one is in effect, else current
+    // (Linux sigmask_to_save)
+    let me = crate::task::percpu::current();
+    let restore = me.has_tif(crate::task::tif::RESTORE_SIGMASK);
+    let frame_mask = with_task_signal_state(tid, |state| {
+        if restore {
+            state.saved_sigmask
+        } else {
+            state.blocked
+        }
+    })
+    .unwrap_or(SigSet::EMPTY);
 
     match signal::setup_rt_frame(sig, action, frame_mask, info, regs) {
         Ok(()) => {
+            // The saved mask now lives in the frame (Linux
+            // signal_delivered -> clear_restore_sigmask)
+            me.clear_tif(crate::task::tif::RESTORE_SIGMASK);
             // Block action.mask and the signal itself (unless SA_NODEFER)
             with_task_signal_state(tid, |state| {
-                // Saved mask now lives in the frame
-                state.saved_sigmask = None;
                 state.blocked = state.blocked.union(&action.mask);
                 if action.flags & sa_flags::SA_NODEFER == 0 {
                     state.blocked.add(sig);
                 }
-                state.recalc_sigpending();
             });
             true
         }
         Err(_) => {
             // Frame setup failed (invalid stack) - force SIGSEGV
-            restore_saved_sigmask(tid);
+            restore_saved_sigmask();
             force_sigsegv(tid);
             false
         }
@@ -1773,7 +1804,6 @@ pub fn force_sig_fault(sig: u32, info: KSigInfo, regs: &mut PtRegs) {
         }
         with_task_signal_state(tid, |s| {
             s.blocked.remove(sig);
-            s.recalc_sigpending();
         });
     }
     do_exit(sig as i32);

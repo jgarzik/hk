@@ -175,7 +175,6 @@ impl Signalfd {
             let deliverable = state.pending.signal.intersect(&mask);
             if let Some(sig) = deliverable.first() {
                 state.pending.signal.remove(sig);
-                state.recalc_sigpending();
                 return Some(sig);
             }
 
@@ -185,7 +184,6 @@ impl Signalfd {
             if let Some(sig) = deliverable.first() {
                 shared.signal.remove(sig);
                 drop(shared);
-                state.recalc_sigpending();
                 return Some(sig);
             }
             None

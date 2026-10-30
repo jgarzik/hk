@@ -89,6 +89,7 @@ pub mod rename2;
 pub mod rlimit;
 pub mod signalfd;
 pub mod signals;
+pub mod sigmask;
 pub mod sk;
 pub mod sockcore;
 pub mod sockets;
@@ -159,6 +160,7 @@ pub fn run_all_tests() {
     sync::run_tests();
     sysinfo::run_tests();
     signals::run_tests();
+    sigmask::run_tests();
     fpu::run_tests();
     preempt::run_tests();
     fault_signals::run_tests();

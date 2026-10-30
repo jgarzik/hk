@@ -515,6 +515,10 @@ pub fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout: i32) 
 }
 
 /// sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize) - Wait with signal mask
+///
+/// `sigmask` (if not null) is the blocked mask during the wait, as with
+/// ppoll; it stays for the delivery of a signal that ends the wait with
+/// EINTR (Linux do_epoll_pwait)
 pub fn sys_epoll_pwait(
     epfd: i32,
     events_ptr: u64,
@@ -527,15 +531,26 @@ pub fn sys_epoll_pwait(
     do_epoll_pwait(epfd, events_ptr, maxevents, deadline, sigmask, sigsetsize)
 }
 
-/// epoll_pwait and epoll_pwait2 with the timeout as a [`Deadline`]
+/// epoll_pwait and epoll_pwait2: the timeout as a [`Deadline`], the
+/// signal mask in place while waiting (kept only on EINTR)
 fn do_epoll_pwait(
     epfd: i32,
     events_ptr: u64,
     maxevents: i32,
     deadline: Deadline,
-    _sigmask: u64,
-    _sigsetsize: u64,
+    sigmask: u64,
+    sigsetsize: u64,
 ) -> i64 {
+    if let Err(e) = crate::signal::set_user_sigmask(sigmask, sigsetsize) {
+        return e.sysret();
+    }
+    let r = do_epoll_wait(epfd, events_ptr, maxevents, deadline);
+    crate::signal::restore_saved_sigmask_unless(r == KernelError::Interrupted.sysret());
+    r
+}
+
+/// Wait on `epfd` and copy the ready events out (Linux do_epoll_wait)
+fn do_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, deadline: Deadline) -> i64 {
     // Validate maxevents
     if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
         return KernelError::InvalidArgument.sysret();
@@ -561,8 +576,6 @@ fn do_epoll_pwait(
         Some(e) => e,
         None => return KernelError::InvalidArgument.sysret(),
     };
-
-    // TODO: Handle signal mask if provided (for proper epoll_pwait semantics)
 
     // Allocate buffer for events
     let mut events = alloc::vec![EpollEvent::default(); maxevents as usize];
@@ -595,7 +608,7 @@ fn do_epoll_pwait(
 /// * `events_ptr` - User space buffer for returned events
 /// * `maxevents` - Maximum number of events to return
 /// * `timeout_ptr` - Pointer to struct timespec timeout (NULL = wait indefinitely)
-/// * `sigmask` - Signal mask (not yet implemented)
+/// * `sigmask` - Blocked mask during the wait (NULL = unchanged)
 /// * `sigsetsize` - Size of signal mask
 ///
 /// Returns number of ready descriptors, 0 on timeout, or negative errno on error.
@@ -604,8 +617,8 @@ pub fn sys_epoll_pwait2(
     events_ptr: u64,
     maxevents: i32,
     timeout_ptr: u64,
-    _sigmask: u64,
-    _sigsetsize: u64,
+    sigmask: u64,
+    sigsetsize: u64,
 ) -> i64 {
     use crate::time_syscall::LinuxTimespec;
 
@@ -622,5 +635,5 @@ pub fn sys_epoll_pwait2(
             Err(e) => return e.sysret(),
         }
     };
-    do_epoll_pwait(epfd, events_ptr, maxevents, deadline, _sigmask, _sigsetsize)
+    do_epoll_pwait(epfd, events_ptr, maxevents, deadline, sigmask, sigsetsize)
 }

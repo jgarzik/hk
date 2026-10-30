@@ -2273,28 +2273,42 @@ actions[sig] = new_action;
 
 **rt_sigprocmask(2):** Modify blocked mask:
 ```rust
-with_task_signal_state(tid, |state| {   // under TASKLIST
+with_task_signal_state(tid, |state| {   // Task.sig (current: no TASKLIST)
     state.blocked = new_mask;
-    state.recalc_sigpending();
-});
+});                                     // TIF_SIGPENDING recomputed
 ```
 
 **kill(2)/tgkill(2):** Send signal to task (`send_signal`, process context
 only):
 ```rust
-let deliverable = with_task_signal_state(tid, |state| {  // TASKLIST
-    if sig_ignored(..) { return false }   // SIG_IGN / default-ignore: dropped
-    state.pending.add(sig);
+let deliverable = with_task_signal_state(tid, |state| {  // TASKLIST read
+    if sig_ignored(..) { return false }   // to find tid, then Task.sig;
+    state.pending.add(sig);               // SIG_IGN / default-ignore: dropped
     !state.blocked.contains(sig)
-});                                       // tif_sigpending recomputed
-// TASKLIST released, then:
-wake_up_tid(tid, WakeMode::Interruptible) // signal_wake_up
+});                                       // TIF_SIGPENDING recomputed
+// both released, then:
+signal_wake_up(tid, WakeMode::Interruptible) // try_to_wake_up(&Task) or
+                                             // kick_process
 ```
-`with_task_signal_state` recomputes `tif_sigpending` after every access, so it
-means "a signal is deliverable under the current mask"; interruptible sleeps
+`with_task_signal_state` recomputes the task's TIF_SIGPENDING after every
+access (the one record of it: no copy in `TaskSignalState`), so it means
+"a signal is deliverable under the current mask"; interruptible sleeps
 test it via `waitqueue::signal_pending()` and return `-ERESTARTSYS`/
-`-ERESTARTNOHAND`. `do_signal(regs)` (arch syscall exit) delivers the
-signal and restarts or fails the syscall per SA_RESTART.
+`-ERESTARTNOHAND`.
+
+**Syscall exit** (`entry::syscall_exit_to_user_mode`, Linux
+syscall_exit_to_user_mode): it enters `do_signal(regs)` only if
+TIF_SIGPENDING or TIF_RESTORE_SIGMASK is set or the result is an
+-ERESTART* code (rewound even with no signal, like Linux
+arch_do_signal_or_restart); otherwise it reads only the thread flags and
+the result register and takes no lock. `do_signal` delivers the signal
+and restarts or fails the syscall per SA_RESTART. A syscall with a
+temporary mask (rt_sigsuspend, ppoll, pselect6, epoll_pwait;
+`set_temp_sigmask`) saves the old one in `TaskSignalState.saved_sigmask`
+under Task.sig and sets TIF_RESTORE_SIGMASK (current task only, an atomic
+bit: no lock); a handler frame takes the saved mask and clears the bit,
+otherwise `restore_saved_sigmask` puts it back under Task.sig on the way
+out (Linux set_restore_sigmask / restore_saved_sigmask_unless).
 
 #### Thread-Group Exit (Linux do_group_exit, zap_other_threads, de_thread)
 

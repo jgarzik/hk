@@ -615,12 +615,6 @@ Found during T0 (2026-10-19). Tag = when to fix.
    pending); `NET_STRESS_TRUNC_RACE:FAIL reader status got 256` on the
    x86 Linux reference (a reader hit its 2 s receive timeout under host
    load).
-11. **Syscall exit takes the signal lock every time** (D):
-   `entry::syscall_exit_to_user_mode` runs `do_signal` unconditionally
-   (for -ERESTART* codes and `saved_sigmask` with nothing pending), and
-   its no-signal path (`restore_saved_sigmask`) locks Task.sig. Linux
-   only enters with TIF_SIGPENDING/TIF_NOTIFY_SIGNAL; a
-   TIF_RESTORE_SIGMASK-style flag would allow a lock-free early out.
 12. **arm64 overflow check misses a frame over 32 KB** (next batch):
    vectors.S KERNEL_ENTRY tests bit 15 of SP only, so an SP that jumped
    more than 32 KB below a stack base (one huge frame) lands where the

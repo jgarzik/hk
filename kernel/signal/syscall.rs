@@ -200,9 +200,6 @@ pub fn sys_rt_sigprocmask(how: i32, set_ptr: u64, oset_ptr: u64, sigsetsize: u64
 
             // Never allow blocking SIGKILL/SIGSTOP
             state.blocked = state.blocked.subtract(&UNMASKABLE_SIGNALS);
-
-            // Recalculate pending flag
-            state.recalc_sigpending();
         }
         Ok(old)
     });
@@ -530,8 +527,8 @@ pub fn sys_rt_tgsigqueueinfo(tgid: i64, tid: i64, sig: u32, uinfo: u64) -> i64 {
 /// rt_sigsuspend(mask, sigsetsize) - wait for signal with temporary mask
 ///
 /// Atomically replaces the signal mask with `mask` and sleeps until a signal
-/// becomes deliverable. The original mask is kept in `saved_sigmask`; the
-/// syscall-return path (`do_signal`) delivers the signal under the temporary
+/// becomes deliverable. The original mask is kept in `saved_sigmask`
+/// (TIF_RESTORE_SIGMASK); the syscall-return path (`do_signal`) delivers the signal under the temporary
 /// mask, stores the original mask in the signal frame (restored by
 /// rt_sigreturn), or restores it directly if no handler runs.
 ///
@@ -554,16 +551,8 @@ pub fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> i64 {
         Err(_) => return -14, // EFAULT
     };
 
-    let tid = current_tid();
-
     // Save old mask (restored on return to user) and install the new one
-    let ok = with_task_signal_state(tid, |state| {
-        state.saved_sigmask = Some(state.blocked);
-        // Never block SIGKILL/SIGSTOP
-        state.blocked = new_mask.subtract(&UNMASKABLE_SIGNALS);
-        state.recalc_sigpending();
-    });
-    if ok.is_none() {
+    if crate::signal::set_temp_sigmask(new_mask).is_none() {
         return -3; // ESRCH
     }
 
@@ -846,7 +835,6 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
             let old = st.blocked;
             st.real_blocked = old;
             st.blocked = old.subtract(&mask);
-            st.recalc_sigpending();
             old
         });
         let deadline = timeout_ns.map(|ns| crate::time::monotonic_ns().saturating_add(ns));
@@ -855,7 +843,6 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, ts_ptr: u64, sigsetsize:
             with_task_signal_state(tid, |st| {
                 st.blocked = old;
                 st.real_blocked = SigSet::EMPTY;
-                st.recalc_sigpending();
             });
         }
         sig = dequeue_in(tid, &mask);
@@ -888,7 +875,6 @@ fn dequeue_in(tid: crate::task::Tid, mask: &SigSet) -> Option<u32> {
         let deliverable = state.pending.signal.intersect(mask);
         if let Some(sig) = deliverable.first() {
             state.pending.remove(sig);
-            state.recalc_sigpending();
             return Some(sig);
         }
         let mut shared = state.shared_pending.lock();
@@ -896,7 +882,6 @@ fn dequeue_in(tid: crate::task::Tid, mask: &SigSet) -> Option<u32> {
         if let Some(sig) = deliverable.first() {
             shared.remove(sig);
             drop(shared);
-            state.recalc_sigpending();
             return Some(sig);
         }
         None

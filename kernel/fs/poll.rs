@@ -9,7 +9,7 @@ use alloc::vec;
 
 use crate::arch::Uaccess;
 use crate::fs::KernelError;
-use crate::signal::{SigSet, UNMASKABLE_SIGNALS, with_task_signal_state};
+use crate::signal::SigSet;
 use crate::task::percpu::current_tid;
 
 use super::syscall::current_fd_table;
@@ -18,30 +18,17 @@ use super::syscall::current_fd_table;
 // Signal Mask Helpers for ppoll/pselect6
 // =============================================================================
 
-/// Save current blocked mask and set new mask atomically for ppoll/pselect6
-///
-/// Returns the old mask that should be restored after polling
+/// Install ppoll/pselect6's temporary mask (TIF_RESTORE_SIGMASK);
+/// returns the old one
 fn set_poll_sigmask(new_mask: SigSet) -> Option<SigSet> {
-    let tid = current_tid();
-    with_task_signal_state(tid, |state| {
-        let old = state.blocked;
-        // Save to saved_sigmask for potential signal handler restoration
-        state.saved_sigmask = Some(old);
-        // Set new mask, never allow blocking SIGKILL/SIGSTOP
-        state.blocked = new_mask.subtract(&UNMASKABLE_SIGNALS);
-        state.recalc_sigpending();
-        old
-    })
+    crate::signal::set_temp_sigmask(new_mask)
 }
 
-/// Restore blocked mask after ppoll/pselect6
-fn restore_poll_sigmask(old_mask: SigSet) {
-    let tid = current_tid();
-    with_task_signal_state(tid, |state| {
-        state.blocked = old_mask;
-        state.saved_sigmask = None;
-        state.recalc_sigpending();
-    });
+/// Put the old mask back after ppoll/pselect6, unless a signal
+/// interrupted it (Linux poll_select_finish ->
+/// restore_saved_sigmask_unless)
+fn restore_poll_sigmask(result: i64) {
+    crate::signal::restore_saved_sigmask_unless(result == KernelError::RestartNoHand.sysret());
 }
 
 // =============================================================================
@@ -440,10 +427,8 @@ pub fn sys_ppoll(fds: u64, nfds: u32, tmo_p: u64, sigmask_ptr: u64, sigsetsize: 
     // Restore mask if we changed it, unless interrupted by a signal: then
     // the temporary mask stays in effect for signal delivery and do_signal()
     // restores saved_sigmask (Linux: restore_saved_sigmask_unless()).
-    if let Some(old) = saved_mask
-        && result != KernelError::RestartNoHand.sysret()
-    {
-        restore_poll_sigmask(old);
+    if saved_mask.is_some() {
+        restore_poll_sigmask(result);
     }
 
     result
@@ -552,10 +537,8 @@ pub fn sys_pselect6(
     // Restore mask if we changed it, unless interrupted by a signal: then
     // the temporary mask stays in effect for signal delivery and do_signal()
     // restores saved_sigmask (Linux: restore_saved_sigmask_unless()).
-    if let Some(old) = saved_mask
-        && result != KernelError::RestartNoHand.sysret()
-    {
-        restore_poll_sigmask(old);
+    if saved_mask.is_some() {
+        restore_poll_sigmask(result);
     }
 
     result

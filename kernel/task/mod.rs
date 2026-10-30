@@ -828,6 +828,10 @@ pub mod tif {
     pub const NEED_RESCHED: u32 = 1 << 1;
     /// Work queued for the return to user mode (Linux TIF_NOTIFY_RESUME)
     pub const NOTIFY_RESUME: u32 = 1 << 2;
+    /// A syscall left a temporary mask in place: `saved_sigmask` goes
+    /// back on the way out, or into a handler's frame (Linux
+    /// TIF_RESTORE_SIGMASK; set and cleared by the task itself)
+    pub const RESTORE_SIGMASK: u32 = 1 << 3;
 }
 
 /// A task (thread or process; Linux task_struct), shared as
@@ -1513,6 +1517,11 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
     /// Clear TIF_* flags `f`
     pub fn clear_tif(&self, f: u32) {
         self.thread_flags.fetch_and(!f, Ordering::Release);
+    }
+
+    /// Clear TIF_* flags `f`; whether any of them was set
+    pub fn test_and_clear_tif(&self, f: u32) -> bool {
+        self.thread_flags.fetch_and(!f, Ordering::AcqRel) & f != 0
     }
 
     /// Charge the time since the last boundary to user or system time
