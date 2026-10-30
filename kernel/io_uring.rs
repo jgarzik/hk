@@ -1329,9 +1329,16 @@ fn read_user_iovec(iov_addr: u64, i: usize) -> Result<IoVec, i32> {
     copy_val_from_user::<Uaccess, IoVec>(addr).map_err(|_| KernelError::BadAddress.to_errno_neg())
 }
 
-/// Copy an `int fds[n]` array from user space
+/// Most registered files (Linux IORING_MAX_FIXED_FILES)
+const IORING_MAX_FIXED_FILES: usize = 1 << 15;
+
+/// Copy an `int fds[n]` array from user space (EMFILE over
+/// IORING_MAX_FIXED_FILES, as Linux io_sqe_files_register)
 fn read_user_fds(arg: u64, n: usize) -> Result<Vec<i32>, KernelError> {
-    let mut fds = alloc::vec![0i32; n];
+    if n > IORING_MAX_FIXED_FILES {
+        return Err(KernelError::ProcessFileLimit);
+    }
+    let mut fds = crate::kmem::try_vec(n, 0i32)?;
     // SAFETY: byte view of the `n` initialized i32 elements of `fds`
     let bytes = unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr() as *mut u8, n * 4) };
     copy_from_user::<Uaccess>(bytes, arg, n * 4).map_err(|_| KernelError::BadAddress)?;

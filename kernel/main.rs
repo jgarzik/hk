@@ -28,6 +28,7 @@ pub mod hrtimer;
 pub mod inotify;
 pub mod io_uring;
 pub mod kcmp;
+pub mod kmem;
 pub mod list;
 pub mod pidfd;
 pub mod pipe;

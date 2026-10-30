@@ -11,7 +11,6 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -238,6 +237,17 @@ impl BpfMapOps for BpfHashMap {
 // BPF Array Map
 // =============================================================================
 
+/// Most bytes a map may preallocate: half of free memory (host tests:
+/// no limit)
+fn prealloc_budget() -> u64 {
+    #[cfg(not(test))]
+    {
+        crate::FRAME_ALLOCATOR.stats().free_bytes / 2
+    }
+    #[cfg(test)]
+    u64::MAX
+}
+
 /// Array map implementation
 ///
 /// Entries are accessed by u32 index (stored in key). The array is
@@ -263,11 +273,25 @@ impl BpfArrayMap {
             return Err(KernelError::InvalidArgument);
         }
 
-        // Pre-allocate all entries with zero values
-        let zero_value = vec![0u8; value_size as usize];
-        let mut data = Vec::with_capacity(max_entries as usize);
+        // Pre-allocate all entries with zero values: ENOMEM rather than
+        // exhaust memory (Linux bpf_map_area_alloc fails; no memcg here,
+        // so at most half of free memory)
+        // Each entry: its lock and Vec header, and the value's kmalloc
+        // class (powers of two from 16 bytes)
+        let entry = core::mem::size_of::<IrqSpinlock<Vec<u8>>>() as u64
+            + (value_size as u64).next_power_of_two().max(16);
+        let bytes = max_entries as u64 * entry;
+        if bytes > prealloc_budget() {
+            return Err(KernelError::OutOfMemory);
+        }
+        let mut data = Vec::new();
+        data.try_reserve_exact(max_entries as usize)
+            .map_err(|_| KernelError::OutOfMemory)?;
         for _ in 0..max_entries {
-            data.push(IrqSpinlock::new(zero_value.clone()));
+            data.push(IrqSpinlock::new(crate::kmem::try_vec(
+                value_size as usize,
+                0u8,
+            )?));
         }
 
         Ok(Arc::new(Self {

@@ -112,6 +112,7 @@ pub mod timer_accuracy;
 pub mod timer_rt;
 pub mod ptrace_stop;
 pub mod wake_storm;
+pub mod enomem;
 pub mod timing;
 pub mod tlb;
 pub mod tls;
@@ -253,6 +254,7 @@ pub fn run_all_tests() {
     timer_rt::run_tests();
     ptrace_stop::run_tests();
     wake_storm::run_tests();
+    enomem::run_tests();
     uaccess::run_tests();
     isolated(b"BUSYBOX", busybox::run_tests);
     #[cfg(target_arch = "x86_64")]

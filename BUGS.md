@@ -332,7 +332,11 @@ beyond two each, but nothing asks them under pressure), no slab
 merging, poisoning or red zones.
 
 Heap allocations cannot fail gracefully (Rust's global allocator): one
-the page allocator cannot meet panics. The heap goes down to the min
+the page allocator cannot meet panics. Buffers sized by a syscall
+argument use `kmem::try_vec` (ENOMEM) where the size was unbounded
+(listxattr, keyctl read/update, process_vm, io_uring fixed files, bpf
+array maps); the many sites bounded by a sysctl or a constant still
+allocate infallibly. The heap goes down to the min
 watermark while user data stops at low (also after direct reclaim:
 user allocations stop at low until the OOM killer (P6); then Linux's
 min), so only kernel objects can get there (no memcg or OOM killer bounds what a process pins in pipes,
@@ -346,6 +350,15 @@ memory: each fork+exec keeps two dentries and two inodes plus ~900
 bytes of kmalloc (~1.3KB; suspected: procfs entries of dead pids, for
 the dcache work). The MM_LIFE tests count MemFree + Slab so they check user memory only; these leaks
 are listed here instead.
+
+## BPF map memory is not charged
+
+**Location**: `kernel/bpf/map.rs`
+
+An array map refuses a preallocation over half of free memory, but
+nothing adds maps up: no RLIMIT_MEMLOCK or memcg charge (Linux
+bpf_map_charge_memlock / memcg accounting), so many maps can still use
+up memory.
 
 ## Heap allocations in atomic context are not reported
 
