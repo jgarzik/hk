@@ -2584,7 +2584,8 @@ pub fn kick_process(t: &KernelTask) {
     }
 }
 
-/// Scheduler tick period (both arches program a 10 ms local timer)
+/// Scheduler tick period (each CPU's tick is a HARD hrtimer re-armed
+/// every TICK_NS: `hrtimer::tick_fire`)
 pub const TICK_MS: u64 = 10;
 /// Scheduler tick period in nanoseconds
 pub const TICK_NS: u64 = TICK_MS * 1_000_000;
@@ -2601,23 +2602,20 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
 
 /// Per-CPU timer tick (IRQ context, every CPU)
 ///
-/// Every CPU's local timer fires every TICK_MS, so only CPU 0 advances the
-/// global tick count (jiffies); previously each CPU advanced it, making
-/// time run ~Ncpu times too fast. All CPUs then do their own work
+/// Every CPU's tick hrtimer fires every TICK_MS, so only CPU 0 advances
+/// the global tick count (jiffies). All CPUs then do their own work
 /// (remote wakeups, their timers: HARD callbacks run here, `ktimers/N`
 /// is woken for SOFT ones), and the running task's slice (one tick,
 /// round robin within a priority) is used up: TIF_NEED_RESCHED, acted
 /// on at its next return to user mode (`entry::exit_to_user_mode`;
 /// Linux scheduler_tick -> resched_curr).
 pub fn scheduler_tick() {
-    crate::sync::lockdep::irq_enter();
     if crate::cpu::try_this_id() == Some(0) {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     }
     sched_ipi();
     crate::timer::run_local();
     current().set_tif(crate::task::tif::NEED_RESCHED);
-    crate::sync::lockdep::irq_exit();
 }
 
 /// Get current tick count

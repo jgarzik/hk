@@ -46,7 +46,6 @@ const ICR_DEST_FIELD: u32 = 0x00000; // Use destination field
 const ICR_DELIVERY_PENDING: u32 = 0x1000;
 
 // Timer LVT bits
-const TIMER_PERIODIC: u32 = 0x20000;
 const TIMER_MASKED: u32 = 0x10000;
 
 // Timer divide values
@@ -201,18 +200,19 @@ impl LocalApic {
         self.wait_for_ipi();
     }
 
-    /// Configure and start the APIC timer in periodic mode
+    /// Configure and start the APIC timer in one-shot mode (the clock
+    /// event device: `set_next_event` re-arms it)
     ///
     /// # Arguments
     /// * `vector` - Interrupt vector for timer
     /// * `initial_count` - Initial countdown value
     /// * `divider` - Clock divider (use TIMER_DIV_* constants)
-    pub fn start_timer_periodic(&self, vector: u8, initial_count: u32, divider: u32) {
+    pub fn start_timer_oneshot(&self, vector: u8, initial_count: u32, divider: u32) {
         // Set divider
         self.write(LAPIC_TIMER_DIV, divider);
 
-        // Set timer LVT entry (periodic mode, not masked)
-        self.write(LAPIC_TIMER_LVT, TIMER_PERIODIC | (vector as u32));
+        // Set timer LVT entry (one-shot mode: mode bits 0, not masked)
+        self.write(LAPIC_TIMER_LVT, vector as u32);
 
         // Set initial count (starts the timer)
         self.write(LAPIC_TIMER_INIT, initial_count);
@@ -360,8 +360,8 @@ pub fn calibrate_and_start_timer(vector: u8, interval_ms: u32) -> u32 {
     // Calculate initial count for desired interval
     let initial_count = ticks_per_ms * interval_ms;
 
-    // Start periodic timer with divider 16 (same as calibration)
-    lapic.start_timer_periodic(vector, initial_count, TIMER_DIV_16);
+    // Start the one-shot timer with divider 16 (same as calibration)
+    lapic.start_timer_oneshot(vector, initial_count, TIMER_DIV_16);
 
     ticks_per_ms
 }
@@ -375,5 +375,13 @@ pub fn start_timer_on_ap(vector: u8, interval_ms: u32) {
 
     let lapic = LocalApic::get();
     let initial_count = ticks_per_ms * interval_ms;
-    lapic.start_timer_periodic(vector, initial_count, TIMER_DIV_16);
+    lapic.start_timer_oneshot(vector, initial_count, TIMER_DIV_16);
+}
+
+/// Program this CPU's timer interrupt `delta_ns` from now (the clock
+/// event device, Linux lapic_next_event; interrupts off)
+pub fn set_next_event(delta_ns: u64) {
+    let per_ms = LAPIC_TICKS_PER_MS.load(Ordering::Relaxed) as u64;
+    let count = (delta_ns as u128 * per_ms as u128 / 1_000_000).clamp(1, u32::MAX as u128);
+    LocalApic::get().write(LAPIC_TIMER_INIT, count as u32);
 }

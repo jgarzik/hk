@@ -374,17 +374,30 @@ pub fn run_local() {
     }
 }
 
-/// `ktimers/N`: runs CPU N's SOFT timer callbacks (Linux ktimers / the
-/// TIMER softirq)
+/// `ktimers/N`: runs CPU N's SOFT timer and hrtimer callbacks (Linux
+/// ktimers / the TIMER and HRTIMER softirqs)
 fn ktimers(cpu: usize) {
-    let soft = &BASES.get(cpu as u32)[1];
+    let cpu = cpu as u32;
+    let soft = &BASES.get(cpu)[1];
     loop {
         soft.wq
-            .wait_event(|| soft.wheel.lock().any_due(get_ticks()));
+            .wait_event(|| soft.wheel.lock().any_due(get_ticks()) || crate::hrtimer::soft_due(cpu));
         soft.run(get_ticks());
-        // `del_timer_sync` waiters look again
+        crate::hrtimer::run_soft(cpu);
+        // `del_timer_sync` / `cancel_sync` waiters look again
         soft.wq.wake_all();
     }
+}
+
+/// Wake `ktimers/N` of `cpu` (a SOFT hrtimer is due; any context)
+pub fn wake_ktimers(cpu: u32) {
+    BASES.get(cpu)[1].wq.wake_all();
+}
+
+/// Sleep until `cond` holds, woken whenever `ktimers/N` of `cpu`
+/// finishes a pass (a SOFT callback cancelled with `cancel_sync`)
+pub fn wait_soft(cpu: u32, cond: impl FnMut() -> bool) {
+    BASES.get(cpu)[1].wq.wait_event(cond);
 }
 
 /// Start `ktimers/N` on every CPU with a scheduler

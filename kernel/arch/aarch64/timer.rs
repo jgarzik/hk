@@ -69,6 +69,33 @@ fn write_tval(val: u64) {
     }
 }
 
+/// Read CNTPCT_EL0, ordered after earlier instructions (isb)
+#[inline]
+fn read_cntpct() -> u64 {
+    let v: u64;
+    unsafe {
+        asm!(
+            "isb",
+            "mrs {}, cntpct_el0",
+            out(reg) v,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    v
+}
+
+/// Write CNTP_CVAL_EL0 (absolute compare value)
+#[inline]
+fn write_cval(val: u64) {
+    unsafe {
+        asm!(
+            "msr cntp_cval_el0, {}",
+            in(reg) val,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+}
+
 /// Initialize the ARM Generic Timer
 ///
 /// This sets up the timer frequency and enables the timer interrupt.
@@ -106,17 +133,22 @@ pub fn start(interval_ms: u32) {
     printkln!("Timer: started with {}ms interval", interval_ms);
 }
 
+/// Program this CPU's timer interrupt `delta_ns` from now (the clock
+/// event device, Linux arch_timer_set_next_event; interrupts off)
+pub fn set_next_event(delta_ns: u64) {
+    let freq = TIMER_FREQ.load(Ordering::Relaxed);
+    let cycles = (delta_ns as u128 * freq as u128 / 1_000_000_000).clamp(1, u32::MAX as u128);
+    // An absolute compare value: no 32-bit countdown limit
+    write_cval(read_cntpct().wrapping_add(cycles as u64));
+}
+
 /// Handle timer interrupt
 ///
-/// Called from the IRQ handler when the timer fires.
+/// Called from the IRQ handler when the timer fires. The interrupt
+/// handler (`hrtimer::interrupt`) programs the next event.
 pub fn handle_timer_irq() {
     // Increment tick counter
     let _ticks = TIMER_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-
-    // Reload timer for next interval
-    let ticks_per_ms = TICKS_PER_MS.load(Ordering::Relaxed);
-    let interval = TIMER_INTERVAL_MS.load(Ordering::Relaxed);
-    write_tval(ticks_per_ms * interval);
 
     // Update global timekeeper (only on CPU 0 to avoid contention)
     if super::percpu::try_current_cpu()
@@ -126,8 +158,8 @@ pub fn handle_timer_irq() {
         crate::time::TIMEKEEPER.update(crate::time::TIMEKEEPER.get_read_cycles());
     }
 
-    // Global ticks/timers and this CPU's scheduler work
-    crate::task::percpu::scheduler_tick();
+    // Due timers (the scheduler tick among them), the next event
+    crate::hrtimer::interrupt();
 
     // Call preemption callback if registered
     unsafe {

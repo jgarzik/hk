@@ -117,6 +117,14 @@ pub use x86_64::uapi;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::uapi;
 
+// Program this CPU's next timer interrupt, ns from now (the one-shot
+// clock event device: LAPIC timer count / CNTP_CVAL)
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::lapic::set_next_event as clockevent_next;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::timer::set_next_event as clockevent_next;
+
 // The current task's user TLS register (FS base / TPIDR_EL0)
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::percpu::read_fs_base as read_user_tls;

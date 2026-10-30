@@ -24,6 +24,7 @@ pub mod epoll;
 pub mod eventfd;
 pub mod fanotify;
 pub mod futex;
+pub mod hrtimer;
 pub mod inotify;
 pub mod io_uring;
 pub mod kcmp;

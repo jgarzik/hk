@@ -424,6 +424,15 @@ pub fn deadline_after(now_ns: u64, delta_ns: u64) -> u64 {
     now_ns.saturating_add(delta_ns).min(KTIME_MAX)
 }
 
+/// CLOCK_REALTIME now in ns (0 before the epoch)
+pub fn realtime_ns() -> u64 {
+    let ts = TIMEKEEPER.read(ClockId::Realtime, TIMEKEEPER.get_read_cycles());
+    if ts.sec < 0 {
+        return 0;
+    }
+    ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
+}
+
 /// Get current monotonic time in nanoseconds
 ///
 /// Returns the current monotonic clock time since boot in nanoseconds.

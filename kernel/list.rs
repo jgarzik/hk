@@ -151,6 +151,26 @@ impl<A: Adapter> List<A> {
         self.len += 1;
     }
 
+    /// Insert `item` after `at` (Linux list_add(item, at))
+    ///
+    /// # Safety
+    /// `at` is on this list; `item` as for [`List::push_back`].
+    pub unsafe fn insert_after(&mut self, at: *const A::Item, item: *const A::Item) {
+        let (a, l) = (Self::lk(at), Self::lk(item));
+        // SAFETY: `a` is on this list, `l` is a free live link
+        unsafe {
+            let n = (*a).next.load(Relaxed);
+            (*l).prev.store(a, Relaxed);
+            (*l).next.store(n, Relaxed);
+            match n.as_ref() {
+                Some(n) => n.prev.store(l, Relaxed),
+                None => self.tail = l,
+            }
+            (*a).next.store(l, Relaxed);
+        }
+        self.len += 1;
+    }
+
     /// Unlink `item` (Linux list_del)
     ///
     /// # Safety
@@ -387,5 +407,31 @@ mod tests {
         assert_eq!(l.len(), 1);
         assert_eq!(l.pop_front().map(|p| unsafe { (*p).v }), Some(5));
         assert!(l.is_empty());
+    }
+
+    #[test]
+    fn insert_after_middle_and_tail() {
+        let n = |v| Node {
+            v,
+            link: Link::new(),
+        };
+        let (a, b, c) = (n(1), n(3), n(2));
+        let mut l: List<NodeA> = List::new();
+        unsafe {
+            l.push_back(&a);
+            l.insert_after(&a, &b);
+            l.insert_after(&a, &c);
+        }
+        assert_eq!(l.iter().map(|n| n.v).collect::<Vec<_>>(), [1, 2, 3]);
+        let d = n(4);
+        unsafe { l.insert_after(&b, &d) };
+        assert_eq!(l.len(), 4);
+        unsafe { l.remove(&d) };
+        assert_eq!(l.iter().map(|n| n.v).collect::<Vec<_>>(), [1, 2, 3]);
+        // The tail moved back to `b`
+        let e = n(5);
+        unsafe { l.push_back(&e) };
+        assert_eq!(l.iter().map(|n| n.v).collect::<Vec<_>>(), [1, 2, 3, 5]);
+        while l.pop_front().is_some() {}
     }
 }

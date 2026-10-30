@@ -326,7 +326,8 @@ Wakeups (3.1; any context, under any of the above):
 
 Timers (3.3 Timers): owner locks (PosixTimer.inner, Timerfd.inner,
     Alarm.st) → TimerBase.wheel (IrqSpinlock leaf, per CPU; callbacks
-    run with it dropped)
+    run with it dropped). HrBase.q (IrqSpinlock leaf, per CPU, HARD and
+    SOFT; callbacks run with it dropped)
 
 Timekeeping (3.5):
     TimeKeeper.lock (IrqSpinlock leaf; writers only: the CPU 0 tick,
@@ -1795,6 +1796,24 @@ queue); a timer stays on the base of the CPU that first armed it.
 - Order: owner locks (`PosixTimer.inner`, `Timerfd.inner`, `Alarm.st`)
   -> `TimerBase.wheel` (leaf).
 
+#### High-resolution timers (kernel/hrtimer.rs; Linux kernel/time/hrtimer.c)
+
+An `HrTimer` is embedded in its pinned owner and fires at an absolute
+CLOCK_MONOTONIC or CLOCK_REALTIME ns time. Each CPU has a HARD and a
+SOFT `HrBase`: `q`, an IrqSpinlock over one sorted intrusive list per
+clock, and `running`. The CPU's clock event device runs one-shot,
+programmed for the earliest expiry of both bases; the scheduler tick is
+a HARD hrtimer re-armed every TICK_NS.
+
+- HARD callbacks run in the timer interrupt (the tick, sleep
+  deadlines); SOFT ones in `ktimers/N`, like the wheel's.
+- `start` queues and reprograms with interrupts off (no migration or
+  timer interrupt in between). `cancel_sync` waits out a running
+  callback (spinning for HARD, sleeping on the `ktimers/N` wait queue
+  for SOFT); dropping an `HrTimer` does that.
+- `HrBase.q` is a leaf: callbacks run with it dropped, and
+  `reprogram` takes the two bases' locks one at a time.
+
 #### Wait Queues (kernel/waitqueue.rs)
 
 Linux-style wait queues (`include/linux/wait.h`, `kernel/sched/wait.c`).
@@ -2805,6 +2824,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `SignalStruct.posix_timers` | signal/mod.rs, posix_timer.rs | spin Mutex | the thread group's POSIX timers and ITIMER_REAL (Linux signal->posix_timers); leaf, thread context; deleted at the group's last exit (`exit_itimers`, timers stopped after the lock) or with the SignalStruct |
 | `PosixTimer.inner` | posix_timer.rs | IrqSpinlock | one timer's state; -> its timer's base (re-armed under it); cancelled with `del_timer_sync` before it is taken (settime) or with it dropped (delete) |
 | `TimerBase.wheel` (per CPU, HARD and SOFT) | timer.rs | IrqSpinlock leaf | a 64-slot wheel of `TimerList`s (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the tick, by `ktimers/N` and by arming/deleting code in any context |
+| `HrBase.q` (per CPU, HARD and SOFT) | hrtimer.rs | IrqSpinlock leaf | sorted lists of `HrTimer`s per clock (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the clock event interrupt, by `ktimers/N` and by start/cancel in any context |
 | `Eventfd.inner`, `Eventpoll.inner`, `Inotify.inner`, `Fanotify.inner`, `IoUring.inner`, `Pidfd.inner`, `Signalfd.inner`, `Timerfd.inner` | eventfd.rs, epoll.rs, inotify.rs, fanotify.rs, io_uring.rs, pidfd.rs, signalfd.rs, timerfd.rs | IrqSpinlock | per-object state of the anon-inode files; their wait queues are woken after unlocking (pidfd: under it -> wait queue head) |
 | `SIGNALFD_REGISTRY`, `PIDFD_REGISTRY` | signalfd.rs, pidfd.rs | IrqSpinlock | live instances for signal and exit notification; registry -> the instance's `inner` |
 | `Workqueue.inner` | workqueue.rs | IrqSpinlock | pending and delayed work lists (`SYSTEM_WQ`, `BDI_WORKQUEUE`); a work item's own `spin::Mutex<Work>` is taken and dropped before it |
@@ -3049,6 +3069,9 @@ is `SCHED:FAIL scheduling while atomic`).
 - `WaitQueue::wake_one/wake_all` and `try_to_wake_up` (IrqSpinlocks
   only, no allocation: wakes run under the head lock; the priority
   lists and remote wake lists are intrusive)
+- `hrtimer::interrupt()` (every CPU's clock event): runs the due HARD
+  hrtimers (the tick among them), wakes `ktimers/N` for due SOFT ones,
+  programs the next event (`HrBase.q` leaves only)
 - `timer::run_local()` (every CPU's tick): runs the CPU's due HARD timer
   callbacks (they only wake tasks) and wakes `ktimers/N` when a SOFT one
   is due; SOFT callbacks run there, in process context (they may send
