@@ -425,7 +425,8 @@ Other CPUs cannot cause deadlock because:
 
 **Location:** `kernel/task/percpu.rs`
 
-The scheduler uses a per-CPU locking model to minimize contention.
+Each CPU has its own run queue and lock (Linux struct rq); a wakeup
+takes the lock of the run queue it queues on, whichever CPU that is.
 
 #### Global State
 
@@ -433,15 +434,14 @@ The scheduler uses a per-CPU locking model to minimize contention.
 |----------|------|---------|
 | `PERCPU_SCHEDS` | `PerCpu<PerCpuScheduler>` | Per-CPU scheduler array |
 | `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task (Linux tasklist_lock + task list) |
-| `TICK_COUNT` | `AtomicU64` | Global tick counter (jiffies, TICK_MS = 10 ms); advanced only by CPU 0's tick; every CPU's tick applies its remote wakeups (`sched_ipi`) and runs its own timers (`timer::run_local`; Timers, 3.3) |
+| `TICK_COUNT` | `AtomicU64` | Global tick counter (jiffies, TICK_MS = 10 ms); advanced only by CPU 0's tick; every CPU's tick runs its own timers (`timer::run_local`; Timers, 3.3) |
 
 #### Per-CPU State
 
 Each `PerCpuScheduler` contains:
 ```rust
 pub struct PerCpuScheduler {
-    pub lock: IrqSpinlock<CpuRunQueue>,  // curr, idle, 256 priority lists, dead
-    wake_list: AtomicPtr<()>,            // remote wakeups (lock-free llist)
+    pub lock: IrqSpinlock<CpuRunQueue>,  // curr, idle, prev, 256 priority lists, dead
     pub initialized: AtomicBool,          // Init flag
     pub nr_switches: AtomicU64,           // context switches (QSBR hook)
     pub curr_mm: AtomicUsize,             // running task's Mm address (membarrier)
@@ -451,8 +451,9 @@ pub struct PerCpuScheduler {
 
 Each `Task` carries its scheduling entity (`Task.se`, Linux
 sched_entity + `__state`/`on_rq`): `state` (`SleepState` as an
-atomic), `on_rq` (queued or running), `prio`, the priority-list `link`,
-the saved switch frame, and the wake-list / WakeQ links; plus
+atomic), `on_rq` (queued or running), `on_cpu` (running, or its CPU
+still switching away from it), `prio`, the priority-list `link`, the
+saved switch frame, and the WakeQ link; plus
 `Task.pi_lock` (IrqSpinlock, Linux pi_lock). The run queue owns one
 reference to each task of its CPU, from its first wakeup (or creation
 asleep) until its final switch away (`DeadTask`; Linux: the task's own
@@ -474,27 +475,31 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
 
 #### Locking Rules
 
-1. **Each CPU only locks its own run queue** - no CPU takes another
-   CPU's `PerCpuScheduler.lock` (bring-up aside: the BSP installs the
-   APs' idle tasks). A wakeup for a task owned by another CPU is pushed
-   onto that CPU's `wake_list` (a lock-free stack linked through
-   `Task.se.wake_next`, one entry per task via `se.wake_pending`, pushed
-   under the task's pi_lock; nothing allocates) and a reschedule IPI;
-   the owner applies it under its rq lock (`ttwu_pending`: in the IPI,
-   and at every `schedule()`/`yield_now()`/tick; Linux
-   ttwu_queue_wakelist / sched_ttwu_pending). Entries hold no task
-   reference: an exiting task sets Dead under its pi_lock (no new
-   pushes) and drains its CPU's list before its final switch, and tasks
-   never migrate (`Task.cpu` names the owning run queue; migration, P7,
-   must drain the old CPU's list first).
+1. **Any CPU may lock any run queue** (Linux) - `Task.cpu` names the
+   run queue a task belongs to (Linux task_cpu); it changes only in
+   `set_task_cpu`, under the task's pi_lock while it is on no run queue
+   (a wakeup, a new task), or under its rq lock while queued (a
+   migration). `task_rq_lock` locks the run queue it names and rechecks
+   it. A wakeup (`try_to_wake_up`, Linux ttwu) holds the task's pi_lock
+   throughout: under its rq lock it sees whether the task is still on
+   it (then only sets Running, Linux ttwu_runnable); if not, it waits
+   for `se.on_cpu` to clear (its old CPU is off its stack), chooses the
+   CPU (`select_task_rq`), sets it and activates the task under that
+   CPU's rq lock. `resched_curr` flags the running task and sends a
+   reschedule IPI when the run queue is another CPU's. The rq holds no
+   task reference per CPU: the scheduler's reference (rule 8) follows
+   the task.
 
 2. **Run queue lock is IRQ-safe** - Timer interrupts cannot cause deadlocks.
-   Lock order: pi_lock → rq lock; nothing is taken under the rq lock but
-   the arm64 ASID leaf (no TASKLIST: the switch and the wakeup use only
-   `Task` atomics). Never call a wakeup (`try_to_wake_up`,
-   `WaitQueue::wake*`) while holding this CPU's rq lock (it is not
-   recursive); `schedule_timeout`'s HARD timer wakes its sleeper from
-   the tick with no rq lock held.
+   Lock order: pi_lock → rq lock; two rq locks lowest CPU first
+   (`double_rq_lock`); nothing is taken under an rq lock but the arm64
+   ASID leaf (no TASKLIST: the switch and the wakeup use only `Task`
+   atomics). Never call a wakeup (`try_to_wake_up`, `WaitQueue::wake*`)
+   while holding an rq lock (it is not recursive); `schedule_timeout`'s
+   HARD timer wakes its sleeper from the tick with no rq lock held. A
+   waker spinning on `on_cpu` holds only the pi_lock: the CPU it waits
+   for finishes its switch with interrupts off and no pi_lock, so it is
+   never the waker's own CPU.
 
 3. **Context switch happens with lock held** - The lock is released by the
    task switched to, in `finish_task_switch` (Linux), always on the run
@@ -515,8 +520,8 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    preempt count stays balanced (dropping the guard there and releasing
    again in `finish_task_switch` left it at -1).
 
-5. **Timer ISR only touches local CPU** - the tick drains the local
-   `wake_list` and runs the local CPU's timers only.
+5. **Timer ISR only touches local CPU** - the tick runs the local
+   CPU's timers only.
 
 9. **The idle task is never queued** - `rq.idle` runs when the lists are
    empty. Making a task runnable flags the running task NEED_RESCHED if
@@ -579,20 +584,19 @@ register on wait queue                    make condition true
 set_current_state(Interruptible)          try_to_wake_up(&task, mode):
   (store state, full barrier)               lock task.pi_lock, full barrier
 if condition: done                          state matches mode? else return
-if signal_pending(): -ERESTARTSYS           state = Running
-schedule():                                 on_rq? return (its schedule()
-  lock rq; state Running? return              sees Running)
-  on_rq = false                             own CPU: lock rq, activate
-  state Running? on_rq = true; return       remote: push wake_list + IPI
-  switch                                  activate (under the rq lock):
-                                            on_rq = true, enqueue
+if signal_pending(): -ERESTARTSYS           lock task's rq: on_rq?
+schedule():                                   state = Running; return
+  lock rq; state Running? return            wait until !on_cpu
+  on_rq = false                             cpu = select_task_rq
+  switch (finish_task_switch on the         lock that rq, activate:
+    next task clears on_cpu)                  state = Running, on_rq,
+                                              enqueue, resched_curr
 ```
 
-Both `on_rq` and `state` are SeqCst: a waker that still saw `on_rq`
-left `state` Running, which `schedule()` sees after clearing `on_rq`
-(it stays); a waker that saw it cleared queues the task. A wakeup
-racing a sleeper that stayed may leave a stale wake-list entry, applied
-later as a spurious wakeup (allowed: every sleeper re-checks).
+The sleeper tests `state` and clears `on_rq` under its rq lock; the
+waker tests `on_rq` under the same lock: either it saw the sleeper still
+on it and set Running first (the sleeper stays), or the sleeper is off
+it and the waker queues it, once its CPU is off its stack.
 
 `WakeMode::Interruptible` (signals) wakes only `Interruptible` sleepers;
 `WakeMode::Fatal` (SIGKILL) also wakes `Killable` ones (Linux
@@ -635,11 +639,10 @@ timer callbacks), the system workqueue worker, `softnet/N` (one per CPU,
 network receive; see 3.10), `kselftest` (boot only).
 
 Every online AP gets an idle task (`init_ap_schedulers`) and enters the
-scheduler from its boot idle loop. User tasks still run only on CPU 0. On
-x86-64 the TSS (RSP0) and the syscall entry stack are global: kernel
-threads switch with kernel stack 0, which leaves them untouched, so an AP
-switch cannot clobber CPU 0's user-entry stack. Per-CPU TSS is required
-before user tasks run on APs.
+scheduler from its boot idle loop. User tasks still run only on CPU 0
+(`select_task_rq` keeps a task on its CPU). On x86-64 each CPU has its
+own TSS (RSP0) and syscall entry stack top, set at each switch to a
+user task.
 
 ### 3.1.1 Task Struct and Credentials
 
@@ -1283,9 +1286,9 @@ No lock: the state is atomics and per-CPU data (Linux arch/x86/mm/tlb.c).
 No lock (Linux kernel/smp.c): `smp_call_function_many(mask, func,
 info, wait)` runs `func(info)` on other CPUs from their call-function
 IPI (x86 vector 0xfc, arm64 SGI 1); `on_each_cpu` adds this CPU;
-`smp_send_reschedule` (x86 0xfd, arm64 SGI 0) wakes a remote CPU after
-a remote wakeup was queued (`try_to_wake_up`); its handler applies the
-CPU's queued wakeups (`sched_ipi`).
+`smp_send_reschedule` (x86 0xfd, arm64 SGI 0) makes a remote CPU
+reschedule (`resched_curr` after queueing a task on its run queue,
+`kick_process`); its handler flags the running task NEED_RESCHED.
 
 - `QUEUE[cpu]` (per CPU): the calls queued for a CPU, a lock-free list
   (Linux llist). Senders push with a compare-and-swap (Release); only
@@ -2996,8 +2999,8 @@ circular wait conditions.
 
 ### 4.4 Per-CPU Data Structures
 
-The scheduler uses per-CPU run queues. Each CPU only locks its own run queue,
-eliminating cross-CPU lock contention for the hot path.
+The scheduler uses per-CPU run queues: a CPU's own scheduling takes only
+its own lock; a wakeup takes the target's (3.1).
 
 ### 4.5 Lock-Free Reads (Seqlock)
 

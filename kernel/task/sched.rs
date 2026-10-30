@@ -43,10 +43,6 @@ pub struct SchedEntity {
     /// The kernel stack is freed with the task (the boot stack of the
     /// first user task is not)
     owns_stack: AtomicBool,
-    /// Next task on a remote wake list (Linux wake_entry)
-    pub wake_next: AtomicPtr<()>,
-    /// On a remote wake list (one entry per task)
-    pub wake_pending: AtomicBool,
     /// Next task on a [`WakeQ`](crate::task::percpu::WakeQ); null when
     /// on none (Linux wake_q_node)
     pub wake_q: AtomicPtr<()>,
@@ -67,8 +63,6 @@ impl SchedEntity {
             // SAFETY: a switch frame is plain integers; zero is valid
             ctx: UnsafeCell::new(unsafe { MaybeUninit::zeroed().assume_init() }),
             owns_stack: AtomicBool::new(true),
-            wake_next: AtomicPtr::new(core::ptr::null_mut()),
-            wake_pending: AtomicBool::new(false),
             wake_q: AtomicPtr::new(core::ptr::null_mut()),
         }
     }

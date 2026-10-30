@@ -180,13 +180,12 @@ pub fn call_function_interrupt() {
     run_queue(this_id());
 }
 
-/// Reschedule IPI handler (Linux scheduler_ipi): the remote wakeups
-/// queued for this CPU are applied now; the woken task is picked at
-/// this CPU's next scheduling point (the idle loop's, right after this
-/// interrupt), or the running task's return to user mode
-/// (TIF_NEED_RESCHED; a kick_process for a signal also lands here)
+/// Reschedule IPI handler (Linux scheduler_ipi): another CPU queued a
+/// task here that should run now (`resched_curr`) or wants the running
+/// task to notice new work (`kick_process`); it switches at this CPU's
+/// next scheduling point (the idle loop's, right after this interrupt),
+/// or the running task's return to user mode (TIF_NEED_RESCHED)
 pub fn reschedule_interrupt() {
-    crate::task::percpu::sched_ipi();
     crate::task::percpu::current().set_tif(crate::task::tif::NEED_RESCHED);
 }
 
