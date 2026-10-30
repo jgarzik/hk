@@ -530,7 +530,10 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    nothing to save, and signal frames (`do_signal`, `force_sig_fault`),
    fork (`do_clone` copies it), exec (`jump_to_user` rebuilds it) and
    ptrace read and write it there with no lock: the task itself, or a
-   stopped tracee under TASKLIST.
+   stopped tracee under TASKLIST. A tracer first waits for the tracee's
+   `se.on_cpu` to clear (`wait_task_inactive`, in ptrace_check_attach):
+   its TLS and GS base are saved by its switch-out, which may still be
+   finishing on another CPU.
 
 7. **User FP/SIMD state is saved eagerly, per task, never lazily** - no
    lock is involved; the state always lives with the task it belongs to:

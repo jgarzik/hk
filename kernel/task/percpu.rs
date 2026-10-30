@@ -2680,6 +2680,20 @@ pub fn try_to_wake_up(p: &KernelTask, mode: WakeMode) -> bool {
     true
 }
 
+/// Wait until `p`, asleep, is off its CPU (Linux wait_task_inactive):
+/// what its switch-out saves (user TLS, GS base, FP state) is complete
+/// once its CPU has cleared `on_cpu`, which takes no longer than the
+/// rest of a context switch. False if it woke meanwhile.
+pub fn wait_task_inactive(p: &KernelTask) -> bool {
+    while p.se.on_cpu() {
+        if p.se.state() == RUNNING {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    p.se.state() != RUNNING
+}
+
 /// Reschedule IPI (any CPU, interrupts off): apply the remote wakeups
 /// queued for this CPU (Linux scheduler_ipi -> sched_ttwu_pending)
 pub fn sched_ipi() {

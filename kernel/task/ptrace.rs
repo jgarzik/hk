@@ -184,21 +184,28 @@ fn ptrace_may_access(target_tid: Tid) -> bool {
 
 /// Check if tracee is stopped and caller is its tracer.
 ///
-/// Most ptrace operations require the tracee to be in a ptrace-stop.
+/// Most ptrace operations require the tracee to be in a ptrace-stop,
+/// and switched out: its CPU may still be on its way out of it, with
+/// its TLS and GS base not yet saved (Linux wait_task_inactive)
 fn ptrace_check_attach(target_tid: Tid) -> Result<(), i64> {
-    let table = TASKLIST.read();
-    let target = table.get(target_tid).ok_or(-ESRCH)?;
+    let task = {
+        let table = TASKLIST.read();
+        let target = table.get(target_tid).ok_or(-ESRCH)?;
 
-    // Check if we are the tracer
-    if !target.traced_by(&percpu::current()) {
+        // Check if we are the tracer
+        if !target.traced_by(&percpu::current()) {
+            return Err(-ESRCH);
+        }
+
+        // Check if target is in ptrace stop
+        if !matches!(target.state, TaskState::Traced(_)) {
+            return Err(-ESRCH);
+        }
+        table.task(target_tid).ok_or(-ESRCH)?
+    };
+    if !percpu::wait_task_inactive(&task) {
         return Err(-ESRCH);
     }
-
-    // Check if target is in ptrace stop
-    if !matches!(target.state, TaskState::Traced(_)) {
-        return Err(-ESRCH);
-    }
-
     Ok(())
 }
 
