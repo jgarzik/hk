@@ -72,8 +72,14 @@ const EINVAL: i64 = -22;
 const EPERM: i64 = -1;
 
 /// Serializes the commands that interrupt other CPUs (Linux
-/// membarrier_ipi_mutex): concurrent callers cannot multiply the IPIs
+/// membarrier_ipi_mutex): concurrent callers cannot multiply the IPIs.
+/// Held only while the IPIs are sent and waited for.
 static IPI_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Paces MEMBARRIER_CMD_GLOBAL: one call per tick system-wide, held
+/// across its sleep, so its callers queue here and never delay the
+/// expedited commands
+static GLOBAL_MUTEX: Mutex<()> = Mutex::new(());
 
 /// membarrier(cmd, flags, cpu_id) (Linux kernel/sched/membarrier.c)
 ///
@@ -82,8 +88,8 @@ static IPI_MUTEX: Mutex<()> = Mutex::new(());
 /// caller's address space, GLOBAL_EXPEDITED those running a registered
 /// one. MEMBARRIER_CMD_GLOBAL is Linux's synchronize_rcu; hk has no
 /// RCU, so it interrupts every CPU running a user address space and
-/// then sleeps a tick under the mutex, which keeps it as slow as a
-/// grace period and bounds the IPIs any caller can cause.
+/// then sleeps a tick under its own pacing mutex, which keeps it as slow
+/// as a grace period and bounds the IPIs any caller can cause.
 pub fn sys_membarrier(cmd: i32, flags: u32, _cpu_id: i32) -> i64 {
     let flags_ok = match cmd {
         MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ => flags == 0 || flags == MEMBARRIER_CMD_FLAG_CPU,
@@ -160,10 +166,16 @@ fn barrier_cpus(f: fn(usize), pick: impl Fn(&PerCpuScheduler) -> bool) {
     fence(Ordering::SeqCst);
 }
 
-/// MEMBARRIER_CMD_GLOBAL (see `sys_membarrier`)
+/// MEMBARRIER_CMD_GLOBAL (see `sys_membarrier`); EINTR if killed while
+/// waiting its turn
 fn global() -> i64 {
-    let _g = IPI_MUTEX.lock();
-    barrier_cpus(ipi_mb, |s| s.curr_mm.load(Ordering::Relaxed) != 0);
+    let Ok(_pace) = GLOBAL_MUTEX.lock_killable() else {
+        return -4;
+    };
+    {
+        let _g = IPI_MUTEX.lock();
+        barrier_cpus(ipi_mb, |s| s.curr_mm.load(Ordering::Relaxed) != 0);
+    }
     crate::task::percpu::sleep_current_until(crate::task::percpu::get_ticks() + 1);
     0
 }
