@@ -1595,11 +1595,12 @@ pub fn wait_traced(tracer_pid: Pid, target_pid: i64, wnowait: bool) -> Option<(T
     };
     let tid = TASKLIST.read().find(found)?.task.tid();
     let mut table = TASKLIST.write();
-    let mut t = table.get_mut(tid)?;
-    // It may have been resumed or reported meanwhile
-    if !matches!(t.state, TaskState::Traced(_)) || t.ptrace_code == 0 {
+    // Everything may have changed meanwhile (resumed, reported,
+    // detached, the tid reused): the whole check again
+    if !table.get(tid).is_some_and(|t| found(&t)) {
         return None;
     }
+    let mut t = table.get_mut(tid)?;
     let code = t.ptrace_code;
     if !wnowait {
         t.ptrace_code = 0;
@@ -1612,7 +1613,7 @@ fn wait_match(t: &TaskView<'_>, target_pid: i64, pgid: Pid) -> bool {
     match target_pid {
         -1 => true,
         0 => t.task.pgid() == pgid,
-        p if p < -1 => t.task.pgid() == (-p) as u64,
+        p if p < -1 => t.task.pgid() == p.unsigned_abs(),
         p => t.task.tid() == p as u64,
     }
 }
