@@ -184,6 +184,11 @@ pub struct CpuRunQueue {
     /// away from it (Linux finish_task_switch for TASK_DEAD); one at a
     /// time: the next task takes it before anything else runs
     dead: Option<DeadTask>,
+    /// The task this CPU is switching away from (Linux switch_to's
+    /// `last`): the task switched to clears its `on_cpu` once off its
+    /// stack (`finish_task_switch`). Kept alive by the scheduler's
+    /// reference, or by `dead`.
+    prev: *const KernelTask,
 }
 
 // SAFETY: the task pointers are owned references (see above), used
@@ -248,6 +253,7 @@ impl CpuRunQueue {
             curr: core::ptr::null(),
             idle: core::ptr::null(),
             dead: None,
+            prev: core::ptr::null(),
         }
     }
 
@@ -2422,11 +2428,12 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // SAFETY: a task of this run queue, alive while it holds it
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(unsafe { &*next });
     rq.curr = next;
+    rq.prev = &*me;
     sched.nr_switches.fetch_add(1, Ordering::Relaxed);
 
     // The rq lock stays held across the switch, as for any switch: the
-    // next task releases it (its own guard, or finish_context_switch),
-    // and only then frees our stack (`rq.dead`)
+    // next task releases it (finish_task_switch), and only then frees our
+    // stack (`rq.dead`)
     check_switch_atomic();
     core::mem::forget(rq);
 
@@ -2457,6 +2464,8 @@ fn make_current(t: &KernelTask) -> (u64, *const crate::mm::Mm, (u64, u64)) {
         .as_ref()
         .map_or(core::ptr::null(), |m| Arc::as_ptr(m.arc()));
     CurrentArch::set_current_task_ptr(t as *const KernelTask as usize);
+    // Linux prepare_task
+    t.se.set_on_cpu(true);
     let tls = (
         t.tls.load(Ordering::Relaxed),
         t.gsbase.load(Ordering::Relaxed),
@@ -2477,9 +2486,9 @@ unsafe fn switch_mm(mm: *const crate::mm::Mm) {
 /// context_switch)
 ///
 /// The lock stays held across the switch and is released by whichever task
-/// runs next (its own guard drop, or `finish_context_switch` for a new
-/// task). `prev`'s user registers stay in its pt_regs, on its own kernel
-/// stack.
+/// runs next (`finish_task_switch`, from here or from
+/// `finish_context_switch` for a new task). `prev`'s user registers stay
+/// in its pt_regs, on its own kernel stack.
 fn context_switch_locked(
     sched: &PerCpuScheduler,
     mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>,
@@ -2500,6 +2509,7 @@ fn context_switch_locked(
     let n = unsafe { &*next };
     let (next_kstack, next_mm, (next_tls, next_gs)) = make_current(n);
     rq.curr = next;
+    rq.prev = prev;
     sched.nr_switches.fetch_add(1, Ordering::Relaxed);
 
     // SAFETY: both frames are under the rq lock we hold
@@ -2507,7 +2517,24 @@ fn context_switch_locked(
         switch_mm(next_mm);
         CurrentArch::context_switch(prev.se.ctx(), n.se.ctx(), next_kstack, next_tls, next_gs);
     }
-    // Back on `prev` (the rq lock is held again; `rq` releases it)
+    // Back on `prev`, holding the rq lock of the CPU it runs on now
+    // (taken by the task that switched to it there), which need not be
+    // the one `rq` locked
+    let this = current_percpu_sched().expect("No scheduler");
+    // SAFETY: the switch handed this CPU's rq lock to us
+    finish_task_switch(unsafe { rq.rebind(&this.lock) });
+}
+
+/// Complete a switch on the task switched to, with this CPU's rq lock
+/// (Linux finish_task_switch): the task switched away from is off its
+/// stack now, so its `on_cpu` clears; release the lock, then free what
+/// a task that exited here left
+fn finish_task_switch(mut rq: crate::arch::IrqSpinlockGuard<'_, CpuRunQueue>) {
+    // SAFETY: kept alive by the scheduler's reference or by `rq.dead`
+    if let Some(prev) = unsafe { rq.prev.as_ref() } {
+        prev.se.set_on_cpu(false);
+    }
+    rq.prev = core::ptr::null();
     let dead = rq.dead.take();
     drop(rq);
     drop(dead);
@@ -2838,25 +2865,15 @@ pub fn sleep_current_ms(ms: u64) {
     sleep_current_until(get_ticks().saturating_add(ms_to_ticks(ms)));
 }
 
-/// Called after context switch to release the scheduler lock
-///
-/// When context_switch is called, the IrqSpinlock guard is on the old task's
-/// stack. After switching to the new task, we need to release the lock so
-/// other code can acquire it.
+/// First run of a task (the arch's new-task trampoline): complete the
+/// switch to it (Linux schedule_tail -> finish_task_switch). Interrupts
+/// stay disabled; the trampoline enables them.
 pub fn finish_context_switch() {
-    let sched = match current_percpu_sched() {
-        Some(s) => s,
-        None => return,
+    let Some(sched) = current_percpu_sched() else {
+        return;
     };
-
-    // Force unlock the scheduler lock - safe because we just switched to this
-    // task and the old task won't run until we switch back to it
-    unsafe {
-        sched.lock.force_unlock();
-    }
-    // Free what a task that exited here left (we are off its stack)
-    let dead = sched.lock.lock().dead.take();
-    drop(dead);
+    // SAFETY: the switch handed this CPU's rq lock to the new task
+    finish_task_switch(unsafe { sched.lock.assume_held() });
 }
 
 /// Write the child TID for CLONE_CHILD_SETTID (from the fork child's

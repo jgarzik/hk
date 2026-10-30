@@ -29,6 +29,10 @@ pub struct SchedEntity {
     state: AtomicU8,
     /// Queued or running on its CPU's run queue
     on_rq: AtomicBool,
+    /// Its CPU runs it or is still switching away from it (Linux
+    /// p->on_cpu): set when it is made current, cleared by the task
+    /// switched to once the switch is complete (finish_task_switch)
+    on_cpu: AtomicBool,
     /// Priority (Linux p->prio): written under TASKLIST, read lock-free;
     /// a queued task moves at its next enqueue
     prio: AtomicU8,
@@ -57,6 +61,7 @@ impl SchedEntity {
         Self {
             state: AtomicU8::new(state),
             on_rq: AtomicBool::new(false),
+            on_cpu: AtomicBool::new(false),
             prio: AtomicU8::new(prio),
             link: Link::new(),
             // SAFETY: a switch frame is plain integers; zero is valid
@@ -90,6 +95,19 @@ impl SchedEntity {
     #[inline]
     pub fn set_on_rq(&self, v: bool) {
         self.on_rq.store(v, Ordering::SeqCst);
+    }
+
+    /// Running, or not yet switched away from (Acquire: what the task
+    /// did on its CPU is visible once this reads false)
+    #[inline]
+    pub fn on_cpu(&self) -> bool {
+        self.on_cpu.load(Ordering::Acquire)
+    }
+
+    /// Under the rq lock of its CPU (Release: see `on_cpu`)
+    #[inline]
+    pub fn set_on_cpu(&self, v: bool) {
+        self.on_cpu.store(v, Ordering::Release);
     }
 
     pub fn prio(&self) -> Priority {

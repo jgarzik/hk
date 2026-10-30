@@ -494,8 +494,15 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    the tick with no rq lock held.
 
 3. **Context switch happens with lock held** - The lock is released by the
-   task switched to (its guard drop, or `finish_context_switch` for a new
-   task).
+   task switched to, in `finish_task_switch` (Linux), always on the run
+   queue of the CPU it runs on now: a resumed task rebinds its guard to
+   that CPU's rq lock (`IrqSpinlockGuard::rebind`, keeping its own saved
+   interrupt state), a new task takes it over (`assume_held`, from the
+   arch trampoline via `finish_context_switch`). Before the switch the
+   CPU records the outgoing task in `rq.prev` and sets the incoming
+   task's `se.on_cpu`; `finish_task_switch` clears `prev.se.on_cpu`
+   (Release) once off its stack (Linux p->on_cpu: a task is not run
+   anywhere else while it is set).
 
 4. **`context_switch_first()`** - An exiting task (`exit_current`) keeps
    the lock held across its final switch like any other switch (the guard
@@ -503,7 +510,7 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    between leaving the dead task and the next task taking over. The
    boot-time first switch (`try_schedule`) does the same, so the per-CPU
    preempt count stays balanced (dropping the guard there and releasing
-   again in `finish_context_switch` left it at -1).
+   again in `finish_task_switch` left it at -1).
 
 5. **Timer ISR only touches local CPU** - the tick drains the local
    `wake_list` and runs the local CPU's timers only.
@@ -547,9 +554,9 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    `DeadTask` (stack, mm_count reference, the run queue's task
    reference) in its rq's `dead` slot (one: the next task takes it
    before anything else can exit here), under
-   the rq lock held across the switch. The task switched to takes the list
-   under the rq lock and frees it after releasing the lock (in
-   `context_switch_locked`, or `finish_context_switch` for a new task):
+   the rq lock held across the switch. The task switched to takes it
+   under the rq lock and frees it after releasing the lock
+   (`finish_task_switch`):
    frame frees and the last `Arc<Mm>` drop (top-level table, heap) never
    happen under the rq lock.
 
