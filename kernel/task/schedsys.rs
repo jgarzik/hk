@@ -107,6 +107,35 @@ pub fn sys_getpriority(which: i32, who: u64, caller_pid: Pid) -> i64 {
     }
 }
 
+/// Set task `tid`'s nice value (Linux set_one_prio): EPERM unless the
+/// caller's euid is its uid or euid or the caller has CAP_SYS_NICE;
+/// EACCES for a lower nice beyond RLIMIT_NICE without CAP_SYS_NICE.
+/// `error` is the result so far: a success turns ESRCH into 0.
+fn set_one_prio(tid: Pid, niceval: i32, caller_euid: super::Uid, error: i64) -> i64 {
+    use super::{CAP_SYS_NICE, capable, nice_to_priority, priority_to_nice};
+    let Some(prio) = super::percpu::lookup_task_priority(tid) else {
+        return error;
+    };
+    let target = super::percpu::TASKLIST.read().get(tid).map(|t| t.cred());
+    let Some(c) = target else {
+        return error;
+    };
+    if c.uid != caller_euid && c.euid != caller_euid && !capable(CAP_SYS_NICE) {
+        return KernelError::NotPermitted.sysret();
+    }
+    // Linux can_nice: 20 - nice within RLIMIT_NICE
+    let rlim = crate::rlimit::rlimit(crate::rlimit::RLIMIT_NICE);
+    let lower = niceval < priority_to_nice(prio);
+    if lower && (20 - niceval) as u64 > rlim && !capable(CAP_SYS_NICE) {
+        return KernelError::PermissionDenied.sysret();
+    }
+    match super::percpu::set_task_priority(tid, nice_to_priority(niceval)) {
+        Ok(()) if error == KernelError::NoProcess.sysret() => 0,
+        Ok(()) => error,
+        Err(errno) => -(errno as i64),
+    }
+}
+
 /// sys_setpriority - set program scheduling priority
 ///
 /// # Arguments
@@ -133,9 +162,7 @@ pub fn sys_setpriority(
     caller_pid: Pid,
     caller_euid: super::Uid,
 ) -> i64 {
-    use super::{
-        PRIO_MAX, PRIO_MIN, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, nice_to_priority, priority_to_nice,
-    };
+    use super::{PRIO_MAX, PRIO_MIN, PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
 
     // Clamp nice value to valid range (Linux does this)
     let niceval = niceval.clamp(PRIO_MIN, PRIO_MAX);
@@ -143,28 +170,16 @@ pub fn sys_setpriority(
     match which {
         PRIO_PROCESS => {
             let target_pid = if who == 0 { caller_pid } else { who };
-
-            // Get current priority to check permissions
-            let current_nice = match super::percpu::lookup_task_priority(target_pid) {
-                Some(priority) => priority_to_nice(priority),
-                None => return KernelError::NoProcess.sysret(),
-            };
-
-            // Permission check: non-root cannot raise priority (lower nice value)
-            if caller_euid != 0 && niceval < current_nice {
-                return KernelError::PermissionDenied.sysret();
-            }
-
-            // Set the new priority
-            let new_priority = nice_to_priority(niceval);
-            match super::percpu::set_task_priority(target_pid, new_priority) {
-                Ok(()) => 0,
-                Err(errno) => -(errno as i64),
-            }
+            set_one_prio(
+                target_pid,
+                niceval,
+                caller_euid,
+                KernelError::NoProcess.sysret(),
+            )
         }
         PRIO_PGRP => {
-            // Every thread of the group (Linux set_one_prio each); the
-            // last error, ESRCH if none
+            // Every thread of the group (Linux set_one_prio each): the
+            // first success clears ESRCH, an error stays
             let pgid = if who == 0 {
                 super::percpu::current_pgid()
             } else {
@@ -172,17 +187,7 @@ pub fn sys_setpriority(
             };
             let mut ret = KernelError::NoProcess.sysret();
             for tid in super::percpu::get_tids_by_pgid(pgid) {
-                let Some(prio) = super::percpu::lookup_task_priority(tid) else {
-                    continue;
-                };
-                ret = if caller_euid != 0 && niceval < priority_to_nice(prio) {
-                    KernelError::PermissionDenied.sysret()
-                } else {
-                    match super::percpu::set_task_priority(tid, nice_to_priority(niceval)) {
-                        Ok(()) => 0,
-                        Err(errno) => -(errno as i64),
-                    }
-                };
+                ret = set_one_prio(tid, niceval, caller_euid, ret);
             }
             ret
         }

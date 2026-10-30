@@ -59,6 +59,7 @@ pub fn run_tests() {
     test_getpriority();
     test_setpriority();
     test_getpriority_esrch();
+    test_setpriority_perm();
     test_setuid();
     test_setgid();
     test_getresuid();
@@ -841,6 +842,38 @@ fn test_setpriority() {
         print(b"Expected 15, got ");
         print_num(new_prio);
         println(b"SETPRIORITY:FAIL");
+    }
+}
+
+/// SETPRIORITY_PERM: an unprivileged caller (uid 1000) may not renice
+/// another user's process (EPERM), may raise its own nice value, and may
+/// not lower it beyond RLIMIT_NICE (0 by default: EACCES), as in Linux
+/// set_one_prio
+fn test_setpriority_perm() {
+    let pid = sys_fork();
+    if pid == 0 {
+        sys_setresgid(1000, 1000, 1000);
+        sys_setresuid(1000, 1000, 1000);
+        let mut bad = 0;
+        if sys_setpriority(PRIO_PROCESS, sys_getppid() as u64, 10) != -1 {
+            bad |= 1;
+        }
+        if sys_setpriority(PRIO_PROCESS, 0, 19) != 0 {
+            bad |= 2;
+        }
+        if sys_setpriority(PRIO_PROCESS, 0, 18) != -13 {
+            bad |= 4;
+        }
+        sys_exit(bad);
+    }
+    let mut st = 0i32;
+    sys_wait4(pid, &mut st, 0, 0);
+    if st == 0 {
+        println(b"SETPRIORITY_PERM:OK");
+    } else {
+        print(b"SETPRIORITY_PERM:FAIL status ");
+        print_num(st as i64);
+        println(b"");
     }
 }
 
