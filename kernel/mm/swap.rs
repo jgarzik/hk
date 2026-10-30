@@ -217,6 +217,11 @@ impl SwapInfo {
     }
 
     /// Swap PTEs referencing slot `off`
+    /// SWAP_HAS_CACHE is set on slot `off`
+    pub fn has_cache(&self, off: u64) -> bool {
+        off < self.max && self.map.lock().count[off as usize] & SWAP_HAS_CACHE != 0
+    }
+
     pub fn count(&self, off: u64) -> u16 {
         if off >= self.max {
             return 0;
@@ -307,6 +312,20 @@ pub fn swapcache_clear(e: SwapEntry) {
     if let Some(si) = info_of(e) {
         si.update(e.offset(), |c| Some(c & !SWAP_HAS_CACHE));
     }
+    // A reader waiting for the claim to settle looks again
+    swap_wait(e).wake_all();
+}
+
+/// Another task claimed `e` for the swap cache (SWAP_HAS_CACHE) and
+/// has not put its page there yet: `read_swap_page` waits on this
+pub fn swap_wait(e: SwapEntry) -> &'static crate::waitqueue::WaitQueue {
+    // Hashed like the page wait table (Linux folio_waitqueue)
+    crate::waitqueue::page_wait_queue(e.raw() << 12)
+}
+
+/// SWAP_HAS_CACHE is set on `e`
+pub fn swapcache_busy(e: SwapEntry) -> bool {
+    info_of(e).is_some_and(|si| si.has_cache(e.offset()))
 }
 
 /// Swap PTEs referencing `e` (Linux swp_swapcount)

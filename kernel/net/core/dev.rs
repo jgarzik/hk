@@ -384,8 +384,9 @@ fn softnet_thread(cpu: usize) {
             sd.time_squeeze.fetch_add(1, Ordering::Relaxed);
         }
         if sd.has_work() {
-            // Cooperative scheduler: let other tasks on this CPU run
-            crate::task::percpu::yield_now();
+            // Work left after the budget: a scheduling point (Linux
+            // net_rx_action defers to ksoftirqd, which cond_rescheds)
+            crate::task::percpu::cond_resched();
         }
     }
 }

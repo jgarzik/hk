@@ -2743,6 +2743,14 @@ pub fn yield_now() {
     yield_cpu();
 }
 
+/// A scheduling point in a long kernel loop (Linux cond_resched): yield
+/// only if this task's slice is used up (TIF_NEED_RESCHED)
+pub fn cond_resched() {
+    if current().has_tif(crate::task::tif::NEED_RESCHED) {
+        yield_cpu();
+    }
+}
+
 /// Give up the CPU on the way back to user mode, the slice used up
 /// (TIF_NEED_RESCHED; Linux schedule() in exit_to_user_mode_loop): like
 /// `yield_now`, an involuntary switch if another task runs

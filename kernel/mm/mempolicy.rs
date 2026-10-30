@@ -560,13 +560,13 @@ pub fn sys_move_pages(
 /// in chunks with cond_resched)
 const MOVE_PAGES_CHUNK: u64 = 1024;
 
-/// Every `MOVE_PAGES_CHUNK` entries: let other tasks run (the scheduler is
-/// cooperative, so a huge user-supplied count would otherwise monopolize
-/// the CPU) and stop for a pending signal (restartable: the work done so
-/// far is idempotent)
+/// Every `MOVE_PAGES_CHUNK` entries: a scheduling point (the kernel is
+/// not preemptive, so a huge user-supplied count would otherwise
+/// monopolize the CPU) and a stop for a pending signal (restartable: the
+/// work done so far is idempotent)
 fn move_pages_resched(i: u64) -> Result<(), i64> {
     if i > 0 && i.is_multiple_of(MOVE_PAGES_CHUNK) {
-        crate::task::percpu::yield_now();
+        crate::task::percpu::cond_resched();
         if crate::waitqueue::signal_pending() {
             return Err(KernelError::RestartSys.sysret());
         }
