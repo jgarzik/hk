@@ -116,6 +116,9 @@ struct TimerfdInner {
     interval_ns: u64,
     /// Number of expirations since last read
     ticks: u64,
+    /// A periodic timer expired and waits to be re-armed by a read or
+    /// gettime (Linux ctx->expired)
+    expired: bool,
     /// settime flags (TFD_TIMER_ABSTIME, etc.)
     settime_flags: i32,
     /// TFD_TIMER_CANCEL_ON_SET armed (on the cancel list)
@@ -133,6 +136,7 @@ impl TimerfdInner {
             clock: HrClock::Monotonic,
             interval_ns: 0,
             ticks: 0,
+            expired: false,
             settime_flags: 0,
             might_cancel: false,
             moffs: Some(0),
@@ -191,6 +195,7 @@ impl Timerfd {
 
         // Reset ticks
         inner.ticks = 0;
+        inner.expired = false;
         inner.settime_flags = flags;
         inner.moffs = Some(crate::time::real_offset());
 
@@ -227,7 +232,9 @@ impl Timerfd {
 
     /// Get current timer value
     pub fn gettime(&self) -> ITimerSpec {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        let more = self.restart(&mut inner);
+        inner.ticks = inner.ticks.saturating_add(more);
         self.get_current_value_locked(&inner)
     }
 
@@ -258,10 +265,12 @@ impl Timerfd {
             if inner.might_cancel && inner.moffs.is_none() {
                 inner.moffs = Some(crate::time::real_offset());
                 inner.ticks = 0;
+                inner.expired = false;
                 return Err(KernelError::Canceled);
             }
             if inner.ticks > 0 {
-                return Ok(core::mem::take(&mut inner.ticks));
+                let n = core::mem::take(&mut inner.ticks);
+                return Ok(n.saturating_add(self.restart(&mut inner)));
             }
             if nonblock {
                 return Err(KernelError::WouldBlock);
@@ -284,35 +293,46 @@ impl Timerfd {
         }
     }
 
-    /// Called when timer expires (from timer callback): a periodic
-    /// timer counts every period that passed and re-arms for the next
-    /// (Linux hrtimer_forward_now)
+    /// Called when timer expires (from timer callback): one more tick; a
+    /// periodic timer is re-armed by the next read or gettime (Linux
+    /// timerfd_tmrproc)
     fn on_expire(&self) {
         {
             let mut inner = self.inner.lock();
             if inner.expires_ns == 0 {
                 return;
             }
+            inner.ticks = inner.ticks.saturating_add(1);
             if inner.interval_ns == 0 {
-                inner.ticks = inner.ticks.saturating_add(1);
                 inner.expires_ns = 0;
             } else {
-                let now = inner.clock.now();
-                let (missed, next) =
-                    crate::timer::forward(inner.expires_ns, inner.interval_ns, now);
-                inner.ticks = inner.ticks.saturating_add(missed);
-                match next {
-                    Some(n) => {
-                        inner.expires_ns = n;
-                        self.timer().start(n, inner.clock);
-                    }
-                    None => inner.expires_ns = 0,
-                }
+                inner.expired = true;
             }
         }
 
         // Wake any waiting readers
         self.wait_queue.wake_all();
+    }
+
+    /// Re-arm an expired periodic timer for the first period end after
+    /// now; returns the periods missed beyond the one counted at expiry
+    /// (Linux timerfd_hrtimer_restart). Re-arming here rather than in
+    /// the callback bounds a tiny period to one expiry per read.
+    fn restart(&self, inner: &mut TimerfdInner) -> u64 {
+        if !inner.expired || inner.interval_ns == 0 {
+            return 0;
+        }
+        inner.expired = false;
+        let now = inner.clock.now();
+        let (missed, next) = crate::timer::forward(inner.expires_ns, inner.interval_ns, now);
+        match next {
+            Some(n) => {
+                inner.expires_ns = n;
+                self.timer().start(n, inner.clock);
+            }
+            None => inner.expires_ns = 0,
+        }
+        missed - 1
     }
 
     /// Release the timerfd (cancel the timer, waiting out its callback)

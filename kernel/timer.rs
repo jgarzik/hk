@@ -386,6 +386,9 @@ fn ktimers(cpu: usize) {
         crate::hrtimer::run_soft(cpu);
         // `del_timer_sync` / `cancel_sync` waiters look again
         soft.wq.wake_all();
+        // A scheduling point between passes: callbacks due again at
+        // once cannot keep this CPU's tasks off it
+        crate::task::percpu::cond_resched();
     }
 }
 

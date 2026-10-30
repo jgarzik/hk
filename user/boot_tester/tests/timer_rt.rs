@@ -9,6 +9,9 @@
 //!   expirations (within one)
 //! - POSIX_TIMER_ABSTIME_RT: an absolute CLOCK_REALTIME POSIX timer
 //!   reports its remaining time and expires at its wall-clock time
+//! - TIMER_TINY_PERIOD: 1 ns periodic timerfd and POSIX timers do not
+//!   starve the CPU (a 20 ms sleep still returns promptly), and the
+//!   timerfd counts every period
 //!
 //! Bounds are loose (TCG).
 
@@ -29,6 +32,7 @@ pub fn run_tests() {
     test_timerfd_cancel_on_set();
     test_timerfd_periodic_count();
     test_posix_timer_abstime_rt();
+    test_timer_tiny_period();
 }
 
 fn clock_ns(clock: i32) -> i64 {
@@ -134,5 +138,30 @@ fn test_posix_timer_abstime_rt() {
     let left = cur.it_value.tv_sec * 1_000_000_000 + cur.it_value.tv_nsec;
     t.eq(b"expired", left, 0);
     sys_timer_delete(id);
+    t.done();
+}
+
+fn test_timer_tiny_period() {
+    let mut t = T::new(b"TIMER_TINY_PERIOD");
+    let fd = sys_timerfd_create(CLOCK_MONOTONIC, 0);
+    let s = spec(1, 1);
+    t.eq(b"timerfd settime", sys_timerfd_settime(fd as i32, 0, &s, core::ptr::null_mut()), 0);
+    let sev = SigEvent {
+        sigev_notify: sigev_notify::SIGEV_NONE,
+        ..SigEvent::default()
+    };
+    let mut id = -1i32;
+    t.eq(b"timer_create", sys_timer_create(CLOCK_MONOTONIC, &sev, &mut id), 0);
+    t.eq(b"timer settime", sys_timer_settime(id, 0, &s, core::ptr::null_mut()), 0);
+    // Every CPU's tasks still run: a short sleep is not held up
+    let start = clock_ns(CLOCK_MONOTONIC);
+    sleep_ns(20_000_000);
+    let el = clock_ns(CLOCK_MONOTONIC) - start;
+    t.ok(b"sleep", el < 1_000_000_000, el);
+    // About one expiry per ns since it was armed
+    let n = tfd_read(fd);
+    t.ok(b"count", n >= 10_000_000, n);
+    sys_timer_delete(id);
+    sys_close(fd as u64);
     t.done();
 }

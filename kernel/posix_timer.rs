@@ -33,6 +33,7 @@ use crate::arch::IrqSpinlock;
 use crate::hrtimer::{HrClock, HrTimer};
 use crate::signal::{SIGALRM, send_signal};
 use crate::task::Tid;
+use crate::task::percpu::TICK_NS;
 use crate::time_syscall::CLOCK_REALTIME;
 use crate::timerfd::ITimerSpec;
 
@@ -269,6 +270,14 @@ impl PosixTimer {
             } else {
                 let now = inner.clock.now();
                 let (_, next) = crate::timer::forward(inner.expires_ns, inner.interval_ns, now);
+                // A period under a tick re-arms a tick away at the
+                // soonest: a tiny one would otherwise keep ktimers/N busy
+                // (Linux re-arms when the signal is dequeued instead)
+                let floor = now.saturating_add(TICK_NS);
+                let next = next.map(|n| match inner.interval_ns < TICK_NS {
+                    true => n.max(floor),
+                    false => n,
+                });
                 match next {
                     Some(n) => {
                         inner.expires_ns = n;
