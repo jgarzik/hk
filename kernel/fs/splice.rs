@@ -90,7 +90,7 @@ pub fn splice_to_pipe(
     offset: u32,
     len: u32,
 ) -> Result<usize, KernelError> {
-    let mut inner = pipe.inner.lock();
+    let mut inner = pipe.lock();
 
     if inner.is_full() {
         return Err(KernelError::WouldBlock);
@@ -121,7 +121,7 @@ pub fn splice_to_pipe(
 /// # Returns
 /// The pipe buffer containing page reference, or None if pipe is empty
 pub fn splice_from_pipe(pipe: &Pipe) -> Option<(Arc<CachedPage>, u32, u32)> {
-    let mut inner = pipe.inner.lock();
+    let mut inner = pipe.lock();
 
     if inner.is_empty() {
         return None;
@@ -178,12 +178,12 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
 
     // Lock in address order
     let (src_guard, mut dst_guard) = if src_addr < dst_addr {
-        let s = src.inner.lock();
-        let d = dst.inner.lock();
+        let s = src.lock();
+        let d = dst.lock();
         (s, d)
     } else {
-        let d = dst.inner.lock();
-        let s = src.inner.lock();
+        let d = dst.lock();
+        let s = src.lock();
         (s, d)
     };
 
@@ -237,18 +237,6 @@ pub fn link_pipe(src: &Pipe, dst: &Pipe, len: usize, _flags: u32) -> Result<usiz
     dst.wait_queue.wake_all();
 
     Ok(copied)
-}
-
-// =============================================================================
-// Access to pipe internals (needed by splice module)
-// =============================================================================
-
-impl Pipe {
-    /// Get a reference to the inner pipe data
-    #[allow(dead_code)]
-    pub fn inner(&self) -> &crate::sync::spin::Mutex<crate::pipe::PipeInner> {
-        &self.inner
-    }
 }
 
 // =============================================================================
@@ -423,10 +411,10 @@ fn do_splice_pipe_to_pipe(src: &Pipe, dst: &Pipe, len: usize, flags: u32) -> i64
 
     // Lock in address order to prevent deadlock
     let (mut src_guard, mut dst_guard) = if src_addr < dst_addr {
-        (src.inner.lock(), dst.inner.lock())
+        (src.lock(), dst.lock())
     } else {
-        let d = dst.inner.lock();
-        let s = src.inner.lock();
+        let d = dst.lock();
+        let s = src.lock();
         (s, d)
     };
 
@@ -508,7 +496,7 @@ fn do_splice_file_to_pipe(
 
     // Check pipe has space
     {
-        let inner = pipe.inner.lock();
+        let inner = pipe.lock();
         if inner.is_full() {
             return if nonblock {
                 KernelError::WouldBlock.sysret()
@@ -580,7 +568,7 @@ fn do_splice_file_to_pipe(
         pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE,
     );
 
-    let mut inner = pipe.inner.lock();
+    let mut inner = pipe.lock();
     if inner.push_buffer(pipe_buf).is_err() {
         return if nonblock {
             KernelError::WouldBlock.sysret()
@@ -607,7 +595,7 @@ fn do_splice_pipe_to_file(
 
     // Check if pipe has data
     {
-        let inner = pipe.inner.lock();
+        let inner = pipe.lock();
         if inner.is_empty() {
             if !pipe.has_writers() {
                 return 0; // EOF
@@ -807,7 +795,7 @@ pub fn sys_vmsplice(fd: i32, iov: u64, nr_segs: usize, flags: u32) -> i64 {
             pipe_buf_flags::OWNED | pipe_buf_flags::CAN_MERGE,
         );
 
-        let mut inner = pipe.inner.lock();
+        let mut inner = pipe.lock();
         if inner.is_full() {
             drop(inner);
             if nonblock {

@@ -4,13 +4,20 @@
 //! again if it lost the race, so each unlock wakes one sleeper and no
 //! wakeup is lost. The owner's tid is recorded (Linux mutex owner) to
 //! catch recursive locking and foreign unlocks in debug builds.
+//!
+//! `lock_interruptible` and `lock_killable` (Linux
+//! mutex_lock_interruptible/_killable) give up with EINTR when a signal
+//! (any, or SIGKILL) is pending while they would sleep; a waiter that
+//! gives up has seen the mutex held, so its holder's unlock wakes the
+//! next waiter. `try_lock` (Linux mutex_trylock) never sleeps.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{can_sleep, might_sleep};
-use crate::task::percpu::current_tid;
+use crate::error::KernelError;
+use crate::task::percpu::{SleepState, current_tid};
 use crate::waitqueue::WaitQueue;
 
 /// Owner value of an unlocked mutex
@@ -57,6 +64,14 @@ impl<T> Mutex<T> {
     /// Acquire without a guard (pair with `unlock_raw`)
     #[track_caller]
     pub fn lock_raw(&self) {
+        let r = self.lock_wait(SleepState::Uninterruptible);
+        debug_assert!(r.is_ok());
+    }
+
+    /// Acquire, sleeping in `state` while contended (Linux
+    /// __mutex_lock_common): EINTR if that sleep ends on a signal
+    #[track_caller]
+    fn lock_wait(&self, state: SleepState) -> Result<(), KernelError> {
         might_sleep();
         let me = me();
         debug_assert!(
@@ -64,13 +79,21 @@ impl<T> Mutex<T> {
             "recursive mutex lock"
         );
         while !self.try_raw(me) {
-            if can_sleep() {
-                self.wq
-                    .wait_event_exclusive(|| self.owner.load(Ordering::Acquire) == UNLOCKED);
-            } else {
+            if !can_sleep() {
                 core::hint::spin_loop();
+                continue;
+            }
+            let free = || self.owner.load(Ordering::Acquire) == UNLOCKED;
+            match state {
+                SleepState::Interruptible => self
+                    .wq
+                    .wait_event_interruptible_exclusive(free)
+                    .map_err(|_| KernelError::Interrupted)?,
+                SleepState::Killable => self.wq.wait_event_killable_exclusive(free)?,
+                _ => self.wq.wait_event_exclusive(free),
             }
         }
+        Ok(())
     }
 
     /// Release a `lock_raw` acquisition
@@ -91,6 +114,27 @@ impl<T> Mutex<T> {
     pub fn lock(&self) -> MutexGuard<'_, T> {
         self.lock_raw();
         MutexGuard { m: self }
+    }
+
+    /// Acquire, or give up with EINTR if a signal is pending while
+    /// contended (Linux mutex_lock_interruptible)
+    #[track_caller]
+    pub fn lock_interruptible(&self) -> Result<MutexGuard<'_, T>, KernelError> {
+        self.lock_wait(SleepState::Interruptible)?;
+        Ok(MutexGuard { m: self })
+    }
+
+    /// Acquire, or give up with EINTR if SIGKILL is pending while
+    /// contended (Linux mutex_lock_killable)
+    #[track_caller]
+    pub fn lock_killable(&self) -> Result<MutexGuard<'_, T>, KernelError> {
+        self.lock_wait(SleepState::Killable)?;
+        Ok(MutexGuard { m: self })
+    }
+
+    /// Acquire if free, without sleeping (Linux mutex_trylock)
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+        self.try_raw(me()).then_some(MutexGuard { m: self })
     }
 }
 

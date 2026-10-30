@@ -141,6 +141,9 @@ user page faults, blocking pipe/socket I/O).
 
 - `Mutex<T>`: owner tid recorded (debug builds catch recursive locking
   and foreign unlocks); `unlock` wakes one waiter, which retries.
+  `lock_interruptible`/`lock_killable` (Linux mutex_lock_interruptible/
+  _killable) give up with EINTR on a signal (any, or SIGKILL) pending
+  while they wait; `try_lock` (mutex_trylock) never sleeps.
 - `RwSem<T>` (typed; `RwSem<()>` guards what its owner says):
   `read`/`write` guards, `read_killable`/`write_killable` (Linux
   down_*_killable: a `Killable` sleep, woken by wakeups and SIGKILL
@@ -159,7 +162,8 @@ user page faults, blocking pipe/socket I/O).
 the mmap_lock (`Mm.map`), `AnonVma.chain`; `Mutex`:
 `SuperBlock.s_vfs_rename_mutex`, `File.f_pos_lock`,
 `SignalStruct.cred_guard`, RTNL (Linux rtnl_mutex), `TcpSock.rd`,
-`UnixSock.bindlock`, `UnixSock.iolock`, `Disk.open_mutex` and `SWAPON`.
+`UnixSock.bindlock`, `UnixSock.iolock`, `Disk.open_mutex`, `SWAPON` and
+`Pipe.inner` (Linux pipe->mutex).
 
 ### 1.5 Lockdep-lite (`sync::lockdep`, feature `lockdep`)
 
@@ -287,6 +291,9 @@ Kernel mappings (3.2 Kernel Page Tables): vmstack FLUSH (sleeping,
     thread context; held across the stack area's TLB flush) → IOREMAP,
     vmstack SLOTS (spin leaves; no mapping or flush under them); KTABLES
     (spin, thread context) → frame allocator
+
+Pipes (3.11): Pipe.inner (sleeping; two in address order) → frame
+    allocator; no other lock under it, none of these above it
 
 Block locks (3.10 Block Device Subsystem):
     Disk.open_mutex (sleeping) → devtmpfs root i_rwsem → BLKDEV_REGISTRY,
@@ -1881,8 +1888,13 @@ wq.wake_one(); wq.wake_all();
   Wakers of queues shared by waiters with different conditions (SysV
   sem/msg, mqueue, sockets) use `wake_all`: a `wake_one` could pick a
   waiter whose condition is still false.
-- `cond` closures run with the task state set; they may take sleeping-context
-  locks (Mutex) but must not sleep themselves.
+- `cond` closures run with the task state set, so they must not sleep:
+  they read atomics or take spin locks (eventfd, inotify, timer wheel)
+  but never a sleeping lock (`sync::Mutex`, `RwSem`), whose contended
+  path would sleep and reset the task state. Objects guarded by a
+  sleeping lock publish what their waiters test: a pipe's ring indices
+  are atomics read without `Pipe.inner` (Linux pipe_readable /
+  pipe_writable).
 
 **Page Locking (Linux folio_wait_table Pattern):**
 
@@ -2863,7 +2875,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock) |
 | `SuperBlock.{root, private}`, `DentryCache.root` | fs/superblock.rs, fs/dentry.rs | spin RwLock | superblock root and private data, the dcache root |
 | `RamfsInodeData.xattrs`, `RamfsSbData.sb` | fs/ramfs.rs | spin | ramfs xattrs and superblock back-pointer (under VFS locks) |
-| `Pipe.inner` | pipe.rs | spin Mutex | pipe buffer and state (holders never sleep; BUGS.md) |
+| `Pipe.inner` | pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation, never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock |
 | `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |
 | `SimpleGfxDevice.state`, `GFX_DEVICES`, `NEXT_MINOR` | gfx/ | spin | framebuffer device state and registry |

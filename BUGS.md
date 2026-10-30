@@ -155,11 +155,10 @@ chmod/chown do not update ctime; ETXTBSY is not enforced.
 
 **Location**: `kernel/sync` (Mutex, RwSem), various
 
-Linux rw_semaphores/mutexes modeled as `spin` locks include the mount
-namespace/topology locks (namespace_sem, `Mount` RwLocks), `s_umount`
-(absent) and pipe locks: their holders must not sleep (`make check
-LOCKDEP=1` reports one that does). `Mutex` has no `_killable` or `try`
-variants, and no lock has `_interruptible` variants.
+Linux rw_semaphores modeled as `spin` locks include the mount
+namespace/topology locks (namespace_sem, `Mount` RwLocks) and `s_umount`
+(absent): their holders must not sleep (`make check LOCKDEP=1` reports
+one that does). `RwSem` has no `_interruptible` variants.
 
 ## Mount flag gaps
 

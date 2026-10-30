@@ -28,15 +28,25 @@
 //! - O_NONBLOCK support
 //! - Zero-copy splice/tee/vmsplice support via page-based buffers
 //!
+//! ## Locking
+//!
+//! `Pipe.inner` is a sleeping mutex (Linux pipe->mutex, `Pipe::lock`):
+//! its holder may allocate pages. Wait conditions and poll never take
+//! it (poll runs under epoll's spin lock): like Linux pipe_readable /
+//! pipe_writable they read the ring indices `Pipe.head`/`Pipe.tail`,
+//! which the guard publishes as it unlocks. Wakeups follow the unlock.
+//! splice/tee lock two pipes in address order (Linux pipe_double_lock).
+//!
 //! ## Reference
 //!
 //! - `./select-poll.md` - Implementation guide
 //! - Linux pipe(7) man page
 //! - Linux fs/pipe.c
 
-use crate::sync::spin::Mutex;
+use crate::sync::{Mutex, MutexGuard};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::fs::KernelError;
 use crate::fs::file::{File, FileOps, RwFlags, flags};
@@ -414,9 +424,12 @@ fn allocate_pipe_page() -> Option<Arc<CachedPage>> {
 
 /// Shared pipe structure
 pub struct Pipe {
-    /// Pipe buffer (protected by mutex)
-    /// Public for splice module access
-    pub inner: Mutex<PipeInner>,
+    /// Pipe buffer (Linux pipe->mutex); taken through [`Pipe::lock`]
+    inner: Mutex<PipeInner>,
+    /// `inner.head` and `inner.tail` as of the last unlock, for lockless
+    /// readers (Linux READ_ONCE(pipe->head/tail))
+    head: AtomicUsize,
+    tail: AtomicUsize,
     /// Wait queue for readers/writers
     pub wait_queue: WaitQueue,
     /// Number of read end references
@@ -428,12 +441,43 @@ pub struct Pipe {
 impl Pipe {
     /// Create a new pipe
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(PipeInner::new()),
-            wait_queue: WaitQueue::new(),
-            readers: AtomicU32::new(1),
-            writers: AtomicU32::new(1),
-        })
+        Arc::new(Self::default())
+    }
+
+    /// Lock the buffer (Linux pipe_lock); may sleep. Wake waiters only
+    /// after dropping the guard: it publishes the ring indices then.
+    pub fn lock(&self) -> PipeGuard<'_> {
+        PipeGuard {
+            pipe: self,
+            g: self.inner.lock(),
+        }
+    }
+
+    /// Used slots, without the lock (a snapshot)
+    fn occupancy(&self) -> usize {
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        (head + PIPE_RING - tail) % PIPE_RING
+    }
+
+    /// No buffered data, without the lock
+    pub fn ring_empty(&self) -> bool {
+        self.occupancy() == 0
+    }
+
+    /// Every slot used, without the lock
+    pub fn ring_full(&self) -> bool {
+        self.occupancy() >= PIPE_BUFFERS
+    }
+
+    /// A reader need not wait (Linux pipe_readable): data or no writer
+    fn readable(&self) -> bool {
+        !self.ring_empty() || !self.has_writers()
+    }
+
+    /// A writer need not wait (Linux pipe_writable): room or no reader
+    fn writable(&self) -> bool {
+        !self.ring_full() || !self.has_readers()
     }
 
     /// Check if there are any readers
@@ -479,10 +523,40 @@ impl Default for Pipe {
     fn default() -> Self {
         Self {
             inner: Mutex::new(PipeInner::new()),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
             wait_queue: WaitQueue::new(),
             readers: AtomicU32::new(1),
             writers: AtomicU32::new(1),
         }
+    }
+}
+
+/// A locked pipe buffer ([`Pipe::lock`])
+pub struct PipeGuard<'a> {
+    pipe: &'a Pipe,
+    g: MutexGuard<'a, PipeInner>,
+}
+
+impl Deref for PipeGuard<'_> {
+    type Target = PipeInner;
+    fn deref(&self) -> &PipeInner {
+        &self.g
+    }
+}
+
+impl DerefMut for PipeGuard<'_> {
+    fn deref_mut(&mut self) -> &mut PipeInner {
+        &mut self.g
+    }
+}
+
+impl Drop for PipeGuard<'_> {
+    /// Publish the ring indices for lockless readers, then unlock (the
+    /// mutex guard field drops after this)
+    fn drop(&mut self) {
+        self.pipe.head.store(self.g.head, Ordering::Release);
+        self.pipe.tail.store(self.g.tail, Ordering::Release);
     }
 }
 
@@ -534,15 +608,15 @@ impl FileOps for PipeReadFileOps {
 
         loop {
             // Try to read
-            {
-                let mut inner = pipe.inner.lock();
-                if !inner.is_empty() {
-                    let n = inner.read(buf);
-                    // Wake writers - there's now space
-                    pipe.wait_queue.wake_all();
-                    return Ok(n);
-                }
+            let mut inner = pipe.lock();
+            if !inner.is_empty() {
+                let n = inner.read(buf);
+                drop(inner);
+                // Wake writers - there's now space
+                pipe.wait_queue.wake_all();
+                return Ok(n);
             }
+            drop(inner);
 
             // Buffer is empty
             if !pipe.has_writers() {
@@ -555,9 +629,8 @@ impl FileOps for PipeReadFileOps {
             }
 
             // Block until data or EOF; a signal ends the wait (-ERESTARTSYS)
-            pipe.wait_queue.wait_event_interruptible(|| {
-                !pipe.inner.lock().is_empty() || !pipe.has_writers()
-            })?;
+            pipe.wait_queue
+                .wait_event_interruptible(|| pipe.readable())?;
         }
     }
 
@@ -575,24 +648,15 @@ impl FileOps for PipeReadFileOps {
             poll_table.poll_wait(&pipe.wait_queue);
         }
 
+        // Lockless, like Linux pipe_poll (epoll polls under a spin lock)
         let mut mask = 0u16;
-        let inner = pipe.inner.lock();
-
-        // Check if data available
-        if !inner.is_empty() {
+        if !pipe.ring_empty() {
             mask |= POLLIN | POLLRDNORM;
         }
-
-        // Check if write end closed (EOF)
-        if !pipe.has_writers() {
-            if inner.is_empty() {
-                mask |= POLLHUP;
-            } else {
-                // Data still available to read
-                mask |= POLLIN | POLLRDNORM;
-            }
+        // Write end closed: EOF once drained
+        if !pipe.has_writers() && mask == 0 {
+            mask |= POLLHUP;
         }
-
         mask
     }
 
@@ -610,17 +674,12 @@ impl FileOps for PipeReadFileOps {
         flags: RwFlags,
     ) -> Result<usize, KernelError> {
         let pipe = pipe_of(file)?;
-        if flags.nowait {
-            // Check if data is available without blocking
-            let inner = pipe.inner.lock();
-            if inner.is_empty() {
-                // No data available
-                if !pipe.has_writers() {
-                    return Ok(0); // EOF - write end closed
-                }
-                return Err(KernelError::WouldBlock);
+        if flags.nowait && pipe.ring_empty() {
+            // No data available
+            if !pipe.has_writers() {
+                return Ok(0); // EOF - write end closed
             }
-            drop(inner); // Release lock before doing the actual read
+            return Err(KernelError::WouldBlock);
         }
         self.read(file, buf)
     }
@@ -699,24 +758,24 @@ impl FileOps for PipeWriteFileOps {
                 };
             }
 
-            // Try to write
-            {
-                let mut inner = pipe.inner.lock();
-                if !inner.is_full() {
-                    let n = inner.write(&buf[done..]);
-                    if n == 0 {
-                        // No page for a free slot
-                        drop(inner);
-                        return if done > 0 {
-                            Ok(done)
-                        } else {
-                            Err(KernelError::OutOfMemory)
-                        };
-                    }
-                    done += n;
-                    // Wake readers - there's data available
-                    pipe.wait_queue.wake_all();
+            // Try to write (page allocation under the sleeping lock)
+            let mut inner = pipe.lock();
+            if !inner.is_full() {
+                let n = inner.write(&buf[done..]);
+                drop(inner);
+                if n == 0 {
+                    // No page for a free slot
+                    return if done > 0 {
+                        Ok(done)
+                    } else {
+                        Err(KernelError::OutOfMemory)
+                    };
                 }
+                done += n;
+                // Wake readers - there's data available
+                pipe.wait_queue.wake_all();
+            } else {
+                drop(inner);
             }
             if done == buf.len() {
                 return Ok(done);
@@ -731,9 +790,7 @@ impl FileOps for PipeWriteFileOps {
             }
 
             // Block until space or no readers; a signal ends the wait
-            let r = pipe
-                .wait_queue
-                .wait_event_interruptible(|| !pipe.inner.lock().is_full() || !pipe.has_readers());
+            let r = pipe.wait_queue.wait_event_interruptible(|| pipe.writable());
             match r {
                 Err(_) if done > 0 => return Ok(done),
                 Err(e) => return Err(e),
@@ -751,11 +808,9 @@ impl FileOps for PipeWriteFileOps {
             poll_table.poll_wait(&pipe.wait_queue);
         }
 
+        // Lockless, like Linux pipe_poll
         let mut mask = 0u16;
-        let inner = pipe.inner.lock();
-
-        // Check if space available
-        if !inner.is_full() {
+        if !pipe.ring_full() {
             mask |= POLLOUT | POLLWRNORM;
         }
 
@@ -791,11 +846,9 @@ impl FileOps for PipeWriteFileOps {
                 return Err(KernelError::BrokenPipe);
             }
             // Check if buffer has space without blocking
-            let inner = pipe.inner.lock();
-            if inner.is_full() {
+            if pipe.ring_full() {
                 return Err(KernelError::WouldBlock);
             }
-            drop(inner); // Release lock before doing the actual write
         }
         self.write(file, buf)
     }

@@ -265,6 +265,26 @@ impl WaitQueue {
         debug_assert!(r.is_ok());
     }
 
+    /// Exclusive [`Self::wait_event_interruptible`] (Linux
+    /// wait_event_interruptible_exclusive)
+    pub fn wait_event_interruptible_exclusive<F: FnMut() -> bool>(
+        &self,
+        cond: F,
+    ) -> Result<(), KernelError> {
+        self.wait_common(cond, MAX_SCHEDULE_TIMEOUT, SleepState::Interruptible, true)
+            .map(|_| ())
+    }
+
+    /// Exclusive [`Self::wait_event_killable`] (Linux
+    /// wait_event_killable_exclusive)
+    pub fn wait_event_killable_exclusive<F: FnMut() -> bool>(
+        &self,
+        cond: F,
+    ) -> Result<(), KernelError> {
+        self.wait_common(cond, MAX_SCHEDULE_TIMEOUT, SleepState::Killable, true)
+            .map(|_| ())
+    }
+
     /// Sleep until `cond()` is true or a signal is pending
     ///
     /// Returns `Err(KernelError::RestartSys)` on a signal.
