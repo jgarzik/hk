@@ -127,7 +127,7 @@ pub fn reclaim_pages(pages: Vec<u64>) -> usize {
 /// The number freed.
 pub fn try_to_free_pages(nr: usize) -> usize {
     let (total, free) = super::swap::swap_totals();
-    if total == 0 || free == 0 {
+    if total == 0 || free == 0 || super::swap::file_swap_active() {
         return 0;
     }
     lru::lru_add_drain_all();

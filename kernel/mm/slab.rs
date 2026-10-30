@@ -314,29 +314,20 @@ impl KmemCache {
         this_cpu().map(|c| unsafe { &mut *self.cpu[c].0.get() })
     }
 
-    /// Fill `ac` with up to `batch` objects, growing the cache if no
-    /// slab has any (Linux cache_alloc_refill)
+    /// Fill `ac` with up to `batch` objects from the slabs (Linux
+    /// cache_alloc_refill); false if none has any
     fn refill(&self, ac: &mut ArrayCache) -> bool {
-        loop {
-            {
-                let mut l = self.list_lock.lock();
-                while ac.avail < self.batch {
-                    match self.list_alloc(&mut l) {
-                        Some(obj) => {
-                            ac.entry[ac.avail] = obj;
-                            ac.avail += 1;
-                        }
-                        None => break,
-                    }
+        let mut l = self.list_lock.lock();
+        while ac.avail < self.batch {
+            match self.list_alloc(&mut l) {
+                Some(obj) => {
+                    ac.entry[ac.avail] = obj;
+                    ac.avail += 1;
                 }
-            }
-            if ac.avail > 0 {
-                return true;
-            }
-            if !self.grow() {
-                return false;
+                None => break,
             }
         }
+        ac.avail > 0
     }
 
     /// Give the oldest `batch` objects of `ac` back to their slabs, and
@@ -365,23 +356,33 @@ impl KmemCache {
         }
     }
 
-    /// Allocate an object (null if memory is exhausted)
+    /// Allocate an object (null if memory is exhausted). A new slab is
+    /// made with interrupts as the caller had them, so its pages come
+    /// GFP_KERNEL (reclaiming) where the caller may sleep (Linux
+    /// cache_grow_begin enables interrupts for a blocking allocation).
     pub fn alloc(&self) -> *mut u8 {
-        let flags = local_irq_save();
-        // SAFETY: interrupts are off
-        let obj = match unsafe { self.array() } {
-            Some(ac) => {
-                if ac.avail == 0 && !self.refill(ac) {
-                    0
-                } else {
-                    ac.avail -= 1;
-                    ac.entry[ac.avail]
+        loop {
+            let flags = local_irq_save();
+            // SAFETY: interrupts are off
+            let obj = match unsafe { self.array() } {
+                Some(ac) => {
+                    if ac.avail > 0 || self.refill(ac) {
+                        ac.avail -= 1;
+                        ac.entry[ac.avail]
+                    } else {
+                        0
+                    }
                 }
+                None => self.list_alloc(&mut self.list_lock.lock()).unwrap_or(0),
+            };
+            local_irq_restore(flags);
+            if obj != 0 {
+                return obj as *mut u8;
             }
-            None => self.slow_alloc(),
-        };
-        local_irq_restore(flags);
-        obj as *mut u8
+            if !self.grow() {
+                return core::ptr::null_mut();
+            }
+        }
     }
 
     /// Free an object of this cache
@@ -399,18 +400,6 @@ impl KmemCache {
             None => self.slow_free(obj as usize),
         }
         local_irq_restore(flags);
-    }
-
-    /// Allocation without a per-CPU array
-    fn slow_alloc(&self) -> usize {
-        loop {
-            if let Some(obj) = self.list_alloc(&mut self.list_lock.lock()) {
-                return obj;
-            }
-            if !self.grow() {
-                return 0;
-            }
-        }
     }
 
     /// Free without a per-CPU array
@@ -437,15 +426,20 @@ unsafe impl Sync for KmemCache {}
 /// Slab pages from `FRAME_ALLOCATOR`, used through the direct map
 pub struct KernelPages;
 
-/// Heap pages: GFP_KERNEL (down to the min watermark) in thread
-/// context, GFP_ATOMIC (Linux's partial allowance below min) only in
-/// interrupt context. User data, kernel buffers of it included (pipe
-/// pages), stops at low, so heap objects get low - min to themselves.
+/// Heap pages, GFP from the context (the heap API has no flags):
+/// GFP_KERNEL, down to the min watermark; the page allocator reclaims
+/// for it only where the caller may sleep, else it drains the per-CPU
+/// lists and fails (a spin lock held: Linux GFP_NOWAIT's limits).
+/// GFP_ATOMIC (Linux's partial allowance below min) only in an
+/// interrupt handler or within reclaim (PF_MEMALLOC). User data, kernel
+/// buffers of it included (pipe pages), stops at low, so heap objects
+/// get low - min to themselves.
 fn heap_gfp() -> Gfp {
     #[cfg(not(test))]
     {
         use crate::arch::{CurrentArch, PerCpuOps};
-        if CurrentArch::interrupt_depth() > 0 {
+        let reclaiming = crate::task::percpu::current().has_flag(crate::task::pf::MEMALLOC);
+        if CurrentArch::interrupt_depth() > 0 || reclaiming {
             return Gfp::ATOMIC;
         }
     }
@@ -777,7 +771,14 @@ pub mod tests {
     #[test]
     fn slow_paths_agree() {
         let (c, src) = cache(64, 8);
-        let v: Vec<usize> = (0..500).map(|_| c.slow_alloc()).collect();
+        // The list path alone (no per-CPU array), growing as needed
+        let take = || loop {
+            if let Some(o) = c.list_alloc(&mut c.list_lock.lock()) {
+                break o;
+            }
+            assert!(c.grow());
+        };
+        let v: Vec<usize> = (0..500).map(|_| take()).collect();
         for o in v {
             c.slow_free(o);
         }

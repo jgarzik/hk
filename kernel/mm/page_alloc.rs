@@ -58,7 +58,9 @@ impl Gfp {
     pub const ZERO: Gfp = Gfp(1 << 1);
     /// A compound page (head counts for all)
     pub const COMP: Gfp = Gfp(1 << 2);
-    /// The caller may sleep (Linux __GFP_DIRECT_RECLAIM)
+    /// The caller may sleep (Linux __GFP_DIRECT_RECLAIM): direct reclaim
+    /// runs when it really can (`may_direct_reclaim`: no spin lock,
+    /// interrupts on, not reclaim itself, I/O allowed)
     pub const RECLAIM: Gfp = Gfp(1 << 3);
     /// For user space (Linux __GFP_HARDWALL)
     pub const HARDWALL: Gfp = Gfp(1 << 4);
@@ -66,12 +68,6 @@ impl Gfp {
     pub const MOVABLE: Gfp = Gfp(1 << 5);
     /// Failure is expected; do not report it
     pub const NOWARN: Gfp = Gfp(1 << 6);
-    /// The caller holds no spinlock and may sleep in direct reclaim
-    /// (Linux __GFP_DIRECT_RECLAIM in its own sense: hk's
-    /// `Gfp::RECLAIM` only means thread context, since kernel heap
-    /// allocations happen under spinlocks)
-    pub const DIRECT: Gfp = Gfp(1 << 7);
-
     /// Kernel allocation from thread context
     pub const KERNEL: Gfp = Gfp::RECLAIM;
     /// Cannot sleep, may dip into reserves (interrupt context)
@@ -84,7 +80,6 @@ impl Gfp {
     pub const HIGHUSER_MOVABLE: Gfp = Gfp(Gfp::USER.0 | Gfp::MOVABLE.0);
     /// User page data for a caller that may reclaim (a page fault with
     /// only the mmap_lock held)
-    pub const HIGHUSER_RECLAIM: Gfp = Gfp(Gfp::HIGHUSER_MOVABLE.0 | Gfp::DIRECT.0);
     /// An opportunistic huge page for user data (Linux
     /// GFP_TRANSHUGE_LIGHT): never drains or reclaims, the fault falls
     /// back to 4KB pages
@@ -181,10 +176,32 @@ const MAX_RECLAIM_RETRIES: usize = 16;
 fn direct_reclaim() -> usize {
     #[cfg(not(test))]
     {
-        crate::mm::vmscan::try_to_free_pages(crate::mm::vmscan::SWAP_CLUSTER_MAX)
+        // Allocations made while reclaiming do not reclaim again
+        // (Linux __perform_reclaim: memalloc_noreclaim_save)
+        crate::mm::memalloc_scope(crate::task::pf::MEMALLOC, || {
+            crate::mm::vmscan::try_to_free_pages(crate::mm::vmscan::SWAP_CLUSTER_MAX)
+        })
     }
     #[cfg(test)]
     0
+}
+
+/// This allocation may run direct reclaim: it may sleep, and is neither
+/// made by reclaim itself (PF_MEMALLOC) nor barred from I/O
+/// (PF_MEMALLOC_NOIO). Linux: gfpflags_allow_blocking plus the
+/// current_gfp_context / PF_MEMALLOC checks of the slowpath.
+fn may_direct_reclaim() -> bool {
+    #[cfg(not(test))]
+    {
+        use crate::task::pf::{MEMALLOC, MEMALLOC_NOIO};
+        let me = crate::task::percpu::current();
+        crate::task::percpu::can_sleep()
+            && !crate::sync::in_atomic()
+            && !me.has_flag(MEMALLOC)
+            && !me.has_flag(MEMALLOC_NOIO)
+    }
+    #[cfg(test)]
+    false
 }
 
 /// In an interrupt handler: allocations there never drain or reclaim,
@@ -528,7 +545,7 @@ impl Zone {
         if !gfp.has(Gfp::RECLAIM) || in_interrupt() {
             return None;
         }
-        if !gfp.has(Gfp::DIRECT) {
+        if !may_direct_reclaim() {
             // A drain already running elsewhere is making progress:
             // retry once either way
             self.drain_all();
@@ -1085,7 +1102,7 @@ mod tests {
             AtomicUsize::new(30),
         ];
         assert_eq!(alloc_mark(&w, Gfp::HIGHUSER_MOVABLE), 20);
-        assert_eq!(alloc_mark(&w, Gfp::HIGHUSER_RECLAIM), 20);
+        assert_eq!(alloc_mark(&w, Gfp::HIGHUSER_MOVABLE), 20);
         assert_eq!(alloc_mark(&w, Gfp::KERNEL), 10);
     }
 

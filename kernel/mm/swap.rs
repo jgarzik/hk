@@ -375,6 +375,16 @@ pub fn swap_read_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
 
 /// Write the frame at `frame_phys` to slot `entry` (may sleep)
 pub fn swap_write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
+    // Allocations on the way to the device (bio, buffers, the file's
+    // own) must not reclaim through swap I/O again (Linux: swap_writepage
+    // under memalloc_noio / PF_MEMALLOC)
+    super::memalloc_scope(crate::task::pf::MEMALLOC_NOIO, || {
+        write_page(entry, frame_phys)
+    })
+}
+
+/// `swap_write_page` with PF_MEMALLOC_NOIO set
+fn write_page(entry: SwapEntry, frame_phys: u64) -> Result<(), i64> {
     let si = info_of(entry).ok_or(KernelError::InvalidArgument.sysret())?;
     let off = entry.offset();
     if let Some(ref inode) = si.inode {
@@ -530,6 +540,18 @@ pub fn swap_full() -> bool {
 }
 
 /// Swap totals in pages: (total, free) (meminfo, sysinfo)
+/// A swap file (not a block device) is on: its pages go out through
+/// the filesystem's writepage, which may need locks an allocating task
+/// holds, so direct reclaim leaves them alone (Linux writes swap files
+/// to their blocks directly, mapped at swapon)
+pub fn file_swap_active() -> bool {
+    SWAP_INFO
+        .read()
+        .iter()
+        .flatten()
+        .any(|si| si.inode.is_some())
+}
+
 pub fn swap_totals() -> (u64, u64) {
     let total = TOTAL_SWAP_PAGES.load(Ordering::Relaxed);
     let used = TOTAL_SWAP_USED.load(Ordering::Relaxed);

@@ -102,6 +102,19 @@ impl AnonVma {
         self.chain.read()
     }
 
+    /// The chain for a walk; with `try_only` (reclaim), none if it is
+    /// held for writing (Linux anon_vma_trylock_read)
+    pub fn read_for(
+        &self,
+        try_only: bool,
+    ) -> Option<impl core::ops::Deref<Target = Vec<Avc>> + '_> {
+        if try_only {
+            self.chain.try_read()
+        } else {
+            Some(self.chain.read())
+        }
+    }
+
     /// Entries in the chain
     pub fn len(&self) -> usize {
         self.chain.read().len()

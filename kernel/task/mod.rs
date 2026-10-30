@@ -810,6 +810,12 @@ pub mod pf {
     /// A real-uid change left the task over RLIMIT_NPROC: its next
     /// execve rechecks (Linux PF_NPROC_EXCEEDED)
     pub const NPROC_EXCEEDED: u32 = 0x0000_1000;
+    /// In direct reclaim: its allocations neither reclaim again nor
+    /// stop at the watermarks (Linux PF_MEMALLOC)
+    pub const MEMALLOC: u32 = 0x0000_0800;
+    /// Its allocations do no I/O to reclaim, so no direct reclaim (Linux
+    /// PF_MEMALLOC_NOIO, memalloc_noio_save)
+    pub const MEMALLOC_NOIO: u32 = 0x0008_0000;
     /// Kernel thread (Linux PF_KTHREAD)
     pub const KTHREAD: u32 = 0x0020_0000;
 }

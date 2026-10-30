@@ -1373,19 +1373,32 @@ layout in `doc/MEMORY.md`
   but the policy is still **no allocation in IRQ context**; IRQ paths
   reserve capacity up front (e.g. `netif_napi_add`)
 - kmalloc above 8KB (or aligned above 4KB) takes pages directly from
-  the page allocator. Heap pages are GFP_KERNEL (to the min watermark)
-  in thread context, GFP_ATOMIC only in interrupt context; user data
-  stops at low, leaving low - min to kernel objects (a failed heap
+  the page allocator. The heap has no GFP argument, so its pages take
+  one from the context (`slab::heap_gfp`): GFP_KERNEL (to the min
+  watermark; reclaiming only where the caller may sleep, else a drain),
+  GFP_ATOMIC only in an interrupt handler or within reclaim
+  (PF_MEMALLOC). A cache grows with interrupts as the caller had
+  them (the per-CPU array is used with them off, the new slab is made
+  after restoring them, Linux cache_grow_begin). User data stops at
+  low, leaving low - min to kernel objects (a failed heap
   allocation is fatal in Rust): user allocations stop at low until the
   OOM killer (P6), even after reclaim; then Linux's min.
-- Direct reclaim (`Gfp::DIRECT`, Linux __GFP_DIRECT_RECLAIM) runs only
-  for callers that hold no spinlock: user page faults (mmap_lock held
-  for reading) and swapoff. hk's `Gfp::RECLAIM` (GFP_KERNEL) means only
-  thread context, since the heap allocates under spin locks; such
-  allocations drain the per-CPU lists but never reclaim. A fault whose
-  page table cannot be allocated (under the page_table_lock) reclaims
-  after dropping it and retries. Reclaim allocates only without
-  `DIRECT`, so it never recurses.
+- Direct reclaim runs for a `Gfp::RECLAIM` allocation (GFP_KERNEL,
+  GFP_USER, GFP_HIGHUSER_MOVABLE) only when the caller really may sleep
+  (`page_alloc::may_direct_reclaim`): no spin lock held, interrupts on,
+  a task (not tid 0), not reclaim itself (PF_MEMALLOC) and I/O allowed
+  (no PF_MEMALLOC_NOIO). Otherwise it drains the per-CPU lists and
+  retries once. Reclaim runs with PF_MEMALLOC set
+  (`mm::memalloc_scope`, Linux memalloc_noreclaim_save), so its own
+  allocations take GFP_ATOMIC and never reclaim again; swap writeback
+  runs with PF_MEMALLOC_NOIO (Linux memalloc_noio_save). The reverse map
+  only tries the AnonVma chain lock under PF_MEMALLOC (Linux rmap_walk
+  with try_lock): an allocating task may hold it for writing. Direct
+  reclaim swaps only to block devices: with a swap file on it frees
+  nothing (`swap::file_swap_active`), since the file's writepage may
+  need filesystem locks the allocating task holds. A fault
+  whose page table cannot be allocated (under the page_table_lock)
+  reclaims after dropping it and retries.
 
 #### Page Cache
 

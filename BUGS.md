@@ -347,6 +347,33 @@ bytes of kmalloc (~1.3KB; suspected: procfs entries of dead pids, for
 the dcache work). The MM_LIFE tests count MemFree + Slab so they check user memory only; these leaks
 are listed here instead.
 
+## Heap allocations in atomic context are not reported
+
+**Location**: `kernel/mm/slab.rs` (`heap_gfp`), `kernel/sync/lockdep.rs`
+
+The heap picks GFP_ATOMIC by itself under a spin lock or with
+interrupts off, so an allocation there takes the atomic reserve
+silently. Linux needs an explicit GFP_ATOMIC and might_alloc reports a
+GFP_KERNEL allocation in atomic context. LOCKDEP has no such report
+(the T0 design's `atomic_alloc()` scope): the global allocator has no
+call site to attribute it to, so the sites (allocations under spin locks
+across net, fs, ipc) cannot be audited yet.
+
+## Multi-second CPU stalls when the host is overcommitted
+
+**Location**: unknown (CPU 0 of the x86 guest)
+
+With roughly 10 QEMUs (4 vCPUs each) on the 24-thread host, CPU 0 of a
+guest sometimes runs nothing else for 3-45 s: SOFT timers wait that long
+for `ktimers/0` (TIMERFD_ABSTIME_RT took 2-45 s when timerfd still used
+a SOFT timer), and once a 20 ms nanosleep took 29 s (TIMER_TINY_PERIOD).
+HARD timers and the tick stay on time, and no SOFT callback ran long,
+so some kernel path on CPU 0 does not reach a scheduling point:
+suspected spinning on another vCPU (a lock holder or an IPI target
+descheduled by the host). Never seen with up to ~4 QEMUs at once. Next:
+log long non-scheduling stretches per CPU (a tick-time check of the
+current task's run time in kernel mode) and the IPI/csd waits.
+
 ## Unconfirmed: Arc<T> field corruption in the USB mass-storage driver
 
 **Location**: `kernel/usb/msc.rs`

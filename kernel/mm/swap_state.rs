@@ -204,7 +204,7 @@ fn settled(e: SwapEntry) -> bool {
 /// Read `e`, whose slot this task claimed (SWAP_HAS_CACHE), into a new
 /// locked swap-cache page
 fn read_new(e: SwapEntry) -> Result<u64, VmFault> {
-    let Some(phys) = super::fault::alloc_user_reclaim() else {
+    let Some(phys) = super::fault::alloc_user() else {
         swapcache_clear(e);
         return Err(VmFault::Oom);
     };
