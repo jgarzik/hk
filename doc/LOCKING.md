@@ -324,10 +324,11 @@ Wakeups (3.1; any context, under any of the above):
     list is lock-free (pushed under pi_lock). Nothing else is taken
     under pi_lock or an rq lock: no TASKLIST, no allocation.
 
-Timers (3.3 Timers): owner locks (PosixTimer.inner, Timerfd.inner,
-    Alarm.st) → TimerBase.wheel (IrqSpinlock leaf, per CPU; callbacks
-    run with it dropped). HrBase.q (IrqSpinlock leaf, per CPU, HARD and
-    SOFT; callbacks run with it dropped)
+Timers (3.3 Timers): Alarm.st → TimerBase.wheel (IrqSpinlock leaf,
+    per CPU; callbacks run with it dropped). Owner locks
+    (PosixTimer.inner, Timerfd.inner) → HrBase.q (IrqSpinlock leaf, per
+    CPU, HARD and SOFT; callbacks run with it dropped). timerfd
+    CANCEL_LIST (spin) → Timerfd.inner
 
 Timekeeping (3.5):
     TimeKeeper.lock (IrqSpinlock leaf; writers only: the CPU 0 tick,
@@ -1781,8 +1782,7 @@ queue); a timer stays on the base of the CPU that first armed it.
 - **HARD** callbacks run in the CPU's tick with interrupts off and only
   wake tasks (`schedule_timeout`'s on-stack timer, Linux
   process_timeout). **SOFT** callbacks run in `ktimers/N`, process
-  context (POSIX timers and itimers send signals, timerfd wakes
-  readers, `Alarm`s run the network protocol timers); the tick only
+  context (`Alarm`s run the network protocol timers); the tick only
   wakes the thread.
 - Callbacks run with the base lock dropped and `running` set.
   `del_timer_sync` detaches and waits for a running callback (spinning
@@ -1790,11 +1790,8 @@ queue); a timer stays on the base of the CPU that first armed it.
   sleeping on the base's wait queue for SOFT, whose callback may
   sleep), so the owner may go once it returns; dropping a `TimerList`
   does that. Never call it from the timer's own callback, nor (SOFT)
-  where sleeping is not allowed; posix timers and timerfd cancel before
-  taking their `inner` lock (their callback takes it) and re-arm under
-  it.
-- Order: owner locks (`PosixTimer.inner`, `Timerfd.inner`, `Alarm.st`)
-  -> `TimerBase.wheel` (leaf).
+  where sleeping is not allowed.
+- Order: `Alarm.st` -> `TimerBase.wheel` (leaf).
 
 #### High-resolution timers (kernel/hrtimer.rs; Linux kernel/time/hrtimer.c)
 
@@ -1806,7 +1803,18 @@ programmed for the earliest expiry of both bases; the scheduler tick is
 a HARD hrtimer re-armed every TICK_NS.
 
 - HARD callbacks run in the timer interrupt (the tick, sleep
-  deadlines); SOFT ones in `ktimers/N`, like the wheel's.
+  deadlines, timerfd, which only takes its IrqSpinlock and wakes
+  readers); SOFT ones in `ktimers/N`, like the wheel's: POSIX timers
+  and itimers send signals. Both cancel with
+  `cancel_sync` before taking their `inner` lock (their callback takes
+  it) and re-arm under it, so owner locks (`PosixTimer.inner`,
+  `Timerfd.inner`) -> `HrBase.q`.
+- `clock_settime` (thread context, timekeeper lock dropped) runs
+  `timerfd::clock_was_set`: it snapshots the cancel-on-set timerfds
+  under `CANCEL_LIST` (a spin leaf except for `setup_cancel`, which
+  takes `CANCEL_LIST` -> `Timerfd.inner`), then locks each one's
+  `inner` with the list dropped. Absolute realtime hrtimers see the new
+  time at the next clock event (at most a tick away).
 - `start` queues and reprograms with interrupts off (no migration or
   timer interrupt in between). `cancel_sync` waits out a running
   callback (spinning for HARD, sleeping on the `ktimers/N` wait queue
@@ -2824,7 +2832,8 @@ else is taken under it) unless an order is given. "spin" is the
 |------|----------|-------|------------------|
 | `Task.vfork_done` | task/mod.rs | atomic pointer | the vforking parent's on-stack `Completion` (Linux vfork_done): set before the child runs, taken once by the child at exec/exit, which completes it; the parent waits uninterruptibly so the completion outlives that use |
 | `SignalStruct.posix_timers` | signal/mod.rs, posix_timer.rs | spin Mutex | the thread group's POSIX timers and ITIMER_REAL (Linux signal->posix_timers); leaf, thread context; deleted at the group's last exit (`exit_itimers`, timers stopped after the lock) or with the SignalStruct |
-| `PosixTimer.inner` | posix_timer.rs | IrqSpinlock | one timer's state; -> its timer's base (re-armed under it); cancelled with `del_timer_sync` before it is taken (settime) or with it dropped (delete) |
+| `PosixTimer.inner` | posix_timer.rs | IrqSpinlock | one timer's state; -> its hrtimer's base (re-armed under it); cancelled with `cancel_sync` before it is taken (settime) or with it dropped (delete) |
+| timerfd `CANCEL_LIST` | timerfd.rs | spin::Mutex | thread only: weak refs to TFD_TIMER_CANCEL_ON_SET timerfds; -> `Timerfd.inner` (setup_cancel); `clock_was_set` copies it out and drops it first |
 | `TimerBase.wheel` (per CPU, HARD and SOFT) | timer.rs | IrqSpinlock leaf | a 64-slot wheel of `TimerList`s (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the tick, by `ktimers/N` and by arming/deleting code in any context |
 | `HrBase.q` (per CPU, HARD and SOFT) | hrtimer.rs | IrqSpinlock leaf | sorted lists of `HrTimer`s per clock (their links, `expires`, `pending`); callbacks run with it dropped (`running` set); taken in the clock event interrupt, by `ktimers/N` and by start/cancel in any context |
 | `Eventfd.inner`, `Eventpoll.inner`, `Inotify.inner`, `Fanotify.inner`, `IoUring.inner`, `Pidfd.inner`, `Signalfd.inner`, `Timerfd.inner` | eventfd.rs, epoll.rs, inotify.rs, fanotify.rs, io_uring.rs, pidfd.rs, signalfd.rs, timerfd.rs | IrqSpinlock | per-object state of the anon-inode files; their wait queues are woken after unlocking (pidfd: under it -> wait queue head) |

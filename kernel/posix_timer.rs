@@ -30,11 +30,10 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::IrqSpinlock;
+use crate::hrtimer::{HrClock, HrTimer};
 use crate::signal::{SIGALRM, send_signal};
 use crate::task::Tid;
-use crate::time::{ClockId, TIMEKEEPER};
 use crate::time_syscall::CLOCK_REALTIME;
-use crate::timer::TimerList;
 use crate::timerfd::ITimerSpec;
 
 /// POSIX timer notification types (matches Linux)
@@ -107,8 +106,12 @@ pub type TimerT = i32;
 
 /// Internal POSIX timer state
 struct PosixTimerInner {
-    /// Next expiration time (absolute monotonic ns, 0 if disarmed)
+    /// Next expiration time (absolute ns on `clock`, 0 if disarmed)
     expires_ns: u64,
+    /// The clock `expires_ns` is on: CLOCK_REALTIME only for an
+    /// absolute realtime timer (Linux: relative timers run on
+    /// CLOCK_MONOTONIC)
+    clock: HrClock,
     /// Interval for periodic timers (0 = one-shot)
     interval_ns: u64,
     /// Overrun count (expirations since last signal delivery)
@@ -121,6 +124,7 @@ impl PosixTimerInner {
     fn new() -> Self {
         Self {
             expires_ns: 0,
+            clock: HrClock::Monotonic,
             interval_ns: 0,
             overrun: 0,
             armed: false,
@@ -143,7 +147,7 @@ pub struct PosixTimer {
     inner: IrqSpinlock<PosixTimerInner>,
     /// Its expiry timer (SOFT: the callback sends a signal; data: this
     /// timer, which outlives it: dropping it waits out its callback)
-    timer: TimerList,
+    timer: HrTimer,
 }
 
 impl PosixTimer {
@@ -155,22 +159,16 @@ impl PosixTimer {
             owner_tid: AtomicU64::new(owner_tid),
             sigevent,
             inner: IrqSpinlock::new(PosixTimerInner::new()),
-            timer: TimerList::new(posix_timer_fire, 0),
+            timer: HrTimer::new(posix_timer_fire, 0),
         });
         timer.timer.set_data(Arc::as_ptr(&timer) as usize);
         timer
     }
 
     /// Its timer (pinned: the timer lives in an Arc)
-    fn timer(&self) -> Pin<&TimerList> {
+    fn timer(&self) -> Pin<&HrTimer> {
         // SAFETY: an Arc's contents never move
         unsafe { Pin::new_unchecked(&self.timer) }
-    }
-
-    /// Get current monotonic time in nanoseconds
-    fn now_ns() -> u64 {
-        let ts = TIMEKEEPER.read(ClockId::Monotonic, TIMEKEEPER.get_read_cycles());
-        ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
     }
 
     /// Arm the timer
@@ -184,7 +182,7 @@ impl PosixTimer {
     pub fn settime(self: &Arc<Self>, new_value: &ITimerSpec, flags: i32) -> ITimerSpec {
         // Cancel the existing timer, waiting out its callback (it takes
         // `inner`)
-        self.timer.del_timer_sync();
+        self.timer.cancel_sync();
         let mut inner = self.inner.lock();
 
         // Save old value
@@ -205,25 +203,28 @@ impl PosixTimer {
         let value_ns = new_value.value_to_ns();
         inner.interval_ns = new_value.interval_to_ns();
 
-        let expires_ns = if flags & timer_flags::TIMER_ABSTIME != 0 {
-            // Absolute time
-            if self.clockid == CLOCK_REALTIME {
-                // CLOCK_REALTIME - need to convert to monotonic
-                // For simplicity, we assume realtime ~= monotonic + offset
-                // A proper implementation would handle clock jumps
-                value_ns
+        let (expires_ns, clock) = if flags & timer_flags::TIMER_ABSTIME != 0 {
+            // Absolute, kept on its clock: a realtime one follows
+            // clock_settime
+            let clock = if self.clockid == CLOCK_REALTIME {
+                HrClock::Realtime
             } else {
-                // CLOCK_MONOTONIC - use directly
-                value_ns
-            }
+                HrClock::Monotonic
+            };
+            (value_ns, clock)
         } else {
             // Relative time (saturates: a huge value never fires)
-            crate::time::deadline_after(Self::now_ns(), value_ns)
+            let now = crate::time::monotonic_ns();
+            (
+                crate::time::deadline_after(now, value_ns),
+                HrClock::Monotonic,
+            )
         };
 
         inner.expires_ns = expires_ns;
+        inner.clock = clock;
         inner.armed = true;
-        self.timer().mod_timer_ns(expires_ns);
+        self.timer().start(expires_ns, clock);
 
         old_value
     }
@@ -240,8 +241,7 @@ impl PosixTimer {
             return ITimerSpec::default();
         }
 
-        let now = Self::now_ns();
-        let remaining = inner.expires_ns.saturating_sub(now);
+        let remaining = inner.expires_ns.saturating_sub(inner.clock.now());
 
         ITimerSpec::from_ns(remaining, inner.interval_ns)
     }
@@ -267,12 +267,12 @@ impl PosixTimer {
                 inner.armed = false;
                 inner.expires_ns = 0;
             } else {
-                let (_, next) =
-                    crate::timer::forward(inner.expires_ns, inner.interval_ns, Self::now_ns());
+                let now = inner.clock.now();
+                let (_, next) = crate::timer::forward(inner.expires_ns, inner.interval_ns, now);
                 match next {
                     Some(n) => {
                         inner.expires_ns = n;
-                        self.timer().mod_timer_ns(n);
+                        self.timer().start(n, inner.clock);
                     }
                     None => {
                         inner.armed = false;
@@ -305,12 +305,12 @@ impl PosixTimer {
     /// context)
     fn delete(&self) {
         self.inner.lock().armed = false;
-        self.timer.del_timer_sync();
+        self.timer.cancel_sync();
     }
 }
 
 /// A POSIX timer expired (`ktimers/N`)
-fn posix_timer_fire(t: &TimerList) {
+fn posix_timer_fire(t: &HrTimer) {
     // SAFETY: `data` is the PosixTimer owning `t` (see `PosixTimer::timer`)
     unsafe { &*(t.data() as *const PosixTimer) }.on_expire();
 }
@@ -471,7 +471,7 @@ pub fn retarget(sig: &crate::signal::SignalStruct, old: Tid, new: Tid) {
 /// thread is exiting)
 pub fn exit_itimers(sig: &crate::signal::SignalStruct) {
     let timers = core::mem::take(&mut sig.posix_timers.lock().timers);
-    // Deleted after the lock (del_timer_sync waits out a running callback)
+    // Deleted after the lock (cancel_sync waits out a running callback)
     for (_, t) in timers {
         t.delete();
     }

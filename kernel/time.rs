@@ -378,8 +378,14 @@ impl TimeKeeper {
             .store(new_offset as i64, Ordering::Relaxed);
 
         self.write_end();
-
+        drop(_g);
+        clock_was_set();
         true
+    }
+
+    /// CLOCK_REALTIME - CLOCK_MONOTONIC, ns
+    pub fn real_offset(&self) -> i64 {
+        self.realtime_offset_ns.load(Ordering::Relaxed)
     }
 }
 
@@ -398,6 +404,19 @@ pub const TIME_SETTOD_SEC_MAX: i64 = (KTIME_MAX / 1_000_000_000) as i64 - 30 * 3
 /// A wall-clock time that may be set (Linux timespec64_valid_settod)
 pub fn settod_valid(t: &Timespec) -> bool {
     t.sec >= 0 && t.sec < TIME_SETTOD_SEC_MAX && t.nsec < 1_000_000_000
+}
+
+/// CLOCK_REALTIME was set (Linux clock_was_set; thread context, no
+/// timekeeper lock): absolute realtime hrtimers see the new time at the
+/// next clock event (at most a tick away); cancel-on-set timerfds fail
+/// their next read
+fn clock_was_set() {
+    crate::timerfd::clock_was_set();
+}
+
+/// CLOCK_REALTIME - CLOCK_MONOTONIC now, ns
+pub fn real_offset() -> i64 {
+    TIMEKEEPER.real_offset()
 }
 
 /// Global timekeeper instance
