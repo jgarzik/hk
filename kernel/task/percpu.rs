@@ -2623,11 +2623,25 @@ pub fn get_ticks() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
 }
 
-/// Sleep until CLOCK_MONOTONIC reaches `deadline_ns`
+/// Sleep until CLOCK_MONOTONIC reaches `deadline_ns` (see [`sleep_until`])
+pub fn sleep_until_ns(deadline_ns: u64, interruptible: bool) -> Result<(), u64> {
+    sleep_until(
+        deadline_ns,
+        crate::hrtimer::HrClock::Monotonic,
+        interruptible,
+    )
+}
+
+/// Sleep until `clock` reaches `deadline` ns (Linux hrtimer_nanosleep)
 ///
 /// Interruptible sleeps stop early when a signal is pending and return
-/// `Err(ns_left)`. Wakes at tick granularity, never before the deadline.
-pub fn sleep_until_ns(deadline_ns: u64, interruptible: bool) -> Result<(), u64> {
+/// `Err(ns_left)`. ns-precise (an hrtimer), never before the deadline;
+/// an absolute CLOCK_REALTIME deadline follows clock steps.
+pub fn sleep_until(
+    deadline: u64,
+    clock: crate::hrtimer::HrClock,
+    interruptible: bool,
+) -> Result<(), u64> {
     let state = if interruptible {
         SleepState::Interruptible
     } else {
@@ -2635,21 +2649,21 @@ pub fn sleep_until_ns(deadline_ns: u64, interruptible: bool) -> Result<(), u64> 
     };
     loop {
         set_current_state(state);
-        let now = crate::time::monotonic_ns();
-        if now >= deadline_ns {
+        let now = clock.now();
+        if now >= deadline {
             set_current_state(SleepState::Running);
             return Ok(());
         }
         if interruptible && crate::waitqueue::signal_pending() {
             set_current_state(SleepState::Running);
-            return Err(deadline_ns - now);
+            return Err(deadline - now);
         }
         if this_sched().is_none() || current_tid() == 0 {
             set_current_state(SleepState::Running);
             core::hint::spin_loop();
             continue;
         }
-        schedule_timeout(ns_to_ticks(deadline_ns - now).max(1));
+        crate::hrtimer::schedule_hrtimeout(Some(deadline), clock);
     }
 }
 

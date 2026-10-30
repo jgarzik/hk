@@ -64,6 +64,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
 use crate::arch::IrqSpinlock;
 use crate::error::KernelError;
+use crate::hrtimer::HrClock;
 use crate::list::{Link, List};
 use crate::task::percpu::{
     KernelTask, MAX_SCHEDULE_TIMEOUT, SleepState, WakeMode, current, current_tid, schedule_timeout,
@@ -303,30 +304,77 @@ impl WaitQueue {
         self.wait_common(cond, timeout, SleepState::Interruptible, false)
     }
 
-    /// Sleep until `cond()` is true, a signal, or the CLOCK_MONOTONIC
-    /// `deadline` in ns (`None` = never). `Ok(true)`: condition true;
-    /// `Ok(false)`: deadline passed; `Err(RestartSys)`: signal.
+    /// Sleep (uninterruptibly) until `cond()` is true or `deadline` ns on
+    /// `clock` passes (`None` = never). True if `cond()` holds.
+    pub fn wait_event_deadline<F: FnMut() -> bool>(
+        &self,
+        cond: F,
+        deadline: Option<u64>,
+        clock: HrClock,
+    ) -> bool {
+        match self.deadline_common(cond, deadline, clock, SleepState::Uninterruptible) {
+            Ok(done) => done,
+            Err(_) => unreachable!("uninterruptible wait interrupted"),
+        }
+    }
+
+    /// Sleep until `cond()` is true, a signal, or `deadline` ns on `clock`
+    /// (`None` = never). `Ok(true)`: condition true; `Ok(false)`: deadline
+    /// passed; `Err(RestartSys)`: signal.
     pub fn wait_event_interruptible_deadline<F: FnMut() -> bool>(
+        &self,
+        cond: F,
+        deadline: Option<u64>,
+        clock: HrClock,
+    ) -> Result<bool, KernelError> {
+        self.deadline_common(cond, deadline, clock, SleepState::Interruptible)
+    }
+
+    /// As [`Self::wait_event_interruptible_deadline`], woken only by a
+    /// fatal signal (`Err(Interrupted)`)
+    pub fn wait_event_killable_deadline<F: FnMut() -> bool>(
+        &self,
+        cond: F,
+        deadline: Option<u64>,
+        clock: HrClock,
+    ) -> Result<bool, KernelError> {
+        self.deadline_common(cond, deadline, clock, SleepState::Killable)
+    }
+
+    /// The deadline wait loop (Linux ___wait_event with
+    /// schedule_hrtimeout): ns-precise, never early, and an absolute
+    /// CLOCK_REALTIME deadline follows clock steps
+    fn deadline_common<F: FnMut() -> bool>(
         &self,
         mut cond: F,
         deadline: Option<u64>,
+        clock: HrClock,
+        state: SleepState,
     ) -> Result<bool, KernelError> {
-        loop {
-            let ticks = match deadline {
-                None => MAX_SCHEDULE_TIMEOUT,
-                Some(d) => {
-                    let now = crate::time::monotonic_ns();
-                    if now >= d {
-                        return Ok(cond());
-                    }
-                    crate::task::percpu::ns_to_ticks(d - now)
-                }
-            };
-            if self.wait_event_interruptible_timeout(&mut cond, ticks)? != 0 {
-                return Ok(true);
-            }
-            // Tick granularity: re-check the clock before giving up
+        crate::sync::might_sleep();
+        if cond() {
+            return Ok(true);
         }
+        let w = core::pin::pin!(WaitEntry::new());
+        let result = loop {
+            self.prepare_to_wait(w.as_ref(), state);
+            if cond() {
+                break Ok(true);
+            }
+            if interrupted(state) {
+                break Err(match state {
+                    SleepState::Killable => KernelError::Interrupted,
+                    _ => KernelError::RestartSys,
+                });
+            }
+            if crate::hrtimer::schedule_hrtimeout(deadline, clock) {
+                // Timed out: one last look
+                self.prepare_to_wait(w.as_ref(), state);
+                break Ok(cond());
+            }
+        };
+        self.finish_wait(w.as_ref());
+        result
     }
 
     /// The wait loop (Linux ___wait_event); the entry is unlinked on

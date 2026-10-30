@@ -7,6 +7,7 @@
 
 use crate::arch::Uaccess;
 use crate::error::KernelError;
+use crate::hrtimer::HrClock;
 use crate::time::{ClockId, NTP_STATE, STA_NANO, STA_UNSYNC, TIMEKEEPER};
 use crate::uaccess::{UaccessArch, get_user, put_user};
 use core::sync::atomic::Ordering;
@@ -186,24 +187,22 @@ pub fn sys_clock_nanosleep(clockid: i32, flags: i32, req: u64, rem: u64) -> i64 
     }
 
     let req_ns = crate::time::timespec_to_ns(request.tv_sec, request.tv_nsec);
-    let now_mono = crate::time::monotonic_ns();
     if flags & TIMER_ABSTIME != 0 {
-        // Absolute time on `clockid`: convert to a CLOCK_MONOTONIC deadline
+        // Absolute time on `clockid`, kept on that clock: a realtime
+        // sleep follows clock_settime (Linux hrtimer_nanosleep)
         let clock = if clockid == CLOCK_REALTIME {
-            ClockId::Realtime
+            HrClock::Realtime
         } else {
-            ClockId::Monotonic
+            HrClock::Monotonic
         };
-        let ts = TIMEKEEPER.read(clock, TIMEKEEPER.get_read_cycles());
-        let clock_now = ts.sec as u64 * 1_000_000_000 + ts.nsec as u64;
-        let deadline = crate::time::deadline_after(now_mono, req_ns.saturating_sub(clock_now));
         // Absolute sleeps are restarted unchanged; no remaining time
-        match crate::task::percpu::sleep_until_ns(deadline, true) {
+        match crate::task::percpu::sleep_until(req_ns, clock, true) {
             Ok(()) => 0,
             Err(_) => KernelError::RestartNoHand.sysret(),
         }
     } else {
-        do_nanosleep(crate::time::deadline_after(now_mono, req_ns), rem)
+        let now = crate::time::monotonic_ns();
+        do_nanosleep(crate::time::deadline_after(now, req_ns), rem)
     }
 }
 
@@ -817,7 +816,9 @@ pub fn sys_adjtimex(txc_p: u64) -> i64 {
         let current = TIMEKEEPER.read(ClockId::Realtime, TIMEKEEPER.get_read_cycles());
         let new_ns = current.to_nanos() + offset_ns as i128;
         let new_time = crate::time::Timespec::from_nanos(new_ns);
-        TIMEKEEPER.set_realtime(new_time);
+        if !TIMEKEEPER.set_realtime(new_time) {
+            return KernelError::InvalidArgument.sysret();
+        }
     }
 
     // Read current state back into txc

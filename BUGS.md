@@ -234,19 +234,14 @@ RTM_GETRULE dumps nothing (Linux lists its three default IPv4 rules; there
 is no rule engine: lookups are local then main), address lifetimes are
 always infinite, promote_secondaries is off.
 
-## Relative timeouts measured on CLOCK_REALTIME
+## io_uring timeouts measured on CLOCK_REALTIME
 
-**Location**: `kernel/ipc/sem.rs` (semtimedop), `kernel/io_uring.rs`
-(IORING_OP_TIMEOUT), `kernel/time.rs` (`current_ticks`, used by the
-ARP conflict rate limit)
+**Location**: `kernel/io_uring.rs` (IORING_OP_TIMEOUT)
 
-These compute deadlines from `TIMEKEEPER.current_time()` (wall clock),
-so clock_settime/settimeofday stretches or cuts them short (a backward
-step of N s adds N s to every pending wait). Linux measures them on
-CLOCK_MONOTONIC (semtimedop: `ktime_get()` + timeout; io_uring: relative
-and, by default, absolute timeouts are CLOCK_MONOTONIC, CLOCK_REALTIME
-only with IORING_TIMEOUT_REALTIME). `current_ticks` says "monotonic" but
-reads the wall clock.
+Relative timeouts are computed from `TIMEKEEPER.current_time()` (wall
+clock), so clock_settime stretches or cuts them short. Linux measures
+relative and, by default, absolute timeouts on CLOCK_MONOTONIC
+(CLOCK_REALTIME only with IORING_TIMEOUT_REALTIME).
 
 ## Rare QEMU crash in the arm64 boot test (host CPU suspected)
 

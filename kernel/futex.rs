@@ -264,8 +264,12 @@ fn futex_clock_ns(realtime: bool) -> u64 {
 /// Sleep interruptibly until `queued()` turns false (a waker dequeued us),
 /// a signal arrives, or `deadline_ns` (on the given clock) passes
 fn futex_sleep<F: Fn() -> bool>(queued: F, deadline_ns: Option<u64>, realtime: bool) -> FutexSleep {
-    use crate::task::percpu::{
-        SleepState, ns_to_ticks, schedule, schedule_timeout, set_current_state,
+    use crate::hrtimer::{HrClock, schedule_hrtimeout};
+    use crate::task::percpu::{SleepState, set_current_state};
+    let clock = if realtime {
+        HrClock::Realtime
+    } else {
+        HrClock::Monotonic
     };
     let result = loop {
         set_current_state(SleepState::Interruptible);
@@ -275,16 +279,10 @@ fn futex_sleep<F: Fn() -> bool>(queued: F, deadline_ns: Option<u64>, realtime: b
         if crate::waitqueue::signal_pending() {
             break FutexSleep::Signal;
         }
-        match deadline_ns {
-            None => schedule(),
-            Some(d) => {
-                let now = futex_clock_ns(realtime);
-                if now >= d {
-                    break FutexSleep::Timeout;
-                }
-                schedule_timeout(ns_to_ticks(d - now));
-            }
+        if deadline_ns.is_some_and(|d| clock.now() >= d) {
+            break FutexSleep::Timeout;
         }
+        schedule_hrtimeout(deadline_ns, clock);
     };
     set_current_state(SleepState::Running);
     result

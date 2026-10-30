@@ -907,24 +907,17 @@ fn dequeue_in(tid: crate::task::Tid, mask: &SigSet) -> Option<u32> {
 /// Sleep interruptibly until a signal is deliverable or the
 /// CLOCK_MONOTONIC `deadline` (ns) passes
 fn sleep_until_signal(deadline: Option<u64>) {
-    use crate::task::percpu::{
-        SleepState, ns_to_ticks, schedule, schedule_timeout, set_current_state,
-    };
+    use crate::hrtimer::{HrClock, schedule_hrtimeout};
+    use crate::task::percpu::{SleepState, set_current_state};
     loop {
         set_current_state(SleepState::Interruptible);
         if crate::waitqueue::signal_pending() {
             break;
         }
-        match deadline {
-            None => schedule(),
-            Some(d) => {
-                let now = crate::time::monotonic_ns();
-                if now >= d {
-                    break;
-                }
-                schedule_timeout(ns_to_ticks(d - now));
-            }
+        if deadline.is_some_and(|d| crate::time::monotonic_ns() >= d) {
+            break;
         }
+        schedule_hrtimeout(deadline, HrClock::Monotonic);
     }
     set_current_state(SleepState::Running);
 }

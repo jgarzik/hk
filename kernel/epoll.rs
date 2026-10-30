@@ -41,6 +41,7 @@ use crate::poll::{POLLIN, POLLRDNORM, PollTable};
 use crate::task::Fd;
 use crate::task::fdtable::get_task_fd;
 use crate::task::percpu::current_tid;
+use crate::time::Deadline;
 use crate::uaccess::{get_user, put_user};
 use crate::waitqueue::WaitQueue;
 
@@ -190,38 +191,30 @@ impl Eventpoll {
     /// between scan and sleep is never lost. Returns the number of ready
     /// events; 0 on timeout; -EINTR on a signal (epoll_wait is never
     /// restarted).
-    pub fn wait(&self, events: &mut [EpollEvent], timeout_ms: i32) -> Result<usize, i64> {
+    pub fn wait(&self, events: &mut [EpollEvent], deadline: Deadline) -> Result<usize, i64> {
+        use crate::hrtimer::{HrClock, schedule_hrtimeout};
         use crate::poll::PollContext;
-        use crate::task::percpu::{
-            SleepState, ns_to_ticks, schedule, schedule_timeout, set_current_state,
-        };
+        use crate::task::percpu::{SleepState, set_current_state};
         if events.is_empty() {
             return Ok(0);
         }
-        let deadline = (timeout_ms > 0)
-            .then(|| crate::time::monotonic_ns().saturating_add(timeout_ms as u64 * 1_000_000));
+        let nonblock = deadline == Some(0);
         let mut ctx = PollContext::new(current_tid());
         let mut first = true;
         let r = loop {
             set_current_state(SleepState::Interruptible);
-            let n = self.scan(events, &mut ctx, first && timeout_ms != 0);
+            let n = self.scan(events, &mut ctx, first && !nonblock);
             first = false;
-            if n > 0 || timeout_ms == 0 {
+            if n > 0 || nonblock {
                 break Ok(n);
             }
             if crate::waitqueue::signal_pending() {
                 break Err(KernelError::Interrupted.sysret());
             }
-            match deadline {
-                None => schedule(),
-                Some(d) => {
-                    let now = crate::time::monotonic_ns();
-                    if now >= d {
-                        break Ok(0);
-                    }
-                    schedule_timeout(ns_to_ticks(d - now));
-                }
+            if deadline.is_some_and(|d| crate::time::monotonic_ns() >= d) {
+                break Ok(0);
             }
+            schedule_hrtimeout(deadline, HrClock::Monotonic);
         };
         set_current_state(SleepState::Running);
         r
@@ -527,6 +520,19 @@ pub fn sys_epoll_pwait(
     events_ptr: u64,
     maxevents: i32,
     timeout: i32,
+    sigmask: u64,
+    sigsetsize: u64,
+) -> i64 {
+    let deadline = crate::time::deadline_ms(timeout);
+    do_epoll_pwait(epfd, events_ptr, maxevents, deadline, sigmask, sigsetsize)
+}
+
+/// epoll_pwait and epoll_pwait2 with the timeout as a [`Deadline`]
+fn do_epoll_pwait(
+    epfd: i32,
+    events_ptr: u64,
+    maxevents: i32,
+    deadline: Deadline,
     _sigmask: u64,
     _sigsetsize: u64,
 ) -> i64 {
@@ -562,7 +568,7 @@ pub fn sys_epoll_pwait(
     let mut events = alloc::vec![EpollEvent::default(); maxevents as usize];
 
     // Wait for events
-    let count = match ep.wait(&mut events, timeout) {
+    let count = match ep.wait(&mut events, deadline) {
         Ok(n) => n,
         Err(e) => return e,
     };
@@ -603,53 +609,18 @@ pub fn sys_epoll_pwait2(
 ) -> i64 {
     use crate::time_syscall::LinuxTimespec;
 
-    // Convert timespec to milliseconds for the existing wait logic
-    let timeout_ms: i32 = if timeout_ptr == 0 {
-        // NULL timeout = wait indefinitely
-        -1
+    // NULL waits forever; the timeout is ns-precise (Linux ep_timeout_to_timespec)
+    let deadline = if timeout_ptr == 0 {
+        None
     } else {
-        // Read timespec from user space
         let ts: LinuxTimespec = match get_user::<Uaccess, LinuxTimespec>(timeout_ptr) {
             Ok(ts) => ts,
             Err(_) => return KernelError::BadAddress.sysret(),
         };
-
-        // Validate timespec
-        if ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-            return KernelError::InvalidArgument.sysret();
-        }
-
-        // Handle negative seconds (invalid)
-        if ts.tv_sec < 0 {
-            return KernelError::InvalidArgument.sysret();
-        }
-
-        // Check for zero timeout (non-blocking)
-        if ts.tv_sec == 0 && ts.tv_nsec == 0 {
-            0
-        } else {
-            // Convert seconds and nanoseconds to milliseconds
-            // tv_sec * 1000 + tv_nsec / 1_000_000, with rounding up for ns remainder
-            let ms_from_sec = (ts.tv_sec as i64).saturating_mul(1000);
-            let ms_from_ns = (ts.tv_nsec + 999_999) / 1_000_000; // Round up
-            let total_ms = ms_from_sec.saturating_add(ms_from_ns);
-
-            // Clamp to i32::MAX if overflow
-            if total_ms > i32::MAX as i64 {
-                i32::MAX
-            } else {
-                total_ms as i32
-            }
+        match crate::time::deadline_ts(ts.tv_sec, ts.tv_nsec) {
+            Ok(d) => d,
+            Err(e) => return e.sysret(),
         }
     };
-
-    // Delegate to existing epoll_pwait implementation
-    sys_epoll_pwait(
-        epfd,
-        events_ptr,
-        maxevents,
-        timeout_ms,
-        _sigmask,
-        _sigsetsize,
-    )
+    do_epoll_pwait(epfd, events_ptr, maxevents, deadline, _sigmask, _sigsetsize)
 }

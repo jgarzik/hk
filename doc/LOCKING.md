@@ -1867,7 +1867,9 @@ wq.wake_one(); wq.wake_all();
 - **Autoremove:** a woken entry is removed by the waker; `finish_wait`
   (or the entry's drop) removes it otherwise. Poll entries stay until
   the poll ends.
-- `wait_event_interruptible_deadline` takes a CLOCK_MONOTONIC deadline.
+- `wait_event_*_deadline` take an absolute deadline on CLOCK_MONOTONIC
+  or CLOCK_REALTIME and sleep on an on-stack HARD hrtimer
+  (`hrtimer::schedule_hrtimeout`): ns-precise, never early.
   Wakers of queues shared by waiters with different conditions (SysV
   sem/msg, mqueue, sockets) use `wake_all`: a `wake_one` could pick a
   waiter whose condition is still false.
