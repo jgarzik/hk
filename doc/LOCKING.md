@@ -649,7 +649,11 @@ network receive; see 3.10), `kselftest` (boot only).
 with `stop_one_cpu` (thread context; the caller sleeps until done). Per
 CPU: `Stopper.lock` (sleeping `sync::Mutex`, one caller at a time, held
 until the call completes) → `Stopper.work` (IrqSpinlock leaf, the
-slot). `migration_cpu_stop` takes the task's pi_lock → this CPU's rq
+slot). `stop_one_cpu_nowait` (any context) only fills an empty slot:
+the soft lockup detector (`watchdog.rs`, Linux kernel/watchdog.c) queues
+a touch from each CPU's tick every `watchdog_thresh * 2 / 5` s and
+reports `BUG: soft lockup` when the last one ran over `2 *
+watchdog_thresh` s ago (per-CPU atomics only). `migration_cpu_stop` takes the task's pi_lock → this CPU's rq
 lock: a task still queued here moves; one asleep gets `wake_cpu` (Linux
 p->wake_cpu, under the pi_lock), where its next wakeup starts.
 `set_cpus_allowed_ptr` (sched_setaffinity; Linux affine_move_task)

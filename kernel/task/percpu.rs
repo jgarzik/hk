@@ -3039,6 +3039,7 @@ pub fn scheduler_tick() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     }
     crate::timer::run_local();
+    crate::watchdog::tick();
     current().set_tif(crate::task::tif::NEED_RESCHED);
 }
 

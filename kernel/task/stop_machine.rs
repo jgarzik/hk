@@ -8,9 +8,10 @@
 //! ahead. The scheduler uses it to move a task off a CPU it may no
 //! longer run on, or to a better one at exec (`migration_cpu_stop`).
 //!
-//! Locking: a CPU's stopper takes one work item at a time; callers
-//! queue under its sleeping `lock` and wait for completion with it
-//! held, so the slot (`work`, an IrqSpinlock leaf) never holds two.
+//! Locking: a CPU's stopper takes one work item at a time; waiting
+//! callers queue under its sleeping `lock` and wait for completion with
+//! it held; `stop_one_cpu_nowait` (any context, the soft lockup
+//! detector) only fills an empty slot (`work`, an IrqSpinlock leaf).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,6 +26,7 @@ use crate::waitqueue::WaitQueue;
 struct Work {
     func: fn(usize),
     arg: usize,
+    /// Null for `stop_one_cpu_nowait`
     done: *const Completion,
 }
 
@@ -63,13 +65,47 @@ pub fn stop_one_cpu(cpu: u32, func: fn(usize), arg: usize) -> bool {
     }
     let _g = st.lock.lock();
     let done = Completion::new();
-    *st.work.lock() = Some(Work {
-        func,
-        arg,
-        done: &done,
-    });
+    // A nowait call may hold the slot: wait for the stopper to take it
+    loop {
+        let mut w = st.work.lock();
+        if w.is_none() {
+            *w = Some(Work {
+                func,
+                arg,
+                done: &done,
+            });
+            break;
+        }
+        drop(w);
+        crate::task::percpu::yield_now();
+    }
     st.wq.wake_all();
     done.wait();
+    true
+}
+
+/// Queue `func(arg)` on `cpu`'s stopper without waiting (Linux
+/// stop_one_cpu_nowait); any context. False if it has no stopper or
+/// already has a call queued.
+pub fn stop_one_cpu_nowait(cpu: u32, func: fn(usize), arg: usize) -> bool {
+    let Some(st) = STOPPERS.try_get(cpu) else {
+        return false;
+    };
+    if !st.enabled.load(Ordering::Acquire) {
+        return false;
+    }
+    {
+        let mut w = st.work.lock();
+        if w.is_some() {
+            return false;
+        }
+        *w = Some(Work {
+            func,
+            arg,
+            done: core::ptr::null(),
+        });
+    }
+    st.wq.wake_all();
     true
 }
 
@@ -84,7 +120,9 @@ fn stopper_thread(cpu: usize) {
         };
         (w.func)(w.arg);
         // SAFETY: the caller waits for this before its stack goes
-        unsafe { &*w.done }.complete();
+        if let Some(done) = unsafe { w.done.as_ref() } {
+            done.complete();
+        }
     }
 }
 

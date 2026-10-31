@@ -387,8 +387,10 @@ never stalled, so the cause is in hk, made likely by vCPU preemption.
 HARD timers and the tick stay on time and no SOFT callback ran long, so
 some kernel path on CPU 0 does not reach a scheduling point: suspected
 spinning on another vCPU (a lock holder or an IPI target descheduled by
-the host). Next: log long non-scheduling stretches per CPU (a tick-time
-check of the current task's time in kernel mode) and the IPI/csd waits.
+the host). Seen again once with user tasks on all CPUs (ALARM: SIGALRM
+not within 2 s). Next: boot with `watchdog_thresh=1` (the soft lockup
+detector reports a CPU that does not schedule for 2 s, with the tid it
+runs) and watch for `csd:` reports of cross-CPU calls waited on over 1 s.
 
 ## Unconfirmed: Arc<T> field corruption in the USB mass-storage driver
 

@@ -46,6 +46,7 @@ pub mod timer;
 pub mod timerfd;
 pub mod uaccess;
 pub mod waitqueue;
+pub mod watchdog;
 pub mod workqueue;
 
 // Device subsystems

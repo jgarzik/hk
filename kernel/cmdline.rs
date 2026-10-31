@@ -72,12 +72,17 @@ static CMDLINE_CONSOLE: Mutex<CmdlineConsole> = Mutex::new(CmdlineConsole::new()
 /// Supported options:
 /// - `usb_trace`: Enable USB protocol tracing for debugging
 /// - `console=<device>[,<baud>]`: Set kernel console device
+/// - `watchdog_thresh=<seconds>`: soft lockup threshold (`watchdog`)
 pub fn parse_cmdline(cmdline: &str) {
     for option in cmdline.split_whitespace() {
         if option == "usb_trace" {
             usb::enable_usb_trace();
         } else if let Some(console_arg) = option.strip_prefix("console=") {
             parse_console_option(console_arg);
+        } else if let Some(s) = option.strip_prefix("watchdog_thresh=")
+            && let Ok(s) = s.parse()
+        {
+            crate::watchdog::set_thresh(s);
         }
         // Unknown options are ignored
     }
