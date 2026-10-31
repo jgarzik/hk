@@ -354,16 +354,17 @@ fn trunc_reader(s: i32, trunc: bool) -> i64 {
         if trunc {
             continue;
         }
+        // Stream order: every word later than the last one this reader
+        // saw. Not contiguous within one recv: MSG_WAITALL waits with
+        // the socket unlocked (Linux sk_wait_data), so another reader
+        // may take the bytes in between (the writer's 4096-byte sends
+        // keep that word-aligned)
         for w in b[..n as usize].chunks(4) {
             let v = u32::from_be_bytes([w[0], w[1], w[2], w[3]]) as i64;
             if v <= last {
                 return -1;
             }
             last = v;
-        }
-        let first = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as i64;
-        if last - first + 1 != n as i64 / 4 {
-            return -1;
         }
     }
 }

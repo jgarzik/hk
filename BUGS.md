@@ -621,13 +621,7 @@ Found during T0 (2026-10-19). Tag = when to fix.
    `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64, 1 of 10
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was
-   pending); `NET_STRESS_TRUNC_RACE:FAIL reader status got 256` on the
-   x86 Linux reference (a reader hit its 2 s receive timeout under host
-   load), and on hk now and then since user tasks run on all CPUs. The
-   test expects each 256-byte MSG_WAITALL recv of its three concurrent
-   readers to be contiguous, which Linux does not promise (tcp_recvmsg
-   drops the socket lock while it waits, so another reader takes the
-   bytes in between; a timeout returns a partial count): fix the test.
+   pending).
 12. **arm64 overflow check misses a frame over 32 KB** (next batch):
    vectors.S KERNEL_ENTRY tests bit 15 of SP only, so an SP that jumped
    more than 32 KB below a stack base (one huge frame) lands where the
