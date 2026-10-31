@@ -85,6 +85,7 @@ pub fn set_active(cpu: u32) {
     // CPU changed its page tables before reading the mask
     fence(Ordering::SeqCst);
     crate::mm::tlb::cpu_active();
+    crate::task::percpu::sched_cpu_update(cpu);
 }
 
 /// The CPUs that take call-function IPIs

@@ -269,20 +269,21 @@ impl CpuRunQueue {
     /// Put `p` (runnable, neither running nor queued) on its class's
     /// list (Linux enqueue_task)
     fn enqueue(&mut self, p: &KernelTask) {
+        self.enqueue_at(p, false);
+    }
+
+    /// `enqueue` at the head of its level (`head`) or the tail
+    fn enqueue_at(&mut self, p: &KernelTask, head: bool) {
         // SAFETY: the rq owns a reference to `p`; it is on no list
-        unsafe {
-            self.queue()
-                .push(p, p.se.class(), p.se.rt_priority(), false)
-        };
+        unsafe { self.queue().push(p, p.se.class(), p.se.rt_priority(), head) };
     }
 
     /// Put the task switched away from back: an rt task preempted
     /// before its slice ran out keeps the head of its level (Linux
     /// put_prev_task_rt), anything else goes to the tail
     fn enqueue_prev(&mut self, p: &KernelTask, preempted: bool) {
-        let head = preempted && p.se.class() == Class::Rt && !p.se.take_requeue_tail();
-        // SAFETY: as for `enqueue`
-        unsafe { self.queue().push(p, p.se.class(), p.se.rt_priority(), head) };
+        let expired = p.se.take_requeue_tail();
+        self.enqueue_at(p, preempted && p.se.class() == Class::Rt && !expired);
     }
 
     /// Take queued `p` off its list (Linux dequeue_task)
@@ -1298,6 +1299,7 @@ fn create_idle_task(cpu_id: u32) -> Result<(), &'static str> {
     get_percpu_sched(cpu_id)
         .initialized
         .store(true, Ordering::Release);
+    sched_cpu_update(cpu_id);
     printkln!("IDLE_TASK_CREATED: cpu={} tid=0", cpu_id);
     Ok(())
 }
@@ -2601,13 +2603,17 @@ fn make_current(t: &KernelTask) -> (u64, *const crate::mm::Mm, (u64, u64)) {
         .as_ref()
         .map_or(core::ptr::null(), |m| Arc::as_ptr(m.arc()));
     if let Some(s) = current_percpu_sched() {
-        // SAFETY: the task's address space, alive while it runs
-        let st = unsafe { mm.as_ref() }.map_or(0, |m| m.membarrier_state().load(Ordering::Relaxed));
-        s.membarrier_state.store(st, Ordering::Relaxed);
         // Full barrier: a membarrier caller that misses this CPU's new
         // address space is ordered before the task's return to user
         // mode (Linux: the barriers around rq->curr's update)
         s.curr_mm.store(mm as usize, Ordering::SeqCst);
+        // Then its registrations (Linux membarrier_switch_mm, after
+        // rq->curr): a registration either sees this CPU in the mm and
+        // updates its cache by IPI, or is seen here
+        core::sync::atomic::fence(Ordering::SeqCst);
+        // SAFETY: the task's address space, alive while it runs
+        let st = unsafe { mm.as_ref() }.map_or(0, |m| m.membarrier_state().load(Ordering::Relaxed));
+        s.membarrier_state.store(st, Ordering::Relaxed);
         s.curr_rank.store(rank(t), Ordering::Relaxed);
     }
     CurrentArch::set_current_task_ptr(t as *const KernelTask as usize);
@@ -2748,6 +2754,8 @@ pub fn schedule() {
     }
     me.se.set_on_rq(false);
     rq.add_nr(-1);
+    // A slice that ran out is not carried past the sleep
+    me.se.take_requeue_tail();
     let st = me.se.state();
     if st == SleepState::Uninterruptible as u8 || st == SleepState::Killable as u8 {
         me.se.contrib_load.store(true, Ordering::Relaxed);
@@ -2849,15 +2857,33 @@ enum Placement {
     Fork,
 }
 
-/// CPUs that run a scheduler and take IPIs
+/// CPUs that run a scheduler and take IPIs (Linux cpu_active_mask):
+/// kept as each becomes active and gets its scheduler, read by every
+/// wakeup and balancing pass
+static SCHED_CPUS: crate::cpumask::CpuMask = crate::cpumask::CpuMask::new();
+
 fn sched_cpus() -> crate::cpumask::CpuSet {
-    let mut s = crate::smp::active_cpus();
-    for cpu in crate::smp::active_cpus().iter() {
-        if !cpu_has_scheduler(cpu) {
-            s.clear(cpu);
-        }
-    }
+    let s = SCHED_CPUS.snapshot();
+    // Pairs with `sched_cpu_update`: a CPU found here has its run queue
+    core::sync::atomic::fence(Ordering::Acquire);
     s
+}
+
+/// `cpu` became active or got its scheduler: in `sched_cpus` once both
+pub fn sched_cpu_update(cpu: u32) {
+    if crate::smp::active_cpus().test(cpu) && cpu_has_scheduler(cpu) {
+        core::sync::atomic::fence(Ordering::Release);
+        SCHED_CPUS.set(cpu);
+    }
+}
+
+/// Linux p->prio: 99 - rt_priority for an rt task, else static_prio
+/// (lower is more important)
+fn prio(se: &sched::SchedEntity) -> i32 {
+    match se.class() {
+        Class::Rt | Class::Stop => 99 - se.rt_priority() as i32,
+        _ => se.static_prio() as i32,
+    }
 }
 
 /// How important `p` is to keep running, for rt placement (Linux
@@ -3075,7 +3101,9 @@ fn sched_balance_rq(this: u32) {
     let (mut busiest, mut max) = (this, 0);
     for c in cpus.iter() {
         let n = balance_load(c);
-        if c != this && n > max {
+        // Something queued to pull (Linux: busiest->nr_running > 1)
+        let queued = PERCPU_SCHEDS.get(c).nr_running.load(Ordering::Relaxed) > 1;
+        if c != this && queued && n > max {
             (busiest, max) = (c, n);
         }
     }
@@ -3092,15 +3120,28 @@ fn sched_balance_rq(this: u32) {
     let want = (((sn - dn) / 2) as usize).clamp(1, NR_MIGRATE);
     // Queued rt tasks, then fair ones: the running one and idle are on
     // no list
-    let n = src.queue().take(&mut moved[..want], |t| {
-        // SAFETY: on this run queue's list, kept alive by the scheduler
-        unsafe { &*t }.cpus_mask.test(this)
-    });
+    let mut n = 0;
+    while n < want {
+        // Its lag on the old queue, measured before it leaves (Linux
+        // update_entity_lag at dequeue; migrate_task_rq_fair keeps it)
+        let avg = src.fair_avg(true);
+        let one = src.queue().take(&mut moved[n..n + 1], |t| {
+            // SAFETY: on this run queue's list, kept alive by the scheduler
+            unsafe { &*t }.cpus_mask.test(this)
+        });
+        if one == 0 {
+            break;
+        }
+        // SAFETY: as above
+        let p = unsafe { &*moved[n] };
+        if p.se.class() == Class::Fair {
+            crate::task::fair::save_lag(&p.se, avg);
+        }
+        n += 1;
+    }
     for &t in &moved[..n] {
         // SAFETY: as above
         let p = unsafe { &*t };
-        // Its lag on the old queue (Linux migrate_task_rq_fair keeps it)
-        src.save_lag(p);
         src.add_nr(-1);
         set_task_cpu(p, this);
         dst.place_fair(p, false);
@@ -3809,6 +3850,12 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
     if matches!(task.se.class(), Class::Stop | Class::Idle) {
         return Err(22);
     }
+    // Nothing changes (Linux __sched_setscheduler: same policy and
+    // priority only updates reset-on-fork)
+    if base_policy == task.se.policy() && rt_priority == task.se.rt_priority() as i32 {
+        task.se.set_reset_on_fork(reset_on_fork);
+        return Ok(());
+    }
     let static_prio = task.se.static_prio();
     change_class(&task, |se| {
         se.set_params(
@@ -3884,18 +3931,27 @@ fn change_class(p: &KernelTask, f: impl FnOnce(&sched::SchedEntity)) {
     let pp = p as *const KernelTask;
     let running = core::ptr::eq(rq.curr, pp);
     let queued = p.se.on_rq() && !running && !core::ptr::eq(rq.idle, pp);
-    if queued {
-        rq.dequeue(p);
-    }
-    let old = p.se.class();
+    let (old, old_rt, old_prio) = (p.se.class(), p.se.rt_priority(), prio(&p.se));
     f(&p.se);
+    let new_prio = prio(&p.se);
+    // An rt task whose priority stays keeps its place (sched(7); Linux
+    // set_user_nice leaves an rt task's queue position alone)
+    if old == Class::Rt && p.se.class() == Class::Rt && old_prio == new_prio {
+        return;
+    }
+    if queued {
+        // SAFETY: queued on the list of its old class and priority
+        unsafe { rq.queue().remove(p, old, old_rt) };
+    }
     // Into the fair class: placed at the average (Linux switched_to_fair)
     if old != Class::Fair && p.se.class() == Class::Fair {
         p.se.vlag.store(0, Ordering::Relaxed);
         rq.place_fair(p, false);
     }
     if queued {
-        rq.enqueue(p);
+        // Lowered: the head of its new level, else the tail (Linux
+        // __sched_setscheduler ENQUEUE_HEAD)
+        rq.enqueue_at(p, old_prio < new_prio);
         rq.check_preempt(p);
     } else if running {
         // Its CPU's rank follows now: it may run on without a switch

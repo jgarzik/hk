@@ -313,19 +313,26 @@ fn check_setscheduler(
     }
     let reset = policy & SCHED_RESET_ON_FORK != 0;
     let policy = policy & !SCHED_RESET_ON_FORK;
-    let cred = super::percpu::TASKLIST.read().get(tid).map(|t| t.cred());
-    let Some(c) = cred else {
+    // One snapshot of the task (Linux reads p's fields under its locks)
+    let snap = super::percpu::TASKLIST.read().get(tid).map(|t| {
+        let se = &t.task.se;
+        (
+            t.cred(),
+            se.policy(),
+            se.reset_on_fork(),
+            se.rt_priority() as i32,
+            se.nice(),
+        )
+    });
+    let Some((c, cur, cur_reset, cur_prio, nice)) = snap else {
         return Err(KernelError::NoProcess);
     };
     if c.uid != euid && c.euid != euid {
         return Err(KernelError::NotPermitted);
     }
-    let cur_full = super::percpu::lookup_task_policy(tid).unwrap_or(0);
-    if cur_full & SCHED_RESET_ON_FORK != 0 && !reset {
+    if cur_reset && !reset {
         return Err(KernelError::NotPermitted);
     }
-    let cur = cur_full & !SCHED_RESET_ON_FORK;
-    let cur_prio = super::percpu::lookup_task_rt_priority(tid).unwrap_or(0);
     let limit =
         |r| crate::rlimit::get_task_rlimit(tid, r).map_or(0, |l: crate::rlimit::RLimit| l.rlim_cur);
     if is_rt_policy(policy) {
@@ -338,7 +345,6 @@ fn check_setscheduler(
         }
     }
     if cur == SCHED_IDLE && policy != SCHED_IDLE {
-        let nice = super::percpu::lookup_task_nice(tid).unwrap_or(0);
         if (20 - nice) as u64 > limit(crate::rlimit::RLIMIT_NICE) {
             return Err(KernelError::NotPermitted);
         }

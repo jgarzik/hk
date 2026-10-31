@@ -441,6 +441,7 @@ takes the lock of the run queue it queues on, whichever CPU that is.
 | Variable | Type | Purpose |
 |----------|------|---------|
 | `PERCPU_SCHEDS` | `PerCpu<PerCpuScheduler>` | Per-CPU scheduler array |
+| `SCHED_CPUS` | `CpuMask` | CPUs that are active and run a scheduler (Linux cpu_active_mask): set once per CPU at bring-up (`sched_cpu_update`, Release fence), read lock-free by every wakeup placement and balancing pass (Acquire fence) |
 | `TASKLIST` | `RwLock<GlobalTaskTable>` | Every task (Linux tasklist_lock + task list) |
 | `TICK_COUNT` | `AtomicU64` | Global tick counter (jiffies, TICK_MS = 10 ms); advanced only by CPU 0's tick; every CPU's tick runs its own timers (`timer::run_local`; Timers, 3.3) |
 
@@ -449,11 +450,15 @@ takes the lock of the run queue it queues on, whichever CPU that is.
 Each `PerCpuScheduler` contains:
 ```rust
 pub struct PerCpuScheduler {
-    pub lock: IrqSpinlock<CpuRunQueue>,  // curr, idle, prev, 256 priority lists, dead
+    pub lock: IrqSpinlock<CpuRunQueue>,  // curr, idle, prev, class queues, dead
     pub initialized: AtomicBool,          // Init flag
     pub nr_switches: AtomicU64,           // context switches (QSBR hook)
     pub curr_mm: AtomicUsize,             // running task's Mm address (membarrier)
     pub membarrier_state: AtomicU32,      // its membarrier registrations
+    pub curr_rank: AtomicU32,             // running task's importance (rt placement)
+    pub ticks: AtomicU64,                 // this CPU's ticks (balancing interval)
+    pub nr_running: AtomicU32,            // queued + running tasks
+    pub nr_uninterruptible: AtomicI64,    // loadavg's D-state count
 }
 ```
 
@@ -3034,7 +3039,7 @@ else is taken under it) unless an order is given. "spin" is the
 | `File.f_lock` | fs/file.rs | spin Mutex | file status flags (Linux f_lock) |
 | `SuperBlock.{root, private}`, `DentryCache.root` | fs/superblock.rs, fs/dentry.rs | spin RwLock | superblock root and private data, the dcache root |
 | `RamfsInodeData.xattrs`, `RamfsSbData.sb` | fs/ramfs.rs | spin | ramfs xattrs and superblock back-pointer (under VFS locks) |
-| membarrier `GLOBAL_MUTEX` → `IPI_MUTEX` | membarrier.rs | sleeping (`sync::Mutex`; `IPI_MUTEX` is Linux membarrier_ipi_mutex) | `IPI_MUTEX` serializes the membarrier commands that interrupt other CPUs, so callers cannot multiply the IPIs; held only across `smp_call_function_many` (waited); nothing is taken under it. `GLOBAL_MUTEX` (killable) paces MEMBARRIER_CMD_GLOBAL to one call per tick: held across its IPIs and its one-tick sleep, so GLOBAL callers never delay the expedited ones. The targets are chosen from each CPU's `PerCpuScheduler.curr_mm` / `membarrier_state` (atomics written at every switch in `make_current`, SeqCst for `curr_mm`; Linux rq->curr->mm and rq->membarrier_state), compared, never dereferenced |
+| membarrier `GLOBAL_MUTEX` → `IPI_MUTEX` | membarrier.rs | sleeping (`sync::Mutex`; `IPI_MUTEX` is Linux membarrier_ipi_mutex) | `IPI_MUTEX` serializes the membarrier commands that interrupt other CPUs, so callers cannot multiply the IPIs; held only across `smp_call_function_many` (waited); nothing is taken under it. `GLOBAL_MUTEX` (killable) paces MEMBARRIER_CMD_GLOBAL to one call per tick: held across its IPIs and its one-tick sleep, so GLOBAL callers never delay the expedited ones. The targets are chosen from each CPU's `PerCpuScheduler.curr_mm` / `membarrier_state` (atomics written at every switch in `make_current`: `curr_mm` SeqCst, then a full fence, then the registrations read, so a registration either sees the CPU in its mm and refreshes it by IPI or is seen by the switch; Linux rq->curr->mm and rq->membarrier_state), compared, never dereferenced |
 | `Pipe.inner` | pipe.rs | sleeping (`sync::Mutex`, Linux pipe->mutex) | the pipe's buffer ring; held across page allocation, never under a spin lock; two pipes (splice, tee) in address order (Linux pipe_double_lock); -> frame allocator. `Pipe.head`/`tail` (atomics) are published as the guard unlocks and read locklessly by wait conditions and poll (poll runs under `Eventpoll.inner`, an IrqSpinlock); wakeups follow the unlock |
 | `NTtyLdisc.data` | tty/n_tty.rs | spin Mutex | line discipline buffer (input is polled, not IRQ-fed) |
 | `VgaCon.state` | arch/x86_64/vgacon.rs | IrqSpinlock | VGA text console state, under `CONSOLE_REGISTRY` (3.9) |

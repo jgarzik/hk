@@ -207,13 +207,13 @@ impl SchedEntity {
     }
 
     /// Set the scheduling class and parameters (the task's pi_lock and
-    /// rq lock held, and off the run queue lists, or not yet started)
+    /// rq lock held, and off the run queue lists, or not yet started).
+    /// A SCHED_RR slice goes on (Linux leaves p->rt.time_slice).
     pub fn set_params(&self, class: Class, policy: i32, static_prio: u8, rt_priority: u8) {
         self.class.store(class as u8, Ordering::Relaxed);
         self.policy.store(policy as u8, Ordering::Relaxed);
         self.static_prio.store(static_prio, Ordering::Relaxed);
         self.rt_priority.store(rt_priority, Ordering::Relaxed);
-        self.rr_left.store(RR_TICKS, Ordering::Relaxed);
     }
 
     pub fn set_reset_on_fork(&self, v: bool) {
