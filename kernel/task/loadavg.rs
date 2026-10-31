@@ -50,6 +50,18 @@ pub fn avenrun() -> [u64; 3] {
     [0, 1, 2].map(|i| AVENRUN[i].load(Ordering::Relaxed))
 }
 
+/// The last pid handed out in the reader's pid namespace (Linux
+/// idr_get_cursor(&task_active_pid_ns(current)->idr) - 1): a reader in
+/// a child namespace learns nothing of its parent's
+fn last_pid() -> u32 {
+    let tid = super::percpu::current_tid();
+    let table = super::percpu::TASKLIST.read();
+    table
+        .get(tid)
+        .and_then(|t| t.thread_pid.as_ref().map(|p| p.ns().map.last()))
+        .unwrap_or_else(|| crate::ns::INIT_PID_NS.map.last())
+}
+
 /// /proc/loadavg (Linux loadavg_proc_show): the three loads with two
 /// decimals, runnable/total tasks, the last pid handed out
 pub fn proc_loadavg() -> alloc::vec::Vec<u8> {
@@ -65,7 +77,7 @@ pub fn proc_loadavg() -> alloc::vec::Vec<u8> {
         c.1,
         super::percpu::nr_running_all(),
         super::percpu::task_count(),
-        crate::ns::INIT_PID_NS.map.last()
+        last_pid()
     )
     .into_bytes()
 }
