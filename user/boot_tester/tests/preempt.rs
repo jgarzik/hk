@@ -9,6 +9,8 @@
 //! - TIMESLICE: two children pinned to one CPU spin, counting; both make
 //!   progress (within 1:10 of each other over 300ms), and the parent's
 //!   nanosleep(20ms) meanwhile returns within 1s.
+//! - SMP_SPREAD: with two or more CPUs, spinning children forked one
+//!   after the other run on at least two CPUs at once.
 //! - ASYNC_SIG_REGS: every general register (rcx/r11 on x86, x0-x30 on
 //!   arm64) holds its value across a SIGUSR1 handler that interrupts a
 //!   spin loop; on x86 the loop runs with DF set (`std`), which the
@@ -18,8 +20,9 @@
 use super::helpers::{print, print_num, println};
 use hk_syscall::{
     CLOCK_MONOTONIC, MAP_ANONYMOUS, MAP_SHARED, PROT_READ, PROT_WRITE, SA_RESTORER, SIG_DFL,
-    SIGKILL, SIGUSR1, Timespec, sys_clock_gettime, sys_exit, sys_fork, sys_kill, sys_mmap,
-    sys_munmap, sys_nanosleep, sys_rt_sigaction, sys_sched_setaffinity, sys_wait4,
+    SIGKILL, SIGUSR1, Timespec, sys_clock_gettime, sys_exit, sys_fork, sys_getcpu, sys_kill,
+    sys_mmap, sys_munmap, sys_nanosleep, sys_rt_sigaction, sys_sched_getaffinity,
+    sys_sched_setaffinity, sys_wait4,
 };
 
 const WNOHANG: i32 = 1;
@@ -28,7 +31,74 @@ const WNOHANG: i32 = 1;
 pub fn run_tests() {
     test_sigkill_spin();
     test_timeslice();
+    test_smp_spread();
     test_async_sig_regs();
+}
+
+/// CPUs the caller may run on (sched_getaffinity, up to 1024 CPUs)
+pub fn ncpus_allowed() -> u32 {
+    let mut mask = [0u64; 16];
+    let n = sys_sched_getaffinity(0, core::mem::size_of_val(&mask), mask.as_mut_ptr());
+    if n <= 0 {
+        return 1;
+    }
+    mask.iter().map(|w| w.count_ones()).sum()
+}
+
+/// SMP_SPREAD: spinners forked one after another run on distinct CPUs
+/// (fork places a child on the least loaded CPU, Linux
+/// sched_balance_find_dst_cpu); each publishes the CPU it runs on
+fn test_smp_spread() {
+    let ncpu = ncpus_allowed();
+    if ncpu < 2 {
+        println(b"SMP_SPREAD:SKIP (one CPU)");
+        return;
+    }
+    let n = ncpu.min(4) as usize;
+    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if page < 0 {
+        print(b"SMP_SPREAD:FAIL mmap ");
+        print_num(page);
+        println(b"");
+        return;
+    }
+    let slots = page as *mut u32;
+    let mut pids = [0i64; 4];
+    for (i, pid) in pids.iter_mut().enumerate().take(n) {
+        // SAFETY: slot i of the shared page; u32::MAX = not yet running
+        unsafe { slots.add(i).write_volatile(u32::MAX) };
+        *pid = sys_fork();
+        if *pid == 0 {
+            loop {
+                let mut cpu = 0u32;
+                sys_getcpu(&mut cpu, core::ptr::null_mut());
+                // SAFETY: as above
+                unsafe { slots.add(i).write_volatile(cpu) };
+            }
+        }
+    }
+    sleep_ms(300);
+    let mut seen = 0u64;
+    for i in 0..n {
+        // SAFETY: as above
+        let cpu = unsafe { slots.add(i).read_volatile() };
+        if cpu < 64 {
+            seen |= 1 << cpu;
+        }
+    }
+    for pid in pids.iter().take(n) {
+        reap(*pid);
+    }
+    sys_munmap(page as u64, 4096);
+    if seen.count_ones() >= 2 {
+        println(b"SMP_SPREAD:OK");
+    } else {
+        print(b"SMP_SPREAD:FAIL children on cpus mask ");
+        print_num(seen as i64);
+        print(b" of ");
+        print_num(n as i64);
+        println(b" children");
+    }
 }
 
 /// CLOCK_MONOTONIC in ms

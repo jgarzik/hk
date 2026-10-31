@@ -278,6 +278,7 @@ impl CpuRunQueue {
         p.se.set_state(RUNNING);
         if !p.se.on_rq() {
             p.se.set_on_rq(true);
+            self.add_nr(1);
             self.enqueue(p);
             self.check_preempt(p);
         }
@@ -293,6 +294,15 @@ impl CpuRunQueue {
         if self.curr_is_idle() || p.se.prio() > curr.se.prio() {
             self.resched_curr();
         }
+    }
+
+    /// A task joined (+1) or left (-1) this run queue (Linux
+    /// add_nr_running / sub_nr_running)
+    fn add_nr(&self, d: i32) {
+        PERCPU_SCHEDS
+            .get(self.cpu)
+            .nr_running
+            .fetch_add(d as u32, Ordering::Relaxed);
     }
 
     /// Make the running task switch at its next scheduling point: flag
@@ -344,6 +354,10 @@ pub struct PerCpuScheduler {
     /// That address space's membarrier registrations, cached at each
     /// switch (Linux rq->membarrier_state)
     pub membarrier_state: AtomicU32,
+    /// Tasks on this run queue, queued or running, the idle task aside
+    /// (Linux rq->nr_running): changed under the rq lock, read without
+    /// it to place tasks
+    pub nr_running: AtomicU32,
 }
 
 impl PerCpuScheduler {
@@ -351,6 +365,7 @@ impl PerCpuScheduler {
     pub const fn new() -> Self {
         Self {
             lock: IrqSpinlock::new(CpuRunQueue::uninit()),
+            nr_running: AtomicU32::new(0),
             initialized: AtomicBool::new(false),
             nr_switches: AtomicU64::new(0),
             curr_mm: AtomicUsize::new(0),
@@ -1044,7 +1059,6 @@ fn create_kernel_task(
         },
         rt_priority: 0,
         reset_on_fork: false,
-        cpus_allowed: crate::cpumask::CpuSet::one(cpu_id),
         page_table: ArchPageTable::kernel_identity(),
         // TLS fields (not used for idle task)
         clear_child_tid: 0,
@@ -1088,6 +1102,7 @@ fn create_kernel_task(
         TaskKind::KernelThread,
         stack_top,
         cpu_id,
+        &crate::cpumask::CpuSet::one(cpu_id),
         alloc::sync::Arc::new(Cred::ROOT),
         None,
         crate::task::TaskAlloc::named(name.as_bytes()),
@@ -1130,11 +1145,12 @@ fn attach_asleep(p: &TaskRef) {
 /// on the CPU `select_task_rq` picks (Linux wake_up_new_task)
 fn wake_up_new_task(p: &TaskRef) {
     let _pi = p.pi_lock.lock();
-    set_task_cpu(p, select_task_rq(p));
+    set_task_cpu(p, select_task_rq(p, Placement::Fork));
     let mut rq = get_percpu_sched(p.cpu()).lock.lock();
     let _ = Arc::into_raw(p.clone());
     p.se.set_state(RUNNING);
     p.se.set_on_rq(true);
+    rq.add_nr(1);
     rq.enqueue(p);
     rq.check_preempt(p);
 }
@@ -1248,7 +1264,6 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         policy: crate::task::SCHED_NORMAL,
         rt_priority: 0,
         reset_on_fork: false,
-        cpus_allowed: crate::cpumask::CpuSet::all(),
         page_table: config.page_table,
         // TLS fields (initialized to 0, set by syscalls)
         clear_child_tid: 0,
@@ -1291,6 +1306,7 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
         TaskKind::UserProcess,
         config.kstack_top,
         cpu_id,
+        &crate::cpumask::CpuSet::all(),
         alloc::sync::Arc::new(Cred::ROOT),
         Some(mm),
         // comm after the init binary, /bin/init (Linux names init after
@@ -1308,8 +1324,16 @@ pub fn create_user_task(config: UserTaskConfig) -> Result<Tid, &'static str> {
     task.se.set_prio(config.priority);
     task.se.set_state(RUNNING);
     task.se.set_on_rq(true);
+    task.se.set_on_cpu(true);
     {
-        let mut rq = get_percpu_sched(cpu_id).lock.lock();
+        let sched = get_percpu_sched(cpu_id);
+        // SAFETY: the task is not running yet; only its creator sees it
+        let mm = unsafe { task.mm() }
+            .as_ref()
+            .map_or(0, |m| Arc::as_ptr(m.arc()) as usize);
+        sched.curr_mm.store(mm, Ordering::SeqCst);
+        let mut rq = sched.lock.lock();
+        rq.add_nr(1);
         // The boot context becomes this task (Linux: init_task's
         // kernel_init thread execs /sbin/init); the run queue takes
         // its reference
@@ -1782,7 +1806,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
             parent.policy,
             parent.rt_priority,
             parent.reset_on_fork,
-            parent.cpus_allowed,
+            parent.task.cpus_mask.snapshot(),
             parent.page_table.root_table_phys(),
             parent.cred_arc(),
             parent.prctl.clone(),
@@ -1903,7 +1927,6 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         policy: child_policy,
         rt_priority: child_rt_priority,
         reset_on_fork: false, // Never inherited - child must set explicitly
-        cpus_allowed: parent_cpus_allowed, // Inherit CPU affinity from parent
         page_table: child_pt,
         // TLS fields - will be set based on clone flags below
         clear_child_tid: 0,
@@ -1981,6 +2004,7 @@ pub fn do_clone<FA: FrameAlloc<PhysAddr = u64>>(
         TaskKind::UserProcess,
         kstack_top,
         cpu_id,
+        &parent_cpus_allowed,
         crate::task::copy_creds(config.flags, &parent_cred),
         child_mm,
         // The name and memory policy are inherited
@@ -2397,6 +2421,7 @@ pub fn exit_current(status: Option<i32>) -> ! {
     // Off the run queue for good; its stack, mm and the run queue's
     // reference go once this CPU runs something else
     me.se.set_on_rq(false);
+    rq.add_nr(-1);
     let stack = if me.se.owns_stack() {
         (me.kstack_top - KERNEL_STACK_SIZE as u64, KERNEL_STACK_SIZE)
     } else {
@@ -2586,6 +2611,7 @@ pub fn schedule() {
     }
     // Leave the run queue (Linux deactivate_task)
     me.se.set_on_rq(false);
+    rq.add_nr(-1);
     me.nvcsw.fetch_add(1, Ordering::Relaxed);
     let next = rq.pick_next();
     context_switch_locked(sched, rq, &me, next);
@@ -2650,9 +2676,80 @@ fn set_task_cpu(p: &KernelTask, cpu: u32) {
     p.cpu.store(cpu, Ordering::Release);
 }
 
-/// The CPU to run `p` on (Linux select_task_rq): its own, for now
-fn select_task_rq(p: &KernelTask) -> u32 {
-    p.cpu()
+/// Why a CPU is being chosen (Linux WF_TTWU / WF_FORK)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    Wake,
+    Fork,
+}
+
+/// CPUs that run a scheduler and take IPIs
+fn sched_cpus() -> crate::cpumask::CpuSet {
+    let mut s = crate::smp::active_cpus();
+    for cpu in crate::smp::active_cpus().iter() {
+        if !cpu_has_scheduler(cpu) {
+            s.clear(cpu);
+        }
+    }
+    s
+}
+
+/// CPU `cpu` has nothing to run but its idle task (Linux idle_cpu)
+fn idle_cpu(cpu: u32) -> bool {
+    PERCPU_SCHEDS.get(cpu).nr_running.load(Ordering::Relaxed) == 0
+}
+
+/// The CPU to run `p` on (Linux select_task_rq): one it may run on, as
+/// idle as possible. All CPUs form one domain (one LLC), so Linux's
+/// domain walk reduces to a scan; a task that may run nowhere active
+/// stays where it is.
+fn select_task_rq(p: &KernelTask, why: Placement) -> u32 {
+    let prev = p.cpu();
+    let allowed = p.cpus_mask.snapshot().and(&sched_cpus());
+    if allowed.is_empty() {
+        return prev;
+    }
+    match why {
+        Placement::Fork => find_idlest_cpu(&allowed, crate::cpu::this_id()),
+        Placement::Wake => select_idle_sibling(&allowed, prev),
+    }
+}
+
+/// The allowed CPU with the fewest tasks, the first found from `from`
+/// on (Linux sched_balance_find_dst_cpu, without groups or idle states)
+fn find_idlest_cpu(allowed: &crate::cpumask::CpuSet, from: u32) -> u32 {
+    let n = crate::cpu::nr_cpu_ids();
+    let mut best = (u32::MAX, from);
+    for i in 0..n {
+        let cpu = (from + i) % n;
+        if allowed.test(cpu) {
+            let nr = PERCPU_SCHEDS.get(cpu).nr_running.load(Ordering::Relaxed);
+            if nr < best.0 {
+                best = (nr, cpu);
+            }
+        }
+    }
+    best.1
+}
+
+/// A waking task's CPU (Linux select_idle_sibling, wake_affine left
+/// out): its previous one if idle (warm cache), else an idle one, else
+/// its previous one, else the least loaded
+fn select_idle_sibling(allowed: &crate::cpumask::CpuSet, prev: u32) -> u32 {
+    if allowed.test(prev) && idle_cpu(prev) {
+        return prev;
+    }
+    let n = crate::cpu::nr_cpu_ids();
+    for i in 1..n {
+        let cpu = (prev + i) % n;
+        if allowed.test(cpu) && idle_cpu(cpu) {
+            return cpu;
+        }
+    }
+    if allowed.test(prev) {
+        return prev;
+    }
+    find_idlest_cpu(allowed, prev)
 }
 
 /// Wake `p` if it sleeps in a state `mode` ends (Linux try_to_wake_up)
@@ -2697,7 +2794,7 @@ pub fn try_to_wake_up(p: &KernelTask, mode: WakeMode) -> bool {
     while p.se.on_cpu() {
         core::hint::spin_loop();
     }
-    let cpu = select_task_rq(p);
+    let cpu = select_task_rq(p, Placement::Wake);
     set_task_cpu(p, cpu);
     get_percpu_sched(cpu).lock.lock().activate(p);
     true
@@ -3200,7 +3297,7 @@ fn account_current(kernel: bool) {
 /// Returns None if the process is not found.
 pub fn lookup_task_cpus_allowed(pid: Pid) -> Option<crate::cpumask::CpuSet> {
     let table = TASKLIST.read();
-    table.get(pid).map(|t| t.cpus_allowed)
+    table.get(pid).map(|t| t.task.cpus_mask.snapshot())
 }
 
 /// Set a task's scheduling policy and priority by PID
@@ -3286,23 +3383,20 @@ pub fn set_task_scheduler(pid: Pid, policy: i32, rt_priority: i32) -> Result<(),
 ///   - EINVAL (22): Empty mask (no CPUs allowed)
 ///
 /// # Locking
-/// Acquires TASKLIST lock. Migration to new CPU set takes effect on next
-/// schedule.
+/// The mask is written under the task's pi_lock and rq lock (Linux
+/// __set_cpus_allowed_ptr); a task running elsewhere moves at its next
+/// wakeup (`select_task_rq`).
 pub fn set_task_cpus_allowed(pid: Pid, mask: crate::cpumask::CpuSet) -> Result<(), i32> {
     // At least one CPU the task can run on (Linux __sched_setaffinity:
     // the mask and cpu_active_mask intersect)
     if mask.and(&crate::smp::active_cpus()).is_empty() {
         return Err(22); // EINVAL
     }
-
-    let mut table = TASKLIST.write();
-    match table.get_mut(pid) {
-        Some(mut task) => {
-            task.cpus_allowed = mask;
-            Ok(())
-        }
-        None => Err(3), // ESRCH
-    }
+    let task = TASKLIST.read().task(pid).ok_or(3)?; // ESRCH
+    let _pi = task.pi_lock.lock();
+    let _rq = cpu_has_scheduler(task.cpu()).then(|| task_rq_lock(&task));
+    task.cpus_mask.assign(&mask);
+    Ok(())
 }
 
 /// Get the total number of tasks in the system

@@ -633,16 +633,22 @@ CPU being idle) is a quiescent state for a future QSBR RCU.
 a wakeup/sleep; order: may be taken while holding nothing else) maps tid ->
 control block. `kthread_should_stop/should_park/parkme` and
 `kthread_stop/park/unpark` use atomics + `try_to_wake_up` + the block's
-`ack` WaitQueue. Unbound threads go round-robin to APs (CPU 0 runs the
-cooperative user tasks). Standing threads: `ktimers/N` (one per CPU, runs its SOFT
+`ack` WaitQueue. A thread created without a CPU gets one round-robin;
+every kernel thread stays on its CPU (`cpus_mask` holds only it, Linux
+kthread_bind). Standing threads: `ktimers/N` (one per CPU, runs its SOFT
 timer callbacks), the system workqueue worker, `softnet/N` (one per CPU,
 network receive; see 3.10), `kselftest` (boot only).
 
 Every online AP gets an idle task (`init_ap_schedulers`) and enters the
-scheduler from its boot idle loop. User tasks still run only on CPU 0
-(`select_task_rq` keeps a task on its CPU). On x86-64 each CPU has its
-own TSS (RSP0) and syscall entry stack top, set at each switch to a
-user task.
+scheduler from its boot idle loop. User tasks run on every CPU:
+`select_task_rq` places a new task on the allowed CPU with the fewest
+tasks (`find_idlest_cpu`, Linux sched_balance_find_dst_cpu) and a
+waking one on its previous CPU if idle, else an idle allowed CPU, else
+its previous one (`select_idle_sibling`); all CPUs form one domain (no
+topology yet). `PerCpuScheduler.nr_running` (queued or running, idle
+aside; changed under the rq lock, read locklessly for placement) is
+Linux rq->nr_running. On x86-64 each CPU has its own TSS (RSP0) and
+syscall entry stack top, set at each switch to a user task.
 
 ### 3.1.1 Task Struct and Credentials
 
@@ -2747,11 +2753,10 @@ locks (Linux runs pending softirqs at `local_bh_enable()` after
 `sendto()` returns. A received packet's namespace is its device's
 (`skb.net()`), never `current_net_ns()`; a socket's is `Sock.net`.
 
-Today all device IRQs are routed to CPU 0 (PIC / GIC IROUTER) and user
-tasks run only on CPU 0, so in practice protocol work for eth0 and lo runs
-on CPU 0 (`softnet/0` or a CPU-0 task); kernel threads on other CPUs (e.g.
-the ICMP self-test on CPU 1) use their own CPU's softnet. The locks below
-do not rely on that.
+Today all device IRQs are routed to CPU 0 (PIC / GIC IROUTER), so
+received traffic for eth0 runs on `softnet/0`; `lo` traffic goes to the
+backlog of the sending task's CPU, whichever that is. The locks below do
+not rely on either.
 
 | Lock | Type | IRQ class | Notes |
 |------|------|-----------|-------|
@@ -3309,8 +3314,10 @@ calls; an interrupt from user mode may switch on its way back, with
 nothing held), so code between explicit schedule points still runs
 uninterrupted by other tasks. What this changes, and why it holds:
 
-- Per-CPU data and the current task: a task stays on its CPU (no
-  preemption, no migration), so per-CPU reads stay valid; state an
+- Per-CPU data and the current task: a task stays on its CPU between
+  scheduling points (no preemption), so per-CPU reads stay valid until
+  the next sleep, yield or return to user mode, after which it may run
+  on another CPU (a slot is not kept across one: re-read it); state an
   interrupt handler also touches is atomic or taken with interrupts
   off (`IrqSpinlock`, `local_irq_save`: per-CPU page lists, slab arrays,
   TLB state, cross-CPU queues); `curr` is written only by thread

@@ -110,7 +110,7 @@ fn snap(pid: Pid) -> Option<Snap> {
         nice: crate::task::priority_to_nice(t.task.se.prio()),
         policy: t.policy,
         rt_priority: t.rt_priority,
-        cpus: t.cpus_allowed,
+        cpus: t.task.cpus_mask.snapshot(),
         cpu: t.task.cpu.load(core::sync::atomic::Ordering::Relaxed),
         exit_signal: t.exit_signal,
         exit_code: t.exit_code,

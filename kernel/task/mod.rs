@@ -877,8 +877,12 @@ pub struct Task<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::Phy
     pub flags: AtomicU32,
     /// Linux TIF_* ([`tif`])
     pub thread_flags: AtomicU32,
-    /// CPU whose run queue owns this task (tasks never migrate)
+    /// CPU whose run queue owns this task (Linux task_cpu): changed by
+    /// `set_task_cpu` only
     pub cpu: AtomicU32,
+    /// CPUs it may run on (Linux p->cpus_mask, sched_setaffinity):
+    /// written under its pi_lock and rq lock, read under either
+    pub cpus_mask: crate::cpumask::CpuMask,
     /// Page-fault-disable depth (Linux p->pagefault_disabled), written
     /// by the task itself (`uaccess::pagefault_disable`)
     pub pagefault_disabled: AtomicU32,
@@ -1025,7 +1029,6 @@ pub struct TaskInner<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A
     /// Reset scheduling policy on fork (SCHED_RESET_ON_FORK was set)
     pub reset_on_fork: bool,
     /// CPU affinity mask (bit N = CPU N is allowed)
-    pub cpus_allowed: crate::cpumask::CpuSet,
     /// Page table for this task
     pub page_table: PT,
 
@@ -1444,6 +1447,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
         kind: TaskKind,
         kstack_top: A::VirtAddr,
         cpu: u32,
+        cpus: &crate::cpumask::CpuSet,
         cred: Arc<Cred>,
         mm: Option<crate::mm::MmRef>,
         alloc: TaskAlloc,
@@ -1463,6 +1467,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             flags: AtomicU32::new(flags),
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(cpu),
+            cpus_mask: crate::cpumask::CpuMask::from_set(cpus),
             pagefault_disabled: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(PRIORITY_NORMAL, 0),
@@ -1516,6 +1521,7 @@ impl<A: Arch, PT: PageTable<VirtAddr = A::VirtAddr, PhysAddr = A::PhysAddr>> Tas
             flags: AtomicU32::new(pf::KTHREAD),
             thread_flags: AtomicU32::new(0),
             cpu: AtomicU32::new(0),
+            cpus_mask: crate::cpumask::CpuMask::new(),
             pagefault_disabled: AtomicU32::new(0),
             rx_cpu: AtomicU32::new(u32::MAX),
             se: sched::SchedEntity::new(PRIORITY_NORMAL, 0),
