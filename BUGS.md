@@ -527,10 +527,6 @@ From the P1 /code-review (unverified unless noted). Tag = phase that fixes it.
    max_io assumes PAGE/seg per page; bdev_rw_frame ignores
    max_segments: SIZE_MAX < 4096 without SEG_MAX overflows SEG_MAX /
    MAX_SEGS → EIO.
-8. **blk-mq run() locks every CPU's sw queue per bio** (P7).
-   `kernel/storage/blk_mq.rs:135`: O(MAX_CPUS) IRQ-off lock pairs and
-   cacheline bounces per submit; use a per-hctx pending bitmap (Linux
-   ctx_map).
 9. **Write path copies** (P5). `kernel/storage/blkdev.rs:749`:
    writes take `&mut [u8]` (to_vec + bounce copy per page); unaligned
    bdev_rw_bytes allocates a request-sized temp buffer.

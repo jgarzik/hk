@@ -2765,7 +2765,7 @@ thread context, the driver completes it from its interrupt handler and
 | `Disk.open_mutex` | `sync::Mutex` (sleeping; Linux disk->open_mutex) | thread only | outermost block lock: block device open/release, partition scans (and rescans, BLKRRPART); I/O, `BLKDEV_REGISTRY`, `MAJORS` and the devtmpfs root's `i_rwsem` are taken under it |
 | `BLKDEV_REGISTRY` | spin `RwLock` (dev_t -> block device; global like Linux's bdev map) | thread only | leaf |
 | `MAJORS` | spin `Mutex` (block majors, register_blkdev) | thread only | leaf |
-| blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) | leaf: never taken with the hardware queue lock held |
+| blk-mq software queue (`BlkMq.ctxs[cpu]`) | `IrqSpinlock<BioList>`, one per CPU | thread (submit) | leaf: never taken with the hardware queue lock held; its pending bit in the hardware queue's `ctx_map` (Linux) is set and cleared under it, and a run visits only set bits (one that misses a bit being set is followed by the submitter's own run) |
 | blk-mq hardware queue (`BlkMq.hctxs[i]`) | `IrqSpinlock` over the dispatch list and the driver queue (virtio-blk: one virtqueue and its tags; Linux virtio_blk_vq.lock) | thread (dispatch) and hardirq (completion, restart) | leaf: `queue_rq`/`complete` only touch the ring, MMIO and the lock-free DMA API (`DMA_OPS` is a `Once`), never allocate or sleep; taken under `IRQ_TABLE` in the ISR |
 | `Completion.done` | `IrqSpinlock<u32>` | any context | -> its wait queue head -> run-queue lock (the wakeup is issued under it, Linux complete()) |
 | `RamDisk.pages` | spin `Mutex` | thread only (bio-based driver) | leaf |
