@@ -14,6 +14,9 @@
 //! - AFFINITY_MIGRATE: right after sched_setaffinity to one CPU, the
 //!   caller runs there, for every CPU; a child asleep in a pipe read,
 //!   pinned elsewhere by its parent, wakes on the new CPU.
+//! - BALANCE: spinners started together on one CPU spread to at least
+//!   two once allowed everywhere (load balancing; widening the mask
+//!   alone moves nothing, as their CPU stays allowed).
 //! - ASYNC_SIG_REGS: every general register (rcx/r11 on x86, x0-x30 on
 //!   arm64) holds its value across a SIGUSR1 handler that interrupts a
 //!   spin loop; on x86 the loop runs with DF set (`std`), which the
@@ -36,7 +39,75 @@ pub fn run_tests() {
     test_timeslice();
     test_smp_spread();
     test_affinity_migrate();
+    test_balance();
     test_async_sig_regs();
+}
+
+/// BALANCE: see the module doc (Linux sched_balance_rq)
+fn test_balance() {
+    let ncpu = ncpus_allowed();
+    if ncpu < 2 {
+        println(b"BALANCE:SKIP (one CPU)");
+        return;
+    }
+    let n = ncpu.clamp(2, 4) as usize;
+    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if page < 0 {
+        print(b"BALANCE:FAIL mmap ");
+        print_num(page);
+        println(b"");
+        return;
+    }
+    let slots = page as *mut u32;
+    let mut all = [0u64; 16];
+    let len = sys_sched_getaffinity(0, core::mem::size_of_val(&all), all.as_mut_ptr());
+    let first = 1u64 << all[0].trailing_zeros();
+    let mut pids = [0i64; 4];
+    for (i, pid) in pids.iter_mut().enumerate().take(n) {
+        // SAFETY: slot i of the shared page
+        unsafe { slots.add(i).write_volatile(u32::MAX) };
+        *pid = sys_fork();
+        if *pid == 0 {
+            sys_sched_setaffinity(0, 8, &first);
+            loop {
+                let mut cpu = 0u32;
+                sys_getcpu(&mut cpu, core::ptr::null_mut());
+                // SAFETY: as above
+                unsafe { slots.add(i).write_volatile(cpu) };
+            }
+        }
+    }
+    sleep_ms(100);
+    for pid in pids.iter().take(n) {
+        sys_sched_setaffinity(*pid, len as usize, all.as_ptr());
+    }
+    // Then allowed everywhere: the balancer spreads them
+    let mut seen = 0u64;
+    for _ in 0..20 {
+        sleep_ms(50);
+        seen = 0;
+        for i in 0..n {
+            // SAFETY: as above
+            let cpu = unsafe { slots.add(i).read_volatile() };
+            if cpu < 64 {
+                seen |= 1 << cpu;
+            }
+        }
+        if seen.count_ones() >= 2 {
+            break;
+        }
+    }
+    for pid in pids.iter().take(n) {
+        reap(*pid);
+    }
+    sys_munmap(page as u64, 4096);
+    if seen.count_ones() >= 2 {
+        println(b"BALANCE:OK");
+    } else {
+        print(b"BALANCE:FAIL spinners on cpus mask ");
+        print_num(seen as i64);
+        println(b"");
+    }
 }
 
 /// The CPU the caller runs on

@@ -195,6 +195,36 @@ impl<A: Adapter> PrioQueue<A> {
     pub fn is_empty(&self) -> bool {
         self.bitmap == [0; 4]
     }
+
+    /// Remove up to `out.len()` items `f` accepts, highest priority
+    /// first, each list from its front; the number taken (into `out`)
+    pub fn take(
+        &mut self,
+        out: &mut [*const A::Item],
+        mut f: impl FnMut(*const A::Item) -> bool,
+    ) -> usize {
+        let mut n = 0;
+        for p in (0..NUM_PRIORITIES).rev() {
+            if self.bitmap[p / 64] & (1u64 << (p % 64)) == 0 {
+                continue;
+            }
+            let mut it = self.lists[p].front();
+            while let Some(item) = it {
+                if n == out.len() {
+                    return n;
+                }
+                // SAFETY: `item` is on this list
+                it = unsafe { self.lists[p].next(item) };
+                if f(item) {
+                    // SAFETY: as above
+                    unsafe { self.remove(item, p as Priority) };
+                    out[n] = item;
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
 }
 
 impl<A: Adapter> Default for PrioQueue<A> {

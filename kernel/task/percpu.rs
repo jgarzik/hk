@@ -996,6 +996,9 @@ fn idle_task_entry() -> ! {
     loop {
         // Yield immediately to give other tasks priority
         yield_now();
+        // Nothing to run here: pull from a busier CPU (Linux
+        // sched_balance_newidle); a task pulled flags us to switch
+        sched_balance_rq(crate::cpu::this_id());
 
         // Flush console before halting to ensure all output is sent
         crate::console::console_flush();
@@ -2801,6 +2804,84 @@ pub fn try_to_wake_up(p: &KernelTask, mode: WakeMode) -> bool {
     true
 }
 
+/// Most tasks one balancing pass moves (Linux sysctl_sched_nr_migrate)
+const NR_MIGRATE: usize = 32;
+
+/// Lock the run queues of CPUs `a` and `b` (different), lowest CPU
+/// first (Linux double_rq_lock); the guards in (a, b) order
+fn double_rq_lock(
+    a: u32,
+    b: u32,
+) -> (
+    crate::arch::IrqSpinlockGuard<'static, CpuRunQueue>,
+    crate::arch::IrqSpinlockGuard<'static, CpuRunQueue>,
+) {
+    if a < b {
+        let ga = get_percpu_sched(a).lock.lock();
+        (ga, get_percpu_sched(b).lock.lock())
+    } else {
+        let gb = get_percpu_sched(b).lock.lock();
+        (get_percpu_sched(a).lock.lock(), gb)
+    }
+}
+
+/// Tasks on `cpu`'s run queue (read without its lock)
+fn nr_running(cpu: u32) -> u32 {
+    PERCPU_SCHEDS.get(cpu).nr_running.load(Ordering::Relaxed)
+}
+
+/// Pull queued tasks from the busiest CPU to `this` until the two are
+/// within one task of each other (Linux sched_balance_rq: one flat
+/// domain, the task count as the load, no cache-hot or active
+/// balancing). A task moves only to a CPU its mask allows; the running
+/// ones stay. Any context, no rq lock held.
+fn sched_balance_rq(this: u32) {
+    let cpus = sched_cpus();
+    if !cpus.test(this) {
+        return;
+    }
+    let (mut busiest, mut max) = (this, 0);
+    for c in cpus.iter() {
+        let n = nr_running(c);
+        if c != this && n > max {
+            (busiest, max) = (c, n);
+        }
+    }
+    if busiest == this || max <= nr_running(this) + 1 {
+        return;
+    }
+    let (mut src, mut dst) = double_rq_lock(busiest, this);
+    let (sn, dn) = (nr_running(busiest), nr_running(this));
+    if sn <= dn + 1 {
+        return;
+    }
+    let mut moved = [core::ptr::null::<KernelTask>(); NR_MIGRATE];
+    let want = (((sn - dn) / 2) as usize).clamp(1, NR_MIGRATE);
+    // Queued tasks are on the lists; the running one and idle are not
+    let n = src.queue().take(&mut moved[..want], |t| {
+        // SAFETY: on this run queue's list, kept alive by the scheduler
+        unsafe { &*t }.cpus_mask.test(this)
+    });
+    for &t in &moved[..n] {
+        // SAFETY: as above
+        let p = unsafe { &*t };
+        src.add_nr(-1);
+        set_task_cpu(p, this);
+        dst.add_nr(1);
+        dst.enqueue(p);
+        dst.check_preempt(p);
+    }
+}
+
+/// The tick's balancing (Linux sched_balance_trigger): an idle CPU
+/// every tick, a busy one every 8
+fn balance_tick(cpu: u32) {
+    let interval = if idle_cpu(cpu) { 1 } else { 8 };
+    if (get_ticks() + cpu as u64).is_multiple_of(interval) {
+        sched_balance_rq(cpu);
+    }
+}
+
 /// A task to move and where (`migration_cpu_stop`'s argument)
 struct Migration {
     task: *const KernelTask,
@@ -3040,6 +3121,9 @@ pub fn scheduler_tick() {
     }
     crate::timer::run_local();
     crate::watchdog::tick();
+    if let Some(cpu) = crate::cpu::try_this_id() {
+        balance_tick(cpu);
+    }
     current().set_tif(crate::task::tif::NEED_RESCHED);
 }
 

@@ -493,7 +493,14 @@ only at that task's return to user mode (`entry::exit_to_user_mode`).
    lock, `set_task_cpu`, then onto the new one under the new lock, never
    both locks at once. In between it is `on_rq` on no list, so whatever
    touches a queued task on its run queue holds its pi_lock (wakeup,
-   priority and affinity changes) or found it on that list.
+   priority and affinity changes) or found it on that list. The load
+   balancer (`sched_balance_rq`, Linux; from the tick, every tick on an
+   idle CPU and every 8 on a busy one, and from the idle loop before it
+   halts) finds the busiest CPU by `nr_running`, takes both run queues
+   with `double_rq_lock` (lowest CPU first) and moves queued tasks that
+   may run here, never the running one, at most 32 per pass, with no
+   pi_lock: it found them on the list, and `set_task_cpu` is under both
+   rq locks.
 
 2. **Run queue lock is IRQ-safe** - Timer interrupts cannot cause deadlocks.
    Lock order: pi_lock → rq lock; two rq locks lowest CPU first
