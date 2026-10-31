@@ -1146,8 +1146,13 @@ pub struct Zone {
   (`fault::replace_pte`, Linux ptep_clear_flush) first clear the entry
   and flush its TLB entry, then write the new one (required on arm64,
   ARM ARM D8.16; x86 needs it for the page-size change). In between
-  the address faults; the fault waits for the mm lock the writer holds,
-  then finds the new entry.
+  the address faults; the fault waits for the lock the writer holds,
+  then finds the new entry. A split leaves `PMD_SPLITTING` (invalid to
+  the MMU, Linux's invalidated pmd) rather than 0 in between, under the
+  page_table_lock: lockless walkers (`walk_pmd`, `pte_alloc`) wait it
+  out (`pmd_settled`) instead of taking the slot for empty (a racing
+  MADV_DONTNEED of the whole 2MB would otherwise miss the 4KB entries
+  the split then installs).
 - Teardown TLB: `exit_mmap` detaches the user half from the top-level
   table (`paging::detach_user`) into a full-mm `Gather`, which flushes
   the whole address space with its paging-structure caches
