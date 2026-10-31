@@ -244,6 +244,15 @@ pub struct Iter<'a, A: Adapter> {
     _l: PhantomData<&'a List<A>>,
 }
 
+impl<A: Adapter> Clone for Iter<'_, A> {
+    fn clone(&self) -> Self {
+        Self {
+            cur: self.cur,
+            _l: PhantomData,
+        }
+    }
+}
+
 impl<'a, A: Adapter> Iterator for Iter<'a, A> {
     type Item = &'a A::Item;
     fn next(&mut self) -> Option<&'a A::Item> {

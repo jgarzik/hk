@@ -466,8 +466,13 @@ a queued task is taken off its list first and put back on its new one)
 and read lock-free. Classes (Linux sched_class), highest first: stop
 (`migration/N`), rt (SCHED_FIFO/RR: 99 levels, FIFO never time-sliced,
 RR every 100 ms, a preempted rt task keeps the head of its level), fair
-(SCHED_NORMAL/BATCH/IDLE, one-tick round robin), idle (never queued).
-A woken task preempts a lower class or a lower rt priority.
+(SCHED_NORMAL/BATCH/IDLE: EEVDF, `task/fair.rs`; the entity's
+vruntime, deadline, lag and exec_start change under the rq lock of its
+CPU, and the tick charges the running one under it), idle (never
+queued). A woken task preempts a lower class, a lower rt priority, or
+a fair task EEVDF would not pick at that point (not for SCHED_BATCH/IDLE).
+`CpuRunQueue.min_vruntime` (under the rq lock) stands for the average
+when no fair task is there.
 
 Each `PerCpu` (per-CPU data) contains:
 ```rust

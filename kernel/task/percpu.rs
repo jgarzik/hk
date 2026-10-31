@@ -189,6 +189,9 @@ pub struct CpuRunQueue {
     prev: *const KernelTask,
     /// The CPU this run queue belongs to (Linux rq->cpu)
     cpu: u32,
+    /// Fair: a vruntime no fair task here is behind (Linux
+    /// cfs_rq->min_vruntime), the average when none is queued
+    min_vruntime: u64,
 }
 
 // SAFETY: the task pointers are owned references (see above), used
@@ -255,6 +258,7 @@ impl CpuRunQueue {
             dead: None,
             prev: core::ptr::null(),
             cpu: 0,
+            min_vruntime: 0,
         }
     }
 
@@ -299,6 +303,7 @@ impl CpuRunQueue {
                 .fetch_sub(1, Ordering::Relaxed);
         }
         if !p.se.on_rq() {
+            self.place_fair(p, false);
             p.se.set_on_rq(true);
             self.add_nr(1);
             self.enqueue(p);
@@ -319,9 +324,31 @@ impl CpuRunQueue {
         if self.curr_is_idle()
             || pc < cc
             || (pc == Class::Rt && cc == Class::Rt && p.se.rt_priority() > curr.se.rt_priority())
+            || (pc == Class::Fair && cc == Class::Fair && self.fair_wakeup_preempts(p, curr))
         {
             self.resched_curr();
         }
+    }
+
+    /// A woken fair task preempts the running fair one if EEVDF would
+    /// pick it now (Linux check_preempt_wakeup_fair): never a SCHED_BATCH
+    /// or SCHED_IDLE one, always over a SCHED_IDLE one
+    fn fair_wakeup_preempts(&self, p: &KernelTask, curr: &KernelTask) -> bool {
+        use crate::task::{SCHED_BATCH, SCHED_IDLE};
+        let (pp, cp) = (p.se.policy(), curr.se.policy());
+        if pp == SCHED_BATCH || pp == SCHED_IDLE {
+            return false;
+        }
+        if cp == SCHED_IDLE {
+            return true;
+        }
+        crate::task::fair::update_curr(&curr.se, crate::time::monotonic_ns());
+        let q = self.queue.as_ref().expect("run queue not initialized");
+        let ents = q
+            .fair_iter()
+            .map(|t| (t as *const KernelTask, &t.se))
+            .chain(self.curr_fair().map(|c| (c as *const KernelTask, &c.se)));
+        crate::task::fair::pick(ents).is_some_and(|t| core::ptr::eq(t, p))
     }
 
     /// A task joined (+1) or left (-1) this run queue (Linux
@@ -350,10 +377,71 @@ impl CpuRunQueue {
         }
     }
 
-    /// The next task to run: the first of the highest priority queued,
-    /// else the idle task (Linux pick_next_task)
+    /// The next task to run: a stopper, else the highest rt task, else
+    /// EEVDF's fair pick, else the idle task (Linux pick_next_task)
     fn pick_next(&mut self) -> *const KernelTask {
-        self.queue().pop().unwrap_or(self.idle)
+        if let Some(t) = self.queue().pop_stop_rt() {
+            return t;
+        }
+        let pick = {
+            let q = self.queue.as_ref().expect("run queue not initialized");
+            crate::task::fair::pick(q.fair_iter().map(|t| (t as *const KernelTask, &t.se)))
+        };
+        match pick {
+            Some(t) => {
+                // SAFETY: on the fair list (just found there)
+                unsafe { self.queue().remove(t, Class::Fair, 0) };
+                // SAFETY: as above
+                let v = unsafe { &*t }.se.vruntime.load(Ordering::Relaxed);
+                self.min_vruntime = self.min_vruntime.max(v.min(self.fair_avg(false)));
+                t
+            }
+            None => self.idle,
+        }
+    }
+
+    /// The running task if it is a fair task still on this run queue
+    /// and not on its list (Linux cfs_rq->curr)
+    fn curr_fair(&self) -> Option<&KernelTask> {
+        // SAFETY: the running task, kept alive by this run queue
+        unsafe { self.curr.as_ref() }
+            .filter(|c| !self.curr_is_idle() && c.se.class() == Class::Fair && c.se.on_rq())
+    }
+
+    /// The fair entities competing here: the queued ones, plus the
+    /// running one if `with_curr` and it is one (`curr_fair`)
+    fn fair_ents(&self, with_curr: bool) -> impl Iterator<Item = &sched::SchedEntity> + Clone {
+        let q = self.queue.as_ref().expect("run queue not initialized");
+        let curr = if with_curr { self.curr_fair() } else { None };
+        q.fair_iter().map(|t| &t.se).chain(curr.map(|c| &c.se))
+    }
+
+    /// Their weighted average vruntime (`min_vruntime` if none)
+    fn fair_avg(&self, with_curr: bool) -> u64 {
+        crate::task::fair::avg_vruntime(self.fair_ents(with_curr)).unwrap_or(self.min_vruntime)
+    }
+
+    /// Their total weight (Linux cfs_rq->load.weight)
+    fn fair_load(&self, with_curr: bool) -> u64 {
+        self.fair_ents(with_curr)
+            .map(crate::task::fair::weight)
+            .sum()
+    }
+
+    /// Place fair `p`, joining this run queue, by its lag (Linux
+    /// place_entity; `initial`: a new task)
+    fn place_fair(&self, p: &KernelTask, initial: bool) {
+        if p.se.class() == Class::Fair {
+            crate::task::fair::place(&p.se, self.fair_avg(true), self.fair_load(true), initial);
+        }
+    }
+
+    /// Fair `p` (queued here, or running) leaves: keep its lag (Linux
+    /// update_entity_lag)
+    fn save_lag(&self, p: &KernelTask) {
+        if p.se.class() == Class::Fair {
+            crate::task::fair::save_lag(&p.se, self.fair_avg(true));
+        }
     }
 
     /// The running task is the idle task
@@ -1178,6 +1266,7 @@ fn wake_up_new_task(p: &TaskRef) {
     let mut rq = get_percpu_sched(p.cpu()).lock.lock();
     let _ = Arc::into_raw(p.clone());
     p.se.set_state(RUNNING);
+    rq.place_fair(p, true);
     p.se.set_on_rq(true);
     rq.add_nr(1);
     rq.enqueue(p);
@@ -2514,6 +2603,9 @@ fn make_current(t: &KernelTask) -> (u64, *const crate::mm::Mm, (u64, u64)) {
     CurrentArch::set_current_task_ptr(t as *const KernelTask as usize);
     // Linux prepare_task
     t.se.set_on_cpu(true);
+    // A fair task's runtime counts from now (Linux set_next_entity)
+    t.se.exec_start
+        .store(crate::time::monotonic_ns(), Ordering::Relaxed);
     let tls = (
         t.tls.load(Ordering::Relaxed),
         t.gsbase.load(Ordering::Relaxed),
@@ -2637,8 +2729,13 @@ pub fn schedule() {
     if rq.curr.is_null() || rq.curr_is_idle() || me.se.state() == RUNNING {
         return;
     }
-    // Leave the run queue (Linux deactivate_task); an uninterruptible
-    // or killable sleep counts in the load (task_contributes_to_load)
+    // Leave the run queue (Linux deactivate_task), a fair task keeping
+    // its lag; an uninterruptible or killable sleep counts in the load
+    // (task_contributes_to_load)
+    if me.se.class() == Class::Fair {
+        crate::task::fair::update_curr(&me.se, crate::time::monotonic_ns());
+        rq.save_lag(&me);
+    }
     me.se.set_on_rq(false);
     rq.add_nr(-1);
     let st = me.se.state();
@@ -2939,8 +3036,11 @@ fn sched_balance_rq(this: u32) {
     for &t in &moved[..n] {
         // SAFETY: as above
         let p = unsafe { &*t };
+        // Its lag on the old queue (Linux migrate_task_rq_fair keeps it)
+        src.save_lag(p);
         src.add_nr(-1);
         set_task_cpu(p, this);
+        dst.place_fair(p, false);
         dst.add_nr(1);
         dst.enqueue(p);
         dst.check_preempt(p);
@@ -2995,11 +3095,13 @@ fn move_queued_task(
     p: &KernelTask,
     dest: u32,
 ) {
+    rq.save_lag(p);
     rq.dequeue(p);
     rq.add_nr(-1);
     set_task_cpu(p, dest);
     drop(rq);
     let mut d = get_percpu_sched(dest).lock.lock();
+    d.place_fair(p, false);
     d.add_nr(1);
     d.enqueue(p);
     d.check_preempt(p);
@@ -3205,7 +3307,13 @@ pub fn scheduler_tick() {
     let resched = match me.se.class() {
         Class::Stop => false,
         Class::Rt => me.se.policy() == crate::task::SCHED_RR && me.se.rr_tick(),
-        Class::Fair | Class::Idle => true,
+        // Charged under its rq lock; a used-up slice (new deadline) lets
+        // EEVDF pick again (Linux task_tick_fair -> update_deadline)
+        Class::Fair => this_sched().is_some_and(|s| {
+            let _rq = s.lock.lock();
+            crate::task::fair::update_curr(&me.se, crate::time::monotonic_ns())
+        }),
+        Class::Idle => true,
     };
     if resched {
         me.set_tif(crate::task::tif::NEED_RESCHED);
@@ -3358,9 +3466,16 @@ fn yield_cpu(preempted: bool) -> bool {
     if rq.curr.is_null() {
         return false;
     }
-    // Back on its class's list; the idle task is never queued
+    // Back on its class's list, a fair task charged first (and a
+    // sched_yield moves its deadline on); the idle task is never queued
     me.se.set_state(RUNNING);
     if !rq.curr_is_idle() {
+        if me.se.class() == Class::Fair {
+            crate::task::fair::update_curr(&me.se, crate::time::monotonic_ns());
+            if !preempted {
+                crate::task::fair::yield_task(&me.se);
+            }
+        }
         rq.enqueue_prev(&me, preempted);
     }
     let next = rq.pick_next();
@@ -3708,7 +3823,13 @@ fn change_class(p: &KernelTask, f: impl FnOnce(&sched::SchedEntity)) {
     if queued {
         rq.dequeue(p);
     }
+    let old = p.se.class();
     f(&p.se);
+    // Into the fair class: placed at the average (Linux switched_to_fair)
+    if old != Class::Fair && p.se.class() == Class::Fair {
+        p.se.vlag.store(0, Ordering::Relaxed);
+        rq.place_fair(p, false);
+    }
     if queued {
         rq.enqueue(p);
         rq.check_preempt(p);

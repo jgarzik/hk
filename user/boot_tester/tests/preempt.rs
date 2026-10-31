@@ -25,6 +25,9 @@
 //! - RT_FIFO: a SCHED_FIFO spinner keeps a SCHED_OTHER spinner on its
 //!   CPU from running, and is not time-sliced against another FIFO task
 //!   of the same priority.
+//! - NICE_WEIGHT, NICE_ADJACENT, SCHED_IDLE_SHARE: two spinners on
+//!   one CPU share it by weight (EEVDF): nice 0 vs 5 about 3:1, nice 0
+//!   vs 1 about 5:4 (neither starves), SCHED_IDLE under a tenth.
 //! - ASYNC_SIG_REGS: every general register (rcx/r11 on x86, x0-x30 on
 //!   arm64) holds its value across a SIGUSR1 handler that interrupts a
 //!   spin loop; on x86 the loop runs with DF set (`std`), which the
@@ -51,7 +54,65 @@ pub fn run_tests() {
     test_sched_prio_fields();
     test_sched_perm();
     test_rt_fifo();
+    test_fair_share(b"NICE_WEIGHT", (0, 0), (5, 0), (18, 50));
+    test_fair_share(b"NICE_ADJACENT", (0, 0), (1, 0), (6, 25));
+    test_fair_share(b"SCHED_IDLE_SHARE", (0, 0), (0, 5), (100, u64::MAX));
     test_async_sig_regs();
+}
+
+/// A child pinned to `cpu` with `nice` and fair `policy` counting in
+/// `counter` forever
+fn fair_spinner(cpu: u32, nice: i32, policy: i32, counter: *mut u64) -> i64 {
+    use hk_syscall::{SchedParam, sys_sched_setscheduler, sys_setpriority};
+    let pid = sys_fork();
+    if pid == 0 {
+        let m = 1u64 << cpu;
+        sys_sched_setaffinity(0, 8, &m);
+        sys_setpriority(0, 0, nice);
+        if policy != 0 {
+            sys_sched_setscheduler(0, policy, &SchedParam { sched_priority: 0 });
+        }
+        loop {
+            // SAFETY: the shared page the parent mapped
+            unsafe { counter.write_volatile(counter.read_volatile() + 1) };
+        }
+    }
+    pid
+}
+
+/// Two fair spinners `a` and `b` ((nice, policy)) on one CPU for 400 ms:
+/// a's progress over b's, in tenths, within `range` (Linux EEVDF shares
+/// a CPU by weight)
+fn test_fair_share(name: &'static [u8], a: (i32, i32), b: (i32, i32), range: (u64, u64)) {
+    use super::sk::T;
+    let mut t = T::new(name);
+    let page = sys_mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if !t.ok(b"mmap", page >= 0, page) {
+        t.done();
+        return;
+    }
+    let c = page as *mut u64;
+    let cpu = {
+        let mut m = [0u64; 16];
+        sys_sched_getaffinity(0, core::mem::size_of_val(&m), m.as_mut_ptr());
+        63 - m[0].leading_zeros()
+    };
+    let pa = fair_spinner(cpu, a.0, a.1, c);
+    // SAFETY: the second counter of the page
+    let pb = fair_spinner(cpu, b.0, b.1, unsafe { c.add(1) });
+    sleep_ms(100);
+    // SAFETY: counters 0 and 1 of the shared page
+    let at = |i: usize| unsafe { c.add(i).read_volatile() };
+    let (a0, b0) = (at(0), at(1));
+    sleep_ms(400);
+    let (da, db) = (at(0) - a0, at(1) - b0);
+    reap(pa);
+    reap(pb);
+    sys_munmap(page as u64, 4096);
+    let tenths = da * 10 / db.max(1);
+    t.ok(b"both ran", da > 0, da as i64);
+    t.ok(b"share a:b tenths", (range.0..=range.1).contains(&tenths), tenths as i64);
+    t.done();
 }
 
 /// Fields 18 (priority), 19 (nice), 40 (rt_priority), 41 (policy) of

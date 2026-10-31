@@ -372,14 +372,30 @@ GFP_KERNEL allocation in atomic context. LOCKDEP has no such report
 call site to attribute it to, so the sites (allocations under spin locks
 across net, fs, ipc) cannot be audited yet.
 
+## Scheduler gaps (deviations from Linux)
+
+**Location**: `kernel/task/fair.rs`, `kernel/task/percpu.rs`
+
+- EEVDF scans a list per pick and computes the average vruntime per use
+  (Linux: an rbtree augmented with min_vruntime and incremental sums,
+  O(log n)); fine for short run queues.
+- Slices end at tick granularity (10 ms; no hrtick), no reweight on a
+  nice change of a queued task, no RUN_TO_PARITY or delayed dequeue.
+- No PELT: load balancing counts tasks and wakeup placement looks for
+  an idle CPU; one flat domain (no SMT/LLC/NUMA topology), no active
+  balancing, no rt push/pull beyond wakeup placement.
+- No RT throttling (sched_rt_runtime_us) or dl_server: a SCHED_FIFO
+  spinner starves its CPU's fair tasks; no SCHED_DEADLINE (EINVAL).
+- Kernel preemption is off: a long kernel path delays a woken task of
+  a higher class until its next scheduling point.
+
 ## Rare arm64 hang: a CPU stops answering cross-CPU calls
 
 **Location**: unknown (`make check-arm`, right after CLOCK_NANOSLEEP)
 
-Seen once during phase K (class rework under test): `csd: CPU#3
-waiting 1000 ms for CPU#2 to run a cross-CPU call` (and CPU#1), then
-no progress until the boot timeout, no panic or soft lockup report:
-CPU 2 sat with interrupts off. Not reproduced in the following runs.
+Rare: `csd: CPU#3 waiting 1000 ms for CPU#2 to run a cross-CPU call`
+(and CPU#1), then no progress until the boot timeout, no panic or soft
+lockup report: CPU 2 sat with interrupts off.
 Next occurrence: dump CPU 2's state from the csd report (send it an
 NMI-like FIQ, or record the last IrqSpinlock taken per CPU).
 
@@ -628,7 +644,7 @@ Found during T0 (2026-10-19). Tag = when to fix.
    (23, 17, 281, 169, 170) but have no arm in
    `kernel/arch/aarch64/syscall.rs`, so they return ENOSYS. Add them
    with boot tests.
-10. **Network test flakes seen in the phase A sweep** (I). Once each:
+10. **Network test flake** (I):
    `SOCKCORE_CONNECT_REFUSED:FAIL SO_ERROR got 0` (hk arm64, 1 of 10
    `check-stress` boots: poll reported POLLOUT for a nonblocking
    connect to a just-closed loopback port, but no ECONNREFUSED was

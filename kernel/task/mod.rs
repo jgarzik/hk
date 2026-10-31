@@ -1,6 +1,7 @@
 //! Task management
 
 pub mod exec;
+pub mod fair;
 pub mod fdtable;
 pub mod id;
 pub mod kthread;

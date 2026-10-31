@@ -8,7 +8,9 @@
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering,
+};
 
 use super::Priority;
 use crate::list::{Adapter, Link, List};
@@ -83,6 +85,15 @@ pub struct SchedEntity {
     reset_on_fork: AtomicBool,
     /// SCHED_RR: ticks left of its slice (Linux p->rt.time_slice)
     rr_left: AtomicU32,
+    /// Fair: virtual runtime, ns (Linux se->vruntime; `fair`)
+    pub vruntime: AtomicU64,
+    /// Fair: virtual deadline (Linux se->deadline)
+    pub deadline: AtomicU64,
+    /// Fair: lag saved when it left its run queue (Linux se->vlag)
+    pub vlag: AtomicI64,
+    /// Fair: when it last started running or was charged (monotonic ns;
+    /// 0 while not running)
+    pub exec_start: AtomicU64,
     /// Its slice ran out: requeued at the tail, not the head
     requeue_tail: AtomicBool,
     /// Its place in a priority list (under the rq lock)
@@ -115,6 +126,10 @@ impl SchedEntity {
             rt_priority: AtomicU8::new(0),
             reset_on_fork: AtomicBool::new(false),
             rr_left: AtomicU32::new(RR_TICKS),
+            vruntime: AtomicU64::new(0),
+            deadline: AtomicU64::new(0),
+            vlag: AtomicI64::new(0),
+            exec_start: AtomicU64::new(0),
             requeue_tail: AtomicBool::new(false),
             link: Link::new(),
             // SAFETY: a switch frame is plain integers; zero is valid
@@ -372,13 +387,20 @@ impl<A: Adapter> ClassQueues<A> {
         }
     }
 
-    /// Remove and return the next task to run: stop, then the highest
-    /// rt priority, then the first fair task (Linux pick_next_task)
-    pub fn pop(&mut self) -> Option<*const A::Item> {
-        self.stop
-            .pop_front()
-            .or_else(|| self.rt.pop())
-            .or_else(|| self.fair.pop_front())
+    /// Remove and return the next stop or rt task (Linux pick_next_task
+    /// down to the rt class); the fair one is EEVDF's to choose
+    pub fn pop_stop_rt(&mut self) -> Option<*const A::Item> {
+        self.stop.pop_front().or_else(|| self.rt.pop())
+    }
+
+    /// The queued fair tasks
+    pub fn fair_iter(&self) -> crate::list::Iter<'_, A> {
+        self.fair.iter()
+    }
+
+    /// Fair tasks are queued
+    pub fn has_fair(&self) -> bool {
+        !self.fair.is_empty()
     }
 
     /// Remove up to `out.len()` fair tasks `f` accepts, oldest first
